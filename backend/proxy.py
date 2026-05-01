@@ -358,6 +358,26 @@ def apply_responses_request_options(upstream_body: dict, provider: dict) -> dict
     return upstream_body
 
 
+def _chat_request_options(provider: dict) -> dict:
+    options = provider.get("requestOptions") or {}
+    if not isinstance(options, dict):
+        return {}
+    chat_options = options.get("chat")
+    return chat_options if isinstance(chat_options, dict) else {}
+
+
+def apply_chat_request_options(upstream_body: dict, provider: dict) -> dict:
+    """把 provider.requestOptions.chat 合并进 OpenAI Chat 上游请求体。
+
+    DeepSeek chat/completions 把 thinking 放在 extra_body 里、reasoning_effort
+    在顶层；其它提供商默认不透传以免触发 400。
+    """
+    options = _chat_request_options(provider)
+    if not options or _provider_kind(provider) != "deepseek":
+        return upstream_body
+    return _deep_merge(upstream_body, options)
+
+
 def _normalize_usage(usage) -> dict:
     """保证 usage 至少包含 input_tokens / output_tokens。"""
     def token_int(value) -> int:
@@ -444,6 +464,7 @@ async def forward_request(
     if api_format == "openai_chat":
         upstream_url = build_upstream_url(provider.get("baseUrl", ""), api_format)
         upstream_body = await _responses_to_openai_body(body, stream=False, provider=provider)
+        upstream_body = apply_chat_request_options(upstream_body, provider)
     else:
         # Responses API 格式直接透传
         upstream_url = build_upstream_url(provider.get("baseUrl", ""), api_format)
@@ -560,6 +581,7 @@ async def forward_request_stream(
     if api_format == "openai_chat":
         upstream_url = build_upstream_url(provider.get("baseUrl", ""), api_format)
         upstream_body = await _responses_to_openai_body(body, stream=True, provider=provider)
+        upstream_body = apply_chat_request_options(upstream_body, provider)
     else:
         upstream_url = build_upstream_url(provider.get("baseUrl", ""), api_format)
         upstream_body = dict(body)

@@ -18,7 +18,7 @@ LIBRARY_DIR = os.path.join(CONFIG_DIR, "configLibrary")
 OLD_CONFIG_DIR = os.path.expanduser("~/.cc-desktop-switch")
 DEFAULT_UPDATE_URL = "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 DEFAULT_CONFIG = {
     "version": APP_VERSION,
@@ -42,7 +42,7 @@ BUILTIN_PRESETS = [
         "name": "DeepSeek",
         "baseUrl": "https://api.deepseek.com/v1",
         "authScheme": "bearer",
-        "apiFormat": "responses",
+        "apiFormat": "openai_chat",
         "models": {
             "sonnet": "deepseek-v4-pro",
             "haiku": "deepseek-v4-flash",
@@ -70,14 +70,14 @@ BUILTIN_PRESETS = [
                 "label": "DeepSeek Max 思维",
                 "description": "Low：更快更省，适合简单任务。\nMedium：速度和效果平衡，适合日常使用。\nHigh：更认真思考，适合复杂代码和排错。\n勾选后：本工具会按 DeepSeek Max 转发；未勾选则使用 Claude 当前默认配置。",
                 "requestOptions": {
-                    "responses": {
+                    "chat": {
                         "thinking": {"type": "enabled"},
-                        "output_config": {"effort": "max"},
+                        "reasoning_effort": "max",
                     }
                 },
             }
         },
-        "extraHeaders": {"x-api-key": "{apiKey}"},
+        "extraHeaders": {},
         "isBuiltin": True,
     },
     {
@@ -116,7 +116,7 @@ BUILTIN_PRESETS = [
         "name": "Xiaomi MiMo (Pay for Token)",
         "baseUrl": "https://api.xiaomimimo.com/v1",
         "authScheme": "bearer",
-        "apiFormat": "responses",
+        "apiFormat": "openai_chat",
         "models": {
             "sonnet": "",
             "haiku": "",
@@ -130,7 +130,7 @@ BUILTIN_PRESETS = [
         "name": "Xiaomi MiMo (Token Plan)",
         "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
         "authScheme": "bearer",
-        "apiFormat": "responses",
+        "apiFormat": "openai_chat",
         "baseUrlOptions": [
             {
                 "label": "官方默认",
@@ -154,8 +154,8 @@ BUILTIN_PRESETS = [
         "id": "zhipu",
         "name": "智谱 GLM",
         "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
-        "authScheme": "x-api-key",
-        "apiFormat": "responses",
+        "authScheme": "bearer",
+        "apiFormat": "openai_chat",
         "models": {
             "sonnet": "glm-5.1",
             "haiku": "glm-4.7",
@@ -168,8 +168,8 @@ BUILTIN_PRESETS = [
         "id": "bailian",
         "name": "阿里云百炼",
         "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "authScheme": "x-api-key",
-        "apiFormat": "responses",
+        "authScheme": "bearer",
+        "apiFormat": "openai_chat",
         "models": {
             "sonnet": "qwen3.6-plus",
             "haiku": "qwen3.6-flash",

@@ -264,40 +264,74 @@
     )));
   }
 
-  function normalizeRequestOptions(options = {}) {
-    if (!options || typeof options !== "object") return {};
-    // 优先读取 responses 键，回退到 anthropic 键（向后兼容旧配置）
-    const source = options.responses && typeof options.responses === "object"
-      ? options.responses
-      : (options.anthropic && typeof options.anthropic === "object" ? options.anthropic : options);
-    const normalized = {};
+  const EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"];
+
+  function normalizeResponsesBlock(source = {}) {
+    if (!source || typeof source !== "object") return {};
+    const block = {};
+    if (["enabled", "disabled"].includes(source.thinking?.type)) {
+      block.thinking = { type: source.thinking.type };
+    }
+    if (EFFORT_VALUES.includes(source.output_config?.effort)) {
+      block.output_config = { effort: source.output_config.effort };
+    }
+    return block;
+  }
+
+  function normalizeChatBlock(source = {}) {
+    if (!source || typeof source !== "object") return {};
+    const block = {};
+    // DeepSeek V4：thinking 对象只接受 type；reasoning_effort 在请求体顶层
     const thinkingType = source.thinking?.type;
     if (["enabled", "disabled"].includes(thinkingType)) {
-      normalized.thinking = { type: thinkingType };
+      block.thinking = { type: thinkingType };
     }
-    const effort = source.output_config?.effort;
-    if (["low", "medium", "high", "xhigh", "max"].includes(effort)) {
-      normalized.output_config = { effort };
+    if (EFFORT_VALUES.includes(source.reasoning_effort)) {
+      block.reasoning_effort = source.reasoning_effort;
     }
-    return Object.keys(normalized).length ? { responses: normalized } : {};
+    return block;
+  }
+
+  function normalizeRequestOptions(options = {}) {
+    if (!options || typeof options !== "object") return {};
+    // 兼容旧配置：anthropic 键重命名为 responses
+    const responsesSource = options.responses && typeof options.responses === "object"
+      ? options.responses
+      : (options.anthropic && typeof options.anthropic === "object" ? options.anthropic : null);
+    const result = {};
+    const responsesBlock = normalizeResponsesBlock(responsesSource || (responsesSource === null ? options : {}));
+    if (Object.keys(responsesBlock).length) result.responses = responsesBlock;
+    const chatBlock = normalizeChatBlock(options.chat);
+    if (Object.keys(chatBlock).length) result.chat = chatBlock;
+    return result;
   }
 
   function mergeRequestOptions(base = {}, extra = {}) {
-    const baseResponses = normalizeRequestOptions(base).responses || {};
-    const extraResponses = normalizeRequestOptions(extra).responses || {};
-    const merged = { ...baseResponses };
-    if (extraResponses.thinking) merged.thinking = { ...extraResponses.thinking };
-    if (extraResponses.output_config) merged.output_config = { ...extraResponses.output_config };
-    return normalizeRequestOptions({ responses: merged });
+    const baseNorm = normalizeRequestOptions(base);
+    const extraNorm = normalizeRequestOptions(extra);
+    const merged = {};
+    const responsesMerged = { ...(baseNorm.responses || {}), ...(extraNorm.responses || {}) };
+    if (Object.keys(responsesMerged).length) merged.responses = responsesMerged;
+    const chatMerged = { ...(baseNorm.chat || {}), ...(extraNorm.chat || {}) };
+    if (Object.keys(chatMerged).length) merged.chat = chatMerged;
+    return normalizeRequestOptions(merged);
   }
 
   function clearRequestOptions(base = {}, option = {}) {
-    const baseResponses = normalizeRequestOptions(base).responses || {};
-    const optionResponses = normalizeRequestOptions(option).responses || {};
-    const current = { ...baseResponses };
-    if (optionResponses.thinking) delete current.thinking;
-    if (optionResponses.output_config) delete current.output_config;
-    return normalizeRequestOptions({ responses: current });
+    const baseNorm = normalizeRequestOptions(base);
+    const optionNorm = normalizeRequestOptions(option);
+    const next = {};
+    if (baseNorm.responses) {
+      const block = { ...baseNorm.responses };
+      Object.keys(optionNorm.responses || {}).forEach((key) => { delete block[key]; });
+      if (Object.keys(block).length) next.responses = block;
+    }
+    if (baseNorm.chat) {
+      const block = { ...baseNorm.chat };
+      Object.keys(optionNorm.chat || {}).forEach((key) => { delete block[key]; });
+      if (Object.keys(block).length) next.chat = block;
+    }
+    return normalizeRequestOptions(next);
   }
 
   function requestOptionsMatch(left = {}, right = {}) {
@@ -985,6 +1019,16 @@
     if (label) label.classList.toggle("required", input.required);
   }
 
+  function isKimiProviderId(id) {
+    const value = String(id || "").toLowerCase();
+    return value === "kimi" || value === "kimi-code" || value.startsWith("kimi-");
+  }
+
+  function setUnverifiedBanner(show) {
+    const banner = $("#providerUnverifiedBanner");
+    if (banner) banner.hidden = !show;
+  }
+
   function resetProviderForm() {
     editingProviderId = null;
     selectedPreset = null;
@@ -1006,6 +1050,7 @@
     renderAuthSchemeControl();
     setFormApiFormat("responses");
     setProviderMappings(emptyMappings());
+    setUnverifiedBanner(false);
   }
 
   function applyPresetToForm(preset, notify = true) {
@@ -1019,13 +1064,14 @@
     setAuthSchemeValue(preset.authScheme);
     setApiKeyInputState(false);
     selectedPreset = preset;
-    setFormApiFormat(preset.apiFormat === "OpenAI" ? "openai_chat" : "responses");
+    setFormApiFormat(["openai", "openai_chat", "OpenAI"].includes(preset.apiFormat) ? "openai_chat" : "responses");
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     providerAvailableModels = [];
     setProviderMappings(preset.models || emptyMappings());
     renderPresetOptions(preset, preset.models || emptyMappings());
     updatePresetSelection();
+    setUnverifiedBanner(!isKimiProviderId(preset.id));
     if (notify) showToast(`${preset.name} ${t("toast.presetFilled")}`);
   }
 
@@ -1070,6 +1116,7 @@
     setProviderMappings(provider.mappings || emptyMappings());
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
     updatePresetSelection();
+    setUnverifiedBanner(!isKimiProviderId(matchedPreset?.id || provider.id));
   }
 
   async function renderProviderForm() {

@@ -96,6 +96,10 @@
         <div class="two-column provider-add-layout">
           <article class="panel form-panel">
             <form id="providerForm" autocomplete="off">
+              <div class="desktop-warning compact" id="providerUnverifiedBanner" role="note" hidden>
+                <i class="bi bi-exclamation-triangle-fill" aria-hidden="true"></i>
+                <p data-i18n="providersAdd.unverifiedNotice">目前仅 Kimi Code 进行了端到端验证，其他采用兼容适配，如有问题欢迎提交反馈，谢谢！</p>
+              </div>
               <div class="mb-4">
                 <label class="form-label required" for="providerName" data-i18n="providers.name">提供商名称</label>
                 <input class="form-control form-control-lg" id="providerName" name="name" value="My DeepSeek" autocomplete="organization" required>
@@ -106,7 +110,7 @@
                   <button class="link-action" type="button" data-action="test-provider-form"><i class="bi bi-lightning-charge"></i><span data-i18n="providers.manageAndTest">管理与测速</span></button>
                 </div>
                 <div class="baseurl-input-wrap" id="providerBaseUrlControl">
-                  <input class="form-control form-control-lg" id="providerBaseUrl" name="baseUrl" value="https://api.deepseek.com/anthropic" autocomplete="url" required>
+                  <input class="form-control form-control-lg" id="providerBaseUrl" name="baseUrl" value="https://api.deepseek.com/v1" autocomplete="url" required>
                   <button class="baseurl-trigger" id="providerBaseUrlTrigger" type="button" data-action="toggle-baseurl-menu" aria-haspopup="listbox" aria-expanded="false" hidden>
                     <i class="bi bi-chevron-down" aria-hidden="true"></i>
                   </button>
