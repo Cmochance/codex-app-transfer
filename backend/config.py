@@ -43,6 +43,7 @@ BUILTIN_PRESETS = [
         "id": "deepseek",
         "name": "DeepSeek",
         "baseUrl": "https://api.deepseek.com/v1",
+        "docsUrl": "https://api-docs.deepseek.com/",
         "authScheme": "bearer",
         "apiFormat": "openai_chat",
         "models": {
@@ -86,6 +87,7 @@ BUILTIN_PRESETS = [
         "id": "kimi",
         "name": "Kimi (月之暗面)",
         "baseUrl": "https://api.moonshot.cn/v1",
+        "docsUrl": "https://platform.moonshot.cn/docs",
         "authScheme": "bearer",
         "apiFormat": "openai_chat",
         "models": {
@@ -100,6 +102,7 @@ BUILTIN_PRESETS = [
         "id": "kimi-code",
         "name": "Kimi Code",
         "baseUrl": "https://api.kimi.com/coding/v1",
+        "docsUrl": "https://platform.moonshot.cn/docs",
         "authScheme": "bearer",
         "apiFormat": "openai_chat",
         "extraHeaders": {
@@ -117,6 +120,7 @@ BUILTIN_PRESETS = [
         "id": "xiaomi-mimo-payg",
         "name": "Xiaomi MiMo (Pay for Token)",
         "baseUrl": "https://api.xiaomimimo.com/v1",
+        "docsUrl": "https://www.mimo-v2.com/zh/docs/quick-start/first-api-call",
         "authScheme": "bearer",
         "apiFormat": "openai_chat",
         "models": {
@@ -131,6 +135,7 @@ BUILTIN_PRESETS = [
         "id": "xiaomi-mimo-token-plan",
         "name": "Xiaomi MiMo (Token Plan)",
         "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
+        "docsUrl": "https://www.mimo-v2.com/zh/docs/quick-start/first-api-call",
         "authScheme": "bearer",
         "apiFormat": "openai_chat",
         "baseUrlOptions": [
@@ -160,6 +165,7 @@ BUILTIN_PRESETS = [
         "id": "zhipu",
         "name": "智谱 GLM",
         "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+        "docsUrl": "https://docs.bigmodel.cn/cn/guide/develop/openai/introduction",
         "authScheme": "bearer",
         "apiFormat": "openai_chat",
         "models": {
@@ -174,6 +180,7 @@ BUILTIN_PRESETS = [
         "id": "bailian",
         "name": "阿里云百炼",
         "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "docsUrl": "https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope",
         "authScheme": "bearer",
         "apiFormat": "openai_chat",
         "models": {

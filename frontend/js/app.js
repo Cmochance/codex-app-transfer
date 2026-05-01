@@ -746,6 +746,23 @@
     return payload;
   }
 
+  function findDocsUrlForProvider(provider) {
+    if (!presetCache.length) return null;
+    const stripSlash = (s) => String(s || "").replace(/\/+$/, "");
+    const target = stripSlash(provider.baseUrl);
+    const providerId = String(provider.id || "");
+    for (const preset of presetCache) {
+      const candidates = new Set([stripSlash(preset.baseUrl)]);
+      for (const opt of (preset.baseUrlOptions || [])) {
+        if (opt && opt.value) candidates.add(stripSlash(opt.value));
+      }
+      if (preset.id === providerId || (target && candidates.has(target))) {
+        return preset.docsUrl || null;
+      }
+    }
+    return null;
+  }
+
   function providerCardMarkup(provider) {
     const mapping = [
       provider.mappings.default,
@@ -761,15 +778,18 @@
     const providerId = escapeHtml(provider.id);
     const providerName = escapeHtml(provider.name);
     const providerUrl = escapeHtml(provider.baseUrl);
-    const providerHref = escapeHtml(safeHttpUrl(provider.baseUrl));
     const mappingText = escapeHtml(mapping || provider.apiFormat);
+    const docsUrl = findDocsUrlForProvider(provider);
+    const baseUrlMarkup = docsUrl
+      ? `<a class="truncate baseurl-docs-link" href="#" data-action="open-docs" data-docs-url="${escapeHtml(docsUrl)}" data-provider-name="${providerName}" title="${t("providers.openDocsHint")}">${providerUrl}<i class="bi bi-box-arrow-up-right baseurl-docs-icon"></i></a>`
+      : `<span class="truncate">${providerUrl}</span>`;
     return `
       <article class="provider-switch-card ${provider.default ? "active" : ""}" draggable="true" data-provider-id="${providerId}">
         <span class="drag-handle"><i class="bi bi-grip-vertical"></i></span>
         <span class="provider-logo">${iconMarkup(provider)}</span>
         <span class="provider-main">
           <strong>${providerName}</strong>
-          <a class="truncate" href="${providerHref}" target="_blank" rel="noreferrer">${providerUrl}</a>
+          ${baseUrlMarkup}
         </span>
         <span class="provider-meta truncate">${mappingText}</span>
         <span class="provider-actions">
@@ -887,17 +907,16 @@
     const target = $(targetSelector);
     if (!target) return;
     const providers = await CCApi.getProviders();
+    if (!presetCache.length) presetCache = await CCApi.getPresets();
     const providerList = providers.length
       ? `<div class="provider-configured-list" data-provider-list>${providers.map(providerCardMarkup).join("")}</div>`
       : "";
     if (!providers.length) {
-      const presets = await CCApi.getPresets();
-      target.innerHTML = `<div class="provider-preset-grid">${presets.map((preset) => providerPresetCardMarkup(preset)).join("")}</div>`;
+      target.innerHTML = `<div class="provider-preset-grid">${presetCache.map((preset) => providerPresetCardMarkup(preset)).join("")}</div>`;
       return;
     }
     if (options.includePresets) {
-      const presets = await CCApi.getPresets();
-      target.innerHTML = `${providerList}${dashboardPresetSectionMarkup(providers, presets)}`;
+      target.innerHTML = `${providerList}${dashboardPresetSectionMarkup(providers, presetCache)}`;
     } else {
       target.innerHTML = providerList;
     }
@@ -1502,6 +1521,17 @@
       if (action === "copy-url") {
         await navigator.clipboard.writeText(actionEl.dataset.url || "");
         showToast(t("toast.copied"));
+      }
+
+      if (action === "open-docs") {
+        event.preventDefault();
+        const url = actionEl.dataset.docsUrl;
+        const name = actionEl.dataset.providerName || "";
+        if (!url) return;
+        const message = t("confirm.openDocs").replace("{provider}", name);
+        if (window.confirm(message)) {
+          window.open(url, "_blank", "noopener,noreferrer");
+        }
       }
 
       if (action === "test-provider") {

@@ -98,6 +98,7 @@
       "providers.usage": "余额/用量",
       "providers.usageQuerying": "查询中...",
       "providers.usageUnavailable": "暂未识别到余额/用量",
+      "providers.openDocsHint": "点击打开官方文档",
       "providers.empty": "还没有提供商，先从预设添加一个。",
       "providers.keyPlaceholder": "sk-...",
       "providers.keySavedPlaceholder": "已填入，可点眼睛查看",
@@ -261,6 +262,7 @@
       "confirm.configImport": "导入配置会覆盖当前提供商和设置，系统会先自动备份现有配置。确认继续？",
       "confirm.providerApplyDesktop": "即将保存当前供应商和模型映射，并生成 Codex CLI 环境变量配置，同时启动转发服务。确认继续？",
       "confirm.installUpdate": "将自动下载安装包。下载完成后，当前应用会自动退出并启动安装器。确认继续？",
+      "confirm.openDocs": "即将在浏览器打开 {provider} 的官方文档页面。继续？",
     },
     en: {
       "nav.dashboard": "Dashboard",
@@ -359,6 +361,7 @@
       "providers.usage": "Balance / Usage",
       "providers.usageQuerying": "Querying...",
       "providers.usageUnavailable": "Balance or usage not found",
+      "providers.openDocsHint": "Click to open official docs",
       "providers.empty": "No provider yet. Add one from presets.",
       "providers.keyPlaceholder": "sk-...",
       "providers.keySavedPlaceholder": "Saved. Use the eye button to view it.",
@@ -529,6 +532,7 @@
       "confirm.configImport": "Importing config will replace current providers and settings. A backup will be created first. Continue?",
       "confirm.providerApplyDesktop": "This will save the provider and model mapping, generate Codex CLI environment config, and start the forwarding service. Continue?",
       "confirm.installUpdate": "This will download the installer. After the download finishes, the app will quit automatically and start the installer. Continue?",
+      "confirm.openDocs": "Open {provider}'s official docs in the browser?",
     },
   };
 
