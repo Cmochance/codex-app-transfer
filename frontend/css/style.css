@@ -1143,8 +1143,8 @@ label[for],
 
 .log-line {
   display: grid;
-  grid-template-columns: 220px 86px 1fr;
-  gap: 16px;
+  grid-template-columns: 96px 86px 1fr;
+  gap: 12px;
   white-space: nowrap;
 }
 

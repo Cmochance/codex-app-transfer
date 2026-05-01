@@ -1169,6 +1169,21 @@
 
   let proxyLogTimer = null;
   let proxyLogInflight = false;
+  let proxyLogAtBottom = true;
+  const PROXY_LOG_BOTTOM_TOLERANCE = 8;
+
+  function isProxyLogAtBottom(el) {
+    return el.scrollTop + el.clientHeight >= el.scrollHeight - PROXY_LOG_BOTTOM_TOLERANCE;
+  }
+
+  function bindProxyLogScroll() {
+    const logEl = $("#proxyLog");
+    if (!logEl || logEl.dataset.scrollBound === "1") return;
+    logEl.dataset.scrollBound = "1";
+    logEl.addEventListener("scroll", () => {
+      proxyLogAtBottom = isProxyLogAtBottom(logEl);
+    }, { passive: true });
+  }
 
   async function refreshProxyLog() {
     if (proxyLogInflight) return;
@@ -1180,10 +1195,19 @@
         CCApi.getProxyStatus(),
         CCApi.getProxyLogs(),
       ]);
+      const wasAtBottom = proxyLogAtBottom;
+      const prevScrollTop = logEl.scrollTop;
       logEl.innerHTML = logs.map((line) => `
         <div class="log-line"><span>${escapeHtml(line.at)}</span><span class="log-level ${escapeHtml(line.level)}">${escapeHtml(line.level.toUpperCase())}</span><span>${escapeHtml(line.message)}</span></div>
       `).join("");
-      if ($("#autoScroll")?.checked) logEl.scrollTop = logEl.scrollHeight;
+      const userToggleOn = $("#autoScroll")?.checked !== false;
+      if (userToggleOn && wasAtBottom) {
+        logEl.scrollTop = logEl.scrollHeight;
+        proxyLogAtBottom = true;
+      } else {
+        logEl.scrollTop = prevScrollTop;
+        proxyLogAtBottom = isProxyLogAtBottom(logEl);
+      }
       const statsEl = $("#proxyStats");
       if (statsEl) {
         const stats = [
@@ -1208,6 +1232,7 @@
       clearInterval(proxyLogTimer);
       proxyLogTimer = null;
     }
+    proxyLogAtBottom = true;
   }
 
   function startProxyLogAutoRefresh() {
@@ -1223,6 +1248,8 @@
     $("#proxyPort").value = status.proxyPort;
     $("#settingsProxyPort").value = status.proxyPort;
     $("#proxyStateText").textContent = status.proxyRunning ? t("status.running") : t("status.stopped");
+    bindProxyLogScroll();
+    proxyLogAtBottom = true;
     await refreshProxyLog();
     startProxyLogAutoRefresh();
   }
