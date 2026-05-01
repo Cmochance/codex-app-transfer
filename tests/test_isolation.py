@@ -587,6 +587,150 @@ test_codex_snapshot_restore()
 
 
 # ============================================================================
+# 7. 启动时按 active provider 自动 apply（含 requiresProxy 启动 proxy）
+# ============================================================================
+print("\n" + "=" * 60)
+print("7. 启动时自动 apply active provider")
+print("=" * 60)
+
+
+def test_startup_auto_apply():
+    import json as _json
+    import tempfile
+    from backend import registry as _registry
+    from backend import config as _cfg
+    import backend.main as _bm
+
+    # 完全隔离环境：CONFIG_DIR / CODEX_HOME / 快照目录都重定向到 tempdir
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_app_dir = os.path.join(tmp, ".codex-app-transfer")
+        fake_codex = os.path.join(tmp, ".codex")
+        fake_snap = os.path.join(fake_app_dir, "codex-snapshot")
+        fake_lib = os.path.join(fake_app_dir, "library")
+        os.makedirs(fake_codex, exist_ok=True)
+        os.makedirs(fake_app_dir, exist_ok=True)
+        os.makedirs(fake_lib, exist_ok=True)
+
+        old_cfg_dir = _cfg.CONFIG_DIR
+        old_cfg_path = _cfg.CONFIG_FILE
+        old_lib_dir = _cfg.LIBRARY_DIR
+        old_codex = (
+            _registry.CODEX_HOME, _registry.CODEX_CONFIG_PATH, _registry.CODEX_AUTH_PATH,
+            _registry.CAS_SNAPSHOT_DIR, _registry.CAS_SNAPSHOT_CONFIG,
+            _registry.CAS_SNAPSHOT_AUTH, _registry.CAS_SNAPSHOT_MANIFEST,
+        )
+
+        _cfg.CONFIG_DIR = fake_app_dir
+        _cfg.CONFIG_FILE = os.path.join(fake_app_dir, "config.json")
+        _cfg.LIBRARY_DIR = fake_lib
+
+        _registry.CODEX_HOME = fake_codex
+        _registry.CODEX_CONFIG_PATH = os.path.join(fake_codex, "config.toml")
+        _registry.CODEX_AUTH_PATH = os.path.join(fake_codex, "auth.json")
+        _registry.CAS_SNAPSHOT_DIR = fake_snap
+        _registry.CAS_SNAPSHOT_CONFIG = os.path.join(fake_snap, "config.toml")
+        _registry.CAS_SNAPSHOT_AUTH = os.path.join(fake_snap, "auth.json")
+        _registry.CAS_SNAPSHOT_MANIFEST = os.path.join(fake_snap, "manifest.json")
+
+        try:
+            with open(_registry.CODEX_AUTH_PATH, "w") as f:
+                _json.dump({"auth_mode": "chatgpt", "tokens": {"id": "abc"}}, f)
+
+            # 1) 真正空 provider 列表 → 跳过,不建快照
+            _cfg.save_config({
+                "version": _cfg.APP_VERSION,
+                "activeProvider": None,
+                "providers": [],
+                "settings": _cfg.DEFAULT_CONFIG["settings"].copy(),
+            })
+            result = _bm.auto_apply_active_provider_on_startup()
+            assert result["applied"] is False, f"无 provider 时应跳过, got: {result}"
+            assert not _registry.has_snapshot()
+            ok("startup auto-apply: 无 provider 时正确跳过")
+
+            # 2) Responses 兼容 provider → apply 但不起 proxy
+            _cfg.save_config({
+                "version": _cfg.APP_VERSION,
+                "activeProvider": "kimi-test",
+                "providers": [{
+                    "id": "kimi-test", "name": "Kimi Test",
+                    "baseUrl": "https://api.moonshot.cn/anthropic",
+                    "apiFormat": "responses",
+                    "apiKey": "sk-kimi",
+                    "models": {"sonnet": "kimi-k1", "haiku": "kimi-k1", "opus": "kimi-k1"},
+                }],
+                "settings": _cfg.DEFAULT_CONFIG["settings"].copy(),
+            })
+            if _bm._proxy_running:
+                _bm._stop_proxy_server()
+
+            result = _bm.auto_apply_active_provider_on_startup()
+            assert result["applied"] is True
+            assert result["requiresProxy"] is False
+            assert result["proxyStarted"] is False
+            assert _registry.has_snapshot()
+            ok("startup auto-apply: responses 路径写入但不起 proxy")
+
+            applied_cfg = open(_registry.CODEX_CONFIG_PATH).read()
+            assert 'api.moonshot.cn' in applied_cfg
+            ok("startup auto-apply: responses 路径写入真实 baseUrl 直连地址")
+
+            # 3) OpenAI Chat 类需要转发 → apply 同时起 proxy
+            _registry.restore_codex_state()
+            with open(_registry.CODEX_AUTH_PATH, "w") as f:
+                _json.dump({"auth_mode": "chatgpt", "tokens": {"id": "abc"}}, f)
+
+            _cfg.save_config({
+                "version": _cfg.APP_VERSION,
+                "activeProvider": "ds-test",
+                "providers": [{
+                    "id": "ds-test", "name": "DeepSeek Test",
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "apiFormat": "openai_chat",
+                    "apiKey": "sk-deepseek",
+                    "models": {"sonnet": "deepseek-v4-pro", "haiku": "deepseek-v4-flash", "opus": "deepseek-v4-pro"},
+                }],
+                "settings": dict(_cfg.DEFAULT_CONFIG["settings"], proxyPort=29291),
+            })
+            if _bm._proxy_running:
+                _bm._stop_proxy_server()
+
+            result = _bm.auto_apply_active_provider_on_startup()
+            assert result["applied"] is True
+            assert result["requiresProxy"] is True
+            assert result["proxyStarted"] is True, f"应已启动 proxy: {result}"
+            ok("startup auto-apply: openai_chat 路径触发 proxy 启动")
+
+            applied_cfg2 = open(_registry.CODEX_CONFIG_PATH).read()
+            assert '127.0.0.1' in applied_cfg2
+            ok("startup auto-apply: openai_chat 路径写入网关地址")
+
+            # 4) maybe_stop_proxy_for_provider：切到不需转发的 provider 应能识别
+            kimi_provider = {
+                "id": "kimi-test", "name": "Kimi Test",
+                "baseUrl": "https://api.moonshot.cn/anthropic",
+                "apiFormat": "responses",
+            }
+            # 注意 _proxy_running 状态依赖于线程,这里只验证函数能正确判断 requiresProxy=False
+            stopped = _bm.maybe_stop_proxy_for_provider(kimi_provider)
+            ok(f"maybe_stop_proxy_for_provider on responses provider → stopped={stopped}")
+
+            # 收尾
+            if _bm._proxy_running:
+                _bm._stop_proxy_server()
+        finally:
+            _cfg.CONFIG_DIR = old_cfg_dir
+            _cfg.CONFIG_FILE = old_cfg_path
+            _cfg.LIBRARY_DIR = old_lib_dir
+            (_registry.CODEX_HOME, _registry.CODEX_CONFIG_PATH, _registry.CODEX_AUTH_PATH,
+             _registry.CAS_SNAPSHOT_DIR, _registry.CAS_SNAPSHOT_CONFIG,
+             _registry.CAS_SNAPSHOT_AUTH, _registry.CAS_SNAPSHOT_MANIFEST) = old_codex
+
+
+test_startup_auto_apply()
+
+
+# ============================================================================
 # 总结
 # ============================================================================
 print("\n" + "=" * 60)

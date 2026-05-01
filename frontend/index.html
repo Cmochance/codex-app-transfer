@@ -324,9 +324,12 @@
             <strong data-i18n="settings.adminPort">管理端口</strong>
             <input class="form-control form-control-lg" type="number" id="settingsAdminPort" value="18081">
           </div>
-          <div class="settings-row">
-            <strong data-i18n="settings.autoStart">开机自启</strong>
-            <label class="switch-label only-switch"><input type="checkbox" id="autoStart" checked><span class="switch-ui"></span></label>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.autoApplyOnStart">启动时自动应用配置</strong>
+            <div>
+              <label class="switch-label only-switch"><input type="checkbox" id="autoApplyOnStart" checked><span class="switch-ui"></span></label>
+              <p class="settings-note" data-i18n="settings.autoApplyOnStartHint">启动时自动应用当前提供商的 Codex 配置；如该提供商需要转发服务，会同时启动转发。关闭则需要手动点「应用配置」。</p>
+            </div>
           </div>
           <div class="settings-row settings-row-stack">
             <strong data-i18n="settings.restoreCodexOnExit">退出时还原 Codex 原配置</strong>

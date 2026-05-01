@@ -1262,7 +1262,7 @@
     applyTheme(settings.theme || "default");
     $("#settingsProxyPort").value = settings.proxyPort;
     $("#settingsAdminPort").value = settings.adminPort;
-    $("#autoStart").checked = settings.autoStart;
+    $("#autoApplyOnStart").checked = settings.autoApplyOnStart !== false;
     $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
@@ -1333,7 +1333,7 @@
       theme: currentTheme,
       proxyPort: Number($("#settingsProxyPort").value),
       adminPort: Number($("#settingsAdminPort").value),
-      autoStart: $("#autoStart").checked,
+      autoApplyOnStart: $("#autoApplyOnStart")?.checked !== false,
       exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
@@ -1959,7 +1959,7 @@
     $("#settingsProxyPort").addEventListener("change", saveSettingsFromForm);
     $("#settingsAdminPort").addEventListener("change", saveSettingsFromForm);
     $("#settingsUpdateUrl").addEventListener("change", saveSettingsFromForm);
-    $("#autoStart").addEventListener("change", saveSettingsFromForm);
+    $("#autoApplyOnStart")?.addEventListener("change", saveSettingsFromForm);
     $("#exposeAllProviderModels").addEventListener("change", saveSettingsFromForm);
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#configImportFile")?.addEventListener("change", (event) => {

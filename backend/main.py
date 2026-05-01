@@ -229,13 +229,21 @@ def _desktop_health(
 
 
 def _sync_desktop_for_active_provider() -> dict:
-    """默认 provider 切换后，同步本工具管理的 Codex CLI 模型列表。"""
+    """默认 provider 切换后，同步本工具管理的 Codex CLI 模型列表 + 按需启停转发。"""
     provider = cfg.get_active_provider()
     if not provider:
         return {"attempted": False, "success": False, "message": "没有默认提供商"}
 
     settings = cfg.get_settings()
     target = desktop_config_target_for_provider(provider, settings)
+
+    # 转发服务状态跟新 provider 对齐：需要转发就起,不需要就停
+    if target.get("requiresProxy"):
+        _start_proxy_server(settings.get("proxyPort", 18080))
+    else:
+        if _proxy_running:
+            _stop_proxy_server()
+
     result = registry.apply_config(
         target["baseUrl"],
         gateway_api_key=target["apiKey"],
@@ -251,6 +259,70 @@ def _sync_desktop_for_active_provider() -> dict:
         "requiresProxy": target["requiresProxy"],
         **result,
     }
+
+
+def auto_apply_active_provider_on_startup() -> dict:
+    """启动时按 active provider 写入 ~/.codex/ 并按需起转发服务。
+
+    供 main.py 启动序列调用。任何异常都吞掉、记日志,不阻塞应用启动。
+
+    返回 {applied, requiresProxy, proxyStarted, message} 供日志输出。
+    """
+    try:
+        provider = cfg.get_active_provider()
+        if not provider:
+            return {"applied": False, "requiresProxy": False, "proxyStarted": False,
+                    "message": "no active provider; skip"}
+
+        settings = cfg.get_settings()
+        target = desktop_config_target_for_provider(provider, settings)
+        proxy_started = False
+        if target.get("requiresProxy"):
+            proxy_started = _start_proxy_server(settings.get("proxyPort", 18080))
+
+        registry.apply_config(
+            target["baseUrl"],
+            gateway_api_key=target["apiKey"],
+            provider=target["provider"],
+            providers=target["providers"],
+            expose_all=target["exposeAll"],
+            auth_scheme=target["authScheme"],
+            gateway_headers=target["gatewayHeaders"],
+        )
+        return {
+            "applied": True,
+            "requiresProxy": bool(target.get("requiresProxy")),
+            "proxyStarted": bool(proxy_started),
+            "message": f"applied {provider.get('name', provider.get('id'))}",
+        }
+    except Exception as exc:  # 启动阶段任何错误都不阻塞应用打开
+        return {"applied": False, "requiresProxy": False, "proxyStarted": False,
+                "message": f"failed: {exc}"}
+
+
+def maybe_stop_proxy_for_provider(provider: Optional[dict]) -> bool:
+    """切 provider 后,如果新 provider 不需要转发,把 proxy stop 掉避免空跑。
+
+    返回是否真的执行了 stop。
+    """
+    if not provider:
+        return False
+    settings = cfg.get_settings()
+    target = desktop_config_target_for_provider(provider, settings)
+    if target.get("requiresProxy"):
+        return False
+    if not _proxy_running:
+        return False
+    _stop_proxy_server()
+    return True
+
+
+def stop_proxy_if_running() -> bool:
+    """供 main.py atexit 钩子调用。已停 / 未启动时是 no-op。"""
+    if not _proxy_running:
+        return False
+    _stop_proxy_server()
+    return True
 
 
 def _provider_test_model(provider: dict) -> str:

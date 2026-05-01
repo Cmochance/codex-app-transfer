@@ -31,6 +31,7 @@ DEFAULT_CONFIG = {
         "proxyPort": 18080,
         "adminPort": 18081,
         "autoStart": False,
+        "autoApplyOnStart": True,
         "exposeAllProviderModels": False,
         "restoreCodexOnExit": True,
         "updateUrl": DEFAULT_UPDATE_URL,

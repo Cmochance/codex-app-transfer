@@ -16,9 +16,12 @@ from urllib.request import urlopen
 import uvicorn
 
 from backend.main import (
+    auto_apply_active_provider_on_startup,
     create_admin_app,
     desktop_config_target_for_provider,
+    maybe_stop_proxy_for_provider,
     register_update_quit_handler,
+    stop_proxy_if_running,
     _start_proxy_server,
     _stop_proxy_server,
 )
@@ -97,6 +100,38 @@ def restore_codex_if_enabled(reason: str = "exit") -> bool:
     except Exception as exc:
         safe_print(f"[{reason}] restore codex state failed: {exc}")
         return False
+
+
+def on_app_exit_cleanup(reason: str = "exit"):
+    """退出时综合清理：先停转发服务（无条件，避免端口残留），再按设置还原 Codex 配置。
+
+    所有失败都吞掉,确保 atexit 钩子链不会因为其中一项异常而中断后续清理。
+    """
+    try:
+        if stop_proxy_if_running():
+            safe_print(f"[{reason}] proxy server stopped")
+    except Exception as exc:
+        safe_print(f"[{reason}] stop proxy failed: {exc}")
+
+    restore_codex_if_enabled(reason=reason)
+
+
+def auto_apply_on_startup_if_enabled():
+    """启动序列：根据 autoApplyOnStart 决定是否自动写入 ~/.codex/ 并按需起转发。"""
+    try:
+        if not cfg.get_settings().get("autoApplyOnStart", True):
+            return
+        result = auto_apply_active_provider_on_startup()
+        if result.get("applied"):
+            extras = []
+            if result.get("requiresProxy"):
+                extras.append("proxy started" if result.get("proxyStarted") else "proxy already running")
+            tail = f" ({'; '.join(extras)})" if extras else ""
+            safe_print(f"[startup] auto-apply: {result.get('message', '')}{tail}")
+        elif result.get("message"):
+            safe_print(f"[startup] auto-apply skipped: {result.get('message')}")
+    except Exception as exc:
+        safe_print(f"[startup] auto-apply failed: {exc}")
 
 
 def parse_args():
@@ -343,6 +378,9 @@ class DesktopTrayController:
                 )
                 if target.get("requiresProxy"):
                     _start_proxy_server(settings.get("proxyPort", 18080))
+                else:
+                    # 切到不需要转发的 provider 时主动停 proxy,避免空跑占端口
+                    maybe_stop_proxy_for_provider(provider)
                 desktop_synced = bool(result.get("success"))
                 desktop_message = "，Codex CLI 配置已同步，重启终端后生效" if result.get("success") else "，请重新一键生成 Codex CLI 配置"
         except Exception as exc:
@@ -515,14 +553,17 @@ def run_browser_mode(admin_app, admin_port: int, open_ui: bool = True):
 ╚══════════════════════════════════════════╝
     """)
 
-    uvicorn.run(
-        admin_app,
-        host="127.0.0.1",
-        port=admin_port,
-        log_level="warning",
-        access_log=False,
-        log_config=None,
-    )
+    try:
+        uvicorn.run(
+            admin_app,
+            host="127.0.0.1",
+            port=admin_port,
+            log_level="warning",
+            access_log=False,
+            log_config=None,
+        )
+    finally:
+        on_app_exit_cleanup(reason="browser-finally")
 
 
 def run_desktop_mode(admin_app, admin_port: int):
@@ -543,8 +584,7 @@ def run_desktop_mode(admin_app, admin_port: int):
                 time.sleep(0.5)
     finally:
         server.should_exit = True
-        _stop_proxy_server()
-        restore_codex_if_enabled(reason="desktop-finally")
+        on_app_exit_cleanup(reason="desktop-finally")
 
 
 def main():
@@ -557,20 +597,18 @@ def main():
     # 设置开关开启时静默还原一次,保证「不开应用 → ~/.codex/ 即原配置」语义。
     restore_codex_if_enabled(reason="startup")
 
-    # 注册退出钩子（B2）：覆盖正常退出路径（托盘退出、Ctrl+C、窗口关闭、
-    # webview.start 返回等）。SIGKILL 走不到这里,由下次启动 startup 钩子兜底。
-    atexit.register(restore_codex_if_enabled, "atexit")
+    # 启动时根据 active provider 自动 apply（受 autoApplyOnStart 控制,默认 True）：
+    # 写入 ~/.codex/、按需起转发服务,保证用户开应用即用,无需手点「应用配置」。
+    auto_apply_on_startup_if_enabled()
+
+    # 注册退出钩子：覆盖正常退出路径（托盘退出、Ctrl+C、窗口关闭、webview.start
+    # 返回等）。SIGKILL 走不到这里,由下次启动 startup 钩子兜底。综合 cleanup 包含：
+    # 停转发服务（无条件） + 还原 Codex 配置（受 restoreCodexOnExit 控制）。
+    atexit.register(on_app_exit_cleanup, "atexit")
 
     # 读取设置
     settings = cfg.get_settings()
     admin_port = args.port or settings.get("adminPort", 18081)
-    proxy_port = settings.get("proxyPort", 18080)
-    auto_start_proxy = settings.get("autoStart", False)
-
-    # 如果开启了自动启动代理
-    if auto_start_proxy:
-        safe_print(f"  自动启动代理 (端口 {proxy_port})...")
-        _start_proxy_server(proxy_port)
 
     # 创建管理后台应用
     admin_app = create_admin_app()
