@@ -126,21 +126,7 @@
                   <button type="button" class="input-icon" data-action="toggle-key" aria-label="toggle api key"><i class="bi bi-eye"></i></button>
                 </div>
               </div>
-              <div class="mb-4">
-                <label class="form-label required" for="providerAuth">Auth Scheme</label>
-                <input id="providerAuth" name="authScheme" type="hidden" value="bearer">
-                <div class="auth-scheme-menu-wrap" id="providerAuthControl">
-                  <button class="form-select form-select-lg auth-scheme-trigger" id="providerAuthTrigger" type="button" data-action="toggle-auth-scheme-menu" aria-haspopup="listbox" aria-expanded="false">
-                    <span>bearer</span>
-                    <i class="bi bi-chevron-down"></i>
-                  </button>
-                  <div class="auth-scheme-menu" id="providerAuthMenu" role="listbox" aria-labelledby="providerAuthTrigger">
-                    <button class="auth-scheme-option selected" type="button" role="option" data-action="select-auth-scheme" data-value="bearer" aria-selected="true"><span>bearer</span><i class="bi bi-check2"></i></button>
-                    <button class="auth-scheme-option" type="button" role="option" data-action="select-auth-scheme" data-value="x-api-key" aria-selected="false"><span>x-api-key</span></button>
-                    <button class="auth-scheme-option" type="button" role="option" data-action="select-auth-scheme" data-value="none" aria-selected="false"><span>none</span></button>
-                  </div>
-                </div>
-              </div>
+              <input id="providerAuth" name="authScheme" type="hidden" value="bearer">
               <details class="advanced-provider-options" open>
                 <summary><i class="bi bi-sliders"></i><span data-i18n="providersAdd.compatTitle">高级：第三方兼容接口</span><i class="bi bi-chevron-down compat-chevron"></i></summary>
                 <p data-i18n="providersAdd.compatHint">默认使用 Responses 兼容接口。OpenAI Chat 属于实验适配，建议确认工具调用可用后再用于 Claude Code。</p>
@@ -497,6 +483,11 @@
               <i class="bi bi-arrow-clockwise"></i>
               <h3 data-i18n="guide.tsRestartTitle">模型菜单不刷新?</h3>
               <p data-i18n="guide.tsRestartText">Codex CLI 只在启动时读 <code>~/.codex/</code> 配置。切换 provider 后必须 <strong>关闭并重新打开终端</strong>,新终端才会用新映射。</p>
+            </div>
+            <div class="guide-card guide-card-static">
+              <i class="bi bi-speedometer2"></i>
+              <h3 data-i18n="guide.tsSpeedTitle">测速 / 兼容性失败?</h3>
+              <p data-i18n="guide.tsSpeedText">如果测速失败,可能是默认选择了 <strong>responses</strong> 协议。编辑该 provider,将 API 协议切到 <strong>chat/completions</strong> 后重新测试。Kimi / DeepSeek / 智谱 / 百炼 / Xiaomi MiMo 官方接口都用 chat/completions。</p>
             </div>
           </div>
         </section>

@@ -24,7 +24,6 @@
   let openProviderSlotMenuIndex = null;
   let openProviderModelMenuKey = null;
   let baseUrlMenuOpen = false;
-  let authSchemeMenuOpen = false;
   let editingProviderId = null;
   let deleteModal = null;
   let restartReminderModal = null;
@@ -659,42 +658,10 @@
     renderProviderMappings();
   }
 
-  function renderAuthSchemeControl() {
-    const input = $("#providerAuth");
-    const trigger = $("#providerAuthTrigger");
-    const menu = $("#providerAuthMenu");
-    const wrap = $("#providerAuthControl");
-    if (!input || !trigger || !menu || !wrap) return;
-    const value = providerAuthSchemes.includes(input.value) ? input.value : "bearer";
-    input.value = value;
-    $("span", trigger).textContent = value;
-    trigger.setAttribute("aria-expanded", authSchemeMenuOpen ? "true" : "false");
-    wrap.classList.toggle("open", authSchemeMenuOpen);
-    menu.innerHTML = providerAuthSchemes.map((item) => `
-      <button class="auth-scheme-option ${item === value ? "selected" : ""}" type="button" role="option" data-action="select-auth-scheme" data-value="${escapeHtml(item)}" aria-selected="${item === value ? "true" : "false"}">
-        <span>${escapeHtml(item)}</span>
-        ${item === value ? '<i class="bi bi-check2"></i>' : ""}
-      </button>
-    `).join("");
-  }
-
   function setAuthSchemeValue(value) {
     const input = $("#providerAuth");
     if (!input) return;
     input.value = providerAuthSchemes.includes(value) ? value : "bearer";
-    authSchemeMenuOpen = false;
-    renderAuthSchemeControl();
-  }
-
-  function toggleAuthSchemeMenu() {
-    authSchemeMenuOpen = !authSchemeMenuOpen;
-    renderAuthSchemeControl();
-  }
-
-  function closeAuthSchemeMenu() {
-    if (!authSchemeMenuOpen) return;
-    authSchemeMenuOpen = false;
-    renderAuthSchemeControl();
   }
 
   function renderPresetOptions(preset = null, mappings = null) {
@@ -1029,7 +996,6 @@
     renderBaseUrlOptions(null);
     setApiKeyInputState(false);
     $("#providerAuth").value = "bearer";
-    renderAuthSchemeControl();
     setFormApiFormat("responses");
     setProviderMappings(emptyMappings());
     setUnverifiedBanner(false);
@@ -1641,14 +1607,6 @@
         }
       }
 
-      if (action === "toggle-auth-scheme-menu") {
-        toggleAuthSchemeMenu();
-      }
-
-      if (action === "select-auth-scheme") {
-        setAuthSchemeValue(actionEl.dataset.value);
-      }
-
       if (action === "delete-provider") {
         pendingDeleteId = actionEl.dataset.id;
         deleteModal.show();
@@ -2044,9 +2002,6 @@
       if (!event.target.closest(".provider-model-input-wrap")) {
         closeProviderModelMenu();
       }
-      if (!event.target.closest(".auth-scheme-menu-wrap")) {
-        closeAuthSchemeMenu();
-      }
       const langButton = event.target.closest("[data-lang]");
       if (langButton) CCI18n.apply(langButton.dataset.lang);
       const addLink = event.target.closest("a[href='#providers/add']");
@@ -2106,7 +2061,6 @@
         closeBaseUrlMenu();
         closeProviderSlotMenu();
         closeProviderModelMenu();
-        closeAuthSchemeMenu();
       }
     });
 
