@@ -12,6 +12,7 @@
   <body>
     <header class="app-header">
       <div class="header-actions-left">
+        <button class="btn btn-outline-primary btn-sm dashboard-feedback-button" type="button" data-action="open-feedback"><i class="bi bi-chat-dots"></i><span data-i18n="dashboard.feedback">反馈</span></button>
         <button class="btn btn-outline-danger btn-sm dashboard-clear-button" type="button" data-action="clear-desktop"><i class="bi bi-arrow-counterclockwise"></i><span data-i18n="dashboard.clearDesktopConfig">还原 Codex 原配置</span></button>
       </div>
       <nav class="route-tabs" aria-label="Primary navigation">
@@ -370,6 +371,15 @@
               <p class="settings-note" data-i18n="settings.configBackupHint">导出的配置会包含 API Key，请只保存在可信设备上。</p>
             </div>
           </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.feedback">反馈与建议</strong>
+            <div>
+              <div class="settings-actions">
+                <button class="btn btn-outline-primary btn-sm" type="button" data-action="open-feedback"><i class="bi bi-chat-dots"></i><span data-i18n="settings.feedbackOpen">打开反馈窗口</span></button>
+              </div>
+              <p class="settings-note" data-i18n="settings.feedbackHint">遇到问题或想提建议?支持文本 + 截图 + 日志,匿名提交,无需登录。诊断信息(应用版本 / OS / 当前 provider 名称 / 最近 200 行代理日志)默认附上,不含 API Key 等敏感数据。</p>
+            </div>
+          </div>
         </article>
 
         <article class="panel about-panel">
@@ -420,6 +430,45 @@
           <div class="modal-footer restart-modal-footer">
             <label class="restart-reminder-check"><input type="checkbox" id="restartReminderDontShow"><span data-i18n="restartReminder.dontShow">不再提醒</span></label>
             <button type="button" class="btn btn-primary" id="restartReminderAck" data-i18n="restartReminder.ack">我已知晓</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal fade" id="feedbackModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" data-i18n="feedback.title">反馈与建议</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <p class="settings-note" data-i18n="feedback.intro">欢迎反馈使用问题或改进建议。提交内容会发送到开发者维护的私有存储,不会公开。</p>
+            <div class="form-group">
+              <label for="feedbackTitle" data-i18n="feedback.titleLabel">标题(选填)</label>
+              <input class="form-control" type="text" id="feedbackTitle" maxlength="100" data-i18n-attr="placeholder|feedback.titlePlaceholder" placeholder="一句话概括问题">
+            </div>
+            <div class="form-group">
+              <label for="feedbackBody" data-i18n="feedback.bodyLabel">详细描述 *</label>
+              <textarea class="form-control" id="feedbackBody" rows="6" maxlength="10000" data-i18n-attr="placeholder|feedback.bodyPlaceholder" placeholder="请尽量描述清楚:发生了什么,你期望的是什么,如何复现"></textarea>
+            </div>
+            <div class="form-group">
+              <label data-i18n="feedback.attachmentsLabel">附件(选填,可多个,单文件最大 5MB)</label>
+              <div class="feedback-dropzone" id="feedbackDropzone">
+                <input type="file" id="feedbackFiles" multiple accept="image/*,.log,.txt,.json" hidden>
+                <p class="feedback-dropzone-hint" data-i18n="feedback.attachmentsHint">点击选择文件 / 直接拖拽到此处 / Cmd+V 粘贴截图</p>
+                <ul class="feedback-attachment-list" id="feedbackAttachmentList"></ul>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="switch-label"><input type="checkbox" id="feedbackIncludeDiagnostics" checked><span class="switch-ui"></span><strong data-i18n="feedback.includeDiagnostics">附加诊断信息(默认开启,推荐)</strong></label>
+              <p class="settings-note" data-i18n="feedback.includeDiagnosticsHint">应用版本 / OS / 当前 provider 名称 / 最近 200 行代理日志。**不含 API Key、provider URL 等敏感数据**。</p>
+            </div>
+            <p class="settings-note feedback-warning" data-i18n="feedback.privacyWarning">⚠ 截图请检查是否含 API Key、个人信息等敏感内容。</p>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" data-i18n="common.cancel">取消</button>
+            <button type="button" class="btn btn-primary" id="feedbackSubmitBtn" data-i18n="feedback.submit">提交反馈</button>
           </div>
         </div>
       </div>

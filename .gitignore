@@ -78,3 +78,8 @@ backend/provider_workarounds.py
 backend/response_id_codec.py
 backend/session_cache.py
 backend/deployment_affinity.py
+
+# Feedback Worker secrets / 本地缓存
+feedback-worker/.env
+feedback-worker/.wrangler/
+feedback-worker/node_modules/

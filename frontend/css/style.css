@@ -1889,12 +1889,82 @@ body {
   flex-shrink: 0;
 }
 
-.dashboard-clear-button {
+.dashboard-clear-button,
+.dashboard-feedback-button {
   min-height: 38px;
   padding-inline: 14px;
   border-radius: 12px;
   font-weight: 700;
   white-space: nowrap;
+}
+
+/* ── Feedback modal ─────────────────────────────────────── */
+.feedback-dropzone {
+  margin-top: 6px;
+  padding: 18px;
+  border: 1.5px dashed var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.feedback-dropzone:hover {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+}
+.feedback-dropzone.dragover {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+  border-style: solid;
+}
+.feedback-dropzone-hint {
+  margin: 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+.feedback-attachment-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.feedback-attachment-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--surface-2, var(--surface));
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.feedback-attachment-item span {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.feedback-attachment-item small {
+  color: var(--muted);
+}
+.feedback-attachment-item .btn-link {
+  color: var(--muted);
+  background: none;
+  border: none;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.feedback-attachment-item .btn-link:hover {
+  color: var(--danger, #c33);
+}
+.feedback-warning {
+  color: var(--danger, #c33);
+  margin-top: 12px;
 }
 
 .switch-board-head h1 {

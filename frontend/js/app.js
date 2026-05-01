@@ -1742,6 +1742,10 @@
         window.location.hash = "proxy";
       }
 
+      if (action === "open-feedback") {
+        openFeedbackModal();
+      }
+
       if (action === "toggle-model-menu-mode") {
         const settings = await CCApi.getSettings();
         const next = !settings.exposeAllProviderModels;
@@ -1851,6 +1855,172 @@
     if (!preset) return;
     editingProviderId = null;
     applyPresetToForm(preset);
+  }
+
+  // ── 用户反馈 modal ───────────────────────────────────────────────
+  let feedbackAttachments = [];  // [{name, size, file}]
+  let feedbackBsModal = null;
+
+  function openFeedbackModal() {
+    const el = $("#feedbackModal");
+    if (!el) return;
+    // 重置表单
+    $("#feedbackTitle").value = "";
+    $("#feedbackBody").value = "";
+    $("#feedbackIncludeDiagnostics").checked = true;
+    feedbackAttachments = [];
+    renderFeedbackAttachments();
+    if (!feedbackBsModal) feedbackBsModal = new bootstrap.Modal(el);
+    feedbackBsModal.show();
+  }
+
+  function renderFeedbackAttachments() {
+    const list = $("#feedbackAttachmentList");
+    if (!list) return;
+    list.innerHTML = feedbackAttachments
+      .map((a, i) => `<li class="feedback-attachment-item"><span>${escapeHtml(a.name)}</span><small>${formatBytes(a.size)}</small><button type="button" class="btn-link" data-idx="${i}">×</button></li>`)
+      .join("");
+    list.querySelectorAll("button[data-idx]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const idx = Number(btn.dataset.idx);
+        feedbackAttachments.splice(idx, 1);
+        renderFeedbackAttachments();
+      });
+    });
+  }
+
+  function addFeedbackFiles(files) {
+    if (!files || !files.length) return;
+    const max = 5 * 1024 * 1024;
+    for (const f of files) {
+      if (f.size > max) {
+        showToast(formatI18n("feedback.tooLargeFile", { name: f.name }));
+        continue;
+      }
+      feedbackAttachments.push({ name: f.name, size: f.size, file: f });
+    }
+    renderFeedbackAttachments();
+  }
+
+  function formatBytes(n) {
+    if (n < 1024) return `${n}B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+    return `${(n / 1024 / 1024).toFixed(2)}MB`;
+  }
+
+  async function submitFeedback() {
+    const titleEl = $("#feedbackTitle");
+    const bodyEl = $("#feedbackBody");
+    const submitBtn = $("#feedbackSubmitBtn");
+    if (!bodyEl) return;
+
+    const title = (titleEl?.value || "").trim();
+    const body = bodyEl.value.trim();
+    if (!body) {
+      showToast(t("feedback.bodyRequired"));
+      bodyEl.focus();
+      return;
+    }
+
+    submitBtn.disabled = true;
+    const originalText = submitBtn.textContent;
+    submitBtn.textContent = t("feedback.submitting");
+
+    try {
+      // 把附件转成 base64 嵌进 JSON,避开 pywebview WebKit 对 FormData 的 bug
+      const attachments = [];
+      for (const a of feedbackAttachments) {
+        try {
+          const b64 = await fileToBase64(a.file);
+          const isImg = /^image\//.test(a.file.type || "");
+          const safeName = String(a.name || `attachment-${Date.now()}.bin`)
+            .replace(/[\x00-\x1f\\/]/g, "_")
+            .slice(0, 200);
+          attachments.push({
+            kind: isImg ? "screenshot" : "log",
+            name: safeName,
+            content_type: a.file.type || "application/octet-stream",
+            content_b64: b64,
+          });
+        } catch (innerErr) {
+          console.warn("[feedback] skipped attachment:", innerErr, a);
+        }
+      }
+
+      const payload = {
+        title,
+        body,
+        include_diagnostics: $("#feedbackIncludeDiagnostics").checked,
+        attachments,
+      };
+
+      const result = await CCApi.submitFeedback(payload);
+      if (feedbackBsModal) feedbackBsModal.hide();
+      showToast(formatI18n("feedback.successToast", { id: result.id || "" }));
+    } catch (err) {
+      console.error("[feedback] submit failed:", err);
+      let msg = err && err.message ? err.message : String(err);
+      if (msg.includes("did not match the expected pattern")) {
+        msg = "请求体构造异常,请重试或去掉附件";
+      }
+      showToast(formatI18n("feedback.failToast", { message: msg }));
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = originalText;
+    }
+  }
+
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const r = String(reader.result || "");
+        const i = r.indexOf(",");
+        resolve(i >= 0 ? r.slice(i + 1) : r);
+      };
+      reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function bindFeedbackEvents() {
+    const dropzone = $("#feedbackDropzone");
+    const fileInput = $("#feedbackFiles");
+    if (dropzone && fileInput) {
+      dropzone.addEventListener("click", (e) => {
+        // 不要在点击删除按钮 / 列表项时触发
+        if (e.target.closest(".feedback-attachment-item")) return;
+        fileInput.click();
+      });
+      fileInput.addEventListener("change", () => {
+        addFeedbackFiles(Array.from(fileInput.files));
+        fileInput.value = "";
+      });
+      dropzone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropzone.classList.add("dragover");
+      });
+      dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
+      dropzone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropzone.classList.remove("dragover");
+        addFeedbackFiles(Array.from(e.dataTransfer.files));
+      });
+    }
+    document.addEventListener("paste", (e) => {
+      // 粘贴截图(只有 modal 打开时响应)
+      const modalEl = $("#feedbackModal");
+      if (!modalEl?.classList.contains("show")) return;
+      const items = e.clipboardData?.items || [];
+      for (const it of items) {
+        if (it.kind === "file" && /^image\//.test(it.type)) {
+          const f = it.getAsFile();
+          if (f) addFeedbackFiles([new File([f], f.name || `pasted-${Date.now()}.png`, { type: f.type })]);
+        }
+      }
+    });
+    const submitBtn = $("#feedbackSubmitBtn");
+    if (submitBtn) submitBtn.addEventListener("click", submitFeedback);
   }
 
   function bindEvents() {
@@ -1994,6 +2164,7 @@
     });
     toast = new bootstrap.Toast($("#appToast"), { delay: 2200 });
     bindEvents();
+    bindFeedbackEvents();
     const settings = await CCApi.getSettings();
     CCI18n.apply(settings.language || "zh");
     applyTheme(settings.theme || "default");

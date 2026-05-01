@@ -40,6 +40,67 @@ from backend.proxy import (
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 _update_quit_handler: Optional[Callable[[], None]] = None
 
+# 用户反馈 Worker(Cloudflare),所有反馈走它收集 + 邮件通知
+FEEDBACK_WORKER_URL = "https://codex-app-transfer-feedback.alysechencn.workers.dev"
+
+
+class _FeedbackThrottle:
+    """进程内反馈节流。
+
+    设计原则(用户体验优先):
+    - **成功提交后冷却 60s** —— 防止用户连点
+    - **失败不立即计入冷却** —— 让用户能立刻改完重试
+    - **5 分钟内连续 5 次失败** 才触发 60s 冷却 —— 防滥用兜底
+    """
+
+    SUCCESS_COOLDOWN_S = 60
+    FAILURE_WINDOW_S = 300        # 5 分钟
+    FAILURE_LIMIT = 5
+    FAILURE_COOLDOWN_S = 60
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_success_ts: float = 0.0
+        self._failure_ts: list[float] = []
+        self._failure_cooldown_until: float = 0.0
+
+    def acquire(self) -> dict:
+        with self._lock:
+            now = time.time()
+
+            # 1. 成功后 60s 冷却
+            since_success = now - self._last_success_ts
+            if 0 < since_success < self.SUCCESS_COOLDOWN_S:
+                wait = int(self.SUCCESS_COOLDOWN_S - since_success)
+                return {"ok": False, "reason": f"刚提交成功,请等 {wait} 秒后再发新反馈"}
+
+            # 2. 累积失败导致的冷却
+            if now < self._failure_cooldown_until:
+                wait = int(self._failure_cooldown_until - now)
+                return {"ok": False, "reason": f"连续提交失败次数过多,请等 {wait} 秒后再试"}
+
+            # 3. 失败窗口清理
+            self._failure_ts = [t for t in self._failure_ts if now - t < self.FAILURE_WINDOW_S]
+            return {"ok": True}
+
+    def record_success(self):
+        with self._lock:
+            self._last_success_ts = time.time()
+            # 成功一次重置失败计数
+            self._failure_ts.clear()
+            self._failure_cooldown_until = 0.0
+
+    def record_failure(self):
+        with self._lock:
+            now = time.time()
+            self._failure_ts = [t for t in self._failure_ts if now - t < self.FAILURE_WINDOW_S]
+            self._failure_ts.append(now)
+            if len(self._failure_ts) >= self.FAILURE_LIMIT:
+                self._failure_cooldown_until = now + self.FAILURE_COOLDOWN_S
+
+
+_feedback_throttle = _FeedbackThrottle()
+
 
 def _popen_hidden(command: list[str], *, detached: bool = False):
     """启动外部程序时避免 Windows 弹出黑色终端窗口。"""
@@ -793,6 +854,118 @@ def create_admin_app() -> FastAPI:
             "success": True,
             "message": "配置已导入",
             "backup": result["backup"],
+        }
+
+    # ── 用户反馈 API ──
+    @app.post("/api/feedback")
+    async def submit_feedback(request: Request):
+        """转发用户反馈到 Cloudflare Worker (codex-app-transfer-feedback)。
+
+        - 客户端用 JSON 提交(避开 pywebview WebKit 对 FormData 的 bug)
+        - 服务端拼装 multipart/form-data 转发给 Worker
+        - 服务端按需自动附加诊断信息(应用版本 / OS / active provider / 最近 200 行 proxy 日志)
+        - 节流:成功一次 60s 冷却,失败 5 次内不限速,5 次后 60s 冷却
+        """
+        # 节流
+        ok_msg = _feedback_throttle.acquire()
+        if not ok_msg["ok"]:
+            return JSONResponse(status_code=429, content={"success": False, "message": ok_msg["reason"]})
+
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"success": False, "message": "请求体非 JSON"})
+
+        title = str(data.get("title") or "").strip()
+        body_text = str(data.get("body") or "").strip()
+        include_diag = bool(data.get("include_diagnostics", True))
+        client_attachments = data.get("attachments") or []
+
+        if not body_text:
+            return JSONResponse(status_code=400, content={"success": False, "message": "请填写描述"})
+
+        # 自动附加诊断信息(脱敏:不含 API Key / 不含 base URL)
+        meta = {"app_version": APP_VERSION}
+        if include_diag:
+            import platform as _platform
+            try:
+                active = cfg.get_active_provider() or {}
+                meta.update({
+                    "os": _platform.system(),
+                    "arch": _platform.machine(),
+                    "active_provider_name": active.get("name", ""),
+                    "include_diagnostics": True,
+                })
+            except Exception:
+                pass
+
+        # 构造 multipart 转发到 Worker
+        import base64 as _b64
+        files: list = []
+        files.append(("meta", (None, json.dumps(meta, ensure_ascii=False), "application/json")))
+        files.append(("title", (None, title, "text/plain")))
+        files.append(("body", (None, body_text, "text/plain")))
+
+        # 用户上传的附件(base64 → 二进制)
+        shot_idx = log_idx = 0
+        if isinstance(client_attachments, list):
+            for att in client_attachments:
+                if not isinstance(att, dict):
+                    continue
+                try:
+                    raw = _b64.b64decode((att.get("content_b64") or "").encode("ascii"), validate=False)
+                except Exception:
+                    continue
+                if not raw or len(raw) > 5 * 1024 * 1024:
+                    continue
+                kind = str(att.get("kind") or "log")
+                name = str(att.get("name") or f"{kind}-{int(time.time())}.bin")
+                content_type = str(att.get("content_type") or "application/octet-stream")
+                if kind == "screenshot":
+                    field = f"screenshot{shot_idx}"; shot_idx += 1
+                else:
+                    field = f"log{log_idx}"; log_idx += 1
+                files.append((field, (name, raw, content_type)))
+
+        # 自动附加最近 200 行 proxy 日志
+        if include_diag:
+            try:
+                from datetime import date as _date
+                from pathlib import Path as _Path
+                log_path = _Path.home() / ".codex-app-transfer" / "logs" / f"proxy-{_date.today().isoformat()}.log"
+                if log_path.exists():
+                    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    tail = "\n".join(lines[-200:])
+                    if tail.strip():
+                        files.append((
+                            "log_proxy_tail",
+                            (f"proxy-tail-{_date.today().isoformat()}.log", tail.encode("utf-8"), "text/plain"),
+                        ))
+            except Exception:
+                pass
+
+        # 转发到 Worker(超时 30s)
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(FEEDBACK_WORKER_URL, files=files)
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception as exc:
+            _feedback_throttle.record_failure()
+            return JSONResponse(status_code=502, content={"success": False, "message": f"反馈服务暂不可用:{exc}"})
+
+        if not resp.is_success or not data.get("ok"):
+            _feedback_throttle.record_failure()
+            return JSONResponse(
+                status_code=resp.status_code if resp.status_code >= 400 else 502,
+                content={"success": False, "message": data.get("error") or data.get("message") or "上游错误"},
+            )
+
+        _feedback_throttle.record_success()
+        return {
+            "success": True,
+            "id": data.get("id", ""),
+            "message": f"反馈已收到 (ID: {data.get('id', '')})",
+            "email_sent": bool(data.get("email_sent")),
         }
 
     # ── Desktop 集成 API ──

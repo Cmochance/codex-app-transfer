@@ -310,6 +310,13 @@
       return api('GET', '/api/desktop/snapshot-status');
     },
 
+    async submitFeedback(payload) {
+      // 走 JSON 而不是 multipart/form-data —— pywebview 的 WebKit 对
+      // fetch+FormData 组合存在 "the string did not match the expected pattern"
+      // bug,JSON 路径稳定。文件以 base64 嵌入。
+      return api('POST', '/api/feedback', payload);
+    },
+
     async getActivities() {
       const data = await api('GET', '/api/proxy/logs');
       const logs = data.logs || [];
