@@ -189,6 +189,94 @@ stats = ProxyStats()
 log_buffer = LogBuffer()
 _session_cache = ResponseSessionCache(max_size=1000, ttl_seconds=3600)
 
+# tool_calls cache 在 session_cache 模块定义，导入直接用。
+from backend.session_cache import TOOL_CALLS_CACHE
+
+
+def _populate_tool_calls_cache(tool_calls: list) -> None:
+    """把上游返回的 tool_calls 完整定义打入全局 TOOL_CALLS_CACHE。
+
+    Codex CLI 下一轮可能只发 function_call_output(不再带 function_call),
+    届时 _repair_tool_call_ids 会从这个 cache 取回 tool_call 信息,补到
+    前面 assistant 消息的 tool_calls 列表里,避免上游 400。
+    """
+    if not isinstance(tool_calls, list):
+        return
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        tc_id = tc.get("id")
+        if not tc_id:
+            continue
+        TOOL_CALLS_CACHE.set(str(tc_id), {
+            "id": str(tc_id),
+            "type": tc.get("type") or "function",
+            "function": {
+                "name": (tc.get("function") or {}).get("name") or "",
+                "arguments": (tc.get("function") or {}).get("arguments") or "",
+            },
+        })
+
+
+def _build_assistant_msg_from_chat(chat_resp: dict) -> Optional[dict]:
+    """从非流式 OpenAI Chat 响应里提取 assistant message,用于会话缓存。"""
+    if not isinstance(chat_resp, dict):
+        return None
+    choices = chat_resp.get("choices") or []
+    if not choices:
+        return None
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(msg, dict):
+        return None
+    out: dict = {"role": "assistant"}
+    content = msg.get("content")
+    out["content"] = content if isinstance(content, str) else ""
+    rc = msg.get("reasoning_content")
+    if isinstance(rc, str) and rc:
+        out["reasoning_content"] = rc
+    tcs = msg.get("tool_calls")
+    if isinstance(tcs, list) and tcs:
+        out["tool_calls"] = [tc for tc in tcs if isinstance(tc, dict)]
+    return out
+
+
+def _build_assistant_msg_from_streaming(converter) -> Optional[dict]:
+    """从 streaming_adapter 累积状态重建 assistant message,用于会话缓存。
+
+    Codex CLI 在多轮对话中会用 ``previous_response_id`` 引用上一轮响应,
+    期望我们记得 prior assistant 输出。如果只缓存原始 input 没缓存我们合成的
+    assistant 响应,Kimi 拿到的历史就是孤儿 tool message,触发
+    ``400 tool_call_id is not found``。
+    """
+    if converter is None:
+        return None
+    out: dict = {"role": "assistant"}
+    text = getattr(converter, "accumulated_text", "") or ""
+    out["content"] = text  # 即使是空串,标准要求 content 字段存在
+    reasoning = getattr(converter, "accumulated_reasoning", "") or ""
+    if reasoning:
+        out["reasoning_content"] = reasoning
+    tool_call_ids: dict = getattr(converter, "tool_call_ids", {}) or {}
+    tool_names: dict = getattr(converter, "tool_names", {}) or {}
+    tool_args: dict = getattr(converter, "tool_args", {}) or {}
+    if tool_call_ids:
+        ordered = []
+        for idx in sorted(tool_call_ids.keys()):
+            cid = tool_call_ids[idx]
+            if not cid:
+                continue
+            ordered.append({
+                "id": cid,
+                "type": "function",
+                "function": {
+                    "name": tool_names.get(cid, "") or "",
+                    "arguments": tool_args.get(cid, "") or "",
+                },
+            })
+        if ordered:
+            out["tool_calls"] = ordered
+    return out
+
 # 全局 HTTP 客户端（连接池复用）
 _http_client: httpx.AsyncClient | None = None
 
@@ -524,8 +612,16 @@ async def forward_request(
                 request_body=body,
             )
             # 保存会话历史用于后续 previous_response_id
+            # 完整存我们送给上游的 messages + 合成的 assistant 响应,
+            # 让下一轮 Codex 用 previous_response_id 时能拿到完整对话上下文。
             if isinstance(result, dict) and not result.get("error") and result.get("id"):
-                _session_cache.save(result["id"], body.get("input", []))
+                saved_msgs = list(upstream_body.get("messages", []) or [])
+                asst_msg = _build_assistant_msg_from_chat(upstream_data)
+                if asst_msg:
+                    saved_msgs.append(asst_msg)
+                    # 同步打 TOOL_CALLS_CACHE
+                    _populate_tool_calls_cache(asst_msg.get("tool_calls") or [])
+                _session_cache.save(result["id"], saved_msgs)
             return result
         return _normalize_responses_response(upstream_data, body.get("model", ""))
 
@@ -593,6 +689,32 @@ async def forward_request_stream(
 
     log_buffer.add("INFO", f"流式请求 → {upstream_url}")
 
+    # ── 临时诊断: 看 Codex 是否用 previous_response_id + 我们 cache 是否命中,
+    #    以及最终发给 Kimi 的 messages 状态(是否有 user/assistant/tool 配对)。
+    try:
+        if api_format == "openai_chat":
+            _input = body.get("input")
+            _input_count = len(_input) if isinstance(_input, list) else (1 if _input else 0)
+            _prev_id = body.get("previous_response_id")
+            _cache_hit = False
+            if _prev_id:
+                try:
+                    _cache_hit = bool(_session_cache.get(_prev_id))
+                except Exception:
+                    _cache_hit = False
+            _msgs = upstream_body.get("messages") or []
+            _roles = [str(m.get("role") or "?") for m in _msgs if isinstance(m, dict)]
+            _from_role = {}
+            for r in _roles:
+                _from_role[r] = _from_role.get(r, 0) + 1
+            log_buffer.add(
+                "INFO",
+                f"DEBUG ctx: input_items={_input_count} prev_id={_prev_id or 'NONE'} "
+                f"cache_hit={_cache_hit} upstream_msgs={len(_msgs)} roles={_from_role}"
+            )
+    except Exception as _exc:
+        log_buffer.add("ERROR", f"DEBUG ctx 失败: {_exc}")
+
     try:
         client = await get_http_client()
         async with client.stream(
@@ -645,6 +767,22 @@ async def forward_request_stream(
                                 responses_event, original_model, provider_name
                             )
                             yield f"data: {json.dumps(normalized_event)}\n\n"
+                    # 流完成后,把"我们送给上游的 messages + 合成 assistant 响应"保存到
+                    # session_cache,供下一轮 Codex 用 previous_response_id 引用。
+                    # 同时把每个 tool_call 打入 TOOL_CALLS_CACHE,供 _repair_tool_call_ids
+                    # 在缺 assistant.tool_calls 时重建用。
+                    try:
+                        rsp_id = getattr(converter, "response_id", None)
+                        asst_msg = _build_assistant_msg_from_streaming(converter)
+                        if asst_msg:
+                            _populate_tool_calls_cache(asst_msg.get("tool_calls") or [])
+                        if rsp_id:
+                            saved_msgs = list(upstream_body.get("messages", []) or [])
+                            if asst_msg:
+                                saved_msgs.append(asst_msg)
+                            _session_cache.save(rsp_id, saved_msgs)
+                    except Exception as _exc:
+                        log_buffer.add("ERROR", f"会话缓存保存失败: {_exc}")
                 else:
                     async for line in resp.aiter_lines():
                         if line.startswith("data:"):

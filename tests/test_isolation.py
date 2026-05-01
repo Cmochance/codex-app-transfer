@@ -234,6 +234,179 @@ async def test_async_conversions():
     assert any(item.get("type") == "message" for item in resp["output"])
     ok("chat_responses_adapter convert_chat_to_responses")
 
+    # ─── streaming reasoning 事件协议（Kimi thinking 不展开 bug 修复）─────────
+    # 验证：reasoning_content delta 应触发 reasoning_summary_part.added/done +
+    # summary_index,而不是通用的 content_part.added/done + content_index。
+    # Codex CLI 严格按事件名匹配 reasoning summary part,通用的 content_part
+    # 会让 thinking UI 卡住不展开。
+    from backend.streaming_adapter import StreamingAdapter
+    sa = StreamingAdapter("kimi-for-coding", "kimi")
+    chunk1 = {
+        "id": "chatcmpl-test-r",
+        "choices": [{"index": 0, "delta": {"reasoning_content": "Let me think..."}, "finish_reason": None}],
+    }
+    events1 = sa.process_chunk(chunk1)
+    types1 = [e["type"] for e in events1]
+    assert "response.reasoning_summary_part.added" in types1, \
+        f"reasoning 起点应发 reasoning_summary_part.added, got: {types1}"
+    assert "response.content_part.added" not in [
+        e["type"] for e in events1
+        if isinstance(e.get("item"), dict) and e["item"].get("type") == "reasoning"
+    ], "reasoning item 不应再发通用 content_part.added"
+    summary_part = next(e for e in events1 if e["type"] == "response.reasoning_summary_part.added")
+    assert summary_part.get("summary_index") == 0
+    assert summary_part.get("part", {}).get("type") == "summary_text"
+    assert "response.reasoning_summary_text.delta" in types1
+    ok("streaming reasoning: 首个 reasoning_content 触发 reasoning_summary_part.added")
+
+    chunk2 = {
+        "id": "chatcmpl-test-r",
+        "choices": [{"index": 0, "delta": {"content": "Final answer"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 10},
+    }
+    events2 = sa.process_chunk(chunk2)
+    types2 = [e["type"] for e in events2]
+    assert "response.reasoning_summary_part.done" in types2, \
+        f"reasoning 收尾应发 reasoning_summary_part.done, got: {types2}"
+    done_part = next(e for e in events2 if e["type"] == "response.reasoning_summary_part.done")
+    assert done_part.get("summary_index") == 0
+    assert done_part.get("part", {}).get("type") == "summary_text"
+    assert done_part.get("part", {}).get("text") == "Let me think..."
+    ok("streaming reasoning: 收尾发 reasoning_summary_part.done 含完整 text")
+
+    # ─── tool_call_id 修复 pass (Kimi 'tool_call_id is not found' 400 修复) ────
+    # 场景 A: function_call_output 的 call_id 字段为空 → 按位置从前面 assistant
+    #         的 tool_calls 取 ID 补上
+    body_tool_a = {
+        "model": "kimi-for-coding",
+        "input": [
+            {"type": "message", "role": "user", "content": "run ls"},
+            {"type": "function_call", "id": "call_xyz1", "call_id": "call_xyz1",
+             "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+            # 模拟 Codex 历史压缩后 call_id 丢失
+            {"type": "function_call_output", "output": "file.txt"},
+            {"type": "message", "role": "user", "content": "ok"},
+        ],
+    }
+    chat_tool_a = await convert_responses_to_chat_body(body_tool_a)
+    tool_msg_a = next(m for m in chat_tool_a["messages"] if m.get("role") == "tool")
+    assert tool_msg_a["tool_call_id"] == "call_xyz1", \
+        f"空 tool_call_id 应按位置补成 call_xyz1, got: {tool_msg_a['tool_call_id']!r}"
+    ok("tool_call_id 修复: 空字段按位置从前面 assistant.tool_calls 补 ID")
+
+    # 场景 B: 多个 tool_calls + 部分 tool message 缺 ID → 按顺序逐个配对
+    body_tool_b = {
+        "model": "kimi-for-coding",
+        "input": [
+            {"type": "message", "role": "user", "content": "do two things"},
+            {"type": "function_call", "id": "call_a", "call_id": "call_a",
+             "name": "shell", "arguments": "{\"cmd\":\"a\"}"},
+            {"type": "function_call", "id": "call_b", "call_id": "call_b",
+             "name": "shell", "arguments": "{\"cmd\":\"b\"}"},
+            {"type": "function_call_output", "call_id": "call_a", "output": "A"},
+            {"type": "function_call_output", "output": "B"},  # 缺 ID
+            {"type": "message", "role": "user", "content": "next"},
+        ],
+    }
+    chat_tool_b = await convert_responses_to_chat_body(body_tool_b)
+    tool_msgs_b = [m for m in chat_tool_b["messages"] if m.get("role") == "tool"]
+    assert len(tool_msgs_b) == 2
+    assert tool_msgs_b[0]["tool_call_id"] == "call_a"
+    assert tool_msgs_b[1]["tool_call_id"] == "call_b", \
+        f"第二条 tool 应按位置补成 call_b, got: {tool_msgs_b[1]['tool_call_id']!r}"
+    ok("tool_call_id 修复: 多 tool_calls 按位置逐个配对")
+
+    # 场景 C: 孤儿 tool message (前面没有 assistant.tool_calls) → 丢弃
+    body_tool_c = {
+        "model": "kimi-for-coding",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            # 模拟 Codex 历史压缩把 function_call 删了但留下 output
+            {"type": "function_call_output", "output": "orphan"},
+            {"type": "message", "role": "user", "content": "still here"},
+        ],
+    }
+    chat_tool_c = await convert_responses_to_chat_body(body_tool_c)
+    tool_msgs_c = [m for m in chat_tool_c["messages"] if m.get("role") == "tool"]
+    assert len(tool_msgs_c) == 0, f"孤儿 tool message 应被丢弃, got: {tool_msgs_c}"
+    ok("tool_call_id 修复: 无可配对 assistant 的孤儿 tool message 被丢弃")
+
+    # 场景 D: 正常情况 → 行为保持不变(回归保护)
+    body_tool_d = {
+        "model": "kimi-for-coding",
+        "input": [
+            {"type": "function_call", "id": "call_x", "call_id": "call_x",
+             "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_x", "output": "ok"},
+            {"type": "message", "role": "user", "content": "next"},
+        ],
+    }
+    chat_tool_d = await convert_responses_to_chat_body(body_tool_d)
+    tool_msg_d = next(m for m in chat_tool_d["messages"] if m.get("role") == "tool")
+    assert tool_msg_d["tool_call_id"] == "call_x"
+    ok("tool_call_id 修复: 正常 call_id 透传无副作用")
+
+    # ─── reasoning_content 占位符回归 (Kimi/DeepSeek thinking 模式 400 修复) ────
+    # 场景 A: reasoning item 只有 encrypted_content,无 summary text
+    #         → assistant tool_call 消息应得到非空 reasoning_content
+    body_a = {
+        "model": "kimi-for-coding",
+        "reasoning": {"effort": "high"},
+        "input": [
+            {"type": "reasoning", "encrypted_content": "opaque_blob_abc123", "summary": []},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+             "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "file.txt"},
+            {"type": "message", "role": "user", "content": "next step?"},
+        ],
+    }
+    chat_a = await convert_responses_to_chat_body(body_a)
+    asst_a = next(m for m in chat_a["messages"] if m.get("role") == "assistant" and m.get("tool_calls"))
+    rc_a = asst_a.get("reasoning_content")
+    assert rc_a is not None and str(rc_a).strip() == "" and len(str(rc_a)) > 0, \
+        f"encrypted-only 应得到非空但空白占位符, got: {rc_a!r}"
+    ok("reasoning_content fix: encrypted_content-only 历史得到非空占位")
+
+    # 场景 B: 历史中没有 reasoning item,但 assistant 有 tool_calls + 请求体含 reasoning
+    #         → safety net 应填非空占位
+    body_b = {
+        "model": "kimi-for-coding",
+        "reasoning": {"effort": "high"},
+        "input": [
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+             "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "file.txt"},
+            {"type": "message", "role": "user", "content": "next?"},
+        ],
+    }
+    chat_b = await convert_responses_to_chat_body(body_b)
+    asst_b = next(m for m in chat_b["messages"] if m.get("role") == "assistant" and m.get("tool_calls"))
+    rc_b = asst_b.get("reasoning_content")
+    assert rc_b is not None and len(str(rc_b)) > 0, \
+        f"safety net 应保证 tool_call assistant 消息有非空 reasoning_content, got: {rc_b!r}"
+    ok("reasoning_content fix: 缺 reasoning item 时 safety net 填非空")
+
+    # 场景 C: reasoning item 有真实 summary text → 真实文本透传,不被覆盖
+    body_c = {
+        "model": "kimi-for-coding",
+        "reasoning": {"effort": "high"},
+        "input": [
+            {"type": "reasoning", "summary": [
+                {"type": "summary_text", "text": "Analyzing the user's request..."},
+            ]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+             "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "file.txt"},
+            {"type": "message", "role": "user", "content": "good"},
+        ],
+    }
+    chat_c = await convert_responses_to_chat_body(body_c)
+    asst_c = next(m for m in chat_c["messages"] if m.get("role") == "assistant" and m.get("tool_calls"))
+    rc_c = asst_c.get("reasoning_content")
+    assert rc_c == "Analyzing the user's request...", \
+        f"真实 summary 文本应原样保留, got: {rc_c!r}"
+    ok("reasoning_content fix: 真实 summary text 不被空格占位覆盖")
+
 
 # run sync tests
 test_normalize_api_format()
