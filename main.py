@@ -30,7 +30,7 @@ from backend import registry
 
 
 APP_NAME = "Codex App Transfer"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 TRAY_OPEN_LABEL = "打开 Codex App Transfer"
 TRAY_QUIT_LABEL = "退出"
 _macos_app_delegate = None

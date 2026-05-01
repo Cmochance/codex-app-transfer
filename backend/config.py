@@ -18,7 +18,7 @@ LIBRARY_DIR = os.path.join(CONFIG_DIR, "configLibrary")
 OLD_CONFIG_DIR = os.path.expanduser("~/.cc-desktop-switch")
 DEFAULT_UPDATE_URL = "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 DEFAULT_CONFIG = {
     "version": APP_VERSION,

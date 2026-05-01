@@ -15,10 +15,16 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本：v1.0.1
+- 当前版本：v1.0.2
 - 已验证供应商：Kimi For Coding（`kimi-for-coding` UA 网关）
 - 实验兼容：DeepSeek V4（含「Max 思维」思考模式）/ 智谱 GLM / 阿里云百炼 / Xiaomi MiMo / 其它 OpenAI Chat 兼容反代
 - 平台：Windows x64 安装版 / Windows 便携版 / macOS arm64 / Linux x86_64
+
+### v1.0.2 主要变化
+
+- **新增用户反馈系统(无需登录)**：Dashboard 顶栏 + Settings 底部都加了反馈按钮,弹出 Modal 支持文本 + 拖拽 / Cmd+V 粘截图 / 选附日志,默认勾选附加诊断(应用版本 / OS / 当前 provider 名称 / 最近 200 行 proxy 日志,**不含 API Key**)。提交后端转发到自建 Cloudflare Worker,落 R2 存储 + Resend 邮件即时通知开发者。匿名提交,无任何账号体系。完整方案见 [`feedback-worker/README.md`](feedback-worker/README.md)。
+- **修复 pywebview WebKit FormData 兼容 bug**：反馈链路最初用 `fetch + FormData` 提交,WKWebView 在某些状态下会抛 `the string did not match the expected pattern`。改为前端 → 后端走 JSON + base64,后端 → Worker 仍用 multipart(httpx 拼包不受 WebKit 影响),应用层完全绕开 FormData。
+- **节流体验改进**:成功提交一次后 60s 冷却(防误触);失败不立即计入,5 分钟内连续 5 次失败才触发 60s 冷却(给改完即重试的容错空间);任意成功重置失败计数。完整变更见 [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md)。
 
 ### v1.0.1 主要变化
 
@@ -98,12 +104,12 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: v1.0.1
+- Current version: v1.0.2
 - Validated upstream: Kimi For Coding (`kimi-for-coding` UA gateway)
 - Experimental compatibility: DeepSeek V4 (with "Max thinking" mode) / Zhipu GLM / Alibaba Cloud Bailian / Xiaomi MiMo / other OpenAI Chat-compatible reverse proxies
 - Platforms: Windows x64 installer / Windows portable / macOS arm64 / Linux x86_64
 
-v1.0.1 highlights: multi-turn `previous_response_id` context-loss fix, three thinking-mode anomalies fixed, `~/.codex/` original-config snapshot/restore, auto-apply on start, Windows installer crash fix. See [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md) for details.
+v1.0.2 highlights: anonymous user feedback system (Cloudflare Worker + R2 + Resend), pywebview WebKit FormData compatibility fix (switched to JSON+base64 transport), refined throttle UX. See [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md). v1.0.1 highlights: multi-turn `previous_response_id` context-loss fix, three thinking-mode anomalies fixed, `~/.codex/` original-config snapshot/restore, auto-apply on start, Windows installer crash fix. See [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md).
 
 ### Getting started
 
@@ -228,7 +234,7 @@ build.bat                 # 交互式选 1/2/3/4
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\New-Release.ps1 `
     -Version 1.0.0 -Build -TryInstaller `
     -Repository Cmochance/codex-app-transfer
-python scripts\release_assets.py --version 1.0.1 --include windows
+python scripts\release_assets.py --version 1.0.2 --include windows
 ```
 
 带代码签名证书时再加 `-CodeSign -CodeSigningCertificateBase64 ...`，参见 `scripts/Invoke-CodeSigning.ps1`。
@@ -237,7 +243,7 @@ python scripts\release_assets.py --version 1.0.1 --include windows
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Test-ReleaseSignature.ps1 `
-    -File release\Codex-App-Transfer-v1.0.1-Windows-Setup.exe
+    -File release\Codex-App-Transfer-v1.0.2-Windows-Setup.exe
 ```
 
 或在任意有 Python + cryptography 的环境里：
@@ -249,7 +255,7 @@ import base64
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 pub = serialization.load_pem_public_key(Path('release/Codex-App-Transfer-release-public.pem').read_bytes())
-asset = 'release/Codex-App-Transfer-v1.0.1-Linux-x86_64.tar.gz'
+asset = 'release/Codex-App-Transfer-v1.0.2-Linux-x86_64.tar.gz'
 sig = base64.b64decode(Path(asset+'.sig').read_text())
 pub.verify(sig, Path(asset).read_bytes(), padding.PKCS1v15(), hashes.SHA256())
 print('OK')

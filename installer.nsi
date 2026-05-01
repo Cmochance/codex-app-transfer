@@ -8,7 +8,7 @@
 ;============================================
 
 !define PRODUCT_NAME "Codex App Transfer"
-!define PRODUCT_VERSION "1.0.0"
+!define PRODUCT_VERSION "1.0.2"
 !define PRODUCT_PUBLISHER "Codex App Transfer"
 !define PRODUCT_DIR "$PROGRAMFILES64\Codex-App-Transfer"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
