@@ -1093,7 +1093,11 @@
       }
     }
     setAuthSchemeValue(provider.authScheme);
-    setFormApiFormat(["openai", "openai_chat"].includes(provider.apiFormat) ? "openai_chat" : "responses");
+    // 优先用匹配预设的 apiFormat,saved provider 的 apiFormat 可能因升级残留旧值
+    // (例如 v1.0.0 时 Kimi 默认 "responses",v1.0.1 起改成 "openai_chat")。后端
+    // _sync_apiformat_from_builtin 也会做一次根治,这里是 UI 侧的二重保险。
+    const effectiveApiFormat = (matchedPreset && matchedPreset.apiFormat) || provider.apiFormat;
+    setFormApiFormat(["openai", "openai_chat"].includes(effectiveApiFormat) ? "openai_chat" : "responses");
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());

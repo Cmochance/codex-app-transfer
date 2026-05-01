@@ -393,12 +393,115 @@
       </section>
 
       <section class="page" id="page-guide" data-page="guide">
-        <div class="timeline">
-          <article class="timeline-card"><span>1</span><i class="bi bi-plug"></i><div><h2 data-i18n="guide.step1">添加提供商</h2><p data-i18n="guide.step1Text">选择预设，填入 API Key，必要时调整模型映射。</p></div></article>
-          <article class="timeline-card"><span>2</span><i class="bi bi-magic"></i><div><h2 data-i18n="guide.step2">一键应用</h2><p data-i18n="guide.step2Text">点击“一键生成 Codex CLI 配置”，本工具会生成环境变量配置命令。</p></div></article>
-          <article class="timeline-card"><span>3</span><i class="bi bi-arrow-repeat"></i><div><h2 data-i18n="guide.step3">设置环境变量</h2><p data-i18n="guide.step3Text">重启后正常提问，消息会通过本工具转发到当前供应商。</p></div></article>
-        </div>
-        <a class="btn btn-primary btn-lg guide-start" href="#providers/add"><i class="bi bi-arrow-right-circle"></i><span data-i18n="guide.start">开始使用</span></a>
+        <header class="guide-hero">
+          <img src="assets/app-icon.png" alt="">
+          <div>
+            <h1 data-i18n="guide.title">使用引导</h1>
+            <p data-i18n="guide.subtitle">让 OpenAI Codex CLI 接入 Kimi、DeepSeek、智谱 GLM、阿里云百炼、Xiaomi MiMo 等供应商,无需改动 CLI 本身。</p>
+          </div>
+        </header>
+
+        <section class="guide-section">
+          <h2 class="guide-section-title" data-i18n="guide.prereqTitle">开始之前</h2>
+          <div class="guide-prereq">
+            <i class="bi bi-info-circle"></i>
+            <div>
+              <p data-i18n="guide.prereqBody">需要已安装 <strong>OpenAI Codex CLI 0.126+</strong>。终端跑 <code>codex --version</code> 看版本号;没装的话先去 <a href="https://github.com/openai/codex" target="_blank" rel="noreferrer">github.com/openai/codex</a>。</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="guide-section">
+          <h2 class="guide-section-title" data-i18n="guide.quickStartTitle">快速开始</h2>
+          <div class="timeline">
+            <article class="timeline-card">
+              <span>1</span><i class="bi bi-plug"></i>
+              <div>
+                <h2 data-i18n="guide.step1">添加提供商</h2>
+                <p data-i18n="guide.step1Text">在「提供商」页右上角「+」选预设(Kimi / Kimi Code / DeepSeek / 智谱 GLM / 阿里云百炼 / Xiaomi MiMo),粘贴 API Key。模型映射按官方文档已预填。</p>
+                <a class="guide-action-link" href="#providers/add" data-i18n="guide.step1Link">去添加 →</a>
+              </div>
+            </article>
+            <article class="timeline-card">
+              <span>2</span><i class="bi bi-check2-square"></i>
+              <div>
+                <h2 data-i18n="guide.step2">设为默认</h2>
+                <p data-i18n="guide.step2Text">「提供商」列表点你要用的那个,确认带上「默认」标记。可以同时保存多个,以后随时切。</p>
+                <a class="guide-action-link" href="#providers" data-i18n="guide.step2Link">去管理 →</a>
+              </div>
+            </article>
+            <article class="timeline-card">
+              <span>3</span><i class="bi bi-magic"></i>
+              <div>
+                <h2 data-i18n="guide.step3">应用配置(自动)</h2>
+                <p data-i18n="guide.step3Text">应用启动时自动写入 <code>~/.codex/config.toml</code> 与 <code>auth.json</code>,按需启动本地转发服务。<strong>第一次会先快照备份你原来的 ~/.codex 配置</strong>,退出时按 key 智能合并还原。</p>
+              </div>
+            </article>
+            <article class="timeline-card">
+              <span>4</span><i class="bi bi-terminal"></i>
+              <div>
+                <h2 data-i18n="guide.step4">在终端跑 codex</h2>
+                <p data-i18n="guide.step4Text"><strong>打开新终端</strong>,直接跑 <code>codex</code>。模型选单会显示当前 provider 的映射(Sonnet / Haiku / Opus 对应真实模型)。</p>
+              </div>
+            </article>
+            <article class="timeline-card">
+              <span>5</span><i class="bi bi-arrow-left-right"></i>
+              <div>
+                <h2 data-i18n="guide.step5">切换 / 退出</h2>
+                <p data-i18n="guide.step5Text">右键系统托盘图标可以一键切换 provider。退出应用时,<code>~/.codex/</code> 自动回到你原来的配置 —— 不开应用 = 用你自己的原配置。</p>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="guide-section">
+          <h2 class="guide-section-title" data-i18n="guide.advancedTitle">进阶用法</h2>
+          <div class="guide-card-grid">
+            <a class="guide-card" href="#providers">
+              <i class="bi bi-lightning-charge"></i>
+              <h3 data-i18n="guide.advThinkingTitle">DeepSeek 思维模式</h3>
+              <p data-i18n="guide.advThinkingText">编辑 DeepSeek provider 时打开「Max 思维」开关,自动按官方 chat/completions 思维协议发送 reasoning_effort + thinking 字段。</p>
+            </a>
+            <a class="guide-card" href="#settings">
+              <i class="bi bi-patch-check"></i>
+              <h3 data-i18n="guide.advCompatTitle">兼容性测试</h3>
+              <p data-i18n="guide.advCompatText">Settings 页「检查兼容性」按钮一键测试所有 provider 的实际响应,标记哪些直连、哪些需要转发、哪些有问题。</p>
+            </a>
+            <a class="guide-card" href="#settings">
+              <i class="bi bi-shield-check"></i>
+              <h3 data-i18n="guide.advBackupTitle">配置备份</h3>
+              <p data-i18n="guide.advBackupText">Settings 页可立即备份当前配置,或导出/导入完整 JSON。备份包含 API Key,只在可信设备上保存。</p>
+            </a>
+            <a class="guide-card" href="#dashboard">
+              <i class="bi bi-arrow-counterclockwise"></i>
+              <h3 data-i18n="guide.advRestoreTitle">还原 Codex 原配置</h3>
+              <p data-i18n="guide.advRestoreText">Dashboard 顶栏红色按钮按 key 智能合并 —— 仅回滚我们写过的 auth_mode / OPENAI_API_KEY / openai_base_url,你的 model_reasoning_effort 等其他配置原样保留。</p>
+            </a>
+          </div>
+        </section>
+
+        <section class="guide-section">
+          <h2 class="guide-section-title" data-i18n="guide.troubleshootTitle">遇到问题</h2>
+          <div class="guide-card-grid">
+            <div class="guide-card guide-card-static">
+              <i class="bi bi-chat-dots"></i>
+              <h3 data-i18n="guide.tsFeedbackTitle">提交反馈</h3>
+              <p data-i18n="guide.tsFeedbackText">Dashboard 顶栏「反馈」按钮匿名提交问题描述 + 截图 + 日志,默认附诊断信息(应用版本 / OS / 当前 provider 名,<strong>不含 API Key</strong>)。无需登录。</p>
+            </div>
+            <div class="guide-card guide-card-static">
+              <i class="bi bi-journal-text"></i>
+              <h3 data-i18n="guide.tsLogsTitle">查看日志</h3>
+              <p data-i18n="guide.tsLogsText">Settings 页底部「查看日志」按钮直接打开 <code>~/.codex-app-transfer/logs/</code>。或在「转发」页内置实时日志面板,2 秒自动刷新。</p>
+            </div>
+            <div class="guide-card guide-card-static">
+              <i class="bi bi-arrow-clockwise"></i>
+              <h3 data-i18n="guide.tsRestartTitle">模型菜单不刷新?</h3>
+              <p data-i18n="guide.tsRestartText">Codex CLI 只在启动时读 <code>~/.codex/</code> 配置。切换 provider 后必须 <strong>关闭并重新打开终端</strong>,新终端才会用新映射。</p>
+            </div>
+          </div>
+        </section>
+
+        <a class="btn btn-primary btn-lg guide-start" href="#providers/add"><i class="bi bi-arrow-right-circle"></i><span data-i18n="guide.start">添加你的第一个提供商</span></a>
       </section>
     </main>
 

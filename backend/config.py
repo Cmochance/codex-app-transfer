@@ -135,15 +135,19 @@ BUILTIN_PRESETS = [
         "apiFormat": "openai_chat",
         "baseUrlOptions": [
             {
-                "label": "官方默认",
+                "label": "中国集群",
                 "value": "https://token-plan-cn.xiaomimimo.com/v1",
             },
             {
-                "label": "活动专属",
+                "label": "新加坡集群",
                 "value": "https://token-plan-sgp.xiaomimimo.com/v1",
             },
+            {
+                "label": "欧洲集群",
+                "value": "https://token-plan-ams.xiaomimimo.com/v1",
+            },
         ],
-        "baseUrlHint": "如果是活动赠送会员请使用活动专属 Base URL，若仍无法获取模型请访问 https://platform.xiaomimimo.com/console/plan-manage 获取专属Base URL。",
+        "baseUrlHint": "请使用账号所属地区的 Base URL，若不清楚请访问 https://platform.xiaomimimo.com/console/plan-manage 获取专属Base URL。",
         "models": {
             "sonnet": "",
             "haiku": "",
@@ -267,6 +271,33 @@ def save_config(config: dict):
     shutil.move(tmp_file, CONFIG_FILE)
 
 
+def _sync_apiformat_from_builtin(provider: dict) -> None:
+    """若 provider 的 baseUrl 与某个内置预设完全一致(包含 baseUrlOptions),
+    把 apiFormat 同步为预设值。
+
+    背景:v1.0.0 时 Kimi 默认 apiFormat 是 "responses",v1.0.1 起改成 "openai_chat"。
+    从 1.0.0 升级来的用户 saved Kimi provider 仍停在旧 "responses",导致编辑页
+    默认勾错 + 代理走错协议 + 测速失败。预设变更不会自动迁移已保存数据,本函数
+    在每次 _normalize_provider 调用时按 baseUrl 同步,保证读取出来的 provider
+    永远跟当前预设的 apiFormat 一致。
+
+    用户自定义 URL(跟任何预设都不匹配)的 provider 不会被改动。
+    """
+    base_url = str(provider.get("baseUrl") or "").strip().rstrip("/")
+    if not base_url:
+        return
+    for preset in BUILTIN_PRESETS:
+        candidates = {str(preset.get("baseUrl") or "").rstrip("/")}
+        for opt in preset.get("baseUrlOptions") or []:
+            if isinstance(opt, dict) and opt.get("value"):
+                candidates.add(str(opt["value"]).rstrip("/"))
+        if base_url in candidates:
+            preset_format = preset.get("apiFormat")
+            if preset_format and provider.get("apiFormat") != preset_format:
+                provider["apiFormat"] = preset_format
+            return
+
+
 def _normalize_provider(provider: dict) -> dict:
     """补齐 provider 必要字段，导入旧配置时保持兼容。"""
     normalized = dict(provider)
@@ -284,6 +315,8 @@ def _normalize_provider(provider: dict) -> dict:
     normalized.setdefault("isBuiltin", False)
     normalized.setdefault("sortIndex", 0)
     normalized["models"] = normalize_model_mappings(normalized.get("models"))
+    # 自动跟内置预设的 apiFormat 对齐(仅当 baseUrl 完全匹配某预设时)
+    _sync_apiformat_from_builtin(normalized)
     return normalized
 
 

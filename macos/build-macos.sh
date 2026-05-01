@@ -6,7 +6,8 @@ cd "$ROOT"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 detect_version() {
-  "$PYTHON_BIN" - "$ROOT/main.py" <<'PY'
+  # 唯一版本源:backend/config.py:APP_VERSION
+  "$PYTHON_BIN" - "$ROOT/backend/config.py" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ from pathlib import Path
 text = Path(sys.argv[1]).read_text(encoding="utf-8")
 match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
 if not match:
-    raise SystemExit("APP_VERSION not found in main.py")
+    raise SystemExit("APP_VERSION not found in backend/config.py")
 print(match.group(1))
 PY
 }
