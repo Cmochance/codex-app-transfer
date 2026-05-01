@@ -121,13 +121,16 @@ if "%MODE%"=="installer" (
         echo    https://nsis.sourceforge.io/Download
         echo.
         echo  安装后确保 makensis.exe 在 PATH 中
-        echo  或手动执行: makensis installer.nsi
+        echo  或手动执行: makensis -DPRODUCT_VERSION=^<x.y.z^> installer.nsi
         echo.
         pause
         exit /b 1
     )
 
-    makensis installer.nsi >nul 2>&1
+    REM 从 backend/config.py 读取唯一版本号(单一源策略)
+    for /f "tokens=*" %%v in ('python -c "from backend.config import APP_VERSION; print(APP_VERSION)"') do set "APP_VERSION=%%v"
+    if not defined APP_VERSION set "APP_VERSION=0.0.0"
+    makensis /DPRODUCT_VERSION=%APP_VERSION% installer.nsi >nul 2>&1
     if %errorlevel% equ 0 (
         echo  Setup 安装包制作成功！
     ) else (

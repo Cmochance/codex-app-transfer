@@ -43,11 +43,10 @@ fi
 cp LICENSE.txt "dist/Codex-App-Transfer/LICENSE.txt"
 
 if [[ "$SKIP_INSTALLER" != "1" ]]; then
-    echo "==> NSIS installer"
-    # installer.nsi already !defines PRODUCT_VERSION; passing -D would clash.
-    # If the .nsi version drifts from $VERSION the upstream build script will
-    # warn — but for now both are pinned to 1.0.0.
-    makensis installer.nsi
+    echo "==> NSIS installer (PRODUCT_VERSION=$VERSION)"
+    # 单一版本源在 backend/config.py;installer.nsi 已改成 !ifndef PRODUCT_VERSION,
+    # 这里通过 -D 注入 $VERSION,nsi 文件不再保留版本副本。
+    makensis -DPRODUCT_VERSION="$VERSION" installer.nsi
 fi
 
 echo "==> Done. Container produced raw artifacts; host driver will sign + index."

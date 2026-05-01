@@ -27,10 +27,10 @@ from backend.main import (
 )
 from backend import config as cfg
 from backend import registry
+from backend.config import APP_VERSION  # 唯一版本源:backend/config.py
 
 
 APP_NAME = "Codex App Transfer"
-APP_VERSION = "1.0.2"
 TRAY_OPEN_LABEL = "打开 Codex App Transfer"
 TRAY_QUIT_LABEL = "退出"
 _macos_app_delegate = None

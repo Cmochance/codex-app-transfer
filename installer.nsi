@@ -8,7 +8,13 @@
 ;============================================
 
 !define PRODUCT_NAME "Codex App Transfer"
-!define PRODUCT_VERSION "1.0.2"
+; PRODUCT_VERSION 从命令行 -DPRODUCT_VERSION=x.y.z 注入,防止本文件成为版本副本。
+; 单一版本源在 backend/config.py:APP_VERSION,Windows 构建脚本(docker/windows-builder/build.sh
+; / build.bat / scripts/New-Release.ps1)负责传 -D。裸跑 makensis installer.nsi
+; 不传 -D 时回退默认值,只为提示用户走构建脚本而不是直接调 makensis。
+!ifndef PRODUCT_VERSION
+  !define PRODUCT_VERSION "0.0.0"
+!endif
 !define PRODUCT_PUBLISHER "Codex App Transfer"
 !define PRODUCT_DIR "$PROGRAMFILES64\Codex-App-Transfer"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"

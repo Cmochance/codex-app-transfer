@@ -1,5 +1,7 @@
-VERSION ?= 1.0.0
 PYTHON  ?= .venv/bin/python
+# 唯一版本源: backend/config.py:APP_VERSION
+# 优先用环境变量(允许 CI 临时覆盖如 release candidates),否则从 Python 读取。
+VERSION ?= $(shell $(PYTHON) -c "from backend.config import APP_VERSION; print(APP_VERSION)" 2>/dev/null || echo 0.0.0)
 WIN_IMAGE_TAG   ?= codex-app-transfer-win:latest
 LINUX_IMAGE_TAG ?= codex-app-transfer-linux:latest
 

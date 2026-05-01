@@ -15,10 +15,11 @@ def detect_app_version():
     env_version = os.environ.get("CCDS_VERSION")
     if env_version:
         return env_version
-    text = (ROOT / "main.py").read_text(encoding="utf-8")
+    # 唯一版本源:backend/config.py:APP_VERSION
+    text = (ROOT / "backend" / "config.py").read_text(encoding="utf-8")
     match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
     if not match:
-        raise RuntimeError("APP_VERSION not found in main.py")
+        raise RuntimeError("APP_VERSION not found in backend/config.py")
     return match.group(1)
 
 

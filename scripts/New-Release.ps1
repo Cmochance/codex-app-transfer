@@ -241,7 +241,8 @@ Invoke-OptionalCodeSigning -Files @($folderExe, $oneFileExe)
 if ($TryInstaller) {
     $makensis = Get-Makensis
     if ($makensis) {
-        & $makensis installer.nsi
+        # 通过 -D 把脚本参数 $Version 传给 NSIS,installer.nsi 不再保留版本副本
+        & $makensis "/DPRODUCT_VERSION=$Version" installer.nsi
         if ($LASTEXITCODE -ne 0) {
             throw "NSIS failed with exit code $LASTEXITCODE"
         }
