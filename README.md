@@ -15,19 +15,30 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本：v1.0.0（首个公开发布版本）
+- 当前版本：v1.0.1
 - 已验证供应商：Kimi For Coding（`kimi-for-coding` UA 网关）
-- 实验兼容：DeepSeek / 智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
+- 实验兼容：DeepSeek V4（含「Max 思维」思考模式）/ 智谱 GLM / 阿里云百炼 / Xiaomi MiMo / 其它 OpenAI Chat 兼容反代
 - 平台：Windows x64 安装版 / Windows 便携版 / macOS arm64 / Linux x86_64
+
+### v1.0.1 主要变化
+
+- **修复 `previous_response_id` 多轮对话上下文丢失**：与 Kimi / DeepSeek 等 OpenAI Chat 上游做多轮工具调用时，第 2-3 轮起会出现"模型彻底失忆、回复 'I'm here, what would you like me to help you with today?'"等表现 —— 实质是 100% session_cache miss。修复 cache 查询前先 decode `resp_<base64>` 还原原始 `chatcmpl-xxx`，等价于 litellm `session_handler.py:284-291` 的标准做法。
+- **修复 Kimi / DeepSeek thinking 模式三类异常**：(1) 深层对话 `400 reasoning_content is missing` —— 占位改单空格 + strip 后判空；(2) 思维内容流式 UI 卡住 —— 改用正确的 `reasoning_summary_part.added/done` + `summary_index` 协议事件；(3) 思考结束后工具调用 `400 tool_call_id is not found` —— 多字段 fallback + 全局 `TOOL_CALLS_CACHE` 重建缺失的 assistant.tool_calls。
+- **Codex CLI 原配置自动还原 + 启动自动应用**：第一次「应用配置」前自动备份 `~/.codex/{config.toml,auth.json}` 至本工具目录；顶栏按钮由「清除配置」改为**「还原 Codex 原配置」**，按 key 智能合并。退出 / 下次启动自动还原；启动时按当前 active provider 自动写入 + 按需起转发。Settings 新增两个开关，均默认开启。
+- **多家提供商切换到 OpenAI Chat 兼容路径**：DeepSeek / 智谱 GLM / 阿里云百炼 / Xiaomi MiMo 五家的默认 `apiFormat` 改为 `openai_chat`，转发统一为 `<baseUrl>/chat/completions`。智谱 / 百炼默认认证由 `x-api-key` 改为 `Authorization: Bearer`，DeepSeek baseURL 由 `/anthropic` 改为 `/v1`。
+- **DeepSeek V4 思维模式**：「DeepSeek Max 思维」开关现支持 chat/completions 路径，请求体按 [DeepSeek V4 Thinking Mode 文档](https://api-docs.deepseek.com/guides/thinking_mode) 对齐。
+- **修复 Windows 安装版启动崩溃**：v1.0.1 安装版报 `ModuleNotFoundError: jaraco.text`，原因是 PyInstaller 配置遗漏 `pkg_resources` 的 vendored 依赖。
+- 编辑页新增「未端到端验证」提示横幅；移除遗留的 CC-Switch 导入功能。完整变更见 [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md)。
 
 ## 能做什么
 
 - 管理多套供应商，按 OpenAI 模型名（gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex / gpt-5.2）映射到供应商真实模型 ID。
-- 把 Codex CLI 的 Responses API 流式 / 非流式请求转换为 Chat Completions 格式后转发。
+- 把 Codex CLI 的 Responses API 流式 / 非流式请求转换为 Chat Completions 格式后转发，多轮工具对话上下文 + 思维内容流式展开均已对齐 OpenAI Responses API 协议。
 - 兼容 Codex CLI 0.126+ 的 `responses_websocket` 主连接和 `responses_http` HTTP 回退（含 `/responses` 路由别名）。
-- 自动把上游 `chatcmpl-...` 应答 ID 重写成 Codex CLI 校验通过的 `resp_...`，并保留 deployment affinity 编码。
-- thinking 开启的上游（Kimi / DeepSeek 等）自动给历史 assistant tool_call 消息补 `reasoning_content`，避免 400。
+- 自动把上游 `chatcmpl-...` 应答 ID 重写成 Codex CLI 校验通过的 `resp_...`，并保留 deployment affinity 编码；session_cache 查询前自动 decode 回原始 ID。
+- thinking 开启的上游（Kimi / DeepSeek 等）三层防御：单空格占位 `reasoning_content`、`reasoning_summary_part` 标准协议事件、全局 `TOOL_CALLS_CACHE` 在历史压缩后重建缺失的 assistant.tool_calls。
 - 自动归一化 `reasoning_effort`（`xhigh` / `max` → `high`，`auto` / `none` 直接丢弃），适配只接受 `minimal/low/medium/high` 的供应商。
+- Codex CLI 原配置守护：apply 前自动快照 `~/.codex/{config.toml,auth.json}`，退出 / 下次启动按 key 智能合并还原；切到不需转发的 provider 自动停转发服务。
 - 实时日志面板：每 2 秒自动刷新；提供"查看日志"按钮直接打开 `~/.codex-app-transfer/logs/`；"清除日志"按钮会把当前日志备份到 `logs/backup/` 后开启新日志，不直接删除文件。
 - 中文 / 英文界面，浅色 / 深色 / 绿色 / 橙色 / 灰色 / 白色多种主题（仅深色会改变背景色）。
 - Windows 系统托盘 + 单实例锁定。
@@ -87,10 +98,12 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: v1.0.0 (first public release)
+- Current version: v1.0.1
 - Validated upstream: Kimi For Coding (`kimi-for-coding` UA gateway)
-- Experimental compatibility: DeepSeek / Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
+- Experimental compatibility: DeepSeek V4 (with "Max thinking" mode) / Zhipu GLM / Alibaba Cloud Bailian / Xiaomi MiMo / other OpenAI Chat-compatible reverse proxies
 - Platforms: Windows x64 installer / Windows portable / macOS arm64 / Linux x86_64
+
+v1.0.1 highlights: multi-turn `previous_response_id` context-loss fix, three thinking-mode anomalies fixed, `~/.codex/` original-config snapshot/restore, auto-apply on start, Windows installer crash fix. See [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md) for details.
 
 ### Getting started
 
@@ -215,7 +228,7 @@ build.bat                 # 交互式选 1/2/3/4
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\New-Release.ps1 `
     -Version 1.0.0 -Build -TryInstaller `
     -Repository Cmochance/codex-app-transfer
-python scripts\release_assets.py --version 1.0.0 --include windows
+python scripts\release_assets.py --version 1.0.1 --include windows
 ```
 
 带代码签名证书时再加 `-CodeSign -CodeSigningCertificateBase64 ...`，参见 `scripts/Invoke-CodeSigning.ps1`。
@@ -224,7 +237,7 @@ python scripts\release_assets.py --version 1.0.0 --include windows
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Test-ReleaseSignature.ps1 `
-    -File release\Codex-App-Transfer-v1.0.0-Windows-Setup.exe
+    -File release\Codex-App-Transfer-v1.0.1-Windows-Setup.exe
 ```
 
 或在任意有 Python + cryptography 的环境里：
@@ -236,7 +249,7 @@ import base64
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 pub = serialization.load_pem_public_key(Path('release/Codex-App-Transfer-release-public.pem').read_bytes())
-asset = 'release/Codex-App-Transfer-v1.0.0-Linux-x86_64.tar.gz'
+asset = 'release/Codex-App-Transfer-v1.0.1-Linux-x86_64.tar.gz'
 sig = base64.b64decode(Path(asset+'.sig').read_text())
 pub.verify(sig, Path(asset).read_bytes(), padding.PKCS1v15(), hashes.SHA256())
 print('OK')
@@ -247,7 +260,7 @@ print('OK')
 
 ### Codex CLI 提示 `404 Not Found url: http://127.0.0.1:18080/responses`
 
-老版本只有 `/v1/responses`，Codex CLI 0.126 起会回退到 `/responses`（不带 `/v1/`）。本工具已加路由别名，更新到 v1.0.0+ 即可。
+老版本只有 `/v1/responses`，Codex CLI 0.126 起会回退到 `/responses`（不带 `/v1/`）。本工具已加路由别名，更新到 v1.0.1+ 即可。
 
 ### Codex CLI 提示 `stream disconnected before completion`
 
@@ -255,7 +268,7 @@ print('OK')
 
 ### 上游 400：`thinking is enabled but reasoning_content is missing in assistant tool call message`
 
-Kimi / DeepSeek 在开启 thinking 后强制要求历史中带 tool_call 的 assistant 消息提供 `reasoning_content`。v1.0.0 已自动补默认空字符串，并把 Responses 输入里的 reasoning items 映射到对应 assistant 消息。如果仍出现，请抓一份转发日志反馈。
+Kimi / DeepSeek 在开启 thinking 后强制要求历史中带 tool_call 的 assistant 消息提供 `reasoning_content`。v1.0.1 已自动补默认空字符串，并把 Responses 输入里的 reasoning items 映射到对应 assistant 消息。如果仍出现，请抓一份转发日志反馈。
 
 ### 上游 400：`'reasoning_effort' does not support 'xhigh'`
 
