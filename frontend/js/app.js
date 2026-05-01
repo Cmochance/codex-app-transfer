@@ -968,9 +968,11 @@
     if (label) label.classList.toggle("required", input.required);
   }
 
-  function isKimiProviderId(id) {
+  function isVerifiedProviderId(id) {
     const value = String(id || "").toLowerCase();
-    return value === "kimi" || value === "kimi-code" || value.startsWith("kimi-");
+    if (value === "kimi" || value === "kimi-code" || value.startsWith("kimi-")) return true;
+    if (value === "xiaomi-mimo-token-plan") return true;
+    return false;
   }
 
   function setUnverifiedBanner(show) {
@@ -1019,7 +1021,7 @@
     setProviderMappings(preset.models || emptyMappings());
     renderPresetOptions(preset, preset.models || emptyMappings());
     updatePresetSelection();
-    setUnverifiedBanner(!isKimiProviderId(preset.id));
+    setUnverifiedBanner(!isVerifiedProviderId(preset.id));
     if (notify) showToast(`${preset.name} ${t("toast.presetFilled")}`);
   }
 
@@ -1068,7 +1070,7 @@
     setProviderMappings(provider.mappings || emptyMappings());
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
     updatePresetSelection();
-    setUnverifiedBanner(!isKimiProviderId(matchedPreset?.id || provider.id));
+    setUnverifiedBanner(!isVerifiedProviderId(matchedPreset?.id || provider.id));
   }
 
   async function renderProviderForm() {

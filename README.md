@@ -16,8 +16,8 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 ## 项目状态
 
 - 当前版本：v1.0.2
-- 已验证供应商：Kimi For Coding（`kimi-for-coding` UA 网关）
-- 实验兼容：DeepSeek V4（含「Max 思维」思考模式）/ 智谱 GLM / 阿里云百炼 / Xiaomi MiMo / 其它 OpenAI Chat 兼容反代
+- 已验证供应商：Kimi For Coding（`kimi-for-coding` UA 网关）、Xiaomi MiMo (Token Plan)
+- 实验兼容：DeepSeek V4（含「Max 思维」思考模式）/ 智谱 GLM / 阿里云百炼 / Xiaomi MiMo (Pay for Token) / 其它 OpenAI Chat 兼容反代
 - 平台：Windows x64 安装版 / Windows 便携版 / macOS arm64 / Linux x86_64
 
 ### v1.0.2 主要变化
@@ -105,8 +105,8 @@ The Windows installer / portable build opens a standalone desktop window by defa
 ### Project status
 
 - Current version: v1.0.2
-- Validated upstream: Kimi For Coding (`kimi-for-coding` UA gateway)
-- Experimental compatibility: DeepSeek V4 (with "Max thinking" mode) / Zhipu GLM / Alibaba Cloud Bailian / Xiaomi MiMo / other OpenAI Chat-compatible reverse proxies
+- Validated upstream: Kimi For Coding (`kimi-for-coding` UA gateway), Xiaomi MiMo (Token Plan)
+- Experimental compatibility: DeepSeek V4 (with "Max thinking" mode) / Zhipu GLM / Alibaba Cloud Bailian / Xiaomi MiMo (Pay for Token) / other OpenAI Chat-compatible reverse proxies
 - Platforms: Windows x64 installer / Windows portable / macOS arm64 / Linux x86_64
 
 v1.0.2 highlights: anonymous user feedback system (Cloudflare Worker + R2 + Resend), pywebview WebKit FormData compatibility fix (switched to JSON+base64 transport), refined throttle UX. See [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md). v1.0.1 highlights: multi-turn `previous_response_id` context-loss fix, three thinking-mode anomalies fixed, `~/.codex/` original-config snapshot/restore, auto-apply on start, Windows installer crash fix. See [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md).
