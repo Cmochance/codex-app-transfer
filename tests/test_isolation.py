@@ -76,7 +76,6 @@ MODULES = [
     "backend.config",
     "backend.model_alias",
     "backend.provider_tools",
-    "backend.ccswitch_import",
     "backend.update",
     "backend.registry",
 ]

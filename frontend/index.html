@@ -12,7 +12,6 @@
   <body>
     <header class="app-header">
       <div class="header-actions-left">
-        <button class="btn btn-outline-primary btn-sm dashboard-import-button" type="button" data-action="open-ccswitch-import"><i class="bi bi-box-arrow-in-down"></i><span data-i18n="dashboard.importCcSwitch">导入 CC Switch 配置</span></button>
         <button class="btn btn-outline-danger btn-sm dashboard-clear-button" type="button" data-action="clear-desktop"><i class="bi bi-trash"></i><span data-i18n="dashboard.clearDesktopConfig">清除 Codex CLI 配置</span></button>
       </div>
       <nav class="route-tabs" aria-label="Primary navigation">
@@ -347,7 +346,7 @@
               <p class="settings-note" data-i18n="settings.thirdPartyCompatHint">Responses 兼容接口是稳定主线；OpenAI Chat、new-api、CPA、OpenCode Go 属于实验适配，工具调用需要单独验证。</p>
             </div>
           </div>
-          <div class="settings-row settings-row-stack" id="ccSwitchImportSection">
+          <div class="settings-row settings-row-stack">
             <strong data-i18n="settings.configBackup">配置备份</strong>
             <div>
               <div class="settings-actions">
@@ -358,17 +357,6 @@
               </div>
               <div class="backup-list" id="backupList"></div>
               <p class="settings-note" data-i18n="settings.configBackupHint">导出的配置会包含 API Key，请只保存在可信设备上。</p>
-            </div>
-          </div>
-          <div class="settings-row settings-row-stack">
-            <strong data-i18n="settings.ccswitchImport">CC-Switch 导入</strong>
-            <div>
-              <div class="settings-actions">
-                <button class="btn btn-outline-primary btn-sm" type="button" data-action="detect-ccswitch"><i class="bi bi-search"></i><span data-i18n="settings.ccswitchDetect">检测配置</span></button>
-                <button class="btn btn-outline-primary btn-sm" type="button" data-action="import-ccswitch"><i class="bi bi-box-arrow-in-down"></i><span data-i18n="settings.ccswitchImportButton">导入兼容项</span></button>
-              </div>
-              <div class="ccswitch-import-list" id="ccSwitchImportList"></div>
-              <p class="settings-note" data-i18n="settings.ccswitchImportHint">只导入 Responses 兼容配置；OpenAI 格式会显示为暂不导入，避免转换风险。</p>
             </div>
           </div>
         </article>

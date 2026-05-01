@@ -14,7 +14,7 @@ CC Desktop Switch - PyInstaller 构建配置
 
 import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules, copy_metadata
 
 ROOT = Path(SPECPATH)
 FRONTEND = ROOT / "frontend"
@@ -44,26 +44,32 @@ def safe_copy_metadata(package):
 PYSTRAY_HIDDENIMPORTS = safe_collect_submodules("pystray")
 PYSTRAY_DATAS = safe_copy_metadata("pystray") + safe_copy_metadata("Pillow")
 
+# PyInstaller 的运行时 hook pyi_rth_pkgres.py 启动时一定会 import pkg_resources。
+# 新版 setuptools 把 jaraco.text / more_itertools / platformdirs / zipp / packaging
+# 等 vendored 到 pkg_resources/_vendor/ 下，必须整体收集，否则 Windows 启动会报
+# ModuleNotFoundError: No module named 'jaraco.text'。
+PKG_RES_DATAS, PKG_RES_BINARIES, PKG_RES_HIDDENIMPORTS = collect_all("pkg_resources")
+
 block_cipher = None
 
 a = Analysis(
     ["main.py"],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=[] + PKG_RES_BINARIES,
     datas=[
         (str(FRONTEND), "frontend"),
         (str(ROOT / "LICENSE.txt"), "."),
-    ] + WEBVIEW_DATAS + PYSTRAY_DATAS,
+    ] + WEBVIEW_DATAS + PYSTRAY_DATAS + PKG_RES_DATAS,
     hiddenimports=[
         "backend", "backend.main", "backend.config",
         "backend.registry", "backend.proxy", "backend.update",
-    ] + WEBVIEW_HIDDENIMPORTS + PYSTRAY_HIDDENIMPORTS,
+    ] + WEBVIEW_HIDDENIMPORTS + PYSTRAY_HIDDENIMPORTS + PKG_RES_HIDDENIMPORTS,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
         "tkinter", "matplotlib", "numpy", "pandas",
-        "scipy", "setuptools", "pip",
+        "scipy", "pip",
         "cryptography", "zmq", "notebook", "IPython",
         "PyQt5", "PySide2", "PySide6",
     ],

@@ -20,7 +20,6 @@ from fastapi.staticfiles import StaticFiles
 
 from backend import config as cfg
 from backend.config import APP_VERSION
-from backend import ccswitch_import
 from backend import provider_tools
 from backend import registry
 from backend import update as updater
@@ -722,49 +721,6 @@ def create_admin_app() -> FastAPI:
             "success": True,
             "message": "配置已导入",
             "backup": result["backup"],
-        }
-
-    # ── CC-Switch 导入 API ──
-    @app.get("/api/ccswitch/status")
-    async def get_ccswitch_status():
-        """检测本机 CC-Switch 配置。不会返回 API Key。"""
-        return {"success": True, **ccswitch_import.status()}
-
-    @app.get("/api/ccswitch/providers")
-    async def get_ccswitch_providers():
-        """预览可从 CC-Switch 导入的 Claude provider。API Key 只返回掩码。"""
-        try:
-            providers = ccswitch_import.read_providers()
-        except ccswitch_import.CcSwitchImportError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "message": str(exc)},
-            )
-        return {
-            "success": True,
-            "providers": providers,
-            "supportedCount": len([item for item in providers if item.get("supported")]),
-            "unsupportedCount": len([item for item in providers if not item.get("supported")]),
-        }
-
-    @app.post("/api/ccswitch/import")
-    async def import_ccswitch_providers(request: Request):
-        """把 CC-Switch 的 Responses 兼容 provider 导入本工具。"""
-        data = await request.json() if request.headers.get("content-type") == "application/json" else {}
-        try:
-            result = ccswitch_import.import_providers(
-                ids=data.get("ids"),
-                set_default=bool(data.get("setDefault")),
-            )
-        except ccswitch_import.CcSwitchImportError as exc:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "message": str(exc)},
-            )
-        return {
-            "success": True,
-            "message": f"已导入 {len(result['imported'])} 个 CC-Switch 配置",
-            **result,
         }
 
     # ── Desktop 集成 API ──

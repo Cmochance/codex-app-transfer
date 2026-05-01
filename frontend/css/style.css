@@ -1588,7 +1588,7 @@ label[for],
   }
 }
 
-/* CC Switch style refinement: compact desktop utility surface */
+/* Compact desktop utility surface */
 :root {
   --app-bg: #ffffff;
   --surface: #ffffff;
@@ -1889,7 +1889,6 @@ body {
   flex-shrink: 0;
 }
 
-.dashboard-import-button,
 .dashboard-clear-button {
   min-height: 38px;
   padding-inline: 14px;
@@ -2846,23 +2845,6 @@ body {
   padding: 14px 0;
 }
 
-.settings-row.focus-flash {
-  border-radius: 12px;
-  animation: focusFlash 1.35s ease-out;
-}
-
-@keyframes focusFlash {
-  0%,
-  65% {
-    background: color-mix(in srgb, var(--primary) 10%, transparent);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 24%, transparent);
-  }
-  100% {
-    background: transparent;
-    box-shadow: none;
-  }
-}
-
 .settings-actions {
   display: flex;
   flex-wrap: wrap;
@@ -3056,75 +3038,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.ccswitch-import-list {
-  display: grid;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.ccswitch-import-empty,
-.ccswitch-import-summary {
-  margin: 0;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.ccswitch-import-item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 8px 12px;
-  align-items: center;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--surface);
-}
-
-.ccswitch-import-item.supported {
-  border-color: color-mix(in srgb, var(--primary) 40%, var(--line));
-  background: var(--primary-soft);
-}
-
-.ccswitch-import-item.unsupported {
-  opacity: .76;
-}
-
-.ccswitch-import-item strong,
-.ccswitch-import-item span,
-.ccswitch-import-item small {
-  display: block;
-}
-
-.ccswitch-import-item strong {
-  font-size: 13px;
-}
-
-.ccswitch-import-item small,
-.ccswitch-import-item p,
-.ccswitch-import-secret {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.ccswitch-import-item p {
-  grid-column: 1 / -1;
-  margin: 0;
-}
-
-.ccswitch-import-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.ccswitch-import-item.supported .ccswitch-import-status {
-  color: var(--primary);
 }
 
 .settings-note {

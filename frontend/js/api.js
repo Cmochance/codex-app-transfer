@@ -306,18 +306,6 @@
       return api('POST', '/api/config/import', configData);
     },
 
-    async getCcSwitchStatus() {
-      return api('GET', '/api/ccswitch/status');
-    },
-
-    async getCcSwitchProviders() {
-      return api('GET', '/api/ccswitch/providers');
-    },
-
-    async importCcSwitchProviders(ids, setDefault = false) {
-      return api('POST', '/api/ccswitch/import', { ids, setDefault });
-    },
-
     async getActivities() {
       const data = await api('GET', '/api/proxy/logs');
       const logs = data.logs || [];
