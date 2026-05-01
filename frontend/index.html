@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="zh-CN" data-bs-theme="light">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Codex App Transfer</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <link rel="icon" href="assets/app-icon.png">
+    <link href="css/style.css" rel="stylesheet">
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="header-actions-left">
+        <button class="btn btn-outline-primary btn-sm dashboard-import-button" type="button" data-action="open-ccswitch-import"><i class="bi bi-box-arrow-in-down"></i><span data-i18n="dashboard.importCcSwitch">导入 CC Switch 配置</span></button>
+        <button class="btn btn-outline-danger btn-sm dashboard-clear-button" type="button" data-action="clear-desktop"><i class="bi bi-trash"></i><span data-i18n="dashboard.clearDesktopConfig">清除 Codex CLI 配置</span></button>
+      </div>
+      <nav class="route-tabs" aria-label="Primary navigation">
+        <a href="#dashboard" class="route-tab" data-nav="dashboard" title="Providers"><i class="bi bi-speedometer2"></i><span data-i18n="nav.dashboard">仪表盘</span></a>
+        <a href="#providers" class="route-tab" data-nav="providers" title="Providers"><i class="bi bi-plug"></i><span data-i18n="nav.providers">提供商</span></a>
+        <a href="#proxy" class="route-tab" data-nav="proxy" title="Forwarding"><i class="bi bi-broadcast-pin"></i><span data-i18n="nav.proxy">转发</span></a>
+        <a href="#settings" class="route-tab" data-nav="settings" title="Settings"><i class="bi bi-gear"></i><span data-i18n="nav.settings">设置</span></a>
+        <a href="#guide" class="route-tab" data-nav="guide" title="Guide"><i class="bi bi-book"></i><span data-i18n="nav.guide">引导</span></a>
+      </nav>
+      <div class="header-actions">
+        <div class="lang-switch" aria-label="language switch">
+          <button class="text-button active" type="button" data-lang="zh">中</button>
+          <span>/</span>
+          <button class="text-button" type="button" data-lang="en">EN</button>
+        </div>
+        <span class="header-divider"></span>
+        <a class="theme-btn" href="#settings" aria-label="Settings">
+          <i class="bi bi-gear"></i>
+        </a>
+        <button class="theme-btn" type="button" data-theme-action="toggle" aria-label="Toggle theme">
+          <i class="bi bi-moon-stars-fill"></i>
+        </button>
+        <a class="round-add" href="#providers/add" aria-label="Add provider">
+          <i class="bi bi-plus-lg"></i>
+        </a>
+      </div>
+    </header>
+
+    <main class="app-main">
+      <section class="page active" id="page-dashboard" data-page="dashboard">
+        <div class="switch-board">
+          <div class="provider-card-list" id="dashboardProviderCards"></div>
+        </div>
+
+        <div class="status-grid">
+          <article class="status-card">
+            <h2 data-i18n="dashboard.desktopStatus">桌面版状态</h2>
+            <div class="hero-status muted" id="dashboardDesktopIcon"><i class="bi bi-exclamation-lg"></i></div>
+            <strong class="muted-text" id="dashboardDesktopStatus" data-i18n="status.notConfigured">未配置</strong>
+          </article>
+          <article class="status-card">
+            <h2 data-i18n="dashboard.proxyStatus">代理状态</h2>
+            <div class="hero-line-icon success"><i class="bi bi-hdd-network"></i><i class="bi bi-activity badge-icon"></i></div>
+            <strong id="dashboardProxyStatus">运行中 :18080</strong>
+          </article>
+          <article class="status-card">
+            <h2 data-i18n="dashboard.activeProvider">当前提供商</h2>
+            <span class="large-dot"></span>
+            <strong id="dashboardProviderName">DeepSeek</strong>
+          </article>
+        </div>
+        <div class="desktop-warning" id="dashboardDesktopWarning" hidden>
+          <i class="bi bi-exclamation-triangle"></i>
+          <span></span>
+        </div>
+
+        <div class="quick-actions">
+          <a href="#providers/add" class="btn btn-primary action-button"><i class="bi bi-magic"></i><span data-i18n="dashboard.configureDesktop">添加并生成配置</span></a>
+          <button class="btn btn-success action-button" type="button" data-action="proxy-start"><i class="bi bi-play-circle"></i><span data-i18n="proxy.start">启动转发</span></button>
+          <a href="#providers" class="btn btn-outline-primary action-button"><i class="bi bi-arrow-left-right"></i><span data-i18n="dashboard.switchProvider">切换提供商</span></a>
+        </div>
+
+        <article class="panel">
+          <div class="panel-header">
+            <div class="title-with-icon">
+              <span class="soft-icon"><i class="bi bi-file-earmark-text"></i></span>
+              <h2 data-i18n="dashboard.recentActivity">最近操作</h2>
+            </div>
+            <button class="btn btn-outline-primary btn-sm" type="button" data-action="view-logs"><span data-i18n="common.viewAll">查看全部</span><i class="bi bi-chevron-right"></i></button>
+          </div>
+          <div class="activity-list" id="activityList"></div>
+        </article>
+      </section>
+
+      <section class="page" id="page-providers-add" data-page="providers/add">
+        <div class="page-title">
+          <h1 data-i18n="providersAdd.title">添加提供商</h1>
+          <p data-i18n="providersAdd.subtitle">添加新的 API 提供商或选择预设</p>
+        </div>
+
+        <div class="two-column provider-add-layout">
+          <article class="panel form-panel">
+            <form id="providerForm" autocomplete="off">
+              <div class="mb-4">
+                <label class="form-label required" for="providerName" data-i18n="providers.name">提供商名称</label>
+                <input class="form-control form-control-lg" id="providerName" name="name" value="My DeepSeek" autocomplete="organization" required>
+              </div>
+              <div class="mb-4">
+                <div class="label-line">
+                  <label class="form-label required" for="providerBaseUrl">API Base URL</label>
+                  <button class="link-action" type="button" data-action="test-provider-form"><i class="bi bi-lightning-charge"></i><span data-i18n="providers.manageAndTest">管理与测速</span></button>
+                </div>
+                <div class="baseurl-input-wrap" id="providerBaseUrlControl">
+                  <input class="form-control form-control-lg" id="providerBaseUrl" name="baseUrl" value="https://api.deepseek.com/anthropic" autocomplete="url" required>
+                  <button class="baseurl-trigger" id="providerBaseUrlTrigger" type="button" data-action="toggle-baseurl-menu" aria-haspopup="listbox" aria-expanded="false" hidden>
+                    <i class="bi bi-chevron-down" aria-hidden="true"></i>
+                  </button>
+                  <div class="baseurl-menu" id="providerBaseUrlMenu" role="listbox" aria-labelledby="providerBaseUrlTrigger"></div>
+                </div>
+                <p class="field-hint" id="providerBaseUrlHint" hidden></p>
+                <div class="speed-result" id="formSpeedResult"></div>
+              </div>
+              <div class="mb-4">
+                <label class="form-label required" for="providerApiKey">API Key</label>
+                <div class="input-with-button">
+                  <input class="form-control form-control-lg" id="providerApiKey" name="apiKey" type="password" placeholder="sk-..." autocomplete="current-password" required>
+                  <button type="button" class="input-icon" data-action="toggle-key" aria-label="toggle api key"><i class="bi bi-eye"></i></button>
+                </div>
+              </div>
+              <div class="mb-4">
+                <label class="form-label required" for="providerAuth">Auth Scheme</label>
+                <input id="providerAuth" name="authScheme" type="hidden" value="bearer">
+                <div class="auth-scheme-menu-wrap" id="providerAuthControl">
+                  <button class="form-select form-select-lg auth-scheme-trigger" id="providerAuthTrigger" type="button" data-action="toggle-auth-scheme-menu" aria-haspopup="listbox" aria-expanded="false">
+                    <span>bearer</span>
+                    <i class="bi bi-chevron-down"></i>
+                  </button>
+                  <div class="auth-scheme-menu" id="providerAuthMenu" role="listbox" aria-labelledby="providerAuthTrigger">
+                    <button class="auth-scheme-option selected" type="button" role="option" data-action="select-auth-scheme" data-value="bearer" aria-selected="true"><span>bearer</span><i class="bi bi-check2"></i></button>
+                    <button class="auth-scheme-option" type="button" role="option" data-action="select-auth-scheme" data-value="x-api-key" aria-selected="false"><span>x-api-key</span></button>
+                    <button class="auth-scheme-option" type="button" role="option" data-action="select-auth-scheme" data-value="none" aria-selected="false"><span>none</span></button>
+                  </div>
+                </div>
+              </div>
+              <details class="advanced-provider-options" open>
+                <summary><i class="bi bi-sliders"></i><span data-i18n="providersAdd.compatTitle">高级：第三方兼容接口</span><i class="bi bi-chevron-down compat-chevron"></i></summary>
+                <p data-i18n="providersAdd.compatHint">默认使用 Responses 兼容接口。OpenAI Chat 属于实验适配，建议确认工具调用可用后再用于 Claude Code。</p>
+                <div class="format-choice" id="providerFormatChoice" role="group" aria-label="API format">
+                  <button class="format-choice-button active" type="button" data-api-format="responses">
+                    <strong data-i18n="providersAdd.formatResponses">Responses 兼容</strong>
+                    <span data-i18n="providersAdd.formatResponsesHint">推荐，稳定主流程</span>
+                  </button>
+                  <button class="format-choice-button" type="button" data-api-format="openai_chat">
+                    <strong data-i18n="providersAdd.formatOpenAI">OpenAI Chat 实验</strong>
+                    <span data-i18n="providersAdd.formatOpenAIHint">用于 new-api / CPA / OpenCode Go 等兼容端点</span>
+                  </button>
+                </div>
+              </details>
+              <section class="provider-mapping-section">
+                <div class="section-title-row">
+                  <div>
+                    <h2 data-i18n="providersAdd.mappingTitle">模型映射</h2>
+                    <p data-i18n="providersAdd.mappingSubtitle">把 OpenAI 模型名（gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex / gpt-5.2）映射到这个供应商真实支持的模型。未设置的模型自动使用 Default 映射。</p>
+                  </div>
+                  <button class="provider-mapping-fetch" type="button" data-action="fetch-form-models"><i class="bi bi-cloud-arrow-down"></i><span data-i18n="models.fetch">获取模型</span></button>
+                </div>
+                <div class="form-mapping-grid" id="providerMappingStack"></div>
+                <div class="preset-options" id="providerPresetOptions" hidden></div>
+                <p class="inline-status" id="providerModelFetchResult"></p>
+                <div class="apply-explain">
+                  <i class="bi bi-info-circle"></i>
+                  <p data-i18n="providersAdd.applyHint">一键应用会保存供应商和模型映射，把它设为默认，并让 Codex CLI 连接到本工具。之后你在 Codex CLI 里发消息，本工具会自动转发到你填写的 API 地址。</p>
+                </div>
+              </section>
+              <div class="button-row provider-form-actions">
+                <button class="btn btn-primary btn-lg" type="button" data-action="apply-provider-desktop"><i class="bi bi-magic"></i><span data-i18n="providersAdd.applyToDesktop">一键生成 Codex CLI 配置</span></button>
+                <button class="btn btn-outline-primary btn-lg" id="providerSaveOnly" type="submit" data-i18n="common.saveOnly">仅保存</button>
+                <a class="btn btn-outline-primary btn-lg" href="#providers" data-i18n="common.cancel">取消</a>
+              </div>
+            </form>
+          </article>
+
+          <article class="panel preset-panel">
+            <h2 data-i18n="providersAdd.presets">快捷预设</h2>
+            <p class="preset-help" data-i18n="providersAdd.presetsHint">选择后会自动填入 API 地址和推荐模型，API Key 仍由你自己填写。</p>
+            <div id="presetList" class="preset-list"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="page" id="page-providers" data-page="providers">
+        <div class="page-title with-action">
+          <div>
+            <h1 data-i18n="providers.title">提供商</h1>
+            <p data-i18n="providers.subtitle">管理已配置的 API 提供商</p>
+          </div>
+          <a href="#providers/add" class="btn btn-primary btn-lg"><i class="bi bi-plus-lg"></i><span data-i18n="providers.add">添加提供商</span></a>
+        </div>
+
+        <article class="panel model-menu-mode-panel" hidden aria-hidden="true">
+          <div>
+            <h2 data-i18n="providers.modelMenuTitle">Claude 模型菜单</h2>
+            <p id="modelMenuModeHint" data-i18n="providers.modelMenuSingleHint">当前只把默认提供商的模型显示到 Codex CLI。</p>
+          </div>
+          <button class="btn btn-outline-primary btn-sm" id="modelMenuModeToggle" type="button" data-action="toggle-model-menu-mode">
+            <i class="bi bi-list-stars"></i><span data-i18n="providers.showAllModels">显示全部模型</span>
+          </button>
+        </article>
+
+        <article class="panel table-panel">
+          <div class="provider-table-header">
+            <span></span>
+            <span data-i18n="providers.name">提供商名称</span>
+            <span data-i18n="providers.baseUrl">API Base URL</span>
+            <span data-i18n="providers.mapping">模型映射</span>
+            <span data-i18n="providers.status">状态</span>
+            <span data-i18n="providers.actions">操作</span>
+          </div>
+          <div id="providerRows"></div>
+        </article>
+      </section>
+
+      <section class="page" id="page-desktop" data-page="desktop">
+        <div class="page-title title-with-back">
+          <a class="square-button" href="#dashboard" aria-label="back"><i class="bi bi-arrow-left"></i></a>
+          <div>
+            <h1 data-i18n="desktop.title">Codex CLI</h1>
+            <p data-i18n="desktop.subtitle">一键让 Codex CLI 使用当前供应商</p>
+          </div>
+        </div>
+
+        <div class="two-column desktop-layout">
+          <div>
+            <article class="panel desktop-card">
+              <h2 data-i18n="desktop.configTitle">Codex CLI 配置</h2>
+              <div class="configured-row">
+                <span class="circle-check"><i class="bi bi-check-lg"></i></span>
+                <strong id="desktopConfiguredText" data-i18n="status.configured">已配置</strong>
+              </div>
+              <div class="desktop-warning compact" id="desktopPageWarning" hidden>
+                <i class="bi bi-exclamation-triangle"></i>
+                <span></span>
+              </div>
+              <div class="config-list" id="desktopConfigList"></div>
+              <div class="apply-explain desktop-explain">
+                <i class="bi bi-diagram-3"></i>
+                <p data-i18n="desktop.explainText">原理很简单：Codex CLI 先连接到本工具；本工具再把模型名翻译成你选择的供应商模型，并转发到对应 API。你的上游 API Key 只保存在本机配置里，不直接写进 Codex CLI。</p>
+              </div>
+              <button class="btn btn-primary btn-lg w-100" type="button" data-action="apply-desktop"><i class="bi bi-download"></i><span data-i18n="desktop.apply">复制环境变量命令</span></button>
+            </article>
+            <article class="panel details-panel">
+              <div class="panel-header">
+                <h2 data-i18n="desktop.details">配置详情</h2>
+                <i class="bi bi-chevron-down"></i>
+              </div>
+              <pre class="code-block" id="desktopJson"></pre>
+            </article>
+            <button class="btn btn-outline-danger btn-lg w-100 danger-outline" type="button" data-action="clear-desktop"><i class="bi bi-trash"></i><span data-i18n="desktop.clear">清除配置</span></button>
+          </div>
+
+          <article class="panel guide-panel">
+            <h2 data-i18n="desktop.quickGuide">快速引导</h2>
+            <div class="mini-steps">
+              <div class="mini-step"><span>1</span><i class="bi bi-cursor"></i><strong data-i18n="desktop.step1Title">复制命令</strong><p data-i18n="desktop.step1Text">把 Codex CLI 连接到本工具</p></div>
+              <div class="mini-step"><span>2</span><i class="bi bi-arrow-clockwise"></i><strong data-i18n="desktop.step2Title">设置环境变量</strong><p data-i18n="desktop.step2Text">在终端执行复制的命令</p></div>
+              <div class="mini-step"><span>3</span><i class="bi bi-display"></i><strong data-i18n="desktop.step3Title">开始使用</strong><p data-i18n="desktop.step3Text">之后在终端使用 codex 命令即可</p></div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="page" id="page-proxy" data-page="proxy">
+        <article class="panel proxy-control">
+          <div class="proxy-running">
+            <span class="pulse-dot"></span>
+            <div class="proxy-running-meta">
+              <strong id="proxyStateText">运行中</strong>
+              <p data-i18n="proxy.localhost">本机监听</p>
+            </div>
+          </div>
+          <div class="port-control">
+            <label class="form-label" for="proxyPort" data-i18n="settings.proxyPort">转发端口</label>
+            <input class="form-control form-control-lg" type="number" id="proxyPort" value="18080">
+          </div>
+          <button class="btn btn-outline-secondary btn-lg" type="button" data-action="proxy-start"><i class="bi bi-play"></i><span data-i18n="proxy.start">启动转发</span></button>
+          <button class="btn btn-danger btn-lg" type="button" data-action="proxy-stop"><i class="bi bi-stop-fill"></i><span data-i18n="proxy.stop">停止转发</span></button>
+        </article>
+
+        <article class="terminal-panel">
+          <div class="terminal-toolbar">
+            <button class="btn btn-outline-light btn-sm" type="button" data-action="open-log-dir"><i class="bi bi-folder2-open"></i><span data-i18n="proxy.viewLog">查看日志</span></button>
+            <button class="btn btn-outline-light btn-sm" type="button" data-action="clear-logs"><i class="bi bi-trash"></i><span data-i18n="proxy.clearLog">清除日志</span></button>
+            <label class="switch-label"><span data-i18n="proxy.autoScroll">自动滚动</span><input type="checkbox" id="autoScroll" checked><span class="switch-ui"></span></label>
+          </div>
+          <div class="terminal-log" id="proxyLog"></div>
+        </article>
+
+        <div class="stats-grid" id="proxyStats"></div>
+      </section>
+
+      <section class="page" id="page-settings" data-page="settings">
+        <article class="panel settings-panel">
+          <div class="settings-row">
+            <strong data-i18n="settings.theme">主题</strong>
+            <div class="segmented theme-segment">
+              <button class="btn active theme-swatch theme-swatch-default" type="button" data-theme-action="default" aria-label="Default theme"></button>
+              <button class="btn theme-swatch theme-swatch-green" type="button" data-theme-action="green" aria-label="Green theme"></button>
+              <button class="btn theme-swatch theme-swatch-orange" type="button" data-theme-action="orange" aria-label="Orange theme"></button>
+              <button class="btn theme-swatch theme-swatch-gray" type="button" data-theme-action="gray" aria-label="Gray theme"></button>
+              <button class="btn theme-swatch theme-swatch-dark" type="button" data-theme-action="dark" aria-label="Dark theme"></button>
+              <button class="btn theme-swatch theme-swatch-white" type="button" data-theme-action="white" aria-label="White theme"></button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <strong data-i18n="settings.language">语言</strong>
+            <div class="segmented language-segment">
+              <button class="btn active" type="button" data-lang="zh">中文</button>
+              <button class="btn" type="button" data-lang="en">EN</button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <strong data-i18n="settings.proxyPort">转发端口</strong>
+            <input class="form-control form-control-lg" type="number" id="settingsProxyPort" value="18080">
+          </div>
+          <div class="settings-row">
+            <strong data-i18n="settings.adminPort">管理端口</strong>
+            <input class="form-control form-control-lg" type="number" id="settingsAdminPort" value="18081">
+          </div>
+          <div class="settings-row">
+            <strong data-i18n="settings.autoStart">开机自启</strong>
+            <label class="switch-label only-switch"><input type="checkbox" id="autoStart" checked><span class="switch-ui"></span></label>
+          </div>
+          <div class="settings-row" hidden aria-hidden="true">
+            <strong data-i18n="settings.exposeAllModels">Claude 模型菜单</strong>
+            <label class="switch-label only-switch"><input type="checkbox" id="exposeAllProviderModels"><span class="switch-ui"></span></label>
+          </div>
+          <div class="settings-row">
+            <strong data-i18n="settings.updateUrl">更新地址</strong>
+            <input class="form-control form-control-lg" type="url" id="settingsUpdateUrl" placeholder="https://github.com/owner/repo/releases/latest/download/latest.json">
+          </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.thirdPartyCompat">第三方兼容</strong>
+            <div>
+              <div class="settings-actions">
+                <button class="btn btn-outline-primary btn-sm" type="button" data-action="check-provider-compatibility"><i class="bi bi-patch-check"></i><span data-i18n="settings.checkCompatibility">检查兼容性</span></button>
+              </div>
+              <div class="compatibility-list" id="providerCompatibilityList"></div>
+              <p class="settings-note" data-i18n="settings.thirdPartyCompatHint">Responses 兼容接口是稳定主线；OpenAI Chat、new-api、CPA、OpenCode Go 属于实验适配，工具调用需要单独验证。</p>
+            </div>
+          </div>
+          <div class="settings-row settings-row-stack" id="ccSwitchImportSection">
+            <strong data-i18n="settings.configBackup">配置备份</strong>
+            <div>
+              <div class="settings-actions">
+                <button class="btn btn-outline-primary btn-sm" type="button" data-action="backup-config"><i class="bi bi-shield-check"></i><span data-i18n="settings.backupNow">立即备份</span></button>
+                <button class="btn btn-outline-primary btn-sm" type="button" data-action="export-config"><i class="bi bi-box-arrow-down"></i><span data-i18n="settings.exportConfig">导出配置</span></button>
+                <button class="btn btn-outline-primary btn-sm" type="button" data-action="choose-import-config"><i class="bi bi-box-arrow-in-up"></i><span data-i18n="settings.importConfig">导入配置</span></button>
+                <input class="visually-hidden" type="file" id="configImportFile" accept="application/json,.json">
+              </div>
+              <div class="backup-list" id="backupList"></div>
+              <p class="settings-note" data-i18n="settings.configBackupHint">导出的配置会包含 API Key，请只保存在可信设备上。</p>
+            </div>
+          </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.ccswitchImport">CC-Switch 导入</strong>
+            <div>
+              <div class="settings-actions">
+                <button class="btn btn-outline-primary btn-sm" type="button" data-action="detect-ccswitch"><i class="bi bi-search"></i><span data-i18n="settings.ccswitchDetect">检测配置</span></button>
+                <button class="btn btn-outline-primary btn-sm" type="button" data-action="import-ccswitch"><i class="bi bi-box-arrow-in-down"></i><span data-i18n="settings.ccswitchImportButton">导入兼容项</span></button>
+              </div>
+              <div class="ccswitch-import-list" id="ccSwitchImportList"></div>
+              <p class="settings-note" data-i18n="settings.ccswitchImportHint">只导入 Responses 兼容配置；OpenAI 格式会显示为暂不导入，避免转换风险。</p>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel about-panel">
+          <h2 data-i18n="settings.about">关于</h2>
+          <div class="about-row"><span data-i18n="settings.version">版本</span><strong>1.0.0</strong></div>
+          <div class="about-row"><span data-i18n="settings.license">许可证</span><strong>MIT License</strong></div>
+          <div class="about-row"><span data-i18n="settings.checkUpdate">检查更新</span><span class="settings-actions inline-actions"><button class="btn btn-outline-primary btn-sm" type="button" data-action="check-update"><i class="bi bi-cloud-arrow-down"></i><span data-i18n="settings.checkUpdate">检查更新</span></button><button class="btn btn-primary btn-sm" id="settingsInstallUpdate" type="button" data-action="install-update" hidden><i class="bi bi-download"></i><span data-i18n="settings.installUpdate">下载并安装</span></button></span></div>
+          <p class="update-status" id="updateStatus"></p>
+          <div class="about-row"><span>GitHub</span><a href="https://github.com/lonr-6/codex-app-transfer" target="_blank" rel="noreferrer"><i class="bi bi-box-arrow-up-right"></i></a></div>
+        </article>
+      </section>
+
+      <section class="page" id="page-guide" data-page="guide">
+        <div class="timeline">
+          <article class="timeline-card"><span>1</span><i class="bi bi-plug"></i><div><h2 data-i18n="guide.step1">添加提供商</h2><p data-i18n="guide.step1Text">选择预设，填入 API Key，必要时调整模型映射。</p></div></article>
+          <article class="timeline-card"><span>2</span><i class="bi bi-magic"></i><div><h2 data-i18n="guide.step2">一键应用</h2><p data-i18n="guide.step2Text">点击“一键生成 Codex CLI 配置”，本工具会生成环境变量配置命令。</p></div></article>
+          <article class="timeline-card"><span>3</span><i class="bi bi-arrow-repeat"></i><div><h2 data-i18n="guide.step3">设置环境变量</h2><p data-i18n="guide.step3Text">重启后正常提问，消息会通过本工具转发到当前供应商。</p></div></article>
+        </div>
+        <a class="btn btn-primary btn-lg guide-start" href="#providers/add"><i class="bi bi-arrow-right-circle"></i><span data-i18n="guide.start">开始使用</span></a>
+      </section>
+    </main>
+
+    <div class="modal fade" id="deleteModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" data-i18n="providers.deleteTitle">删除提供商</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body" data-i18n="providers.deleteMessage">确认删除这个提供商吗？此操作会更新当前配置文件。</div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" data-i18n="common.cancel">取消</button>
+            <button type="button" class="btn btn-danger" id="confirmDelete" data-i18n="common.delete">删除</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal fade" id="restartReminderModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+      <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content restart-modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" data-i18n="restartReminder.title">请重启 Codex CLI 终端</h5>
+          </div>
+          <div class="modal-body">
+            <p data-i18n="restartReminder.body">已切换供应商并同步模型列表。请关闭并重新打开终端，否则可能还在使用旧模型。</p>
+          </div>
+          <div class="modal-footer restart-modal-footer">
+            <label class="restart-reminder-check"><input type="checkbox" id="restartReminderDontShow"><span data-i18n="restartReminder.dontShow">不再提醒</span></label>
+            <button type="button" class="btn btn-primary" id="restartReminderAck" data-i18n="restartReminder.ack">我已知晓</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast-container position-fixed bottom-0 end-0 p-3">
+      <div id="appToast" class="toast" role="status" aria-live="polite" aria-atomic="true">
+        <div class="toast-body" id="toastBody"></div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/i18n.js"></script>
+    <script src="js/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,50 @@
+VERSION ?= 1.0.0
+PYTHON  ?= .venv/bin/python
+WIN_IMAGE_TAG   ?= codex-app-transfer-win:latest
+LINUX_IMAGE_TAG ?= codex-app-transfer-linux:latest
+
+REPO_FLAG := $(if $(CCDS_REPO),--repo $(CCDS_REPO),)
+
+.PHONY: help mac-release win-image win-release linux-image linux-release release-bundle release clean
+
+help:
+	@echo "Targets:"
+	@echo "  mac-release      Build macOS .app/.pkg/.dmg + sign + index in release/"
+	@echo "  linux-release    Cross-build Linux x86_64 tarball + onefile via Docker + sign"
+	@echo "  win-release      Cross-build Windows portable + onefile + Setup .exe via Docker + sign"
+	@echo "  release          mac-release + linux-release + win-release"
+	@echo "  release-bundle   Re-run release_assets.py against existing dist/ artifacts"
+	@echo "  win-image        Build the Windows builder Docker image"
+	@echo "  linux-image      Build the Linux builder Docker image"
+	@echo "  clean            Remove build/, dist/, release/, .release-signing/, .tmp/"
+	@echo ""
+	@echo "Variables: VERSION=$(VERSION), PYTHON=$(PYTHON)"
+	@echo "           WIN_IMAGE_TAG=$(WIN_IMAGE_TAG)"
+	@echo "           LINUX_IMAGE_TAG=$(LINUX_IMAGE_TAG)"
+	@echo "           CCDS_REPO=<owner/repo>  (optional; embeds asset URLs in latest.json)"
+
+mac-release:
+	CCDS_VERSION=$(VERSION) PYTHON_BIN=$(PYTHON) bash macos/build-macos.sh
+	$(PYTHON) scripts/release_assets.py --version $(VERSION) --include macos $(REPO_FLAG)
+
+linux-image:
+	docker build --platform linux/amd64 -t $(LINUX_IMAGE_TAG) -f docker/linux-builder/Dockerfile .
+
+linux-release:
+	IMAGE_TAG=$(LINUX_IMAGE_TAG) bash scripts/build-linux-on-mac.sh $(VERSION)
+	$(PYTHON) scripts/release_assets.py --version $(VERSION) --include linux $(REPO_FLAG)
+
+win-image:
+	docker build --platform linux/amd64 -t $(WIN_IMAGE_TAG) -f docker/windows-builder/Dockerfile .
+
+win-release:
+	IMAGE_TAG=$(WIN_IMAGE_TAG) bash scripts/build-windows-on-mac.sh $(VERSION)
+	$(PYTHON) scripts/release_assets.py --version $(VERSION) --include windows $(REPO_FLAG)
+
+release-bundle:
+	$(PYTHON) scripts/release_assets.py --version $(VERSION) $(REPO_FLAG)
+
+release: mac-release linux-release win-release release-bundle
+
+clean:
+	rm -rf build dist release .release-signing .tmp

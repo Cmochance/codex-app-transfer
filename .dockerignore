@@ -1,0 +1,13 @@
+.venv/
+.git/
+.tmp/
+build/
+dist/
+release/
+.release-signing/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+docs/litellm/
+docs/plan/
