@@ -764,8 +764,13 @@ def create_admin_app() -> FastAPI:
 
     @app.post("/api/desktop/clear")
     async def clear_desktop_config():
-        """清除 Codex CLI 环境变量配置指导"""
-        return registry.clear_config()
+        """还原 ~/.codex/ 至 apply 之前的状态（智能合并；无快照时退化为旧 clear）"""
+        return registry.restore_codex_state()
+
+    @app.get("/api/desktop/snapshot-status")
+    async def get_desktop_snapshot_status():
+        """读取当前是否存在未还原的 Codex 原配置快照,供 Settings 页展示。"""
+        return {"success": True, **registry.get_snapshot_status()}
 
     # ── 代理 API ──
     @app.get("/api/version")

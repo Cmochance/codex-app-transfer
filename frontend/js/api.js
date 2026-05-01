@@ -306,6 +306,10 @@
       return api('POST', '/api/config/import', configData);
     },
 
+    async getDesktopSnapshotStatus() {
+      return api('GET', '/api/desktop/snapshot-status');
+    },
+
     async getActivities() {
       const data = await api('GET', '/api/proxy/logs');
       const logs = data.logs || [];

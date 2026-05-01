@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
         "adminPort": 18081,
         "autoStart": False,
         "exposeAllProviderModels": False,
+        "restoreCodexOnExit": True,
         "updateUrl": DEFAULT_UPDATE_URL,
     },
 }

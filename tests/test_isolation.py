@@ -11,6 +11,7 @@
 
 import asyncio
 import json
+import os
 import sys
 import time
 import traceback
@@ -454,6 +455,135 @@ async def test_end_to_end():
 
 
 asyncio.run(test_end_to_end())
+
+
+# ============================================================================
+# 6. Codex 配置快照 / 智能合并还原 round-trip
+# ============================================================================
+print("\n" + "=" * 60)
+print("6. Codex 配置快照 / 智能合并还原 round-trip")
+print("=" * 60)
+
+
+def test_codex_snapshot_restore():
+    import json as _json
+    import tempfile
+    from backend import registry as _registry
+
+    # 准备一个临时 fake $HOME，重定向 ~/.codex/ 与 ~/.codex-app-transfer/codex-snapshot/
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_codex = os.path.join(tmp, ".codex")
+        fake_snap = os.path.join(tmp, ".codex-app-transfer", "codex-snapshot")
+        os.makedirs(fake_codex, exist_ok=True)
+
+        original_home = _registry.CODEX_HOME
+        original_config = _registry.CODEX_CONFIG_PATH
+        original_auth = _registry.CODEX_AUTH_PATH
+        original_snap_dir = _registry.CAS_SNAPSHOT_DIR
+        original_snap_cfg = _registry.CAS_SNAPSHOT_CONFIG
+        original_snap_auth = _registry.CAS_SNAPSHOT_AUTH
+        original_snap_manifest = _registry.CAS_SNAPSHOT_MANIFEST
+
+        _registry.CODEX_HOME = fake_codex
+        _registry.CODEX_CONFIG_PATH = os.path.join(fake_codex, "config.toml")
+        _registry.CODEX_AUTH_PATH = os.path.join(fake_codex, "auth.json")
+        _registry.CAS_SNAPSHOT_DIR = fake_snap
+        _registry.CAS_SNAPSHOT_CONFIG = os.path.join(fake_snap, "config.toml")
+        _registry.CAS_SNAPSHOT_AUTH = os.path.join(fake_snap, "auth.json")
+        _registry.CAS_SNAPSHOT_MANIFEST = os.path.join(fake_snap, "manifest.json")
+
+        try:
+            # 1) 模拟用户原状态：ChatGPT 登录,有 model_reasoning_effort
+            with open(_registry.CODEX_CONFIG_PATH, "w") as f:
+                f.write('model_reasoning_effort = "xhigh"\npersonality = "pragmatic"\n')
+            with open(_registry.CODEX_AUTH_PATH, "w") as f:
+                _json.dump({"auth_mode": "chatgpt", "tokens": {"id": "abc"}, "last_refresh": "t0"}, f)
+
+            assert not _registry.has_snapshot()
+            ok("snapshot pre-state: no snapshot")
+
+            # 2) apply：写入网关 base_url + apikey
+            _registry.apply_config(
+                base_url="http://127.0.0.1:18080",
+                gateway_api_key="sk-our-gateway",
+            )
+
+            assert _registry.has_snapshot(), "apply 后应已建立快照"
+            ok("apply triggers snapshot")
+
+            applied_auth = _json.load(open(_registry.CODEX_AUTH_PATH))
+            assert applied_auth["auth_mode"] == "apikey"
+            assert applied_auth["OPENAI_API_KEY"] == "sk-our-gateway"
+            assert applied_auth["tokens"] == {"id": "abc"}, "tokens 应保留"
+            ok("apply 写入 auth.json 字段正确")
+
+            applied_cfg = open(_registry.CODEX_CONFIG_PATH).read()
+            assert 'openai_base_url = "http://127.0.0.1:18080"' in applied_cfg
+            assert 'model_reasoning_effort = "xhigh"' in applied_cfg
+            ok("apply 写入 config.toml 字段正确,其他行保留")
+
+            # 3) 用户在 apply 之后手动加了一个 auth 字段和一个 toml 字段
+            modified_auth = _json.load(open(_registry.CODEX_AUTH_PATH))
+            modified_auth["my_extra_field"] = "user-data"
+            with open(_registry.CODEX_AUTH_PATH, "w") as f:
+                _json.dump(modified_auth, f)
+            with open(_registry.CODEX_CONFIG_PATH, "a") as f:
+                f.write('user_added_key = "preserved"\n')
+
+            # 4) 第二次 apply：快照不应被覆盖（关键幂等性）
+            _registry.apply_config(
+                base_url="http://127.0.0.1:19999",
+                gateway_api_key="sk-second-apply",
+            )
+            snap_auth = _json.load(open(_registry.CAS_SNAPSHOT_AUTH))
+            assert snap_auth["auth_mode"] == "chatgpt", "快照 auth_mode 必须保持原值"
+            ok("二次 apply 不覆盖原始快照")
+
+            # 5) 还原：智能合并
+            result = _registry.restore_codex_state()
+            assert result["restored"] is True
+            assert not _registry.has_snapshot(), "还原后应清除快照"
+            ok("restore_codex_state 智能合并 + 清快照")
+
+            restored_auth = _json.load(open(_registry.CODEX_AUTH_PATH))
+            assert restored_auth["auth_mode"] == "chatgpt", f"auth_mode 应还原, got {restored_auth}"
+            assert "OPENAI_API_KEY" not in restored_auth, "OPENAI_API_KEY 应被移除（原本就没有）"
+            assert restored_auth["tokens"] == {"id": "abc"}, "tokens 应保留"
+            assert restored_auth["my_extra_field"] == "user-data", "用户运行期间加的字段应保留"
+            ok("auth.json 智能合并：我们的字段还原 + 用户字段保留")
+
+            restored_cfg = open(_registry.CODEX_CONFIG_PATH).read()
+            assert 'openai_base_url' not in restored_cfg, "openai_base_url 应移除（原本就没有）"
+            assert 'model_reasoning_effort = "xhigh"' in restored_cfg, "原 toml 行应保留"
+            assert 'user_added_key = "preserved"' in restored_cfg, "用户运行期间加的 toml 行应保留"
+            ok("config.toml 智能合并：我们的行还原 + 用户行保留")
+
+            # 6) legacy fallback：没有快照时 restore 退化为旧 clear
+            with open(_registry.CODEX_AUTH_PATH, "w") as f:
+                _json.dump({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-stale"}, f)
+            with open(_registry.CODEX_CONFIG_PATH, "w") as f:
+                f.write('openai_base_url = "http://stale"\nother = "x"\n')
+            assert not _registry.has_snapshot()
+            result = _registry.restore_codex_state()
+            assert result["restored"] is False, "无快照时 restored=False"
+            stale_auth = _json.load(open(_registry.CODEX_AUTH_PATH))
+            assert "OPENAI_API_KEY" not in stale_auth
+            stale_cfg = open(_registry.CODEX_CONFIG_PATH).read()
+            assert 'openai_base_url' not in stale_cfg
+            assert 'other = "x"' in stale_cfg
+            ok("无快照时 fallback 到旧 clear 行为")
+
+        finally:
+            _registry.CODEX_HOME = original_home
+            _registry.CODEX_CONFIG_PATH = original_config
+            _registry.CODEX_AUTH_PATH = original_auth
+            _registry.CAS_SNAPSHOT_DIR = original_snap_dir
+            _registry.CAS_SNAPSHOT_CONFIG = original_snap_cfg
+            _registry.CAS_SNAPSHOT_AUTH = original_snap_auth
+            _registry.CAS_SNAPSHOT_MANIFEST = original_snap_manifest
+
+
+test_codex_snapshot_restore()
 
 
 # ============================================================================

@@ -1264,9 +1264,28 @@
     $("#settingsAdminPort").value = settings.adminPort;
     $("#autoStart").checked = settings.autoStart;
     $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
+    $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
     renderModelMenuModeState(settings);
     await refreshBackupList();
+    await refreshCodexSnapshotStatus();
+  }
+
+  async function refreshCodexSnapshotStatus() {
+    const target = $("#codexSnapshotStatus");
+    if (!target) return;
+    try {
+      const status = await CCApi.getDesktopSnapshotStatus();
+      if (status && status.hasSnapshot) {
+        target.textContent = formatI18n("settings.codexSnapshotStatusActive", {
+          time: status.snapshotAt || "",
+        });
+      } else {
+        target.textContent = t("settings.codexSnapshotStatusEmpty");
+      }
+    } catch (error) {
+      target.textContent = t("settings.codexSnapshotStatusEmpty");
+    }
   }
 
   async function renderRoute(route) {
@@ -1316,6 +1335,7 @@
       adminPort: Number($("#settingsAdminPort").value),
       autoStart: $("#autoStart").checked,
       exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
+      restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
     await CCApi.saveSettings(settings);
@@ -1676,14 +1696,17 @@
 
       if (action === "clear-desktop") {
         if (!window.confirm(t("confirm.desktopClear"))) return;
-        await CCApi.clearDesktop();
+        const result = await CCApi.clearDesktop();
         const route = routeFromHash();
         if (route === "dashboard") {
           await renderDashboard();
         } else if (route === "desktop") {
           await renderDesktop();
+        } else if (route === "settings") {
+          await refreshCodexSnapshotStatus();
         }
-        showToast(t("toast.desktopCleared"));
+        const fellBackToLegacy = result && result.restored === false;
+        showToast(t(fellBackToLegacy ? "toast.desktopClearedLegacy" : "toast.desktopCleared"));
       }
 
       if (action === "proxy-start") {
@@ -1938,6 +1961,7 @@
     $("#settingsUpdateUrl").addEventListener("change", saveSettingsFromForm);
     $("#autoStart").addEventListener("change", saveSettingsFromForm);
     $("#exposeAllProviderModels").addEventListener("change", saveSettingsFromForm);
+    $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#configImportFile")?.addEventListener("change", (event) => {
       importConfigFile(event.target.files?.[0]);
     });

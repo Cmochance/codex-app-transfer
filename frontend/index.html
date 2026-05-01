@@ -12,7 +12,7 @@
   <body>
     <header class="app-header">
       <div class="header-actions-left">
-        <button class="btn btn-outline-danger btn-sm dashboard-clear-button" type="button" data-action="clear-desktop"><i class="bi bi-trash"></i><span data-i18n="dashboard.clearDesktopConfig">清除 Codex CLI 配置</span></button>
+        <button class="btn btn-outline-danger btn-sm dashboard-clear-button" type="button" data-action="clear-desktop"><i class="bi bi-arrow-counterclockwise"></i><span data-i18n="dashboard.clearDesktopConfig">还原 Codex 原配置</span></button>
       </div>
       <nav class="route-tabs" aria-label="Primary navigation">
         <a href="#dashboard" class="route-tab" data-nav="dashboard" title="Providers"><i class="bi bi-speedometer2"></i><span data-i18n="nav.dashboard">仪表盘</span></a>
@@ -253,7 +253,7 @@
               </div>
               <pre class="code-block" id="desktopJson"></pre>
             </article>
-            <button class="btn btn-outline-danger btn-lg w-100 danger-outline" type="button" data-action="clear-desktop"><i class="bi bi-trash"></i><span data-i18n="desktop.clear">清除配置</span></button>
+            <button class="btn btn-outline-danger btn-lg w-100 danger-outline" type="button" data-action="clear-desktop"><i class="bi bi-arrow-counterclockwise"></i><span data-i18n="desktop.clear">还原 Codex 原配置</span></button>
           </div>
 
           <article class="panel guide-panel">
@@ -327,6 +327,14 @@
           <div class="settings-row">
             <strong data-i18n="settings.autoStart">开机自启</strong>
             <label class="switch-label only-switch"><input type="checkbox" id="autoStart" checked><span class="switch-ui"></span></label>
+          </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.restoreCodexOnExit">退出时还原 Codex 原配置</strong>
+            <div>
+              <label class="switch-label only-switch"><input type="checkbox" id="restoreCodexOnExit" checked><span class="switch-ui"></span></label>
+              <p class="settings-note" data-i18n="settings.restoreCodexOnExitHint">开启后，应用退出或下次启动时会自动把 ~/.codex/config.toml 与 auth.json 还原至 apply 之前的状态；保证不开应用时 Codex CLI 仍是你本人的原配置。</p>
+              <p class="settings-note" id="codexSnapshotStatus" data-i18n="settings.codexSnapshotStatusUnknown">正在读取快照状态…</p>
+            </div>
           </div>
           <div class="settings-row" hidden aria-hidden="true">
             <strong data-i18n="settings.exposeAllModels">Claude 模型菜单</strong>

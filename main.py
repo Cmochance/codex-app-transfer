@@ -2,6 +2,7 @@
 """Codex App Transfer - 启动入口"""
 
 import argparse
+import atexit
 import ctypes
 import sys
 import threading
@@ -78,6 +79,24 @@ def write_crash_log():
         log_path.write_text(traceback.format_exc(), encoding="utf-8")
     except Exception:
         return
+
+
+def restore_codex_if_enabled(reason: str = "exit") -> bool:
+    """根据设置开关 restoreCodexOnExit 决定是否还原 ~/.codex/ 至 apply 之前的状态。
+
+    幂等：无快照 / 开关关闭时直接跳过；任何异常都吞掉（不能让退出/启动流程崩）。
+    """
+    try:
+        if not cfg.get_settings().get("restoreCodexOnExit", True):
+            return False
+        if not registry.has_snapshot():
+            return False
+        result = registry.restore_codex_state()
+        safe_print(f"[{reason}] restore codex state: {result.get('message', '')}")
+        return bool(result.get("success"))
+    except Exception as exc:
+        safe_print(f"[{reason}] restore codex state failed: {exc}")
+        return False
 
 
 def parse_args():
@@ -525,6 +544,7 @@ def run_desktop_mode(admin_app, admin_port: int):
     finally:
         server.should_exit = True
         _stop_proxy_server()
+        restore_codex_if_enabled(reason="desktop-finally")
 
 
 def main():
@@ -532,6 +552,14 @@ def main():
 
     # 确保配置目录存在
     cfg.ensure_config_dir()
+
+    # 启动兜底（A3）：上一会话若异常退出（SIGKILL / 断电 / 闪退）会留下快照,
+    # 设置开关开启时静默还原一次,保证「不开应用 → ~/.codex/ 即原配置」语义。
+    restore_codex_if_enabled(reason="startup")
+
+    # 注册退出钩子（B2）：覆盖正常退出路径（托盘退出、Ctrl+C、窗口关闭、
+    # webview.start 返回等）。SIGKILL 走不到这里,由下次启动 startup 钩子兜底。
+    atexit.register(restore_codex_if_enabled, "atexit")
 
     # 读取设置
     settings = cfg.get_settings()

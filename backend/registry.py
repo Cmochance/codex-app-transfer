@@ -1,8 +1,10 @@
 """Codex CLI 环境变量配置管理（保留旧注册表函数供参考）"""
 
 import base64
+import datetime as _datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1006,7 +1008,14 @@ def apply_config(
     auth_scheme: str = "bearer",
     gateway_headers: str = "",
 ) -> dict:
-    """将配置写入 Codex CLI 配置文件（~/.codex/config.toml + ~/.codex/auth.json）。"""
+    """将配置写入 Codex CLI 配置文件（~/.codex/config.toml + ~/.codex/auth.json）。
+
+    在写入前会确保已对原始 Codex 配置做过快照（幂等），用于退出 / 点「还原 Codex
+    原配置」时回滚。
+    """
+    # 在第一次 apply 前对原状态做快照；同会话再次 apply 不会覆盖原始备份。
+    snapshot_codex_state()
+
     # 写入 config.toml：openai_base_url
     _sync_codex_toml_value("openai_base_url", base_url or None)
 
@@ -1023,12 +1032,247 @@ def apply_config(
 
 
 def clear_config() -> dict:
-    """清除 Codex CLI 配置文件中的配置。"""
+    """对外旧入口：还原至 apply 之前的原始 Codex 配置（智能合并）。
+
+    保留函数名是为了让 /api/desktop/clear 端点和外部调用方无需改动；
+    实际行为已升级为 restore_codex_state。
+    """
+    return restore_codex_state()
+
+
+# ── apply 前快照 / 退出时智能合并还原 ──
+#
+# 设计目标：
+#   1. 用户首次 apply 时，把 ~/.codex/config.toml 与 ~/.codex/auth.json 整文件备份
+#      到 ~/.codex-app-transfer/codex-snapshot/，记下文件存在与否、原始内容；
+#   2. 用户点「还原 Codex 原配置」或退出应用时，按 key 级别合并还原：
+#        - 我们写过的 key（auth_mode、OPENAI_API_KEY、openai_base_url）改回快照值
+#          （快照里没有就删除）；
+#        - 其他 key / 行原样保留，不影响用户在我们运行期间手动加的内容；
+#   3. 还原成功后删除快照目录，下一次 apply 重新建快照；
+#   4. 若没有快照（极端情况：用户从 v1.0.0 升级而来，原状态已被破坏），
+#      退化为旧版「pop OPENAI_API_KEY + 删除 openai_base_url 行」。
+
+CAS_SNAPSHOT_DIR = os.path.expanduser("~/.codex-app-transfer/codex-snapshot")
+CAS_SNAPSHOT_CONFIG = os.path.join(CAS_SNAPSHOT_DIR, "config.toml")
+CAS_SNAPSHOT_AUTH = os.path.join(CAS_SNAPSHOT_DIR, "auth.json")
+CAS_SNAPSHOT_MANIFEST = os.path.join(CAS_SNAPSHOT_DIR, "manifest.json")
+
+# 我们 apply 时实际触碰的 key 集合 —— 还原时只动这些,其他 key 全部保留。
+_MANAGED_AUTH_KEYS = ("auth_mode", "OPENAI_API_KEY")
+_MANAGED_TOML_KEYS = ("openai_base_url",)
+
+
+def _read_manifest() -> dict:
+    if not os.path.exists(CAS_SNAPSHOT_MANIFEST):
+        return {}
+    try:
+        with open(CAS_SNAPSHOT_MANIFEST, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_manifest(data: dict):
+    os.makedirs(CAS_SNAPSHOT_DIR, exist_ok=True)
+    with open(CAS_SNAPSHOT_MANIFEST, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+def has_snapshot() -> bool:
+    """判断当前是否存在未还原的 Codex 配置快照。"""
+    return os.path.exists(CAS_SNAPSHOT_MANIFEST)
+
+
+def get_snapshot_status() -> dict:
+    """供 UI 展示的快照状态摘要。不含敏感字段值。"""
+    manifest = _read_manifest()
+    if not manifest:
+        return {"hasSnapshot": False}
+    return {
+        "hasSnapshot": True,
+        "snapshotAt": manifest.get("snapshot_at"),
+        "configExisted": bool(manifest.get("config_existed")),
+        "authExisted": bool(manifest.get("auth_existed")),
+        "appVersion": manifest.get("app_version"),
+    }
+
+
+def _read_file_text(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def snapshot_codex_state(app_version: Optional[str] = None) -> dict:
+    """apply 前调用：若尚未快照,则把 config.toml / auth.json 整文件复制到快照目录。
+
+    幂等：已存在快照则直接返回当前 manifest,绝不覆盖原始快照（保证同会话内多次
+    切换 provider、多次 apply 都不会污染最初那份原始备份）。
+    """
+    if has_snapshot():
+        return _read_manifest()
+
+    os.makedirs(CAS_SNAPSHOT_DIR, exist_ok=True)
+
+    config_existed = os.path.exists(CODEX_CONFIG_PATH)
+    auth_existed = os.path.exists(CODEX_AUTH_PATH)
+
+    if config_existed:
+        shutil.copy2(CODEX_CONFIG_PATH, CAS_SNAPSHOT_CONFIG)
+    if auth_existed:
+        shutil.copy2(CODEX_AUTH_PATH, CAS_SNAPSHOT_AUTH)
+        try:
+            os.chmod(CAS_SNAPSHOT_AUTH, 0o600)
+        except OSError:
+            pass  # Windows 上 chmod 无效；auth 内容已落盘即可
+
+    manifest = {
+        "snapshot_at": _datetime.datetime.now().isoformat(timespec="seconds"),
+        "config_existed": config_existed,
+        "auth_existed": auth_existed,
+        "app_version": app_version or "",
+    }
+    _write_manifest(manifest)
+    return manifest
+
+
+def _snapshot_auth_managed_values() -> dict:
+    """从快照读取我们 apply 时会动的 auth.json 字段的原始值。
+
+    返回结构 {key: ("present", value)} 或 {key: ("absent",)}。区分"原本就没有"
+    与"原本是空字符串"两种情况。快照不存在时返回空 dict（调用方需先判断）。
+    """
+    result: dict = {}
+    if not os.path.exists(CAS_SNAPSHOT_AUTH):
+        for key in _MANAGED_AUTH_KEYS:
+            result[key] = ("absent",)
+        return result
+
+    try:
+        with open(CAS_SNAPSHOT_AUTH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+    for key in _MANAGED_AUTH_KEYS:
+        if key in data:
+            result[key] = ("present", data[key])
+        else:
+            result[key] = ("absent",)
+    return result
+
+
+def _snapshot_toml_managed_values() -> dict:
+    """从快照解析 config.toml 中我们 apply 时会动的根级别 key 的原值。"""
+    result: dict = {}
+    snapshot_text = _read_file_text(CAS_SNAPSHOT_CONFIG)
+    for key in _MANAGED_TOML_KEYS:
+        if snapshot_text is None:
+            result[key] = ("absent",)
+            continue
+        # 简单解析：找根级别第一个 `key = ...` 行（不在某个 [section] 里）。
+        # 与 _sync_codex_toml_value 写入逻辑对称。
+        in_section = False
+        found_value: Optional[str] = None
+        for line in snapshot_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                in_section = True
+                continue
+            if in_section:
+                continue
+            if stripped.startswith(key) and "=" in stripped:
+                _, raw = stripped.split("=", 1)
+                raw = raw.strip()
+                if raw.startswith('"') and raw.endswith('"'):
+                    found_value = raw[1:-1]
+                elif raw.startswith("'") and raw.endswith("'"):
+                    found_value = raw[1:-1]
+                else:
+                    found_value = raw
+                break
+        if found_value is not None:
+            result[key] = ("present", found_value)
+        else:
+            result[key] = ("absent",)
+    return result
+
+
+def _restore_from_snapshot_smart_merge() -> dict:
+    """智能合并还原：只把我们写过的 key 改回快照值,其他保持现状。"""
+    auth_originals = _snapshot_auth_managed_values()
+    toml_originals = _snapshot_toml_managed_values()
+
+    # auth.json：读当前内容,逐 key 还原
+    current_auth = _read_codex_auth()
+    for key in _MANAGED_AUTH_KEYS:
+        spec = auth_originals.get(key, ("absent",))
+        if spec[0] == "present":
+            current_auth[key] = spec[1]
+        else:
+            current_auth.pop(key, None)
+    # 边界：当前 auth.json 不存在 + 原也不存在 → 不写,保持缺失
+    snapshot_had_auth = os.path.exists(CAS_SNAPSHOT_AUTH)
+    if current_auth or snapshot_had_auth or os.path.exists(CODEX_AUTH_PATH):
+        _write_codex_auth(current_auth)
+        try:
+            os.chmod(CODEX_AUTH_PATH, 0o600)
+        except OSError:
+            pass
+
+    # config.toml：复用 _sync_codex_toml_value 行级合并能力
+    for key in _MANAGED_TOML_KEYS:
+        spec = toml_originals.get(key, ("absent",))
+        if spec[0] == "present":
+            _sync_codex_toml_value(key, spec[1])
+        else:
+            _sync_codex_toml_value(key, None)
+
+    # 还原成功后删除快照目录
+    try:
+        shutil.rmtree(CAS_SNAPSHOT_DIR)
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "restored": True,
+        "message": "已还原 ~/.codex/config.toml 与 ~/.codex/auth.json 至 apply 之前的状态",
+    }
+
+
+def _legacy_clear_without_snapshot() -> dict:
+    """旧 clear 行为：用户从 v1.0.0 升级、原状态已无快照可还原时的兜底。"""
     _sync_codex_toml_value("openai_base_url", None)
     auth = _read_codex_auth()
     auth.pop("OPENAI_API_KEY", None)
     _write_codex_auth(auth)
     return {
         "success": True,
-        "message": "Codex CLI 配置文件已清除（~/.codex/config.toml / auth.json）",
+        "restored": False,
+        "message": "未发现快照,已按旧逻辑清除 openai_base_url / OPENAI_API_KEY（升级前的原始 auth_mode / 自定义 base_url 无法恢复）",
     }
+
+
+def restore_codex_state() -> dict:
+    """对外入口：智能合并还原至 apply 之前的状态；若无快照则退化为旧 clear 行为。"""
+    if has_snapshot():
+        return _restore_from_snapshot_smart_merge()
+    return _legacy_clear_without_snapshot()
+
+
+def discard_snapshot() -> dict:
+    """显式丢弃快照（不执行还原）。预留给未来 UI；当前未在常规路径调用。"""
+    if not has_snapshot():
+        return {"success": True, "message": "无快照可丢弃"}
+    try:
+        shutil.rmtree(CAS_SNAPSHOT_DIR)
+    except Exception as exc:
+        return {"success": False, "message": f"丢弃快照失败：{exc}"}
+    return {"success": True, "message": "已丢弃 Codex 配置快照"}
