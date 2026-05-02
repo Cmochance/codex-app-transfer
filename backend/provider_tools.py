@@ -142,60 +142,24 @@ def _pick_model(model_ids: list[str], keywords: tuple[str, ...], fallback_index:
 
 
 def suggest_model_mappings(model_ids: list[str]) -> dict:
-    """根据模型名称给默认槽位自动推荐映射。
+    """获取模型后给默认槽位填一个推荐值，其它槽位保持为空。
 
-    匹配规则从 ``model_alias.MODEL_SLOTS`` 的 ``legacy`` 字段动态生成，
-    避免新增槽位时需要手动同步两处。
+    其它具名槽位（gpt_5_5 等）会在请求时通过 default 降级机制兜底,
+    所以这里不再把它们也填成同一个模型 —— 那样 UI 上一片重复, 用户改起来很烦。
+    选 default 的优先级: 含 ``v4-pro`` / ``coder`` / ``plus`` 等常见旗舰关键字 →
+    第一个可用模型。
     """
     from backend.model_alias import MODEL_SLOTS
 
     usable = _usable_model_ids(model_ids)
-    result = {
-        "default": "",
-    }
-    for slot in MODEL_SLOTS:
-        if slot["key"] != "default":
-            result[slot["key"]] = ""
+    result = {slot["key"]: "" for slot in MODEL_SLOTS}
 
-    # 基于 MODEL_SLOTS 的 legacy 字段动态匹配
-    slot_matches = {}
-    for slot in MODEL_SLOTS:
-        key = slot["key"]
-        if key == "default":
-            continue
-        # 将 legacy 元组扩展为匹配关键词列表
-        keywords = tuple(slot.get("legacy", ()))
-        if keywords:
-            slot_matches[key] = _pick_model(usable, keywords)
+    if not usable:
+        return result
 
-    # 回填结果
-    for slot in MODEL_SLOTS:
-        key = slot["key"]
-        if key == "default":
-            continue
-        result[key] = slot_matches.get(key, "")
-
-    # default 优先取第一个非空槽位，否则取第一个可用模型
-    default = ""
-    for slot in MODEL_SLOTS:
-        key = slot["key"]
-        if key == "default":
-            continue
-        if result[key]:
-            default = result[key]
-            break
-    if not default and usable:
-        default = usable[0]
-    result["default"] = default
-
-    # 空槽位降级到 default
-    for slot in MODEL_SLOTS:
-        key = slot["key"]
-        if key == "default":
-            continue
-        if not result[key]:
-            result[key] = default
-
+    flagship_keywords = ("pro", "plus", "coder", "max", "reasoner", "v4")
+    chosen = _pick_model(usable, flagship_keywords) or usable[0]
+    result["default"] = chosen
     return result
 
 

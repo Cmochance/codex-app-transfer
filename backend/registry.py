@@ -869,39 +869,43 @@ def _write_codex_config(content: str):
         f.write(content)
 
 
-def _sync_codex_toml_value(key: str, value: Optional[str]):
-    """同步 ~/.codex/config.toml 中的单个键值（参考 Codex_Account_Switch 的 sync_root_string_value）。
-    
-    规则：
-    1. 删除所有已存在的 root-level `key = ...` 行（以 key 开头且包含 = 的行）
-    2. 如果 value 不为 None，在第一个 `[` 节标题之前插入新行；如果没有节，则追加到末尾。
+def _sync_codex_toml_value(key: str, raw_value: Optional[str]):
+    """同步 ~/.codex/config.toml 中的单个根级别键值。
+
+    ``raw_value`` 必须是已经按 TOML 字面量格式化好的字符串(由调用方负责)。
+    比如字符串值要传 ``'"https://..."'``(带引号), 整数传 ``"1000000"``(不带引号),
+    布尔传 ``"true"``。``None`` 表示删除该键。
+
+    规则:
+    1. 删除所有已存在的 root-level ``key = ...`` 行
+    2. 在第一个 ``[`` 节标题之前插入新行; 没有节则追加到末尾
     """
     current = _read_codex_config()
     lines = current.splitlines()
     new_lines = []
-    found_first_section = False
     inserted = False
-    
+
     for line in lines:
         stripped = line.strip()
-        # 删除旧的 root-level 同名键行
         if stripped.startswith(key) and "=" in stripped:
             continue
-        # 在第一个节标题 [ 之前插入新值
-        if not inserted and value is not None and stripped.startswith("["):
-            new_lines.append(f'{key} = {json.dumps(value)}')
+        if not inserted and raw_value is not None and stripped.startswith("["):
+            new_lines.append(f'{key} = {raw_value}')
             inserted = True
-            found_first_section = True
         new_lines.append(line)
-    
-    # 如果没有节标题且 value 未插入，追加到末尾
-    if not inserted and value is not None:
-        new_lines.append(f'{key} = {json.dumps(value)}')
-    
+
+    if not inserted and raw_value is not None:
+        new_lines.append(f'{key} = {raw_value}')
+
     result = "\n".join(new_lines)
     if not result.endswith("\n"):
         result += "\n"
     _write_codex_config(result)
+
+
+def _toml_string_literal(value: str) -> str:
+    """把 Python 字符串转成 TOML 双引号字符串字面量。"""
+    return json.dumps(str(value))
 
 
 def _read_codex_auth() -> dict:
@@ -1016,8 +1020,20 @@ def apply_config(
     # 在第一次 apply 前对原状态做快照；同会话再次 apply 不会覆盖原始备份。
     snapshot_codex_state()
 
-    # 写入 config.toml：openai_base_url
-    _sync_codex_toml_value("openai_base_url", base_url or None)
+    # 写入 config.toml：openai_base_url（字符串字面量需要引号）
+    _sync_codex_toml_value(
+        "openai_base_url",
+        _toml_string_literal(base_url) if base_url else None,
+    )
+
+    # 写入 config.toml：model_context_window
+    # Codex CLI 默认按 ChatGPT 内置模型推断窗口(gpt-5 系列约 256k),
+    # 不读上游 supports1m 字段。当激活 provider 的默认模型支持 1M 时，
+    # 显式覆盖窗口为 1,000,000，避免 Codex CLI 按 256k 提前压缩。
+    _sync_codex_toml_value(
+        "model_context_window",
+        "1000000" if _active_provider_supports_1m(provider) else None,
+    )
 
     # 写入 auth.json：OPENAI_API_KEY
     auth = _read_codex_auth()
@@ -1029,6 +1045,18 @@ def apply_config(
     _write_codex_auth(auth)
 
     return _generate_env_config(base_url, gateway_api_key, provider, providers, expose_all, auth_scheme, gateway_headers)
+
+
+def _active_provider_supports_1m(provider: Optional[dict]) -> bool:
+    """激活 provider 的 default 模型是否支持 1M 上下文。"""
+    if not provider:
+        return False
+    from backend.model_alias import normalize_model_mappings, model_supports_1m
+    mappings = normalize_model_mappings(provider.get("models") or {})
+    default_model = (mappings.get("default") or "").strip()
+    if not default_model:
+        return False
+    return model_supports_1m(provider, default_model)
 
 
 def clear_config() -> dict:
@@ -1060,7 +1088,7 @@ CAS_SNAPSHOT_MANIFEST = os.path.join(CAS_SNAPSHOT_DIR, "manifest.json")
 
 # 我们 apply 时实际触碰的 key 集合 —— 还原时只动这些,其他 key 全部保留。
 _MANAGED_AUTH_KEYS = ("auth_mode", "OPENAI_API_KEY")
-_MANAGED_TOML_KEYS = ("openai_base_url",)
+_MANAGED_TOML_KEYS = ("openai_base_url", "model_context_window")
 
 
 def _read_manifest() -> dict:
@@ -1169,17 +1197,19 @@ def _snapshot_auth_managed_values() -> dict:
 
 
 def _snapshot_toml_managed_values() -> dict:
-    """从快照解析 config.toml 中我们 apply 时会动的根级别 key 的原值。"""
+    """从快照解析 config.toml 中我们 apply 时会动的根级别 key 的原值。
+
+    保留 ``=`` 右侧的**原始字面量**(含可能的引号、空格已 strip),
+    restore 时直接原样回写, 避免类型(字符串 vs 整数)在 round-trip 中走样。
+    """
     result: dict = {}
     snapshot_text = _read_file_text(CAS_SNAPSHOT_CONFIG)
     for key in _MANAGED_TOML_KEYS:
         if snapshot_text is None:
             result[key] = ("absent",)
             continue
-        # 简单解析：找根级别第一个 `key = ...` 行（不在某个 [section] 里）。
-        # 与 _sync_codex_toml_value 写入逻辑对称。
         in_section = False
-        found_value: Optional[str] = None
+        found_raw: Optional[str] = None
         for line in snapshot_text.splitlines():
             stripped = line.strip()
             if stripped.startswith("[") and stripped.endswith("]"):
@@ -1189,16 +1219,10 @@ def _snapshot_toml_managed_values() -> dict:
                 continue
             if stripped.startswith(key) and "=" in stripped:
                 _, raw = stripped.split("=", 1)
-                raw = raw.strip()
-                if raw.startswith('"') and raw.endswith('"'):
-                    found_value = raw[1:-1]
-                elif raw.startswith("'") and raw.endswith("'"):
-                    found_value = raw[1:-1]
-                else:
-                    found_value = raw
+                found_raw = raw.strip()
                 break
-        if found_value is not None:
-            result[key] = ("present", found_value)
+        if found_raw is not None:
+            result[key] = ("present", found_raw)
         else:
             result[key] = ("absent",)
     return result

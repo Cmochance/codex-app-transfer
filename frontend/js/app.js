@@ -674,14 +674,30 @@
       ? Object.entries(preset.requestOptionPresets)
       : [];
     const options = [...modelOptions, ...requestOptionPresets];
-    if (!options.length) {
+    const notices = Array.isArray(preset?.notices) ? preset.notices.filter((n) => n && n.text) : [];
+
+    if (!options.length && !notices.length) {
       container.hidden = true;
       container.innerHTML = "";
       return;
     }
+
     const currentMappings = normalizeMappings(mappings || collectProviderMappings());
     container.hidden = false;
-    container.innerHTML = options.map(([id, option]) => `
+
+    const noticeIcon = (type) => {
+      if (type === "warning") return "bi-exclamation-triangle-fill";
+      if (type === "success") return "bi-check-circle-fill";
+      return "bi-info-circle-fill";
+    };
+    const noticesHtml = notices.map((n) => `
+      <div class="preset-notice preset-notice-${escapeHtml(n.type || "info")}" role="note">
+        <i class="bi ${noticeIcon(n.type)}" aria-hidden="true"></i>
+        <span>${escapeHtml(n.text)}</span>
+      </div>
+    `).join("");
+
+    const optionsHtml = options.map(([id, option]) => `
       <label class="preset-option-item">
         <input class="form-check-input" type="checkbox" data-preset-model-option="${escapeHtml(id)}" ${optionEnabled(option, currentMappings) ? "checked" : ""}>
         <span>
@@ -690,6 +706,8 @@
         </span>
       </label>
     `).join("");
+
+    container.innerHTML = noticesHtml + optionsHtml;
   }
 
   function applyPresetModelOption(optionId, enabled) {
@@ -793,8 +811,9 @@
         </span>
         <span class="provider-meta truncate">${mappingText}</span>
         <span class="provider-actions">
-          <button class="btn btn-primary compact-enable" type="button" data-action="set-default" data-id="${providerId}" ${provider.default ? "disabled" : ""}>
-            <i class="bi bi-play-fill"></i><span>${provider.default ? t("status.default") : t("providers.enable")}</span>
+          ${provider.default ? `<span class="active-indicator" role="status" aria-label="${escapeHtml(t("status.active"))}"><i class="bi bi-broadcast" aria-hidden="true"></i><span>${escapeHtml(t("status.active"))}</span></span>` : ""}
+          <button class="btn btn-primary compact-enable" type="button" data-action="set-default" data-id="${providerId}">
+            <i class="bi bi-play-fill"></i><span>${t("providers.enable")}</span>
           </button>
           <button class="icon-action" type="button" data-action="test-provider" data-id="${providerId}" title="${t("providers.testSpeed")}" aria-label="${t("providers.testSpeed")}"><i class="bi bi-lightning-charge"></i></button>
           <button class="icon-action" type="button" data-action="query-usage" data-id="${providerId}" title="${t("providers.usage")}" aria-label="${t("providers.usage")}"><i class="bi bi-wallet2"></i></button>
@@ -1083,8 +1102,11 @@
     // 优先用匹配预设的 apiFormat,saved provider 的 apiFormat 可能因升级残留旧值
     // (例如 v1.0.0 时 Kimi 默认 "responses",v1.0.1 起改成 "openai_chat")。后端
     // _sync_apiformat_from_builtin 也会做一次根治,这里是 UI 侧的二重保险。
+    // 注意: getPresets() 把 preset.apiFormat 标准化成大写 "OpenAI"/"Responses",
+    // mapProvider() 把 provider.apiFormat 标准化成小写 "openai_chat"/"responses",
+    // 两套表示都要在白名单里, 否则 preset 命中却被判失败, 错误回退到 responses。
     const effectiveApiFormat = (matchedPreset && matchedPreset.apiFormat) || provider.apiFormat;
-    setFormApiFormat(["openai", "openai_chat"].includes(effectiveApiFormat) ? "openai_chat" : "responses");
+    setFormApiFormat(["openai", "openai_chat", "OpenAI"].includes(effectiveApiFormat) ? "openai_chat" : "responses");
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());

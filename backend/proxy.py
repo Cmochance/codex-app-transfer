@@ -29,6 +29,7 @@ from backend.session_cache import ResponseSessionCache
 from backend.model_alias import (
     all_provider_model_entries,
     normalize_model_mappings,
+    outbound_model_id,
     provider_model_ids as alias_provider_model_ids,
     resolve_model_alias,
     resolve_requested_model_slot,
@@ -562,6 +563,10 @@ async def forward_request(
         upstream_body.pop("stream", None)
         upstream_body = apply_responses_request_options(upstream_body, provider)
 
+    # 剥掉模型名末尾的内部修饰后缀（如 ``[1m]``）后再发给上游。
+    if upstream_body.get("model"):
+        upstream_body["model"] = outbound_model_id(upstream_body["model"])
+
     headers = get_upstream_headers(provider)
 
     log_buffer.add("INFO", f"转发请求 → {upstream_url}")
@@ -685,6 +690,10 @@ async def forward_request_stream(
         # 确保流式开启
         upstream_body["stream"] = True
 
+    # 剥掉模型名末尾的内部修饰后缀（如 ``[1m]``）后再发给上游。
+    if upstream_body.get("model"):
+        upstream_body["model"] = outbound_model_id(upstream_body["model"])
+
     headers = get_upstream_headers(provider)
 
     log_buffer.add("INFO", f"流式请求 → {upstream_url}")
@@ -736,15 +745,50 @@ async def forward_request_stream(
                         "ERROR",
                         f"上游 {resp.status_code} body: {error_text}" if error_text else f"上游 {resp.status_code} body: <空>",
                     )
+                    # 提取上游错误体里的 message / code, 给 Codex 显示更友好。
+                    upstream_message = error_text or f"上游 {resp.status_code} 错误"
+                    upstream_code = "upstream_error"
+                    try:
+                        parsed = json.loads(error_text) if error_text else {}
+                        if isinstance(parsed, dict):
+                            err_obj = parsed.get("error") if isinstance(parsed.get("error"), dict) else parsed
+                            if isinstance(err_obj, dict):
+                                upstream_message = str(err_obj.get("message") or upstream_message)
+                                upstream_code = str(err_obj.get("code") or upstream_code)
+                    except (ValueError, TypeError):
+                        pass
+                    if resp.status_code == 402 and upstream_code in ("upstream_error", "invalid_request_error"):
+                        upstream_code = "insufficient_quota"
+
+                    error_obj = {
+                        "type": "upstream_error",
+                        "code": upstream_code,
+                        "status": resp.status_code,
+                        "message": upstream_message,
+                        "param": None,
+                    }
+                    # Codex CLI 同时关心两个事件:
+                    #   - "error" 用于显示错误内容
+                    #   - "response.failed" 是流终止信号, 不发的话 Codex 一直 thinking
                     error_event = {
                         "type": "error",
-                        "error": {
-                            "type": "upstream_error",
-                            "status": resp.status_code,
-                            "message": error_text or "上游 API 返回错误",
+                        "sequence_number": 0,
+                        "error": error_obj,
+                    }
+                    failed_event = {
+                        "type": "response.failed",
+                        "sequence_number": 1,
+                        "response": {
+                            "id": f"resp_{uuid.uuid4().hex[:12]}",
+                            "object": "response",
+                            "status": "failed",
+                            "error": error_obj,
+                            "model": original_model or body.get("model", ""),
+                            "output": [],
                         },
                     }
-                    yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps(failed_event, ensure_ascii=False)}\n\n"
                     return
 
                 if api_format == "openai_chat":

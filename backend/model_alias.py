@@ -117,16 +117,58 @@ def model_alias(provider: dict, model_id: str) -> str:
     return f"{provider_slug(provider)}/{model_id}"
 
 
+_DEFAULT_1M_MODELS_BY_KIND: dict[str, tuple[str, ...]] = {
+    # DeepSeek V4 全系（pro / flash）默认 1M 上下文。
+    "deepseek": ("deepseek-v4-",),
+    # 阿里云百炼 Qwen 3.6 系列（plus / flash / max-preview 等）默认 1M。
+    "bailian": ("qwen3.6-",),
+}
+
+
+def _provider_default_supports_1m(provider: dict, model_id: str) -> bool:
+    """已知 provider 在某些模型上默认提供 1M 上下文。"""
+    try:
+        from backend.provider_workarounds import detect_provider_kind  # 局部导入避免循环
+    except ImportError:
+        return False
+    kind = detect_provider_kind(provider)
+    prefixes = _DEFAULT_1M_MODELS_BY_KIND.get(kind)
+    if not prefixes:
+        return False
+    lower = str(model_id or "").lower()
+    return any(lower.startswith(prefix) for prefix in prefixes)
+
+
 def model_supports_1m(provider: dict, model_id: str) -> bool:
-    """判断模型是否应声明 supports1m。"""
+    """判断模型是否应声明 supports1m。
+
+    判定顺序：
+    1. 模型名结尾的 ``[1m]`` 修饰后缀（旧版兼容，迁移期内仍承认）。
+    2. ``provider.modelCapabilities[model].supports1m`` 用户手动声明。
+    3. 已知 provider + 模型族默认 1M（见 ``_DEFAULT_1M_MODELS_BY_KIND``）。
+    """
+    if "[1m]" in str(model_id or "").lower():
+        return True
     capabilities = provider.get("modelCapabilities") or {}
-    if not isinstance(capabilities, dict):
-        capabilities = {}
-    model_capability = capabilities.get(model_id)
-    return "[1m]" in model_id.lower() or (
-        isinstance(model_capability, dict)
-        and model_capability.get("supports1m") is True
-    )
+    if isinstance(capabilities, dict):
+        model_capability = capabilities.get(model_id)
+        if isinstance(model_capability, dict) and model_capability.get("supports1m") is True:
+            return True
+    return _provider_default_supports_1m(provider, model_id)
+
+
+_OUTBOUND_MODEL_SUFFIX_RE = re.compile(r"\[[^\[\]]*\]\s*$")
+
+
+def outbound_model_id(model_id: str) -> str:
+    """剥掉模型名结尾的 ``[xxx]`` 内部修饰后缀，得到上游真实模型名。
+
+    比如内部用 ``deepseek-v4-pro[1m]`` 标记 1M 上下文变体,
+    但 DeepSeek 上游只认 ``deepseek-v4-pro``。
+    """
+    if not isinstance(model_id, str):
+        return model_id
+    return _OUTBOUND_MODEL_SUFFIX_RE.sub("", model_id).strip()
 
 
 def provider_model_entries(provider: Optional[dict], use_alias: bool = False) -> list[dict]:

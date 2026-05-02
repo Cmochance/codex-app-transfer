@@ -2352,6 +2352,32 @@ body {
   background: var(--primary-soft);
 }
 
+.active-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  height: 28px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--success, #16a34a);
+  background: color-mix(in srgb, var(--success, #16a34a) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--success, #16a34a) 30%, var(--line));
+  user-select: none;
+  cursor: default;
+}
+
+.active-indicator i {
+  font-size: 12px;
+  animation: active-indicator-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes active-indicator-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
 .speed-result {
   min-height: 18px;
   margin-top: 6px;
@@ -2766,6 +2792,43 @@ body {
   font-size: 12px;
   line-height: 1.45;
   white-space: pre-line;
+}
+
+.preset-notice {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--line));
+  background: color-mix(in srgb, var(--primary-soft) 45%, var(--surface));
+  color: var(--text);
+}
+
+.preset-notice i {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--primary);
+}
+
+.preset-notice-warning {
+  border-color: color-mix(in srgb, var(--warning, #d97706) 35%, var(--line));
+  background: color-mix(in srgb, var(--warning, #d97706) 10%, var(--surface));
+}
+
+.preset-notice-warning i {
+  color: var(--warning, #d97706);
+}
+
+.preset-notice-success {
+  border-color: color-mix(in srgb, var(--success, #16a34a) 35%, var(--line));
+  background: color-mix(in srgb, var(--success, #16a34a) 10%, var(--surface));
+}
+
+.preset-notice-success i {
+  color: var(--success, #16a34a);
 }
 
 .apply-explain {

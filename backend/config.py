@@ -18,7 +18,7 @@ LIBRARY_DIR = os.path.join(CONFIG_DIR, "configLibrary")
 OLD_CONFIG_DIR = os.path.expanduser("~/.cc-desktop-switch")
 DEFAULT_UPDATE_URL = "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 DEFAULT_CONFIG = {
     "version": APP_VERSION,
@@ -52,21 +52,12 @@ BUILTIN_PRESETS = [
             "opus": "deepseek-v4-pro",
             "default": "deepseek-v4-pro",
         },
-        "modelOptions": {
-            "deepseek_1m": {
-                "label": "解锁 1M 上下文",
-                "description": "用于 Claude Code/长上下文场景。开启后 Sonnet、Opus 和默认模型使用 deepseek-v4-pro[1m]。",
-                "models": {
-                    "sonnet": "deepseek-v4-pro[1m]",
-                    "haiku": "deepseek-v4-flash",
-                    "opus": "deepseek-v4-pro[1m]",
-                    "default": "deepseek-v4-pro[1m]",
-                },
-                "modelCapabilities": {
-                    "deepseek-v4-pro[1m]": {"supports1m": True},
-                },
+        "notices": [
+            {
+                "type": "info",
+                "text": "DeepSeek V4 全系模型（pro / flash）默认提供 1M 上下文，本应用直接透传，无需额外开关。",
             }
-        },
+        ],
         "requestOptions": {},
         "requestOptionPresets": {
             "deepseek_max_effort": {
@@ -189,16 +180,12 @@ BUILTIN_PRESETS = [
             "opus": "qwen3.6-max-preview",
             "default": "qwen3.6-plus",
         },
-        "modelOptions": {
-            "qwen_1m": {
-                "label": "开启千问 1M 上下文",
-                "description": "阿里云文档确认 qwen3.6-plus / qwen3.6-flash 支持 1M。勾选后会把 1M 能力写入 Codex CLI 配置；不勾选则按普通上下文显示。",
-                "modelCapabilities": {
-                    "qwen3.6-plus": {"supports1m": True},
-                    "qwen3.6-flash": {"supports1m": True},
-                },
+        "notices": [
+            {
+                "type": "info",
+                "text": "Qwen 3.6 Plus / Flash 默认提供 1M 上下文，本应用直接透传，无需额外开关。",
             }
-        },
+        ],
         "modelCapabilities": {},
         "requestOptions": {},
         "isBuiltin": True,

@@ -15,7 +15,7 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本：v1.0.2
+- 当前版本：v1.0.3
 - 已验证供应商：Kimi For Coding（`kimi-for-coding` UA 网关）、Xiaomi MiMo (Token Plan)
 - 实验兼容：DeepSeek V4（含「Max 思维」思考模式）/ 智谱 GLM / 阿里云百炼 / Xiaomi MiMo (Pay for Token) / 其它 OpenAI Chat 兼容反代
 - 平台：Windows x64 安装版 / Windows 便携版 / macOS arm64 / Linux x86_64
@@ -92,7 +92,7 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: v1.0.2
+- Current version: v1.0.3
 - Validated upstream: Kimi For Coding (`kimi-for-coding` UA gateway), Xiaomi MiMo (Token Plan)
 - Experimental compatibility: DeepSeek V4 (with "Max thinking" mode) / Zhipu GLM / Alibaba Cloud Bailian / Xiaomi MiMo (Pay for Token) / other OpenAI Chat-compatible reverse proxies
 - Platforms: Windows x64 installer / Windows portable / macOS arm64 / Linux x86_64
@@ -224,7 +224,7 @@ build.bat                 # 交互式选 1/2/3/4
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\New-Release.ps1 `
     -Version 1.0.0 -Build -TryInstaller `
     -Repository Cmochance/codex-app-transfer
-python scripts\release_assets.py --version 1.0.2 --include windows
+python scripts\release_assets.py --version 1.0.3 --include windows
 ```
 
 带代码签名证书时再加 `-CodeSign -CodeSigningCertificateBase64 ...`，参见 `scripts/Invoke-CodeSigning.ps1`。
@@ -233,7 +233,7 @@ python scripts\release_assets.py --version 1.0.2 --include windows
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Test-ReleaseSignature.ps1 `
-    -File release\Codex-App-Transfer-v1.0.2-Windows-Setup.exe
+    -File release\Codex-App-Transfer-v1.0.3-Windows-Setup.exe
 ```
 
 或在任意有 Python + cryptography 的环境里：
@@ -245,7 +245,7 @@ import base64
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 pub = serialization.load_pem_public_key(Path('release/Codex-App-Transfer-release-public.pem').read_bytes())
-asset = 'release/Codex-App-Transfer-v1.0.2-Linux-x86_64.tar.gz'
+asset = 'release/Codex-App-Transfer-v1.0.3-Linux-x86_64.tar.gz'
 sig = base64.b64decode(Path(asset+'.sig').read_text())
 pub.verify(sig, Path(asset).read_bytes(), padding.PKCS1v15(), hashes.SHA256())
 print('OK')
