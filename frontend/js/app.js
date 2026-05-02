@@ -1009,7 +1009,8 @@
   function isVerifiedProviderId(id) {
     const value = String(id || "").toLowerCase();
     if (value === "kimi" || value === "kimi-code" || value.startsWith("kimi-")) return true;
-    if (value === "xiaomi-mimo-token-plan") return true;
+    if (value === "xiaomi-mimo-token-plan" || value === "xiaomi-mimo-payg") return true;
+    if (value === "deepseek") return true;
     return false;
   }
 

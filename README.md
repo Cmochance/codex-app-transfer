@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
 [![Downloads](https://img.shields.io/github/downloads/Cmochance/codex-app-transfer/total?label=downloads)](https://github.com/Cmochance/codex-app-transfer/releases)
 
-Codex App Transfer 是一个面向 **OpenAI Codex CLI** 的轻量配置和转发工具。它在本机起一个网关，把 Codex CLI 发出的 Responses API（含 WebSocket 流和 `/responses` HTTP 回退）翻译成 Chat Completions 格式，再转发到你选择的供应商，比如 Kimi For Coding、DeepSeek、智谱 GLM、阿里云百炼等。
+Codex App Transfer 是一个面向 **OpenAI Codex CLI** 的轻量配置和转发工具。它在本机起一个网关，把 Codex CLI 发出的 Responses API（含 WebSocket 流和 `/responses` HTTP 回退）翻译成 Chat Completions 格式，再转发到你选择的供应商，比如 Kimi Code、Kimi 月之暗面、DeepSeek V4、Xiaomi MiMo、智谱 GLM、阿里云百炼等。
 
 和 `farion1231/cc-switch` 这类偏 Claude Code / CLI 的 Anthropic 工具不同，本项目专注 OpenAI Codex CLI 的接入：用桌面界面管理供应商、模型映射、转发端口和日志，让 Codex CLI 可以无缝使用第三方 OpenAI 兼容的推理服务。
 
@@ -16,8 +16,8 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 ## 项目状态
 
 - 当前版本：v1.0.3
-- 已验证供应商：Kimi For Coding（`kimi-for-coding` UA 网关）、Xiaomi MiMo (Token Plan)
-- 实验兼容：DeepSeek V4（含「Max 思维」思考模式）/ 智谱 GLM / 阿里云百炼 / Xiaomi MiMo (Pay for Token) / 其它 OpenAI Chat 兼容反代
+- 已验证供应商：Kimi Code（`kimi-for-coding` UA 网关）、Kimi 月之暗面（Moonshot Platform）、DeepSeek V4（含「Max 思维」思考模式）、Xiaomi MiMo (Token Plan)、Xiaomi MiMo (Pay for Token)
+- 实验兼容：智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
 - 平台：Windows x64 安装版 / Windows 便携版 / macOS arm64 / Linux x86_64
 
 ### 更新日志
@@ -84,7 +84,7 @@ http://127.0.0.1:18081
 
 ## English Quick Start
 
-Codex App Transfer is a lightweight desktop app that turns OpenAI Codex CLI into a multi-provider client. It runs a local gateway, translating Codex CLI's Responses API requests (WebSocket stream + `/responses` HTTP fallback) into Chat Completions format and forwarding them to providers such as Kimi For Coding, DeepSeek, Zhipu GLM, and Alibaba Cloud Bailian.
+Codex App Transfer is a lightweight desktop app that turns OpenAI Codex CLI into a multi-provider client. It runs a local gateway, translating Codex CLI's Responses API requests (WebSocket stream + `/responses` HTTP fallback) into Chat Completions format and forwarding them to providers such as Kimi Code, Kimi Moonshot, DeepSeek V4, Xiaomi MiMo, Zhipu GLM, and Alibaba Cloud Bailian.
 
 Unlike `farion1231/cc-switch` and similar Anthropic-oriented Claude Code tools, this project focuses on OpenAI Codex CLI: manage providers, model mapping, forwarding ports, and logs from a desktop UI so Codex CLI can talk to any third-party OpenAI-compatible inference endpoint.
 
@@ -93,8 +93,8 @@ The Windows installer / portable build opens a standalone desktop window by defa
 ### Project status
 
 - Current version: v1.0.3
-- Validated upstream: Kimi For Coding (`kimi-for-coding` UA gateway), Xiaomi MiMo (Token Plan)
-- Experimental compatibility: DeepSeek V4 (with "Max thinking" mode) / Zhipu GLM / Alibaba Cloud Bailian / Xiaomi MiMo (Pay for Token) / other OpenAI Chat-compatible reverse proxies
+- Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (with "Max thinking" mode), Xiaomi MiMo (Token Plan), Xiaomi MiMo (Pay for Token)
+- Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
 - Platforms: Windows x64 installer / Windows portable / macOS arm64 / Linux x86_64
 
 ### Changelog
