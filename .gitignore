@@ -7,6 +7,14 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Native compile artifacts
+backend/*.c
+backend/*.so
+backend/*.pyd
+
+# Local-only build helpers (kept out of public repo)
+scripts/_local_*
+
 # OS / editor noise
 .DS_Store
 Thumbs.db
@@ -52,6 +60,7 @@ macos/assets/app-icon-prepared.png
 # Internal-only docs (kept locally; not part of the public repo)
 docs/litellm/
 docs/plan/
+docs/internal/
 
 # -----------------------------------------------------------------------------
 # Protocol conversion core — DO NOT upload to the public remote.

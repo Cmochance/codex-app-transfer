@@ -56,6 +56,12 @@ echo "Installing Python dependencies..."
 echo "Preparing macOS icon..."
 ensure_icon
 
+# Optional local-only pre-build hook (kept out of public repo).
+if [[ -f "$ROOT/scripts/_local_prebuild.sh" ]]; then
+    cd "$ROOT"
+    source "$ROOT/scripts/_local_prebuild.sh" "$PYTHON_BIN" strict
+fi
+
 echo "Building macOS app bundle..."
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
 rm -rf "$MAC_DIST"

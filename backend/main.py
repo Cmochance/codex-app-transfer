@@ -39,6 +39,7 @@ from backend.proxy import (
 # 前端目录: 项目根目录下的 frontend/
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 _update_quit_handler: Optional[Callable[[], None]] = None
+_show_window_handler: Optional[Callable[[], None]] = None
 
 # 用户反馈 Worker(Cloudflare),所有反馈走它收集 + 邮件通知
 FEEDBACK_WORKER_URL = "https://codex-app-transfer-feedback.alysechencn.workers.dev"
@@ -123,6 +124,12 @@ def register_update_quit_handler(handler: Optional[Callable[[], None]]):
     """注册更新安装前用于优雅退出主应用的回调。"""
     global _update_quit_handler
     _update_quit_handler = handler
+
+
+def register_show_window_handler(handler: Optional[Callable[[], None]]):
+    """注册"将主窗口拉到前台"的回调。供单实例锁第二实例触发用。"""
+    global _show_window_handler
+    _show_window_handler = handler
 
 
 def _get_update_quit_handler() -> Optional[Callable[[], None]]:
@@ -588,6 +595,28 @@ def create_admin_app() -> FastAPI:
             "desktopHealth": _desktop_health(desktop_status, proxy_port, active, providers, expose_all),
             "exposeAllProviderModels": expose_all,
         }
+
+    # ── 单实例握手 API ──
+    # 第二实例启动时探测 admin 端口拿到 instance-info 即可识别"已有实例在跑";
+    # 调 instance-show-window 让旧实例把主窗口拉到前台,然后第二实例 sys.exit(0)。
+    @app.get("/api/instance-info")
+    async def get_instance_info():
+        return {
+            "app": "codex-app-transfer",
+            "version": APP_VERSION,
+            "pid": os.getpid(),
+        }
+
+    @app.post("/api/instance-show-window")
+    async def instance_show_window():
+        handler = _show_window_handler
+        if not callable(handler):
+            return {"shown": False, "reason": "no-handler"}
+        try:
+            handler()
+        except Exception as exc:
+            return {"shown": False, "error": str(exc)}
+        return {"shown": True}
 
     # ── 提供商 API ──
     @app.get("/api/providers")

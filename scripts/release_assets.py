@@ -182,6 +182,15 @@ def collect_windows(root: Path, release_dir: Path, version: str) -> list[Path]:
         target = release_dir / f"{ASSET_PREFIX}-v{version}-Windows-Setup.exe"
         shutil.copyfile(setup, target)
         out.append(target)
+    elif folder.is_dir() or onefile.is_file():
+        # 有 portable / onefile 但没 Setup 时,Setup 缺失绝大概率是 build 没跑全;
+        # 报错而不是静默(老版本就是这里漏了,导致 1.0.1 release 没 Setup 包)。
+        if os.environ.get("CCDS_SKIP_INSTALLER") != "1":
+            raise SystemExit(
+                f"ERROR: Windows Portable/onefile present but Setup installer missing.\n"
+                f"       Expected: {setup}\n"
+                f"       Re-run windows builder; if you really mean to skip, set CCDS_SKIP_INSTALLER=1."
+            )
 
     return out
 

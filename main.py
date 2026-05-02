@@ -20,6 +20,7 @@ from backend.main import (
     create_admin_app,
     desktop_config_target_for_provider,
     maybe_stop_proxy_for_provider,
+    register_show_window_handler,
     register_update_quit_handler,
     stop_proxy_if_running,
     _start_proxy_server,
@@ -170,6 +171,38 @@ def wait_for_admin(url: str, timeout: float = 12.0) -> bool:
             time.sleep(0.2)
 
     return False
+
+
+def try_signal_existing_instance(admin_port: int) -> bool:
+    """检测 127.0.0.1:<admin_port> 是否已有本应用在跑。
+    是 → 调老实例的 show-window 把窗口拉前台,返回 True(调用方应 sys.exit)。
+    否 / 端口被无关进程占 → 返回 False,主流程继续(uvicorn 起不来时会报清晰错误)。"""
+    import json
+    from urllib.request import Request
+
+    info_url = f"http://127.0.0.1:{admin_port}/api/instance-info"
+    show_url = f"http://127.0.0.1:{admin_port}/api/instance-show-window"
+    try:
+        with urlopen(info_url, timeout=1.0) as response:
+            body = response.read().decode("utf-8")
+        payload = json.loads(body) if body else {}
+    except (OSError, URLError, ValueError):
+        return False
+
+    if not isinstance(payload, dict) or payload.get("app") != "codex-app-transfer":
+        return False
+
+    try:
+        req = Request(
+            show_url,
+            method="POST",
+            headers={"X-CAS-Request": "1", "Content-Length": "0"},
+        )
+        with urlopen(req, timeout=2.0):
+            pass
+    except (OSError, URLError):
+        pass
+    return True
 
 
 def build_admin_server(admin_app, port: int) -> uvicorn.Server:
@@ -507,6 +540,9 @@ def open_desktop_window(url: str) -> bool:
         if tray_started:
             window.events.closed += tray.stop
 
+        # 单实例锁:把"拉前台"能力暴露给 backend HTTP 端点,供第二实例触发
+        register_show_window_handler(tray.show_window)
+
         menu = []
         if sys.platform == "darwin":
             from webview.menu import Menu, MenuAction, MenuSeparator
@@ -542,6 +578,9 @@ def run_browser_mode(admin_app, admin_port: int, open_ui: bool = True):
     url = f"http://127.0.0.1:{admin_port}"
     if open_ui:
         threading.Thread(target=open_browser_when_ready, args=(url,), daemon=True).start()
+
+    # 单实例锁:浏览器模式下"拉前台"等价于重新打开同一 URL,大多数浏览器会聚焦已有 tab
+    register_show_window_handler(lambda: webbrowser.open(url))
 
     safe_print(f"""
 ╔══════════════════════════════════════════╗
@@ -593,6 +632,16 @@ def main():
     # 确保配置目录存在
     cfg.ensure_config_dir()
 
+    # 单实例锁:启动前先探测 admin 端口,有老实例就把它的窗口拉前台,自己退出。
+    # 必须在 restore / auto-apply / 注册 atexit 之前,避免第二实例做出任何副作用。
+    settings = cfg.get_settings()
+    admin_port = args.port or settings.get("adminPort", 18081)
+    if try_signal_existing_instance(admin_port):
+        safe_print(f"{APP_NAME} 已在运行,已唤起现有窗口。")
+        if sys.platform == "win32":
+            show_message_box_async(APP_NAME, f"{APP_NAME} 已经在运行。\n请通过任务栏或系统托盘打开。")
+        sys.exit(0)
+
     # 启动兜底（A3）：上一会话若异常退出（SIGKILL / 断电 / 闪退）会留下快照,
     # 设置开关开启时静默还原一次,保证「不开应用 → ~/.codex/ 即原配置」语义。
     restore_codex_if_enabled(reason="startup")
@@ -605,10 +654,6 @@ def main():
     # 返回等）。SIGKILL 走不到这里,由下次启动 startup 钩子兜底。综合 cleanup 包含：
     # 停转发服务（无条件） + 还原 Codex 配置（受 restoreCodexOnExit 控制）。
     atexit.register(on_app_exit_cleanup, "atexit")
-
-    # 读取设置
-    settings = cfg.get_settings()
-    admin_port = args.port or settings.get("adminPort", 18081)
 
     # 创建管理后台应用
     admin_app = create_admin_app()

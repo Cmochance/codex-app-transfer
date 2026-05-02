@@ -22,9 +22,13 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ### v1.0.2 主要变化
 
-- **新增用户反馈系统(无需登录)**：Dashboard 顶栏 + Settings 底部都加了反馈按钮,弹出 Modal 支持文本 + 拖拽 / Cmd+V 粘截图 / 选附日志,默认勾选附加诊断(应用版本 / OS / 当前 provider 名称 / 最近 200 行 proxy 日志,**不含 API Key**)。提交后端转发到自建 Cloudflare Worker,落 R2 存储 + Resend 邮件即时通知开发者。匿名提交,无任何账号体系。完整方案见 [`feedback-worker/README.md`](feedback-worker/README.md)。
-- **修复 pywebview WebKit FormData 兼容 bug**：反馈链路最初用 `fetch + FormData` 提交,WKWebView 在某些状态下会抛 `the string did not match the expected pattern`。改为前端 → 后端走 JSON + base64,后端 → Worker 仍用 multipart(httpx 拼包不受 WebKit 影响),应用层完全绕开 FormData。
-- **节流体验改进**:成功提交一次后 60s 冷却(防误触);失败不立即计入,5 分钟内连续 5 次失败才触发 60s 冷却(给改完即重试的容错空间);任意成功重置失败计数。完整变更见 [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md)。
+- **新增用户反馈系统(完全匿名,无需登录)**:Dashboard / Settings 两处入口,Modal 支持文本 + 拖拽 / Cmd+V 粘截图 / 选附日志,默认附加诊断信息(应用版本 / OS / provider 名 / 最近 200 行 proxy 日志,**不含 API Key**)。链路走自建 Cloudflare Worker → R2 + Resend 邮件,完整方案见 [`feedback-worker/README.md`](feedback-worker/README.md)。
+- **指南页重做**:Hero + 5 步快速开始 + 进阶用法 4 卡片 + 故障排查 4 卡片(含"测速失败 → 协议改 chat/completions"提示),取代老版本简陋的 3 步 timeline。
+- **Xiaomi MiMo (Token Plan) 端到端验证升级**:从「实验兼容」升级为「已验证供应商」,同步多集群配置(中国 / 新加坡 / 欧洲)。Pay for Token 仍在实验列表。
+- **单实例锁(修复多开)**:老版本双击 `.exe` 两次会启两个进程抢端口冲突;现在第二实例会自动唤起首个实例的窗口并退出。
+- **Dashboard 文档跳转**:provider 卡片的 baseUrl 不再是死链(`https://api.deepseek.com/v1` 这种 API 接入地址不可访问),改为指向官方文档,点击有确认弹窗避免误触。
+- **多个 bug 修复**:pywebview WebKit FormData 兼容、CSRF 防护头、i18n HTML 渲染、Kimi 默认协议矫正、日志面板自动滚动、Provider 编辑表单去掉混淆性的 Auth Scheme 选择器。
+- **打包流程**:Windows Setup 安装包默认强制构建(v1.0.1 漏过),增强了打包产物的反编译保护(macOS / Linux)。完整变更见 [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md)。
 
 ### v1.0.1 主要变化
 
@@ -47,7 +51,7 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 - Codex CLI 原配置守护：apply 前自动快照 `~/.codex/{config.toml,auth.json}`，退出 / 下次启动按 key 智能合并还原；切到不需转发的 provider 自动停转发服务。
 - 实时日志面板：每 2 秒自动刷新；提供"查看日志"按钮直接打开 `~/.codex-app-transfer/logs/`；"清除日志"按钮会把当前日志备份到 `logs/backup/` 后开启新日志，不直接删除文件。
 - 中文 / 英文界面，浅色 / 深色 / 绿色 / 橙色 / 灰色 / 白色多种主题（仅深色会改变背景色）。
-- Windows 系统托盘 + 单实例锁定。
+- Windows / macOS / Linux 系统托盘 + 跨平台单实例锁定(双击启动会自动唤起已有窗口)。
 
 ## 界面预览
 
@@ -109,7 +113,7 @@ The Windows installer / portable build opens a standalone desktop window by defa
 - Experimental compatibility: DeepSeek V4 (with "Max thinking" mode) / Zhipu GLM / Alibaba Cloud Bailian / Xiaomi MiMo (Pay for Token) / other OpenAI Chat-compatible reverse proxies
 - Platforms: Windows x64 installer / Windows portable / macOS arm64 / Linux x86_64
 
-v1.0.2 highlights: anonymous user feedback system (Cloudflare Worker + R2 + Resend), pywebview WebKit FormData compatibility fix (switched to JSON+base64 transport), refined throttle UX. See [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md). v1.0.1 highlights: multi-turn `previous_response_id` context-loss fix, three thinking-mode anomalies fixed, `~/.codex/` original-config snapshot/restore, auto-apply on start, Windows installer crash fix. See [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md).
+v1.0.2 highlights: anonymous user feedback system (Cloudflare Worker + R2 + Resend), redesigned getting-started guide page, Xiaomi MiMo (Token Plan) e2e verified, cross-platform single-instance lock (fixes multi-open), Dashboard provider docs link with confirm dialog, Auth Scheme selector removed, log panel auto-scroll fix, Windows Setup installer enforced by default, plus several bug fixes (pywebview WebKit FormData, CSRF header, i18n HTML rendering, Kimi default protocol). See [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md). v1.0.1 highlights: multi-turn `previous_response_id` context-loss fix, three thinking-mode anomalies fixed, `~/.codex/` original-config snapshot/restore, auto-apply on start, Windows installer crash fix. See [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md).
 
 ### Getting started
 
@@ -132,7 +136,7 @@ If the desktop window fails to open, the management UI is also reachable at `htt
 - Normalizes `reasoning_effort` (`xhigh` / `max` → `high`; `auto` / `none` dropped) so providers that only accept `minimal/low/medium/high` won't reject the request.
 - Live log panel auto-refreshing every 2 seconds, with an `Open log folder` button that jumps to `~/.codex-app-transfer/logs/`. The `Clear logs` button archives the active log to `logs/backup/` with a timestamp suffix instead of deleting it.
 - Chinese / English UI with light, dark, green, orange, gray, and white themes (only the dark theme changes background colors).
-- Windows system tray + single-instance lock.
+- System tray on Windows / macOS / Linux + cross-platform single-instance lock (a second launch auto-focuses the existing window).
 
 ### Security notes
 
