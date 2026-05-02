@@ -394,6 +394,25 @@ def stop_proxy_if_running() -> bool:
 
 
 def _provider_test_model(provider: dict) -> str:
+    """挑一个上游真实接受的模型 ID 用于 POST 测试。
+
+    优先用 provider 自己 ``models`` 映射里的真实模型（比如 ``kimi-k2.6``、
+    ``deepseek-v4-pro``），不能用 OpenAI 端的 ID（``gpt-5.5`` 等）—— 那种
+    上游不认会直接 401/400, 误报"认证失败"。
+    """
+    from backend.model_alias import normalize_model_mappings, MODEL_ORDER
+
+    mappings = normalize_model_mappings(provider.get("models") or {})
+    default = (mappings.get("default") or "").strip()
+    if default:
+        return default
+    for slot in MODEL_ORDER:
+        if slot == "default":
+            continue
+        slot_model = (mappings.get(slot) or "").strip()
+        if slot_model:
+            return slot_model
+    # 兜底用 OpenAI ID（实际几乎不会走到这里）
     for model in provider_model_ids(provider):
         if model:
             return model

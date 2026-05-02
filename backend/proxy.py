@@ -726,11 +726,15 @@ async def forward_request_stream(
 
     try:
         client = await get_http_client()
+        # 流式 read timeout 必须比非流式宽松得多。reasoning 模型(Kimi k2.6 / DeepSeek
+        # max thinking 等)在思考阶段两个 SSE chunk 之间的 idle gap 经常 > 120s,
+        # 用全局默认会被 ReadTimeout 误杀。connect 30s 足够;read 给 600s。
         async with client.stream(
             "POST",
             upstream_url,
             json=upstream_body,
             headers=headers,
+            timeout=httpx.Timeout(connect=30.0, read=600.0, write=120.0, pool=120.0),
         ) as resp:
 
                 log_buffer.add(
@@ -848,11 +852,32 @@ async def forward_request_stream(
         stats.record(False)
         message = f"{e.__class__.__name__}: {str(e)}".rstrip()
         log_buffer.add("ERROR", f"流式请求失败: {message}")
+        error_obj = {
+            "type": "upstream_error",
+            "code": e.__class__.__name__.lower() if isinstance(e, httpx.TimeoutException) else "stream_error",
+            "message": message,
+            "param": None,
+        }
+        # Codex CLI 同时关心 error(显示) 和 response.failed(终止信号), 缺后者会一直 thinking
         error_event = {
             "type": "error",
-            "error": {"message": message},
+            "sequence_number": 0,
+            "error": error_obj,
         }
-        yield f"data: {json.dumps(error_event)}\n\n"
+        failed_event = {
+            "type": "response.failed",
+            "sequence_number": 1,
+            "response": {
+                "id": f"resp_{uuid.uuid4().hex[:12]}",
+                "object": "response",
+                "status": "failed",
+                "error": error_obj,
+                "model": original_model or body.get("model", ""),
+                "output": [],
+            },
+        }
+        yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps(failed_event, ensure_ascii=False)}\n\n"
 
 
 def _openai_to_responses(
