@@ -20,25 +20,9 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 - 实验兼容：DeepSeek V4（含「Max 思维」思考模式）/ 智谱 GLM / 阿里云百炼 / Xiaomi MiMo (Pay for Token) / 其它 OpenAI Chat 兼容反代
 - 平台：Windows x64 安装版 / Windows 便携版 / macOS arm64 / Linux x86_64
 
-### v1.0.2 主要变化
+### 更新日志
 
-- **新增用户反馈系统(完全匿名,无需登录)**:Dashboard / Settings 两处入口,Modal 支持文本 + 拖拽 / Cmd+V 粘截图 / 选附日志,默认附加诊断信息(应用版本 / OS / provider 名 / 最近 200 行 proxy 日志,**不含 API Key**)。链路走自建 Cloudflare Worker → R2 + Resend 邮件,完整方案见 [`feedback-worker/README.md`](feedback-worker/README.md)。
-- **指南页重做**:Hero + 5 步快速开始 + 进阶用法 4 卡片 + 故障排查 4 卡片(含"测速失败 → 协议改 chat/completions"提示),取代老版本简陋的 3 步 timeline。
-- **Xiaomi MiMo (Token Plan) 端到端验证升级**:从「实验兼容」升级为「已验证供应商」,同步多集群配置(中国 / 新加坡 / 欧洲)。Pay for Token 仍在实验列表。
-- **单实例锁(修复多开)**:老版本双击 `.exe` 两次会启两个进程抢端口冲突;现在第二实例会自动唤起首个实例的窗口并退出。
-- **Dashboard 文档跳转**:provider 卡片的 baseUrl 不再是死链(`https://api.deepseek.com/v1` 这种 API 接入地址不可访问),改为指向官方文档,点击有确认弹窗避免误触。
-- **多个 bug 修复**:pywebview WebKit FormData 兼容、CSRF 防护头、i18n HTML 渲染、Kimi 默认协议矫正、日志面板自动滚动、Provider 编辑表单去掉混淆性的 Auth Scheme 选择器。
-- **打包流程**:Windows Setup 安装包默认强制构建(v1.0.1 漏过),增强了打包产物的反编译保护(macOS / Linux)。完整变更见 [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md)。
-
-### v1.0.1 主要变化
-
-- **修复 `previous_response_id` 多轮对话上下文丢失**：与 Kimi / DeepSeek 等 OpenAI Chat 上游做多轮工具调用时，第 2-3 轮起会出现"模型彻底失忆、回复 'I'm here, what would you like me to help you with today?'"等表现 —— 实质是 100% session_cache miss。修复 cache 查询前先 decode `resp_<base64>` 还原原始 `chatcmpl-xxx`，等价于 litellm `session_handler.py:284-291` 的标准做法。
-- **修复 Kimi / DeepSeek thinking 模式三类异常**：(1) 深层对话 `400 reasoning_content is missing` —— 占位改单空格 + strip 后判空；(2) 思维内容流式 UI 卡住 —— 改用正确的 `reasoning_summary_part.added/done` + `summary_index` 协议事件；(3) 思考结束后工具调用 `400 tool_call_id is not found` —— 多字段 fallback + 全局 `TOOL_CALLS_CACHE` 重建缺失的 assistant.tool_calls。
-- **Codex CLI 原配置自动还原 + 启动自动应用**：第一次「应用配置」前自动备份 `~/.codex/{config.toml,auth.json}` 至本工具目录；顶栏按钮由「清除配置」改为**「还原 Codex 原配置」**，按 key 智能合并。退出 / 下次启动自动还原；启动时按当前 active provider 自动写入 + 按需起转发。Settings 新增两个开关，均默认开启。
-- **多家提供商切换到 OpenAI Chat 兼容路径**：DeepSeek / 智谱 GLM / 阿里云百炼 / Xiaomi MiMo 五家的默认 `apiFormat` 改为 `openai_chat`，转发统一为 `<baseUrl>/chat/completions`。智谱 / 百炼默认认证由 `x-api-key` 改为 `Authorization: Bearer`，DeepSeek baseURL 由 `/anthropic` 改为 `/v1`。
-- **DeepSeek V4 思维模式**：「DeepSeek Max 思维」开关现支持 chat/completions 路径，请求体按 [DeepSeek V4 Thinking Mode 文档](https://api-docs.deepseek.com/guides/thinking_mode) 对齐。
-- **修复 Windows 安装版启动崩溃**：v1.0.1 安装版报 `ModuleNotFoundError: jaraco.text`，原因是 PyInstaller 配置遗漏 `pkg_resources` 的 vendored 依赖。
-- 编辑页新增「未端到端验证」提示横幅；移除遗留的 CC-Switch 导入功能。完整变更见 [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md)。
+逐版本变更详见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 或 `docs/release-notes-v*.md`。
 
 ## 能做什么
 
@@ -113,7 +97,9 @@ The Windows installer / portable build opens a standalone desktop window by defa
 - Experimental compatibility: DeepSeek V4 (with "Max thinking" mode) / Zhipu GLM / Alibaba Cloud Bailian / Xiaomi MiMo (Pay for Token) / other OpenAI Chat-compatible reverse proxies
 - Platforms: Windows x64 installer / Windows portable / macOS arm64 / Linux x86_64
 
-v1.0.2 highlights: anonymous user feedback system (Cloudflare Worker + R2 + Resend), redesigned getting-started guide page, Xiaomi MiMo (Token Plan) e2e verified, cross-platform single-instance lock (fixes multi-open), Dashboard provider docs link with confirm dialog, Auth Scheme selector removed, log panel auto-scroll fix, Windows Setup installer enforced by default, plus several bug fixes (pywebview WebKit FormData, CSRF header, i18n HTML rendering, Kimi default protocol). See [`docs/release-notes-v1.0.2.md`](docs/release-notes-v1.0.2.md). v1.0.1 highlights: multi-turn `previous_response_id` context-loss fix, three thinking-mode anomalies fixed, `~/.codex/` original-config snapshot/restore, auto-apply on start, Windows installer crash fix. See [`docs/release-notes-v1.0.1.md`](docs/release-notes-v1.0.1.md).
+### Changelog
+
+Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) (and locally under `docs/release-notes-v*.md`).
 
 ### Getting started
 
