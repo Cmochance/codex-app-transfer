@@ -15,11 +15,6 @@ VERSION="${CCDS_VERSION:-1.0.0}"
 echo "==> Cleaning previous Linux artifacts"
 rm -rf dist/linux-folder dist/linux-onefile build/build-linux 2>/dev/null || true
 
-# Optional local-only pre-build hook (kept out of public repo).
-if [[ -f scripts/_local_prebuild.sh ]]; then
-    source scripts/_local_prebuild.sh python3 strict
-fi
-
 echo "==> PyInstaller folder mode (Linux x86_64)"
 unset CCDS_ONEFILE
 python3 -m PyInstaller --noconfirm --clean \

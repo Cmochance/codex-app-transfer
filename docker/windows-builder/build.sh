@@ -24,11 +24,6 @@ rm -rf dist/Codex-App-Transfer dist/Codex-App-Transfer.exe \
        Codex-App-Transfer-Setup-*.exe \
        build/build build/build-onefile 2>/dev/null || true
 
-# Optional local-only pre-build hook (kept out of public repo).
-if [[ -f scripts/_local_prebuild.sh ]]; then
-    source scripts/_local_prebuild.sh "wine python" best-effort
-fi
-
 echo "==> PyInstaller (folder mode)"
 unset CCDS_ONEFILE
 wine python -m PyInstaller --noconfirm --clean build.spec

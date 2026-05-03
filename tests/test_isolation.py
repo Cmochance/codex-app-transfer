@@ -58,8 +58,6 @@ print("1. 模块导入测试")
 print("=" * 60)
 
 MODULES = [
-    "backend.api_types",
-    "backend.api_response_types",
     "backend.session_cache",
     "backend.response_id_codec",
     "backend.deployment_affinity",
@@ -67,7 +65,6 @@ MODULES = [
     "backend.base_adapter",
     "backend.provider_workarounds",
     "backend.openai_adapter",
-    "backend.native_streaming_adapter",
     "backend.responses_adapter",
     "backend.chat_responses_adapter",
     "backend.streaming_adapter",

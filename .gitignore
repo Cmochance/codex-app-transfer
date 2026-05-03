@@ -7,14 +7,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Native compile artifacts
-backend/*.c
-backend/*.so
-backend/*.pyd
-
-# Local-only build helpers (kept out of public repo)
-scripts/_local_*
-
 # OS / editor noise
 .DS_Store
 Thumbs.db
@@ -60,33 +52,6 @@ macos/assets/app-icon-prepared.png
 # Internal-only docs (kept locally; not part of the public repo)
 docs/litellm/
 docs/plan/
-docs/internal/
-
-# -----------------------------------------------------------------------------
-# Protocol conversion core — DO NOT upload to the public remote.
-#
-# 以下 backend 模块实现 Responses API ↔ Chat Completions 的双向转换、
-# 流式状态机、类型系统、provider 兼容修复以及 response_id / session 复用逻辑。
-# 实现思路与字段映射高度参考 litellm（BerriAI/litellm，MIT），存在归属/侵权风险，
-# 为安全起见仅在本地保留，不纳入公开仓库；macOS / Linux / Windows 打包脚本均直接
-# 读取本地源码，不影响发布流程。
-#
-# 如需开源版本，应替换为完全独立实现或先与 litellm 协议许可对齐再解除忽略。
-# -----------------------------------------------------------------------------
-backend/responses_adapter.py
-backend/chat_responses_adapter.py
-backend/streaming_adapter.py
-backend/native_streaming_adapter.py
-backend/openai_adapter.py
-backend/base_adapter.py
-backend/adapter_utils.py
-backend/api_adapters.py
-backend/api_types.py
-backend/api_response_types.py
-backend/provider_workarounds.py
-backend/response_id_codec.py
-backend/session_cache.py
-backend/deployment_affinity.py
 
 # Feedback Worker secrets / 本地缓存
 feedback-worker/.env
