@@ -2,7 +2,8 @@
 
 [![GitHub stars](https://img.shields.io/github/stars/Cmochance/codex-app-transfer?style=social)](https://github.com/Cmochance/codex-app-transfer/stargazers)
 [![License](https://img.shields.io/github/license/Cmochance/codex-app-transfer)](LICENSE.txt)
-[![Python](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)](https://www.python.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri)](https://v2.tauri.app/)
 [![Downloads](https://img.shields.io/github/downloads/Cmochance/codex-app-transfer/total?label=downloads)](https://github.com/Cmochance/codex-app-transfer/releases)
 
 Codex App Transfer 是一个面向 **OpenAI Codex CLI** 的轻量配置和转发工具。它在本机起一个网关，把 Codex CLI 发出的 Responses API（含 WebSocket 流和 `/responses` HTTP 回退）翻译成 Chat Completions 格式，再转发到你选择的供应商，比如 Kimi Code、Kimi 月之暗面、DeepSeek V4、Xiaomi MiMo、智谱 GLM、阿里云百炼等。
@@ -15,10 +16,11 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本：v1.0.4
+- 当前版本：**v2.0.0**(Python → Rust/Tauri 全栈重写;UI 视觉与 v1.0.4 字节级一致)
 - 已验证供应商：Kimi Code（`kimi-for-coding` UA 网关）、Kimi 月之暗面（Moonshot Platform）、DeepSeek V4（含「Max 思维」思考模式）、Xiaomi MiMo (Token Plan)、Xiaomi MiMo (Pay for Token)
-- 实验兼容：智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
-- 平台：Windows x64 安装版 / Windows 便携版 / macOS arm64 / Linux x86_64
+- 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
+- 平台:macOS arm64(v2.0.0 首发);Windows x64 / Linux x86_64 留 v2.0.x 补
+- 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.0.4 字节级互通,可来回切换不丢数据
 
 ### 更新日志
 
@@ -92,10 +94,11 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: v1.0.4
+- Current version: **v2.0.0** (full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
 - Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (with "Max thinking" mode), Xiaomi MiMo (Token Plan), Xiaomi MiMo (Pay for Token)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
-- Platforms: Windows x64 installer / Windows portable / macOS arm64 / Linux x86_64
+- Platforms: macOS arm64 (v2.0.0 launch); Windows x64 / Linux x86_64 follow in v2.0.x
+- Data compatibility: `~/.codex-app-transfer/config.json` is byte-identical between v1.0.4 and v2.0.0 — switch back and forth without data loss
 
 ### Changelog
 
@@ -110,7 +113,7 @@ Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochanc
 5. In Codex CLI's config (`~/.codex/config.toml`), point `base_url` at `http://127.0.0.1:18080` and set the API key to the gateway API key shown in the app.
 6. Restart Codex CLI; the model picker now lists the model mappings for the active provider.
 
-If the desktop window fails to open, the management UI is also reachable at `http://127.0.0.1:18081`.
+> Note (v2): the management UI is now in-process via Tauri's custom `cas://` URI scheme. The v1.x debug fallback at `http://127.0.0.1:18081` no longer exists; use the desktop window (or restart the app to recreate it).
 
 ### What it does
 
@@ -135,99 +138,68 @@ If the desktop window fails to open, the management UI is also reachable at `htt
 
 ## 默认端口
 
-- 管理界面：`18081`
-- 本机转发服务：`18080`，Codex CLI 通过它访问上游供应商
+- **本机转发服务**:`18080`,Codex CLI 通过它访问上游供应商
+- **管理界面(v2)**:Tauri 自定义 `cas://` URI scheme + 同进程 axum,**不再绑定 18081 端口**。v1.4 的 18081 调试入口已移除,管理界面只能通过应用窗口访问
 
-可在 设置 → 端口 修改，修改后需要重启转发。
+可在 设置 → 端口 修改转发端口,修改后需要重启转发。
 
-## 本地开发
+## 本地开发(v2 / Rust)
 
-```powershell
+前置:Rust 1.80+(`rustup`)、Tauri CLI(`cargo install tauri-cli --version "^2"`)、macOS 上需要 Xcode CLT。
+
+```bash
 git clone https://github.com/Cmochance/codex-app-transfer.git
 cd codex-app-transfer
+
+# 启动桌面窗口(开发模式,代码改动自动重编译)
+cargo tauri dev
+
+# 单独跑后端测试(不开窗口)
+cargo test --workspace
+```
+
+`frontend/` 是 v1.4 同款 Bootstrap + 原生 JS,改任何 HTML/CSS/JS 文件后**刷新窗口**即可生效(Tauri 的 cas:// 协议会重新读取 `include_dir!` 嵌入的资源,但需要重新构建二进制——dev 模式下会自动)。
+
+### Python 端验证脚本(契约测试用,可选)
+
+```bash
+. .venv/bin/activate
+pip install pytest pytest-asyncio respx
+pytest tests/test_replay_smoke.py
+```
+
+`tests/replay/fixtures/` 下的 SSE fixture 是 Python ↔ Rust 字节级契约,Rust crate 的集成测试会读这些 fixture 做 round-trip 验证。
+
+## 历史版本(v1.x / Python)
+
+v1.0.4 及更早版本基于 Python 3.11+ + FastAPI + pywebview + PyInstaller。源码仍在 `backend/` 和 `main.py` 中保留,可用以下命令运行:
+
+```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-默认会打开桌面窗口。调试时也可以用浏览器模式：
+但 v2.0.0 起主线只维护 Rust 实现。`backend/` 与 `main.py` 留作历史参考。
 
-```powershell
-python main.py --browser
-```
+## 打包(v2)
 
-## 验证
-
-```powershell
-python -m compileall -q backend main.py
-node --check frontend/js/api.js
-node --check frontend/js/app.js
-node --check frontend/js/i18n.js
-```
-
-## 打包
-
-构建跑在 Mac 本机 + Docker 容器里。三平台一键发布：
+只需一条命令(macOS):
 
 ```bash
-make release VERSION=1.0.0
+make mac-app
 ```
 
-依次执行 `mac-release` → `linux-release` → `win-release`，最后汇总 `latest.json`。
-每个产物在 `release/` 下都附带 `.sha256` 和 `.sig`（RSA-3072 PKCS#1 v1.5 + SHA-256，
-公钥 `Codex-App-Transfer-release-public.pem`）。
+内部跑 `cargo tauri build --bundles app`,产出落到 `dist/mac/Codex App Transfer.app`。**单二进制 27MB**,不需要 Python 解释器、不需要外部 frontend/ 目录(全部 `include_dir!` 嵌入二进制)、不需要 Docker/Wine。
 
-### macOS（在 macOS 本机）
+要带签名 + notarize 的正式发布(`mac-release` Makefile target,Apple Developer ID + dmg/pkg),v2.0.x 起补;当前 v2.0.0 仅本地自测路径。
 
-```bash
-make mac-release VERSION=1.0.0
-```
+### Windows / Linux
 
-产物：`dist/mac/Codex App Transfer.app`、`Codex-App-Transfer-v<版本>-macOS-arm64.{pkg,dmg}`。
-设置 `MACOS_CODESIGN_IDENTITY` 启用 Apple Developer ID 签名；不设则仅本机自签。
+v2.0.0 首发只 ship macOS arm64。Tauri 2 原生支持跨平台编译,后续 v2.0.x 会接 Windows MSI / Linux .deb / .rpm。代码层面没有平台特异(除 macOS Apple-specific 的 NSApp.hide / NSRunningApplication.activate 等已 `#[cfg(target_os = "macos")]` 隔离),`cargo tauri build` 在对应平台直接出 native 产物。
 
-### Linux x86_64（macOS 上跨编译，需要 Docker）
+### 历史(v1.x / Python)打包
 
-```bash
-make linux-release VERSION=1.0.0
-```
-
-容器基于 `ubuntu:22.04`，预装 GTK3 + WebKit2GTK 4.0 + libayatana-appindicator3，
-PyInstaller 同时出 folder 模式（打成 tar.gz 便携包）和 onefile 模式（单文件可执行）。
-运行时仍依赖目标系统已装上述系统库。
-
-### Windows（macOS 上跨编译，需要 Docker）
-
-```bash
-make win-release VERSION=1.0.0
-```
-
-容器基于 `tobix/pywine:3.12` + Linux NSIS，Wine 跑 PyInstaller 出 Windows 原生 exe，
-再用 `makensis` 出 Setup。详细原理、踩坑提示和 Authenticode 签名的回退方案见
-[`docs/build.md`](docs/build.md)。
-
-> ⚠️ PyInstaller-via-Wine 偶尔在 pywebview / pystray 上有兼容问题，
-> **正式发布前请在真实 Windows 机器上烟雾测试** Setup 安装、单文件 exe 启动、托盘交互。
-
-### Docker / OrbStack 准备
-
-Apple Silicon 推荐安装 [OrbStack](https://orbstack.dev/)，比 Docker Desktop 轻量。
-首次启动 OrbStack 后建议把 `~/.orbstack/bin` 加进 PATH（脚本里有 fallback，PATH 没配也能跑）。
-首次跑 `linux-image` / `win-image` 会拉 ~3 GB 基础镜像，之后增量构建很快。
-
-### Windows 本地原生打包（备用路径）
-
-手头有 Windows 机器时：
-
-```powershell
-build.bat                 # 交互式选 1/2/3/4
-# 或：
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\New-Release.ps1 `
-    -Version 1.0.0 -Build -TryInstaller `
-    -Repository Cmochance/codex-app-transfer
-python scripts\release_assets.py --version 1.0.3 --include windows
-```
-
-带代码签名证书时再加 `-CodeSign -CodeSigningCertificateBase64 ...`，参见 `scripts/Invoke-CodeSigning.ps1`。
+v1.0.4 之前用 PyInstaller + Docker + Wine + NSIS 三平台打包,Makefile target `make mac-release`、`make linux-release`、`make win-release` 仍可工作但已停止维护。详见 `docs/build.md` 与各 `release-notes-v1.0.x.md`。
 
 ### 签名校验
 
@@ -291,14 +263,18 @@ netstat -ano | findstr :18081
 - 磁盘文件：`~/.codex-app-transfer/logs/proxy-YYYY-MM-DD.log`，可点"查看日志"按钮直接打开。
 - 清除日志：把当前日志移到 `logs/backup/` 并加时间戳后缀，不直接删除。
 
-## 技术栈
+## 技术栈(v2)
 
-- 后端：Python 3.11+, FastAPI, httpx, uvicorn, websockets
-- 前端：HTML, CSS, Vanilla JavaScript, Bootstrap 5.3 CDN
-- 桌面壳：pywebview（Windows EdgeWebView2 / macOS WKWebView）+ pystray
-- 存储：`~/.codex-app-transfer/config.json`（配置）、`~/.codex-app-transfer/logs/`（日志）
-- 打包：PyInstaller, NSIS, hdiutil（macOS）
-- 跨平台构建：Docker + Wine（macOS 上跨编译 Windows）+ macOS 本机 PyInstaller
+- **后端 / 转发**:Rust 1.80+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio
+- **协议适配**:`crates/adapters` —— Responses ↔ Chat 互转(请求 body + 流式响应状态机,支持 reasoning_content / tool_calls)
+- **前端**:HTML + CSS + 原生 JavaScript + Bootstrap 5.3.3(本地化,无 CDN 依赖)—— 与 v1.0.4 **视觉字节级一致**
+- **桌面壳**:Tauri 2 + tray-icon 0.23,通过自定义 `cas://` URI scheme 把 frontend/ 与 axum 同进程串起来,无 TCP loopback
+- **存储**:`~/.codex-app-transfer/config.json`(配置,与 v1.x 字节级兼容)、`~/.codex/{config.toml,auth.json}`(Codex CLI 集成)、`~/.codex-app-transfer/codex-snapshot/`(apply 前的备份快照)
+- **打包**:`cargo tauri build` 单命令 → `dist/mac/Codex App Transfer.app`(27MB,unsigned 自测;v2.0.x 起接 Apple Developer ID + notarize)
+
+## 重写过程
+
+v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 修订日志)记录在 [`docs/migration-plan.md`](docs/migration-plan.md),核心结论 + 量化对比 + 关键 bug 修复见 [`docs/release-notes-v2.0.0.md`](docs/release-notes-v2.0.0.md)。
 
 ## 安全说明
 
@@ -313,7 +289,8 @@ netstat -ano | findstr :18081
 
 - **[CC-Switch](https://github.com/farion1231/cc-switch)** 提供了"轻量桌面 + 一键切换 API 提供商"的产品形态启发。
 - **[CC Desktop Switch](https://github.com/lonr-6/cc-desktop-switch)** 提供了完整的桌面应用框架——pywebview 桌面壳、pystray 托盘、FastAPI 双端口（管理 / 转发）布局、PyInstaller / NSIS 打包脚本、`scripts/New-Release.ps1` 发布签名链路、GitHub Actions 自动构建工作流，以及 i18n / 主题 / 设置面板等前端模板都直接沿用了它的实现。
-- **[litellm](https://github.com/BerriAI/litellm)** 提供了 Responses API ↔ Chat Completions 双向协议转换的核心思路。`backend/responses_adapter.py` / `backend/openai_adapter.py` / `backend/base_adapter.py` 等模块的字段映射、消息归一化、reasoning 处理等都参考了 litellm 的实现策略。
+- **[litellm](https://github.com/BerriAI/litellm)** 提供了 Responses API ↔ Chat Completions 双向协议转换的核心思路。v1.x 的 `backend/responses_adapter.py` / `backend/openai_adapter.py` / `backend/base_adapter.py` 以及 v2.x 的 `crates/adapters/` 都直接参考了 litellm 的字段映射、消息归一化和 reasoning 处理策略。
+- **[Tauri](https://tauri.app/)** 提供了 v2.0 桌面壳的全部基础设施 —— 单二进制打包、native webview、tray、IPC、单实例插件、自定义 URI scheme。v2.0 的"frontend/ 零改动 + cas:// 同进程 axum"架构靠 Tauri 2 的 `register_asynchronous_uri_scheme_protocol` 才能成立。
 
 本项目专注 OpenAI Codex CLI 接入，不是 OpenAI、Anthropic、CC-Switch 或 `farion1231/cc-switch` 的官方项目，也不复用它们的商标、Logo 或发布身份。
 

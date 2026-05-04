@@ -57,3 +57,18 @@ docs/plan/
 feedback-worker/.env
 feedback-worker/.wrangler/
 feedback-worker/node_modules/
+
+# Rust / Tauri 2 工作区构建产物
+/target/
+**/target/
+src-tauri/gen/
+**/*.rs.bk
+
+# IDE / editor noise
+.vscode/
+.idea/
+*.iml
+
+# Tauri auto-generated mobile icons(本仓不发移动端;`cargo tauri icon` 重生即可)
+src-tauri/icons/android/
+src-tauri/icons/ios/
