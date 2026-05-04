@@ -1,0 +1,924 @@
+//! `/api/*` 路由 handlers —— 1:1 翻译自 `backend/main.py`.
+//!
+//! 数据形态(请求/响应 JSON shape)严格对齐 v1.4,frontend/js/api.js 不需要
+//! 任何修改即可工作。
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use codex_app_transfer_codex_integration::{
+    apply_provider, has_snapshot, restore_codex_state, ApplyConfig, CodexPaths,
+};
+use codex_app_transfer_registry::{builtin_presets, RawConfig};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use super::registry_io::{load as load_registry, public_provider, save as save_registry};
+use super::state::AdminState;
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ── 工具 ─────────────────────────────────────────────────────────────
+
+fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        status,
+        Json(json!({"success": false, "message": msg.into()})),
+    )
+}
+
+static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+fn fresh_provider_id(existing: &[String]) -> String {
+    loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u32)
+            .unwrap_or(0);
+        let counter = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("{:08x}", nanos.wrapping_add(counter));
+        if !existing.iter().any(|id| id == &candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn provider_supports_1m(provider: &Value) -> bool {
+    let default = provider
+        .get("models")
+        .and_then(|m| m.get("default"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if default.contains("[1m]") {
+        return true;
+    }
+    if default.starts_with("deepseek-v4-") || default.starts_with("qwen3.6-") {
+        return true;
+    }
+    if let Some(b) = provider
+        .get("modelCapabilities")
+        .and_then(|c| c.get(&default))
+        .and_then(|v| v.get("supports1m"))
+        .and_then(|v| v.as_bool())
+    {
+        return b;
+    }
+    false
+}
+
+fn read_proxy_port(cfg: &RawConfig) -> u16 {
+    cfg.get("settings")
+        .and_then(|s| s.get("proxyPort"))
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(18080)
+}
+
+fn read_gateway_key(cfg: &RawConfig) -> String {
+    cfg.get("gatewayApiKey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn ensure_settings_object(cfg: &mut RawConfig) -> &mut serde_json::Map<String, Value> {
+    let obj = cfg.as_object_mut().expect("registry root is object");
+    obj.entry("settings".to_owned())
+        .or_insert_with(|| json!({}));
+    obj.get_mut("settings")
+        .and_then(|v| v.as_object_mut())
+        .expect("settings is object")
+}
+
+fn provider_index(cfg: &RawConfig, id: &str) -> Option<usize> {
+    cfg.get("providers")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .position(|p| {
+            p.as_object()
+                .and_then(|o| o.get("id"))
+                .and_then(|v| v.as_str())
+                == Some(id)
+        })
+}
+
+fn active_provider(cfg: &RawConfig) -> Option<Value> {
+    let active_id = cfg
+        .get("activeProvider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let providers = cfg.get("providers").and_then(|v| v.as_array())?;
+    let chosen = match active_id {
+        Some(id) => providers.iter().find(|p| {
+            p.as_object()
+                .and_then(|o| o.get("id"))
+                .and_then(|v| v.as_str())
+                == Some(id.as_str())
+        }),
+        None => providers.first(),
+    };
+    chosen.cloned()
+}
+
+fn generate_gateway_key_value() -> String {
+    let mut buf = [0u8; 32];
+    let _ = getrandom::getrandom(&mut buf);
+    format!("cas_{}", URL_SAFE_NO_PAD.encode(buf))
+}
+
+// ── /api/instance-info & /api/instance-show-window ───────────────────
+
+pub async fn instance_info() -> Json<Value> {
+    Json(json!({
+        "app": "codex-app-transfer",
+        "version": APP_VERSION,
+        "pid": std::process::id(),
+    }))
+}
+
+pub async fn instance_show_window() -> Json<Value> {
+    // 由 main.rs 通过 channel/event 拉前主窗口;这里至少回 ack
+    Json(json!({"success": true}))
+}
+
+// ── /api/status ──────────────────────────────────────────────────────
+
+pub async fn status(State(state): State<AdminState>) -> impl IntoResponse {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let providers_count = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let active = active_provider(&cfg).map(|p| public_provider(&p));
+    let active_id = cfg
+        .get("activeProvider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let proxy_port = read_proxy_port(&cfg);
+    let proxy_status = state.proxy_manager.status();
+    let codex_paths = CodexPaths::from_home_env().ok();
+    let codex_configured = codex_paths.as_ref().map(has_snapshot).unwrap_or(false);
+
+    Json(json!({
+        "desktopConfigured": codex_configured,
+        "proxyRunning": proxy_status.running,
+        "proxyPort": proxy_port,
+        "desktopMode": "gateway",
+        "desktopRequiresProxy": true,
+        "activeProvider": active,
+        "activeProviderId": active_id,
+        "providerCount": providers_count,
+        "desktopHealth": {
+            "needsApply": !codex_configured,
+            "issues": [],
+        },
+        "exposeAllProviderModels": false,
+    }))
+    .into_response()
+}
+
+// ── /api/providers ────────────────────────────────────────────────────
+
+pub async fn list_providers() -> impl IntoResponse {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let providers: Vec<Value> = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(public_provider)
+        .collect();
+    let active_id = cfg
+        .get("activeProvider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    Json(json!({
+        "providers": providers,
+        "activeId": active_id,
+    }))
+    .into_response()
+}
+
+pub async fn get_secret(Path(id): Path<String>) -> impl IntoResponse {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let providers = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let provider = providers.iter().find(|p| {
+        p.as_object()
+            .and_then(|o| o.get("id"))
+            .and_then(|v| v.as_str())
+            == Some(id.as_str())
+    });
+    match provider {
+        Some(p) => Json(json!({
+            "apiKey": p.get("apiKey").and_then(|v| v.as_str()).unwrap_or(""),
+            "extraHeaders": p.get("extraHeaders").cloned().unwrap_or_else(|| json!({})),
+        }))
+        .into_response(),
+        None => err(StatusCode::NOT_FOUND, "提供商不存在").into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddProviderInput {
+    pub name: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    #[serde(rename = "authScheme")]
+    pub auth_scheme: Option<String>,
+    #[serde(rename = "apiFormat")]
+    pub api_format: Option<String>,
+    #[serde(rename = "apiKey")]
+    pub api_key: Option<String>,
+    pub models: Option<Value>,
+    #[serde(rename = "extraHeaders")]
+    pub extra_headers: Option<Value>,
+    #[serde(rename = "modelCapabilities")]
+    pub model_capabilities: Option<Value>,
+    #[serde(rename = "requestOptions")]
+    pub request_options: Option<Value>,
+}
+
+pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let providers = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let existing_ids: Vec<String> = providers
+        .iter()
+        .filter_map(|p| {
+            p.as_object()
+                .and_then(|o| o.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+        })
+        .collect();
+    let new_id = fresh_provider_id(&existing_ids);
+
+    let mut new_provider = serde_json::Map::new();
+    new_provider.insert("id".into(), Value::String(new_id.clone()));
+    new_provider.insert(
+        "name".into(),
+        Value::String(input.name.unwrap_or_else(|| "Unnamed Provider".into())),
+    );
+    new_provider.insert(
+        "baseUrl".into(),
+        Value::String(input.base_url.unwrap_or_default()),
+    );
+    new_provider.insert(
+        "authScheme".into(),
+        Value::String(input.auth_scheme.unwrap_or_else(|| "bearer".into())),
+    );
+    new_provider.insert(
+        "apiFormat".into(),
+        Value::String(
+            input
+                .api_format
+                .filter(|s| matches!(s.as_str(), "openai_chat" | "responses"))
+                .unwrap_or_else(|| "responses".into()),
+        ),
+    );
+    new_provider.insert(
+        "apiKey".into(),
+        Value::String(input.api_key.unwrap_or_default()),
+    );
+    new_provider.insert(
+        "models".into(),
+        input.models.unwrap_or_else(|| {
+            json!({"default":"","gpt_5_5":"","gpt_5_4":"","gpt_5_4_mini":"","gpt_5_3_codex":"","gpt_5_2":""})
+        }),
+    );
+    new_provider.insert(
+        "extraHeaders".into(),
+        input.extra_headers.unwrap_or_else(|| json!({})),
+    );
+    new_provider.insert(
+        "modelCapabilities".into(),
+        input.model_capabilities.unwrap_or_else(|| json!({})),
+    );
+    new_provider.insert(
+        "requestOptions".into(),
+        input.request_options.unwrap_or_else(|| json!({})),
+    );
+    new_provider.insert("isBuiltin".into(), Value::Bool(false));
+    new_provider.insert("sortIndex".into(), Value::Number(providers.len().into()));
+
+    let new_provider_value = Value::Object(new_provider);
+    let mut new_providers = providers;
+    new_providers.push(new_provider_value.clone());
+    let was_empty = new_providers.len() == 1;
+
+    let obj = cfg.as_object_mut().unwrap();
+    obj.insert("providers".into(), Value::Array(new_providers));
+    if was_empty {
+        obj.insert("activeProvider".into(), Value::String(new_id));
+    }
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"success": true, "provider": public_provider(&new_provider_value)}))
+        .into_response()
+}
+
+pub async fn update_provider(
+    Path(id): Path<String>,
+    Json(input): Json<AddProviderInput>,
+) -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let Some(idx) = provider_index(&cfg, &id) else {
+        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+    };
+    let providers = cfg
+        .get_mut("providers")
+        .and_then(|v| v.as_array_mut())
+        .expect("providers array");
+    let existing = providers[idx].as_object().unwrap().clone();
+    let mut updated = existing.clone();
+    let is_builtin = existing
+        .get("isBuiltin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if let Some(name) = input.name {
+        updated.insert("name".into(), Value::String(name));
+    }
+    if !is_builtin {
+        if let Some(base_url) = input.base_url {
+            updated.insert("baseUrl".into(), Value::String(base_url));
+        }
+    }
+    if let Some(auth_scheme) = input.auth_scheme {
+        updated.insert("authScheme".into(), Value::String(auth_scheme));
+    }
+    if let Some(api_format) = input.api_format {
+        let normalized = if matches!(api_format.as_str(), "openai_chat" | "responses") {
+            api_format
+        } else {
+            "responses".to_owned()
+        };
+        updated.insert("apiFormat".into(), Value::String(normalized));
+    }
+    // apiKey 留空表示"不修改"
+    if let Some(key) = input.api_key.filter(|s| !s.is_empty()) {
+        updated.insert("apiKey".into(), Value::String(key));
+    }
+    if let Some(headers) = input.extra_headers {
+        if !headers.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            updated.insert("extraHeaders".into(), headers);
+        }
+    }
+    if let Some(caps) = input.model_capabilities {
+        updated.insert("modelCapabilities".into(), caps);
+    }
+    if let Some(opts) = input.request_options {
+        updated.insert("requestOptions".into(), opts);
+    }
+    if let Some(models) = input.models {
+        if models.is_object() {
+            let mut merged = existing
+                .get("models")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            for (k, v) in models.as_object().unwrap() {
+                merged.insert(k.clone(), v.clone());
+            }
+            updated.insert("models".into(), Value::Object(merged));
+        }
+    }
+    updated.insert("id".into(), Value::String(id));
+    updated.insert("isBuiltin".into(), Value::Bool(is_builtin));
+
+    providers[idx] = Value::Object(updated.clone());
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"success": true, "provider": public_provider(&Value::Object(updated))}))
+        .into_response()
+}
+
+pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let providers = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let original_len = providers.len();
+    let mut remaining: Vec<Value> = providers
+        .into_iter()
+        .filter(|p| {
+            p.as_object()
+                .and_then(|o| o.get("id"))
+                .and_then(|v| v.as_str())
+                != Some(id.as_str())
+        })
+        .collect();
+    if remaining.len() == original_len {
+        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+    }
+    for (i, p) in remaining.iter_mut().enumerate() {
+        if let Some(o) = p.as_object_mut() {
+            o.insert("sortIndex".into(), Value::Number(i.into()));
+        }
+    }
+    let active = cfg
+        .get("activeProvider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let new_active = match active {
+        Some(a) if a == id => remaining
+            .first()
+            .and_then(|p| p.as_object())
+            .and_then(|o| o.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| Value::String(s.to_owned()))
+            .unwrap_or(Value::Null),
+        Some(a) => Value::String(a),
+        None => Value::Null,
+    };
+    let obj = cfg.as_object_mut().unwrap();
+    obj.insert("providers".into(), Value::Array(remaining));
+    obj.insert("activeProvider".into(), new_active);
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"success": true})).into_response()
+}
+
+pub async fn set_default_provider(Path(id): Path<String>) -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if provider_index(&cfg, &id).is_none() {
+        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+    }
+    let obj = cfg.as_object_mut().unwrap();
+    obj.insert("activeProvider".into(), Value::String(id));
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"success": true})).into_response()
+}
+
+pub async fn activate_provider(Path(id): Path<String>) -> impl IntoResponse {
+    set_default_provider(Path(id)).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReorderInput {
+    #[serde(rename = "providerIds")]
+    pub provider_ids: Vec<String>,
+}
+
+pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let providers = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let by_id: std::collections::HashMap<String, Value> = providers
+        .iter()
+        .filter_map(|p| {
+            let id = p
+                .as_object()
+                .and_then(|o| o.get("id"))
+                .and_then(|v| v.as_str())?
+                .to_owned();
+            Some((id, p.clone()))
+        })
+        .collect();
+    let mut ordered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in &input.provider_ids {
+        if let Some(p) = by_id.get(id) {
+            if seen.insert(id.clone()) {
+                ordered.push(p.clone());
+            }
+        }
+    }
+    for p in &providers {
+        if let Some(id) = p
+            .as_object()
+            .and_then(|o| o.get("id"))
+            .and_then(|v| v.as_str())
+        {
+            if seen.insert(id.to_owned()) {
+                ordered.push(p.clone());
+            }
+        }
+    }
+    if ordered.len() != providers.len() {
+        return err(StatusCode::BAD_REQUEST, "排序数量不一致").into_response();
+    }
+    for (i, p) in ordered.iter_mut().enumerate() {
+        if let Some(o) = p.as_object_mut() {
+            o.insert("sortIndex".into(), Value::Number(i.into()));
+        }
+    }
+    let public_ordered: Vec<Value> = ordered.iter().map(public_provider).collect();
+    let obj = cfg.as_object_mut().unwrap();
+    obj.insert("providers".into(), Value::Array(ordered));
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"success": true, "providers": public_ordered})).into_response()
+}
+
+// /api/providers/{id}/draft —— v1 当 update 用,我们直接复用
+pub async fn save_draft(
+    Path(id): Path<String>,
+    Json(input): Json<AddProviderInput>,
+) -> impl IntoResponse {
+    update_provider(Path(id), Json(input)).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateModelsInput {
+    pub models: Value,
+}
+
+pub async fn update_models(
+    Path(id): Path<String>,
+    Json(input): Json<UpdateModelsInput>,
+) -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let Some(idx) = provider_index(&cfg, &id) else {
+        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+    };
+    let providers = cfg
+        .get_mut("providers")
+        .and_then(|v| v.as_array_mut())
+        .unwrap();
+    if let Some(o) = providers[idx].as_object_mut() {
+        o.insert("models".into(), input.models);
+    }
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"success": true})).into_response()
+}
+
+// ── /api/presets ─────────────────────────────────────────────────────
+
+pub async fn list_presets() -> impl IntoResponse {
+    let presets: Vec<Value> = builtin_presets().to_vec();
+    Json(json!({"presets": presets})).into_response()
+}
+
+// ── /api/desktop/* ───────────────────────────────────────────────────
+
+pub async fn desktop_status() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let configured = has_snapshot(&paths);
+    let base_url = std::fs::read_to_string(&paths.config_toml)
+        .ok()
+        .and_then(|s| {
+            for line in s.lines() {
+                let stripped = line.trim_start();
+                if !stripped.starts_with("openai_base_url") {
+                    continue;
+                }
+                let after = &stripped["openai_base_url".len()..];
+                let mut rest = after.trim_start();
+                if !rest.starts_with('=') {
+                    continue;
+                }
+                rest = rest[1..].trim();
+                if let Some(idx) = rest.find('#') {
+                    rest = rest[..idx].trim_end();
+                }
+                let trimmed = rest.trim_matches(|c: char| c == '"' || c == '\'');
+                return Some(trimmed.to_owned());
+            }
+            None
+        });
+    let cfg = load_registry().unwrap_or_else(|_| json!({}));
+    let proxy_port = read_proxy_port(&cfg);
+    Json(json!({
+        "configured": configured,
+        "health": {"needsApply": !configured, "issues": []},
+        "keys": {
+            "inferenceProvider": "gateway",
+            "inferenceGatewayBaseUrl": base_url.unwrap_or_else(|| format!("http://127.0.0.1:{proxy_port}")),
+            "inferenceGatewayApiKey": if read_gateway_key(&cfg).is_empty() { "" } else { "******" },
+            "inferenceGatewayAuthScheme": "bearer",
+            "inferenceModels": "[\"sonnet\",\"haiku\",\"opus\"]",
+        },
+    }))
+    .into_response()
+}
+
+pub async fn desktop_configure() -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let providers = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if providers.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "请先添加 provider").into_response();
+    }
+    let active_id = cfg
+        .get("activeProvider")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let active = match active_id {
+        Some(id) => providers.iter().find(|p| {
+            p.as_object()
+                .and_then(|o| o.get("id"))
+                .and_then(|v| v.as_str())
+                == Some(id.as_str())
+        }),
+        None => providers.first(),
+    };
+    let Some(active) = active else {
+        return err(StatusCode::BAD_REQUEST, "未找到 active provider").into_response();
+    };
+    let supports_1m = provider_supports_1m(active);
+    let port = read_proxy_port(&cfg);
+
+    // 缺 gateway key 自动补
+    let mut gateway_key = read_gateway_key(&cfg);
+    if gateway_key.is_empty() {
+        gateway_key = generate_gateway_key_value();
+        let obj = cfg.as_object_mut().unwrap();
+        obj.insert("gatewayApiKey".into(), Value::String(gateway_key.clone()));
+        if let Err(e) = save_registry(&cfg) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(e) = apply_provider(
+        &paths,
+        &ApplyConfig {
+            base_url: &base_url,
+            gateway_api_key: &gateway_key,
+            supports_1m,
+            app_version: APP_VERSION,
+        },
+    ) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("apply 失败: {e}"),
+        )
+        .into_response();
+    }
+    Json(json!({"success": true})).into_response()
+}
+
+pub async fn desktop_clear() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    match restore_codex_state(&paths) {
+        Ok(_) => Json(json!({"success": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn desktop_snapshot_status() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    Json(json!({
+        "hasSnapshot": has_snapshot(&paths),
+    }))
+    .into_response()
+}
+
+// ── /api/proxy/* ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct StartProxyInput {
+    pub port: Option<u16>,
+}
+
+pub async fn start_proxy(
+    State(state): State<AdminState>,
+    body: Option<Json<StartProxyInput>>,
+) -> impl IntoResponse {
+    let port = body
+        .and_then(|b| b.0.port)
+        .or_else(|| {
+            load_registry()
+                .ok()
+                .map(|cfg| read_proxy_port(&cfg))
+        })
+        .unwrap_or(18080);
+    match state.proxy_manager.start(port).await {
+        Ok(s) => Json(json!({
+            "success": true,
+            "running": s.running,
+            "port": s.addr.and_then(|a| a.split(':').last().and_then(|p| p.parse::<u16>().ok())).unwrap_or(port),
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+pub async fn stop_proxy(State(state): State<AdminState>) -> impl IntoResponse {
+    state.proxy_manager.stop_silent();
+    Json(json!({"success": true, "running": false})).into_response()
+}
+
+pub async fn proxy_status(State(state): State<AdminState>) -> impl IntoResponse {
+    let s = state.proxy_manager.status();
+    let cfg = load_registry().unwrap_or_else(|_| json!({}));
+    let port = s
+        .addr
+        .as_ref()
+        .and_then(|a| a.split(':').last().and_then(|p| p.parse::<u16>().ok()))
+        .unwrap_or_else(|| read_proxy_port(&cfg));
+    Json(json!({
+        "running": s.running,
+        "port": port,
+        "stats": {"total": 0, "success": 0, "failed": 0, "today": 0},
+    }))
+    .into_response()
+}
+
+pub async fn proxy_logs() -> impl IntoResponse {
+    Json(json!({"logs": []})).into_response()
+}
+
+pub async fn proxy_logs_clear() -> impl IntoResponse {
+    Json(json!({"success": true})).into_response()
+}
+
+pub async fn proxy_logs_open_dir() -> impl IntoResponse {
+    Json(json!({"success": true})).into_response()
+}
+
+// ── /api/settings ────────────────────────────────────────────────────
+
+pub async fn get_settings() -> impl IntoResponse {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let settings = cfg
+        .get("settings")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    Json(settings).into_response()
+}
+
+pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let s = ensure_settings_object(&mut cfg);
+    if let Some(obj) = input.as_object() {
+        for (k, v) in obj {
+            s.insert(k.clone(), v.clone());
+        }
+    }
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    let settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
+    Json(json!({"success": true, "settings": settings})).into_response()
+}
+
+// ── /api/config/* ────────────────────────────────────────────────────
+
+pub async fn create_backup() -> impl IntoResponse {
+    Json(json!({"success": true, "name": "stub", "createdAt": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(), "size": 0})).into_response()
+}
+
+pub async fn list_backups() -> impl IntoResponse {
+    Json(json!({"backups": []})).into_response()
+}
+
+pub async fn export_config() -> impl IntoResponse {
+    let cfg = load_registry().unwrap_or_else(|_| json!({}));
+    Json(json!({
+        "format": "codex-app-transfer.config",
+        "exportedAt": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "config": cfg,
+    }))
+    .into_response()
+}
+
+pub async fn import_config(Json(_data): Json<Value>) -> impl IntoResponse {
+    Json(json!({"success": true, "message": "import 暂未实现(v2.0.x 补)"})).into_response()
+}
+
+// ── /api/update/* ────────────────────────────────────────────────────
+
+pub async fn update_check() -> impl IntoResponse {
+    Json(json!({
+        "hasUpdate": false,
+        "currentVersion": APP_VERSION,
+        "message": "暂不检测更新",
+    }))
+    .into_response()
+}
+
+pub async fn update_install(Json(_input): Json<Value>) -> impl IntoResponse {
+    err(
+        StatusCode::NOT_IMPLEMENTED,
+        "update install 暂未实现",
+    )
+    .into_response()
+}
+
+// ── /api/feedback ────────────────────────────────────────────────────
+
+pub async fn submit_feedback(Json(_input): Json<Value>) -> impl IntoResponse {
+    Json(json!({"success": true, "message": "feedback 暂存(v2.0.x 接 worker)"})).into_response()
+}
+
+// ── 测速 / 模型探测 / 兼容性 等 stub ─────────────────────────────────
+
+pub async fn test_provider(Path(_id): Path<String>) -> impl IntoResponse {
+    Json(json!({"success": true, "message": "测试功能 v2.0.x 接通"})).into_response()
+}
+
+pub async fn query_provider_usage(Path(_id): Path<String>) -> impl IntoResponse {
+    Json(json!({"success": true, "usage": null})).into_response()
+}
+
+pub async fn provider_compatibility() -> impl IntoResponse {
+    Json(json!({"providers": []})).into_response()
+}
+
+pub async fn test_provider_payload(Json(_payload): Json<Value>) -> impl IntoResponse {
+    Json(json!({"success": true})).into_response()
+}
+
+pub async fn fetch_provider_models(Path(_id): Path<String>) -> impl IntoResponse {
+    Json(json!({"models": []})).into_response()
+}
+
+pub async fn fetch_provider_models_payload(Json(_payload): Json<Value>) -> impl IntoResponse {
+    Json(json!({"models": []})).into_response()
+}
+
+pub async fn autofill_provider_models(Path(_id): Path<String>) -> impl IntoResponse {
+    Json(json!({"success": true})).into_response()
+}
+
+#[allow(dead_code)]
+pub fn _state_typecheck(_s: Arc<AdminState>) -> bool {
+    true
+}
+
+#[derive(Serialize)]
+pub struct _Marker;

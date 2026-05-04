@@ -1,0 +1,48 @@
+[package]
+name = "codex-app-transfer"
+version = "2.0.0-stage0"
+description = "Codex App Transfer - Tauri 2 shell (stage 0 scaffold)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# 二进制入口
+[[bin]]
+name = "codex-app-transfer"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+codex-app-transfer-registry = { path = "../crates/registry" }
+codex-app-transfer-codex-integration = { path = "../crates/codex_integration" }
+codex-app-transfer-proxy = { path = "../crates/proxy" }
+tokio = { version = "1", features = ["sync", "net", "rt-multi-thread"] }
+axum = { version = "0.8", features = ["http1", "tokio", "macros"] }
+base64 = "0.22"
+getrandom = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = "0.2"
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplication"] }
+tower = "0.5"
+tower-service = "0.3"
+http = "1"
+bytes = "1"
+include_dir = "0.7"
+mime_guess = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[features]
+# 默认空,自定义 protocol 在打包时启用
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

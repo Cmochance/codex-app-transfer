@@ -1,0 +1,25 @@
+[package]
+name = "codex-app-transfer-adapters"
+version = "0.1.0"
+description = "Provider 协议适配器(Stage 3 起)。把入站 OpenAI Chat / Responses API 与上游 provider 协议互转。"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+codex-app-transfer-registry = { path = "../registry" }
+axum = { version = "0.8", default-features = false, features = ["http1"] }
+bytes = "1"
+futures-core = "0.3"
+futures-util = "0.3"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+indexmap = "2"
