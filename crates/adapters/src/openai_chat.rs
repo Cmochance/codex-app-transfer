@@ -42,6 +42,7 @@ impl Adapter for OpenAiChatAdapter {
         Ok(RequestPlan {
             upstream_path: normalize_v1_prefix(client_path),
             body,
+            response_session: None,
         })
     }
 }

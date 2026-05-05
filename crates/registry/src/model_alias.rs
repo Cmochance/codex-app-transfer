@@ -51,10 +51,50 @@ pub const DEFAULT_MODEL_KEY: &str = "default";
 const INTERNAL_ONE_M_SUFFIX: &str = "[1m]";
 
 pub fn openai_model_slot(openai_id: &str) -> Option<&'static str> {
+    let requested = openai_id.trim().to_ascii_lowercase();
+    if requested.is_empty() {
+        return None;
+    }
     MODEL_SLOTS
         .iter()
-        .find(|slot| slot.openai_id == Some(openai_id))
+        .find(|slot| slot.openai_id == Some(requested.as_str()))
         .map(|slot| slot.key)
+}
+
+pub fn provider_slug(provider: &crate::Provider) -> String {
+    let source = if !provider.id.is_empty() {
+        provider.id.as_str()
+    } else if !provider.name.is_empty() {
+        provider.name.as_str()
+    } else {
+        "provider"
+    };
+    slugify_provider_source(source)
+}
+
+fn slugify_provider_source(source: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_replacement = false;
+    for ch in source.to_lowercase().chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' {
+            slug.push(ch);
+            last_was_replacement = false;
+        } else if !last_was_replacement {
+            slug.push('-');
+            last_was_replacement = true;
+        }
+    }
+
+    let trimmed = slug
+        .trim_matches(|ch| ch == '-' || ch == '_')
+        .chars()
+        .take(56)
+        .collect::<String>();
+    if trimmed.is_empty() {
+        "provider".to_owned()
+    } else {
+        trimmed
+    }
 }
 
 pub fn has_internal_one_m_suffix(model: &str) -> bool {
@@ -154,7 +194,35 @@ mod tests {
     fn openai_model_slot_maps_current_codex_slugs() {
         assert_eq!(openai_model_slot("gpt-5.5"), Some("gpt_5_5"));
         assert_eq!(openai_model_slot("gpt-5.4-mini"), Some("gpt_5_4_mini"));
+        assert_eq!(openai_model_slot(" GPT-5.5 "), Some("gpt_5_5"));
         assert_eq!(openai_model_slot("unknown"), None);
+    }
+
+    #[test]
+    fn provider_slug_matches_legacy_python_rules() {
+        let mut provider = crate::Provider {
+            id: "OpenAI.Custom_1".into(),
+            name: "Ignored Name".into(),
+            base_url: String::new(),
+            auth_scheme: String::new(),
+            api_format: String::new(),
+            api_key: String::new(),
+            models: IndexMap::new(),
+            extra_headers: IndexMap::new(),
+            model_capabilities: IndexMap::new(),
+            request_options: IndexMap::new(),
+            is_builtin: false,
+            sort_index: 0,
+            extra: IndexMap::new(),
+        };
+        assert_eq!(provider_slug(&provider), "openai-custom_1");
+
+        provider.id.clear();
+        provider.name = "七牛 / Qiniu++".into();
+        assert_eq!(provider_slug(&provider), "qiniu");
+
+        provider.name = "___".into();
+        assert_eq!(provider_slug(&provider), "provider");
     }
 
     #[test]

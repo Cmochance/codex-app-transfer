@@ -6,6 +6,7 @@ use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
 use futures_core::Stream;
 use http::{HeaderMap, StatusCode};
+use serde_json::Value;
 use thiserror::Error;
 
 /// Adapter 内部 / 上下游间使用的字节流.
@@ -29,6 +30,16 @@ pub struct RequestPlan {
     pub upstream_path: String,
     /// 改写后的请求体。openai_chat 路径下与入参等同。
     pub body: Bytes,
+    /// Responses adapter uses this to save the Chat messages that produced the
+    /// outbound response, so future `previous_response_id` requests can restore
+    /// history.
+    pub response_session: Option<ResponseSessionPlan>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseSessionPlan {
+    pub response_id: String,
+    pub messages: Vec<Value>,
 }
 
 /// adapter 处理完上游响应后,交给 proxy 的"回灌计划".
@@ -65,6 +76,7 @@ pub trait Adapter: Send + Sync {
         upstream_headers: HeaderMap,
         upstream_stream: ByteStream,
         _provider: &Provider,
+        _request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
         Ok(ResponsePlan {
             status: upstream_status,

@@ -184,7 +184,7 @@ pub async fn forward_handler(
     let mut up = state
         .http
         .request(parts.method.clone(), &upstream_url)
-        .body(plan.body);
+        .body(plan.body.clone());
     for (name, value) in parts.headers.iter() {
         if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
             continue;
@@ -210,6 +210,7 @@ pub async fn forward_handler(
         upstream_headers,
         upstream_stream,
         &resolved.provider,
+        &plan,
     )?;
     let success = response_plan.status.is_success();
     telemetry.stats.record(success);
