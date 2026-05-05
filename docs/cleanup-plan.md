@@ -167,19 +167,18 @@ jobs:
         with: { files: 'release/*', tag_name: 'v${{ env.VERSION }}' }
 ```
 
-`rename-bundles.sh` 单独在 `.github/workflows/scripts/` 下,做 Tauri 默认名 → 项目老名的 mv,`release_assets.py` 的 `dist/{,mac,linux-folder,linux-onefile}` 输入约定继续生效。
+> **实施修正**:Phase 2 落地时 `tauri.conf.json` 加了 `bundle.fileName: "codex-app-transfer"`,Tauri 默认产物名变成 `codex-app-transfer_<V>_<arch>.<ext>`(无空格),rename 逻辑直接写在 `release.yml` build step 的 ~30 行 bash case,不再需要单独的 `rename-bundles.sh`。
 
 #### 2.3 文件级 diff 清单
 
 **新增**:
-- `.github/workflows/release.yml`
-- `.github/workflows/scripts/rename-bundles.sh`
-- `src-tauri/tauri.conf.json` 加 `bundle.macOS.{entitlements, signingIdentity, providerShortName}`、`bundle.linux.deb.depends`、`bundle.windows.{wix, nsis, signCommand}` 等子段
+- `.github/workflows/release.yml`(三平台 matrix build + release-bundle 收口)
+- `src-tauri/tauri.conf.json` 加 `bundle.fileName`、`bundle.macOS.entitlements`、`bundle.linux.deb.depends`、`bundle.windows.{wix, nsis}` 子段
 
 **修改**:
-- `Makefile`:删除 `mac-release` `linux-release` `win-release` `release` `release-bundle` `linux-image` `win-image`;只留 `mac-app`(本地自测)+ `clean` + `help`
+- `Makefile`:删除 `mac-release` `linux-release` `win-release` `release` `release-bundle` `linux-image` `win-image`、变量 `PYTHON` `VERSION` `WIN_IMAGE_TAG` `LINUX_IMAGE_TAG` `REPO_FLAG`;只留 `mac-app`(本地自测)+ `clean` + `help`
 - `docs/build.md`:大幅重写。主线变 GitHub Actions / `gh workflow run release.yml`,本地路径只剩 `make mac-app`
-- `scripts/release_assets.py`:微调 `collect_mac/linux/windows` 输入路径(从 `dist/{mac,linux-{folder,onefile}}` → release-bundle job 的 download-artifact 落地路径)
+- `scripts/release_assets.py`:**整体重写适配 Tauri 输出形态** — 删除假设 PyInstaller 输出的 `collect_windows/mac/linux`(`dist/{mac,linux-folder,linux-onefile}` 路径),换成统一的 `collect_from_incoming(dist-incoming/, ...)`;`PLATFORM_PATTERNS` 改:macOS `.pkg` 退役、Linux `.tar.gz`/无后缀退役改 `.deb`/`.AppImage`、Windows `Portable.zip`/`-x64.exe` 退役改 `-Setup.exe`/`.msi`;新增 `--incoming-dir` CLI 参数
 
 **删除**:
 - `macos/build-macos.sh`、`build-macos.spec`、`make-dmg.sh`、`make-pkg.sh`、`prepare-icon.py`、`pkg-scripts/`、`README.md`(本目录的)
@@ -202,18 +201,21 @@ jobs:
 
 #### 2.5 产物命名映射
 
-Tauri bundler 默认名 → 项目老名(`rename-bundles.sh` 做 mv,V 来自 `Cargo.toml`):
+`tauri.conf.json` 设 `bundle.fileName: "codex-app-transfer"` 后,Tauri 默认产物名变成 `codex-app-transfer_<V>_<arch>.<ext>` (无空格)。`release.yml` 的 rename step 直接 cp 成项目老命名:
 
-| Tauri 默认 | → 项目老名 |
+| Tauri (fileName=codex-app-transfer) | → 项目老名(staging/) |
 |---|---|
-| `target/<T>/release/bundle/macos/Codex App Transfer.app` | `dist/mac/Codex App Transfer.app`(供 release_assets 用) |
-| `target/<T>/release/bundle/dmg/Codex App Transfer_<V>_aarch64.dmg` | `dist/mac/Codex-App-Transfer-v<V>-macOS-arm64.dmg` |
-| `target/<T>/release/bundle/deb/codex-app-transfer_<V>_amd64.deb` | `dist/linux-folder/codex-app-transfer.deb`(release_assets 不直接发,workflow 单独 upload) |
-| `target/<T>/release/bundle/appimage/codex-app-transfer_<V>_amd64.AppImage` | `dist/linux-onefile/Codex-App-Transfer`(chmod +x) |
-| `target/<T>/release/bundle/nsis/Codex App Transfer_<V>_x64-setup.exe` | `Codex-App-Transfer-Setup-<V>.exe` |
-| `target/<T>/release/bundle/msi/Codex App Transfer_<V>_x64_en-US.msi` | (新增格式,直接 upload 不进 release_assets) |
+| `target/<T>/release/bundle/dmg/codex-app-transfer_<V>_aarch64.dmg` | `Codex-App-Transfer-v<V>-macOS-arm64.dmg` |
+| `target/<T>/release/bundle/deb/codex-app-transfer_<V>_amd64.deb` | `Codex-App-Transfer-v<V>-Linux-x86_64.deb` |
+| `target/<T>/release/bundle/appimage/codex-app-transfer_<V>_amd64.AppImage` | `Codex-App-Transfer-v<V>-Linux-x86_64.AppImage` |
+| `target/<T>/release/bundle/nsis/codex-app-transfer_<V>_x64-setup.exe` | `Codex-App-Transfer-v<V>-Windows-x64-Setup.exe` |
+| `target/<T>/release/bundle/msi/codex-app-transfer_<V>_x64_en-US.msi` | `Codex-App-Transfer-v<V>-Windows-x64.msi` |
 
-注:Windows Portable.zip 退役(Tauri 不直出 zip 风格),用户走 NSIS / MSI 安装。
+**调整说明**:
+- `.pkg` 退役 (Tauri 2 macOS bundler 不直出);macOS 只发 `.dmg`
+- Linux 不再用 `.tar.gz` (PyInstaller folder build 时代的形态);改 `.deb`+`.AppImage`
+- Windows `Portable.zip` 退役 (Tauri 不直出);改 `-Setup.exe`(NSIS)+ `.msi`(WiX)
+- `release_assets.py` 的 `PLATFORM_PATTERNS` 同步更新
 
 #### 2.6 验收
 
@@ -281,3 +283,4 @@ Tauri bundler 默认名 → 项目老名(`rename-bundles.sh` 做 mv,V 来自 `Ca
 | 2026-05-05 | Phase 1 → Phase 3 范围微调 | CI 中"Python 重生 registry fixture → diff" 步骤直接删除(原属 Phase 3 范围)。原因:Phase 1 删了 backend/ 后 `gen_registry_fixtures.py` 失去数据源,该 CI 步骤会一直红;`python_compat.rs` 仍读 commit 的 fixture 做 round-trip,反向校验(Rust → diff)留给 Phase 3 xtask 重建 | 最小化 CI 红区,保住回归门禁;真正的 xtask 替身仍按 Phase 3 计划做 |
 | 2026-05-05 | Phase 1 后期 CI 修(3 个补 commit) | (1) `aebf8cd` 补 `Cargo.lock` 与 `src-tauri` dep 删除的同步(16bb9fb 漏);(2) `c53de00` `apt-get install` 加 `timeout-minutes:8` + 3 次 retry + `--no-install-recommends`,抗 archive.ubuntu.com 偶发抖动(上一次 run 卡 17 分钟);(3) `e4d3382` 修 `crates/registry/src/raw_io.rs::tests::tempdir()` 并发 race(共享 `cas-registry-test-{pid}` 目录,加 `AtomicU64` counter 保唯一) | 都是 Phase 1 范围内的 CI 修,记录在案以便 Phase 2 不重蹈覆辙 |
 | 2026-05-05 | Phase 2 详细方案落地 | 把 §3 Phase 2 概念性段落扩充为 §2.1-2.8 子章节(决策矩阵 / release.yml 蓝图 / 文件 diff 清单 / 签名密钥迁移 / 产物命名映射 / 验收 / 回滚 / 不做项) | 概念描述不足以直接动手,细化后让 reviewer 在动代码之前先评设计 |
+| 2026-05-05 | Phase 2 §2.3/§2.5 修正 | 实施时 `tauri.conf.json` 加 `bundle.fileName: "codex-app-transfer"` 让 Tauri 产物名摆脱空格,rename 逻辑直接写在 `release.yml` 的 ~30 行 bash case,**不再需要单独的 `rename-bundles.sh`**;`release_assets.py` 不是"微调路径"而是**整体重写**:删 `collect_windows/mac/linux`(假设 PyInstaller 输出),换 `collect_from_incoming(dist-incoming/)`,`PLATFORM_PATTERNS` 同步换为 `.dmg`/`.deb`/`.AppImage`/`-Setup.exe`/`.msi` | 调研 Tauri 2 实际产物形态后发现原设计估计过粗,落地修正 |

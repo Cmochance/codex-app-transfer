@@ -1,193 +1,201 @@
 # Building Codex App Transfer
 
-This project ships installers for macOS arm64, Linux x86_64, and Windows x64.
-The build pipeline runs entirely on a developer's macOS machine — macOS uses
-the host's PyInstaller, Linux and Windows run inside Docker containers that
-mount the project as a workspace.
+Phase 2 起 release pipeline 全部走 GitHub Actions
+(`.github/workflows/release.yml`)。本地仓库**不再**需要 Docker / Wine /
+PyInstaller / Python venv 来出三平台 release;本地 Makefile 只保留:
 
-## Prerequisites
+- `make mac-app` — 出未签 `.app` 自测
+- `make clean` — 清理 `build/` `dist/` `release/` `.release-signing/` `.tmp/`
 
-- macOS host (Apple Silicon or Intel; only arm64 macOS PKG/DMG is produced —
-  Intel mac builds would need an x86_64 macOS to run on)
-- Python 3.11–3.14 with project deps installed; the repo's `.venv` is
-  authoritative — see "venv setup" below
-- For Linux + Windows targets: Docker Desktop or [OrbStack](https://orbstack.dev/)
-  (Apple Silicon: OrbStack is lighter and faster than Docker Desktop)
-- ~5 GB free disk for the two builder images plus build artifacts
+唯一版本源:`src-tauri/Cargo.toml` 的 `[package].version`(`tauri.conf.json`
+也带一份,**保持两处一致**;后续 Phase 4 会做单向同步)。
 
-## venv setup (one-time)
+## 三平台 release 触发
+
+### 推荐:tag 触发
 
 ```bash
-uv venv .venv                                  # or: python3 -m venv .venv
-.venv/bin/python -m ensurepip --upgrade        # uv venvs ship without pip
-uv pip install --python .venv/bin/python -r requirements.txt cryptography
+# 在本地 main 上
+git tag v2.0.1
+git push --tags
 ```
 
-`cryptography` is needed by `scripts/release_assets.py` to sign artifacts.
-It's intentionally not in `requirements.txt` (excluded from the bundled app).
+这会触发 `release.yml`,三平台同时 build → rename → upload artifact →
+收口 job 跑 `release_assets.py` 出 sha256/.sig/`latest.json` → 创建一个
+**draft** GitHub release(用户手动 ready/publish)。
 
-## One-shot release
+### 备用:手动触发
 
 ```bash
-make release VERSION=1.0.0
+gh workflow run release.yml -f version=2.0.1
+# 或 workflow_dispatch 也接受 RC 版本
+gh workflow run release.yml -f version=2.0.1-rc1
 ```
 
-Runs `mac-release` → `linux-release` → `win-release` → final `release-bundle`
-that regenerates `latest.json` from whatever is in `release/`.
+`workflow_dispatch` 不要求先打 tag,适合 release rehearsal。
 
-Optional environment variables:
+### 监控
 
-| Variable | Effect |
+```bash
+gh run watch
+gh run list --workflow=release.yml --limit 3
+```
+
+## 一次性 secret 配置
+
+仓库 Settings → Secrets and variables → Actions → New repository secret:
+
+### 必须
+
+| Secret 名 | 内容 |
 |---|---|
-| `CCDS_REPO=owner/repo` | Embed `https://github.com/owner/repo/...` URLs in `latest.json` |
-| `MACOS_CODESIGN_IDENTITY="Developer ID Application: ..."` | Apple Developer ID sign macOS bundle |
-| `CCDS_SKIP_INSTALLER=1` | Skip NSIS in Windows build (faster iteration) |
-| `WIN_IMAGE_TAG`, `LINUX_IMAGE_TAG` | Override Docker image tags |
+| `RELEASE_PRIVATE_KEY_PEM` | RSA-3072 PKCS#8 PEM 全文(`.release-signing/release-private-key.pem` 的内容) |
 
-## Per-platform details
+`RELEASE_PRIVATE_KEY_PEM` 缺失会让 release-bundle job fail-fast。如果是
+首次 release,在本地跑一次 `python scripts/release_assets.py --version
+0.0.0-init --include macos`(失败没关系)就会自动生成 keypair 到
+`.release-signing/`,把 `release-private-key.pem` 全文复制进 secret 即可。
+**`.release-signing/` 已 .gitignored,公钥(`release-public-key.pem`)用户
+分发后让最终用户验签**。
 
-### macOS
+### 可选
 
-```bash
-make mac-release VERSION=1.0.0
-```
+| Secret 名 | 用途 | 缺失时 |
+|---|---|---|
+| `APPLE_CERTIFICATE` | Apple Developer ID `.p12`(base64) | macOS .dmg 退化为 ad-hoc 签名(用户首次启动需右键打开) |
+| `APPLE_CERTIFICATE_PASSWORD` | 上面 .p12 的密码 | 同上 |
+| `APPLE_SIGNING_IDENTITY` | 形如 `Developer ID Application: Foo (TEAMID)` | 同上 |
+| `APPLE_API_KEY_BASE64` | App Store Connect API .p8(base64) | 跳过公证,Gatekeeper 第一次启动会再 quarantine |
+| `APPLE_API_KEY` | 上面 key 的 ID | 同上 |
+| `APPLE_API_ISSUER` | App Store Connect Issuer ID | 同上 |
 
-Calls `macos/build-macos.sh` (PyInstaller + `productbuild` + `hdiutil`),
-then `release_assets.py --include macos`. Outputs:
+> **Windows 签名**:Phase 2 暂不接入。后续如有 EV / OV 证书,在
+> `tauri.conf.json` 的 `bundle.windows.signCommand` 注入 signtool /
+> Azure Trusted Signing 命令即可。
 
-- `dist/mac/Codex App Transfer.app`
-- `release/Codex-App-Transfer-v1.0.0-macOS-arm64.pkg`
-- `release/Codex-App-Transfer-v1.0.0-macOS-arm64.dmg`
-
-Without `MACOS_CODESIGN_IDENTITY`, the app is ad-hoc signed only; first
-launch requires right-click → Open to bypass Gatekeeper.
-
-### Linux x86_64
-
-```bash
-make linux-release VERSION=1.0.0
-```
-
-Container: `docker/linux-builder/Dockerfile` (Ubuntu 22.04 + Python 3.10 +
-GTK3 + WebKit2GTK 4.0 + libayatana-appindicator3 + PyInstaller deps). The
-container builds *both* a folder mode and an onefile mode binary using
-separate `--distpath` directories so they don't collide (Linux executables
-have no extension to disambiguate). The host then bundles them.
-
-Outputs:
-
-- `release/Codex-App-Transfer-v1.0.0-Linux-x86_64.tar.gz` (folder build,
-  tarred so file modes survive)
-- `release/Codex-App-Transfer-v1.0.0-Linux-x86_64` (onefile, +x)
-
-The bundled binary still requires GTK3 + WebKit2GTK 4.0 +
-libayatana-appindicator3 *on the user's Linux box*. On Debian/Ubuntu:
+## 本地自测出 .app
 
 ```bash
-sudo apt-get install libgtk-3-0 libwebkit2gtk-4.0-37 libayatana-appindicator3-1
+make mac-app
+# → dist/mac/Codex App Transfer.app (未签, 双击启动有 Gatekeeper 警告)
 ```
 
-### Windows x64
+只用于本地开发自测。要分发的 release 一律走 GitHub Actions。
+
+## 产物清单
+
+`release.yml` 一次成功执行后落到 GitHub release 的资产:
+
+```
+Codex-App-Transfer-v2.0.1-macOS-arm64.dmg
+Codex-App-Transfer-v2.0.1-macOS-arm64.dmg.sha256
+Codex-App-Transfer-v2.0.1-macOS-arm64.dmg.sig
+Codex-App-Transfer-v2.0.1-Linux-x86_64.deb
+Codex-App-Transfer-v2.0.1-Linux-x86_64.deb.sha256
+Codex-App-Transfer-v2.0.1-Linux-x86_64.deb.sig
+Codex-App-Transfer-v2.0.1-Linux-x86_64.AppImage
+Codex-App-Transfer-v2.0.1-Linux-x86_64.AppImage.sha256
+Codex-App-Transfer-v2.0.1-Linux-x86_64.AppImage.sig
+Codex-App-Transfer-v2.0.1-Windows-x64-Setup.exe
+Codex-App-Transfer-v2.0.1-Windows-x64-Setup.exe.sha256
+Codex-App-Transfer-v2.0.1-Windows-x64-Setup.exe.sig
+Codex-App-Transfer-v2.0.1-Windows-x64.msi
+Codex-App-Transfer-v2.0.1-Windows-x64.msi.sha256
+Codex-App-Transfer-v2.0.1-Windows-x64.msi.sig
+Codex-App-Transfer-release-public.pem
+latest.json
+latest.json.sha256
+latest.json.sig
+```
+
+格式说明:
+- macOS 只发 `.dmg`(Tauri 不直出 `.pkg`,`.pkg` 已退役)
+- Linux 双格式:`.deb`(Debian/Ubuntu 系,自动拉运行时依赖)+
+  `.AppImage`(免安装,任何 distro 直接 `chmod +x` 跑)
+- Windows 双格式:`-Setup.exe`(NSIS 安装包,推荐)+ `.msi`(企业 MDM
+  / GPO 部署用)。Portable.zip 退役
+
+## 验签
+
+公钥:`Codex-App-Transfer-release-public.pem`(随每个 release 一起发布)
+
+签名协议:RSA-3072 PKCS#1 v1.5 over the raw file bytes,SHA-256 哈希,
+签名 base64 存在 `<file>.sig`。
+
+任意平台(需要 Python + cryptography):
 
 ```bash
-make win-release VERSION=1.0.0
-```
-
-Container: `docker/windows-builder/Dockerfile` (`tobix/pywine:3.12` + Linux
-`makensis`). PyInstaller runs under Wine so the resulting `.exe` is a real
-PE32+ binary; NSIS runs natively on Linux and produces the Setup installer.
-
-Outputs:
-
-- `release/Codex-App-Transfer-v1.0.0-Windows-Portable.zip` (folder build zipped)
-- `release/Codex-App-Transfer-v1.0.0-Windows-x64.exe` (single-file)
-- `release/Codex-App-Transfer-v1.0.0-Windows-Setup.exe` (NSIS installer)
-
-#### Known Wine pitfalls
-
-PyInstaller-via-Wine produces a real Windows binary, but the build environment
-isn't quite real Windows. Things that have bitten us before:
-
-- **WebView2 missing at runtime**: pywebview's Edge backend tries to load
-  `Microsoft.Web.WebView2.*` DLLs. In our spec these come along via
-  `collect_data_files("webview")`, but if pywebview adds backends or moves
-  files between releases, the bundled `.exe` may launch a blank window.
-- **Tray icon transparency / DPI**: pystray under Wine sometimes draws the
-  tray icon with a black background on real Windows.
-- **NSIS taskkill on update**: `installer.nsi` runs
-  `taskkill /IM Codex-App-Transfer.exe /T /F` before overwrite. Wine's
-  makensis builds it fine; verify the upgrade path on a real Windows install.
-
-**Always smoke-test the Windows binary on a real Windows 10/11 machine
-before publishing.** If something is broken, fall back to the Windows-native
-build path below.
-
-#### Windows-native fallback
-
-On a real Windows machine:
-
-```powershell
-build.bat
-# or:
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\New-Release.ps1 `
-    -Version 1.0.0 -Build -TryInstaller -Repository Cmochance/codex-app-transfer
-python scripts\release_assets.py --version 1.0.0 --include windows
-```
-
-Needs Python 3.11–3.13, NSIS 3.x (`makensis` on PATH), and
-`pip install -r requirements.txt cryptography` already done.
-With an Authenticode certificate, add
-`-CodeSign -CodeSigningCertificateBase64 ... -CodeSigningCertificatePassword ...`.
-
-## Verifying signatures
-
-Public key: `release/Codex-App-Transfer-release-public.pem`. Scheme:
-RSA-3072 PKCS#1 v1.5 over the raw file bytes, hashed with SHA-256, signature
-stored as base64 in `<file>.sig`.
-
-PowerShell (works on Windows 10+ with built-in PowerShell 5.1+):
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Test-ReleaseSignature.ps1 `
-    -File release\Codex-App-Transfer-v1.0.0-Windows-Setup.exe
-```
-
-Python (any platform with `cryptography` installed):
-
-```bash
-.venv/bin/python -c "
+python -c "
+import base64, sys
 from pathlib import Path
-import base64
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-pub = serialization.load_pem_public_key(Path('release/Codex-App-Transfer-release-public.pem').read_bytes())
-asset = 'release/Codex-App-Transfer-v1.0.0-Windows-Setup.exe'
-sig = base64.b64decode(Path(asset+'.sig').read_text())
+pub = serialization.load_pem_public_key(
+    Path('Codex-App-Transfer-release-public.pem').read_bytes())
+asset = sys.argv[1]
+sig = base64.b64decode(Path(asset + '.sig').read_text())
 pub.verify(sig, Path(asset).read_bytes(), padding.PKCS1v15(), hashes.SHA256())
 print('OK')
-"
+" Codex-App-Transfer-v2.0.1-Windows-x64-Setup.exe
 ```
 
-## Where things live
+`latest.json` 和它的 `.sig` 同样可用上面命令验签。
+
+## CI 链路全图
 
 ```
-.
-├── Makefile                          # mac-release / linux-release / win-release / release
-├── build.spec                        # PyInstaller, used by all three platforms
-├── installer.nsi                     # NSIS, runs in win-builder container
-├── docker/
-│   ├── linux-builder/
-│   │   ├── Dockerfile
-│   │   └── build.sh                  # entrypoint inside container
-│   └── windows-builder/
-│       ├── Dockerfile
-│       └── build.sh
-├── macos/
-│   ├── build-macos.sh                # macOS host-side driver
-│   └── build-macos.spec
-└── scripts/
-    ├── build-linux-on-mac.sh         # macOS → docker driver for Linux
-    ├── build-windows-on-mac.sh       # macOS → docker driver for Windows
-    ├── release_assets.py             # cross-platform sha256 + sig + latest.json
-    └── Test-ReleaseSignature.ps1     # PowerShell verifier
+push tag v* / workflow_dispatch
+        │
+        ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ build (matrix)                                                    │
+ │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐   │
+ │  │ macos-14        │  │ ubuntu-22.04    │  │ windows-latest  │   │
+ │  │ aarch64-apple-  │  │ x86_64-unknown- │  │ x86_64-pc-      │   │
+ │  │ darwin          │  │ linux-gnu       │  │ windows-msvc    │   │
+ │  │ bundles=app,dmg │  │ bundles=deb,    │  │ bundles=nsis,msi│   │
+ │  │                 │  │   appimage      │  │                 │   │
+ │  │ cargo tauri     │  │ apt+retry →     │  │ cargo tauri     │   │
+ │  │ build           │  │ cargo tauri     │  │ build           │   │
+ │  │  ↓              │  │ build           │  │  ↓              │   │
+ │  │ rename → staging│  │  ↓              │  │ rename → staging│   │
+ │  │  ↓              │  │ rename → staging│  │  ↓              │   │
+ │  │ upload-artifact │  │  ↓              │  │ upload-artifact │   │
+ │  └─────────────────┘  │ upload-artifact │  └─────────────────┘   │
+ │                       └─────────────────┘                         │
+ └────────────────────────────┬─────────────────────────────────────┘
+                              ▼
+                  ┌────────────────────────┐
+                  │ release-bundle         │
+                  │ ubuntu-22.04           │
+                  │  ↓                     │
+                  │ download-artifact      │
+                  │  ↓                     │
+                  │ release_assets.py      │
+                  │  → release/*.sig+.sha256+latest.json │
+                  │  ↓                     │
+                  │ softprops/action-      │
+                  │ gh-release@v2          │
+                  │  → DRAFT GH release    │
+                  └────────────────────────┘
 ```
+
+draft release 由用户手动 ready/publish。失败重跑:`gh run rerun <ID>` 或
+重新触发 `gh workflow run release.yml -f version=...`。
+
+## Phase 2 之前的旧路径
+
+如果你看到老 PR / issue 提到 `make mac-release` / `make linux-release` /
+`make win-release` / `docker build` / Wine / PyInstaller / NSIS,这些是
+Phase 2 之前的本地路径,现已**全部删除**(Phase 2 PR)。详见
+`docs/cleanup-plan.md` Phase 2。
+
+## 故障排查
+
+| 症状 | 可能原因 | 修法 |
+|---|---|---|
+| release-bundle job 报 `RELEASE_PRIVATE_KEY_PEM secret 未配置` | 仓库 secret 未配 | 见上"必须 secret"章节 |
+| build job rename step 报 `if-no-files-found: error` | Tauri 没出该格式产物 | 看 `cargo tauri build` 输出,确认 `--bundles` 字符串拼写 |
+| Linux apt-get 卡住 / 失败 | archive.ubuntu.com 偶发抖动 | `release.yml` 已加 3 次 retry + 8min 硬上限,继续重跑;持续问题用 `gh run rerun` |
+| macOS 公证 fail | API key 过期或 Bundle ID 不在 App Store Connect 注册 | App Store Connect → Users and Access → Keys 重新生成 |
+| Windows .msi 安装失败 | WiX 模板缺 upgrade code | `tauri.conf.json` 加 `bundle.windows.wix.upgradeCode` |
