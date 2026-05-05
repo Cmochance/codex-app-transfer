@@ -12,12 +12,14 @@
 import asyncio
 import json
 import os
+import socket
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx
 import uvicorn
@@ -48,6 +50,16 @@ def err(msg: str):
 
 def info(msg: str):
     print(f"  {YELLOW}ℹ{RESET} {msg}")
+
+
+def free_port() -> int:
+    """Ask the OS for an unused localhost port.
+
+    向操作系统申请一个当前空闲的 localhost 端口。
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 # ============================================================================
@@ -404,6 +416,53 @@ async def test_async_conversions():
         f"真实 summary 文本应原样保留, got: {rc_c!r}"
     ok("reasoning_content fix: 真实 summary text 不被空格占位覆盖")
 
+    # 场景 D: DeepSeek V4 provider preset 开启 thinking,但请求体没有 reasoning
+    #         → tool-call 续轮仍应补 reasoning_content。
+    # Scenario D: DeepSeek V4 provider preset enables thinking, but the request
+    #             body has no reasoning field. Tool-call continuations should
+    #             still replay non-empty reasoning_content.
+    deepseek_provider = {
+        "id": "deepseek",
+        "name": "DeepSeek V4 Pro",
+        "baseUrl": "https://api.deepseek.com/v1",
+        "requestOptions": {
+            "chat": {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "max",
+            }
+        },
+    }
+    body_d = {
+        "model": "deepseek-v4-pro",
+        "input": [
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+             "name": "shell", "arguments": "{\"cmd\":\"pwd\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "/tmp"},
+            {"type": "message", "role": "user", "content": "continue"},
+        ],
+    }
+    chat_d = await convert_responses_to_chat_body(body_d, provider=deepseek_provider)
+    asst_d = next(m for m in chat_d["messages"] if m.get("role") == "assistant" and m.get("tool_calls"))
+    rc_d = asst_d.get("reasoning_content")
+    assert rc_d is not None and len(str(rc_d)) > 0, \
+        f"provider-level thinking 应补非空 reasoning_content, got: {rc_d!r}"
+    ok("reasoning_content fix: DeepSeek provider-level thinking 续轮补非空")
+
+    # 场景 E: Codex Responses input 可直接是 role/content dict,无 type 字段。
+    # Scenario E: Codex Responses input may use role/content dicts without type.
+    body_e = {
+        "model": "deepseek-v4-pro",
+        "input": [
+            {"role": "user", "content": [
+                {"type": "input_text", "text": "hello"},
+            ]},
+        ],
+    }
+    chat_e = await convert_responses_to_chat_body(body_e, provider=deepseek_provider)
+    assert chat_e["messages"][0]["role"] == "user"
+    assert chat_e["messages"][0]["content"] == [{"type": "text", "text": "hello"}]
+    ok("responses input: role/content dict without type is normalized")
+
 
 # run sync tests
 test_normalize_api_format()
@@ -427,33 +486,55 @@ print("=" * 60)
 
 
 async def test_admin_api():
+    from backend import config as cfg
     from backend.main import create_admin_app
 
-    admin_app = create_admin_app()
-    admin_port = 28081
-
-    config = uvicorn.Config(admin_app, host="127.0.0.1", port=admin_port, log_level="error")
-    server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve())
-    await asyncio.sleep(0.5)
+    old_cfg_dir = cfg.CONFIG_DIR
+    old_cfg_file = cfg.CONFIG_FILE
+    old_lib_dir = cfg.LIBRARY_DIR
 
     try:
-        async with httpx.AsyncClient() as client:
-            # /api/status
-            r = await client.get(f"http://127.0.0.1:{admin_port}/api/status")
-            assert r.status_code == 200
-            assert "proxyRunning" in r.json()
-            ok(f"Admin /api/status → {r.status_code}")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_app_dir = os.path.join(tmp, ".codex-app-transfer")
+            cfg.CONFIG_DIR = fake_app_dir
+            cfg.CONFIG_FILE = os.path.join(fake_app_dir, "config.json")
+            cfg.LIBRARY_DIR = os.path.join(fake_app_dir, "configLibrary")
+            cfg.save_config({
+                "version": cfg.APP_VERSION,
+                "activeProvider": None,
+                "providers": [],
+                "settings": cfg.DEFAULT_CONFIG["settings"].copy(),
+            })
 
-            # /api/version
-            r = await client.get(f"http://127.0.0.1:{admin_port}/api/version")
-            assert r.status_code == 200
-            assert "version" in r.json()
-            info(f"Admin /api/version → {r.json()}")
-            ok("Admin /api/version")
+            admin_app = create_admin_app()
+            admin_port = free_port()
+
+            config = uvicorn.Config(admin_app, host="127.0.0.1", port=admin_port, log_level="error")
+            server = uvicorn.Server(config)
+            task = asyncio.create_task(server.serve())
+            await asyncio.sleep(0.5)
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    # /api/status
+                    r = await client.get(f"http://127.0.0.1:{admin_port}/api/status")
+                    assert r.status_code == 200
+                    assert "proxyRunning" in r.json()
+                    ok(f"Admin /api/status → {r.status_code}")
+
+                    # /api/version
+                    r = await client.get(f"http://127.0.0.1:{admin_port}/api/version")
+                    assert r.status_code == 200
+                    assert "version" in r.json()
+                    info(f"Admin /api/version → {r.json()}")
+                    ok("Admin /api/version")
+            finally:
+                server.should_exit = True
+                await task
     finally:
-        server.should_exit = True
-        await task
+        cfg.CONFIG_DIR = old_cfg_dir
+        cfg.CONFIG_FILE = old_cfg_file
+        cfg.LIBRARY_DIR = old_lib_dir
 
 
 asyncio.run(test_admin_api())
@@ -471,7 +552,7 @@ async def test_proxy_api():
     from backend.proxy import create_proxy_app
 
     proxy_app = create_proxy_app()
-    proxy_port = 28082
+    proxy_port = free_port()
 
     config = uvicorn.Config(proxy_app, host="127.0.0.1", port=proxy_port, log_level="error")
     server = uvicorn.Server(config)
@@ -507,6 +588,12 @@ print("=" * 60)
 
 
 async def test_end_to_end():
+    from backend import config as cfg
+
+    old_cfg_dir = cfg.CONFIG_DIR
+    old_cfg_file = cfg.CONFIG_FILE
+    old_lib_dir = cfg.LIBRARY_DIR
+
     # 启动 mock 上游
     mock_app = FastAPI()
 
@@ -540,7 +627,7 @@ async def test_end_to_end():
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
 
-    mock_port = 29090
+    mock_port = free_port()
     mock_config = uvicorn.Config(mock_app, host="127.0.0.1", port=mock_port, log_level="error")
     mock_server = uvicorn.Server(mock_config)
     mock_task = asyncio.create_task(mock_server.serve())
@@ -552,24 +639,29 @@ async def test_end_to_end():
         await _proxy_mod._http_client.aclose()
         _proxy_mod._http_client = None
 
-    # 配置一个指向 mock 的 provider
-    from backend import config as cfg
-    cfg.save_config({
-        "version": cfg.APP_VERSION,
-        "activeProvider": "mock-provider",
-        "gatewayApiKey": "test-key",
-        "providers": [{
-            "id": "mock-provider",
-            "name": "Mock",
-            "baseUrl": f"http://127.0.0.1:{mock_port}",
-            "apiFormat": "openai_chat",
-            "apiKey": "mock-key",
-            "models": {"default": "mock-model"},
-        }],
-        "settings": cfg.DEFAULT_CONFIG["settings"].copy(),
-    })
+    fake_config_tmp = tempfile.TemporaryDirectory()
+    fake_app_dir = os.path.join(fake_config_tmp.name, ".codex-app-transfer")
+    cfg.CONFIG_DIR = fake_app_dir
+    cfg.CONFIG_FILE = os.path.join(fake_app_dir, "config.json")
+    cfg.LIBRARY_DIR = os.path.join(fake_app_dir, "configLibrary")
 
     try:
+        # 配置一个指向 mock 的 provider
+        cfg.save_config({
+            "version": cfg.APP_VERSION,
+            "activeProvider": "mock-provider",
+            "gatewayApiKey": "test-key",
+            "providers": [{
+                "id": "mock-provider",
+                "name": "Mock",
+                "baseUrl": f"http://127.0.0.1:{mock_port}",
+                "apiFormat": "openai_chat",
+                "apiKey": "mock-key",
+                "models": {"default": "mock-model"},
+            }],
+            "settings": cfg.DEFAULT_CONFIG["settings"].copy(),
+        })
+
         # 直接测试核心转发函数（避免两个 uvicorn 服务器在同一事件循环中竞争）
         from backend.proxy import forward_request
 
@@ -620,6 +712,10 @@ async def test_end_to_end():
         ok(f"E2E streaming → events={len(events)}")
 
     finally:
+        cfg.CONFIG_DIR = old_cfg_dir
+        cfg.CONFIG_FILE = old_cfg_file
+        cfg.LIBRARY_DIR = old_lib_dir
+        fake_config_tmp.cleanup()
         mock_server.should_exit = True
         await mock_task
 

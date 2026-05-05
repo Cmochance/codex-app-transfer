@@ -104,20 +104,18 @@ async def convert_responses_to_chat_body(
     # 里补 ID;无法配对的孤儿 tool message 直接丢弃避免上游 400。
     messages = _repair_tool_call_ids(messages)
 
-    # reasoning 开启时，确保所有带 tool_calls 的 assistant 消息都有
-    # **非空** 的 ``reasoning_content`` 字段。Kimi (kimi-k2.6 / kimi-for-coding)
-    # 服务端默认开启 thinking、DeepSeek 在「DeepSeek Max 思维」开关 ON 时也开启,
-    # 它们都会强校验:空字符串等同于缺失,会返回 400 "thinking is enabled but
-    # reasoning_content is missing"。用单空格做最小占位,语义零、token 信号近乎为零。
-    if body.get("reasoning") is not None:
-        for m in messages:
-            if (
-                isinstance(m, dict)
-                and m.get("role") == "assistant"
-                and m.get("tool_calls")
-                and not str(m.get("reasoning_content") or "").strip()
-            ):
-                m["reasoning_content"] = " "
+    # Thinking + tool-call loops must replay assistant reasoning_content.
+    # 思考模式 + 工具调用循环必须回传 assistant 的 reasoning_content。
+    #
+    # Codex may send full Responses history instead of previous_response_id,
+    # and DeepSeek thinking can be enabled by provider requestOptions rather
+    # than a request-level `reasoning` field. Repair after all message merging
+    # and tool-call pairing has settled.
+    #
+    # Codex 可能直接发送完整 Responses 历史，而不是 previous_response_id；
+    # DeepSeek thinking 也可能由 provider.requestOptions 开启，而不是请求体里的
+    # `reasoning` 字段。这里等消息合并和 tool_call 配对完成后再统一修复。
+    _ensure_thinking_tool_call_reasoning(messages, original, provider)
 
     # 非 OpenAI 官方 provider 时，developer → system
     if provider and isinstance(provider, dict):
@@ -259,6 +257,100 @@ async def convert_responses_to_chat_body(
 # --------------------------------------------------------------------------- #
 # Messages 构建
 # --------------------------------------------------------------------------- #
+
+
+def _provider_looks_like(provider: dict | None, needle: str) -> bool:
+    if not isinstance(provider, dict):
+        return False
+    haystack = " ".join(
+        str(provider.get(key) or "").lower()
+        for key in ("id", "name", "baseUrl")
+    )
+    return needle.lower() in haystack
+
+
+def _provider_chat_thinking_enabled(provider: dict | None) -> bool:
+    """Whether provider config forces Chat Completions thinking mode on.
+
+    判断 provider 配置是否强制开启 Chat Completions thinking 模式。
+    """
+    if not isinstance(provider, dict):
+        return False
+    options = provider.get("requestOptions") or {}
+    if not isinstance(options, dict):
+        return False
+    chat_options = options.get("chat", options)
+    if not isinstance(chat_options, dict):
+        return False
+
+    thinking = chat_options.get("thinking")
+    if isinstance(thinking, dict):
+        thinking_type = str(thinking.get("type") or "").lower()
+        if thinking_type and thinking_type != "disabled":
+            return True
+    elif thinking:
+        return True
+
+    return bool(chat_options.get("reasoning_effort"))
+
+
+def _request_thinking_enabled(body: dict, provider: dict | None) -> bool:
+    if isinstance(body, dict) and body.get("reasoning") is not None:
+        return True
+    # DeepSeek V4 preset enables thinking in provider.requestOptions.chat.
+    if _provider_looks_like(provider, "deepseek") and _provider_chat_thinking_enabled(provider):
+        return True
+    return False
+
+
+def _ensure_thinking_tool_call_reasoning(
+    messages: list[dict],
+    body: dict,
+    provider: dict | None,
+) -> None:
+    """Repair DeepSeek-style thinking history for tool-call continuations.
+
+    修复 DeepSeek 风格 thinking 模式下工具调用续轮的历史消息。
+
+    DeepSeek V4 thinking mode returns `reasoning_content` alongside `content`.
+    Normal fresh user turns should not replay old reasoning, but tool-call
+    continuations are stricter: once history contains a tool-call loop, DeepSeek
+    validates assistant history for reasoning_content. When Codex history has
+    only an opaque reasoning item, a single-space placeholder satisfies the API
+    without inventing visible content.
+
+    DeepSeek V4 thinking 模式会在 `content` 之外返回 `reasoning_content`。
+    普通新用户轮不应回放旧推理，但工具调用续轮更严格：一旦历史里包含
+    tool-call loop，DeepSeek 会校验 assistant 历史是否带 reasoning_content。
+    当 Codex 历史里只有不透明 reasoning item 时，用单个空格占位即可满足
+    API 要求，同时不会编造可见内容。
+    """
+    if not _request_thinking_enabled(body, provider):
+        return
+    has_tool_loop = any(
+        isinstance(msg, dict)
+        and (
+            msg.get("role") == "tool"
+            or (
+                msg.get("role") == "assistant"
+                and isinstance(msg.get("tool_calls"), list)
+                and msg.get("tool_calls")
+            )
+        )
+        for msg in messages
+    )
+    if not has_tool_loop:
+        return
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        if not (isinstance(msg.get("tool_calls"), list) and msg.get("tool_calls")):
+            continue
+        if not str(msg.get("reasoning_content") or "").strip():
+            msg["reasoning_content"] = " "
 
 
 def _build_messages_from_input(
@@ -661,7 +753,14 @@ def _extract_input_items(input_param: Any) -> list[dict]:
         items: list[dict] = []
         for elem in input_param:
             if isinstance(elem, dict):
-                items.append(dict(elem))
+                if "type" in elem:
+                    items.append(dict(elem))
+                else:
+                    items.append({
+                        "type": "message",
+                        "role": elem.get("role", "user"),
+                        "content": elem.get("content", dict(elem)),
+                    })
             elif isinstance(elem, str):
                 items.append({"type": "message", "role": "user", "content": elem})
             else:
@@ -889,7 +988,7 @@ def convert_input_item_to_message(item: dict) -> list[dict]:
     content = item.get("content")
     if content is not None:
         role = item.get("role", "user")
-        return [{"role": role, "content": content}]
+        return [{"role": role, "content": _normalize_message_content_for_chat(content)}]
 
     return []
 
