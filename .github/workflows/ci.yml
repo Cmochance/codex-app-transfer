@@ -9,8 +9,9 @@ name: ci
 on:
   push:
     branches: [main]
+  # branches 不限制, 让 stacked PR (base=feature/* 而非 main) 也跑 CI.
+  # GH Actions 免费额度对 public repo 无上限, 不必省 trigger.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
