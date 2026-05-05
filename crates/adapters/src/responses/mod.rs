@@ -13,7 +13,7 @@ pub mod request;
 pub mod stream;
 
 pub use converter::ChatToResponsesConverter;
-pub use request::responses_body_to_chat_body;
+pub use request::{responses_body_to_chat_body, responses_body_to_chat_body_for_provider};
 pub use stream::convert_chat_to_responses_stream;
 
 use bytes::Bytes;
@@ -40,14 +40,14 @@ impl Adapter for ResponsesAdapter {
         &self,
         client_path: &str,
         body: Bytes,
-        _provider: &Provider,
+        provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
         let upstream_path = redirect_responses_to_chat(client_path);
         // Stage 3.2a stateless:解析 body → Responses,转出 Chat 形态。
         // 失败时(body 非 JSON / 非对象)用 BadRequest 错出去,proxy 会回 400。
         let parsed: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| AdapterError::BadRequest(format!("body 不是合法 JSON: {e}")))?;
-        let chat_body = responses_body_to_chat_body(&parsed)?;
+        let chat_body = responses_body_to_chat_body_for_provider(&parsed, Some(provider))?;
         let new_body = serde_json::to_vec(&chat_body)
             .map_err(|e| AdapterError::Internal(format!("re-serialize: {e}")))?;
         Ok(RequestPlan {

@@ -19,7 +19,7 @@ pub mod types;
 pub use openai_chat::OpenAiChatAdapter;
 pub use registry::AdapterRegistry;
 pub use responses::{
-    convert_chat_to_responses_stream, responses_body_to_chat_body, ChatToResponsesConverter,
-    ResponsesAdapter,
+    convert_chat_to_responses_stream, responses_body_to_chat_body,
+    responses_body_to_chat_body_for_provider, ChatToResponsesConverter, ResponsesAdapter,
 };
 pub use types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};

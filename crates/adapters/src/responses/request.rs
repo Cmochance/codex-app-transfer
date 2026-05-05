@@ -24,12 +24,26 @@
 //! - 多轮 user/assistant 合并(Python 有 `merge_consecutive_*_messages`,
 //!   stateless 阶段不必要,Codex CLI 自己不会发出连续同角色消息)
 
+use codex_app_transfer_registry::Provider;
 use serde_json::{json, Value};
 
 use crate::types::AdapterError;
 
 /// 把 Responses API 请求体转换成 OpenAI Chat Completions 请求体.
 pub fn responses_body_to_chat_body(input: &Value) -> Result<Value, AdapterError> {
+    responses_body_to_chat_body_for_provider(input, None)
+}
+
+/// 把 Responses API 请求体转换成 OpenAI Chat Completions 请求体.
+///
+/// provider-aware 路径用于恢复 Python 版 DeepSeek/Kimi thinking 历史修复:
+/// Codex 续轮工具调用时,部分上游会要求 assistant.tool_calls 历史带
+/// `reasoning_content`;DeepSeek 的 thinking 还可能由 provider.requestOptions
+/// 开启,而不是出现在本次请求体里。
+pub fn responses_body_to_chat_body_for_provider(
+    input: &Value,
+    provider: Option<&Provider>,
+) -> Result<Value, AdapterError> {
     let body = input
         .as_object()
         .ok_or_else(|| AdapterError::BadRequest("body 必须是 JSON 对象".into()))?;
@@ -54,6 +68,8 @@ pub fn responses_body_to_chat_body(input: &Value) -> Result<Value, AdapterError>
             messages.push(msg);
         }
     }
+    repair_tool_call_ids(&mut messages);
+    ensure_thinking_tool_call_reasoning(&mut messages, input, provider);
     if !messages.is_empty() {
         result.insert("messages".into(), Value::Array(messages));
     }
@@ -128,15 +144,74 @@ fn input_field_to_messages(input: &Value) -> Vec<Value> {
         }
         Value::Array(items) => {
             let mut out = Vec::new();
+            let mut pending_reasoning: Option<String> = None;
             for item in items {
                 if let Some(obj) = item.as_object() {
-                    out.extend(input_item_to_messages(obj));
+                    if obj.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+                        pending_reasoning = Some(extract_reasoning_text(obj));
+                        continue;
+                    }
+                    let mut item_messages = input_item_to_messages(obj);
+                    for msg in &mut item_messages {
+                        if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+                            if let Some(reasoning) = pending_reasoning.take() {
+                                let has_reasoning = msg
+                                    .get("reasoning_content")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|s| !s.trim().is_empty());
+                                if !has_reasoning {
+                                    let repaired = if reasoning.trim().is_empty() {
+                                        " ".to_owned()
+                                    } else {
+                                        reasoning
+                                    };
+                                    if let Some(msg_obj) = msg.as_object_mut() {
+                                        msg_obj.insert(
+                                            "reasoning_content".into(),
+                                            Value::String(repaired),
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            pending_reasoning = None;
+                        }
+                    }
+                    out.extend(item_messages);
                 }
             }
             out
         }
         _ => Vec::new(),
     }
+}
+
+fn extract_reasoning_text(item: &serde_json::Map<String, Value>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(summaries) = item.get("summary").and_then(|v| v.as_array()) {
+        for summary in summaries {
+            if let Some(text) = summary.get("text").and_then(|v| v.as_str()) {
+                if !text.trim().is_empty() {
+                    parts.push(text.to_owned());
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+            for block in content {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    if !text.trim().is_empty() {
+                        parts.push(text.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    parts.join("\n")
 }
 
 /// 单个 Responses input item → 一条或多条 Chat message.
@@ -203,6 +278,158 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
             }
         }
     }
+}
+
+fn repair_tool_call_ids(messages: &mut Vec<Value>) {
+    let mut pending_call_ids: Vec<String> = Vec::new();
+    let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for mut msg in messages.drain(..) {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if role == "assistant" {
+            if let Some(calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                pending_call_ids = calls
+                    .iter()
+                    .filter_map(|call| call.get("id").and_then(|id| id.as_str()))
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect();
+            }
+            repaired.push(msg);
+            continue;
+        }
+
+        if role == "tool" {
+            let existing = msg
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            if existing.is_empty() {
+                if pending_call_ids.is_empty() {
+                    continue;
+                }
+                if let Some(obj) = msg.as_object_mut() {
+                    obj.insert(
+                        "tool_call_id".into(),
+                        Value::String(pending_call_ids.remove(0)),
+                    );
+                }
+            } else if let Some(pos) = pending_call_ids.iter().position(|id| id == &existing) {
+                pending_call_ids.remove(pos);
+            }
+        }
+
+        if matches!(role.as_str(), "user" | "system" | "developer") {
+            pending_call_ids.clear();
+        }
+
+        repaired.push(msg);
+    }
+
+    *messages = repaired;
+}
+
+fn ensure_thinking_tool_call_reasoning(
+    messages: &mut [Value],
+    body: &Value,
+    provider: Option<&Provider>,
+) {
+    if !request_thinking_enabled(body, provider) {
+        return;
+    }
+
+    let has_tool_loop = messages.iter().any(|msg| {
+        msg.get("role").and_then(|v| v.as_str()) == Some("tool")
+            || (msg.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                && msg
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|calls| !calls.is_empty()))
+    });
+    if !has_tool_loop {
+        return;
+    }
+
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let has_tool_calls = msg
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .is_some_and(|calls| !calls.is_empty());
+        if !has_tool_calls {
+            continue;
+        }
+        let has_reasoning = msg
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_reasoning {
+            if let Some(obj) = msg.as_object_mut() {
+                obj.insert("reasoning_content".into(), Value::String(" ".into()));
+            }
+        }
+    }
+}
+
+fn request_thinking_enabled(body: &Value, provider: Option<&Provider>) -> bool {
+    if body.get("reasoning").is_some() {
+        return true;
+    }
+    provider
+        .is_some_and(|p| provider_looks_like(p, "deepseek") && provider_chat_thinking_enabled(p))
+}
+
+fn provider_looks_like(provider: &Provider, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    [&provider.id, &provider.name, &provider.base_url]
+        .iter()
+        .any(|value| value.to_ascii_lowercase().contains(&needle))
+}
+
+fn provider_chat_thinking_enabled(provider: &Provider) -> bool {
+    if thinking_value_enabled(provider.request_options.get("thinking"))
+        || provider.request_options.get("reasoning_effort").is_some()
+    {
+        return true;
+    }
+
+    let Some(chat_options) = provider
+        .request_options
+        .get("chat")
+        .and_then(|v| v.as_object())
+    else {
+        return false;
+    };
+
+    thinking_value_enabled(chat_options.get("thinking"))
+        || chat_options.get("reasoning_effort").is_some()
+}
+
+fn thinking_value_enabled(thinking: Option<&Value>) -> bool {
+    match thinking {
+        Some(Value::Object(thinking)) => {
+            let thinking_type = thinking
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !thinking_type.is_empty() && thinking_type != "disabled" {
+                return true;
+            }
+        }
+        Some(Value::Bool(true)) => return true,
+        Some(other) if !other.is_null() => return true,
+        _ => {}
+    }
+    false
 }
 
 /// Responses message.content 可能是 string 或 [{type, text/image_url}].
@@ -338,9 +565,41 @@ fn convert_responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_transfer_registry::Provider;
+    use indexmap::IndexMap;
 
     fn convert(body: Value) -> Value {
         responses_body_to_chat_body(&body).unwrap()
+    }
+
+    fn provider(id: &str, name: &str, base_url: &str) -> Provider {
+        Provider {
+            id: id.into(),
+            name: name.into(),
+            base_url: base_url.into(),
+            auth_scheme: "bearer".into(),
+            api_format: "responses".into(),
+            api_key: "sk-test".into(),
+            models: IndexMap::new(),
+            extra_headers: IndexMap::new(),
+            model_capabilities: IndexMap::new(),
+            request_options: IndexMap::new(),
+            is_builtin: false,
+            sort_index: 0,
+            extra: IndexMap::new(),
+        }
+    }
+
+    fn deepseek_thinking_provider() -> Provider {
+        let mut p = provider("deepseek", "DeepSeek V4 Pro", "https://api.deepseek.com/v1");
+        p.request_options.insert(
+            "chat".into(),
+            json!({
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "max",
+            }),
+        );
+        p
     }
 
     #[test]
@@ -483,6 +742,169 @@ mod tests {
         }));
         let msg = &out["messages"][0];
         assert_eq!(msg["content"], "{\"temp\":72}");
+    }
+
+    #[test]
+    fn empty_tool_call_id_is_repaired_from_previous_assistant_call() {
+        let out = convert(json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "shell",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "output": "ok"
+                }
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "call_abc");
+    }
+
+    #[test]
+    fn orphan_tool_message_without_call_id_is_dropped() {
+        let out = convert(json!({
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "output": "orphan"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "continue"
+                }
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+    }
+
+    #[test]
+    fn reasoning_summary_is_attached_to_following_tool_call() {
+        let out = convert(json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "I should inspect the repo."
+                    }],
+                    "content": null,
+                    "encrypted_content": null
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                }
+            ]
+        }));
+        let msg = &out["messages"][0];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["reasoning_content"], "I should inspect the repo.");
+    }
+
+    #[test]
+    fn opaque_reasoning_item_uses_blank_placeholder_for_tool_call() {
+        let out = convert(json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": null,
+                    "encrypted_content": "opaque"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "shell",
+                    "arguments": "{}"
+                }
+            ]
+        }));
+        assert_eq!(out["messages"][0]["reasoning_content"], " ");
+    }
+
+    #[test]
+    fn request_reasoning_repairs_tool_call_assistant_reasoning() {
+        let out = convert(json!({
+            "reasoning": {"effort": "high"},
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "shell",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": "ok"
+                }
+            ]
+        }));
+        assert_eq!(out["messages"][0]["reasoning_content"], " ");
+    }
+
+    #[test]
+    fn deepseek_provider_thinking_repairs_without_request_reasoning() {
+        let provider = deepseek_thinking_provider();
+        let out = responses_body_to_chat_body_for_provider(
+            &json!({
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_abc",
+                        "name": "shell",
+                        "arguments": "{}"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_abc",
+                        "output": "ok"
+                    }
+                ]
+            }),
+            Some(&provider),
+        )
+        .unwrap();
+        assert_eq!(out["messages"][0]["reasoning_content"], " ");
+    }
+
+    #[test]
+    fn non_deepseek_provider_thinking_does_not_repair_by_config_alone() {
+        let mut provider = provider("other", "Other", "https://example.test/v1");
+        provider
+            .request_options
+            .insert("chat".into(), json!({"thinking": {"type": "enabled"}}));
+        let out = responses_body_to_chat_body_for_provider(
+            &json!({
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_abc",
+                        "name": "shell",
+                        "arguments": "{}"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_abc",
+                        "output": "ok"
+                    }
+                ]
+            }),
+            Some(&provider),
+        )
+        .unwrap();
+        assert!(out["messages"][0].get("reasoning_content").is_none());
     }
 
     #[test]
