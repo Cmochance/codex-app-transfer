@@ -165,20 +165,79 @@ jobs:
 
           cargo tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
 
-      # macOS build 后置验证: 确保 .app codesign 有效 + dmg 完整.
-      # 防 release 上传坏包 (上传前早 fail).
+      # 三平台 build 后置验证 (PR #13 review 建议): 上传前早 fail, 防 release
+      # 上传坏包. 历史教训: v2.0.1 第一次 dispatch 出过 macOS dmg 内 .app
+      # 完全未签 → Sequoia Gatekeeper 无路径绕过. 三平台都加各自 sanity
+      # check 后这类问题不会再静默上传.
       - name: Verify macOS .app codesign + dmg integrity
         if: matrix.os == 'macos-14'
         shell: bash
         run: |
           APP="target/${{ matrix.target }}/release/bundle/macos/Codex App Transfer.app"
           DMG_DIR="target/${{ matrix.target }}/release/bundle/dmg"
-          echo "::group::codesign --verify .app"
+          echo "::group::codesign --verify .app (深度严格模式)"
           codesign --verify --deep --strict --verbose=4 "$APP"
           echo "::endgroup::"
           echo "::group::hdiutil verify dmg"
           for d in "$DMG_DIR"/*.dmg; do
             [[ -f "$d" ]] && hdiutil verify "$d"
+          done
+          echo "::endgroup::"
+
+      - name: Verify Linux .deb / .AppImage integrity
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          DEB_DIR="target/${{ matrix.target }}/release/bundle/deb"
+          APPIMG_DIR="target/${{ matrix.target }}/release/bundle/appimage"
+          echo "::group::dpkg-deb -I .deb (control + 依赖列表)"
+          for f in "$DEB_DIR"/*.deb; do
+            [[ -f "$f" ]] && dpkg-deb -I "$f"
+          done
+          echo "::endgroup::"
+          echo "::group::dpkg-deb -c .deb (验证有 usr/bin/codex-app-transfer)"
+          for f in "$DEB_DIR"/*.deb; do
+            [[ -f "$f" ]] || continue
+            dpkg-deb -c "$f" | grep -E "usr/bin/codex-app-transfer\$" || \
+              { echo "::error::deb 缺主 binary: $f"; exit 1; }
+          done
+          echo "::endgroup::"
+          echo "::group::AppImage --appimage-extract 验证内部结构"
+          for f in "$APPIMG_DIR"/*.AppImage; do
+            [[ -f "$f" ]] || continue
+            chmod +x "$f"
+            (cd /tmp && rm -rf squashfs-root && "$OLDPWD/$f" --appimage-extract > /dev/null) || \
+              { echo "::error::AppImage extract failed: $f"; exit 1; }
+            ls /tmp/squashfs-root/usr/bin/codex-app-transfer >/dev/null || \
+              { echo "::error::AppImage 缺主 binary: $f"; rm -rf /tmp/squashfs-root; exit 1; }
+            rm -rf /tmp/squashfs-root
+          done
+          echo "::endgroup::"
+
+      - name: Verify Windows .exe / .msi integrity
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          NSIS_DIR="target/${{ matrix.target }}/release/bundle/nsis"
+          MSI_DIR="target/${{ matrix.target }}/release/bundle/msi"
+          echo "::group::file 检查 NSIS Setup.exe 是 PE32+"
+          for f in "$NSIS_DIR"/*-setup.exe; do
+            [[ -f "$f" ]] || continue
+            file "$f" | grep -qE "PE32\+? executable" || \
+              { echo "::error::非 PE32 PE32+ Windows 可执行: $f"; exit 1; }
+            size=$(wc -c < "$f")
+            (( size > 1048576 )) || \
+              { echo "::error::Setup.exe 太小 ($size bytes), 疑似坏包: $f"; exit 1; }
+            echo "OK: $f ($size bytes)"
+          done
+          echo "::endgroup::"
+          echo "::group::文件存在 + 大小 sanity 检查 .msi"
+          for f in "$MSI_DIR"/*.msi; do
+            [[ -f "$f" ]] || continue
+            size=$(wc -c < "$f")
+            (( size > 1048576 )) || \
+              { echo "::error::.msi 太小 ($size bytes), 疑似坏包: $f"; exit 1; }
+            echo "OK: $f ($size bytes)"
           done
           echo "::endgroup::"
 
