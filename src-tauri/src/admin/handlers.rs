@@ -25,7 +25,8 @@ use base64::{
     Engine,
 };
 use codex_app_transfer_codex_integration::{
-    apply_provider, has_snapshot, restore_codex_state, ApplyConfig, CodexPaths,
+    apply_provider, catalog_models_for_provider, has_snapshot, read_auth, restore_codex_state,
+    ApplyConfig, CodexPaths,
 };
 use codex_app_transfer_proxy::{proxy_log_dir, proxy_telemetry};
 use codex_app_transfer_registry::{
@@ -47,6 +48,7 @@ use super::state::AdminState;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FEEDBACK_WORKER_URL: &str = "https://codex-app-transfer-feedback.alysechencn.workers.dev";
+const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
 struct FeedbackThrottleState {
     last_success: Option<Instant>,
@@ -1740,6 +1742,190 @@ fn desktop_config_target_for_provider(
     }
 }
 
+fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConfigTarget> {
+    let provider = active_provider(cfg)?;
+    let mut snapshot = cfg.clone();
+    Some(desktop_config_target_for_provider(
+        &mut snapshot,
+        &provider,
+        None,
+    ))
+}
+
+fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> {
+    catalog_models_for_provider(
+        &target.provider_name,
+        &target.default_model,
+        target.supports_1m,
+        Some(&target.model_mappings),
+        Some(&target.model_capabilities),
+    )
+    .into_iter()
+    .map(|model| {
+        let mut item = json!({
+            "name": model.slug,
+            "displayName": model.display_name,
+        });
+        if model.context_window >= ONE_M_CONTEXT_WINDOW {
+            item["supports1m"] = Value::Bool(true);
+        }
+        item
+    })
+    .collect()
+}
+
+fn desktop_inference_models_json(target: Option<&DesktopConfigTarget>) -> String {
+    let Some(target) = target else {
+        return "[]".to_owned();
+    };
+    serde_json::to_string(&desktop_expected_model_items(target)).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(&paths.config_toml).ok()?;
+    for line in content.lines() {
+        let stripped = line.trim_start();
+        if stripped.starts_with('[') {
+            break;
+        }
+        if !stripped.starts_with(key) {
+            continue;
+        }
+        let after = &stripped[key.len()..];
+        let mut rest = after.trim_start();
+        if !rest.starts_with('=') {
+            continue;
+        }
+        rest = rest[1..].trim();
+        if let Some(idx) = rest.find('#') {
+            rest = rest[..idx].trim_end();
+        }
+        let trimmed = rest.trim_matches(|c: char| c == '"' || c == '\'');
+        return Some(trimmed.to_owned());
+    }
+    None
+}
+
+fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
+    read_auth(&paths.auth_json)
+        .ok()
+        .and_then(|auth| {
+            auth.get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -> bool {
+    let one_million_names: Vec<String> = desktop_expected_model_items(target)
+        .into_iter()
+        .filter_map(|item| {
+            if item.get("supports1m").and_then(|v| v.as_bool()) == Some(true) {
+                item.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if one_million_names.is_empty() {
+        return true;
+    }
+
+    let Some(catalog_path) = read_codex_toml_root_string(paths, "model_catalog_json") else {
+        return false;
+    };
+    let catalog_path = PathBuf::from(catalog_path);
+    let catalog = fs::read_to_string(catalog_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let Some(models) = catalog.get("models").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    models.iter().any(|item| {
+        let slug = item
+            .get("slug")
+            .or_else(|| item.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !one_million_names.iter().any(|name| name == slug) {
+            return false;
+        }
+        let context_window = item
+            .get("context_window")
+            .or_else(|| item.get("max_context_window"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        context_window >= ONE_M_CONTEXT_WINDOW
+    })
+}
+
+fn desktop_health(
+    paths: Option<&CodexPaths>,
+    configured: bool,
+    actual_base_url: Option<&str>,
+    actual_api_key_present: bool,
+    target: Option<&DesktopConfigTarget>,
+) -> Value {
+    let expected_base_url = target
+        .map(|target| target.base_url.trim_end_matches('/').to_owned())
+        .unwrap_or_default();
+    let actual_base_url = actual_base_url
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    let mut issues = Vec::new();
+
+    if !configured {
+        if !actual_base_url.is_empty() || actual_api_key_present {
+            issues.push(json!({
+                "code": "not_managed_by_cas",
+                "message": "当前 Codex CLI 配置不是由本工具最新版本写入。",
+            }));
+        } else {
+            issues.push(json!({
+                "code": "codex_snapshot_missing",
+                "message": "尚未由本工具应用 Codex CLI 配置，请重新一键生成配置。",
+            }));
+        }
+    }
+
+    if !actual_base_url.is_empty()
+        && !expected_base_url.is_empty()
+        && actual_base_url != expected_base_url
+    {
+        issues.push(json!({
+            "code": "gateway_base_url_mismatch",
+            "message": "Codex CLI 仍指向旧地址，请重新一键生成 Codex CLI 配置。",
+        }));
+    }
+
+    let one_million_ready = match (paths, target) {
+        (Some(paths), Some(target)) => one_million_catalog_ready(paths, target),
+        _ => true,
+    };
+    if !one_million_ready {
+        issues.push(json!({
+            "code": "one_million_not_written",
+            "message": "1M 上下文模型尚未写入 Codex CLI 配置，请重新一键生成配置并重启终端。",
+        }));
+    }
+
+    json!({
+        "needsApply": !configured || !issues.is_empty(),
+        "oneMillionReady": one_million_ready,
+        "expectedBaseUrl": expected_base_url,
+        "actualBaseUrl": actual_base_url,
+        "mode": target.map(|target| target.mode),
+        "requiresProxy": target.map(|target| target.requires_proxy).unwrap_or(false),
+        "issues": issues,
+    })
+}
+
 fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
     let paths = CodexPaths::from_home_env().map_err(|e| e.to_string())?;
     let result = apply_provider(
@@ -2320,20 +2506,35 @@ pub async fn status(State(state): State<AdminState>) -> impl IntoResponse {
     let proxy_status = state.proxy_manager.status();
     let codex_paths = CodexPaths::from_home_env().ok();
     let codex_configured = codex_paths.as_ref().map(has_snapshot).unwrap_or(false);
+    let actual_base_url = codex_paths
+        .as_ref()
+        .and_then(|paths| read_codex_toml_root_string(paths, "openai_base_url"));
+    let actual_api_key_present = codex_paths
+        .as_ref()
+        .map(codex_openai_api_key_present)
+        .unwrap_or(false);
+    let desktop_target = desktop_target_for_active_provider(&cfg);
+    let desktop_health = desktop_health(
+        codex_paths.as_ref(),
+        codex_configured,
+        actual_base_url.as_deref(),
+        actual_api_key_present,
+        desktop_target.as_ref(),
+    );
 
     Json(json!({
         "desktopConfigured": codex_configured,
         "proxyRunning": proxy_status.running,
         "proxyPort": proxy_port,
-        "desktopMode": "gateway",
-        "desktopRequiresProxy": true,
+        "desktopMode": desktop_target.as_ref().map(|target| target.mode).unwrap_or("unconfigured"),
+        "desktopRequiresProxy": desktop_target
+            .as_ref()
+            .map(|target| target.requires_proxy)
+            .unwrap_or(false),
         "activeProvider": active,
         "activeProviderId": active_id,
         "providerCount": providers_count,
-        "desktopHealth": {
-            "needsApply": !codex_configured,
-            "issues": [],
-        },
+        "desktopHealth": desktop_health,
         "exposeAllProviderModels": false,
     }))
     .into_response()
@@ -2776,39 +2977,36 @@ pub async fn desktop_status() -> impl IntoResponse {
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let configured = has_snapshot(&paths);
-    let base_url = std::fs::read_to_string(&paths.config_toml)
-        .ok()
-        .and_then(|s| {
-            for line in s.lines() {
-                let stripped = line.trim_start();
-                if !stripped.starts_with("openai_base_url") {
-                    continue;
-                }
-                let after = &stripped["openai_base_url".len()..];
-                let mut rest = after.trim_start();
-                if !rest.starts_with('=') {
-                    continue;
-                }
-                rest = rest[1..].trim();
-                if let Some(idx) = rest.find('#') {
-                    rest = rest[..idx].trim_end();
-                }
-                let trimmed = rest.trim_matches(|c: char| c == '"' || c == '\'');
-                return Some(trimmed.to_owned());
-            }
-            None
-        });
     let cfg = load_registry().unwrap_or_else(|_| json!({}));
     let proxy_port = read_proxy_port(&cfg);
+    let actual_base_url = read_codex_toml_root_string(&paths, "openai_base_url");
+    let actual_api_key_present = codex_openai_api_key_present(&paths);
+    let desktop_target = desktop_target_for_active_provider(&cfg);
+    let fallback_base_url = desktop_target
+        .as_ref()
+        .map(|target| target.base_url.clone())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{proxy_port}"));
+    let api_key_present = actual_api_key_present
+        || desktop_target
+            .as_ref()
+            .map(|target| !target.api_key.is_empty())
+            .unwrap_or_else(|| !read_gateway_key(&cfg).is_empty());
+    let health = desktop_health(
+        Some(&paths),
+        configured,
+        actual_base_url.as_deref(),
+        actual_api_key_present,
+        desktop_target.as_ref(),
+    );
     Json(json!({
         "configured": configured,
-        "health": {"needsApply": !configured, "issues": []},
+        "health": health,
         "keys": {
             "inferenceProvider": "gateway",
-            "inferenceGatewayBaseUrl": base_url.unwrap_or_else(|| format!("http://127.0.0.1:{proxy_port}")),
-            "inferenceGatewayApiKey": if read_gateway_key(&cfg).is_empty() { "" } else { "******" },
+            "inferenceGatewayBaseUrl": actual_base_url.unwrap_or(fallback_base_url),
+            "inferenceGatewayApiKey": if api_key_present { "******" } else { "" },
             "inferenceGatewayAuthScheme": "bearer",
-            "inferenceModels": "[\"sonnet\",\"haiku\",\"opus\"]",
+            "inferenceModels": desktop_inference_models_json(desktop_target.as_ref()),
         },
     }))
     .into_response()
@@ -4066,6 +4264,138 @@ mod tests {
         runtime.block_on(async {
             let Json(payload) = version().await;
             assert_eq!(payload, json!({"version": APP_VERSION}));
+        });
+    }
+
+    #[test]
+    fn desktop_inference_models_use_current_codex_catalog_slots() {
+        let mut cfg = config_with_secret();
+        cfg["providers"][0]["models"] = json!({
+            "default": "deepseek-v4-pro[1m]",
+            "gpt_5_5": "kimi-k2",
+            "gpt_5_4": "glm-4.6",
+        });
+        let provider = active_provider(&cfg).unwrap();
+        let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
+        let raw = desktop_inference_models_json(Some(&target));
+
+        assert!(!raw.contains("sonnet"));
+        assert!(!raw.contains("haiku"));
+        assert!(!raw.contains("opus"));
+
+        let models: Vec<Value> = serde_json::from_str(&raw).unwrap();
+        let names: Vec<&str> = models
+            .iter()
+            .filter_map(|item| item.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"gpt-5.5"));
+        assert!(names.contains(&"gpt-5.4"));
+        assert!(names.contains(&"gpt-5.4-mini"));
+        assert!(names.contains(&"deepseek-v4-pro"));
+        assert!(models
+            .iter()
+            .any(|item| item.get("supports1m").and_then(|v| v.as_bool()) == Some(true)));
+    }
+
+    #[test]
+    fn desktop_status_reports_current_models_and_health_issues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["providers"][0]["models"] = json!({
+                    "default": "deepseek-v4-pro[1m]",
+                    "gpt_5_5": "kimi-k2",
+                });
+                save_registry(&cfg).unwrap();
+
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                fs::write(
+                    codex_dir.join("config.toml"),
+                    "openai_base_url = \"http://127.0.0.1:18080\"\n",
+                )
+                .unwrap();
+                fs::write(
+                    codex_dir.join("auth.json"),
+                    "{\"OPENAI_API_KEY\":\"cas_existing\"}\n",
+                )
+                .unwrap();
+
+                let response = desktop_status().await.into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+
+                let models_raw = payload["keys"]["inferenceModels"].as_str().unwrap();
+                assert!(!models_raw.contains("sonnet"));
+                assert!(models_raw.contains("gpt-5.5"));
+                assert!(models_raw.contains("deepseek-v4-pro"));
+                assert_eq!(payload["configured"], json!(false));
+                assert_eq!(payload["health"]["needsApply"], json!(true));
+                assert_eq!(payload["health"]["oneMillionReady"], json!(false));
+
+                let codes: Vec<&str> = payload["health"]["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
+                    .collect();
+                assert!(codes.contains(&"not_managed_by_cas"));
+                assert!(codes.contains(&"one_million_not_written"));
+            });
+        });
+    }
+
+    #[test]
+    fn desktop_health_reports_base_url_mismatch() {
+        with_isolated_home(|home| {
+            let cfg = config_with_secret();
+            let provider = active_provider(&cfg).unwrap();
+            let mut target_cfg = cfg.clone();
+            let target =
+                desktop_config_target_for_provider(&mut target_cfg, &provider, Some(19090));
+
+            let codex_dir = home.join(".codex");
+            fs::create_dir_all(&codex_dir).unwrap();
+            fs::write(
+                codex_dir.join("config.toml"),
+                "openai_base_url = \"http://127.0.0.1:18080\"\n",
+            )
+            .unwrap();
+            fs::write(
+                codex_dir.join("auth.json"),
+                "{\"OPENAI_API_KEY\":\"cas_old\"}\n",
+            )
+            .unwrap();
+
+            let paths = CodexPaths::from_home_env().unwrap();
+            let actual_base_url = read_codex_toml_root_string(&paths, "openai_base_url");
+            let health = desktop_health(
+                Some(&paths),
+                false,
+                actual_base_url.as_deref(),
+                true,
+                Some(&target),
+            );
+
+            assert_eq!(health["needsApply"], json!(true));
+            assert_eq!(health["expectedBaseUrl"], json!("http://127.0.0.1:19090"));
+            assert_eq!(health["actualBaseUrl"], json!("http://127.0.0.1:18080"));
+            let codes: Vec<&str> = health["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
+                .collect();
+            assert!(codes.contains(&"not_managed_by_cas"));
+            assert!(codes.contains(&"gateway_base_url_mismatch"));
         });
     }
 
