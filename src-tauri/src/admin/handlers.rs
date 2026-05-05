@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, State},
@@ -17,7 +17,13 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use codex_app_transfer_codex_integration::{
     apply_provider, has_snapshot, restore_codex_state, ApplyConfig, CodexPaths,
 };
-use codex_app_transfer_registry::{builtin_presets, strip_internal_model_suffix, RawConfig};
+use codex_app_transfer_registry::{
+    builtin_presets, normalize_model_mappings, strip_internal_model_suffix, RawConfig, MODEL_ORDER,
+};
+use reqwest::{
+    header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE},
+    StatusCode as ReqwestStatusCode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -100,6 +106,290 @@ fn provider_display_name(provider: &Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("Provider")
         .to_owned()
+}
+
+fn normalize_provider_api_format(api_format: Option<&str>) -> &'static str {
+    match api_format
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "openai" | "openai_chat" | "chat_completions" => "openai_chat",
+        _ => "responses",
+    }
+}
+
+fn build_provider_test_url(base_url: &str, api_format: &str) -> String {
+    let clean = base_url.trim().trim_end_matches('/');
+    let lower = clean.to_ascii_lowercase();
+    if api_format == "openai_chat" {
+        if lower.ends_with("/chat/completions") {
+            return clean.to_owned();
+        }
+        return format!("{clean}/chat/completions");
+    }
+    if lower.ends_with("/v1/responses") {
+        return clean.to_owned();
+    }
+    if lower.ends_with("/v1") {
+        return format!("{clean}/responses");
+    }
+    format!("{clean}/v1/responses")
+}
+
+fn provider_api_key(provider: &Value) -> String {
+    provider
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn provider_test_model(provider: &Value) -> String {
+    let mappings = normalize_model_mappings(provider.get("models"));
+    let default = mappings.get("default").map(|s| s.trim()).unwrap_or("");
+    if !default.is_empty() {
+        return strip_internal_model_suffix(default);
+    }
+    for slot in MODEL_ORDER
+        .iter()
+        .copied()
+        .filter(|slot| *slot != "default")
+    {
+        let model = mappings.get(slot).map(|s| s.trim()).unwrap_or("");
+        if !model.is_empty() {
+            return strip_internal_model_suffix(model);
+        }
+    }
+    "claude-sonnet-4-6".to_owned()
+}
+
+fn provider_test_body(provider: &Value, api_format: &str) -> Value {
+    let model = provider_test_model(provider);
+    if api_format == "openai_chat" {
+        return json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 8,
+            "stream": false,
+        });
+    }
+    json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 8,
+    })
+}
+
+fn is_kimi_provider(provider: &Value) -> bool {
+    let probe = format!(
+        "{} {}",
+        provider.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        provider
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    probe.contains("kimi") || probe.contains("moonshot")
+}
+
+fn provider_test_headers(provider: &Value, include_content_type: bool) -> HeaderMap {
+    let api_key = provider_api_key(provider);
+    let mut headers = HeaderMap::new();
+    if include_content_type {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+
+    if !api_key.is_empty() {
+        let auth_scheme = provider
+            .get("authScheme")
+            .and_then(|v| v.as_str())
+            .unwrap_or("bearer")
+            .trim()
+            .to_ascii_lowercase();
+        match auth_scheme.as_str() {
+            "x-api-key" | "x_api_key" | "xapikey" | "apikey" => {
+                if let Ok(value) = HeaderValue::from_str(&api_key) {
+                    headers.insert(HeaderName::from_static("x-api-key"), value);
+                }
+            }
+            "none" | "no" => {}
+            _ => {
+                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {api_key}")) {
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                }
+            }
+        }
+    }
+
+    if let Some(extra) = provider.get("extraHeaders").and_then(|v| v.as_object()) {
+        for (key, value) in extra {
+            let Some(raw_value) = value.as_str() else {
+                continue;
+            };
+            let header_value = raw_value.replace("{apiKey}", &api_key);
+            let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(&header_value),
+            ) else {
+                continue;
+            };
+            headers.insert(name, value);
+        }
+    }
+
+    headers
+}
+
+fn provider_test_error_label(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "Timeout"
+    } else if error.is_connect() {
+        "ConnectError"
+    } else {
+        "RequestError"
+    }
+}
+
+async fn test_provider_connection(provider: &Value) -> Value {
+    let api_format = normalize_provider_api_format(
+        provider
+            .get("apiFormat")
+            .and_then(|v| v.as_str())
+            .or(Some("responses")),
+    );
+    let base_url = build_provider_test_url(
+        provider
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        api_format,
+    );
+    let parsed = reqwest::Url::parse(&base_url);
+    let valid_url = parsed
+        .as_ref()
+        .map(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        .unwrap_or(false);
+    if !valid_url {
+        return json!({
+            "success": true,
+            "ok": false,
+            "latencyMs": 0,
+            "message": "API 地址无效",
+        });
+    }
+
+    let started = Instant::now();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "success": true,
+                "ok": false,
+                "latencyMs": started.elapsed().as_millis(),
+                "message": format!("连接失败：{}", provider_test_error_label(&error)),
+            });
+        }
+    };
+
+    let probe_headers = provider_test_headers(provider, false);
+    let content_headers = provider_test_headers(provider, true);
+    let mut response = match client
+        .head(&base_url)
+        .headers(probe_headers.clone())
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "success": true,
+                "ok": false,
+                "latencyMs": started.elapsed().as_millis(),
+                "message": format!("连接失败：{}", provider_test_error_label(&error)),
+            });
+        }
+    };
+
+    if matches!(
+        response.status(),
+        ReqwestStatusCode::NOT_FOUND | ReqwestStatusCode::METHOD_NOT_ALLOWED
+    ) {
+        response = match client.get(&base_url).headers(probe_headers).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return json!({
+                    "success": true,
+                    "ok": false,
+                    "latencyMs": started.elapsed().as_millis(),
+                    "message": format!("连接失败：{}", provider_test_error_label(&error)),
+                });
+            }
+        };
+    }
+
+    if matches!(
+        response.status(),
+        ReqwestStatusCode::NOT_FOUND | ReqwestStatusCode::METHOD_NOT_ALLOWED
+    ) && !provider_api_key(provider).is_empty()
+    {
+        response = match client
+            .post(&base_url)
+            .headers(content_headers)
+            .json(&provider_test_body(provider, api_format))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return json!({
+                    "success": true,
+                    "ok": false,
+                    "latencyMs": started.elapsed().as_millis(),
+                    "message": format!("连接失败：{}", provider_test_error_label(&error)),
+                });
+            }
+        };
+    }
+
+    let latency_ms = started.elapsed().as_millis();
+    let status_code = response.status().as_u16();
+    let mut reachable = status_code < 500;
+    let message = if (200..300).contains(&status_code) {
+        format!("连接正常，{latency_ms} ms")
+    } else if matches!(status_code, 401 | 403) {
+        reachable = false;
+        if is_kimi_provider(provider) {
+            format!(
+                "Kimi 认证失败，HTTP {status_code}。Kimi Platform Key 请使用 https://api.moonshot.cn/v1；Kimi Code 会员 Key 请使用 https://api.kimi.com/coding，{latency_ms} ms"
+            )
+        } else {
+            format!(
+                "认证失败，HTTP {status_code}，请检查 API Key 和 API 地址是否匹配，{latency_ms} ms"
+            )
+        }
+    } else if matches!(status_code, 404 | 405) {
+        reachable = false;
+        format!("接口不可用，HTTP {status_code}，请检查 API 地址是否填到了兼容 Codex 的接口，{latency_ms} ms")
+    } else {
+        format!("地址可达，HTTP {status_code}，{latency_ms} ms")
+    };
+
+    json!({
+        "success": true,
+        "ok": reachable,
+        "latencyMs": latency_ms,
+        "statusCode": status_code,
+        "message": message,
+    })
 }
 
 fn read_proxy_port(cfg: &RawConfig) -> u16 {
@@ -909,10 +1199,29 @@ pub async fn submit_feedback(Json(_input): Json<Value>) -> impl IntoResponse {
     Json(json!({"success": true, "message": "feedback 暂存(v2.0.x 接 worker)"})).into_response()
 }
 
-// ── 测速 / 模型探测 / 兼容性 等 stub ─────────────────────────────────
+// ── 测速 / 模型探测 / 兼容性 ─────────────────────────────────
 
-pub async fn test_provider(Path(_id): Path<String>) -> impl IntoResponse {
-    Json(json!({"success": true, "message": "测试功能 v2.0.x 接通"})).into_response()
+pub async fn test_provider(Path(id): Path<String>) -> impl IntoResponse {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let provider = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .and_then(|providers| {
+            providers.iter().find(|provider| {
+                provider
+                    .as_object()
+                    .and_then(|o| o.get("id"))
+                    .and_then(|v| v.as_str())
+                    == Some(id.as_str())
+            })
+        });
+    let Some(provider) = provider else {
+        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+    };
+    Json(test_provider_connection(provider).await).into_response()
 }
 
 pub async fn query_provider_usage(Path(_id): Path<String>) -> impl IntoResponse {
@@ -923,8 +1232,8 @@ pub async fn provider_compatibility() -> impl IntoResponse {
     Json(json!({"providers": []})).into_response()
 }
 
-pub async fn test_provider_payload(Json(_payload): Json<Value>) -> impl IntoResponse {
-    Json(json!({"success": true})).into_response()
+pub async fn test_provider_payload(Json(payload): Json<Value>) -> impl IntoResponse {
+    Json(test_provider_connection(&payload).await).into_response()
 }
 
 pub async fn fetch_provider_models(Path(_id): Path<String>) -> impl IntoResponse {
@@ -946,3 +1255,44 @@ pub fn _state_typecheck(_s: Arc<AdminState>) -> bool {
 
 #[derive(Serialize)]
 pub struct _Marker;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_test_url_matches_legacy_chat_rules() {
+        assert_eq!(
+            build_provider_test_url("https://api.example.com/v1", "openai_chat"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            build_provider_test_url("https://api.example.com/v1/chat/completions", "openai_chat"),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn provider_test_url_matches_legacy_responses_rules() {
+        assert_eq!(
+            build_provider_test_url("https://api.example.com/v1", "responses"),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            build_provider_test_url("https://api.example.com", "responses"),
+            "https://api.example.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn provider_test_model_prefers_real_provider_mapping() {
+        let provider = json!({
+            "models": {
+                "default": "kimi-k2.6[1m]",
+                "gpt_5_5": "gpt-side-name"
+            }
+        });
+
+        assert_eq!(provider_test_model(&provider), "kimi-k2.6");
+    }
+}
