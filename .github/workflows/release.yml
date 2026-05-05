@@ -136,13 +136,15 @@ jobs:
       # in the keychain", PR #6 dispatch test 实测). 这里把 secret 接到带 _RAW
       # 后缀的 env 上, run 内显式判空再 export, 空时不暴露给 cargo tauri build.
       #
-      # macOS 无 Developer ID 路径(secret 未配): 拆 build 为两步,
-      # 中间显式 codesign --force --deep --sign - 做 ad-hoc bundle 签名 +
-      # codesign --verify 验证, 然后再打 dmg. 这样 dmg 里包含的 .app 是
-      # ad-hoc 签的, macOS Sequoia (15+) Gatekeeper 会显示"打开"选项,
-      # 而完全未签的 .app 会被无条件拒绝运行没有任何绕过 UI.
+      # macOS 无 Developer ID 路径(secret 未配): 显式 export
+      # APPLE_SIGNING_IDENTITY="-" 让 Tauri 在同一次 build 内用 ad-hoc identity
+      # 签 .app 和 dmg. 完全未签的 .app 在 macOS Sequoia 15+ 会被 Gatekeeper
+      # 无条件拒绝(没有"仍要打开"UI), ad-hoc 签的会显示打开选项.
       #
-      # macOS 有 Developer ID / Linux / Windows: 走原一次性 build 路径.
+      # 注意: 不能用"先 build app + 手动 codesign + 再 build dmg"的方案,
+      # 因为第二次 cargo tauri build --bundles dmg 时 Tauri 会重新 bundle .app,
+      # 把手动 codesign 结果覆盖 (PR #13 review 实测验证). 必须 Tauri 自己在
+      # 同一次 build 里完成签名链.
       - name: cargo tauri build
         working-directory: src-tauri
         shell: bash
@@ -155,19 +157,30 @@ jobs:
           [[ -n "$APPLE_API_ISSUER_RAW" ]] && export APPLE_API_ISSUER="$APPLE_API_ISSUER_RAW"
           [[ -n "$APPLE_API_KEY_RAW" ]] && export APPLE_API_KEY="$APPLE_API_KEY_RAW"
 
+          # macOS 无 Developer ID 时走 ad-hoc, 让 Tauri 内部 codesign --sign -.
           if [[ "${{ matrix.os }}" == "macos-14" ]] && [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
-            # macOS 无 Developer ID 路径
-            cargo tauri build --target "${{ matrix.target }}" --bundles app
-            APP="../target/${{ matrix.target }}/release/bundle/macos/Codex App Transfer.app"
-            echo "::group::Ad-hoc codesign .app (no Apple Developer ID)"
-            codesign --force --deep --sign - "$APP"
-            codesign --verify --deep --strict --verbose=2 "$APP"
-            echo "::endgroup::"
-            cargo tauri build --target "${{ matrix.target }}" --bundles dmg
-          else
-            # 其他平台 (Linux/Windows) 或 macOS 有 Developer ID
-            cargo tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+            export APPLE_SIGNING_IDENTITY="-"
+            echo "::notice::macOS no Developer ID secret, using ad-hoc identity (-)"
           fi
+
+          cargo tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+
+      # macOS build 后置验证: 确保 .app codesign 有效 + dmg 完整.
+      # 防 release 上传坏包 (上传前早 fail).
+      - name: Verify macOS .app codesign + dmg integrity
+        if: matrix.os == 'macos-14'
+        shell: bash
+        run: |
+          APP="target/${{ matrix.target }}/release/bundle/macos/Codex App Transfer.app"
+          DMG_DIR="target/${{ matrix.target }}/release/bundle/dmg"
+          echo "::group::codesign --verify .app"
+          codesign --verify --deep --strict --verbose=4 "$APP"
+          echo "::endgroup::"
+          echo "::group::hdiutil verify dmg"
+          for d in "$DMG_DIR"/*.dmg; do
+            [[ -f "$d" ]] && hdiutil verify "$d"
+          done
+          echo "::endgroup::"
 
       - name: Rename bundles to project naming
         shell: bash
