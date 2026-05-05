@@ -1,0 +1,232 @@
+name: release
+
+# 三平台 release pipeline (Phase 2):
+#   macos-14 (arm64 原生) + ubuntu-22.04 (AppImage glibc 兼容) + windows-latest
+# 触发: push tag v*  或  workflow_dispatch with version input
+# 产物经 cargo tauri build 直出, rename 为项目老命名兼容老下载链接,
+# 收口 job 跑 scripts/release_assets.py 出 sha256 + .sig + latest.json,
+# 最终落到一个 draft GitHub release 让用户手动 ready/publish。
+#
+# Secrets (按需):
+#   RELEASE_PRIVATE_KEY_PEM     必须 - release_assets.py RSA-3072 自签私钥
+#   APPLE_CERTIFICATE           可选 - Apple Developer ID .p12 (base64)
+#   APPLE_CERTIFICATE_PASSWORD  可选
+#   APPLE_SIGNING_IDENTITY      可选 - 形如 "Developer ID Application: Foo (TEAMID)"
+#   APPLE_API_KEY_BASE64        可选 - .p8 文件 base64, 公证用
+#   APPLE_API_KEY               可选 - Key ID
+#   APPLE_API_ISSUER            可选 - Issuer ID
+# 详见 docs/cleanup-plan.md §2.4
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '不带 v 前缀 (如 2.0.1, 2.0.1-rc1)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bundles: 'app,dmg'
+            plat: macOS-arm64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: 'deb,appimage'
+            plat: Linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: 'nsis,msi'
+            plat: Windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri Linux deps (with retry)
+        if: matrix.os == 'ubuntu-22.04'
+        timeout-minutes: 8
+        run: |
+          set -e
+          for i in 1 2 3; do
+            echo "::group::apt attempt $i"
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+                libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev \
+                librsvg2-dev patchelf build-essential file; then
+              echo "::endgroup::"; exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::apt attempt $i failed, sleeping 30s"
+            sleep 30
+          done
+          echo "::error::apt failed after 3 attempts"; exit 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: ${{ matrix.target }}
+
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y tauri-cli@^2
+
+      - name: Resolve VERSION
+        id: ver
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "Resolved VERSION=$V"
+
+      - name: Import macOS signing cert
+        if: matrix.os == 'macos-14' && env.CERT != ''
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+
+      - name: Write Apple notary API key
+        if: matrix.os == 'macos-14' && env.KEY_B64 != ''
+        shell: bash
+        env:
+          KEY_B64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          KEY_ID: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$KEY_B64" | base64 -d \
+            > ~/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8
+          echo "APPLE_API_KEY_PATH=$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8" >> $GITHUB_ENV
+
+      - name: cargo tauri build
+        working-directory: src-tauri
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Rename bundles to project naming
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          PLAT="${{ matrix.plat }}"
+          BDIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          mkdir -p staging
+
+          # tauri.conf.json bundle.fileName=codex-app-transfer 让产物名变
+          # codex-app-transfer_<V>_<arch>.<ext>, glob 即可命中, 不需处理空格。
+
+          case "$PLAT" in
+            macOS-arm64)
+              for f in "$BDIR"/dmg/*.dmg; do
+                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.dmg"
+              done
+              ;;
+            Linux-x86_64)
+              for f in "$BDIR"/deb/*.deb; do
+                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.deb"
+              done
+              for f in "$BDIR"/appimage/*.AppImage; do
+                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.AppImage"
+              done
+              ;;
+            Windows-x64)
+              for f in "$BDIR"/nsis/*-setup.exe; do
+                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}-Setup.exe"
+              done
+              for f in "$BDIR"/msi/*.msi; do
+                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.msi"
+              done
+              ;;
+          esac
+
+          echo "Staged artifacts for $PLAT:"
+          ls -la staging/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.plat }}
+          path: staging/*
+          if-no-files-found: error
+
+  release-bundle:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-incoming
+          merge-multiple: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - run: pip install cryptography
+
+      - name: Resolve VERSION
+        id: ver
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> $GITHUB_OUTPUT
+
+      - name: Write release signing key
+        env:
+          KEY: ${{ secrets.RELEASE_PRIVATE_KEY_PEM }}
+        run: |
+          if [[ -z "$KEY" ]]; then
+            echo "::error::RELEASE_PRIVATE_KEY_PEM secret 未配置, 无法签 latest.json"
+            exit 1
+          fi
+          mkdir -p .release-signing
+          printf '%s\n' "$KEY" > .release-signing/release-private-key.pem
+          chmod 600 .release-signing/release-private-key.pem
+
+      - name: Run release_assets.py
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          ls -la dist-incoming/
+          # Phase 2 Commit C 会把 release_assets.py 的 collect_* 改为
+          # 接受 dist-incoming/ 下已 rename 的产物。本 commit (B) 此 step
+          # 暂时会因路径不匹配报 "no platform artifacts found" 退 1 —
+          # 完整 release pipeline 在 Commit C 之后整体生效。
+          python scripts/release_assets.py \
+            --version "${{ steps.ver.outputs.version }}" \
+            --include macos linux windows
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: 'release/*'
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          draft: true
