@@ -71,20 +71,11 @@ jobs:
       - name: cargo check --workspace
         run: cargo check --workspace --all-targets
 
-      # registry 的契约测试需要 Python 生成的 fixture;CI 重生一次并 diff,
-      # 防止有人改了 backend/config.py 却忘了刷新 fixture(详见
-      # crates/registry/tests/python_compat.rs)
-      - name: Setup Python (for registry fixture regeneration)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Regenerate registry fixtures and verify clean
-        run: |
-          python scripts/gen_registry_fixtures.py
-          if ! git diff --exit-code -- tests/replay/fixtures/registry/; then
-            echo "::error::Python 端 backend/config.py 改动未刷新 fixtures。请本地跑 \`python scripts/gen_registry_fixtures.py\` 并提交结果。"
-            exit 1
-          fi
+      # 旧的"Python 重生 registry fixture → diff"步骤已删:
+      # backend/ 在 Phase 1 被移除后,gen_registry_fixtures.py 失去数据源。
+      # crates/registry/tests/python_compat.rs 仍读已 commit 的 fixture 做
+      # round-trip 校验。Phase 3 会用 xtask gen-fixtures 重建反向校验。
+      # 详见 docs/cleanup-plan.md。
 
       - name: cargo test --workspace
         run: cargo test --workspace --no-fail-fast
