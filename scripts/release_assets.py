@@ -101,6 +101,17 @@ def get_or_create_key(key_dir: Path, release_dir: Path) -> rsa.RSAPrivateKey:
         )
         print(f"Created local release signing key: {private_path}")
 
+    # CI 场景: secret 只配 RELEASE_PRIVATE_KEY_PEM, 公钥文件不存在时
+    # 从私钥派生 SubjectPublicKeyInfo PEM 写出, 与本地首次生成的公钥
+    # byte-for-byte 一致 (PKCS#8 + SPKI 是 RFC 标准, 派生确定性).
+    if not public_path.exists():
+        public_path.write_bytes(
+            private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+
     release_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(public_path, release_dir / PUBLIC_KEY_BASENAME)
     return private_key
