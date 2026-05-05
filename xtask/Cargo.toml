@@ -14,7 +14,7 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 # preserve_order 保字节级 round-trip; 与 crates/registry 同
@@ -24,10 +24,11 @@ indexmap = { version = "2", features = ["serde"] }
 # gen-fixtures 直接复用 registry crate 的 schema + 内置预设数据
 codex-app-transfer-registry = { path = "../crates/registry" }
 
-# release-bundle 子命令(Commit D 启用):
-# rsa = { version = "0.9", features = ["sha2"] }
-# sha2 = "0.10"
-# base64 = "0.22"
-# chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-# walkdir = "2"
-# regex = "1"
+# release-bundle 子命令依赖 (Phase 3 Commit D):
+# rsa "pem" feature 启用 PKCS#8 PEM 编解码; sha2 "oid" feature 让 Pkcs1v15Sign::new::<Sha256> 编译过.
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+sha2 = { version = "0.10", features = ["oid"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+regex = "1"
+rand = "0.8"
