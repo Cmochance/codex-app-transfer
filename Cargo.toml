@@ -8,10 +8,10 @@ members = [
     "crates/proxy",
     "crates/adapters",
     "crates/codex_integration",
+    "xtask",
     # 后续阶段陆续启用:
     # "crates/session_cache",
     # "crates/update",
-    # "xtask",
 ]
 
 [workspace.package]
