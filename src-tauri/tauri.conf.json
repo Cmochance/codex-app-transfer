@@ -27,7 +27,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "fileName": "codex-app-transfer",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -46,10 +45,6 @@
           "libayatana-appindicator3-1"
         ]
       }
-    },
-    "windows": {
-      "wix": {},
-      "nsis": {}
     }
   }
 }

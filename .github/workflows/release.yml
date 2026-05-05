@@ -134,8 +134,10 @@ jobs:
           BDIR="src-tauri/target/${{ matrix.target }}/release/bundle"
           mkdir -p staging
 
-          # tauri.conf.json bundle.fileName=codex-app-transfer 让产物名变
-          # codex-app-transfer_<V>_<arch>.<ext>, glob 即可命中, 不需处理空格。
+          # Tauri 2 没有 bundle.fileName 字段, 默认产物名为
+          # "Codex App Transfer_<V>_<arch>.<ext>" (productName 带空格透传).
+          # glob 已用引号 ("$BDIR"/dmg/*.dmg) 能命中带空格文件名;
+          # cp 时也用引号 cp "$f" "staging/...", 安全。
 
           case "$PLAT" in
             macOS-arm64)
