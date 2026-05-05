@@ -11,7 +11,9 @@
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use codex_app_transfer_registry::model_alias::normalize_model_mappings;
+use codex_app_transfer_registry::model_alias::{
+    normalize_model_mappings, openai_model_slot, strip_internal_model_suffix,
+};
 use codex_app_transfer_registry::Provider;
 use thiserror::Error;
 
@@ -126,22 +128,15 @@ impl StaticResolver {
     fn map_model_for_provider(&self, provider: &Provider, requested_model: &str) -> Option<String> {
         let mappings_value = serde_json::to_value(&provider.models).ok();
         let mappings = normalize_model_mappings(mappings_value.as_ref());
-        let slot = match requested_model {
-            "gpt-5.5" => Some("gpt_5_5"),
-            "gpt-5.4" => Some("gpt_5_4"),
-            "gpt-5.4-mini" => Some("gpt_5_4_mini"),
-            "gpt-5.3-codex" => Some("gpt_5_3_codex"),
-            "gpt-5.2" => Some("gpt_5_2"),
-            _ => None,
-        };
+        let slot = openai_model_slot(requested_model);
         if let Some(slot) = slot {
             let mapped = mappings.get(slot).map(|s| s.trim()).unwrap_or("");
             if !mapped.is_empty() {
-                return Some(mapped.to_owned());
+                return Some(strip_internal_model_suffix(mapped));
             }
             let default = mappings.get("default").map(|s| s.trim()).unwrap_or("");
             if !default.is_empty() {
-                return Some(default.to_owned());
+                return Some(strip_internal_model_suffix(default));
             }
         }
         None
@@ -209,7 +204,7 @@ fn decide_provider<'a>(
         if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
             if let Some((slug, real)) = model.split_once('/') {
                 if let Some(p) = res.find_by_slug(slug) {
-                    return Some((p, Some(real.to_owned())));
+                    return Some((p, Some(strip_internal_model_suffix(real))));
                 }
             }
         }
@@ -333,6 +328,20 @@ mod tests {
     }
 
     #[test]
+    fn slash_route_strips_internal_suffix() {
+        let r = StaticResolver::new(
+            None,
+            vec![provider("deepseek", "https://up-2", "sk-2")],
+            Some("deepseek".into()),
+        );
+        let p = parts_with(&[]);
+        let body = br#"{"model":"deepseek/deepseek-v4-pro[1m]"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "deepseek");
+        assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
     fn falls_back_to_default_when_no_slash_in_model() {
         let r = StaticResolver::new(
             None,
@@ -354,6 +363,19 @@ mod tests {
         deepseek
             .models
             .insert("default".into(), "deepseek-v4-pro".into());
+        let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
+        let p = parts_with(&[]);
+        let res = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();
+        assert_eq!(res.provider_id, "deepseek");
+        assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn openai_slot_model_maps_to_provider_specific_slot() {
+        let mut deepseek = provider("deepseek", "https://up-2", "sk-2");
+        deepseek
+            .models
+            .insert("gpt_5_5".into(), "deepseek-v4-pro[1m]".into());
         let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
         let p = parts_with(&[]);
         let res = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();

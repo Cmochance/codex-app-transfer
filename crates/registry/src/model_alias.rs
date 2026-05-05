@@ -48,6 +48,31 @@ pub static MODEL_ORDER: Lazy<Vec<&'static str>> =
     Lazy::new(|| MODEL_SLOTS.iter().map(|s| s.key).collect());
 
 pub const DEFAULT_MODEL_KEY: &str = "default";
+const INTERNAL_ONE_M_SUFFIX: &str = "[1m]";
+
+pub fn openai_model_slot(openai_id: &str) -> Option<&'static str> {
+    MODEL_SLOTS
+        .iter()
+        .find(|slot| slot.openai_id == Some(openai_id))
+        .map(|slot| slot.key)
+}
+
+pub fn has_internal_one_m_suffix(model: &str) -> bool {
+    model
+        .trim()
+        .to_ascii_lowercase()
+        .ends_with(INTERNAL_ONE_M_SUFFIX)
+}
+
+pub fn strip_internal_model_suffix(model: &str) -> String {
+    let trimmed = model.trim();
+    if !has_internal_one_m_suffix(trimmed) {
+        return trimmed.to_owned();
+    }
+    trimmed[..trimmed.len() - INTERNAL_ONE_M_SUFFIX.len()]
+        .trim_end()
+        .to_owned()
+}
 
 pub fn empty_model_mappings() -> ModelMappings {
     let mut map = IndexMap::with_capacity(MODEL_SLOTS.len());
@@ -123,6 +148,33 @@ mod tests {
         let v = json!({"default": "  glm-5.1  "});
         let m = normalize_model_mappings(Some(&v));
         assert_eq!(m["default"], "glm-5.1", "应 trim 空白");
+    }
+
+    #[test]
+    fn openai_model_slot_maps_current_codex_slugs() {
+        assert_eq!(openai_model_slot("gpt-5.5"), Some("gpt_5_5"));
+        assert_eq!(openai_model_slot("gpt-5.4-mini"), Some("gpt_5_4_mini"));
+        assert_eq!(openai_model_slot("unknown"), None);
+    }
+
+    #[test]
+    fn strip_internal_model_suffix_only_strips_one_m_marker() {
+        assert_eq!(
+            strip_internal_model_suffix("deepseek-v4-pro[1m]"),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            strip_internal_model_suffix("deepseek-v4-pro [1M]"),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            strip_internal_model_suffix("deepseek-v4-pro[beta]"),
+            "deepseek-v4-pro[beta]"
+        );
+        assert_eq!(
+            strip_internal_model_suffix("deepseek-v4-pro[1m-preview]"),
+            "deepseek-v4-pro[1m-preview]"
+        );
     }
 
     #[test]

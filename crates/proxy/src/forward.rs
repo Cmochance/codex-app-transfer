@@ -19,6 +19,7 @@ use axum::{
 };
 use bytes::Bytes;
 use codex_app_transfer_adapters::{AdapterError, AdapterRegistry};
+use codex_app_transfer_registry::strip_internal_model_suffix;
 use futures_util::TryStreamExt;
 use thiserror::Error;
 
@@ -229,7 +230,7 @@ fn strip_model_suffix_in_place(body: &mut Bytes) {
     let Some(model) = obj.get("model").and_then(|v| v.as_str()) else {
         return;
     };
-    let stripped = strip_model_suffix(model);
+    let stripped = strip_internal_model_suffix(model);
     if stripped == model {
         return;
     }
@@ -237,17 +238,6 @@ fn strip_model_suffix_in_place(body: &mut Bytes) {
     if let Ok(next) = serde_json::to_vec(&v) {
         *body = Bytes::from(next);
     }
-}
-
-fn strip_model_suffix(model: &str) -> String {
-    let trimmed = model.trim();
-    let Some(end) = trimmed.strip_suffix(']') else {
-        return trimmed.to_owned();
-    };
-    let Some(open) = end.rfind('[') else {
-        return trimmed.to_owned();
-    };
-    end[..open].trim_end().to_owned()
 }
 
 fn filter_hop_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
@@ -314,6 +304,15 @@ mod tests {
         strip_model_suffix_in_place(&mut body);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["model"], "deepseek-v4-pro");
+        assert_eq!(v["stream"], true);
+    }
+
+    #[test]
+    fn keeps_non_internal_model_suffixes() {
+        let mut body = Bytes::from_static(br#"{"model":"deepseek-v4-pro[beta]","stream":true}"#);
+        strip_model_suffix_in_place(&mut body);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["model"], "deepseek-v4-pro[beta]");
         assert_eq!(v["stream"], true);
     }
 }

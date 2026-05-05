@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{read_auth, write_auth};
 use crate::model_catalog::{
-    catalog_models_for_provider, upsert_catalog_models, CODEX_MODEL_CATALOG_KEY,
+    catalog_models_for_provider, clear_catalog_models, upsert_catalog_models,
+    CODEX_MODEL_CATALOG_KEY,
 };
 use crate::paths::CodexPaths;
 use crate::snapshot::{
@@ -39,6 +40,12 @@ pub struct ApplyConfig<'a> {
     /// 当前 active provider 的默认真实模型 ID,用于生成 Codex model catalog。
     #[serde(default)]
     pub default_model: &'a str,
+    /// 当前 active provider 的模型槽位映射,用于让 catalog 与 proxy 路由一致。
+    #[serde(skip)]
+    pub model_mappings: Option<&'a serde_json::Value>,
+    /// 当前 active provider 的模型能力声明,用于按目标模型声明窗口。
+    #[serde(skip)]
+    pub model_capabilities: Option<&'a serde_json::Value>,
     /// 应用版本(写入快照 manifest,便于诊断)。
     pub app_version: &'a str,
 }
@@ -76,11 +83,18 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
             CODEX_MODEL_CATALOG_KEY,
             Some(&catalog_literal),
         )?;
-        let models = catalog_models_for_provider(cfg.provider_name, cfg.default_model, true);
+        let models = catalog_models_for_provider(
+            cfg.provider_name,
+            cfg.default_model,
+            true,
+            cfg.model_mappings,
+            cfg.model_capabilities,
+        );
         upsert_catalog_models(&paths.model_catalog_json, &models)?;
     } else {
         sync_root_value(&paths.config_toml, "model_context_window", None)?;
         sync_root_value(&paths.config_toml, CODEX_MODEL_CATALOG_KEY, None)?;
+        clear_catalog_models(&paths.model_catalog_json)?;
     }
 
     // 4. auth.json: auth_mode + OPENAI_API_KEY
@@ -117,6 +131,7 @@ pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
         for key in MANAGED_TOML_KEYS {
             sync_root_value(&paths.config_toml, key, None)?;
         }
+        clear_catalog_models(&paths.model_catalog_json)?;
         if paths.auth_json.exists() {
             let mut auth = read_auth(&paths.auth_json)?;
             if let Some(obj) = auth.as_object_mut() {
@@ -154,6 +169,7 @@ pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
     write_auth(&paths.auth_json, &current)?;
 
     drop_snapshot(paths)?;
+    clear_catalog_models(&paths.model_catalog_json)?;
     Ok(true)
 }
 
@@ -176,6 +192,10 @@ mod tests {
         read_auth(&paths.auth_json).unwrap()
     }
 
+    fn read_app_config(paths: &CodexPaths) -> serde_json::Value {
+        codex_app_transfer_registry::load_raw_config(&paths.model_catalog_json).unwrap()
+    }
+
     #[test]
     fn apply_on_empty_writes_both_files_and_takes_snapshot() {
         let (_t, paths) = setup();
@@ -187,6 +207,8 @@ mod tests {
                 supports_1m: false,
                 provider_name: "Mock",
                 default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v2.0.0-stage2.5",
             },
         )
@@ -215,6 +237,8 @@ mod tests {
                 supports_1m: true,
                 provider_name: "DeepSeek",
                 default_model: "deepseek-v4-pro[1m]",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )
@@ -233,6 +257,90 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m["slug"] == "deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn apply_with_supports_1m_uses_provider_slot_mapping() {
+        let (_t, paths) = setup();
+        let mappings = json!({
+            "default": "deepseek-v4-pro",
+            "gpt_5_5": "short-context-model",
+            "gpt_5_4": "custom-long-model"
+        });
+        let capabilities = json!({
+            "short-context-model": {"supports1m": false},
+            "custom-long-model": {"supports1m": true}
+        });
+
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://x",
+                gateway_api_key: "k",
+                supports_1m: true,
+                provider_name: "Mixed",
+                default_model: "deepseek-v4-pro",
+                model_mappings: Some(&mappings),
+                model_capabilities: Some(&capabilities),
+                app_version: "v",
+            },
+        )
+        .unwrap();
+
+        let catalog = read_app_config(&paths);
+        let models = catalog["models"].as_array().unwrap();
+        let gpt55 = models.iter().find(|m| m["slug"] == "gpt-5.5").unwrap();
+        let gpt54 = models.iter().find(|m| m["slug"] == "gpt-5.4").unwrap();
+        let mini = models.iter().find(|m| m["slug"] == "gpt-5.4-mini").unwrap();
+        assert_eq!(gpt55["display_name"], "Mixed / short-context-model");
+        assert_eq!(gpt55["context_window"], 258_400);
+        assert_eq!(gpt54["display_name"], "Mixed / custom-long-model");
+        assert_eq!(gpt54["context_window"], 1_000_000);
+        assert_eq!(
+            mini["display_name"], "Mixed / deepseek-v4-pro",
+            "empty slots should document their default fallback target"
+        );
+        assert_eq!(mini["context_window"], 1_000_000);
+    }
+
+    #[test]
+    fn apply_without_supports_1m_removes_catalog_key_and_top_level_models() {
+        let (_t, paths) = setup();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://x",
+                gateway_api_key: "k",
+                supports_1m: true,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        assert!(read_app_config(&paths).get("models").is_some());
+
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://x",
+                gateway_api_key: "k",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+
+        let toml = read_toml(&paths);
+        assert!(!toml.contains("model_context_window"));
+        assert!(!toml.contains(CODEX_MODEL_CATALOG_KEY));
+        assert!(read_app_config(&paths).get("models").is_none());
     }
 
     #[test]
@@ -257,6 +365,8 @@ mod tests {
                 supports_1m: false,
                 provider_name: "Mock",
                 default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )
@@ -296,6 +406,8 @@ mod tests {
                 supports_1m: true,
                 provider_name: "DeepSeek",
                 default_model: "deepseek-v4-pro",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )
@@ -324,6 +436,44 @@ mod tests {
         );
 
         assert!(!has_snapshot(&paths), "restore 完成后应清掉快照");
+        assert!(
+            read_app_config(&paths).get("models").is_none(),
+            "restore 应清理本应用写入的顶层 catalog models"
+        );
+    }
+
+    #[test]
+    fn restore_with_snapshot_restores_user_model_catalog_json_key() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(
+            &paths.config_toml,
+            "model_catalog_json = \"/tmp/user-catalog.json\"\n",
+        )
+        .unwrap();
+
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_proxy",
+                supports_1m: true,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        assert!(read_toml(&paths).contains(".codex-app-transfer"));
+        assert!(read_app_config(&paths).get("models").is_some());
+
+        restore_codex_state(&paths).unwrap();
+
+        let toml = read_toml(&paths);
+        assert!(toml.contains("model_catalog_json = \"/tmp/user-catalog.json\""));
+        assert!(read_app_config(&paths).get("models").is_none());
     }
 
     #[test]
@@ -332,7 +482,16 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(
             &paths.config_toml,
-            "openai_base_url = \"http://leftover\"\nmodel_context_window = 1000000\nfoo = 1\n",
+            "openai_base_url = \"http://leftover\"\nmodel_context_window = 1000000\nmodel_catalog_json = \"leftover.json\"\nfoo = 1\n",
+        )
+        .unwrap();
+        codex_app_transfer_registry::save_raw_config(
+            &paths.model_catalog_json,
+            &json!({
+                "version": "1.0.4",
+                "models": [{"slug": "gpt-5.5"}],
+                "settings": {"theme": "default"}
+            }),
         )
         .unwrap();
         std::fs::write(
@@ -345,7 +504,9 @@ mod tests {
         let toml = read_toml(&paths);
         assert!(!toml.contains("openai_base_url"));
         assert!(!toml.contains("model_context_window"));
+        assert!(!toml.contains(CODEX_MODEL_CATALOG_KEY));
         assert!(toml.contains("foo = 1"));
+        assert!(read_app_config(&paths).get("models").is_none());
         let auth = read_auth_value(&paths);
         assert!(auth.get("OPENAI_API_KEY").is_none());
         assert!(auth.get("auth_mode").is_none());
@@ -366,6 +527,8 @@ mod tests {
                 supports_1m: false,
                 provider_name: "Mock",
                 default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )
@@ -380,6 +543,8 @@ mod tests {
                 supports_1m: true,
                 provider_name: "DeepSeek",
                 default_model: "deepseek-v4-pro",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )
@@ -408,6 +573,8 @@ mod tests {
                 supports_1m: false,
                 provider_name: "Mock",
                 default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )
@@ -428,6 +595,8 @@ mod tests {
                 supports_1m: false,
                 provider_name: "Mock",
                 default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )
@@ -455,6 +624,8 @@ mod tests {
                 supports_1m: false,
                 provider_name: "Mock",
                 default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )
@@ -488,6 +659,8 @@ mod tests {
                 supports_1m: false,
                 provider_name: "Mock",
                 default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
                 app_version: "v",
             },
         )

@@ -19,7 +19,10 @@ pub mod presets;
 pub mod raw_io;
 pub mod schema;
 
-pub use model_alias::{empty_model_mappings, normalize_model_mappings, MODEL_ORDER, MODEL_SLOTS};
+pub use model_alias::{
+    empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
+    strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
+};
 pub use paths::{config_dir, config_file, library_dir, resolve_home};
 pub use presets::builtin_presets;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};
