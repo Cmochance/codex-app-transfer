@@ -16,7 +16,7 @@ use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Utc;
 use clap::Args as ClapArgs;
@@ -102,6 +102,9 @@ struct AssetEntry {
 }
 
 pub fn run(args: Args) -> Result<()> {
+    let patterns = platform_patterns();
+    let include = validate_include(&args.include, &patterns)?;
+
     let root = repo_root()?;
     let release_dir = root.join(&args.output_dir);
     let incoming_dir = root.join(&args.incoming_dir);
@@ -110,10 +113,6 @@ pub fn run(args: Args) -> Result<()> {
     fs::create_dir_all(&release_dir)
         .with_context(|| format!("创建输出目录: {}", release_dir.display()))?;
     let private_key = get_or_create_key(&key_dir, &release_dir)?;
-
-    let patterns = platform_patterns();
-    let include: std::collections::HashSet<&str> =
-        args.include.iter().map(|s| s.as_str()).collect();
 
     let mut platforms: IndexMap<String, Vec<AssetEntry>> = IndexMap::new();
 
@@ -202,6 +201,22 @@ pub fn run(args: Args) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn validate_include<'a>(
+    include: &'a [String],
+    patterns: &IndexMap<&'static str, Vec<(Regex, &'static str)>>,
+) -> Result<std::collections::HashSet<&'a str>> {
+    let mut selected = std::collections::HashSet::new();
+    for platform in include {
+        let platform = platform.as_str();
+        if !patterns.contains_key(platform) {
+            let valid = patterns.keys().copied().collect::<Vec<_>>().join(", ");
+            bail!("unsupported --include platform '{platform}'. Valid values: {valid}");
+        }
+        selected.insert(platform);
+    }
+    Ok(selected)
 }
 
 fn get_or_create_key(key_dir: &Path, release_dir: &Path) -> Result<RsaPrivateKey> {
@@ -477,6 +492,19 @@ mod tests {
         assert!(pub1
             .verify(Pkcs1v15Sign::new::<Sha256>(), &tampered, &sig)
             .is_err());
+    }
+
+    #[test]
+    fn validate_include_rejects_unknown_platform() {
+        let patterns = platform_patterns();
+        let include = vec!["macos".to_string(), "freebsd".to_string()];
+        let err = validate_include(&include, &patterns)
+            .expect_err("unknown platform must be rejected")
+            .to_string();
+        assert!(err.contains("unsupported --include platform 'freebsd'"));
+        assert!(err.contains("macos"));
+        assert!(err.contains("linux"));
+        assert!(err.contains("windows"));
     }
 
     #[test]
