@@ -11,7 +11,7 @@ files untouched. latest.json is regenerated from whatever is currently in
 release/ (i.e. it always reflects the latest signed artifacts on disk).
 
 Signature scheme: RSA-3072 PKCS#1 v1.5 + SHA-256, key in PEM.
-Verifier: scripts/Test-ReleaseSignature.ps1.
+Verifier: use the Python cryptography snippet in README.md.
 """
 from __future__ import annotations
 
