@@ -52,13 +52,19 @@ impl ProxyManager {
         Self::default()
     }
 
-    /// 启动代理监听 `127.0.0.1:<port>`。已 running 时报错。
+    /// 启动代理监听 `127.0.0.1:<port>`。已 running 时沿用旧版语义返回当前状态。
     pub async fn start(&self, port: u16) -> Result<ProxyStatus, String> {
         // 1. 预检查(短锁)
         {
             let guard = self.handle.lock().unwrap();
-            if guard.is_some() {
-                return Err("代理已在运行,请先停止".to_owned());
+            if let Some(h) = guard.as_ref() {
+                return Ok(ProxyStatus {
+                    running: true,
+                    addr: Some(h.addr.to_string()),
+                    gateway_auth: h.gateway_auth,
+                    provider_count: h.provider_count,
+                    active_provider: h.active_provider.clone(),
+                });
             }
         }
 

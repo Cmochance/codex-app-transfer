@@ -85,6 +85,7 @@ pub fn build_app_router(state: AdminState) -> Router {
             get(handlers::desktop_snapshot_status),
         )
         // Proxy lifecycle
+        .route("/api/version", get(handlers::version))
         .route("/api/proxy/start", post(handlers::start_proxy))
         .route("/api/proxy/stop", post(handlers::stop_proxy))
         .route("/api/proxy/status", get(handlers::proxy_status))

@@ -5,15 +5,17 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -23,12 +25,13 @@ use base64::{
     Engine,
 };
 use codex_app_transfer_codex_integration::{
-    apply_provider, has_snapshot, restore_codex_state, ApplyConfig, CodexPaths,
+    apply_provider, catalog_models_for_provider, has_snapshot, read_auth, restore_codex_state,
+    ApplyConfig, CodexPaths,
 };
 use codex_app_transfer_proxy::{proxy_log_dir, proxy_telemetry};
 use codex_app_transfer_registry::{
     builtin_presets, config_dir, normalize_model_mappings, strip_internal_model_suffix, RawConfig,
-    MODEL_ORDER,
+    DEFAULT_UPDATE_URL, MODEL_ORDER,
 };
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE},
@@ -36,12 +39,16 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::proxy_runner::ProxyManager;
 
 use super::registry_io::{load as load_registry, public_provider, save as save_registry};
 use super::state::AdminState;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FEEDBACK_WORKER_URL: &str = "https://codex-app-transfer-feedback.alysechencn.workers.dev";
+const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
 struct FeedbackThrottleState {
     last_success: Option<Instant>,
@@ -276,6 +283,454 @@ fn feedback_attachments(input: &Value, timestamp_secs: u64) -> Vec<FeedbackAttac
     }
 
     parts
+}
+
+fn current_update_platform() -> String {
+    current_update_platform_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn current_update_platform_for(raw_platform: &str, raw_machine: &str) -> String {
+    let machine = raw_machine.to_ascii_lowercase();
+    let arch = match machine.as_str() {
+        "amd64" | "x86_64" => "x64".to_owned(),
+        "arm64" | "aarch64" => "arm64".to_owned(),
+        "" => "unknown".to_owned(),
+        value => value.to_owned(),
+    };
+    let platform = raw_platform.to_ascii_lowercase();
+    if platform.starts_with("win") || platform == "windows" {
+        return format!("windows-{arch}");
+    }
+    if platform == "darwin" || platform == "macos" {
+        return format!("macos-{arch}");
+    }
+    if platform.starts_with("linux") {
+        return format!("linux-{arch}");
+    }
+    format!("{platform}-{arch}")
+}
+
+fn version_parts(version: &str) -> Vec<u64> {
+    let text = version.trim().trim_start_matches(['v', 'V']);
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            parts.push(current.parse::<u64>().unwrap_or(0));
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current.parse::<u64>().unwrap_or(0));
+    }
+    if parts.is_empty() {
+        parts.push(0);
+    }
+    parts
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let mut latest_parts = version_parts(latest);
+    let mut current_parts = version_parts(current);
+    let width = latest_parts.len().max(current_parts.len());
+    latest_parts.resize(width, 0);
+    current_parts.resize(width, 0);
+    latest_parts > current_parts
+}
+
+fn validate_update_url(url: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|_| "更新地址必须是 http 或 https URL".to_owned())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("更新地址必须是 http 或 https URL".to_owned());
+    }
+    Ok(parsed.to_string())
+}
+
+fn safe_asset_name(name: &str) -> Result<String, String> {
+    let filename = FsPath::new(name.trim())
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    if filename.is_empty() {
+        Err("更新资产缺少文件名".to_owned())
+    } else {
+        Ok(filename)
+    }
+}
+
+fn asset_filename_from_url(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .map(|name| name.to_owned())
+        })
+        .unwrap_or_default()
+}
+
+fn file_sha256(path: &FsPath) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|e| format!("读取安装包失败: {e}"))?;
+    let mut digest = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("读取安装包失败: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn pick_platform_data<'a>(latest_json: &'a Value, platform: &str) -> Result<&'a Value, String> {
+    latest_json
+        .get("platforms")
+        .and_then(|v| v.as_object())
+        .and_then(|platforms| platforms.get(platform))
+        .filter(|v| v.as_object().is_some())
+        .ok_or_else(|| format!("latest.json 中没有 {platform} 平台资产"))
+}
+
+fn allowed_install_extensions(platform: &str) -> &'static [&'static str] {
+    if platform.starts_with("windows-") {
+        &[".exe"]
+    } else if platform.starts_with("macos-") {
+        &[".pkg", ".dmg"]
+    } else {
+        &[]
+    }
+}
+
+fn pick_windows_installer(assets: &[Value]) -> Result<Value, String> {
+    assets
+        .iter()
+        .find(|asset| {
+            asset
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .ends_with("windows-setup.exe")
+        })
+        .cloned()
+        .ok_or_else(|| "当前版本没有 Windows 安装包资产".to_owned())
+}
+
+fn pick_macos_installer(assets: &[Value]) -> Result<Value, String> {
+    if let Some(pkg) = assets.iter().find(|asset| {
+        asset
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .ends_with(".pkg")
+    }) {
+        return Ok(pkg.clone());
+    }
+    assets
+        .iter()
+        .find(|asset| {
+            asset
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .ends_with(".dmg")
+        })
+        .cloned()
+        .ok_or_else(|| "当前版本没有 macOS 安装资产".to_owned())
+}
+
+fn pick_platform_installer(assets: &[Value], platform: &str) -> Result<Value, String> {
+    if platform.starts_with("windows-") {
+        return pick_windows_installer(assets);
+    }
+    if platform.starts_with("macos-") {
+        return pick_macos_installer(assets);
+    }
+    Err(format!("当前平台暂不支持应用内安装: {platform}"))
+}
+
+fn install_command_parts(path: &str, platform: &str) -> Result<Vec<String>, String> {
+    if platform.starts_with("windows-") {
+        return Ok(vec![path.to_owned()]);
+    }
+    if platform.starts_with("macos-") {
+        return Ok(vec!["open".to_owned(), path.to_owned()]);
+    }
+    Err(format!("当前平台暂不支持应用内安装: {platform}"))
+}
+
+#[cfg(test)]
+fn install_after_quit_command_parts(
+    path: &str,
+    platform: &str,
+    wait_for_pid: u32,
+) -> Result<Vec<String>, String> {
+    if wait_for_pid == 0 {
+        return Err("等待退出的进程 ID 无效".to_owned());
+    }
+    if platform.starts_with("macos-") {
+        return Ok(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "pid=\"$1\"; installer=\"$2\"; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.2; done; exec open \"$installer\"".to_owned(),
+            "cas-update-installer".to_owned(),
+            wait_for_pid.to_string(),
+            path.to_owned(),
+        ]);
+    }
+    install_command_parts(path, platform)
+}
+
+fn launch_update_installer(installer_path: &str, platform: &str) -> Result<bool, String> {
+    let command = install_command_parts(installer_path, platform)?;
+    let Some((program, args)) = command.split_first() else {
+        return Err("安装命令为空".to_owned());
+    };
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| false)
+        .map_err(|e| format!("启动安装器失败: {e}"))
+}
+
+fn configured_update_url(input: Option<&str>) -> String {
+    if let Some(url) = input.map(str::trim).filter(|url| !url.is_empty()) {
+        return url.to_owned();
+    }
+    load_registry()
+        .ok()
+        .and_then(|cfg| {
+            cfg.get("settings")
+                .and_then(|settings| settings.get("updateUrl"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| DEFAULT_UPDATE_URL.to_owned())
+}
+
+async fn fetch_latest_json(client: &reqwest::Client, url: &str) -> Result<Value, String> {
+    let safe_url = validate_update_url(url)?;
+    let response = client
+        .get(safe_url)
+        .send()
+        .await
+        .map_err(|e| format!("更新地址请求失败: {e}"))?;
+    response
+        .error_for_status_ref()
+        .map_err(|e| format!("更新地址请求失败: {e}"))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("更新地址请求失败: {e}"))?;
+    let data = serde_json::from_slice::<Value>(&bytes).or_else(|_| {
+        let without_bom = bytes
+            .strip_prefix(&[0xEF, 0xBB, 0xBF])
+            .unwrap_or(bytes.as_ref());
+        serde_json::from_slice::<Value>(without_bom)
+    });
+    let data = data.map_err(|_| "更新地址返回的不是有效 JSON".to_owned())?;
+    if !data.is_object() {
+        return Err("latest.json 格式错误".to_owned());
+    }
+    Ok(data)
+}
+
+async fn check_update_impl(
+    client: &reqwest::Client,
+    url: &str,
+    current_version: &str,
+    platform: &str,
+) -> Result<Value, String> {
+    let latest_json = fetch_latest_json(client, url).await?;
+    let latest_version = latest_json
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    if latest_version.is_empty() {
+        return Err("latest.json 缺少 version 字段".to_owned());
+    }
+    let platform_data = pick_platform_data(&latest_json, platform)?;
+    let assets = platform_data
+        .get("assets")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    if !assets.is_array() {
+        return Err("latest.json assets 字段格式错误".to_owned());
+    }
+    Ok(json!({
+        "success": true,
+        "updateAvailable": is_newer_version(&latest_version, current_version),
+        "currentVersion": current_version,
+        "latestVersion": latest_version,
+        "platform": platform,
+        "pubDate": latest_json.get("pub_date").cloned().unwrap_or(Value::Null),
+        "notes": latest_json.get("notes").cloned().unwrap_or_else(|| json!("")),
+        "assets": assets,
+        "minimumSupportedVersion": latest_json.get("minimum_supported_version").cloned().unwrap_or(Value::Null),
+        "updateProtocol": latest_json.get("update_protocol").cloned().unwrap_or_else(|| json!(1)),
+    }))
+}
+
+async fn download_asset_impl(
+    client: &reqwest::Client,
+    asset: &Value,
+    target_dir: Option<&FsPath>,
+    platform: &str,
+) -> Result<Value, String> {
+    let url = validate_update_url(asset.get("url").and_then(|v| v.as_str()).unwrap_or(""))?;
+    let raw_name = asset
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| asset_filename_from_url(&url));
+    let filename = safe_asset_name(&raw_name)?;
+    let allowed_extensions = allowed_install_extensions(platform);
+    if allowed_extensions.is_empty() {
+        return Err(format!("当前平台暂不支持应用内安装: {platform}"));
+    }
+    let lower_name = filename.to_ascii_lowercase();
+    if !allowed_extensions
+        .iter()
+        .any(|ext| lower_name.ends_with(ext))
+    {
+        return Err(format!(
+            "当前平台只能下载安装资产: {}",
+            allowed_extensions.join(" / ")
+        ));
+    }
+
+    let updates_dir = target_dir.map(PathBuf::from).unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("Codex-App-Transfer")
+            .join("updates")
+    });
+    fs::create_dir_all(&updates_dir).map_err(|e| format!("写入安装包失败: {e}"))?;
+    let target = updates_dir.join(filename);
+    let partial = target.with_file_name(format!(
+        "{}.download",
+        target
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("update")
+    ));
+
+    let download_result: Result<(), String> = async {
+        let mut response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("下载安装包失败: {e}"))?;
+        response
+            .error_for_status_ref()
+            .map_err(|e| format!("下载安装包失败: {e}"))?;
+        let mut file = fs::File::create(&partial).map_err(|e| format!("写入安装包失败: {e}"))?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("下载安装包失败: {e}"))?
+        {
+            if !chunk.is_empty() {
+                file.write_all(&chunk)
+                    .map_err(|e| format!("写入安装包失败: {e}"))?;
+            }
+        }
+        file.flush().map_err(|e| format!("写入安装包失败: {e}"))?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = download_result {
+        let _ = fs::remove_file(&partial);
+        return Err(e);
+    }
+
+    let actual_sha = file_sha256(&partial)?;
+    let expected_sha = asset
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !expected_sha.is_empty() && actual_sha.to_ascii_lowercase() != expected_sha {
+        let _ = fs::remove_file(&partial);
+        return Err("安装包校验失败，已取消安装".to_owned());
+    }
+
+    if target.exists() {
+        fs::remove_file(&target).map_err(|e| format!("写入安装包失败: {e}"))?;
+    }
+    fs::rename(&partial, &target).map_err(|e| format!("写入安装包失败: {e}"))?;
+    let size = fs::metadata(&target)
+        .map_err(|e| format!("读取安装包失败: {e}"))?
+        .len();
+    Ok(json!({
+        "asset": asset,
+        "path": target.to_string_lossy(),
+        "sha256": actual_sha,
+        "size": size,
+    }))
+}
+
+async fn download_update_impl(
+    client: &reqwest::Client,
+    url: &str,
+    current_version: &str,
+    platform: &str,
+    target_dir: Option<&FsPath>,
+) -> Result<Value, String> {
+    let mut result = check_update_impl(client, url, current_version, platform).await?;
+    if result.get("updateAvailable").and_then(|v| v.as_bool()) != Some(true) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("downloaded".to_owned(), Value::Bool(false));
+            obj.insert(
+                "message".to_owned(),
+                Value::String("当前已是最新版本".to_owned()),
+            );
+        }
+        return Ok(result);
+    }
+
+    let assets = result
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let installer_asset = pick_platform_installer(&assets, platform)?;
+    let downloaded = download_asset_impl(client, &installer_asset, target_dir, platform).await?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("downloaded".to_owned(), Value::Bool(true));
+        obj.insert("installerAsset".to_owned(), installer_asset);
+        obj.insert(
+            "installerPath".to_owned(),
+            downloaded.get("path").cloned().unwrap_or(Value::Null),
+        );
+        obj.insert(
+            "installerSha256".to_owned(),
+            downloaded.get("sha256").cloned().unwrap_or(Value::Null),
+        );
+        obj.insert(
+            "installerSize".to_owned(),
+            downloaded.get("size").cloned().unwrap_or(Value::Null),
+        );
+    }
+    Ok(result)
 }
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1214,6 +1669,424 @@ fn read_gateway_key(cfg: &RawConfig) -> String {
         .to_owned()
 }
 
+fn read_setting_bool(cfg: &RawConfig, key: &str, default: bool) -> bool {
+    cfg.get("settings")
+        .and_then(|settings| settings.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
+fn ensure_gateway_key(cfg: &mut RawConfig) -> String {
+    let existing = read_gateway_key(cfg);
+    if !existing.is_empty() {
+        return existing;
+    }
+    let gateway_key = generate_gateway_key_value();
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("gatewayApiKey".into(), Value::String(gateway_key.clone()));
+    gateway_key
+}
+
+struct DesktopConfigTarget {
+    base_url: String,
+    api_key: String,
+    supports_1m: bool,
+    provider_name: String,
+    default_model: String,
+    model_mappings: Value,
+    model_capabilities: Value,
+    requires_proxy: bool,
+    mode: &'static str,
+    proxy_port: u16,
+}
+
+fn desktop_config_target_for_provider(
+    cfg: &mut RawConfig,
+    provider: &Value,
+    proxy_port_override: Option<u16>,
+) -> DesktopConfigTarget {
+    let proxy_port = proxy_port_override.unwrap_or_else(|| read_proxy_port(cfg));
+    let api_format =
+        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
+    let requires_proxy = api_format != "responses";
+    let (base_url, api_key, mode) = if requires_proxy {
+        (
+            format!("http://127.0.0.1:{proxy_port}"),
+            ensure_gateway_key(cfg),
+            "local_proxy",
+        )
+    } else {
+        (
+            clean_base_url(
+                provider
+                    .get("baseUrl")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            ),
+            provider_api_key(provider),
+            "direct_provider",
+        )
+    };
+    DesktopConfigTarget {
+        base_url,
+        api_key,
+        supports_1m: provider_supports_1m(provider),
+        provider_name: provider_display_name(provider),
+        default_model: provider_default_model(provider),
+        model_mappings: provider_model_mappings(provider),
+        model_capabilities: provider_model_capabilities(provider),
+        requires_proxy,
+        mode,
+        proxy_port,
+    }
+}
+
+fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConfigTarget> {
+    let provider = active_provider(cfg)?;
+    let mut snapshot = cfg.clone();
+    Some(desktop_config_target_for_provider(
+        &mut snapshot,
+        &provider,
+        None,
+    ))
+}
+
+fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> {
+    catalog_models_for_provider(
+        &target.provider_name,
+        &target.default_model,
+        target.supports_1m,
+        Some(&target.model_mappings),
+        Some(&target.model_capabilities),
+    )
+    .into_iter()
+    .map(|model| {
+        let mut item = json!({
+            "name": model.slug,
+            "displayName": model.display_name,
+        });
+        if model.context_window >= ONE_M_CONTEXT_WINDOW {
+            item["supports1m"] = Value::Bool(true);
+        }
+        item
+    })
+    .collect()
+}
+
+fn desktop_inference_models_json(target: Option<&DesktopConfigTarget>) -> String {
+    let Some(target) = target else {
+        return "[]".to_owned();
+    };
+    serde_json::to_string(&desktop_expected_model_items(target)).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(&paths.config_toml).ok()?;
+    for line in content.lines() {
+        let stripped = line.trim_start();
+        if stripped.starts_with('[') {
+            break;
+        }
+        if !stripped.starts_with(key) {
+            continue;
+        }
+        let after = &stripped[key.len()..];
+        let mut rest = after.trim_start();
+        if !rest.starts_with('=') {
+            continue;
+        }
+        rest = rest[1..].trim();
+        if let Some(idx) = rest.find('#') {
+            rest = rest[..idx].trim_end();
+        }
+        let trimmed = rest.trim_matches(|c: char| c == '"' || c == '\'');
+        return Some(trimmed.to_owned());
+    }
+    None
+}
+
+fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
+    read_auth(&paths.auth_json)
+        .ok()
+        .and_then(|auth| {
+            auth.get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -> bool {
+    let one_million_names: Vec<String> = desktop_expected_model_items(target)
+        .into_iter()
+        .filter_map(|item| {
+            if item.get("supports1m").and_then(|v| v.as_bool()) == Some(true) {
+                item.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if one_million_names.is_empty() {
+        return true;
+    }
+
+    let Some(catalog_path) = read_codex_toml_root_string(paths, "model_catalog_json") else {
+        return false;
+    };
+    let catalog_path = PathBuf::from(catalog_path);
+    let catalog = fs::read_to_string(catalog_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let Some(models) = catalog.get("models").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    models.iter().any(|item| {
+        let slug = item
+            .get("slug")
+            .or_else(|| item.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !one_million_names.iter().any(|name| name == slug) {
+            return false;
+        }
+        let context_window = item
+            .get("context_window")
+            .or_else(|| item.get("max_context_window"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        context_window >= ONE_M_CONTEXT_WINDOW
+    })
+}
+
+fn desktop_health(
+    paths: Option<&CodexPaths>,
+    configured: bool,
+    actual_base_url: Option<&str>,
+    actual_api_key_present: bool,
+    target: Option<&DesktopConfigTarget>,
+) -> Value {
+    let expected_base_url = target
+        .map(|target| target.base_url.trim_end_matches('/').to_owned())
+        .unwrap_or_default();
+    let actual_base_url = actual_base_url
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    let mut issues = Vec::new();
+
+    if !configured {
+        if !actual_base_url.is_empty() || actual_api_key_present {
+            issues.push(json!({
+                "code": "not_managed_by_cas",
+                "message": "当前 Codex CLI 配置不是由本工具最新版本写入。",
+            }));
+        } else {
+            issues.push(json!({
+                "code": "codex_snapshot_missing",
+                "message": "尚未由本工具应用 Codex CLI 配置，请重新一键生成配置。",
+            }));
+        }
+    }
+
+    if !actual_base_url.is_empty()
+        && !expected_base_url.is_empty()
+        && actual_base_url != expected_base_url
+    {
+        issues.push(json!({
+            "code": "gateway_base_url_mismatch",
+            "message": "Codex CLI 仍指向旧地址，请重新一键生成 Codex CLI 配置。",
+        }));
+    }
+
+    let one_million_ready = match (paths, target) {
+        (Some(paths), Some(target)) => one_million_catalog_ready(paths, target),
+        _ => true,
+    };
+    if !one_million_ready {
+        issues.push(json!({
+            "code": "one_million_not_written",
+            "message": "1M 上下文模型尚未写入 Codex CLI 配置，请重新一键生成配置并重启终端。",
+        }));
+    }
+
+    json!({
+        "needsApply": !configured || !issues.is_empty(),
+        "oneMillionReady": one_million_ready,
+        "expectedBaseUrl": expected_base_url,
+        "actualBaseUrl": actual_base_url,
+        "mode": target.map(|target| target.mode),
+        "requiresProxy": target.map(|target| target.requires_proxy).unwrap_or(false),
+        "issues": issues,
+    })
+}
+
+fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
+    let paths = CodexPaths::from_home_env().map_err(|e| e.to_string())?;
+    let result = apply_provider(
+        &paths,
+        &ApplyConfig {
+            base_url: &target.base_url,
+            gateway_api_key: &target.api_key,
+            supports_1m: target.supports_1m,
+            provider_name: &target.provider_name,
+            default_model: &target.default_model,
+            model_mappings: Some(&target.model_mappings),
+            model_capabilities: Some(&target.model_capabilities),
+            app_version: APP_VERSION,
+        },
+    )
+    .map_err(|e| format!("apply 失败: {e}"))?;
+    serde_json::to_value(result).map_err(|e| format!("apply 结果序列化失败: {e}"))
+}
+
+async fn start_proxy_if_needed(manager: &ProxyManager, port: u16) -> Result<bool, String> {
+    if manager.status().running {
+        manager.stop_silent();
+    }
+    manager.start(port).await.map(|_| true)
+}
+
+async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
+    let mut cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"attempted": true, "success": false, "message": e});
+        }
+    };
+    let Some(provider) = active_provider(&cfg) else {
+        return json!({
+            "attempted": false,
+            "success": false,
+            "message": "没有默认提供商",
+        });
+    };
+
+    let target = desktop_config_target_for_provider(&mut cfg, &provider, None);
+    if let Err(e) = save_registry(&cfg) {
+        return json!({"attempted": true, "success": false, "message": e});
+    }
+
+    let mut proxy_started = false;
+    if target.requires_proxy {
+        match start_proxy_if_needed(&state.proxy_manager, target.proxy_port).await {
+            Ok(started) => proxy_started = started,
+            Err(e) => {
+                return json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "message": e});
+            }
+        }
+    } else {
+        state.proxy_manager.stop_silent();
+    }
+
+    match apply_desktop_target(&target) {
+        Ok(mut result) => {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("attempted".into(), Value::Bool(true));
+                obj.insert("success".into(), Value::Bool(true));
+                obj.insert("mode".into(), Value::String(target.mode.to_owned()));
+                obj.insert("requiresProxy".into(), Value::Bool(target.requires_proxy));
+                obj.insert("proxyStarted".into(), Value::Bool(proxy_started));
+            }
+            result
+        }
+        Err(e) => {
+            json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "proxyStarted": proxy_started, "message": e})
+        }
+    }
+}
+
+pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) -> Value {
+    let cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": format!("failed: {e}")})
+        }
+    };
+    if !read_setting_bool(&cfg, "autoApplyOnStart", true) {
+        return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "disabled by settings"});
+    }
+    if active_provider(&cfg).is_none() {
+        return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "no active provider; skip"});
+    }
+    let state = AdminState { proxy_manager };
+    let result = sync_desktop_for_active_provider(&state).await;
+    if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        return json!({
+            "applied": true,
+            "requiresProxy": result.get("requiresProxy").and_then(|v| v.as_bool()).unwrap_or(false),
+            "proxyStarted": result.get("proxyStarted").and_then(|v| v.as_bool()).unwrap_or(false),
+            "message": format!("applied {}", active_provider_name(&cfg)),
+        });
+    }
+    json!({
+        "applied": false,
+        "requiresProxy": result.get("requiresProxy").and_then(|v| v.as_bool()).unwrap_or(false),
+        "proxyStarted": result.get("proxyStarted").and_then(|v| v.as_bool()).unwrap_or(false),
+        "message": format!("failed: {}", result.get("message").and_then(|v| v.as_str()).unwrap_or("unknown")),
+    })
+}
+
+pub fn restore_codex_if_enabled(reason: &str) -> Value {
+    let cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e})
+        }
+    };
+    if !read_setting_bool(&cfg, "restoreCodexOnExit", true) {
+        return json!({"attempted": false, "restored": false, "success": true, "reason": reason, "message": "disabled by settings"});
+    }
+    let paths = match CodexPaths::from_home_env() {
+        Ok(paths) => paths,
+        Err(e) => {
+            return json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e.to_string()})
+        }
+    };
+    if !has_snapshot(&paths) {
+        return json!({"attempted": false, "restored": false, "success": true, "reason": reason, "message": "no snapshot; skip"});
+    }
+    match restore_codex_state(&paths) {
+        Ok(restored) => {
+            json!({"attempted": true, "restored": restored, "success": true, "reason": reason})
+        }
+        Err(e) => {
+            json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e.to_string()})
+        }
+    }
+}
+
+pub async fn switch_provider_and_sync(
+    proxy_manager: Arc<ProxyManager>,
+    provider_id: String,
+) -> Value {
+    let mut cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => return json!({"success": false, "message": e}),
+    };
+    if provider_index(&cfg, &provider_id).is_none() {
+        return json!({"success": false, "message": "提供商不存在"});
+    }
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("activeProvider".into(), Value::String(provider_id));
+    if let Err(e) = save_registry(&cfg) {
+        return json!({"success": false, "message": e});
+    }
+    let state = AdminState { proxy_manager };
+    let desktop_sync = sync_desktop_for_active_provider(&state).await;
+    json!({
+        "success": true,
+        "message": "默认提供商已更新",
+        "desktopSync": desktop_sync,
+    })
+}
+
 fn ensure_settings_object(cfg: &mut RawConfig) -> &mut serde_json::Map<String, Value> {
     let obj = cfg.as_object_mut().expect("registry root is object");
     obj.entry("settings".to_owned())
@@ -1633,20 +2506,35 @@ pub async fn status(State(state): State<AdminState>) -> impl IntoResponse {
     let proxy_status = state.proxy_manager.status();
     let codex_paths = CodexPaths::from_home_env().ok();
     let codex_configured = codex_paths.as_ref().map(has_snapshot).unwrap_or(false);
+    let actual_base_url = codex_paths
+        .as_ref()
+        .and_then(|paths| read_codex_toml_root_string(paths, "openai_base_url"));
+    let actual_api_key_present = codex_paths
+        .as_ref()
+        .map(codex_openai_api_key_present)
+        .unwrap_or(false);
+    let desktop_target = desktop_target_for_active_provider(&cfg);
+    let desktop_health = desktop_health(
+        codex_paths.as_ref(),
+        codex_configured,
+        actual_base_url.as_deref(),
+        actual_api_key_present,
+        desktop_target.as_ref(),
+    );
 
     Json(json!({
         "desktopConfigured": codex_configured,
         "proxyRunning": proxy_status.running,
         "proxyPort": proxy_port,
-        "desktopMode": "gateway",
-        "desktopRequiresProxy": true,
+        "desktopMode": desktop_target.as_ref().map(|target| target.mode).unwrap_or("unconfigured"),
+        "desktopRequiresProxy": desktop_target
+            .as_ref()
+            .map(|target| target.requires_proxy)
+            .unwrap_or(false),
         "activeProvider": active,
         "activeProviderId": active_id,
         "providerCount": providers_count,
-        "desktopHealth": {
-            "needsApply": !codex_configured,
-            "issues": [],
-        },
+        "desktopHealth": desktop_health,
         "exposeAllProviderModels": false,
     }))
     .into_response()
@@ -1941,24 +2829,36 @@ pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
     Json(json!({"success": true})).into_response()
 }
 
-pub async fn set_default_provider(Path(id): Path<String>) -> impl IntoResponse {
-    let mut cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    if provider_index(&cfg, &id).is_none() {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+pub async fn set_default_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let result = switch_provider_and_sync(state.proxy_manager.clone(), id).await;
+    if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        Json(result).into_response()
+    } else {
+        let status = if result.get("message").and_then(|v| v.as_str()) == Some("提供商不存在")
+        {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        err(
+            status,
+            result
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("提供商不存在"),
+        )
+        .into_response()
     }
-    let obj = cfg.as_object_mut().unwrap();
-    obj.insert("activeProvider".into(), Value::String(id));
-    if let Err(e) = save_registry(&cfg) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-    Json(json!({"success": true})).into_response()
 }
 
-pub async fn activate_provider(Path(id): Path<String>) -> impl IntoResponse {
-    set_default_provider(Path(id)).await
+pub async fn activate_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    set_default_provider(State(state), Path(id)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -2077,39 +2977,36 @@ pub async fn desktop_status() -> impl IntoResponse {
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let configured = has_snapshot(&paths);
-    let base_url = std::fs::read_to_string(&paths.config_toml)
-        .ok()
-        .and_then(|s| {
-            for line in s.lines() {
-                let stripped = line.trim_start();
-                if !stripped.starts_with("openai_base_url") {
-                    continue;
-                }
-                let after = &stripped["openai_base_url".len()..];
-                let mut rest = after.trim_start();
-                if !rest.starts_with('=') {
-                    continue;
-                }
-                rest = rest[1..].trim();
-                if let Some(idx) = rest.find('#') {
-                    rest = rest[..idx].trim_end();
-                }
-                let trimmed = rest.trim_matches(|c: char| c == '"' || c == '\'');
-                return Some(trimmed.to_owned());
-            }
-            None
-        });
     let cfg = load_registry().unwrap_or_else(|_| json!({}));
     let proxy_port = read_proxy_port(&cfg);
+    let actual_base_url = read_codex_toml_root_string(&paths, "openai_base_url");
+    let actual_api_key_present = codex_openai_api_key_present(&paths);
+    let desktop_target = desktop_target_for_active_provider(&cfg);
+    let fallback_base_url = desktop_target
+        .as_ref()
+        .map(|target| target.base_url.clone())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{proxy_port}"));
+    let api_key_present = actual_api_key_present
+        || desktop_target
+            .as_ref()
+            .map(|target| !target.api_key.is_empty())
+            .unwrap_or_else(|| !read_gateway_key(&cfg).is_empty());
+    let health = desktop_health(
+        Some(&paths),
+        configured,
+        actual_base_url.as_deref(),
+        actual_api_key_present,
+        desktop_target.as_ref(),
+    );
     Json(json!({
         "configured": configured,
-        "health": {"needsApply": !configured, "issues": []},
+        "health": health,
         "keys": {
             "inferenceProvider": "gateway",
-            "inferenceGatewayBaseUrl": base_url.unwrap_or_else(|| format!("http://127.0.0.1:{proxy_port}")),
-            "inferenceGatewayApiKey": if read_gateway_key(&cfg).is_empty() { "" } else { "******" },
+            "inferenceGatewayBaseUrl": actual_base_url.unwrap_or(fallback_base_url),
+            "inferenceGatewayApiKey": if api_key_present { "******" } else { "" },
             "inferenceGatewayAuthScheme": "bearer",
-            "inferenceModels": "[\"sonnet\",\"haiku\",\"opus\"]",
+            "inferenceModels": desktop_inference_models_json(desktop_target.as_ref()),
         },
     }))
     .into_response()
@@ -2120,73 +3017,24 @@ pub async fn desktop_configure() -> impl IntoResponse {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let providers = cfg
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if providers.is_empty() {
+    let Some(active) = active_provider(&cfg) else {
         return err(StatusCode::BAD_REQUEST, "请先添加 provider").into_response();
+    };
+    let target = desktop_config_target_for_provider(&mut cfg, &active, None);
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
-    let active_id = cfg
-        .get("activeProvider")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
-    let active = match active_id {
-        Some(id) => providers.iter().find(|p| {
-            p.as_object()
-                .and_then(|o| o.get("id"))
-                .and_then(|v| v.as_str())
-                == Some(id.as_str())
-        }),
-        None => providers.first(),
-    };
-    let Some(active) = active else {
-        return err(StatusCode::BAD_REQUEST, "未找到 active provider").into_response();
-    };
-    let supports_1m = provider_supports_1m(active);
-    let provider_name = provider_display_name(active);
-    let default_model = provider_default_model(active);
-    let model_mappings = provider_model_mappings(active);
-    let model_capabilities = provider_model_capabilities(active);
-    let port = read_proxy_port(&cfg);
-
-    // 缺 gateway key 自动补
-    let mut gateway_key = read_gateway_key(&cfg);
-    if gateway_key.is_empty() {
-        gateway_key = generate_gateway_key_value();
-        let obj = cfg.as_object_mut().unwrap();
-        obj.insert("gatewayApiKey".into(), Value::String(gateway_key.clone()));
-        if let Err(e) = save_registry(&cfg) {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    match apply_desktop_target(&target) {
+        Ok(mut result) => {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("success".into(), Value::Bool(true));
+                obj.insert("mode".into(), Value::String(target.mode.to_owned()));
+                obj.insert("requiresProxy".into(), Value::Bool(target.requires_proxy));
+            }
+            Json(result).into_response()
         }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-
-    let base_url = format!("http://127.0.0.1:{port}");
-    let paths = match CodexPaths::from_home_env() {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    if let Err(e) = apply_provider(
-        &paths,
-        &ApplyConfig {
-            base_url: &base_url,
-            gateway_api_key: &gateway_key,
-            supports_1m,
-            provider_name: &provider_name,
-            default_model: &default_model,
-            model_mappings: Some(&model_mappings),
-            model_capabilities: Some(&model_capabilities),
-            app_version: APP_VERSION,
-        },
-    ) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("apply 失败: {e}"),
-        )
-        .into_response();
-    }
-    Json(json!({"success": true})).into_response()
 }
 
 pub async fn desktop_clear() -> impl IntoResponse {
@@ -2209,6 +3057,12 @@ pub async fn desktop_snapshot_status() -> impl IntoResponse {
         "hasSnapshot": has_snapshot(&paths),
     }))
     .into_response()
+}
+
+// ── /api/version ─────────────────────────────────────────────────────
+
+pub async fn version() -> Json<Value> {
+    Json(json!({"version": APP_VERSION}))
 }
 
 // ── /api/proxy/* ─────────────────────────────────────────────────────
@@ -2363,17 +3217,123 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
 
 // ── /api/update/* ────────────────────────────────────────────────────
 
-pub async fn update_check() -> impl IntoResponse {
-    Json(json!({
-        "hasUpdate": false,
-        "currentVersion": APP_VERSION,
-        "message": "暂不检测更新",
-    }))
-    .into_response()
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateCheckQuery {
+    pub url: Option<String>,
+    pub current: Option<String>,
+    pub platform: Option<String>,
 }
 
-pub async fn update_install(Json(_input): Json<Value>) -> impl IntoResponse {
-    err(StatusCode::NOT_IMPLEMENTED, "update install 暂未实现").into_response()
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateInstallInput {
+    pub url: Option<String>,
+    pub current: Option<String>,
+    pub platform: Option<String>,
+}
+
+pub async fn update_check(Query(query): Query<UpdateCheckQuery>) -> impl IntoResponse {
+    let update_url = configured_update_url(query.url.as_deref());
+    if update_url.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "请先配置 latest.json 更新地址").into_response();
+    }
+    let current = query
+        .current
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(APP_VERSION)
+        .to_owned();
+    let platform = query
+        .platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(current_update_platform);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            return err(StatusCode::BAD_REQUEST, format!("更新地址请求失败: {e}")).into_response()
+        }
+    };
+    match check_update_impl(&client, &update_url, &current, &platform).await {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl IntoResponse {
+    let input = body.map(|value| value.0).unwrap_or_default();
+    let update_url = configured_update_url(input.url.as_deref());
+    if update_url.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "请先配置 latest.json 更新地址").into_response();
+    }
+    let current = input
+        .current
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(APP_VERSION)
+        .to_owned();
+    let platform = input
+        .platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(current_update_platform);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            return err(StatusCode::BAD_REQUEST, format!("更新地址请求失败: {e}")).into_response()
+        }
+    };
+    let mut result =
+        match download_update_impl(&client, &update_url, &current, &platform, None).await {
+            Ok(result) => result,
+            Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+        };
+    if result.get("updateAvailable").and_then(|v| v.as_bool()) != Some(true) {
+        return Json(result).into_response();
+    }
+    let installer_path = result
+        .get("installerPath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if installer_path.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "下载安装包失败").into_response();
+    }
+    let quit_requested = match launch_update_installer(installer_path, &platform) {
+        Ok(quit_requested) => quit_requested,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let is_macos = platform.starts_with("macos-");
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("success".to_owned(), Value::Bool(true));
+        obj.insert("installerStarted".to_owned(), Value::Bool(true));
+        obj.insert("quitRequested".to_owned(), Value::Bool(quit_requested));
+        obj.insert(
+            "message".to_owned(),
+            Value::String(if is_macos {
+                if quit_requested {
+                    "更新包已下载，应用即将退出并启动安装器。".to_owned()
+                } else {
+                    "更新包已下载并打开。请先退出当前应用，再按 macOS 提示完成安装。".to_owned()
+                }
+            } else {
+                "安装包已下载并启动。安装器会沿用旧安装目录，并在安装前关闭正在运行的 Codex App Transfer。".to_owned()
+            }),
+        );
+    }
+    Json(result).into_response()
 }
 
 // ── /api/feedback ────────────────────────────────────────────────────
@@ -3132,6 +4092,610 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap()
                 .contains("before-import"));
+        });
+    }
+
+    #[test]
+    fn desktop_config_target_matches_legacy_proxy_and_direct_modes() {
+        let mut proxy_cfg = config_with_secret();
+        proxy_cfg["gatewayApiKey"] = Value::Null;
+        let proxy_provider = active_provider(&proxy_cfg).unwrap();
+        let proxy_target =
+            desktop_config_target_for_provider(&mut proxy_cfg, &proxy_provider, Some(19090));
+        assert_eq!(proxy_target.mode, "local_proxy");
+        assert!(proxy_target.requires_proxy);
+        assert_eq!(proxy_target.base_url, "http://127.0.0.1:19090");
+        assert!(proxy_target.api_key.starts_with("cas_"));
+        assert_eq!(
+            proxy_cfg
+                .get("gatewayApiKey")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            proxy_target.api_key
+        );
+
+        let mut direct_cfg = config_with_secret();
+        direct_cfg["gatewayApiKey"] = Value::Null;
+        let direct_provider = json!({
+            "id": "direct",
+            "name": "Direct Provider",
+            "baseUrl": "https://direct.example.com/v1/",
+            "authScheme": "bearer",
+            "apiFormat": "responses",
+            "apiKey": "sk-direct",
+            "models": {"default": "direct-model"},
+        });
+        let direct_target =
+            desktop_config_target_for_provider(&mut direct_cfg, &direct_provider, Some(19090));
+        assert_eq!(direct_target.mode, "direct_provider");
+        assert!(!direct_target.requires_proxy);
+        assert_eq!(direct_target.base_url, "https://direct.example.com/v1");
+        assert_eq!(direct_target.api_key, "sk-direct");
+        assert!(direct_cfg
+            .get("gatewayApiKey")
+            .and_then(|v| v.as_str())
+            .is_none());
+    }
+
+    #[test]
+    fn startup_auto_apply_starts_proxy_and_exit_restore_uses_snapshot() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["gatewayApiKey"] = Value::Null;
+                cfg["settings"]["proxyPort"] = json!(0);
+                save_registry(&cfg).unwrap();
+
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                let config_toml = codex_dir.join("config.toml");
+                fs::write(&config_toml, "approval_policy = \"on-request\"\n").unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(result["applied"], json!(true));
+                assert_eq!(result["requiresProxy"], json!(true));
+                assert_eq!(result["proxyStarted"], json!(true));
+                assert!(manager.status().running);
+
+                let saved = load_registry().unwrap();
+                assert!(saved
+                    .get("gatewayApiKey")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .starts_with("cas_"));
+                let paths = CodexPaths::from_home_env().unwrap();
+                assert!(has_snapshot(&paths));
+                let applied_config = fs::read_to_string(&config_toml).unwrap();
+                assert!(applied_config.contains("approval_policy = \"on-request\""));
+                assert!(applied_config.contains("openai_base_url = \"http://127.0.0.1:0\""));
+
+                let restored = restore_codex_if_enabled("test-exit");
+                assert_eq!(restored["success"], json!(true));
+                assert_eq!(restored["attempted"], json!(true));
+                assert!(!has_snapshot(&paths));
+                let restored_config = fs::read_to_string(&config_toml).unwrap();
+                assert!(restored_config.contains("approval_policy = \"on-request\""));
+                assert!(!restored_config.contains("openai_base_url"));
+                manager.stop_silent();
+            });
+        });
+    }
+
+    #[test]
+    fn startup_auto_apply_respects_disabled_setting() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|_| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["settings"]["autoApplyOnStart"] = json!(false);
+                save_registry(&cfg).unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(result["applied"], json!(false));
+                assert_eq!(result["message"], json!("disabled by settings"));
+                assert!(!manager.status().running);
+            });
+        });
+    }
+
+    #[test]
+    fn provider_switch_syncs_desktop_without_proxy_for_direct_provider() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["providers"] = json!([
+                    cfg["providers"][0].clone(),
+                    {
+                        "id": "p2",
+                        "name": "Direct Provider",
+                        "baseUrl": "https://direct.example.com/v1/",
+                        "authScheme": "bearer",
+                        "apiFormat": "responses",
+                        "apiKey": "sk-direct",
+                        "models": {"default": "direct-model"},
+                        "sortIndex": 1
+                    }
+                ]);
+                save_registry(&cfg).unwrap();
+                fs::create_dir_all(home.join(".codex")).unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = switch_provider_and_sync(Arc::clone(&manager), "p2".to_owned()).await;
+                assert_eq!(result["success"], json!(true));
+                assert_eq!(result["desktopSync"]["success"], json!(true));
+                assert_eq!(result["desktopSync"]["mode"], json!("direct_provider"));
+                assert_eq!(result["desktopSync"]["requiresProxy"], json!(false));
+                assert!(!manager.status().running);
+
+                let saved = load_registry().unwrap();
+                assert_eq!(saved["activeProvider"], json!("p2"));
+                let config_toml = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+                assert!(config_toml.contains("openai_base_url = \"https://direct.example.com/v1\""));
+                let auth_json: Value =
+                    serde_json::from_str(&fs::read_to_string(home.join(".codex").join("auth.json")).unwrap())
+                        .unwrap();
+                assert_eq!(auth_json["OPENAI_API_KEY"], json!("sk-direct"));
+            });
+        });
+    }
+
+    #[test]
+    fn version_endpoint_matches_legacy_shape() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let Json(payload) = version().await;
+            assert_eq!(payload, json!({"version": APP_VERSION}));
+        });
+    }
+
+    #[test]
+    fn desktop_inference_models_use_current_codex_catalog_slots() {
+        let mut cfg = config_with_secret();
+        cfg["providers"][0]["models"] = json!({
+            "default": "deepseek-v4-pro[1m]",
+            "gpt_5_5": "kimi-k2",
+            "gpt_5_4": "glm-4.6",
+        });
+        let provider = active_provider(&cfg).unwrap();
+        let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
+        let raw = desktop_inference_models_json(Some(&target));
+
+        assert!(!raw.contains("sonnet"));
+        assert!(!raw.contains("haiku"));
+        assert!(!raw.contains("opus"));
+
+        let models: Vec<Value> = serde_json::from_str(&raw).unwrap();
+        let names: Vec<&str> = models
+            .iter()
+            .filter_map(|item| item.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"gpt-5.5"));
+        assert!(names.contains(&"gpt-5.4"));
+        assert!(names.contains(&"gpt-5.4-mini"));
+        assert!(names.contains(&"deepseek-v4-pro"));
+        assert!(models
+            .iter()
+            .any(|item| item.get("supports1m").and_then(|v| v.as_bool()) == Some(true)));
+    }
+
+    #[test]
+    fn desktop_status_reports_current_models_and_health_issues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["providers"][0]["models"] = json!({
+                    "default": "deepseek-v4-pro[1m]",
+                    "gpt_5_5": "kimi-k2",
+                });
+                save_registry(&cfg).unwrap();
+
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                fs::write(
+                    codex_dir.join("config.toml"),
+                    "openai_base_url = \"http://127.0.0.1:18080\"\n",
+                )
+                .unwrap();
+                fs::write(
+                    codex_dir.join("auth.json"),
+                    "{\"OPENAI_API_KEY\":\"cas_existing\"}\n",
+                )
+                .unwrap();
+
+                let response = desktop_status().await.into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+
+                let models_raw = payload["keys"]["inferenceModels"].as_str().unwrap();
+                assert!(!models_raw.contains("sonnet"));
+                assert!(models_raw.contains("gpt-5.5"));
+                assert!(models_raw.contains("deepseek-v4-pro"));
+                assert_eq!(payload["configured"], json!(false));
+                assert_eq!(payload["health"]["needsApply"], json!(true));
+                assert_eq!(payload["health"]["oneMillionReady"], json!(false));
+
+                let codes: Vec<&str> = payload["health"]["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
+                    .collect();
+                assert!(codes.contains(&"not_managed_by_cas"));
+                assert!(codes.contains(&"one_million_not_written"));
+            });
+        });
+    }
+
+    #[test]
+    fn desktop_health_reports_base_url_mismatch() {
+        with_isolated_home(|home| {
+            let cfg = config_with_secret();
+            let provider = active_provider(&cfg).unwrap();
+            let mut target_cfg = cfg.clone();
+            let target =
+                desktop_config_target_for_provider(&mut target_cfg, &provider, Some(19090));
+
+            let codex_dir = home.join(".codex");
+            fs::create_dir_all(&codex_dir).unwrap();
+            fs::write(
+                codex_dir.join("config.toml"),
+                "openai_base_url = \"http://127.0.0.1:18080\"\n",
+            )
+            .unwrap();
+            fs::write(
+                codex_dir.join("auth.json"),
+                "{\"OPENAI_API_KEY\":\"cas_old\"}\n",
+            )
+            .unwrap();
+
+            let paths = CodexPaths::from_home_env().unwrap();
+            let actual_base_url = read_codex_toml_root_string(&paths, "openai_base_url");
+            let health = desktop_health(
+                Some(&paths),
+                false,
+                actual_base_url.as_deref(),
+                true,
+                Some(&target),
+            );
+
+            assert_eq!(health["needsApply"], json!(true));
+            assert_eq!(health["expectedBaseUrl"], json!("http://127.0.0.1:19090"));
+            assert_eq!(health["actualBaseUrl"], json!("http://127.0.0.1:18080"));
+            let codes: Vec<&str> = health["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
+                .collect();
+            assert!(codes.contains(&"not_managed_by_cas"));
+            assert!(codes.contains(&"gateway_base_url_mismatch"));
+        });
+    }
+
+    #[test]
+    fn update_platform_version_and_installer_selection_match_legacy() {
+        assert_eq!(
+            current_update_platform_for("darwin", "arm64"),
+            "macos-arm64"
+        );
+        assert_eq!(current_update_platform_for("win32", "AMD64"), "windows-x64");
+        assert_eq!(current_update_platform_for("linux", "x86_64"), "linux-x64");
+        assert_eq!(
+            current_update_platform_for("freebsd", ""),
+            "freebsd-unknown"
+        );
+
+        assert!(is_newer_version("v2.0.10", "2.0.9"));
+        assert!(is_newer_version("2.1", "2.0.99"));
+        assert!(!is_newer_version("2.0", "2.0.0"));
+
+        let windows_assets = vec![
+            json!({"name": "Codex-App-Transfer-Windows-Portable.exe"}),
+            json!({"name": "Codex-App-Transfer-Windows-Setup.exe"}),
+        ];
+        assert_eq!(
+            pick_windows_installer(&windows_assets).unwrap()["name"],
+            json!("Codex-App-Transfer-Windows-Setup.exe")
+        );
+
+        let macos_assets = vec![
+            json!({"name": "Codex-App-Transfer.dmg"}),
+            json!({"name": "Codex-App-Transfer.pkg"}),
+        ];
+        assert_eq!(
+            pick_macos_installer(&macos_assets).unwrap()["name"],
+            json!("Codex-App-Transfer.pkg")
+        );
+        assert_eq!(
+            pick_platform_installer(&macos_assets, "linux-x64").unwrap_err(),
+            "当前平台暂不支持应用内安装: linux-x64"
+        );
+
+        assert_eq!(
+            install_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64").unwrap(),
+            vec!["open", "/tmp/Codex-App-Transfer.pkg"]
+        );
+        assert_eq!(
+            install_command_parts("C:\\Codex-App-Transfer-Windows-Setup.exe", "windows-x64")
+                .unwrap(),
+            vec!["C:\\Codex-App-Transfer-Windows-Setup.exe"]
+        );
+        assert_eq!(
+            install_after_quit_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64", 1234)
+                .unwrap(),
+            vec![
+                "/bin/sh",
+                "-c",
+                "pid=\"$1\"; installer=\"$2\"; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.2; done; exec open \"$installer\"",
+                "cas-update-installer",
+                "1234",
+                "/tmp/Codex-App-Transfer.pkg",
+            ]
+        );
+        assert_eq!(
+            install_after_quit_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64", 0)
+                .unwrap_err(),
+            "等待退出的进程 ID 无效"
+        );
+    }
+
+    #[test]
+    fn update_check_reads_latest_json_and_platform_assets() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            let app = Router::new().route(
+                "/latest.json",
+                get(|| async {
+                    Json(json!({
+                        "version": "2.0.2",
+                        "pub_date": "2026-05-06",
+                        "notes": "update notes",
+                        "minimum_supported_version": "2.0.0",
+                        "update_protocol": 1,
+                        "platforms": {
+                            "macos-arm64": {
+                                "assets": [
+                                    {"name": "Codex-App-Transfer.pkg", "url": "https://example.com/Codex-App-Transfer.pkg"}
+                                ]
+                            }
+                        }
+                    }))
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let result = check_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "2.0.1",
+                "macos-arm64",
+            )
+            .await
+            .unwrap();
+            server.abort();
+
+            assert_eq!(result["success"], json!(true));
+            assert_eq!(result["updateAvailable"], json!(true));
+            assert_eq!(result["currentVersion"], json!("2.0.1"));
+            assert_eq!(result["latestVersion"], json!("2.0.2"));
+            assert_eq!(result["platform"], json!("macos-arm64"));
+            assert_eq!(result["pubDate"], json!("2026-05-06"));
+            assert_eq!(result["notes"], json!("update notes"));
+            assert_eq!(result["minimumSupportedVersion"], json!("2.0.0"));
+            assert_eq!(result["updateProtocol"], json!(1));
+            assert_eq!(
+                result["assets"][0]["name"],
+                json!("Codex-App-Transfer.pkg")
+            );
+        });
+    }
+
+    #[test]
+    fn update_downloads_installer_and_checks_sha256() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let installer_bytes = Arc::new(b"pkg-bytes".to_vec());
+            let installer_sha = format!("{:x}", Sha256::digest(installer_bytes.as_ref()));
+            let app = Router::new()
+                .route(
+                    "/latest.json",
+                    get({
+                        let installer_sha = installer_sha.clone();
+                        move || async move {
+                            Json(json!({
+                                "version": "2.0.2",
+                                "platforms": {
+                                    "macos-arm64": {
+                                        "assets": [{
+                                            "name": "../Codex-App-Transfer.pkg",
+                                            "url": format!("http://{addr}/Codex-App-Transfer.pkg"),
+                                            "sha256": installer_sha,
+                                        }]
+                                    }
+                                }
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/Codex-App-Transfer.pkg",
+                    get({
+                        let installer_bytes = Arc::clone(&installer_bytes);
+                        move || {
+                            let installer_bytes = Arc::clone(&installer_bytes);
+                            async move { installer_bytes.as_ref().clone() }
+                        }
+                    }),
+                );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let target_dir = std::env::temp_dir().join(format!(
+                "cas-update-download-{}-{}",
+                std::process::id(),
+                random_hex(6)
+            ));
+            let _ = fs::remove_dir_all(&target_dir);
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let result = download_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "2.0.1",
+                "macos-arm64",
+                Some(&target_dir),
+            )
+            .await
+            .unwrap();
+            server.abort();
+
+            assert_eq!(result["downloaded"], json!(true));
+            assert_eq!(
+                result["installerAsset"]["name"],
+                json!("../Codex-App-Transfer.pkg")
+            );
+            assert_eq!(result["installerSha256"], json!(installer_sha));
+            assert_eq!(result["installerSize"], json!(9));
+            let installer_path = result["installerPath"].as_str().unwrap();
+            assert!(installer_path.ends_with("Codex-App-Transfer.pkg"));
+            assert_eq!(fs::read(installer_path).unwrap(), b"pkg-bytes");
+            let _ = fs::remove_dir_all(&target_dir);
+        });
+    }
+
+    #[test]
+    fn update_download_rejects_bad_sha_and_unsupported_platform() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/latest.json",
+                    get(move || async move {
+                        Json(json!({
+                            "version": "2.0.2",
+                            "platforms": {
+                                "macos-arm64": {
+                                    "assets": [{
+                                        "name": "Codex-App-Transfer.pkg",
+                                        "url": format!("http://{addr}/Codex-App-Transfer.pkg"),
+                                        "sha256": "bad-sha",
+                                    }]
+                                },
+                                "linux-x64": {
+                                    "assets": [{
+                                        "name": "Codex-App-Transfer.AppImage",
+                                        "url": format!("http://{addr}/Codex-App-Transfer.AppImage")
+                                    }]
+                                }
+                            }
+                        }))
+                    }),
+                )
+                .route(
+                    "/Codex-App-Transfer.pkg",
+                    get(|| async { b"pkg-bytes".to_vec() }),
+                );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let target_dir = std::env::temp_dir().join(format!(
+                "cas-update-bad-sha-{}-{}",
+                std::process::id(),
+                random_hex(6)
+            ));
+            let _ = fs::remove_dir_all(&target_dir);
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+
+            let bad_sha = download_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "2.0.1",
+                "macos-arm64",
+                Some(&target_dir),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(bad_sha, "安装包校验失败，已取消安装");
+
+            let unsupported = download_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "2.0.1",
+                "linux-x64",
+                Some(&target_dir),
+            )
+            .await
+            .unwrap_err();
+            server.abort();
+            assert_eq!(unsupported, "当前平台暂不支持应用内安装: linux-x64");
+            let _ = fs::remove_dir_all(&target_dir);
         });
     }
 

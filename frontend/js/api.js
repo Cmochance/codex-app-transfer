@@ -216,7 +216,7 @@
           inferenceGatewayBaseUrl: registryConfig.inferenceGatewayBaseUrl || `http://127.0.0.1:${proxyPort}`,
           inferenceGatewayApiKey: registryConfig.inferenceGatewayApiKey ? '******' : '',
           inferenceGatewayAuthScheme: registryConfig.inferenceGatewayAuthScheme || 'bearer',
-          inferenceModels: registryConfig.inferenceModels || '["sonnet","haiku","opus"]',
+          inferenceModels: registryConfig.inferenceModels || '[]',
         },
       };
     },
