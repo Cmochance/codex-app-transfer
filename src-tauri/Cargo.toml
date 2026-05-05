@@ -29,18 +29,18 @@ tokio = { version = "1", features = ["sync", "net", "rt-multi-thread"] }
 axum = { version = "0.8", features = ["http1", "tokio", "macros"] }
 base64 = "0.22"
 getrandom = "0.2"
+# 以下 5 项为 cas:// scheme 静态文件路由的跨平台依赖,
+# 之前误放在 [target.macos] 块下导致 Linux/Windows cargo check 失败。
+tower = "0.5"
+bytes = "1"
+include_dir = "0.7"
+mime_guess = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = "0.2"
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplication"] }
-tower = "0.5"
-tower-service = "0.3"
-http = "1"
-bytes = "1"
-include_dir = "0.7"
-mime_guess = "2"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [features]
 # 默认空,自定义 protocol 在打包时启用
