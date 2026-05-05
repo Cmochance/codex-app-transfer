@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
-"""Bundle build artifacts into release/ with sha256 + signature + latest.json.
+"""Sign release artifacts (sha256 + .sig) and emit latest.json.
 
-Cross-platform replacement for the asset bundling part of New-Release.ps1.
-Runs on macOS (after macos/build-macos.sh) and inside the Linux / Windows
-builder containers (after PyInstaller + makensis).
+Phase 2 起读取 GitHub Actions release.yml 已 rename 完的产物
+(dist-incoming/Codex-App-Transfer-v<V>-<plat>.<ext>), 不再调 PyInstaller /
+NSIS / 老 Docker 路径自己组装产物。
 
-Designed for incremental, per-platform invocation: re-running with --include
-windows replaces only the Windows-* files in release/ and keeps macOS / Linux
-files untouched. latest.json is regenerated from whatever is currently in
-release/ (i.e. it always reflects the latest signed artifacts on disk).
+支持 incremental, per-platform 调用: --include windows 只刷 release/ 中
+Windows-* 文件, 其他平台不动。latest.json 总是按 release/ 目录里的
+当前所有已签 asset 重新生成。
 
-Signature scheme: RSA-3072 PKCS#1 v1.5 + SHA-256, key in PEM.
-Verifier: use the Python cryptography snippet in README.md.
+签名: RSA-3072 PKCS#1 v1.5 + SHA-256, key 在 PEM。Verifier:
+
+    python -c "
+    import base64, sys
+    from pathlib import Path
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    pub = serialization.load_pem_public_key(
+        Path('release/Codex-App-Transfer-release-public.pem').read_bytes())
+    asset = sys.argv[1]
+    sig = base64.b64decode(Path(asset + '.sig').read_text())
+    pub.verify(sig, Path(asset).read_bytes(), padding.PKCS1v15(), hashes.SHA256())
+    print('OK')
+    "
 """
 from __future__ import annotations
 
@@ -24,8 +35,6 @@ import os
 import re
 import shutil
 import sys
-import tarfile
-import zipfile
 from pathlib import Path
 
 try:
@@ -41,21 +50,23 @@ PROJECT_NAME = "Codex App Transfer"
 ASSET_PREFIX = "Codex-App-Transfer"
 PUBLIC_KEY_BASENAME = f"{ASSET_PREFIX}-release-public.pem"
 
-# Per-platform patterns and the platforms[] key in latest.json.
-# Each pattern is matched against the basename in release/.
+# Phase 2 后的 PLATFORM_PATTERNS:
+# - macOS:  .pkg 退役, 只保 .dmg (Tauri bundler 不直出 .pkg)
+# - Linux:  .tar.gz / 无后缀 onefile 退役, 替换为 .deb (推荐) + .AppImage (兜底)
+# - Windows: Portable.zip / x64.exe (PyInstaller onefile) 退役,
+#            替换为 -Setup.exe (NSIS) + .msi (WiX)
 PLATFORM_PATTERNS: dict[str, list[tuple[str, str]]] = {
     "windows": [
-        (r"-Windows-Portable\.zip$", "windows-x64"),
-        (r"-Windows-x64\.exe$", "windows-x64"),
-        (r"-Windows-Setup\.exe$", "windows-x64"),
+        (r"-Windows-x64-Setup\.exe$", "windows-x64"),
+        (r"-Windows-x64\.msi$", "windows-x64"),
     ],
     "macos": [
-        (r"-macOS-arm64\.(?:pkg|dmg)$", "macos-arm64"),
-        (r"-macOS-x64\.(?:pkg|dmg)$", "macos-x64"),
+        (r"-macOS-arm64\.dmg$", "macos-arm64"),
+        (r"-macOS-x64\.dmg$", "macos-x64"),
     ],
     "linux": [
-        (r"-Linux-x86_64\.tar\.gz$", "linux-x86_64"),
-        (r"-Linux-x86_64$", "linux-x86_64"),
+        (r"-Linux-x86_64\.deb$", "linux-x86_64"),
+        (r"-Linux-x86_64\.AppImage$", "linux-x86_64"),
     ],
 }
 
@@ -155,82 +166,35 @@ def clean_platform(release_dir: Path, platform_name: str) -> None:
                 break
 
 
-def collect_windows(root: Path, release_dir: Path, version: str) -> list[Path]:
-    dist = root / "dist"
-    folder = dist / ASSET_PREFIX
-    onefile = dist / f"{ASSET_PREFIX}.exe"
-    setup = root / f"{ASSET_PREFIX}-Setup-{version}.exe"
+def collect_from_incoming(
+    incoming_dir: Path,
+    release_dir: Path,
+    version: str,
+    platform_name: str,
+) -> list[Path]:
+    """Copy already-renamed artifacts from incoming_dir → release_dir for one platform.
 
-    out: list[Path] = []
-
-    if folder.is_dir():
-        portable = release_dir / f"{ASSET_PREFIX}-v{version}-Windows-Portable.zip"
-        if portable.exists():
-            portable.unlink()
-        with zipfile.ZipFile(portable, "w", zipfile.ZIP_DEFLATED) as zf:
-            for p in folder.rglob("*"):
-                if p.is_file():
-                    zf.write(p, p.relative_to(folder))
-        out.append(portable)
-
-    if onefile.is_file():
-        target = release_dir / f"{ASSET_PREFIX}-v{version}-Windows-x64.exe"
-        shutil.copyfile(onefile, target)
-        out.append(target)
-
-    if setup.is_file():
-        target = release_dir / f"{ASSET_PREFIX}-v{version}-Windows-Setup.exe"
-        shutil.copyfile(setup, target)
-        out.append(target)
-    elif folder.is_dir() or onefile.is_file():
-        # 有 portable / onefile 但没 Setup 时,Setup 缺失绝大概率是 build 没跑全;
-        # 报错而不是静默(老版本就是这里漏了,导致 1.0.1 release 没 Setup 包)。
-        if os.environ.get("CCDS_SKIP_INSTALLER") != "1":
-            raise SystemExit(
-                f"ERROR: Windows Portable/onefile present but Setup installer missing.\n"
-                f"       Expected: {setup}\n"
-                f"       Re-run windows builder; if you really mean to skip, set CCDS_SKIP_INSTALLER=1."
-            )
-
-    return out
-
-
-def collect_mac(root: Path, release_dir: Path, version: str) -> list[Path]:
-    mac_dist = root / "dist" / "mac"
-    if not mac_dist.is_dir():
+    release.yml 的 build job 把 Tauri 默认产物 cp 到 staging/, upload-artifact
+    后 release-bundle job 用 download-artifact 落到 dist-incoming/。文件名
+    在 build job rename 阶段已经是 ASSET_PREFIX-vV-PLAT.EXT, 这里只做
+    "按 platform 过滤 + cp 到 release/"。
+    """
+    if not incoming_dir.is_dir():
         return []
-
     out: list[Path] = []
-    for arch in ("arm64", "x64"):
-        for ext in ("pkg", "dmg"):
-            src = mac_dist / f"{ASSET_PREFIX}-v{version}-macOS-{arch}.{ext}"
-            if src.is_file():
-                target = release_dir / src.name
-                shutil.copyfile(src, target)
+    for entry in sorted(incoming_dir.iterdir()):
+        if not entry.is_file():
+            continue
+        if not entry.name.startswith(f"{ASSET_PREFIX}-v{version}-"):
+            continue
+        for pattern, _platform_key in PLATFORM_PATTERNS[platform_name]:
+            if re.search(pattern, entry.name):
+                target = release_dir / entry.name
+                if target.exists():
+                    target.unlink()
+                shutil.copyfile(entry, target)
                 out.append(target)
-    return out
-
-
-def collect_linux(root: Path, release_dir: Path, version: str) -> list[Path]:
-    folder = root / "dist" / "linux-folder" / ASSET_PREFIX
-    onefile = root / "dist" / "linux-onefile" / ASSET_PREFIX
-
-    out: list[Path] = []
-
-    if folder.is_dir():
-        tarball = release_dir / f"{ASSET_PREFIX}-v{version}-Linux-x86_64.tar.gz"
-        if tarball.exists():
-            tarball.unlink()
-        with tarfile.open(tarball, "w:gz") as tar:
-            tar.add(folder, arcname=ASSET_PREFIX)
-        out.append(tarball)
-
-    if onefile.is_file():
-        target = release_dir / f"{ASSET_PREFIX}-v{version}-Linux-x86_64"
-        shutil.copyfile(onefile, target)
-        target.chmod(0o755)
-        out.append(target)
-
+                break
     return out
 
 
@@ -285,6 +249,12 @@ def parse_args() -> argparse.Namespace:
         help="Which platforms' artifacts to (re)scan and sign (default: all three).",
     )
     parser.add_argument(
+        "--incoming-dir",
+        default="dist-incoming",
+        help="Directory containing already-renamed artifacts from release.yml "
+        "build job (default: dist-incoming).",
+    )
+    parser.add_argument(
         "--output-dir",
         default="release",
         help="Output directory under project root (default: release).",
@@ -301,6 +271,7 @@ def main() -> int:
     args = parse_args()
     root = project_root()
     release_dir = root / args.output_dir
+    incoming_dir = root / args.incoming_dir
     key_dir = root / ".release-signing"
 
     release_dir.mkdir(parents=True, exist_ok=True)
@@ -309,17 +280,15 @@ def main() -> int:
     include = set(args.include)
     platforms: dict[str, list[dict]] = {}
 
-    # Process --include platforms: clean their files in release/, copy/zip from
-    # dist/, sign, and record the asset dict.
-    for platform_name, collector in (
-        ("windows", collect_windows),
-        ("macos", collect_mac),
-        ("linux", collect_linux),
-    ):
+    # 处理 --include 平台: 清 release/ 中该平台旧文件 → 从 incoming_dir cp →
+    # 签名 + 索引到 latest.json。
+    for platform_name in ("windows", "macos", "linux"):
         if platform_name not in include:
             continue
         clean_platform(release_dir, platform_name)
-        files = collector(root, release_dir, args.version)
+        files = collect_from_incoming(
+            incoming_dir, release_dir, args.version, platform_name
+        )
         for f in files:
             asset = sign_and_index(f, private_key, args.repo, args.version)
             for pattern, platform_key in PLATFORM_PATTERNS[platform_name]:
@@ -327,8 +296,8 @@ def main() -> int:
                     platforms.setdefault(platform_key, []).append(asset)
                     break
 
-    # Pick up platforms that weren't rebuilt this run by reading the already-signed
-    # files left in release/ from previous invocations.
+    # 没在 --include 里的平台: 从 release/ 上次跑已签的文件读出, 让 latest.json
+    # 仍然完整描述全部 3 平台 (incremental release 场景)。
     for platform_name in PLATFORM_PATTERNS:
         if platform_name in include:
             continue
@@ -341,7 +310,6 @@ def main() -> int:
                     platforms.setdefault(platform_key, []).append(asset)
                     break
 
-    # Stable ordering inside each platform's assets list (by filename).
     sorted_platforms: dict[str, dict] = {}
     for key in sorted(platforms):
         sorted_platforms[key] = {
