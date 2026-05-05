@@ -1,7 +1,0 @@
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-testpaths = ["tests"]
-addopts = "-ra"
-# 让 `from tests.replay import ...` 在 pytest 9 默认 import mode 下工作。
-# pytest 9 不再自动把 rootdir 加进 sys.path,需要显式声明。
-pythonpath = ["."]

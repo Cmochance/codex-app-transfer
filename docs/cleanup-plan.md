@@ -240,21 +240,204 @@ jobs:
 
 ### Phase 3 — 跨语言契约工具改造
 
-**`scripts/gen_registry_fixtures.py` + `crates/registry/tests/python_compat.rs`**
-- 当前作用:Python 端用 `backend/config.py` / `backend/registry.py` 生成 4 份 JSON fixture,Rust 端读取后做字节级 round-trip 断言,**双源真相校验**。
-- backend/ 删了之后,这条路就断了。Python 不再是"权威源",fixture 只剩 Rust 一边的 golden file。
-- **方案**:fixtures 改成 Rust 自己生成 + 入库 golden,`gen_registry_fixtures.py` 改写成 `xtask gen-fixtures`(`cargo run -p xtask -- gen-fixtures`),CI 步骤改成"Rust 生成一遍 → `git diff --exit-code`"。删掉 `python_compat.rs` 里跟 Python 比对的部分,只留 round-trip。
+**目标**:把仓库剩余的 Python 工具(`gen_registry_fixtures.py` + `release_assets.py` + `tests/replay/*.py` + `test_replay_smoke.py`)全部用 Rust `xtask` 重写或删除,实现"仓库只有 Rust + JS(frontend + worker) + 少量 shell"。
 
-**`tests/replay/{fixture,player,recorder}.py` + `test_replay_smoke.py`**
-- 当前作用:fixture JSON schema 是语言中立的(`crates/proxy/src/fixture.rs` 已经复刻 schema);Python 这套主要给"录制新 fixture"用,player 给老 Python 测试驱动用。
-- 现 Rust 集成测试(`crates/proxy/tests/streaming_passthrough.rs`、`crates/adapters/tests/responses_streaming.rs`)直接读 fixture JSON,不走 Python player。
-- **方案**:删 `player.py`、`fixture.py`、`test_replay_smoke.py`。`recorder.py` 是录制工具,以后录新 fixture 改用一次性 `curl + tee` 或一次性 Rust 工具。fixture JSON 文件保留(Rust 测试要读)。
-- CI 里删 `python-replay-tests` job。
+#### 3.1 现状盘点(Phase 2 完成后)
 
-**`scripts/release_assets.py`**
-- 作用:扫 `release/` 算 sha256 + RSA-3072 PKCS#1 v1.5 + SHA-256 签名 + 生 `latest.json`。
-- 这个跟 Python 还是 Rust 没本质关系,是个独立 ~380 行的本地资产打包工具(不进二进制)。
-- **方案**:Phase 2 完成后顺手用 Rust 重写为 `xtask release-bundle`,这样仓库就真正只有 Rust + JS(frontend + worker) + 少量 shell。`ring` 或 `rsa` crate 移植 RSA-3072 + SHA-256 不复杂。
+| 路径 | 状态 | Phase 3 处置 |
+|---|---|---|
+| `scripts/gen_registry_fixtures.py` (107 行) | **当前已死**:`from backend.config import ...` 在 Phase 1 删 backend 后失败 | 删除,改 `xtask gen-fixtures` |
+| `tests/replay/fixtures/registry/*.json` (4 份) | 仍 commit 在仓库,`python_compat.rs` 读它们做 round-trip | **保留**(权威源从 Python 改成 xtask + commit) |
+| `crates/registry/tests/python_compat.rs` (146 行, 5 测试) | 仍跑通,但名字 + 注释提"Python 比对"已过时 | 改名 `golden_compat.rs` + 删冗余测试 + 加自检 |
+| `tests/replay/__init__.py` / `fixture.py` / `player.py` / `recorder.py` | Python 录制 / 回放工具,Rust 集成测试不走它们 | 全删 |
+| `tests/test_replay_smoke.py` | CI `python-replay-tests` job 跑它 | 删 + 删 CI job |
+| `scripts/release_assets.py` (重写后约 280 行) | Phase 2 调通的 Tauri 输出适配版 | Rust 重写为 `xtask release-bundle` |
+| `requirements.txt` / `pyproject.toml` | release_assets.py 用 `cryptography` | xtask 替代后删(留给 Phase 4 收尾,但 Phase 3 已可删) |
+
+#### 3.2 设计决策矩阵
+
+| 决策点 | 选项 | 选择 | 理由 |
+|---|---|---|---|
+| RSA crate | (a) `ring`(快,FFI) / (b) `rsa`(纯 Rust) | **(b) `rsa = "0.9"`** | release-bundle 不是性能敏感(每个 release 跑 1 次,几十个文件签名 < 1s);`rsa` 纯 Rust 不依赖 system crypto,GH Actions 跑无环境差异;API 比 `ring` 友好 |
+| xtask binary 命名 | (a) `cargo xtask <sub>` (符号链接 alias) / (b) `cargo run -p xtask --release -- <sub>` | **(b)** | 不引入 `.cargo/config.toml` alias 复杂度;CI 直接用,本地可加 `make` shortcut |
+| fixture round-trip 校验 | (a) 删 `python_compat.rs` 全部 5 测试,只在 CI 跑反向 diff / (b) 留 round-trip 测试,**额外**加 CI 反向 diff | **(b)** | round-trip 测试是单元级保险,反向 diff 是端到端保险,两层都要 |
+| `recorder.py` 去留 | (a) Rust 重写 / (b) 删,以后录新 fixture 用 `curl + tee` 临时手工 | **(b)** | recorder 一年用不到几次,Rust 重写工作量 > 收益;留 README 一行说明 "录新 fixture: curl ... > target.json" 即可 |
+| `tests/replay/fixtures/` 路径 | (a) 移到 `crates/registry/tests/fixtures/` 让物理位置贴近 / (b) 保留现路径 | **(b)** | 跨多个 crate 用(registry/proxy/adapters tests 都读),共享一份就行;移路径还要改一堆 `..` 相对引用,不值 |
+| Python 残留删除时机 | (a) Phase 3 同 PR 删 / (b) Phase 4 收尾再删 | **(a)** | xtask 一旦上线 Python 即彻底无用,留着只是干扰;Phase 4 留 README/Makefile/migration-plan 修订日志收尾 |
+
+#### 3.3 xtask crate 蓝图
+
+新增 `xtask/Cargo.toml`:
+
+```toml
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+
+# release-bundle only
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+walkdir = "2"
+regex = "1"
+
+# gen-fixtures only
+codex-app-transfer-registry = { path = "../crates/registry" }
+```
+
+`Cargo.toml` workspace.members 把注释里的 `# "xtask"` 启用。
+
+`xtask/src/main.rs`:用 clap derive 出两个子命令 `gen-fixtures` 和 `release-bundle`。
+
+#### 3.4 `xtask gen-fixtures` 实现要点
+
+复刻 `gen_registry_fixtures.py` 的 4 份输出:
+1. `default_config.json` — `Config::default()` 序列化(无末尾换行)
+2. `with_provider.json` — default + 1 个合成 provider(中文 name、所有必备字段、6 model 槽位)
+3. `builtin_presets.json` — `builtin_presets()` 的 `Vec<Provider>` 序列化
+4. `library_entry.json` — 1 个 library 条目(末尾**带** `\n`,经 `save_raw_library` 写)
+
+关键约束:必须**字节级**与 commit 在仓库的当前 fixture 一致。验证手段:
+- 实现完先本地跑 `cargo run -p xtask -- gen-fixtures`
+- `git diff --exit-code -- tests/replay/fixtures/registry/` 应为空
+- 不空则要么 fixture 落后(Rust schema 已更新),要么实现有 bug;两种情况下手工修正
+
+输出格式细节:`serde_json::to_string_pretty`(默认 indent=2、key 顺序保留(`preserve_order` feature)、非 ASCII 不转义)— 跟 Python 的 `json.dump(ensure_ascii=False, indent=2)` 等价(Phase 0 已验证)。Library 条目额外 `f.write("\n")`。
+
+#### 3.5 `xtask release-bundle` 实现要点
+
+CLI 兼容现 `release_assets.py`:
+
+```
+xtask release-bundle \
+  --version <X.Y.Z> \
+  [--include macos linux windows] \
+  [--incoming-dir dist-incoming] \
+  [--output-dir release] \
+  [--repo owner/repo]
+```
+
+核心算法逐项 1:1 复刻:
+
+| 函数 | Python | Rust |
+|---|---|---|
+| `get_or_create_key` | `cryptography.rsa.generate_private_key` PKCS#8 PEM | `rsa::RsaPrivateKey::new` + `rsa::pkcs8::EncodePrivateKey::to_pkcs8_pem` |
+| `sha256_of` | `hashlib.sha256` 流式 1MB | `sha2::Sha256` + `BufReader` 1MB chunks |
+| `sign_file` | `private_key.sign(bytes, PKCS1v15(), SHA256())` | `rsa::Pkcs1v15Sign::new::<sha2::Sha256>()` + `private_key.sign(...)`,base64 encode |
+| `latest.json` schema | `dict` → `json.dumps(indent=2, ensure_ascii=False)` | `serde_json::to_string_pretty` + `serde_json::Value`(preserve_order) |
+| `PLATFORM_PATTERNS` | Python regex | `regex` crate |
+| `pub_date` | `datetime.utcnow()` | `chrono::Utc::now()` 同样格式 `%Y-%m-%dT%H:%M:%SZ` |
+
+**密钥兼容性硬要求**:Rust 生成的 PKCS#8 PEM 必须能被 `cryptography` 读(以及反向)。`rsa = "0.9"` 的 `EncodePrivateKey`/`DecodePrivateKey` 走标准 PKCS#8,`cryptography` 也走同标准 — 兼容。**实施时单测验证**:加一个 test 读 Phase 2 已存在的 `.release-signing/release-private-key.pem`,sign 同一段 bytes,验证签名能被 Python `cryptography` 验过(reverse 测试)。
+
+#### 3.6 `python_compat.rs` → `golden_compat.rs` 改造
+
+文件改名 `crates/registry/tests/golden_compat.rs`,**保留全部 7 个测试,只改名 + 改注释**(原 plan 想删 `typed_config_can_parse_*` 2 个,落地时发现它们检查"字段值正确"是反向 diff + round-trip 都不覆盖的另一维度,**留着不亏**):
+
+| 原测试名 | 新测试名 | 调整 |
+|---|---|---|
+| `default_config_roundtrip` | (同) | 无 |
+| `with_provider_roundtrip` | (同) | 无 |
+| `builtin_presets_roundtrip_python_dump` | `builtin_presets_roundtrip` | 去 `_python_dump` 后缀 |
+| `library_entry_roundtrip` | (同) | 无 |
+| `rust_embedded_presets_match_python_dump` | `rust_embedded_presets_match_committed_fixture` | 语义改"对照 commit golden"而非"对照 Python dump" |
+| `typed_config_can_parse_python_default` | `typed_config_can_parse_default` | 去 `_python` 中缀 |
+| `typed_config_can_parse_python_with_provider` | `typed_config_can_parse_with_provider` | 同上 |
+
+文件头注释 + panic message 中 `python` / `gen_registry_fixtures.py` 提法换成 `golden` / `xtask gen-fixtures` + git 维护权威源闭环说明。
+
+#### 3.7 CI 反向 diff(ci.yml 加一 step)
+
+在 `cargo test --workspace` 之后加:
+
+```yaml
+- name: Verify fixtures regenerable
+  run: |
+    cargo run -p xtask --release -- gen-fixtures
+    git diff --exit-code -- tests/replay/fixtures/registry/
+```
+
+任何 `crates/registry` 的 schema / 序列化器变动 + 忘记重新 commit fixture → CI 立即红,error message 引导用户 `cargo run -p xtask -- gen-fixtures && git add -p tests/replay/fixtures/registry/`。
+
+同步**删**老的 `python-replay-tests` job(整段)。
+
+#### 3.8 release.yml 切 xtask
+
+改 `.github/workflows/release.yml` 的 release-bundle job:
+- **删** `actions/setup-python@v5` step
+- **删** `pip install cryptography` step
+- **改** `python scripts/release_assets.py --version ... --include ...` →
+  `cargo run -p xtask --release -- release-bundle --version ... --include ...`
+- **加** `Swatinem/rust-cache@v2`(workspaces "." key xtask) 复用 build job 的 cache
+
+#### 3.9 文件级 diff 清单
+
+**新增**:
+- `xtask/Cargo.toml`
+- `xtask/src/main.rs`(clap 解析 + 子命令分发)
+- `xtask/src/gen_fixtures.rs`
+- `xtask/src/release_bundle.rs`
+
+**修改**:
+- `Cargo.toml`(根) — workspace.members 把 `# "xtask"` 取消注释
+- `Cargo.lock` — 自动更新(rsa / sha2 / base64 / chrono / walkdir / regex / clap 等新增 transitive deps)
+- `crates/registry/tests/python_compat.rs` → 改名 `golden_compat.rs`,删 3 测试,改名 1 测试
+- `tests/replay/fixtures/registry/*.json` 注释/header 不变(JSON 文件本身无注释,只是文件 header 在文档里说明权威源)
+- `.github/workflows/ci.yml`(加反向 diff step + 删 `python-replay-tests` job)
+- `.github/workflows/release.yml`(切 xtask)
+- `docs/cleanup-plan.md` 修订日志追加
+
+**删除**:
+- `scripts/gen_registry_fixtures.py`
+- `scripts/release_assets.py`
+- `tests/replay/__init__.py`
+- `tests/replay/fixture.py`
+- `tests/replay/player.py`
+- `tests/replay/recorder.py`(以后录新 fixture 改用 `curl ... > tests/replay/fixtures/<X>.json`)
+- `tests/test_replay_smoke.py`
+- `requirements.txt`
+- `pyproject.toml`
+- `tests/replay/__pycache__/`(本地缓存,本来就 .gitignored,不在 commit 里)
+
+**保留**:
+- `tests/replay/fixtures/`(Rust 测试要读)
+
+#### 3.10 验收
+
+- `cargo run -p xtask -- gen-fixtures && git diff --exit-code -- tests/replay/fixtures/registry/` 干净
+- `cargo run -p xtask --release -- release-bundle --version 0.0.0-dryrun --include macos --incoming-dir <空目录>` 正常 fail("no platform artifacts found")而不 panic
+- 加一个临时 .release-signing/release-private-key.pem(Phase 2 留下的)+ 假 dist-incoming/ 含一份 .dmg → `xtask release-bundle` 出 release/{*.sig, *.sha256, latest.json} 与 Python 旧版本 byte-for-byte 一致(关键兼容性硬要求)
+- `release.yml` `gh workflow run -f version=2.0.2-rc1 --ref feature/cleanup-phase-3` dispatch 跑通三平台 + 签名 + draft release
+- `find . -name '*.py'` 应为空(排 `.venv/`)
+- `find . -name 'requirements.txt' -o -name 'pyproject.toml'` 应为空
+
+#### 3.11 回滚策略
+
+- **PR 内 commit 顺序**(关键防回滚):B(xtask gen-fixtures) → C(python_compat 改造 + CI 反向 diff)→ D(xtask release-bundle 实现 + 单测验证签名兼容)→ E(release.yml 切 xtask)→ F(删 Python 残留)。F 是最后一步,前面任何一步挂掉都不影响 Python 路径仍能跑
+- **DELETE-ONLY commit 单独成 F**:revert 只回 1 个 commit 就能恢复 Python 路径
+- **xtask release-bundle 必须先单测验证密钥兼容**(读 Phase 2 .release-signing/ 私钥,sign 一段 bytes,Python `cryptography` 反向验签),否则 Phase 2 release 出的老资产无法被新 xtask 验证 → 链断
+
+#### 3.12 范围明确**不做**(留给 Phase 4)
+
+- 不动 `README.md` / `docs/migration-plan.md` / `Makefile` 注释里的 Python 提法(Phase 4 收尾统一改)
+- 不删 `.gitignore`(Phase 4 检查 `.venv/` `.pytest_cache/` 是否漏)
+- 不重命名 `tests/replay/` 路径(不动文件位置)
 
 ### Phase 4 — 收尾
 
@@ -285,3 +468,5 @@ jobs:
 | 2026-05-05 | Phase 2 详细方案落地 | 把 §3 Phase 2 概念性段落扩充为 §2.1-2.8 子章节(决策矩阵 / release.yml 蓝图 / 文件 diff 清单 / 签名密钥迁移 / 产物命名映射 / 验收 / 回滚 / 不做项) | 概念描述不足以直接动手,细化后让 reviewer 在动代码之前先评设计 |
 | 2026-05-05 | Phase 2 §2.3/§2.5 修正 | 实施时尝试 `tauri.conf.json` 加 `bundle.fileName: "codex-app-transfer"` 让 Tauri 产物名摆脱空格,rename 逻辑直接写在 `release.yml` 的 ~30 行 bash case,**不再需要单独的 `rename-bundles.sh`**;`release_assets.py` 不是"微调路径"而是**整体重写**:删 `collect_windows/mac/linux`(假设 PyInstaller 输出),换 `collect_from_incoming(dist-incoming/)`,`PLATFORM_PATTERNS` 同步换为 `.dmg`/`.deb`/`.AppImage`/`-Setup.exe`/`.msi` | 调研 Tauri 2 实际产物形态后发现原设计估计过粗,落地修正 |
 | 2026-05-05 | Phase 2 cargo check 第一次红, 二次修正 tauri.conf.json | CI `cargo check` 报 `tauri-build` schema 校验失败:`unknown field "fileName"`(允许的 bundle.* 字段为 `active/targets/createUpdaterArtifacts/publisher/homepage/icon/resources/copyright/license/category/fileAssociations/short-description/long-description/use-local-tools-dir/external-bin/windows/linux/macOS/iOS/android`)。同时 `bundle.windows.{wix,nsis}` 空对象也无效。**撤回 `bundle.fileName` 和 `bundle.windows` 子段**,接受 Tauri 默认带空格产物名 `Codex App Transfer_<V>_<arch>.<ext>`,glob 用引号处理 | 之前的 plan 来自外部调研建议,Tauri 2 实际 schema 与建议不符;落地必须以 `tauri-build` 实际校验结果为准 |
+| 2026-05-05 | Phase 3 详细方案落地 | 把 §3 Phase 3 概念性段落扩充为 §3.1-3.12 子章节(现状盘点 / 决策矩阵 / xtask crate 蓝图 / gen-fixtures 实现要点 / release-bundle 实现要点 / golden_compat 改造 / CI 反向 diff / release.yml 切 xtask / 文件 diff 清单 / 验收 / 回滚策略 / 不做项)。RSA crate 选 `rsa = "0.9"` 而非 `ring`(纯 Rust 不依赖 system crypto + API 更友好,release-bundle 非性能敏感) | Phase 3 涉及 xtask 重写 + 删大量 Python,概念描述不足;细化后让 reviewer 在动代码之前先评关键决策(RSA crate / xtask CLI 命名 / fixture 路径 / Python 删除时机) |
+| 2026-05-05 | Phase 3 §3.6 修正 | 落地 golden_compat 改造时**保留全部 7 测试只改名**,而非原 plan 想删 `typed_config_can_parse_*` 2 个。原因:`typed_config_can_parse_*` 验证"typed Config struct 能消化 fixture + 字段值正确",这是 round-trip 字节级 / 反向 diff 都不覆盖的另一维度(语义层断言,如 `proxy_port == 18080`)| 删测试丢覆盖,改名 + 调注释成本极低 |

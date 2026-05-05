@@ -227,11 +227,12 @@ jobs:
           path: dist-incoming
           merge-multiple: true
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
 
-      - run: pip install cryptography
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: xtask-release-bundle
 
       - name: Resolve VERSION
         id: ver
@@ -256,16 +257,12 @@ jobs:
           printf '%s\n' "$KEY" > .release-signing/release-private-key.pem
           chmod 600 .release-signing/release-private-key.pem
 
-      - name: Run release_assets.py
+      - name: xtask release-bundle (Phase 3 起 Rust 替代 release_assets.py)
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           ls -la dist-incoming/
-          # Phase 2 Commit C 会把 release_assets.py 的 collect_* 改为
-          # 接受 dist-incoming/ 下已 rename 的产物。本 commit (B) 此 step
-          # 暂时会因路径不匹配报 "no platform artifacts found" 退 1 —
-          # 完整 release pipeline 在 Commit C 之后整体生效。
-          python scripts/release_assets.py \
+          cargo run -p xtask --release -- release-bundle \
             --version "${{ steps.ver.outputs.version }}" \
             --include macos linux windows
 
