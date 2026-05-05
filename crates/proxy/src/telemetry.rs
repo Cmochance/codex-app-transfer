@@ -88,6 +88,7 @@ pub struct LogBuffer {
     logs: Mutex<Vec<ProxyLogEntry>>,
     max_size: usize,
     file_lock: Mutex<()>,
+    log_dir_override: Option<PathBuf>,
 }
 
 impl LogBuffer {
@@ -96,6 +97,17 @@ impl LogBuffer {
             logs: Mutex::new(Vec::new()),
             max_size,
             file_lock: Mutex::new(()),
+            log_dir_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_in_dir(max_size: usize, log_dir: PathBuf) -> Self {
+        Self {
+            logs: Mutex::new(Vec::new()),
+            max_size,
+            file_lock: Mutex::new(()),
+            log_dir_override: Some(log_dir),
         }
     }
 
@@ -128,7 +140,7 @@ impl LogBuffer {
     }
 
     fn append_to_file(&self, now: DateTime<Local>, level: &str, message: &str) {
-        let Some(dir) = proxy_log_dir() else {
+        let Some(dir) = self.log_dir() else {
             return;
         };
         if fs::create_dir_all(&dir).is_err() {
@@ -149,13 +161,13 @@ impl LogBuffer {
     }
 
     fn archive_logs(&self) {
-        let Some(dir) = proxy_log_dir() else {
+        let Some(dir) = self.log_dir() else {
             return;
         };
         if !dir.is_dir() {
             return;
         }
-        let backup_dir = proxy_log_backup_dir();
+        let backup_dir = self.log_backup_dir();
         if fs::create_dir_all(&backup_dir).is_err() {
             return;
         }
@@ -181,6 +193,16 @@ impl LogBuffer {
             }
             let _ = fs::rename(&src, dst);
         }
+    }
+
+    fn log_dir(&self) -> Option<PathBuf> {
+        self.log_dir_override.clone().or_else(proxy_log_dir)
+    }
+
+    fn log_backup_dir(&self) -> PathBuf {
+        self.log_dir()
+            .unwrap_or_else(|| PathBuf::from(".codex-app-transfer").join("logs"))
+            .join("backup")
     }
 }
 
@@ -209,8 +231,88 @@ pub fn proxy_log_dir() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("logs"))
 }
 
-fn proxy_log_backup_dir() -> PathBuf {
-    proxy_log_dir()
-        .unwrap_or_else(|| PathBuf::from(".codex-app-transfer").join("logs"))
-        .join("backup")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("codex-app-transfer-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn stats_records_success_failed_and_today() {
+        let stats = ProxyStats::default();
+
+        stats.record(true);
+        stats.record(false);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.total, 2);
+        assert_eq!(snapshot.success, 1);
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(snapshot.today, 2);
+    }
+
+    #[test]
+    fn log_buffer_keeps_recent_entries_and_writes_daily_file() {
+        let dir = unique_temp_dir("logs-write");
+        let buffer = LogBuffer::new_in_dir(2, dir.clone());
+
+        buffer.add("INFO", "first request");
+        buffer.add("ERROR", "failed request");
+        buffer.add("SUCCESS", "finished request");
+
+        let entries = buffer.get_all();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].level, "ERROR");
+        assert_eq!(entries[0].message, "failed request");
+        assert_eq!(entries[1].level, "SUCCESS");
+        assert_eq!(entries[1].message, "finished request");
+
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let log_path = dir.join(format!("proxy-{today}.log"));
+        let content = fs::read_to_string(log_path).unwrap();
+        assert!(content.contains("\tINFO\tfirst request"));
+        assert!(content.contains("\tERROR\tfailed request"));
+        assert!(content.contains("\tSUCCESS\tfinished request"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_buffer_clear_archives_proxy_log_files() {
+        let dir = unique_temp_dir("logs-clear");
+        let buffer = LogBuffer::new_in_dir(20, dir.clone());
+
+        buffer.add("INFO", "before clear");
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let log_path = dir.join(format!("proxy-{today}.log"));
+        assert!(log_path.exists());
+
+        buffer.clear();
+
+        assert!(buffer.get_all().is_empty());
+        assert!(!log_path.exists());
+
+        let backup_dir = dir.join("backup");
+        let archived: Vec<PathBuf> = fs::read_dir(&backup_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .starts_with(&format!("proxy-{today}_")));
+        let content = fs::read_to_string(&archived[0]).unwrap();
+        assert!(content.contains("\tINFO\tbefore clear"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }
