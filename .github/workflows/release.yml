@@ -81,8 +81,22 @@ jobs:
           workspaces: '. -> target'
           key: ${{ matrix.target }}
 
-      - uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall -y tauri-cli@^2
+      # cargo binstall 在 windows-latest 上偶发卡死(PR #3 dispatch test 30+ min
+      # 无进展); cargo install 稳但 windows-latest 冷编译 tauri-cli 需 15-25 min
+      # (PR #6 dispatch test 实测 10 min 不够). 给独立 cache + timeout 25 min.
+      - name: Cache cargo-tauri binary
+        id: cache-tauri-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/bin/cargo-tauri.exe
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-tauri-cli-v2
+
+      - name: Install tauri-cli
+        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
+        timeout-minutes: 25
+        run: cargo install tauri-cli --version "^2" --locked
 
       - name: Resolve VERSION
         id: ver
@@ -117,13 +131,23 @@ jobs:
             > ~/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8
           echo "APPLE_API_KEY_PATH=$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8" >> $GITHUB_ENV
 
+      # macOS Apple env: GH Actions secret 未配置时, 直接传到 env 会变成空字符串,
+      # 导致 codesign 用空 identity 失败 ("The specified item could not be found
+      # in the keychain", PR #6 dispatch test 实测). 这里把 secret 接到带 _RAW
+      # 后缀的 env 上, run 内显式判空再 export, 空时不暴露给 cargo tauri build,
+      # 让 Tauri 走 ad-hoc 签名路径 (默认行为).
       - name: cargo tauri build
         working-directory: src-tauri
+        shell: bash
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-        run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          APPLE_SIGNING_IDENTITY_RAW: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER_RAW: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_RAW: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          [[ -n "$APPLE_SIGNING_IDENTITY_RAW" ]] && export APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY_RAW"
+          [[ -n "$APPLE_API_ISSUER_RAW" ]] && export APPLE_API_ISSUER="$APPLE_API_ISSUER_RAW"
+          [[ -n "$APPLE_API_KEY_RAW" ]] && export APPLE_API_KEY="$APPLE_API_KEY_RAW"
+          cargo tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
 
       - name: Rename bundles to project naming
         shell: bash
@@ -131,40 +155,60 @@ jobs:
           set -euo pipefail
           V="${{ steps.ver.outputs.version }}"
           PLAT="${{ matrix.plat }}"
-          BDIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          # Cargo workspace 的 target_directory 是 workspace 根 (Cargo.toml
+          # [workspace] 所在目录), 即使 cargo tauri build 在 src-tauri/ 下跑,
+          # bundle 也输出到根级 target/, 不是 src-tauri/target/. PR #3 dispatch
+          # test 实测 Linux job upload-artifact 报 "No files were found"
+          # 即此 BDIR 路径错的征兆.
+          BDIR="target/${{ matrix.target }}/release/bundle"
           mkdir -p staging
 
           # Tauri 2 没有 bundle.fileName 字段, 默认产物名为
           # "Codex App Transfer_<V>_<arch>.<ext>" (productName 带空格透传).
-          # glob 已用引号 ("$BDIR"/dmg/*.dmg) 能命中带空格文件名;
-          # cp 时也用引号 cp "$f" "staging/...", 安全。
+          # glob 用引号 ("$BDIR"/dmg/*.dmg) 命中带空格文件名;
+          # cp 时也用引号 cp "$f" "staging/...", 安全.
 
+          shopt -s nullglob
           case "$PLAT" in
             macOS-arm64)
               for f in "$BDIR"/dmg/*.dmg; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.dmg"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.dmg"
               done
               ;;
             Linux-x86_64)
               for f in "$BDIR"/deb/*.deb; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.deb"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.deb"
               done
               for f in "$BDIR"/appimage/*.AppImage; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.AppImage"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.AppImage"
               done
               ;;
             Windows-x64)
               for f in "$BDIR"/nsis/*-setup.exe; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}-Setup.exe"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}-Setup.exe"
               done
               for f in "$BDIR"/msi/*.msi; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.msi"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.msi"
               done
               ;;
           esac
 
           echo "Staged artifacts for $PLAT:"
           ls -la staging/
+
+          # 显式空 staging 检查, 早 fail 而非拖到 upload-artifact step 才报错;
+          # 失败时 dump bundle 树前 200 行帮助 debug 路径问题.
+          files=(staging/*)
+          if (( ${#files[@]} == 0 )); then
+            echo "::error::No bundles staged for $PLAT from $BDIR"
+            echo "--- bundle tree under $BDIR (first 200 entries) ---"
+            find "$BDIR" -maxdepth 4 -type f 2>/dev/null | sort | sed -n "1,200p" || \
+              echo "($BDIR does not exist)"
+            echo "--- target tree (first 200 entries) ---"
+            find target -maxdepth 5 -type f 2>/dev/null | sort | sed -n "1,200p" || \
+              echo "(target does not exist)"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
