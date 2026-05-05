@@ -1,16 +1,25 @@
 name: ci
 
-# 回归门禁: Rust 工作区编译/测试 + xtask gen-fixtures 反向 diff.
+# 回归门禁分两层:
+# 1. rust-fast-check (always run, 无 apt) — fmt + workspace check/test (exclude
+#    src-tauri) + xtask gen-fixtures 反向 diff. 1-2 min, 覆盖 docs/xtask/普通
+#    crate 的 PR.
+# 2. rust-tauri-check (conditional run, 需 apt 装 webkit2gtk 等) — 仅 Tauri
+#    相关路径变动 (src-tauri/, frontend/, crates/, Cargo.{toml,lock}, 本
+#    workflow) 才跑 cargo check/test -p codex-app-transfer. 不跑就 skip 报
+#    success (job-level if 跳过 = 不卡 required check, 而 workflow-level
+#    paths filter 跳过会让 required check 永久 pending).
+#
 # 历史 job 演进:
-# - Leptos UI WASM 构建 job 已废弃 (v2.0.0 改用 frontend/ + cas://, Leptos 弃案)
-# - python-replay-tests job 已废弃 (Phase 3 删 Python, 删 tests/test_replay_smoke.py)
-# 详见 docs/migration-plan.md (Stage 6 架构调整) 与 docs/cleanup-plan.md (Phase 1/3)。
+# - Leptos UI WASM build 已废弃 (v2.0.0 改 frontend/ + cas://)
+# - python-replay-tests 已废弃 (Phase 3 删 Python)
+# - 早期单一 rust-workspace-check 每 PR 都 apt (~7 min) → 拆成上述 2 层
+# 详见 docs/migration-plan.md / docs/cleanup-plan.md / 本仓 PR codex review
 
 on:
   push:
     branches: [main]
   # branches 不限制, 让 stacked PR (base=feature/* 而非 main) 也跑 CI.
-  # GH Actions 免费额度对 public repo 无上限, 不必省 trigger.
   pull_request:
   workflow_dispatch:
 
@@ -19,15 +28,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust-workspace-check:
-    name: Rust · workspace cargo check
+  # 路径变动检测 (always runs, 极快 ~10s, 不装任何系统包).
+  # tauri 输出供 rust-tauri-check job-level if 用.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      tauri: ${{ steps.filter.outputs.tauri }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            tauri:
+              - 'src-tauri/**'
+              - 'frontend/**'
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/**'
+
+  # 快速门禁: always runs, 无 apt. 覆盖 fmt + 非 Tauri crate 的 check/test +
+  # xtask gen-fixtures 反向 diff. 排除 codex-app-transfer (src-tauri 包名),
+  # 因 src-tauri 编译需要 webkit2gtk 等系统依赖, 留给 rust-tauri-check.
+  rust-fast-check:
+    name: Rust · fast workspace check (no Tauri sysdeps)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # apt-get 偶发性卡 archive.ubuntu.com (曾出现 update 阶段挂 17min 才被 cancel)。
-      # 加 timeout + 3 次重试: 每次失败睡 30s,整步 8 分钟硬上限避免再卡死。
-      - name: Install Tauri Linux system deps
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: fast
+
+      - name: cargo fmt --check (workspace)
+        run: cargo fmt --all -- --check
+
+      - name: cargo check --workspace (exclude codex-app-transfer)
+        run: cargo check --workspace --all-targets --exclude codex-app-transfer
+
+      - name: cargo test --workspace (exclude codex-app-transfer)
+        run: cargo test --workspace --no-fail-fast --exclude codex-app-transfer
+
+      - name: Verify fixtures regenerable from Rust (xtask gen-fixtures)
+        run: |
+          cargo run -p xtask --release -- gen-fixtures
+          git diff --exit-code -- tests/replay/fixtures/registry/
+
+  # Tauri 相关检查: 仅 Tauri 路径有变动时才跑. 否则 skip = success, 不卡
+  # required check. apt 仍保留 retry + 8min timeout 兜底.
+  rust-tauri-check:
+    name: Rust · Tauri (src-tauri) check
+    needs: changes
+    if: needs.changes.outputs.tauri == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri Linux system deps (with retry)
         timeout-minutes: 8
         run: |
           set -e
@@ -53,30 +115,15 @@ jobs:
           echo "::error::apt failed after 3 attempts"
           exit 1
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target"
+          workspaces: '. -> target'
+          key: tauri
 
-      - name: cargo fmt --check (workspace)
-        run: cargo fmt --all -- --check
+      - name: cargo check -p codex-app-transfer
+        run: cargo check -p codex-app-transfer --all-targets
 
-      - name: cargo check --workspace
-        run: cargo check --workspace --all-targets
-
-      - name: cargo test --workspace
-        run: cargo test --workspace --no-fail-fast
-
-      # Phase 3 起的反向 diff 校验: xtask 重新生成 4 份 registry fixture,
-      # 与 commit 在仓库的 golden 字节级 diff. 任何 schema/数据变动忘记
-      # 同步 fixture 都会让 CI 红, 引导开发者跑
-      # `cargo run -p xtask -- gen-fixtures && git add tests/replay/fixtures/registry/`.
-      # crates/registry/tests/golden_compat.rs 是单元级 round-trip 保险, 这一步是
-      # 端到端"Rust 数据源 → 文件系统"全链路保险, 两层都要.
-      - name: Verify fixtures regenerable from Rust (xtask gen-fixtures)
-        run: |
-          cargo run -p xtask --release -- gen-fixtures
-          git diff --exit-code -- tests/replay/fixtures/registry/
+      - name: cargo test -p codex-app-transfer
+        run: cargo test -p codex-app-transfer --no-fail-fast
