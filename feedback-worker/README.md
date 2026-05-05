@@ -35,7 +35,7 @@ chmod +x setup-secrets.sh
 env -u CLOUDFLARE_API_TOKEN wrangler deploy
 ```
 
-部署完会输出 Worker URL,形如 `https://codex-app-transfer-feedback.<your-subdomain>.workers.dev`。把这个 URL 配到主项目 `backend/main.py` 的 `FEEDBACK_WORKER_URL`。
+部署完会输出 Worker URL,形如 `https://codex-app-transfer-feedback.<your-subdomain>.workers.dev`。当前 v2 主线的 `/api/feedback` 仍是 Rust 端暂存占位,Worker URL 接入会在后续 v2.0.x 中恢复;如果维护 v1.x 历史分支,请在对应 tag / branch 的 `backend/main.py` 中配置 `FEEDBACK_WORKER_URL`。
 
 ## 自测(curl)
 

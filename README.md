@@ -133,7 +133,7 @@ Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochanc
 - The forwarding service binds to `127.0.0.1` only and never hijacks the system proxy. Management API endpoints require an `x-cas-request: 1` header so generic web pages can't trigger local writes via cross-site requests.
 - Backup / export JSON files contain plaintext API keys — keep them on trusted devices only.
 - Logs append to `~/.codex-app-transfer/logs/proxy-YYYY-MM-DD.log`. Clearing logs archives them to `logs/backup/` with a timestamp suffix (no deletion).
-- Windows builds are not Authenticode-signed yet; verify downloads with the published `.sha256` / `.sig` (run `scripts/Test-ReleaseSignature.ps1 -File <asset>`).
+- Windows builds are not Authenticode-signed yet; verify downloads with the published `.sha256` / `.sig` and the Python verification snippet below.
 - This project is not affiliated with OpenAI, Anthropic, CC-Switch, or `farion1231/cc-switch`.
 
 ## 默认端口
@@ -172,14 +172,15 @@ pytest tests/test_replay_smoke.py
 
 ## 历史版本(v1.x / Python)
 
-v1.0.4 及更早版本基于 Python 3.11+ + FastAPI + pywebview + PyInstaller。源码仍在 `backend/` 和 `main.py` 中保留,可用以下命令运行:
+v1.0.4 及更早版本基于 Python 3.11+ + FastAPI + pywebview + PyInstaller。Phase 1 清理后,主线不再保留 `backend/` 和 `main.py`;如需运行历史 Python 版本,请切到对应 tag 或 GitHub Release 的 source archive:
 
 ```bash
+git checkout v1.0.4
 pip install -r requirements.txt
 python main.py
 ```
 
-但 v2.0.0 起主线只维护 Rust 实现。`backend/` 与 `main.py` 留作历史参考。
+v2.0.0 起主线只维护 Rust 实现。历史 Python 代码只通过 v1.x tag / release source archive 保留。
 
 ## 打包(v2)
 
@@ -199,16 +200,11 @@ v2.0.0 首发只 ship macOS arm64。Tauri 2 原生支持跨平台编译,后续 v
 
 ### 历史(v1.x / Python)打包
 
-v1.0.4 之前用 PyInstaller + Docker + Wine + NSIS 三平台打包,Makefile target `make mac-release`、`make linux-release`、`make win-release` 仍可工作但已停止维护。详见 `docs/build.md` 与各 `release-notes-v1.0.x.md`。
+v1.0.4 之前用 PyInstaller + Docker + Wine + NSIS 三平台打包。相关旧脚本已从主线清理;如需复现 v1.x 打包流程,请切到对应 v1.x tag 或 release source archive。主线后续正式发布链路会在 v2.0.x 中切到 Tauri bundler。
 
 ### 签名校验
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\Test-ReleaseSignature.ps1 `
-    -File release\Codex-App-Transfer-v1.0.3-Windows-Setup.exe
-```
-
-或在任意有 Python + cryptography 的环境里：
+可在任意有 Python + cryptography 的环境里验证：
 
 ```bash
 .venv/bin/python -c "
@@ -281,7 +277,7 @@ v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 
 - API Key 仅保存在本机 `~/.codex-app-transfer/config.json`，不要把它和 `logs/` 一起上传公开仓库。
 - 转发服务只监听 `127.0.0.1`，不接管系统代理；管理 API 强制要求 `x-cas-request: 1` 头部，避免普通网页跨站触发本地写操作。
 - 备份 / 导出配置的 JSON 文件包含 API Key 明文，仅在可信设备上保存。
-- 代码签名公钥位于 `release/Codex-App-Transfer-release-public.pem`，可用 `scripts/Test-ReleaseSignature.ps1 -File <asset>` 验证下载完整性。
+- 代码签名公钥位于 `release/Codex-App-Transfer-release-public.pem`，可用上文"签名校验"里的 Python 片段验证下载完整性。
 
 ## 致谢
 

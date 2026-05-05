@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-transfer"
-version = "2.0.0-stage0"
+version = "2.0.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -547,7 +547,6 @@ dependencies = [
  "codex-app-transfer-proxy",
  "codex-app-transfer-registry",
  "getrandom 0.2.17",
- "http",
  "include_dir",
  "mime_guess",
  "objc2 0.5.2",
@@ -561,7 +560,6 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "tower",
- "tower-service",
 ]
 
 [[package]]
