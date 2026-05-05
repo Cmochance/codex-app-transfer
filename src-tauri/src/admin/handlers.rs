@@ -339,8 +339,7 @@ async fn test_provider_connection(provider: &Value) -> Value {
     if matches!(
         response.status(),
         ReqwestStatusCode::NOT_FOUND | ReqwestStatusCode::METHOD_NOT_ALLOWED
-    ) && !provider_api_key(provider).is_empty()
-    {
+    ) {
         response = match client
             .post(&base_url)
             .headers(content_headers)
