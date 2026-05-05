@@ -1,12 +1,11 @@
-//! `apiFormat == "responses"` 适配器(Stage 3.2c · 仅文本流骨架).
+//! `apiFormat == "responses"` 适配器.
 //!
 //! 范围:
-//! - **请求侧**:Stage 3.2a 才做完整 Responses → Chat body 转换;本轮先把
-//!   path 从 `/v1/responses` 重定到 `/chat/completions`,body 透传(意味着
-//!   端到端真实场景 Codex CLI → 上游会失败,因为 body schema 对不上;
-//!   但**单元 / 集成测试可以独立 driving 响应侧**)。
-//! - **响应侧**:Chat SSE → Responses SSE 状态机(text-only)。tool / reasoning /
-//!   function call 留 Stage 3.3。
+//! - **请求侧**:把 Responses body 转成 Chat Completions body,并把
+//!   `/responses` / `/v1/responses` / `/openai/v1/responses` 重定向到
+//!   `/chat/completions`。
+//! - **响应侧**:把上游 Chat SSE 转回 Responses SSE,覆盖文本、reasoning、
+//!   tool call、legacy function_call 和 session cache 写回。
 
 pub mod converter;
 pub mod request;

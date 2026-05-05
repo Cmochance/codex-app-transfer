@@ -2,9 +2,7 @@
 //!
 //! 当前内置:
 //! - `openai_chat` → `OpenAiChatAdapter`
-//!
-//! Stage 3.2 起会注册 `responses` adapter,以及为部分 provider 注册其
-//! 专用 workaround adapter(如 deepseek 的 reasoning_content 字段处理)。
+//! - `responses` → `ResponsesAdapter`
 
 use std::sync::Arc;
 

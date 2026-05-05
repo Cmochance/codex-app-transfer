@@ -1,15 +1,17 @@
-//! Codex App Transfer · 代理转发主干(Stage 2).
+//! Codex App Transfer · 代理转发主干.
 //!
 //! 当前实现:
 //! - **B1 多 provider 路由**:`StaticResolver` 按 body `model = "<slug>/<real>"`
 //!   匹配 provider,失败 fallback 到 `default_provider_id`。
 //! - **B2 鉴权改写**:剥掉 incoming `Authorization`,按 `provider.auth_scheme`
 //!   注入 `Bearer <api_key>` 或 `X-Api-Key`,再叠 `provider.extra_headers`。
-//! - **HTTP/SSE 透传**:body 完整读取 → 必要时改写 model → reqwest 发起 →
-//!   响应字节流(`bytes_stream`)灌回 axum,流式 SSE 0 损耗。
+//! - **Adapter 协议层**:按 `provider.api_format` 选择 `openai_chat` 或
+//!   `responses` adapter,完成请求 body 与流式响应转换。
+//! - **HTTP/SSE 转发**:body 完整读取 → 必要时改写 model → reqwest 发起 →
+//!   响应字节流(`bytes_stream`)灌回 axum。
 //!
-//! 未实现(下阶段):provider 协议转换(`crates/adapters`,Stage 3)、
-//! OS 集成(`crates/codex_integration`,Stage 2.5)、WebSocket 透传。
+//! 当前 proxy router 没有注册 WebSocket upgrade 路由;对外承诺的是 HTTP/SSE
+//! 转发入口。
 
 pub mod fixture;
 pub mod forward;
