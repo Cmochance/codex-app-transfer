@@ -56,10 +56,7 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/providers/{id}/usage",
             post(handlers::query_provider_usage),
         )
-        .route(
-            "/api/providers/{id}/models",
-            put(handlers::update_models),
-        )
+        .route("/api/providers/{id}/models", put(handlers::update_models))
         .route(
             "/api/providers/{id}/models/available",
             get(handlers::fetch_provider_models),
@@ -72,10 +69,7 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/providers/compatibility",
             get(handlers::provider_compatibility),
         )
-        .route(
-            "/api/providers/test",
-            post(handlers::test_provider_payload),
-        )
+        .route("/api/providers/test", post(handlers::test_provider_payload))
         .route(
             "/api/providers/models/available",
             post(handlers::fetch_provider_models_payload),
@@ -119,4 +113,3 @@ pub fn build_app_router(state: AdminState) -> Router {
         .fallback(static_files::serve_static)
         .with_state(state)
 }
-

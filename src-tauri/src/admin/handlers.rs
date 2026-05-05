@@ -343,8 +343,7 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
     if let Err(e) = save_registry(&cfg) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
-    Json(json!({"success": true, "provider": public_provider(&new_provider_value)}))
-        .into_response()
+    Json(json!({"success": true, "provider": public_provider(&new_provider_value)})).into_response()
 }
 
 pub async fn update_provider(
@@ -754,11 +753,7 @@ pub async fn start_proxy(
 ) -> impl IntoResponse {
     let port = body
         .and_then(|b| b.0.port)
-        .or_else(|| {
-            load_registry()
-                .ok()
-                .map(|cfg| read_proxy_port(&cfg))
-        })
+        .or_else(|| load_registry().ok().map(|cfg| read_proxy_port(&cfg)))
         .unwrap_or(18080);
     match state.proxy_manager.start(port).await {
         Ok(s) => Json(json!({
@@ -811,10 +806,7 @@ pub async fn get_settings() -> impl IntoResponse {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let settings = cfg
-        .get("settings")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
     Json(settings).into_response()
 }
 
@@ -872,11 +864,7 @@ pub async fn update_check() -> impl IntoResponse {
 }
 
 pub async fn update_install(Json(_input): Json<Value>) -> impl IntoResponse {
-    err(
-        StatusCode::NOT_IMPLEMENTED,
-        "update install 暂未实现",
-    )
-    .into_response()
+    err(StatusCode::NOT_IMPLEMENTED, "update install 暂未实现").into_response()
 }
 
 // ── /api/feedback ────────────────────────────────────────────────────
