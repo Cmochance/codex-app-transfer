@@ -118,8 +118,13 @@ mod tests {
     }
 
     fn tempdir() -> std::path::PathBuf {
+        // cargo test 默认多线程并发跑测试,每次调用必须返回唯一目录;
+        // 否则 A 写 .tmp 时 B 的 remove_dir_all 会让 A 的 rename 拿到 ENOENT。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("cas-registry-test-{}", std::process::id()));
+        p.push(format!("cas-registry-test-{}-{}", std::process::id(), n));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
