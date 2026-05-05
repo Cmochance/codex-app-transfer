@@ -134,8 +134,15 @@ jobs:
       # macOS Apple env: GH Actions secret 未配置时, 直接传到 env 会变成空字符串,
       # 导致 codesign 用空 identity 失败 ("The specified item could not be found
       # in the keychain", PR #6 dispatch test 实测). 这里把 secret 接到带 _RAW
-      # 后缀的 env 上, run 内显式判空再 export, 空时不暴露给 cargo tauri build,
-      # 让 Tauri 走 ad-hoc 签名路径 (默认行为).
+      # 后缀的 env 上, run 内显式判空再 export, 空时不暴露给 cargo tauri build.
+      #
+      # macOS 无 Developer ID 路径(secret 未配): 拆 build 为两步,
+      # 中间显式 codesign --force --deep --sign - 做 ad-hoc bundle 签名 +
+      # codesign --verify 验证, 然后再打 dmg. 这样 dmg 里包含的 .app 是
+      # ad-hoc 签的, macOS Sequoia (15+) Gatekeeper 会显示"打开"选项,
+      # 而完全未签的 .app 会被无条件拒绝运行没有任何绕过 UI.
+      #
+      # macOS 有 Developer ID / Linux / Windows: 走原一次性 build 路径.
       - name: cargo tauri build
         working-directory: src-tauri
         shell: bash
@@ -147,7 +154,20 @@ jobs:
           [[ -n "$APPLE_SIGNING_IDENTITY_RAW" ]] && export APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY_RAW"
           [[ -n "$APPLE_API_ISSUER_RAW" ]] && export APPLE_API_ISSUER="$APPLE_API_ISSUER_RAW"
           [[ -n "$APPLE_API_KEY_RAW" ]] && export APPLE_API_KEY="$APPLE_API_KEY_RAW"
-          cargo tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+
+          if [[ "${{ matrix.os }}" == "macos-14" ]] && [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+            # macOS 无 Developer ID 路径
+            cargo tauri build --target "${{ matrix.target }}" --bundles app
+            APP="../target/${{ matrix.target }}/release/bundle/macos/Codex App Transfer.app"
+            echo "::group::Ad-hoc codesign .app (no Apple Developer ID)"
+            codesign --force --deep --sign - "$APP"
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            echo "::endgroup::"
+            cargo tauri build --target "${{ matrix.target }}" --bundles dmg
+          else
+            # 其他平台 (Linux/Windows) 或 macOS 有 Developer ID
+            cargo tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
+          fi
 
       - name: Rename bundles to project naming
         shell: bash
