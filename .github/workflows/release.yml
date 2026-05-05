@@ -4,11 +4,11 @@ name: release
 #   macos-14 (arm64 原生) + ubuntu-22.04 (AppImage glibc 兼容) + windows-latest
 # 触发: push tag v*  或  workflow_dispatch with version input
 # 产物经 cargo tauri build 直出, rename 为项目老命名兼容老下载链接,
-# 收口 job 跑 scripts/release_assets.py 出 sha256 + .sig + latest.json,
+# 收口 job 跑 xtask release-bundle 出 sha256 + .sig + latest.json,
 # 最终落到一个 draft GitHub release 让用户手动 ready/publish。
 #
 # Secrets (按需):
-#   RELEASE_PRIVATE_KEY_PEM     必须 - release_assets.py RSA-3072 自签私钥
+#   RELEASE_PRIVATE_KEY_PEM     必须 - xtask release-bundle RSA-3072 自签私钥
 #   APPLE_CERTIFICATE           可选 - Apple Developer ID .p12 (base64)
 #   APPLE_CERTIFICATE_PASSWORD  可选
 #   APPLE_SIGNING_IDENTITY      可选 - 形如 "Developer ID Application: Foo (TEAMID)"

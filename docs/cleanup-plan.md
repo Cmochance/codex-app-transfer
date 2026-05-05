@@ -1,6 +1,6 @@
 # Python → Rust 旧码清理方案
 
-> 状态:**Phase 1 已合 (PR #2), Phase 2 已合 (PR #3, dispatch test 暴露 release pipeline 3 bug 见 PR #6 hotfix), Phase 3 PR #4 ready 待合, Phase 4 本 PR (#5) 待合**
+> 状态:**Phase 1-4 全部完成;PR #5 为最终收尾归档**
 > 起草:2026-05-05
 > 适用范围:`codex-app-transfer` 全仓
 > 前置:`docs/migration-plan.md` 全部 7 个 Stage 已落地,v2.0.0 已发版
