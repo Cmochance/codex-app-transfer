@@ -85,11 +85,16 @@ jobs:
       - name: cargo check --workspace
         run: cargo check --workspace --all-targets
 
-      # 旧的"Python 重生 registry fixture → diff"步骤已删:
-      # backend/ 在 Phase 1 被移除后,gen_registry_fixtures.py 失去数据源。
-      # crates/registry/tests/python_compat.rs 仍读已 commit 的 fixture 做
-      # round-trip 校验。Phase 3 会用 xtask gen-fixtures 重建反向校验。
-      # 详见 docs/cleanup-plan.md。
-
       - name: cargo test --workspace
         run: cargo test --workspace --no-fail-fast
+
+      # Phase 3 起的反向 diff 校验: xtask 重新生成 4 份 registry fixture,
+      # 与 commit 在仓库的 golden 字节级 diff. 任何 schema/数据变动忘记
+      # 同步 fixture 都会让 CI 红, 引导开发者跑
+      # `cargo run -p xtask -- gen-fixtures && git add tests/replay/fixtures/registry/`.
+      # crates/registry/tests/golden_compat.rs 是单元级 round-trip 保险, 这一步是
+      # 端到端"Rust 数据源 → 文件系统"全链路保险, 两层都要.
+      - name: Verify fixtures regenerable from Rust (xtask gen-fixtures)
+        run: |
+          cargo run -p xtask --release -- gen-fixtures
+          git diff --exit-code -- tests/replay/fixtures/registry/

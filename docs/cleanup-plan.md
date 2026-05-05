@@ -348,19 +348,19 @@ xtask release-bundle \
 
 #### 3.6 `python_compat.rs` → `golden_compat.rs` 改造
 
-文件改名 `crates/registry/tests/golden_compat.rs`,内容调整:
+文件改名 `crates/registry/tests/golden_compat.rs`,**保留全部 7 个测试,只改名 + 改注释**(原 plan 想删 `typed_config_can_parse_*` 2 个,落地时发现它们检查"字段值正确"是反向 diff + round-trip 都不覆盖的另一维度,**留着不亏**):
 
-**保留**(权威源从 Python 改成 xtask + commit fixture,语义不变):
-- `default_config_roundtrip` — 读 fixture round-trip,字节级一致
-- `with_provider_roundtrip` — 同上
-- `builtin_presets_roundtrip_python_dump` → 改名 `builtin_presets_roundtrip`
-- `library_entry_roundtrip` — 同上
+| 原测试名 | 新测试名 | 调整 |
+|---|---|---|
+| `default_config_roundtrip` | (同) | 无 |
+| `with_provider_roundtrip` | (同) | 无 |
+| `builtin_presets_roundtrip_python_dump` | `builtin_presets_roundtrip` | 去 `_python_dump` 后缀 |
+| `library_entry_roundtrip` | (同) | 无 |
+| `rust_embedded_presets_match_python_dump` | `rust_embedded_presets_match_committed_fixture` | 语义改"对照 commit golden"而非"对照 Python dump" |
+| `typed_config_can_parse_python_default` | `typed_config_can_parse_default` | 去 `_python` 中缀 |
+| `typed_config_can_parse_python_with_provider` | `typed_config_can_parse_with_provider` | 同上 |
 
-**删**:
-- `rust_embedded_presets_match_python_dump` → 改成 `rust_embedded_presets_match_committed_fixture`(`builtin_presets()` vs commit 的 fixture);严格说反向 diff 已涵盖,但单测保留作为快速失败信号
-- `typed_config_can_parse_python_default` / `typed_config_can_parse_python_with_provider` — 删("Python parse" 不再有意义,Rust 自己 gen + 自己 parse 的 round-trip 已涵盖)
-
-文件头注释更新("Python 生成" → "xtask gen-fixtures 生成,golden 由 git 维护")。
+文件头注释 + panic message 中 `python` / `gen_registry_fixtures.py` 提法换成 `golden` / `xtask gen-fixtures` + git 维护权威源闭环说明。
 
 #### 3.7 CI 反向 diff(ci.yml 加一 step)
 
@@ -469,3 +469,4 @@ xtask release-bundle \
 | 2026-05-05 | Phase 2 §2.3/§2.5 修正 | 实施时尝试 `tauri.conf.json` 加 `bundle.fileName: "codex-app-transfer"` 让 Tauri 产物名摆脱空格,rename 逻辑直接写在 `release.yml` 的 ~30 行 bash case,**不再需要单独的 `rename-bundles.sh`**;`release_assets.py` 不是"微调路径"而是**整体重写**:删 `collect_windows/mac/linux`(假设 PyInstaller 输出),换 `collect_from_incoming(dist-incoming/)`,`PLATFORM_PATTERNS` 同步换为 `.dmg`/`.deb`/`.AppImage`/`-Setup.exe`/`.msi` | 调研 Tauri 2 实际产物形态后发现原设计估计过粗,落地修正 |
 | 2026-05-05 | Phase 2 cargo check 第一次红, 二次修正 tauri.conf.json | CI `cargo check` 报 `tauri-build` schema 校验失败:`unknown field "fileName"`(允许的 bundle.* 字段为 `active/targets/createUpdaterArtifacts/publisher/homepage/icon/resources/copyright/license/category/fileAssociations/short-description/long-description/use-local-tools-dir/external-bin/windows/linux/macOS/iOS/android`)。同时 `bundle.windows.{wix,nsis}` 空对象也无效。**撤回 `bundle.fileName` 和 `bundle.windows` 子段**,接受 Tauri 默认带空格产物名 `Codex App Transfer_<V>_<arch>.<ext>`,glob 用引号处理 | 之前的 plan 来自外部调研建议,Tauri 2 实际 schema 与建议不符;落地必须以 `tauri-build` 实际校验结果为准 |
 | 2026-05-05 | Phase 3 详细方案落地 | 把 §3 Phase 3 概念性段落扩充为 §3.1-3.12 子章节(现状盘点 / 决策矩阵 / xtask crate 蓝图 / gen-fixtures 实现要点 / release-bundle 实现要点 / golden_compat 改造 / CI 反向 diff / release.yml 切 xtask / 文件 diff 清单 / 验收 / 回滚策略 / 不做项)。RSA crate 选 `rsa = "0.9"` 而非 `ring`(纯 Rust 不依赖 system crypto + API 更友好,release-bundle 非性能敏感) | Phase 3 涉及 xtask 重写 + 删大量 Python,概念描述不足;细化后让 reviewer 在动代码之前先评关键决策(RSA crate / xtask CLI 命名 / fixture 路径 / Python 删除时机) |
+| 2026-05-05 | Phase 3 §3.6 修正 | 落地 golden_compat 改造时**保留全部 7 测试只改名**,而非原 plan 想删 `typed_config_can_parse_*` 2 个。原因:`typed_config_can_parse_*` 验证"typed Config struct 能消化 fixture + 字段值正确",这是 round-trip 字节级 / 反向 diff 都不覆盖的另一维度(语义层断言,如 `proxy_port == 18080`)| 删测试丢覆盖,改名 + 调注释成本极低 |
