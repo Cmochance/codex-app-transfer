@@ -43,19 +43,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # apt-get 偶发性卡 archive.ubuntu.com (曾出现 update 阶段挂 17min 才被 cancel)。
+      # 加 timeout + 3 次重试: 每次失败睡 30s,整步 8 分钟硬上限避免再卡死。
       - name: Install Tauri Linux system deps
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            build-essential \
-            curl \
-            wget \
-            file
+          set -e
+          for attempt in 1 2 3; do
+            echo "::group::apt attempt $attempt"
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+                libwebkit2gtk-4.1-dev \
+                libssl-dev \
+                libayatana-appindicator3-dev \
+                librsvg2-dev \
+                patchelf \
+                build-essential \
+                curl \
+                wget \
+                file; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::apt attempt $attempt failed, sleeping 30s before retry"
+            sleep 30
+          done
+          echo "::error::apt failed after 3 attempts"
+          exit 1
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
