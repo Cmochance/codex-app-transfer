@@ -19,6 +19,9 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 - 当前版本：**v2.0.0**(Python → Rust/Tauri 全栈重写;UI 视觉与 v1.0.4 字节级一致)
 - 已验证供应商：Kimi Code（`kimi-for-coding` UA 网关）、Kimi 月之暗面（Moonshot Platform）、DeepSeek V4（含「Max 思维」思考模式）、Xiaomi MiMo (Token Plan)、Xiaomi MiMo (Pay for Token)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
+
+> 如果使用过程中出现问题，欢迎提交 PR 协助作者完善，会及时处理，非常感谢。
+
 - 平台:macOS arm64(v2.0.0 首发);Windows x64 / Linux x86_64 留 v2.0.x 补
 - 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.0.4 字节级互通,可来回切换不丢数据
 
