@@ -3,17 +3,15 @@
 //! 覆盖范围:
 //! - **Stage 3.2c**:文本流(`delta.content`)→ message 生命周期
 //! - **Stage 3.3a**:推理流(`delta.reasoning_content`)→ reasoning 生命周期
-//! - **Stage 3.3b**(本次):工具调用流(`delta.tool_calls[]`)→ function_call
+//! - **Stage 3.3b**:工具调用流(`delta.tool_calls[]`)→ function_call
 //!   生命周期。多个 tool_call 用 OpenAI 自带的 `index` 区分;同一 index 的
 //!   `function.arguments` 在多 chunk 间累计成一个完整 JSON 字符串。
+//! - **Stage 3.3c**:legacy 单工具流(`delta.function_call`)→ function_call
+//!   生命周期。旧版 Chat 流式适配器只读取 `choices[0]`;这里保留同一策略,
+//!   不把多个 choice 合并成一个 Responses 输出,避免发明 1.0.x 没有的语义。
 //!
 //! reasoning / message / tool_calls 三类 item 在同一响应里独立维持,按
 //! "实际出现顺序"决定它们在最终 `response.completed.output[]` 里的排列。
-//!
-//! **暂不处理**(留 Stage 3.3c):
-//! - `delta.function_call`(legacy 单工具形式;现在所有主流 provider 已
-//!   迁到 `tool_calls[]`,触发 legacy 形式的概率极低,命中时静默跳过)
-//! - 多 choice(只看 `choices[0]`)
 //!
 //! 状态机生命周期(单次响应):
 //! ```text
@@ -260,6 +258,9 @@ impl ChatToResponsesConverter {
             }
         }
 
+        // 1.0.x 旧版 StreamingAdapter 明确只读取 choices[0]。Responses
+        // 单个响应没有 Chat Completions 多候选的直接合并语义,所以这里保持
+        // 首个 choice 策略并用测试锁定,不自行合并或展开其他 choice。
         let choice = match chunk.choices.first() {
             Some(c) => c,
             None => {
@@ -317,6 +318,20 @@ impl ChatToResponsesConverter {
         // tool_calls(可能与 content / reasoning 同帧;此处独立处理)
         for tc in &choice.delta.tool_calls {
             self.handle_tool_call_delta(tc, out);
+        }
+        if let Some(function_call) = &choice.delta.function_call {
+            if function_call.has_payload() {
+                let tc = ChatToolCallDelta {
+                    index: 0,
+                    id: None,
+                    _kind: Some("function".to_owned()),
+                    function: ChatToolCallFunctionDelta {
+                        name: function_call.name.clone(),
+                        arguments: function_call.arguments.clone(),
+                    },
+                };
+                self.handle_tool_call_delta(&tc, out);
+            }
         }
 
         if let Some(reason) = choice.finish_reason.as_deref() {
@@ -669,7 +684,9 @@ impl ChatToResponsesConverter {
         }
 
         let (status, incomplete_details) = match (self.finish_reason.as_deref(), from_done) {
-            (Some("stop") | Some("tool_calls"), _) => ("completed", Value::Null),
+            (Some("stop") | Some("tool_calls") | Some("function_call"), _) => {
+                ("completed", Value::Null)
+            }
             (Some("length"), _) => ("incomplete", json!({ "reason": "max_output_tokens" })),
             (Some("content_filter"), _) => ("incomplete", json!({ "reason": "content_filter" })),
             (Some(other), _) => ("incomplete", json!({ "reason": other })),
@@ -783,7 +800,26 @@ struct ChatDelta {
     /// 成完整的 `function.arguments` JSON 字符串。
     #[serde(default)]
     tool_calls: Vec<ChatToolCallDelta>,
-    // legacy `function_call`(单工具)在 Stage 3.3c 处理
+    /// 旧版 Chat Completions 单工具调用增量。OpenAI 后续改为
+    /// `tool_calls[]`,但 1.0.x 已把 `finish_reason=function_call` 视为完成,
+    /// 这里把流式 delta 直接转成 index=0 的 function_call item。
+    #[serde(default)]
+    function_call: Option<LegacyFunctionCallDelta>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LegacyFunctionCallDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+impl LegacyFunctionCallDelta {
+    fn has_payload(&self) -> bool {
+        self.name.as_deref().map_or(false, |v| !v.is_empty())
+            || self.arguments.as_deref().map_or(false, |v| !v.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1287,6 +1323,76 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
         // tool_call 后出现,output_index=1
         assert_eq!(output[1]["type"], "function_call");
         assert_eq!(output[1]["call_id"], "call_t");
+    }
+
+    // ── Stage 3.3c legacy function_call / multi-choice 兼容 ────────
+
+    #[test]
+    fn legacy_function_call_stream_becomes_function_call_item() {
+        let mut c = fixed();
+        let first = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"function_call":{"name":"legacy_tool","arguments":""}}}]}
+
+"#,
+        );
+        let first_events = parse_emitted(&first);
+        assert_eq!(
+            names(&first_events),
+            vec!["response.created", "response.output_item.added"]
+        );
+        assert_eq!(first_events[1].1["item"]["type"], "function_call");
+        assert_eq!(first_events[1].1["item"]["id"], "fc_x_0");
+        assert_eq!(first_events[1].1["item"]["call_id"], "call_x_0");
+        assert_eq!(first_events[1].1["item"]["name"], "legacy_tool");
+
+        let _ = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"function_call":{"arguments":"{\"a\""}}}]}
+
+data: {"choices":[{"index":0,"delta":{"function_call":{"arguments":":1}"}},"finish_reason":"function_call"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let item_done = &events[1].1["item"];
+        assert_eq!(item_done["type"], "function_call");
+        assert_eq!(item_done["status"], "completed");
+        assert_eq!(item_done["call_id"], "call_x_0");
+        assert_eq!(item_done["name"], "legacy_tool");
+        assert_eq!(item_done["arguments"], "{\"a\":1}");
+
+        let completed = &events[2].1["response"];
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["incomplete_details"], Value::Null);
+        assert_eq!(completed["output"][0]["type"], "function_call");
+        assert_eq!(completed["output"][0]["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn multi_choice_uses_first_choice_only_like_legacy_adapter() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"content":"first"}},{"index":1,"delta":{"content":"second"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        assert_eq!(completed["output"][0]["type"], "message");
+        assert_eq!(completed["output"][0]["content"][0]["text"], "first");
+        assert_ne!(completed["output"][0]["content"][0]["text"], "second");
     }
 
     // ── 边界回归(已有用例迁移)──────────────────────────────────────
