@@ -681,6 +681,7 @@ name = "codex-app-transfer-codex-integration"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "codex-app-transfer-registry",
  "serde",
  "serde_json",
  "tempfile",

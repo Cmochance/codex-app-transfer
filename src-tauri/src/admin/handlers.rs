@@ -17,7 +17,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use codex_app_transfer_codex_integration::{
     apply_provider, has_snapshot, restore_codex_state, ApplyConfig, CodexPaths,
 };
-use codex_app_transfer_registry::{builtin_presets, RawConfig};
+use codex_app_transfer_registry::{builtin_presets, strip_internal_model_suffix, RawConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -51,15 +51,15 @@ fn fresh_provider_id(existing: &[String]) -> String {
 }
 
 fn provider_supports_1m(provider: &Value) -> bool {
-    let default = provider
+    let default_raw = provider
         .get("models")
         .and_then(|m| m.get("default"))
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_lowercase();
-    if default.contains("[1m]") {
+        .unwrap_or("");
+    if codex_app_transfer_registry::has_internal_one_m_suffix(default_raw) {
         return true;
     }
+    let default = strip_internal_model_suffix(default_raw).to_lowercase();
     if default.starts_with("deepseek-v4-") || default.starts_with("qwen3.6-") {
         return true;
     }
@@ -72,6 +72,34 @@ fn provider_supports_1m(provider: &Value) -> bool {
         return b;
     }
     false
+}
+
+fn provider_default_model(provider: &Value) -> String {
+    let raw = provider
+        .get("models")
+        .and_then(|m| m.get("default"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    strip_internal_model_suffix(raw)
+}
+
+fn provider_model_mappings(provider: &Value) -> Value {
+    provider.get("models").cloned().unwrap_or_else(|| json!({}))
+}
+
+fn provider_model_capabilities(provider: &Value) -> Value {
+    provider
+        .get("modelCapabilities")
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
+fn provider_display_name(provider: &Value) -> String {
+    provider
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Provider")
+        .to_owned()
 }
 
 fn read_proxy_port(cfg: &RawConfig) -> u16 {
@@ -682,6 +710,10 @@ pub async fn desktop_configure() -> impl IntoResponse {
         return err(StatusCode::BAD_REQUEST, "未找到 active provider").into_response();
     };
     let supports_1m = provider_supports_1m(active);
+    let provider_name = provider_display_name(active);
+    let default_model = provider_default_model(active);
+    let model_mappings = provider_model_mappings(active);
+    let model_capabilities = provider_model_capabilities(active);
     let port = read_proxy_port(&cfg);
 
     // 缺 gateway key 自动补
@@ -706,6 +738,10 @@ pub async fn desktop_configure() -> impl IntoResponse {
             base_url: &base_url,
             gateway_api_key: &gateway_key,
             supports_1m,
+            provider_name: &provider_name,
+            default_model: &default_model,
+            model_mappings: Some(&model_mappings),
+            model_capabilities: Some(&model_capabilities),
             app_version: APP_VERSION,
         },
     ) {

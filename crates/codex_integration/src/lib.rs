@@ -16,12 +16,14 @@
 
 pub mod apply;
 pub mod auth;
+pub mod model_catalog;
 pub mod paths;
 pub mod snapshot;
 pub mod toml_sync;
 
 pub use apply::{apply_provider, restore_codex_state, ApplyConfig, ApplyResult};
 pub use auth::{read_auth, write_auth};
+pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, upsert_catalog_models};
 pub use paths::CodexPaths;
 pub use snapshot::{
     get_snapshot_status, has_snapshot, snapshot_codex_state, SnapshotManifest, SnapshotStatus,
@@ -36,6 +38,8 @@ pub enum CodexError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("registry io: {0}")]
+    RegistryIo(#[from] codex_app_transfer_registry::IoError),
     #[error("home directory not resolved: set $HOME or pass paths explicitly")]
     NoHome,
 }

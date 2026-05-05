@@ -865,7 +865,7 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
     // ── Stage 3.3 新行为(reasoning)──────────────────────────────────
 
     #[test]
-    fn reasoning_only_emits_reasoning_lifecycle_no_message() {
+    fn reasoning_only_completed_turn_emits_reasoning_lifecycle_no_message() {
         let mut c = fixed();
         let _ = c.feed(
             br#"data: {"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
@@ -887,11 +887,11 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
                 "response.output_item.done",
                 "response.completed",
             ],
-            "reasoning-only 在 [DONE] 时只 close reasoning,不 emit message"
+            "reasoning-only completed turns should not inject synthetic assistant text"
         );
         let completed = &events[3].1["response"];
         let output = completed["output"].as_array().unwrap();
-        assert_eq!(output.len(), 1, "output 只含 reasoning item");
+        assert_eq!(output.len(), 1, "output contains only the reasoning item");
         assert_eq!(output[0]["type"], "reasoning");
         assert_eq!(output[0]["content"], Value::Null);
         assert_eq!(output[0]["encrypted_content"], Value::Null);

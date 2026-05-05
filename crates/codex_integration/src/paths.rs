@@ -7,8 +7,10 @@ use crate::CodexError;
 #[derive(Debug, Clone)]
 pub struct CodexPaths {
     pub codex_home: PathBuf,
+    pub app_home: PathBuf,
     pub config_toml: PathBuf,
     pub auth_json: PathBuf,
+    pub model_catalog_json: PathBuf,
     pub snapshot_dir: PathBuf,
     pub snapshot_config: PathBuf,
     pub snapshot_auth: PathBuf,
@@ -33,11 +35,13 @@ impl CodexPaths {
         Self {
             config_toml: codex_home.join("config.toml"),
             auth_json: codex_home.join("auth.json"),
+            model_catalog_json: app_home.join("config.json"),
             snapshot_config: snapshot_dir.join("config.toml"),
             snapshot_auth: snapshot_dir.join("auth.json"),
             snapshot_manifest: snapshot_dir.join("manifest.json"),
             snapshot_dir,
             codex_home,
+            app_home,
         }
     }
 }
@@ -50,8 +54,13 @@ mod tests {
     fn from_home_dir_layout() {
         let p = CodexPaths::from_home_dir("/x");
         assert_eq!(p.codex_home, PathBuf::from("/x/.codex"));
+        assert_eq!(p.app_home, PathBuf::from("/x/.codex-app-transfer"));
         assert_eq!(p.config_toml, PathBuf::from("/x/.codex/config.toml"));
         assert_eq!(p.auth_json, PathBuf::from("/x/.codex/auth.json"));
+        assert_eq!(
+            p.model_catalog_json,
+            PathBuf::from("/x/.codex-app-transfer/config.json")
+        );
         assert_eq!(
             p.snapshot_dir,
             PathBuf::from("/x/.codex-app-transfer/codex-snapshot")
