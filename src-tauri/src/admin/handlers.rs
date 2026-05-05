@@ -3,8 +3,12 @@
 //! 数据形态(请求/响应 JSON shape)严格对齐 v1.4,frontend/js/api.js 不需要
 //! 任何修改即可工作。
 
+use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -13,16 +17,21 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use codex_app_transfer_codex_integration::{
     apply_provider, has_snapshot, restore_codex_state, ApplyConfig, CodexPaths,
 };
+use codex_app_transfer_proxy::{proxy_log_dir, proxy_telemetry};
 use codex_app_transfer_registry::{
-    builtin_presets, normalize_model_mappings, strip_internal_model_suffix, RawConfig, MODEL_ORDER,
+    builtin_presets, config_dir, normalize_model_mappings, strip_internal_model_suffix, RawConfig,
+    MODEL_ORDER,
 };
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE},
-    StatusCode as ReqwestStatusCode,
+    multipart, StatusCode as ReqwestStatusCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -31,6 +40,84 @@ use super::registry_io::{load as load_registry, public_provider, save as save_re
 use super::state::AdminState;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const FEEDBACK_WORKER_URL: &str = "https://codex-app-transfer-feedback.alysechencn.workers.dev";
+
+struct FeedbackThrottleState {
+    last_success: Option<Instant>,
+    failure_ts: Vec<Instant>,
+    failure_cooldown_until: Option<Instant>,
+}
+
+struct FeedbackThrottle {
+    inner: Mutex<FeedbackThrottleState>,
+}
+
+impl FeedbackThrottle {
+    const SUCCESS_COOLDOWN: Duration = Duration::from_secs(60);
+    const FAILURE_WINDOW: Duration = Duration::from_secs(300);
+    const FAILURE_LIMIT: usize = 5;
+    const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(FeedbackThrottleState {
+                last_success: None,
+                failure_ts: Vec::new(),
+                failure_cooldown_until: None,
+            }),
+        }
+    }
+
+    fn acquire(&self) -> Result<(), String> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+
+        if let Some(last_success) = inner.last_success {
+            let elapsed = now.saturating_duration_since(last_success);
+            if elapsed < Self::SUCCESS_COOLDOWN {
+                let wait = Self::SUCCESS_COOLDOWN.saturating_sub(elapsed).as_secs();
+                return Err(format!("刚提交成功,请等 {wait} 秒后再发新反馈"));
+            }
+        }
+
+        if let Some(until) = inner.failure_cooldown_until {
+            if now < until {
+                let wait = until.saturating_duration_since(now).as_secs();
+                return Err(format!("连续提交失败次数过多,请等 {wait} 秒后再试"));
+            }
+        }
+
+        inner
+            .failure_ts
+            .retain(|ts| now.saturating_duration_since(*ts) < Self::FAILURE_WINDOW);
+        Ok(())
+    }
+
+    fn record_success(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.last_success = Some(Instant::now());
+        inner.failure_ts.clear();
+        inner.failure_cooldown_until = None;
+    }
+
+    fn record_failure(&self) {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .failure_ts
+            .retain(|ts| now.saturating_duration_since(*ts) < Self::FAILURE_WINDOW);
+        inner.failure_ts.push(now);
+        if inner.failure_ts.len() >= Self::FAILURE_LIMIT {
+            inner.failure_cooldown_until = Some(now + Self::FAILURE_COOLDOWN);
+        }
+    }
+}
+
+static FEEDBACK_THROTTLE: OnceLock<FeedbackThrottle> = OnceLock::new();
+
+fn feedback_throttle() -> &'static FeedbackThrottle {
+    FEEDBACK_THROTTLE.get_or_init(FeedbackThrottle::new)
+}
 
 // ── 工具 ─────────────────────────────────────────────────────────────
 
@@ -38,6 +125,70 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) 
     (
         status,
         Json(json!({"success": false, "message": msg.into()})),
+    )
+}
+
+fn open_directory(path: &PathBuf) -> Result<(), String> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = Command::new("explorer");
+        command.arg(path);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开日志目录: {e}"))
+}
+
+fn multipart_text_part(text: String, mime: &str) -> multipart::Part {
+    multipart::Part::text(text.clone())
+        .mime_str(mime)
+        .unwrap_or_else(|_| multipart::Part::text(text))
+}
+
+fn active_provider_name(config: &Value) -> String {
+    let active_id = config.get("activeProvider").and_then(|v| v.as_str());
+    config
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .and_then(|providers| {
+            if let Some(active_id) = active_id {
+                providers
+                    .iter()
+                    .find(|provider| provider.get("id").and_then(|v| v.as_str()) == Some(active_id))
+            } else {
+                providers.first()
+            }
+        })
+        .and_then(|provider| provider.get("name").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn feedback_proxy_tail_part() -> Option<multipart::Part> {
+    let log_dir = proxy_log_dir()?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let path = log_dir.join(format!("proxy-{today}.log"));
+    let content = fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(200);
+    let tail = lines[start..].join("\n");
+    if tail.trim().is_empty() {
+        return None;
+    }
+    let part =
+        multipart::Part::bytes(tail.into_bytes()).file_name(format!("proxy-tail-{today}.log"));
+    Some(
+        part.mime_str("text/plain")
+            .unwrap_or_else(|_| multipart::Part::text("")),
     )
 }
 
@@ -241,6 +392,19 @@ fn provider_test_headers(provider: &Value, include_content_type: bool) -> Header
         }
     }
 
+    let provider_id = provider.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let base_url = provider
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if provider_id == "kimi-code" || base_url.contains("api.kimi.com/coding") {
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("KimiCLI/1.40.0"),
+        );
+    }
+
     headers
 }
 
@@ -252,6 +416,565 @@ fn provider_test_error_label(error: &reqwest::Error) -> &'static str {
     } else {
         "RequestError"
     }
+}
+
+fn clean_base_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_owned()
+}
+
+fn replace_path_suffix(url: &str, suffixes: &[&str], replacement: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return url.to_owned();
+    };
+    let mut path = parsed.path().trim_end_matches('/').to_owned();
+    let lower = path.to_ascii_lowercase();
+    for suffix in suffixes {
+        if lower.ends_with(suffix) {
+            let keep = path.len().saturating_sub(suffix.len());
+            path.truncate(keep);
+            break;
+        }
+    }
+    let next = format!(
+        "{}/{}",
+        path.trim_end_matches('/'),
+        replacement.trim_start_matches('/')
+    );
+    parsed.set_path(&next);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string().trim_end_matches('/').to_owned()
+}
+
+fn model_endpoint_candidates(provider: &Value) -> Vec<String> {
+    let base_url = clean_base_url(
+        provider
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    );
+    if base_url.is_empty() {
+        return Vec::new();
+    }
+
+    let api_format =
+        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
+    let upstream = build_provider_test_url(&base_url, api_format);
+    let mut candidates = Vec::new();
+
+    if api_format == "openai_chat" {
+        candidates.push(replace_path_suffix(
+            &upstream,
+            &["/chat/completions", "/completions"],
+            "/models",
+        ));
+        candidates.push(format!("{base_url}/models"));
+    } else {
+        candidates.push(replace_path_suffix(
+            &upstream,
+            &["/v1/responses", "/responses"],
+            "/v1/models",
+        ));
+        if base_url.to_ascii_lowercase().ends_with("/v1") {
+            candidates.push(format!("{base_url}/models"));
+        }
+        candidates.push(format!("{base_url}/models"));
+        if let Ok(parsed) = reqwest::Url::parse(&base_url) {
+            let stripped_path = parsed.path().trim_end_matches('/');
+            let lower = stripped_path.to_ascii_lowercase();
+            if lower.ends_with("/anthropic") || lower.ends_with("/v1") {
+                let root_path = if lower.ends_with("/anthropic") {
+                    &stripped_path[..stripped_path.len().saturating_sub("/anthropic".len())]
+                } else {
+                    &stripped_path[..stripped_path.len().saturating_sub("/v1".len())]
+                };
+                let mut root = parsed.clone();
+                root.set_path(root_path.trim_end_matches('/'));
+                root.set_query(None);
+                root.set_fragment(None);
+                let root_url = root.to_string().trim_end_matches('/').to_owned();
+                candidates.push(format!("{root_url}/models"));
+                candidates.push(format!("{root_url}/v1/models"));
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|item| !item.is_empty() && seen.insert(item.clone()))
+        .collect()
+}
+
+fn model_id_from_item(item: &Value) -> Option<String> {
+    if let Some(s) = item.as_str() {
+        return Some(s.to_owned());
+    }
+    let obj = item.as_object()?;
+    for key in ["id", "name", "model", "model_id"] {
+        if let Some(value) = obj.get(key).and_then(|v| v.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn extract_model_ids(payload: &Value) -> Vec<String> {
+    let mut candidates: Vec<Value> = Vec::new();
+    if let Some(items) = payload.as_array() {
+        candidates = items.clone();
+    } else if let Some(obj) = payload.as_object() {
+        for key in ["data", "models", "items", "result"] {
+            if let Some(items) = obj.get(key).and_then(|v| v.as_array()) {
+                candidates = items.clone();
+                break;
+            }
+        }
+        if candidates.is_empty() {
+            if let Some(data) = obj.get("data").and_then(|v| v.as_object()) {
+                for key in ["models", "items"] {
+                    if let Some(items) = data.get(key).and_then(|v| v.as_array()) {
+                        candidates = items.clone();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for item in candidates {
+        let Some(model_id) = model_id_from_item(&item) else {
+            continue;
+        };
+        if seen.insert(model_id.clone()) {
+            ids.push(model_id);
+        }
+    }
+    ids
+}
+
+fn usable_model_ids(model_ids: &[String]) -> Vec<String> {
+    const EXCLUDE: &[&str] = &[
+        "embedding",
+        "rerank",
+        "moderation",
+        "whisper",
+        "tts",
+        "image",
+        "vision",
+        "audio",
+    ];
+    let usable: Vec<String> = model_ids
+        .iter()
+        .filter(|model_id| {
+            let lower = model_id.to_ascii_lowercase();
+            !EXCLUDE.iter().any(|keyword| lower.contains(keyword))
+        })
+        .cloned()
+        .collect();
+    if usable.is_empty() {
+        model_ids.to_vec()
+    } else {
+        usable
+    }
+}
+
+fn pick_model(model_ids: &[String], keywords: &[&str], fallback_index: usize) -> String {
+    for keyword in keywords {
+        for model_id in model_ids {
+            if model_id.to_ascii_lowercase().contains(keyword) {
+                return model_id.clone();
+            }
+        }
+    }
+    if model_ids.is_empty() {
+        String::new()
+    } else {
+        model_ids[std::cmp::min(fallback_index, model_ids.len() - 1)].clone()
+    }
+}
+
+fn empty_model_mappings_value() -> Value {
+    let mut out = serde_json::Map::new();
+    for slot in MODEL_ORDER.iter().copied() {
+        out.insert(slot.to_owned(), Value::String(String::new()));
+    }
+    Value::Object(out)
+}
+
+fn suggest_model_mappings(model_ids: &[String]) -> Value {
+    let usable = usable_model_ids(model_ids);
+    let mut result = empty_model_mappings_value();
+    if usable.is_empty() {
+        return result;
+    }
+    let chosen = pick_model(
+        &usable,
+        &["pro", "plus", "coder", "max", "reasoner", "v4"],
+        0,
+    );
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("default".to_owned(), Value::String(chosen));
+    }
+    result
+}
+
+async fn fetch_provider_models_impl(provider: &Value) -> Value {
+    let endpoints = model_endpoint_candidates(provider);
+    if endpoints.is_empty() {
+        return json!({"success": false, "message": "API 地址无效", "models": [], "suggested": {}});
+    }
+
+    let headers = provider_test_headers(provider, false);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .connect_timeout(Duration::from_secs(6))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "success": false,
+                "message": "无法自动获取模型列表",
+                "models": [],
+                "suggested": {},
+                "errors": [format!("client: {}", provider_test_error_label(&error))],
+            });
+        }
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+    for endpoint in endpoints {
+        let response = match client.get(&endpoint).headers(headers.clone()).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                errors.push(format!("{endpoint}: {}", provider_test_error_label(&error)));
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            errors.push(format!("{endpoint}: HTTP {}", response.status().as_u16()));
+            continue;
+        }
+        let payload = match response.json::<Value>().await {
+            Ok(payload) => payload,
+            Err(_) => {
+                errors.push(format!("{endpoint}: 非 JSON 响应"));
+                continue;
+            }
+        };
+        let model_ids = extract_model_ids(&payload);
+        if !model_ids.is_empty() {
+            return json!({
+                "success": true,
+                "endpoint": endpoint,
+                "models": model_ids,
+                "suggested": suggest_model_mappings(&model_ids),
+            });
+        }
+        errors.push(format!("{endpoint}: 未发现模型列表"));
+    }
+
+    let start = errors.len().saturating_sub(5);
+    json!({
+        "success": false,
+        "message": "无法自动获取模型列表",
+        "models": [],
+        "suggested": {},
+        "errors": errors[start..].to_vec(),
+    })
+}
+
+fn provider_kind(provider: &Value) -> &'static str {
+    let probe = format!(
+        "{} {}",
+        provider.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        provider
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    if probe.contains("deepseek") {
+        "deepseek"
+    } else if probe.contains("siliconflow") {
+        "siliconflow"
+    } else if probe.contains("openrouter") {
+        "openrouter"
+    } else if probe.contains("novita") {
+        "novita"
+    } else if probe.contains("stepfun") || probe.contains("step") {
+        "stepfun"
+    } else {
+        "unknown"
+    }
+}
+
+fn balance_endpoint(provider: &Value) -> Option<(&'static str, String)> {
+    let kind = provider_kind(provider);
+    let base = clean_base_url(
+        provider
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    )
+    .to_ascii_lowercase();
+    match kind {
+        "deepseek" => Some((kind, "https://api.deepseek.com/user/balance".to_owned())),
+        "siliconflow" => {
+            let host = if base.contains(".com") {
+                "https://api.siliconflow.com"
+            } else {
+                "https://api.siliconflow.cn"
+            };
+            Some((kind, format!("{host}/v1/user/info")))
+        }
+        "openrouter" => Some((kind, "https://openrouter.ai/api/v1/credits".to_owned())),
+        "novita" => Some((kind, "https://api.novita.ai/v3/user/balance".to_owned())),
+        "stepfun" => Some((kind, "https://api.stepfun.com/v1/accounts".to_owned())),
+        _ => None,
+    }
+}
+
+fn float_or_none(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) if !s.is_empty() => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn money_item(
+    label: impl Into<String>,
+    remaining: Option<f64>,
+    total: Option<f64>,
+    used: Option<f64>,
+    unit: impl Into<String>,
+) -> Value {
+    json!({
+        "label": label.into(),
+        "remaining": remaining,
+        "total": total,
+        "used": used,
+        "unit": unit.into(),
+    })
+}
+
+fn normalize_balance_payload(kind: &str, payload: &Value) -> Vec<Value> {
+    if kind == "deepseek" {
+        let mut items = Vec::new();
+        for item in payload
+            .get("balance_infos")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            let currency = obj
+                .get("currency")
+                .and_then(|v| v.as_str())
+                .unwrap_or("CNY")
+                .to_owned();
+            items.push(money_item(
+                currency.clone(),
+                float_or_none(obj.get("total_balance")),
+                float_or_none(obj.get("granted_balance")),
+                float_or_none(obj.get("topped_up_balance")),
+                currency,
+            ));
+        }
+        return items;
+    }
+
+    if kind == "openrouter" {
+        let data = payload.get("data").unwrap_or(payload);
+        let total = float_or_none(data.get("total_credits"));
+        let used = float_or_none(data.get("total_usage"));
+        let remaining = match (total, used) {
+            (Some(total), Some(used)) => Some(total - used),
+            _ => None,
+        };
+        return vec![money_item("credits", remaining, total, used, "USD")];
+    }
+
+    let data = payload.get("data").unwrap_or(payload);
+    if let Some(obj) = data.as_object() {
+        for remaining_key in [
+            "balance",
+            "remaining",
+            "available_balance",
+            "availableBalance",
+            "credit",
+        ] {
+            if obj.contains_key(remaining_key) {
+                let unit = obj
+                    .get("currency")
+                    .or_else(|| obj.get("unit"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                return vec![money_item(
+                    "balance",
+                    float_or_none(obj.get(remaining_key)),
+                    float_or_none(
+                        obj.get("total")
+                            .or_else(|| obj.get("totalBalance"))
+                            .or_else(|| obj.get("total_credits")),
+                    ),
+                    float_or_none(
+                        obj.get("used")
+                            .or_else(|| obj.get("usage"))
+                            .or_else(|| obj.get("usedBalance")),
+                    ),
+                    unit,
+                )];
+            }
+        }
+    }
+    Vec::new()
+}
+
+async fn query_provider_usage_impl(provider: &Value) -> Value {
+    if provider_api_key(provider).is_empty() {
+        return json!({"success": false, "message": "请先保存 API Key"});
+    }
+    let Some((kind, endpoint)) = balance_endpoint(provider) else {
+        return json!({
+            "success": true,
+            "supported": false,
+            "items": [],
+            "message": "这个提供商暂未适配余额/用量接口",
+        });
+    };
+
+    let headers = provider_test_headers(provider, false);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .connect_timeout(Duration::from_secs(6))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "success": true,
+                "supported": true,
+                "ok": false,
+                "message": format!("查询失败：{}", provider_test_error_label(&error)),
+                "items": [],
+            });
+        }
+    };
+    let response = match client.get(&endpoint).headers(headers).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "success": true,
+                "supported": true,
+                "ok": false,
+                "message": format!("查询失败：{}", provider_test_error_label(&error)),
+                "items": [],
+            });
+        }
+    };
+    if !response.status().is_success() {
+        return json!({
+            "success": true,
+            "supported": true,
+            "ok": false,
+            "statusCode": response.status().as_u16(),
+            "message": format!("余额接口返回 HTTP {}", response.status().as_u16()),
+            "items": [],
+        });
+    }
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(_) => {
+            return json!({
+                "success": true,
+                "supported": true,
+                "ok": false,
+                "message": "余额接口返回了非 JSON 响应",
+                "items": [],
+            });
+        }
+    };
+    let items = normalize_balance_payload(kind, &payload);
+    let ok = !items.is_empty();
+    let message = if ok {
+        "查询完成"
+    } else {
+        "余额接口响应中未识别到余额字段"
+    };
+    json!({
+        "success": true,
+        "supported": true,
+        "ok": ok,
+        "endpoint": endpoint,
+        "items": items,
+        "message": message,
+    })
+}
+
+fn provider_compatibility_item(provider: &Value) -> Value {
+    let api_format =
+        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
+    let id = provider.get("id").cloned().unwrap_or(Value::Null);
+    let name = provider.get("name").cloned().unwrap_or(Value::Null);
+    if api_format == "responses" {
+        return json!({
+            "id": id,
+            "name": name,
+            "apiFormat": api_format,
+            "level": "stable",
+            "message": "Responses 兼容接口，适合 Codex App 主流程。",
+            "checks": {
+                "models": true,
+                "text": true,
+                "stream": true,
+                "tools": true,
+                "streamingTools": true,
+            },
+        });
+    }
+    if api_format == "openai_chat" {
+        return json!({
+            "id": id,
+            "name": name,
+            "apiFormat": api_format,
+            "level": "experimental",
+            "message": "OpenAI Chat 实验适配：文本和非流式工具调用可测试，流式工具调用暂不作为稳定能力。",
+            "checks": {
+                "models": true,
+                "text": true,
+                "stream": true,
+                "tools": true,
+                "streamingTools": false,
+            },
+        });
+    }
+    json!({
+        "id": id,
+        "name": name,
+        "apiFormat": api_format,
+        "level": "unsupported",
+        "message": format!("{api_format} 暂未适配。"),
+        "checks": {
+            "models": false,
+            "text": false,
+            "stream": false,
+            "tools": false,
+            "streamingTools": false,
+        },
+    })
 }
 
 async fn test_provider_connection(provider: &Value) -> Value {
@@ -275,10 +998,8 @@ async fn test_provider_connection(provider: &Value) -> Value {
         .unwrap_or(false);
     if !valid_url {
         return json!({
-            "success": true,
-            "ok": false,
-            "latencyMs": 0,
             "message": "API 地址无效",
+            "success": false,
         });
     }
 
@@ -339,7 +1060,8 @@ async fn test_provider_connection(provider: &Value) -> Value {
     if matches!(
         response.status(),
         ReqwestStatusCode::NOT_FOUND | ReqwestStatusCode::METHOD_NOT_ALLOWED
-    ) {
+    ) && !provider_api_key(provider).is_empty()
+    {
         response = match client
             .post(&base_url)
             .headers(content_headers)
@@ -449,6 +1171,283 @@ fn generate_gateway_key_value() -> String {
     let mut buf = [0u8; 32];
     let _ = getrandom::getrandom(&mut buf);
     format!("cas_{}", URL_SAFE_NO_PAD.encode(buf))
+}
+
+fn random_hex(bytes_len: usize) -> String {
+    let mut buf = vec![0u8; bytes_len];
+    let _ = getrandom::getrandom(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn app_config_dir() -> Result<PathBuf, String> {
+    config_dir().ok_or_else(|| "无法定位用户配置目录".to_owned())
+}
+
+fn app_config_file() -> Result<PathBuf, String> {
+    Ok(app_config_dir()?.join("config.json"))
+}
+
+fn app_backup_dir() -> Result<PathBuf, String> {
+    Ok(app_config_dir()?.join("backups"))
+}
+
+fn system_time_iso_seconds(time: SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Local> = time.into();
+    dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+}
+
+fn default_config_value() -> Value {
+    json!({
+        "version": APP_VERSION,
+        "activeProvider": null,
+        "gatewayApiKey": null,
+        "providers": [],
+        "settings": {
+            "theme": "default",
+            "language": "zh",
+            "proxyPort": 18080,
+            "adminPort": 18081,
+            "autoStart": false,
+            "autoApplyOnStart": true,
+            "exposeAllProviderModels": false,
+            "restoreCodexOnExit": true,
+            "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+        }
+    })
+}
+
+fn normalize_imported_provider(provider: &Value) -> Option<Value> {
+    let src = provider.as_object()?;
+    let mut normalized = src.clone();
+    let provider_id = normalized.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let safe_id: String = provider_id
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
+        .take(64)
+        .collect();
+    normalized.insert(
+        "id".into(),
+        Value::String(if safe_id.is_empty() {
+            random_hex(4)
+        } else {
+            safe_id
+        }),
+    );
+    normalized
+        .entry("name")
+        .or_insert_with(|| Value::String("Unnamed Provider".into()));
+    normalized
+        .entry("baseUrl")
+        .or_insert_with(|| Value::String(String::new()));
+    normalized
+        .entry("authScheme")
+        .or_insert_with(|| Value::String("bearer".into()));
+    normalized
+        .entry("apiFormat")
+        .or_insert_with(|| Value::String("responses".into()));
+    normalized
+        .entry("apiKey")
+        .or_insert_with(|| Value::String(String::new()));
+    normalized
+        .entry("extraHeaders")
+        .or_insert_with(|| json!({}));
+    normalized
+        .entry("modelCapabilities")
+        .or_insert_with(|| json!({}));
+    normalized
+        .entry("requestOptions")
+        .or_insert_with(|| json!({}));
+    normalized.entry("isBuiltin").or_insert(Value::Bool(false));
+    normalized
+        .entry("sortIndex")
+        .or_insert(Value::Number(0.into()));
+
+    let models = serde_json::to_value(normalize_model_mappings(normalized.get("models"))).ok()?;
+    normalized.insert("models".into(), models);
+    Some(Value::Object(normalized))
+}
+
+fn normalize_imported_config(data: &Value) -> Result<Value, String> {
+    let root = data
+        .as_object()
+        .ok_or_else(|| "配置文件必须是 JSON 对象".to_owned())?;
+    let source = root
+        .get("config")
+        .and_then(|v| v.as_object())
+        .map(|obj| Value::Object(obj.clone()))
+        .unwrap_or_else(|| data.clone());
+    let source_obj = source
+        .as_object()
+        .ok_or_else(|| "配置文件必须是 JSON 对象".to_owned())?;
+
+    let mut normalized = default_config_value();
+    {
+        let obj = normalized.as_object_mut().expect("default config object");
+        for key in [
+            "version",
+            "activeProvider",
+            "gatewayApiKey",
+            "providers",
+            "settings",
+        ] {
+            if let Some(value) = source_obj.get(key) {
+                obj.insert(key.to_owned(), value.clone());
+            }
+        }
+        obj.insert(
+            "version".into(),
+            source_obj
+                .get("version")
+                .cloned()
+                .unwrap_or_else(|| Value::String(APP_VERSION.to_owned())),
+        );
+    }
+
+    let mut settings = default_config_value()
+        .get("settings")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let (Some(settings_obj), Some(imported)) = (
+        settings.as_object_mut(),
+        source_obj.get("settings").and_then(|v| v.as_object()),
+    ) {
+        for (key, value) in imported {
+            settings_obj.insert(key.clone(), value.clone());
+        }
+    }
+    normalized["settings"] = settings;
+
+    let providers = source_obj
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "providers 必须是数组".to_owned())?;
+    let mut normalized_providers = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for provider in providers {
+        let Some(mut normalized_provider) = normalize_imported_provider(provider) else {
+            continue;
+        };
+        let provider_id = normalized_provider
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if !seen_ids.insert(provider_id.clone()) {
+            if let Some(obj) = normalized_provider.as_object_mut() {
+                obj.insert(
+                    "id".into(),
+                    Value::String(format!("{provider_id}-{}", random_hex(2))),
+                );
+            }
+        }
+        if let Some(id) = normalized_provider.get("id").and_then(|v| v.as_str()) {
+            seen_ids.insert(id.to_owned());
+        }
+        normalized_providers.push(normalized_provider);
+    }
+    normalized["providers"] = Value::Array(normalized_providers);
+
+    let provider_ids: HashSet<String> = normalized["providers"]
+        .as_array()
+        .map(|providers| {
+            providers
+                .iter()
+                .filter_map(|p| p.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let active_provider = source_obj.get("activeProvider").and_then(|v| v.as_str());
+    normalized["activeProvider"] = if let Some(active) = active_provider {
+        if provider_ids.contains(active) {
+            Value::String(active.to_owned())
+        } else {
+            normalized["providers"]
+                .as_array()
+                .and_then(|providers| providers.first())
+                .and_then(|p| p.get("id"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        }
+    } else {
+        normalized["providers"]
+            .as_array()
+            .and_then(|providers| providers.first())
+            .and_then(|p| p.get("id"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    if let Some(key) = source_obj.get("gatewayApiKey").filter(|v| !v.is_null()) {
+        normalized["gatewayApiKey"] = key.clone();
+    }
+
+    Ok(normalized)
+}
+
+fn create_config_backup(reason: &str) -> Result<Value, String> {
+    let backup_dir = app_backup_dir()?;
+    fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    let config_file = app_config_file()?;
+    if !config_file.exists() {
+        let cfg = load_registry()?;
+        save_registry(&cfg)?;
+    }
+
+    let safe_reason: String = reason
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
+        .take(32)
+        .collect();
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%f");
+    let filename = format!(
+        "config-{timestamp}-{}-{}.json",
+        if safe_reason.is_empty() {
+            "manual"
+        } else {
+            safe_reason.as_str()
+        },
+        random_hex(2)
+    );
+    let target = backup_dir.join(&filename);
+    fs::copy(&config_file, &target).map_err(|e| format!("复制配置备份失败: {e}"))?;
+    let stat = fs::metadata(&target).map_err(|e| format!("读取备份元数据失败: {e}"))?;
+    Ok(json!({
+        "name": filename,
+        "size": stat.len(),
+        "createdAt": system_time_iso_seconds(stat.modified().unwrap_or_else(|_| SystemTime::now())),
+    }))
+}
+
+fn list_config_backups() -> Result<Vec<Value>, String> {
+    let backup_dir = app_backup_dir()?;
+    fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    let mut backups = Vec::new();
+    let entries = fs::read_dir(&backup_dir).map_err(|e| format!("读取备份目录失败: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("json") || !path.is_file() {
+            continue;
+        }
+        let stat = match fs::metadata(&path) {
+            Ok(stat) => stat,
+            Err(_) => continue,
+        };
+        let name = match path.file_name().and_then(|v| v.to_str()) {
+            Some(name) => name.to_owned(),
+            None => continue,
+        };
+        backups.push(json!({
+            "name": name,
+            "size": stat.len(),
+            "createdAt": system_time_iso_seconds(stat.modified().unwrap_or_else(|_| SystemTime::now())),
+        }));
+    }
+    backups.sort_by(|a, b| {
+        let a = a.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
+        let b = b.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
+        b.cmp(a)
+    });
+    Ok(backups)
 }
 
 // ── /api/instance-info & /api/instance-show-window ───────────────────
@@ -1107,21 +2106,35 @@ pub async fn proxy_status(State(state): State<AdminState>) -> impl IntoResponse 
     Json(json!({
         "running": s.running,
         "port": port,
-        "stats": {"total": 0, "success": 0, "failed": 0, "today": 0},
+        "stats": proxy_telemetry().stats.snapshot(),
     }))
     .into_response()
 }
 
 pub async fn proxy_logs() -> impl IntoResponse {
-    Json(json!({"logs": []})).into_response()
+    Json(json!({"logs": proxy_telemetry().logs.get_all()})).into_response()
 }
 
 pub async fn proxy_logs_clear() -> impl IntoResponse {
+    proxy_telemetry().logs.clear();
     Json(json!({"success": true})).into_response()
 }
 
 pub async fn proxy_logs_open_dir() -> impl IntoResponse {
-    Json(json!({"success": true})).into_response()
+    let Some(path) = proxy_log_dir() else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位日志目录").into_response();
+    };
+    if let Err(e) = fs::create_dir_all(&path) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法创建日志目录: {e}"),
+        )
+        .into_response();
+    }
+    match open_directory(&path) {
+        Ok(_) => Json(json!({"success": true, "path": path.to_string_lossy()})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 // ── /api/settings ────────────────────────────────────────────────────
@@ -1156,11 +2169,17 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
 // ── /api/config/* ────────────────────────────────────────────────────
 
 pub async fn create_backup() -> impl IntoResponse {
-    Json(json!({"success": true, "name": "stub", "createdAt": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(), "size": 0})).into_response()
+    match create_config_backup("manual") {
+        Ok(backup) => Json(json!({"success": true, "backup": backup})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 pub async fn list_backups() -> impl IntoResponse {
-    Json(json!({"backups": []})).into_response()
+    match list_config_backups() {
+        Ok(backups) => Json(json!({"backups": backups})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 pub async fn export_config() -> impl IntoResponse {
@@ -1173,8 +2192,24 @@ pub async fn export_config() -> impl IntoResponse {
     .into_response()
 }
 
-pub async fn import_config(Json(_data): Json<Value>) -> impl IntoResponse {
-    Json(json!({"success": true, "message": "import 暂未实现(v2.0.x 补)"})).into_response()
+pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
+    let backup = match create_config_backup("before-import") {
+        Ok(backup) => backup,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let normalized = match normalize_imported_config(&data) {
+        Ok(config) => config,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if let Err(e) = save_registry(&normalized) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "success": true,
+        "message": "配置已导入",
+        "backup": backup,
+    }))
+    .into_response()
 }
 
 // ── /api/update/* ────────────────────────────────────────────────────
@@ -1194,8 +2229,177 @@ pub async fn update_install(Json(_input): Json<Value>) -> impl IntoResponse {
 
 // ── /api/feedback ────────────────────────────────────────────────────
 
-pub async fn submit_feedback(Json(_input): Json<Value>) -> impl IntoResponse {
-    Json(json!({"success": true, "message": "feedback 暂存(v2.0.x 接 worker)"})).into_response()
+pub async fn submit_feedback(Json(input): Json<Value>) -> impl IntoResponse {
+    let throttle = feedback_throttle();
+    if let Err(reason) = throttle.acquire() {
+        return err(StatusCode::TOO_MANY_REQUESTS, reason).into_response();
+    }
+
+    let title = input
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let body_text = input
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let include_diag = input
+        .get("include_diagnostics")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if body_text.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "请填写描述").into_response();
+    }
+
+    let mut meta = json!({"app_version": APP_VERSION});
+    if include_diag {
+        let active_name = load_registry()
+            .ok()
+            .map(|cfg| active_provider_name(&cfg))
+            .unwrap_or_default();
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert(
+                "os".to_owned(),
+                Value::String(std::env::consts::OS.to_owned()),
+            );
+            obj.insert(
+                "arch".to_owned(),
+                Value::String(std::env::consts::ARCH.to_owned()),
+            );
+            obj.insert(
+                "active_provider_name".to_owned(),
+                Value::String(active_name),
+            );
+            obj.insert("include_diagnostics".to_owned(), Value::Bool(true));
+        }
+    }
+
+    let mut form = multipart::Form::new()
+        .part(
+            "meta",
+            multipart_text_part(meta.to_string(), "application/json"),
+        )
+        .part("title", multipart_text_part(title, "text/plain"))
+        .part("body", multipart_text_part(body_text, "text/plain"));
+
+    let mut shot_idx = 0usize;
+    let mut log_idx = 0usize;
+    if let Some(attachments) = input.get("attachments").and_then(|v| v.as_array()) {
+        for attachment in attachments {
+            let Some(obj) = attachment.as_object() else {
+                continue;
+            };
+            let content_b64 = obj
+                .get("content_b64")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let Ok(raw) = STANDARD.decode(content_b64.as_bytes()) else {
+                continue;
+            };
+            if raw.is_empty() || raw.len() > 5 * 1024 * 1024 {
+                continue;
+            }
+            let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("log");
+            let name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .unwrap_or("attachment.bin")
+                .to_owned();
+            let content_type = obj
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .filter(|v| v.contains('/'))
+                .unwrap_or("application/octet-stream")
+                .to_owned();
+            let field = if kind == "screenshot" {
+                let field = format!("screenshot{shot_idx}");
+                shot_idx += 1;
+                field
+            } else {
+                let field = format!("log{log_idx}");
+                log_idx += 1;
+                field
+            };
+            let part = multipart::Part::bytes(raw.clone()).file_name(name.clone());
+            let part = part
+                .mime_str(&content_type)
+                .unwrap_or_else(|_| multipart::Part::bytes(raw).file_name(name));
+            form = form.part(field, part);
+        }
+    }
+
+    if include_diag {
+        if let Some(part) = feedback_proxy_tail_part() {
+            form = form.part("log_proxy_tail", part);
+        }
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            throttle.record_failure();
+            return err(StatusCode::BAD_GATEWAY, format!("反馈服务暂不可用:{e}")).into_response();
+        }
+    };
+
+    let response = match client
+        .post(FEEDBACK_WORKER_URL)
+        .multipart(form)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            throttle.record_failure();
+            return err(StatusCode::BAD_GATEWAY, format!("反馈服务暂不可用:{e}")).into_response();
+        }
+    };
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("application/json"))
+        .unwrap_or(false);
+    let data = if is_json {
+        response.json::<Value>().await.unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    if !status.is_success() || data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        throttle.record_failure();
+        let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status_code = if status_code.is_client_error() || status_code.is_server_error() {
+            status_code
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        let message = data
+            .get("error")
+            .or_else(|| data.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("上游错误");
+        return err(status_code, message).into_response();
+    }
+
+    throttle.record_success();
+    let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    Json(json!({
+        "success": true,
+        "id": id,
+        "message": format!("反馈已收到 (ID: {id})"),
+        "email_sent": data.get("email_sent").and_then(|v| v.as_bool()).unwrap_or(false),
+    }))
+    .into_response()
 }
 
 // ── 测速 / 模型探测 / 兼容性 ─────────────────────────────────
@@ -1223,28 +2427,141 @@ pub async fn test_provider(Path(id): Path<String>) -> impl IntoResponse {
     Json(test_provider_connection(provider).await).into_response()
 }
 
-pub async fn query_provider_usage(Path(_id): Path<String>) -> impl IntoResponse {
-    Json(json!({"success": true, "usage": null})).into_response()
+pub async fn query_provider_usage(Path(id): Path<String>) -> impl IntoResponse {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let provider = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .and_then(|providers| {
+            providers.iter().find(|provider| {
+                provider
+                    .as_object()
+                    .and_then(|o| o.get("id"))
+                    .and_then(|v| v.as_str())
+                    == Some(id.as_str())
+            })
+        });
+    let Some(provider) = provider else {
+        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+    };
+    let result = query_provider_usage_impl(provider).await;
+    let status = if result.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(result)).into_response()
 }
 
 pub async fn provider_compatibility() -> impl IntoResponse {
-    Json(json!({"providers": []})).into_response()
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let providers: Vec<Value> = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(provider_compatibility_item)
+        .collect();
+    let experimental_count = providers
+        .iter()
+        .filter(|item| item.get("level").and_then(|v| v.as_str()) == Some("experimental"))
+        .count();
+    Json(json!({
+        "success": true,
+        "providers": providers,
+        "experimentalCount": experimental_count,
+    }))
+    .into_response()
 }
 
 pub async fn test_provider_payload(Json(payload): Json<Value>) -> impl IntoResponse {
     Json(test_provider_connection(&payload).await).into_response()
 }
 
-pub async fn fetch_provider_models(Path(_id): Path<String>) -> impl IntoResponse {
-    Json(json!({"models": []})).into_response()
+pub async fn fetch_provider_models(Path(id): Path<String>) -> impl IntoResponse {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let provider = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .and_then(|providers| {
+            providers.iter().find(|provider| {
+                provider
+                    .as_object()
+                    .and_then(|o| o.get("id"))
+                    .and_then(|v| v.as_str())
+                    == Some(id.as_str())
+            })
+        });
+    let Some(provider) = provider else {
+        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+    };
+    let result = fetch_provider_models_impl(provider).await;
+    let status = if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, Json(result)).into_response()
 }
 
-pub async fn fetch_provider_models_payload(Json(_payload): Json<Value>) -> impl IntoResponse {
-    Json(json!({"models": []})).into_response()
+pub async fn fetch_provider_models_payload(Json(payload): Json<Value>) -> impl IntoResponse {
+    let result = fetch_provider_models_impl(&payload).await;
+    let status = if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, Json(result)).into_response()
 }
 
-pub async fn autofill_provider_models(Path(_id): Path<String>) -> impl IntoResponse {
-    Json(json!({"success": true})).into_response()
+pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let Some(idx) = provider_index(&cfg, &id) else {
+        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+    };
+    let provider = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .and_then(|providers| providers.get(idx))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let result = fetch_provider_models_impl(&provider).await;
+    if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return (StatusCode::BAD_REQUEST, Json(result)).into_response();
+    }
+    let suggested = result
+        .get("suggested")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) {
+        if let Some(provider) = providers.get_mut(idx).and_then(|v| v.as_object_mut()) {
+            provider.insert("models".into(), suggested.clone());
+        }
+    }
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "success": true,
+        "models": result.get("models").cloned().unwrap_or_else(|| json!([])),
+        "suggested": suggested,
+        "endpoint": result.get("endpoint").cloned().unwrap_or(Value::Null),
+        "message": "模型映射已自动填充",
+    }))
+    .into_response()
 }
 
 #[allow(dead_code)]
