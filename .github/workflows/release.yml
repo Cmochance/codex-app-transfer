@@ -81,8 +81,12 @@ jobs:
           workspaces: '. -> target'
           key: ${{ matrix.target }}
 
-      - uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall -y tauri-cli@^2
+      # cargo binstall 在 windows-latest 上偶发卡死(2026-05-05 PR #3 dispatch
+      # test 实测: Windows job 在该 step 30+ 分钟无进展). 改用 cargo install
+      # --locked, 三平台一致, 慢但稳, Swatinem cache 命中后 ~10s.
+      - name: Install tauri-cli
+        timeout-minutes: 10
+        run: cargo install tauri-cli --version "^2" --locked
 
       - name: Resolve VERSION
         id: ver
@@ -131,40 +135,60 @@ jobs:
           set -euo pipefail
           V="${{ steps.ver.outputs.version }}"
           PLAT="${{ matrix.plat }}"
-          BDIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          # Cargo workspace 的 target_directory 是 workspace 根 (Cargo.toml
+          # [workspace] 所在目录), 即使 cargo tauri build 在 src-tauri/ 下跑,
+          # bundle 也输出到根级 target/, 不是 src-tauri/target/. PR #3 dispatch
+          # test 实测 Linux job upload-artifact 报 "No files were found"
+          # 即此 BDIR 路径错的征兆.
+          BDIR="target/${{ matrix.target }}/release/bundle"
           mkdir -p staging
 
           # Tauri 2 没有 bundle.fileName 字段, 默认产物名为
           # "Codex App Transfer_<V>_<arch>.<ext>" (productName 带空格透传).
-          # glob 已用引号 ("$BDIR"/dmg/*.dmg) 能命中带空格文件名;
-          # cp 时也用引号 cp "$f" "staging/...", 安全。
+          # glob 用引号 ("$BDIR"/dmg/*.dmg) 命中带空格文件名;
+          # cp 时也用引号 cp "$f" "staging/...", 安全.
 
+          shopt -s nullglob
           case "$PLAT" in
             macOS-arm64)
               for f in "$BDIR"/dmg/*.dmg; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.dmg"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.dmg"
               done
               ;;
             Linux-x86_64)
               for f in "$BDIR"/deb/*.deb; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.deb"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.deb"
               done
               for f in "$BDIR"/appimage/*.AppImage; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.AppImage"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.AppImage"
               done
               ;;
             Windows-x64)
               for f in "$BDIR"/nsis/*-setup.exe; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}-Setup.exe"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}-Setup.exe"
               done
               for f in "$BDIR"/msi/*.msi; do
-                [[ -f "$f" ]] && cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.msi"
+                cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.msi"
               done
               ;;
           esac
 
           echo "Staged artifacts for $PLAT:"
           ls -la staging/
+
+          # 显式空 staging 检查, 早 fail 而非拖到 upload-artifact step 才报错;
+          # 失败时 dump bundle 树前 200 行帮助 debug 路径问题.
+          files=(staging/*)
+          if (( ${#files[@]} == 0 )); then
+            echo "::error::No bundles staged for $PLAT from $BDIR"
+            echo "--- bundle tree under $BDIR (first 200 entries) ---"
+            find "$BDIR" -maxdepth 4 -type f 2>/dev/null | sort | sed -n "1,200p" || \
+              echo "($BDIR does not exist)"
+            echo "--- target tree (first 200 entries) ---"
+            find target -maxdepth 5 -type f 2>/dev/null | sort | sed -n "1,200p" || \
+              echo "(target does not exist)"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
