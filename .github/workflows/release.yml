@@ -81,11 +81,21 @@ jobs:
           workspaces: '. -> target'
           key: ${{ matrix.target }}
 
-      # cargo binstall 在 windows-latest 上偶发卡死(2026-05-05 PR #3 dispatch
-      # test 实测: Windows job 在该 step 30+ 分钟无进展). 改用 cargo install
-      # --locked, 三平台一致, 慢但稳, Swatinem cache 命中后 ~10s.
+      # cargo binstall 在 windows-latest 上偶发卡死(PR #3 dispatch test 30+ min
+      # 无进展); cargo install 稳但 windows-latest 冷编译 tauri-cli 需 15-25 min
+      # (PR #6 dispatch test 实测 10 min 不够). 给独立 cache + timeout 25 min.
+      - name: Cache cargo-tauri binary
+        id: cache-tauri-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/bin/cargo-tauri.exe
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-tauri-cli-v2
+
       - name: Install tauri-cli
-        timeout-minutes: 10
+        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
+        timeout-minutes: 25
         run: cargo install tauri-cli --version "^2" --locked
 
       - name: Resolve VERSION
@@ -121,13 +131,23 @@ jobs:
             > ~/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8
           echo "APPLE_API_KEY_PATH=$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8" >> $GITHUB_ENV
 
+      # macOS Apple env: GH Actions secret 未配置时, 直接传到 env 会变成空字符串,
+      # 导致 codesign 用空 identity 失败 ("The specified item could not be found
+      # in the keychain", PR #6 dispatch test 实测). 这里把 secret 接到带 _RAW
+      # 后缀的 env 上, run 内显式判空再 export, 空时不暴露给 cargo tauri build,
+      # 让 Tauri 走 ad-hoc 签名路径 (默认行为).
       - name: cargo tauri build
         working-directory: src-tauri
+        shell: bash
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-        run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          APPLE_SIGNING_IDENTITY_RAW: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER_RAW: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_RAW: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          [[ -n "$APPLE_SIGNING_IDENTITY_RAW" ]] && export APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY_RAW"
+          [[ -n "$APPLE_API_ISSUER_RAW" ]] && export APPLE_API_ISSUER="$APPLE_API_ISSUER_RAW"
+          [[ -n "$APPLE_API_KEY_RAW" ]] && export APPLE_API_KEY="$APPLE_API_KEY_RAW"
+          cargo tauri build --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}"
 
       - name: Rename bundles to project naming
         shell: bash
