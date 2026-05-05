@@ -438,6 +438,8 @@ impl ChatToResponsesConverter {
                     "status": "in_progress",
                     "id": self.reasoning_id,
                     "summary": [],
+                    "content": null,
+                    "encrypted_content": null,
                 },
             }),
         );
@@ -501,6 +503,8 @@ impl ChatToResponsesConverter {
                 "type": "summary_text",
                 "text": self.reasoning_acc,
             }],
+            "content": null,
+            "encrypted_content": null,
         })
     }
 
@@ -889,7 +893,10 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         let output = completed["output"].as_array().unwrap();
         assert_eq!(output.len(), 1, "output 只含 reasoning item");
         assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"], Value::Null);
+        assert_eq!(output[0]["encrypted_content"], Value::Null);
         assert_eq!(output[0]["summary"][0]["text"], "The");
+        assert_eq!(output[0]["summary"][0]["type"], "summary_text");
     }
 
     #[test]
@@ -913,6 +920,9 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         );
         assert_eq!(ev1[1].1["item"]["type"], "reasoning");
         assert_eq!(ev1[1].1["output_index"], 0);
+        assert_eq!(ev1[1].1["item"]["summary"], json!([]));
+        assert_eq!(ev1[1].1["item"]["content"], Value::Null);
+        assert_eq!(ev1[1].1["item"]["encrypted_content"], Value::Null);
 
         // 第 2 chunk:content 出现,先关 reasoning 再开 message
         let out2 = c.feed(
@@ -934,6 +944,9 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         );
         // reasoning 关闭事件的 output_index = 0
         assert_eq!(ev2[2].1["output_index"], 0);
+        assert_eq!(ev2[2].1["item"]["content"], Value::Null);
+        assert_eq!(ev2[2].1["item"]["encrypted_content"], Value::Null);
+        assert_eq!(ev2[2].1["item"]["summary"][0]["type"], "summary_text");
         // message 打开事件的 output_index = 1
         assert_eq!(ev2[3].1["output_index"], 1);
 
@@ -953,6 +966,9 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         let output = ev3[3].1["response"]["output"].as_array().unwrap();
         assert_eq!(output.len(), 2);
         assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"], Value::Null);
+        assert_eq!(output[0]["encrypted_content"], Value::Null);
+        assert_eq!(output[0]["summary"][0]["type"], "summary_text");
         assert_eq!(output[0]["summary"][0]["text"], "think");
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "answer");

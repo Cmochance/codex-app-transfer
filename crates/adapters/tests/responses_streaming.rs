@@ -135,6 +135,9 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
     let output = completed["output"].as_array().unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[0]["content"], Value::Null);
+    assert_eq!(output[0]["encrypted_content"], Value::Null);
+    assert_eq!(output[0]["summary"][0]["type"], "summary_text");
     assert_eq!(output[0]["summary"][0]["text"], "The");
 }
 
