@@ -2448,12 +2448,7 @@ pub async fn query_provider_usage(Path(id): Path<String>) -> impl IntoResponse {
         return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
     };
     let result = query_provider_usage_impl(provider).await;
-    let status = if result.get("success").and_then(|v| v.as_bool()) == Some(false) {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::OK
-    };
-    (status, Json(result)).into_response()
+    Json(result).into_response()
 }
 
 pub async fn provider_compatibility() -> impl IntoResponse {
@@ -2664,5 +2659,199 @@ mod tests {
             );
             assert_eq!(result["suggested"]["default"], json!("deepseek-v4-pro"));
         });
+    }
+
+    #[test]
+    fn provider_connection_posts_legacy_minimal_ping_after_probe_fallback() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::post, Router};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(Json(json!({"id": "ok", "choices": []}))),
+            );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let provider = json!({
+                "name": "Mock OpenAI Chat",
+                "baseUrl": format!("http://{addr}/v1"),
+                "apiFormat": "openai_chat",
+                "apiKey": "test-key",
+                "models": {"default": "deepseek-chat"}
+            });
+            let result = test_provider_connection(&provider).await;
+            server.abort();
+
+            assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(result.get("ok").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(result.get("statusCode").and_then(|v| v.as_u64()), Some(200));
+        });
+    }
+
+    #[test]
+    fn provider_connection_distinguishes_invalid_url_and_bad_key() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let invalid = json!({
+                "baseUrl": "not a url",
+                "apiFormat": "responses",
+            });
+            let result = test_provider_connection(&invalid).await;
+            assert_eq!(result["success"], json!(false));
+            assert_eq!(result["message"], json!("API 地址无效"));
+
+            use axum::{
+                http::{HeaderMap as AxumHeaderMap, StatusCode as AxumStatusCode},
+                routing::post,
+                Router,
+            };
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(|headers: AxumHeaderMap| async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok())
+                        == Some("Bearer good-key")
+                    {
+                        (AxumStatusCode::OK, Json(json!({"id": "ok", "choices": []})))
+                    } else {
+                        (
+                            AxumStatusCode::UNAUTHORIZED,
+                            Json(json!({"error": "bad key"})),
+                        )
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let bad_key = json!({
+                "name": "Mock Provider",
+                "baseUrl": format!("http://{addr}/v1"),
+                "apiFormat": "openai_chat",
+                "apiKey": "bad-key",
+                "models": {"default": "deepseek-chat"}
+            });
+            let result = test_provider_connection(&bad_key).await;
+            server.abort();
+
+            assert_eq!(result["success"], json!(true));
+            assert_eq!(result["ok"], json!(false));
+            assert_eq!(result["statusCode"], json!(401));
+            assert!(result["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("认证失败"));
+        });
+    }
+
+    #[test]
+    fn provider_usage_preserves_legacy_no_key_and_unsupported_payloads() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let no_key = json!({
+                "name": "DeepSeek",
+                "baseUrl": "https://api.deepseek.com",
+            });
+            let result = query_provider_usage_impl(&no_key).await;
+            assert_eq!(result["success"], json!(false));
+            assert_eq!(result["message"], json!("请先保存 API Key"));
+
+            let unsupported = json!({
+                "name": "Unknown",
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "test-key",
+            });
+            let result = query_provider_usage_impl(&unsupported).await;
+            assert_eq!(result["success"], json!(true));
+            assert_eq!(result["supported"], json!(false));
+            assert_eq!(result["items"], json!([]));
+        });
+    }
+
+    #[test]
+    fn balance_payloads_match_legacy_normalization() {
+        let deepseek = normalize_balance_payload(
+            "deepseek",
+            &json!({
+                "balance_infos": [{
+                    "currency": "CNY",
+                    "total_balance": "8.5",
+                    "granted_balance": "10",
+                    "topped_up_balance": "1.5"
+                }]
+            }),
+        );
+        assert_eq!(deepseek[0]["label"], json!("CNY"));
+        assert_eq!(deepseek[0]["remaining"], json!(8.5));
+        assert_eq!(deepseek[0]["total"], json!(10.0));
+        assert_eq!(deepseek[0]["used"], json!(1.5));
+
+        let openrouter = normalize_balance_payload(
+            "openrouter",
+            &json!({"data": {"total_credits": 12.0, "total_usage": 5.25}}),
+        );
+        assert_eq!(openrouter[0]["label"], json!("credits"));
+        assert_eq!(openrouter[0]["remaining"], json!(6.75));
+        assert_eq!(openrouter[0]["unit"], json!("USD"));
+
+        let generic = normalize_balance_payload(
+            "siliconflow",
+            &json!({"data": {"availableBalance": "3.25", "totalBalance": "4", "usedBalance": "0.75", "currency": "CNY"}}),
+        );
+        assert_eq!(generic[0]["remaining"], json!(3.25));
+        assert_eq!(generic[0]["total"], json!(4.0));
+        assert_eq!(generic[0]["used"], json!(0.75));
+        assert_eq!(generic[0]["unit"], json!("CNY"));
+    }
+
+    #[test]
+    fn provider_compatibility_matches_legacy_matrix() {
+        let responses = provider_compatibility_item(&json!({
+            "id": "responses",
+            "name": "Responses",
+            "apiFormat": "responses",
+        }));
+        assert_eq!(responses["level"], json!("stable"));
+        assert_eq!(responses["checks"]["streamingTools"], json!(true));
+
+        let openai_chat = provider_compatibility_item(&json!({
+            "id": "chat",
+            "name": "OpenAI Chat",
+            "apiFormat": "openai_chat",
+        }));
+        assert_eq!(openai_chat["level"], json!("experimental"));
+        assert_eq!(openai_chat["checks"]["models"], json!(true));
+        assert_eq!(openai_chat["checks"]["streamingTools"], json!(false));
+
+        let legacy_alias = provider_compatibility_item(&json!({
+            "id": "legacy",
+            "name": "Legacy",
+            "apiFormat": "anthropic",
+        }));
+        assert_eq!(legacy_alias["apiFormat"], json!("responses"));
+        assert_eq!(legacy_alias["level"], json!("stable"));
+        assert_eq!(legacy_alias["checks"]["models"], json!(true));
     }
 }
