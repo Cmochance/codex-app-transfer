@@ -6,7 +6,7 @@
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri)](https://v2.tauri.app/)
 [![Downloads](https://img.shields.io/github/downloads/Cmochance/codex-app-transfer/total?label=downloads)](https://github.com/Cmochance/codex-app-transfer/releases)
 
-Codex App Transfer 是一个面向 **OpenAI Codex CLI** 的轻量配置和转发工具。它在本机起一个网关，把 Codex CLI 发出的 Responses API（含 WebSocket 流和 `/responses` HTTP 回退）翻译成 Chat Completions 格式，再转发到你选择的供应商，比如 Kimi Code、Kimi 月之暗面、DeepSeek V4、Xiaomi MiMo、智谱 GLM、阿里云百炼等。
+Codex App Transfer 是一个面向 **OpenAI Codex CLI** 的轻量配置和转发工具。它在本机起一个网关，把 Codex CLI 发出的 Responses API（HTTP 流式 / 非流式请求，含 `/responses` HTTP 回退）翻译成 Chat Completions 格式，再转发到你选择的供应商，比如 Kimi Code、Kimi 月之暗面、DeepSeek V4、Xiaomi MiMo、智谱 GLM、阿里云百炼等。
 
 和 `farion1231/cc-switch` 这类偏 Claude Code / CLI 的 Anthropic 工具不同，本项目专注 OpenAI Codex CLI 的接入：用桌面界面管理供应商、模型映射、转发端口和日志，让 Codex CLI 可以无缝使用第三方 OpenAI 兼容的推理服务。
 
@@ -16,24 +16,24 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本：**v2.0.0**(Python → Rust/Tauri 全栈重写;UI 视觉与 v1.0.4 字节级一致)
+- 当前版本：**v2.0.1**(Python → Rust/Tauri 全栈重写后的当前主线;UI 视觉与 v1.0.4 字节级一致)
 - 已验证供应商：Kimi Code（`kimi-for-coding` UA 网关）、Kimi 月之暗面（Moonshot Platform）、DeepSeek V4（含「Max 思维」思考模式）、Xiaomi MiMo (Token Plan)、Xiaomi MiMo (Pay for Token)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
 
 > 如果使用过程中出现问题，欢迎提交 PR 协助作者完善，会及时处理，非常感谢。
 
-- 平台:macOS arm64(v2.0.0 首发);Windows x64 / Linux x86_64 留 v2.0.x 补
+- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产
 - 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.0.4 字节级互通,可来回切换不丢数据
 
 ### 更新日志
 
-逐版本变更详见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 或 `docs/release-notes-v*.md`。
+逐版本变更详见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 或 `docs/release-notes-v*.md`。当前管理 API 与代理入口状态见 [`docs/api-route-status.md`](docs/api-route-status.md)。
 
 ## 能做什么
 
 - 管理多套供应商，按 OpenAI 模型名（gpt-5.5 / gpt-5.4 / gpt-5.4-mini / gpt-5.3-codex / gpt-5.2）映射到供应商真实模型 ID。
 - 把 Codex CLI 的 Responses API 流式 / 非流式请求转换为 Chat Completions 格式后转发，多轮工具对话上下文 + 思维内容流式展开均已对齐 OpenAI Responses API 协议。
-- 兼容 Codex CLI 0.126+ 的 `responses_websocket` 主连接和 `responses_http` HTTP 回退（含 `/responses` 路由别名）。
+- 兼容 Codex CLI 0.126+ 的 `responses_http` 路径和 `/responses` 路由别名；当前 Rust 主线对外承诺的是 HTTP/SSE 转发入口。
 - 自动把上游 `chatcmpl-...` 应答 ID 重写成 Codex CLI 校验通过的 `resp_...`，并保留 deployment affinity 编码；session_cache 查询前自动 decode 回原始 ID。
 - thinking 开启的上游（Kimi / DeepSeek 等）三层防御：单空格占位 `reasoning_content`、`reasoning_summary_part` 标准协议事件、全局 `TOOL_CALLS_CACHE` 在历史压缩后重建缺失的 assistant.tool_calls。
 - 自动归一化 `reasoning_effort`（`xhigh` / `max` → `high`，`auto` / `none` 直接丢弃），适配只接受 `minimal/low/medium/high` 的供应商。
@@ -88,7 +88,7 @@ http://127.0.0.1:18081
 
 ## English Quick Start
 
-Codex App Transfer is a lightweight desktop app that turns OpenAI Codex CLI into a multi-provider client. It runs a local gateway, translating Codex CLI's Responses API requests (WebSocket stream + `/responses` HTTP fallback) into Chat Completions format and forwarding them to providers such as Kimi Code, Kimi Moonshot, DeepSeek V4, Xiaomi MiMo, Zhipu GLM, and Alibaba Cloud Bailian.
+Codex App Transfer is a lightweight desktop app that turns OpenAI Codex CLI into a multi-provider client. It runs a local gateway, translating Codex CLI's Responses API requests (HTTP streaming / non-streaming requests, including the `/responses` HTTP fallback) into Chat Completions format and forwarding them to providers such as Kimi Code, Kimi Moonshot, DeepSeek V4, Xiaomi MiMo, Zhipu GLM, and Alibaba Cloud Bailian.
 
 Unlike `farion1231/cc-switch` and similar Anthropic-oriented Claude Code tools, this project focuses on OpenAI Codex CLI: manage providers, model mapping, forwarding ports, and logs from a desktop UI so Codex CLI can talk to any third-party OpenAI-compatible inference endpoint.
 
@@ -96,15 +96,15 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: **v2.0.0** (full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
+- Current version: **v2.0.1** (current mainline after the full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
 - Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (with "Max thinking" mode), Xiaomi MiMo (Token Plan), Xiaomi MiMo (Pay for Token)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
-- Platforms: macOS arm64 (v2.0.0 launch); Windows x64 / Linux x86_64 follow in v2.0.x
-- Data compatibility: `~/.codex-app-transfer/config.json` is byte-identical between v1.0.4 and v2.0.0 — switch back and forth without data loss
+- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets
+- Data compatibility: `~/.codex-app-transfer/config.json` remains byte-identical between v1.0.4 and the v2.x Rust mainline — switch back and forth without data loss
 
 ### Changelog
 
-Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) (and locally under `docs/release-notes-v*.md`).
+Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) (and locally under `docs/release-notes-v*.md`). The current management API and proxy surface are indexed in [`docs/api-route-status.md`](docs/api-route-status.md).
 
 ### Getting started
 
@@ -121,7 +121,7 @@ Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochanc
 
 - Manages multiple providers and maps OpenAI model names (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.2`) to each provider's real model ID.
 - Translates Codex CLI's Responses API requests (streaming and non-streaming) to Chat Completions format before forwarding.
-- Compatible with the Codex CLI 0.126+ transport: `responses_websocket` primary connection plus `responses_http` HTTP fallback, including the `/responses` route alias (no `/v1/` prefix).
+- Compatible with the Codex CLI 0.126+ `responses_http` path and the `/responses` route alias (no `/v1/` prefix); the current Rust mainline exposes an HTTP/SSE forwarding surface.
 - Re-encodes upstream `chatcmpl-*` IDs into Codex-friendly `resp_<base64>` while preserving deployment affinity, so `previous_response_id` keeps working.
 - For thinking-enabled upstreams (Kimi / DeepSeek), automatically attaches `reasoning_content` to historical assistant tool-call messages to avoid `400 thinking is enabled but reasoning_content is missing`.
 - Normalizes `reasoning_effort` (`xhigh` / `max` → `high`; `auto` / `none` dropped) so providers that only accept `minimal/low/medium/high` won't reject the request.
@@ -132,7 +132,7 @@ Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochanc
 ### Security notes
 
 - Provider API keys are stored only in `~/.codex-app-transfer/config.json` — do not upload it together with `logs/` to a public repo.
-- The forwarding service binds to `127.0.0.1` only and never hijacks the system proxy. Management API endpoints require an `x-cas-request: 1` header so generic web pages can't trigger local writes via cross-site requests.
+- The forwarding service binds to `127.0.0.1` only and never hijacks the system proxy. The v2 management UI is served through Tauri's in-process `cas://` scheme instead of a loopback HTTP admin port; `X-CAS-Request` is still sent by the frontend for compatibility, but it is not the current security boundary.
 - Backup / export JSON files contain plaintext API keys — keep them on trusted devices only.
 - Logs append to `~/.codex-app-transfer/logs/proxy-YYYY-MM-DD.log`. Clearing logs archives them to `logs/backup/` with a timestamp suffix (no deletion).
 - Windows builds are not Authenticode-signed yet; verify downloads with the published `.sha256` / `.sig` and the verification snippet below.
@@ -193,11 +193,11 @@ make mac-app
 
 内部跑 `cargo tauri build --bundles app`,产出落到 `dist/mac/Codex App Transfer.app`。**单二进制 27MB**,不需要 Python 解释器、不需要外部 frontend/ 目录(全部 `include_dir!` 嵌入二进制)、不需要 Docker/Wine。
 
-要带签名 + notarize 的正式发布(`mac-release` Makefile target,Apple Developer ID + dmg/pkg),v2.0.x 起补;当前 v2.0.0 仅本地自测路径。
+正式发布走 GitHub Actions 的 `release.yml` 工作流,由 Tauri bundler 生成三平台资产并由 `xtask release-bundle` 生成 `.sha256` / `.sig` / `latest.json`。本地 `make mac-app` 仅用于 macOS 自测;Apple Developer ID notarize 仍是后续工作。
 
 ### Windows / Linux
 
-v2.0.0 首发只 ship macOS arm64。Tauri 2 原生支持跨平台编译,后续 v2.0.x 会接 Windows MSI / Linux .deb / .rpm。代码层面没有平台特异(除 macOS Apple-specific 的 NSApp.hide / NSRunningApplication.activate 等已 `#[cfg(target_os = "macos")]` 隔离),`cargo tauri build` 在对应平台直接出 native 产物。
+v2.0.0 首发只 ship macOS arm64;v2.0.1 起发布工作流会生成 Windows NSIS / MSI、Linux `.deb` / AppImage 和 macOS `.dmg`。Tauri 2 原生支持跨平台编译,代码层面没有平台特异(除 macOS Apple-specific 的 NSApp.hide / NSRunningApplication.activate 等已 `#[cfg(target_os = "macos")]` 隔离),`cargo tauri build` 在对应平台直接出 native 产物。
 
 ### 历史(v1.x / Python)打包
 
@@ -276,7 +276,7 @@ v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 
 ## 安全说明
 
 - API Key 仅保存在本机 `~/.codex-app-transfer/config.json`，不要把它和 `logs/` 一起上传公开仓库。
-- 转发服务只监听 `127.0.0.1`，不接管系统代理；管理 API 强制要求 `x-cas-request: 1` 头部，避免普通网页跨站触发本地写操作。
+- 转发服务只监听 `127.0.0.1`，不接管系统代理；v2 管理界面通过 Tauri 同进程 `cas://` scheme 提供，不再暴露 loopback HTTP 管理端口。前端仍会发送 `X-CAS-Request` 兼容头，但当前安全边界是 Tauri 自定义协议，而不是这个请求头。
 - 备份 / 导出配置的 JSON 文件包含 API Key 明文，仅在可信设备上保存。
 - 代码签名公钥位于 `release/Codex-App-Transfer-release-public.pem`，可用上文"签名校验"里的 Python 片段验证下载完整性。
 
