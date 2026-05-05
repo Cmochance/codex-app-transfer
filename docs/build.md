@@ -21,8 +21,9 @@ git push --tags
 ```
 
 这会触发 `release.yml`,三平台同时 build → rename → upload artifact →
-收口 job 跑 `release_assets.py` 出 sha256/.sig/`latest.json` → 创建一个
-**draft** GitHub release(用户手动 ready/publish)。
+收口 job 跑 `cargo run -p xtask --release -- release-bundle` 出
+sha256/.sig/`latest.json` → 创建一个 **draft** GitHub release
+(用户手动 ready/publish)。
 
 ### 备用:手动触发
 
@@ -52,11 +53,22 @@ gh run list --workflow=release.yml --limit 3
 | `RELEASE_PRIVATE_KEY_PEM` | RSA-3072 PKCS#8 PEM 全文(`.release-signing/release-private-key.pem` 的内容) |
 
 `RELEASE_PRIVATE_KEY_PEM` 缺失会让 release-bundle job fail-fast。如果是
-首次 release,在本地跑一次 `python scripts/release_assets.py --version
-0.0.0-init --include macos`(失败没关系)就会自动生成 keypair 到
-`.release-signing/`,把 `release-private-key.pem` 全文复制进 secret 即可。
-**`.release-signing/` 已 .gitignored,公钥(`release-public-key.pem`)用户
-分发后让最终用户验签**。
+首次 release,在本地跑一次:
+
+```bash
+cargo run -p xtask --release -- release-bundle \
+  --version 0.0.0-init --include macos --incoming-dir <空目录>
+```
+
+(失败没关系,会正常 exit 1 报 "no platform artifacts found",但路径上
+已经先生成了 keypair) → keypair 落到 `.release-signing/`,把
+`release-private-key.pem` 全文复制进 secret 即可。**`.release-signing/`
+已 .gitignored,公钥(`release-public-key.pem`)用户分发后让最终用户验签**。
+
+> **历史**:Phase 3 之前用 `python scripts/release_assets.py ...`,
+> Phase 3 (PR #4) 改用 Rust `xtask release-bundle`,RSA-3072 PKCS#1 v1.5 +
+> SHA-256 算法 1:1 复刻,公私钥 PKCS#8 PEM 双向兼容(私钥可被 Python
+> `cryptography` 读、公钥也可)。
 
 ### 可选
 
@@ -171,7 +183,7 @@ push tag v* / workflow_dispatch
                   │  ↓                     │
                   │ download-artifact      │
                   │  ↓                     │
-                  │ release_assets.py      │
+                  │ xtask release-bundle   │
                   │  → release/*.sig+.sha256+latest.json │
                   │  ↓                     │
                   │ softprops/action-      │
