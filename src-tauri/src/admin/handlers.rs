@@ -2611,4 +2611,58 @@ mod tests {
 
         assert_eq!(provider_test_model(&provider), "kimi-k2.6");
     }
+
+    #[test]
+    fn fetch_provider_models_reads_openai_compatible_models() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/v1/models",
+                get(|| async {
+                    Json(json!({
+                        "data": [
+                            {"id": "text-embedding-3-small"},
+                            {"id": "deepseek-v4-pro"},
+                            {"id": "deepseek-chat"}
+                        ]
+                    }))
+                }),
+            );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let provider = json!({
+                "baseUrl": format!("http://{addr}/v1"),
+                "apiFormat": "responses",
+                "authScheme": "none"
+            });
+            let result = fetch_provider_models_impl(&provider).await;
+            server.abort();
+
+            assert_eq!(result.get("success").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(
+                result.get("endpoint").and_then(|v| v.as_str()),
+                Some(format!("http://{addr}/v1/models").as_str())
+            );
+            assert_eq!(
+                result.get("models").and_then(|v| v.as_array()).cloned(),
+                Some(vec![
+                    json!("text-embedding-3-small"),
+                    json!("deepseek-v4-pro"),
+                    json!("deepseek-chat"),
+                ])
+            );
+            assert_eq!(result["suggested"]["default"], json!("deepseek-v4-pro"));
+        });
+    }
 }
