@@ -74,6 +74,23 @@ fn provider_supports_1m(provider: &Value) -> bool {
     false
 }
 
+fn provider_default_model(provider: &Value) -> String {
+    provider
+        .get("models")
+        .and_then(|m| m.get("default"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn provider_display_name(provider: &Value) -> String {
+    provider
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Provider")
+        .to_owned()
+}
+
 fn read_proxy_port(cfg: &RawConfig) -> u16 {
     cfg.get("settings")
         .and_then(|s| s.get("proxyPort"))
@@ -682,6 +699,8 @@ pub async fn desktop_configure() -> impl IntoResponse {
         return err(StatusCode::BAD_REQUEST, "未找到 active provider").into_response();
     };
     let supports_1m = provider_supports_1m(active);
+    let provider_name = provider_display_name(active);
+    let default_model = provider_default_model(active);
     let port = read_proxy_port(&cfg);
 
     // 缺 gateway key 自动补
@@ -706,6 +725,8 @@ pub async fn desktop_configure() -> impl IntoResponse {
             base_url: &base_url,
             gateway_api_key: &gateway_key,
             supports_1m,
+            provider_name: &provider_name,
+            default_model: &default_model,
             app_version: APP_VERSION,
         },
     ) {

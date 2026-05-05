@@ -132,6 +132,8 @@ pub async fn forward_handler(
         }
     }
 
+    strip_model_suffix_in_place(&mut body_bytes);
+
     // 4. 走 adapter 拿到上游路径 + 改写后的 body(openai_chat 路径下 body 等同)
     let client_path = parts
         .uri
@@ -217,6 +219,37 @@ fn rewrite_model_field(body: &Bytes, new_model: &str) -> Option<Bytes> {
     Some(Bytes::from(serde_json::to_vec(&v).ok()?))
 }
 
+fn strip_model_suffix_in_place(body: &mut Bytes) {
+    let Some(mut v) = serde_json::from_slice::<serde_json::Value>(body).ok() else {
+        return;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    let Some(model) = obj.get("model").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let stripped = strip_model_suffix(model);
+    if stripped == model {
+        return;
+    }
+    obj.insert("model".to_owned(), serde_json::Value::String(stripped));
+    if let Ok(next) = serde_json::to_vec(&v) {
+        *body = Bytes::from(next);
+    }
+}
+
+fn strip_model_suffix(model: &str) -> String {
+    let trimmed = model.trim();
+    let Some(end) = trimmed.strip_suffix(']') else {
+        return trimmed.to_owned();
+    };
+    let Some(open) = end.rfind('[') else {
+        return trimmed.to_owned();
+    };
+    end[..open].trim_end().to_owned()
+}
+
 fn filter_hop_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::with_capacity(src.len());
     for (k, v) in src.iter() {
@@ -273,5 +306,14 @@ mod tests {
     fn rewrite_returns_none_for_non_json() {
         let body = Bytes::from_static(b"not json");
         assert!(rewrite_model_field(&body, "x").is_none());
+    }
+
+    #[test]
+    fn strips_internal_model_suffix_before_upstream() {
+        let mut body = Bytes::from_static(br#"{"model":"deepseek-v4-pro[1m]","stream":true}"#);
+        strip_model_suffix_in_place(&mut body);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["model"], "deepseek-v4-pro");
+        assert_eq!(v["stream"], true);
     }
 }

@@ -95,6 +95,7 @@ pub struct ChatToResponsesConverter {
     model: String,
     finish_reason: Option<String>,
     usage: Option<Value>,
+    final_summary_fallback: Option<String>,
 }
 
 impl ChatToResponsesConverter {
@@ -136,7 +137,16 @@ impl ChatToResponsesConverter {
             model: String::new(),
             finish_reason: None,
             usage: None,
+            final_summary_fallback: Some(
+                "上游已结束本轮，但没有返回最终可见文本。Upstream completed this turn without final visible text."
+                    .into(),
+            ),
         }
+    }
+
+    pub fn without_final_summary_fallback(mut self) -> Self {
+        self.final_summary_fallback = None;
+        self
     }
 
     /// 喂入站 SSE 字节;返回**已经可以 flush** 的出站 SSE 字节。
@@ -633,6 +643,31 @@ impl ChatToResponsesConverter {
             (None, false) => ("incomplete", json!({ "reason": "interrupted" })),
         };
 
+        if status == "completed"
+            && self.reasoning_open
+            && !self.message_open
+            && self.tool_calls.is_empty()
+        {
+            if let Some(text) = self.final_summary_fallback.clone() {
+                if !text.trim().is_empty() {
+                    self.open_message(out);
+                    self.text_acc.push_str(&text);
+                    emit_event(
+                        out,
+                        "response.output_text.delta",
+                        json!({
+                            "type": "response.output_text.delta",
+                            "item_id": self.message_id,
+                            "output_index": self.message_index,
+                            "content_index": 0,
+                            "delta": text,
+                        }),
+                    );
+                    self.close_message(out);
+                }
+            }
+        }
+
         // output[] 严格按 output_index 排序(reasoning/message/tool_calls 全混在一起)
         let mut all_items: Vec<(u32, Value)> = Vec::new();
         if self.reasoning_open {
@@ -865,7 +900,7 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
     // ── Stage 3.3 新行为(reasoning)──────────────────────────────────
 
     #[test]
-    fn reasoning_only_emits_reasoning_lifecycle_no_message() {
+    fn reasoning_only_completed_turn_emits_final_message_fallback() {
         let mut c = fixed();
         let _ = c.feed(
             br#"data: {"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
@@ -885,18 +920,59 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
                 "response.reasoning_summary_text.done",
                 "response.reasoning_summary_part.done",
                 "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
                 "response.completed",
             ],
-            "reasoning-only 在 [DONE] 时只 close reasoning,不 emit message"
+            "reasoning-only completed turns should still emit visible final text"
         );
-        let completed = &events[3].1["response"];
+        let completed = &events[9].1["response"];
         let output = completed["output"].as_array().unwrap();
-        assert_eq!(output.len(), 1, "output 只含 reasoning item");
+        assert_eq!(
+            output.len(),
+            2,
+            "output contains reasoning plus fallback message"
+        );
         assert_eq!(output[0]["type"], "reasoning");
         assert_eq!(output[0]["content"], Value::Null);
         assert_eq!(output[0]["encrypted_content"], Value::Null);
         assert_eq!(output[0]["summary"][0]["text"], "The");
         assert_eq!(output[0]["summary"][0]["type"], "summary_text");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(
+            output[1]["content"][0]["text"],
+            "上游已结束本轮，但没有返回最终可见文本。Upstream completed this turn without final visible text."
+        );
+    }
+
+    #[test]
+    fn reasoning_only_fallback_can_be_disabled_for_schema_checks() {
+        let mut c = fixed().without_final_summary_fallback();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"The"}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        let output = events[3].1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "reasoning");
     }
 
     #[test]

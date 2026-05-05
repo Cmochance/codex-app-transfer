@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use codex_app_transfer_registry::model_alias::normalize_model_mappings;
 use codex_app_transfer_registry::Provider;
 use thiserror::Error;
 
@@ -122,6 +123,30 @@ impl StaticResolver {
         self.providers.first()
     }
 
+    fn map_model_for_provider(&self, provider: &Provider, requested_model: &str) -> Option<String> {
+        let mappings_value = serde_json::to_value(&provider.models).ok();
+        let mappings = normalize_model_mappings(mappings_value.as_ref());
+        let slot = match requested_model {
+            "gpt-5.5" => Some("gpt_5_5"),
+            "gpt-5.4" => Some("gpt_5_4"),
+            "gpt-5.4-mini" => Some("gpt_5_4_mini"),
+            "gpt-5.3-codex" => Some("gpt_5_3_codex"),
+            "gpt-5.2" => Some("gpt_5_2"),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            let mapped = mappings.get(slot).map(|s| s.trim()).unwrap_or("");
+            if !mapped.is_empty() {
+                return Some(mapped.to_owned());
+            }
+            let default = mappings.get("default").map(|s| s.trim()).unwrap_or("");
+            if !default.is_empty() {
+                return Some(default.to_owned());
+            }
+        }
+        None
+    }
+
     /// 校验 incoming 的 `Authorization: Bearer <gw>`,匹配 self.gateway_key.
     fn check_gateway(&self, headers: &HeaderMap) -> Result<(), ResolveError> {
         let Some(expected) = self.gateway_key.as_deref() else {
@@ -189,8 +214,16 @@ fn decide_provider<'a>(
             }
         }
     }
-    // 没 / 或没 body → 走默认 provider.
-    res.default_provider().map(|p| (p, None))
+    let provider = res.default_provider()?;
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
+            if let Some(mapped) = res.map_model_for_provider(provider, model) {
+                return Some((provider, Some(mapped)));
+            }
+        }
+    }
+    // 没 / 或没可映射 model → 走默认 provider.
+    Some((provider, None))
 }
 
 /// 让裸 Resolver 可装进 `Arc<dyn ProviderResolver>`(给 ProxyState 共享用).
@@ -204,6 +237,8 @@ mod tests {
     use indexmap::IndexMap;
 
     fn provider(id: &str, base: &str, key: &str) -> Provider {
+        let mut models = IndexMap::new();
+        models.insert("default".into(), format!("{id}-default"));
         Provider {
             id: id.into(),
             name: id.into(),
@@ -211,7 +246,7 @@ mod tests {
             auth_scheme: "bearer".into(),
             api_format: "openai_chat".into(),
             api_key: key.into(),
-            models: IndexMap::new(),
+            models,
             extra_headers: IndexMap::new(),
             model_capabilities: IndexMap::new(),
             request_options: IndexMap::new(),
@@ -311,6 +346,19 @@ mod tests {
         let res = r.resolve(&p, br#"{"model":"any-name"}"#).unwrap();
         assert_eq!(res.provider_id, "deepseek");
         assert_eq!(res.rewritten_model, None);
+    }
+
+    #[test]
+    fn openai_slot_model_maps_to_provider_default() {
+        let mut deepseek = provider("deepseek", "https://up-2", "sk-2");
+        deepseek
+            .models
+            .insert("default".into(), "deepseek-v4-pro".into());
+        let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
+        let p = parts_with(&[]);
+        let res = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();
+        assert_eq!(res.provider_id, "deepseek");
+        assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
     }
 
     #[test]
