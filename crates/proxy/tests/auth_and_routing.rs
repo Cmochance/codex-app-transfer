@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use axum::{body::Body, extract::Request, response::Response, routing::any, Router};
-use codex_app_transfer_proxy::{build_router, StaticResolver};
+use codex_app_transfer_proxy::{build_router, proxy_telemetry, StaticResolver};
 use codex_app_transfer_registry::Provider;
 use indexmap::IndexMap;
 use serde_json::json;
@@ -137,6 +137,59 @@ fn client() -> reqwest::Client {
 async fn body_json(resp: reqwest::Response) -> serde_json::Value {
     let bytes = resp.bytes().await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn successful_forward_updates_proxy_telemetry() {
+    let before = proxy_telemetry().stats.snapshot();
+    let s = build_stack().await;
+
+    let resp = client()
+        .post(format!("http://{}/v1/chat/completions", s.proxy))
+        .header("authorization", "Bearer cas_test_gw")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"provider-a/gpt-x"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let after = proxy_telemetry().stats.snapshot();
+    assert!(after.total >= before.total + 1);
+    assert!(after.success >= before.success + 1);
+
+    let logs = proxy_telemetry().logs.get_all();
+    assert!(logs
+        .iter()
+        .any(|entry| entry.level == "INFO" && entry.message.contains("请求: POST")));
+    assert!(logs
+        .iter()
+        .any(|entry| entry.level == "SUCCESS" && entry.message == "上游响应 200"));
+}
+
+#[tokio::test]
+async fn gateway_auth_failure_updates_proxy_telemetry() {
+    let before = proxy_telemetry().stats.snapshot();
+    let s = build_stack().await;
+
+    let resp = client()
+        .post(format!("http://{}/v1/chat/completions", s.proxy))
+        .body(r#"{"model":"any"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 401);
+
+    let after = proxy_telemetry().stats.snapshot();
+    assert!(after.total >= before.total + 1);
+    assert!(after.failed >= before.failed + 1);
+
+    let logs = proxy_telemetry().logs.get_all();
+    assert!(logs
+        .iter()
+        .any(|entry| entry.level == "ERROR" && entry.message.contains("代理请求失败")));
 }
 
 #[tokio::test]
