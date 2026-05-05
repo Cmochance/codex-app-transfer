@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use codex_app_transfer_registry::model_alias::{
-    normalize_model_mappings, openai_model_slot, strip_internal_model_suffix,
+    normalize_model_mappings, openai_model_slot, provider_slug, strip_internal_model_suffix,
 };
 use codex_app_transfer_registry::Provider;
 use thiserror::Error;
@@ -110,10 +110,7 @@ impl StaticResolver {
     }
 
     fn find_by_slug(&self, slug: &str) -> Option<&Provider> {
-        // Python 版 `provider_slug` 取 id 或 name 小写并把非 [a-z0-9_-] 替换为 -;
-        // 我们 Stage 2 里只支持最常见情况:slug == provider.id.
-        // Stage 3 接入 adapter 时再补完整 slug 算法.
-        self.find_by_id(slug)
+        self.providers.iter().find(|p| provider_slug(p) == slug)
     }
 
     fn default_provider(&self) -> Option<&Provider> {
@@ -232,11 +229,15 @@ mod tests {
     use indexmap::IndexMap;
 
     fn provider(id: &str, base: &str, key: &str) -> Provider {
+        provider_with_name(id, id, base, key)
+    }
+
+    fn provider_with_name(id: &str, name: &str, base: &str, key: &str) -> Provider {
         let mut models = IndexMap::new();
         models.insert("default".into(), format!("{id}-default"));
         Provider {
             id: id.into(),
-            name: id.into(),
+            name: name.into(),
             base_url: base.into(),
             auth_scheme: "bearer".into(),
             api_format: "openai_chat".into(),
@@ -342,6 +343,60 @@ mod tests {
     }
 
     #[test]
+    fn slug_routing_normalizes_provider_id_like_legacy_model_alias() {
+        let r = StaticResolver::new(
+            None,
+            vec![provider("OpenAI.Custom_1", "https://up-1", "sk-1")],
+            None,
+        );
+        let p = parts_with(&[]);
+        let body = br#"{"model":"openai-custom_1/gpt-real"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "OpenAI.Custom_1");
+        assert_eq!(res.rewritten_model.as_deref(), Some("gpt-real"));
+    }
+
+    #[test]
+    fn slug_routing_uses_provider_name_when_id_is_blank() {
+        let r = StaticResolver::new(
+            None,
+            vec![provider_with_name(
+                "",
+                "Moonshot AI",
+                "https://up-1",
+                "sk-1",
+            )],
+            None,
+        );
+        let p = parts_with(&[]);
+        let body = br#"{"model":"moonshot-ai/kimi-k2.6"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "");
+        assert_eq!(res.upstream_base, "https://up-1");
+        assert_eq!(res.rewritten_model.as_deref(), Some("kimi-k2.6"));
+    }
+
+    #[test]
+    fn slug_routing_collapses_special_character_provider_name() {
+        let r = StaticResolver::new(
+            None,
+            vec![provider_with_name(
+                "",
+                "七牛 / Qiniu++",
+                "https://up-1",
+                "sk-1",
+            )],
+            None,
+        );
+        let p = parts_with(&[]);
+        let body = br#"{"model":"qiniu/qna-v1"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "");
+        assert_eq!(res.upstream_base, "https://up-1");
+        assert_eq!(res.rewritten_model.as_deref(), Some("qna-v1"));
+    }
+
+    #[test]
     fn falls_back_to_default_when_no_slash_in_model() {
         let r = StaticResolver::new(
             None,
@@ -379,6 +434,19 @@ mod tests {
         let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
         let p = parts_with(&[]);
         let res = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();
+        assert_eq!(res.provider_id, "deepseek");
+        assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn openai_slot_model_matching_is_case_insensitive_like_legacy() {
+        let mut deepseek = provider("deepseek", "https://up-2", "sk-2");
+        deepseek
+            .models
+            .insert("gpt_5_5".into(), "deepseek-v4-pro".into());
+        let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
+        let p = parts_with(&[]);
+        let res = r.resolve(&p, br#"{"model":"GPT-5.5"}"#).unwrap();
         assert_eq!(res.provider_id, "deepseek");
         assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
     }

@@ -21,7 +21,7 @@ pub mod schema;
 
 pub use model_alias::{
     empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
-    strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
+    provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
 };
 pub use paths::{config_dir, config_file, library_dir, resolve_home};
 pub use presets::builtin_presets;
