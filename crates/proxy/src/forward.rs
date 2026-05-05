@@ -196,7 +196,7 @@ pub async fn forward_handler(
         up = up.header(name, value);
     }
 
-    // 7. 发起 + 转译响应(adapter 默认透传;responses adapter 会重写 SSE 流)
+    // 7. 发起 + 转译响应(adapter 默认透传;Stage 3.2 起 SSE 状态机会重写流)
     let resp = up.send().await?;
     let status = resp.status();
     let upstream_headers = filter_hop_headers(resp.headers());

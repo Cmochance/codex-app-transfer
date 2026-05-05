@@ -5,8 +5,8 @@ use axum::{routing::any, Router};
 use crate::forward::{forward_handler, ProxyState};
 use crate::resolver::SharedResolver;
 
-/// 把所有 HTTP 方法 / 所有路径都路由到 `forward_handler`。
-/// WebSocket upgrade 不走这个 fallback router;当前 proxy 只承诺 HTTP/SSE。
+/// 把所有方法 / 所有路径都路由到 `forward_handler`(裸代理 + B1 路由 + B2 鉴权改写)。
+/// Stage 3 起此 router 会再叠 adapter 中间件(provider 协议转换)。
 pub fn build_router(resolver: SharedResolver) -> Router {
     let state = ProxyState::new(resolver);
     Router::new()
