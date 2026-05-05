@@ -2861,6 +2861,12 @@ pub async fn desktop_snapshot_status() -> impl IntoResponse {
     .into_response()
 }
 
+// ── /api/version ─────────────────────────────────────────────────────
+
+pub async fn version() -> Json<Value> {
+    Json(json!({"version": APP_VERSION}))
+}
+
 // ── /api/proxy/* ─────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -4048,6 +4054,18 @@ mod tests {
                         .unwrap();
                 assert_eq!(auth_json["OPENAI_API_KEY"], json!("sk-direct"));
             });
+        });
+    }
+
+    #[test]
+    fn version_endpoint_matches_legacy_shape() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let Json(payload) = version().await;
+            assert_eq!(payload, json!({"version": APP_VERSION}));
         });
     }
 
