@@ -16,12 +16,14 @@
 
 pub mod apply;
 pub mod auth;
+pub mod model_catalog;
 pub mod paths;
 pub mod snapshot;
 pub mod toml_sync;
 
 pub use apply::{apply_provider, restore_codex_state, ApplyConfig, ApplyResult};
 pub use auth::{read_auth, write_auth};
+pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, write_catalog};
 pub use paths::CodexPaths;
 pub use snapshot::{
     get_snapshot_status, has_snapshot, snapshot_codex_state, SnapshotManifest, SnapshotStatus,

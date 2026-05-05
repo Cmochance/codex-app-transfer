@@ -9,6 +9,7 @@ pub struct CodexPaths {
     pub codex_home: PathBuf,
     pub config_toml: PathBuf,
     pub auth_json: PathBuf,
+    pub model_catalog_json: PathBuf,
     pub snapshot_dir: PathBuf,
     pub snapshot_config: PathBuf,
     pub snapshot_auth: PathBuf,
@@ -33,6 +34,7 @@ impl CodexPaths {
         Self {
             config_toml: codex_home.join("config.toml"),
             auth_json: codex_home.join("auth.json"),
+            model_catalog_json: codex_home.join("codex-app-transfer-models.json"),
             snapshot_config: snapshot_dir.join("config.toml"),
             snapshot_auth: snapshot_dir.join("auth.json"),
             snapshot_manifest: snapshot_dir.join("manifest.json"),
@@ -52,6 +54,10 @@ mod tests {
         assert_eq!(p.codex_home, PathBuf::from("/x/.codex"));
         assert_eq!(p.config_toml, PathBuf::from("/x/.codex/config.toml"));
         assert_eq!(p.auth_json, PathBuf::from("/x/.codex/auth.json"));
+        assert_eq!(
+            p.model_catalog_json,
+            PathBuf::from("/x/.codex/codex-app-transfer-models.json")
+        );
         assert_eq!(
             p.snapshot_dir,
             PathBuf::from("/x/.codex-app-transfer/codex-snapshot")

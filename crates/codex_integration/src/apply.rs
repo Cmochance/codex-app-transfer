@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{read_auth, write_auth};
+use crate::model_catalog::{catalog_models_for_provider, write_catalog, CODEX_MODEL_CATALOG_KEY};
 use crate::paths::CodexPaths;
 use crate::snapshot::{
     drop_snapshot, has_snapshot, read_snapshot_auth, read_snapshot_config, snapshot_codex_state,
@@ -15,7 +16,11 @@ use crate::CodexError;
 const MANAGED_AUTH_KEYS: &[&str] = &["auth_mode", "OPENAI_API_KEY"];
 
 /// 我们 apply 时实际触碰的 config.toml 根级别字段(restore 时只动这些)。
-const MANAGED_TOML_KEYS: &[&str] = &["openai_base_url", "model_context_window"];
+const MANAGED_TOML_KEYS: &[&str] = &[
+    "openai_base_url",
+    "model_context_window",
+    CODEX_MODEL_CATALOG_KEY,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyConfig<'a> {
@@ -24,8 +29,14 @@ pub struct ApplyConfig<'a> {
     /// gateway API key(`cas_...`),会写到 auth.json。空字符串表示移除。
     pub gateway_api_key: &'a str,
     /// 当前 active provider 默认模型是否支持 1M 上下文。
-    /// 为 `true` 时 config.toml 会被注入 `model_context_window = 1000000`。
+    /// 为 `true` 时 config.toml 会被注入 1M 兼容配置。
     pub supports_1m: bool,
+    /// 当前 active provider 的展示名,用于生成 Codex model catalog。
+    #[serde(default)]
+    pub provider_name: &'a str,
+    /// 当前 active provider 的默认真实模型 ID,用于生成 Codex model catalog。
+    #[serde(default)]
+    pub default_model: &'a str,
     /// 应用版本(写入快照 manifest,便于诊断)。
     pub app_version: &'a str,
 }
@@ -36,6 +47,7 @@ pub struct ApplyResult {
     pub auth_json_path: String,
     pub snapshot_taken: bool,
     pub model_context_window_set: bool,
+    pub model_catalog_json_set: bool,
 }
 
 /// 把 active provider 配置写入 `~/.codex/{config.toml,auth.json}`,
@@ -53,11 +65,20 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         sync_root_value(&paths.config_toml, "openai_base_url", Some(&literal))?;
     }
 
-    // 3. config.toml: model_context_window(1M 时显式覆盖,否则删除)
+    // 3. config.toml: model_context_window(旧版兼容) + model_catalog_json(Codex 0.128+)
     if cfg.supports_1m {
         sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
+        let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
+        sync_root_value(
+            &paths.config_toml,
+            CODEX_MODEL_CATALOG_KEY,
+            Some(&catalog_literal),
+        )?;
+        let models = catalog_models_for_provider(cfg.provider_name, cfg.default_model, true);
+        write_catalog(&paths.model_catalog_json, &models)?;
     } else {
         sync_root_value(&paths.config_toml, "model_context_window", None)?;
+        sync_root_value(&paths.config_toml, CODEX_MODEL_CATALOG_KEY, None)?;
     }
 
     // 4. auth.json: auth_mode + OPENAI_API_KEY
@@ -82,6 +103,7 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         auth_json_path: paths.auth_json.display().to_string(),
         snapshot_taken: snapshot_taken_now,
         model_context_window_set: cfg.supports_1m,
+        model_catalog_json_set: cfg.supports_1m,
     })
 }
 
@@ -161,12 +183,15 @@ mod tests {
                 base_url: "http://127.0.0.1:18080",
                 gateway_api_key: "cas_test",
                 supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
                 app_version: "v2.0.0-stage2.5",
             },
         )
         .unwrap();
         assert!(result.snapshot_taken);
         assert!(!result.model_context_window_set);
+        assert!(!result.model_catalog_json_set);
 
         let toml = read_toml(&paths);
         assert!(toml.contains("openai_base_url = \"http://127.0.0.1:18080\""));
@@ -178,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_with_supports_1m_writes_model_context_window() {
+    fn apply_with_supports_1m_writes_model_context_window_and_catalog() {
         let (_t, paths) = setup();
         apply_provider(
             &paths,
@@ -186,12 +211,25 @@ mod tests {
                 base_url: "http://x",
                 gateway_api_key: "k",
                 supports_1m: true,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro[1m]",
                 app_version: "v",
             },
         )
         .unwrap();
         let toml = read_toml(&paths);
         assert!(toml.contains("model_context_window = 1000000"));
+        assert!(toml.contains("model_catalog_json = "));
+        assert!(toml.contains("codex-app-transfer-models.json"));
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.model_catalog_json).unwrap()).unwrap();
+        assert_eq!(catalog["models"][0]["context_window"], 1_000_000);
+        assert_eq!(catalog["models"][0]["effective_context_window_percent"], 95);
+        assert!(catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["slug"] == "deepseek-v4-pro"));
     }
 
     #[test]
@@ -214,6 +252,8 @@ mod tests {
                 base_url: "http://up",
                 gateway_api_key: "cas_new",
                 supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
                 app_version: "v",
             },
         )
@@ -251,6 +291,8 @@ mod tests {
                 base_url: "http://127.0.0.1:18080",
                 gateway_api_key: "cas_proxy",
                 supports_1m: true,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro",
                 app_version: "v",
             },
         )
@@ -319,6 +361,8 @@ mod tests {
                 base_url: "http://first",
                 gateway_api_key: "cas_first",
                 supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
                 app_version: "v",
             },
         )
@@ -331,6 +375,8 @@ mod tests {
                 base_url: "http://second",
                 gateway_api_key: "cas_second",
                 supports_1m: true,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro",
                 app_version: "v",
             },
         )
@@ -357,6 +403,8 @@ mod tests {
                 base_url: "http://x",
                 gateway_api_key: "",
                 supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
                 app_version: "v",
             },
         )
@@ -375,6 +423,8 @@ mod tests {
                 base_url: "",
                 gateway_api_key: "k",
                 supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
                 app_version: "v",
             },
         )
@@ -400,6 +450,8 @@ mod tests {
                 base_url: "http://new",
                 gateway_api_key: "k",
                 supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
                 app_version: "v",
             },
         )
@@ -431,6 +483,8 @@ mod tests {
                 base_url: "http://x",
                 gateway_api_key: "cas_test",
                 supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
                 app_version: "v",
             },
         )
