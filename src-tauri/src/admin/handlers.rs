@@ -1383,6 +1383,67 @@ fn normalize_imported_config(data: &Value) -> Result<Value, String> {
     Ok(normalized)
 }
 
+fn preserve_existing_provider_secrets(imported: &mut Value, current: &Value) {
+    let Some(imported_providers) = imported.get_mut("providers").and_then(|v| v.as_array_mut())
+    else {
+        return;
+    };
+    let current_providers = current
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    for provider in imported_providers {
+        let Some(provider_obj) = provider.as_object_mut() else {
+            continue;
+        };
+        let Some(provider_id) = provider_obj.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(current_provider) = current_providers
+            .iter()
+            .find(|item| item.get("id").and_then(|v| v.as_str()) == Some(provider_id))
+            .and_then(|v| v.as_object())
+        else {
+            continue;
+        };
+
+        let imported_key_is_blank = provider_obj
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+        if imported_key_is_blank {
+            if let Some(existing_key) = current_provider
+                .get("apiKey")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                provider_obj.insert("apiKey".into(), Value::String(existing_key.to_owned()));
+            }
+        }
+
+        let imported_headers_empty = provider_obj
+            .get("extraHeaders")
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.is_empty())
+            .unwrap_or(true);
+        if imported_headers_empty {
+            if let Some(existing_headers) = current_provider
+                .get("extraHeaders")
+                .and_then(|v| v.as_object())
+                .filter(|obj| !obj.is_empty())
+            {
+                provider_obj.insert(
+                    "extraHeaders".into(),
+                    Value::Object(existing_headers.clone()),
+                );
+            }
+        }
+    }
+}
+
 fn create_config_backup(reason: &str) -> Result<Value, String> {
     let backup_dir = app_backup_dir()?;
     fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
@@ -2197,10 +2258,12 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
         Ok(backup) => backup,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let normalized = match normalize_imported_config(&data) {
+    let mut normalized = match normalize_imported_config(&data) {
         Ok(config) => config,
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
+    let current = load_registry().unwrap_or_else(|_| json!({}));
+    preserve_existing_provider_secrets(&mut normalized, &current);
     if let Err(e) = save_registry(&normalized) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
@@ -2571,6 +2634,80 @@ pub struct _Marker;
 mod tests {
     use super::*;
 
+    fn with_isolated_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = HOME_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        struct EnvGuard {
+            home: Option<std::ffi::OsString>,
+            userprofile: Option<std::ffi::OsString>,
+            root: PathBuf,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.userprofile {
+                    Some(value) => std::env::set_var("USERPROFILE", value),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "cas-admin-test-{}-{}",
+            std::process::id(),
+            random_hex(6)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let env_guard = EnvGuard {
+            home: std::env::var_os("HOME"),
+            userprofile: std::env::var_os("USERPROFILE"),
+            root: root.clone(),
+        };
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("USERPROFILE");
+
+        let result = f(&root);
+        drop(env_guard);
+        result
+    }
+
+    fn config_with_secret() -> Value {
+        json!({
+            "version": APP_VERSION,
+            "activeProvider": "p1",
+            "gatewayApiKey": "cas_existing",
+            "providers": [{
+                "id": "p1",
+                "name": "Provider One",
+                "baseUrl": "https://api.example.com/v1",
+                "authScheme": "bearer",
+                "apiFormat": "openai_chat",
+                "apiKey": "sk-existing",
+                "extraHeaders": {"x-extra-secret": "secret-header"},
+                "models": {"default": "model-one"},
+                "sortIndex": 0
+            }],
+            "settings": {
+                "theme": "default",
+                "language": "zh",
+                "proxyPort": 18080,
+                "adminPort": 18081,
+                "autoStart": false,
+                "autoApplyOnStart": true,
+                "exposeAllProviderModels": false,
+                "restoreCodexOnExit": true,
+                "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+            }
+        })
+    }
+
     #[test]
     fn provider_test_url_matches_legacy_chat_rules() {
         assert_eq!(
@@ -2853,5 +2990,80 @@ mod tests {
         assert_eq!(legacy_alias["apiFormat"], json!("responses"));
         assert_eq!(legacy_alias["level"], json!("stable"));
         assert_eq!(legacy_alias["checks"]["models"], json!(true));
+    }
+
+    #[test]
+    fn config_backup_list_uses_real_files() {
+        with_isolated_home(|home| {
+            let cfg = config_with_secret();
+            save_registry(&cfg).unwrap();
+
+            let backup = create_config_backup("manual").unwrap();
+            let name = backup.get("name").and_then(|v| v.as_str()).unwrap();
+            assert!(name.starts_with("config-"));
+            assert!(name.ends_with(".json"));
+            assert!(backup.get("size").and_then(|v| v.as_u64()).unwrap() > 0);
+
+            let backup_path = home.join(".codex-app-transfer").join("backups").join(name);
+            assert!(backup_path.is_file());
+            let saved: Value =
+                serde_json::from_str(&fs::read_to_string(&backup_path).unwrap()).unwrap();
+            assert_eq!(saved["providers"][0]["apiKey"], json!("sk-existing"));
+
+            let backups = list_config_backups().unwrap();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(backups[0]["name"], backup["name"]);
+        });
+    }
+
+    #[test]
+    fn import_config_backs_up_and_preserves_existing_provider_secrets_when_missing() {
+        with_isolated_home(|_| {
+            save_registry(&config_with_secret()).unwrap();
+
+            let incoming = json!({
+                "format": "codex-app-transfer.config",
+                "config": {
+                    "version": "1.0.3",
+                    "activeProvider": "p1",
+                    "gatewayApiKey": "cas_imported",
+                    "providers": [{
+                        "id": "p1",
+                        "name": "Imported Provider",
+                        "baseUrl": "https://imported.example.com/v1",
+                        "authScheme": "bearer",
+                        "apiFormat": "openai_chat",
+                        "models": {"default": "imported-model"}
+                    }],
+                    "settings": {"proxyPort": 19090}
+                }
+            });
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let response = runtime.block_on(async { import_config(Json(incoming)).await });
+            assert_eq!(response.into_response().status(), StatusCode::OK);
+
+            let saved = load_registry().unwrap();
+            assert_eq!(saved["activeProvider"], json!("p1"));
+            assert_eq!(saved["gatewayApiKey"], json!("cas_imported"));
+            assert_eq!(saved["settings"]["proxyPort"], json!(19090));
+            assert_eq!(saved["providers"][0]["name"], json!("Imported Provider"));
+            assert_eq!(saved["providers"][0]["apiKey"], json!("sk-existing"));
+            assert_eq!(
+                saved["providers"][0]["extraHeaders"]["x-extra-secret"],
+                json!("secret-header")
+            );
+
+            let backups = list_config_backups().unwrap();
+            assert_eq!(backups.len(), 1);
+            assert!(backups[0]
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .contains("before-import"));
+        });
     }
 }
