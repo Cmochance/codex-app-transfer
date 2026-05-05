@@ -184,7 +184,7 @@
     },
 
     async testProviderPayload(payload) {
-      return api('POST', '/api/providers/test', providerBody(payload, false));
+      return api('POST', '/api/providers/test', providerBody(payload, true));
     },
 
     async saveModelMappings(id, mappings) {

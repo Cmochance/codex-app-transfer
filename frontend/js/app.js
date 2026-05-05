@@ -1399,6 +1399,12 @@
     }).join(" · ");
   }
 
+  function formatProviderTestResult(result) {
+    if (result?.message) return result.message;
+    if (Number.isFinite(result?.latencyMs)) return `${Math.round(result.latencyMs)} ms`;
+    return t("providers.testDone");
+  }
+
   function downloadJson(filename, data) {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -1566,11 +1572,12 @@
         }
         try {
           const result = await CCApi.testProvider(actionEl.dataset.id);
+          const message = formatProviderTestResult(result);
           if (resultEl) {
-            resultEl.textContent = result.message || `${result.latencyMs} ms`;
+            resultEl.textContent = message;
             resultEl.classList.toggle("bad", result.ok === false);
           }
-          showToast(result.message || t("providers.testDone"));
+          showToast(message);
         } finally {
           actionEl.disabled = false;
         }
@@ -1602,7 +1609,7 @@
         resultEl.textContent = t("providers.testing");
         resultEl.classList.remove("bad");
         try {
-          const payload = providerPayloadFromForm(false);
+          const payload = providerPayloadFromForm(true);
           if (editingProviderId && !payload.apiKey) {
             try {
               const secret = await CCApi.getProviderSecret(editingProviderId);
@@ -1613,9 +1620,10 @@
             await CCApi.saveDraft(editingProviderId, payload);
           }
           const result = await CCApi.testProviderPayload(payload);
-          resultEl.textContent = result.message || `${result.latencyMs} ms`;
+          const message = formatProviderTestResult(result);
+          resultEl.textContent = message;
           resultEl.classList.toggle("bad", result.ok === false);
-          showToast(result.message || t("providers.testDone"));
+          showToast(message);
         } finally {
           actionEl.disabled = false;
         }
