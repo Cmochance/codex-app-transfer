@@ -40,6 +40,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::proxy_runner::ProxyManager;
+
 use super::registry_io::{load as load_registry, public_provider, save as save_registry};
 use super::state::AdminState;
 
@@ -1665,6 +1667,240 @@ fn read_gateway_key(cfg: &RawConfig) -> String {
         .to_owned()
 }
 
+fn read_setting_bool(cfg: &RawConfig, key: &str, default: bool) -> bool {
+    cfg.get("settings")
+        .and_then(|settings| settings.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
+fn ensure_gateway_key(cfg: &mut RawConfig) -> String {
+    let existing = read_gateway_key(cfg);
+    if !existing.is_empty() {
+        return existing;
+    }
+    let gateway_key = generate_gateway_key_value();
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("gatewayApiKey".into(), Value::String(gateway_key.clone()));
+    gateway_key
+}
+
+struct DesktopConfigTarget {
+    base_url: String,
+    api_key: String,
+    supports_1m: bool,
+    provider_name: String,
+    default_model: String,
+    model_mappings: Value,
+    model_capabilities: Value,
+    requires_proxy: bool,
+    mode: &'static str,
+    proxy_port: u16,
+}
+
+fn desktop_config_target_for_provider(
+    cfg: &mut RawConfig,
+    provider: &Value,
+    proxy_port_override: Option<u16>,
+) -> DesktopConfigTarget {
+    let proxy_port = proxy_port_override.unwrap_or_else(|| read_proxy_port(cfg));
+    let api_format =
+        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
+    let requires_proxy = api_format != "responses";
+    let (base_url, api_key, mode) = if requires_proxy {
+        (
+            format!("http://127.0.0.1:{proxy_port}"),
+            ensure_gateway_key(cfg),
+            "local_proxy",
+        )
+    } else {
+        (
+            clean_base_url(
+                provider
+                    .get("baseUrl")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            ),
+            provider_api_key(provider),
+            "direct_provider",
+        )
+    };
+    DesktopConfigTarget {
+        base_url,
+        api_key,
+        supports_1m: provider_supports_1m(provider),
+        provider_name: provider_display_name(provider),
+        default_model: provider_default_model(provider),
+        model_mappings: provider_model_mappings(provider),
+        model_capabilities: provider_model_capabilities(provider),
+        requires_proxy,
+        mode,
+        proxy_port,
+    }
+}
+
+fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
+    let paths = CodexPaths::from_home_env().map_err(|e| e.to_string())?;
+    let result = apply_provider(
+        &paths,
+        &ApplyConfig {
+            base_url: &target.base_url,
+            gateway_api_key: &target.api_key,
+            supports_1m: target.supports_1m,
+            provider_name: &target.provider_name,
+            default_model: &target.default_model,
+            model_mappings: Some(&target.model_mappings),
+            model_capabilities: Some(&target.model_capabilities),
+            app_version: APP_VERSION,
+        },
+    )
+    .map_err(|e| format!("apply 失败: {e}"))?;
+    serde_json::to_value(result).map_err(|e| format!("apply 结果序列化失败: {e}"))
+}
+
+async fn start_proxy_if_needed(manager: &ProxyManager, port: u16) -> Result<bool, String> {
+    if manager.status().running {
+        manager.stop_silent();
+    }
+    manager.start(port).await.map(|_| true)
+}
+
+async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
+    let mut cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"attempted": true, "success": false, "message": e});
+        }
+    };
+    let Some(provider) = active_provider(&cfg) else {
+        return json!({
+            "attempted": false,
+            "success": false,
+            "message": "没有默认提供商",
+        });
+    };
+
+    let target = desktop_config_target_for_provider(&mut cfg, &provider, None);
+    if let Err(e) = save_registry(&cfg) {
+        return json!({"attempted": true, "success": false, "message": e});
+    }
+
+    let mut proxy_started = false;
+    if target.requires_proxy {
+        match start_proxy_if_needed(&state.proxy_manager, target.proxy_port).await {
+            Ok(started) => proxy_started = started,
+            Err(e) => {
+                return json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "message": e});
+            }
+        }
+    } else {
+        state.proxy_manager.stop_silent();
+    }
+
+    match apply_desktop_target(&target) {
+        Ok(mut result) => {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("attempted".into(), Value::Bool(true));
+                obj.insert("success".into(), Value::Bool(true));
+                obj.insert("mode".into(), Value::String(target.mode.to_owned()));
+                obj.insert("requiresProxy".into(), Value::Bool(target.requires_proxy));
+                obj.insert("proxyStarted".into(), Value::Bool(proxy_started));
+            }
+            result
+        }
+        Err(e) => {
+            json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "proxyStarted": proxy_started, "message": e})
+        }
+    }
+}
+
+pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) -> Value {
+    let cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": format!("failed: {e}")})
+        }
+    };
+    if !read_setting_bool(&cfg, "autoApplyOnStart", true) {
+        return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "disabled by settings"});
+    }
+    if active_provider(&cfg).is_none() {
+        return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "no active provider; skip"});
+    }
+    let state = AdminState { proxy_manager };
+    let result = sync_desktop_for_active_provider(&state).await;
+    if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        return json!({
+            "applied": true,
+            "requiresProxy": result.get("requiresProxy").and_then(|v| v.as_bool()).unwrap_or(false),
+            "proxyStarted": result.get("proxyStarted").and_then(|v| v.as_bool()).unwrap_or(false),
+            "message": format!("applied {}", active_provider_name(&cfg)),
+        });
+    }
+    json!({
+        "applied": false,
+        "requiresProxy": result.get("requiresProxy").and_then(|v| v.as_bool()).unwrap_or(false),
+        "proxyStarted": result.get("proxyStarted").and_then(|v| v.as_bool()).unwrap_or(false),
+        "message": format!("failed: {}", result.get("message").and_then(|v| v.as_str()).unwrap_or("unknown")),
+    })
+}
+
+pub fn restore_codex_if_enabled(reason: &str) -> Value {
+    let cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e})
+        }
+    };
+    if !read_setting_bool(&cfg, "restoreCodexOnExit", true) {
+        return json!({"attempted": false, "restored": false, "success": true, "reason": reason, "message": "disabled by settings"});
+    }
+    let paths = match CodexPaths::from_home_env() {
+        Ok(paths) => paths,
+        Err(e) => {
+            return json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e.to_string()})
+        }
+    };
+    if !has_snapshot(&paths) {
+        return json!({"attempted": false, "restored": false, "success": true, "reason": reason, "message": "no snapshot; skip"});
+    }
+    match restore_codex_state(&paths) {
+        Ok(restored) => {
+            json!({"attempted": true, "restored": restored, "success": true, "reason": reason})
+        }
+        Err(e) => {
+            json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e.to_string()})
+        }
+    }
+}
+
+pub async fn switch_provider_and_sync(
+    proxy_manager: Arc<ProxyManager>,
+    provider_id: String,
+) -> Value {
+    let mut cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => return json!({"success": false, "message": e}),
+    };
+    if provider_index(&cfg, &provider_id).is_none() {
+        return json!({"success": false, "message": "提供商不存在"});
+    }
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("activeProvider".into(), Value::String(provider_id));
+    if let Err(e) = save_registry(&cfg) {
+        return json!({"success": false, "message": e});
+    }
+    let state = AdminState { proxy_manager };
+    let desktop_sync = sync_desktop_for_active_provider(&state).await;
+    json!({
+        "success": true,
+        "message": "默认提供商已更新",
+        "desktopSync": desktop_sync,
+    })
+}
+
 fn ensure_settings_object(cfg: &mut RawConfig) -> &mut serde_json::Map<String, Value> {
     let obj = cfg.as_object_mut().expect("registry root is object");
     obj.entry("settings".to_owned())
@@ -2392,24 +2628,36 @@ pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
     Json(json!({"success": true})).into_response()
 }
 
-pub async fn set_default_provider(Path(id): Path<String>) -> impl IntoResponse {
-    let mut cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    if provider_index(&cfg, &id).is_none() {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+pub async fn set_default_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let result = switch_provider_and_sync(state.proxy_manager.clone(), id).await;
+    if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        Json(result).into_response()
+    } else {
+        let status = if result.get("message").and_then(|v| v.as_str()) == Some("提供商不存在")
+        {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        err(
+            status,
+            result
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("提供商不存在"),
+        )
+        .into_response()
     }
-    let obj = cfg.as_object_mut().unwrap();
-    obj.insert("activeProvider".into(), Value::String(id));
-    if let Err(e) = save_registry(&cfg) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-    Json(json!({"success": true})).into_response()
 }
 
-pub async fn activate_provider(Path(id): Path<String>) -> impl IntoResponse {
-    set_default_provider(Path(id)).await
+pub async fn activate_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    set_default_provider(State(state), Path(id)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -2571,73 +2819,24 @@ pub async fn desktop_configure() -> impl IntoResponse {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let providers = cfg
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if providers.is_empty() {
+    let Some(active) = active_provider(&cfg) else {
         return err(StatusCode::BAD_REQUEST, "请先添加 provider").into_response();
+    };
+    let target = desktop_config_target_for_provider(&mut cfg, &active, None);
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
-    let active_id = cfg
-        .get("activeProvider")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
-    let active = match active_id {
-        Some(id) => providers.iter().find(|p| {
-            p.as_object()
-                .and_then(|o| o.get("id"))
-                .and_then(|v| v.as_str())
-                == Some(id.as_str())
-        }),
-        None => providers.first(),
-    };
-    let Some(active) = active else {
-        return err(StatusCode::BAD_REQUEST, "未找到 active provider").into_response();
-    };
-    let supports_1m = provider_supports_1m(active);
-    let provider_name = provider_display_name(active);
-    let default_model = provider_default_model(active);
-    let model_mappings = provider_model_mappings(active);
-    let model_capabilities = provider_model_capabilities(active);
-    let port = read_proxy_port(&cfg);
-
-    // 缺 gateway key 自动补
-    let mut gateway_key = read_gateway_key(&cfg);
-    if gateway_key.is_empty() {
-        gateway_key = generate_gateway_key_value();
-        let obj = cfg.as_object_mut().unwrap();
-        obj.insert("gatewayApiKey".into(), Value::String(gateway_key.clone()));
-        if let Err(e) = save_registry(&cfg) {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    match apply_desktop_target(&target) {
+        Ok(mut result) => {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("success".into(), Value::Bool(true));
+                obj.insert("mode".into(), Value::String(target.mode.to_owned()));
+                obj.insert("requiresProxy".into(), Value::Bool(target.requires_proxy));
+            }
+            Json(result).into_response()
         }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-
-    let base_url = format!("http://127.0.0.1:{port}");
-    let paths = match CodexPaths::from_home_env() {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    if let Err(e) = apply_provider(
-        &paths,
-        &ApplyConfig {
-            base_url: &base_url,
-            gateway_api_key: &gateway_key,
-            supports_1m,
-            provider_name: &provider_name,
-            default_model: &default_model,
-            model_mappings: Some(&model_mappings),
-            model_capabilities: Some(&model_capabilities),
-            app_version: APP_VERSION,
-        },
-    ) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("apply 失败: {e}"),
-        )
-        .into_response();
-    }
-    Json(json!({"success": true})).into_response()
 }
 
 pub async fn desktop_clear() -> impl IntoResponse {
@@ -2863,7 +3062,8 @@ pub async fn update_check(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
     }
 }
 
-pub async fn update_install(Json(input): Json<UpdateInstallInput>) -> impl IntoResponse {
+pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl IntoResponse {
+    let input = body.map(|value| value.0).unwrap_or_default();
     let update_url = configured_update_url(input.url.as_deref());
     if update_url.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "请先配置 latest.json 更新地址").into_response();
@@ -3688,6 +3888,166 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap()
                 .contains("before-import"));
+        });
+    }
+
+    #[test]
+    fn desktop_config_target_matches_legacy_proxy_and_direct_modes() {
+        let mut proxy_cfg = config_with_secret();
+        proxy_cfg["gatewayApiKey"] = Value::Null;
+        let proxy_provider = active_provider(&proxy_cfg).unwrap();
+        let proxy_target =
+            desktop_config_target_for_provider(&mut proxy_cfg, &proxy_provider, Some(19090));
+        assert_eq!(proxy_target.mode, "local_proxy");
+        assert!(proxy_target.requires_proxy);
+        assert_eq!(proxy_target.base_url, "http://127.0.0.1:19090");
+        assert!(proxy_target.api_key.starts_with("cas_"));
+        assert_eq!(
+            proxy_cfg
+                .get("gatewayApiKey")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            proxy_target.api_key
+        );
+
+        let mut direct_cfg = config_with_secret();
+        direct_cfg["gatewayApiKey"] = Value::Null;
+        let direct_provider = json!({
+            "id": "direct",
+            "name": "Direct Provider",
+            "baseUrl": "https://direct.example.com/v1/",
+            "authScheme": "bearer",
+            "apiFormat": "responses",
+            "apiKey": "sk-direct",
+            "models": {"default": "direct-model"},
+        });
+        let direct_target =
+            desktop_config_target_for_provider(&mut direct_cfg, &direct_provider, Some(19090));
+        assert_eq!(direct_target.mode, "direct_provider");
+        assert!(!direct_target.requires_proxy);
+        assert_eq!(direct_target.base_url, "https://direct.example.com/v1");
+        assert_eq!(direct_target.api_key, "sk-direct");
+        assert!(direct_cfg
+            .get("gatewayApiKey")
+            .and_then(|v| v.as_str())
+            .is_none());
+    }
+
+    #[test]
+    fn startup_auto_apply_starts_proxy_and_exit_restore_uses_snapshot() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["gatewayApiKey"] = Value::Null;
+                cfg["settings"]["proxyPort"] = json!(0);
+                save_registry(&cfg).unwrap();
+
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                let config_toml = codex_dir.join("config.toml");
+                fs::write(&config_toml, "approval_policy = \"on-request\"\n").unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(result["applied"], json!(true));
+                assert_eq!(result["requiresProxy"], json!(true));
+                assert_eq!(result["proxyStarted"], json!(true));
+                assert!(manager.status().running);
+
+                let saved = load_registry().unwrap();
+                assert!(saved
+                    .get("gatewayApiKey")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .starts_with("cas_"));
+                let paths = CodexPaths::from_home_env().unwrap();
+                assert!(has_snapshot(&paths));
+                let applied_config = fs::read_to_string(&config_toml).unwrap();
+                assert!(applied_config.contains("approval_policy = \"on-request\""));
+                assert!(applied_config.contains("openai_base_url = \"http://127.0.0.1:0\""));
+
+                let restored = restore_codex_if_enabled("test-exit");
+                assert_eq!(restored["success"], json!(true));
+                assert_eq!(restored["attempted"], json!(true));
+                assert!(!has_snapshot(&paths));
+                let restored_config = fs::read_to_string(&config_toml).unwrap();
+                assert!(restored_config.contains("approval_policy = \"on-request\""));
+                assert!(!restored_config.contains("openai_base_url"));
+                manager.stop_silent();
+            });
+        });
+    }
+
+    #[test]
+    fn startup_auto_apply_respects_disabled_setting() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|_| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["settings"]["autoApplyOnStart"] = json!(false);
+                save_registry(&cfg).unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(result["applied"], json!(false));
+                assert_eq!(result["message"], json!("disabled by settings"));
+                assert!(!manager.status().running);
+            });
+        });
+    }
+
+    #[test]
+    fn provider_switch_syncs_desktop_without_proxy_for_direct_provider() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["providers"] = json!([
+                    cfg["providers"][0].clone(),
+                    {
+                        "id": "p2",
+                        "name": "Direct Provider",
+                        "baseUrl": "https://direct.example.com/v1/",
+                        "authScheme": "bearer",
+                        "apiFormat": "responses",
+                        "apiKey": "sk-direct",
+                        "models": {"default": "direct-model"},
+                        "sortIndex": 1
+                    }
+                ]);
+                save_registry(&cfg).unwrap();
+                fs::create_dir_all(home.join(".codex")).unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = switch_provider_and_sync(Arc::clone(&manager), "p2".to_owned()).await;
+                assert_eq!(result["success"], json!(true));
+                assert_eq!(result["desktopSync"]["success"], json!(true));
+                assert_eq!(result["desktopSync"]["mode"], json!("direct_provider"));
+                assert_eq!(result["desktopSync"]["requiresProxy"], json!(false));
+                assert!(!manager.status().running);
+
+                let saved = load_registry().unwrap();
+                assert_eq!(saved["activeProvider"], json!("p2"));
+                let config_toml = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+                assert!(config_toml.contains("openai_base_url = \"https://direct.example.com/v1\""));
+                let auth_json: Value =
+                    serde_json::from_str(&fs::read_to_string(home.join(".codex").join("auth.json")).unwrap())
+                        .unwrap();
+                assert_eq!(auth_json["OPENAI_API_KEY"], json!("sk-direct"));
+            });
         });
     }
 

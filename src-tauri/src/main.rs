@@ -13,12 +13,12 @@ use bytes::Bytes;
 use proxy_runner::ProxyManager;
 use std::io::Write;
 
-use tauri::menu::MenuBuilder;
+use tauri::menu::{Menu, MenuBuilder, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent};
 use tower::ServiceExt;
 
-use admin::{build_app_router, AdminState};
+use admin::{build_app_router, handlers, AdminState};
 
 fn main() {
     let proxy_manager = Arc::new(ProxyManager::new());
@@ -42,12 +42,13 @@ fn main() {
             });
         })
         .setup(|app| {
-            let menu = MenuBuilder::new(app)
-                .text("show", "显示主窗口")
-                .text("hide", "隐藏主窗口")
-                .separator()
-                .text("quit", "退出 Codex App Transfer")
-                .build()?;
+            let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
+            let _ = handlers::restore_codex_if_enabled("startup");
+            tauri::async_runtime::spawn(async move {
+                let _ = handlers::auto_apply_on_startup_if_enabled(startup_proxy_manager).await;
+            });
+
+            let menu = build_tray_menu(app)?;
             let _ = TrayIconBuilder::with_id("main")
                 .tooltip("Codex App Transfer")
                 .icon(app.default_window_icon().unwrap().clone())
@@ -58,6 +59,7 @@ fn main() {
                 .on_tray_icon_event(|tray, event| {
                     log_tray_event(&event);
                     let app = tray.app_handle();
+                    refresh_tray_menu(app);
                     match event {
                         // 左键单击(Up)= 显示窗口并 focus
                         TrayIconEvent::Click {
@@ -104,6 +106,7 @@ fn main() {
         if matches!(event, RunEvent::Exit) {
             let manager = app_handle.state::<Arc<ProxyManager>>();
             manager.stop_silent();
+            let _ = handlers::restore_codex_if_enabled("exit");
         }
     });
 }
@@ -143,7 +146,21 @@ async fn handle_cas_request(
 }
 
 fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
-    match event.id().as_ref() {
+    let id = event.id().as_ref();
+    if let Some(provider_id) = id.strip_prefix("provider:") {
+        if provider_id != "none" {
+            let provider_id = provider_id.to_owned();
+            let app_handle = app.clone();
+            let proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = handlers::switch_provider_and_sync(proxy_manager, provider_id).await;
+                refresh_tray_menu(&app_handle);
+            });
+        }
+        return;
+    }
+
+    match id {
         "show" => show_main_window(app),
         "hide" => hide_main_window(app),
         "quit" => {
@@ -153,6 +170,74 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         _ => {}
     }
+}
+
+fn build_tray_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Menu<R>> {
+    let mut providers = SubmenuBuilder::new(manager, "切换提供商");
+    let entries = tray_provider_entries();
+    if entries.is_empty() {
+        providers = providers.text("provider:none", "暂无提供商");
+    } else {
+        for entry in entries {
+            let label = if entry.active {
+                format!("✓ {}", entry.name)
+            } else {
+                entry.name
+            };
+            providers = providers.text(format!("provider:{}", entry.id), label);
+        }
+    }
+    let providers = providers.build()?;
+    MenuBuilder::new(manager)
+        .text("show", "显示主窗口")
+        .text("hide", "隐藏主窗口")
+        .separator()
+        .item(&providers)
+        .separator()
+        .text("quit", "退出 Codex App Transfer")
+        .build()
+}
+
+fn refresh_tray_menu(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id("main") else {
+        return;
+    };
+    if let Ok(menu) = build_tray_menu(app) {
+        let _ = tray.set_menu(Some(menu));
+    }
+}
+
+struct TrayProviderEntry {
+    id: String,
+    name: String,
+    active: bool,
+}
+
+fn tray_provider_entries() -> Vec<TrayProviderEntry> {
+    let Ok(cfg) = admin::registry_io::load() else {
+        return Vec::new();
+    };
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    cfg.get("providers")
+        .and_then(|v| v.as_array())
+        .map(|providers| {
+            providers
+                .iter()
+                .filter_map(|provider| {
+                    let id = provider.get("id").and_then(|v| v.as_str())?;
+                    let name = provider
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unnamed Provider");
+                    Some(TrayProviderEntry {
+                        id: id.to_owned(),
+                        name: name.to_owned(),
+                        active: Some(id) == active_id,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn show_main_window(app: &AppHandle) {
