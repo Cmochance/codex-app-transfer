@@ -1,9 +1,10 @@
 # Python → Rust 旧码清理方案
 
-> 状态:**已确认,启动 Phase 1**
+> 状态:**Phase 1 已合 (PR #2), Phase 2 已合 (PR #3, dispatch test 暴露 release pipeline 3 bug 见 PR #6 hotfix), Phase 3 PR #4 ready 待合, Phase 4 本 PR (#5) 待合**
 > 起草:2026-05-05
 > 适用范围:`codex-app-transfer` 全仓
 > 前置:`docs/migration-plan.md` 全部 7 个 Stage 已落地,v2.0.0 已发版
+> 落地总览:见 §5 修订日志末尾
 
 ---
 
@@ -470,3 +471,6 @@ xtask release-bundle \
 | 2026-05-05 | Phase 2 cargo check 第一次红, 二次修正 tauri.conf.json | CI `cargo check` 报 `tauri-build` schema 校验失败:`unknown field "fileName"`(允许的 bundle.* 字段为 `active/targets/createUpdaterArtifacts/publisher/homepage/icon/resources/copyright/license/category/fileAssociations/short-description/long-description/use-local-tools-dir/external-bin/windows/linux/macOS/iOS/android`)。同时 `bundle.windows.{wix,nsis}` 空对象也无效。**撤回 `bundle.fileName` 和 `bundle.windows` 子段**,接受 Tauri 默认带空格产物名 `Codex App Transfer_<V>_<arch>.<ext>`,glob 用引号处理 | 之前的 plan 来自外部调研建议,Tauri 2 实际 schema 与建议不符;落地必须以 `tauri-build` 实际校验结果为准 |
 | 2026-05-05 | Phase 3 详细方案落地 | 把 §3 Phase 3 概念性段落扩充为 §3.1-3.12 子章节(现状盘点 / 决策矩阵 / xtask crate 蓝图 / gen-fixtures 实现要点 / release-bundle 实现要点 / golden_compat 改造 / CI 反向 diff / release.yml 切 xtask / 文件 diff 清单 / 验收 / 回滚策略 / 不做项)。RSA crate 选 `rsa = "0.9"` 而非 `ring`(纯 Rust 不依赖 system crypto + API 更友好,release-bundle 非性能敏感) | Phase 3 涉及 xtask 重写 + 删大量 Python,概念描述不足;细化后让 reviewer 在动代码之前先评关键决策(RSA crate / xtask CLI 命名 / fixture 路径 / Python 删除时机) |
 | 2026-05-05 | Phase 3 §3.6 修正 | 落地 golden_compat 改造时**保留全部 7 测试只改名**,而非原 plan 想删 `typed_config_can_parse_*` 2 个。原因:`typed_config_can_parse_*` 验证"typed Config struct 能消化 fixture + 字段值正确",这是 round-trip 字节级 / 反向 diff 都不覆盖的另一维度(语义层断言,如 `proxy_port == 18080`)| 删测试丢覆盖,改名 + 调注释成本极低 |
+| 2026-05-05 | Phase 3 ci.yml stacked PR trigger 修 | Phase 3 全 6 commit push 后 PR #4 (base=feature/cleanup-phase-2) 没触发 CI, 因 ci.yml `on.pull_request.branches: [main]` 只对 base=main 的 PR 跑. 加第 7 commit 删该 branches 限制, 让 stacked PR 也走回归门禁. push trigger 仍限 main (避免 feature 分支 push 双触发) | stacked PR 是 cleanup 系列必然形态(三层依赖), CI 触发条件必须同步放宽 |
+| 2026-05-05 | Phase 2 dispatch test 失败 + PR #6 hotfix | PR #3 squash 到 main 后 dispatch `release.yml` 暴露 3 bug: (1) Linux upload-artifact "No files found" — `BDIR` 错指 `src-tauri/target/`, Cargo workspace 实际 target 是仓库根 `target/`; (2) rename step 静默成功但 staging 空 (#1 次生症状); (3) Windows `cargo binstall tauri-cli` 卡 30+ min. 单独 hotfix PR #6 (base=main) 修这 3 个 + `release_assets.py` 公钥从私钥派生 (CI secret 只配 `RELEASE_PRIVATE_KEY_PEM` 时缺公钥). PR #4 后来把 PR #6 的 build job 改动直接合进 phase-3 commit `65fe5a2`, PR #4 独立合并即获完整 hotfix; PR #6 在 PR #4 合并后变冗余可关 | dispatch test 在 squash-merge 前必须跑;**stacked PR 在底层 PR squash 后, GitHub 不会自动切 base, 必须 `gh pr edit X --base main` 显式 retarget** |
+| 2026-05-05 | PR #4/#5 review 反馈 + 双 PR rebase + retarget | (1) PR #4 (Phase 3) 原 base=feature/cleanup-phase-2, 没含 PR #6 hotfix → 操作: `git reset --hard origin/main` + cherry-pick phase-3 自己的 7 commits + 加第 8 commit 把 PR #6 build job 改动合进, force-push, `gh pr edit 4 --base main`. (2) PR #5 (Phase 4) 原 base=feature/cleanup-phase-3 + 顶部状态 over-claim "Phase 1-4 全部完成" + README 推荐下载产物清单仍是旧 PyInstaller 时代 (Portable.zip / pkg / tar.gz / 无后缀 Linux 单文件) → 操作: reset 到新 phase-3 head + cherry-pick phase-4 unique commit + 改 README 产物为 Tauri 实际 (Windows-x64-Setup.exe / .msi / macOS-arm64.dmg / Linux-x86_64.deb / .AppImage) + 改 plan 顶部为实际进度状态 + retarget base=main | over-claim 文档归档必须等 PR 真正合并后再写完成态;否则 review 会发现"事实不一致"|
