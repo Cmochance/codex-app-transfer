@@ -1,7 +1,7 @@
-//! Stage 3.2a stateless · Responses body → Chat body 转换.
+//! Stage 3.2a · Responses body → Chat body 转换.
 //!
 //! 对应 Python 端 `backend/responses_adapter.py::convert_responses_to_chat_body`,
-//! 但**不**接 `session_cache`(`previous_response_id` 历史恢复留 3.2a' 处理)。
+//! 并恢复旧版 `ResponseSessionCache` 的 `previous_response_id` 历史拼接。
 //!
 //! 覆盖范围:
 //! - 顶层字段:`model` / `instructions` / `input` / `tools` / `tool_choice` /
@@ -18,7 +18,6 @@
 //! - `reasoning` 顶层字段(各 provider 默认行为差异大,Stage 3.3c 在
 //!   provider_workarounds 里处理)
 //! - `text.format` → `response_format`(罕见,留后做)
-//! - `previous_response_id`(stateless 阶段直接丢弃,不报错,不恢复历史)
 //! - `store` / `metadata` / `prediction` / `service_tier` / `modalities` /
 //!   `audio`(罕见,留后做)
 //! - 多轮 user/assistant 合并(Python 有 `merge_consecutive_*_messages`,
@@ -27,7 +26,15 @@
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Value};
 
-use crate::types::AdapterError;
+use crate::types::{AdapterError, ResponseSessionPlan};
+
+use super::session::ResponseSessionCache;
+
+#[derive(Debug, Clone)]
+pub struct ResponsesBodyConversion {
+    pub body: Value,
+    pub response_session: ResponseSessionPlan,
+}
 
 /// 把 Responses API 请求体转换成 OpenAI Chat Completions 请求体.
 pub fn responses_body_to_chat_body(input: &Value) -> Result<Value, AdapterError> {
@@ -44,6 +51,14 @@ pub fn responses_body_to_chat_body_for_provider(
     input: &Value,
     provider: Option<&Provider>,
 ) -> Result<Value, AdapterError> {
+    Ok(responses_body_to_chat_body_for_provider_with_session(input, provider, None)?.body)
+}
+
+pub fn responses_body_to_chat_body_for_provider_with_session(
+    input: &Value,
+    provider: Option<&Provider>,
+    session_cache: Option<&ResponseSessionCache>,
+) -> Result<ResponsesBodyConversion, AdapterError> {
     let body = input
         .as_object()
         .ok_or_else(|| AdapterError::BadRequest("body 必须是 JSON 对象".into()))?;
@@ -55,21 +70,12 @@ pub fn responses_body_to_chat_body_for_provider(
         result.insert("model".into(), m.clone());
     }
 
-    // messages: instructions(优先,作为 system 头) + input 展开
-    let mut messages: Vec<Value> = Vec::new();
-    if let Some(instr) = body.get("instructions").and_then(|v| v.as_str()) {
-        let trimmed = instr.trim();
-        if !trimmed.is_empty() {
-            messages.push(json!({ "role": "system", "content": trimmed }));
-        }
-    }
-    if let Some(input_field) = body.get("input") {
-        for msg in input_field_to_messages(input_field) {
-            messages.push(msg);
-        }
-    }
+    // messages: instructions(优先,作为 system 头) + input 展开;如果存在
+    // previous_response_id 且 session cache 命中,先恢复历史再追加本轮 input。
+    let mut messages = build_messages_from_input(input, session_cache);
     repair_tool_call_ids(&mut messages);
     ensure_thinking_tool_call_reasoning(&mut messages, input, provider);
+    let session_messages = messages.clone();
     if !messages.is_empty() {
         result.insert("messages".into(), Value::Array(messages));
     }
@@ -128,7 +134,70 @@ pub fn responses_body_to_chat_body_for_provider(
         result.insert("stream_options".into(), json!({ "include_usage": true }));
     }
 
-    Ok(Value::Object(result))
+    Ok(ResponsesBodyConversion {
+        body: Value::Object(result),
+        response_session: ResponseSessionPlan {
+            response_id: response_id_for_session(),
+            messages: session_messages,
+        },
+    })
+}
+
+fn response_id_for_session() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("resp_{nanos:x}")
+}
+
+fn build_messages_from_input(
+    body: &Value,
+    session_cache: Option<&ResponseSessionCache>,
+) -> Vec<Value> {
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(instr) = body.get("instructions").and_then(|v| v.as_str()) {
+        let trimmed = instr.trim();
+        if !trimmed.is_empty() {
+            messages.push(json!({ "role": "system", "content": trimmed }));
+        }
+    }
+
+    let current_messages = body
+        .get("input")
+        .map(input_field_to_messages)
+        .unwrap_or_default();
+    let previous_response_id = body
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if !previous_response_id.is_empty() {
+        if let Some(cache) = session_cache {
+            let merged = cache.build_messages_with_history(previous_response_id, &current_messages);
+            let history_has_system = merged.iter().any(|msg| {
+                matches!(
+                    msg.get("role").and_then(|v| v.as_str()),
+                    Some("system" | "developer")
+                )
+            });
+            if history_has_system
+                && messages
+                    .first()
+                    .and_then(|msg| msg.get("role"))
+                    .and_then(|v| v.as_str())
+                    == Some("system")
+            {
+                messages.remove(0);
+            }
+            messages.extend(merged);
+            return messages;
+        }
+    }
+
+    messages.extend(current_messages);
+    messages
 }
 
 /// 把 `body.input` 字段(可能是 string 也可能是 array)展开成 messages 列表.
@@ -1017,14 +1086,60 @@ mod tests {
     }
 
     #[test]
-    fn previous_response_id_silently_dropped_for_now() {
+    fn previous_response_id_without_session_cache_keeps_current_input_only() {
         let out = convert(json!({
             "previous_response_id": "resp_abc",
             "input": "hi"
         }));
-        // stateless 阶段不报错、不恢复历史,只丢字段
+        // 没有传入 session cache 的公开 helper 保持无状态兼容。
         assert!(out.get("previous_response_id").is_none());
         assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn previous_response_id_restores_history_before_current_input() {
+        let cache = ResponseSessionCache::new(1000, std::time::Duration::from_secs(3600));
+        cache.save(
+            "resp_prev",
+            vec![
+                json!({"role": "system", "content": "old instructions"}),
+                json!({"role": "user", "content": "what is the weather?"}),
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"loc\":\"NYC\"}"}
+                    }]
+                }),
+            ],
+        );
+
+        let conversion = responses_body_to_chat_body_for_provider_with_session(
+            &json!({
+                "instructions": "new duplicate instructions",
+                "previous_response_id": "resp_prev",
+                "input": [
+                    {"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+                    {"type": "message", "role": "user", "content": "summarize"}
+                ]
+            }),
+            None,
+            Some(&cache),
+        )
+        .unwrap();
+
+        let msgs = conversion.body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "old instructions");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_1");
+        assert_eq!(msgs[4]["content"], "summarize");
+        assert_eq!(conversion.response_session.messages, msgs.clone());
     }
 
     #[test]

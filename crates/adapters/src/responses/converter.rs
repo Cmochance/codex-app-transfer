@@ -139,6 +139,50 @@ impl ChatToResponsesConverter {
         }
     }
 
+    pub fn new_with_response_id(response_id: String) -> Self {
+        let seed = response_id
+            .strip_prefix("resp_")
+            .unwrap_or(response_id.as_str())
+            .to_owned();
+        Self::new_with_ids(response_id, format!("msg_{seed}"), format!("rs_{seed}"))
+    }
+
+    pub fn assistant_message(&self) -> Option<Value> {
+        if !self.message_open && self.tool_calls.is_empty() && self.reasoning_acc.is_empty() {
+            return None;
+        }
+
+        let mut message = json!({
+            "role": "assistant",
+            "content": self.text_acc,
+        });
+        if !self.reasoning_acc.is_empty() {
+            message["reasoning_content"] = Value::String(self.reasoning_acc.clone());
+        }
+
+        if !self.tool_calls.is_empty() {
+            let tool_calls: Vec<Value> = self
+                .tool_calls
+                .values()
+                .map(|pending| {
+                    json!({
+                        "id": pending.call_id.clone(),
+                        "type": "function",
+                        "function": {
+                            "name": pending.name.clone(),
+                            "arguments": pending.args_acc.clone(),
+                        },
+                    })
+                })
+                .collect();
+            if !tool_calls.is_empty() {
+                message["tool_calls"] = Value::Array(tool_calls);
+            }
+        }
+
+        Some(message)
+    }
+
     /// 喂入站 SSE 字节;返回**已经可以 flush** 的出站 SSE 字节。
     /// 半个 frame(没遇到 `\n\n`)会留在内部 buffer 等下次 feed。
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {

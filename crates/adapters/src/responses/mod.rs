@@ -10,11 +10,16 @@
 
 pub mod converter;
 pub mod request;
+pub mod session;
 pub mod stream;
 
 pub use converter::ChatToResponsesConverter;
-pub use request::{responses_body_to_chat_body, responses_body_to_chat_body_for_provider};
-pub use stream::convert_chat_to_responses_stream;
+pub use request::{
+    responses_body_to_chat_body, responses_body_to_chat_body_for_provider,
+    responses_body_to_chat_body_for_provider_with_session,
+};
+pub use session::{global_response_session_cache, ResponseSessionCache};
+pub use stream::{convert_chat_to_responses_stream, convert_chat_to_responses_stream_with_session};
 
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
@@ -43,16 +48,21 @@ impl Adapter for ResponsesAdapter {
         provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
         let upstream_path = redirect_responses_to_chat(client_path);
-        // Stage 3.2a stateless:解析 body → Responses,转出 Chat 形态。
+        // Stage 3.2a:解析 body → Responses,转出 Chat 形态。
         // 失败时(body 非 JSON / 非对象)用 BadRequest 错出去,proxy 会回 400。
         let parsed: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| AdapterError::BadRequest(format!("body 不是合法 JSON: {e}")))?;
-        let chat_body = responses_body_to_chat_body_for_provider(&parsed, Some(provider))?;
-        let new_body = serde_json::to_vec(&chat_body)
+        let conversion = responses_body_to_chat_body_for_provider_with_session(
+            &parsed,
+            Some(provider),
+            Some(global_response_session_cache()),
+        )?;
+        let new_body = serde_json::to_vec(&conversion.body)
             .map_err(|e| AdapterError::Internal(format!("re-serialize: {e}")))?;
         Ok(RequestPlan {
             upstream_path,
             body: Bytes::from(new_body),
+            response_session: Some(conversion.response_session),
         })
     }
 
@@ -62,6 +72,7 @@ impl Adapter for ResponsesAdapter {
         mut upstream_headers: HeaderMap,
         upstream_stream: ByteStream,
         _provider: &Provider,
+        request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
         // 把 content-type 强制改成 text/event-stream(上游本来就是,但保险)
         upstream_headers.insert(
@@ -71,7 +82,11 @@ impl Adapter for ResponsesAdapter {
         Ok(ResponsePlan {
             status: upstream_status,
             headers: upstream_headers,
-            stream: convert_chat_to_responses_stream(upstream_stream),
+            stream: if let Some(session) = request_plan.response_session.clone() {
+                convert_chat_to_responses_stream_with_session(upstream_stream, session)
+            } else {
+                convert_chat_to_responses_stream(upstream_stream)
+            },
         })
     }
 }
