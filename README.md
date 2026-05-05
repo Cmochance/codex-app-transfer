@@ -16,13 +16,13 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本：**v2.0.0**(Python → Rust/Tauri 全栈重写;UI 视觉与 v1.0.4 字节级一致)
+- 当前版本：**v2.0.1**(Python → Rust/Tauri 全栈重写后的当前主线;UI 视觉与 v1.0.4 字节级一致)
 - 已验证供应商：Kimi Code（`kimi-for-coding` UA 网关）、Kimi 月之暗面（Moonshot Platform）、DeepSeek V4（含「Max 思维」思考模式）、Xiaomi MiMo (Token Plan)、Xiaomi MiMo (Pay for Token)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
 
 > 如果使用过程中出现问题，欢迎提交 PR 协助作者完善，会及时处理，非常感谢。
 
-- 平台:macOS arm64(v2.0.0 首发);Windows x64 / Linux x86_64 留 v2.0.x 补
+- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产
 - 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.0.4 字节级互通,可来回切换不丢数据
 
 ### 更新日志
@@ -96,11 +96,11 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: **v2.0.0** (full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
+- Current version: **v2.0.1** (current mainline after the full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
 - Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (with "Max thinking" mode), Xiaomi MiMo (Token Plan), Xiaomi MiMo (Pay for Token)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
-- Platforms: macOS arm64 (v2.0.0 launch); Windows x64 / Linux x86_64 follow in v2.0.x
-- Data compatibility: `~/.codex-app-transfer/config.json` is byte-identical between v1.0.4 and v2.0.0 — switch back and forth without data loss
+- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets
+- Data compatibility: `~/.codex-app-transfer/config.json` remains byte-identical between v1.0.4 and the v2.x Rust mainline — switch back and forth without data loss
 
 ### Changelog
 
@@ -193,11 +193,11 @@ make mac-app
 
 内部跑 `cargo tauri build --bundles app`,产出落到 `dist/mac/Codex App Transfer.app`。**单二进制 27MB**,不需要 Python 解释器、不需要外部 frontend/ 目录(全部 `include_dir!` 嵌入二进制)、不需要 Docker/Wine。
 
-要带签名 + notarize 的正式发布(`mac-release` Makefile target,Apple Developer ID + dmg/pkg),v2.0.x 起补;当前 v2.0.0 仅本地自测路径。
+正式发布走 GitHub Actions 的 `release.yml` 工作流,由 Tauri bundler 生成三平台资产并由 `xtask release-bundle` 生成 `.sha256` / `.sig` / `latest.json`。本地 `make mac-app` 仅用于 macOS 自测;Apple Developer ID notarize 仍是后续工作。
 
 ### Windows / Linux
 
-v2.0.0 首发只 ship macOS arm64。Tauri 2 原生支持跨平台编译,后续 v2.0.x 会接 Windows MSI / Linux .deb / .rpm。代码层面没有平台特异(除 macOS Apple-specific 的 NSApp.hide / NSRunningApplication.activate 等已 `#[cfg(target_os = "macos")]` 隔离),`cargo tauri build` 在对应平台直接出 native 产物。
+v2.0.0 首发只 ship macOS arm64;v2.0.1 起发布工作流会生成 Windows NSIS / MSI、Linux `.deb` / AppImage 和 macOS `.dmg`。Tauri 2 原生支持跨平台编译,代码层面没有平台特异(除 macOS Apple-specific 的 NSApp.hide / NSRunningApplication.activate 等已 `#[cfg(target_os = "macos")]` 隔离),`cargo tauri build` 在对应平台直接出 native 产物。
 
 ### 历史(v1.x / Python)打包
 
