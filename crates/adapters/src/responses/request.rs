@@ -285,7 +285,11 @@ fn repair_tool_call_ids(messages: &mut Vec<Value>) {
     let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
 
     for mut msg in messages.drain(..) {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
         if role == "assistant" {
             if let Some(calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                 pending_call_ids = calls
@@ -321,7 +325,7 @@ fn repair_tool_call_ids(messages: &mut Vec<Value>) {
             }
         }
 
-        if matches!(role, "user" | "system" | "developer") {
+        if matches!(role.as_str(), "user" | "system" | "developer") {
             pending_call_ids.clear();
         }
 
@@ -379,7 +383,8 @@ fn request_thinking_enabled(body: &Value, provider: Option<&Provider>) -> bool {
     if body.get("reasoning").is_some() {
         return true;
     }
-    provider.is_some_and(|p| provider_looks_like(p, "deepseek") && provider_chat_thinking_enabled(p))
+    provider
+        .is_some_and(|p| provider_looks_like(p, "deepseek") && provider_chat_thinking_enabled(p))
 }
 
 fn provider_looks_like(provider: &Provider, needle: &str) -> bool {
@@ -396,7 +401,10 @@ fn provider_chat_thinking_enabled(provider: &Provider) -> bool {
         return true;
     }
 
-    let Some(chat_options) = provider.request_options.get("chat").and_then(|v| v.as_object())
+    let Some(chat_options) = provider
+        .request_options
+        .get("chat")
+        .and_then(|v| v.as_object())
     else {
         return false;
     };
