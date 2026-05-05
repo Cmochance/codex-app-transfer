@@ -1,8 +1,8 @@
 name: ci
 
-# Stage 0 起的回归门禁:Python 测试 + Rust 工作区编译 + Leptos UI WASM 构建。
-# 后续 Stage 1-7 每次提交都会跑这套,作为方案验收最低基线。
-# 详见 docs/migration-plan.md。
+# 回归门禁:Python replay smoke + Rust 工作区编译/测试。
+# Leptos UI WASM 构建 job 已废弃(v2.0.0 改用 frontend/ + cas:// scheme,Leptos 弃案)。
+# 详见 docs/migration-plan.md(Stage 6 架构调整)与 docs/cleanup-plan.md(Phase 1)。
 
 on:
   push:
@@ -88,40 +88,3 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace --no-fail-fast
-
-  ui-wasm-build:
-    name: Leptos UI · trunk build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain (with wasm32 target)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache cargo (UI)
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "ui -> target"
-
-      - name: Install trunk
-        uses: jetli/trunk-action@v0.5.0
-        with:
-          version: "latest"
-
-      - name: trunk build (release)
-        working-directory: ui
-        run: trunk build --release
-
-      - name: Check WASM size budget (≤ 500 KB after release+wasm-opt)
-        working-directory: ui/dist
-        run: |
-          set -euo pipefail
-          wasm_file=$(ls *.wasm | head -n 1)
-          size=$(stat -c%s "$wasm_file")
-          echo "wasm: $wasm_file = $size bytes"
-          # 500 KB upper bound;Stage 6 验收;超出会失败,提醒优化
-          if [ "$size" -gt 512000 ]; then
-            echo "::warning::WASM size $size exceeds 500 KB soft budget (will hard-fail at Stage 6 verification)"
-          fi
