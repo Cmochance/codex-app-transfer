@@ -1405,6 +1405,11 @@
     return t("providers.testDone");
   }
 
+  function formatModelFetchError(error) {
+    const reason = error?.message || t("toast.requestFailed");
+    return `${t("models.fetchFailedManual")}: ${reason}`;
+  }
+
   function downloadJson(filename, data) {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -1578,6 +1583,13 @@
             resultEl.classList.toggle("bad", result.ok === false);
           }
           showToast(message);
+        } catch (error) {
+          const message = error?.message || t("toast.requestFailed");
+          if (resultEl) {
+            resultEl.textContent = message;
+            resultEl.classList.add("bad");
+          }
+          showToast(message);
         } finally {
           actionEl.disabled = false;
         }
@@ -1596,6 +1608,13 @@
           if (resultEl) {
             resultEl.textContent = message;
             resultEl.classList.toggle("bad", result.ok === false || result.supported === false);
+          }
+          showToast(message);
+        } catch (error) {
+          const message = error?.message || t("toast.requestFailed");
+          if (resultEl) {
+            resultEl.textContent = message;
+            resultEl.classList.add("bad");
           }
           showToast(message);
         } finally {
@@ -1623,6 +1642,11 @@
           const message = formatProviderTestResult(result);
           resultEl.textContent = message;
           resultEl.classList.toggle("bad", result.ok === false);
+          showToast(message);
+        } catch (error) {
+          const message = error?.message || t("toast.requestFailed");
+          resultEl.textContent = message;
+          resultEl.classList.add("bad");
           showToast(message);
         } finally {
           actionEl.disabled = false;
@@ -1652,8 +1676,9 @@
         } catch (error) {
           providerAvailableModels = [];
           renderProviderMappings();
-          if (resultEl) resultEl.textContent = t("models.fetchFailedManual");
-          showToast(error.message || t("toast.requestFailed"));
+          const message = formatModelFetchError(error);
+          if (resultEl) resultEl.textContent = message;
+          showToast(message);
         } finally {
           actionEl.disabled = false;
         }
@@ -1725,6 +1750,10 @@
             resultEl.textContent = `${t("models.fetched")} ${result.models.length}`;
           }
           showToast(t("toast.modelsAutofilled"));
+        } catch (error) {
+          const message = formatModelFetchError(error);
+          if (resultEl) resultEl.textContent = message;
+          showToast(message);
         } finally {
           actionEl.disabled = false;
         }

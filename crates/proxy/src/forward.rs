@@ -24,6 +24,7 @@ use futures_util::TryStreamExt;
 use thiserror::Error;
 
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
+use crate::telemetry::proxy_telemetry;
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -76,6 +77,12 @@ pub enum ForwardError {
 
 impl axum::response::IntoResponse for ForwardError {
     fn into_response(self) -> Response {
+        let message = self.to_string();
+        let telemetry = proxy_telemetry();
+        telemetry.stats.record(false);
+        telemetry
+            .logs
+            .add("ERROR", format!("代理请求失败: {message}"));
         let (status, body) = match &self {
             ForwardError::Resolve(re) => (re.status(), format!("proxy resolve error: {re}")),
             ForwardError::Adapter(ae) => (
@@ -124,6 +131,12 @@ pub async fn forward_handler(
     let mut body_bytes: Bytes = axum::body::to_bytes(body, usize::MAX).await?;
 
     // 2. 解析(鉴权 + 路由)
+    let client_path = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+    let original_model = body_model(&body_bytes);
     let resolved = state.resolver.resolve(&parts, &body_bytes)?;
 
     // 3. 如有 model 重写,改写 body 的 "model" 字段
@@ -134,15 +147,11 @@ pub async fn forward_handler(
     }
 
     strip_model_suffix_in_place(&mut body_bytes);
+    let resolved_model = body_model(&body_bytes);
 
     // 4. 走 adapter 拿到上游路径 + 改写后的 body(openai_chat 路径下 body 等同)
-    let client_path = parts
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
     let adapter = state.adapters.lookup(&resolved.provider.api_format);
-    let plan = adapter.prepare_request(client_path, body_bytes, &resolved.provider)?;
+    let plan = adapter.prepare_request(&client_path, body_bytes, &resolved.provider)?;
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
     let path = if plan.upstream_path.starts_with('/') {
@@ -151,6 +160,25 @@ pub async fn forward_handler(
         format!("/{}", plan.upstream_path)
     };
     let upstream_url = format!("{}{}", resolved.upstream_base.trim_end_matches('/'), path);
+    let telemetry = proxy_telemetry();
+    telemetry
+        .logs
+        .add("INFO", format!("请求: {} {client_path}", parts.method));
+    if let Some(original_model) = original_model.as_deref() {
+        let mapped = resolved_model.as_deref().unwrap_or(original_model);
+        telemetry
+            .logs
+            .add("INFO", format!("模型映射: {original_model} → {mapped}"));
+    }
+    telemetry
+        .logs
+        .add("INFO", format!("转发请求 → {upstream_url}"));
+    if let Some(upstream_model) = body_model(&plan.body) {
+        let mapped = resolved_model.as_deref().unwrap_or(&upstream_model);
+        telemetry
+            .logs
+            .add("INFO", format!("模型: {mapped} → {upstream_model}"));
+    }
 
     // 6. 构造 reqwest 请求 —— 头复制 + 鉴权改写 + extras 注入
     let mut up = state
@@ -183,6 +211,12 @@ pub async fn forward_handler(
         upstream_stream,
         &resolved.provider,
     )?;
+    let success = response_plan.status.is_success();
+    telemetry.stats.record(success);
+    telemetry.logs.add(
+        if success { "SUCCESS" } else { "ERROR" },
+        format!("上游响应 {}", response_plan.status.as_u16()),
+    );
 
     // 8. 把 ResponsePlan 还原成 axum Response
     let mut builder = Response::builder().status(response_plan.status);
@@ -191,6 +225,13 @@ pub async fn forward_handler(
         .ok_or_else(|| ForwardError::Header("response builder lacks headers".into()))?;
     *headers_out = response_plan.headers;
     Ok(builder.body(Body::from_stream(response_plan.stream))?)
+}
+
+fn body_model(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.get("model")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
 }
 
 fn inject_auth(

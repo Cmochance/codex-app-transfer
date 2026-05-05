@@ -13,6 +13,7 @@ codex-app-transfer-registry = { path = "../registry" }
 codex-app-transfer-adapters = { path = "../adapters" }
 axum = { version = "0.8", features = ["http1", "http2", "tokio"] }
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures-core = "0.3"
 futures-util = "0.3"
 http = "1"

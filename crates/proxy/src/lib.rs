@@ -15,9 +15,11 @@ pub mod fixture;
 pub mod forward;
 pub mod resolver;
 pub mod server;
+pub mod telemetry;
 
 pub use forward::{forward_handler, ProxyState};
 pub use resolver::{
     AuthScheme, ProviderResolver, ResolveError, ResolvedProvider, SharedResolver, StaticResolver,
 };
 pub use server::build_router;
+pub use telemetry::{proxy_log_dir, proxy_telemetry, ProxyLogEntry, ProxyStatsSnapshot};
