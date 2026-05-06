@@ -59,7 +59,12 @@ fn main() {
                 .on_tray_icon_event(|tray, event| {
                     log_tray_event(&event);
                     let app = tray.app_handle();
-                    refresh_tray_menu(app);
+                    // **不要**在每个事件(尤其右键 Click/Move/Enter)里
+                    // 调用 `refresh_tray_menu`:Windows 平台正在呈现菜单时
+                    // 把菜单引用替换会让选项点不动 / 不显示(2026-05-06
+                    // 现场实测)。菜单在 handle_tray_menu 切 provider 之后
+                    // 已经会刷新一次,那是真正会变内容的时机;其他事件
+                    // (左键开窗 / 悬停 / 双击)菜单不变,没必要重建。
                     match event {
                         // 左键单击(Up)= 显示窗口并 focus
                         TrayIconEvent::Click {

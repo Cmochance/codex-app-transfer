@@ -77,18 +77,6 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     ensure_thinking_tool_call_reasoning(&mut messages, input, provider);
     convert_developer_to_system_if_needed(&mut messages, provider);
 
-    // 空 messages 守卫:Codex CLI 偶尔会带着 previous_response_id + input=[]
-    // 续轮(典型场景:本地代理刚重启,session_cache 是冷的;或上次会话被
-    // 清掉)。merge 完仍空意味着我们要么发一份没有 messages 的 body 上去
-    // (上游必拒,部分还会扣 reasoning tokens),要么在这里直接 400 让 Codex
-    // CLI 重试一份带完整 history 的请求。后者上游零打扰、账单零噪音、
-    // 用户视角无感(Codex CLI 的内置重试覆盖了这条)。
-    if messages.is_empty() {
-        return Err(AdapterError::BadRequest(
-            "Responses 请求转换后 messages 为空(input 空且 previous_response_id 在 session cache 未命中);拒绝向上游发空 messages,Codex CLI 应当带完整 history 重试".into(),
-        ));
-    }
-
     // 视觉剥离:对已知不支持视觉的上游(deepseek-v4-* / mimo-v2.5-* 等纯
     // 文本模型),把 messages.content 里所有 `image_url` block 替换为占位
     // 文本块。**必须**做这一步:DeepSeek API 在 deserialize 阶段就对
@@ -99,6 +87,13 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         strip_image_blocks_in_place(&mut messages);
     }
 
+    // 空 messages 处理:Codex CLI 偶尔会带 previous_response_id + input=[]
+    // 续轮(代理刚重启 session_cache 冷启动 / 心跳类轮询 / 上次会话被清)。
+    // **不**主动 fail-fast,实测会持续阻塞 Kimi 对话(2026-05-06 现场:
+    // proxy 自身 BadRequest 比上游 400 更难让 Codex CLI 走重试路径)。
+    // 改为透传:发空 messages 给上游,让上游回原生 4xx,Codex CLI 按内置
+    // 重试策略覆盖。此时**仍写 messages 字段**(空数组),避免上游报
+    // "missing field messages" 之类二级错误。
     let session_messages = messages.clone();
     result.insert("messages".into(), Value::Array(messages));
 
@@ -1489,11 +1484,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_with_no_session_history_returns_bad_request() {
+    fn empty_input_with_no_session_history_passes_through_with_empty_messages() {
         // Codex CLI 续轮:input 空 + previous_response_id 在 session_cache 未命中
-        // (代理刚重启 / 上次 session 被清).代理必须 400 fail-fast,不能让上游
-        // 收到没有 messages 的 body 拒绝(MiMo 实测会回 "Param Incorrect:
-        // messages is a required array" + 部分 provider 仍然扣 reasoning tokens)。
+        // (代理刚重启 / 上次 session 被清 / 心跳轮询 etc)。
+        //
+        // **不再 fail-fast**(2026-05-06 实测:proxy 自己 BadRequest 比上游
+        // 400 更难触发 Codex CLI 内置重试路径,导致 Kimi 对话被持续阻塞)。
+        // 现在透传空 messages 给上游,上游回原生 4xx,Codex CLI 按它自己的
+        // 重试逻辑覆盖。**仍**写 messages 字段(空数组),避免上游报"missing
+        // field messages"之类二级错误。
         let req = json!({
             "model": "x",
             "stream": true,
@@ -1501,17 +1500,9 @@ mod tests {
             "tools": [{"type":"function","name":"shell","parameters":{"type":"object"}}],
             "input": []
         });
-        let err =
-            responses_body_to_chat_body(&req).expect_err("messages 全空必须 fail-fast,不能透传");
-        match err {
-            AdapterError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("messages 为空"),
-                    "错误信息应当指出 messages 空: {msg}"
-                );
-            }
-            other => panic!("应当返回 BadRequest,实际: {other:?}"),
-        }
+        let out = responses_body_to_chat_body(&req).expect("不再 fail-fast,应当通过");
+        let msgs = out["messages"].as_array().expect("messages 字段必须存在");
+        assert!(msgs.is_empty(), "messages 应是空数组,留给上游决定如何处理");
     }
 
     #[test]
