@@ -75,26 +75,30 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     }
 
     // 3. config.toml: model_context_window(旧版兼容) + model_catalog_json(Codex 0.128+)
+    //
+    // catalog 始终写(2026-05-06):之前只在 `supports_1m=true` 时写,导致非 1M
+    // provider(如 Kimi `kimi-k2.6` / MiMo `mimo-v2.5-pro`)在 Codex CLI 模型
+    // 选择器里 fallback 到内置 GPT 系列名("GPT-5.5"等),用户看不到真实
+    // provider/model。现在每条 provider 都通过 catalog 把 display_name 设成
+    // "<provider> / <real-model>",`model_context_window` 仍只在 1M 时设。
+    let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
+    sync_root_value(
+        &paths.config_toml,
+        CODEX_MODEL_CATALOG_KEY,
+        Some(&catalog_literal),
+    )?;
+    let models = catalog_models_for_provider(
+        cfg.provider_name,
+        cfg.default_model,
+        cfg.supports_1m,
+        cfg.model_mappings,
+        cfg.model_capabilities,
+    );
+    upsert_catalog_models(&paths.model_catalog_json, &models)?;
     if cfg.supports_1m {
         sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
-        let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
-        sync_root_value(
-            &paths.config_toml,
-            CODEX_MODEL_CATALOG_KEY,
-            Some(&catalog_literal),
-        )?;
-        let models = catalog_models_for_provider(
-            cfg.provider_name,
-            cfg.default_model,
-            true,
-            cfg.model_mappings,
-            cfg.model_capabilities,
-        );
-        upsert_catalog_models(&paths.model_catalog_json, &models)?;
     } else {
         sync_root_value(&paths.config_toml, "model_context_window", None)?;
-        sync_root_value(&paths.config_toml, CODEX_MODEL_CATALOG_KEY, None)?;
-        clear_catalog_models(&paths.model_catalog_json)?;
     }
 
     // 4. auth.json: auth_mode + OPENAI_API_KEY
@@ -119,7 +123,7 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         auth_json_path: paths.auth_json.display().to_string(),
         snapshot_taken: snapshot_taken_now,
         model_context_window_set: cfg.supports_1m,
-        model_catalog_json_set: cfg.supports_1m,
+        model_catalog_json_set: true,
     })
 }
 
@@ -215,11 +219,15 @@ mod tests {
         .unwrap();
         assert!(result.snapshot_taken);
         assert!(!result.model_context_window_set);
-        assert!(!result.model_catalog_json_set);
+        // catalog 现在始终写(让非 1M provider 也能在 Codex CLI 模型选择器
+        // 显示"<provider> / <real-model>"而不是 fallback 到 GPT 内置名)
+        assert!(result.model_catalog_json_set);
 
         let toml = read_toml(&paths);
         assert!(toml.contains("openai_base_url = \"http://127.0.0.1:18080\""));
         assert!(!toml.contains("model_context_window"));
+        // model_catalog_json 始终在 config.toml 里
+        assert!(toml.contains("model_catalog_json"));
 
         let auth = read_auth_value(&paths);
         assert_eq!(auth["auth_mode"], "apikey");
@@ -304,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_without_supports_1m_removes_catalog_key_and_top_level_models() {
+    fn apply_without_supports_1m_keeps_catalog_drops_only_context_window() {
         let (_t, paths) = setup();
         apply_provider(
             &paths,
@@ -337,10 +345,22 @@ mod tests {
         )
         .unwrap();
 
+        // 现在 catalog 始终写,即使 supports_1m=false 也保留(2026-05-06):
+        // - model_context_window 仍按 supports_1m 切换:这条只在 1M 时设
+        // - model_catalog_json 与顶层 "models" 数组不再被清掉,Codex CLI
+        //   能继续从 catalog 读到正确的 "<provider> / <real-model>" 显示
         let toml = read_toml(&paths);
-        assert!(!toml.contains("model_context_window"));
-        assert!(!toml.contains(CODEX_MODEL_CATALOG_KEY));
-        assert!(read_app_config(&paths).get("models").is_none());
+        assert!(!toml.contains("model_context_window = "));
+        assert!(toml.contains(CODEX_MODEL_CATALOG_KEY));
+        let models = read_app_config(&paths)
+            .get("models")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .expect("models 数组应保留");
+        assert!(
+            !models.is_empty(),
+            "catalog 始终写,至少包含 default 模型条目"
+        );
     }
 
     #[test]
