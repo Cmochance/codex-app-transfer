@@ -723,8 +723,7 @@ impl ChatToResponsesConverter {
         // `output_tokens` / `total_tokens` 是必填,缺一帧就整流断开重连。Chat
         // 上游的 `prompt_tokens` / `completion_tokens` 与 Responses 的字段名
         // 不同,部分 provider 也可能完全不发 usage,这里统一规范化。
-        completed["response"]["usage"] =
-            normalize_usage_to_responses_shape(self.usage.clone());
+        completed["response"]["usage"] = normalize_usage_to_responses_shape(self.usage.clone());
         emit_event(out, "response.completed", completed);
         self.state = State::Done;
     }
@@ -765,10 +764,14 @@ fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
     let input_tokens = if already_responses {
         map.get("input_tokens").cloned().unwrap_or_else(|| json!(0))
     } else {
-        map.get("prompt_tokens").cloned().unwrap_or_else(|| json!(0))
+        map.get("prompt_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(0))
     };
     let output_tokens = if already_responses {
-        map.get("output_tokens").cloned().unwrap_or_else(|| json!(0))
+        map.get("output_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(0))
     } else {
         map.get("completion_tokens")
             .cloned()
@@ -881,9 +884,7 @@ struct ChatDelta {
     function_call: Option<LegacyFunctionCallDelta>,
 }
 
-fn deserialize_null_or_missing_to_empty_vec<'de, D, T>(
-    deserializer: D,
-) -> Result<Vec<T>, D::Error>
+fn deserialize_null_or_missing_to_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de>,
@@ -1626,7 +1627,9 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
         let _ = c.feed(
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
         );
-        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\n");
+        let _ = c.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\n",
+        );
         let out = c.feed(b"data: [DONE]\n\n");
         let events = parse_emitted(&out);
         let usage = &events.last().unwrap().1["response"]["usage"];

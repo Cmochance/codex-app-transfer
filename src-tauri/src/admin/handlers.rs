@@ -208,8 +208,18 @@ fn running_check_command(platform: &str) -> Vec<String> {
 /// 退出命令(`force=false` 普通退出, `force=true` 强杀).
 fn quit_command(platform: &str, force: bool) -> Vec<String> {
     match (platform, force) {
-        ("macos", false) => vec!["pkill".into(), "-TERM".into(), "-x".into(), MACOS_APP_NAME.into()],
-        ("macos", true) => vec!["pkill".into(), "-KILL".into(), "-x".into(), MACOS_APP_NAME.into()],
+        ("macos", false) => vec![
+            "pkill".into(),
+            "-TERM".into(),
+            "-x".into(),
+            MACOS_APP_NAME.into(),
+        ],
+        ("macos", true) => vec![
+            "pkill".into(),
+            "-KILL".into(),
+            "-x".into(),
+            MACOS_APP_NAME.into(),
+        ],
         ("windows", false) => vec!["taskkill".into(), "/IM".into(), WINDOWS_PROCESS_NAME.into()],
         ("windows", true) => vec![
             "taskkill".into(),
@@ -217,8 +227,18 @@ fn quit_command(platform: &str, force: bool) -> Vec<String> {
             "/IM".into(),
             WINDOWS_PROCESS_NAME.into(),
         ],
-        (_, false) => vec!["pkill".into(), "-TERM".into(), "-x".into(), LINUX_BIN_NAME.into()],
-        (_, true) => vec!["pkill".into(), "-KILL".into(), "-x".into(), LINUX_BIN_NAME.into()],
+        (_, false) => vec![
+            "pkill".into(),
+            "-TERM".into(),
+            "-x".into(),
+            LINUX_BIN_NAME.into(),
+        ],
+        (_, true) => vec![
+            "pkill".into(),
+            "-KILL".into(),
+            "-x".into(),
+            LINUX_BIN_NAME.into(),
+        ],
     }
 }
 
@@ -4449,17 +4469,11 @@ mod tests {
 
     #[test]
     fn running_check_command_is_platform_specific() {
-        assert_eq!(
-            running_check_command("macos"),
-            vec!["pgrep", "-x", "Codex"]
-        );
+        assert_eq!(running_check_command("macos"), vec!["pgrep", "-x", "Codex"]);
         let windows = running_check_command("windows");
         assert_eq!(windows[0], "tasklist");
         assert!(windows.iter().any(|a| a == "IMAGENAME eq Codex.exe"));
-        assert_eq!(
-            running_check_command("linux"),
-            vec!["pgrep", "-x", "codex"]
-        );
+        assert_eq!(running_check_command("linux"), vec!["pgrep", "-x", "codex"]);
     }
 
     #[test]
@@ -4498,10 +4512,7 @@ mod tests {
             vec!["open", "-a", "/Applications/Codex.app"]
         );
         // 落空时回到裸 app 名,让 LaunchServices 找
-        assert_eq!(
-            open_command("macos", None),
-            vec!["open", "-a", "Codex"]
-        );
+        assert_eq!(open_command("macos", None), vec!["open", "-a", "Codex"]);
         let windows = open_command("windows", None);
         assert_eq!(windows[0], "explorer.exe");
         assert!(windows[1].starts_with("shell:AppsFolder\\"));
