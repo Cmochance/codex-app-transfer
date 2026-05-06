@@ -386,7 +386,7 @@ fn extract_reasoning_text(item: &serde_json::Map<String, Value>) -> String {
         for summary in summaries {
             if let Some(text) = summary.get("text").and_then(|v| v.as_str()) {
                 if !text.trim().is_empty() {
-                    parts.push(text.to_owned());
+                    parts.push(strip_codex_reasoning_prefix(text).to_owned());
                 }
             }
         }
@@ -397,7 +397,7 @@ fn extract_reasoning_text(item: &serde_json::Map<String, Value>) -> String {
             for block in content {
                 if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                     if !text.trim().is_empty() {
-                        parts.push(text.to_owned());
+                        parts.push(strip_codex_reasoning_prefix(text).to_owned());
                     }
                 }
             }
@@ -405,6 +405,18 @@ fn extract_reasoning_text(item: &serde_json::Map<String, Value>) -> String {
     }
 
     parts.join("\n")
+}
+
+/// 续轮(`previous_response_id`)时,Codex CLI 会把 v2.0.8+ 注入的 reasoning
+/// `**Thinking**\n\n` prefix 通过 reasoning summary 文本回送回来。这里在
+/// 写回上游 messages 的 `reasoning_content` 之前 strip 掉,避免 prefix 累积
+/// 污染上游 history、长会话里出现"前面所有轮 reasoning_content 都带人造
+/// header"。新一轮 reasoning 在 `converter.rs::open_reasoning` 处会再次注入,
+/// 行为对 Codex CLI UI 显示无变化。
+pub(crate) const CODEX_REASONING_PREFIX: &str = "**Thinking**\n\n";
+
+fn strip_codex_reasoning_prefix(text: &str) -> &str {
+    text.strip_prefix(CODEX_REASONING_PREFIX).unwrap_or(text)
 }
 
 /// 单个 Responses input item → 一条或多条 Chat message.
@@ -2115,6 +2127,37 @@ mod tests {
         let msg = &out["messages"][0];
         assert_eq!(msg["role"], "assistant");
         assert_eq!(msg["reasoning_content"], "I should inspect the repo.");
+    }
+
+    #[test]
+    fn reasoning_summary_strips_codex_thinking_prefix_on_continuation() {
+        // 续轮场景:Codex CLI 把上一轮 v2.0.8 注入的 `**Thinking**\n\n` prefix
+        // 通过 reasoning summary 文本回送回来。proxy 在写回上游 messages.reasoning_content
+        // 之前必须 strip,避免 prefix 累积污染上游 history。
+        let out = convert(json!({
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "**Thinking**\n\nI should inspect the repo."
+                    }],
+                    "content": null,
+                    "encrypted_content": null
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "shell",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                }
+            ]
+        }));
+        let msg = &out["messages"][0];
+        assert_eq!(
+            msg["reasoning_content"], "I should inspect the repo.",
+            "**Thinking**\\n\\n prefix 应被 strip,只保留原始 reasoning"
+        );
     }
 
     #[test]

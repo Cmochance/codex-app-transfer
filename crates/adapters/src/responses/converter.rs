@@ -157,7 +157,14 @@ impl ChatToResponsesConverter {
             "content": self.text_acc,
         });
         if !self.reasoning_acc.is_empty() {
-            message["reasoning_content"] = Value::String(self.reasoning_acc.clone());
+            // ToolCallCache 重建走这条路把 reasoning 写回上游 messages —
+            // 上游不需要见到 v2.0.8+ open_reasoning 注入的 `**Thinking**\n\n`
+            // 人造 header(那只为 Codex CLI TUI 显示分支用),strip 后给上游。
+            let cleaned = self
+                .reasoning_acc
+                .strip_prefix(crate::responses::request::CODEX_REASONING_PREFIX)
+                .unwrap_or(self.reasoning_acc.as_str());
+            message["reasoning_content"] = Value::String(cleaned.to_owned());
         }
 
         if !self.tool_calls.is_empty() {
@@ -536,6 +543,27 @@ impl ChatToResponsesConverter {
                 "output_index": self.reasoning_index,
                 "summary_index": 0,
                 "part": { "type": "summary_text", "text": "" },
+            }),
+        );
+        // 注入 `**Thinking**\n\n` header 让 Codex CLI TUI 走"显示" 分支。
+        // Codex CLI 0.128 `tui/src/history_cell.rs:2783 new_reasoning_summary_block`
+        // 检测累积 buffer 里是否有匹配的 `**...**` 标记 —— 命中走显示分支,
+        // 否则把整段 reasoning 标记为 transcript_only,主 UI 完全不渲染
+        // (只在 `/transcript` 命令可见)。OpenAI o1/o3 自带 section header,
+        // 但 Kimi for Coding / DeepSeek thinking 等纯文本流默认无 `**`,
+        // 不补 prefix 就会被整段隐藏。详见
+        // `docs/kimi-reasoning-truncation-investigation.md` §5.4 根因结论。
+        const REASONING_HEADER: &str = "**Thinking**\n\n";
+        self.reasoning_acc.push_str(REASONING_HEADER);
+        emit_event(
+            out,
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": self.reasoning_id,
+                "output_index": self.reasoning_index,
+                "summary_index": 0,
+                "delta": REASONING_HEADER,
             }),
         );
     }
@@ -1132,7 +1160,8 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         assert_eq!(output[0]["type"], "reasoning");
         assert_eq!(output[0]["content"], Value::Null);
         assert_eq!(output[0]["encrypted_content"], Value::Null);
-        assert_eq!(output[0]["summary"][0]["text"], "The");
+        // summary[0].text 是注入 prefix + 上游 reasoning 累积的全文
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nThe");
         assert_eq!(output[0]["summary"][0]["type"], "summary_text");
     }
 
@@ -1146,6 +1175,8 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 "#,
         );
         let ev1 = parse_emitted(&out1);
+        // open_reasoning 现在多 emit 一条 `**Thinking**` prefix delta,放在
+        // reasoning_summary_part.added 之后、上游真实 delta "think" 之前。
         assert_eq!(
             names(&ev1),
             vec![
@@ -1153,7 +1184,8 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
                 "response.in_progress",
                 "response.output_item.added", // reasoning open
                 "response.reasoning_summary_part.added",
-                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.delta", // prefix `**Thinking**\n\n`
+                "response.reasoning_summary_text.delta", // 上游 "think"
             ]
         );
         assert_eq!(ev1[2].1["item"]["type"], "reasoning");
@@ -1161,6 +1193,8 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         assert_eq!(ev1[2].1["item"]["summary"], json!([]));
         assert_eq!(ev1[2].1["item"]["content"], Value::Null);
         assert_eq!(ev1[2].1["item"]["encrypted_content"], Value::Null);
+        assert_eq!(ev1[4].1["delta"], "**Thinking**\n\n");
+        assert_eq!(ev1[5].1["delta"], "think");
 
         // 第 2 chunk:content 出现,先关 reasoning 再开 message
         let out2 = c.feed(
@@ -1207,7 +1241,7 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         assert_eq!(output[0]["content"], Value::Null);
         assert_eq!(output[0]["encrypted_content"], Value::Null);
         assert_eq!(output[0]["summary"][0]["type"], "summary_text");
-        assert_eq!(output[0]["summary"][0]["text"], "think");
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink");
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "answer");
     }
@@ -1229,7 +1263,11 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         let out = c.feed(b"data: [DONE]\n\n");
         let events = parse_emitted(&out);
         let completed = &events.last().unwrap().1["response"];
-        assert_eq!(completed["output"][0]["summary"][0]["text"], "part1 part2");
+        // 多 chunk reasoning 与 prefix 合并后是 `**Thinking**\n\npart1 part2`
+        assert_eq!(
+            completed["output"][0]["summary"][0]["text"],
+            "**Thinking**\n\npart1 part2"
+        );
     }
 
     // ── 边界回归(已有用例迁移)──────────────────────────────────────
@@ -1675,15 +1713,21 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"reasoning_content\":\"想想\",\"tool_calls\":null,\"role\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
         );
         let events = parse_emitted(&out);
-        let reasoning_event = events
+        // open_reasoning 注入一次 `**Thinking**\n\n` prefix delta(让 Codex CLI
+        // TUI 走 bold-header 显示分支),然后再 emit 上游 "想想" delta —— 总计 2 条。
+        let reasoning_deltas: Vec<&Value> = events
             .iter()
-            .find(|(n, _)| n == "response.reasoning_summary_text.delta");
-        assert!(
-            reasoning_event.is_some(),
-            "delta.reasoning_content 必须 emit;实际事件: {:?}",
+            .filter(|(n, _)| n == "response.reasoning_summary_text.delta")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            reasoning_deltas.len(),
+            2,
+            "应有 prefix + 上游 reasoning_content 共两条 delta;实际事件: {:?}",
             names(&events)
         );
-        assert_eq!(reasoning_event.unwrap().1["delta"], "想想");
+        assert_eq!(reasoning_deltas[0]["delta"], "**Thinking**\n\n");
+        assert_eq!(reasoning_deltas[1]["delta"], "想想");
     }
 
     #[test]
