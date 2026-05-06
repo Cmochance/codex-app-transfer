@@ -12,6 +12,7 @@ pub mod converter;
 pub mod request;
 pub mod session;
 pub mod stream;
+pub mod tool_call_cache;
 
 pub use converter::ChatToResponsesConverter;
 pub use request::{
@@ -20,6 +21,7 @@ pub use request::{
 };
 pub use session::{global_response_session_cache, ResponseSessionCache};
 pub use stream::{convert_chat_to_responses_stream, convert_chat_to_responses_stream_with_session};
+pub use tool_call_cache::{global_tool_call_cache, ToolCallCache, ToolCallEntry};
 
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;

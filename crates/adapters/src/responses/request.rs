@@ -70,7 +70,10 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     let mut messages = build_messages_from_input(input, session_cache);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
-    repair_tool_call_ids(&mut messages);
+    repair_tool_call_ids(
+        &mut messages,
+        super::tool_call_cache::global_tool_call_cache(),
+    );
     ensure_thinking_tool_call_reasoning(&mut messages, input, provider);
     convert_developer_to_system_if_needed(&mut messages, provider);
     let session_messages = messages.clone();
@@ -685,9 +688,34 @@ fn provider_is_openai_official(provider: &Provider) -> bool {
     name.contains("openai") && !name.contains("azure")
 }
 
-fn repair_tool_call_ids(messages: &mut Vec<Value>) {
+/// 修复 / 重建工具调用 id 关联。
+///
+/// 改造前 Python `responses_adapter.py:466-597 _repair_tool_call_ids` 的行为
+/// 等价 Rust 实现 + 把孤儿 tool 的"直接丢弃"换成"用 ToolCallCache 兜底重建,
+/// 否则插占位 assistant"。
+///
+/// 三类输入:
+///   1. tool_call_id 为空 → 从前一条 assistant.tool_calls 顺序补 id
+///   2. tool_call_id 非空且能在前 assistant.tool_calls 找到 → 直接 ack 通过
+///   3. tool_call_id 非空但前 assistant 不含该 id(history 被压缩 / 截断 /
+///      跨 session 续接)→ 查 ToolCallCache:
+///        - 命中:把 tool_call 注回最近一条 assistant 的 tool_calls 列表
+///        - 未命中:在前面塞一条占位 assistant `{role:assistant, content:"",
+///          tool_calls:[{id, type:function, function:{name:"", arguments:""}}]}`,
+///          让 Chat 上游(Kimi / DeepSeek 严格校验)能匹配上不报 400
+///   4. 完全没有前置 assistant + cache 也没有 → 插占位 assistant + 保留 tool
+///
+/// 与 litellm 1.84.0 `transformation.py:802-948
+/// _ensure_tool_results_have_corresponding_tool_calls` 行为一致(只是 litellm
+/// 还做 Anthropic 合并,本仓库不需要)。
+fn repair_tool_call_ids(
+    messages: &mut Vec<Value>,
+    tool_call_cache: &super::tool_call_cache::ToolCallCache,
+) {
     let mut pending_call_ids: Vec<String> = Vec::new();
     let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
+    // 跟踪最近一条 assistant 在 repaired 里的下标,用于 path B "注回前 assistant"
+    let mut last_assistant_idx: Option<usize> = None;
 
     for mut msg in messages.drain(..) {
         let role = msg
@@ -704,6 +732,7 @@ fn repair_tool_call_ids(messages: &mut Vec<Value>) {
                     .map(str::to_owned)
                     .collect();
             }
+            last_assistant_idx = Some(repaired.len());
             repaired.push(msg);
             continue;
         }
@@ -716,22 +745,67 @@ fn repair_tool_call_ids(messages: &mut Vec<Value>) {
                 .trim()
                 .to_owned();
             if existing.is_empty() {
-                if pending_call_ids.is_empty() {
+                // path A1:有 pending → 顺序补
+                if let Some(next) = pending_call_ids.first().cloned() {
+                    pending_call_ids.remove(0);
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.insert("tool_call_id".into(), Value::String(next));
+                    }
+                } else {
+                    // path A2:tool_call_id 空且 pending 也空 →
+                    // 没有任何 id 可以关联,作为孤儿 message 丢弃(沿用旧行为)
                     continue;
                 }
-                if let Some(obj) = msg.as_object_mut() {
-                    obj.insert(
-                        "tool_call_id".into(),
-                        Value::String(pending_call_ids.remove(0)),
-                    );
-                }
             } else if let Some(pos) = pending_call_ids.iter().position(|id| id == &existing) {
+                // path B1:tool_call_id 非空 + 前 assistant 含该 id → ack 通过
                 pending_call_ids.remove(pos);
+            } else {
+                // path B2:tool_call_id 非空但前 assistant 不含该 id →
+                // 查 ToolCallCache 兜底重建
+                let entry = tool_call_cache.get(&existing);
+                let (name, arguments) = match entry {
+                    Some(e) => (e.name, e.arguments),
+                    // path B3:cache 也未命中 → 占位 (name 空字符串),
+                    // 上游能 match id 不报 400 是关键,name / args 由上游能容
+                    None => (String::new(), String::new()),
+                };
+                let placeholder_tool_call = json!({
+                    "id": existing,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                });
+                match last_assistant_idx {
+                    // path B-into-existing:把重建 tool_call 注回最近 assistant
+                    Some(idx) => {
+                        let assistant = &mut repaired[idx];
+                        let obj = assistant.as_object_mut().expect("assistant must be object");
+                        let calls = obj
+                            .entry("tool_calls".to_owned())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        if let Value::Array(arr) = calls {
+                            arr.push(placeholder_tool_call);
+                        }
+                    }
+                    // path B-orphan:连前 assistant 都没有 → 在 tool 前插占位
+                    None => {
+                        let placeholder_assistant = json!({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [placeholder_tool_call],
+                        });
+                        last_assistant_idx = Some(repaired.len());
+                        repaired.push(placeholder_assistant);
+                    }
+                }
             }
         }
 
         if matches!(role.as_str(), "user" | "system" | "developer") {
             pending_call_ids.clear();
+            last_assistant_idx = None;
         }
 
         repaired.push(msg);
@@ -1401,23 +1475,36 @@ mod tests {
         );
     }
 
+    /// 给单测用的隔离 cache,避免并行测试互相污染。
+    fn empty_tool_cache() -> super::super::tool_call_cache::ToolCallCache {
+        super::super::tool_call_cache::ToolCallCache::new(16, std::time::Duration::from_secs(60))
+    }
+
     #[test]
-    fn function_call_output_becomes_tool_message() {
-        let out = convert(json!({
-            "input": [{
-                "type": "function_call_output",
-                "call_id": "call_abc",
-                "output": "sunny"
-            }]
-        }));
-        let msg = &out["messages"][0];
-        assert_eq!(msg["role"], "tool");
-        assert_eq!(msg["tool_call_id"], "call_abc");
-        assert_eq!(msg["content"], "sunny");
+    fn function_call_output_becomes_tool_message_with_placeholder_assistant() {
+        // 孤儿 function_call_output(无前置 function_call):repair 路径 B-orphan
+        // 必须在它前面插占位 assistant.tool_calls,Chat 上游(Kimi/DeepSeek)
+        // 严格校验时才能匹配住 tool_call_id,不会 400。
+        let mut messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_abc",
+            "content": "sunny",
+        })];
+        let cache = empty_tool_cache();
+        repair_tool_call_ids(&mut messages, &cache);
+        assert_eq!(messages.len(), 2, "孤儿 tool 前应插占位 assistant");
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_abc");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_abc");
+        assert_eq!(messages[1]["content"], "sunny");
     }
 
     #[test]
     fn function_call_output_non_string_is_json_serialized() {
+        // 走完整 convert 路径(global cache 在生产里就这条路);
+        // 这里只关心 content 序列化,不关心占位 assistant 行为(见上一条测试)。
         let out = convert(json!({
             "input": [{
                 "type": "function_call_output",
@@ -1425,8 +1512,13 @@ mod tests {
                 "output": {"temp": 72}
             }]
         }));
-        let msg = &out["messages"][0];
-        assert_eq!(msg["content"], "{\"temp\":72}");
+        let tool_msg = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("应当有 tool 消息");
+        assert_eq!(tool_msg["content"], "{\"temp\":72}");
     }
 
     #[test]
@@ -1449,6 +1541,87 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1]["role"], "tool");
         assert_eq!(msgs[1]["tool_call_id"], "call_abc");
+    }
+
+    #[test]
+    fn orphan_tool_with_call_id_rebuilds_from_tool_call_cache() {
+        // path B-orphan + cache 命中:占位 assistant 应当用 cache 里的 name +
+        // arguments,让 Chat 上游能按真实工具名重建上下文。
+        let cache = empty_tool_cache();
+        cache.save(
+            "call_rebuild",
+            super::super::tool_call_cache::ToolCallEntry {
+                name: "shell".to_owned(),
+                arguments: r#"{"cmd":"ls"}"#.to_owned(),
+            },
+        );
+        let mut messages = vec![json!({
+            "role": "tool",
+            "tool_call_id": "call_rebuild",
+            "content": "/repo",
+        })];
+        repair_tool_call_ids(&mut messages, &cache);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_rebuild");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "shell");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"cmd":"ls"}"#
+        );
+        assert_eq!(messages[1]["tool_call_id"], "call_rebuild");
+    }
+
+    #[test]
+    fn orphan_tool_with_call_id_inserts_tool_call_into_existing_assistant() {
+        // path B-into-existing:user → assistant(无 tool_calls)→ tool
+        // (call_id 不在前 assistant 的 tool_calls 里)。应当把重建的
+        // tool_call 注回到那条 assistant 里,而不是再插一条占位。
+        let cache = empty_tool_cache();
+        cache.save(
+            "call_inject",
+            super::super::tool_call_cache::ToolCallEntry {
+                name: "search".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        );
+        let mut messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "thinking"}),
+            json!({"role": "tool", "tool_call_id": "call_inject", "content": "ok"}),
+        ];
+        repair_tool_call_ids(&mut messages, &cache);
+        assert_eq!(
+            messages.len(),
+            3,
+            "不应插占位 assistant,只在已有 assistant 里加 tool_calls"
+        );
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_inject");
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "search");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_inject");
+    }
+
+    #[test]
+    fn user_message_after_tool_call_resets_pending_state() {
+        // path "boundary":user / system / developer 出现时清掉 pending +
+        // last_assistant_idx,后续孤儿 tool 不会错把那条 assistant 当作注入
+        // 目标,而是在 tool 前再插占位 assistant。
+        let cache = empty_tool_cache();
+        let mut messages = vec![
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "user", "content": "next"}),
+            json!({"role": "tool", "tool_call_id": "call_after_user", "content": "x"}),
+        ];
+        repair_tool_call_ids(&mut messages, &cache);
+        let assistant_count = messages.iter().filter(|m| m["role"] == "assistant").count();
+        assert!(
+            assistant_count >= 2,
+            "user 边界后再来 orphan tool 必须重新插占位 assistant,实际 {assistant_count}"
+        );
+        let tool_msg = messages.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(tool_msg["tool_call_id"], "call_after_user");
     }
 
     #[test]
