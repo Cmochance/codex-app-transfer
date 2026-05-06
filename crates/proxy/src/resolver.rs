@@ -169,12 +169,15 @@ impl ProviderResolver for StaticResolver {
         let (provider, rewritten_model) = decide_provider(self, body)
             .ok_or_else(|| ResolveError::NotFound("no provider available".into()))?;
 
-        // 把 provider.extraHeaders 转成 HeaderMap;非法名/值跳过(不阻塞请求)
+        // 把 provider.extraHeaders 转成 HeaderMap;非法名/值跳过(不阻塞请求)。
+        // 支持 `{apiKey}` 模板替换,与 v1.0.3 backend/proxy.py:381 行为对齐
+        // (例如 DeepSeek 同时需要 Authorization 和 x-api-key 头)。
         let mut extras = HeaderMap::new();
         for (k, v) in &provider.extra_headers {
+            let v_substituted = v.replace("{apiKey}", &provider.api_key);
             if let (Ok(name), Ok(val)) = (
                 HeaderName::from_bytes(k.as_bytes()),
-                HeaderValue::from_str(v),
+                HeaderValue::from_str(&v_substituted),
             ) {
                 extras.append(name, val);
             }
@@ -463,5 +466,20 @@ mod tests {
             res.extra_headers.get("user-agent").unwrap(),
             "KimiCLI/1.40.0"
         );
+    }
+
+    #[test]
+    fn extra_headers_substitute_api_key_template() {
+        // 对齐 v1.0.3 backend/proxy.py:381 的 `{apiKey}` 模板替换。
+        let mut p = provider("deepseek", "https://up", "sk-real-key");
+        p.extra_headers
+            .insert("x-api-key".into(), "{apiKey}".into());
+        p.extra_headers
+            .insert("X-Plain".into(), "no-template".into());
+        let r = StaticResolver::new(None, vec![p], Some("deepseek".into()));
+        let parts = parts_with(&[]);
+        let res = r.resolve(&parts, b"{}").unwrap();
+        assert_eq!(res.extra_headers.get("x-api-key").unwrap(), "sk-real-key");
+        assert_eq!(res.extra_headers.get("x-plain").unwrap(), "no-template");
     }
 }

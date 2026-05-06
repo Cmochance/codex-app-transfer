@@ -97,7 +97,8 @@ const KIMI_REASONING_LIFECYCLE: &[&str] = &[
     "response.in_progress", // OpenAI Responses 协议要求 created 后立即跟 in_progress
     "response.output_item.added", // reasoning lazy open
     "response.reasoning_summary_part.added",
-    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.delta", // open_reasoning 注入的 `**Thinking**\n\n` prefix
+    "response.reasoning_summary_text.delta", // 上游真实 reasoning_content delta
     "response.reasoning_summary_text.done",
     "response.reasoning_summary_part.done",
     "response.output_item.done", // reasoning close
@@ -116,12 +117,12 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
         "Kimi fixture(只有 reasoning 没有 content)应走 reasoning-only 生命周期"
     );
 
-    // reasoning summary 文本来自 `delta.reasoning_content="The"`
+    // reasoning summary 文本 = 注入 prefix + 上游 `delta.reasoning_content="The"`
     let summary_done = events
         .iter()
         .find(|(n, _)| n == "response.reasoning_summary_text.done")
         .unwrap();
-    assert_eq!(summary_done.1["text"], "The");
+    assert_eq!(summary_done.1["text"], "**Thinking**\n\nThe");
 
     // completed: incomplete + max_output_tokens(finish_reason=length),
     // output 里只有 reasoning item,没有 message item
@@ -139,7 +140,7 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
     assert_eq!(output[0]["content"], Value::Null);
     assert_eq!(output[0]["encrypted_content"], Value::Null);
     assert_eq!(output[0]["summary"][0]["type"], "summary_text");
-    assert_eq!(output[0]["summary"][0]["text"], "The");
+    assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nThe");
 }
 
 #[tokio::test]
