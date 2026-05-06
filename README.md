@@ -16,7 +16,7 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本：**v2.0.1**(Python → Rust/Tauri 全栈重写后的当前主线;UI 视觉与 v1.0.4 字节级一致)
+- 当前版本：**v2.0.2**(Python → Rust/Tauri 全栈重写后的当前主线;UI 视觉与 v1.0.4 字节级一致)
 - 已验证供应商：Kimi Code（`kimi-for-coding` UA 网关）、Kimi 月之暗面（Moonshot Platform）、DeepSeek V4（含「Max 思维」思考模式）、Xiaomi MiMo (Token Plan)、Xiaomi MiMo (Pay for Token)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
 
@@ -96,7 +96,7 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: **v2.0.1** (current mainline after the full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
+- Current version: **v2.0.2** (current mainline after the full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
 - Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (with "Max thinking" mode), Xiaomi MiMo (Token Plan), Xiaomi MiMo (Pay for Token)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
 - Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets
@@ -214,7 +214,7 @@ import base64
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 pub = serialization.load_pem_public_key(Path('release/Codex-App-Transfer-release-public.pem').read_bytes())
-asset = 'release/Codex-App-Transfer-v2.0.1-macOS-arm64.dmg'  # 替换成你下载的产物
+asset = 'release/Codex-App-Transfer-v2.0.2-macOS-arm64.dmg'  # 替换成你下载的产物
 sig = base64.b64decode(Path(asset+'.sig').read_text())
 pub.verify(sig, Path(asset).read_bytes(), padding.PKCS1v15(), hashes.SHA256())
 print('OK')
