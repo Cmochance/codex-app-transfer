@@ -1507,6 +1507,19 @@
     // 唯一差异是这里要先把表单字段保存为 provider。**不弹 window.confirm**:
     // Tauri webview 在某些环境会静默忽略原生 confirm,导致用户看不到任何反馈
     // 误以为按钮失灵(2026-05-06 现场实测)。
+    //
+    // 响应延迟优化(2026-05-06):
+    // 旧版按顺序 await 10+ RPC(saveProvider → setDefault → startProxy →
+    // renderProviderCards × 1 → renderProviders 内 × 2 → renderDashboard 内
+    // × 3,getProviders 重复 3 次),链路 1.5-3s 才解锁按钮。
+    // 现在:
+    // 1. 关键路径只 await `saveProviderFromForm` + `setDefaultProvider`(2-3
+    //    RPC),拿到结果立刻 hash 跳页 / toast / 重启提示。
+    // 2. hash → "dashboard" 由路由器自动触发 `renderDashboard`,不再手动调,
+    //    避免与路由器重复 fetch 同一份 providers/status。
+    // 3. `startProxy`(若 desktopSync.requiresProxy)放后台,不阻塞 UI。
+    // 4. providers 页 / model 选择器等"用户没在看"的渲染留给下次进入时再
+    //    跑,避免冗余 RPC。
     const form = $("#providerForm");
     if (form && !form.reportValidity()) return;
 
@@ -1515,12 +1528,6 @@
       const provider = await saveProviderFromForm();
       const result = await CCApi.setDefaultProvider(provider.id);
       const desktopSync = result?.desktopSync || {};
-      if (desktopSync.requiresProxy) {
-        await CCApi.startProxy();
-      }
-      await renderProviderCards("#dashboardProviderCards", { includePresets: true });
-      await renderProviders();
-      await renderDashboard();
 
       editingProviderId = null;
       selectedPreset = null;
@@ -1531,6 +1538,12 @@
         showToast(t("toast.defaultUpdatedDesktop"));
       }
       showRestartReminder();
+
+      if (desktopSync.requiresProxy) {
+        CCApi.startProxy().catch((error) => {
+          console.error("applyProviderToDesktop background startProxy failed:", error);
+        });
+      }
     } finally {
       actionEl.disabled = false;
     }
