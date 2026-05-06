@@ -43,6 +43,8 @@ use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::tool_call_cache::{global_tool_call_cache, ToolCallEntry};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
@@ -480,6 +482,16 @@ impl ChatToResponsesConverter {
                 "output_index": pending.output_index,
                 "item": item,
             }),
+        );
+        // 把 (call_id → name + arguments) 写进 ToolCallCache,供下一轮
+        // Codex CLI 发 function_call_output 时 repair_tool_call_ids 路径 B
+        // 在前 assistant 找不到 call_id 时重建工具调用上下文。
+        global_tool_call_cache().save(
+            &pending.call_id,
+            ToolCallEntry {
+                name: pending.name.clone(),
+                arguments: pending.args_acc.clone(),
+            },
         );
         pending.closed = true;
     }
