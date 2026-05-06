@@ -281,6 +281,22 @@ fn resolve_macos_app_path() -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Windows 上给 Command 加 `CREATE_NO_WINDOW`(0x08000000)flag,避免每次
+/// 调 `tasklist` / `taskkill` 都 flash 一个 console 黑框。其他平台 no-op。
+/// 借鉴 codex-account-switch `src-tauri/win/runtime/process.rs::hide_console_window`。
+#[cfg(target_os = "windows")]
+fn hide_console_window(command: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console_window(command: &mut Command) -> &mut Command {
+    command
+}
+
 fn is_codex_app_running(platform: &str) -> bool {
     let cmd = running_check_command(platform);
     let Some((program, args)) = cmd.split_first() else {
@@ -288,7 +304,9 @@ fn is_codex_app_running(platform: &str) -> bool {
     };
     if platform == "windows" {
         // tasklist 即使没匹配也 exit 0,要看 stdout 里有没有 process 名
-        match Command::new(program).args(args).output() {
+        let mut command = Command::new(program);
+        command.args(args);
+        match hide_console_window(&mut command).output() {
             Ok(out) => String::from_utf8_lossy(&out.stdout)
                 .to_ascii_lowercase()
                 .contains(&WINDOWS_PROCESS_NAME.to_ascii_lowercase()),
@@ -311,12 +329,13 @@ fn run_quit_command(platform: &str, force: bool) {
     let Some((program, args)) = cmd.split_first() else {
         return;
     };
-    let _ = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    let _ = hide_console_window(&mut command).status();
 }
 
 fn quit_codex_app_with_retries(platform: &str) -> Result<(), String> {
@@ -350,11 +369,13 @@ fn open_codex_app(platform: &str) -> Result<(), String> {
     let Some((program, args)) = cmd.split_first() else {
         return Err("打开命令为空".to_owned());
     };
-    Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console_window(&mut command)
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("无法启动 Codex App: {e}"))
