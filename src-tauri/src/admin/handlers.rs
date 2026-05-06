@@ -188,6 +188,9 @@ const LINUX_BIN_NAME: &str = "codex";
 const QUIT_TERM_POLL_ITERS: u32 = 20; // 20 × 200ms = 4s
 const QUIT_KILL_POLL_ITERS: u32 = 10; // 10 × 200ms = 2s
 const QUIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// 退出确认后,等 launchd reap 完旧进程的 grace 窗口。低于 ~250ms 时
+/// `open -a` 仍可能误命中"已在运行"缓存。
+const POST_QUIT_LAUNCHD_GRACE: Duration = Duration::from_millis(400);
 
 /// 平台检测命令(可纯函数测试).返回 (program, args).第一个元素总是命令名。
 fn running_check_command(platform: &str) -> Vec<String> {
@@ -246,8 +249,12 @@ fn quit_command(platform: &str, force: bool) -> Vec<String> {
 /// 让 LaunchServices 自己找。
 fn open_command(platform: &str, resolved_macos_app: Option<&str>) -> Vec<String> {
     match platform {
+        // `-n`:即使 LaunchServices 缓存还以为 Codex 在运行,也强制启动一个新
+        // 实例。我们刚 SIGTERM 杀过主进程,launchd 偶尔会在 reap 完成前误把
+        // `open -a` 解读为 activate 已有实例 → 啥也不发生。`-n` 绕过这条。
         "macos" => vec![
             "open".into(),
+            "-n".into(),
             "-a".into(),
             resolved_macos_app.unwrap_or(MACOS_APP_NAME).into(),
         ],
@@ -354,7 +361,15 @@ fn open_codex_app(platform: &str) -> Result<(), String> {
 }
 
 fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
+    let was_running = is_codex_app_running(platform);
     quit_codex_app_with_retries(platform)?;
+    // 退出确认后给 launchd 一段 grace 让它 reap 完旧进程,LaunchServices 才会
+    // 把"Codex 在运行"的缓存清掉。否则紧跟的 `open -a` 会被当成 activate
+    // 一个不存在的实例,啥也不发生(2026-05-06 现场实测)。
+    // 跳过条件:本来就没在运行,根本不需要等。
+    if was_running {
+        std::thread::sleep(POST_QUIT_LAUNCHD_GRACE);
+    }
     open_codex_app(platform)
 }
 
@@ -4507,12 +4522,17 @@ mod tests {
 
     #[test]
     fn open_command_uses_resolved_path_when_available() {
+        // macOS 必带 `-n` 强制新实例(重启场景下 LaunchServices 缓存仍以为
+        // 旧 Codex 在运行,不加 -n 会让 `open -a` 静默 no-op)。
         assert_eq!(
             open_command("macos", Some("/Applications/Codex.app")),
-            vec!["open", "-a", "/Applications/Codex.app"]
+            vec!["open", "-n", "-a", "/Applications/Codex.app"]
         );
         // 落空时回到裸 app 名,让 LaunchServices 找
-        assert_eq!(open_command("macos", None), vec!["open", "-a", "Codex"]);
+        assert_eq!(
+            open_command("macos", None),
+            vec!["open", "-n", "-a", "Codex"]
+        );
         let windows = open_command("windows", None);
         assert_eq!(windows[0], "explorer.exe");
         assert!(windows[1].starts_with("shell:AppsFolder\\"));
