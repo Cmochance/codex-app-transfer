@@ -313,7 +313,7 @@ fn open_reasoning(&mut self, out: &mut Vec<u8>) {
 
 ---
 
-## 6. 复现方法(可重做)
+## 8. 复现方法(可重做)
 
 ```bash
 # 1. 录上游 raw SSE(替换 KEY)
@@ -350,7 +350,7 @@ print('上游 reasoning 字符:', total)
 
 ---
 
-## 7. 直接结论与建议
+## 9. 直接结论与建议
 
 ### 已确认(无需进一步验证)
 

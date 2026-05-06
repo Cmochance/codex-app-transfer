@@ -157,7 +157,14 @@ impl ChatToResponsesConverter {
             "content": self.text_acc,
         });
         if !self.reasoning_acc.is_empty() {
-            message["reasoning_content"] = Value::String(self.reasoning_acc.clone());
+            // ToolCallCache 重建走这条路把 reasoning 写回上游 messages —
+            // 上游不需要见到 v2.0.8+ open_reasoning 注入的 `**Thinking**\n\n`
+            // 人造 header(那只为 Codex CLI TUI 显示分支用),strip 后给上游。
+            let cleaned = self
+                .reasoning_acc
+                .strip_prefix(crate::responses::request::CODEX_REASONING_PREFIX)
+                .unwrap_or(self.reasoning_acc.as_str());
+            message["reasoning_content"] = Value::String(cleaned.to_owned());
         }
 
         if !self.tool_calls.is_empty() {

@@ -172,14 +172,42 @@ impl ProviderResolver for StaticResolver {
         // 把 provider.extraHeaders 转成 HeaderMap;非法名/值跳过(不阻塞请求)。
         // 支持 `{apiKey}` 模板替换,与 v1.0.3 backend/proxy.py:381 行为对齐
         // (例如 DeepSeek 同时需要 Authorization 和 x-api-key 头)。
+        // 失败的 header 写 telemetry WARN 日志(原代码静默丢,排查 401 困难)。
+        let telemetry = crate::telemetry::proxy_telemetry();
         let mut extras = HeaderMap::new();
         for (k, v) in &provider.extra_headers {
+            let template_uses_api_key = v.contains("{apiKey}");
+            if template_uses_api_key && provider.api_key.is_empty() {
+                telemetry.logs.add(
+                    "WARN",
+                    format!(
+                        "extraHeaders {k:?} 含 {{apiKey}} 模板但 provider {} api_key 为空,生成空值头",
+                        provider.id
+                    ),
+                );
+            }
             let v_substituted = v.replace("{apiKey}", &provider.api_key);
-            if let (Ok(name), Ok(val)) = (
+            match (
                 HeaderName::from_bytes(k.as_bytes()),
                 HeaderValue::from_str(&v_substituted),
             ) {
-                extras.append(name, val);
+                (Ok(name), Ok(val)) => {
+                    extras.append(name, val);
+                }
+                (Err(e), _) => telemetry.logs.add(
+                    "WARN",
+                    format!(
+                        "跳过 extraHeader provider={} {k:?}: 头名非法 ({e})",
+                        provider.id
+                    ),
+                ),
+                (_, Err(e)) => telemetry.logs.add(
+                    "WARN",
+                    format!(
+                        "跳过 extraHeader provider={} {k:?}: 头值非法 ({e}),检查 api_key 是否含换行/非 ASCII",
+                        provider.id
+                    ),
+                ),
             }
         }
 
