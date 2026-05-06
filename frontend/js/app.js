@@ -1501,22 +1501,23 @@
   }
 
   async function applyProviderToDesktop(actionEl) {
+    // 表单页"启用"按钮 = 保存表单 + 走 set-default 同一条后端链路
+    // (`switch_provider_and_sync` 写 activeProvider 并同步到 ~/.codex)。
+    // 与 dashboard 的「启用」按钮(action="set-default")在用户感知上等价,
+    // 唯一差异是这里要先把表单字段保存为 provider。**不弹 window.confirm**:
+    // Tauri webview 在某些环境会静默忽略原生 confirm,导致用户看不到任何反馈
+    // 误以为按钮失灵(2026-05-06 现场实测)。
     const form = $("#providerForm");
     if (form && !form.reportValidity()) return;
-    if (!window.confirm(t("confirm.providerApplyDesktop"))) return;
 
     actionEl.disabled = true;
     try {
       const provider = await saveProviderFromForm();
-      // setDefaultProvider 后端 = switch_provider_and_sync:写 activeProvider
-      // + 同步 desktop config(沿用「启用」按钮同一条链路,避免出现仅写
-      // config.json 但没动 ~/.codex/config.toml 的中间态)。
       const result = await CCApi.setDefaultProvider(provider.id);
       const desktopSync = result?.desktopSync || {};
       if (desktopSync.requiresProxy) {
         await CCApi.startProxy();
       }
-      // 让首页 / 提供商页 / dashboard 立刻反映新 active,跟「启用」按钮一致。
       await renderProviderCards("#dashboardProviderCards", { includePresets: true });
       await renderProviders();
       await renderDashboard();
@@ -1527,7 +1528,7 @@
       if (desktopSync.attempted && desktopSync.success === false) {
         showToast(t("toast.defaultUpdatedDesktopFailed"));
       } else {
-        showToast(t("toast.providerAppliedDesktop"));
+        showToast(t("toast.defaultUpdatedDesktop"));
       }
       showRestartReminder();
     } finally {
