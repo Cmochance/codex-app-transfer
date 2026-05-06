@@ -165,30 +165,163 @@ fn open_directory(path: &PathBuf) -> Result<(), String> {
         .map_err(|e| format!("无法打开日志目录: {e}"))
 }
 
-fn codex_app_restart_command_for_platform(platform: &str) -> Vec<String> {
+// ── Codex App 重启 ────────────────────────────────────────────────────
+//
+// 借鉴 codex-account-switch (`src-tauri/{mac,win}/runtime/process.rs`):旧版用
+// `osascript ... quit; sleep 0.5; open -a Codex` 的 sh 一行式管道,gentle
+// quit 在 Codex 卡住 / 多窗口未保存时会被忽略,sleep 0.5 也太短;表面上
+// spawn 成功代码视为 OK,实则 app 没动.改成三步:
+// 1. pgrep / tasklist 探活
+// 2. SIGTERM / taskkill 普通退出 + 最长 4s 轮询
+// 3. 仍存活 → SIGKILL / taskkill /F + 最长 2s 轮询
+// 4. 解析 .app 路径(macOS:/Applications + ~/Applications)再 open;
+//    Windows 直接 explorer.exe shell:AppsFolder\<APP_ID>.
+
+const MACOS_APP_NAME: &str = "Codex";
+const WINDOWS_PROCESS_NAME: &str = "Codex.exe";
+/// OpenAI 官方 Windows Store 包 ID,与 codex-account-switch 保持一致;
+/// 用户若装的是非 Store 版本,resolve 失败时 explorer.exe 会报错,前端会
+/// 看到 INTERNAL_SERVER_ERROR,比静默假成功好。
+const WINDOWS_STORE_APP_ID: &str = "OpenAI.Codex_2p2nqsd0c76g0!App";
+const LINUX_BIN_NAME: &str = "codex";
+
+const QUIT_TERM_POLL_ITERS: u32 = 20; // 20 × 200ms = 4s
+const QUIT_KILL_POLL_ITERS: u32 = 10; // 10 × 200ms = 2s
+const QUIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 平台检测命令(可纯函数测试).返回 (program, args).第一个元素总是命令名。
+fn running_check_command(platform: &str) -> Vec<String> {
+    match platform {
+        "macos" => vec!["pgrep".into(), "-x".into(), MACOS_APP_NAME.into()],
+        "windows" => vec![
+            "tasklist".into(),
+            "/FI".into(),
+            format!("IMAGENAME eq {WINDOWS_PROCESS_NAME}"),
+            "/FO".into(),
+            "CSV".into(),
+            "/NH".into(),
+        ],
+        _ => vec!["pgrep".into(), "-x".into(), LINUX_BIN_NAME.into()],
+    }
+}
+
+/// 退出命令(`force=false` 普通退出, `force=true` 强杀).
+fn quit_command(platform: &str, force: bool) -> Vec<String> {
+    match (platform, force) {
+        ("macos", false) => vec!["pkill".into(), "-TERM".into(), "-x".into(), MACOS_APP_NAME.into()],
+        ("macos", true) => vec!["pkill".into(), "-KILL".into(), "-x".into(), MACOS_APP_NAME.into()],
+        ("windows", false) => vec!["taskkill".into(), "/IM".into(), WINDOWS_PROCESS_NAME.into()],
+        ("windows", true) => vec![
+            "taskkill".into(),
+            "/F".into(),
+            "/IM".into(),
+            WINDOWS_PROCESS_NAME.into(),
+        ],
+        (_, false) => vec!["pkill".into(), "-TERM".into(), "-x".into(), LINUX_BIN_NAME.into()],
+        (_, true) => vec!["pkill".into(), "-KILL".into(), "-x".into(), LINUX_BIN_NAME.into()],
+    }
+}
+
+/// 启动命令.macOS 优先用解析后的 .app 路径,fallback 到 `open -a Codex`
+/// 让 LaunchServices 自己找。
+fn open_command(platform: &str, resolved_macos_app: Option<&str>) -> Vec<String> {
     match platform {
         "macos" => vec![
-            "sh".to_owned(),
-            "-c".to_owned(),
-            "osascript -e 'if application \"Codex\" is running then tell application \"Codex\" to quit'; sleep 0.5; open -a Codex".to_owned(),
+            "open".into(),
+            "-a".into(),
+            resolved_macos_app.unwrap_or(MACOS_APP_NAME).into(),
         ],
         "windows" => vec![
-            "cmd".to_owned(),
-            "/C".to_owned(),
-            "taskkill /IM Codex.exe /F >NUL 2>NUL & timeout /T 1 /NOBREAK >NUL & start \"\" Codex".to_owned(),
+            "explorer.exe".into(),
+            format!("shell:AppsFolder\\{WINDOWS_STORE_APP_ID}"),
         ],
         _ => vec![
-            "sh".to_owned(),
-            "-c".to_owned(),
-            "pkill -x codex >/dev/null 2>&1 || true; sleep 0.5; codex >/dev/null 2>&1 &".to_owned(),
+            "sh".into(),
+            "-c".into(),
+            format!("{LINUX_BIN_NAME} >/dev/null 2>&1 &"),
         ],
     }
 }
 
-fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
-    let command = codex_app_restart_command_for_platform(platform);
-    let Some((program, args)) = command.split_first() else {
-        return Err("重启命令为空".to_owned());
+fn resolve_macos_app_path() -> Option<String> {
+    let mut candidates = vec![PathBuf::from("/Applications/Codex.app")];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join("Applications").join("Codex.app"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+fn is_codex_app_running(platform: &str) -> bool {
+    let cmd = running_check_command(platform);
+    let Some((program, args)) = cmd.split_first() else {
+        return false;
+    };
+    if platform == "windows" {
+        // tasklist 即使没匹配也 exit 0,要看 stdout 里有没有 process 名
+        match Command::new(program).args(args).output() {
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .to_ascii_lowercase()
+                .contains(&WINDOWS_PROCESS_NAME.to_ascii_lowercase()),
+            Err(_) => false,
+        }
+    } else {
+        // pgrep:有进程 exit 0,没进程 exit 1
+        Command::new(program)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+fn run_quit_command(platform: &str, force: bool) {
+    let cmd = quit_command(platform, force);
+    let Some((program, args)) = cmd.split_first() else {
+        return;
+    };
+    let _ = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn quit_codex_app_with_retries(platform: &str) -> Result<(), String> {
+    if !is_codex_app_running(platform) {
+        return Ok(());
+    }
+    run_quit_command(platform, false);
+    for _ in 0..QUIT_TERM_POLL_ITERS {
+        if !is_codex_app_running(platform) {
+            return Ok(());
+        }
+        std::thread::sleep(QUIT_POLL_INTERVAL);
+    }
+    run_quit_command(platform, true);
+    for _ in 0..QUIT_KILL_POLL_ITERS {
+        if !is_codex_app_running(platform) {
+            return Ok(());
+        }
+        std::thread::sleep(QUIT_POLL_INTERVAL);
+    }
+    Err("Codex 未能正常退出,请手动关闭后重试".to_owned())
+}
+
+fn open_codex_app(platform: &str) -> Result<(), String> {
+    let resolved = if platform == "macos" {
+        resolve_macos_app_path()
+    } else {
+        None
+    };
+    let cmd = open_command(platform, resolved.as_deref());
+    let Some((program, args)) = cmd.split_first() else {
+        return Err("打开命令为空".to_owned());
     };
     Command::new(program)
         .args(args)
@@ -197,7 +330,12 @@ fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("无法重启 Codex App: {e}"))
+        .map_err(|e| format!("无法启动 Codex App: {e}"))
+}
+
+fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
+    quit_codex_app_with_retries(platform)?;
+    open_codex_app(platform)
 }
 
 fn multipart_text_part(text: String, mime: &str) -> multipart::Part {
@@ -4310,20 +4448,67 @@ mod tests {
     }
 
     #[test]
-    fn codex_app_restart_commands_are_platform_specific() {
-        let macos = codex_app_restart_command_for_platform("macos");
-        assert_eq!(macos[0], "sh");
-        assert!(macos[2].contains("application \"Codex\""));
-        assert!(macos[2].contains("open -a Codex"));
+    fn running_check_command_is_platform_specific() {
+        assert_eq!(
+            running_check_command("macos"),
+            vec!["pgrep", "-x", "Codex"]
+        );
+        let windows = running_check_command("windows");
+        assert_eq!(windows[0], "tasklist");
+        assert!(windows.iter().any(|a| a == "IMAGENAME eq Codex.exe"));
+        assert_eq!(
+            running_check_command("linux"),
+            vec!["pgrep", "-x", "codex"]
+        );
+    }
 
-        let windows = codex_app_restart_command_for_platform("windows");
-        assert_eq!(windows[0], "cmd");
-        assert!(windows[2].contains("taskkill /IM Codex.exe /F"));
-        assert!(windows[2].contains("start \"\" Codex"));
+    #[test]
+    fn quit_command_uses_term_then_kill() {
+        // graceful = SIGTERM / 普通 taskkill;force = SIGKILL / taskkill /F
+        assert_eq!(
+            quit_command("macos", false),
+            vec!["pkill", "-TERM", "-x", "Codex"]
+        );
+        assert_eq!(
+            quit_command("macos", true),
+            vec!["pkill", "-KILL", "-x", "Codex"]
+        );
+        assert_eq!(
+            quit_command("windows", false),
+            vec!["taskkill", "/IM", "Codex.exe"]
+        );
+        assert_eq!(
+            quit_command("windows", true),
+            vec!["taskkill", "/F", "/IM", "Codex.exe"]
+        );
+        assert_eq!(
+            quit_command("linux", false),
+            vec!["pkill", "-TERM", "-x", "codex"]
+        );
+        assert_eq!(
+            quit_command("linux", true),
+            vec!["pkill", "-KILL", "-x", "codex"]
+        );
+    }
 
-        let linux = codex_app_restart_command_for_platform("linux");
+    #[test]
+    fn open_command_uses_resolved_path_when_available() {
+        assert_eq!(
+            open_command("macos", Some("/Applications/Codex.app")),
+            vec!["open", "-a", "/Applications/Codex.app"]
+        );
+        // 落空时回到裸 app 名,让 LaunchServices 找
+        assert_eq!(
+            open_command("macos", None),
+            vec!["open", "-a", "Codex"]
+        );
+        let windows = open_command("windows", None);
+        assert_eq!(windows[0], "explorer.exe");
+        assert!(windows[1].starts_with("shell:AppsFolder\\"));
+        assert!(windows[1].contains("OpenAI.Codex"));
+        let linux = open_command("linux", None);
         assert_eq!(linux[0], "sh");
-        assert!(linux[2].contains("pkill -x codex"));
+        assert_eq!(linux[1], "-c");
         assert!(linux[2].contains("codex"));
     }
 
