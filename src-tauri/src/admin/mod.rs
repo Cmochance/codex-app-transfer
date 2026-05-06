@@ -81,6 +81,10 @@ pub fn build_app_router(state: AdminState) -> Router {
         .route("/api/desktop/configure", post(handlers::desktop_configure))
         .route("/api/desktop/clear", post(handlers::desktop_clear))
         .route(
+            "/api/desktop/restart-codex-app",
+            post(handlers::restart_codex_app),
+        )
+        .route(
             "/api/desktop/snapshot-status",
             get(handlers::desktop_snapshot_status),
         )

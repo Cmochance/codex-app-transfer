@@ -3265,16 +3265,21 @@ body {
 }
 
 .restart-modal-footer {
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
 }
 
-.restart-reminder-check {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 14px;
+.restart-modal-later {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: #fff;
+}
+
+.restart-modal-now {
+  color: #fff;
+  background: var(--primary);
+  border-color: var(--primary);
+  min-width: 112px;
 }
 
 .backup-list {

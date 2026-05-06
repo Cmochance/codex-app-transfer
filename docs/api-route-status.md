@@ -1,7 +1,7 @@
 # API route status
 
 > Last audited: 2026-05-06
-> Code baseline: `src-tauri/Cargo.toml` version `2.0.1`
+> Code baseline: `src-tauri/Cargo.toml` version `2.0.3`
 > Primary sources: `src-tauri/src/admin/mod.rs`, `src-tauri/src/admin/handlers.rs`, `frontend/js/api.js`, `crates/proxy/src/server.rs`, `crates/proxy/src/forward.rs`, `crates/adapters/src/*`
 
 This document is the current route contract index for the Rust/Tauri mainline. It exists to avoid the old v2.0.0 launch problem where frontend entries still existed while some backend routes returned fake success.
@@ -44,8 +44,9 @@ The management UI runs inside Tauri through the custom `cas://` URI scheme. It n
 | `/api/desktop/status` | GET | Implemented | Yes | Reads current Codex config state and active provider model catalog. |
 | `/api/desktop/configure` | POST | Conditional | Yes | Applies active provider to `~/.codex/{config.toml,auth.json}` and writes snapshot data. |
 | `/api/desktop/clear` | POST | Conditional | Yes | Restores Codex config from snapshot when present. |
+| `/api/desktop/restart-codex-app` | POST | Conditional | Yes | Requests a platform best-effort restart of the external Codex App after provider/model sync. |
 | `/api/desktop/snapshot-status` | GET | Implemented | Yes | Reports whether this app has a Codex snapshot. |
-| `/api/version` | GET | Implemented | No | Returns `{ "version": APP_VERSION }` for legacy and script compatibility. |
+| `/api/version` | GET | Implemented | Yes | Returns `{ "version": APP_VERSION }`; Settings/About reads this instead of hard-coding a version string. |
 | `/api/proxy/start` | POST | Conditional | Yes | Starts local forwarding proxy on configured or requested port. Port binding can fail if unavailable. |
 | `/api/proxy/stop` | POST | Implemented | Yes | Stops local forwarding proxy. |
 | `/api/proxy/status` | GET | Implemented | Yes | Returns running state, port, and real proxy telemetry counters. |

@@ -274,6 +274,10 @@
       return api('GET', '/api/settings');
     },
 
+    async getVersion() {
+      return api('GET', '/api/version');
+    },
+
     async saveSettings(settings) {
       const data = await api('PUT', '/api/settings', settings);
       return data.settings || data;
@@ -308,6 +312,10 @@
 
     async getDesktopSnapshotStatus() {
       return api('GET', '/api/desktop/snapshot-status');
+    },
+
+    async restartCodexApp() {
+      return api('POST', '/api/desktop/restart-codex-app');
     },
 
     async submitFeedback(payload) {

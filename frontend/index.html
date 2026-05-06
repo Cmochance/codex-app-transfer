@@ -370,7 +370,7 @@
 
         <article class="panel about-panel">
           <h2 data-i18n="settings.about">关于</h2>
-          <div class="about-row"><span data-i18n="settings.version">版本</span><strong>1.0.0</strong></div>
+          <div class="about-row"><span data-i18n="settings.version">版本</span><strong id="appVersion">...</strong></div>
           <div class="about-row"><span data-i18n="settings.license">许可证</span><strong>MIT License</strong></div>
           <div class="about-row"><span data-i18n="settings.checkUpdate">检查更新</span><span class="settings-actions inline-actions"><button class="btn btn-outline-primary btn-sm" type="button" data-action="check-update"><i class="bi bi-cloud-arrow-down"></i><span data-i18n="settings.checkUpdate">检查更新</span></button><button class="btn btn-primary btn-sm" id="settingsInstallUpdate" type="button" data-action="install-update" hidden><i class="bi bi-download"></i><span data-i18n="settings.installUpdate">下载并安装</span></button></span></div>
           <p class="update-status" id="updateStatus"></p>
@@ -516,14 +516,14 @@
       <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content restart-modal-content">
           <div class="modal-header">
-            <h5 class="modal-title" data-i18n="restartReminder.title">请重启 Codex CLI 终端</h5>
+            <h5 class="modal-title" data-i18n="restartReminder.title">是否立即重启 Codex App？</h5>
           </div>
           <div class="modal-body">
-            <p data-i18n="restartReminder.body">已切换供应商并同步模型列表。请关闭并重新打开终端，否则可能还在使用旧模型。</p>
+            <p data-i18n="restartReminder.body">已切换供应商并同步模型列表，需要重启 Codex App 才能生效。</p>
           </div>
           <div class="modal-footer restart-modal-footer">
-            <label class="restart-reminder-check"><input type="checkbox" id="restartReminderDontShow"><span data-i18n="restartReminder.dontShow">不再提醒</span></label>
-            <button type="button" class="btn btn-primary" id="restartReminderAck" data-i18n="restartReminder.ack">我已知晓</button>
+            <button type="button" class="btn btn-outline-primary restart-modal-later" id="restartReminderLater" data-i18n="restartReminder.later">取消，稍后重启</button>
+            <button type="button" class="btn btn-primary restart-modal-now" id="restartReminderNow" data-i18n="restartReminder.now">立即重启</button>
           </div>
         </div>
       </div>

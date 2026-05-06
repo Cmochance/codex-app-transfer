@@ -1,6 +1,5 @@
 (function () {
   const routes = ["dashboard", "providers/add", "providers", "desktop", "proxy", "settings", "guide"];
-  const restartReminderStorageKey = "cas.restartReminder.dismissed";
   const providerFormModelSlots = [
     { key: "default", label: "Default", icon: "bi-circle-fill", iconClass: "default", source: "未配置映射时默认使用这一项", required: true },
     { key: "gpt_5_5", label: "gpt-5.5", icon: "bi-circle", iconClass: "default", source: "gpt-5.5" },
@@ -49,31 +48,34 @@
     toast.show();
   }
 
-  function restartReminderDismissed() {
-    try {
-      return localStorage.getItem(restartReminderStorageKey) === "1";
-    } catch (error) {
-      return false;
-    }
-  }
-
   function showRestartReminder() {
-    if (restartReminderDismissed()) return;
-    const checkbox = $("#restartReminderDontShow");
-    if (checkbox) checkbox.checked = false;
     restartReminderModal?.show();
   }
 
-  function dismissRestartReminder() {
-    const checkbox = $("#restartReminderDontShow");
-    if (checkbox?.checked) {
-      try {
-        localStorage.setItem(restartReminderStorageKey, "1");
-      } catch (error) {
-        console.warn(error);
+  function dismissRestartReminderLater() {
+    restartReminderModal?.hide();
+  }
+
+  async function restartCodexAppNow() {
+    const button = $("#restartReminderNow");
+    const original = button?.textContent;
+    try {
+      if (button) {
+        button.disabled = true;
+        button.textContent = t("restartReminder.restarting");
+      }
+      await CCApi.restartCodexApp();
+      restartReminderModal?.hide();
+      showToast(t("toast.codexAppRestartRequested"));
+    } catch (error) {
+      console.error(error);
+      showToast(error.message || t("toast.codexAppRestartFailed"));
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = original || t("restartReminder.now");
       }
     }
-    restartReminderModal?.hide();
   }
 
   function t(key) {
@@ -1308,8 +1310,22 @@
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
     renderModelMenuModeState(settings);
+    await refreshAppVersion();
     await refreshBackupList();
     await refreshCodexSnapshotStatus();
+  }
+
+  async function refreshAppVersion() {
+    const target = $("#appVersion");
+    if (!target) return;
+    try {
+      const payload = await CCApi.getVersion();
+      if (payload && payload.version) {
+        target.textContent = payload.version;
+      }
+    } catch (error) {
+      console.warn("Failed to load app version", error);
+    }
   }
 
   async function refreshCodexSnapshotStatus() {
@@ -2212,7 +2228,8 @@
     $("#configImportFile")?.addEventListener("change", (event) => {
       importConfigFile(event.target.files?.[0]);
     });
-    $("#restartReminderAck")?.addEventListener("click", dismissRestartReminder);
+    $("#restartReminderLater")?.addEventListener("click", dismissRestartReminderLater);
+    $("#restartReminderNow")?.addEventListener("click", restartCodexAppNow);
 
     $("#confirmDelete").addEventListener("click", async () => {
       if (!pendingDeleteId) return;

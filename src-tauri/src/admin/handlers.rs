@@ -165,6 +165,41 @@ fn open_directory(path: &PathBuf) -> Result<(), String> {
         .map_err(|e| format!("无法打开日志目录: {e}"))
 }
 
+fn codex_app_restart_command_for_platform(platform: &str) -> Vec<String> {
+    match platform {
+        "macos" => vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "osascript -e 'if application \"Codex\" is running then tell application \"Codex\" to quit'; sleep 0.5; open -a Codex".to_owned(),
+        ],
+        "windows" => vec![
+            "cmd".to_owned(),
+            "/C".to_owned(),
+            "taskkill /IM Codex.exe /F >NUL 2>NUL & timeout /T 1 /NOBREAK >NUL & start \"\" Codex".to_owned(),
+        ],
+        _ => vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "pkill -x codex >/dev/null 2>&1 || true; sleep 0.5; codex >/dev/null 2>&1 &".to_owned(),
+        ],
+    }
+}
+
+fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
+    let command = codex_app_restart_command_for_platform(platform);
+    let Some((program, args)) = command.split_first() else {
+        return Err("重启命令为空".to_owned());
+    };
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法重启 Codex App: {e}"))
+}
+
 fn multipart_text_part(text: String, mime: &str) -> multipart::Part {
     multipart::Part::text(text.clone())
         .mime_str(mime)
@@ -3059,6 +3094,13 @@ pub async fn desktop_snapshot_status() -> impl IntoResponse {
     .into_response()
 }
 
+pub async fn restart_codex_app() -> impl IntoResponse {
+    match launch_codex_app_restart(std::env::consts::OS) {
+        Ok(_) => Json(json!({"success": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 // ── /api/version ─────────────────────────────────────────────────────
 
 pub async fn version() -> Json<Value> {
@@ -4265,6 +4307,24 @@ mod tests {
             let Json(payload) = version().await;
             assert_eq!(payload, json!({"version": APP_VERSION}));
         });
+    }
+
+    #[test]
+    fn codex_app_restart_commands_are_platform_specific() {
+        let macos = codex_app_restart_command_for_platform("macos");
+        assert_eq!(macos[0], "sh");
+        assert!(macos[2].contains("application \"Codex\""));
+        assert!(macos[2].contains("open -a Codex"));
+
+        let windows = codex_app_restart_command_for_platform("windows");
+        assert_eq!(windows[0], "cmd");
+        assert!(windows[2].contains("taskkill /IM Codex.exe /F"));
+        assert!(windows[2].contains("start \"\" Codex"));
+
+        let linux = codex_app_restart_command_for_platform("linux");
+        assert_eq!(linux[0], "sh");
+        assert!(linux[2].contains("pkill -x codex"));
+        assert!(linux[2].contains("codex"));
     }
 
     #[test]
