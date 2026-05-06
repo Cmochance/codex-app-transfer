@@ -94,6 +94,7 @@ async fn collect_events(mut s: ByteStream) -> Vec<(String, Value)> {
 
 const KIMI_REASONING_LIFECYCLE: &[&str] = &[
     "response.created",
+    "response.in_progress", // OpenAI Responses 协议要求 created 后立即跟 in_progress
     "response.output_item.added", // reasoning lazy open
     "response.reasoning_summary_part.added",
     "response.reasoning_summary_text.delta",

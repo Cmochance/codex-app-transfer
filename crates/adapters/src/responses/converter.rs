@@ -218,6 +218,31 @@ impl ChatToResponsesConverter {
         out
     }
 
+    /// emit `response.created` 紧跟 `response.in_progress`(同一个 response
+    /// 信封)。OpenAI Responses 协议要求 `response.created` 后立即跟一个
+    /// `response.in_progress`,严格客户端(litellm 自身、Anthropic 工具链)
+    /// 不发就会卡住;Codex CLI 0.x/1.x 实测能容忍但不应当依赖这条容忍。
+    /// 与 Python pre-refactor `streaming_adapter.py:266-281`、litellm
+    /// `streaming_iterator.py:434-444` 行为一致。
+    fn emit_lifecycle_open(&self, out: &mut Vec<u8>) {
+        let envelope = json!({
+            "id": self.response_id,
+            "object": "response",
+            "status": "in_progress",
+            "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
+        });
+        emit_event(
+            out,
+            "response.created",
+            json!({"type": "response.created", "response": envelope.clone()}),
+        );
+        emit_event(
+            out,
+            "response.in_progress",
+            json!({"type": "response.in_progress", "response": envelope}),
+        );
+    }
+
     fn handle_frame(&mut self, frame: &[u8], out: &mut Vec<u8>) {
         let payload = match parse_sse_data_payload(frame) {
             Some(p) => p,
@@ -232,26 +257,14 @@ impl ChatToResponsesConverter {
             Err(_) => return,
         };
 
-        // 确保 response.created 只 emit 一次,且在任何 item open 之前
+        // 确保 response.created / in_progress 只 emit 一次,且在任何 item open 之前
         if matches!(self.state, State::Idle) {
             self.state = State::Streaming;
             // model 名优先取本帧;首帧没有再用 unknown 占位
             if let Some(m) = chunk.model.as_deref() {
                 self.model = m.to_owned();
             }
-            emit_event(
-                out,
-                "response.created",
-                json!({
-                    "type": "response.created",
-                    "response": {
-                        "id": self.response_id,
-                        "object": "response",
-                        "status": "in_progress",
-                        "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
-                    },
-                }),
-            );
+            self.emit_lifecycle_open(out);
         } else if self.model.is_empty() {
             if let Some(m) = chunk.model.as_deref() {
                 self.model = m.to_owned();
@@ -654,22 +667,11 @@ impl ChatToResponsesConverter {
 
     fn emit_close(&mut self, out: &mut Vec<u8>, from_done: bool) {
         // 如果到 [DONE] 还没 emit 过 created(纯 [DONE] 输入 / 全是坏 JSON),
-        // 仍要补 emit 一次,保证客户端拿到完整生命周期。
+        // 仍要补 emit 一次,保证客户端拿到完整生命周期(response.created +
+        // response.in_progress 一起发)。
         if matches!(self.state, State::Idle) {
             self.state = State::Streaming;
-            emit_event(
-                out,
-                "response.created",
-                json!({
-                    "type": "response.created",
-                    "response": {
-                        "id": self.response_id,
-                        "object": "response",
-                        "status": "in_progress",
-                        "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
-                    },
-                }),
-            );
+            self.emit_lifecycle_open(out);
         }
         if self.reasoning_open && !self.reasoning_closed {
             self.close_reasoning(out);
@@ -962,7 +964,64 @@ mod tests {
     // ── Stage 3.2c 行为回归(content-only)── ─────────────────────────
 
     #[test]
-    fn first_chunk_emits_only_response_created_when_content_is_empty() {
+    fn lifecycle_open_emits_created_and_in_progress_back_to_back() {
+        // OpenAI Responses 协议要求 response.created 后立即跟 response.in_progress;
+        // 严格客户端(litellm 自身、Anthropic 工具链)缺这条会卡住。
+        // 同 envelope(同 id / status / model)保证语义一致。
+        let mut c = fixed();
+        let out = c.feed(
+            br#"data: {"model":"mock","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+"#,
+        );
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec!["response.created", "response.in_progress"],
+            "首个 chunk 必须先 emit lifecycle open(created + in_progress)"
+        );
+        // 同一个 envelope:id / status / model 全一致
+        assert_eq!(events[0].1["response"]["id"], events[1].1["response"]["id"]);
+        assert_eq!(
+            events[0].1["response"]["status"],
+            events[1].1["response"]["status"]
+        );
+        assert_eq!(events[0].1["response"]["status"], "in_progress");
+        assert_eq!(events[0].1["response"]["model"], "mock");
+        assert_eq!(events[1].1["response"]["model"], "mock");
+    }
+
+    #[test]
+    fn lifecycle_open_emits_once_even_across_many_chunks() {
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n");
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        // 整流里 response.created / in_progress 各只能出现 1 次
+        let count = |needle: &str, body: &[u8]| {
+            String::from_utf8_lossy(body)
+                .lines()
+                .filter(|l| l.starts_with(&format!("event: {needle}")))
+                .count()
+        };
+        // 用 finish 的 out 检验全流(包含前两块)就麻烦,直接做端到端字符串拼接:
+        let mut all = Vec::new();
+        let mut c2 = fixed();
+        all.extend(
+            c2.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n"),
+        );
+        all.extend(
+            c2.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\n"),
+        );
+        all.extend(c2.feed(b"data: [DONE]\n\n"));
+        assert_eq!(count("response.created", &all), 1);
+        assert_eq!(count("response.in_progress", &all), 1);
+        // 顺便 sanity 一下原 c 也走完了
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn first_chunk_emits_only_lifecycle_open_when_content_is_empty() {
         let mut c = fixed();
         let out = c.feed(
             br#"data: {"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
@@ -972,8 +1031,8 @@ mod tests {
         let events = parse_emitted(&out);
         assert_eq!(
             names(&events),
-            vec!["response.created"],
-            "无实际内容时只 emit response.created,message 懒开"
+            vec!["response.created", "response.in_progress"],
+            "无实际内容时只 emit lifecycle open(created + in_progress),message 懒开"
         );
     }
 
@@ -990,14 +1049,15 @@ mod tests {
             names(&events),
             vec![
                 "response.created",
+                "response.in_progress",
                 "response.output_item.added",
                 "response.content_part.added",
                 "response.output_text.delta",
             ],
             "首个非空 content 应同时懒开 message item"
         );
-        assert_eq!(events[3].1["delta"], "Hi");
-        assert_eq!(events[1].1["output_index"], 0);
+        assert_eq!(events[4].1["delta"], "Hi");
+        assert_eq!(events[2].1["output_index"], 0);
     }
 
     #[test]
@@ -1078,16 +1138,17 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
             names(&ev1),
             vec![
                 "response.created",
+                "response.in_progress",
                 "response.output_item.added", // reasoning open
                 "response.reasoning_summary_part.added",
                 "response.reasoning_summary_text.delta",
             ]
         );
-        assert_eq!(ev1[1].1["item"]["type"], "reasoning");
-        assert_eq!(ev1[1].1["output_index"], 0);
-        assert_eq!(ev1[1].1["item"]["summary"], json!([]));
-        assert_eq!(ev1[1].1["item"]["content"], Value::Null);
-        assert_eq!(ev1[1].1["item"]["encrypted_content"], Value::Null);
+        assert_eq!(ev1[2].1["item"]["type"], "reasoning");
+        assert_eq!(ev1[2].1["output_index"], 0);
+        assert_eq!(ev1[2].1["item"]["summary"], json!([]));
+        assert_eq!(ev1[2].1["item"]["content"], Value::Null);
+        assert_eq!(ev1[2].1["item"]["encrypted_content"], Value::Null);
 
         // 第 2 chunk:content 出现,先关 reasoning 再开 message
         let out2 = c.feed(
@@ -1181,12 +1242,13 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             names(&events),
             vec![
                 "response.created",
+                "response.in_progress",
                 "response.output_item.added",
                 "response.content_part.added",
                 "response.output_text.delta",
             ]
         );
-        assert_eq!(events[3].1["delta"], "part1");
+        assert_eq!(events[4].1["delta"], "part1");
     }
 
     #[test]
@@ -1296,15 +1358,16 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
             names(&events),
             vec![
                 "response.created",
+                "response.in_progress",
                 "response.output_item.added",
                 "response.function_call_arguments.delta",
             ],
-            "首帧:created + tool_call open + 第一段 args delta"
+            "首帧:lifecycle open + tool_call open + 第一段 args delta"
         );
-        assert_eq!(events[1].1["item"]["type"], "function_call");
-        assert_eq!(events[1].1["item"]["call_id"], "call_a");
-        assert_eq!(events[1].1["item"]["name"], "f");
-        assert_eq!(events[2].1["delta"], "{}");
+        assert_eq!(events[2].1["item"]["type"], "function_call");
+        assert_eq!(events[2].1["item"]["call_id"], "call_a");
+        assert_eq!(events[2].1["item"]["name"], "f");
+        assert_eq!(events[3].1["delta"], "{}");
     }
 
     #[test]
@@ -1423,12 +1486,16 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
         let first_events = parse_emitted(&first);
         assert_eq!(
             names(&first_events),
-            vec!["response.created", "response.output_item.added"]
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+            ]
         );
-        assert_eq!(first_events[1].1["item"]["type"], "function_call");
-        assert_eq!(first_events[1].1["item"]["id"], "fc_x_0");
-        assert_eq!(first_events[1].1["item"]["call_id"], "call_x_0");
-        assert_eq!(first_events[1].1["item"]["name"], "legacy_tool");
+        assert_eq!(first_events[2].1["item"]["type"], "function_call");
+        assert_eq!(first_events[2].1["item"]["id"], "fc_x_0");
+        assert_eq!(first_events[2].1["item"]["call_id"], "call_x_0");
+        assert_eq!(first_events[2].1["item"]["name"], "legacy_tool");
 
         let _ = c.feed(
             br#"data: {"choices":[{"index":0,"delta":{"function_call":{"arguments":"{\"a\""}}}]}
