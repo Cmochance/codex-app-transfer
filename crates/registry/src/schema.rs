@@ -13,6 +13,17 @@ pub const DEFAULT_LANGUAGE: &str = "zh";
 pub const DEFAULT_PROXY_PORT: u16 = 18080;
 pub const DEFAULT_ADMIN_PORT: u16 = 18081;
 
+/// Provider 缺省 `authScheme`：旧版 / 手编 config 不写时按主流 OpenAI 兼容
+/// 上游回退为 `bearer`，避免反序列化失败。
+fn default_auth_scheme() -> String {
+    "bearer".to_owned()
+}
+
+/// Provider 缺省 `apiFormat`：与现存 5 家用户 + 7 家内置预设保持一致。
+fn default_api_format() -> String {
+    "openai_chat".to_owned()
+}
+
 /// 顶层配置文件结构(对应 `~/.codex-app-transfer/config.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -76,10 +87,13 @@ pub struct Provider {
     pub id: String,
     pub name: String,
     pub base_url: String,
+    #[serde(default = "default_auth_scheme")]
     pub auth_scheme: String,
+    #[serde(default = "default_api_format")]
     pub api_format: String,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
     pub models: ModelMappings,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
@@ -123,5 +137,38 @@ impl ModelSlotKey {
             ModelSlotKey::Gpt53Codex => "gpt_5_3_codex",
             ModelSlotKey::Gpt52 => "gpt_5_2",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_tolerates_missing_auth_scheme_and_api_format() {
+        let json = r#"{
+            "id": "mock-provider",
+            "name": "Mock",
+            "baseUrl": "http://127.0.0.1:29090",
+            "apiKey": "mock-key",
+            "models": { "default": "mock-model" },
+            "sortIndex": 0
+        }"#;
+        let p: Provider = serde_json::from_str(json).expect("旧版 / 手编 config 应能加载");
+        assert_eq!(p.auth_scheme, "bearer");
+        assert_eq!(p.api_format, "openai_chat");
+    }
+
+    #[test]
+    fn provider_tolerates_missing_models() {
+        let json = r#"{
+            "id": "p",
+            "name": "P",
+            "baseUrl": "http://x",
+            "authScheme": "bearer",
+            "apiFormat": "openai_chat"
+        }"#;
+        let p: Provider = serde_json::from_str(json).unwrap();
+        assert!(p.models.is_empty());
     }
 }

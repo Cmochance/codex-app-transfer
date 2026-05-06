@@ -719,9 +719,11 @@ impl ChatToResponsesConverter {
                 "incomplete_details": incomplete_details,
             },
         });
-        if let Some(usage) = self.usage.clone() {
-            completed["response"]["usage"] = usage;
-        }
+        // Codex CLI 反序列化 `ResponseCompleted` 时 usage 中的 `input_tokens` /
+        // `output_tokens` / `total_tokens` 是必填,缺一帧就整流断开重连。Chat
+        // 上游的 `prompt_tokens` / `completion_tokens` 与 Responses 的字段名
+        // 不同,部分 provider 也可能完全不发 usage,这里统一规范化。
+        completed["response"]["usage"] = normalize_usage_to_responses_shape(self.usage.clone());
         emit_event(out, "response.completed", completed);
         self.state = State::Done;
     }
@@ -731,6 +733,73 @@ impl Default for ChatToResponsesConverter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 把 Chat Completions 风格的 `usage`(prompt_tokens / completion_tokens /
+/// total_tokens / *_tokens_details)统一翻译为 Responses 风格(input_tokens /
+/// output_tokens / total_tokens / input_tokens_details / output_tokens_details)。
+///
+/// - 已经是 Responses 形态(含 `input_tokens` 键)时原值兜底返回,只补 total。
+/// - 上游完全没发 usage 时返回三零结构,避免 Codex CLI 因
+///   "missing field input_tokens" 报错断流(2026-05-06)。
+/// - 与 litellm 的 `_transform_chat_completion_usage_to_responses_usage`
+///   (docs/litellm/.../litellm_completion_transformation/transformation.py)
+///   语义一致,仅做静态字段重命名,不引入业务行为差异。
+fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
+    let zero = json!({
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    });
+    let Some(value) = usage else {
+        return zero;
+    };
+    let Value::Object(map) = value else {
+        return zero;
+    };
+
+    let already_responses = map.contains_key("input_tokens") || map.contains_key("output_tokens");
+    let mut out = serde_json::Map::new();
+
+    let input_tokens = if already_responses {
+        map.get("input_tokens").cloned().unwrap_or_else(|| json!(0))
+    } else {
+        map.get("prompt_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(0))
+    };
+    let output_tokens = if already_responses {
+        map.get("output_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(0))
+    } else {
+        map.get("completion_tokens")
+            .cloned()
+            .unwrap_or_else(|| json!(0))
+    };
+    let total_tokens = map.get("total_tokens").cloned().unwrap_or_else(|| {
+        let i = input_tokens.as_u64().unwrap_or(0);
+        let o = output_tokens.as_u64().unwrap_or(0);
+        json!(i + o)
+    });
+
+    out.insert("input_tokens".into(), input_tokens);
+    out.insert("output_tokens".into(), output_tokens);
+    out.insert("total_tokens".into(), total_tokens);
+
+    // *_tokens_details 子对象重命名;已经是 Responses 形态就原样保留。
+    if let Some(details) = map.get("input_tokens_details").cloned() {
+        out.insert("input_tokens_details".into(), details);
+    } else if let Some(details) = map.get("prompt_tokens_details").cloned() {
+        out.insert("input_tokens_details".into(), details);
+    }
+    if let Some(details) = map.get("output_tokens_details").cloned() {
+        out.insert("output_tokens_details".into(), details);
+    } else if let Some(details) = map.get("completion_tokens_details").cloned() {
+        out.insert("output_tokens_details".into(), details);
+    }
+
+    Value::Object(out)
 }
 
 fn emit_event(out: &mut Vec<u8>, event_name: &str, payload: Value) {
@@ -770,7 +839,10 @@ fn parse_sse_data_payload(frame: &[u8]) -> Option<String> {
 struct ChatChunk {
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
+    /// `choices: null` 与 `tool_calls: null` 同源 —— 部分上游(MiMo /
+    /// 一些聚合层)在某些 chunk 里把 choices 写成 null;直接 Vec 解析失败
+    /// 会丢整帧。同样套 Option 兜底。
+    #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<Value>,
@@ -798,13 +870,26 @@ struct ChatDelta {
     reasoning_content: Option<String>,
     /// OpenAI / DeepSeek / Kimi 工具调用增量;同一 `index` 的多 chunk 累计
     /// 成完整的 `function.arguments` JSON 字符串。
-    #[serde(default)]
+    ///
+    /// **null 容忍**:小米 MiMo 在每个 delta 里把无关字段显式发成 `null`
+    /// (`{"content":null,"reasoning_content":"...","tool_calls":null}`),
+    /// 直接 `Vec<...>` 解析 `null` 会让整帧反序列化失败、被静默丢弃,导致
+    /// 文本 / reasoning 全丢。这里走 Option 兜底再 flatten 回空 Vec。
+    #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
     tool_calls: Vec<ChatToolCallDelta>,
     /// 旧版 Chat Completions 单工具调用增量。OpenAI 后续改为
     /// `tool_calls[]`,但 1.0.x 已把 `finish_reason=function_call` 视为完成,
     /// 这里把流式 delta 直接转成 index=0 的 function_call item。
     #[serde(default)]
     function_call: Option<LegacyFunctionCallDelta>,
+}
+
+fn deserialize_null_or_missing_to_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(|v| v.unwrap_or_default())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1409,5 +1494,147 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
             completed["incomplete_details"]["reason"],
             "max_output_tokens"
         );
+    }
+
+    // ── usage 规范化 ──────────────────────────────────────────────────
+    // Codex CLI ResponseCompleted 反序列化要求 usage.{input_tokens,output_tokens,
+    // total_tokens} 都到位;Chat 上游用的是 prompt/completion_tokens,部分
+    // provider 完全不发 usage —— 都要兜住。
+
+    #[test]
+    fn missing_upstream_usage_emits_zero_usage_block() {
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 0);
+        assert_eq!(usage["output_tokens"], 0);
+        assert_eq!(usage["total_tokens"], 0);
+    }
+
+    #[test]
+    fn chat_usage_prompt_completion_remapped_to_responses() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 10);
+        assert!(usage.get("prompt_tokens").is_none());
+        assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[test]
+    fn responses_shape_usage_passes_through() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"total_tokens\":10}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 10);
+    }
+
+    #[test]
+    fn chat_usage_subdetails_remapped_to_responses_subdetails() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 2);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 1);
+        assert!(usage.get("prompt_tokens_details").is_none());
+        assert!(usage.get("completion_tokens_details").is_none());
+    }
+
+    // ── null 容忍(MiMo 真实帧形态)─────────────────────────────────────
+    // 上游在每个 delta 里把无关字段显式发 null:
+    //   {"delta":{"content":null,"reasoning_content":"...","tool_calls":null}}
+    // 直接 `Vec<ChatToolCallDelta>` 反序列化 null 会报错,导致整帧被
+    // serde_json::from_str 静默丢弃,文本和 reasoning 全丢失。
+
+    #[test]
+    fn delta_with_explicit_null_tool_calls_does_not_drop_content() {
+        let mut c = fixed();
+        let _ = c.feed(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":null,\"tool_calls\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
+        );
+        let out = c.feed(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\",\"reasoning_content\":null,\"tool_calls\":null,\"role\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
+        );
+        let events = parse_emitted(&out);
+        let kinds = names(&events);
+        assert!(
+            kinds.contains(&"response.output_text.delta"),
+            "delta.content 必须 emit;实际事件: {kinds:?}"
+        );
+        let delta_event = events
+            .iter()
+            .find(|(n, _)| n == "response.output_text.delta")
+            .unwrap();
+        assert_eq!(delta_event.1["delta"], "你好");
+    }
+
+    #[test]
+    fn delta_with_explicit_null_tool_calls_keeps_reasoning_content() {
+        let mut c = fixed();
+        let out = c.feed(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"reasoning_content\":\"想想\",\"tool_calls\":null,\"role\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
+        );
+        let events = parse_emitted(&out);
+        let reasoning_event = events
+            .iter()
+            .find(|(n, _)| n == "response.reasoning_summary_text.delta");
+        assert!(
+            reasoning_event.is_some(),
+            "delta.reasoning_content 必须 emit;实际事件: {:?}",
+            names(&events)
+        );
+        assert_eq!(reasoning_event.unwrap().1["delta"], "想想");
+    }
+
+    #[test]
+    fn chunk_with_explicit_null_choices_is_not_dropped() {
+        // 部分聚合层在 usage-only 帧里写 `choices: null` 而非 `[]`
+        let mut c = fixed();
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n");
+        let _ = c.feed(b"data: {\"choices\":null,\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 3);
+        assert_eq!(usage["output_tokens"], 1);
+        assert_eq!(usage["total_tokens"], 4);
+    }
+
+    #[test]
+    fn missing_total_tokens_is_computed_from_input_output_sum() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6}}\n\n",
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 4);
+        assert_eq!(usage["output_tokens"], 6);
+        assert_eq!(usage["total_tokens"], 10);
     }
 }

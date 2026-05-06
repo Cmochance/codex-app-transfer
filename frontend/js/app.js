@@ -1508,15 +1508,27 @@
     actionEl.disabled = true;
     try {
       const provider = await saveProviderFromForm();
-      await CCApi.activateProvider(provider.id);
-      const desktopResult = await CCApi.configureDesktop();
-      if (desktopResult.requiresProxy) {
+      // setDefaultProvider 后端 = switch_provider_and_sync:写 activeProvider
+      // + 同步 desktop config(沿用「启用」按钮同一条链路,避免出现仅写
+      // config.json 但没动 ~/.codex/config.toml 的中间态)。
+      const result = await CCApi.setDefaultProvider(provider.id);
+      const desktopSync = result?.desktopSync || {};
+      if (desktopSync.requiresProxy) {
         await CCApi.startProxy();
       }
+      // 让首页 / 提供商页 / dashboard 立刻反映新 active,跟「启用」按钮一致。
+      await renderProviderCards("#dashboardProviderCards", { includePresets: true });
+      await renderProviders();
+      await renderDashboard();
+
       editingProviderId = null;
       selectedPreset = null;
       window.location.hash = "dashboard";
-      showToast(t("toast.providerAppliedDesktop"));
+      if (desktopSync.attempted && desktopSync.success === false) {
+        showToast(t("toast.defaultUpdatedDesktopFailed"));
+      } else {
+        showToast(t("toast.providerAppliedDesktop"));
+      }
       showRestartReminder();
     } finally {
       actionEl.disabled = false;
