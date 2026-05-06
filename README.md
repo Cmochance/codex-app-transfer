@@ -50,6 +50,12 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 | **设置** | **日志** |
 | ![Settings](docs/img/Settings.png) | ![Logs](docs/img/Logs.png) |
 
+### Codex CLI 实际接入
+
+启用任意供应商后，Codex CLI 模型选择器会显示「<provider> / <real-model>」形式的真实模型名（v2.0.5 起所有供应商均如此），对话过程中工具循环 / `previous_response_id` 历史回放 / thinking 模式 reasoning_content 注入全部由本地代理透明处理：
+
+![Codex CLI 实际对话](docs/img/codex-cli-real-chat.png)
+
 ## 下载
 
 最新已发布版本在 GitHub Release：
