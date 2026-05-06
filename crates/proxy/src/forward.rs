@@ -208,10 +208,21 @@ pub async fn forward_handler(
     let resp = up.send().await?;
     let status = resp.status();
     let upstream_headers = filter_hop_headers(resp.headers());
-    let upstream_stream: codex_app_transfer_adapters::ByteStream = Box::pin(
-        resp.bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-    );
+
+    // 4xx / 5xx 诊断:整段缓冲 upstream body,把请求体 + 响应体片段写日志,
+    // 然后用同一份字节再造一个 stream 走 adapter / 客户端。错误 body 一般
+    // 很小(JSON error),全缓冲不影响延迟;成功路径仍走零拷贝 stream。
+    let upstream_stream: codex_app_transfer_adapters::ByteStream = if status.is_success() {
+        Box::pin(
+            resp.bytes_stream()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+        )
+    } else {
+        let body_bytes = resp.bytes().await.unwrap_or_default();
+        log_upstream_error_diag(&telemetry, status, &upstream_url, &plan.body, &body_bytes);
+        let single = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) });
+        Box::pin(single)
+    };
 
     let response_plan = adapter.transform_response_stream(
         status,
@@ -234,6 +245,45 @@ pub async fn forward_handler(
         .ok_or_else(|| ForwardError::Header("response builder lacks headers".into()))?;
     *headers_out = response_plan.headers;
     Ok(builder.body(Body::from_stream(response_plan.stream))?)
+}
+
+/// 4xx / 5xx 时把请求体片段 + 上游响应体片段写到 telemetry 日志,辅助诊断。
+/// 截断到 ~2KB(req)+ 4KB(resp)避免污染日志。
+fn log_upstream_error_diag(
+    telemetry: &crate::telemetry::ProxyTelemetry,
+    status: StatusCode,
+    upstream_url: &str,
+    request_body: &Bytes,
+    response_body: &Bytes,
+) {
+    const REQ_MAX: usize = 2048;
+    const RESP_MAX: usize = 4096;
+    let req_snippet = bytes_preview(request_body, REQ_MAX);
+    let resp_snippet = bytes_preview(response_body, RESP_MAX);
+    telemetry.logs.add(
+        "ERROR",
+        format!(
+            "上游错误诊断 {} {}\n  → request body ({} bytes): {}\n  ← response body ({} bytes): {}",
+            status.as_u16(),
+            upstream_url,
+            request_body.len(),
+            req_snippet,
+            response_body.len(),
+            resp_snippet,
+        ),
+    );
+}
+
+fn bytes_preview(body: &Bytes, max: usize) -> String {
+    if body.is_empty() {
+        return "(empty)".to_owned();
+    }
+    let s = String::from_utf8_lossy(body);
+    if s.len() <= max {
+        s.into_owned()
+    } else {
+        format!("{}…(+{} bytes truncated)", &s[..max], s.len() - max)
+    }
 }
 
 fn cors_preflight_response() -> Result<Response, axum::http::Error> {
