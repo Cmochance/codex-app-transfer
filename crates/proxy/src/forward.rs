@@ -17,11 +17,16 @@ use axum::{
     http::{HeaderMap, HeaderName, Method, StatusCode},
     response::Response,
 };
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Instant;
+
 use bytes::Bytes;
 use codex_app_transfer_adapters::{
     registry::is_local_responses_route, AdapterError, AdapterRegistry,
 };
 use codex_app_transfer_registry::strip_internal_model_suffix;
+use futures_core::Stream;
 use futures_util::TryStreamExt;
 use thiserror::Error;
 
@@ -212,11 +217,23 @@ pub async fn forward_handler(
     // 4xx / 5xx 诊断:整段缓冲 upstream body,把请求体 + 响应体片段写日志,
     // 然后用同一份字节再造一个 stream 走 adapter / 客户端。错误 body 一般
     // 很小(JSON error),全缓冲不影响延迟;成功路径仍走零拷贝 stream。
+    //
+    // 成功路径再叠 TracedStream:记录 send → 首字节 → 流末尾的耗时
+    // + 总字节数,流被 Drop(adapter / 客户端断流)时出一行"上游耗时"日志,
+    // 辅助定位真实 Codex CLI 流量里"几分钟"是单次 reasoning 慢、还是连续
+    // 多轮工具循环放大。
+    let t_send = Instant::now();
     let upstream_stream: codex_app_transfer_adapters::ByteStream = if status.is_success() {
-        Box::pin(
+        let raw = Box::pin(
             resp.bytes_stream()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-        )
+        );
+        Box::pin(TracedStream::new(
+            raw,
+            t_send,
+            status.as_u16(),
+            upstream_url.clone(),
+        ))
     } else {
         let body_bytes = resp.bytes().await.unwrap_or_default();
         log_upstream_error_diag(&telemetry, status, &upstream_url, &plan.body, &body_bytes);
@@ -245,6 +262,76 @@ pub async fn forward_handler(
         .ok_or_else(|| ForwardError::Header("response builder lacks headers".into()))?;
     *headers_out = response_plan.headers;
     Ok(builder.body(Body::from_stream(response_plan.stream))?)
+}
+
+/// 在上游 SSE / chunked 流上叠加耗时埋点。流被 Drop(adapter 链路 / 客户端
+/// 中断)时,自动写一行 telemetry 日志,记录 send → 首字节(TTFB)/ 总耗时
+/// / 总字节数。**对延迟与吞吐零侵入**,只多了 Instant 比较与计数器累加。
+struct TracedStream {
+    inner: codex_app_transfer_adapters::ByteStream,
+    started_at: Instant,
+    first_byte_at: Option<Instant>,
+    total_bytes: usize,
+    status: u16,
+    upstream_url: String,
+}
+
+impl TracedStream {
+    fn new(
+        inner: codex_app_transfer_adapters::ByteStream,
+        started_at: Instant,
+        status: u16,
+        upstream_url: String,
+    ) -> Self {
+        Self {
+            inner,
+            started_at,
+            first_byte_at: None,
+            total_bytes: 0,
+            status,
+            upstream_url,
+        }
+    }
+}
+
+impl Stream for TracedStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if this.first_byte_at.is_none() {
+                    this.first_byte_at = Some(Instant::now());
+                }
+                this.total_bytes += chunk.len();
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for TracedStream {
+    fn drop(&mut self) {
+        let total = self.started_at.elapsed();
+        let ttfb = self
+            .first_byte_at
+            .map(|t| t.duration_since(self.started_at));
+        let ttfb_str = ttfb
+            .map(|d| format!("{:.2}s", d.as_secs_f64()))
+            .unwrap_or_else(|| "(none)".to_owned());
+        proxy_telemetry().logs.add(
+            "INFO",
+            format!(
+                "上游耗时 {} {} TTFB={} total={:.2}s bytes={}",
+                self.status,
+                self.upstream_url,
+                ttfb_str,
+                total.as_secs_f64(),
+                self.total_bytes,
+            ),
+        );
+    }
 }
 
 /// 4xx / 5xx 时把请求体片段 + 上游响应体片段写到 telemetry 日志,辅助诊断。

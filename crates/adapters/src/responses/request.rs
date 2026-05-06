@@ -76,10 +76,31 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     );
     ensure_thinking_tool_call_reasoning(&mut messages, input, provider);
     convert_developer_to_system_if_needed(&mut messages, provider);
-    let session_messages = messages.clone();
-    if !messages.is_empty() {
-        result.insert("messages".into(), Value::Array(messages));
+
+    // 空 messages 守卫:Codex CLI 偶尔会带着 previous_response_id + input=[]
+    // 续轮(典型场景:本地代理刚重启,session_cache 是冷的;或上次会话被
+    // 清掉)。merge 完仍空意味着我们要么发一份没有 messages 的 body 上去
+    // (上游必拒,部分还会扣 reasoning tokens),要么在这里直接 400 让 Codex
+    // CLI 重试一份带完整 history 的请求。后者上游零打扰、账单零噪音、
+    // 用户视角无感(Codex CLI 的内置重试覆盖了这条)。
+    if messages.is_empty() {
+        return Err(AdapterError::BadRequest(
+            "Responses 请求转换后 messages 为空(input 空且 previous_response_id 在 session cache 未命中);拒绝向上游发空 messages,Codex CLI 应当带完整 history 重试".into(),
+        ));
     }
+
+    // 视觉剥离:对已知不支持视觉的上游(deepseek-v4-* / mimo-v2.5-* 等纯
+    // 文本模型),把 messages.content 里所有 `image_url` block 替换为占位
+    // 文本块。**必须**做这一步:DeepSeek API 在 deserialize 阶段就对
+    // `image_url` content variant 报 400(实测 messages[8]: unknown variant
+    // `image_url`, expected `text`),Codex CLI 历史里只要存在过一次图片
+    // (即使发给 vision provider 后切换到 DeepSeek)就会让续轮全部失败。
+    if !provider_supports_vision(provider) {
+        strip_image_blocks_in_place(&mut messages);
+    }
+
+    let session_messages = messages.clone();
+    result.insert("messages".into(), Value::Array(messages));
 
     // tools(只接受 function / custom,其余 Responses 专属类型丢弃)
     if let Some(Value::Array(tools)) = body.get("tools") {
@@ -911,6 +932,104 @@ fn thinking_value_enabled(thinking: Option<&Value>) -> bool {
     false
 }
 
+/// 上游 provider 是否支持 vision(messages.content 里允许 `image_url` block)。
+///
+/// 判断顺序:
+/// 1. provider.modelCapabilities[<default_model>].supports_vision 显式 false → 不支持
+/// 2. provider.modelCapabilities[<default_model>].supports_vision 显式 true → 支持
+/// 3. provider 的 id / name / base_url 命中已知纯文本上游名单
+///    (deepseek / mimo / xiaomi-mimo 等)→ 不支持
+/// 4. 其余默认支持(走 OpenAI 标准多模态;Kimi 月之暗面也走这条,
+///    部分 Kimi 模型支持视觉)
+///
+/// 这条防御对应 DeepSeek `deepseek-v4-pro` 在 deserialize 阶段直接对
+/// `messages[i].content[*].type == "image_url"` 报 400 unknown variant,
+/// 让 Codex CLI 续轮 history 一旦含过图就全链路阻塞(2026-05-06 实测)。
+fn provider_supports_vision(provider: Option<&Provider>) -> bool {
+    let Some(p) = provider else {
+        return true;
+    };
+
+    // 1+2:modelCapabilities 显式声明
+    let default_model = p
+        .models
+        .get("default")
+        .map(|s| codex_app_transfer_registry::strip_internal_model_suffix(s))
+        .unwrap_or_default();
+    let candidates: [&str; 2] = [default_model.as_str(), default_model.trim()];
+    for key in candidates {
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(b) = p
+            .model_capabilities
+            .get(key)
+            .and_then(|v| v.get("supports_vision"))
+            .and_then(|v| v.as_bool())
+        {
+            return b;
+        }
+    }
+
+    // 3:已知纯文本上游名单。命中即视为不支持。
+    const KNOWN_TEXT_ONLY: &[&str] = &["deepseek", "xiaomi", "mimo", "qwen3.6"];
+    for needle in KNOWN_TEXT_ONLY {
+        if provider_looks_like(p, needle) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 把 messages 中所有 `image_url` content block 替换为占位文本块,
+/// 防止纯文本上游(deepseek-v4-pro / mimo-v2.5-pro 等)拒绝整 body。
+/// 替换后若 content 数组只剩 text 块,会进一步合并为单 string,与
+/// 普通文本消息序列化形态一致。
+fn strip_image_blocks_in_place(messages: &mut [Value]) {
+    const PLACEHOLDER: &str = "[图片省略:当前 provider 不支持视觉输入]";
+    for msg in messages.iter_mut() {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        let Some(content) = obj.get_mut("content") else {
+            continue;
+        };
+        let Value::Array(arr) = content else {
+            continue;
+        };
+        let mut had_image = false;
+        for block in arr.iter_mut() {
+            let Some(block_obj) = block.as_object_mut() else {
+                continue;
+            };
+            let block_type = block_obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if block_type == "image_url" {
+                had_image = true;
+                block_obj.clear();
+                block_obj.insert("type".into(), Value::String("text".into()));
+                block_obj.insert("text".into(), Value::String(PLACEHOLDER.into()));
+            }
+        }
+        if had_image {
+            // 替换后若全是 text,合并成单 string,跟其它纯文本消息一致
+            let all_text = arr
+                .iter()
+                .all(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"));
+            if all_text {
+                let combined: Vec<String> = arr
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()).map(str::to_owned))
+                    .collect();
+                obj.insert("content".into(), Value::String(combined.join("\n")));
+            }
+        }
+    }
+}
+
 /// Responses message.content 可能是 string 或 [{type, text/image_url}].
 /// stateless 阶段:string 保留;text 块拼成 string;含 image_url 的块降级为
 /// Chat 多模态格式(`[{type: "text", text}, {type: "image_url", image_url}]`).
@@ -1269,6 +1388,145 @@ mod tests {
 
     fn convert(body: Value) -> Value {
         responses_body_to_chat_body(&body).unwrap()
+    }
+
+    fn deepseek_provider() -> Provider {
+        let mut p = provider("deepseek", "DeepSeek", "https://api.deepseek.com");
+        p.models.insert("default".into(), "deepseek-v4-pro".into());
+        p.api_format = "openai_chat".into();
+        p
+    }
+
+    #[test]
+    fn deepseek_history_strips_image_blocks_to_text_placeholder() {
+        // 真实 Codex CLI history:第 9 条 user 消息含 image_url,DeepSeek 实测
+        // 在 deserialize 阶段对 image_url variant 报 400(2026-05-06 实测)。
+        // 转换后 image_url 必须不再存在 messages.content 任何块里。
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"看这张图"},
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]}
+            ]
+        });
+        let p = deepseek_provider();
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        let serialized = serde_json::to_string(messages).unwrap();
+        assert!(
+            !serialized.contains("\"image_url\""),
+            "DeepSeek 上游不接 image_url,转换后必须不含此 variant\nactual: {serialized}"
+        );
+        assert!(
+            serialized.contains("图片省略"),
+            "应当用占位文本替换,而不是直接丢弃,让模型知道历史里曾有图\nactual: {serialized}"
+        );
+    }
+
+    #[test]
+    fn deepseek_input_image_top_level_item_strips_to_text_placeholder() {
+        // input_image 作为顶层 item(Codex CLI 当前轮直接贴图)也要被剥
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [
+                {"type":"input_image","image_url":"data:image/png;base64,AAA","detail":"low"}
+            ]
+        });
+        let p = deepseek_provider();
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let serialized = serde_json::to_string(&out["messages"]).unwrap();
+        assert!(!serialized.contains("\"image_url\""));
+        assert!(serialized.contains("图片省略"));
+    }
+
+    #[test]
+    fn kimi_history_keeps_image_blocks_intact() {
+        // Kimi(月之暗面)部分模型支持视觉,默认放行 → image_url 必须保留
+        let mut kimi = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
+        kimi.models.insert("default".into(), "kimi-k2.6".into());
+        let req = json!({
+            "model": "kimi-k2.6",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_text","text":"图里是什么"},
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&kimi)).unwrap();
+        let serialized = serde_json::to_string(&out["messages"]).unwrap();
+        assert!(
+            serialized.contains("\"image_url\""),
+            "Kimi 应保留 image_url"
+        );
+    }
+
+    #[test]
+    fn explicit_supports_vision_true_overrides_text_only_blacklist() {
+        // 用户在 modelCapabilities 显式标 supports_vision: true → 即使 base_url
+        // 命中黑名单(deepseek)也保留 image_url。给未来视觉版预留口子。
+        let mut deepseek_with_vision = deepseek_provider();
+        deepseek_with_vision
+            .model_capabilities
+            .insert("deepseek-v4-pro".into(), json!({"supports_vision": true}));
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type":"input_image","image_url":"data:image/png;base64,AAA"
+            }]
+        });
+        let out =
+            responses_body_to_chat_body_for_provider(&req, Some(&deepseek_with_vision)).unwrap();
+        let serialized = serde_json::to_string(&out["messages"]).unwrap();
+        assert!(serialized.contains("\"image_url\""));
+    }
+
+    #[test]
+    fn empty_input_with_no_session_history_returns_bad_request() {
+        // Codex CLI 续轮:input 空 + previous_response_id 在 session_cache 未命中
+        // (代理刚重启 / 上次 session 被清).代理必须 400 fail-fast,不能让上游
+        // 收到没有 messages 的 body 拒绝(MiMo 实测会回 "Param Incorrect:
+        // messages is a required array" + 部分 provider 仍然扣 reasoning tokens)。
+        let req = json!({
+            "model": "x",
+            "stream": true,
+            "previous_response_id": "resp_unknown_to_cache",
+            "tools": [{"type":"function","name":"shell","parameters":{"type":"object"}}],
+            "input": []
+        });
+        let err =
+            responses_body_to_chat_body(&req).expect_err("messages 全空必须 fail-fast,不能透传");
+        match err {
+            AdapterError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("messages 为空"),
+                    "错误信息应当指出 messages 空: {msg}"
+                );
+            }
+            other => panic!("应当返回 BadRequest,实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_input_but_with_instructions_passes_through() {
+        // 只要有 instructions(system 头),messages 就非空,正常往上游发。
+        let req = json!({
+            "model": "x",
+            "stream": true,
+            "instructions": "You are Codex.",
+            "input": []
+        });
+        let out = responses_body_to_chat_body(&req).expect("应当通过");
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "system");
     }
 
     fn provider(id: &str, name: &str, base_url: &str) -> Provider {
@@ -1768,6 +2026,7 @@ mod tests {
     #[test]
     fn tools_function_passes_through() {
         let out = convert(json!({
+            "input": "hi",
             "tools": [{
                 "type": "function",
                 "name": "get_weather",
@@ -1791,6 +2050,7 @@ mod tests {
     #[test]
     fn tools_parameters_default_type_object() {
         let out = convert(json!({
+            "input": "hi",
             "tools": [{
                 "type": "function",
                 "name": "f",
@@ -1806,6 +2066,7 @@ mod tests {
     #[test]
     fn tools_custom_type_is_lowered_to_function_with_input() {
         let out = convert(json!({
+            "input": "hi",
             "tools": [{
                 "type": "custom",
                 "name": "free_text_tool",
@@ -1825,6 +2086,7 @@ mod tests {
     #[test]
     fn tools_unknown_responses_only_types_dropped() {
         let out = convert(json!({
+            "input": "hi",
             "tools": [
                 {"type": "function", "name": "keep_me"},
                 {"type": "web_search_preview"},
@@ -1839,7 +2101,7 @@ mod tests {
 
     #[test]
     fn max_output_tokens_renamed_to_max_tokens() {
-        let out = convert(json!({"max_output_tokens": 256}));
+        let out = convert(json!({"input": "hi", "max_output_tokens": 256}));
         assert_eq!(out["max_tokens"], 256);
         assert!(out.get("max_output_tokens").is_none());
     }
