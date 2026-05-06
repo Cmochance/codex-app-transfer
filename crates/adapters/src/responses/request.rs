@@ -114,8 +114,14 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     }
 
     // text.format → response_format
-    if let Some(response_format) = body.get("text").and_then(build_response_format) {
-        result.insert("response_format".into(), response_format);
+    // 注:对已知不支持 `json_schema` 的上游(DeepSeek 实测 2026-05-06)会自动
+    // 降级为 `{"type":"json_object"}`,Codex CLI 的 system prompt 通常已写明
+    // required keys,模型仍会输出符合 schema 的 JSON。Kimi / MiMo 实测都支持
+    // json_schema,不在降级名单。
+    if let Some(text_config) = body.get("text") {
+        if let Some(response_format) = build_response_format_for_provider(text_config, provider) {
+            result.insert("response_format".into(), response_format);
+        }
     }
 
     // reasoning → reasoning_effort
@@ -1168,30 +1174,97 @@ fn responses_block_to_chat_block(block: &Value) -> Option<Value> {
     }
 }
 
-fn build_response_format(text_config: &Value) -> Option<Value> {
+/// 把 Responses API 的 `text.format` 翻译成 Chat Completions 的 `response_format`。对已知不支持 `json_schema` 的上游(实测 DeepSeek
+/// API 在 deserialize 阶段对 `response_format.type=json_schema` 报 400
+/// "This response_format type is unavailable now"),把
+/// `{type:"json_schema", ...}` 降级为 `{type:"json_object"}`,让模型
+/// 仍输出 JSON,schema 字段顺序由 Codex CLI 的 system prompt 中"required
+/// keys"指示驱动(2026-05-06 实测各家在 system prompt 给约束时,模型
+/// 输出的 JSON 都能匹配三个 key)。
+///
+/// 实测结果(2026-05-06,真实 API):
+/// - DeepSeek v4-pro:json_schema → 400;json_object → 200 + 合法 JSON
+/// - Kimi k2.6:json_schema → 200 + 合法 JSON(不降级)
+/// - MiMo v2.5-pro(PAYG / Token Plan):json_schema → 200 + 合法 JSON(**不降级**)
+fn build_response_format_for_provider(
+    text_config: &Value,
+    provider: Option<&Provider>,
+) -> Option<Value> {
     let fmt = text_config.get("format")?.as_object()?;
     let fmt_type = fmt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match fmt_type {
-        "json_schema" => Some(json!({
+
+    let json_schema_value = || {
+        json!({
             "type": "json_schema",
             "json_schema": {
                 "name": fmt.get("name").and_then(|v| v.as_str()).unwrap_or("response_schema"),
                 "schema": fmt.get("schema").cloned().unwrap_or_else(|| json!({})),
                 "strict": fmt.get("strict").and_then(|v| v.as_bool()).unwrap_or(false),
             },
-        })),
-        "json_object" => Some(json!({ "type": "json_object" })),
-        "text" => None,
-        _ if fmt.contains_key("schema") => Some(json!({
-            "type": "json_schema",
-            "json_schema": {
-                "name": fmt.get("name").and_then(|v| v.as_str()).unwrap_or("response_schema"),
-                "schema": fmt.get("schema").cloned().unwrap_or_else(|| json!({})),
-                "strict": fmt.get("strict").and_then(|v| v.as_bool()).unwrap_or(false),
-            },
-        })),
-        _ => None,
+        })
+    };
+
+    let raw = match fmt_type {
+        "json_schema" => json_schema_value(),
+        "json_object" => json!({ "type": "json_object" }),
+        "text" => return None,
+        _ if fmt.contains_key("schema") => json_schema_value(),
+        _ => return None,
+    };
+
+    // json_schema 降级:命中 provider 黑名单时,转 json_object
+    if raw.get("type").and_then(|v| v.as_str()) == Some("json_schema")
+        && !provider_supports_json_schema_response_format(provider)
+    {
+        return Some(json!({ "type": "json_object" }));
     }
+    Some(raw)
+}
+
+/// 上游 provider 是否支持 `response_format = {type:"json_schema", json_schema:{...}}`。
+///
+/// 判断顺序:
+/// 1. `provider.modelCapabilities[<default_model>].supports_json_schema_response_format`
+///    显式 false → 不支持;true → 支持
+/// 2. fallback 黑名单(只放经实测确认拒绝 `json_schema` 的上游):
+///    - `deepseek` → 不支持(API 直接 400 unavailable)
+/// 3. 其他默认支持(Kimi / MiMo 实测都支持完整 OpenAI `json_schema` 语义)
+///
+/// **不要把 mimo / qwen3.6 加入名单**:实测 MiMo 两家都支持
+/// json_schema(2026-05-06)。误加会导致正常 schema 被无谓降级。
+fn provider_supports_json_schema_response_format(provider: Option<&Provider>) -> bool {
+    let Some(p) = provider else {
+        return true;
+    };
+
+    // 1. 显式 modelCapabilities 优先
+    let default_model = p
+        .models
+        .get("default")
+        .map(|s| codex_app_transfer_registry::strip_internal_model_suffix(s))
+        .unwrap_or_default();
+    let candidates: [&str; 2] = [default_model.as_str(), default_model.trim()];
+    for key in candidates {
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(b) = p
+            .model_capabilities
+            .get(key)
+            .and_then(|v| v.get("supports_json_schema_response_format"))
+            .and_then(|v| v.as_bool())
+        {
+            return b;
+        }
+    }
+
+    // 2. 实测黑名单(命中即视为不支持)。
+    //    **慎重添加新条目**:必须先用真实凭据 curl 验证 json_schema 真的报错
+    //    (DeepSeek 形态:400 + "This response_format type is unavailable now")。
+    const KNOWN_NOT_SUPPORTED: &[&str] = &["deepseek"];
+    !KNOWN_NOT_SUPPORTED
+        .iter()
+        .any(|needle| provider_looks_like(p, needle))
 }
 
 fn build_reasoning_effort(reasoning: &Value) -> Option<Value> {
@@ -1437,6 +1510,131 @@ mod tests {
         let serialized = serde_json::to_string(&out["messages"]).unwrap();
         assert!(!serialized.contains("\"image_url\""));
         assert!(serialized.contains("图片省略"));
+    }
+
+    // ── response_format json_schema 降级(基于实测 2026-05-06)─────────
+    // - DeepSeek v4-pro:json_schema → 400;json_object → 200(必须降级)
+    // - Kimi k2.6:json_schema → 200(不降级)
+    // - MiMo v2.5-pro:json_schema → 200(不降级,实测两家都支持)
+
+    fn json_schema_text_config() -> Value {
+        json!({
+            "format": {
+                "type": "json_schema",
+                "name": "risk_review",
+                "strict": true,
+                "schema": {
+                    "type":"object",
+                    "properties": {
+                        "risk_level":{"type":"string","enum":["low","medium","high"]},
+                        "outcome":{"type":"string","enum":["allow","deny"]}
+                    },
+                    "required": ["risk_level","outcome"],
+                    "additionalProperties": false,
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn deepseek_downgrades_json_schema_response_format_to_json_object() {
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "instructions": "Output strict JSON. Required keys: risk_level, outcome.",
+            "input": [{"type":"message","role":"user","content":"Risk of ls?"}],
+            "text": json_schema_text_config(),
+        });
+        let p = deepseek_provider();
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let rf = &out["response_format"];
+        assert_eq!(
+            rf["type"], "json_object",
+            "DeepSeek 必须把 json_schema 降级为 json_object;实际: {rf}"
+        );
+        assert!(
+            rf.get("json_schema").is_none(),
+            "降级后不能保留 json_schema 字段:{rf}"
+        );
+    }
+
+    #[test]
+    fn kimi_keeps_json_schema_response_format_intact() {
+        let mut kimi = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
+        kimi.models.insert("default".into(), "kimi-k2.6".into());
+        let req = json!({
+            "model": "kimi-k2.6",
+            "stream": true,
+            "instructions": "x",
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "text": json_schema_text_config(),
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&kimi)).unwrap();
+        let rf = &out["response_format"];
+        assert_eq!(rf["type"], "json_schema", "Kimi 应保留 json_schema:{rf}");
+        assert_eq!(rf["json_schema"]["name"], "risk_review");
+        assert_eq!(rf["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn mimo_keeps_json_schema_response_format_intact() {
+        // MiMo 实测两家(PAYG / Token Plan)都支持 json_schema,不能降级
+        let mut mimo = provider(
+            "xiaomi-mimo",
+            "Xiaomi MiMo",
+            "https://api.xiaomimimo.com/v1",
+        );
+        mimo.models.insert("default".into(), "mimo-v2.5-pro".into());
+        let req = json!({
+            "model": "mimo-v2.5-pro",
+            "stream": true,
+            "instructions": "x",
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "text": json_schema_text_config(),
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&mimo)).unwrap();
+        let rf = &out["response_format"];
+        assert_eq!(rf["type"], "json_schema", "MiMo 实测支持,不应降级:{rf}");
+    }
+
+    #[test]
+    fn explicit_supports_json_schema_true_overrides_blacklist() {
+        // 用户在 modelCapabilities 显式标 supports_json_schema_response_format: true
+        // 即使 base_url 命中黑名单(deepseek)也保留(给未来能力升级预留)。
+        let mut p = deepseek_provider();
+        p.model_capabilities.insert(
+            "deepseek-v4-pro".into(),
+            json!({"supports_json_schema_response_format": true}),
+        );
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "instructions": "x",
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "text": json_schema_text_config(),
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert_eq!(out["response_format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn explicit_supports_json_schema_false_forces_downgrade() {
+        // 即使 base_url 不在黑名单(例如 Kimi),用户显式标 false 也要降级
+        let mut kimi = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
+        kimi.models.insert("default".into(), "kimi-k2.6".into());
+        kimi.model_capabilities.insert(
+            "kimi-k2.6".into(),
+            json!({"supports_json_schema_response_format": false}),
+        );
+        let req = json!({
+            "model": "kimi-k2.6",
+            "stream": true,
+            "instructions": "x",
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "text": json_schema_text_config(),
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&kimi)).unwrap();
+        assert_eq!(out["response_format"]["type"], "json_object");
     }
 
     #[test]
