@@ -91,22 +91,35 @@ impl Adapter for ResponsesAdapter {
     }
 }
 
-/// 把 `/v1/responses` / `/responses` / `/openai/v1/responses` 等路径重定向到
-/// `/chat/completions`(上游 OpenAI Chat 的标准入口)。其它路径透传不动。
+/// 把 `/v1/responses` / `/responses` / `/openai/v1/responses` 以及旧版 message
+/// aliases 重定向到 `/chat/completions`(上游 OpenAI Chat 的标准入口)。其它路径透传不动。
 fn redirect_responses_to_chat(path: &str) -> String {
-    let normalized = path
-        .strip_prefix("/openai")
-        .unwrap_or(path)
-        .strip_prefix("/v1")
-        .map(|s| if s.is_empty() { "/" } else { s }.to_owned())
-        .unwrap_or_else(|| path.to_owned());
+    let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+    let normalized = normalize_local_responses_path(path_only);
 
-    // 现在 normalized 形如 "/responses" 或 "/chat/completions" 或别的
-    if let Some(after) = normalized.strip_prefix("/responses") {
+    let target = if let Some(after) = normalized.strip_prefix("/responses") {
+        format!("/chat/completions{after}")
+    } else if let Some(after) = normalized.strip_prefix("/messages") {
         format!("/chat/completions{after}")
     } else {
         normalized
+    };
+
+    if query.is_empty() {
+        target
+    } else {
+        format!("{target}?{query}")
     }
+}
+
+fn normalize_local_responses_path(path: &str) -> String {
+    let path = path.strip_prefix("/openai").unwrap_or(path);
+    if path == "/claude/v1/messages" {
+        return "/messages".to_owned();
+    }
+    path.strip_prefix("/v1")
+        .map(|s| if s.is_empty() { "/" } else { s }.to_owned())
+        .unwrap_or_else(|| path.to_owned())
 }
 
 #[cfg(test)]
@@ -134,6 +147,18 @@ mod tests {
         );
         assert_eq!(
             redirect_responses_to_chat("/v1/responses?stream=1"),
+            "/chat/completions?stream=1"
+        );
+        assert_eq!(
+            redirect_responses_to_chat("/v1/messages"),
+            "/chat/completions"
+        );
+        assert_eq!(
+            redirect_responses_to_chat("/claude/v1/messages"),
+            "/chat/completions"
+        );
+        assert_eq!(
+            redirect_responses_to_chat("/v1/messages?stream=1"),
             "/chat/completions?stream=1"
         );
     }

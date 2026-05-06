@@ -45,6 +45,48 @@ impl AdapterRegistry {
             _ => self.responses.clone(),
         }
     }
+
+    /// Selects the adapter for a local Codex request.
+    ///
+    /// The provider's `apiFormat` describes the upstream protocol, while Codex
+    /// still enters this proxy through local Responses routes. v1.x handled
+    /// `/responses` locally first, then converted to the provider protocol. Keep
+    /// that routing rule here so OpenAI Chat providers do not receive
+    /// `/responses` directly.
+    pub fn lookup_for_request(&self, api_format: &str, client_path: &str) -> Arc<dyn Adapter> {
+        let normalized = api_format.trim().to_ascii_lowercase().replace('-', "_");
+        if matches!(
+            normalized.as_str(),
+            "openai" | "openai_chat" | "chat_completions"
+        ) && is_local_responses_route(client_path)
+        {
+            return self.responses.clone();
+        }
+        self.lookup(api_format)
+    }
+}
+
+pub fn is_local_responses_route(client_path: &str) -> bool {
+    let path = client_path.split('?').next().unwrap_or(client_path);
+    matches!(
+        normalize_local_responses_path(path).as_str(),
+        "/responses" | "/messages"
+    )
+}
+
+fn normalize_local_responses_path(path: &str) -> String {
+    let path = path.strip_prefix("/openai").unwrap_or(path);
+    if path == "/claude/v1/messages" {
+        return "/messages".to_owned();
+    }
+    if let Some(stripped) = path.strip_prefix("/v1") {
+        return if stripped.is_empty() {
+            "/".to_owned()
+        } else {
+            stripped.to_owned()
+        };
+    }
+    path.to_owned()
 }
 
 impl Default for AdapterRegistry {
@@ -89,5 +131,29 @@ mod tests {
         let r = AdapterRegistry::with_builtins();
         assert_eq!(r.lookup("").name(), "responses");
         assert_eq!(r.lookup("unknown_format").name(), "responses");
+    }
+
+    #[test]
+    fn openai_chat_local_responses_routes_use_responses_adapter() {
+        let r = AdapterRegistry::with_builtins();
+        for path in [
+            "/responses",
+            "/responses?stream=1",
+            "/v1/responses",
+            "/openai/v1/responses",
+            "/v1/messages",
+            "/claude/v1/messages",
+        ] {
+            assert_eq!(
+                r.lookup_for_request("openai_chat", path).name(),
+                "responses",
+                "{path} must be treated as a local Codex Responses route"
+            );
+        }
+        assert_eq!(
+            r.lookup_for_request("openai_chat", "/v1/chat/completions")
+                .name(),
+            "openai_chat"
+        );
     }
 }

@@ -14,11 +14,13 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, StatusCode},
+    http::{HeaderMap, HeaderName, Method, StatusCode},
     response::Response,
 };
 use bytes::Bytes;
-use codex_app_transfer_adapters::{AdapterError, AdapterRegistry};
+use codex_app_transfer_adapters::{
+    registry::is_local_responses_route, AdapterError, AdapterRegistry,
+};
 use codex_app_transfer_registry::strip_internal_model_suffix;
 use futures_util::TryStreamExt;
 use thiserror::Error;
@@ -136,6 +138,9 @@ pub async fn forward_handler(
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_owned());
+    if parts.method == Method::OPTIONS && is_local_responses_route(&client_path) {
+        return Ok(cors_preflight_response()?);
+    }
     let original_model = body_model(&body_bytes);
     let resolved = state.resolver.resolve(&parts, &body_bytes)?;
 
@@ -149,8 +154,11 @@ pub async fn forward_handler(
     strip_model_suffix_in_place(&mut body_bytes);
     let resolved_model = body_model(&body_bytes);
 
-    // 4. 走 adapter 拿到上游路径 + 改写后的 body(openai_chat 路径下 body 等同)
-    let adapter = state.adapters.lookup(&resolved.provider.api_format);
+    // 4. 走 adapter 拿到上游路径 + 改写后的 body。Codex 的本地
+    // `/responses` 入口必须先在本地按旧版语义处理,再转为上游协议。
+    let adapter = state
+        .adapters
+        .lookup_for_request(&resolved.provider.api_format, &client_path);
     let plan = adapter.prepare_request(&client_path, body_bytes, &resolved.provider)?;
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
@@ -226,6 +234,15 @@ pub async fn forward_handler(
         .ok_or_else(|| ForwardError::Header("response builder lacks headers".into()))?;
     *headers_out = response_plan.headers;
     Ok(builder.body(Body::from_stream(response_plan.stream))?)
+}
+
+fn cors_preflight_response() -> Result<Response, axum::http::Error> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "POST, OPTIONS")
+        .header("access-control-allow-headers", "*")
+        .body(Body::empty())
 }
 
 fn body_model(body: &[u8]) -> Option<String> {

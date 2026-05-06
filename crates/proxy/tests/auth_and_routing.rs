@@ -11,14 +11,22 @@
 //! - Authorization / X-Api-Key / extra-headers 是否被代理重写正确
 //! - body 中的 model 字段是否被剥掉 `<slug>/` 前缀
 
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{body::Body, extract::Request, response::Response, routing::any, Router};
 use codex_app_transfer_proxy::{build_router, proxy_telemetry, StaticResolver};
 use codex_app_transfer_registry::Provider;
+use futures_util::{SinkExt, StreamExt};
 use indexmap::IndexMap;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue, Message as WsMessage},
+};
 
 /// echo-back 上游:把收到的请求镜像成 JSON 返回。`marker` 用来在响应头里
 /// 标记是哪个 mock,以便测试断言代理选对了上游。
@@ -48,6 +56,33 @@ fn echo_mock(marker: &'static str) -> Router {
             .header("x-mock-marker", marker)
             .body(Body::from(payload.to_string()))
             .unwrap()
+    }))
+}
+
+fn chat_sse_capture_mock(calls: Arc<Mutex<Vec<serde_json::Value>>>) -> Router {
+    Router::new().fallback(any(move |req: Request| {
+        let calls = calls.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .unwrap_or_default();
+            calls.lock().unwrap().push(json!({
+                "method": parts.method.as_str(),
+                "path": parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+                "body": String::from_utf8_lossy(&bytes),
+            }));
+            let payload = concat!(
+                "data: {\"id\":\"chatcmpl_test\",\"model\":\"mock-chat\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl_test\",\"model\":\"mock-chat\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(payload))
+                .unwrap()
+        }
     }))
 }
 
@@ -359,4 +394,124 @@ async fn adapter_passes_through_paths_without_v1_prefix() {
     assert_eq!(resp.status().as_u16(), 200);
     let v = body_json(resp).await;
     assert_eq!(v["path"].as_str().unwrap(), "/models");
+}
+
+#[tokio::test]
+async fn openai_chat_provider_handles_responses_route_like_legacy_proxy() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(chat_sse_capture_mock(calls.clone())).await;
+    let mut active = provider(
+        "kimi-code",
+        &format!("http://{upstream}/v1"),
+        "sk-kimi",
+        "bearer",
+        &[("User-Agent", "KimiCLI/1.40.0")],
+    );
+    active
+        .models
+        .insert("default".into(), "kimi-for-coding".into());
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![active],
+        Some("kimi-code".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/responses"))
+        .header("authorization", "Bearer cas_test_gw")
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "gpt-5.5",
+                "input": "hello",
+                "stream": true
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.text().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["method"], "POST");
+    assert_eq!(
+        calls[0]["path"], "/v1/chat/completions",
+        "Codex /responses must be handled locally and converted to upstream Chat Completions for openai_chat providers"
+    );
+    let body: serde_json::Value = serde_json::from_str(calls[0]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(body["model"], "kimi-for-coding");
+    assert_eq!(body["stream"], true);
+    assert!(body["messages"].is_array());
+}
+
+#[tokio::test]
+async fn websocket_responses_route_uses_legacy_responses_conversion() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(chat_sse_capture_mock(calls.clone())).await;
+    let mut active = provider(
+        "kimi-code",
+        &format!("http://{upstream}/v1"),
+        "sk-kimi",
+        "bearer",
+        &[("User-Agent", "KimiCLI/1.40.0")],
+    );
+    active
+        .models
+        .insert("default".into(), "kimi-for-coding".into());
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![active],
+        Some("kimi-code".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let mut request = format!("ws://{proxy}/responses")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_static("Bearer cas_test_gw"),
+    );
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "type": "response.create",
+                "response": {
+                    "model": "gpt-5.5",
+                    "input": "hello"
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let first_message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("websocket response timed out")
+        .expect("websocket closed")
+        .expect("websocket message");
+    let WsMessage::Text(text) = first_message else {
+        panic!("expected text websocket response");
+    };
+    let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_ne!(
+        payload["type"], "error",
+        "websocket should not return error"
+    );
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["method"], "POST");
+    assert_eq!(calls[0]["path"], "/v1/chat/completions");
+    let body: serde_json::Value = serde_json::from_str(calls[0]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(body["model"], "kimi-for-coding");
+    assert_eq!(body["stream"], true);
+    assert!(body["messages"].is_array());
 }
