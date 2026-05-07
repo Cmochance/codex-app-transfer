@@ -5,165 +5,77 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use axum::body::Bytes;
 use axum::{
-    body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     Json,
 };
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
+#[cfg(test)]
+use base64::{engine::general_purpose::STANDARD, Engine};
 use codex_app_transfer_codex_integration::{
     apply_provider, catalog_models_for_provider, has_snapshot, read_auth, restore_codex_state,
     ApplyConfig, CodexPaths,
 };
-use codex_app_transfer_proxy::{proxy_log_dir, proxy_telemetry};
 use codex_app_transfer_registry::{
-    builtin_presets, config_dir, normalize_model_mappings, strip_internal_model_suffix, RawConfig,
-    DEFAULT_UPDATE_URL, MODEL_ORDER,
+    builtin_presets, normalize_model_mappings, strip_internal_model_suffix, RawConfig, MODEL_ORDER,
 };
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE},
-    multipart, StatusCode as ReqwestStatusCode,
+    StatusCode as ReqwestStatusCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use crate::proxy_runner::ProxyManager;
 
-use super::registry_io::{load as load_registry, public_provider, save as save_registry};
-use super::state::AdminState;
+use super::super::registry_io::{load as load_registry, public_provider, save as save_registry};
+use super::super::state::AdminState;
+#[cfg(test)]
+use super::common::random_hex;
+#[cfg(test)]
+use super::common::version;
+use super::common::{active_provider_name, err, read_setting_bool};
+#[cfg(test)]
+use super::feedback::{
+    feedback_attachments, feedback_proxy_tail_content, submit_feedback_with_body, FeedbackThrottle,
+};
+use super::proxy::{ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed};
+#[cfg(test)]
+use super::settings::{create_config_backup, import_config, list_config_backups};
+#[cfg(test)]
+use super::update::{
+    check_update_impl, current_update_platform_for, download_update_impl,
+    install_after_quit_command_parts, install_command_parts, is_newer_version,
+    pick_macos_installer, pick_platform_installer, pick_windows_installer,
+};
 
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const FEEDBACK_WORKER_URL: &str = "https://codex-app-transfer-feedback.alysechencn.workers.dev";
+pub(super) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+// moved to handlers::feedback::FEEDBACK_WORKER_URL
 const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
-struct FeedbackThrottleState {
-    last_success: Option<Instant>,
-    failure_ts: Vec<Instant>,
-    failure_cooldown_until: Option<Instant>,
-}
-
-struct FeedbackThrottle {
-    inner: Mutex<FeedbackThrottleState>,
-}
-
-impl FeedbackThrottle {
-    const SUCCESS_COOLDOWN: Duration = Duration::from_secs(60);
-    const FAILURE_WINDOW: Duration = Duration::from_secs(300);
-    const FAILURE_LIMIT: usize = 5;
-    const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
-
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(FeedbackThrottleState {
-                last_success: None,
-                failure_ts: Vec::new(),
-                failure_cooldown_until: None,
-            }),
-        }
-    }
-
-    fn acquire(&self) -> Result<(), String> {
-        let now = Instant::now();
-        let mut inner = self.inner.lock().unwrap();
-
-        if let Some(last_success) = inner.last_success {
-            let elapsed = now.saturating_duration_since(last_success);
-            if elapsed < Self::SUCCESS_COOLDOWN {
-                let wait = Self::SUCCESS_COOLDOWN.saturating_sub(elapsed).as_secs();
-                return Err(format!("刚提交成功,请等 {wait} 秒后再发新反馈"));
-            }
-        }
-
-        if let Some(until) = inner.failure_cooldown_until {
-            if now < until {
-                let wait = until.saturating_duration_since(now).as_secs();
-                return Err(format!("连续提交失败次数过多,请等 {wait} 秒后再试"));
-            }
-        }
-
-        inner
-            .failure_ts
-            .retain(|ts| now.saturating_duration_since(*ts) < Self::FAILURE_WINDOW);
-        Ok(())
-    }
-
-    fn record_success(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.last_success = Some(Instant::now());
-        inner.failure_ts.clear();
-        inner.failure_cooldown_until = None;
-    }
-
-    fn record_failure(&self) {
-        let now = Instant::now();
-        let mut inner = self.inner.lock().unwrap();
-        inner
-            .failure_ts
-            .retain(|ts| now.saturating_duration_since(*ts) < Self::FAILURE_WINDOW);
-        inner.failure_ts.push(now);
-        if inner.failure_ts.len() >= Self::FAILURE_LIMIT {
-            inner.failure_cooldown_until = Some(now + Self::FAILURE_COOLDOWN);
-        }
-    }
-}
-
-static FEEDBACK_THROTTLE: OnceLock<FeedbackThrottle> = OnceLock::new();
-
-fn feedback_throttle() -> &'static FeedbackThrottle {
-    FEEDBACK_THROTTLE.get_or_init(FeedbackThrottle::new)
-}
-
-fn feedback_worker_url(raw: &str) -> Result<&str, String> {
-    let url = raw.trim();
-    if url.is_empty() {
-        Err("反馈服务未配置".to_owned())
-    } else {
-        Ok(url)
-    }
-}
+// moved to handlers::feedback::FeedbackThrottle / FeedbackThrottleState
+// moved to handlers::feedback::FEEDBACK_THROTTLE
+// moved to handlers::feedback::feedback_throttle
+// moved to handlers::feedback::feedback_worker_url
 
 // ── 工具 ─────────────────────────────────────────────────────────────
 
-fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
-    (
-        status,
-        Json(json!({"success": false, "message": msg.into()})),
-    )
-}
-
-fn open_directory(path: &PathBuf) -> Result<(), String> {
-    let mut command = if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(path);
-        command
-    } else if cfg!(target_os = "windows") {
-        let mut command = Command::new("explorer");
-        command.arg(path);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(path);
-        command
-    };
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("无法打开日志目录: {e}"))
-}
+// moved to handlers::common::err
+// moved to handlers::common::open_directory
 
 // ── Codex App 重启 ────────────────────────────────────────────────────
 //
@@ -394,573 +306,24 @@ fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
     open_codex_app(platform)
 }
 
-fn multipart_text_part(text: String, mime: &str) -> multipart::Part {
-    multipart::Part::text(text.clone())
-        .mime_str(mime)
-        .unwrap_or_else(|_| multipart::Part::text(text))
-}
+// moved to handlers::feedback::multipart_text_part
 
-fn active_provider_name(config: &Value) -> String {
-    let active_id = config.get("activeProvider").and_then(|v| v.as_str());
-    config
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .and_then(|providers| {
-            if let Some(active_id) = active_id {
-                providers
-                    .iter()
-                    .find(|provider| provider.get("id").and_then(|v| v.as_str()) == Some(active_id))
-            } else {
-                providers.first()
-            }
-        })
-        .and_then(|provider| provider.get("name").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_owned()
-}
+// moved to handlers::common::active_provider_name
 
-fn feedback_proxy_tail_content(path: &FsPath) -> Option<String> {
-    let content = fs::read(path).ok()?;
-    let content = String::from_utf8_lossy(&content);
-    let lines: Vec<&str> = content.lines().collect();
-    let start = lines.len().saturating_sub(200);
-    let tail = lines[start..].join("\n");
-    if tail.trim().is_empty() {
-        return None;
-    }
-    Some(tail)
-}
+// moved to handlers::feedback::feedback_proxy_tail_content
+// moved to handlers::feedback::feedback_proxy_tail_part
+// moved to handlers::feedback::FeedbackAttachment
 
-fn feedback_proxy_tail_part() -> Option<multipart::Part> {
-    let log_dir = proxy_log_dir()?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let path = log_dir.join(format!("proxy-{today}.log"));
-    let tail = feedback_proxy_tail_content(&path)?;
-    let part =
-        multipart::Part::bytes(tail.into_bytes()).file_name(format!("proxy-tail-{today}.log"));
-    Some(
-        part.mime_str("text/plain")
-            .unwrap_or_else(|_| multipart::Part::text("")),
-    )
-}
+// moved to handlers::common::current_epoch_secs
 
-#[derive(Debug, PartialEq, Eq)]
-struct FeedbackAttachment {
-    field: String,
-    name: String,
-    content_type: String,
-    raw: Vec<u8>,
-}
+// moved to handlers::feedback::feedback_attachments
 
-fn current_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn feedback_attachments(input: &Value, timestamp_secs: u64) -> Vec<FeedbackAttachment> {
-    let mut shot_idx = 0usize;
-    let mut log_idx = 0usize;
-    let mut parts = Vec::new();
-
-    if let Some(attachments) = input.get("attachments").and_then(|v| v.as_array()) {
-        for attachment in attachments {
-            let Some(obj) = attachment.as_object() else {
-                continue;
-            };
-            let content_b64 = obj
-                .get("content_b64")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let Ok(raw) = STANDARD.decode(content_b64.as_bytes()) else {
-                continue;
-            };
-            if raw.is_empty() || raw.len() > 5 * 1024 * 1024 {
-                continue;
-            }
-            let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("log");
-            let fallback_name = format!("{kind}-{timestamp_secs}.bin");
-            let name = obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .filter(|v| !v.is_empty())
-                .unwrap_or(&fallback_name)
-                .to_owned();
-            let content_type = obj
-                .get("content_type")
-                .and_then(|v| v.as_str())
-                .filter(|v| v.contains('/'))
-                .unwrap_or("application/octet-stream")
-                .to_owned();
-            let field = if kind == "screenshot" {
-                let field = format!("screenshot{shot_idx}");
-                shot_idx += 1;
-                field
-            } else {
-                let field = format!("log{log_idx}");
-                log_idx += 1;
-                field
-            };
-            parts.push(FeedbackAttachment {
-                field,
-                name,
-                content_type,
-                raw,
-            });
-        }
-    }
-
-    parts
-}
-
-fn current_update_platform() -> String {
-    current_update_platform_for(std::env::consts::OS, std::env::consts::ARCH)
-}
-
-fn current_update_platform_for(raw_platform: &str, raw_machine: &str) -> String {
-    let machine = raw_machine.to_ascii_lowercase();
-    let arch = match machine.as_str() {
-        "amd64" | "x86_64" => "x64".to_owned(),
-        "arm64" | "aarch64" => "arm64".to_owned(),
-        "" => "unknown".to_owned(),
-        value => value.to_owned(),
-    };
-    let platform = raw_platform.to_ascii_lowercase();
-    if platform.starts_with("win") || platform == "windows" {
-        return format!("windows-{arch}");
-    }
-    if platform == "darwin" || platform == "macos" {
-        return format!("macos-{arch}");
-    }
-    if platform.starts_with("linux") {
-        return format!("linux-{arch}");
-    }
-    format!("{platform}-{arch}")
-}
-
-fn version_parts(version: &str) -> Vec<u64> {
-    let text = version.trim().trim_start_matches(['v', 'V']);
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_digit() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            parts.push(current.parse::<u64>().unwrap_or(0));
-            current.clear();
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current.parse::<u64>().unwrap_or(0));
-    }
-    if parts.is_empty() {
-        parts.push(0);
-    }
-    parts
-}
-
-fn is_newer_version(latest: &str, current: &str) -> bool {
-    let mut latest_parts = version_parts(latest);
-    let mut current_parts = version_parts(current);
-    let width = latest_parts.len().max(current_parts.len());
-    latest_parts.resize(width, 0);
-    current_parts.resize(width, 0);
-    latest_parts > current_parts
-}
-
-fn validate_update_url(url: &str) -> Result<String, String> {
-    let parsed = reqwest::Url::parse(url.trim())
-        .map_err(|_| "更新地址必须是 http 或 https URL".to_owned())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("更新地址必须是 http 或 https URL".to_owned());
-    }
-    Ok(parsed.to_string())
-}
-
-fn safe_asset_name(name: &str) -> Result<String, String> {
-    let filename = FsPath::new(name.trim())
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    if filename.is_empty() {
-        Err("更新资产缺少文件名".to_owned())
-    } else {
-        Ok(filename)
-    }
-}
-
-fn asset_filename_from_url(url: &str) -> String {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .path_segments()
-                .and_then(|mut segments| segments.next_back())
-                .map(|name| name.to_owned())
-        })
-        .unwrap_or_default()
-}
-
-fn file_sha256(path: &FsPath) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| format!("读取安装包失败: {e}"))?;
-    let mut digest = Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| format!("读取安装包失败: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
-fn pick_platform_data<'a>(latest_json: &'a Value, platform: &str) -> Result<&'a Value, String> {
-    latest_json
-        .get("platforms")
-        .and_then(|v| v.as_object())
-        .and_then(|platforms| platforms.get(platform))
-        .filter(|v| v.as_object().is_some())
-        .ok_or_else(|| format!("latest.json 中没有 {platform} 平台资产"))
-}
-
-fn allowed_install_extensions(platform: &str) -> &'static [&'static str] {
-    if platform.starts_with("windows-") {
-        &[".exe"]
-    } else if platform.starts_with("macos-") {
-        &[".pkg", ".dmg"]
-    } else {
-        &[]
-    }
-}
-
-fn pick_windows_installer(assets: &[Value]) -> Result<Value, String> {
-    assets
-        .iter()
-        .find(|asset| {
-            asset
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .ends_with("windows-setup.exe")
-        })
-        .cloned()
-        .ok_or_else(|| "当前版本没有 Windows 安装包资产".to_owned())
-}
-
-fn pick_macos_installer(assets: &[Value]) -> Result<Value, String> {
-    if let Some(pkg) = assets.iter().find(|asset| {
-        asset
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .ends_with(".pkg")
-    }) {
-        return Ok(pkg.clone());
-    }
-    assets
-        .iter()
-        .find(|asset| {
-            asset
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .ends_with(".dmg")
-        })
-        .cloned()
-        .ok_or_else(|| "当前版本没有 macOS 安装资产".to_owned())
-}
-
-fn pick_platform_installer(assets: &[Value], platform: &str) -> Result<Value, String> {
-    if platform.starts_with("windows-") {
-        return pick_windows_installer(assets);
-    }
-    if platform.starts_with("macos-") {
-        return pick_macos_installer(assets);
-    }
-    Err(format!("当前平台暂不支持应用内安装: {platform}"))
-}
-
-fn install_command_parts(path: &str, platform: &str) -> Result<Vec<String>, String> {
-    if platform.starts_with("windows-") {
-        return Ok(vec![path.to_owned()]);
-    }
-    if platform.starts_with("macos-") {
-        return Ok(vec!["open".to_owned(), path.to_owned()]);
-    }
-    Err(format!("当前平台暂不支持应用内安装: {platform}"))
-}
-
-#[cfg(test)]
-fn install_after_quit_command_parts(
-    path: &str,
-    platform: &str,
-    wait_for_pid: u32,
-) -> Result<Vec<String>, String> {
-    if wait_for_pid == 0 {
-        return Err("等待退出的进程 ID 无效".to_owned());
-    }
-    if platform.starts_with("macos-") {
-        return Ok(vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "pid=\"$1\"; installer=\"$2\"; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.2; done; exec open \"$installer\"".to_owned(),
-            "cas-update-installer".to_owned(),
-            wait_for_pid.to_string(),
-            path.to_owned(),
-        ]);
-    }
-    install_command_parts(path, platform)
-}
-
-fn launch_update_installer(installer_path: &str, platform: &str) -> Result<bool, String> {
-    let command = install_command_parts(installer_path, platform)?;
-    let Some((program, args)) = command.split_first() else {
-        return Err("安装命令为空".to_owned());
-    };
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| false)
-        .map_err(|e| format!("启动安装器失败: {e}"))
-}
-
-fn configured_update_url(input: Option<&str>) -> String {
-    if let Some(url) = input.map(str::trim).filter(|url| !url.is_empty()) {
-        return url.to_owned();
-    }
-    load_registry()
-        .ok()
-        .and_then(|cfg| {
-            cfg.get("settings")
-                .and_then(|settings| settings.get("updateUrl"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|url| !url.is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| DEFAULT_UPDATE_URL.to_owned())
-}
-
-async fn fetch_latest_json(client: &reqwest::Client, url: &str) -> Result<Value, String> {
-    let safe_url = validate_update_url(url)?;
-    let response = client
-        .get(safe_url)
-        .send()
-        .await
-        .map_err(|e| format!("更新地址请求失败: {e}"))?;
-    response
-        .error_for_status_ref()
-        .map_err(|e| format!("更新地址请求失败: {e}"))?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("更新地址请求失败: {e}"))?;
-    let data = serde_json::from_slice::<Value>(&bytes).or_else(|_| {
-        let without_bom = bytes
-            .strip_prefix(&[0xEF, 0xBB, 0xBF])
-            .unwrap_or(bytes.as_ref());
-        serde_json::from_slice::<Value>(without_bom)
-    });
-    let data = data.map_err(|_| "更新地址返回的不是有效 JSON".to_owned())?;
-    if !data.is_object() {
-        return Err("latest.json 格式错误".to_owned());
-    }
-    Ok(data)
-}
-
-async fn check_update_impl(
-    client: &reqwest::Client,
-    url: &str,
-    current_version: &str,
-    platform: &str,
-) -> Result<Value, String> {
-    let latest_json = fetch_latest_json(client, url).await?;
-    let latest_version = latest_json
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-    if latest_version.is_empty() {
-        return Err("latest.json 缺少 version 字段".to_owned());
-    }
-    let platform_data = pick_platform_data(&latest_json, platform)?;
-    let assets = platform_data
-        .get("assets")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    if !assets.is_array() {
-        return Err("latest.json assets 字段格式错误".to_owned());
-    }
-    Ok(json!({
-        "success": true,
-        "updateAvailable": is_newer_version(&latest_version, current_version),
-        "currentVersion": current_version,
-        "latestVersion": latest_version,
-        "platform": platform,
-        "pubDate": latest_json.get("pub_date").cloned().unwrap_or(Value::Null),
-        "notes": latest_json.get("notes").cloned().unwrap_or_else(|| json!("")),
-        "assets": assets,
-        "minimumSupportedVersion": latest_json.get("minimum_supported_version").cloned().unwrap_or(Value::Null),
-        "updateProtocol": latest_json.get("update_protocol").cloned().unwrap_or_else(|| json!(1)),
-    }))
-}
-
-async fn download_asset_impl(
-    client: &reqwest::Client,
-    asset: &Value,
-    target_dir: Option<&FsPath>,
-    platform: &str,
-) -> Result<Value, String> {
-    let url = validate_update_url(asset.get("url").and_then(|v| v.as_str()).unwrap_or(""))?;
-    let raw_name = asset
-        .get("name")
-        .and_then(|v| v.as_str())
-        .filter(|name| !name.trim().is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| asset_filename_from_url(&url));
-    let filename = safe_asset_name(&raw_name)?;
-    let allowed_extensions = allowed_install_extensions(platform);
-    if allowed_extensions.is_empty() {
-        return Err(format!("当前平台暂不支持应用内安装: {platform}"));
-    }
-    let lower_name = filename.to_ascii_lowercase();
-    if !allowed_extensions
-        .iter()
-        .any(|ext| lower_name.ends_with(ext))
-    {
-        return Err(format!(
-            "当前平台只能下载安装资产: {}",
-            allowed_extensions.join(" / ")
-        ));
-    }
-
-    let updates_dir = target_dir.map(PathBuf::from).unwrap_or_else(|| {
-        std::env::temp_dir()
-            .join("Codex-App-Transfer")
-            .join("updates")
-    });
-    fs::create_dir_all(&updates_dir).map_err(|e| format!("写入安装包失败: {e}"))?;
-    let target = updates_dir.join(filename);
-    let partial = target.with_file_name(format!(
-        "{}.download",
-        target
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("update")
-    ));
-
-    let download_result: Result<(), String> = async {
-        let mut response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| format!("下载安装包失败: {e}"))?;
-        response
-            .error_for_status_ref()
-            .map_err(|e| format!("下载安装包失败: {e}"))?;
-        let mut file = fs::File::create(&partial).map_err(|e| format!("写入安装包失败: {e}"))?;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| format!("下载安装包失败: {e}"))?
-        {
-            if !chunk.is_empty() {
-                file.write_all(&chunk)
-                    .map_err(|e| format!("写入安装包失败: {e}"))?;
-            }
-        }
-        file.flush().map_err(|e| format!("写入安装包失败: {e}"))?;
-        Ok(())
-    }
-    .await;
-    if let Err(e) = download_result {
-        let _ = fs::remove_file(&partial);
-        return Err(e);
-    }
-
-    let actual_sha = file_sha256(&partial)?;
-    let expected_sha = asset
-        .get("sha256")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if !expected_sha.is_empty() && actual_sha.to_ascii_lowercase() != expected_sha {
-        let _ = fs::remove_file(&partial);
-        return Err("安装包校验失败，已取消安装".to_owned());
-    }
-
-    if target.exists() {
-        fs::remove_file(&target).map_err(|e| format!("写入安装包失败: {e}"))?;
-    }
-    fs::rename(&partial, &target).map_err(|e| format!("写入安装包失败: {e}"))?;
-    let size = fs::metadata(&target)
-        .map_err(|e| format!("读取安装包失败: {e}"))?
-        .len();
-    Ok(json!({
-        "asset": asset,
-        "path": target.to_string_lossy(),
-        "sha256": actual_sha,
-        "size": size,
-    }))
-}
-
-async fn download_update_impl(
-    client: &reqwest::Client,
-    url: &str,
-    current_version: &str,
-    platform: &str,
-    target_dir: Option<&FsPath>,
-) -> Result<Value, String> {
-    let mut result = check_update_impl(client, url, current_version, platform).await?;
-    if result.get("updateAvailable").and_then(|v| v.as_bool()) != Some(true) {
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert("downloaded".to_owned(), Value::Bool(false));
-            obj.insert(
-                "message".to_owned(),
-                Value::String("当前已是最新版本".to_owned()),
-            );
-        }
-        return Ok(result);
-    }
-
-    let assets = result
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let installer_asset = pick_platform_installer(&assets, platform)?;
-    let downloaded = download_asset_impl(client, &installer_asset, target_dir, platform).await?;
-    if let Some(obj) = result.as_object_mut() {
-        obj.insert("downloaded".to_owned(), Value::Bool(true));
-        obj.insert("installerAsset".to_owned(), installer_asset);
-        obj.insert(
-            "installerPath".to_owned(),
-            downloaded.get("path").cloned().unwrap_or(Value::Null),
-        );
-        obj.insert(
-            "installerSha256".to_owned(),
-            downloaded.get("sha256").cloned().unwrap_or(Value::Null),
-        );
-        obj.insert(
-            "installerSize".to_owned(),
-            downloaded.get("size").cloned().unwrap_or(Value::Null),
-        );
-    }
-    Ok(result)
-}
+// moved to handlers::update::current_update_platform / current_update_platform_for / version_parts /
+// is_newer_version / validate_update_url / safe_asset_name / asset_filename_from_url / file_sha256 /
+// pick_platform_data / allowed_install_extensions / pick_windows_installer / pick_macos_installer /
+// pick_platform_installer / install_command_parts / install_after_quit_command_parts /
+// launch_update_installer / configured_update_url / fetch_latest_json / check_update_impl /
+// download_asset_impl / download_update_impl
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 fn fresh_provider_id(existing: &[String]) -> String {
@@ -1883,51 +1246,22 @@ async fn test_provider_connection(provider: &Value) -> Value {
     })
 }
 
-fn read_proxy_port(cfg: &RawConfig) -> u16 {
-    cfg.get("settings")
-        .and_then(|s| s.get("proxyPort"))
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok())
-        .unwrap_or(18080)
-}
+// moved to handlers::proxy::read_proxy_port
+// moved to handlers::proxy::read_gateway_key
+// moved to handlers::common::read_setting_bool
+// moved to handlers::proxy::ensure_gateway_key
 
-fn read_gateway_key(cfg: &RawConfig) -> String {
-    cfg.get("gatewayApiKey")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned()
-}
-
-fn read_setting_bool(cfg: &RawConfig, key: &str, default: bool) -> bool {
-    cfg.get("settings")
-        .and_then(|settings| settings.get(key))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(default)
-}
-
-fn ensure_gateway_key(cfg: &mut RawConfig) -> String {
-    let existing = read_gateway_key(cfg);
-    if !existing.is_empty() {
-        return existing;
-    }
-    let gateway_key = generate_gateway_key_value();
-    cfg.as_object_mut()
-        .unwrap()
-        .insert("gatewayApiKey".into(), Value::String(gateway_key.clone()));
-    gateway_key
-}
-
-struct DesktopConfigTarget {
-    base_url: String,
-    api_key: String,
-    supports_1m: bool,
-    provider_name: String,
-    default_model: String,
-    model_mappings: Value,
-    model_capabilities: Value,
-    requires_proxy: bool,
-    mode: &'static str,
-    proxy_port: u16,
+pub(super) struct DesktopConfigTarget {
+    pub(super) base_url: String,
+    pub(super) api_key: String,
+    pub(super) supports_1m: bool,
+    pub(super) provider_name: String,
+    pub(super) default_model: String,
+    pub(super) model_mappings: Value,
+    pub(super) model_capabilities: Value,
+    pub(super) requires_proxy: bool,
+    pub(super) mode: &'static str,
+    pub(super) proxy_port: u16,
 }
 
 fn desktop_config_target_for_provider(
@@ -1971,7 +1305,7 @@ fn desktop_config_target_for_provider(
     }
 }
 
-fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConfigTarget> {
+pub(super) fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConfigTarget> {
     let provider = active_provider(cfg)?;
     let mut snapshot = cfg.clone();
     Some(desktop_config_target_for_provider(
@@ -2010,7 +1344,7 @@ fn desktop_inference_models_json(target: Option<&DesktopConfigTarget>) -> String
     serde_json::to_string(&desktop_expected_model_items(target)).unwrap_or_else(|_| "[]".to_owned())
 }
 
-fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<String> {
+pub(super) fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<String> {
     let content = std::fs::read_to_string(&paths.config_toml).ok()?;
     for line in content.lines() {
         let stripped = line.trim_start();
@@ -2035,7 +1369,7 @@ fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<String> 
     None
 }
 
-fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
+pub(super) fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
     read_auth(&paths.auth_json)
         .ok()
         .and_then(|auth| {
@@ -2092,7 +1426,7 @@ fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -
     })
 }
 
-fn desktop_health(
+pub(super) fn desktop_health(
     paths: Option<&CodexPaths>,
     configured: bool,
     actual_base_url: Option<&str>,
@@ -2174,12 +1508,7 @@ fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
     serde_json::to_value(result).map_err(|e| format!("apply 结果序列化失败: {e}"))
 }
 
-async fn start_proxy_if_needed(manager: &ProxyManager, port: u16) -> Result<bool, String> {
-    if manager.status().running {
-        manager.stop_silent();
-    }
-    manager.start(port).await.map(|_| true)
-}
+// moved to handlers::proxy::start_proxy_if_needed
 
 async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
     let mut cfg = match load_registry() {
@@ -2316,14 +1645,7 @@ pub async fn switch_provider_and_sync(
     })
 }
 
-fn ensure_settings_object(cfg: &mut RawConfig) -> &mut serde_json::Map<String, Value> {
-    let obj = cfg.as_object_mut().expect("registry root is object");
-    obj.entry("settings".to_owned())
-        .or_insert_with(|| json!({}));
-    obj.get_mut("settings")
-        .and_then(|v| v.as_object_mut())
-        .expect("settings is object")
-}
+// moved to handlers::settings::ensure_settings_object
 
 fn provider_index(cfg: &RawConfig, id: &str) -> Option<usize> {
     cfg.get("providers")
@@ -2337,7 +1659,7 @@ fn provider_index(cfg: &RawConfig, id: &str) -> Option<usize> {
         })
 }
 
-fn active_provider(cfg: &RawConfig) -> Option<Value> {
+pub(super) fn active_provider(cfg: &RawConfig) -> Option<Value> {
     let active_id = cfg
         .get("activeProvider")
         .and_then(|v| v.as_str())
@@ -2355,419 +1677,24 @@ fn active_provider(cfg: &RawConfig) -> Option<Value> {
     chosen.cloned()
 }
 
-fn generate_gateway_key_value() -> String {
-    let mut buf = [0u8; 32];
-    let _ = getrandom::getrandom(&mut buf);
-    format!("cas_{}", URL_SAFE_NO_PAD.encode(buf))
-}
+// moved to handlers::common::generate_gateway_key_value
+// moved to handlers::common::random_hex
 
-fn random_hex(bytes_len: usize) -> String {
-    let mut buf = vec![0u8; bytes_len];
-    let _ = getrandom::getrandom(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
-}
+// moved to handlers::settings::app_config_dir
+// moved to handlers::settings::app_config_file
+// moved to handlers::settings::app_backup_dir
+// moved to handlers::settings::system_time_iso_seconds
+// moved to handlers::settings::default_config_value
 
-fn app_config_dir() -> Result<PathBuf, String> {
-    config_dir().ok_or_else(|| "无法定位用户配置目录".to_owned())
-}
+// moved to handlers::settings::normalize_imported_provider
+// moved to handlers::settings::normalize_imported_config
+// moved to handlers::settings::preserve_existing_provider_secrets
+// moved to handlers::settings::create_config_backup
+// moved to handlers::settings::list_config_backups
 
-fn app_config_file() -> Result<PathBuf, String> {
-    Ok(app_config_dir()?.join("config.json"))
-}
-
-fn app_backup_dir() -> Result<PathBuf, String> {
-    Ok(app_config_dir()?.join("backups"))
-}
-
-fn system_time_iso_seconds(time: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Local> = time.into();
-    dt.format("%Y-%m-%dT%H:%M:%S").to_string()
-}
-
-fn default_config_value() -> Value {
-    json!({
-        "version": APP_VERSION,
-        "activeProvider": null,
-        "gatewayApiKey": null,
-        "providers": [],
-        "settings": {
-            "theme": "default",
-            "language": "zh",
-            "proxyPort": 18080,
-            "adminPort": 18081,
-            "autoStart": false,
-            "autoApplyOnStart": true,
-            "exposeAllProviderModels": false,
-            "restoreCodexOnExit": true,
-            "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
-        }
-    })
-}
-
-fn normalize_imported_provider(provider: &Value) -> Option<Value> {
-    let src = provider.as_object()?;
-    let mut normalized = src.clone();
-    let provider_id = normalized.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let safe_id: String = provider_id
-        .chars()
-        .filter(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
-        .take(64)
-        .collect();
-    normalized.insert(
-        "id".into(),
-        Value::String(if safe_id.is_empty() {
-            random_hex(4)
-        } else {
-            safe_id
-        }),
-    );
-    normalized
-        .entry("name")
-        .or_insert_with(|| Value::String("Unnamed Provider".into()));
-    normalized
-        .entry("baseUrl")
-        .or_insert_with(|| Value::String(String::new()));
-    normalized
-        .entry("authScheme")
-        .or_insert_with(|| Value::String("bearer".into()));
-    normalized
-        .entry("apiFormat")
-        .or_insert_with(|| Value::String("responses".into()));
-    normalized
-        .entry("apiKey")
-        .or_insert_with(|| Value::String(String::new()));
-    normalized
-        .entry("extraHeaders")
-        .or_insert_with(|| json!({}));
-    normalized
-        .entry("modelCapabilities")
-        .or_insert_with(|| json!({}));
-    normalized
-        .entry("requestOptions")
-        .or_insert_with(|| json!({}));
-    normalized.entry("isBuiltin").or_insert(Value::Bool(false));
-    normalized
-        .entry("sortIndex")
-        .or_insert(Value::Number(0.into()));
-
-    let models = serde_json::to_value(normalize_model_mappings(normalized.get("models"))).ok()?;
-    normalized.insert("models".into(), models);
-    Some(Value::Object(normalized))
-}
-
-fn normalize_imported_config(data: &Value) -> Result<Value, String> {
-    let root = data
-        .as_object()
-        .ok_or_else(|| "配置文件必须是 JSON 对象".to_owned())?;
-    let source = root
-        .get("config")
-        .and_then(|v| v.as_object())
-        .map(|obj| Value::Object(obj.clone()))
-        .unwrap_or_else(|| data.clone());
-    let source_obj = source
-        .as_object()
-        .ok_or_else(|| "配置文件必须是 JSON 对象".to_owned())?;
-
-    let mut normalized = default_config_value();
-    {
-        let obj = normalized.as_object_mut().expect("default config object");
-        for key in [
-            "version",
-            "activeProvider",
-            "gatewayApiKey",
-            "providers",
-            "settings",
-        ] {
-            if let Some(value) = source_obj.get(key) {
-                obj.insert(key.to_owned(), value.clone());
-            }
-        }
-        obj.insert(
-            "version".into(),
-            source_obj
-                .get("version")
-                .cloned()
-                .unwrap_or_else(|| Value::String(APP_VERSION.to_owned())),
-        );
-    }
-
-    let mut settings = default_config_value()
-        .get("settings")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if let (Some(settings_obj), Some(imported)) = (
-        settings.as_object_mut(),
-        source_obj.get("settings").and_then(|v| v.as_object()),
-    ) {
-        for (key, value) in imported {
-            settings_obj.insert(key.clone(), value.clone());
-        }
-    }
-    normalized["settings"] = settings;
-
-    let providers = source_obj
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "providers 必须是数组".to_owned())?;
-    let mut normalized_providers = Vec::new();
-    let mut seen_ids = HashSet::new();
-    for provider in providers {
-        let Some(mut normalized_provider) = normalize_imported_provider(provider) else {
-            continue;
-        };
-        let provider_id = normalized_provider
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        if !seen_ids.insert(provider_id.clone()) {
-            if let Some(obj) = normalized_provider.as_object_mut() {
-                obj.insert(
-                    "id".into(),
-                    Value::String(format!("{provider_id}-{}", random_hex(2))),
-                );
-            }
-        }
-        if let Some(id) = normalized_provider.get("id").and_then(|v| v.as_str()) {
-            seen_ids.insert(id.to_owned());
-        }
-        normalized_providers.push(normalized_provider);
-    }
-    normalized["providers"] = Value::Array(normalized_providers);
-
-    let provider_ids: HashSet<String> = normalized["providers"]
-        .as_array()
-        .map(|providers| {
-            providers
-                .iter()
-                .filter_map(|p| p.get("id").and_then(|v| v.as_str()).map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let active_provider = source_obj.get("activeProvider").and_then(|v| v.as_str());
-    normalized["activeProvider"] = if let Some(active) = active_provider {
-        if provider_ids.contains(active) {
-            Value::String(active.to_owned())
-        } else {
-            normalized["providers"]
-                .as_array()
-                .and_then(|providers| providers.first())
-                .and_then(|p| p.get("id"))
-                .cloned()
-                .unwrap_or(Value::Null)
-        }
-    } else {
-        normalized["providers"]
-            .as_array()
-            .and_then(|providers| providers.first())
-            .and_then(|p| p.get("id"))
-            .cloned()
-            .unwrap_or(Value::Null)
-    };
-    if let Some(key) = source_obj.get("gatewayApiKey").filter(|v| !v.is_null()) {
-        normalized["gatewayApiKey"] = key.clone();
-    }
-
-    Ok(normalized)
-}
-
-fn preserve_existing_provider_secrets(imported: &mut Value, current: &Value) {
-    let Some(imported_providers) = imported.get_mut("providers").and_then(|v| v.as_array_mut())
-    else {
-        return;
-    };
-    let current_providers = current
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-
-    for provider in imported_providers {
-        let Some(provider_obj) = provider.as_object_mut() else {
-            continue;
-        };
-        let Some(provider_id) = provider_obj.get("id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(current_provider) = current_providers
-            .iter()
-            .find(|item| item.get("id").and_then(|v| v.as_str()) == Some(provider_id))
-            .and_then(|v| v.as_object())
-        else {
-            continue;
-        };
-
-        let imported_key_is_blank = provider_obj
-            .get("apiKey")
-            .and_then(|v| v.as_str())
-            .map(|s| s.is_empty())
-            .unwrap_or(true);
-        if imported_key_is_blank {
-            if let Some(existing_key) = current_provider
-                .get("apiKey")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                provider_obj.insert("apiKey".into(), Value::String(existing_key.to_owned()));
-            }
-        }
-
-        let imported_headers_empty = provider_obj
-            .get("extraHeaders")
-            .and_then(|v| v.as_object())
-            .map(|obj| obj.is_empty())
-            .unwrap_or(true);
-        if imported_headers_empty {
-            if let Some(existing_headers) = current_provider
-                .get("extraHeaders")
-                .and_then(|v| v.as_object())
-                .filter(|obj| !obj.is_empty())
-            {
-                provider_obj.insert(
-                    "extraHeaders".into(),
-                    Value::Object(existing_headers.clone()),
-                );
-            }
-        }
-    }
-}
-
-fn create_config_backup(reason: &str) -> Result<Value, String> {
-    let backup_dir = app_backup_dir()?;
-    fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
-    let config_file = app_config_file()?;
-    if !config_file.exists() {
-        let cfg = load_registry()?;
-        save_registry(&cfg)?;
-    }
-
-    let safe_reason: String = reason
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
-        .take(32)
-        .collect();
-    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%f");
-    let filename = format!(
-        "config-{timestamp}-{}-{}.json",
-        if safe_reason.is_empty() {
-            "manual"
-        } else {
-            safe_reason.as_str()
-        },
-        random_hex(2)
-    );
-    let target = backup_dir.join(&filename);
-    fs::copy(&config_file, &target).map_err(|e| format!("复制配置备份失败: {e}"))?;
-    let stat = fs::metadata(&target).map_err(|e| format!("读取备份元数据失败: {e}"))?;
-    Ok(json!({
-        "name": filename,
-        "size": stat.len(),
-        "createdAt": system_time_iso_seconds(stat.modified().unwrap_or_else(|_| SystemTime::now())),
-    }))
-}
-
-fn list_config_backups() -> Result<Vec<Value>, String> {
-    let backup_dir = app_backup_dir()?;
-    fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
-    let mut backups = Vec::new();
-    let entries = fs::read_dir(&backup_dir).map_err(|e| format!("读取备份目录失败: {e}"))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("json") || !path.is_file() {
-            continue;
-        }
-        let stat = match fs::metadata(&path) {
-            Ok(stat) => stat,
-            Err(_) => continue,
-        };
-        let name = match path.file_name().and_then(|v| v.to_str()) {
-            Some(name) => name.to_owned(),
-            None => continue,
-        };
-        backups.push(json!({
-            "name": name,
-            "size": stat.len(),
-            "createdAt": system_time_iso_seconds(stat.modified().unwrap_or_else(|_| SystemTime::now())),
-        }));
-    }
-    backups.sort_by(|a, b| {
-        let a = a.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
-        let b = b.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
-        b.cmp(a)
-    });
-    Ok(backups)
-}
-
-// ── /api/instance-info & /api/instance-show-window ───────────────────
-
-pub async fn instance_info() -> Json<Value> {
-    Json(json!({
-        "app": "codex-app-transfer",
-        "version": APP_VERSION,
-        "pid": std::process::id(),
-    }))
-}
-
-pub async fn instance_show_window() -> Json<Value> {
-    // 由 main.rs 通过 channel/event 拉前主窗口;这里至少回 ack
-    Json(json!({"success": true}))
-}
-
-// ── /api/status ──────────────────────────────────────────────────────
-
-pub async fn status(State(state): State<AdminState>) -> impl IntoResponse {
-    let cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let providers_count = cfg
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    let active = active_provider(&cfg).map(|p| public_provider(&p));
-    let active_id = cfg
-        .get("activeProvider")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
-    let proxy_port = read_proxy_port(&cfg);
-    let proxy_status = state.proxy_manager.status();
-    let codex_paths = CodexPaths::from_home_env().ok();
-    let codex_configured = codex_paths.as_ref().map(has_snapshot).unwrap_or(false);
-    let actual_base_url = codex_paths
-        .as_ref()
-        .and_then(|paths| read_codex_toml_root_string(paths, "openai_base_url"));
-    let actual_api_key_present = codex_paths
-        .as_ref()
-        .map(codex_openai_api_key_present)
-        .unwrap_or(false);
-    let desktop_target = desktop_target_for_active_provider(&cfg);
-    let desktop_health = desktop_health(
-        codex_paths.as_ref(),
-        codex_configured,
-        actual_base_url.as_deref(),
-        actual_api_key_present,
-        desktop_target.as_ref(),
-    );
-
-    Json(json!({
-        "desktopConfigured": codex_configured,
-        "proxyRunning": proxy_status.running,
-        "proxyPort": proxy_port,
-        "desktopMode": desktop_target.as_ref().map(|target| target.mode).unwrap_or("unconfigured"),
-        "desktopRequiresProxy": desktop_target
-            .as_ref()
-            .map(|target| target.requires_proxy)
-            .unwrap_or(false),
-        "activeProvider": active,
-        "activeProviderId": active_id,
-        "providerCount": providers_count,
-        "desktopHealth": desktop_health,
-        "exposeAllProviderModels": false,
-    }))
-    .into_response()
-}
+// moved to handlers::common::instance_info
+// moved to handlers::common::instance_show_window
+// moved to handlers::common::status
 
 // ── /api/providers ────────────────────────────────────────────────────
 
@@ -3295,439 +2222,24 @@ pub async fn restart_codex_app() -> impl IntoResponse {
     }
 }
 
-// ── /api/version ─────────────────────────────────────────────────────
-
-pub async fn version() -> Json<Value> {
-    Json(json!({"version": APP_VERSION}))
-}
+// moved to handlers::common::version
 
 // ── /api/proxy/* ─────────────────────────────────────────────────────
+// moved to handlers::proxy::*
 
-#[derive(Debug, Deserialize)]
-pub struct StartProxyInput {
-    pub port: Option<u16>,
-}
+// moved to handlers::settings::get_settings
+// moved to handlers::settings::save_settings
+// moved to handlers::settings::create_backup
+// moved to handlers::settings::list_backups
+// moved to handlers::settings::export_config
+// moved to handlers::settings::import_config
 
-pub async fn start_proxy(
-    State(state): State<AdminState>,
-    body: Option<Json<StartProxyInput>>,
-) -> impl IntoResponse {
-    let port = body
-        .and_then(|b| b.0.port)
-        .or_else(|| load_registry().ok().map(|cfg| read_proxy_port(&cfg)))
-        .unwrap_or(18080);
-    match state.proxy_manager.start(port).await {
-        Ok(s) => Json(json!({
-            "success": true,
-            "running": s.running,
-            "port": s.addr.and_then(|a| a.split(':').last().and_then(|p| p.parse::<u16>().ok())).unwrap_or(port),
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub async fn stop_proxy(State(state): State<AdminState>) -> impl IntoResponse {
-    state.proxy_manager.stop_silent();
-    Json(json!({"success": true, "running": false})).into_response()
-}
-
-pub async fn proxy_status(State(state): State<AdminState>) -> impl IntoResponse {
-    let s = state.proxy_manager.status();
-    let cfg = load_registry().unwrap_or_else(|_| json!({}));
-    let port = s
-        .addr
-        .as_ref()
-        .and_then(|a| a.split(':').last().and_then(|p| p.parse::<u16>().ok()))
-        .unwrap_or_else(|| read_proxy_port(&cfg));
-    Json(json!({
-        "running": s.running,
-        "port": port,
-        "stats": proxy_telemetry().stats.snapshot(),
-    }))
-    .into_response()
-}
-
-pub async fn proxy_logs() -> impl IntoResponse {
-    Json(json!({"logs": proxy_telemetry().logs.get_all()})).into_response()
-}
-
-pub async fn proxy_logs_clear() -> impl IntoResponse {
-    proxy_telemetry().logs.clear();
-    Json(json!({"success": true})).into_response()
-}
-
-pub async fn proxy_logs_open_dir() -> impl IntoResponse {
-    let Some(path) = proxy_log_dir() else {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位日志目录").into_response();
-    };
-    if let Err(e) = fs::create_dir_all(&path) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("无法创建日志目录: {e}"),
-        )
-        .into_response();
-    }
-    match open_directory(&path) {
-        Ok(_) => Json(json!({"success": true, "path": path.to_string_lossy()})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-// ── /api/settings ────────────────────────────────────────────────────
-
-pub async fn get_settings() -> impl IntoResponse {
-    let cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
-    Json(settings).into_response()
-}
-
-pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
-    let mut cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let s = ensure_settings_object(&mut cfg);
-    if let Some(obj) = input.as_object() {
-        for (k, v) in obj {
-            s.insert(k.clone(), v.clone());
-        }
-    }
-    if let Err(e) = save_registry(&cfg) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-    let settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
-    Json(json!({"success": true, "settings": settings})).into_response()
-}
-
-// ── /api/config/* ────────────────────────────────────────────────────
-
-pub async fn create_backup() -> impl IntoResponse {
-    match create_config_backup("manual") {
-        Ok(backup) => Json(json!({"success": true, "backup": backup})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub async fn list_backups() -> impl IntoResponse {
-    match list_config_backups() {
-        Ok(backups) => Json(json!({"backups": backups})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub async fn export_config() -> impl IntoResponse {
-    let cfg = load_registry().unwrap_or_else(|_| json!({}));
-    Json(json!({
-        "format": "codex-app-transfer.config",
-        "exportedAt": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-        "config": cfg,
-    }))
-    .into_response()
-}
-
-pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
-    let backup = match create_config_backup("before-import") {
-        Ok(backup) => backup,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let mut normalized = match normalize_imported_config(&data) {
-        Ok(config) => config,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    let current = load_registry().unwrap_or_else(|_| json!({}));
-    preserve_existing_provider_secrets(&mut normalized, &current);
-    if let Err(e) = save_registry(&normalized) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-    Json(json!({
-        "success": true,
-        "message": "配置已导入",
-        "backup": backup,
-    }))
-    .into_response()
-}
-
-// ── /api/update/* ────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, Default)]
-pub struct UpdateCheckQuery {
-    pub url: Option<String>,
-    pub current: Option<String>,
-    pub platform: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct UpdateInstallInput {
-    pub url: Option<String>,
-    pub current: Option<String>,
-    pub platform: Option<String>,
-}
-
-pub async fn update_check(Query(query): Query<UpdateCheckQuery>) -> impl IntoResponse {
-    let update_url = configured_update_url(query.url.as_deref());
-    if update_url.trim().is_empty() {
-        return err(StatusCode::BAD_REQUEST, "请先配置 latest.json 更新地址").into_response();
-    }
-    let current = query
-        .current
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or(APP_VERSION)
-        .to_owned();
-    let platform = query
-        .platform
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(current_update_platform);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            return err(StatusCode::BAD_REQUEST, format!("更新地址请求失败: {e}")).into_response()
-        }
-    };
-    match check_update_impl(&client, &update_url, &current, &platform).await {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
-    }
-}
-
-pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl IntoResponse {
-    let input = body.map(|value| value.0).unwrap_or_default();
-    let update_url = configured_update_url(input.url.as_deref());
-    if update_url.trim().is_empty() {
-        return err(StatusCode::BAD_REQUEST, "请先配置 latest.json 更新地址").into_response();
-    }
-    let current = input
-        .current
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or(APP_VERSION)
-        .to_owned();
-    let platform = input
-        .platform
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(current_update_platform);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            return err(StatusCode::BAD_REQUEST, format!("更新地址请求失败: {e}")).into_response()
-        }
-    };
-    let mut result =
-        match download_update_impl(&client, &update_url, &current, &platform, None).await {
-            Ok(result) => result,
-            Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
-        };
-    if result.get("updateAvailable").and_then(|v| v.as_bool()) != Some(true) {
-        return Json(result).into_response();
-    }
-    let installer_path = result
-        .get("installerPath")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if installer_path.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "下载安装包失败").into_response();
-    }
-    let quit_requested = match launch_update_installer(installer_path, &platform) {
-        Ok(quit_requested) => quit_requested,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let is_macos = platform.starts_with("macos-");
-    if let Some(obj) = result.as_object_mut() {
-        obj.insert("success".to_owned(), Value::Bool(true));
-        obj.insert("installerStarted".to_owned(), Value::Bool(true));
-        obj.insert("quitRequested".to_owned(), Value::Bool(quit_requested));
-        obj.insert(
-            "message".to_owned(),
-            Value::String(if is_macos {
-                if quit_requested {
-                    "更新包已下载，应用即将退出并启动安装器。".to_owned()
-                } else {
-                    "更新包已下载并打开。请先退出当前应用，再按 macOS 提示完成安装。".to_owned()
-                }
-            } else {
-                "安装包已下载并启动。安装器会沿用旧安装目录，并在安装前关闭正在运行的 Codex App Transfer。".to_owned()
-            }),
-        );
-    }
-    Json(result).into_response()
-}
+// moved to handlers::update::UpdateCheckQuery / UpdateInstallInput / update_check / update_install
 
 // ── /api/feedback ────────────────────────────────────────────────────
 
-pub async fn submit_feedback(body: Bytes) -> Response {
-    submit_feedback_with_body(body, FEEDBACK_WORKER_URL, feedback_throttle()).await
-}
-
-async fn submit_feedback_with_body(
-    body: Bytes,
-    worker_url: &str,
-    throttle: &FeedbackThrottle,
-) -> Response {
-    if let Err(reason) = throttle.acquire() {
-        return err(StatusCode::TOO_MANY_REQUESTS, reason).into_response();
-    }
-
-    let input = match serde_json::from_slice::<Value>(&body) {
-        Ok(input) => input,
-        Err(_) => return err(StatusCode::BAD_REQUEST, "请求体非 JSON").into_response(),
-    };
-
-    let title = input
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    let body_text = input
-        .get("body")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    let include_diag = input
-        .get("include_diagnostics")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    if body_text.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "请填写描述").into_response();
-    }
-
-    let worker_url = match feedback_worker_url(worker_url) {
-        Ok(url) => url,
-        Err(e) => {
-            throttle.record_failure();
-            return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
-    };
-
-    let mut meta = json!({"app_version": APP_VERSION});
-    if include_diag {
-        let active_name = load_registry()
-            .ok()
-            .map(|cfg| active_provider_name(&cfg))
-            .unwrap_or_default();
-        if let Some(obj) = meta.as_object_mut() {
-            obj.insert(
-                "os".to_owned(),
-                Value::String(std::env::consts::OS.to_owned()),
-            );
-            obj.insert(
-                "arch".to_owned(),
-                Value::String(std::env::consts::ARCH.to_owned()),
-            );
-            obj.insert(
-                "active_provider_name".to_owned(),
-                Value::String(active_name),
-            );
-            obj.insert("include_diagnostics".to_owned(), Value::Bool(true));
-        }
-    }
-
-    let mut form = multipart::Form::new()
-        .part(
-            "meta",
-            multipart_text_part(meta.to_string(), "application/json"),
-        )
-        .part("title", multipart_text_part(title, "text/plain"))
-        .part("body", multipart_text_part(body_text, "text/plain"));
-
-    for attachment in feedback_attachments(&input, current_epoch_secs()) {
-        let FeedbackAttachment {
-            field,
-            name,
-            content_type,
-            raw,
-        } = attachment;
-        let part = multipart::Part::bytes(raw.clone()).file_name(name.clone());
-        let part = part
-            .mime_str(&content_type)
-            .unwrap_or_else(|_| multipart::Part::bytes(raw).file_name(name));
-        form = form.part(field, part);
-    }
-
-    if include_diag {
-        if let Some(part) = feedback_proxy_tail_part() {
-            form = form.part("log_proxy_tail", part);
-        }
-    }
-
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            throttle.record_failure();
-            return err(StatusCode::BAD_GATEWAY, format!("反馈服务暂不可用:{e}")).into_response();
-        }
-    };
-
-    let response = match client.post(worker_url).multipart(form).send().await {
-        Ok(response) => response,
-        Err(e) => {
-            throttle.record_failure();
-            return err(StatusCode::BAD_GATEWAY, format!("反馈服务暂不可用:{e}")).into_response();
-        }
-    };
-    let status = response.status();
-    let is_json = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.starts_with("application/json"))
-        .unwrap_or(false);
-    let data = if is_json {
-        response.json::<Value>().await.unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
-
-    if !status.is_success() || data.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        throttle.record_failure();
-        let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let status_code = if status_code.is_client_error() || status_code.is_server_error() {
-            status_code
-        } else {
-            StatusCode::BAD_GATEWAY
-        };
-        let message = data
-            .get("error")
-            .or_else(|| data.get("message"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("上游错误");
-        return err(status_code, message).into_response();
-    }
-
-    throttle.record_success();
-    let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    Json(json!({
-        "success": true,
-        "id": id,
-        "message": format!("反馈已收到 (ID: {id})"),
-        "email_sent": data.get("email_sent").and_then(|v| v.as_bool()).unwrap_or(false),
-    }))
-    .into_response()
-}
+// moved to handlers::feedback::submit_feedback
+// moved to handlers::feedback::submit_feedback_with_body
 
 // ── 测速 / 模型探测 / 兼容性 ─────────────────────────────────
 
@@ -3886,10 +2398,7 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
     .into_response()
 }
 
-#[allow(dead_code)]
-pub fn _state_typecheck(_s: Arc<AdminState>) -> bool {
-    true
-}
+// moved to handlers::common::_state_typecheck
 
 #[derive(Serialize)]
 pub struct _Marker;

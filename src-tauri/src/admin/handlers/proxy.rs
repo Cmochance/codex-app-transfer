@@ -1,0 +1,125 @@
+//! `/api/proxy/*` —— 代理生命周期 + 网关密钥 + 端口.
+
+use std::fs;
+
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use codex_app_transfer_proxy::{proxy_log_dir, proxy_telemetry};
+use codex_app_transfer_registry::RawConfig;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::proxy_runner::ProxyManager;
+
+use super::super::registry_io::load as load_registry;
+use super::super::state::AdminState;
+use super::common::{err, generate_gateway_key_value, open_directory};
+
+pub(super) fn read_proxy_port(cfg: &RawConfig) -> u16 {
+    cfg.get("settings")
+        .and_then(|s| s.get("proxyPort"))
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(18080)
+}
+
+pub(super) fn read_gateway_key(cfg: &RawConfig) -> String {
+    cfg.get("gatewayApiKey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
+pub(super) fn ensure_gateway_key(cfg: &mut RawConfig) -> String {
+    let existing = read_gateway_key(cfg);
+    if !existing.is_empty() {
+        return existing;
+    }
+    let gateway_key = generate_gateway_key_value();
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("gatewayApiKey".into(), Value::String(gateway_key.clone()));
+    gateway_key
+}
+
+pub(super) async fn start_proxy_if_needed(
+    manager: &ProxyManager,
+    port: u16,
+) -> Result<bool, String> {
+    if manager.status().running {
+        manager.stop_silent();
+    }
+    manager.start(port).await.map(|_| true)
+}
+
+// ── /api/proxy/* ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct StartProxyInput {
+    pub port: Option<u16>,
+}
+
+pub async fn start_proxy(
+    State(state): State<AdminState>,
+    body: Option<Json<StartProxyInput>>,
+) -> impl IntoResponse {
+    let port = body
+        .and_then(|b| b.0.port)
+        .or_else(|| load_registry().ok().map(|cfg| read_proxy_port(&cfg)))
+        .unwrap_or(18080);
+    match state.proxy_manager.start(port).await {
+        Ok(s) => Json(json!({
+            "success": true,
+            "running": s.running,
+            "port": s.addr.and_then(|a| a.split(':').last().and_then(|p| p.parse::<u16>().ok())).unwrap_or(port),
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+pub async fn stop_proxy(State(state): State<AdminState>) -> impl IntoResponse {
+    state.proxy_manager.stop_silent();
+    Json(json!({"success": true, "running": false})).into_response()
+}
+
+pub async fn proxy_status(State(state): State<AdminState>) -> impl IntoResponse {
+    let s = state.proxy_manager.status();
+    let cfg = load_registry().unwrap_or_else(|_| json!({}));
+    let port = s
+        .addr
+        .as_ref()
+        .and_then(|a| a.split(':').last().and_then(|p| p.parse::<u16>().ok()))
+        .unwrap_or_else(|| read_proxy_port(&cfg));
+    Json(json!({
+        "running": s.running,
+        "port": port,
+        "stats": proxy_telemetry().stats.snapshot(),
+    }))
+    .into_response()
+}
+
+pub async fn proxy_logs() -> impl IntoResponse {
+    Json(json!({"logs": proxy_telemetry().logs.get_all()})).into_response()
+}
+
+pub async fn proxy_logs_clear() -> impl IntoResponse {
+    proxy_telemetry().logs.clear();
+    Json(json!({"success": true})).into_response()
+}
+
+pub async fn proxy_logs_open_dir() -> impl IntoResponse {
+    let Some(path) = proxy_log_dir() else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位日志目录").into_response();
+    };
+    if let Err(e) = fs::create_dir_all(&path) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法创建日志目录: {e}"),
+        )
+        .into_response();
+    }
+    match open_directory(&path) {
+        Ok(_) => Json(json!({"success": true, "path": path.to_string_lossy()})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}

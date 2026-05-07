@@ -24,13 +24,13 @@ pub use state::AdminState;
 pub fn build_app_router(state: AdminState) -> Router {
     Router::new()
         // 单实例握手
-        .route("/api/instance-info", get(handlers::instance_info))
+        .route("/api/instance-info", get(handlers::common::instance_info))
         .route(
             "/api/instance-show-window",
-            post(handlers::instance_show_window),
+            post(handlers::common::instance_show_window),
         )
         // 总状态
-        .route("/api/status", get(handlers::status))
+        .route("/api/status", get(handlers::common::status))
         // Providers
         .route(
             "/api/providers",
@@ -89,31 +89,43 @@ pub fn build_app_router(state: AdminState) -> Router {
             get(handlers::desktop_snapshot_status),
         )
         // Proxy lifecycle
-        .route("/api/version", get(handlers::version))
-        .route("/api/proxy/start", post(handlers::start_proxy))
-        .route("/api/proxy/stop", post(handlers::stop_proxy))
-        .route("/api/proxy/status", get(handlers::proxy_status))
-        .route("/api/proxy/logs", get(handlers::proxy_logs))
-        .route("/api/proxy/logs/clear", post(handlers::proxy_logs_clear))
+        .route("/api/version", get(handlers::common::version))
+        .route("/api/proxy/start", post(handlers::proxy::start_proxy))
+        .route("/api/proxy/stop", post(handlers::proxy::stop_proxy))
+        .route("/api/proxy/status", get(handlers::proxy::proxy_status))
+        .route("/api/proxy/logs", get(handlers::proxy::proxy_logs))
+        .route(
+            "/api/proxy/logs/clear",
+            post(handlers::proxy::proxy_logs_clear),
+        )
         .route(
             "/api/proxy/logs/open-dir",
-            post(handlers::proxy_logs_open_dir),
+            post(handlers::proxy::proxy_logs_open_dir),
         )
         // Settings
         .route(
             "/api/settings",
-            get(handlers::get_settings).put(handlers::save_settings),
+            get(handlers::settings::get_settings).put(handlers::settings::save_settings),
         )
         // Update
-        .route("/api/update/check", get(handlers::update_check))
-        .route("/api/update/install", post(handlers::update_install))
+        .route("/api/update/check", get(handlers::update::update_check))
+        .route(
+            "/api/update/install",
+            post(handlers::update::update_install),
+        )
         // Config
-        .route("/api/config/backup", post(handlers::create_backup))
-        .route("/api/config/backups", get(handlers::list_backups))
-        .route("/api/config/export", get(handlers::export_config))
-        .route("/api/config/import", post(handlers::import_config))
+        .route(
+            "/api/config/backup",
+            post(handlers::settings::create_backup),
+        )
+        .route("/api/config/backups", get(handlers::settings::list_backups))
+        .route("/api/config/export", get(handlers::settings::export_config))
+        .route(
+            "/api/config/import",
+            post(handlers::settings::import_config),
+        )
         // Feedback
-        .route("/api/feedback", post(handlers::submit_feedback))
+        .route("/api/feedback", post(handlers::feedback::submit_feedback))
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)
