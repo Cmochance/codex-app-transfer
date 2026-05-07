@@ -86,6 +86,10 @@ pub struct ChatToResponsesConverter {
     message_closed: bool,
     message_index: u32,
     text_acc: String,
+    /// 是否在 `delta.content` 上启用 `<think>...</think>` 兜底拆分。
+    /// 仅对 MiniMax 一类把 thinking 塞进 content 标签的 provider 开启;
+    /// 其他 provider 默认透传,避免代码块/字面 `<think>` 被误吃。
+    enable_think_tag_split: bool,
     think_tag_open: bool,
     think_tag_buffer: String,
 
@@ -134,6 +138,7 @@ impl ChatToResponsesConverter {
             message_closed: false,
             message_index: 0,
             text_acc: String::new(),
+            enable_think_tag_split: false,
             think_tag_open: false,
             think_tag_buffer: String::new(),
             tool_calls: BTreeMap::new(),
@@ -150,6 +155,12 @@ impl ChatToResponsesConverter {
             .unwrap_or(response_id.as_str())
             .to_owned();
         Self::new_with_ids(response_id, format!("msg_{seed}"), format!("rs_{seed}"))
+    }
+
+    /// 开启/关闭 `<think>...</think>` 兜底拆分(默认关闭)。
+    pub fn with_think_tag_split(mut self, enabled: bool) -> Self {
+        self.enable_think_tag_split = enabled;
+        self
     }
 
     pub fn assistant_message(&self) -> Option<Value> {
@@ -527,11 +538,18 @@ impl ChatToResponsesConverter {
     }
 
     fn handle_content_delta(&mut self, text: &str, out: &mut Vec<u8>) {
+        if !self.enable_think_tag_split {
+            self.emit_text_delta(text, out);
+            return;
+        }
         self.think_tag_buffer.push_str(text);
         self.drain_think_tag_buffer(out, false);
     }
 
     fn flush_content_parser(&mut self, out: &mut Vec<u8>) {
+        if !self.enable_think_tag_split {
+            return;
+        }
         self.drain_think_tag_buffer(out, true);
     }
 
@@ -1143,6 +1161,72 @@ mod tests {
         events.iter().map(|(n, _)| n.as_str()).collect()
     }
 
+    // ── <think> 兜底拆分 provider 门控回归 ─────────────────────────────
+
+    #[test]
+    fn think_tag_split_disabled_passes_literal_tags_through() {
+        // 默认未开启 enable_think_tag_split:DeepSeek/Kimi 等 provider 在普通
+        // content 里输出字面 <think>...</think>(代码示例、讨论)时必须原样透传,
+        // 不能被解析成 reasoning,否则会丢用户实际想看到的文本。
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"see <think>example</think> here"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "应只产一个 message,不应误产 reasoning");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(
+            output[0]["content"][0]["text"],
+            "see <think>example</think> here"
+        );
+    }
+
+    #[test]
+    fn think_tag_split_disabled_keeps_code_block_intact() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"qwen3","choices":[{"index":0,"delta":{"content":"usage: ```html\n<think>thoughts</think>\n```"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        let text = output[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("<think>thoughts</think>"), "got: {text}");
+    }
+
+    #[test]
+    fn think_tag_split_enabled_splits_minimax_style_content() {
+        // 显式 opt-in 后,<think>...</think> 应被拆成 reasoning(MiniMax 行为)。
+        let mut c = ChatToResponsesConverter::new_with_ids(
+            "resp_x".into(),
+            "msg_x".into(),
+            "rs_x".into(),
+        )
+        .with_think_tag_split(true);
+        let _ = c.feed(
+            br#"data: {"model":"MiniMax-M2.7","choices":[{"index":0,"delta":{"content":"<think>plan more</think>final"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nplan more");
+        assert_eq!(output[1]["content"][0]["text"], "final");
+    }
+
     // ── Stage 3.2c 行为回归(content-only)── ─────────────────────────
 
     #[test]
@@ -1435,7 +1519,7 @@ data: {"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"
 
     #[test]
     fn minimax_think_tags_are_split_out_of_content() {
-        let mut c = fixed();
+        let mut c = fixed().with_think_tag_split(true);
         let _ = c.feed(
             br#"data: {"model":"MiniMax-M2.7","choices":[{"index":0,"delta":{"content":"<think>plan"}}]}
 
@@ -1456,7 +1540,7 @@ data: {"choices":[{"index":0,"delta":{"content":" more</think>final"},"finish_re
 
     #[test]
     fn split_think_open_tag_is_buffered() {
-        let mut c = fixed();
+        let mut c = fixed().with_think_tag_split(true);
         let _ = c.feed(b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<thi\"}}]}\n\n");
         let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"nk>x</think>y\"},\"finish_reason\":\"stop\"}]}\n\n");
         let out = c.feed(b"data: [DONE]\n\n");

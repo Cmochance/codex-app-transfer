@@ -31,6 +31,20 @@ pub fn convert_chat_to_responses_stream_with_session(
     convert_chat_to_responses_stream_inner(input, conv, Some(response_session))
 }
 
+/// 同上,但允许调用方按 provider 行为开启 `<think>` 兜底拆分等可选解析。
+pub fn convert_chat_to_responses_stream_with_options(
+    input: ByteStream,
+    response_session: Option<ResponseSessionPlan>,
+    enable_think_tag_split: bool,
+) -> ByteStream {
+    let conv = match response_session.as_ref() {
+        Some(s) => ChatToResponsesConverter::new_with_response_id(s.response_id.clone()),
+        None => ChatToResponsesConverter::new(),
+    }
+    .with_think_tag_split(enable_think_tag_split);
+    convert_chat_to_responses_stream_inner(input, conv, response_session)
+}
+
 fn convert_chat_to_responses_stream_inner(
     input: ByteStream,
     conv: ChatToResponsesConverter,
