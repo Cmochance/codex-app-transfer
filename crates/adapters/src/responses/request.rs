@@ -77,13 +77,22 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     ensure_thinking_tool_call_reasoning(&mut messages, input, provider);
     convert_developer_to_system_if_needed(&mut messages, provider);
 
-    // 视觉剥离:对已知不支持视觉的上游(deepseek-v4-* / mimo-v2.5-* 等纯
-    // 文本模型),把 messages.content 里所有 `image_url` block 替换为占位
-    // 文本块。**必须**做这一步:DeepSeek API 在 deserialize 阶段就对
-    // `image_url` content variant 报 400(实测 messages[8]: unknown variant
-    // `image_url`, expected `text`),Codex CLI 历史里只要存在过一次图片
-    // (即使发给 vision provider 后切换到 DeepSeek)就会让续轮全部失败。
-    if !provider_supports_vision(provider) {
+    // 视觉剥离:对已知不支持视觉的上游(deepseek-v4-* / moonshot-v1-* 非
+    // vision-preview / mimo-v2-pro / mimo-v2.5-pro 等纯文本模型),把
+    // messages.content 里所有 `image_url` block 替换为占位文本块。
+    // **必须**做这一步:DeepSeek API 在 deserialize 阶段就对 `image_url`
+    // content variant 报 400(实测 messages[8]: unknown variant `image_url`,
+    // expected `text`),Codex CLI 历史里只要存在过一次图片(即使发给 vision
+    // provider 后切换到 DeepSeek)就会让续轮全部失败。
+    //
+    // 用 body 里的实际 model(prepare_request 路径上,model 已被 forward.rs
+    // 重写成 upstream 真实 model id),而不是 provider.models["default"] —
+    // 因为 Codex CLI 经过 alias 映射,实际请求的 model 未必是 default。
+    let body_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(codex_app_transfer_registry::strip_internal_model_suffix);
+    if !provider_supports_vision(provider, body_model.as_deref()) {
         strip_image_blocks_in_place(&mut messages);
     }
 
@@ -945,52 +954,109 @@ fn thinking_value_enabled(thinking: Option<&Value>) -> bool {
     false
 }
 
-/// 上游 provider 是否支持 vision(messages.content 里允许 `image_url` block)。
+/// 当前请求(provider × model 组合)是否支持 vision(messages.content
+/// 里允许 `image_url` block)。
 ///
 /// 判断顺序:
-/// 1. provider.modelCapabilities[<default_model>].supports_vision 显式 false → 不支持
-/// 2. provider.modelCapabilities[<default_model>].supports_vision 显式 true → 支持
-/// 3. provider 的 id / name / base_url 命中已知纯文本上游名单
-///    (deepseek / mimo / xiaomi-mimo 等)→ 不支持
-/// 4. 其余默认支持(走 OpenAI 标准多模态;Kimi 月之暗面也走这条,
-///    部分 Kimi 模型支持视觉)
+/// 1. **请求 body 的 model** 在 `provider.modelCapabilities[<model>].supports_vision`
+///    显式 false/true → 直接返回(粒度细到模型,允许同 provider 不同模型差异)
+/// 2. fallback 到 `provider.modelCapabilities[<default_model>].supports_vision`
+///    显式声明(向后兼容旧配置)
+/// 3. 模型 id 命中**模型名黑名单**(2026-05-07 实测验证的纯文本模型) → 不支持
+/// 4. 其余默认支持(走 OpenAI 标准多模态)
+///
+/// **2026-05-07 实测覆盖**(所有 5 接入 provider 的所有公开 model):
+///
+/// | Model | Vision | 来源 |
+/// |---|---|---|
+/// | `deepseek-v4-pro` / `deepseek-v4-flash` | ❌ | 实测 400 unknown variant `image_url` |
+/// | `moonshot-v1-{8k,32k,128k}` / `moonshot-v1-auto` | ❌ | 实测 400 "Image input not supported" |
+/// | `kimi-k2.5` / `kimi-k2.6` | ✅ | 实测 SAW_RED + 官方 vision guide |
+/// | `moonshot-v1-{8k,32k,128k}-vision-preview` | ✅ | 实测 SAW_RED |
+/// | `kimi-for-coding` | ✅ | 实测 SAW_RED(虽然 base_url 像 coding-only) |
+/// | `mimo-v2-omni` / `mimo-v2-flash` / `mimo-v2.5` | ✅ | 实测 SAW_RED + 官方 omni 标识 |
+/// | `mimo-v2-pro` / `mimo-v2.5-pro` | ❌ | 实测响应 "I don't see any image attached" |
+/// | `mimo-v2*-tts*` | n/a | 不接受 chat 接口 |
+///
+/// **粒度从 provider 子串改成模型名精确匹配**:旧版 `["deepseek", "xiaomi",
+/// "mimo", "qwen3.6"]` 子串黑名单会把整个 MiMo provider 的 omni / flash /
+/// 2.5 这三个**支持视觉的**模型一刀切掉(误杀);也会让 Moonshot 的
+/// `moonshot-v1-8k` 这种纯文本模型逃过(漏杀,因为 "moonshot" 不在子串名单)。
 ///
 /// 这条防御对应 DeepSeek `deepseek-v4-pro` 在 deserialize 阶段直接对
 /// `messages[i].content[*].type == "image_url"` 报 400 unknown variant,
 /// 让 Codex CLI 续轮 history 一旦含过图就全链路阻塞(2026-05-06 实测)。
-fn provider_supports_vision(provider: Option<&Provider>) -> bool {
+fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) -> bool {
     let Some(p) = provider else {
         return true;
     };
 
-    // 1+2:modelCapabilities 显式声明
+    // **关键**:request body 缺 model 字段时仍要保护文本-only 上游不收图。
+    // codex-connector P1 review (PR #43) 指出:几条 conversion path 允许 body
+    // 不带 model 进来,如果只在 `model.is_some()` 时跑黑名单,DeepSeek 这类
+    // text-only provider 一旦 model 缺失就会让 image_url 透传出去,触发原本
+    // 要修的 400 unknown variant 失败。
+    //
+    // 解决:把 body model + provider.models["default"] 合并成 effective_model,
+    // 所有检查(modelCapabilities 显式 / TEXT_ONLY_MODELS 黑名单)都在它上面跑。
     let default_model = p
         .models
         .get("default")
         .map(|s| codex_app_transfer_registry::strip_internal_model_suffix(s))
-        .unwrap_or_default();
-    let candidates: [&str; 2] = [default_model.as_str(), default_model.trim()];
-    for key in candidates {
-        if key.is_empty() {
-            continue;
-        }
+        .filter(|s| !s.is_empty());
+    let effective_model: Option<String> = model
+        .map(|s| s.to_owned())
+        .or_else(|| default_model.clone());
+
+    // 1:effective_model 命中 provider.modelCapabilities 显式声明 → 直接采用
+    if let Some(m) = effective_model.as_deref() {
         if let Some(b) = p
             .model_capabilities
-            .get(key)
+            .get(m)
             .and_then(|v| v.get("supports_vision"))
             .and_then(|v| v.as_bool())
         {
             return b;
         }
     }
+    // 2:body model 不在 capabilities 但 default_model 在(向后兼容旧配置:
+    //    用户可能只在 modelCapabilities 标过 default model 的能力)
+    if let (Some(body), Some(def)) = (model, default_model.as_deref()) {
+        if body != def {
+            if let Some(b) = p
+                .model_capabilities
+                .get(def)
+                .and_then(|v| v.get("supports_vision"))
+                .and_then(|v| v.as_bool())
+            {
+                return b;
+            }
+        }
+    }
 
-    // 3:已知纯文本上游名单。命中即视为不支持。
-    const KNOWN_TEXT_ONLY: &[&str] = &["deepseek", "xiaomi", "mimo", "qwen3.6"];
-    for needle in KNOWN_TEXT_ONLY {
-        if provider_looks_like(p, needle) {
+    // 3:effective_model 命中**硬编码模型名黑名单**(2026-05-07 实测 — 详见函数 doc)
+    if let Some(m) = effective_model.as_deref() {
+        let lc = m.to_ascii_lowercase();
+        const TEXT_ONLY_MODELS: &[&str] = &[
+            // DeepSeek v4 系列(实测 400 unknown variant `image_url`)
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            // Moonshot 标准 v1 系列(无 -vision-preview 后缀,实测 400
+            // "Image input not supported for model ...")
+            "moonshot-v1-8k",
+            "moonshot-v1-32k",
+            "moonshot-v1-128k",
+            "moonshot-v1-auto",
+            // Xiaomi MiMo 文本-only 子集(实测响应 "I don't see any image attached")
+            "mimo-v2-pro",
+            "mimo-v2.5-pro",
+        ];
+        if TEXT_ONLY_MODELS.iter().any(|n| lc == *n) {
             return false;
         }
     }
+
+    // 4:默认支持(覆盖未列在白名单的新模型 / OpenAI 标准 vision provider)
     true
 }
 
@@ -1674,8 +1740,8 @@ mod tests {
 
     #[test]
     fn explicit_supports_vision_true_overrides_text_only_blacklist() {
-        // 用户在 modelCapabilities 显式标 supports_vision: true → 即使 base_url
-        // 命中黑名单(deepseek)也保留 image_url。给未来视觉版预留口子。
+        // 用户在 modelCapabilities 显式标 supports_vision: true → 即使模型
+        // 命中黑名单(deepseek-v4-pro)也保留 image_url。给未来视觉版预留口子。
         let mut deepseek_with_vision = deepseek_provider();
         deepseek_with_vision
             .model_capabilities
@@ -1691,6 +1757,233 @@ mod tests {
             responses_body_to_chat_body_for_provider(&req, Some(&deepseek_with_vision)).unwrap();
         let serialized = serde_json::to_string(&out["messages"]).unwrap();
         assert!(serialized.contains("\"image_url\""));
+    }
+
+    // ── vision 白名单的模型级 granularity 验证(2026-05-07 实测覆盖所有 5 接入 provider)──
+    //
+    // 旧版 provider-id 子串黑名单(["deepseek","xiaomi","mimo","qwen3.6"])会:
+    // - 误杀:Mimo 的 mimo-v2-omni / mimo-v2-flash / mimo-v2.5(实测均支持视觉)
+    // - 漏杀:Moonshot 的 moonshot-v1-{8k,32k,128k}(实测 400 "Image input not supported")
+    //
+    // 新版按**请求 body 的 model**精确匹配模型名黑名单。
+
+    fn moonshot_provider() -> Provider {
+        let mut p = provider("moonshot", "Moonshot", "https://api.moonshot.cn/v1");
+        p.models.insert("default".into(), "kimi-k2.6".into());
+        p.api_format = "openai_chat".into();
+        p
+    }
+
+    fn mimo_provider() -> Provider {
+        let mut p = provider(
+            "xiaomi-mimo",
+            "Xiaomi MiMo",
+            "https://api.xiaomimimo.com/v1",
+        );
+        p.models.insert("default".into(), "mimo-v2.5-pro".into());
+        p.api_format = "openai_chat".into();
+        p
+    }
+
+    fn vision_request_for(model: &str) -> Value {
+        json!({
+            "model": model,
+            "stream": true,
+            "input": [{"type":"input_image","image_url":"data:image/png;base64,AAA"}]
+        })
+    }
+
+    fn image_url_kept(req: &Value, p: &Provider) -> bool {
+        let out = responses_body_to_chat_body_for_provider(req, Some(p)).unwrap();
+        serde_json::to_string(&out["messages"])
+            .unwrap()
+            .contains("\"image_url\"")
+    }
+
+    #[test]
+    fn vision_blacklist_blocks_deepseek_v4_pro() {
+        let req = vision_request_for("deepseek-v4-pro");
+        assert!(!image_url_kept(&req, &deepseek_provider()));
+    }
+
+    #[test]
+    fn vision_blacklist_blocks_deepseek_v4_flash() {
+        let req = vision_request_for("deepseek-v4-flash");
+        let mut p = deepseek_provider();
+        p.models
+            .insert("default".into(), "deepseek-v4-flash".into());
+        assert!(!image_url_kept(&req, &p));
+    }
+
+    #[test]
+    fn vision_blacklist_blocks_moonshot_v1_non_preview_models() {
+        // moonshot-v1-{8k,32k,128k}/auto 实测 400 "Image input not supported"
+        for model in [
+            "moonshot-v1-8k",
+            "moonshot-v1-32k",
+            "moonshot-v1-128k",
+            "moonshot-v1-auto",
+        ] {
+            let req = vision_request_for(model);
+            let mut p = moonshot_provider();
+            p.models.insert("default".into(), model.into());
+            assert!(
+                !image_url_kept(&req, &p),
+                "{model} 实测纯文本,必须 strip image_url"
+            );
+        }
+    }
+
+    #[test]
+    fn vision_whitelist_keeps_moonshot_vision_preview_variants() {
+        // moonshot-v1-{8k,32k,128k}-vision-preview 实测 SAW_RED
+        for model in [
+            "moonshot-v1-8k-vision-preview",
+            "moonshot-v1-32k-vision-preview",
+            "moonshot-v1-128k-vision-preview",
+        ] {
+            let req = vision_request_for(model);
+            let mut p = moonshot_provider();
+            p.models.insert("default".into(), model.into());
+            assert!(
+                image_url_kept(&req, &p),
+                "{model} 实测支持视觉,必须保留 image_url"
+            );
+        }
+    }
+
+    #[test]
+    fn vision_whitelist_keeps_kimi_k2_models() {
+        // kimi-k2.5 / kimi-k2.6 实测 SAW_RED + 官方 vision guide 列出 k2.6
+        for model in ["kimi-k2.5", "kimi-k2.6"] {
+            let req = vision_request_for(model);
+            let mut p = moonshot_provider();
+            p.models.insert("default".into(), model.into());
+            assert!(image_url_kept(&req, &p), "{model} 实测支持视觉");
+        }
+    }
+
+    #[test]
+    fn vision_whitelist_keeps_kimi_for_coding() {
+        // 实测意外:kimi-for-coding 居然支持视觉(SAW_RED)
+        let req = vision_request_for("kimi-for-coding");
+        let mut p = provider("kimi-code", "Kimi Code", "https://api.kimi.com/coding/v1");
+        p.models.insert("default".into(), "kimi-for-coding".into());
+        assert!(image_url_kept(&req, &p));
+    }
+
+    #[test]
+    fn vision_whitelist_keeps_mimo_omni_flash_2_5() {
+        // mimo-v2-omni / mimo-v2-flash / mimo-v2.5 实测 SAW_RED
+        for model in ["mimo-v2-omni", "mimo-v2-flash", "mimo-v2.5"] {
+            let req = vision_request_for(model);
+            let mut p = mimo_provider();
+            p.models.insert("default".into(), model.into());
+            assert!(
+                image_url_kept(&req, &p),
+                "{model} 实测支持视觉,旧版子串黑名单(\"mimo\")会误杀"
+            );
+        }
+    }
+
+    #[test]
+    fn vision_blacklist_blocks_mimo_v2_pro_and_v2_5_pro() {
+        // mimo-v2-pro / mimo-v2.5-pro 实测响应 "I don't see any image attached"
+        for model in ["mimo-v2-pro", "mimo-v2.5-pro"] {
+            let req = vision_request_for(model);
+            let mut p = mimo_provider();
+            p.models.insert("default".into(), model.into());
+            assert!(!image_url_kept(&req, &p), "{model} 实测纯文本");
+        }
+    }
+
+    #[test]
+    fn vision_check_uses_body_model_not_provider_default() {
+        // 关键:provider.default = "kimi-k2.6"(支持视觉),但 body 实际请求
+        // moonshot-v1-8k(纯文本)→ 必须按 body model 判定,strip 图。
+        // 旧版 provider_supports_vision(provider) 只看 default_model 会误判。
+        let mut p = moonshot_provider();
+        p.models.insert("default".into(), "kimi-k2.6".into());
+        let req = vision_request_for("moonshot-v1-8k");
+        assert!(
+            !image_url_kept(&req, &p),
+            "body.model=moonshot-v1-8k 必须当前请求级 strip,与 default 无关"
+        );
+    }
+
+    #[test]
+    fn vision_unknown_model_defaults_to_supported() {
+        // 未在黑名单的模型默认放行(覆盖 OpenAI gpt-4o / 新接入 vision provider)
+        let req = vision_request_for("gpt-4o");
+        let mut p = provider("openai", "OpenAI", "https://api.openai.com/v1");
+        p.models.insert("default".into(), "gpt-4o".into());
+        assert!(image_url_kept(&req, &p));
+    }
+
+    #[test]
+    fn vision_explicit_capability_overrides_blacklist_for_per_model() {
+        // 用户在 modelCapabilities 显式标 supports_vision = true,即使该模型
+        // 在硬编码黑名单(mimo-v2-pro)里也放行。给"我知道这是视觉版升级"留口子。
+        let mut p = mimo_provider();
+        p.model_capabilities
+            .insert("mimo-v2-pro".into(), json!({"supports_vision": true}));
+        let req = vision_request_for("mimo-v2-pro");
+        assert!(image_url_kept(&req, &p));
+    }
+
+    #[test]
+    fn vision_explicit_capability_false_overrides_default_pass() {
+        // 反向:模型不在黑名单(默认放行),但用户标 supports_vision = false
+        // → 必须 strip。给"我知道这上游临时挂了 vision"留口子。
+        let mut p = provider("custom", "Custom", "https://api.custom.example/v1");
+        p.models.insert("default".into(), "custom-text".into());
+        p.model_capabilities
+            .insert("custom-text".into(), json!({"supports_vision": false}));
+        let req = vision_request_for("custom-text");
+        assert!(!image_url_kept(&req, &p));
+    }
+
+    #[test]
+    fn vision_falls_back_to_default_model_when_body_omits_model() {
+        // codex-connector P1 review (2026-05-07 PR #43) 指出:旧改法在 body
+        // 缺 model 字段时直接 return true,DeepSeek 这类 text-only provider
+        // 一旦 model 缺失就让 image_url 透传 → 触发原本要修的 400 unknown
+        // variant 失败。新版必须 fallback 到 provider.models["default"]。
+        let p = deepseek_provider(); // default = "deepseek-v4-pro"
+        let req = json!({
+            // 故意不写 "model" 字段,模拟某些 conversion path 的合法形态
+            "stream": true,
+            "input": [
+                {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let serialized = serde_json::to_string(&out["messages"]).unwrap();
+        assert!(
+            !serialized.contains("\"image_url\""),
+            "body 缺 model + default=deepseek-v4-pro → 必须按 default 命中黑名单 strip"
+        );
+        assert!(serialized.contains("图片省略"), "应该用占位文本替换");
+    }
+
+    #[test]
+    fn vision_falls_back_to_default_model_for_explicit_capability_too() {
+        // body 缺 model,但 default 在 modelCapabilities 标了 supports_vision = false
+        // → 同样要 strip,而不是默认放行。
+        let mut p = provider("custom", "Custom", "https://api.custom.example/v1");
+        p.models.insert("default".into(), "future-text-v1".into());
+        p.model_capabilities
+            .insert("future-text-v1".into(), json!({"supports_vision": false}));
+        let req = json!({
+            "stream": true,
+            "input": [
+                {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert!(!serde_json::to_string(&out["messages"])
+            .unwrap()
+            .contains("\"image_url\""));
     }
 
     #[test]
