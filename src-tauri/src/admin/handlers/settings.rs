@@ -429,3 +429,117 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
     }))
     .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::response::IntoResponse;
+
+    use super::super::common::test_support::with_isolated_home;
+
+    fn config_with_secret() -> Value {
+        json!({
+            "version": APP_VERSION,
+            "activeProvider": "p1",
+            "gatewayApiKey": "cas_existing",
+            "providers": [{
+                "id": "p1",
+                "name": "Provider One",
+                "baseUrl": "https://api.example.com/v1",
+                "authScheme": "bearer",
+                "apiFormat": "openai_chat",
+                "apiKey": "sk-existing",
+                "extraHeaders": {"x-extra-secret": "secret-header"},
+                "models": {"default": "model-one"},
+                "sortIndex": 0
+            }],
+            "settings": {
+                "theme": "default",
+                "language": "zh",
+                "proxyPort": 18080,
+                "adminPort": 18081,
+                "autoStart": false,
+                "autoApplyOnStart": true,
+                "exposeAllProviderModels": false,
+                "restoreCodexOnExit": true,
+                "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+            }
+        })
+    }
+
+    #[test]
+    fn config_backup_list_uses_real_files() {
+        with_isolated_home(|home| {
+            let cfg = config_with_secret();
+            save_registry(&cfg).unwrap();
+
+            let backup = create_config_backup("manual").unwrap();
+            let name = backup.get("name").and_then(|v| v.as_str()).unwrap();
+            assert!(name.starts_with("config-"));
+            assert!(name.ends_with(".json"));
+            assert!(backup.get("size").and_then(|v| v.as_u64()).unwrap() > 0);
+
+            let backup_path = home.join(".codex-app-transfer").join("backups").join(name);
+            assert!(backup_path.is_file());
+            let saved: Value =
+                serde_json::from_str(&fs::read_to_string(&backup_path).unwrap()).unwrap();
+            assert_eq!(saved["providers"][0]["apiKey"], json!("sk-existing"));
+
+            let backups = list_config_backups().unwrap();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(backups[0]["name"], backup["name"]);
+        });
+    }
+
+    #[test]
+    fn import_config_backs_up_and_preserves_existing_provider_secrets_when_missing() {
+        with_isolated_home(|_| {
+            save_registry(&config_with_secret()).unwrap();
+
+            let incoming = json!({
+                "format": "codex-app-transfer.config",
+                "config": {
+                    "version": "1.0.3",
+                    "activeProvider": "p1",
+                    "gatewayApiKey": "cas_imported",
+                    "providers": [{
+                        "id": "p1",
+                        "name": "Imported Provider",
+                        "baseUrl": "https://imported.example.com/v1",
+                        "authScheme": "bearer",
+                        "apiFormat": "openai_chat",
+                        "models": {"default": "imported-model"}
+                    }],
+                    "settings": {"proxyPort": 19090}
+                }
+            });
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let response = runtime.block_on(async { import_config(Json(incoming)).await });
+            assert_eq!(response.into_response().status(), StatusCode::OK);
+
+            let saved = load_registry().unwrap();
+            assert_eq!(saved["activeProvider"], json!("p1"));
+            assert_eq!(saved["gatewayApiKey"], json!("cas_imported"));
+            assert_eq!(saved["settings"]["proxyPort"], json!(19090));
+            assert_eq!(saved["providers"][0]["name"], json!("Imported Provider"));
+            assert_eq!(saved["providers"][0]["apiKey"], json!("sk-existing"));
+            assert_eq!(
+                saved["providers"][0]["extraHeaders"]["x-extra-secret"],
+                json!("secret-header")
+            );
+
+            let backups = list_config_backups().unwrap();
+            assert_eq!(backups.len(), 1);
+            assert!(backups[0]
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .contains("before-import"));
+        });
+    }
+}

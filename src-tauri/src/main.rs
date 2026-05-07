@@ -43,9 +43,10 @@ fn main() {
         })
         .setup(|app| {
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
-            let _ = handlers::restore_codex_if_enabled("startup");
+            let _ = handlers::desktop::restore_codex_if_enabled("startup");
             tauri::async_runtime::spawn(async move {
-                let _ = handlers::auto_apply_on_startup_if_enabled(startup_proxy_manager).await;
+                let _ = handlers::desktop::auto_apply_on_startup_if_enabled(startup_proxy_manager)
+                    .await;
             });
 
             let menu = build_tray_menu(app)?;
@@ -111,7 +112,7 @@ fn main() {
         if matches!(event, RunEvent::Exit) {
             let manager = app_handle.state::<Arc<ProxyManager>>();
             manager.stop_silent();
-            let _ = handlers::restore_codex_if_enabled("exit");
+            let _ = handlers::desktop::restore_codex_if_enabled("exit");
         }
     });
 }
@@ -158,7 +159,8 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
             let app_handle = app.clone();
             let proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
             tauri::async_runtime::spawn(async move {
-                let _ = handlers::switch_provider_and_sync(proxy_manager, provider_id).await;
+                let _ =
+                    handlers::desktop::switch_provider_and_sync(proxy_manager, provider_id).await;
                 refresh_tray_menu(&app_handle);
             });
         }

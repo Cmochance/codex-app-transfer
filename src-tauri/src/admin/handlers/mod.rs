@@ -6,13 +6,13 @@
 //! - `feedback`:`/api/feedback`
 //! - `settings`:`/api/settings` + `/api/config/*`
 //! - `update`:`/api/update/*`
-//! - `_legacy`:Round 2 待迁移的剩余函数(desktop / providers)
+//! - `desktop`:`/api/desktop/*` + Codex.app 进程管理 + apply/restore
+//! - `providers`:`/api/providers/*` + `/api/presets`(二级再拆 crud/test/models/balance/presets)
 
 pub mod common;
+pub mod desktop;
 pub mod feedback;
+pub mod providers;
 pub mod proxy;
 pub mod settings;
 pub mod update;
-
-mod _legacy;
-pub use _legacy::*;

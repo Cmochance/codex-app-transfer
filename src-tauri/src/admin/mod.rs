@@ -34,59 +34,88 @@ pub fn build_app_router(state: AdminState) -> Router {
         // Providers
         .route(
             "/api/providers",
-            get(handlers::list_providers).post(handlers::add_provider),
+            get(handlers::providers::crud::list_providers)
+                .post(handlers::providers::crud::add_provider),
         )
         .route(
             "/api/providers/{id}",
-            put(handlers::update_provider).delete(handlers::delete_provider),
+            put(handlers::providers::crud::update_provider)
+                .delete(handlers::providers::crud::delete_provider),
         )
-        .route("/api/providers/reorder", put(handlers::reorder_providers))
+        .route(
+            "/api/providers/reorder",
+            put(handlers::providers::crud::reorder_providers),
+        )
         .route(
             "/api/providers/{id}/default",
-            put(handlers::set_default_provider),
+            put(handlers::providers::crud::set_default_provider),
         )
         .route(
             "/api/providers/{id}/activate",
-            post(handlers::activate_provider),
+            post(handlers::providers::crud::activate_provider),
         )
-        .route("/api/providers/{id}/secret", get(handlers::get_secret))
-        .route("/api/providers/{id}/draft", post(handlers::save_draft))
-        .route("/api/providers/{id}/test", post(handlers::test_provider))
+        .route(
+            "/api/providers/{id}/secret",
+            get(handlers::providers::crud::get_secret),
+        )
+        .route(
+            "/api/providers/{id}/draft",
+            post(handlers::providers::crud::save_draft),
+        )
+        .route(
+            "/api/providers/{id}/test",
+            post(handlers::providers::test::test_provider),
+        )
         .route(
             "/api/providers/{id}/usage",
-            post(handlers::query_provider_usage),
+            post(handlers::providers::balance::query_provider_usage),
         )
-        .route("/api/providers/{id}/models", put(handlers::update_models))
+        .route(
+            "/api/providers/{id}/models",
+            put(handlers::providers::crud::update_models),
+        )
         .route(
             "/api/providers/{id}/models/available",
-            get(handlers::fetch_provider_models),
+            get(handlers::providers::models::fetch_provider_models),
         )
         .route(
             "/api/providers/{id}/models/autofill",
-            post(handlers::autofill_provider_models),
+            post(handlers::providers::models::autofill_provider_models),
         )
         .route(
             "/api/providers/compatibility",
-            get(handlers::provider_compatibility),
+            get(handlers::providers::test::provider_compatibility),
         )
-        .route("/api/providers/test", post(handlers::test_provider_payload))
+        .route(
+            "/api/providers/test",
+            post(handlers::providers::test::test_provider_payload),
+        )
         .route(
             "/api/providers/models/available",
-            post(handlers::fetch_provider_models_payload),
+            post(handlers::providers::models::fetch_provider_models_payload),
         )
         // Presets
-        .route("/api/presets", get(handlers::list_presets))
+        .route(
+            "/api/presets",
+            get(handlers::providers::presets::list_presets),
+        )
         // Desktop / Codex CLI
-        .route("/api/desktop/status", get(handlers::desktop_status))
-        .route("/api/desktop/configure", post(handlers::desktop_configure))
-        .route("/api/desktop/clear", post(handlers::desktop_clear))
+        .route(
+            "/api/desktop/status",
+            get(handlers::desktop::desktop_status),
+        )
+        .route(
+            "/api/desktop/configure",
+            post(handlers::desktop::desktop_configure),
+        )
+        .route("/api/desktop/clear", post(handlers::desktop::desktop_clear))
         .route(
             "/api/desktop/restart-codex-app",
-            post(handlers::restart_codex_app),
+            post(handlers::desktop::restart_codex_app),
         )
         .route(
             "/api/desktop/snapshot-status",
-            get(handlers::desktop_snapshot_status),
+            get(handlers::desktop::desktop_snapshot_status),
         )
         // Proxy lifecycle
         .route("/api/version", get(handlers::common::version))
