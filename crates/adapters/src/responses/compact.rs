@@ -81,13 +81,30 @@ pub(super) fn build_compact_chat_request(
         .cloned()
         .unwrap_or(Value::Array(Vec::new()));
 
-    let synthetic_responses_body = json!({
+    let mut synthetic_responses_body = json!({
         "model": model,
         "instructions": COMPACT_SUMMARIZATION_PROMPT,
         "input": input,
         "stream": false,
         "max_output_tokens": COMPACT_MAX_OUTPUT_TOKENS,
     });
+
+    // 透传原 CompactionInput 里的 thinking-相关字段。
+    // 关键:`responses_body_to_chat_body_for_provider` 内部的
+    // `ensure_thinking_tool_call_reasoning` 通过 `body.get("reasoning")` 判断
+    // 是否启用 thinking,只在 reasoning 字段存在时才给 history 里的
+    // assistant tool_call message 补 reasoning_content。如果不透传,Kimi /
+    // DeepSeek 等 thinking 默认开的上游会 400 报
+    // "thinking is enabled but reasoning_content is missing in assistant
+    // tool call message"。
+    if let Some(reasoning) = parsed.get("reasoning") {
+        synthetic_responses_body["reasoning"] = reasoning.clone();
+    }
+    if let Some(tools) = parsed.get("tools") {
+        // 工具定义需要透传(含 ensure_thinking_tool_call_reasoning 路径
+        // 的 has_tool_loop 检测,以及万一上游借 tool 信息提取上下文)。
+        synthetic_responses_body["tools"] = tools.clone();
+    }
 
     let chat_body =
         responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))?;
@@ -216,6 +233,48 @@ mod tests {
         assert!(!is_compact_path("/responses"));
         assert!(!is_compact_path("/responses/compact/extra"));
         assert!(!is_compact_path("/chat/completions"));
+    }
+
+    #[test]
+    fn build_compact_chat_request_passes_through_reasoning_field_for_thinking_repair() {
+        // Kimi/DeepSeek 等 thinking 模式 provider 要求历史里的 assistant
+        // tool_call message 必带 reasoning_content。`ensure_thinking_tool_call_reasoning`
+        // 通过 body.reasoning 字段判断是否启用 thinking。compact 路径合成的
+        // synthetic body **必须**透传原 reasoning,否则 thinking 模式上游
+        // 会 400 "thinking is enabled but reasoning_content is missing"。
+        let p = make_provider();
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "next"}
+                ]}
+            ],
+            "reasoning": {"effort": "high"},
+            "tools": [{"type": "function", "name": "shell"}]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        // 找到 function_call 转出来的 assistant message,必须带 reasoning_content
+        let assistant_with_tool_calls = messages
+            .iter()
+            .find(|m| {
+                m["role"] == "assistant" && m.get("tool_calls").and_then(|v| v.as_array()).is_some()
+            })
+            .expect("应有一条 assistant + tool_calls(从 function_call 转换而来)");
+        // ensure_thinking_tool_call_reasoning 在缺真实 reasoning 时塞 " "(单空格占位)
+        // 这就是 Kimi/DeepSeek 上游接受的兜底值,字段存在即可,不做非空断言。
+        assert!(
+            assistant_with_tool_calls
+                .get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "thinking 启用时 assistant tool_call 必须带 reasoning_content 字段(可以是单空格占位)"
+        );
     }
 
     #[test]
