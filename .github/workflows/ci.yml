@@ -49,9 +49,12 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/**'
 
-  # 快速门禁: always runs, 无 apt. 覆盖 fmt + 非 Tauri crate 的 check/test +
-  # xtask gen-fixtures 反向 diff. 排除 codex-app-transfer (src-tauri 包名),
-  # 因 src-tauri 编译需要 webkit2gtk 等系统依赖, 留给 rust-tauri-check.
+  # 快速门禁: always runs, 无 apt. 覆盖 fmt + 非 GUI crate 的 check/test +
+  # xtask gen-fixtures 反向 diff. 排除两个 GUI 包:
+  # - codex-app-transfer (src-tauri 包名): webkit2gtk
+  # - codex-app-transfer-desktop-app (W2+ egui 原生 UI): gtk via tray-icon/muda 的
+  #   libayatana-appindicator
+  # 都留给 rust-gui-check 装齐 gtk 系统包.
   rust-fast-check:
     name: Rust · fast workspace check (no Tauri sysdeps)
     runs-on: ubuntu-latest
@@ -68,19 +71,26 @@ jobs:
       - name: cargo fmt --check (workspace)
         run: cargo fmt --all -- --check
 
-      - name: cargo check --workspace (exclude codex-app-transfer)
-        run: cargo check --workspace --all-targets --exclude codex-app-transfer
+      - name: cargo check --workspace (exclude GUI packages)
+        run: |
+          cargo check --workspace --all-targets \
+            --exclude codex-app-transfer \
+            --exclude codex-app-transfer-desktop-app
 
-      - name: cargo test --workspace (exclude codex-app-transfer)
-        run: cargo test --workspace --no-fail-fast --exclude codex-app-transfer
+      - name: cargo test --workspace (exclude GUI packages)
+        run: |
+          cargo test --workspace --no-fail-fast \
+            --exclude codex-app-transfer \
+            --exclude codex-app-transfer-desktop-app
 
       - name: Verify fixtures regenerable from Rust (xtask gen-fixtures)
         run: |
           cargo run -p xtask --release -- gen-fixtures
           git diff --exit-code -- tests/replay/fixtures/registry/
 
-  # Tauri 相关检查: 仅 Tauri 路径有变动时才跑. 否则 skip = success, 不卡
-  # required check. apt 仍保留 retry + 8min timeout 兜底.
+  # GUI 相关检查: 仅 Tauri / desktop_app / 共享 crate 路径有变动时才跑. 否则 skip
+  # = success, 不卡 required check. apt 仍保留 retry + timeout 兜底.
+  # 装齐 webkit2gtk (Tauri webview) + libayatana-appindicator (tray-icon/muda).
   rust-tauri-check:
     name: Rust · Tauri (src-tauri) check
     needs: changes
@@ -89,7 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Tauri Linux system deps (with retry)
+      - name: Install Linux GUI system deps (with retry)
         timeout-minutes: 20
         run: |
           set -e
@@ -100,6 +110,8 @@ jobs:
                 libssl-dev \
                 libayatana-appindicator3-dev \
                 librsvg2-dev \
+                libgtk-3-dev \
+                libxdo-dev \
                 patchelf \
                 build-essential \
                 curl \
@@ -120,10 +132,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          key: tauri
+          key: gui
 
-      - name: cargo check -p codex-app-transfer
+      - name: cargo check -p codex-app-transfer (Tauri)
         run: cargo check -p codex-app-transfer --all-targets
 
-      - name: cargo test -p codex-app-transfer
+      - name: cargo test -p codex-app-transfer (Tauri)
         run: cargo test -p codex-app-transfer --no-fail-fast
+
+      - name: cargo check -p codex-app-transfer-desktop-app (egui)
+        run: cargo check -p codex-app-transfer-desktop-app --all-targets
+
+      - name: cargo test -p codex-app-transfer-desktop-app (egui)
+        run: cargo test -p codex-app-transfer-desktop-app --no-fail-fast
