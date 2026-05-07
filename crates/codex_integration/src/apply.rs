@@ -23,7 +23,37 @@ const MANAGED_TOML_KEYS: &[&str] = &[
     "openai_base_url",
     "model_context_window",
     CODEX_MODEL_CATALOG_KEY,
+    "model_providers.cas",
+    "model_provider",
+    "model_auto_compact_token_limit",
+    "tool_output_token_limit",
 ];
+
+/// 写到 `~/.codex/config.toml` 里的 provider id;**必须不是 `"openai"` / `"azure"`**,
+/// 否则 Codex CLI 会触发 remote `/responses/compact` 端点(只有 OpenAI/Azure
+/// 后端实现),第三方 OpenAI-compatible provider 会回 404。用 `"cas"` 让
+/// Codex CLI 改走 inline compact(发普通 `/responses` 请求 + summarize prompt),
+/// 这条路径所有 provider 都能直接处理。
+/// 详见 `codex-rs/model-provider-info/src/lib.rs::supports_remote_compaction`。
+const CAS_PROVIDER_ID: &str = "cas";
+
+/// 默认 inline compact 触发阈值:`total_usage_tokens >= limit` 时 Codex CLI
+/// 触发摘要,留 ~25% buffer 给 system prompt + 当前输出 token,避免请求
+/// 真的超上游 context window。
+/// - `supports_1m=true`: 750_000(1M × 0.75)
+/// - 其他: 150_000(适配 192K~256K 主流第三方 provider,留 22%~41% buffer)
+fn compute_auto_compact_limit(supports_1m: bool) -> i64 {
+    if supports_1m {
+        750_000
+    } else {
+        150_000
+    }
+}
+
+/// 单次工具调用输出在历史里的截断阈值(token)。Codex CLI 会按这个阈值
+/// 截断超长 stdout/stderr,避免一次 `git diff` / `cargo test` 输出就把
+/// context 撑爆。32K 在大多数任务里足够保留有用信息,又远小于阈值。
+const DEFAULT_TOOL_OUTPUT_TOKEN_LIMIT: i64 = 32_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyConfig<'a> {
@@ -101,7 +131,45 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         sync_root_value(&paths.config_toml, "model_context_window", None)?;
     }
 
-    // 4. auth.json: auth_mode + OPENAI_API_KEY
+    // 4. config.toml: 显式声明 [model_providers.cas] 让 Codex CLI 不走
+    //    remote `/responses/compact` 端点(那只在 provider name="openai"/"azure"
+    //    时调用,第三方上游会 404)。改用 `cas` 这个 id 后,Codex CLI 转用
+    //    inline compact —— 发普通 /responses 请求 + summarize prompt 作为
+    //    user message,所有 provider 都能直接接受。
+    if cfg.base_url.is_empty() {
+        sync_root_value(&paths.config_toml, "model_providers.cas", None)?;
+        sync_root_value(&paths.config_toml, "model_provider", None)?;
+    } else {
+        let base_url_literal = toml_string_literal(cfg.base_url);
+        let provider_table = format!(
+            "{{ name = \"Codex App Transfer\", base_url = {base_url_literal}, wire_api = \"responses\", env_key = \"OPENAI_API_KEY\" }}"
+        );
+        sync_root_value(
+            &paths.config_toml,
+            "model_providers.cas",
+            Some(&provider_table),
+        )?;
+        let id_literal = toml_string_literal(CAS_PROVIDER_ID);
+        sync_root_value(&paths.config_toml, "model_provider", Some(&id_literal))?;
+    }
+
+    // 5. config.toml: 提前触发 auto-compact + 工具输出截断,避免一次性
+    //    把超长上下文 / 工具 stdout 推过上游真实 context window。
+    //    Codex CLI 触发条件:`total_usage_tokens >= model_auto_compact_token_limit`
+    //    (`codex-rs/core/src/session/turn.rs:736-748`)。
+    let auto_compact_limit = compute_auto_compact_limit(cfg.supports_1m);
+    sync_root_value(
+        &paths.config_toml,
+        "model_auto_compact_token_limit",
+        Some(&auto_compact_limit.to_string()),
+    )?;
+    sync_root_value(
+        &paths.config_toml,
+        "tool_output_token_limit",
+        Some(&DEFAULT_TOOL_OUTPUT_TOKEN_LIMIT.to_string()),
+    )?;
+
+    // 6. auth.json: auth_mode + OPENAI_API_KEY
     let mut auth = read_auth(&paths.auth_json)?;
     let obj = auth.as_object_mut().expect("read_auth 保证返回 Object");
     if cfg.gateway_api_key.is_empty() {
@@ -198,6 +266,113 @@ mod tests {
 
     fn read_app_config(paths: &CodexPaths) -> serde_json::Value {
         codex_app_transfer_registry::load_raw_config(&paths.model_catalog_json).unwrap()
+    }
+
+    #[test]
+    fn apply_writes_cas_model_provider_with_inline_compact_config() {
+        // 关键回归:ensure Codex CLI 看到 `cas` provider name(非 openai/azure),
+        // 走 inline compact 而不是 remote `/responses/compact`。同时写入
+        // model_auto_compact_token_limit + tool_output_token_limit 提前触发摘要。
+        let (_t, paths) = setup();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_key",
+                supports_1m: false,
+                provider_name: "MiMo",
+                default_model: "mimo-v2.5",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains("model_provider = \"cas\""),
+            "Codex CLI 应选 cas 这个 provider id (非 openai/azure 才会走 inline compact)"
+        );
+        assert!(
+            toml.contains("model_providers.cas = {"),
+            "应写入 [model_providers.cas] inline table"
+        );
+        assert!(toml.contains("wire_api = \"responses\""));
+        assert!(toml.contains("env_key = \"OPENAI_API_KEY\""));
+        assert!(
+            toml.contains("base_url = \"http://127.0.0.1:18080\""),
+            "cas.base_url 应跟 openai_base_url 一致"
+        );
+        assert!(
+            toml.contains("model_auto_compact_token_limit = 150000"),
+            "非 1M provider 默认 150K 触发阈值"
+        );
+        assert!(toml.contains("tool_output_token_limit = 32000"));
+    }
+
+    #[test]
+    fn apply_with_supports_1m_uses_higher_compact_limit() {
+        let (_t, paths) = setup();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://x",
+                gateway_api_key: "k",
+                supports_1m: true,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains("model_auto_compact_token_limit = 750000"),
+            "1M 上下文 provider 触发阈值取 1M × 0.75 = 750K"
+        );
+    }
+
+    #[test]
+    fn apply_with_empty_base_url_removes_cas_provider_config() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        // 先 apply 一次(写入 cas provider 配置)
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "k",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        assert!(read_toml(&paths).contains("model_providers.cas = {"));
+
+        // 再用 empty base_url 关掉转发(模拟切到不转发的 provider)
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "",
+                gateway_api_key: "k",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        let toml = read_toml(&paths);
+        assert!(!toml.contains("model_providers.cas"));
+        assert!(!toml.contains("model_provider = "));
     }
 
     #[test]
