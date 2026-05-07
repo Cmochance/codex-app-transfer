@@ -12,6 +12,14 @@
       "opus": "deepseek-v4-pro",
       "default": "deepseek-v4-pro"
     },
+    "modelCapabilities": {
+      "deepseek-v4-pro": {
+        "context_window": 1000000
+      },
+      "deepseek-v4-flash": {
+        "context_window": 1000000
+      }
+    },
     "notices": [
       {
         "type": "info",
@@ -25,7 +33,9 @@
         "description": "Low：更快更省，适合简单任务。\nMedium：速度和效果平衡，适合日常使用。\nHigh：更认真思考，适合复杂代码和排错。\n勾选后：本工具会按 DeepSeek Max 转发；未勾选则使用 Claude 当前默认配置。",
         "requestOptions": {
           "chat": {
-            "thinking": { "type": "enabled" },
+            "thinking": {
+              "type": "enabled"
+            },
             "reasoning_effort": "max"
           }
         }
@@ -47,6 +57,35 @@
       "opus": "kimi-k2.6",
       "default": "kimi-k2.6"
     },
+    "modelCapabilities": {
+      "kimi-k2.5": {
+        "context_window": 262144
+      },
+      "kimi-k2.6": {
+        "context_window": 262144
+      },
+      "moonshot-v1-8k": {
+        "context_window": 8192
+      },
+      "moonshot-v1-32k": {
+        "context_window": 32768
+      },
+      "moonshot-v1-128k": {
+        "context_window": 131072
+      },
+      "moonshot-v1-auto": {
+        "context_window": 131072
+      },
+      "moonshot-v1-8k-vision-preview": {
+        "context_window": 8192
+      },
+      "moonshot-v1-32k-vision-preview": {
+        "context_window": 32768
+      },
+      "moonshot-v1-128k-vision-preview": {
+        "context_window": 131072
+      }
+    },
     "isBuiltin": true
   },
   {
@@ -65,6 +104,11 @@
       "opus": "kimi-for-coding",
       "default": "kimi-for-coding"
     },
+    "modelCapabilities": {
+      "kimi-for-coding": {
+        "context_window": 262144
+      }
+    },
     "isBuiltin": true
   },
   {
@@ -79,6 +123,23 @@
       "haiku": "",
       "opus": "",
       "default": "mimo-v2.5-pro"
+    },
+    "modelCapabilities": {
+      "mimo-v2-pro": {
+        "context_window": 1000000
+      },
+      "mimo-v2-flash": {
+        "context_window": 262144
+      },
+      "mimo-v2-omni": {
+        "context_window": 262144
+      },
+      "mimo-v2.5": {
+        "context_window": 1000000
+      },
+      "mimo-v2.5-pro": {
+        "context_window": 1000000
+      }
     },
     "isBuiltin": true
   },
@@ -110,6 +171,20 @@
       "opus": "",
       "default": "mimo-v2.5-pro"
     },
+    "modelCapabilities": {
+      "mimo-v2-pro": {
+        "context_window": 1000000
+      },
+      "mimo-v2-omni": {
+        "context_window": 262144
+      },
+      "mimo-v2.5": {
+        "context_window": 1000000
+      },
+      "mimo-v2.5-pro": {
+        "context_window": 1000000
+      }
+    },
     "isBuiltin": true
   },
   {
@@ -124,6 +199,14 @@
       "haiku": "glm-4.7",
       "opus": "glm-5.1",
       "default": "glm-5.1"
+    },
+    "modelCapabilities": {
+      "glm-5.1": {
+        "context_window": 200000
+      },
+      "glm-4.7": {
+        "context_window": 200000
+      }
     },
     "isBuiltin": true
   },
