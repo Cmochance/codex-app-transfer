@@ -43,6 +43,7 @@ impl Adapter for OpenAiChatAdapter {
             upstream_path: normalize_v1_prefix(client_path),
             body,
             response_session: None,
+            is_compact: false,
         })
     }
 }

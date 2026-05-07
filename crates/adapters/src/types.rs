@@ -34,6 +34,10 @@ pub struct RequestPlan {
     /// outbound response, so future `previous_response_id` requests can restore
     /// history.
     pub response_session: Option<ResponseSessionPlan>,
+    /// 是否是 `/responses/compact` 请求(由 Responses adapter 转换成 chat
+    /// completions 模拟 compact 端点)。`transform_response_stream` 据此选择
+    /// 直接 SSE 转换还是包装成 `{"output":[{"type":"compaction",...}]}` 响应。
+    pub is_compact: bool,
 }
 
 #[derive(Debug, Clone)]

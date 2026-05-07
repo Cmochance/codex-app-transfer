@@ -8,6 +8,7 @@
 //! - **响应侧**:Chat SSE → Responses SSE 状态机(text-only)。tool / reasoning /
 //!   function call 留 Stage 3.3。
 
+pub mod compact;
 pub mod converter;
 pub mod request;
 pub mod session;
@@ -52,6 +53,20 @@ impl Adapter for ResponsesAdapter {
         body: Bytes,
         provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
+        // 私有 `/responses/compact` 端点:OpenAI Responses API 的私有扩展,
+        // 第三方 OpenAI-compatible provider 都不支持。我们在代理层本地实现:
+        // 把 input 历史重组成普通 chat completions summarize 请求,响应阶段
+        // 再包装成 Codex CLI 期待的 compact 响应。详见 `compact.rs`。
+        if compact::is_compact_path(client_path) {
+            let new_body = compact::build_compact_chat_request(&body, provider)?;
+            return Ok(RequestPlan {
+                upstream_path: "/chat/completions".to_owned(),
+                body: Bytes::from(new_body),
+                response_session: None,
+                is_compact: true,
+            });
+        }
+
         let upstream_path = redirect_responses_to_chat(client_path);
         // Stage 3.2a:解析 body → Responses,转出 Chat 形态。
         // 失败时(body 非 JSON / 非对象)用 BadRequest 错出去,proxy 会回 400。
@@ -68,6 +83,7 @@ impl Adapter for ResponsesAdapter {
             upstream_path,
             body: Bytes::from(new_body),
             response_session: Some(conversion.response_session),
+            is_compact: false,
         })
     }
 
@@ -79,6 +95,15 @@ impl Adapter for ResponsesAdapter {
         provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
+        // /responses/compact:上游回的是非流式 chat completion JSON,
+        // 收齐后包装成 `{"output":[{"type":"compaction",...}]}`。
+        if request_plan.is_compact {
+            return compact::build_compact_response_plan(
+                upstream_status,
+                upstream_headers,
+                upstream_stream,
+            );
+        }
         // 把 content-type 强制改成 text/event-stream(上游本来就是,但保险)
         upstream_headers.insert(
             http::header::CONTENT_TYPE,
