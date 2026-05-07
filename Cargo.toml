@@ -11,9 +11,9 @@ members = [
     "crates/proxy_runner",
     "crates/admin_api",
     "crates/desktop_state",
+    "crates/desktop_app",
     "xtask",
     # 后续阶段陆续启用:
-    # "crates/desktop_app",   # W2 起 eframe 主程序
     # "crates/session_cache",
     # "crates/update",
 ]

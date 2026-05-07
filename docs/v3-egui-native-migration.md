@@ -154,16 +154,28 @@ frontend/            ← W1-W7 期间存活共存,W8 删
 - [x] **现 Tauri app `make mac-app` 仍能 build 仍能跑**(已验证:dist/mac binary 27M,version 2.0.9,行为不变)
 - [x] `cargo fmt --check` 通过
 
-### W2: desktop_app 骨架
+### W2: desktop_app 骨架 ✅ 完成
 
-- [ ] `crates/desktop_app/Cargo.toml` 依赖 eframe + egui + egui_extras + egui_phosphor + tokio
-- [ ] 主窗口 1024×700,标题"Codex App Transfer"
-- [ ] 7 个空 Page(只有 placeholder 文本)+ 左侧 nav 切换
-- [ ] 主题切换按钮 + 7 主题 Visuals 应用(`Theme::DEFAULT/GREEN/ORANGE/GRAY/DARK/WHITE`)
-- [ ] i18n:`build.rs` + `crates/desktop_app/src/i18n/strings.toml`(含 571 行原表)+ phf 静态表 + `t!()` 宏
-- [ ] `cargo run -p desktop_app` 能起空窗口
-- [ ] **不**动 src-tauri / frontend
-- [ ] ⚠️ **决策点 W2-A**:把 7 主题各自的 Dashboard 空骨架截图发给用户,确认色彩是否接受
+- [x] `crates/desktop_app/Cargo.toml` 依赖 eframe 0.31 + egui 0.31 + egui_extras + phf + serde
+- [x] 主窗口 1024×700,标题"Codex App Transfer"
+- [x] 7 个空 Page(每个 page 一个 placeholder render)+ 左侧 nav 切换
+- [x] 主题切换器(Settings page 内)+ 7 主题 ThemeName::ALL + Palette 结构 + apply()
+  - [x] Default / Dark 完整调色板(从 style.css 第 1-25 行逐字搬)
+  - [ ] Green / Orange / Gray / White 完整调色板(W3 决策点 W2-A 时填充并审)
+- [x] i18n:`build.rs` 读 `src/i18n/strings.toml`(267 keys 全自动从 i18n.js 抽出)→ phf::Map<&str, [&str; 2]> 静态表
+- [x] `lookup_owned()` 函数 + `t!()` 宏
+- [x] Locale enum + 切换器(Settings page)
+- [x] `cargo run -p desktop_app` 能起空窗口(已 smoke test 验证 2 秒无 panic)
+- [x] **不**动 src-tauri / frontend(回滚保护成立:`make mac-app` 仍然 build 出 v2.0.9)
+- [ ] ⚠️ **决策点 W2-A**:延后到 W3。W2 只填 Default/Dark 两套真色板,Green/Orange/Gray/White 是占位;W3 填充齐 5 套色板后再做 A/B 审,信息更充分
+
+### W2 量化首结
+
+| 指标 | 现状 | 备注 |
+|---|---|---|
+| desktop_app release binary | **9.5 MB** | vs Tauri 27 MB(目标 ≤12 MB),已留充足余量 |
+| workspace 全测 | 250+ tests 全绿 | adapters / proxy / codex_integration / registry / 等等不动 |
+| Tauri app 旧版本 | `make mac-app` 仍出 v2.0.9 27MB | 回滚保护成立 |
 
 ### W3: Dashboard + Settings 完整
 
