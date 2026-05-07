@@ -592,3 +592,312 @@ pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl Into
     }
     Json(result).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use super::super::common::random_hex;
+
+    #[test]
+    fn update_platform_version_and_installer_selection_match_legacy() {
+        assert_eq!(
+            current_update_platform_for("darwin", "arm64"),
+            "macos-arm64"
+        );
+        assert_eq!(current_update_platform_for("win32", "AMD64"), "windows-x64");
+        assert_eq!(current_update_platform_for("linux", "x86_64"), "linux-x64");
+        assert_eq!(
+            current_update_platform_for("freebsd", ""),
+            "freebsd-unknown"
+        );
+
+        assert!(is_newer_version("v2.0.10", "2.0.9"));
+        assert!(is_newer_version("2.1", "2.0.99"));
+        assert!(!is_newer_version("2.0", "2.0.0"));
+
+        let windows_assets = vec![
+            json!({"name": "Codex-App-Transfer-Windows-Portable.exe"}),
+            json!({"name": "Codex-App-Transfer-Windows-Setup.exe"}),
+        ];
+        assert_eq!(
+            pick_windows_installer(&windows_assets).unwrap()["name"],
+            json!("Codex-App-Transfer-Windows-Setup.exe")
+        );
+
+        let macos_assets = vec![
+            json!({"name": "Codex-App-Transfer.dmg"}),
+            json!({"name": "Codex-App-Transfer.pkg"}),
+        ];
+        assert_eq!(
+            pick_macos_installer(&macos_assets).unwrap()["name"],
+            json!("Codex-App-Transfer.pkg")
+        );
+        assert_eq!(
+            pick_platform_installer(&macos_assets, "linux-x64").unwrap_err(),
+            "当前平台暂不支持应用内安装: linux-x64"
+        );
+
+        assert_eq!(
+            install_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64").unwrap(),
+            vec!["open", "/tmp/Codex-App-Transfer.pkg"]
+        );
+        assert_eq!(
+            install_command_parts("C:\\Codex-App-Transfer-Windows-Setup.exe", "windows-x64")
+                .unwrap(),
+            vec!["C:\\Codex-App-Transfer-Windows-Setup.exe"]
+        );
+        assert_eq!(
+            install_after_quit_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64", 1234)
+                .unwrap(),
+            vec![
+                "/bin/sh",
+                "-c",
+                "pid=\"$1\"; installer=\"$2\"; while kill -0 \"$pid\" 2>/dev/null; do sleep 0.2; done; exec open \"$installer\"",
+                "cas-update-installer",
+                "1234",
+                "/tmp/Codex-App-Transfer.pkg",
+            ]
+        );
+        assert_eq!(
+            install_after_quit_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64", 0)
+                .unwrap_err(),
+            "等待退出的进程 ID 无效"
+        );
+    }
+
+    #[test]
+    fn update_check_reads_latest_json_and_platform_assets() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            let app = Router::new().route(
+                "/latest.json",
+                get(|| async {
+                    Json(json!({
+                        "version": "2.0.2",
+                        "pub_date": "2026-05-06",
+                        "notes": "update notes",
+                        "minimum_supported_version": "2.0.0",
+                        "update_protocol": 1,
+                        "platforms": {
+                            "macos-arm64": {
+                                "assets": [
+                                    {"name": "Codex-App-Transfer.pkg", "url": "https://example.com/Codex-App-Transfer.pkg"}
+                                ]
+                            }
+                        }
+                    }))
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let result = check_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "2.0.1",
+                "macos-arm64",
+            )
+            .await
+            .unwrap();
+            server.abort();
+
+            assert_eq!(result["success"], json!(true));
+            assert_eq!(result["updateAvailable"], json!(true));
+            assert_eq!(result["currentVersion"], json!("2.0.1"));
+            assert_eq!(result["latestVersion"], json!("2.0.2"));
+            assert_eq!(result["platform"], json!("macos-arm64"));
+            assert_eq!(result["pubDate"], json!("2026-05-06"));
+            assert_eq!(result["notes"], json!("update notes"));
+            assert_eq!(result["minimumSupportedVersion"], json!("2.0.0"));
+            assert_eq!(result["updateProtocol"], json!(1));
+            assert_eq!(
+                result["assets"][0]["name"],
+                json!("Codex-App-Transfer.pkg")
+            );
+        });
+    }
+
+    #[test]
+    fn update_downloads_installer_and_checks_sha256() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let installer_bytes = Arc::new(b"pkg-bytes".to_vec());
+            let installer_sha = format!("{:x}", Sha256::digest(installer_bytes.as_ref()));
+            let app = Router::new()
+                .route(
+                    "/latest.json",
+                    get({
+                        let installer_sha = installer_sha.clone();
+                        move || async move {
+                            Json(json!({
+                                "version": "2.0.2",
+                                "platforms": {
+                                    "macos-arm64": {
+                                        "assets": [{
+                                            "name": "../Codex-App-Transfer.pkg",
+                                            "url": format!("http://{addr}/Codex-App-Transfer.pkg"),
+                                            "sha256": installer_sha,
+                                        }]
+                                    }
+                                }
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/Codex-App-Transfer.pkg",
+                    get({
+                        let installer_bytes = Arc::clone(&installer_bytes);
+                        move || {
+                            let installer_bytes = Arc::clone(&installer_bytes);
+                            async move { installer_bytes.as_ref().clone() }
+                        }
+                    }),
+                );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let target_dir = std::env::temp_dir().join(format!(
+                "cas-update-download-{}-{}",
+                std::process::id(),
+                random_hex(6)
+            ));
+            let _ = fs::remove_dir_all(&target_dir);
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let result = download_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "2.0.1",
+                "macos-arm64",
+                Some(&target_dir),
+            )
+            .await
+            .unwrap();
+            server.abort();
+
+            assert_eq!(result["downloaded"], json!(true));
+            assert_eq!(
+                result["installerAsset"]["name"],
+                json!("../Codex-App-Transfer.pkg")
+            );
+            assert_eq!(result["installerSha256"], json!(installer_sha));
+            assert_eq!(result["installerSize"], json!(9));
+            let installer_path = result["installerPath"].as_str().unwrap();
+            assert!(installer_path.ends_with("Codex-App-Transfer.pkg"));
+            assert_eq!(fs::read(installer_path).unwrap(), b"pkg-bytes");
+            let _ = fs::remove_dir_all(&target_dir);
+        });
+    }
+
+    #[test]
+    fn update_download_rejects_bad_sha_and_unsupported_platform() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/latest.json",
+                    get(move || async move {
+                        Json(json!({
+                            "version": "2.0.2",
+                            "platforms": {
+                                "macos-arm64": {
+                                    "assets": [{
+                                        "name": "Codex-App-Transfer.pkg",
+                                        "url": format!("http://{addr}/Codex-App-Transfer.pkg"),
+                                        "sha256": "bad-sha",
+                                    }]
+                                },
+                                "linux-x64": {
+                                    "assets": [{
+                                        "name": "Codex-App-Transfer.AppImage",
+                                        "url": format!("http://{addr}/Codex-App-Transfer.AppImage")
+                                    }]
+                                }
+                            }
+                        }))
+                    }),
+                )
+                .route(
+                    "/Codex-App-Transfer.pkg",
+                    get(|| async { b"pkg-bytes".to_vec() }),
+                );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let target_dir = std::env::temp_dir().join(format!(
+                "cas-update-bad-sha-{}-{}",
+                std::process::id(),
+                random_hex(6)
+            ));
+            let _ = fs::remove_dir_all(&target_dir);
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+
+            let bad_sha = download_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "2.0.1",
+                "macos-arm64",
+                Some(&target_dir),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(bad_sha, "安装包校验失败，已取消安装");
+
+            let unsupported = download_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "2.0.1",
+                "linux-x64",
+                Some(&target_dir),
+            )
+            .await
+            .unwrap_err();
+            server.abort();
+            assert_eq!(unsupported, "当前平台暂不支持应用内安装: linux-x64");
+            let _ = fs::remove_dir_all(&target_dir);
+        });
+    }
+}

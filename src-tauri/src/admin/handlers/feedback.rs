@@ -358,3 +358,243 @@ pub(super) async fn submit_feedback_with_body(
     }))
     .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use super::super::common::random_hex;
+
+    #[test]
+    fn feedback_throttle_matches_legacy_success_and_failure_cooldowns() {
+        let throttle = FeedbackThrottle::new();
+        assert!(throttle.acquire().is_ok());
+        throttle.record_success();
+        assert!(throttle.acquire().unwrap_err().contains("刚提交成功"));
+
+        let throttle = FeedbackThrottle::new();
+        for _ in 0..FeedbackThrottle::FAILURE_LIMIT {
+            throttle.record_failure();
+        }
+        assert!(throttle
+            .acquire()
+            .unwrap_err()
+            .contains("连续提交失败次数过多"));
+    }
+
+    #[test]
+    fn feedback_attachments_match_legacy_limits_and_fields() {
+        let oversized = STANDARD.encode(vec![b'x'; 5 * 1024 * 1024 + 1]);
+        let input = json!({
+            "attachments": [
+                {"kind": "screenshot", "name": "shot.png", "content_type": "image/png", "content_b64": STANDARD.encode(b"image-bytes")},
+                {"kind": "log", "content_type": "not-a-mime", "content_b64": STANDARD.encode(b"log-bytes")},
+                {"kind": "log", "name": "too-large.log", "content_b64": oversized},
+                {"kind": "log", "name": "bad.log", "content_b64": "%%%"}
+            ]
+        });
+
+        let attachments = feedback_attachments(&input, 1234);
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].field, "screenshot0");
+        assert_eq!(attachments[0].name, "shot.png");
+        assert_eq!(attachments[0].content_type, "image/png");
+        assert_eq!(attachments[0].raw, b"image-bytes");
+        assert_eq!(attachments[1].field, "log0");
+        assert_eq!(attachments[1].name, "log-1234.bin");
+        assert_eq!(attachments[1].content_type, "application/octet-stream");
+        assert_eq!(attachments[1].raw, b"log-bytes");
+    }
+
+    #[test]
+    fn feedback_proxy_tail_reads_last_200_lines_lossily() {
+        let root = std::env::temp_dir().join(format!(
+            "cas-feedback-tail-{}-{}",
+            std::process::id(),
+            random_hex(6)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("proxy.log");
+
+        let mut content = Vec::new();
+        for i in 0..205 {
+            content.extend_from_slice(format!("line-{i}\n").as_bytes());
+        }
+        content.extend_from_slice(b"bad-\xff\n");
+        fs::write(&path, content).unwrap();
+
+        let tail = feedback_proxy_tail_content(&path).unwrap();
+        assert!(!tail.contains("line-0"));
+        assert!(tail.contains("line-6"));
+        assert!(tail.contains("line-204"));
+        assert!(tail.contains("bad-\u{fffd}"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn feedback_submit_posts_json_payload_as_multipart_to_worker() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{
+                body::Bytes as AxumBytes,
+                http::{header::CONTENT_TYPE as AXUM_CONTENT_TYPE, HeaderMap as AxumHeaderMap},
+                routing::post,
+                Router,
+            };
+            use tokio::net::TcpListener;
+
+            let seen_body = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let seen_content_type = Arc::new(Mutex::new(String::new()));
+            let app = Router::new().route(
+                "/feedback",
+                post({
+                    let seen_body = Arc::clone(&seen_body);
+                    let seen_content_type = Arc::clone(&seen_content_type);
+                    move |headers: AxumHeaderMap, body: AxumBytes| {
+                        let seen_body = Arc::clone(&seen_body);
+                        let seen_content_type = Arc::clone(&seen_content_type);
+                        async move {
+                            *seen_content_type.lock().unwrap() = headers
+                                .get(AXUM_CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_owned();
+                            *seen_body.lock().unwrap() = body.to_vec();
+                            Json(json!({"ok": true, "id": "fb-test", "email_sent": true}))
+                        }
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let payload = json!({
+                "title": "short title",
+                "body": "feedback body",
+                "include_diagnostics": false,
+                "attachments": [
+                    {"kind": "screenshot", "name": "shot.png", "content_type": "image/png", "content_b64": STANDARD.encode(b"png-bytes")},
+                    {"kind": "log", "content_b64": STANDARD.encode(b"log-bytes")}
+                ]
+            });
+            let throttle = FeedbackThrottle::new();
+            let response = submit_feedback_with_body(
+                Bytes::from(payload.to_string()),
+                &format!("http://{addr}/feedback"),
+                &throttle,
+            )
+            .await;
+            server.abort();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let data: Value = serde_json::from_slice(&response_body).unwrap();
+            assert_eq!(data["success"], json!(true));
+            assert_eq!(data["id"], json!("fb-test"));
+            assert_eq!(data["email_sent"], json!(true));
+
+            assert!(seen_content_type
+                .lock()
+                .unwrap()
+                .starts_with("multipart/form-data"));
+            let seen = seen_body.lock().unwrap().clone();
+            let multipart = String::from_utf8_lossy(&seen);
+            assert!(multipart.contains("name=\"meta\""));
+            assert!(multipart.contains("name=\"title\""));
+            assert!(multipart.contains("short title"));
+            assert!(multipart.contains("name=\"body\""));
+            assert!(multipart.contains("feedback body"));
+            assert!(multipart.contains("name=\"screenshot0\"; filename=\"shot.png\""));
+            assert!(multipart.contains("name=\"log0\"; filename=\"log-"));
+        });
+    }
+
+    #[test]
+    fn feedback_submit_preserves_legacy_validation_and_upstream_errors() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use axum::{routing::post, Router};
+            use tokio::net::TcpListener;
+
+            let throttle = FeedbackThrottle::new();
+            let response =
+                submit_feedback_with_body(Bytes::from("not-json"), "http://127.0.0.1", &throttle)
+                    .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let data: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(data["message"], json!("请求体非 JSON"));
+
+            let throttle = FeedbackThrottle::new();
+            let response = submit_feedback_with_body(
+                Bytes::from(json!({"body": ""}).to_string()),
+                "http://127.0.0.1",
+                &throttle,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let data: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(data["message"], json!("请填写描述"));
+
+            let throttle = FeedbackThrottle::new();
+            let response = submit_feedback_with_body(
+                Bytes::from(json!({"body": "configured"}).to_string()),
+                "",
+                &throttle,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let data: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(data["message"], json!("反馈服务未配置"));
+
+            let app = Router::new().route(
+                "/feedback",
+                post(|| async { Json(json!({"ok": false, "error": "worker failed"})) }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let throttle = FeedbackThrottle::new();
+            let response = submit_feedback_with_body(
+                Bytes::from(json!({"body": "goes upstream"}).to_string()),
+                &format!("http://{addr}/feedback"),
+                &throttle,
+            )
+            .await;
+            server.abort();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let data: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(data["message"], json!("worker failed"));
+        });
+    }
+}

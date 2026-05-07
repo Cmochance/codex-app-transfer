@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 
 use super::super::registry_io::{load as load_registry, public_provider};
 use super::super::state::AdminState;
-pub(super) use super::_legacy::APP_VERSION;
+
+pub(super) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(super) fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (
@@ -117,7 +118,7 @@ pub async fn status(State(state): State<AdminState>) -> impl IntoResponse {
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
-    let active = super::_legacy::active_provider(&cfg).map(|p| public_provider(&p));
+    let active = super::providers::active_provider(&cfg).map(|p| public_provider(&p));
     let active_id = cfg
         .get("activeProvider")
         .and_then(|v| v.as_str())
@@ -128,13 +129,13 @@ pub async fn status(State(state): State<AdminState>) -> impl IntoResponse {
     let codex_configured = codex_paths.as_ref().map(has_snapshot).unwrap_or(false);
     let actual_base_url = codex_paths
         .as_ref()
-        .and_then(|paths| super::_legacy::read_codex_toml_root_string(paths, "openai_base_url"));
+        .and_then(|paths| super::desktop::read_codex_toml_root_string(paths, "openai_base_url"));
     let actual_api_key_present = codex_paths
         .as_ref()
-        .map(super::_legacy::codex_openai_api_key_present)
+        .map(super::desktop::codex_openai_api_key_present)
         .unwrap_or(false);
-    let desktop_target = super::_legacy::desktop_target_for_active_provider(&cfg);
-    let desktop_health = super::_legacy::desktop_health(
+    let desktop_target = super::desktop::desktop_target_for_active_provider(&cfg);
+    let desktop_health = super::desktop::desktop_health(
         codex_paths.as_ref(),
         codex_configured,
         actual_base_url.as_deref(),
@@ -169,4 +170,84 @@ pub async fn version() -> Json<Value> {
 #[allow(dead_code)]
 pub fn _state_typecheck(_s: Arc<AdminState>) -> bool {
     true
+}
+
+/// 测试用 helper:把 HOME / USERPROFILE 切到 isolated tempdir,跑完函数后
+/// 还原 + 清理.全局共享同一把 `Mutex`,确保多个 test 不会并发改 env。
+/// 跨子模块的测试都通过 `super::common::test_support::with_isolated_home`
+/// 复用同一份实现 + 同一把锁(原 `_legacy.rs` 单 mod 时只有一份)。
+#[cfg(test)]
+pub(super) mod test_support {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    use super::random_hex;
+
+    pub(in super::super) fn with_isolated_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // 清掉之前 panic 留下的 poison —— 我们的 EnvGuard 已经把 env 还原干净
+        let mutex = HOME_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = match mutex.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+
+        struct EnvGuard {
+            home: Option<OsString>,
+            userprofile: Option<OsString>,
+            root: PathBuf,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.userprofile {
+                    Some(value) => std::env::set_var("USERPROFILE", value),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "cas-admin-test-{}-{}",
+            std::process::id(),
+            random_hex(6)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let env_guard = EnvGuard {
+            home: std::env::var_os("HOME"),
+            userprofile: std::env::var_os("USERPROFILE"),
+            root: root.clone(),
+        };
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("USERPROFILE");
+
+        let result = f(&root);
+        drop(env_guard);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_endpoint_matches_legacy_shape() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let Json(payload) = version().await;
+            assert_eq!(payload, json!({"version": APP_VERSION}));
+        });
+    }
 }

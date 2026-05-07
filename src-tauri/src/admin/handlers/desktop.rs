@@ -1,0 +1,1139 @@
+//! `/api/desktop/*` + Codex.app 进程管理 + apply / restore 桌面状态.
+//!
+//! - 把 `~/.codex/{config.toml,auth.json}` 应用 / 还原
+//! - Codex App 进程退出 / 重启(macOS / Windows / Linux)
+//! - 桌面健康检查 + active provider 同步
+//!
+//! 借鉴 codex-account-switch (`src-tauri/{mac,win}/runtime/process.rs`):旧版用
+//! `osascript ... quit; sleep 0.5; open -a Codex` 的 sh 一行式管道,gentle
+//! quit 在 Codex 卡住 / 多窗口未保存时会被忽略,sleep 0.5 也太短;表面上
+//! spawn 成功代码视为 OK,实则 app 没动.改成三步:
+//! 1. pgrep / tasklist 探活
+//! 2. SIGTERM / taskkill 普通退出 + 最长 4s 轮询
+//! 3. 仍存活 → SIGKILL / taskkill /F + 最长 2s 轮询
+//! 4. 解析 .app 路径(macOS:/Applications + ~/Applications)再 open;
+//!    Windows 直接 explorer.exe shell:AppsFolder\<APP_ID>.
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{http::StatusCode, response::IntoResponse, Json};
+use codex_app_transfer_codex_integration::{
+    apply_provider, catalog_models_for_provider, has_snapshot, read_auth, restore_codex_state,
+    ApplyConfig, CodexPaths,
+};
+use codex_app_transfer_registry::RawConfig;
+use serde_json::{json, Value};
+
+use crate::proxy_runner::ProxyManager;
+
+use super::super::registry_io::{load as load_registry, save as save_registry};
+use super::super::state::AdminState;
+use super::common::{active_provider_name, err, read_setting_bool, APP_VERSION};
+use super::providers::{
+    active_provider, clean_base_url, normalize_provider_api_format, provider_api_key,
+    provider_default_model, provider_display_name, provider_index, provider_model_capabilities,
+    provider_model_mappings, provider_supports_1m,
+};
+use super::proxy::{ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed};
+
+const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
+
+const MACOS_APP_NAME: &str = "Codex";
+const WINDOWS_PROCESS_NAME: &str = "Codex.exe";
+/// OpenAI 官方 Windows Store 包 ID,与 codex-account-switch 保持一致;
+/// 用户若装的是非 Store 版本,resolve 失败时 explorer.exe 会报错,前端会
+/// 看到 INTERNAL_SERVER_ERROR,比静默假成功好。
+const WINDOWS_STORE_APP_ID: &str = "OpenAI.Codex_2p2nqsd0c76g0!App";
+const LINUX_BIN_NAME: &str = "codex";
+
+const QUIT_TERM_POLL_ITERS: u32 = 20; // 20 × 200ms = 4s
+const QUIT_KILL_POLL_ITERS: u32 = 10; // 10 × 200ms = 2s
+const QUIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// 退出确认后,等 launchd reap 完旧进程的 grace 窗口。低于 ~250ms 时
+/// `open -a` 仍可能误命中"已在运行"缓存。
+const POST_QUIT_LAUNCHD_GRACE: Duration = Duration::from_millis(400);
+
+/// 平台检测命令(可纯函数测试).返回 (program, args).第一个元素总是命令名。
+fn running_check_command(platform: &str) -> Vec<String> {
+    match platform {
+        "macos" => vec!["pgrep".into(), "-x".into(), MACOS_APP_NAME.into()],
+        "windows" => vec![
+            "tasklist".into(),
+            "/FI".into(),
+            format!("IMAGENAME eq {WINDOWS_PROCESS_NAME}"),
+            "/FO".into(),
+            "CSV".into(),
+            "/NH".into(),
+        ],
+        _ => vec!["pgrep".into(), "-x".into(), LINUX_BIN_NAME.into()],
+    }
+}
+
+/// 退出命令(`force=false` 普通退出, `force=true` 强杀).
+fn quit_command(platform: &str, force: bool) -> Vec<String> {
+    match (platform, force) {
+        ("macos", false) => vec![
+            "pkill".into(),
+            "-TERM".into(),
+            "-x".into(),
+            MACOS_APP_NAME.into(),
+        ],
+        ("macos", true) => vec![
+            "pkill".into(),
+            "-KILL".into(),
+            "-x".into(),
+            MACOS_APP_NAME.into(),
+        ],
+        ("windows", false) => vec!["taskkill".into(), "/IM".into(), WINDOWS_PROCESS_NAME.into()],
+        ("windows", true) => vec![
+            "taskkill".into(),
+            "/F".into(),
+            "/IM".into(),
+            WINDOWS_PROCESS_NAME.into(),
+        ],
+        (_, false) => vec![
+            "pkill".into(),
+            "-TERM".into(),
+            "-x".into(),
+            LINUX_BIN_NAME.into(),
+        ],
+        (_, true) => vec![
+            "pkill".into(),
+            "-KILL".into(),
+            "-x".into(),
+            LINUX_BIN_NAME.into(),
+        ],
+    }
+}
+
+/// 启动命令.macOS 优先用解析后的 .app 路径,fallback 到 `open -a Codex`
+/// 让 LaunchServices 自己找。
+fn open_command(platform: &str, resolved_macos_app: Option<&str>) -> Vec<String> {
+    match platform {
+        // `-n`:即使 LaunchServices 缓存还以为 Codex 在运行,也强制启动一个新
+        // 实例。我们刚 SIGTERM 杀过主进程,launchd 偶尔会在 reap 完成前误把
+        // `open -a` 解读为 activate 已有实例 → 啥也不发生。`-n` 绕过这条。
+        "macos" => vec![
+            "open".into(),
+            "-n".into(),
+            "-a".into(),
+            resolved_macos_app.unwrap_or(MACOS_APP_NAME).into(),
+        ],
+        "windows" => vec![
+            "explorer.exe".into(),
+            format!("shell:AppsFolder\\{WINDOWS_STORE_APP_ID}"),
+        ],
+        _ => vec![
+            "sh".into(),
+            "-c".into(),
+            format!("{LINUX_BIN_NAME} >/dev/null 2>&1 &"),
+        ],
+    }
+}
+
+fn resolve_macos_app_path() -> Option<String> {
+    let mut candidates = vec![PathBuf::from("/Applications/Codex.app")];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join("Applications").join("Codex.app"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Windows 上给 Command 加 `CREATE_NO_WINDOW`(0x08000000)flag,避免每次
+/// 调 `tasklist` / `taskkill` 都 flash 一个 console 黑框。其他平台 no-op。
+/// 借鉴 codex-account-switch `src-tauri/win/runtime/process.rs::hide_console_window`。
+#[cfg(target_os = "windows")]
+fn hide_console_window(command: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console_window(command: &mut Command) -> &mut Command {
+    command
+}
+
+fn is_codex_app_running(platform: &str) -> bool {
+    let cmd = running_check_command(platform);
+    let Some((program, args)) = cmd.split_first() else {
+        return false;
+    };
+    if platform == "windows" {
+        // tasklist 即使没匹配也 exit 0,要看 stdout 里有没有 process 名
+        let mut command = Command::new(program);
+        command.args(args);
+        match hide_console_window(&mut command).output() {
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .to_ascii_lowercase()
+                .contains(&WINDOWS_PROCESS_NAME.to_ascii_lowercase()),
+            Err(_) => false,
+        }
+    } else {
+        // pgrep:有进程 exit 0,没进程 exit 1
+        Command::new(program)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+fn run_quit_command(platform: &str, force: bool) {
+    let cmd = quit_command(platform, force);
+    let Some((program, args)) = cmd.split_first() else {
+        return;
+    };
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = hide_console_window(&mut command).status();
+}
+
+fn quit_codex_app_with_retries(platform: &str) -> Result<(), String> {
+    if !is_codex_app_running(platform) {
+        return Ok(());
+    }
+    run_quit_command(platform, false);
+    for _ in 0..QUIT_TERM_POLL_ITERS {
+        if !is_codex_app_running(platform) {
+            return Ok(());
+        }
+        std::thread::sleep(QUIT_POLL_INTERVAL);
+    }
+    run_quit_command(platform, true);
+    for _ in 0..QUIT_KILL_POLL_ITERS {
+        if !is_codex_app_running(platform) {
+            return Ok(());
+        }
+        std::thread::sleep(QUIT_POLL_INTERVAL);
+    }
+    Err("Codex 未能正常退出,请手动关闭后重试".to_owned())
+}
+
+fn open_codex_app(platform: &str) -> Result<(), String> {
+    let resolved = if platform == "macos" {
+        resolve_macos_app_path()
+    } else {
+        None
+    };
+    let cmd = open_command(platform, resolved.as_deref());
+    let Some((program, args)) = cmd.split_first() else {
+        return Err("打开命令为空".to_owned());
+    };
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console_window(&mut command)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法启动 Codex App: {e}"))
+}
+
+fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
+    let was_running = is_codex_app_running(platform);
+    quit_codex_app_with_retries(platform)?;
+    // 退出确认后给 launchd 一段 grace 让它 reap 完旧进程,LaunchServices 才会
+    // 把"Codex 在运行"的缓存清掉。否则紧跟的 `open -a` 会被当成 activate
+    // 一个不存在的实例,啥也不发生(2026-05-06 现场实测)。
+    // 跳过条件:本来就没在运行,根本不需要等。
+    if was_running {
+        std::thread::sleep(POST_QUIT_LAUNCHD_GRACE);
+    }
+    open_codex_app(platform)
+}
+
+pub(super) struct DesktopConfigTarget {
+    pub(super) base_url: String,
+    pub(super) api_key: String,
+    pub(super) supports_1m: bool,
+    pub(super) provider_name: String,
+    pub(super) default_model: String,
+    pub(super) model_mappings: Value,
+    pub(super) model_capabilities: Value,
+    pub(super) requires_proxy: bool,
+    pub(super) mode: &'static str,
+    pub(super) proxy_port: u16,
+}
+
+fn desktop_config_target_for_provider(
+    cfg: &mut RawConfig,
+    provider: &Value,
+    proxy_port_override: Option<u16>,
+) -> DesktopConfigTarget {
+    let proxy_port = proxy_port_override.unwrap_or_else(|| read_proxy_port(cfg));
+    let api_format =
+        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
+    let requires_proxy = api_format != "responses";
+    let (base_url, api_key, mode) = if requires_proxy {
+        (
+            format!("http://127.0.0.1:{proxy_port}"),
+            ensure_gateway_key(cfg),
+            "local_proxy",
+        )
+    } else {
+        (
+            clean_base_url(
+                provider
+                    .get("baseUrl")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            ),
+            provider_api_key(provider),
+            "direct_provider",
+        )
+    };
+    DesktopConfigTarget {
+        base_url,
+        api_key,
+        supports_1m: provider_supports_1m(provider),
+        provider_name: provider_display_name(provider),
+        default_model: provider_default_model(provider),
+        model_mappings: provider_model_mappings(provider),
+        model_capabilities: provider_model_capabilities(provider),
+        requires_proxy,
+        mode,
+        proxy_port,
+    }
+}
+
+pub(super) fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConfigTarget> {
+    let provider = active_provider(cfg)?;
+    let mut snapshot = cfg.clone();
+    Some(desktop_config_target_for_provider(
+        &mut snapshot,
+        &provider,
+        None,
+    ))
+}
+
+fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> {
+    catalog_models_for_provider(
+        &target.provider_name,
+        &target.default_model,
+        target.supports_1m,
+        Some(&target.model_mappings),
+        Some(&target.model_capabilities),
+    )
+    .into_iter()
+    .map(|model| {
+        let mut item = json!({
+            "name": model.slug,
+            "displayName": model.display_name,
+        });
+        if model.context_window >= ONE_M_CONTEXT_WINDOW {
+            item["supports1m"] = Value::Bool(true);
+        }
+        item
+    })
+    .collect()
+}
+
+fn desktop_inference_models_json(target: Option<&DesktopConfigTarget>) -> String {
+    let Some(target) = target else {
+        return "[]".to_owned();
+    };
+    serde_json::to_string(&desktop_expected_model_items(target)).unwrap_or_else(|_| "[]".to_owned())
+}
+
+pub(super) fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(&paths.config_toml).ok()?;
+    for line in content.lines() {
+        let stripped = line.trim_start();
+        if stripped.starts_with('[') {
+            break;
+        }
+        if !stripped.starts_with(key) {
+            continue;
+        }
+        let after = &stripped[key.len()..];
+        let mut rest = after.trim_start();
+        if !rest.starts_with('=') {
+            continue;
+        }
+        rest = rest[1..].trim();
+        if let Some(idx) = rest.find('#') {
+            rest = rest[..idx].trim_end();
+        }
+        let trimmed = rest.trim_matches(|c: char| c == '"' || c == '\'');
+        return Some(trimmed.to_owned());
+    }
+    None
+}
+
+pub(super) fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
+    read_auth(&paths.auth_json)
+        .ok()
+        .and_then(|auth| {
+            auth.get("OPENAI_API_KEY")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -> bool {
+    let one_million_names: Vec<String> = desktop_expected_model_items(target)
+        .into_iter()
+        .filter_map(|item| {
+            if item.get("supports1m").and_then(|v| v.as_bool()) == Some(true) {
+                item.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if one_million_names.is_empty() {
+        return true;
+    }
+
+    let Some(catalog_path) = read_codex_toml_root_string(paths, "model_catalog_json") else {
+        return false;
+    };
+    let catalog_path = PathBuf::from(catalog_path);
+    let catalog = fs::read_to_string(catalog_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let Some(models) = catalog.get("models").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    models.iter().any(|item| {
+        let slug = item
+            .get("slug")
+            .or_else(|| item.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !one_million_names.iter().any(|name| name == slug) {
+            return false;
+        }
+        let context_window = item
+            .get("context_window")
+            .or_else(|| item.get("max_context_window"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        context_window >= ONE_M_CONTEXT_WINDOW
+    })
+}
+
+pub(super) fn desktop_health(
+    paths: Option<&CodexPaths>,
+    configured: bool,
+    actual_base_url: Option<&str>,
+    actual_api_key_present: bool,
+    target: Option<&DesktopConfigTarget>,
+) -> Value {
+    let expected_base_url = target
+        .map(|target| target.base_url.trim_end_matches('/').to_owned())
+        .unwrap_or_default();
+    let actual_base_url = actual_base_url
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    let mut issues = Vec::new();
+
+    if !configured {
+        if !actual_base_url.is_empty() || actual_api_key_present {
+            issues.push(json!({
+                "code": "not_managed_by_cas",
+                "message": "当前 Codex CLI 配置不是由本工具最新版本写入。",
+            }));
+        } else {
+            issues.push(json!({
+                "code": "codex_snapshot_missing",
+                "message": "尚未由本工具应用 Codex CLI 配置，请重新一键生成配置。",
+            }));
+        }
+    }
+
+    if !actual_base_url.is_empty()
+        && !expected_base_url.is_empty()
+        && actual_base_url != expected_base_url
+    {
+        issues.push(json!({
+            "code": "gateway_base_url_mismatch",
+            "message": "Codex CLI 仍指向旧地址，请重新一键生成 Codex CLI 配置。",
+        }));
+    }
+
+    let one_million_ready = match (paths, target) {
+        (Some(paths), Some(target)) => one_million_catalog_ready(paths, target),
+        _ => true,
+    };
+    if !one_million_ready {
+        issues.push(json!({
+            "code": "one_million_not_written",
+            "message": "1M 上下文模型尚未写入 Codex CLI 配置，请重新一键生成配置并重启终端。",
+        }));
+    }
+
+    json!({
+        "needsApply": !configured || !issues.is_empty(),
+        "oneMillionReady": one_million_ready,
+        "expectedBaseUrl": expected_base_url,
+        "actualBaseUrl": actual_base_url,
+        "mode": target.map(|target| target.mode),
+        "requiresProxy": target.map(|target| target.requires_proxy).unwrap_or(false),
+        "issues": issues,
+    })
+}
+
+fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
+    let paths = CodexPaths::from_home_env().map_err(|e| e.to_string())?;
+    let result = apply_provider(
+        &paths,
+        &ApplyConfig {
+            base_url: &target.base_url,
+            gateway_api_key: &target.api_key,
+            supports_1m: target.supports_1m,
+            provider_name: &target.provider_name,
+            default_model: &target.default_model,
+            model_mappings: Some(&target.model_mappings),
+            model_capabilities: Some(&target.model_capabilities),
+            app_version: APP_VERSION,
+        },
+    )
+    .map_err(|e| format!("apply 失败: {e}"))?;
+    serde_json::to_value(result).map_err(|e| format!("apply 结果序列化失败: {e}"))
+}
+
+async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
+    let mut cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"attempted": true, "success": false, "message": e});
+        }
+    };
+    let Some(provider) = active_provider(&cfg) else {
+        return json!({
+            "attempted": false,
+            "success": false,
+            "message": "没有默认提供商",
+        });
+    };
+
+    let target = desktop_config_target_for_provider(&mut cfg, &provider, None);
+    if let Err(e) = save_registry(&cfg) {
+        return json!({"attempted": true, "success": false, "message": e});
+    }
+
+    let mut proxy_started = false;
+    if target.requires_proxy {
+        match start_proxy_if_needed(&state.proxy_manager, target.proxy_port).await {
+            Ok(started) => proxy_started = started,
+            Err(e) => {
+                return json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "message": e});
+            }
+        }
+    } else {
+        state.proxy_manager.stop_silent();
+    }
+
+    match apply_desktop_target(&target) {
+        Ok(mut result) => {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("attempted".into(), Value::Bool(true));
+                obj.insert("success".into(), Value::Bool(true));
+                obj.insert("mode".into(), Value::String(target.mode.to_owned()));
+                obj.insert("requiresProxy".into(), Value::Bool(target.requires_proxy));
+                obj.insert("proxyStarted".into(), Value::Bool(proxy_started));
+            }
+            result
+        }
+        Err(e) => {
+            json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "proxyStarted": proxy_started, "message": e})
+        }
+    }
+}
+
+pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) -> Value {
+    let cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": format!("failed: {e}")})
+        }
+    };
+    if !read_setting_bool(&cfg, "autoApplyOnStart", true) {
+        return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "disabled by settings"});
+    }
+    if active_provider(&cfg).is_none() {
+        return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "no active provider; skip"});
+    }
+    let state = AdminState { proxy_manager };
+    let result = sync_desktop_for_active_provider(&state).await;
+    if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        return json!({
+            "applied": true,
+            "requiresProxy": result.get("requiresProxy").and_then(|v| v.as_bool()).unwrap_or(false),
+            "proxyStarted": result.get("proxyStarted").and_then(|v| v.as_bool()).unwrap_or(false),
+            "message": format!("applied {}", active_provider_name(&cfg)),
+        });
+    }
+    json!({
+        "applied": false,
+        "requiresProxy": result.get("requiresProxy").and_then(|v| v.as_bool()).unwrap_or(false),
+        "proxyStarted": result.get("proxyStarted").and_then(|v| v.as_bool()).unwrap_or(false),
+        "message": format!("failed: {}", result.get("message").and_then(|v| v.as_str()).unwrap_or("unknown")),
+    })
+}
+
+pub fn restore_codex_if_enabled(reason: &str) -> Value {
+    let cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e})
+        }
+    };
+    if !read_setting_bool(&cfg, "restoreCodexOnExit", true) {
+        return json!({"attempted": false, "restored": false, "success": true, "reason": reason, "message": "disabled by settings"});
+    }
+    let paths = match CodexPaths::from_home_env() {
+        Ok(paths) => paths,
+        Err(e) => {
+            return json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e.to_string()})
+        }
+    };
+    if !has_snapshot(&paths) {
+        return json!({"attempted": false, "restored": false, "success": true, "reason": reason, "message": "no snapshot; skip"});
+    }
+    match restore_codex_state(&paths) {
+        Ok(restored) => {
+            json!({"attempted": true, "restored": restored, "success": true, "reason": reason})
+        }
+        Err(e) => {
+            json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e.to_string()})
+        }
+    }
+}
+
+pub async fn switch_provider_and_sync(
+    proxy_manager: Arc<ProxyManager>,
+    provider_id: String,
+) -> Value {
+    let mut cfg = match load_registry() {
+        Ok(cfg) => cfg,
+        Err(e) => return json!({"success": false, "message": e}),
+    };
+    if provider_index(&cfg, &provider_id).is_none() {
+        return json!({"success": false, "message": "提供商不存在"});
+    }
+    cfg.as_object_mut()
+        .unwrap()
+        .insert("activeProvider".into(), Value::String(provider_id));
+    if let Err(e) = save_registry(&cfg) {
+        return json!({"success": false, "message": e});
+    }
+    let state = AdminState { proxy_manager };
+    let desktop_sync = sync_desktop_for_active_provider(&state).await;
+    json!({
+        "success": true,
+        "message": "默认提供商已更新",
+        "desktopSync": desktop_sync,
+    })
+}
+
+// ── /api/desktop/* ───────────────────────────────────────────────────
+
+pub async fn desktop_status() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let configured = has_snapshot(&paths);
+    let cfg = load_registry().unwrap_or_else(|_| json!({}));
+    let proxy_port = read_proxy_port(&cfg);
+    let actual_base_url = read_codex_toml_root_string(&paths, "openai_base_url");
+    let actual_api_key_present = codex_openai_api_key_present(&paths);
+    let desktop_target = desktop_target_for_active_provider(&cfg);
+    let fallback_base_url = desktop_target
+        .as_ref()
+        .map(|target| target.base_url.clone())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{proxy_port}"));
+    let api_key_present = actual_api_key_present
+        || desktop_target
+            .as_ref()
+            .map(|target| !target.api_key.is_empty())
+            .unwrap_or_else(|| !read_gateway_key(&cfg).is_empty());
+    let health = desktop_health(
+        Some(&paths),
+        configured,
+        actual_base_url.as_deref(),
+        actual_api_key_present,
+        desktop_target.as_ref(),
+    );
+    Json(json!({
+        "configured": configured,
+        "health": health,
+        "keys": {
+            "inferenceProvider": "gateway",
+            "inferenceGatewayBaseUrl": actual_base_url.unwrap_or(fallback_base_url),
+            "inferenceGatewayApiKey": if api_key_present { "******" } else { "" },
+            "inferenceGatewayAuthScheme": "bearer",
+            "inferenceModels": desktop_inference_models_json(desktop_target.as_ref()),
+        },
+    }))
+    .into_response()
+}
+
+pub async fn desktop_configure() -> impl IntoResponse {
+    let mut cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let Some(active) = active_provider(&cfg) else {
+        return err(StatusCode::BAD_REQUEST, "请先添加 provider").into_response();
+    };
+    let target = desktop_config_target_for_provider(&mut cfg, &active, None);
+    if let Err(e) = save_registry(&cfg) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    match apply_desktop_target(&target) {
+        Ok(mut result) => {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("success".into(), Value::Bool(true));
+                obj.insert("mode".into(), Value::String(target.mode.to_owned()));
+                obj.insert("requiresProxy".into(), Value::Bool(target.requires_proxy));
+            }
+            Json(result).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+pub async fn desktop_clear() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    match restore_codex_state(&paths) {
+        Ok(_) => Json(json!({"success": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn desktop_snapshot_status() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    Json(json!({
+        "hasSnapshot": has_snapshot(&paths),
+    }))
+    .into_response()
+}
+
+pub async fn restart_codex_app() -> impl IntoResponse {
+    match launch_codex_app_restart(std::env::consts::OS) {
+        Ok(_) => Json(json!({"success": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::super::common::test_support::with_isolated_home;
+
+    fn config_with_secret() -> Value {
+        json!({
+            "version": APP_VERSION,
+            "activeProvider": "p1",
+            "gatewayApiKey": "cas_existing",
+            "providers": [{
+                "id": "p1",
+                "name": "Provider One",
+                "baseUrl": "https://api.example.com/v1",
+                "authScheme": "bearer",
+                "apiFormat": "openai_chat",
+                "apiKey": "sk-existing",
+                "extraHeaders": {"x-extra-secret": "secret-header"},
+                "models": {"default": "model-one"},
+                "sortIndex": 0
+            }],
+            "settings": {
+                "theme": "default",
+                "language": "zh",
+                "proxyPort": 18080,
+                "adminPort": 18081,
+                "autoStart": false,
+                "autoApplyOnStart": true,
+                "exposeAllProviderModels": false,
+                "restoreCodexOnExit": true,
+                "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+            }
+        })
+    }
+
+    #[test]
+    fn running_check_command_is_platform_specific() {
+        assert_eq!(running_check_command("macos"), vec!["pgrep", "-x", "Codex"]);
+        let windows = running_check_command("windows");
+        assert_eq!(windows[0], "tasklist");
+        assert!(windows.iter().any(|a| a == "IMAGENAME eq Codex.exe"));
+        assert_eq!(running_check_command("linux"), vec!["pgrep", "-x", "codex"]);
+    }
+
+    #[test]
+    fn quit_command_uses_term_then_kill() {
+        // graceful = SIGTERM / 普通 taskkill;force = SIGKILL / taskkill /F
+        assert_eq!(
+            quit_command("macos", false),
+            vec!["pkill", "-TERM", "-x", "Codex"]
+        );
+        assert_eq!(
+            quit_command("macos", true),
+            vec!["pkill", "-KILL", "-x", "Codex"]
+        );
+        assert_eq!(
+            quit_command("windows", false),
+            vec!["taskkill", "/IM", "Codex.exe"]
+        );
+        assert_eq!(
+            quit_command("windows", true),
+            vec!["taskkill", "/F", "/IM", "Codex.exe"]
+        );
+        assert_eq!(
+            quit_command("linux", false),
+            vec!["pkill", "-TERM", "-x", "codex"]
+        );
+        assert_eq!(
+            quit_command("linux", true),
+            vec!["pkill", "-KILL", "-x", "codex"]
+        );
+    }
+
+    #[test]
+    fn open_command_uses_resolved_path_when_available() {
+        // macOS 必带 `-n` 强制新实例(重启场景下 LaunchServices 缓存仍以为
+        // 旧 Codex 在运行,不加 -n 会让 `open -a` 静默 no-op)。
+        assert_eq!(
+            open_command("macos", Some("/Applications/Codex.app")),
+            vec!["open", "-n", "-a", "/Applications/Codex.app"]
+        );
+        // 落空时回到裸 app 名,让 LaunchServices 找
+        assert_eq!(
+            open_command("macos", None),
+            vec!["open", "-n", "-a", "Codex"]
+        );
+        let windows = open_command("windows", None);
+        assert_eq!(windows[0], "explorer.exe");
+        assert!(windows[1].starts_with("shell:AppsFolder\\"));
+        assert!(windows[1].contains("OpenAI.Codex"));
+        let linux = open_command("linux", None);
+        assert_eq!(linux[0], "sh");
+        assert_eq!(linux[1], "-c");
+        assert!(linux[2].contains("codex"));
+    }
+
+    #[test]
+    fn desktop_config_target_matches_legacy_proxy_and_direct_modes() {
+        let mut proxy_cfg = config_with_secret();
+        proxy_cfg["gatewayApiKey"] = Value::Null;
+        let proxy_provider = active_provider(&proxy_cfg).unwrap();
+        let proxy_target =
+            desktop_config_target_for_provider(&mut proxy_cfg, &proxy_provider, Some(19090));
+        assert_eq!(proxy_target.mode, "local_proxy");
+        assert!(proxy_target.requires_proxy);
+        assert_eq!(proxy_target.base_url, "http://127.0.0.1:19090");
+        assert!(proxy_target.api_key.starts_with("cas_"));
+        assert_eq!(
+            proxy_cfg
+                .get("gatewayApiKey")
+                .and_then(|v| v.as_str())
+                .unwrap(),
+            proxy_target.api_key
+        );
+
+        let mut direct_cfg = config_with_secret();
+        direct_cfg["gatewayApiKey"] = Value::Null;
+        let direct_provider = json!({
+            "id": "direct",
+            "name": "Direct Provider",
+            "baseUrl": "https://direct.example.com/v1/",
+            "authScheme": "bearer",
+            "apiFormat": "responses",
+            "apiKey": "sk-direct",
+            "models": {"default": "direct-model"},
+        });
+        let direct_target =
+            desktop_config_target_for_provider(&mut direct_cfg, &direct_provider, Some(19090));
+        assert_eq!(direct_target.mode, "direct_provider");
+        assert!(!direct_target.requires_proxy);
+        assert_eq!(direct_target.base_url, "https://direct.example.com/v1");
+        assert_eq!(direct_target.api_key, "sk-direct");
+        assert!(direct_cfg
+            .get("gatewayApiKey")
+            .and_then(|v| v.as_str())
+            .is_none());
+    }
+
+    #[test]
+    fn startup_auto_apply_starts_proxy_and_exit_restore_uses_snapshot() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["gatewayApiKey"] = Value::Null;
+                cfg["settings"]["proxyPort"] = json!(0);
+                save_registry(&cfg).unwrap();
+
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                let config_toml = codex_dir.join("config.toml");
+                fs::write(&config_toml, "approval_policy = \"on-request\"\n").unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(result["applied"], json!(true));
+                assert_eq!(result["requiresProxy"], json!(true));
+                assert_eq!(result["proxyStarted"], json!(true));
+                assert!(manager.status().running);
+
+                let saved = load_registry().unwrap();
+                assert!(saved
+                    .get("gatewayApiKey")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .starts_with("cas_"));
+                let paths = CodexPaths::from_home_env().unwrap();
+                assert!(has_snapshot(&paths));
+                let applied_config = fs::read_to_string(&config_toml).unwrap();
+                assert!(applied_config.contains("approval_policy = \"on-request\""));
+                assert!(applied_config.contains("openai_base_url = \"http://127.0.0.1:0\""));
+
+                let restored = restore_codex_if_enabled("test-exit");
+                assert_eq!(restored["success"], json!(true));
+                assert_eq!(restored["attempted"], json!(true));
+                assert!(!has_snapshot(&paths));
+                let restored_config = fs::read_to_string(&config_toml).unwrap();
+                assert!(restored_config.contains("approval_policy = \"on-request\""));
+                assert!(!restored_config.contains("openai_base_url"));
+                manager.stop_silent();
+            });
+        });
+    }
+
+    #[test]
+    fn startup_auto_apply_respects_disabled_setting() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|_| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["settings"]["autoApplyOnStart"] = json!(false);
+                save_registry(&cfg).unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
+                assert_eq!(result["applied"], json!(false));
+                assert_eq!(result["message"], json!("disabled by settings"));
+                assert!(!manager.status().running);
+            });
+        });
+    }
+
+    #[test]
+    fn provider_switch_syncs_desktop_without_proxy_for_direct_provider() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["providers"] = json!([
+                    cfg["providers"][0].clone(),
+                    {
+                        "id": "p2",
+                        "name": "Direct Provider",
+                        "baseUrl": "https://direct.example.com/v1/",
+                        "authScheme": "bearer",
+                        "apiFormat": "responses",
+                        "apiKey": "sk-direct",
+                        "models": {"default": "direct-model"},
+                        "sortIndex": 1
+                    }
+                ]);
+                save_registry(&cfg).unwrap();
+                fs::create_dir_all(home.join(".codex")).unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = switch_provider_and_sync(Arc::clone(&manager), "p2".to_owned()).await;
+                assert_eq!(result["success"], json!(true));
+                assert_eq!(result["desktopSync"]["success"], json!(true));
+                assert_eq!(result["desktopSync"]["mode"], json!("direct_provider"));
+                assert_eq!(result["desktopSync"]["requiresProxy"], json!(false));
+                assert!(!manager.status().running);
+
+                let saved = load_registry().unwrap();
+                assert_eq!(saved["activeProvider"], json!("p2"));
+                let config_toml = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+                assert!(config_toml.contains("openai_base_url = \"https://direct.example.com/v1\""));
+                let auth_json: Value =
+                    serde_json::from_str(&fs::read_to_string(home.join(".codex").join("auth.json")).unwrap())
+                        .unwrap();
+                assert_eq!(auth_json["OPENAI_API_KEY"], json!("sk-direct"));
+            });
+        });
+    }
+
+    #[test]
+    fn desktop_inference_models_use_current_codex_catalog_slots() {
+        let mut cfg = config_with_secret();
+        cfg["providers"][0]["models"] = json!({
+            "default": "deepseek-v4-pro[1m]",
+            "gpt_5_5": "kimi-k2",
+            "gpt_5_4": "glm-4.6",
+        });
+        let provider = active_provider(&cfg).unwrap();
+        let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
+        let raw = desktop_inference_models_json(Some(&target));
+
+        assert!(!raw.contains("sonnet"));
+        assert!(!raw.contains("haiku"));
+        assert!(!raw.contains("opus"));
+
+        let models: Vec<Value> = serde_json::from_str(&raw).unwrap();
+        let names: Vec<&str> = models
+            .iter()
+            .filter_map(|item| item.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"gpt-5.5"));
+        assert!(names.contains(&"gpt-5.4"));
+        assert!(names.contains(&"gpt-5.4-mini"));
+        assert!(names.contains(&"deepseek-v4-pro"));
+        assert!(models
+            .iter()
+            .any(|item| item.get("supports1m").and_then(|v| v.as_bool()) == Some(true)));
+    }
+
+    #[test]
+    fn desktop_status_reports_current_models_and_health_issues() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["providers"][0]["models"] = json!({
+                    "default": "deepseek-v4-pro[1m]",
+                    "gpt_5_5": "kimi-k2",
+                });
+                save_registry(&cfg).unwrap();
+
+                let codex_dir = home.join(".codex");
+                fs::create_dir_all(&codex_dir).unwrap();
+                fs::write(
+                    codex_dir.join("config.toml"),
+                    "openai_base_url = \"http://127.0.0.1:18080\"\n",
+                )
+                .unwrap();
+                fs::write(
+                    codex_dir.join("auth.json"),
+                    "{\"OPENAI_API_KEY\":\"cas_existing\"}\n",
+                )
+                .unwrap();
+
+                let response = desktop_status().await.into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+
+                let models_raw = payload["keys"]["inferenceModels"].as_str().unwrap();
+                assert!(!models_raw.contains("sonnet"));
+                assert!(models_raw.contains("gpt-5.5"));
+                assert!(models_raw.contains("deepseek-v4-pro"));
+                assert_eq!(payload["configured"], json!(false));
+                assert_eq!(payload["health"]["needsApply"], json!(true));
+                assert_eq!(payload["health"]["oneMillionReady"], json!(false));
+
+                let codes: Vec<&str> = payload["health"]["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
+                    .collect();
+                assert!(codes.contains(&"not_managed_by_cas"));
+                assert!(codes.contains(&"one_million_not_written"));
+            });
+        });
+    }
+
+    #[test]
+    fn desktop_health_reports_base_url_mismatch() {
+        with_isolated_home(|home| {
+            let cfg = config_with_secret();
+            let provider = active_provider(&cfg).unwrap();
+            let mut target_cfg = cfg.clone();
+            let target =
+                desktop_config_target_for_provider(&mut target_cfg, &provider, Some(19090));
+
+            let codex_dir = home.join(".codex");
+            fs::create_dir_all(&codex_dir).unwrap();
+            fs::write(
+                codex_dir.join("config.toml"),
+                "openai_base_url = \"http://127.0.0.1:18080\"\n",
+            )
+            .unwrap();
+            fs::write(
+                codex_dir.join("auth.json"),
+                "{\"OPENAI_API_KEY\":\"cas_old\"}\n",
+            )
+            .unwrap();
+
+            let paths = CodexPaths::from_home_env().unwrap();
+            let actual_base_url = read_codex_toml_root_string(&paths, "openai_base_url");
+            let health = desktop_health(
+                Some(&paths),
+                false,
+                actual_base_url.as_deref(),
+                true,
+                Some(&target),
+            );
+
+            assert_eq!(health["needsApply"], json!(true));
+            assert_eq!(health["expectedBaseUrl"], json!("http://127.0.0.1:19090"));
+            assert_eq!(health["actualBaseUrl"], json!("http://127.0.0.1:18080"));
+            let codes: Vec<&str> = health["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
+                .collect();
+            assert!(codes.contains(&"not_managed_by_cas"));
+            assert!(codes.contains(&"gateway_base_url_mismatch"));
+        });
+    }
+}
