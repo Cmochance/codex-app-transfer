@@ -30,6 +30,11 @@ use tokio_tungstenite::{
 
 /// echo-back 上游:把收到的请求镜像成 JSON 返回。`marker` 用来在响应头里
 /// 标记是哪个 mock,以便测试断言代理选对了上游。
+///
+/// `headers` 字段:每个 header name 只保留**最后一个**值(serde Map insert
+/// 语义),用于已有断言。
+/// `headers_all` 字段:每个 header name → 所有值的列表,用于检测同名
+/// header 是否被重复发送(extras override 单测要看这里)。
 fn echo_mock(marker: &'static str) -> Router {
     Router::new().fallback(any(move |req: Request| async move {
         let (parts, body) = req.into_parts();
@@ -37,17 +42,24 @@ fn echo_mock(marker: &'static str) -> Router {
             .await
             .unwrap_or_default();
         let mut headers_map = serde_json::Map::new();
+        let mut headers_all: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
         for (k, v) in parts.headers.iter() {
-            headers_map.insert(
-                k.as_str().to_owned(),
-                serde_json::Value::String(v.to_str().unwrap_or("").to_owned()),
-            );
+            let name = k.as_str().to_owned();
+            let value = v.to_str().unwrap_or("").to_owned();
+            headers_map.insert(name.clone(), serde_json::Value::String(value.clone()));
+            headers_all
+                .entry(name)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::Value::String(value));
         }
         let payload = json!({
             "marker": marker,
             "method": parts.method.as_str(),
             "path": parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"),
             "headers": headers_map,
+            "headers_all": headers_all,
             "body": String::from_utf8_lossy(&bytes),
         });
         Response::builder()
@@ -332,6 +344,43 @@ async fn slug_routes_to_provider_b_with_x_api_key_and_extras() {
     let body = v["body"].as_str().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(parsed["model"], "coding");
+}
+
+/// 同名 header 必须**只**带 `provider.extraHeaders` 的值上线,**不能**和
+/// 客户端原始 header 一起以多值形式打到上游。reqwest `RequestBuilder::header`
+/// 是 append 语义,如果不在复制客户端 header 时过滤掉 extras 已覆盖的名字,
+/// kimi-code 这类靠 `User-Agent: KimiCLI/1.40.0` 伪装身份的 provider 会被
+/// 上游"首条 UA"一票否决(2026-05-07 Windows v2.0.8 Kimi 403 现场)。
+#[tokio::test]
+async fn extras_header_overrides_client_value_no_duplicate() {
+    let s = build_stack().await;
+    // 客户端显式带 User-Agent 模拟 Codex CLI 自加身份头
+    let resp = client()
+        .post(format!("http://{}/v1/chat/completions", s.proxy))
+        .header("authorization", "Bearer cas_test_gw")
+        .header("user-agent", "client-codex-cli/0.x.x")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"provider-b/coding"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v = body_json(resp).await;
+
+    let ua_values = v["headers_all"]["user-agent"]
+        .as_array()
+        .expect("upstream 应当至少收到一条 user-agent");
+    assert_eq!(
+        ua_values.len(),
+        1,
+        "extras 必须 override:上游应只见到 1 条 User-Agent,实际: {:?}",
+        ua_values
+    );
+    assert_eq!(
+        ua_values[0].as_str().unwrap(),
+        "TestAgent/1.0",
+        "唯一一条 User-Agent 必须是 extras 的值,而不是客户端 codex CLI 的值"
+    );
 }
 
 #[tokio::test]

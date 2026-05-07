@@ -194,12 +194,23 @@ pub async fn forward_handler(
     }
 
     // 6. 构造 reqwest 请求 —— 头复制 + 鉴权改写 + extras 注入
+    //
+    // **extras 同名 header 走 override 语义**:reqwest `RequestBuilder::header()`
+    // 是 append,不是 replace。如果客户端(例如 Codex CLI 自己加的
+    // `User-Agent: codex-cli/...`)和 `provider.extraHeaders`(例如 kimi-code
+    // 的 `User-Agent: KimiCLI/1.40.0`)同名,两条值都会上线,部分上游
+    // 严格按"首条 UA"判定接入身份就会绕过我们的伪装。这里在复制客户端
+    // header 时,先把 extras 已经覆盖的名字过滤掉,保证最终只有 extras 的
+    // 值出去。
     let mut up = state
         .http
         .request(parts.method.clone(), &upstream_url)
         .body(plan.body.clone());
     for (name, value) in parts.headers.iter() {
         if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
+            continue;
+        }
+        if resolved.extra_headers.contains_key(name) {
             continue;
         }
         up = up.header(name, value);
