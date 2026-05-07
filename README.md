@@ -16,14 +16,14 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本：**v2.0.6**(Python → Rust/Tauri 全栈重写后的当前主线;UI 视觉与 v1.0.4 字节级一致)
-- 已验证供应商：Kimi Code（`kimi-for-coding` UA 网关）、Kimi 月之暗面（Moonshot Platform）、DeepSeek V4(官方 baseUrl,含「Max 思维」思考模式)、Xiaomi MiMo (Token Plan)、Xiaomi MiMo (Pay for Token)
+- 当前版本:**v2.0.9**(Python → Rust/Tauri 全栈重写后的当前主线;UI 视觉与 v1.0.4 字节级一致)
+- 已验证供应商:Kimi Code(`kimi-for-coding` UA 网关)、Kimi 月之暗面(Moonshot Platform)、DeepSeek V4(官方 baseUrl,含「Max 思维」思考模式)、Xiaomi MiMo (Token Plan / Pay for Token)、MiniMax M2.x(OpenAI-compatible chat,自动剥不兼容字段 + `reasoning_split` + `<think>` 兜底)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
-- v2.0.x 链路稳定性改动(累计到 v2.0.6):reasoning_content 历史回放 + 全局 `TOOL_CALLS_CACHE` 在历史压缩后重建缺失的 assistant.tool_calls;`response.in_progress` 事件按协议补齐;chat usage → responses usage 字段规范化;DeepSeek 视觉(image)输入剥离避免 400;Windows 重启 Codex 不再 flash 终端窗口 + 托盘菜单交互修复;启用按钮即时反馈,不再等转发回包
+- v2.0.x 链路稳定性改动(累计到 v2.0.9):reasoning_content 历史回放 + 全局 `TOOL_CALLS_CACHE` 在历史压缩后重建缺失的 assistant.tool_calls;`response.in_progress` 事件按协议补齐;chat usage → responses usage 字段规范化(含 `cached_tokens` 默认补零,避免 Kimi/MiMo 重连卡顿);DeepSeek 视觉(image)输入剥离避免 400;vision 白名单按模型级精确匹配(替换之前的 provider 子串匹配);Kimi/DeepSeek thinking 在 Codex CLI TUI 显示头修复 + `extraHeaders` 支持 `{apiKey}` 模板(解决 Kimi 403);MiniMax 兼容(请求侧白名单清洗 `reasoning_effort`/`response_format`/`parallel_tool_calls` 等不支持字段、`tool` 剥 `strict`、连续 `system` 合并;响应侧 `reasoning_details` 拆 reasoning + `<think>` 兜底拆分仅对 MiniMax 启用,不影响其他 provider 的字面 `<think>` 文本);Windows 重启 Codex 不再 flash 终端窗口 + 托盘菜单交互修复;启用按钮即时反馈,不再等转发回包
 
 > 如果使用过程中出现问题，欢迎提交 PR 协助作者完善，会及时处理，非常感谢。
 
-- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.0.6 或 v1.0.3
+- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.0.9 或 v1.0.3
 - 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.0.4 字节级互通,可来回切换不丢数据
 
 ### 更新日志
@@ -103,12 +103,12 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: **v2.0.6** (current mainline after the full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
-- Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (official baseUrl, with "Max thinking" mode), Xiaomi MiMo (Token Plan), Xiaomi MiMo (Pay for Token)
+- Current version: **v2.0.9** (current mainline after the full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
+- Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (official baseUrl, with "Max thinking" mode), Xiaomi MiMo (Token Plan / Pay for Token), MiniMax M2.x (OpenAI-compatible chat — incompatible fields auto-stripped, `reasoning_split` enabled, `<think>` tag fallback)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
-- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets. v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.0.6 or v1.0.3 in production.
+- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets. v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.0.9 or v1.0.3 in production.
 - Data compatibility: `~/.codex-app-transfer/config.json` remains byte-identical between v1.0.4 and the v2.x Rust mainline — switch back and forth without data loss
-- v2.0.x stability rollups (cumulative through v2.0.6): reasoning_content history replay + global `TOOL_CALLS_CACHE` rebuilds missing `assistant.tool_calls` after history compaction; emits the protocol-correct `response.in_progress` event; normalizes chat-style `usage` into Responses-API `usage`; strips DeepSeek vision (image) inputs to avoid upstream 400; Windows Codex restart no longer flashes a terminal window + tray menu interactions fixed; enable-button now gives instant feedback instead of waiting for the forwarder roundtrip.
+- v2.0.x stability rollups (cumulative through v2.0.9): reasoning_content history replay + global `TOOL_CALLS_CACHE` rebuilds missing `assistant.tool_calls` after history compaction; emits the protocol-correct `response.in_progress` event; normalizes chat-style `usage` into Responses-API `usage` (with `cached_tokens` defaulted to 0 to fix Kimi/MiMo reconnect stalls); strips DeepSeek vision (image) inputs to avoid upstream 400; vision allowlist switched from provider substring to per-model exact match; Kimi/DeepSeek thinking header rendering fix in Codex CLI TUI + `extraHeaders` `{apiKey}` template (resolves Kimi 403); MiniMax compatibility (request-side allowlist drops `reasoning_effort`/`response_format`/`parallel_tool_calls` and other unsupported fields, strips tool `strict`, merges consecutive `system` messages; response-side `reasoning_details` lifted into reasoning + `<think>` fallback split scoped to MiniMax only, non-MiniMax providers' literal `<think>` text passes through unmodified); Windows Codex restart no longer flashes a terminal window + tray menu interactions fixed; enable-button now gives instant feedback instead of waiting for the forwarder roundtrip.
 
 ### Changelog
 
