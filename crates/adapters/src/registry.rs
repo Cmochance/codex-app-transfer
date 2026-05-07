@@ -68,10 +68,18 @@ impl AdapterRegistry {
 
 pub fn is_local_responses_route(client_path: &str) -> bool {
     let path = client_path.split('?').next().unwrap_or(client_path);
-    matches!(
-        normalize_local_responses_path(path).as_str(),
-        "/responses" | "/messages"
-    )
+    let normalized = normalize_local_responses_path(path);
+    let normalized = normalized.as_str();
+    // `/responses` / `/messages` 是 OpenAI Codex CLI 本地入站路径;
+    // `/responses/compact` 等 `/responses/*` 子路径(以及 `/messages/*`)
+    // 是 OpenAI Responses API 的私有扩展,第三方 provider 都不实现,**必须**
+    // 走 ResponsesAdapter 在本地处理而不是透传到 openai_chat 上游(否则
+    // OpenaiChatAdapter 会把 `/responses/compact` 直接转给 chat-completions
+    // 上游 base_url,触发 404)。
+    normalized == "/responses"
+        || normalized.starts_with("/responses/")
+        || normalized == "/messages"
+        || normalized.starts_with("/messages/")
 }
 
 fn normalize_local_responses_path(path: &str) -> String {
@@ -155,5 +163,39 @@ mod tests {
                 .name(),
             "openai_chat"
         );
+    }
+
+    #[test]
+    fn responses_compact_subpath_routes_to_responses_adapter() {
+        // 关键回归 (2026-05-07):/responses/compact 必须命中 ResponsesAdapter,
+        // 让它在本地实现 compact 端点,而不是被 OpenaiChatAdapter 直接透传到
+        // 上游 chat-completions provider(那一定 404,因为这是 OpenAI 私有
+        // 扩展,第三方都没实现)。
+        let r = AdapterRegistry::with_builtins();
+        for path in [
+            "/responses/compact",
+            "/responses/compact?foo=1",
+            "/v1/responses/compact",
+            "/openai/v1/responses/compact",
+        ] {
+            assert_eq!(
+                r.lookup_for_request("openai_chat", path).name(),
+                "responses",
+                "{path} 必须走 ResponsesAdapter 本地处理(不能透传成 OpenaiChat)"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_routes_match_does_not_trigger_on_unrelated_prefixes() {
+        // 防回归:`/responses_alt`、`/responsesfake` 不应被误判成 local 路由
+        let r = AdapterRegistry::with_builtins();
+        for path in ["/responses_alt", "/v1/responsesfake", "/v1/messagessuffix"] {
+            assert_eq!(
+                r.lookup_for_request("openai_chat", path).name(),
+                "openai_chat",
+                "{path} 不应误判为 Codex 本地 Responses/Messages 路由"
+            );
+        }
     }
 }
