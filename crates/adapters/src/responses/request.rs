@@ -1761,7 +1761,11 @@ mod tests {
     }
 
     fn mimo_provider() -> Provider {
-        let mut p = provider("xiaomi-mimo", "Xiaomi MiMo", "https://api.xiaomimimo.com/v1");
+        let mut p = provider(
+            "xiaomi-mimo",
+            "Xiaomi MiMo",
+            "https://api.xiaomimimo.com/v1",
+        );
         p.models.insert("default".into(), "mimo-v2.5-pro".into());
         p.api_format = "openai_chat".into();
         p
@@ -1792,7 +1796,8 @@ mod tests {
     fn vision_blacklist_blocks_deepseek_v4_flash() {
         let req = vision_request_for("deepseek-v4-flash");
         let mut p = deepseek_provider();
-        p.models.insert("default".into(), "deepseek-v4-flash".into());
+        p.models
+            .insert("default".into(), "deepseek-v4-flash".into());
         assert!(!image_url_kept(&req, &p));
     }
 
