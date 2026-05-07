@@ -37,6 +37,7 @@
 //!   (Stage 4 接 tracing 后再 warn)
 
 use std::collections::BTreeMap;
+use std::mem;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -85,6 +86,12 @@ pub struct ChatToResponsesConverter {
     message_closed: bool,
     message_index: u32,
     text_acc: String,
+    /// 是否在 `delta.content` 上启用 `<think>...</think>` 兜底拆分。
+    /// 仅对 MiniMax 一类把 thinking 塞进 content 标签的 provider 开启;
+    /// 其他 provider 默认透传,避免代码块/字面 `<think>` 被误吃。
+    enable_think_tag_split: bool,
+    think_tag_open: bool,
+    think_tag_buffer: String,
 
     // ── tool_calls(工具调用流)── BTreeMap 用 OpenAI 自带的 index 做 key,
     // 迭代顺序天然按 OpenAI index 升序;output_index 在首次 open 时分配
@@ -131,6 +138,9 @@ impl ChatToResponsesConverter {
             message_closed: false,
             message_index: 0,
             text_acc: String::new(),
+            enable_think_tag_split: false,
+            think_tag_open: false,
+            think_tag_buffer: String::new(),
             tool_calls: BTreeMap::new(),
             fc_id_seed,
             model: String::new(),
@@ -145,6 +155,12 @@ impl ChatToResponsesConverter {
             .unwrap_or(response_id.as_str())
             .to_owned();
         Self::new_with_ids(response_id, format!("msg_{seed}"), format!("rs_{seed}"))
+    }
+
+    /// 开启/关闭 `<think>...</think>` 兜底拆分(默认关闭)。
+    pub fn with_think_tag_split(mut self, enabled: bool) -> Self {
+        self.enable_think_tag_split = enabled;
+        self
     }
 
     pub fn assistant_message(&self) -> Option<Value> {
@@ -296,44 +312,20 @@ impl ChatToResponsesConverter {
         // reasoning 优先于 content 处理(Kimi/DeepSeek 在同一 chunk 里通常只有一种)
         if let Some(rs) = choice.delta.reasoning_content.as_deref() {
             if !rs.is_empty() {
-                if !self.reasoning_open {
-                    self.open_reasoning(out);
+                self.emit_reasoning_delta(rs, out);
+            }
+        }
+        for detail in &choice.delta.reasoning_details {
+            if let Some(rs) = detail.text.as_deref() {
+                if !rs.is_empty() {
+                    self.emit_reasoning_delta(rs, out);
                 }
-                self.reasoning_acc.push_str(rs);
-                emit_event(
-                    out,
-                    "response.reasoning_summary_text.delta",
-                    json!({
-                        "type": "response.reasoning_summary_text.delta",
-                        "item_id": self.reasoning_id,
-                        "output_index": self.reasoning_index,
-                        "summary_index": 0,
-                        "delta": rs,
-                    }),
-                );
             }
         }
 
         if let Some(text) = choice.delta.content.as_deref() {
             if !text.is_empty() {
-                if self.reasoning_open && !self.reasoning_closed {
-                    self.close_reasoning(out);
-                }
-                if !self.message_open {
-                    self.open_message(out);
-                }
-                self.text_acc.push_str(text);
-                emit_event(
-                    out,
-                    "response.output_text.delta",
-                    json!({
-                        "type": "response.output_text.delta",
-                        "item_id": self.message_id,
-                        "output_index": self.message_index,
-                        "content_index": 0,
-                        "delta": text,
-                    }),
-                );
+                self.handle_content_delta(text, out);
             }
         }
 
@@ -501,6 +493,131 @@ impl ChatToResponsesConverter {
             },
         );
         pending.closed = true;
+    }
+
+    fn emit_reasoning_delta(&mut self, text: &str, out: &mut Vec<u8>) {
+        if !self.reasoning_open {
+            self.open_reasoning(out);
+        }
+        self.reasoning_acc.push_str(text);
+        emit_event(
+            out,
+            "response.reasoning_summary_text.delta",
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": self.reasoning_id,
+                "output_index": self.reasoning_index,
+                "summary_index": 0,
+                "delta": text,
+            }),
+        );
+    }
+
+    fn emit_text_delta(&mut self, text: &str, out: &mut Vec<u8>) {
+        if text.is_empty() {
+            return;
+        }
+        if self.reasoning_open && !self.reasoning_closed {
+            self.close_reasoning(out);
+        }
+        if !self.message_open {
+            self.open_message(out);
+        }
+        self.text_acc.push_str(text);
+        emit_event(
+            out,
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": self.message_id,
+                "output_index": self.message_index,
+                "content_index": 0,
+                "delta": text,
+            }),
+        );
+    }
+
+    fn handle_content_delta(&mut self, text: &str, out: &mut Vec<u8>) {
+        if !self.enable_think_tag_split {
+            self.emit_text_delta(text, out);
+            return;
+        }
+        self.think_tag_buffer.push_str(text);
+        self.drain_think_tag_buffer(out, false);
+    }
+
+    fn flush_content_parser(&mut self, out: &mut Vec<u8>) {
+        if !self.enable_think_tag_split {
+            return;
+        }
+        self.drain_think_tag_buffer(out, true);
+    }
+
+    /// MiniMax 原生 OpenAI-compatible 格式会把 thinking 写进
+    /// `content` 的 `<think>...</think>` 中。这里把它拆成 Responses
+    /// reasoning,避免标签和思考正文污染普通 assistant 文本。请求侧会优先
+    /// 使用 reasoning_split=true,本解析器作为上游未拆分时的兜底。
+    fn drain_think_tag_buffer(&mut self, out: &mut Vec<u8>, flush: bool) {
+        const OPEN: &str = "<think>";
+        const CLOSE: &str = "</think>";
+        loop {
+            if self.think_tag_open {
+                if let Some(pos) = self.think_tag_buffer.find(CLOSE) {
+                    let reasoning = self.think_tag_buffer[..pos].to_owned();
+                    if !reasoning.is_empty() {
+                        self.emit_reasoning_delta(&reasoning, out);
+                    }
+                    self.think_tag_buffer.drain(..pos + CLOSE.len());
+                    self.think_tag_open = false;
+                    continue;
+                }
+
+                let keep = if flush {
+                    0
+                } else {
+                    suffix_prefix_len(&self.think_tag_buffer, CLOSE)
+                };
+                let emit_len = self.think_tag_buffer.len().saturating_sub(keep);
+                if emit_len > 0 {
+                    let reasoning = self.think_tag_buffer[..emit_len].to_owned();
+                    self.think_tag_buffer.drain(..emit_len);
+                    self.emit_reasoning_delta(&reasoning, out);
+                }
+                break;
+            }
+
+            if let Some(pos) = self.think_tag_buffer.find(OPEN) {
+                let text = self.think_tag_buffer[..pos].to_owned();
+                if !text.is_empty() {
+                    self.emit_text_delta(&text, out);
+                }
+                self.think_tag_buffer.drain(..pos + OPEN.len());
+                self.think_tag_open = true;
+                continue;
+            }
+
+            let keep = if flush {
+                0
+            } else {
+                suffix_prefix_len(&self.think_tag_buffer, OPEN)
+            };
+            let emit_len = self.think_tag_buffer.len().saturating_sub(keep);
+            if emit_len > 0 {
+                let text = self.think_tag_buffer[..emit_len].to_owned();
+                self.think_tag_buffer.drain(..emit_len);
+                self.emit_text_delta(&text, out);
+            }
+            break;
+        }
+
+        if flush && !self.think_tag_buffer.is_empty() {
+            let rest = mem::take(&mut self.think_tag_buffer);
+            if self.think_tag_open {
+                self.emit_reasoning_delta(&rest, out);
+            } else {
+                self.emit_text_delta(&rest, out);
+            }
+        }
     }
 
     fn tool_call_item_completed(pending: &PendingToolCall) -> Value {
@@ -713,6 +830,7 @@ impl ChatToResponsesConverter {
             self.state = State::Streaming;
             self.emit_lifecycle_open(out);
         }
+        self.flush_content_parser(out);
         if self.reasoning_open && !self.reasoning_closed {
             self.close_reasoning(out);
         }
@@ -897,6 +1015,16 @@ fn parse_sse_data_payload(frame: &[u8]) -> Option<String> {
     None
 }
 
+fn suffix_prefix_len(value: &str, pattern: &str) -> usize {
+    let max = value.len().min(pattern.len().saturating_sub(1));
+    for len in (1..=max).rev() {
+        if value.ends_with(&pattern[..len]) {
+            return len;
+        }
+    }
+    0
+}
+
 // ── 入站 chunk 反序列化结构 ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -932,6 +1060,10 @@ struct ChatDelta {
     /// 没有这个字段,我们透传到 Responses 的 reasoning summary。
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// MiniMax M2.7 在 `reasoning_split=true` 时把 thinking 单独放在
+    /// reasoning_details 中。
+    #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
+    reasoning_details: Vec<ChatReasoningDetail>,
     /// OpenAI / DeepSeek / Kimi 工具调用增量;同一 `index` 的多 chunk 累计
     /// 成完整的 `function.arguments` JSON 字符串。
     ///
@@ -969,6 +1101,12 @@ impl LegacyFunctionCallDelta {
         self.name.as_deref().map_or(false, |v| !v.is_empty())
             || self.arguments.as_deref().map_or(false, |v| !v.is_empty())
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatReasoningDetail {
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1021,6 +1159,69 @@ mod tests {
 
     fn names(events: &[(String, Value)]) -> Vec<&str> {
         events.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    // ── <think> 兜底拆分 provider 门控回归 ─────────────────────────────
+
+    #[test]
+    fn think_tag_split_disabled_passes_literal_tags_through() {
+        // 默认未开启 enable_think_tag_split:DeepSeek/Kimi 等 provider 在普通
+        // content 里输出字面 <think>...</think>(代码示例、讨论)时必须原样透传,
+        // 不能被解析成 reasoning,否则会丢用户实际想看到的文本。
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"see <think>example</think> here"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "应只产一个 message,不应误产 reasoning");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(
+            output[0]["content"][0]["text"],
+            "see <think>example</think> here"
+        );
+    }
+
+    #[test]
+    fn think_tag_split_disabled_keeps_code_block_intact() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"qwen3","choices":[{"index":0,"delta":{"content":"usage: ```html\n<think>thoughts</think>\n```"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        let text = output[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("<think>thoughts</think>"), "got: {text}");
+    }
+
+    #[test]
+    fn think_tag_split_enabled_splits_minimax_style_content() {
+        // 显式 opt-in 后,<think>...</think> 应被拆成 reasoning(MiniMax 行为)。
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_think_tag_split(true);
+        let _ = c.feed(
+            br#"data: {"model":"MiniMax-M2.7","choices":[{"index":0,"delta":{"content":"<think>plan more</think>final"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nplan more");
+        assert_eq!(output[1]["content"][0]["text"], "final");
     }
 
     // ── Stage 3.2c 行为回归(content-only)── ─────────────────────────
@@ -1290,6 +1491,63 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             completed["output"][0]["summary"][0]["text"],
             "**Thinking**\n\npart1 part2"
         );
+    }
+
+    #[test]
+    fn minimax_reasoning_details_becomes_reasoning_item() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"MiniMax-M2.7","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"think"}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn minimax_think_tags_are_split_out_of_content() {
+        let mut c = fixed().with_think_tag_split(true);
+        let _ = c.feed(
+            br#"data: {"model":"MiniMax-M2.7","choices":[{"index":0,"delta":{"content":"<think>plan"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":" more</think>final"},"finish_reason":"stop"}]}
+
+"#,
+        );
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nplan more");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "final");
+    }
+
+    #[test]
+    fn split_think_open_tag_is_buffered() {
+        let mut c = fixed().with_think_tag_split(true);
+        let _ = c.feed(b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<thi\"}}]}\n\n");
+        let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"nk>x</think>y\"},\"finish_reason\":\"stop\"}]}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let completed = &events.last().unwrap().1["response"];
+        assert_eq!(
+            completed["output"][0]["summary"][0]["text"],
+            "**Thinking**\n\nx"
+        );
+        assert_eq!(completed["output"][1]["content"][0]["text"], "y");
     }
 
     // ── 边界回归(已有用例迁移)──────────────────────────────────────

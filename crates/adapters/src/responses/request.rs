@@ -19,7 +19,7 @@
 //! - 多轮 user/assistant 合并
 
 use codex_app_transfer_registry::Provider;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::types::{AdapterError, ResponseSessionPlan};
 
@@ -205,6 +205,8 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     if stream {
         result.insert("stream_options".into(), json!({ "include_usage": true }));
     }
+
+    sanitize_chat_body_for_provider(&mut result, provider);
 
     Ok(ResponsesBodyConversion {
         body: Value::Object(result),
@@ -916,6 +918,136 @@ fn provider_looks_like(provider: &Provider, needle: &str) -> bool {
         .any(|value| value.to_ascii_lowercase().contains(&needle))
 }
 
+fn sanitize_chat_body_for_provider(body: &mut Map<String, Value>, provider: Option<&Provider>) {
+    let Some(provider) = provider else {
+        return;
+    };
+    if provider_looks_like(provider, "minimax") || provider_looks_like(provider, "minimaxi") {
+        sanitize_minimax_chat_body(body);
+    }
+}
+
+/// MiniMax M2.x 的 OpenAI-compatible chat 端点并不接受完整 OpenAI/Codex
+/// 参数集。官方文档主要列出 model/messages/stream/max_tokens/
+/// max_completion_tokens/temperature/top_p/tools/tool_choice/
+/// mask_sensitive_info；`response_format` 仅 MiniMax-Text-01 支持。
+/// Codex Responses 转 Chat 时会生成 `reasoning_effort`、`response_format`、
+/// `parallel_tool_calls` 等字段，MiniMax 会统一报 400:
+/// "invalid params, invalid chat setting (2013)"。
+fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
+    let response_format_allowed = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|model| model.eq_ignore_ascii_case("MiniMax-Text-01"));
+
+    body.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "model"
+                | "messages"
+                | "stream"
+                | "max_tokens"
+                | "max_completion_tokens"
+                | "temperature"
+                | "top_p"
+                | "tool_choice"
+                | "tools"
+                | "reasoning_split"
+                | "stream_options"
+                | "mask_sensitive_info"
+        ) || (key == "response_format" && response_format_allowed)
+    });
+
+    // MiniMax 官方建议 OpenAI-compatible M2.7 工具调用启用
+    // reasoning_split,让 thinking 单独进入 reasoning_details,避免塞进
+    // content 的 <think>...</think> 里。
+    body.insert("reasoning_split".into(), Value::Bool(true));
+    // MiniMax 的 OpenAI-compatible streaming 不稳定接受
+    // `stream_options.include_usage`;缺 usage 时响应转换层会补零值 usage。
+    body.remove("stream_options");
+    merge_consecutive_system_messages(body);
+    sanitize_minimax_tools(body);
+
+    if let Some(choice) = body.get_mut("tool_choice") {
+        let allowed = choice
+            .as_str()
+            .is_some_and(|s| matches!(s, "auto" | "none"));
+        if !allowed {
+            *choice = Value::String("auto".into());
+        }
+    }
+
+    remove_non_positive_number(body, "temperature");
+    remove_non_positive_number(body, "top_p");
+}
+
+fn merge_consecutive_system_messages(body: &mut Map<String, Value>) {
+    let Some(Value::Array(messages)) = body.get_mut("messages") else {
+        return;
+    };
+
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages.drain(..) {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let is_system = role == "system";
+        let prev_is_system = merged
+            .last()
+            .and_then(|prev| prev.get("role"))
+            .and_then(|v| v.as_str())
+            == Some("system");
+
+        if is_system && prev_is_system {
+            let current = msg
+                .get("content")
+                .map(value_to_chat_string)
+                .unwrap_or_default();
+            if let Some(prev_obj) = merged.last_mut().and_then(|prev| prev.as_object_mut()) {
+                let prev = prev_obj
+                    .get("content")
+                    .map(value_to_chat_string)
+                    .unwrap_or_default();
+                let combined = if prev.is_empty() {
+                    current
+                } else if current.is_empty() {
+                    prev
+                } else {
+                    format!("{prev}\n\n{current}")
+                };
+                prev_obj.insert("content".into(), Value::String(combined));
+            }
+            continue;
+        }
+
+        merged.push(msg);
+    }
+
+    *messages = merged;
+}
+
+fn sanitize_minimax_tools(body: &mut Map<String, Value>) {
+    let Some(Value::Array(tools)) = body.get_mut("tools") else {
+        return;
+    };
+    for tool in tools.iter_mut() {
+        let Some(function) = tool.get_mut("function").and_then(|v| v.as_object_mut()) else {
+            continue;
+        };
+        // MiniMax tool examples use the classic OpenAI tool schema and do not
+        // accept OpenAI strict function-calling metadata.
+        function.remove("strict");
+    }
+}
+
+fn remove_non_positive_number(body: &mut Map<String, Value>, key: &str) {
+    let should_remove = body
+        .get(key)
+        .and_then(|v| v.as_f64())
+        .is_some_and(|v| v <= 0.0);
+    if should_remove {
+        body.remove(key);
+    }
+}
+
 fn provider_chat_thinking_enabled(provider: &Provider) -> bool {
     if thinking_value_enabled(provider.request_options.get("thinking"))
         || provider.request_options.get("reasoning_effort").is_some()
@@ -1543,6 +1675,13 @@ mod tests {
         p
     }
 
+    fn minimax_provider() -> Provider {
+        let mut p = provider("minimax", "MiniMax", "https://api.minimaxi.com/v1");
+        p.models.insert("default".into(), "MiniMax-M2.7".into());
+        p.api_format = "openai_chat".into();
+        p
+    }
+
     #[test]
     fn deepseek_history_strips_image_blocks_to_text_placeholder() {
         // 真实 Codex CLI history:第 9 条 user 消息含 image_url,DeepSeek 实测
@@ -1713,6 +1852,89 @@ mod tests {
         });
         let out = responses_body_to_chat_body_for_provider(&req, Some(&kimi)).unwrap();
         assert_eq!(out["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn minimax_m2_drops_unsupported_chat_settings() {
+        // MiniMax M2.7 OpenAI-compatible chat 对 OpenAI/Codex 的扩展字段会报
+        // 400 invalid chat setting (2013)。保留工具相关标准字段,剥掉
+        // response_format/reasoning_effort/parallel_tool_calls 等不兼容项。
+        let req = json!({
+            "model": "MiniMax-M2.7",
+            "stream": true,
+            "reasoning": {"effort": "high"},
+            "parallel_tool_calls": true,
+            "store": false,
+            "metadata": {"k": "v"},
+            "instructions": "Output strict JSON.",
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "text": json_schema_text_config(),
+            "tool_choice": "auto",
+            "tools": [{
+                "type":"function",
+                "name":"shell",
+                "parameters":{"type":"object"}
+            }]
+        });
+        let p = minimax_provider();
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert!(out.get("response_format").is_none());
+        assert!(out.get("reasoning_effort").is_none());
+        assert!(out.get("parallel_tool_calls").is_none());
+        assert!(out.get("store").is_none());
+        assert!(out.get("metadata").is_none());
+        assert!(out.get("tools").is_some(), "MiniMax M2 支持 tool use");
+        assert_eq!(out["tool_choice"], "auto");
+        assert_eq!(out["reasoning_split"], true);
+        assert!(out.get("stream_options").is_none());
+        assert!(out["tools"][0]["function"].get("strict").is_none());
+    }
+
+    #[test]
+    fn minimax_tool_choice_required_is_downgraded_to_auto() {
+        let req = json!({
+            "model": "MiniMax-M2.7",
+            "stream": true,
+            "input": "hi",
+            "tool_choice": {"type": "required"}
+        });
+        let p = minimax_provider();
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert_eq!(out["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn minimax_merges_consecutive_system_messages() {
+        let req = json!({
+            "model": "MiniMax-M2.7",
+            "stream": true,
+            "instructions": "system one",
+            "input": [
+                {"type":"message","role":"system","content":"system two"},
+                {"type":"message","role":"user","content":"hi"}
+            ]
+        });
+        let p = minimax_provider();
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "system one\n\nsystem two");
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn minimax_text_01_keeps_response_format() {
+        let mut p = provider("minimax", "MiniMax", "https://api.minimaxi.com/v1");
+        p.models.insert("default".into(), "MiniMax-Text-01".into());
+        let req = json!({
+            "model": "MiniMax-Text-01",
+            "stream": true,
+            "input": "hi",
+            "text": json_schema_text_config(),
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert_eq!(out["response_format"]["type"], "json_schema");
     }
 
     #[test]

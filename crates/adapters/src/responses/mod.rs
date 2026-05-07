@@ -20,7 +20,10 @@ pub use request::{
     responses_body_to_chat_body_for_provider_with_session,
 };
 pub use session::{global_response_session_cache, ResponseSessionCache};
-pub use stream::{convert_chat_to_responses_stream, convert_chat_to_responses_stream_with_session};
+pub use stream::{
+    convert_chat_to_responses_stream, convert_chat_to_responses_stream_with_options,
+    convert_chat_to_responses_stream_with_session,
+};
 pub use tool_call_cache::{global_tool_call_cache, ToolCallCache, ToolCallEntry};
 
 use bytes::Bytes;
@@ -73,7 +76,7 @@ impl Adapter for ResponsesAdapter {
         upstream_status: StatusCode,
         mut upstream_headers: HeaderMap,
         upstream_stream: ByteStream,
-        _provider: &Provider,
+        provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
         // 把 content-type 强制改成 text/event-stream(上游本来就是,但保险)
@@ -81,16 +84,28 @@ impl Adapter for ResponsesAdapter {
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
         );
+        let enable_think_tag_split = provider_needs_think_tag_split(provider);
         Ok(ResponsePlan {
             status: upstream_status,
             headers: upstream_headers,
-            stream: if let Some(session) = request_plan.response_session.clone() {
-                convert_chat_to_responses_stream_with_session(upstream_stream, session)
-            } else {
-                convert_chat_to_responses_stream(upstream_stream)
-            },
+            stream: convert_chat_to_responses_stream_with_options(
+                upstream_stream,
+                request_plan.response_session.clone(),
+                enable_think_tag_split,
+            ),
         })
     }
+}
+
+/// 哪些 provider 需要 `<think>...</think>` 兜底拆分。
+/// 目前只有 MiniMax 的 OpenAI-compatible 端点在不开启 `reasoning_split` 时
+/// 会把思考过程塞进 content 的 `<think>` 标签里,需要兜底解析。
+fn provider_needs_think_tag_split(provider: &Provider) -> bool {
+    let needles = [&provider.id, &provider.name, &provider.base_url];
+    needles.iter().any(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower.contains("minimax") || lower.contains("minimaxi")
+    })
 }
 
 /// 把 `/v1/responses` / `/responses` / `/openai/v1/responses` 以及旧版 message
