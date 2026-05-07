@@ -830,16 +830,38 @@ fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
     out.insert("total_tokens".into(), total_tokens);
 
     // *_tokens_details 子对象重命名;已经是 Responses 形态就原样保留。
-    if let Some(details) = map.get("input_tokens_details").cloned() {
-        out.insert("input_tokens_details".into(), details);
-    } else if let Some(details) = map.get("prompt_tokens_details").cloned() {
-        out.insert("input_tokens_details".into(), details);
-    }
-    if let Some(details) = map.get("output_tokens_details").cloned() {
-        out.insert("output_tokens_details".into(), details);
-    } else if let Some(details) = map.get("completion_tokens_details").cloned() {
-        out.insert("output_tokens_details".into(), details);
-    }
+    // **关键**:Codex CLI 0.128.0-alpha.1 严格 parse `ResponseCompleted` 时
+    // 要求 `usage.input_tokens_details.cached_tokens` 必须存在(否则报
+    // "missing field `cached_tokens`" → 直接当流断,触发 5 次重连 → 30s
+    // Mimo 推理被重打 5 次 ≈ 150s 卡顿,2026-05-07 实测复现)。Mimo 上游
+    // 实际发的是 `prompt_tokens_details: {}` 空对象,透传后下游缺字段必爆。
+    // 同理 `output_tokens_details.reasoning_tokens` 也补默认 0,防同类断流。
+    let mut input_details = match (
+        map.get("input_tokens_details").cloned(),
+        map.get("prompt_tokens_details").cloned(),
+    ) {
+        (Some(Value::Object(d)), _) | (_, Some(Value::Object(d))) => d,
+        _ => serde_json::Map::new(),
+    };
+    input_details
+        .entry("cached_tokens".to_owned())
+        .or_insert(json!(0));
+    out.insert("input_tokens_details".into(), Value::Object(input_details));
+
+    let mut output_details = match (
+        map.get("output_tokens_details").cloned(),
+        map.get("completion_tokens_details").cloned(),
+    ) {
+        (Some(Value::Object(d)), _) | (_, Some(Value::Object(d))) => d,
+        _ => serde_json::Map::new(),
+    };
+    output_details
+        .entry("reasoning_tokens".to_owned())
+        .or_insert(json!(0));
+    out.insert(
+        "output_tokens_details".into(),
+        Value::Object(output_details),
+    );
 
     Value::Object(out)
 }
@@ -1676,6 +1698,50 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
         assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 1);
         assert!(usage.get("prompt_tokens_details").is_none());
         assert!(usage.get("completion_tokens_details").is_none());
+    }
+
+    /// Mimo 上游实测会发 `prompt_tokens_details: {}`(空对象,无 `cached_tokens`)。
+    /// Codex CLI 0.128.0-alpha.1 严格 parse `ResponseCompleted` 必须有
+    /// `usage.input_tokens_details.cached_tokens`,缺字段会触发"stream
+    /// disconnected" → 5 次重连重试 → 30s Mimo 推理被打 5 遍 ≈ 150s 卡顿
+    /// (2026-05-07 实测 fake_proxy + codex exec --json 复现)。本测试锁定:
+    /// 即使上游 details 是空对象或缺,我们 emit 都补 `cached_tokens: 0` /
+    /// `reasoning_tokens: 0` 默认值。
+    #[test]
+    fn empty_upstream_details_get_default_cached_and_reasoning_fields() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        // Mimo 实测形态:prompt_tokens_details 是空 {},completion_tokens_details
+        // 不发(整字段缺)。
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":54,\"completion_tokens\":1042,\"total_tokens\":1096,\"prompt_tokens_details\":{}}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(
+            usage["input_tokens_details"]["cached_tokens"], 0,
+            "上游 prompt_tokens_details 空时必须默认 cached_tokens=0"
+        );
+        assert_eq!(
+            usage["output_tokens_details"]["reasoning_tokens"], 0,
+            "上游缺 completion_tokens_details 时必须默认 reasoning_tokens=0"
+        );
+    }
+
+    #[test]
+    fn missing_subdetails_entirely_still_emit_required_fields() {
+        // 极端场景:上游 usage 完全没有 *_tokens_details 任何形态。
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 0);
     }
 
     // ── null 容忍(MiMo 真实帧形态)─────────────────────────────────────
