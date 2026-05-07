@@ -296,6 +296,15 @@ v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 
 - **[litellm](https://github.com/BerriAI/litellm)** 提供了 Responses API ↔ Chat Completions 双向协议转换的核心思路。v1.x 的 `backend/responses_adapter.py` / `backend/openai_adapter.py` / `backend/base_adapter.py` 以及 v2.x 的 `crates/adapters/` 都直接参考了 litellm 的字段映射、消息归一化和 reasoning 处理策略。
 - **[Tauri](https://tauri.app/)** 提供了 v2.0 桌面壳的全部基础设施 —— 单二进制打包、native webview、tray、IPC、单实例插件、自定义 URI scheme。v2.0 的"frontend/ 零改动 + cas:// 同进程 axum"架构靠 Tauri 2 的 `register_asynchronous_uri_scheme_protocol` 才能成立。
 
+### 社区贡献者
+
+感谢以下贡献者通过 Pull Request 直接改进过本项目(按首次提交时间倒序;完整列表见 [Contributors 图表](https://github.com/Cmochance/codex-app-transfer/graphs/contributors)):
+
+- [@lukegood](https://github.com/lukegood) — MiniMax M2.x OpenAI-compatible 接入兼容性(请求侧字段白名单清洗 + 连续 system 合并 + tool `strict` 剥离;响应侧 `reasoning_details` 拆 reasoning + `<think>` 兜底;[#47](https://github.com/Cmochance/codex-app-transfer/pull/47))
+- [@cw881014](https://github.com/cw881014) — 早期协议层修复:DeepSeek thinking 工具历史回放([#1](https://github.com/Cmochance/codex-app-transfer/pull/1))、Responses reasoning schema 与历史修复对齐([#7](https://github.com/Cmochance/codex-app-transfer/pull/7))、Codex 0.128 model catalog 路由加固([#12](https://github.com/Cmochance/codex-app-transfer/pull/12))
+
+如果你提交过 PR 但希望改名 / 补链接 / 移除,直接开 issue 跟我说一声即可。
+
 本项目专注 OpenAI Codex CLI 接入，不是 OpenAI、Anthropic、CC-Switch 或 `farion1231/cc-switch` 的官方项目，也不复用它们的商标、Logo 或发布身份。
 
 ## 许可证
