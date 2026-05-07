@@ -1,10 +1,30 @@
 # v3.0.0 — Tauri webview → egui 原生 widget 迁移
 
-> **Status**: 起步阶段(W0)。本文档是 PR 内单一推进 source of truth,所有 W1-W8 子任务都按本表格推进,完成后我在对应 commit 里更新本文档的 checkbox 状态。
+> **Status (截至 2026-05-07)**: W1-W7.2 ✅ + W7.3/W7.4 配置就位等 CI artifact 验证。
+> 待办:
+> - W7-验证(用户手动 `gh workflow run egui-bundle-test.yml`,跑出三平台 .app/.dmg/.exe/.deb/.AppImage)
+> - W7.5 release.yml 整合(放 W8 或 W7-A/B 决策后)
+> - W8 cutover(删 src-tauri/+frontend/、bump 3.0.0、合并)
 >
 > **目标**: 抛 Tauri webview,改用 `eframe + egui` 原生 widget,**体积减半 / 启动快 4 倍 / RAM 减 70%**,功能 1:1 等价。
 >
-> **PR 模式**: 全部 W1-W8 commits 都推到这一个 PR,**不合并**直到用户手测确认。
+> **PR 模式**: 全部 W1-W8 commits 都推到 [PR #46](https://github.com/Cmochance/codex-app-transfer/pull/46),**不合并**直到用户手测确认。
+>
+> **当前 commit 链(migrate/egui-native-ui 分支)**:
+> ```
+> 96a3cb8 ci: egui-bundle-test workflow + W7.3/W7.4 文档
+> eab86f5 W7.2 mac bundle (cargo-packager) + eframe Linux fix
+> 4406d6b W7.1 install_update_flow 真实下载
+> 48209ed CI fix: rust-tauri-check 加 desktop_app
+> b35d951 W6.2 system 集成
+> 76e5eba W6.1 tokio runtime + 14 异步 action
+> 0453e6d W5 Proxy + Desktop + Guide
+> 2e3f8cf W4 Providers + Providers/Add
+> 038d33d W3 Dashboard + Settings
+> c234538 W2 骨架
+> 8dd6b68 W1 抽 admin_api/proxy_runner/desktop_state
+> aa37c88 docs(v3): 跟踪文档起步
+> ```
 
 ---
 
@@ -44,19 +64,19 @@
 
 ### 2.1 七个页面
 
-- [ ] Dashboard `#dashboard` — provider 卡片网格 + 三个 status hero(桌面/代理/当前 provider) + 行动按钮 + 最近活动
-- [ ] Providers/Add `#providers/add` — name/baseUrl/apiKey/auth + 高级折叠(API format) + 模型映射 grid + preset 列表
-- [ ] Providers `#providers` — 表头 + 可重排 provider 列表 + Claude 模型菜单切换
-- [ ] Desktop `#desktop` — config 列表 + JSON 预览 + apply/clear + 3 步 mini-step
-- [ ] Proxy `#proxy` — 启停 + 端口输入 + 实时日志面板(终端式)+ 自动滚动 + stats
-- [ ] Settings `#settings` — 主题 / 语言 / 双端口 / 4 开关 / 兼容性检测 / 配置备份+导出+导入 / 反馈 / About
-- [ ] Guide `#guide` — 静态富文本(用 `egui_commonmark`)
+- [x] Dashboard `#dashboard` — provider 卡片网格 + 三个 status hero(桌面/代理/当前 provider) + 行动按钮 + 最近活动 *(W3 ✅)*
+- [x] Providers/Add `#providers/add` — name/baseUrl/apiKey/auth + 高级折叠(API format) + 模型映射 grid + preset 列表 *(W4 ✅)*
+- [x] Providers `#providers` — 表头 + 可重排 provider 列表 + Claude 模型菜单切换 *(W4 ✅,reorder 用上下箭头替代 drag-drop)*
+- [x] Desktop `#desktop` — config 列表 + JSON 预览 + apply/clear + 3 步 mini-step *(W5 ✅)*
+- [x] Proxy `#proxy` — 启停 + 端口输入 + 实时日志面板(终端式)+ 自动滚动 + stats *(W5 ✅,TableBuilder virtualized)*
+- [x] Settings `#settings` — 主题 / 语言 / 双端口 / 4 开关 / 兼容性检测 / 配置备份+导出+导入 / 反馈 / About *(W3 ✅)*
+- [x] Guide `#guide` — 静态富文本(用 `egui_commonmark`)*(W5 ✅)*
 
 ### 2.2 三个 modal
 
-- [ ] deleteModal — "确认删除"
-- [ ] restartReminderModal — "立即重启 Codex App?"
-- [ ] feedbackModal — textarea + 截图上传 + 日志附加开关 + 提交
+- [x] deleteModal — "确认删除" *(W4 ✅)*
+- [x] restartReminderModal — "立即重启 Codex App?" *(W5 渲染,W6.1 接 RestartCodex action)*
+- [x] feedbackModal — textarea + 日志附加开关 + 提交 *(W6.1 ✅,截图上传留 W7+ 进阶)*
 
 ### 2.3 二十个 action(逐条迁移)
 
@@ -106,12 +126,12 @@ POST /api/feedback                  POST /api/update/install
 
 ### 2.5 系统集成
 
-- [ ] cas:// URI scheme(macOS Info.plist / Windows Registry / Linux .desktop)
-- [ ] 系统托盘:provider 切换 + 主窗口显隐 + 退出
-- [ ] macOS native app menu(Cmd+Q/Cmd+H/About)
-- [ ] 单实例(`single-instance` crate)
-- [ ] 自动启动(autoStart 设置 → `auto-launch` crate)
-- [ ] 自动更新(`self_update` crate;沿用 latest.json)
+- [x] cas:// URI scheme — 解析 + argv 接入 *(W6.2 ✅)*;mac Info.plist 注册 *(W7.2 ✅)*;Win NSIS registry + Linux .desktop *(W7.3/W7.4 配置就位,需 CI artifact 验证)*
+- [x] 系统托盘:动态 provider 切换 + 主窗口显隐 + proxy 启停 + 退出 *(W6.2 ✅,tray-icon 0.23)*
+- [x] macOS native app menu:App + Edit + Window 三个 submenu *(W6.2 ✅,muda 0.19)*
+- [x] 单实例(`single-instance` 0.3)*(W6.2 ✅,Unix 用 ~/.codex-app-transfer/.singleton.lock)*
+- [x] 自动启动(`auto-launch` 0.6 + Settings auto_start 切换触发)*(W6.2 ✅)*
+- [x] 自动更新:check + 下载 + 启动安装器 *(W7.1 ✅)*;atomic .app 替换辅助脚本 *(W7-A 测完决定要不要上)*
 
 ### 2.6 七个主题
 
