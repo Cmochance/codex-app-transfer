@@ -546,6 +546,30 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
         | "image_generation_call" => {
             vec![json!({ "role": "user", "content": format!("[{item_type}]") })]
         }
+        "compaction" | "context_compaction" | "compaction_summary" => {
+            // Codex CLI 触发 auto-compact 后把 summary 作为 ResponseItem::Compaction
+            // 塞进 history(`codex-rs/protocol/src/models.rs:882`),续轮 input 里
+            // 会带这个 item。`encrypted_content` 字段名是历史包袱,**实际是
+            // 明文** —— Codex 自家 SUMMARY_PREFIX(`codex-rs/core/src/compact.rs:262`)
+            // 已写明"based on this summary..."的语义。
+            //
+            // 必须把它转成 user message 注入下游 chat completions(role 与 Codex
+            // 自家 inline compact 一致:`build_compacted_history_with_limit`
+            // 也是 push role="user"),否则上游 LLM 完全看不到 summary,等同
+            // 于 compact 后失忆 —— 体感"compact 触发了但下一轮 LLM 不记得任何
+            // 之前的事"。
+            let summary = item
+                .get("encrypted_content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            if summary.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({ "role": "user", "content": summary })]
+            }
+        }
         _ => {
             // 兜底:若有 content 字段,作为 user message 透传;否则丢弃
             if let Some(content) = item.get("content") {
@@ -2406,6 +2430,63 @@ mod tests {
         assert_eq!(
             content[0]["image_url"]["url"],
             "data:image/png;base64,ZmFrZQ=="
+        );
+    }
+
+    #[test]
+    fn compaction_item_renders_as_user_message_with_summary_text() {
+        // 关键回归:Codex CLI auto-compact 后,续轮 input[] 会带
+        // {"type":"compaction","encrypted_content":"<SUMMARY_PREFIX>\n<summary>"}。
+        // 必须转成 user message,跟 Codex 自家 inline compact 行为对齐;否则
+        // 上游 LLM 完全看不到 summary,等于 compact 后失忆。
+        let out = convert(json!({
+            "input": [{
+                "type": "compaction",
+                "encrypted_content": "Another language model started... <SUMMARY>: user wanted X, we did Y."
+            }]
+        }));
+        let msg = &out["messages"][0];
+        assert_eq!(msg["role"], "user");
+        assert!(msg["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("user wanted X, we did Y"));
+    }
+
+    #[test]
+    fn context_compaction_alias_renders_same_as_compaction() {
+        // ResponseItem::ContextCompaction 是 Codex protocol 里同一概念的别名
+        // (`codex-rs/protocol/src/models.rs:884`),也要识别。
+        let out = convert(json!({
+            "input": [{
+                "type": "context_compaction",
+                "encrypted_content": "summary body"
+            }]
+        }));
+        let msg = &out["messages"][0];
+        assert_eq!(msg["role"], "user");
+        assert_eq!(msg["content"], "summary body");
+    }
+
+    #[test]
+    fn compaction_item_with_empty_encrypted_content_is_dropped() {
+        // 防御:空 summary 不应往上游塞空 user message(会触发某些 provider
+        // "user message must not be empty" 400)
+        let out = convert(json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "real user msg"}
+                ]},
+                {"type": "compaction", "encrypted_content": "   "}
+            ]
+        }));
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "空 compaction 应被丢弃,只剩真实 user");
+        // content 可能是 string 或 array,都接受 — 关键是没 compaction 留下来
+        let content_str = serde_json::to_string(&messages[0]["content"]).unwrap();
+        assert!(
+            content_str.contains("real user msg"),
+            "应保留真实 user message 内容,实际: {content_str}"
         );
     }
 
