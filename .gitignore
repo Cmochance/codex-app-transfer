@@ -7,8 +7,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Python v1.4 残留 (v2 全栈 Rust 后已无, 但本地可能仍有)
+backend/
+scripts/__pycache__/
+
 # OS / editor noise
 .DS_Store
+**/.DS_Store
 Thumbs.db
 *.swp
 *.swo

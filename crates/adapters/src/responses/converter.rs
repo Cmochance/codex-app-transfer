@@ -669,7 +669,7 @@ impl ChatToResponsesConverter {
         // (只在 `/transcript` 命令可见)。OpenAI o1/o3 自带 section header,
         // 但 Kimi for Coding / DeepSeek thinking 等纯文本流默认无 `**`,
         // 不补 prefix 就会被整段隐藏。详见
-        // `docs/kimi-reasoning-truncation-investigation.md` §5.4 根因结论。
+        // `docs/investigation/kimi-reasoning-truncation.md` §5.4 根因结论。
         const REASONING_HEADER: &str = "**Thinking**\n\n";
         self.reasoning_acc.push_str(REASONING_HEADER);
         emit_event(

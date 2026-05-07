@@ -14,7 +14,7 @@ name: ci
 # - Leptos UI WASM build 已废弃 (v2.0.0 改 frontend/ + cas://)
 # - python-replay-tests 已废弃 (Phase 3 删 Python)
 # - 早期单一 rust-workspace-check 每 PR 都 apt (~7 min) → 拆成上述 2 层
-# 详见 docs/migration-plan.md / docs/cleanup-plan.md / 本仓 PR codex review
+# 详见 docs/refactor/migration.md / docs/refactor/cleanup.md / 本仓 PR codex review
 
 on:
   push:

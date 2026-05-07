@@ -15,7 +15,7 @@ name: release
 #   APPLE_API_KEY_BASE64        可选 - .p8 文件 base64, 公证用
 #   APPLE_API_KEY               可选 - Key ID
 #   APPLE_API_ISSUER            可选 - Issuer ID
-# 详见 docs/cleanup-plan.md §2.4
+# 详见 docs/refactor/cleanup.md §2.4
 
 on:
   push:

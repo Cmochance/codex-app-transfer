@@ -32,7 +32,7 @@ impl AdapterRegistry {
     /// - `responses` / `openai_responses` → responses
     /// - **`anthropic` / `claude` / `messages`**:Python 历史配置兼容值,在源
     ///   码里被归一为 `responses`(并非 Anthropic Messages 协议入站,详见
-    ///   docs/migration-plan.md 修订日志 2026-05-04 关于此项的说明)
+    ///   docs/refactor/migration.md 修订日志 2026-05-04 关于此项的说明)
     /// - 未知值 fallback 到 `responses`(与 Python 默认 `responses` 一致)
     pub fn lookup(&self, api_format: &str) -> Arc<dyn Adapter> {
         let normalized = api_format.trim().to_ascii_lowercase().replace('-', "_");

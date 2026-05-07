@@ -28,7 +28,7 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ### 更新日志
 
-逐版本变更详见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 或 `docs/release-notes-v*.md`。当前管理 API 与代理入口状态见 [`docs/api-route-status.md`](docs/api-route-status.md)。
+逐版本变更详见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 或 `docs/release-notes/v*.md`。当前管理 API 与代理入口状态见 [`docs/api-route-status.md`](docs/api-route-status.md)。
 
 ## 能做什么
 
@@ -112,7 +112,7 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Changelog
 
-Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) (and locally under `docs/release-notes-v*.md`). The current management API and proxy surface are indexed in [`docs/api-route-status.md`](docs/api-route-status.md).
+Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) (and locally under `docs/release-notes/v*.md`). The current management API and proxy surface are indexed in [`docs/api-route-status.md`](docs/api-route-status.md).
 
 ### Getting started
 
@@ -278,7 +278,7 @@ netstat -ano | findstr :18080
 
 ## 重写过程
 
-v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 修订日志)记录在 [`docs/migration-plan.md`](docs/migration-plan.md),核心结论 + 量化对比 + 关键 bug 修复见 [`docs/release-notes-v2.0.0.md`](docs/release-notes-v2.0.0.md)。
+v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 修订日志)记录在 [`docs/refactor/migration.md`](docs/refactor/migration.md),核心结论 + 量化对比 + 关键 bug 修复见 [`docs/release-notes/v2.0.0.md`](docs/release-notes/v2.0.0.md)。
 
 ## 安全说明
 

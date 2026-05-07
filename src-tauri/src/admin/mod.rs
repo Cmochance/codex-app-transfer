@@ -7,7 +7,7 @@
 //! - **frontend/ 整目录通过 `include_dir!` 编进二进制**,首次加载零 IO
 //! - `/api/*` 数据 shape **严格对齐 v1.4**(frontend/js/api.js 不需要任何改动)
 //!
-//! 详见 docs/migration-plan.md Stage 6 修订日志。
+//! 详见 docs/refactor/migration.md Stage 6 修订日志。
 
 pub mod handlers;
 pub mod registry_io;

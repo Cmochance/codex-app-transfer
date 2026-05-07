@@ -11,7 +11,7 @@
 //!   `serde_json::to_string_pretty` 默认 2 空格缩进、非 ASCII 不转义,
 //!   `,` 与 `: ` 分隔符也一致。
 //! - **未实现** OS 集成层(Windows 注册表 / macOS plist / Codex TOML 注入),
-//!   按 docs/migration-plan.md §4 拆分,留给 Stage 2.5 的 `crates/codex_integration`。
+//!   按 docs/refactor/migration.md §4 拆分,留给 Stage 2.5 的 `crates/codex_integration`。
 
 pub mod model_alias;
 pub mod paths;

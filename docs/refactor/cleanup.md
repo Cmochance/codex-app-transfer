@@ -3,7 +3,7 @@
 > 状态:**Phase 1-4 全部完成;PR #5 为最终收尾归档**
 > 起草:2026-05-05
 > 适用范围:`codex-app-transfer` 全仓
-> 前置:`docs/migration-plan.md` 全部 7 个 Stage 已落地,v2.0.0 已发版
+> 前置:`docs/refactor/migration.md` 全部 7 个 Stage 已落地,v2.0.0 已发版
 > 落地总览:见 §5 修订日志末尾
 
 ---
@@ -402,7 +402,7 @@ xtask release-bundle \
 - `tests/replay/fixtures/registry/*.json` 注释/header 不变(JSON 文件本身无注释,只是文件 header 在文档里说明权威源)
 - `.github/workflows/ci.yml`(加反向 diff step + 删 `python-replay-tests` job)
 - `.github/workflows/release.yml`(切 xtask)
-- `docs/cleanup-plan.md` 修订日志追加
+- `docs/refactor/cleanup.md` 修订日志追加
 
 **删除**:
 - `scripts/gen_registry_fixtures.py`
@@ -436,7 +436,7 @@ xtask release-bundle \
 
 #### 3.12 范围明确**不做**(留给 Phase 4)
 
-- 不动 `README.md` / `docs/migration-plan.md` / `Makefile` 注释里的 Python 提法(Phase 4 收尾统一改)
+- 不动 `README.md` / `docs/refactor/migration.md` / `Makefile` 注释里的 Python 提法(Phase 4 收尾统一改)
 - 不删 `.gitignore`(Phase 4 检查 `.venv/` `.pytest_cache/` 是否漏)
 - 不重命名 `tests/replay/` 路径(不动文件位置)
 
@@ -446,7 +446,7 @@ xtask release-bundle \
 - `.gitignore` 加 `.venv/`、`.pytest_cache/`(若未加),并删除已 track 的副本
 - `README.md`:更新所有"Python"提法
 - `Makefile`:更新注释,version 来源改为 `Cargo.toml`
-- `docs/migration-plan.md`:在文末追加"清理已完成"修订日志
+- `docs/refactor/migration.md`:在文末追加"清理已完成"修订日志
 - 仓库里 `find . -name '*.py'` 应只剩 0 个或仅 `feedback-worker/`(无)
 
 ## 4. 时间线 / 里程碑

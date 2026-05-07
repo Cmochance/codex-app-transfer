@@ -1,4 +1,4 @@
-# Rust workspace 根。详见 docs/migration-plan.md 第 4 节。
+# Rust workspace 根。详见 docs/refactor/migration.md 第 4 节。
 
 [workspace]
 resolver = "2"
