@@ -997,7 +997,10 @@ fn merge_consecutive_system_messages(body: &mut Map<String, Value>) {
             == Some("system");
 
         if is_system && prev_is_system {
-            let current = msg.get("content").map(value_to_chat_string).unwrap_or_default();
+            let current = msg
+                .get("content")
+                .map(value_to_chat_string)
+                .unwrap_or_default();
             if let Some(prev_obj) = merged.last_mut().and_then(|prev| prev.as_object_mut()) {
                 let prev = prev_obj
                     .get("content")

@@ -1206,12 +1206,9 @@ mod tests {
     #[test]
     fn think_tag_split_enabled_splits_minimax_style_content() {
         // 显式 opt-in 后,<think>...</think> 应被拆成 reasoning(MiniMax 行为)。
-        let mut c = ChatToResponsesConverter::new_with_ids(
-            "resp_x".into(),
-            "msg_x".into(),
-            "rs_x".into(),
-        )
-        .with_think_tag_split(true);
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_think_tag_split(true);
         let _ = c.feed(
             br#"data: {"model":"MiniMax-M2.7","choices":[{"index":0,"delta":{"content":"<think>plan more</think>final"},"finish_reason":"stop"}]}
 
