@@ -991,8 +991,25 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
         return true;
     };
 
-    // 1:请求 body 的 model 命中显式 modelCapabilities → 直接采用
-    if let Some(m) = model {
+    // **关键**:request body 缺 model 字段时仍要保护文本-only 上游不收图。
+    // codex-connector P1 review (PR #43) 指出:几条 conversion path 允许 body
+    // 不带 model 进来,如果只在 `model.is_some()` 时跑黑名单,DeepSeek 这类
+    // text-only provider 一旦 model 缺失就会让 image_url 透传出去,触发原本
+    // 要修的 400 unknown variant 失败。
+    //
+    // 解决:把 body model + provider.models["default"] 合并成 effective_model,
+    // 所有检查(modelCapabilities 显式 / TEXT_ONLY_MODELS 黑名单)都在它上面跑。
+    let default_model = p
+        .models
+        .get("default")
+        .map(|s| codex_app_transfer_registry::strip_internal_model_suffix(s))
+        .filter(|s| !s.is_empty());
+    let effective_model: Option<String> = model
+        .map(|s| s.to_owned())
+        .or_else(|| default_model.clone());
+
+    // 1:effective_model 命中 provider.modelCapabilities 显式声明 → 直接采用
+    if let Some(m) = effective_model.as_deref() {
         if let Some(b) = p
             .model_capabilities
             .get(m)
@@ -1002,26 +1019,23 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
             return b;
         }
     }
-
-    // 2:fallback 到 default_model 的显式 modelCapabilities(向后兼容)
-    let default_model = p
-        .models
-        .get("default")
-        .map(|s| codex_app_transfer_registry::strip_internal_model_suffix(s))
-        .unwrap_or_default();
-    if !default_model.is_empty() {
-        if let Some(b) = p
-            .model_capabilities
-            .get(default_model.as_str())
-            .and_then(|v| v.get("supports_vision"))
-            .and_then(|v| v.as_bool())
-        {
-            return b;
+    // 2:body model 不在 capabilities 但 default_model 在(向后兼容旧配置:
+    //    用户可能只在 modelCapabilities 标过 default model 的能力)
+    if let (Some(body), Some(def)) = (model, default_model.as_deref()) {
+        if body != def {
+            if let Some(b) = p
+                .model_capabilities
+                .get(def)
+                .and_then(|v| v.get("supports_vision"))
+                .and_then(|v| v.as_bool())
+            {
+                return b;
+            }
         }
     }
 
-    // 3:模型名黑名单(2026-05-07 实测验证的纯文本模型 — 详见函数 doc)
-    if let Some(m) = model {
+    // 3:effective_model 命中**硬编码模型名黑名单**(2026-05-07 实测 — 详见函数 doc)
+    if let Some(m) = effective_model.as_deref() {
         let lc = m.to_ascii_lowercase();
         const TEXT_ONLY_MODELS: &[&str] = &[
             // DeepSeek v4 系列(实测 400 unknown variant `image_url`)
@@ -1927,6 +1941,49 @@ mod tests {
             .insert("custom-text".into(), json!({"supports_vision": false}));
         let req = vision_request_for("custom-text");
         assert!(!image_url_kept(&req, &p));
+    }
+
+    #[test]
+    fn vision_falls_back_to_default_model_when_body_omits_model() {
+        // codex-connector P1 review (2026-05-07 PR #43) 指出:旧改法在 body
+        // 缺 model 字段时直接 return true,DeepSeek 这类 text-only provider
+        // 一旦 model 缺失就让 image_url 透传 → 触发原本要修的 400 unknown
+        // variant 失败。新版必须 fallback 到 provider.models["default"]。
+        let p = deepseek_provider(); // default = "deepseek-v4-pro"
+        let req = json!({
+            // 故意不写 "model" 字段,模拟某些 conversion path 的合法形态
+            "stream": true,
+            "input": [
+                {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let serialized = serde_json::to_string(&out["messages"]).unwrap();
+        assert!(
+            !serialized.contains("\"image_url\""),
+            "body 缺 model + default=deepseek-v4-pro → 必须按 default 命中黑名单 strip"
+        );
+        assert!(serialized.contains("图片省略"), "应该用占位文本替换");
+    }
+
+    #[test]
+    fn vision_falls_back_to_default_model_for_explicit_capability_too() {
+        // body 缺 model,但 default 在 modelCapabilities 标了 supports_vision = false
+        // → 同样要 strip,而不是默认放行。
+        let mut p = provider("custom", "Custom", "https://api.custom.example/v1");
+        p.models.insert("default".into(), "future-text-v1".into());
+        p.model_capabilities
+            .insert("future-text-v1".into(), json!({"supports_vision": false}));
+        let req = json!({
+            "stream": true,
+            "input": [
+                {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert!(!serde_json::to_string(&out["messages"])
+            .unwrap()
+            .contains("\"image_url\""));
     }
 
     #[test]
