@@ -89,12 +89,24 @@ async fn responses_websocket_loop(mut socket: WebSocket, state: ProxyState, head
         // 这是 ws incremental delta=0 续轮 — 走 ResponseSessionCache 查历史
         // (PR #65 sqlite 持久化覆盖)。
         if should_skip_upstream_warmup(&body) {
-            send_ws_error(
-                &mut socket,
-                "websocket warmup / empty-input frame: not supported by upstream chat-completions API; client should fall back to HTTP",
-            )
-            .await;
-            continue;
+            // **关键**:OpenAI Responses ws 协议里 `{"type":"error",...}` 是
+            // "流内错误事件"(stream-level)语义 —— Codex CLI ws 客户端收到
+            // 后**不会**立即放弃 ws session,可能等 ws idle timeout(实测 ~5
+            // 分钟,见反馈 fb-8f5b51fb / fb-0c121681)才 fallback HTTP。
+            //
+            // 应当**直接关闭 ws 连接**(发 Close frame),让 Codex CLI 立即
+            // 看到"ws 通道不可用"→ 进入 try_switch_fallback_transport →
+            // HTTP 路径,total wait 从 ~5 分钟降到秒级。
+            //
+            // 之前 v2.0.11 PR #67 用 send_ws_error 是错的协议语义,本次
+            // 修正为 close。
+            let _ = socket
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: axum::extract::ws::close_code::UNSUPPORTED,
+                    reason: "warmup / empty-input frame not supported; fall back to HTTP".into(),
+                })))
+                .await;
+            break;
         }
         if body.get("stream").is_none() {
             body["stream"] = serde_json::Value::Bool(true);
