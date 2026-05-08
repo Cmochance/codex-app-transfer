@@ -383,6 +383,41 @@ async fn extras_header_overrides_client_value_no_duplicate() {
     );
 }
 
+/// 关键回归(2026-05-08 Kimi Windows 403):extras 没 User-Agent 时,客户端的
+/// codex_cli_rs/... UA 必须被 strip,上游收到的是中性 default UA
+/// (Codex-App-Transfer/<v>),绝不能透传客户端 codex UA。
+///
+/// provider-a 在 build_stack 里 extras 不含 User-Agent(只有 `x-mock-marker`),
+/// 所以走 default UA 路径。
+#[tokio::test]
+async fn client_user_agent_stripped_when_provider_extras_lacks_ua() {
+    let s = build_stack().await;
+    let resp = client()
+        .post(format!("http://{}/v1/chat/completions", s.proxy))
+        .header("authorization", "Bearer cas_test_gw")
+        .header("user-agent", "codex_cli_rs/0.128.0 (Windows 10.0; x86_64)")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"plain-model-name"}"#) // 走 fallback default = provider-a
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v = body_json(resp).await;
+    let ua_values = v["headers_all"]["user-agent"]
+        .as_array()
+        .expect("upstream 应有 user-agent");
+    assert_eq!(ua_values.len(), 1, "应只有 1 条 UA,实际: {:?}", ua_values);
+    let ua = ua_values[0].as_str().unwrap();
+    assert!(
+        !ua.contains("codex_cli_rs"),
+        "客户端 codex UA 必须被 strip,实际泄漏: {ua}"
+    );
+    assert!(
+        ua.starts_with("Codex-App-Transfer/"),
+        "无 extras UA 时上游应收到中性 default UA,实际: {ua}"
+    );
+}
+
 /// 关键回归(2026-05-08):Codex CLI 内置注入 originator / x-codex-installation-id /
 /// x-codex-window-id / x-openai-* / chatgpt-account-id 等身份头(`codex-rs/login/
 /// src/auth/default_client.rs::default_headers` + `codex-rs/core/src/client.rs:481-605`)。

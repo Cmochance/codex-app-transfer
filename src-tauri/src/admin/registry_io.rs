@@ -1,6 +1,8 @@
 //! 用户注册表 (~/.codex-app-transfer/config.json) 读写助手.
 
-use codex_app_transfer_registry::{config_file, load_raw_config, save_raw_config, RawConfig};
+use codex_app_transfer_registry::{
+    config_file, heal_builtin_extra_headers, load_raw_config, save_raw_config, RawConfig,
+};
 use serde_json::{json, Value};
 
 pub fn load() -> Result<RawConfig, String> {
@@ -24,7 +26,12 @@ pub fn load() -> Result<RawConfig, String> {
             }
         }));
     }
-    load_raw_config(&path).map_err(|e| format!("读取 config.json 失败: {e}"))
+    let mut cfg = load_raw_config(&path).map_err(|e| format!("读取 config.json 失败: {e}"))?;
+    // 自愈 isBuiltin provider 缺 extras 的存量配置(如 v1.x 写入的 Kimi Code
+    // 没 KimiCLI UA → forward 透 codex_cli_rs UA → Kimi 反爬 403)。仅内存
+    // 修补,不写回磁盘 — 让 import/export round-trip 仍是用户原文件。
+    heal_builtin_extra_headers(&mut cfg);
+    Ok(cfg)
 }
 
 pub fn save(cfg: &RawConfig) -> Result<(), String> {

@@ -13,12 +13,14 @@
 //! - **未实现** OS 集成层(Windows 注册表 / macOS plist / Codex TOML 注入),
 //!   按 docs/refactor/migration.md §4 拆分,留给 Stage 2.5 的 `crates/codex_integration`。
 
+pub mod healing;
 pub mod model_alias;
 pub mod paths;
 pub mod presets;
 pub mod raw_io;
 pub mod schema;
 
+pub use healing::heal_builtin_extra_headers;
 pub use model_alias::{
     empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
     provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,

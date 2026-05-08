@@ -40,11 +40,22 @@ pub struct ProxyState {
     pub adapters: AdapterRegistry,
 }
 
+/// 出站 reqwest 默认 User-Agent — 在 provider.extra_headers 没配 UA、客户端
+/// UA 又被 `is_strip_on_forward` 剔除后兜底用,**绝不能含 codex/openai/codex_cli
+/// 等关键字**(否则等于把 strip 的 UA 又自己写回来)。
+const DEFAULT_OUTBOUND_USER_AGENT: &str = concat!("Codex-App-Transfer/", env!("CARGO_PKG_VERSION"));
+
 impl ProxyState {
     pub fn new(resolver: SharedResolver) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .pool_idle_timeout(std::time::Duration::from_secs(30))
+                // 显式设 default UA:client header 复制循环已 strip 客户端
+                // user-agent;若 provider.extra_headers 也没配 UA,reqwest
+                // 默认会用 `reqwest/<ver>` 作为 default UA,部分 provider
+                // 反爬可能 ban "reqwest" 字串。改用中性的 Codex-App-Transfer/<v>
+                // 兜底,既不命中 codex 反爬规则,也不在 reqwest 黑名单。
+                .user_agent(DEFAULT_OUTBOUND_USER_AGENT)
                 .build()
                 .expect("reqwest client"),
             resolver,
@@ -138,6 +149,24 @@ fn is_hop_header(name: &str) -> bool {
 fn is_strip_on_forward(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if lower == "authorization" {
+        return true;
+    }
+    // **客户端 User-Agent**:Codex CLI 客户端发的 `User-Agent: codex_cli_rs/...`
+    // 是反爬识别非白名单 client 的核心字段(实测 Kimi For Coding Windows 403
+    // 元凶)。把它进 strip 列表后,后续逻辑会保证有正确的 UA 出站:
+    //
+    //   (1) 若 `provider.extra_headers` 含 User-Agent(如 Kimi Code preset 的
+    //       `KimiCLI/1.40.0`)→ extras 注入路径会上 UA(forward 复制循环跳过
+    //       客户端 UA + extras 注入循环上 extras 的 UA = 干净一份)。
+    //   (2) 若 extras **没有** User-Agent(如非 Kimi 系 provider 没配)→
+    //       `ProxyState::new` 给 reqwest `Client` 设了中性 default
+    //       `Codex-App-Transfer/<version>`,reqwest 会自动用这个 default
+    //       兜底,确保上游永远收到一个非 codex 的 UA。
+    //
+    // `codex-rs/login/src/auth/default_client.rs::default_headers` 自带 codex 系
+    // identity headers(originator / x-codex-* 等)在前面已经 strip,这里把 UA
+    // 也加进来,Codex CLI 整套客户端身份指纹就**完全不会泄漏到上游**。
+    if lower == "user-agent" {
         return true;
     }
     // 显式黑名单:Codex / OpenAI / ChatGPT 客户端身份头
@@ -587,6 +616,28 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_stripped_on_forward() {
+        // 关键回归(2026-05-08 Kimi Windows 403):客户端 codex_cli_rs/... UA
+        // 必须被剔除,后续 reqwest default UA 或 extras 的 UA 兜底
+        assert!(is_strip_on_forward("User-Agent"));
+        assert!(is_strip_on_forward("user-agent"));
+        assert!(is_strip_on_forward("USER-AGENT"));
+    }
+
+    #[test]
+    fn default_outbound_user_agent_is_neutral() {
+        // 兜底 default UA 必须是中性的 Codex-App-Transfer/<v>,绝不能含
+        // codex_cli / openai / chatgpt 等可能触发反爬的关键字
+        let ua = DEFAULT_OUTBOUND_USER_AGENT;
+        assert!(ua.starts_with("Codex-App-Transfer/"), "ua: {ua}");
+        let lower = ua.to_ascii_lowercase();
+        assert!(!lower.contains("codex_cli"), "ua 不应含 codex_cli: {ua}");
+        assert!(!lower.contains("reqwest"), "ua 不应含 reqwest: {ua}");
+        assert!(!lower.contains("openai"), "ua 不应含 openai: {ua}");
+        assert!(!lower.contains("chatgpt"), "ua 不应含 chatgpt: {ua}");
+    }
+
+    #[test]
     fn codex_identity_headers_stripped_on_forward() {
         // 精确名黑名单
         assert!(is_strip_on_forward("originator"));
@@ -601,9 +652,9 @@ mod tests {
         assert!(is_strip_on_forward("x-openai-subagent"));
         assert!(is_strip_on_forward("x-openai-memgen-request"));
         assert!(is_strip_on_forward("x-chatgpt-anything"));
-        // 普通 header 仍然透传
+        // 普通 header 仍然透传(注意:user-agent 现在也被 strip,见
+        // user_agent_stripped_on_forward 测试)
         assert!(!is_strip_on_forward("content-type"));
-        assert!(!is_strip_on_forward("user-agent"));
         assert!(!is_strip_on_forward("accept"));
     }
 
