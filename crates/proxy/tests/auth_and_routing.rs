@@ -383,6 +383,75 @@ async fn extras_header_overrides_client_value_no_duplicate() {
     );
 }
 
+/// 关键回归(2026-05-08):Codex CLI 内置注入 originator / x-codex-installation-id /
+/// x-codex-window-id / x-openai-* / chatgpt-account-id 等身份头(`codex-rs/login/
+/// src/auth/default_client.rs::default_headers` + `codex-rs/core/src/client.rs:481-605`)。
+/// 这些头对第三方 OpenAI-compatible provider 永远没用,但 Kimi For Coding 等 provider
+/// 的反爬规则会按这些头判定"非白名单 client"返回 403 access_terminated_error。
+/// 出站时**必须**整片剔除,不能透传到上游。
+#[tokio::test]
+async fn codex_identity_headers_are_stripped_on_forward() {
+    let s = build_stack().await;
+    let resp = client()
+        .post(format!("http://{}/v1/chat/completions", s.proxy))
+        .header("authorization", "Bearer cas_test_gw")
+        // Codex CLI 自家身份头(精确名 + 前缀两类全覆盖)
+        .header("originator", "codex_cli_rs")
+        .header("x-codex-installation-id", "test-installation-uuid")
+        .header("x-codex-window-id", "test-window-uuid")
+        .header("x-openai-subagent", "memgen")
+        .header("x-openai-memgen-request", "1")
+        .header("chatgpt-account-id", "test-acct")
+        .header("session_id", "test-session")
+        .header("thread_id", "test-thread")
+        // 普通 header 应正常透传
+        .header("content-type", "application/json")
+        .body(r#"{"model":"provider-b/coding"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let v = body_json(resp).await;
+    let headers_all = v["headers_all"].as_object().expect("headers_all");
+
+    // 精确名黑名单
+    for forbidden in [
+        "originator",
+        "chatgpt-account-id",
+        "session_id",
+        "thread_id",
+    ] {
+        assert!(
+            !headers_all.contains_key(forbidden),
+            "上游绝不应收到 codex 身份头 {forbidden},实际 headers: {:?}",
+            headers_all.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // 前缀黑名单(防御未来 Codex CLI 加新头)
+    for (k, _) in headers_all.iter() {
+        let lower = k.to_ascii_lowercase();
+        assert!(
+            !lower.starts_with("x-codex-"),
+            "上游不应收到任何 x-codex-* 头,但有: {k}"
+        );
+        assert!(
+            !lower.starts_with("x-openai-"),
+            "上游不应收到任何 x-openai-* 头,但有: {k}"
+        );
+        assert!(
+            !lower.starts_with("x-chatgpt-"),
+            "上游不应收到任何 x-chatgpt-* 头,但有: {k}"
+        );
+    }
+
+    // 普通 header 仍然透传
+    assert!(
+        headers_all.contains_key("content-type"),
+        "正常 content-type 头仍应透传"
+    );
+}
+
 #[tokio::test]
 async fn fallback_to_default_when_no_slug() {
     let s = build_stack().await;

@@ -192,7 +192,11 @@ impl ProviderResolver for StaticResolver {
                 HeaderValue::from_str(&v_substituted),
             ) {
                 (Ok(name), Ok(val)) => {
-                    extras.append(name, val);
+                    // insert 而非 append:provider.extra_headers 是 IndexMap
+                    // 不会有 dup key,但 insert 更准确表达"该 provider 的
+                    // X 头就这一个值"的意图,防止后续重构有人误把 resolver
+                    // 里某段循环加 dup,导致出站 HeaderMap 里同名多值。
+                    extras.insert(name, val);
                 }
                 (Err(e), _) => telemetry.logs.add(
                     "WARN",
