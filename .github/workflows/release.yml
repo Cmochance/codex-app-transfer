@@ -1,7 +1,8 @@
 name: release
 
 # 三平台 release pipeline (Phase 2):
-#   macos-14 (arm64 原生) + ubuntu-22.04 (AppImage glibc 兼容) + windows-latest
+#   macos-14 (Apple Silicon arm64 原生) + macos-13 (Intel x64 原生)
+#   + ubuntu-22.04 (AppImage glibc 兼容) + windows-latest
 # 触发: push tag v*  或  workflow_dispatch with version input
 # 产物经 cargo tauri build 直出, rename 为项目老命名兼容老下载链接,
 # 收口 job 跑 xtask release-bundle 出 sha256 + .sig + latest.json,
@@ -42,6 +43,14 @@ jobs:
             target: aarch64-apple-darwin
             bundles: 'app,dmg'
             plat: macOS-arm64
+          # Intel Mac (issue #61):macos-13 是 GitHub Actions 唯一保留的 Intel
+          # runner(macos-12 已退役),原生编译 x86_64-apple-darwin。共用所有
+          # macos-14 的签名 / notarization 步骤(条件用 startsWith('macos-')
+          # 即可同时覆盖)。
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bundles: 'app,dmg'
+            plat: macOS-x64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             bundles: 'deb,appimage'
@@ -111,7 +120,7 @@ jobs:
           echo "Resolved VERSION=$V"
 
       - name: Import macOS signing cert
-        if: matrix.os == 'macos-14' && env.CERT != ''
+        if: startsWith(matrix.os, 'macos-') && env.CERT != ''
         uses: apple-actions/import-codesign-certs@v3
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
@@ -120,7 +129,7 @@ jobs:
           CERT: ${{ secrets.APPLE_CERTIFICATE }}
 
       - name: Write Apple notary API key
-        if: matrix.os == 'macos-14' && env.KEY_B64 != ''
+        if: startsWith(matrix.os, 'macos-') && env.KEY_B64 != ''
         shell: bash
         env:
           KEY_B64: ${{ secrets.APPLE_API_KEY_BASE64 }}
@@ -158,7 +167,7 @@ jobs:
           [[ -n "$APPLE_API_KEY_RAW" ]] && export APPLE_API_KEY="$APPLE_API_KEY_RAW"
 
           # macOS 无 Developer ID 时走 ad-hoc, 让 Tauri 内部 codesign --sign -.
-          if [[ "${{ matrix.os }}" == "macos-14" ]] && [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+          if [[ "${{ matrix.os }}" == macos-* ]] && [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
             export APPLE_SIGNING_IDENTITY="-"
             echo "::notice::macOS no Developer ID secret, using ad-hoc identity (-)"
           fi
@@ -170,7 +179,7 @@ jobs:
       # 完全未签 → Sequoia Gatekeeper 无路径绕过. 三平台都加各自 sanity
       # check 后这类问题不会再静默上传.
       - name: Verify macOS .app codesign + dmg integrity
-        if: matrix.os == 'macos-14'
+        if: startsWith(matrix.os, 'macos-')
         shell: bash
         run: |
           APP="target/${{ matrix.target }}/release/bundle/macos/Codex App Transfer.app"
@@ -262,7 +271,7 @@ jobs:
 
           shopt -s nullglob
           case "$PLAT" in
-            macOS-arm64)
+            macOS-arm64 | macOS-x64)
               for f in "$BDIR"/dmg/*.dmg; do
                 cp "$f" "staging/Codex-App-Transfer-v${V}-${PLAT}.dmg"
               done
