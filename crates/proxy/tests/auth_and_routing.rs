@@ -209,10 +209,10 @@ async fn successful_forward_updates_proxy_telemetry() {
     let logs = proxy_telemetry().logs.get_all();
     assert!(logs
         .iter()
-        .any(|entry| entry.level == "INFO" && entry.message.contains("请求: POST")));
+        .any(|entry| entry.level == "INFO" && entry.message.contains("request: POST")));
     assert!(logs
         .iter()
-        .any(|entry| entry.level == "SUCCESS" && entry.message == "上游响应 200"));
+        .any(|entry| entry.level == "SUCCESS" && entry.message == "upstream status 200"));
 }
 
 #[tokio::test]
@@ -236,7 +236,7 @@ async fn gateway_auth_failure_updates_proxy_telemetry() {
     let logs = proxy_telemetry().logs.get_all();
     assert!(logs
         .iter()
-        .any(|entry| entry.level == "ERROR" && entry.message.contains("代理请求失败")));
+        .any(|entry| entry.level == "ERROR" && entry.message.contains("proxy request failed")));
 }
 
 #[tokio::test]

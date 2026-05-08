@@ -93,7 +93,7 @@ pub async fn get_secret(Path(id): Path<String>) -> impl IntoResponse {
             "extraHeaders": p.get("extraHeaders").cloned().unwrap_or_else(|| json!({})),
         }))
         .into_response(),
-        None => err(StatusCode::NOT_FOUND, "提供商不存在").into_response(),
+        None => err(StatusCode::NOT_FOUND, "provider not found").into_response(),
     }
 }
 
@@ -229,7 +229,7 @@ pub async fn update_provider(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
     let Some(idx) = provider_index(&cfg, &id) else {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
     };
     let providers = cfg
         .get_mut("providers")
@@ -322,7 +322,7 @@ pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
         })
         .collect();
     if remaining.len() == original_len {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
     }
     for (i, p) in remaining.iter_mut().enumerate() {
         if let Some(o) = p.as_object_mut() {
@@ -361,7 +361,7 @@ pub async fn set_default_provider(
     if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
         Json(result).into_response()
     } else {
-        let status = if result.get("message").and_then(|v| v.as_str()) == Some("提供商不存在")
+        let status = if result.get("message").and_then(|v| v.as_str()) == Some("provider not found")
         {
             StatusCode::NOT_FOUND
         } else {
@@ -372,7 +372,7 @@ pub async fn set_default_provider(
             result
                 .get("message")
                 .and_then(|v| v.as_str())
-                .unwrap_or("提供商不存在"),
+                .unwrap_or("provider not found"),
         )
         .into_response()
     }
@@ -433,7 +433,7 @@ pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResp
         }
     }
     if ordered.len() != providers.len() {
-        return err(StatusCode::BAD_REQUEST, "排序数量不一致").into_response();
+        return err(StatusCode::BAD_REQUEST, "reorder count mismatch").into_response();
     }
     for (i, p) in ordered.iter_mut().enumerate() {
         if let Some(o) = p.as_object_mut() {
@@ -471,7 +471,7 @@ pub async fn update_models(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
     let Some(idx) = provider_index(&cfg, &id) else {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
     };
     let providers = cfg
         .get_mut("providers")

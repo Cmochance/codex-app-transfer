@@ -134,12 +134,16 @@ pub async fn sessions_clear() -> impl IntoResponse {
 
 pub async fn proxy_logs_open_dir() -> impl IntoResponse {
     let Some(path) = proxy_log_dir() else {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位日志目录").into_response();
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot locate log directory",
+        )
+        .into_response();
     };
     if let Err(e) = fs::create_dir_all(&path) {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("无法创建日志目录: {e}"),
+            format!("create log directory failed: {e}"),
         )
         .into_response();
     }

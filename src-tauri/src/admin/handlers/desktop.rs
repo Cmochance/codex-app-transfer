@@ -231,7 +231,7 @@ fn open_codex_app(platform: &str) -> Result<(), String> {
     };
     let cmd = open_command(platform, resolved.as_deref());
     let Some((program, args)) = cmd.split_first() else {
-        return Err("打开命令为空".to_owned());
+        return Err("open command is empty".to_owned());
     };
     let mut command = Command::new(program);
     command
@@ -242,7 +242,7 @@ fn open_codex_app(platform: &str) -> Result<(), String> {
     hide_console_window(&mut command)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("无法启动 Codex App: {e}"))
+        .map_err(|e| format!("cannot launch Codex App: {e}"))
 }
 
 fn launch_codex_app_restart(platform: &str) -> Result<(), String> {
@@ -450,12 +450,12 @@ pub(super) fn desktop_health(
         if !actual_base_url.is_empty() || actual_api_key_present {
             issues.push(json!({
                 "code": "not_managed_by_cas",
-                "message": "当前 Codex CLI 配置不是由本工具最新版本写入。",
+                "message": "Current Codex CLI config was not written by the latest version of this tool.",
             }));
         } else {
             issues.push(json!({
                 "code": "codex_snapshot_missing",
-                "message": "尚未由本工具应用 Codex CLI 配置，请重新一键生成配置。",
+                "message": "Codex CLI config has not been applied by this tool — re-generate the config from the dashboard.",
             }));
         }
     }
@@ -522,7 +522,7 @@ async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
         return json!({
             "attempted": false,
             "success": false,
-            "message": "没有默认提供商",
+            "message": "no default provider",
         });
     };
 
@@ -629,7 +629,7 @@ pub async fn switch_provider_and_sync(
         Err(e) => return json!({"success": false, "message": e}),
     };
     if provider_index(&cfg, &provider_id).is_none() {
-        return json!({"success": false, "message": "提供商不存在"});
+        return json!({"success": false, "message": "provider not found"});
     }
     cfg.as_object_mut()
         .unwrap()
@@ -641,7 +641,7 @@ pub async fn switch_provider_and_sync(
     let desktop_sync = sync_desktop_for_active_provider(&state).await;
     json!({
         "success": true,
-        "message": "默认提供商已更新",
+        "message": "default provider updated",
         "desktopSync": desktop_sync,
     })
 }
@@ -695,7 +695,7 @@ pub async fn desktop_configure() -> impl IntoResponse {
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
     let Some(active) = active_provider(&cfg) else {
-        return err(StatusCode::BAD_REQUEST, "请先添加 provider").into_response();
+        return err(StatusCode::BAD_REQUEST, "add a provider first").into_response();
     };
     let target = desktop_config_target_for_provider(&mut cfg, &active, None);
     if let Err(e) = save_registry(&cfg) {

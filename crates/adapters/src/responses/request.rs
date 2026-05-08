@@ -1242,7 +1242,7 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
 /// 替换后若 content 数组只剩 text 块,会进一步合并为单 string,与
 /// 普通文本消息序列化形态一致。
 fn strip_image_blocks_in_place(messages: &mut [Value]) {
-    const PLACEHOLDER: &str = "[图片省略:当前 provider 不支持视觉输入]";
+    const PLACEHOLDER: &str = "[image omitted: current provider does not support vision]";
     for msg in messages.iter_mut() {
         let Some(obj) = msg.as_object_mut() else {
             continue;
@@ -1752,7 +1752,7 @@ mod tests {
             "DeepSeek 上游不接 image_url,转换后必须不含此 variant\nactual: {serialized}"
         );
         assert!(
-            serialized.contains("图片省略"),
+            serialized.contains("image omitted"),
             "应当用占位文本替换,而不是直接丢弃,让模型知道历史里曾有图\nactual: {serialized}"
         );
     }
@@ -1771,7 +1771,7 @@ mod tests {
         let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
         let serialized = serde_json::to_string(&out["messages"]).unwrap();
         assert!(!serialized.contains("\"image_url\""));
-        assert!(serialized.contains("图片省略"));
+        assert!(serialized.contains("image omitted"));
     }
 
     // ── response_format json_schema 降级(基于实测 2026-05-06)─────────
@@ -2230,7 +2230,7 @@ mod tests {
             !serialized.contains("\"image_url\""),
             "body 缺 model + default=deepseek-v4-pro → 必须按 default 命中黑名单 strip"
         );
-        assert!(serialized.contains("图片省略"), "应该用占位文本替换");
+        assert!(serialized.contains("image omitted"), "应该用占位文本替换");
     }
 
     #[test]

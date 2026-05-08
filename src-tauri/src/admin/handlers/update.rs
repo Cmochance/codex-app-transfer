@@ -72,9 +72,9 @@ pub(super) fn is_newer_version(latest: &str, current: &str) -> bool {
 
 pub(super) fn validate_update_url(url: &str) -> Result<String, String> {
     let parsed = reqwest::Url::parse(url.trim())
-        .map_err(|_| "更新地址必须是 http 或 https URL".to_owned())?;
+        .map_err(|_| "update URL must be http or https".to_owned())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err("更新地址必须是 http 或 https URL".to_owned());
+        return Err("update URL must be http or https".to_owned());
     }
     Ok(parsed.to_string())
 }
@@ -87,7 +87,7 @@ pub(super) fn safe_asset_name(name: &str) -> Result<String, String> {
         .trim()
         .to_owned();
     if filename.is_empty() {
-        Err("更新资产缺少文件名".to_owned())
+        Err("update asset missing filename".to_owned())
     } else {
         Ok(filename)
     }
@@ -106,13 +106,13 @@ pub(super) fn asset_filename_from_url(url: &str) -> String {
 }
 
 pub(super) fn file_sha256(path: &FsPath) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| format!("读取安装包失败: {e}"))?;
+    let mut file = fs::File::open(path).map_err(|e| format!("read installer failed: {e}"))?;
     let mut digest = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
         let n = file
             .read(&mut buf)
-            .map_err(|e| format!("读取安装包失败: {e}"))?;
+            .map_err(|e| format!("read installer failed: {e}"))?;
         if n == 0 {
             break;
         }
@@ -130,7 +130,7 @@ pub(super) fn pick_platform_data<'a>(
         .and_then(|v| v.as_object())
         .and_then(|platforms| platforms.get(platform))
         .filter(|v| v.as_object().is_some())
-        .ok_or_else(|| format!("latest.json 中没有 {platform} 平台资产"))
+        .ok_or_else(|| format!("latest.json has no asset for platform {platform}"))
 }
 
 pub(super) fn allowed_install_extensions(platform: &str) -> &'static [&'static str] {
@@ -155,7 +155,7 @@ pub(super) fn pick_windows_installer(assets: &[Value]) -> Result<Value, String> 
                 .ends_with("windows-setup.exe")
         })
         .cloned()
-        .ok_or_else(|| "当前版本没有 Windows 安装包资产".to_owned())
+        .ok_or_else(|| "current release has no Windows installer asset".to_owned())
 }
 
 pub(super) fn pick_macos_installer(assets: &[Value]) -> Result<Value, String> {
@@ -180,7 +180,7 @@ pub(super) fn pick_macos_installer(assets: &[Value]) -> Result<Value, String> {
                 .ends_with(".dmg")
         })
         .cloned()
-        .ok_or_else(|| "当前版本没有 macOS 安装资产".to_owned())
+        .ok_or_else(|| "current release has no macOS installer asset".to_owned())
 }
 
 pub(super) fn pick_platform_installer(assets: &[Value], platform: &str) -> Result<Value, String> {
@@ -190,7 +190,9 @@ pub(super) fn pick_platform_installer(assets: &[Value], platform: &str) -> Resul
     if platform.starts_with("macos-") {
         return pick_macos_installer(assets);
     }
-    Err(format!("当前平台暂不支持应用内安装: {platform}"))
+    Err(format!(
+        "in-app install is not supported on platform: {platform}"
+    ))
 }
 
 pub(super) fn install_command_parts(path: &str, platform: &str) -> Result<Vec<String>, String> {
@@ -200,7 +202,9 @@ pub(super) fn install_command_parts(path: &str, platform: &str) -> Result<Vec<St
     if platform.starts_with("macos-") {
         return Ok(vec!["open".to_owned(), path.to_owned()]);
     }
-    Err(format!("当前平台暂不支持应用内安装: {platform}"))
+    Err(format!(
+        "in-app install is not supported on platform: {platform}"
+    ))
 }
 
 #[cfg(test)]
@@ -210,7 +214,7 @@ pub(super) fn install_after_quit_command_parts(
     wait_for_pid: u32,
 ) -> Result<Vec<String>, String> {
     if wait_for_pid == 0 {
-        return Err("等待退出的进程 ID 无效".to_owned());
+        return Err("wait-for-exit pid is invalid".to_owned());
     }
     if platform.starts_with("macos-") {
         return Ok(vec![
@@ -231,7 +235,7 @@ pub(super) fn launch_update_installer(
 ) -> Result<bool, String> {
     let command = install_command_parts(installer_path, platform)?;
     let Some((program, args)) = command.split_first() else {
-        return Err("安装命令为空".to_owned());
+        return Err("install command is empty".to_owned());
     };
     Command::new(program)
         .args(args)
@@ -240,7 +244,7 @@ pub(super) fn launch_update_installer(
         .stderr(Stdio::null())
         .spawn()
         .map(|_| false)
-        .map_err(|e| format!("启动安装器失败: {e}"))
+        .map_err(|e| format!("launch installer failed: {e}"))
 }
 
 pub(super) fn configured_update_url(input: Option<&str>) -> String {
@@ -269,21 +273,21 @@ pub(super) async fn fetch_latest_json(
         .get(safe_url)
         .send()
         .await
-        .map_err(|e| format!("更新地址请求失败: {e}"))?;
+        .map_err(|e| format!("update URL request failed: {e}"))?;
     response
         .error_for_status_ref()
-        .map_err(|e| format!("更新地址请求失败: {e}"))?;
+        .map_err(|e| format!("update URL request failed: {e}"))?;
     let bytes = response
         .bytes()
         .await
-        .map_err(|e| format!("更新地址请求失败: {e}"))?;
+        .map_err(|e| format!("update URL request failed: {e}"))?;
     let data = serde_json::from_slice::<Value>(&bytes).or_else(|_| {
         let without_bom = bytes
             .strip_prefix(&[0xEF, 0xBB, 0xBF])
             .unwrap_or(bytes.as_ref());
         serde_json::from_slice::<Value>(without_bom)
     });
-    let data = data.map_err(|_| "更新地址返回的不是有效 JSON".to_owned())?;
+    let data = data.map_err(|_| "update URL did not return valid JSON".to_owned())?;
     if !data.is_object() {
         return Err("latest.json 格式错误".to_owned());
     }
@@ -343,7 +347,9 @@ pub(super) async fn download_asset_impl(
     let filename = safe_asset_name(&raw_name)?;
     let allowed_extensions = allowed_install_extensions(platform);
     if allowed_extensions.is_empty() {
-        return Err(format!("当前平台暂不支持应用内安装: {platform}"));
+        return Err(format!(
+            "in-app install is not supported on platform: {platform}"
+        ));
     }
     let lower_name = filename.to_ascii_lowercase();
     if !allowed_extensions
@@ -351,7 +357,7 @@ pub(super) async fn download_asset_impl(
         .any(|ext| lower_name.ends_with(ext))
     {
         return Err(format!(
-            "当前平台只能下载安装资产: {}",
+            "platform supports download-only installer asset: {}",
             allowed_extensions.join(" / ")
         ));
     }
@@ -361,7 +367,7 @@ pub(super) async fn download_asset_impl(
             .join("Codex-App-Transfer")
             .join("updates")
     });
-    fs::create_dir_all(&updates_dir).map_err(|e| format!("写入安装包失败: {e}"))?;
+    fs::create_dir_all(&updates_dir).map_err(|e| format!("write installer failed: {e}"))?;
     let target = updates_dir.join(filename);
     let partial = target.with_file_name(format!(
         "{}.download",
@@ -376,22 +382,24 @@ pub(super) async fn download_asset_impl(
             .get(url)
             .send()
             .await
-            .map_err(|e| format!("下载安装包失败: {e}"))?;
+            .map_err(|e| format!("download installer failed: {e}"))?;
         response
             .error_for_status_ref()
-            .map_err(|e| format!("下载安装包失败: {e}"))?;
-        let mut file = fs::File::create(&partial).map_err(|e| format!("写入安装包失败: {e}"))?;
+            .map_err(|e| format!("download installer failed: {e}"))?;
+        let mut file =
+            fs::File::create(&partial).map_err(|e| format!("write installer failed: {e}"))?;
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|e| format!("下载安装包失败: {e}"))?
+            .map_err(|e| format!("download installer failed: {e}"))?
         {
             if !chunk.is_empty() {
                 file.write_all(&chunk)
-                    .map_err(|e| format!("写入安装包失败: {e}"))?;
+                    .map_err(|e| format!("write installer failed: {e}"))?;
             }
         }
-        file.flush().map_err(|e| format!("写入安装包失败: {e}"))?;
+        file.flush()
+            .map_err(|e| format!("write installer failed: {e}"))?;
         Ok(())
     }
     .await;
@@ -409,15 +417,15 @@ pub(super) async fn download_asset_impl(
         .to_ascii_lowercase();
     if !expected_sha.is_empty() && actual_sha.to_ascii_lowercase() != expected_sha {
         let _ = fs::remove_file(&partial);
-        return Err("安装包校验失败，已取消安装".to_owned());
+        return Err("installer checksum mismatch, install cancelled".to_owned());
     }
 
     if target.exists() {
-        fs::remove_file(&target).map_err(|e| format!("写入安装包失败: {e}"))?;
+        fs::remove_file(&target).map_err(|e| format!("write installer failed: {e}"))?;
     }
-    fs::rename(&partial, &target).map_err(|e| format!("写入安装包失败: {e}"))?;
+    fs::rename(&partial, &target).map_err(|e| format!("write installer failed: {e}"))?;
     let size = fs::metadata(&target)
-        .map_err(|e| format!("读取安装包失败: {e}"))?
+        .map_err(|e| format!("read installer failed: {e}"))?
         .len();
     Ok(json!({
         "asset": asset,
@@ -440,7 +448,7 @@ pub(super) async fn download_update_impl(
             obj.insert("downloaded".to_owned(), Value::Bool(false));
             obj.insert(
                 "message".to_owned(),
-                Value::String("当前已是最新版本".to_owned()),
+                Value::String("already on the latest version".to_owned()),
             );
         }
         return Ok(result);
@@ -491,7 +499,11 @@ pub struct UpdateInstallInput {
 pub async fn update_check(Query(query): Query<UpdateCheckQuery>) -> impl IntoResponse {
     let update_url = configured_update_url(query.url.as_deref());
     if update_url.trim().is_empty() {
-        return err(StatusCode::BAD_REQUEST, "请先配置 latest.json 更新地址").into_response();
+        return err(
+            StatusCode::BAD_REQUEST,
+            "configure latest.json update URL first",
+        )
+        .into_response();
     }
     let current = query
         .current
@@ -514,7 +526,11 @@ pub async fn update_check(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
     {
         Ok(client) => client,
         Err(e) => {
-            return err(StatusCode::BAD_REQUEST, format!("更新地址请求失败: {e}")).into_response()
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("update URL request failed: {e}"),
+            )
+            .into_response()
         }
     };
     match check_update_impl(&client, &update_url, &current, &platform).await {
@@ -527,7 +543,11 @@ pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl Into
     let input = body.map(|value| value.0).unwrap_or_default();
     let update_url = configured_update_url(input.url.as_deref());
     if update_url.trim().is_empty() {
-        return err(StatusCode::BAD_REQUEST, "请先配置 latest.json 更新地址").into_response();
+        return err(
+            StatusCode::BAD_REQUEST,
+            "configure latest.json update URL first",
+        )
+        .into_response();
     }
     let current = input
         .current
@@ -550,7 +570,11 @@ pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl Into
     {
         Ok(client) => client,
         Err(e) => {
-            return err(StatusCode::BAD_REQUEST, format!("更新地址请求失败: {e}")).into_response()
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("update URL request failed: {e}"),
+            )
+            .into_response()
         }
     };
     let mut result =
@@ -566,7 +590,7 @@ pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl Into
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if installer_path.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "下载安装包失败").into_response();
+        return err(StatusCode::BAD_REQUEST, "download installer failed").into_response();
     }
     let quit_requested = match launch_update_installer(installer_path, &platform) {
         Ok(quit_requested) => quit_requested,
@@ -581,12 +605,12 @@ pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl Into
             "message".to_owned(),
             Value::String(if is_macos {
                 if quit_requested {
-                    "更新包已下载，应用即将退出并启动安装器。".to_owned()
+                    "Installer downloaded. App will exit and launch the installer.".to_owned()
                 } else {
-                    "更新包已下载并打开。请先退出当前应用，再按 macOS 提示完成安装。".to_owned()
+                    "Installer downloaded and opened. Quit the app, then follow the macOS prompts to finish installing.".to_owned()
                 }
             } else {
-                "安装包已下载并启动。安装器会沿用旧安装目录，并在安装前关闭正在运行的 Codex App Transfer。".to_owned()
+                "Installer downloaded and launched. It will reuse the previous install location and close any running Codex App Transfer before installing.".to_owned()
             }),
         );
     }
@@ -637,7 +661,7 @@ mod tests {
         );
         assert_eq!(
             pick_platform_installer(&macos_assets, "linux-x64").unwrap_err(),
-            "当前平台暂不支持应用内安装: linux-x64"
+            "in-app install is not supported on platform: linux-x64"
         );
 
         assert_eq!(
@@ -664,7 +688,7 @@ mod tests {
         assert_eq!(
             install_after_quit_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64", 0)
                 .unwrap_err(),
-            "等待退出的进程 ID 无效"
+            "wait-for-exit pid is invalid"
         );
     }
 
@@ -884,7 +908,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(bad_sha, "安装包校验失败，已取消安装");
+            assert_eq!(bad_sha, "installer checksum mismatch, install cancelled");
 
             let unsupported = download_update_impl(
                 &client,
@@ -896,7 +920,10 @@ mod tests {
             .await
             .unwrap_err();
             server.abort();
-            assert_eq!(unsupported, "当前平台暂不支持应用内安装: linux-x64");
+            assert_eq!(
+                unsupported,
+                "in-app install is not supported on platform: linux-x64"
+            );
             let _ = fs::remove_dir_all(&target_dir);
         });
     }

@@ -100,7 +100,7 @@ impl axum::response::IntoResponse for ForwardError {
         telemetry.stats.record(false);
         telemetry
             .logs
-            .add("ERROR", format!("代理请求失败: {message}"));
+            .add("ERROR", format!("proxy request failed: {message}"));
 
         // PreviousResponseNotFound 单独走 OpenAI SDK-compatible JSON 错误体,
         // 字面对齐 OpenAI Responses API 服务端真实行为(LM Studio bug tracker
@@ -262,21 +262,21 @@ pub async fn forward_handler(
     let telemetry = proxy_telemetry();
     telemetry
         .logs
-        .add("INFO", format!("请求: {} {client_path}", parts.method));
+        .add("INFO", format!("request: {} {client_path}", parts.method));
     if let Some(original_model) = original_model.as_deref() {
         let mapped = resolved_model.as_deref().unwrap_or(original_model);
         telemetry
             .logs
-            .add("INFO", format!("模型映射: {original_model} → {mapped}"));
+            .add("INFO", format!("model alias: {original_model} → {mapped}"));
     }
     telemetry
         .logs
-        .add("INFO", format!("转发请求 → {upstream_url}"));
+        .add("INFO", format!("forwarding → {upstream_url}"));
     if let Some(upstream_model) = body_model(&plan.body) {
         let mapped = resolved_model.as_deref().unwrap_or(&upstream_model);
         telemetry
             .logs
-            .add("INFO", format!("模型: {mapped} → {upstream_model}"));
+            .add("INFO", format!("model: {mapped} → {upstream_model}"));
     }
 
     // 6. 构造 reqwest 请求 —— 头复制 + 鉴权改写 + extras 注入
@@ -360,7 +360,7 @@ pub async fn forward_handler(
     telemetry.stats.record(success);
     telemetry.logs.add(
         if success { "SUCCESS" } else { "ERROR" },
-        format!("上游响应 {}", response_plan.status.as_u16()),
+        format!("upstream status {}", response_plan.status.as_u16()),
     );
 
     // 8. 把 ResponsePlan 还原成 axum Response
@@ -431,7 +431,7 @@ impl Drop for TracedStream {
         proxy_telemetry().logs.add(
             "INFO",
             format!(
-                "上游耗时 {} {} TTFB={} total={:.2}s bytes={}",
+                "upstream timing {} {} TTFB={} total={:.2}s bytes={}",
                 self.status,
                 self.upstream_url,
                 ttfb_str,
@@ -462,7 +462,7 @@ fn log_upstream_error_diag(
     telemetry.logs.add(
         "ERROR",
         format!(
-            "上游错误诊断 {} {}\n  → outbound headers: [{}]\n  → request body ({} bytes): {}\n  ← response body ({} bytes): {}",
+            "upstream error diag {} {}\n  → outbound headers: [{}]\n  → request body ({} bytes): {}\n  ← response body ({} bytes): {}",
             status.as_u16(),
             upstream_url,
             headers_dump,

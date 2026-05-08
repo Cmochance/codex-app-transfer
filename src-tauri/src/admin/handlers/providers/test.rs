@@ -225,7 +225,7 @@ async fn test_provider_connection(provider: &Value) -> Value {
                 "success": true,
                 "ok": false,
                 "latencyMs": started.elapsed().as_millis(),
-                "message": format!("连接失败：{}", provider_test_error_label(&error)),
+                "message": format!("connection failed: {}", provider_test_error_label(&error)),
             });
         }
     };
@@ -244,7 +244,7 @@ async fn test_provider_connection(provider: &Value) -> Value {
                 "success": true,
                 "ok": false,
                 "latencyMs": started.elapsed().as_millis(),
-                "message": format!("连接失败：{}", provider_test_error_label(&error)),
+                "message": format!("connection failed: {}", provider_test_error_label(&error)),
             });
         }
     };
@@ -260,7 +260,7 @@ async fn test_provider_connection(provider: &Value) -> Value {
                     "success": true,
                     "ok": false,
                     "latencyMs": started.elapsed().as_millis(),
-                    "message": format!("连接失败：{}", provider_test_error_label(&error)),
+                    "message": format!("connection failed: {}", provider_test_error_label(&error)),
                 });
             }
         };
@@ -284,7 +284,7 @@ async fn test_provider_connection(provider: &Value) -> Value {
                     "success": true,
                     "ok": false,
                     "latencyMs": started.elapsed().as_millis(),
-                    "message": format!("连接失败：{}", provider_test_error_label(&error)),
+                    "message": format!("connection failed: {}", provider_test_error_label(&error)),
                 });
             }
         };
@@ -294,23 +294,23 @@ async fn test_provider_connection(provider: &Value) -> Value {
     let status_code = response.status().as_u16();
     let mut reachable = status_code < 500;
     let message = if (200..300).contains(&status_code) {
-        format!("连接正常，{latency_ms} ms")
+        format!("connection OK, {latency_ms} ms")
     } else if matches!(status_code, 401 | 403) {
         reachable = false;
         if is_kimi_provider(provider) {
             format!(
-                "Kimi 认证失败，HTTP {status_code}。Kimi Platform Key 请使用 https://api.moonshot.cn/v1；Kimi Code 会员 Key 请使用 https://api.kimi.com/coding，{latency_ms} ms"
+                "Kimi auth failed, HTTP {status_code}. Use https://api.moonshot.cn/v1 for Kimi Platform key, or https://api.kimi.com/coding for Kimi Code subscription key. ({latency_ms} ms)"
             )
         } else {
             format!(
-                "认证失败，HTTP {status_code}，请检查 API Key 和 API 地址是否匹配，{latency_ms} ms"
+                "auth failed, HTTP {status_code}. Check that the API key and base URL match. ({latency_ms} ms)"
             )
         }
     } else if matches!(status_code, 404 | 405) {
         reachable = false;
-        format!("接口不可用，HTTP {status_code}，请检查 API 地址是否填到了兼容 Codex 的接口，{latency_ms} ms")
+        format!("endpoint unavailable, HTTP {status_code}. Verify the base URL points to a Codex-compatible endpoint. ({latency_ms} ms)")
     } else {
-        format!("地址可达，HTTP {status_code}，{latency_ms} ms")
+        format!("reachable, HTTP {status_code} ({latency_ms} ms)")
     };
 
     json!({
@@ -340,7 +340,7 @@ pub async fn test_provider(Path(id): Path<String>) -> impl IntoResponse {
             })
         });
     let Some(provider) = provider else {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
     };
     Json(test_provider_connection(provider).await).into_response()
 }
@@ -511,7 +511,7 @@ mod tests {
             assert!(result["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("认证失败"));
+                .contains("auth failed"));
         });
     }
 
