@@ -298,6 +298,7 @@ v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 
 - **[CC Desktop Switch](https://github.com/lonr-6/cc-desktop-switch)** 提供了完整的桌面应用框架——pywebview 桌面壳、pystray 托盘、FastAPI 双端口（管理 / 转发）布局、PyInstaller / NSIS 打包脚本、`scripts/New-Release.ps1` 发布签名链路、GitHub Actions 自动构建工作流，以及 i18n / 主题 / 设置面板等前端模板都直接沿用了它的实现。
 - **[litellm](https://github.com/BerriAI/litellm)** 提供了 Responses API ↔ Chat Completions 双向协议转换的核心思路。v1.x 的 `backend/responses_adapter.py` / `backend/openai_adapter.py` / `backend/base_adapter.py` 以及 v2.x 的 `crates/adapters/` 都直接参考了 litellm 的字段映射、消息归一化和 reasoning 处理策略。
 - **[Tauri](https://tauri.app/)** 提供了 v2.0 桌面壳的全部基础设施 —— 单二进制打包、native webview、tray、IPC、单实例插件、自定义 URI scheme。v2.0 的"frontend/ 零改动 + cas:// 同进程 axum"架构靠 Tauri 2 的 `register_asynchronous_uri_scheme_protocol` 才能成立。
+- **[Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts)** 提供了 reverse-engineered Claude Code system prompts 公开版本。v2.1.0 的 autocompact summary prompt(`crates/adapters/src/responses/compact.rs`)以此为蓝本改写成 9-section 强 schema —— `<analysis>` + `<summary>` 二段输出,`Primary Request and Intent` / `Files and Code Sections` / `All User Messages` 等固定 section,末尾 few-shot example 防第三方 provider 输出格式飘 —— 续轮断片体感大幅改善。
 
 ### 社区贡献者
 
