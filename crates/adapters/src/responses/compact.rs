@@ -38,8 +38,85 @@ use crate::types::{AdapterError, ByteStream, ResponsePlan};
 
 use super::request::responses_body_to_chat_body_for_provider;
 
-/// 抄自 `openai/codex` 仓库 `codex-rs/core/templates/compact/prompt.md` (Apache-2).
-const COMPACT_SUMMARIZATION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work.";
+/// **v2.0.12 prompt rewrite**:从原 Codex CLI 的 86 字符 prompt 改为 Claude Code
+/// 风格的 9-section 结构化 prompt(精简移植自 Piebald-AI/claude-code-system-prompts
+/// 反编译公开版本 `agent-prompt-conversation-summarization.md`)。
+///
+/// ## 为什么改
+///
+/// 原 Codex prompt(86 字符)对 GPT-5 系列指令遵循够用,但接到第三方 provider
+/// (Kimi/MiMo/DeepSeek)指令遵循能力相对弱,实测 summary 只记最近 1-2 个动作,
+/// 丢任务目标 / 文件路径 / 历次 user 主诉 → 用户体感"compact 后断片"。
+/// (用户反馈截图:"在 curl 网页"不知道 curl 什么 / 为什么。)
+///
+/// Claude Code "几乎感觉不到断点" 不是模型更强,是 **prompt 把"必须保留什么"
+/// 枚举死了**:9 个固定 section、chronological 强制要求、ALL user messages
+/// 逐字列、Next Step 强制 verbatim quote 最近用户诉求。
+///
+/// ## 关键设计点
+///
+/// 1. **`<analysis>` + `<summary>` 二段输出**:让模型先做时序 chain-of-thought
+///    再生 summary;`collect_and_wrap_compact_body` 抽 `<summary>` 段落注入
+///    下一轮(避免 analysis 部分污染 history)。
+/// 2. **9 section 强 schema**:每条 section 用 markdown header,模型只能填空。
+/// 3. **All User Messages 必须逐字列**(section 6):防丢历次主诉 —
+///    用户中途换需求 / 给反馈是最常被压缩掉的信息。
+/// 4. **Next Step 强制 verbatim quote**(section 9):最近用户原话引用,防 drift。
+/// 5. **Files and Code Sections 含具体文件路径 + 完整 snippets**(section 3):
+///    防丢实现细节(用户截图里 "curl 网页"不知道 curl 什么 = 这条 section 没填)。
+/// 6. **末尾 few-shot example**:第三方 provider 没 example 时输出格式飘,
+///    给一段示范让模型对齐结构(花费几百 token 换稳定输出)。
+const COMPACT_SUMMARIZATION_PROMPT: &str = "Your task is to create a detailed CONTEXT CHECKPOINT summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing the work without losing context.
+
+Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts. In your analysis:
+
+1. Chronologically walk through every message in the conversation. For each message identify:
+   - The user's explicit requests and intents
+   - Your approach to addressing those requests
+   - Key decisions, technical concepts, and code patterns
+   - Specific details: file paths, full code snippets, function signatures, command-line invocations, URLs, configuration values
+   - Errors encountered and how they were fixed
+   - Any user feedback that asked you to do something differently — capture this verbatim
+
+2. Double-check that your analysis covers every request the user made and every concrete artifact (file, command, URL, error message) referenced.
+
+After the analysis, provide your summary inside <summary> tags using EXACTLY these nine sections in this order:
+
+1. **Primary Request and Intent**: All of the user's explicit requests captured in detail. Include the original phrasing where possible.
+2. **Key Technical Concepts**: Technologies, frameworks, libraries, protocols, and tools that came up.
+3. **Files and Code Sections**: Enumerate every file you examined / modified / created. Use absolute paths when known. Include the most important code snippets verbatim.
+4. **Errors and Fixes**: Every error you ran into and exactly how it was resolved. Note any user correction verbatim.
+5. **Problem Solving**: Problems solved and ongoing troubleshooting threads.
+6. **All User Messages**: List ALL user messages (excluding tool results) verbatim or near-verbatim, in chronological order. This is critical — it preserves intent shifts that get lost otherwise.
+7. **Pending Tasks**: Tasks the user explicitly asked for that are not yet completed.
+8. **Current Work**: Precisely what was being worked on right before this checkpoint. Include relevant file names and code snippets.
+9. **Next Step**: The immediate next action, DIRECTLY in line with the user's most recent explicit request. Include a verbatim direct quote from the most recent user message showing exactly where you left off — this prevents task drift.
+
+Be thorough and structured. Do NOT compress at the cost of losing file paths, command-line invocations, URLs, error messages, or the user's literal words. The next LLM should be able to seamlessly continue the work without asking the user to re-explain anything.
+
+<example>
+<analysis>
+The user started by asking to review the auth module for race conditions. I read src/auth/login.rs:120-180 and found a TOCTOU on session_token validation. The user then corrected me, saying \"actually the bug is in refresh, not login\". I switched to src/auth/refresh.rs:45-90 and found the actual race in cache invalidation. Final user message before this checkpoint: \"add a regression test for the refresh race\".
+</analysis>
+
+<summary>
+1. **Primary Request and Intent**: Review the auth module for race conditions; the user clarified the bug was in the refresh path, not login.
+2. **Key Technical Concepts**: TOCTOU race, session token validation, cache invalidation, tokio Mutex.
+3. **Files and Code Sections**:
+   - `src/auth/login.rs:120-180`: original suspicion (false positive — no actual race here).
+   - `src/auth/refresh.rs:45-90`: actual race in cache invalidation between `lookup` and `replace`.
+4. **Errors and Fixes**: Initially misidentified the buggy file. User correction (verbatim): \"actually the bug is in refresh, not login\".
+5. **Problem Solving**: Identified the race, designed fix using `tokio::sync::Mutex` around the lookup-replace section.
+6. **All User Messages**:
+   - \"review the auth module for race conditions\"
+   - \"actually the bug is in refresh, not login\"
+   - \"add a regression test for the refresh race\"
+7. **Pending Tasks**:
+   - Add regression test for the refresh race.
+8. **Current Work**: Just identified the race in `src/auth/refresh.rs:45-90`; designed the Mutex fix but have not yet written code.
+9. **Next Step**: Add a regression test for the refresh race, per user's most recent message: \"add a regression test for the refresh race\".
+</summary>
+</example>";
 
 /// 抄自 `openai/codex` 仓库 `codex-rs/core/templates/compact/summary_prefix.md` (Apache-2).
 /// Codex CLI 反序列化 compact 响应后,通过 `is_summary_message`(`startswith(PREFIX)`)
@@ -63,12 +140,19 @@ pub(super) fn is_compact_path(path: &str) -> bool {
 
 /// 把 Codex CLI 的 `CompactionInput` JSON 改写成上游 `/chat/completions` 请求体。
 ///
-/// 策略:
-/// - 注入 `COMPACT_SUMMARIZATION_PROMPT` 作为 `instructions`(覆盖原 instructions)
+/// 策略(v2.0.12 调整):
+/// - **注入 `COMPACT_SUMMARIZATION_PROMPT` 作为最后一条 user message**(append
+///   到 input 数组末尾),而不是 instructions/system。原因:
+///   * 第三方 provider 对 user 服从度普遍 > system,structured prompt 更被尊重
+///   * 避免 system prompt cache 截断 / 去重(部分 provider 把超长 system 截短)
+///   * 对齐 Codex CLI 自家做法(`compact.rs::build_compact_request` 把 prompt
+///     当 `UserInput::Text` 注入)
 /// - 保留 `input` 数组(原对话历史),交给现有 `responses_body_to_chat_body_for_provider`
 ///   做 ResponseItem → ChatMessage 转换、merge consecutive、tool call repair、vision 剥离等
 /// - `stream = false`(上游回完整 chat completion JSON,不是 SSE)
-/// - 丢弃 `tools`(摘要任务不需要工具调用)
+/// - 丢弃 `instructions`(摘要任务不应受原任务 system prompt 影响)
+/// - 保留 `tools`(`ensure_thinking_tool_call_reasoning` 的 `has_tool_loop`
+///   检测需要,且第三方 provider 看到 tools 字段不会 400)
 pub(super) fn build_compact_chat_request(
     body_bytes: &[u8],
     provider: &Provider,
@@ -76,14 +160,22 @@ pub(super) fn build_compact_chat_request(
     let parsed: Value = serde_json::from_slice(body_bytes)
         .map_err(|e| AdapterError::BadRequest(format!("compact body 不是合法 JSON: {e}")))?;
     let model = parsed.get("model").cloned().unwrap_or(Value::Null);
-    let input = parsed
+    let mut input = parsed
         .get("input")
         .cloned()
         .unwrap_or(Value::Array(Vec::new()));
 
+    // A2:把 SUMMARIZATION_PROMPT 作为最后一条 user message append 到 input
+    if let Some(arr) = input.as_array_mut() {
+        arr.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": COMPACT_SUMMARIZATION_PROMPT,
+        }));
+    }
+
     let mut synthetic_responses_body = json!({
         "model": model,
-        "instructions": COMPACT_SUMMARIZATION_PROMPT,
         "input": input,
         "stream": false,
         "max_output_tokens": COMPACT_MAX_OUTPUT_TOKENS,
@@ -174,14 +266,18 @@ async fn collect_and_wrap_compact_body(
             "compact upstream non-JSON response: {e}; first 500 chars: {preview}"
         ))
     })?;
-    let summary = parsed
+    let raw = parsed
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
             AdapterError::Internal("compact upstream missing choices[0].message.content".to_owned())
-        })?
-        .trim()
-        .to_owned();
+        })?;
+
+    // B1:抽 `<summary>...</summary>` tag 内容(配合 v2.0.12 prompt 强制
+    // `<analysis>` + `<summary>` 二段输出),无 tag 时容错回退原文。
+    // 不抽 analysis 部分,避免污染下一轮 history(模型 chain-of-thought
+    // 的 meta-discussion 进 history 后会让续轮模型被带偏)。
+    let summary = extract_summary_section(raw).trim().to_owned();
 
     let encrypted_content = format!("{COMPACT_SUMMARY_PREFIX}\n{summary}");
     let compact_response = json!({
@@ -192,6 +288,25 @@ async fn collect_and_wrap_compact_body(
     });
     serde_json::to_vec(&compact_response)
         .map_err(|e| AdapterError::Internal(format!("serialize compact response: {e}")))
+}
+
+/// 从模型输出中抽 `<summary>...</summary>` 段落 — 配合 v2.0.12 prompt 强制
+/// `<analysis>` + `<summary>` 二段输出。容错策略:
+///
+/// - 找到第一个 `<summary>` 和最后一个 `</summary>`,返回中间内容
+/// - 无 `<summary>` tag → 返回 raw(可能模型没遵守格式,先用着,日志会
+///   反映 summary 质量)
+/// - 有 `<summary>` 无 `</summary>`(模型截断) → 返回 `<summary>` 之后所有文本
+fn extract_summary_section(raw: &str) -> &str {
+    let Some(start) = raw.find("<summary>") else {
+        return raw;
+    };
+    let after = &raw[start + "<summary>".len()..];
+    if let Some(end) = after.rfind("</summary>") {
+        &after[..end]
+    } else {
+        after
+    }
 }
 
 #[cfg(test)]
@@ -278,14 +393,19 @@ mod tests {
     }
 
     #[test]
-    fn build_compact_chat_request_injects_summarization_prompt_and_drops_stream() {
+    fn build_compact_chat_request_injects_prompt_as_last_user_message() {
+        // v2.0.12 调整:SUMMARIZATION_PROMPT 注入成**最后一条 user message**
+        // (不是 system),对齐 Codex CLI 自家做法,提升第三方 provider 服从度。
         let p = make_provider();
         let body = json!({
             "model": "mimo-v2.5",
             "input": [
                 {"type": "message", "role": "user", "content": [
                     {"type": "input_text", "text": "hello"}
-                ]}
+                ]},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "world"}
+                ]},
             ],
             "instructions": "ORIGINAL_PROJECT_INSTRUCTIONS",
             "tools": [{"type": "function", "name": "shell"}],
@@ -293,33 +413,106 @@ mod tests {
         let bytes = serde_json::to_vec(&body).unwrap();
         let chat = build_compact_chat_request(&bytes, &p).unwrap();
         let parsed: Value = serde_json::from_slice(&chat).unwrap();
-
-        // 注入了 SUMMARIZATION_PROMPT 作为 system,覆盖原 instructions
         let messages = parsed["messages"].as_array().unwrap();
-        let system_msg = messages
-            .iter()
-            .find(|m| m["role"] == "system")
-            .expect("system message");
+
+        // 最后一条 message 必须是 user + 包含 SUMMARIZATION_PROMPT 关键字
+        let last = messages.last().expect("non-empty messages");
+        assert_eq!(last["role"], "user", "prompt 必须注入成 user message");
+        let last_content = last["content"].as_str().unwrap_or_else(|| {
+            // content 也可能是 array(取决于 provider 转换路径)
+            last["content"]
+                .as_array()
+                .and_then(|a| {
+                    a.iter()
+                        .find_map(|b| b.get("text").and_then(|v| v.as_str()))
+                })
+                .unwrap_or_default()
+        });
         assert!(
-            system_msg["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("CONTEXT CHECKPOINT COMPACTION"),
-            "system 应含 SUMMARIZATION_PROMPT 关键字"
+            last_content.contains("CONTEXT CHECKPOINT"),
+            "last user message 必须含 SUMMARIZATION_PROMPT 关键字 'CONTEXT CHECKPOINT',实际:{last_content}"
         );
+        assert!(
+            last_content.contains("All User Messages"),
+            "9-section schema 必须含 'All User Messages' 段名"
+        );
+        assert!(
+            last_content.contains("<analysis>") && last_content.contains("<summary>"),
+            "二段输出格式必须出现在 prompt 里"
+        );
+
+        // 原 instructions **不应**进 system/任何 message(摘要任务不受原任务 system 影响)
         assert!(
             !messages.iter().any(|m| m["content"]
                 .as_str()
                 .unwrap_or("")
                 .contains("ORIGINAL_PROJECT_INSTRUCTIONS")),
-            "原 instructions 应被覆盖,不应进 messages"
+            "原 instructions 应被丢掉,不应进 messages"
         );
-        // 历史 user message 保留
+        // 没有 system message(prompt 改 user message 后)
+        assert!(
+            !messages.iter().any(|m| m["role"] == "system"),
+            "compact 请求不应再产生 system message,实际 messages 角色:{:?}",
+            messages
+                .iter()
+                .map(|m| m["role"].clone())
+                .collect::<Vec<_>>()
+        );
+        // 历史 user / assistant 保留
         assert!(messages
             .iter()
             .any(|m| m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("hello")));
-        // 不带 stream(stream=false 在 chat body 转换里会被丢)
+        assert!(messages
+            .iter()
+            .any(|m| m["role"] == "assistant"
+                && m["content"].as_str().unwrap_or("").contains("world")));
+        // stream 字段不带(false 在 chat body 转换里会被丢)
         assert!(parsed.get("stream").is_none() || parsed["stream"] == false);
+    }
+
+    // ── extract_summary_section ──────────────────────────────────────
+
+    #[test]
+    fn extract_summary_section_strips_analysis_and_keeps_summary() {
+        let raw = "<analysis>\nblah blah meta\n</analysis>\n<summary>\nactual summary content\n</summary>";
+        assert_eq!(
+            extract_summary_section(raw).trim(),
+            "actual summary content"
+        );
+    }
+
+    #[test]
+    fn extract_summary_section_handles_summary_only_no_analysis() {
+        let raw = "<summary>\njust a summary\n</summary>";
+        assert_eq!(extract_summary_section(raw).trim(), "just a summary");
+    }
+
+    #[test]
+    fn extract_summary_section_returns_raw_when_no_tag() {
+        // 模型没遵守格式 → 整段保留(总比丢好,日志会反映质量)
+        let raw = "this is plain text without any tags";
+        assert_eq!(extract_summary_section(raw), raw);
+    }
+
+    #[test]
+    fn extract_summary_section_handles_truncated_close_tag() {
+        // 模型输出超 max_tokens 被截断,只有 <summary> 没 </summary>
+        let raw = "<analysis>meta</analysis><summary>\npartial summary content cut off here";
+        assert_eq!(
+            extract_summary_section(raw).trim(),
+            "partial summary content cut off here"
+        );
+    }
+
+    #[test]
+    fn extract_summary_section_picks_outermost_when_nested_or_repeated() {
+        // 防御:few-shot example 里也有 `<summary>` 被模型直接 echo 出来时
+        // 用 first-open + last-close,取最外层。
+        let raw = "<summary>real <summary>nested example</summary> content</summary>";
+        assert_eq!(
+            extract_summary_section(raw).trim(),
+            "real <summary>nested example</summary> content"
+        );
     }
 
     fn one_chunk_stream(bytes: Vec<u8>) -> ByteStream {
@@ -355,6 +548,50 @@ mod tests {
             "encrypted_content 必须以 SUMMARY_PREFIX 开头(Codex CLI 用它识别 summary)"
         );
         assert!(enc.ends_with("summary text body"));
+    }
+
+    #[tokio::test]
+    async fn collect_and_wrap_strips_analysis_keeps_only_summary_in_encrypted_content() {
+        // v2.0.12 关键回归:上游模型按 prompt 输出 `<analysis>` + `<summary>`,
+        // 我们必须只把 `<summary>` 段塞进 encrypted_content,不能把 analysis
+        // chain-of-thought 也塞进下一轮 history(会污染续轮模型注意力)。
+        let model_output = "<analysis>\n\
+            User asked X, I did Y, then user corrected to Z.\n\
+            </analysis>\n\
+            <summary>\n\
+            1. Primary Request: do Z\n\
+            2. Files: /abs/foo.rs\n\
+            6. All User Messages:\n\
+            - \"do X\"\n\
+            - \"actually do Z\"\n\
+            </summary>";
+        let upstream_body = serde_json::to_vec(&json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": model_output},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+
+        let body = collect_and_wrap_compact_body(StatusCode::OK, one_chunk_stream(upstream_body))
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let enc = parsed["output"][0]["encrypted_content"].as_str().unwrap();
+        assert!(enc.starts_with(COMPACT_SUMMARY_PREFIX));
+        // 只保留 summary 部分
+        assert!(
+            !enc.contains("<analysis>") && !enc.contains("</analysis>"),
+            "analysis tag 不应进 encrypted_content"
+        );
+        assert!(
+            !enc.contains("User asked X, I did Y"),
+            "analysis chain-of-thought 内容不应被保留"
+        );
+        // summary 内容保留
+        assert!(enc.contains("Primary Request: do Z"));
+        assert!(enc.contains("All User Messages"));
+        assert!(enc.contains("\"actually do Z\""));
     }
 
     #[tokio::test]
