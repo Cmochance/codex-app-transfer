@@ -144,6 +144,7 @@ Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochanc
 - The forwarding service binds to `127.0.0.1` only and never hijacks the system proxy. The v2 management UI is served through Tauri's in-process `cas://` scheme instead of a loopback HTTP admin port; `X-CAS-Request` is still sent by the frontend for compatibility, but it is not the current security boundary.
 - Backup / export JSON files contain plaintext API keys — keep them on trusted devices only.
 - Logs append to `~/.codex-app-transfer/logs/proxy-YYYY-MM-DD.log`. Clearing logs archives them to `logs/backup/` with a timestamp suffix (no deletion).
+- **Conversation history persistence (v2.0.11+)**: the proxy persists Responses-API session messages (mapped to `previous_response_id`) to `~/.codex-app-transfer/sessions.db` (SQLite, 30-day TTL) so Codex CLI long sessions survive app restarts without triggering `previous_response_not_found`. The DB contains complete chat history (system / user / assistant / tool messages); to wipe it, either call the admin endpoint `POST /api/sessions/clear` or delete the file directly.
 - Windows builds are not Authenticode-signed yet; verify downloads with the published `.sha256` / `.sig` and the verification snippet below.
 - This project is not affiliated with OpenAI, Anthropic, CC-Switch, or `farion1231/cc-switch`.
 

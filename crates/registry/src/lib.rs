@@ -27,7 +27,7 @@ pub use model_alias::{
     empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
     provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
 };
-pub use paths::{config_dir, config_file, library_dir, resolve_home};
+pub use paths::{config_dir, config_file, library_dir, resolve_home, sessions_db_file};
 pub use presets::builtin_presets;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};
 pub use schema::{Config, ModelSlotKey, Provider, Settings, APP_VERSION, DEFAULT_UPDATE_URL};

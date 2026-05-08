@@ -6,6 +6,7 @@ const CONFIG_DIR_NAME: &str = ".codex-app-transfer";
 const CONFIG_FILE_NAME: &str = "config.json";
 const LIBRARY_DIR_NAME: &str = "configLibrary";
 const BACKUPS_DIR_NAME: &str = "backups";
+const SESSIONS_DB_NAME: &str = "sessions.db";
 
 /// 解析当前用户的 home 目录;走 `$HOME` 然后 `$USERPROFILE`(Windows).
 pub fn resolve_home() -> Option<PathBuf> {
@@ -36,4 +37,10 @@ pub fn library_dir() -> Option<PathBuf> {
 
 pub fn backups_dir() -> Option<PathBuf> {
     config_dir().map(|d| d.join(BACKUPS_DIR_NAME))
+}
+
+/// SQLite 持久化的 ResponseSessionCache 数据库路径,
+/// `~/.codex-app-transfer/sessions.db`。
+pub fn sessions_db_file() -> Option<PathBuf> {
+    config_dir().map(|d| d.join(SESSIONS_DB_NAME))
 }

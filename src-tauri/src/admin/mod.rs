@@ -131,6 +131,7 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/proxy/logs/open-dir",
             post(handlers::proxy::proxy_logs_open_dir),
         )
+        .route("/api/sessions/clear", post(handlers::proxy::sessions_clear))
         // Settings
         .route(
             "/api/settings",

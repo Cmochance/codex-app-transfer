@@ -19,7 +19,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio-stream = "0.1"
+# rusqlite 用 bundled feature 自带 SQLite 静态库 — 避免依赖系统 libsqlite3
+# (Windows / macOS / Linux 三平台一致),代价是编译产物 +~1.5MB,可接受。
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 indexmap = "2"
+tempfile = "3"

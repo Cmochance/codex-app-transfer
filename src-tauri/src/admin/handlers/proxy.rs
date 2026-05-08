@@ -107,6 +107,31 @@ pub async fn proxy_logs_clear() -> impl IntoResponse {
     Json(json!({"success": true})).into_response()
 }
 
+/// `POST /api/sessions/clear` —— 清除 Responses session cache 持久化历史
+/// (`~/.codex-app-transfer/sessions.db` 全表 + 内存 hot cache)。
+///
+/// 隐私控制点:用户主动清除"应用记得的对话历史"。生产场景:换设备前 / 用户
+/// 切账号 / debug 数据问题。返回清掉的 L2 行数。**清除后正在进行的 Codex CLI
+/// 会话续轮会触发 cache miss → PR 1 标准 OpenAI 400(`previous_response_not_found`)
+/// → Codex CLI fail-fast,用户重发对话即可。**
+pub async fn sessions_clear() -> impl IntoResponse {
+    let cache = codex_app_transfer_adapters::responses::session::global_response_session_cache();
+    match cache.clear_all_persisted() {
+        Ok(rows) => {
+            proxy_telemetry().logs.add(
+                "INFO",
+                format!("sessions.db cleared by admin: {rows} rows removed"),
+            );
+            Json(json!({"success": true, "rowsRemoved": rows})).into_response()
+        }
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("clear sessions.db failed: {e}"),
+        )
+        .into_response(),
+    }
+}
+
 pub async fn proxy_logs_open_dir() -> impl IntoResponse {
     let Some(path) = proxy_log_dir() else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位日志目录").into_response();
