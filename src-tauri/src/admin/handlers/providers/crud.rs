@@ -10,6 +10,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use codex_app_transfer_proxy::validation::{validate_extra_headers, HeaderValidationError};
+
 use super::super::super::registry_io::{
     load as load_registry, public_provider, save as save_registry,
 };
@@ -17,6 +19,33 @@ use super::super::super::state::AdminState;
 use super::super::common::err;
 use super::super::desktop::switch_provider_and_sync;
 use super::{fresh_provider_id, provider_index};
+
+/// 提交时校验 `extraHeaders` 字段的合法性,非法返回 400 + 详细错误。
+/// `Value::Null` / 缺字段 / 空对象 → 视为无 extras,通过校验。
+fn validate_extra_headers_input(headers: &Value) -> Result<(), Vec<HeaderValidationError>> {
+    let Some(obj) = headers.as_object() else {
+        return Ok(());
+    };
+    let errs = validate_extra_headers(
+        obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.as_str(), s))),
+    );
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
+}
+
+/// 把 HeaderValidationError 列表渲染成 user-facing 错误消息。
+fn format_header_errs(errs: &[HeaderValidationError]) -> String {
+    let lines: Vec<String> = errs.iter().map(|e| format!("• {e}")).collect();
+    format!(
+        "extraHeaders 校验失败({} 项):\n{}",
+        errs.len(),
+        lines.join("\n")
+    )
+}
 
 pub async fn list_providers() -> impl IntoResponse {
     let cfg = match load_registry() {
@@ -89,6 +118,15 @@ pub struct AddProviderInput {
 }
 
 pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
+    // 校验 extraHeaders 在保存前合法,避免运行时静默丢 header(实测痛点:Kimi
+    // KimiCLI UA 字符串带换行 → resolver 运行时 HeaderValue::from_str 失败 →
+    // WARN 后跳过 → Kimi 上游 403 但用户看不到原因)
+    if let Some(headers) = input.extra_headers.as_ref() {
+        if let Err(errs) = validate_extra_headers_input(headers) {
+            return err(StatusCode::BAD_REQUEST, format_header_errs(&errs)).into_response();
+        }
+    }
+
     let mut cfg = match load_registry() {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -177,6 +215,13 @@ pub async fn update_provider(
     Path(id): Path<String>,
     Json(input): Json<AddProviderInput>,
 ) -> impl IntoResponse {
+    // 同 add_provider:保存前校验 extraHeaders 合法
+    if let Some(headers) = input.extra_headers.as_ref() {
+        if let Err(errs) = validate_extra_headers_input(headers) {
+            return err(StatusCode::BAD_REQUEST, format_header_errs(&errs)).into_response();
+        }
+    }
+
     let mut cfg = match load_registry() {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

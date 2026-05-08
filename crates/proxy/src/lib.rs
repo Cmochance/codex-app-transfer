@@ -16,6 +16,7 @@ pub mod forward;
 pub mod resolver;
 pub mod server;
 pub mod telemetry;
+pub mod validation;
 
 pub use forward::{forward_handler, ProxyState};
 pub use resolver::{
