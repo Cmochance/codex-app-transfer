@@ -84,9 +84,11 @@ pub(super) fn normalize_imported_provider(provider: &Value) -> Option<Value> {
     normalized
         .entry("authScheme")
         .or_insert_with(|| Value::String("bearer".into()));
+    // import_config 兜底:缺 apiFormat 字段(v1.x 备份 / 第三方手编 JSON)
+    // 一律落 "openai_chat",跟 schema serde default / add_provider 对齐。
     normalized
         .entry("apiFormat")
-        .or_insert_with(|| Value::String("responses".into()));
+        .or_insert_with(|| Value::String("openai_chat".into()));
     normalized
         .entry("apiKey")
         .or_insert_with(|| Value::String(String::new()));

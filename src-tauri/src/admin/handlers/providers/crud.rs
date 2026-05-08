@@ -161,13 +161,15 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
         "authScheme".into(),
         Value::String(input.auth_scheme.unwrap_or_else(|| "bearer".into())),
     );
+    // 未知值 / 缺失 → "openai_chat"(跟 schema serde default 一致)。
+    // 详见 normalize_provider_api_format / docs/refactor/admin-handlers.md。
     new_provider.insert(
         "apiFormat".into(),
         Value::String(
             input
                 .api_format
                 .filter(|s| matches!(s.as_str(), "openai_chat" | "responses"))
-                .unwrap_or_else(|| "responses".into()),
+                .unwrap_or_else(|| "openai_chat".into()),
         ),
     );
     new_provider.insert(
@@ -252,10 +254,11 @@ pub async fn update_provider(
         updated.insert("authScheme".into(), Value::String(auth_scheme));
     }
     if let Some(api_format) = input.api_format {
+        // 未知值 → "openai_chat" fallback,跟 add_provider / schema default 对齐。
         let normalized = if matches!(api_format.as_str(), "openai_chat" | "responses") {
             api_format
         } else {
-            "responses".to_owned()
+            "openai_chat".to_owned()
         };
         updated.insert("apiFormat".into(), Value::String(normalized));
     }

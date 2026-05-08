@@ -27,13 +27,18 @@ impl AdapterRegistry {
     }
 
     /// 按 `apiFormat` 字符串(已小写化)查 adapter。
-    /// 与 `backend/api_adapters.py::normalize_api_format` 行为对齐:
-    /// - `openai` / `openai_chat` / `chat_completions` → openai_chat
-    /// - `responses` / `openai_responses` → responses
-    /// - **`anthropic` / `claude` / `messages`**:Python 历史配置兼容值,在源
-    ///   码里被归一为 `responses`(并非 Anthropic Messages 协议入站,详见
-    ///   docs/refactor/migration.md 修订日志 2026-05-04 关于此项的说明)
-    /// - 未知值 fallback 到 `responses`(与 Python 默认 `responses` 一致)
+    ///
+    /// - `openai` / `openai_chat` / `chat_completions` → `openai_chat` adapter
+    /// - `responses` / `openai_responses` → `responses` adapter(协议转换层)
+    /// - **`anthropic` / `claude` / `messages`** Python 历史配置兼容值,归一到
+    ///   `responses` adapter(详见 docs/refactor/migration.md)
+    /// - **空 / 未知值 fallback 到 `openai_chat`**(跟 `Provider::api_format`
+    ///   schema serde default 一致):本项目核心是 chat ↔ responses 协议转换
+    ///   器,默认走 chat completions 转发更安全;客户端发 `/responses` 路径时
+    ///   `lookup_for_request` 仍会自动选 ResponsesAdapter 做转换。
+    ///
+    /// 注:Python 早期 backend 把空值 fallback 到 `responses`,造成 v1.x 的
+    /// 配置升级 bug(2026-05-08 实测 MiMo 直连上游 404)— 本方法已纠正。
     pub fn lookup(&self, api_format: &str) -> Arc<dyn Adapter> {
         let normalized = api_format.trim().to_ascii_lowercase().replace('-', "_");
         match normalized.as_str() {
@@ -41,8 +46,8 @@ impl AdapterRegistry {
             "responses" | "openai_responses" | "anthropic" | "claude" | "messages" => {
                 self.responses.clone()
             }
-            "" => self.responses.clone(), // Python 默认值
-            _ => self.responses.clone(),
+            // 空字符串 / 未知值 → 跟 schema default 一致,fallback openai_chat
+            _ => self.openai_chat.clone(),
         }
     }
 
@@ -135,10 +140,17 @@ mod tests {
     }
 
     #[test]
-    fn lookup_empty_or_unknown_falls_back_to_responses() {
+    fn lookup_empty_or_unknown_falls_back_to_openai_chat() {
+        // 关键回归(2026-05-08):空 / 未知值 fallback 到 openai_chat,跟
+        // Provider::api_format schema serde default 一致。早期 v1.x backend
+        // 把空值 fallback 到 responses,造成 Kimi/MiMo 配置升级时绕过代理 →
+        // 直连上游 → 404。修法见 docs/refactor/admin-handlers.md。
         let r = AdapterRegistry::with_builtins();
-        assert_eq!(r.lookup("").name(), "responses");
-        assert_eq!(r.lookup("unknown_format").name(), "responses");
+        assert_eq!(r.lookup("").name(), "openai_chat");
+        assert_eq!(r.lookup("unknown_format").name(), "openai_chat");
+        // 显式 responses / anthropic / claude / messages 仍走 responses adapter
+        assert_eq!(r.lookup("responses").name(), "responses");
+        assert_eq!(r.lookup("anthropic").name(), "responses");
     }
 
     #[test]

@@ -1,99 +1,349 @@
-//! 配置自愈:对 `isBuiltin=true` 但 `extra_headers` 字段缺失/为空的 provider,
-//! 从 `builtin_presets()` 同步补齐。
+//! 配置自愈:对**通过 baseUrl 命中 builtin preset** 的 provider,把"非用户
+//! 配置"字段强制覆盖为 `builtin_presets()` 的字面值。
 //!
-//! ## 历史背景(为什么需要这个)
+//! ## 策略变更(2026-05-08)
 //!
-//! v2.0.10 实测痛点:用户 Windows 上接 Kimi For Coding 一律 403
-//! `access_terminated_error`,macOS 同 API key 正常。根因调查发现 Windows 上
-//! `~/.codex-app-transfer/config.json` 里 Kimi Code provider 的 `extraHeaders`
-//! 是 `{}` 空对象 —— 运行时 `forward` 不注入 `User-Agent: KimiCLI/1.40.0`,
-//! Codex CLI 客户端的 `codex_cli_rs/...` UA 直接透传到 Kimi → 反爬识别非白名单
-//! client → 403。
+//! 早期 healing 只在 extras 缺失/空时补齐,且仅内存修改不写回磁盘 —— 但实测
+//! 发现 v1.x 老配置 / 用户手改 / 升级路径漏字段会导致一系列功能性 bug:
 //!
-//! 为什么 macOS 没事:用户在 macOS 上**编辑过**这条 Kimi(改过任意字段),
-//! 触发 frontend `presetMatchesProvider` 命中 → preset 的 `extraHeaders` 被
-//! 同步进 config.json。Windows 上从未编辑过,`extraHeaders` 一直是 `{}`。
+//! - **Kimi For Coding Windows 403**:`extraHeaders` 是空 `{}` → 不注入 KimiCLI UA
+//!   → Codex CLI 客户端 `codex_cli_rs/...` UA 透传 → Kimi 反爬 403
+//! - **MiMo Token Plan 404**:`apiFormat` 缺失/空 → 旧版 fallback `responses` →
+//!   apply 走 direct_provider → Codex CLI 直连 MiMo 上游 → MiMo 不支持 `/responses`
+//!   → 404,且整个请求**完全跳过我们代理**(零日志、零观测)
 //!
-//! 真正的根因是**老版本(v1.x)写入的 builtin provider 没有 extras 字段,
-//! 升级到新版后既不会自动补齐,也没有 UI 提示**。本模块在每次 load config
-//! 时做一次 healing pass,只在内存中补齐 extras,不写回磁盘(让用户的
-//! config.json 保持原样,避免跟 import/export 流程冲突)。
+//! 用户决定:**这些字段属于"不支持用户配置"的内部协议路由信号**,以后修这类
+//! 问题采取**直接覆盖用户旧配置的实际内容**,避免老残留 / 用户手改导致 bug。
+//!
+//! ## 识别规则(2026-05-08 v2 扩展)
+//!
+//! **早期版本只用 `isBuiltin=true && id == preset.id` 识别,但实测真机配置
+//! 全部 `isBuiltin=false`、id 是随机 hex,完全跳过 healing。** 改成:
+//!
+//! 1. 把 provider.baseUrl 经 [`normalize_base_url`] 规范化(去 scheme / 末尾
+//!    `/` / 末尾 `/v\d+` 版本后缀 / 大小写统一)
+//! 2. 把每个 preset 的 `baseUrl` 与 `baseUrlOptions[*].value` 同样规范化
+//! 3. 用户 normalized baseUrl 命中**任一** preset 的规范化集合 → 视作该 preset
+//!    的 provider,触发 healing
+//!
+//! ### 命中后做什么 / 不做什么
+//!
+//! 强制覆盖(`ENFORCED_BUILTIN_FIELDS`,以及 `isBuiltin = true`):
+//! - `apiFormat` —— 协议路由信号,决定 ResponsesAdapter / OpenaiChatAdapter 选择
+//! - `authScheme` —— `bearer` / `x-api-key` / `none`,鉴权方式由 preset 定
+//! - `extraHeaders` —— 反爬 UA 等 client 标识头,由 preset 内置
+//! - `isBuiltin` —— 命中即视作内置,UI 后续会防止用户改 baseUrl / authScheme
+//!
+//! 保留用户配置(**绝不动**):
+//! - `id` —— 改 id 会破坏 `activeProvider` 引用
+//! - `name` —— 用户可改显示名
+//! - `baseUrl` —— 用户可能选了 `baseUrlOptions` 里的备选集群(MiMo 的 sgp/ams
+//!   等),原样保留;preset 命中靠 normalize 后比对,不强制把 baseUrl 改回 preset 默认值
+//! - `apiKey` —— 用户的 API key,绝不能覆盖
+//! - `models` / `modelCapabilities` / `requestOptions` —— 用户可调
+//! - `sortIndex` —— 排序,用户可改
 
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::presets::builtin_presets;
 
-/// 对 `isBuiltin=true` 且 `extraHeaders` 缺失/空的 provider,从 builtin preset
-/// 同步补齐。**只在内存中改,不写回磁盘**。
+/// 必须强制覆盖为 builtin preset 字面值的字段(忽略用户编辑).
+/// 见模块头注 §"覆盖范围"小节.
+const ENFORCED_BUILTIN_FIELDS: &[&str] = &["apiFormat", "authScheme", "extraHeaders"];
+
+/// 对 cfg 里所有 **baseUrl 命中 builtin preset** 的 provider,把
+/// `ENFORCED_BUILTIN_FIELDS` 列出的字段(以及 `isBuiltin`)强制覆盖为对应
+/// builtin preset 的字面值。
 ///
-/// 触发条件(三者全部满足):
-/// 1. provider 的 `isBuiltin` 字段是 `true`
-/// 2. provider 的 `extraHeaders` 字段缺失,或值是空对象 `{}`
-/// 3. 同 id 的 builtin preset 里 `extraHeaders` 不为空
+/// **返回 `true`** 当且仅当有字段被实际修改(用于决定是否写回磁盘)。
 ///
-/// 用户已经自定义(extras 非空)的 provider **完全不动**,保留用户意图。
-pub fn heal_builtin_extra_headers(cfg: &mut Value) {
-    // 一次性收集所有 builtin preset 的 (id → extraHeaders),按 id O(1) 查找
-    let presets = builtin_presets();
-    let preset_extras_by_id: HashMap<String, Value> = presets
-        .iter()
-        .filter_map(|p| {
-            let id = p.get("id")?.as_str()?.to_owned();
-            let extras = p.get("extraHeaders")?;
-            // 只收集 extras 非空的 preset(空就没有补齐价值)
-            if extras.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
-                Some((id, extras.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if preset_extras_by_id.is_empty() {
-        return;
+/// 用户**不该自定义**这几个字段(它们是协议路由 / 反爬适配的内部信号)。
+/// 当前/历史的所有"用户手改 / 老版本残留导致的 bug"几乎都源于这几个字段被
+/// 改坏或缺失 —— 强制覆盖是最稳的根治方案。
+///
+/// 用户可定制的字段(`apiKey` / `baseUrl` / `models` / 等)**绝不动**;详见
+/// 模块头注 "命中后做什么 / 不做什么" 小节。
+pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
+    let presets_index = build_preset_index();
+    if presets_index.is_empty() {
+        return false;
     }
 
     let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) else {
-        return;
+        return false;
     };
 
+    let mut changed = false;
     for provider in providers.iter_mut() {
         let Some(obj) = provider.as_object_mut() else {
             continue;
         };
-        // 1) 只处理 isBuiltin=true(用户自建 provider 的 extras 是用户责任)
-        let is_builtin = obj
+        // 1. 拿 baseUrl,normalize 后查 preset
+        let base_url = obj
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let normalized = normalize_base_url(&base_url);
+        if normalized.is_empty() {
+            continue;
+        }
+        let Some(preset) = presets_index.get(&normalized) else {
+            continue;
+        };
+
+        // 2. isBuiltin → true(若不是)
+        let is_builtin_now = obj
             .get("isBuiltin")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if !is_builtin {
-            continue;
+        if !is_builtin_now {
+            obj.insert("isBuiltin".into(), Value::Bool(true));
+            changed = true;
         }
-        // 2) 只在 extraHeaders 缺失或空对象时补
-        let needs_heal = obj
-            .get("extraHeaders")
-            .and_then(|v| v.as_object())
-            .map(|o| o.is_empty())
-            .unwrap_or(true); // 字段缺失 / 类型不是 object → 也算 needs_heal
-        if !needs_heal {
-            continue;
+
+        // 3. ENFORCED_BUILTIN_FIELDS 强制覆盖为 preset 字面值。
+        //    特殊处理:preset 字面值是 `null`(serde_json::Value::Null)视作"未
+        //    指定"—— 不覆盖用户字段。多数 preset 把空 extraHeaders 写成 null
+        //    而用户配置写成 `{}`,行为等价但语义不同;不应该把用户的 `{}` 改成
+        //    `null`,反之亦然。
+        for field in ENFORCED_BUILTIN_FIELDS {
+            let preset_value = preset.get(*field).cloned();
+            let current_value = obj.get(*field).cloned();
+            let preset_specifies = !matches!(preset_value, None | Some(Value::Null));
+            if !preset_specifies {
+                continue;
+            }
+            let preset_value = preset_value.unwrap();
+            match current_value {
+                Some(c) if c == preset_value => {}
+                _ => {
+                    obj.insert((*field).to_owned(), preset_value);
+                    changed = true;
+                }
+            }
         }
-        // 3) 同 id preset 里 extras 非空才补
-        let Some(id) = obj.get("id").and_then(|v| v.as_str()).map(|s| s.to_owned()) else {
-            continue;
-        };
-        let Some(preset_extras) = preset_extras_by_id.get(&id) else {
-            continue;
-        };
-        obj.insert("extraHeaders".into(), preset_extras.clone());
     }
+    changed
+}
+
+/// 把 baseUrl 规范化为可比对的形式 —— 用于 healing 通过 baseUrl 反查 preset.
+///
+/// 处理:
+/// - trim
+/// - 大小写归一(全小写)
+/// - 去 `http://` / `https://` 前缀(scheme 不参与匹配,即 http→https 升级
+///   或反之均视作同一上游)
+/// - 去 query / fragment(`?...` / `#...`)
+/// - 去末尾 `/`
+/// - 去末尾 `/v\d+`(API 版本号,例如 `/v1` / `/v2` / `/v10`)—— 解决 preset
+///   写 `https://api.deepseek.com` 但用户配 `https://api.deepseek.com/v1` 的
+///   差异;**只 strip 一次**,避免 `https://api.kimi.com/coding/v1` 被错误地
+///   strip 成 `api.kimi.com`(应为 `api.kimi.com/coding`)
+/// - 末尾 `/v\d+` strip 后再 strip 一次末尾 `/`(以防 `/v1/` 形式)
+///
+/// 不做的事(故意保守):
+/// - 不识别 host 别名(`api.example.com` ≠ `api2.example.com`)
+/// - 不展开 path 中的 `/v\d+/`(只 strip 末尾)
+/// - 不识别端口(用户加端口会导致不命中,这是合理隔离)
+pub fn normalize_base_url(s: &str) -> String {
+    let mut t = s.trim().to_ascii_lowercase();
+    // strip query / fragment
+    if let Some(idx) = t.find(['?', '#']) {
+        t.truncate(idx);
+    }
+    // strip scheme
+    for prefix in ["https://", "http://"] {
+        if let Some(stripped) = t.strip_prefix(prefix) {
+            t = stripped.to_owned();
+            break;
+        }
+    }
+    // strip trailing `/`
+    while t.ends_with('/') {
+        t.pop();
+    }
+    // strip 末尾 `/v\d+`(只一次)
+    if let Some(stripped) = strip_trailing_version_segment(&t) {
+        t = stripped;
+        // 再去一次末尾 `/`(防 `/v1/` strip 后留空 path 末 `/`)
+        while t.ends_with('/') {
+            t.pop();
+        }
+    }
+    t
+}
+
+/// 若 `s` 末尾是 `/v\d+`(版本号 segment),返回去掉该 segment 的字符串;
+/// 否则返回 None。要求版本号至少 1 个数字。
+fn strip_trailing_version_segment(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut end = bytes.len();
+    // 末尾连续数字
+    let mut digits = 0usize;
+    while end > 0 && bytes[end - 1].is_ascii_digit() {
+        end -= 1;
+        digits += 1;
+    }
+    if digits == 0 {
+        return None;
+    }
+    // 数字前应是 `v`
+    if end == 0 || bytes[end - 1] != b'v' {
+        return None;
+    }
+    end -= 1;
+    // `v` 前应是 `/`
+    if end == 0 || bytes[end - 1] != b'/' {
+        return None;
+    }
+    end -= 1;
+    Some(s[..end].to_owned())
+}
+
+/// **向后兼容别名** —— 历史 API 名,保留供老调用方;新代码直接用
+/// `heal_builtin_provider_fields`。
+#[deprecated(
+    since = "2.0.11",
+    note = "use heal_builtin_provider_fields which covers more fields and reports changes"
+)]
+pub fn heal_builtin_extra_headers(cfg: &mut Value) {
+    heal_builtin_provider_fields(cfg);
+}
+
+/// 索引:normalized baseUrl → preset Map<String,Value>。
+///
+/// 一个 preset 通常贡献 1 条(baseUrl) + N 条(baseUrlOptions[*].value),
+/// 其中任一被用户使用都视作命中该 preset。如果两个 preset 在 normalize 后
+/// 撞到同一 key(理论上不该出现,因为不同上游的 host 不同),后写入的覆盖前者
+/// —— 这种冲突应在 preset 数据评审时拦截,运行时不做特殊处理。
+fn build_preset_index() -> HashMap<String, Map<String, Value>> {
+    let mut idx = HashMap::new();
+    for preset in builtin_presets().iter() {
+        let Some(obj) = preset.as_object() else {
+            continue;
+        };
+        // 1. preset.baseUrl
+        let mut urls: Vec<String> = Vec::new();
+        if let Some(u) = obj.get("baseUrl").and_then(|v| v.as_str()) {
+            urls.push(u.to_owned());
+        }
+        // 2. preset.baseUrlOptions[*].value
+        if let Some(opts) = obj.get("baseUrlOptions").and_then(|v| v.as_array()) {
+            for opt in opts {
+                if let Some(v) = opt.get("value").and_then(|v| v.as_str()) {
+                    urls.push(v.to_owned());
+                }
+            }
+        }
+        for url in urls {
+            let norm = normalize_base_url(&url);
+            if norm.is_empty() {
+                continue;
+            }
+            idx.insert(norm, obj.clone());
+        }
+    }
+    idx
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── normalize_base_url ───────────────────────────────────────────
+
+    #[test]
+    fn normalize_base_url_strips_scheme_and_trailing_slash() {
+        assert_eq!(
+            normalize_base_url("https://api.deepseek.com/"),
+            "api.deepseek.com"
+        );
+        assert_eq!(
+            normalize_base_url("http://api.deepseek.com"),
+            "api.deepseek.com"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_strips_trailing_v1_v2_v10() {
+        // /v1
+        assert_eq!(
+            normalize_base_url("https://api.moonshot.cn/v1"),
+            "api.moonshot.cn"
+        );
+        // /v1/
+        assert_eq!(
+            normalize_base_url("https://api.moonshot.cn/v1/"),
+            "api.moonshot.cn"
+        );
+        // /v2
+        assert_eq!(
+            normalize_base_url("https://api.deepseek.com/v2"),
+            "api.deepseek.com"
+        );
+        // /v10(多位数字)
+        assert_eq!(
+            normalize_base_url("https://api.example.com/v10"),
+            "api.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_keeps_path_before_version() {
+        // Kimi Code: 用户配 `https://api.kimi.com/coding/v1`,preset 也是
+        // `https://api.kimi.com/coding/v1` —— normalize 后都该是 `api.kimi.com/coding`
+        assert_eq!(
+            normalize_base_url("https://api.kimi.com/coding/v1"),
+            "api.kimi.com/coding"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.kimi.com/coding/v1/"),
+            "api.kimi.com/coding"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_only_strips_one_version_segment() {
+        // 防御:`/v1/v2`(理论不会出现)只 strip 末尾一次,留 `/v1`
+        assert_eq!(
+            normalize_base_url("https://api.example.com/v1/v2"),
+            "api.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_lowercases_and_strips_query() {
+        assert_eq!(
+            normalize_base_url("HTTPS://API.DeepSeek.COM/v1?x=1#anchor"),
+            "api.deepseek.com"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_does_not_strip_non_version_suffix() {
+        // `/chat` 不该被 strip(不是 v\d+ 形态)
+        assert_eq!(
+            normalize_base_url("https://api.example.com/chat"),
+            "api.example.com/chat"
+        );
+        // `/version1`(不是 `/v1` 边界)不 strip
+        assert_eq!(
+            normalize_base_url("https://api.example.com/version1"),
+            "api.example.com/version1"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_handles_empty_and_whitespace() {
+        assert_eq!(normalize_base_url(""), "");
+        assert_eq!(normalize_base_url("   "), "");
+    }
+
+    // ── heal_builtin_provider_fields ─────────────────────────────────
 
     #[test]
     fn fills_empty_extras_for_builtin_kimi_code() {
@@ -108,133 +358,253 @@ mod tests {
                 }
             ]
         });
-        heal_builtin_extra_headers(&mut cfg);
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(changed, "应当报告有改动");
         let extras = &cfg["providers"][0]["extraHeaders"];
-        assert!(
-            extras.as_object().map(|o| !o.is_empty()).unwrap_or(false),
-            "Kimi Code 的 extraHeaders 应被自动补齐,实际: {extras}"
-        );
         assert_eq!(
             extras["User-Agent"], "KimiCLI/1.40.0",
-            "应补 KimiCLI 的 User-Agent"
+            "Kimi Code 的 KimiCLI UA 应被强制写入"
         );
     }
 
     #[test]
-    fn fills_missing_extras_field_for_builtin() {
+    fn heals_user_built_provider_when_baseurl_matches_preset() {
+        // 关键回归(2026-05-08):真机配置里所有 builtin-类 provider 都
+        // `isBuiltin=false`、id 是随机 hex —— 老识别规则 (id == preset.id)
+        // 完全跳过 healing。新规则:baseUrl 命中 preset → 强制 healing 并把
+        // isBuiltin 设为 true。
         let mut cfg = json!({
             "providers": [
                 {
-                    "id": "kimi-code",
+                    "id": "b405e7b0",                                  // 随机 hex,不在 preset.id 列表
                     "name": "Kimi Code",
-                    "baseUrl": "https://api.kimi.com/coding/v1",
-                    "isBuiltin": true
+                    "baseUrl": "https://api.kimi.com/coding/v1",       // 命中 kimi-code preset.baseUrl
+                    "isBuiltin": false,                                // 老配置遗留
+                    "apiFormat": "openai_chat",
+                    "extraHeaders": {}                                 // 反爬 UA 缺失 → Windows 403 root cause
                 }
             ]
         });
-        heal_builtin_extra_headers(&mut cfg);
-        assert!(
-            cfg["providers"][0]
-                .get("extraHeaders")
-                .and_then(|v| v.as_object())
-                .map(|o| !o.is_empty())
-                .unwrap_or(false),
-            "extraHeaders 字段缺失也应被补齐"
-        );
-    }
-
-    #[test]
-    fn does_not_overwrite_user_customized_extras() {
-        let user_value = "MyCustomAgent/2.0";
-        let mut cfg = json!({
-            "providers": [
-                {
-                    "id": "kimi-code",
-                    "isBuiltin": true,
-                    "extraHeaders": { "User-Agent": user_value }
-                }
-            ]
-        });
-        heal_builtin_extra_headers(&mut cfg);
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(changed);
+        let p = &cfg["providers"][0];
         assert_eq!(
-            cfg["providers"][0]["extraHeaders"]["User-Agent"], user_value,
-            "用户自定义的 extras **绝不**被覆盖,即使 preset 里有不同的值"
+            p["isBuiltin"],
+            json!(true),
+            "命中 preset → isBuiltin 应被设为 true"
+        );
+        assert_eq!(p["id"], "b405e7b0", "id 不动(避免破坏 activeProvider 引用)");
+        assert_eq!(p["extraHeaders"]["User-Agent"], "KimiCLI/1.40.0");
+    }
+
+    #[test]
+    fn heals_via_baseurl_options_alternate_cluster() {
+        // MiMo Token Plan:preset.baseUrl 是 cn 集群,但 baseUrlOptions 包含 sgp/ams
+        // 用户选了 sgp 集群 → normalize 后命中 baseUrlOptions → 触发 healing,
+        // 但 baseUrl 本身**不被改回 cn**(用户的集群选择保留)。
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "b863a67c",
+                    "name": "Xiaomi MiMo (Token Plan)",
+                    "baseUrl": "https://token-plan-sgp.xiaomimimo.com/v1",
+                    "isBuiltin": false,
+                    "apiFormat": "responses"   // 错误值,需被覆盖回 preset 的 openai_chat
+                }
+            ]
+        });
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(changed);
+        let p = &cfg["providers"][0];
+        assert_eq!(p["apiFormat"], "openai_chat");
+        assert_eq!(p["isBuiltin"], json!(true));
+        assert_eq!(
+            p["baseUrl"], "https://token-plan-sgp.xiaomimimo.com/v1",
+            "baseUrl 应保留用户的 sgp 集群选择,不被改回 preset 默认 cn"
         );
     }
 
     #[test]
-    fn does_not_touch_non_builtin_providers() {
+    fn forces_apiformat_override_even_if_user_edited_to_bogus_value() {
+        // 关键回归(2026-05-08 MiMo 404):用户手改把 apiFormat 改成 "responses"
+        // → apply 跳过代理直连上游 → 404
+        // 新策略:命中 preset 即强制覆盖,不管用户改成了什么。
         let mut cfg = json!({
             "providers": [
                 {
-                    "id": "kimi-code", // 同 id 但 isBuiltin=false → 当作用户自建,不动
-                    "isBuiltin": false,
+                    "id": "xiaomi-mimo-token-plan",
+                    "name": "Xiaomi MiMo (Token Plan)",
+                    "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
+                    "isBuiltin": true,
+                    "apiFormat": "responses",
                     "extraHeaders": {}
                 }
             ]
         });
-        heal_builtin_extra_headers(&mut cfg);
-        assert!(
-            cfg["providers"][0]["extraHeaders"]
-                .as_object()
-                .unwrap()
-                .is_empty(),
-            "非 builtin provider 的空 extras 不应被自动填充"
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(changed);
+        assert_eq!(
+            cfg["providers"][0]["apiFormat"], "openai_chat",
+            "MiMo apiFormat 必须被强制覆盖回 preset 的 openai_chat"
         );
     }
 
     #[test]
-    fn no_op_when_preset_id_not_in_builtin_list() {
+    fn forces_authscheme_override() {
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "kimi-code",
+                    "baseUrl": "https://api.kimi.com/coding/v1",
+                    "isBuiltin": true,
+                    "authScheme": "none"
+                }
+            ]
+        });
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(changed);
+        assert_eq!(cfg["providers"][0]["authScheme"], "bearer");
+    }
+
+    #[test]
+    fn does_not_touch_truly_user_built_provider() {
+        // 真正的用户自建 provider(baseUrl 不命中任何 preset)绝不动
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "mock-provider",
+                    "name": "My Reverse Proxy",
+                    "baseUrl": "http://127.0.0.1:29090",   // 不在任何 preset 的 baseUrl 集合里
+                    "isBuiltin": false,
+                    "apiFormat": "responses",
+                    "extraHeaders": {}
+                }
+            ]
+        });
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(!changed, "baseUrl 未命中 preset → 视作用户自建,不动");
+        assert_eq!(cfg["providers"][0]["apiFormat"], "responses");
+        assert_eq!(cfg["providers"][0]["isBuiltin"], json!(false));
+    }
+
+    #[test]
+    fn does_not_touch_user_apikey_or_baseurl_or_models() {
+        // 用户可定制字段绝不能被 healing 覆盖
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "xiaomi-mimo-token-plan",
+                    "name": "My MiMo",
+                    "baseUrl": "https://token-plan-sgp.xiaomimimo.com/v1",  // 命中 sgp 集群
+                    "isBuiltin": true,
+                    "apiKey": "sk-user-custom-key",
+                    "models": {"default": "user-overridden-model"},
+                    "modelCapabilities": {"foo": {"context_window": 12345}},
+                    "apiFormat": "openai_chat",
+                    "extraHeaders": {"User-Agent": "Test/1.0"}  // 强制覆盖时会被替换
+                }
+            ]
+        });
+        let _ = heal_builtin_provider_fields(&mut cfg);
+        let p = &cfg["providers"][0];
+        assert_eq!(p["apiKey"], "sk-user-custom-key", "apiKey 绝不动");
+        assert_eq!(p["name"], "My MiMo", "name 绝不动(用户自定义显示名)");
+        assert_eq!(
+            p["baseUrl"], "https://token-plan-sgp.xiaomimimo.com/v1",
+            "baseUrl 绝不动(支持 baseUrlOptions 选择)"
+        );
+        assert_eq!(
+            p["models"]["default"], "user-overridden-model",
+            "models 绝不动"
+        );
+        assert_eq!(p["modelCapabilities"]["foo"]["context_window"], 12345);
+    }
+
+    #[test]
+    fn no_op_when_already_aligned_with_preset() {
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "kimi-code",
+                    "baseUrl": "https://api.kimi.com/coding/v1",
+                    "isBuiltin": true,
+                    "apiFormat": "openai_chat",
+                    "authScheme": "bearer",
+                    "extraHeaders": {"User-Agent": "KimiCLI/1.40.0"}
+                }
+            ]
+        });
+        assert!(
+            !heal_builtin_provider_fields(&mut cfg),
+            "字段已与 preset 一致 → 不改"
+        );
+    }
+
+    #[test]
+    fn no_op_when_baseurl_does_not_match_any_preset() {
         let mut cfg = json!({
             "providers": [
                 {
                     "id": "totally-unknown-id",
-                    "isBuiltin": true,
-                    "extraHeaders": {}
+                    "name": "Random",
+                    "baseUrl": "https://my-private-llm.example.org/api",
+                    "isBuiltin": true,                  // 即使 isBuiltin=true,baseUrl 不命中 → 不视作 builtin
+                    "apiFormat": "responses"
                 }
             ]
         });
-        heal_builtin_extra_headers(&mut cfg);
-        assert!(
-            cfg["providers"][0]["extraHeaders"]
-                .as_object()
-                .unwrap()
-                .is_empty(),
-            "id 不在 builtin presets 里时,什么都不做"
+        assert!(!heal_builtin_provider_fields(&mut cfg));
+        assert_eq!(
+            cfg["providers"][0]["apiFormat"], "responses",
+            "baseUrl 未命中 preset → 字段不动(用户用了自有反代)"
         );
+    }
+
+    #[test]
+    fn handles_missing_baseurl_gracefully() {
+        // 配置损坏:provider 没 baseUrl → 跳过,不报错
+        let mut cfg = json!({
+            "providers": [
+                {"id": "broken", "isBuiltin": true, "apiFormat": "responses"}
+            ]
+        });
+        assert!(!heal_builtin_provider_fields(&mut cfg));
     }
 
     #[test]
     fn handles_missing_providers_array_gracefully() {
         let mut cfg = json!({"version": "1.0.4"});
-        heal_builtin_extra_headers(&mut cfg);
-        assert!(
-            cfg.get("providers").is_none(),
-            "不应额外创建 providers 字段"
-        );
+        assert!(!heal_builtin_provider_fields(&mut cfg));
     }
 
     #[test]
     fn heals_multiple_providers_in_one_pass() {
+        // 模拟用户真机:5 个 builtin-类 + 1 个真自建,id 都是随机 hex,
+        // isBuiltin 全 false,只看 baseUrl 命中。
         let mut cfg = json!({
             "providers": [
-                {"id": "kimi-code", "isBuiltin": true, "extraHeaders": {}},
-                {"id": "user-custom", "isBuiltin": false, "extraHeaders": {}},
-                {"id": "kimi-code", "isBuiltin": true} // 字段都缺
+                {"id": "h1", "name": "Kimi Code", "baseUrl": "https://api.kimi.com/coding/v1", "isBuiltin": false, "apiFormat": "responses", "extraHeaders": {}},
+                {"id": "h2", "name": "DeepSeek",  "baseUrl": "https://api.deepseek.com/v1",    "isBuiltin": false},
+                {"id": "h3", "name": "Mock",      "baseUrl": "http://127.0.0.1:29090",         "isBuiltin": false, "apiFormat": "responses"}
             ]
         });
-        heal_builtin_extra_headers(&mut cfg);
-        assert!(!cfg["providers"][0]["extraHeaders"]
-            .as_object()
-            .unwrap()
-            .is_empty());
-        assert!(cfg["providers"][1]["extraHeaders"]
-            .as_object()
-            .unwrap()
-            .is_empty()); // 用户自建不动
-        assert!(!cfg["providers"][2]["extraHeaders"]
-            .as_object()
-            .unwrap()
-            .is_empty());
+        assert!(heal_builtin_provider_fields(&mut cfg));
+        // h1 Kimi Code 命中 preset → apiFormat 强制覆盖回 openai_chat
+        assert_eq!(cfg["providers"][0]["apiFormat"], "openai_chat");
+        assert_eq!(cfg["providers"][0]["isBuiltin"], json!(true));
+        assert_eq!(
+            cfg["providers"][0]["extraHeaders"]["User-Agent"],
+            "KimiCLI/1.40.0"
+        );
+        // h2 DeepSeek 命中 preset(/v1 后缀已 normalize)→ isBuiltin 设为 true,
+        // apiFormat 写入 preset 字面值 openai_chat
+        assert_eq!(cfg["providers"][1]["apiFormat"], "openai_chat");
+        assert_eq!(cfg["providers"][1]["isBuiltin"], json!(true));
+        // h3 Mock(localhost)未命中任何 preset → 不动
+        assert_eq!(
+            cfg["providers"][2]["apiFormat"], "responses",
+            "真用户自建(baseUrl 不命中)绝不动"
+        );
+        assert_eq!(cfg["providers"][2]["isBuiltin"], json!(false));
     }
 }

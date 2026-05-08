@@ -49,7 +49,7 @@
       id: provider.id,
       name: provider.name,
       baseUrl: provider.baseUrl,
-      apiFormat: ['openai', 'openai_chat'].includes(provider.apiFormat) ? 'openai_chat' : (provider.apiFormat || 'responses'),
+      apiFormat: ['openai', 'openai_chat'].includes(provider.apiFormat) ? 'openai_chat' : (provider.apiFormat || 'openai_chat'),
       authScheme: provider.authScheme || 'bearer',
       hasApiKey: !!provider.hasApiKey,
       extraHeaders: provider.extraHeaders || {},
@@ -74,7 +74,11 @@
       name: payload.name,
       baseUrl: payload.baseUrl,
       authScheme: payload.authScheme || 'bearer',
-      apiFormat: ['OpenAI', 'openai', 'openai_chat'].includes(payload.apiFormat) ? 'openai_chat' : 'responses',
+      // 未知值 / 缺失 → "openai_chat" fallback(跟后端 normalize_provider_api_format 对齐)。
+      // 历史 v1.x 这里 fallback 是 "responses",造成 MiMo / 老配置升级时绕过代理 → 404。
+      apiFormat: ['responses', 'openai_responses', 'anthropic', 'claude', 'messages'].includes(payload.apiFormat)
+        ? 'responses'
+        : 'openai_chat',
       extraHeaders: payload.extraHeaders || {},
       modelCapabilities: payload.modelCapabilities || {},
       requestOptions: payload.requestOptions || {},
@@ -127,7 +131,9 @@
         id: p.id,
         name: p.name,
         baseUrl: p.baseUrl,
-        apiFormat: ['openai', 'openai_chat'].includes(p.apiFormat) ? 'OpenAI' : 'Responses',
+        // 显示标签:仅显式 responses 系列才显示 "Responses",其它(含未知 / 缺失)显示 "OpenAI",
+        // 跟后端 normalize 行为对齐。当前 7 个 builtin preset 全部 openai_chat。
+        apiFormat: ['responses', 'openai_responses', 'anthropic', 'claude', 'messages'].includes(p.apiFormat) ? 'Responses' : 'OpenAI',
         authScheme: p.authScheme || 'bearer',
         models: p.models || {},
         modelOptions: p.modelOptions || {},

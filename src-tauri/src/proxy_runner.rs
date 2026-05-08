@@ -167,13 +167,14 @@ fn load_resolver_snapshot() -> Result<ResolverSnapshot, String> {
         );
     }
     let s = std::fs::read_to_string(&path).map_err(|e| format!("读取 config.json 失败: {e}"))?;
-    // 先 raw Value 解析 + healing(给老配置补 builtin extras),再转 typed Config。
-    // healing 仅内存级,不写回磁盘。详见 registry::healing 模块说明 — 解决
-    // 老版本(v1.x)写入的 builtin provider 没有 extras 字段、升级到新版后
-    // 既不会自动补也没 UI 提示导致的运行时 UA / 反爬 bug(实测 Kimi Windows 403)。
+    // 先 raw Value 解析 + healing(强制覆盖 builtin provider 的 apiFormat /
+    // authScheme / extraHeaders),再转 typed Config。proxy 这条路径**不写回
+    // 磁盘**(避免与 admin 路径写盘竞争),仅在内存中保证当前 resolver 拿到
+    // 修过的配置;真正的盘写入由 admin/registry_io.rs::load 在用户打开应用
+    // 时触发。详见 registry::healing 模块说明。
     let mut raw: serde_json::Value =
         serde_json::from_str(&s).map_err(|e| format!("解析 config.json 失败: {e}"))?;
-    codex_app_transfer_registry::heal_builtin_extra_headers(&mut raw);
+    codex_app_transfer_registry::heal_builtin_provider_fields(&mut raw);
     let cfg: Config =
         serde_json::from_value(raw).map_err(|e| format!("config.json schema 不匹配: {e}"))?;
     if cfg.providers.is_empty() {

@@ -1,7 +1,7 @@
 //! 用户注册表 (~/.codex-app-transfer/config.json) 读写助手.
 
 use codex_app_transfer_registry::{
-    config_file, heal_builtin_extra_headers, load_raw_config, save_raw_config, RawConfig,
+    config_file, heal_builtin_provider_fields, load_raw_config, save_raw_config, RawConfig,
 };
 use serde_json::{json, Value};
 
@@ -27,10 +27,19 @@ pub fn load() -> Result<RawConfig, String> {
         }));
     }
     let mut cfg = load_raw_config(&path).map_err(|e| format!("读取 config.json 失败: {e}"))?;
-    // 自愈 isBuiltin provider 缺 extras 的存量配置(如 v1.x 写入的 Kimi Code
-    // 没 KimiCLI UA → forward 透 codex_cli_rs UA → Kimi 反爬 403)。仅内存
-    // 修补,不写回磁盘 — 让 import/export round-trip 仍是用户原文件。
-    heal_builtin_extra_headers(&mut cfg);
+    // 强制覆盖 builtin provider 的"非用户配置"字段(apiFormat / authScheme /
+    // extraHeaders) — 详见 codex_app_transfer_registry::healing 模块说明。
+    // 老版本(v1.x)写入或用户手改可能让这些字段不对(空字符串 / "responses" /
+    // 缺失等),触发 MiMo 404 / Kimi 403 等绕过代理的功能性 bug。
+    //
+    // 策略:有改动 → **写回磁盘**(2026-05-08 用户确认:这类内部协议路由信号
+    // 不支持用户自定义,直接覆盖磁盘旧配置,以后不再因残留而出错)。
+    if heal_builtin_provider_fields(&mut cfg) {
+        // 写回失败不致命:内存里 heal 过的版本仍可用,下次启动再尝试同步盘
+        if let Err(e) = save_raw_config(&path, &cfg) {
+            eprintln!("warning: heal 后写回 config.json 失败(本次启动仍用内存修补): {e}");
+        }
+    }
     Ok(cfg)
 }
 

@@ -34,9 +34,8 @@ use super::super::registry_io::{load as load_registry, save as save_registry};
 use super::super::state::AdminState;
 use super::common::{active_provider_name, err, read_setting_bool, APP_VERSION};
 use super::providers::{
-    active_provider, clean_base_url, normalize_provider_api_format, provider_api_key,
-    provider_default_model, provider_display_name, provider_index, provider_model_capabilities,
-    provider_model_mappings, provider_supports_1m,
+    active_provider, provider_default_model, provider_display_name, provider_index,
+    provider_model_capabilities, provider_model_mappings, provider_supports_1m,
 };
 use super::proxy::{ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed};
 
@@ -278,27 +277,23 @@ fn desktop_config_target_for_provider(
     proxy_port_override: Option<u16>,
 ) -> DesktopConfigTarget {
     let proxy_port = proxy_port_override.unwrap_or_else(|| read_proxy_port(cfg));
-    let api_format =
-        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
-    let requires_proxy = api_format != "responses";
-    let (base_url, api_key, mode) = if requires_proxy {
-        (
-            format!("http://127.0.0.1:{proxy_port}"),
-            ensure_gateway_key(cfg),
-            "local_proxy",
-        )
-    } else {
-        (
-            clean_base_url(
-                provider
-                    .get("baseUrl")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(""),
-            ),
-            provider_api_key(provider),
-            "direct_provider",
-        )
-    };
+    // 永远走代理:本项目核心是 Responses ↔ Chat Completions 协议转换 + extras 注入 +
+    // model 改写 + vision 剥离等。当前没有任何合理 provider 真要 Codex CLI 直连
+    // 上游(直连 = 跳过所有代理价值,且第三方上游普遍不支持 OpenAI Responses API
+    // 端点 → 必 404)。
+    //
+    // 历史 v1.x / v2.0.x 早期曾用 `apiFormat == "responses"` 当 "上游原生 Responses"
+    // 信号 → 走 direct_provider 跳过代理。但 ResponsesAdapter 实际语义是"客户端
+    // 发 Responses 我们做转换",与"上游原生 Responses"完全不同。误判会让
+    // Codex CLI 直接打第三方上游的 /responses 端点(MiMo / Kimi / DeepSeek 等
+    // 都不支持)→ 用户看到 404 但**完全跳过了我们代理**(总请求计数为 0,
+    // 无诊断观测)。
+    //
+    // 未来若真有"上游原生 Responses 透传"需求(如 OpenAI 官方),应加显式
+    // `provider.bypass_proxy: bool` 字段 opt-in,而不是用 apiFormat 隐式信号。
+    let base_url = format!("http://127.0.0.1:{proxy_port}");
+    let api_key = ensure_gateway_key(cfg);
+    let mode = "local_proxy";
     DesktopConfigTarget {
         base_url,
         api_key,
@@ -307,7 +302,7 @@ fn desktop_config_target_for_provider(
         default_model: provider_default_model(provider),
         model_mappings: provider_model_mappings(provider),
         model_capabilities: provider_model_capabilities(provider),
-        requires_proxy,
+        requires_proxy: true,
         mode,
         proxy_port,
     }
@@ -864,27 +859,40 @@ mod tests {
             proxy_target.api_key
         );
 
-        let mut direct_cfg = config_with_secret();
-        direct_cfg["gatewayApiKey"] = Value::Null;
-        let direct_provider = json!({
+        // 关键回归(2026-05-08):desktop_config_target_for_provider 现在永远走
+        // local_proxy。历史 v1.x 用 `apiFormat == "responses"` 当 "上游原生
+        // Responses 透传" 信号 → direct_provider,但 ResponsesAdapter 实际是
+        // 协议**转换器**(Responses → Chat),direct 路径让 Codex CLI 直连
+        // 第三方上游 /responses → 必 404(实测 MiMo)。修法:删 direct 分支,
+        // 所有 provider 都走 local_proxy。详见 desktop.rs::desktop_config_target_for_provider 注释。
+        let mut formerly_direct_cfg = config_with_secret();
+        formerly_direct_cfg["gatewayApiKey"] = Value::Null;
+        let formerly_direct_provider = json!({
             "id": "direct",
             "name": "Direct Provider",
             "baseUrl": "https://direct.example.com/v1/",
             "authScheme": "bearer",
-            "apiFormat": "responses",
+            "apiFormat": "responses",  // 即使配 "responses" 也仍走 local_proxy
             "apiKey": "sk-direct",
             "models": {"default": "direct-model"},
         });
-        let direct_target =
-            desktop_config_target_for_provider(&mut direct_cfg, &direct_provider, Some(19090));
-        assert_eq!(direct_target.mode, "direct_provider");
-        assert!(!direct_target.requires_proxy);
-        assert_eq!(direct_target.base_url, "https://direct.example.com/v1");
-        assert_eq!(direct_target.api_key, "sk-direct");
-        assert!(direct_cfg
+        let target = desktop_config_target_for_provider(
+            &mut formerly_direct_cfg,
+            &formerly_direct_provider,
+            Some(19090),
+        );
+        assert_eq!(
+            target.mode, "local_proxy",
+            "永远走代理,不再有 direct_provider 分支"
+        );
+        assert!(target.requires_proxy);
+        assert_eq!(target.base_url, "http://127.0.0.1:19090");
+        // ensure_gateway_key 应当生成 / 复用 gateway key 给 Codex CLI 用
+        assert!(!target.api_key.is_empty());
+        assert!(formerly_direct_cfg
             .get("gatewayApiKey")
             .and_then(|v| v.as_str())
-            .is_none());
+            .is_some_and(|s| !s.is_empty()));
     }
 
     #[test]
@@ -960,7 +968,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_switch_syncs_desktop_without_proxy_for_direct_provider() {
+    fn provider_switch_syncs_desktop_via_local_proxy_even_when_apiformat_is_responses() {
+        // 关键回归(2026-05-08):无论 provider 配 apiFormat="responses" 与否,
+        // 切换默认 provider + 同步 desktop 都必须把 Codex CLI 指向本地代理 ——
+        // ResponsesAdapter 是协议**转换器**,不是"原生 Responses 透传",历史
+        // direct_provider 分支会让 Codex CLI 直连第三方 /responses 触发 404
+        // (实测 MiMo/小米 token-plan)。详见 desktop_config_target_for_provider 注释。
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -969,13 +982,16 @@ mod tests {
         with_isolated_home(|home| {
             runtime.block_on(async {
                 let mut cfg = config_with_secret();
+                // 让 OS 自选空闲端口,避免与并发其它测试用 18080 冲突
+                cfg["settings"]["proxyPort"] = json!(0);
                 cfg["providers"] = json!([
                     cfg["providers"][0].clone(),
                     {
                         "id": "p2",
-                        "name": "Direct Provider",
+                        "name": "Formerly-Direct Provider",
                         "baseUrl": "https://direct.example.com/v1/",
                         "authScheme": "bearer",
+                        // 即使配 "responses" 也仍走 local_proxy(协议转换由代理本地完成)
                         "apiFormat": "responses",
                         "apiKey": "sk-direct",
                         "models": {"default": "direct-model"},
@@ -989,18 +1005,37 @@ mod tests {
                 let result = switch_provider_and_sync(Arc::clone(&manager), "p2".to_owned()).await;
                 assert_eq!(result["success"], json!(true));
                 assert_eq!(result["desktopSync"]["success"], json!(true));
-                assert_eq!(result["desktopSync"]["mode"], json!("direct_provider"));
-                assert_eq!(result["desktopSync"]["requiresProxy"], json!(false));
-                assert!(!manager.status().running);
+                assert_eq!(result["desktopSync"]["mode"], json!("local_proxy"));
+                assert_eq!(result["desktopSync"]["requiresProxy"], json!(true));
+                // sync_desktop_for_active_provider 在 requires_proxy 时会启动代理
+                assert!(
+                    manager.status().running,
+                    "永远走 local_proxy → 代理必须被启动"
+                );
 
                 let saved = load_registry().unwrap();
                 assert_eq!(saved["activeProvider"], json!("p2"));
-                let config_toml = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
-                assert!(config_toml.contains("openai_base_url = \"https://direct.example.com/v1\""));
-                let auth_json: Value =
-                    serde_json::from_str(&fs::read_to_string(home.join(".codex").join("auth.json")).unwrap())
-                        .unwrap();
-                assert_eq!(auth_json["OPENAI_API_KEY"], json!("sk-direct"));
+                // Codex CLI 指向本地代理,不再是上游 baseUrl
+                let config_toml =
+                    fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+                assert!(
+                    config_toml.contains("openai_base_url = \"http://127.0.0.1:"),
+                    "config.toml 必须指向本地代理,实际:\n{config_toml}"
+                );
+                assert!(
+                    !config_toml.contains("direct.example.com"),
+                    "禁止把上游 URL 写进 Codex CLI 配置(会绕过代理):\n{config_toml}"
+                );
+                // auth.json 写的是 gateway key 而不是 provider apiKey
+                let auth_json: Value = serde_json::from_str(
+                    &fs::read_to_string(home.join(".codex").join("auth.json")).unwrap(),
+                )
+                .unwrap();
+                let api_key = auth_json["OPENAI_API_KEY"].as_str().unwrap_or_default();
+                assert_ne!(api_key, "sk-direct", "auth.json 不该写 provider apiKey");
+                assert!(!api_key.is_empty(), "auth.json 必须有 gateway key");
+
+                manager.stop_silent();
             });
         });
     }

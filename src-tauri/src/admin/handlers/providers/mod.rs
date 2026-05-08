@@ -90,6 +90,16 @@ pub(super) fn provider_display_name(provider: &Value) -> String {
         .to_owned()
 }
 
+/// 把 `provider.apiFormat` 字段的字面值规范化成两个枚举之一:
+/// `"openai_chat"` / `"responses"`。
+///
+/// **未知值 / 缺失 fallback 到 `"openai_chat"`**(跟 `Provider::api_format`
+/// schema serde default 一致),这是项目的核心默认行为:**所有 provider 默认
+/// 走代理,代理负责 chat ↔ responses 协议转换 + extras 注入 + model 改写**。
+///
+/// `apiFormat == "responses"` 表示客户端可能发 Responses 风格协议,我们用
+/// `ResponsesAdapter` 在代理层做协议转换 —— **不是**"上游原生 Responses 透传"
+/// (历史 v1.x 误读)。`anthropic` / `claude` / `messages` 同理走 ResponsesAdapter。
 pub(super) fn normalize_provider_api_format(api_format: Option<&str>) -> &'static str {
     match api_format
         .unwrap_or("")
@@ -97,8 +107,10 @@ pub(super) fn normalize_provider_api_format(api_format: Option<&str>) -> &'stati
         .to_ascii_lowercase()
         .as_str()
     {
-        "openai" | "openai_chat" | "chat_completions" => "openai_chat",
-        _ => "responses",
+        "responses" | "openai_responses" | "anthropic" | "claude" | "messages" => "responses",
+        // openai / openai_chat / chat_completions / 空字符串 / 未知值
+        // → 一律走 "openai_chat" — 跟 schema serde default 一致
+        _ => "openai_chat",
     }
 }
 
