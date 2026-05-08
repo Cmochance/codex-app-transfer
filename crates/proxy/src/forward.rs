@@ -101,6 +101,33 @@ impl axum::response::IntoResponse for ForwardError {
         telemetry
             .logs
             .add("ERROR", format!("代理请求失败: {message}"));
+
+        // PreviousResponseNotFound 单独走 OpenAI SDK-compatible JSON 错误体,
+        // 字面对齐 OpenAI Responses API 服务端真实行为(LM Studio bug tracker
+        // #1188、Microsoft semantic-kernel #13128 等多源验证)。这样 SDK 的
+        // OpenAI error handler、Codex CLI 等客户端都能走标准 invalid_request
+        // 路径,而不会把它当作非结构化错误重试。**英文**对齐 SDK 错误处理。
+        if let ForwardError::Adapter(AdapterError::PreviousResponseNotFound {
+            previous_response_id,
+        }) = &self
+        {
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "Previous response with id '{previous_response_id}' not found."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "previous_response_id",
+                    "code": "previous_response_not_found",
+                }
+            });
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json; charset=utf-8")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+        }
+
         let (status, body) = match &self {
             ForwardError::Resolve(re) => (re.status(), format!("proxy resolve error: {re}")),
             ForwardError::Adapter(ae) => (
@@ -591,6 +618,47 @@ fn filter_hop_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn previous_response_not_found_renders_openai_sdk_compatible_400() {
+        // 关键回归(2026-05-08):cache miss + empty input 路径返回的错误体
+        // 必须**字面对齐 OpenAI Responses API 服务端真实行为**(LM Studio bug
+        // tracker #1188、Microsoft semantic-kernel #13128 等多源验证):
+        // HTTP 400 + content-type application/json + body 严格匹配下面四个字段。
+        // 客户端 SDK / Codex CLI fail-fast 路径依赖此格式;改字段名 = 破坏 SDK。
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let err = ForwardError::Adapter(AdapterError::PreviousResponseNotFound {
+            previous_response_id: "resp_abc123".to_owned(),
+        });
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            ctype.starts_with("application/json"),
+            "content-type 必须是 JSON,实际 {ctype}"
+        );
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("body 必须是合法 JSON");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "previous_response_not_found");
+        assert_eq!(body["error"]["param"], "previous_response_id");
+        // message 必须包含 ID,客户端 SDK 据此提取 ID 决定是否重发完整 history
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("resp_abc123"),
+            "error.message 必须包含失效的 response_id,实际 {message}"
+        );
+        assert!(
+            message.starts_with("Previous response with id"),
+            "措辞对齐 OpenAI 服务端,实际 {message}"
+        );
+    }
 
     #[test]
     fn hop_headers_recognized() {

@@ -67,7 +67,10 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
 
     // messages: instructions(优先,作为 system 头) + input 展开;如果存在
     // previous_response_id 且 session cache 命中,先恢复历史再追加本轮 input。
-    let mut messages = build_messages_from_input(input, session_cache);
+    // **cache miss + input 空** → build_messages_from_input 返回
+    // PreviousResponseNotFound,proxy 层 IntoResponse 会转成标准 OpenAI 400
+    // (`code: "previous_response_not_found"`)让 Codex CLI fail-fast。
+    let mut messages = build_messages_from_input(input, session_cache)?;
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -96,13 +99,16 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         strip_image_blocks_in_place(&mut messages);
     }
 
-    // 空 messages 处理:Codex CLI 偶尔会带 previous_response_id + input=[]
-    // 续轮(代理刚重启 session_cache 冷启动 / 心跳类轮询 / 上次会话被清)。
-    // **不**主动 fail-fast,实测会持续阻塞 Kimi 对话(2026-05-06 现场:
-    // proxy 自身 BadRequest 比上游 400 更难让 Codex CLI 走重试路径)。
-    // 改为透传:发空 messages 给上游,让上游回原生 4xx,Codex CLI 按内置
-    // 重试策略覆盖。此时**仍写 messages 字段**(空数组),避免上游报
-    // "missing field messages" 之类二级错误。
+    // 历史定位(2026-05-06 → 2026-05-08):
+    // - 早期:cache miss + input 空 → 代理层主动 BadRequest 拒绝
+    // - 中期:改为放行 messages:[] 给上游,期望 Codex 重试 4xx
+    // - 实测:Codex CLI `codex-rs/codex-client/src/retry.rs` 对 400 fail-fast,
+    //   只对 5xx 与 transport timeout 重试 → 放行后上游 19s+ 才 400,且 Codex
+    //   无法重置 session,延迟分钟级
+    // 现行(2026-05-08+):cache miss + input 空 → 上层 build_messages_from_input
+    // 返回 `PreviousResponseNotFound`,proxy IntoResponse 转标准 OpenAI 400
+    // (`code: "previous_response_not_found"`),与 OpenAI 服务端真实行为对齐。
+    // 此处不再有"messages 为空"分支:进到这里 messages 必非空。
     let session_messages = messages.clone();
     result.insert("messages".into(), Value::Array(messages));
 
@@ -228,7 +234,7 @@ fn response_id_for_session() -> String {
 fn build_messages_from_input(
     body: &Value,
     session_cache: Option<&ResponseSessionCache>,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, AdapterError> {
     let mut messages: Vec<Value> = Vec::new();
     if let Some(msg) = body
         .get("instructions")
@@ -249,29 +255,44 @@ fn build_messages_from_input(
 
     if !previous_response_id.is_empty() {
         if let Some(cache) = session_cache {
-            let merged = cache.build_messages_with_history(previous_response_id, &current_messages);
-            let history_has_system = merged.iter().any(|msg| {
-                matches!(
-                    msg.get("role").and_then(|v| v.as_str()),
-                    Some("system" | "developer")
-                )
-            });
-            if history_has_system
-                && messages
-                    .first()
-                    .and_then(|msg| msg.get("role"))
-                    .and_then(|v| v.as_str())
-                    == Some("system")
-            {
-                messages.remove(0);
+            // 命中 → 拼历史 + 当前输入;Miss + 当前输入也空 → 报
+            // PreviousResponseNotFound 让上层返回标准 OpenAI 400。
+            // (单纯 Miss + 当前输入有内容仍走"忽略 previous_response_id 只
+            // 发当前输入"的旧降级逻辑,避免改变 cache miss 但 input 非空的
+            // 既有行为。)
+            if let Some(history) = cache.get(previous_response_id) {
+                let history_has_system = history.iter().any(|msg| {
+                    matches!(
+                        msg.get("role").and_then(|v| v.as_str()),
+                        Some("system" | "developer")
+                    )
+                });
+                if history_has_system
+                    && messages
+                        .first()
+                        .and_then(|msg| msg.get("role"))
+                        .and_then(|v| v.as_str())
+                        == Some("system")
+                {
+                    messages.remove(0);
+                }
+                messages.extend(history);
+                messages.extend(current_messages);
+                return Ok(messages);
             }
-            messages.extend(merged);
-            return messages;
+            // cache miss
+            if current_messages.is_empty() {
+                return Err(AdapterError::PreviousResponseNotFound {
+                    previous_response_id: previous_response_id.to_owned(),
+                });
+            }
+            // miss 但 input 非空 → 降级,丢 previous_response_id 只用 input
+            // (保留既有行为,避免无 cache 时的纯新对话误报)
         }
     }
 
     messages.extend(current_messages);
-    messages
+    Ok(messages)
 }
 
 fn build_instructions_message(instructions: &Value) -> Option<Value> {
@@ -2233,15 +2254,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_with_no_session_history_passes_through_with_empty_messages() {
-        // Codex CLI 续轮:input 空 + previous_response_id 在 session_cache 未命中
-        // (代理刚重启 / 上次 session 被清 / 心跳轮询 etc)。
-        //
-        // **不再 fail-fast**(2026-05-06 实测:proxy 自己 BadRequest 比上游
-        // 400 更难触发 Codex CLI 内置重试路径,导致 Kimi 对话被持续阻塞)。
-        // 现在透传空 messages 给上游,上游回原生 4xx,Codex CLI 按它自己的
-        // 重试逻辑覆盖。**仍**写 messages 字段(空数组),避免上游报"missing
-        // field messages"之类二级错误。
+    fn empty_input_no_session_cache_helper_returns_empty_messages() {
+        // 底层 helper `responses_body_to_chat_body`(不传 session_cache)的契约:
+        // 没有 session_cache 时,根本不进 cache 查询路径,纯按当前 input 拼;
+        // input 空就空 — 这条路径只服务于工具/测试场景,生产代理永远传
+        // `Some(global_response_session_cache())`,见生产路径测试。
         let req = json!({
             "model": "x",
             "stream": true,
@@ -2249,9 +2266,60 @@ mod tests {
             "tools": [{"type":"function","name":"shell","parameters":{"type":"object"}}],
             "input": []
         });
-        let out = responses_body_to_chat_body(&req).expect("不再 fail-fast,应当通过");
+        let out = responses_body_to_chat_body(&req).expect("无 session_cache 路径不报错");
         let msgs = out["messages"].as_array().expect("messages 字段必须存在");
-        assert!(msgs.is_empty(), "messages 应是空数组,留给上游决定如何处理");
+        assert!(msgs.is_empty(), "无 session_cache 时纯按 input 拼");
+    }
+
+    #[test]
+    fn cache_miss_with_empty_input_returns_previous_response_not_found() {
+        // 关键回归(2026-05-08):生产路径(传 session_cache),Codex CLI 用旧
+        // previous_response_id 续轮(代理重启 / TTL 过期 / LRU 淘汰),但当前
+        // input 为空 → 没有任何上下文可发上游 → 返回 OpenAI 标准
+        // PreviousResponseNotFound,proxy IntoResponse 转 HTTP 400 +
+        // `code: "previous_response_not_found"`,Codex CLI fail-fast 不重试。
+        //
+        // 历史:2026-05-06 ~ 2026-05-08 期间代码放行 messages:[] 给上游想触发
+        // Codex 重试,但实测 Codex CLI `should_retry` 对 400 直接 fail-fast
+        // (`codex-rs/codex-client/src/retry.rs`),只对 5xx + transport timeout
+        // 重试 → 旧策略既不能修复,又额外引入上游 RTT(实测 Kimi 19s+)。
+        let cache = ResponseSessionCache::new(8, std::time::Duration::from_secs(60));
+        let req = json!({
+            "model": "x",
+            "stream": true,
+            "previous_response_id": "resp_unknown_to_cache",
+            "input": []
+        });
+        let err = responses_body_to_chat_body_for_provider_with_session(&req, None, Some(&cache))
+            .err()
+            .expect("cache miss + empty input 必须报错");
+        match err {
+            AdapterError::PreviousResponseNotFound {
+                previous_response_id,
+            } => {
+                assert_eq!(previous_response_id, "resp_unknown_to_cache");
+            }
+            other => panic!("预期 PreviousResponseNotFound,实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_miss_with_nonempty_input_falls_back_to_current_only() {
+        // cache miss 但 input 非空 → 保留旧降级:丢 previous_response_id,只用
+        // 当前 input。这条路径不报错(模型可能丢上下文,但至少能继续对话),
+        // 跟 PreviousResponseNotFound 路径区分清楚。
+        let cache = ResponseSessionCache::new(8, std::time::Duration::from_secs(60));
+        let req = json!({
+            "model": "x",
+            "stream": true,
+            "previous_response_id": "resp_unknown_to_cache",
+            "input": [{"type":"message","role":"user","content":"hi"}]
+        });
+        let out = responses_body_to_chat_body_for_provider_with_session(&req, None, Some(&cache))
+            .expect("cache miss 但 input 非空 → 降级,不报错");
+        let msgs = out.body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
     }
 
     #[test]

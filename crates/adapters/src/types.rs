@@ -20,6 +20,16 @@ pub enum AdapterError {
     BodyDecode(#[from] serde_json::Error),
     #[error("internal: {0}")]
     Internal(String),
+    /// `previous_response_id` 在 session cache 未命中,且当前 input 不足以
+    /// 独立构成完整对话(messages 为空)。对齐 OpenAI Responses API 服务端
+    /// 真实行为(LM Studio bug tracker #1188、Microsoft semantic-kernel #13128
+    /// 等多源验证):返回 HTTP 400 + `code: "previous_response_not_found"`。
+    ///
+    /// proxy 层 IntoResponse 会把它转成 SDK 兼容的标准 OpenAI 错误体,Codex
+    /// CLI 看到 400 立即 fail-fast(不会进 5xx / transport timeout 重试路径),
+    /// 把延迟从分钟级降到秒级。
+    #[error("previous_response_not_found: {previous_response_id}")]
+    PreviousResponseNotFound { previous_response_id: String },
 }
 
 /// 单次请求经过 adapter 后,proxy 拿到的"出站计划".
