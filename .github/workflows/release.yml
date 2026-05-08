@@ -363,5 +363,10 @@ jobs:
           files: 'release/*'
           tag_name: v${{ steps.ver.outputs.version }}
           name: v${{ steps.ver.outputs.version }}
-          generate_release_notes: true
+          # **不**让 GitHub 自动追加 What's Changed PR 列表 footer ——
+          # 我们手写的中英 release notes 已含 `## 主线改动` / `## Mainline
+          # changes`,自动追加段会跟它**完全重复**(2026-05-08 v2.0.10 / v2.0.11
+          # 都踩过这个,用户报"什么有两遍",见 memory feedback_release_notes_template)。
+          # 之后用 `gh release edit --notes-file` 提交完整 body,这里发的是空 notes。
+          generate_release_notes: false
           draft: true
