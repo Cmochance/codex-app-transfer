@@ -56,14 +56,18 @@ impl FeedbackThrottle {
             let elapsed = now.saturating_duration_since(last_success);
             if elapsed < Self::SUCCESS_COOLDOWN {
                 let wait = Self::SUCCESS_COOLDOWN.saturating_sub(elapsed).as_secs();
-                return Err(format!("刚提交成功,请等 {wait} 秒后再发新反馈"));
+                return Err(format!(
+                    "just submitted; wait {wait}s before sending another feedback"
+                ));
             }
         }
 
         if let Some(until) = inner.failure_cooldown_until {
             if now < until {
                 let wait = until.saturating_duration_since(now).as_secs();
-                return Err(format!("连续提交失败次数过多,请等 {wait} 秒后再试"));
+                return Err(format!(
+                    "too many consecutive failures; wait {wait}s before retrying"
+                ));
             }
         }
 
@@ -102,7 +106,7 @@ pub(super) fn feedback_throttle() -> &'static FeedbackThrottle {
 pub(super) fn feedback_worker_url(raw: &str) -> Result<&str, String> {
     let url = raw.trim();
     if url.is_empty() {
-        Err("反馈服务未配置".to_owned())
+        Err("feedback service is not configured".to_owned())
     } else {
         Ok(url)
     }
@@ -219,7 +223,7 @@ pub(super) async fn submit_feedback_with_body(
 
     let input = match serde_json::from_slice::<Value>(&body) {
         Ok(input) => input,
-        Err(_) => return err(StatusCode::BAD_REQUEST, "请求体非 JSON").into_response(),
+        Err(_) => return err(StatusCode::BAD_REQUEST, "request body is not JSON").into_response(),
     };
 
     let title = input
@@ -239,7 +243,7 @@ pub(super) async fn submit_feedback_with_body(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     if body_text.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "请填写描述").into_response();
+        return err(StatusCode::BAD_REQUEST, "description is required").into_response();
     }
 
     let worker_url = match feedback_worker_url(worker_url) {
@@ -308,7 +312,11 @@ pub(super) async fn submit_feedback_with_body(
         Ok(client) => client,
         Err(e) => {
             throttle.record_failure();
-            return err(StatusCode::BAD_GATEWAY, format!("反馈服务暂不可用:{e}")).into_response();
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("feedback service unavailable: {e}"),
+            )
+            .into_response();
         }
     };
 
@@ -316,7 +324,11 @@ pub(super) async fn submit_feedback_with_body(
         Ok(response) => response,
         Err(e) => {
             throttle.record_failure();
-            return err(StatusCode::BAD_GATEWAY, format!("反馈服务暂不可用:{e}")).into_response();
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("feedback service unavailable: {e}"),
+            )
+            .into_response();
         }
     };
     let status = response.status();
@@ -344,7 +356,7 @@ pub(super) async fn submit_feedback_with_body(
             .get("error")
             .or_else(|| data.get("message"))
             .and_then(|v| v.as_str())
-            .unwrap_or("上游错误");
+            .unwrap_or("upstream error");
         return err(status_code, message).into_response();
     }
 
@@ -353,7 +365,7 @@ pub(super) async fn submit_feedback_with_body(
     Json(json!({
         "success": true,
         "id": id,
-        "message": format!("反馈已收到 (ID: {id})"),
+        "message": format!("feedback received (ID: {id})"),
         "email_sent": data.get("email_sent").and_then(|v| v.as_bool()).unwrap_or(false),
     }))
     .into_response()
@@ -372,7 +384,7 @@ mod tests {
         let throttle = FeedbackThrottle::new();
         assert!(throttle.acquire().is_ok());
         throttle.record_success();
-        assert!(throttle.acquire().unwrap_err().contains("刚提交成功"));
+        assert!(throttle.acquire().unwrap_err().contains("just submitted"));
 
         let throttle = FeedbackThrottle::new();
         for _ in 0..FeedbackThrottle::FAILURE_LIMIT {
@@ -381,7 +393,7 @@ mod tests {
         assert!(throttle
             .acquire()
             .unwrap_err()
-            .contains("连续提交失败次数过多"));
+            .contains("too many consecutive failures"));
     }
 
     #[test]
@@ -541,7 +553,7 @@ mod tests {
                 .await
                 .unwrap();
             let data: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(data["message"], json!("请求体非 JSON"));
+            assert_eq!(data["message"], json!("request body is not JSON"));
 
             let throttle = FeedbackThrottle::new();
             let response = submit_feedback_with_body(
@@ -555,7 +567,7 @@ mod tests {
                 .await
                 .unwrap();
             let data: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(data["message"], json!("请填写描述"));
+            assert_eq!(data["message"], json!("description is required"));
 
             let throttle = FeedbackThrottle::new();
             let response = submit_feedback_with_body(
@@ -569,7 +581,7 @@ mod tests {
                 .await
                 .unwrap();
             let data: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(data["message"], json!("反馈服务未配置"));
+            assert_eq!(data["message"], json!("feedback service is not configured"));
 
             let app = Router::new().route(
                 "/feedback",

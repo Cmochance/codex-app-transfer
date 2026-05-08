@@ -207,7 +207,7 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
         Err(error) => {
             return json!({
                 "success": false,
-                "message": "无法自动获取模型列表",
+                "message": "cannot auto-fetch model list",
                 "models": [],
                 "suggested": {},
                 "errors": [format!("client: {}", provider_test_error_label(&error))],
@@ -250,7 +250,7 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
     let start = errors.len().saturating_sub(5);
     json!({
         "success": false,
-        "message": "无法自动获取模型列表",
+        "message": "cannot auto-fetch model list",
         "models": [],
         "suggested": {},
         "errors": errors[start..].to_vec(),
@@ -275,7 +275,7 @@ pub async fn fetch_provider_models(Path(id): Path<String>) -> impl IntoResponse 
             })
         });
     let Some(provider) = provider else {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
     };
     let result = fetch_provider_models_impl(provider).await;
     let status = if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
@@ -302,7 +302,7 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
     let Some(idx) = provider_index(&cfg, &id) else {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
     };
     let provider = cfg
         .get("providers")
@@ -331,7 +331,7 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
         "models": result.get("models").cloned().unwrap_or_else(|| json!([])),
         "suggested": suggested,
         "endpoint": result.get("endpoint").cloned().unwrap_or(Value::Null),
-        "message": "模型映射已自动填充",
+        "message": "model mappings auto-filled",
     }))
     .into_response()
 }

@@ -43,7 +43,7 @@ pub(super) fn open_directory(path: &PathBuf) -> Result<(), String> {
     command
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("无法打开日志目录: {e}"))
+        .map_err(|e| format!("cannot open log directory: {e}"))
 }
 
 pub(super) fn active_provider_name(config: &Value) -> String {

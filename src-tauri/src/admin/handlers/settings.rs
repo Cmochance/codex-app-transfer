@@ -22,7 +22,7 @@ pub(super) fn ensure_settings_object(cfg: &mut RawConfig) -> &mut serde_json::Ma
 }
 
 pub(super) fn app_config_dir() -> Result<PathBuf, String> {
-    config_dir().ok_or_else(|| "无法定位用户配置目录".to_owned())
+    config_dir().ok_or_else(|| "cannot locate user config directory".to_owned())
 }
 
 pub(super) fn app_config_file() -> Result<PathBuf, String> {
@@ -114,7 +114,7 @@ pub(super) fn normalize_imported_provider(provider: &Value) -> Option<Value> {
 pub(super) fn normalize_imported_config(data: &Value) -> Result<Value, String> {
     let root = data
         .as_object()
-        .ok_or_else(|| "配置文件必须是 JSON 对象".to_owned())?;
+        .ok_or_else(|| "config file must be a JSON object".to_owned())?;
     let source = root
         .get("config")
         .and_then(|v| v.as_object())
@@ -122,7 +122,7 @@ pub(super) fn normalize_imported_config(data: &Value) -> Result<Value, String> {
         .unwrap_or_else(|| data.clone());
     let source_obj = source
         .as_object()
-        .ok_or_else(|| "配置文件必须是 JSON 对象".to_owned())?;
+        .ok_or_else(|| "config file must be a JSON object".to_owned())?;
 
     let mut normalized = default_config_value();
     {
@@ -290,7 +290,7 @@ pub(super) fn preserve_existing_provider_secrets(imported: &mut Value, current: 
 
 pub(super) fn create_config_backup(reason: &str) -> Result<Value, String> {
     let backup_dir = app_backup_dir()?;
-    fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    fs::create_dir_all(&backup_dir).map_err(|e| format!("create backup directory failed: {e}"))?;
     let config_file = app_config_file()?;
     if !config_file.exists() {
         let cfg = load_registry()?;
@@ -314,8 +314,8 @@ pub(super) fn create_config_backup(reason: &str) -> Result<Value, String> {
         random_hex(2)
     );
     let target = backup_dir.join(&filename);
-    fs::copy(&config_file, &target).map_err(|e| format!("复制配置备份失败: {e}"))?;
-    let stat = fs::metadata(&target).map_err(|e| format!("读取备份元数据失败: {e}"))?;
+    fs::copy(&config_file, &target).map_err(|e| format!("copy config backup failed: {e}"))?;
+    let stat = fs::metadata(&target).map_err(|e| format!("read backup metadata failed: {e}"))?;
     Ok(json!({
         "name": filename,
         "size": stat.len(),
@@ -325,9 +325,10 @@ pub(super) fn create_config_backup(reason: &str) -> Result<Value, String> {
 
 pub(super) fn list_config_backups() -> Result<Vec<Value>, String> {
     let backup_dir = app_backup_dir()?;
-    fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    fs::create_dir_all(&backup_dir).map_err(|e| format!("create backup directory failed: {e}"))?;
     let mut backups = Vec::new();
-    let entries = fs::read_dir(&backup_dir).map_err(|e| format!("读取备份目录失败: {e}"))?;
+    let entries =
+        fs::read_dir(&backup_dir).map_err(|e| format!("read backup directory failed: {e}"))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|v| v.to_str()) != Some("json") || !path.is_file() {
@@ -426,7 +427,7 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
     }
     Json(json!({
         "success": true,
-        "message": "配置已导入",
+        "message": "config imported",
         "backup": backup,
     }))
     .into_response()

@@ -72,10 +72,10 @@ impl ProxyManager {
         let snapshot = load_resolver_snapshot()?;
         let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
             .await
-            .map_err(|e| format!("绑定 127.0.0.1:{port} 失败: {e}"))?;
+            .map_err(|e| format!("bind 127.0.0.1:{port} failed: {e}"))?;
         let addr = listener
             .local_addr()
-            .map_err(|e| format!("无法读取 listener 地址: {e}"))?;
+            .map_err(|e| format!("cannot read listener address: {e}"))?;
         let router = build_router(Arc::new(snapshot.resolver));
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -98,7 +98,7 @@ impl ProxyManager {
         if guard.is_some() {
             // race condition,自己的 listener 让出去:发 shutdown 给自己再报错
             let _ = new_handle.shutdown_tx.send(());
-            return Err("代理已被其它路径启动".to_owned());
+            return Err("proxy already started by another path".to_owned());
         }
         *guard = Some(new_handle);
         Ok(ProxyStatus {
@@ -119,7 +119,7 @@ impl ProxyManager {
                 let _ = h.shutdown_tx.send(());
                 Ok(())
             }
-            None => Err("代理未在运行".to_owned()),
+            None => Err("proxy is not running".to_owned()),
         }
     }
 
@@ -160,25 +160,25 @@ struct ResolverSnapshot {
 }
 
 fn load_resolver_snapshot() -> Result<ResolverSnapshot, String> {
-    let path = config_file().ok_or_else(|| "无法定位配置目录".to_owned())?;
+    let path = config_file().ok_or_else(|| "cannot locate config directory".to_owned())?;
     if !path.exists() {
         return Err(
-            "配置文件 ~/.codex-app-transfer/config.json 不存在;请先到「提供商」页添加".to_owned(),
+            "config file ~/.codex-app-transfer/config.json does not exist; add a provider on the Providers page first".to_owned(),
         );
     }
-    let s = std::fs::read_to_string(&path).map_err(|e| format!("读取 config.json 失败: {e}"))?;
+    let s = std::fs::read_to_string(&path).map_err(|e| format!("read config.json failed: {e}"))?;
     // 先 raw Value 解析 + healing(强制覆盖 builtin provider 的 apiFormat /
     // authScheme / extraHeaders),再转 typed Config。proxy 这条路径**不写回
     // 磁盘**(避免与 admin 路径写盘竞争),仅在内存中保证当前 resolver 拿到
     // 修过的配置;真正的盘写入由 admin/registry_io.rs::load 在用户打开应用
     // 时触发。详见 registry::healing 模块说明。
     let mut raw: serde_json::Value =
-        serde_json::from_str(&s).map_err(|e| format!("解析 config.json 失败: {e}"))?;
+        serde_json::from_str(&s).map_err(|e| format!("parse config.json failed: {e}"))?;
     codex_app_transfer_registry::heal_builtin_provider_fields(&mut raw);
     let cfg: Config =
-        serde_json::from_value(raw).map_err(|e| format!("config.json schema 不匹配: {e}"))?;
+        serde_json::from_value(raw).map_err(|e| format!("config.json schema mismatch: {e}"))?;
     if cfg.providers.is_empty() {
-        return Err("当前没有任何 provider,请先添加".to_owned());
+        return Err("no providers configured; add one first".to_owned());
     }
     let gateway_key = cfg.gateway_api_key.filter(|s| !s.is_empty());
     let gateway_auth = gateway_key.is_some();

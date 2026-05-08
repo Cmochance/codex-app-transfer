@@ -6,7 +6,7 @@ use codex_app_transfer_registry::{
 use serde_json::{json, Value};
 
 pub fn load() -> Result<RawConfig, String> {
-    let path = config_file().ok_or_else(|| "无法定位用户配置目录".to_owned())?;
+    let path = config_file().ok_or_else(|| "cannot locate user config directory".to_owned())?;
     if !path.exists() {
         return Ok(json!({
             "version": "1.0.4",
@@ -26,7 +26,7 @@ pub fn load() -> Result<RawConfig, String> {
             }
         }));
     }
-    let mut cfg = load_raw_config(&path).map_err(|e| format!("读取 config.json 失败: {e}"))?;
+    let mut cfg = load_raw_config(&path).map_err(|e| format!("read config.json failed: {e}"))?;
     // 强制覆盖 builtin provider 的"非用户配置"字段(apiFormat / authScheme /
     // extraHeaders) — 详见 codex_app_transfer_registry::healing 模块说明。
     // 老版本(v1.x)写入或用户手改可能让这些字段不对(空字符串 / "responses" /
@@ -37,15 +37,15 @@ pub fn load() -> Result<RawConfig, String> {
     if heal_builtin_provider_fields(&mut cfg) {
         // 写回失败不致命:内存里 heal 过的版本仍可用,下次启动再尝试同步盘
         if let Err(e) = save_raw_config(&path, &cfg) {
-            eprintln!("warning: heal 后写回 config.json 失败(本次启动仍用内存修补): {e}");
+            eprintln!("warning: write back config.json after heal failed (in-memory healed version still in effect for this session): {e}");
         }
     }
     Ok(cfg)
 }
 
 pub fn save(cfg: &RawConfig) -> Result<(), String> {
-    let path = config_file().ok_or_else(|| "无法定位用户配置目录".to_owned())?;
-    save_raw_config(&path, cfg).map_err(|e| format!("写入 config.json 失败: {e}"))
+    let path = config_file().ok_or_else(|| "cannot locate user config directory".to_owned())?;
+    save_raw_config(&path, cfg).map_err(|e| format!("write config.json failed: {e}"))
 }
 
 /// Mask provider 给前端展示:apiKey 字段去除,extraHeaders 清空(可能含敏感

@@ -201,14 +201,14 @@ impl ProviderResolver for StaticResolver {
                 (Err(e), _) => telemetry.logs.add(
                     "WARN",
                     format!(
-                        "跳过 extraHeader provider={} {k:?}: 头名非法 ({e})",
+                        "skip extraHeader provider={} {k:?}: header name invalid ({e})",
                         provider.id
                     ),
                 ),
                 (_, Err(e)) => telemetry.logs.add(
                     "WARN",
                     format!(
-                        "跳过 extraHeader provider={} {k:?}: 头值非法 ({e}),检查 api_key 是否含换行/非 ASCII",
+                        "skip extraHeader provider={} {k:?}: header value invalid ({e}); check api_key for newlines / non-ASCII",
                         provider.id
                     ),
                 ),

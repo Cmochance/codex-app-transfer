@@ -163,14 +163,14 @@ fn normalize_balance_payload(kind: &str, payload: &Value) -> Vec<Value> {
 
 async fn query_provider_usage_impl(provider: &Value) -> Value {
     if provider_api_key(provider).is_empty() {
-        return json!({"success": false, "message": "请先保存 API Key"});
+        return json!({"success": false, "message": "save the API key first"});
     }
     let Some((kind, endpoint)) = balance_endpoint(provider) else {
         return json!({
             "success": true,
             "supported": false,
             "items": [],
-            "message": "这个提供商暂未适配余额/用量接口",
+            "message": "balance / usage endpoint is not implemented for this provider yet",
         });
     };
 
@@ -187,7 +187,7 @@ async fn query_provider_usage_impl(provider: &Value) -> Value {
                 "success": true,
                 "supported": true,
                 "ok": false,
-                "message": format!("查询失败：{}", provider_test_error_label(&error)),
+                "message": format!("query failed: {}", provider_test_error_label(&error)),
                 "items": [],
             });
         }
@@ -199,7 +199,7 @@ async fn query_provider_usage_impl(provider: &Value) -> Value {
                 "success": true,
                 "supported": true,
                 "ok": false,
-                "message": format!("查询失败：{}", provider_test_error_label(&error)),
+                "message": format!("query failed: {}", provider_test_error_label(&error)),
                 "items": [],
             });
         }
@@ -210,7 +210,7 @@ async fn query_provider_usage_impl(provider: &Value) -> Value {
             "supported": true,
             "ok": false,
             "statusCode": response.status().as_u16(),
-            "message": format!("余额接口返回 HTTP {}", response.status().as_u16()),
+            "message": format!("balance endpoint returned HTTP {}", response.status().as_u16()),
             "items": [],
         });
     }
@@ -221,7 +221,7 @@ async fn query_provider_usage_impl(provider: &Value) -> Value {
                 "success": true,
                 "supported": true,
                 "ok": false,
-                "message": "余额接口返回了非 JSON 响应",
+                "message": "balance endpoint returned a non-JSON response",
                 "items": [],
             });
         }
@@ -229,9 +229,9 @@ async fn query_provider_usage_impl(provider: &Value) -> Value {
     let items = normalize_balance_payload(kind, &payload);
     let ok = !items.is_empty();
     let message = if ok {
-        "查询完成"
+        "query complete"
     } else {
-        "余额接口响应中未识别到余额字段"
+        "balance endpoint response did not contain a recognizable balance field"
     };
     json!({
         "success": true,
@@ -261,7 +261,7 @@ pub async fn query_provider_usage(Path(id): Path<String>) -> impl IntoResponse {
             })
         });
     let Some(provider) = provider else {
-        return err(StatusCode::NOT_FOUND, "提供商不存在").into_response();
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
     };
     let result = query_provider_usage_impl(provider).await;
     Json(result).into_response()
@@ -285,7 +285,7 @@ mod tests {
             });
             let result = query_provider_usage_impl(&no_key).await;
             assert_eq!(result["success"], json!(false));
-            assert_eq!(result["message"], json!("请先保存 API Key"));
+            assert_eq!(result["message"], json!("save the API key first"));
 
             let unsupported = json!({
                 "name": "Unknown",

@@ -180,10 +180,10 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
 }
 
 fn build_tray_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Menu<R>> {
-    let mut providers = SubmenuBuilder::new(manager, "切换提供商");
+    let mut providers = SubmenuBuilder::new(manager, "Switch provider");
     let entries = tray_provider_entries();
     if entries.is_empty() {
-        providers = providers.text("provider:none", "暂无提供商");
+        providers = providers.text("provider:none", "No providers");
     } else {
         for entry in entries {
             let label = if entry.active {
@@ -196,12 +196,12 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Menu
     }
     let providers = providers.build()?;
     MenuBuilder::new(manager)
-        .text("show", "显示主窗口")
-        .text("hide", "隐藏主窗口")
+        .text("show", "Show window")
+        .text("hide", "Hide window")
         .separator()
         .item(&providers)
         .separator()
-        .text("quit", "退出 Codex App Transfer")
+        .text("quit", "Quit Codex App Transfer")
         .build()
 }
 
