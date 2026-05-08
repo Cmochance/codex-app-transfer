@@ -487,7 +487,7 @@
             <div class="guide-card guide-card-static">
               <i class="bi bi-speedometer2"></i>
               <h3 data-i18n="guide.tsSpeedTitle">测速 / 兼容性失败?</h3>
-              <p data-i18n="guide.tsSpeedText">如果测速失败,可能是默认选择了 <strong>responses</strong> 协议。编辑该 provider,将 API 协议切到 <strong>chat/completions</strong> 后重新测试。Kimi / DeepSeek / 智谱 / 百炼 / Xiaomi MiMo 官方接口都用 chat/completions。</p>
+              <p data-i18n="guide.tsSpeedText">如果测速失败,先确认 baseUrl 与 API Key 对得上。v2.0.10 起所有 provider 的 API 协议默认 <strong>chat/completions</strong>,内置预设(Kimi / Kimi Code / DeepSeek / 智谱 / 百炼 / Xiaomi MiMo)在加载时按 baseUrl 自动命中并强制写回预设字面值,无需手动切。自建反代(baseUrl 不命中任何预设)请保持 chat/completions;仅当上游明确实现 OpenAI Responses API 时才选 responses。</p>
             </div>
           </div>
         </section>
