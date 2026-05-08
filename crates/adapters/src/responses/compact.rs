@@ -160,19 +160,49 @@ pub(super) fn build_compact_chat_request(
     let parsed: Value = serde_json::from_slice(body_bytes)
         .map_err(|e| AdapterError::BadRequest(format!("compact body 不是合法 JSON: {e}")))?;
     let model = parsed.get("model").cloned().unwrap_or(Value::Null);
-    let mut input = parsed
-        .get("input")
-        .cloned()
-        .unwrap_or(Value::Array(Vec::new()));
+    let raw_input = parsed.get("input").cloned();
 
-    // A2:把 SUMMARIZATION_PROMPT 作为最后一条 user message append 到 input
-    if let Some(arr) = input.as_array_mut() {
-        arr.push(json!({
-            "type": "message",
-            "role": "user",
-            "content": COMPACT_SUMMARIZATION_PROMPT,
-        }));
-    }
+    // A2:把 SUMMARIZATION_PROMPT 作为最后一条 user message append 到 input。
+    // 必须**先 normalize input 为 array**才能可靠 append —— `extract_input_items`
+    // (`responses/request.rs:376`)接受 Null / String / Object / Array 多种形式,
+    // 实际客户端 body 也可能是 string/object(非典型但合法)。如果只 match
+    // array 路径,non-array input 时会**完全丢失 prompt**,上游收到无 summary
+    // 指令的请求,返回任意 chat 内容而不是 summary —— PR #71 codex review 报
+    // 的 P2 隐患(2026-05-08)。
+    let mut input_array: Vec<Value> = match raw_input {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => arr,
+        Some(Value::String(s)) => {
+            if s.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": s,
+                })]
+            }
+        }
+        Some(obj @ Value::Object(_)) => {
+            // 已是 single item object(可能是带 type 的 input item,也可能是
+            // {role,content} 形式),直接当 array[0]
+            vec![obj]
+        }
+        Some(other) => {
+            // bool / number 等非典型形式,toString 包成 user message 兜底
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": other.to_string(),
+            })]
+        }
+    };
+    input_array.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": COMPACT_SUMMARIZATION_PROMPT,
+    }));
+    let input = Value::Array(input_array);
 
     let mut synthetic_responses_body = json!({
         "model": model,
@@ -468,6 +498,82 @@ mod tests {
                 && m["content"].as_str().unwrap_or("").contains("world")));
         // stream 字段不带(false 在 chat body 转换里会被丢)
         assert!(parsed.get("stream").is_none() || parsed["stream"] == false);
+    }
+
+    #[test]
+    fn build_compact_chat_request_injects_prompt_when_input_is_string() {
+        // 关键回归(2026-05-08 codex review P2):input 不一定是 array,
+        // 也可能是 string / object / null / 缺失。**所有形式都必须确保 prompt
+        // 被注入**,否则上游收到无 summary 指令的请求,返回任意 chat 内容。
+        let p = make_provider();
+        let body = json!({
+            "model": "mimo-v2.5",
+            "input": "raw user prompt as plain string",
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let last = messages.last().expect("messages 非空");
+        let last_text = last["content"].as_str().unwrap_or_default();
+        assert!(
+            last_text.contains("CONTEXT CHECKPOINT"),
+            "string input 路径下 prompt 必须仍被注入,实际 last:{last:?}"
+        );
+        // 原 string input 也应保留为前一条 user message
+        assert!(messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("raw user prompt as plain string")
+        }));
+    }
+
+    #[test]
+    fn build_compact_chat_request_injects_prompt_when_input_is_object() {
+        // input 是单个 object item(非典型但合法),prompt 必须注入
+        let p = make_provider();
+        let body = json!({
+            "model": "mimo-v2.5",
+            "input": {"type": "message", "role": "user", "content": "single obj"},
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert!(
+            last["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("CONTEXT CHECKPOINT"),
+            "object input 路径下 prompt 必须仍被注入"
+        );
+    }
+
+    #[test]
+    fn build_compact_chat_request_injects_prompt_when_input_is_null_or_missing() {
+        let p = make_provider();
+        for body in [
+            json!({"model": "mimo-v2.5"}),
+            json!({"model": "mimo-v2.5", "input": null}),
+            json!({"model": "mimo-v2.5", "input": []}),
+            json!({"model": "mimo-v2.5", "input": ""}),
+        ] {
+            let bytes = serde_json::to_vec(&body).unwrap();
+            let chat = build_compact_chat_request(&bytes, &p).unwrap();
+            let parsed: Value = serde_json::from_slice(&chat).unwrap();
+            let messages = parsed["messages"].as_array().unwrap();
+            let last = messages.last().expect("messages 必非空(prompt 至少一条)");
+            assert!(
+                last["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("CONTEXT CHECKPOINT"),
+                "null/empty input 时 prompt 也必须注入,实际 body={body:?},last={last:?}"
+            );
+        }
     }
 
     // ── extract_summary_section ──────────────────────────────────────
