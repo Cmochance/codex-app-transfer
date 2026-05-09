@@ -251,7 +251,7 @@ Per-version changes are tracked at [GitHub Releases](https://github.com/Cmochanc
 - Logs append to `~/.codex-app-transfer/logs/proxy-YYYY-MM-DD.log`. Clearing logs archives them to `logs/backup/` with a timestamp suffix (no deletion).
 - **Conversation history persistence (v2.0.11+)**: the proxy persists Responses-API session messages (mapped to `previous_response_id`) to `~/.codex-app-transfer/sessions.db` (SQLite, 30-day TTL) so Codex CLI long sessions survive app restarts without triggering `previous_response_not_found`. The DB contains complete chat history (system / user / assistant / tool messages); to wipe it, either call the admin endpoint `POST /api/sessions/clear` or delete the file directly.
 - Windows builds are not Authenticode-signed yet; verify downloads with the published `.sha256` / `.sig` and the verification snippet below.
-- This project is not affiliated with OpenAI, Anthropic, CC-Switch, or `farion1231/cc-switch`.
+- This project is not an official OpenAI project.
 
 ## 默认端口
 
@@ -414,7 +414,7 @@ v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 
 
 如果你提交过 PR 但希望改名 / 补链接 / 移除,直接开 issue 跟我说一声即可。
 
-本项目专注 OpenAI Codex CLI 接入，不是 OpenAI、Anthropic、CC-Switch 或 `farion1231/cc-switch` 的官方项目，也不复用它们的商标、Logo 或发布身份。
+本项目专注 OpenAI Codex CLI 接入,不是 OpenAI 的官方项目,也不复用其商标、Logo 或发布身份。
 
 ## 许可证
 

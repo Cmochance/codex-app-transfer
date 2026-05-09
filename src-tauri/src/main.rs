@@ -5,6 +5,7 @@
 
 mod admin;
 mod proxy_runner;
+mod telemetry_bridge;
 
 use std::sync::Arc;
 
@@ -21,6 +22,10 @@ use tower::ServiceExt;
 use admin::{build_app_router, handlers, AdminState};
 
 fn main() {
+    // 必须在所有可能 emit tracing event 的代码之前 init,否则 startup 阶段
+    // (registry healing / desktop apply / proxy 拉起)的 tracing event 会被 drop。
+    telemetry_bridge::init_global_subscriber();
+
     let proxy_manager = Arc::new(ProxyManager::new());
     let admin_state = AdminState {
         proxy_manager: proxy_manager.clone(),

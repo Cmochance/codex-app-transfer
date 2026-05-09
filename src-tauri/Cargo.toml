@@ -27,6 +27,8 @@ codex-app-transfer-codex-integration = { path = "../crates/codex_integration" }
 codex-app-transfer-proxy = { path = "../crates/proxy" }
 codex-app-transfer-adapters = { path = "../crates/adapters" }
 tokio = { version = "1", features = ["sync", "net", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 axum = { version = "0.8", features = ["http1", "tokio", "macros"] }
 base64 = "0.22"
 getrandom = "0.2"
