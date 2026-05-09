@@ -2449,85 +2449,24 @@ body {
   line-height: 1.5;
 }
 
-.advanced-provider-options {
-  margin: -2px 0 18px;
-  border: 2px solid #ef4444;
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--soft-surface) 55%, var(--surface));
-  box-shadow: 0 0 0 3px rgba(239, 68, 68, .08);
-}
-
-.advanced-provider-options summary {
+.api-format-display {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 14px;
+  gap: 12px;
+  background: var(--soft-surface);
+  cursor: default;
+  user-select: text;
+}
+
+.api-format-display .api-format-name {
+  font-weight: 600;
   color: var(--text);
-  font-size: 13px;
-  font-weight: 700;
-  list-style: none;
 }
 
-.advanced-provider-options summary .compat-chevron {
-  margin-left: auto;
+.api-format-display .api-format-detail {
   color: var(--muted);
-  font-size: 14px;
-  transition: transform .18s ease, color .18s ease;
-}
-
-.advanced-provider-options summary:hover .compat-chevron {
-  color: var(--primary);
-}
-
-.advanced-provider-options:not([open]) summary .compat-chevron {
-  transform: rotate(-90deg);
-}
-
-.advanced-provider-options summary::-webkit-details-marker {
-  display: none;
-}
-
-.advanced-provider-options > p {
-  margin: 0;
-  padding: 0 14px 12px;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.format-choice {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  padding: 0 14px 14px;
-}
-
-.format-choice-button {
-  display: grid;
-  gap: 4px;
-  min-height: 66px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--surface);
-  color: var(--text);
-  text-align: left;
-}
-
-.format-choice-button strong {
-  font-size: 13px;
-}
-
-.format-choice-button span {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.35;
-}
-
-.format-choice-button.active {
-  border-color: var(--primary);
-  background: var(--primary-soft);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 20%, transparent);
+  font-weight: 400;
+  font-size: 0.92em;
 }
 
 .section-title-row {
@@ -3394,7 +3333,6 @@ body {
   }
 
   .model-menu-mode-panel,
-  .format-choice,
   .compatibility-item {
     grid-template-columns: 1fr;
   }

@@ -127,20 +127,14 @@
                 </div>
               </div>
               <input id="providerAuth" name="authScheme" type="hidden" value="bearer">
-              <details class="advanced-provider-options" open>
-                <summary><i class="bi bi-sliders"></i><span data-i18n="providersAdd.compatTitle">高级：第三方兼容接口</span><i class="bi bi-chevron-down compat-chevron"></i></summary>
-                <p data-i18n="providersAdd.compatHint">默认使用 Responses 兼容接口。OpenAI Chat 属于实验适配，建议确认工具调用可用后再用于 Claude Code。</p>
-                <div class="format-choice" id="providerFormatChoice" role="group" aria-label="API format">
-                  <button class="format-choice-button active" type="button" data-api-format="responses">
-                    <strong data-i18n="providersAdd.formatResponses">Responses 兼容</strong>
-                    <span data-i18n="providersAdd.formatResponsesHint">推荐，稳定主流程</span>
-                  </button>
-                  <button class="format-choice-button" type="button" data-api-format="openai_chat">
-                    <strong data-i18n="providersAdd.formatOpenAI">OpenAI Chat 实验</strong>
-                    <span data-i18n="providersAdd.formatOpenAIHint">用于 new-api / CPA / OpenCode Go 等兼容端点</span>
-                  </button>
+              <div class="mb-4">
+                <label class="form-label" for="providerApiFormatDisplay" data-i18n="providersAdd.apiFormatLabel">协议类型</label>
+                <div class="form-control form-control-lg api-format-display" id="providerApiFormatDisplay" tabindex="-1" aria-readonly="true">
+                  <strong class="api-format-name" id="providerApiFormatName"></strong>
+                  <span class="api-format-detail" id="providerApiFormatDetail"></span>
                 </div>
-              </details>
+                <p class="field-hint" data-i18n="providersAdd.apiFormatHint">由系统按 provider 实际能力锁定;后续版本将根据上游能力开放原生 Responses 透传 / Anthropic Messages 等其他协议路由。</p>
+              </div>
               <section class="provider-mapping-section">
                 <div class="section-title-row">
                   <div>
@@ -341,7 +335,7 @@
                 <button class="btn btn-outline-primary btn-sm" type="button" data-action="check-provider-compatibility"><i class="bi bi-patch-check"></i><span data-i18n="settings.checkCompatibility">检查兼容性</span></button>
               </div>
               <div class="compatibility-list" id="providerCompatibilityList"></div>
-              <p class="settings-note" data-i18n="settings.thirdPartyCompatHint">Responses 兼容接口是稳定主线；OpenAI Chat、new-api、CPA、OpenCode Go 属于实验适配，工具调用需要单独验证。</p>
+              <p class="settings-note" data-i18n="settings.thirdPartyCompatHint">一键检查所有 provider 实际可用性。协议类型由系统按 provider 能力锁定;后续版本将开放原生 Responses 透传等其他协议路由。</p>
             </div>
           </div>
           <div class="settings-row settings-row-stack">

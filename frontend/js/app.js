@@ -14,7 +14,7 @@
   let pendingDeleteId = null;
   let selectedPreset = null;
   let presetCache = [];
-  let formApiFormat = "Responses";
+  let formApiFormatValue = "openai_chat";
   let formModelCapabilities = {};
   let formRequestOptions = {};
   let providerFormMappings = {};
@@ -138,14 +138,30 @@
     });
   }
 
-  function setFormApiFormat(format) {
-    formApiFormat = ["OpenAI", "openai", "openai_chat"].includes(format) ? "OpenAI" : "Responses";
-    const activeFormat = formApiFormat === "OpenAI" ? "openai_chat" : "responses";
-    $all("[data-api-format]").forEach((button) => {
-      const active = button.dataset.apiFormat === activeFormat;
-      button.classList.toggle("active", active);
-      button.setAttribute("aria-pressed", active ? "true" : "false");
-    });
+  function renderApiFormatDisplay(apiFormat) {
+    const v = String(apiFormat || "").toLowerCase().replace(/-/g, "_");
+    let key = "openaiChat";
+    let canonical = "openai_chat";
+    if (["responses", "openai_responses"].includes(v)) {
+      key = "responses";
+      canonical = "responses";
+    } else if (["anthropic", "claude", "messages"].includes(v)) {
+      key = "anthropic";
+      canonical = "anthropic";
+    }
+    formApiFormatValue = canonical;
+    const nameEl = $("#providerApiFormatName");
+    const detailEl = $("#providerApiFormatDetail");
+    if (nameEl) {
+      const nameKey = `apiFormatDisplay.${key}.name`;
+      nameEl.dataset.i18n = nameKey;
+      nameEl.textContent = t(nameKey);
+    }
+    if (detailEl) {
+      const detailKey = `apiFormatDisplay.${key}.detail`;
+      detailEl.dataset.i18n = detailKey;
+      detailEl.textContent = t(detailKey);
+    }
   }
 
   function firstHealthMessage(health) {
@@ -752,7 +768,7 @@
       name: $("#providerName").value.trim(),
       baseUrl: $("#providerBaseUrl").value.trim(),
       authScheme: $("#providerAuth").value,
-      apiFormat: formApiFormat,
+      apiFormat: formApiFormatValue,
       extraHeaders: selectedPreset?.extraHeaders || {},
       modelCapabilities: mappings ? capabilitiesForCurrentMappings(mappings) : normalizeCapabilities(formModelCapabilities),
       requestOptions: normalizeRequestOptions(formRequestOptions),
@@ -1039,7 +1055,7 @@
     renderBaseUrlOptions(null);
     setApiKeyInputState(false);
     $("#providerAuth").value = "bearer";
-    setFormApiFormat("responses");
+    renderApiFormatDisplay("openai_chat");
     setProviderMappings(emptyMappings());
     setUnverifiedBanner(false);
   }
@@ -1055,8 +1071,7 @@
     setAuthSchemeValue(preset.authScheme);
     setApiKeyInputState(false);
     selectedPreset = preset;
-    // 仅显式 Responses 系列才用 "responses",其它(含未知 / 缺失)默认 "openai_chat"。
-    setFormApiFormat(["Responses", "responses", "openai_responses", "anthropic", "claude", "messages"].includes(preset.apiFormat) ? "responses" : "openai_chat");
+    renderApiFormatDisplay(preset.apiFormat);
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     providerAvailableModels = [];
@@ -1103,15 +1118,7 @@
       }
     }
     setAuthSchemeValue(provider.authScheme);
-    // 优先用匹配预设的 apiFormat,saved provider 的 apiFormat 可能因升级残留旧值
-    // (例如 v1.0.0 时 Kimi 默认 "responses",v1.0.1 起改成 "openai_chat")。后端
-    // healing 也会强制覆盖 builtin 字段,这里是 UI 侧的二重保险。
-    // 注意:getPresets() 把 preset.apiFormat 标准化成大写 "OpenAI"/"Responses",
-    // mapProvider() 把 provider.apiFormat 标准化成小写 "openai_chat"/"responses",
-    // 两套表示都要在白名单里。**未知 / 缺失 → "openai_chat"**(2026-05-08 全栈
-    // 统一 fallback,与后端 schema default / normalize / add+update / import 对齐)。
-    const effectiveApiFormat = (matchedPreset && matchedPreset.apiFormat) || provider.apiFormat;
-    setFormApiFormat(["Responses", "responses", "openai_responses", "anthropic", "claude", "messages"].includes(effectiveApiFormat) ? "responses" : "openai_chat");
+    renderApiFormatDisplay((matchedPreset && matchedPreset.apiFormat) || provider.apiFormat);
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
@@ -2177,13 +2184,6 @@
       if (themeButton) {
         const nextTheme = applyTheme(themeButton.dataset.themeAction);
         await CCApi.saveSettings({ theme: nextTheme });
-      }
-      const formatButton = event.target.closest("[data-api-format]");
-      if (formatButton) {
-        event.preventDefault();
-        setFormApiFormat(formatButton.dataset.apiFormat);
-        showToast(formatButton.dataset.apiFormat === "openai_chat" ? t("toast.openaiFormatExperimental") : t("toast.responsesFormatSelected"));
-        return;
       }
       const presetButton = event.target.closest("[data-preset]");
       if (presetButton && presetButton.closest("#presetList")) {
