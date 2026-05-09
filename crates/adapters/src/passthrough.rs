@@ -30,7 +30,7 @@
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
 
-use crate::normalize_v1_prefix;
+use crate::registry::rewrite_local_path_for_upstream;
 use crate::types::{Adapter, AdapterError, RequestPlan};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -53,8 +53,12 @@ impl Adapter for ResponsesPassthroughAdapter {
         body: Bytes,
         _provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
+        // 用 registry::rewrite_local_path_for_upstream 完整 normalize:
+        // 剥 `/openai` legacy prefix + `/claude/v1/messages` alias + `/v1` 前缀 + 保 query。
+        // 不能用 `normalize_v1_prefix`(只剥 `/v1`),否则 `/openai/v1/responses` 会
+        // 被透传成 `/openai/v1/responses` 拼到 baseUrl → 上游 404。
         Ok(RequestPlan {
-            upstream_path: normalize_v1_prefix(client_path),
+            upstream_path: rewrite_local_path_for_upstream(client_path),
             body,
             response_session: None,
             is_compact: false,
@@ -161,5 +165,46 @@ mod tests {
             .prepare_request("/responses", Bytes::from_static(b"{}"), &dummy_provider())
             .unwrap();
         assert_eq!(plan.upstream_path, "/responses");
+    }
+
+    #[test]
+    fn strips_openai_legacy_prefix() {
+        // P1 (chatgpt-codex-connector review): /openai/v1/responses 必须 normalize 成
+        // /responses 给上游(provider.base_url 自带 /v1)。否则透传成
+        // https://api.openai.com/v1/openai/v1/responses → 必 404。
+        let plan = ResponsesPassthroughAdapter
+            .prepare_request(
+                "/openai/v1/responses",
+                Bytes::from_static(b"{}"),
+                &dummy_provider(),
+            )
+            .unwrap();
+        assert_eq!(plan.upstream_path, "/responses");
+    }
+
+    #[test]
+    fn rewrites_claude_legacy_alias_to_messages() {
+        // P1 (chatgpt-codex-connector review): /claude/v1/messages 是 Codex CLI legacy
+        // alias,必须 rewrite 成 /messages 给上游。
+        let plan = ResponsesPassthroughAdapter
+            .prepare_request(
+                "/claude/v1/messages",
+                Bytes::from_static(b"{}"),
+                &dummy_provider(),
+            )
+            .unwrap();
+        assert_eq!(plan.upstream_path, "/messages");
+    }
+
+    #[test]
+    fn preserves_query_after_legacy_prefix_strip() {
+        let plan = ResponsesPassthroughAdapter
+            .prepare_request(
+                "/openai/v1/responses?stream=true&foo=bar",
+                Bytes::from_static(b"{}"),
+                &dummy_provider(),
+            )
+            .unwrap();
+        assert_eq!(plan.upstream_path, "/responses?stream=true&foo=bar");
     }
 }
