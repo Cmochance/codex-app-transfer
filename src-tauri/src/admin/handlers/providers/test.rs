@@ -48,19 +48,6 @@ fn provider_test_body(provider: &Value, api_format: &str) -> Value {
     })
 }
 
-fn is_kimi_provider(provider: &Value) -> bool {
-    let probe = format!(
-        "{} {}",
-        provider.get("name").and_then(|v| v.as_str()).unwrap_or(""),
-        provider
-            .get("baseUrl")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-    )
-    .to_ascii_lowercase();
-    probe.contains("kimi") || probe.contains("moonshot")
-}
-
 pub(super) fn provider_test_headers(provider: &Value, include_content_type: bool) -> HeaderMap {
     let api_key = provider_api_key(provider);
     let mut headers = HeaderMap::new();
@@ -293,19 +280,15 @@ async fn test_provider_connection(provider: &Value) -> Value {
     let latency_ms = started.elapsed().as_millis();
     let status_code = response.status().as_u16();
     let mut reachable = status_code < 500;
-    let message = if (200..300).contains(&status_code) {
+    // 401/403 = endpoint 已响应 + 需鉴权(server 认得请求)= **baseUrl 连接性 OK**。
+    // 鉴权层语义跟连接层语义解耦:测速本质是测可达性,带不带 / 带对带错 key 都不
+    // 影响 baseUrl 是否可达。鉴权失败留待 Codex CLI 实际请求路径暴露 — 在测速结果
+    // 显示"auth failed"会让用户误判 baseUrl 错(自定义第三方 provider 实测痛点)。
+    // builtin Kimi 此前的 "Kimi platform/code baseUrl 选错" 提示也一并去掉:真用错
+    // baseUrl 时上游 endpoint 缺失会落到 404/405 分支显示 "endpoint unavailable",
+    // key 跟 baseUrl 不匹配则 Codex CLI 真实请求会暴露,不需要测速代位提示。
+    let message = if (200..300).contains(&status_code) || matches!(status_code, 401 | 403) {
         format!("connection OK, {latency_ms} ms")
-    } else if matches!(status_code, 401 | 403) {
-        reachable = false;
-        if is_kimi_provider(provider) {
-            format!(
-                "Kimi auth failed, HTTP {status_code}. Use https://api.moonshot.cn/v1 for Kimi Platform key, or https://api.kimi.com/coding for Kimi Code subscription key. ({latency_ms} ms)"
-            )
-        } else {
-            format!(
-                "auth failed, HTTP {status_code}. Check that the API key and base URL match. ({latency_ms} ms)"
-            )
-        }
     } else if matches!(status_code, 404 | 405) {
         reachable = false;
         format!("endpoint unavailable, HTTP {status_code}. Verify the base URL points to a Codex-compatible endpoint. ({latency_ms} ms)")
@@ -506,12 +489,14 @@ mod tests {
             server.abort();
 
             assert_eq!(result["success"], json!(true));
-            assert_eq!(result["ok"], json!(false));
+            // 401 = endpoint 已响应 + 需鉴权 → baseUrl 连接性 OK,标绿
+            // (鉴权失败由 Codex CLI 实际请求路径暴露,测速不再代位报 "auth failed")
+            assert_eq!(result["ok"], json!(true));
             assert_eq!(result["statusCode"], json!(401));
             assert!(result["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("auth failed"));
+                .contains("connection OK"));
         });
     }
 
