@@ -103,11 +103,22 @@ pub struct ChatToResponsesConverter {
     finish_reason: Option<String>,
     usage: Option<Value>,
 
-    /// 原入站 Responses API request 的 `tools` 数组(未经展平),用于
-    /// 在 envelope 里回灌让 Codex CLI 反向路由 namespace 工具调用。
-    /// 借鉴 mimo2codex `streamToSse.ts:102` `tools: state.req.tools ?? []`。
-    /// None / 空数组在 envelope 里都序列化为 `[]`(对齐 mimo2codex 行为)。
-    original_tools: Option<Value>,
+    /// 原入站 Responses API request 的**完整 body**(未经展平),用于在
+    /// envelope 里回灌完整字段集(tools / parallel_tool_calls / tool_choice
+    /// / reasoning / text / metadata / previous_response_id / instructions
+    /// / temperature / top_p / max_output_tokens / truncation 等),让
+    /// Codex CLI 严格 Responses 协议解析不缺字段、并能反向路由 namespace
+    /// 工具调用。借鉴 mimo2codex `streamToSse.ts:75-105` `buildResponseSnapshot`。
+    original_request: Option<Value>,
+
+    /// SSE event 单调递增 sequence,从 0 开始;每次 `emit_event` 自增。
+    /// 借鉴 mimo2codex `streamToSse.ts:71-72` `sequence_number: state.nextSeq()`。
+    /// 严格 Responses 协议客户端用这个字段确保事件不乱序 / 不丢。
+    sequence_number: u64,
+
+    /// envelope.created_at 时间戳(秒),整个响应生命周期固定。借鉴
+    /// mimo2codex `streamToSse.ts:41` `createdAt = Math.floor(Date.now() / 1000)`。
+    created_at: u64,
 }
 
 impl ChatToResponsesConverter {
@@ -152,7 +163,12 @@ impl ChatToResponsesConverter {
             model: String::new(),
             finish_reason: None,
             usage: None,
-            original_tools: None,
+            original_request: None,
+            sequence_number: 0,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         }
     }
 
@@ -170,23 +186,53 @@ impl ChatToResponsesConverter {
         self
     }
 
-    /// 注入原入站 Responses API request 的 `tools` 数组(未展平),
-    /// 让 envelope 在 `response.created` / `response.in_progress` /
-    /// `response.completed` 三个生命周期事件里都回传它,Codex CLI
-    /// 据此用 `(namespace, function.name)` 复合主键路由 function_call
-    /// 到对应的 MCP server。**关键修复**:不带这个数组,namespace 包装
-    /// 的 MCP 工具调用全部 "unsupported call"。
-    pub fn with_original_tools(mut self, tools: Option<Value>) -> Self {
-        self.original_tools = tools;
+    /// 注入原入站 Responses API request 的**完整 body**(未展平 / 未转换)。
+    /// envelope 构造时从中抽取 tools / parallel_tool_calls / tool_choice /
+    /// reasoning / text / metadata / previous_response_id / instructions /
+    /// temperature / top_p / max_output_tokens / truncation 等字段,保协议
+    /// 合规性 + 让 Codex CLI 用 tools 数组反向路由 namespace 工具调用。
+    /// 借鉴 mimo2codex `streamToSse.ts:75-105` `buildResponseSnapshot`。
+    pub fn with_original_request(mut self, request: Option<Value>) -> Self {
+        self.original_request = request;
         self
     }
 
-    /// 用于 envelope 的 `tools` 字段。None / 空都返回 `[]`,对齐
-    /// mimo2codex `state.req.tools ?? []` 行为。
-    fn envelope_tools(&self) -> Value {
-        self.original_tools
-            .clone()
-            .unwrap_or_else(|| Value::Array(Vec::new()))
+    /// 从 `original_request` 抽取一个字段;不存在时返回 fallback `Value`。
+    fn req_field_or<'a>(&'a self, key: &str, fallback: Value) -> Value {
+        self.original_request
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .cloned()
+            .unwrap_or(fallback)
+    }
+
+    /// 构造 envelope 共享部分(`response.created` / `response.in_progress` /
+    /// `response.completed` / `response.failed` 都用这一份字段集),对齐
+    /// mimo2codex `streamToSse.ts:75-105` `buildResponseSnapshot`。
+    fn build_envelope(&self, status: &str) -> Value {
+        // tools / tool_choice / parallel_tool_calls / reasoning / text /
+        // metadata / previous_response_id / instructions / temperature /
+        // top_p / max_output_tokens 12 个字段 + envelope 自带 id/object/
+        // status/model/created_at/truncation = 18 个字段。
+        json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
+            "tools": self.req_field_or("tools", json!([])),
+            "tool_choice": self.req_field_or("tool_choice", json!("auto")),
+            "parallel_tool_calls": self.req_field_or("parallel_tool_calls", json!(true)),
+            "reasoning": self.req_field_or("reasoning", json!({"effort": null, "summary": null})),
+            "text": self.req_field_or("text", json!({"format": {"type": "text"}})),
+            "metadata": self.req_field_or("metadata", Value::Null),
+            "previous_response_id": self.req_field_or("previous_response_id", Value::Null),
+            "instructions": self.req_field_or("instructions", Value::Null),
+            "temperature": self.req_field_or("temperature", Value::Null),
+            "top_p": self.req_field_or("top_p", Value::Null),
+            "max_output_tokens": self.req_field_or("max_output_tokens", Value::Null),
+            "truncation": "disabled",
+        })
     }
 
     pub fn assistant_message(&self) -> Option<Value> {
@@ -275,25 +321,28 @@ impl ChatToResponsesConverter {
     /// 不发就会卡住;Codex CLI 0.x/1.x 实测能容忍但不应当依赖这条容忍。
     /// 与 Python pre-refactor `streaming_adapter.py:266-281`、litellm
     /// `streaming_iterator.py:434-444` 行为一致。
-    fn emit_lifecycle_open(&self, out: &mut Vec<u8>) {
-        let envelope = json!({
-            "id": self.response_id,
-            "object": "response",
-            "status": "in_progress",
-            "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
-            // 回传原入站 tools(未展平),Codex CLI 用它反向路由 namespace
-            // 包装的 MCP 工具调用。借鉴 mimo2codex streamToSse.ts:102。
-            "tools": self.envelope_tools(),
-        });
+    fn emit_lifecycle_open(&mut self, out: &mut Vec<u8>) {
+        // open 状态下 envelope 还没有 output / usage / incomplete_details /
+        // error,但已含 id/created_at/tools/tool_choice 等所有合规字段。
+        let mut envelope = self.build_envelope("in_progress");
+        envelope["output"] = json!([]);
+        envelope["usage"] = Value::Null;
+        envelope["incomplete_details"] = Value::Null;
+        envelope["error"] = Value::Null;
+        let created_payload = json!({"type": "response.created", "response": envelope.clone()});
+        let in_progress_payload =
+            json!({"type": "response.in_progress", "response": envelope});
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.created",
-            json!({"type": "response.created", "response": envelope.clone()}),
+            created_payload,
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.in_progress",
-            json!({"type": "response.in_progress", "response": envelope}),
+            in_progress_payload,
         );
     }
 
@@ -414,6 +463,7 @@ impl ChatToResponsesConverter {
             );
             emit_event(
                 out,
+                &mut self.sequence_number,
                 "response.output_item.added",
                 json!({
                     "type": "response.output_item.added",
@@ -464,6 +514,7 @@ impl ChatToResponsesConverter {
                     let output_index = pending.output_index;
                     emit_event(
                         out,
+                        &mut self.sequence_number,
                         "response.function_call_arguments.delta",
                         json!({
                             "type": "response.function_call_arguments.delta",
@@ -486,6 +537,7 @@ impl ChatToResponsesConverter {
         }
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.function_call_arguments.done",
             json!({
                 "type": "response.function_call_arguments.done",
@@ -504,6 +556,7 @@ impl ChatToResponsesConverter {
         });
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
@@ -531,6 +584,7 @@ impl ChatToResponsesConverter {
         self.reasoning_acc.push_str(text);
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_text.delta",
             json!({
                 "type": "response.reasoning_summary_text.delta",
@@ -555,6 +609,7 @@ impl ChatToResponsesConverter {
         self.text_acc.push_str(text);
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_text.delta",
             json!({
                 "type": "response.output_text.delta",
@@ -666,6 +721,7 @@ impl ChatToResponsesConverter {
         self.next_output_index += 1;
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.added",
             json!({
                 "type": "response.output_item.added",
@@ -682,6 +738,7 @@ impl ChatToResponsesConverter {
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_part.added",
             json!({
                 "type": "response.reasoning_summary_part.added",
@@ -703,6 +760,7 @@ impl ChatToResponsesConverter {
         self.reasoning_acc.push_str(REASONING_HEADER);
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_text.delta",
             json!({
                 "type": "response.reasoning_summary_text.delta",
@@ -717,6 +775,7 @@ impl ChatToResponsesConverter {
     fn close_reasoning(&mut self, out: &mut Vec<u8>) {
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_text.done",
             json!({
                 "type": "response.reasoning_summary_text.done",
@@ -728,6 +787,7 @@ impl ChatToResponsesConverter {
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.reasoning_summary_part.done",
             json!({
                 "type": "response.reasoning_summary_part.done",
@@ -740,13 +800,16 @@ impl ChatToResponsesConverter {
                 },
             }),
         );
+        let reasoning_item = self.reasoning_item_completed();
+        let reasoning_index = self.reasoning_index;
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
-                "output_index": self.reasoning_index,
-                "item": self.reasoning_item_completed(),
+                "output_index": reasoning_index,
+                "item": reasoning_item,
             }),
         );
         self.reasoning_closed = true;
@@ -772,6 +835,7 @@ impl ChatToResponsesConverter {
         self.next_output_index += 1;
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.added",
             json!({
                 "type": "response.output_item.added",
@@ -787,6 +851,7 @@ impl ChatToResponsesConverter {
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.content_part.added",
             json!({
                 "type": "response.content_part.added",
@@ -801,6 +866,7 @@ impl ChatToResponsesConverter {
     fn close_message(&mut self, out: &mut Vec<u8>) {
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_text.done",
             json!({
                 "type": "response.output_text.done",
@@ -812,6 +878,7 @@ impl ChatToResponsesConverter {
         );
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.content_part.done",
             json!({
                 "type": "response.content_part.done",
@@ -825,13 +892,16 @@ impl ChatToResponsesConverter {
                 },
             }),
         );
+        let message_item = self.message_item_completed();
+        let message_index = self.message_index;
         emit_event(
             out,
+            &mut self.sequence_number,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
-                "output_index": self.message_index,
-                "item": self.message_item_completed(),
+                "output_index": message_index,
+                "item": message_item,
             }),
         );
         self.message_closed = true;
@@ -872,6 +942,11 @@ impl ChatToResponsesConverter {
             self.close_tool_call(idx, out);
         }
 
+        // finish_reason → status / incomplete_details 映射。保留现有 5 路径
+        // 行为(Codex CLI 实测能容忍 `response.completed status:incomplete`)。
+        // mimo2codex `streamToSse.ts:403-411` 走 `response.failed` 路径需要
+        // 区分 "EOF 中断" vs "真上游错误",当前 converter 拿不到这个上下文,
+        // 留 follow-up 处理(单独 PR + 改 stream.rs 错误流路径标记)。
         let (status, incomplete_details) = match (self.finish_reason.as_deref(), from_done) {
             (Some("stop") | Some("tool_calls") | Some("function_call"), _) => {
                 ("completed", Value::Null)
@@ -897,26 +972,26 @@ impl ChatToResponsesConverter {
         all_items.sort_by_key(|(idx, _)| *idx);
         let output_items: Vec<Value> = all_items.into_iter().map(|(_, v)| v).collect();
 
-        let mut completed = json!({
-            "type": "response.completed",
-            "response": {
-                "id": self.response_id,
-                "object": "response",
-                "status": status,
-                "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
-                "output": output_items,
-                "incomplete_details": incomplete_details,
-                // 同 emit_lifecycle_open:回传原入站 tools 让 Codex CLI
-                // 反向路由 namespace 包装的工具调用。
-                "tools": self.envelope_tools(),
-            },
-        });
+        let mut envelope = self.build_envelope(status);
+        envelope["output"] = Value::Array(output_items);
+        envelope["incomplete_details"] = incomplete_details;
+        envelope["error"] = Value::Null;
         // Codex CLI 反序列化 `ResponseCompleted` 时 usage 中的 `input_tokens` /
         // `output_tokens` / `total_tokens` 是必填,缺一帧就整流断开重连。Chat
         // 上游的 `prompt_tokens` / `completion_tokens` 与 Responses 的字段名
         // 不同,部分 provider 也可能完全不发 usage,这里统一规范化。
-        completed["response"]["usage"] = normalize_usage_to_responses_shape(self.usage.clone());
-        emit_event(out, "response.completed", completed);
+        envelope["usage"] = normalize_usage_to_responses_shape(self.usage.clone());
+
+        let final_payload = json!({
+            "type": "response.completed",
+            "response": envelope,
+        });
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.completed",
+            final_payload,
+        );
         self.state = State::Done;
     }
 }
@@ -1016,7 +1091,15 @@ fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
     Value::Object(out)
 }
 
-fn emit_event(out: &mut Vec<u8>, event_name: &str, payload: Value) {
+/// 写一帧 SSE event。`seq` 是 `ChatToResponsesConverter::sequence_number` 的可变
+/// 引用 —— 函数自动把当前值塞进 payload `sequence_number` 字段并 +1。借鉴
+/// mimo2codex `streamToSse.ts:71-72` `sequence_number: state.nextSeq()`,严格
+/// Responses 协议客户端依赖此字段确保事件不丢 / 不乱序。
+fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, mut payload: Value) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("sequence_number".into(), json!(*seq));
+    }
+    *seq += 1;
     let line = format!(
         "event: {event_name}\ndata: {}\n\n",
         serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
@@ -1299,12 +1382,16 @@ mod tests {
                 {"type": "function", "name": "notion_search"}
             ]}
         ]);
+        let original_request = json!({
+            "model": "kimi",
+            "tools": original_tools.clone(),
+        });
         let mut c = ChatToResponsesConverter::new_with_ids(
             "resp_x".into(),
             "msg_x".into(),
             "rs_x".into(),
         )
-        .with_original_tools(Some(original_tools.clone()));
+        .with_original_request(Some(original_request));
         let mut all = Vec::new();
         all.extend(c.feed(
             br#"data: {"model":"kimi","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}
@@ -1337,6 +1424,120 @@ mod tests {
             .find(|(n, _)| n == "response.completed")
             .expect("response.completed emitted");
         assert_eq!(completed.1["response"]["tools"], original_tools);
+    }
+
+    #[test]
+    fn envelope_includes_all_responses_api_fields_for_protocol_compliance() {
+        // 严格 Responses 协议客户端期待 envelope 含 16+ 字段。借鉴 mimo2codex
+        // streamToSse.ts:75-105 buildResponseSnapshot 全字段策略。
+        let original_request = json!({
+            "model": "kimi-for-coding",
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high", "summary": null},
+            "text": {"format": {"type": "text"}},
+            "metadata": {"trace_id": "abc"},
+            "previous_response_id": "resp_prev_xyz",
+            "instructions": "You are helpful.",
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 2048,
+        });
+        let mut c = ChatToResponsesConverter::new_with_ids(
+            "resp_x".into(),
+            "msg_x".into(),
+            "rs_x".into(),
+        )
+        .with_original_request(Some(original_request.clone()));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"model":"kimi","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        for (event_name, expected_status) in [
+            ("response.created", "in_progress"),
+            ("response.in_progress", "in_progress"),
+            ("response.completed", "completed"),
+        ] {
+            let ev = events
+                .iter()
+                .find(|(n, _)| n == event_name)
+                .unwrap_or_else(|| panic!("{event_name} not emitted"));
+            let resp = &ev.1["response"];
+            assert_eq!(resp["status"], expected_status);
+            // 全字段必须存在(即使 null)以满足严格协议解析
+            for field in [
+                "id",
+                "object",
+                "created_at",
+                "status",
+                "model",
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls",
+                "reasoning",
+                "text",
+                "metadata",
+                "previous_response_id",
+                "instructions",
+                "temperature",
+                "top_p",
+                "max_output_tokens",
+                "truncation",
+                "output",
+                "usage",
+                "incomplete_details",
+                "error",
+            ] {
+                assert!(
+                    resp.get(field).is_some(),
+                    "{event_name} envelope missing field `{field}`\nactual: {resp}"
+                );
+            }
+            // 关键字段值回灌正确
+            assert_eq!(resp["tool_choice"], "auto");
+            assert_eq!(resp["parallel_tool_calls"], true);
+            assert_eq!(resp["reasoning"]["effort"], "high");
+            assert_eq!(resp["temperature"], 0.7);
+            assert_eq!(resp["previous_response_id"], "resp_prev_xyz");
+            assert_eq!(resp["truncation"], "disabled");
+            assert!(
+                resp["created_at"].as_u64().is_some(),
+                "created_at must be unix seconds"
+            );
+        }
+    }
+
+    #[test]
+    fn every_sse_event_has_monotonically_increasing_sequence_number() {
+        // 借鉴 mimo2codex streamToSse.ts:71-72 sequence_number: state.nextSeq()。
+        // 每个 SSE event payload 必须含 sequence_number 字段,且整流单调递增。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"model":"mock","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let mut prev: i64 = -1;
+        for (name, payload) in &events {
+            let seq = payload["sequence_number"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("event {name} missing sequence_number: {payload}"));
+            assert!(
+                seq > prev,
+                "{name} sequence_number {seq} not > prev {prev}"
+            );
+            prev = seq;
+        }
+        assert_eq!(events[0].1["sequence_number"], 0);
     }
 
     #[test]

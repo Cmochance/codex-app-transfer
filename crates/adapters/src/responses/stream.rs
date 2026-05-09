@@ -34,23 +34,27 @@ pub fn convert_chat_to_responses_stream_with_session(
 
 /// 同上,但允许调用方按 provider 行为开启 `<think>` 兜底拆分等可选解析。
 ///
-/// `original_responses_tools` 是入站 Responses API request 的原始 `tools` 字段
-/// (未展平的 namespace 形态),会被 envelope 在 `response.created` /
-/// `response.in_progress` / `response.completed` 三处回灌,让 Codex CLI
-/// 客户端用 `(namespace, function.name)` 复合主键反向路由 namespace 包装
-/// 工具的 function_call 到对应 MCP server。
+/// `original_responses_request` 是入站 Responses API request 的**完整 body**
+/// (未经任何展平 / 协议转换),会被 envelope 在 `response.created` /
+/// `response.in_progress` / `response.completed` 三处回灌完整字段集
+/// (tools / parallel_tool_calls / tool_choice / reasoning / text / metadata
+/// / previous_response_id / instructions / temperature / top_p /
+/// max_output_tokens / truncation / created_at)。
+///
+/// 关键作用是 `tools` 字段:Codex CLI 用 `(namespace, function.name)` 复合
+/// 主键反向路由 namespace 包装的 MCP function_call;其余字段保协议合规性。
 pub fn convert_chat_to_responses_stream_with_options(
     input: ByteStream,
     response_session: Option<ResponseSessionPlan>,
     enable_think_tag_split: bool,
-    original_responses_tools: Option<Value>,
+    original_responses_request: Option<Value>,
 ) -> ByteStream {
     let conv = match response_session.as_ref() {
         Some(s) => ChatToResponsesConverter::new_with_response_id(s.response_id.clone()),
         None => ChatToResponsesConverter::new(),
     }
     .with_think_tag_split(enable_think_tag_split)
-    .with_original_tools(original_responses_tools);
+    .with_original_request(original_responses_request);
     convert_chat_to_responses_stream_inner(input, conv, response_session)
 }
 
