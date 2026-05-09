@@ -442,10 +442,31 @@ fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -
         return false;
     };
     let catalog_path = PathBuf::from(catalog_path);
-    let catalog = fs::read_to_string(catalog_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or_else(|| json!({}));
+    // M3 (silent-failure-hunter review):catalog 读不到 / JSON 解析失败 → 区分
+    // 子原因 telemetry warn(原 .ok().and_then().unwrap_or_else(|| json!({}))
+    // 把"文件不存在"和"JSON 损坏"混吃成空对象 → 用户看到"未就绪"但分不清是
+    // 配置缺失还是文件损坏)。
+    let catalog: Value = match fs::read_to_string(&catalog_path) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    catalog_path = %catalog_path.display(),
+                    error = %e,
+                    "one_million_catalog_ready: model_catalog JSON 解析失败"
+                );
+                return false;
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                catalog_path = %catalog_path.display(),
+                error = %e,
+                "one_million_catalog_ready: model_catalog 文件读取失败"
+            );
+            return false;
+        }
+    };
     let Some(models) = catalog.get("models").and_then(|v| v.as_array()) else {
         return false;
     };

@@ -314,7 +314,19 @@ pub async fn forward_handler(
         let resp = live_resp.take().expect("live_resp is Some by check above");
         let st = resp.status();
         let hs = resp.headers().clone();
-        let body_bytes = resp.bytes().await.unwrap_or_default();
+        let body_bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                // H2 修复:静默吞错改为 telemetry log。上游 4xx body read 失败时,
+                // web_search retry 检测会失效(is_web_search_upstream_reject 拿空 body
+                // → false → 不进 retry 路径),用户看不到 root cause。
+                telemetry.logs.add(
+                    "WARN",
+                    format!("upstream {st} body read failed during web_search retry check: {e}",),
+                );
+                Bytes::new()
+            }
+        };
         if is_web_search_upstream_reject(&body_bytes) {
             codex_app_transfer_adapters::disable_web_search_for(&resolved.provider.id);
             telemetry.logs.add(
@@ -403,7 +415,16 @@ pub async fn forward_handler(
             ))
         } else {
             // retry 后再次 4xx 或 5xx
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    telemetry.logs.add(
+                        "WARN",
+                        format!("upstream {st} body read failed after retry: {e}"),
+                    );
+                    Bytes::new()
+                }
+            };
             log_upstream_error_diag(
                 &telemetry,
                 st,

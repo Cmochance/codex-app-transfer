@@ -111,12 +111,22 @@ pub(super) fn provider_test_headers(provider: &Value, include_content_type: bool
 }
 
 pub(super) fn provider_test_error_label(error: &reqwest::Error) -> &'static str {
+    // M2 (silent-failure-hunter review):TLS / decode 错单独区分,用户 toast 看
+    // 到 label 就能 self-debug(原来都吃成 "RequestError" 看不出哪步出错)。
     if error.is_timeout() {
         "Timeout"
     } else if error.is_connect() {
         "ConnectError"
-    } else {
+    } else if error.is_redirect() {
+        "RedirectError"
+    } else if error.is_decode() {
+        "DecodeError"
+    } else if error.is_request() {
         "RequestError"
+    } else if error.is_body() {
+        "BodyError"
+    } else {
+        "OtherError"
     }
 }
 
@@ -281,14 +291,21 @@ async fn test_provider_connection(provider: &Value) -> Value {
     let status_code = response.status().as_u16();
     let mut reachable = status_code < 500;
     // 401/403 = endpoint 已响应 + 需鉴权(server 认得请求)= **baseUrl 连接性 OK**。
-    // 鉴权层语义跟连接层语义解耦:测速本质是测可达性,带不带 / 带对带错 key 都不
-    // 影响 baseUrl 是否可达。鉴权失败留待 Codex CLI 实际请求路径暴露 — 在测速结果
-    // 显示"auth failed"会让用户误判 baseUrl 错(自定义第三方 provider 实测痛点)。
-    // builtin Kimi 此前的 "Kimi platform/code baseUrl 选错" 提示也一并去掉:真用错
-    // baseUrl 时上游 endpoint 缺失会落到 404/405 分支显示 "endpoint unavailable",
-    // key 跟 baseUrl 不匹配则 Codex CLI 真实请求会暴露,不需要测速代位提示。
-    let message = if (200..300).contains(&status_code) || matches!(status_code, 401 | 403) {
+    // 但鉴权失败也可能是 baseUrl 配错(指向需 auth 的非 LLM endpoint)/ key 过期 /
+    // key 给错 provider —— 直接显示"connection OK"绿色会误导。改成 reachable=true
+    // (UI 不标 bad 红色)+ authStatus="auth_required_or_invalid" 让前端标黄色警告 +
+    // 文案显式区分"已可达,但 server 拒绝鉴权,如确认 key 没错可能 baseUrl 不是 LLM API"。
+    let auth_status = if matches!(status_code, 401 | 403) {
+        "auth_required_or_invalid"
+    } else {
+        "ok"
+    };
+    let message = if (200..300).contains(&status_code) {
         format!("connection OK, {latency_ms} ms")
+    } else if matches!(status_code, 401 | 403) {
+        format!(
+            "reachable, HTTP {status_code} (auth required or invalid — verify API key matches this baseUrl). {latency_ms} ms"
+        )
     } else if matches!(status_code, 404 | 405) {
         reachable = false;
         format!("endpoint unavailable, HTTP {status_code}. Verify the base URL points to a Codex-compatible endpoint. ({latency_ms} ms)")
@@ -299,6 +316,7 @@ async fn test_provider_connection(provider: &Value) -> Value {
     json!({
         "success": true,
         "ok": reachable,
+        "authStatus": auth_status,
         "latencyMs": latency_ms,
         "statusCode": status_code,
         "message": message,
@@ -489,14 +507,60 @@ mod tests {
             server.abort();
 
             assert_eq!(result["success"], json!(true));
-            // 401 = endpoint 已响应 + 需鉴权 → baseUrl 连接性 OK,标绿
-            // (鉴权失败由 Codex CLI 实际请求路径暴露,测速不再代位报 "auth failed")
+            // 401 = endpoint 已响应 + 需鉴权 → baseUrl 连接性 OK(reachable=true,
+            // UI 不标 bad);但 authStatus="auth_required_or_invalid" 让前端标黄色
+            // 警告 + 文案区分,避免用户把"key 错 / baseUrl 不是 LLM endpoint"误判
+            // 为 baseUrl 完全 OK
             assert_eq!(result["ok"], json!(true));
+            assert_eq!(result["authStatus"], json!("auth_required_or_invalid"));
             assert_eq!(result["statusCode"], json!(401));
             assert!(result["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("connection OK"));
+                .contains("auth required or invalid"));
+        });
+    }
+
+    #[test]
+    fn provider_connection_403_marks_auth_required() {
+        // 防回归:403 跟 401 同样视为 reachable + auth_required_or_invalid
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use axum::http::StatusCode as AxumStatusCode;
+            use axum::routing::post;
+            use axum::Json;
+            use axum::Router;
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(|| async {
+                    (
+                        AxumStatusCode::FORBIDDEN,
+                        Json(json!({"error": "WAF blocked"})),
+                    )
+                }),
+            );
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let provider = json!({
+                "name": "Mock 403",
+                "baseUrl": format!("http://{addr}/v1"),
+                "apiFormat": "openai_chat",
+                "apiKey": "any-key",
+                "models": {"default": "x"}
+            });
+            let result = test_provider_connection(&provider).await;
+            server.abort();
+            assert_eq!(result["ok"], json!(true), "403 仍 reachable");
+            assert_eq!(result["authStatus"], json!("auth_required_or_invalid"));
+            assert_eq!(result["statusCode"], json!(403));
         });
     }
 

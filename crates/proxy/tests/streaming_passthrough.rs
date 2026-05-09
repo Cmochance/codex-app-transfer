@@ -174,3 +174,15 @@ async fn responses_passthrough_byte_identical() {
     )
     .await;
 }
+
+/// H2 (silent-failure-hunter review):passthrough 上游 4xx 错误体字节级透传。
+/// 防回归:`forward.rs::unwrap_or_default` 静默吞 body read 错误改成 telemetry warn,
+/// 上游 400 + JSON error body 完整原样透回客户端,不丢失 error.code / error.message。
+#[tokio::test]
+async fn responses_passthrough_upstream_error_body_passthrough() {
+    run_passthrough_against_with_format(
+        "tests/replay/fixtures/_example_responses_passthrough_error.json",
+        "responses",
+    )
+    .await;
+}

@@ -1493,6 +1493,15 @@
     return t("providers.testDone");
   }
 
+  // 测速结果是否要 UI 标黄(.bad class):
+  // - reachable=false:连接失败 / 4xx-405 endpoint unavailable / 5xx
+  // - authStatus=auth_required_or_invalid:连接 OK 但鉴权失败,可能 baseUrl 不是 LLM API
+  function isProviderTestResultBad(result) {
+    if (result?.ok === false) return true;
+    if (result?.authStatus === "auth_required_or_invalid") return true;
+    return false;
+  }
+
   function formatModelFetchError(error) {
     const reason = error?.message || t("toast.requestFailed");
     return `${t("models.fetchFailedManual")}: ${reason}`;
@@ -1705,7 +1714,7 @@
           const message = formatProviderTestResult(result);
           if (resultEl) {
             resultEl.textContent = message;
-            resultEl.classList.toggle("bad", result.ok === false);
+            resultEl.classList.toggle("bad", isProviderTestResultBad(result));
           }
           showToast(message);
         } catch (error) {
@@ -1766,7 +1775,7 @@
           const result = await CCApi.testProviderPayload(payload);
           const message = formatProviderTestResult(result);
           resultEl.textContent = message;
-          resultEl.classList.toggle("bad", result.ok === false);
+          resultEl.classList.toggle("bad", isProviderTestResultBad(result));
           showToast(message);
         } catch (error) {
           const message = error?.message || t("toast.requestFailed");
