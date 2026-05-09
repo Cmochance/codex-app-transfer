@@ -47,3 +47,42 @@ pub fn warn_once_drop_tool(tool_type: &str) {
         tracing::warn!(tool_type = %tool_type, "dropping unsupported responses tool type");
     }
 }
+
+/// 本进程已自动禁用 web_search 的 provider id 集合 — 4xx fallback 路径调用
+/// `disable_web_search_for(provider_id)` 加入,`convert_web_search_tool`
+/// 调用 `is_web_search_disabled_for` 命中即 drop。
+///
+/// **设计语义**(对齐用户决策"A+B 双层"):
+/// - **A**:Provider 配置 `request_options.web_search_enabled` 默认 false,
+///   只有用户显式标 true 才会发 web_search 工具上去
+/// - **B**:上游真的拒了(MiMo plugin 没开 / token plan 套餐不支持 / 其他)
+///   后,proxy 自动加入此 cache,本进程后续 turn 立即 drop。下次启动
+///   cache 重置(用户去 UI 关 web_search_enabled = false 才是持久关闭)。
+///
+/// **本提交不做**:① transparent retry without web_search(用户视角第一次
+/// 请求失败,需要重新提问下一个 turn 才 work);② 写回 config.json 持久化
+/// (应用重启后用户配置仍是 enabled=true,需要再失败一次)。这两项留 follow-up。
+fn web_search_disabled_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SET: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn disable_web_search_for(provider_id: &str) {
+    if let Ok(mut guard) = web_search_disabled_set().lock() {
+        if guard.insert(provider_id.to_owned()) {
+            tracing::warn!(
+                provider_id = %provider_id,
+                "auto-disabling web_search after upstream rejection (likely Web Search Plugin not activated upstream)"
+            );
+        }
+    }
+}
+
+pub fn is_web_search_disabled_for(provider_id: &str) -> bool {
+    web_search_disabled_set()
+        .lock()
+        .map(|s| s.contains(provider_id))
+        .unwrap_or(false)
+}

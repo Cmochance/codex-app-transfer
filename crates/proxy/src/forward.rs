@@ -345,6 +345,25 @@ pub async fn forward_handler(
             &plan.body,
             &body_bytes,
         );
+        // ── A+B web_search fallback: 上游 web search 拒绝时自动降级 ──
+        // 例如 MiMo Token Plan 套餐没开 Web Search Plugin 时返回:
+        //   { "code": "400", "param": "web search tool found in the request body,
+        //     but webSearchEnabled is false" }
+        // 把 provider 加入本进程内存 disable cache,后续 turn 立即 drop
+        // web_search 工具(`adapters::convert_web_search_tool` 检查 cache),
+        // 用户在 codex-app-transfer UI 重新打开开关之前都不会再发。
+        // 本次请求仍然把 4xx 透传给客户端(用户视角看到一次错误,提示去关
+        // web_search_enabled 或确认 plugin 状态)。
+        if status == http::StatusCode::BAD_REQUEST && is_web_search_upstream_reject(&body_bytes) {
+            codex_app_transfer_adapters::disable_web_search_for(&resolved.provider.id);
+            telemetry.logs.add(
+                "WARN",
+                format!(
+                    "auto-disabled web_search for provider {} (upstream rejected: webSearchEnabled=false). User must verify plugin / re-enable in UI to retry.",
+                    resolved.provider.id
+                ),
+            );
+        }
         let single = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) });
         Box::pin(single)
     };
@@ -446,6 +465,40 @@ impl Drop for TracedStream {
 /// 辅助诊断身份头泄漏 / 反爬识别 / token 配置等问题。
 /// 截断到 ~2KB(req)+ 4KB(resp)避免污染日志;headers 全打但脱敏 Authorization /
 /// api-key 等敏感字段。
+/// 检测上游 4xx 响应 body 是否是"web search plugin / Web Search 能力未开"
+/// 这一类错误。命中时 `forward.rs` 主路径会调用
+/// `adapters::disable_web_search_for(provider_id)` 把当前 provider 加入本进程
+/// 内存 disable cache,避免后续 turn 重复触发同样错误。
+///
+/// **匹配关键字**(实测覆盖):
+/// - MiMo Token Plan / 其他套餐没开 Web Search Plugin:`"webSearchEnabled is false"`
+///   / `"web search tool found"`(实测 2026-05-09 dump)
+/// - 通用兜底:`"web_search"` + `"not enabled" / "not supported" / "not activated"`
+///   未来其他 provider 可能用类似措辞,留个宽松兜底
+///
+/// 误判风险:**故意宽松**(关键字 OR 命中即触发 disable),最坏情况是用户
+/// 没开 web_search_enabled 也"被 disable"(本来就是 disabled,无副作用)。
+fn is_web_search_upstream_reject(body_bytes: &[u8]) -> bool {
+    let body = match std::str::from_utf8(body_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let lower = body.to_ascii_lowercase();
+    // 实测精确字面量(MiMo)
+    if lower.contains("websearchenabled is false")
+        || lower.contains("web search tool found in the request body")
+    {
+        return true;
+    }
+    // 通用兜底
+    let mentions_web_search = lower.contains("web_search") || lower.contains("web search");
+    let mentions_not_available = lower.contains("not enabled")
+        || lower.contains("not supported")
+        || lower.contains("not activated")
+        || lower.contains("disabled");
+    mentions_web_search && mentions_not_available
+}
+
 fn log_upstream_error_diag(
     telemetry: &crate::telemetry::ProxyTelemetry,
     status: StatusCode,
@@ -861,5 +914,51 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["model"], "deepseek-v4-pro[beta]");
         assert_eq!(v["stream"], true);
+    }
+
+    // ── is_web_search_upstream_reject 关键字识别(B 层 fallback 触发条件)──
+
+    #[test]
+    fn web_search_reject_matches_mimo_exact_literal() {
+        // MiMo Token Plan 套餐没开 Web Search Plugin 时实测错误体
+        // (2026-05-09 dump 抓到的精确字面量)
+        let body = br#"{"error":{"code":"400","message":"Param Incorrect","param":"web search tool found in the request body, but webSearchEnabled is false","type":""}}"#;
+        assert!(is_web_search_upstream_reject(body));
+    }
+
+    #[test]
+    fn web_search_reject_matches_camelcase_variant() {
+        let body = br#"{"error":"webSearchEnabled is false"}"#;
+        assert!(is_web_search_upstream_reject(body));
+    }
+
+    #[test]
+    fn web_search_reject_matches_generic_not_enabled_phrasing() {
+        // 兜底:其他 provider 可能用类似措辞
+        let body = br#"{"error":"web_search is not enabled for this account"}"#;
+        assert!(is_web_search_upstream_reject(body));
+        let body2 = br#"{"error":"web search not activated"}"#;
+        assert!(is_web_search_upstream_reject(body2));
+    }
+
+    #[test]
+    fn web_search_reject_does_not_match_unrelated_400() {
+        // 普通 400 错误不该误触发 fallback(只 disable web_search)
+        assert!(!is_web_search_upstream_reject(
+            b"{\"error\":\"Invalid model name\"}"
+        ));
+        assert!(!is_web_search_upstream_reject(
+            b"{\"error\":\"token limit exceeded\"}"
+        ));
+        assert!(!is_web_search_upstream_reject(
+            b"{\"error\":\"rate limit reached\"}"
+        ));
+    }
+
+    #[test]
+    fn web_search_reject_handles_non_utf8_safely() {
+        // 上游返回非 UTF-8 时不 panic,认为不匹配
+        let body: &[u8] = &[0xff, 0xfe, 0xfd, 0x00];
+        assert!(!is_web_search_upstream_reject(body));
     }
 }

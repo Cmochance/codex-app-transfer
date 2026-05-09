@@ -1820,9 +1820,26 @@ fn convert_web_search_tool(
     provider: Option<&Provider>,
 ) -> Vec<Value> {
     let Some(provider) = provider else {
-        crate::warn_once_drop_tool("web_search");
+        crate::warn_once_drop_tool("web_search:no-provider");
         return vec![];
     };
+
+    // A 层:配置开关。`request_options.web_search_enabled` 默认 false。
+    // 用户必须主动在 codex-app-transfer config 里标 true 才会启用;UI 提示
+    // 文案:"web_search 需要先在 Xiaomi MiMo 控制台付费启用后才能正常使用"。
+    if !provider_web_search_enabled(provider) {
+        crate::warn_once_drop_tool("web_search:disabled-by-config");
+        return vec![];
+    }
+
+    // B 层:运行时自动 disable cache。上游 4xx 失败一次后(forward.rs 调
+    // `disable_web_search_for`),本进程后续 turn 立即 drop,避免每个 turn
+    // 都触发同样错误。本次启动有效;用户去 UI 关 `web_search_enabled = false`
+    // 才是持久关闭。
+    if crate::is_web_search_disabled_for(&provider.id) {
+        crate::warn_once_drop_tool("web_search:auto-disabled-after-failure");
+        return vec![];
+    }
 
     if provider_looks_like(provider, "xiaomimimo") || provider_looks_like(provider, "mimo") {
         // MiMo 私有 chat 端 web_search 形态(reqToChat.ts:196-209)
@@ -1840,8 +1857,21 @@ fn convert_web_search_tool(
     // 用户实地反馈"模型不能直接用 web_search,绕路 MCP 工具/Node Repl 写
     // JS fetch HTML"是预期当前行为(P5 namespace MCP 修复后这条路是通的);
     // 后续逐家移植后会让模型直接走 chat 原生 web search,效率更高。
-    crate::warn_once_drop_tool("web_search");
+    crate::warn_once_drop_tool("web_search:provider-not-implemented");
     vec![]
+}
+
+/// 读 `provider.request_options.web_search_enabled`(boolean,默认 false)。
+/// 用户必须显式在 codex-app-transfer 配置里标 true 才启用;**默认关闭**
+/// 是因为很多 provider(如 MiMo Token Plan 套餐)没开 Web Search Plugin
+/// 时,发 web_search 工具会被 400 拒绝。配套 4xx fallback 自动降级
+/// (`crate::disable_web_search_for`)防止重复失败。
+fn provider_web_search_enabled(provider: &Provider) -> bool {
+    provider
+        .request_options
+        .get("web_search_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -2451,10 +2481,19 @@ mod tests {
     // mimo2codex `reqToChat.ts:196-209`),Kimi/DeepSeek/MiniMax 等留 follow-up
     // (逐家文档实证后跟进,见 `docs/web-search-implementation-tracker.md`)。
 
-    #[test]
-    fn mimo_web_search_converted_to_native_schema_with_user_location() {
+    /// MiMo provider 用于 web_search 测试 — 显式 enable Web Search Plugin。
+    /// A 层默认 false,测试需要显式开才会触发转换。
+    fn mimo_provider_with_web_search() -> Provider {
         let mut p = mimo_provider();
         p.models.insert("default".into(), "mimo-v2.5".into());
+        p.request_options
+            .insert("web_search_enabled".into(), json!(true));
+        p
+    }
+
+    #[test]
+    fn mimo_web_search_converted_to_native_schema_with_user_location() {
+        let p = mimo_provider_with_web_search();
         let req = json!({
             "model": "mimo-v2.5",
             "stream": true,
@@ -2502,8 +2541,7 @@ mod tests {
     #[test]
     fn mimo_web_search_with_minimal_fields_outputs_minimal_tool() {
         // 用户没传 user_location / max_keyword 等字段时,只输出 type:"web_search"
-        let mut p = mimo_provider();
-        p.models.insert("default".into(), "mimo-v2.5".into());
+        let p = mimo_provider_with_web_search();
         let req = json!({
             "model": "mimo-v2.5",
             "stream": true,
@@ -2524,8 +2562,7 @@ mod tests {
     fn mimo_web_search_preview_alias_handled_same_as_web_search() {
         // Codex.app 历史上有过 web_search_preview / web_search 两种 type,
         // mimo2codex `reqToChat.ts:196` 同样处理,我们也照抄。
-        let mut p = mimo_provider();
-        p.models.insert("default".into(), "mimo-v2.5".into());
+        let p = mimo_provider_with_web_search();
         let req = json!({
             "model": "mimo-v2.5",
             "stream": true,
@@ -2571,6 +2608,104 @@ mod tests {
         let out = convert(req);
         // 没 provider 时整个 web_search drop,tools 字段不存在(empty 数组不写入)
         assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
+    }
+
+    // ── A 层(provider 配置开关)──
+    // `request_options.web_search_enabled` 默认 false,用户必须显式标 true。
+    // 默认关闭原因:很多 provider(如 MiMo Token Plan)没开 plugin 时发
+    // web_search 工具会触发上游 400。
+
+    #[test]
+    fn mimo_provider_without_web_search_enabled_drops_web_search_by_default() {
+        // 默认状态:mimo_provider() 没设 web_search_enabled → 视为 false → drop
+        let mut p = mimo_provider();
+        p.models.insert("default".into(), "mimo-v2.5".into());
+        // 故意不设 web_search_enabled
+        let req = json!({
+            "model": "mimo-v2.5",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"web_search", "external_web_access": true},
+                {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            1,
+            "默认 web_search_enabled=false → web_search 被 A 层 drop"
+        );
+        assert_eq!(tools[0]["function"]["name"], "keep_me");
+    }
+
+    #[test]
+    fn mimo_provider_with_explicit_web_search_enabled_false_drops_web_search() {
+        // 显式标 false 跟没设效果一致 — 都触发 A 层 drop
+        let mut p = mimo_provider();
+        p.models.insert("default".into(), "mimo-v2.5".into());
+        p.request_options
+            .insert("web_search_enabled".into(), json!(false));
+        let req = json!({
+            "model": "mimo-v2.5",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"web_search"}]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
+    }
+
+    // ── B 层(运行时自动 disable cache)──
+    // `crate::disable_web_search_for(provider_id)` 后,即使配置 web_search_enabled=true,
+    // 同 provider id 后续转换也立即 drop。模拟 forward.rs 4xx fallback 后的行为。
+
+    #[test]
+    fn b_layer_runtime_disable_blocks_subsequent_web_search_conversion() {
+        let mut p = mimo_provider_with_web_search();
+        p.id = "mimo-runtime-disable-test".into();
+        // 模拟 forward.rs 4xx fallback 调用
+        crate::disable_web_search_for(&p.id);
+
+        let req = json!({
+            "model": "mimo-v2.5",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"web_search"},
+                {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            1,
+            "运行时 disable cache 命中 → web_search 被 B 层 drop,只剩 keep_me"
+        );
+        assert_eq!(tools[0]["function"]["name"], "keep_me");
+        assert!(crate::is_web_search_disabled_for(&p.id));
+    }
+
+    #[test]
+    fn b_layer_runtime_disable_only_affects_targeted_provider_id() {
+        // disable provider A 不影响 provider B(各自 cache 隔离)
+        let mut a = mimo_provider_with_web_search();
+        a.id = "mimo-disable-a".into();
+        let mut b = mimo_provider_with_web_search();
+        b.id = "mimo-untouched-b".into();
+        crate::disable_web_search_for(&a.id);
+
+        let req = json!({
+            "model": "mimo-v2.5",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"web_search"}]
+        });
+        let out_b = responses_body_to_chat_body_for_provider(&req, Some(&b)).unwrap();
+        // b 的 web_search_enabled=true 且没被 disable,正常转换
+        assert_eq!(out_b["tools"][0]["type"], "web_search");
     }
 
     #[test]

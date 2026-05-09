@@ -8,7 +8,7 @@
 
 | Provider | 文档实证 | 实施 | 单测 | 实地测试 | 备注 |
 |---|---|---|---|---|---|
-| **Xiaomi MiMo** | ✅ mimo2codex fresh 源码 1:1 对照 | ✅ `convert_web_search_tool` MiMo 分支 | ✅ 5 用例 | ⏳ **等用户实测** | 实测验收后才能进 Kimi 移植 |
+| **Xiaomi MiMo** | ✅ mimo2codex fresh 源码 1:1 对照 + dump 实证 4xx 错误 | ✅ `convert_web_search_tool` + A 配置开关 + B 运行时 cache | ✅ 8 用例(5 转换 + 2 A 层 + 2 B 层 + 5 forward.rs 关键字识别) | ⏳ **等用户实测**(配置 enable + plugin 已开 → 期待第一次成功) | 实测验收后才能进 Kimi 移植 |
 | **Kimi (Moonshot)** | ⏳ 待 WebFetch 官方文档 | — | — | — | 已知形态(待文档证实):`tools:[{type:"builtin_function", function:{name:"$web_search"}}]` |
 | **DeepSeek** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
 | **MiniMax M2.x** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
@@ -71,6 +71,14 @@ export interface ChatWebSearchTool {
 - 字段透传 4 个:`user_location` / `max_keyword` / `force_search` / `limit`
 - **OpenAI 的 `search_context_size` / `external_web_access` / `search_content_types` 字段在 MiMo 无等价,silent drop**(对齐 mimo2codex)
 - provider 识别:`provider.id` / `base_url` 含 `xiaomimimo` / `mimo`(沿用 `provider_looks_like` 模式)
+
+### 1.2.1 A+B 双层防错链路(2026-05-09 dump 实证)
+
+**A 层**:`Provider.request_options.web_search_enabled`(boolean,默认 false)。用户必须显式标 true 才发 web_search 工具。默认关闭原因:MiMo Token Plan 套餐没开 Web Search Plugin 时上游 400 `"web search tool found in the request body, but webSearchEnabled is false"`。UI 提示文案:**"web_search 需要先在 Xiaomi MiMo 控制台付费启用后才能正常使用"**。
+
+**B 层**:运行时自动 disable cache(`adapters::disable_web_search_for(provider_id)`)。`forward.rs::is_web_search_upstream_reject` 4xx 路径识别实测错误关键字(`webSearchEnabled is false` / `web search tool found` / 通用 `web search.*not enabled|not supported|not activated|disabled` 兜底)→ 命中即调 `disable_web_search_for`。`convert_web_search_tool` 检查 cache,命中即 drop(B 层在 A 层之后)。本次启动有效,应用重启后 cache 重置。
+
+**未做**(留 follow-up):transparent retry without web_search / 持久化写回 config.json / UI provider 编辑加 web_search switch。
 
 ### 1.3 入站 annotations 通用处理(跟 MiMo 同 commit)
 
