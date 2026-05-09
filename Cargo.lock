@@ -674,7 +674,6 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "tower",
- "tracing",
 ]
 
 [[package]]

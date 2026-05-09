@@ -561,6 +561,12 @@ mod tests {
             assert_eq!(result["ok"], json!(true), "403 仍 reachable");
             assert_eq!(result["authStatus"], json!("auth_required_or_invalid"));
             assert_eq!(result["statusCode"], json!(403));
+            // H3 (silent-failure-hunter review):防文案回归 — 403 message 必须含
+            // "auth required or invalid" 子串(跟 401 共用 match arm 的回归保险)
+            assert!(result["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("auth required or invalid"));
         });
     }
 

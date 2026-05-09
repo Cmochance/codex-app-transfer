@@ -25,6 +25,7 @@ use codex_app_transfer_codex_integration::{
     apply_provider, catalog_models_for_provider, has_snapshot, read_auth, restore_codex_state,
     ApplyConfig, CodexPaths,
 };
+use codex_app_transfer_proxy::proxy_telemetry;
 use codex_app_transfer_registry::RawConfig;
 use serde_json::{json, Value};
 
@@ -442,27 +443,37 @@ fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -
         return false;
     };
     let catalog_path = PathBuf::from(catalog_path);
-    // M3 (silent-failure-hunter review):catalog 读不到 / JSON 解析失败 → 区分
-    // 子原因 telemetry warn(原 .ok().and_then().unwrap_or_else(|| json!({}))
-    // 把"文件不存在"和"JSON 损坏"混吃成空对象 → 用户看到"未就绪"但分不清是
-    // 配置缺失还是文件损坏)。
+    // M3 (silent-failure-hunter review):catalog 读不到 / JSON 解析失败 → 通过
+    // proxy_telemetry().logs 写日志面板可见(原 `.ok().and_then().unwrap_or_else(|| json!({}))`
+    // 把"文件不存在"和"JSON 损坏"混吃成空对象 → 用户看到"未就绪"但分不清是配置
+    // 缺失还是文件损坏)。
+    //
+    // **必须用 proxy_telemetry.logs 而非 `tracing::warn!`**:整个 workspace 没
+    // `tracing_subscriber::*::init()`,Tauri 桌面用户不会从终端跑 binary,tracing
+    // event 默认 drop,等于"假修复"。proxy_telemetry.logs 通道写 ~/.codex-app-transfer/
+    // logs/proxy-*.log,设置面板 logs viewer 也能直接读。
+    let telemetry = proxy_telemetry();
     let catalog: Value = match fs::read_to_string(&catalog_path) {
         Ok(raw) => match serde_json::from_str::<Value>(&raw) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
-                    catalog_path = %catalog_path.display(),
-                    error = %e,
-                    "one_million_catalog_ready: model_catalog JSON 解析失败"
+                telemetry.logs.add(
+                    "WARN",
+                    format!(
+                        "one_million_catalog_ready: model_catalog JSON 解析失败 ({}): {e}",
+                        catalog_path.display(),
+                    ),
                 );
                 return false;
             }
         },
         Err(e) => {
-            tracing::warn!(
-                catalog_path = %catalog_path.display(),
-                error = %e,
-                "one_million_catalog_ready: model_catalog 文件读取失败"
+            telemetry.logs.add(
+                "WARN",
+                format!(
+                    "one_million_catalog_ready: model_catalog 文件读取失败 ({}): {e}",
+                    catalog_path.display(),
+                ),
             );
             return false;
         }

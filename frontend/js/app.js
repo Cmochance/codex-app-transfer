@@ -1493,12 +1493,15 @@
     return t("providers.testDone");
   }
 
-  // 测速结果是否要 UI 标黄(.bad class):
-  // - reachable=false:连接失败 / 4xx-405 endpoint unavailable / 5xx
-  // - authStatus=auth_required_or_invalid:连接 OK 但鉴权失败,可能 baseUrl 不是 LLM API
+  // 测速结果是否要 UI 标黄(.bad class)。**白名单语义**(silent-failure-hunter
+  // review H2):后端将来加新 authStatus 枚举(`tls_warn` / `rate_limited` /
+  // `cert_expired` 等)/ 或返 `success: false` 不带 ok 字段,helper 默认标黄不漏判。
+  // 只有显式"全 OK"才标绿:result 存在 + ok!==false + (无 authStatus 或 authStatus==="ok")。
   function isProviderTestResultBad(result) {
-    if (result?.ok === false) return true;
-    if (result?.authStatus === "auth_required_or_invalid") return true;
+    if (!result) return true;
+    if (result.success === false) return true;
+    if (result.ok === false) return true;
+    if (result.authStatus && result.authStatus !== "ok") return true;
     return false;
   }
 
