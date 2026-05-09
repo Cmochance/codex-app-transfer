@@ -97,6 +97,11 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         .map(codex_app_transfer_registry::strip_internal_model_suffix);
     if !provider_supports_vision(provider, body_model.as_deref()) {
         strip_image_blocks_in_place(&mut messages);
+    } else {
+        // 含 image_url 但无 text part 时补一个空格 text part — MiMo 多模态
+        // 接口强制要求(否则 400 "Param Incorrect: text is not set"),
+        // 对其他 supports_vision provider 无副作用,统一处理。
+        ensure_text_part_when_image_present(&mut messages);
     }
 
     // 历史定位(2026-05-06 → 2026-05-08):
@@ -1286,6 +1291,34 @@ fn strip_image_blocks_in_place(messages: &mut [Value]) {
     }
 }
 
+/// 兜底:有 `image_url` block 但完全没 `text` block 的 message,在 content
+/// 数组末尾追加 `{type:"text", text:" "}` —— 防止 MiMo 多模态接口因
+/// "Param Incorrect: text is not set" 拒绝纯图请求(MiMo 文档要求含
+/// `image_url` 时至少 1 个 text part)。其他 `supports_vision` provider
+/// (Kimi / OpenAI 等)对此无副作用,统一处理避免 per-provider 分支,
+/// 也省掉未来新接 vision provider 时重新评估的工作。
+///
+/// 对照实现:`7as0nch/mimo2codex` `reqToChat.ts:71-79` 同名兜底逻辑。
+fn ensure_text_part_when_image_present(messages: &mut [Value]) {
+    for msg in messages.iter_mut() {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        let Some(Value::Array(arr)) = obj.get_mut("content") else {
+            continue;
+        };
+        let has_image = arr
+            .iter()
+            .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("image_url"));
+        let has_text = arr
+            .iter()
+            .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"));
+        if has_image && !has_text {
+            arr.push(json!({"type": "text", "text": " "}));
+        }
+    }
+}
+
 /// Responses message.content 可能是 string 或 [{type, text/image_url}].
 /// stateless 阶段:string 保留;text 块拼成 string;含 image_url 的块降级为
 /// Chat 多模态格式(`[{type: "text", text}, {type: "image_url", image_url}]`).
@@ -2002,6 +2035,141 @@ mod tests {
         assert!(
             serialized.contains("\"image_url\""),
             "Kimi 应保留 image_url"
+        );
+    }
+
+    // ── ensure_text_part_when_image_present 兜底:MiMo 文档强制要求图存在
+    // 时 content 至少有 1 个 text part,否则 400 "Param Incorrect: text is
+    // not set"。借鉴 7as0nch/mimo2codex reqToChat.ts:71-79。
+    // 对其他 supports_vision provider (Kimi / OpenAI 等) 无副作用,统一处理。
+
+    #[test]
+    fn mimo_image_only_message_gets_text_part_appended() {
+        // MiMo vision 模型 + 仅 image 的 user 消息(用户粘图未输入文字)→
+        // 必须在 content 末尾追加 {type:"text", text:" "} 兜底
+        let mut mimo = mimo_provider();
+        mimo.models.insert("default".into(), "mimo-v2.5".into());
+        let req = json!({
+            "model": "mimo-v2.5",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&mimo)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        let content = messages[0]["content"].as_array().unwrap();
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text")),
+            "兜底 text part 必须存在,否则 MiMo 400 Param Incorrect\nactual: {content:?}"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("image_url")),
+            "原 image_url 必须保留\nactual: {content:?}"
+        );
+    }
+
+    #[test]
+    fn mimo_image_with_existing_text_part_unchanged() {
+        // 用户既贴了图也输了字 → 原 text part 已存在,不应再追加
+        let mut mimo = mimo_provider();
+        mimo.models.insert("default".into(), "mimo-v2.5".into());
+        let req = json!({
+            "model": "mimo-v2.5",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_text","text":"图里是什么"},
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&mimo)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        let content = messages[0]["content"].as_array().unwrap();
+        let text_blocks: Vec<&Value> = content
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .collect();
+        assert_eq!(
+            text_blocks.len(),
+            1,
+            "已有 text 时不应重复追加,只该有 1 个 text block\nactual: {content:?}"
+        );
+        assert_eq!(
+            text_blocks[0].get("text").and_then(|v| v.as_str()),
+            Some("图里是什么"),
+            "原 text 内容必须保留,不能被空格 text 覆盖"
+        );
+    }
+
+    #[test]
+    fn kimi_image_only_message_also_gets_text_part_appended() {
+        // 兜底统一对所有 supports_vision provider 应用(避免 per-provider
+        // 分支),Kimi 也加。空格 text 对 Kimi 无副作用 — 验证不会影响其
+        // image_url 保留。
+        let mut kimi = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
+        kimi.models.insert("default".into(), "kimi-k2.6".into());
+        let req = json!({
+            "model": "kimi-k2.6",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&kimi)).unwrap();
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text")),
+            "Kimi 也走兜底统一处理(无副作用)"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("image_url")),
+            "image_url 必须保留"
+        );
+    }
+
+    #[test]
+    fn text_only_provider_image_only_still_strips_to_placeholder() {
+        // 非 supports_vision provider(deepseek-v4-pro)+ 仅 image →
+        // 走 strip 路径,不该被 ensure_text_part 兜底干扰(strip 已自带
+        // 占位文本 "image omitted")
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out =
+            responses_body_to_chat_body_for_provider(&req, Some(&deepseek_provider())).unwrap();
+        let serialized = serde_json::to_string(&out["messages"]).unwrap();
+        assert!(
+            !serialized.contains("\"image_url\""),
+            "DeepSeek 必须 strip 掉 image_url"
+        );
+        assert!(
+            serialized.contains("image omitted"),
+            "占位文本必须存在(strip 路径,而非 ensure_text 兜底空格)"
+        );
+        // ensure_text_part 不应被调用(走的是 strip 分支)
+        assert!(
+            !serialized.contains(r#""text":" ""#),
+            "走 strip 分支时,不应额外追加空格 text"
         );
     }
 
