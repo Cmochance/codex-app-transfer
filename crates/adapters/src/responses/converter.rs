@@ -129,6 +129,13 @@ pub struct ChatToResponsesConverter {
     /// 含 6 个字段都需 namespace),缺 namespace 字段时所有 namespace 工具调用
     /// 都返回 `"unsupported call: <name>"`。
     tool_namespace_map: std::collections::HashMap<String, String>,
+
+    /// 当前 message item 累计的 url citation annotations(`delta.annotations`
+    /// 解析后的转换结果)。每条 message item open 时清空,close 时写入
+    /// final item 的 `content[0].annotations`。借鉴 mimo2codex
+    /// `streamToSse.ts:48` `state.activeAnnotations` + `streamToSse.ts:338-352`
+    /// 累计逻辑。
+    active_annotations: Vec<Value>,
 }
 
 impl ChatToResponsesConverter {
@@ -180,6 +187,7 @@ impl ChatToResponsesConverter {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             tool_namespace_map: std::collections::HashMap::new(),
+            active_annotations: Vec::new(),
         }
     }
 
@@ -459,6 +467,15 @@ impl ChatToResponsesConverter {
             }
         }
 
+        // url citation annotations(MiMo / Kimi / 其他支持 web_search 的 provider
+        // 在 delta.annotations 里返回引用)。借鉴 mimo2codex `streamToSse.ts:338-352`:
+        // 每条 annotation 转换字段(`summary` → `snippet`)、push 到 active_annotations
+        // 累计、emit `response.output_text.annotation.added` event。前提是有 active
+        // message item(annotation 必须挂在 message 上),没有就先 open。
+        if !choice.delta.annotations.is_empty() {
+            self.handle_annotations_delta(&choice.delta.annotations, out);
+        }
+
         // tool_calls(可能与 content / reasoning 同帧;此处独立处理)
         for tc in &choice.delta.tool_calls {
             self.handle_tool_call_delta(tc, out);
@@ -717,6 +734,45 @@ impl ChatToResponsesConverter {
         self.drain_think_tag_buffer(out, true);
     }
 
+    /// 处理 chat completions stream 的 `delta.annotations` 字段(URL citation)。
+    /// 借鉴 mimo2codex `streamToSse.ts:338-352`:
+    /// 1. annotation 必须挂在 message item 上,没 active message 就先开
+    /// 2. 字段映射:`summary` → `snippet`,缺失字段(`type` / `url` / `title`)填默认
+    /// 3. 累计到 `active_annotations`(close message 时塞进 final item content[0].annotations)
+    /// 4. emit `response.output_text.annotation.added`(逐 annotation 一个事件)
+    fn handle_annotations_delta(&mut self, annotations: &[Value], out: &mut Vec<u8>) {
+        if annotations.is_empty() {
+            return;
+        }
+        // annotations 必须挂在 message 上;reasoning open 时先 close,然后 open message
+        if self.reasoning_open && !self.reasoning_closed {
+            self.close_reasoning(out);
+        }
+        if !self.message_open {
+            self.open_message(out);
+        }
+        for annotation in annotations {
+            let translated = translate_annotation(annotation);
+            let annotation_index = self.active_annotations.len();
+            self.active_annotations.push(translated.clone());
+            let item_id = self.message_id.clone();
+            let output_index = self.message_index;
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_text.annotation.added",
+                json!({
+                    "type": "response.output_text.annotation.added",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "annotation_index": annotation_index,
+                    "annotation": translated,
+                }),
+            );
+        }
+    }
+
     /// MiniMax 原生 OpenAI-compatible 格式会把 thinking 写进
     /// `content` 的 `<think>...</think>` 中。这里把它拆成 Responses
     /// reasoning,避免标签和思考正文污染普通 assistant 文本。请求侧会优先
@@ -960,6 +1016,11 @@ impl ChatToResponsesConverter {
                 "text": self.text_acc,
             }),
         );
+        // close 时 part / final item 的 annotations 用累计的实际值
+        // (open 时是 `[]` 因为还没 annotation,delta.annotations 处理时累计到
+        // self.active_annotations,close 时塞回)。借鉴 mimo2codex
+        // `streamToSse.ts:230-256` `finalizeActive` 的 message 分支。
+        let annotations = Value::Array(self.active_annotations.clone());
         emit_event(
             out,
             &mut self.sequence_number,
@@ -972,7 +1033,7 @@ impl ChatToResponsesConverter {
                 "part": {
                     "type": "output_text",
                     "text": self.text_acc,
-                    "annotations": [],
+                    "annotations": annotations,
                 },
             }),
         );
@@ -1000,7 +1061,10 @@ impl ChatToResponsesConverter {
             "content": [{
                 "type": "output_text",
                 "text": self.text_acc,
-                "annotations": [],
+                // 累计 url citations(delta.annotations 解析后)。借鉴
+                // mimo2codex `streamToSse.ts:245-251` `finalItem` 的 message
+                // 分支结构。
+                "annotations": Value::Array(self.active_annotations.clone()),
             }],
         })
     }
@@ -1179,6 +1243,41 @@ fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
 /// 引用 —— 函数自动把当前值塞进 payload `sequence_number` 字段并 +1。借鉴
 /// mimo2codex `streamToSse.ts:71-72` `sequence_number: state.nextSeq()`,严格
 /// Responses 协议客户端依赖此字段确保事件不丢 / 不乱序。
+/// 把 chat completions `delta.annotations[]` 单条 annotation(MiMo / Kimi /
+/// 其他 provider 模型回答里 URL citation 的载体)翻译成 Responses API 的
+/// `response.output_text.annotation.added` event 里的 annotation 形态。
+///
+/// 借鉴 mimo2codex `streamToSse.ts:156-163` `translateAnnotation`:
+/// - `type` 默认 `"url_citation"`(对齐 OpenAI Responses API 标准 annotation type)
+/// - `url` / `title` 缺失填空字符串(严格协议客户端不容缺字段)
+/// - **`summary` → `snippet`**(mimo2codex 重命名,跟 OpenAI Responses
+///   url_citation annotation schema 对齐;summary 在 OpenAI 标准里没有,
+///   snippet 是其引用预览的字段名)
+fn translate_annotation(a: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let atype = a
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("url_citation");
+    out.insert("type".into(), Value::String(atype.to_owned()));
+    out.insert(
+        "url".into(),
+        a.get("url")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new())),
+    );
+    out.insert(
+        "title".into(),
+        a.get("title")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new())),
+    );
+    if let Some(summary) = a.get("summary") {
+        out.insert("snippet".into(), summary.clone());
+    }
+    Value::Object(out)
+}
+
 fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, mut payload: Value) {
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("sequence_number".into(), json!(*seq));
@@ -1272,6 +1371,14 @@ struct ChatDelta {
     /// 文本 / reasoning 全丢。这里走 Option 兜底再 flatten 回空 Vec。
     #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
     tool_calls: Vec<ChatToolCallDelta>,
+    /// MiMo / Kimi / 其他 chat 上游在模型回答里引用网页 / 文档时,通过
+    /// `delta.annotations` 增量返回 url citations。OpenAI 标准 chat
+    /// completions 也支持(web_search 启用后),所有 provider 通用。
+    /// 借鉴 mimo2codex `streamToSse.ts:338-352` 解析 + emit
+    /// `response.output_text.annotation.added` event。
+    /// 注释跟其他可空字段对齐,允许 null / missing 兜底为空 Vec。
+    #[serde(default, deserialize_with = "deserialize_null_or_missing_to_empty_vec")]
+    annotations: Vec<Value>,
     /// 旧版 Chat Completions 单工具调用增量。OpenAI 后续改为
     /// `tool_calls[]`,但 1.0.x 已把 `finish_reason=function_call` 视为完成,
     /// 这里把流式 delta 直接转成 index=0 的 function_call item。
@@ -1691,6 +1798,176 @@ mod tests {
             "顶级 function 不应有 namespace 字段;got: {}",
             added.1["item"]
         );
+    }
+
+    // ── delta.annotations → response.output_text.annotation.added 通用入站处理
+    // 借鉴 mimo2codex `streamToSse.ts:156-163, 338-352` 1:1 复刻,跨所有 provider
+    // 通用(任何 chat 上游模型回答里 URL 引用都会用 delta.annotations 携带)。
+
+    #[test]
+    fn delta_annotations_emit_url_citation_event_with_summary_renamed_to_snippet() {
+        // 关键字段重命名:`summary` → `snippet`(对齐 OpenAI Responses url_citation
+        // schema,mimo2codex `streamToSse.ts:161` 同样做)
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"see ref"}}]}
+
+"#,
+        ));
+        // 单 chunk 含 1 个 annotation,带 summary 字段
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"annotations":[{"type":"url_citation","url":"https://example.com/x","title":"Example","summary":"Brief excerpt"}]}}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let added = events
+            .iter()
+            .find(|(n, _)| n == "response.output_text.annotation.added")
+            .expect("annotation.added emitted");
+        assert_eq!(added.1["annotation"]["type"], "url_citation");
+        assert_eq!(added.1["annotation"]["url"], "https://example.com/x");
+        assert_eq!(added.1["annotation"]["title"], "Example");
+        assert_eq!(
+            added.1["annotation"]["snippet"], "Brief excerpt",
+            "summary 字段必须被重命名为 snippet"
+        );
+        assert!(
+            added.1["annotation"].get("summary").is_none(),
+            "原 summary 字段不该出现在 Responses 端 annotation 里"
+        );
+        assert_eq!(added.1["annotation_index"], 0);
+        assert_eq!(added.1["content_index"], 0);
+    }
+
+    #[test]
+    fn multiple_annotations_in_one_chunk_each_get_unique_increasing_index() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}
+
+"#,
+        ));
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"annotations":[{"type":"url_citation","url":"https://a.com","title":"A"},{"url":"https://b.com","title":"B"}]}}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let indices: Vec<i64> = events
+            .iter()
+            .filter(|(n, _)| n == "response.output_text.annotation.added")
+            .map(|(_, p)| p["annotation_index"].as_i64().unwrap())
+            .collect();
+        assert_eq!(indices, vec![0, 1], "多 annotation 索引单调递增 0,1,...");
+        // 第 2 条没传 type 字段,默认 "url_citation"
+        let second = events
+            .iter()
+            .filter(|(n, _)| n == "response.output_text.annotation.added")
+            .nth(1)
+            .unwrap();
+        assert_eq!(second.1["annotation"]["type"], "url_citation");
+        assert_eq!(second.1["annotation"]["url"], "https://b.com");
+    }
+
+    #[test]
+    fn final_message_item_includes_accumulated_annotations() {
+        // close 时 final message item 的 content[0].annotations 必须含累积的所有
+        // annotation,不再是写死 `[]`。借鉴 mimo2codex `streamToSse.ts:245-251`
+        // `finalItem` 的 message 分支结构。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}
+
+"#,
+        ));
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"annotations":[{"url":"https://x.com","title":"X"}]}}]}
+
+"#,
+        ));
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let final_msg = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("message in output");
+        let annotations = final_msg["content"][0]["annotations"]
+            .as_array()
+            .expect("annotations array");
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0]["url"], "https://x.com");
+        assert_eq!(annotations[0]["type"], "url_citation");
+    }
+
+    #[test]
+    fn annotations_open_message_item_when_none_active() {
+        // delta.annotations 出现时如果还没有 active message,自动 open 一个
+        // (annotation 必须挂在 message 上)。借鉴 mimo2codex `streamToSse.ts:339`:
+        // `if (state.activeKind !== "message") openMessage(sink, state)`。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        // 直接发只含 annotation 的 chunk(无 content delta)
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"annotations":[{"url":"https://only.com","title":"Only"}]}}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        // 应该 open 了 message item
+        let msg_added = events
+            .iter()
+            .find(|(n, p)| n == "response.output_item.added" && p["item"]["type"] == "message")
+            .expect("message output_item should be opened for orphan annotations");
+        assert_eq!(msg_added.1["item"]["role"], "assistant");
+        // 然后 emit annotation
+        let annot = events
+            .iter()
+            .find(|(n, _)| n == "response.output_text.annotation.added")
+            .expect("annotation event emitted after message open");
+        assert_eq!(annot.1["annotation"]["url"], "https://only.com");
+    }
+
+    #[test]
+    fn no_annotations_means_final_message_annotations_stays_empty() {
+        // 普通对话(无 annotation),final message annotations 是 [],跟旧行为一致
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"plain text"},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let final_msg = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap();
+        assert_eq!(final_msg["content"][0]["annotations"], json!([]));
     }
 
     #[test]
