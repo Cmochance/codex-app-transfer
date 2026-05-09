@@ -1562,6 +1562,17 @@
 
   async function saveProviderFromForm() {
     const payload = providerPayloadFromForm(true);
+    // Responses 透传协议(direct mode)必须填齐 baseUrl + apiKey,否则 backend
+    // 会 silent fallback 到 local_proxy → Codex.app 经代理 → 行为偏离用户预期。
+    // 前端拦下让用户立即看到错误,而不是后端 fallback 后用户毫无察觉。
+    if (payload.apiFormat === "responses" || payload.apiFormat === "openai_responses") {
+      if (!payload.baseUrl) {
+        throw new Error(t("toast.directModeBaseUrlRequired"));
+      }
+      if (!editingProviderId && !payload.apiKey) {
+        throw new Error(t("toast.directModeApiKeyRequired"));
+      }
+    }
     if (editingProviderId) {
       await CCApi.saveDraft(editingProviderId, payload);
       return { id: editingProviderId, ...payload };

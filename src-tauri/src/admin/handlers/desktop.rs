@@ -974,6 +974,130 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_aliases_never_bypass_proxy() {
+        // 防回归:`anthropic` / `claude` / `messages` 是 Python 历史兼容值,
+        // 必须继续走 local_proxy ResponsesAdapter 本地协议转换;direct 分支只放行
+        // `responses` / `openai_responses`。如未来误把 anthropic 加进 bypass match
+        // → 复活 v1.x MiMo 404 类回归(Codex.app 直连第三方上游 /responses → 必 404)。
+        for fmt in ["anthropic", "claude", "messages"] {
+            let mut cfg = config_with_secret();
+            let provider = json!({
+                "id": "anthropic-aliased",
+                "name": "Anthropic Aliased",
+                "baseUrl": "https://anthropic-style.example.com/v1/",
+                "authScheme": "bearer",
+                "apiFormat": fmt,
+                "apiKey": "sk-x",
+                "models": {"default": "claude-sonnet"},
+            });
+            let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
+            assert_eq!(
+                target.mode, "local_proxy",
+                "{fmt} 必须走代理协议转换,不能进 bypass"
+            );
+            assert!(target.requires_proxy, "{fmt} 必须 requires_proxy=true");
+        }
+    }
+
+    #[test]
+    fn openai_responses_alias_triggers_direct_mode() {
+        // 防回归:registry.rs::lookup 已支持 `openai_responses` 别名,
+        // desktop bypass 分支必须同样支持(独立 match 分支,registry 测试不传递)。
+        let mut cfg = config_with_secret();
+        let provider = json!({
+            "id": "alias-direct",
+            "name": "Alias Direct",
+            "baseUrl": "https://api.openai.com/v1/",
+            "authScheme": "bearer",
+            "apiFormat": "openai_responses",
+            "apiKey": "sk-direct",
+            "models": {"default": "gpt-5"},
+        });
+        let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
+        assert_eq!(
+            target.mode, "direct",
+            "openai_responses 别名必须跟 responses 同样进 bypass"
+        );
+        assert!(!target.requires_proxy);
+        assert_eq!(target.base_url, "https://api.openai.com/v1/");
+        assert_eq!(target.api_key, "sk-direct");
+    }
+
+    #[test]
+    fn switch_back_to_builtin_restarts_proxy_and_repoints_config() {
+        // 防回归:用户工作流 "加 OpenAI direct 试用 → 切回 Kimi"。反向切换
+        // 必须:① config.toml 重新指向 127.0.0.1:proxy_port;② auth.json 写
+        // gateway key(不再是 sk-direct);③ 代理 manager 重新 start。
+        // 若反向切换 config 没重写 / 代理没重启 → Codex.app 仍连 OpenAI baseUrl
+        // 但带 Kimi key → 全爆。
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["settings"]["proxyPort"] = json!(0);
+                cfg["providers"] = json!([
+                    cfg["providers"][0].clone(),  // p1: builtin (openai_chat)
+                    {
+                        "id": "p2",
+                        "name": "Custom Direct",
+                        "baseUrl": "https://direct.example.com/v1/",
+                        "authScheme": "bearer",
+                        "apiFormat": "responses",
+                        "apiKey": "sk-direct",
+                        "models": {"default": "direct-model"},
+                        "sortIndex": 1
+                    }
+                ]);
+                save_registry(&cfg).unwrap();
+                fs::create_dir_all(home.join(".codex")).unwrap();
+
+                let manager = Arc::new(ProxyManager::new());
+
+                // Step 1: 切到 p2 (direct mode) — config 应指向 direct.example.com
+                let r1 = switch_provider_and_sync(Arc::clone(&manager), "p2".to_owned()).await;
+                assert_eq!(r1["desktopSync"]["mode"], json!("direct"));
+                assert!(!manager.status().running, "direct 模式不启动代理");
+                let toml1 = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+                assert!(toml1.contains("direct.example.com"));
+
+                // Step 2: 切回 p1 (builtin local_proxy) — config 应重新指向 127.0.0.1
+                let p1_id = cfg["providers"][0]["id"].as_str().unwrap().to_owned();
+                let r2 = switch_provider_and_sync(Arc::clone(&manager), p1_id).await;
+                assert_eq!(r2["desktopSync"]["mode"], json!("local_proxy"));
+                assert!(manager.status().running, "切回 builtin 必须重启代理");
+                let toml2 = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+                assert!(
+                    toml2.contains("openai_base_url = \"http://127.0.0.1:"),
+                    "config.toml 必须重新指向 127.0.0.1,实际:\n{toml2}"
+                );
+                assert!(
+                    !toml2.contains("direct.example.com"),
+                    "禁止残留 direct 上游 URL:\n{toml2}"
+                );
+                let auth_json: Value = serde_json::from_str(
+                    &fs::read_to_string(home.join(".codex").join("auth.json")).unwrap(),
+                )
+                .unwrap();
+                let api_key = auth_json["OPENAI_API_KEY"].as_str().unwrap_or_default();
+                assert_ne!(
+                    api_key, "sk-direct",
+                    "auth.json 不能残留 direct 时的 provider apiKey"
+                );
+                assert!(
+                    !api_key.is_empty(),
+                    "auth.json 必须有 gateway key(local_proxy 模式)"
+                );
+
+                manager.stop_silent();
+            });
+        });
+    }
+
+    #[test]
     fn startup_auto_apply_starts_proxy_and_exit_restore_uses_snapshot() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
