@@ -12,8 +12,8 @@
 | **Kimi (Moonshot)** | ✅ WebFetch `platform.kimi.ai/docs/guide/use-web-search` 真文档实证 | ✅ Kimi/Moonshot 分支 + 自动注入 `thinking.disabled` 顶级字段 | ✅ 5 用例 | ✅ **实测通过**(2026-05-09):Kimi For Coding + Moonshot `=true` 上游接受 builtin_function 无降级警告;Moonshot 单条 429 是账号 TPD 超额(跟 PR 无关) | 完成,进入 DeepSeek 阶段 |
 | **DeepSeek** | ✅ WebFetch `api-docs.deepseek.com/api/create-chat-completion` 实证 `"Currently, only function is supported"` | ✅ 显式 drop 分支 + warn key `web_search:not-supported-by-deepseek-api` | ✅ 2 用例 | ✅ 不需要实测(文档实证不支持,代码层只 drop;用户联网走 P5 已通的 MCP 路径) | 完成 |
 | **MiniMax M2.x** | ✅ WebFetch `platform.minimaxi.com/docs/api-reference/` + liteLLM 三方实证:chat tools 仅 `type:"function"`,web_search 仅作 Token Plan MCP 工具存在 | ✅ 显式 drop + warn key `web_search:not-supported-by-minimax-api` + **新加 MiniMax builtin preset(2026-05-09)** + 官方 favicon 图标 | ✅ 1 用例 + preset 完整性测试 | ✅ 不需实测(文档实证不支持;preset 显示可后续 UI 验证) | 完成 |
-| **(实验兼容)阿里 Qwen** | ⏳ | — | — | — | `extra_body.enable_search` 形态待证 |
-| **(实验兼容)智谱 GLM** | ⏳ | — | — | — | `browser.search` 形态待证 |
+| **(实验兼容)阿里 Qwen** | ⚠️ **部分实证 + 部分阻断**:Responses API 端点 (`/compatible-mode/v1/responses`) WebFetch 真原文实证 `tools:[{type:"web_search"}]` ✓;但本仓 `bailian` preset 走 chat completions 端点,chat 端 `extra_body.enable_search` 形态文档入口全 404 拿不到一手源 | ⏸️ **暂停**(等用户提供可访问的 chat completions web search 文档 URL) | — | — | follow-up,详见 §5 |
+| **(实验兼容)智谱 GLM** | ❌ **未实证**:agent 当时给的 `browser.search` 是综合推理无 quote 原文;`docs.bigmodel.cn` 各路径全 404 | ⏸️ **暂停**(等用户提供可访问的官方文档 URL) | — | — | follow-up,详见 §6 |
 | **入站 `delta.annotations` 通用处理** | ✅ mimo2codex `streamToSse.ts:156-163, 338-352` | ✅ `handle_annotations_delta` + `translate_annotation` | ✅ 5 用例 | ⏳ 跟 MiMo 一起实测 | 跨 provider 通用 |
 
 ## 1. Xiaomi MiMo(优先实施)
@@ -244,24 +244,69 @@ Node Repl 之类绕路)。
 
 (等 MiMo 实测通过后再启动)
 
-## 5. 阿里 Qwen(实验兼容)
+## 5. 阿里 Qwen(实验兼容)— **暂停状态**
 
-### 5.1 待办
+### 5.1 实证现状(2026-05-09)
 
-- **WebFetch** 官方文档:https://help.aliyun.com/zh/model-studio/qwen-web-search
-- 关注:
-  - `extra_body.enable_search`(顶级字段,**不是 tools**)的实际形态
-  - `search_options.forced_search?` 子字段
-  - response 字段
+**Responses API 端点已实证支持**:WebFetch `https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-responses` 拿到原文:
 
-## 6. 智谱 GLM(实验兼容)
+```json
+{
+  "model": "qwen3.6-plus",
+  "input": "...",
+  "tools": [{"type": "web_search"}, {"type": "code_interpreter"}, {"type": "web_extractor"}]
+}
+```
 
-### 6.1 待办
+> "内置联网搜索、网页抓取、代码解释器、文搜图、图搜图、知识库搜索等工具"
 
-- **WebFetch** 官方文档:https://docs.bigmodel.cn/cn/api-reference/api-trial/web-search
-- 关注:
-  - 工具列表里 `browser.search` 还是别的格式
-  - GLM-4.5+ tool-integrated reasoning 字段
+端点:`POST https://dashscope.aliyuncs.com/compatible-mode/v1/responses`
+
+响应:`web_search_call` output items 含 `query` + `sources` 数组。
+
+### 5.2 暂停原因
+
+本仓现有 `bailian` builtin preset 配:
+- `baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1"`
+- `apiFormat: "openai_chat"`(走 **chat completions** 端点 `/v1/chat/completions`,**不是** Responses)
+
+**Qwen chat completions 端点是否支持 web_search 没找到一手文档**:
+- `https://help.aliyun.com/zh/model-studio/qwen-via-openai-chat-completions` → 404
+- `https://help.aliyun.com/zh/model-studio/use-the-qwen-text-generation-model` → 404
+- 其他 Aliyun 入口均 404 / SSR 拿不到
+
+agent 之前给的 `extra_body.enable_search: true + search_options.forced_search` 形态**没附具体页面 quote 原文**(可能 agent 综合多页拼出),不算严格 WebFetch 真原文实证。
+
+### 5.3 后续启动条件(任一满足即可)
+
+1. **用户提供可访问的 Qwen chat completions web_search 文档 URL**(我 WebFetch 验证后做 explicit `extra_body.enable_search` 分支)
+2. **本仓 `bailian` preset 升级到 Responses 端点**(`apiFormat` 改 `responses` / 加新 preset)→ 直接走 Qwen Responses API 已实证的 `tools:[{type:"web_search"}]` 路径
+3. 用户手上有 Qwen chat completions web search 真实请求 JSON,贴给我做实证依据
+
+未启动前,bailian preset 用户 `web_search_enabled=true` 走通用 fallback(`web_search:provider-not-implemented`)。
+
+## 6. 智谱 GLM(实验兼容)— **暂停状态**
+
+### 6.1 实证现状(2026-05-09)
+
+**完全没找到一手文档**:
+- `https://docs.bigmodel.cn/cn/api-reference/api-trial/web-search` → 404
+- `https://docs.bigmodel.cn/cn/api-reference/llm/web-search` → 404
+- `https://docs.bigmodel.cn/api-reference/搜索能力` → 404
+- `https://www.bigmodel.cn/dev/api` → redirect to docs.bigmodel.cn 然后 404
+
+agent 之前给的 "GLM-4.5+ tool-integrated reasoning 通过预定义工具如 `browser.search`" **是 agent 自己综合推理,完全没 quote 原文**。
+
+### 6.2 暂停原因
+
+按 "严格不靠推测、必须 WebFetch 真原文实证" 原则,无文档源就不动。
+
+### 6.3 后续启动条件(用户任一满足即可)
+
+1. 用户提供可访问的 GLM 官方 web_search / 联网搜索文档 URL(我 WebFetch 验证)
+2. 用户手上有 GLM 真实 web_search 请求 JSON 示例,贴给我做实证依据
+
+未启动前,zhipu preset 用户 `web_search_enabled=true` 走通用 fallback。
 
 ## 7. 通用入站 annotations 处理(跟 MiMo 同实施)
 
