@@ -119,6 +119,16 @@ pub struct ChatToResponsesConverter {
     /// envelope.created_at 时间戳(秒),整个响应生命周期固定。借鉴
     /// mimo2codex `streamToSse.ts:41` `createdAt = Math.floor(Date.now() / 1000)`。
     created_at: u64,
+
+    /// `function_name → namespace_name` 反查表,扫 `original_request.tools`
+    /// 里所有 `type:"namespace"` 包的内层 function name 建立。`emit_*` function_call
+    /// 相关 SSE event 时,若 function.name 命中此表,**给 item 加 `namespace`
+    /// 字段** —— 这是 Codex.app 客户端 dispatch namespace 工具调用的必要字段
+    /// (实测 `strings /Applications/Codex.app/Contents/Resources/codex` 含
+    /// `"dynamic tool namespace must not be empty for"` 校验 + `DynamicToolCallRequest`
+    /// 含 6 个字段都需 namespace),缺 namespace 字段时所有 namespace 工具调用
+    /// 都返回 `"unsupported call: <name>"`。
+    tool_namespace_map: std::collections::HashMap<String, String>,
 }
 
 impl ChatToResponsesConverter {
@@ -169,6 +179,7 @@ impl ChatToResponsesConverter {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            tool_namespace_map: std::collections::HashMap::new(),
         }
     }
 
@@ -190,11 +201,49 @@ impl ChatToResponsesConverter {
     /// envelope 构造时从中抽取 tools / parallel_tool_calls / tool_choice /
     /// reasoning / text / metadata / previous_response_id / instructions /
     /// temperature / top_p / max_output_tokens / truncation 等字段,保协议
-    /// 合规性 + 让 Codex CLI 用 tools 数组反向路由 namespace 工具调用。
-    /// 借鉴 mimo2codex `streamToSse.ts:75-105` `buildResponseSnapshot`。
+    /// 合规性。**同时**扫描 tools 里 `type:"namespace"` 包,建立
+    /// `function.name → namespace.name` 反查表,emit function_call 相关
+    /// events 时给 item 加 `namespace` 字段(Codex.app dispatch 必要字段)。
+    /// 借鉴 mimo2codex `streamToSse.ts:75-105` `buildResponseSnapshot`(全字段
+    /// 回灌)+ `Codex.app` binary strings 实证(`DynamicToolCallRequest` 含
+    /// namespace 必填字段)。
     pub fn with_original_request(mut self, request: Option<Value>) -> Self {
+        // 扫 tools 数组,把每个 namespace 包内层 function 的 name 映射到 namespace 名
+        if let Some(req) = request.as_ref() {
+            if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
+                for tool in tools {
+                    let Some(obj) = tool.as_object() else { continue };
+                    if obj.get("type").and_then(|v| v.as_str()) != Some("namespace") {
+                        continue;
+                    }
+                    let Some(ns_name) = obj.get("name").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Some(inner_tools) = obj.get("tools").and_then(|v| v.as_array()) else {
+                        continue;
+                    };
+                    for inner in inner_tools {
+                        let Some(inner_obj) = inner.as_object() else { continue };
+                        if inner_obj.get("type").and_then(|v| v.as_str()) != Some("function") {
+                            continue;
+                        }
+                        if let Some(fname) = inner_obj.get("name").and_then(|v| v.as_str()) {
+                            // 后写覆盖前写(罕见同名跨 namespace 时取最后一个)
+                            self.tool_namespace_map
+                                .insert(fname.to_owned(), ns_name.to_owned());
+                        }
+                    }
+                }
+            }
+        }
         self.original_request = request;
         self
+    }
+
+    /// 查询 function.name 对应的 namespace.name(用于给 function_call output
+    /// 添加 `namespace` 字段,让 Codex.app 客户端能 dispatch 到对应 MCP server)。
+    fn lookup_namespace_for(&self, tool_name: &str) -> Option<&str> {
+        self.tool_namespace_map.get(tool_name).map(String::as_str)
     }
 
     /// 从 `original_request` 抽取一个字段;不存在时返回 fallback `Value`。
@@ -461,6 +510,23 @@ impl ChatToResponsesConverter {
                     closed: false,
                 },
             );
+            // 如果 function name 来自 namespace 包(从 original_request.tools
+            // 反查表查到),给 item 加 `namespace` 字段 — Codex.app 客户端
+            // dispatch namespace 工具时这是必要字段(strings 实证 binary 含
+            // `dynamic tool namespace must not be empty for` 校验,缺字段会
+            // 报 `unsupported call: <name>`)。
+            let namespace = self.lookup_namespace_for(&name).map(str::to_owned);
+            let mut item = json!({
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": "",
+                "status": "in_progress",
+            });
+            if let Some(ns) = namespace.as_ref() {
+                item["namespace"] = Value::String(ns.clone());
+            }
             emit_event(
                 out,
                 &mut self.sequence_number,
@@ -468,14 +534,7 @@ impl ChatToResponsesConverter {
                 json!({
                     "type": "response.output_item.added",
                     "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": fc_id,
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": "",
-                        "status": "in_progress",
-                    },
+                    "item": item,
                 }),
             );
         }
@@ -529,10 +588,22 @@ impl ChatToResponsesConverter {
     }
 
     fn close_tool_call(&mut self, openai_index: u32, out: &mut Vec<u8>) {
-        let Some(pending) = self.tool_calls.get_mut(&openai_index) else {
-            return;
+        // 先把所有需要的字段 clone 出来,避免 mutable borrow 跟
+        // self.lookup_namespace_for 的 immutable borrow 冲突
+        let (fc_id, call_id, name, args_acc, output_index, already_closed) = {
+            let Some(pending) = self.tool_calls.get(&openai_index) else {
+                return;
+            };
+            (
+                pending.fc_id.clone(),
+                pending.call_id.clone(),
+                pending.name.clone(),
+                pending.args_acc.clone(),
+                pending.output_index,
+                pending.closed,
+            )
         };
-        if pending.closed {
+        if already_closed {
             return;
         }
         emit_event(
@@ -541,26 +612,30 @@ impl ChatToResponsesConverter {
             "response.function_call_arguments.done",
             json!({
                 "type": "response.function_call_arguments.done",
-                "item_id": pending.fc_id,
-                "output_index": pending.output_index,
-                "arguments": pending.args_acc,
+                "item_id": fc_id,
+                "output_index": output_index,
+                "arguments": args_acc,
             }),
         );
-        let item = json!({
+        let namespace = self.lookup_namespace_for(&name).map(str::to_owned);
+        let mut item = json!({
             "type": "function_call",
-            "id": pending.fc_id,
-            "call_id": pending.call_id,
-            "name": pending.name,
-            "arguments": pending.args_acc,
+            "id": fc_id,
+            "call_id": call_id,
+            "name": name,
+            "arguments": args_acc,
             "status": "completed",
         });
+        if let Some(ns) = namespace.as_ref() {
+            item["namespace"] = Value::String(ns.clone());
+        }
         emit_event(
             out,
             &mut self.sequence_number,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
-                "output_index": pending.output_index,
+                "output_index": output_index,
                 "item": item,
             }),
         );
@@ -568,13 +643,15 @@ impl ChatToResponsesConverter {
         // Codex CLI 发 function_call_output 时 repair_tool_call_ids 路径 B
         // 在前 assistant 找不到 call_id 时重建工具调用上下文。
         global_tool_call_cache().save(
-            &pending.call_id,
+            &call_id,
             ToolCallEntry {
-                name: pending.name.clone(),
-                arguments: pending.args_acc.clone(),
+                name: name.clone(),
+                arguments: args_acc.clone(),
             },
         );
-        pending.closed = true;
+        if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+            pending.closed = true;
+        }
     }
 
     fn emit_reasoning_delta(&mut self, text: &str, out: &mut Vec<u8>) {
@@ -704,15 +781,19 @@ impl ChatToResponsesConverter {
         }
     }
 
-    fn tool_call_item_completed(pending: &PendingToolCall) -> Value {
-        json!({
+    fn tool_call_item_completed(&self, pending: &PendingToolCall) -> Value {
+        let mut item = json!({
             "type": "function_call",
             "id": pending.fc_id,
             "call_id": pending.call_id,
             "name": pending.name,
             "arguments": pending.args_acc,
             "status": "completed",
-        })
+        });
+        if let Some(ns) = self.lookup_namespace_for(&pending.name) {
+            item["namespace"] = Value::String(ns.to_owned());
+        }
+        item
     }
 
     fn open_reasoning(&mut self, out: &mut Vec<u8>) {
@@ -967,7 +1048,7 @@ impl ChatToResponsesConverter {
             all_items.push((self.message_index, self.message_item_completed()));
         }
         for tc in self.tool_calls.values() {
-            all_items.push((tc.output_index, Self::tool_call_item_completed(tc)));
+            all_items.push((tc.output_index, self.tool_call_item_completed(tc)));
         }
         all_items.sort_by_key(|(idx, _)| *idx);
         let output_items: Vec<Value> = all_items.into_iter().map(|(_, v)| v).collect();
@@ -1511,6 +1592,114 @@ mod tests {
                 "created_at must be unix seconds"
             );
         }
+    }
+
+    #[test]
+    fn function_call_item_includes_namespace_field_when_tool_came_from_namespace_pack() {
+        // 关键修复:Codex.app 客户端 dispatch namespace 工具时必须读 `namespace`
+        // 字段(strings 实证 binary 含 `dynamic tool namespace must not be empty`
+        // 校验)。converter 扫 original_request.tools 里 namespace 包,建反查表,
+        // emit function_call output 时给 item 加 namespace。
+        let original_request = json!({
+            "model": "kimi",
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "namespace", "name": "mcp__notion__", "tools": [
+                    {"type": "function", "name": "notion_search"},
+                    {"type": "function", "name": "notion_create_pages"},
+                ]},
+                {"type": "namespace", "name": "mcp__figma__", "tools": [
+                    {"type": "function", "name": "whoami"},
+                ]},
+            ]
+        });
+        let mut c = ChatToResponsesConverter::new_with_ids(
+            "resp_x".into(),
+            "msg_x".into(),
+            "rs_x".into(),
+        )
+        .with_original_request(Some(original_request));
+        let mut all = Vec::new();
+        // 模型生成 tool_call: notion_search
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"notion_search","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        // response.output_item.added 的 item 必须含 namespace = mcp__notion__
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .expect("function_call output_item.added emitted");
+        assert_eq!(
+            added.1["item"]["namespace"], "mcp__notion__",
+            "function_call.added item 必须含 namespace 字段(Codex.app dispatch 必要)"
+        );
+        assert_eq!(added.1["item"]["name"], "notion_search");
+
+        // response.output_item.done 同理
+        let done = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .expect("function_call output_item.done emitted");
+        assert_eq!(done.1["item"]["namespace"], "mcp__notion__");
+
+        // response.completed 里的 output 数组 final item 也要含 namespace
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed emitted");
+        let final_output = completed.1["response"]["output"].as_array().unwrap();
+        let final_fc = final_output
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .expect("function_call in completed output");
+        assert_eq!(final_fc["namespace"], "mcp__notion__");
+    }
+
+    #[test]
+    fn function_call_item_omits_namespace_when_tool_is_top_level_function() {
+        // 顶级 function(非 namespace 包内层),item 不应含 namespace 字段,
+        // 否则 Codex.app 可能把它误当 dynamic tool 路由到不存在的 server。
+        let original_request = json!({
+            "model": "kimi",
+            "tools": [{"type": "function", "name": "shell"}]
+        });
+        let mut c = ChatToResponsesConverter::new_with_ids(
+            "resp_x".into(),
+            "msg_x".into(),
+            "rs_x".into(),
+        )
+        .with_original_request(Some(original_request));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"shell","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .unwrap();
+        assert!(
+            added.1["item"].get("namespace").is_none(),
+            "顶级 function 不应有 namespace 字段;got: {}",
+            added.1["item"]
+        );
     }
 
     #[test]
