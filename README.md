@@ -16,15 +16,67 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本:**v2.1.2**(Python → Rust/Tauri 全栈重写后的当前主线;UI 视觉与 v1.0.4 字节级一致)
+- 当前版本:**v2.1.2**(Python → Rust/Tauri 全栈重写后的当前主线)
 - 已验证供应商:Kimi Code(`kimi-for-coding` UA 网关)、Kimi 月之暗面(Moonshot Platform)、DeepSeek V4(官方 baseUrl,含「Max 思维」思考模式)、Xiaomi MiMo (Token Plan / Pay for Token)、MiniMax M2.x(OpenAI-compatible chat,自动剥不兼容字段 + `reasoning_split` + `<think>` 兜底)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
-- v2.x 链路稳定性改动(累计到 v2.1.2):**chat 端原生 web_search 工具支持**(逐家文档实证后实施:Xiaomi MiMo 私有 `type:"web_search"` 工具 + 4 字段透传(`user_location` / `max_keyword` / `force_search` / `limit`)+ A 配置开关 `web_search_enabled` 默认关闭 + B 4xx 上游拒绝时 transparent retry 自动降级 + 进程内 disable cache 防重复失败;Kimi (Moonshot) 内置 `$web_search` builtin_function + 自动注入 `thinking:{type:"disabled"}` 顶级字段(Kimi 文档强制要求);DeepSeek / MiniMax 文档实证 chat 端不支持 → 显式 drop + 专属 warn key 帮用户调试;OpenAI Responses `delta.annotations` URL citation **跨 provider 通用入站处理**(任何 chat 上游模型回答里 URL 引用都通过 `response.output_text.annotation.added` event 透传给 Codex.app UI 显示来源链接,P5 之前完全丢失);**新加 MiniMax builtin preset 卡片**(粉红渐变音波 logo 真品牌 favicon,用户可像其他 builtin provider 一样直接点选,不用手动配 base_url));**namespace MCP 工具调用**(实测 Codex.app 客户端配 12+ MCP servers 共 88 个具体 function 在第三方 chat completions provider 之前必须做四件事:① `type:"namespace"` 包递归 `flat_map` 展平为顶级 function;② chat→responses SSE envelope 回灌完整 16+ 字段(`tools`/`tool_choice`/`reasoning`/`text`/`metadata`/`previous_response_id`/`temperature` 等)+ `created_at` + 每个 event 单调递增 `sequence_number` —— 严格 Responses 协议合规;③ **function_call SSE output 加 `namespace` 字段**(strings 实证 Codex.app desktop binary 含 `dynamic tool namespace must not be empty for` 校验,缺这个字段所有 namespace 工具调用都返回 `unsupported call: <name>`);④ unknown tool type `warn_once_drop_tool` 防多轮重发刷屏;借鉴 mimo2codex `streamToSse.ts` + Codex.app 二进制反求工程,本项目五层修复后 Notion / Figma / Zeabur 等 MCP server 完整工具集模型可见可调);**MiMo 多模态纯图请求兜底**(MiMo 文档要求 content 含 `image_url` 时至少 1 个 text part 否则 400 `Param Incorrect: text is not set`,Codex CLI 用户粘图未输入文字场景统一兜底插入空格 text part);reasoning_content 历史回放 + 全局 `TOOL_CALLS_CACHE` 在历史压缩后重建缺失的 assistant.tool_calls;`response.in_progress` 事件按协议补齐;chat usage → responses usage 字段规范化(含 `cached_tokens` 默认补零,避免 Kimi/MiMo 重连卡顿);DeepSeek 视觉(image)输入剥离避免 400;vision 白名单按模型级精确匹配(替换之前的 provider 子串匹配);Kimi/DeepSeek thinking 在 Codex CLI TUI 显示头修复 + `extraHeaders` 支持 `{apiKey}` 模板(解决 Kimi 403);MiniMax 兼容(请求侧白名单清洗 `reasoning_effort`/`response_format`/`parallel_tool_calls` 等不支持字段、`tool` 剥 `strict`、连续 `system` 合并;响应侧 `reasoning_details` 拆 reasoning + `<think>` 兜底拆分仅对 MiniMax 启用);**Codex CLI 客户端身份头零泄漏**(出站剔除 `originator`/`x-codex-*`/`x-openai-*`/`chatgpt-account-id`/`session_id`/`thread_id`/`user-agent`,reqwest 默认 UA 改为中性 `Codex-App-Transfer/<v>`,彻底解决 Kimi For Coding Windows 403 access_terminated_error);**配置自愈**(load config.json 时按 `baseUrl normalize` 命中 builtin preset,**不依赖 `isBuiltin` 字段或随机 hex id**,命中即强制覆盖 `apiFormat / authScheme / extraHeaders` + 把 `isBuiltin=true`,admin 路径**写回磁盘**根治旧残留 —— 适配真机里 v1.x 升级遗留的"name/baseUrl 是 builtin 但 isBuiltin=false、id 是随机 hex"的老配置);**MiMo Token Plan 404 修复**(`apiFormat == "responses"` 不再被误读为"上游原生 Responses 透传"路由到 direct_provider,所有 provider 永远走 local_proxy,Responses↔Chat 协议转换由代理在本地完成);**`apiFormat` fallback 全栈统一为 `openai_chat`**(后端 add+update+import + 前端 mapProvider/providerBody/getPresets/选预设/编辑共 8 处对齐 schema serde default);**Responses 会话历史持久化**(`ResponseSessionCache` 双层架构:L1 内存 1000×60min LRU + L2 sqlite 30 天 TTL,落盘 `~/.codex-app-transfer/sessions.db`,Tauri 重启 / TTL 续期不丢历史 → ws incremental delta=0 续轮直接命中 cache 走 ws 路径,避免 stream retry + fallback HTTP 浪费);**Codex CLI ws warmup 不再打上游 + 立即关闭 ws 让客户端 fallback HTTP**(`server.rs` ws handler 识别 `generate: false` / 空 input 帧后直接发送 ws **Close frame**(连接关闭语义),Codex CLI 立即放弃 ws session 转 HTTP `stream_responses_api`。**注意**:之前 v2.0.11 早期用 `{"type":"error",...}` 文本帧被 Codex CLI 当流内错误处理,卡 ws idle timeout ~5 分钟才 fallback —— 实测反馈 fb-8f5b51fb / fb-0c121681 卡 4分48秒,改 Close frame 后秒级 fallback);**cache miss 错误体对齐 OpenAI SDK**(`previous_response_id` 失效返 HTTP 400 + `code: "previous_response_not_found"` 字面对齐 OpenAI 服务端真实行为,SDK / Codex CLI 错误处理路径直接复用);**user-facing 字符串改回英文**(API 响应 message / proxy telemetry log / tray menu / SDK 错误体全部英文,对齐 OpenAI/Anthropic SDK 错误处理风格;注释 / test 仍保留中文);**autocompact summary 大幅增强**(`/responses/compact` 本地实现的 SUMMARIZATION_PROMPT 从 Codex 86 字符版改为 Claude Code 风格 9-section 强 schema:`<analysis>` + `<summary>` 二段输出 + `Primary Request`/`Files and Code Sections`/`All User Messages 逐字列`/`Errors and Fixes`/`Current Work`/`Next Step verbatim quote` 等 9 个固定 section + few-shot example,并改注入位置从 system 到最后一条 user message 提升第三方 provider 服从度;响应解析只抽 `<summary>` 段进续轮 history,过滤 `<analysis>` chain-of-thought 防污染。**根治旧 prompt"compact 后只记最近 1-2 个动作"丢任务目标 / 文件路径 / 历次 user 主诉的体感断片**);Windows 重启 Codex 不再 flash 终端窗口 + 托盘菜单交互修复;启用按钮即时反馈,不再等转发回包
-
-> 如果使用过程中出现问题，欢迎提交 PR 协助作者完善，会及时处理，非常感谢。
-
 - 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产;**v2.1.0 起新增 macOS Intel x64**(见 [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61))。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.1.2。早期 Python 版本 v1.0.x 已不再作为推荐稳定版,新用户直接用 v2.x
-- 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.0.4 字节级互通,可来回切换不丢数据
+- 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.x 互通,升级 / 回退不丢配置
+
+> 如果使用过程中出现问题,欢迎提交 PR 协助作者完善,会及时处理,非常感谢。
+
+### v2.x 主线改动(累计到 v2.1.2)
+
+按主题分组。
+
+**MCP 工具调用 + namespace**(v2.1.1)
+- `type:"namespace"` 包递归 `flat_map` 展平为顶级 function;chat→responses SSE envelope 回灌 16+ Responses API 字段(`tools` / `tool_choice` / `reasoning` / `text` / `metadata` / `previous_response_id` / `temperature` 等)+ `created_at` + 每 event 单调递增 `sequence_number`
+- **function_call SSE output 加 `namespace` 字段**:strings 实证 Codex.app desktop binary 含 `dynamic tool namespace must not be empty for` 校验,缺字段则 namespace 工具调用全返 `unsupported call: <name>`
+- unknown tool type `warn_once_drop_tool` 防多轮重发刷屏
+- 借鉴 mimo2codex `streamToSse.ts` + Codex.app 二进制反求工程。修复后 Notion / Figma / Zeabur 等 MCP server 完整工具集模型可见可调
+
+**chat 端原生 web_search 工具支持**(v2.1.2,逐家文档实证)
+- **Xiaomi MiMo**:私有 `type:"web_search"` + 4 字段透传(`user_location` / `max_keyword` / `force_search` / `limit`)+ A 配置开关 `web_search_enabled` 默认关闭 + B 4xx 上游拒绝时 transparent retry 自动降级 + 进程内 disable cache 防重复失败
+- **Kimi (Moonshot)**:内置 `$web_search` builtin_function + 自动注入 `thinking:{type:"disabled"}` 顶级字段(Kimi 文档强制)
+- **DeepSeek / MiniMax**:文档实证 chat 端不支持 → 显式 drop + 专属 warn key 帮用户调试
+- **跨 provider URL citation 通用入站**:任何 chat 上游 URL 引用通过 `response.output_text.annotation.added` event 透传 Codex.app UI 显示来源链接(P5 之前完全丢失)
+- **MiniMax builtin preset 卡片**:粉红渐变音波 logo 真品牌 favicon,直接点选不用手动配 base_url
+
+**配置自愈 / 协议路由 / 客户端身份**
+- **Codex CLI 客户端身份头零泄漏**:出站剔除 `originator` / `x-codex-*` / `x-openai-*` / `chatgpt-account-id` / `session_id` / `thread_id` / `user-agent`,reqwest 默认 UA 改中性 `Codex-App-Transfer/<v>`,根治 Kimi For Coding Windows 403 access_terminated_error
+- **配置自愈**:load 时按 `baseUrl normalize` 命中 builtin preset(不依赖 `isBuiltin` 字段或随机 hex id),命中即强制覆盖 `apiFormat / authScheme / extraHeaders` + `isBuiltin=true` 写回磁盘,适配真机 v1.x 升级遗留老配置
+- **MiMo Token Plan 404 修复**:`apiFormat == "responses"` 不再误读为"上游原生 Responses 透传",所有 provider 走 local_proxy,Responses↔Chat 协议转换在本地完成
+- **`apiFormat` fallback 全栈统一为 `openai_chat`**:后端 add+update+import + 前端 mapProvider/providerBody/getPresets/选预设/编辑共 8 处对齐 schema serde default
+
+**Responses 会话 / ws 链路**
+- **会话历史持久化**:`ResponseSessionCache` 双层(L1 内存 1000×60min LRU + L2 sqlite 30 天 TTL,落盘 `~/.codex-app-transfer/sessions.db`),Tauri 重启 / TTL 续期不丢历史
+- **ws warmup 不打上游 + 立即 Close frame**:`server.rs` ws handler 识别 `generate:false` / 空 input 帧后直接发 ws **Close frame**,Codex CLI 立即转 HTTP `stream_responses_api`(旧版用 `{"type":"error"}` 文本帧实测卡 4 分 48 秒 ws idle timeout 才 fallback)
+- **cache miss 错误体对齐 OpenAI SDK**:`previous_response_id` 失效返 HTTP 400 + `code:"previous_response_not_found"` 字面对齐,SDK / Codex CLI 错误处理路径直接复用
+
+**Auto-compact summary 大幅增强**(v2.1.0)
+- `/responses/compact` 本地 SUMMARIZATION_PROMPT 从 Codex 86 字符版改为 Claude Code 风格 9-section 强 schema(`<analysis>` + `<summary>` 二段输出 + `Primary Request` / `Files and Code Sections` / `All User Messages 逐字列` / `Errors and Fixes` / `Current Work` / `Next Step verbatim quote` 等固定 section + few-shot example)
+- 注入位置从 system 改为最后一条 user message,提升第三方 provider 服从度
+- 响应解析只抽 `<summary>` 段进续轮 history,过滤 `<analysis>` chain-of-thought 防污染
+- **根治旧 prompt"compact 后只记最近 1-2 个动作"丢任务目标 / 文件路径 / 历次 user 主诉的体感断片**
+
+**多模态 / vision**
+- **MiMo 纯图请求兜底**:MiMo 文档要求 content 含 `image_url` 时至少 1 个 text part(否则 400 `Param Incorrect: text is not set`),Codex CLI 粘图未输入文字场景统一兜底插入空格 text part
+- DeepSeek 视觉输入剥离避免 400
+- vision 白名单按模型级精确匹配(替换 provider 子串匹配)
+
+**Reasoning / thinking 链路**
+- Kimi/DeepSeek thinking 在 Codex CLI TUI 显示头修复 + `extraHeaders` 支持 `{apiKey}` 模板(解决 Kimi 403)
+- reasoning_content 历史回放 + 全局 `TOOL_CALLS_CACHE` 在历史压缩后重建缺失的 `assistant.tool_calls`
+- `response.in_progress` 事件按协议补齐
+- chat usage → responses usage 字段规范化(含 `cached_tokens` 默认补零,避免 Kimi/MiMo 重连卡顿)
+
+**MiniMax 兼容**(由 [@lukegood](https://github.com/lukegood) 贡献)
+- 请求侧白名单清洗 `reasoning_effort` / `response_format` / `parallel_tool_calls` 等不支持字段;`tool` 剥 `strict`;连续 `system` 合并
+- 响应侧 `reasoning_details` 拆 reasoning + `<think>` 兜底拆分仅对 MiniMax 启用
+
+**UI / 桌面**
+- Windows 重启 Codex 不再 flash 终端窗口 + 托盘菜单交互修复
+- 启用按钮即时反馈,不再等转发回包
+- **user-facing 字符串改回英文**:API 响应 message / proxy telemetry log / tray menu / SDK 错误体全部英文,对齐 OpenAI/Anthropic SDK 错误处理风格(注释 / test 仍中文)
 
 ### 更新日志
 
@@ -105,12 +157,64 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: **v2.1.2** (current mainline after the full Python → Rust/Tauri rewrite; UI byte-identical to v1.0.4)
+- Current version: **v2.1.2** (current mainline after the full Python → Rust/Tauri rewrite)
 - Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (official baseUrl, with "Max thinking" mode), Xiaomi MiMo (Token Plan / Pay for Token), MiniMax M2.x (OpenAI-compatible chat — incompatible fields auto-stripped, `reasoning_split` enabled, `<think>` tag fallback)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
 - Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets; **v2.1.0+ also ships macOS Intel x64** (see [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61)). v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.1.2 in production. Earlier Python v1.0.x line is no longer recommended for new installs — go straight to v2.x.
-- Data compatibility: `~/.codex-app-transfer/config.json` remains byte-identical between v1.0.4 and the v2.x Rust mainline — switch back and forth without data loss
-- v2.x stability rollups (cumulative through v2.1.2): **native `web_search` tool support per upstream provider** (after thorough WebFetch documentation verification per provider: Xiaomi MiMo private `type:"web_search"` tool with 4 field passthrough (`user_location` / `max_keyword` / `force_search` / `limit`) + A-layer `web_search_enabled` config toggle defaulting off + B-layer transparent retry on upstream 4xx rejection (e.g. MiMo Web Search Plugin not activated → auto-degrade + in-process disable cache prevents repeat failures); Kimi (Moonshot) builtin_function `$web_search` + auto-injected `thinking:{type:"disabled"}` top-level field (mandated by Kimi docs); DeepSeek / MiniMax documentation-proven not supported on chat endpoint → explicit drop with dedicated warn key for user debugging; OpenAI Responses `delta.annotations` URL citation **cross-provider universal inbound handling** (any chat-completions upstream returning URL citations now flows through `response.output_text.annotation.added` events for Codex.app UI source link display — completely lost before this fix); **new MiniMax builtin preset card** with official MiniMax favicon brand logo (users can pick MiniMax directly like other builtin providers, no manual base_url required)); **namespace MCP tool dispatch** (Codex.app desktop client wraps each `[mcp_servers.<name>]` config entry into a `type:"namespace"` tool pack with ~10-30 inner functions; third-party chat completions providers can't see them. This release does four things to make namespace MCP tools fully callable: ① recursive `flat_map` flattening of `type:"namespace"` packs into top-level function tools sent upstream; ② chat→responses SSE envelope replays all 16+ Responses API fields (`tools`/`tool_choice`/`reasoning`/`text`/`metadata`/`previous_response_id`/`temperature` etc.) + `created_at` + monotonically increasing `sequence_number` on every event for strict-protocol compliance; ③ **adds `namespace` field to function_call SSE output** — `strings` against the Codex.app desktop binary surfaces `dynamic tool namespace must not be empty for` validation, and missing this field causes every namespace-bound tool call to fail with `unsupported call: <name>`; ④ `warn_once_drop_tool` prevents per-turn re-warn spam for unsupported tool types. Borrows from mimo2codex `streamToSse.ts` + Codex.app binary reverse engineering. After this five-layer fix, full Notion / Figma / Zeabur etc. MCP server toolsets become model-visible and dispatchable); **MiMo multimodal image-only fallback** (MiMo's vision API requires at least one `text` part in the content array when `image_url` parts exist, otherwise 400 `Param Incorrect: text is not set`. Covers the Codex CLI paste-image-without-typing case by appending a single-space text part); reasoning_content history replay + global `TOOL_CALLS_CACHE` rebuilds missing `assistant.tool_calls` after history compaction; emits the protocol-correct `response.in_progress` event; normalizes chat-style `usage` into Responses-API `usage` (with `cached_tokens` defaulted to 0 to fix Kimi/MiMo reconnect stalls); strips DeepSeek vision (image) inputs to avoid upstream 400; vision allowlist switched from provider substring to per-model exact match; Kimi/DeepSeek thinking header rendering fix in Codex CLI TUI + `extraHeaders` `{apiKey}` template; MiniMax compatibility (request-side allowlist + `<think>` fallback split scoped to MiniMax only); **zero leakage of Codex CLI client identity headers** (strips `originator`/`x-codex-*`/`x-openai-*`/`chatgpt-account-id`/`session_id`/`thread_id`/`user-agent` on outbound; reqwest default UA changed to neutral `Codex-App-Transfer/<v>` — fixes Kimi For Coding 403 access_terminated_error on Windows); **configuration self-healing** (on load, providers whose `baseUrl` (normalized) matches any builtin preset are recognized as that preset — **independent of the `isBuiltin` field or random-hex ids** — and have `apiFormat / authScheme / extraHeaders` force-overwritten + `isBuiltin=true` set; the admin path **persists changes to disk** so legacy residue heals on first launch — fixes real-world v1.x configs where name/baseUrl matched a builtin but `isBuiltin=false` with random hex ids); **MiMo Token Plan 404 fix** (`apiFormat == "responses"` is no longer misread as "upstream-native Responses passthrough" routing to `direct_provider`; every provider always goes through `local_proxy`, Responses↔Chat conversion happens locally in the proxy); **`apiFormat` fallback unified to `openai_chat` stack-wide** (backend add+update+import + frontend mapProvider/providerBody/getPresets/preset-pick/edit, 8 sites aligned with schema serde default); **persistent Responses session cache** (two-tier `ResponseSessionCache`: L1 in-memory 1000×60min LRU + L2 SQLite 30-day TTL at `~/.codex-app-transfer/sessions.db`; survives Tauri restarts; ws incremental delta=0 follow-ups hit cache and stream over ws directly, avoiding the stream-retry + HTTP fallback waste); **Codex CLI ws warmup no longer touches upstream + closes ws so client falls back to HTTP** (`server.rs` ws handler detects `generate: false` / empty-input frames and sends a ws **Close frame** (connection-close semantics); Codex CLI immediately abandons the ws session and goes through HTTP `stream_responses_api`. **Note**: an earlier v2.0.11 build sent `{"type":"error",...}` text frames, which Codex CLI treated as a stream-level error and waited the full ws idle timeout (~5 minutes) before falling back — feedback fb-8f5b51fb / fb-0c121681 measured 4m48s; switching to Close frame brings fallback down to seconds); **cache miss error body aligned with OpenAI SDK** (`previous_response_id` not found returns HTTP 400 + `code: "previous_response_not_found"` literally matching OpenAI server-side behavior, so SDKs / Codex CLI error paths apply directly); **user-facing strings switched back to English** (API response messages / proxy telemetry log / tray menu / SDK error bodies all in English to align with OpenAI/Anthropic SDK error styles; comments / tests still in Chinese); **massively upgraded auto-compact summary quality** (the local `/responses/compact` SUMMARIZATION_PROMPT replaced from the 86-char Codex version to a Claude-Code-style 9-section strict schema: `<analysis>` + `<summary>` two-pass output, with required sections `Primary Request` / `Files and Code Sections` / `All User Messages listed verbatim` / `Errors and Fixes` / `Current Work` / `Next Step verbatim quote`, plus a few-shot example. The prompt is now injected as the last user message instead of system, improving third-party provider compliance. The response parser only extracts the `<summary>` section into the resumed history, filtering out the `<analysis>` chain-of-thought to avoid polluting the next turn. **Fixes the previous "compact only remembers the last 1-2 actions, loses the task goal / file paths / earlier user requests" experience**); Windows Codex restart no longer flashes a terminal window + tray menu interactions fixed; enable-button now gives instant feedback instead of waiting for the forwarder roundtrip.
+- Data compatibility: `~/.codex-app-transfer/config.json` carries over from v1.x without conversion — upgrade or roll back without losing config
+### v2.x mainline rollups (cumulative through v2.1.2)
+
+Grouped by theme.
+
+**MCP tool dispatch + namespace** (v2.1.1)
+- `type:"namespace"` packs flattened via recursive `flat_map` into top-level function tools sent upstream; chat→responses SSE envelope replays 16+ Responses API fields (`tools` / `tool_choice` / `reasoning` / `text` / `metadata` / `previous_response_id` / `temperature` etc.) + `created_at` + monotonically increasing `sequence_number` per event
+- **Adds `namespace` field to function_call SSE output**: `strings` against the Codex.app desktop binary surfaces `dynamic tool namespace must not be empty for` validation; missing this field causes every namespace-bound tool call to fail with `unsupported call: <name>`
+- `warn_once_drop_tool` prevents per-turn re-warn spam for unsupported tool types
+- Borrows from mimo2codex `streamToSse.ts` + Codex.app binary reverse engineering. After the five-layer fix, full Notion / Figma / Zeabur etc. MCP server toolsets become model-visible and dispatchable
+
+**Native chat-endpoint `web_search` tool support** (v2.1.2, per-provider documentation-verified)
+- **Xiaomi MiMo**: private `type:"web_search"` + 4 field passthrough (`user_location` / `max_keyword` / `force_search` / `limit`) + A-layer `web_search_enabled` config toggle defaulting off + B-layer transparent retry on upstream 4xx + in-process disable cache
+- **Kimi (Moonshot)**: builtin_function `$web_search` + auto-injected `thinking:{type:"disabled"}` top-level field (mandated by Kimi docs)
+- **DeepSeek / MiniMax**: documentation-proven not supported on chat endpoint → explicit drop with dedicated warn key
+- **Cross-provider URL citation inbound**: any chat-completions upstream returning URL citations flows through `response.output_text.annotation.added` events for Codex.app UI source link display (completely lost before this fix)
+- **MiniMax builtin preset card**: official pink-gradient sound-wave M favicon, pickable directly like other builtin providers (no manual base_url)
+
+**Configuration self-healing / protocol routing / client identity**
+- **Zero leakage of Codex CLI client identity headers**: strips `originator` / `x-codex-*` / `x-openai-*` / `chatgpt-account-id` / `session_id` / `thread_id` / `user-agent` on outbound; reqwest default UA changed to neutral `Codex-App-Transfer/<v>` — fixes Kimi For Coding Windows 403 access_terminated_error
+- **Configuration self-healing**: on load, providers whose normalized `baseUrl` matches any builtin preset are force-overwritten with `apiFormat / authScheme / extraHeaders` and `isBuiltin=true` (independent of the `isBuiltin` field or random-hex ids); admin path persists changes to disk
+- **MiMo Token Plan 404 fix**: `apiFormat == "responses"` is no longer misread as "upstream-native Responses passthrough"; every provider goes through `local_proxy` and Responses↔Chat conversion happens locally
+- **`apiFormat` fallback unified to `openai_chat` stack-wide**: 8 sites aligned with schema serde default
+
+**Responses session / ws path**
+- **Persistent session cache**: two-tier `ResponseSessionCache` (L1 in-memory 1000×60min LRU + L2 SQLite 30-day TTL at `~/.codex-app-transfer/sessions.db`); survives Tauri restarts and TTL renewals
+- **ws warmup no longer touches upstream + closes ws immediately**: `server.rs` ws handler detects `generate:false` / empty-input frames and sends a ws **Close frame**, so Codex CLI immediately falls back to HTTP `stream_responses_api` (older builds sent `{"type":"error",...}` text frames and waited the full ws idle timeout — feedback fb-8f5b51fb / fb-0c121681 measured 4m48s; Close frame brings fallback down to seconds)
+- **Cache miss error body aligned with OpenAI SDK**: `previous_response_id` not found returns HTTP 400 + `code:"previous_response_not_found"` matching OpenAI server-side behavior literally
+
+**Auto-compact summary quality** (v2.1.0)
+- Local `/responses/compact` SUMMARIZATION_PROMPT replaced from the 86-char Codex version to a Claude-Code-style 9-section strict schema (`<analysis>` + `<summary>` two-pass output, required sections `Primary Request` / `Files and Code Sections` / `All User Messages listed verbatim` / `Errors and Fixes` / `Current Work` / `Next Step verbatim quote`, plus a few-shot example)
+- Prompt injected as the last user message instead of system, improving third-party provider compliance
+- Response parser only extracts the `<summary>` section into resumed history, filtering out `<analysis>` chain-of-thought
+- **Fixes the previous "compact only remembers the last 1-2 actions, loses the task goal / file paths / earlier user requests" experience**
+
+**Multimodal / vision**
+- **MiMo image-only fallback**: MiMo's vision API requires at least one `text` part when `image_url` parts exist (otherwise 400 `Param Incorrect: text is not set`); the Codex CLI paste-image-without-typing case is covered by appending a single-space text part
+- DeepSeek vision (image) inputs stripped to avoid upstream 400
+- Vision allowlist switched from provider substring to per-model exact match
+
+**Reasoning / thinking**
+- Kimi/DeepSeek thinking header rendering fix in Codex CLI TUI + `extraHeaders` `{apiKey}` template (resolves Kimi 403)
+- `reasoning_content` history replay + global `TOOL_CALLS_CACHE` rebuilds missing `assistant.tool_calls` after history compaction
+- Emits the protocol-correct `response.in_progress` event
+- Normalizes chat-style `usage` into Responses-API `usage` (with `cached_tokens` defaulted to 0 to fix Kimi/MiMo reconnect stalls)
+
+**MiniMax compatibility** (contributed by [@lukegood](https://github.com/lukegood))
+- Request-side allowlist clean-up of `reasoning_effort` / `response_format` / `parallel_tool_calls` etc.; `tool` strips `strict`; consecutive `system` merged
+- Response-side `reasoning_details` split into reasoning + `<think>` fallback split scoped to MiniMax only
+
+**UI / desktop**
+- Windows Codex restart no longer flashes a terminal window + tray menu interactions fixed
+- Enable-button gives instant feedback instead of waiting for the forwarder roundtrip
+- **User-facing strings switched back to English**: API response messages / proxy telemetry log / tray menu / SDK error bodies all in English to align with OpenAI/Anthropic SDK error styles (comments / tests still in Chinese)
 
 ### Changelog
 
@@ -274,9 +378,9 @@ netstat -ano | findstr :18080
 
 - **后端 / 转发**:Rust 1.80+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio
 - **协议适配**:`crates/adapters` —— Responses ↔ Chat 互转(请求 body + 流式响应状态机,支持 reasoning_content / tool_calls)
-- **前端**:HTML + CSS + 原生 JavaScript + Bootstrap 5.3.3(本地化,无 CDN 依赖)—— 与 v1.0.4 **视觉字节级一致**
+- **前端**:HTML + CSS + 原生 JavaScript + Bootstrap 5.3.3(本地化,无 CDN 依赖)
 - **桌面壳**:Tauri 2 + tray-icon 0.23,通过自定义 `cas://` URI scheme 把 frontend/ 与 axum 同进程串起来,无 TCP loopback
-- **存储**:`~/.codex-app-transfer/config.json`(配置,与 v1.x 字节级兼容)、`~/.codex/{config.toml,auth.json}`(Codex CLI 集成)、`~/.codex-app-transfer/codex-snapshot/`(apply 前的备份快照)
+- **存储**:`~/.codex-app-transfer/config.json`(配置,与 v1.x 互通)、`~/.codex/{config.toml,auth.json}`(Codex CLI 集成)、`~/.codex-app-transfer/codex-snapshot/`(apply 前的备份快照)
 - **打包**:`cargo tauri build` 单命令 → `dist/mac/Codex App Transfer.app`(27MB,unsigned 自测;v2.0.x 起接 Apple Developer ID + notarize)
 
 ## 重写过程
@@ -292,21 +396,21 @@ v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 
 
 ## 致谢
 
-本项目站在前人的肩膀上：
+本项目站在前人的肩膀上:
 
-- **[CC-Switch](https://github.com/farion1231/cc-switch)** 提供了"轻量桌面 + 一键切换 API 提供商"的产品形态启发。
-- **[CC Desktop Switch](https://github.com/lonr-6/cc-desktop-switch)** 提供了完整的桌面应用框架——pywebview 桌面壳、pystray 托盘、FastAPI 双端口（管理 / 转发）布局、PyInstaller / NSIS 打包脚本、`scripts/New-Release.ps1` 发布签名链路、GitHub Actions 自动构建工作流，以及 i18n / 主题 / 设置面板等前端模板都直接沿用了它的实现。
-- **[litellm](https://github.com/BerriAI/litellm)** 提供了 Responses API ↔ Chat Completions 双向协议转换的核心思路。v1.x 的 `backend/responses_adapter.py` / `backend/openai_adapter.py` / `backend/base_adapter.py` 以及 v2.x 的 `crates/adapters/` 都直接参考了 litellm 的字段映射、消息归一化和 reasoning 处理策略。
-- **[Tauri](https://tauri.app/)** 提供了 v2.0 桌面壳的全部基础设施 —— 单二进制打包、native webview、tray、IPC、单实例插件、自定义 URI scheme。v2.0 的"frontend/ 零改动 + cas:// 同进程 axum"架构靠 Tauri 2 的 `register_asynchronous_uri_scheme_protocol` 才能成立。
-- **[Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts)** 提供了 reverse-engineered Claude Code system prompts 公开版本。v2.1.0 的 autocompact summary prompt(`crates/adapters/src/responses/compact.rs`)以此为蓝本改写成 9-section 强 schema —— `<analysis>` + `<summary>` 二段输出,`Primary Request and Intent` / `Files and Code Sections` / `All User Messages` 等固定 section,末尾 few-shot example 防第三方 provider 输出格式飘 —— 续轮断片体感大幅改善。
-- **[7as0nch/mimo2codex](https://github.com/7as0nch/mimo2codex)** MiMo↔Codex 协议转换 TS 实现提供了多点关键借鉴:① MiMo 多模态接口的隐性强制要求(含 `image_url` 时 content 数组必须有至少 1 个 text part,否则上游 400 "Param Incorrect: text is not set")—— `crates/adapters/src/responses/request.rs` 的 `ensure_text_part_when_image_present` 兜底直接借鉴其 `reqToChat.ts:71-79` 处理思路,统一对所有 supports_vision provider 应用;② Codex CLI 用 `type:"namespace"` 包装 MCP server 工具集的展平逻辑(实测每轮 218 个 namespace × 88 个内层 function 经此层才能让模型可见)—— `convert_responses_tool_to_chat_tool` 的 namespace 递归 flat_map 借鉴 `reqToChat.ts:232-250`,加上 `warn_once_drop_tool` (`crates/adapters/src/lib.rs`) 借鉴 `reqToChat.ts:158-172` 的 `warnOnce` 模式防多轮重发刷屏;③ MiMo 私有 chat 端 `type:"web_search"` 工具映射(`user_location` / `max_keyword` / `force_search` / `limit` 4 字段透传)—— `convert_web_search_tool` 1:1 复刻 `reqToChat.ts:196-209`,Codex.app 入站默认每轮发的 OpenAI Responses 标准 `web_search` 工具被转成 MiMo 控制台 Web Search Plugin 期待的形态;④ chat completions stream `delta.annotations` URL citation 通用入站处理(跨 provider 通用)—— `ChatToResponsesConverter::handle_annotations_delta` + `translate_annotation` 借鉴 `streamToSse.ts:156-163, 338-352`,字段 `summary → snippet` 重命名对齐 OpenAI Responses url_citation schema,emit `response.output_text.annotation.added` event 让 Codex.app 显示来源链接。
+- **[CC-Switch](https://github.com/farion1231/cc-switch)** — 轻量桌面 + 一键切换 provider 形态启发。
+- **[CC Desktop Switch](https://github.com/lonr-6/cc-desktop-switch)** — v1.x 桌面壳 / 托盘 / 打包发布链路骨架沿用。
+- **[litellm](https://github.com/BerriAI/litellm)** — Responses ↔ Chat 双向协议转换思路。
+- **[Tauri](https://tauri.app/)** — v2 桌面壳 + cas:// 同进程 axum 架构基座。
+- **[Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts)** — autocompact 9-section summary prompt 蓝本。
+- **[7as0nch/mimo2codex](https://github.com/7as0nch/mimo2codex)** — MiMo image / namespace 展平 / web_search / annotation 协议借鉴。
 
 ### 社区贡献者
 
 感谢以下贡献者通过 Pull Request 直接改进过本项目(按首次提交时间倒序;完整列表见 [Contributors 图表](https://github.com/Cmochance/codex-app-transfer/graphs/contributors)):
 
-- [@lukegood](https://github.com/lukegood) — MiniMax M2.x OpenAI-compatible 接入兼容性(请求侧字段白名单清洗 + 连续 system 合并 + tool `strict` 剥离;响应侧 `reasoning_details` 拆 reasoning + `<think>` 兜底;[#47](https://github.com/Cmochance/codex-app-transfer/pull/47))
-- [@cw881014](https://github.com/cw881014) — 早期协议层修复:DeepSeek thinking 工具历史回放([#1](https://github.com/Cmochance/codex-app-transfer/pull/1))、Responses reasoning schema 与历史修复对齐([#7](https://github.com/Cmochance/codex-app-transfer/pull/7))、Codex 0.128 model catalog 路由加固([#12](https://github.com/Cmochance/codex-app-transfer/pull/12))
+- [@lukegood](https://github.com/lukegood) — MiniMax M2.x 接入兼容性([#47](https://github.com/Cmochance/codex-app-transfer/pull/47))。
+- [@cw881014](https://github.com/cw881014) — 早期协议层修复 3 PR([#1](https://github.com/Cmochance/codex-app-transfer/pull/1) / [#7](https://github.com/Cmochance/codex-app-transfer/pull/7) / [#12](https://github.com/Cmochance/codex-app-transfer/pull/12))。
 
 如果你提交过 PR 但希望改名 / 补链接 / 移除,直接开 issue 跟我说一声即可。
 
