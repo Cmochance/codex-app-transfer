@@ -16,17 +16,35 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本:**v2.1.2**(Python → Rust/Tauri 全栈重写后的当前主线)
+- 当前版本:**v2.1.3**(Python → Rust/Tauri 全栈重写后的当前主线)
 - 已验证供应商:Kimi Code(`kimi-for-coding` UA 网关)、Kimi 月之暗面(Moonshot Platform)、DeepSeek V4(官方 baseUrl,含「Max 思维」思考模式)、Xiaomi MiMo (Token Plan / Pay for Token)、MiniMax M2.x(OpenAI-compatible chat,自动剥不兼容字段 + `reasoning_split` + `<think>` 兜底)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
-- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产;**v2.1.0 起新增 macOS Intel x64**(见 [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61))。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.1.2。早期 Python 版本 v1.0.x 已不再作为推荐稳定版,新用户直接用 v2.x
+- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产;**v2.1.0 起新增 macOS Intel x64**(见 [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61))。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.1.3。早期 Python 版本 v1.0.x 已不再作为推荐稳定版,新用户直接用 v2.x
 - 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.x 互通,升级 / 回退不丢配置
 
 > 如果使用过程中出现问题,欢迎提交 PR 协助作者完善,会及时处理,非常感谢。
 
-### v2.x 主线改动(累计到 v2.1.2)
+### v2.x 主线改动(累计到 v2.1.3)
 
 按主题分组。
+
+**自定义第三方 + Responses 协议 direct 透传**(v2.1.3,本版主线)
+- 用户在「自定义第三方」preset 显式选 `apiFormat=responses` + 填齐 baseUrl + apiKey → **Codex.app 直连上游不经代理**(借鉴 codex-account-switch 纯配置写入):`~/.codex/config.toml::openai_base_url` 写用户 baseUrl + `auth.json` 写用户 apiKey + 本地 18080 端口不启;适用 OpenAI 官方 / 任何原生实现 OpenAI Responses API 的反代
+- **healing 教训仍生效**(2026-05-08 MiMo Token Plan 404):8 条 builtin preset 的 apiFormat 启动时强制覆盖回 `openai_chat`,bypass 只可能命中显式自定义 + 用户主动选透传的第三方 — informed choice
+- 配套 `ResponsesPassthroughAdapter`(`crates/adapters/src/passthrough.rs`):字节级透传 OpenAI Responses API,SSE envelope / `sequence_number` / `chatcmpl→resp_` ID 全由上游产生代理不重写;`/responses/compact` 私有扩展即便 apiFormat=responses 也强制留本地 ResponsesAdapter 包装(避免上游 404)
+- 「**自定义第三方**」preset 卡片(`bi-puzzle` icon)无限重复添加 + 协议类型 UI 改 readonly + Responses 协议解锁 default 模型映射可空 + baseUrl input 加 `autocapitalize="off"` + form-submit direct 模式必填 baseUrl/apiKey 校验
+
+**测速文案分级 + 上游错误诊断闭环**(v2.1.3)
+- 测速 401/403 仍 `reachable=true`(连接 OK)+ 新 `authStatus="auth_required_or_invalid"` + UI 黄色警告 + 文案 `(auth required or invalid — verify API key matches this baseUrl)`,避免之前误判 baseUrl 错红色;前端 `isProviderTestResultBad()` helper 用白名单语义防未来后端加新 authStatus 枚举漏判
+- `forward.rs` 两处 `resp.bytes().await.unwrap_or_default()` 改 `match` + telemetry.logs.add WARN,避免上游 body read 失败时静默吞错丢失 root cause
+- `provider_test_error_label` 拆 7 类(Timeout / ConnectError / RedirectError / DecodeError / RequestError / BodyError / OtherError),用户 toast self-debug
+- `desktop.rs::one_million_catalog_ready` catalog 读取/解析失败改用 `proxy_telemetry().logs.add` 写日志面板可见
+
+**全局 tracing → proxy_telemetry.logs 桥接**(v2.1.3 silent failure 根治)
+- workspace 5 处历史 `tracing::warn!`(healing apiFormat 强制覆盖 / `warn_once_drop_tool` / `disable_web_search_for` 等)在 Tauri 桌面 binary 之前**完全静默**(没注册 tracing_subscriber)
+- 新加 `TelemetryLogsLayer`(`src-tauri/src/telemetry_bridge.rs`)实现 tracing_subscriber Layer trait,`main()` 第一行 init 全局 subscriber 把所有 `tracing::*` event 转发到 `proxy_telemetry().logs` 同通道(`~/.codex-app-transfer/logs/proxy-*.log` + 设置面板 logs viewer 双可见)
+- `LevelFilter::INFO` 兜底防未来 dep 引入 TRACE 噪音 + sensitive field redact(`api_key` / `authorization` / `bearer` / `token` / `secret` / `password` 含子串 → `[REDACTED]`)+ `try_init` 失败时 telemetry ERROR 兜底 + 成功 emit INFO `tracing-bridge active` 正向确认
+- 未来任何 crate 加 `tracing::*` 调用自动生效,不需要每处手动决策"用 tracing 还是 telemetry.logs"
 
 **MCP 工具调用 + namespace**(v2.1.1)
 - `type:"namespace"` 包递归 `flat_map` 展平为顶级 function;chat→responses SSE envelope 回灌 16+ Responses API 字段(`tools` / `tool_choice` / `reasoning` / `text` / `metadata` / `previous_response_id` / `temperature` 等)+ `created_at` + 每 event 单调递增 `sequence_number`
@@ -157,14 +175,31 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: **v2.1.2** (current mainline after the full Python → Rust/Tauri rewrite)
+- Current version: **v2.1.3** (current mainline after the full Python → Rust/Tauri rewrite)
 - Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (official baseUrl, with "Max thinking" mode), Xiaomi MiMo (Token Plan / Pay for Token), MiniMax M2.x (OpenAI-compatible chat — incompatible fields auto-stripped, `reasoning_split` enabled, `<think>` tag fallback)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
-- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets; **v2.1.0+ also ships macOS Intel x64** (see [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61)). v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.1.2 in production. Earlier Python v1.0.x line is no longer recommended for new installs — go straight to v2.x.
+- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets; **v2.1.0+ also ships macOS Intel x64** (see [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61)). v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.1.3 in production. Earlier Python v1.0.x line is no longer recommended for new installs — go straight to v2.x.
 - Data compatibility: `~/.codex-app-transfer/config.json` carries over from v1.x without conversion — upgrade or roll back without losing config
-### v2.x mainline rollups (cumulative through v2.1.2)
+### v2.x mainline rollups (cumulative through v2.1.3)
 
 Grouped by theme.
+
+**Custom Third-Party + Responses protocol direct passthrough** (v2.1.3, this release's main theme)
+- Users explicitly pick `apiFormat=responses` on the new "Custom Third-Party" preset card and provide both baseUrl + apiKey → **Codex.app connects directly to upstream, bypassing the proxy** (codex-account-switch style pure-config switch): `~/.codex/config.toml::openai_base_url` ← user baseUrl, `auth.json` ← user apiKey, local 18080 not started. Suitable for OpenAI official / any reverse proxy implementing OpenAI Responses API natively
+- **v1.x MiMo Token Plan 404 lesson preserved**: healing on startup force-overrides the 8 builtin presets' `apiFormat` back to `openai_chat`; bypass only triggers on **explicit custom + user-chosen** third-party providers — informed choice
+- New `ResponsesPassthroughAdapter` (`crates/adapters/src/passthrough.rs`): byte-level passthrough with SSE envelope / `sequence_number` / `chatcmpl→resp_` IDs all produced by upstream (proxy doesn't rewrite). `/responses/compact` (this repo's private extension) always stays on local ResponsesAdapter to avoid upstream 404
+- "Custom Third-Party" preset card (`bi-puzzle` icon) can be added unlimited times + protocol type UI now read-only display + Responses unlocks default model mapping as optional + baseUrl input adds `autocapitalize="off"` + form-submit time direct-mode requires both baseUrl + apiKey
+
+**Speed test message tiers + upstream error diagnostic loop** (v2.1.3)
+- Speed test 401/403 stays `reachable=true` (connection OK) + new `authStatus="auth_required_or_invalid"` field + UI yellow warning + message `(auth required or invalid — verify API key matches this baseUrl)`. Frontend `isProviderTestResultBad()` helper switched to whitelist semantics for future-proofing
+- `forward.rs` two `resp.bytes().await.unwrap_or_default()` paths replaced by `match` + `telemetry.logs.add` WARN to surface body-read failures
+- `provider_test_error_label` split into 7 categories (Timeout / ConnectError / RedirectError / DecodeError / RequestError / BodyError / OtherError) for easier user self-debug
+- `desktop.rs::one_million_catalog_ready` catalog read/parse failures now write `proxy_telemetry().logs.add` (visible in logs viewer)
+
+**Global tracing → proxy_telemetry.logs bridge** (v2.1.3 silent-failure root cure)
+- workspace had 5 historical `tracing::warn!` call sites (healing apiFormat force-override / `warn_once_drop_tool` / `disable_web_search_for` etc.) that were **completely silent in the Tauri desktop binary** (no `tracing_subscriber` registered, events dropped by default)
+- New `TelemetryLogsLayer` (`src-tauri/src/telemetry_bridge.rs`) implementing `tracing_subscriber::Layer`, registered at `main()` first line; bridges all `tracing::*` events into `proxy_telemetry().logs` same channel as forward.rs (visible in `~/.codex-app-transfer/logs/proxy-*.log` + Settings logs viewer)
+- `LevelFilter::INFO` cap to prevent future dep TRACE-level noise + sensitive-field redaction (`api_key` / `authorization` / `bearer` / `token` / `secret` / `password` substring → `[REDACTED]`) + `try_init` failure → ERROR to telemetry; success → INFO `tracing-bridge active` positive confirmation
 
 **MCP tool dispatch + namespace** (v2.1.1)
 - `type:"namespace"` packs flattened via recursive `flat_map` into top-level function tools sent upstream; chat→responses SSE envelope replays 16+ Responses API fields (`tools` / `tool_choice` / `reasoning` / `text` / `metadata` / `previous_response_id` / `temperature` etc.) + `created_at` + monotonically increasing `sequence_number` per event
