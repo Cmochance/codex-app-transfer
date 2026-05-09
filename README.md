@@ -35,7 +35,7 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 - 「**自定义第三方**」preset 卡片(`bi-puzzle` icon)无限重复添加 + 协议类型 UI 改 readonly + Responses 协议解锁 default 模型映射可空 + baseUrl input 加 `autocapitalize="off"` + form-submit direct 模式必填 baseUrl/apiKey 校验
 
 **测速文案分级 + 上游错误诊断闭环**(v2.1.3)
-- 测速 401/403 仍 `reachable=true`(连接 OK)+ 新 `authStatus="auth_required_or_invalid"` + UI 黄色警告 + 文案 `(auth required or invalid — verify API key matches this baseUrl)`,避免之前误判 baseUrl 错红色;前端 `isProviderTestResultBad()` helper 用白名单语义防未来后端加新 authStatus 枚举漏判
+- 测速 401/403 仍 `reachable=true`(连接 OK)+ 新 `authStatus="auth_required_or_invalid"` + **绿色显示** + 文案 `connection OK; API key not configured or auth not verified`,解耦"连接性"和"鉴权"语义(避免黄色警告让用户误以为 baseUrl 错);前端 `isProviderTestResultBad()` helper 不依据 authStatus 标黄,真鉴权失败由 Codex CLI 实际请求路径暴露
 - `forward.rs` 两处 `resp.bytes().await.unwrap_or_default()` 改 `match` + telemetry.logs.add WARN,避免上游 body read 失败时静默吞错丢失 root cause
 - `provider_test_error_label` 拆 7 类(Timeout / ConnectError / RedirectError / DecodeError / RequestError / BodyError / OtherError),用户 toast self-debug
 - `desktop.rs::one_million_catalog_ready` catalog 读取/解析失败改用 `proxy_telemetry().logs.add` 写日志面板可见
@@ -191,7 +191,7 @@ Grouped by theme.
 - "Custom Third-Party" preset card (`bi-puzzle` icon) can be added unlimited times + protocol type UI now read-only display + Responses unlocks default model mapping as optional + baseUrl input adds `autocapitalize="off"` + form-submit time direct-mode requires both baseUrl + apiKey
 
 **Speed test message tiers + upstream error diagnostic loop** (v2.1.3)
-- Speed test 401/403 stays `reachable=true` (connection OK) + new `authStatus="auth_required_or_invalid"` field + UI yellow warning + message `(auth required or invalid — verify API key matches this baseUrl)`. Frontend `isProviderTestResultBad()` helper switched to whitelist semantics for future-proofing
+- Speed test 401/403 stays `reachable=true` (connection OK) + new `authStatus="auth_required_or_invalid"` field + **green** display + message `connection OK; API key not configured or auth not verified`, decoupling "connectivity" from "auth" semantics. Frontend `isProviderTestResultBad()` helper does not flag bad on authStatus alone — real auth failures surface via Codex CLI's actual request path
 - `forward.rs` two `resp.bytes().await.unwrap_or_default()` paths replaced by `match` + `telemetry.logs.add` WARN to surface body-read failures
 - `provider_test_error_label` split into 7 categories (Timeout / ConnectError / RedirectError / DecodeError / RequestError / BodyError / OtherError) for easier user self-debug
 - `desktop.rs::one_million_catalog_ready` catalog read/parse failures now write `proxy_telemetry().logs.add` (visible in logs viewer)

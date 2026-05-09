@@ -507,17 +507,20 @@ mod tests {
             server.abort();
 
             assert_eq!(result["success"], json!(true));
-            // 401 = endpoint 已响应 + 需鉴权 → baseUrl 连接性 OK(reachable=true,
-            // UI 不标 bad);但 authStatus="auth_required_or_invalid" 让前端标黄色
-            // 警告 + 文案区分,避免用户把"key 错 / baseUrl 不是 LLM endpoint"误判
-            // 为 baseUrl 完全 OK
+            // 401 = endpoint 已响应 + 需鉴权 → baseUrl 连接性 OK,绿色显示
+            // (2026-05-10 反转:之前文案 "auth required or invalid" 标黄误导
+            //  用户以为 baseUrl 错;改回绿色 + 文案明示连接成功+鉴权未验证)
             assert_eq!(result["ok"], json!(true));
             assert_eq!(result["authStatus"], json!("auth_required_or_invalid"));
             assert_eq!(result["statusCode"], json!(401));
             assert!(result["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("auth required or invalid"));
+                .contains("connection OK"));
+            assert!(result["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("API key not configured or auth not verified"));
         });
     }
 
@@ -561,12 +564,16 @@ mod tests {
             assert_eq!(result["ok"], json!(true), "403 仍 reachable");
             assert_eq!(result["authStatus"], json!("auth_required_or_invalid"));
             assert_eq!(result["statusCode"], json!(403));
-            // H3 (silent-failure-hunter review):防文案回归 — 403 message 必须含
-            // "auth required or invalid" 子串(跟 401 共用 match arm 的回归保险)
+            // 防文案回归 — 403 跟 401 共用 match arm,message 必须含
+            // "connection OK" + "API key not configured or auth not verified"
             assert!(result["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("auth required or invalid"));
+                .contains("connection OK"));
+            assert!(result["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("API key not configured or auth not verified"));
         });
     }
 
