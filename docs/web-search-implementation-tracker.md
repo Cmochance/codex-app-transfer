@@ -9,7 +9,7 @@
 | Provider | 文档实证 | 实施 | 单测 | 实地测试 | 备注 |
 |---|---|---|---|---|---|
 | **Xiaomi MiMo** | ✅ mimo2codex fresh 源码 1:1 对照 + dump 实证 4xx 错误 | ✅ A 配置开关 + B 运行时 cache + transparent retry | ✅ 13 用例 + transparent retry 集成路径 | ✅ **实测全通过**(2026-05-09):默认关 / `=true` plugin 未开 transparent retry 无感降级秒出结果 / `=false` 显式关 三场景全验证;log 流 `WARN auto-disabled → INFO retry status 200 → SUCCESS upstream status 200` 完美 | **完成,进入 Kimi 移植阶段** |
-| **Kimi (Moonshot)** | ⏳ 待 WebFetch 官方文档 | — | — | — | 已知形态(待文档证实):`tools:[{type:"builtin_function", function:{name:"$web_search"}}]` |
+| **Kimi (Moonshot)** | ✅ WebFetch `platform.kimi.ai/docs/guide/use-web-search` 真文档实证 | ✅ Kimi/Moonshot 分支 + 自动注入 `thinking.disabled` 顶级字段 | ✅ 5 用例(builtin_function 形态 / thinking 注入 / Moonshot 同形态 / 未启用不注入 / B 层 cache disable 不注入) | ⏳ **等用户实测** | A/B 双层 + transparent retry 全复用 MiMo 阶段基础设施 |
 | **DeepSeek** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
 | **MiniMax M2.x** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
 | **(实验兼容)阿里 Qwen** | ⏳ | — | — | — | `extra_body.enable_search` 形态待证 |
@@ -134,18 +134,63 @@ if (delta.annotations && delta.annotations.length > 0) {
 
 ## 2. Kimi (Moonshot)
 
-### 2.1 待办
+### 2.1 文档实证
 
-- **WebFetch** 官方文档:https://platform.moonshot.cn/docs(可能需要中文版 / API reference 入口)
-- 关注:
-  - chat completions 是否支持 `tools:[{type:"builtin_function", function:{name:"$web_search"}}]`?(agent 调研给的形态)
-  - `extra_body.thinking.type` 是否影响 web_search?(agent 提到禁用 thinking,确认是否必须)
-  - 计费规则($0.005/搜索?)
-  - 响应 url citation 字段(`delta.annotations`?)
+来源:**WebFetch** `https://platform.kimi.ai/docs/guide/use-web-search`(2026-05-09 真原文,跟 `platform.moonshot.cn/docs/api/tool_use` 301 重定向到同一处)。
 
-### 2.2 待用户提供 / 一起 WebFetch
+#### 2.1.1 Tool 声明
 
-(等 MiMo 实测通过后再启动)
+```json
+{
+  "type": "builtin_function",
+  "function": {
+    "name": "$web_search"
+  }
+}
+```
+
+> "The `$web_search` function is prefixed with a dollar sign `$`, which is our agreed way to indicate Kimi built-in functions."
+
+#### 2.1.2 强制约束:Thinking 必须 disabled
+
+> "When using `$web_search` function, you must disable the thinking ability of the model."
+
+通过 `extra_body.thinking.type = "disabled"` 设置。OpenAI Python SDK `extra_body` 在 wire 上等价于 request body 顶级加 `thinking: {type: "disabled"}` 字段。
+
+**Side effect**:用户启用 web_search 时 Kimi 模型 thinking 能力被强制禁用 — UI 提示文案需要补:
+**"启用 web_search 时模型 thinking 能力会被禁用(Kimi API 限制)。"**
+
+#### 2.1.3 执行流程
+
+- `finish_reason == "tool_calls"` 时模型请求搜索
+- 实现:**"return the arguments as-is"**(代理不需特殊处理,Codex CLI 拿到 tool_call 后会回灌)
+- 提交结果:`role=tool` + 匹配 `tool_call_id`
+
+#### 2.1.4 计费 / Token
+
+- 搜索结果计入 `prompt_tokens`
+- usage 含 `search_content_total_tokens`(示例 13046)
+- **每次搜索独立计费 $0.005**(超 token 费)
+
+#### 2.1.5 兼容性
+
+> "The tool works alongside regular function tools without code restructuring needed for switching implementations."
+
+Kimi `$web_search` 跟普通 function tools 共存,不冲突。
+
+### 2.2 实施要点
+
+- `convert_web_search_tool` 加 Kimi 分支:provider 识别 `provider_looks_like(p, "kimi") || provider_looks_like(p, "moonshot")`,输出 `{"type":"builtin_function", "function":{"name":"$web_search"}}`
+- **不透传任何 OpenAI 字段**(`user_location` / `max_keyword` / `force_search` / `limit` / `external_web_access` / `search_content_types` 全 drop —— Kimi 文档明确只要 type + function.name)
+- **Body 后处理**:扫 outbound tools,命中 `type:"builtin_function"` + `function.name == "$web_search"` → 设 `body["thinking"] = {"type": "disabled"}`(注入顶级字段,wire-equivalent of OpenAI SDK `extra_body`)
+- A 层(`web_search_enabled`)+ B 层(运行时 cache)+ transparent retry 全部复用 MiMo 阶段已实施的基础设施,无需重复
+
+### 2.3 实施 / 测试 checklist
+
+- [ ] `convert_web_search_tool` Kimi 分支:输出固定 builtin_function schema,不透传任何子字段
+- [ ] 顶级 `thinking.disabled` 注入 hook(在 `responses_body_to_chat_body_for_provider_with_session` body 后处理)
+- [ ] 单测:Kimi web_search 转换正确 / 命中时 thinking 注入 / 不启用 web_search 时 thinking 不动 / 用户原配置 thinking 时被覆盖
+- [ ] 用户实地测:Codex.app + Kimi provider + `web_search_enabled=true` → "搜索 X" → 看模型直接用 $web_search 工具(不绕路 Node Repl)+ 响应 url citation 通过 delta.annotations 展示
 
 ## 3. DeepSeek
 

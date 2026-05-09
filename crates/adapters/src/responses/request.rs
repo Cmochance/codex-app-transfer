@@ -126,6 +126,17 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
             .flat_map(|t| convert_responses_tool_to_chat_tool(t, provider))
             .collect();
         if !chat_tools.is_empty() {
+            // **Kimi `$web_search` 强制 thinking disabled**:Kimi 官方文档
+            // (`platform.kimi.ai/docs/guide/use-web-search`)明确写
+            // "When using `$web_search` function, you must disable the thinking
+            // ability of the model"。OpenAI SDK 的 `extra_body.thinking.type=
+            // "disabled"` 在 wire 上等价于 request body 顶级 `thinking:
+            // {type:"disabled"}` 字段。如果 outbound tools 含 Kimi 内置
+            // `$web_search`,代理在这里强制注入(用户启用 web_search 时模型
+            // thinking 能力被禁用是 Kimi API 限制,UI 后续会加提示)。
+            if contains_kimi_web_search_tool(&chat_tools) {
+                result.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
+            }
             result.insert("tools".into(), Value::Array(chat_tools));
         }
     }
@@ -1853,12 +1864,43 @@ fn convert_web_search_tool(
         return vec![Value::Object(out)];
     }
 
+    if provider_looks_like(provider, "kimi") || provider_looks_like(provider, "moonshot") {
+        // Kimi 内置 `$web_search` builtin_function(WebFetch
+        // `platform.kimi.ai/docs/guide/use-web-search` 真原文实证):
+        //   {"type":"builtin_function", "function":{"name":"$web_search"}}
+        // **不透传任何子字段**(Kimi 文档明确只要 type + function.name)。
+        // 配套强制 `thinking:{type:"disabled"}` 顶级字段在
+        // `responses_body_to_chat_body_for_provider_with_session` body 后处理
+        // 注入(`contains_kimi_web_search_tool` 检测命中即写)。
+        // 计费:每次搜索调用 $0.005(独立于 token),搜索结果计入 prompt_tokens。
+        return vec![serde_json::json!({
+            "type": "builtin_function",
+            "function": {
+                "name": "$web_search",
+            },
+        })];
+    }
+
     // 其他 provider 暂未文档实证,走 drop + warn_once。
     // 用户实地反馈"模型不能直接用 web_search,绕路 MCP 工具/Node Repl 写
     // JS fetch HTML"是预期当前行为(P5 namespace MCP 修复后这条路是通的);
     // 后续逐家移植后会让模型直接走 chat 原生 web search,效率更高。
     crate::warn_once_drop_tool("web_search:provider-not-implemented");
     vec![]
+}
+
+/// 扫 outbound tools 数组,看是否含 Kimi 内置 `$web_search`
+/// (`type:"builtin_function"` + `function.name == "$web_search"`)。
+/// 命中时调用方需要在 body 顶级注入 `thinking:{type:"disabled"}` —— Kimi
+/// 文档强制要求(see `docs/web-search-implementation-tracker.md` §2.1.2)。
+fn contains_kimi_web_search_tool(tools: &[Value]) -> bool {
+    tools.iter().any(|t| {
+        t.get("type").and_then(|v| v.as_str()) == Some("builtin_function")
+            && t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                == Some("$web_search")
+    })
 }
 
 /// 读 `provider.request_options.web_search_enabled`(boolean,默认 false)。
@@ -2706,6 +2748,146 @@ mod tests {
         let out_b = responses_body_to_chat_body_for_provider(&req, Some(&b)).unwrap();
         // b 的 web_search_enabled=true 且没被 disable,正常转换
         assert_eq!(out_b["tools"][0]["type"], "web_search");
+    }
+
+    // ── Kimi (Moonshot) web_search builtin_function 映射 ──
+    // 来源:WebFetch `platform.kimi.ai/docs/guide/use-web-search` 真原文实证。
+    // 1:1 复刻官方文档:tools 形态固定 `{type:"builtin_function", function:{name:"$web_search"}}`,
+    // 强制配套 `thinking:{type:"disabled"}` 顶级字段(Kimi 文档明确强制)。
+
+    fn kimi_provider_with_web_search() -> Provider {
+        let mut p = provider(
+            "kimi-for-coding",
+            "Kimi For Coding",
+            "https://api.kimi.com/coding/v1",
+        );
+        p.models.insert("default".into(), "kimi-for-coding".into());
+        p.api_format = "openai_chat".into();
+        p.request_options
+            .insert("web_search_enabled".into(), json!(true));
+        p
+    }
+
+    fn moonshot_provider_with_web_search() -> Provider {
+        let mut p = provider("moonshot", "Moonshot", "https://api.moonshot.cn/v1");
+        p.models.insert("default".into(), "kimi-k2.6".into());
+        p.api_format = "openai_chat".into();
+        p.request_options
+            .insert("web_search_enabled".into(), json!(true));
+        p
+    }
+
+    #[test]
+    fn kimi_web_search_outputs_builtin_function_with_dollar_prefix_name() {
+        let p = kimi_provider_with_web_search();
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"搜索 X"}],
+            "tools": [
+                {
+                    "type": "web_search",
+                    "external_web_access": true,
+                    "search_content_types": ["text", "image"],
+                    "user_location": {"country": "CN"},
+                    "max_keyword": 5
+                }
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let tools = out["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        // Kimi 形态:固定 builtin_function + $web_search,**不透传任何子字段**
+        assert_eq!(tools[0]["type"], "builtin_function");
+        assert_eq!(tools[0]["function"]["name"], "$web_search");
+        // OpenAI 字段全部 silent drop(Kimi 文档明确只要 type + function.name)
+        assert!(tools[0].get("user_location").is_none());
+        assert!(tools[0].get("max_keyword").is_none());
+        assert!(tools[0].get("external_web_access").is_none());
+        assert!(tools[0].get("search_content_types").is_none());
+    }
+
+    #[test]
+    fn kimi_web_search_force_injects_thinking_disabled_top_level_field() {
+        let p = kimi_provider_with_web_search();
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"web_search"}]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        // Kimi 文档强制:`thinking:{type:"disabled"}` 顶级字段必填
+        assert_eq!(
+            out["thinking"],
+            json!({"type": "disabled"}),
+            "Kimi $web_search 必须配套 thinking disabled(官方文档强制)"
+        );
+    }
+
+    #[test]
+    fn moonshot_provider_uses_same_kimi_web_search_form() {
+        // moonshot.cn / kimi.ai 同公司,provider_looks_like("moonshot") 同样命中
+        let p = moonshot_provider_with_web_search();
+        let req = json!({
+            "model": "kimi-k2.6",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"web_search"}]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert_eq!(out["tools"][0]["type"], "builtin_function");
+        assert_eq!(out["tools"][0]["function"]["name"], "$web_search");
+        assert_eq!(out["thinking"], json!({"type": "disabled"}));
+    }
+
+    #[test]
+    fn kimi_without_web_search_enabled_does_not_inject_thinking() {
+        // 未启用 web_search 时不该强制 disable thinking(用户原 thinking 配置不变)
+        let mut p = provider(
+            "kimi-for-coding",
+            "Kimi For Coding",
+            "https://api.kimi.com/coding/v1",
+        );
+        p.models.insert("default".into(), "kimi-for-coding".into());
+        // 故意不设 web_search_enabled
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"web_search"},
+                {"type":"function", "name":"shell", "parameters":{"type":"object","properties":{}}}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        // web_search 被 A 层 drop(默认关),不该注入 thinking disabled
+        assert!(
+            out.get("thinking").is_none(),
+            "未启用 web_search 时不该注入 thinking disabled,实际: {:?}",
+            out.get("thinking")
+        );
+        // shell function 仍然保留
+        assert_eq!(out["tools"][0]["function"]["name"], "shell");
+    }
+
+    #[test]
+    fn kimi_web_search_b_layer_runtime_disable_skips_thinking_injection() {
+        // B 层 cache 命中(运行时已 disable)→ web_search drop → 不该注入 thinking
+        let mut p = kimi_provider_with_web_search();
+        p.id = "kimi-runtime-disabled".into();
+        crate::disable_web_search_for(&p.id);
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"web_search"}]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert!(
+            out.get("thinking").is_none(),
+            "B 层 cache disable 后 web_search drop,thinking 不该注入"
+        );
     }
 
     #[test]
