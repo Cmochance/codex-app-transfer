@@ -10,8 +10,8 @@
 |---|---|---|---|---|---|
 | **Xiaomi MiMo** | ✅ mimo2codex fresh 源码 1:1 对照 + dump 实证 4xx 错误 | ✅ A 配置开关 + B 运行时 cache + transparent retry | ✅ 13 用例 + transparent retry 集成路径 | ✅ **实测全通过**(2026-05-09):默认关 / `=true` plugin 未开 transparent retry 无感降级秒出结果 / `=false` 显式关 三场景全验证;log 流 `WARN auto-disabled → INFO retry status 200 → SUCCESS upstream status 200` 完美 | **完成,进入 Kimi 移植阶段** |
 | **Kimi (Moonshot)** | ✅ WebFetch `platform.kimi.ai/docs/guide/use-web-search` 真文档实证 | ✅ Kimi/Moonshot 分支 + 自动注入 `thinking.disabled` 顶级字段 | ✅ 5 用例 | ✅ **实测通过**(2026-05-09):Kimi For Coding + Moonshot `=true` 上游接受 builtin_function 无降级警告;Moonshot 单条 429 是账号 TPD 超额(跟 PR 无关) | 完成,进入 DeepSeek 阶段 |
-| **DeepSeek** | ✅ WebFetch `api-docs.deepseek.com/api/create-chat-completion` 实证 `"Currently, only function is supported"` | ✅ 显式 drop 分支 + warn key `web_search:not-supported-by-deepseek-api` | ✅ 2 用例 | ✅ 不需要实测(文档实证不支持,代码层只 drop;用户联网走 P5 已通的 MCP 路径) | 完成,进入 MiniMax 阶段 |
-| **MiniMax M2.x** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
+| **DeepSeek** | ✅ WebFetch `api-docs.deepseek.com/api/create-chat-completion` 实证 `"Currently, only function is supported"` | ✅ 显式 drop 分支 + warn key `web_search:not-supported-by-deepseek-api` | ✅ 2 用例 | ✅ 不需要实测(文档实证不支持,代码层只 drop;用户联网走 P5 已通的 MCP 路径) | 完成 |
+| **MiniMax M2.x** | ✅ WebFetch `platform.minimaxi.com/docs/api-reference/` + liteLLM 三方实证:chat tools 仅 `type:"function"`,web_search 仅作 Token Plan MCP 工具存在 | ✅ 显式 drop + warn key `web_search:not-supported-by-minimax-api` + **新加 MiniMax builtin preset(2026-05-09)** + 官方 favicon 图标 | ✅ 1 用例 + preset 完整性测试 | ✅ 不需实测(文档实证不支持;preset 显示可后续 UI 验证) | 完成 |
 | **(实验兼容)阿里 Qwen** | ⏳ | — | — | — | `extra_body.enable_search` 形态待证 |
 | **(实验兼容)智谱 GLM** | ⏳ | — | — | — | `browser.search` 形态待证 |
 | **入站 `delta.annotations` 通用处理** | ✅ mimo2codex `streamToSse.ts:156-163, 338-352` | ✅ `handle_annotations_delta` + `translate_annotation` | ✅ 5 用例 | ⏳ 跟 MiMo 一起实测 | 跨 provider 通用 |

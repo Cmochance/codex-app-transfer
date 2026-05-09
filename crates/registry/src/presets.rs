@@ -34,10 +34,28 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // backend/config.py BUILTIN_PRESETS 当前 8 条:
+        // 当前 8 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
-        // / zhipu / bailian
-        assert_eq!(builtin_presets().len(), 7);
+        // / zhipu / bailian / minimax(2026-05-09 加 MiniMax M2.x preset)
+        assert_eq!(builtin_presets().len(), 8);
+    }
+
+    #[test]
+    fn minimax_preset_exists_and_uses_official_minimaxi_base_url() {
+        let minimax = builtin_presets()
+            .iter()
+            .find(|p| p["id"] == "minimax")
+            .expect("MiniMax preset must exist as builtin entry");
+        assert_eq!(minimax["baseUrl"], "https://api.minimaxi.com/v1");
+        assert_eq!(minimax["apiFormat"], "openai_chat");
+        assert_eq!(minimax["isBuiltin"], true);
+        assert!(
+            minimax["models"]["default"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("MiniMax-M2"),
+            "default model 必须是 MiniMax-M2.x 系列"
+        );
     }
 
     #[test]

@@ -1897,6 +1897,18 @@ fn convert_web_search_tool(
         return vec![];
     }
 
+    // MiniMax(三方实证 2026-05-09:WebFetch `platform.minimaxi.com/docs/api-reference/`
+    // + `platform.minimax.io/docs/api-reference/text-openai-api` + liteLLM
+    // MiniMax provider 文档):MiniMax chat completions API(`api.minimaxi.com/v1`)
+    // tools 仅 `type:"function"`,**无任何 builtin web_search / native search /
+    // 顶级 enable_search 字段**。MiniMax 自家的 web_search 能力**仅作 Token Plan
+    // MCP 工具存在**,不在 chat completions API 内。用户需联网搜索 → 走 P5
+    // 修通的 namespace MCP 路径(`~/.codex/config.toml` 加 mcp_servers 条目)。
+    if provider_looks_like(provider, "minimax") || provider_looks_like(provider, "minimaxi") {
+        crate::warn_once_drop_tool("web_search:not-supported-by-minimax-api");
+        return vec![];
+    }
+
     // 其他 provider 尚未文档实证,走 drop + warn_once。
     // 用户实地反馈"模型不能直接用 web_search,绕路 MCP 工具/Node Repl 写
     // JS fetch HTML"是预期当前行为(P5 namespace MCP 修复后这条路是通的);
@@ -2935,6 +2947,37 @@ mod tests {
         );
         assert_eq!(tools[0]["function"]["name"], "keep_me");
         // DeepSeek 不应触发 Kimi thinking 注入(它跟 thinking-disabled 路径无关)
+        assert!(out.get("thinking").is_none());
+    }
+
+    // ── MiniMax web_search drop(文档实证不支持)──
+    // 来源:WebFetch `platform.minimaxi.com/docs/api-reference/` + liteLLM
+    // MiniMax provider 文档(2026-05-09):MiniMax chat completions tools 只接受
+    // type:"function",无内置 web_search;web_search 仅作 Token Plan MCP 工具存在。
+
+    #[test]
+    fn minimax_web_search_dropped_with_explicit_warn_key() {
+        let mut p = minimax_provider();
+        p.request_options
+            .insert("web_search_enabled".into(), json!(true));
+        let req = json!({
+            "model": "MiniMax-M2.7",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"web_search"},
+                {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            1,
+            "MiniMax chat API 不支持 web_search,只剩 keep_me function"
+        );
+        assert_eq!(tools[0]["function"]["name"], "keep_me");
+        // MiniMax 不应触发 Kimi thinking 注入(它跟 thinking-disabled 路径无关)
         assert!(out.get("thinking").is_none());
     }
 

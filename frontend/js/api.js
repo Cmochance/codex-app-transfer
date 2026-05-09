@@ -33,6 +33,8 @@
     bailian: { logo: 'assets/providers/aliyun.ico' },
     dashscope: { logo: 'assets/providers/aliyun.ico' },
     aliyun: { logo: 'assets/providers/aliyun.ico' },
+    minimax: { logo: 'assets/providers/minimax.ico' },
+    minimaxi: { logo: 'assets/providers/minimax.ico' },
   };
 
   function computeIcon(provider) {
