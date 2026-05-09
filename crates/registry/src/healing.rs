@@ -119,7 +119,23 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
             let preset_value = preset_value.unwrap();
             match current_value {
                 Some(c) if c == preset_value => {}
-                _ => {
+                Some(c) => {
+                    // C1 (2026-05-10):apiFormat 被强制覆盖时 telemetry warn,让用户在
+                    // 日志面板看清"我的 direct 透传为啥失效了"—— baseUrl 命中 builtin
+                    // preset 即触发,direct 透传需要 baseUrl 不命中任何 builtin。
+                    if *field == "apiFormat" {
+                        tracing::warn!(
+                            provider_id = %obj.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                            base_url = %obj.get("baseUrl").and_then(|v| v.as_str()).unwrap_or(""),
+                            user_value = %c,
+                            preset_value = %preset_value,
+                            "healing: apiFormat 被强制覆盖回 preset 字面值(baseUrl 命中 builtin preset);direct 透传需要 baseUrl 不命中任何 builtin"
+                        );
+                    }
+                    obj.insert((*field).to_owned(), preset_value);
+                    changed = true;
+                }
+                None => {
                     obj.insert((*field).to_owned(), preset_value);
                     changed = true;
                 }

@@ -12,11 +12,13 @@
 //! 为 0 复制 / 0 缓冲。Stage 3.2 起的 SSE 状态机适配器会重写这条流。
 
 pub mod openai_chat;
+pub mod passthrough;
 pub mod registry;
 pub mod responses;
 pub mod types;
 
 pub use openai_chat::OpenAiChatAdapter;
+pub use passthrough::ResponsesPassthroughAdapter;
 pub use registry::AdapterRegistry;
 pub use responses::{
     convert_chat_to_responses_stream, responses_body_to_chat_body,
@@ -85,4 +87,63 @@ pub fn is_web_search_disabled_for(provider_id: &str) -> bool {
         .lock()
         .map(|s| s.contains(provider_id))
         .unwrap_or(false)
+}
+
+/// 把入站 `/v1/foo?bar` 规范化为 `/foo?bar`;若开头不是 `/v1/` 则原样返回。
+///
+/// 用于把 Codex CLI 入站 Responses/Chat 路径的 `/v1` 前缀剥离 —
+/// `provider.base_url` 通常已带 `/v1`(如 `https://api.openai.com/v1`),不剥
+/// 则会拼出 `…/v1/v1/...`(Stage 3.1 实测 OpenAI 兼容上游 404 / 405)。
+///
+/// `OpenAiChatAdapter` 与 `ResponsesPassthroughAdapter` 共用此规则。
+pub(crate) fn normalize_v1_prefix(path: &str) -> String {
+    let path = if path.is_empty() { "/" } else { path };
+    if let Some(stripped) = path.strip_prefix("/v1/") {
+        format!("/{stripped}")
+    } else if path == "/v1" {
+        "/".to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod normalize_v1_prefix_tests {
+    use super::normalize_v1_prefix;
+
+    #[test]
+    fn strips_v1_chat() {
+        assert_eq!(
+            normalize_v1_prefix("/v1/chat/completions"),
+            "/chat/completions"
+        );
+    }
+
+    #[test]
+    fn strips_v1_responses() {
+        assert_eq!(normalize_v1_prefix("/v1/responses"), "/responses");
+    }
+
+    #[test]
+    fn preserves_query() {
+        assert_eq!(
+            normalize_v1_prefix("/v1/responses?stream=true"),
+            "/responses?stream=true"
+        );
+    }
+
+    #[test]
+    fn passthrough_when_no_v1() {
+        assert_eq!(normalize_v1_prefix("/responses"), "/responses");
+    }
+
+    #[test]
+    fn lone_v1_becomes_root() {
+        assert_eq!(normalize_v1_prefix("/v1"), "/");
+    }
+
+    #[test]
+    fn empty_becomes_root() {
+        assert_eq!(normalize_v1_prefix(""), "/");
+    }
 }

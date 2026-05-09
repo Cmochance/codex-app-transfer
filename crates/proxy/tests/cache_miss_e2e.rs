@@ -23,7 +23,12 @@ async fn spawn_proxy_no_upstream() -> std::net::SocketAddr {
         name: "Must Not Reach Upstream".into(),
         base_url: "http://192.0.2.1:1".into(),
         auth_scheme: "none".into(),
-        api_format: "responses".into(),
+        // `openai_chat` 跟 8 条 builtin preset 真实配置一致:Codex.app 入站
+        // /v1/responses 仍命中 ResponsesAdapter(通过 lookup_for_request 第一层
+        // short-circuit),触发本地 cache miss → 400 short-circuit。
+        // 注:`responses` 字面值现在归 ResponsesPassthroughAdapter(字节级透传
+        // 上游 OpenAI Responses API),不走本地 cache,与本测试场景不符。
+        api_format: "openai_chat".into(),
         api_key: String::new(),
         models: IndexMap::new(),
         extra_headers: IndexMap::new(),

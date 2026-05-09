@@ -17,6 +17,7 @@
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
 
+use crate::normalize_v1_prefix;
 use crate::types::{Adapter, AdapterError, RequestPlan};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -48,18 +49,6 @@ impl Adapter for OpenAiChatAdapter {
             // 无 namespace 包装也无 Responses API envelope 字段需求,留 None。
             original_responses_request: None,
         })
-    }
-}
-
-/// 把 `/v1/foo?bar` 规范化为 `/foo?bar`;若开头不是 `/v1/` 则原样返回。
-fn normalize_v1_prefix(path: &str) -> String {
-    let path = if path.is_empty() { "/" } else { path };
-    if let Some(stripped) = path.strip_prefix("/v1/") {
-        format!("/{stripped}")
-    } else if path == "/v1" {
-        "/".to_owned()
-    } else {
-        path.to_owned()
     }
 }
 

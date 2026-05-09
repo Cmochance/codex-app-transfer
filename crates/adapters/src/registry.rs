@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::openai_chat::OpenAiChatAdapter;
+use crate::passthrough::ResponsesPassthroughAdapter;
 use crate::responses::ResponsesAdapter;
 use crate::types::Adapter;
 
@@ -16,6 +17,7 @@ use crate::types::Adapter;
 pub struct AdapterRegistry {
     openai_chat: Arc<dyn Adapter>,
     responses: Arc<dyn Adapter>,
+    responses_passthrough: Arc<dyn Adapter>,
 }
 
 impl AdapterRegistry {
@@ -23,6 +25,7 @@ impl AdapterRegistry {
         Self {
             openai_chat: Arc::new(OpenAiChatAdapter),
             responses: Arc::new(ResponsesAdapter),
+            responses_passthrough: Arc::new(ResponsesPassthroughAdapter),
         }
     }
 
@@ -60,6 +63,20 @@ impl AdapterRegistry {
     /// `/responses` directly.
     pub fn lookup_for_request(&self, api_format: &str, client_path: &str) -> Arc<dyn Adapter> {
         let normalized = api_format.trim().to_ascii_lowercase().replace('-', "_");
+        // 用户显式选 responses 透传 + 入站是 /responses 路径 → 字节级透传给上游。
+        // 上游需原生实现 OpenAI Responses API(如 OpenAI 官方 / 自建反代);
+        // anthropic/claude/messages 是 Python 历史兼容值,继续走 ResponsesAdapter
+        // 本地协议转换,不在此分支(后续若加 native Anthropic Messages 透传再扩)。
+        //
+        // **关键例外**:`/responses/compact` 是本仓库私有扩展(不是 OpenAI 官方
+        // 端点),OpenAI 上游不实现 → 必须走 ResponsesAdapter 在本地包装成 chat
+        // completions 模拟实现。passthrough 这条路径会让上游必 404。
+        if matches!(normalized.as_str(), "responses" | "openai_responses")
+            && is_local_responses_route(client_path)
+            && !is_responses_compact_subpath(client_path)
+        {
+            return self.responses_passthrough.clone();
+        }
         if matches!(
             normalized.as_str(),
             "openai" | "openai_chat" | "chat_completions"
@@ -69,6 +86,33 @@ impl AdapterRegistry {
         }
         self.lookup(api_format)
     }
+}
+
+/// 给 passthrough adapter 用:把 client_path(可能含 query)normalize 成上游
+/// 标准 path,处理:
+/// - `/openai/v1/responses` → `/responses`(剥 legacy `/openai` prefix)
+/// - `/claude/v1/messages` → `/messages`(legacy alias)
+/// - `/v1/responses` → `/responses`(剥 `/v1`,因 provider.base_url 已带 `/v1`)
+/// - 保留 query string
+pub fn rewrite_local_path_for_upstream(client_path: &str) -> String {
+    let (path, query) = match client_path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (client_path, None),
+    };
+    let normalized = normalize_local_responses_path(path);
+    match query {
+        Some(q) => format!("{normalized}?{q}"),
+        None => normalized,
+    }
+}
+
+/// 是否是 `/responses/compact*` 子路径(本仓库私有扩展,OpenAI 上游不实现)。
+/// passthrough adapter 必须排除这条路径,留给 ResponsesAdapter 在本地包装实现。
+pub fn is_responses_compact_subpath(client_path: &str) -> bool {
+    let path = client_path.split('?').next().unwrap_or(client_path);
+    let normalized = normalize_local_responses_path(path);
+    let normalized = normalized.as_str();
+    normalized == "/responses/compact" || normalized.starts_with("/responses/compact/")
 }
 
 pub fn is_local_responses_route(client_path: &str) -> bool {
@@ -209,5 +253,136 @@ mod tests {
                 "{path} 不应误判为 Codex 本地 Responses/Messages 路由"
             );
         }
+    }
+
+    #[test]
+    fn responses_passthrough_active_for_responses_format_on_local_routes() {
+        // apiFormat=responses + 入站 /responses 路径 → ResponsesPassthroughAdapter
+        // (字节级透传给上游 OpenAI Responses API,不做协议转换)
+        let r = AdapterRegistry::with_builtins();
+        for path in [
+            "/responses",
+            "/responses?stream=1",
+            "/v1/responses",
+            "/openai/v1/responses",
+            "/v1/responses/resp_abc/cancel",
+            "/v1/messages",
+        ] {
+            assert_eq!(
+                r.lookup_for_request("responses", path).name(),
+                "responses_passthrough",
+                "{path} apiFormat=responses 必须走 passthrough adapter"
+            );
+        }
+        // openai_responses 别名同样命中
+        assert_eq!(
+            r.lookup_for_request("openai_responses", "/v1/responses")
+                .name(),
+            "responses_passthrough"
+        );
+        // 大小写 / 连字符变体
+        assert_eq!(
+            r.lookup_for_request("Openai-Responses", "/v1/responses")
+                .name(),
+            "responses_passthrough"
+        );
+    }
+
+    #[test]
+    fn anthropic_aliases_still_use_local_responses_adapter_not_passthrough() {
+        // anthropic/claude/messages 是 Python 历史兼容值 → 继续走 ResponsesAdapter
+        // 本地协议转换,不进 passthrough 分支(后续若加 Anthropic Messages 原生
+        // 透传需要再扩 lookup_for_request)
+        let r = AdapterRegistry::with_builtins();
+        for api_format in ["anthropic", "claude", "messages"] {
+            assert_eq!(
+                r.lookup_for_request(api_format, "/v1/responses").name(),
+                "responses",
+                "{api_format} 必须走 ResponsesAdapter 本地转换,不走 passthrough"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_format_with_chat_path_falls_back_to_lookup() {
+        // 入站非 /responses 路径(理论上 Codex.app 不会发,但防御性)
+        // → fallback 到 lookup,apiFormat=responses 仍归 ResponsesAdapter
+        let r = AdapterRegistry::with_builtins();
+        assert_eq!(
+            r.lookup_for_request("responses", "/v1/chat/completions")
+                .name(),
+            "responses"
+        );
+    }
+
+    #[test]
+    fn responses_compact_subpath_never_uses_passthrough_even_for_responses_format() {
+        // P1 (chatgpt-codex-connector review): /responses/compact 是本仓库私有扩展
+        // (不是 OpenAI 官方端点),OpenAI 上游不实现 → 必须走 ResponsesAdapter 本地
+        // 包装成 chat completions 模拟实现。即便 apiFormat=responses 也不能进 passthrough
+        // (passthrough 上去必 404)。
+        let r = AdapterRegistry::with_builtins();
+        for path in [
+            "/responses/compact",
+            "/responses/compact?foo=1",
+            "/v1/responses/compact",
+            "/openai/v1/responses/compact",
+        ] {
+            assert_eq!(
+                r.lookup_for_request("responses", path).name(),
+                "responses",
+                "{path} 即使 apiFormat=responses 也必须走 ResponsesAdapter,不能 passthrough"
+            );
+            assert_eq!(
+                r.lookup_for_request("openai_responses", path).name(),
+                "responses",
+                "{path} openai_responses 别名也必须走 ResponsesAdapter"
+            );
+        }
+        // 防回归:`/responses/compact_alt` 不属于 compact 私有扩展,仍走 passthrough
+        // (语义上是普通子路径,passthrough 让上游决定是否实现)
+        assert_eq!(
+            r.lookup_for_request("responses", "/v1/responses/compact_alt")
+                .name(),
+            "responses_passthrough"
+        );
+    }
+
+    #[test]
+    fn rewrite_local_path_for_upstream_strips_legacy_prefixes() {
+        // P1 (chatgpt-codex-connector review): passthrough adapter 必须 normalize
+        // 所有 legacy prefix(/openai / /claude/v1/messages),否则透传到上游必 404。
+        assert_eq!(
+            rewrite_local_path_for_upstream("/openai/v1/responses"),
+            "/responses"
+        );
+        assert_eq!(
+            rewrite_local_path_for_upstream("/claude/v1/messages"),
+            "/messages"
+        );
+        assert_eq!(
+            rewrite_local_path_for_upstream("/v1/responses?stream=true"),
+            "/responses?stream=true"
+        );
+        assert_eq!(
+            rewrite_local_path_for_upstream("/openai/v1/responses?model=gpt-5"),
+            "/responses?model=gpt-5"
+        );
+        assert_eq!(rewrite_local_path_for_upstream("/responses"), "/responses");
+        assert_eq!(rewrite_local_path_for_upstream("/v1"), "/");
+    }
+
+    #[test]
+    fn is_responses_compact_subpath_matches_only_compact_extension() {
+        assert!(is_responses_compact_subpath("/responses/compact"));
+        assert!(is_responses_compact_subpath("/v1/responses/compact"));
+        assert!(is_responses_compact_subpath("/openai/v1/responses/compact"));
+        assert!(is_responses_compact_subpath("/v1/responses/compact?foo=1"));
+        assert!(is_responses_compact_subpath("/responses/compact/sub"));
+        // 防回归:其他 /responses/* 子路径不算 compact
+        assert!(!is_responses_compact_subpath("/responses"));
+        assert!(!is_responses_compact_subpath("/v1/responses"));
+        assert!(!is_responses_compact_subpath("/v1/responses/resp_abc"));
+        assert!(!is_responses_compact_subpath("/responses/compact_alt"));
     }
 }
