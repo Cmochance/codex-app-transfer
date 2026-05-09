@@ -102,6 +102,12 @@ pub struct ChatToResponsesConverter {
     model: String,
     finish_reason: Option<String>,
     usage: Option<Value>,
+
+    /// 原入站 Responses API request 的 `tools` 数组(未经展平),用于
+    /// 在 envelope 里回灌让 Codex CLI 反向路由 namespace 工具调用。
+    /// 借鉴 mimo2codex `streamToSse.ts:102` `tools: state.req.tools ?? []`。
+    /// None / 空数组在 envelope 里都序列化为 `[]`(对齐 mimo2codex 行为)。
+    original_tools: Option<Value>,
 }
 
 impl ChatToResponsesConverter {
@@ -146,6 +152,7 @@ impl ChatToResponsesConverter {
             model: String::new(),
             finish_reason: None,
             usage: None,
+            original_tools: None,
         }
     }
 
@@ -161,6 +168,25 @@ impl ChatToResponsesConverter {
     pub fn with_think_tag_split(mut self, enabled: bool) -> Self {
         self.enable_think_tag_split = enabled;
         self
+    }
+
+    /// 注入原入站 Responses API request 的 `tools` 数组(未展平),
+    /// 让 envelope 在 `response.created` / `response.in_progress` /
+    /// `response.completed` 三个生命周期事件里都回传它,Codex CLI
+    /// 据此用 `(namespace, function.name)` 复合主键路由 function_call
+    /// 到对应的 MCP server。**关键修复**:不带这个数组,namespace 包装
+    /// 的 MCP 工具调用全部 "unsupported call"。
+    pub fn with_original_tools(mut self, tools: Option<Value>) -> Self {
+        self.original_tools = tools;
+        self
+    }
+
+    /// 用于 envelope 的 `tools` 字段。None / 空都返回 `[]`,对齐
+    /// mimo2codex `state.req.tools ?? []` 行为。
+    fn envelope_tools(&self) -> Value {
+        self.original_tools
+            .clone()
+            .unwrap_or_else(|| Value::Array(Vec::new()))
     }
 
     pub fn assistant_message(&self) -> Option<Value> {
@@ -255,6 +281,9 @@ impl ChatToResponsesConverter {
             "object": "response",
             "status": "in_progress",
             "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
+            // 回传原入站 tools(未展平),Codex CLI 用它反向路由 namespace
+            // 包装的 MCP 工具调用。借鉴 mimo2codex streamToSse.ts:102。
+            "tools": self.envelope_tools(),
         });
         emit_event(
             out,
@@ -877,6 +906,9 @@ impl ChatToResponsesConverter {
                 "model": if self.model.is_empty() { "unknown" } else { self.model.as_str() },
                 "output": output_items,
                 "incomplete_details": incomplete_details,
+                // 同 emit_lifecycle_open:回传原入站 tools 让 Codex CLI
+                // 反向路由 namespace 包装的工具调用。
+                "tools": self.envelope_tools(),
             },
         });
         // Codex CLI 反序列化 `ResponseCompleted` 时 usage 中的 `input_tokens` /
@@ -1252,6 +1284,85 @@ mod tests {
         assert_eq!(events[0].1["response"]["status"], "in_progress");
         assert_eq!(events[0].1["response"]["model"], "mock");
         assert_eq!(events[1].1["response"]["model"], "mock");
+    }
+
+    // ── envelope tools 字段(MCP namespace 反向路由)──
+    // 借鉴 mimo2codex streamToSse.ts:102 / respToResponses.ts:117。Codex CLI
+    // 用响应 envelope 里的 tools 数组 + (namespace, function.name) 复合主键
+    // 反向路由 namespace 包装的 MCP 工具 function_call。
+
+    #[test]
+    fn envelope_includes_original_tools_in_lifecycle_events() {
+        let original_tools = json!([
+            {"type": "function", "name": "shell"},
+            {"type": "namespace", "name": "mcp__notion__", "tools": [
+                {"type": "function", "name": "notion_search"}
+            ]}
+        ]);
+        let mut c = ChatToResponsesConverter::new_with_ids(
+            "resp_x".into(),
+            "msg_x".into(),
+            "rs_x".into(),
+        )
+        .with_original_tools(Some(original_tools.clone()));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"model":"kimi","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        // response.created envelope 含完整原始 tools(未展平的 namespace)
+        let created = events
+            .iter()
+            .find(|(n, _)| n == "response.created")
+            .expect("response.created emitted");
+        assert_eq!(
+            created.1["response"]["tools"], original_tools,
+            "response.created envelope 必须含原始 tools 数组,Codex CLI 据此反向路由"
+        );
+
+        // response.in_progress 同 envelope
+        let in_progress = events
+            .iter()
+            .find(|(n, _)| n == "response.in_progress")
+            .expect("response.in_progress emitted");
+        assert_eq!(in_progress.1["response"]["tools"], original_tools);
+
+        // response.completed 也含 tools
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed emitted");
+        assert_eq!(completed.1["response"]["tools"], original_tools);
+    }
+
+    #[test]
+    fn envelope_tools_default_to_empty_array_when_unset() {
+        // 没调 with_original_tools 时 envelope tools 字段必须存在且为 [],
+        // 对齐 mimo2codex `state.req.tools ?? []`,严格 Responses 协议客户端
+        // 不容缺字段。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            br#"data: {"model":"mock","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}
+
+"#,
+        ));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        let created = events
+            .iter()
+            .find(|(n, _)| n == "response.created")
+            .unwrap();
+        assert_eq!(created.1["response"]["tools"], json!([]));
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        assert_eq!(completed.1["response"]["tools"], json!([]));
     }
 
     #[test]

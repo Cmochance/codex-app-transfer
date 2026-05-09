@@ -48,6 +48,17 @@ pub struct RequestPlan {
     /// completions 模拟 compact 端点)。`transform_response_stream` 据此选择
     /// 直接 SSE 转换还是包装成 `{"output":[{"type":"compaction",...}]}` 响应。
     pub is_compact: bool,
+    /// 原入站 Responses API request 的 `tools` 字段(未经任何展平 / 协议转换)。
+    /// chat→responses SSE 状态机把这个数组原样塞进 `response.created` /
+    /// `response.in_progress` / `response.completed` 的 envelope —— Codex CLI
+    /// 客户端用这个 tools 数组 + `(namespace, function.name)` 复合主键路由
+    /// 模型生成的 function_call 到正确的 MCP server。
+    ///
+    /// 缺这个字段时,namespace 包装的 MCP 工具调用会全部 "unsupported call"
+    /// (Codex CLI 找不到 server 上下文)。借鉴 mimo2codex
+    /// `streamToSse.ts:102` / `respToResponses.ts:117` `tools: state.req.tools ?? []`
+    /// 处理思路。openai_chat 路径不涉及此字段,留 None。
+    pub original_responses_tools: Option<Value>,
 }
 
 #[derive(Debug, Clone)]

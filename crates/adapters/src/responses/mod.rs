@@ -64,6 +64,7 @@ impl Adapter for ResponsesAdapter {
                 body: Bytes::from(new_body),
                 response_session: None,
                 is_compact: true,
+                original_responses_tools: None,
             });
         }
 
@@ -72,6 +73,11 @@ impl Adapter for ResponsesAdapter {
         // 失败时(body 非 JSON / 非对象)用 BadRequest 错出去,proxy 会回 400。
         let parsed: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| AdapterError::BadRequest(format!("body 不是合法 JSON: {e}")))?;
+        // 在跑 chat-body 转换之前,先把入站原始 tools 数组留一份(未经
+        // namespace 展平 / 协议转换)。chat→responses 响应阶段 envelope
+        // 要原样回灌它,Codex CLI 据此用 (namespace, function.name) 复合
+        // 主键反向路由 MCP 工具的 function_call。
+        let original_responses_tools = parsed.get("tools").cloned();
         let conversion = responses_body_to_chat_body_for_provider_with_session(
             &parsed,
             Some(provider),
@@ -84,6 +90,7 @@ impl Adapter for ResponsesAdapter {
             body: Bytes::from(new_body),
             response_session: Some(conversion.response_session),
             is_compact: false,
+            original_responses_tools,
         })
     }
 
@@ -117,6 +124,7 @@ impl Adapter for ResponsesAdapter {
                 upstream_stream,
                 request_plan.response_session.clone(),
                 enable_think_tag_split,
+                request_plan.original_responses_tools.clone(),
             ),
         })
     }
