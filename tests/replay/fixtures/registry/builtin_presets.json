@@ -278,7 +278,7 @@
   },
   {
     "id": "google-ai-studio",
-    "name": "Google AI Studio (Gemini)",
+    "name": "Google AI Studio",
     "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
     "docsUrl": "https://ai.google.dev/gemini-api/docs/openai",
     "authScheme": "bearer",
@@ -301,21 +301,14 @@
       },
       {
         "type": "info",
-        "text": "**Google Search grounding 已通过代理 extra_body 自动注入**:在 provider 配置打开 `web_search_enabled` 即用,代理出站时把 Codex.app 的 `web_search` 工具映射成 Gemini 期待的 `extra_body.google.tools=[{google_search:{}}]`(A 层默认关 + B 层 4xx fallback 自动降级,跟 MiMo 同款双层防错)。"
-      },
-      {
-        "type": "info",
         "text": "**字段白名单清洗**:代理在出站前主动剥 Gemini OpenAI 兼容层不支持(silently ignored)的字段(`frequency_penalty` / `presence_penalty` / `logprobs` / `parallel_tool_calls` / `user` / `stop` / `logit_bias` / `max_completion_tokens` / `safety_identifier` 等),防 wire 噪音 + 防未来 schema 漂移意外报错。"
       },
       {
         "type": "warning",
-        "text": "已知限制:① 3.x 文本模型当前**仍为 Preview**(`-preview` 后缀);未来 GA 后模型 ID 可能去掉 `-preview`,届时需手动改 mapping。② `generativelanguage.googleapis.com` 在中国大陆未直连,需 VPN。③ `gemini-3.1-flash-lite` 是当前唯一不带 `-preview` 的 stable 3.x,但能力为轻量级。④ **响应侧 grounding citations 映射未完成**:Google Search 返回的来源 URL → Codex.app `delta.annotations` 翻译需要先抓真 SSE wire 形态(Google 文档零字描述,LiteLLM/Vercel SDK 都走 native path 不可借鉴),用户体验:模型回答内容含搜索结果,但 UI 不显示来源链接。等社区提供真 GEMINI_API_KEY 抓包后再实施 converter。"
+        "text": "已知限制:① 3.x 文本模型当前**仍为 Preview**(`-preview` 后缀);未来 GA 后模型 ID 可能去掉 `-preview`,届时需手动改 mapping。② `generativelanguage.googleapis.com` 在中国大陆未直连,需 VPN。③ `gemini-3.1-flash-lite` 是当前唯一不带 `-preview` 的 stable 3.x,但能力为轻量级。④ **OpenAI 兼容 endpoint 不支持 Google Search grounding**:实测 2026-05-10,`extra_body.google.tools=[{google_search:{}}]` 仅对 `gemini-3-pro-image-preview`(image generation)有效,text chat 上游直接 400(`Cannot find field`);要联网搜索必须走 native `generateContent` API,本应用暂未实现该路径,需待后续版本支持。"
       }
     ],
-    "requestOptions": {
-      "web_search_enabled": true
-    },
-    "isBuiltin": true,
-    "supportsWebSearch": true
+    "requestOptions": {},
+    "isBuiltin": true
   }
 ]
