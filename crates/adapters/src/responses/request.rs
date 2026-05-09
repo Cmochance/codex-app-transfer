@@ -117,12 +117,6 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     let session_messages = messages.clone();
     result.insert("messages".into(), Value::Array(messages));
 
-    // **入站 web_search 检测**(必须在 convert 之前):
-    // Gemini 分支会把 web_search 工具剥成 vec![],下游无法判定原始入站是否含
-    // web_search;需在此 capture 标志位,后续 inject_gemini_google_search_extra_body
-    // 用它决定是否注入 `extra_body.google.tools=[{google_search:{}}]`。
-    let input_had_responses_web_search = input_tools_contain_responses_web_search(body);
-
     // tools(function / custom 直接处理,namespace 递归展平,web_search /
     // web_search_preview per-provider 适配上游真支持的形态,其余 Responses
     // 专属类型 drop + warn_once)
@@ -234,23 +228,6 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     result.insert("stream".into(), Value::Bool(stream));
     if stream {
         result.insert("stream_options".into(), json!({ "include_usage": true }));
-    }
-
-    // Gemini Google Search grounding 注入:入站 web_search + provider 是 Gemini
-    // + web_search_enabled + 未被 4xx fallback disable → 注入
-    // `extra_body.google.tools=[{google_search:{}}]`。必须在 sanitize 之前 —
-    // sanitize_gemini_chat_body 白名单保留 extra_body,但若注入晚于 sanitize
-    // 反而无谓多走一次 retain。**A 层 web_search_enabled + B 层 disable cache**
-    // 的双层防错跟 MiMo / Kimi 同款 pattern。
-    if input_had_responses_web_search {
-        if let Some(p) = provider {
-            if provider_looks_like_gemini(p)
-                && provider_web_search_enabled(p)
-                && !crate::is_web_search_disabled_for(&p.id)
-            {
-                inject_gemini_google_search_extra_body(&mut result);
-            }
-        }
     }
 
     sanitize_chat_body_for_provider(&mut result, provider);
@@ -1013,59 +990,6 @@ fn provider_looks_like_gemini(provider: &Provider) -> bool {
         || provider_looks_like(provider, "gemini")
 }
 
-/// 检查入站 Responses API request body 的 `tools` 数组是否含 OpenAI 标准
-/// `type:"web_search"` 工具。Gemini extra_body 注入用此标志位 — 因 outbound
-/// 转换时 `convert_web_search_tool` 已把 web_search 剥成 vec![](Gemini 分支),
-/// 所以必须在 convert 前就 capture 入站状态。
-fn input_tools_contain_responses_web_search(body: &Map<String, Value>) -> bool {
-    let Some(Value::Array(tools)) = body.get("tools") else {
-        return false;
-    };
-    tools
-        .iter()
-        .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("web_search"))
-}
-
-/// Gemini OpenAI 兼容层 Google Search grounding 注入:
-/// `extra_body.google.tools = [{google_search:{}}]` — Codex.app 默认不发
-/// extra_body,代理判定 web_search_enabled + 未 disable cache 时主动注入。
-///
-/// 实证(2026-05-10 ai.google.dev/gemini-api/docs/openai):extra_body 顶层
-/// 在 wire 上不嵌入 OpenAI request,Google 服务端单独解析此扩展。
-///
-/// 跟既有用户 body.extra_body merge:用户原始 body 经 PASSTHROUGH 透传后,
-/// `result["extra_body"]` 已存在(若用户配了);本函数走 `or_insert_with(...)`
-/// 取已有的或新建,然后嵌套 `google.tools` 路径写入 google_search。
-fn inject_gemini_google_search_extra_body(result: &mut Map<String, Value>) {
-    let extra_body = result
-        .entry("extra_body".to_string())
-        .or_insert_with(|| json!({}));
-    let Some(extra_body_obj) = extra_body.as_object_mut() else {
-        return;
-    };
-    let google = extra_body_obj
-        .entry("google".to_string())
-        .or_insert_with(|| json!({}));
-    let Some(google_obj) = google.as_object_mut() else {
-        return;
-    };
-    let tools = google_obj
-        .entry("tools".to_string())
-        .or_insert_with(|| Value::Array(vec![]));
-    let Some(tools_arr) = tools.as_array_mut() else {
-        return;
-    };
-    // 防重复:用户已经手动配了 google_search → 不重复加
-    let already_has_google_search = tools_arr.iter().any(|t| {
-        t.as_object()
-            .map(|o| o.contains_key("google_search"))
-            .unwrap_or(false)
-    });
-    if !already_has_google_search {
-        tools_arr.push(json!({"google_search": {}}));
-    }
-}
-
 fn sanitize_chat_body_for_provider(body: &mut Map<String, Value>, provider: Option<&Provider>) {
     let Some(provider) = provider else {
         return;
@@ -1083,11 +1007,16 @@ fn sanitize_chat_body_for_provider(body: &mut Map<String, Value>, provider: Opti
 /// silently ignored"(`ai.google.dev/gemini-api/docs/openai` 实证 2026-05-10)。
 ///
 /// 主动剥不在白名单的字段,理由:silent ignore 让 wire 干净 + 调试日志可读 +
-/// 防未来 schema 漂移意外报错。保留官方明列 + extra_body(关键!代理注入的
-/// google_search / safety_settings / thinking_config 在这里)。
+/// 防未来 schema 漂移意外报错。保留官方明列 + extra_body(用户若手动配
+/// safety_settings / thinking_config 时会用到,代理本身不再注入)。
 ///
 /// 保守策略:`response_format` / `seed` 文档未明列但 LiteLLM 走 OpenAI compat
 /// 路径会传,先**保留**等真 400 实证再补 drop。
+///
+/// **注意**:OpenAI 兼容 chat 端点不支持 `extra_body.google.tools=[{google_search:{}}]`
+/// grounding 注入(2026-05-10 实测 5 种 variant 全部 400,该字段仅对
+/// `gemini-3-pro-image-preview` 有效),所以代理不再做请求侧注入,本 sanitize 仍
+/// 保留 extra_body 字段是给用户自定义透传留口。
 fn sanitize_gemini_chat_body(body: &mut Map<String, Value>) {
     body.retain(|key, _| {
         matches!(
@@ -1105,7 +1034,8 @@ fn sanitize_gemini_chat_body(body: &mut Map<String, Value>) {
             | "service_tier"
             | "reasoning_effort"
             | "n"
-            // 代理独占注入字段(必须保留 — google_search 在 extra_body.google.tools)
+            // 用户透传字段(代理本身不注入 — Gemini OpenAI compat 不支持 google_search;
+            // 但用户若手动配 safety_settings / thinking_config 会走这里)
             | "extra_body"
             | "extra_headers"
             | "extra_query"
@@ -1995,11 +1925,14 @@ fn convert_web_search_tool(
     }
 
     if provider_looks_like_gemini(provider) {
-        // Google AI Studio Gemini OpenAI 兼容层:web_search 走 `extra_body.google.tools`
-        // (`platform/openai` 文档实证 2026-05-10:`extra_body:{google:{tools:[{google_search:{}}]}}`)
-        // **不在 chat tools 数组里出现** — 返 vec![],真正的注入在
-        // `responses_body_to_chat_body_for_provider_with_session` 末尾(line ~150)
-        // 通过 `inject_gemini_google_search_extra_body` 写到 result body。
+        // Google AI Studio Gemini OpenAI 兼容 chat 端点**不支持 google_search grounding**
+        // (2026-05-10 curl 实证:`extra_body.google.tools=[{google_search:{}}]` /
+        // `tools=[{type:"google_search"}]` / `tools=[{type:"web_search"}]` / 顶层
+        // `web_search_options` 等 5 种 variant 全部 400 `Cannot find field`;官方
+        // ai.google.dev/gemini-api/docs/openai 写明 `extra_body.google.tools` 仅
+        // 对 `gemini-3-pro-image-preview` 有效)。要 grounding 必须走 native
+        // `generateContent` API,本应用暂未实现该路径。返 vec![] 静默剥工具,
+        // 让请求按普通 chat 透传上游。
         return vec![];
     }
 
@@ -2110,7 +2043,7 @@ mod tests {
     fn gemini_provider() -> Provider {
         let mut p = provider(
             "google-ai-studio",
-            "Google AI Studio (Gemini)",
+            "Google AI Studio",
             "https://generativelanguage.googleapis.com/v1beta/openai",
         );
         p.models
@@ -2135,9 +2068,10 @@ mod tests {
     }
 
     #[test]
-    fn gemini_web_search_disabled_by_default_drops_tool_no_extra_body() {
-        // A 层 默认 web_search_enabled=false → web_search 工具被 drop,
-        // 也不注入 extra_body.google.tools(用户没显式启用)
+    fn gemini_web_search_tool_dropped_no_extra_body_inject() {
+        // OpenAI 兼容 chat 端点不支持 google_search grounding(2026-05-10 实测 5
+        // 种 variant 全部 400),代理把入站 web_search 工具静默剥成 vec![],
+        // 不注入任何 extra_body.google 字段(防上游 400)。
         let p = gemini_provider();
         let req = json!({
             "model": "gemini-3.1-flash-lite",
@@ -2146,44 +2080,15 @@ mod tests {
             "tools": [{"type":"web_search","external_web_access":true}]
         });
         let body = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-        // Gemini 分支返 vec![] → outbound chat tools 不存在或为空
         assert!(
             body.get("tools")
                 .map(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(false))
                 .unwrap_or(true),
-            "默认 web_search_enabled=false 时 outbound tools 必须为空 / 不存在"
+            "Gemini 分支必须把 web_search 工具剥成空数组 / 不存在"
         );
-        // 不注入 extra_body.google
         assert!(
             body.get("extra_body").is_none() || body["extra_body"]["google"].is_null(),
-            "默认未启用时不注入 extra_body.google,实际:{body}"
-        );
-    }
-
-    #[test]
-    fn gemini_web_search_enabled_injects_extra_body_google_tools() {
-        // A 层 web_search_enabled=true → 注入 extra_body.google.tools=[{google_search:{}}]
-        let mut p = gemini_provider();
-        p.request_options
-            .insert("web_search_enabled".into(), Value::Bool(true));
-        let req = json!({
-            "model": "gemini-3.1-flash-lite",
-            "stream": true,
-            "input": [{"type":"message","role":"user","content":"搜一下"}],
-            "tools": [{"type":"web_search","external_web_access":true}]
-        });
-        let body = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-        // outbound chat tools 仍空(Gemini 分支返 vec![]);google_search 走 extra_body
-        let google_tools = &body["extra_body"]["google"]["tools"];
-        let arr = google_tools
-            .as_array()
-            .expect("extra_body.google.tools 必须是数组");
-        assert!(
-            arr.iter().any(|t| t
-                .as_object()
-                .map(|o| o.contains_key("google_search"))
-                .unwrap_or(false)),
-            "extra_body.google.tools 必须含 {{google_search:{{}}}}, 实际:{google_tools}"
+            "代理不再注入 extra_body.google.tools(上游 chat 不支持),实际:{body}"
         );
     }
 
@@ -2220,72 +2125,6 @@ mod tests {
         // 保留字段 sanity
         assert!(body.get("model").is_some(), "model 必须保留");
         assert!(body.get("messages").is_some(), "messages 必须保留");
-    }
-
-    #[test]
-    fn gemini_preserves_extra_body_through_sanitize() {
-        // 防回归:sanitize 必须保留 extra_body(google_search 在里面),
-        // 否则代理注入立即被 sanitize 剥光,功能失效
-        let mut p = gemini_provider();
-        p.request_options
-            .insert("web_search_enabled".into(), Value::Bool(true));
-        let req = json!({
-            "model": "gemini-3.1-flash-lite",
-            "stream": true,
-            "input": [{"type":"message","role":"user","content":"hi"}],
-            "tools": [{"type":"web_search","external_web_access":true}]
-        });
-        let body = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-        assert!(
-            body.get("extra_body").is_some(),
-            "extra_body 必须保留(google_search 在里面)"
-        );
-        assert!(
-            !body["extra_body"]["google"]["tools"].is_null(),
-            "extra_body.google.tools 必须保留,实际:{body}"
-        );
-    }
-
-    #[test]
-    fn gemini_b_layer_disable_cache_drops_extra_body_inject() {
-        // B 层 (`is_web_search_disabled_for`) 4xx fallback 已 disable provider id
-        // → 即便 web_search_enabled=true 也不注入(防再次失败)
-        let mut p = gemini_provider();
-        p.id = "gemini-blayer-test".into(); // 用专属 id 避免污染其他测试
-        p.request_options
-            .insert("web_search_enabled".into(), Value::Bool(true));
-        // 模拟运行时 disable
-        crate::disable_web_search_for(&p.id);
-        let req = json!({
-            "model": "gemini-3.1-flash-lite",
-            "stream": true,
-            "input": [{"type":"message","role":"user","content":"hi"}],
-            "tools": [{"type":"web_search","external_web_access":true}]
-        });
-        let body = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-        assert!(
-            body.get("extra_body").is_none() || body["extra_body"]["google"].is_null(),
-            "B 层 disable 后必须不注入 extra_body.google,实际:{body}"
-        );
-    }
-
-    #[test]
-    fn gemini_no_input_web_search_no_inject_even_when_enabled() {
-        // 入站不含 web_search 工具时,即便 web_search_enabled=true 也不注入
-        let mut p = gemini_provider();
-        p.request_options
-            .insert("web_search_enabled".into(), Value::Bool(true));
-        let req = json!({
-            "model": "gemini-3.1-flash-lite",
-            "stream": true,
-            "input": [{"type":"message","role":"user","content":"hi"}]
-            // 注:没有 tools 字段
-        });
-        let body = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-        assert!(
-            body.get("extra_body").is_none() || body["extra_body"]["google"].is_null(),
-            "入站没 web_search 工具不应注入"
-        );
     }
 
     #[test]

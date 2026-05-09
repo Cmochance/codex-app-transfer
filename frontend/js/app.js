@@ -179,13 +179,27 @@
     setProviderMappings(providerFormMappings);
   }
 
-  // 控制 web_search 配置开关 row 的显示 + 初始 checkbox state。
-  // 触发条件:preset.supportsWebSearch === true(MiMo / Kimi / Gemini 三家)。
-  function setWebSearchRow(supports, enabled) {
+  // 控制 web_search 配置开关 row 的显示 + 初始 checkbox state + provider-specific
+  // hint 文案。preset.supportsWebSearch === true 才显示(Kimi / Kimi Code / MiMo
+  // PAYG / MiMo Token Plan 四家;Gemini OpenAI compat chat 不支持 grounding,
+  // 已实测 5 种 variant 全 400,故不开)。
+  // hint 文案按 presetId 选 i18n key,fallback 到 .default;切换 preset 时
+  // 同步更新 dataset.i18n + textContent,语言切换 + preset 切换都不会留旧文案。
+  function setWebSearchRow(supports, enabled, presetId) {
     const row = $("#providerWebSearchRow");
     const cb = $("#providerWebSearchEnabled");
+    const hint = $("#providerWebSearchHint");
     if (row) row.hidden = !supports;
     if (cb) cb.checked = !!enabled;
+    if (hint) {
+      const specificKey = presetId
+        ? `providersAdd.webSearchEnabledHint.${presetId}`
+        : null;
+      const fallbackKey = "providersAdd.webSearchEnabledHint.default";
+      const useKey = specificKey && t(specificKey) !== specificKey ? specificKey : fallbackKey;
+      hint.dataset.i18n = useKey;
+      hint.textContent = t(useKey);
+    }
   }
 
   function setApiFormatMode(allowSelect, currentValue) {
@@ -1131,7 +1145,7 @@
     $("#providerAuth").value = "bearer";
     renderApiFormatDisplay("openai_chat");
     setApiFormatMode(false, "openai_chat");
-    setWebSearchRow(false, false);
+    setWebSearchRow(false, false, null);
     setProviderMappings(emptyMappings());
     setUnverifiedBanner(false);
   }
@@ -1164,11 +1178,13 @@
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     // Web Search 配置开关:preset 标支持 + preset.requestOptions.web_search_enabled
-    // 决定初始 checkbox state(google-ai-studio / kimi / kimi-code 默认 true,
-    // xiaomi-mimo-* 默认 false,跟 backend `provider_web_search_enabled` 读取契约一致)
+    // 决定初始 checkbox state(kimi / kimi-code 默认 true,xiaomi-mimo-* 默认 false,
+    // 跟 backend `provider_web_search_enabled` 读取契约一致);hint 文案按
+    // preset.id 选 provider-specific 段落
     setWebSearchRow(
       !!preset.supportsWebSearch,
-      !!formRequestOptions.web_search_enabled
+      !!formRequestOptions.web_search_enabled,
+      preset.id
     );
     providerAvailableModels = [];
     setProviderMappings(preset.models || emptyMappings());
@@ -1220,10 +1236,12 @@
     setApiFormatMode(false, (matchedPreset && matchedPreset.apiFormat) || provider.apiFormat);
     // 编辑场景:支持判定走 matchedPreset.supportsWebSearch(自定义 provider 不命中
     // builtin → matchedPreset undefined → 不显示开关);初始 checkbox state 读
-    // provider 实际保存的 requestOptions.web_search_enabled
+    // provider 实际保存的 requestOptions.web_search_enabled;hint 文案按
+    // matchedPreset.id(自定义 provider 时 fallback 到 .default 通用文案)
     setWebSearchRow(
       !!(matchedPreset && matchedPreset.supportsWebSearch),
-      !!formRequestOptions.web_search_enabled
+      !!formRequestOptions.web_search_enabled,
+      matchedPreset?.id || null
     );
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
