@@ -119,6 +119,9 @@
   }
 
   function presetExists(preset, providers) {
+    // 「自定义第三方」是无限重复添加入口卡片(用户每次填不同 baseUrl + apiKey),
+    // 永远视为不存在 → 永远在 dashboard available presets 列表显示
+    if (preset.id === "custom-third-party") return false;
     const presetName = normalizePresetKey(preset.name);
     const presetUrl = normalizePresetKey(preset.baseUrl);
     return providers.some((provider) => (
@@ -1077,7 +1080,9 @@
     formRequestOptions = {};
     setProviderFormMode("providersAdd.title");
     $("#providerName").value = "";
+    $("#providerName").placeholder = "";
     $("#providerBaseUrl").value = "";
+    $("#providerBaseUrl").placeholder = "";
     $("#providerBaseUrl").disabled = false;
     const trigger = $("#providerBaseUrlTrigger");
     if (trigger) trigger.hidden = true;
@@ -1091,8 +1096,20 @@
   }
 
   function applyPresetToForm(preset, notify = true) {
-    $("#providerName").value = preset.name;
-    $("#providerBaseUrl").value = preset.baseUrl;
+    // 自定义第三方:不预填 name/baseUrl(用户必须自己填),用 placeholder 提示
+    // builtin preset:直接预填 name + baseUrl,用户保存即可
+    const isCustom = preset.id === "custom-third-party";
+    if (isCustom) {
+      $("#providerName").value = "";
+      $("#providerName").placeholder = preset.name;
+      $("#providerBaseUrl").value = "";
+      $("#providerBaseUrl").placeholder = "https://api.example.com/v1";
+    } else {
+      $("#providerName").value = preset.name;
+      $("#providerName").placeholder = "";
+      $("#providerBaseUrl").value = preset.baseUrl;
+      $("#providerBaseUrl").placeholder = "";
+    }
     $("#providerBaseUrl").disabled = false;
     const trigger = $("#providerBaseUrlTrigger");
     if (trigger) trigger.hidden = true;
@@ -1131,7 +1148,9 @@
     formRequestOptions = normalizeRequestOptions(provider.requestOptions || selectedPreset.requestOptions || {});
     setProviderFormMode("providersAdd.editTitle");
     $("#providerName").value = provider.name;
+    $("#providerName").placeholder = "";
     $("#providerBaseUrl").value = provider.baseUrl;
+    $("#providerBaseUrl").placeholder = "";
     // 内置 provider 不允许修改 baseUrl
     $("#providerBaseUrl").disabled = !!provider.isBuiltin;
     const baseUrlTrigger = $("#providerBaseUrlTrigger");
