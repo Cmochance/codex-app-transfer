@@ -34,10 +34,11 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 8 条 builtin presets:
+        // 当前 9 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
-        // / zhipu / bailian / minimax(2026-05-09 加 MiniMax M2.x preset)
-        assert_eq!(builtin_presets().len(), 8);
+        // / zhipu / bailian / minimax / google-ai-studio
+        // (2026-05-10 加 Google AI Studio Gemini preset)
+        assert_eq!(builtin_presets().len(), 9);
     }
 
     #[test]
@@ -55,6 +56,29 @@ mod tests {
                 .unwrap_or("")
                 .starts_with("MiniMax-M2"),
             "default model 必须是 MiniMax-M2.x 系列"
+        );
+    }
+
+    #[test]
+    fn google_ai_studio_preset_exists_with_openai_compat_endpoint() {
+        let g = builtin_presets()
+            .iter()
+            .find(|p| p["id"] == "google-ai-studio")
+            .expect("Google AI Studio preset must exist as builtin entry");
+        assert_eq!(
+            g["baseUrl"],
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+        assert_eq!(
+            g["apiFormat"], "openai_chat",
+            "Google 官方 OpenAI Chat Completions 兼容 endpoint,走 chat 路径"
+        );
+        assert_eq!(g["authScheme"], "bearer");
+        assert_eq!(g["isBuiltin"], true);
+        let default_model = g["models"]["default"].as_str().unwrap_or("");
+        assert!(
+            default_model.starts_with("gemini-3"),
+            "default model 必须是 Gemini 3.x 系列(2026-05 主流),实际:{default_model}"
         );
     }
 

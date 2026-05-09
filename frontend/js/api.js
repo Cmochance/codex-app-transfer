@@ -35,6 +35,13 @@
     aliyun: { logo: 'assets/providers/aliyun.ico' },
     minimax: { logo: 'assets/providers/minimax.ico' },
     minimaxi: { logo: 'assets/providers/minimax.ico' },
+    // Google AI Studio (Gemini):用 Bootstrap bi-stars 图标(蓝紫四角星视觉
+    // 跟 Gemini 品牌契合,无版权风险无新 binary asset)。子串命中
+    // "google" / "gemini" / "aistudio" / "generativelanguage" 任一都映射到此。
+    google: { icon: 'bi-stars' },
+    gemini: { icon: 'bi-stars' },
+    aistudio: { icon: 'bi-stars' },
+    generativelanguage: { icon: 'bi-stars' },
   };
 
   function buildCustomThirdPartyPreset() {

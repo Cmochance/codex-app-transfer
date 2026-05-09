@@ -259,5 +259,36 @@
     ],
     "requestOptions": {},
     "isBuiltin": true
+  },
+  {
+    "id": "google-ai-studio",
+    "name": "Google AI Studio (Gemini)",
+    "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "docsUrl": "https://ai.google.dev/gemini-api/docs/openai",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "models": {
+      "sonnet": "gemini-3.1-pro-preview",
+      "haiku": "gemini-3.1-flash-lite",
+      "opus": "gemini-3.1-pro-preview",
+      "default": "gemini-3.1-flash-lite"
+    },
+    "modelCapabilities": {},
+    "notices": [
+      {
+        "type": "info",
+        "text": "Google AI Studio OpenAI Chat Completions 兼容 endpoint(2024 末上线 Beta,至今未 GA),代理走标准 chat completions 路径。鉴权用 GEMINI_API_KEY(标准 Bearer)。"
+      },
+      {
+        "type": "info",
+        "text": "Gemini 3.x 默认 dynamic thinking 已开启(Pro/Flash 默认 high),通过 OpenAI 标准 `reasoning_effort: none/low/medium/high` 调节,无需私货 extra_body 配置。"
+      },
+      {
+        "type": "warning",
+        "text": "已知限制:① 3.x 文本模型当前**仍为 Preview**(`-preview` 后缀);未来 GA 后模型 ID 可能去掉 `-preview`,届时需手动改 mapping。② Google Search grounding 走 extra_body,Codex.app 不发 → 原生 web_search 不可用,推荐配 mcp_servers 联网。③ 兼容层 Beta,部分参数被静默忽略。④ `generativelanguage.googleapis.com` 在中国大陆未直连,需 VPN。⑤ `gemini-3.1-flash-lite` 是当前唯一不带 `-preview` 的 stable 3.x,但能力为轻量级。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
   }
 ]
