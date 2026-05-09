@@ -138,17 +138,15 @@
     });
   }
 
-  function renderApiFormatDisplay(apiFormat) {
+  function normalizeApiFormat(apiFormat) {
     const v = String(apiFormat || "").toLowerCase().replace(/-/g, "_");
-    let key = "openaiChat";
-    let canonical = "openai_chat";
-    if (["responses", "openai_responses"].includes(v)) {
-      key = "responses";
-      canonical = "responses";
-    } else if (["anthropic", "claude", "messages"].includes(v)) {
-      key = "anthropic";
-      canonical = "anthropic";
-    }
+    if (["responses", "openai_responses"].includes(v)) return { key: "responses", canonical: "responses" };
+    if (["anthropic", "claude", "messages"].includes(v)) return { key: "anthropic", canonical: "anthropic" };
+    return { key: "openaiChat", canonical: "openai_chat" };
+  }
+
+  function renderApiFormatDisplay(apiFormat) {
+    const { key, canonical } = normalizeApiFormat(apiFormat);
     formApiFormatValue = canonical;
     const nameEl = $("#providerApiFormatName");
     const detailEl = $("#providerApiFormatDetail");
@@ -161,6 +159,30 @@
       const detailKey = `apiFormatDisplay.${key}.detail`;
       detailEl.dataset.i18n = detailKey;
       detailEl.textContent = t(detailKey);
+    }
+  }
+
+  function updateApiFormatSelectDetail(value) {
+    const { key, canonical } = normalizeApiFormat(value);
+    formApiFormatValue = canonical;
+    const detailEl = $("#providerApiFormatSelectDetail");
+    if (detailEl) {
+      const detailKey = `apiFormatDisplay.${key}.detail`;
+      detailEl.dataset.i18n = detailKey;
+      detailEl.textContent = t(detailKey);
+    }
+  }
+
+  function setApiFormatMode(allowSelect, currentValue) {
+    const displayEl = $("#providerApiFormatDisplay");
+    const selectableEl = $("#providerApiFormatSelectable");
+    const selectEl = $("#providerApiFormatSelect");
+    if (displayEl) displayEl.hidden = allowSelect;
+    if (selectableEl) selectableEl.hidden = !allowSelect;
+    if (allowSelect && selectEl) {
+      const { canonical } = normalizeApiFormat(currentValue);
+      selectEl.value = canonical;
+      updateApiFormatSelectDetail(canonical);
     }
   }
 
@@ -987,10 +1009,17 @@
     presetCache = await CCApi.getPresets();
     $("#presetList").innerHTML = presetCache.map((preset) => {
       const active = selectedPreset?.id === preset.id;
+      const isCustom = preset.id === "custom-third-party";
+      const nameMarkup = isCustom
+        ? `<strong data-i18n="providersAdd.customThirdPartyName">${escapeHtml(preset.name)}</strong>`
+        : `<strong>${escapeHtml(preset.name)}</strong>`;
+      const subText = isCustom
+        ? `<span data-i18n="providersAdd.customThirdPartyHint">${escapeHtml(preset.baseUrlHint || "")}</span>`
+        : `<span>${escapeHtml(preset.baseUrl)}</span>`;
       return `
       <button class="preset-item ${active ? "active" : ""}" type="button" data-preset="${escapeHtml(preset.id)}" aria-pressed="${active ? "true" : "false"}">
         <span class="preset-logo">${iconMarkup(preset)}</span>
-        <span><strong>${escapeHtml(preset.name)}</strong><span>${escapeHtml(preset.baseUrl)}</span></span>
+        <span>${nameMarkup}${subText}</span>
         <i class="bi ${active ? "bi-check2" : "bi-chevron-right"}"></i>
       </button>
     `;
@@ -1056,6 +1085,7 @@
     setApiKeyInputState(false);
     $("#providerAuth").value = "bearer";
     renderApiFormatDisplay("openai_chat");
+    setApiFormatMode(false, "openai_chat");
     setProviderMappings(emptyMappings());
     setUnverifiedBanner(false);
   }
@@ -1072,6 +1102,7 @@
     setApiKeyInputState(false);
     selectedPreset = preset;
     renderApiFormatDisplay(preset.apiFormat);
+    setApiFormatMode(!!preset.allowApiFormatSelection, preset.apiFormat);
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     providerAvailableModels = [];
@@ -1119,6 +1150,7 @@
     }
     setAuthSchemeValue(provider.authScheme);
     renderApiFormatDisplay((matchedPreset && matchedPreset.apiFormat) || provider.apiFormat);
+    setApiFormatMode(false, (matchedPreset && matchedPreset.apiFormat) || provider.apiFormat);
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
@@ -2207,6 +2239,9 @@
       }
       if (event.target.id === "providerBaseUrl") {
         renderBaseUrlOptions();
+      }
+      if (event.target.id === "providerApiFormatSelect") {
+        updateApiFormatSelectDetail(event.target.value);
       }
     });
 

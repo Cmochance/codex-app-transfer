@@ -37,6 +37,28 @@
     minimaxi: { logo: 'assets/providers/minimax.ico' },
   };
 
+  function buildCustomThirdPartyPreset() {
+    const i18n = window.CCI18n;
+    const tr = (k, fallback) => (i18n && i18n.t(k)) || fallback;
+    return {
+      id: 'custom-third-party',
+      name: tr('providersAdd.customThirdPartyName', '自定义第三方'),
+      baseUrl: '',
+      apiFormat: 'OpenAI',
+      authScheme: 'bearer',
+      models: {},
+      modelOptions: {},
+      baseUrlOptions: [],
+      baseUrlHint: tr('providersAdd.customThirdPartyHint', ''),
+      requestOptionPresets: {},
+      extraHeaders: {},
+      modelCapabilities: {},
+      requestOptions: {},
+      icon: 'bi-puzzle',
+      allowApiFormatSelection: true,
+    };
+  }
+
   function computeIcon(provider) {
     const id = `${provider.id || ''} ${provider.name || ''} ${provider.baseUrl || ''}`.toLowerCase();
     for (const [key, val] of Object.entries(ICON_MAP)) {
@@ -129,7 +151,7 @@
 
     async getPresets() {
       const data = await api('GET', '/api/presets');
-      return (data.presets || []).map(p => ({
+      const builtin = (data.presets || []).map(p => ({
         id: p.id,
         name: p.name,
         baseUrl: p.baseUrl,
@@ -147,6 +169,7 @@
         requestOptions: p.requestOptions || {},
         ...computeIcon(p),
       }));
+      return [...builtin, buildCustomThirdPartyPreset()];
     },
 
     async addProvider(payload) {

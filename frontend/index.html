@@ -133,6 +133,14 @@
                   <strong class="api-format-name" id="providerApiFormatName"></strong>
                   <span class="api-format-detail" id="providerApiFormatDetail"></span>
                 </div>
+                <div class="api-format-selectable" id="providerApiFormatSelectable" hidden>
+                  <select class="form-control form-control-lg" id="providerApiFormatSelect" name="apiFormatSelect">
+                    <option value="openai_chat" data-i18n="apiFormatDisplay.openaiChat.name">OpenAI Chat</option>
+                    <option value="responses" data-i18n="apiFormatDisplay.responses.name">Responses</option>
+                    <option value="anthropic" data-i18n="apiFormatDisplay.anthropic.name">Anthropic Messages</option>
+                  </select>
+                  <p class="api-format-detail-hint" id="providerApiFormatSelectDetail"></p>
+                </div>
               </div>
               <section class="provider-mapping-section">
                 <div class="section-title-row">
