@@ -286,7 +286,10 @@ mod tests {
             .as_ref()
             .expect("original_responses_request 必须填");
         assert_eq!(saved["model"], "kimi-for-coding");
-        assert_eq!(saved["tools"], inbound["tools"], "原 tools 数组(含 namespace 包装)必须原样保留");
+        assert_eq!(
+            saved["tools"], inbound["tools"],
+            "原 tools 数组(含 namespace 包装)必须原样保留"
+        );
         assert_eq!(saved["tool_choice"], "auto");
         assert_eq!(saved["parallel_tool_calls"], true);
         assert_eq!(saved["temperature"], 0.7);
@@ -304,7 +307,11 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap_or(""))
             .collect();
-        assert_eq!(outbound_names.len(), 3, "namespace 已展平,共 3 个顶级 function");
+        assert_eq!(
+            outbound_names.len(),
+            3,
+            "namespace 已展平,共 3 个顶级 function"
+        );
         assert!(outbound_names.contains(&"shell"));
         assert!(outbound_names.contains(&"notion_search"));
         assert!(outbound_names.contains(&"notion_create_pages"));

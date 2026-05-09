@@ -2253,7 +2253,11 @@ mod tests {
         });
         let out = convert(req);
         let tools = out["tools"].as_array().expect("tools array present");
-        assert_eq!(tools.len(), 2, "namespace 内层 2 个 function 必须展平为 2 个顶级 tool");
+        assert_eq!(
+            tools.len(),
+            2,
+            "namespace 内层 2 个 function 必须展平为 2 个顶级 tool"
+        );
         let names: Vec<&str> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap_or(""))

@@ -212,7 +212,9 @@ impl ChatToResponsesConverter {
         if let Some(req) = request.as_ref() {
             if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
                 for tool in tools {
-                    let Some(obj) = tool.as_object() else { continue };
+                    let Some(obj) = tool.as_object() else {
+                        continue;
+                    };
                     if obj.get("type").and_then(|v| v.as_str()) != Some("namespace") {
                         continue;
                     }
@@ -223,7 +225,9 @@ impl ChatToResponsesConverter {
                         continue;
                     };
                     for inner in inner_tools {
-                        let Some(inner_obj) = inner.as_object() else { continue };
+                        let Some(inner_obj) = inner.as_object() else {
+                            continue;
+                        };
                         if inner_obj.get("type").and_then(|v| v.as_str()) != Some("function") {
                             continue;
                         }
@@ -379,8 +383,7 @@ impl ChatToResponsesConverter {
         envelope["incomplete_details"] = Value::Null;
         envelope["error"] = Value::Null;
         let created_payload = json!({"type": "response.created", "response": envelope.clone()});
-        let in_progress_payload =
-            json!({"type": "response.in_progress", "response": envelope});
+        let in_progress_payload = json!({"type": "response.in_progress", "response": envelope});
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1467,12 +1470,9 @@ mod tests {
             "model": "kimi",
             "tools": original_tools.clone(),
         });
-        let mut c = ChatToResponsesConverter::new_with_ids(
-            "resp_x".into(),
-            "msg_x".into(),
-            "rs_x".into(),
-        )
-        .with_original_request(Some(original_request));
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_original_request(Some(original_request));
         let mut all = Vec::new();
         all.extend(c.feed(
             br#"data: {"model":"kimi","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}
@@ -1525,12 +1525,9 @@ mod tests {
             "top_p": 0.9,
             "max_output_tokens": 2048,
         });
-        let mut c = ChatToResponsesConverter::new_with_ids(
-            "resp_x".into(),
-            "msg_x".into(),
-            "rs_x".into(),
-        )
-        .with_original_request(Some(original_request.clone()));
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_original_request(Some(original_request.clone()));
         let mut all = Vec::new();
         all.extend(c.feed(
             br#"data: {"model":"kimi","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}
@@ -1613,12 +1610,9 @@ mod tests {
                 ]},
             ]
         });
-        let mut c = ChatToResponsesConverter::new_with_ids(
-            "resp_x".into(),
-            "msg_x".into(),
-            "rs_x".into(),
-        )
-        .with_original_request(Some(original_request));
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_original_request(Some(original_request));
         let mut all = Vec::new();
         // 模型生成 tool_call: notion_search
         all.extend(c.feed(
@@ -1674,12 +1668,9 @@ mod tests {
             "model": "kimi",
             "tools": [{"type": "function", "name": "shell"}]
         });
-        let mut c = ChatToResponsesConverter::new_with_ids(
-            "resp_x".into(),
-            "msg_x".into(),
-            "rs_x".into(),
-        )
-        .with_original_request(Some(original_request));
+        let mut c =
+            ChatToResponsesConverter::new_with_ids("resp_x".into(), "msg_x".into(), "rs_x".into())
+                .with_original_request(Some(original_request));
         let mut all = Vec::new();
         all.extend(c.feed(
             br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"shell","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
@@ -1720,10 +1711,7 @@ mod tests {
             let seq = payload["sequence_number"]
                 .as_i64()
                 .unwrap_or_else(|| panic!("event {name} missing sequence_number: {payload}"));
-            assert!(
-                seq > prev,
-                "{name} sequence_number {seq} not > prev {prev}"
-            );
+            assert!(seq > prev, "{name} sequence_number {seq} not > prev {prev}");
             prev = seq;
         }
         assert_eq!(events[0].1["sequence_number"], 0);
