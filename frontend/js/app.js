@@ -174,6 +174,9 @@
       detailEl.dataset.i18n = detailKey;
       detailEl.textContent = t(detailKey);
     }
+    // 协议切换 → 重渲 mappings UI 让 default required 状态跟当前协议同步
+    // (direct 模式 default 解锁为可空,其他场景仍 required)
+    setProviderMappings(providerFormMappings);
   }
 
   function setApiFormatMode(allowSelect, currentValue) {
@@ -550,10 +553,19 @@
     `;
   }
 
+  function isDirectResponsesMode() {
+    // 自定义第三方 + apiFormat=responses → Codex.app 直连上游(direct 模式),
+    // 模型透传给上游,代理不做 alias 翻译 → default mapping 可空。
+    return (
+      formApiFormatValue === "responses" && !!selectedPreset?.allowApiFormatSelection
+    );
+  }
+
   function formMappingMarkup() {
     return providerFormRows.map((rowKey, index) => {
       const slot = slotByKey(rowKey);
-      const isRequired = rowKey === "default";
+      // direct 模式不需要 model alias 映射,default 字段也可空;其他场景仍 required
+      const isRequired = rowKey === "default" && !isDirectResponsesMode();
       const currentProviderModel = providerFormMappings[rowKey] || "";
       return `
         <article class="form-mapping-row">
