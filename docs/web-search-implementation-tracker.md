@@ -8,7 +8,7 @@
 
 | Provider | 文档实证 | 实施 | 单测 | 实地测试 | 备注 |
 |---|---|---|---|---|---|
-| **Xiaomi MiMo** | ✅ mimo2codex fresh 源码 1:1 对照 + dump 实证 4xx 错误 | ✅ `convert_web_search_tool` + A 配置开关 + B 运行时 cache | ✅ 13 用例 | ✅ **实测通过**(2026-05-09):默认关闭走 Node Repl 绕路 / `=true` plugin 未开自动降级 / `=false` 显式关闭 三场景全验证 | 进入 Kimi 移植阶段 |
+| **Xiaomi MiMo** | ✅ mimo2codex fresh 源码 1:1 对照 + dump 实证 4xx 错误 | ✅ A 配置开关 + B 运行时 cache + transparent retry | ✅ 13 用例 + transparent retry 集成路径 | ✅ **实测全通过**(2026-05-09):默认关 / `=true` plugin 未开 transparent retry 无感降级秒出结果 / `=false` 显式关 三场景全验证;log 流 `WARN auto-disabled → INFO retry status 200 → SUCCESS upstream status 200` 完美 | **完成,进入 Kimi 移植阶段** |
 | **Kimi (Moonshot)** | ⏳ 待 WebFetch 官方文档 | — | — | — | 已知形态(待文档证实):`tools:[{type:"builtin_function", function:{name:"$web_search"}}]` |
 | **DeepSeek** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
 | **MiniMax M2.x** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
