@@ -42,13 +42,13 @@ async fn spawn(router: axum::Router) -> std::net::SocketAddr {
     addr
 }
 
-fn provider_for(upstream_base: &str) -> Provider {
+fn provider_for(upstream_base: &str, api_format: &str) -> Provider {
     Provider {
         id: "test-upstream".into(),
         name: "Test Upstream".into(),
         base_url: upstream_base.into(),
         auth_scheme: "none".into(), // 不向 mock 上游写鉴权,简化样例
-        api_format: "openai_chat".into(),
+        api_format: api_format.into(),
         api_key: String::new(),
         models: IndexMap::new(),
         extra_headers: IndexMap::new(),
@@ -61,6 +61,10 @@ fn provider_for(upstream_base: &str) -> Provider {
 }
 
 async fn run_passthrough_against(fixture_rel: &str) {
+    run_passthrough_against_with_format(fixture_rel, "openai_chat").await;
+}
+
+async fn run_passthrough_against_with_format(fixture_rel: &str, api_format: &str) {
     let fixture = Fixture::load(fixture_path(fixture_rel))
         .unwrap_or_else(|e| panic!("load fixture {fixture_rel}: {e}"));
 
@@ -71,7 +75,7 @@ async fn run_passthrough_against(fixture_rel: &str) {
     // 2. 起代理,resolver 把所有请求 fallback 到 test-upstream provider
     let resolver = Arc::new(StaticResolver::new(
         None, // smoke 测试不要求 gateway 鉴权
-        vec![provider_for(&upstream_base)],
+        vec![provider_for(&upstream_base, api_format)],
         Some("test-upstream".into()),
     ));
     let proxy_addr = spawn(build_router(resolver)).await;
@@ -155,4 +159,18 @@ async fn sse_passthrough_synthetic_example() {
 #[tokio::test]
 async fn sse_passthrough_real_kimi() {
     run_passthrough_against("tests/replay/fixtures/kimi_chat_minimal_streaming.json").await;
+}
+
+/// ResponsesPassthroughAdapter 字节级透传验证 —— 自定义第三方 provider 选
+/// apiFormat=responses 时,Codex.app 入站 /v1/responses 应**字节级透传**给上游
+/// (不被 ChatToResponsesConverter 重写 envelope / sequence_number / resp_id 等)。
+/// 上游 mock 返 OpenAI Responses API style SSE,期望客户端拿到的字节流跟上游
+/// 拼接一致 —— 等价 OpenAiChatAdapter 的 passthrough 行为,但走 /responses 路径。
+#[tokio::test]
+async fn responses_passthrough_byte_identical() {
+    run_passthrough_against_with_format(
+        "tests/replay/fixtures/_example_responses_passthrough_streaming.json",
+        "responses",
+    )
+    .await;
 }
