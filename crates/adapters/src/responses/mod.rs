@@ -64,6 +64,7 @@ impl Adapter for ResponsesAdapter {
                 body: Bytes::from(new_body),
                 response_session: None,
                 is_compact: true,
+                original_responses_request: None,
             });
         }
 
@@ -72,6 +73,15 @@ impl Adapter for ResponsesAdapter {
         // 失败时(body 非 JSON / 非对象)用 BadRequest 错出去,proxy 会回 400。
         let parsed: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| AdapterError::BadRequest(format!("body 不是合法 JSON: {e}")))?;
+        // chat→responses 响应阶段 envelope 需要回灌入站 Responses API
+        // request 的多个字段(tools / parallel_tool_calls / tool_choice /
+        // reasoning / text / metadata / previous_response_id / instructions /
+        // temperature / top_p / max_output_tokens / truncation 等)。tools
+        // 字段尤其关键:Codex CLI 用 (namespace, function.name) 复合主键
+        // 反向路由 MCP 工具的 function_call;缺其他字段会让严格 Responses
+        // 协议客户端解析失败。借鉴 mimo2codex `streamToSse.ts:75-105`
+        // `buildResponseSnapshot` 一次回灌全字段策略。
+        let original_responses_request = Some(parsed.clone());
         let conversion = responses_body_to_chat_body_for_provider_with_session(
             &parsed,
             Some(provider),
@@ -84,6 +94,7 @@ impl Adapter for ResponsesAdapter {
             body: Bytes::from(new_body),
             response_session: Some(conversion.response_session),
             is_compact: false,
+            original_responses_request,
         })
     }
 
@@ -117,6 +128,7 @@ impl Adapter for ResponsesAdapter {
                 upstream_stream,
                 request_plan.response_session.clone(),
                 enable_think_tag_split,
+                request_plan.original_responses_request.clone(),
             ),
         })
     }
@@ -209,5 +221,107 @@ mod tests {
     fn passes_through_unrelated_paths() {
         assert_eq!(redirect_responses_to_chat("/v1/models"), "/models");
         assert_eq!(redirect_responses_to_chat("/health"), "/health");
+    }
+
+    /// 集成测试:prepare_request → RequestPlan.original_responses_request →
+    /// (后续 transform_response_stream 会读这个字段塞进 envelope)。
+    /// 验证 P3+P4 修复在真实 adapter trait 调用下整条链路通。
+    #[test]
+    fn prepare_request_preserves_original_inbound_body_for_envelope_replay() {
+        use codex_app_transfer_registry::Provider;
+        use indexmap::IndexMap;
+
+        let mut p = Provider {
+            id: "kimi".into(),
+            name: "Kimi".into(),
+            base_url: "https://api.moonshot.cn/v1".into(),
+            auth_scheme: "bearer".into(),
+            api_format: "responses".into(),
+            api_key: "sk-test".into(),
+            models: IndexMap::new(),
+            extra_headers: IndexMap::new(),
+            model_capabilities: IndexMap::new(),
+            request_options: IndexMap::new(),
+            is_builtin: false,
+            sort_index: 0,
+            extra: IndexMap::new(),
+        };
+        p.models.insert("default".into(), "kimi-for-coding".into());
+
+        // 构造一个**含 namespace 包装 + 多个 envelope 字段**的入站 body
+        // (模拟真实 Codex CLI 发的形态)
+        let inbound = serde_json::json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [
+                {"type": "message", "role": "user", "content": "list my notion pages"}
+            ],
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "namespace", "name": "mcp__notion__", "tools": [
+                    {"type": "function", "name": "notion_search"},
+                    {"type": "function", "name": "notion_create_pages"}
+                ]}
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high", "summary": null},
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 4096,
+            "metadata": {"trace": "abc"},
+            "previous_response_id": "resp_prev",
+            "instructions": "Be helpful.",
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&inbound).unwrap());
+
+        let adapter = ResponsesAdapter::new();
+        let plan = adapter
+            .prepare_request("/v1/responses", body, &p)
+            .expect("prepare_request 成功");
+
+        // P3 修复:RequestPlan 必须保留入站完整 body 供 envelope 回灌
+        let saved = plan
+            .original_responses_request
+            .as_ref()
+            .expect("original_responses_request 必须填");
+        assert_eq!(saved["model"], "kimi-for-coding");
+        assert_eq!(
+            saved["tools"], inbound["tools"],
+            "原 tools 数组(含 namespace 包装)必须原样保留"
+        );
+        assert_eq!(saved["tool_choice"], "auto");
+        assert_eq!(saved["parallel_tool_calls"], true);
+        assert_eq!(saved["temperature"], 0.7);
+        assert_eq!(saved["previous_response_id"], "resp_prev");
+        assert_eq!(saved["instructions"], "Be helpful.");
+        assert_eq!(saved["reasoning"]["effort"], "high");
+
+        // P2 修复:出站 body(plan.body)tools 已展平,namespace 包装已被
+        // recursively flat_map 成顶级 function tools(`shell` + `notion_search`
+        // + `notion_create_pages` 共 3 个 function)
+        let outbound: serde_json::Value =
+            serde_json::from_slice(&plan.body).expect("plan.body 是合法 JSON");
+        let outbound_tools = outbound["tools"].as_array().expect("outbound tools 数组");
+        let outbound_names: Vec<&str> = outbound_tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            outbound_names.len(),
+            3,
+            "namespace 已展平,共 3 个顶级 function"
+        );
+        assert!(outbound_names.contains(&"shell"));
+        assert!(outbound_names.contains(&"notion_search"));
+        assert!(outbound_names.contains(&"notion_create_pages"));
+        // 验证已无任何 namespace type 残留(全部展平为 function)
+        for t in outbound_tools {
+            assert_eq!(t["type"], "function", "outbound 不应有 type:namespace 残留");
+        }
+
+        // 出站路径正确(/v1/responses → /chat/completions)
+        assert_eq!(plan.upstream_path, "/chat/completions");
+        assert!(!plan.is_compact);
     }
 }

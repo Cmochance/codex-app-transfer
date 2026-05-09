@@ -97,6 +97,11 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         .map(codex_app_transfer_registry::strip_internal_model_suffix);
     if !provider_supports_vision(provider, body_model.as_deref()) {
         strip_image_blocks_in_place(&mut messages);
+    } else {
+        // 含 image_url 但无 text part 时补一个空格 text part — MiMo 多模态
+        // 接口强制要求(否则 400 "Param Incorrect: text is not set"),
+        // 对其他 supports_vision provider 无副作用,统一处理。
+        ensure_text_part_when_image_present(&mut messages);
     }
 
     // 历史定位(2026-05-06 → 2026-05-08):
@@ -112,11 +117,12 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     let session_messages = messages.clone();
     result.insert("messages".into(), Value::Array(messages));
 
-    // tools(只接受 function / custom,其余 Responses 专属类型丢弃)
+    // tools(function / custom 直接处理,namespace 递归展平,其余 Responses
+    // 专属类型 drop + warn_once)
     if let Some(Value::Array(tools)) = body.get("tools") {
         let chat_tools: Vec<Value> = tools
             .iter()
-            .filter_map(convert_responses_tool_to_chat_tool)
+            .flat_map(convert_responses_tool_to_chat_tool)
             .collect();
         if !chat_tools.is_empty() {
             result.insert("tools".into(), Value::Array(chat_tools));
@@ -1286,6 +1292,34 @@ fn strip_image_blocks_in_place(messages: &mut [Value]) {
     }
 }
 
+/// 兜底:有 `image_url` block 但完全没 `text` block 的 message,在 content
+/// 数组末尾追加 `{type:"text", text:" "}` —— 防止 MiMo 多模态接口因
+/// "Param Incorrect: text is not set" 拒绝纯图请求(MiMo 文档要求含
+/// `image_url` 时至少 1 个 text part)。其他 `supports_vision` provider
+/// (Kimi / OpenAI 等)对此无副作用,统一处理避免 per-provider 分支,
+/// 也省掉未来新接 vision provider 时重新评估的工作。
+///
+/// 对照实现:`7as0nch/mimo2codex` `reqToChat.ts:71-79` 同名兜底逻辑。
+fn ensure_text_part_when_image_present(messages: &mut [Value]) {
+    for msg in messages.iter_mut() {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        let Some(Value::Array(arr)) = obj.get_mut("content") else {
+            continue;
+        };
+        let has_image = arr
+            .iter()
+            .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("image_url"));
+        let has_text = arr
+            .iter()
+            .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"));
+        if has_image && !has_text {
+            arr.push(json!({"type": "text", "text": " "}));
+        }
+    }
+}
+
 /// Responses message.content 可能是 string 或 [{type, text/image_url}].
 /// stateless 阶段:string 保留;text 块拼成 string;含 image_url 的块降级为
 /// Chat 多模态格式(`[{type: "text", text}, {type: "image_url", image_url}]`).
@@ -1643,9 +1677,27 @@ fn value_to_chat_string(value: &Value) -> String {
 }
 
 /// Responses tool 定义 → Chat tool 定义.
-fn convert_responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
-    let obj = tool.as_object()?;
-    let ttype = obj.get("type").and_then(|v| v.as_str())?;
+/// 把单个 Responses API tool 转成零或多个 Chat Completions tool。
+///
+/// 返回 `Vec<Value>` 而非 `Option<Value>` 是为了支持 `type:"namespace"` 展平
+/// (Codex CLI 把 MCP server 工具集打成一个 namespace 包,内层 5-26 个具体
+/// `type:"function"`,实测 9 个 server 共 88 个 tool 在第三方 chat provider
+/// 之前必须展平为顶级 function 数组)。
+///
+/// 实测形态(2026-05-09 抓本机 ~/.codex/config.toml 配 12+ MCP server 时
+/// Codex CLI 的入站 Responses API body):
+/// - `function` × 420 / 轮(Codex 内置 + `read_mcp_resource` 等通用 meta)
+/// - `namespace` × 218 / 轮(9 个 server 包装,内层 88 个具体 MCP function)
+/// - `custom` × 28 / 轮(`apply_patch` 用 lark grammar)
+/// - `web_search` × 28 / 轮(server-side built-in,无 name/parameters,
+///   chat 端无等价,继续 drop + warn_once 提示用户)
+fn convert_responses_tool_to_chat_tool(tool: &Value) -> Vec<Value> {
+    let Some(obj) = tool.as_object() else {
+        return vec![];
+    };
+    let Some(ttype) = obj.get("type").and_then(|v| v.as_str()) else {
+        return vec![];
+    };
     match ttype {
         "function" => {
             let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1660,7 +1712,7 @@ fn convert_responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
                 }
             }
             let strict = obj.get("strict").and_then(|v| v.as_bool()).unwrap_or(false);
-            Some(json!({
+            vec![json!({
                 "type": "function",
                 "function": {
                     "name": name,
@@ -1668,7 +1720,7 @@ fn convert_responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
                     "parameters": parameters,
                     "strict": strict,
                 },
-            }))
+            })]
         }
         "custom" => {
             // Custom tool(无 JSON schema)降级为接受单字符串 input 的 function
@@ -1677,7 +1729,7 @@ fn convert_responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            Some(json!({
+            vec![json!({
                 "type": "function",
                 "function": {
                     "name": name,
@@ -1694,12 +1746,43 @@ fn convert_responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
                     },
                     "strict": false,
                 },
-            }))
+            })]
+        }
+        "namespace" => {
+            // Codex CLI 用 `type:"namespace"` 包装 MCP server 工具集 — 实测
+            // `~/.codex/config.toml` 配的每个 `[mcp_servers.<name>]` 在入站
+            // Responses API body 里都是一个 `{type:"namespace", name:"mcp__<name>__",
+            // tools:[ {type:"function", ...}, ... ]}` 包,内层 5-26 个具体 function。
+            // 第三方 chat completions provider 不认 namespace type,**必须递归
+            // 展平内层 functions 为顶级 tool 数组**,模型才能看到具体 MCP tools
+            // 像 `notion_create_pages` / `figma_get_file_data` 等并直接调用。
+            //
+            // 借鉴 `7as0nch/mimo2codex` `src/translate/reqToChat.ts:232-250` 同名
+            // namespace 展平逻辑(见 reqToChat 注释 "Shape we've seen in the wild")。
+            //
+            // 不做的:展平内层时**不**改写 tool name(实测内层 function name 已经
+            // 自带前缀如 `migrate_pages_to_workers_guide`,无冲突风险);**不**保留
+            // namespace 包裹元数据(模型只需看到具体 tool name + description 即可)。
+            let Some(inner) = obj.get("tools").and_then(|v| v.as_array()) else {
+                tracing::debug!(
+                    namespace_name = ?obj.get("name").and_then(|v| v.as_str()),
+                    "dropping namespace tool with no nested `tools` array"
+                );
+                return vec![];
+            };
+            inner
+                .iter()
+                .flat_map(convert_responses_tool_to_chat_tool)
+                .collect()
         }
         // Responses 专属类型(local_shell / web_search* / file_search /
         // computer_use* / code_interpreter / image_generation / mcp 等)
-        // Chat 端点不认,丢弃
-        _ => None,
+        // Chat 端点不认,丢弃。warn_once 防多轮重发刷屏(借鉴 mimo2codex
+        // `reqToChat.ts:158-172` 的 warnOnce 模式)。
+        other => {
+            crate::warn_once_drop_tool(other);
+            vec![]
+        }
     }
 }
 
@@ -2003,6 +2086,304 @@ mod tests {
             serialized.contains("\"image_url\""),
             "Kimi 应保留 image_url"
         );
+    }
+
+    // ── ensure_text_part_when_image_present 兜底:MiMo 文档强制要求图存在
+    // 时 content 至少有 1 个 text part,否则 400 "Param Incorrect: text is
+    // not set"。借鉴 7as0nch/mimo2codex reqToChat.ts:71-79。
+    // 对其他 supports_vision provider (Kimi / OpenAI 等) 无副作用,统一处理。
+
+    #[test]
+    fn mimo_image_only_message_gets_text_part_appended() {
+        // MiMo vision 模型 + 仅 image 的 user 消息(用户粘图未输入文字)→
+        // 必须在 content 末尾追加 {type:"text", text:" "} 兜底
+        let mut mimo = mimo_provider();
+        mimo.models.insert("default".into(), "mimo-v2.5".into());
+        let req = json!({
+            "model": "mimo-v2.5",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&mimo)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        let content = messages[0]["content"].as_array().unwrap();
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text")),
+            "兜底 text part 必须存在,否则 MiMo 400 Param Incorrect\nactual: {content:?}"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("image_url")),
+            "原 image_url 必须保留\nactual: {content:?}"
+        );
+    }
+
+    #[test]
+    fn mimo_image_with_existing_text_part_unchanged() {
+        // 用户既贴了图也输了字 → 原 text part 已存在,不应再追加
+        let mut mimo = mimo_provider();
+        mimo.models.insert("default".into(), "mimo-v2.5".into());
+        let req = json!({
+            "model": "mimo-v2.5",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_text","text":"图里是什么"},
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&mimo)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        let content = messages[0]["content"].as_array().unwrap();
+        let text_blocks: Vec<&Value> = content
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .collect();
+        assert_eq!(
+            text_blocks.len(),
+            1,
+            "已有 text 时不应重复追加,只该有 1 个 text block\nactual: {content:?}"
+        );
+        assert_eq!(
+            text_blocks[0].get("text").and_then(|v| v.as_str()),
+            Some("图里是什么"),
+            "原 text 内容必须保留,不能被空格 text 覆盖"
+        );
+    }
+
+    #[test]
+    fn kimi_image_only_message_also_gets_text_part_appended() {
+        // 兜底统一对所有 supports_vision provider 应用(避免 per-provider
+        // 分支),Kimi 也加。空格 text 对 Kimi 无副作用 — 验证不会影响其
+        // image_url 保留。
+        let mut kimi = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
+        kimi.models.insert("default".into(), "kimi-k2.6".into());
+        let req = json!({
+            "model": "kimi-k2.6",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&kimi)).unwrap();
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text")),
+            "Kimi 也走兜底统一处理(无副作用)"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("image_url")),
+            "image_url 必须保留"
+        );
+    }
+
+    #[test]
+    fn text_only_provider_image_only_still_strips_to_placeholder() {
+        // 非 supports_vision provider(deepseek-v4-pro)+ 仅 image →
+        // 走 strip 路径,不该被 ensure_text_part 兜底干扰(strip 已自带
+        // 占位文本 "image omitted")
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{
+                "type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,AAA"}
+                ]
+            }]
+        });
+        let out =
+            responses_body_to_chat_body_for_provider(&req, Some(&deepseek_provider())).unwrap();
+        let serialized = serde_json::to_string(&out["messages"]).unwrap();
+        assert!(
+            !serialized.contains("\"image_url\""),
+            "DeepSeek 必须 strip 掉 image_url"
+        );
+        assert!(
+            serialized.contains("image omitted"),
+            "占位文本必须存在(strip 路径,而非 ensure_text 兜底空格)"
+        );
+        // ensure_text_part 不应被调用(走的是 strip 分支)
+        assert!(
+            !serialized.contains(r#""text":" ""#),
+            "走 strip 分支时,不应额外追加空格 text"
+        );
+    }
+
+    // ── namespace 工具递归展平(借鉴 7as0nch/mimo2codex reqToChat.ts:232-250)
+    // Codex CLI 用 type:"namespace" 包装 MCP server 工具集,内层是具体
+    // type:"function"。第三方 chat completions provider 不认 namespace,必须
+    // 展平为顶级 function 数组。实测每轮 218 个 namespace × 88 内层 function
+    // 被旧版 `_ => None` 整个 drop,模型完全看不到 MCP 具体 tools。
+
+    #[test]
+    fn namespace_with_two_inner_functions_flattens_to_two_function_tools() {
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type": "namespace", "name": "mcp__cloudflare_docs__",
+                 "description": "Tools in the mcp__cloudflare_docs__ namespace.",
+                 "tools": [
+                    {"type":"function","name":"migrate_pages_to_workers_guide",
+                     "description":"Read this guide before migrating.",
+                     "parameters":{"type":"object","properties":{},"additionalProperties":false},
+                     "strict":false},
+                    {"type":"function","name":"search_cloudflare_documentation",
+                     "description":"Search the Cloudflare documentation.",
+                     "parameters":{"type":"object","properties":{
+                        "query":{"type":"string"}},"required":["query"]},
+                     "strict":false}
+                 ]}
+            ]
+        });
+        let out = convert(req);
+        let tools = out["tools"].as_array().expect("tools array present");
+        assert_eq!(
+            tools.len(),
+            2,
+            "namespace 内层 2 个 function 必须展平为 2 个顶级 tool"
+        );
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"migrate_pages_to_workers_guide"));
+        assert!(names.contains(&"search_cloudflare_documentation"));
+        // namespace 包装的 name (mcp__cloudflare_docs__) 不该作为顶级工具出现
+        assert!(
+            !names.contains(&"mcp__cloudflare_docs__"),
+            "namespace 包装名不该泄漏成 tool name"
+        );
+    }
+
+    #[test]
+    fn namespace_alongside_top_level_function_both_kept() {
+        // 实测真实场景:tools 数组同时含顶级 function + namespace 包,展平
+        // 后总数 = 顶级 function 数 + 所有 namespace 内层 function 数
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"function","name":"shell",
+                 "description":"Run shell command.",
+                 "parameters":{"type":"object","properties":{}}},
+                {"type":"namespace","name":"mcp__notion__","tools":[
+                    {"type":"function","name":"notion_search","description":"",
+                     "parameters":{"type":"object","properties":{}}},
+                    {"type":"function","name":"notion_create_pages","description":"",
+                     "parameters":{"type":"object","properties":{}}}
+                ]}
+            ]
+        });
+        let out = convert(req);
+        let names: Vec<&str> = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"notion_search"));
+        assert!(names.contains(&"notion_create_pages"));
+    }
+
+    #[test]
+    fn namespace_with_empty_tools_array_silently_dropped() {
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"namespace","name":"mcp__empty__","tools": []}
+            ]
+        });
+        let out = convert(req);
+        // 空 namespace 不该出现在 tools 数组里;若没其他 tools,整个 tools key
+        // 不应进 result(对齐"chat_tools.is_empty() 时 skip insert"逻辑)。
+        assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn namespace_missing_tools_field_silently_dropped() {
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"namespace","name":"mcp__broken__"}  // 无 tools 字段
+            ]
+        });
+        let out = convert(req);
+        assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nested_namespace_inside_namespace_recursively_flattens() {
+        // 边界:虽然实测 Codex CLI 当前不嵌套 namespace,但实现走的是递归
+        // flat_map,理应正确处理。future-safe 验证。
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"namespace","name":"outer","tools":[
+                    {"type":"namespace","name":"inner","tools":[
+                        {"type":"function","name":"deep_tool","description":"",
+                         "parameters":{"type":"object","properties":{}}}
+                    ]},
+                    {"type":"function","name":"sibling","description":"",
+                     "parameters":{"type":"object","properties":{}}}
+                ]}
+            ]
+        });
+        let out = convert(req);
+        let names: Vec<&str> = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["deep_tool", "sibling"]);
+    }
+
+    #[test]
+    fn unknown_tool_type_dropped_via_warn_once_path_does_not_panic() {
+        // web_search / file_search / code_interpreter / image_generation 等
+        // Responses 专属 server-side 工具在第三方 chat 端无等价,继续 drop。
+        // 验证:不 panic,不出现在 outbound,与已有 type:"function" 共存。
+        let req = json!({
+            "model": "kimi-for-coding",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"web_search","external_web_access":true,
+                 "search_content_types":["text","image"]},
+                {"type":"file_search","vector_store_ids":["xx"]},
+                {"type":"function","name":"keep_me","description":"",
+                 "parameters":{"type":"object","properties":{}}}
+            ]
+        });
+        let out = convert(req);
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "只 keep_me 这个 function 应保留");
+        assert_eq!(tools[0]["function"]["name"], "keep_me");
     }
 
     #[test]
