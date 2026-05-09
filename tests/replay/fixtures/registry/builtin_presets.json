@@ -232,5 +232,32 @@
     "modelCapabilities": {},
     "requestOptions": {},
     "isBuiltin": true
+  },
+  {
+    "id": "minimax",
+    "name": "MiniMax",
+    "baseUrl": "https://api.minimaxi.com/v1",
+    "docsUrl": "https://platform.minimaxi.com/docs/api-reference/text/chat-completion",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "models": {
+      "sonnet": "MiniMax-M2.7",
+      "haiku": "MiniMax-M2.7",
+      "opus": "MiniMax-M2.7",
+      "default": "MiniMax-M2.7"
+    },
+    "modelCapabilities": {},
+    "notices": [
+      {
+        "type": "info",
+        "text": "MiniMax M2.x 走 OpenAI 兼容 chat completions 端点,代理自动剥不兼容字段(reasoning_effort / response_format / parallel_tool_calls 等)+ tool 剥 strict + 连续 system 合并;响应侧 reasoning_details 拆 reasoning + <think> 兜底拆分仅对 MiniMax 启用。"
+      },
+      {
+        "type": "info",
+        "text": "MiniMax chat completions API 当前不支持原生 web_search 工具(文档实证 2026-05-09)。如需联网搜索,推荐配 mcp_servers 使用 MCP 路径(参考 P5 namespace MCP 修复)。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
   }
 ]
