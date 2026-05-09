@@ -9,8 +9,8 @@
 | Provider | 文档实证 | 实施 | 单测 | 实地测试 | 备注 |
 |---|---|---|---|---|---|
 | **Xiaomi MiMo** | ✅ mimo2codex fresh 源码 1:1 对照 + dump 实证 4xx 错误 | ✅ A 配置开关 + B 运行时 cache + transparent retry | ✅ 13 用例 + transparent retry 集成路径 | ✅ **实测全通过**(2026-05-09):默认关 / `=true` plugin 未开 transparent retry 无感降级秒出结果 / `=false` 显式关 三场景全验证;log 流 `WARN auto-disabled → INFO retry status 200 → SUCCESS upstream status 200` 完美 | **完成,进入 Kimi 移植阶段** |
-| **Kimi (Moonshot)** | ✅ WebFetch `platform.kimi.ai/docs/guide/use-web-search` 真文档实证 | ✅ Kimi/Moonshot 分支 + 自动注入 `thinking.disabled` 顶级字段 | ✅ 5 用例(builtin_function 形态 / thinking 注入 / Moonshot 同形态 / 未启用不注入 / B 层 cache disable 不注入) | ⏳ **等用户实测** | A/B 双层 + transparent retry 全复用 MiMo 阶段基础设施 |
-| **DeepSeek** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
+| **Kimi (Moonshot)** | ✅ WebFetch `platform.kimi.ai/docs/guide/use-web-search` 真文档实证 | ✅ Kimi/Moonshot 分支 + 自动注入 `thinking.disabled` 顶级字段 | ✅ 5 用例 | ✅ **实测通过**(2026-05-09):Kimi For Coding + Moonshot `=true` 上游接受 builtin_function 无降级警告;Moonshot 单条 429 是账号 TPD 超额(跟 PR 无关) | 完成,进入 DeepSeek 阶段 |
+| **DeepSeek** | ✅ WebFetch `api-docs.deepseek.com/api/create-chat-completion` 实证 `"Currently, only function is supported"` | ✅ 显式 drop 分支 + warn key `web_search:not-supported-by-deepseek-api` | ✅ 2 用例 | ✅ 不需要实测(文档实证不支持,代码层只 drop;用户联网走 P5 已通的 MCP 路径) | 完成,进入 MiniMax 阶段 |
 | **MiniMax M2.x** | ⏳ 待 WebFetch 官方文档 | — | — | — | 文档实证不支持后才能 drop |
 | **(实验兼容)阿里 Qwen** | ⏳ | — | — | — | `extra_body.enable_search` 形态待证 |
 | **(实验兼容)智谱 GLM** | ⏳ | — | — | — | `browser.search` 形态待证 |
@@ -194,15 +194,44 @@ Kimi `$web_search` 跟普通 function tools 共存,不冲突。
 
 ## 3. DeepSeek
 
-### 3.1 待办
+### 3.1 文档实证
 
-- **WebFetch** 官方文档:https://api-docs.deepseek.com/api/create-chat-completion + https://api-docs.deepseek.com/guides/function_calling
-- 关注:
-  - chat completions 的 tools 是否支持 `type:"web_search"` 或类似?
-  - 文档明确说"only function tools supported"是否仍然成立?
-  - 如真不支持,代理层 drop + warn_once(用户在 UI 看到 warning 知道当前 provider 不支持 web 搜索)
+来源:**WebFetch** `https://api-docs.deepseek.com/api/create-chat-completion`(2026-05-09 真原文)。
 
-(等 MiMo 实测通过后再启动)
+#### 3.1.1 tools 字段约束
+
+> **"The type of the tool. Currently, only `function` is supported."**
+
+最大 128 functions,naming `[a-zA-Z0-9_-]{1,64}`,parameters 用 JSON Schema。
+
+#### 3.1.2 不支持的能力
+
+WebFetch 全文中**完全没有**:
+- `web_search` / `web_search_options` / `builtin_function` 等 tool type
+- 顶级 `enable_search` / `web_search` / `search_options` 字段
+- search-specific model id(如 deepseek-search 等)
+- `delta.annotations` / url citation 响应字段提及
+
+#### 3.1.3 结论
+
+DeepSeek chat completions API **完全不支持原生 web search**。用户启用
+`web_search_enabled=true` 时代理只能 drop。用户需联网搜索 → 走 P5 修通的
+namespace MCP 工具路径(`mcp_servers.<...>` 配置 + 模型用 `read_mcp_resource` /
+Node Repl 之类绕路)。
+
+### 3.2 实施
+
+`crates/adapters/src/responses/request.rs::convert_web_search_tool`:
+- DeepSeek 分支显式 drop:`provider_looks_like(p, "deepseek")` 命中 → `warn_once_drop_tool("web_search:not-supported-by-deepseek-api")` + `vec![]`
+- 用户在 log 看到 warn key 立即知道是 DeepSeek API 不支持
+
+### 3.3 测试
+
+`#[cfg(test)] mod tests` 2 用例:
+- `deepseek_web_search_dropped_with_explicit_warn_key` — `web_search_enabled=true` 时 web_search 仍 drop,只剩其他 function tools;不触发 Kimi thinking 注入
+- `deepseek_web_search_drop_independent_of_web_search_enabled_flag` — A 层默认行为(未启用),B 层和 A 层都把 DeepSeek web_search drop
+
+`cargo test --workspace` 全 193 pass(无回归)。
 
 ## 4. MiniMax M2.x
 

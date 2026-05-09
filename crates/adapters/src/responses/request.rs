@@ -1881,7 +1881,23 @@ fn convert_web_search_tool(
         })];
     }
 
-    // 其他 provider 暂未文档实证,走 drop + warn_once。
+    // ── 文档实证不支持 web_search 的 provider ──
+    // 这些 provider 的 chat completions API 明确只接受 `type:"function"`,
+    // 没有 builtin web_search / native search / extra_body 顶级开关等任何
+    // 形式的 server-side web 搜索能力。用户启用 web_search_enabled=true 也
+    // 不会 work,只能走 P5 修通的 namespace MCP 工具(如 Node Repl + JS
+    // fetch)绕路联网。warn_once 写明具体 provider 帮用户理解。
+
+    // DeepSeek(WebFetch `api-docs.deepseek.com/api/create-chat-completion`
+    // 真原文实证 2026-05-09):"Currently, only `function` is supported."
+    // tools 数组只接受 type:"function",最多 128 个,无 builtin / web_search
+    // / 任何 server-side 搜索能力。
+    if provider_looks_like(provider, "deepseek") {
+        crate::warn_once_drop_tool("web_search:not-supported-by-deepseek-api");
+        return vec![];
+    }
+
+    // 其他 provider 尚未文档实证,走 drop + warn_once。
     // 用户实地反馈"模型不能直接用 web_search,绕路 MCP 工具/Node Repl 写
     // JS fetch HTML"是预期当前行为(P5 namespace MCP 修复后这条路是通的);
     // 后续逐家移植后会让模型直接走 chat 原生 web search,效率更高。
@@ -2887,6 +2903,56 @@ mod tests {
         assert!(
             out.get("thinking").is_none(),
             "B 层 cache disable 后 web_search drop,thinking 不该注入"
+        );
+    }
+
+    // ── DeepSeek web_search drop(文档实证不支持)──
+    // 来源:WebFetch `api-docs.deepseek.com/api/create-chat-completion` 真原文
+    // (2026-05-09):"Currently, only `function` is supported." DeepSeek chat
+    // completions tools 数组只接受 type:"function",无任何 server-side web 搜索。
+
+    #[test]
+    fn deepseek_web_search_dropped_with_explicit_warn_key() {
+        // DeepSeek 即使 web_search_enabled=true 也 drop(API 不支持)
+        let mut p = deepseek_provider();
+        p.request_options
+            .insert("web_search_enabled".into(), json!(true));
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"web_search"},
+                {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            1,
+            "DeepSeek API 不支持 web_search,只剩 keep_me function"
+        );
+        assert_eq!(tools[0]["function"]["name"], "keep_me");
+        // DeepSeek 不应触发 Kimi thinking 注入(它跟 thinking-disabled 路径无关)
+        assert!(out.get("thinking").is_none());
+    }
+
+    #[test]
+    fn deepseek_web_search_drop_independent_of_web_search_enabled_flag() {
+        // 即使用户显式标 web_search_enabled=false / 不标,DeepSeek 都 drop
+        // (其实只是 DeepSeek 不支持的硬实事,跟 A 层无关)
+        let p = deepseek_provider(); // 默认未标 web_search_enabled
+        let req = json!({
+            "model": "deepseek-v4-pro",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"web_search"}]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        assert!(
+            out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty(),
+            "DeepSeek 默认未启用 web_search 时,A 层先 drop(走 disabled-by-config 路径)"
         );
     }
 
