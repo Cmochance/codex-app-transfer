@@ -1,7 +1,7 @@
 name: release
 
 # 三平台 release pipeline (Phase 2):
-#   macos-14 (Apple Silicon arm64 原生) + macos-13 (Intel x64 原生)
+#   macos-14 (Apple Silicon arm64 原生) + macos-15-intel (Intel x64 原生)
 #   + ubuntu-22.04 (AppImage glibc 兼容) + windows-latest
 # 触发: push tag v*  或  workflow_dispatch with version input
 # 产物经 cargo tauri build 直出, rename 为项目老命名兼容老下载链接,
@@ -43,11 +43,15 @@ jobs:
             target: aarch64-apple-darwin
             bundles: 'app,dmg'
             plat: macOS-arm64
-          # Intel Mac (issue #61):macos-13 是 GitHub Actions 唯一保留的 Intel
-          # runner(macos-12 已退役),原生编译 x86_64-apple-darwin。共用所有
-          # macos-14 的签名 / notarization 步骤(条件用 startsWith('macos-')
-          # 即可同时覆盖)。
-          - os: macos-13
+          # Intel Mac (issue #61):`macos-15-intel` 是 GitHub 在 macos-13
+          # (2025-12-04 退役) 后为 Intel x64 延续支持新设的 runner 标签,
+          # 公开仓免费,官方支持到 2027-08。原生编译 x86_64-apple-darwin。
+          # 共用所有 macos-14 的签名 / notarization 步骤(条件用
+          # startsWith('macos-') 即可同时覆盖)。
+          # 历史教训:PR #75 误用已退役的 `macos-13`,GitHub 静默丢弃 job
+          # 导致 v2.1.0 release 卡死 24h+ 无人分配 runner;查
+          # https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             bundles: 'app,dmg'
             plat: macOS-x64
