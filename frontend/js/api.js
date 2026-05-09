@@ -174,6 +174,9 @@
         extraHeaders: p.extraHeaders || {},
         modelCapabilities: p.modelCapabilities || {},
         requestOptions: p.requestOptions || {},
+        // supportsWebSearch:preset 标记是否支持 web_search 配置开关(MiMo /
+        // Kimi / Gemini 三家)。frontend form 据此决定是否渲染开关 UI。
+        supportsWebSearch: !!p.supportsWebSearch,
         ...computeIcon(p),
       }));
       return [...builtin, buildCustomThirdPartyPreset()];

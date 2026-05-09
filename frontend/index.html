@@ -142,6 +142,14 @@
                   <p class="api-format-detail-hint" id="providerApiFormatSelectDetail"></p>
                 </div>
               </div>
+              <div class="mb-4" id="providerWebSearchRow" hidden>
+                <label class="form-label" data-i18n="providersAdd.webSearchEnabled">联网搜索</label>
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" id="providerWebSearchEnabled">
+                  <label class="form-check-label" for="providerWebSearchEnabled" data-i18n="providersAdd.webSearchEnabledToggle">启用 web_search 工具</label>
+                </div>
+                <p class="field-hint" data-i18n="providersAdd.webSearchEnabledHint">启用后代理在出站请求注入 web_search 工具,让模型联网搜索。计费 / 限制取决于 provider。</p>
+              </div>
               <section class="provider-mapping-section">
                 <div class="section-title-row">
                   <div>
