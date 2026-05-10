@@ -1048,6 +1048,33 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
             }],
         });
     }
+
+    // **Gemini wire 严格要求**(2026-05-10 实测 400):"function call turn comes
+    // immediately after a user turn or after a function response turn" — contents
+    // 必须以 user role 开头(且 user/model 严格交替)。Codex.app 多轮 session resume
+    // 时不重发早期 user turn,仅发 function_call_output;我们 synthesize prior
+    // function_call(model role)后 contents 仍以 model 开头 → Gemini 拒。
+    //
+    // **非破坏性修复**:contents 第一条若是 model role,前面插入 synthetic user
+    // 占位 turn 解释上下文(Gemini 模型对 user turn 文案不敏感,只要满足 alternation)。
+    if let Some(first) = contents.first() {
+        if first.role == "model" {
+            contents.insert(
+                0,
+                Content {
+                    role: "user".into(),
+                    parts: vec![Part {
+                        text: Some(
+                            "[Earlier conversation turns elided for brevity. The model's previous \
+                             tool call is replayed below for context; please continue from there.]"
+                                .into(),
+                        ),
+                        ..Default::default()
+                    }],
+                },
+            );
+        }
+    }
     Ok(contents)
 }
 
