@@ -108,7 +108,10 @@ fn detect_platform() -> String {
         "linux" => "LINUX",
         "windows" => "WINDOWS",
         other => {
-            tracing::warn!(os = other, "unknown OS for Google ClientMetadata.platform mapping; using PLATFORM_UNSPECIFIED");
+            tracing::warn!(
+                os = other,
+                "unknown OS for Google ClientMetadata.platform mapping; using PLATFORM_UNSPECIFIED"
+            );
             return "PLATFORM_UNSPECIFIED".to_owned();
         }
     };
