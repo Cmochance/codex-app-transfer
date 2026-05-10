@@ -9,7 +9,12 @@
     { key: "gpt_5_2", label: "gpt-5.2", icon: "bi-circle", iconClass: "default", source: "gpt-5.2" },
   ];
   const availableThemes = ["default", "green", "orange", "gray", "dark", "white"];
-  const providerAuthSchemes = ["bearer", "x-api-key", "none"];
+  // **2026-05-10 修复**:加 google_api_key(Gemini native 用 `x-goog-api-key` header)。
+  // 旧实现白名单只有 bearer / x-api-key / none,Google AI Studio preset 的
+  // authScheme=google_api_key 经 setAuthSchemeValue 校验失败 → fallback 'bearer'
+  // → backend 用 Authorization: Bearer 调 Gemini /v1beta/models → 401(Google 不接 Bearer)
+  // → 测速看似绿(401 走 auth_not_verified 路径)但实际从未真正鉴权过 + 列模型失败。
+  const providerAuthSchemes = ["bearer", "x-api-key", "google_api_key", "none"];
   const providerFormDefaultRows = ["default", "gpt_5_5", "gpt_5_4", "gpt_5_4_mini", "gpt_5_3_codex", "gpt_5_2"];
   let pendingDeleteId = null;
   let selectedPreset = null;
