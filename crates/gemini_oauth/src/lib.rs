@@ -37,6 +37,7 @@ pub mod service;
 pub mod token;
 
 pub use cloud_code::{bootstrap_project, ClientMetadata, CloudCodeError};
+pub use constants::{detect_user_agent, X_GOOG_API_CLIENT};
 pub use flow::{build_auth_url, refresh_access_token, run_oauth_flow, FlowError, OauthFlowConfig};
 pub use service::{ensure_valid_access_token, persist_token, ServiceError};
 pub use token::{OauthToken, TokenError, TokenStore};

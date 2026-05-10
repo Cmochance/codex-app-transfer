@@ -685,6 +685,24 @@ async fn build_and_send_upstream(
     for (name, value) in resolved.extra_headers.iter() {
         up = up.header(name, value);
     }
+    // Cloud Code Assist 上游(impersonate gemini-cli)**必须**用 GeminiCLI UA
+    // + X-Goog-Api-Client 才会命中"官方 gemini-cli 客户端"分支;漏 / 错值
+    // 上游会按"非官方 wire"路径处理(latent silent failure / quota 划归不同
+    // bucket)。强制 override inbound/extra_headers 的同名值 — 这是 Google
+    // 协议必需,不是用户可选。参考:CLIProxyAPI `header_utils.go`。
+    if matches!(
+        resolved.auth_scheme,
+        crate::resolver::AuthScheme::GoogleOauthCloudCode
+    ) {
+        up = up.header(
+            "User-Agent",
+            codex_app_transfer_gemini_oauth::detect_user_agent(),
+        );
+        up = up.header(
+            "X-Goog-Api-Client",
+            codex_app_transfer_gemini_oauth::X_GOOG_API_CLIENT,
+        );
+    }
     let req = up.build()?;
     let outbound_headers_snapshot = req.headers().clone();
     let resp = state.http.execute(req).await?;

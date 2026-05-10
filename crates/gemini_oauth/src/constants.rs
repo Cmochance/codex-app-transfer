@@ -33,7 +33,33 @@ pub const SCOPES: &[&str] = &[
 
 /// 出站 User-Agent —— impersonate gemini-cli。Google 上游会按这个字段做客户端
 /// 识别,跟 `X-Goog-Api-Client` 一起出现在所有 cloudcode-pa 请求里。值跟
-/// CLIProxyAPI `gemini_cli_executor.go` 保持一致。
+/// CLIProxyAPI `header_utils.go::DetectUserAgent` 一致(format
+/// `GeminiCLI/0.34.0 (<platform>; <arch>; terminal)`,platform/arch 跟
+/// `process.platform` / `process.arch` 一致 — `darwin`/`linux`/`win32`,
+/// `arm64`/`x64`/`ia32`)。
+///
+/// **不能 hardcode**:Linux 用户上传 `darwin; arm64` UA 会让 Google 上游 telemetry
+/// 把 Linux 流量当 macOS 统计 + 部分 quota / abuse 检测可能 trip。
+pub fn detect_user_agent() -> String {
+    let platform = match std::env::consts::OS {
+        "macos" => "darwin",
+        "linux" => "linux",
+        "windows" => "win32",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        other => other,
+    };
+    format!("GeminiCLI/0.34.0 ({platform}; {arch}; terminal)")
+}
+
+/// 兼容老调用方 —— 跟 `detect_user_agent()` 同一身份格式;preset extraHeaders
+/// 不能放运行时值,需要静态字符串时用此 const(macOS Apple Silicon 字面)。
+/// **新代码请用 `detect_user_agent()`**。
+#[deprecated(note = "use detect_user_agent() — preset extraHeaders 走 forward.rs runtime 注入")]
 pub const USER_AGENT: &str = "GeminiCLI/0.34.0 (darwin; arm64; terminal)";
 
 /// 出站 X-Goog-Api-Client header —— Google 内部 telemetry,缺这个字段

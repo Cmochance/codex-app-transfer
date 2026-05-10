@@ -25,7 +25,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::constants::{CLOUD_CODE_BASE_URL, USER_AGENT, X_GOOG_API_CLIENT};
+#[allow(deprecated)]
+use super::constants::USER_AGENT;
+use super::constants::{detect_user_agent, CLOUD_CODE_BASE_URL, X_GOOG_API_CLIENT};
 
 #[derive(Debug, Error)]
 pub enum CloudCodeError {
@@ -293,7 +295,7 @@ pub(crate) async fn bootstrap_project_at(
     let resp = http
         .post(&load_url)
         .bearer_auth(access_token)
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", &detect_user_agent())
         .header("X-Goog-Api-Client", X_GOOG_API_CLIENT)
         .json(&load_req)
         .send()
@@ -333,7 +335,7 @@ pub(crate) async fn bootstrap_project_at(
     let initial_resp = http
         .post(&onboard_url)
         .bearer_auth(access_token)
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", &detect_user_agent())
         .header("X-Goog-Api-Client", X_GOOG_API_CLIENT)
         .json(&onboard_req)
         .send()
@@ -387,7 +389,7 @@ pub(crate) async fn bootstrap_project_at(
         let resp = http
             .post(&get_op_url)
             .bearer_auth(access_token)
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", &detect_user_agent())
             .header("X-Goog-Api-Client", X_GOOG_API_CLIENT)
             .json(&serde_json::json!({ "name": op_name }))
             .send()
@@ -456,7 +458,7 @@ mod tests {
         let resp = http
             .post(format!("{}/v1internal:loadCodeAssist", server.uri()))
             .bearer_auth("test-token")
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", &detect_user_agent())
             .header("X-Goog-Api-Client", X_GOOG_API_CLIENT)
             .json(&req)
             .send()
@@ -615,7 +617,7 @@ mod tests {
         let load_resp: LoadCodeAssistResponse = http
             .post(&load_url)
             .bearer_auth("token")
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", &detect_user_agent())
             .header("X-Goog-Api-Client", X_GOOG_API_CLIENT)
             .json(&LoadCodeAssistRequest {
                 cloudaicompanion_project: None,
@@ -633,7 +635,7 @@ mod tests {
         let lro: LongRunningOperation = http
             .post(&onboard_url)
             .bearer_auth("token")
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", &detect_user_agent())
             .header("X-Goog-Api-Client", X_GOOG_API_CLIENT)
             .json(&OnboardUserRequest {
                 tier_id: tier.id,
