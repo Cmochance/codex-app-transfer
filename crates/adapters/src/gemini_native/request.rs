@@ -712,12 +712,21 @@ pub fn chat_normalized_to_gemini_request(
                     tools = None;
                 }
             }
-            let constraint_text = "Note: The user has enabled the web_search (google_search) \
-                built-in tool, but this Gemini 2.x model does not allow built-in tools and function \
-                declarations to coexist. The web_search tool has been disabled for this request to \
-                preserve function calling. If you need to fetch external information, tell the user \
-                this limitation and ask them to either (a) switch to a Gemini 3+ model which \
-                supports both, or (b) disable function calling tools.";
+            // **文案精准**(2026-05-10 修):旧文案 "If you need to fetch external
+            // information, tell the user this limitation" 让 model 把"联网"泛化理解成
+            // 包括 exec_command/curl 也禁 → user 让 model 查天气,model 直接 refuse
+            // 不试 curl。改成只精准说明 google_search 工具不可用,**显式告知** model
+            // 仍可以用 exec_command 跑 curl/wget 等 HTTP 请求实现联网(若 sandbox
+            // 允许 network)。
+            let constraint_text = "Note about tool availability: The built-in `google_search` \
+                (web_search) tool from Gemini is currently unavailable in this request because \
+                this Gemini 2.x model does not allow built-in tools and function declarations to \
+                coexist on the wire. **All your other function-calling tools (e.g. exec_command, \
+                Read, Write, Bash) are fully available** — including using `exec_command` to run \
+                `curl`/`wget` for HTTP requests if the sandbox permissions allow network access. \
+                Only mention this limitation explicitly if the user asks specifically for the \
+                built-in google_search feature; do not refuse network-related tasks just because \
+                google_search is disabled (use other tools to fulfill the request).";
             let si = system_instruction.get_or_insert_with(|| SystemInstruction {
                 role: None,
                 parts: Vec::new(),
