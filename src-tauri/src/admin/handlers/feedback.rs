@@ -195,8 +195,11 @@ fn sanitize_codex_toml(raw: &str) -> String {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
+        let normalized = key.replace(['-', '_'], "");
         let sensitive = key.contains("api_key")
+            || key.contains("api-key")
             || key.contains("apikey")
+            || normalized.contains("apikey")
             || key.contains("token")
             || key.contains("secret")
             || key.contains("password")
