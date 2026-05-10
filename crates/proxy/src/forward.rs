@@ -30,6 +30,7 @@ use futures_core::Stream;
 use futures_util::TryStreamExt;
 use thiserror::Error;
 
+use crate::diagnostics::{write_upstream_error_bundle, UpstreamErrorBundleInput};
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
 
@@ -391,6 +392,20 @@ pub async fn forward_handler(
             &plan.body,
             &body,
         );
+        let upstream_model_for_diag = body_model(&plan.body);
+        record_upstream_error_bundle(
+            &parts.method,
+            &client_path,
+            &resolved,
+            original_model.as_deref(),
+            resolved_model.as_deref(),
+            upstream_model_for_diag.as_deref(),
+            st,
+            &upstream_url,
+            &outbound_headers_snapshot,
+            &plan.body,
+            &body,
+        );
         let single = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body) });
         (
             st,
@@ -427,6 +442,20 @@ pub async fn forward_handler(
             };
             log_upstream_error_diag(
                 &telemetry,
+                st,
+                &upstream_url,
+                &outbound_headers_snapshot,
+                &plan.body,
+                &body_bytes,
+            );
+            let upstream_model_for_diag = body_model(&plan.body);
+            record_upstream_error_bundle(
+                &parts.method,
+                &client_path,
+                &resolved,
+                original_model.as_deref(),
+                resolved_model.as_deref(),
+                upstream_model_for_diag.as_deref(),
                 st,
                 &upstream_url,
                 &outbound_headers_snapshot,
@@ -648,6 +677,36 @@ fn log_upstream_error_diag(
             resp_snippet,
         ),
     );
+}
+
+fn record_upstream_error_bundle(
+    method: &http::Method,
+    client_path: &str,
+    resolved: &ResolvedProvider,
+    original_model: Option<&str>,
+    resolved_model: Option<&str>,
+    upstream_model: Option<&str>,
+    status: StatusCode,
+    upstream_url: &str,
+    outbound_headers: &reqwest::header::HeaderMap,
+    request_body: &Bytes,
+    response_body: &Bytes,
+) {
+    let input = UpstreamErrorBundleInput {
+        method: method.as_str().to_owned(),
+        client_path: client_path.to_owned(),
+        upstream_url: upstream_url.to_owned(),
+        status_code: status.as_u16(),
+        provider_id: resolved.provider.id.clone(),
+        provider_name: resolved.provider.name.clone(),
+        original_model: original_model.map(str::to_owned),
+        resolved_model: resolved_model.map(str::to_owned),
+        upstream_model: upstream_model.map(str::to_owned),
+        outbound_headers_redacted: format_headers_redacted(outbound_headers),
+        request_body: request_body.to_vec(),
+        response_body: response_body.to_vec(),
+    };
+    let _ = write_upstream_error_bundle(&input);
 }
 
 /// 把 HeaderMap 渲染成一行 `name=value, name=value, ...` 用于错误诊断日志。

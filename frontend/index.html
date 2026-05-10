@@ -544,6 +544,11 @@
               <input class="form-control" type="text" id="feedbackTitle" maxlength="100" data-i18n-attr="placeholder|feedback.titlePlaceholder" placeholder="一句话概括问题">
             </div>
             <div class="form-group">
+              <label for="feedbackContactEmail" data-i18n="feedback.contactEmailLabel">联系邮箱(选填)</label>
+              <input class="form-control" type="email" id="feedbackContactEmail" maxlength="200" data-i18n-attr="placeholder|feedback.contactEmailPlaceholder" placeholder="name@example.com">
+              <p class="settings-note" data-i18n="feedback.contactEmailHint">选填。填写后作者可通过该邮箱联系你反馈处理进展。</p>
+            </div>
+            <div class="form-group">
               <label for="feedbackBody" data-i18n="feedback.bodyLabel">详细描述 *</label>
               <textarea class="form-control" id="feedbackBody" rows="6" maxlength="10000" data-i18n-attr="placeholder|feedback.bodyPlaceholder" placeholder="请尽量描述清楚:发生了什么,你期望的是什么,如何复现"></textarea>
             </div>

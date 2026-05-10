@@ -12,7 +12,8 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use codex_app_transfer_proxy::proxy_log_dir;
+use codex_app_transfer_codex_integration::CodexPaths;
+use codex_app_transfer_proxy::{proxy_log_dir, recent_feedback_bundles};
 use reqwest::{header::CONTENT_TYPE, multipart};
 use serde_json::{json, Value};
 
@@ -143,6 +144,147 @@ pub(super) fn feedback_proxy_tail_part() -> Option<multipart::Part> {
     )
 }
 
+fn redacted_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                let key_lower = k.to_ascii_lowercase();
+                let is_sensitive_key = key_lower.contains("apikey")
+                    || key_lower.contains("api_key")
+                    || key_lower.contains("authorization")
+                    || key_lower.contains("token")
+                    || key_lower.contains("secret")
+                    || key_lower.contains("password");
+                if is_sensitive_key {
+                    out.insert(k.clone(), Value::String("<REDACTED>".to_owned()));
+                } else {
+                    out.insert(k.clone(), redacted_json(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(redacted_json).collect()),
+        Value::String(s) => {
+            let lower = s.to_ascii_lowercase();
+            if lower.contains("bearer ")
+                || lower.contains("sk-")
+                || lower.contains("api_key")
+                || lower.contains("apikey")
+            {
+                Value::String("<REDACTED>".to_owned())
+            } else {
+                Value::String(s.clone())
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+fn sanitize_codex_toml(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || !trimmed.contains('=') {
+            out.push(line.to_owned());
+            continue;
+        }
+        let key = trimmed
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let normalized = key.replace(['-', '_'], "");
+        let sensitive = key.contains("api_key")
+            || key.contains("api-key")
+            || key.contains("apikey")
+            || normalized.contains("apikey")
+            || key.contains("token")
+            || key.contains("secret")
+            || key.contains("password")
+            || key.contains("authorization");
+        if sensitive {
+            let prefix_len = line.find('=').unwrap_or(line.len());
+            let prefix = &line[..prefix_len + 1];
+            out.push(format!("{prefix} \"<REDACTED>\""));
+        } else {
+            out.push(line.to_owned());
+        }
+    }
+    out.join("\n")
+}
+
+fn diagnostic_attachments(include_diag: bool) -> Vec<FeedbackAttachment> {
+    if !include_diag {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut log_idx = 10usize;
+
+    if let Ok(cfg) = load_registry() {
+        let cfg_redacted = redacted_json(&cfg);
+        if let Ok(raw) = serde_json::to_vec_pretty(&cfg_redacted) {
+            parts.push(FeedbackAttachment {
+                field: format!("log{log_idx}"),
+                name: "proxy-config.redacted.json".to_owned(),
+                content_type: "application/json".to_owned(),
+                raw,
+            });
+            log_idx += 1;
+        }
+    }
+
+    if let Ok(paths) = CodexPaths::from_home_env() {
+        if let Ok(raw_toml) = fs::read_to_string(&paths.config_toml) {
+            let sanitized = sanitize_codex_toml(&raw_toml);
+            if !sanitized.trim().is_empty() {
+                parts.push(FeedbackAttachment {
+                    field: format!("log{log_idx}"),
+                    name: "codex-config.redacted.toml".to_owned(),
+                    content_type: "text/plain".to_owned(),
+                    raw: sanitized.into_bytes(),
+                });
+                log_idx += 1;
+            }
+        }
+    }
+
+    for bundle_path in recent_feedback_bundles(3) {
+        let Ok(raw) = fs::read(&bundle_path) else {
+            continue;
+        };
+        let name = bundle_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("feedback-bundle.json")
+            .to_owned();
+        parts.push(FeedbackAttachment {
+            field: format!("log{log_idx}"),
+            name,
+            content_type: "application/json".to_owned(),
+            raw,
+        });
+        log_idx += 1;
+    }
+
+    let versions = format!(
+        "codex-app-transfer={}\nproxy_runtime={}\nclient_type=codex-desktop\nos={} {}\n",
+        APP_VERSION,
+        APP_VERSION,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    parts.push(FeedbackAttachment {
+        field: format!("log{log_idx}"),
+        name: "versions.txt".to_owned(),
+        content_type: "text/plain".to_owned(),
+        raw: versions.into_bytes(),
+    });
+
+    parts
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct FeedbackAttachment {
     pub(super) field: String,
@@ -232,6 +374,12 @@ pub(super) async fn submit_feedback_with_body(
         .unwrap_or("")
         .trim()
         .to_owned();
+    let contact_email = input
+        .get("contact_email")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
     let body_text = input
         .get("body")
         .and_then(|v| v.as_str())
@@ -283,9 +431,27 @@ pub(super) async fn submit_feedback_with_body(
             multipart_text_part(meta.to_string(), "application/json"),
         )
         .part("title", multipart_text_part(title, "text/plain"))
+        .part(
+            "contact_email",
+            multipart_text_part(contact_email, "text/plain"),
+        )
         .part("body", multipart_text_part(body_text, "text/plain"));
 
     for attachment in feedback_attachments(&input, current_epoch_secs()) {
+        let FeedbackAttachment {
+            field,
+            name,
+            content_type,
+            raw,
+        } = attachment;
+        let part = multipart::Part::bytes(raw.clone()).file_name(name.clone());
+        let part = part
+            .mime_str(&content_type)
+            .unwrap_or_else(|_| multipart::Part::bytes(raw).file_name(name));
+        form = form.part(field, part);
+    }
+
+    for attachment in diagnostic_attachments(include_diag) {
         let FeedbackAttachment {
             field,
             name,
@@ -492,6 +658,7 @@ mod tests {
 
             let payload = json!({
                 "title": "short title",
+                "contact_email": "user@example.com",
                 "body": "feedback body",
                 "include_diagnostics": false,
                 "attachments": [
@@ -526,6 +693,8 @@ mod tests {
             assert!(multipart.contains("name=\"meta\""));
             assert!(multipart.contains("name=\"title\""));
             assert!(multipart.contains("short title"));
+            assert!(multipart.contains("name=\"contact_email\""));
+            assert!(multipart.contains("user@example.com"));
             assert!(multipart.contains("name=\"body\""));
             assert!(multipart.contains("feedback body"));
             assert!(multipart.contains("name=\"screenshot0\"; filename=\"shot.png\""));
