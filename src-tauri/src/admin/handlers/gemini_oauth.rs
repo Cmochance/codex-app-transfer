@@ -34,7 +34,7 @@ use codex_app_transfer_gemini_oauth::{
 };
 use serde_json::{json, Value};
 
-use super::super::registry_io::{load as load_registry, save as save_registry};
+use super::super::registry_io::with_config_write;
 use super::super::state::AdminState;
 use super::common::err;
 use super::providers::active_provider;
@@ -226,85 +226,207 @@ async fn logout_handler() -> impl IntoResponse {
 /// 把 project_id 写进当前 active provider 的 `extra.cloud_code_project_id` 字段,
 /// 让 GeminiCliAdapter 能读到。仅当 active provider 是 `apiFormat=gemini_cli_oauth`
 /// 时才写,其他 provider 不动。
+///
+/// 走 [`with_config_write`] 闭包模式 atomic RMW,防与并发 form save / desktop
+/// switch_provider 等其他 RMW 路径互相 overwrite(H1 修)。
 fn sync_project_id_to_active_provider(project_id: &str) -> Result<(), String> {
-    let mut cfg = load_registry().map_err(|e| e.to_string())?;
-    let Some(active) = active_provider(&cfg) else {
-        return Err("no active provider".into());
-    };
-    if active.get("apiFormat").and_then(|v| v.as_str()) != Some("gemini_cli_oauth") {
-        return Ok(()); // active provider 不是 gemini_cli_oauth,跳过
-    }
-    let active_id = active
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or("active provider id missing")?
-        .to_owned();
-    let providers = cfg
-        .as_object_mut()
-        .and_then(|o| o.get_mut("providers"))
-        .and_then(|v| v.as_array_mut())
-        .ok_or("no providers array")?;
-    for p in providers.iter_mut() {
-        if p.get("id").and_then(|v| v.as_str()) == Some(active_id.as_str()) {
-            let obj = p.as_object_mut().ok_or("provider not object")?;
-            let extra = obj
-                .entry("extra".to_owned())
-                .or_insert_with(|| Value::Object(Default::default()));
-            if let Some(extra_obj) = extra.as_object_mut() {
-                extra_obj.insert(
-                    "cloud_code_project_id".into(),
-                    Value::String(project_id.to_owned()),
-                );
-            }
-            break;
+    with_config_write(|cfg| {
+        let Some(active) = active_provider(cfg) else {
+            return Err("no active provider".into());
+        };
+        if active.get("apiFormat").and_then(|v| v.as_str()) != Some("gemini_cli_oauth") {
+            return Ok(()); // active provider 不是 gemini_cli_oauth,跳过
         }
-    }
-    save_registry(&cfg).map_err(|e| e.to_string())
+        let active_id = active
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or("active provider id missing")?
+            .to_owned();
+        let providers = cfg
+            .as_object_mut()
+            .and_then(|o| o.get_mut("providers"))
+            .and_then(|v| v.as_array_mut())
+            .ok_or("no providers array")?;
+        for p in providers.iter_mut() {
+            if p.get("id").and_then(|v| v.as_str()) == Some(active_id.as_str()) {
+                let obj = p.as_object_mut().ok_or("provider not object")?;
+                let extra = obj
+                    .entry("extra".to_owned())
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if let Some(extra_obj) = extra.as_object_mut() {
+                    extra_obj.insert(
+                        "cloud_code_project_id".into(),
+                        Value::String(project_id.to_owned()),
+                    );
+                }
+                break;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// logout 时清 active provider 的 `extra.cloud_code_project_id`。**镜像 sync**
 /// 的 active+apiFormat 双 gate(silent-failure-hunter C1 修):原版无脑遍历所有
 /// provider,会抹掉非 active / 非 gemini_cli_oauth 的 provider 的 project_id。
 /// 用户多 OAuth 账号时会让其他 provider 莫名失效。
+///
+/// 走 [`with_config_write`] atomic RMW,同 sync(H1 修)。
 fn clear_project_id_from_active_provider() -> Result<(), String> {
-    let mut cfg = load_registry().map_err(|e| e.to_string())?;
-    let Some(active) = active_provider(&cfg) else {
-        return Ok(()); // 没 active provider,无需清理
-    };
-    if active.get("apiFormat").and_then(|v| v.as_str()) != Some("gemini_cli_oauth") {
-        return Ok(()); // active 不是 gemini_cli_oauth,跳过
-    }
-    let active_id = active
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or("active provider id missing")?
-        .to_owned();
-    let providers = cfg
-        .as_object_mut()
-        .and_then(|o| o.get_mut("providers"))
-        .and_then(|v| v.as_array_mut())
-        .ok_or("no providers array")?;
-    for p in providers.iter_mut() {
-        if p.get("id").and_then(|v| v.as_str()) != Some(active_id.as_str()) {
-            continue; // 只清 active provider
+    with_config_write(|cfg| {
+        let Some(active) = active_provider(cfg) else {
+            return Ok(()); // 没 active provider,无需清理
+        };
+        if active.get("apiFormat").and_then(|v| v.as_str()) != Some("gemini_cli_oauth") {
+            return Ok(()); // active 不是 gemini_cli_oauth,跳过
         }
-        if let Some(obj) = p.as_object_mut() {
-            if let Some(extra) = obj.get_mut("extra").and_then(|v| v.as_object_mut()) {
-                extra.remove("cloud_code_project_id");
+        let active_id = active
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or("active provider id missing")?
+            .to_owned();
+        let providers = cfg
+            .as_object_mut()
+            .and_then(|o| o.get_mut("providers"))
+            .and_then(|v| v.as_array_mut())
+            .ok_or("no providers array")?;
+        for p in providers.iter_mut() {
+            if p.get("id").and_then(|v| v.as_str()) != Some(active_id.as_str()) {
+                continue; // 只清 active provider
             }
+            if let Some(obj) = p.as_object_mut() {
+                if let Some(extra) = obj.get_mut("extra").and_then(|v| v.as_object_mut()) {
+                    extra.remove("cloud_code_project_id");
+                }
+            }
+            break;
         }
-        break;
-    }
-    save_registry(&cfg).map_err(|e| e.to_string())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::handlers::common::test_support::with_isolated_home;
+    use crate::admin::registry_io::with_config_write;
+    use serde_json::json;
 
     #[test]
     fn routes_compile_and_paths_are_unique() {
         // smoke test:确保 routes() 编译且不 panic
         let _ = routes();
+    }
+
+    /// 写一个特定 providers 数组到 disk(测试 fixture)
+    fn seed_config(cfg_value: Value) {
+        with_config_write(|cfg| {
+            *cfg = cfg_value;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// 读出当前 providers 数组用于断言
+    fn read_providers() -> Vec<Value> {
+        with_config_write(|cfg| {
+            Ok(cfg
+                .get("providers")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default())
+        })
+        .unwrap()
+    }
+
+    /// G2 contract 1:active=gemini_cli_oauth → sync 把 project_id 写入 active provider 的 extra
+    #[test]
+    fn sync_writes_project_id_to_active_oauth_provider() {
+        with_isolated_home(|_home| {
+            seed_config(json!({
+                "activeProvider": "p-oauth",
+                "providers": [
+                    {"id": "p-oauth", "apiFormat": "gemini_cli_oauth", "extra": {}},
+                ]
+            }));
+            sync_project_id_to_active_provider("proj-xyz").unwrap();
+            let providers = read_providers();
+            assert_eq!(
+                providers[0]["extra"]["cloud_code_project_id"], "proj-xyz",
+                "active=gemini_cli_oauth 必须把 project_id 写入 extra"
+            );
+        });
+    }
+
+    /// G2 contract 2:active 不是 gemini_cli_oauth → sync 不动任何 provider(防写错 provider)
+    #[test]
+    fn sync_skips_when_active_is_not_oauth() {
+        with_isolated_home(|_home| {
+            seed_config(json!({
+                "activeProvider": "p-other",
+                "providers": [
+                    {"id": "p-other", "apiFormat": "openai_chat", "extra": null},
+                    {"id": "p-oauth", "apiFormat": "gemini_cli_oauth", "extra": {}},
+                ]
+            }));
+            sync_project_id_to_active_provider("proj-xyz").unwrap();
+            let providers = read_providers();
+            assert!(
+                providers[0]["extra"].is_null(),
+                "active 不是 OAuth 时 active provider extra 不该被改"
+            );
+            assert!(
+                providers[1]["extra"]["cloud_code_project_id"].is_null(),
+                "active 不是 OAuth 时其他 OAuth provider 也不该被写"
+            );
+        });
+    }
+
+    /// G2 contract 3:**C1 回归 gate** — clear 只清 active 的 project_id,
+    /// 其他 gemini_cli_oauth provider 的 project_id 必须保留(用户多账号场景)
+    #[test]
+    fn clear_preserves_other_oauth_providers_project_id() {
+        with_isolated_home(|_home| {
+            seed_config(json!({
+                "activeProvider": "p-active",
+                "providers": [
+                    {"id": "p-active", "apiFormat": "gemini_cli_oauth",
+                     "extra": {"cloud_code_project_id": "active-proj"}},
+                    {"id": "p-other", "apiFormat": "gemini_cli_oauth",
+                     "extra": {"cloud_code_project_id": "other-proj"}},
+                ]
+            }));
+            clear_project_id_from_active_provider().unwrap();
+            let providers = read_providers();
+            assert!(
+                providers[0]["extra"]["cloud_code_project_id"].is_null()
+                    || providers[0]["extra"].get("cloud_code_project_id").is_none(),
+                "active provider 的 project_id 必须被清"
+            );
+            assert_eq!(
+                providers[1]["extra"]["cloud_code_project_id"], "other-proj",
+                "**C1 回归 gate**:其他 OAuth provider 的 project_id 必须保留"
+            );
+        });
+    }
+
+    /// G2 contract 4:无 active provider → sync 返 Err(login 时必有 active),
+    /// clear 返 Ok(logout 容忍无 active,best-effort 清理)
+    #[test]
+    fn sync_and_clear_no_active_provider_behavior() {
+        with_isolated_home(|_home| {
+            seed_config(json!({
+                "providers": [],
+                // activeProvider 缺失
+            }));
+            assert!(
+                sync_project_id_to_active_provider("proj").is_err(),
+                "sync 无 active 必须 Err — login 流必须有 active 才走到这"
+            );
+            assert!(
+                clear_project_id_from_active_provider().is_ok(),
+                "clear 无 active 应 Ok — logout best-effort 容忍"
+            );
+        });
     }
 }
