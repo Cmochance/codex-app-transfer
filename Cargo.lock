@@ -695,6 +695,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "codex-app-transfer-gemini-oauth",
  "codex-app-transfer-registry",
  "futures-core",
  "futures-util",

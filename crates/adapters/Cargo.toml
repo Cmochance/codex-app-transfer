@@ -10,6 +10,10 @@ repository.workspace = true
 
 [dependencies]
 codex-app-transfer-registry = { path = "../registry" }
+# OAuth token store fallback —— GeminiCliAdapter 在 provider.extra.cloud_code_project_id
+# 缺失时直接从 ~/.codex-app-transfer/gemini-oauth.json 读 project_id(token 文件
+# 是 single source of truth,避免 sync_to_active_provider race 让 chat 路径全 fail)
+codex-app-transfer-gemini-oauth = { path = "../gemini_oauth" }
 axum = { version = "0.8", default-features = false, features = ["http1"] }
 bytes = "1"
 futures-core = "0.3"

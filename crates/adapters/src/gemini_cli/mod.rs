@@ -70,18 +70,33 @@ impl Adapter for GeminiCliAdapter {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AdapterError::BadRequest("model field required".into()))?
             .to_owned();
+        // project_id 三层 fallback:
+        //   1. provider.extra.cloud_code_project_id(admin handler login 时 sync 写)
+        //   2. ~/.codex-app-transfer/gemini-oauth.json(login bootstrap 时 persist,
+        //      authoritative source — 避免 sync_to_active_provider 失败 / race)
+        //   3. 都缺 → BadRequest 提示用户重 login
+        // 修历史:仅依赖 (1) 时,sync 失败(如 active 切到非 OAuth 后切回的 race)
+        // 让 chat 全 fail "cloud_code_project_id required",但磁盘 token 实际有
+        // project_id,user 已成功 login。2026-05-11 实测触发。
         let project_id = provider
             .extra
             .get("cloud_code_project_id")
             .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .or_else(|| {
+                codex_app_transfer_gemini_oauth::TokenStore::from_home_env()
+                    .ok()
+                    .and_then(|store| store.load().ok().flatten())
+                    .and_then(|token| token.project_id)
+            })
             .ok_or_else(|| {
                 AdapterError::BadRequest(
-                    "provider.extra.cloud_code_project_id required for OAuth path \
-                     (run OAuth login first to bootstrap project)"
+                    "cloud_code_project_id missing in both provider.extra and \
+                     ~/.codex-app-transfer/gemini-oauth.json — run OAuth login \
+                     to bootstrap project"
                         .into(),
                 )
-            })?
-            .to_owned();
+            })?;
 
         // 1. 复用 gemini_native 把 Codex /responses 转 Gemini inner body
         let inner =
@@ -241,6 +256,13 @@ mod adapter_tests {
 
     #[test]
     fn missing_project_id_returns_bad_request_with_hint() {
+        // 隔离 HOME 让 token store fallback 走 None 而不是命中真实磁盘
+        // ~/.codex-app-transfer/gemini-oauth.json — 否则 dev 机跑 test 会因为
+        // 真有 token 而把"missing project_id"路径覆盖掉。每个 test fn override
+        // HOME 即可,不影响 cargo test 并发(env::set_var 进程级,但其他 test
+        // 不依赖 HOME path 默认)。
+        // 安全:仅 cfg(test) 路径,不进 prod
+        let _guard = HomeGuard::set(tempfile::tempdir().unwrap().path());
         let mut p = dummy_provider_with_project();
         p.extra.shift_remove("cloud_code_project_id");
         let body = serde_json::json!({
@@ -263,6 +285,32 @@ mod adapter_tests {
                 assert!(msg.contains("OAuth login"));
             }
             other => panic!("期待 BadRequest,得到 {other:?}"),
+        }
+    }
+
+    /// scoped HOME override —— Drop 时还原原值,防 test 间泄漏。
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl HomeGuard {
+        fn set(new_home: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            // SAFETY: cfg(test) 路径,test 内手动隔离 HOME 验 token-store fallback
+            unsafe {
+                std::env::set_var("HOME", new_home);
+            }
+            Self { prev }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: 同 set,Drop 时还原避免 leak
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
         }
     }
 
