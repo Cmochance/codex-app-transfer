@@ -70,10 +70,20 @@ pub struct FunctionResponse {
 
 /// `contents[].role` 只接受 `"user"` 或 `"model"`(无 system / tool 角色 —
 /// system 走顶层 systemInstruction,tool response 用 user role 包 functionResponse)。
+///
+/// **反序列化时 role 是 optional**:Gemini streaming chunks 内部的 `content`
+/// 经常省略 role(隐含 "model"),用 `#[serde(default)]` 兜底成 "model"。
+/// 序列化时(我们出站请求)总是显式 emit。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Content {
+    #[serde(default = "default_content_role")]
     pub role: String,
+    #[serde(default)]
     pub parts: Vec<Part>,
+}
+
+fn default_content_role() -> String {
+    "model".to_owned()
 }
 
 /// `system_instruction` 顶层字段(Gemini 不支持 messages 里独立 system role)。

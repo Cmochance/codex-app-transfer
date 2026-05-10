@@ -20,11 +20,14 @@
 
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
+use http::{header::HeaderValue, HeaderMap, StatusCode};
 use serde_json::Value;
 
-use crate::types::{Adapter, AdapterError, RequestPlan};
+use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
+pub mod grounding;
 pub mod request;
+pub mod response;
 pub mod types;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -79,8 +82,45 @@ impl Adapter for GeminiNativeAdapter {
         })
     }
 
-    // transform_response_stream 用 trait 默认实现(passthrough),响应侧 SSE
-    // 状态机下轮加入 — 见模块顶部注释。
+    /// 响应侧:Gemini SSE → Responses SSE **直转**(2026-05-10 用户决策)。
+    ///
+    /// 不走 chat 中间形态,Gemini adapter 自给自足 — `response.rs::GeminiToResponsesConverter`
+    /// 直接 emit `response.created/in_progress/output_item.added/output_text.delta/
+    /// function_call_arguments.delta/output_text.annotation.added/completed` 等事件,
+    /// envelope 字段从 `request_plan.original_responses_request` 回灌(tools / instructions
+    /// / temperature / etc.)。
+    ///
+    /// 错误路径:5xx / 4xx body 直接透传(Codex.app 看到错误体可重试 / 显示)。
+    fn transform_response_stream(
+        &self,
+        upstream_status: StatusCode,
+        mut upstream_headers: HeaderMap,
+        upstream_stream: ByteStream,
+        _provider: &Provider,
+        request_plan: &RequestPlan,
+    ) -> Result<ResponsePlan, AdapterError> {
+        if !upstream_status.is_success() {
+            return Ok(ResponsePlan {
+                status: upstream_status,
+                headers: upstream_headers,
+                stream: upstream_stream,
+            });
+        }
+        upstream_headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let stream = response::convert_gemini_to_responses_stream(
+            upstream_stream,
+            request_plan.original_responses_request.clone(),
+            request_plan.response_session.clone(),
+        );
+        Ok(ResponsePlan {
+            status: upstream_status,
+            headers: upstream_headers,
+            stream,
+        })
+    }
 }
 
 #[cfg(test)]

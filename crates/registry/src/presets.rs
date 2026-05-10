@@ -60,20 +60,25 @@ mod tests {
     }
 
     #[test]
-    fn google_ai_studio_preset_exists_with_openai_compat_endpoint() {
+    fn google_ai_studio_preset_uses_native_generate_content_endpoint() {
         let g = builtin_presets()
             .iter()
             .find(|p| p["id"] == "google-ai-studio")
             .expect("Google AI Studio preset must exist as builtin entry");
+        // 2026-05-10 起从 OpenAI compat 切到 native generateContent path:
+        // ① baseUrl 不再带 /v1beta/openai(adapter 按 model 自动选 v1alpha vs v1beta)
+        // ② apiFormat=gemini_native(GeminiNativeAdapter 路由)
+        // ③ authScheme=google_api_key(`x-goog-api-key` header,不是 Bearer)
         assert_eq!(
             g["baseUrl"],
-            "https://generativelanguage.googleapis.com/v1beta/openai"
+            "https://generativelanguage.googleapis.com",
+            "baseUrl 不带版本前缀,adapter 按 Gemini 3+ 用 v1alpha / 2.x 用 v1beta 自动选"
         );
         assert_eq!(
-            g["apiFormat"], "openai_chat",
-            "Google 官方 OpenAI Chat Completions 兼容 endpoint,走 chat 路径"
+            g["apiFormat"], "gemini_native",
+            "Google AI Studio 走 native generateContent endpoint,不走 OpenAI compat"
         );
-        assert_eq!(g["authScheme"], "bearer");
+        assert_eq!(g["authScheme"], "google_api_key");
         assert_eq!(g["isBuiltin"], true);
         let default_model = g["models"]["default"].as_str().unwrap_or("");
         assert!(
