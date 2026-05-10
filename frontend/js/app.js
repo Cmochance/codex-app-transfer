@@ -1558,12 +1558,19 @@
   // 测速结果是否要 UI 标黄(.bad class)。**白名单语义**(silent-failure-hunter
   // review H2):后端将来加新 authStatus 枚举(`tls_warn` / `rate_limited` /
   // `cert_expired` 等)/ 或返 `success: false` 不带 ok 字段,helper 默认标黄不漏判。
-  // 只有显式"全 OK"才标绿:result 存在 + ok!==false + (无 authStatus 或 authStatus==="ok")。
+  //
+  // **修复历史(2026-05-10)**:`auth_required_or_invalid`(401/403)以前被
+  // 当 bad 标黄,但 backend `test.rs:312-318` 注释明确"401/403 = baseUrl 连接性
+  // OK + 鉴权未验证,应绿色"(测连接性本来不需要 key,鉴权层跟连接层解耦)。
+  // 显式 allow-list 这个 authStatus 走绿色,其他未来新增 authStatus 默认仍标黄。
   function isProviderTestResultBad(result) {
     if (!result) return true;
     if (result.success === false) return true;
     if (result.ok === false) return true;
-    if (result.authStatus && result.authStatus !== "ok") return true;
+    if (result.authStatus && result.authStatus !== "ok"
+        && result.authStatus !== "auth_required_or_invalid") {
+      return true;
+    }
     return false;
   }
 

@@ -28,7 +28,13 @@ fn model_endpoint_candidates(provider: &Value) -> Vec<String> {
     let upstream = build_provider_test_url(&base_url, api_format);
     let mut candidates = Vec::new();
 
-    if api_format == "openai_chat" {
+    if api_format == "gemini_native" {
+        // Gemini native:**只**用 build_provider_test_url 拼好的 endpoint
+        // (`/v1beta/models` 或 `/v1alpha/models`,跟 base_url 是否带版本相关)。
+        // **不要**push 别的 candidates(如 `{base_url}/models` 或 v1/models),
+        // Google 上游对 unknown path 返 404 — 多 fallback 浪费请求 + 日志噪音。
+        candidates.push(upstream.clone());
+    } else if api_format == "openai_chat" {
         candidates.push(replace_path_suffix(
             &upstream,
             &["/chat/completions", "/completions"],
