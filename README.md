@@ -484,13 +484,13 @@ v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 
 
 本项目站在前人的肩膀上:
 
-- **[CC-Switch](https://github.com/farion1231/cc-switch)** — 轻量桌面 + 一键切换 provider 形态启发。
-- **[CC Desktop Switch](https://github.com/lonr-6/cc-desktop-switch)** — v1.x 桌面壳 / 托盘 / 打包发布链路骨架沿用。
-- **[litellm](https://github.com/BerriAI/litellm)** — Responses ↔ Chat 双向协议转换思路。
-- **[Tauri](https://tauri.app/)** — v2 桌面壳 + cas:// 同进程 axum 架构基座。
-- **[Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts)** — autocompact 9-section summary prompt 蓝本。
-- **[7as0nch/mimo2codex](https://github.com/7as0nch/mimo2codex)** — MiMo image / namespace 展平 / web_search / annotation 协议借鉴。
-- **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**(MIT, Go, 31.8k⭐)— Gemini CLI OAuth 流程 + Cloud Code Assist 内部 API wire 形态参考(`internal/auth/gemini/` + `internal/runtime/executor/gemini_cli_executor.go` + `internal/cmd/login.go`),让我们能在不依赖 API key 的前提下接入 Google Gemini 免费 tier 配额。
+- **[CC-Switch](https://github.com/farion1231/cc-switch)** — provider 切换形态启发。
+- **[CC Desktop Switch](https://github.com/lonr-6/cc-desktop-switch)** — v1.x 桌面壳骨架沿用。
+- **[litellm](https://github.com/BerriAI/litellm)** — 协议双向转换思路。
+- **[Tauri](https://tauri.app/)** — v2 + cas:// 架构基座。
+- **[Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts)** — autocompact prompt 蓝本。
+- **[7as0nch/mimo2codex](https://github.com/7as0nch/mimo2codex)** — MiMo 协议借鉴。
+- **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** — Gemini OAuth wire 参考。
 
 ### 社区贡献者
 
