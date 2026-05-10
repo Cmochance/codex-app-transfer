@@ -96,12 +96,40 @@ pub enum ConfigMutation<T> {
     Unchanged(T),
 }
 
+/// thread-local 守卫:进入 [`with_config_write`] 闭包时设 true,退出时还原。
+/// 用于检测 closure 内套调 with_config_write 的 reentrant deadlock —— std
+/// Mutex 同线程 re-lock 永久 hang(无 panic 无 timeout,UI 静默冻结)。本守卫
+/// 让 reentrant 立刻 panic 报告位置,silent hang → loud panic。
+thread_local! {
+    static IN_WITH_CONFIG_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn with_config_write<F, T>(f: F) -> Result<T, String>
 where
     F: FnOnce(&mut RawConfig) -> Result<ConfigMutation<T>, String>,
 {
-    // **不可重入**:closure 不能再调 with_config_write / load / save —— std
-    // Mutex 同线程 re-lock 即 deadlock。doc 已警告,callsite 自查
+    // **reentrant detection**(防 silent deadlock):同线程已经持锁却又进 with_
+    // config_write → std Mutex 直接 deadlock 永远 hang。本检查让它 panic 报告
+    // 哪个 callsite 套调了。常见误用:closure 内调用了某个 helper,helper 又
+    // (直接或间接)再调 with_config_write/load/save。
+    IN_WITH_CONFIG_WRITE.with(|flag| {
+        if flag.get() {
+            panic!(
+                "with_config_write reentered from within its own closure — std::sync::Mutex \
+                 would deadlock silently. Check call stack for nested with_config_write / load / save."
+            );
+        }
+        flag.set(true);
+    });
+    // RAII 守卫保证 panic 路径也复位 flag(否则下次 with_config_write 永远 panic)
+    struct ReentryGuard;
+    impl Drop for ReentryGuard {
+        fn drop(&mut self) {
+            IN_WITH_CONFIG_WRITE.with(|flag| flag.set(false));
+        }
+    }
+    let _reentry_guard = ReentryGuard;
+
     let _guard = CONFIG_FILE_LOCK.lock().unwrap_or_else(|poison| {
         // poison = 之前一次 closure 内 panic 留下的状态。锁本身不带数据,
         // recover 安全;但要 log 让 operator 看到有 panic 发生过 —— 否则
@@ -266,6 +294,44 @@ mod tests {
                 result.is_ok(),
                 "poison recovery 失败,后续 with_config_write 应能继续: {:?}",
                 result
+            );
+        });
+    }
+
+    /// **reentrant detection contract**:closure 内套调 with_config_write 必须
+    /// panic 而非 silent deadlock。`#[should_panic]` 验 panic message 含
+    /// "reentered"。RAII guard 保证 panic 路径也复位 thread-local flag。
+    #[test]
+    #[should_panic(expected = "reentered")]
+    fn reentrant_call_panics_not_deadlocks() {
+        with_isolated_home(|_home| {
+            let _ = with_config_write(|_cfg| {
+                // 套调 with_config_write — 必须 panic 报告 reentrant
+                let _ = with_config_write(|_inner| Ok(ConfigMutation::Unchanged(())));
+                Ok(ConfigMutation::Unchanged(()))
+            });
+        });
+    }
+
+    /// 验 RAII guard:reentrant panic 后,下一次调用 with_config_write 应能
+    /// 正常 work(thread-local flag 已复位,不会永久 false-positive panic)。
+    #[test]
+    fn after_reentrant_panic_next_call_works() {
+        with_isolated_home(|_home| {
+            // 触发 reentrant panic
+            let panic_result = std::panic::catch_unwind(|| {
+                let _ = with_config_write(|_cfg| {
+                    let _ = with_config_write(|_| Ok(ConfigMutation::Unchanged(())));
+                    Ok(ConfigMutation::Unchanged(()))
+                });
+            });
+            assert!(panic_result.is_err(), "套调必须触发 panic");
+            // 下一次 with_config_write 应能正常返(RAII guard 复位 flag)
+            let result = with_config_write(|_cfg| Ok::<_, String>(ConfigMutation::Unchanged(42)));
+            assert_eq!(
+                result.unwrap(),
+                42,
+                "RAII guard 失效:reentrant panic 后 thread-local flag 未复位"
             );
         });
     }
