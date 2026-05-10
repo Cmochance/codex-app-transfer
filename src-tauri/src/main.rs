@@ -47,48 +47,12 @@ fn main() {
             });
         })
         .setup(|app| {
-            // **启动 codex 配置就绪**(2026-05-10 修):原版用 `let _ =` 吞 restore
-            // 错误 + spawn async auto_apply 也吞错误 → 任何 timing race / IO / panic
-            // 都让 codex 配置永久 strand 在 restore 后的"被清空"状态(snapshot 还原到
-            // chatgpt OAuth),用户切的 active provider 没生效却毫无报错提示。
-            // 现在改成 sync block_on + tracing::error! 让失败可诊断(违反 "no silent
-            // destructive fallback" 用户硬性规则)。startup 阻塞 ~100-500ms 在 GUI
-            // 应用里完全可接受,换来"启动完成 = 配置就绪"的强保证。
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
-
-            // ① restore: 还原上次 apply 留下的"我们写的字段"到 snapshot 原始状态。
-            // 这是设计意图明确的一步 — 防御 force-kill / crash 没正常 RunEvent::Exit
-            // 时残留的本应用配置污染下次 snapshot
-            let restore_result = handlers::desktop::restore_codex_if_enabled("startup");
-            if restore_result.get("success").and_then(|v| v.as_bool()) == Some(false) {
-                tracing::error!(
-                    result = %restore_result,
-                    "startup restore_codex_state 失败"
-                );
-            }
-
-            // ② auto_apply: 把 active provider 配置写进 codex(snapshot 原始状态 +
-            // 写 base_url + auth)。block_on 而不是 spawn,确保 startup 完成时配置就绪
-            let apply_result = tauri::async_runtime::block_on(
-                handlers::desktop::auto_apply_on_startup_if_enabled(startup_proxy_manager),
-            );
-            let applied = apply_result
-                .get("applied")
-                .and_then(|v| v.as_bool())
-                == Some(true);
-            if !applied {
-                let message = apply_result
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("(no message)");
-                tracing::error!(
-                    result = %apply_result,
-                    message,
-                    "startup auto_apply 失败 — codex 配置未写入,Codex.app 可能 fallback 到 \
-                     ChatGPT OAuth 默认 endpoint(用户切的 active provider 不会生效)。\
-                     前端 dashboard health check 应反映 needsApply"
-                );
-            }
+            let _ = handlers::desktop::restore_codex_if_enabled("startup");
+            tauri::async_runtime::spawn(async move {
+                let _ = handlers::desktop::auto_apply_on_startup_if_enabled(startup_proxy_manager)
+                    .await;
+            });
 
             let menu = build_tray_menu(app)?;
             let _ = TrayIconBuilder::with_id("main")
@@ -153,16 +117,7 @@ fn main() {
         if matches!(event, RunEvent::Exit) {
             let manager = app_handle.state::<Arc<ProxyManager>>();
             manager.stop_silent();
-            // exit restore 失败也要可见(下次启动会再 restore + apply 一次纠正,但中间
-            // 用户如果直接拉 Codex.app 会看到污染配置)
-            let exit_result = handlers::desktop::restore_codex_if_enabled("exit");
-            if exit_result.get("success").and_then(|v| v.as_bool()) == Some(false) {
-                tracing::error!(
-                    result = %exit_result,
-                    "RunEvent::Exit restore_codex_state 失败 — codex 配置可能残留本应用 \
-                     openai_base_url / OPENAI_API_KEY"
-                );
-            }
+            let _ = handlers::desktop::restore_codex_if_enabled("exit");
         }
     });
 }
