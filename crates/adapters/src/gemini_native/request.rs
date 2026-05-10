@@ -542,6 +542,29 @@ pub fn chat_normalized_to_gemini_request(
         .and_then(|v| v.as_array())
         .cloned();
 
+    // **Gemini wire 约束**(2026-05-10 实测 400):function_declarations + responseMimeType
+    // 不能共存,Gemini 返 "Function calling with a response mime type:
+    // 'application/json' is unsupported"。Codex.app 同时发 tools(function calling)+
+    // text.format=json_schema 是常见(让 LLM 在工具调用时也强制 JSON 输出),但 Gemini
+    // 不支持 — drop response_mime_type/response_schema 让 tools 优先(Codex 的 tool
+    // 调用是核心功能,无法 drop;json_schema output 通常是 tool args 内部约束,丢失影响小)。
+    let has_function_decls = tools.as_ref().is_some_and(|t| {
+        t.iter().any(|tool| tool.function_declarations.is_some())
+    });
+    let mut generation_config = generation_config;
+    if has_function_decls {
+        if let Some(gc) = generation_config.as_mut() {
+            if gc.response_mime_type.is_some() || gc.response_schema.is_some() {
+                tracing::warn!(
+                    "gemini_native: dropping responseMimeType/responseSchema because functionDeclarations \
+                     is present (Gemini does not support both — function calling takes priority)"
+                );
+                gc.response_mime_type = None;
+                gc.response_schema = None;
+            }
+        }
+    }
+
     let mut request = RequestBody {
         contents,
         system_instruction,
@@ -1031,6 +1054,35 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                     if matches!(item, Value::String(s) if s.is_empty()) {
                         *item = Value::Null;
                     }
+                }
+            }
+            // **JSON Schema array type → Gemini single type + nullable**
+            // (2026-05-10 实测 400):JSON Schema 允许 `"type": ["string", "null"]`
+            // 表示 nullable string,但 Gemini protobuf schema 要求 type 是单 string,
+            // 数组形态会触发 "Proto field is not repeating, cannot start list"。
+            // Codex.app 的 text.format.json_schema 经常出这种 union type。
+            // 转换:取第一个 non-null type + 若有 "null" 加 nullable=true。
+            if let Some(Value::Array(types)) = obj.get("type").cloned().as_ref() {
+                let mut has_null = false;
+                let mut non_null_type: Option<String> = None;
+                for t in types {
+                    if let Some(s) = t.as_str() {
+                        if s == "null" {
+                            has_null = true;
+                        } else if non_null_type.is_none() {
+                            non_null_type = Some(s.to_owned());
+                        }
+                    }
+                }
+                if let Some(t) = non_null_type {
+                    obj.insert("type".into(), Value::String(t));
+                    if has_null {
+                        obj.insert("nullable".into(), Value::Bool(true));
+                    }
+                } else if has_null {
+                    // 全是 ["null"] — 极罕见,留空 type + nullable
+                    obj.remove("type");
+                    obj.insert("nullable".into(), Value::Bool(true));
                 }
             }
             // anyOf 处理(H1 + H2 修复):
@@ -1584,6 +1636,60 @@ mod tests {
         assert_eq!(arr[0], "a");
         assert!(arr[1].is_null(), "空字符串必须转 null");
         assert_eq!(arr[2], "b");
+    }
+
+    #[test]
+    fn schema_sanitize_array_type_becomes_single_type_plus_nullable() {
+        // 实测 2026-05-10:Codex.app text.format.json_schema 含 `"type":["string","null"]`
+        // → Gemini 拒 "Proto field is not repeating, cannot start list"。修复后:
+        // → `{"type":"string","nullable":true}`
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "value": {"type": ["string", "null"]},
+                "count": {"type": ["number", "null"], "description": "optional count"}
+            }
+        });
+        let cleaned = sanitize_schema(schema);
+        assert_eq!(cleaned["properties"]["value"]["type"], "string");
+        assert_eq!(cleaned["properties"]["value"]["nullable"], true);
+        assert_eq!(cleaned["properties"]["count"]["type"], "number");
+        assert_eq!(cleaned["properties"]["count"]["nullable"], true);
+        // 描述等其他字段保留
+        assert_eq!(cleaned["properties"]["count"]["description"], "optional count");
+        // 非 array type 不动
+        assert_eq!(cleaned["properties"]["name"]["type"], "string");
+        assert!(cleaned["properties"]["name"].get("nullable").is_none());
+    }
+
+    #[test]
+    fn function_decls_drop_response_mime_type_and_schema() {
+        // 实测 2026-05-10:Gemini "Function calling with a response mime type:
+        // 'application/json' is unsupported" — function declarations 跟
+        // responseMimeType/responseSchema 不能共存。修复后:tools 优先,drop json schema。
+        let body = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+            "response_format": {"type":"json_schema","json_schema":{"schema":{"type":"object"}}}
+        });
+        let req = chat_normalized_to_gemini_request(&body, &dummy_provider()).unwrap();
+        // function declarations 应保留
+        assert!(
+            req.tools.as_ref().unwrap().iter().any(|t| t.function_declarations.is_some()),
+            "functionDeclarations 必须保留"
+        );
+        // generation_config 不应含 responseMimeType / responseSchema
+        let gc = req.generation_config;
+        assert!(
+            gc.as_ref().is_none_or(|g| g.response_mime_type.is_none()),
+            "tools 存在时必须 drop responseMimeType,实际 gc:{gc:?}"
+        );
+        assert!(
+            gc.as_ref().is_none_or(|g| g.response_schema.is_none()),
+            "tools 存在时必须 drop responseSchema,实际 gc:{gc:?}"
+        );
     }
 
     #[test]
