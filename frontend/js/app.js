@@ -1574,8 +1574,29 @@
     return false;
   }
 
+  // 把 backend errors[] (object 数组,含 code/host/statusCode)按当前 locale i18n 翻译。
+  // 历史兼容:string 元素直接显示。未识别的 code → 走 unknown / unknown_with_status
+  // fallback,把 statusCode 拼进文案("上游返回错误 (HTTP 502)" / "Upstream error (HTTP 502)")。
+  function translateUpstreamError(err) {
+    if (typeof err === "string") return err;
+    if (!err || typeof err !== "object") return t("models.upstreamError.unknown");
+    const code = err.code || "unknown";
+    let translated = t(`models.upstreamError.${code}`);
+    // 没命中(返了 key 自身)→ fallback 通用文案
+    if (translated === `models.upstreamError.${code}`) {
+      translated = t("models.upstreamError.unknown");
+    }
+    if (err.statusCode) {
+      translated = translated.replace("{status}", String(err.statusCode));
+    }
+    return err.host ? `[${err.host}] ${translated}` : translated;
+  }
+
   function formatModelFetchError(error) {
-    const reason = error?.message || t("toast.requestFailed");
+    const errs = (error && error.errors) || [];
+    // 优先用第一个结构化 error(最相关) — 已 i18n;退化路径用 error.message(网络层异常)
+    const detail = errs.length > 0 ? translateUpstreamError(errs[0]) : (error && error.message);
+    const reason = detail || t("toast.requestFailed");
     return `${t("models.fetchFailedManual")}: ${reason}`;
   }
 

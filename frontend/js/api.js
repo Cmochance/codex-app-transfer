@@ -12,14 +12,13 @@
     const resp = await fetch(BASE + path, opts);
     const data = await resp.json();
     if (!resp.ok || data.success === false) {
-      // 拼具体 errors[] 信息进 message,防 backend 给的"HTTP 400 — API key not valid"
-      // 等关键诊断被通用 message "cannot auto-fetch model list" 覆盖丢失。
-      // 完整 errors 数组留给上层 catch 拿 error.errors 自己 render。
+      // baseMessage 直接用 backend message(可能是 i18n key 如 "models.fetchFailed",
+      // 上层负责翻译;也可能是 raw string)。**不在这里 inline errors[0]**:
+      // backend 现在返结构化 errors[] (object 数组,含 code/host/statusCode),
+      // string 拼接会变 "[object Object]"。让上层(如 formatModelFetchError)
+      // 按 i18n 翻译每条 error 后再拼。
       const baseMessage = data.message || `Request failed: ${method} ${path}`;
-      const detailedMessage = (Array.isArray(data.errors) && data.errors.length > 0)
-        ? `${baseMessage} — ${data.errors[0]}`  // 首个 endpoint 错误一般最相关
-        : baseMessage;
-      const error = new Error(detailedMessage);
+      const error = new Error(baseMessage);
       error.errors = Array.isArray(data.errors) ? data.errors : [];
       error.responseData = data;
       throw error;

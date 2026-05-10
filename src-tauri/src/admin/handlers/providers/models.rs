@@ -12,59 +12,59 @@ use super::super::common::err;
 use super::test::{build_provider_test_url, provider_test_error_label, provider_test_headers};
 use super::{clean_base_url, normalize_provider_api_format, provider_index, replace_path_suffix};
 
-/// 把上游 raw 错误(英文 + 长 URL + stack trace)翻译成中文易读文案。
-///
-/// **设计**(2026-05-10 用户决策):
-/// - 不透传上游 raw 英文 message(用户体验差,且可能含 OAuth doc 链接 / 长 stack)
-/// - 按 HTTP status code + 已知 reason 关键词识别常见错误,返中文文案
-/// - unknown 错误走 fallback "上游返回错误 (HTTP {code})",至少告诉用户 HTTP 码
+/// 按 HTTP status + 上游 raw 错误中的关键词识别成结构化 reason code,
+/// 前端拿 code 走 i18n 翻译(2026-05-10 用户决策:中英两版按当前 locale 切换,
+/// backend 不 hardcode 任何语言文案)。
 ///
 /// 已知 pattern 来源:
 /// - Gemini: UNAUTHENTICATED / API_KEY_INVALID / RESOURCE_EXHAUSTED
 /// - OpenAI: invalid_api_key / insufficient_quota / model_not_found
 /// - 通用: timeout / rate_limit / not_found
-fn humanize_upstream_error(status: u16, raw: Option<&str>) -> String {
+fn classify_upstream_error_code(status: u16, raw: Option<&str>) -> &'static str {
     let lower = raw.unwrap_or("").to_ascii_lowercase();
     match status {
         400 => {
             if lower.contains("api key not valid") || lower.contains("api_key_invalid") {
-                "API key 无效,请检查 key 格式或重新生成".into()
+                "api_key_invalid"
             } else if lower.contains("invalid_argument") || lower.contains("malformed") {
-                "请求参数错误 (HTTP 400),请检查 baseUrl 是否对应 Codex 兼容端点".into()
+                "invalid_argument"
             } else {
-                "请求格式错误 (HTTP 400)".into()
+                "bad_request"
             }
         }
         401 => {
-            if lower.contains("oauth") || lower.contains("invalid authentication") || lower.contains("expected access token") {
-                "API key 缺失或无效,请填写正确的 API key 后重试".into()
+            if lower.contains("oauth")
+                || lower.contains("invalid authentication")
+                || lower.contains("expected access token")
+            {
+                "unauthenticated_oauth"
             } else if lower.contains("expired") {
-                "API key 已过期,请重新生成".into()
+                "unauthenticated_expired"
             } else {
-                "鉴权失败 (HTTP 401),请检查 API key".into()
+                "unauthenticated"
             }
         }
         403 => {
             if lower.contains("permission_denied") || lower.contains("permission denied") {
-                "API key 无权访问此功能 (HTTP 403),请确认账号已开通对应 API".into()
+                "permission_denied"
             } else if lower.contains("billing") || lower.contains("payment") {
-                "未启用计费,请到上游控制台启用 billing (HTTP 403)".into()
+                "billing_required"
             } else {
-                "上游拒绝访问 (HTTP 403)".into()
+                "forbidden"
             }
         }
-        404 => "端点不存在 (HTTP 404),请检查 baseUrl 是否填写正确".into(),
-        405 => "端点不支持此方法 (HTTP 405),baseUrl 可能填错".into(),
-        408 | 504 => "上游响应超时,稍后重试".into(),
+        404 => "not_found",
+        405 => "method_not_allowed",
+        408 | 504 => "timeout",
         429 => {
             if lower.contains("quota") || lower.contains("resource_exhausted") {
-                "上游配额已用完 (HTTP 429),请检查计费 / 等待配额刷新".into()
+                "quota_exceeded"
             } else {
-                "请求过于频繁 (HTTP 429),稍后重试".into()
+                "rate_limited"
             }
         }
-        500..=599 => format!("上游服务异常 (HTTP {status}),稍后重试"),
-        _ => format!("上游返回错误 (HTTP {status})"),
+        500..=599 => "server_error",
+        _ => "unknown",
     }
 }
 
@@ -255,7 +255,13 @@ fn suggest_model_mappings(model_ids: &[String]) -> Value {
 async fn fetch_provider_models_impl(provider: &Value) -> Value {
     let endpoints = model_endpoint_candidates(provider);
     if endpoints.is_empty() {
-        return json!({"success": false, "message": "API 地址无效", "models": [], "suggested": {}});
+        return json!({
+            "success": false,
+            "message": "models.fetchFailed",
+            "models": [],
+            "suggested": {},
+            "errors": [{"code": "invalid_base_url"}],
+        });
     }
 
     let headers = provider_test_headers(provider, false);
@@ -267,44 +273,46 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
     {
         Ok(client) => client,
         Err(error) => {
+            // client builder 失败极罕见(系统资源耗尽等);返结构化 code 给前端 i18n
+            let _ = error;
             return json!({
                 "success": false,
-                "message": "cannot auto-fetch model list",
+                "message": "models.fetchFailed",
                 "models": [],
                 "suggested": {},
-                "errors": [format!("client: {}", provider_test_error_label(&error))],
+                "errors": [{"code": "client_init_failure"}],
             });
         }
     };
 
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<Value> = Vec::new();
     for endpoint in endpoints {
+        let host = reqwest::Url::parse(&endpoint)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+            .unwrap_or_else(|| endpoint.clone());
         let response = match client.get(&endpoint).headers(headers.clone()).send().await {
             Ok(response) => response,
             Err(error) => {
-                // 不透传英文 reqwest error label,翻译成中文
-                let host = reqwest::Url::parse(&endpoint)
-                    .ok()
-                    .and_then(|u| u.host_str().map(String::from))
-                    .unwrap_or_else(|| endpoint.clone());
-                let label = match provider_test_error_label(&error) {
-                    "Timeout" => "请求超时",
-                    "ConnectError" => "无法连接",
-                    "RedirectError" => "重定向异常",
-                    "DecodeError" => "响应解码失败",
-                    "BodyError" => "响应体读取失败",
-                    "RequestError" => "请求构造失败",
-                    _ => "网络错误",
+                // 不透传英文 reqwest error label,返结构化 code 给前端 i18n 翻
+                let code = match provider_test_error_label(&error) {
+                    "Timeout" => "network_timeout",
+                    "ConnectError" => "network_connect",
+                    "RedirectError" => "network_redirect",
+                    "DecodeError" => "network_decode",
+                    "BodyError" => "network_body",
+                    "RequestError" => "network_request",
+                    _ => "network_other",
                 };
-                errors.push(format!("[{host}] {label}"));
+                errors.push(json!({"host": host, "code": code}));
                 continue;
             }
         };
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            // 读 body 提取 error.message(OpenAI / Gemini / Anthropic 统一用
-            // `{"error":{"message":"..."}}` shape),**不透传上游英文 raw** —
-            // 用 `humanize_upstream_error` 翻成中文易读文案 + 仅保留 endpoint host。
+            // 读 body 提取 error.message 仅用于 reason 关键词识别(OpenAI/Gemini/
+            // Anthropic 统一 `{"error":{"message":"..."}}` shape),**不透传 raw**
+            // 给 UI;返结构化 code,前端按当前 locale 翻译。
             let body = response.text().await.unwrap_or_default();
             let raw = serde_json::from_str::<Value>(&body).ok().and_then(|v| {
                 v.get("error")
@@ -312,23 +320,14 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
                     .and_then(|m| m.as_str())
                     .map(String::from)
             });
-            let humanized = humanize_upstream_error(status, raw.as_deref());
-            // 只显示 endpoint host(去掉长 URL path),用户能看出哪个上游错就够了
-            let host = reqwest::Url::parse(&endpoint)
-                .ok()
-                .and_then(|u| u.host_str().map(String::from))
-                .unwrap_or_else(|| endpoint.clone());
-            errors.push(format!("[{host}] {humanized}"));
+            let code = classify_upstream_error_code(status, raw.as_deref());
+            errors.push(json!({"host": host, "code": code, "statusCode": status}));
             continue;
         }
         let payload = match response.json::<Value>().await {
             Ok(payload) => payload,
             Err(_) => {
-                let host = reqwest::Url::parse(&endpoint)
-                    .ok()
-                    .and_then(|u| u.host_str().map(String::from))
-                    .unwrap_or_else(|| endpoint.clone());
-                errors.push(format!("[{host}] 上游返回非 JSON 响应"));
+                errors.push(json!({"host": host, "code": "non_json_response"}));
                 continue;
             }
         };
@@ -341,17 +340,14 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
                 "suggested": suggest_model_mappings(&model_ids),
             });
         }
-        let host = reqwest::Url::parse(&endpoint)
-            .ok()
-            .and_then(|u| u.host_str().map(String::from))
-            .unwrap_or_else(|| endpoint.clone());
-        errors.push(format!("[{host}] 响应中未找到模型列表"));
+        errors.push(json!({"host": host, "code": "models_not_found"}));
     }
 
     let start = errors.len().saturating_sub(5);
+    // message 现在是 i18n key,前端拿 key 翻译(防 hardcode 中英任一语言)
     json!({
         "success": false,
-        "message": "无法自动获取模型列表",
+        "message": "models.fetchFailed",
         "models": [],
         "suggested": {},
         "errors": errors[start..].to_vec(),
