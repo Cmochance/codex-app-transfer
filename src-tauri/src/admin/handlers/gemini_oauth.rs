@@ -34,7 +34,7 @@ use codex_app_transfer_gemini_oauth::{
     TokenStore,
 };
 use serde_json::{json, Value};
-use tokio::sync::{watch, Notify};
+use tokio::sync::watch;
 
 use super::super::registry_io::{with_config_write, ConfigMutation};
 use super::super::state::AdminState;
@@ -102,8 +102,10 @@ fn lock_cancel_slot_with_poison_flag() -> (
 }
 
 /// `cancel_in_flight_login` 的结构化结果(H1 修):caller(handler / app exit /
-/// 新 login 抢占)能区分三种状态:
-/// - `cancelled=true`:slot 真有 in-flight,已发 cancel signal
+/// 新 login 抢占)能区分三种状态 + 拿到被取消的 epoch 用于 [`wait_for_login_
+/// epoch_complete`] 等待**特定** task 退出(C1 chatgpt-codex P1 修):
+/// - `cancelled=true` + `cancelled_epoch=Some(N)`:slot 真有 in-flight,已发
+///   cancel signal,N 是被取消的 login 的 epoch
 /// - `cancelled=false, slot_recovered=false`:slot 当前为空,没 in-flight
 /// - `cancelled=false, slot_recovered=true`:lock 过 poison recovery,本身没
 ///   in-flight,但说明之前有过 panic — operator 应去看 logs
@@ -111,52 +113,83 @@ fn lock_cancel_slot_with_poison_flag() -> (
 pub struct CancelOutcome {
     pub cancelled: bool,
     pub slot_recovered: bool,
+    pub cancelled_epoch: Option<u64>,
 }
 
-/// 取出并触发当前 in-flight login 的 cancel signal(若有)。idempotent 安全。
-/// 返 [`CancelOutcome`] 让 caller 区分 cancel / no-in-flight / poison-recovery
-/// 三种状态(H1 修)。
+/// **进程级 last-completed-epoch 通道**(C1 chatgpt-codex P1+P2 修):
+/// LoginDoneGuard::Drop 把 self.epoch 通过 watch::Sender 发出,RunEvent::Exit
+/// 钩子持 Receiver clone 用 `wait_for_login_epoch_complete(target)` 等
+/// `*rx.borrow() >= target` 触发返回。
 ///
-/// 调用场景:① DELETE /login/cancel 用户主动按"取消";② app RunEvent::Exit
-/// 钩子防 5min 后 token persist 进 disk(user 已经退出 app);③ 新 login 启
-/// 动前抢占旧 login(防 user 连点 2 次"登录"按钮 → 2 个 loopback server 抢
-/// port + 2 个 OAuth flow 互相覆盖)
-/// 进程级 Notify — login_handler 走任意 return path(成功 / 错 / cancel /
-/// panic)时触发,让 RunEvent::Exit 钩子能 await 等 login task 真退完才让
-/// Tauri tear-down runtime(C1 修)。原版 fire-and-forget 让 OAuth task 在
-/// runtime drop 前可能恰好走到 persist_token 写出 partial token。
-pub fn login_done_notify() -> &'static Arc<Notify> {
-    static N: OnceLock<Arc<Notify>> = OnceLock::new();
-    N.get_or_init(|| Arc::new(Notify::new()))
+/// 跟原 `Notify::notify_waiters()` 设计的区别:
+/// - **P2 修(persist completion)**:notify_waiters 只唤醒**当前** awaiting
+///   tasks,如果 cancel 在 awaiter 起来前就触发 → 信号丢失,Exit 钩子等满 2s
+///   timeout。watch sticky:Sender::send 之后值持久化,Receiver `borrow()`
+///   读到的就是最新值,不会因 await 时机错过
+/// - **P1 修(specific epoch)**:`u64` 是**已完成的最高 epoch**。Exit 钩子
+///   waits for `*rx.borrow() >= cancelled_epoch`,不会被另一个 newer login
+///   完成的事件误唤醒(preemption 场景:旧 login B 抢占旧 A 后,A 完成
+///   不会让 B 的 wait 提早返)
+fn login_done_channel() -> &'static (watch::Sender<u64>, watch::Receiver<u64>) {
+    static C: OnceLock<(watch::Sender<u64>, watch::Receiver<u64>)> = OnceLock::new();
+    C.get_or_init(|| watch::channel(0))
 }
 
-/// RAII 守卫:Drop 时通知 [`login_done_notify`] 所有 waiter。覆盖 login_handler
-/// 任意 return / panic / future-drop 路径,无需在每个 return 前手写 notify。
-struct LoginDoneGuard;
+/// 等待 epoch=N 的 login task 真退完。Exit 钩子用,timeout 兜底由 caller。
+pub async fn wait_for_login_epoch_complete(target_epoch: u64) {
+    let mut rx = login_done_channel().1.clone();
+    loop {
+        if *rx.borrow() >= target_epoch {
+            return;
+        }
+        // changed() 等下次 send,Err 时 sender 已 drop(进程退出),退化 pending
+        // 让上层 timeout 兜底。生产路径下 sender 是 'static,几乎不会 Err
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// RAII 守卫:Drop 时把 self.epoch 写进 [`login_done_channel`]。覆盖 login_handler
+/// 任意 return / panic / future-drop 路径,无需在每个 return 前手写 send。
+/// 多次 drop 同一 epoch 等价(send_if_modified 只在更高 epoch 时触发 changed),
+/// 防 stale 旧 epoch 倒退覆盖 newer 完成状态。
+struct LoginDoneGuard {
+    epoch: u64,
+}
 impl Drop for LoginDoneGuard {
     fn drop(&mut self) {
-        // notify_waiters 唤醒**所有**当前 await notified() 的 task。如果没有
-        // waiter,no-op 不留 stale permit(对齐 Notify 文档)。RunEvent::Exit
-        // 才会 await,正常路径 no-op 零开销
-        login_done_notify().notify_waiters();
+        let (tx, _) = login_done_channel();
+        // send_if_modified 只在 cur < self.epoch 时改值 + 触发 changed,确保
+        // higher epoch 不会被 earlier 完成的旧 epoch 倒退覆盖
+        let my = self.epoch;
+        let _ = tx.send_if_modified(|cur| {
+            if my > *cur {
+                *cur = my;
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
 pub fn cancel_in_flight_login() -> CancelOutcome {
     let (mut guard, slot_recovered) = lock_cancel_slot_with_poison_flag();
-    let cancelled = if let Some((_epoch, sender)) = guard.take() {
+    let (cancelled, cancelled_epoch) = if let Some((epoch, sender)) = guard.take() {
         // watch::send(true) 把当前 value 设 true 通知所有 clone 的 receiver。
         // send 失败(所有 receiver 已 drop)等价于 flow 已结束,无 op。
         // **C2 修**:此 send 触发的 cancel 不仅 OAuth flow 收到,login_handler
         // 持的 receiver clone 也会让 bootstrap/persist/sync 阶段 select! 退出
         let _ = sender.send(true);
-        true
+        (true, Some(epoch))
     } else {
-        false
+        (false, None)
     };
     CancelOutcome {
         cancelled,
         slot_recovered,
+        cancelled_epoch,
     }
 }
 
@@ -292,11 +325,17 @@ async fn status_handler() -> impl IntoResponse {
 /// Request body:`{}`(无参数)
 /// Response:成功返 200 + 当前 status 形态;失败返 4xx/5xx + error message
 async fn login_handler() -> impl IntoResponse {
-    // **C1 修**:RAII 守卫,fn 走任意 return / panic / future-drop 路径都
-    // 通知 login_done_notify → RunEvent::Exit 钩子 await 到信号才让 Tauri
-    // tear-down runtime,防 OAuth task 在 persist_token 中段被砍写出 partial
-    // token。下面 a738a04 commit 会把这里改 epoch-tracked 版本
-    let _done_guard = LoginDoneGuard;
+    // **epoch token** 创建在最前 — 既给 cancel slot 用(抢占语义 race fix),
+    // 也给 LoginDoneGuard 用(C1 chatgpt-codex P1+P2:Exit 等具体 epoch 完成
+    // 而非 generic notify。preemption 场景下 newer epoch 完成不会让 wait_for_
+    // login_epoch_complete(older) 提早返,避免 race teardown 切断 newer task)
+    let my_epoch = next_epoch();
+    // **C1 + chatgpt-codex P1+P2 修**:把 my_epoch 写进 login_done_channel →
+    // RunEvent::Exit 钩子 await 到 my_epoch 才让 Tauri tear-down runtime,防
+    // OAuth task 在 persist_token 中段被砍写出 partial token。watch::channel
+    // sticky + specific epoch wait 让快速 cancel 不卡 2s timeout + preemption
+    // 场景下 newer epoch wait 不被 older epoch 完成误唤醒
+    let _done_guard = LoginDoneGuard { epoch: my_epoch };
     // 拿进程级共享 client(M1 修):跨多次 login / refresh 复用 connection
     // pool + DNS cache + TLS session,避免每次 login 重建 connector
     let http = match shared_oauth_http_client() {
@@ -323,10 +362,9 @@ async fn login_handler() -> impl IntoResponse {
     // 释放 loopback port,新 flow 接管。防 user 连点 2 次"登录"产生 2 个并行
     // OAuth flow / 2 个 loopback server / 2 个 callback URL race。
     //
-    // **epoch token**(reviewer high #1 修):本 login 持自己的 epoch,post-flow
-    // 清理时只在 slot 当前 epoch 跟自己匹配时才 take,防"已被新 login 抢占
-    // 后再 take 把新 login 的 sender 误清掉"
-    let my_epoch = next_epoch();
+    // **epoch token**(reviewer high #1 修):本 login 持 my_epoch(line ~280
+    // 已 next_epoch),post-flow 清理时只在 slot 当前 epoch 跟自己匹配时才
+    // take,防"已被新 login 抢占后再 take 把新 login 的 sender 误清掉"
     let (cancel_tx, mut cancel_rx) = watch::channel::<bool>(false);
     {
         let mut slot = lock_cancel_slot();
@@ -623,33 +661,88 @@ mod tests {
     use crate::admin::registry_io::with_config_write;
     use serde_json::json;
 
-    /// **C1 修核心 contract**:LoginDoneGuard::Drop 必须 notify_waiters,让
-    /// 等 login_done_notify().notified() 的 RunEvent::Exit 钩子立即唤醒。
-    /// 防 future 把 notify 调用挪到 explicit code path 后忘走某些 return /
-    /// panic 分支(RAII 守卫保证全路径覆盖)。
+    /// **C1 修核心 contract**:LoginDoneGuard::Drop 必须把 epoch 写进
+    /// login_done_channel,让 wait_for_login_epoch_complete 立即返。
     #[tokio::test]
-    async fn login_done_guard_notifies_waiters_on_drop() {
-        // spawn 一个 waiter task 等 notify
-        let notified = tokio::spawn(async {
-            login_done_notify().notified().await;
-            "got_notify"
+    async fn login_done_guard_writes_epoch_to_channel() {
+        // 拿 unique 大 epoch 防跟其他 test 串(channel 是进程级 sticky)
+        let target = next_epoch() + 100_000;
+        let waiter = tokio::spawn(async move {
+            wait_for_login_epoch_complete(target).await;
+            "completed"
         });
-        // 给 spawn 一点时间真进入 await
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // 创建 guard 然后立即 drop
         {
-            let _guard = LoginDoneGuard;
+            let _guard = LoginDoneGuard { epoch: target };
         }
 
-        // waiter 应在 100ms 内收到 notify(实际几乎瞬时)
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), waiter).await;
         match result {
-            Ok(Ok("got_notify")) => {}
+            Ok(Ok("completed")) => {}
             Ok(Ok(other)) => panic!("waiter 收到非预期值: {other}"),
             Ok(Err(e)) => panic!("waiter task panicked: {e:?}"),
-            Err(_) => panic!("LoginDoneGuard::drop 没触发 notify_waiters — RAII 守卫失效"),
+            Err(_) => panic!("LoginDoneGuard::drop 没把 epoch 写进 channel"),
         }
+    }
+
+    /// **chatgpt-codex P2 修**(persist completion notification):guard.drop
+    /// 在 await 之前触发,wait_for_login_epoch_complete 仍能立即看到 sticky
+    /// 值返,**不**等 timeout。原 Notify::notify_waiters 设计这种场景信号丢失。
+    #[tokio::test]
+    async fn wait_returns_immediately_when_drop_happens_before_await() {
+        let target = next_epoch() + 200_000;
+        // 先 drop guard(模拟 cancel signal 在 Exit 钩子 await 之前到达)
+        {
+            let _g = LoginDoneGuard { epoch: target };
+        }
+        // 然后才 await — 必须立即返(读 sticky 值)
+        let started = std::time::Instant::now();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            wait_for_login_epoch_complete(target),
+        )
+        .await
+        .expect("await 必须在 200ms 内返,实际超时表示 sticky 值没读到 → P2 修没生效");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "early-drop 路径必须几乎瞬时返,实际 {:?}",
+            elapsed
+        );
+    }
+
+    /// **chatgpt-codex P1 修**(specific epoch):preemption 场景下,wait_for_
+    /// login_epoch_complete(target=B) 不会被 newer epoch C 完成事件提早返。
+    /// 只有 epoch >= target 时才返。
+    #[tokio::test]
+    async fn wait_for_specific_epoch_not_satisfied_by_lower_epoch() {
+        let target_high = next_epoch() + 300_000;
+        let lower = target_high - 1;
+        // 先 drop 一个 lower epoch guard — 不应满足 wait(target_high)
+        {
+            let _g = LoginDoneGuard { epoch: lower };
+        }
+        // wait 应该 timeout(因为 lower < target_high,sticky 值不到 target)
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            wait_for_login_epoch_complete(target_high),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "lower epoch 完成不该满足 higher target,但 wait 提早返了 → P1 修没生效"
+        );
+        // 再 drop target_high guard — 现在应立即返
+        {
+            let _g = LoginDoneGuard { epoch: target_high };
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            wait_for_login_epoch_complete(target_high),
+        )
+        .await
+        .expect("matching epoch drop 后 wait 应立即返");
     }
 
     /// **核心 preemption race**:login B 抢占 login A 的 slot 后,A 的 post-flow
