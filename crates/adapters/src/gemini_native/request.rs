@@ -552,13 +552,13 @@ pub fn chat_normalized_to_gemini_request(
     let (mut system_instruction, body_messages) = split_system_instruction(messages);
     let contents = convert_messages_to_contents(&body_messages)?;
 
-    let tools = body_obj
+    let mut tools = body_obj
         .get("tools")
         .and_then(|v| v.as_array())
         .map(|arr| convert_tools(arr))
         .filter(|v: &Vec<Tool>| !v.is_empty());
 
-    let tool_config = body_obj.get("tool_choice").and_then(convert_tool_choice);
+    let mut tool_config = body_obj.get("tool_choice").and_then(convert_tool_choice);
 
     let generation_config = build_generation_config(body_obj, model);
 
@@ -611,6 +611,62 @@ pub fn chat_normalized_to_gemini_request(
                 gc.response_mime_type = None;
                 gc.response_schema = None;
             }
+        }
+    }
+
+    // **Gemini wire 约束** (2026-05-10 实测 400):googleSearch (built-in tool) +
+    // functionDeclarations (Codex exec_command/Read/Write 等)Gemini 拒绝共存,
+    // 返 "Built-in tools ({google_search}) and Function Calling cannot be combined
+    // in the same request."
+    //
+    // 处理(用户决策 2026-05-10:B 方案):
+    // - **Gemini 3+**:加 `toolConfig.includeServerSideToolInvocations=true`
+    //   让两者共存(Gemini 3+ 支持 server-side tool 跟 function declaration 共存)
+    // - **Gemini 2.x / 老版本**:wire 必须 drop googleSearch(否则 400),但**软约束保留**
+    //   语义 — 拼 system_instruction 提示 model "用户期望联网搜索但当前 model 不支持
+    //   两者共存,需联网信息时告知用户限制",function calling 保留(Codex 核心)
+    let has_google_search = tools
+        .as_ref()
+        .is_some_and(|t| t.iter().any(|tool| tool.google_search.is_some()));
+    if has_function_decls && has_google_search {
+        if is_gemini_3_or_newer(model) {
+            // Gemini 3+:toolConfig.includeServerSideToolInvocations=true 共存
+            let tc = tool_config.get_or_insert_with(|| ToolConfig {
+                function_calling_config: None,
+                include_server_side_tool_invocations: None,
+                retrieval_config: None,
+            });
+            tc.include_server_side_tool_invocations = Some(true);
+            tracing::info!(
+                "gemini_native: Gemini 3+ enabled toolConfig.includeServerSideToolInvocations=true \
+                 to allow function declarations + googleSearch coexistence (no destructive drop)"
+            );
+        } else {
+            // Gemini 2.x:wire drop googleSearch + system_instruction 软约束
+            if let Some(tools_vec) = tools.as_mut() {
+                tools_vec.retain(|tool| tool.google_search.is_none());
+                if tools_vec.is_empty() {
+                    tools = None;
+                }
+            }
+            let constraint_text = "Note: The user has enabled the web_search (google_search) \
+                built-in tool, but this Gemini 2.x model does not allow built-in tools and function \
+                declarations to coexist. The web_search tool has been disabled for this request to \
+                preserve function calling. If you need to fetch external information, tell the user \
+                this limitation and ask them to either (a) switch to a Gemini 3+ model which \
+                supports both, or (b) disable function calling tools.";
+            let si = system_instruction.get_or_insert_with(|| SystemInstruction {
+                role: None,
+                parts: Vec::new(),
+            });
+            si.parts.push(Part {
+                text: Some(constraint_text.into()),
+                ..Default::default()
+            });
+            tracing::info!(
+                "gemini_native: Gemini 2.x dropped googleSearch wire (Gemini wire 强制 + functionDecls \
+                 priority) + added system_instruction soft constraint (LiteLLM _resolve_search_tool_conflict pattern)"
+            );
         }
     }
 
@@ -1928,6 +1984,76 @@ mod tests {
         assert!(
             combined.contains("answer") && combined.contains("type"),
             "schema JSON 内容必须 inline 在软约束 text;实际:{combined}"
+        );
+    }
+
+    #[test]
+    fn gemini_3_plus_function_decls_with_google_search_enables_server_side_tool_invocations() {
+        // 实测 2026-05-10:Gemini "Built-in tools ({google_search}) and Function Calling
+        // cannot be combined in the same request" — Gemini 3+ 通过开
+        // toolConfig.includeServerSideToolInvocations=true 让两者共存(无破坏性 drop)。
+        let body = serde_json::json!({
+            "model": "gemini-3.1-pro-preview",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [
+                {"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+                {"type":"web_search"}
+            ]
+        });
+        let req = chat_normalized_to_gemini_request(&body, &dummy_provider()).unwrap();
+        // 两者都保留(function declarations + googleSearch)
+        let tools = req.tools.expect("tools 必须存在");
+        assert!(
+            tools.iter().any(|t| t.function_declarations.is_some()),
+            "Gemini 3+ functionDeclarations 必须保留"
+        );
+        assert!(
+            tools.iter().any(|t| t.google_search.is_some()),
+            "Gemini 3+ googleSearch 必须保留(toolConfig.includeServerSideToolInvocations 让共存)"
+        );
+        // toolConfig.includeServerSideToolInvocations=true
+        let tc = req.tool_config.expect("toolConfig 必须存在");
+        assert_eq!(
+            tc.include_server_side_tool_invocations,
+            Some(true),
+            "Gemini 3+ 必须开 includeServerSideToolInvocations 让 googleSearch + function 共存"
+        );
+    }
+
+    #[test]
+    fn gemini_2_function_decls_with_google_search_drops_search_and_adds_soft_constraint() {
+        // Gemini 2.x 不支持两者共存,wire 必须 drop googleSearch + 软约束 system_instruction
+        // 提示 model "用户期望联网但不可用,需要时告知用户"。Function calling 完全保留。
+        let body = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [
+                {"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+                {"type":"web_search"}
+            ]
+        });
+        let req = chat_normalized_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let tools = req.tools.expect("function declarations 必须保留");
+        // googleSearch 被 drop (Gemini 2.x wire 不允许共存)
+        assert!(
+            !tools.iter().any(|t| t.google_search.is_some()),
+            "Gemini 2.x wire 必须 drop googleSearch(防 400)"
+        );
+        // function declarations 保留
+        assert!(
+            tools.iter().any(|t| t.function_declarations.is_some()),
+            "Gemini 2.x functionDeclarations 必须保留(Codex 核心)"
+        );
+        // system_instruction 含软约束告知 model 限制
+        let si = req.system_instruction.expect("systemInstruction 必须含软约束");
+        let combined: String = si.parts.iter()
+            .filter_map(|p| p.text.as_ref())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("web_search") && combined.contains("disabled"),
+            "软约束必须告诉 model googleSearch 被禁;实际:{combined}"
         );
     }
 
