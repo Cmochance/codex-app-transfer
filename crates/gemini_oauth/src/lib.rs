@@ -30,6 +30,7 @@
 //! Wire-level 实现参考 [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI)
 //! (Go, MIT) 的 `internal/auth/gemini/` 与 `internal/runtime/executor/gemini_cli_executor.go`。
 
+pub mod antigravity;
 pub mod cloud_code;
 pub mod constants;
 pub mod flow;
@@ -37,10 +38,22 @@ pub mod service;
 pub mod token;
 
 pub use cloud_code::{bootstrap_project, ClientMetadata, CloudCodeError};
-pub use constants::{detect_user_agent, X_GOOG_API_CLIENT};
+pub use constants::{
+    antigravity_user_agent_chat, antigravity_user_agent_loadcodeassist, detect_user_agent,
+    OauthProviderConfig, ANTIGRAVITY_PROVIDER, ANTIGRAVITY_USERINFO_ENDPOINT, ANTIGRAVITY_VERSION,
+    ANTIGRAVITY_X_GOOG_API_CLIENT, GEMINI_CLI_PROVIDER, X_GOOG_API_CLIENT,
+};
 pub use flow::{
     build_auth_url, refresh_access_token, run_oauth_flow, run_oauth_flow_with_cancel, FlowError,
     OauthFlowConfig,
 };
-pub use service::{ensure_valid_access_token, persist_token, ServiceError};
+pub use service::{
+    ensure_valid_access_token, ensure_valid_antigravity_token, persist_token, ServiceError,
+};
 pub use token::{OauthToken, TokenError, TokenStore};
+
+// Antigravity provider re-exports(parallel module,跟 gemini-cli 共用 token / FlowError 等)
+pub use antigravity::{
+    antigravity_bootstrap_project, refresh_antigravity_access_token,
+    run_antigravity_oauth_flow_with_cancel, AntigravityClientMetadata,
+};

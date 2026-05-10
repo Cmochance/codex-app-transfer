@@ -643,29 +643,44 @@ async fn build_and_send_upstream(
     plan_body: &Bytes,
     upstream_url: &str,
 ) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
-    // GoogleOauthCloudCode authScheme:provider.api_key 是空,真实 token 在
-    // ~/.codex-app-transfer/gemini-oauth.json,这里 await load + auto refresh 拿
-    // 当前可用 access_token,后面 inject_auth 用它注 Bearer。错误分类逻辑提到
-    // 独立 `classify_oauth_service_error` fn 方便单测覆盖每条 case。
-    let oauth_bearer: Option<String> = if matches!(
-        resolved.auth_scheme,
-        crate::resolver::AuthScheme::GoogleOauthCloudCode
-    ) {
-        let store = codex_app_transfer_gemini_oauth::TokenStore::from_home_env().map_err(|e| {
-            // HOME 不可用 → 环境错(不是 OAuth 状态问题),独立 needs_login=false +
-            // message 明示"check HOME / app config"而不是误导用户重跑 OAuth(重登
-            // 解决不了 HOME 缺失)
-            ForwardError::OauthUnavailable {
-                reason: format!("HOME directory unavailable; cannot locate token store: {e}"),
+    // GoogleOauthCloudCode / GoogleOauthAntigravity authScheme:provider.api_key
+    // 是空,真实 token 在 ~/.codex-app-transfer/{gemini,antigravity}-oauth.json。
+    // 这里 await load + auto refresh 拿当前可用 access_token,后面 inject_auth 用
+    // 它注 Bearer。两个 provider 共用 cloudcode-pa 上游但 token 文件 + refresh
+    // 用不同 client_id/secret(antigravity 走 ensure_valid_antigravity_token,
+    // gemini-cli 走 ensure_valid_access_token)。
+    let oauth_bearer: Option<String> = match resolved.auth_scheme {
+        crate::resolver::AuthScheme::GoogleOauthCloudCode => {
+            let store = codex_app_transfer_gemini_oauth::TokenStore::from_home_env().map_err(
+                |e| ForwardError::OauthUnavailable {
+                    reason: format!("HOME directory unavailable; cannot locate token store: {e}"),
+                    needs_login: false,
+                },
+            )?;
+            let token =
+                codex_app_transfer_gemini_oauth::ensure_valid_access_token(&state.http, &store)
+                    .await
+                    .map_err(classify_oauth_service_error)?;
+            Some(token)
+        }
+        crate::resolver::AuthScheme::GoogleOauthAntigravity => {
+            let provider = &codex_app_transfer_gemini_oauth::ANTIGRAVITY_PROVIDER;
+            let store = codex_app_transfer_gemini_oauth::TokenStore::for_token_filename(
+                provider.token_filename,
+            )
+            .map_err(|e| ForwardError::OauthUnavailable {
+                reason: format!("HOME directory unavailable; cannot locate antigravity token store: {e}"),
                 needs_login: false,
-            }
-        })?;
-        let token = codex_app_transfer_gemini_oauth::ensure_valid_access_token(&state.http, &store)
+            })?;
+            let token = codex_app_transfer_gemini_oauth::ensure_valid_antigravity_token(
+                &state.http,
+                &store,
+            )
             .await
             .map_err(classify_oauth_service_error)?;
-        Some(token)
-    } else {
-        None
+            Some(token)
+        }
+        _ => None,
     };
 
     let mut up = state
@@ -685,23 +700,34 @@ async fn build_and_send_upstream(
     for (name, value) in resolved.extra_headers.iter() {
         up = up.header(name, value);
     }
-    // Cloud Code Assist 上游(impersonate gemini-cli)**必须**用 GeminiCLI UA
-    // + X-Goog-Api-Client 才会命中"官方 gemini-cli 客户端"分支;漏 / 错值
-    // 上游会按"非官方 wire"路径处理(latent silent failure / quota 划归不同
-    // bucket)。强制 override inbound/extra_headers 的同名值 — 这是 Google
-    // 协议必需,不是用户可选。参考:CLIProxyAPI `header_utils.go`。
-    if matches!(
-        resolved.auth_scheme,
-        crate::resolver::AuthScheme::GoogleOauthCloudCode
-    ) {
-        up = up.header(
-            "User-Agent",
-            codex_app_transfer_gemini_oauth::detect_user_agent(),
-        );
-        up = up.header(
-            "X-Goog-Api-Client",
-            codex_app_transfer_gemini_oauth::X_GOOG_API_CLIENT,
-        );
+    // Cloud Code Assist 上游 OAuth providers **必须**用各自 UA + X-Goog-Api-Client
+    // 才命中"官方客户端"分支;漏/错值上游按"非官方 wire"路径,latent silent
+    // failure + quota 划归错 bucket。强制 override inbound/extra_headers 同名值
+    // —— Google 协议必需。参考 CLIProxyAPI `header_utils.go` (gemini-cli) +
+    // `antigravity_version.go` (antigravity)。
+    match resolved.auth_scheme {
+        crate::resolver::AuthScheme::GoogleOauthCloudCode => {
+            up = up.header(
+                "User-Agent",
+                codex_app_transfer_gemini_oauth::detect_user_agent(),
+            );
+            up = up.header(
+                "X-Goog-Api-Client",
+                codex_app_transfer_gemini_oauth::X_GOOG_API_CLIENT,
+            );
+        }
+        crate::resolver::AuthScheme::GoogleOauthAntigravity => {
+            // chat path 用短 UA 形式(不带 google-api-nodejs-client 后缀)
+            up = up.header(
+                "User-Agent",
+                codex_app_transfer_gemini_oauth::antigravity_user_agent_chat(),
+            );
+            up = up.header(
+                "X-Goog-Api-Client",
+                codex_app_transfer_gemini_oauth::ANTIGRAVITY_X_GOOG_API_CLIENT,
+            );
+        }
+        _ => {}
     }
     let req = up.build()?;
     let outbound_headers_snapshot = req.headers().clone();
@@ -930,11 +956,26 @@ fn inject_auth(
         AuthScheme::GoogleApiKey => {
             req = req.header("x-goog-api-key", resolved.api_key.clone());
         }
-        AuthScheme::GoogleOauthCloudCode => {
+        AuthScheme::GoogleOauthCloudCode | AuthScheme::GoogleOauthAntigravity => {
             // 调用方在 build_and_send_upstream 入口处已 await 过 OAuth token,
-            // 这里单纯 Bearer 注入。oauth_bearer 必须 Some(否则上游会 401)
-            if let Some(token) = oauth_bearer {
-                req = req.header("authorization", format!("Bearer {token}"));
+            // 这里单纯 Bearer 注入。两个 OAuth scheme 共用 cloudcode-pa 上游 →
+            // Bearer header 一样,只是 token 来源(gemini-cli vs antigravity 文件)
+            // 不同。**None 是 build_and_send_upstream 的 bug** — 大声 log error_id
+            // 让 Sentry/grep 锚定;请求会因缺 Authorization header 上游 401,
+            // 用户看到 401 时再交叉看日志(2026-05-11 silent-failure-hunter C1)
+            match oauth_bearer {
+                Some(token) => {
+                    req = req.header("authorization", format!("Bearer {token}"));
+                }
+                None => {
+                    tracing::error!(
+                        error_id = "OAUTH_BEARER_MISSING_BUG",
+                        scheme = ?resolved.auth_scheme,
+                        provider_id = %resolved.provider_id,
+                        "OAuth scheme 但 oauth_bearer=None — build_and_send_upstream 应 await 过 token,\
+                         上游会因缺 Authorization 返 401。检查 forward.rs 入口 ensure_valid_*_token 调用链"
+                    );
+                }
             }
         }
         AuthScheme::None => {}

@@ -40,6 +40,16 @@ use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan}
 pub mod request;
 pub mod response;
 
+/// `apiFormat` 值是否属于 antigravity OAuth provider(全部别名,大小写无关)。
+/// 必须跟 `crates/proxy/src/resolver.rs::AuthScheme::parse` 与
+/// `crates/adapters/src/registry.rs` 接受的别名集合一致。
+fn is_antigravity_api_format(api_format: &str) -> bool {
+    matches!(
+        api_format.to_ascii_lowercase().as_str(),
+        "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
+    )
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GeminiCliAdapter;
 
@@ -72,30 +82,39 @@ impl Adapter for GeminiCliAdapter {
             .to_owned();
         // project_id 三层 fallback:
         //   1. provider.extra.cloud_code_project_id(admin handler login 时 sync 写)
-        //   2. ~/.codex-app-transfer/gemini-oauth.json(login bootstrap 时 persist,
+        //   2. ~/.codex-app-transfer/<token-file>.json(login bootstrap 时 persist,
         //      authoritative source — 避免 sync_to_active_provider 失败 / race)
         //   3. 都缺 → BadRequest 提示用户重 login
-        // 修历史:仅依赖 (1) 时,sync 失败(如 active 切到非 OAuth 后切回的 race)
-        // 让 chat 全 fail "cloud_code_project_id required",但磁盘 token 实际有
-        // project_id,user 已成功 login。2026-05-11 实测触发。
+        //
+        // **文件名按 apiFormat 选**:gemini-cli (`gemini_cli_oauth`) 用
+        // `gemini-oauth.json`,antigravity (`antigravity_oauth` / `antigravity` /
+        // `google_oauth_antigravity`) 用 `antigravity-oauth.json`。两个 provider
+        // token 文件独立,project_id 也独立(各自 bootstrap 拿不同的 GCP project)。
+        // 别名集合必须跟 `crates/proxy/src/resolver.rs` AuthScheme parse 与
+        // `crates/adapters/src/registry.rs` adapter dispatch 一致 —— 否则用户
+        // 手填别名 silently 读错文件污染对方 token(2026-05-11 review 修)
+        let token_filename = if is_antigravity_api_format(&provider.api_format) {
+            "antigravity-oauth.json"
+        } else {
+            "gemini-oauth.json"
+        };
         let project_id = provider
             .extra
             .get("cloud_code_project_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_owned())
             .or_else(|| {
-                codex_app_transfer_gemini_oauth::TokenStore::from_home_env()
+                codex_app_transfer_gemini_oauth::TokenStore::for_token_filename(token_filename)
                     .ok()
                     .and_then(|store| store.load().ok().flatten())
                     .and_then(|token| token.project_id)
             })
             .ok_or_else(|| {
-                AdapterError::BadRequest(
+                AdapterError::BadRequest(format!(
                     "cloud_code_project_id missing in both provider.extra and \
-                     ~/.codex-app-transfer/gemini-oauth.json — run OAuth login \
+                     ~/.codex-app-transfer/{token_filename} — run OAuth login \
                      to bootstrap project"
-                        .into(),
-                )
+                ))
             })?;
 
         // 1. 复用 gemini_native 把 Codex /responses 转 Gemini inner body
@@ -225,6 +244,53 @@ mod adapter_tests {
     fn name_is_stable_id() {
         assert_eq!(GeminiCliAdapter.name(), "gemini_cli_oauth");
     }
+
+    /// 锚定 antigravity api_format 别名集合 — 必须跟 `crates/proxy/src/resolver.rs`
+    /// `AuthScheme::parse` 与 `crates/adapters/src/registry.rs` adapter dispatch
+    /// 一致。任一别名漏判会让用户手填的 provider config silently 读错 token 文件
+    /// (gemini-oauth.json vs antigravity-oauth.json),刷新时会用错 client_id
+    /// 污染对方 token —— 两个 provider 同时 brick(2026-05-11 review #1 修)
+    #[test]
+    fn is_antigravity_api_format_recognizes_all_aliases() {
+        // 全部 antigravity 别名(大小写无关)
+        for v in [
+            "antigravity_oauth",
+            "antigravity",
+            "google_oauth_antigravity",
+            "Antigravity-OAuth", // dash 不识别(parse 在 registry/resolver 层做)
+            "ANTIGRAVITY",
+            "Antigravity",
+        ] {
+            // dash 形式不接受 —— 这里 lowercase 后是 "antigravity-oauth" 不在白名单
+            // 这是有意:adapter 层只接受 underscore + 全 alias,跟 registry lookup
+            // 入口的 normalize 行为对齐(registry.lookup 也 fail dash)
+            let normalized = v.to_ascii_lowercase();
+            let expected = matches!(
+                normalized.as_str(),
+                "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
+            );
+            assert_eq!(
+                is_antigravity_api_format(v),
+                expected,
+                "alias {v} 识别错"
+            );
+        }
+        // 非 antigravity 必须返 false
+        for v in [
+            "gemini_cli_oauth",
+            "gemini_cli",
+            "google_oauth_cloud_code",
+            "openai_chat",
+            "",
+            "antigravity_other",
+        ] {
+            assert!(
+                !is_antigravity_api_format(v),
+                "{v} 不应判成 antigravity"
+            );
+        }
+    }
+
 
     /// **cloud-code wire 兼容性**:Gemini 3 + Codex tools 触发 transformer 加
     /// `toolConfig.includeServerSideToolInvocations=true`,但 cloudcode-pa proto

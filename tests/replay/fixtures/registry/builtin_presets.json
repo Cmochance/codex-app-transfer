@@ -299,5 +299,33 @@
     ],
     "requestOptions": {},
     "isBuiltin": true
+  },
+  {
+    "id": "antigravity-oauth",
+    "name": "Antigravity",
+    "baseUrl": "https://cloudcode-pa.googleapis.com",
+    "docsUrl": "https://antigravity.google.com/",
+    "authScheme": "google_oauth_antigravity",
+    "apiFormat": "antigravity_oauth",
+    "models": {
+      "default": "gemini-2.5-flash"
+    },
+    "modelCapabilities": {},
+    "notices": [
+      {
+        "type": "info",
+        "text": "**Antigravity OAuth 登录**(无需 API key)— Google Antigravity IDE 的 OAuth 客户端身份,跟 Gemini CLI 共用 Cloud Code Assist 上游(`cloudcode-pa.googleapis.com/v1internal:*`)但身份独立 + 配额独立。浏览器登录一次后 token 持久化到 `~/.codex-app-transfer/antigravity-oauth.json`,过期前自动 refresh。"
+      },
+      {
+        "type": "info",
+        "text": "Antigravity 跟 Gemini CLI 可同时登录,互不抢占。两边各自有独立 GCP cloudaicompanionProject(Google 自动 provision)+ 独立 free tier 配额。配额耗尽切换另一边继续用是常见用法。"
+      },
+      {
+        "type": "warning",
+        "text": "⚠️ **TOS 灰色 + 用户自担风险**:同 Gemini CLI provider — `cloudcode-pa.googleapis.com/v1internal` 是 Google 内部端点,impersonate 严格说违反 TOS,Google 可随时改协议。降级路径:切到 Google AI Studio(API key)provider,仍受官方支持。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
   }
 ]

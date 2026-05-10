@@ -59,6 +59,12 @@ impl AdapterRegistry {
             "gemini_cli_oauth" | "gemini_cli" | "google_oauth_cloud_code" => {
                 self.gemini_cli.clone()
             }
+            // Antigravity OAuth — 跟 gemini-cli 共用上游 wire (cloudcode-pa/v1internal:*),
+            // adapter 层完全等价(outer envelope + SSE unwrap),只 OAuth 身份 / UA 不同。
+            // 复用 GeminiCliAdapter 即可;forward.rs / project_id 来源由 auth_scheme 区分
+            "antigravity_oauth" | "antigravity" | "google_oauth_antigravity" => {
+                self.gemini_cli.clone()
+            }
             // 空字符串 / 未知值 → 跟 schema default 一致,fallback openai_chat
             _ => self.openai_chat.clone(),
         }
@@ -174,6 +180,28 @@ mod tests {
                 r.lookup(v).name(),
                 "openai_chat",
                 "alias {v} 应解析到 openai_chat"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_antigravity_aliases_route_to_gemini_cli_adapter() {
+        // 3 个 antigravity 别名(全部接受,大小写无关)— 必须全部解析到 gemini_cli
+        // adapter 复用同一个 wire(cloudcode-pa),但运行时按 auth_scheme 区分 token
+        // 文件 + UA(forward.rs)。漏一个别名会让用户手填的 provider config 跑错
+        // adapter,典型现象 = 401 / project_id 串号(2026-05-11 加,锚定 alias 集合)
+        let r = AdapterRegistry::with_builtins();
+        for v in [
+            "antigravity_oauth",
+            "antigravity",
+            "google_oauth_antigravity",
+            "Antigravity-OAuth",
+            "ANTIGRAVITY",
+        ] {
+            assert_eq!(
+                r.lookup(v).name(),
+                "gemini_cli_oauth",
+                "antigravity 别名 {v} 必须复用 gemini_cli adapter wire"
             );
         }
     }

@@ -34,12 +34,14 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 10 条 builtin presets:
+        // 当前 11 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
         // / zhipu / bailian / minimax / google-ai-studio / gemini-cli-oauth
+        // / antigravity-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
         // (2026-05-11 加 Gemini CLI OAuth login preset)
-        assert_eq!(builtin_presets().len(), 10);
+        // (2026-05-11 加 Antigravity OAuth preset)
+        assert_eq!(builtin_presets().len(), 11);
     }
 
     #[test]
@@ -103,5 +105,33 @@ mod tests {
         for p in builtin_presets() {
             assert_eq!(p["isBuiltin"], serde_json::Value::Bool(true));
         }
+    }
+
+    /// 锚定 antigravity preset 关键字段 —— 不能漂移成 alias / 错 baseUrl,
+    /// 否则跟 adapter / proxy / handler 的 hard-coded 匹配字符串不一致就 silently
+    /// 走错路径(2026-05-11 加,与 review 反映的 alias 漂移问题对应)
+    #[test]
+    fn antigravity_preset_uses_canonical_authscheme_apiformat() {
+        let a = builtin_presets()
+            .iter()
+            .find(|p| p["id"] == "antigravity-oauth")
+            .expect("antigravity-oauth preset 必须存在");
+        // 这两个字符串必须是 canonical 形式(加了 alias 也别在 preset 里用)—
+        // adapter (gemini_cli/mod.rs is_antigravity_api_format) + proxy
+        // (resolver.rs AuthScheme::parse) 都接受多种 alias,但 preset 必须用
+        // canonical 形,任何变更要同步加 hard-coded 路径覆盖
+        assert_eq!(
+            a["authScheme"], "google_oauth_antigravity",
+            "preset authScheme 必须用 canonical 形 google_oauth_antigravity"
+        );
+        assert_eq!(
+            a["apiFormat"], "antigravity_oauth",
+            "preset apiFormat 必须用 canonical 形 antigravity_oauth"
+        );
+        assert_eq!(
+            a["baseUrl"], "https://cloudcode-pa.googleapis.com",
+            "antigravity 跟 gemini-cli 共用 cloudcode-pa 上游"
+        );
+        assert_eq!(a["isBuiltin"], true);
     }
 }

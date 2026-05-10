@@ -94,12 +94,21 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
-    /// 用 `$HOME/.codex-app-transfer/gemini-oauth.json` 默认路径。
+    /// 用 `$HOME/.codex-app-transfer/gemini-oauth.json` 默认路径(gemini-cli)。
+    /// **新代码**(支持多 OAuth provider)请用 [`for_token_filename`]
+    /// 显式指定文件名。本 fn 等价 `for_token_filename("gemini-oauth.json")`。
     pub fn from_home_env() -> Result<Self, TokenError> {
+        Self::for_token_filename("gemini-oauth.json")
+    }
+
+    /// 用 `$HOME/.codex-app-transfer/<filename>` 路径,让多个 OAuth provider
+    /// 共存(eg `gemini-oauth.json` vs `antigravity-oauth.json`)。filename
+    /// 来自 `OauthProviderConfig::token_filename`。
+    pub fn for_token_filename(filename: &str) -> Result<Self, TokenError> {
         let home = std::env::var_os("HOME").ok_or(TokenError::HomeNotSet)?;
         let path = PathBuf::from(home)
             .join(".codex-app-transfer")
-            .join("gemini-oauth.json");
+            .join(filename);
         Ok(Self { path })
     }
 

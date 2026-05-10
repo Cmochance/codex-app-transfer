@@ -45,6 +45,12 @@ pub enum AuthScheme {
     /// 但 access_token 不在 provider.api_key 里 — 由 `gemini_oauth::TokenStore`
     /// 持久化 + `ensure_valid_access_token` 在请求时 load + auto refresh。
     GoogleOauthCloudCode,
+    /// Antigravity OAuth — 跟 GoogleOauthCloudCode 共用 `cloudcode-pa` 上游端点
+    /// 但 OAuth 身份不同(client_id / scopes / UA / metadata)+ token 文件独立
+    /// (`~/.codex-app-transfer/antigravity-oauth.json`)。`gemini_oauth::antigravity::*`
+    /// 处理 flow / refresh / bootstrap;forward.rs 用此 scheme 路由到 antigravity
+    /// token store + 注入 antigravity UA / X-Goog-Api-Client。
+    GoogleOauthAntigravity,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -59,6 +65,9 @@ impl AuthScheme {
             "google_api_key" | "x_goog_api_key" | "google" | "gemini" => AuthScheme::GoogleApiKey,
             "google_oauth_cloud_code" | "google_oauth" | "gemini_cli_oauth" | "gemini_oauth" => {
                 AuthScheme::GoogleOauthCloudCode
+            }
+            "google_oauth_antigravity" | "antigravity_oauth" | "antigravity" => {
+                AuthScheme::GoogleOauthAntigravity
             }
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
@@ -353,6 +362,26 @@ mod tests {
         assert_eq!(
             AuthScheme::parse("Google-OAuth-Cloud-Code"),
             AuthScheme::GoogleOauthCloudCode
+        );
+
+        // Antigravity 3 别名(2026-05-11 加 antigravity provider):任何一个误归
+        // Bearer 都会让 forward.rs 跳过 ensure_valid_antigravity_token + 不注入 UA
+        // → 上游静默 401 / 配额错 bucket
+        assert_eq!(
+            AuthScheme::parse("google_oauth_antigravity"),
+            AuthScheme::GoogleOauthAntigravity
+        );
+        assert_eq!(
+            AuthScheme::parse("antigravity_oauth"),
+            AuthScheme::GoogleOauthAntigravity
+        );
+        assert_eq!(
+            AuthScheme::parse("antigravity"),
+            AuthScheme::GoogleOauthAntigravity
+        );
+        assert_eq!(
+            AuthScheme::parse("Google-OAuth-Antigravity"),
+            AuthScheme::GoogleOauthAntigravity
         );
     }
 

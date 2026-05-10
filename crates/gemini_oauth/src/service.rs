@@ -107,6 +107,60 @@ pub(crate) async fn ensure_valid_access_token_at(
     Ok(refreshed.access_token)
 }
 
+/// 同 [`ensure_valid_access_token`] 但走 antigravity refresh fn(用 antigravity
+/// client_id/secret)。Antigravity token 文件独立 — caller 必须先 `TokenStore::
+/// for_token_filename(ANTIGRAVITY_PROVIDER.token_filename)` 拿专属 store。
+///
+/// **共用 single-flight mutex**:跟 gemini-cli 共一个进程级 refresh_mutex —
+/// 实际并发场景两个 provider 也很少同时刷,共用 lock 不会成 bottleneck,且
+/// 简化"两个 store 各自有 mutex"的状态管理复杂度。
+pub async fn ensure_valid_antigravity_token(
+    http: &reqwest::Client,
+    store: &TokenStore,
+) -> Result<String, ServiceError> {
+    ensure_valid_antigravity_token_at(http, store, TOKEN_ENDPOINT).await
+}
+
+pub(crate) async fn ensure_valid_antigravity_token_at(
+    http: &reqwest::Client,
+    store: &TokenStore,
+    token_endpoint: &str,
+) -> Result<String, ServiceError> {
+    use super::antigravity::flow::refresh_antigravity_access_token_at;
+
+    let token = store.load()?.ok_or(ServiceError::NotLoggedIn)?;
+    if !token.should_refresh() {
+        return Ok(token.access_token);
+    }
+
+    let _guard = refresh_mutex().lock().await;
+
+    let token = store.load()?.ok_or(ServiceError::NotLoggedIn)?;
+    if !token.should_refresh() {
+        tracing::debug!(
+            "single-flight (antigravity): 并发请求已 refresh,复用新 token 跳过自己 refresh 调用"
+        );
+        return Ok(token.access_token);
+    }
+
+    tracing::debug!(
+        expiry_date = token.expiry_date,
+        "antigravity OAuth token 过期窗口内,触发 refresh(single-flight critical section)"
+    );
+    let refreshed = refresh_antigravity_access_token_at(
+        http,
+        token_endpoint,
+        &token.refresh_token,
+        token.id_token.clone(),
+        token.email.clone(),
+        token.project_id.clone(),
+        Some(token.scope.clone()),
+    )
+    .await?;
+    store.save(&refreshed)?;
+    Ok(refreshed.access_token)
+}
+
 /// 把 OAuth flow 拿到的 token 持久化 — 包装 `store.save`,加 `tracing` 日志。
 /// 通常 admin handler OAuth login 完成 + cloud_code bootstrap 写完 project_id 后
 /// 调用一次落盘。

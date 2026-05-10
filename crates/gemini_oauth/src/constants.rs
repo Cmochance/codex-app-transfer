@@ -74,6 +74,109 @@ pub const REDIRECT_PATH: &str = "/oauth2callback";
 /// token 刚好过期)。
 pub const REFRESH_BUFFER_SECS: i64 = 60;
 
+// ── Antigravity provider 常量 ────────────────────────────────────────
+//
+// Antigravity 是 Google 另一个 OAuth-based 客户端,跟 gemini-cli **共用**
+// `cloudcode-pa.googleapis.com/v1internal:*` 上游端点(chat / bootstrap 同样),
+// 但使用不同的 OAuth 身份 + UA + ClientMetadata。CLIProxyAPI antigravity 实现
+// 见 `internal/auth/antigravity/{auth.go, constants.go}` + `internal/misc/
+// antigravity_version.go`。
+
+/// Antigravity 客户端 ID(installed-app 类型)。CLIProxyAPI `auth/antigravity/
+/// constants.go:6`。
+pub const ANTIGRAVITY_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+
+/// Antigravity 客户端 secret。CLIProxyAPI `:7`。
+pub const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
+
+/// Antigravity 固定 callback port(不像 gemini-cli 用动态 port)。CLIProxyAPI `:8`。
+pub const ANTIGRAVITY_CALLBACK_PORT: u16 = 51121;
+
+/// Antigravity OAuth scopes —— 比 gemini-cli 多 2 个(`cclog` + `experimentsandconfigs`)。
+/// CLIProxyAPI `:12-18`。
+pub const ANTIGRAVITY_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/cclog",
+    "https://www.googleapis.com/auth/experimentsandconfigs",
+];
+
+/// Antigravity 出站 X-Goog-Api-Client header。CLIProxyAPI `antigravity_version.go:23`。
+pub const ANTIGRAVITY_X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
+
+/// Antigravity 版本号(hardcode fallback,跟 CLIProxyAPI `antigravity_version.go:19`
+/// `antigravityFallbackVersion` 一致)。CLIProxyAPI 有 background goroutine 拉
+/// `https://antigravity-auto-updater-974169037036.us-central1.run.app/releases`
+/// 拿最新版,我们暂时只用 fallback。如果 Google 大改 wire 协议跟版本绑定,
+/// 后续可引入 dynamic version refresher。
+pub const ANTIGRAVITY_VERSION: &str = "1.21.9";
+
+/// Antigravity chat / generate request UA(短形式,无 nodejs-client 后缀)。
+/// CLIProxyAPI `antigravity_version.go:132`。
+pub fn antigravity_user_agent_chat() -> String {
+    format!("antigravity/{ANTIGRAVITY_VERSION} darwin/arm64")
+}
+
+/// Antigravity loadCodeAssist / onboardUser control-plane UA(长形式,带
+/// nodejs-client 后缀)。CLIProxyAPI `antigravity_version.go:138-151`。
+pub fn antigravity_user_agent_loadcodeassist() -> String {
+    format!(
+        "antigravity/{ANTIGRAVITY_VERSION} darwin/arm64 google-api-nodejs-client/10.3.0"
+    )
+}
+
+/// Antigravity 用户信息端点 — 用 v2 (gemini-cli 用 v3 openidconnect),
+/// CLIProxyAPI `auth/antigravity/constants.go:24`。
+pub const ANTIGRAVITY_USERINFO_ENDPOINT: &str =
+    "https://www.googleapis.com/oauth2/v2/userinfo?alt=json";
+
+/// OAuth provider 通用配置 — gemini-cli 和 antigravity 共用一套 OAuth flow
+/// 实现,差异通过此结构注入。
+///
+/// **callback_port = None** 表示动态选 port(gemini-cli 风格);Some(N) 强制
+/// 用固定 port(antigravity 风格,N=51121)。
+/// **prompt_consent = true** 在 auth URL 加 `prompt=consent` 强制每次重授权
+/// (antigravity 风格)。
+#[derive(Debug, Clone, Copy)]
+pub struct OauthProviderConfig {
+    pub provider_id: &'static str,
+    pub client_id: &'static str,
+    pub client_secret: &'static str,
+    pub scopes: &'static [&'static str],
+    pub callback_port: Option<u16>,
+    pub prompt_consent: bool,
+    /// Token 持久化文件名(`~/.codex-app-transfer/<token_filename>`),不同
+    /// provider 必须不同 token 文件,防覆盖。
+    pub token_filename: &'static str,
+    pub x_goog_api_client: &'static str,
+}
+
+/// gemini-cli provider 配置(等价于现有 hardcoded 常量,用于新代码统一接口)。
+pub const GEMINI_CLI_PROVIDER: OauthProviderConfig = OauthProviderConfig {
+    provider_id: "gemini_cli",
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    scopes: SCOPES,
+    callback_port: None,
+    prompt_consent: false,
+    token_filename: "gemini-oauth.json",
+    x_goog_api_client: X_GOOG_API_CLIENT,
+};
+
+/// Antigravity provider 配置。
+pub const ANTIGRAVITY_PROVIDER: OauthProviderConfig = OauthProviderConfig {
+    provider_id: "antigravity",
+    client_id: ANTIGRAVITY_CLIENT_ID,
+    client_secret: ANTIGRAVITY_CLIENT_SECRET,
+    scopes: ANTIGRAVITY_SCOPES,
+    callback_port: Some(ANTIGRAVITY_CALLBACK_PORT),
+    prompt_consent: true,
+    token_filename: "antigravity-oauth.json",
+    x_goog_api_client: ANTIGRAVITY_X_GOOG_API_CLIENT,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

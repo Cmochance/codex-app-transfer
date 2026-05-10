@@ -9,6 +9,7 @@
 //! - `desktop`:`/api/desktop/*` + Codex.app 进程管理 + apply/restore
 //! - `providers`:`/api/providers/*` + `/api/presets`(二级再拆 crud/test/models/balance/presets)
 
+pub mod antigravity_oauth;
 pub mod common;
 pub mod desktop;
 pub mod feedback;
