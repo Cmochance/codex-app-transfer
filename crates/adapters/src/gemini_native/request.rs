@@ -307,13 +307,6 @@ fn responses_input_to_chat_messages(
                 pending_tool_calls.push(Value::Object(tc));
             }
             "function_call_output" => {
-                // flush pending assistant 再追加 tool message
-                flush_assistant(
-                    &mut pending_assistant_content,
-                    &mut pending_tool_calls,
-                    &mut pending_assistant_reasoning,
-                    &mut messages,
-                );
                 let call_id = obj
                     .get("call_id")
                     .and_then(|v| v.as_str())
@@ -324,24 +317,78 @@ fn responses_input_to_chat_messages(
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let mut m = Map::new();
-                m.insert("role".into(), Value::String("tool".into()));
-                m.insert("tool_call_id".into(), Value::String(call_id.clone()));
-                m.insert("content".into(), Value::String(content_str));
-                // P0-G:item 自带 name → 直接用;没有 → 从 global ToolCallCache lookup
-                // (Codex.app 不重发 prior function_call,依赖 server cache)。
-                // cache 命中后写到 chat tool message.name,后续 convert_messages_to_contents
-                // 拿这个 name 给 Gemini functionResponse(避免 BadRequest "no matching prior")。
-                let name = obj
+                // P0-G + Bug B 修复:Codex.app 不重发 prior function_call,但 Gemini
+                // 强制要求 functionCall turn(model role) 紧跟 functionResponse turn
+                // (user role)。从 global ToolCallCache 拿 (name, arguments) 在 messages
+                // 里 synthesize prior function_call 重建上下文。
+                // 如果当前 turn 已有 prior(pending_tool_calls / 已 flush 的 messages
+                // assistant)就不 synthesize 防重复;cache 也没就 fallback 让下游 BadRequest。
+                let cache_entry =
+                    crate::responses::global_tool_call_cache().get(&call_id);
+                let prior_in_pending = pending_tool_calls
+                    .iter()
+                    .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(call_id.as_str()));
+                let prior_in_messages = messages.iter().rev().take(8).any(|m| {
+                    m.get("tool_calls")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|arr| {
+                            arr.iter().any(|tc| {
+                                tc.get("id").and_then(|v| v.as_str()) == Some(call_id.as_str())
+                            })
+                        })
+                });
+                let need_synthesize = !prior_in_pending && !prior_in_messages;
+                let resolved_name = obj
                     .get("name")
                     .and_then(|v| v.as_str())
                     .map(String::from)
-                    .or_else(|| {
-                        crate::responses::global_tool_call_cache()
-                            .get(&call_id)
-                            .map(|entry| entry.name)
-                    });
-                if let Some(n) = name {
+                    .or_else(|| cache_entry.as_ref().map(|entry| entry.name.clone()));
+
+                // flush pending assistant 再操作
+                flush_assistant(
+                    &mut pending_assistant_content,
+                    &mut pending_tool_calls,
+                    &mut pending_assistant_reasoning,
+                    &mut messages,
+                );
+
+                if need_synthesize {
+                    if let (Some(name), Some(entry)) = (&resolved_name, &cache_entry) {
+                        // synthesize prior assistant tool_call message —— 让下游
+                        // convert_messages_to_contents 形成 model role 的 functionCall turn,
+                        // Gemini "function response turn 必须紧跟 function call turn" 满足
+                        let mut tc = Map::new();
+                        tc.insert("id".into(), Value::String(call_id.clone()));
+                        tc.insert("type".into(), Value::String("function".into()));
+                        let mut func = Map::new();
+                        func.insert("name".into(), Value::String(name.clone()));
+                        func.insert(
+                            "arguments".into(),
+                            Value::String(entry.arguments.clone()),
+                        );
+                        tc.insert("function".into(), Value::Object(func));
+                        let mut synthetic = Map::new();
+                        synthetic.insert("role".into(), Value::String("assistant".into()));
+                        synthetic.insert("content".into(), Value::Null);
+                        synthetic.insert(
+                            "tool_calls".into(),
+                            Value::Array(vec![Value::Object(tc)]),
+                        );
+                        messages.push(Value::Object(synthetic));
+                        tracing::debug!(
+                            call_id,
+                            "gemini_native: synthesized prior assistant function_call from cache \
+                             (Codex.app didn't resend prior function_call; Gemini wire requires \
+                             functionCall turn before functionResponse turn)"
+                        );
+                    }
+                }
+
+                let mut m = Map::new();
+                m.insert("role".into(), Value::String("tool".into()));
+                m.insert("tool_call_id".into(), Value::String(call_id));
+                m.insert("content".into(), Value::String(content_str));
+                if let Some(n) = resolved_name {
                     m.insert("name".into(), Value::String(n));
                 }
                 messages.push(Value::Object(m));
@@ -683,6 +730,73 @@ pub fn chat_normalized_to_gemini_request(
                 "gemini_native: Gemini 2.x dropped googleSearch wire (Gemini wire 强制 + functionDecls \
                  priority) + added system_instruction soft constraint (LiteLLM _resolve_search_tool_conflict pattern)"
             );
+        }
+    }
+
+    // **Bug A 修复**(2026-05-10 实测 400):"Function calling config is set without
+    // function_declarations" — Gemini 拒 tool_config(functionCallingConfig)单独
+    // 出现而无 functionDeclarations。Codex.app 内部 task(如 Memory Writing Agent)
+    // 不发 tools 但仍发 tool_choice="auto" → 我们转出 toolConfig → Gemini 400。
+    //
+    // **不主动破坏性降级**(用户硬性规则)— 按 tool_choice 实际值分支:
+    // - "auto" / "none":没 tools 时跟"不传 tool_choice"等价,drop 是 normalize 无损
+    // - "required" / {function:{name:"X"}}:client 请求自相矛盾(必须调工具但
+    //   没 tool 可调 / 指定 X 但 tools 里没 X),BadRequest 让 client 看到根因,
+    //   不主动 silent drop
+    let has_any_function_decls = tools
+        .as_ref()
+        .is_some_and(|t| t.iter().any(|tool| tool.function_declarations.is_some()));
+    if !has_any_function_decls {
+        if let Some(tc) = tool_config.as_ref() {
+            if let Some(fcc) = &tc.function_calling_config {
+                let mode = fcc.mode.to_ascii_uppercase();
+                let has_allowed = fcc
+                    .allowed_function_names
+                    .as_ref()
+                    .is_some_and(|v| !v.is_empty());
+                match mode.as_str() {
+                    "AUTO" | "NONE" => {
+                        // 无损 normalize:无 tools 时 auto/none 跟不传 tool_choice 等价
+                        if let Some(tc_mut) = tool_config.as_mut() {
+                            tc_mut.function_calling_config = None;
+                            // 若 toolConfig 整体空(仅 functionCallingConfig 一项),整 drop
+                            if tc_mut.include_server_side_tool_invocations.is_none()
+                                && tc_mut.retrieval_config.is_none()
+                            {
+                                tool_config = None;
+                            }
+                        }
+                    }
+                    "ANY" if has_allowed => {
+                        return Err(AdapterError::BadRequest(format!(
+                            "tool_choice specifies function name(s) {:?} but no tools/functionDeclarations \
+                             are provided in the request — this is a client-side mismatch (Gemini wire \
+                             requires functionDeclarations whenever tool_config is set). Either include \
+                             the matching function in tools, or omit tool_choice.",
+                            fcc.allowed_function_names.as_ref().unwrap()
+                        )));
+                    }
+                    "ANY" => {
+                        return Err(AdapterError::BadRequest(
+                            "tool_choice=\"required\" (Gemini ANY mode) without any tools is a \
+                             client-side mismatch — model is told to invoke a tool but no tools are \
+                             available. Either provide tools, or change tool_choice to \"auto\"/\"none\"."
+                                .to_string(),
+                        ));
+                    }
+                    _ => {
+                        // 未知 mode — 同 normalize 处理(drop)
+                        if let Some(tc_mut) = tool_config.as_mut() {
+                            tc_mut.function_calling_config = None;
+                            if tc_mut.include_server_side_tool_invocations.is_none()
+                                && tc_mut.retrieval_config.is_none()
+                            {
+                                tool_config = None;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
