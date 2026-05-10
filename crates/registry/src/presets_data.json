@@ -270,7 +270,7 @@
   },
   {
     "id": "gemini-cli-oauth",
-    "name": "Gemini CLI(OAuth 登录)",
+    "name": "Gemini CLI",
     "baseUrl": "https://cloudcode-pa.googleapis.com",
     "docsUrl": "https://github.com/google-gemini/gemini-cli",
     "authScheme": "google_oauth_cloud_code",

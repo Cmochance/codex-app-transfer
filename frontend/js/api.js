@@ -44,6 +44,14 @@
     aliyun: { logo: 'assets/providers/aliyun.ico' },
     minimax: { logo: 'assets/providers/minimax.ico' },
     minimaxi: { logo: 'assets/providers/minimax.ico' },
+    // Gemini CLI(OAuth)provider — 用 Gemini 品牌四角星 spark 图标(brand mark
+    // 跟 gemini.google.com 一致)。**必须放在 'gemini' 通用规则前**(JS object
+    // iteration 顺序 = insertion 顺序),computeIcon 子串匹配 'gemini-cli' 命中
+    // 这条 才能优先于下面的 'gemini' 走到 google-ai-studio.png。
+    // 不加 'cloudcode' 子串(silent-failure-hunter C2 修):太宽会误命中任何含
+    // cloudcode 的 provider 名 / baseUrl 包括用户自定义 — 仅 'gemini-cli' id
+    // stable 匹配
+    'gemini-cli': { logo: 'assets/providers/gemini.svg' },
     // Google AI Studio:用官方品牌图标(从 aistudio.google.com 抓的
     // ai_studio_favicon_2_128x128.png,圆形黑底带 sparkle/方框 mark)。
     // 子串命中 "google" / "gemini" / "aistudio" / "generativelanguage" 任一都映射到此。

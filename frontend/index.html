@@ -119,7 +119,7 @@
                 <label class="form-label required" for="providerName" data-i18n="providers.name">提供商名称</label>
                 <input class="form-control form-control-lg" id="providerName" name="name" value="My DeepSeek" autocomplete="organization" required>
               </div>
-              <div class="mb-4">
+              <div class="mb-4" id="providerBaseUrlRow">
                 <div class="label-line">
                   <label class="form-label required" for="providerBaseUrl">API Base URL</label>
                   <button class="link-action" type="button" data-action="test-provider-form"><i class="bi bi-lightning-charge"></i><span data-i18n="providers.manageAndTest">管理与测速</span></button>
@@ -147,13 +147,11 @@
               <div class="mb-4" id="providerOauthRow" hidden>
                 <label class="form-label" data-i18n="geminiOauth.title">Google OAuth Login</label>
                 <div id="oauthStatusBox">
-                  <div class="mb-2" id="oauthStatusText" data-i18n="geminiOauth.statusLoading">Loading...</div>
                   <div class="d-flex gap-2 mb-2">
                     <button type="button" class="btn btn-primary" id="oauthLoginBtn" data-i18n="geminiOauth.loginBtn">Log in with Google in browser</button>
                     <button type="button" class="btn btn-outline-secondary" id="oauthLogoutBtn" hidden data-i18n="geminiOauth.logoutBtn">Log out</button>
                   </div>
-                  <p class="field-hint" id="oauthHint" data-i18n="geminiOauth.hint">After login the browser window can be closed. Token is persisted and auto-refreshes before expiry.</p>
-                  <p class="field-hint text-warning" data-i18n="geminiOauth.tosWarning">⚠️ Impersonates gemini-cli to reach Google's internal Cloud Code endpoint. TOS gray area; Google may change the protocol at any time. Fallback: use the Google AI Studio (API key) provider.</p>
+                  <div class="mb-2" id="oauthStatusText" data-i18n="geminiOauth.statusLoading">Loading...</div>
                 </div>
               </div>
               <input id="providerAuth" name="authScheme" type="hidden" value="bearer">
