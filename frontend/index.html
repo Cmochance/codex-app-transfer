@@ -1,9 +1,24 @@
 <!doctype html>
-<html lang="zh-CN" data-bs-theme="light">
+<html lang="zh-CN" data-bs-theme="light" data-i18n-pending>
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Codex App Transfer</title>
+    <!--
+      M3 followup:消除 HTML 中文 fallback 在 EN 用户首屏的单帧闪烁。
+
+      策略:HTML default `data-i18n-pending` 属性 → CSS 隐藏所有 `[data-i18n]`
+      节点直到 i18n.apply() 完成后移除属性。trade-off:首屏会有 ~ 几十 ms
+      blank(看不到 text 但 layout 已就位)— 比"闪一下中文 → 切英文"体感好。
+
+      CSS 必须放 inline 或同步 stylesheet,放 head 让 parser 一遇到 body 就
+      已经能 hide [data-i18n](避免 CSS 加载完才 hide 的二次闪烁)。
+    -->
+    <style>
+      html[data-i18n-pending] [data-i18n] {
+        visibility: hidden;
+      }
+    </style>
     <link href="vendor/bootstrap@5.3.3/bootstrap.min.css" rel="stylesheet">
     <link href="vendor/bootstrap-icons@1.11.3/bootstrap-icons.css" rel="stylesheet">
     <link rel="icon" href="assets/app-icon.png">

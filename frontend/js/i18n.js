@@ -698,6 +698,10 @@
     document.querySelectorAll("[data-lang]").forEach((node) => {
       node.classList.toggle("active", node.dataset.lang === currentLanguage);
     });
+    // M3 followup:apply 完后移除 data-i18n-pending,index.html 的 inline CSS
+    // 解除对 [data-i18n] 节点的 visibility:hidden 隐藏。第一次 apply 后整页
+    // 同帧渲染最终 language,user 角度无 flash
+    document.documentElement.removeAttribute("data-i18n-pending");
     window.dispatchEvent(new CustomEvent("cc:i18n", { detail: { language: currentLanguage } }));
   }
 
