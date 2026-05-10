@@ -523,7 +523,7 @@ pub fn chat_normalized_to_gemini_request(
         .ok_or_else(|| AdapterError::BadRequest("messages array required".into()))?;
     let model = body_obj.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
-    let (system_instruction, body_messages) = split_system_instruction(messages);
+    let (mut system_instruction, body_messages) = split_system_instruction(messages);
     let contents = convert_messages_to_contents(&body_messages)?;
 
     let tools = body_obj
@@ -545,9 +545,14 @@ pub fn chat_normalized_to_gemini_request(
     // **Gemini wire 约束**(2026-05-10 实测 400):function_declarations + responseMimeType
     // 不能共存,Gemini 返 "Function calling with a response mime type:
     // 'application/json' is unsupported"。Codex.app 同时发 tools(function calling)+
-    // text.format=json_schema 是常见(让 LLM 在工具调用时也强制 JSON 输出),但 Gemini
-    // 不支持 — drop response_mime_type/response_schema 让 tools 优先(Codex 的 tool
-    // 调用是核心功能,无法 drop;json_schema output 通常是 tool args 内部约束,丢失影响小)。
+    // text.format=json_schema 时(让 LLM 走 message 输出时强制 JSON),Gemini 拒绝。
+    //
+    // **不主动破坏性降级**(memory rule:用户硬性规则)— 不能简单 drop response_schema
+    // 字段(那会丢失用户语义)。改用 LiteLLM `apply_response_schema_transformation`
+    // 思路:wire 上必须 drop 这两字段(否则 Gemini 400),但**语义不丢**:把 schema
+    // 拼成 systemInstruction text 作软约束传给 model。Model 调 tool 时不变;走 message
+    // 输出时被 prompted 按 schema 输出(虽是软约束不是硬,但比 wire-level json_schema
+    // 完全丢失好得多 — Gemini 模型对 system_instruction JSON 约束服从度高)。
     let has_function_decls = tools.as_ref().is_some_and(|t| {
         t.iter().any(|tool| tool.function_declarations.is_some())
     });
@@ -555,9 +560,27 @@ pub fn chat_normalized_to_gemini_request(
     if has_function_decls {
         if let Some(gc) = generation_config.as_mut() {
             if gc.response_mime_type.is_some() || gc.response_schema.is_some() {
-                tracing::warn!(
-                    "gemini_native: dropping responseMimeType/responseSchema because functionDeclarations \
-                     is present (Gemini does not support both — function calling takes priority)"
+                let schema_str = gc
+                    .response_schema
+                    .as_ref()
+                    .and_then(|s| serde_json::to_string(s).ok())
+                    .filter(|s| !s.is_empty());
+                let constraint_text = match schema_str {
+                    Some(s) => format!(
+                        "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object matching this schema:\n\n{s}\n\nDo not wrap the JSON in markdown fences and do not add any commentary."
+                    ),
+                    None => "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object. Do not wrap the JSON in markdown fences and do not add any commentary.".into(),
+                };
+                let si = system_instruction.get_or_insert_with(|| SystemInstruction {
+                    role: None,
+                    parts: Vec::new(),
+                });
+                si.parts.push(Part {
+                    text: Some(constraint_text),
+                    ..Default::default()
+                });
+                tracing::info!(
+                    "gemini_native: responseMimeType/responseSchema cannot coexist with functionDeclarations on Gemini wire; transformed into systemInstruction soft constraint (LiteLLM apply_response_schema_transformation pattern). Function calling unaffected; textual responses still prompted to follow JSON schema."
                 );
                 gc.response_mime_type = None;
                 gc.response_schema = None;
@@ -1664,31 +1687,49 @@ mod tests {
     }
 
     #[test]
-    fn function_decls_drop_response_mime_type_and_schema() {
+    fn function_decls_with_json_schema_transforms_to_system_instruction_soft_constraint() {
         // 实测 2026-05-10:Gemini "Function calling with a response mime type:
         // 'application/json' is unsupported" — function declarations 跟
-        // responseMimeType/responseSchema 不能共存。修复后:tools 优先,drop json schema。
+        // responseMimeType/responseSchema 不能共存。
+        //
+        // **不主动破坏性降级**(memory rule):wire 上必须 drop(Gemini 拒绝),
+        // 但语义不丢 — schema 拼成 systemInstruction text 作软约束。
         let body = serde_json::json!({
             "model": "gemini-2.5-flash",
             "messages": [{"role":"user","content":"x"}],
             "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
-            "response_format": {"type":"json_schema","json_schema":{"schema":{"type":"object"}}}
+            "response_format": {
+                "type":"json_schema",
+                "json_schema":{"schema":{"type":"object","properties":{"answer":{"type":"string"}}}}
+            }
         });
         let req = chat_normalized_to_gemini_request(&body, &dummy_provider()).unwrap();
-        // function declarations 应保留
+        // function declarations 保留
         assert!(
             req.tools.as_ref().unwrap().iter().any(|t| t.function_declarations.is_some()),
             "functionDeclarations 必须保留"
         );
-        // generation_config 不应含 responseMimeType / responseSchema
-        let gc = req.generation_config;
+        // generation_config wire 字段被剥(Gemini 400 防御)
+        let gc = req.generation_config.as_ref().unwrap();
         assert!(
-            gc.as_ref().is_none_or(|g| g.response_mime_type.is_none()),
-            "tools 存在时必须 drop responseMimeType,实际 gc:{gc:?}"
+            gc.response_mime_type.is_none() && gc.response_schema.is_none(),
+            "wire 上必须 drop responseMimeType/responseSchema 防 Gemini 400,实际 gc:{gc:?}"
+        );
+        // **关键**:schema 语义必须以 systemInstruction text 形式传达(不丢用户语义)
+        let si = req.system_instruction.expect("systemInstruction 必须含软约束 text");
+        let combined: String = si.parts.iter()
+            .filter_map(|p| p.text.as_ref())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("MUST be a valid JSON object")
+                && combined.contains("matching this schema"),
+            "systemInstruction 必须含 JSON schema 软约束 prompt;实际:{combined}"
         );
         assert!(
-            gc.as_ref().is_none_or(|g| g.response_schema.is_none()),
-            "tools 存在时必须 drop responseSchema,实际 gc:{gc:?}"
+            combined.contains("answer") && combined.contains("type"),
+            "schema JSON 内容必须 inline 在软约束 text;实际:{combined}"
         );
     }
 
