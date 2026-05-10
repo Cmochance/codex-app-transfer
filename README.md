@@ -16,23 +16,32 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本:**v2.1.3**(Python → Rust/Tauri 全栈重写后的当前主线)
-- 已验证供应商:Kimi Code(`kimi-for-coding` UA 网关)、Kimi 月之暗面(Moonshot Platform)、DeepSeek V4(官方 baseUrl,含「Max 思维」思考模式)、Xiaomi MiMo (Token Plan / Pay for Token)、MiniMax M2.x(OpenAI-compatible chat,自动剥不兼容字段 + `reasoning_split` + `<think>` 兜底)
+- 当前版本:**v2.1.4**(Python → Rust/Tauri 全栈重写后的当前主线)
+- 已验证供应商:Kimi Code(`kimi-for-coding` UA 网关)、Kimi 月之暗面(Moonshot Platform)、DeepSeek V4(官方 baseUrl,含「Max 思维」思考模式)、Xiaomi MiMo (Token Plan / Pay for Token)、MiniMax M2.x(OpenAI-compatible chat,自动剥不兼容字段 + `reasoning_split` + `<think>` 兜底)、**Google AI Studio / Gemini API**(v2.1.4 新增 `gemini_native` 适配器,直转 `:streamGenerateContent` 无中间 chat)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
-- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产;**v2.1.0 起新增 macOS Intel x64**(见 [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61))。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.1.3。早期 Python 版本 v1.0.x 已不再作为推荐稳定版,新用户直接用 v2.x
+- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产;**v2.1.0 起新增 macOS Intel x64**(见 [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61))。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.1.4。早期 Python 版本 v1.0.x 已不再作为推荐稳定版,新用户直接用 v2.x
 - 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.x 互通,升级 / 回退不丢配置
 
 > 如果使用过程中出现问题,欢迎提交 PR 协助作者完善,会及时处理,非常感谢。
 
-### v2.x 主线改动(累计到 v2.1.3)
+### v2.x 主线改动(累计到 v2.1.4)
 
 按主题分组。
 
-**自定义第三方 + Responses 协议 direct 透传**(v2.1.3,本版主线)
+**Gemini Native 直转适配器**(v2.1.4,本版主线)
+- 新增 `apiFormat=gemini_native` + `authScheme=google_api_key`(`x-goog-api-key` header)。Codex.app `/responses` 入站直接转 Google `:streamGenerateContent?alt=sse` 出站,**完全不走 chat 中间形态**(`crates/adapters/src/gemini_native/`)。Gemini 3 走 `/v1alpha`,Gemini 2.x 走 `/v1beta`,baseUrl 不带版本前缀适配器自动选
+- **Web Search**:Gemini 3+ `googleSearch` builtin tool + functionDeclarations 共存(`toolConfig.includeServerSideToolInvocations`);Gemini 2.x 上游不允许共存 → 用 systemInstruction 软约束告知模型 `google_search` 暂不可用(LiteLLM `apply_response_schema_transformation` 风格,不 destructive drop 字段)
+- **JSON Schema 兼容化**:`type:["string","null"]` 数组形态 → `string` + `nullable:true`;`anyOf` 含 null → 折叠 nullable;`$ref` / `$defs` 内联展开;`additionalProperties` / `strict` 剥离;空 enum 字符串 → null;object 缺 `properties` 补空对象 — 适配 Gemini 严格 schema 校验,**全部转换非破坏性**
+- **多轮 function calling round-trip**:接全局 `ToolCallCache`(`crates/adapters/src/responses/tool_call_cache.rs`)在 `function_call_output` 缺失前置 `function_call` 时按 `call_id` 查 cache **synthesize 假 assistant turn**,根治 Gemini "function response without prior call" 400;`tool_choice` 按值 normalize(`auto/none` drop / `required/specific` BadRequest 不静默吞);`contents` 必须 user role 开头(Gemini strict user/model alternation),首项是 model 时插占位 user turn
+- **错误流 → Responses SSE failure**(2026-05-10 修):上游 4xx/5xx 不再透传 raw Gemini JSON 让 Codex.app 卡 Thinking,改成构造合规 SSE failure 流(`response.created` → `response.failed`),含结构化 error code:`auth_error` / `permission_denied` / `quota_exceeded` / `rate_limited` / `timeout` / `service_unavailable` / `content_filter` / `bad_request` / `server_error` / `upstream_transport_error` / `upstream_error`;ByteStream 中途 transport err / 64KB 之外 body / 非 UTF-8 / 2000 字符过长 message 全标 marker 后缀,不静默吞
+- 单测 60+ 覆盖 wire round-trip / schema sanitize / tool_choice modes / multi-turn / failure stream 完整 lifecycle / 错误分类 / array-form error body / oversized body / non-UTF-8 / transport err 等
+
+**自定义第三方 + Responses 协议 direct 透传**(v2.1.3)
 - 用户在「自定义第三方」preset 显式选 `apiFormat=responses` + 填齐 baseUrl + apiKey → **Codex.app 直连上游不经代理**(借鉴 codex-account-switch 纯配置写入):`~/.codex/config.toml::openai_base_url` 写用户 baseUrl + `auth.json` 写用户 apiKey + 本地 18080 端口不启;适用 OpenAI 官方 / 任何原生实现 OpenAI Responses API 的反代
 - **healing 教训仍生效**(2026-05-08 MiMo Token Plan 404):8 条 builtin preset 的 apiFormat 启动时强制覆盖回 `openai_chat`,bypass 只可能命中显式自定义 + 用户主动选透传的第三方 — informed choice
 - 配套 `ResponsesPassthroughAdapter`(`crates/adapters/src/passthrough.rs`):字节级透传 OpenAI Responses API,SSE envelope / `sequence_number` / `chatcmpl→resp_` ID 全由上游产生代理不重写;`/responses/compact` 私有扩展即便 apiFormat=responses 也强制留本地 ResponsesAdapter 包装(避免上游 404)
 - 「**自定义第三方**」preset 卡片(`bi-puzzle` icon)无限重复添加 + 协议类型 UI 改 readonly + Responses 协议解锁 default 模型映射可空 + baseUrl input 加 `autocapitalize="off"` + form-submit direct 模式必填 baseUrl/apiKey 校验
+- ⚠️ **使用注意 — 长对话切第三方 Responses provider 可能报 `thinking_signature_invalid`**:Codex CLI 在长对话超出上下文阈值时会自动 compact 历史,塞一个 `type=compaction` item(Codex CLI 私有协议字段,**OpenAI Responses 标准协议没有**,`encrypted_content` 字段名是历史包袱实际填明文 summary)。第三方 Responses 上游(OpenAI 官方 / Anthropic 系网关 / 自建 wrapper 等)不识别这个 item,会试图把 `encrypted_content` 当 thinking signature 去 verify → 报 `thinking_signature_invalid`。**workaround**:切到第三方 Responses provider 时**新建对话**避免历史累积进 compact item;或者使用走代理转换的 builtin provider(`apiFormat=openai_chat`),代理本地 ResponsesAdapter 已正确把 compaction 展开成 user message 注入下游
 
 **测速文案分级 + 上游错误诊断闭环**(v2.1.3)
 - 测速 401/403 仍 `reachable=true`(连接 OK)+ 新 `authStatus="auth_required_or_invalid"` + **绿色显示** + 文案 `connection OK; API key not configured or auth not verified`,解耦"连接性"和"鉴权"语义(避免黄色警告让用户误以为 baseUrl 错);前端 `isProviderTestResultBad()` helper 不依据 authStatus 标黄,真鉴权失败由 Codex CLI 实际请求路径暴露
@@ -175,20 +184,29 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: **v2.1.3** (current mainline after the full Python → Rust/Tauri rewrite)
-- Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (official baseUrl, with "Max thinking" mode), Xiaomi MiMo (Token Plan / Pay for Token), MiniMax M2.x (OpenAI-compatible chat — incompatible fields auto-stripped, `reasoning_split` enabled, `<think>` tag fallback)
+- Current version: **v2.1.4** (current mainline after the full Python → Rust/Tauri rewrite)
+- Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (official baseUrl, with "Max thinking" mode), Xiaomi MiMo (Token Plan / Pay for Token), MiniMax M2.x (OpenAI-compatible chat — incompatible fields auto-stripped, `reasoning_split` enabled, `<think>` tag fallback), **Google AI Studio / Gemini API** (v2.1.4 adds `gemini_native` adapter, direct `:streamGenerateContent` with no chat intermediate)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
-- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets; **v2.1.0+ also ships macOS Intel x64** (see [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61)). v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.1.3 in production. Earlier Python v1.0.x line is no longer recommended for new installs — go straight to v2.x.
+- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets; **v2.1.0+ also ships macOS Intel x64** (see [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61)). v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.1.4 in production. Earlier Python v1.0.x line is no longer recommended for new installs — go straight to v2.x.
 - Data compatibility: `~/.codex-app-transfer/config.json` carries over from v1.x without conversion — upgrade or roll back without losing config
-### v2.x mainline rollups (cumulative through v2.1.3)
+### v2.x mainline rollups (cumulative through v2.1.4)
 
 Grouped by theme.
 
-**Custom Third-Party + Responses protocol direct passthrough** (v2.1.3, this release's main theme)
+**Gemini Native direct adapter** (v2.1.4, this release's main theme)
+- New `apiFormat=gemini_native` + `authScheme=google_api_key` (`x-goog-api-key` header). Codex.app `/responses` inbound transforms directly to Google `:streamGenerateContent?alt=sse` outbound, **never via chat intermediate** (`crates/adapters/src/gemini_native/`). Gemini 3 routes to `/v1alpha`, Gemini 2.x to `/v1beta`; baseUrl without version prefix is auto-resolved by the adapter
+- **Web Search**: Gemini 3+ allows `googleSearch` builtin tool + `functionDeclarations` to coexist (`toolConfig.includeServerSideToolInvocations`); Gemini 2.x does not — adapter falls back to a `systemInstruction` soft constraint informing the model that `google_search` is currently unavailable (LiteLLM `apply_response_schema_transformation` style, **never destructive-drops fields silently**)
+- **JSON Schema compatibility**: `type:["string","null"]` array form → `string` + `nullable:true`; `anyOf` containing null → folded into nullable; `$ref` / `$defs` inlined; `additionalProperties` / `strict` stripped; empty enum strings → null; objects missing `properties` get an empty object — adapts to Gemini's strict schema validation, **all transformations non-destructive**
+- **Multi-turn function calling round-trip**: hooks into the global `ToolCallCache` (`crates/adapters/src/responses/tool_call_cache.rs`); when `function_call_output` is missing the prior `function_call`, looks up by `call_id` and **synthesizes the missing assistant turn**, fixing Gemini's "function response without prior call" 400. `tool_choice` is normalized by mode (`auto/none` drop, `required/specific` BadRequest — never silently swallowed). `contents` must start with `user` role (Gemini's strict user/model alternation); a placeholder user turn is inserted if the first item is a `model` turn
+- **Error stream → Responses SSE failure** (2026-05-10 fix): upstream 4xx/5xx no longer passes raw Gemini JSON through (which left Codex.app stuck on "Thinking"). Instead synthesizes a compliant SSE failure stream (`response.created` → `response.failed`) with structured error codes: `auth_error` / `permission_denied` / `quota_exceeded` / `rate_limited` / `timeout` / `service_unavailable` / `content_filter` / `bad_request` / `server_error` / `upstream_transport_error` / `upstream_error`. Mid-read transport errors / bodies > 64KB / non-UTF-8 / messages > 2000 chars are all marked with marker suffixes — never silently swallowed
+- 60+ unit tests cover wire round-trip / schema sanitize / tool_choice modes / multi-turn / failure stream complete lifecycle / error classification / array-form error body / oversized body / non-UTF-8 / transport err etc.
+
+**Custom Third-Party + Responses protocol direct passthrough** (v2.1.3)
 - Users explicitly pick `apiFormat=responses` on the new "Custom Third-Party" preset card and provide both baseUrl + apiKey → **Codex.app connects directly to upstream, bypassing the proxy** (codex-account-switch style pure-config switch): `~/.codex/config.toml::openai_base_url` ← user baseUrl, `auth.json` ← user apiKey, local 18080 not started. Suitable for OpenAI official / any reverse proxy implementing OpenAI Responses API natively
 - **v1.x MiMo Token Plan 404 lesson preserved**: healing on startup force-overrides the 8 builtin presets' `apiFormat` back to `openai_chat`; bypass only triggers on **explicit custom + user-chosen** third-party providers — informed choice
 - New `ResponsesPassthroughAdapter` (`crates/adapters/src/passthrough.rs`): byte-level passthrough with SSE envelope / `sequence_number` / `chatcmpl→resp_` IDs all produced by upstream (proxy doesn't rewrite). `/responses/compact` (this repo's private extension) always stays on local ResponsesAdapter to avoid upstream 404
 - "Custom Third-Party" preset card (`bi-puzzle` icon) can be added unlimited times + protocol type UI now read-only display + Responses unlocks default model mapping as optional + baseUrl input adds `autocapitalize="off"` + form-submit time direct-mode requires both baseUrl + apiKey
+- ⚠️ **Usage caveat — long conversations on third-party Responses providers may hit `thinking_signature_invalid`**: Codex CLI auto-compacts history when it exceeds the context threshold and injects a `type=compaction` item (Codex CLI private-protocol field, **not part of the OpenAI Responses standard**; the field name `encrypted_content` is a historical naming artifact — its value is actually plaintext summary). Third-party Responses upstreams (OpenAI official / Anthropic-style gateways / self-hosted wrappers) don't recognize this item and try to verify `encrypted_content` as a thinking signature → returns `thinking_signature_invalid`. **Workaround**: when switching to a third-party Responses provider, **start a new conversation** to avoid history accumulating into a compaction item; or use a builtin proxy-routed provider (`apiFormat=openai_chat`) — the local ResponsesAdapter correctly expands `compaction` items into user messages before forwarding
 
 **Speed test message tiers + upstream error diagnostic loop** (v2.1.3)
 - Speed test 401/403 stays `reachable=true` (connection OK) + new `authStatus="auth_required_or_invalid"` field + **green** display + message `connection OK; API key not configured or auth not verified`, decoupling "connectivity" from "auth" semantics. Frontend `isProviderTestResultBad()` helper does not flag bad on authStatus alone — real auth failures surface via Codex CLI's actual request path
