@@ -42,6 +42,10 @@ mime_guess = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "http2"] }
 sha2 = "0.10"
+# cross-process file locking — config.json RMW 跨实例(双开 .app)防 lost-update。
+# 进程内 std::sync::Mutex 不管多 OS 进程,fs2::FileExt::lock_exclusive 走 fcntl
+# (POSIX) / LockFileEx (Windows),OS 级独占。
+fs2 = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
