@@ -1168,6 +1168,17 @@ impl GeminiToResponsesConverter {
                 "item": item,
             }),
         );
+        // P0-G:写 global ToolCallCache (call_id → name + arguments) 让下轮
+        // function_call_output 即便 Codex.app 不重发 prior function_call 也能 lookup
+        // (Codex.app 是 stateful client,默认依赖 server 维护 mapping)。复用项目
+        // 已有 ResponsesAdapter converter.rs:665 同款模式。
+        crate::responses::global_tool_call_cache().save(
+            &call_id,
+            crate::responses::ToolCallEntry {
+                name: name.to_owned(),
+                arguments: args_json_str.clone(),
+            },
+        );
         self.closed_function_calls.push(ClosedFunctionCall {
             item_id,
             output_index,

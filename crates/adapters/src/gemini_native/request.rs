@@ -326,8 +326,24 @@ fn responses_input_to_chat_messages(
                 };
                 let mut m = Map::new();
                 m.insert("role".into(), Value::String("tool".into()));
-                m.insert("tool_call_id".into(), Value::String(call_id));
+                m.insert("tool_call_id".into(), Value::String(call_id.clone()));
                 m.insert("content".into(), Value::String(content_str));
+                // P0-G:item 自带 name → 直接用;没有 → 从 global ToolCallCache lookup
+                // (Codex.app 不重发 prior function_call,依赖 server cache)。
+                // cache 命中后写到 chat tool message.name,后续 convert_messages_to_contents
+                // 拿这个 name 给 Gemini functionResponse(避免 BadRequest "no matching prior")。
+                let name = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| {
+                        crate::responses::global_tool_call_cache()
+                            .get(&call_id)
+                            .map(|entry| entry.name)
+                    });
+                if let Some(n) = name {
+                    m.insert("name".into(), Value::String(n));
+                }
                 messages.push(Value::Object(m));
             }
             "reasoning" => {
