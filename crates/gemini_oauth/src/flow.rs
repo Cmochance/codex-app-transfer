@@ -172,16 +172,20 @@ pub async fn run_oauth_flow(
 
 /// 同 [`run_oauth_flow`],额外接受**可选** cancellation signal。
 ///
-/// `cancel` 是 `oneshot::Receiver<()>`:
-/// - 调用方持 Sender 任意时刻 `send(()).ok()` 或 `drop(sender)` → flow 立即
+/// `cancel` 是 `watch::Receiver<bool>`(C2 修升级 — 原 oneshot::Receiver 一次性
+/// 消费,只能给 OAuth flow 用,bootstrap_project 等后续阶段无法共享。watch
+/// 支持 `clone()` 让 caller 把同一 cancel signal 喂给多阶段):
+/// - 调用方持 `watch::Sender<bool>` 任意时刻 `send(true).ok()` → flow 立即
 ///   退出返 [`FlowError::Cancelled`],loopback server abort,token 不 persist
 /// - `None` 等价于不可取消(老 API 行为,backward compat)
+/// - watch 初始值约定 `false`(未取消),caller 持有 sender 直到整个 login
+///   pipeline 完成才 drop
 ///
 /// 触发场景:user 关 UI / app exit / 第二次 login 抢占第一次 in-flight。
 pub async fn run_oauth_flow_with_cancel(
     http: &reqwest::Client,
     config: &OauthFlowConfig,
-    mut cancel: Option<oneshot::Receiver<()>>,
+    mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<OauthToken, FlowError> {
     // 1. bind loopback 拿动态 port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -258,16 +262,31 @@ pub async fn run_oauth_flow_with_cancel(
     //
     // cancel 用 `OptionFuture` pattern — 没传 cancel 时 cancel_fut 永远 pending,
     // tokio::select! 不会选到,等价于老 API 行为。callsite 主动 cancel 时
-    // (Sender 被 drop / send(())): rx 完成 → 这里立即 abort + 返 Cancelled,
-    // 比 5min timeout 提早数十倍释放 loopback port + reqwest client。
+    // (Sender 调 `send(true)`):rx 看到 value=true → 这里立即 abort + 返
+    // Cancelled,比 5min timeout 提早数十倍释放 loopback port + reqwest client。
     //
-    // **不能放在循环里**(M3):cancel_fut 单次构造 + select! 单次进入,future
-    // 在 select 完成后 drop。如未来包成 loop 重复 await,需要把 cancel_fut 用
-    // `&mut cancel` 引用形式或者外面 pin 住,否则每轮新建会丢之前消费的状态。
+    // watch 升级(C2 修):原 oneshot 一次性,cancel 信号只能给 OAuth flow
+    // 自己用,bootstrap_project 等后续阶段错过 5-30s 都听不到。watch::Receiver
+    // 支持 clone,caller 可把同一 cancel signal 喂给多阶段;watch 可重复 read
+    // 当前值,即便 caller 已经 drop sender 也能 read 最后状态。
     let cancel_fut = async {
         match cancel.as_mut() {
             Some(rx) => {
-                let _ = rx.await;
+                // 入口先看当前值——cancel 在调用前已 set 时立即返回不浪费
+                if *rx.borrow() {
+                    return;
+                }
+                // 等 sender 改值;true 即取消,false 仍要继续等(轮换)。
+                // sender drop 时 changed() 返 Err,等价于"再无 cancel 可能",
+                // 退化成 pending 让其他 select arm 决定退出
+                loop {
+                    if rx.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    if *rx.borrow() {
+                        return;
+                    }
+                }
             }
             None => std::future::pending::<()>().await,
         }
@@ -709,16 +728,17 @@ mod tests {
             on_auth_url: None,
         };
         // 用 on_auth_url 当 hook,callback 拿到 URL 后立即触发 cancel
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        // (C2 升级:oneshot → watch::channel<bool>)
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel::<bool>(false);
         let cancel_holder = std::sync::Mutex::new(Some(cancel_tx));
         // on_auth_url callback 同步执行(在生成 URL 时立即调),拿走 sender
-        // 然后 spawn task 在 20ms 后 send → flow 在等 callback 阶段被 cancel
+        // 然后 spawn task 在 20ms 后 send(true) → flow 在等 callback 阶段被 cancel
         config.on_auth_url = Some(Arc::new(move |_url: &str| {
             if let Ok(mut g) = cancel_holder.lock() {
                 if let Some(tx) = g.take() {
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(20)).await;
-                        let _ = tx.send(());
+                        let _ = tx.send(true);
                     });
                 }
             }
@@ -741,6 +761,39 @@ mod tests {
                 "期待 FlowError::Cancelled,实际 {:?}(elapsed {:?})",
                 other, elapsed
             ),
+        }
+    }
+
+    /// **C2 修核心 contract**:cancel signal 已 set true 时再调
+    /// run_oauth_flow_with_cancel,入口 fast-path 立即返 Cancelled,不浪费
+    /// loopback bind / browser open / 等 callback。验"watch::channel pre-set"
+    /// 路径走 cancel arm。
+    #[tokio::test]
+    async fn cancel_already_set_returns_immediately() {
+        let http = reqwest::Client::new();
+        let config = OauthFlowConfig {
+            callback_timeout: Duration::from_millis(2000),
+            auto_open_browser: false,
+            on_auth_url: None,
+        };
+        // 起 channel 立即 send(true) 让 receiver 看到 cancelled state
+        let (tx, rx) = tokio::sync::watch::channel::<bool>(false);
+        tx.send(true).unwrap();
+        let started = std::time::Instant::now();
+        let result = run_oauth_flow_with_cancel(&http, &config, Some(rx)).await;
+        let elapsed = started.elapsed();
+        match result {
+            Err(FlowError::Cancelled) => {
+                // pre-set cancel 应几乎瞬时退,但 OAuth flow 仍跑了 bind +
+                // state token + on_auth_url 等准备工作,放宽到 < 500ms
+                // (callback_timeout=2000ms,真触 timeout 是 2000+ms)
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "pre-set cancel 应快速退,实际 {:?}",
+                    elapsed
+                );
+            }
+            other => panic!("期待 Cancelled,实际 {:?} (elapsed {:?})", other, elapsed),
         }
     }
 

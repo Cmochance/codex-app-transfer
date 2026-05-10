@@ -34,7 +34,7 @@ use codex_app_transfer_gemini_oauth::{
     TokenStore,
 };
 use serde_json::{json, Value};
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use super::super::registry_io::{with_config_write, ConfigMutation};
 use super::super::state::AdminState;
@@ -48,10 +48,14 @@ use super::providers::active_provider;
 /// 时**才 take —— 否则 B 已经接管,A 清理把 B 的 sender 也抹掉,B 整段无法
 /// 取消(直到 B 自己结束)。epoch 由 `next_epoch()` 单调原子分配。
 ///
-/// 类型:`Mutex<Option<(u64, Sender)>>`(epoch, sender)。OnceLock 避免
-/// lazy_static 依赖。
-fn cancel_slot() -> &'static Mutex<Option<(u64, oneshot::Sender<()>)>> {
-    static SLOT: OnceLock<Mutex<Option<(u64, oneshot::Sender<()>)>>> = OnceLock::new();
+/// 类型:`Mutex<Option<(u64, watch::Sender<bool>)>>`(epoch, sender)。
+/// **C2 修**(silent-failure-hunter 标 critical):原 oneshot::Sender 一次性
+/// 消费,只能给 OAuth flow 用,bootstrap_project 等后续阶段(5-30s)收不到
+/// cancel,user 看 cancelled:false 但 token 仍 persist。watch::Sender 升级 —
+/// 多 receiver clone 跨阶段共享,login_handler 把 OAuth flow + bootstrap
+/// project + persist + sync 全部 wrap cancel-aware,真"贯穿 pipeline"。
+fn cancel_slot() -> &'static Mutex<Option<(u64, watch::Sender<bool>)>> {
+    static SLOT: OnceLock<Mutex<Option<(u64, watch::Sender<bool>)>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
@@ -73,7 +77,7 @@ fn next_epoch() -> u64 {
 /// 锁 cancel_slot 时统一处理 poison(reviewer high #2)—— Mutex 数据轻量,
 /// poison 时直接 recover 让后续路径继续 + warn log 让 operator 看到曾发生
 /// panic。silent ignore 会让 cancel 整个 silent 失效。
-fn lock_cancel_slot() -> std::sync::MutexGuard<'static, Option<(u64, oneshot::Sender<()>)>> {
+fn lock_cancel_slot() -> std::sync::MutexGuard<'static, Option<(u64, watch::Sender<bool>)>> {
     cancel_slot().lock().unwrap_or_else(|poison| {
         tracing::warn!(
             error_id = "OAUTH_CANCEL_SLOT_POISONED",
@@ -92,8 +96,11 @@ fn lock_cancel_slot() -> std::sync::MutexGuard<'static, Option<(u64, oneshot::Se
 /// port + 2 个 OAuth flow 互相覆盖)
 pub fn cancel_in_flight_login() -> bool {
     if let Some((_epoch, sender)) = lock_cancel_slot().take() {
-        // send 失败(receiver 已 drop)等价于 flow 已结束,无 op
-        let _ = sender.send(());
+        // watch::send(true) 把当前 value 设 true 通知所有 clone 的 receiver。
+        // send 失败(所有 receiver 已 drop)等价于 flow 已结束,无 op。
+        // **C2 修**:此 send 触发的 cancel 不仅 OAuth flow 收到,login_handler
+        // 持的 receiver clone 也会让 bootstrap/persist/sync 阶段 select! 退出
+        let _ = sender.send(true);
         return true;
     }
     false
@@ -209,56 +216,96 @@ async fn login_handler() -> impl IntoResponse {
     // 清理时只在 slot 当前 epoch 跟自己匹配时才 take,防"已被新 login 抢占
     // 后再 take 把新 login 的 sender 误清掉"
     let my_epoch = next_epoch();
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let (cancel_tx, mut cancel_rx) = watch::channel::<bool>(false);
     {
         let mut slot = lock_cancel_slot();
         if let Some((_, prev_sender)) = slot.replace((my_epoch, cancel_tx)) {
             tracing::info!("抢占 in-flight OAuth login(user 连点登录或并发请求)");
-            let _ = prev_sender.send(()); // 旧 flow 收到 Cancelled 立即退
+            let _ = prev_sender.send(true); // 旧 flow 收到 Cancelled 立即退
         }
     }
 
-    let flow_result = run_oauth_flow_with_cancel(&http, &config, Some(cancel_rx)).await;
-    // 清理 slot —— 仅在 slot 当前 epoch == my_epoch 时 take,防 race(本 login
-    // 已被另一新 login 抢占接管,此时 slot 里是新 login 的 sender,绝不能 take)
+    // helper: 跑 inner future,期间 select 监听 cancel — 命中即退出整 login
+    // pipeline。**C2 修核心**:wrap bootstrap_project / persist 等任意 await
+    // 都能立即响应 cancel(原 oneshot 只够 OAuth flow 用,过了 OAuth 后用户
+    // 按取消 silent 失效)
+    async fn cancellable<F, T>(
+        cancel_rx: &mut watch::Receiver<bool>,
+        fut: F,
+    ) -> Result<T, FlowError>
+    where
+        F: std::future::Future<Output = Result<T, FlowError>>,
     {
-        let mut slot = lock_cancel_slot();
-        if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
-            slot.take();
+        // 入口快路径 — cancel 已 set 不浪费起 fut
+        if *cancel_rx.borrow() {
+            return Err(FlowError::Cancelled);
+        }
+        tokio::select! {
+            res = fut => res,
+            // changed() 等 sender send(任意值);loop 直到看到 true,防 spurious
+            // 唤醒(实际 watch 不会 spurious 但留 belt-and-suspenders)
+            _ = async {
+                loop {
+                    if cancel_rx.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    if *cancel_rx.borrow() { return; }
+                }
+            } => Err(FlowError::Cancelled),
         }
     }
+
+    let flow_result = run_oauth_flow_with_cancel(&http, &config, Some(cancel_rx.clone())).await;
     let token = match flow_result {
         Ok(t) => t,
         Err(FlowError::Cancelled) => {
-            // Cancelled 不当作错——返 200 + cancelled:true 让前端区分"用户主动
-            // 取消"vs"实际错误",不在 UI 弹错 toast
+            // 清理 slot — 仅在 epoch 匹配时 take(防被新 login 抢占后误清)
+            let mut slot = lock_cancel_slot();
+            if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
+                slot.take();
+            }
             tracing::info!("OAuth login cancelled — 不持久化 token");
-            return Json(json!({
-                "loggedIn": false,
-                "cancelled": true,
-            }))
-            .into_response();
+            return Json(json!({"loggedIn": false, "cancelled": true})).into_response();
         }
         Err(e) => {
-            return Json(json!({
-                "loggedIn": false,
-                "error": e.to_string(),
-            }))
-            .into_response();
+            let mut slot = lock_cancel_slot();
+            if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
+                slot.take();
+            }
+            return Json(json!({"loggedIn": false, "error": e.to_string()})).into_response();
         }
     };
 
-    // 2. Bootstrap Cloud Code project — 拿 project_id
+    // 2. Bootstrap Cloud Code project — 拿 project_id(**C2 修**:cancel-aware
+    // wrap,5-30s bootstrap 中按 cancel 立即退,不再等 LRO timeout)
     //
-    // **silent-failure-hunter C2 修**:bootstrap 失败时**不 persist token** —— 半 state
-    // 让前端 status 看到"loggedIn: true + projectId: null"以为成功,但 GeminiCli
-    // Adapter 后续每次请求都返"cloud_code_project_id required" BadRequest。Login
-    // 是原子性合约:OAuth + bootstrap 都成功才算 login,任一失败用户必须重试整流
-    let project_id = match bootstrap_project(&http, &token.access_token, token.project_id.clone())
-        .await
+    // **silent-failure-hunter C2 atomicity**:bootstrap 失败时**不 persist token**
+    let project_id = match cancellable(&mut cancel_rx, async {
+        bootstrap_project(&http, &token.access_token, token.project_id.clone())
+            .await
+            .map_err(|e| {
+                // bootstrap 错误用 FlowError::TokenParse 当容器类型 — 它专门
+                // 给 endpoint-side 错信息留;也可加新 variant 但本 PR scope 内
+                // 复用避免 API 大改
+                FlowError::TokenParse(format!("cloud_code_bootstrap: {e}"))
+            })
+    })
+    .await
     {
         Ok(id) => id,
+        Err(FlowError::Cancelled) => {
+            let mut slot = lock_cancel_slot();
+            if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
+                slot.take();
+            }
+            tracing::info!("OAuth login cancelled during bootstrap_project — 不持久化 token");
+            return Json(json!({"loggedIn": false, "cancelled": true})).into_response();
+        }
         Err(e) => {
+            let mut slot = lock_cancel_slot();
+            if matches!(slot.as_ref(), Some((e2, _)) if *e2 == my_epoch) {
+                slot.take();
+            }
             tracing::error!(error = %e, "Cloud Code bootstrap 失败 — token 不 persist,login 整体失败");
             return err(
                 StatusCode::BAD_GATEWAY,
@@ -271,16 +318,36 @@ async fn login_handler() -> impl IntoResponse {
         }
     };
 
-    // 3. 把 project_id 写进 token + 持久化
+    // 3. 终态 cancel check — 在 sync 写盘前最后机会(cancel 在 persist 之后到
+    // 已经晚了,token 已 in disk;此 check 让"刚刚错过 bootstrap 完成"窗口
+    // 内到达的 cancel 仍能阻止 sync + persist)
+    if *cancel_rx.borrow() {
+        let mut slot = lock_cancel_slot();
+        if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
+            slot.take();
+        }
+        tracing::info!("OAuth login cancelled after bootstrap, before persist — 不持久化 token");
+        return Json(json!({"loggedIn": false, "cancelled": true})).into_response();
+    }
+
+    // 4. 把 project_id 写进 token + 持久化(快路径,< 1ms)
     let mut token_with_project = token;
     token_with_project.project_id = Some(project_id.clone());
     let store = match TokenStore::from_home_env() {
         Ok(s) => s,
         Err(e) => {
+            let mut slot = lock_cancel_slot();
+            if matches!(slot.as_ref(), Some((e2, _)) if *e2 == my_epoch) {
+                slot.take();
+            }
             return err(StatusCode::INTERNAL_SERVER_ERROR, format!("HOME: {e}")).into_response();
         }
     };
     if let Err(e) = persist_token(&store, &token_with_project) {
+        let mut slot = lock_cancel_slot();
+        if matches!(slot.as_ref(), Some((e2, _)) if *e2 == my_epoch) {
+            slot.take();
+        }
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("token persist failed: {e}"),
@@ -288,14 +355,12 @@ async fn login_handler() -> impl IntoResponse {
         .into_response();
     }
 
-    // 4. 把 project_id 同步到 active provider extra(让 GeminiCliAdapter 能读到)
-    //
-    // **silent-failure-hunter H2 修**:sync 失败必须 fail login,不能 warn-only。
-    // sync 内部已经 gate "active=gemini_cli_oauth 时才写",所以非 active 场景
-    // 无 op 不会失败到这。如果走到这里 fail = active 是 gemini,project_id 没写
-    // 进 provider config → 后续请求每次返 "cloud_code_project_id required" 4xx。
-    // 此场景必须用户感知(fail login)而不是"login 看起来成功但 chat 全 fail"
+    // 5. 把 project_id 同步到 active provider extra
     if let Err(e) = sync_project_id_to_active_provider(&project_id) {
+        let mut slot = lock_cancel_slot();
+        if matches!(slot.as_ref(), Some((e2, _)) if *e2 == my_epoch) {
+            slot.take();
+        }
         tracing::error!(error = %e, "project_id sync 失败,login 整体回滚");
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -305,6 +370,14 @@ async fn login_handler() -> impl IntoResponse {
             ),
         )
         .into_response();
+    }
+
+    // 全成功,清 slot(epoch 匹配时)
+    {
+        let mut slot = lock_cancel_slot();
+        if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
+            slot.take();
+        }
     }
 
     Json(json!({
@@ -451,16 +524,16 @@ mod tests {
         {
             let _ = lock_cancel_slot().take();
         }
-        // 1. login A 注册
+        // 1. login A 注册(C2:watch::channel 替代 oneshot)
         let epoch_a = next_epoch();
-        let (tx_a, _rx_a) = oneshot::channel::<()>();
+        let (tx_a, _rx_a) = watch::channel::<bool>(false);
         {
             let mut slot = lock_cancel_slot();
             slot.replace((epoch_a, tx_a));
         }
         // 2. login B 抢占 — 取出旧 sender 触发 cancel + 注册自己
         let epoch_b = next_epoch();
-        let (tx_b, _rx_b) = oneshot::channel::<()>();
+        let (tx_b, _rx_b) = watch::channel::<bool>(false);
         let prev_sender_taken_by_b = {
             let mut slot = lock_cancel_slot();
             slot.replace((epoch_b, tx_b))
