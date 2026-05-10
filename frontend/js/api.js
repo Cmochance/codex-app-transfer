@@ -396,5 +396,23 @@
         text: log.message,
       }));
     },
+
+    // ── Gemini CLI OAuth (P2.2) ──────────────────────────────────────────
+    // 后端 admin handler 在 src-tauri/src/admin/handlers/gemini_oauth.rs。
+    // login 是 long-poll 5min(浏览器登录 callback timeout),前端按钮要 disable
+    // 直到 promise resolve;status / logout 是即时操作。
+
+    async getGeminiOauthStatus() {
+      return api('GET', '/api/gemini-oauth/status');
+    },
+
+    async loginGeminiOauth() {
+      // **long polling** — fetch 会阻塞最长 5min 等待 OAuth callback
+      return api('POST', '/api/gemini-oauth/login', {});
+    },
+
+    async logoutGeminiOauth() {
+      return api('DELETE', '/api/gemini-oauth/logout');
+    },
   };
 })();

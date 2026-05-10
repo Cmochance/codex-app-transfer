@@ -119,11 +119,26 @@
                 <p class="field-hint" id="providerBaseUrlHint" hidden></p>
                 <div class="speed-result" id="formSpeedResult"></div>
               </div>
-              <div class="mb-4">
+              <div class="mb-4" id="providerApiKeyRow">
                 <label class="form-label required" for="providerApiKey">API Key</label>
                 <div class="input-with-button">
                   <input class="form-control form-control-lg" id="providerApiKey" name="apiKey" type="password" placeholder="sk-..." autocomplete="current-password" required>
                   <button type="button" class="input-icon" data-action="toggle-key" aria-label="toggle api key"><i class="bi bi-eye"></i></button>
+                </div>
+              </div>
+              <!-- Gemini CLI OAuth section — apiFormat=gemini_cli_oauth 时显示替代 apiKey input。
+                   登录调 POST /api/gemini-oauth/login long-poll(浏览器登录 5min 内完成),
+                   状态从 GET /api/gemini-oauth/status 同步。 -->
+              <div class="mb-4" id="providerOauthRow" hidden>
+                <label class="form-label" data-i18n="geminiOauth.title">Google OAuth Login</label>
+                <div id="oauthStatusBox">
+                  <div class="mb-2" id="oauthStatusText" data-i18n="geminiOauth.statusLoading">Loading...</div>
+                  <div class="d-flex gap-2 mb-2">
+                    <button type="button" class="btn btn-primary" id="oauthLoginBtn" data-i18n="geminiOauth.loginBtn">Log in with Google in browser</button>
+                    <button type="button" class="btn btn-outline-secondary" id="oauthLogoutBtn" hidden data-i18n="geminiOauth.logoutBtn">Log out</button>
+                  </div>
+                  <p class="field-hint" id="oauthHint" data-i18n="geminiOauth.hint">After login the browser window can be closed. Token is persisted and auto-refreshes before expiry.</p>
+                  <p class="field-hint text-warning" data-i18n="geminiOauth.tosWarning">⚠️ Impersonates gemini-cli to reach Google's internal Cloud Code endpoint. TOS gray area; Google may change the protocol at any time. Fallback: use the Google AI Studio (API key) provider.</p>
                 </div>
               </div>
               <input id="providerAuth" name="authScheme" type="hidden" value="bearer">
@@ -139,6 +154,7 @@
                     <option value="responses" data-i18n="apiFormatDisplay.responses.name">Responses</option>
                     <option value="anthropic" data-i18n="apiFormatDisplay.anthropic.name">Anthropic Messages</option>
                     <option value="gemini_native" data-i18n="apiFormatDisplay.geminiNative.name">Gemini Native</option>
+                    <option value="gemini_cli_oauth" data-i18n="apiFormatDisplay.geminiCliOauth.name">Gemini CLI(OAuth)</option>
                   </select>
                   <p class="api-format-detail-hint" id="providerApiFormatSelectDetail"></p>
                 </div>
