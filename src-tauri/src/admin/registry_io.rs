@@ -117,6 +117,66 @@ thread_local! {
     static IN_WITH_CONFIG_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// 拿 cross-process 文件锁(`<config_dir>/config.json.lock`),`fs2::FileExt::
+/// lock_exclusive` 走 OS 级 fcntl/LockFileEx,任意 OS 进程同时 with_config_write
+/// 时排队执行。配合进程内 `CONFIG_FILE_LOCK` Mutex(单 OS 进程内 thread 之间
+/// 串行),实现"两层锁"全栈 race-free。
+///
+/// **lock 文件**(non-config 文件):**不**直接锁 config.json — 那样 file open /
+/// rename 顺序复杂(配合 atomic rename 保存)。专门 sentinel 文件 `.lock`,只
+/// 用作锁 token,内容空,跨进程协调用。
+///
+/// **失败 fallback**:lock_exclusive 失败(eg lock 文件路径不可用)tracing::warn
+/// 后**继续走仅进程内 Mutex 路径** — 即便没 cross-process 锁,单进程内仍 race-
+/// free,跟未升级前等价。错误仅在 user 真同时跑 2 个 .app 实例时才暴露(罕见)。
+fn lock_config_file_cross_process() -> Option<std::fs::File> {
+    let path = config_file()?.with_extension("json.lock");
+    // **fresh-install fix**(chatgpt-codex P2):~/.codex-app-transfer/ 在首次启
+    // 动时不存在,直接 OpenOptions::open 会返 ENOENT → fallback 到无锁路径,
+    // 正好在 bootstrap 多 .app 实例并发场景失去保护。先 create_dir_all 父目录,
+    // 跟 save_raw_config 内部走的 mkdir 路径对齐
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                error_id = "CONFIG_LOCK_PARENT_DIR_CREATE_FAILED",
+                error = %e,
+                parent = ?parent,
+                "create_dir_all for cross-process lock parent failed; falling back"
+            );
+            return None;
+        }
+    }
+    // 创建 / 打开 lock 文件 — OpenOptions read+write+create 让其他进程也能 open
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                error_id = "CONFIG_LOCK_FILE_OPEN_FAILED",
+                error = %e,
+                path = ?path,
+                "cross-process config lock file open failed; falling back to in-process Mutex only"
+            );
+            return None;
+        }
+    };
+    use fs2::FileExt;
+    if let Err(e) = file.lock_exclusive() {
+        tracing::warn!(
+            error_id = "CONFIG_LOCK_EXCLUSIVE_FAILED",
+            error = %e,
+            "fs2::lock_exclusive failed; falling back to in-process Mutex only"
+        );
+        return None;
+    }
+    Some(file)
+}
+
 pub fn with_config_write<F, T>(f: F) -> Result<T, String>
 where
     F: FnOnce(&mut RawConfig) -> Result<ConfigMutation<T>, String>,
@@ -154,6 +214,10 @@ where
         );
         poison.into_inner()
     });
+    // **cross-process** 锁:第二层兜 OS 级别。File drop 时 OS 自动 release lock
+    // (不需要显式 unlock)。fallback None 时 silent — 单进程内 Mutex 仍 race-free
+    let _file_lock = lock_config_file_cross_process();
+
     let mut cfg = load()?;
     // closure 返 Err → 直接冒泡,save 不被调,内存版本 cfg drop
     match f(&mut cfg)? {
