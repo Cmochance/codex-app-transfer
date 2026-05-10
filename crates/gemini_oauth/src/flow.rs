@@ -55,6 +55,11 @@ pub enum FlowError {
     TokenParse(String),
     #[error("OS RNG 不可用: {0}")]
     Rng(String),
+    /// 调用方主动取消(eg user 关 UI / app exit / 新 login 抢占旧 login)。
+    /// 跟 [`Timeout`] 区分:Timeout 是上游(用户没点)超时,Cancelled 是
+    /// 我方主动放弃。callsite 应该当作"无错状态"处理而非弹错给 user。
+    #[error("OAuth flow cancelled by caller (UI close / app exit / superseded by newer login)")]
+    Cancelled,
 }
 
 /// OAuth flow 配置。所有字段都有默认值,通常不需要改。
@@ -162,6 +167,22 @@ pub async fn run_oauth_flow(
     http: &reqwest::Client,
     config: &OauthFlowConfig,
 ) -> Result<OauthToken, FlowError> {
+    run_oauth_flow_with_cancel(http, config, None).await
+}
+
+/// 同 [`run_oauth_flow`],额外接受**可选** cancellation signal。
+///
+/// `cancel` 是 `oneshot::Receiver<()>`:
+/// - 调用方持 Sender 任意时刻 `send(()).ok()` 或 `drop(sender)` → flow 立即
+///   退出返 [`FlowError::Cancelled`],loopback server abort,token 不 persist
+/// - `None` 等价于不可取消(老 API 行为,backward compat)
+///
+/// 触发场景:user 关 UI / app exit / 第二次 login 抢占第一次 in-flight。
+pub async fn run_oauth_flow_with_cancel(
+    http: &reqwest::Client,
+    config: &OauthFlowConfig,
+    mut cancel: Option<oneshot::Receiver<()>>,
+) -> Result<OauthToken, FlowError> {
     // 1. bind loopback 拿动态 port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let local_addr: SocketAddr = listener.local_addr()?;
@@ -233,7 +254,24 @@ pub async fn run_oauth_flow(
         }
     }
 
-    // 5. 等待 callback / timeout / server 错(三选一)
+    // 5. 等待 callback / timeout / server 错 / cancellation(四选一)
+    //
+    // cancel 用 `OptionFuture` pattern — 没传 cancel 时 cancel_fut 永远 pending,
+    // tokio::select! 不会选到,等价于老 API 行为。callsite 主动 cancel 时
+    // (Sender 被 drop / send(())): rx 完成 → 这里立即 abort + 返 Cancelled,
+    // 比 5min timeout 提早数十倍释放 loopback port + reqwest client。
+    //
+    // **不能放在循环里**(M3):cancel_fut 单次构造 + select! 单次进入,future
+    // 在 select 完成后 drop。如未来包成 loop 重复 await,需要把 cancel_fut 用
+    // `&mut cancel` 引用形式或者外面 pin 住,否则每轮新建会丢之前消费的状态。
+    let cancel_fut = async {
+        match cancel.as_mut() {
+            Some(rx) => {
+                let _ = rx.await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     let callback = tokio::select! {
         result = rx => result.map_err(|_| FlowError::Timeout(config.callback_timeout))?,
         _ = tokio::time::sleep(config.callback_timeout) => {
@@ -244,6 +282,11 @@ pub async fn run_oauth_flow(
         Ok(server_err) = &mut server_err_rx => {
             tracing::error!(error = %server_err, "loopback HTTP server crashed mid-flow");
             return Err(FlowError::Bind(server_err));
+        }
+        _ = cancel_fut => {
+            tracing::info!("OAuth flow cancelled by caller; aborting loopback server + flow");
+            server_handle.abort();
+            return Err(FlowError::Cancelled);
         }
     };
     server_handle.abort();
@@ -635,5 +678,98 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("invalid_request"));
         assert!(!msg.contains("None"));
+    }
+
+    #[test]
+    fn flow_error_cancelled_message_distinguishes_from_timeout() {
+        let cancelled_msg = FlowError::Cancelled.to_string();
+        // Cancelled message 必须明示是"调用方主动取消"而不是 user-side timeout,
+        // 让 UI / log 区分两种状态(timeout 应弹错,cancelled 应静默)
+        assert!(
+            cancelled_msg.contains("cancelled") && cancelled_msg.contains("caller"),
+            "Cancelled 错误 message 需明示主动取消,实际:{cancelled_msg}"
+        );
+        let timeout_msg = FlowError::Timeout(Duration::from_secs(300)).to_string();
+        assert!(
+            !timeout_msg.contains("cancelled"),
+            "Timeout 不能含 'cancelled' 字面值,会跟 Cancelled 混淆"
+        );
+    }
+
+    /// **核心 cancel contract**:cancel signal 触发后,run_oauth_flow_with_cancel
+    /// 必须立即返 Cancelled,不会等到 callback_timeout(5min)。本测试 lock
+    /// "提早退出" 防 future 把 cancel arm 从 select! 误删后回归到长 timeout。
+    #[tokio::test]
+    async fn cancel_signal_aborts_flow_immediately_not_at_timeout() {
+        let http = reqwest::Client::new();
+        // 极短 timeout(100ms)和 cancel 时机(20ms)对比 — cancel 应该 < timeout
+        let mut config = OauthFlowConfig {
+            callback_timeout: Duration::from_millis(2000),
+            auto_open_browser: false, // 不真打开浏览器
+            on_auth_url: None,
+        };
+        // 用 on_auth_url 当 hook,callback 拿到 URL 后立即触发 cancel
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let cancel_holder = std::sync::Mutex::new(Some(cancel_tx));
+        // on_auth_url callback 同步执行(在生成 URL 时立即调),拿走 sender
+        // 然后 spawn task 在 20ms 后 send → flow 在等 callback 阶段被 cancel
+        config.on_auth_url = Some(Arc::new(move |_url: &str| {
+            if let Ok(mut g) = cancel_holder.lock() {
+                if let Some(tx) = g.take() {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let _ = tx.send(());
+                    });
+                }
+            }
+        }));
+
+        let started = std::time::Instant::now();
+        let result = run_oauth_flow_with_cancel(&http, &config, Some(cancel_rx)).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(FlowError::Cancelled) => {
+                // 必须 < callback_timeout / 2 才能证明 cancel 提早退而不是 timeout
+                assert!(
+                    elapsed < Duration::from_millis(1000),
+                    "cancel 应立即退,实际耗时 {:?}(callback_timeout=2000ms)",
+                    elapsed
+                );
+            }
+            other => panic!(
+                "期待 FlowError::Cancelled,实际 {:?}(elapsed {:?})",
+                other, elapsed
+            ),
+        }
+    }
+
+    /// **backward compat**:run_oauth_flow(老 API,无 cancel 参数)行为
+    /// 不变 —— 内部走 None cancel,等价于不可取消,跟原 PR #97 行为一致。
+    /// 本测试不真发起 OAuth(timeout 200ms 后退),只验 None cancel 不会
+    /// 让 select! 立即匹配到不存在的 cancel arm。
+    #[tokio::test]
+    async fn run_oauth_flow_without_cancel_still_works() {
+        let http = reqwest::Client::new();
+        let config = OauthFlowConfig {
+            callback_timeout: Duration::from_millis(150),
+            auto_open_browser: false,
+            on_auth_url: None,
+        };
+        // 没传 cancel,应等到 callback_timeout 退而不是立即 Cancelled
+        let started = std::time::Instant::now();
+        let result = run_oauth_flow(&http, &config).await;
+        let elapsed = started.elapsed();
+        match result {
+            Err(FlowError::Timeout(_)) => {
+                // 必须等到接近 timeout(150ms),不能立即返(< 50ms)
+                assert!(
+                    elapsed >= Duration::from_millis(120),
+                    "无 cancel 时不能立即退,实际 {:?}",
+                    elapsed
+                );
+            }
+            other => panic!("期待 Timeout,实际 {:?}", other),
+        }
     }
 }

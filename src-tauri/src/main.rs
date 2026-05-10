@@ -117,6 +117,14 @@ fn main() {
         if matches!(event, RunEvent::Exit) {
             let manager = app_handle.state::<Arc<ProxyManager>>();
             manager.stop_silent();
+            // 取消任何 in-flight OAuth login —— 防 user 在 OAuth 5min 等待
+            // 期间 Cmd+Q 退出 app,后台 task 残留 5min 后才超时(浪费资源,
+            // 而且 callback 还可能触发 token persist 写入磁盘但 user 已经
+            // 退出 app,产生 ghost 状态)
+            let cancelled = handlers::gemini_oauth::cancel_in_flight_login();
+            if cancelled {
+                tracing::info!("app exit: cancelled in-flight OAuth login");
+            }
             let _ = handlers::desktop::restore_codex_if_enabled("exit");
         }
     });

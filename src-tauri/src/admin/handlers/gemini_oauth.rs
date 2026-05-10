@@ -21,7 +21,7 @@
 //! 的 callback** —— user 拿不到自动浏览器但可手动用任意浏览器打开 URL(URL 在
 //! tracing log 里,前端从 log viewer 能看到)。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
     http::StatusCode,
@@ -30,20 +30,97 @@ use axum::{
     Router,
 };
 use codex_app_transfer_gemini_oauth::{
-    bootstrap_project, persist_token, run_oauth_flow, OauthFlowConfig, TokenStore,
+    bootstrap_project, persist_token, run_oauth_flow_with_cancel, FlowError, OauthFlowConfig,
+    TokenStore,
 };
 use serde_json::{json, Value};
+use tokio::sync::oneshot;
 
 use super::super::registry_io::{with_config_write, ConfigMutation};
 use super::super::state::AdminState;
 use super::common::err;
 use super::providers::active_provider;
 
+/// **进程级**当前 in-flight OAuth login 的 cancel sender + epoch —— 任意时刻
+/// 最多一个 login。**epoch 防"晚 take" race**(reviewer high #1):新 login B
+/// `slot.replace((epoch_B, tx_B))` 把旧 (epoch_A, tx_A) 抢出来 send 取消 A;
+/// 但 A 的 post-flow 清理路径里**只能在 slot 当前 epoch 仍是自己的 epoch_A
+/// 时**才 take —— 否则 B 已经接管,A 清理把 B 的 sender 也抹掉,B 整段无法
+/// 取消(直到 B 自己结束)。epoch 由 `next_epoch()` 单调原子分配。
+///
+/// 类型:`Mutex<Option<(u64, Sender)>>`(epoch, sender)。OnceLock 避免
+/// lazy_static 依赖。
+fn cancel_slot() -> &'static Mutex<Option<(u64, oneshot::Sender<()>)>> {
+    static SLOT: OnceLock<Mutex<Option<(u64, oneshot::Sender<()>)>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// 单调分配 cancel slot 的 epoch token —— 每个 login 持自己的 epoch,清理时
+/// 用 epoch 校验防 ABA / 抢占 race。
+///
+/// **SAFETY (Relaxed ordering)**:本 fn 用 Relaxed 仅保证原子计数自身的单调性,
+/// 不提供跟 cancel_slot 内容的 happens-before。**写 epoch 的 callsite**(`slot.
+/// replace((my_epoch, ..))`)和**读 epoch 的 callsite**(`slot.as_ref()` 后比
+/// `*e == my_epoch`)都在 cancel_slot() Mutex 锁内执行,Mutex 自身的
+/// acquire/release 已提供 happens-before。如果未来 refactor 把 epoch 比较移到
+/// 锁外,需要改 Acquire/Release(silent-failure-hunter H2 lock 防回归)
+fn next_epoch() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 锁 cancel_slot 时统一处理 poison(reviewer high #2)—— Mutex 数据轻量,
+/// poison 时直接 recover 让后续路径继续 + warn log 让 operator 看到曾发生
+/// panic。silent ignore 会让 cancel 整个 silent 失效。
+fn lock_cancel_slot() -> std::sync::MutexGuard<'static, Option<(u64, oneshot::Sender<()>)>> {
+    cancel_slot().lock().unwrap_or_else(|poison| {
+        tracing::warn!(
+            error_id = "OAUTH_CANCEL_SLOT_POISONED",
+            "OAuth cancel slot mutex poisoned by prior panic; recovering — verify last login state"
+        );
+        poison.into_inner()
+    })
+}
+
+/// 取出并触发当前 in-flight login 的 cancel signal(若有)。返 true 表示真有
+/// 一个 login 被取消,false 表示当时没 in-flight。idempotent 安全。
+///
+/// 调用场景:① DELETE /login/cancel 用户主动按"取消";② app RunEvent::Exit
+/// 钩子防 5min 后 token persist 进 disk(user 已经退出 app);③ 新 login 启
+/// 动前抢占旧 login(防 user 连点 2 次"登录"按钮 → 2 个 loopback server 抢
+/// port + 2 个 OAuth flow 互相覆盖)
+pub fn cancel_in_flight_login() -> bool {
+    if let Some((_epoch, sender)) = lock_cancel_slot().take() {
+        // send 失败(receiver 已 drop)等价于 flow 已结束,无 op
+        let _ = sender.send(());
+        return true;
+    }
+    false
+}
+
 pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/api/gemini-oauth/status", get(status_handler))
         .route("/api/gemini-oauth/login", post(login_handler))
+        .route(
+            "/api/gemini-oauth/login/cancel",
+            delete(cancel_login_handler),
+        )
         .route("/api/gemini-oauth/logout", delete(logout_handler))
+}
+
+/// `DELETE /api/gemini-oauth/login/cancel` — 取消当前 in-flight OAuth login。
+/// 响应 `{ cancelled: bool }`(true=确实有 in-flight 被取消,false=没 in-flight)。
+async fn cancel_login_handler() -> impl IntoResponse {
+    let cancelled = cancel_in_flight_login();
+    if cancelled {
+        tracing::info!("OAuth login cancelled by user request");
+    } else {
+        // M2: false 也 log debug 让 "cancel button does nothing" 类报告可追
+        tracing::debug!("OAuth cancel requested but no in-flight login");
+    }
+    Json(json!({ "cancelled": cancelled })).into_response()
 }
 
 /// `GET /api/gemini-oauth/status` — 返当前 token 状态。
@@ -122,8 +199,46 @@ async fn login_handler() -> impl IntoResponse {
         );
     }));
 
-    let token = match run_oauth_flow(&http, &config).await {
+    // 注册 cancel sender 到进程级 slot:任意 cancel 路径(DELETE /login/cancel /
+    // app exit / 新 login 抢占)都能 send(()) 让 flow 立即退。**抢占语义**:新
+    // login 启动前 take 旧 sender 触发 send,旧 flow 收到 Cancelled 立即退出 +
+    // 释放 loopback port,新 flow 接管。防 user 连点 2 次"登录"产生 2 个并行
+    // OAuth flow / 2 个 loopback server / 2 个 callback URL race。
+    //
+    // **epoch token**(reviewer high #1 修):本 login 持自己的 epoch,post-flow
+    // 清理时只在 slot 当前 epoch 跟自己匹配时才 take,防"已被新 login 抢占
+    // 后再 take 把新 login 的 sender 误清掉"
+    let my_epoch = next_epoch();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    {
+        let mut slot = lock_cancel_slot();
+        if let Some((_, prev_sender)) = slot.replace((my_epoch, cancel_tx)) {
+            tracing::info!("抢占 in-flight OAuth login(user 连点登录或并发请求)");
+            let _ = prev_sender.send(()); // 旧 flow 收到 Cancelled 立即退
+        }
+    }
+
+    let flow_result = run_oauth_flow_with_cancel(&http, &config, Some(cancel_rx)).await;
+    // 清理 slot —— 仅在 slot 当前 epoch == my_epoch 时 take,防 race(本 login
+    // 已被另一新 login 抢占接管,此时 slot 里是新 login 的 sender,绝不能 take)
+    {
+        let mut slot = lock_cancel_slot();
+        if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
+            slot.take();
+        }
+    }
+    let token = match flow_result {
         Ok(t) => t,
+        Err(FlowError::Cancelled) => {
+            // Cancelled 不当作错——返 200 + cancelled:true 让前端区分"用户主动
+            // 取消"vs"实际错误",不在 UI 弹错 toast
+            tracing::info!("OAuth login cancelled — 不持久化 token");
+            return Json(json!({
+                "loggedIn": false,
+                "cancelled": true,
+            }))
+            .into_response();
+        }
         Err(e) => {
             return Json(json!({
                 "loggedIn": false,
@@ -323,6 +438,60 @@ mod tests {
     use crate::admin::handlers::common::test_support::with_isolated_home;
     use crate::admin::registry_io::with_config_write;
     use serde_json::json;
+
+    /// **核心 preemption race**:login B 抢占 login A 的 slot 后,A 的 post-flow
+    /// 清理路径**不能**清掉 B 的 sender —— epoch token 校验保证。reviewer high #1
+    /// 修(原版 raw take 会让 B 整段无法取消)。
+    ///
+    /// 模拟:手动模拟 login A 注册 + login B 抢占 + A 走完 post-flow 清理 +
+    /// 验 slot 里仍是 B 的 sender(没被 A 误清)。
+    #[test]
+    fn cancel_slot_epoch_prevents_a_from_clearing_b_sender() {
+        // 隔离前:清空残留(如果别的 test 留下来的)— take 不带 send 不影响
+        {
+            let _ = lock_cancel_slot().take();
+        }
+        // 1. login A 注册
+        let epoch_a = next_epoch();
+        let (tx_a, _rx_a) = oneshot::channel::<()>();
+        {
+            let mut slot = lock_cancel_slot();
+            slot.replace((epoch_a, tx_a));
+        }
+        // 2. login B 抢占 — 取出旧 sender 触发 cancel + 注册自己
+        let epoch_b = next_epoch();
+        let (tx_b, _rx_b) = oneshot::channel::<()>();
+        let prev_sender_taken_by_b = {
+            let mut slot = lock_cancel_slot();
+            slot.replace((epoch_b, tx_b))
+        };
+        assert!(prev_sender_taken_by_b.is_some(), "B 抢占应拿到 A 的 sender");
+        let (taken_epoch, _) = prev_sender_taken_by_b.unwrap();
+        assert_eq!(taken_epoch, epoch_a, "B 拿到的应是 A 的 sender");
+
+        // 3. 模拟 A 的 post-flow 清理 — 用 epoch_a 校验,slot 当前是 epoch_b 不该清
+        {
+            let mut slot = lock_cancel_slot();
+            if matches!(slot.as_ref(), Some((e, _)) if *e == epoch_a) {
+                slot.take();
+            }
+        }
+        // 4. 验 slot 仍含 B 的 sender(epoch_b)— 没被 A 的清理误清
+        {
+            let slot = lock_cancel_slot();
+            match slot.as_ref() {
+                Some((e, _)) => assert_eq!(
+                    *e, epoch_b,
+                    "**preemption race**:B 的 sender 应仍在 slot,实际 epoch={e}"
+                ),
+                None => panic!("B 的 sender 被 A 的清理误删 — race 没修"),
+            }
+        }
+        // cleanup:把 B 也 take 掉防泄漏到下一个 test
+        {
+            let _ = lock_cancel_slot().take();
+        }
+    }
 
     #[test]
     fn routes_compile_and_paths_are_unique() {
