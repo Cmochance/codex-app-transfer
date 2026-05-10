@@ -269,11 +269,7 @@ mod adapter_tests {
                 normalized.as_str(),
                 "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
             );
-            assert_eq!(
-                is_antigravity_api_format(v),
-                expected,
-                "alias {v} 识别错"
-            );
+            assert_eq!(is_antigravity_api_format(v), expected, "alias {v} 识别错");
         }
         // 非 antigravity 必须返 false
         for v in [
@@ -284,13 +280,9 @@ mod adapter_tests {
             "",
             "antigravity_other",
         ] {
-            assert!(
-                !is_antigravity_api_format(v),
-                "{v} 不应判成 antigravity"
-            );
+            assert!(!is_antigravity_api_format(v), "{v} 不应判成 antigravity");
         }
     }
-
 
     /// **cloud-code wire 兼容性**:Gemini 3 + Codex tools 触发 transformer 加
     /// `toolConfig.includeServerSideToolInvocations=true`,但 cloudcode-pa proto

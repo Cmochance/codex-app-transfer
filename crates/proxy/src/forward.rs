@@ -651,12 +651,15 @@ async fn build_and_send_upstream(
     // gemini-cli 走 ensure_valid_access_token)。
     let oauth_bearer: Option<String> = match resolved.auth_scheme {
         crate::resolver::AuthScheme::GoogleOauthCloudCode => {
-            let store = codex_app_transfer_gemini_oauth::TokenStore::from_home_env().map_err(
-                |e| ForwardError::OauthUnavailable {
-                    reason: format!("HOME directory unavailable; cannot locate token store: {e}"),
-                    needs_login: false,
-                },
-            )?;
+            let store =
+                codex_app_transfer_gemini_oauth::TokenStore::from_home_env().map_err(|e| {
+                    ForwardError::OauthUnavailable {
+                        reason: format!(
+                            "HOME directory unavailable; cannot locate token store: {e}"
+                        ),
+                        needs_login: false,
+                    }
+                })?;
             let token =
                 codex_app_transfer_gemini_oauth::ensure_valid_access_token(&state.http, &store)
                     .await
@@ -669,7 +672,9 @@ async fn build_and_send_upstream(
                 provider.token_filename,
             )
             .map_err(|e| ForwardError::OauthUnavailable {
-                reason: format!("HOME directory unavailable; cannot locate antigravity token store: {e}"),
+                reason: format!(
+                    "HOME directory unavailable; cannot locate antigravity token store: {e}"
+                ),
                 needs_login: false,
             })?;
             let token = codex_app_transfer_gemini_oauth::ensure_valid_antigravity_token(

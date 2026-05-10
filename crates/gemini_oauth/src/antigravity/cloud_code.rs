@@ -147,7 +147,15 @@ pub(crate) async fn bootstrap_project_at(
         .map(|t| t.id.clone())
         .unwrap_or_else(|| "legacy-tier".to_owned());
 
-    onboard_user_at(http, base_url, access_token, &tier_id, &metadata, &user_agent).await
+    onboard_user_at(
+        http,
+        base_url,
+        access_token,
+        &tier_id,
+        &metadata,
+        &user_agent,
+    )
+    .await
 }
 
 /// LRO polling — 跟 gemini-cli LRO 略微不同(antigravity 用 `:onboardUser` 多次
@@ -168,7 +176,11 @@ async fn onboard_user_at(
 
     const MAX_ATTEMPTS: u32 = 5;
     for attempt in 1..=MAX_ATTEMPTS {
-        tracing::debug!(attempt, max = MAX_ATTEMPTS, "antigravity onboardUser polling");
+        tracing::debug!(
+            attempt,
+            max = MAX_ATTEMPTS,
+            "antigravity onboardUser polling"
+        );
         let resp = http
             .post(&onboard_url)
             .bearer_auth(access_token)

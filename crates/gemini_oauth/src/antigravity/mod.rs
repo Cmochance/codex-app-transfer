@@ -25,7 +25,7 @@
 pub mod cloud_code;
 pub mod flow;
 
-pub use cloud_code::{bootstrap_project as antigravity_bootstrap_project, AntigravityClientMetadata};
-pub use flow::{
-    run_antigravity_oauth_flow_with_cancel, refresh_antigravity_access_token,
+pub use cloud_code::{
+    bootstrap_project as antigravity_bootstrap_project, AntigravityClientMetadata,
 };
+pub use flow::{refresh_antigravity_access_token, run_antigravity_oauth_flow_with_cancel};

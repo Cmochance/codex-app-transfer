@@ -122,9 +122,7 @@ pub fn antigravity_user_agent_chat() -> String {
 /// Antigravity loadCodeAssist / onboardUser control-plane UA(长形式,带
 /// nodejs-client 后缀)。CLIProxyAPI `antigravity_version.go:138-151`。
 pub fn antigravity_user_agent_loadcodeassist() -> String {
-    format!(
-        "antigravity/{ANTIGRAVITY_VERSION} darwin/arm64 google-api-nodejs-client/10.3.0"
-    )
+    format!("antigravity/{ANTIGRAVITY_VERSION} darwin/arm64 google-api-nodejs-client/10.3.0")
 }
 
 /// Antigravity 用户信息端点 — 用 v2 (gemini-cli 用 v3 openidconnect),

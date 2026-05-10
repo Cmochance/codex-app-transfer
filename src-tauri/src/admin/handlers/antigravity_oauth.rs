@@ -311,7 +311,9 @@ async fn login_handler() -> impl IntoResponse {
 
     // 拿 email(cancel-aware)— 错误必须 surface,不能 swallow 成 None
     let userinfo = match cancellable(&mut cancel_rx, async {
-        Ok::<UserInfoFetch, FlowError>(fetch_antigravity_user_email(http, &token.access_token).await)
+        Ok::<UserInfoFetch, FlowError>(
+            fetch_antigravity_user_email(http, &token.access_token).await,
+        )
     })
     .await
     {
@@ -341,15 +343,13 @@ async fn login_handler() -> impl IntoResponse {
     token_with_project.project_id = Some(project_id.clone());
     token_with_project.email = userinfo.email.clone();
 
-    let store =
-        match TokenStore::for_token_filename(ANTIGRAVITY_PROVIDER.token_filename) {
-            Ok(s) => s,
-            Err(e) => {
-                cleanup_slot(my_epoch);
-                return err(StatusCode::INTERNAL_SERVER_ERROR, format!("HOME: {e}"))
-                    .into_response();
-            }
-        };
+    let store = match TokenStore::for_token_filename(ANTIGRAVITY_PROVIDER.token_filename) {
+        Ok(s) => s,
+        Err(e) => {
+            cleanup_slot(my_epoch);
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("HOME: {e}")).into_response();
+        }
+    };
     if let Err(e) = persist_token(&store, &token_with_project) {
         cleanup_slot(my_epoch);
         return err(
@@ -434,10 +434,7 @@ struct UserInfoFetch {
 
 /// 拿 antigravity 登录账号 email — 用 v2 userinfo endpoint (跟 gemini-cli
 /// 用 v3 openidconnect 不同;CLIProxyAPI `auth/antigravity/constants.go:24`)。
-async fn fetch_antigravity_user_email(
-    http: &reqwest::Client,
-    access_token: &str,
-) -> UserInfoFetch {
+async fn fetch_antigravity_user_email(http: &reqwest::Client, access_token: &str) -> UserInfoFetch {
     let resp = match http
         .get(ANTIGRAVITY_USERINFO_ENDPOINT)
         .bearer_auth(access_token)

@@ -17,8 +17,8 @@ use serde::Deserialize;
 use tokio::sync::oneshot;
 
 use super::super::constants::{
-    AUTH_ENDPOINT, ANTIGRAVITY_CALLBACK_PORT, ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET,
-    ANTIGRAVITY_SCOPES, REDIRECT_PATH, TOKEN_ENDPOINT,
+    ANTIGRAVITY_CALLBACK_PORT, ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET,
+    ANTIGRAVITY_SCOPES, AUTH_ENDPOINT, REDIRECT_PATH, TOKEN_ENDPOINT,
 };
 use super::super::flow::{FlowError, OauthFlowConfig};
 use super::super::token::OauthToken;
@@ -110,9 +110,7 @@ pub async fn run_antigravity_oauth_flow_with_cancel(
     let server_handle = tokio::spawn(async move {
         match axum::serve(listener, app).await {
             Ok(()) => {
-                tracing::warn!(
-                    "axum::serve 返 Ok 异常 — listener 已关闭,后续 callback 无法到达"
-                )
+                tracing::warn!("axum::serve 返 Ok 异常 — listener 已关闭,后续 callback 无法到达")
             }
             Err(e) => {
                 let _ = server_err_tx.send(e);
@@ -194,9 +192,7 @@ pub async fn run_antigravity_oauth_flow_with_cancel(
         CallbackResult::Malformed => {
             return Err(FlowError::Denied {
                 error: "missing_code_and_state".into(),
-                description: Some(
-                    "Google callback 既没 code 也没 error,极不正常".into(),
-                ),
+                description: Some("Google callback 既没 code 也没 error,极不正常".into()),
             });
         }
     };
@@ -299,9 +295,7 @@ pub(crate) async fn exchange_antigravity_code_for_token_at(
     let parsed: TokenResponse =
         serde_json::from_str(&body).map_err(|e| FlowError::TokenParse(e.to_string()))?;
     let refresh_token = parsed.refresh_token.ok_or_else(|| {
-        FlowError::TokenParse(
-            "antigravity 授权码 exchange 必须返 refresh_token,但响应没有".into(),
-        )
+        FlowError::TokenParse("antigravity 授权码 exchange 必须返 refresh_token,但响应没有".into())
     })?;
     Ok(OauthToken {
         access_token: parsed.access_token,
