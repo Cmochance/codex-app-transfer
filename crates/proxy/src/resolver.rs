@@ -41,16 +41,24 @@ pub enum AuthScheme {
     /// LiteLLM 注释(`common_utils.py:402`):API key 不放 URL,放 header
     /// 防 traceback 泄露。
     GoogleApiKey,
+    /// Google Cloud Code Assist OAuth 2.0:`Authorization: Bearer <oauth_access_token>`,
+    /// 但 access_token 不在 provider.api_key 里 — 由 `gemini_oauth::TokenStore`
+    /// 持久化 + `ensure_valid_access_token` 在请求时 load + auto refresh。
+    GoogleOauthCloudCode,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
 
 impl AuthScheme {
     pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "x-api-key" | "x_api_key" | "xapikey" | "apikey" => AuthScheme::XApiKey,
-            "google_api_key" | "x-goog-api-key" | "x_goog_api_key" | "google" | "gemini" => {
-                AuthScheme::GoogleApiKey
+        // 统一 normalize:trim + lowercase + dash→underscore,所有 alias 不再单独
+        // 列 dash 形态(对齐 AdapterRegistry::lookup 同样 normalize)。
+        let normalized = s.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "x_api_key" | "xapikey" | "apikey" => AuthScheme::XApiKey,
+            "google_api_key" | "x_goog_api_key" | "google" | "gemini" => AuthScheme::GoogleApiKey,
+            "google_oauth_cloud_code" | "google_oauth" | "gemini_cli_oauth" | "gemini_oauth" => {
+                AuthScheme::GoogleOauthCloudCode
             }
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
@@ -321,6 +329,31 @@ mod tests {
         assert_eq!(AuthScheme::parse("gemini"), AuthScheme::GoogleApiKey);
         assert_eq!(AuthScheme::parse(""), AuthScheme::None);
         assert_eq!(AuthScheme::parse("unknown"), AuthScheme::Bearer);
+
+        // **Critical** test gap(2026-05-11 修):4 个 GoogleOauthCloudCode alias
+        // 全部明确 lock 防 typo / refactor 把它们误归 Bearer 导致 401(provider.api_key
+        // 字段为空,Bearer 注入空 token,silent fail)。
+        assert_eq!(
+            AuthScheme::parse("google_oauth_cloud_code"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+        assert_eq!(
+            AuthScheme::parse("google_oauth"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+        assert_eq!(
+            AuthScheme::parse("gemini_cli_oauth"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+        assert_eq!(
+            AuthScheme::parse("gemini_oauth"),
+            AuthScheme::GoogleOauthCloudCode
+        );
+        // 大小写 / dash 混用都识别(parse 内部 to_ascii_lowercase + replace '-' '_')
+        assert_eq!(
+            AuthScheme::parse("Google-OAuth-Cloud-Code"),
+            AuthScheme::GoogleOauthCloudCode
+        );
     }
 
     #[test]

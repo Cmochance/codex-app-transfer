@@ -125,6 +125,11 @@
         const v = (payload.apiFormat || '').toLowerCase().replace(/-/g, '_');
         if (['responses', 'openai_responses', 'anthropic', 'claude', 'messages'].includes(v)) return 'responses';
         if (['gemini_native', 'google_ai_studio', 'gemini'].includes(v)) return 'gemini_native';
+        // Cloud Code Assist OAuth(impersonate gemini-cli)— passthrough,
+        // 后端 normalize_provider_api_format 识别 + GeminiCliAdapter 路由。
+        // 漏 passthrough 会被 fallback 'openai_chat',OAuth provider 退化成
+        // 用 api_key+/chat/completions 探测 cloudcode-pa 必 404。2026-05-11 实测
+        if (['gemini_cli_oauth', 'gemini_oauth', 'google_oauth_cloud_code'].includes(v)) return 'gemini_cli_oauth';
         return 'openai_chat';  // openai / openai_chat / chat_completions / 空 / 未知 → openai_chat
       })(),
       extraHeaders: payload.extraHeaders || {},
@@ -395,6 +400,24 @@
         time: log.time,
         text: log.message,
       }));
+    },
+
+    // ── Gemini CLI OAuth (P2.2) ──────────────────────────────────────────
+    // 后端 admin handler 在 src-tauri/src/admin/handlers/gemini_oauth.rs。
+    // login 是 long-poll 5min(浏览器登录 callback timeout),前端按钮要 disable
+    // 直到 promise resolve;status / logout 是即时操作。
+
+    async getGeminiOauthStatus() {
+      return api('GET', '/api/gemini-oauth/status');
+    },
+
+    async loginGeminiOauth() {
+      // **long polling** — fetch 会阻塞最长 5min 等待 OAuth callback
+      return api('POST', '/api/gemini-oauth/login', {});
+    },
+
+    async logoutGeminiOauth() {
+      return api('DELETE', '/api/gemini-oauth/logout');
     },
   };
 })();

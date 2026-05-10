@@ -253,6 +253,43 @@ fn suggest_model_mappings(model_ids: &[String]) -> Value {
 }
 
 async fn fetch_provider_models_impl(provider: &Value) -> Value {
+    // Cloud Code Assist (gemini_cli_oauth) 上游没有 listModels endpoint —
+    // gemini-cli upstream 自己用 hardcoded enum (`packages/core/src/config/models.ts`)。
+    // 这里返跟 gemini-cli upstream + CLIProxyAPI `internal/registry/models/models.json`
+    // (provider="gemini-cli")交集对齐的固定列表(2026-05-10 同步两个 upstream)。
+    //
+    // **Gemini 3 系列在 OAuth 路径已可用**(实证 CLIProxyAPI 2026-05-10
+    // models.json L817/845/874/904 + gemini-cli `PREVIEW_GEMINI_*` 常量
+    // 路由进 Code Assist):
+    //   - gemini-3-pro-preview / gemini-3.1-pro-preview
+    //   - gemini-3-flash-preview / gemini-3.1-flash-lite-preview
+    // 免费 tier 对 3.x 配额更紧(易触 RESOURCE_EXHAUSTED),但 OAuth 路径
+    // 自动绑 cloudaicompanionProject,quota 走 GCP project 计数。
+    //
+    // 不含的:
+    //   - `gemini-3-pro-image-preview` / `gemini-3.1-flash-image-preview`
+    //     (CLIProxyAPI 仅在 gemini/aistudio API-key 路径列,gemini-cli 路径无)
+    //   - `*-latest` 别名(也仅 API-key 路径)
+    if provider.get("apiFormat").and_then(|v| v.as_str()) == Some("gemini_cli_oauth") {
+        let model_ids = vec![
+            // 稳定 2.5 系列(default 推 flash:免费 tier 配额最宽)
+            "gemini-2.5-flash".to_owned(),
+            "gemini-2.5-pro".to_owned(),
+            "gemini-2.5-flash-lite".to_owned(),
+            // Gemini 3 preview 系列(2026-05 起在 OAuth 路径可用)
+            "gemini-3-pro-preview".to_owned(),
+            "gemini-3.1-pro-preview".to_owned(),
+            "gemini-3-flash-preview".to_owned(),
+            "gemini-3.1-flash-lite-preview".to_owned(),
+        ];
+        return json!({
+            "success": true,
+            "endpoint": "(static: cloud-code-assist hardcoded list)",
+            "models": model_ids.clone(),
+            "suggested": suggest_model_mappings(&model_ids),
+        });
+    }
+
     let endpoints = model_endpoint_candidates(provider);
     if endpoints.is_empty() {
         return json!({

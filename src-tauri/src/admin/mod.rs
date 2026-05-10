@@ -156,6 +156,8 @@ pub fn build_app_router(state: AdminState) -> Router {
         )
         // Feedback
         .route("/api/feedback", post(handlers::feedback::submit_feedback))
+        // Gemini CLI OAuth (login / status / logout)
+        .merge(handlers::gemini_oauth::routes())
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)

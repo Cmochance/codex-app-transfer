@@ -267,5 +267,37 @@
     ],
     "requestOptions": {},
     "isBuiltin": true
+  },
+  {
+    "id": "gemini-cli-oauth",
+    "name": "Gemini CLI(OAuth 登录)",
+    "baseUrl": "https://cloudcode-pa.googleapis.com",
+    "docsUrl": "https://github.com/google-gemini/gemini-cli",
+    "authScheme": "google_oauth_cloud_code",
+    "apiFormat": "gemini_cli_oauth",
+    "models": {
+      "default": "gemini-2.5-flash"
+    },
+    "modelCapabilities": {},
+    "notices": [
+      {
+        "type": "info",
+        "text": "**Gemini CLI OAuth 登录**(无需 API key)— 浏览器登录 Google 账号一次,后续请求自动复用 access_token。免费 tier per-account 配额绑 GCP cloudaicompanionProject(自动 provision)。Codex.app `/responses` → Cloud Code Assist `:streamGenerateContent` 直转,wire 实现参考 router-for-me/CLIProxyAPI(MIT, Go)。"
+      },
+      {
+        "type": "info",
+        "text": "默认模型 `gemini-2.5-flash`(对齐官方 gemini-cli 在配额耗尽时的 fallback 行为)。需要 pro 能力可在模型映射手动改 `gemini-2.5-pro`,但免费 tier per-account 日配额对 pro 较紧,heavy use 容易 429。"
+      },
+      {
+        "type": "info",
+        "text": "**Gemini 3 系列已在 OAuth 路径可用**(2026-05 起):`gemini-3-pro-preview` / `gemini-3.1-pro-preview` / `gemini-3-flash-preview` / `gemini-3.1-flash-lite-preview`。模型 ID 仍带 `-preview` 后缀(GA 后会去掉);3.x 默认 dynamic thinking 已开 + Pro 默认 high。免费 tier 对 3.x 配额更紧,heavy use 易触 429,推荐先用 2.5-flash 试通。图像生成(`gemini-3-pro-image-preview`)仅 API-key 路径(Google AI Studio provider)支持,OAuth 路径不可用。"
+      },
+      {
+        "type": "warning",
+        "text": "⚠️ **TOS 灰色 + 用户自担风险**:`cloudcode-pa.googleapis.com/v1internal` 是 Google 内部未文档化端点,Google 可随时改协议导致 break(CLIProxyAPI 多次因 gemini-cli 升级而 break)。Code Assist TOS 禁止「非官方客户端 automated 使用」,impersonation 严格说违反。降级路径:切回 Google AI Studio(API key)模式,仍受 Google 官方支持。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
   }
 ]

@@ -92,6 +92,16 @@ pub enum ForwardError {
     Resolve(#[from] ResolveError),
     #[error("adapter: {0}")]
     Adapter(#[from] AdapterError),
+    /// OAuth bearer 不可用(用户没登过 / refresh 失败 / token 文件 IO 错)。
+    /// 跟 generic Header 错误区分,IntoResponse 走 401 + 结构化 code 提示用户
+    /// 重新登录,**不**走 502 generic 错误体(2026-05-11 silent-failure 修)。
+    #[error("OAuth credentials unavailable: {reason}")]
+    OauthUnavailable {
+        reason: String,
+        /// `true` 表示用户必须重新跑 OAuth login flow 才能恢复(NotLoggedIn /
+        /// invalid_grant 等);`false` 是临时网络错误用户可重试。
+        needs_login: bool,
+    },
 }
 
 impl axum::response::IntoResponse for ForwardError {
@@ -102,6 +112,45 @@ impl axum::response::IntoResponse for ForwardError {
         telemetry
             .logs
             .add("ERROR", format!("proxy request failed: {message}"));
+
+        // OauthUnavailable 单独走 401 + structured JSON,提示用户重新登录(2026-05-11
+        // silent-failure 修)。原版走 502 + plain text "proxy error: invalid header: ..."
+        // 用户毫无 actionable 信息,以为是 proxy bug 而不是自己 OAuth 失效。
+        if let ForwardError::OauthUnavailable {
+            reason,
+            needs_login,
+        } = &self
+        {
+            let (code, message) = if *needs_login {
+                (
+                    "oauth_login_required",
+                    format!(
+                        "Gemini OAuth credentials missing or revoked — please re-run login from \
+                         settings. Detail: {reason}"
+                    ),
+                )
+            } else {
+                (
+                    "oauth_token_refresh_failed",
+                    format!(
+                        "Gemini OAuth token refresh transiently failed; please retry. Detail: \
+                         {reason}"
+                    ),
+                )
+            };
+            let body = serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "authentication_error",
+                    "code": code,
+                }
+            });
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("content-type", "application/json; charset=utf-8")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+        }
 
         // PreviousResponseNotFound 单独走 OpenAI SDK-compatible JSON 错误体,
         // 字面对齐 OpenAI Responses API 服务端真实行为(LM Studio bug tracker
@@ -594,6 +643,31 @@ async fn build_and_send_upstream(
     plan_body: &Bytes,
     upstream_url: &str,
 ) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
+    // GoogleOauthCloudCode authScheme:provider.api_key 是空,真实 token 在
+    // ~/.codex-app-transfer/gemini-oauth.json,这里 await load + auto refresh 拿
+    // 当前可用 access_token,后面 inject_auth 用它注 Bearer。错误分类逻辑提到
+    // 独立 `classify_oauth_service_error` fn 方便单测覆盖每条 case。
+    let oauth_bearer: Option<String> = if matches!(
+        resolved.auth_scheme,
+        crate::resolver::AuthScheme::GoogleOauthCloudCode
+    ) {
+        let store = codex_app_transfer_gemini_oauth::TokenStore::from_home_env().map_err(|e| {
+            // HOME 不可用 → 环境错(不是 OAuth 状态问题),独立 needs_login=false +
+            // message 明示"check HOME / app config"而不是误导用户重跑 OAuth(重登
+            // 解决不了 HOME 缺失)
+            ForwardError::OauthUnavailable {
+                reason: format!("HOME directory unavailable; cannot locate token store: {e}"),
+                needs_login: false,
+            }
+        })?;
+        let token = codex_app_transfer_gemini_oauth::ensure_valid_access_token(&state.http, &store)
+            .await
+            .map_err(classify_oauth_service_error)?;
+        Some(token)
+    } else {
+        None
+    };
+
     let mut up = state
         .http
         .request(method.clone(), upstream_url)
@@ -607,9 +681,27 @@ async fn build_and_send_upstream(
         }
         up = up.header(name, value);
     }
-    up = inject_auth(up, resolved);
+    up = inject_auth(up, resolved, oauth_bearer.as_deref());
     for (name, value) in resolved.extra_headers.iter() {
         up = up.header(name, value);
+    }
+    // Cloud Code Assist 上游(impersonate gemini-cli)**必须**用 GeminiCLI UA
+    // + X-Goog-Api-Client 才会命中"官方 gemini-cli 客户端"分支;漏 / 错值
+    // 上游会按"非官方 wire"路径处理(latent silent failure / quota 划归不同
+    // bucket)。强制 override inbound/extra_headers 的同名值 — 这是 Google
+    // 协议必需,不是用户可选。参考:CLIProxyAPI `header_utils.go`。
+    if matches!(
+        resolved.auth_scheme,
+        crate::resolver::AuthScheme::GoogleOauthCloudCode
+    ) {
+        up = up.header(
+            "User-Agent",
+            codex_app_transfer_gemini_oauth::detect_user_agent(),
+        );
+        up = up.header(
+            "X-Goog-Api-Client",
+            codex_app_transfer_gemini_oauth::X_GOOG_API_CLIENT,
+        );
     }
     let req = up.build()?;
     let outbound_headers_snapshot = req.headers().clone();
@@ -787,9 +879,46 @@ fn body_model(body: &[u8]) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// 把 [`codex_app_transfer_gemini_oauth::ServiceError`] 分类成 [`ForwardError::
+/// OauthUnavailable`] 的 `needs_login` flag。逻辑提出独立 fn 方便单测覆盖每条
+/// case 的 routing(2026-05-11 review 反馈)。
+///
+/// 分类规则:
+/// - `NotLoggedIn` → `needs_login=true`(token 文件不存在)
+/// - `Token(_)` → `needs_login=true`(token 文件 IO/JSON 错,大概率 corrupt)
+/// - `Refresh(TokenStatus { body, .. })` → 解析 body 为 JSON,看 RFC 6749
+///   `error` 字段是不是 `"invalid_grant"`(refresh_token 被 revoke / 已用过)→
+///   `needs_login=true`。其他 `error` 值(如 `invalid_client` / `unauthorized_
+///   client`)是 client 配置错,**也**需要重登(可能是凭证错)
+/// - `Refresh(其他)` → 网络/TLS/JSON 解析等临时错 → `needs_login=false`
+fn classify_oauth_service_error(e: codex_app_transfer_gemini_oauth::ServiceError) -> ForwardError {
+    use codex_app_transfer_gemini_oauth::{FlowError, ServiceError};
+    let needs_login = match &e {
+        ServiceError::NotLoggedIn | ServiceError::Token(_) => true,
+        ServiceError::Refresh(FlowError::TokenStatus { body, .. }) => {
+            // RFC 6749 §5.2 标准错误 code 走 JSON `error` 字段精确匹配,**不**
+            // substring `body.contains` 防 "description: ...invalid_grant_request_id"
+            // 等假阳性。
+            const REVOCATION_CODES: &[&str] =
+                &["invalid_grant", "invalid_client", "unauthorized_client"];
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .map(|code| REVOCATION_CODES.contains(&code.as_str()))
+                .unwrap_or(false)
+        }
+        ServiceError::Refresh(_) => false, // 网络/TLS/解析等临时错
+    };
+    ForwardError::OauthUnavailable {
+        reason: e.to_string(),
+        needs_login,
+    }
+}
+
 fn inject_auth(
     mut req: reqwest::RequestBuilder,
     resolved: &ResolvedProvider,
+    oauth_bearer: Option<&str>,
 ) -> reqwest::RequestBuilder {
     match resolved.auth_scheme {
         AuthScheme::Bearer => {
@@ -800,6 +929,13 @@ fn inject_auth(
         }
         AuthScheme::GoogleApiKey => {
             req = req.header("x-goog-api-key", resolved.api_key.clone());
+        }
+        AuthScheme::GoogleOauthCloudCode => {
+            // 调用方在 build_and_send_upstream 入口处已 await 过 OAuth token,
+            // 这里单纯 Bearer 注入。oauth_bearer 必须 Some(否则上游会 401)
+            if let Some(token) = oauth_bearer {
+                req = req.header("authorization", format!("Bearer {token}"));
+            }
         }
         AuthScheme::None => {}
     }
@@ -895,6 +1031,213 @@ mod tests {
         assert!(
             message.starts_with("Previous response with id"),
             "措辞对齐 OpenAI 服务端,实际 {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_unavailable_renders_401_with_login_required_code_when_needs_login() {
+        // **Critical** silent-failure C3 修(2026-05-11):OAuth 失败必须返
+        // 401 + structured code "oauth_login_required" 让用户看到可操作提示,
+        // 不能走 generic 502 + plain text "proxy error: invalid header: ..."
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let err = ForwardError::OauthUnavailable {
+            reason: "token file missing".into(),
+            needs_login: true,
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            ctype.starts_with("application/json"),
+            "content-type 必须 JSON,实际 {ctype}"
+        );
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["code"], "oauth_login_required");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("re-run login"),
+            "message 必须含 re-login hint,实际 {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_unavailable_renders_401_with_refresh_failed_code_when_transient() {
+        // 临时网络错误 → needs_login=false → code "oauth_token_refresh_failed",
+        // 文案不让用户重登(避免误导用户重做 OAuth 当成永久错误)
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let err = ForwardError::OauthUnavailable {
+            reason: "TLS handshake failed".into(),
+            needs_login: false,
+        };
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["error"]["code"], "oauth_token_refresh_failed");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("retry"),
+            "临时错误 message 应提示 retry,实际 {message}"
+        );
+        assert!(
+            !message.contains("re-run login"),
+            "临时错误 message 不该让用户重登,实际 {message}"
+        );
+    }
+
+    #[test]
+    fn classify_not_logged_in_needs_login() {
+        use codex_app_transfer_gemini_oauth::ServiceError;
+        let result = classify_oauth_service_error(ServiceError::NotLoggedIn);
+        match result {
+            ForwardError::OauthUnavailable { needs_login, .. } => {
+                assert!(needs_login, "NotLoggedIn 必须 needs_login=true");
+            }
+            other => panic!("期待 OauthUnavailable,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_refresh_invalid_grant_needs_login() {
+        use codex_app_transfer_gemini_oauth::{FlowError, ServiceError};
+        // Google /token revocation response 标准 shape:`{"error":"invalid_grant",...}`
+        let body =
+            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+        let result = classify_oauth_service_error(ServiceError::Refresh(FlowError::TokenStatus {
+            status: 400,
+            body: body.to_owned(),
+        }));
+        match result {
+            ForwardError::OauthUnavailable { needs_login, .. } => {
+                assert!(
+                    needs_login,
+                    "invalid_grant 必须 needs_login=true 让用户重登"
+                );
+            }
+            other => panic!("期待 OauthUnavailable,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_refresh_substring_false_match_does_not_trigger_needs_login() {
+        use codex_app_transfer_gemini_oauth::{FlowError, ServiceError};
+        // 防御 substring 假阳性:body 含 "invalid_grant_request_id" 但 `error` 字段
+        // 是 "server_error" — 不该误归 needs_login
+        let body = r#"{"error":"server_error","error_description":"correlated invalid_grant_request_id=xyz"}"#;
+        let result = classify_oauth_service_error(ServiceError::Refresh(FlowError::TokenStatus {
+            status: 500,
+            body: body.to_owned(),
+        }));
+        match result {
+            ForwardError::OauthUnavailable { needs_login, .. } => {
+                assert!(
+                    !needs_login,
+                    "JSON `error` 不是 invalid_grant 时不该 needs_login(防 substring 假阳性)"
+                );
+            }
+            other => panic!("期待 OauthUnavailable,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_refresh_network_error_does_not_need_login() {
+        use codex_app_transfer_gemini_oauth::{FlowError, ServiceError};
+        let result = classify_oauth_service_error(ServiceError::Refresh(FlowError::TokenParse(
+            "TLS handshake failed".into(),
+        )));
+        match result {
+            ForwardError::OauthUnavailable { needs_login, .. } => {
+                assert!(!needs_login, "网络/TLS 错不该让用户重登(临时错可重试)");
+            }
+            other => panic!("期待 OauthUnavailable,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inject_auth_google_oauth_cloud_code_with_token_sets_bearer() {
+        // **Critical** test gap(2026-05-11):inject_auth GoogleOauthCloudCode
+        // 分支 0 直接测试。这里 build mock RequestBuilder + 注入 OAuth Bearer
+        let resolved = ResolvedProvider {
+            provider_id: "test".into(),
+            upstream_base: "https://cloudcode-pa.googleapis.com".into(),
+            api_key: String::new(), // OAuth 路径 api_key 为空
+            extra_headers: HeaderMap::new(),
+            rewritten_model: None,
+            provider: std::sync::Arc::new(codex_app_transfer_registry::Provider {
+                id: "test".into(),
+                name: "test".into(),
+                base_url: "https://cloudcode-pa.googleapis.com".into(),
+                auth_scheme: "google_oauth_cloud_code".into(),
+                api_format: "gemini_cli_oauth".into(),
+                api_key: String::new(),
+                models: indexmap::IndexMap::new(),
+                extra_headers: indexmap::IndexMap::new(),
+                model_capabilities: indexmap::IndexMap::new(),
+                request_options: indexmap::IndexMap::new(),
+                is_builtin: true,
+                sort_index: 0,
+                extra: indexmap::IndexMap::new(),
+            }),
+            auth_scheme: AuthScheme::GoogleOauthCloudCode,
+        };
+        let client = reqwest::Client::new();
+        let req = client.post("https://cloudcode-pa.googleapis.com/v1internal:test");
+        let req = inject_auth(req, &resolved, Some("ya29.test-bearer"));
+        let built = req.build().unwrap();
+        let auth = built
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer ya29.test-bearer");
+        // 不该误用 GoogleApiKey 的 x-goog-api-key
+        assert!(built.headers().get("x-goog-api-key").is_none());
+    }
+
+    #[test]
+    fn inject_auth_google_oauth_cloud_code_with_none_skips_silently() {
+        // 文档 lock — None bearer 时 inject_auth 不写 Authorization。这是 silent
+        // skip(memory note),实际生产 build_and_send_upstream 会先 await
+        // ensure_valid_access_token 在前面失败,不该走到这里。本测试只防 future
+        // 重构把 if let Some 改成 unwrap 导致 panic。
+        let resolved = ResolvedProvider {
+            provider_id: "test".into(),
+            upstream_base: "https://cloudcode-pa.googleapis.com".into(),
+            api_key: String::new(),
+            extra_headers: HeaderMap::new(),
+            rewritten_model: None,
+            provider: std::sync::Arc::new(codex_app_transfer_registry::Provider {
+                id: "test".into(),
+                name: "test".into(),
+                base_url: "https://cloudcode-pa.googleapis.com".into(),
+                auth_scheme: "google_oauth_cloud_code".into(),
+                api_format: "gemini_cli_oauth".into(),
+                api_key: String::new(),
+                models: indexmap::IndexMap::new(),
+                extra_headers: indexmap::IndexMap::new(),
+                model_capabilities: indexmap::IndexMap::new(),
+                request_options: indexmap::IndexMap::new(),
+                is_builtin: true,
+                sort_index: 0,
+                extra: indexmap::IndexMap::new(),
+            }),
+            auth_scheme: AuthScheme::GoogleOauthCloudCode,
+        };
+        let client = reqwest::Client::new();
+        let req = client.post("https://cloudcode-pa.googleapis.com/v1internal:test");
+        let req = inject_auth(req, &resolved, None);
+        let built = req.build().unwrap();
+        assert!(
+            built.headers().get("authorization").is_none(),
+            "None bearer 不该注入 Authorization(等 build_and_send_upstream 先返 OauthUnavailable)"
         );
     }
 

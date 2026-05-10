@@ -34,11 +34,12 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 9 条 builtin presets:
+        // 当前 10 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
-        // / zhipu / bailian / minimax / google-ai-studio
+        // / zhipu / bailian / minimax / google-ai-studio / gemini-cli-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
-        assert_eq!(builtin_presets().len(), 9);
+        // (2026-05-11 加 Gemini CLI OAuth login preset)
+        assert_eq!(builtin_presets().len(), 10);
     }
 
     #[test]

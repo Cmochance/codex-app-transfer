@@ -151,7 +151,14 @@
     if (["responses", "openai_responses"].includes(v)) return { key: "responses", canonical: "responses" };
     if (["anthropic", "claude", "messages"].includes(v)) return { key: "anthropic", canonical: "anthropic" };
     if (["gemini_native", "google_ai_studio", "gemini"].includes(v)) return { key: "geminiNative", canonical: "gemini_native" };
+    if (["gemini_cli_oauth", "gemini_cli", "google_oauth_cloud_code"].includes(v)) return { key: "geminiCliOauth", canonical: "gemini_cli_oauth" };
     return { key: "openaiChat", canonical: "openai_chat" };
+  }
+
+  /// Gemini CLI OAuth 路径不需要 apiKey input,改 OAuth login UI block。
+  /// 返 true 表示当前协议是 OAuth 模式,调用方据此切换 form 显示
+  function isOauthApiFormat(apiFormat) {
+    return normalizeApiFormat(apiFormat).canonical === "gemini_cli_oauth";
   }
 
   function renderApiFormatDisplay(apiFormat) {
@@ -183,6 +190,8 @@
     // 协议切换 → 重渲 mappings UI 让 default required 状态跟当前协议同步
     // (direct 模式 default 解锁为可空,其他场景仍 required)
     setProviderMappings(providerFormMappings);
+    // OAuth 模式切换:apiFormat=gemini_cli_oauth 时隐藏 apiKey input,显示 OAuth UI
+    setOauthRowState(canonical);
   }
 
   // 控制 web_search 配置开关 row 的显示 + 初始 checkbox state + provider-specific
@@ -1116,6 +1125,180 @@
     if (label) label.classList.toggle("required", input.required);
   }
 
+  /// i18n template fill — 替代 ad-hoc `t(key).replace("{var}",val)`。fallback 行为:
+  /// 1) t() 返 key 字符串(missing key)→ console.warn + return key (silent-failure
+  ///    M1 修)。2) replace 后仍残留 `{var}` 占位 → console.warn 让 i18n 不全暴露
+  function tFmt(key, vars = {}) {
+    const tmpl = t(key);
+    if (tmpl === key) {
+      console.warn(`[i18n] missing key: ${key}`);
+    }
+    let out = tmpl;
+    for (const [k, v] of Object.entries(vars)) {
+      out = out.split(`{${k}}`).join(String(v ?? ""));
+    }
+    if (/\{[a-zA-Z_]+\}/.test(out)) {
+      console.warn(`[i18n] unsubstituted placeholder in "${key}": ${out}`);
+    }
+    return out;
+  }
+
+  /// Gemini CLI OAuth row 切换:apiFormat=gemini_cli_oauth 时隐藏 apiKey input,
+  /// 显示 OAuth login button + status widget。其他 apiFormat 隐藏 OAuth row。
+  /// 调用时机:form 加载 / apiFormat select 切换。
+  function setOauthRowState(apiFormat) {
+    const oauthRow = $("#providerOauthRow");
+    const apiKeyRow = $("#providerApiKeyRow");
+    const apiKeyInput = $("#providerApiKey");
+    const isOauth = isOauthApiFormat(apiFormat);
+    if (oauthRow) oauthRow.hidden = !isOauth;
+    if (apiKeyRow) apiKeyRow.hidden = isOauth;
+    // **silent-failure-hunter H3 修**:原 `required = !isOauth && req` 单调毁掉
+    // required 字段(切 OAuth 后 required=false,切回 openai_chat 仍 false)。改用
+    // dataset.origRequired 缓存,switch 回非 OAuth 时恢复
+    if (apiKeyInput) {
+      if (apiKeyInput.dataset.origRequired === undefined) {
+        apiKeyInput.dataset.origRequired = apiKeyInput.required ? "1" : "0";
+      }
+      if (isOauth) {
+        apiKeyInput.required = false;
+        // **不**清 apiKey 值 — 用户切回时不丢之前输入(security 上 value 也只在 DOM
+        // 内不进网络,泄漏面相同)。silent-failure-hunter H3 修
+      } else {
+        apiKeyInput.required = apiKeyInput.dataset.origRequired === "1";
+      }
+    }
+    if (isOauth) {
+      refreshOauthStatusUi().catch((e) => {
+        console.error("refresh oauth status failed:", e);
+      });
+    }
+  }
+
+  /// 调 GET /api/gemini-oauth/status 同步 UI 状态(已登录 / 未登录 / partial)。
+  /// 错误路径完整:清旧 i18n key + 复位 button visibility + structured error message
+  /// (silent-failure-hunter C1 修)
+  async function refreshOauthStatusUi() {
+    const statusEl = $("#oauthStatusText");
+    const loginBtn = $("#oauthLoginBtn");
+    const logoutBtn = $("#oauthLogoutBtn");
+    if (!statusEl) return;
+    try {
+      const status = await CCApi.getGeminiOauthStatus();
+      if (!status.loggedIn) {
+        statusEl.dataset.i18n = "geminiOauth.statusNotLoggedIn";
+        statusEl.textContent = tFmt("geminiOauth.statusNotLoggedIn");
+        statusEl.classList.remove("text-warning");
+        if (logoutBtn) logoutBtn.hidden = true;
+        if (loginBtn) {
+          loginBtn.hidden = false;
+          loginBtn.dataset.i18n = "geminiOauth.loginBtn";
+          loginBtn.textContent = tFmt("geminiOauth.loginBtn");
+        }
+      } else {
+        const expiresStr = status.expiresAt
+          ? new Date(status.expiresAt).toLocaleString()
+          : "?";
+        const tmplKey = status.projectId
+          ? "geminiOauth.statusLoggedIn"
+          : "geminiOauth.statusLoggedInNoProject";
+        statusEl.dataset.i18n = tmplKey;
+        statusEl.textContent = tFmt(tmplKey, {
+          email: status.email || "?",
+          projectId: status.projectId || "?",
+          expiresAt: expiresStr,
+        });
+        // partial state(无 projectId)加 visual cue(M3 修)
+        statusEl.classList.toggle("text-warning", !status.projectId);
+        if (logoutBtn) logoutBtn.hidden = false;
+        if (loginBtn) {
+          loginBtn.hidden = false;
+          // 已登录时改 button 文案为"切换账号"(reviewer #2 修)
+          loginBtn.dataset.i18n = "geminiOauth.switchAccountBtn";
+          loginBtn.textContent = tFmt("geminiOauth.switchAccountBtn");
+        }
+      }
+    } catch (e) {
+      const msg = e?.message || String(e);
+      statusEl.dataset.i18n = "geminiOauth.statusFetchFailed";
+      statusEl.textContent = tFmt("geminiOauth.statusFetchFailed", { error: msg });
+      statusEl.classList.add("text-warning");
+      // catch 路径**复位** button visibility 防 stale(C1 修)
+      if (loginBtn) {
+        loginBtn.hidden = false;
+        loginBtn.dataset.i18n = "geminiOauth.loginBtn";
+        loginBtn.textContent = tFmt("geminiOauth.loginBtn");
+      }
+      if (logoutBtn) logoutBtn.hidden = true;
+    }
+  }
+
+  /// OAuth login click handler — long-poll 等浏览器授权 + bootstrap project。
+  /// **silent-failure-hunter C2 修**:fetch 自带 timeout 风险(浏览器 ~ 90-300s vs
+  /// 后端 5min),browser timeout 后端继续成功 → frontend 看 fail 但 status 看 success
+  /// 矛盾 UX。修法:catch 不显 "failed" toast,而是显"timeout 等 status 刷新"+ refresh
+  async function handleOauthLogin() {
+    const loginBtn = $("#oauthLoginBtn");
+    const logoutBtn = $("#oauthLogoutBtn");
+    if (loginBtn) {
+      loginBtn.disabled = true;
+      loginBtn.textContent = tFmt("geminiOauth.loginBtnInProgress");
+    }
+    if (logoutBtn) logoutBtn.disabled = true;
+    try {
+      const result = await CCApi.loginGeminiOauth();
+      if (result.loggedIn && result.projectId) {
+        showToast(tFmt("geminiOauth.loginSuccess", {
+          email: result.email || "?",
+          projectId: result.projectId,
+        }));
+      } else if (result.loggedIn && !result.projectId) {
+        // partial state — token 不该在此分支被持久化(后端 commit C C2 修),但 UI 防御
+        showToast(tFmt("geminiOauth.loginPartial"));
+      } else if (result.error) {
+        showToast(tFmt("geminiOauth.loginFailed", { error: result.error }));
+      } else {
+        // 未知 shape — 把整个 response 序列化进 toast 给 user 看到(silent H1 修)
+        const dump = JSON.stringify(result).slice(0, 200);
+        console.error("OAuth login unknown response shape:", result);
+        showToast(tFmt("geminiOauth.loginFailed", { error: `unknown response: ${dump}` }));
+      }
+    } catch (e) {
+      // C2:浏览器 fetch timeout 而后端可能仍成功 — 不显 "failed",改提示"refreshing"
+      const msg = e?.message || String(e);
+      console.warn("OAuth login fetch error (backend may have succeeded):", msg);
+      showToast(`Login fetch interrupted (${msg}); refreshing status...`);
+    } finally {
+      if (loginBtn) loginBtn.disabled = false;
+      if (logoutBtn) logoutBtn.disabled = false;
+      // refreshOauthStatusUi 会按 status 设 button text(loginBtn / switchAccountBtn)
+      await refreshOauthStatusUi();
+    }
+  }
+
+  /// Logout click handler。**silent-failure-hunter H2 修**:logout 失败时显手动删
+  /// 提示而不是 blindly refresh status (那会让 user 看 logged in 没意识 token 还在)
+  async function handleOauthLogout() {
+    let failed = false;
+    try {
+      await CCApi.logoutGeminiOauth();
+      showToast(tFmt("geminiOauth.logoutConfirmed"));
+    } catch (e) {
+      failed = true;
+      const msg = e?.message || String(e);
+      showToast(tFmt("geminiOauth.logoutFailedManual", { error: msg }));
+      const statusEl = $("#oauthStatusText");
+      if (statusEl) {
+        statusEl.dataset.i18n = "geminiOauth.logoutFailedManual";
+        statusEl.textContent = tFmt("geminiOauth.logoutFailedManual", { error: msg });
+        statusEl.classList.add("text-warning");
+      }
+    } finally {
+      // 失败时不刷新 status — 防覆盖 manual-delete 警告。成功时刷新让 UI 转 "未登录"
+      if (!failed) await refreshOauthStatusUi();
+    }
+  }
+
   function isVerifiedProviderId(id) {
     const value = String(id || "").toLowerCase();
     if (value === "kimi" || value === "kimi-code" || value.startsWith("kimi-")) return true;
@@ -1151,6 +1334,7 @@
     $("#providerAuth").value = "bearer";
     renderApiFormatDisplay("openai_chat");
     setApiFormatMode(false, "openai_chat");
+    setOauthRowState("openai_chat"); // P2.2 reset OAuth row 隐藏
     setWebSearchRow(false, false, null);
     setProviderMappings(emptyMappings());
     setUnverifiedBanner(false);
@@ -1181,6 +1365,7 @@
     selectedPreset = preset;
     renderApiFormatDisplay(preset.apiFormat);
     setApiFormatMode(!!preset.allowApiFormatSelection, preset.apiFormat);
+    setOauthRowState(preset.apiFormat); // P2.2 OAuth UI 切换
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     // Web Search 配置开关:preset 标支持 + preset.requestOptions.web_search_enabled
@@ -1238,8 +1423,10 @@
       }
     }
     setAuthSchemeValue(provider.authScheme);
-    renderApiFormatDisplay((matchedPreset && matchedPreset.apiFormat) || provider.apiFormat);
-    setApiFormatMode(false, (matchedPreset && matchedPreset.apiFormat) || provider.apiFormat);
+    const effectiveFormat = (matchedPreset && matchedPreset.apiFormat) || provider.apiFormat;
+    renderApiFormatDisplay(effectiveFormat);
+    setApiFormatMode(false, effectiveFormat);
+    setOauthRowState(effectiveFormat); // OAuth UI 切换(P2.2)
     // 编辑场景:支持判定走 matchedPreset.supportsWebSearch(自定义 provider 不命中
     // builtin → matchedPreset undefined → 不显示开关);初始 checkbox state 读
     // provider 实际保存的 requestOptions.web_search_enabled;hint 文案按
@@ -1678,6 +1865,22 @@
       }
       if (!editingProviderId && !payload.apiKey) {
         throw new Error(t("toast.directModeApiKeyRequired"));
+      }
+    }
+    // **code-reviewer #3 修**:gemini_cli_oauth 必须先 OAuth 登录才能 save。否则
+    // backend 存了 provider 但 extra.cloud_code_project_id 缺失,任何 chat 请求
+    // 都返 BadRequest "cloud_code_project_id required" — 前端拦下让 user 立即
+    // 知道要先登录,不是 save 后才发现 silently broken provider
+    if (payload.apiFormat === "gemini_cli_oauth") {
+      try {
+        const status = await CCApi.getGeminiOauthStatus();
+        if (!status.loggedIn || !status.projectId) {
+          throw new Error(t("geminiOauth.loginRequired"));
+        }
+      } catch (e) {
+        // 网络错也阻止 save — 不能让 unknown state 持久化
+        if (e.message && e.message.includes(t("geminiOauth.loginRequired"))) throw e;
+        throw new Error(`OAuth status check failed: ${e.message || e}`);
       }
     }
     if (editingProviderId) {
@@ -2395,6 +2598,16 @@
       }
       if (event.target.id === "providerApiFormatSelect") {
         updateApiFormatSelectDetail(event.target.value);
+      }
+    });
+
+    // P2.2 OAuth login/logout buttons —— delegate via closest() 防 future 嵌套
+    // <i> icon 时 event.target 是 <i> 而 .id 为空导致 dead button (silent-failure L1 修)
+    document.addEventListener("click", (event) => {
+      if (event.target?.closest?.("#oauthLoginBtn")) {
+        handleOauthLogin();
+      } else if (event.target?.closest?.("#oauthLogoutBtn")) {
+        handleOauthLogout();
       }
     });
 

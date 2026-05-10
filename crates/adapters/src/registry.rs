@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::gemini_cli::GeminiCliAdapter;
 use crate::gemini_native::GeminiNativeAdapter;
 use crate::openai_chat::OpenAiChatAdapter;
 use crate::passthrough::ResponsesPassthroughAdapter;
@@ -20,6 +21,7 @@ pub struct AdapterRegistry {
     responses: Arc<dyn Adapter>,
     responses_passthrough: Arc<dyn Adapter>,
     gemini_native: Arc<dyn Adapter>,
+    gemini_cli: Arc<dyn Adapter>,
 }
 
 impl AdapterRegistry {
@@ -29,6 +31,7 @@ impl AdapterRegistry {
             responses: Arc::new(ResponsesAdapter),
             responses_passthrough: Arc::new(ResponsesPassthroughAdapter),
             gemini_native: Arc::new(GeminiNativeAdapter),
+            gemini_cli: Arc::new(GeminiCliAdapter),
         }
     }
 
@@ -53,6 +56,9 @@ impl AdapterRegistry {
                 self.responses.clone()
             }
             "gemini_native" | "google_ai_studio" | "gemini" => self.gemini_native.clone(),
+            "gemini_cli_oauth" | "gemini_cli" | "google_oauth_cloud_code" => {
+                self.gemini_cli.clone()
+            }
             // 空字符串 / 未知值 → 跟 schema default 一致,fallback openai_chat
             _ => self.openai_chat.clone(),
         }

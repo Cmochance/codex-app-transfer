@@ -10,6 +10,10 @@ repository.workspace = true
 
 [dependencies]
 codex-app-transfer-registry = { path = "../registry" }
+# OAuth token store fallback —— GeminiCliAdapter 在 provider.extra.cloud_code_project_id
+# 缺失时直接从 ~/.codex-app-transfer/gemini-oauth.json 读 project_id(token 文件
+# 是 single source of truth,避免 sync_to_active_provider race 让 chat 路径全 fail)
+codex-app-transfer-gemini-oauth = { path = "../gemini_oauth" }
 axum = { version = "0.8", default-features = false, features = ["http1"] }
 bytes = "1"
 futures-core = "0.3"
@@ -25,6 +29,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # tracing — namespace 展平 + warn_once_drop_tool 用 tracing::warn / debug 落日志,
 # 跟 crates/proxy 同版本对齐(proxy/Cargo.toml:29 也是 0.1)。
 tracing = "0.1"
+# CSRF state token + UUID v4 for outer envelope user_prompt_id
+getrandom = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

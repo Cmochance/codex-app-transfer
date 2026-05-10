@@ -8,6 +8,7 @@ members = [
     "crates/proxy",
     "crates/adapters",
     "crates/codex_integration",
+    "crates/gemini_oauth",
     "xtask",
     # 后续阶段陆续启用:
     # "crates/session_cache",
