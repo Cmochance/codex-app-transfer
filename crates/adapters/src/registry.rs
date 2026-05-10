@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::gemini_native::GeminiNativeAdapter;
 use crate::openai_chat::OpenAiChatAdapter;
 use crate::passthrough::ResponsesPassthroughAdapter;
 use crate::responses::ResponsesAdapter;
@@ -18,6 +19,7 @@ pub struct AdapterRegistry {
     openai_chat: Arc<dyn Adapter>,
     responses: Arc<dyn Adapter>,
     responses_passthrough: Arc<dyn Adapter>,
+    gemini_native: Arc<dyn Adapter>,
 }
 
 impl AdapterRegistry {
@@ -26,6 +28,7 @@ impl AdapterRegistry {
             openai_chat: Arc::new(OpenAiChatAdapter),
             responses: Arc::new(ResponsesAdapter),
             responses_passthrough: Arc::new(ResponsesPassthroughAdapter),
+            gemini_native: Arc::new(GeminiNativeAdapter),
         }
     }
 
@@ -49,6 +52,7 @@ impl AdapterRegistry {
             "responses" | "openai_responses" | "anthropic" | "claude" | "messages" => {
                 self.responses.clone()
             }
+            "gemini_native" | "google_ai_studio" | "gemini" => self.gemini_native.clone(),
             // 空字符串 / 未知值 → 跟 schema default 一致,fallback openai_chat
             _ => self.openai_chat.clone(),
         }

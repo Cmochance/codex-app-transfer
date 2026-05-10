@@ -739,6 +739,9 @@ fn inject_auth(
         AuthScheme::XApiKey => {
             req = req.header("x-api-key", resolved.api_key.clone());
         }
+        AuthScheme::GoogleApiKey => {
+            req = req.header("x-goog-api-key", resolved.api_key.clone());
+        }
         AuthScheme::None => {}
     }
     req

@@ -37,6 +37,10 @@ pub struct ResolvedProvider {
 pub enum AuthScheme {
     Bearer,
     XApiKey,
+    /// Google AI Studio Gemini API:`x-goog-api-key: <api_key>` header.
+    /// LiteLLM 注释(`common_utils.py:402`):API key 不放 URL,放 header
+    /// 防 traceback 泄露。
+    GoogleApiKey,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -45,6 +49,9 @@ impl AuthScheme {
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "x-api-key" | "x_api_key" | "xapikey" | "apikey" => AuthScheme::XApiKey,
+            "google_api_key" | "x-goog-api-key" | "x_goog_api_key" | "google" | "gemini" => {
+                AuthScheme::GoogleApiKey
+            }
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
@@ -303,6 +310,15 @@ mod tests {
         assert_eq!(AuthScheme::parse("bearer"), AuthScheme::Bearer);
         assert_eq!(AuthScheme::parse("Bearer"), AuthScheme::Bearer);
         assert_eq!(AuthScheme::parse("x-api-key"), AuthScheme::XApiKey);
+        assert_eq!(
+            AuthScheme::parse("google_api_key"),
+            AuthScheme::GoogleApiKey
+        );
+        assert_eq!(
+            AuthScheme::parse("x-goog-api-key"),
+            AuthScheme::GoogleApiKey
+        );
+        assert_eq!(AuthScheme::parse("gemini"), AuthScheme::GoogleApiKey);
         assert_eq!(AuthScheme::parse(""), AuthScheme::None);
         assert_eq!(AuthScheme::parse("unknown"), AuthScheme::Bearer);
     }
