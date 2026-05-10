@@ -935,7 +935,7 @@
         <span class="drag-handle preset-plus"><i class="bi ${added ? "bi-check2" : "bi-plus-lg"}"></i></span>
         <span class="provider-logo">${iconMarkup(preset)}</span>
         <span class="provider-main"><strong>${escapeHtml(preset.name)}</strong><span class="truncate">${escapeHtml(preset.baseUrl)}</span></span>
-        <span class="provider-meta">${escapeHtml(preset.apiFormat)}</span>
+        <span class="provider-meta">${escapeHtml(t(`apiFormatDisplay.${normalizeApiFormat(preset.apiFormat).key}.name`))}</span>
         <span class="provider-actions"><span class="compact-enable ghost"><i class="bi ${added ? "bi-check2" : "bi-plus-lg"}"></i><span>${added ? t("providers.added") : t("providers.add")}</span></span></span>
       </button>
     `;

@@ -162,9 +162,14 @@
         id: p.id,
         name: p.name,
         baseUrl: p.baseUrl,
-        // 显示标签:仅显式 responses 系列才显示 "Responses",其它(含未知 / 缺失)显示 "OpenAI",
-        // 跟后端 normalize 行为对齐。当前 7 个 builtin preset 全部 openai_chat。
-        apiFormat: ['responses', 'openai_responses', 'anthropic', 'claude', 'messages'].includes(p.apiFormat) ? 'Responses' : 'OpenAI',
+        // 直接 passthrough 后端原值,让前端 normalizeApiFormat 唯一负责协议规范化。
+        // **修复历史(2026-05-10)**:之前这里 hardcode `?'Responses':'OpenAI'`,
+        // 把任何不在白名单的 apiFormat(包括新加的 `gemini_native`)强制改写成
+        // 字面量 `'OpenAI'`,导致 normalizeApiFormat 永远命中 default openai_chat
+        // 分支,UI 显示协议名错误。passthrough + 让 normalizeApiFormat 处理是
+        // 唯一正确做法(它已识别 openai_chat / responses / anthropic / gemini_native
+        // 各种子值,加新协议只需更新 normalizeApiFormat,不需要改这里)。
+        apiFormat: p.apiFormat || 'openai_chat',
         authScheme: p.authScheme || 'bearer',
         models: p.models || {},
         modelOptions: p.modelOptions || {},
