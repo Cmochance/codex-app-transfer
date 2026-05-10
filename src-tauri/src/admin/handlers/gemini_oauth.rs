@@ -78,32 +78,65 @@ fn next_epoch() -> u64 {
 /// poison 时直接 recover 让后续路径继续 + warn log 让 operator 看到曾发生
 /// panic。silent ignore 会让 cancel 整个 silent 失效。
 fn lock_cancel_slot() -> std::sync::MutexGuard<'static, Option<(u64, watch::Sender<bool>)>> {
-    cancel_slot().lock().unwrap_or_else(|poison| {
-        tracing::warn!(
-            error_id = "OAUTH_CANCEL_SLOT_POISONED",
-            "OAuth cancel slot mutex poisoned by prior panic; recovering — verify last login state"
-        );
-        poison.into_inner()
-    })
+    lock_cancel_slot_with_poison_flag().0
 }
 
-/// 取出并触发当前 in-flight login 的 cancel signal(若有)。返 true 表示真有
-/// 一个 login 被取消,false 表示当时没 in-flight。idempotent 安全。
+/// 跟 [`lock_cancel_slot`] 一样但额外返 `was_poisoned: bool` —— H1 修让 cancel
+/// response 能区分 "没 in-flight" vs "lock 过 poison recovery 之后没 in-flight"。
+/// 第二种状态意味着之前有过 panic,user 当下看到 cancelled:false 不知道发生过
+/// 什么 — 此 flag 让 response 携带这个信息让 UI 给 operator 提示。
+fn lock_cancel_slot_with_poison_flag() -> (
+    std::sync::MutexGuard<'static, Option<(u64, watch::Sender<bool>)>>,
+    bool,
+) {
+    match cancel_slot().lock() {
+        Ok(g) => (g, false),
+        Err(poison) => {
+            tracing::warn!(
+                error_id = "OAUTH_CANCEL_SLOT_POISONED",
+                "OAuth cancel slot mutex poisoned by prior panic; recovering — verify last login state"
+            );
+            (poison.into_inner(), true)
+        }
+    }
+}
+
+/// `cancel_in_flight_login` 的结构化结果(H1 修):caller(handler / app exit /
+/// 新 login 抢占)能区分三种状态:
+/// - `cancelled=true`:slot 真有 in-flight,已发 cancel signal
+/// - `cancelled=false, slot_recovered=false`:slot 当前为空,没 in-flight
+/// - `cancelled=false, slot_recovered=true`:lock 过 poison recovery,本身没
+///   in-flight,但说明之前有过 panic — operator 应去看 logs
+#[derive(Debug, Clone, Copy)]
+pub struct CancelOutcome {
+    pub cancelled: bool,
+    pub slot_recovered: bool,
+}
+
+/// 取出并触发当前 in-flight login 的 cancel signal(若有)。idempotent 安全。
+/// 返 [`CancelOutcome`] 让 caller 区分 cancel / no-in-flight / poison-recovery
+/// 三种状态(H1 修)。
 ///
 /// 调用场景:① DELETE /login/cancel 用户主动按"取消";② app RunEvent::Exit
 /// 钩子防 5min 后 token persist 进 disk(user 已经退出 app);③ 新 login 启
 /// 动前抢占旧 login(防 user 连点 2 次"登录"按钮 → 2 个 loopback server 抢
 /// port + 2 个 OAuth flow 互相覆盖)
-pub fn cancel_in_flight_login() -> bool {
-    if let Some((_epoch, sender)) = lock_cancel_slot().take() {
+pub fn cancel_in_flight_login() -> CancelOutcome {
+    let (mut guard, slot_recovered) = lock_cancel_slot_with_poison_flag();
+    let cancelled = if let Some((_epoch, sender)) = guard.take() {
         // watch::send(true) 把当前 value 设 true 通知所有 clone 的 receiver。
         // send 失败(所有 receiver 已 drop)等价于 flow 已结束,无 op。
         // **C2 修**:此 send 触发的 cancel 不仅 OAuth flow 收到,login_handler
         // 持的 receiver clone 也会让 bootstrap/persist/sync 阶段 select! 退出
         let _ = sender.send(true);
-        return true;
+        true
+    } else {
+        false
+    };
+    CancelOutcome {
+        cancelled,
+        slot_recovered,
     }
-    false
 }
 
 /// 进程级共享的 reqwest::Client,专门给 OAuth login flow + Cloud Code Assist
@@ -165,16 +198,30 @@ pub fn routes() -> Router<AdminState> {
 }
 
 /// `DELETE /api/gemini-oauth/login/cancel` — 取消当前 in-flight OAuth login。
-/// 响应 `{ cancelled: bool }`(true=确实有 in-flight 被取消,false=没 in-flight)。
+/// 响应 `{ cancelled: bool, slotRecovered: bool }`(H1 修):
+/// - `cancelled=true`:真有 in-flight 被取消
+/// - `cancelled=false, slotRecovered=false`:没 in-flight (no-op)
+/// - `cancelled=false, slotRecovered=true`:lock 过 poison recovery — 本次没
+///   in-flight,但之前有过 panic,UI 应给 operator hint 去看 logs
 async fn cancel_login_handler() -> impl IntoResponse {
-    let cancelled = cancel_in_flight_login();
-    if cancelled {
+    let outcome = cancel_in_flight_login();
+    if outcome.cancelled {
         tracing::info!("OAuth login cancelled by user request");
+    } else if outcome.slot_recovered {
+        tracing::warn!(
+            error_id = "OAUTH_CANCEL_NOOP_AFTER_POISON",
+            "OAuth cancel requested, no in-flight login but slot had been poison-recovered \
+             — earlier panic in cancel-related path,operator 应查 OAUTH_CANCEL_SLOT_POISONED log"
+        );
     } else {
-        // M2: false 也 log debug 让 "cancel button does nothing" 类报告可追
+        // false 也 log debug 让 "cancel button does nothing" 类报告可追
         tracing::debug!("OAuth cancel requested but no in-flight login");
     }
-    Json(json!({ "cancelled": cancelled })).into_response()
+    Json(json!({
+        "cancelled": outcome.cancelled,
+        "slotRecovered": outcome.slot_recovered,
+    }))
+    .into_response()
 }
 
 /// `GET /api/gemini-oauth/status` — 返当前 token 状态。
@@ -626,6 +673,106 @@ mod tests {
             std::ptr::eq(c1, c2) && std::ptr::eq(c2, c3),
             "shared_oauth_http_client 必须每次返同一 OnceLock 实例,实测不同 → 没复用 connection pool"
         );
+    }
+
+    /// **H3 修**(silent-failure-hunter):preemption race test 加端到端 signal
+    /// 通路验证 — 老 sync test 只验 slot epoch 逻辑,没验 watch::Sender::send(true)
+    /// → Receiver::changed().await 真触发。本测试用 #[tokio::test] 把 receiver
+    /// await 起来,B 抢占 send(true) 后 A 的 receiver 必须立即看到 true。
+    #[tokio::test]
+    async fn preemption_actually_delivers_cancel_signal_to_receiver() {
+        // 清空残留
+        {
+            let _ = lock_cancel_slot().take();
+        }
+        // 1. login A 注册:持 receiver 准备 await
+        let epoch_a = next_epoch();
+        let (tx_a, mut rx_a) = watch::channel::<bool>(false);
+        {
+            let mut slot = lock_cancel_slot();
+            slot.replace((epoch_a, tx_a));
+        }
+        assert!(!*rx_a.borrow(), "初始 cancel 状态应为 false");
+
+        // 2. spawn 一个 task 模拟 OAuth flow 的 cancel-aware select arm —
+        // 等 receiver 看到 true 立即返。如果 send 没真触发,这个 task 永远 hang
+        let watcher = tokio::spawn(async move {
+            loop {
+                if *rx_a.borrow() {
+                    return "cancelled";
+                }
+                if rx_a.changed().await.is_err() {
+                    return "sender_dropped"; // 发生时也 OK,等价 sender drop=cancel
+                }
+            }
+        });
+
+        // 3. login B 抢占
+        let epoch_b = next_epoch();
+        let (tx_b, _rx_b) = watch::channel::<bool>(false);
+        let prev_sender = {
+            let mut slot = lock_cancel_slot();
+            slot.replace((epoch_b, tx_b))
+        };
+        // 关键:B 真的对 A 的 sender 触发 send(true) — 模拟 login_handler
+        // 抢占语义里的 `let _ = prev_sender.send(true)`
+        if let Some((_, tx_a_taken)) = prev_sender {
+            let _ = tx_a_taken.send(true);
+        }
+
+        // 4. A 的 watcher 必须在 100ms 内收到 cancel(端到端 signal delivery 验证)
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), watcher).await;
+        match result {
+            Ok(Ok(reason)) => {
+                assert!(
+                    reason == "cancelled" || reason == "sender_dropped",
+                    "watcher 应收到 cancel,实际 {reason}"
+                );
+            }
+            Ok(Err(e)) => panic!("watcher task panicked: {e:?}"),
+            Err(_) => panic!("watcher 100ms 内没收到 cancel — preemption signal delivery 没生效"),
+        }
+
+        // cleanup
+        {
+            let _ = lock_cancel_slot().take();
+        }
+    }
+
+    /// **H1 修**:cancel_in_flight_login 返 CancelOutcome 区分 cancelled /
+    /// no-in-flight / poison-recovery 三种状态,response 携带 slotRecovered flag。
+    #[test]
+    fn cancel_no_in_flight_returns_distinguishable_outcome() {
+        // 清空 slot 模拟 "无 in-flight"
+        {
+            let _ = lock_cancel_slot().take();
+        }
+        let outcome = cancel_in_flight_login();
+        assert!(!outcome.cancelled, "无 in-flight 时 cancelled 应 false");
+        assert!(
+            !outcome.slot_recovered,
+            "正常 lock 路径 slot_recovered 应 false"
+        );
+    }
+
+    #[test]
+    fn cancel_with_in_flight_returns_cancelled_true() {
+        {
+            let _ = lock_cancel_slot().take();
+        }
+        let epoch = next_epoch();
+        let (tx, _rx) = watch::channel::<bool>(false);
+        {
+            let mut slot = lock_cancel_slot();
+            slot.replace((epoch, tx));
+        }
+        let outcome = cancel_in_flight_login();
+        assert!(outcome.cancelled, "有 in-flight 时 cancelled 应 true");
+        assert!(
+            !outcome.slot_recovered,
+            "正常 lock 路径 slot_recovered false"
+        );
+        // cleanup not needed — cancel 已 take
     }
 
     /// 写一个特定 providers 数组到 disk(测试 fixture)
