@@ -30,9 +30,9 @@ use futures_core::Stream;
 use futures_util::TryStreamExt;
 use thiserror::Error;
 
+use crate::diagnostics::{write_upstream_error_bundle, UpstreamErrorBundleInput};
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
-use crate::diagnostics::{write_upstream_error_bundle, UpstreamErrorBundleInput};
 
 #[derive(Clone)]
 pub struct ProxyState {

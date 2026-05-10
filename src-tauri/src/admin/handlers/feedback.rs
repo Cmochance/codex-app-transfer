@@ -189,7 +189,12 @@ fn sanitize_codex_toml(raw: &str) -> String {
             out.push(line.to_owned());
             continue;
         }
-        let key = trimmed.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+        let key = trimmed
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         let sensitive = key.contains("api_key")
             || key.contains("apikey")
             || key.contains("token")
