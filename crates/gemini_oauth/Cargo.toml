@@ -36,3 +36,5 @@ url = "2"
 # 单测起 mock OAuth server / cloudcode-pa endpoint
 wiremock = "0.6"
 tempfile = "3"
+# 并发测试用 join_all
+futures-util = "0.3"

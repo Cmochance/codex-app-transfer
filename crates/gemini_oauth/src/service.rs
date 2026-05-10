@@ -21,7 +21,8 @@ use std::sync::OnceLock;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use super::flow::{refresh_access_token, FlowError};
+use super::constants::TOKEN_ENDPOINT;
+use super::flow::{refresh_access_token_at, FlowError};
 use super::token::{OauthToken, TokenError, TokenStore};
 
 /// 进程级 refresh mutex —— 同一进程内任何 `ensure_valid_access_token` 并发调用
@@ -58,6 +59,20 @@ pub async fn ensure_valid_access_token(
     http: &reqwest::Client,
     store: &TokenStore,
 ) -> Result<String, ServiceError> {
+    ensure_valid_access_token_at(http, store, TOKEN_ENDPOINT).await
+}
+
+/// 内部版 — 接收可定制 token endpoint。`pub(crate)` 让 crate 外**完全不可见**
+/// (silent-failure-hunter H-1 修),只 crate 内 production [`ensure_valid_access_
+/// token`] 走 const + tests 调 mock。
+///
+/// 单飞 mutex 在 const endpoint 路径生效;测试路径每次调用都用同一 mock URL
+/// 也共享同一 mutex(进程级 OnceLock),所以测试也能验证并发 short-circuit。
+pub(crate) async fn ensure_valid_access_token_at(
+    http: &reqwest::Client,
+    store: &TokenStore,
+    token_endpoint: &str,
+) -> Result<String, ServiceError> {
     // 第一次 load(无锁):大多数情况 token 没过期,直接返避免 mutex contention
     let token = store.load()?.ok_or(ServiceError::NotLoggedIn)?;
     if !token.should_refresh() {
@@ -78,8 +93,9 @@ pub async fn ensure_valid_access_token(
         expiry_date = token.expiry_date,
         "OAuth token 过期窗口内,触发 refresh(single-flight critical section)"
     );
-    let refreshed = refresh_access_token(
+    let refreshed = refresh_access_token_at(
         http,
+        token_endpoint,
         &token.refresh_token,
         token.id_token.clone(),
         token.email.clone(),
@@ -154,6 +170,89 @@ mod tests {
         let http = reqwest::Client::new();
         let err = ensure_valid_access_token(&http, &store).await.unwrap_err();
         assert!(matches!(err, ServiceError::NotLoggedIn));
+    }
+
+    /// **Critical** test gap (从 silent-failure-hunter + pr-test-analyzer 双 review
+    /// 标 critical 8/10):验单飞 mutex 真的 short-circuit 并发 refresh,不让两个
+    /// 并发请求各自调一次 Google `/token`(后者会让 refresh_token 被 revoke 永久
+    /// brick token)。用 wiremock 计数实际调用次数。
+    #[tokio::test]
+    async fn concurrent_callers_share_single_refresh_call() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        struct CountingResponder {
+            counter: Arc<AtomicU64>,
+        }
+        impl Respond for CountingResponder {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "ya29.refreshed-by-single-flight",
+                    "expires_in": 3600,
+                    "scope": "test-scope",
+                    "token_type": "Bearer",
+                    "id_token": "ey.refreshed.id"
+                }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        let counter = Arc::new(AtomicU64::new(0));
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(CountingResponder {
+                counter: Arc::clone(&counter),
+            })
+            .mount(&server)
+            .await;
+        let token_endpoint = format!("{}/token", server.uri());
+
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(TokenStore::at_path(dir.path().join("token.json")));
+        // expiry 在 30s 后(应该触发 refresh)
+        let expiring = fresh_token(30);
+        store.save(&expiring).unwrap();
+
+        let http = Arc::new(reqwest::Client::new());
+
+        // 5 并发调用 ensure_valid_access_token_at
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let http = Arc::clone(&http);
+            let store = Arc::clone(&store);
+            let endpoint = token_endpoint.clone();
+            handles.push(tokio::spawn(async move {
+                ensure_valid_access_token_at(&http, &store, &endpoint).await
+            }));
+        }
+
+        let results: Vec<Result<String, ServiceError>> = futures_util::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|jh| jh.unwrap())
+            .collect();
+
+        // 5 个调用都必须成功
+        for r in &results {
+            assert!(
+                r.is_ok(),
+                "并发调用都应成功,实际 err: {:?}",
+                r.as_ref().err()
+            );
+        }
+        // 都拿到 refreshed access_token(无论是首次 refresh 的还是 short-circuit 复用的)
+        for r in &results {
+            assert_eq!(r.as_ref().unwrap(), "ya29.refreshed-by-single-flight");
+        }
+        // **关键断言**:Google /token 应该只被调一次(其他 4 个并发都 short-circuit)
+        let actual_calls = counter.load(Ordering::SeqCst);
+        assert_eq!(
+            actual_calls, 1,
+            "single-flight mutex 必须 short-circuit 4/5 并发,只让 1 次 refresh 真正调 /token,实际 {actual_calls} 次"
+        );
     }
 
     #[tokio::test]

@@ -162,30 +162,49 @@ fn process_event(event: &[u8]) -> Vec<u8> {
                             Err(_) => payload, // 序列化失败极不正常,原样透传
                         }
                     } else if let Some(error) = obj.get("error") {
-                        // **Critical** silent-failure 修(2026-05-11):Cloud Code 上游有时
-                        // 在 HTTP 200 SSE 流中间发 `data: {"error":{...}}` 事件(quota 中途
+                        // **Critical** silent-failure 修(2026-05-11 完整版):Cloud Code 上游
+                        // 在 HTTP 200 SSE 流中间偶发 `data: {"error":{...}}` 事件(quota 中途
                         // 耗尽 / 项目权限丢 / 内部异常),没 `.response` wrap 字段。原版当
-                        // 普通 keepalive 透传 → native 状态机看不懂忽略 → 用户 Codex.app
-                        // 收到无 candidates 的空流,silent 完成。
+                        // keepalive silent 透传 → native 看不懂忽略 → 用户 Codex.app 收到
+                        // 无 candidates 的空流 silent 完成。
                         //
-                        // 修法:tracing::error! 落完整 body(operator 必看),把 event 改写
-                        // 成 Gemini wire 形式的 error JSON(`{"error":{...}}`) — native 状态
-                        // 机不直接识别此 inline error,但 finish() 会因 final_finish_reason
-                        // 仍是 None 走 C4 防御路径 emit `response.incomplete` + reason=
-                        // interrupted,client 至少能识别 stream 终止状态(虽不如 4xx/5xx
-                        // 路径的 response.failed 信息丰富,完整 envelope 注入留 followup)。
+                        // 完整修法:转成 Gemini wire 形式的合法事件 — emit 一条带 ⚠️ 前缀的
+                        // assistant text 把 upstream error.message 直接放给 user 看,加
+                        // finishReason=OTHER 让 native 状态机走完整 lifecycle(text delta +
+                        // text done + completed),client 收到的是 response.completed 含
+                        // "⚠️ Cloud Code error: <message>" 的 output_text 而不是空流。
                         let error_message = error
                             .get("message")
                             .and_then(|v| v.as_str())
                             .unwrap_or("(no message)");
+                        let error_code = error.get("code").and_then(|v| v.as_i64());
+                        let error_status = error.get("status").and_then(|v| v.as_str());
                         tracing::error!(
                             body = %payload,
+                            error_code = ?error_code,
+                            error_status = ?error_status,
                             message = %error_message,
-                            "Cloud Code 200 流中 inline error event;转 Gemini error 让 native 状态机走 incomplete 终态,防 silent 空流"
+                            "Cloud Code 200 流中 inline error event;转成 candidates[].text 让 user 看到 error.message"
                         );
-                        // 透传 error JSON 给 native 状态机(它不会构造 candidates 但会因
-                        // 缺 finishReason 在 EOF 时走 incomplete 路径)
-                        payload
+                        let display_text = format!("⚠️ Cloud Code error: {error_message}");
+                        // **关键**:finishReason 必须让 native 状态机产 status="incomplete"
+                        // 而不是 "completed"。`OTHER` 在 map_finish_reason 落到默认 "stop"
+                        // → emit_completed 走 completed 分支 → client 误以为成功(即便有 ⚠️
+                        // 文字 client 的 retry/telemetry 仍当 success)。改用 `SAFETY`:
+                        // map_finish_reason → "content_filter" + emit_completed 产
+                        // status="incomplete" + incomplete_details.reason="content_filter"。
+                        // 语义略偏(实际不是 safety block 是 upstream 内部错),但 ⚠️ 文字
+                        // 已说明真实原因,且 client 能正确识别"非 normal completion"
+                        let synthetic = serde_json::json!({
+                            "candidates": [{
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"text": display_text}]
+                                },
+                                "finishReason": "SAFETY"
+                            }]
+                        });
+                        synthetic.to_string()
                     } else {
                         // 真正的 keepalive(纯 comment / 心跳)— 原样透传
                         payload
@@ -273,17 +292,97 @@ mod tests {
     }
 
     #[test]
-    fn inline_error_event_logged_and_passed_through() {
-        // **Critical** silent-failure 修:Cloud Code 200 流中 `data: {"error":...}` event
-        // 不再被当 keepalive silent 吃掉。当前实现:tracing::error! 落 body + 透传 error JSON
-        // (native 状态机看不懂 → finish() 走 C4 incomplete 路径)。本测试 lock 透传行为,
-        // tracing log 由 tracing-subscriber 在生产环境下捕获(单测里 default subscriber drop)
+    fn inline_error_event_emits_synthetic_candidates_with_warning_text() {
+        // **Critical** silent-failure 修(完整版,2026-05-11 commit B):Cloud Code 200
+        // 流中 `data: {"error":...}` event 转成合法 Gemini wire 形式
+        // `{"candidates":[{"content":{"parts":[{"text":"⚠️ Cloud Code error: <msg>"}]}, finishReason:"OTHER"}]}`
+        // 让 native 状态机走完整 lifecycle (text delta + text done + completed) — user
+        // Codex.app 看到带 ⚠️ 前缀的 assistant 消息含 upstream error.message,而不是
+        // 当 keepalive silent 透传 → 空流终止
         let input = b"data: {\"error\":{\"code\":429,\"message\":\"quota exceeded\"}}\n\n";
         let out = run_unwrap(vec![input]);
-        assert!(out.contains("\"error\""));
-        assert!(out.contains("\"code\":429"));
-        // 没 .response wrap → 原 error JSON 应该出现在输出
-        assert!(out.contains("quota exceeded"));
+        // 不再透传原 error JSON
+        assert!(
+            !out.contains("\"code\":429"),
+            "原 error code 不该泄漏到 output(应转换成 user-friendly 形式)"
+        );
+        // 转成的合法 candidates wire 应包含 error.message 给 user 看到
+        assert!(out.contains("\"candidates\""));
+        assert!(out.contains("⚠️ Cloud Code error: quota exceeded"));
+        assert!(
+            out.contains("\"finishReason\":\"SAFETY\""),
+            "finishReason=SAFETY 让 native 状态机产 status=incomplete + reason=content_filter,\
+             不是 OTHER (会被映射到 stop=completed 误导 client 以为正常结束)"
+        );
+    }
+
+    /// **Integration test** — pipe `unwrap_cloud_code_sse_envelope` 输出喂给
+    /// `gemini_native::response::convert_gemini_to_responses_stream`,验整条链路
+    /// (Cloud Code SSE → unwrap → native 状态机 → Responses SSE)。
+    ///
+    /// 这是 silent-failure-hunter 标的 critical test gap:adapter 层每个 unit
+    /// 各自测了,但没测 unwrap + native pipeline 端到端 user-facing event sequence。
+    #[test]
+    fn integration_inline_error_produces_user_visible_warning_event_sequence() {
+        use crate::gemini_native::response::convert_gemini_to_responses_stream;
+        use futures_util::StreamExt;
+
+        let cloud_code_sse =
+            b"data: {\"error\":{\"code\":429,\"message\":\"quota exceeded mid-stream\"}}\n\n";
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from(cloud_code_sse.to_vec()))];
+        let cloud_code_input: ByteStream = Box::pin(stream::iter(chunks));
+
+        // unwrap layer 转 inline error → 合法 Gemini wire form
+        let unwrapped = unwrap_cloud_code_sse_envelope(cloud_code_input);
+        // native 状态机消费 unwrapped 流
+        let mut responses = convert_gemini_to_responses_stream(unwrapped, None, None);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut all = Vec::new();
+        runtime.block_on(async {
+            while let Some(item) = responses.next().await {
+                all.extend_from_slice(&item.unwrap());
+            }
+        });
+        let out = String::from_utf8(all).unwrap();
+
+        // user 看到的 SSE event 序列 — 必须有 lifecycle + text delta 含 error.message
+        assert!(
+            out.contains("event: response.created"),
+            "lifecycle 必须 emit response.created,实际:\n{out}"
+        );
+        assert!(
+            out.contains("event: response.in_progress"),
+            "lifecycle 必须 emit response.in_progress"
+        );
+        assert!(
+            out.contains("event: response.output_text.delta"),
+            "user 必须看到 text delta 含 error.message"
+        );
+        // error.message 必须出现在 user-visible 的 stream 里
+        assert!(
+            out.contains("quota exceeded mid-stream"),
+            "upstream error.message 必须传到 user 端 SSE,实际:\n{out}"
+        );
+        assert!(
+            out.contains("⚠️"),
+            "⚠️ 前缀必须出现让 user 知道这是 error 而非 normal output"
+        );
+        // **必须** terminal 是 incomplete 不是 completed,client 才能区分错误 vs 正常成功
+        // (silent-failure-hunter C-1 critical 修:OTHER → completed 让 client retry/telemetry
+        // 误判 success;改用 SAFETY → content_filter incomplete)
+        assert!(
+            out.contains("event: response.incomplete"),
+            "stream 必须 terminal=incomplete(不是 completed)让 client 识别 error 终态,实际:\n{out}"
+        );
+        assert!(
+            !out.contains("event: response.completed"),
+            "禁止 emit response.completed —— 那会让 client 误判 success,实际:\n{out}"
+        );
     }
 
     #[test]

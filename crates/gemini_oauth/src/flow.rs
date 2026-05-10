@@ -241,13 +241,38 @@ pub async fn refresh_access_token(
     existing_project_id: Option<String>,
     existing_scope: Option<String>,
 ) -> Result<OauthToken, FlowError> {
+    refresh_access_token_at(
+        http,
+        TOKEN_ENDPOINT,
+        refresh_token,
+        existing_id_token,
+        existing_email,
+        existing_project_id,
+        existing_scope,
+    )
+    .await
+}
+
+/// 内部版 — 接收可定制 token endpoint。`pub(crate)` 让 crate 外**完全不可见**
+/// (silent-failure-hunter H-1 修:lib.rs export 也透不出去,proxy / admin handler
+/// 等下游 crate 无法误用此 fn 绕过 const [`TOKEN_ENDPOINT`])。仅 crate 内
+/// production [`refresh_access_token`] 走 const,以及 service::tests 调 mock。
+pub(crate) async fn refresh_access_token_at(
+    http: &reqwest::Client,
+    token_endpoint: &str,
+    refresh_token: &str,
+    existing_id_token: Option<String>,
+    existing_email: Option<String>,
+    existing_project_id: Option<String>,
+    existing_scope: Option<String>,
+) -> Result<OauthToken, FlowError> {
     let params = [
         ("client_id", CLIENT_ID),
         ("client_secret", CLIENT_SECRET),
         ("refresh_token", refresh_token),
         ("grant_type", "refresh_token"),
     ];
-    let resp = http.post(TOKEN_ENDPOINT).form(&params).send().await?;
+    let resp = http.post(token_endpoint).form(&params).send().await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
