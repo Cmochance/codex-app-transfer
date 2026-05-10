@@ -430,10 +430,13 @@ mod tests {
     #[tokio::test]
     async fn load_code_assist_sends_required_metadata() {
         let server = MockServer::start().await;
+        // 用 detect_user_agent() 而非 const USER_AGENT —— const 硬码 darwin/arm64,
+        // CI Linux runner (linux/x64) 跑会 mismatch 导致 wiremock 不命中 Mock 返 404
+        let expected_ua = detect_user_agent();
         let _mock = Mock::given(method("POST"))
             .and(path("/v1internal:loadCodeAssist"))
             .and(header_exists("authorization"))
-            .and(header("user-agent", USER_AGENT))
+            .and(header("user-agent", expected_ua.as_str()))
             .and(header("x-goog-api-client", X_GOOG_API_CLIENT))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "currentTier": {
