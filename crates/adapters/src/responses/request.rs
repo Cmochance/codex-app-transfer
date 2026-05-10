@@ -487,7 +487,9 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 .unwrap_or("")
                 .to_owned();
             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+            let arguments = sanitize_tool_arguments_json_string(
+                item.get("arguments").and_then(|v| v.as_str()).unwrap_or(""),
+            );
             vec![json!({
                 "role": "assistant",
                 "content": "",
@@ -872,10 +874,10 @@ fn repair_tool_call_ids(
                 // 查 ToolCallCache 兜底重建
                 let entry = tool_call_cache.get(&existing);
                 let (name, arguments) = match entry {
-                    Some(e) => (e.name, e.arguments),
+                    Some(e) => (e.name, sanitize_tool_arguments_json_string(&e.arguments)),
                     // path B3:cache 也未命中 → 占位 (name 空字符串),
                     // 上游能 match id 不报 400 是关键,name / args 由上游能容
-                    None => (String::new(), String::new()),
+                    None => (String::new(), "{}".to_owned()),
                 };
                 let placeholder_tool_call = json!({
                     "id": existing,
@@ -998,6 +1000,7 @@ fn sanitize_chat_body_for_provider(body: &mut Map<String, Value>, provider: Opti
 /// `parallel_tool_calls` 等字段，MiniMax 会统一报 400:
 /// "invalid params, invalid chat setting (2013)"。
 fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
+    const MINIMAX_SYSTEM_MESSAGE_MAX_CHARS: usize = 24_000;
     let response_format_allowed = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -1029,6 +1032,8 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
     // `stream_options.include_usage`;缺 usage 时响应转换层会补零值 usage。
     body.remove("stream_options");
     merge_consecutive_system_messages(body);
+    normalize_and_split_minimax_system_messages(body, MINIMAX_SYSTEM_MESSAGE_MAX_CHARS);
+    sanitize_minimax_tool_call_arguments(body);
     sanitize_minimax_tools(body);
 
     if let Some(choice) = body.get_mut("tool_choice") {
@@ -1085,6 +1090,99 @@ fn merge_consecutive_system_messages(body: &mut Map<String, Value>) {
     }
 
     *messages = merged;
+}
+
+fn sanitize_minimax_tool_call_arguments(body: &mut Map<String, Value>) {
+    let Some(Value::Array(messages)) = body.get_mut("messages") else {
+        return;
+    };
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for call in tool_calls.iter_mut() {
+            let Some(function) = call.get_mut("function").and_then(|v| v.as_object_mut()) else {
+                continue;
+            };
+            let arguments = function
+                .get("arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            function.insert(
+                "arguments".into(),
+                Value::String(sanitize_tool_arguments_json_string(arguments)),
+            );
+        }
+    }
+}
+
+fn sanitize_tool_arguments_json_string(arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return "{}".to_owned();
+    }
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
+        return trimmed.to_owned();
+    }
+    "{}".to_owned()
+}
+
+fn normalize_and_split_minimax_system_messages(body: &mut Map<String, Value>, max_chars: usize) {
+    let Some(Value::Array(messages)) = body.get_mut("messages") else {
+        return;
+    };
+    if max_chars == 0 {
+        return;
+    }
+    let mut rewritten: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages.drain(..) {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "system" {
+            rewritten.push(msg);
+            continue;
+        }
+        let normalized = msg
+            .get("content")
+            .map(value_to_chat_string)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
+        if normalized.chars().count() <= max_chars {
+            let mut out = msg;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("content".into(), Value::String(normalized));
+            }
+            rewritten.push(out);
+            continue;
+        }
+        for chunk in split_string_by_char_limit(&normalized, max_chars) {
+            rewritten.push(json!({"role": "system", "content": chunk}));
+        }
+    }
+    *messages = rewritten;
+}
+
+fn split_string_by_char_limit(input: &str, max_chars: usize) -> Vec<String> {
+    if input.is_empty() || max_chars == 0 {
+        return vec![input.to_owned()];
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut count = 0usize;
+    for ch in input.chars() {
+        current.push(ch);
+        count += 1;
+        if count == max_chars {
+            chunks.push(std::mem::take(&mut current));
+            count = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn sanitize_minimax_tools(body: &mut Map<String, Value>) {
@@ -2207,6 +2305,73 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "system one\n\nsystem two");
         assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn minimax_sanitizes_invalid_tool_call_arguments_in_messages() {
+        let mut body = json!({
+            "model": "MiniMax-M2.7",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_bad_1",
+                            "type": "function",
+                            "function": {"name":"f1", "arguments": ""}
+                        },
+                        {
+                            "id": "call_bad_2",
+                            "type": "function",
+                            "function": {"name":"f2", "arguments": "{bad-json"}
+                        },
+                        {
+                            "id": "call_ok",
+                            "type": "function",
+                            "function": {"name":"f3", "arguments": "{\"k\":1}"}
+                        }
+                    ]
+                }
+            ]
+        })
+        .as_object()
+        .expect("json object")
+        .clone();
+        sanitize_minimax_chat_body(&mut body);
+        let calls = body["messages"][0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+        assert_eq!(calls[1]["function"]["arguments"], "{}");
+        assert_eq!(calls[2]["function"]["arguments"], "{\"k\":1}");
+    }
+
+    #[test]
+    fn minimax_normalizes_and_splits_long_system_messages() {
+        let long = "a".repeat(12);
+        let mut body = json!({
+            "model": "MiniMax-M2.7",
+            "messages": [
+                {"role":"system","content": format!("{}\r\n{}", long, long)},
+                {"role":"user","content":"hi"}
+            ]
+        })
+        .as_object()
+        .expect("json object")
+        .clone();
+        normalize_and_split_minimax_system_messages(&mut body, 10);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[2]["role"], "system");
+        assert_eq!(messages[3]["role"], "user");
+        let joined = format!(
+            "{}{}{}",
+            messages[0]["content"].as_str().unwrap(),
+            messages[1]["content"].as_str().unwrap(),
+            messages[2]["content"].as_str().unwrap()
+        );
+        assert_eq!(joined, format!("{long}\n{long}"));
+        assert!(!joined.contains('\r'));
     }
 
     #[test]
@@ -3592,6 +3757,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn function_call_without_arguments_defaults_to_json_object() {
+        let out = convert(json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_no_args",
+                "name": "noop"
+            }]
+        }));
+        let msg = &out["messages"][0];
+        assert_eq!(msg["tool_calls"][0]["function"]["arguments"], "{}");
+    }
+
     /// 给单测用的隔离 cache,避免并行测试互相污染。
     fn empty_tool_cache() -> super::super::tool_call_cache::ToolCallCache {
         super::super::tool_call_cache::ToolCallCache::new(16, std::time::Duration::from_secs(60))
@@ -3613,6 +3791,7 @@ mod tests {
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_abc");
         assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["arguments"], "{}");
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "call_abc");
         assert_eq!(messages[1]["content"], "sunny");

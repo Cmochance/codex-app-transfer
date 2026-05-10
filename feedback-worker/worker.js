@@ -36,6 +36,7 @@ export default {
     }
 
     const title = (form.get("title") || "").toString().slice(0, 200);
+    const contactEmail = (form.get("contact_email") || "").toString().trim().slice(0, 200);
     const body = (form.get("body") || "").toString().slice(0, 50000);
     let meta = {};
     try {
@@ -56,6 +57,7 @@ export default {
     const metaContent = {
       id,
       title,
+      contact_email: contactEmail,
       body,
       submitted_at: new Date().toISOString(),
       ip_hash: ipHash,
@@ -180,6 +182,7 @@ async function sendNotificationEmail(env, { id, title, body, meta, fileSummary, 
     `**Active Provider**: ${meta.active_provider_name || "(无)"}`,
     `**国家**: ${meta.country || "??"}`,
     `**IP Hash**: ${meta.ip_hash}`,
+    `**联系邮箱**: ${meta.contact_email || "(未填写)"}`,
     ``,
     `## 标题`,
     title || "(无)",

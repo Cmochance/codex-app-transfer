@@ -716,6 +716,7 @@ name = "codex-app-transfer-proxy"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "codex-app-transfer-adapters",

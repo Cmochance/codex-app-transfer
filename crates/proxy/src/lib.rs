@@ -13,6 +13,7 @@
 
 pub mod fixture;
 pub mod forward;
+pub mod diagnostics;
 pub mod resolver;
 pub mod server;
 pub mod telemetry;
@@ -23,4 +24,5 @@ pub use resolver::{
     AuthScheme, ProviderResolver, ResolveError, ResolvedProvider, SharedResolver, StaticResolver,
 };
 pub use server::build_router;
+pub use diagnostics::{feedback_bundle_dir, recent_feedback_bundles};
 pub use telemetry::{proxy_log_dir, proxy_telemetry, ProxyLogEntry, ProxyStatsSnapshot};

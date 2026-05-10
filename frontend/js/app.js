@@ -2084,6 +2084,7 @@
     if (!el) return;
     // 重置表单
     $("#feedbackTitle").value = "";
+    $("#feedbackContactEmail").value = "";
     $("#feedbackBody").value = "";
     $("#feedbackIncludeDiagnostics").checked = true;
     feedbackAttachments = [];
@@ -2128,11 +2129,13 @@
 
   async function submitFeedback() {
     const titleEl = $("#feedbackTitle");
+    const contactEmailEl = $("#feedbackContactEmail");
     const bodyEl = $("#feedbackBody");
     const submitBtn = $("#feedbackSubmitBtn");
     if (!bodyEl) return;
 
     const title = (titleEl?.value || "").trim();
+    const contactEmail = (contactEmailEl?.value || "").trim();
     const body = bodyEl.value.trim();
     if (!body) {
       showToast(t("feedback.bodyRequired"));
@@ -2167,6 +2170,7 @@
 
       const payload = {
         title,
+        contact_email: contactEmail,
         body,
         include_diagnostics: $("#feedbackIncludeDiagnostics").checked,
         attachments,
