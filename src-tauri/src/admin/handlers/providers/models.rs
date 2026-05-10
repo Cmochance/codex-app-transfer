@@ -231,7 +231,25 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
             }
         };
         if !response.status().is_success() {
-            errors.push(format!("{endpoint}: HTTP {}", response.status().as_u16()));
+            let status = response.status().as_u16();
+            // 读 body 提取 error.message(OpenAI / Gemini / Anthropic 统一用
+            // `{"error":{"message":"..."}}` shape)— 防 silent 把"API key not valid"
+            // / "model not found" 等关键诊断信息吃掉只留 `HTTP 400`。
+            let body = response.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.chars().take(300).collect::<String>())
+                })
+                .filter(|s| !s.is_empty());
+            let msg = match detail {
+                Some(d) => format!("{endpoint}: HTTP {status} — {d}"),
+                None => format!("{endpoint}: HTTP {status}"),
+            };
+            errors.push(msg);
             continue;
         }
         let payload = match response.json::<Value>().await {

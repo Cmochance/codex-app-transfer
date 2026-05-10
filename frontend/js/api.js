@@ -12,7 +12,17 @@
     const resp = await fetch(BASE + path, opts);
     const data = await resp.json();
     if (!resp.ok || data.success === false) {
-      throw new Error(data.message || `Request failed: ${method} ${path}`);
+      // 拼具体 errors[] 信息进 message,防 backend 给的"HTTP 400 — API key not valid"
+      // 等关键诊断被通用 message "cannot auto-fetch model list" 覆盖丢失。
+      // 完整 errors 数组留给上层 catch 拿 error.errors 自己 render。
+      const baseMessage = data.message || `Request failed: ${method} ${path}`;
+      const detailedMessage = (Array.isArray(data.errors) && data.errors.length > 0)
+        ? `${baseMessage} — ${data.errors[0]}`  // 首个 endpoint 错误一般最相关
+        : baseMessage;
+      const error = new Error(detailedMessage);
+      error.errors = Array.isArray(data.errors) ? data.errors : [];
+      error.responseData = data;
+      throw error;
     }
     return data;
   }
