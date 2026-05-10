@@ -78,9 +78,23 @@ pub fn save(cfg: &RawConfig) -> Result<(), String> {
 /// 让后续 RMW 继续(用 `lock().unwrap_or_else(|e| e.into_inner())` 模式)。
 static CONFIG_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 闭包返回值告诉 [`with_config_write`] 是否真改了 config —— `Modified` 触发
+/// `save()`,`Unchanged` 跳过 save 全程 read-only。
+///
+/// **存在原因**(chatgpt-codex P1 修,2026-05-11):skip 分支(eg active provider
+/// 不是 gemini_cli_oauth)早期实现返 `Ok(())`,with_config_write 无条件 save
+/// 让 read-only 路径退化成 read-write,跟仍未迁的 raw load+save callsite 并发
+/// 时仍 lost-update。换成 enum 后 caller **必须显式声明**有没有改。
+pub enum ConfigMutation<T> {
+    /// 闭包改了 config,with_config_write 必须 save。
+    Modified(T),
+    /// 闭包没改 config(纯 read 决策 / skip 分支)— save 跳过,不 touch disk。
+    Unchanged(T),
+}
+
 pub fn with_config_write<F, T>(f: F) -> Result<T, String>
 where
-    F: FnOnce(&mut RawConfig) -> Result<T, String>,
+    F: FnOnce(&mut RawConfig) -> Result<ConfigMutation<T>, String>,
 {
     // **不可重入**:closure 不能再调 with_config_write / load / save —— std
     // Mutex 同线程 re-lock 即 deadlock。doc 已警告,callsite 自查
@@ -96,11 +110,18 @@ where
         poison.into_inner()
     });
     let mut cfg = load()?;
-    // closure 返 Err → 直接冒泡,save 不被调,内存版本 cfg drop。磁盘 atomic:
-    // 要么完整 save 要么完全不变,不留 partial state
-    let result = f(&mut cfg)?;
-    save(&cfg)?;
-    Ok(result)
+    // closure 返 Err → 直接冒泡,save 不被调,内存版本 cfg drop
+    match f(&mut cfg)? {
+        ConfigMutation::Modified(v) => {
+            save(&cfg)?;
+            Ok(v)
+        }
+        ConfigMutation::Unchanged(v) => {
+            // **跳过 save**(chatgpt-codex P1 修):skip 分支不 touch disk,
+            // 不会跟仍未迁的 raw load+save callsite 并发覆盖。等价于 read-only。
+            Ok(v)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -125,7 +146,7 @@ mod tests {
                 cfg.as_object_mut()
                     .unwrap()
                     .insert("counter".into(), serde_json::json!(42));
-                Ok(())
+                Ok(ConfigMutation::Modified(()))
             })
             .unwrap();
             let path = config_file().unwrap();
@@ -149,14 +170,67 @@ mod tests {
 
             // 4. 重新 load 验内存版本也是 42 而不是 999
             let n = with_config_write(|cfg| {
-                Ok(cfg
-                    .as_object()
-                    .and_then(|o| o.get("counter"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(-1))
+                Ok(ConfigMutation::Unchanged(
+                    cfg.as_object()
+                        .and_then(|o| o.get("counter"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1),
+                ))
             })
             .unwrap();
             assert_eq!(n, 42, "Err closure 不该 leak 内存改动到 disk");
+        });
+    }
+
+    /// **chatgpt-codex P1 修**回归 gate:closure 返 Unchanged 时 disk 字节级
+    /// 不变 —— skip 分支(active≠OAuth)不能退化成 read-only-then-write。原版
+    /// `Ok(())` 无条件 save,跟未迁的 raw load+save callsite 并发会 lost-update。
+    #[test]
+    fn closure_unchanged_does_not_touch_disk() {
+        use codex_app_transfer_registry::config_file;
+
+        with_isolated_home(|_home| {
+            // 先 seed
+            with_config_write(|cfg| {
+                cfg.as_object_mut()
+                    .unwrap()
+                    .insert("counter".into(), serde_json::json!(7));
+                Ok(ConfigMutation::Modified(()))
+            })
+            .unwrap();
+            let path = config_file().unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let before_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+            // 等一会防 mtime 同 second
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            // closure 故意 mutate 内存 cfg 但返 Unchanged — disk 必须不变
+            // (这测试 contract:Unchanged 即便内存改了也跳过 save)
+            with_config_write(|cfg| {
+                cfg.as_object_mut()
+                    .unwrap()
+                    .insert("counter".into(), serde_json::json!(999));
+                Ok(ConfigMutation::Unchanged(()))
+            })
+            .unwrap();
+
+            let after = std::fs::read(&path).unwrap();
+            let after_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            assert_eq!(before, after, "Unchanged 时 disk content 必须字节级不变");
+            assert_eq!(before_mtime, after_mtime, "Unchanged 时 mtime 不该被 touch");
+
+            // 重新 load 应该是原 7 不是 999
+            let n = with_config_write(|cfg| {
+                Ok(ConfigMutation::Unchanged(
+                    cfg.as_object()
+                        .and_then(|o| o.get("counter"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1),
+                ))
+            })
+            .unwrap();
+            assert_eq!(n, 7, "Unchanged closure 不该 leak 内存改动到 disk");
         });
     }
 
@@ -182,7 +256,7 @@ mod tests {
                 cfg.as_object_mut()
                     .unwrap()
                     .insert("after_poison".into(), serde_json::json!(true));
-                Ok(())
+                Ok(ConfigMutation::Modified(()))
             });
             assert!(
                 result.is_ok(),
@@ -205,7 +279,7 @@ mod tests {
                 cfg.as_object_mut()
                     .unwrap()
                     .insert("counter".into(), serde_json::json!(0));
-                Ok(())
+                Ok(ConfigMutation::Modified(()))
             });
 
             // 8 线程各自 +1 共 800 次,Barrier 同步起跑增并发竞争
@@ -227,7 +301,7 @@ mod tests {
                                 cfg.as_object_mut()
                                     .unwrap()
                                     .insert("counter".into(), serde_json::json!(n + 1));
-                                Ok(())
+                                Ok(ConfigMutation::Modified(()))
                             });
                         }
                     })
@@ -237,11 +311,12 @@ mod tests {
                 h.join().unwrap();
             }
             let final_n = with_config_write(|cfg| {
-                Ok(cfg
-                    .as_object()
-                    .and_then(|o| o.get("counter"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(-1))
+                Ok(ConfigMutation::Unchanged(
+                    cfg.as_object()
+                        .and_then(|o| o.get("counter"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1),
+                ))
             })
             .unwrap();
 

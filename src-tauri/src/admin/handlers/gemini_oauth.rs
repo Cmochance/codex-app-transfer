@@ -34,7 +34,7 @@ use codex_app_transfer_gemini_oauth::{
 };
 use serde_json::{json, Value};
 
-use super::super::registry_io::with_config_write;
+use super::super::registry_io::{with_config_write, ConfigMutation};
 use super::super::state::AdminState;
 use super::common::err;
 use super::providers::active_provider;
@@ -235,7 +235,9 @@ fn sync_project_id_to_active_provider(project_id: &str) -> Result<(), String> {
             return Err("no active provider".into());
         };
         if active.get("apiFormat").and_then(|v| v.as_str()) != Some("gemini_cli_oauth") {
-            return Ok(()); // active provider 不是 gemini_cli_oauth,跳过
+            // skip 分支 — 不动 disk(chatgpt-codex P1 修:read-only-then-write
+            // 退化路径会跟未迁的 raw load+save 并发覆盖)
+            return Ok(ConfigMutation::Unchanged(()));
         }
         let active_id = active
             .get("id")
@@ -262,7 +264,7 @@ fn sync_project_id_to_active_provider(project_id: &str) -> Result<(), String> {
                 break;
             }
         }
-        Ok(())
+        Ok(ConfigMutation::Modified(()))
     })
 }
 
@@ -275,10 +277,11 @@ fn sync_project_id_to_active_provider(project_id: &str) -> Result<(), String> {
 fn clear_project_id_from_active_provider() -> Result<(), String> {
     with_config_write(|cfg| {
         let Some(active) = active_provider(cfg) else {
-            return Ok(()); // 没 active provider,无需清理
+            // skip — 不动 disk(chatgpt-codex P1 修)
+            return Ok(ConfigMutation::Unchanged(()));
         };
         if active.get("apiFormat").and_then(|v| v.as_str()) != Some("gemini_cli_oauth") {
-            return Ok(()); // active 不是 gemini_cli_oauth,跳过
+            return Ok(ConfigMutation::Unchanged(()));
         }
         let active_id = active
             .get("id")
@@ -290,18 +293,27 @@ fn clear_project_id_from_active_provider() -> Result<(), String> {
             .and_then(|o| o.get_mut("providers"))
             .and_then(|v| v.as_array_mut())
             .ok_or("no providers array")?;
+        // 跟踪是否真删了字段 — 没有的 provider 也走过遍历但实际无 mutation,
+        // 应回 Unchanged 让 with_config_write 跳过 save
+        let mut actually_removed = false;
         for p in providers.iter_mut() {
             if p.get("id").and_then(|v| v.as_str()) != Some(active_id.as_str()) {
                 continue; // 只清 active provider
             }
             if let Some(obj) = p.as_object_mut() {
                 if let Some(extra) = obj.get_mut("extra").and_then(|v| v.as_object_mut()) {
-                    extra.remove("cloud_code_project_id");
+                    if extra.remove("cloud_code_project_id").is_some() {
+                        actually_removed = true;
+                    }
                 }
             }
             break;
         }
-        Ok(())
+        Ok(if actually_removed {
+            ConfigMutation::Modified(())
+        } else {
+            ConfigMutation::Unchanged(())
+        })
     })
 }
 
@@ -322,7 +334,7 @@ mod tests {
     fn seed_config(cfg_value: Value) {
         with_config_write(|cfg| {
             *cfg = cfg_value;
-            Ok(())
+            Ok(ConfigMutation::Modified(()))
         })
         .unwrap();
     }
@@ -330,11 +342,12 @@ mod tests {
     /// 读出当前 providers 数组用于断言
     fn read_providers() -> Vec<Value> {
         with_config_write(|cfg| {
-            Ok(cfg
-                .get("providers")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default())
+            Ok(ConfigMutation::Unchanged(
+                cfg.get("providers")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+            ))
         })
         .unwrap()
     }
