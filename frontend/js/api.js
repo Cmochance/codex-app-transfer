@@ -107,9 +107,17 @@
       authScheme: payload.authScheme || 'bearer',
       // 未知值 / 缺失 → "openai_chat" fallback(跟后端 normalize_provider_api_format 对齐)。
       // 历史 v1.x 这里 fallback 是 "responses",造成 MiMo / 老配置升级时绕过代理 → 404。
-      apiFormat: ['responses', 'openai_responses', 'anthropic', 'claude', 'messages'].includes(payload.apiFormat)
-        ? 'responses'
-        : 'openai_chat',
+      // **修复历史(2026-05-10)**:旧实现把白名单外任何 apiFormat(包括新加的
+      // `gemini_native`)强制改写成 `'openai_chat'` → backend 收到 openai_chat
+      // 走 /chat/completions 探测 → Gemini native 端点不存在 → 404(用户截图反馈)。
+      // 改成 passthrough 已知协议(responses/openai_chat/gemini_native + 别名),
+      // 让后端 normalize_provider_api_format 唯一负责协议规范化(它已识别全部 3 种)。
+      apiFormat: (() => {
+        const v = (payload.apiFormat || '').toLowerCase().replace(/-/g, '_');
+        if (['responses', 'openai_responses', 'anthropic', 'claude', 'messages'].includes(v)) return 'responses';
+        if (['gemini_native', 'google_ai_studio', 'gemini'].includes(v)) return 'gemini_native';
+        return 'openai_chat';  // openai / openai_chat / chat_completions / 空 / 未知 → openai_chat
+      })(),
       extraHeaders: payload.extraHeaders || {},
       modelCapabilities: payload.modelCapabilities || {},
       requestOptions: payload.requestOptions || {},

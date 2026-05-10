@@ -163,13 +163,16 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
     );
     // 未知值 / 缺失 → "openai_chat"(跟 schema serde default 一致)。
     // 详见 normalize_provider_api_format / docs/refactor/admin-handlers.md。
+    // 复用 normalize_provider_api_format 唯一权威来源识别协议(2026-05-10 修复:
+    // 旧 hardcode `matches!("openai_chat" | "responses")` 把任何不在白名单的
+    // apiFormat 包括 gemini_native 都强制改写成 openai_chat,导致用户保存 Google
+    // AI Studio provider 后 apiFormat 永久变成 openai_chat,后续测速 / proxy 路由
+    // 全错。任何新协议(以后可能 anthropic_native / vertex_ai 等)只需更新
+    // normalize_provider_api_format 一处,不需要再到 crud / providerBody / 等多处补)。
     new_provider.insert(
         "apiFormat".into(),
         Value::String(
-            input
-                .api_format
-                .filter(|s| matches!(s.as_str(), "openai_chat" | "responses"))
-                .unwrap_or_else(|| "openai_chat".into()),
+            super::normalize_provider_api_format(input.api_format.as_deref()).to_owned(),
         ),
     );
     new_provider.insert(
@@ -254,12 +257,10 @@ pub async fn update_provider(
         updated.insert("authScheme".into(), Value::String(auth_scheme));
     }
     if let Some(api_format) = input.api_format {
-        // 未知值 → "openai_chat" fallback,跟 add_provider / schema default 对齐。
-        let normalized = if matches!(api_format.as_str(), "openai_chat" | "responses") {
-            api_format
-        } else {
-            "openai_chat".to_owned()
-        };
+        // 复用 normalize_provider_api_format(同 add_provider 修复历史:旧 hardcode
+        // 漏 gemini_native 等新协议 → 用户保存的 apiFormat 被静默改成 openai_chat)
+        let normalized =
+            super::normalize_provider_api_format(Some(api_format.as_str())).to_owned();
         updated.insert("apiFormat".into(), Value::String(normalized));
     }
     // apiKey 留空表示"不修改"
