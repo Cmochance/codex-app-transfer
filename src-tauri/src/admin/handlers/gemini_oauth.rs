@@ -34,7 +34,7 @@ use codex_app_transfer_gemini_oauth::{
     TokenStore,
 };
 use serde_json::{json, Value};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 use super::super::registry_io::{with_config_write, ConfigMutation};
 use super::super::state::AdminState;
@@ -121,6 +121,27 @@ pub struct CancelOutcome {
 /// 钩子防 5min 后 token persist 进 disk(user 已经退出 app);③ 新 login 启
 /// 动前抢占旧 login(防 user 连点 2 次"登录"按钮 → 2 个 loopback server 抢
 /// port + 2 个 OAuth flow 互相覆盖)
+/// 进程级 Notify — login_handler 走任意 return path(成功 / 错 / cancel /
+/// panic)时触发,让 RunEvent::Exit 钩子能 await 等 login task 真退完才让
+/// Tauri tear-down runtime(C1 修)。原版 fire-and-forget 让 OAuth task 在
+/// runtime drop 前可能恰好走到 persist_token 写出 partial token。
+pub fn login_done_notify() -> &'static Arc<Notify> {
+    static N: OnceLock<Arc<Notify>> = OnceLock::new();
+    N.get_or_init(|| Arc::new(Notify::new()))
+}
+
+/// RAII 守卫:Drop 时通知 [`login_done_notify`] 所有 waiter。覆盖 login_handler
+/// 任意 return / panic / future-drop 路径,无需在每个 return 前手写 notify。
+struct LoginDoneGuard;
+impl Drop for LoginDoneGuard {
+    fn drop(&mut self) {
+        // notify_waiters 唤醒**所有**当前 await notified() 的 task。如果没有
+        // waiter,no-op 不留 stale permit(对齐 Notify 文档)。RunEvent::Exit
+        // 才会 await,正常路径 no-op 零开销
+        login_done_notify().notify_waiters();
+    }
+}
+
 pub fn cancel_in_flight_login() -> CancelOutcome {
     let (mut guard, slot_recovered) = lock_cancel_slot_with_poison_flag();
     let cancelled = if let Some((_epoch, sender)) = guard.take() {
@@ -271,10 +292,13 @@ async fn status_handler() -> impl IntoResponse {
 /// Request body:`{}`(无参数)
 /// Response:成功返 200 + 当前 status 形态;失败返 4xx/5xx + error message
 async fn login_handler() -> impl IntoResponse {
+    // **C1 修**:RAII 守卫,fn 走任意 return / panic / future-drop 路径都
+    // 通知 login_done_notify → RunEvent::Exit 钩子 await 到信号才让 Tauri
+    // tear-down runtime,防 OAuth task 在 persist_token 中段被砍写出 partial
+    // token。下面 a738a04 commit 会把这里改 epoch-tracked 版本
+    let _done_guard = LoginDoneGuard;
     // 拿进程级共享 client(M1 修):跨多次 login / refresh 复用 connection
-    // pool + DNS cache + TLS session,避免每次 login 重建 connector(rustls
-    // config + Google IP 探测 ~ 50-200ms 浪费)。底层 ProxyState client 跟
-    // 这个独立,chat path 行为不变(forward.rs 仍走 ProxyState.http)
+    // pool + DNS cache + TLS session,避免每次 login 重建 connector
     let http = match shared_oauth_http_client() {
         Ok(c) => c,
         Err(msg) => return err(StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
@@ -598,6 +622,35 @@ mod tests {
     use crate::admin::handlers::common::test_support::with_isolated_home;
     use crate::admin::registry_io::with_config_write;
     use serde_json::json;
+
+    /// **C1 修核心 contract**:LoginDoneGuard::Drop 必须 notify_waiters,让
+    /// 等 login_done_notify().notified() 的 RunEvent::Exit 钩子立即唤醒。
+    /// 防 future 把 notify 调用挪到 explicit code path 后忘走某些 return /
+    /// panic 分支(RAII 守卫保证全路径覆盖)。
+    #[tokio::test]
+    async fn login_done_guard_notifies_waiters_on_drop() {
+        // spawn 一个 waiter task 等 notify
+        let notified = tokio::spawn(async {
+            login_done_notify().notified().await;
+            "got_notify"
+        });
+        // 给 spawn 一点时间真进入 await
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // 创建 guard 然后立即 drop
+        {
+            let _guard = LoginDoneGuard;
+        }
+
+        // waiter 应在 100ms 内收到 notify(实际几乎瞬时)
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
+        match result {
+            Ok(Ok("got_notify")) => {}
+            Ok(Ok(other)) => panic!("waiter 收到非预期值: {other}"),
+            Ok(Err(e)) => panic!("waiter task panicked: {e:?}"),
+            Err(_) => panic!("LoginDoneGuard::drop 没触发 notify_waiters — RAII 守卫失效"),
+        }
+    }
 
     /// **核心 preemption race**:login B 抢占 login A 的 slot 后,A 的 post-flow
     /// 清理路径**不能**清掉 B 的 sender —— epoch token 校验保证。reviewer high #1

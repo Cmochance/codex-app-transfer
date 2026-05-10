@@ -123,7 +123,23 @@ fn main() {
             // 退出 app,产生 ghost 状态)
             let outcome = handlers::gemini_oauth::cancel_in_flight_login();
             if outcome.cancelled {
-                tracing::info!("app exit: cancelled in-flight OAuth login");
+                tracing::info!(
+                    "app exit: cancelled in-flight OAuth login,等 task 真退出 (≤2s) 防 partial token persist"
+                );
+                // **C1 修**:cancel signal 是 fire-and-forget,login_handler 从
+                // 收到信号到走完 select 退出 + clean up 期间(通常 < 100ms)
+                // Tauri tear-down runtime 会切断 task,可能恰好在 persist_token
+                // 中段写出 partial token。block_on 等 LoginDoneGuard::drop 触发
+                // 的 notify;timeout 2s 兜底防 task 异常 hang(eg cancellable
+                // helper bug 导致 select 没退)
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handlers::gemini_oauth::login_done_notify().notified(),
+                    )
+                    .await
+                });
+                tracing::info!("app exit: in-flight OAuth task 已退出或 timeout");
             }
             let _ = handlers::desktop::restore_codex_if_enabled("exit");
         }
