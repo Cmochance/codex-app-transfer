@@ -266,7 +266,10 @@ mod tests {
         // 三个 None 字段都不该出现在 JSON 里
         assert!(!json.contains("id_token"), "json 不应含 id_token: {json}");
         assert!(!json.contains("email"), "json 不应含 email: {json}");
-        assert!(!json.contains("project_id"), "json 不应含 project_id: {json}");
+        assert!(
+            !json.contains("project_id"),
+            "json 不应含 project_id: {json}"
+        );
         // 必填字段必须有
         assert!(json.contains("access_token"));
         assert!(json.contains("refresh_token"));

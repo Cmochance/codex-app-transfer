@@ -25,6 +25,12 @@ tracing = "0.1"
 # 浏览器自动打开 OAuth 授权 URL(macOS open / Windows start / Linux xdg-open)
 # 选 webbrowser crate:cross-platform、零依赖、API 简单(`webbrowser::open(url)` 就够)
 webbrowser = "1"
+# Crypto-secure RNG —— 给 OAuth `state` CSRF 防御 token 用(32 bytes hex)。
+# workspace 已 transitive 依赖 0.2,显式声明保证一致。
+getrandom = "0.2"
+# URL form-encode —— 构造 OAuth 授权 URL query + token endpoint POST body。
+# reqwest 内部依赖 url crate,这里直接复用 transitive。
+url = "2"
 
 [dev-dependencies]
 # 单测起 mock OAuth server / cloudcode-pa endpoint
