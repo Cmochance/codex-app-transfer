@@ -31,6 +31,8 @@
 //! (Go, MIT) 的 `internal/auth/gemini/` 与 `internal/runtime/executor/gemini_cli_executor.go`。
 
 pub mod constants;
+pub mod flow;
 pub mod token;
 
+pub use flow::{build_auth_url, refresh_access_token, run_oauth_flow, FlowError, OauthFlowConfig};
 pub use token::{OauthToken, TokenError, TokenStore};
