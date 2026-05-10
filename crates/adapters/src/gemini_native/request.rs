@@ -30,12 +30,12 @@
 use std::collections::HashMap;
 
 use codex_app_transfer_registry::Provider;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::types::AdapterError;
 
 use super::types::{
-    Content, FunctionCall, FunctionCallingConfig, FunctionDeclaration, FunctionResponse,
+    Content, FileData, FunctionCall, FunctionCallingConfig, FunctionDeclaration, FunctionResponse,
     GenerationConfig, InlineData, Part, RequestBody, SystemInstruction, ThinkingConfig, Tool,
     ToolConfig,
 };
@@ -343,9 +343,13 @@ fn responses_input_to_chat_messages(
                     }
                 }
             }
-            // 其他类型(computer_call_output / image_generation_call / file_search_call /
-            // mcp_call ...)— Codex.app 当前不发,跳过 + 标 TODO follow-up
-            _ => {}
+            // 其他类型(computer_call / image_generation_call / file_search_call /
+            // mcp_call / local_shell_call / code_interpreter_call ...)Codex.app
+            // 当前不发,但加 warn_once_drop_tool 让以后 Codex 加新 type 时立刻在
+            // telemetry 看到 + 帮我们快速定位需补哪种 type
+            other => {
+                crate::warn_once_drop_tool(&format!("gemini_native:input_item:{other}"));
+            }
         }
     }
     // 收尾 flush
@@ -404,19 +408,38 @@ fn normalize_responses_message_content(content: &Value) -> Value {
                     out.push(Value::Object(m));
                 }
             }
-            // input_file:Codex.app 会贴文件,MVP 占位文本(Gemini fileData 待加)
             "input_file" => {
-                let placeholder = obj
-                    .get("filename")
+                // 提取 file_url / file_id / file_data 任一,转 chat 标准 image_url 块
+                // (Gemini 端 image_url_block_to_part 会进一步转 fileData / inlineData,
+                // 不再静默改成 [file omitted] 占位 text — 那是 destructive 降级)。
+                let url = obj
+                    .get("file_url")
+                    .or_else(|| obj.get("file_id"))
+                    .or_else(|| obj.get("file_data"))
                     .and_then(|v| v.as_str())
-                    .map(|f| format!("[file omitted: {f}]"))
-                    .unwrap_or_else(|| "[file omitted]".into());
-                let mut m = Map::new();
-                m.insert("type".into(), Value::String("text".into()));
-                m.insert("text".into(), Value::String(placeholder));
-                out.push(Value::Object(m));
+                    .map(String::from);
+                if let Some(url) = url {
+                    let mut img = Map::new();
+                    img.insert("url".into(), Value::String(url));
+                    if let Some(filename) = obj.get("filename").and_then(|v| v.as_str()) {
+                        img.insert("filename".into(), Value::String(filename.to_owned()));
+                    }
+                    if let Some(mime) = obj.get("mime_type").and_then(|v| v.as_str()) {
+                        img.insert("mime_type".into(), Value::String(mime.to_owned()));
+                    }
+                    let mut m = Map::new();
+                    m.insert("type".into(), Value::String("input_file".into()));
+                    m.insert("input_file".into(), Value::Object(img));
+                    out.push(Value::Object(m));
+                } else {
+                    crate::warn_once_drop_tool("gemini_native:input_file:no_url_or_data");
+                }
             }
-            _ => {}
+            other => {
+                crate::warn_once_drop_tool(&format!(
+                    "gemini_native:content_block:{other}"
+                ));
+            }
         }
     }
     Value::Array(out)
@@ -471,8 +494,11 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                 wrapper.insert("function".into(), Value::Object(func));
                 out.push(Value::Object(wrapper));
             }
-            // computer_use_preview / file_search / image_generation 等 Gemini 不直接对应,drop
-            _ => {}
+            // computer_use_preview / file_search / image_generation 等 Gemini 不直接对应。
+            // warn_once 让以后用户配新 tool 类型时能在 telemetry 立刻看到 silent drop。
+            other => {
+                crate::warn_once_drop_tool(&format!("gemini_native:responses_tool:{other}"));
+            }
         }
     }
     out
@@ -597,7 +623,7 @@ pub fn chat_normalized_to_gemini_request(
         generation_config,
         cached_content: None,
     };
-    apply_extra_body_overrides(&mut request, body_obj);
+    apply_extra_body_overrides(&mut request, body_obj)?;
     Ok(request)
 }
 
@@ -721,10 +747,13 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
             // tool_calls → functionCall parts
             if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tool_calls {
-                    if let Some((id, name, args)) = extract_tool_call(tc) {
+                    if let Some((id, name, args, sig)) = extract_tool_call(tc) {
                         tool_call_id_to_name.insert(id, name.clone());
+                        // P1-B:thoughtSignature 从 call_id 解出后写回 functionCall part,
+                        // Gemini 3 多轮 thinking 上下文不断
                         assistant_parts.push(Part {
                             function_call: Some(FunctionCall { name, args }),
+                            thought_signature: sig,
                             ..Default::default()
                         });
                     }
@@ -768,31 +797,27 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             // C1 修复(silent-failure-hunter 报告):tool_call_id 找不到时
-            // 不能 fake 字面量 "tool"(Gemini 收到 functionResponse.name="tool"
-            // 而 declarations 里没该工具,会 400 + 用户看不出根因 + 若用户真有
-            // 名为 "tool" 的工具会被静默误路由)。改:fallback 用 tool_call_id
-            // 本身当 name(至少有诊断价值)+ tracing::warn 在 telemetry 暴露根因。
+            // P1-D 修复(用户硬性规则:不主动破坏性降级):tool_call_id 找不到时
+            // 不能 fake "tool" / 用 tool_call_id 当 name 给 Gemini → Gemini 400
+            // (function name not in declarations)是 destructive。改成 BadRequest
+            // 让客户端立刻看到清晰错。Codex.app 当前每轮发完整 input 包含
+            // function_call + function_call_output 不会触发这条 path;若 Codex.app
+            // 启用 session resume 而 SessionStore 还没实现,这条会触发 — 当前
+            // 安全 BadRequest 让用户看到 "缺 SessionStore" 而不是 silent Gemini 400。
             let name = tool_call_id_to_name
                 .get(tool_call_id)
                 .cloned()
                 .or_else(|| msg.get("name").and_then(|v| v.as_str()).map(String::from))
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        tool_call_id,
-                        "gemini_native: tool/function role message has no matching prior \
-                         function_call in this input (likely session-resumed history dropped \
-                         the function_call item, or Codex.app sent stale call_id); using \
-                         tool_call_id as name fallback. If Gemini upstream 400s, ensure the \
-                         original function_call is included in the input array alongside the \
-                         output."
-                    );
-                    if tool_call_id.is_empty() {
-                        "unknown_tool".into()
-                    } else {
-                        tool_call_id.to_string()
-                    }
-                });
-            let response_value = parse_tool_response_content(msg.get("content"));
+                .ok_or_else(|| {
+                    AdapterError::BadRequest(format!(
+                        "function_call_output call_id={tool_call_id:?} has no matching prior \
+                         function_call in this request input — Gemini wire requires \
+                         functionResponse.name. Pass the original function_call alongside its \
+                         output in the input array, or include explicit `name` field on the \
+                         function_call_output item. (Session-resume path: TODO add SessionStore lookup.)"
+                    ))
+                })?;
+            let response_value = parse_tool_response_content(msg.get("content"))?;
             tool_call_responses.push(Part {
                 function_response: Some(FunctionResponse {
                     name,
@@ -844,7 +869,19 @@ fn role_of(msg: &Value) -> &str {
     msg.get("role").and_then(|v| v.as_str()).unwrap_or("")
 }
 
-fn extract_tool_call(tc: &Value) -> Option<(String, String, Value)> {
+/// 拆 call_id 里的 thoughtSignature(P1-B 修复 — Gemini 3 多轮 thinking roundtrip)。
+/// emit_function_call 用 `~~sig~~` 分隔符编码,这里反向拆。
+/// 返 (clean_call_id_without_signature, Option<signature>)。
+pub fn decode_tool_call_id_signature(id: &str) -> (String, Option<String>) {
+    if let Some((before, after)) = id.split_once("~~sig~~") {
+        if !after.is_empty() {
+            return (before.to_owned(), Some(after.to_owned()));
+        }
+    }
+    (id.to_owned(), None)
+}
+
+fn extract_tool_call(tc: &Value) -> Option<(String, String, Value, Option<String>)> {
     let id = tc.get("id")?.as_str()?.to_owned();
     let func = tc.get("function")?.as_object()?;
     let name = func.get("name")?.as_str()?.to_owned();
@@ -858,29 +895,51 @@ fn extract_tool_call(tc: &Value) -> Option<(String, String, Value)> {
             }
         })
         .unwrap_or(Value::Object(Map::new()));
-    Some((id, name, args))
+    let (clean_id, sig) = decode_tool_call_id_signature(&id);
+    Some((clean_id, name, args, sig))
 }
 
-fn parse_tool_response_content(content: Option<&Value>) -> Value {
+/// P1-D 修复(用户硬性规则:不主动破坏性降级):
+/// - string 是 JSON dict → 直接用(不丢)
+/// - string 是非 dict JSON(array/number/bool)→ wrap `{"content":"...原 string..."}`
+///   仅在 string 形态做 wrap,因为 Codex.app function_call_output.output 永远是
+///   stringified JSON,这层 wrap 是把"反序列化失败的 string"当 raw text 给 Gemini,
+///   语义跟"传字符串内容"一致,**非 destructive**
+/// - object → 直接用
+/// - 其他原生类型(array/number/bool)→ BadRequest(Gemini wire 要求 dict;wrap
+///   `{"result":...}` 是改 wire shape 影响 model 看到的结构,destructive)
+fn parse_tool_response_content(content: Option<&Value>) -> Result<Value, AdapterError> {
     let Some(content) = content else {
-        return Value::Object(Map::new());
+        return Ok(Value::Object(Map::new()));
     };
     if let Some(s) = content.as_str() {
+        // string 优先尝试 JSON 解析为 dict(Codex 通常发 stringified JSON)
         if let Ok(v) = serde_json::from_str::<Value>(s) {
             if v.is_object() {
-                return v;
+                return Ok(v);
             }
         }
+        // string 不是 dict → wrap "content":"..." 把它当 raw text 传给 Gemini
+        // (语义保留,model 看到的就是字符串内容)
         let mut wrapper = Map::new();
         wrapper.insert("content".into(), Value::String(s.to_owned()));
-        return Value::Object(wrapper);
+        return Ok(Value::Object(wrapper));
     }
     if content.is_object() {
-        return content.clone();
+        return Ok(content.clone());
     }
-    let mut wrapper = Map::new();
-    wrapper.insert("result".into(), content.clone());
-    Value::Object(wrapper)
+    Err(AdapterError::BadRequest(format!(
+        "function_call_output.output is {} but Gemini functionResponse.response wire requires \
+         a dict (object) — silent wrapping {{result: ...}} would change the wire shape model sees. \
+         Pass the output as a JSON object, or as a stringified JSON object.",
+        match content {
+            Value::Array(_) => "array",
+            Value::Number(_) => "number",
+            Value::Bool(_) => "bool",
+            Value::Null => "null",
+            _ => "unknown type",
+        }
+    )))
 }
 
 // ───────── content block → Part ─────────
@@ -897,8 +956,45 @@ fn convert_content_block_to_part(elem: &Value) -> Option<Part> {
         }
         "image_url" | "input_image" => image_url_block_to_part(obj),
         "input_audio" => audio_block_to_part(obj),
-        _ => None,
+        "input_file" => file_block_to_part(obj),
+        other => {
+            crate::warn_once_drop_tool(&format!("gemini_native:chat_block:{other}"));
+            None
+        }
     }
+}
+
+/// 推断 file URL 的 mime type — 简单按扩展名 + 默认 application/octet-stream。
+/// Gemini fileData 必须有 mimeType,缺会 400。
+fn infer_mime_from_url(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    if path.ends_with(".pdf") {
+        "application/pdf"
+    } else if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if path.ends_with(".gif") {
+        "image/gif"
+    } else if path.ends_with(".webp") {
+        "image/webp"
+    } else if path.ends_with(".mp3") {
+        "audio/mp3"
+    } else if path.ends_with(".wav") {
+        "audio/wav"
+    } else if path.ends_with(".mp4") {
+        "video/mp4"
+    } else if path.ends_with(".txt") || path.ends_with(".md") {
+        "text/plain"
+    } else if path.ends_with(".html") || path.ends_with(".htm") {
+        "text/html"
+    } else if path.ends_with(".json") {
+        "application/json"
+    } else {
+        "application/octet-stream"
+    }
+    .to_owned()
 }
 
 fn image_url_block_to_part(obj: &Map<String, Value>) -> Option<Part> {
@@ -911,6 +1007,7 @@ fn image_url_block_to_part(obj: &Map<String, Value>) -> Option<Part> {
         })
         .or_else(|| obj.get("url").and_then(|v| v.as_str()).map(String::from))?;
 
+    // base64 data URI → inlineData(本地数据)
     if let Some((mime, data)) = parse_data_uri(&url) {
         return Some(Part {
             inline_data: Some(InlineData {
@@ -920,8 +1017,42 @@ fn image_url_block_to_part(obj: &Map<String, Value>) -> Option<Part> {
             ..Default::default()
         });
     }
+    // 外网 URL → fileData(让 Gemini 上游 fetch);**不再** 用 [image omitted] 占位 text
+    // (那是 destructive 降级,model 完全看不到图)。Gemini fileData 接受公开 https URL。
+    let mime = infer_mime_from_url(&url);
     Some(Part {
-        text: Some(format!("[image omitted: {url}]")),
+        file_data: Some(FileData {
+            mime_type: mime,
+            file_uri: url,
+        }),
+        ..Default::default()
+    })
+}
+
+fn file_block_to_part(obj: &Map<String, Value>) -> Option<Part> {
+    // input_file 经 normalize_responses_message_content 已转成 chat 格式:
+    // {type:"input_file", input_file:{url, filename?, mime_type?}}
+    let inner = obj.get("input_file").and_then(|v| v.as_object())?;
+    let url = inner.get("url").and_then(|v| v.as_str())?.to_owned();
+    if let Some((mime, data)) = parse_data_uri(&url) {
+        return Some(Part {
+            inline_data: Some(InlineData {
+                mime_type: mime,
+                data,
+            }),
+            ..Default::default()
+        });
+    }
+    let mime = inner
+        .get("mime_type")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| infer_mime_from_url(&url));
+    Some(Part {
+        file_data: Some(FileData {
+            mime_type: mime,
+            file_uri: url,
+        }),
         ..Default::default()
     })
 }
@@ -1048,14 +1179,78 @@ fn function_object_to_declaration(func: Option<&Value>) -> Option<FunctionDeclar
 }
 
 /// Schema sanitize 增强版(LiteLLM `common_utils.py` `_build_vertex_schema` 主流程):
+/// - **P1-C 修复**:`$ref` / `$defs` **inline 展开**(LiteLLM `unpack_defs`
+///   思路 — 旧实现直接 remove $ref/$defs 导致引用断 + schema 不完整)
 /// - 剥 OpenAPI 高级 keyword(`additionalProperties` / `strict` / `$schema` / `$id`)
 /// - enum 内空字符串 → null(LiteLLM `_fix_enum_empty_strings:466`)
 /// - anyOf 单一 null branch → 当作 nullable + 提取另一 branch(LiteLLM
 ///   `convert_anyof_null_to_nullable:745`)
 /// - object 类型未指定 properties 时补 `properties:{}`(Gemini 强制要求)
 pub fn sanitize_schema(mut schema: Value) -> Value {
+    // 先抽 $defs 出来作为 lookup table,然后递归展开所有 $ref
+    // (P1-C 修复:不再 silent remove $ref → 引用断)
+    let defs = schema
+        .as_object()
+        .and_then(|o| o.get("$defs"))
+        .cloned()
+        .or_else(|| {
+            schema
+                .as_object()
+                .and_then(|o| o.get("definitions"))
+                .cloned()
+        });
+    if let Some(defs_value) = defs {
+        if let Value::Object(defs_map) = defs_value {
+            inline_refs_inplace(&mut schema, &defs_map, 0);
+        }
+    }
     sanitize_schema_inplace(&mut schema, 0);
     schema
+}
+
+/// 递归 inline 展开 $ref(LiteLLM unpack_defs 简化实现)。
+/// 仅支持 `#/$defs/<name>` 和 `#/definitions/<name>` 的 local ref(JSON Schema
+/// 标准用法,Codex.app + OpenAI tool schema 都用这两种)。
+/// External ref(`http://...`)+ recursive ref 跳过(防无限递归)。
+fn inline_refs_inplace(v: &mut Value, defs: &Map<String, Value>, depth: usize) {
+    if depth > 32 {
+        return; // 防 self-recursive ref 死循环
+    }
+    if let Value::Object(obj) = v {
+        // 当前节点是 $ref → 替换为 defs 里对应 schema 的 clone
+        if let Some(ref_val) = obj.get("$ref").and_then(|r| r.as_str()) {
+            let key = ref_val
+                .trim_start_matches("#/$defs/")
+                .trim_start_matches("#/definitions/");
+            if let Some(resolved) = defs.get(key).cloned() {
+                // 把 resolved 整个替换当前节点(merge 其他 keys 优先用 resolved 的)
+                let merged = if let Value::Object(mut resolved_obj) = resolved {
+                    // 保留当前节点 $ref 之外的 sibling keys(JSON Schema spec:$ref
+                    // 跟其他 keyword 共存时实施 merge)
+                    for (k, val) in obj.iter() {
+                        if k != "$ref" {
+                            resolved_obj.entry(k.clone()).or_insert_with(|| val.clone());
+                        }
+                    }
+                    Value::Object(resolved_obj)
+                } else {
+                    resolved
+                };
+                *v = merged;
+                // 展开后的节点本身也可能含 $ref,继续递归
+                inline_refs_inplace(v, defs, depth + 1);
+                return;
+            }
+            // ref 找不到 → 留原样(后面 sanitize_schema_inplace 会 remove $ref)
+        }
+        for (_k, vv) in obj.iter_mut() {
+            inline_refs_inplace(vv, defs, depth + 1);
+        }
+    } else if let Value::Array(arr) = v {
+        for item in arr.iter_mut() {
+            inline_refs_inplace(item, defs, depth + 1);
+        }
+    }
 }
 
 fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
@@ -1079,42 +1274,62 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                     }
                 }
             }
-            // **JSON Schema array type → Gemini single type + nullable**
-            // (2026-05-10 实测 400):JSON Schema 允许 `"type": ["string", "null"]`
-            // 表示 nullable string,但 Gemini protobuf schema 要求 type 是单 string,
-            // 数组形态会触发 "Proto field is not repeating, cannot start list"。
-            // Codex.app 的 text.format.json_schema 经常出这种 union type。
-            // 转换:取第一个 non-null type + 若有 "null" 加 nullable=true。
+            // **JSON Schema array type → Gemini schema(P2-A:不丢 union 信息)**:
+            // JSON Schema 允许 `"type": ["string","number","null"]` 表示 union type,
+            // Gemini protobuf 要求 type 是单 string("Proto field is not repeating")。
+            // 转换规则(不丢信息):
+            // - ["X","null"] → {type:"X", nullable:true}
+            // - ["X"] → {type:"X"}
+            // - ["X","Y", ...](多 non-null)→ {anyOf:[{type:"X"},{type:"Y"},...], nullable?}
+            //   Gemini Schema 文档支持 anyOf,union 信息保留
+            // - ["null"] 仅 → {nullable:true}(无 type)
             if let Some(Value::Array(types)) = obj.get("type").cloned().as_ref() {
                 let mut has_null = false;
-                let mut non_null_type: Option<String> = None;
+                let mut non_null_types: Vec<String> = Vec::new();
                 for t in types {
                     if let Some(s) = t.as_str() {
                         if s == "null" {
                             has_null = true;
-                        } else if non_null_type.is_none() {
-                            non_null_type = Some(s.to_owned());
+                        } else if !non_null_types.contains(&s.to_owned()) {
+                            non_null_types.push(s.to_owned());
                         }
                     }
                 }
-                if let Some(t) = non_null_type {
-                    obj.insert("type".into(), Value::String(t));
-                    if has_null {
-                        obj.insert("nullable".into(), Value::Bool(true));
+                match non_null_types.len() {
+                    0 => {
+                        obj.remove("type");
+                        if has_null {
+                            obj.insert("nullable".into(), Value::Bool(true));
+                        }
                     }
-                } else if has_null {
-                    // 全是 ["null"] — 极罕见,留空 type + nullable
-                    obj.remove("type");
-                    obj.insert("nullable".into(), Value::Bool(true));
+                    1 => {
+                        obj.insert("type".into(), Value::String(non_null_types[0].clone()));
+                        if has_null {
+                            obj.insert("nullable".into(), Value::Bool(true));
+                        }
+                    }
+                    _ => {
+                        // 多 non-null type → anyOf 表达 union(Gemini 支持)
+                        obj.remove("type");
+                        let any_of: Vec<Value> = non_null_types
+                            .iter()
+                            .map(|t| json!({"type": t}))
+                            .collect();
+                        obj.insert("anyOf".into(), Value::Array(any_of));
+                        if has_null {
+                            obj.insert("nullable".into(), Value::Bool(true));
+                        }
+                    }
                 }
             }
-            // anyOf 处理(H1 + H2 修复):
-            // - Gemini schema **不接受** anyOf,任何留 anyOf 的请求会 400
-            // - 单一 non-null branch + null:转成 nullable + 把 non-null 字段提到外层
-            //   (H1:**只插不在 obj 的 key**,不能覆盖 parent 已有字段如 description)
-            // - 多 non-null branch:Gemini 不支持 union types,**至少剥 anyOf 关键字**
-            //   保留 first non-null branch(LiteLLM 简化做法 + warn)
-            // - 全是 null:留空字段(罕见)
+            // P2-A 修复(用户硬性规则:不主动破坏性降级):
+            // Gemini Schema 文档(`vertex-ai/docs/reference/rest/v1beta1/Schema`)
+            // **明确支持 anyOf**。旧实现把多 non-null branch silent 砍到 first,
+            // 是 destructive(union type 信息丢失)。改成:
+            // - single non-null + null → 转 nullable + merge non-null 字段(更地道,
+            //   Gemini nullable 比 anyOf null 处理更优)
+            // - 其他形态 anyOf(多 non-null / pure null)→ **保留 anyOf 字段不剥**,
+            //   让 Gemini 自己 validate;若拒就 BadRequest 反馈给用户(user-visible)
             if let Some(Value::Array(any_of)) = obj.get("anyOf").cloned().as_ref() {
                 let non_null: Vec<&Value> = any_of
                     .iter()
@@ -1126,40 +1341,21 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                     })
                     .collect();
                 let has_null_branch = any_of.len() != non_null.len();
-                if !non_null.is_empty() {
-                    if non_null.len() > 1 {
-                        tracing::warn!(
-                            count = non_null.len(),
-                            "gemini schema sanitize: anyOf has {} non-null branches; \
-                             Gemini does not support union types, keeping first only",
-                            non_null.len()
-                        );
-                    }
+                if non_null.len() == 1 && has_null_branch {
+                    // 经典 nullable 场景 — 单 non-null branch + null branch → 提到外层 + nullable=true
                     if let Some(Value::Object(target)) =
                         non_null.first().map(|v| (*v).clone()).as_mut()
                     {
                         for (k, vv) in target.iter() {
-                            // H1:用 entry.or_insert 避免覆盖 parent 已有字段
-                            // (例如 parent.description="x",inner branch 也带 description="y",
-                            // 旧实现会用 inner 覆盖 parent → 静默丢用户原意)
-                            obj.entry(k.clone())
-                                .or_insert_with(|| vv.clone());
+                            // entry.or_insert 不覆盖 parent 已有字段(防丢 description 等)
+                            obj.entry(k.clone()).or_insert_with(|| vv.clone());
                         }
                     }
-                    if has_null_branch {
-                        obj.insert("nullable".into(), Value::Bool(true));
-                    }
-                    obj.remove("anyOf");
-                } else {
-                    // **sanity check 报告 HIGH** — pure null-only anyOf
-                    // (e.g. `{anyOf:[{type:"null"}]}`)走不到上面 merge 路径,
-                    // 旧实现把 `anyOf` 关键字留给 Gemini → 400。这里强制剥
-                    // anyOf + 至少标 nullable=true 让 schema 在 Gemini 那边合法。
-                    if has_null_branch {
-                        obj.insert("nullable".into(), Value::Bool(true));
-                    }
+                    obj.insert("nullable".into(), Value::Bool(true));
                     obj.remove("anyOf");
                 }
+                // 其他形态(多 non-null / pure null)— anyOf 字段**保留**不剥,
+                // Gemini 自己 validate(它文档支持 anyOf union type)
             }
             // object 类型 properties 默认补空对象
             if obj.get("type").and_then(|v| v.as_str()) == Some("object")
@@ -1352,16 +1548,20 @@ pub fn is_gemini_3_or_newer(model: &str) -> bool {
 
 // ───────── extra_body 顶层合并 ─────────
 
-fn apply_extra_body_overrides(req: &mut RequestBody, body: &Map<String, Value>) {
+fn apply_extra_body_overrides(
+    req: &mut RequestBody,
+    body: &Map<String, Value>,
+) -> Result<(), AdapterError> {
     let Some(extra) = body.get("extra_body").and_then(|v| v.as_object()) else {
-        return;
+        return Ok(());
     };
-    let Ok(req_value) = serde_json::to_value(&*req) else { return };
+    let req_value = serde_json::to_value(&*req).map_err(|e| {
+        AdapterError::Internal(format!("failed to serialize RequestBody for extra_body merge: {e}"))
+    })?;
     let mut merged = req_value;
-    let merged_obj = match merged.as_object_mut() {
-        Some(o) => o,
-        None => return,
-    };
+    let merged_obj = merged
+        .as_object_mut()
+        .ok_or_else(|| AdapterError::Internal("RequestBody serialization not an object".into()))?;
     for (k, v) in extra {
         match (merged_obj.get_mut(k), v) {
             (Some(Value::Object(existing)), Value::Object(new_obj)) => {
@@ -1374,19 +1574,17 @@ fn apply_extra_body_overrides(req: &mut RequestBody, body: &Map<String, Value>) 
             }
         }
     }
-    // H7 修复:不能 silent 丢用户 extra_body — 解析失败时 tracing::warn 至少在
-    // telemetry 里可见,帮用户调"为什么我的 extra_body 没生效"。
-    match serde_json::from_value::<RequestBody>(merged) {
-        Ok(parsed) => *req = parsed,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "gemini_native: extra_body merge produced invalid Gemini RequestBody, \
-                 dropping the override (request continues without extra_body fields). \
-                 Fix the field type/path in extra_body to take effect."
-            );
-        }
-    }
+    // P2-A 修复(用户硬性规则:不主动破坏性降级)— extra_body 解析失败前是
+    // tracing::warn + silent drop,用户 override 被吞,提"我的 extra_body 没生效"
+    // 几乎找不到原因。改 BadRequest 让客户端立刻看到具体哪个字段类型错。
+    *req = serde_json::from_value::<RequestBody>(merged).map_err(|e| {
+        AdapterError::BadRequest(format!(
+            "extra_body merge produced an invalid Gemini RequestBody (field type / path \
+             mismatch): {e}. Check your extra_body schema against Gemini generateContent docs \
+             (https://ai.google.dev/api/generate-content)."
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

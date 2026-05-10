@@ -204,11 +204,38 @@ pub struct GeminiToResponsesConverter {
     closed_messages: Vec<(u32, Value)>,
     /// 已 close 的 reasoning items(同 H3 设计)
     closed_reasonings: Vec<(u32, Value)>,
+    /// P0-E:已 close 的非 message/reasoning/function_call 类 items
+    /// (image_generation_call / 等扩展 type),emit_completed 也按 output_index 排序
+    closed_other_items: Vec<(u32, Value)>,
 
     // ─ 终态 ─
     has_seen_tool_calls: bool,
     final_finish_reason: Option<String>,
     final_usage: Option<Value>,
+
+    // ─ Gemini provider-specific metadata 累积(P0-C/D 修复:不丢上游字段)─
+    /// candidate.safetyRatings 累积,envelope.metadata.gemini.safety_ratings 透出
+    accumulated_safety_ratings: Vec<Value>,
+    /// candidate.citationMetadata(老 Gemini 1.5 引用形式)
+    accumulated_citation_metadata: Vec<Value>,
+    /// candidate.urlContextMetadata(urlContext 工具响应)
+    accumulated_url_context_metadata: Vec<Value>,
+    /// candidate.logprobsResult
+    accumulated_logprobs: Vec<Value>,
+    /// candidate.tokenCount(部分 Gemini 模型逐 candidate 报)
+    accumulated_token_counts: Vec<i64>,
+    /// groundingMetadata.searchEntryPoint(**Google 法律 ToS 要求显示** 的
+    /// "Search Suggestion" widget,UI 不显示等于违反 Google API 条款)
+    accumulated_search_entry_points: Vec<Value>,
+    /// groundingMetadata.webSearchQueries(透明展示哪些查询被发起)
+    accumulated_web_search_queries: Vec<String>,
+    /// groundingMetadata.retrievalMetadata
+    accumulated_retrieval_metadata: Vec<Value>,
+    /// promptFeedback.blockReason — Gemini 拒 user prompt(safety)时设置;
+    /// emit_completed 看到非空 → status=incomplete + reason=content_filter +
+    /// error.code=prompt_blocked
+    prompt_block_reason: Option<String>,
+    prompt_feedback_safety: Vec<Value>,
 }
 
 impl GeminiToResponsesConverter {
@@ -237,9 +264,20 @@ impl GeminiToResponsesConverter {
             closed_function_calls: Vec::new(),
             closed_messages: Vec::new(),
             closed_reasonings: Vec::new(),
+            closed_other_items: Vec::new(),
             has_seen_tool_calls: false,
             final_finish_reason: None,
             final_usage: None,
+            accumulated_safety_ratings: Vec::new(),
+            accumulated_citation_metadata: Vec::new(),
+            accumulated_url_context_metadata: Vec::new(),
+            accumulated_logprobs: Vec::new(),
+            accumulated_token_counts: Vec::new(),
+            accumulated_search_entry_points: Vec::new(),
+            accumulated_web_search_queries: Vec::new(),
+            accumulated_retrieval_metadata: Vec::new(),
+            prompt_block_reason: None,
+            prompt_feedback_safety: Vec::new(),
         }
     }
 
@@ -254,6 +292,68 @@ impl GeminiToResponsesConverter {
             .and_then(|r| r.get(key))
             .cloned()
             .unwrap_or(fallback)
+    }
+
+    /// 把累积的 Gemini provider-specific metadata 收成 dict,塞进 envelope.metadata.gemini。
+    /// 包括:safetyRatings / citationMetadata / urlContextMetadata / logprobsResult /
+    /// tokenCount(每 candidate)+ groundingMetadata 完整 (searchEntryPoint / webSearchQueries
+    /// / retrievalMetadata)+ promptFeedback。
+    /// 客户端可按需展示(searchEntryPoint 是 Google ToS 法律要求)— 至少 wire 上不丢。
+    fn build_gemini_metadata(&self) -> Option<Value> {
+        let mut g = serde_json::Map::new();
+        if !self.accumulated_safety_ratings.is_empty() {
+            g.insert("safety_ratings".into(), Value::Array(self.accumulated_safety_ratings.clone()));
+        }
+        if !self.accumulated_citation_metadata.is_empty() {
+            g.insert("citation_metadata".into(), Value::Array(self.accumulated_citation_metadata.clone()));
+        }
+        if !self.accumulated_url_context_metadata.is_empty() {
+            g.insert("url_context_metadata".into(), Value::Array(self.accumulated_url_context_metadata.clone()));
+        }
+        if !self.accumulated_logprobs.is_empty() {
+            g.insert("logprobs".into(), Value::Array(self.accumulated_logprobs.clone()));
+        }
+        if !self.accumulated_token_counts.is_empty() {
+            g.insert(
+                "candidate_token_counts".into(),
+                Value::Array(self.accumulated_token_counts.iter().map(|n| json!(n)).collect()),
+            );
+        }
+        let mut grounding = serde_json::Map::new();
+        if !self.accumulated_search_entry_points.is_empty() {
+            grounding.insert(
+                "search_entry_point".into(),
+                Value::Array(self.accumulated_search_entry_points.clone()),
+            );
+        }
+        if !self.accumulated_web_search_queries.is_empty() {
+            grounding.insert(
+                "web_search_queries".into(),
+                Value::Array(self.accumulated_web_search_queries.iter().map(|s| Value::String(s.clone())).collect()),
+            );
+        }
+        if !self.accumulated_retrieval_metadata.is_empty() {
+            grounding.insert(
+                "retrieval_metadata".into(),
+                Value::Array(self.accumulated_retrieval_metadata.clone()),
+            );
+        }
+        if !grounding.is_empty() {
+            g.insert("grounding".into(), Value::Object(grounding));
+        }
+        if let Some(br) = &self.prompt_block_reason {
+            let mut pf = serde_json::Map::new();
+            pf.insert("block_reason".into(), Value::String(br.clone()));
+            if !self.prompt_feedback_safety.is_empty() {
+                pf.insert("safety_ratings".into(), Value::Array(self.prompt_feedback_safety.clone()));
+            }
+            g.insert("prompt_feedback".into(), Value::Object(pf));
+        }
+        if g.is_empty() {
+            None
+        } else {
+            Some(Value::Object(g))
+        }
     }
 
     fn build_envelope(&self, status: &str) -> Value {
@@ -271,6 +371,34 @@ impl GeminiToResponsesConverter {
                 .map(String::from)
                 .unwrap_or_else(|| "unknown".into())
         };
+        // P0-C/D 修复:envelope.metadata 合并用户原 metadata + gemini provider-specific
+        // metadata(safetyRatings / grounding / promptFeedback / etc),不丢上游字段
+        let user_metadata = self.req_field_or("metadata", Value::Null);
+        let gemini_metadata = self.build_gemini_metadata();
+        let metadata = match (user_metadata, gemini_metadata) {
+            (Value::Object(mut user), Some(g)) => {
+                user.insert("gemini".into(), g);
+                Value::Object(user)
+            }
+            (user, Some(g)) if !user.is_null() => {
+                let mut m = serde_json::Map::new();
+                m.insert("user".into(), user);
+                m.insert("gemini".into(), g);
+                Value::Object(m)
+            }
+            (user, None) => user,
+            (Value::Null, Some(g)) => {
+                let mut m = serde_json::Map::new();
+                m.insert("gemini".into(), g);
+                Value::Object(m)
+            }
+            (other, Some(g)) => {
+                let mut m = serde_json::Map::new();
+                m.insert("user".into(), other);
+                m.insert("gemini".into(), g);
+                Value::Object(m)
+            }
+        };
         json!({
             "id": self.response_id,
             "object": "response",
@@ -282,7 +410,7 @@ impl GeminiToResponsesConverter {
             "parallel_tool_calls": self.req_field_or("parallel_tool_calls", json!(true)),
             "reasoning": self.req_field_or("reasoning", json!({"effort": null, "summary": null})),
             "text": self.req_field_or("text", json!({"format": {"type": "text"}})),
-            "metadata": self.req_field_or("metadata", Value::Null),
+            "metadata": metadata,
             "previous_response_id": self.req_field_or("previous_response_id", Value::Null),
             "instructions": self.req_field_or("instructions", Value::Null),
             "temperature": self.req_field_or("temperature", Value::Null),
@@ -443,12 +571,44 @@ impl GeminiToResponsesConverter {
                         if self.open_reasoning.is_some() {
                             self.close_reasoning(out);
                         }
-                        self.emit_function_call(out, &fc.name, &fc.args);
+                        // P1-B:thoughtSignature 在 functionCall part 上时编码进 call_id,
+                        // client roundtrip 时由请求侧 decode_tool_call_id_signature 拆出
+                        // signature 写回 outgoing functionCall part(LiteLLM
+                        // _encode_tool_call_id_with_signature 模式)。Gemini 3 多轮
+                        // thinking 链才不会断。
+                        self.emit_function_call(
+                            out,
+                            &fc.name,
+                            &fc.args,
+                            part.thought_signature.as_deref(),
+                        );
                         self.has_seen_tool_calls = true;
+                    }
+                    // P0-E:模型多模态输出 inline_data(图/音频/视频)→ 独立 output_item
+                    if let Some(inline) = &part.inline_data {
+                        if self.open_message.is_some() {
+                            self.close_message(out);
+                        }
+                        if self.open_reasoning.is_some() {
+                            self.close_reasoning(out);
+                        }
+                        self.emit_inline_data(out, &inline.mime_type, &inline.data);
+                    }
+                    // P0-E:模型 file_data 输出(罕见,Gemini 偶尔通过 fileUri 引用上游存的文件)
+                    if let Some(file) = &part.file_data {
+                        if self.open_message.is_some() {
+                            self.close_message(out);
+                        }
+                        if self.open_reasoning.is_some() {
+                            self.close_reasoning(out);
+                        }
+                        self.emit_file_data(out, &file.mime_type, &file.file_uri);
                     }
                 }
             }
-            // groundingMetadata → annotations(挂到 active message)
+            // groundingMetadata → annotations(挂到 active message)+ 累积完整字段
+            // (P0-D 修复:searchEntryPoint 是 Google ToS 法律要求显示的 widget,
+            // webSearchQueries/retrievalMetadata 是透明展示信息,全部累积透出 envelope)
             if let Some(gm) = &candidate.grounding_metadata {
                 let annotations = convert_grounding_metadata_to_annotations(gm);
                 if !annotations.is_empty() {
@@ -458,6 +618,31 @@ impl GeminiToResponsesConverter {
                     }
                     self.emit_annotations(out, annotations);
                 }
+                if let Some(sep) = &gm.search_entry_point {
+                    self.accumulated_search_entry_points.push(sep.clone());
+                }
+                if let Some(qs) = &gm.web_search_queries {
+                    self.accumulated_web_search_queries.extend(qs.iter().cloned());
+                }
+                if let Some(rm) = &gm.retrieval_metadata {
+                    self.accumulated_retrieval_metadata.push(rm.clone());
+                }
+            }
+            // P0-C:Candidate metadata 累积
+            if let Some(sr) = &candidate.safety_ratings {
+                self.accumulated_safety_ratings.extend(sr.iter().cloned());
+            }
+            if let Some(cm) = &candidate.citation_metadata {
+                self.accumulated_citation_metadata.push(cm.clone());
+            }
+            if let Some(ucm) = &candidate.url_context_metadata {
+                self.accumulated_url_context_metadata.push(ucm.clone());
+            }
+            if let Some(lp) = &candidate.logprobs_result {
+                self.accumulated_logprobs.push(lp.clone());
+            }
+            if let Some(tc) = candidate.token_count {
+                self.accumulated_token_counts.push(tc);
             }
             // finishReason 累积到末态(末 chunk emit completed 时用)
             // **粘性保护**(sanity check 报告):INTERRUPTED 是 C3b/C4 cap-trip /
@@ -470,19 +655,46 @@ impl GeminiToResponsesConverter {
                 }
             }
         }
-        // usageMetadata 累积到末态
+        // P0-F:promptFeedback.blockReason — Gemini 拒 user prompt(safety 拦截)→
+        // 设 prompt_block_reason,emit_completed 转 status=incomplete + reason=
+        // content_filter + error.code=prompt_blocked,客户端能区分"prompt 被拦"
+        // 跟"模型不响应"。
+        if let Some(pf) = &gemini.prompt_feedback {
+            if let Some(br) = &pf.block_reason {
+                if !br.is_empty() && self.prompt_block_reason.is_none() {
+                    self.prompt_block_reason = Some(br.clone());
+                }
+            }
+            if let Some(sr) = &pf.safety_ratings {
+                self.prompt_feedback_safety.extend(sr.iter().cloned());
+            }
+        }
+        // usageMetadata 累积到末态(P1-A 修复:补 tool_use_prompt + traffic_type +
+        // 详细 prompt token 分类,不丢任何上游 usage 字段)
         if let Some(um) = gemini.usage_metadata {
-            self.final_usage = Some(json!({
+            let mut input_details = json!({
+                "cached_tokens": um.cached_content_token_count.unwrap_or(0),
+            });
+            if let Some(tu) = um.tool_use_prompt_token_count {
+                if let Some(obj) = input_details.as_object_mut() {
+                    obj.insert("tool_use_prompt_tokens".into(), json!(tu));
+                }
+            }
+            let mut usage = json!({
                 "input_tokens": um.prompt_token_count,
                 "output_tokens": um.candidates_token_count,
                 "total_tokens": um.total_token_count,
-                "input_tokens_details": {
-                    "cached_tokens": um.cached_content_token_count.unwrap_or(0),
-                },
+                "input_tokens_details": input_details,
                 "output_tokens_details": {
                     "reasoning_tokens": um.thoughts_token_count.unwrap_or(0),
                 },
-            }));
+            });
+            if let Some(tt) = um.traffic_type {
+                if let Some(obj) = usage.as_object_mut() {
+                    obj.insert("traffic_type".into(), Value::String(tt));
+                }
+            }
+            self.final_usage = Some(usage);
         }
     }
 
@@ -510,23 +722,30 @@ impl GeminiToResponsesConverter {
         if self.completed_emitted {
             return;
         }
-        // **关键防御**(C4 + C5):None / FINISH_INTERRUPTED 都映射成 "incomplete"。
-        // 原因:Gemini 上游断流 / 5xx mid-stream / 网络 reset 都会让 final_finish_reason
-        // 维持 None,如果按"completed"上报就是 silent truncation —— 客户端把半截响应
-        // 当成完整响应,无法识别。强制成 incomplete 让客户端走错误恢复路径。
-        let status = match self.final_finish_reason.as_deref() {
-            Some("STOP") => "completed",
-            Some("MAX_TOKENS")
-            | Some("SAFETY")
-            | Some("RECITATION")
-            | Some("BLOCKLIST")
-            | Some("PROHIBITED_CONTENT")
-            | Some("SPII")
-            | Some("IMAGE_SAFETY")
-            | Some("IMAGE_PROHIBITED_CONTENT") => "incomplete",
-            Some(s) if s == FINISH_INTERRUPTED => "incomplete",
-            None => "incomplete",
-            _ => "completed",
+        // **关键防御**(C4 + C5 + P0-F):None / FINISH_INTERRUPTED / prompt_block_reason
+        // 都映射成 "incomplete"。
+        // - 上游断流 / 5xx mid-stream / 网络 reset → final_finish_reason 维持 None
+        //   → 强制 "incomplete" 防 silent truncation
+        // - prompt_block_reason 非空(Gemini 拒 user prompt safety 拦截)→ "incomplete"
+        //   + reason="content_filter" + error.code="prompt_blocked"
+        let prompt_blocked = self.prompt_block_reason.is_some();
+        let status = if prompt_blocked {
+            "incomplete"
+        } else {
+            match self.final_finish_reason.as_deref() {
+                Some("STOP") => "completed",
+                Some("MAX_TOKENS")
+                | Some("SAFETY")
+                | Some("RECITATION")
+                | Some("BLOCKLIST")
+                | Some("PROHIBITED_CONTENT")
+                | Some("SPII")
+                | Some("IMAGE_SAFETY")
+                | Some("IMAGE_PROHIBITED_CONTENT") => "incomplete",
+                Some(s) if s == FINISH_INTERRUPTED => "incomplete",
+                None => "incomplete",
+                _ => "completed",
+            }
         };
         let mut envelope = self.build_envelope(status);
 
@@ -537,6 +756,7 @@ impl GeminiToResponsesConverter {
         let mut all_items: Vec<(u32, Value)> = Vec::new();
         all_items.extend(self.closed_messages.drain(..));
         all_items.extend(self.closed_reasonings.drain(..));
+        all_items.extend(self.closed_other_items.drain(..));
         for fc in self.closed_function_calls.drain(..) {
             all_items.push((
                 fc.output_index,
@@ -555,20 +775,38 @@ impl GeminiToResponsesConverter {
         envelope["output"] = Value::Array(output_items);
         envelope["usage"] = self.final_usage.clone().unwrap_or(Value::Null);
         envelope["incomplete_details"] = if status == "incomplete" {
-            json!({"reason": match self.final_finish_reason.as_deref() {
-                Some("MAX_TOKENS") => "max_output_tokens",
-                Some("SAFETY") | Some("RECITATION") | Some("BLOCKLIST")
-                | Some("PROHIBITED_CONTENT") | Some("SPII") | Some("IMAGE_SAFETY")
-                | Some("IMAGE_PROHIBITED_CONTENT") => "content_filter",
-                Some(s) if s == FINISH_INTERRUPTED => "interrupted",
-                None => "interrupted",
-                _ => "interrupted",
-            }})
+            // P0-F:prompt_blocked 优先(用户 prompt 被 safety 拦)→ content_filter
+            let reason = if prompt_blocked {
+                "content_filter"
+            } else {
+                match self.final_finish_reason.as_deref() {
+                    Some("MAX_TOKENS") => "max_output_tokens",
+                    Some("SAFETY") | Some("RECITATION") | Some("BLOCKLIST")
+                    | Some("PROHIBITED_CONTENT") | Some("SPII") | Some("IMAGE_SAFETY")
+                    | Some("IMAGE_PROHIBITED_CONTENT") => "content_filter",
+                    Some(s) if s == FINISH_INTERRUPTED => "interrupted",
+                    None => "interrupted",
+                    _ => "interrupted",
+                }
+            };
+            json!({"reason": reason})
         } else {
             Value::Null
         };
-        // 上游断流时附 error 字段帮客户端做诊断
-        envelope["error"] = if matches!(self.final_finish_reason.as_deref(), Some(s) if s == FINISH_INTERRUPTED)
+        // P0-F + C4 + C5:错误诊断字段
+        // - prompt_blocked → error.code=prompt_blocked + 上游具体 block_reason
+        // - upstream interrupted → upstream_interrupted
+        envelope["error"] = if prompt_blocked {
+            let br = self.prompt_block_reason.clone().unwrap_or_default();
+            json!({
+                "code": "prompt_blocked",
+                "message": format!(
+                    "Gemini upstream blocked the user prompt due to safety policy: {br}. \
+                     See envelope.metadata.gemini.prompt_feedback for full safety_ratings."
+                ),
+                "upstream_block_reason": br,
+            })
+        } else if matches!(self.final_finish_reason.as_deref(), Some(s) if s == FINISH_INTERRUPTED)
             || (status == "incomplete" && self.final_finish_reason.is_none())
         {
             json!({
@@ -835,9 +1073,24 @@ impl GeminiToResponsesConverter {
 
     // ───── function_call item ─────
 
-    fn emit_function_call(&mut self, out: &mut Vec<u8>, name: &str, args: &Value) {
+    fn emit_function_call(
+        &mut self,
+        out: &mut Vec<u8>,
+        name: &str,
+        args: &Value,
+        thought_signature: Option<&str>,
+    ) {
         let item_id = format!("fc_{}", synthesize_id());
-        let call_id = format!("call_{}", synthesize_id());
+        // P1-B:thoughtSignature 编码进 call_id 让客户端 roundtrip 不丢
+        // (LiteLLM _encode_tool_call_id_with_signature 模式)。
+        // 用 `~~sig~~` 分隔符(JSON-safe + 跟 hex/base64 互补不冲突),
+        // 请求侧 decode_tool_call_id_signature 反向拆。
+        let call_id = match thought_signature {
+            Some(sig) if !sig.is_empty() => {
+                format!("call_{}~~sig~~{sig}", synthesize_id())
+            }
+            _ => format!("call_{}", synthesize_id()),
+        };
         let output_index = self.next_output_index;
         self.next_output_index += 1;
         // OpenAI function_call.arguments 是 JSON 字符串,Gemini 是结构化对象 → 序列化
@@ -922,6 +1175,66 @@ impl GeminiToResponsesConverter {
             name: name.to_owned(),
             arguments_json_str: args_json_str,
         });
+    }
+
+    // ───── inline_data / file_data 输出 (P0-E:模型多模态输出) ─────
+
+    /// 模型在 response 里直接生成 inline_data (image/audio/video base64),
+    /// 转 Responses output_item type="image_generation_call" + result 含
+    /// mime_type + data。Codex.app 旧版可能不识别此 item 但 wire 上不丢。
+    fn emit_inline_data(&mut self, out: &mut Vec<u8>, mime: &str, data: &str) {
+        let item_id = format!("img_{}", synthesize_id());
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let item = json!({
+            "type": "image_generation_call",
+            "id": item_id,
+            "status": "completed",
+            "result": {
+                "type": "inline_data",
+                "mime_type": mime,
+                "data": data,
+            },
+        });
+        emit_event(out, &mut self.sequence_number, "response.output_item.added", json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": item.clone(),
+        }));
+        emit_event(out, &mut self.sequence_number, "response.output_item.done", json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item.clone(),
+        }));
+        self.closed_other_items.push((output_index, item));
+    }
+
+    /// 模型 file_data 输出(Gemini 偶尔通过 fileUri 引用上游 Files API 存的文件)。
+    fn emit_file_data(&mut self, out: &mut Vec<u8>, mime: &str, file_uri: &str) {
+        let item_id = format!("file_{}", synthesize_id());
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let item = json!({
+            "type": "file_search_call",
+            "id": item_id,
+            "status": "completed",
+            "result": {
+                "type": "file_data",
+                "mime_type": mime,
+                "file_uri": file_uri,
+            },
+        });
+        emit_event(out, &mut self.sequence_number, "response.output_item.added", json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": item.clone(),
+        }));
+        emit_event(out, &mut self.sequence_number, "response.output_item.done", json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item.clone(),
+        }));
+        self.closed_other_items.push((output_index, item));
     }
 }
 
