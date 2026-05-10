@@ -43,7 +43,8 @@ pub struct OauthToken {
     /// `Bearer` 字面值。
     pub token_type: String,
     /// Token 过期时刻,**UNIX milliseconds epoch**。Google `Credentials` 形态。
-    /// `is_expired()` / `should_refresh()` 都用这个判断。
+    /// `should_refresh()` 用此判断(单一过期判定;原 `is_expired()` 已删,reviewer
+    /// H2 dead-code 修)。
     pub expiry_date: i64,
     /// OAuth scope(空格分隔的字符串,从 Google 响应拿到原值)。
     pub scope: String,
@@ -66,14 +67,11 @@ impl OauthToken {
         format!("{} {}", self.token_type, self.access_token)
     }
 
-    /// 当前时刻是否已过 `expiry_date`。Token 已过期必须 refresh 才能用。
-    pub fn is_expired(&self) -> bool {
-        let now_ms = unix_now_ms();
-        now_ms >= self.expiry_date
-    }
-
     /// 是否应该**主动**触发 refresh —— `expiry_date` 之前 [`REFRESH_BUFFER_SECS`]
-    /// 秒就 trigger,防请求到上游时 token 刚好过期(network race)。
+    /// 秒就 trigger,防请求到上游时 token 刚好过期(network race)。**单一过期判断**:
+    /// `service::ensure_valid_access_token` 等所有调用点都用这个,不再单独存在
+    /// `is_expired()`(reviewer H2 dead-code 修;曾存在另一异步性 inclusive 边界
+    /// 让未来 caller 容易选错)。
     pub fn should_refresh(&self) -> bool {
         let now_ms = unix_now_ms();
         let buffer_ms = REFRESH_BUFFER_SECS * 1000;
@@ -127,21 +125,42 @@ impl TokenStore {
     }
 
     /// 写 token —— 先写临时文件再 rename,保证写入是 atomic(防中途崩溃留半截
-    /// 文件)。Unix 平台额外设 0600 权限(只有当前用户可读,token 是 secret)。
+    /// 文件)。Unix 平台用 [`std::os::unix::fs::OpenOptionsExt`] **创建时即设
+    /// 0600 权限**(原版先 fs::write 默认 0644 后 set_permissions 0600,中间窗口
+    /// token 文件世界可读;reviewer H3 race 修)。
     pub fn save(&self, token: &OauthToken) -> Result<(), TokenError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = self.path.with_extension("json.tmp");
         let json = serde_json::to_vec_pretty(token)?;
-        std::fs::write(&tmp, &json)?;
 
-        // Unix 平台:write 之前先 rename,permissions 在 tmp 上设了走 atomic
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perm = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&tmp, perm)?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            // tmp 文件可能已经存在(上次崩溃残留)— 先删。**只吞 NotFound,
+            // EACCES / 别的 IO 错必须 propagate**(silent-failure-hunter M5 修;
+            // 原 `let _ =` 吞所有错,例如 parent dir mode 改了无权限 unlink 也
+            // silent 跳过 → 后续 create_new 直接 EEXIST 失败但 root cause 已丢)
+            match std::fs::remove_file(&tmp) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(TokenError::Io(e)),
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(&json)?;
+            file.sync_all()?; // fsync 保证 rename 前数据落盘(防 crash race)
+        }
+        #[cfg(not(unix))]
+        {
+            // 非 Unix(Windows)用普通 write — Windows ACL 已默认限制 user 私有,
+            // POSIX 0600 概念不直接映射
+            std::fs::write(&tmp, &json)?;
         }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
@@ -179,15 +198,6 @@ mod tests {
     fn auth_header_uses_token_type() {
         let token = fresh_token(3600);
         assert_eq!(token.auth_header(), "Bearer ya29.test-access");
-    }
-
-    #[test]
-    fn is_expired_detects_past_expiry() {
-        let stale = fresh_token(-1);
-        assert!(stale.is_expired());
-
-        let valid = fresh_token(3600);
-        assert!(!valid.is_expired());
     }
 
     #[test]
@@ -230,6 +240,21 @@ mod tests {
         let token = fresh_token(3600);
         store.save(&token).unwrap();
         assert!(store.load().unwrap().is_some());
+    }
+
+    #[test]
+    fn load_returns_serde_error_on_corrupt_json() {
+        // **pr-test-analyzer H1 修**:token 文件存在但 JSON 损坏(disk full /
+        // user 手改)走 TokenError::Serde 路径,不静默当成"未登录"
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("token.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        let store = TokenStore::at_path(&path);
+        let err = store.load().unwrap_err();
+        assert!(
+            matches!(err, TokenError::Serde(_)),
+            "corrupt JSON 必须返 Serde 错让 caller 看到致命错,实际:{err:?}"
+        );
     }
 
     #[test]

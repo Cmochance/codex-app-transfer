@@ -53,19 +53,35 @@ pub enum FlowError {
     TokenStatus { status: u16, body: String },
     #[error("token 响应 JSON 解析失败: {0}")]
     TokenParse(String),
-    #[error("浏览器打开失败 — 用户可手动复制 URL 粘贴: {url}")]
-    BrowserOpen { url: String },
     #[error("OS RNG 不可用: {0}")]
     Rng(String),
 }
 
 /// OAuth flow 配置。所有字段都有默认值,通常不需要改。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OauthFlowConfig {
     /// 等待 callback 的最大时长。默认 5 分钟 — 用户登 Google 账号 + 同意授权 5min 够用。
     pub callback_timeout: Duration,
     /// 是否自动打开浏览器。`false` 时返回 URL 让调用方自己处理(headless / 测试)。
     pub auto_open_browser: bool,
+    /// (silent-failure H2 修)调用方注册的 callback,在 auth URL 生成之后、open
+    /// browser 之前**总是**被调一次,让 UI 提前展示 URL 给用户。这样 webbrowser::
+    /// open 失败时 UI 已经显示了 URL,用户可手动粘贴到任意浏览器,**flow 继续
+    /// 等同一 redirect_uri 的 callback**(不需要重启 flow,不需要新 redirect_uri)。
+    pub on_auth_url: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for OauthFlowConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OauthFlowConfig")
+            .field("callback_timeout", &self.callback_timeout)
+            .field("auto_open_browser", &self.auto_open_browser)
+            .field(
+                "on_auth_url",
+                &self.on_auth_url.as_ref().map(|_| "<callback>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for OauthFlowConfig {
@@ -73,6 +89,7 @@ impl Default for OauthFlowConfig {
         Self {
             callback_timeout: Duration::from_secs(300),
             auto_open_browser: true,
+            on_auth_url: None,
         }
     }
 }
@@ -139,7 +156,8 @@ enum CallbackResult {
 /// - `StateMismatch` → 不要重试,极可能 CSRF 攻击
 /// - `Timeout` → 用户没及时授权,可重启 flow
 /// - `Denied` → 用户拒绝,重启 flow 让用户重新选账号
-/// - `BrowserOpen` → fallback 让用户手动复制 URL,**flow 仍在等 callback**(loopback server 没退)
+/// - webbrowser::open 失败:**不返错**,通过 `on_auth_url` callback 让 UI 提前
+///   显示 URL,用户手动粘贴到任意浏览器,flow 继续等 callback(redirect_uri 不变)
 pub async fn run_oauth_flow(
     http: &reqwest::Client,
     config: &OauthFlowConfig,
@@ -178,24 +196,54 @@ pub async fn run_oauth_flow(
             }
         }),
     );
+    // axum::serve 错通过额外 oneshot 通知 main flow,而不是 silent let _ =(silent-
+    // failure-hunter M2 修;原版 server crash 后 callback 永不触发,用户傻等到
+    // 5min timeout 才能看到泛泛 "Timeout" 错误)
+    let (server_err_tx, mut server_err_rx) = oneshot::channel::<std::io::Error>();
     let server_handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        match axum::serve(listener, app).await {
+            // axum::serve 实际不返 Ok(()),如果未来变了至少 warn 让 operator 看见
+            Ok(()) => {
+                tracing::warn!("axum::serve 返 Ok 异常 — listener 已关闭,后续 callback 无法到达")
+            }
+            Err(e) => {
+                let _ = server_err_tx.send(e);
+            }
+        }
     });
 
-    // 4. 打开浏览器(失败也继续 — 用户可手动复制 URL)
+    // 4. 通过 on_auth_url callback 让 UI 提前知道 auth URL — 总是调一次,无论
+    //    后面 webbrowser::open 成功与否(silent-failure H2 修;原 design "BrowserOpen
+    //    错 + abort server" 实际打破 manual-paste 路径:user 复制了 URL 含旧 port,
+    //    新启 server 旧 port 已 abort → callback connection refused)。新 design:
+    //    server 持续等 callback,redirect_uri 不变,UI 同时显示 URL + 试图打开浏览器,
+    //    任意一边成功都能完成 flow
+    if let Some(callback) = &config.on_auth_url {
+        callback(&auth_url);
+    }
+
+    // 5. 尝试自动打开浏览器:失败仅 warn,**不返错**(URL 已通过 on_auth_url
+    //    callback 给 UI),flow 继续等 callback。manual paste 路径 work
     if config.auto_open_browser {
         if let Err(e) = webbrowser::open(&auth_url) {
-            tracing::warn!(error = %e, "无法自动打开浏览器,用户需手动复制 URL");
-            // 不立刻返错 — flow 继续,用户可能直接拷贝 url 到别的浏览器粘贴
+            tracing::warn!(
+                error = %e,
+                "webbrowser::open 失败,等 user 通过 on_auth_url 看到的 URL 手动粘贴"
+            );
         }
     }
 
-    // 5. 等待 callback 或 timeout
+    // 5. 等待 callback / timeout / server 错(三选一)
     let callback = tokio::select! {
         result = rx => result.map_err(|_| FlowError::Timeout(config.callback_timeout))?,
         _ = tokio::time::sleep(config.callback_timeout) => {
             server_handle.abort();
             return Err(FlowError::Timeout(config.callback_timeout));
+        }
+        // axum::serve crash 时立即返而不是等 5min timeout
+        Ok(server_err) = &mut server_err_rx => {
+            tracing::error!(error = %server_err, "loopback HTTP server crashed mid-flow");
+            return Err(FlowError::Bind(server_err));
         }
     };
     server_handle.abort();
@@ -304,6 +352,17 @@ async fn exchange_code_for_token(
     code: &str,
     redirect_uri: &str,
 ) -> Result<OauthToken, FlowError> {
+    exchange_code_for_token_at(http, TOKEN_ENDPOINT, code, redirect_uri).await
+}
+
+/// 内部版 — 接收可定制 token endpoint。`pub(crate)` 让 crate 外完全不可见,
+/// 仅 production fn 走 const + tests 注入 mock。
+pub(crate) async fn exchange_code_for_token_at(
+    http: &reqwest::Client,
+    token_endpoint: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<OauthToken, FlowError> {
     let params = [
         ("client_id", CLIENT_ID),
         ("client_secret", CLIENT_SECRET),
@@ -311,7 +370,7 @@ async fn exchange_code_for_token(
         ("grant_type", "authorization_code"),
         ("redirect_uri", redirect_uri),
     ];
-    let resp = http.post(TOKEN_ENDPOINT).form(&params).send().await?;
+    let resp = http.post(token_endpoint).form(&params).send().await?;
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
@@ -511,6 +570,49 @@ mod tests {
             .clone()
             .unwrap_or_else(|| "old-refresh".to_owned());
         assert_eq!(fallback, "old-refresh");
+    }
+
+    #[tokio::test]
+    async fn exchange_code_errors_when_refresh_token_missing() {
+        // **pr-test-analyzer H4 修**:initial code-exchange 必须返 refresh_token
+        // (Google `access_type=offline` 才返;若漏配 access_type=offline 上游返空
+        // refresh_token)。原有测试只覆盖 refresh path 的 None fallback,没覆盖
+        // initial exchange 的 ok_or_else 错误路径。
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ya29.test",
+                "expires_in": 3600,
+                "scope": "test-scope",
+                "token_type": "Bearer"
+                // **故意**漏 refresh_token,模拟 Google 没收到 access_type=offline
+            })))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let token_endpoint = format!("{}/token", server.uri());
+        let err = exchange_code_for_token_at(
+            &http,
+            &token_endpoint,
+            "fake-code",
+            "http://127.0.0.1:8080/oauth2callback",
+        )
+        .await
+        .unwrap_err();
+        match err {
+            FlowError::TokenParse(msg) => {
+                assert!(
+                    msg.contains("refresh_token") && msg.contains("access_type=offline"),
+                    "错误 message 必须 hint 配置问题,实际:{msg}"
+                );
+            }
+            other => panic!("期待 TokenParse,实际 {other:?}"),
+        }
     }
 
     #[test]

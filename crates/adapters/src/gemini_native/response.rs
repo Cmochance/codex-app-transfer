@@ -1459,8 +1459,34 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                         // Gemini 403 多是 API 未启用 / billing / region — 跟 401 ("API key 错") 区分
                         if upstream_status_str.as_deref() == Some("UNAUTHENTICATED") {
                             ("auth_error", "Authentication failed")
+                        } else if upstream_message
+                            .as_deref()
+                            .map(|m| {
+                                let lower = m.to_ascii_lowercase();
+                                // **Cloud Code OAuth 路径专用**:免费 tier per-account
+                                // 日配额耗尽,Google 上游返 403 PERMISSION_DENIED + message
+                                // 含 cloudaicompanion **AND** quota/limit 关键词(silent-failure-
+                                // hunter M4 修:cloudaicompanion 单独 substring 太宽,会把
+                                // "Project xxx is not authorized" / "API not enabled" 等
+                                // 真 permission 错误误归 quota,误导用户等次日重试)
+                                let has_companion = lower.contains("cloudaicompanion");
+                                let has_quota_keyword =
+                                    lower.contains("quota") || lower.contains("limit");
+                                (has_companion && has_quota_keyword)
+                                    || (lower.contains("quota") && lower.contains("daily"))
+                                    || lower.contains("perdayperuser")
+                            })
+                            .unwrap_or(false)
+                        {
+                            (
+                                "quota_exceeded",
+                                "Free-tier daily quota exhausted; retry tomorrow or set up paid GCP project",
+                            )
                         } else {
-                            ("permission_denied", "Permission denied (API not enabled, billing, or region restricted)")
+                            (
+                                "permission_denied",
+                                "Permission denied (API not enabled, billing, or region restricted)",
+                            )
                         }
                     }
                     408 => ("timeout", "Upstream request timed out"),
@@ -2060,6 +2086,31 @@ mod tests {
         assert!(s.contains("\"code\":\"rate_limited\""));
         assert!(!s.contains("\"code\":\"quota_exceeded\""));
         assert!(s.contains("Too many concurrent requests"));
+    }
+
+    #[test]
+    fn failure_stream_403_cloudaicompanion_without_quota_keyword_stays_permission_denied() {
+        // **silent-failure-hunter M4 防御**:cloudaicompanion 单独 substring 不该归 quota,
+        // 必须同时含 quota/limit 关键词。`Project xxx is not authorized` / API not enabled
+        // 等真 permission 错应保持 permission_denied 让用户检查 billing
+        let body = r#"{"error":{"code":403,"message":"cloudaicompanionProject 'xxx-default-1234' is not authorized to access this resource.","status":"PERMISSION_DENIED"}}"#;
+        let s = drive_failure_stream(403, body);
+        assert!(s.contains("\"code\":\"permission_denied\""));
+        assert!(!s.contains("\"code\":\"quota_exceeded\""));
+    }
+
+    #[test]
+    fn failure_stream_403_cloudaicompanion_quota_classifies_as_quota_exceeded() {
+        // **silent-failure-hunter H4 修**:Cloud Code OAuth 路径下 403 +
+        // cloudaicompanionProject 是免费 tier per-account 日配额耗尽 — 不是
+        // permission 问题,不该让用户去检查 billing。应分类 quota_exceeded
+        // 让 client UI 显示"次日重置"
+        let body = r#"{"error":{"code":403,"message":"Quota exceeded for cloudaicompanionProject 'xxx-default-1234'.","status":"PERMISSION_DENIED"}}"#;
+        let s = drive_failure_stream(403, body);
+        assert!(s.contains("\"code\":\"quota_exceeded\""));
+        assert!(s.contains("Free-tier daily quota exhausted"));
+        // 不应误归 permission_denied
+        assert!(!s.contains("\"code\":\"permission_denied\""));
     }
 
     #[test]

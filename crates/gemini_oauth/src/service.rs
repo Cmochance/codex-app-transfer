@@ -110,8 +110,18 @@ pub(crate) async fn ensure_valid_access_token_at(
 /// 把 OAuth flow 拿到的 token 持久化 — 包装 `store.save`,加 `tracing` 日志。
 /// 通常 admin handler OAuth login 完成 + cloud_code bootstrap 写完 project_id 后
 /// 调用一次落盘。
+///
+/// 失败也 emit `tracing::error!`(silent-failure-hunter M3 修;原版直接 `?` 传
+/// 回 caller,filesystem 错误 message 易丢)。
 pub fn persist_token(store: &TokenStore, token: &OauthToken) -> Result<(), TokenError> {
-    store.save(token)?;
+    if let Err(e) = store.save(token) {
+        tracing::error!(
+            error = %e,
+            path = %store.path().display(),
+            "OAuth token 持久化失败 — 用户重启后会被当成未登录"
+        );
+        return Err(e);
+    }
     tracing::info!(
         email = token.email.as_deref().unwrap_or(""),
         project_id = token.project_id.as_deref().unwrap_or(""),

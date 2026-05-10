@@ -433,6 +433,17 @@ mod tests {
     }
 
     #[test]
+    fn data_line_without_space_prefix_still_unwrapped() {
+        // **pr-test-analyzer H3 修**:SSE 协议允许 `data:<no space>` 形态(罕见但
+        // legal)。process_event 已经处理这一支(strip_prefix("data:")),但之前
+        // 没测覆盖。本测试 lock 行为防 future regression
+        let input = b"data:{\"response\":{\"candidates\":[{\"x\":99}]}}\n\n";
+        let out = run_unwrap(vec![input]);
+        assert!(out.contains("\"x\":99"));
+        assert!(!out.contains("\"response\":"));
+    }
+
+    #[test]
     fn empty_stream_produces_empty_output() {
         let out = run_unwrap(vec![]);
         assert!(out.is_empty());
