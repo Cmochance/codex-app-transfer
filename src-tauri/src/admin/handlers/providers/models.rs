@@ -7,7 +7,9 @@ use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_registry::MODEL_ORDER;
 use serde_json::{json, Value};
 
-use super::super::super::registry_io::{load as load_registry, save as save_registry};
+use super::super::super::registry_io::{
+    load as load_registry, save as save_registry, with_config_write, ConfigMutation,
+};
 use super::super::common::err;
 use super::test::{build_provider_test_url, provider_test_error_label, provider_test_headers};
 use super::{clean_base_url, normalize_provider_api_format, provider_index, replace_path_suffix};
@@ -431,20 +433,24 @@ pub async fn fetch_provider_models_payload(Json(payload): Json<Value>) -> impl I
 }
 
 pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoResponse {
-    let mut cfg = match load_registry() {
-        Ok(c) => c,
+    // **不能在 with_config_write 闭包内 await**(closure 是 sync)。先 load 一份
+    // provider snapshot 给 fetch 用,await long async 在锁外,然后真 mutate +
+    // save 走 atomic RMW。
+    let provider_snapshot = match load_registry() {
+        Ok(cfg) => {
+            let Some(idx) = provider_index(&cfg, &id) else {
+                return err(StatusCode::NOT_FOUND, "provider not found").into_response();
+            };
+            cfg.get("providers")
+                .and_then(|v| v.as_array())
+                .and_then(|providers| providers.get(idx))
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let Some(idx) = provider_index(&cfg, &id) else {
-        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
-    };
-    let provider = cfg
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .and_then(|providers| providers.get(idx))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let result = fetch_provider_models_impl(&provider).await;
+    // 长 async — 在锁外执行,不阻塞其他 RMW
+    let result = fetch_provider_models_impl(&provider_snapshot).await;
     if result.get("success").and_then(|v| v.as_bool()) != Some(true) {
         return (StatusCode::BAD_REQUEST, Json(result)).into_response();
     }
@@ -452,12 +458,23 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
         .get("suggested")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) {
-        if let Some(provider) = providers.get_mut(idx).and_then(|v| v.as_object_mut()) {
-            provider.insert("models".into(), suggested.clone());
+
+    // 真 mutate + save 走 atomic RMW
+    let suggested_for_closure = suggested.clone();
+    let write_result = with_config_write(|cfg| {
+        let Some(idx) = provider_index(cfg, &id) else {
+            // race:autofill 期间 provider 被并发 delete 了
+            return Err("provider disappeared during autofill".into());
+        };
+        if let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) {
+            if let Some(provider) = providers.get_mut(idx).and_then(|v| v.as_object_mut()) {
+                provider.insert("models".into(), suggested_for_closure.clone());
+                return Ok(ConfigMutation::Modified(()));
+            }
         }
-    }
-    if let Err(e) = save_registry(&cfg) {
+        Ok(ConfigMutation::Unchanged(()))
+    });
+    if let Err(e) = write_result {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
     Json(json!({

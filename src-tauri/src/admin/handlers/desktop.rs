@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 
 use crate::proxy_runner::ProxyManager;
 
-use super::super::registry_io::{load as load_registry, save as save_registry};
+use super::super::registry_io::{
+    load as load_registry, save as save_registry, with_config_write, ConfigMutation,
+};
 use super::super::state::AdminState;
 use super::common::{active_provider_name, err, read_setting_bool, APP_VERSION};
 use super::providers::{
@@ -582,24 +584,26 @@ fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
 }
 
 async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
-    let mut cfg = match load_registry() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return json!({"attempted": true, "success": false, "message": e});
+    // RMW atomic — load + mutate (desktop_config_target_for_provider 修改 cfg)
+    // + save 必须在同 lock 内,防与并发 form save / OAuth sync 互相覆盖
+    let target_result = with_config_write(|cfg| {
+        let Some(provider) = active_provider(cfg) else {
+            return Err("no default provider".into());
+        };
+        let target = desktop_config_target_for_provider(cfg, &provider, None);
+        Ok(ConfigMutation::Modified(target))
+    });
+    let target = match target_result {
+        Ok(t) => t,
+        Err(e) if e == "no default provider" => {
+            return json!({
+                "attempted": false,
+                "success": false,
+                "message": e,
+            });
         }
+        Err(e) => return json!({"attempted": true, "success": false, "message": e}),
     };
-    let Some(provider) = active_provider(&cfg) else {
-        return json!({
-            "attempted": false,
-            "success": false,
-            "message": "no default provider",
-        });
-    };
-
-    let target = desktop_config_target_for_provider(&mut cfg, &provider, None);
-    if let Err(e) = save_registry(&cfg) {
-        return json!({"attempted": true, "success": false, "message": e});
-    }
 
     let mut proxy_started = false;
     if target.requires_proxy {
@@ -694,17 +698,16 @@ pub async fn switch_provider_and_sync(
     proxy_manager: Arc<ProxyManager>,
     provider_id: String,
 ) -> Value {
-    let mut cfg = match load_registry() {
-        Ok(cfg) => cfg,
-        Err(e) => return json!({"success": false, "message": e}),
-    };
-    if provider_index(&cfg, &provider_id).is_none() {
-        return json!({"success": false, "message": "provider not found"});
-    }
-    cfg.as_object_mut()
-        .unwrap()
-        .insert("activeProvider".into(), Value::String(provider_id));
-    if let Err(e) = save_registry(&cfg) {
+    let result = with_config_write(|cfg| {
+        if provider_index(cfg, &provider_id).is_none() {
+            return Err("provider not found".into());
+        }
+        cfg.as_object_mut()
+            .unwrap()
+            .insert("activeProvider".into(), Value::String(provider_id.clone()));
+        Ok(ConfigMutation::Modified(()))
+    });
+    if let Err(e) = result {
         return json!({"success": false, "message": e});
     }
     let state = AdminState { proxy_manager };
@@ -760,17 +763,20 @@ pub async fn desktop_status() -> impl IntoResponse {
 }
 
 pub async fn desktop_configure() -> impl IntoResponse {
-    let mut cfg = match load_registry() {
-        Ok(c) => c,
+    let target_result = with_config_write(|cfg| {
+        let Some(active) = active_provider(cfg) else {
+            return Err("add a provider first".into());
+        };
+        let target = desktop_config_target_for_provider(cfg, &active, None);
+        Ok(ConfigMutation::Modified(target))
+    });
+    let target = match target_result {
+        Ok(t) => t,
+        Err(e) if e == "add a provider first" => {
+            return err(StatusCode::BAD_REQUEST, e).into_response();
+        }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let Some(active) = active_provider(&cfg) else {
-        return err(StatusCode::BAD_REQUEST, "add a provider first").into_response();
-    };
-    let target = desktop_config_target_for_provider(&mut cfg, &active, None);
-    if let Err(e) = save_registry(&cfg) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
     match apply_desktop_target(&target) {
         Ok(mut result) => {
             if let Some(obj) = result.as_object_mut() {

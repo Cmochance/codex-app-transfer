@@ -9,7 +9,9 @@ use axum::{http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_registry::{config_dir, normalize_model_mappings, RawConfig};
 use serde_json::{json, Value};
 
-use super::super::registry_io::{load as load_registry, save as save_registry};
+use super::super::registry_io::{
+    load as load_registry, save as save_registry, with_config_write, ConfigMutation,
+};
 use super::common::{err, random_hex, APP_VERSION};
 
 pub(super) fn ensure_settings_object(cfg: &mut RawConfig) -> &mut serde_json::Map<String, Value> {
@@ -293,8 +295,10 @@ pub(super) fn create_config_backup(reason: &str) -> Result<Value, String> {
     fs::create_dir_all(&backup_dir).map_err(|e| format!("create backup directory failed: {e}"))?;
     let config_file = app_config_file()?;
     if !config_file.exists() {
-        let cfg = load_registry()?;
-        save_registry(&cfg)?;
+        // ensure-config-exists:走 with_config_write 让 load(synthesize default)
+        // + save 在 lock 内 atomic,防与并发 RMW 重复创建文件 race(尽管 load
+        // 默认 JSON 同样,race window 写竞争仍可能让 fs::copy 后续 read 半文件)
+        with_config_write(|_cfg| Ok(ConfigMutation::Modified(())))?;
     }
 
     let safe_reason: String = reason
@@ -368,21 +372,20 @@ pub async fn get_settings() -> impl IntoResponse {
 }
 
 pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
-    let mut cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let s = ensure_settings_object(&mut cfg);
-    if let Some(obj) = input.as_object() {
-        for (k, v) in obj {
-            s.insert(k.clone(), v.clone());
+    let result = with_config_write(|cfg| {
+        let s = ensure_settings_object(cfg);
+        if let Some(obj) = input.as_object() {
+            for (k, v) in obj {
+                s.insert(k.clone(), v.clone());
+            }
         }
+        let settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
+        Ok(ConfigMutation::Modified(settings))
+    });
+    match result {
+        Ok(settings) => Json(json!({"success": true, "settings": settings})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-    if let Err(e) = save_registry(&cfg) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-    let settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
-    Json(json!({"success": true, "settings": settings})).into_response()
 }
 
 // ── /api/config/* ────────────────────────────────────────────────────
@@ -416,13 +419,21 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
         Ok(backup) => backup,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let mut normalized = match normalize_imported_config(&data) {
+    let normalized_base = match normalize_imported_config(&data) {
         Ok(config) => config,
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    let current = load_registry().unwrap_or_else(|_| json!({}));
-    preserve_existing_provider_secrets(&mut normalized, &current);
-    if let Err(e) = save_registry(&normalized) {
+    // 用 with_config_write 包"读 current 用于保留 secret + 写 normalized" 整段,
+    // 防 import 期间另一 RMW(eg form save / OAuth sync)读 current 看到旧
+    // secret 又写回去导致 secret 状态不一致
+    let result = with_config_write(|cfg| {
+        let current = cfg.clone();
+        let mut normalized = normalized_base.clone();
+        preserve_existing_provider_secrets(&mut normalized, &current);
+        *cfg = normalized;
+        Ok(ConfigMutation::Modified(()))
+    });
+    if let Err(e) = result {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
     Json(json!({

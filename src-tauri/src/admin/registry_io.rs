@@ -53,15 +53,19 @@ pub fn save(cfg: &RawConfig) -> Result<(), String> {
 /// 防止 `load → mutate → save` 序列被另一**同样走 with_config_write**的并发
 /// RMW 切入导致最终 save 覆盖中间结果("write skew")。
 ///
-/// **当前迁移状态**(2026-05-11):**仅 OAuth 路径** —— `gemini_oauth.rs::
-/// sync_project_id_to_active_provider` + `clear_project_id_from_active_provider`
-/// 走此 API。其他 RMW callsite(`desktop.rs::switch_provider/restore_codex/
-/// apply_proxy_target` + `providers/crud.rs::create/update/delete/draft` +
-/// `providers/models.rs::autofill_provider_models` + `settings.rs` 等)
-/// **仍走 raw [`load`] + [`save`]**,跟 OAuth 路径并发时 race 仍存在。完整
-/// 迁移留 followup PR(scope:每个 callsite 单独验证 + 错误流测试不退化)。
-/// 即便如此,本 lock 仍然消除了 OAuth-vs-OAuth 自身并发(login + logout 同
-/// 时 click)的 race,部分缓解了 PR #97 触发的 sync 失败。
+/// **迁移状态**(2026-05-11 完成全栈):所有 prod RMW callsite 走此 API:
+/// - `gemini_oauth.rs`:sync_project_id_to_active_provider /
+///   clear_project_id_from_active_provider
+/// - `desktop.rs`:sync_desktop_for_active_provider / switch_provider_and_sync /
+///   desktop_configure
+/// - `providers/crud.rs`:add_provider / update_provider / delete_provider /
+///   reorder_providers / update_models(save_draft 复用 update_provider)
+/// - `providers/models.rs`:autofill_provider_models(read 锁外 await + 写锁内)
+/// - `settings.rs`:save_settings / import_config / create_config_backup
+///
+/// 测试代码 + read-only handlers(get_*)仍可用 raw [`load`] / [`save`],它们
+/// 不构成 RMW 序列。任何**新加** RMW 路径**必须**走 [`with_config_write`],
+/// 而不是 raw load+save(自动 lint 待 followup)。
 ///
 /// **不可重入**:`std::sync::Mutex` 同线程 re-lock 直接 deadlock。closure
 /// 内部**严禁**再调 `with_config_write` / `load` / `save` —— 只能纯 mutate
