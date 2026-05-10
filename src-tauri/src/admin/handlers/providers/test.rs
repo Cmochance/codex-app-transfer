@@ -16,6 +16,19 @@ use super::{normalize_provider_api_format, provider_api_key, provider_test_model
 pub(super) fn build_provider_test_url(base_url: &str, api_format: &str) -> String {
     let clean = base_url.trim().trim_end_matches('/');
     let lower = clean.to_ascii_lowercase();
+    if api_format == "gemini_native" {
+        // Gemini native:用 `/v1beta/models` (list public models) 探测端点。
+        // 不带 key → 401 / 403(我们 v2.1.3 已让 401/403 走"绿色 + auth not
+        // verified" 路径);带 key → 200。两版本(v1alpha for Gemini 3+ /
+        // v1beta for 2.x)的 `models` 端点都返 200,探测 v1beta 即可。
+        if lower.ends_with("/v1beta/models") || lower.ends_with("/v1alpha/models") {
+            return clean.to_owned();
+        }
+        if lower.ends_with("/v1beta") || lower.ends_with("/v1alpha") {
+            return format!("{clean}/models");
+        }
+        return format!("{clean}/v1beta/models");
+    }
     if api_format == "openai_chat" {
         if lower.ends_with("/chat/completions") {
             return clean.to_owned();
@@ -67,6 +80,13 @@ pub(super) fn provider_test_headers(provider: &Value, include_content_type: bool
             "x-api-key" | "x_api_key" | "xapikey" | "apikey" => {
                 if let Ok(value) = HeaderValue::from_str(&api_key) {
                     headers.insert(HeaderName::from_static("x-api-key"), value);
+                }
+            }
+            "google_api_key" | "x-goog-api-key" | "x_goog_api_key" | "google" | "gemini" => {
+                // Google AI Studio Gemini API:`x-goog-api-key: <key>` header
+                // (LiteLLM 注释:API key 不放 URL 防 traceback 泄露)。
+                if let Ok(value) = HeaderValue::from_str(&api_key) {
+                    headers.insert(HeaderName::from_static("x-goog-api-key"), value);
                 }
             }
             "none" | "no" => {}
@@ -164,6 +184,22 @@ fn provider_compatibility_item(provider: &Value) -> Value {
                 "stream": true,
                 "tools": true,
                 "streamingTools": false,
+            },
+        });
+    }
+    if api_format == "gemini_native" {
+        return json!({
+            "id": id,
+            "name": name,
+            "apiFormat": api_format,
+            "level": "stable",
+            "message": "Gemini native generateContent 适配：Codex.app /responses → Gemini wire 直转,含 google_search grounding citations。",
+            "checks": {
+                "models": true,
+                "text": true,
+                "stream": true,
+                "tools": true,
+                "streamingTools": true,
             },
         });
     }
@@ -419,6 +455,63 @@ mod tests {
         assert_eq!(
             build_provider_test_url("https://api.example.com", "responses"),
             "https://api.example.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn provider_test_url_gemini_native_uses_models_endpoint() {
+        // Gemini native:用 /v1beta/models 探测(不带 key 走 401 / "auth not verified",
+        // 带 key 200)。base_url 不带版本号 → 自动补 /v1beta/models。
+        assert_eq!(
+            build_provider_test_url(
+                "https://generativelanguage.googleapis.com",
+                "gemini_native"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+        // 用户在 base_url 已指定 /v1beta → 只补 /models
+        assert_eq!(
+            build_provider_test_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini_native"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+        // Gemini 3+ v1alpha 也支持
+        assert_eq!(
+            build_provider_test_url(
+                "https://generativelanguage.googleapis.com/v1alpha",
+                "gemini_native"
+            ),
+            "https://generativelanguage.googleapis.com/v1alpha/models"
+        );
+        // 完整 URL 已带 /v1beta/models → 不重复加
+        assert_eq!(
+            build_provider_test_url(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "gemini_native"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+    }
+
+    #[test]
+    fn provider_test_headers_google_api_key_uses_x_goog_header() {
+        let provider = json!({
+            "apiKey": "AQ.Ab8RN6Jg_secret_key",
+            "authScheme": "google_api_key",
+        });
+        let headers = provider_test_headers(&provider, false);
+        assert_eq!(
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("AQ.Ab8RN6Jg_secret_key"),
+            "google_api_key authScheme 必须用 x-goog-api-key header,不是 Bearer"
+        );
+        assert!(
+            headers.get(reqwest::header::AUTHORIZATION).is_none(),
+            "Gemini 不能用 Authorization: Bearer(那是 OpenAI 兼容路径,native 走 x-goog-api-key)"
         );
     }
 

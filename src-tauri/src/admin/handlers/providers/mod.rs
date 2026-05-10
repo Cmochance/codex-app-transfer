@@ -108,6 +108,10 @@ pub(super) fn normalize_provider_api_format(api_format: Option<&str>) -> &'stati
         .as_str()
     {
         "responses" | "openai_responses" | "anthropic" | "claude" | "messages" => "responses",
+        // Gemini native generateContent path(GeminiNativeAdapter)— 测速 / compat
+        // 走 `/v1beta/models` 探测 + `x-goog-api-key` header,跟 chat completions
+        // 完全不同的协议形态,必须独立分支。
+        "gemini_native" | "google_ai_studio" | "gemini" => "gemini_native",
         // openai / openai_chat / chat_completions / 空字符串 / 未知值
         // → 一律走 "openai_chat" — 跟 schema serde default 一致
         _ => "openai_chat",
