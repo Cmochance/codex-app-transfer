@@ -679,6 +679,14 @@
   function apply(language) {
     currentLanguage = dictionaries[language] ? language : "zh";
     document.documentElement.lang = currentLanguage === "zh" ? "zh-CN" : "en";
+    // 持久化最近一次 apply 的 language —— 下次启动 cachedLanguage() 同步读
+    // 立即 apply 防 DOMContentLoaded → getSettings (async) 之间空窗内 EN 用户
+    // 看 zh 默认占位 / zh 用户看 EN(M3 i18n apply 时序修)
+    try {
+      window.localStorage.setItem("cas:lang", currentLanguage);
+    } catch (_) {
+      // localStorage 在 sandboxed contexts 可能 throw;cache 失败不阻塞 apply
+    }
     document.querySelectorAll("[data-i18n]").forEach((node) => {
       const value = t(node.dataset.i18n);
       if (/<[a-z][^>]*>/i.test(value)) {
@@ -693,5 +701,34 @@
     window.dispatchEvent(new CustomEvent("cc:i18n", { detail: { language: currentLanguage } }));
   }
 
-  window.CCI18n = { apply, t, get language() { return currentLanguage; } };
+  /// **同步** 拿 language 偏好,DOMContentLoaded 第一时间能用,无需等 async
+  /// CCApi.getSettings():
+  /// 1) localStorage `cas:lang` 上次 apply 的 language(最准 — 用户已选过)
+  /// 2) navigator.language 浏览器/系统语言(zh-* → zh,其他 → en)
+  /// 3) fallback "zh"(对齐 dictionaries 默认)
+  ///
+  /// 用途:在拉到真正 settings.language 之前先 apply 一次,消除 EN 用户瞬间
+  /// 看到默认 zh placeholder 的乱码体验。Settings 拿到后再 apply 第二次确保
+  /// 最终值跟 backend 一致(idempotent,localStorage 也同步更新)。
+  function cachedLanguage() {
+    try {
+      const stored = window.localStorage.getItem("cas:lang");
+      if (stored && dictionaries[stored]) return stored;
+    } catch (_) {
+      // sandboxed throw — 走 navigator fallback
+    }
+    const nav = (navigator.language || navigator.userLanguage || "").toLowerCase();
+    if (nav.startsWith("zh")) return "zh";
+    if (nav.startsWith("en")) return "en";
+    return "zh";
+  }
+
+  window.CCI18n = {
+    apply,
+    t,
+    cachedLanguage,
+    get language() {
+      return currentLanguage;
+    },
+  };
 })();

@@ -87,11 +87,10 @@
     return CCI18n.t(key);
   }
 
-  function formatI18n(key, values = {}) {
-    return t(key).replace(/\{(\w+)\}/g, (_, name) => (
-      Object.prototype.hasOwnProperty.call(values, name) ? values[name] : `{${name}}`
-    ));
-  }
+  // formatI18n removed (M2 migration) — 使用 tFmt 统一(line ~1131),tFmt 多了
+  // missing-key + unsubstituted-placeholder warning,行为更安全。所有原 callsite
+  // 已迁到 tFmt
+
 
   function iconMarkup(item) {
     if (item.logo) return `<img src="${item.logo}" alt="">`;
@@ -1660,7 +1659,7 @@
     try {
       const status = await CCApi.getDesktopSnapshotStatus();
       if (status && status.hasSnapshot) {
-        target.textContent = formatI18n("settings.codexSnapshotStatusActive", {
+        target.textContent = tFmt("settings.codexSnapshotStatusActive", {
           time: status.snapshotAt || "",
         });
       } else {
@@ -1779,7 +1778,10 @@
       translated = t("models.upstreamError.unknown");
     }
     if (err.statusCode) {
-      translated = translated.replace("{status}", String(err.statusCode));
+      // 动态 key (`models.upstreamError.${code}`) 已 t() 完,这里只对模板字符串
+      // 替换 `{status}` 占位 — split/join 而非 String.replace 防 statusCode 含
+      // `$` / 正则元字符被 replace 误解析。tFmt 不适用于"已 t 完的字符串"
+      translated = translated.split("{status}").join(String(err.statusCode));
     }
     return err.host ? `[${err.host}] ${translated}` : translated;
   }
@@ -1997,7 +1999,7 @@
         const url = actionEl.dataset.docsUrl;
         const name = actionEl.dataset.providerName || "";
         if (!url) return;
-        const message = t("confirm.openDocs").replace("{provider}", name);
+        const message = tFmt("confirm.openDocs", { provider: name });
         if (window.confirm(message)) {
           window.open(url, "_blank", "noopener,noreferrer");
         }
@@ -2411,7 +2413,7 @@
     const max = 5 * 1024 * 1024;
     for (const f of files) {
       if (f.size > max) {
-        showToast(formatI18n("feedback.tooLargeFile", { name: f.name }));
+        showToast(tFmt("feedback.tooLargeFile", { name: f.name }));
         continue;
       }
       feedbackAttachments.push({ name: f.name, size: f.size, file: f });
@@ -2476,14 +2478,14 @@
 
       const result = await CCApi.submitFeedback(payload);
       if (feedbackBsModal) feedbackBsModal.hide();
-      showToast(formatI18n("feedback.successToast", { id: result.id || "" }));
+      showToast(tFmt("feedback.successToast", { id: result.id || "" }));
     } catch (err) {
       console.error("[feedback] submit failed:", err);
       let msg = err && err.message ? err.message : String(err);
       if (msg.includes("did not match the expected pattern")) {
         msg = "请求体构造异常,请重试或去掉附件";
       }
-      showToast(formatI18n("feedback.failToast", { message: msg }));
+      showToast(tFmt("feedback.failToast", { message: msg }));
     } finally {
       submitBtn.disabled = false;
       submitBtn.textContent = originalText;
@@ -2680,6 +2682,12 @@
   }
 
   document.addEventListener("DOMContentLoaded", async () => {
+    // **M3 i18n apply 时序修**:第一时间用 localStorage cache + navigator.language
+    // 同步 apply 一次,消除 DOMContentLoaded → getSettings (async) 之间空窗内
+    // EN 用户看 zh 默认占位 / zh 用户看 EN 的乱码体验。Settings 拿到后再 apply
+    // 第二次(idempotent,只在 language 不同时真改 DOM)
+    CCI18n.apply(CCI18n.cachedLanguage());
+
     deleteModal = new bootstrap.Modal($("#deleteModal"));
     restartReminderModal = new bootstrap.Modal($("#restartReminderModal"), {
       backdrop: "static",
@@ -2689,7 +2697,11 @@
     bindEvents();
     bindFeedbackEvents();
     const settings = await CCApi.getSettings();
-    CCI18n.apply(settings.language || "zh");
+    const finalLang = settings.language || "zh";
+    if (finalLang !== CCI18n.language) {
+      // backend settings 跟 cache/navigator 不一致才再 apply,正常路径无 op
+      CCI18n.apply(finalLang);
+    }
     applyTheme(settings.theme || "default");
     if (!window.location.hash) window.location.hash = "dashboard";
     await renderRoute(routeFromHash());
