@@ -1075,6 +1075,15 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                         obj.insert("nullable".into(), Value::Bool(true));
                     }
                     obj.remove("anyOf");
+                } else {
+                    // **sanity check 报告 HIGH** — pure null-only anyOf
+                    // (e.g. `{anyOf:[{type:"null"}]}`)走不到上面 merge 路径,
+                    // 旧实现把 `anyOf` 关键字留给 Gemini → 400。这里强制剥
+                    // anyOf + 至少标 nullable=true 让 schema 在 Gemini 那边合法。
+                    if has_null_branch {
+                        obj.insert("nullable".into(), Value::Bool(true));
+                    }
+                    obj.remove("anyOf");
                 }
             }
             // object 类型 properties 默认补空对象

@@ -460,8 +460,14 @@ impl GeminiToResponsesConverter {
                 }
             }
             // finishReason 累积到末态(末 chunk emit completed 时用)
+            // **粘性保护**(sanity check 报告):INTERRUPTED 是 C3b/C4 cap-trip /
+            // upstream-Err 路径标记的"已宣告中断",不能被后续合法 chunk 的
+            // finishReason="STOP" 覆盖回 completed —— 那会让"宣告 incomplete 后又
+            // 静默 recover"成 silent truncation 的孪生 bug。
             if let Some(fr) = &candidate.finish_reason {
-                self.final_finish_reason = Some(fr.clone());
+                if self.final_finish_reason.as_deref() != Some(FINISH_INTERRUPTED) {
+                    self.final_finish_reason = Some(fr.clone());
+                }
             }
         }
         // usageMetadata 累积到末态
@@ -835,7 +841,21 @@ impl GeminiToResponsesConverter {
         let output_index = self.next_output_index;
         self.next_output_index += 1;
         // OpenAI function_call.arguments 是 JSON 字符串,Gemini 是结构化对象 → 序列化
-        let args_json_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
+        // (LOW from sanity check):跟 emit_event 的 C2 fix 一致,失败时至少 log。
+        // 实际 serde_json::to_string(&Value) 几乎不可能失败(只有 NaN/Infinity 等
+        // 非标准 number 才会 trip),但留 log 能帮 debug。
+        let args_json_str = match serde_json::to_string(args) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    name,
+                    "BUG: failed to serialize functionCall.args to JSON string; \
+                     falling back to '{{}}'. This may produce a tool call with no args."
+                );
+                "{}".into()
+            }
+        };
 
         emit_event(
             out,
