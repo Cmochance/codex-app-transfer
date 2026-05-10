@@ -1,0 +1,296 @@
+//! Cloud Code SSE outer envelope unwrap。
+//!
+//! gemini_native 的 SSE → Responses 状态机([`crate::gemini_native::response::
+//! convert_gemini_to_responses_stream`])期待 wire 是 `data: {candidates,...}\n\n`。
+//! Cloud Code Assist 给每个 event 多包一层 `{response: {...}}`:
+//!
+//! ```text
+//! data: {"response":{"candidates":[...],"usageMetadata":{...}}}\n\n
+//! ```
+//!
+//! 本模块在 byte stream 入口插一层 transformer,把每个 SSE event 的 JSON 取出
+//! `.response` 字段,重新序列化回 `data: <inner>\n\n`,然后传给 native 的状态机
+//! 复用所有现成转换逻辑(reasoning / function_call / annotations / failure 等)。
+//!
+//! 实现策略:行级 buffer + 按 `\n\n` 切完整 event,每 event 独立处理。
+//! - 多个 event 一次到达 → 切开逐个处理
+//! - event 跨 chunk 到达 → buffer 累积直到 `\n\n` 边界
+//! - data 字段不是有效 JSON / 没有 `.response` 字段 → 透传原 event(防御性,Cloud
+//!   Code 偶尔返非 wrap 形态比如 keepalive pings)
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use futures_core::Stream;
+use serde_json::Value;
+
+use crate::types::ByteStream;
+
+/// 把 Cloud Code SSE byte stream → unwrapped Gemini SSE byte stream。
+///
+/// 每个 event 是 SSE 标准格式:
+/// ```text
+/// event: <name>\n
+/// data: <json>\n
+/// \n
+/// ```
+///
+/// 我们解析 `data:` 后 JSON,如果含 `.response` 字段就 emit `data: <response>\n\n`,
+/// 否则原样透传(防御 keepalive / 非 wrap 事件)。`event:` 行如果存在也保留。
+pub fn unwrap_cloud_code_sse_envelope(input: ByteStream) -> ByteStream {
+    Box::pin(UnwrapStream {
+        inner: input,
+        buffer: Vec::new(),
+        finished: false,
+    })
+}
+
+struct UnwrapStream {
+    inner: ByteStream,
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+impl Stream for UnwrapStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            // 1. 先看 buffer 里有没有完整 event(以 \n\n 结尾)
+            if let Some((event, rest)) = take_complete_event(&this.buffer) {
+                this.buffer = rest;
+                let processed = process_event(&event);
+                if !processed.is_empty() {
+                    return Poll::Ready(Some(Ok(Bytes::from(processed))));
+                }
+                // 如果该 event 处理后输出空(比如非 wrap 格式 + 解析失败),
+                // 跳过继续看 buffer 下个 event
+                continue;
+            }
+
+            // 2. buffer 没完整 event,从 inner stream 拉新 chunk
+            if this.finished {
+                return Poll::Ready(None);
+            }
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.buffer.extend_from_slice(&chunk);
+                    // continue loop:回到第 1 步看是否能切出 event
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(None) => {
+                    this.finished = true;
+                    // EOF 时 buffer 里可能有"没以 \n\n 结尾"的残留 — 当成最后一个
+                    // event 处理(SSE 协议建议 EOF 也算一个 event 边界)
+                    if !this.buffer.is_empty() {
+                        let last = std::mem::take(&mut this.buffer);
+                        let processed = process_event(&last);
+                        if !processed.is_empty() {
+                            return Poll::Ready(Some(Ok(Bytes::from(processed))));
+                        }
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// 在 buffer 里找第一个完整 SSE event(以 `\n\n` 结尾)。返回 (event_bytes, remaining)。
+/// 如果找不到完整 event 返 None。
+fn take_complete_event(buffer: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    // SSE event 边界是 `\n\n`(两个连续 LF)。CRLF 客户端 `\r\n\r\n` 也兼容。
+    let lf2 = find_subseq(buffer, b"\n\n");
+    let crlf2 = find_subseq(buffer, b"\r\n\r\n");
+    let (boundary_end, sep_len) = match (lf2, crlf2) {
+        (Some(a), Some(b)) if a < b => (a + 2, 2),
+        (Some(_), Some(b)) => (b + 4, 4),
+        (Some(a), None) => (a + 2, 2),
+        (None, Some(b)) => (b + 4, 4),
+        (None, None) => return None,
+    };
+    let _ = sep_len; // 仅用于解释
+    let event = buffer[..boundary_end].to_vec();
+    let rest = buffer[boundary_end..].to_vec();
+    Some((event, rest))
+}
+
+/// 朴素 byte slice substring 查找。SSE event 通常很小(<10KB),朴素 O(n*m) 够用。
+fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 处理单个 SSE event,把 `data:` 里的 JSON 解 `.response` 重新序列化。返回新的
+/// event bytes(含 trailing `\n\n`)。失败时返原 event 透传(防御 keepalive / 非
+/// wrap 形态)。
+fn process_event(event: &[u8]) -> Vec<u8> {
+    // 找 `data:` 行
+    let text = match std::str::from_utf8(event) {
+        Ok(s) => s,
+        Err(_) => return event.to_vec(),
+    };
+    // SSE 一个 event 可能有多行(event:/id:/data:),我们只动 data: 行,其他原样保留
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut data_payload: Option<String> = None;
+    for line in text.split('\n') {
+        if let Some(rest) = line.strip_prefix("data: ") {
+            // 多行 data 在 SSE 协议里 concat,但 Cloud Code 实测一行 = 一个 JSON,
+            // 这里直接当单行处理(简单 + 跟 gemini_native::response 状态机一致)
+            data_payload = Some(rest.to_owned());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            // SSE 允许 `data:<no space>` 形态(罕见)
+            data_payload = Some(rest.to_owned());
+        } else {
+            new_lines.push(line.to_owned());
+        }
+    }
+
+    let new_data = match data_payload {
+        Some(payload) => {
+            // 解析 JSON,提 .response 字段
+            match serde_json::from_str::<Value>(&payload) {
+                Ok(Value::Object(mut obj)) => {
+                    if let Some(inner) = obj.remove("response") {
+                        match serde_json::to_string(&inner) {
+                            Ok(s) => s,
+                            Err(_) => payload, // 序列化失败极不正常,原样透传
+                        }
+                    } else {
+                        // 没 .response 字段 — 可能是 keepalive / error event,原样透传
+                        payload
+                    }
+                }
+                Ok(_) | Err(_) => payload, // JSON parse 失败原样透传(防御)
+            }
+        }
+        None => return event.to_vec(), // 没 data: 行(纯 comment 等)原样透传
+    };
+
+    // 重新组装 event
+    let mut out = String::new();
+    for line in new_lines {
+        if !line.is_empty() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out.push_str("data: ");
+    out.push_str(&new_data);
+    out.push_str("\n\n");
+    out.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream::{self, StreamExt};
+
+    fn run_unwrap(chunks: Vec<&[u8]>) -> String {
+        let bytes_chunks: Vec<Result<Bytes, std::io::Error>> = chunks
+            .into_iter()
+            .map(|c| Ok(Bytes::from(c.to_vec())))
+            .collect();
+        let input: ByteStream = Box::pin(stream::iter(bytes_chunks));
+        let mut out = unwrap_cloud_code_sse_envelope(input);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut all = Vec::new();
+        runtime.block_on(async {
+            while let Some(item) = out.next().await {
+                all.extend_from_slice(&item.unwrap());
+            }
+        });
+        String::from_utf8(all).unwrap()
+    }
+
+    #[test]
+    fn single_event_unwraps_response_field() {
+        let input = b"data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}}\n\n";
+        let out = run_unwrap(vec![input]);
+        assert!(out.starts_with("data: "));
+        assert!(out.contains("candidates"));
+        // 不该再有 outer "response" 字段
+        assert!(!out.contains("\"response\":"));
+        // 必须以 \n\n 结尾
+        assert!(out.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn multiple_events_in_one_chunk_all_unwrapped() {
+        let input = b"data: {\"response\":{\"candidates\":[{\"x\":1}]}}\n\ndata: {\"response\":{\"candidates\":[{\"x\":2}]}}\n\n";
+        let out = run_unwrap(vec![input]);
+        let events: Vec<&str> = out.split("\n\n").filter(|s| !s.is_empty()).collect();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("\"x\":1"));
+        assert!(events[1].contains("\"x\":2"));
+        for e in &events {
+            assert!(!e.contains("\"response\":"));
+        }
+    }
+
+    #[test]
+    fn event_split_across_chunks_buffered_correctly() {
+        // 第一 chunk 半个 JSON,第二 chunk 后半 + 边界
+        let chunk1 = b"data: {\"response\":{\"cand";
+        let chunk2 = b"idates\":[{\"y\":42}]}}\n\n";
+        let out = run_unwrap(vec![chunk1, chunk2]);
+        assert!(out.contains("\"y\":42"));
+        assert!(!out.contains("\"response\":"));
+    }
+
+    #[test]
+    fn keepalive_or_non_wrap_event_passed_through() {
+        // 不带 response 字段的 event(keepalive / error)— 原样透传
+        let input = b"data: {\"error\":{\"code\":429,\"message\":\"quota\"}}\n\n";
+        let out = run_unwrap(vec![input]);
+        assert!(out.contains("\"error\""));
+        assert!(out.contains("\"code\":429"));
+    }
+
+    #[test]
+    fn malformed_json_data_passed_through() {
+        let input = b"data: not-valid-json\n\n";
+        let out = run_unwrap(vec![input]);
+        assert!(out.contains("not-valid-json"));
+    }
+
+    #[test]
+    fn crlf_line_endings_recognized() {
+        let input = b"data: {\"response\":{\"x\":1}}\r\n\r\n";
+        let out = run_unwrap(vec![input]);
+        assert!(out.contains("\"x\":1"));
+        assert!(!out.contains("\"response\":"));
+    }
+
+    #[test]
+    fn event_without_trailing_double_newline_at_eof_still_processed() {
+        // EOF 边界:最后一个 event 没 \n\n 结尾 — 仍要 process(SSE 实测如此)
+        let input = b"data: {\"response\":{\"x\":99}}";
+        let out = run_unwrap(vec![input]);
+        assert!(out.contains("\"x\":99"));
+    }
+
+    #[test]
+    fn empty_stream_produces_empty_output() {
+        let out = run_unwrap(vec![]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn multi_line_event_keeps_event_id_lines() {
+        // SSE event 可以有 event:/id: 行,unwrap 不该丢
+        let input = b"event: message\ndata: {\"response\":{\"x\":1}}\n\n";
+        let out = run_unwrap(vec![input]);
+        assert!(out.contains("event: message"));
+        assert!(out.contains("\"x\":1"));
+    }
+}

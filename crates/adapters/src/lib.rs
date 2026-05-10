@@ -11,6 +11,7 @@
 //! 对于 passthrough 适配器(本轮的 openai_chat),返回值就是入参,实现
 //! 为 0 复制 / 0 缓冲。Stage 3.2 起的 SSE 状态机适配器会重写这条流。
 
+pub mod gemini_cli;
 pub mod gemini_native;
 pub mod openai_chat;
 pub mod passthrough;
@@ -18,6 +19,7 @@ pub mod registry;
 pub mod responses;
 pub mod types;
 
+pub use gemini_cli::GeminiCliAdapter;
 pub use gemini_native::GeminiNativeAdapter;
 pub use openai_chat::OpenAiChatAdapter;
 pub use passthrough::ResponsesPassthroughAdapter;

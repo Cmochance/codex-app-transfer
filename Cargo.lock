@@ -697,6 +697,7 @@ dependencies = [
  "codex-app-transfer-registry",
  "futures-core",
  "futures-util",
+ "getrandom 0.2.17",
  "http",
  "indexmap 2.14.0",
  "rusqlite",
