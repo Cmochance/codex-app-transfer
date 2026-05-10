@@ -16,19 +16,27 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 ## 项目状态
 
-- 当前版本:**v2.1.4**(Python → Rust/Tauri 全栈重写后的当前主线)
+- 当前版本:**v2.1.5**(Python → Rust/Tauri 全栈重写后的当前主线)
 - 已验证供应商:Kimi Code(`kimi-for-coding` UA 网关)、Kimi 月之暗面(Moonshot Platform)、DeepSeek V4(官方 baseUrl,含「Max 思维」思考模式)、Xiaomi MiMo (Token Plan / Pay for Token)、MiniMax M2.x(OpenAI-compatible chat,自动剥不兼容字段 + `reasoning_split` + `<think>` 兜底)、**Google AI Studio / Gemini API**(v2.1.4 新增 `gemini_native` 适配器,直转 `:streamGenerateContent` 无中间 chat)
 - 实验兼容:智谱 GLM / 阿里云百炼 / 其它 OpenAI Chat 兼容反代
-- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产;**v2.1.0 起新增 macOS Intel x64**(见 [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61))。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.1.4。早期 Python 版本 v1.0.x 已不再作为推荐稳定版,新用户直接用 v2.x
+- 平台:v2.0.0 首发只发 macOS arm64;v2.0.1 起发布链路生成 macOS arm64 / Windows x64 / Linux x86_64 资产;**v2.1.0 起新增 macOS Intel x64**(见 [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61))。v2.0.0 ~ v2.0.5 已归档为中间版本(仅源代码,不提供二进制,详见各 Release 页),生产请用 v2.1.5。早期 Python 版本 v1.0.x 已不再作为推荐稳定版,新用户直接用 v2.x
 - 数据兼容:`~/.codex-app-transfer/config.json` 与 v1.x 互通,升级 / 回退不丢配置
 
 > 如果使用过程中出现问题,欢迎提交 PR 协助作者完善,会及时处理,非常感谢。
 
-### v2.x 主线改动(累计到 v2.1.4)
+### v2.x 主线改动(累计到 v2.1.5)
 
 按主题分组。
 
-**Gemini CLI OAuth 直连(impersonate gemini-cli,无需 API key)**(下版主线)
+**v2.1.5 主线 — Gemini CLI OAuth UI 精修 + 后端硬化收官**
+- Provider 卡片:隐藏未端到端验证警告 banner(已实测)、name 去 "(OAuth 登录)"、隐藏 OAuth 模式不需要的 baseUrl 输入(由 preset 写死 `cloudcode-pa.googleapis.com`)、删 2 段冗余说明文字、调按钮 / status 顺序(buttons 在前,status 在后)
+- Provider 图标换 Gemini 品牌"四角星 spark"(SVG,跟 gemini.google.com 一致),不再误用 Google AI Studio 黑色方块图标
+- OAuth 完成后自动调 `https://openidconnect.googleapis.com/v1/userinfo` 拿 Google 账号 email,持久化到 token,UI 显 `已登录:user@gmail.com — 项目 xxx-xxx-xxx`,不再显 `?` 占位
+- **架构性 enforcement**(防新 callsite 误用 raw config IO):`registry_io::save()` 改 module-private,prod 代码物理上无法 import 误用;`#[cfg(test)] save_for_test` 显式 opt-in
+- **三层锁**全栈 race-free:thread-local reentry detection(silent deadlock → loud panic)+ 进程内 `std::sync::Mutex` + cross-process `fs2::FileExt::lock_exclusive` 文件锁(防双开 .app 实例 RMW lost-update)
+- Frontend i18n 启动时序消除单帧 fallback 闪烁(HTML `data-i18n-pending` + inline CSS hide 直到 `apply()` 完成)+ `formatI18n` 全栈迁 `tFmt`(missing key + unsubstituted placeholder console.warn)
+
+**Gemini CLI OAuth 直连(impersonate gemini-cli,无需 API key)**(v2.1.5,本版主线)
 - 新增 `apiFormat=gemini_cli_oauth` + `authScheme=google_oauth_cloud_code`。用户**通过浏览器登录 Google 账号一次**,本地持久化 access/refresh token(`~/.codex-app-transfer/gemini-oauth.json`,Unix 0600 + atomic write),后续请求自动 refresh 复用,**不需要手动配 API key**。免费 tier per-account 配额绑 GCP `cloudaicompanionProject`(自动 provision)
 - 新独立 crate `crates/gemini_oauth/` 实现完整 OAuth 流程(impersonate `google-gemini/gemini-cli` web flow):loopback callback server (动态 port) + 32-byte hex CSRF state + `oauth2.googleapis.com/token` code-grant exchange + 60s buffer auto refresh + `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`+`onboardUser` LRO project bootstrap
 - 新 `crates/adapters/src/gemini_cli/` adapter:**复用 `gemini_native` 90% 内部转换**(JSON Schema sanitize / Web Search 软约束 / 多轮 function call cache / failure SSE / etc.),只加 outer envelope 层(`{model, project, user_prompt_id: uuid_v4, request: <inner>}`)+ SSE event 外包 `{response: {...}}` unwrap。proxy/forward.rs 加 `GoogleOauthCloudCode` authScheme 分支:dispatch 时 await `ensure_valid_access_token` 拿 Bearer 注入,token 过期前 60s 自动 refresh + 持久化
@@ -193,16 +201,24 @@ The Windows installer / portable build opens a standalone desktop window by defa
 
 ### Project status
 
-- Current version: **v2.1.4** (current mainline after the full Python → Rust/Tauri rewrite)
-- Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (official baseUrl, with "Max thinking" mode), Xiaomi MiMo (Token Plan / Pay for Token), MiniMax M2.x (OpenAI-compatible chat — incompatible fields auto-stripped, `reasoning_split` enabled, `<think>` tag fallback), **Google AI Studio / Gemini API** (v2.1.4 adds `gemini_native` adapter, direct `:streamGenerateContent` with no chat intermediate)
+- Current version: **v2.1.5** (current mainline after the full Python → Rust/Tauri rewrite)
+- Validated upstream: Kimi Code (`kimi-for-coding` UA gateway), Kimi Moonshot (Platform API), DeepSeek V4 (official baseUrl, with "Max thinking" mode), Xiaomi MiMo (Token Plan / Pay for Token), MiniMax M2.x (OpenAI-compatible chat — incompatible fields auto-stripped, `reasoning_split` enabled, `<think>` tag fallback), **Google AI Studio / Gemini API** (v2.1.4 adds `gemini_native` adapter, direct `:streamGenerateContent` with no chat intermediate), **Gemini CLI OAuth** (v2.1.5 adds `gemini_cli_oauth` — browser login Google once, no API key needed)
 - Experimental compatibility: Zhipu GLM / Alibaba Cloud Bailian / other OpenAI Chat-compatible reverse proxies
-- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets; **v2.1.0+ also ships macOS Intel x64** (see [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61)). v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.1.4 in production. Earlier Python v1.0.x line is no longer recommended for new installs — go straight to v2.x.
+- Platforms: v2.0.0 launched on macOS arm64 only; v2.0.1+ release builds produce macOS arm64 / Windows x64 / Linux x86_64 assets; **v2.1.0+ also ships macOS Intel x64** (see [issue #61](https://github.com/Cmochance/codex-app-transfer/issues/61)). v2.0.0 ~ v2.0.5 are archived as intermediate releases (source-only, no binaries — see each Release page); use v2.1.5 in production. Earlier Python v1.0.x line is no longer recommended for new installs — go straight to v2.x.
 - Data compatibility: `~/.codex-app-transfer/config.json` carries over from v1.x without conversion — upgrade or roll back without losing config
-### v2.x mainline rollups (cumulative through v2.1.4)
+### v2.x mainline rollups (cumulative through v2.1.5)
 
 Grouped by theme.
 
-**Gemini CLI OAuth direct (impersonate gemini-cli, no API key required)** (next release main theme)
+**v2.1.5 mainline — Gemini CLI OAuth UI polish + backend hardening wrap-up**
+- Provider card: hide unverified-banner (now end-to-end validated), drop "(OAuth login)" suffix from name, hide baseUrl input in OAuth mode (preset hard-codes `cloudcode-pa.googleapis.com`), remove 2 redundant explanatory paragraphs, swap order so login/logout buttons sit above the status line
+- Provider icon switched to the Gemini brand spark (SVG, matches gemini.google.com), no longer mis-using the Google AI Studio black square
+- After OAuth completes, fetch Google account email via `https://openidconnect.googleapis.com/v1/userinfo` and persist it in the token; status now shows `Signed in: user@gmail.com — project xxx-xxx-xxx` instead of the `?` placeholder
+- **Architectural enforcement** to prevent future raw-IO misuse: `registry_io::save()` is now module-private — prod code physically cannot import it; `#[cfg(test)] save_for_test` is the explicit opt-in for fixture tests
+- **Three-layer locking** for race-free RMW: thread-local reentry detection (silent deadlock → loud panic) + in-process `std::sync::Mutex` + cross-process `fs2::FileExt::lock_exclusive` file lock (defends against the "two-app-instance lost-update" scenario)
+- Frontend i18n boot timing eliminates the single-frame Chinese-fallback flash for EN users (HTML `data-i18n-pending` + inline CSS hide until `apply()` runs); `formatI18n` migrated wholesale to `tFmt` (which warns on missing keys and unsubstituted placeholders)
+
+**Gemini CLI OAuth direct (impersonate gemini-cli, no API key required)** (v2.1.5 main theme)
 - New `apiFormat=gemini_cli_oauth` + `authScheme=google_oauth_cloud_code`. Users log in via browser **once** to Google; access/refresh tokens are persisted locally (`~/.codex-app-transfer/gemini-oauth.json`, Unix 0600 + atomic write) and **auto-refreshed** by subsequent requests. **No manual API key needed**. Free-tier per-account quota is bound to a GCP `cloudaicompanionProject` (auto-provisioned).
 - New standalone `crates/gemini_oauth/` crate implementing the full OAuth flow (impersonating `google-gemini/gemini-cli`'s web flow): loopback callback server (dynamic port) + 32-byte hex CSRF state + `oauth2.googleapis.com/token` code grant + 60s-buffer auto refresh + `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`+`onboardUser` LRO project bootstrap
 - New `crates/adapters/src/gemini_cli/` adapter: **reuses 90% of `gemini_native`'s internal transforms** (JSON Schema sanitize / Web Search soft constraint / multi-turn function-call cache / failure SSE / etc.), only adding the outer envelope layer (`{model, project, user_prompt_id: uuid_v4, request: <inner>}`) and SSE event `{response: {...}}` outer unwrap. `proxy/forward.rs` adds a `GoogleOauthCloudCode` authScheme branch: dispatch awaits `ensure_valid_access_token` to inject Bearer; tokens auto-refresh 60s before expiry and persist.
