@@ -101,7 +101,25 @@ impl Adapter for GeminiCliAdapter {
         // 1. 复用 gemini_native 把 Codex /responses 转 Gemini inner body
         let inner =
             crate::gemini_native::request::responses_body_to_gemini_request(&parsed, provider)?;
-        let inner_value = serde_json::to_value(&inner).map_err(AdapterError::BodyDecode)?;
+        let mut inner_value = serde_json::to_value(&inner).map_err(AdapterError::BodyDecode)?;
+
+        // **cloud-code wire 兼容性**:`tool_config.includeServerSideToolInvocations`
+        // 仅在 generativelanguage(API key)/ Vertex 路径 proto 已实装;
+        // cloudcode-pa OAuth 路径 proto 当前**不识别**此字段,返
+        // `400 INVALID_ARGUMENT: Unknown name "includeServerSideToolInvocations"`
+        // (实测 2026-05-11 Gemini 3 + Codex tools 触发)。CLIProxyAPI / gemini-cli
+        // upstream 在 cloudcode-pa 路径**都不发**此字段 — combined `tools: [
+        // {googleSearch:{}}, {functionDeclarations:[...]}]` 在 cloudcode-pa
+        // Gemini 3 模型上原生接受,不需要 flag。strip 后继续走。
+        if let Some(obj) = inner_value.as_object_mut() {
+            if let Some(tc) = obj.get_mut("toolConfig").and_then(|v| v.as_object_mut()) {
+                tc.remove("includeServerSideToolInvocations");
+                // 如果 toolConfig 整体空(只有这一个 flag),把 toolConfig 整个移除
+                if tc.is_empty() {
+                    obj.remove("toolConfig");
+                }
+            }
+        }
 
         // 2. outer envelope: {model, project, user_prompt_id, request: <inner>}
         // RNG 失败(极罕见,iOS-style sandbox 可能触发)→ BadRequest 让 client 看到失败,
@@ -206,6 +224,55 @@ mod adapter_tests {
     #[test]
     fn name_is_stable_id() {
         assert_eq!(GeminiCliAdapter.name(), "gemini_cli_oauth");
+    }
+
+    /// **cloud-code wire 兼容性**:Gemini 3 + Codex tools 触发 transformer 加
+    /// `toolConfig.includeServerSideToolInvocations=true`,但 cloudcode-pa proto
+    /// 未实装此字段,返 400 `Unknown name ...`。本测试 lock GeminiCliAdapter
+    /// 走 strip 路径:transformer 加了字段后 prepare_request 必须 strip。
+    /// (实测 2026-05-11 Gemini 3 调用直接触发,user-facing chat 全 fail)
+    #[test]
+    fn strips_include_server_side_tool_invocations_for_cloud_code_path() {
+        // 构造既含 functionDeclarations 又含 googleSearch 的请求 — 这是触发
+        // transformer 设 includeServerSideToolInvocations=true 的唯一路径
+        let body = serde_json::json!({
+            "model": "gemini-3-pro-preview",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"x"}],
+            "tools": [
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}},
+                {"type":"web_search"}
+            ]
+        });
+        let plan = GeminiCliAdapter
+            .prepare_request(
+                "/v1/responses",
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                &dummy_provider_with_project(),
+            )
+            .unwrap();
+        // body 是 outer envelope: {model, project, user_prompt_id, request: <inner>}
+        let outer: Value = serde_json::from_slice(&plan.body).unwrap();
+        let inner = outer.get("request").unwrap();
+        // 1. 字段被 strip:cloudcode-pa 拒识别
+        let tc_field = inner
+            .get("toolConfig")
+            .and_then(|v| v.get("includeServerSideToolInvocations"));
+        assert!(
+            tc_field.is_none(),
+            "includeServerSideToolInvocations 必须被 strip,实际 inner={inner:#}"
+        );
+        // 2. tools 数组保留 — 两者共存让 cloudcode-pa 原生接受
+        let tools = inner.get("tools").and_then(|v| v.as_array()).unwrap();
+        let has_gs = tools.iter().any(|t| t.get("googleSearch").is_some());
+        let has_fd = tools
+            .iter()
+            .any(|t| t.get("functionDeclarations").is_some());
+        assert!(
+            has_gs,
+            "googleSearch 必须保留(cloud-code Gemini 3 原生接受共存)"
+        );
+        assert!(has_fd, "functionDeclarations 必须保留");
     }
 
     #[test]
