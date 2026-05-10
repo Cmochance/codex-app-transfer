@@ -1,20 +1,36 @@
 //! High-level "拿一个有效的 access_token" service —— 给 proxy / admin handler 调。
 //!
 //! 隐藏 [`TokenStore`] / [`refresh_access_token`] 协调细节,提供单一函数
-//! [`ensure_valid_access_token`]:load → check expiry → refresh + persist 必要时 →
-//! return access_token。
+//! [`ensure_valid_access_token`]:load → check expiry → single-flight refresh +
+//! persist 必要时 → return access_token。
 //!
-//! ## Race / 并发
+//! ## Single-flight refresh(2026-05-11 critical 修)
 //!
-//! 当前实现**没有跨进程 / 跨请求 mutex**。两个并发请求同时进 should_refresh()
-//! true 分支 → 各自 refresh 一次,后者覆盖前者。Google `/token` endpoint
-//! idempotent,refresh 操作本身不出错;但浪费一次网络往返 + 多写一次磁盘。
-//! 影响小,后续若高并发可加 `tokio::sync::Mutex` 包 store。
+//! 原版无 mutex,两个并发请求都进 should_refresh() true 分支时各自调 refresh,
+//! Google 默认**不 rotate refresh_token**但在某些 edge case(refresh_token 已被
+//! 用过一次后再用)会返 `invalid_grant`,**永久 brick** 这个 token,用户必须
+//! 重新 OAuth 登录。
+//!
+//! 修法:用进程级 `tokio::sync::Mutex` 把 load → refresh → save 整个 sequence
+//! 原子化。第二个并发请求拿到锁后会**重新 load**,看到第一次 refresh 的新
+//! token + should_refresh()=false → 直接返新 access_token,**完全跳过自己的
+//! refresh 调用**,根治 invalid_grant brick + 浪费 RTT。
+
+use std::sync::OnceLock;
 
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use super::flow::{refresh_access_token, FlowError};
 use super::token::{OauthToken, TokenError, TokenStore};
+
+/// 进程级 refresh mutex —— 同一进程内任何 `ensure_valid_access_token` 并发调用
+/// 都串行进 critical section。Mutex 不绑定到具体 store path 上(全局 single-flight)
+/// 因为本项目只用一份 token store(`~/.codex-app-transfer/gemini-oauth.json`)。
+fn refresh_mutex() -> &'static Mutex<()> {
+    static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    MUTEX.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -28,22 +44,39 @@ pub enum ServiceError {
 
 /// 加载持久化 token,过期前 60s 自动 refresh + 持久化,返回当前可用 access_token。
 ///
+/// **Single-flight refresh**(2026-05-11):并发请求由 [`refresh_mutex`] 串行化,
+/// 第二个请求拿到锁后**重新 load** token,如果第一次已经 refresh 过(should_refresh=
+/// false)→ 直接返新 access_token,**跳过自己的 refresh 调用**,防 Google
+/// `invalid_grant` 永久 brick token。
+///
 /// 失败语义:
 /// - 文件不存在 → `NotLoggedIn`,调用方应触发 OAuth login flow
 /// - 文件存在但 IO / JSON 错 → `Token` 包装(致命,不能用)
-/// - refresh 调用失败 → `Refresh` 包装(可重试)
+/// - refresh 调用失败 → `Refresh` 包装(`invalid_grant` 等;调用方应映射到 401 +
+///   `refresh_token_revoked` code 提示用户重登)
 pub async fn ensure_valid_access_token(
     http: &reqwest::Client,
     store: &TokenStore,
 ) -> Result<String, ServiceError> {
+    // 第一次 load(无锁):大多数情况 token 没过期,直接返避免 mutex contention
     let token = store.load()?.ok_or(ServiceError::NotLoggedIn)?;
     if !token.should_refresh() {
         return Ok(token.access_token);
     }
-    // 过期窗口内 — refresh + 持久化
+
+    // 过期窗口内 — 进 single-flight critical section
+    let _guard = refresh_mutex().lock().await;
+
+    // 拿到锁后**重新 load** —— 若上一并发请求已 refresh 过,这里直接复用新 token
+    let token = store.load()?.ok_or(ServiceError::NotLoggedIn)?;
+    if !token.should_refresh() {
+        tracing::debug!("single-flight: 并发请求已 refresh,复用新 token 跳过自己的 refresh 调用");
+        return Ok(token.access_token);
+    }
+
     tracing::debug!(
         expiry_date = token.expiry_date,
-        "OAuth token 过期窗口内,触发 refresh"
+        "OAuth token 过期窗口内,触发 refresh(single-flight critical section)"
     );
     let refreshed = refresh_access_token(
         http,

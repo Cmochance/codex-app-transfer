@@ -161,8 +161,33 @@ fn process_event(event: &[u8]) -> Vec<u8> {
                             Ok(s) => s,
                             Err(_) => payload, // 序列化失败极不正常,原样透传
                         }
+                    } else if let Some(error) = obj.get("error") {
+                        // **Critical** silent-failure 修(2026-05-11):Cloud Code 上游有时
+                        // 在 HTTP 200 SSE 流中间发 `data: {"error":{...}}` 事件(quota 中途
+                        // 耗尽 / 项目权限丢 / 内部异常),没 `.response` wrap 字段。原版当
+                        // 普通 keepalive 透传 → native 状态机看不懂忽略 → 用户 Codex.app
+                        // 收到无 candidates 的空流,silent 完成。
+                        //
+                        // 修法:tracing::error! 落完整 body(operator 必看),把 event 改写
+                        // 成 Gemini wire 形式的 error JSON(`{"error":{...}}`) — native 状态
+                        // 机不直接识别此 inline error,但 finish() 会因 final_finish_reason
+                        // 仍是 None 走 C4 防御路径 emit `response.incomplete` + reason=
+                        // interrupted,client 至少能识别 stream 终止状态(虽不如 4xx/5xx
+                        // 路径的 response.failed 信息丰富,完整 envelope 注入留 followup)。
+                        let error_message = error
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("(no message)");
+                        tracing::error!(
+                            body = %payload,
+                            message = %error_message,
+                            "Cloud Code 200 流中 inline error event;转 Gemini error 让 native 状态机走 incomplete 终态,防 silent 空流"
+                        );
+                        // 透传 error JSON 给 native 状态机(它不会构造 candidates 但会因
+                        // 缺 finishReason 在 EOF 时走 incomplete 路径)
+                        payload
                     } else {
-                        // 没 .response 字段 — 可能是 keepalive / error event,原样透传
+                        // 真正的 keepalive(纯 comment / 心跳)— 原样透传
                         payload
                     }
                 }
@@ -248,12 +273,41 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_or_non_wrap_event_passed_through() {
-        // 不带 response 字段的 event(keepalive / error)— 原样透传
-        let input = b"data: {\"error\":{\"code\":429,\"message\":\"quota\"}}\n\n";
+    fn inline_error_event_logged_and_passed_through() {
+        // **Critical** silent-failure 修:Cloud Code 200 流中 `data: {"error":...}` event
+        // 不再被当 keepalive silent 吃掉。当前实现:tracing::error! 落 body + 透传 error JSON
+        // (native 状态机看不懂 → finish() 走 C4 incomplete 路径)。本测试 lock 透传行为,
+        // tracing log 由 tracing-subscriber 在生产环境下捕获(单测里 default subscriber drop)
+        let input = b"data: {\"error\":{\"code\":429,\"message\":\"quota exceeded\"}}\n\n";
         let out = run_unwrap(vec![input]);
         assert!(out.contains("\"error\""));
         assert!(out.contains("\"code\":429"));
+        // 没 .response wrap → 原 error JSON 应该出现在输出
+        assert!(out.contains("quota exceeded"));
+    }
+
+    #[test]
+    fn mixed_response_and_error_prefers_response_branch() {
+        // 防御性 lock:同 event 既有 .response 又有 .error 时,我们的实现先 remove .response
+        // → 走正常 unwrap 路径(error 分支不触发)。这是 Cloud Code 实测不会出现的形态,
+        // 但 lock 当前行为防 future 重构改 branch 顺序导致 error 优先吃掉 response。
+        let input =
+            b"data: {\"response\":{\"candidates\":[{\"x\":1}]},\"error\":{\"code\":429}}\n\n";
+        let out = run_unwrap(vec![input]);
+        // .response unwrap 后:输出 {"candidates":[{"x":1}]} — 不含 outer "response" key
+        // 也不含 "error"(它是 outer object 字段,跟 response 同级,被 remove("response")
+        // 后没保留)
+        assert!(out.contains("\"x\":1"));
+        assert!(!out.contains("\"response\":"));
+    }
+
+    #[test]
+    fn pure_keepalive_event_passed_through_unchanged() {
+        // 纯 keepalive / 心跳(无 .response 也无 .error)还是原样透传
+        let input = b"data: {\"_keepalive\":true,\"timestamp\":1234}\n\n";
+        let out = run_unwrap(vec![input]);
+        assert!(out.contains("_keepalive"));
+        assert!(out.contains("1234"));
     }
 
     #[test]

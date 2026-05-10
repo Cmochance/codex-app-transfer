@@ -89,7 +89,12 @@ impl Adapter for GeminiCliAdapter {
         let inner_value = serde_json::to_value(&inner).map_err(AdapterError::BodyDecode)?;
 
         // 2. outer envelope: {model, project, user_prompt_id, request: <inner>}
-        let outer = request::wrap_cloud_code_envelope(&model, &project_id, inner_value);
+        // RNG 失败(极罕见,iOS-style sandbox 可能触发)→ BadRequest 让 client 看到失败,
+        // 不进 silent zero UUID 路径(2026-05-11 silent-failure 修)
+        let outer =
+            request::wrap_cloud_code_envelope(&model, &project_id, inner_value).map_err(|e| {
+                AdapterError::BadRequest(format!("OS RNG unavailable for user_prompt_id: {e}"))
+            })?;
         let outer_body = serde_json::to_vec(&outer).map_err(AdapterError::BodyDecode)?;
 
         // 3. cloud-code 上游 path: 不像 gemini_native 是 /v1{alpha,beta}/models/<m>:method
@@ -237,7 +242,7 @@ mod adapter_tests {
     #[test]
     fn missing_project_id_returns_bad_request_with_hint() {
         let mut p = dummy_provider_with_project();
-        p.extra.remove("cloud_code_project_id");
+        p.extra.shift_remove("cloud_code_project_id");
         let body = serde_json::json!({
             "model": "gemini-2.5-pro",
             "input": [{"type":"message","role":"user","content":"x"}]
