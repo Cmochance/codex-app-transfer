@@ -75,18 +75,53 @@ pub struct ClientMetadata {
 
 impl ClientMetadata {
     /// 默认元数据,plugin_type / version 锁死跟 USER_AGENT 一致。platform 按
-    /// `<OS>_<ARCH>` 大写拼,Google 上游期望这种 enum 字面。
+    /// Google 上游 `ClientMetadata.Platform` enum 字面拼:`DARWIN_ARM64` /
+    /// `LINUX_AMD64` / `WINDOWS_AMD64` 等。
+    ///
+    /// **关键**:**不能**直接用 `std::env::consts::{OS,ARCH}` upper-case 拼 ——
+    /// 那会拿到 `MACOS_AARCH64` / `MACOS_X86_64` / `LINUX_X86_64`,Google 上游
+    /// `loadCodeAssist` 立即返 400 `Invalid value at 'metadata.platform'`。
+    /// 实测 2026-05-11(MacBook Apple Silicon)整条 login flow break。
+    /// gemini-cli upstream(`packages/cli/src/utils/userInfo.ts`)用 `process.platform`
+    /// → `darwin/linux/win32`,跟 Rust 的 `std::env::consts::OS=macos` 名空间不
+    /// 重叠,必须显式 map。
     pub fn default_for_current_platform() -> Self {
-        let os = std::env::consts::OS.to_ascii_uppercase();
-        let arch = std::env::consts::ARCH.to_ascii_uppercase();
         Self {
             ide_type: "IDE_UNSPECIFIED",
-            platform: format!("{os}_{arch}"),
+            platform: detect_platform(),
             plugin_type: "GEMINI",
             plugin_version: "0.34.0",
             duet_project: None,
         }
     }
+}
+
+/// 把 Rust `std::env::consts::{OS,ARCH}` 转 Google `ClientMetadata.Platform`
+/// enum 字面值。未识别 OS/ARCH 组合 fallback `PLATFORM_UNSPECIFIED`(Google
+/// 上游可能 reject,比直接发错值更安全)。
+///
+/// Mapping 来源:CLIProxyAPI `header_utils.go::DetectPlatform()` + gemini-cli
+/// `userInfo.ts` 的 `getPlatform()`。
+fn detect_platform() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "DARWIN",
+        "linux" => "LINUX",
+        "windows" => "WINDOWS",
+        other => {
+            tracing::warn!(os = other, "unknown OS for Google ClientMetadata.platform mapping; using PLATFORM_UNSPECIFIED");
+            return "PLATFORM_UNSPECIFIED".to_owned();
+        }
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "ARM64",
+        "x86_64" => "AMD64",
+        "x86" => "X86",
+        other => {
+            tracing::warn!(arch = other, "unknown ARCH for Google ClientMetadata.platform mapping; using PLATFORM_UNSPECIFIED");
+            return "PLATFORM_UNSPECIFIED".to_owned();
+        }
+    };
+    format!("{os}_{arch}")
 }
 
 /// `loadCodeAssist` 请求 body。
@@ -498,13 +533,34 @@ mod tests {
         assert_eq!(m.plugin_type, "GEMINI");
         assert_eq!(m.plugin_version, "0.34.0");
         assert_eq!(m.ide_type, "IDE_UNSPECIFIED");
-        // platform 形如 DARWIN_ARM64 / LINUX_X86_64 / WINDOWS_X86_64
+        // platform 必须命中 Google ClientMetadata.Platform 字面 enum
+        // 之一(DARWIN_ARM64 / LINUX_AMD64 / WINDOWS_AMD64 等),
+        // 或 fallback PLATFORM_UNSPECIFIED。**绝对不能**含 "MACOS" / "AARCH64"
+        // / "X86_64" 等 std::env::consts 原始值 — Google 上游 returns 400
+        const VALID: &[&str] = &[
+            "DARWIN_ARM64",
+            "DARWIN_AMD64",
+            "LINUX_ARM64",
+            "LINUX_AMD64",
+            "LINUX_X86",
+            "WINDOWS_ARM64",
+            "WINDOWS_AMD64",
+            "WINDOWS_X86",
+            "PLATFORM_UNSPECIFIED",
+        ];
         assert!(
-            m.platform.contains("_"),
-            "platform 必须 OS_ARCH: {}",
+            VALID.contains(&m.platform.as_str()),
+            "platform '{}' 不在 Google ClientMetadata.Platform enum 范围,login 整流会被 400 拒;若新增平台请同步加 mapping",
             m.platform
         );
-        assert_eq!(m.platform, m.platform.to_ascii_uppercase());
+        // bug 检测:这些是 std::env::consts 原始值 upper-case,**绝不能**出现
+        for forbidden in ["MACOS", "AARCH64", "X86_64"] {
+            assert!(
+                !m.platform.contains(forbidden),
+                "platform '{}' 含 std::env::consts 原始值 '{forbidden}' — Google 上游不识别",
+                m.platform
+            );
+        }
     }
 
     #[test]
