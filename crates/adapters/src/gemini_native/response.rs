@@ -718,6 +718,40 @@ impl GeminiToResponsesConverter {
         );
     }
 
+    /// 上游 4xx/5xx → 构造合规 Responses SSE failure event(`response.failed`)。
+    /// envelope.error 用 OpenAI Responses API 的 `{code, message}` 形状,Codex.app
+    /// 客户端能正确识别 + 显示。`type` 字段额外塞 upstream HTTP status 方便诊断。
+    ///
+    /// **WARNING — 仅 pre-stream 调用**:本方法无脑标 `completed_emitted = true`,**不会**
+    /// flush 任何 pending output_item.done / content_part.done。如果上游已 emit 过部分
+    /// output_*.delta 后中途调 emit_failure,客户端会看到孤立的 delta + failed,行为
+    /// 未定义。当前唯一调用点是 `convert_gemini_error_to_responses_failure_stream`
+    /// (fresh converter,4xx/5xx 入口),mid-stream 失败请走 `final_finish_reason =
+    /// FINISH_INTERRUPTED` 让 `finish()` emit incomplete envelope。
+    pub(super) fn emit_failure(&mut self, code: &str, message: &str, http_status: u16) -> Vec<u8> {
+        debug_assert!(
+            !self.completed_emitted,
+            "emit_failure called after terminal event — would skip pending item closures"
+        );
+        let mut out = Vec::new();
+        if !self.lifecycle_opened {
+            self.emit_lifecycle_open(&mut out);
+        }
+        let mut envelope = self.build_envelope("failed");
+        envelope["output"] = json!([]);
+        envelope["usage"] = Value::Null;
+        envelope["incomplete_details"] = Value::Null;
+        envelope["error"] = json!({
+            "code": code,
+            "message": message,
+            "type": format!("upstream_http_{http_status}"),
+        });
+        let payload = json!({"type": "response.failed", "response": envelope});
+        emit_event(&mut out, &mut self.sequence_number, "response.failed", payload);
+        self.completed_emitted = true;
+        out
+    }
+
     fn emit_completed(&mut self, out: &mut Vec<u8>) {
         if self.completed_emitted {
             return;
@@ -1253,6 +1287,209 @@ impl GeminiToResponsesConverter {
 // ByteStream wrapper
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// 上游错误 body 最大读取字节数。Gemini error 通常 <1KB;CDN HTML 错误页 / proxy
+/// 异常体可能数 MB。无 cap → 失败请求并发时内存放大攻击面。截断后剩余 bytes 直接 drop
+/// (上游已经表态错误,我们不需要 forward 完整 body,只需要 error message 给用户)。
+const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// 用户可见 error message 截断阈值。Responses error envelope 无文档化硬上限,选 2000
+/// 给操作者足够诊断信息(stack trace / quota detail)又不至于撑爆 SSE event。
+const MAX_USER_ERROR_MESSAGE_CHARS: usize = 2000;
+
+/// 上游 4xx/5xx 错误 → Responses SSE failure 流。
+///
+/// **不能直接透传 Gemini raw JSON 4xx body** — Codex.app 期待 SSE event 流,
+/// 收到非 SSE raw JSON 不知道怎 parse → 卡 Thinking 永不结束(silent failure)。
+/// 改成构造合规 Responses SSE:`response.created`(in_progress)→ `response.failed`
+/// 含 error code + message。客户端能识别 + 显示用户级错误。
+///
+/// 错误分类(status code + Gemini `error.status` + message 关键词):
+/// - 401 / UNAUTHENTICATED → `auth_error`
+/// - 403 / PERMISSION_DENIED → `permission_denied`(API 未启用 / billing / region)
+/// - 408 / 504 → `timeout`(retry 可能有效)
+/// - 429 + RESOURCE_EXHAUSTED → `quota_exceeded`(retry 短期内无效)
+/// - 429 其他 → `rate_limited`(指数退避 retry)
+/// - 400 + SAFETY/blockReason → `content_filter`
+/// - 400 其他 → `bad_request`
+/// - 503 → `service_unavailable`
+/// - 502 / 5xx 其他 → `server_error`
+/// - 其他 → `upstream_error`
+///
+/// 防御性失败处理(本身**不能**埋新 silent failure):
+/// - upstream ByteStream Err mid-read → 把 transport error 拼进用户 message,降级
+///   `code = "upstream_transport_error"`(operator log 也会记)
+/// - body 超过 [`MAX_UPSTREAM_ERROR_BODY_BYTES`] → 截断,在 message 后缀标 `…(truncated)`
+/// - body 非 UTF-8 → `from_utf8_lossy` 替换,在 message 后缀标 `(non-UTF-8 body)`
+/// - 任何分支都**保证** emit `response.failed`,客户端永远不会卡住
+pub fn convert_gemini_error_to_responses_failure_stream(
+    upstream_status: http::StatusCode,
+    upstream_stream: ByteStream,
+    original_request: Option<Value>,
+) -> ByteStream {
+    use futures_util::stream::StreamExt;
+    let status_u16 = upstream_status.as_u16();
+    let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        Box::pin(stream::unfold(
+            (upstream_stream, original_request, false),
+            move |(mut input, orig, finished)| async move {
+                if finished {
+                    return None;
+                }
+                // 收上游 error body, cap 防 DoS, 记录 transport err 防 silent swallow
+                let mut body = Vec::with_capacity(1024);
+                let mut transport_err: Option<String> = None;
+                let mut truncated = false;
+                while let Some(chunk) = input.next().await {
+                    match chunk {
+                        Ok(b) => {
+                            let remaining = MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
+                            if remaining == 0 {
+                                truncated = true;
+                                break;
+                            }
+                            let take = b.len().min(remaining);
+                            body.extend_from_slice(&b[..take]);
+                            if take < b.len() {
+                                truncated = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            transport_err = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                let was_lossy = std::str::from_utf8(&body).is_err();
+                let raw_text = String::from_utf8_lossy(&body).into_owned();
+                let parsed: Option<Value> = serde_json::from_str(&raw_text).ok();
+
+                // 提 Gemini error.message,支持 object {"error":{...}} 与 array [{"error":{...}}] 两种 shape
+                let extract_message = |v: &Value| -> Option<String> {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(String::from)
+                };
+                let extract_status = |v: &Value| -> Option<String> {
+                    v.get("error")
+                        .and_then(|e| e.get("status"))
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
+                };
+                let (upstream_message, upstream_status_str) = match parsed.as_ref() {
+                    Some(v) if v.is_object() => (extract_message(v), extract_status(v)),
+                    Some(v) => match v.as_array().and_then(|a| a.first()) {
+                        Some(first) => (extract_message(first), extract_status(first)),
+                        None => (None, None),
+                    },
+                    None => (None, None),
+                };
+
+                // ── 分类 ──
+                let (mut code, mut kind): (&str, &str) = match status_u16 {
+                    401 => ("auth_error", "Authentication failed"),
+                    403 => {
+                        // Gemini 403 多是 API 未启用 / billing / region — 跟 401 ("API key 错") 区分
+                        if upstream_status_str.as_deref() == Some("UNAUTHENTICATED") {
+                            ("auth_error", "Authentication failed")
+                        } else {
+                            ("permission_denied", "Permission denied (API not enabled, billing, or region restricted)")
+                        }
+                    }
+                    408 => ("timeout", "Upstream request timed out"),
+                    400 => {
+                        // INVALID_ARGUMENT 也覆盖 safety block;message 关键词探测
+                        let is_safety = upstream_message
+                            .as_deref()
+                            .map(|m| {
+                                let lower = m.to_ascii_lowercase();
+                                lower.contains("safety") || lower.contains("blocked") || lower.contains("block_reason")
+                            })
+                            .unwrap_or(false);
+                        if is_safety {
+                            ("content_filter", "Content blocked by upstream safety filter")
+                        } else {
+                            ("bad_request", "Bad request to upstream")
+                        }
+                    }
+                    429 => {
+                        let is_quota = upstream_status_str.as_deref() == Some("RESOURCE_EXHAUSTED")
+                            || upstream_message
+                                .as_deref()
+                                .map(|m| {
+                                    let lower = m.to_ascii_lowercase();
+                                    lower.contains("quota") || lower.contains("resource_exhausted")
+                                })
+                                .unwrap_or(false);
+                        if is_quota {
+                            ("quota_exceeded", "Quota exceeded")
+                        } else {
+                            ("rate_limited", "Rate limited")
+                        }
+                    }
+                    503 => ("service_unavailable", "Upstream service unavailable"),
+                    504 => ("timeout", "Upstream gateway timed out"),
+                    s if (500..600).contains(&s) => ("server_error", "Upstream server error"),
+                    _ => ("upstream_error", "Upstream returned an error"),
+                };
+
+                // transport error 覆盖分类:body 不完整,前面提到的 message 不可信
+                if transport_err.is_some() {
+                    code = "upstream_transport_error";
+                    kind = "Transport error reading upstream error body";
+                }
+
+                // ── 拼用户可见 message ──
+                let mut error_message = match &upstream_message {
+                    Some(m) => format!("{kind} (HTTP {status_u16}): {m}"),
+                    None => format!("{kind} (HTTP {status_u16})"),
+                };
+                if let Some(te) = &transport_err {
+                    error_message.push_str(&format!(" [transport error: {te}]"));
+                }
+                if truncated {
+                    error_message.push_str(" [body truncated]");
+                }
+                if was_lossy {
+                    error_message.push_str(" [non-UTF-8 body]");
+                }
+                if error_message.chars().count() > MAX_USER_ERROR_MESSAGE_CHARS {
+                    let truncated_msg: String = error_message
+                        .chars()
+                        .take(MAX_USER_ERROR_MESSAGE_CHARS)
+                        .collect();
+                    error_message = format!("{truncated_msg}…");
+                }
+
+                // operator-side log:让 5xx 显眼,4xx 走 warn
+                if (500..600).contains(&status_u16) || transport_err.is_some() {
+                    tracing::error!(
+                        upstream_status = status_u16,
+                        code,
+                        truncated,
+                        was_lossy,
+                        transport_err = transport_err.as_deref().unwrap_or(""),
+                        "gemini upstream returned error; synthesized response.failed for client"
+                    );
+                } else {
+                    tracing::warn!(
+                        upstream_status = status_u16,
+                        code,
+                        upstream_status_str = upstream_status_str.as_deref().unwrap_or(""),
+                        message_preview = upstream_message.as_deref().unwrap_or("").chars().take(200).collect::<String>(),
+                        "gemini upstream returned error; synthesized response.failed for client"
+                    );
+                }
+
+                let mut conv = GeminiToResponsesConverter::new(orig, None);
+                let out = conv.emit_failure(code, &error_message, status_u16);
+                Some((Ok(Bytes::from(out)), (input, None, true)))
+            },
+        ));
+    s
+}
+
 /// 包装 Gemini SSE byte stream → Responses SSE byte stream。
 pub fn convert_gemini_to_responses_stream(
     input: ByteStream,
@@ -1637,5 +1874,241 @@ mod tests {
         assert!(s.contains("event: response.created"));
         assert!(s.contains("event: response.completed"));
         assert!(s.contains("end-to-end"));
+    }
+
+    fn drive_failure_stream(status: u16, body: &str) -> String {
+        let upstream: ByteStream = Box::pin(stream::iter(vec![Ok(Bytes::from(body.to_owned()))]));
+        let mut s = convert_gemini_error_to_responses_failure_stream(
+            http::StatusCode::from_u16(status).unwrap(),
+            upstream,
+            None,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut all = Vec::new();
+        runtime.block_on(async {
+            while let Some(item) = s.next().await {
+                all.extend_from_slice(&item.unwrap());
+            }
+        });
+        String::from_utf8(all).unwrap()
+    }
+
+    #[test]
+    fn failure_stream_429_quota_exceeded() {
+        let body = r#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'Generate Content API requests per minute' and limit 'GenerateContent request limit per minute' of service 'generativelanguage.googleapis.com' for consumer 'project_number:xxx'.","status":"RESOURCE_EXHAUSTED"}}"#;
+        let s = drive_failure_stream(429, body);
+        assert!(s.contains("event: response.created"));
+        assert!(s.contains("event: response.in_progress"));
+        assert!(s.contains("event: response.failed"));
+        assert!(s.contains("\"code\":\"quota_exceeded\""));
+        assert!(s.contains("\"type\":\"upstream_http_429\""));
+        assert!(s.contains("Quota exceeded"));
+    }
+
+    #[test]
+    fn failure_stream_401_auth_error() {
+        let body = r#"{"error":{"code":401,"message":"API key not valid. Please pass a valid API key.","status":"UNAUTHENTICATED"}}"#;
+        let s = drive_failure_stream(401, body);
+        assert!(s.contains("\"code\":\"auth_error\""));
+        assert!(s.contains("API key not valid"));
+        assert!(s.contains("event: response.failed"));
+    }
+
+    #[test]
+    fn failure_stream_500_server_error_with_unparseable_body() {
+        // 上游 5xx 经常返非 JSON HTML 错误页;不能崩,要降级到 generic message
+        let s = drive_failure_stream(500, "<html>Internal Server Error</html>");
+        assert!(s.contains("\"code\":\"server_error\""));
+        assert!(s.contains("\"type\":\"upstream_http_500\""));
+        // 没有 upstream message 时,至少有 status code
+        assert!(s.contains("HTTP 500"));
+    }
+
+    #[test]
+    fn failure_stream_429_rate_limited_when_no_quota_keyword() {
+        // 429 但 message/status 都不含 quota 关键词 → 应分类为 rate_limited 而非 quota_exceeded
+        let body = r#"{"error":{"code":429,"message":"Too many concurrent requests","status":"UNAVAILABLE"}}"#;
+        let s = drive_failure_stream(429, body);
+        assert!(s.contains("\"code\":\"rate_limited\""));
+        assert!(!s.contains("\"code\":\"quota_exceeded\""));
+        assert!(s.contains("Too many concurrent requests"));
+    }
+
+    #[test]
+    fn failure_stream_403_permission_denied_distinct_from_401() {
+        // 403 PERMISSION_DENIED 应区分于 401 auth_error(用户不会被误导去检查 API key)
+        let body = r#"{"error":{"code":403,"message":"Generative Language API has not been used in project xxx before or it is disabled.","status":"PERMISSION_DENIED"}}"#;
+        let s = drive_failure_stream(403, body);
+        assert!(s.contains("\"code\":\"permission_denied\""));
+        assert!(s.contains("API not enabled, billing, or region restricted"));
+        assert!(s.contains("\"type\":\"upstream_http_403\""));
+    }
+
+    #[test]
+    fn failure_stream_403_unauthenticated_keeps_auth_error() {
+        // 403 但 status=UNAUTHENTICATED(罕见但 Gemini 偶尔这么返)→ auth_error
+        let body = r#"{"error":{"code":403,"message":"Invalid auth credential.","status":"UNAUTHENTICATED"}}"#;
+        let s = drive_failure_stream(403, body);
+        assert!(s.contains("\"code\":\"auth_error\""));
+    }
+
+    #[test]
+    fn failure_stream_400_safety_block_emits_content_filter() {
+        // 400 + safety 关键词 → content_filter,跟普通 schema 错区分
+        let body = r#"{"error":{"code":400,"message":"Request contains content blocked by safety filter (HARM_CATEGORY_DANGEROUS).","status":"INVALID_ARGUMENT"}}"#;
+        let s = drive_failure_stream(400, body);
+        assert!(s.contains("\"code\":\"content_filter\""));
+    }
+
+    #[test]
+    fn failure_stream_400_schema_error_stays_bad_request() {
+        let body = r#"{"error":{"code":400,"message":"Invalid JSON payload received. Unknown name \"xx\".","status":"INVALID_ARGUMENT"}}"#;
+        let s = drive_failure_stream(400, body);
+        assert!(s.contains("\"code\":\"bad_request\""));
+    }
+
+    #[test]
+    fn failure_stream_408_504_emits_timeout() {
+        let s = drive_failure_stream(408, r#"{"error":{"message":"deadline"}}"#);
+        assert!(s.contains("\"code\":\"timeout\""));
+        let s = drive_failure_stream(504, r#"<html>504 Gateway Time-out</html>"#);
+        assert!(s.contains("\"code\":\"timeout\""));
+        assert!(s.contains("HTTP 504"));
+    }
+
+    #[test]
+    fn failure_stream_503_service_unavailable_distinct_from_500() {
+        let s = drive_failure_stream(503, r#"{"error":{"message":"overloaded"}}"#);
+        assert!(s.contains("\"code\":\"service_unavailable\""));
+        let s = drive_failure_stream(500, r#"{"error":{"message":"internal"}}"#);
+        assert!(s.contains("\"code\":\"server_error\""));
+    }
+
+    #[test]
+    fn failure_stream_array_form_error_body() {
+        // Gemini 偶尔返 [{"error":{...}}] array shape,而非 object;必须能 extract message
+        let body = r#"[{"error":{"code":429,"message":"array-form quota exceeded","status":"RESOURCE_EXHAUSTED"}}]"#;
+        let s = drive_failure_stream(429, body);
+        assert!(s.contains("array-form quota exceeded"));
+        assert!(s.contains("\"code\":\"quota_exceeded\""));
+    }
+
+    #[test]
+    fn failure_stream_empty_body_still_emits_failed() {
+        // 空 body 也必须 emit lifecycle + failed,客户端不能卡
+        let s = drive_failure_stream(500, "");
+        assert!(s.contains("event: response.failed"));
+        assert!(s.contains("\"code\":\"server_error\""));
+        assert!(s.contains("HTTP 500"));
+    }
+
+    #[test]
+    fn failure_stream_transport_error_mid_read_surfaces_in_message() {
+        // 上游 ByteStream Err mid-read 不能 silent swallow — 必须出现在 user message 里 +
+        // code 降级到 upstream_transport_error(client 知道 body 不可信)
+        let upstream: ByteStream = Box::pin(stream::iter(vec![
+            Ok(Bytes::from_static(b"{\"error\":\"partial")),
+            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "tcp reset by peer")),
+        ]));
+        let mut s = convert_gemini_error_to_responses_failure_stream(
+            http::StatusCode::from_u16(429).unwrap(),
+            upstream,
+            None,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut all = Vec::new();
+        runtime.block_on(async {
+            while let Some(item) = s.next().await {
+                all.extend_from_slice(&item.unwrap());
+            }
+        });
+        let out = String::from_utf8(all).unwrap();
+        assert!(out.contains("\"code\":\"upstream_transport_error\""));
+        assert!(out.contains("transport error"));
+        assert!(out.contains("tcp reset by peer"));
+        assert!(out.contains("event: response.failed"));
+    }
+
+    #[test]
+    fn failure_stream_oversized_body_capped_with_truncated_marker() {
+        // 模拟 100KB 错误体 → body cap 64KB,JSON 解析失败(被截在中间),
+        // message 标 [body truncated],客户端仍能识别错误
+        let huge = format!("{{\"error\":{{\"message\":\"{}\"}}}}", "x".repeat(100_000));
+        let upstream: ByteStream = Box::pin(stream::iter(vec![Ok(Bytes::from(huge))]));
+        let mut s = convert_gemini_error_to_responses_failure_stream(
+            http::StatusCode::from_u16(500).unwrap(),
+            upstream,
+            None,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut all = Vec::new();
+        runtime.block_on(async {
+            while let Some(item) = s.next().await {
+                all.extend_from_slice(&item.unwrap());
+            }
+        });
+        let out = String::from_utf8(all).unwrap();
+        assert!(out.contains("[body truncated]"));
+        assert!(out.contains("event: response.failed"));
+    }
+
+    #[test]
+    fn failure_stream_long_user_message_truncated_with_ellipsis() {
+        // 上游返 10K-char 合法 JSON message → 用户 message 应在 2000 char 处截断 + … 标记,
+        // 防 SSE event 撑爆
+        let long_msg = "z".repeat(10_000);
+        let body = format!(r#"{{"error":{{"code":429,"message":"{long_msg}","status":"RESOURCE_EXHAUSTED"}}}}"#);
+        let s = drive_failure_stream(429, &body);
+        assert!(s.contains("…"));
+        assert!(s.contains("\"code\":\"quota_exceeded\""));
+    }
+
+    #[test]
+    fn failure_stream_non_utf8_body_marked() {
+        // 非 UTF-8 字节序列 → from_utf8_lossy 替换 + message 标 [non-UTF-8 body]
+        let upstream: ByteStream = Box::pin(stream::iter(vec![Ok(Bytes::from_static(&[0xFF, 0xFE, 0xFD]))]));
+        let mut s = convert_gemini_error_to_responses_failure_stream(
+            http::StatusCode::from_u16(502).unwrap(),
+            upstream,
+            None,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut all = Vec::new();
+        runtime.block_on(async {
+            while let Some(item) = s.next().await {
+                all.extend_from_slice(&item.unwrap());
+            }
+        });
+        let out = String::from_utf8(all).unwrap();
+        assert!(out.contains("[non-UTF-8 body]"));
+        assert!(out.contains("\"code\":\"server_error\""));
+    }
+
+    #[test]
+    fn failure_stream_emits_complete_lifecycle() {
+        // failure 流必须包含完整 created+in_progress+failed,客户端能正确进入终态
+        let s = drive_failure_stream(429, r#"{"error":{"message":"rate"}}"#);
+        let events: Vec<&str> = s.split("\n\n").filter(|x| !x.is_empty()).collect();
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        assert_eq!(names[0], "response.created");
+        assert_eq!(names[1], "response.in_progress");
+        assert_eq!(names[2], "response.failed");
+        // sequence_number 单调
+        for (i, e) in events.iter().enumerate() {
+            let (_, v) = parse_event(e);
+            assert_eq!(v["sequence_number"], i);
+        }
     }
 }

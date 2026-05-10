@@ -90,7 +90,11 @@ impl Adapter for GeminiNativeAdapter {
     /// envelope 字段从 `request_plan.original_responses_request` 回灌(tools / instructions
     /// / temperature / etc.)。
     ///
-    /// 错误路径:5xx / 4xx body 直接透传(Codex.app 看到错误体可重试 / 显示)。
+    /// 错误路径(2026-05-10 修):4xx/5xx **不再直接透传 raw Gemini JSON**。Codex.app
+    /// 期待 OpenAI Responses SSE event 流,收到 raw JSON 不知道怎 parse → 卡 Thinking。
+    /// 改成构造合规 Responses SSE 失败流(`response.created` + `response.failed`),
+    /// 含 Gemini error 翻译过的 message + statusCode + raw upstream code,客户端
+    /// 能正确识别 + 显示用户级错误而不是 silent hang。
     fn transform_response_stream(
         &self,
         upstream_status: StatusCode,
@@ -99,17 +103,29 @@ impl Adapter for GeminiNativeAdapter {
         _provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
-        if !upstream_status.is_success() {
-            return Ok(ResponsePlan {
-                status: upstream_status,
-                headers: upstream_headers,
-                stream: upstream_stream,
-            });
-        }
+        // 上游 4xx/5xx 也走 SSE — 两个分支都要重写 content-type;另外必须 strip
+        // content-length(我们 emit 的 SSE bytes 数跟原 body 不一样)和 content-encoding
+        // (上游可能返 gzip 的 JSON 错误体,如果保留 header 客户端会试图 gunzip plaintext SSE
+        // → 整个流 corrupt,等于又埋一个 silent failure)
+        upstream_headers.remove(http::header::CONTENT_LENGTH);
+        upstream_headers.remove(http::header::CONTENT_ENCODING);
         upstream_headers.insert(
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
         );
+        if !upstream_status.is_success() {
+            // 构造 Responses SSE failure 流:200 response + SSE event 流(created+failed)
+            let stream = response::convert_gemini_error_to_responses_failure_stream(
+                upstream_status,
+                upstream_stream,
+                request_plan.original_responses_request.clone(),
+            );
+            return Ok(ResponsePlan {
+                status: StatusCode::OK, // SSE 流 status 永远 200,错误信息在 SSE event 内
+                headers: upstream_headers,
+                stream,
+            });
+        }
         let stream = response::convert_gemini_to_responses_stream(
             upstream_stream,
             request_plan.original_responses_request.clone(),
