@@ -981,15 +981,6 @@ fn provider_looks_like(provider: &Provider, needle: &str) -> bool {
         .any(|value| value.to_ascii_lowercase().contains(&needle))
 }
 
-/// Gemini provider 识别:子串命中 `generativelanguage`(host 唯一标识) /
-/// `gemini`(name) / `google-ai-studio`(builtin preset id)三者任一。
-/// `google` 单独不够(可能误命中第三方 reverse proxy 名带 google),所以不用。
-fn provider_looks_like_gemini(provider: &Provider) -> bool {
-    provider_looks_like(provider, "generativelanguage")
-        || provider_looks_like(provider, "google-ai-studio")
-        || provider_looks_like(provider, "gemini")
-}
-
 fn sanitize_chat_body_for_provider(body: &mut Map<String, Value>, provider: Option<&Provider>) {
     let Some(provider) = provider else {
         return;
@@ -997,57 +988,6 @@ fn sanitize_chat_body_for_provider(body: &mut Map<String, Value>, provider: Opti
     if provider_looks_like(provider, "minimax") || provider_looks_like(provider, "minimaxi") {
         sanitize_minimax_chat_body(body);
     }
-    if provider_looks_like_gemini(provider) {
-        sanitize_gemini_chat_body(body);
-    }
-}
-
-/// Google AI Studio Gemini OpenAI 兼容层(2024 末上线 Beta):官方文档原文
-/// "Any other parameters not listed here or in the extra_body section will be
-/// silently ignored"(`ai.google.dev/gemini-api/docs/openai` 实证 2026-05-10)。
-///
-/// 主动剥不在白名单的字段,理由:silent ignore 让 wire 干净 + 调试日志可读 +
-/// 防未来 schema 漂移意外报错。保留官方明列 + extra_body(用户若手动配
-/// safety_settings / thinking_config 时会用到,代理本身不再注入)。
-///
-/// 保守策略:`response_format` / `seed` 文档未明列但 LiteLLM 走 OpenAI compat
-/// 路径会传,先**保留**等真 400 实证再补 drop。
-///
-/// **注意**:OpenAI 兼容 chat 端点不支持 `extra_body.google.tools=[{google_search:{}}]`
-/// grounding 注入(2026-05-10 实测 5 种 variant 全部 400,该字段仅对
-/// `gemini-3-pro-image-preview` 有效),所以代理不再做请求侧注入,本 sanitize 仍
-/// 保留 extra_body 字段是给用户自定义透传留口。
-fn sanitize_gemini_chat_body(body: &mut Map<String, Value>) {
-    body.retain(|key, _| {
-        matches!(
-            key.as_str(),
-            // Google 官方明列支持
-            "model"
-            | "messages"
-            | "stream"
-            | "stream_options"
-            | "tools"
-            | "tool_choice"
-            | "temperature"
-            | "top_p"
-            | "max_tokens"
-            | "service_tier"
-            | "reasoning_effort"
-            | "n"
-            // 用户透传字段(代理本身不注入 — Gemini OpenAI compat 不支持 google_search;
-            // 但用户若手动配 safety_settings / thinking_config 会走这里)
-            | "extra_body"
-            | "extra_headers"
-            | "extra_query"
-            // 文档未明列但 LiteLLM 走 OpenAI compat 会传(保守保留)
-            | "response_format"
-            | "seed"
-        )
-        // 静默忽略类(主动 drop):
-        // frequency_penalty / presence_penalty / logprobs / top_logprobs /
-        // parallel_tool_calls / user / stop / logit_bias / max_completion_tokens /
-        // safety_identifier / context / truncate / prompt_truncation / timeout
-    });
 }
 
 /// MiniMax M2.x 的 OpenAI-compatible chat 端点并不接受完整 OpenAI/Codex
@@ -1924,18 +1864,6 @@ fn convert_web_search_tool(
         return vec![Value::Object(out)];
     }
 
-    if provider_looks_like_gemini(provider) {
-        // Google AI Studio Gemini OpenAI 兼容 chat 端点**不支持 google_search grounding**
-        // (2026-05-10 curl 实证:`extra_body.google.tools=[{google_search:{}}]` /
-        // `tools=[{type:"google_search"}]` / `tools=[{type:"web_search"}]` / 顶层
-        // `web_search_options` 等 5 种 variant 全部 400 `Cannot find field`;官方
-        // ai.google.dev/gemini-api/docs/openai 写明 `extra_body.google.tools` 仅
-        // 对 `gemini-3-pro-image-preview` 有效)。要 grounding 必须走 native
-        // `generateContent` API,本应用暂未实现该路径。返 vec![] 静默剥工具,
-        // 让请求按普通 chat 透传上游。
-        return vec![];
-    }
-
     if provider_looks_like(provider, "kimi") || provider_looks_like(provider, "moonshot") {
         // Kimi 内置 `$web_search` builtin_function(WebFetch
         // `platform.kimi.ai/docs/guide/use-web-search` 真原文实证):
@@ -2038,93 +1966,6 @@ mod tests {
         p.models.insert("default".into(), "MiniMax-M2.7".into());
         p.api_format = "openai_chat".into();
         p
-    }
-
-    fn gemini_provider() -> Provider {
-        let mut p = provider(
-            "google-ai-studio",
-            "Google AI Studio",
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-        );
-        p.models
-            .insert("default".into(), "gemini-3.1-flash-lite".into());
-        p.api_format = "openai_chat".into();
-        p
-    }
-
-    #[test]
-    fn provider_looks_like_gemini_via_base_url() {
-        let p = gemini_provider();
-        assert!(provider_looks_like_gemini(&p));
-        // 防误命中:其他 provider 名 / URL 不含 generativelanguage / google-ai-studio / gemini
-        let kimi = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
-        assert!(!provider_looks_like_gemini(&kimi));
-        let mimo = provider(
-            "xiaomi-mimo-payg",
-            "Xiaomi MiMo",
-            "https://api.xiaomimimo.com/v1",
-        );
-        assert!(!provider_looks_like_gemini(&mimo));
-    }
-
-    #[test]
-    fn gemini_web_search_tool_dropped_no_extra_body_inject() {
-        // OpenAI 兼容 chat 端点不支持 google_search grounding(2026-05-10 实测 5
-        // 种 variant 全部 400),代理把入站 web_search 工具静默剥成 vec![],
-        // 不注入任何 extra_body.google 字段(防上游 400)。
-        let p = gemini_provider();
-        let req = json!({
-            "model": "gemini-3.1-flash-lite",
-            "stream": true,
-            "input": [{"type":"message","role":"user","content":"hi"}],
-            "tools": [{"type":"web_search","external_web_access":true}]
-        });
-        let body = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-        assert!(
-            body.get("tools")
-                .map(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(false))
-                .unwrap_or(true),
-            "Gemini 分支必须把 web_search 工具剥成空数组 / 不存在"
-        );
-        assert!(
-            body.get("extra_body").is_none() || body["extra_body"]["google"].is_null(),
-            "代理不再注入 extra_body.google.tools(上游 chat 不支持),实际:{body}"
-        );
-    }
-
-    #[test]
-    fn gemini_strips_silently_ignored_fields() {
-        // sanitize_gemini_chat_body:剥 frequency_penalty / presence_penalty /
-        // logprobs / parallel_tool_calls / user / stop / logit_bias 等
-        let p = gemini_provider();
-        let req = json!({
-            "model": "gemini-3.1-flash-lite",
-            "stream": true,
-            "input": [{"type":"message","role":"user","content":"hi"}],
-            "frequency_penalty": 0.5,
-            "presence_penalty": 0.3,
-            "parallel_tool_calls": true,
-            "user": "user-123",
-            "logprobs": true,
-            "top_logprobs": 5
-        });
-        let body = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-        for stripped in [
-            "frequency_penalty",
-            "presence_penalty",
-            "parallel_tool_calls",
-            "user",
-            "logprobs",
-            "top_logprobs",
-        ] {
-            assert!(
-                body.get(stripped).is_none(),
-                "{stripped} 必须被剥(Gemini silent ignore)"
-            );
-        }
-        // 保留字段 sanity
-        assert!(body.get("model").is_some(), "model 必须保留");
-        assert!(body.get("messages").is_some(), "messages 必须保留");
     }
 
     #[test]
