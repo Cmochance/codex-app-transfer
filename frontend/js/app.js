@@ -1149,9 +1149,14 @@
     const oauthRow = $("#providerOauthRow");
     const apiKeyRow = $("#providerApiKeyRow");
     const apiKeyInput = $("#providerApiKey");
+    const baseUrlRow = $("#providerBaseUrlRow");
+    const baseUrlInput = $("#providerBaseUrl");
     const isOauth = isOauthApiFormat(apiFormat);
     if (oauthRow) oauthRow.hidden = !isOauth;
     if (apiKeyRow) apiKeyRow.hidden = isOauth;
+    // OAuth 模式 baseUrl 由 preset 写死(cloudcode-pa.googleapis.com),
+    // user 不需要看 / 改;切回非 OAuth 显示
+    if (baseUrlRow) baseUrlRow.hidden = isOauth;
     // **silent-failure-hunter H3 修**:原 `required = !isOauth && req` 单调毁掉
     // required 字段(切 OAuth 后 required=false,切回 openai_chat 仍 false)。改用
     // dataset.origRequired 缓存,switch 回非 OAuth 时恢复
@@ -1161,10 +1166,22 @@
       }
       if (isOauth) {
         apiKeyInput.required = false;
-        // **不**清 apiKey 值 — 用户切回时不丢之前输入(security 上 value 也只在 DOM
-        // 内不进网络,泄漏面相同)。silent-failure-hunter H3 修
       } else {
         apiKeyInput.required = apiKeyInput.dataset.origRequired === "1";
+      }
+    }
+    // baseUrl 同样的 required cache 处理 — OAuth 时解 required 防表单提交卡住
+    if (baseUrlInput) {
+      if (baseUrlInput.dataset.origRequired === undefined) {
+        baseUrlInput.dataset.origRequired = baseUrlInput.required ? "1" : "0";
+      }
+      baseUrlInput.required = isOauth ? false : baseUrlInput.dataset.origRequired === "1";
+      // **silent-failure-hunter H2 修**:hide 行不等于清 value。OAuth 模式下
+      // baseUrl 由 preset 写死(cloudcode-pa.googleapis.com),user 切换 preset
+      // 时残留的旧 value 可能跟着 form submit 上去让 backend 用错 endpoint。
+      // 强制锁定 value 防止 hidden field 数据漂移
+      if (isOauth) {
+        baseUrlInput.value = "https://cloudcode-pa.googleapis.com";
       }
     }
     if (isOauth) {
@@ -1303,6 +1320,7 @@
     if (value === "kimi" || value === "kimi-code" || value.startsWith("kimi-")) return true;
     if (value === "xiaomi-mimo-token-plan" || value === "xiaomi-mimo-payg") return true;
     if (value === "deepseek") return true;
+    if (value === "gemini-cli-oauth") return true;
     return false;
   }
 

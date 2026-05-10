@@ -240,6 +240,45 @@ pub fn shared_oauth_http_client() -> Result<&'static reqwest::Client, &'static s
     }
 }
 
+const USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+
+/// 拿登录用户的 Google 账号 email — OAuth scope 已含 userinfo.email,直接调
+/// `USERINFO_URL`。**失败 fallback None**:email 仅展示用,缺它 status UI 显
+/// fallback 但 token / chat 全程不依赖。
+async fn fetch_google_user_email(http: &reqwest::Client, access_token: &str) -> Option<String> {
+    fetch_google_user_email_at(http, USERINFO_URL, access_token).await
+}
+
+/// 内部版 — 接受可定制 url 让单测 mock。pub(crate) 仅给 tests 用。
+pub(crate) async fn fetch_google_user_email_at(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+) -> Option<String> {
+    let resp = match http.get(url).bearer_auth(access_token).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "fetch_google_user_email http failed; status UI 将显 fallback");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(status = %resp.status(), "fetch_google_user_email non-2xx; status UI 将显 fallback");
+        return None;
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "fetch_google_user_email JSON parse failed");
+            return None;
+        }
+    };
+    body.get("email")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+}
+
 pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/api/gemini-oauth/status", get(status_handler))
@@ -479,9 +518,35 @@ async fn login_handler() -> impl IntoResponse {
         return Json(json!({"loggedIn": false, "cancelled": true})).into_response();
     }
 
-    // 4. 把 project_id 写进 token + 持久化(快路径,< 1ms)
+    // 3.5 拿 Google 账号 email — OAuth scope 已含 userinfo.email,直接调
+    // openidconnect.googleapis.com/v1/userinfo 拿。失败不阻塞 login(email
+    // 是展示字段,缺了 status UI 显 fallback,token 仍可用)。
+    // **silent-failure-hunter C1 修**:cancel-aware wrap,user 在 userinfo
+    // HTTP 卡时(慢网络)按 cancel 也立即生效,跟 step 1/2/3 cancel 契约一致
+    let email_opt = match cancellable(&mut cancel_rx, async {
+        Ok::<Option<String>, FlowError>(fetch_google_user_email(http, &token.access_token).await)
+    })
+    .await
+    {
+        Ok(opt) => opt,
+        Err(FlowError::Cancelled) => {
+            let mut slot = lock_cancel_slot();
+            if matches!(slot.as_ref(), Some((e, _)) if *e == my_epoch) {
+                slot.take();
+            }
+            tracing::info!("OAuth login cancelled during userinfo fetch — 不持久化 token");
+            return Json(json!({"loggedIn": false, "cancelled": true})).into_response();
+        }
+        // 不可能命中 — fetch_google_user_email 自身从不返 FlowError(它返 Option)
+        Err(_) => None,
+    };
+
+    // 4. 把 project_id + email 写进 token + 持久化(快路径,< 1ms)
     let mut token_with_project = token;
     token_with_project.project_id = Some(project_id.clone());
+    // M1 修:无条件赋值 — None 也清掉(re-login 不同账号但 userinfo fail 时
+    // 不要 leak 旧账号 email)。本调用路径 token.email 始终 None,实际等价
+    token_with_project.email = email_opt;
     let store = match TokenStore::from_home_env() {
         Ok(s) => s,
         Err(e) => {
@@ -1032,5 +1097,89 @@ mod tests {
                 "clear 无 active 应 Ok — logout best-effort 容忍"
             );
         });
+    }
+
+    // ── fetch_google_user_email tests(silent-failure-hunter C1 修补充)──
+    //
+    // 起 inline axum mock server,通过 Arc<Mutex<>> 注入 (status, body)
+    // 让 handler 闭包 Send+Sync。验 4 条路径。
+
+    use axum::extract::State;
+
+    type MockResp = std::sync::Arc<(StatusCode, String)>;
+
+    async fn mock_handler(State(resp): State<MockResp>) -> (StatusCode, String) {
+        (resp.0, resp.1.clone())
+    }
+
+    /// 起一个一次性 axum server 返指定 (status, body),返 (port, JoinHandle)。
+    async fn spawn_userinfo_mock(
+        status: StatusCode,
+        body: &str,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resp: MockResp = std::sync::Arc::new((status, body.to_owned()));
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(mock_handler))
+            .with_state(resp);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // 给 server 一点时间真起来
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn userinfo_returns_email_on_2xx_with_email_field() {
+        let (port, h) =
+            spawn_userinfo_mock(StatusCode::OK, r#"{"email":"u@example.com","sub":"123"}"#).await;
+        let url = format!("http://127.0.0.1:{port}/");
+        let result = fetch_google_user_email_at(&reqwest::Client::new(), &url, "fake-token").await;
+        h.abort();
+        assert_eq!(result, Some("u@example.com".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn userinfo_returns_none_on_500() {
+        let (port, h) = spawn_userinfo_mock(StatusCode::INTERNAL_SERVER_ERROR, "boom").await;
+        let url = format!("http://127.0.0.1:{port}/");
+        let result = fetch_google_user_email_at(&reqwest::Client::new(), &url, "fake").await;
+        h.abort();
+        assert_eq!(result, None, "non-2xx 必须 fallback None");
+    }
+
+    #[tokio::test]
+    async fn userinfo_returns_none_on_invalid_json() {
+        let (port, h) = spawn_userinfo_mock(StatusCode::OK, "not valid json {").await;
+        let url = format!("http://127.0.0.1:{port}/");
+        let result = fetch_google_user_email_at(&reqwest::Client::new(), &url, "fake").await;
+        h.abort();
+        assert_eq!(result, None, "JSON parse 失败 fallback None");
+    }
+
+    #[tokio::test]
+    async fn userinfo_returns_none_when_email_field_missing_or_empty() {
+        let (port1, h1) = spawn_userinfo_mock(StatusCode::OK, r#"{"sub":"123"}"#).await;
+        let r1 = fetch_google_user_email_at(
+            &reqwest::Client::new(),
+            &format!("http://127.0.0.1:{port1}/"),
+            "fake",
+        )
+        .await;
+        h1.abort();
+        assert_eq!(r1, None, "缺 email 字段 fallback None");
+
+        // 空 string — `.filter(|s| !s.is_empty())` 应该 reject
+        let (port2, h2) = spawn_userinfo_mock(StatusCode::OK, r#"{"email":"","sub":"123"}"#).await;
+        let r2 = fetch_google_user_email_at(
+            &reqwest::Client::new(),
+            &format!("http://127.0.0.1:{port2}/"),
+            "fake",
+        )
+        .await;
+        h2.abort();
+        assert_eq!(r2, None, "空 string email 必须 reject 返 None");
     }
 }
