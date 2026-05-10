@@ -666,6 +666,7 @@ dependencies = [
  "chrono",
  "codex-app-transfer-adapters",
  "codex-app-transfer-codex-integration",
+ "codex-app-transfer-gemini-oauth",
  "codex-app-transfer-proxy",
  "codex-app-transfer-registry",
  "getrandom 0.2.17",

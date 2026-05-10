@@ -26,6 +26,7 @@ codex-app-transfer-registry = { path = "../crates/registry" }
 codex-app-transfer-codex-integration = { path = "../crates/codex_integration" }
 codex-app-transfer-proxy = { path = "../crates/proxy" }
 codex-app-transfer-adapters = { path = "../crates/adapters" }
+codex-app-transfer-gemini-oauth = { path = "../crates/gemini_oauth" }
 tokio = { version = "1", features = ["sync", "net", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

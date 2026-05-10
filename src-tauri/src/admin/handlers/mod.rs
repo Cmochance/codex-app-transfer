@@ -12,6 +12,7 @@
 pub mod common;
 pub mod desktop;
 pub mod feedback;
+pub mod gemini_oauth;
 pub mod providers;
 pub mod proxy;
 pub mod settings;
