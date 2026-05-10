@@ -7,9 +7,6 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "sonnet": "deepseek-v4-pro",
-      "haiku": "deepseek-v4-flash",
-      "opus": "deepseek-v4-pro",
       "default": "deepseek-v4-pro"
     },
     "modelCapabilities": {
@@ -52,9 +49,6 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "sonnet": "kimi-k2.6",
-      "haiku": "kimi-k2.6",
-      "opus": "kimi-k2.6",
       "default": "kimi-k2.6"
     },
     "modelCapabilities": {
@@ -99,9 +93,6 @@
       "User-Agent": "KimiCLI/1.40.0"
     },
     "models": {
-      "sonnet": "kimi-for-coding",
-      "haiku": "kimi-for-coding",
-      "opus": "kimi-for-coding",
       "default": "kimi-for-coding"
     },
     "modelCapabilities": {
@@ -119,9 +110,6 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "sonnet": "",
-      "haiku": "",
-      "opus": "",
       "default": "mimo-v2.5-pro"
     },
     "modelCapabilities": {
@@ -166,9 +154,6 @@
     ],
     "baseUrlHint": "请使用账号所属地区的 Base URL，若不清楚请访问 https://platform.xiaomimimo.com/console/plan-manage 获取专属Base URL。",
     "models": {
-      "sonnet": "",
-      "haiku": "",
-      "opus": "",
       "default": "mimo-v2.5-pro"
     },
     "modelCapabilities": {
@@ -195,9 +180,6 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "sonnet": "glm-5.1",
-      "haiku": "glm-4.7",
-      "opus": "glm-5.1",
       "default": "glm-5.1"
     },
     "modelCapabilities": {
@@ -218,9 +200,6 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "sonnet": "qwen3.6-plus",
-      "haiku": "qwen3.6-flash",
-      "opus": "qwen3.6-max-preview",
       "default": "qwen3.6-plus"
     },
     "notices": [
@@ -241,9 +220,6 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "sonnet": "MiniMax-M2.7",
-      "haiku": "MiniMax-M2.7",
-      "opus": "MiniMax-M2.7",
       "default": "MiniMax-M2.7"
     },
     "modelCapabilities": {},
@@ -268,9 +244,6 @@
     "authScheme": "google_api_key",
     "apiFormat": "gemini_native",
     "models": {
-      "sonnet": "gemini-3.1-pro-preview",
-      "haiku": "gemini-3.1-flash-lite",
-      "opus": "gemini-3.1-pro-preview",
       "default": "gemini-3.1-flash-lite"
     },
     "modelCapabilities": {},
