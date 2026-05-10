@@ -253,6 +253,24 @@ fn suggest_model_mappings(model_ids: &[String]) -> Value {
 }
 
 async fn fetch_provider_models_impl(provider: &Value) -> Value {
+    // Cloud Code Assist (gemini_cli_oauth) 上游没有 listModels endpoint —
+    // gemini-cli upstream 自己用 hardcoded enum (`packages/core/src/config/models.ts`)。
+    // 这里返跟 builtin preset 对齐 + 实际 OAuth tier 可访问的固定列表,而不是
+    // fall through 通用 /v1beta/models 探测(必 404 + headers 也没 OAuth bearer)。
+    if provider.get("apiFormat").and_then(|v| v.as_str()) == Some("gemini_cli_oauth") {
+        let model_ids = vec![
+            "gemini-2.5-flash".to_owned(),
+            "gemini-2.5-pro".to_owned(),
+            "gemini-2.5-flash-lite".to_owned(),
+        ];
+        return json!({
+            "success": true,
+            "endpoint": "(static: cloud-code-assist hardcoded list)",
+            "models": model_ids.clone(),
+            "suggested": suggest_model_mappings(&model_ids),
+        });
+    }
+
     let endpoints = model_endpoint_candidates(provider);
     if endpoints.is_empty() {
         return json!({
