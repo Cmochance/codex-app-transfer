@@ -222,41 +222,42 @@ fn responses_input_to_chat_messages(
     let mut pending_assistant_content: Option<Value> = None;
     let mut pending_assistant_reasoning: Vec<String> = Vec::new();
 
-    let flush_assistant =
-        |pending_content: &mut Option<Value>,
-         pending_calls: &mut Vec<Value>,
-         pending_reasoning: &mut Vec<String>,
-         out: &mut Vec<Value>| {
-            if pending_content.is_some()
-                || !pending_calls.is_empty()
-                || !pending_reasoning.is_empty()
-            {
-                let mut m = Map::new();
-                m.insert("role".into(), Value::String("assistant".into()));
+    let flush_assistant = |pending_content: &mut Option<Value>,
+                           pending_calls: &mut Vec<Value>,
+                           pending_reasoning: &mut Vec<String>,
+                           out: &mut Vec<Value>| {
+        if pending_content.is_some() || !pending_calls.is_empty() || !pending_reasoning.is_empty() {
+            let mut m = Map::new();
+            m.insert("role".into(), Value::String("assistant".into()));
+            m.insert(
+                "content".into(),
+                pending_content.take().unwrap_or(Value::Null),
+            );
+            if !pending_calls.is_empty() {
                 m.insert(
-                    "content".into(),
-                    pending_content.take().unwrap_or(Value::Null),
+                    "tool_calls".into(),
+                    Value::Array(std::mem::take(pending_calls)),
                 );
-                if !pending_calls.is_empty() {
-                    m.insert(
-                        "tool_calls".into(),
-                        Value::Array(std::mem::take(pending_calls)),
-                    );
-                }
-                if !pending_reasoning.is_empty() {
-                    m.insert(
-                        "reasoning_content".into(),
-                        Value::String(pending_reasoning.join("\n")),
-                    );
-                    pending_reasoning.clear();
-                }
-                out.push(Value::Object(m));
             }
-        };
+            if !pending_reasoning.is_empty() {
+                m.insert(
+                    "reasoning_content".into(),
+                    Value::String(pending_reasoning.join("\n")),
+                );
+                pending_reasoning.clear();
+            }
+            out.push(Value::Object(m));
+        }
+    };
 
     for item in input {
-        let Some(obj) = item.as_object() else { continue };
-        let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("message");
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let item_type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("message");
         match item_type {
             "message" => {
                 // 先 flush pending assistant
@@ -323,8 +324,7 @@ fn responses_input_to_chat_messages(
                 // 里 synthesize prior function_call 重建上下文。
                 // 如果当前 turn 已有 prior(pending_tool_calls / 已 flush 的 messages
                 // assistant)就不 synthesize 防重复;cache 也没就 fallback 让下游 BadRequest。
-                let cache_entry =
-                    crate::responses::global_tool_call_cache().get(&call_id);
+                let cache_entry = crate::responses::global_tool_call_cache().get(&call_id);
                 let prior_in_pending = pending_tool_calls
                     .iter()
                     .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(call_id.as_str()));
@@ -362,18 +362,13 @@ fn responses_input_to_chat_messages(
                         tc.insert("type".into(), Value::String("function".into()));
                         let mut func = Map::new();
                         func.insert("name".into(), Value::String(name.clone()));
-                        func.insert(
-                            "arguments".into(),
-                            Value::String(entry.arguments.clone()),
-                        );
+                        func.insert("arguments".into(), Value::String(entry.arguments.clone()));
                         tc.insert("function".into(), Value::Object(func));
                         let mut synthetic = Map::new();
                         synthetic.insert("role".into(), Value::String("assistant".into()));
                         synthetic.insert("content".into(), Value::Null);
-                        synthetic.insert(
-                            "tool_calls".into(),
-                            Value::Array(vec![Value::Object(tc)]),
-                        );
+                        synthetic
+                            .insert("tool_calls".into(), Value::Array(vec![Value::Object(tc)]));
                         messages.push(Value::Object(synthetic));
                         tracing::debug!(
                             call_id,
@@ -438,7 +433,9 @@ fn normalize_responses_message_content(content: &Value) -> Value {
     };
     let mut out: Vec<Value> = Vec::new();
     for block in arr {
-        let Some(obj) = block.as_object() else { continue };
+        let Some(obj) = block.as_object() else {
+            continue;
+        };
         let block_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match block_type {
             "input_text" | "output_text" | "text" => {
@@ -499,9 +496,7 @@ fn normalize_responses_message_content(content: &Value) -> Value {
                 }
             }
             other => {
-                crate::warn_once_drop_tool(&format!(
-                    "gemini_native:content_block:{other}"
-                ));
+                crate::warn_once_drop_tool(&format!("gemini_native:content_block:{other}"));
             }
         }
     }
@@ -513,7 +508,9 @@ fn normalize_responses_message_content(content: &Value) -> Value {
 fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for tool in tools {
-        let Some(obj) = tool.as_object() else { continue };
+        let Some(obj) = tool.as_object() else {
+            continue;
+        };
         let tool_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match tool_type {
             "function" => {
@@ -574,10 +571,7 @@ fn responses_text_format_to_response_format(text: &Map<String, Value>) -> Option
     let format = text.get("format")?.as_object()?;
     let format_type = format.get("type").and_then(|v| v.as_str())?;
     let mut out = Map::new();
-    out.insert(
-        "type".into(),
-        Value::String(format_type.to_owned()),
-    );
+    out.insert("type".into(), Value::String(format_type.to_owned()));
     if format_type == "json_schema" {
         let mut js = Map::new();
         if let Some(n) = format.get("name") {
@@ -642,9 +636,9 @@ pub fn chat_normalized_to_gemini_request(
     // 拼成 systemInstruction text 作软约束传给 model。Model 调 tool 时不变;走 message
     // 输出时被 prompted 按 schema 输出(虽是软约束不是硬,但比 wire-level json_schema
     // 完全丢失好得多 — Gemini 模型对 system_instruction JSON 约束服从度高)。
-    let has_function_decls = tools.as_ref().is_some_and(|t| {
-        t.iter().any(|tool| tool.function_declarations.is_some())
-    });
+    let has_function_decls = tools
+        .as_ref()
+        .is_some_and(|t| t.iter().any(|tool| tool.function_declarations.is_some()));
     let mut generation_config = generation_config;
     if has_function_decls {
         if let Some(gc) = generation_config.as_mut() {
@@ -918,10 +912,7 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
                     if b.get("type").and_then(|v| v.as_str()) != Some("thinking") {
                         continue;
                     }
-                    let thinking = b
-                        .get("thinking")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
+                    let thinking = b.get("thinking").and_then(|v| v.as_str()).map(String::from);
                     let signature = b
                         .get("signature")
                         .and_then(|v| v.as_str())
@@ -1282,7 +1273,10 @@ fn file_block_to_part(obj: &Map<String, Value>) -> Option<Part> {
 fn audio_block_to_part(obj: &Map<String, Value>) -> Option<Part> {
     let inner = obj.get("input_audio").and_then(|v| v.as_object())?;
     let data = inner.get("data").and_then(|v| v.as_str())?;
-    let format = inner.get("format").and_then(|v| v.as_str()).unwrap_or("wav");
+    let format = inner
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("wav");
     let mime = if format.starts_with("audio/") {
         format.to_string()
     } else {
@@ -1321,7 +1315,9 @@ fn convert_tools(tools_arr: &[Value]) -> Vec<Tool> {
     let mut code_execution: Option<Value> = None;
 
     for tool in tools_arr {
-        let Some(obj) = tool.as_object() else { continue };
+        let Some(obj) = tool.as_object() else {
+            continue;
+        };
         let tool_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match tool_type {
@@ -1533,10 +1529,8 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                     _ => {
                         // 多 non-null type → anyOf 表达 union(Gemini 支持)
                         obj.remove("type");
-                        let any_of: Vec<Value> = non_null_types
-                            .iter()
-                            .map(|t| json!({"type": t}))
-                            .collect();
+                        let any_of: Vec<Value> =
+                            non_null_types.iter().map(|t| json!({"type": t})).collect();
                         obj.insert("anyOf".into(), Value::Array(any_of));
                         if has_null {
                             obj.insert("nullable".into(), Value::Bool(true));
@@ -1778,7 +1772,9 @@ fn apply_extra_body_overrides(
         return Ok(());
     };
     let req_value = serde_json::to_value(&*req).map_err(|e| {
-        AdapterError::Internal(format!("failed to serialize RequestBody for extra_body merge: {e}"))
+        AdapterError::Internal(format!(
+            "failed to serialize RequestBody for extra_body merge: {e}"
+        ))
     })?;
     let mut merged = req_value;
     let merged_obj = merged
@@ -1837,7 +1833,10 @@ mod tests {
     #[test]
     fn upstream_path_gemini_3_uses_v1alpha() {
         let p = build_gemini_upstream_path("gemini-3.1-pro-preview", true, "https://x.com");
-        assert!(p.starts_with("/v1alpha/"), "Gemini 3+ 必须用 v1alpha,实际:{p}");
+        assert!(
+            p.starts_with("/v1alpha/"),
+            "Gemini 3+ 必须用 v1alpha,实际:{p}"
+        );
     }
 
     #[test]
@@ -2037,7 +2036,10 @@ mod tests {
         let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
         let tc = req.generation_config.unwrap().thinking_config.unwrap();
         assert_eq!(tc.thinking_level.as_deref(), Some("high"));
-        assert!(tc.thinking_budget.is_none(), "Gemini 3+ 不写 budget,只写 level");
+        assert!(
+            tc.thinking_budget.is_none(),
+            "Gemini 3+ 不写 budget,只写 level"
+        );
     }
 
     #[test]
@@ -2050,7 +2052,10 @@ mod tests {
         let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
         let tc = req.generation_config.unwrap().thinking_config.unwrap();
         assert_eq!(tc.thinking_budget, Some(16384));
-        assert!(tc.thinking_level.is_none(), "Gemini 2.x 用 budget 不用 level");
+        assert!(
+            tc.thinking_level.is_none(),
+            "Gemini 2.x 用 budget 不用 level"
+        );
     }
 
     #[test]
@@ -2100,7 +2105,10 @@ mod tests {
         assert_eq!(cleaned["properties"]["count"]["type"], "number");
         assert_eq!(cleaned["properties"]["count"]["nullable"], true);
         // 描述等其他字段保留
-        assert_eq!(cleaned["properties"]["count"]["description"], "optional count");
+        assert_eq!(
+            cleaned["properties"]["count"]["description"],
+            "optional count"
+        );
         // 非 array type 不动
         assert_eq!(cleaned["properties"]["name"]["type"], "string");
         assert!(cleaned["properties"]["name"].get("nullable").is_none());
@@ -2126,7 +2134,11 @@ mod tests {
         let req = chat_normalized_to_gemini_request(&body, &dummy_provider()).unwrap();
         // function declarations 保留
         assert!(
-            req.tools.as_ref().unwrap().iter().any(|t| t.function_declarations.is_some()),
+            req.tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|t| t.function_declarations.is_some()),
             "functionDeclarations 必须保留"
         );
         // generation_config wire 字段被剥(Gemini 400 防御)
@@ -2136,8 +2148,12 @@ mod tests {
             "wire 上必须 drop responseMimeType/responseSchema 防 Gemini 400,实际 gc:{gc:?}"
         );
         // **关键**:schema 语义必须以 systemInstruction text 形式传达(不丢用户语义)
-        let si = req.system_instruction.expect("systemInstruction 必须含软约束 text");
-        let combined: String = si.parts.iter()
+        let si = req
+            .system_instruction
+            .expect("systemInstruction 必须含软约束 text");
+        let combined: String = si
+            .parts
+            .iter()
             .filter_map(|p| p.text.as_ref())
             .cloned()
             .collect::<Vec<_>>()
@@ -2211,8 +2227,12 @@ mod tests {
             "Gemini 2.x functionDeclarations 必须保留(Codex 核心)"
         );
         // system_instruction 含软约束告知 model 限制
-        let si = req.system_instruction.expect("systemInstruction 必须含软约束");
-        let combined: String = si.parts.iter()
+        let si = req
+            .system_instruction
+            .expect("systemInstruction 必须含软约束");
+        let combined: String = si
+            .parts
+            .iter()
             .filter_map(|p| p.text.as_ref())
             .cloned()
             .collect::<Vec<_>>()
@@ -2259,11 +2279,13 @@ mod tests {
             .iter()
             .find(|c| c.role == "model")
             .expect("应有 model content");
-        let has_thought_part = model_content
-            .parts
-            .iter()
-            .any(|p| p.thought == Some(true) && p.text.as_deref() == Some("I should think carefully"));
-        assert!(has_thought_part, "reasoning summary 必须转 thought=true part");
+        let has_thought_part = model_content.parts.iter().any(|p| {
+            p.thought == Some(true) && p.text.as_deref() == Some("I should think carefully")
+        });
+        assert!(
+            has_thought_part,
+            "reasoning summary 必须转 thought=true part"
+        );
     }
 
     #[test]
@@ -2282,7 +2304,10 @@ mod tests {
         let tools = req.tools.unwrap();
         let has_decls = tools.iter().any(|t| t.function_declarations.is_some());
         let has_search = tools.iter().any(|t| t.google_search.is_some());
-        assert!(has_decls && has_search, "function declarations + googleSearch 必须共存");
+        assert!(
+            has_decls && has_search,
+            "function declarations + googleSearch 必须共存"
+        );
         // 验证 functionDeclarations 内的 schema 已 sanitize
         let decls = tools
             .iter()

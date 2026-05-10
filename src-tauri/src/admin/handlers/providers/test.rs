@@ -463,10 +463,7 @@ mod tests {
         // Gemini native:用 /v1beta/models 探测(不带 key 走 401 / "auth not verified",
         // 带 key 200)。base_url 不带版本号 → 自动补 /v1beta/models。
         assert_eq!(
-            build_provider_test_url(
-                "https://generativelanguage.googleapis.com",
-                "gemini_native"
-            ),
+            build_provider_test_url("https://generativelanguage.googleapis.com", "gemini_native"),
             "https://generativelanguage.googleapis.com/v1beta/models"
         );
         // 用户在 base_url 已指定 /v1beta → 只补 /models
@@ -503,9 +500,7 @@ mod tests {
         });
         let headers = provider_test_headers(&provider, false);
         assert_eq!(
-            headers
-                .get("x-goog-api-key")
-                .and_then(|v| v.to_str().ok()),
+            headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()),
             Some("AQ.Ab8RN6Jg_secret_key"),
             "google_api_key authScheme 必须用 x-goog-api-key header,不是 Bearer"
         );

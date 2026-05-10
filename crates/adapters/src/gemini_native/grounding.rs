@@ -62,10 +62,7 @@ pub fn convert_grounding_metadata_to_annotations(gm: &GroundingMetadata) -> Vec<
             continue;
         };
         let mut url_citation = Map::new();
-        url_citation.insert(
-            "start_index".into(),
-            json!(support.segment.start_index),
-        );
+        url_citation.insert("start_index".into(), json!(support.segment.start_index));
         url_citation.insert("end_index".into(), json!(support.segment.end_index));
         url_citation.insert("url".into(), json!(web.uri));
         if let Some(title) = &web.title {
@@ -114,10 +111,16 @@ mod tests {
         assert_eq!(annotations[0]["type"], "url_citation");
         assert_eq!(annotations[0]["url_citation"]["start_index"], 0);
         assert_eq!(annotations[0]["url_citation"]["end_index"], 25);
-        assert_eq!(annotations[0]["url_citation"]["url"], "https://weather.com/nyc");
+        assert_eq!(
+            annotations[0]["url_citation"]["url"],
+            "https://weather.com/nyc"
+        );
         assert_eq!(annotations[0]["url_citation"]["title"], "Weather - NYC");
         // 第 2 条 — 用 chunk[1]
-        assert_eq!(annotations[1]["url_citation"]["url"], "https://accuweather.com/nyc");
+        assert_eq!(
+            annotations[1]["url_citation"]["url"],
+            "https://accuweather.com/nyc"
+        );
     }
 
     #[test]
@@ -130,7 +133,10 @@ mod tests {
         }))
         .unwrap();
         let annotations = convert_grounding_metadata_to_annotations(&gm);
-        assert!(annotations.is_empty(), "groundingChunkIndices 为空必须 skip");
+        assert!(
+            annotations.is_empty(),
+            "groundingChunkIndices 为空必须 skip"
+        );
     }
 
     #[test]
@@ -158,7 +164,10 @@ mod tests {
         .unwrap();
         let annotations = convert_grounding_metadata_to_annotations(&gm);
         assert_eq!(annotations.len(), 1);
-        assert!(annotations[0]["url_citation"].get("title").is_none(), "title 缺时不写字段");
+        assert!(
+            annotations[0]["url_citation"].get("title").is_none(),
+            "title 缺时不写字段"
+        );
     }
 
     #[test]

@@ -371,7 +371,12 @@ pub fn map_finish_reason(gemini: &str) -> &'static str {
     match gemini {
         "STOP" => "stop",
         "MAX_TOKENS" => "length",
-        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY"
+        "SAFETY"
+        | "RECITATION"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "IMAGE_SAFETY"
         | "IMAGE_PROHIBITED_CONTENT" => "content_filter",
         "TOO_MANY_TOOL_CALLS" | "MALFORMED_FUNCTION_CALL" | "MALFORMED_RESPONSE" => "tool_calls",
         // FINISH_REASON_UNSPECIFIED / LANGUAGE / OTHER 等
@@ -403,7 +408,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert!(v.get("text").is_none(), "functionCall part 必须不含 text");
         assert_eq!(v["functionCall"]["name"], "search");
         assert_eq!(v["functionCall"]["args"]["q"], "weather");
@@ -426,7 +432,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
         // generation_config → generationConfig
         assert!(v.get("generationConfig").is_some());
         assert_eq!(v["generationConfig"]["maxOutputTokens"], 1024);
@@ -465,7 +472,10 @@ mod tests {
         let gm: GroundingMetadata = serde_json::from_value(raw).unwrap();
         assert_eq!(gm.web_search_queries.as_ref().unwrap().len(), 1);
         let chunks = gm.grounding_chunks.unwrap();
-        assert_eq!(chunks[0].web.as_ref().unwrap().uri, "https://weather.com/nyc");
+        assert_eq!(
+            chunks[0].web.as_ref().unwrap().uri,
+            "https://weather.com/nyc"
+        );
         let supports = gm.grounding_supports.unwrap();
         assert_eq!(supports[0].segment.start_index, 0);
         assert_eq!(supports[0].segment.end_index, 25);

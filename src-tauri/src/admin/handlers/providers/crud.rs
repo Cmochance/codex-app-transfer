@@ -171,9 +171,7 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
     // normalize_provider_api_format 一处,不需要再到 crud / providerBody / 等多处补)。
     new_provider.insert(
         "apiFormat".into(),
-        Value::String(
-            super::normalize_provider_api_format(input.api_format.as_deref()).to_owned(),
-        ),
+        Value::String(super::normalize_provider_api_format(input.api_format.as_deref()).to_owned()),
     );
     new_provider.insert(
         "apiKey".into(),
@@ -259,8 +257,7 @@ pub async fn update_provider(
     if let Some(api_format) = input.api_format {
         // 复用 normalize_provider_api_format(同 add_provider 修复历史:旧 hardcode
         // 漏 gemini_native 等新协议 → 用户保存的 apiFormat 被静默改成 openai_chat)
-        let normalized =
-            super::normalize_provider_api_format(Some(api_format.as_str())).to_owned();
+        let normalized = super::normalize_provider_api_format(Some(api_format.as_str())).to_owned();
         updated.insert("apiFormat".into(), Value::String(normalized));
     }
     // apiKey 留空表示"不修改"

@@ -70,8 +70,7 @@ mod tests {
         // ② apiFormat=gemini_native(GeminiNativeAdapter 路由)
         // ③ authScheme=google_api_key(`x-goog-api-key` header,不是 Bearer)
         assert_eq!(
-            g["baseUrl"],
-            "https://generativelanguage.googleapis.com",
+            g["baseUrl"], "https://generativelanguage.googleapis.com",
             "baseUrl 不带版本前缀,adapter 按 Gemini 3+ 用 v1alpha / 2.x 用 v1beta 自动选"
         );
         assert_eq!(

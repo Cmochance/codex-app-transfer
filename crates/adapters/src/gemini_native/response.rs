@@ -302,21 +302,38 @@ impl GeminiToResponsesConverter {
     fn build_gemini_metadata(&self) -> Option<Value> {
         let mut g = serde_json::Map::new();
         if !self.accumulated_safety_ratings.is_empty() {
-            g.insert("safety_ratings".into(), Value::Array(self.accumulated_safety_ratings.clone()));
+            g.insert(
+                "safety_ratings".into(),
+                Value::Array(self.accumulated_safety_ratings.clone()),
+            );
         }
         if !self.accumulated_citation_metadata.is_empty() {
-            g.insert("citation_metadata".into(), Value::Array(self.accumulated_citation_metadata.clone()));
+            g.insert(
+                "citation_metadata".into(),
+                Value::Array(self.accumulated_citation_metadata.clone()),
+            );
         }
         if !self.accumulated_url_context_metadata.is_empty() {
-            g.insert("url_context_metadata".into(), Value::Array(self.accumulated_url_context_metadata.clone()));
+            g.insert(
+                "url_context_metadata".into(),
+                Value::Array(self.accumulated_url_context_metadata.clone()),
+            );
         }
         if !self.accumulated_logprobs.is_empty() {
-            g.insert("logprobs".into(), Value::Array(self.accumulated_logprobs.clone()));
+            g.insert(
+                "logprobs".into(),
+                Value::Array(self.accumulated_logprobs.clone()),
+            );
         }
         if !self.accumulated_token_counts.is_empty() {
             g.insert(
                 "candidate_token_counts".into(),
-                Value::Array(self.accumulated_token_counts.iter().map(|n| json!(n)).collect()),
+                Value::Array(
+                    self.accumulated_token_counts
+                        .iter()
+                        .map(|n| json!(n))
+                        .collect(),
+                ),
             );
         }
         let mut grounding = serde_json::Map::new();
@@ -329,7 +346,12 @@ impl GeminiToResponsesConverter {
         if !self.accumulated_web_search_queries.is_empty() {
             grounding.insert(
                 "web_search_queries".into(),
-                Value::Array(self.accumulated_web_search_queries.iter().map(|s| Value::String(s.clone())).collect()),
+                Value::Array(
+                    self.accumulated_web_search_queries
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect(),
+                ),
             );
         }
         if !self.accumulated_retrieval_metadata.is_empty() {
@@ -345,7 +367,10 @@ impl GeminiToResponsesConverter {
             let mut pf = serde_json::Map::new();
             pf.insert("block_reason".into(), Value::String(br.clone()));
             if !self.prompt_feedback_safety.is_empty() {
-                pf.insert("safety_ratings".into(), Value::Array(self.prompt_feedback_safety.clone()));
+                pf.insert(
+                    "safety_ratings".into(),
+                    Value::Array(self.prompt_feedback_safety.clone()),
+                );
             }
             g.insert("prompt_feedback".into(), Value::Object(pf));
         }
@@ -622,7 +647,8 @@ impl GeminiToResponsesConverter {
                     self.accumulated_search_entry_points.push(sep.clone());
                 }
                 if let Some(qs) = &gm.web_search_queries {
-                    self.accumulated_web_search_queries.extend(qs.iter().cloned());
+                    self.accumulated_web_search_queries
+                        .extend(qs.iter().cloned());
                 }
                 if let Some(rm) = &gm.retrieval_metadata {
                     self.accumulated_retrieval_metadata.push(rm.clone());
@@ -747,7 +773,12 @@ impl GeminiToResponsesConverter {
             "type": format!("upstream_http_{http_status}"),
         });
         let payload = json!({"type": "response.failed", "response": envelope});
-        emit_event(&mut out, &mut self.sequence_number, "response.failed", payload);
+        emit_event(
+            &mut out,
+            &mut self.sequence_number,
+            "response.failed",
+            payload,
+        );
         self.completed_emitted = true;
         out
     }
@@ -815,8 +846,12 @@ impl GeminiToResponsesConverter {
             } else {
                 match self.final_finish_reason.as_deref() {
                     Some("MAX_TOKENS") => "max_output_tokens",
-                    Some("SAFETY") | Some("RECITATION") | Some("BLOCKLIST")
-                    | Some("PROHIBITED_CONTENT") | Some("SPII") | Some("IMAGE_SAFETY")
+                    Some("SAFETY")
+                    | Some("RECITATION")
+                    | Some("BLOCKLIST")
+                    | Some("PROHIBITED_CONTENT")
+                    | Some("SPII")
+                    | Some("IMAGE_SAFETY")
                     | Some("IMAGE_PROHIBITED_CONTENT") => "content_filter",
                     Some(s) if s == FINISH_INTERRUPTED => "interrupted",
                     None => "interrupted",
@@ -904,7 +939,9 @@ impl GeminiToResponsesConverter {
     }
 
     fn emit_text_delta(&mut self, out: &mut Vec<u8>, delta: &str) {
-        let Some(msg) = self.open_message.as_mut() else { return };
+        let Some(msg) = self.open_message.as_mut() else {
+            return;
+        };
         msg.text_acc.push_str(delta);
         emit_event(
             out,
@@ -921,7 +958,9 @@ impl GeminiToResponsesConverter {
     }
 
     fn emit_annotations(&mut self, out: &mut Vec<u8>, annotations: Vec<Value>) {
-        let Some(msg) = self.open_message.as_mut() else { return };
+        let Some(msg) = self.open_message.as_mut() else {
+            return;
+        };
         for annotation in annotations {
             // emit + 累积(close 时塞进 message.content[0].annotations 整体)
             let payload = json!({
@@ -943,7 +982,9 @@ impl GeminiToResponsesConverter {
     }
 
     fn close_message(&mut self, out: &mut Vec<u8>) {
-        let Some(msg) = self.open_message.take() else { return };
+        let Some(msg) = self.open_message.take() else {
+            return;
+        };
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1039,7 +1080,9 @@ impl GeminiToResponsesConverter {
     }
 
     fn emit_reasoning_delta(&mut self, out: &mut Vec<u8>, delta: &str) {
-        let Some(rs) = self.open_reasoning.as_mut() else { return };
+        let Some(rs) = self.open_reasoning.as_mut() else {
+            return;
+        };
         rs.text_acc.push_str(delta);
         emit_event(
             out,
@@ -1056,7 +1099,9 @@ impl GeminiToResponsesConverter {
     }
 
     fn close_reasoning(&mut self, out: &mut Vec<u8>) {
-        let Some(rs) = self.open_reasoning.take() else { return };
+        let Some(rs) = self.open_reasoning.take() else {
+            return;
+        };
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1241,16 +1286,26 @@ impl GeminiToResponsesConverter {
                 "data": data,
             },
         });
-        emit_event(out, &mut self.sequence_number, "response.output_item.added", json!({
-            "type": "response.output_item.added",
-            "output_index": output_index,
-            "item": item.clone(),
-        }));
-        emit_event(out, &mut self.sequence_number, "response.output_item.done", json!({
-            "type": "response.output_item.done",
-            "output_index": output_index,
-            "item": item.clone(),
-        }));
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": item.clone(),
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item.clone(),
+            }),
+        );
         self.closed_other_items.push((output_index, item));
     }
 
@@ -1269,16 +1324,26 @@ impl GeminiToResponsesConverter {
                 "file_uri": file_uri,
             },
         });
-        emit_event(out, &mut self.sequence_number, "response.output_item.added", json!({
-            "type": "response.output_item.added",
-            "output_index": output_index,
-            "item": item.clone(),
-        }));
-        emit_event(out, &mut self.sequence_number, "response.output_item.done", json!({
-            "type": "response.output_item.done",
-            "output_index": output_index,
-            "item": item.clone(),
-        }));
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": item.clone(),
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item.clone(),
+            }),
+        );
         self.closed_other_items.push((output_index, item));
     }
 }
@@ -1328,8 +1393,8 @@ pub fn convert_gemini_error_to_responses_failure_stream(
 ) -> ByteStream {
     use futures_util::stream::StreamExt;
     let status_u16 = upstream_status.as_u16();
-    let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-        Box::pin(stream::unfold(
+    let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
+        stream::unfold(
             (upstream_stream, original_request, false),
             move |(mut input, orig, finished)| async move {
                 if finished {
@@ -1342,7 +1407,8 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                 while let Some(chunk) = input.next().await {
                     match chunk {
                         Ok(b) => {
-                            let remaining = MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
+                            let remaining =
+                                MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
                             if remaining == 0 {
                                 truncated = true;
                                 break;
@@ -1404,11 +1470,16 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                             .as_deref()
                             .map(|m| {
                                 let lower = m.to_ascii_lowercase();
-                                lower.contains("safety") || lower.contains("blocked") || lower.contains("block_reason")
+                                lower.contains("safety")
+                                    || lower.contains("blocked")
+                                    || lower.contains("block_reason")
                             })
                             .unwrap_or(false);
                         if is_safety {
-                            ("content_filter", "Content blocked by upstream safety filter")
+                            (
+                                "content_filter",
+                                "Content blocked by upstream safety filter",
+                            )
                         } else {
                             ("bad_request", "Bad request to upstream")
                         }
@@ -1477,7 +1548,12 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                         upstream_status = status_u16,
                         code,
                         upstream_status_str = upstream_status_str.as_deref().unwrap_or(""),
-                        message_preview = upstream_message.as_deref().unwrap_or("").chars().take(200).collect::<String>(),
+                        message_preview = upstream_message
+                            .as_deref()
+                            .unwrap_or("")
+                            .chars()
+                            .take(200)
+                            .collect::<String>(),
                         "gemini upstream returned error; synthesized response.failed for client"
                     );
                 }
@@ -1486,7 +1562,8 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                 let out = conv.emit_failure(code, &error_message, status_u16);
                 Some((Ok(Bytes::from(out)), (input, None, true)))
             },
-        ));
+        ),
+    );
     s
 }
 
@@ -1603,7 +1680,10 @@ mod tests {
         // sequence_number 单调递增
         for (i, e) in events.iter().enumerate() {
             let (_, v) = parse_event(e);
-            assert_eq!(v["sequence_number"], i, "event {i} sequence_number 必须 = i");
+            assert_eq!(
+                v["sequence_number"], i,
+                "event {i} sequence_number 必须 = i"
+            );
         }
     }
 
@@ -1621,13 +1701,17 @@ mod tests {
         let mut conv = GeminiToResponsesConverter::new(None, None);
         let events = drive_to_events(&mut conv, &[chunk1, chunk2, chunk3]);
         // 找 completed envelope
-        let completed = events.iter()
+        let completed = events
+            .iter()
             .map(|e| parse_event(e))
             .find(|(n, _)| n == "response.completed")
             .expect("response.completed 应存在");
         let output = &completed.1["response"]["output"];
         assert_eq!(output[0]["type"], "message");
-        assert_eq!(output[0]["content"][0]["text"], "Hello", "完整文本应在 envelope output 中");
+        assert_eq!(
+            output[0]["content"][0]["text"], "Hello",
+            "完整文本应在 envelope output 中"
+        );
     }
 
     #[test]
@@ -1642,12 +1726,18 @@ mod tests {
         assert!(names.contains(&"response.function_call_arguments.delta".into()));
         assert!(names.contains(&"response.function_call_arguments.done".into()));
         // completed envelope 的 output[] 含 function_call item
-        let completed = events.iter()
+        let completed = events
+            .iter()
             .map(|e| parse_event(e))
             .find(|(n, _)| n == "response.completed")
             .unwrap();
         let output = &completed.1["response"]["output"];
-        let fc = output.as_array().unwrap().iter().find(|i| i["type"] == "function_call").unwrap();
+        let fc = output
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .unwrap();
         assert_eq!(fc["name"], "search");
         // arguments 必须是 JSON 字符串(OpenAI 兼容)
         let args_str = fc["arguments"].as_str().unwrap();
@@ -1668,7 +1758,11 @@ mod tests {
         assert!(names.contains(&"response.reasoning_summary_text.delta".into()));
         assert!(names.contains(&"response.reasoning_summary_text.done".into()));
         // envelope output 既有 reasoning 又有 message
-        let completed = events.iter().map(|s| parse_event(s.as_str())).find(|(n,_)| n == "response.completed").unwrap();
+        let completed = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
         let output = completed.1["response"]["output"].as_array().unwrap();
         assert!(output.iter().any(|i| i["type"] == "reasoning"));
         assert!(output.iter().any(|i| i["type"] == "message"));
@@ -1687,7 +1781,11 @@ mod tests {
         let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
         assert!(names.contains(&"response.output_text.annotation.added".into()));
         // envelope output[].content[0].annotations 含 url_citation
-        let completed = events.iter().map(|s| parse_event(s.as_str())).find(|(n,_)| n == "response.completed").unwrap();
+        let completed = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
         let output = completed.1["response"]["output"].as_array().unwrap();
         let msg = output.iter().find(|i| i["type"] == "message").unwrap();
         let annos = msg["content"][0]["annotations"].as_array().unwrap();
@@ -1716,7 +1814,8 @@ mod tests {
     fn crlf_sse_boundary_recognized() {
         // C3 修复:Google `alt=sse` 经常 emit `\r\n\r\n` 边界,只识 `\n\n` 会让
         // 整个流被 buffer 到结束才一次性 process(streaming → batch 退化)。
-        let chunk = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"crlf\"}]}}]}\r\n\r\n";
+        let chunk =
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"crlf\"}]}}]}\r\n\r\n";
         let mut conv = GeminiToResponsesConverter::new(None, None);
         let events = drive_to_events(&mut conv, &[chunk]);
         let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
@@ -1784,18 +1883,26 @@ mod tests {
             "temperature": 0.5,
             "tool_choice": "auto"
         });
-        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}]}
+        let chunk =
+            br#"data: {"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}]}
 
 "#;
         let mut conv = GeminiToResponsesConverter::new(Some(original), None);
         let events = drive_to_events(&mut conv, &[chunk]);
-        let created = events.iter().map(|s| parse_event(s.as_str())).find(|(n,_)| n == "response.created").unwrap();
+        let created = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, _)| n == "response.created")
+            .unwrap();
         let env = &created.1["response"];
         assert_eq!(env["instructions"], "You are helpful.");
         assert_eq!(env["temperature"], 0.5);
         assert_eq!(env["tool_choice"], "auto");
         let tools = env["tools"].as_array().unwrap();
-        assert_eq!(tools[0]["name"], "test_fn", "envelope.tools 必须是 Codex.app 原始 tools");
+        assert_eq!(
+            tools[0]["name"], "test_fn",
+            "envelope.tools 必须是 Codex.app 原始 tools"
+        );
     }
 
     #[test]
@@ -1805,9 +1912,16 @@ mod tests {
 "#;
         let mut conv = GeminiToResponsesConverter::new(None, None);
         let events = drive_to_events(&mut conv, &[chunk]);
-        let last = events.iter().map(|s| parse_event(s.as_str())).find(|(n,_)| n == "response.incomplete").expect("MAX_TOKENS → response.incomplete");
+        let last = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, _)| n == "response.incomplete")
+            .expect("MAX_TOKENS → response.incomplete");
         assert_eq!(last.1["response"]["status"], "incomplete");
-        assert_eq!(last.1["response"]["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(
+            last.1["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
     }
 
     #[test]
@@ -1817,8 +1931,15 @@ mod tests {
 "#;
         let mut conv = GeminiToResponsesConverter::new(None, None);
         let events = drive_to_events(&mut conv, &[chunk]);
-        let last = events.iter().map(|s| parse_event(s.as_str())).find(|(n,_)| n == "response.incomplete").unwrap();
-        assert_eq!(last.1["response"]["incomplete_details"]["reason"], "content_filter");
+        let last = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, _)| n == "response.incomplete")
+            .unwrap();
+        assert_eq!(
+            last.1["response"]["incomplete_details"]["reason"],
+            "content_filter"
+        );
     }
 
     #[test]
@@ -1828,7 +1949,11 @@ mod tests {
 "#;
         let mut conv = GeminiToResponsesConverter::new(None, None);
         let events = drive_to_events(&mut conv, &[chunk]);
-        let completed = events.iter().map(|s| parse_event(s.as_str())).find(|(n,_)| n == "response.completed").unwrap();
+        let completed = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
         let usage = &completed.1["response"]["usage"];
         assert_eq!(usage["input_tokens"], 100);
         assert_eq!(usage["output_tokens"], 50);
@@ -2011,7 +2136,10 @@ mod tests {
         // code 降级到 upstream_transport_error(client 知道 body 不可信)
         let upstream: ByteStream = Box::pin(stream::iter(vec![
             Ok(Bytes::from_static(b"{\"error\":\"partial")),
-            Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "tcp reset by peer")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "tcp reset by peer",
+            )),
         ]));
         let mut s = convert_gemini_error_to_responses_failure_stream(
             http::StatusCode::from_u16(429).unwrap(),
@@ -2066,7 +2194,9 @@ mod tests {
         // 上游返 10K-char 合法 JSON message → 用户 message 应在 2000 char 处截断 + … 标记,
         // 防 SSE event 撑爆
         let long_msg = "z".repeat(10_000);
-        let body = format!(r#"{{"error":{{"code":429,"message":"{long_msg}","status":"RESOURCE_EXHAUSTED"}}}}"#);
+        let body = format!(
+            r#"{{"error":{{"code":429,"message":"{long_msg}","status":"RESOURCE_EXHAUSTED"}}}}"#
+        );
         let s = drive_failure_stream(429, &body);
         assert!(s.contains("…"));
         assert!(s.contains("\"code\":\"quota_exceeded\""));
@@ -2075,7 +2205,9 @@ mod tests {
     #[test]
     fn failure_stream_non_utf8_body_marked() {
         // 非 UTF-8 字节序列 → from_utf8_lossy 替换 + message 标 [non-UTF-8 body]
-        let upstream: ByteStream = Box::pin(stream::iter(vec![Ok(Bytes::from_static(&[0xFF, 0xFE, 0xFD]))]));
+        let upstream: ByteStream = Box::pin(stream::iter(vec![Ok(Bytes::from_static(&[
+            0xFF, 0xFE, 0xFD,
+        ]))]));
         let mut s = convert_gemini_error_to_responses_failure_stream(
             http::StatusCode::from_u16(502).unwrap(),
             upstream,
