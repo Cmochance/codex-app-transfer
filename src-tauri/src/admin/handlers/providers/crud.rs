@@ -13,8 +13,7 @@ use serde_json::{json, Value};
 use codex_app_transfer_proxy::validation::{validate_extra_headers, HeaderValidationError};
 
 use super::super::super::registry_io::{
-    load as load_registry, public_provider, save as save_registry, with_config_write,
-    ConfigMutation,
+    load as load_registry, public_provider, with_config_write, ConfigMutation,
 };
 use super::super::super::state::AdminState;
 use super::super::common::err;

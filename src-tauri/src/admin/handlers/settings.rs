@@ -9,9 +9,9 @@ use axum::{http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_registry::{config_dir, normalize_model_mappings, RawConfig};
 use serde_json::{json, Value};
 
-use super::super::registry_io::{
-    load as load_registry, save as save_registry, with_config_write, ConfigMutation,
-};
+#[cfg(test)]
+use super::super::registry_io::save_for_test as save_registry;
+use super::super::registry_io::{load as load_registry, with_config_write, ConfigMutation};
 use super::common::{err, random_hex, APP_VERSION};
 
 pub(super) fn ensure_settings_object(cfg: &mut RawConfig) -> &mut serde_json::Map<String, Value> {

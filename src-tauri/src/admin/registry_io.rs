@@ -43,9 +43,22 @@ pub fn load() -> Result<RawConfig, String> {
     Ok(cfg)
 }
 
-pub fn save(cfg: &RawConfig) -> Result<(), String> {
+/// **module-private**(架构性 enforcement,2026-05-11):RMW 调用方**只能**走
+/// [`with_config_write`],不能直接调 `save`。把 save 限制到 registry_io 模块
+/// 内部让 prod 代码物理上无法 import raw save —— 防新增 callsite 误用 raw
+/// load+save 而 reintroduce lost-update race。
+///
+/// 测试代码通过 [`save_for_test`](cfg(test) 暴露)显式 opt-in。
+fn save(cfg: &RawConfig) -> Result<(), String> {
     let path = config_file().ok_or_else(|| "cannot locate user config directory".to_owned())?;
     save_raw_config(&path, cfg).map_err(|e| format!("write config.json failed: {e}"))
+}
+
+/// **测试专用**:绕过 `with_config_write` 直接 save。prod 代码访问不到(cfg(test)
+/// 编译时排除)。test 路径仍可任意写 fixture / 直接验 disk state。
+#[cfg(test)]
+pub fn save_for_test(cfg: &RawConfig) -> Result<(), String> {
+    save(cfg)
 }
 
 /// 序列化 config.json 的 RMW 操作 — 单进程内多 admin handler 并发时

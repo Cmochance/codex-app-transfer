@@ -31,9 +31,9 @@ use serde_json::{json, Value};
 
 use crate::proxy_runner::ProxyManager;
 
-use super::super::registry_io::{
-    load as load_registry, save as save_registry, with_config_write, ConfigMutation,
-};
+#[cfg(test)]
+use super::super::registry_io::save_for_test as save_registry;
+use super::super::registry_io::{load as load_registry, with_config_write, ConfigMutation};
 use super::super::state::AdminState;
 use super::common::{active_provider_name, err, read_setting_bool, APP_VERSION};
 use super::providers::{

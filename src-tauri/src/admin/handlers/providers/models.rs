@@ -7,9 +7,7 @@ use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_registry::MODEL_ORDER;
 use serde_json::{json, Value};
 
-use super::super::super::registry_io::{
-    load as load_registry, save as save_registry, with_config_write, ConfigMutation,
-};
+use super::super::super::registry_io::{load as load_registry, with_config_write, ConfigMutation};
 use super::super::common::err;
 use super::test::{build_provider_test_url, provider_test_error_label, provider_test_headers};
 use super::{clean_base_url, normalize_provider_api_format, provider_index, replace_path_suffix};
