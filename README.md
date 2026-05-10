@@ -28,6 +28,14 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 
 按主题分组。
 
+**Gemini CLI OAuth 直连(impersonate gemini-cli,无需 API key)**(下版主线)
+- 新增 `apiFormat=gemini_cli_oauth` + `authScheme=google_oauth_cloud_code`。用户**通过浏览器登录 Google 账号一次**,本地持久化 access/refresh token(`~/.codex-app-transfer/gemini-oauth.json`,Unix 0600 + atomic write),后续请求自动 refresh 复用,**不需要手动配 API key**。免费 tier per-account 配额绑 GCP `cloudaicompanionProject`(自动 provision)
+- 新独立 crate `crates/gemini_oauth/` 实现完整 OAuth 流程(impersonate `google-gemini/gemini-cli` web flow):loopback callback server (动态 port) + 32-byte hex CSRF state + `oauth2.googleapis.com/token` code-grant exchange + 60s buffer auto refresh + `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`+`onboardUser` LRO project bootstrap
+- 新 `crates/adapters/src/gemini_cli/` adapter:**复用 `gemini_native` 90% 内部转换**(JSON Schema sanitize / Web Search 软约束 / 多轮 function call cache / failure SSE / etc.),只加 outer envelope 层(`{model, project, user_prompt_id: uuid_v4, request: <inner>}`)+ SSE event 外包 `{response: {...}}` unwrap。proxy/forward.rs 加 `GoogleOauthCloudCode` authScheme 分支:dispatch 时 await `ensure_valid_access_token` 拿 Bearer 注入,token 过期前 60s 自动 refresh + 持久化
+- ⚠️ **TOS 灰色 + 风险免责**:`cloudcode-pa.googleapis.com/v1internal` 是 Google **内部未文档化**端点(CLIProxyAPI #1584/#1674 多次因 gemini-cli 升级而 break),Google 可能随时改协议;Code Assist TOS 禁止"非官方客户端 automated/programmatic 使用",impersonation 严格说违反,**用户自担风险**;免费 tier per-account rate limit 严格,heavy use 会 429。本功能**不保证长期可用**,降级路径:切回 v2.1.4 起的 `gemini_native`(API key 模式)
+- Wire-level 实现参考 [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI)(MIT, Go, 31.8k⭐)— 致谢段已加注明
+- 76 单测覆盖 OAuth(token 持久化 + flow + bootstrap + service refresh)+ adapter(outer envelope + SSE unwrap + chunk-buffered 边界 + keepalive 透传)+ proxy 路由(GoogleOauthCloudCode authScheme dispatch)
+
 **Gemini Native 直转适配器**(v2.1.4,本版主线)
 - 新增 `apiFormat=gemini_native` + `authScheme=google_api_key`(`x-goog-api-key` header)。Codex.app `/responses` 入站直接转 Google `:streamGenerateContent?alt=sse` 出站,**完全不走 chat 中间形态**(`crates/adapters/src/gemini_native/`)。Gemini 3 走 `/v1alpha`,Gemini 2.x 走 `/v1beta`,baseUrl 不带版本前缀适配器自动选
 - **Web Search**:Gemini 3+ `googleSearch` builtin tool + functionDeclarations 共存(`toolConfig.includeServerSideToolInvocations`);Gemini 2.x 上游不允许共存 → 用 systemInstruction 软约束告知模型 `google_search` 暂不可用(LiteLLM `apply_response_schema_transformation` 风格,不 destructive drop 字段)
@@ -193,6 +201,14 @@ The Windows installer / portable build opens a standalone desktop window by defa
 ### v2.x mainline rollups (cumulative through v2.1.4)
 
 Grouped by theme.
+
+**Gemini CLI OAuth direct (impersonate gemini-cli, no API key required)** (next release main theme)
+- New `apiFormat=gemini_cli_oauth` + `authScheme=google_oauth_cloud_code`. Users log in via browser **once** to Google; access/refresh tokens are persisted locally (`~/.codex-app-transfer/gemini-oauth.json`, Unix 0600 + atomic write) and **auto-refreshed** by subsequent requests. **No manual API key needed**. Free-tier per-account quota is bound to a GCP `cloudaicompanionProject` (auto-provisioned).
+- New standalone `crates/gemini_oauth/` crate implementing the full OAuth flow (impersonating `google-gemini/gemini-cli`'s web flow): loopback callback server (dynamic port) + 32-byte hex CSRF state + `oauth2.googleapis.com/token` code grant + 60s-buffer auto refresh + `cloudcode-pa.googleapis.com/v1internal:loadCodeAssist`+`onboardUser` LRO project bootstrap
+- New `crates/adapters/src/gemini_cli/` adapter: **reuses 90% of `gemini_native`'s internal transforms** (JSON Schema sanitize / Web Search soft constraint / multi-turn function-call cache / failure SSE / etc.), only adding the outer envelope layer (`{model, project, user_prompt_id: uuid_v4, request: <inner>}`) and SSE event `{response: {...}}` outer unwrap. `proxy/forward.rs` adds a `GoogleOauthCloudCode` authScheme branch: dispatch awaits `ensure_valid_access_token` to inject Bearer; tokens auto-refresh 60s before expiry and persist.
+- ⚠️ **TOS gray area + disclaimer**: `cloudcode-pa.googleapis.com/v1internal` is Google's **internal, undocumented** endpoint (CLIProxyAPI #1584/#1674 broke multiple times after gemini-cli upgrades); Google may change the protocol at any time. Code Assist TOS forbids "automated/programmatic use outside the official client" — impersonation technically violates it; **users assume the risk**. Free-tier per-account rate limits are strict and heavy use hits 429. This feature is **not guaranteed long-term**; fallback path: switch to `gemini_native` (API key mode, available since v2.1.4).
+- Wire-level implementation references [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) (MIT, Go, 31.8k⭐) — credit added in the Acknowledgements section.
+- 76 unit tests cover OAuth (token persist + flow + bootstrap + service refresh) + adapter (outer envelope + SSE unwrap + chunk-buffered boundaries + keepalive passthrough) + proxy routing (GoogleOauthCloudCode authScheme dispatch).
 
 **Gemini Native direct adapter** (v2.1.4, this release's main theme)
 - New `apiFormat=gemini_native` + `authScheme=google_api_key` (`x-goog-api-key` header). Codex.app `/responses` inbound transforms directly to Google `:streamGenerateContent?alt=sse` outbound, **never via chat intermediate** (`crates/adapters/src/gemini_native/`). Gemini 3 routes to `/v1alpha`, Gemini 2.x to `/v1beta`; baseUrl without version prefix is auto-resolved by the adapter
@@ -458,6 +474,7 @@ v2.0.0 是从 v1.0.4 (Python) 一次性重写而来,完整过程(7 阶段 + 30+ 
 - **[Tauri](https://tauri.app/)** — v2 桌面壳 + cas:// 同进程 axum 架构基座。
 - **[Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts)** — autocompact 9-section summary prompt 蓝本。
 - **[7as0nch/mimo2codex](https://github.com/7as0nch/mimo2codex)** — MiMo image / namespace 展平 / web_search / annotation 协议借鉴。
+- **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**(MIT, Go, 31.8k⭐)— Gemini CLI OAuth 流程 + Cloud Code Assist 内部 API wire 形态参考(`internal/auth/gemini/` + `internal/runtime/executor/gemini_cli_executor.go` + `internal/cmd/login.go`),让我们能在不依赖 API key 的前提下接入 Google Gemini 免费 tier 配额。
 
 ### 社区贡献者
 
