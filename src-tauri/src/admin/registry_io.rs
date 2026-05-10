@@ -131,6 +131,21 @@ thread_local! {
 /// free,跟未升级前等价。错误仅在 user 真同时跑 2 个 .app 实例时才暴露(罕见)。
 fn lock_config_file_cross_process() -> Option<std::fs::File> {
     let path = config_file()?.with_extension("json.lock");
+    // **fresh-install fix**(chatgpt-codex P2):~/.codex-app-transfer/ 在首次启
+    // 动时不存在,直接 OpenOptions::open 会返 ENOENT → fallback 到无锁路径,
+    // 正好在 bootstrap 多 .app 实例并发场景失去保护。先 create_dir_all 父目录,
+    // 跟 save_raw_config 内部走的 mkdir 路径对齐
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                error_id = "CONFIG_LOCK_PARENT_DIR_CREATE_FAILED",
+                error = %e,
+                parent = ?parent,
+                "create_dir_all for cross-process lock parent failed; falling back"
+            );
+            return None;
+        }
+    }
     // 创建 / 打开 lock 文件 — OpenOptions read+write+create 让其他进程也能 open
     let file = match std::fs::OpenOptions::new()
         .read(true)
