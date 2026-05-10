@@ -41,8 +41,26 @@ pub fn convert_grounding_metadata_to_annotations(gm: &GroundingMetadata) -> Vec<
             continue;
         }
         let first_idx = support.grounding_chunk_indices[0];
-        let Some(chunk) = chunks.get(first_idx) else { continue };
-        let Some(web) = &chunk.web else { continue };
+        let Some(chunk) = chunks.get(first_idx) else {
+            tracing::debug!(
+                chunk_index = first_idx,
+                total_chunks = chunks.len(),
+                "gemini grounding support references out-of-range chunk index, skipping"
+            );
+            continue;
+        };
+        let Some(web) = &chunk.web else {
+            // H6 修复:非 web chunk(如 retrievedContext / RAG)目前 MVP 不映射,
+            // 用户视角"模型回答有引用但 UI 没显示来源"。debug log 帮 follow-up
+            // 加 retrievedContext → annotation 转换时定位需求。
+            tracing::debug!(
+                chunk_index = first_idx,
+                "gemini grounding chunk lacks `web` field (likely retrievedContext or future \
+                 chunk type); skipping annotation. TODO: map non-web chunks once Codex.app \
+                 UI supports their citation shape."
+            );
+            continue;
+        };
         let mut url_citation = Map::new();
         url_citation.insert(
             "start_index".into(),

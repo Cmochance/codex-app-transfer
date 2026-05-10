@@ -62,6 +62,18 @@ pub fn responses_body_to_gemini_request(
 /// adapter 不再补,respect 用户配置。
 pub fn build_gemini_upstream_path(model: &str, stream: bool, base_url: &str) -> String {
     let base_has_version = base_url.contains("/v1beta") || base_url.contains("/v1alpha");
+    // H5 修复:用户在 base_url 里 hardcode `/v1beta` + 用 Gemini 3.x model
+    // → adapter 不能自动改路由,Gemini 上游会 400("model not supported on this version")。
+    // warn 帮用户定位根因,而不是让他对着不知所云的 400 抓瞎。
+    if base_url.contains("/v1beta") && is_gemini_3_or_newer(model) {
+        tracing::warn!(
+            model,
+            base_url,
+            "Gemini 3+ requires /v1alpha API endpoint; base_url pins /v1beta which will likely \
+             result in upstream 400. Remove the version suffix from base_url to enable \
+             auto-routing (Gemini 3+ → v1alpha, Gemini 2.x → v1beta)."
+        );
+    }
     let model_with_prefix = if model.starts_with("models/") {
         model.to_owned()
     } else {
@@ -709,11 +721,31 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
                 .get("tool_call_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // C1 修复(silent-failure-hunter 报告):tool_call_id 找不到时
+            // 不能 fake 字面量 "tool"(Gemini 收到 functionResponse.name="tool"
+            // 而 declarations 里没该工具,会 400 + 用户看不出根因 + 若用户真有
+            // 名为 "tool" 的工具会被静默误路由)。改:fallback 用 tool_call_id
+            // 本身当 name(至少有诊断价值)+ tracing::warn 在 telemetry 暴露根因。
             let name = tool_call_id_to_name
                 .get(tool_call_id)
                 .cloned()
                 .or_else(|| msg.get("name").and_then(|v| v.as_str()).map(String::from))
-                .unwrap_or_else(|| "tool".into());
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        tool_call_id,
+                        "gemini_native: tool/function role message has no matching prior \
+                         function_call in this input (likely session-resumed history dropped \
+                         the function_call item, or Codex.app sent stale call_id); using \
+                         tool_call_id as name fallback. If Gemini upstream 400s, ensure the \
+                         original function_call is included in the input array alongside the \
+                         output."
+                    );
+                    if tool_call_id.is_empty() {
+                        "unknown_tool".into()
+                    } else {
+                        tool_call_id.to_string()
+                    }
+                });
             let response_value = parse_tool_response_content(msg.get("content"));
             tool_call_responses.push(Part {
                 function_response: Some(FunctionResponse {
@@ -1001,17 +1033,14 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                     }
                 }
             }
-            // anyOf null → nullable
+            // anyOf 处理(H1 + H2 修复):
+            // - Gemini schema **不接受** anyOf,任何留 anyOf 的请求会 400
+            // - 单一 non-null branch + null:转成 nullable + 把 non-null 字段提到外层
+            //   (H1:**只插不在 obj 的 key**,不能覆盖 parent 已有字段如 description)
+            // - 多 non-null branch:Gemini 不支持 union types,**至少剥 anyOf 关键字**
+            //   保留 first non-null branch(LiteLLM 简化做法 + warn)
+            // - 全是 null:留空字段(罕见)
             if let Some(Value::Array(any_of)) = obj.get("anyOf").cloned().as_ref() {
-                let null_branches: Vec<&Value> = any_of
-                    .iter()
-                    .filter(|b| {
-                        b.as_object()
-                            .and_then(|o| o.get("type"))
-                            .and_then(|t| t.as_str())
-                            == Some("null")
-                    })
-                    .collect();
                 let non_null: Vec<&Value> = any_of
                     .iter()
                     .filter(|b| {
@@ -1021,15 +1050,31 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                             != Some("null")
                     })
                     .collect();
-                if !null_branches.is_empty() && non_null.len() == 1 {
-                    // 提到外层 + nullable=true
-                    if let Some(Value::Object(target)) = non_null.first().map(|v| (*v).clone()).as_mut() {
-                        for (k, vv) in target.iter() {
-                            obj.insert(k.clone(), vv.clone());
-                        }
-                        obj.insert("nullable".into(), Value::Bool(true));
-                        obj.remove("anyOf");
+                let has_null_branch = any_of.len() != non_null.len();
+                if !non_null.is_empty() {
+                    if non_null.len() > 1 {
+                        tracing::warn!(
+                            count = non_null.len(),
+                            "gemini schema sanitize: anyOf has {} non-null branches; \
+                             Gemini does not support union types, keeping first only",
+                            non_null.len()
+                        );
                     }
+                    if let Some(Value::Object(target)) =
+                        non_null.first().map(|v| (*v).clone()).as_mut()
+                    {
+                        for (k, vv) in target.iter() {
+                            // H1:用 entry.or_insert 避免覆盖 parent 已有字段
+                            // (例如 parent.description="x",inner branch 也带 description="y",
+                            // 旧实现会用 inner 覆盖 parent → 静默丢用户原意)
+                            obj.entry(k.clone())
+                                .or_insert_with(|| vv.clone());
+                        }
+                    }
+                    if has_null_branch {
+                        obj.insert("nullable".into(), Value::Bool(true));
+                    }
+                    obj.remove("anyOf");
                 }
             }
             // object 类型 properties 默认补空对象
@@ -1245,8 +1290,18 @@ fn apply_extra_body_overrides(req: &mut RequestBody, body: &Map<String, Value>) 
             }
         }
     }
-    if let Ok(parsed) = serde_json::from_value::<RequestBody>(merged) {
-        *req = parsed;
+    // H7 修复:不能 silent 丢用户 extra_body — 解析失败时 tracing::warn 至少在
+    // telemetry 里可见,帮用户调"为什么我的 extra_body 没生效"。
+    match serde_json::from_value::<RequestBody>(merged) {
+        Ok(parsed) => *req = parsed,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "gemini_native: extra_body merge produced invalid Gemini RequestBody, \
+                 dropping the override (request continues without extra_body fields). \
+                 Fix the field type/path in extra_body to take effect."
+            );
+        }
     }
 }
 

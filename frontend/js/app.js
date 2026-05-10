@@ -145,6 +145,7 @@
     const v = String(apiFormat || "").toLowerCase().replace(/-/g, "_");
     if (["responses", "openai_responses"].includes(v)) return { key: "responses", canonical: "responses" };
     if (["anthropic", "claude", "messages"].includes(v)) return { key: "anthropic", canonical: "anthropic" };
+    if (["gemini_native", "google_ai_studio", "gemini"].includes(v)) return { key: "geminiNative", canonical: "gemini_native" };
     return { key: "openaiChat", canonical: "openai_chat" };
   }
 
