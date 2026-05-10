@@ -72,10 +72,7 @@ fn main() {
             let apply_result = tauri::async_runtime::block_on(
                 handlers::desktop::auto_apply_on_startup_if_enabled(startup_proxy_manager),
             );
-            let applied = apply_result
-                .get("applied")
-                .and_then(|v| v.as_bool())
-                == Some(true);
+            let applied = apply_result.get("applied").and_then(|v| v.as_bool()) == Some(true);
             if !applied {
                 let message = apply_result
                     .get("message")

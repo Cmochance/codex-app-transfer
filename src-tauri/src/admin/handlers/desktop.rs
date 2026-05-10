@@ -1246,12 +1246,13 @@ mod tests {
                 let result = auto_apply_on_startup_if_enabled(Arc::clone(&manager)).await;
                 eprintln!("startup auto-apply result: {result:#}");
                 assert_eq!(
-                    result["applied"], json!(true),
+                    result["applied"],
+                    json!(true),
                     "startup auto-apply 必须 applied=true,实际:{result:#}"
                 );
 
-                let toml = fs::read_to_string(home.join(".codex").join("config.toml"))
-                    .unwrap_or_default();
+                let toml =
+                    fs::read_to_string(home.join(".codex").join("config.toml")).unwrap_or_default();
                 assert!(
                     toml.contains("openai_base_url = \"https://lonr.zeabur.app/v1\""),
                     "config.toml 必须含 lonr base_url,实际内容:\n{toml}"
@@ -1261,11 +1262,13 @@ mod tests {
                     fs::read_to_string(home.join(".codex").join("auth.json")).unwrap_or_default();
                 let auth: Value = serde_json::from_str(&auth_str).unwrap_or(json!({}));
                 assert_eq!(
-                    auth["auth_mode"].as_str(), Some("apikey"),
+                    auth["auth_mode"].as_str(),
+                    Some("apikey"),
                     "auth_mode 必须切到 apikey,实际:{auth:#}"
                 );
                 assert_eq!(
-                    auth["OPENAI_API_KEY"].as_str(), Some("CMC22339"),
+                    auth["OPENAI_API_KEY"].as_str(),
+                    Some("CMC22339"),
                     "OPENAI_API_KEY 必须写 lonr 的 apiKey,实际:{auth:#}"
                 );
             });
