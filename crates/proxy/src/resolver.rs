@@ -41,6 +41,10 @@ pub enum AuthScheme {
     /// LiteLLM 注释(`common_utils.py:402`):API key 不放 URL,放 header
     /// 防 traceback 泄露。
     GoogleApiKey,
+    /// Google Cloud Code Assist OAuth 2.0:`Authorization: Bearer <oauth_access_token>`,
+    /// 但 access_token 不在 provider.api_key 里 — 由 `gemini_oauth::TokenStore`
+    /// 持久化 + `ensure_valid_access_token` 在请求时 load + auto refresh。
+    GoogleOauthCloudCode,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -51,6 +55,9 @@ impl AuthScheme {
             "x-api-key" | "x_api_key" | "xapikey" | "apikey" => AuthScheme::XApiKey,
             "google_api_key" | "x-goog-api-key" | "x_goog_api_key" | "google" | "gemini" => {
                 AuthScheme::GoogleApiKey
+            }
+            "google_oauth_cloud_code" | "google_oauth" | "gemini_cli_oauth" | "gemini_oauth" => {
+                AuthScheme::GoogleOauthCloudCode
             }
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)

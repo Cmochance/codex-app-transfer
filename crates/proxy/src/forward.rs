@@ -594,6 +594,23 @@ async fn build_and_send_upstream(
     plan_body: &Bytes,
     upstream_url: &str,
 ) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
+    // GoogleOauthCloudCode authScheme:provider.api_key 是空,真实 token 在
+    // ~/.codex-app-transfer/gemini-oauth.json,这里 await load + auto refresh 拿
+    // 当前可用 access_token,后面 inject_auth 用它注 Bearer。
+    let oauth_bearer: Option<String> = if matches!(
+        resolved.auth_scheme,
+        crate::resolver::AuthScheme::GoogleOauthCloudCode
+    ) {
+        let store = codex_app_transfer_gemini_oauth::TokenStore::from_home_env()
+            .map_err(|e| ForwardError::Header(format!("gemini OAuth token store: {e}")))?;
+        let token = codex_app_transfer_gemini_oauth::ensure_valid_access_token(&state.http, &store)
+            .await
+            .map_err(|e| ForwardError::Header(format!("gemini OAuth token unavailable: {e}")))?;
+        Some(token)
+    } else {
+        None
+    };
+
     let mut up = state
         .http
         .request(method.clone(), upstream_url)
@@ -607,7 +624,7 @@ async fn build_and_send_upstream(
         }
         up = up.header(name, value);
     }
-    up = inject_auth(up, resolved);
+    up = inject_auth(up, resolved, oauth_bearer.as_deref());
     for (name, value) in resolved.extra_headers.iter() {
         up = up.header(name, value);
     }
@@ -790,6 +807,7 @@ fn body_model(body: &[u8]) -> Option<String> {
 fn inject_auth(
     mut req: reqwest::RequestBuilder,
     resolved: &ResolvedProvider,
+    oauth_bearer: Option<&str>,
 ) -> reqwest::RequestBuilder {
     match resolved.auth_scheme {
         AuthScheme::Bearer => {
@@ -800,6 +818,13 @@ fn inject_auth(
         }
         AuthScheme::GoogleApiKey => {
             req = req.header("x-goog-api-key", resolved.api_key.clone());
+        }
+        AuthScheme::GoogleOauthCloudCode => {
+            // 调用方在 build_and_send_upstream 入口处已 await 过 OAuth token,
+            // 这里单纯 Bearer 注入。oauth_bearer 必须 Some(否则上游会 401)
+            if let Some(token) = oauth_bearer {
+                req = req.header("authorization", format!("Bearer {token}"));
+            }
         }
         AuthScheme::None => {}
     }

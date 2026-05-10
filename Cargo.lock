@@ -749,6 +749,7 @@ dependencies = [
  "bytes",
  "chrono",
  "codex-app-transfer-adapters",
+ "codex-app-transfer-gemini-oauth",
  "codex-app-transfer-registry",
  "futures-core",
  "futures-util",
