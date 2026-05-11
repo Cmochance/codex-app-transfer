@@ -98,6 +98,7 @@ pub fn convert_grok_sse_to_responses_sse(
         open_reasoning: None,
         open_message: None,
         pending_url_citations: Vec::new(),
+        grok_render_strip: GrokRenderStrip::new(),
     };
     // 先把 response.created 塞进 pending(unfold 第一步立即 yield)
     state.pending.push_back(initial_event);
@@ -112,6 +113,37 @@ pub fn convert_grok_sse_to_responses_sse(
                 // 2. 上游已 exhausted,看是否需要补 completed / failed 防御
                 if s.upstream_exhausted {
                     if !s.emitted_completed {
+                        // **strip finalize**(task 11):流末取出 strip 状态机残留 —
+                        // SuspectOpen 的 `<...` flush 回 user(silent-failure F3),
+                        // InsideRender/SuspectClose 的 truncation 加 sentinel(F2)。
+                        // trailing 非空时 open message 注入。
+                        let trailing = s.grok_render_strip.finalize();
+                        if !trailing.is_empty() {
+                            open_message_if_needed(&mut s);
+                            if let Some(msg) = s.open_message.as_mut() {
+                                msg.text_acc.push_str(&trailing);
+                                let item_id = msg.item_id.clone();
+                                let output_index = msg.output_index;
+                                s.pending.push_back(emit_output_text_delta_for_item(
+                                    &item_id,
+                                    output_index,
+                                    &trailing,
+                                ));
+                                s.received_any_final_token = true;
+                            }
+                        }
+                        // **silent-failure F1**:strip 吞过完整 block 但 message
+                        // 从未 open → 空 chat bubble。强制 open placeholder + close。
+                        if s.grok_render_strip.stripped_any_block()
+                            && s.open_message.is_none()
+                            && s.received_any_final_token
+                        {
+                            tracing::warn!(
+                                error_id = "GROK_RENDER_STRIP_EMPTY_MESSAGE",
+                                "grok_web: 所有 final token 被 <grok:render> strip 吞,open 占位 message 避免空 chat bubble"
+                            );
+                            open_message_if_needed(&mut s);
+                        }
                         // 流末/中断前 close 所有 open items(R1 PR-1 P1 + PR-3):
                         // - reasoning item 永远 in_progress 会让 Codex APP Thinking UI 卡
                         // - message item 同理
@@ -313,6 +345,194 @@ struct OpenMessage {
     annotations_acc: Vec<serde_json::Value>,
 }
 
+/// **`<grok:render>` 块跨 token 切线安全 strip 器**(2026-05-12 task 11)。
+///
+/// grok 真账号实测(2026-05-12 wire-dump),`messageTag=final` 流里会嵌入:
+/// ```text
+/// <grok:render card_id="92b206" card_type="image_card" type="render_searched_image">
+///   <argument name="image_id">2tZxC</argument>
+///   <argument name="size">"LARGE"</argument>
+/// </grok:render>
+/// ```
+/// 标签**不 self-closing**,open/close 之间含 inner content。token 切碎时 open
+/// tag 可能跨 2-3 token、close tag 同样。R3 PoC 直接透传 token → Codex APP
+/// chat UI 显示一堆 HTML-like 噪音。
+///
+/// 本结构用最小状态机 strip 整个 `<grok:render>...</grok:render>` 块:
+/// - **State::Text**:正常文本,直接产出
+/// - **State::SuspectOpen(buf)**:看到 `<` 开始累积,等够判断
+/// - **State::InsideRender { depth }**:确认在 `<grok:render>` 块内,吞所有字符
+///   (depth 计数嵌套 — 实测 wire 不嵌套,defensive)
+/// - **State::SuspectClose(buf)**:在块内但看到 `<`,等够判断是否 `</grok:render>`
+///
+/// **buf 移进 enum variants**(type-design-analyzer F1):
+/// 让 type system 强制"Text/InsideRender 无 buf"的 invariant,消除"buf 在哪些
+/// state 有意义"的注释依赖。
+///
+/// **不替换**为 image markdown(v1 scope:仅消除噪音);后续 v2 加 markdown
+/// image link 注入(基于 `cardAttachmentsJson` 反查 image_url)。
+#[derive(Debug, Default)]
+struct GrokRenderStrip {
+    state: GrokRenderStripState,
+    /// **silent-failure-hunter F1**:本流是否曾吞过完整 `<grok:render>` 块。
+    /// 若 final token 全被 strip 吞 → received_any_final_token=true 但 message
+    /// 从未 open → Codex APP 看到 response.completed 但空 message bubble。
+    /// stream-end guard 用此字段判断是否 emit failure / placeholder。
+    stripped_any_block: bool,
+}
+
+#[derive(Debug, Default)]
+enum GrokRenderStripState {
+    #[default]
+    Text,
+    /// 看到 `<` 但还没拼到 `<grok:render` 完整前缀。buf 含 `<` 起头的所有累积。
+    SuspectOpen(String),
+    /// 在 `<grok:render>` 块内,吞所有字符直到 `</grok:render>` close tag。
+    /// `depth` 防御 hypothetical 嵌套(实测 wire 不嵌套,但 code-reviewer #1
+    /// 指出嵌套会让外层 close 把文本 leak 到 UI;加 depth 兜底)。
+    InsideRender { depth: u32 },
+    /// 在 InsideRender 期间看到 `<`,可能是 `</grok:render>` 开始 / 嵌套 open。
+    SuspectClose { buf: String, depth: u32 },
+}
+
+impl GrokRenderStrip {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入一个 token chunk,返回应输出的 clean text(可能为空字符串)。
+    ///
+    /// 调用方按 token 切片逐次调用,内部累积 buffer。本方法**不**保证消费完
+    /// 全部 buf —— 若 token 末尾有未闭合的 SuspectOpen,buf 留到下次 feed。
+    /// 流末调用 [`finalize`](Self::finalize) 取出可能残留的 SuspectOpen buf。
+    fn feed(&mut self, token: &str) -> String {
+        let mut out = String::with_capacity(token.len());
+        const OPEN_PREFIX: &str = "<grok:render";
+        const CLOSE_TAG: &str = "</grok:render>";
+        for ch in token.chars() {
+            // 取出 state(置 Text 占位,稍后写回),让 owned 转换避免 borrow checker
+            let cur = std::mem::take(&mut self.state);
+            self.state = match cur {
+                GrokRenderStripState::Text => {
+                    if ch == '<' {
+                        let mut buf = String::with_capacity(OPEN_PREFIX.len());
+                        buf.push(ch);
+                        GrokRenderStripState::SuspectOpen(buf)
+                    } else {
+                        out.push(ch);
+                        GrokRenderStripState::Text
+                    }
+                }
+                GrokRenderStripState::SuspectOpen(mut buf) => {
+                    buf.push(ch);
+                    if OPEN_PREFIX.starts_with(buf.as_str()) {
+                        // 仍 maybe matching(buf 是 OPEN_PREFIX 真前缀,可能含完整 prefix)
+                        GrokRenderStripState::SuspectOpen(buf)
+                    } else if buf.starts_with(OPEN_PREFIX) {
+                        // buf 完整匹配 prefix + 一个边界字符(space / `>` / attrs 起头)
+                        // → 进 InsideRender depth=1。buf 内容(已含部分 tag 内部)丢弃
+                        tracing::debug!(
+                            error_id = "GROK_RENDER_STRIP_OPEN",
+                            "grok_web: <grok:render> open detected, entering strip mode"
+                        );
+                        self.stripped_any_block = true;
+                        GrokRenderStripState::InsideRender { depth: 1 }
+                    } else {
+                        // buf 不再 match prefix(如 `<x`),整段 flush 回 output,回 Text
+                        out.push_str(&buf);
+                        GrokRenderStripState::Text
+                    }
+                }
+                GrokRenderStripState::InsideRender { depth } => {
+                    if ch == '<' {
+                        let mut buf = String::with_capacity(CLOSE_TAG.len());
+                        buf.push(ch);
+                        GrokRenderStripState::SuspectClose { buf, depth }
+                    } else {
+                        // 其他字符丢弃(在 render 块内)
+                        GrokRenderStripState::InsideRender { depth }
+                    }
+                }
+                GrokRenderStripState::SuspectClose { mut buf, depth } => {
+                    buf.push(ch);
+                    if CLOSE_TAG.starts_with(buf.as_str()) {
+                        if buf.len() == CLOSE_TAG.len() {
+                            // 完整 close tag,depth-1;若 depth 归 0 回 Text
+                            let new_depth = depth.saturating_sub(1);
+                            if new_depth == 0 {
+                                GrokRenderStripState::Text
+                            } else {
+                                GrokRenderStripState::InsideRender { depth: new_depth }
+                            }
+                        } else {
+                            // 仍 maybe matching close,继续累积
+                            GrokRenderStripState::SuspectClose { buf, depth }
+                        }
+                    } else if OPEN_PREFIX.starts_with(buf.as_str()) {
+                        // 不像 close,但像 inner open(嵌套 `<grok:render`)。
+                        // 继续累积,等够长后判定嵌套 → depth+1 + InsideRender
+                        if buf.starts_with(OPEN_PREFIX) {
+                            // 嵌套 open 确认,depth+1
+                            GrokRenderStripState::InsideRender {
+                                depth: depth.saturating_add(1),
+                            }
+                        } else {
+                            // buf 仍是 OPEN_PREFIX 真前缀,继续 SuspectClose 累积
+                            GrokRenderStripState::SuspectClose { buf, depth }
+                        }
+                    } else {
+                        // 不是 close 也不是嵌套 open(如 `<argument>` inner),
+                        // 整段丢弃回 InsideRender 同 depth
+                        GrokRenderStripState::InsideRender { depth }
+                    }
+                }
+            };
+        }
+        out
+    }
+
+    /// 流末调用:取出可能残留的 SuspectOpen buf(那是用户原本可见的 `<...` 文本,
+    /// 在流末因协议中断没等到下个 char 来判定,**不能静默丢失**)。
+    ///
+    /// **行为**:
+    /// - `Text` → 返回空 string(无残留)
+    /// - `SuspectOpen(buf)` → 返回 buf(flush 回 user,silent-failure F3 修)
+    /// - `InsideRender` / `SuspectClose` → 返回 `"\n[grok render block truncated]"`
+    ///   sentinel(silent-failure F2 修:user 看到协议截断信号,而不是消息突然结束)
+    ///   同时 emit `tracing::warn!` 让 operator 看清
+    fn finalize(&mut self) -> String {
+        let cur = std::mem::take(&mut self.state);
+        match cur {
+            GrokRenderStripState::Text => String::new(),
+            GrokRenderStripState::SuspectOpen(buf) => {
+                tracing::warn!(
+                    error_id = "GROK_RENDER_STRIP_TRAILING_LT",
+                    flushed_chars = buf.len(),
+                    "grok_web: stream ended mid-SuspectOpen, flushing `<...` back to user output"
+                );
+                buf
+            }
+            GrokRenderStripState::InsideRender { depth }
+            | GrokRenderStripState::SuspectClose { depth, .. } => {
+                tracing::warn!(
+                    error_id = "GROK_RENDER_STRIP_TRUNCATED",
+                    %depth,
+                    "grok_web: stream ended mid-<grok:render> block, appending truncation sentinel"
+                );
+                "\n[grok render block truncated]".to_owned()
+            }
+        }
+    }
+
+    /// 流末判断是否需要 placeholder message:strip 吞过完整 block 但**没**有
+    /// 别的 clean text 触发 open_message → Codex APP 会看到 zero-output_item
+    /// 的 `response.completed`(空 chat bubble)。返 true 时调用方应 open
+    /// 一个 placeholder message。silent-failure-hunter F1 修。
+    fn stripped_any_block(&self) -> bool {
+        self.stripped_any_block
+    }
+}
+
 /// `unfold` 内部状态。
 struct ConvState {
     upstream: ByteStream,
@@ -337,6 +557,16 @@ struct ConvState {
     /// thinking 阶段累积的 url citation(webSearchResults / xSearchResults),
     /// 第一个 final token 触发 open_message 后 flush 为 annotation.added 事件。
     pending_url_citations: Vec<serde_json::Value>,
+    /// **grok:render 块跨 token 切线安全 strip 器**(2026-05-12 task 11):
+    /// grok 把 inline image card / search card 引用嵌进 message text:
+    ///   `<grok:render card_id="..." card_type="image_card" ...>
+    ///      <argument name="...">...</argument>
+    ///    </grok:render>`
+    /// streaming 时 open/close tag 可能跨 2-3 个 token 切碎,需要 stateful
+    /// buffer 累积。本字段是 strip 器的内部 buffer:遇到 `<` 开始 buffer,
+    /// 累积到能判断"在 grok:render 内"或"安全文本";完整 close tag 出现
+    /// 后丢弃整块,emit 后续 safe text。
+    grok_render_strip: GrokRenderStrip,
 }
 
 /// 从 `line_buf` 切出所有完整 line,parse 成 Codex SSE events 入 pending。
@@ -411,18 +641,29 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
     if matches!(tag, Some(GrokMessageTag::Final)) && frame.is_thinking != Some(true) {
         if let Some(tok) = &frame.token {
             if !tok.is_empty() {
-                open_message_if_needed(state);
-                if let Some(msg) = state.open_message.as_mut() {
-                    msg.text_acc.push_str(tok);
-                    let item_id = msg.item_id.clone();
-                    let output_index = msg.output_index;
-                    state.pending.push_back(emit_output_text_delta_for_item(
-                        &item_id,
-                        output_index,
-                        tok,
-                    ));
+                // **grok:render 块剥离**(task 11):每个 final token 先喂进
+                // GrokRenderStrip,产出 clean text(可能为空 —— 整 token 都在
+                // grok:render 块内被吞)。剥离器跨 token buffer,保证 open/close
+                // tag 切线安全。本轮没有产出的部分留 buffer,等下个 token。
+                let clean = state.grok_render_strip.feed(tok);
+                if !clean.is_empty() {
+                    open_message_if_needed(state);
+                    if let Some(msg) = state.open_message.as_mut() {
+                        msg.text_acc.push_str(&clean);
+                        let item_id = msg.item_id.clone();
+                        let output_index = msg.output_index;
+                        state.pending.push_back(emit_output_text_delta_for_item(
+                            &item_id,
+                            output_index,
+                            &clean,
+                        ));
+                        state.received_any_final_token = true;
+                        flush_pending_url_citations(state);
+                    }
+                } else {
+                    // token 全被吞但仍要记 received_any_final_token,防止流末
+                    // 误判"上游中断未收到任何最终 token"补 response.failed
                     state.received_any_final_token = true;
-                    flush_pending_url_citations(state);
                 }
             }
         }
@@ -488,6 +729,33 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
                 grok_response_id = %grok_response_id,
                 "recorded parent_response mapping for multi-turn anchoring"
             );
+        }
+        // **cardAttachmentsJson → markdown image links**(task 11 v1 增强,user 反馈):
+        // strip 把 `<grok:render card_id="X" .../>` inline tag 吞掉了,但 grok 在
+        // modelResponse 帧附带 cardAttachmentsJson(实测 wire-dump:3 张景点图片
+        // image_card),user 在 Codex APP 完全看不到。本段把图片转 markdown
+        // `![title](url)` 拼到 message 末尾(失去 inline 位置但保留图片可见性)。
+        if state.grok_render_strip.stripped_any_block() {
+            let cards_md = format_card_attachments_as_markdown(model_response);
+            if !cards_md.is_empty() {
+                open_message_if_needed(state);
+                if let Some(msg) = state.open_message.as_mut() {
+                    msg.text_acc.push_str(&cards_md);
+                    let item_id = msg.item_id.clone();
+                    let output_index = msg.output_index;
+                    state.pending.push_back(emit_output_text_delta_for_item(
+                        &item_id,
+                        output_index,
+                        &cards_md,
+                    ));
+                    state.received_any_final_token = true;
+                    tracing::debug!(
+                        error_id = "GROK_RENDER_CARDS_APPENDED",
+                        len = cards_md.len(),
+                        "grok_web: appended cardAttachments as markdown images to message tail"
+                    );
+                }
+            }
         }
     }
 
@@ -750,6 +1018,97 @@ fn format_code_execution_result_for_reasoning(cer: &serde_json::Value) -> String
         }
     }
     s
+}
+
+/// 把 `modelResponse.cardAttachmentsJson` 转 markdown image / link 块,追加到
+/// message 末尾(task 11 v1 user 反馈:strip 把 `<grok:render>` 吞了,
+/// cardAttachments 数据完全丢失,user 看不到 grok 找到的图片)。
+///
+/// 实测 wire-dump cardAttachmentsJson 数组每项是 JSON-stringified object:
+/// ```json
+/// {"id":"92b206","type":"render_searched_image","cardType":"image_card",
+///  "image":{"thumbnail":"https://...","source":"Alamy",
+///           "title":"Brandenburg Gate","link":"https://...",
+///           "original":"https://...","original_width":1300,
+///           "original_height":956,"image_id":"2tZxC"},
+///  "size":"LARGE"}
+/// ```
+///
+/// 转换策略:
+/// - cardType=image_card → `![title](thumbnail) — [source](link)\n`
+/// - 其他 cardType:fallback 显示 type + id(不丢信息)
+/// - 全块前置 `\n\n---\n**📎 相关图片 (N)**\n\n` 分隔
+///
+/// 失去 inline 位置但保留可见性(streaming 时 cardAttachmentsJson 还没到,
+/// 不能 inline 替换)。v2 followup:如果 grok 后续 stream 帧能提前 emit
+/// cardAttachments,改成 streaming inline 替换。
+fn format_card_attachments_as_markdown(model_response: &serde_json::Value) -> String {
+    let Some(cards) = model_response
+        .get("cardAttachmentsJson")
+        .and_then(|v| v.as_array())
+    else {
+        return String::new();
+    };
+    if cards.is_empty() {
+        return String::new();
+    }
+    let parsed: Vec<serde_json::Value> = cards
+        .iter()
+        .filter_map(|c| match c {
+            // cardAttachmentsJson 数组元素是 JSON-stringified object,要解二次
+            serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+            // 防御:已经是 object 也接受(协议可能变)
+            v if v.is_object() => Some(v.clone()),
+            _ => None,
+        })
+        .collect();
+    if parsed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("\n\n---\n**📎 相关图片 (");
+    out.push_str(&parsed.len().to_string());
+    out.push_str(")**\n\n");
+    for card in &parsed {
+        let card_type = card
+            .get("cardType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        match card_type {
+            "image_card" => {
+                let image = card.get("image");
+                let title = image
+                    .and_then(|i| i.get("title"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(untitled)");
+                let thumb = image
+                    .and_then(|i| i.get("thumbnail"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let source = image
+                    .and_then(|i| i.get("source"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("source");
+                let link = image
+                    .and_then(|i| i.get("link"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !thumb.is_empty() {
+                    out.push_str(&format!("![{title}]({thumb})"));
+                }
+                if !link.is_empty() {
+                    out.push_str(&format!(" — [{source}]({link})"));
+                }
+                out.push('\n');
+            }
+            _ => {
+                // 未识别 cardType 不丢信息:emit type + id 行让 user 看到 grok 给过什么
+                let id = card.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                out.push_str(&format!("- `{card_type}` (id={id})\n"));
+            }
+        }
+    }
+    out
 }
 
 /// 截断长输出防 reasoning summary 爆长。按字节截断 + UTF-8 边界对齐。
@@ -1254,6 +1613,227 @@ fn emit_event(event: &str, data: serde_json::Value) -> Bytes {
     out.push_str(&data.to_string());
     out.push_str("\n\n");
     Bytes::from(out)
+}
+
+#[cfg(test)]
+mod grok_render_strip_tests {
+    use super::*;
+
+    #[test]
+    fn passthrough_plain_text() {
+        let mut s = GrokRenderStrip::new();
+        assert_eq!(s.feed("hello world"), "hello world");
+        assert_eq!(s.feed(" more"), " more");
+    }
+
+    #[test]
+    fn strip_single_block_inline() {
+        let mut s = GrokRenderStrip::new();
+        // 单 token 含完整 block
+        let out = s.feed(r#"before <grok:render card_id="92b206" card_type="image_card" type="render_searched_image"><argument name="image_id">2tZxC</argument><argument name="size">"LARGE"</argument></grok:render> after"#);
+        assert_eq!(out, "before  after");
+    }
+
+    #[test]
+    fn strip_block_split_across_two_tokens_open_tag_boundary() {
+        // open tag 跨 token 切线:第一个 token 在 `<grok:re` 处切
+        let mut s = GrokRenderStrip::new();
+        assert_eq!(s.feed("text <grok:re"), "text "); // `<grok:re` 累积在 buf
+        let out = s.feed(r#"nder card_id="x"><argument name="a">v</argument></grok:render> tail"#);
+        assert_eq!(out, " tail");
+    }
+
+    #[test]
+    fn strip_block_split_across_three_tokens() {
+        let mut s = GrokRenderStrip::new();
+        assert_eq!(s.feed("A <"), "A ");
+        assert_eq!(s.feed("grok:render card_id=\"x\">inner"), "");
+        // close tag 也跨切线
+        assert_eq!(s.feed("</grok:rend"), "");
+        assert_eq!(s.feed("er> B"), " B");
+    }
+
+    #[test]
+    fn lone_less_than_passes_through_when_not_grok_render() {
+        let mut s = GrokRenderStrip::new();
+        // `<x` 不是 grok:render → flush 回 output,回 Text
+        assert_eq!(s.feed("price < 100"), "price < 100");
+    }
+
+    #[test]
+    fn html_like_other_tag_passes_through() {
+        let mut s = GrokRenderStrip::new();
+        // `<a href=...>` 不 match `<grok:render` 前缀 → 早期 flush
+        assert_eq!(s.feed("<a href=\"x\">link</a>"), "<a href=\"x\">link</a>");
+    }
+
+    #[test]
+    fn multiple_blocks_in_sequence() {
+        let mut s = GrokRenderStrip::new();
+        let out = s.feed(r#"x <grok:render card_id="a">..</grok:render> y <grok:render card_id="b">..</grok:render> z"#);
+        assert_eq!(out, "x  y  z");
+    }
+
+    #[test]
+    fn unclosed_block_at_stream_end_keeps_buffered() {
+        // 流末没等到 close → 整个 buffered 区被静默吞(grok.com 协议 break
+        // 情况;后续 token 永远不来,buffer 永远不 flush。这跟 raw 泄漏比
+        // 是更可接受的 fail mode)。
+        let mut s = GrokRenderStrip::new();
+        assert_eq!(
+            s.feed("safe <grok:render card_id=\"x\">incomplete"),
+            "safe "
+        );
+        // 没有后续 token,buffer 卡死 InsideRender,但 safe text 已 emit
+    }
+
+    #[test]
+    fn closing_angle_inside_render_block_handled() {
+        // `<argument ...>v</argument>` 嵌套在 render 内,inner `<` 不破坏整体
+        let mut s = GrokRenderStrip::new();
+        let out =
+            s.feed(r#"a<grok:render card_id="x"><argument name="k">"v"</argument></grok:render>b"#);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn nested_grok_render_handled_by_depth_counter() {
+        // code-reviewer #1 修:嵌套场景 outer close 不会让 `</grok:render>` 文本
+        // 泄漏到 UI。depth=2 时第一个 close → depth=1 InsideRender,第二个 close
+        // → depth=0 Text。结果 `ab`。
+        let mut s = GrokRenderStrip::new();
+        let out = s.feed(
+            r#"a<grok:render card_id="x">x<grok:render card_id="y">y</grok:render>z</grok:render>b"#,
+        );
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn finalize_flushes_trailing_suspect_open_back_to_output() {
+        // silent-failure F3 修:流末 SuspectOpen 残留 `<` 不该静默丢失
+        let mut s = GrokRenderStrip::new();
+        let mid = s.feed("price <");
+        assert_eq!(mid, "price ");
+        let trailing = s.finalize();
+        assert_eq!(trailing, "<");
+    }
+
+    #[test]
+    fn finalize_inside_render_returns_truncation_sentinel() {
+        // silent-failure F2 修:流末 mid-block → sentinel
+        let mut s = GrokRenderStrip::new();
+        s.feed("text <grok:render card_id=\"x\">incomplete");
+        let trailing = s.finalize();
+        assert!(
+            trailing.contains("grok render block truncated"),
+            "expected truncation sentinel, got: {trailing:?}"
+        );
+    }
+
+    #[test]
+    fn stripped_any_block_flag_tracked() {
+        // silent-failure F1:stream end placeholder gate 依赖此 flag
+        let mut s = GrokRenderStrip::new();
+        s.feed("plain text only");
+        assert!(!s.stripped_any_block(), "无 block,flag 应 false");
+        s.feed("<grok:render card_id=\"x\">..</grok:render>");
+        assert!(s.stripped_any_block(), "stripped block 后 flag 应 true");
+    }
+
+    #[test]
+    fn finalize_idempotent_after_text_state() {
+        let mut s = GrokRenderStrip::new();
+        s.feed("hello");
+        assert_eq!(s.finalize(), "");
+        let out = s.feed(" world");
+        assert_eq!(out, " world");
+    }
+}
+
+#[cfg(test)]
+mod card_attachments_markdown_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn empty_or_missing_returns_empty() {
+        let mr = json!({});
+        assert!(format_card_attachments_as_markdown(&mr).is_empty());
+        let mr = json!({"cardAttachmentsJson": []});
+        assert!(format_card_attachments_as_markdown(&mr).is_empty());
+    }
+
+    #[test]
+    fn image_card_renders_markdown_image_with_source_link() {
+        // 实测 wire-dump 形态:cardAttachmentsJson 数组每项是 JSON-stringified object
+        let card_str = serde_json::to_string(&json!({
+            "id": "92b206",
+            "type": "render_searched_image",
+            "cardType": "image_card",
+            "image": {
+                "thumbnail": "https://serpapi.com/images/x.jpeg",
+                "source": "Alamy",
+                "title": "Brandenburg Gate",
+                "link": "https://www.alamy.com/x",
+                "image_id": "2tZxC"
+            },
+            "size": "LARGE"
+        }))
+        .unwrap();
+        let mr = json!({"cardAttachmentsJson": [card_str]});
+        let out = format_card_attachments_as_markdown(&mr);
+        assert!(out.contains("📎 相关图片 (1)"));
+        assert!(
+            out.contains("![Brandenburg Gate](https://serpapi.com/images/x.jpeg)"),
+            "missing image markdown, got: {out}"
+        );
+        assert!(out.contains("[Alamy](https://www.alamy.com/x)"));
+    }
+
+    #[test]
+    fn multiple_image_cards_all_appear() {
+        let make = |id: &str, title: &str| {
+            serde_json::to_string(&json!({
+                "id": id, "cardType": "image_card",
+                "image": {
+                    "thumbnail": format!("https://t/{id}"),
+                    "source": "S",
+                    "title": title,
+                    "link": format!("https://l/{id}"),
+                }
+            }))
+            .unwrap()
+        };
+        let mr = json!({"cardAttachmentsJson": [make("a","A"), make("b","B"), make("c","C")]});
+        let out = format_card_attachments_as_markdown(&mr);
+        assert!(out.contains("(3)"));
+        assert!(out.contains("![A]"));
+        assert!(out.contains("![B]"));
+        assert!(out.contains("![C]"));
+    }
+
+    #[test]
+    fn unknown_card_type_falls_back_to_safe_listing() {
+        let card_str = serde_json::to_string(&json!({
+            "id": "xyz123", "cardType": "future_card_type_we_dont_know_yet"
+        }))
+        .unwrap();
+        let mr = json!({"cardAttachmentsJson": [card_str]});
+        let out = format_card_attachments_as_markdown(&mr);
+        assert!(out.contains("future_card_type"));
+        assert!(out.contains("id=xyz123"));
+    }
+
+    #[test]
+    fn already_parsed_object_accepted_as_defensive_fallback() {
+        // 协议如果改成直接 object 而不是 stringified,仍然 work
+        let mr = json!({"cardAttachmentsJson": [{
+            "id": "a", "cardType": "image_card",
+            "image": {"thumbnail": "https://t/a", "source": "S", "title": "T", "link": "https://l/a"}
+        }]});
+        let out = format_card_attachments_as_markdown(&mr);
+        assert!(out.contains("![T](https://t/a)"));
+    }
 }
 
 #[cfg(test)]
