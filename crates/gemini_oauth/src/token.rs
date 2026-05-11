@@ -21,7 +21,10 @@ use super::constants::REFRESH_BUFFER_SECS;
 
 #[derive(Debug, Error)]
 pub enum TokenError {
-    #[error("HOME 环境变量未设置,无法定位 token 持久化目录")]
+    /// 用户主目录环境变量都缺失 —— Unix 上一般是 `$HOME`,Windows 上一般是
+    /// `%USERPROFILE%`(GUI 进程下 `HOME` 通常没被设过)。变体名保留 `HomeNotSet`
+    /// 以维持 ABI;消息覆盖两个 env var 让 Windows 报错也能自解释。
+    #[error("无法定位 token 持久化目录:HOME 与 USERPROFILE 环境变量都未设置")]
     HomeNotSet,
     #[error("token 文件 IO 失败: {0}")]
     Io(#[from] std::io::Error),
@@ -87,6 +90,34 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 解析当前用户主目录,`HOME` 优先,`USERPROFILE` 回退。
+///
+/// Tauri / desktop_app 在 Windows 下被打包成 GUI 进程时一般**不带** `HOME`
+/// 环境变量(只有 MSYS / Git Bash / 手动 set 才会有),OS 默认给的是
+/// `%USERPROFILE%`。这里复刻 `crates/registry/src/paths.rs::resolve_home` 与
+/// `crates/codex_integration/src/paths.rs::CodexPaths::from_home_env` 的语义,
+/// 让 token store 在 macOS / Linux / Windows 上行为一致。空字符串视作未设置。
+fn resolve_home_dir() -> Option<PathBuf> {
+    resolve_home_dir_from(|k| std::env::var_os(k))
+}
+
+/// `resolve_home_dir` 的纯函数版本 —— 通过注入 env getter 给单测调用,避免
+/// 在测试中跨线程改进程级环境变量(Rust 1.78+ `std::env::set_var` 在多线程
+/// 下为 `unsafe`,gemini_oauth crate 默认并发 test runner)。
+fn resolve_home_dir_from<F>(get_env: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(raw) = get_env(key) {
+            if !raw.is_empty() {
+                return Some(PathBuf::from(raw));
+            }
+        }
+    }
+    None
+}
+
 /// Token 持久化句柄 —— 封装 `~/.codex-app-transfer/gemini-oauth.json` 路径
 /// 解析 + atomic write(temp + rename)+ secure permissions(Unix 0600)。
 pub struct TokenStore {
@@ -94,21 +125,24 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
-    /// 用 `$HOME/.codex-app-transfer/gemini-oauth.json` 默认路径(gemini-cli)。
-    /// **新代码**(支持多 OAuth provider)请用 [`for_token_filename`]
-    /// 显式指定文件名。本 fn 等价 `for_token_filename("gemini-oauth.json")`。
+    /// 用 `<home>/.codex-app-transfer/gemini-oauth.json` 默认路径(gemini-cli)。
+    /// `<home>` 解析优先级:`HOME` → `USERPROFILE`(Windows GUI 进程默认只设
+    /// `USERPROFILE`,无 `HOME`,所以必须 fallback)。**新代码**(支持多 OAuth
+    /// provider)请用 [`Self::for_token_filename`] 显式指定文件名;本 fn 等价
+    /// `for_token_filename("gemini-oauth.json")`。
     pub fn from_home_env() -> Result<Self, TokenError> {
         Self::for_token_filename("gemini-oauth.json")
     }
 
-    /// 用 `$HOME/.codex-app-transfer/<filename>` 路径,让多个 OAuth provider
+    /// 用 `<home>/.codex-app-transfer/<filename>` 路径,让多个 OAuth provider
     /// 共存(eg `gemini-oauth.json` vs `antigravity-oauth.json`)。filename
-    /// 来自 `OauthProviderConfig::token_filename`。
+    /// 来自 `OauthProviderConfig::token_filename`。`<home>` 解析同
+    /// [`Self::from_home_env`],`HOME` → `USERPROFILE` 回退,**Windows GUI 进程
+    /// 一律走 `USERPROFILE`**,与 `crates/codex_integration::CodexPaths` /
+    /// `crates/registry::paths::resolve_home` 保持一致。
     pub fn for_token_filename(filename: &str) -> Result<Self, TokenError> {
-        let home = std::env::var_os("HOME").ok_or(TokenError::HomeNotSet)?;
-        let path = PathBuf::from(home)
-            .join(".codex-app-transfer")
-            .join(filename);
+        let home = resolve_home_dir().ok_or(TokenError::HomeNotSet)?;
+        let path = home.join(".codex-app-transfer").join(filename);
         Ok(Self { path })
     }
 
@@ -287,6 +321,69 @@ mod tests {
         let meta = std::fs::metadata(store.path()).unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "token 文件必须 0600,实际 {mode:o}");
+    }
+
+    #[test]
+    fn resolve_home_prefers_home_over_userprofile() {
+        let env = |k: &str| match k {
+            "HOME" => Some(std::ffi::OsString::from("/Users/me")),
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\me")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_home_dir_from(env),
+            Some(PathBuf::from("/Users/me")),
+            "HOME 若存在必须优先于 USERPROFILE,保证 Mac/Linux 行为不变"
+        );
+    }
+
+    #[test]
+    fn resolve_home_falls_back_to_userprofile_on_windows() {
+        let env = |k: &str| match k {
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\me")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_home_dir_from(env),
+            Some(PathBuf::from(r"C:\Users\me")),
+            "Windows GUI 进程没有 HOME 时必须走 USERPROFILE,这是本次 fix 的核心"
+        );
+    }
+
+    #[test]
+    fn resolve_home_treats_empty_strings_as_missing() {
+        // CI runner / 某些 shell 可能把 HOME 设成 "" 而不是 unset,既然这种值
+        // 在 Path 上拼起来等价 ".",直接当未设置避免后续误写到 cwd
+        let env = |k: &str| match k {
+            "HOME" => Some(std::ffi::OsString::new()),
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\me")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_home_dir_from(env),
+            Some(PathBuf::from(r"C:\Users\me")),
+            "空字符串 HOME 应被视作未设置,继续 fallback 到 USERPROFILE"
+        );
+    }
+
+    #[test]
+    fn resolve_home_returns_none_when_both_missing() {
+        let env = |_k: &str| None;
+        assert_eq!(resolve_home_dir_from(env), None);
+    }
+
+    #[test]
+    fn homenotset_display_lists_both_env_vars() {
+        // 公共可观察契约:`HomeNotSet` 的 `Display` 必须同时点名 HOME +
+        // USERPROFILE,Windows 用户在前端 status warning 才能从字面理解错因
+        // (本次 fix 的核心 UX 契约)。变体名 `HomeNotSet` 保留以维持 ABI,
+        // 只 pin message 文本里两个 env var 名。
+        let err = TokenError::HomeNotSet;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HOME") && msg.contains("USERPROFILE"),
+            "HomeNotSet display 必须同时提到 HOME 和 USERPROFILE,实际:{msg}"
+        );
     }
 
     #[test]

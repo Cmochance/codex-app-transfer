@@ -655,7 +655,7 @@ async fn build_and_send_upstream(
                 codex_app_transfer_gemini_oauth::TokenStore::from_home_env().map_err(|e| {
                     ForwardError::OauthUnavailable {
                         reason: format!(
-                            "HOME directory unavailable; cannot locate token store: {e}"
+                            "home directory unavailable; cannot locate token store: {e}"
                         ),
                         needs_login: false,
                     }
@@ -673,7 +673,7 @@ async fn build_and_send_upstream(
             )
             .map_err(|e| ForwardError::OauthUnavailable {
                 reason: format!(
-                    "HOME directory unavailable; cannot locate antigravity token store: {e}"
+                    "home directory unavailable; cannot locate antigravity token store: {e}"
                 ),
                 needs_login: false,
             })?;
