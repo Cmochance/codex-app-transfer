@@ -231,6 +231,7 @@
     setProviderMappings(providerFormMappings);
     // OAuth 模式切换:apiFormat=gemini_cli_oauth 时隐藏 apiKey input,显示 OAuth UI
     setOauthRowState(canonical);
+    setCompatSoftConstraintsRow(canonical, $("#providerCompatSoftConstraints")?.value || "minimal");
   }
 
   // 控制 web_search 配置开关 row 的显示 + 初始 checkbox state + provider-specific
@@ -253,6 +254,29 @@
       const useKey = specificKey && t(specificKey) !== specificKey ? specificKey : fallbackKey;
       hint.dataset.i18n = useKey;
       hint.textContent = t(useKey);
+    }
+  }
+
+  function normalizeCompatSoftConstraints(value) {
+    const v = String(value || "").trim().toLowerCase();
+    if (["off", "disabled", "none"].includes(v)) return "off";
+    if (["strict", "verbose", "detailed"].includes(v)) return "strict";
+    return "minimal";
+  }
+
+  function supportsCompatSoftConstraints(apiFormat) {
+    const { canonical } = normalizeApiFormat(apiFormat);
+    return canonical === "gemini_native";
+  }
+
+  function setCompatSoftConstraintsRow(apiFormat, value = "minimal") {
+    const row = $("#providerCompatSoftConstraintsRow");
+    const select = $("#providerCompatSoftConstraints");
+    if (!row || !select) return;
+    const supported = supportsCompatSoftConstraints(apiFormat);
+    row.hidden = !supported;
+    if (supported) {
+      select.value = normalizeCompatSoftConstraints(value);
     }
   }
 
@@ -897,6 +921,8 @@
     // 状态(preset 不支持时 normalize 阶段会自动剥)。
     const webSearchRow = $("#providerWebSearchRow");
     const webSearchToggle = $("#providerWebSearchEnabled");
+    const compatRow = $("#providerCompatSoftConstraintsRow");
+    const compatSelect = $("#providerCompatSoftConstraints");
     if (webSearchRow && webSearchToggle && !webSearchRow.hidden) {
       formRequestOptions = {
         ...formRequestOptions,
@@ -912,6 +938,9 @@
       modelCapabilities: mappings ? capabilitiesForCurrentMappings(mappings) : normalizeCapabilities(formModelCapabilities),
       requestOptions: normalizeRequestOptions(formRequestOptions),
     };
+    if (compatRow && compatSelect && !compatRow.hidden) {
+      payload.compatSoftConstraints = normalizeCompatSoftConstraints(compatSelect.value);
+    }
     if (apiKey) {
       payload.apiKey = apiKey;
     }
@@ -1477,6 +1506,7 @@
     setApiFormatMode(false, "openai_chat");
     setOauthRowState("openai_chat"); // P2.2 reset OAuth row 隐藏
     setWebSearchRow(false, false, null);
+    setCompatSoftConstraintsRow("openai_chat", "minimal");
     setProviderMappings(emptyMappings());
     setUnverifiedBanner(false);
   }
@@ -1507,6 +1537,7 @@
     renderApiFormatDisplay(preset.apiFormat);
     setApiFormatMode(!!preset.allowApiFormatSelection, preset.apiFormat);
     setOauthRowState(preset.apiFormat); // P2.2 OAuth UI 切换
+    setCompatSoftConstraintsRow(preset.apiFormat, preset.compatSoftConstraints || "minimal");
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     // Web Search 配置开关:preset 标支持 + preset.requestOptions.web_search_enabled
@@ -1568,6 +1599,7 @@
     renderApiFormatDisplay(effectiveFormat);
     setApiFormatMode(false, effectiveFormat);
     setOauthRowState(effectiveFormat); // OAuth UI 切换(P2.2)
+    setCompatSoftConstraintsRow(effectiveFormat, provider.compatSoftConstraints || "minimal");
     // 编辑场景:支持判定走 matchedPreset.supportsWebSearch(自定义 provider 不命中
     // builtin → matchedPreset undefined → 不显示开关);初始 checkbox state 读
     // provider 实际保存的 requestOptions.web_search_enabled;hint 文案按

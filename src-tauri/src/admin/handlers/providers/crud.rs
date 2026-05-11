@@ -47,6 +47,16 @@ fn format_header_errs(errs: &[HeaderValidationError]) -> String {
     )
 }
 
+fn normalize_compat_soft_constraints(value: &str) -> Option<&'static str> {
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "off" | "disabled" | "none" => Some("off"),
+        "strict" | "verbose" | "detailed" => Some("strict"),
+        "minimal" | "" => Some("minimal"),
+        _ => None,
+    }
+}
+
 pub async fn list_providers() -> impl IntoResponse {
     let cfg = match load_registry() {
         Ok(c) => c,
@@ -115,6 +125,8 @@ pub struct AddProviderInput {
     pub model_capabilities: Option<Value>,
     #[serde(rename = "requestOptions")]
     pub request_options: Option<Value>,
+    #[serde(rename = "compatSoftConstraints")]
+    pub compat_soft_constraints: Option<String>,
 }
 
 pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
@@ -194,6 +206,14 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
             "requestOptions".into(),
             input.request_options.clone().unwrap_or_else(|| json!({})),
         );
+        if let Some(raw) = input.compat_soft_constraints.as_deref() {
+            if let Some(mode) = normalize_compat_soft_constraints(raw) {
+                new_provider.insert(
+                    "compatSoftConstraints".into(),
+                    Value::String(mode.to_owned()),
+                );
+            }
+        }
         new_provider.insert("isBuiltin".into(), Value::Bool(false));
         new_provider.insert("sortIndex".into(), Value::Number(providers.len().into()));
 
@@ -270,6 +290,16 @@ pub async fn update_provider(
         }
         if let Some(opts) = input.request_options.clone() {
             updated.insert("requestOptions".into(), opts);
+        }
+        if let Some(raw) = input.compat_soft_constraints.as_deref() {
+            if let Some(mode) = normalize_compat_soft_constraints(raw) {
+                updated.insert(
+                    "compatSoftConstraints".into(),
+                    Value::String(mode.to_owned()),
+                );
+            } else {
+                updated.remove("compatSoftConstraints");
+            }
         }
         if let Some(models) = input.models.clone() {
             if models.is_object() {

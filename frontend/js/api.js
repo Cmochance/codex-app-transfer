@@ -116,6 +116,7 @@
       extraHeaders: provider.extraHeaders || {},
       modelCapabilities: provider.modelCapabilities || {},
       requestOptions: provider.requestOptions || {},
+      compatSoftConstraints: provider.compatSoftConstraints || provider.compat_soft_constraints || '',
       default: provider.id === activeId,
       isBuiltin: !!provider.isBuiltin,
       mappings: {
@@ -163,6 +164,9 @@
       modelCapabilities: payload.modelCapabilities || {},
       requestOptions: payload.requestOptions || {},
     };
+    if (payload.compatSoftConstraints) {
+      body.compatSoftConstraints = payload.compatSoftConstraints;
+    }
     if (payload.apiKey) {
       body.apiKey = payload.apiKey;
     }

@@ -181,6 +181,15 @@
                 </div>
                 <p class="field-hint" id="providerWebSearchHint" data-i18n="providersAdd.webSearchEnabledHint.default">启用后代理在出站请求注入 web_search 工具,让模型联网搜索。计费 / 限制取决于 provider。</p>
               </div>
+              <div class="mb-4" id="providerCompatSoftConstraintsRow" hidden>
+                <label class="form-label" for="providerCompatSoftConstraints" data-i18n="providersAdd.compatSoftConstraints">Gemini 兼容软约束</label>
+                <select class="form-control form-control-lg" id="providerCompatSoftConstraints">
+                  <option value="minimal" data-i18n="providersAdd.compatSoftConstraintsOptionMinimal">Minimal(默认)</option>
+                  <option value="off" data-i18n="providersAdd.compatSoftConstraintsOptionOff">Off(关闭)</option>
+                  <option value="strict" data-i18n="providersAdd.compatSoftConstraintsOptionStrict">Strict(详细)</option>
+                </select>
+                <p class="field-hint" id="providerCompatSoftConstraintsHint" data-i18n="providersAdd.compatSoftConstraintsHint">控制 Gemini 协议冲突时注入的兼容提示词强度:Minimal 降低语义干扰;Off 不注入提示(仍保留必要防 400 的协议降级);Strict 保留旧版详细提示。</p>
+              </div>
               <section class="provider-mapping-section">
                 <div class="section-title-row">
                   <div>
