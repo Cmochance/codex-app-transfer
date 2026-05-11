@@ -90,7 +90,27 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
         if normalized.is_empty() {
             continue;
         }
-        let Some(preset) = presets_index.get(&normalized) else {
+        let Some(candidates) = presets_index.get(&normalized) else {
+            continue;
+        };
+        // **多 preset 共 baseUrl 的歧义解决**:cloudcode-pa.googleapis.com 同
+        // 时给 gemini-cli-oauth 和 antigravity-oauth 两个 preset 用。原实现按
+        // baseUrl 反查 preset(单 map)会让后插入的 preset 覆盖前一个,user 加
+        // antigravity provider 后 healing 把它的 apiFormat 错改成 gemini_cli_oauth
+        // (404 / 路由错)。改用 candidate list + user 字段 disambiguate
+        // (2026-05-11 实测 user.apiFormat=gemini_cli_oauth 但 user.name=Antigravity
+        // 被 healing 错覆盖 gemini-cli 修)
+        let user_name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let user_api_format = obj
+            .get("apiFormat")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let Some(preset) = pick_matching_preset(candidates, &user_name, &user_api_format) else {
             continue;
         };
 
@@ -235,8 +255,8 @@ pub fn heal_builtin_extra_headers(cfg: &mut Value) {
 /// 其中任一被用户使用都视作命中该 preset。如果两个 preset 在 normalize 后
 /// 撞到同一 key(理论上不该出现,因为不同上游的 host 不同),后写入的覆盖前者
 /// —— 这种冲突应在 preset 数据评审时拦截,运行时不做特殊处理。
-fn build_preset_index() -> HashMap<String, Map<String, Value>> {
-    let mut idx = HashMap::new();
+fn build_preset_index() -> HashMap<String, Vec<Map<String, Value>>> {
+    let mut idx: HashMap<String, Vec<Map<String, Value>>> = HashMap::new();
     for preset in builtin_presets().iter() {
         let Some(obj) = preset.as_object() else {
             continue;
@@ -259,10 +279,52 @@ fn build_preset_index() -> HashMap<String, Map<String, Value>> {
             if norm.is_empty() {
                 continue;
             }
-            idx.insert(norm, obj.clone());
+            idx.entry(norm).or_default().push(obj.clone());
         }
     }
     idx
+}
+
+/// 多 preset 共用同一 baseUrl 时(eg gemini-cli-oauth + antigravity-oauth 都
+/// 走 cloudcode-pa 系列)按用户 provider 字段挑最匹配的那条。
+/// 优先级:**name 完全匹配** > **apiFormat 一致** > 单 preset(无 ambiguity)。
+/// 三个都不命中 → 返 None(不强制 healing,避免把 antigravity 错改成 gemini-cli)
+fn pick_matching_preset<'a>(
+    candidates: &'a [Map<String, Value>],
+    user_name: &str,
+    user_api_format: &str,
+) -> Option<&'a Map<String, Value>> {
+    if candidates.len() == 1 {
+        return candidates.first();
+    }
+    // 1. name 完全匹配(case-insensitive trim)— 最强信号,user 自定义 name
+    //    一般会跟 preset.name 一致(或者改了但保留前缀)
+    let un = user_name.trim().to_lowercase();
+    if !un.is_empty() {
+        if let Some(p) = candidates.iter().find(|p| {
+            p.get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_lowercase() == un)
+                .unwrap_or(false)
+        }) {
+            return Some(p);
+        }
+    }
+    // 2. apiFormat 匹配 — user provider 用 antigravity_oauth 想要 antigravity preset
+    let uaf = user_api_format.trim().to_lowercase();
+    if !uaf.is_empty() {
+        if let Some(p) = candidates.iter().find(|p| {
+            p.get("apiFormat")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_lowercase() == uaf)
+                .unwrap_or(false)
+        }) {
+            return Some(p);
+        }
+    }
+    // 3. 多个候选但 name + apiFormat 都没法 disambiguate → 不强制 healing
+    //    (返 None 让 user 字段保留,避免错覆盖。preset evolution 时这是更稳的选择)
+    None
 }
 
 #[cfg(test)]

@@ -129,8 +129,10 @@ mod tests {
             "preset apiFormat 必须用 canonical 形 antigravity_oauth"
         );
         assert_eq!(
-            a["baseUrl"], "https://cloudcode-pa.googleapis.com",
-            "antigravity 跟 gemini-cli 共用 cloudcode-pa 上游"
+            a["baseUrl"], "https://daily-cloudcode-pa.googleapis.com",
+            "antigravity 用 daily host(CLIProxyAPI antigravityBaseURLFallbackOrder \
+             chat 路径主 host = daily),prod 是 429 fallback。跟 gemini-cli 不同 \
+             (gemini-cli 用 prod cloudcode-pa)"
         );
         assert_eq!(a["isBuiltin"], true);
     }

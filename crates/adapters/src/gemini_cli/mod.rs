@@ -122,20 +122,73 @@ impl Adapter for GeminiCliAdapter {
             crate::gemini_native::request::responses_body_to_gemini_request(&parsed, provider)?;
         let mut inner_value = serde_json::to_value(&inner).map_err(AdapterError::BodyDecode)?;
 
-        // **cloud-code wire 兼容性**:`tool_config.includeServerSideToolInvocations`
-        // 仅在 generativelanguage(API key)/ Vertex 路径 proto 已实装;
-        // cloudcode-pa OAuth 路径 proto 当前**不识别**此字段,返
-        // `400 INVALID_ARGUMENT: Unknown name "includeServerSideToolInvocations"`
-        // (实测 2026-05-11 Gemini 3 + Codex tools 触发)。CLIProxyAPI / gemini-cli
-        // upstream 在 cloudcode-pa 路径**都不发**此字段 — combined `tools: [
-        // {googleSearch:{}}, {functionDeclarations:[...]}]` 在 cloudcode-pa
-        // Gemini 3 模型上原生接受,不需要 flag。strip 后继续走。
+        // **cloud-code wire 兼容性 — 按 provider 分流**:
+        // - **gemini-cli OAuth**(cloudcode-pa via gemini-cli client_id):
+        //   cloudcode-pa OAuth 路径 proto **不识别** `includeServerSideToolInvocations`
+        //   返 400 `Unknown name`。CLIProxyAPI / gemini-cli upstream 都不发此字段
+        //   → strip
+        // - **antigravity OAuth**(cloudcode-pa via antigravity client_id):
+        //   反向 — 上游**要求**这个 flag = true 才能 combined tools(built-in +
+        //   function declarations),缺失返 400 `Please enable
+        //   tool_config.include_server_side_tool_invocations to use Built-in tools
+        //   with Function calling`(2026-05-11 实测)。**强制 set true**,
+        //   不依赖上游 responses_body_to_gemini_request 是否注入
+        // 不同 client_id 走不同 proto 分支 — Google 内部行为差异
+        let is_antigravity = is_antigravity_api_format(&provider.api_format);
         if let Some(obj) = inner_value.as_object_mut() {
+            // **toolConfig.includeServerSideToolInvocations 字段在 cloudcode-pa
+            // 任何 OAuth 路径(gemini-cli 或 antigravity)都不识别**(实测 2026-05-11
+            // 两条 client_id 路径都 400 "Unknown name ... Cannot find field"),
+            // 不管 camelCase / snake_case。先无条件 strip 两种形态。
+            // Google "Please enable" 提示是误导 — 该 flag 在公开 proto 不存在
             if let Some(tc) = obj.get_mut("toolConfig").and_then(|v| v.as_object_mut()) {
                 tc.remove("includeServerSideToolInvocations");
-                // 如果 toolConfig 整体空(只有这一个 flag),把 toolConfig 整个移除
+                tc.remove("include_server_side_tool_invocations");
                 if tc.is_empty() {
                     obj.remove("toolConfig");
+                }
+            }
+
+            // **antigravity 路径拒 built-in tools + functionDeclarations 共存**
+            // (实测 2026-05-11 daily-cloudcode-pa 返 400 "Built-in tools with
+            // Function calling")。flag 又不能 enable。**只能 strip 内置 tools**
+            // (googleSearch / urlContext / codeExecution),保留 function_declarations
+            // (Codex.app 主用)。对应 gemini_native 的 Gemini 2.x fallback 路径,
+            // 但 antigravity 把所有 Gemini 3 model 当 2.x 那么处理
+            if is_antigravity {
+                if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
+                    let mut has_function_decls = false;
+                    for t in tools.iter() {
+                        if t.as_object()
+                            .map(|o| {
+                                o.contains_key("functionDeclarations")
+                                    || o.contains_key("function_declarations")
+                            })
+                            .unwrap_or(false)
+                        {
+                            has_function_decls = true;
+                            break;
+                        }
+                    }
+                    if has_function_decls {
+                        tools.retain(|t| {
+                            t.as_object()
+                                .map(|o| {
+                                    !o.contains_key("googleSearch")
+                                        && !o.contains_key("google_search")
+                                        && !o.contains_key("urlContext")
+                                        && !o.contains_key("url_context")
+                                        && !o.contains_key("codeExecution")
+                                        && !o.contains_key("code_execution")
+                                        && !o.contains_key("googleSearchRetrieval")
+                                        && !o.contains_key("google_search_retrieval")
+                                })
+                                .unwrap_or(true)
+                        });
+                        if tools.is_empty() {
+                            obj.remove("tools");
+                        }
+                    }
                 }
             }
         }
@@ -147,6 +200,20 @@ impl Adapter for GeminiCliAdapter {
             request::wrap_cloud_code_envelope(&model, &project_id, inner_value).map_err(|e| {
                 AdapterError::BadRequest(format!("OS RNG unavailable for user_prompt_id: {e}"))
             })?;
+
+        // 3. **antigravity 专属 body 后处理**:加 4 个 antigravity 必需字段
+        // (userAgent / requestType / requestId / request.sessionId)+ delete
+        // request.safetySettings + 顶层 toolConfig 搬到 request 子对象。
+        // 不做这层 antigravity 上游识别成 non-canonical client → 配额错 bucket
+        // / 429。CLIProxyAPI `geminiToAntigravity` 1:1 实证(2026-05-11 修)。
+        // gemini-cli 不需要这层(共用 wire 但 body shape 不同)
+        let outer = if is_antigravity_api_format(&provider.api_format) {
+            request::apply_antigravity_transform(outer, &model).map_err(|e| {
+                AdapterError::BadRequest(format!("OS RNG unavailable for antigravity requestId: {e}"))
+            })?
+        } else {
+            outer
+        };
         let outer_body = serde_json::to_vec(&outer).map_err(AdapterError::BodyDecode)?;
 
         // 3. cloud-code 上游 path: 不像 gemini_native 是 /v1{alpha,beta}/models/<m>:method

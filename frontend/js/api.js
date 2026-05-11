@@ -56,7 +56,7 @@
     // 但 OAuth client_id / brand 不同,用专属箭头 mark 区分(避免跟 gemini 共用
     // 图标让用户分不清两个 OAuth provider)。`antigravity-oauth` 子串命中 preset
     // id;不加更宽的 'antigravity' 防误命中用户自定义 provider 名
-    'antigravity-oauth': { logo: 'assets/providers/antigravity.svg' },
+    'antigravity-oauth': { logo: 'assets/providers/antigravity.png' },
     // Google AI Studio:用官方品牌图标(从 aistudio.google.com 抓的
     // ai_studio_favicon_2_128x128.png,圆形黑底带 sparkle/方框 mark)。
     // 子串命中 "google" / "gemini" / "aistudio" / "generativelanguage" 任一都映射到此。
@@ -89,9 +89,17 @@
   }
 
   function computeIcon(provider) {
-    const id = `${provider.id || ''} ${provider.name || ''} ${provider.baseUrl || ''}`.toLowerCase();
+    // **包含 apiFormat** 让 user 自加的 OAuth provider(name 自填,id UUID)也
+    // 能命中专属图标 — 否则会 fall through 到 baseUrl 的 'google' 子串撞
+    // google-ai-studio.png(2026-05-11 修)。
+    // **normalize**:把 lookup string 里所有 `_` / 空格 全部转 `-`,这样:
+    //   - apiFormat="antigravity_oauth" 命中 ICON_MAP key 'antigravity-oauth'
+    //   - name="Gemini CLI"(空格) 命中 'gemini-cli'(dash)
+    // 用单一 dash 形态做规范化(ICON_MAP key 全是 dash 形)
+    const raw = `${provider.id || ''} ${provider.name || ''} ${provider.baseUrl || ''} ${provider.apiFormat || ''}`.toLowerCase();
+    const lookup = raw.replace(/[_\s]+/g, '-');
     for (const [key, val] of Object.entries(ICON_MAP)) {
-      if (id.includes(key)) return val;
+      if (lookup.includes(key)) return val;
     }
     return { icon: 'bi-plug-fill' };
   }
@@ -455,6 +463,15 @@
 
     async logoutAntigravityOauth() {
       return api('DELETE', '/api/antigravity-oauth/logout');
+    },
+
+    /// 拉 antigravity 上游可用 model 列表(`:fetchAvailableModels`),后端
+    /// 失败时退到静态种子。响应 OpenAI `/v1/models` shape:
+    ///   `{ object: "list", data: [{id, object, owned_by, ...}], source: "upstream"|"static_seed" }`
+    /// 跟 gemini-cli 不同 — gemini-cli 没 fetchAvailableModels endpoint,前端那边
+    /// 是 hardcoded list;antigravity 真有 endpoint(CLIProxyAPI 实证)
+    async getAntigravityOauthModels() {
+      return api('GET', '/api/antigravity-oauth/models');
     },
   };
 })();

@@ -109,9 +109,12 @@ pub const ANTIGRAVITY_X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 /// Antigravity 版本号(hardcode fallback,跟 CLIProxyAPI `antigravity_version.go:19`
 /// `antigravityFallbackVersion` 一致)。CLIProxyAPI 有 background goroutine 拉
 /// `https://antigravity-auto-updater-974169037036.us-central1.run.app/releases`
-/// 拿最新版,我们暂时只用 fallback。如果 Google 大改 wire 协议跟版本绑定,
-/// 后续可引入 dynamic version refresher。
-pub const ANTIGRAVITY_VERSION: &str = "1.21.9";
+/// 拿最新版,我们暂时只用 fallback。
+///
+/// **2026-05-11**:1.21.9 已被 Google upstream 拒(返 "This version of Antigravity
+/// is no longer supported")。auto-updater 当前 stable = 1.23.2,bump 跟上。
+/// followup PR 应实现跟 CLIProxyAPI 一致的 6h-cached HTTP poll updater
+pub const ANTIGRAVITY_VERSION: &str = "1.23.2";
 
 /// Antigravity chat / generate request UA(短形式,无 nodejs-client 后缀)。
 /// CLIProxyAPI `antigravity_version.go:132`。
