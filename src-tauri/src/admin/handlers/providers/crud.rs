@@ -193,12 +193,29 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
     // 发生。**add_provider 额外要求**:apiFormat=grok_web 时 grokWeb 必填(否则
     // 用户填空 cookie 提交 → frontend collectGrokWebPayload 返 null → input 不
     // 带 grokWeb → 这个 if-let-Some 不跑 → 保存成功 → chat 时再炸)。
-    let is_grok_web =
-        super::normalize_provider_api_format(input.api_format.as_deref()) == "grok_web";
-    if is_grok_web && input.grok_web.as_ref().map(Value::is_null).unwrap_or(true) {
+    //
+    // **2026-05-12 user E2E 反馈修**:除了 input.api_format=grok_web,也要拦
+    // `baseUrl=https://grok.com` 但 apiFormat 被前端默认成 "openai_chat" 的
+    // case —— healing 会在下次 load 时把 apiFormat 改成 grok_web,如果此时没
+    // grokWeb cookies,provider 进入"半残"状态(apiFormat=grok_web 但缺 cookies)
+    // 让 chat 失败。在 add 端就 anticipate 这个 healing 改写,提前要求 grokWeb。
+    let api_format_eff = super::normalize_provider_api_format(input.api_format.as_deref());
+    let base_url_norm = input
+        .base_url
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| {
+            s.trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_owned()
+        })
+        .unwrap_or_default();
+    let will_be_grok_web = api_format_eff == "grok_web" || base_url_norm == "grok.com";
+    if will_be_grok_web && input.grok_web.as_ref().map(Value::is_null).unwrap_or(true) {
         return err(
             StatusCode::BAD_REQUEST,
-            "apiFormat=grok_web 需要 grokWeb.cookies.sso(JWT,非空 string);从 grok.com 浏览器 cookies 复制",
+            "apiFormat=grok_web(或 baseUrl=https://grok.com)需要 grokWeb.cookies.sso(JWT,非空 string);从 grok.com 浏览器 cookies 复制",
         )
         .into_response();
     }
