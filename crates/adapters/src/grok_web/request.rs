@@ -97,16 +97,23 @@ pub fn responses_body_to_grok_request_with_tracker(
     })
 }
 
-/// Codex `model` 字段(可能是 "gpt-5-codex" 等槽位名)→ grok backend `modeId`。
+/// Codex `model` 字段 → grok backend `modeId`。
+///
+/// 入参 `codex_model` 在到达本函数前可能已被 `crates/proxy/src/forward.rs:317`
+/// 的 `rewrite_model_field` 改写成 resolver 的 `rewritten_model`(concrete
+/// upstream model 名,不是 slot 名)。两种来源都要 handle。
 ///
 /// 优先级:
-/// 1. `provider.models[codex_model]`(精确槽位映射)
-/// 2. `provider.models["default"]`(provider 默认)
-/// 3. **Err `BadRequest`** —— **不**再 silently fallback 到 hardcoded literal
-///    (review-feedback H2):用户配置 `models = {"gpt-5-codex": "grok-3-mini"}`
-///    期望省 token,如果 Codex 发 `model: "gpt-5"` 两层都 miss,旧版 silently
-///    路由到 `grok-420-computer-use-sa`(更贵)— 用户没有 feedback。
-///    现在显式 Err,let `forward.rs` 主路径 surface 给客户端 400。
+/// 1. `provider.models[codex_model]`(精确槽位映射,典型场景:body.model 是 slot 名)
+/// 2. `provider.models["default"]`(provider 默认 slot)
+/// 3. **`codex_model` 自身 as-is** —— resolver 已 rewrite 时这就是 concrete model;
+///    或用户直接传 model="grok-420-computer-use-sa" 这种已知 backend 名。
+///
+/// **不再 hardcoded literal fallback**(原 R3 PoC 设计 silently 路由到
+/// "grok-420-computer-use-sa" — review-feedback H2 标记为破坏性,删除)。
+/// **不再 Err on miss**(初版改造矫枉过正:用户在 `provider.extra` 给一个
+/// 已知 backend model 名 + 不配 `provider.models` 时合法 use case,
+/// PR #129 chatgpt-codex-connector P1 标记)。
 ///
 /// Provider schema 在 [`codex_app_transfer_registry::Provider::models`] 是 IndexMap,
 /// 按磁盘顺序保留,槽位 key 见 [`codex_app_transfer_registry::ModelSlotKey`]。
@@ -117,10 +124,10 @@ fn resolve_mode_id(codex_model: &str, provider: &Provider) -> Result<String, Ada
     if let Some(default) = provider.models.get("default").cloned() {
         return Ok(default);
     }
-    Err(AdapterError::BadRequest(format!(
-        "grok_web: model slot '{codex_model}' not configured in provider.models, and no 'default' slot set. \
-         Add an entry to provider.models or set models.default = \"grok-420-computer-use-sa\"."
-    )))
+    // P1 fallback:miss 槽位 + 无 default → 用 codex_model 自身(已 rewrite 的
+    // concrete model 名 or 用户直接传的 backend 名)。**不**用 hardcoded literal,
+    // 不静默路由到不同模型,保持用户/resolver 意图。
+    Ok(codex_model.to_owned())
 }
 
 /// 抽 Codex Responses `input` 数组里**最后一条 user message** 的文本。
@@ -341,8 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mode_id_errors_when_no_slot_and_no_default() {
-        // review-feedback H2:无 hardcoded literal fallback,显式 Err
+    fn resolve_mode_id_falls_back_to_codex_model_when_no_slot_and_no_default() {
+        // chatgpt-codex-connector PR #129 P1:miss 槽位 + 无 default 时,fallback
+        // 用 codex_model 自身(已被 resolver rewrite 成 concrete upstream model,
+        // 或用户直接传的已知 backend 名);**不**走 hardcoded literal。
         let p = Provider {
             id: "grok-web".into(),
             name: "Grok Web".into(),
@@ -358,20 +367,16 @@ mod tests {
             sort_index: 0,
             extra: IndexMap::new(),
         };
+        // 模拟 resolver.rs:317 已 rewrite body.model 成 concrete grok backend
         let body = json!({
-            "model": "gpt_5_codex",
+            "model": "grok-420-computer-use-sa",
             "input": [{"type": "message", "role": "user", "content": "hi"}]
         });
-        let err = responses_body_to_grok_request_with_tracker(&body, &p, None).unwrap_err();
-        match err {
-            AdapterError::BadRequest(msg) => {
-                assert!(
-                    msg.contains("not configured"),
-                    "expected slot-not-configured error, got: {msg}"
-                );
-            }
-            _ => panic!("expected BadRequest"),
-        }
+        let req = responses_body_to_grok_request_with_tracker(&body, &p, None).unwrap();
+        assert_eq!(
+            req.mode_id, "grok-420-computer-use-sa",
+            "已 rewrite 的 concrete model 应直接当 modeId,不被静默替换"
+        );
     }
 
     #[test]
