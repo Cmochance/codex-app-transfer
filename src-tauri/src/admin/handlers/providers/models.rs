@@ -252,6 +252,81 @@ fn suggest_model_mappings(model_ids: &[String]) -> Value {
     result
 }
 
+/// Antigravity 专属 model fetch — 走上游 `:fetchAvailableModels`,失败退到
+/// 静态种子。共用 antigravity_oauth handler 的 shared http client + token store
+/// (`~/.codex-app-transfer/antigravity-oauth.json`)。
+///
+/// 不传 provider 参数 — antigravity 上游 list 跟具体 provider config 无关
+/// (只看 OAuth token + 可选 project_id),所以多个 user-defined antigravity_oauth
+/// provider 都能 share 这条 fetch
+async fn fetch_antigravity_models_impl() -> Value {
+    use codex_app_transfer_gemini_oauth::{
+        antigravity_static_models, ensure_valid_antigravity_token,
+        fetch_antigravity_available_models, TokenStore, ANTIGRAVITY_PROVIDER,
+    };
+
+    // 静态 seed 总能拿到 — 即使 OAuth 没登录,UI 上至少能给 model 映射的选项
+    let seed_ids: Vec<String> = antigravity_static_models()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    let seed_response = || {
+        json!({
+            "success": true,
+            "endpoint": "(static seed: antigravity 10 models)",
+            "models": seed_ids.clone(),
+            "suggested": suggest_model_mappings(&seed_ids),
+        })
+    };
+
+    let store = match TokenStore::for_token_filename(ANTIGRAVITY_PROVIDER.token_filename) {
+        Ok(s) => s,
+        Err(_) => return seed_response(),
+    };
+
+    // 共用 antigravity-oauth handler 的 shared http client(避免每个 fetch 起新
+    // pool)。这里用临时 client builder 简化(get_or_init 失败也不阻塞 user)
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return seed_response(),
+    };
+
+    let access_token = match ensure_valid_antigravity_token(&client, &store).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                error_id = "ANTIGRAVITY_FORM_FETCH_TOKEN",
+                error = %e,
+                "antigravity model fetch: token 不可用,退到静态种子"
+            );
+            return seed_response();
+        }
+    };
+    let project_id = store.load().ok().flatten().and_then(|t| t.project_id);
+
+    match fetch_antigravity_available_models(&client, &access_token, project_id.as_deref()).await {
+        Ok(models) if !models.is_empty() => {
+            let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
+            json!({
+                "success": true,
+                "endpoint": "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                "models": ids.clone(),
+                "suggested": suggest_model_mappings(&ids),
+            })
+        }
+        _ => {
+            tracing::warn!(
+                error_id = "ANTIGRAVITY_FORM_FETCH_FAIL",
+                "antigravity :fetchAvailableModels 失败/空,退到静态种子"
+            );
+            seed_response()
+        }
+    }
+}
+
 async fn fetch_provider_models_impl(provider: &Value) -> Value {
     // Cloud Code Assist (gemini_cli_oauth) 上游没有 listModels endpoint —
     // gemini-cli upstream 自己用 hardcoded enum (`packages/core/src/config/models.ts`)。
@@ -288,6 +363,16 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
             "models": model_ids.clone(),
             "suggested": suggest_model_mappings(&model_ids),
         });
+    }
+
+    // **antigravity_oauth — 真有 list endpoint**(CLIProxyAPI
+    // `cmd/fetch_antigravity_models/main.go`):POST 上游
+    // `:fetchAvailableModels` 拿 antigravity 专属 model list(claude-opus-4-6-thinking
+    // / gemini-3-pro-low/high / gpt-oss-120b 等 10 个);失败退到 crate
+    // 内嵌的静态种子(`antigravity_static_models()`,与上游 model.json 1:1)。
+    // 跟 gemini_cli_oauth 不同(那个上游真没 list endpoint)
+    if provider.get("apiFormat").and_then(|v| v.as_str()) == Some("antigravity_oauth") {
+        return fetch_antigravity_models_impl().await;
     }
 
     let endpoints = model_endpoint_candidates(provider);

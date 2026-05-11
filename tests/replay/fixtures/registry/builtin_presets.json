@@ -303,12 +303,18 @@
   {
     "id": "antigravity-oauth",
     "name": "Antigravity",
-    "baseUrl": "https://cloudcode-pa.googleapis.com",
+    "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
+    "baseUrlOptions": [
+      {
+        "value": "https://cloudcode-pa.googleapis.com",
+        "label": "prod (legacy / 自动 self-heal 用)"
+      }
+    ],
     "docsUrl": "https://antigravity.google.com/",
     "authScheme": "google_oauth_antigravity",
     "apiFormat": "antigravity_oauth",
     "models": {
-      "default": "gemini-2.5-flash"
+      "default": "gemini-3-flash"
     },
     "modelCapabilities": {},
     "notices": [

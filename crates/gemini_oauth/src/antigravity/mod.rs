@@ -24,8 +24,12 @@
 
 pub mod cloud_code;
 pub mod flow;
+pub mod models;
+pub mod static_models;
 
 pub use cloud_code::{
     bootstrap_project as antigravity_bootstrap_project, AntigravityClientMetadata,
 };
 pub use flow::{refresh_antigravity_access_token, run_antigravity_oauth_flow_with_cancel};
+pub use models::{fetch_antigravity_available_models, AntigravityModelEntry};
+pub use static_models::antigravity_static_models;

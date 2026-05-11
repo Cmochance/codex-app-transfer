@@ -338,11 +338,63 @@ fn responses_input_to_chat_messages(
                         })
                 });
                 let need_synthesize = !prior_in_pending && !prior_in_messages;
+                // **resolved_name 反查链**(2026-05-11 修):
+                // 1. obj.name 显式(Codex.app 很少发,但优先)
+                // 2. pending_tool_calls 同 input 已处理的 function_call(同输入数组场景)
+                // 3. 已 flush 进 messages 的 assistant tool_calls(同输入跨段)
+                // 4. global_tool_call_cache(跨进程 / session resume,disk persist)
+                // 原版只有 1 + 4,2/3 漏导致 cache miss 时即使同 input 有 function_call
+                // 也找不到 name → BadRequest。User 实测发现就是这条 bug
                 let resolved_name = obj
                     .get("name")
                     .and_then(|v| v.as_str())
                     .map(String::from)
-                    .or_else(|| cache_entry.as_ref().map(|entry| entry.name.clone()));
+                    .or_else(|| {
+                        pending_tool_calls.iter().find_map(|tc| {
+                            if tc.get("id").and_then(|v| v.as_str()) == Some(call_id.as_str())
+                            {
+                                tc.get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .map(String::from)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .or_else(|| {
+                        messages.iter().rev().take(8).find_map(|m| {
+                            m.get("tool_calls").and_then(|v| v.as_array()).and_then(
+                                |arr| {
+                                    arr.iter().find_map(|tc| {
+                                        if tc.get("id").and_then(|v| v.as_str())
+                                            == Some(call_id.as_str())
+                                        {
+                                            tc.get("function")
+                                                .and_then(|f| f.get("name"))
+                                                .and_then(|n| n.as_str())
+                                                .map(String::from)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                },
+                            )
+                        })
+                    })
+                    .or_else(|| {
+                        // step 4: persistent global cache — 跨进程 / session resume /
+                        // provider switch 路径。命中此层是诊断重要 anchor,info log 标记
+                        cache_entry.as_ref().map(|entry| {
+                            tracing::info!(
+                                error_id = "TOOL_CALL_NAME_RESOLVED_FROM_PERSISTENT_CACHE",
+                                call_id = %call_id,
+                                name = %entry.name,
+                                "通过持久化 cache 反查到 function name(可能是 session resume / provider switch / app 重启)"
+                            );
+                            entry.name.clone()
+                        })
+                    });
 
                 // flush pending assistant 再操作
                 flush_assistant(
@@ -399,6 +451,41 @@ fn responses_input_to_chat_messages(
                             pending_assistant_reasoning.push(t.to_owned());
                         }
                     }
+                }
+            }
+            // **autocompact 摘要回灌** — 1:1 对齐 chat 端
+            // `responses/request.rs:590`(`compaction|context_compaction|
+            // compaction_summary`)。Codex CLI 触发 auto-compact 后把摘要作为
+            // ResponseItem::Compaction 塞进 history(`codex-rs/protocol/src/
+            // models.rs:882`),续轮 input 里会带这个 item。`encrypted_content`
+            // 字段名是历史包袱,**实际明文** —— Codex 自家 SUMMARY_PREFIX
+            // (`codex-rs/core/src/compact.rs:262`)已经写明 "based on this
+            // summary..." 语义。
+            //
+            // **修法**:转 user message text 灌进 messages(role 与 Codex
+            // 自家 inline compact `build_compacted_history_with_limit` 一致)。
+            // 否则上游 LLM 完全看不到 summary,等同于 compact 后失忆 — 体感
+            // "compact 触发了但下一轮不记得任何之前的事"。原 gemini_native
+            // 落到 `other` 分支 silent drop(2026-05-11 user 反馈实测)
+            "compaction" | "context_compaction" | "compaction_summary" => {
+                let summary = obj
+                    .get("encrypted_content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                if !summary.is_empty() {
+                    // flush pending assistant 再灌 user summary,保证顺序
+                    flush_assistant(
+                        &mut pending_assistant_content,
+                        &mut pending_tool_calls,
+                        &mut pending_assistant_reasoning,
+                        &mut messages,
+                    );
+                    messages.push(json!({
+                        "role": "user",
+                        "content": summary,
+                    }));
                 }
             }
             // 其他类型(computer_call / image_generation_call / file_search_call /
@@ -553,6 +640,70 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                 wrapper.insert("type".into(), Value::String("function".into()));
                 wrapper.insert("function".into(), Value::Object(func));
                 out.push(Value::Object(wrapper));
+            }
+            "namespace" => {
+                // **MCP namespace 包装递归展开**(Codex CLI 的
+                // `~/.codex/config.toml::mcp_servers.<name>` → 入站
+                // `{type:"namespace", name:"mcp__<name>__", tools:[{type:"function",...}]}`)。
+                // 不展开则整个 MCP 工具集 silent drop → 模型不知道有 notion / figma
+                // 等 server,绕路 grep env / find config 自我发现(2026-05-11 实测)。
+                // 跟 `responses/request.rs::convert_responses_tool_to_chat_tool`
+                // 的 `"namespace"` 分支同款逻辑 — 递归 flatten 内层 tools 为顶级
+                // function tool 数组。借鉴 mimo2codex `reqToChat.ts:232-250`。
+                //
+                // **方案 1 增强**(2026-05-11):**保留 namespace-level description
+                // + name 作为 server 上下文 prefix 注入到每个内层 function 的
+                // description**。原因:Codex CLI namespace 包通常带 description
+                // (eg "Notion MCP server — read/write Notion pages, blocks, comments"),
+                // 这种 server 级提示对模型挑选具体函数(`notion_search` vs
+                // `notion_create_pages`)是关键 context。CLIProxyAPI 默认不保留这层
+                // (注释 "不保留 namespace 包裹元数据"),但实测发现 Gemini 3.x 没
+                // 这层 context 时倾向选"动作"类工具(写),误判 user 的"看一下"为
+                // 创建。我们 over-CLIProxyAPI 把它注入回 inner description。
+                // **不改 name** —— Codex.app dispatch 反向路由仍按原 function.name
+                let Some(inner) = obj.get("tools").and_then(|v| v.as_array()) else {
+                    crate::warn_once_drop_tool("gemini_native:namespace:no_inner_tools");
+                    continue;
+                };
+                let ns_name = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let ns_desc = obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+
+                let expanded = responses_tools_to_chat_tools(inner);
+                // 给每个展开的 function tool 注入 server context prefix
+                for mut tool in expanded {
+                    if let Some(func) = tool.get_mut("function").and_then(|v| v.as_object_mut()) {
+                        let orig_desc = func
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                        let prefix = match (ns_name, ns_desc) {
+                            (Some(n), Some(d)) => format!("[MCP server `{n}`: {d}]"),
+                            (Some(n), None) => format!("[MCP server `{n}`]"),
+                            (None, Some(d)) => format!("[MCP server: {d}]"),
+                            (None, None) => String::new(),
+                        };
+                        let new_desc = if orig_desc.is_empty() {
+                            prefix
+                        } else if prefix.is_empty() {
+                            orig_desc
+                        } else {
+                            format!("{prefix}\n\n{orig_desc}")
+                        };
+                        if !new_desc.is_empty() {
+                            func.insert("description".to_owned(), Value::String(new_desc));
+                        }
+                    }
+                    out.push(tool);
+                }
             }
             // computer_use_preview / file_search / image_generation 等 Gemini 不直接对应。
             // warn_once 让以后用户配新 tool 类型时能在 telemetry 立刻看到 silent drop。
@@ -990,17 +1141,31 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
             // function_call + function_call_output 不会触发这条 path;若 Codex.app
             // 启用 session resume 而 SessionStore 还没实现,这条会触发 — 当前
             // 安全 BadRequest 让用户看到 "缺 SessionStore" 而不是 silent Gemini 400。
+            // **encoded vs clean call_id 兼容**(2026-05-11 修):
+            // tool message 的 tool_call_id 是 emit_function_call 的 encoded form
+            // ("call_X~~sig~~Y"),但 tool_call_id_to_name 是 extract_tool_call
+            // 解码后的 clean form 作 key("call_X")。 lookup 两次试:先 encoded
+            // 后 clean 才不漏 — 不然即使 prior function_call 在同 input,
+            // tool_call_id_to_name lookup MISS,误判没 prior → BadRequest
             let name = tool_call_id_to_name
                 .get(tool_call_id)
                 .cloned()
+                .or_else(|| {
+                    let (clean, _sig) = decode_tool_call_id_signature(tool_call_id);
+                    tool_call_id_to_name.get(&clean).cloned()
+                })
                 .or_else(|| msg.get("name").and_then(|v| v.as_str()).map(String::from))
                 .ok_or_else(|| {
                     AdapterError::BadRequest(format!(
                         "function_call_output call_id={tool_call_id:?} has no matching prior \
                          function_call in this request input — Gemini wire requires \
-                         functionResponse.name. Pass the original function_call alongside its \
-                         output in the input array, or include explicit `name` field on the \
-                         function_call_output item. (Session-resume path: TODO add SessionStore lookup.)"
+                         functionResponse.name. 已尝试 4 路 fallback 全 miss:\
+                         (1) tool message 的 `name` 字段;(2) tool_call_id_to_name 表(encoded+clean);\
+                         (3) 同 input 内 prior function_call;(4) 持久化 tool_call_cache。\
+                         可能原因:cache TTL 过期(1h)/ 用户清过 ~/.codex-app-transfer/tool_call_cache.json / \
+                         HOME 未设置导致 cache 仅内存(重启即丢)/ 跨进程并发 save 撞写丢失。\
+                         排查路径:检查 ~/.codex-app-transfer/tool_call_cache.json 是否存在 + \
+                         尝试让客户端重发完整 function_call(同 input 包含 function_call + output 两条)"
                     ))
                 })?;
             let response_value = parse_tool_response_content(msg.get("content"))?;
@@ -1907,6 +2072,149 @@ mod tests {
         assert_eq!(tool["content"], "sunny");
     }
 
+    /// **Bug 真因回归测试** (2026-05-11):encoded call_id (含 `~~sig~~<sig>`
+    /// thoughtSignature roundtrip) 跨 function_call → function_call_output 链路
+    /// 时,即使两者在**同一 input 数组里**(不需 session resume),也要能找到
+    /// name。原 bug:`extract_tool_call` 解码后 `tool_call_id_to_name` 用 clean_id
+    /// 作 key,tool message 仍用 encoded id lookup → miss → BadRequest
+    #[test]
+    fn function_call_output_with_encoded_call_id_resolves_via_pending_chain() {
+        // Codex.app 实测会发**encoded call_id**(含 `~~sig~~`)在 function_call
+        // 和 function_call_output 上 — 模型这一轮的 thoughtSignature 必须 roundtrip
+        let body = serde_json::json!({
+            "input": [
+                {"type":"message","role":"user","content":"x"},
+                {
+                    "type":"function_call",
+                    "call_id":"call_abc~~sig~~SIGDATA",
+                    "name":"my_tool",
+                    "arguments":"{}"
+                },
+                {
+                    "type":"function_call_output",
+                    "call_id":"call_abc~~sig~~SIGDATA",
+                    "output":"result"
+                }
+            ]
+        });
+        // 不该 panic + 不该 BadRequest。end-to-end 转换走完 Gemini 内层 contents
+        let inner = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let inner_v = serde_json::to_value(&inner).unwrap();
+        // 找到 functionResponse part 且含 name="my_tool"(不是 default unknown)
+        let contents = inner_v["contents"].as_array().unwrap();
+        let mut found_response_with_name = false;
+        for c in contents {
+            if let Some(parts) = c["parts"].as_array() {
+                for p in parts {
+                    if let Some(fr) = p.get("functionResponse") {
+                        assert_eq!(
+                            fr["name"], "my_tool",
+                            "functionResponse.name 必须从 pending chain 反查到 \
+                             encoded call_id 对应的 function_call.name"
+                        );
+                        found_response_with_name = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_response_with_name,
+            "input 里 function_call_output 必须转成 functionResponse part"
+        );
+    }
+
+    /// **test-analyzer top 3 — Bug Q(a)**:cache hit + 同 input **无** prior
+    /// function_call 的场景(Bug P 持久化的核心 use case)。本测试模拟 app 重启后:
+    /// 仅发 function_call_output(call_id 之前已 cache),无对应 function_call。
+    /// 路径必须走第 4 步 cache fallback 才能拿到 name
+    #[test]
+    fn cache_hit_resolves_name_when_no_prior_function_call_in_input() {
+        use crate::responses::{global_tool_call_cache, ToolCallEntry};
+        let encoded_id = "call_resume_test_001~~sig~~RESUME_SIG";
+        // 模拟"上次进程"已经 emit 过 function_call + save 到 cache
+        global_tool_call_cache().save(
+            encoded_id,
+            ToolCallEntry {
+                name: "weather_lookup".into(),
+                arguments: r#"{"city":"上海"}"#.into(),
+            },
+        );
+
+        // 模拟新进程:只有 function_call_output,**没有** prior function_call
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "follow up after restart"},
+                {
+                    "type": "function_call_output",
+                    "call_id": encoded_id,
+                    "output": "晴天 25°C"
+                }
+            ]
+        });
+        let inner = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let inner_v = serde_json::to_value(&inner).unwrap();
+        let contents = inner_v["contents"].as_array().unwrap();
+        let mut found = false;
+        for c in contents {
+            if let Some(parts) = c["parts"].as_array() {
+                for p in parts {
+                    if let Some(fr) = p.get("functionResponse") {
+                        assert_eq!(
+                            fr["name"],
+                            "weather_lookup",
+                            "cache hit 应反查到 'weather_lookup',实际 {:?}",
+                            fr.get("name")
+                        );
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "cache step 4 fallback 必须能反查 name 让 functionResponse 成功构造"
+        );
+    }
+
+    /// `tool_call_id_to_name` lookup 同时试 encoded 和 clean form
+    /// (encoded `call_X~~sig~~Y` 不在 map 时 fallback 试 clean `call_X`)
+    #[test]
+    fn tool_call_id_to_name_lookup_tries_both_encoded_and_clean() {
+        // assistant.tool_calls.id 是 encoded form(extract_tool_call 解码后 clean),
+        // 但 tool.tool_call_id 仍是 encoded — fallback lookup 必须能 match
+        let messages = vec![
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_xyz~~sig~~SIG",
+                    "type": "function",
+                    "function": {"name": "look_up", "arguments": "{}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_xyz~~sig~~SIG",
+                "content": "result"
+            }),
+        ];
+        let contents = convert_messages_to_contents(&messages).unwrap();
+        // 至少一条 user role(synthetic 起首)+ 一条 model + functionResponse
+        let mut has_fr_with_name = false;
+        for c in &contents {
+            for p in &c.parts {
+                if let Some(fr) = &p.function_response {
+                    assert_eq!(
+                        fr.name, "look_up",
+                        "encoded tool_call_id 必须 fallback 到 clean form 找到 name"
+                    );
+                    has_fr_with_name = true;
+                }
+            }
+        }
+        assert!(has_fr_with_name);
+    }
+
     #[test]
     fn responses_web_search_tool_preserved_in_chat_normalized() {
         // 关键回归:web_search 必须在 Responses → 归一化 chat 阶段保留(不能被 drop)
@@ -1934,6 +2242,318 @@ mod tests {
         assert_eq!(t["type"], "function");
         assert_eq!(t["function"]["name"], "get_weather");
         assert!(t["function"]["parameters"]["properties"]["city"].is_object());
+    }
+
+    /// MCP namespace 包装 + 顶级 function 共存:展平后两类同时保留(对齐
+    /// `responses::request::namespace_alongside_top_level_function_both_kept`)
+    #[test]
+    fn responses_namespace_alongside_top_level_function_both_kept() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"x"}],
+            "tools": [
+                {"type":"function","name":"shell","parameters":{"type":"object"}},
+                {"type":"namespace","name":"mcp__notion__","tools":[
+                    {"type":"function","name":"notion_search","parameters":{"type":"object"}},
+                    {"type":"function","name":"notion_create_pages","parameters":{"type":"object"}}
+                ]}
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"notion_search"));
+        assert!(names.contains(&"notion_create_pages"));
+        assert_eq!(names.len(), 3);
+    }
+
+    /// 空 namespace `tools: []` silently dropped(对齐
+    /// `responses::request::namespace_with_empty_tools_array_silently_dropped`)
+    #[test]
+    fn responses_namespace_with_empty_tools_array_silently_dropped() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"namespace","name":"mcp__empty__","tools": []}]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        // namespace 内层空 → 不该产出任何 function tool
+        let tools = chat.get("tools").and_then(|v| v.as_array());
+        assert!(
+            tools.map(|t| t.is_empty()).unwrap_or(true),
+            "空 namespace 不该产出 tools,实际 {tools:?}"
+        );
+    }
+
+    /// 缺 tools 字段的 namespace silently dropped(warn_once)(对齐
+    /// `responses::request::namespace_missing_tools_field_silently_dropped`)
+    #[test]
+    fn responses_namespace_missing_tools_field_silently_dropped() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [{"type":"namespace","name":"mcp__broken__"}]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let tools = chat.get("tools").and_then(|v| v.as_array());
+        assert!(tools.map(|t| t.is_empty()).unwrap_or(true));
+    }
+
+    /// 嵌套 namespace(Codex CLI 当前不发,future-safe 递归保证)(对齐
+    /// `responses::request::nested_namespace_inside_namespace_recursively_flattens`)
+    #[test]
+    fn responses_nested_namespace_inside_namespace_recursively_flattens() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"namespace","name":"outer","tools":[
+                    {"type":"namespace","name":"inner","tools":[
+                        {"type":"function","name":"deep_tool","parameters":{"type":"object"}}
+                    ]},
+                    {"type":"function","name":"sibling","parameters":{"type":"object"}}
+                ]}
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let names: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"deep_tool"));
+        assert!(names.contains(&"sibling"));
+        assert_eq!(names.len(), 2);
+    }
+
+    /// **autocompact 回灌**(parity with chat path
+    /// `responses::request::compaction_item_renders_as_user_message_with_summary_text`)。
+    /// Codex CLI 触发 auto-compact 后续轮 input 会带 `{type:"compaction",
+    /// encrypted_content:"<summary>"}`,gemini_native 必须转 user message text 灌进
+    /// messages,否则模型 compact 后失忆。原版落到 `other` 分支 silent drop
+    /// (2026-05-11 user 反馈)
+    #[test]
+    fn compaction_item_renders_as_user_message_with_summary_text() {
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "earlier turn 1"},
+                {"type": "compaction", "encrypted_content": "Conversation summary: user asked about deepseek vs kimi..."},
+                {"type": "message", "role": "user", "content": "follow up after compact"}
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        // 至少 3 条 user message:earlier + summary + follow up(顺序)
+        let user_texts: Vec<String> = messages
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("user"))
+            .map(|m| {
+                let c = &m["content"];
+                if let Some(s) = c.as_str() {
+                    s.to_owned()
+                } else if let Some(arr) = c.as_array() {
+                    arr.iter()
+                        .filter_map(|p| p["text"].as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                        .join("")
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        assert!(
+            user_texts
+                .iter()
+                .any(|t| t.contains("Conversation summary")),
+            "compaction summary 必须作 user message 注入,实际 {user_texts:?}"
+        );
+    }
+
+    /// **test-analyzer top 3 — Bug O(a)**:`compaction` / `context_compaction` /
+    /// `compaction_summary` 三个别名全应被识别。代码用 `|` match 但原 test 只
+    /// 覆盖了 `compaction`。Codex CLI 历史升级若改发别名,silent drop 复发
+    /// (这是 user 之前 "compact 后失忆" 的根因)
+    #[test]
+    fn compaction_aliases_context_compaction_and_compaction_summary_also_handled() {
+        for alias in ["compaction", "context_compaction", "compaction_summary"] {
+            let body = serde_json::json!({
+                "input": [
+                    {"type": "message", "role": "user", "content": "x"},
+                    {"type": alias, "encrypted_content": format!("summary via {alias}")}
+                ]
+            });
+            let chat = responses_body_to_normalized_chat(&body)
+                .unwrap_or_else(|e| panic!("alias {alias} 应被处理,实际 err {e:?}"));
+            let messages = chat["messages"].as_array().unwrap();
+            let summary_msg = messages.iter().find(|m| {
+                m["role"].as_str() == Some("user")
+                    && m["content"]
+                        .as_str()
+                        .map(|s| s.contains(&format!("summary via {alias}")))
+                        .unwrap_or(false)
+            });
+            assert!(
+                summary_msg.is_some(),
+                "alias `{alias}` 必须被识别 + 转 user message,实际 messages={messages:?}"
+            );
+        }
+    }
+
+    /// **test-analyzer top 3 — Bug O(b)**:compaction 注入前必须 flush 当前
+    /// pending assistant,防 assistant 输出被 reorder 到 summary 之后导致历史错乱。
+    /// 当前测试 compaction 都在 `user → compaction → user` 路径,flush_assistant
+    /// 是 no-op。本测试构造 `user → assistant → compaction → user` 确保 flush 真起作用
+    #[test]
+    fn compaction_flushes_pending_assistant_before_injecting_summary() {
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "assistant", "content": "thinking..."},
+                {"type": "compaction", "encrypted_content": "SUMMARY_TEXT"},
+                {"type": "message", "role": "user", "content": "followup"}
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        // 必须的顺序:user(first) → assistant(thinking) → user(summary) → user(followup)
+        // **不可以是** user → user(summary) → assistant → user(followup)
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        let assistant_pos = roles.iter().position(|r| *r == "assistant");
+        let summary_pos = messages.iter().position(|m| {
+            m["content"]
+                .as_str()
+                .map(|s| s.contains("SUMMARY_TEXT"))
+                .unwrap_or(false)
+        });
+        assert!(assistant_pos.is_some(), "assistant message 必须保留");
+        assert!(summary_pos.is_some(), "summary 必须作 user message 注入");
+        assert!(
+            assistant_pos.unwrap() < summary_pos.unwrap(),
+            "assistant 必须在 summary 之前(flush_assistant 顺序保证),实际 roles={roles:?}"
+        );
+    }
+
+    /// 空 compaction(encrypted_content 为空)silently dropped,不污染 messages
+    #[test]
+    fn empty_compaction_item_silently_dropped() {
+        let body = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "compaction", "encrypted_content": "   "}
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "空 compaction 不应产生额外 message");
+    }
+
+    /// 方案 1 增强:namespace.name/description 应注入到每个内层 function 的
+    /// description,提供 server context 帮模型挑选正确的具体函数
+    /// (eg "看 page" 时不误选 create)
+    #[test]
+    fn responses_namespace_server_context_prefixed_to_inner_function_descriptions() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"x"}],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp__notion__",
+                    "description": "Notion MCP server — read/write Notion pages",
+                    "tools": [
+                        {"type":"function","name":"notion_search","description":"Search pages","parameters":{"type":"object"}},
+                        {"type":"function","name":"notion_create_pages","description":"Create new pages","parameters":{"type":"object"}}
+                    ]
+                }
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let tools = chat["tools"].as_array().unwrap();
+        let search = tools
+            .iter()
+            .find(|t| t["function"]["name"].as_str() == Some("notion_search"))
+            .unwrap();
+        let desc = search["function"]["description"].as_str().unwrap();
+        // 必须含 namespace name + description 作 prefix,然后原 description
+        assert!(
+            desc.contains("mcp__notion__"),
+            "应含 namespace name 作 server context,实际 [{desc}]"
+        );
+        assert!(
+            desc.contains("Notion MCP server — read/write Notion pages"),
+            "应含 namespace description,实际 [{desc}]"
+        );
+        assert!(desc.contains("Search pages"), "应保留原 description");
+    }
+
+    /// 缺 namespace.description 时只 prefix server name(不丢内层 description)
+    #[test]
+    fn responses_namespace_without_description_still_prefixes_name() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"x"}],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp__figma__",
+                    "tools": [
+                        {"type":"function","name":"figma_get_file","description":"Fetch file","parameters":{"type":"object"}}
+                    ]
+                }
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let tool = &chat["tools"].as_array().unwrap()[0];
+        let desc = tool["function"]["description"].as_str().unwrap();
+        assert!(desc.contains("mcp__figma__"));
+        assert!(desc.contains("Fetch file"));
+    }
+
+    /// **Bug 修复回归** (2026-05-11):MCP namespace 包装(Codex CLI
+    /// `mcp_servers.<name>` 入站形态)必须递归展开内层 functions 为顶级 tool
+    /// 数组,否则整个 MCP 工具集 silent drop,模型不知 notion/figma 存在,
+    /// 绕路 grep env / find config 自我发现。
+    #[test]
+    fn responses_namespace_mcp_tools_recursively_flattened() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"列开发下的页面"}],
+            "tools": [
+                // 普通 function tool — 应直接展开
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}},
+                // MCP namespace 包装 — 内层 2 个 functions 必须 flatten 到顶级
+                {
+                    "type": "namespace",
+                    "name": "mcp__notion__",
+                    "description": "Notion MCP server tools",
+                    "tools": [
+                        {"type":"function","name":"notion_create_pages","description":"create","parameters":{"type":"object"}},
+                        {"type":"function","name":"notion_search","description":"search","parameters":{"type":"object"}}
+                    ]
+                }
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let tools = chat["tools"].as_array().unwrap();
+        // 3 个 function tools(1 原生 + 2 从 namespace 展开)
+        assert_eq!(
+            tools.len(),
+            3,
+            "namespace 必须递归展开内层 functions,实际 tools={tools:?}"
+        );
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"exec_command"));
+        assert!(names.contains(&"notion_create_pages"));
+        assert!(names.contains(&"notion_search"));
+        // namespace 包装本身不该作为顶级 tool 出现
+        for t in tools {
+            assert_ne!(t["function"]["name"].as_str(), Some("mcp__notion__"));
+        }
     }
 
     #[test]

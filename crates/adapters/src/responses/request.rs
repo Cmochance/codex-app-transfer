@@ -1873,6 +1873,15 @@ fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>
             // 不做的:展平内层时**不**改写 tool name(实测内层 function name 已经
             // 自带前缀如 `migrate_pages_to_workers_guide`,无冲突风险);**不**保留
             // namespace 包裹元数据(模型只需看到具体 tool name + description 即可)。
+            //
+            // **⚠️ 跟 `gemini_native::request.rs::responses_tools_to_chat_tools`
+            // 的 `"namespace"` 分支故意分歧**:那边把 `namespace.name + description`
+            // 作 prefix 注入到每个内层 function.description(`[MCP server <n>: <d>]`
+            // ...)。原因:Gemini 3.x 缺这层 server-level context 时倾向选"动作类"
+            // 工具(误选 create 而非 search,user 实测)。Chat completions 上游
+            // (OpenAI/Anthropic Messages)未观察到此 bias,故 chat 路径不注入,
+            // 保持 wire 干净。如果要让两个路径行为一致,可以把 prefix 逻辑提到
+            // 公共 helper — 但当前 chat 路径模型选择没问题,保持差异化最小风险。
             let Some(inner) = obj.get("tools").and_then(|v| v.as_array()) else {
                 tracing::debug!(
                     namespace_name = ?obj.get("name").and_then(|v| v.as_str()),

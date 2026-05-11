@@ -21,7 +21,8 @@ use axum::{
     Router,
 };
 use codex_app_transfer_gemini_oauth::{
-    antigravity_bootstrap_project, persist_token, run_antigravity_oauth_flow_with_cancel,
+    antigravity_bootstrap_project, antigravity_static_models, ensure_valid_antigravity_token,
+    fetch_antigravity_available_models, persist_token, run_antigravity_oauth_flow_with_cancel,
     FlowError, OauthFlowConfig, TokenStore, ANTIGRAVITY_PROVIDER, ANTIGRAVITY_USERINFO_ENDPOINT,
 };
 use serde_json::{json, Value};
@@ -158,6 +159,7 @@ pub fn routes() -> Router<AdminState> {
             delete(cancel_login_handler),
         )
         .route("/api/antigravity-oauth/logout", delete(logout_handler))
+        .route("/api/antigravity-oauth/models", get(models_handler))
 }
 
 async fn cancel_login_handler() -> impl IntoResponse {
@@ -206,6 +208,104 @@ async fn status_handler() -> impl IntoResponse {
         )
         .into_response(),
     }
+}
+
+/// `GET /api/antigravity-oauth/models` — 拉 antigravity 上游可用模型列表。
+///
+/// 流程(对齐 CLIProxyAPI `cmd/fetch_antigravity_models`):
+/// 1. 读 antigravity-oauth.json token,refresh 如过期(共享 service-level
+///    single-flight mutex)
+/// 2. POST 上游 `:fetchAvailableModels`(prod → daily → sandbox host fallback)
+/// 3. 失败 → 退到静态种子(crate `static_models.rs` 内嵌的 10 条)
+/// 4. 响应 OpenAI `/v1/models` shape:`{object:"list", data:[{id,object,owned_by,...}]}`
+///
+/// 未登录时返 401(让前端引导用户先点 OAuth login)
+async fn models_handler() -> impl IntoResponse {
+    let store = match TokenStore::for_token_filename(ANTIGRAVITY_PROVIDER.token_filename) {
+        Ok(s) => s,
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("HOME unavailable: {e}"),
+            )
+            .into_response()
+        }
+    };
+
+    let http = match shared_antigravity_http_client() {
+        Ok(c) => c,
+        Err(msg) => return err(StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    };
+
+    // refresh-on-demand:expired token → 服务层 single-flight refresh,返新
+    // access_token。project_id 从 store 上次 persist 的 token 拿(refresh 不
+    // 改 project_id 字段)
+    let access_token = match ensure_valid_antigravity_token(http, &store).await {
+        Ok(t) => t,
+        Err(e) => {
+            // ServiceError::NotLoggedIn 单独 401 让前端引导 OAuth 登录
+            let msg = format!("{e}");
+            if msg.to_lowercase().contains("not logged in")
+                || msg.to_lowercase().contains("notloggedin")
+            {
+                return err(
+                    StatusCode::UNAUTHORIZED,
+                    "antigravity 未登录,请先 OAuth 登录".to_string(),
+                )
+                .into_response();
+            }
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("antigravity token refresh failed: {msg}"),
+            )
+            .into_response();
+        }
+    };
+    let project_id_owned = store.load().ok().flatten().and_then(|t| t.project_id);
+    let project_id = project_id_owned.as_deref();
+
+    // 试上游 fetchAvailableModels — 失败时降级静态种子(不上抛 5xx,UI 至少
+    // 能拿到 sane default 让用户继续配 model 映射)
+    let (models_json, source) =
+        match fetch_antigravity_available_models(http, &access_token, project_id).await {
+            Ok(models) if !models.is_empty() => {
+                let arr: Vec<Value> = models
+                    .into_iter()
+                    .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+                    .collect();
+                (arr, "upstream")
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    error_id = "ANTIGRAVITY_MODELS_EMPTY",
+                    "antigravity fetchAvailableModels 返空 list,退到静态种子"
+                );
+                let arr: Vec<Value> = antigravity_static_models()
+                    .into_iter()
+                    .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+                    .collect();
+                (arr, "static_seed_empty_upstream")
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error_id = "ANTIGRAVITY_MODELS_FETCH_FAIL",
+                    error = %e,
+                    "antigravity fetchAvailableModels 失败,退到静态种子"
+                );
+                let arr: Vec<Value> = antigravity_static_models()
+                    .into_iter()
+                    .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+                    .collect();
+                (arr, "static_seed")
+            }
+        };
+
+    Json(json!({
+        "object": "list",
+        "data": models_json,
+        "source": source,
+    }))
+    .into_response()
 }
 
 async fn login_handler() -> impl IntoResponse {
