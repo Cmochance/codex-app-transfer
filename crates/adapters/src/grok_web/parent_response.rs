@@ -59,6 +59,70 @@ use std::time::Instant;
 /// × ~80B per entry ≈ 80KB 上限内存占用。
 pub const DEFAULT_MAX_SIZE: usize = 1000;
 
+/// Codex APP 暴露给客户端的 Responses ID(`resp_<uuid>` 风格)。
+///
+/// **R1 PR-4 / TD2 type-design-analyzer 反馈**:原 `record(impl Into<String>,
+/// impl Into<String>)` 两个 `String` 参数易 swap 出 bug —— Codex side ID 是
+/// `resp_*` 风格,grok side 是裸 UUID v4,运行时**理论上**能从 prefix 检测但
+/// 实际没做。改成 newtype 让 swap 在 compile time 就报错。
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct CodexResponseId(pub String);
+
+impl CodexResponseId {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for CodexResponseId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for CodexResponseId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+/// grok.com 后端的 `modelResponse.responseId`(裸 UUID v4)。
+///
+/// 与 [`CodexResponseId`] 分两个类型,防止 [`ParentResponseTracker::record`]
+/// 参数 swap(R1 PR-4 / TD2)。
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct GrokResponseId(pub String);
+
+impl GrokResponseId {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for GrokResponseId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for GrokResponseId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     grok_response_id: String,
@@ -100,13 +164,12 @@ impl ParentResponseTracker {
     ///
     /// 满 + 新 key 不在 → evict 最少 `access_count` 的旧 entry(`ts` 作 tiebreak)。
     /// Mutex poison 时用 `PoisonError::into_inner()` 恢复继续工作。
-    pub fn record(
-        &self,
-        codex_response_id: impl Into<String>,
-        grok_response_id: impl Into<String>,
-    ) {
-        let codex_id = codex_response_id.into();
-        let grok_id = grok_response_id.into();
+    ///
+    /// **强类型化(R1 PR-4 / TD2)**:接受 [`CodexResponseId`] / [`GrokResponseId`]
+    /// 而非两个 `impl Into<String>`,防止 record 时参数 swap(call sites 调试苦)。
+    pub fn record(&self, codex: CodexResponseId, grok: GrokResponseId) {
+        let codex_id = codex.0;
+        let grok_id = grok.0;
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -130,11 +193,12 @@ impl ParentResponseTracker {
         );
     }
 
-    /// 查询:给定 Codex APP `previous_response_id`,返回对应 grok responseId。
+    /// 查询:给定 Codex APP `previous_response_id`(包成 [`CodexResponseId`]),
+    /// 返回对应 [`GrokResponseId`]。
     ///
     /// 命中后递增 `access_count`(LRU 近似)。
     /// 返回 `None` 时,请求构建方应**省略** `parent_response_id` 字段(开新会话语义)。
-    pub fn get(&self, codex_response_id: &str) -> Option<String> {
+    pub fn get(&self, codex: &CodexResponseId) -> Option<GrokResponseId> {
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -145,9 +209,24 @@ impl ParentResponseTracker {
                 poisoned.into_inner()
             }
         };
-        let entry = inner.entries.get_mut(codex_response_id)?;
+        let entry = inner.entries.get_mut(&codex.0)?;
         entry.access_count = entry.access_count.saturating_add(1);
-        Some(entry.grok_response_id.clone())
+        Some(GrokResponseId(entry.grok_response_id.clone()))
+    }
+
+    /// 测试便捷:用 `&str` 接 `record`,内部 wrap 成 newtypes。
+    /// 生产代码**必须**用 [`Self::record`](强类型 API)。
+    #[cfg(test)]
+    pub fn record_str(&self, codex: &str, grok: &str) {
+        self.record(CodexResponseId::from(codex), GrokResponseId::from(grok));
+    }
+
+    /// 测试便捷:用 `&str` 查 + 取出 inner String。
+    /// 生产代码**必须**用 [`Self::get`](强类型 API)。
+    #[cfg(test)]
+    pub fn get_str(&self, codex: &str) -> Option<String> {
+        self.get(&CodexResponseId::from(codex))
+            .map(|g| g.into_inner())
     }
 
     /// 容量(测试用)。
@@ -192,18 +271,18 @@ mod tests {
     #[test]
     fn record_and_get_roundtrip() {
         let t = ParentResponseTracker::default();
-        t.record("resp_abc", "9f82a10c-grok-uuid");
-        assert_eq!(t.get("resp_abc").as_deref(), Some("9f82a10c-grok-uuid"));
-        assert_eq!(t.get("resp_unknown"), None);
+        t.record_str("resp_abc", "9f82a10c-grok-uuid");
+        assert_eq!(t.get_str("resp_abc").as_deref(), Some("9f82a10c-grok-uuid"));
+        assert_eq!(t.get_str("resp_unknown"), None);
         assert_eq!(t.len(), 1);
     }
 
     #[test]
     fn record_overwrites_existing_entry() {
         let t = ParentResponseTracker::default();
-        t.record("resp_abc", "old-uuid");
-        t.record("resp_abc", "new-uuid");
-        assert_eq!(t.get("resp_abc").as_deref(), Some("new-uuid"));
+        t.record_str("resp_abc", "old-uuid");
+        t.record_str("resp_abc", "new-uuid");
+        assert_eq!(t.get_str("resp_abc").as_deref(), Some("new-uuid"));
         assert_eq!(t.len(), 1);
     }
 
@@ -218,43 +297,43 @@ mod tests {
     fn lru_evicts_least_used_when_full() {
         // R1 PR-1(PR #129 P2 review thread):满 + 新 key 不在 → evict 最少 access
         let t = ParentResponseTracker::new(3);
-        t.record("a", "grok-a");
-        t.record("b", "grok-b");
-        t.record("c", "grok-c");
+        t.record_str("a", "grok-a");
+        t.record_str("b", "grok-b");
+        t.record_str("c", "grok-c");
         assert_eq!(t.len(), 3);
         // b/c 各访问一次,a 保持 0 access → 最先被 evict
-        let _ = t.get("b");
-        let _ = t.get("c");
+        let _ = t.get_str("b");
+        let _ = t.get_str("c");
         // 容量满 + 新 key "d" → evict access_count 最少的 "a"
-        t.record("d", "grok-d");
+        t.record_str("d", "grok-d");
         assert_eq!(t.len(), 3);
-        assert!(t.get("a").is_none(), "a 应被 evict");
-        assert_eq!(t.get("b").as_deref(), Some("grok-b"));
-        assert_eq!(t.get("c").as_deref(), Some("grok-c"));
-        assert_eq!(t.get("d").as_deref(), Some("grok-d"));
+        assert!(t.get_str("a").is_none(), "a 应被 evict");
+        assert_eq!(t.get_str("b").as_deref(), Some("grok-b"));
+        assert_eq!(t.get_str("c").as_deref(), Some("grok-c"));
+        assert_eq!(t.get_str("d").as_deref(), Some("grok-d"));
     }
 
     #[test]
     fn lru_does_not_evict_when_updating_existing_key() {
         let t = ParentResponseTracker::new(2);
-        t.record("a", "grok-a");
-        t.record("b", "grok-b");
+        t.record_str("a", "grok-a");
+        t.record_str("b", "grok-b");
         assert_eq!(t.len(), 2);
-        t.record("a", "grok-a-new"); // 已在,overwrite
+        t.record_str("a", "grok-a-new"); // 已在,overwrite
         assert_eq!(t.len(), 2, "更新已存在 key 不应 evict");
-        assert_eq!(t.get("a").as_deref(), Some("grok-a-new"));
-        assert_eq!(t.get("b").as_deref(), Some("grok-b"));
+        assert_eq!(t.get_str("a").as_deref(), Some("grok-a-new"));
+        assert_eq!(t.get_str("b").as_deref(), Some("grok-b"));
     }
 
     #[test]
     fn capacity_zero_is_clamped_to_one() {
         let t = ParentResponseTracker::new(0);
         assert_eq!(t.capacity(), 1);
-        t.record("a", "grok-a");
+        t.record_str("a", "grok-a");
         assert_eq!(t.len(), 1);
-        t.record("b", "grok-b");
+        t.record_str("b", "grok-b");
         assert_eq!(t.len(), 1, "容量 1 时 b 应让 a 被 evict");
-        assert!(t.get("a").is_none());
+        assert!(t.get_str("a").is_none());
     }
 
     #[test]

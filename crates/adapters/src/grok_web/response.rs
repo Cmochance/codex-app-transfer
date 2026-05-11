@@ -478,7 +478,10 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
-            global_tracker().record(state.response_id.clone(), grok_response_id);
+            global_tracker().record(
+                crate::grok_web::parent_response::CodexResponseId::from(state.response_id.clone()),
+                crate::grok_web::parent_response::GrokResponseId::from(grok_response_id),
+            );
             tracing::debug!(
                 error_id = "GROK_TRACKER_RECORDED",
                 codex_response_id = %state.response_id,
@@ -1315,7 +1318,7 @@ mod tests {
         .await;
         // 流执行后 tracker 应有记录
         assert_eq!(
-            global_tracker().get(&codex_id).as_deref(),
+            global_tracker().get_str(&codex_id).as_deref(),
             Some(grok_id),
             "multi-turn anchoring broken: modelResponse → tracker.record 未生效"
         );
