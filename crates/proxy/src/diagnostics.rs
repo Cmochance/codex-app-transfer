@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -187,17 +188,25 @@ pub(crate) fn write_wire_dump_to(base: &Path, input: &WireDumpInput) -> Option<P
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    // 进程内单调递增 seq 防 burst 场景同一毫秒 collision(`HHMMSS-pid-ms`
+    // 同值时后写覆盖前一个 dump,正好吃掉诊断"上下文丢失"最需要的 burst
+    // 证据)。`Ordering::Relaxed` 已足够 —— 只要全局唯一,不要求跨变量同步
+    let seq = WIRE_DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let filename = format!(
-        "{}-{}-{}.json",
+        "{}-{}-{}-{}.json",
         now.format("%H%M%S"),
         std::process::id(),
-        ts
+        ts,
+        seq
     );
     let path = day_dir.join(filename);
     let encoded = serde_json::to_vec_pretty(&bundle).ok()?;
     fs::write(&path, encoded).ok()?;
     Some(path)
 }
+
+/// 进程内单调递增 wire-dump 文件名计数器(防 same-ms collision,见 `write_wire_dump_to`)。
+static WIRE_DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// `bytes_payload` 的不截断版本,wire-dump 专用 —— 诊断时缺哪一段都可能漏掉
 /// 关键证据(上下文丢失就是要看完整 contents 数组),所以不限制大小。
@@ -435,6 +444,24 @@ mod tests {
         assert_eq!(v["truncated_bytes"], 0);
         assert_eq!(v["bytes"], 3);
         assert!(v["content"].as_str().unwrap_or("").len() >= 4);
+    }
+
+    #[test]
+    fn write_wire_dump_to_assigns_unique_filenames_in_burst() {
+        // burst 场景同一进程同一毫秒发多次 wire-dump 必须落到独立文件,否则
+        // `fs::write` 会覆盖最早的 dump,正好吃掉用户"切档位 retry 风暴" /
+        // "429 burst 重试"时最需要的诊断证据。`HHMMSS-pid-ms` 三元组在同
+        // 一毫秒内的多次调用会撞名,必须靠 process-local AtomicU64 兜底。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut paths = std::collections::HashSet::new();
+        for _ in 0..10 {
+            let p = write_wire_dump_to(tmp.path(), &sample_wire_dump_input(b"{}".to_vec()))
+                .expect("wire_dump write");
+            assert!(
+                paths.insert(p.clone()),
+                "重复文件名 {p:?} —— burst collision 防御失败"
+            );
+        }
     }
 
     #[test]
