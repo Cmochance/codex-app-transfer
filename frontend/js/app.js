@@ -1251,12 +1251,15 @@
     const sso = $("#grokWebSso")?.value.trim() || "";
     const ssoRw = $("#grokWebSsoRw")?.value.trim() || "";
     const cf = $("#grokWebCfClearance")?.value.trim() || "";
+    const cookieString = $("#grokWebCookieString")?.value.trim() || "";
     const statsigId = $("#grokWebStatsigId")?.value.trim() || "";
     const userAgent = $("#grokWebUserAgent")?.value.trim() || "";
-    if (!sso && !ssoRw && !cf && !statsigId && !userAgent) return null;
+    if (!sso && !ssoRw && !cf && !cookieString && !statsigId && !userAgent)
+      return null;
     const cookies = { sso };
     if (ssoRw) cookies["sso-rw"] = ssoRw;
     if (cf) cookies.cf_clearance = cf;
+    if (cookieString) cookies.cookieString = cookieString;
     const payload = { cookies };
     if (statsigId) payload.statsigId = statsigId;
     if (userAgent) payload.userAgent = userAgent;
@@ -1277,6 +1280,7 @@
       "grokWebSso",
       "grokWebSsoRw",
       "grokWebCfClearance",
+      "grokWebCookieString",
       "grokWebStatsigId",
       "grokWebUserAgent",
     ];

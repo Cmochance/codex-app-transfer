@@ -77,6 +77,19 @@ pub struct GrokCookies {
     pub cf_bm: Option<String>,
     /// 其他 cookie 透传(mixpanel/stripe/optanon/i18next 等)
     pub others: Vec<(String, String)>,
+    /// **完整 Cookie 字符串 paste**(对齐 chenyme `proxy.clearance.cf_cookies`)。
+    ///
+    /// 用户从浏览器 DevTools Network → grok.com 请求 → Request Headers →
+    /// `Cookie: ...` 整段 value 粘贴。包含 `__cf_bm` / `cf_clearance` /
+    /// `mp_xxx_mixpanel` / `__stripe_*` / `OptanonConsent` / `i18nextLng` 等。
+    ///
+    /// 拼接策略([`to_cookie_header`](Self::to_cookie_header)):忠实 chenyme
+    /// `build_sso_cookie` 行为 —— 总是先输出 `sso=X; sso-rw=X`,然后追加这一
+    /// 整段(可能内部含同名 sso/sso-rw —— grok.com 按 cookie 顺序最后值 wins,
+    /// 但实测 chenyme 不去重,我们 follow)。
+    ///
+    /// 来源:`provider.extra.grokWeb.cookies.cookieString`(单一 JSON string)。
+    pub cookie_string: Option<String>,
 }
 
 impl GrokCookies {
@@ -126,9 +139,29 @@ impl GrokCookies {
         let cf_clearance = get_optional("cf_clearance")?;
         let x_userid = get_optional("x-userid")?;
         let cf_bm = get_optional("__cf_bm")?;
+        // **整段 Cookie paste**(对齐 chenyme `proxy.clearance.cf_cookies`):
+        // user 从 DevTools Network 复制 `Cookie:` header value 整段。容忍
+        // 用户复制时多带的 "Cookie: " 前缀(常见 Chrome / Safari Copy as cURL
+        // 行为),trim 掉再存。
+        let cookie_string = get_optional("cookieString")?.map(|s| {
+            let trimmed = s.trim();
+            let stripped = trimmed
+                .strip_prefix("Cookie:")
+                .or_else(|| trimmed.strip_prefix("cookie:"))
+                .map(str::trim)
+                .unwrap_or(trimmed);
+            stripped.to_owned()
+        });
 
         // 收集"其他" cookie(实测里有:mixpanel/stripe/optanon/i18nextLng 等)
-        let known_keys = ["sso", "sso-rw", "cf_clearance", "x-userid", "__cf_bm"];
+        let known_keys = [
+            "sso",
+            "sso-rw",
+            "cf_clearance",
+            "x-userid",
+            "__cf_bm",
+            "cookieString", // 不当 cookie 透传(它是单独 paste 入口,见下方拼接)
+        ];
         let others: Vec<(String, String)> = cookies
             .iter()
             .filter_map(|(k, v)| {
@@ -147,16 +180,22 @@ impl GrokCookies {
             x_userid,
             cf_bm,
             others,
+            cookie_string,
         })
     }
 
     /// 拼成 `Cookie:` header 单行(按 RFC 6265 用 `; ` 分隔)。
     ///
-    /// - `sso` 总是出现
-    /// - `sso-rw` 缺失时复用 `sso` 值(chenyme 行为)
-    /// - `cf_clearance` 缺失时不出现该 segment
+    /// 拼接顺序(忠实 chenyme `build_sso_cookie`):
+    /// 1. `sso=<JWT>` 总是出现(必填)
+    /// 2. `sso-rw=<JWT>`(缺失时复用 sso,chenyme 行为)
+    /// 3. `cf_clearance` / `x-userid` / `__cf_bm`(各自单字段,可选)
+    /// 4. `others` 透传(mixpanel/stripe/optanon 等已知 key 之外的)
+    /// 5. **`cookieString` 整段**(可选,user 从浏览器 paste 的 Cookie header
+    ///    value;追加在最后,可能含同名重复段 —— grok.com 按 cookie 顺序处理,
+    ///    后值 wins,chenyme 也不去重 follow)
     pub fn to_cookie_header(&self) -> String {
-        let mut parts: Vec<String> = Vec::with_capacity(5 + self.others.len());
+        let mut parts: Vec<String> = Vec::with_capacity(5 + self.others.len() + 1);
         parts.push(format!("sso={}", self.sso));
         let sso_rw_val = self.sso_rw.as_deref().unwrap_or(&self.sso);
         parts.push(format!("sso-rw={sso_rw_val}"));
@@ -171,6 +210,11 @@ impl GrokCookies {
         }
         for (k, v) in &self.others {
             parts.push(format!("{k}={v}"));
+        }
+        if let Some(s) = &self.cookie_string {
+            if !s.is_empty() {
+                parts.push(s.clone());
+            }
         }
         parts.join("; ")
     }
@@ -577,6 +621,7 @@ mod tests {
             x_userid: None,
             cf_bm: None,
             others: vec![],
+            cookie_string: None,
         };
         let h = c.to_cookie_header();
         assert!(h.contains("sso=JWT-X"));
@@ -593,6 +638,7 @@ mod tests {
             x_userid: Some("d".into()),
             cf_bm: None,
             others: vec![("i18nextLng".into(), "zh".into())],
+            cookie_string: None,
         };
         let h = c.to_cookie_header();
         assert!(h.contains("sso=a"));
@@ -600,6 +646,47 @@ mod tests {
         assert!(h.contains("cf_clearance=c"));
         assert!(h.contains("x-userid=d"));
         assert!(h.contains("i18nextLng=zh"));
+    }
+
+    #[test]
+    fn cookie_string_paste_appended_to_header() {
+        // user E2E 反馈(2026-05-12):SuperGrok + CF challenge 网络要求完整
+        // Cookie 整段,单字段 sso/cf_clearance 不够。textarea 让用户 paste
+        // 整段 Cookie header value(可能含 Cookie: 前缀,trim 掉)。
+        let c = GrokCookies {
+            sso: "JWT-X".into(),
+            sso_rw: None,
+            cf_clearance: None,
+            x_userid: None,
+            cf_bm: None,
+            others: vec![],
+            cookie_string: Some(
+                "__cf_bm=Z; mp_xxx_mixpanel=Y; OptanonConsent=isGpcEnabled=0".into(),
+            ),
+        };
+        let h = c.to_cookie_header();
+        // 顺序:sso → sso-rw → 整段追加
+        assert!(h.starts_with("sso=JWT-X; sso-rw=JWT-X; __cf_bm=Z;"));
+        assert!(h.contains("OptanonConsent="));
+    }
+
+    #[test]
+    fn cookie_string_paste_strips_cookie_header_prefix() {
+        // 容忍 user 复制时多带 "Cookie: " 前缀(Chrome / Safari Copy as cURL
+        // 默认行为)
+        let p = provider_with_grok_web(json!({
+            "grokWeb": {
+                "cookies": {
+                    "sso": "JWT",
+                    "cookieString": "Cookie: __cf_bm=A; cf_clearance=B"
+                }
+            }
+        }));
+        let c = GrokCookies::from_provider(&p).unwrap();
+        let h = c.to_cookie_header();
+        // "Cookie: " 前缀已剥(整段从 __cf_bm= 开始)
+        assert!(h.ends_with("__cf_bm=A; cf_clearance=B"));
+        assert!(!h.contains("Cookie: "));
     }
 
     #[test]

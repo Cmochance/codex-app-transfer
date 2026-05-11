@@ -184,12 +184,17 @@
                   <input class="form-control" id="grokWebSso" type="password" autocomplete="off" spellcheck="false">
                 </div>
                 <details class="mb-3">
-                  <summary class="small text-muted" data-i18n="grokWeb.advancedSummary" style="cursor:pointer;">高级选项(默认无需填写)</summary>
+                  <summary class="small text-muted" data-i18n="grokWeb.advancedSummary" style="cursor:pointer;">高级选项(401 / CF challenge 时展开补充)</summary>
                   <div class="mt-2 ps-2 border-start">
                     <div class="mb-2">
-                      <label class="form-label small" for="grokWebCfClearance" data-i18n="grokWeb.cfClearanceLabel">cf_clearance(可选,CF challenge 时填)</label>
+                      <label class="form-label small" for="grokWebCookieString" data-i18n="grokWeb.cookieStringLabel">完整 Cookie 字符串(CF challenge 时必填)</label>
+                      <textarea class="form-control" id="grokWebCookieString" rows="3" autocomplete="off" spellcheck="false" placeholder="__cf_bm=...; cf_clearance=...; mp_xxx_mixpanel=...; ..."></textarea>
+                      <p class="field-hint" data-i18n="grokWeb.cookieStringHint">浏览器 DevTools → Network → grok.com 任一请求 → Request Headers → 整行 Cookie value 复制粘贴(可带 "Cookie: " 前缀,自动 strip)。grok.com Cloudflare 401 "No credentials presented" 即缺这一段。对齐 chenyme/grok2api `proxy.clearance.cf_cookies`。</p>
+                    </div>
+                    <div class="mb-2">
+                      <label class="form-label small" for="grokWebCfClearance" data-i18n="grokWeb.cfClearanceLabel">cf_clearance(可选,单 token)</label>
                       <input class="form-control" id="grokWebCfClearance" type="password" autocomplete="off" spellcheck="false">
-                      <p class="field-hint" data-i18n="grokWeb.cfClearanceHint">网络已通过 Cloudflare 时不需要填;遇 403 时从浏览器 Application → Cookies → cf_clearance 复制,~7 天过期。</p>
+                      <p class="field-hint" data-i18n="grokWeb.cfClearanceHint">如已 paste 完整 Cookie 字符串无需填。单独填只发 `cf_clearance=` segment(可能不够);整段 paste 更稳。</p>
                     </div>
                     <div class="mb-2">
                       <label class="form-label small" for="grokWebSsoRw" data-i18n="grokWeb.ssoRwLabel">sso-rw(可选,默认复用 sso)</label>
