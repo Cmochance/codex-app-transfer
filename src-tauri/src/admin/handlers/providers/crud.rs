@@ -188,8 +188,20 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
             return err(StatusCode::BAD_REQUEST, format_header_errs(&errs)).into_response();
         }
     }
-    // silent-failure-hunter H2:grokWeb 结构在 save 时校验,不让 "save success →
-    // chat 时报 missing-cookies / upstream 401" 这种迷惑链发生。
+    // silent-failure-hunter H2 + chatgpt-codex P2:grokWeb 结构在 save 时校验,
+    // 不让 "save success → chat 时报 missing-cookies / upstream 401" 这种迷惑链
+    // 发生。**add_provider 额外要求**:apiFormat=grok_web 时 grokWeb 必填(否则
+    // 用户填空 cookie 提交 → frontend collectGrokWebPayload 返 null → input 不
+    // 带 grokWeb → 这个 if-let-Some 不跑 → 保存成功 → chat 时再炸)。
+    let is_grok_web =
+        super::normalize_provider_api_format(input.api_format.as_deref()) == "grok_web";
+    if is_grok_web && input.grok_web.as_ref().map(Value::is_null).unwrap_or(true) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "apiFormat=grok_web 需要 grokWeb.cookies.sso(JWT,非空 string);从 grok.com 浏览器 cookies 复制",
+        )
+        .into_response();
+    }
     if let Some(gw) = input.grok_web.as_ref() {
         if let Err(errs) = validate_grok_web_input(gw) {
             return err(StatusCode::BAD_REQUEST, format_grok_web_errs(&errs)).into_response();

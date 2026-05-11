@@ -1219,14 +1219,18 @@
         apiKeyRow.hidden = true;
       }
     }
-    if (apiKeyInput) {
-      // required attribute 兜底:grok_web 不需要 apiKey 必填,否则浏览器 form
-      // validation 会卡住 submit(即使 input 被 hidden div 包着,required 仍校验)
-      if (isGrokWeb) {
-        apiKeyInput.required = false;
-      } else {
-        apiKeyInput.required = true;
-      }
+    if (apiKeyInput && isGrokWeb) {
+      // required 兜底:grok_web 不需要 apiKey 必填,否则浏览器 form validation 会
+      // 卡住 submit(即使 input 被 hidden div 包着,required 仍校验)。
+      //
+      // **chatgpt-codex P1 修(2026-05-12)**:**不**在非 grok_web 时无条件设
+      // `required = true` —— OAuth modes(gemini_cli_oauth / antigravity_oauth)
+      // 由 setOauthRowState 自己管理 required(它走 dataset.origRequired
+      // 保存/恢复机制,1308-1313 行),无条件覆盖会让 OAuth 模式 hidden apiKey
+      // 仍 required → form submit 静默被浏览器拒。chain 调用顺序是
+      // setOauthRowState → setGrokWebRowState,我们离开 grok_web 时**不动**,
+      // 让上游 setter 的决定生效。
+      apiKeyInput.required = false;
     }
     if (isGrokWeb) {
       const authEl = $("#providerAuth");
