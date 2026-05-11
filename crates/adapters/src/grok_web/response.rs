@@ -85,7 +85,6 @@ pub fn convert_grok_sse_to_responses_sse(
     upstream_stream: ByteStream,
     response_id: String,
 ) -> ByteStream {
-    let initial_event = emit_response_created(&response_id);
     let mut state = ConvState {
         upstream: upstream_stream,
         response_id,
@@ -99,8 +98,12 @@ pub fn convert_grok_sse_to_responses_sse(
         open_message: None,
         pending_url_citations: Vec::new(),
         grok_render_strip: GrokRenderStrip::new(),
+        sequence_number: 0,
     };
-    // 先把 response.created 塞进 pending(unfold 第一步立即 yield)
+    // 先把 response.created 塞进 pending(unfold 第一步立即 yield),
+    // 并把 sequence_number 注入 — state.sequence_number 从 0 起,emit_response_created
+    // 把它写进 event JSON 后递增到 1
+    let initial_event = emit_response_created(&mut state.sequence_number, &state.response_id);
     state.pending.push_back(initial_event);
 
     let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
@@ -120,15 +123,21 @@ pub fn convert_grok_sse_to_responses_sse(
                         let trailing = s.grok_render_strip.finalize();
                         if !trailing.is_empty() {
                             open_message_if_needed(&mut s);
-                            if let Some(msg) = s.open_message.as_mut() {
+                            let (item_id, output_index) = if let Some(msg) = s.open_message.as_mut()
+                            {
                                 msg.text_acc.push_str(&trailing);
-                                let item_id = msg.item_id.clone();
-                                let output_index = msg.output_index;
-                                s.pending.push_back(emit_output_text_delta_for_item(
+                                (Some(msg.item_id.clone()), msg.output_index)
+                            } else {
+                                (None, 0)
+                            };
+                            if let Some(item_id) = item_id {
+                                let event = emit_output_text_delta_for_item(
+                                    &mut s.sequence_number,
                                     &item_id,
                                     output_index,
                                     &trailing,
-                                ));
+                                );
+                                s.pending.push_back(event);
                                 s.received_any_final_token = true;
                             }
                         }
@@ -156,11 +165,13 @@ pub fn convert_grok_sse_to_responses_sse(
                         s.emitted_completed = true;
                         // received_any_final_token=false → 上游中断未收到任何最终
                         // 答案,绝不能 emit response.completed 伪装成功(review-feedback A2)
+                        let response_id = s.response_id.clone();
                         let event = if s.received_any_final_token {
-                            emit_response_completed(&s.response_id)
+                            emit_response_completed(&mut s.sequence_number, &response_id)
                         } else {
                             emit_response_failed(
-                                &s.response_id,
+                                &mut s.sequence_number,
+                                &response_id,
                                 "upstream_truncated",
                                 "grok.com SSE stream ended before emitting any final token or soft-stop",
                             )
@@ -190,11 +201,14 @@ pub fn convert_grok_sse_to_responses_sse(
                         // 不 yield raw Err(那会让 Codex APP 看到无标签错误后被后续
                         // completed 伪装成功),改 push response.failed 后置 emitted_completed
                         // gate 流末防御。
-                        s.pending.push_back(emit_response_failed(
-                            &s.response_id,
+                        let response_id = s.response_id.clone();
+                        let event = emit_response_failed(
+                            &mut s.sequence_number,
+                            &response_id,
                             "upstream_transport_error",
                             &format!("grok.com SSE transport error: {e}"),
-                        ));
+                        );
+                        s.pending.push_back(event);
                         s.emitted_completed = true;
                         s.upstream_exhausted = true;
                     }
@@ -293,9 +307,16 @@ pub fn convert_grok_error_to_responses_failure_stream(
                 };
 
                 // 两个事件拼一起 yield(避免 mock stream 单 chunk 截断 SSE 帧)
+                // 短路 4xx 路径无 ConvState,自己起 local seq 计数器(从 0 起)
+                let mut local_seq: u64 = 0;
                 let mut buf = Vec::with_capacity(512);
-                buf.extend_from_slice(&emit_response_created(&response_id));
-                buf.extend_from_slice(&emit_response_failed(&response_id, &final_code, &message));
+                buf.extend_from_slice(&emit_response_created(&mut local_seq, &response_id));
+                buf.extend_from_slice(&emit_response_failed(
+                    &mut local_seq,
+                    &response_id,
+                    &final_code,
+                    &message,
+                ));
                 Some((Ok(Bytes::from(buf)), (input, true)))
             }
         }),
@@ -567,6 +588,13 @@ struct ConvState {
     /// 累积到能判断"在 grok:render 内"或"安全文本";完整 close tag 出现
     /// 后丢弃整块,emit 后续 safe text。
     grok_render_strip: GrokRenderStrip,
+    /// OpenAI Responses API 要求每个 SSE event 都带 `sequence_number`(monotonic u64
+    /// 自 response.created 起 0 递增)。Codex APP SDK 用它做事件排序 / 去重 / UI
+    /// 渲染关联。**缺失会让 reasoning + streaming UI 静默不渲染**(2026-05-12
+    /// user E2E 实测:50 reasoning + 1559 delta events 真 emit 但 UI 看不到 —
+    /// proxy log 验证 events 真发出,Codex APP SDK 不识别就丢)。gemini_native
+    /// 同字段(`response.rs:158 sequence_number: u64`)gemini OK,grok 缺这个是根因。
+    sequence_number: u64,
 }
 
 /// 从 `line_buf` 切出所有完整 line,parse 成 Codex SSE events 入 pending。
@@ -598,11 +626,14 @@ fn process_buffered_lines(state: &mut ConvState) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("upstream error frame without message")
                 .to_owned();
-            state.pending.push_back(emit_response_failed(
-                &state.response_id,
+            let response_id = state.response_id.clone();
+            let event = emit_response_failed(
+                &mut state.sequence_number,
+                &response_id,
                 "grok_stream_error",
                 &msg,
-            ));
+            );
+            state.pending.push_back(event);
             state.emitted_completed = true;
             state.upstream_exhausted = true;
             continue;
@@ -653,6 +684,7 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
                         let item_id = msg.item_id.clone();
                         let output_index = msg.output_index;
                         state.pending.push_back(emit_output_text_delta_for_item(
+                            &mut state.sequence_number,
                             &item_id,
                             output_index,
                             &clean,
@@ -692,13 +724,21 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         if let Some(tok) = &frame.token {
             if !tok.is_empty() {
                 open_reasoning_if_needed(state);
-                if let Some(rs) = state.open_reasoning.as_mut() {
+                let (rs_item_id, rs_output_index) = if let Some(rs) = state.open_reasoning.as_mut()
+                {
                     rs.text_acc.push_str(tok);
-                    state.pending.push_back(emit_reasoning_summary_text_delta(
-                        &rs.item_id,
-                        rs.output_index,
+                    (Some(rs.item_id.clone()), rs.output_index)
+                } else {
+                    (None, 0)
+                };
+                if let Some(item_id) = rs_item_id {
+                    let event = emit_reasoning_summary_text_delta(
+                        &mut state.sequence_number,
+                        &item_id,
+                        rs_output_index,
                         tok,
-                    ));
+                    );
+                    state.pending.push_back(event);
                 }
             }
         }
@@ -743,11 +783,13 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
                     msg.text_acc.push_str(&cards_md);
                     let item_id = msg.item_id.clone();
                     let output_index = msg.output_index;
-                    state.pending.push_back(emit_output_text_delta_for_item(
+                    let event = emit_output_text_delta_for_item(
+                        &mut state.sequence_number,
                         &item_id,
                         output_index,
                         &cards_md,
-                    ));
+                    );
+                    state.pending.push_back(event);
                     state.received_any_final_token = true;
                     tracing::debug!(
                         error_id = "GROK_RENDER_CARDS_APPENDED",
@@ -775,6 +817,7 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
                         let item_id = rs.item_id.clone();
                         let output_index = rs.output_index;
                         state.pending.push_back(emit_reasoning_summary_text_delta(
+                            &mut state.sequence_number,
                             &item_id,
                             output_index,
                             &line,
@@ -826,11 +869,13 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
                 rs.text_acc.push_str(&summary);
                 let item_id = rs.item_id.clone();
                 let output_index = rs.output_index;
-                state.pending.push_back(emit_reasoning_summary_text_delta(
+                let event = emit_reasoning_summary_text_delta(
+                    &mut state.sequence_number,
                     &item_id,
                     output_index,
                     &summary,
-                ));
+                );
+                state.pending.push_back(event);
             }
         }
     }
@@ -840,9 +885,9 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         close_reasoning_if_open(state);
         close_message_if_open(state);
         state.emitted_completed = true;
-        state
-            .pending
-            .push_back(emit_response_completed(&state.response_id));
+        let response_id = state.response_id.clone();
+        let event = emit_response_completed(&mut state.sequence_number, &response_id);
+        state.pending.push_back(event);
     }
 }
 
@@ -1199,8 +1244,9 @@ fn accumulate_generic_search_url_citations(state: &mut ConvState, grouping: &ser
 // Event 构造 helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn emit_response_created(response_id: &str) -> Bytes {
+fn emit_response_created(seq: &mut u64, response_id: &str) -> Bytes {
     emit_event(
+        seq,
         "response.created",
         serde_json::json!({
             "type": "response.created",
@@ -1233,6 +1279,7 @@ fn open_reasoning_if_needed(state: &mut ConvState) {
     let output_index = state.next_output_index;
     state.next_output_index += 1;
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.output_item.added",
         serde_json::json!({
             "type": "response.output_item.added",
@@ -1248,6 +1295,7 @@ fn open_reasoning_if_needed(state: &mut ConvState) {
         }),
     ));
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.reasoning_summary_part.added",
         serde_json::json!({
             "type": "response.reasoning_summary_part.added",
@@ -1265,8 +1313,14 @@ fn open_reasoning_if_needed(state: &mut ConvState) {
 }
 
 /// thinking token 增量 emit。调用前必须先 [`open_reasoning_if_needed`]。
-fn emit_reasoning_summary_text_delta(item_id: &str, output_index: u32, delta: &str) -> Bytes {
+fn emit_reasoning_summary_text_delta(
+    seq: &mut u64,
+    item_id: &str,
+    output_index: u32,
+    delta: &str,
+) -> Bytes {
     emit_event(
+        seq,
         "response.reasoning_summary_text.delta",
         serde_json::json!({
             "type": "response.reasoning_summary_text.delta",
@@ -1291,6 +1345,7 @@ fn close_reasoning_if_open(state: &mut ConvState) {
         return;
     };
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.reasoning_summary_text.done",
         serde_json::json!({
             "type": "response.reasoning_summary_text.done",
@@ -1301,6 +1356,7 @@ fn close_reasoning_if_open(state: &mut ConvState) {
         }),
     ));
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.reasoning_summary_part.done",
         serde_json::json!({
             "type": "response.reasoning_summary_part.done",
@@ -1311,6 +1367,7 @@ fn close_reasoning_if_open(state: &mut ConvState) {
         }),
     ));
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.output_item.done",
         serde_json::json!({
             "type": "response.output_item.done",
@@ -1327,8 +1384,9 @@ fn close_reasoning_if_open(state: &mut ConvState) {
     ));
 }
 
-fn emit_output_text_delta(delta: &str) -> Bytes {
+fn emit_output_text_delta(seq: &mut u64, delta: &str) -> Bytes {
     emit_event(
+        seq,
         "response.output_text.delta",
         serde_json::json!({
             "type": "response.output_text.delta",
@@ -1357,6 +1415,7 @@ fn open_message_if_needed(state: &mut ConvState) {
     let output_index = state.next_output_index;
     state.next_output_index += 1;
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.output_item.added",
         serde_json::json!({
             "type": "response.output_item.added",
@@ -1371,6 +1430,7 @@ fn open_message_if_needed(state: &mut ConvState) {
         }),
     ));
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.content_part.added",
         serde_json::json!({
             "type": "response.content_part.added",
@@ -1389,8 +1449,14 @@ fn open_message_if_needed(state: &mut ConvState) {
 }
 
 /// 关联到 message item_id / output_index 的 output_text.delta。
-fn emit_output_text_delta_for_item(item_id: &str, output_index: u32, delta: &str) -> Bytes {
+fn emit_output_text_delta_for_item(
+    seq: &mut u64,
+    item_id: &str,
+    output_index: u32,
+    delta: &str,
+) -> Bytes {
     emit_event(
+        seq,
         "response.output_text.delta",
         serde_json::json!({
             "type": "response.output_text.delta",
@@ -1415,6 +1481,7 @@ fn close_message_if_open(state: &mut ConvState) {
     };
     let annotations = serde_json::Value::Array(msg.annotations_acc.clone());
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.output_text.done",
         serde_json::json!({
             "type": "response.output_text.done",
@@ -1426,6 +1493,7 @@ fn close_message_if_open(state: &mut ConvState) {
         }),
     ));
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.content_part.done",
         serde_json::json!({
             "type": "response.content_part.done",
@@ -1440,6 +1508,7 @@ fn close_message_if_open(state: &mut ConvState) {
         }),
     ));
     state.pending.push_back(emit_event(
+        &mut state.sequence_number,
         "response.output_item.done",
         serde_json::json!({
             "type": "response.output_item.done",
@@ -1475,6 +1544,7 @@ fn flush_pending_url_citations(state: &mut ConvState) {
     let citations = std::mem::take(&mut state.pending_url_citations);
     for (annotation_index, citation) in citations.into_iter().enumerate() {
         state.pending.push_back(emit_event(
+            &mut state.sequence_number,
             "response.output_text.annotation.added",
             serde_json::json!({
                 "type": "response.output_text.annotation.added",
@@ -1571,8 +1641,14 @@ fn accumulate_x_search_url_citations(state: &mut ConvState, xsr: &serde_json::Va
 ///
 /// 字段对齐 [OpenAI Responses API spec](https://platform.openai.com/docs/api-reference/responses):
 /// `response.failed` 顶层 `error.code` + `error.message` 两个必需字段。
-pub(crate) fn emit_response_failed(response_id: &str, code: &str, message: &str) -> Bytes {
+pub(crate) fn emit_response_failed(
+    seq: &mut u64,
+    response_id: &str,
+    code: &str,
+    message: &str,
+) -> Bytes {
     emit_event(
+        seq,
         "response.failed",
         serde_json::json!({
             "type": "response.failed",
@@ -1589,8 +1665,9 @@ pub(crate) fn emit_response_failed(response_id: &str, code: &str, message: &str)
     )
 }
 
-fn emit_response_completed(response_id: &str) -> Bytes {
+fn emit_response_completed(seq: &mut u64, response_id: &str) -> Bytes {
     emit_event(
+        seq,
         "response.completed",
         serde_json::json!({
             "type": "response.completed",
@@ -1603,8 +1680,19 @@ fn emit_response_completed(response_id: &str) -> Bytes {
     )
 }
 
-/// 把 `event: <name>\ndata: <json>\n\n` 拼成 SSE 字节段。
-fn emit_event(event: &str, data: serde_json::Value) -> Bytes {
+/// 把 `event: <name>\ndata: <json>\n\n` 拼成 SSE 字节段,**自动注入
+/// `sequence_number`**(OpenAI Responses API 要求,Codex APP SDK 用它做事件排序)。
+///
+/// 调用方传 `seq: &mut u64`,本 fn 写入 data.sequence_number = *seq 后 *seq += 1。
+/// 来自 [`ConvState::sequence_number`](ConvState),per-request monotonic 从 0 起。
+fn emit_event(seq: &mut u64, event: &str, mut data: serde_json::Value) -> Bytes {
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "sequence_number".into(),
+            serde_json::Value::Number((*seq).into()),
+        );
+    }
+    *seq += 1;
     let mut out = String::with_capacity(128);
     out.push_str("event: ");
     out.push_str(event);
