@@ -446,6 +446,59 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         }
     }
 
+    // tool_usage_card 帧(R1 PR-2):模型调用 grok 内置 / MCP 工具,emit 帧
+    // 含 toolUsageCard.{webSearch|browsePage|...|mcp} 字段。我们把它格式化成
+    // markdown 一行(`🔍 web_search: query="..."` / `🔌 test___ask_question: {...}`)
+    // 拼到当前 reasoning summary —— grok server-side state 自己 dispatch,
+    // 不需要 Codex APP 走 function_call event 回调(那是 client-side tool 路径)。
+    if matches!(tag, Some(GrokMessageTag::ToolUsageCard)) {
+        if let Some(card) = &frame.tool_usage_card {
+            if let Some(call) = crate::grok_web::types::GrokToolCall::parse(card) {
+                let line = format_tool_call_for_reasoning(&call);
+                if !line.is_empty() {
+                    open_reasoning_if_needed(state);
+                    if let Some(rs) = state.open_reasoning.as_mut() {
+                        rs.text_acc.push_str(&line);
+                        let item_id = rs.item_id.clone();
+                        let output_index = rs.output_index;
+                        state.pending.push_back(emit_reasoning_summary_text_delta(
+                            &item_id,
+                            output_index,
+                            &line,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // raw_function_result 数据帧(R1 PR-2 简化版):webSearchResults / xSearchResults
+    // 出现时,转 markdown bullet list 拼到 reasoning summary。
+    // **不**做结构化 url_citation annotation(那需要 message item 而不是 reasoning,
+    // 留 PR-3 处理)。空 token 收尾帧不动。
+    if matches!(tag, Some(GrokMessageTag::RawFunctionResult)) {
+        let mut summary = String::new();
+        if let Some(wsr) = &frame.web_search_results {
+            summary.push_str(&format_web_search_results_for_reasoning(wsr));
+        }
+        if let Some(xsr) = &frame.x_search_results {
+            summary.push_str(&format_x_search_results_for_reasoning(xsr));
+        }
+        if !summary.is_empty() {
+            open_reasoning_if_needed(state);
+            if let Some(rs) = state.open_reasoning.as_mut() {
+                rs.text_acc.push_str(&summary);
+                let item_id = rs.item_id.clone();
+                let output_index = rs.output_index;
+                state.pending.push_back(emit_reasoning_summary_text_delta(
+                    &item_id,
+                    output_index,
+                    &summary,
+                ));
+            }
+        }
+    }
+
     // 流末标志 — softStop 前也必须 close open_reasoning(P1 fix lifecycle)
     if frame.is_soft_stop == Some(true) && !state.emitted_completed {
         close_reasoning_if_open(state);
@@ -454,23 +507,127 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
             .pending
             .push_back(emit_response_completed(&state.response_id));
     }
+}
 
-    // 其他帧 R3 不翻译,debug log 记录(R1 PR 会逐一接管)
-    if let Some(t) = tag {
-        if matches!(
-            t,
-            GrokMessageTag::Header
-                | GrokMessageTag::Summary
-                | GrokMessageTag::ToolUsageCard
-                | GrokMessageTag::RawFunctionResult
-        ) {
-            tracing::debug!(
-                error_id = "GROK_FRAME_R3_DROPPED",
-                tag = ?t,
-                "grok_web R3 dropping frame (R1 will handle)"
-            );
+/// 把一个 [`GrokToolCall`] 格式化成 reasoning summary 一行 markdown。
+///
+/// 形态:
+/// - Builtin:`\n🔍 web_search: query="..."` / `🌐 browse_page: url="..."`
+/// - MCP:    `\n🔌 test___ask_question: {"repoName":"..."}`(args JSON 截断 200 字)
+///
+/// 前缀 `\n` 用于在 reasoning summary 中独占一行(text_acc 累积时不与前一段粘连)。
+fn format_tool_call_for_reasoning(call: &crate::grok_web::types::GrokToolCall) -> String {
+    use crate::grok_web::types::GrokToolCall;
+    const MAX_ARG_PREVIEW: usize = 200;
+    match call {
+        GrokToolCall::Builtin { name, args } => {
+            let icon = builtin_tool_icon(name);
+            // 优先抽 query / url / image_description 等"主参数"为简短形式;
+            // 其余 args 字段省略(R1 PR-2 简化,reasoning UI 主要给用户看)
+            let primary = primary_arg_for_builtin(name, args);
+            if primary.is_empty() {
+                format!("\n{icon} {name}")
+            } else {
+                format!("\n{icon} {name}: {primary}")
+            }
+        }
+        GrokToolCall::Mcp {
+            tool_name,
+            tool_args_json,
+        } => {
+            let preview = if tool_args_json.chars().count() > MAX_ARG_PREVIEW {
+                let truncated: String = tool_args_json.chars().take(MAX_ARG_PREVIEW).collect();
+                format!("{truncated}…")
+            } else {
+                tool_args_json.clone()
+            };
+            format!("\n🔌 {tool_name}: {preview}")
         }
     }
+}
+
+/// 内置工具名 → emoji 图标(对照 chenyme `xai_chat.py::_TOOL_FMT`)。
+fn builtin_tool_icon(name: &str) -> &'static str {
+    match name {
+        "web_search" | "x_search" | "x_keyword_search" | "x_semantic_search" => "🔍",
+        "browse_page" => "🌐",
+        "search_images" | "image_search" => "🖼️",
+        "chatroom_send" => "📋",
+        "code_execution" => "💻",
+        _ => "🔧",
+    }
+}
+
+/// 抽内置工具的"主参数"字符串展示(简短,reasoning UI 用)。
+fn primary_arg_for_builtin(name: &str, args: &serde_json::Value) -> String {
+    let key = match name {
+        "web_search" | "x_search" | "x_keyword_search" | "x_semantic_search" => "query",
+        "browse_page" => "url",
+        "search_images" | "image_search" => "image_description",
+        _ => return String::new(),
+    };
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| format!("\"{s}\""))
+        .unwrap_or_default()
+}
+
+/// 把 `webSearchResults.results` 数组转 markdown bullet list 拼到 reasoning。
+///
+/// 实测帧形态(R1 抓包):`{"results":[{"url":"...","title":"...","preview":"..."}]}`
+/// 最多列前 5 条(避免 reasoning summary 爆长)。
+fn format_web_search_results_for_reasoning(wsr: &serde_json::Value) -> String {
+    let Some(results) = wsr.get("results").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if results.is_empty() {
+        return String::new();
+    }
+    const MAX_RESULTS: usize = 5;
+    let mut s = String::new();
+    for r in results.iter().take(MAX_RESULTS) {
+        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or(url);
+        if url.is_empty() {
+            continue;
+        }
+        s.push_str(&format!("\n  · [{title}]({url})"));
+    }
+    if results.len() > MAX_RESULTS {
+        s.push_str(&format!("\n  · …({} more)", results.len() - MAX_RESULTS));
+    }
+    s
+}
+
+/// 把 `xSearchResults.results`(X/Twitter 帖子)转 markdown bullet list。
+///
+/// 实测帧形态:`{"results":[{"postId":"...","username":"...","text":"..."}]}`
+fn format_x_search_results_for_reasoning(xsr: &serde_json::Value) -> String {
+    let Some(results) = xsr.get("results").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if results.is_empty() {
+        return String::new();
+    }
+    const MAX_RESULTS: usize = 5;
+    let mut s = String::new();
+    for r in results.iter().take(MAX_RESULTS) {
+        let username = r.get("username").and_then(|v| v.as_str()).unwrap_or("");
+        let text = r.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let post_id = r.get("postId").and_then(|v| v.as_str()).unwrap_or("");
+        if username.is_empty() || post_id.is_empty() {
+            continue;
+        }
+        let preview: String = text.chars().take(60).collect();
+        s.push_str(&format!(
+            "\n  · 𝕏 @{username}: {preview}{} (https://x.com/{username}/status/{post_id})",
+            if text.chars().count() > 60 { "…" } else { "" }
+        ));
+    }
+    if results.len() > MAX_RESULTS {
+        s.push_str(&format!("\n  · …({} more)", results.len() - MAX_RESULTS));
+    }
+    s
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -931,6 +1088,72 @@ mod tests {
         ))
         .await;
         assert!(out.contains(r#""code":"server_error""#));
+    }
+
+    #[tokio::test]
+    async fn tool_usage_card_builtin_web_search_appends_to_reasoning() {
+        // R1 PR-2:tool_usage_card 帧 → reasoning summary markdown line
+        // 内置 web_search 工具调用应转成 `🔍 web_search: query="..."` 拼到 thinking 流
+        let lines = vec![
+            r#"{"result":{"response":{"token":"thinking","messageTag":"header","isThinking":true}}}"#,
+            r#"{"result":{"response":{"messageTag":"tool_usage_card","isThinking":true,"toolUsageCardId":"c1","toolUsageCard":{"toolUsageCardId":"c1","webSearch":{"args":{"query":"Rust async"}}}}}}"#,
+            r#"{"result":{"response":{"token":"answer","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        // tool_usage_card 帧应作为 reasoning summary text.delta emit
+        assert!(
+            out.contains("🔍 web_search"),
+            "应有 web_search 图标 + 名字: {out}"
+        );
+        assert!(out.contains(r#"Rust async"#), "应含 query 参数: {out}");
+        // 这些应出现在 reasoning_summary_text.delta 事件中,不污染 output_text
+        assert!(
+            !out.contains(r#""type":"response.output_text.delta","delta":"\n🔍"#),
+            "tool_usage_card 不应进 output_text.delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_usage_card_mcp_appends_to_reasoning() {
+        // R1 PR-2:MCP `call_connected_tool` wrapper 帧
+        let lines = vec![
+            r#"{"result":{"response":{"messageTag":"tool_usage_card","isThinking":true,"toolUsageCardId":"c1","toolUsageCard":{"toolUsageCardId":"c1","mcp":{"toolName":"test___ask_question","toolArgsJson":"{\"repoName\":\"foo/bar\"}"}}}}}"#,
+            r#"{"result":{"response":{"token":"done","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        assert!(
+            out.contains("🔌 test___ask_question"),
+            "MCP 应有插头图标 + 三下划线 namespace"
+        );
+        assert!(out.contains(r#"foo/bar"#), "应含 args JSON 预览");
+    }
+
+    #[tokio::test]
+    async fn raw_function_result_web_search_appends_bullet_list() {
+        // R1 PR-2:raw_function_result webSearchResults → markdown bullet list 拼 reasoning
+        let lines = vec![
+            r#"{"result":{"response":{"messageTag":"tool_usage_card","isThinking":true,"toolUsageCardId":"c1","toolUsageCard":{"toolUsageCardId":"c1","webSearch":{"args":{"query":"MCP"}}}}}"#,
+            r#"{"result":{"response":{"messageTag":"raw_function_result","webSearchResults":{"results":[{"url":"https://modelcontextprotocol.io","title":"MCP Home","preview":"open standard"},{"url":"https://anthropic.com/news/model-context-protocol","title":"MCP Intro"}]}}}}"#,
+            r#"{"result":{"response":{"token":"done","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        assert!(out.contains("[MCP Home](https://modelcontextprotocol.io)"));
+        assert!(out.contains("[MCP Intro](https://anthropic.com/news/model-context-protocol)"));
     }
 
     #[tokio::test]
