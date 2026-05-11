@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
-use crate::responses::input::{merge_messages_with_previous_response, response_id_for_session};
+use crate::responses::input::response_id_for_session;
 use crate::responses::ResponseSessionCache;
 use crate::types::{AdapterError, ResponseSessionPlan};
 
@@ -76,16 +76,23 @@ pub fn responses_body_to_gemini_request_with_session(
 ) -> Result<GeminiResponsesRequestConversion, AdapterError> {
     // Step 1: Codex.app /responses → 归一化 chat-shape 中间表示
     let mut chat_body = responses_body_to_normalized_chat(body)?;
-    // Step 1.5: previous_response_id 会话恢复(与 ResponsesAdapter 对齐)
-    let current_messages = chat_body
+
+    // Step 1.5: 复用 responses 输入主管道统一处理 previous_response_id +
+    // tool_call_cache 修复接线，避免 gemini_native 维护并漂移一套历史恢复逻辑。
+    let responses_conversion =
+        crate::responses::responses_body_to_chat_body_for_provider_with_session(
+            body,
+            None,
+            session_cache,
+        )?;
+    let merged_messages = responses_conversion.response_session.messages;
+    let normalized_messages = responses_conversion
+        .body
         .get("messages")
-        .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
-    let merged_messages =
-        merge_messages_with_previous_response(current_messages, body, session_cache)?;
+        .ok_or_else(|| AdapterError::Internal("responses conversion missing messages".into()))?;
     if let Some(obj) = chat_body.as_object_mut() {
-        obj.insert("messages".into(), Value::Array(merged_messages.clone()));
+        obj.insert("messages".into(), normalized_messages);
     }
     // Step 2: chat → Gemini wire(LiteLLM 1:1 移植)
     let request = chat_normalized_to_gemini_request(&chat_body, provider)?;
