@@ -264,6 +264,34 @@ fn is_strip_on_forward(name: &str) -> bool {
     false
 }
 
+/// grok.com Web 后端反代必需 / 我们要独占注入的 header 名集合(见
+/// `crates/adapters/src/grok_web/auth.rs::apply_grok_headers`)。
+///
+/// **仅在 `AuthScheme::GrokCookie` 下应用** —— 入站客户端的同名 header
+/// 会被 strip,grok_web::auth 拥有这些 header 的独占注入权,防止
+/// `reqwest::header()` append 语义触发 dup-header(grok.com 看到双 Cookie 会
+/// session 错乱)。
+fn is_grok_owned_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "cookie"
+            | "origin"
+            | "referer"
+            | "accept"
+            | "accept-language"
+            | "accept-encoding"
+            | "sec-fetch-site"
+            | "sec-fetch-mode"
+            | "sec-fetch-dest"
+            | "x-statsig-id"
+            | "x-xai-request-id"
+            | "traceparent"
+            | "sentry-trace"
+            | "baggage"
+    )
+}
+
 pub async fn forward_handler(
     State(state): State<ProxyState>,
     req: Request,
@@ -692,11 +720,21 @@ async fn build_and_send_upstream(
         .http
         .request(method.clone(), upstream_url)
         .body(plan_body.clone());
+    let strip_for_grok = matches!(resolved.auth_scheme, AuthScheme::GrokCookie);
     for (name, value) in inbound_headers.iter() {
         if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
             continue;
         }
         if resolved.extra_headers.contains_key(name) {
+            continue;
+        }
+        // dup-header 防御(review-feedback A4):GrokCookie scheme 下,grok.com
+        // 必需的 headers(Cookie / Origin / Referer / Accept-* / Sec-Fetch-* /
+        // x-statsig-id / x-xai-request-id / traceparent)由 grok_web::auth 统一
+        // 注入;如果客户端入站的同名 header 跟随过来,reqwest `header()` 会
+        // append 而不是 replace,grok.com 看到双 Cookie 会 session 错乱。这里
+        // strip 客户端同名,让 GrokCookie 分支独占注入权。
+        if strip_for_grok && is_grok_owned_header(name.as_str()) {
             continue;
         }
         up = up.header(name, value);
@@ -733,6 +771,50 @@ async fn build_and_send_upstream(
                 "User-Agent",
                 codex_app_transfer_gemini_oauth::antigravity_user_agent_chat(),
             );
+        }
+        crate::resolver::AuthScheme::GrokCookie => {
+            // grok.com Web 后端鉴权头(cookie + statsig + xai-request-id + traceparent +
+            // origin/referer/UA + accept/sec-fetch-*)。所有头由 grok_web::auth 集中维护,见
+            // `crates/adapters/src/grok_web/auth.rs::apply_grok_headers`。
+            //
+            // Cookie 与 statsigId 来源:`provider.extra["grokWeb"]`;若缺失(用户没填),
+            // **短路 surface 错误**(见 review-feedback A3):log + 让 build_and_send_upstream
+            // 上层把请求带空 Cookie 发出去会让 Codex APP 卡在 "Thinking" 不可见错误,
+            // 同时还会用用户 IP/UA 触发 grok.com Cloudflare bot 升级风险。改成 BadRequest
+            // 错误,让 forward 主路径 surface 给客户端清晰的 401 + missing-cookie 信息。
+            //
+            // **dup-header 防御**(review-feedback A4):reqwest 0.12 `RequestBuilder::header`
+            // 是 append 不是 replace。如果客户端入站 headers 里有 Cookie / Origin /
+            // Referer / Accept-* / Sec-Fetch-*,grok_headers 会跟客户端值一起 append →
+            // grok.com 看到双 Cookie 会 session 错乱。先用 `reqwest::RequestBuilder` 拿到
+            // 底层 `HeaderMap` 把这些 header 名 remove 干净,再注入 grok_headers。
+            let grok_headers = match codex_app_transfer_adapters::grok_web::auth::apply_grok_headers_typed(
+                &resolved.provider,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(
+                        error_id = "GROK_AUTH_HEADERS_MISSING",
+                        provider_id = %resolved.provider_id,
+                        error = %e,
+                        "grok_web 鉴权头注入失败 — provider.extra.grokWeb 配置缺失;短路 surface 401"
+                    );
+                    return Err(ForwardError::Adapter(
+                        codex_app_transfer_adapters::AdapterError::BadRequest(format!(
+                            "grok_web auth config missing: {e}"
+                        )),
+                    ));
+                }
+            };
+            // dup-header 防御:上方 inbound headers 复制循环已对 GrokCookie scheme
+            // 走 `is_grok_owned_header` 过滤(参见 line 695-703 + line 265 helper),
+            // 入站客户端的 Cookie / Origin / Referer / Accept-* / Sec-Fetch-* /
+            // x-statsig-id / x-xai-request-id / traceparent 不会进 builder,因此
+            // 这里 `headers()` 合并就是干净的一份(reqwest `headers()` 调用 extend,
+            // 不会跟空的同名 entry 冲突)。
+            // **不依赖** extras 写 grok headers — extras 含 Cookie 在 line 705
+            // 循环还会再加一次,GrokCookie scheme 配 extras 是 user error。
+            up = up.headers(grok_headers);
         }
         _ => {}
     }
@@ -984,6 +1066,12 @@ fn inject_auth(
                     );
                 }
             }
+        }
+        AuthScheme::GrokCookie => {
+            // grok.com Web 后端鉴权:cookie + statsig + xai-request-id 一组 headers,
+            // 在 build_and_send_upstream 的 `match resolved.auth_scheme` 分支统一注入
+            // (走 `codex_app_transfer_adapters::grok_web::auth::apply_grok_headers`),
+            // 这里**不写** Authorization Bearer(grok.com 没这 header)。
         }
         AuthScheme::None => {}
     }

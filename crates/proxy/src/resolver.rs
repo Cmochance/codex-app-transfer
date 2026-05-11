@@ -51,6 +51,11 @@ pub enum AuthScheme {
     /// 处理 flow / refresh / bootstrap;forward.rs 用此 scheme 路由到 antigravity
     /// token store + 注入 antigravity UA / X-Goog-Api-Client。
     GoogleOauthAntigravity,
+    /// grok.com Web 后端 cookie 鉴权:`Cookie: sso=<JWT>; sso-rw=<JWT>; cf_clearance=<token>`
+    /// + `x-statsig-id` + `x-xai-request-id`(详见 `crates/adapters/src/grok_web/auth.rs`)。
+    ///
+    /// Cookie 不在 provider.api_key,而在 `provider.extra["grokWeb"]["cookies"]` JSON object。
+    GrokCookie,
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -69,6 +74,7 @@ impl AuthScheme {
             "google_oauth_antigravity" | "antigravity_oauth" | "antigravity" => {
                 AuthScheme::GoogleOauthAntigravity
             }
+            "grok_cookie" | "grok" | "grok_web" => AuthScheme::GrokCookie,
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::core::routes;
 use crate::gemini_cli::GeminiCliAdapter;
 use crate::gemini_native::GeminiNativeAdapter;
+use crate::grok_web::GrokWebAdapter;
 use crate::openai_chat::OpenAiChatAdapter;
 use crate::passthrough::ResponsesPassthroughAdapter;
 use crate::responses::ResponsesAdapter;
@@ -23,6 +24,7 @@ pub struct AdapterRegistry {
     responses_passthrough: Arc<dyn Adapter>,
     gemini_native: Arc<dyn Adapter>,
     gemini_cli: Arc<dyn Adapter>,
+    grok_web: Arc<dyn Adapter>,
 }
 
 impl AdapterRegistry {
@@ -33,6 +35,7 @@ impl AdapterRegistry {
             responses_passthrough: Arc::new(ResponsesPassthroughAdapter),
             gemini_native: Arc::new(GeminiNativeAdapter),
             gemini_cli: Arc::new(GeminiCliAdapter),
+            grok_web: Arc::new(GrokWebAdapter),
         }
     }
 
@@ -66,6 +69,12 @@ impl AdapterRegistry {
             "antigravity_oauth" | "antigravity" | "google_oauth_antigravity" => {
                 self.gemini_cli.clone()
             }
+            // grok.com Web 后端反代(SuperGrok / X Premium+ cookie 鉴权)。
+            // 协议事实(详见 `crates/adapters/src/grok_web/mod.rs` + `types.rs` doc comments):
+            // - Endpoint: POST grok.com/rest/app-chat/conversations/new
+            // - Connector 走 server-side state + 黑名单(disabledConnectorIds: [])
+            // - MCP 通过 call_connected_tool wrapper,namespace 用 `___` 三下划线
+            "grok_web" | "grok" | "grok_com" => self.grok_web.clone(),
             // 空字符串 / 未知值 → 跟 schema default 一致,fallback openai_chat
             _ => self.openai_chat.clone(),
         }
@@ -187,6 +196,22 @@ mod tests {
             "messages",
         ] {
             assert_eq!(r.lookup(v).name(), "responses", "{v} 应解析到 responses");
+        }
+    }
+
+    #[test]
+    fn lookup_grok_web_aliases() {
+        // grok_web 接 grok.com Web 后端反代(SuperGrok cookie),协议事实
+        // 见 docs/grok/04-protocol-final.md。aliases 全集小,但 lookup 必须 stable —
+        // 漏一个会让用户手填 apiFormat="grok"(无下划线)的 provider 错路到
+        // openai_chat → 直连 grok.com 必 401(没注入 cookie/statsig)。
+        let r = AdapterRegistry::with_builtins();
+        for v in ["grok_web", "grok", "grok_com", "Grok-Web", "GROK_WEB"] {
+            assert_eq!(
+                r.lookup(v).name(),
+                "grok_web",
+                "alias {v} 应解析到 grok_web"
+            );
         }
     }
 

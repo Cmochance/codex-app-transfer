@@ -14,6 +14,7 @@
 pub(crate) mod core;
 pub mod gemini_cli;
 pub mod gemini_native;
+pub mod grok_web;
 pub(crate) mod mapper;
 pub mod openai_chat;
 pub mod passthrough;
@@ -23,6 +24,7 @@ pub mod types;
 
 pub use gemini_cli::GeminiCliAdapter;
 pub use gemini_native::GeminiNativeAdapter;
+pub use grok_web::GrokWebAdapter;
 pub use openai_chat::OpenAiChatAdapter;
 pub use passthrough::ResponsesPassthroughAdapter;
 pub use registry::AdapterRegistry;

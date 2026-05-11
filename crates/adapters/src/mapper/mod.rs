@@ -7,6 +7,7 @@ use crate::types::{AdapterError, ByteStream, RequestPlan, ResponsePlan};
 pub(crate) mod chat;
 pub(crate) mod cloud_code;
 pub(crate) mod gemini_native;
+pub(crate) mod grok_web;
 
 /// Request 侧协议映射器统一接口。
 pub(crate) trait RequestMapper {
