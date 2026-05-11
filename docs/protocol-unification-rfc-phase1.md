@@ -94,7 +94,10 @@ pub trait ProviderResponseMapper {
   - `gemini_native` 改为复用 `responses_body_to_chat_body_for_provider_with_session(...)`
     的 `messages` 输出，统一使用 `responses/request.rs::repair_tool_call_ids`
     管道
-- [ ] 统一 `responses_body_to_normalized_chat` 主管道（剩余：抽取 chat-body 通用骨架以减少重复字段映射）
+- [x] 统一 `responses_body_to_normalized_chat` 主管道：
+  - `gemini_native::responses_body_to_normalized_chat` 改为复用
+    `responses_body_to_chat_body_for_provider_with_session(...)` 作为主骨架
+  - Gemini 特有差异（tools/tool_choice/extra_body/safety_settings）在骨架上覆盖
 
 ### Phase 3
 
