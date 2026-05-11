@@ -44,6 +44,7 @@ use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::events::{build_tool_namespace_map, emit_sse_event};
 use super::tool_call_cache::{global_tool_call_cache, ToolCallEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,38 +217,7 @@ impl ChatToResponsesConverter {
     /// 回灌)+ `Codex.app` binary strings 实证(`DynamicToolCallRequest` 含
     /// namespace 必填字段)。
     pub fn with_original_request(mut self, request: Option<Value>) -> Self {
-        // 扫 tools 数组,把每个 namespace 包内层 function 的 name 映射到 namespace 名
-        if let Some(req) = request.as_ref() {
-            if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
-                for tool in tools {
-                    let Some(obj) = tool.as_object() else {
-                        continue;
-                    };
-                    if obj.get("type").and_then(|v| v.as_str()) != Some("namespace") {
-                        continue;
-                    }
-                    let Some(ns_name) = obj.get("name").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let Some(inner_tools) = obj.get("tools").and_then(|v| v.as_array()) else {
-                        continue;
-                    };
-                    for inner in inner_tools {
-                        let Some(inner_obj) = inner.as_object() else {
-                            continue;
-                        };
-                        if inner_obj.get("type").and_then(|v| v.as_str()) != Some("function") {
-                            continue;
-                        }
-                        if let Some(fname) = inner_obj.get("name").and_then(|v| v.as_str()) {
-                            // 后写覆盖前写(罕见同名跨 namespace 时取最后一个)
-                            self.tool_namespace_map
-                                .insert(fname.to_owned(), ns_name.to_owned());
-                        }
-                    }
-                }
-            }
-        }
+        self.tool_namespace_map = build_tool_namespace_map(request.as_ref());
         self.original_request = request;
         self
     }
@@ -1278,16 +1248,8 @@ fn translate_annotation(a: &Value) -> Value {
     Value::Object(out)
 }
 
-fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, mut payload: Value) {
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("sequence_number".into(), json!(*seq));
-    }
-    *seq += 1;
-    let line = format!(
-        "event: {event_name}\ndata: {}\n\n",
-        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into())
-    );
-    out.extend_from_slice(line.as_bytes());
+fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value) {
+    emit_sse_event(out, seq, event_name, payload);
 }
 
 fn drain_one_frame(buf: &mut BytesMut) -> Option<Bytes> {

@@ -51,6 +51,7 @@ use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
+use crate::responses::events::{build_tool_namespace_map, emit_sse_event as emit_event};
 use crate::responses::global_response_session_cache;
 use crate::types::{ByteStream, ResponseSessionPlan};
 
@@ -78,77 +79,6 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// 扫 `original_request.tools` 数组里所有 `type:"namespace"` 包装,建立
-/// `function.name → namespace.name` 反查表(`mcp__notion__` 含 5 个 function
-/// → 5 个 (function name, "mcp__notion__") 入表)。后写覆盖前写(罕见同名
-/// 跨 namespace 时取最后一个)。
-///
-/// 1:1 移植 [`crate::responses::converter::ResponsesConverter::with_original_request`]
-/// 的扫描逻辑(2026-05-11 修)。
-fn build_tool_namespace_map(
-    original_request: Option<&Value>,
-) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    let Some(req) = original_request else {
-        return map;
-    };
-    let Some(tools) = req.get("tools").and_then(|v| v.as_array()) else {
-        return map;
-    };
-    for tool in tools {
-        let Some(obj) = tool.as_object() else {
-            continue;
-        };
-        if obj.get("type").and_then(|v| v.as_str()) != Some("namespace") {
-            continue;
-        }
-        let Some(ns_name) = obj.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(inner_tools) = obj.get("tools").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for inner in inner_tools {
-            let Some(inner_obj) = inner.as_object() else {
-                continue;
-            };
-            if inner_obj.get("type").and_then(|v| v.as_str()) != Some("function") {
-                continue;
-            }
-            if let Some(fname) = inner_obj.get("name").and_then(|v| v.as_str()) {
-                map.insert(fname.to_owned(), ns_name.to_owned());
-            }
-        }
-    }
-    map
-}
-
-/// SSE event 写出。OpenAI Responses 协议:`event: <name>\ndata: <json>\n\n`,
-/// payload 内 `sequence_number` 单调递增。
-///
-/// C2 修复:序列化失败时以前是 `unwrap_or_else(|_| "{}")` 静默回退 — 客户端会
-/// 收到 `data: {}` 事件丢失原始信息。改成 tracing::error! 至少在生产里可见,
-/// 仍 fallback `{}` 让 SSE event 不卡(下个事件可能 OK)。
-fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, mut payload: Value) {
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("sequence_number".into(), json!(*seq));
-    }
-    *seq += 1;
-    let serialized = match serde_json::to_string(&payload) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                event = event_name,
-                "BUG: failed to serialize Responses SSE event payload; falling back to empty object"
-            );
-            "{}".into()
-        }
-    };
-    let line = format!("event: {event_name}\ndata: {serialized}\n\n");
-    out.extend_from_slice(line.as_bytes());
 }
 
 /// 找 SSE event 边界。SSE spec 允许 `\n\n` 或 `\r\n\r\n` 分隔,Google `alt=sse`
