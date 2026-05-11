@@ -2859,6 +2859,40 @@ mod tests {
     }
 
     #[test]
+    fn soft_constraint_mode_strict_preserves_legacy_schema_prompt_wording() {
+        let mut provider = dummy_provider();
+        provider.extra.insert(
+            "compat_soft_constraints".into(),
+            Value::String("strict".into()),
+        );
+        let body = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+            "response_format": {
+                "type":"json_schema",
+                "json_schema":{"schema":{"type":"object","properties":{"answer":{"type":"string"}}}}
+            }
+        });
+        let req = chat_normalized_to_gemini_request(&body, &provider).unwrap();
+        let si = req
+            .system_instruction
+            .expect("strict 模式应保留历史详细 schema 提示");
+        let combined: String = si
+            .parts
+            .iter()
+            .filter_map(|p| p.text.as_ref())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("MUST be a valid JSON object")
+                && combined.contains("Do not wrap the JSON in markdown fences"),
+            "strict 模式应保留旧的强约束措辞,实际:{combined}"
+        );
+    }
+
+    #[test]
     fn gemini_3_plus_function_decls_with_google_search_enables_server_side_tool_invocations() {
         // 实测 2026-05-10:Gemini "Built-in tools ({google_search}) and Function Calling
         // cannot be combined in the same request" — Gemini 3+ 通过开
@@ -2957,6 +2991,32 @@ mod tests {
         assert!(
             req.system_instruction.is_none(),
             "compat_soft_constraints=off 时不应注入 google_search 限制说明文案"
+        );
+    }
+
+    #[test]
+    fn soft_constraint_mode_off_via_camel_alias_works_same_as_snake_case() {
+        let mut provider = dummy_provider();
+        provider
+            .extra
+            .insert("compatSoftConstraints".into(), Value::String("off".into()));
+        let body = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [
+                {"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+                {"type":"web_search"}
+            ]
+        });
+        let req = chat_normalized_to_gemini_request(&body, &provider).unwrap();
+        let tools = req.tools.expect("function declarations must remain");
+        assert!(
+            !tools.iter().any(|t| t.google_search.is_some()),
+            "camelCase 配置别名同样必须执行 wire-level googleSearch drop"
+        );
+        assert!(
+            req.system_instruction.is_none(),
+            "camelCase alias=off 时不应注入兼容提示文案"
         );
     }
 
