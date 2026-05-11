@@ -169,9 +169,49 @@
                     <option value="gemini_native" data-i18n="apiFormatDisplay.geminiNative.name">Gemini Native</option>
                     <option value="gemini_cli_oauth" data-i18n="apiFormatDisplay.geminiCliOauth.name">Gemini CLI(OAuth)</option>
                     <option value="antigravity_oauth" data-i18n="apiFormatDisplay.antigravityOauth.name">Antigravity(OAuth)</option>
+                    <option value="grok_web" data-i18n="apiFormatDisplay.grokWeb.name">Grok Web(实验性)</option>
                   </select>
                   <p class="api-format-detail-hint" id="providerApiFormatSelectDetail"></p>
                 </div>
+              </div>
+              <!-- Grok Web section — apiFormat=grok_web 时显示替代 apiKey input。
+                   Plan A:只必填 sso JWT 一项,其他全部 optional / 后端自动生成。 -->
+              <div class="mb-4" id="providerGrokWebRow" hidden>
+                <label class="form-label" data-i18n="grokWeb.title">Grok Web Cookie 鉴权</label>
+                <p class="field-hint" data-i18n="grokWeb.hint">浏览器登录 grok.com → F12 → Application → Cookies → 复制 <code>sso</code> 一个值即可,其他自动处理(x-statsig-id 每次动态生成、sso-rw 复用 sso、UA 默认)。</p>
+                <div class="mb-3">
+                  <label class="form-label small" for="grokWebSso" data-i18n="grokWeb.ssoLabel">sso (JWT, 必填)</label>
+                  <input class="form-control" id="grokWebSso" type="password" autocomplete="off" spellcheck="false">
+                </div>
+                <details class="mb-3">
+                  <summary class="small text-muted" data-i18n="grokWeb.advancedSummary" style="cursor:pointer;">高级选项(401 / CF challenge 时展开补充)</summary>
+                  <div class="mt-2 ps-2 border-start">
+                    <div class="mb-2">
+                      <label class="form-label small" for="grokWebCookieString" data-i18n="grokWeb.cookieStringLabel">完整 Cookie 字符串(CF challenge 时必填)</label>
+                      <textarea class="form-control" id="grokWebCookieString" rows="3" autocomplete="off" spellcheck="false" placeholder="__cf_bm=...; cf_clearance=...; mp_xxx_mixpanel=...; ..."></textarea>
+                      <p class="field-hint" data-i18n="grokWeb.cookieStringHint">浏览器 DevTools → Network → grok.com 任一请求 → Request Headers → 整行 Cookie value 复制粘贴(可带 "Cookie: " 前缀,自动 strip)。grok.com Cloudflare 401 "No credentials presented" 即缺这一段。对齐 chenyme/grok2api `proxy.clearance.cf_cookies`。</p>
+                    </div>
+                    <div class="mb-2">
+                      <label class="form-label small" for="grokWebCfClearance" data-i18n="grokWeb.cfClearanceLabel">cf_clearance(可选,单 token)</label>
+                      <input class="form-control" id="grokWebCfClearance" type="password" autocomplete="off" spellcheck="false">
+                      <p class="field-hint" data-i18n="grokWeb.cfClearanceHint">如已 paste 完整 Cookie 字符串无需填。单独填只发 `cf_clearance=` segment(可能不够);整段 paste 更稳。</p>
+                    </div>
+                    <div class="mb-2">
+                      <label class="form-label small" for="grokWebSsoRw" data-i18n="grokWeb.ssoRwLabel">sso-rw(可选,默认复用 sso)</label>
+                      <input class="form-control" id="grokWebSsoRw" type="password" autocomplete="off" spellcheck="false">
+                    </div>
+                    <div class="mb-2">
+                      <label class="form-label small" for="grokWebStatsigId" data-i18n="grokWeb.statsigIdLabel">x-statsig-id(可选 override,默认动态生成)</label>
+                      <input class="form-control" id="grokWebStatsigId" type="password" autocomplete="off" spellcheck="false">
+                      <p class="field-hint" data-i18n="grokWeb.statsigIdHint">默认每次请求动态生成伪 Statsig blob,无需手动维护。仅高级用户精确控制 statsig 内容时填写。</p>
+                    </div>
+                    <div class="mb-2">
+                      <label class="form-label small" for="grokWebUserAgent" data-i18n="grokWeb.userAgentLabel">User-Agent override(可选)</label>
+                      <input class="form-control" id="grokWebUserAgent" type="text" autocomplete="off" spellcheck="false" placeholder="Mozilla/5.0 ...">
+                    </div>
+                  </div>
+                </details>
+                <p class="field-hint text-warning" data-i18n="grokWeb.tosWarning">⚠️ 反代 grok.com Web 端,grok TOS 灰色,仅限个人使用本机 SuperGrok 账号,不应作为对外服务发布。</p>
               </div>
               <div class="mb-4" id="providerWebSearchRow" hidden>
                 <label class="form-label" data-i18n="providersAdd.webSearchEnabled">联网搜索</label>

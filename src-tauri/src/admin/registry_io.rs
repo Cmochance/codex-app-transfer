@@ -493,5 +493,30 @@ pub fn public_provider(p: &Value) -> Value {
     out.remove("apiKey");
     out.remove("extraHeaders");
     out.insert("hasApiKey".into(), Value::Bool(has_key));
+    // grokWeb 含 sso / sso-rw / cf_clearance cookie + statsigId,全是敏感凭证。
+    // 跟 apiKey 一样 mask 出去,只暴露 `hasGrokWeb` 给前端,让 UI 决定 placeholder。
+    // 前端编辑保存若不重填 → 不传 grokWeb 字段 → 后端 update_provider 保留现值。
+    let has_grok_web = out
+        .get("grokWeb")
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            let has_cookies = o
+                .get("cookies")
+                .and_then(|c| c.as_object())
+                .map(|c| {
+                    c.values()
+                        .any(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                })
+                .unwrap_or(false);
+            let has_statsig = o
+                .get("statsigId")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            has_cookies || has_statsig
+        })
+        .unwrap_or(false);
+    out.remove("grokWeb");
+    out.insert("hasGrokWeb".into(), Value::Bool(has_grok_web));
     Value::Object(out)
 }

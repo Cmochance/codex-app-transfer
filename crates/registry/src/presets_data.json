@@ -237,6 +237,34 @@
     "isBuiltin": true
   },
   {
+    "id": "grok-web",
+    "name": "Grok(Web)",
+    "baseUrl": "https://grok.com",
+    "docsUrl": "https://grok.com",
+    "authScheme": "grok_cookie",
+    "apiFormat": "grok_web",
+    "models": {
+      "default": "grok-420-computer-use-sa"
+    },
+    "modelCapabilities": {},
+    "notices": [
+      {
+        "type": "warning",
+        "text": "⚠️ **TOS 灰色 + 实验性功能**:本 provider 反向代理 grok.com Web 后端(不是 xAI 官方 API),用 SuperGrok / X Premium+ cookie 鉴权。属于灰色用法,仅限**个人本机使用自己付费的 SuperGrok 账号**,不应作为对外服务发布。grok.com 可能随时改协议导致 break,异常请走「反馈」提交 diagnostics bundle。"
+      },
+      {
+        "type": "info",
+        "text": "**配置步骤(只需 1 步)**:① 浏览器登录 https://grok.com(SuperGrok / X Premium+ 账号);② F12 → Application → Cookies → 复制 `sso` 值粘进下方输入框,保存即可。其他全部自动:`x-statsig-id` 每次请求动态生成(参考 chenyme/grok2api `dynamic_statsig`);`sso-rw` 复用 `sso`(实测同 JWT);User-Agent / Origin / Referer / Sec-Ch-* 后端硬编码默认值;`cf_clearance` 仅在网络遇到 Cloudflare challenge(403)时才需要补填(高级选项)。"
+      },
+      {
+        "type": "info",
+        "text": "**当前能力**:文本对话、reasoning summary、Web Search citations、Connectors / Collections / RAG Search 引用、MCP via `call_connected_tool`(三下划线 namespace 如 `test___ask_question`)、跨轮 `parent_response_id` 自动追踪。**已知限制**:inline `[N]` 精确位置 citation 暂未实现(仅追加在结尾);`cardAttachment` 帧未解析;sso JWT 失效时需重新登录 grok.com 重新复制 cookie。"
+      }
+    ],
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
     "id": "google-ai-studio",
     "name": "Google AI Studio",
     "baseUrl": "https://generativelanguage.googleapis.com",

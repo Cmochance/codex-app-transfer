@@ -14,7 +14,7 @@
   // authScheme=google_api_key 经 setAuthSchemeValue 校验失败 → fallback 'bearer'
   // → backend 用 Authorization: Bearer 调 Gemini /v1beta/models → 401(Google 不接 Bearer)
   // → 测速看似绿(401 走 auth_not_verified 路径)但实际从未真正鉴权过 + 列模型失败。
-  const providerAuthSchemes = ["bearer", "x-api-key", "google_api_key", "none"];
+  const providerAuthSchemes = ["bearer", "x-api-key", "google_api_key", "grok_cookie", "none"];
   const providerFormDefaultRows = ["default", "gpt_5_5", "gpt_5_4", "gpt_5_4_mini", "gpt_5_3_codex", "gpt_5_2"];
   let pendingDeleteId = null;
   let selectedPreset = null;
@@ -161,6 +161,7 @@
     if (["anthropic", "claude", "messages"].includes(v)) return { key: "anthropic", canonical: "anthropic" };
     if (["gemini_native", "google_ai_studio", "gemini"].includes(v)) return { key: "geminiNative", canonical: "gemini_native" };
     if (["gemini_cli_oauth", "gemini_cli", "google_oauth_cloud_code"].includes(v)) return { key: "geminiCliOauth", canonical: "gemini_cli_oauth" };
+    if (["grok_web", "grok", "grok_com"].includes(v)) return { key: "grokWeb", canonical: "grok_web" };
     if (["antigravity_oauth", "antigravity", "google_oauth_antigravity"].includes(v)) return { key: "antigravityOauth", canonical: "antigravity_oauth" };
     return { key: "openaiChat", canonical: "openai_chat" };
   }
@@ -918,6 +919,13 @@
     if (includeModels) {
       payload.models = mappings;
     }
+    // R1 PR-7:apiFormat=grok_web 时打包 extra.grokWeb(cookies + statsigId)。
+    // Provider 后端 schema 用 `#[serde(flatten)] extra`,任何不在已知字段的 key
+    // 自动收进 provider.extra,所以前端 payload 顶层加 `grokWeb` 就 work。
+    const grokWebPayload = collectGrokWebPayload();
+    if (grokWebPayload) {
+      payload.grokWeb = grokWebPayload;
+    }
     return payload;
   }
 
@@ -1193,6 +1201,98 @@
   /// widget;其他 apiFormat 隐藏 OAuth row。调用时机:form 加载 / apiFormat
   /// select 切换。
   /// 内部 update activeOauthConfig 让后续 refresh/login/logout 走对的 provider
+  /// R1 PR-7:apiFormat=grok_web 时显示 grok web cookie 输入 row,隐藏 apiKey
+  /// 输入(grok_web 不用 apiKey,用 extra.grokWeb.{cookies, statsigId})。
+  /// 与 setOauthRowState 互斥 — 调用方应先确保 apiFormat 解析后路由到对的一个。
+  function setGrokWebRowState(apiFormat) {
+    const row = $("#providerGrokWebRow");
+    const apiKeyRow = $("#providerApiKeyRow");
+    const apiKeyInput = $("#providerApiKey");
+    const { canonical } = normalizeApiFormat(apiFormat);
+    const isGrokWeb = canonical === "grok_web";
+    if (row) row.hidden = !isGrokWeb;
+    if (apiKeyRow) {
+      // grok_web 隐藏 apiKey input;非 grok_web 显示(避免与 OAuth 状态冲突
+      // —— setOauthRowState 自己控制 isOauth case 的 apiKey 可见性,所以
+      // 我们**只在切换到/离开 grok_web 时操作**,其它情况让 OAuth/默认逻辑接管)
+      if (isGrokWeb) {
+        apiKeyRow.hidden = true;
+      }
+    }
+    if (apiKeyInput && isGrokWeb) {
+      // required 兜底:grok_web 不需要 apiKey 必填,否则浏览器 form validation 会
+      // 卡住 submit(即使 input 被 hidden div 包着,required 仍校验)。
+      //
+      // **chatgpt-codex P1 修(2026-05-12)**:**不**在非 grok_web 时无条件设
+      // `required = true` —— OAuth modes(gemini_cli_oauth / antigravity_oauth)
+      // 由 setOauthRowState 自己管理 required(它走 dataset.origRequired
+      // 保存/恢复机制,1308-1313 行),无条件覆盖会让 OAuth 模式 hidden apiKey
+      // 仍 required → form submit 静默被浏览器拒。chain 调用顺序是
+      // setOauthRowState → setGrokWebRowState,我们离开 grok_web 时**不动**,
+      // 让上游 setter 的决定生效。
+      apiKeyInput.required = false;
+    }
+    if (isGrokWeb) {
+      const authEl = $("#providerAuth");
+      if (authEl) authEl.value = "grok_cookie";
+    }
+  }
+
+  /// 从 grok_web form input 收集 grokWeb extra payload(用于 POST 时打包到
+  /// provider.extra.grokWeb)。
+  ///
+  /// Plan A:仅 sso 必填;sso-rw / cf_clearance / statsigId / userAgent 都 optional
+  /// (后端 auth.rs 缺失时分别复用 sso / 跳过 segment / 动态生成 / 用默认 UA)。
+  ///
+  /// 返回 null 表示不是 grok_web 模式或 input 全空(编辑模式留空 = 保留现值)。
+  function collectGrokWebPayload() {
+    const row = $("#providerGrokWebRow");
+    if (!row || row.hidden) return null;
+    const sso = $("#grokWebSso")?.value.trim() || "";
+    const ssoRw = $("#grokWebSsoRw")?.value.trim() || "";
+    const cf = $("#grokWebCfClearance")?.value.trim() || "";
+    const cookieString = $("#grokWebCookieString")?.value.trim() || "";
+    const statsigId = $("#grokWebStatsigId")?.value.trim() || "";
+    const userAgent = $("#grokWebUserAgent")?.value.trim() || "";
+    if (!sso && !ssoRw && !cf && !cookieString && !statsigId && !userAgent)
+      return null;
+    const cookies = { sso };
+    if (ssoRw) cookies["sso-rw"] = ssoRw;
+    if (cf) cookies.cf_clearance = cf;
+    if (cookieString) cookies.cookieString = cookieString;
+    const payload = { cookies };
+    if (statsigId) payload.statsigId = statsigId;
+    if (userAgent) payload.userAgent = userAgent;
+    return payload;
+  }
+
+  /// 编辑现有 provider 时初始化 grok_web form。
+  ///
+  /// 后端 public_provider 已把 grokWeb 字段 mask 出去,只保留 `hasGrokWeb: bool`
+  /// (cookies + statsigId 是高敏感凭证,跟 apiKey 一样不回传前端)。所以这里:
+  ///   - 清空 input 值
+  ///   - hasGrokWeb=true 时给 placeholder 提示"已保存凭证,留空则保持不变"
+  ///   - 用户若真要替换才填新值,save 时 collectGrokWebPayload 返回新对象;
+  ///     若空白 save → payload 不带 grokWeb → 后端 update_provider 不动现值
+  function fillGrokWebFormFromProvider(provider) {
+    const hasGrokWeb = !!provider?.hasGrokWeb;
+    const ids = [
+      "grokWebSso",
+      "grokWebSsoRw",
+      "grokWebCfClearance",
+      "grokWebCookieString",
+      "grokWebStatsigId",
+      "grokWebUserAgent",
+    ];
+    const savedPlaceholder = t("grokWeb.savedPlaceholder") || "已保存,留空则保持";
+    for (const id of ids) {
+      const el = $(`#${id}`);
+      if (!el) continue;
+      el.value = "";
+      el.placeholder = hasGrokWeb ? savedPlaceholder : "";
+    }
+  }
+
   function setOauthRowState(apiFormat) {
     const oauthRow = $("#providerOauthRow");
     const apiKeyRow = $("#providerApiKeyRow");
@@ -1476,6 +1576,8 @@
     renderApiFormatDisplay("openai_chat");
     setApiFormatMode(false, "openai_chat");
     setOauthRowState("openai_chat"); // P2.2 reset OAuth row 隐藏
+    setGrokWebRowState("openai_chat"); // R1 PR-7 reset grok_web row 隐藏
+    fillGrokWebFormFromProvider(null);
     setWebSearchRow(false, false, null);
     setProviderMappings(emptyMappings());
     setUnverifiedBanner(false);
@@ -1507,6 +1609,7 @@
     renderApiFormatDisplay(preset.apiFormat);
     setApiFormatMode(!!preset.allowApiFormatSelection, preset.apiFormat);
     setOauthRowState(preset.apiFormat); // P2.2 OAuth UI 切换
+    setGrokWebRowState(preset.apiFormat); // R1 PR-7 grok_web UI 切换
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     // Web Search 配置开关:preset 标支持 + preset.requestOptions.web_search_enabled
@@ -1568,6 +1671,8 @@
     renderApiFormatDisplay(effectiveFormat);
     setApiFormatMode(false, effectiveFormat);
     setOauthRowState(effectiveFormat); // OAuth UI 切换(P2.2)
+    setGrokWebRowState(effectiveFormat); // R1 PR-7 grok_web UI 切换
+    fillGrokWebFormFromProvider(provider);
     // 编辑场景:支持判定走 matchedPreset.supportsWebSearch(自定义 provider 不命中
     // builtin → matchedPreset undefined → 不显示开关);初始 checkbox state 读
     // provider 实际保存的 requestOptions.web_search_enabled;hint 文案按
@@ -2756,6 +2861,10 @@
       }
       if (event.target.id === "providerApiFormatSelect") {
         updateApiFormatSelectDetail(event.target.value);
+        formApiFormatValue = event.target.value;
+        // R1 PR-7:切换 apiFormat 时同步 OAuth / grok_web row 显隐
+        setOauthRowState(event.target.value);
+        setGrokWebRowState(event.target.value);
       }
     });
 

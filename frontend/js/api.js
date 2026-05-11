@@ -64,6 +64,11 @@
     gemini: { logo: 'assets/providers/google-ai-studio.png' },
     aistudio: { logo: 'assets/providers/google-ai-studio.png' },
     generativelanguage: { logo: 'assets/providers/google-ai-studio.png' },
+    // Grok Web 反代 provider — 用 grok.com 官方 favicon SVG(从
+    // https://grok.com/images/favicon.svg 抓的,黑色圆角方块 + 白色 grok mark)。
+    // `grok-web` 子串命中 preset id / apiFormat;不加更宽的 `grok` 防误命中用户
+    // 自定义 provider 名含 "grok" 但实际不是 web 反代场景
+    'grok-web': { logo: 'assets/providers/grok.svg' },
   };
 
   function buildCustomThirdPartyPreset() {
@@ -157,6 +162,11 @@
         // 不接受裸 'antigravity' alias —— 怕 legacy 配置 / 用户手填把别的 provider
         // (apiFormat 历史漂移值)误归 OAuth 路径(silent-failure I3 修)
         if (['antigravity_oauth', 'google_oauth_antigravity'].includes(v)) return 'antigravity_oauth';
+        // Grok Web 反代(R1 Plan A):passthrough 让后端 normalize_provider_api_format
+        // + grok_web adapter 路由。漏这条 → fallback 'openai_chat' → save 后 healing
+        // 强改 grok_web 但 grokWeb 字段也没 passthrough → 进半残态(2026-05-12 user
+        // 真机 E2E 报错 "需要 grokWeb.cookies.sso" 的根因)
+        if (['grok_web', 'grok', 'grok_com'].includes(v)) return 'grok_web';
         return 'openai_chat';  // openai / openai_chat / chat_completions / 空 / 未知 → openai_chat
       })(),
       extraHeaders: payload.extraHeaders || {},
@@ -168,6 +178,14 @@
     }
     if (includeModels) {
       body.models = payload.models || {};
+    }
+    // R1 Plan A:grokWeb extra(cookies + statsigId override + UA override)必须
+    // passthrough 到 backend payload。**此前漏掉**(2026-05-12 user E2E 真机
+    // 反馈):前端 providerPayloadFromForm 拼了 payload.grokWeb,但这个 helper
+    // 一直没 forward → backend AddProviderInput.grok_web 永远是 None → P2 必填
+    // check 命中报错。passthrough 后 backend 正常持久化到 provider.grokWeb
+    if (payload.grokWeb) {
+      body.grokWeb = payload.grokWeb;
     }
     return body;
   }

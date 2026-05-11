@@ -31,6 +31,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = "0.1"
 # CSRF state token + UUID v4 for outer envelope user_prompt_id
 getrandom = "0.2"
+# grok_web 动态 statsig-id 生成(base64-encoded 伪 JS error blob;参考 chenyme/grok2api)
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

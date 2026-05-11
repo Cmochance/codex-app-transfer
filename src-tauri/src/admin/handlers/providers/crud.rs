@@ -47,6 +47,66 @@ fn format_header_errs(errs: &[HeaderValidationError]) -> String {
     )
 }
 
+/// 提交时校验 `grokWeb` 字段结构合法性(silent-failure-hunter H2 反馈)。
+///
+/// 不校验 cookie 值的语义(let grok.com 兜底),仅校验 JSON 结构,防止保存成功
+/// 但 chat 时报 500 / "missing cookies" 让用户找不到根因。
+///
+/// 容忍:`Value::Null` / 缺字段 / 空对象 → 视为无 grokWeb 配置,通过校验
+/// (跟现有 `validate_extra_headers_input` 同 pattern)。
+fn validate_grok_web_input(gw: &Value) -> Result<(), Vec<String>> {
+    if gw.is_null() {
+        return Ok(());
+    }
+    let mut errs: Vec<String> = Vec::new();
+    let Some(obj) = gw.as_object() else {
+        errs.push("grokWeb 必须是 JSON object 或 null".into());
+        return Err(errs);
+    };
+    if let Some(cookies) = obj.get("cookies") {
+        match cookies {
+            Value::Object(map) => {
+                let sso_ok = map
+                    .get("sso")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                if !sso_ok {
+                    errs.push(
+                        "grokWeb.cookies.sso 必填(JWT,非空 string);从 grok.com 浏览器 cookies 复制"
+                            .into(),
+                    );
+                }
+                for (k, v) in map {
+                    if !v.is_string() {
+                        errs.push(format!("grokWeb.cookies.{k} 必须是 string"));
+                    }
+                }
+            }
+            _ => errs.push("grokWeb.cookies 必须是 JSON object".into()),
+        }
+    } else {
+        errs.push("grokWeb.cookies 必填".into());
+    }
+    for opt_field in ["statsigId", "userAgent"] {
+        if let Some(v) = obj.get(opt_field) {
+            if !v.is_string() {
+                errs.push(format!("grokWeb.{opt_field} 必须是 string"));
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
+}
+
+fn format_grok_web_errs(errs: &[String]) -> String {
+    let lines: Vec<String> = errs.iter().map(|e| format!("• {e}")).collect();
+    format!("grokWeb 校验失败({} 项):\n{}", errs.len(), lines.join("\n"))
+}
+
 pub async fn list_providers() -> impl IntoResponse {
     let cfg = match load_registry() {
         Ok(c) => c,
@@ -115,6 +175,8 @@ pub struct AddProviderInput {
     pub model_capabilities: Option<Value>,
     #[serde(rename = "requestOptions")]
     pub request_options: Option<Value>,
+    #[serde(rename = "grokWeb")]
+    pub grok_web: Option<Value>,
 }
 
 pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
@@ -124,6 +186,42 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
     if let Some(headers) = input.extra_headers.as_ref() {
         if let Err(errs) = validate_extra_headers_input(headers) {
             return err(StatusCode::BAD_REQUEST, format_header_errs(&errs)).into_response();
+        }
+    }
+    // silent-failure-hunter H2 + chatgpt-codex P2:grokWeb 结构在 save 时校验,
+    // 不让 "save success → chat 时报 missing-cookies / upstream 401" 这种迷惑链
+    // 发生。**add_provider 额外要求**:apiFormat=grok_web 时 grokWeb 必填(否则
+    // 用户填空 cookie 提交 → frontend collectGrokWebPayload 返 null → input 不
+    // 带 grokWeb → 这个 if-let-Some 不跑 → 保存成功 → chat 时再炸)。
+    //
+    // **2026-05-12 user E2E 反馈修**:除了 input.api_format=grok_web,也要拦
+    // `baseUrl=https://grok.com` 但 apiFormat 被前端默认成 "openai_chat" 的
+    // case —— healing 会在下次 load 时把 apiFormat 改成 grok_web,如果此时没
+    // grokWeb cookies,provider 进入"半残"状态(apiFormat=grok_web 但缺 cookies)
+    // 让 chat 失败。在 add 端就 anticipate 这个 healing 改写,提前要求 grokWeb。
+    let api_format_eff = super::normalize_provider_api_format(input.api_format.as_deref());
+    let base_url_norm = input
+        .base_url
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| {
+            s.trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_owned()
+        })
+        .unwrap_or_default();
+    let will_be_grok_web = api_format_eff == "grok_web" || base_url_norm == "grok.com";
+    if will_be_grok_web && input.grok_web.as_ref().map(Value::is_null).unwrap_or(true) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "apiFormat=grok_web(或 baseUrl=https://grok.com)需要 grokWeb.cookies.sso(JWT,非空 string);从 grok.com 浏览器 cookies 复制",
+        )
+        .into_response();
+    }
+    if let Some(gw) = input.grok_web.as_ref() {
+        if let Err(errs) = validate_grok_web_input(gw) {
+            return err(StatusCode::BAD_REQUEST, format_grok_web_errs(&errs)).into_response();
         }
     }
 
@@ -194,6 +292,11 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
             "requestOptions".into(),
             input.request_options.clone().unwrap_or_else(|| json!({})),
         );
+        if let Some(gw) = input.grok_web.clone() {
+            if !gw.is_null() {
+                new_provider.insert("grokWeb".into(), gw);
+            }
+        }
         new_provider.insert("isBuiltin".into(), Value::Bool(false));
         new_provider.insert("sortIndex".into(), Value::Number(providers.len().into()));
 
@@ -223,6 +326,12 @@ pub async fn update_provider(
     if let Some(headers) = input.extra_headers.as_ref() {
         if let Err(errs) = validate_extra_headers_input(headers) {
             return err(StatusCode::BAD_REQUEST, format_header_errs(&errs)).into_response();
+        }
+    }
+    // silent-failure-hunter H2:grokWeb 结构在 update 时也要校验,同 add_provider
+    if let Some(gw) = input.grok_web.as_ref() {
+        if let Err(errs) = validate_grok_web_input(gw) {
+            return err(StatusCode::BAD_REQUEST, format_grok_web_errs(&errs)).into_response();
         }
     }
 
@@ -270,6 +379,13 @@ pub async fn update_provider(
         }
         if let Some(opts) = input.request_options.clone() {
             updated.insert("requestOptions".into(), opts);
+        }
+        if let Some(gw) = input.grok_web.clone() {
+            if gw.is_null() {
+                updated.remove("grokWeb");
+            } else {
+                updated.insert("grokWeb".into(), gw);
+            }
         }
         if let Some(models) = input.models.clone() {
             if models.is_object() {

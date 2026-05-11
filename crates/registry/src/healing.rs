@@ -137,6 +137,31 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
                 continue;
             }
             let preset_value = preset_value.unwrap();
+
+            // **grok_web 半残防御**(2026-05-12,user E2E 反馈):healing 把 apiFormat
+            // 改成 grok_web 时,如果 provider 上**没有合法的 grokWeb.cookies.sso**,
+            // 改完后是个"半残" provider —— forward 走 GrokCookie scheme 但找不到
+            // cookies,chat 401 失败。这种情况下**不要**强改 apiFormat(否则用户
+            // 在 UI 上看不出协议错配,只看到神秘 chat 失败),保留 user_value
+            // (如 "openai_chat")+ ERROR 级 telemetry 让用户在日志面板看清问题。
+            //
+            // 修复路径:用户在 UI 上看 chat 报"apiFormat=openai_chat 但 baseUrl 是
+            // grok.com"对应错误更直观,引导用户**删了 provider 重建走 Grok(Web)
+            // preset 卡片**(那条路径才会带上 grokWeb form 收集 cookies)。
+            if *field == "apiFormat"
+                && preset_value.as_str() == Some("grok_web")
+                && !has_valid_grok_web_credentials(obj)
+            {
+                tracing::error!(
+                    error_id = "GROK_WEB_INVARIANT_VIOLATION",
+                    provider_id = %obj.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    base_url = %obj.get("baseUrl").and_then(|v| v.as_str()).unwrap_or(""),
+                    user_value = %current_value.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "healing: provider baseUrl 命中 grok-web preset 但缺 grokWeb.cookies.sso;不强改 apiFormat 避免半残状态。修复:UI 上删了 provider,从 Grok(Web) preset 卡片重建并填 sso JWT"
+                );
+                continue; // 跳过这条 apiFormat 字段的 enforce(其它字段照样走)
+            }
+
             match current_value {
                 Some(c) if c == preset_value => {}
                 Some(c) => {
@@ -163,6 +188,22 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
         }
     }
     changed
+}
+
+/// provider 是否有合法的 `grokWeb.cookies.sso` JWT(非空 string)。
+///
+/// 用于 [`heal_builtin_provider_fields`] 检测 grok-web preset 半残不变量:
+/// **provider.apiFormat=grok_web ⇒ provider.grokWeb.cookies.sso 必须是非空 string**。
+fn has_valid_grok_web_credentials(provider_obj: &serde_json::Map<String, Value>) -> bool {
+    provider_obj
+        .get("grokWeb")
+        .and_then(|v| v.as_object())
+        .and_then(|gw| gw.get("cookies"))
+        .and_then(|v| v.as_object())
+        .and_then(|c| c.get("sso"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// 把 baseUrl 规范化为可比对的形式 —— 用于 healing 通过 baseUrl 反查 preset.
@@ -684,5 +725,67 @@ mod tests {
             "真用户自建(baseUrl 不命中)绝不动"
         );
         assert_eq!(cfg["providers"][2]["isBuiltin"], json!(false));
+    }
+
+    // ── grok_web 半残不变量 ────────────────────────────────────────────
+
+    #[test]
+    fn grok_web_missing_credentials_skips_apiformat_enforce() {
+        // user E2E 反馈(2026-05-12):baseUrl=https://grok.com + apiFormat=openai_chat
+        // + 缺 grokWeb cookies。原行为:healing 强改 apiFormat=grok_web → provider
+        // 进入"apiFormat=grok_web 但缺 cookies"半残态 → forward 走 GrokCookie
+        // scheme 找不到 cookies → chat 神秘 401。
+        // 修复后:apiFormat 保留 user_value(openai_chat),isBuiltin 仍 enforce true,
+        // ERROR 级 telemetry 让用户在日志面板看清问题。
+        let mut cfg = json!({
+            "providers": [
+                {"id": "broken-grok", "name": "Grok(Web)", "baseUrl": "https://grok.com",
+                 "isBuiltin": false, "apiFormat": "openai_chat"}
+            ]
+        });
+        assert!(heal_builtin_provider_fields(&mut cfg));
+        // isBuiltin 仍 enforce 改 true(它跟 grok_web 半残不冲突)
+        assert_eq!(cfg["providers"][0]["isBuiltin"], json!(true));
+        // apiFormat **保留** user_value(skip 防半残)
+        assert_eq!(
+            cfg["providers"][0]["apiFormat"], "openai_chat",
+            "缺 grokWeb 时不该强改 apiFormat 让 provider 进半残态"
+        );
+    }
+
+    #[test]
+    fn grok_web_with_valid_credentials_still_enforces_apiformat() {
+        // 正常 case:user 走 Grok(Web) preset 卡片 → form 填了 sso JWT → grokWeb
+        // 合法 → healing 正常 enforce apiFormat=grok_web。
+        let mut cfg = json!({
+            "providers": [
+                {"id": "good-grok", "name": "Grok(Web)", "baseUrl": "https://grok.com",
+                 "isBuiltin": false, "apiFormat": "openai_chat",
+                 "grokWeb": {"cookies": {"sso": "real-jwt-token"}}}
+            ]
+        });
+        assert!(heal_builtin_provider_fields(&mut cfg));
+        assert_eq!(cfg["providers"][0]["isBuiltin"], json!(true));
+        assert_eq!(
+            cfg["providers"][0]["apiFormat"], "grok_web",
+            "有合法 sso 时正常 enforce"
+        );
+    }
+
+    #[test]
+    fn grok_web_empty_sso_string_treated_as_missing() {
+        // 防御:user 在 update_provider 把 sso 设成 "" → 跟没设一样,半残
+        let mut cfg = json!({
+            "providers": [
+                {"id": "empty-sso-grok", "name": "Grok(Web)", "baseUrl": "https://grok.com",
+                 "isBuiltin": false, "apiFormat": "openai_chat",
+                 "grokWeb": {"cookies": {"sso": ""}}}
+            ]
+        });
+        assert!(heal_builtin_provider_fields(&mut cfg));
+        assert_eq!(
+            cfg["providers"][0]["apiFormat"], "openai_chat",
+            "sso 空字符串等同于缺失,不强改 apiFormat"
+        );
     }
 }
