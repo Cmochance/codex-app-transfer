@@ -52,6 +52,11 @@
     // cloudcode 的 provider 名 / baseUrl 包括用户自定义 — 仅 'gemini-cli' id
     // stable 匹配
     'gemini-cli': { logo: 'assets/providers/gemini.svg' },
+    // Antigravity OAuth provider — Google Antigravity IDE 同样走 cloudcode-pa
+    // 但 OAuth client_id / brand 不同,用专属箭头 mark 区分(避免跟 gemini 共用
+    // 图标让用户分不清两个 OAuth provider)。`antigravity-oauth` 子串命中 preset
+    // id;不加更宽的 'antigravity' 防误命中用户自定义 provider 名
+    'antigravity-oauth': { logo: 'assets/providers/antigravity.svg' },
     // Google AI Studio:用官方品牌图标(从 aistudio.google.com 抓的
     // ai_studio_favicon_2_128x128.png,圆形黑底带 sparkle/方框 mark)。
     // 子串命中 "google" / "gemini" / "aistudio" / "generativelanguage" 任一都映射到此。
@@ -138,6 +143,12 @@
         // 漏 passthrough 会被 fallback 'openai_chat',OAuth provider 退化成
         // 用 api_key+/chat/completions 探测 cloudcode-pa 必 404。2026-05-11 实测
         if (['gemini_cli_oauth', 'gemini_oauth', 'google_oauth_cloud_code'].includes(v)) return 'gemini_cli_oauth';
+        // Antigravity OAuth(Google Antigravity IDE,跟 gemini-cli 共用 cloudcode-pa
+        // 上游但不同 OAuth client_id + 独立 token 文件)— passthrough,后端
+        // GeminiCliAdapter 按 apiFormat 别名分流到 antigravity-oauth.json token。
+        // 不接受裸 'antigravity' alias —— 怕 legacy 配置 / 用户手填把别的 provider
+        // (apiFormat 历史漂移值)误归 OAuth 路径(silent-failure I3 修)
+        if (['antigravity_oauth', 'google_oauth_antigravity'].includes(v)) return 'antigravity_oauth';
         return 'openai_chat';  // openai / openai_chat / chat_completions / 空 / 未知 → openai_chat
       })(),
       extraHeaders: payload.extraHeaders || {},
@@ -426,6 +437,24 @@
 
     async logoutGeminiOauth() {
       return api('DELETE', '/api/gemini-oauth/logout');
+    },
+
+    // ── Antigravity OAuth ────────────────────────────────────────────────
+    // 后端 admin handler 在 src-tauri/src/admin/handlers/antigravity_oauth.rs。
+    // 跟 gemini-cli 完全 parallel:独立 cancel slot / done channel / token 文件,
+    // 用户可同时登录两个 provider。endpoint shape 同 gemini-cli(login long-poll +
+    // status/logout 即时操作)。
+    async getAntigravityOauthStatus() {
+      return api('GET', '/api/antigravity-oauth/status');
+    },
+
+    async loginAntigravityOauth() {
+      // **long polling** — fetch 会阻塞最长 5min 等待 OAuth callback
+      return api('POST', '/api/antigravity-oauth/login', {});
+    },
+
+    async logoutAntigravityOauth() {
+      return api('DELETE', '/api/antigravity-oauth/logout');
     },
   };
 })();
