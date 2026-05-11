@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
+use crate::responses::input::{merge_messages_with_previous_response, response_id_for_session};
 use crate::responses::ResponseSessionCache;
 use crate::types::{AdapterError, ResponseSessionPlan};
 
@@ -76,8 +77,16 @@ pub fn responses_body_to_gemini_request_with_session(
     // Step 1: Codex.app /responses → 归一化 chat-shape 中间表示
     let mut chat_body = responses_body_to_normalized_chat(body)?;
     // Step 1.5: previous_response_id 会话恢复(与 ResponsesAdapter 对齐)
+    let current_messages = chat_body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let merged_messages =
-        merge_messages_with_previous_response(&mut chat_body, body, session_cache)?;
+        merge_messages_with_previous_response(current_messages, body, session_cache)?;
+    if let Some(obj) = chat_body.as_object_mut() {
+        obj.insert("messages".into(), Value::Array(merged_messages.clone()));
+    }
     // Step 2: chat → Gemini wire(LiteLLM 1:1 移植)
     let request = chat_normalized_to_gemini_request(&chat_body, provider)?;
     Ok(GeminiResponsesRequestConversion {
@@ -87,72 +96,6 @@ pub fn responses_body_to_gemini_request_with_session(
             messages: merged_messages,
         },
     })
-}
-
-fn response_id_for_session() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("resp_{nanos:x}")
-}
-
-fn merge_messages_with_previous_response(
-    chat_body: &mut Value,
-    original_body: &Value,
-    session_cache: Option<&ResponseSessionCache>,
-) -> Result<Vec<Value>, AdapterError> {
-    let current_messages = chat_body
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let previous_response_id = original_body
-        .get("previous_response_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-
-    let merged = if !previous_response_id.is_empty() {
-        if let Some(cache) = session_cache {
-            if let Some(history) = cache.get(previous_response_id) {
-                let history_has_system = history.iter().any(|msg| {
-                    matches!(
-                        msg.get("role").and_then(|v| v.as_str()),
-                        Some("system" | "developer")
-                    )
-                });
-                let mut current = current_messages;
-                if history_has_system
-                    && current
-                        .first()
-                        .and_then(|msg| msg.get("role"))
-                        .and_then(|v| v.as_str())
-                        == Some("system")
-                {
-                    current.remove(0);
-                }
-                let mut messages = history;
-                messages.extend(current);
-                messages
-            } else if current_messages.is_empty() {
-                return Err(AdapterError::PreviousResponseNotFound {
-                    previous_response_id: previous_response_id.to_owned(),
-                });
-            } else {
-                current_messages
-            }
-        } else {
-            current_messages
-        }
-    } else {
-        current_messages
-    };
-
-    if let Some(obj) = chat_body.as_object_mut() {
-        obj.insert("messages".into(), Value::Array(merged.clone()));
-    }
-    Ok(merged)
 }
 
 /// 拼上游 URL path:`/v1beta/models/{m}:streamGenerateContent?alt=sse` 等。

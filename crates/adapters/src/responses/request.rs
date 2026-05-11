@@ -23,6 +23,7 @@ use serde_json::{json, Map, Value};
 
 use crate::types::{AdapterError, ResponseSessionPlan};
 
+use super::input::{merge_messages_with_previous_response, response_id_for_session};
 use super::session::ResponseSessionCache;
 
 #[derive(Debug, Clone)]
@@ -241,14 +242,6 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     })
 }
 
-fn response_id_for_session() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("resp_{nanos:x}")
-}
-
 fn build_messages_from_input(
     body: &Value,
     session_cache: Option<&ResponseSessionCache>,
@@ -265,52 +258,8 @@ fn build_messages_from_input(
         .get("input")
         .map(input_field_to_messages)
         .unwrap_or_default();
-    let previous_response_id = body
-        .get("previous_response_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-
-    if !previous_response_id.is_empty() {
-        if let Some(cache) = session_cache {
-            // 命中 → 拼历史 + 当前输入;Miss + 当前输入也空 → 报
-            // PreviousResponseNotFound 让上层返回标准 OpenAI 400。
-            // (单纯 Miss + 当前输入有内容仍走"忽略 previous_response_id 只
-            // 发当前输入"的旧降级逻辑,避免改变 cache miss 但 input 非空的
-            // 既有行为。)
-            if let Some(history) = cache.get(previous_response_id) {
-                let history_has_system = history.iter().any(|msg| {
-                    matches!(
-                        msg.get("role").and_then(|v| v.as_str()),
-                        Some("system" | "developer")
-                    )
-                });
-                if history_has_system
-                    && messages
-                        .first()
-                        .and_then(|msg| msg.get("role"))
-                        .and_then(|v| v.as_str())
-                        == Some("system")
-                {
-                    messages.remove(0);
-                }
-                messages.extend(history);
-                messages.extend(current_messages);
-                return Ok(messages);
-            }
-            // cache miss
-            if current_messages.is_empty() {
-                return Err(AdapterError::PreviousResponseNotFound {
-                    previous_response_id: previous_response_id.to_owned(),
-                });
-            }
-            // miss 但 input 非空 → 降级,丢 previous_response_id 只用 input
-            // (保留既有行为,避免无 cache 时的纯新对话误报)
-        }
-    }
-
     messages.extend(current_messages);
-    Ok(messages)
+    merge_messages_with_previous_response(messages, body, session_cache)
 }
 
 fn build_instructions_message(instructions: &Value) -> Option<Value> {

@@ -84,6 +84,15 @@ pub trait ProviderResponseMapper {
   - `tool_call_cache` 修复接线
   - 统一 `responses_body_to_normalized_chat` 管道
 
+#### Phase 2 progress
+
+- [x] 抽取 `previous_response_id` 历史恢复为共享模块：
+  - `responses/input.rs::merge_messages_with_previous_response`
+  - `responses/input.rs::response_id_for_session`
+- [x] `responses/request.rs` 与 `gemini_native/request.rs` 接入共享实现
+- [ ] `tool_call_cache` 修复接线继续收敛
+- [ ] 统一 `responses_body_to_normalized_chat` 主管道
+
 ### Phase 3
 
 - 收敛 compact + endpoint 规则

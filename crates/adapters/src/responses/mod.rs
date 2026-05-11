@@ -11,6 +11,7 @@
 pub mod compact;
 pub mod converter;
 pub(crate) mod events;
+pub(crate) mod input;
 pub mod request;
 pub mod session;
 pub mod stream;
