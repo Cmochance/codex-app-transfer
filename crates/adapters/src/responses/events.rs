@@ -7,7 +7,9 @@ use serde_json::{json, Value};
 ///
 /// 供 Responses / GeminiNative 两条 Responses SSE 转换链路共享,避免同一套
 /// 扫描规则在多个 converter 中重复维护。
-pub(crate) fn build_tool_namespace_map(original_request: Option<&Value>) -> HashMap<String, String> {
+pub(crate) fn build_tool_namespace_map(
+    original_request: Option<&Value>,
+) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let Some(req) = original_request else {
         return map;
@@ -50,7 +52,12 @@ pub(crate) fn build_tool_namespace_map(original_request: Option<&Value>) -> Hash
 ///
 /// 该 helper 统一维护 `sequence_number` 注入逻辑,并在 payload 序列化失败时
 /// 保留 fallback `{}` + error 日志,防止静默丢失。
-pub(crate) fn emit_sse_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, mut payload: Value) {
+pub(crate) fn emit_sse_event(
+    out: &mut Vec<u8>,
+    seq: &mut u64,
+    event_name: &str,
+    mut payload: Value,
+) {
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("sequence_number".into(), json!(*seq));
     }
