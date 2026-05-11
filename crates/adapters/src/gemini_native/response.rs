@@ -44,7 +44,6 @@
 //! - `candidates[].finishReason` → completed envelope 的 incomplete_details(若非 STOP)
 //! - `usageMetadata` → completed envelope 的 usage 字段
 
-use std::collections::HashMap;
 use std::pin::Pin;
 
 use bytes::Bytes;
@@ -52,6 +51,7 @@ use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
+use crate::responses::global_response_session_cache;
 use crate::types::{ByteStream, ResponseSessionPlan};
 
 use super::grounding::convert_grounding_metadata_to_annotations;
@@ -517,6 +517,90 @@ impl GeminiToResponsesConverter {
         })
     }
 
+    /// 从 `response.completed.output[]` 还原一条可缓存的 assistant message,
+    /// 供 `previous_response_id` 续轮恢复历史。
+    ///
+    /// 跟 `responses::converter::assistant_message()` 语义对齐:
+    /// - message items 的 output_text 拼成 `content`
+    /// - reasoning items 的 summary_text 拼成 `reasoning_content`
+    /// - function_call items 还原成 `tool_calls`
+    fn build_assistant_message_for_session(output_items: &[Value]) -> Option<Value> {
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut reasoning_parts: Vec<String> = Vec::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
+
+        for item in output_items {
+            match item.get("type").and_then(|v| v.as_str()) {
+                Some("message") => {
+                    if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                        for part in content {
+                            if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                    if !text.is_empty() {
+                                        text_parts.push(text.to_owned());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
+                        for part in summary {
+                            if part.get("type").and_then(|v| v.as_str()) == Some("summary_text") {
+                                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                    if !text.is_empty() {
+                                        reasoning_parts.push(text.to_owned());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let name = item
+                        .get("name")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new()));
+                    let arguments = item
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(Value::String("{}".into()));
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        if text_parts.is_empty() && reasoning_parts.is_empty() && tool_calls.is_empty() {
+            return None;
+        }
+
+        let mut message = json!({
+            "role": "assistant",
+            "content": text_parts.join("\n"),
+        });
+        if !reasoning_parts.is_empty() {
+            message["reasoning_content"] = Value::String(reasoning_parts.join("\n"));
+        }
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(tool_calls);
+        }
+        Some(message)
+    }
+
     // ───── 字节 feed ─────
 
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
@@ -911,6 +995,18 @@ impl GeminiToResponsesConverter {
         }
         all_items.sort_by_key(|(idx, _)| *idx);
         let output_items: Vec<Value> = all_items.into_iter().map(|(_, item)| item).collect();
+
+        // 保存 session 历史(用于下一轮 previous_response_id 续话):
+        // `prepare_request` 里已经把"上一轮历史 + 当前用户输入"放进 response_session.messages，
+        // 这里补上本轮 assistant 输出后写入全局 ResponseSessionCache。
+        if let Some(session) = self.response_session.take() {
+            let mut messages = session.messages;
+            if let Some(assistant) = Self::build_assistant_message_for_session(&output_items) {
+                messages.push(assistant);
+            }
+            global_response_session_cache().save(&session.response_id, messages);
+        }
+
         envelope["output"] = Value::Array(output_items);
         envelope["usage"] = self.final_usage.clone().unwrap_or(Value::Null);
         envelope["incomplete_details"] = if status == "incomplete" {
@@ -1735,6 +1831,9 @@ pub fn convert_gemini_to_responses_stream(
 mod tests {
     use super::*;
     use futures_util::StreamExt;
+    use serde_json::json;
+
+    use crate::responses::global_response_session_cache;
 
     fn drive_to_events(conv: &mut GeminiToResponsesConverter, chunks: &[&[u8]]) -> Vec<String> {
         let mut all: Vec<u8> = Vec::new();
@@ -1761,6 +1860,35 @@ mod tests {
             }
         }
         (name, serde_json::from_str(&data).unwrap_or(Value::Null))
+    }
+
+    fn input_stream(bytes: &'static [u8]) -> ByteStream {
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(bytes))]))
+    }
+
+    #[tokio::test]
+    async fn stream_completion_saves_response_session_for_resume() {
+        let response_id = format!("resp_gn_session_{}", synthesize_id());
+        let session = ResponseSessionPlan {
+            response_id: response_id.clone(),
+            messages: vec![json!({"role":"user","content":"hello from previous turn"})],
+        };
+        let raw = br#"data: {"candidates":[{"content":{"parts":[{"text":"hi from gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}
+
+"#;
+        let mut converted =
+            convert_gemini_to_responses_stream(input_stream(raw), None, Some(session));
+        while let Some(chunk) = converted.next().await {
+            let _ = chunk.expect("stream chunk should be valid");
+        }
+
+        let saved = global_response_session_cache().get(&response_id).expect(
+            "gemini_native stream must persist response session for previous_response_id resume",
+        );
+        assert_eq!(saved.len(), 2, "保存后应为 1 条用户 + 1 条 assistant");
+        assert_eq!(saved[0]["role"], "user");
+        assert_eq!(saved[1]["role"], "assistant");
+        assert_eq!(saved[1]["content"], "hi from gemini");
     }
 
     #[test]

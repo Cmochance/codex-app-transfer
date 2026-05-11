@@ -131,7 +131,7 @@ const COMPACT_MAX_OUTPUT_TOKENS: u32 = 20_000;
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// 判断入站 path 是否是 `/responses/compact`(含可选 `/v1/`、`/openai/v1/` 前缀)。
-pub(super) fn is_compact_path(path: &str) -> bool {
+pub(crate) fn is_compact_path(path: &str) -> bool {
     let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
     let path_only = path_only.strip_prefix("/openai").unwrap_or(path_only);
     let path_only = path_only.strip_prefix("/v1").unwrap_or(path_only);
@@ -153,7 +153,7 @@ pub(super) fn is_compact_path(path: &str) -> bool {
 /// - 丢弃 `instructions`(摘要任务不应受原任务 system prompt 影响)
 /// - 保留 `tools`(`ensure_thinking_tool_call_reasoning` 的 `has_tool_loop`
 ///   检测需要,且第三方 provider 看到 tools 字段不会 400)
-pub(super) fn build_compact_chat_request(
+pub(crate) fn build_compact_chat_request(
     body_bytes: &[u8],
     provider: &Provider,
 ) -> Result<Vec<u8>, AdapterError> {
@@ -239,7 +239,7 @@ pub(super) fn build_compact_chat_request(
 ///
 /// 当上游返回非 2xx 时,把它的 status + body 透传给客户端(让 Codex CLI
 /// 拿到上游真实错误而不是被我们包成"假成功")。
-pub(super) fn build_compact_response_plan(
+pub(crate) fn build_compact_response_plan(
     upstream_status: StatusCode,
     mut upstream_headers: HeaderMap,
     upstream_stream: ByteStream,

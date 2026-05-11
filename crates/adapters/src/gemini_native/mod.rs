@@ -23,6 +23,10 @@ use codex_app_transfer_registry::Provider;
 use http::{header::HeaderValue, HeaderMap, StatusCode};
 use serde_json::Value;
 
+use crate::responses::compact::{
+    build_compact_chat_request, build_compact_response_plan, is_compact_path,
+};
+use crate::responses::global_response_session_cache;
 use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
 pub mod grounding;
@@ -46,10 +50,38 @@ impl Adapter for GeminiNativeAdapter {
 
     fn prepare_request(
         &self,
-        _client_path: &str,
+        client_path: &str,
         body: Bytes,
         provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
+        // 对齐 chat<=>responses 的私有 /responses/compact 流程:
+        // 入站 compact body 先转成 compact 专用 chat request(含总结 prompt),
+        // 再走 gemini_native chat->Gemini wire 转换。上游用非流式 generateContent,
+        // 响应侧再包装回 {"output":[{"type":"compaction",...}]}.
+        if is_compact_path(client_path) {
+            let compact_chat_body = build_compact_chat_request(&body, provider)?;
+            let compact_chat_json: Value = serde_json::from_slice(&compact_chat_body)
+                .map_err(|e| AdapterError::Internal(format!("compact chat body decode: {e}")))?;
+            let model = compact_chat_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AdapterError::BadRequest("compact body missing model".into()))?
+                .to_owned();
+            let gemini_request =
+                request::chat_normalized_to_gemini_request(&compact_chat_json, provider)?;
+            let gemini_body =
+                serde_json::to_vec(&gemini_request).map_err(AdapterError::BodyDecode)?;
+            let upstream_path =
+                request::build_gemini_upstream_path(&model, false, &provider.base_url);
+            return Ok(RequestPlan {
+                upstream_path,
+                body: Bytes::from(gemini_body),
+                response_session: None,
+                is_compact: true,
+                original_responses_request: None,
+            });
+        }
+
         // 1. 解析入站 body(Codex.app /responses 形态)
         let parsed: Value = serde_json::from_slice(&body)?;
         let stream = parsed
@@ -64,7 +96,12 @@ impl Adapter for GeminiNativeAdapter {
 
         // 2. Codex.app /responses → Gemini RequestBody(完整转换 1:1 LiteLLM
         // chat→Gemini + 我们项目的 Responses→chat 归一化)
-        let gemini_request = request::responses_body_to_gemini_request(&parsed, provider)?;
+        let conversion = request::responses_body_to_gemini_request_with_session(
+            &parsed,
+            provider,
+            Some(global_response_session_cache()),
+        )?;
+        let gemini_request = conversion.request;
         let gemini_body = serde_json::to_vec(&gemini_request).map_err(AdapterError::BodyDecode)?;
 
         // 3. 拼上游 URL path:Gemini 3+ 用 v1alpha,2.x 用 v1beta;若 base_url
@@ -74,7 +111,7 @@ impl Adapter for GeminiNativeAdapter {
         Ok(RequestPlan {
             upstream_path,
             body: Bytes::from(gemini_body),
-            response_session: None,
+            response_session: Some(conversion.response_session),
             is_compact: false,
             // Codex.app /responses 入站时 original_responses_request 用于回灌
             // Responses envelope 字段 — 但响应侧 SSE 状态机下轮才做,留 None。
@@ -103,6 +140,9 @@ impl Adapter for GeminiNativeAdapter {
         _provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
+        if request_plan.is_compact {
+            return build_compact_response_plan(upstream_status, upstream_headers, upstream_stream);
+        }
         // 上游 4xx/5xx 也走 SSE — 两个分支都要重写 content-type;另外必须 strip
         // content-length(我们 emit 的 SSE bytes 数跟原 body 不一样)和 content-encoding
         // (上游可能返 gzip 的 JSON 错误体,如果保留 header 客户端会试图 gunzip plaintext SSE
@@ -142,6 +182,7 @@ impl Adapter for GeminiNativeAdapter {
 #[cfg(test)]
 mod adapter_tests {
     use super::*;
+    use futures_util::StreamExt;
     use indexmap::IndexMap;
 
     fn dummy_provider() -> Provider {
@@ -232,5 +273,124 @@ mod adapter_tests {
             )
             .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
+    }
+
+    #[test]
+    fn compact_path_routes_to_non_stream_generate_content_and_marks_is_compact() {
+        let body = serde_json::json!({
+            "model": "gemini-3.1-pro-high",
+            "input": [
+                {"type":"message","role":"user","content":"history x"},
+            ],
+            "reasoning": {"effort":"medium"}
+        });
+        let plan = GeminiNativeAdapter
+            .prepare_request(
+                "/v1/responses/compact",
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                &dummy_provider(),
+            )
+            .expect("compact prepare_request should succeed");
+        assert!(
+            plan.is_compact,
+            "compact path must set RequestPlan.is_compact=true"
+        );
+        assert!(
+            plan.upstream_path.ends_with(":generateContent"),
+            "compact should call non-stream generateContent, got {}",
+            plan.upstream_path
+        );
+        let parsed: Value = serde_json::from_slice(&plan.body).expect("gemini request json");
+        assert!(
+            parsed.get("contents").is_some(),
+            "compact request must still convert to Gemini contents wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_turn_responses_roundtrip_restores_history_via_previous_response_id() {
+        let adapter = GeminiNativeAdapter;
+        // turn-1: 正常问答
+        let body1 = serde_json::json!({
+            "model": "gemini-3.1-pro-high",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"first question"}]
+        });
+        let plan1 = adapter
+            .prepare_request(
+                "/v1/responses?stream=true",
+                Bytes::from(serde_json::to_vec(&body1).unwrap()),
+                &dummy_provider(),
+            )
+            .expect("turn-1 prepare_request should succeed");
+        let response_id = plan1
+            .response_session
+            .as_ref()
+            .map(|s| s.response_id.clone())
+            .expect("turn-1 must carry response_session for resume");
+
+        // 上游 Gemini SSE(最小成功文本流),用于触发 transform_response_stream 里的
+        // session save 逻辑
+        let upstream_chunk = br#"data: {"candidates":[{"content":{"parts":[{"text":"first answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}
+
+"#;
+        let upstream_stream: ByteStream = Box::pin(futures_util::stream::iter(vec![Ok(
+            Bytes::from_static(upstream_chunk),
+        )]));
+        let response_plan = adapter
+            .transform_response_stream(
+                StatusCode::OK,
+                HeaderMap::new(),
+                upstream_stream,
+                &dummy_provider(),
+                &plan1,
+            )
+            .expect("turn-1 transform_response_stream should succeed");
+        // 消费完流,确保 finish/save 执行
+        let mut stream = response_plan.stream;
+        while let Some(chunk) = stream.next().await {
+            let _ = chunk.expect("transformed chunk should be valid");
+        }
+
+        // turn-2:用 previous_response_id 续话,应当把 turn-1 的 user+assistant 历史拼回
+        let body2 = serde_json::json!({
+            "model": "gemini-3.1-pro-high",
+            "stream": true,
+            "previous_response_id": response_id,
+            "input": [{"type":"message","role":"user","content":"follow up question"}]
+        });
+        let plan2 = adapter
+            .prepare_request(
+                "/v1/responses?stream=true",
+                Bytes::from(serde_json::to_vec(&body2).unwrap()),
+                &dummy_provider(),
+            )
+            .expect("turn-2 prepare_request should succeed");
+        let req2: Value = serde_json::from_slice(&plan2.body).expect("gemini wire json");
+        let contents = req2["contents"].as_array().expect("contents array");
+
+        let mut all_text = String::new();
+        for content in contents {
+            if let Some(parts) = content.get("parts").and_then(|v| v.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                        all_text.push_str(text);
+                        all_text.push('\n');
+                    }
+                }
+            }
+        }
+        assert!(
+            all_text.contains("first question"),
+            "turn-2 outgoing contents must contain restored prior user message"
+        );
+        assert!(
+            all_text.contains("first answer"),
+            "turn-2 outgoing contents must contain restored prior assistant message"
+        );
+        assert!(
+            all_text.contains("follow up question"),
+            "turn-2 outgoing contents must contain current user input"
+        );
     }
 }

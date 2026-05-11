@@ -32,7 +32,8 @@ use std::collections::HashMap;
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
-use crate::types::AdapterError;
+use crate::responses::ResponseSessionCache;
+use crate::types::{AdapterError, ResponseSessionPlan};
 
 use super::types::{
     Content, FileData, FunctionCall, FunctionCallingConfig, FunctionDeclaration, FunctionResponse,
@@ -49,10 +50,109 @@ pub fn responses_body_to_gemini_request(
     body: &Value,
     provider: &Provider,
 ) -> Result<RequestBody, AdapterError> {
+    Ok(responses_body_to_gemini_request_with_session(body, provider, None)?.request)
+}
+
+#[derive(Debug, Clone)]
+pub struct GeminiResponsesRequestConversion {
+    pub request: RequestBody,
+    pub response_session: ResponseSessionPlan,
+}
+
+/// Codex.app /responses body → Gemini RequestBody + ResponseSessionPlan。
+///
+/// 对齐 `responses::request::build_messages_from_input` 的连续会话语义:
+/// - `previous_response_id` 命中 cache 时:历史 + 本轮 input 合并
+/// - miss 且本轮 input 为空:返回 `previous_response_not_found`
+/// - miss 但本轮 input 非空:降级为仅本轮 input
+///
+/// 注意:这里保留 gemini_native 本地归一化/工具映射逻辑,只补会话拼接能力,
+/// 不回退到 ResponsesAdapter 路径。
+pub fn responses_body_to_gemini_request_with_session(
+    body: &Value,
+    provider: &Provider,
+    session_cache: Option<&ResponseSessionCache>,
+) -> Result<GeminiResponsesRequestConversion, AdapterError> {
     // Step 1: Codex.app /responses → 归一化 chat-shape 中间表示
-    let chat_body = responses_body_to_normalized_chat(body)?;
+    let mut chat_body = responses_body_to_normalized_chat(body)?;
+    // Step 1.5: previous_response_id 会话恢复(与 ResponsesAdapter 对齐)
+    let merged_messages =
+        merge_messages_with_previous_response(&mut chat_body, body, session_cache)?;
     // Step 2: chat → Gemini wire(LiteLLM 1:1 移植)
-    chat_normalized_to_gemini_request(&chat_body, provider)
+    let request = chat_normalized_to_gemini_request(&chat_body, provider)?;
+    Ok(GeminiResponsesRequestConversion {
+        request,
+        response_session: ResponseSessionPlan {
+            response_id: response_id_for_session(),
+            messages: merged_messages,
+        },
+    })
+}
+
+fn response_id_for_session() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("resp_{nanos:x}")
+}
+
+fn merge_messages_with_previous_response(
+    chat_body: &mut Value,
+    original_body: &Value,
+    session_cache: Option<&ResponseSessionCache>,
+) -> Result<Vec<Value>, AdapterError> {
+    let current_messages = chat_body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let previous_response_id = original_body
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    let merged = if !previous_response_id.is_empty() {
+        if let Some(cache) = session_cache {
+            if let Some(history) = cache.get(previous_response_id) {
+                let history_has_system = history.iter().any(|msg| {
+                    matches!(
+                        msg.get("role").and_then(|v| v.as_str()),
+                        Some("system" | "developer")
+                    )
+                });
+                let mut current = current_messages;
+                if history_has_system
+                    && current
+                        .first()
+                        .and_then(|msg| msg.get("role"))
+                        .and_then(|v| v.as_str())
+                        == Some("system")
+                {
+                    current.remove(0);
+                }
+                let mut messages = history;
+                messages.extend(current);
+                messages
+            } else if current_messages.is_empty() {
+                return Err(AdapterError::PreviousResponseNotFound {
+                    previous_response_id: previous_response_id.to_owned(),
+                });
+            } else {
+                current_messages
+            }
+        } else {
+            current_messages
+        }
+    } else {
+        current_messages
+    };
+
+    if let Some(obj) = chat_body.as_object_mut() {
+        obj.insert("messages".into(), Value::Array(merged.clone()));
+    }
+    Ok(merged)
 }
 
 /// 拼上游 URL path:`/v1beta/models/{m}:streamGenerateContent?alt=sse` 等。
@@ -1918,6 +2018,9 @@ fn apply_extra_body_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use crate::responses::ResponseSessionCache;
     use indexmap::IndexMap;
 
     fn dummy_provider() -> Provider {
@@ -1993,6 +2096,49 @@ mod tests {
         assert_eq!(msgs[0]["content"], "You are helpful.");
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(msgs[1]["content"], "hi");
+    }
+
+    #[test]
+    fn responses_with_previous_response_id_merges_cached_history() {
+        let cache = ResponseSessionCache::new(16, Duration::from_secs(60));
+        cache.save(
+            "resp_prev_1",
+            vec![
+                serde_json::json!({"role":"user","content":"历史问题"}),
+                serde_json::json!({"role":"assistant","content":"历史回答"}),
+            ],
+        );
+        let body = serde_json::json!({
+            "model": "gemini-3.1-pro-high",
+            "previous_response_id": "resp_prev_1",
+            "input": [
+                {"type":"message","role":"user","content":"新问题"}
+            ]
+        });
+        let conv =
+            responses_body_to_gemini_request_with_session(&body, &dummy_provider(), Some(&cache))
+                .unwrap();
+        let msgs = conv.response_session.messages;
+        assert_eq!(msgs.len(), 3, "应为 历史2条 + 本轮1条");
+        assert_eq!(msgs[0]["content"], "历史问题");
+        assert_eq!(msgs[1]["content"], "历史回答");
+        assert_eq!(msgs[2]["content"], "新问题");
+    }
+
+    #[test]
+    fn previous_response_id_miss_with_empty_input_returns_not_found() {
+        let cache = ResponseSessionCache::new(16, Duration::from_secs(60));
+        let body = serde_json::json!({
+            "model": "gemini-3.1-pro-high",
+            "previous_response_id": "resp_missing"
+        });
+        let err =
+            responses_body_to_gemini_request_with_session(&body, &dummy_provider(), Some(&cache))
+                .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::PreviousResponseNotFound { .. }),
+            "cache miss + 空 input 应返回 previous_response_not_found, 实际: {err:?}"
+        );
     }
 
     #[test]
