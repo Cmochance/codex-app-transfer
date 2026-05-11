@@ -1272,7 +1272,12 @@
   /// 调 GET /api/<provider>-oauth/status 同步 UI 状态(已登录 / 未登录 / partial)。
   /// 错误路径完整:清旧 i18n key + 复位 button visibility + structured error message
   /// (silent-failure-hunter C1 修)。i18n key 前缀按 activeOauthConfig 切换,
-  /// 让 gemini-cli vs antigravity 用各自文案 namespace
+  /// 让 gemini-cli vs antigravity 用各自文案 namespace。
+  ///
+  /// **race 安全**(2026-05-11 codex-connector P2):入口 snapshot `activeOauthConfig`,
+  /// await 后**identity check** 才动 DOM。否则 user 在 status fetch 飞行中切 provider
+  /// (eg gemini-cli ↔ antigravity 互切),旧 provider 的延迟 response 会覆盖
+  /// 新 provider UI,显错登录状态。同 handleOauthLogin/Logout 的 race fix 模式
   async function refreshOauthStatusUi() {
     const statusEl = $("#oauthStatusText");
     const loginBtn = $("#oauthLoginBtn");
@@ -1283,6 +1288,11 @@
     const k = (suffix) => `${config.i18nPrefix}.${suffix}`;
     try {
       const status = await config.api.getStatus();
+      // **post-await identity check**:status 拿回时 user 可能已切到别 provider /
+      // 关 OAuth row,这条 response 是过时数据,不该污染新 UI 上下文
+      if (activeOauthConfig !== config) {
+        return;
+      }
       if (!status.loggedIn) {
         statusEl.dataset.i18n = k("statusNotLoggedIn");
         statusEl.textContent = tFmt(k("statusNotLoggedIn"));
@@ -1317,6 +1327,10 @@
         }
       }
     } catch (e) {
+      // **catch 路径同 identity check**:fetch reject 后 user 可能也已切 provider
+      if (activeOauthConfig !== config) {
+        return;
+      }
       const msg = e?.message || String(e);
       statusEl.dataset.i18n = k("statusFetchFailed");
       statusEl.textContent = tFmt(k("statusFetchFailed"), { error: msg });
