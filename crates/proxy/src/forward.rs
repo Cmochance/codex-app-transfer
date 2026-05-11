@@ -788,24 +788,25 @@ async fn build_and_send_upstream(
             // Referer / Accept-* / Sec-Fetch-*,grok_headers 会跟客户端值一起 append →
             // grok.com 看到双 Cookie 会 session 错乱。先用 `reqwest::RequestBuilder` 拿到
             // 底层 `HeaderMap` 把这些 header 名 remove 干净,再注入 grok_headers。
-            let grok_headers = match codex_app_transfer_adapters::grok_web::auth::apply_grok_headers_typed(
-                &resolved.provider,
-            ) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::error!(
-                        error_id = "GROK_AUTH_HEADERS_MISSING",
-                        provider_id = %resolved.provider_id,
-                        error = %e,
-                        "grok_web 鉴权头注入失败 — provider.extra.grokWeb 配置缺失;短路 surface 401"
-                    );
-                    return Err(ForwardError::Adapter(
-                        codex_app_transfer_adapters::AdapterError::BadRequest(format!(
-                            "grok_web auth config missing: {e}"
-                        )),
-                    ));
-                }
-            };
+            let grok_headers =
+                match codex_app_transfer_adapters::grok_web::auth::apply_grok_headers_typed(
+                    &resolved.provider,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::error!(
+                            error_id = "GROK_AUTH_HEADERS_MISSING",
+                            provider_id = %resolved.provider_id,
+                            error = %e,
+                            "grok_web 鉴权头注入失败 — provider.extra.grokWeb 配置缺失;短路 surface 401"
+                        );
+                        return Err(ForwardError::Adapter(
+                            codex_app_transfer_adapters::AdapterError::BadRequest(format!(
+                                "grok_web auth config missing: {e}"
+                            )),
+                        ));
+                    }
+                };
             // dup-header 防御:上方 inbound headers 复制循环已对 GrokCookie scheme
             // 走 `is_grok_owned_header` 过滤(参见 line 695-703 + line 265 helper),
             // 入站客户端的 Cookie / Origin / Referer / Accept-* / Sec-Fetch-* /

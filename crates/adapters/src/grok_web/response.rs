@@ -190,77 +190,71 @@ pub fn convert_grok_error_to_responses_failure_stream(
     let status_u16 = upstream_status.as_u16();
     let code = classify_grok_error_status(status_u16);
 
-    let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-        Box::pin(stream::unfold(
-            (upstream_stream, false),
-            move |(mut input, finished)| {
-                let response_id = response_id.clone();
-                let code = code.to_owned();
-                async move {
-                    if finished {
-                        return None;
-                    }
-                    let mut body = Vec::with_capacity(1024);
-                    let mut transport_err: Option<String> = None;
-                    let mut truncated = false;
-                    while let Some(chunk) = input.next().await {
-                        match chunk {
-                            Ok(b) => {
-                                let remaining =
-                                    MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
-                                if remaining == 0 {
-                                    truncated = true;
-                                    break;
-                                }
-                                let take = b.len().min(remaining);
-                                body.extend_from_slice(&b[..take]);
-                                if take < b.len() {
-                                    truncated = true;
-                                    break;
-                                }
+    let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
+        stream::unfold((upstream_stream, false), move |(mut input, finished)| {
+            let response_id = response_id.clone();
+            let code = code.to_owned();
+            async move {
+                if finished {
+                    return None;
+                }
+                let mut body = Vec::with_capacity(1024);
+                let mut transport_err: Option<String> = None;
+                let mut truncated = false;
+                while let Some(chunk) = input.next().await {
+                    match chunk {
+                        Ok(b) => {
+                            let remaining =
+                                MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
+                            if remaining == 0 {
+                                truncated = true;
+                                break;
                             }
-                            Err(e) => {
-                                transport_err = Some(e.to_string());
+                            let take = b.len().min(remaining);
+                            body.extend_from_slice(&b[..take]);
+                            if take < b.len() {
+                                truncated = true;
                                 break;
                             }
                         }
+                        Err(e) => {
+                            transport_err = Some(e.to_string());
+                            break;
+                        }
                     }
-                    let was_lossy = std::str::from_utf8(&body).is_err();
-                    let mut body_text = String::from_utf8_lossy(&body).into_owned();
-                    if truncated {
-                        body_text.push_str(" …(truncated)");
-                    }
-                    if was_lossy {
-                        body_text.push_str(" (non-UTF-8 body)");
-                    }
-                    let (final_code, message) = if let Some(transport) = transport_err {
-                        (
+                }
+                let was_lossy = std::str::from_utf8(&body).is_err();
+                let mut body_text = String::from_utf8_lossy(&body).into_owned();
+                if truncated {
+                    body_text.push_str(" …(truncated)");
+                }
+                if was_lossy {
+                    body_text.push_str(" (non-UTF-8 body)");
+                }
+                let (final_code, message) = if let Some(transport) = transport_err {
+                    (
                             "upstream_transport_error".to_owned(),
                             format!(
                                 "grok.com HTTP {status_u16} but transport err during body read: {transport}",
                             ),
                         )
+                } else {
+                    let msg = if body_text.is_empty() {
+                        format!("grok.com HTTP {status_u16} (empty body)")
                     } else {
-                        let msg = if body_text.is_empty() {
-                            format!("grok.com HTTP {status_u16} (empty body)")
-                        } else {
-                            format!("grok.com HTTP {status_u16}: {body_text}")
-                        };
-                        (code, msg)
+                        format!("grok.com HTTP {status_u16}: {body_text}")
                     };
+                    (code, msg)
+                };
 
-                    // 两个事件拼一起 yield(避免 mock stream 单 chunk 截断 SSE 帧)
-                    let mut buf = Vec::with_capacity(512);
-                    buf.extend_from_slice(&emit_response_created(&response_id));
-                    buf.extend_from_slice(&emit_response_failed(
-                        &response_id,
-                        &final_code,
-                        &message,
-                    ));
-                    Some((Ok(Bytes::from(buf)), (input, true)))
-                }
-            },
-        ));
+                // 两个事件拼一起 yield(避免 mock stream 单 chunk 截断 SSE 帧)
+                let mut buf = Vec::with_capacity(512);
+                buf.extend_from_slice(&emit_response_created(&response_id));
+                buf.extend_from_slice(&emit_response_failed(&response_id, &final_code, &message));
+                Some((Ok(Bytes::from(buf)), (input, true)))
+            }
+        }),
+    );
     s
 }
 
@@ -642,9 +636,7 @@ mod tests {
     #[tokio::test]
     async fn error_envelope_frame_emits_response_failed() {
         // review-feedback H3 防御:`{"error": {...}}` envelope 帧检测后翻译
-        let lines = vec![
-            r#"{"error": {"message": "rate limited by upstream", "code": 429}}"#,
-        ];
+        let lines = vec![r#"{"error": {"message": "rate limited by upstream", "code": 429}}"#];
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),

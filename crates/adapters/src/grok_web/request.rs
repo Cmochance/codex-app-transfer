@@ -379,8 +379,7 @@ mod tests {
         // review-feedback TD3:serialize_grok_request 调 validate,connectorIds 偷渡被拦截
         let mut req = GrokChatRequest::default();
         req.message = "hi".into();
-        req.extra
-            .insert("connectorIds".into(), json!(["uuid-1"]));
+        req.extra.insert("connectorIds".into(), json!(["uuid-1"]));
         let err = serialize_grok_request(&req).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }

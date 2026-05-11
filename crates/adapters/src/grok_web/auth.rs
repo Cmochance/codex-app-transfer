@@ -279,11 +279,7 @@ fn generate_traceparent() -> String {
     let mut parent_id = [0u8; 8];
     getrandom::getrandom(&mut trace_id).expect("OS RNG should not fail");
     getrandom::getrandom(&mut parent_id).expect("OS RNG should not fail");
-    format!(
-        "00-{}-{}-00",
-        hex_encode(&trace_id),
-        hex_encode(&parent_id),
-    )
+    format!("00-{}-{}-00", hex_encode(&trace_id), hex_encode(&parent_id),)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -414,6 +410,9 @@ mod tests {
         assert!(headers.contains_key("x-statsig-id"));
         assert!(headers.contains_key("x-xai-request-id"));
         assert!(headers.contains_key("traceparent"));
-        assert_eq!(headers.get("x-statsig-id").unwrap().to_str().unwrap(), "stat-id");
+        assert_eq!(
+            headers.get("x-statsig-id").unwrap().to_str().unwrap(),
+            "stat-id"
+        );
     }
 }

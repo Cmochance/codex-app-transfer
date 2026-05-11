@@ -235,10 +235,10 @@ impl Default for DeviceEnvInfo {
 /// `validate()` 检测后返回 `AdapterError::BadRequest`,让 forward 主路径
 /// surface 给客户端清晰错误而不是 silent ship 给上游。
 pub const FORBIDDEN_EXTRA_KEYS: &[&str] = &[
-    "connectorIds",   // 已废弃白名单(用 disabledConnectorIds 黑名单 + server-side state)
-    "connectors",     // 同上(connectors[] 对象数组路径未启用)
-    "toolOverrides",  // 已废弃(grok.com toolOverrides 字段后端 silent ignore 未知工具名)
-    "modelName",      // 协议已改:用 modeId 替代 modelName
+    "connectorIds",  // 已废弃白名单(用 disabledConnectorIds 黑名单 + server-side state)
+    "connectors",    // 同上(connectors[] 对象数组路径未启用)
+    "toolOverrides", // 已废弃(grok.com toolOverrides 字段后端 silent ignore 未知工具名)
+    "modelName",     // 协议已改:用 modeId 替代 modelName
     "supportedFastTools", // 后端预定义 fast tools 开关字典,不接受 schema
 ];
 
@@ -620,7 +620,8 @@ mod tests {
         };
         let v: Value = serde_json::to_value(&req).unwrap();
         assert_eq!(
-            v["parentResponseId"], "9f82a10c-47fb-4ff0-afee-bdeb21a37b16"
+            v["parentResponseId"],
+            "9f82a10c-47fb-4ff0-afee-bdeb21a37b16"
         );
     }
 
@@ -753,6 +754,9 @@ mod tests {
             GrokMessageTag::RawFunctionResult
         );
         assert_eq!(GrokMessageTag::parse("final"), GrokMessageTag::Final);
-        assert_eq!(GrokMessageTag::parse("unknown_xxx"), GrokMessageTag::Unknown);
+        assert_eq!(
+            GrokMessageTag::parse("unknown_xxx"),
+            GrokMessageTag::Unknown
+        );
     }
 }
