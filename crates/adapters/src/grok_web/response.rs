@@ -536,6 +536,22 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         if let Some(cer) = &frame.code_execution_result {
             summary.push_str(&format_code_execution_result_for_reasoning(cer));
         }
+        // R1 PR-6:connector/collection/rag search 帧累积。
+        // grok modelResponse 末尾 schema 含 connectorSearchResults /
+        // collectionSearchResults / ragResults 字段(实测 R1.js modelResponse
+        // 验证存在),用户启用 Notion / Linear / Drive / 自定义 MCP connector 时 emit。
+        // 没在 types.rs 加显式字段(实测时数组均为空,schema 不确定);
+        // 通过 frame.extra 动态查找 + 保守复用 webSearchResults 形态。
+        for key in [
+            "connectorSearchResults",
+            "collectionSearchResults",
+            "ragResults",
+        ] {
+            if let Some(grouping) = frame.extra.get(key) {
+                summary.push_str(&format_generic_search_results_for_reasoning(grouping, key));
+                accumulate_generic_search_url_citations(state, grouping);
+            }
+        }
         if !summary.is_empty() {
             open_reasoning_if_needed(state);
             if let Some(rs) = state.open_reasoning.as_mut() {
@@ -747,6 +763,77 @@ fn truncate_for_reasoning(s: &str, max_bytes: usize) -> String {
         idx -= 1;
     }
     format!("{}…(truncated, full {} bytes)", &s[..idx], s.len())
+}
+
+/// R1 PR-6 通用 search results 帧 → markdown bullet list。
+///
+/// 适用 grok.com connectorSearchResults / collectionSearchResults / ragResults
+/// 帧 — 实测期间用户没启用对应 connector 致这些字段均为空,schema 不确定。
+/// 保守复用 webSearchResults 形态:`{results: [{url, title, preview?}]}`。
+/// 不匹配的 result 项 silently skip(只接受含 url 的 entry)。
+fn format_generic_search_results_for_reasoning(
+    grouping: &serde_json::Value,
+    source_key: &str,
+) -> String {
+    let Some(results) = grouping.get("results").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if results.is_empty() {
+        return String::new();
+    }
+    const MAX_RESULTS: usize = 5;
+    let mut s = format!("\n🔎 {source_key}:");
+    let mut emitted = 0_usize;
+    for r in results.iter() {
+        let Some(url) = r.get("url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if url.is_empty() {
+            continue;
+        }
+        let title = r.get("title").and_then(|v| v.as_str()).unwrap_or(url);
+        s.push_str(&format!("\n  · [{title}]({url})"));
+        emitted += 1;
+        if emitted >= MAX_RESULTS {
+            break;
+        }
+    }
+    if emitted == 0 {
+        // 全 skip(schema 不符)→ 不污染 reasoning summary
+        return String::new();
+    }
+    if results.len() > emitted {
+        s.push_str(&format!("\n  · …({} more)", results.len() - emitted));
+    }
+    s
+}
+
+/// 把通用 search 帧的 url citation 累积到 pending,等 message open 后 flush。
+/// 同样保守:只取 url + title 字段。
+fn accumulate_generic_search_url_citations(state: &mut ConvState, grouping: &serde_json::Value) {
+    let Some(results) = grouping.get("results").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for r in results {
+        let Some(url) = r.get("url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if url.is_empty() {
+            continue;
+        }
+        let title = r
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or(url)
+            .to_owned();
+        state.pending_url_citations.push(serde_json::json!({
+            "type": "url_citation",
+            "url": url,
+            "title": title,
+            "start_index": 0,
+            "end_index": 0,
+        }));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1536,6 +1623,46 @@ mod tests {
         assert!(out.contains("💻 code_execution stderr"));
         assert!(out.contains("Traceback"));
         assert!(out.contains("exit code: 1"));
+    }
+
+    #[tokio::test]
+    async fn connector_search_results_appends_to_reasoning_and_emits_citation() {
+        // R1 PR-6:connectorSearchResults 帧(Notion/Linear/MCP connector
+        // emit)→ 同 webSearchResults 处理:reasoning summary bullet +
+        // url_citation annotation。
+        let lines = vec![
+            r#"{"result":{"response":{"messageTag":"raw_function_result","connectorSearchResults":{"results":[{"url":"https://notion.so/abc","title":"Notes Page"},{"url":"https://notion.so/xyz","title":"Tasks DB"}]}}}}"#,
+            r#"{"result":{"response":{"token":"done","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        // reasoning bullet
+        assert!(out.contains("🔎 connectorSearchResults"));
+        assert!(out.contains("[Notes Page](https://notion.so/abc)"));
+        // url_citation annotation
+        assert!(out.contains("event: response.output_text.annotation.added"));
+        assert!(out.contains(r#""url":"https://notion.so/abc""#));
+        assert!(out.contains(r#""url":"https://notion.so/xyz""#));
+    }
+
+    #[tokio::test]
+    async fn rag_results_empty_no_pollution() {
+        // 防御:empty results 不污染 reasoning。
+        let lines = vec![
+            r#"{"result":{"response":{"messageTag":"raw_function_result","ragResults":{"results":[]}}}}"#,
+            r#"{"result":{"response":{"token":"done","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        assert!(!out.contains("🔎 ragResults"));
     }
 
     #[tokio::test]
