@@ -175,65 +175,35 @@ pub fn responses_body_to_normalized_chat(body: &Value) -> Result<Value, AdapterE
         .as_object()
         .ok_or_else(|| AdapterError::BadRequest("body must be JSON object".into()))?;
 
-    let mut chat_body = Map::new();
-
-    // model + stream 透传
-    if let Some(model) = body_obj.get("model") {
-        chat_body.insert("model".into(), model.clone());
-    }
-    if let Some(stream) = body_obj.get("stream") {
-        chat_body.insert("stream".into(), stream.clone());
-    }
-
-    // instructions(顶层 string) + input array → messages
-    let instructions = body_obj.get("instructions").and_then(|v| v.as_str());
-    let input = match body_obj.get("input") {
-        Some(Value::Array(arr)) => arr.clone(),
-        // input 也允许是单个 string(Codex CLI 历史)
-        Some(Value::String(s)) => vec![Value::Object({
-            let mut m = Map::new();
-            m.insert("type".into(), Value::String("message".into()));
-            m.insert("role".into(), Value::String("user".into()));
-            m.insert("content".into(), Value::String(s.clone()));
-            m
-        })],
-        _ => Vec::new(),
-    };
-    let messages = responses_input_to_chat_messages(&input, instructions)?;
-    chat_body.insert("messages".into(), Value::Array(messages));
+    // P2 收敛:messages + previous_response_id 恢复 + tool_call_cache 修复接线
+    // 统一复用 responses 输入主管道,避免 gemini_native 维护一套独立映射实现。
+    let conversion =
+        crate::responses::responses_body_to_chat_body_for_provider_with_session(body, None, None)?;
+    let mut chat_body =
+        conversion.body.as_object().cloned().ok_or_else(|| {
+            AdapterError::Internal("responses conversion must return object".into())
+        })?;
 
     // tools[] 转 chat shape(保留 web_search,unwrap function/custom 等)
     if let Some(tools) = body_obj.get("tools").and_then(|v| v.as_array()) {
         let chat_tools = responses_tools_to_chat_tools(tools);
         if !chat_tools.is_empty() {
             chat_body.insert("tools".into(), Value::Array(chat_tools));
+        } else {
+            chat_body.remove("tools");
         }
+    } else {
+        chat_body.remove("tools");
     }
     // tool_choice 直接透传(Responses 跟 chat 形态一致)
     if let Some(tc) = body_obj.get("tool_choice") {
         chat_body.insert("tool_choice".into(), tc.clone());
+    } else {
+        chat_body.remove("tool_choice");
     }
-
-    // 顶层字段映射:max_output_tokens → max_tokens / reasoning.effort → reasoning_effort /
-    // text.format → response_format
-    if let Some(v) = body_obj.get("max_output_tokens") {
-        chat_body.insert("max_tokens".into(), v.clone());
-    }
-    for k in ["temperature", "top_p", "top_k", "stop", "seed", "n"] {
-        if let Some(v) = body_obj.get(k) {
-            chat_body.insert(k.into(), v.clone());
-        }
-    }
-    if let Some(reasoning) = body_obj.get("reasoning").and_then(|v| v.as_object()) {
-        if let Some(effort) = reasoning.get("effort") {
-            chat_body.insert("reasoning_effort".into(), effort.clone());
-        }
-    }
-    if let Some(text) = body_obj.get("text").and_then(|v| v.as_object()) {
-        if let Some(rf) = responses_text_format_to_response_format(text) {
-            chat_body.insert("response_format".into(), rf);
-        }
-    }
+    // responses 主管道会为 stream=true 补 `stream_options.include_usage`;Gemini wire
+    // 不消费该字段,避免带入无关参数。
+    chat_body.remove("stream_options");
     if let Some(eb) = body_obj.get("extra_body") {
         chat_body.insert("extra_body".into(), eb.clone());
     }
@@ -251,6 +221,7 @@ pub fn responses_body_to_normalized_chat(body: &Value) -> Result<Value, AdapterE
 /// - `{type:"function_call", call_id, name, arguments}` — assistant role 的 tool_call
 /// - `{type:"function_call_output", call_id, output}` — tool role 的响应
 /// - `{type:"reasoning", id, summary?, encrypted_content?}` — 历史回放 thinking 块
+#[allow(dead_code)]
 fn responses_input_to_chat_messages(
     input: &[Value],
     instructions: Option<&str>,
@@ -561,6 +532,7 @@ fn responses_input_to_chat_messages(
 /// 把 Responses message content 归一到 chat completions content 形态。
 /// Responses 块类型:`input_text` / `input_image` / `output_text` / `input_file`。
 /// 转成 chat 的 `text` / `image_url` 块。
+#[allow(dead_code)]
 fn normalize_responses_message_content(content: &Value) -> Value {
     if let Some(s) = content.as_str() {
         return Value::String(s.to_owned());
@@ -768,6 +740,7 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
 /// Responses `text.format` → chat `response_format`。
 /// Responses: `{format:{type:"json_schema",name:"...",schema:{...},strict:true}}`
 /// chat: `{type:"json_schema",json_schema:{name:"...",schema:{...},strict:true}}`
+#[allow(dead_code)]
 fn responses_text_format_to_response_format(text: &Map<String, Value>) -> Option<Value> {
     let format = text.get("format")?.as_object()?;
     let format_type = format.get("type").and_then(|v| v.as_str())?;
