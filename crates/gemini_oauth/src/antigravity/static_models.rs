@@ -51,9 +51,15 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"gemini-3-pro-low"), "缺 gemini-3-pro-low");
         assert!(ids.contains(&"gemini-3-pro-high"), "缺 gemini-3-pro-high");
-        assert!(ids.contains(&"claude-opus-4-6-thinking"), "缺 claude-opus-4-6-thinking");
+        assert!(
+            ids.contains(&"claude-opus-4-6-thinking"),
+            "缺 claude-opus-4-6-thinking"
+        );
         assert!(ids.contains(&"gemini-3.1-pro-low"), "缺 gemini-3.1-pro-low");
-        assert!(ids.contains(&"gpt-oss-120b-medium"), "缺 gpt-oss-120b-medium");
+        assert!(
+            ids.contains(&"gpt-oss-120b-medium"),
+            "缺 gpt-oss-120b-medium"
+        );
     }
 
     /// 锚定 owned_by/type 全部 "antigravity"(OpenAI /v1/models 客户端按 owned_by 区分)

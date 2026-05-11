@@ -305,19 +305,9 @@ async fn fetch_antigravity_models_impl() -> Value {
             return seed_response();
         }
     };
-    let project_id = store
-        .load()
-        .ok()
-        .flatten()
-        .and_then(|t| t.project_id);
+    let project_id = store.load().ok().flatten().and_then(|t| t.project_id);
 
-    match fetch_antigravity_available_models(
-        &client,
-        &access_token,
-        project_id.as_deref(),
-    )
-    .await
-    {
+    match fetch_antigravity_available_models(&client, &access_token, project_id.as_deref()).await {
         Ok(models) if !models.is_empty() => {
             let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
             json!({

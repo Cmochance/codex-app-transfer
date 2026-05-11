@@ -209,7 +209,9 @@ impl Adapter for GeminiCliAdapter {
         // gemini-cli 不需要这层(共用 wire 但 body shape 不同)
         let outer = if is_antigravity_api_format(&provider.api_format) {
             request::apply_antigravity_transform(outer, &model).map_err(|e| {
-                AdapterError::BadRequest(format!("OS RNG unavailable for antigravity requestId: {e}"))
+                AdapterError::BadRequest(format!(
+                    "OS RNG unavailable for antigravity requestId: {e}"
+                ))
             })?
         } else {
             outer

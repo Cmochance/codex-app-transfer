@@ -245,7 +245,9 @@ async fn models_handler() -> impl IntoResponse {
         Err(e) => {
             // ServiceError::NotLoggedIn 单独 401 让前端引导 OAuth 登录
             let msg = format!("{e}");
-            if msg.to_lowercase().contains("not logged in") || msg.to_lowercase().contains("notloggedin") {
+            if msg.to_lowercase().contains("not logged in")
+                || msg.to_lowercase().contains("notloggedin")
+            {
                 return err(
                     StatusCode::UNAUTHORIZED,
                     "antigravity 未登录,请先 OAuth 登录".to_string(),
@@ -259,11 +261,7 @@ async fn models_handler() -> impl IntoResponse {
             .into_response();
         }
     };
-    let project_id_owned = store
-        .load()
-        .ok()
-        .flatten()
-        .and_then(|t| t.project_id);
+    let project_id_owned = store.load().ok().flatten().and_then(|t| t.project_id);
     let project_id = project_id_owned.as_deref();
 
     // 试上游 fetchAvailableModels — 失败时降级静态种子(不上抛 5xx,UI 至少

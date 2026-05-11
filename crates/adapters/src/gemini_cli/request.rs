@@ -97,9 +97,7 @@ pub fn apply_antigravity_transform(
     envelope_obj.insert("userAgent".into(), Value::String("antigravity".into()));
     envelope_obj.insert(
         "requestType".into(),
-        Value::String(
-            if is_image { "image_gen" } else { "agent" }.into(),
-        ),
+        Value::String(if is_image { "image_gen" } else { "agent" }.into()),
     );
 
     // requestId: image_gen 形态带时间戳 + uuid + 固定后缀 12;agent 形态简单 "agent-<uuid>"
@@ -441,7 +439,10 @@ mod tests {
 
         // toolConfig 搬到 request 子对象
         assert!(out.get("toolConfig").is_none());
-        assert_eq!(out["request"]["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+        assert_eq!(
+            out["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+            "AUTO"
+        );
     }
 
     /// image 模型用不同的 requestType + requestId 形态,且不加 sessionId

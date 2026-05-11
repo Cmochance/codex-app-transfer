@@ -250,9 +250,7 @@ impl ProviderResolver for StaticResolver {
         // 不依赖 user 手动改 / 删 + 重加
         let auth_scheme = AuthScheme::parse(&provider.auth_scheme);
         let upstream_base = match auth_scheme {
-            AuthScheme::GoogleOauthCloudCode => {
-                "https://cloudcode-pa.googleapis.com".to_string()
-            }
+            AuthScheme::GoogleOauthCloudCode => "https://cloudcode-pa.googleapis.com".to_string(),
             AuthScheme::GoogleOauthAntigravity => {
                 "https://daily-cloudcode-pa.googleapis.com".to_string()
             }
