@@ -695,6 +695,7 @@ name = "codex-app-transfer-adapters"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bytes",
  "codex-app-transfer-gemini-oauth",
  "codex-app-transfer-registry",

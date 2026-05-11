@@ -47,6 +47,66 @@ fn format_header_errs(errs: &[HeaderValidationError]) -> String {
     )
 }
 
+/// 提交时校验 `grokWeb` 字段结构合法性(silent-failure-hunter H2 反馈)。
+///
+/// 不校验 cookie 值的语义(let grok.com 兜底),仅校验 JSON 结构,防止保存成功
+/// 但 chat 时报 500 / "missing cookies" 让用户找不到根因。
+///
+/// 容忍:`Value::Null` / 缺字段 / 空对象 → 视为无 grokWeb 配置,通过校验
+/// (跟现有 `validate_extra_headers_input` 同 pattern)。
+fn validate_grok_web_input(gw: &Value) -> Result<(), Vec<String>> {
+    if gw.is_null() {
+        return Ok(());
+    }
+    let mut errs: Vec<String> = Vec::new();
+    let Some(obj) = gw.as_object() else {
+        errs.push("grokWeb 必须是 JSON object 或 null".into());
+        return Err(errs);
+    };
+    if let Some(cookies) = obj.get("cookies") {
+        match cookies {
+            Value::Object(map) => {
+                let sso_ok = map
+                    .get("sso")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                if !sso_ok {
+                    errs.push(
+                        "grokWeb.cookies.sso 必填(JWT,非空 string);从 grok.com 浏览器 cookies 复制"
+                            .into(),
+                    );
+                }
+                for (k, v) in map {
+                    if !v.is_string() {
+                        errs.push(format!("grokWeb.cookies.{k} 必须是 string"));
+                    }
+                }
+            }
+            _ => errs.push("grokWeb.cookies 必须是 JSON object".into()),
+        }
+    } else {
+        errs.push("grokWeb.cookies 必填".into());
+    }
+    for opt_field in ["statsigId", "userAgent"] {
+        if let Some(v) = obj.get(opt_field) {
+            if !v.is_string() {
+                errs.push(format!("grokWeb.{opt_field} 必须是 string"));
+            }
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs)
+    }
+}
+
+fn format_grok_web_errs(errs: &[String]) -> String {
+    let lines: Vec<String> = errs.iter().map(|e| format!("• {e}")).collect();
+    format!("grokWeb 校验失败({} 项):\n{}", errs.len(), lines.join("\n"))
+}
+
 pub async fn list_providers() -> impl IntoResponse {
     let cfg = match load_registry() {
         Ok(c) => c,
@@ -115,6 +175,8 @@ pub struct AddProviderInput {
     pub model_capabilities: Option<Value>,
     #[serde(rename = "requestOptions")]
     pub request_options: Option<Value>,
+    #[serde(rename = "grokWeb")]
+    pub grok_web: Option<Value>,
 }
 
 pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
@@ -124,6 +186,13 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
     if let Some(headers) = input.extra_headers.as_ref() {
         if let Err(errs) = validate_extra_headers_input(headers) {
             return err(StatusCode::BAD_REQUEST, format_header_errs(&errs)).into_response();
+        }
+    }
+    // silent-failure-hunter H2:grokWeb 结构在 save 时校验,不让 "save success →
+    // chat 时报 missing-cookies / upstream 401" 这种迷惑链发生。
+    if let Some(gw) = input.grok_web.as_ref() {
+        if let Err(errs) = validate_grok_web_input(gw) {
+            return err(StatusCode::BAD_REQUEST, format_grok_web_errs(&errs)).into_response();
         }
     }
 
@@ -194,6 +263,11 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
             "requestOptions".into(),
             input.request_options.clone().unwrap_or_else(|| json!({})),
         );
+        if let Some(gw) = input.grok_web.clone() {
+            if !gw.is_null() {
+                new_provider.insert("grokWeb".into(), gw);
+            }
+        }
         new_provider.insert("isBuiltin".into(), Value::Bool(false));
         new_provider.insert("sortIndex".into(), Value::Number(providers.len().into()));
 
@@ -223,6 +297,12 @@ pub async fn update_provider(
     if let Some(headers) = input.extra_headers.as_ref() {
         if let Err(errs) = validate_extra_headers_input(headers) {
             return err(StatusCode::BAD_REQUEST, format_header_errs(&errs)).into_response();
+        }
+    }
+    // silent-failure-hunter H2:grokWeb 结构在 update 时也要校验,同 add_provider
+    if let Some(gw) = input.grok_web.as_ref() {
+        if let Err(errs) = validate_grok_web_input(gw) {
+            return err(StatusCode::BAD_REQUEST, format_grok_web_errs(&errs)).into_response();
         }
     }
 
@@ -270,6 +350,13 @@ pub async fn update_provider(
         }
         if let Some(opts) = input.request_options.clone() {
             updated.insert("requestOptions".into(), opts);
+        }
+        if let Some(gw) = input.grok_web.clone() {
+            if gw.is_null() {
+                updated.remove("grokWeb");
+            } else {
+                updated.insert("grokWeb".into(), gw);
+            }
         }
         if let Some(models) = input.models.clone() {
             if models.is_object() {
