@@ -18,16 +18,11 @@
 //! 不认识 → 客户端会卡。但这一步至少让请求侧能 work 上游,本地能验证
 //! 出站请求 wire 形态。下轮做完整 SSE 状态机 + Responses 包装就端到端 work。
 
+use crate::mapper::{RequestMapper, ResponseMapper};
+use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
-use http::{header::HeaderValue, HeaderMap, StatusCode};
-use serde_json::Value;
-
-use crate::responses::compact::{
-    build_compact_chat_request, build_compact_response_plan, is_compact_path,
-};
-use crate::responses::global_response_session_cache;
-use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
+use http::{HeaderMap, StatusCode};
 
 pub mod grounding;
 pub mod request;
@@ -54,69 +49,7 @@ impl Adapter for GeminiNativeAdapter {
         body: Bytes,
         provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
-        // 对齐 chat<=>responses 的私有 /responses/compact 流程:
-        // 入站 compact body 先转成 compact 专用 chat request(含总结 prompt),
-        // 再走 gemini_native chat->Gemini wire 转换。上游用非流式 generateContent,
-        // 响应侧再包装回 {"output":[{"type":"compaction",...}]}.
-        if is_compact_path(client_path) {
-            let compact_chat_body = build_compact_chat_request(&body, provider)?;
-            let compact_chat_json: Value = serde_json::from_slice(&compact_chat_body)
-                .map_err(|e| AdapterError::Internal(format!("compact chat body decode: {e}")))?;
-            let model = compact_chat_json
-                .get("model")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AdapterError::BadRequest("compact body missing model".into()))?
-                .to_owned();
-            let gemini_request =
-                request::chat_normalized_to_gemini_request(&compact_chat_json, provider)?;
-            let gemini_body =
-                serde_json::to_vec(&gemini_request).map_err(AdapterError::BodyDecode)?;
-            let upstream_path =
-                request::build_gemini_upstream_path(&model, false, &provider.base_url);
-            return Ok(RequestPlan {
-                upstream_path,
-                body: Bytes::from(gemini_body),
-                response_session: None,
-                is_compact: true,
-                original_responses_request: None,
-            });
-        }
-
-        // 1. 解析入站 body(Codex.app /responses 形态)
-        let parsed: Value = serde_json::from_slice(&body)?;
-        let stream = parsed
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let model = parsed
-            .get("model")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AdapterError::BadRequest("model field required".into()))?
-            .to_owned();
-
-        // 2. Codex.app /responses → Gemini RequestBody(完整转换 1:1 LiteLLM
-        // chat→Gemini + 我们项目的 Responses→chat 归一化)
-        let conversion = request::responses_body_to_gemini_request_with_session(
-            &parsed,
-            provider,
-            Some(global_response_session_cache()),
-        )?;
-        let gemini_request = conversion.request;
-        let gemini_body = serde_json::to_vec(&gemini_request).map_err(AdapterError::BodyDecode)?;
-
-        // 3. 拼上游 URL path:Gemini 3+ 用 v1alpha,2.x 用 v1beta;若 base_url
-        // 已带版本则不重复加。`/{version}/models/{model}:streamGenerateContent?alt=sse`
-        let upstream_path = request::build_gemini_upstream_path(&model, stream, &provider.base_url);
-
-        Ok(RequestPlan {
-            upstream_path,
-            body: Bytes::from(gemini_body),
-            response_session: Some(conversion.response_session),
-            is_compact: false,
-            // Codex.app /responses 入站时 original_responses_request 用于回灌
-            // Responses envelope 字段 — 但响应侧 SSE 状态机下轮才做,留 None。
-            original_responses_request: Some(parsed),
-        })
+        crate::mapper::gemini_native::GeminiNativeMapper.map_request(client_path, body, provider)
     }
 
     /// 响应侧:Gemini SSE → Responses SSE **直转**(2026-05-10 用户决策)。
@@ -135,47 +68,18 @@ impl Adapter for GeminiNativeAdapter {
     fn transform_response_stream(
         &self,
         upstream_status: StatusCode,
-        mut upstream_headers: HeaderMap,
+        upstream_headers: HeaderMap,
         upstream_stream: ByteStream,
         _provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
-        if request_plan.is_compact {
-            return build_compact_response_plan(upstream_status, upstream_headers, upstream_stream);
-        }
-        // 上游 4xx/5xx 也走 SSE — 两个分支都要重写 content-type;另外必须 strip
-        // content-length(我们 emit 的 SSE bytes 数跟原 body 不一样)和 content-encoding
-        // (上游可能返 gzip 的 JSON 错误体,如果保留 header 客户端会试图 gunzip plaintext SSE
-        // → 整个流 corrupt,等于又埋一个 silent failure)
-        upstream_headers.remove(http::header::CONTENT_LENGTH);
-        upstream_headers.remove(http::header::CONTENT_ENCODING);
-        upstream_headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        if !upstream_status.is_success() {
-            // 构造 Responses SSE failure 流:200 response + SSE event 流(created+failed)
-            let stream = response::convert_gemini_error_to_responses_failure_stream(
-                upstream_status,
-                upstream_stream,
-                request_plan.original_responses_request.clone(),
-            );
-            return Ok(ResponsePlan {
-                status: StatusCode::OK, // SSE 流 status 永远 200,错误信息在 SSE event 内
-                headers: upstream_headers,
-                stream,
-            });
-        }
-        let stream = response::convert_gemini_to_responses_stream(
+        crate::mapper::gemini_native::GeminiNativeMapper.map_response(
+            upstream_status,
+            upstream_headers,
             upstream_stream,
-            request_plan.original_responses_request.clone(),
-            request_plan.response_session.clone(),
-        );
-        Ok(ResponsePlan {
-            status: upstream_status,
-            headers: upstream_headers,
-            stream,
-        })
+            _provider,
+            request_plan,
+        )
     }
 }
 
@@ -184,6 +88,7 @@ mod adapter_tests {
     use super::*;
     use futures_util::StreamExt;
     use indexmap::IndexMap;
+    use serde_json::Value;
 
     fn dummy_provider() -> Provider {
         Provider {

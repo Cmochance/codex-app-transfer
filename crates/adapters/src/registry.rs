@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
+use crate::core::routes;
 use crate::gemini_cli::GeminiCliAdapter;
 use crate::gemini_native::GeminiNativeAdapter;
 use crate::openai_chat::OpenAiChatAdapter;
 use crate::passthrough::ResponsesPassthroughAdapter;
 use crate::responses::ResponsesAdapter;
-use crate::routes;
 use crate::types::Adapter;
 
 #[derive(Clone)]

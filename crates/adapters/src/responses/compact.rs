@@ -34,7 +34,7 @@ use futures_util::stream::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::{json, Value};
 
-use crate::routes;
+use crate::core::routes;
 use crate::types::{AdapterError, ByteStream, ResponsePlan};
 
 use super::request::responses_body_to_chat_body_for_provider;

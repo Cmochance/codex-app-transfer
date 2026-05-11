@@ -44,8 +44,8 @@ use bytes::{Bytes, BytesMut};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::events::{build_tool_namespace_map, emit_sse_event};
 use super::tool_call_cache::{global_tool_call_cache, ToolCallEntry};
+use crate::core::events::{build_tool_namespace_map, emit_sse_event};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {

@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::types::AdapterError;
 
-use super::session::ResponseSessionCache;
+use crate::responses::session::ResponseSessionCache;
 
 /// 生成 `ResponseSessionPlan.response_id`，供 responses/gemini_native 共用。
 pub(crate) fn response_id_for_session() -> String {
