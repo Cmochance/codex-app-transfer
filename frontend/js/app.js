@@ -128,10 +128,20 @@
     if (preset.id === "custom-third-party") return false;
     const presetName = normalizePresetKey(preset.name);
     const presetUrl = normalizePresetKey(preset.baseUrl);
-    return providers.some((provider) => (
-      normalizePresetKey(provider.name) === presetName
-      || normalizePresetKey(provider.baseUrl) === presetUrl
-    ));
+    const presetApiFormat = String(preset.apiFormat || "").toLowerCase();
+    return providers.some((provider) => {
+      // **多 preset 共享上游场景**:eg gemini-cli-oauth + antigravity-oauth 都
+      // 走 cloudcode-pa.googleapis.com 上游但 apiFormat 不同 (前者
+      // gemini_cli_oauth 后者 antigravity_oauth) — 加一个另一个不能被
+      // baseUrl 去重隐藏。同 apiFormat 才视为同 preset(2026-05-11 修)
+      if (presetApiFormat && String(provider.apiFormat || "").toLowerCase() !== presetApiFormat) {
+        return false;
+      }
+      return (
+        normalizePresetKey(provider.name) === presetName
+        || normalizePresetKey(provider.baseUrl) === presetUrl
+      );
+    });
   }
 
   function updatePresetSelection() {
@@ -482,6 +492,12 @@
   function presetMatchesProvider(preset, provider) {
     if (!preset || !provider) return false;
     const baseUrlOptions = Array.isArray(preset.baseUrlOptions) ? preset.baseUrlOptions : [];
+    // **多 preset 共享上游场景**:apiFormat 不同就不算同 preset
+    // (gemini-cli-oauth vs antigravity-oauth 同 baseUrl 但不同协议;2026-05-11 修)
+    if (preset.apiFormat && provider.apiFormat
+        && String(preset.apiFormat).toLowerCase() !== String(provider.apiFormat).toLowerCase()) {
+      return false;
+    }
     return normalizePresetKey(preset.name) === normalizePresetKey(provider.name)
       || normalizePresetKey(preset.baseUrl) === normalizePresetKey(provider.baseUrl)
       || baseUrlOptions.some((option) => normalizePresetKey(option?.value) === normalizePresetKey(provider.baseUrl));
