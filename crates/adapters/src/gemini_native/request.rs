@@ -743,9 +743,33 @@ fn responses_text_format_to_response_format(text: &Map<String, Value>) -> Option
 // Step 2:chat-shape body → Gemini RequestBody(LiteLLM 1:1 移植)
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatSoftConstraintMode {
+    /// 不注入任何 systemInstruction 软约束文案;仅做 wire-level 必要剥离/降级。
+    Off,
+    /// 默认模式:注入短小、低干扰的兼容提示,避免抢占用户主提示词语义。
+    Minimal,
+    /// 兼容旧行为:注入详细解释文案(更可观测,但更可能污染语义)。
+    Strict,
+}
+
+fn compat_soft_constraint_mode(provider: &Provider) -> CompatSoftConstraintMode {
+    let raw = provider
+        .extra
+        .get("compat_soft_constraints")
+        .or_else(|| provider.extra.get("compatSoftConstraints"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase());
+    match raw.as_deref() {
+        Some("off") | Some("disabled") | Some("none") => CompatSoftConstraintMode::Off,
+        Some("strict") | Some("verbose") | Some("detailed") => CompatSoftConstraintMode::Strict,
+        _ => CompatSoftConstraintMode::Minimal,
+    }
+}
+
 pub fn chat_normalized_to_gemini_request(
     body: &Value,
-    _provider: &Provider,
+    provider: &Provider,
 ) -> Result<RequestBody, AdapterError> {
     let body_obj = body
         .as_object()
@@ -756,6 +780,7 @@ pub fn chat_normalized_to_gemini_request(
         .and_then(|v| v.as_array())
         .ok_or_else(|| AdapterError::BadRequest("messages array required".into()))?;
     let model = body_obj.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let compat_mode = compat_soft_constraint_mode(provider);
 
     let (mut system_instruction, body_messages) = split_system_instruction(messages);
     let contents = convert_messages_to_contents(&body_messages)?;
@@ -799,22 +824,34 @@ pub fn chat_normalized_to_gemini_request(
                     .as_ref()
                     .and_then(|s| serde_json::to_string(s).ok())
                     .filter(|s| !s.is_empty());
-                let constraint_text = match schema_str {
-                    Some(s) => format!(
-                        "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object matching this schema:\n\n{s}\n\nDo not wrap the JSON in markdown fences and do not add any commentary."
-                    ),
-                    None => "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object. Do not wrap the JSON in markdown fences and do not add any commentary.".into(),
+                let constraint_text = match compat_mode {
+                    CompatSoftConstraintMode::Off => None,
+                    CompatSoftConstraintMode::Minimal => Some(match schema_str {
+                        Some(s) => format!(
+                            "[Protocol compatibility note] This request combines function tools with a JSON schema format, which Gemini cannot accept as wire-level schema fields in the same call. Keep the task intent unchanged. If you return plain text (instead of calling a tool), return one valid JSON object matching this schema:\n\n{s}"
+                        ),
+                        None => "[Protocol compatibility note] This request combines function tools with JSON-only output mode, which Gemini cannot accept as wire-level schema fields in the same call. Keep the task intent unchanged. If you return plain text (instead of calling a tool), return one valid JSON object only.".into(),
+                    }),
+                    CompatSoftConstraintMode::Strict => Some(match schema_str {
+                        Some(s) => format!(
+                            "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object matching this schema:\n\n{s}\n\nDo not wrap the JSON in markdown fences and do not add any commentary."
+                        ),
+                        None => "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object. Do not wrap the JSON in markdown fences and do not add any commentary.".into(),
+                    }),
                 };
-                let si = system_instruction.get_or_insert_with(|| SystemInstruction {
-                    role: None,
-                    parts: Vec::new(),
-                });
-                si.parts.push(Part {
-                    text: Some(constraint_text),
-                    ..Default::default()
-                });
+                if let Some(constraint_text) = constraint_text {
+                    let si = system_instruction.get_or_insert_with(|| SystemInstruction {
+                        role: None,
+                        parts: Vec::new(),
+                    });
+                    si.parts.push(Part {
+                        text: Some(constraint_text),
+                        ..Default::default()
+                    });
+                }
                 tracing::info!(
-                    "gemini_native: responseMimeType/responseSchema cannot coexist with functionDeclarations on Gemini wire; transformed into systemInstruction soft constraint (LiteLLM apply_response_schema_transformation pattern). Function calling unaffected; textual responses still prompted to follow JSON schema."
+                    ?compat_mode,
+                    "gemini_native: responseMimeType/responseSchema cannot coexist with functionDeclarations on Gemini wire; applied compatibility handling (wire-level schema fields removed; optional soft-constraint prompt injected by mode)."
                 );
                 gc.response_mime_type = None;
                 gc.response_schema = None;
@@ -857,32 +894,37 @@ pub fn chat_normalized_to_gemini_request(
                     tools = None;
                 }
             }
-            // **文案精准**(2026-05-10 修):旧文案 "If you need to fetch external
-            // information, tell the user this limitation" 让 model 把"联网"泛化理解成
-            // 包括 exec_command/curl 也禁 → user 让 model 查天气,model 直接 refuse
-            // 不试 curl。改成只精准说明 google_search 工具不可用,**显式告知** model
-            // 仍可以用 exec_command 跑 curl/wget 等 HTTP 请求实现联网(若 sandbox
-            // 允许 network)。
-            let constraint_text = "Note about tool availability: The built-in `google_search` \
-                (web_search) tool from Gemini is currently unavailable in this request because \
-                this Gemini 2.x model does not allow built-in tools and function declarations to \
-                coexist on the wire. **All your other function-calling tools (e.g. exec_command, \
-                Read, Write, Bash) are fully available** — including using `exec_command` to run \
-                `curl`/`wget` for HTTP requests if the sandbox permissions allow network access. \
-                Only mention this limitation explicitly if the user asks specifically for the \
-                built-in google_search feature; do not refuse network-related tasks just because \
-                google_search is disabled (use other tools to fulfill the request).";
-            let si = system_instruction.get_or_insert_with(|| SystemInstruction {
-                role: None,
-                parts: Vec::new(),
-            });
-            si.parts.push(Part {
-                text: Some(constraint_text.into()),
-                ..Default::default()
-            });
+            let constraint_text = match compat_mode {
+                CompatSoftConstraintMode::Off => None,
+                CompatSoftConstraintMode::Minimal => Some(
+                    "[Protocol compatibility note] Gemini 2.x cannot combine built-in `google_search` with function declarations in one request, so only `google_search` is disabled for this turn. Keep the original task intent and use other available tools normally.".to_string(),
+                ),
+                CompatSoftConstraintMode::Strict => Some(
+                    "Note about tool availability: The built-in `google_search` \
+                    (web_search) tool from Gemini is currently unavailable in this request because \
+                    this Gemini 2.x model does not allow built-in tools and function declarations to \
+                    coexist on the wire. **All your other function-calling tools (e.g. exec_command, \
+                    Read, Write, Bash) are fully available** — including using `exec_command` to run \
+                    `curl`/`wget` for HTTP requests if the sandbox permissions allow network access. \
+                    Only mention this limitation explicitly if the user asks specifically for the \
+                    built-in google_search feature; do not refuse network-related tasks just because \
+                    google_search is disabled (use other tools to fulfill the request)."
+                        .to_string(),
+                ),
+            };
+            if let Some(constraint_text) = constraint_text {
+                let si = system_instruction.get_or_insert_with(|| SystemInstruction {
+                    role: None,
+                    parts: Vec::new(),
+                });
+                si.parts.push(Part {
+                    text: Some(constraint_text),
+                    ..Default::default()
+                });
+            }
             tracing::info!(
-                "gemini_native: Gemini 2.x dropped googleSearch wire (Gemini wire 强制 + functionDecls \
-                 priority) + added system_instruction soft constraint (LiteLLM _resolve_search_tool_conflict pattern)"
+                ?compat_mode,
+                "gemini_native: Gemini 2.x dropped googleSearch wire when function declarations coexist; compatibility note injection depends on compat mode."
             );
         }
     }
@@ -2779,13 +2821,74 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            combined.contains("MUST be a valid JSON object")
-                && combined.contains("matching this schema"),
+            combined.contains("JSON object") && combined.contains("schema"),
             "systemInstruction 必须含 JSON schema 软约束 prompt;实际:{combined}"
         );
         assert!(
             combined.contains("answer") && combined.contains("type"),
             "schema JSON 内容必须 inline 在软约束 text;实际:{combined}"
+        );
+    }
+
+    #[test]
+    fn soft_constraint_mode_off_disables_schema_prompt_injection() {
+        let mut provider = dummy_provider();
+        provider.extra.insert(
+            "compat_soft_constraints".into(),
+            Value::String("off".into()),
+        );
+        let body = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+            "response_format": {
+                "type":"json_schema",
+                "json_schema":{"schema":{"type":"object","properties":{"answer":{"type":"string"}}}}
+            }
+        });
+        let req = chat_normalized_to_gemini_request(&body, &provider).unwrap();
+        let gc = req.generation_config.as_ref().unwrap();
+        assert!(
+            gc.response_mime_type.is_none() && gc.response_schema.is_none(),
+            "wire-level schema 字段仍需剥离防 Gemini 400"
+        );
+        assert!(
+            req.system_instruction.is_none(),
+            "compat_soft_constraints=off 时不应注入 schema 软约束文案"
+        );
+    }
+
+    #[test]
+    fn soft_constraint_mode_strict_preserves_legacy_schema_prompt_wording() {
+        let mut provider = dummy_provider();
+        provider.extra.insert(
+            "compat_soft_constraints".into(),
+            Value::String("strict".into()),
+        );
+        let body = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+            "response_format": {
+                "type":"json_schema",
+                "json_schema":{"schema":{"type":"object","properties":{"answer":{"type":"string"}}}}
+            }
+        });
+        let req = chat_normalized_to_gemini_request(&body, &provider).unwrap();
+        let si = req
+            .system_instruction
+            .expect("strict 模式应保留历史详细 schema 提示");
+        let combined: String = si
+            .parts
+            .iter()
+            .filter_map(|p| p.text.as_ref())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("MUST be a valid JSON object")
+                && combined.contains("Do not wrap the JSON in markdown fences"),
+            "strict 模式应保留旧的强约束措辞,实际:{combined}"
         );
     }
 
@@ -2858,8 +2961,62 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            combined.contains("web_search") && combined.contains("disabled"),
-            "软约束必须告诉 model googleSearch 被禁;实际:{combined}"
+            (combined.contains("google_search") || combined.contains("web_search"))
+                && combined.contains("disabled"),
+            "软约束必须告诉 model googleSearch/web_search 被禁;实际:{combined}"
+        );
+    }
+
+    #[test]
+    fn soft_constraint_mode_off_disables_google_search_note_injection() {
+        let mut provider = dummy_provider();
+        provider.extra.insert(
+            "compat_soft_constraints".into(),
+            Value::String("off".into()),
+        );
+        let body = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [
+                {"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+                {"type":"web_search"}
+            ]
+        });
+        let req = chat_normalized_to_gemini_request(&body, &provider).unwrap();
+        let tools = req.tools.expect("function declarations must remain");
+        assert!(
+            !tools.iter().any(|t| t.google_search.is_some()),
+            "Gemini 2.x wire 仍必须 drop googleSearch 防 400"
+        );
+        assert!(
+            req.system_instruction.is_none(),
+            "compat_soft_constraints=off 时不应注入 google_search 限制说明文案"
+        );
+    }
+
+    #[test]
+    fn soft_constraint_mode_off_via_camel_alias_works_same_as_snake_case() {
+        let mut provider = dummy_provider();
+        provider
+            .extra
+            .insert("compatSoftConstraints".into(), Value::String("off".into()));
+        let body = serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [
+                {"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+                {"type":"web_search"}
+            ]
+        });
+        let req = chat_normalized_to_gemini_request(&body, &provider).unwrap();
+        let tools = req.tools.expect("function declarations must remain");
+        assert!(
+            !tools.iter().any(|t| t.google_search.is_some()),
+            "camelCase 配置别名同样必须执行 wire-level googleSearch drop"
+        );
+        assert!(
+            req.system_instruction.is_none(),
+            "camelCase alias=off 时不应注入兼容提示文案"
         );
     }
 
