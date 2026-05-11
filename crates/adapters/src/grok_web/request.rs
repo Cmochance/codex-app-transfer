@@ -78,7 +78,14 @@ pub fn responses_body_to_grok_request_with_tracker(
         .get("previous_response_id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .and_then(|prev| tracker.and_then(|t| t.get(prev)));
+        .and_then(|prev| {
+            tracker.and_then(|t| {
+                t.get(&crate::grok_web::parent_response::CodexResponseId::from(
+                    prev,
+                ))
+                .map(|g| g.into_inner())
+            })
+        });
 
     let is_reasoning = parse_reasoning_flag(body);
     let custom_instructions = body
@@ -285,7 +292,7 @@ mod tests {
     #[test]
     fn previous_response_id_resolved_via_tracker() {
         let tracker = ParentResponseTracker::default();
-        tracker.record("resp_abc", "9f82a10c-grok-uuid");
+        tracker.record_str("resp_abc", "9f82a10c-grok-uuid");
         let body = json!({
             "model": "gpt_5_codex",
             "input": [{"type": "message", "role": "user", "content": "follow-up"}],

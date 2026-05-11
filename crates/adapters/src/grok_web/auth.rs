@@ -150,6 +150,14 @@ pub enum GrokAuthError {
     MissingCookie(String),
     #[error("statsig id missing or invalid")]
     MissingStatsigId,
+    /// 用户提供的 header value(cookie / statsigId / userAgent)含 invalid 字符
+    /// (newline / control byte / non-ASCII 等),无法通过 `HeaderValue::from_str`。
+    ///
+    /// **R1 PR-4 / H1 完整版**:silent-failure-hunter H1 标记原 `insert` 静默
+    /// `tracing::warn!` + drop header → 用户 IP/UA 带空 header 发请求 → grok.com
+    /// 401 → 用户看不到清晰错误。改成 propagate 到 forward 主路径 surface 400。
+    #[error("invalid header value for `{name}`: {reason}")]
+    InvalidHeaderValue { name: &'static str, reason: String },
 }
 
 /// 注入 grok.com 所需 headers 到一个新构造的 [`HeaderMap`] 并返回。
@@ -196,20 +204,20 @@ pub fn apply_grok_headers(
     let statsig_id = read_statsig_id(provider)?;
     let user_agent = read_user_agent(provider);
 
-    insert(headers, "Cookie", &cookies.to_cookie_header());
-    insert(headers, "User-Agent", &user_agent);
-    insert(headers, "Origin", "https://grok.com");
-    insert(headers, "Referer", "https://grok.com/");
-    insert(headers, "Accept", "text/event-stream, */*");
-    insert(headers, "Accept-Language", "zh-CN,zh-Hans;q=0.9");
-    insert(headers, "x-statsig-id", &statsig_id);
-    insert(headers, "x-xai-request-id", &generate_uuid_v4());
-    insert(headers, "traceparent", &generate_traceparent());
+    insert(headers, "Cookie", &cookies.to_cookie_header())?;
+    insert(headers, "User-Agent", &user_agent)?;
+    insert(headers, "Origin", "https://grok.com")?;
+    insert(headers, "Referer", "https://grok.com/")?;
+    insert(headers, "Accept", "text/event-stream, */*")?;
+    insert(headers, "Accept-Language", "zh-CN,zh-Hans;q=0.9")?;
+    insert(headers, "x-statsig-id", &statsig_id)?;
+    insert(headers, "x-xai-request-id", &generate_uuid_v4())?;
+    insert(headers, "traceparent", &generate_traceparent())?;
 
     // CORS hints —— 模拟浏览器行为,降低风控触发概率
-    insert(headers, "Sec-Fetch-Site", "same-origin");
-    insert(headers, "Sec-Fetch-Mode", "cors");
-    insert(headers, "Sec-Fetch-Dest", "empty");
+    insert(headers, "Sec-Fetch-Site", "same-origin")?;
+    insert(headers, "Sec-Fetch-Mode", "cors")?;
+    insert(headers, "Sec-Fetch-Dest", "empty")?;
 
     Ok(())
 }
@@ -291,16 +299,31 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn insert(headers: &mut HeaderMap, name: &'static str, value: &str) {
+/// 注入一个 grok-owned header,失败 propagate 给调用方(R1 PR-4 / H1 完整版)。
+///
+/// - header **名字**(`&'static str` literal)无效是 internal bug,panic-level
+///   严重(说明我们 hardcoded 写错了),但保守起见返 Err 不 panic
+/// - header **值**(用户提供的 cookie / statsigId / UA)无效是常见 config error
+///   (用户从浏览器复制时带了 newline / 控制字符 / non-ASCII),必须 surface
+///   到 forward 主路径,**不要**静默 drop(原 R3 PoC 行为)
+fn insert(headers: &mut HeaderMap, name: &'static str, value: &str) -> Result<(), GrokAuthError> {
     let Ok(header_name) = HeaderName::try_from(name) else {
-        tracing::warn!(name = %name, "invalid grok header name");
-        return;
+        return Err(GrokAuthError::InvalidHeaderValue {
+            name,
+            reason: "internal: hardcoded header name failed HeaderName::try_from".into(),
+        });
     };
     let Ok(header_value) = HeaderValue::from_str(value) else {
-        tracing::warn!(name = %name, "invalid grok header value");
-        return;
+        return Err(GrokAuthError::InvalidHeaderValue {
+            name,
+            reason: format!(
+                "user-supplied value contains invalid chars (control byte / non-ASCII / line break?), length={}",
+                value.len()
+            ),
+        });
     };
     headers.insert(header_name, header_value);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -414,5 +437,35 @@ mod tests {
             headers.get("x-statsig-id").unwrap().to_str().unwrap(),
             "stat-id"
         );
+    }
+
+    #[test]
+    fn invalid_statsig_id_with_control_char_propagates_error() {
+        // R1 PR-4 / H1 完整版:用户从浏览器复制 cookie/statsigId 时可能带换行 /
+        // 控制字符,HeaderValue::from_str 拒绝。原 R3 PoC silently warn + drop,
+        // 现在 propagate GrokAuthError::InvalidHeaderValue 让 forward 主路径
+        // surface 400 给客户端,用户看到清晰错误而不是上游 401。
+        let p = provider_with_grok_web(json!({
+            "grokWeb": {
+                "cookies": {
+                    "sso": "j1",
+                    "sso-rw": "j2",
+                    "cf_clearance": "c"
+                },
+                "statsigId": "stat-id\nwith-newline"  // 含 newline,from_str 必拒
+            }
+        }));
+        let mut headers = HeaderMap::new();
+        let err = apply_grok_headers(&mut headers, &p).unwrap_err();
+        match err {
+            GrokAuthError::InvalidHeaderValue { name, reason } => {
+                assert_eq!(name, "x-statsig-id");
+                assert!(
+                    reason.contains("invalid chars"),
+                    "expected detailed reason, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidHeaderValue, got: {other:?}"),
+        }
     }
 }
