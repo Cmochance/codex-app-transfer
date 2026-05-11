@@ -767,6 +767,14 @@ fn compat_soft_constraint_mode(provider: &Provider) -> CompatSoftConstraintMode 
     }
 }
 
+/// 软约束文案末尾统一附加的"语言守恒"指令(2026-05-11 用户反馈修复)。
+///
+/// 实测:Gemini 系模型对 `systemInstruction` 的语言极敏感,纯英文软约束会让
+/// 中/日/任何非英文 user prompt 的回复被带成英文。修复思路是在 minimal/strict
+/// 文案末尾固定拼一句"按用户语言回复"指令;不做语言检测以保持实现简单且对所有
+/// 语种通用。`Off` 模式不注入任何 systemInstruction,本常量不参与。
+const LANGUAGE_PRESERVATION_HINT: &str = "Respond in the same language as the user's latest message; do not switch language because of this note.";
+
 pub fn chat_normalized_to_gemini_request(
     body: &Value,
     provider: &Provider,
@@ -828,15 +836,19 @@ pub fn chat_normalized_to_gemini_request(
                     CompatSoftConstraintMode::Off => None,
                     CompatSoftConstraintMode::Minimal => Some(match schema_str {
                         Some(s) => format!(
-                            "[Protocol compatibility note] This request combines function tools with a JSON schema format, which Gemini cannot accept as wire-level schema fields in the same call. Keep the task intent unchanged. If you return plain text (instead of calling a tool), return one valid JSON object matching this schema:\n\n{s}"
+                            "[Protocol compatibility note] This request combines function tools with a JSON schema format, which Gemini cannot accept as wire-level schema fields in the same call. Keep the task intent unchanged. {LANGUAGE_PRESERVATION_HINT} If you return plain text (instead of calling a tool), return one valid JSON object matching this schema:\n\n{s}"
                         ),
-                        None => "[Protocol compatibility note] This request combines function tools with JSON-only output mode, which Gemini cannot accept as wire-level schema fields in the same call. Keep the task intent unchanged. If you return plain text (instead of calling a tool), return one valid JSON object only.".into(),
+                        None => format!(
+                            "[Protocol compatibility note] This request combines function tools with JSON-only output mode, which Gemini cannot accept as wire-level schema fields in the same call. Keep the task intent unchanged. {LANGUAGE_PRESERVATION_HINT} If you return plain text (instead of calling a tool), return one valid JSON object only."
+                        ),
                     }),
                     CompatSoftConstraintMode::Strict => Some(match schema_str {
                         Some(s) => format!(
-                            "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object matching this schema:\n\n{s}\n\nDo not wrap the JSON in markdown fences and do not add any commentary."
+                            "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object matching this schema:\n\n{s}\n\nDo not wrap the JSON in markdown fences and do not add any commentary.\n\n{LANGUAGE_PRESERVATION_HINT}"
                         ),
-                        None => "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object. Do not wrap the JSON in markdown fences and do not add any commentary.".into(),
+                        None => format!(
+                            "When you produce a textual answer (rather than invoking a tool), your output MUST be a valid JSON object. Do not wrap the JSON in markdown fences and do not add any commentary. {LANGUAGE_PRESERVATION_HINT}"
+                        ),
                     }),
                 };
                 if let Some(constraint_text) = constraint_text {
@@ -896,10 +908,10 @@ pub fn chat_normalized_to_gemini_request(
             }
             let constraint_text = match compat_mode {
                 CompatSoftConstraintMode::Off => None,
-                CompatSoftConstraintMode::Minimal => Some(
-                    "[Protocol compatibility note] Gemini 2.x cannot combine built-in `google_search` with function declarations in one request, so only `google_search` is disabled for this turn. Keep the original task intent and use other available tools normally.".to_string(),
-                ),
-                CompatSoftConstraintMode::Strict => Some(
+                CompatSoftConstraintMode::Minimal => Some(format!(
+                    "[Protocol compatibility note] Gemini 2.x cannot combine built-in `google_search` with function declarations in one request, so only `google_search` is disabled for this turn. Keep the original task intent and use other available tools normally. {LANGUAGE_PRESERVATION_HINT}"
+                )),
+                CompatSoftConstraintMode::Strict => Some(format!(
                     "Note about tool availability: The built-in `google_search` \
                     (web_search) tool from Gemini is currently unavailable in this request because \
                     this Gemini 2.x model does not allow built-in tools and function declarations to \
@@ -908,9 +920,8 @@ pub fn chat_normalized_to_gemini_request(
                     `curl`/`wget` for HTTP requests if the sandbox permissions allow network access. \
                     Only mention this limitation explicitly if the user asks specifically for the \
                     built-in google_search feature; do not refuse network-related tasks just because \
-                    google_search is disabled (use other tools to fulfill the request)."
-                        .to_string(),
-                ),
+                    google_search is disabled (use other tools to fulfill the request). {LANGUAGE_PRESERVATION_HINT}"
+                )),
             };
             if let Some(constraint_text) = constraint_text {
                 let si = system_instruction.get_or_insert_with(|| SystemInstruction {
@@ -2992,6 +3003,70 @@ mod tests {
             req.system_instruction.is_none(),
             "compat_soft_constraints=off 时不应注入 google_search 限制说明文案"
         );
+    }
+
+    #[test]
+    fn soft_constraint_minimal_and_strict_inject_language_preservation_hint() {
+        // 2026-05-11 用户反馈:中文 prompt 触发软约束后被英文回答。根因是软约束
+        // 文案为纯英文,带偏 model 回复语言。此测试锁定 minimal/strict 两模式
+        // 在 schema 冲突 + google_search 冲突两类分支下都必须注入语言守恒指令。
+        let hint_marker = "same language as the user's latest message";
+
+        for mode in ["minimal", "strict"] {
+            let mut provider = dummy_provider();
+            provider
+                .extra
+                .insert("compat_soft_constraints".into(), Value::String(mode.into()));
+
+            // 分支 1:function tools + json_schema
+            let schema_body = serde_json::json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{"role":"user","content":"x"}],
+                "tools": [{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],
+                "response_format": {
+                    "type":"json_schema",
+                    "json_schema":{"schema":{"type":"object","properties":{"answer":{"type":"string"}}}}
+                }
+            });
+            let req = chat_normalized_to_gemini_request(&schema_body, &provider).unwrap();
+            let combined: String = req
+                .system_instruction
+                .expect("schema 分支必须注入软约束")
+                .parts
+                .iter()
+                .filter_map(|p| p.text.as_ref())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                combined.contains(hint_marker),
+                "mode={mode} schema 软约束必须含语言守恒指令;实际:{combined}"
+            );
+
+            // 分支 2:function tools + googleSearch on Gemini 2.x
+            let gs_body = serde_json::json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{"role":"user","content":"x"}],
+                "tools": [
+                    {"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+                    {"type":"web_search"}
+                ]
+            });
+            let req = chat_normalized_to_gemini_request(&gs_body, &provider).unwrap();
+            let combined: String = req
+                .system_instruction
+                .expect("google_search 分支必须注入软约束")
+                .parts
+                .iter()
+                .filter_map(|p| p.text.as_ref())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                combined.contains(hint_marker),
+                "mode={mode} google_search 软约束必须含语言守恒指令;实际:{combined}"
+            );
+        }
     }
 
     #[test]
