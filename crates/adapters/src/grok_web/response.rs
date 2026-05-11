@@ -517,10 +517,12 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         }
     }
 
-    // raw_function_result 数据帧(R1 PR-2 + PR-3):
-    // - PR-2:webSearchResults / xSearchResults 转 markdown bullet 拼 reasoning summary(已有)
-    // - PR-3:**同时**累积 url_citation annotation 到 pending_url_citations,
-    //   待首个 final token open_message 后 flush(emit annotation.added)
+    // raw_function_result 数据帧(R1 PR-2 + PR-3 + PR-5):
+    // - PR-2:webSearchResults / xSearchResults 转 markdown bullet 拼 reasoning(已有)
+    // - PR-3:同时累积 url_citation 到 pending(message open 后 flush annotation.added)
+    // - PR-5:**codeExecutionResult** 转 markdown fenced code block + 拼 reasoning。
+    //   grok.com 内置 `code_execution` 工具(_TOOL_FMT 已识别)的输出帧。
+    //   实测帧形态:`{stdout, stderr?, exitCode?}`(部分字段缺时跳过)。
     if matches!(tag, Some(GrokMessageTag::RawFunctionResult)) {
         let mut summary = String::new();
         if let Some(wsr) = &frame.web_search_results {
@@ -530,6 +532,9 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         if let Some(xsr) = &frame.x_search_results {
             summary.push_str(&format_x_search_results_for_reasoning(xsr));
             accumulate_x_search_url_citations(state, xsr);
+        }
+        if let Some(cer) = &frame.code_execution_result {
+            summary.push_str(&format_code_execution_result_for_reasoning(cer));
         }
         if !summary.is_empty() {
             open_reasoning_if_needed(state);
@@ -676,6 +681,72 @@ fn format_x_search_results_for_reasoning(xsr: &serde_json::Value) -> String {
         s.push_str(&format!("\n  · …({} more)", results.len() - MAX_RESULTS));
     }
     s
+}
+
+/// 把 `codeExecutionResult.{stdout, stderr, exitCode}` 转 markdown fenced
+/// code block 拼到 reasoning。R1 PR-5(stacked 在 PR-4 cleanup 之上)。
+///
+/// 实测帧形态在 R1.js 抓包里出现的 grok 内置 `code_execution` 工具
+/// (chenyme `_TOOL_FMT`:`"code_execution" → ("💻", ())`)。实际字段名可能是
+/// `stdout` / `stderr` / `output` / `exit_code` / `exitCode` 中之一,本函数
+/// **尽量兼容**(任何一个有内容就用 fenced block 展示);全空则返回空 String。
+///
+/// 输出形态:
+/// ```text
+/// \n💻 code_execution stdout:
+/// ```
+/// <stdout content>
+/// ```
+/// (and similar for stderr)
+/// ```
+fn format_code_execution_result_for_reasoning(cer: &serde_json::Value) -> String {
+    const MAX_OUTPUT_BYTES: usize = 4096;
+    let mut s = String::new();
+    let stdout = cer
+        .get("stdout")
+        .or_else(|| cer.get("output"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let stderr = cer
+        .get("stderr")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let exit_code = cer
+        .get("exitCode")
+        .or_else(|| cer.get("exit_code"))
+        .and_then(|v| v.as_i64());
+
+    if let Some(out) = stdout {
+        let truncated = truncate_for_reasoning(out, MAX_OUTPUT_BYTES);
+        s.push_str("\n💻 code_execution stdout:\n```\n");
+        s.push_str(&truncated);
+        s.push_str("\n```");
+    }
+    if let Some(err) = stderr {
+        let truncated = truncate_for_reasoning(err, MAX_OUTPUT_BYTES);
+        s.push_str("\n💻 code_execution stderr:\n```\n");
+        s.push_str(&truncated);
+        s.push_str("\n```");
+    }
+    if let Some(code) = exit_code {
+        if code != 0 {
+            s.push_str(&format!("\n💻 code_execution exit code: {code}"));
+        }
+    }
+    s
+}
+
+/// 截断长输出防 reasoning summary 爆长。按字节截断 + UTF-8 边界对齐。
+fn truncate_for_reasoning(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    // 找最近的 UTF-8 字符边界(不超过 max_bytes)
+    let mut idx = max_bytes;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    format!("{}…(truncated, full {} bytes)", &s[..idx], s.len())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1426,6 +1497,45 @@ mod tests {
         .await;
         assert!(out.contains("[MCP Home](https://modelcontextprotocol.io)"));
         assert!(out.contains("[MCP Intro](https://anthropic.com/news/model-context-protocol)"));
+    }
+
+    #[tokio::test]
+    async fn code_execution_result_appends_fenced_code_block_to_reasoning() {
+        // R1 PR-5:codeExecutionResult.stdout 转 markdown fenced code block
+        // 拼到 reasoning summary。grok 内置 code_execution 工具产物。
+        let lines = vec![
+            r#"{"result":{"response":{"messageTag":"tool_usage_card","isThinking":true,"toolUsageCardId":"c1","toolUsageCard":{"toolUsageCardId":"c1","codeExecution":{"args":{}}}}}}"#,
+            r#"{"result":{"response":{"messageTag":"raw_function_result","codeExecutionResult":{"stdout":"hello\nworld","exitCode":0}}}}"#,
+            r#"{"result":{"response":{"token":"done","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        assert!(out.contains("💻 code_execution stdout"));
+        assert!(
+            out.contains("hello\\nworld"),
+            "应含 stdout 内容(JSON 字符串形态): {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_execution_result_nonzero_exit_shows_exit_code() {
+        let lines = vec![
+            r#"{"result":{"response":{"messageTag":"raw_function_result","codeExecutionResult":{"stdout":"","stderr":"Traceback...","exitCode":1}}}}"#,
+            r#"{"result":{"response":{"token":"done","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        assert!(out.contains("💻 code_execution stderr"));
+        assert!(out.contains("Traceback"));
+        assert!(out.contains("exit code: 1"));
     }
 
     #[tokio::test]
