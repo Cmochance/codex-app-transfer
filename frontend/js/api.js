@@ -64,6 +64,11 @@
     gemini: { logo: 'assets/providers/google-ai-studio.png' },
     aistudio: { logo: 'assets/providers/google-ai-studio.png' },
     generativelanguage: { logo: 'assets/providers/google-ai-studio.png' },
+    // Grok Web 反代 provider — 用 grok.com 官方 favicon SVG(从
+    // https://grok.com/images/favicon.svg 抓的,黑色圆角方块 + 白色 grok mark)。
+    // `grok-web` 子串命中 preset id / apiFormat;不加更宽的 `grok` 防误命中用户
+    // 自定义 provider 名含 "grok" 但实际不是 web 反代场景
+    'grok-web': { logo: 'assets/providers/grok.svg' },
   };
 
   function buildCustomThirdPartyPreset() {
