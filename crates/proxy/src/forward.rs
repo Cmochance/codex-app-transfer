@@ -525,13 +525,16 @@ pub async fn forward_handler(
     // 完整 body + headers + provider 元信息原样落盘,默认关闭无副作用。用于
     // 排查"上下文丢失" —— 用户怀疑 multi-turn history 没传到上游,需要看
     // 完整 contents 数组,而日志 truncate 到 2 KB / `feedback-bundle` 截到
-    // 256 KB 都不够。env flag 控制只在用户主动开启时落盘。
+    // 256 KB 都不够。env flag 控制只在用户主动开启时落盘。覆盖 success /
+    // captured_4xx / retry-failed 三条路径(`status` 已是最终值),便于按时间
+    // 在 dump 目录里看一次会话的完整出站序列。
     if wire_dump_enabled() {
         let upstream_model_for_dump = body_model(&plan.body);
         let dump_input = WireDumpInput {
             method: parts.method.as_str().to_owned(),
             client_path: client_path.clone(),
             upstream_url: upstream_url.clone(),
+            status_code: status.as_u16(),
             provider_id: resolved.provider.id.clone(),
             provider_name: resolved.provider.name.clone(),
             auth_scheme: format!("{:?}", resolved.auth_scheme),
