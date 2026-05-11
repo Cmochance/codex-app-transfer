@@ -357,6 +357,26 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         }
     }
 
+    // thinking token(R1 PR-1):messageTag=header/summary 是 grok.com 思考阶段
+    // 子标记,token 不空时 emit `response.reasoning.delta`(OpenAI Responses
+    // API 标准 reasoning 事件)。Codex APP 看到 reasoning.delta 进入
+    // "Thinking..." UI 流式展开。
+    //
+    // header token 通常是"思考阶段标题"(如 "Thinking about your request"),
+    // summary token 是 bullet 形小结。两类都映射到 reasoning.delta(Codex
+    // 客户端不区分子标记)。
+    if matches!(
+        tag,
+        Some(GrokMessageTag::Header) | Some(GrokMessageTag::Summary)
+    ) && frame.is_thinking == Some(true)
+    {
+        if let Some(tok) = &frame.token {
+            if !tok.is_empty() {
+                state.pending.push_back(emit_reasoning_delta(tok));
+            }
+        }
+    }
+
     // modelResponse 帧 → 录入 ParentResponseTracker(review-feedback A5/H4)。
     // grok.com 流末 emit modelResponse 含完整 metadata + responseId;客户端的
     // `previous_response_id`(Codex Responses ID)→ grok 的 `responseId` 映射
@@ -417,6 +437,21 @@ fn emit_response_created(response_id: &str) -> Bytes {
                 "object": "response",
                 "status": "in_progress",
             }
+        }),
+    )
+}
+
+/// `response.reasoning.delta` event(R1 PR-1):
+/// thinking 阶段 grok 输出的 `header` / `summary` token 增量。
+///
+/// Codex APP Responses SSE 客户端识别后进入 "Thinking..." UI(类似
+/// `gemini_native` 流式 reasoning 处理)。
+fn emit_reasoning_delta(delta: &str) -> Bytes {
+    emit_event(
+        "response.reasoning.delta",
+        serde_json::json!({
+            "type": "response.reasoning.delta",
+            "delta": delta,
         }),
     )
 }
@@ -554,9 +589,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thinking_frames_do_not_leak_to_output_text() {
+    async fn thinking_frames_emit_reasoning_delta_not_output_text() {
+        // R1 PR-1:thinking 帧不再 silently 丢弃,emit `response.reasoning.delta`
+        // 让 Codex APP 进入 Thinking UI 流式展开。
         let lines = vec![
-            r#"{"result":{"response":{"token":"thinking...","messageTag":"header","isThinking":true}}}"#,
+            r#"{"result":{"response":{"token":"thinking about request","messageTag":"header","isThinking":true}}}"#,
+            r#"{"result":{"response":{"token":"- inspecting tools","messageTag":"summary","isThinking":true}}}"#,
             r#"{"result":{"response":{"token":"answer","messageTag":"final","isThinking":false}}}"#,
             r#"{"result":{"response":{"isSoftStop":true}}}"#,
         ];
@@ -565,8 +603,18 @@ mod tests {
             "r".into(),
         ))
         .await;
-        assert!(!out.contains("thinking..."));
+        // reasoning.delta 出现且含 thinking + summary 文本
+        assert!(out.contains("event: response.reasoning.delta"));
+        assert!(out.contains(r#""delta":"thinking about request""#));
+        assert!(out.contains(r#""delta":"- inspecting tools""#));
+        // final 仍走 output_text.delta(不会重复出现在 reasoning)
         assert!(out.contains(r#""delta":"answer""#));
+        assert!(out.contains("event: response.output_text.delta"));
+        // 关键:reasoning token **不能**出现在 output_text 流里(避免污染最终答案)
+        assert!(
+            !out.contains(r#""type":"response.output_text.delta","delta":"thinking"#),
+            "thinking token 不应出现在 output_text.delta 事件"
+        );
     }
 
     #[tokio::test]

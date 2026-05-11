@@ -28,62 +28,161 @@
 //!
 //! - tracker miss 时,**不传** `parent_response_id`(让 grok 开新会话,与首轮等价)
 //! - 接受多轮信息"断片",比 hard fail 友好
-//! - 持久化策略:R3 PoC 阶段全内存(进程重启即清),R1 后续可加磁盘备份
+//!
+//! ## LRU bound(R1 PR-1,PR #129 P2 review thread 承诺项)
+//!
+//! 原 R3 PoC 用裸 `Mutex<HashMap>` 无 bound — 在长跑代理下每个 chat 都
+//! `record` 一次,**进程内存随时间线性增长**(chatgpt-codex-connector P2 标记)。
+//!
+//! 本 PR 借鉴 [`crate::responses::session::ResponseSessionCache`] 的 L1 LRU 设计:
+//!
+//! - 容量上限 [`DEFAULT_MAX_SIZE`](默认 1000 条,跟 SessionCache 一致)
+//! - `access_count` 追踪近期访问,满 + 新 key 不在 → evict 最少 `access_count` 的 entry
+//! - 无 TTL(R1 阶段刻意不引入;若未来需要再加 `ttl: Option<Duration>`)
+//!
+//! 不持久化磁盘(grok.com cookie 本来就 session-bound,进程重启等于重新登录)。
 //!
 //! ## 线程安全
 //!
-//! 内部用 `Mutex<HashMap>`,所有方法 `&self`,与 [`Adapter`] trait `Send + Sync` 兼容。
-//! 选择 std `Mutex` 而非 `DashMap` 避免引入新 workspace 依赖;tracker 操作频率
-//! 远低于 SSE 帧处理,锁竞争不是热点。
+//! 内部 `Mutex<TrackerInner>`,所有方法 `&self`,与 [`Adapter`] trait `Send + Sync`
+//! 兼容。**Mutex poisoning 优雅恢复**:`PoisonError::into_inner()` 拿原值继续
+//! 操作(tracker 是 cache,数据无 invariant 需保护;poison 后继续 work 比
+//! silently no-op 友好,silent-failure-hunter M1)。
 //!
 //! [`Adapter`]: crate::types::Adapter
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
-/// `(Codex Responses ID) → (grok.com responseId)` 反查表。
-#[derive(Debug, Default)]
+/// L1 LRU 默认容量上限。同 `ResponseSessionCache::DEFAULT_L1_SIZE`,1000 条
+/// × ~80B per entry ≈ 80KB 上限内存占用。
+pub const DEFAULT_MAX_SIZE: usize = 1000;
+
+#[derive(Debug, Clone)]
+struct Entry {
+    grok_response_id: String,
+    /// 创建时间戳,evict_oldest 决断依据之一(secondary key)。
+    ts: Instant,
+    /// 累计 `get` 次数,evict_oldest 决断主键(LRU 近似:访问越少越先 evict)。
+    access_count: u64,
+}
+
+#[derive(Debug)]
+struct TrackerInner {
+    entries: HashMap<String, Entry>,
+}
+
+/// `(Codex Responses ID) → (grok.com responseId)` 反查表,LRU-bounded。
+#[derive(Debug)]
 pub struct ParentResponseTracker {
-    map: Mutex<HashMap<String, String>>,
+    max_size: usize,
+    inner: Mutex<TrackerInner>,
+}
+
+impl Default for ParentResponseTracker {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_SIZE)
+    }
 }
 
 impl ParentResponseTracker {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            max_size: max_size.max(1),
+            inner: Mutex::new(TrackerInner {
+                entries: HashMap::new(),
+            }),
+        }
     }
 
     /// 记录:Codex APP 暴露的 Responses ID → grok.com 后端的 modelResponse.responseId。
+    ///
+    /// 满 + 新 key 不在 → evict 最少 `access_count` 的旧 entry(`ts` 作 tiebreak)。
+    /// Mutex poison 时用 `PoisonError::into_inner()` 恢复继续工作。
     pub fn record(
         &self,
         codex_response_id: impl Into<String>,
         grok_response_id: impl Into<String>,
     ) {
-        if let Ok(mut g) = self.map.lock() {
-            g.insert(codex_response_id.into(), grok_response_id.into());
-        } else {
-            // Mutex poisoned 在生产 unlikely;silently drop 比 panic 友好
-            tracing::warn!("parent_response_tracker mutex poisoned; record dropped");
+        let codex_id = codex_response_id.into();
+        let grok_id = grok_response_id.into();
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!(
+                    error_id = "GROK_TRACKER_POISONED",
+                    "parent_response_tracker mutex poisoned, recovering via PoisonError::into_inner"
+                );
+                poisoned.into_inner()
+            }
+        };
+        if inner.entries.len() >= self.max_size && !inner.entries.contains_key(&codex_id) {
+            evict_oldest_locked(&mut inner);
         }
+        inner.entries.insert(
+            codex_id,
+            Entry {
+                grok_response_id: grok_id,
+                ts: Instant::now(),
+                access_count: 0,
+            },
+        );
     }
 
     /// 查询:给定 Codex APP `previous_response_id`,返回对应 grok responseId。
     ///
+    /// 命中后递增 `access_count`(LRU 近似)。
     /// 返回 `None` 时,请求构建方应**省略** `parent_response_id` 字段(开新会话语义)。
     pub fn get(&self, codex_response_id: &str) -> Option<String> {
-        self.map.lock().ok()?.get(codex_response_id).cloned()
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!(
+                    error_id = "GROK_TRACKER_POISONED",
+                    "parent_response_tracker mutex poisoned, recovering via PoisonError::into_inner"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let entry = inner.entries.get_mut(codex_response_id)?;
+        entry.access_count = entry.access_count.saturating_add(1);
+        Some(entry.grok_response_id.clone())
     }
 
     /// 容量(测试用)。
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.map.lock().map(|g| g.len()).unwrap_or(0)
+        match self.inner.lock() {
+            Ok(g) => g.entries.len(),
+            Err(p) => p.into_inner().entries.len(),
+        }
+    }
+
+    /// 当前 max_size 上限(测试用)。
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.max_size
     }
 }
 
-/// 全局单例 tracker —— 进程级,所有 Provider 共用。
+/// LRU 近似 evict:选 `access_count` 最低的 entry,`ts` 作 tiebreak(旧的先 evict)。
+fn evict_oldest_locked(inner: &mut TrackerInner) {
+    let Some(victim_key) = inner
+        .entries
+        .iter()
+        .min_by_key(|(_, e)| (e.access_count, e.ts))
+        .map(|(k, _)| k.clone())
+    else {
+        return;
+    };
+    inner.entries.remove(&victim_key);
+}
+
+/// 全局单例 tracker —— 进程级,所有 Provider 共用,默认 1000 条 LRU。
 pub fn global_tracker() -> &'static ParentResponseTracker {
     static TRACKER: OnceLock<ParentResponseTracker> = OnceLock::new();
-    TRACKER.get_or_init(ParentResponseTracker::new)
+    TRACKER.get_or_init(ParentResponseTracker::default)
 }
 
 #[cfg(test)]
@@ -92,7 +191,7 @@ mod tests {
 
     #[test]
     fn record_and_get_roundtrip() {
-        let t = ParentResponseTracker::new();
+        let t = ParentResponseTracker::default();
         t.record("resp_abc", "9f82a10c-grok-uuid");
         assert_eq!(t.get("resp_abc").as_deref(), Some("9f82a10c-grok-uuid"));
         assert_eq!(t.get("resp_unknown"), None);
@@ -101,7 +200,7 @@ mod tests {
 
     #[test]
     fn record_overwrites_existing_entry() {
-        let t = ParentResponseTracker::new();
+        let t = ParentResponseTracker::default();
         t.record("resp_abc", "old-uuid");
         t.record("resp_abc", "new-uuid");
         assert_eq!(t.get("resp_abc").as_deref(), Some("new-uuid"));
@@ -113,5 +212,55 @@ mod tests {
         let a = global_tracker() as *const _;
         let b = global_tracker() as *const _;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn lru_evicts_least_used_when_full() {
+        // R1 PR-1(PR #129 P2 review thread):满 + 新 key 不在 → evict 最少 access
+        let t = ParentResponseTracker::new(3);
+        t.record("a", "grok-a");
+        t.record("b", "grok-b");
+        t.record("c", "grok-c");
+        assert_eq!(t.len(), 3);
+        // b/c 各访问一次,a 保持 0 access → 最先被 evict
+        let _ = t.get("b");
+        let _ = t.get("c");
+        // 容量满 + 新 key "d" → evict access_count 最少的 "a"
+        t.record("d", "grok-d");
+        assert_eq!(t.len(), 3);
+        assert!(t.get("a").is_none(), "a 应被 evict");
+        assert_eq!(t.get("b").as_deref(), Some("grok-b"));
+        assert_eq!(t.get("c").as_deref(), Some("grok-c"));
+        assert_eq!(t.get("d").as_deref(), Some("grok-d"));
+    }
+
+    #[test]
+    fn lru_does_not_evict_when_updating_existing_key() {
+        let t = ParentResponseTracker::new(2);
+        t.record("a", "grok-a");
+        t.record("b", "grok-b");
+        assert_eq!(t.len(), 2);
+        t.record("a", "grok-a-new"); // 已在,overwrite
+        assert_eq!(t.len(), 2, "更新已存在 key 不应 evict");
+        assert_eq!(t.get("a").as_deref(), Some("grok-a-new"));
+        assert_eq!(t.get("b").as_deref(), Some("grok-b"));
+    }
+
+    #[test]
+    fn capacity_zero_is_clamped_to_one() {
+        let t = ParentResponseTracker::new(0);
+        assert_eq!(t.capacity(), 1);
+        t.record("a", "grok-a");
+        assert_eq!(t.len(), 1);
+        t.record("b", "grok-b");
+        assert_eq!(t.len(), 1, "容量 1 时 b 应让 a 被 evict");
+        assert!(t.get("a").is_none());
+    }
+
+    #[test]
+    fn default_capacity_is_1000() {
+        let t = ParentResponseTracker::default();
+        assert_eq!(t.capacity(), DEFAULT_MAX_SIZE);
+        assert_eq!(t.capacity(), 1000);
     }
 }
