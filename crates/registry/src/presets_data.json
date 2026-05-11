@@ -238,7 +238,7 @@
   },
   {
     "id": "grok-web",
-    "name": "Grok (Web 反代)",
+    "name": "Grok(Web)",
     "baseUrl": "https://grok.com",
     "docsUrl": "https://grok.com",
     "authScheme": "grok_cookie",
