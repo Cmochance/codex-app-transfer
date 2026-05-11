@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
-use crate::responses::input::response_id_for_session;
+use crate::core::input::response_id_for_session;
 use crate::responses::ResponseSessionCache;
 use crate::types::{AdapterError, ResponseSessionPlan};
 

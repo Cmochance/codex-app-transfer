@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::core::routes;
 use crate::gemini_cli::GeminiCliAdapter;
 use crate::gemini_native::GeminiNativeAdapter;
 use crate::openai_chat::OpenAiChatAdapter;
@@ -111,55 +112,23 @@ impl AdapterRegistry {
 /// - `/v1/responses` → `/responses`(剥 `/v1`,因 provider.base_url 已带 `/v1`)
 /// - 保留 query string
 pub fn rewrite_local_path_for_upstream(client_path: &str) -> String {
-    let (path, query) = match client_path.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (client_path, None),
-    };
-    let normalized = normalize_local_responses_path(path);
-    match query {
-        Some(q) => format!("{normalized}?{q}"),
-        None => normalized,
-    }
+    routes::rewrite_local_path_for_upstream(client_path)
 }
 
 /// 是否是 `/responses/compact*` 子路径(本仓库私有扩展,OpenAI 上游不实现)。
 /// passthrough adapter 必须排除这条路径,留给 ResponsesAdapter 在本地包装实现。
 pub fn is_responses_compact_subpath(client_path: &str) -> bool {
-    let path = client_path.split('?').next().unwrap_or(client_path);
-    let normalized = normalize_local_responses_path(path);
-    let normalized = normalized.as_str();
-    normalized == "/responses/compact" || normalized.starts_with("/responses/compact/")
+    routes::is_responses_compact_subpath(client_path)
 }
 
 pub fn is_local_responses_route(client_path: &str) -> bool {
-    let path = client_path.split('?').next().unwrap_or(client_path);
-    let normalized = normalize_local_responses_path(path);
-    let normalized = normalized.as_str();
     // `/responses` / `/messages` 是 OpenAI Codex CLI 本地入站路径;
     // `/responses/compact` 等 `/responses/*` 子路径(以及 `/messages/*`)
     // 是 OpenAI Responses API 的私有扩展,第三方 provider 都不实现,**必须**
     // 走 ResponsesAdapter 在本地处理而不是透传到 openai_chat 上游(否则
     // OpenaiChatAdapter 会把 `/responses/compact` 直接转给 chat-completions
     // 上游 base_url,触发 404)。
-    normalized == "/responses"
-        || normalized.starts_with("/responses/")
-        || normalized == "/messages"
-        || normalized.starts_with("/messages/")
-}
-
-fn normalize_local_responses_path(path: &str) -> String {
-    let path = path.strip_prefix("/openai").unwrap_or(path);
-    if path == "/claude/v1/messages" {
-        return "/messages".to_owned();
-    }
-    if let Some(stripped) = path.strip_prefix("/v1") {
-        return if stripped.is_empty() {
-            "/".to_owned()
-        } else {
-            stripped.to_owned()
-        };
-    }
-    path.to_owned()
+    routes::is_local_responses_route(client_path)
 }
 
 impl Default for AdapterRegistry {

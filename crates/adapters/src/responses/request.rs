@@ -21,10 +21,9 @@
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
-use crate::types::{AdapterError, ResponseSessionPlan};
-
-use super::input::{merge_messages_with_previous_response, response_id_for_session};
 use super::session::ResponseSessionCache;
+use crate::core::input::{merge_messages_with_previous_response, response_id_for_session};
+use crate::types::{AdapterError, ResponseSessionPlan};
 
 #[derive(Debug, Clone)]
 pub struct ResponsesBodyConversion {

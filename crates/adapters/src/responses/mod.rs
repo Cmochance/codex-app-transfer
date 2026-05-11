@@ -10,8 +10,6 @@
 
 pub mod compact;
 pub mod converter;
-pub(crate) mod events;
-pub(crate) mod input;
 pub mod request;
 pub mod session;
 pub mod stream;
@@ -29,10 +27,10 @@ pub use stream::{
 };
 pub use tool_call_cache::{global_tool_call_cache, ToolCallCache, ToolCallEntry};
 
-use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, StatusCode};
 
+use crate::mapper::{RequestMapper, ResponseMapper};
 use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -52,135 +50,33 @@ impl Adapter for ResponsesAdapter {
     fn prepare_request(
         &self,
         client_path: &str,
-        body: Bytes,
+        body: bytes::Bytes,
         provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
-        // 私有 `/responses/compact` 端点:OpenAI Responses API 的私有扩展,
-        // 第三方 OpenAI-compatible provider 都不支持。我们在代理层本地实现:
-        // 把 input 历史重组成普通 chat completions summarize 请求,响应阶段
-        // 再包装成 Codex CLI 期待的 compact 响应。详见 `compact.rs`。
-        if compact::is_compact_path(client_path) {
-            let new_body = compact::build_compact_chat_request(&body, provider)?;
-            return Ok(RequestPlan {
-                upstream_path: "/chat/completions".to_owned(),
-                body: Bytes::from(new_body),
-                response_session: None,
-                is_compact: true,
-                original_responses_request: None,
-            });
-        }
-
-        let upstream_path = redirect_responses_to_chat(client_path);
-        // Stage 3.2a:解析 body → Responses,转出 Chat 形态。
-        // 失败时(body 非 JSON / 非对象)用 BadRequest 错出去,proxy 会回 400。
-        let parsed: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| AdapterError::BadRequest(format!("body 不是合法 JSON: {e}")))?;
-        // chat→responses 响应阶段 envelope 需要回灌入站 Responses API
-        // request 的多个字段(tools / parallel_tool_calls / tool_choice /
-        // reasoning / text / metadata / previous_response_id / instructions /
-        // temperature / top_p / max_output_tokens / truncation 等)。tools
-        // 字段尤其关键:Codex CLI 用 (namespace, function.name) 复合主键
-        // 反向路由 MCP 工具的 function_call;缺其他字段会让严格 Responses
-        // 协议客户端解析失败。借鉴 mimo2codex `streamToSse.ts:75-105`
-        // `buildResponseSnapshot` 一次回灌全字段策略。
-        let original_responses_request = Some(parsed.clone());
-        let conversion = responses_body_to_chat_body_for_provider_with_session(
-            &parsed,
-            Some(provider),
-            Some(global_response_session_cache()),
-        )?;
-        let new_body = serde_json::to_vec(&conversion.body)
-            .map_err(|e| AdapterError::Internal(format!("re-serialize: {e}")))?;
-        Ok(RequestPlan {
-            upstream_path,
-            body: Bytes::from(new_body),
-            response_session: Some(conversion.response_session),
-            is_compact: false,
-            original_responses_request,
-        })
+        crate::mapper::chat::ChatResponsesMapper.map_request(client_path, body, provider)
     }
 
     fn transform_response_stream(
         &self,
         upstream_status: StatusCode,
-        mut upstream_headers: HeaderMap,
+        upstream_headers: HeaderMap,
         upstream_stream: ByteStream,
         provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
-        // /responses/compact:上游回的是非流式 chat completion JSON,
-        // 收齐后包装成 `{"output":[{"type":"compaction",...}]}`。
-        if request_plan.is_compact {
-            return compact::build_compact_response_plan(
-                upstream_status,
-                upstream_headers,
-                upstream_stream,
-            );
-        }
-        // 把 content-type 强制改成 text/event-stream(上游本来就是,但保险)
-        upstream_headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        let enable_think_tag_split = provider_needs_think_tag_split(provider);
-        Ok(ResponsePlan {
-            status: upstream_status,
-            headers: upstream_headers,
-            stream: convert_chat_to_responses_stream_with_options(
-                upstream_stream,
-                request_plan.response_session.clone(),
-                enable_think_tag_split,
-                request_plan.original_responses_request.clone(),
-            ),
-        })
+        crate::mapper::chat::ChatResponsesMapper.map_response(
+            upstream_status,
+            upstream_headers,
+            upstream_stream,
+            provider,
+            request_plan,
+        )
     }
 }
-
-/// 哪些 provider 需要 `<think>...</think>` 兜底拆分。
-/// 目前只有 MiniMax 的 OpenAI-compatible 端点在不开启 `reasoning_split` 时
-/// 会把思考过程塞进 content 的 `<think>` 标签里,需要兜底解析。
-fn provider_needs_think_tag_split(provider: &Provider) -> bool {
-    let needles = [&provider.id, &provider.name, &provider.base_url];
-    needles.iter().any(|value| {
-        let lower = value.to_ascii_lowercase();
-        lower.contains("minimax") || lower.contains("minimaxi")
-    })
-}
-
-/// 把 `/v1/responses` / `/responses` / `/openai/v1/responses` 以及旧版 message
-/// aliases 重定向到 `/chat/completions`(上游 OpenAI Chat 的标准入口)。其它路径透传不动。
-fn redirect_responses_to_chat(path: &str) -> String {
-    let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
-    let normalized = normalize_local_responses_path(path_only);
-
-    let target = if let Some(after) = normalized.strip_prefix("/responses") {
-        format!("/chat/completions{after}")
-    } else if let Some(after) = normalized.strip_prefix("/messages") {
-        format!("/chat/completions{after}")
-    } else {
-        normalized
-    };
-
-    if query.is_empty() {
-        target
-    } else {
-        format!("{target}?{query}")
-    }
-}
-
-fn normalize_local_responses_path(path: &str) -> String {
-    let path = path.strip_prefix("/openai").unwrap_or(path);
-    if path == "/claude/v1/messages" {
-        return "/messages".to_owned();
-    }
-    path.strip_prefix("/v1")
-        .map(|s| if s.is_empty() { "/" } else { s }.to_owned())
-        .unwrap_or_else(|| path.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::routes;
 
     #[test]
     fn name_is_stable_id() {
@@ -190,39 +86,39 @@ mod tests {
     #[test]
     fn redirects_responses_to_chat_completions() {
         assert_eq!(
-            redirect_responses_to_chat("/v1/responses"),
+            routes::redirect_responses_to_chat("/v1/responses"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/openai/v1/responses"),
+            routes::redirect_responses_to_chat("/openai/v1/responses"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/responses"),
+            routes::redirect_responses_to_chat("/responses"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/v1/responses?stream=1"),
+            routes::redirect_responses_to_chat("/v1/responses?stream=1"),
             "/chat/completions?stream=1"
         );
         assert_eq!(
-            redirect_responses_to_chat("/v1/messages"),
+            routes::redirect_responses_to_chat("/v1/messages"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/claude/v1/messages"),
+            routes::redirect_responses_to_chat("/claude/v1/messages"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/v1/messages?stream=1"),
+            routes::redirect_responses_to_chat("/v1/messages?stream=1"),
             "/chat/completions?stream=1"
         );
     }
 
     #[test]
     fn passes_through_unrelated_paths() {
-        assert_eq!(redirect_responses_to_chat("/v1/models"), "/models");
-        assert_eq!(redirect_responses_to_chat("/health"), "/health");
+        assert_eq!(routes::redirect_responses_to_chat("/v1/models"), "/models");
+        assert_eq!(routes::redirect_responses_to_chat("/health"), "/health");
     }
 
     /// 集成测试:prepare_request → RequestPlan.original_responses_request →

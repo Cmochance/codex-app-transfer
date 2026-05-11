@@ -51,7 +51,7 @@ use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
-use crate::responses::events::{build_tool_namespace_map, emit_sse_event as emit_event};
+use crate::core::events::{build_tool_namespace_map, emit_sse_event as emit_event};
 use crate::responses::global_response_session_cache;
 use crate::types::{ByteStream, ResponseSessionPlan};
 

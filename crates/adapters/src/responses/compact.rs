@@ -34,6 +34,7 @@ use futures_util::stream::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::{json, Value};
 
+use crate::core::routes;
 use crate::types::{AdapterError, ByteStream, ResponsePlan};
 
 use super::request::responses_body_to_chat_body_for_provider;
@@ -132,10 +133,7 @@ const MAX_UPSTREAM_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// 判断入站 path 是否是 `/responses/compact`(含可选 `/v1/`、`/openai/v1/` 前缀)。
 pub(crate) fn is_compact_path(path: &str) -> bool {
-    let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
-    let path_only = path_only.strip_prefix("/openai").unwrap_or(path_only);
-    let path_only = path_only.strip_prefix("/v1").unwrap_or(path_only);
-    path_only.trim_end_matches('/') == "/responses/compact"
+    routes::is_exact_responses_compact_path(path)
 }
 
 /// 把 Codex CLI 的 `CompactionInput` JSON 改写成上游 `/chat/completions` 请求体。
