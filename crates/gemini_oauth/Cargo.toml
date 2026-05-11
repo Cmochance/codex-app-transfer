@@ -31,6 +31,10 @@ getrandom = "0.2"
 # URL form-encode —— 构造 OAuth 授权 URL query + token endpoint POST body。
 # reqwest 内部依赖 url crate,这里直接复用 transitive。
 url = "2"
+# Workspace 内唯一 home 解析入口(`paths::resolve_home`),让 gemini-cli /
+# antigravity token store 路径与 `CodexPaths` / 主 config 行为一致(PR #115
+# 收敛 3 处独立实现 drift)。
+codex-app-transfer-registry = { path = "../registry" }
 
 [dev-dependencies]
 # 单测起 mock OAuth server / cloudcode-pa endpoint

@@ -90,34 +90,6 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 解析当前用户主目录,`HOME` 优先,`USERPROFILE` 回退。
-///
-/// Tauri / desktop_app 在 Windows 下被打包成 GUI 进程时一般**不带** `HOME`
-/// 环境变量(只有 MSYS / Git Bash / 手动 set 才会有),OS 默认给的是
-/// `%USERPROFILE%`。这里复刻 `crates/registry/src/paths.rs::resolve_home` 与
-/// `crates/codex_integration/src/paths.rs::CodexPaths::from_home_env` 的语义,
-/// 让 token store 在 macOS / Linux / Windows 上行为一致。空字符串视作未设置。
-fn resolve_home_dir() -> Option<PathBuf> {
-    resolve_home_dir_from(|k| std::env::var_os(k))
-}
-
-/// `resolve_home_dir` 的纯函数版本 —— 通过注入 env getter 给单测调用,避免
-/// 在测试中跨线程改进程级环境变量(Rust 1.78+ `std::env::set_var` 在多线程
-/// 下为 `unsafe`,gemini_oauth crate 默认并发 test runner)。
-fn resolve_home_dir_from<F>(get_env: F) -> Option<PathBuf>
-where
-    F: Fn(&str) -> Option<std::ffi::OsString>,
-{
-    for key in ["HOME", "USERPROFILE"] {
-        if let Some(raw) = get_env(key) {
-            if !raw.is_empty() {
-                return Some(PathBuf::from(raw));
-            }
-        }
-    }
-    None
-}
-
 /// Token 持久化句柄 —— 封装 `~/.codex-app-transfer/gemini-oauth.json` 路径
 /// 解析 + atomic write(temp + rename)+ secure permissions(Unix 0600)。
 pub struct TokenStore {
@@ -136,12 +108,13 @@ impl TokenStore {
 
     /// 用 `<home>/.codex-app-transfer/<filename>` 路径,让多个 OAuth provider
     /// 共存(eg `gemini-oauth.json` vs `antigravity-oauth.json`)。filename
-    /// 来自 `OauthProviderConfig::token_filename`。`<home>` 解析同
-    /// [`Self::from_home_env`],`HOME` → `USERPROFILE` 回退,**Windows GUI 进程
-    /// 一律走 `USERPROFILE`**,与 `crates/codex_integration::CodexPaths` /
-    /// `crates/registry::paths::resolve_home` 保持一致。
+    /// 来自 `OauthProviderConfig::token_filename`。`<home>` 解析委派给
+    /// `codex_app_transfer_registry::paths::resolve_home`,workspace 内唯一
+    /// 入口,统一 `HOME` → `USERPROFILE` 回退 + 空字符串当未设,**Windows GUI
+    /// 进程一律走 `USERPROFILE`**,与 `CodexPaths` 等其它路径解析一致。
     pub fn for_token_filename(filename: &str) -> Result<Self, TokenError> {
-        let home = resolve_home_dir().ok_or(TokenError::HomeNotSet)?;
+        let home =
+            codex_app_transfer_registry::paths::resolve_home().ok_or(TokenError::HomeNotSet)?;
         let path = home.join(".codex-app-transfer").join(filename);
         Ok(Self { path })
     }
@@ -321,55 +294,6 @@ mod tests {
         let meta = std::fs::metadata(store.path()).unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "token 文件必须 0600,实际 {mode:o}");
-    }
-
-    #[test]
-    fn resolve_home_prefers_home_over_userprofile() {
-        let env = |k: &str| match k {
-            "HOME" => Some(std::ffi::OsString::from("/Users/me")),
-            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\me")),
-            _ => None,
-        };
-        assert_eq!(
-            resolve_home_dir_from(env),
-            Some(PathBuf::from("/Users/me")),
-            "HOME 若存在必须优先于 USERPROFILE,保证 Mac/Linux 行为不变"
-        );
-    }
-
-    #[test]
-    fn resolve_home_falls_back_to_userprofile_on_windows() {
-        let env = |k: &str| match k {
-            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\me")),
-            _ => None,
-        };
-        assert_eq!(
-            resolve_home_dir_from(env),
-            Some(PathBuf::from(r"C:\Users\me")),
-            "Windows GUI 进程没有 HOME 时必须走 USERPROFILE,这是本次 fix 的核心"
-        );
-    }
-
-    #[test]
-    fn resolve_home_treats_empty_strings_as_missing() {
-        // CI runner / 某些 shell 可能把 HOME 设成 "" 而不是 unset,既然这种值
-        // 在 Path 上拼起来等价 ".",直接当未设置避免后续误写到 cwd
-        let env = |k: &str| match k {
-            "HOME" => Some(std::ffi::OsString::new()),
-            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\me")),
-            _ => None,
-        };
-        assert_eq!(
-            resolve_home_dir_from(env),
-            Some(PathBuf::from(r"C:\Users\me")),
-            "空字符串 HOME 应被视作未设置,继续 fallback 到 USERPROFILE"
-        );
-    }
-
-    #[test]
-    fn resolve_home_returns_none_when_both_missing() {
-        let env = |_k: &str| None;
-        assert_eq!(resolve_home_dir_from(env), None);
     }
 
     #[test]

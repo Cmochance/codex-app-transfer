@@ -18,11 +18,12 @@ pub struct CodexPaths {
 }
 
 impl CodexPaths {
-    /// 用真实用户 home 目录构造(`$HOME` / `$USERPROFILE`)。
+    /// 用真实用户 home 目录构造。Home 解析委派给
+    /// [`codex_app_transfer_registry::paths::resolve_home`],它是 workspace
+    /// 内唯一入口,统一 `HOME` → `USERPROFILE` 回退 + 空字符串视作未设(避免
+    /// 此前 3 处独立实现 drift,PR #115 后续清理)。
     pub fn from_home_env() -> Result<Self, CodexError> {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .map_err(|_| CodexError::NoHome)?;
+        let home = codex_app_transfer_registry::paths::resolve_home().ok_or(CodexError::NoHome)?;
         Ok(Self::from_home_dir(home))
     }
 

@@ -730,6 +730,7 @@ name = "codex-app-transfer-gemini-oauth"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "codex-app-transfer-registry",
  "futures-util",
  "getrandom 0.2.17",
  "reqwest 0.12.28",
