@@ -383,6 +383,12 @@ fn extract_reasoning_text(item: &serde_json::Map<String, Value>) -> String {
 
     if let Some(summaries) = item.get("summary").and_then(|v| v.as_array()) {
         for summary in summaries {
+            if let Some(text) = summary.as_str() {
+                if !text.trim().is_empty() {
+                    parts.push(strip_codex_reasoning_prefix(text).to_owned());
+                }
+                continue;
+            }
             if let Some(text) = summary.get("text").and_then(|v| v.as_str()) {
                 if !text.trim().is_empty() {
                     parts.push(strip_codex_reasoning_prefix(text).to_owned());

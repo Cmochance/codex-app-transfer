@@ -90,8 +90,11 @@ pub trait ProviderResponseMapper {
   - `responses/input.rs::merge_messages_with_previous_response`
   - `responses/input.rs::response_id_for_session`
 - [x] `responses/request.rs` 与 `gemini_native/request.rs` 接入共享实现
-- [ ] `tool_call_cache` 修复接线继续收敛
-- [ ] 统一 `responses_body_to_normalized_chat` 主管道
+- [x] `tool_call_cache` 修复接线收敛：
+  - `gemini_native` 改为复用 `responses_body_to_chat_body_for_provider_with_session(...)`
+    的 `messages` 输出，统一使用 `responses/request.rs::repair_tool_call_ids`
+    管道
+- [ ] 统一 `responses_body_to_normalized_chat` 主管道（剩余：抽取 chat-body 通用骨架以减少重复字段映射）
 
 ### Phase 3
 
