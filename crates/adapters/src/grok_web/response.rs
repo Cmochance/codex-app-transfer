@@ -94,6 +94,8 @@ pub fn convert_grok_sse_to_responses_sse(
         emitted_completed: false,
         upstream_exhausted: false,
         received_any_final_token: false,
+        next_output_index: 0,
+        open_reasoning: None,
     };
     // 先把 response.created 塞进 pending(unfold 第一步立即 yield)
     state.pending.push_back(initial_event);
@@ -108,6 +110,13 @@ pub fn convert_grok_sse_to_responses_sse(
                 // 2. 上游已 exhausted,看是否需要补 completed / failed 防御
                 if s.upstream_exhausted {
                     if !s.emitted_completed {
+                        // 流末/中断前 close open_reasoning(P1 fix lifecycle)。
+                        // 否则 reasoning item 永远 in_progress,Codex APP UI 卡。
+                        close_reasoning_if_open(&mut s);
+                        // pending 可能多了 reasoning close 事件,优先 yield 它们
+                        if let Some(event) = s.pending.pop_front() {
+                            return Some((Ok(event), s));
+                        }
                         s.emitted_completed = true;
                         // received_any_final_token=false → 上游中断未收到任何最终
                         // 答案,绝不能 emit response.completed 伪装成功(review-feedback A2)
@@ -269,6 +278,21 @@ fn classify_grok_error_status(status_u16: u16) -> &'static str {
     }
 }
 
+/// 当前打开的 reasoning item lifecycle 状态(R1 PR-1 P1 fix)。
+///
+/// 对齐 [`crate::gemini_native::response`] 的 reasoning emit 三段:
+/// `output_item.added(reasoning)` + `reasoning_summary_part.added` →
+/// `reasoning_summary_text.delta` * N → `reasoning_summary_text.done` +
+/// `reasoning_summary_part.done` + `output_item.done`。
+///
+/// 必须在 final token / soft_stop / 上游中断 emit 前 close,否则 Codex APP
+/// 会等待 reasoning item 闭合而卡住。
+struct OpenReasoning {
+    item_id: String,
+    output_index: u32,
+    text_acc: String,
+}
+
 /// `unfold` 内部状态。
 struct ConvState {
     upstream: ByteStream,
@@ -283,6 +307,11 @@ struct ConvState {
     /// 时,本字段决定补 `response.completed`(true)还是 `response.failed`
     /// `upstream_truncated`(false)。review-feedback A2 / I4 防御 gate。
     received_any_final_token: bool,
+    /// 单调递增的 output_index,用于 reasoning / message item 编号
+    /// (对齐 `gemini_native` ResponsesConverter 行为)。
+    next_output_index: u32,
+    /// 当前打开中的 reasoning item(R1 PR-1 P1 fix);final / soft_stop 前 close。
+    open_reasoning: Option<OpenReasoning>,
 }
 
 /// 从 `line_buf` 切出所有完整 line,parse 成 Codex SSE events 入 pending。
@@ -357,14 +386,21 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         }
     }
 
-    // thinking token(R1 PR-1):messageTag=header/summary 是 grok.com 思考阶段
-    // 子标记,token 不空时 emit `response.reasoning.delta`(OpenAI Responses
-    // API 标准 reasoning 事件)。Codex APP 看到 reasoning.delta 进入
-    // "Thinking..." UI 流式展开。
+    // thinking token(R1 PR-1 P1 fix):messageTag=header/summary 是 grok.com
+    // 思考阶段子标记。原 R3 PoC 静默丢弃;原 PR #130 改成 emit
+    // `response.reasoning.delta`(自创事件类型,客户端不认)。
     //
-    // header token 通常是"思考阶段标题"(如 "Thinking about your request"),
-    // summary token 是 bullet 形小结。两类都映射到 reasoning.delta(Codex
-    // 客户端不区分子标记)。
+    // chatgpt-codex-connector PR #130 P1 反馈:本仓库 reasoning UI 走
+    // `response.reasoning_summary_part.added` + `response.reasoning_summary_text.delta`
+    // + `response.reasoning_summary_text.done` + `response.reasoning_summary_part.done`
+    // + `response.output_item.done` 这套事件族(见 `gemini_native::response::open_reasoning`)。
+    //
+    // 本 fix 对齐 gemini_native 完整 reasoning lifecycle:
+    // 1. 首个 thinking token 触发 `open_reasoning_part`(emit output_item.added +
+    //    reasoning_summary_part.added,创建 item_id rs_<uuid> + output_index)
+    // 2. 每个 thinking token emit `reasoning_summary_text.delta`,关联 item_id
+    // 3. final token / soft_stop / 上游中断前 close(emit text.done + part.done +
+    //    output_item.done with type=reasoning,Codex APP 才能 close UI 项)
     if matches!(
         tag,
         Some(GrokMessageTag::Header) | Some(GrokMessageTag::Summary)
@@ -372,9 +408,22 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
     {
         if let Some(tok) = &frame.token {
             if !tok.is_empty() {
-                state.pending.push_back(emit_reasoning_delta(tok));
+                open_reasoning_if_needed(state);
+                if let Some(rs) = state.open_reasoning.as_mut() {
+                    rs.text_acc.push_str(tok);
+                    state.pending.push_back(emit_reasoning_summary_text_delta(
+                        &rs.item_id,
+                        rs.output_index,
+                        tok,
+                    ));
+                }
             }
         }
+    }
+
+    // final token / softStop 之前必须 close open_reasoning(P1 fix lifecycle)
+    if matches!(tag, Some(GrokMessageTag::Final)) && frame.is_thinking != Some(true) {
+        close_reasoning_if_open(state);
     }
 
     // modelResponse 帧 → 录入 ParentResponseTracker(review-feedback A5/H4)。
@@ -397,8 +446,9 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         }
     }
 
-    // 流末标志
+    // 流末标志 — softStop 前也必须 close open_reasoning(P1 fix lifecycle)
     if frame.is_soft_stop == Some(true) && !state.emitted_completed {
+        close_reasoning_if_open(state);
         state.emitted_completed = true;
         state
             .pending
@@ -441,19 +491,118 @@ fn emit_response_created(response_id: &str) -> Bytes {
     )
 }
 
-/// `response.reasoning.delta` event(R1 PR-1):
-/// thinking 阶段 grok 输出的 `header` / `summary` token 增量。
+// ─────────────────────────────────────────────────────────────────────────────
+// reasoning lifecycle(R1 PR-1 P1 fix — 对齐 gemini_native + responses/converter)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 首次遇到 thinking token 时打开 reasoning item lifecycle。
 ///
-/// Codex APP Responses SSE 客户端识别后进入 "Thinking..." UI(类似
-/// `gemini_native` 流式 reasoning 处理)。
-fn emit_reasoning_delta(delta: &str) -> Bytes {
-    emit_event(
-        "response.reasoning.delta",
+/// emit 两个 event 到 pending:
+/// - `response.output_item.added`(item.type=reasoning, status=in_progress)
+/// - `response.reasoning_summary_part.added`(summary_index=0, empty text)
+fn open_reasoning_if_needed(state: &mut ConvState) {
+    if state.open_reasoning.is_some() {
+        return;
+    }
+    let item_id = format!(
+        "rs_{}",
+        crate::grok_web::auth::generate_uuid_v4().replace('-', "")
+    );
+    let output_index = state.next_output_index;
+    state.next_output_index += 1;
+    state.pending.push_back(emit_event(
+        "response.output_item.added",
         serde_json::json!({
-            "type": "response.reasoning.delta",
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "type": "reasoning",
+                "status": "in_progress",
+                "id": item_id,
+                "summary": [],
+                "content": null,
+                "encrypted_content": null,
+            },
+        }),
+    ));
+    state.pending.push_back(emit_event(
+        "response.reasoning_summary_part.added",
+        serde_json::json!({
+            "type": "response.reasoning_summary_part.added",
+            "item_id": item_id,
+            "output_index": output_index,
+            "summary_index": 0,
+            "part": { "type": "summary_text", "text": "" },
+        }),
+    ));
+    state.open_reasoning = Some(OpenReasoning {
+        item_id,
+        output_index,
+        text_acc: String::new(),
+    });
+}
+
+/// thinking token 增量 emit。调用前必须先 [`open_reasoning_if_needed`]。
+fn emit_reasoning_summary_text_delta(item_id: &str, output_index: u32, delta: &str) -> Bytes {
+    emit_event(
+        "response.reasoning_summary_text.delta",
+        serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": item_id,
+            "output_index": output_index,
+            "summary_index": 0,
             "delta": delta,
         }),
     )
+}
+
+/// final token / soft_stop / 上游中断前 close open reasoning。
+///
+/// emit 三个 event 到 pending(无 open 则 no-op):
+/// - `response.reasoning_summary_text.done`(累计 text)
+/// - `response.reasoning_summary_part.done`
+/// - `response.output_item.done`(item.type=reasoning, status=completed)
+///
+/// 若不调用,Codex APP 永远等 reasoning item 闭合,UI 卡 "Thinking..."。
+fn close_reasoning_if_open(state: &mut ConvState) {
+    let Some(rs) = state.open_reasoning.take() else {
+        return;
+    };
+    state.pending.push_back(emit_event(
+        "response.reasoning_summary_text.done",
+        serde_json::json!({
+            "type": "response.reasoning_summary_text.done",
+            "item_id": rs.item_id,
+            "output_index": rs.output_index,
+            "summary_index": 0,
+            "text": rs.text_acc,
+        }),
+    ));
+    state.pending.push_back(emit_event(
+        "response.reasoning_summary_part.done",
+        serde_json::json!({
+            "type": "response.reasoning_summary_part.done",
+            "item_id": rs.item_id,
+            "output_index": rs.output_index,
+            "summary_index": 0,
+            "part": { "type": "summary_text", "text": rs.text_acc },
+        }),
+    ));
+    state.pending.push_back(emit_event(
+        "response.output_item.done",
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": rs.output_index,
+            "item": {
+                "type": "reasoning",
+                "status": "completed",
+                "id": rs.item_id,
+                "summary": [{ "type": "summary_text", "text": rs.text_acc }],
+                "content": null,
+                "encrypted_content": null,
+            },
+        }),
+    ));
 }
 
 fn emit_output_text_delta(delta: &str) -> Bytes {
@@ -589,9 +738,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thinking_frames_emit_reasoning_delta_not_output_text() {
-        // R1 PR-1:thinking 帧不再 silently 丢弃,emit `response.reasoning.delta`
-        // 让 Codex APP 进入 Thinking UI 流式展开。
+    async fn thinking_frames_emit_reasoning_summary_lifecycle() {
+        // R1 PR-1 P1 fix(chatgpt-codex-connector PR #130):
+        // thinking 帧 emit OpenAI Responses reasoning_summary 事件族
+        // (output_item.added → reasoning_summary_part.added →
+        //  reasoning_summary_text.delta * N →
+        //  reasoning_summary_text.done + reasoning_summary_part.done +
+        //  output_item.done),对齐 gemini_native + responses/converter pattern。
         let lines = vec![
             r#"{"result":{"response":{"token":"thinking about request","messageTag":"header","isThinking":true}}}"#,
             r#"{"result":{"response":{"token":"- inspecting tools","messageTag":"summary","isThinking":true}}}"#,
@@ -603,17 +756,39 @@ mod tests {
             "r".into(),
         ))
         .await;
-        // reasoning.delta 出现且含 thinking + summary 文本
-        assert!(out.contains("event: response.reasoning.delta"));
+        // 1. output_item.added (type=reasoning, in_progress)
+        assert!(out.contains("event: response.output_item.added"));
+        assert!(out.contains(r#""type":"reasoning""#));
+        assert!(out.contains(r#""status":"in_progress""#));
+        // 2. reasoning_summary_part.added
+        assert!(out.contains("event: response.reasoning_summary_part.added"));
+        // 3. reasoning_summary_text.delta * 2(header + summary)
+        let delta_count = out
+            .matches("event: response.reasoning_summary_text.delta")
+            .count();
+        assert_eq!(delta_count, 2, "应有两个 text.delta(header + summary)");
         assert!(out.contains(r#""delta":"thinking about request""#));
         assert!(out.contains(r#""delta":"- inspecting tools""#));
-        // final 仍走 output_text.delta(不会重复出现在 reasoning)
-        assert!(out.contains(r#""delta":"answer""#));
+        // 4. close 三段(final 之前触发):text.done + part.done + output_item.done
+        assert!(out.contains("event: response.reasoning_summary_text.done"));
+        assert!(out.contains("event: response.reasoning_summary_part.done"));
+        let item_done_count = out.matches("event: response.output_item.done").count();
+        assert!(
+            item_done_count >= 1,
+            "应至少 emit 一次 reasoning output_item.done"
+        );
+        // 5. final 仍走 output_text.delta
         assert!(out.contains("event: response.output_text.delta"));
-        // 关键:reasoning token **不能**出现在 output_text 流里(避免污染最终答案)
+        assert!(out.contains(r#""delta":"answer""#));
+        // 关键:reasoning token **不能**出现在 output_text 流里
         assert!(
             !out.contains(r#""type":"response.output_text.delta","delta":"thinking"#),
             "thinking token 不应出现在 output_text.delta 事件"
+        );
+        // 不再 emit 自创的 response.reasoning.delta(P1 fix)
+        assert!(
+            !out.contains("event: response.reasoning.delta"),
+            "不应 emit 自创的 response.reasoning.delta(项目用 reasoning_summary 事件族)"
         );
     }
 
