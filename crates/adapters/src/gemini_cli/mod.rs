@@ -41,35 +41,6 @@ use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan}
 pub mod request;
 pub mod response;
 
-/// **toolConfig.includeServerSideToolInvocations 字段在 cloudcode-pa 任何 OAuth
-/// 路径(gemini-cli 或 antigravity)都不识别**(实测 2026-05-11 两条 client_id
-/// 路径都 400 "Unknown name ... Cannot find field"),不管 camelCase / snake_case。
-/// 无条件 strip 两种形态。Google "Please enable" 提示是误导 — 该 flag 在公开 proto
-/// 不存在。
-///
-/// 抽成独立 helper 的目的是给测试一个稳定的 regression hook:即使 transformer
-/// 阶段(2026-05-11 对齐 cliproxy 后)已经不主动注入此字段,如果未来回退或调用方
-/// 通过 extra body 透传注入,strip 路径仍能兜底。
-fn strip_include_server_side_tool_invocations(obj: &mut serde_json::Map<String, Value>) {
-    if let Some(tc) = obj.get_mut("toolConfig").and_then(|v| v.as_object_mut()) {
-        tc.remove("includeServerSideToolInvocations");
-        tc.remove("include_server_side_tool_invocations");
-        if tc.is_empty() {
-            obj.remove("toolConfig");
-        }
-    }
-}
-
-/// `apiFormat` 值是否属于 antigravity OAuth provider(全部别名,大小写无关)。
-/// 必须跟 `crates/proxy/src/resolver.rs::AuthScheme::parse` 与
-/// `crates/adapters/src/registry.rs` 接受的别名集合一致。
-fn is_antigravity_api_format(api_format: &str) -> bool {
-    matches!(
-        api_format.to_ascii_lowercase().as_str(),
-        "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
-    )
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GeminiCliAdapter;
 
@@ -113,11 +84,8 @@ impl Adapter for GeminiCliAdapter {
         // 别名集合必须跟 `crates/proxy/src/resolver.rs` AuthScheme parse 与
         // `crates/adapters/src/registry.rs` adapter dispatch 一致 —— 否则用户
         // 手填别名 silently 读错文件污染对方 token(2026-05-11 review 修)
-        let token_filename = if is_antigravity_api_format(&provider.api_format) {
-            "antigravity-oauth.json"
-        } else {
-            "gemini-oauth.json"
-        };
+        let flavor = request::CloudCodeApiFlavor::from_api_format(&provider.api_format);
+        let token_filename = request::token_filename_for_api_format(&provider.api_format);
         let project_id = provider
             .extra
             .get("cloud_code_project_id")
@@ -154,75 +122,7 @@ impl Adapter for GeminiCliAdapter {
         //   with Function calling`(2026-05-11 实测)。**强制 set true**,
         //   不依赖上游 responses_body_to_gemini_request 是否注入
         // 不同 client_id 走不同 proto 分支 — Google 内部行为差异
-        let is_antigravity = is_antigravity_api_format(&provider.api_format);
-        if let Some(obj) = inner_value.as_object_mut() {
-            strip_include_server_side_tool_invocations(obj);
-
-            // **antigravity 路径拒 built-in tools + functionDeclarations 共存**
-            // (实测 2026-05-11 daily-cloudcode-pa 返 400 "Built-in tools with
-            // Function calling")。flag 又不能 enable。**只能 strip 内置 tools**,
-            // 保留 function_declarations(Codex.app 主用)。
-            //
-            // 注:`gemini_native` 已经在 transformer 阶段(对齐 cliproxy)统一 drop
-            // `googleSearch`,这里是 antigravity 专属的兜底 strip,额外覆盖
-            // `urlContext` / `codeExecution` / `googleSearchRetrieval` 等其它内置
-            // tools(transformer 当前不主动剥),并对 `googleSearch` 做 idempotent
-            // 二次校验,防 transformer 未来回归。
-            if is_antigravity {
-                if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                    let mut has_function_decls = false;
-                    for t in tools.iter() {
-                        if t.as_object()
-                            .map(|o| {
-                                o.contains_key("functionDeclarations")
-                                    || o.contains_key("function_declarations")
-                            })
-                            .unwrap_or(false)
-                        {
-                            has_function_decls = true;
-                            break;
-                        }
-                    }
-                    if has_function_decls {
-                        // **silent strip**(2026-05-11 对齐 cliproxy):任何 Gemini
-                        // 版本都不再注入 system_instruction 软约束,模型按自身能力
-                        // (Gemini 3.x 内置 exec_command/curl fallback 推理)自适应。
-                        // Gemini 2.x 推理稍弱时表现退化由调用方接受,跟 gemini_native
-                        // 主路径一致,不在 antigravity 这条 OAuth 分支特殊处理。
-                        let before = tools.len();
-                        tools.retain(|t| {
-                            t.as_object()
-                                .map(|o| {
-                                    !o.contains_key("googleSearch")
-                                        && !o.contains_key("google_search")
-                                        && !o.contains_key("urlContext")
-                                        && !o.contains_key("url_context")
-                                        && !o.contains_key("codeExecution")
-                                        && !o.contains_key("code_execution")
-                                        && !o.contains_key("googleSearchRetrieval")
-                                        && !o.contains_key("google_search_retrieval")
-                                })
-                                .unwrap_or(true)
-                        });
-                        let stripped = before - tools.len();
-                        if stripped > 0 {
-                            // **telemetry anchor**(silent-failure-hunter C1 修):
-                            // 没此 log,user 投诉"模型说不能联网但实际可以"时无线索
-                            // 定位到此 strip 路径。info 级别(不报错,只标记策略生效)
-                            tracing::info!(
-                                error_id = "GEMINI_CLI_BUILTIN_TOOLS_STRIPPED",
-                                stripped_count = stripped,
-                                tool_keys = ?["googleSearch", "urlContext", "codeExecution", "googleSearchRetrieval"],
-                                "antigravity wire 不接受 built-in tools + functionDeclarations 共存,strip 内置工具(模型走 exec_command/curl 自适应)"
-                            );
-                        }
-                        if tools.is_empty() {
-                            obj.remove("tools");
-                        }
-                    }
-                }
-            }
-        }
+        request::apply_cloud_code_request_compat(&mut inner_value, flavor);
 
         // 2. outer envelope: {model, project, user_prompt_id, request: <inner>}
         // RNG 失败(极罕见,iOS-style sandbox 可能触发)→ BadRequest 让 client 看到失败,
@@ -238,7 +138,7 @@ impl Adapter for GeminiCliAdapter {
         // 不做这层 antigravity 上游识别成 non-canonical client → 配额错 bucket
         // / 429。CLIProxyAPI `geminiToAntigravity` 1:1 实证(2026-05-11 修)。
         // gemini-cli 不需要这层(共用 wire 但 body shape 不同)
-        let outer = if is_antigravity_api_format(&provider.api_format) {
+        let outer = if flavor.is_antigravity() {
             request::apply_antigravity_transform(outer, &model).map_err(|e| {
                 AdapterError::BadRequest(format!(
                     "OS RNG unavailable for antigravity requestId: {e}"
@@ -351,7 +251,7 @@ mod adapter_tests {
     /// (gemini-oauth.json vs antigravity-oauth.json),刷新时会用错 client_id
     /// 污染对方 token —— 两个 provider 同时 brick(2026-05-11 review #1 修)
     #[test]
-    fn is_antigravity_api_format_recognizes_all_aliases() {
+    fn cloud_code_api_flavor_recognizes_all_aliases() {
         // 全部 antigravity 别名(大小写无关)
         for v in [
             "antigravity_oauth",
@@ -369,7 +269,11 @@ mod adapter_tests {
                 normalized.as_str(),
                 "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
             );
-            assert_eq!(is_antigravity_api_format(v), expected, "alias {v} 识别错");
+            assert_eq!(
+                request::CloudCodeApiFlavor::from_api_format(v).is_antigravity(),
+                expected,
+                "alias {v} 识别错"
+            );
         }
         // 非 antigravity 必须返 false
         for v in [
@@ -380,7 +284,10 @@ mod adapter_tests {
             "",
             "antigravity_other",
         ] {
-            assert!(!is_antigravity_api_format(v), "{v} 不应判成 antigravity");
+            assert!(
+                !request::CloudCodeApiFlavor::from_api_format(v).is_antigravity(),
+                "{v} 不应判成 antigravity"
+            );
         }
     }
 
@@ -398,7 +305,7 @@ mod adapter_tests {
         .as_object()
         .unwrap()
         .clone();
-        strip_include_server_side_tool_invocations(&mut obj);
+        request::strip_include_server_side_tool_invocations(&mut obj);
         assert!(
             !obj.contains_key("toolConfig"),
             "toolConfig 变空后必须整段移除,实际:{obj:?}"
@@ -411,7 +318,7 @@ mod adapter_tests {
         .as_object()
         .unwrap()
         .clone();
-        strip_include_server_side_tool_invocations(&mut obj);
+        request::strip_include_server_side_tool_invocations(&mut obj);
         assert!(!obj.contains_key("toolConfig"));
 
         // 两种 casing 同时存在 → 都剥
@@ -424,7 +331,7 @@ mod adapter_tests {
         .as_object()
         .unwrap()
         .clone();
-        strip_include_server_side_tool_invocations(&mut obj);
+        request::strip_include_server_side_tool_invocations(&mut obj);
         assert!(!obj.contains_key("toolConfig"));
 
         // toolConfig 含其它合法字段时仅剥目标字段,toolConfig 保留
@@ -437,7 +344,7 @@ mod adapter_tests {
         .as_object()
         .unwrap()
         .clone();
-        strip_include_server_side_tool_invocations(&mut obj);
+        request::strip_include_server_side_tool_invocations(&mut obj);
         let tc = obj
             .get("toolConfig")
             .and_then(|v| v.as_object())
@@ -450,7 +357,7 @@ mod adapter_tests {
             .as_object()
             .unwrap()
             .clone();
-        strip_include_server_side_tool_invocations(&mut obj);
+        request::strip_include_server_side_tool_invocations(&mut obj);
         assert!(obj.contains_key("contents"));
         assert_eq!(obj.len(), 1);
     }

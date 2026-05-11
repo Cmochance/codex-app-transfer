@@ -105,6 +105,25 @@ pub trait ProviderResponseMapper {
 - 将 provider 特有差异约束在 mapper 层
 - 减少 adapter 内条件分支与重复路径归一化逻辑
 
+#### Phase 3 progress
+
+- [x] 路径归一化规则收敛：
+  - 新增 `crates/adapters/src/routes.rs` 统一维护
+    `normalize_local_responses_path` / `is_local_responses_route` /
+    `is_responses_compact_subpath` / `rewrite_local_path_for_upstream` /
+    `redirect_responses_to_chat`
+  - `registry.rs` 与 `responses/mod.rs` 改为复用共享路由工具
+- [x] compact endpoint 判定规则收敛：
+  - 新增 `routes::is_exact_responses_compact_path`
+  - `responses/compact.rs::is_compact_path` 改为复用共享规则(仅保留 endpoint 业务语义)
+- [x] provider-specific mapper 边界继续收紧(第一步)：
+  - `gemini_cli` 的 provider flavor 分流(`GeminiCli`/`Antigravity`)
+    与 cloud-code request 兼容逻辑下沉到 `gemini_cli/request.rs`
+  - `GeminiCliAdapter::prepare_request` 主流程仅保留编排(读取 project_id /
+    inner 转换 / outer wrap / flavor transform),减少 adapter 内部协议细节分支
+
+> 当前进度结论：Phase 3 计划项已全部落地，后续如继续演进，进入下一轮 RFC（面向更细粒度 trait 化与模块边界收紧）。
+
 ## Per-Phase File Change List
 
 ### Phase 1 file list

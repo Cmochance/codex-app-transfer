@@ -33,6 +33,7 @@ use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
 use http::{HeaderMap, HeaderValue, StatusCode};
 
+use crate::routes;
 use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -70,7 +71,7 @@ impl Adapter for ResponsesAdapter {
             });
         }
 
-        let upstream_path = redirect_responses_to_chat(client_path);
+        let upstream_path = routes::redirect_responses_to_chat(client_path);
         // Stage 3.2a:解析 body → Responses,转出 Chat 形态。
         // 失败时(body 非 JSON / 非对象)用 BadRequest 错出去,proxy 会回 400。
         let parsed: serde_json::Value = serde_json::from_slice(&body)
@@ -147,37 +148,6 @@ fn provider_needs_think_tag_split(provider: &Provider) -> bool {
     })
 }
 
-/// 把 `/v1/responses` / `/responses` / `/openai/v1/responses` 以及旧版 message
-/// aliases 重定向到 `/chat/completions`(上游 OpenAI Chat 的标准入口)。其它路径透传不动。
-fn redirect_responses_to_chat(path: &str) -> String {
-    let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
-    let normalized = normalize_local_responses_path(path_only);
-
-    let target = if let Some(after) = normalized.strip_prefix("/responses") {
-        format!("/chat/completions{after}")
-    } else if let Some(after) = normalized.strip_prefix("/messages") {
-        format!("/chat/completions{after}")
-    } else {
-        normalized
-    };
-
-    if query.is_empty() {
-        target
-    } else {
-        format!("{target}?{query}")
-    }
-}
-
-fn normalize_local_responses_path(path: &str) -> String {
-    let path = path.strip_prefix("/openai").unwrap_or(path);
-    if path == "/claude/v1/messages" {
-        return "/messages".to_owned();
-    }
-    path.strip_prefix("/v1")
-        .map(|s| if s.is_empty() { "/" } else { s }.to_owned())
-        .unwrap_or_else(|| path.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,39 +160,39 @@ mod tests {
     #[test]
     fn redirects_responses_to_chat_completions() {
         assert_eq!(
-            redirect_responses_to_chat("/v1/responses"),
+            routes::redirect_responses_to_chat("/v1/responses"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/openai/v1/responses"),
+            routes::redirect_responses_to_chat("/openai/v1/responses"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/responses"),
+            routes::redirect_responses_to_chat("/responses"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/v1/responses?stream=1"),
+            routes::redirect_responses_to_chat("/v1/responses?stream=1"),
             "/chat/completions?stream=1"
         );
         assert_eq!(
-            redirect_responses_to_chat("/v1/messages"),
+            routes::redirect_responses_to_chat("/v1/messages"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/claude/v1/messages"),
+            routes::redirect_responses_to_chat("/claude/v1/messages"),
             "/chat/completions"
         );
         assert_eq!(
-            redirect_responses_to_chat("/v1/messages?stream=1"),
+            routes::redirect_responses_to_chat("/v1/messages?stream=1"),
             "/chat/completions?stream=1"
         );
     }
 
     #[test]
     fn passes_through_unrelated_paths() {
-        assert_eq!(redirect_responses_to_chat("/v1/models"), "/models");
-        assert_eq!(redirect_responses_to_chat("/health"), "/health");
+        assert_eq!(routes::redirect_responses_to_chat("/v1/models"), "/models");
+        assert_eq!(routes::redirect_responses_to_chat("/health"), "/health");
     }
 
     /// 集成测试:prepare_request → RequestPlan.original_responses_request →

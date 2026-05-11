@@ -17,6 +17,7 @@ pub mod openai_chat;
 pub mod passthrough;
 pub mod registry;
 pub mod responses;
+mod routes;
 pub mod types;
 
 pub use gemini_cli::GeminiCliAdapter;

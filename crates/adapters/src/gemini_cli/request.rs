@@ -19,6 +19,110 @@
 
 use serde_json::{json, Value};
 
+/// cloud-code OAuth 路径 flavor:
+/// - `GeminiCli`: gemini-cli client_id 路径
+/// - `Antigravity`: antigravity client_id 路径
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloudCodeApiFlavor {
+    GeminiCli,
+    Antigravity,
+}
+
+impl CloudCodeApiFlavor {
+    pub(crate) fn from_api_format(api_format: &str) -> Self {
+        if matches!(
+            api_format.to_ascii_lowercase().as_str(),
+            "antigravity_oauth" | "antigravity" | "google_oauth_antigravity"
+        ) {
+            Self::Antigravity
+        } else {
+            Self::GeminiCli
+        }
+    }
+
+    pub(crate) fn is_antigravity(self) -> bool {
+        matches!(self, Self::Antigravity)
+    }
+}
+
+/// 按 provider `api_format` 选择 token 文件名。
+pub(crate) fn token_filename_for_api_format(api_format: &str) -> &'static str {
+    if CloudCodeApiFlavor::from_api_format(api_format).is_antigravity() {
+        "antigravity-oauth.json"
+    } else {
+        "gemini-oauth.json"
+    }
+}
+
+/// cloudcode-pa 不识别 `toolConfig.includeServerSideToolInvocations`(camel/snake)。
+/// 无条件 strip 两种形态，`toolConfig` 因此变空时同时移除外层 key。
+pub(crate) fn strip_include_server_side_tool_invocations(obj: &mut serde_json::Map<String, Value>) {
+    if let Some(tc) = obj.get_mut("toolConfig").and_then(|v| v.as_object_mut()) {
+        tc.remove("includeServerSideToolInvocations");
+        tc.remove("include_server_side_tool_invocations");
+        if tc.is_empty() {
+            obj.remove("toolConfig");
+        }
+    }
+}
+
+/// 在 inner Gemini request 上应用 cloud-code flavor 兼容规则。
+///
+/// - 所有 flavor: strip `includeServerSideToolInvocations`
+/// - antigravity: 若 tools 含 functionDeclarations,则 strip built-in tools
+///   (`googleSearch`/`urlContext`/`codeExecution`/`googleSearchRetrieval`)
+pub(crate) fn apply_cloud_code_request_compat(inner: &mut Value, flavor: CloudCodeApiFlavor) {
+    let Some(obj) = inner.as_object_mut() else {
+        return;
+    };
+    strip_include_server_side_tool_invocations(obj);
+
+    if !flavor.is_antigravity() {
+        return;
+    }
+    let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let has_function_decls = tools.iter().any(|t| {
+        t.as_object()
+            .map(|o| {
+                o.contains_key("functionDeclarations") || o.contains_key("function_declarations")
+            })
+            .unwrap_or(false)
+    });
+    if !has_function_decls {
+        return;
+    }
+
+    let before = tools.len();
+    tools.retain(|t| {
+        t.as_object()
+            .map(|o| {
+                !o.contains_key("googleSearch")
+                    && !o.contains_key("google_search")
+                    && !o.contains_key("urlContext")
+                    && !o.contains_key("url_context")
+                    && !o.contains_key("codeExecution")
+                    && !o.contains_key("code_execution")
+                    && !o.contains_key("googleSearchRetrieval")
+                    && !o.contains_key("google_search_retrieval")
+            })
+            .unwrap_or(true)
+    });
+    let stripped = before - tools.len();
+    if stripped > 0 {
+        tracing::info!(
+            error_id = "GEMINI_CLI_BUILTIN_TOOLS_STRIPPED",
+            stripped_count = stripped,
+            tool_keys = ?["googleSearch", "urlContext", "codeExecution", "googleSearchRetrieval"],
+            "antigravity wire 不接受 built-in tools + functionDeclarations 共存,strip 内置工具(模型走 exec_command/curl 自适应)"
+        );
+    }
+    if tools.is_empty() {
+        obj.remove("tools");
+    }
+}
+
 /// 用 OS RNG 生成 UUID v4 字符串(`8-4-4-4-12` hex 形态)。
 ///
 /// 不依赖 `uuid` crate(避免 workspace 多一个依赖,且 v4 算法很简单)— 16 字节
@@ -364,6 +468,87 @@ mod tests {
         let wrapped = wrap_cloud_code_envelope("g", "p", json!({})).unwrap();
         assert_eq!(wrapped["request"], json!({}));
         assert_eq!(wrapped["model"], "g");
+    }
+
+    #[test]
+    fn cloud_code_api_flavor_aliases_are_stable() {
+        for v in [
+            "antigravity_oauth",
+            "antigravity",
+            "google_oauth_antigravity",
+            "ANTIGRAVITY",
+        ] {
+            assert!(
+                CloudCodeApiFlavor::from_api_format(v).is_antigravity(),
+                "{v} 必须识别为 antigravity flavor"
+            );
+        }
+        for v in [
+            "gemini_cli_oauth",
+            "gemini_cli",
+            "google_oauth_cloud_code",
+            "openai",
+        ] {
+            assert!(
+                !CloudCodeApiFlavor::from_api_format(v).is_antigravity(),
+                "{v} 不应识别为 antigravity flavor"
+            );
+        }
+    }
+
+    #[test]
+    fn token_filename_selection_is_stable() {
+        assert_eq!(
+            token_filename_for_api_format("gemini_cli_oauth"),
+            "gemini-oauth.json"
+        );
+        assert_eq!(
+            token_filename_for_api_format("antigravity_oauth"),
+            "antigravity-oauth.json"
+        );
+    }
+
+    #[test]
+    fn apply_cloud_code_request_compat_strips_toolconfig_flags_for_all_flavors() {
+        for flavor in [
+            CloudCodeApiFlavor::GeminiCli,
+            CloudCodeApiFlavor::Antigravity,
+        ] {
+            let mut inner = json!({
+                "toolConfig": {"includeServerSideToolInvocations": true}
+            });
+            apply_cloud_code_request_compat(&mut inner, flavor);
+            assert!(
+                inner.get("toolConfig").is_none(),
+                "toolConfig 变空后必须移除"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_compat_strips_builtin_tools_only_when_function_declarations_present() {
+        let mut inner = json!({
+            "tools": [
+                {"functionDeclarations":[{"name":"exec_command"}]},
+                {"googleSearch": {}},
+                {"urlContext": {}}
+            ]
+        });
+        apply_cloud_code_request_compat(&mut inner, CloudCodeApiFlavor::Antigravity);
+        let tools = inner["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].get("functionDeclarations").is_some());
+
+        let mut no_fn_decl = json!({
+            "tools": [{"googleSearch": {}}]
+        });
+        apply_cloud_code_request_compat(&mut no_fn_decl, CloudCodeApiFlavor::Antigravity);
+        let tools = no_fn_decl["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            1,
+            "没有 functionDeclarations 时不应强制 strip built-in tools"
+        );
     }
 
     /// SHA-256 实现锚定 — 用 RFC 6234 标准测试向量(空字符串 + "abc")。
