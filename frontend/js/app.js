@@ -274,10 +274,8 @@
     const select = $("#providerCompatSoftConstraints");
     if (!row || !select) return;
     const supported = supportsCompatSoftConstraints(apiFormat);
+    select.value = normalizeCompatSoftConstraints(value);
     row.hidden = !supported;
-    if (supported) {
-      select.value = normalizeCompatSoftConstraints(value);
-    }
   }
 
   function setApiFormatMode(allowSelect, currentValue) {
