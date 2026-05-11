@@ -373,10 +373,11 @@ mod tests {
     }
 
     #[test]
-    fn for_token_filename_reports_homenotset_via_real_env_when_missing() {
-        // 真 env 路径冒烟测:from_home_env / for_token_filename 在两个 env var
-        // 都缺时必须返 HomeNotSet,error display 必须同时点名 HOME + USERPROFILE
-        // 让 Windows 用户在前端看到有意义的提示(这是本次 fix 的可观察契约)。
+    fn homenotset_display_lists_both_env_vars() {
+        // 公共可观察契约:`HomeNotSet` 的 `Display` 必须同时点名 HOME +
+        // USERPROFILE,Windows 用户在前端 status warning 才能从字面理解错因
+        // (本次 fix 的核心 UX 契约)。变体名 `HomeNotSet` 保留以维持 ABI,
+        // 只 pin message 文本里两个 env var 名。
         let err = TokenError::HomeNotSet;
         let msg = err.to_string();
         assert!(
