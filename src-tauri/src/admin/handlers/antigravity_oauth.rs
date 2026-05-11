@@ -187,7 +187,7 @@ async fn status_handler() -> impl IntoResponse {
         Err(e) => {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("HOME unavailable: {e}"),
+                format!("home directory unavailable: {e}"),
             )
             .into_response()
         }
@@ -226,7 +226,7 @@ async fn models_handler() -> impl IntoResponse {
         Err(e) => {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("HOME unavailable: {e}"),
+                format!("home directory unavailable: {e}"),
             )
             .into_response()
         }
@@ -447,7 +447,11 @@ async fn login_handler() -> impl IntoResponse {
         Ok(s) => s,
         Err(e) => {
             cleanup_slot(my_epoch);
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("HOME: {e}")).into_response();
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("home directory unavailable: {e}"),
+            )
+            .into_response();
         }
     };
     if let Err(e) = persist_token(&store, &token_with_project) {
@@ -494,7 +498,11 @@ async fn logout_handler() -> impl IntoResponse {
     let store = match TokenStore::for_token_filename(ANTIGRAVITY_PROVIDER.token_filename) {
         Ok(s) => s,
         Err(e) => {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("HOME: {e}")).into_response();
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("home directory unavailable: {e}"),
+            )
+            .into_response();
         }
     };
     if let Err(e) = store.delete() {

@@ -335,7 +335,7 @@ async fn status_handler() -> impl IntoResponse {
         Err(e) => {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("HOME unavailable: {e}"),
+                format!("home directory unavailable: {e}"),
             )
             .into_response()
         }
@@ -554,7 +554,11 @@ async fn login_handler() -> impl IntoResponse {
             if matches!(slot.as_ref(), Some((e2, _)) if *e2 == my_epoch) {
                 slot.take();
             }
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("HOME: {e}")).into_response();
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("home directory unavailable: {e}"),
+            )
+            .into_response();
         }
     };
     if let Err(e) = persist_token(&store, &token_with_project) {
@@ -610,7 +614,11 @@ async fn logout_handler() -> impl IntoResponse {
     let store = match TokenStore::from_home_env() {
         Ok(s) => s,
         Err(e) => {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("HOME: {e}")).into_response();
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("home directory unavailable: {e}"),
+            )
+            .into_response();
         }
     };
     if let Err(e) = store.delete() {
