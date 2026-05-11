@@ -745,9 +745,11 @@ fn responses_text_format_to_response_format(text: &Map<String, Value>) -> Option
 
 pub fn chat_normalized_to_gemini_request(
     body: &Value,
-    provider: &Provider,
+    // 对齐 cliproxy 后转换流程不再消费 provider(2026-05-11 移除 compat_soft_constraints
+    // 配置);保留参数避免 callers / 公共 API 改动,后续如确认彻底不需要可在 cleanup
+    // PR 一起收紧
+    _provider: &Provider,
 ) -> Result<RequestBody, AdapterError> {
-    let _ = provider;
     let body_obj = body
         .as_object()
         .ok_or_else(|| AdapterError::BadRequest("chat body must be JSON object".into()))?;

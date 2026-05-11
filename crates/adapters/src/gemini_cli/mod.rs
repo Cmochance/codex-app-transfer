@@ -14,8 +14,9 @@
 //!
 //! ## 复用 gemini_native 内部转换
 //!
-//! 90% inner 转换逻辑(JSON Schema sanitize / web_search 软约束 / 多轮 function
-//! calling round-trip / contents 必须 user 起 / failure stream 等)从
+//! 90% inner 转换逻辑(JSON Schema sanitize / web_search 兼容(对齐 cliproxy:
+//! transformer 阶段统一 drop googleSearch) / 多轮 function calling round-trip /
+//! contents 必须 user 起 / failure stream 等)从
 //! [`crate::gemini_native::request::responses_body_to_gemini_request`] 直接 reuse,
 //! 这里只做 outer wrap + SSE 外层 unwrap。
 //!
@@ -39,6 +40,25 @@ use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan}
 
 pub mod request;
 pub mod response;
+
+/// **toolConfig.includeServerSideToolInvocations 字段在 cloudcode-pa 任何 OAuth
+/// 路径(gemini-cli 或 antigravity)都不识别**(实测 2026-05-11 两条 client_id
+/// 路径都 400 "Unknown name ... Cannot find field"),不管 camelCase / snake_case。
+/// 无条件 strip 两种形态。Google "Please enable" 提示是误导 — 该 flag 在公开 proto
+/// 不存在。
+///
+/// 抽成独立 helper 的目的是给测试一个稳定的 regression hook:即使 transformer
+/// 阶段(2026-05-11 对齐 cliproxy 后)已经不主动注入此字段,如果未来回退或调用方
+/// 通过 extra body 透传注入,strip 路径仍能兜底。
+fn strip_include_server_side_tool_invocations(obj: &mut serde_json::Map<String, Value>) {
+    if let Some(tc) = obj.get_mut("toolConfig").and_then(|v| v.as_object_mut()) {
+        tc.remove("includeServerSideToolInvocations");
+        tc.remove("include_server_side_tool_invocations");
+        if tc.is_empty() {
+            obj.remove("toolConfig");
+        }
+    }
+}
 
 /// `apiFormat` 值是否属于 antigravity OAuth provider(全部别名,大小写无关)。
 /// 必须跟 `crates/proxy/src/resolver.rs::AuthScheme::parse` 与
@@ -136,25 +156,18 @@ impl Adapter for GeminiCliAdapter {
         // 不同 client_id 走不同 proto 分支 — Google 内部行为差异
         let is_antigravity = is_antigravity_api_format(&provider.api_format);
         if let Some(obj) = inner_value.as_object_mut() {
-            // **toolConfig.includeServerSideToolInvocations 字段在 cloudcode-pa
-            // 任何 OAuth 路径(gemini-cli 或 antigravity)都不识别**(实测 2026-05-11
-            // 两条 client_id 路径都 400 "Unknown name ... Cannot find field"),
-            // 不管 camelCase / snake_case。先无条件 strip 两种形态。
-            // Google "Please enable" 提示是误导 — 该 flag 在公开 proto 不存在
-            if let Some(tc) = obj.get_mut("toolConfig").and_then(|v| v.as_object_mut()) {
-                tc.remove("includeServerSideToolInvocations");
-                tc.remove("include_server_side_tool_invocations");
-                if tc.is_empty() {
-                    obj.remove("toolConfig");
-                }
-            }
+            strip_include_server_side_tool_invocations(obj);
 
             // **antigravity 路径拒 built-in tools + functionDeclarations 共存**
             // (实测 2026-05-11 daily-cloudcode-pa 返 400 "Built-in tools with
-            // Function calling")。flag 又不能 enable。**只能 strip 内置 tools**
-            // (googleSearch / urlContext / codeExecution),保留 function_declarations
-            // (Codex.app 主用)。对应 gemini_native 的 Gemini 2.x fallback 路径,
-            // 但 antigravity 把所有 Gemini 3 model 当 2.x 那么处理
+            // Function calling")。flag 又不能 enable。**只能 strip 内置 tools**,
+            // 保留 function_declarations(Codex.app 主用)。
+            //
+            // 注:`gemini_native` 已经在 transformer 阶段(对齐 cliproxy)统一 drop
+            // `googleSearch`,这里是 antigravity 专属的兜底 strip,额外覆盖
+            // `urlContext` / `codeExecution` / `googleSearchRetrieval` 等其它内置
+            // tools(transformer 当前不主动剥),并对 `googleSearch` 做 idempotent
+            // 二次校验,防 transformer 未来回归。
             if is_antigravity {
                 if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
                     let mut has_function_decls = false;
@@ -171,12 +184,11 @@ impl Adapter for GeminiCliAdapter {
                         }
                     }
                     if has_function_decls {
-                        // **silent strip**(2026-05-11 user 反馈 Bug N revert):
-                        // gemini-3.x 模型自带"无 google_search 时改用 exec_command/curl"
-                        // 的 fallback 推理能力,加 system_instruction 软约束反而让
-                        // 模型保守拒绝网络任务。silent drop 让模型按自身能力自适应,
-                        // 实测效果更好。Gemini 2.x 路径仍由 gemini_native 内部加
-                        // soft constraint(2.x 推理弱需要明确提示)
+                        // **silent strip**(2026-05-11 对齐 cliproxy):任何 Gemini
+                        // 版本都不再注入 system_instruction 软约束,模型按自身能力
+                        // (Gemini 3.x 内置 exec_command/curl fallback 推理)自适应。
+                        // Gemini 2.x 推理稍弱时表现退化由调用方接受,跟 gemini_native
+                        // 主路径一致,不在 antigravity 这条 OAuth 分支特殊处理。
                         let before = tools.len();
                         tools.retain(|t| {
                             t.as_object()
@@ -370,6 +382,77 @@ mod adapter_tests {
         ] {
             assert!(!is_antigravity_api_format(v), "{v} 不应判成 antigravity");
         }
+    }
+
+    /// **strip helper 防御性回归**:`strip_include_server_side_tool_invocations`
+    /// 必须 idempotent 地剥两种 case(camelCase / snake_case),并在 `toolConfig`
+    /// 因此变空时把外层 key 一并去掉。即使 transformer 阶段(2026-05-11 对齐
+    /// cliproxy 后)不再主动注入,此 helper 仍要 hold 住未来 extra-body 透传 /
+    /// transformer 回归 等再注入场景。
+    #[test]
+    fn strip_include_server_side_tool_invocations_handles_both_casings_and_empties_toolconfig() {
+        // camelCase 单独存在 → 剥 + toolConfig 变空被一并删除
+        let mut obj = serde_json::json!({
+            "toolConfig": {"includeServerSideToolInvocations": true}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        strip_include_server_side_tool_invocations(&mut obj);
+        assert!(
+            !obj.contains_key("toolConfig"),
+            "toolConfig 变空后必须整段移除,实际:{obj:?}"
+        );
+
+        // snake_case 单独存在 → 同上
+        let mut obj = serde_json::json!({
+            "toolConfig": {"include_server_side_tool_invocations": true}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        strip_include_server_side_tool_invocations(&mut obj);
+        assert!(!obj.contains_key("toolConfig"));
+
+        // 两种 casing 同时存在 → 都剥
+        let mut obj = serde_json::json!({
+            "toolConfig": {
+                "includeServerSideToolInvocations": true,
+                "include_server_side_tool_invocations": true
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        strip_include_server_side_tool_invocations(&mut obj);
+        assert!(!obj.contains_key("toolConfig"));
+
+        // toolConfig 含其它合法字段时仅剥目标字段,toolConfig 保留
+        let mut obj = serde_json::json!({
+            "toolConfig": {
+                "includeServerSideToolInvocations": true,
+                "functionCallingConfig": {"mode": "AUTO"}
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        strip_include_server_side_tool_invocations(&mut obj);
+        let tc = obj
+            .get("toolConfig")
+            .and_then(|v| v.as_object())
+            .expect("toolConfig 含其它字段时必须保留");
+        assert!(!tc.contains_key("includeServerSideToolInvocations"));
+        assert!(tc.contains_key("functionCallingConfig"));
+
+        // 无 toolConfig 时是 no-op
+        let mut obj = serde_json::json!({"contents": []})
+            .as_object()
+            .unwrap()
+            .clone();
+        strip_include_server_side_tool_invocations(&mut obj);
+        assert!(obj.contains_key("contents"));
+        assert_eq!(obj.len(), 1);
     }
 
     /// **cloud-code wire 兼容性**(2026-05-11 对齐 cliproxy):Gemini 3 + Codex tools
