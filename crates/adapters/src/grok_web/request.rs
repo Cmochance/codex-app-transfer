@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn previous_response_id_resolved_via_tracker() {
-        let tracker = ParentResponseTracker::new();
+        let tracker = ParentResponseTracker::default();
         tracker.record("resp_abc", "9f82a10c-grok-uuid");
         let body = json!({
             "model": "gpt_5_codex",
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn previous_response_id_miss_omits_parent_response_id() {
-        let tracker = ParentResponseTracker::new();
+        let tracker = ParentResponseTracker::default();
         let body = json!({
             "model": "gpt_5_codex",
             "input": [{"type": "message", "role": "user", "content": "x"}],
