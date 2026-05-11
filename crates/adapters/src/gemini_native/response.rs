@@ -80,6 +80,51 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 扫 `original_request.tools` 数组里所有 `type:"namespace"` 包装,建立
+/// `function.name → namespace.name` 反查表(`mcp__notion__` 含 5 个 function
+/// → 5 个 (function name, "mcp__notion__") 入表)。后写覆盖前写(罕见同名
+/// 跨 namespace 时取最后一个)。
+///
+/// 1:1 移植 [`crate::responses::converter::ResponsesConverter::with_original_request`]
+/// 的扫描逻辑(2026-05-11 修)。
+fn build_tool_namespace_map(
+    original_request: Option<&Value>,
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(req) = original_request else {
+        return map;
+    };
+    let Some(tools) = req.get("tools").and_then(|v| v.as_array()) else {
+        return map;
+    };
+    for tool in tools {
+        let Some(obj) = tool.as_object() else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) != Some("namespace") {
+            continue;
+        }
+        let Some(ns_name) = obj.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(inner_tools) = obj.get("tools").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for inner in inner_tools {
+            let Some(inner_obj) = inner.as_object() else {
+                continue;
+            };
+            if inner_obj.get("type").and_then(|v| v.as_str()) != Some("function") {
+                continue;
+            }
+            if let Some(fname) = inner_obj.get("name").and_then(|v| v.as_str()) {
+                map.insert(fname.to_owned(), ns_name.to_owned());
+            }
+        }
+    }
+    map
+}
+
 /// SSE event 写出。OpenAI Responses 协议:`event: <name>\ndata: <json>\n\n`,
 /// payload 内 `sequence_number` 单调递增。
 ///
@@ -163,6 +208,9 @@ struct ClosedFunctionCall {
     call_id: String,
     name: String,
     arguments_json_str: String,
+    /// `Some("mcp__<server>__")` 当 function.name 来自 namespace 包装。
+    /// envelope output[] emit 时回灌成 item.namespace 字段。
+    namespace: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -236,6 +284,19 @@ pub struct GeminiToResponsesConverter {
     /// error.code=prompt_blocked
     prompt_block_reason: Option<String>,
     prompt_feedback_safety: Vec<Value>,
+
+    /// **MCP namespace 反查表**(`function.name → namespace.name`)。Codex CLI
+    /// 把每个 `[mcp_servers.<name>]` 入站打成
+    /// `{type:"namespace", name:"mcp__<name>__", tools:[{type:"function",...}]}`。
+    /// emit `function_call` SSE event 时(`response.output_item.added` /
+    /// `.done` + envelope `output[]`),如果 function.name 命中此表,**必须**给
+    /// item 加 `namespace: "mcp__<name>__"` 字段 — Codex.app 客户端按 namespace
+    /// dispatch 到对应 MCP server,缺字段时所有 namespace 工具调用退化成普通
+    /// function call,模型不知怎么路由就绕路 grep env / find config 自我发现。
+    ///
+    /// 跟 [`crate::responses::converter::ResponsesConverter::tool_namespace_map`]
+    /// 同款 — 1:1 移植(2026-05-11 实测 Codex.app + Gemini 路径 MCP 调用)
+    tool_namespace_map: std::collections::HashMap<String, String>,
 }
 
 impl GeminiToResponsesConverter {
@@ -247,6 +308,9 @@ impl GeminiToResponsesConverter {
             .as_ref()
             .map(|s| s.response_id.clone())
             .unwrap_or_else(|| format!("resp_{}", synthesize_id()));
+        // **build namespace map 必须先于 move**(struct field 顺序里
+        // original_request 在前会先 move 走,后面 tool_namespace_map 拿不到 ref)
+        let tool_namespace_map = build_tool_namespace_map(original_request.as_ref());
         Self {
             buffer: Vec::new(),
             accumulated_json: String::new(),
@@ -278,7 +342,15 @@ impl GeminiToResponsesConverter {
             accumulated_retrieval_metadata: Vec::new(),
             prompt_block_reason: None,
             prompt_feedback_safety: Vec::new(),
+            tool_namespace_map,
         }
+    }
+
+    /// 查询 function.name 对应的 namespace.name —— emit function_call event 时
+    /// 用来给 item 加 `namespace` 字段(Codex.app dispatch 必要)。跟
+    /// [`crate::responses::converter::ResponsesConverter::lookup_namespace_for`] 同款
+    fn lookup_namespace_for(&self, tool_name: &str) -> Option<&str> {
+        self.tool_namespace_map.get(tool_name).map(String::as_str)
     }
 
     // ───── envelope 构造 ─────
@@ -823,17 +895,19 @@ impl GeminiToResponsesConverter {
         all_items.extend(self.closed_reasonings.drain(..));
         all_items.extend(self.closed_other_items.drain(..));
         for fc in self.closed_function_calls.drain(..) {
-            all_items.push((
-                fc.output_index,
-                json!({
-                    "type": "function_call",
-                    "id": fc.item_id,
-                    "call_id": fc.call_id,
-                    "name": fc.name,
-                    "arguments": fc.arguments_json_str,
-                    "status": "completed",
-                }),
-            ));
+            let mut item = json!({
+                "type": "function_call",
+                "id": fc.item_id,
+                "call_id": fc.call_id,
+                "name": fc.name,
+                "arguments": fc.arguments_json_str,
+                "status": "completed",
+            });
+            // namespace 字段(Codex.app dispatch MCP server 必填)
+            if let Some(ns) = fc.namespace.as_ref() {
+                item["namespace"] = Value::String(ns.clone());
+            }
+            all_items.push((fc.output_index, item));
         }
         all_items.sort_by_key(|(idx, _)| *idx);
         let output_items: Vec<Value> = all_items.into_iter().map(|(_, item)| item).collect();
@@ -1189,6 +1263,26 @@ impl GeminiToResponsesConverter {
             }
         };
 
+        // **MCP namespace 字段**:如 function.name 来自 namespace 包装(从
+        // `tool_namespace_map` 反查表查到),给 output_item.added / .done /
+        // envelope item 全部加 `namespace: "mcp__<server>__"` —— Codex.app
+        // 客户端 dispatch namespace 工具调用必填(2026-05-11 修)
+        let namespace_for = self.lookup_namespace_for(name).map(str::to_owned);
+        let build_item = |status: &str, arguments_str: &str| {
+            let mut m = json!({
+                "type": "function_call",
+                "id": item_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments_str,
+                "status": status,
+            });
+            if let Some(ns) = namespace_for.as_ref() {
+                m["namespace"] = Value::String(ns.clone());
+            }
+            m
+        };
+
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1196,14 +1290,7 @@ impl GeminiToResponsesConverter {
             json!({
                 "type": "response.output_item.added",
                 "output_index": output_index,
-                "item": {
-                    "type": "function_call",
-                    "id": item_id,
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": "",
-                    "status": "in_progress",
-                },
+                "item": build_item("in_progress", ""),
             }),
         );
         // Gemini 一次性给完整 args(无增量),emit 单条 delta = 完整 args
@@ -1229,14 +1316,7 @@ impl GeminiToResponsesConverter {
                 "arguments": args_json_str,
             }),
         );
-        let item = json!({
-            "type": "function_call",
-            "id": item_id,
-            "call_id": call_id,
-            "name": name,
-            "arguments": args_json_str,
-            "status": "completed",
-        });
+        let item = build_item("completed", &args_json_str);
         emit_event(
             out,
             &mut self.sequence_number,
@@ -1264,6 +1344,7 @@ impl GeminiToResponsesConverter {
             call_id,
             name: name.to_owned(),
             arguments_json_str: args_json_str,
+            namespace: namespace_for,
         });
     }
 
@@ -2293,5 +2374,99 @@ mod tests {
             let (_, v) = parse_event(e);
             assert_eq!(v["sequence_number"], i);
         }
+    }
+
+    /// **MCP namespace dispatch** (parity test) — 对齐
+    /// `responses::converter::function_call_item_includes_namespace_field_when_tool_came_from_namespace_pack`。
+    /// 用 original_request.tools 含 namespace 包 build converter,模型生成 namespace
+    /// 内层 function call → emit 的 output_item.added / .done + envelope output[] 全
+    /// 必须含 `namespace: "mcp__notion__"` 字段(Codex.app dispatch 必要)
+    #[test]
+    fn function_call_item_includes_namespace_field_when_tool_came_from_namespace_pack() {
+        let original_request = json!({
+            "model": "gemini-3-flash",
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "namespace", "name": "mcp__notion__", "tools": [
+                    {"type": "function", "name": "notion_search"},
+                    {"type": "function", "name": "notion_create_pages"},
+                ]},
+                {"type": "namespace", "name": "mcp__figma__", "tools": [
+                    {"type": "function", "name": "whoami"},
+                ]}
+            ]
+        });
+        let mut conv = GeminiToResponsesConverter::new(Some(original_request), None);
+        // Gemini wire:模型回 functionCall {name: notion_search}
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"notion_search","args":{}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events_raw = drive_to_events(&mut conv, &[chunk]);
+        let events: Vec<(String, Value)> = events_raw.iter().map(|e| parse_event(e)).collect();
+
+        // output_item.added 含 namespace
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .expect("function_call output_item.added emitted");
+        assert_eq!(
+            added.1["item"]["namespace"], "mcp__notion__",
+            "function_call.added item 必须含 namespace 字段"
+        );
+        assert_eq!(added.1["item"]["name"], "notion_search");
+
+        // output_item.done 含 namespace
+        let done = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .expect("function_call output_item.done emitted");
+        assert_eq!(done.1["item"]["namespace"], "mcp__notion__");
+
+        // response.completed.output[] final item 含 namespace
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed emitted");
+        let final_output = completed.1["response"]["output"].as_array().unwrap();
+        let final_fc = final_output
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
+            .expect("function_call in completed output");
+        assert_eq!(final_fc["namespace"], "mcp__notion__");
+    }
+
+    /// 顶级 function(非 namespace 内层)的 function_call **不该**带 namespace
+    /// 字段,否则 Codex.app 可能把它误当 dynamic tool 路由到不存在的 server。
+    /// 对齐 `responses::converter::function_call_item_omits_namespace_when_tool_is_top_level_function`
+    #[test]
+    fn function_call_item_omits_namespace_when_tool_is_top_level_function() {
+        let original_request = json!({
+            "model": "gemini-3-flash",
+            "tools": [{"type": "function", "name": "shell"}]
+        });
+        let mut conv = GeminiToResponsesConverter::new(Some(original_request), None);
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events_raw = drive_to_events(&mut conv, &[chunk]);
+        let events: Vec<(String, Value)> = events_raw.iter().map(|e| parse_event(e)).collect();
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+            })
+            .expect("function_call output_item.added emitted");
+        assert!(
+            added.1["item"].get("namespace").is_none(),
+            "顶级 function 不该带 namespace 字段,实际 {:?}",
+            added.1["item"].get("namespace")
+        );
     }
 }

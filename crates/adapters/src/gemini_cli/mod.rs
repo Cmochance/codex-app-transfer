@@ -171,6 +171,13 @@ impl Adapter for GeminiCliAdapter {
                         }
                     }
                     if has_function_decls {
+                        // **silent strip**(2026-05-11 user 反馈 Bug N revert):
+                        // gemini-3.x 模型自带"无 google_search 时改用 exec_command/curl"
+                        // 的 fallback 推理能力,加 system_instruction 软约束反而让
+                        // 模型保守拒绝网络任务。silent drop 让模型按自身能力自适应,
+                        // 实测效果更好。Gemini 2.x 路径仍由 gemini_native 内部加
+                        // soft constraint(2.x 推理弱需要明确提示)
+                        let before = tools.len();
                         tools.retain(|t| {
                             t.as_object()
                                 .map(|o| {
@@ -185,6 +192,18 @@ impl Adapter for GeminiCliAdapter {
                                 })
                                 .unwrap_or(true)
                         });
+                        let stripped = before - tools.len();
+                        if stripped > 0 {
+                            // **telemetry anchor**(silent-failure-hunter C1 修):
+                            // 没此 log,user 投诉"模型说不能联网但实际可以"时无线索
+                            // 定位到此 strip 路径。info 级别(不报错,只标记策略生效)
+                            tracing::info!(
+                                error_id = "GEMINI_CLI_BUILTIN_TOOLS_STRIPPED",
+                                stripped_count = stripped,
+                                tool_keys = ?["googleSearch", "urlContext", "codeExecution", "googleSearchRetrieval"],
+                                "antigravity wire 不接受 built-in tools + functionDeclarations 共存,strip 内置工具(模型走 exec_command/curl 自适应)"
+                            );
+                        }
                         if tools.is_empty() {
                             obj.remove("tools");
                         }

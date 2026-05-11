@@ -2240,7 +2240,16 @@
           }
           const result = await CCApi.fetchProviderModelsPayload(payload);
           providerAvailableModels = Array.isArray(result.models) ? result.models.slice() : [];
-          setProviderMappings(result.suggested || emptyMappings(), { availableModels: providerAvailableModels });
+          // **不覆盖 user 已有 mappings,只刷新下拉选项**(2026-05-11 修):
+          // 原 `setProviderMappings(result.suggested, ...)` 会用 suggested 整覆盖
+          // (suggested 后端只填 default,其他 slot 是空串)→ user 自己设的
+          // gpt_5_5 / gpt_5_4 等被清空。期望行为:获取模型只更新下拉可选项,
+          // 不清 user 已有映射(default 留空时才允许 suggested.default 填进去)
+          const suggestedDefault = (result.suggested && result.suggested.default) || "";
+          if (suggestedDefault && !providerFormMappings.default) {
+            providerFormMappings.default = suggestedDefault;
+          }
+          setProviderMappings(providerFormMappings, { availableModels: providerAvailableModels });
           if (resultEl) resultEl.textContent = t("models.fetchSuccess");
           showToast(t("toast.modelsAutofilled"));
         } catch (error) {
