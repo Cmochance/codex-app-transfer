@@ -372,15 +372,15 @@ mod adapter_tests {
         }
     }
 
-    /// **cloud-code wire 兼容性**:Gemini 3 + Codex tools 触发 transformer 加
-    /// `toolConfig.includeServerSideToolInvocations=true`,但 cloudcode-pa proto
-    /// 未实装此字段,返 400 `Unknown name ...`。本测试 lock GeminiCliAdapter
-    /// 走 strip 路径:transformer 加了字段后 prepare_request 必须 strip。
-    /// (实测 2026-05-11 Gemini 3 调用直接触发,user-facing chat 全 fail)
+    /// **cloud-code wire 兼容性**(2026-05-11 对齐 cliproxy):Gemini 3 + Codex tools
+    /// 同 turn 出现 googleSearch + functionDeclarations 时,inner transformer
+    /// (`chat_normalized_to_gemini_request`)统一 drop `googleSearch`(对齐 cliproxy
+    /// 主项目"不实现 web_search"策略,避免上游 400 + 模型语义偏移)。
+    /// 同时验证防御性 strip:`toolConfig.includeServerSideToolInvocations`
+    /// 在 cloudcode-pa proto 不被识别(实测 2026-05-11 返 400 `Unknown name`),
+    /// 即使未来 transformer 误注入也必须被剥。
     #[test]
-    fn strips_include_server_side_tool_invocations_for_cloud_code_path() {
-        // 构造既含 functionDeclarations 又含 googleSearch 的请求 — 这是触发
-        // transformer 设 includeServerSideToolInvocations=true 的唯一路径
+    fn cloud_code_drops_google_search_and_strips_include_server_side_tool_invocations() {
         let body = serde_json::json!({
             "model": "gemini-3-pro-preview",
             "stream": true,
@@ -397,28 +397,25 @@ mod adapter_tests {
                 &dummy_provider_with_project(),
             )
             .unwrap();
-        // body 是 outer envelope: {model, project, user_prompt_id, request: <inner>}
         let outer: Value = serde_json::from_slice(&plan.body).unwrap();
         let inner = outer.get("request").unwrap();
-        // 1. 字段被 strip:cloudcode-pa 拒识别
         let tc_field = inner
             .get("toolConfig")
             .and_then(|v| v.get("includeServerSideToolInvocations"));
         assert!(
             tc_field.is_none(),
-            "includeServerSideToolInvocations 必须被 strip,实际 inner={inner:#}"
+            "includeServerSideToolInvocations 必须不存在(cloudcode-pa 不识别;transformer 也不再注入)"
         );
-        // 2. tools 数组保留 — 两者共存让 cloudcode-pa 原生接受
         let tools = inner.get("tools").and_then(|v| v.as_array()).unwrap();
         let has_gs = tools.iter().any(|t| t.get("googleSearch").is_some());
         let has_fd = tools
             .iter()
             .any(|t| t.get("functionDeclarations").is_some());
         assert!(
-            has_gs,
-            "googleSearch 必须保留(cloud-code Gemini 3 原生接受共存)"
+            !has_gs,
+            "对齐 cliproxy:googleSearch 必须在 transformer 阶段被 drop,实际 tools={tools:?}"
         );
-        assert!(has_fd, "functionDeclarations 必须保留");
+        assert!(has_fd, "functionDeclarations 必须保留(Codex 核心)");
     }
 
     #[test]
