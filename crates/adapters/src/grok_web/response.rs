@@ -96,6 +96,8 @@ pub fn convert_grok_sse_to_responses_sse(
         received_any_final_token: false,
         next_output_index: 0,
         open_reasoning: None,
+        open_message: None,
+        pending_url_citations: Vec::new(),
     };
     // 先把 response.created 塞进 pending(unfold 第一步立即 yield)
     state.pending.push_back(initial_event);
@@ -110,10 +112,12 @@ pub fn convert_grok_sse_to_responses_sse(
                 // 2. 上游已 exhausted,看是否需要补 completed / failed 防御
                 if s.upstream_exhausted {
                     if !s.emitted_completed {
-                        // 流末/中断前 close open_reasoning(P1 fix lifecycle)。
-                        // 否则 reasoning item 永远 in_progress,Codex APP UI 卡。
+                        // 流末/中断前 close 所有 open items(R1 PR-1 P1 + PR-3):
+                        // - reasoning item 永远 in_progress 会让 Codex APP Thinking UI 卡
+                        // - message item 同理
                         close_reasoning_if_open(&mut s);
-                        // pending 可能多了 reasoning close 事件,优先 yield 它们
+                        close_message_if_open(&mut s);
+                        // pending 可能多了 close 事件,优先 yield 它们
                         if let Some(event) = s.pending.pop_front() {
                             return Some((Ok(event), s));
                         }
@@ -293,6 +297,22 @@ struct OpenReasoning {
     text_acc: String,
 }
 
+/// 当前打开的 message item lifecycle 状态(R1 PR-3)。
+///
+/// 对齐 OpenAI Responses 消息体三段:
+/// `output_item.added(message)` + `content_part.added(output_text)` →
+/// `output_text.delta` * N + 累积 `output_text.annotation.added` →
+/// `output_text.done` + `content_part.done` + `output_item.done`(item.content
+/// 含完整 annotations 数组)。
+///
+/// `annotations_acc` 收集已 emit 的 url_citation,close 时回灌到 item.content。
+struct OpenMessage {
+    item_id: String,
+    output_index: u32,
+    text_acc: String,
+    annotations_acc: Vec<serde_json::Value>,
+}
+
 /// `unfold` 内部状态。
 struct ConvState {
     upstream: ByteStream,
@@ -312,6 +332,11 @@ struct ConvState {
     next_output_index: u32,
     /// 当前打开中的 reasoning item(R1 PR-1 P1 fix);final / soft_stop 前 close。
     open_reasoning: Option<OpenReasoning>,
+    /// 当前打开中的 message item(R1 PR-3);final token 触发 open,soft_stop / 上游中断 close。
+    open_message: Option<OpenMessage>,
+    /// thinking 阶段累积的 url citation(webSearchResults / xSearchResults),
+    /// 第一个 final token 触发 open_message 后 flush 为 annotation.added 事件。
+    pending_url_citations: Vec<serde_json::Value>,
 }
 
 /// 从 `line_buf` 切出所有完整 line,parse 成 Codex SSE events 入 pending。
@@ -376,12 +401,29 @@ fn process_buffered_lines(state: &mut ConvState) {
 fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
     let tag = frame.message_tag.as_deref().map(GrokMessageTag::parse);
 
-    // 最终回答 token(非 thinking)
+    // 最终回答 token(非 thinking)— R1 PR-3:
+    //
+    // 改造 — 包进 message item lifecycle 而不是裸 push output_text.delta。
+    // 首个非空 final token 触发 open_message_if_needed(emit output_item.added(message)
+    // + content_part.added(output_text)),然后 emit output_text.delta。
+    // pending_url_citations(thinking 阶段累积的 webSearchResults)在首次 open
+    // 后立即 flush 为 annotation.added 事件,关联 message item_id。
     if matches!(tag, Some(GrokMessageTag::Final)) && frame.is_thinking != Some(true) {
         if let Some(tok) = &frame.token {
             if !tok.is_empty() {
-                state.pending.push_back(emit_output_text_delta(tok));
-                state.received_any_final_token = true;
+                open_message_if_needed(state);
+                if let Some(msg) = state.open_message.as_mut() {
+                    msg.text_acc.push_str(tok);
+                    let item_id = msg.item_id.clone();
+                    let output_index = msg.output_index;
+                    state.pending.push_back(emit_output_text_delta_for_item(
+                        &item_id,
+                        output_index,
+                        tok,
+                    ));
+                    state.received_any_final_token = true;
+                    flush_pending_url_citations(state);
+                }
             }
         }
     }
@@ -472,17 +514,19 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         }
     }
 
-    // raw_function_result 数据帧(R1 PR-2 简化版):webSearchResults / xSearchResults
-    // 出现时,转 markdown bullet list 拼到 reasoning summary。
-    // **不**做结构化 url_citation annotation(那需要 message item 而不是 reasoning,
-    // 留 PR-3 处理)。空 token 收尾帧不动。
+    // raw_function_result 数据帧(R1 PR-2 + PR-3):
+    // - PR-2:webSearchResults / xSearchResults 转 markdown bullet 拼 reasoning summary(已有)
+    // - PR-3:**同时**累积 url_citation annotation 到 pending_url_citations,
+    //   待首个 final token open_message 后 flush(emit annotation.added)
     if matches!(tag, Some(GrokMessageTag::RawFunctionResult)) {
         let mut summary = String::new();
         if let Some(wsr) = &frame.web_search_results {
             summary.push_str(&format_web_search_results_for_reasoning(wsr));
+            accumulate_web_search_url_citations(state, wsr);
         }
         if let Some(xsr) = &frame.x_search_results {
             summary.push_str(&format_x_search_results_for_reasoning(xsr));
+            accumulate_x_search_url_citations(state, xsr);
         }
         if !summary.is_empty() {
             open_reasoning_if_needed(state);
@@ -499,9 +543,10 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         }
     }
 
-    // 流末标志 — softStop 前也必须 close open_reasoning(P1 fix lifecycle)
+    // 流末标志 — softStop 前 close 所有 open items(PR-3:reasoning + message)
     if frame.is_soft_stop == Some(true) && !state.emitted_completed {
         close_reasoning_if_open(state);
+        close_message_if_open(state);
         state.emitted_completed = true;
         state
             .pending
@@ -770,6 +815,230 @@ fn emit_output_text_delta(delta: &str) -> Bytes {
             "delta": delta,
         }),
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// message item lifecycle(R1 PR-3 — 对齐 OpenAI Responses message item spec)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 首次遇到 final token 时打开 message item lifecycle。
+///
+/// emit 两个 event 到 pending:
+/// - `response.output_item.added`(item.type=message, status=in_progress, role=assistant)
+/// - `response.content_part.added`(part.type=output_text, content_index=0)
+fn open_message_if_needed(state: &mut ConvState) {
+    if state.open_message.is_some() {
+        return;
+    }
+    let item_id = format!(
+        "msg_{}",
+        crate::grok_web::auth::generate_uuid_v4().replace('-', "")
+    );
+    let output_index = state.next_output_index;
+    state.next_output_index += 1;
+    state.pending.push_back(emit_event(
+        "response.output_item.added",
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "type": "message",
+                "id": item_id,
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+        }),
+    ));
+    state.pending.push_back(emit_event(
+        "response.content_part.added",
+        serde_json::json!({
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": "", "annotations": [] },
+        }),
+    ));
+    state.open_message = Some(OpenMessage {
+        item_id,
+        output_index,
+        text_acc: String::new(),
+        annotations_acc: Vec::new(),
+    });
+}
+
+/// 关联到 message item_id / output_index 的 output_text.delta。
+fn emit_output_text_delta_for_item(item_id: &str, output_index: u32, delta: &str) -> Bytes {
+    emit_event(
+        "response.output_text.delta",
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "delta": delta,
+        }),
+    )
+}
+
+/// final token / soft_stop / 上游中断前 close open message。
+///
+/// emit 三个 event:
+/// - `response.output_text.done`(累计 text + 全 annotations)
+/// - `response.content_part.done`(part.text=累计,annotations 数组完整)
+/// - `response.output_item.done`(item.content=[{type:output_text,text,annotations}],
+///   status=completed)
+fn close_message_if_open(state: &mut ConvState) {
+    let Some(msg) = state.open_message.take() else {
+        return;
+    };
+    let annotations = serde_json::Value::Array(msg.annotations_acc.clone());
+    state.pending.push_back(emit_event(
+        "response.output_text.done",
+        serde_json::json!({
+            "type": "response.output_text.done",
+            "item_id": msg.item_id,
+            "output_index": msg.output_index,
+            "content_index": 0,
+            "text": msg.text_acc,
+            "annotations": annotations,
+        }),
+    ));
+    state.pending.push_back(emit_event(
+        "response.content_part.done",
+        serde_json::json!({
+            "type": "response.content_part.done",
+            "item_id": msg.item_id,
+            "output_index": msg.output_index,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": msg.text_acc,
+                "annotations": serde_json::Value::Array(msg.annotations_acc.clone()),
+            },
+        }),
+    ));
+    state.pending.push_back(emit_event(
+        "response.output_item.done",
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": msg.output_index,
+            "item": {
+                "type": "message",
+                "id": msg.item_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": msg.text_acc,
+                    "annotations": serde_json::Value::Array(msg.annotations_acc),
+                }],
+            },
+        }),
+    ));
+}
+
+/// 把 pending_url_citations 全部 emit 为 `response.output_text.annotation.added` 事件。
+///
+/// 只在 message 已 open 时调用(由 final-token 分支触发)。
+/// emit 后 pending 清空(annotations_acc 累积到 message item state,供 done 回灌)。
+fn flush_pending_url_citations(state: &mut ConvState) {
+    if state.pending_url_citations.is_empty() {
+        return;
+    }
+    let Some(msg) = state.open_message.as_mut() else {
+        return;
+    };
+    let item_id = msg.item_id.clone();
+    let output_index = msg.output_index;
+    let citations = std::mem::take(&mut state.pending_url_citations);
+    for (annotation_index, citation) in citations.into_iter().enumerate() {
+        state.pending.push_back(emit_event(
+            "response.output_text.annotation.added",
+            serde_json::json!({
+                "type": "response.output_text.annotation.added",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "annotation_index": annotation_index + msg.annotations_acc.len(),
+                "annotation": citation,
+            }),
+        ));
+        msg.annotations_acc.push(citation);
+    }
+}
+
+/// 把 grok webSearchResults.results 转成 OpenAI Responses url_citation 标准 annotation,
+/// 累积到 pending_url_citations 等 message open 后 flush。
+///
+/// OpenAI url_citation schema:
+/// ```json
+/// {"type":"url_citation","url":"...","title":"...","start_index":0,"end_index":0}
+/// ```
+/// start/end index 对应 message text 内位置 — R3 阶段尚不支持精确定位,统一设 0(标记
+/// 整条 message 与该 url 相关)。R1 后续 PR 加 inline `[N]` 定位再 update。
+fn accumulate_web_search_url_citations(state: &mut ConvState, wsr: &serde_json::Value) {
+    let Some(results) = wsr.get("results").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for r in results {
+        let Some(url) = r.get("url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if url.is_empty() {
+            continue;
+        }
+        let title = r
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or(url)
+            .to_owned();
+        state.pending_url_citations.push(serde_json::json!({
+            "type": "url_citation",
+            "url": url,
+            "title": title,
+            "start_index": 0,
+            "end_index": 0,
+        }));
+    }
+}
+
+/// X 帖子转 url_citation(URL = https://x.com/<username>/status/<postId>)。
+fn accumulate_x_search_url_citations(state: &mut ConvState, xsr: &serde_json::Value) {
+    let Some(results) = xsr.get("results").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for r in results {
+        let username = r.get("username").and_then(|v| v.as_str());
+        let post_id = r.get("postId").and_then(|v| v.as_str());
+        let (Some(u), Some(p)) = (username, post_id) else {
+            continue;
+        };
+        if u.is_empty() || p.is_empty() {
+            continue;
+        }
+        let url = format!("https://x.com/{u}/status/{p}");
+        let text_preview: String = r
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect();
+        let title = if text_preview.is_empty() {
+            format!("𝕏 @{u}")
+        } else {
+            format!("𝕏 @{u}: {text_preview}")
+        };
+        state.pending_url_citations.push(serde_json::json!({
+            "type": "url_citation",
+            "url": url,
+            "title": title,
+            "start_index": 0,
+            "end_index": 0,
+        }));
+    }
 }
 
 /// 合规 OpenAI Responses `response.failed` 事件构造。
@@ -1154,6 +1423,68 @@ mod tests {
         .await;
         assert!(out.contains("[MCP Home](https://modelcontextprotocol.io)"));
         assert!(out.contains("[MCP Intro](https://anthropic.com/news/model-context-protocol)"));
+    }
+
+    #[tokio::test]
+    async fn web_search_emits_url_citation_annotations_on_message() {
+        // R1 PR-3:webSearchResults 累积 → 首个 final token open_message →
+        // flush pending_url_citations 为 annotation.added 事件 → close 时回灌
+        // 完整 annotations 数组到 output_text.done / content_part.done / output_item.done。
+        let lines = vec![
+            r#"{"result":{"response":{"messageTag":"tool_usage_card","isThinking":true,"toolUsageCardId":"c1","toolUsageCard":{"toolUsageCardId":"c1","webSearch":{"args":{"query":"MCP"}}}}}}"#,
+            r#"{"result":{"response":{"messageTag":"raw_function_result","webSearchResults":{"results":[{"url":"https://modelcontextprotocol.io","title":"MCP Home"}]}}}}"#,
+            r#"{"result":{"response":{"token":"hello","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"token":" world","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        // 1. message item 已开
+        assert!(out.contains("event: response.output_item.added"));
+        assert!(out.contains(r#""type":"message""#));
+        assert!(out.contains("event: response.content_part.added"));
+        // 2. output_text.delta 关联 item_id(含 content_index=0)
+        assert!(out.contains("event: response.output_text.delta"));
+        assert!(out.contains(r#""content_index":0"#));
+        assert!(out.contains(r#""delta":"hello""#));
+        assert!(out.contains(r#""delta":" world""#));
+        // 3. url_citation annotation.added 事件
+        assert!(out.contains("event: response.output_text.annotation.added"));
+        assert!(out.contains(r#""type":"url_citation""#));
+        assert!(out.contains(r#""url":"https://modelcontextprotocol.io""#));
+        assert!(out.contains(r#""title":"MCP Home""#));
+        // 4. close 三段
+        assert!(out.contains("event: response.output_text.done"));
+        assert!(out.contains("event: response.content_part.done"));
+        // output_item.done 应至少有两个(reasoning close + message close)
+        let item_done_count = out.matches("event: response.output_item.done").count();
+        assert!(item_done_count >= 2);
+    }
+
+    #[tokio::test]
+    async fn final_token_without_web_search_still_emits_message_lifecycle() {
+        // PR-3 防御:无 webSearchResults 时,message lifecycle 也要走完整
+        // (open_message + delta + close 三段),只是 annotations 数组为空。
+        let lines = vec![
+            r#"{"result":{"response":{"token":"plain","messageTag":"final","isThinking":false}}}"#,
+            r#"{"result":{"response":{"isSoftStop":true}}}"#,
+        ];
+        let out = collect(convert_grok_sse_to_responses_sse(
+            build_byte_stream(lines),
+            "r".into(),
+        ))
+        .await;
+        assert!(out.contains("event: response.output_item.added"));
+        assert!(out.contains(r#""type":"message""#));
+        assert!(out.contains("event: response.content_part.added"));
+        assert!(out.contains(r#""delta":"plain""#));
+        assert!(out.contains("event: response.output_text.done"));
+        assert!(out.contains("event: response.content_part.done"));
+        // 无 annotation.added 事件
+        assert!(!out.contains("event: response.output_text.annotation.added"));
     }
 
     #[tokio::test]
