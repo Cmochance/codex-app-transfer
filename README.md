@@ -126,6 +126,7 @@ Windows 安装版和便携版默认会打开独立桌面窗口；浏览器地址
 **MiniMax 兼容**(由 [@lukegood](https://github.com/lukegood) 贡献)
 - 请求侧白名单清洗 `reasoning_effort` / `response_format` / `parallel_tool_calls` 等不支持字段;`tool` 剥 `strict`;连续 `system` 合并
 - 响应侧 `reasoning_details` 拆 reasoning + `<think>` 兜底拆分仅对 MiniMax 启用
+- **2026-05-12 issue #139 修**:MiniMax `/v1/chat/completions` 不接受 `role=system`(直接 400 `invalid message role: system (2013)`),sanitize 把所有 `role=system` 转 `role=user` + content 前缀 `[System]\n`(超过 24000 char 切片,每片独立 user message 各带前缀);MiniMax M2.x + Text-01 全部恢复可用
 
 **UI / 桌面**
 - Windows 重启 Codex 不再 flash 终端窗口 + 托盘菜单交互修复
@@ -316,6 +317,7 @@ Grouped by theme.
 **MiniMax compatibility** (contributed by [@lukegood](https://github.com/lukegood))
 - Request-side allowlist clean-up of `reasoning_effort` / `response_format` / `parallel_tool_calls` etc.; `tool` strips `strict`; consecutive `system` merged
 - Response-side `reasoning_details` split into reasoning + `<think>` fallback split scoped to MiniMax only
+- **2026-05-12 fix for issue #139**: MiniMax `/v1/chat/completions` rejects `role=system` with `400 invalid message role: system (2013)`. The sanitizer now converts every `role=system` message to `role=user` with a `[System]\n` content prefix (long content split at 24000 chars, each chunk an independent `role=user` message with its own prefix). MiniMax M2.x + Text-01 are usable again.
 
 **UI / desktop**
 - Windows Codex restart no longer flashes a terminal window + tray menu interactions fixed

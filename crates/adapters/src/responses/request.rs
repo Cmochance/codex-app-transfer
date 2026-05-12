@@ -986,7 +986,9 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
     // `stream_options.include_usage`;缺 usage 时响应转换层会补零值 usage。
     body.remove("stream_options");
     merge_consecutive_system_messages(body);
-    normalize_and_split_minimax_system_messages(body, MINIMAX_SYSTEM_MESSAGE_MAX_CHARS);
+    // **issue #139 修(2026-05-12)**:MiniMax /v1/chat/completions 不接受
+    // role=system,400 invalid role。把 system 全转 user + [System]\n prefix。
+    convert_minimax_system_to_user_prefix(body, MINIMAX_SYSTEM_MESSAGE_MAX_CHARS);
     sanitize_minimax_tool_call_arguments(body);
     sanitize_minimax_tools(body);
 
@@ -1084,13 +1086,45 @@ fn sanitize_tool_arguments_json_string(arguments: &str) -> String {
     "{}".to_owned()
 }
 
-fn normalize_and_split_minimax_system_messages(body: &mut Map<String, Value>, max_chars: usize) {
+/// MiniMax `/v1/chat/completions` **不接受 `role="system"` 的 message**
+/// (issue #139,2026-05-12 实证 M2.7 + Text-01 都返 `400 invalid params,
+/// chat content has invalid message role: system (2013)`)。
+///
+/// 本 fn 把所有 system message **转成 `role="user"` + content 前置 `[System]\n`
+/// 前缀**,模型从前缀 token 自己理解原 system role 语义(chenyme/grok2api 同
+/// pattern 在 grok_web 多轮 flatten 也已实证 work)。
+///
+/// 同时保留原 `normalize_and_split_minimax_system_messages` 的副作用:
+/// - `\r\n` → `\n`(MiniMax 对 Windows 换行敏感)
+/// - 超过 `max_chars`(24000)的 system 内容**切片成多个独立 user message**,
+///   每片用 `[System part i/N]\n` 前缀(silent-failure F4:让模型看出是同一逻辑
+///   段落的连续分片,不会误判为 N 个独立 system 指令);单段不切则用 `[System]\n`
+///
+/// **顺序依赖**:必须在 `merge_consecutive_system_messages` **之后**调用,
+/// 那一步合并相邻 system + Codex instructions 字段,**仍是 system role**;
+/// 本 fn 是 MiniMax-specific 兜底,把 system role 一次性转 user。
+///
+/// **content 形态**(silent-failure F2 修):接受 string + array of
+/// `{type:input_text|text|output_text, text:"..."}` parts(Codex CLI Responses
+/// spec 数组形)。其他形态 emit `tracing::warn!` 不静默 raw JSON stringify。
+fn convert_minimax_system_to_user_prefix(body: &mut Map<String, Value>, max_chars: usize) {
+    debug_assert!(
+        max_chars > 0,
+        "max_chars=0 会让本 fn 短路前不做 role 转换,违反 'no role=system 出本 fn' invariant"
+    );
     let Some(Value::Array(messages)) = body.get_mut("messages") else {
         return;
     };
     if max_chars == 0 {
-        return;
+        // 防御 prod 误传 0(同 debug_assert 但 release 不 panic):
+        // 仍做 role 转换,不切片(整段当一个 user message,即便超长)。
+        // **必须**保证 invariant "出本 fn 后没有 role=system"。
+        tracing::warn!(
+            error_id = "MINIMAX_SYS_CONVERT_MAX_CHARS_ZERO",
+            "convert_minimax_system_to_user_prefix 收到 max_chars=0,跳过切片但仍做 role 转换"
+        );
     }
+    const SYSTEM_PREFIX_SINGLE: &str = "[System]\n";
     let mut rewritten: Vec<Value> = Vec::with_capacity(messages.len());
     for msg in messages.drain(..) {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -1098,24 +1132,100 @@ fn normalize_and_split_minimax_system_messages(body: &mut Map<String, Value>, ma
             rewritten.push(msg);
             continue;
         }
-        let normalized = msg
-            .get("content")
-            .map(value_to_chat_string)
-            .unwrap_or_default()
-            .replace("\r\n", "\n");
-        if normalized.chars().count() <= max_chars {
-            let mut out = msg;
-            if let Some(obj) = out.as_object_mut() {
-                obj.insert("content".into(), Value::String(normalized));
-            }
-            rewritten.push(out);
+        let normalized = extract_minimax_system_text(msg.get("content")).replace("\r\n", "\n");
+        if normalized.is_empty() {
+            tracing::debug!(
+                error_id = "MINIMAX_SYS_CONVERT_EMPTY_SKIP",
+                "convert_minimax_system_to_user_prefix 跳过空 system message"
+            );
             continue;
         }
-        for chunk in split_string_by_char_limit(&normalized, max_chars) {
-            rewritten.push(json!({"role": "system", "content": chunk}));
+        if max_chars == 0 || normalized.chars().count() <= max_chars {
+            rewritten.push(json!({
+                "role": "user",
+                "content": format!("{SYSTEM_PREFIX_SINGLE}{normalized}"),
+            }));
+            continue;
+        }
+        let chunks = split_string_by_char_limit(&normalized, max_chars);
+        let total = chunks.len();
+        tracing::info!(
+            error_id = "MINIMAX_SYS_CONVERT_SPLIT",
+            original_chars = normalized.chars().count(),
+            chunks = total,
+            max_chars,
+            "convert_minimax_system_to_user_prefix 长 system 切成多段 user prefix message"
+        );
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let prefix = format!("[System part {}/{total}]\n", idx + 1);
+            rewritten.push(json!({
+                "role": "user",
+                "content": format!("{prefix}{chunk}"),
+            }));
         }
     }
     *messages = rewritten;
+}
+
+/// 抽 MiniMax system message 的 content 文本(silent-failure F2 修)。
+///
+/// 接受形态:
+/// - `Value::String(s)` → 直接返回
+/// - `Value::Array(parts)` → 抽 `parts[i].text` 字段 join `\n`(Codex CLI
+///   Responses spec 形:`[{type:"input_text", text:"..."}, ...]`)
+/// - 其他形态 → `tracing::warn!` 加 stable error_id,**不静默** raw JSON 注入
+fn extract_minimax_system_text(content: Option<&Value>) -> String {
+    let Some(c) = content else {
+        return String::new();
+    };
+    match c {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => {
+            if parts.is_empty() {
+                return String::new();
+            }
+            let texts: Vec<&str> = parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !texts.is_empty() {
+                texts.join("\n")
+            } else {
+                // 数组有 parts 但无可抽 text(eg image-only system,异常 schema):
+                // warn + 返回空,上层 skip。比注入 raw JSON 安全。
+                let part_types: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|p| p.get("type").and_then(Value::as_str))
+                    .collect();
+                tracing::warn!(
+                    error_id = "MINIMAX_SYS_CONTENT_NO_TEXT_PARTS",
+                    part_types = ?part_types,
+                    "MiniMax system message 的 content array 无 text parts,跳过"
+                );
+                String::new()
+            }
+        }
+        other => {
+            let shape = if other.is_null() {
+                "null"
+            } else if other.is_boolean() {
+                "bool"
+            } else if other.is_number() {
+                "number"
+            } else if other.is_object() {
+                "object"
+            } else {
+                "unknown"
+            };
+            tracing::warn!(
+                error_id = "MINIMAX_SYS_CONTENT_UNEXPECTED_SHAPE",
+                shape,
+                "MiniMax system message 的 content 既不是 string 也不是 array,跳过"
+            );
+            String::new()
+        }
+    }
 }
 
 fn split_string_by_char_limit(input: &str, max_chars: usize) -> Vec<String> {
@@ -2251,7 +2361,11 @@ mod tests {
     }
 
     #[test]
-    fn minimax_merges_consecutive_system_messages() {
+    fn minimax_merges_then_converts_system_to_user_prefix() {
+        // issue #139 修(2026-05-12):MiniMax /v1/chat/completions 不接受
+        // role=system,400 invalid role。先 merge_consecutive_system_messages
+        // 合并(instructions + system message 拼一段),再 convert_minimax_system_to_user_prefix
+        // 把 role 一次性转 user + content 前 `[System]\n` prefix。
         let req = json!({
             "model": "MiniMax-M2.7",
             "stream": true,
@@ -2265,9 +2379,15 @@ mod tests {
         let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "system one\n\nsystem two");
+        // 原 system message → 转 user role
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(
+            messages[0]["content"], "[System]\nsystem one\n\nsystem two",
+            "合并后的 system 段被转 user role + [System]\\n prefix"
+        );
+        // 原 user message 不动
         assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "hi");
     }
 
     #[test]
@@ -2309,7 +2429,10 @@ mod tests {
     }
 
     #[test]
-    fn minimax_normalizes_and_splits_long_system_messages() {
+    fn minimax_long_system_split_into_multiple_user_prefix_messages() {
+        // issue #139 修:超 max_chars 切片,每片独立 role=user + 标记部分编号
+        // `[System part i/N]\n` prefix(silent-failure F4:让模型看出是同一逻辑
+        // 段落的连续分片);单段不切则用 `[System]\n`。
         let long = "a".repeat(12);
         let mut body = json!({
             "model": "MiniMax-M2.7",
@@ -2321,20 +2444,159 @@ mod tests {
         .as_object()
         .expect("json object")
         .clone();
-        normalize_and_split_minimax_system_messages(&mut body, 10);
+        convert_minimax_system_to_user_prefix(&mut body, 10);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "system");
-        assert_eq!(messages[2]["role"], "system");
+        // 原 system 24-char → 切成 3 段(10 + 10 + 5)→ 3 个 user message + 1 user follow
+        assert_eq!(messages.len(), 4);
+        for i in 0..3 {
+            assert_eq!(
+                messages[i]["role"], "user",
+                "split chunk {i} should be user"
+            );
+        }
         assert_eq!(messages[3]["role"], "user");
-        let joined = format!(
-            "{}{}{}",
-            messages[0]["content"].as_str().unwrap(),
-            messages[1]["content"].as_str().unwrap(),
-            messages[2]["content"].as_str().unwrap()
-        );
+        assert_eq!(messages[3]["content"], "hi");
+        // 验证 prefix 用 part i/N 标记 + 重组原文
+        let prefixes = [
+            "[System part 1/3]\n",
+            "[System part 2/3]\n",
+            "[System part 3/3]\n",
+        ];
+        let mut joined = String::new();
+        for (i, expected_prefix) in prefixes.iter().enumerate() {
+            let content = messages[i]["content"].as_str().unwrap();
+            let chunk = content.strip_prefix(expected_prefix).unwrap_or_else(|| {
+                panic!("chunk {i} missing prefix {expected_prefix:?}, got: {content}")
+            });
+            joined.push_str(chunk);
+        }
         assert_eq!(joined, format!("{long}\n{long}"));
         assert!(!joined.contains('\r'));
+    }
+
+    #[test]
+    fn minimax_system_content_as_responses_array_form_extracts_text() {
+        // silent-failure F2 修:Codex CLI Responses spec content 数组形
+        // `[{type:"input_text", text:"..."}]` 必须抽 text 字段,不能 raw JSON stringify
+        // 塞 `[System]\n[{"type":"input_text",...}]` 给模型(那会让模型看到 JSON 噪音)
+        let mut body = json!({
+            "model": "MiniMax-M2.7",
+            "messages": [
+                {"role":"system","content": [
+                    {"type":"input_text","text":"line 1"},
+                    {"type":"input_text","text":"line 2"}
+                ]},
+                {"role":"user","content":"q"}
+            ]
+        })
+        .as_object()
+        .expect("json object")
+        .clone();
+        convert_minimax_system_to_user_prefix(&mut body, 1000);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(
+            messages[0]["content"], "[System]\nline 1\nline 2",
+            "array-form content 应抽 text join \\n,不能 raw JSON stringify"
+        );
+    }
+
+    #[test]
+    fn minimax_system_content_empty_array_or_no_text_parts_skipped() {
+        // silent-failure F2 边界:array 有 parts 但全是 image / 无 text 字段 → skip,
+        // 不注入 raw JSON 给模型
+        let mut body = json!({
+            "model": "MiniMax-M2.7",
+            "messages": [
+                {"role":"system","content": [
+                    {"type":"input_image","image_url":"x"}
+                ]},
+                {"role":"user","content":"q"}
+            ]
+        })
+        .as_object()
+        .expect("json object")
+        .clone();
+        convert_minimax_system_to_user_prefix(&mut body, 1000);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "image-only system 跳过,只剩 user");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "q");
+    }
+
+    #[test]
+    fn minimax_integration_long_system_through_public_entry() {
+        // silent-failure F7:整合 test 走 public entry `responses_body_to_chat_body_for_provider`
+        // (含 build_messages_from_input + merge_consecutive_system + sanitize_minimax_chat_body
+        // 全链路),覆盖长 system 切片场景。MAX_CHARS=24000,我们用 30000 字符 system 触发切片。
+        let long = "x".repeat(30_000);
+        let req = json!({
+            "model": "MiniMax-M2.7",
+            "stream": true,
+            "instructions": long.clone(),
+            "input": [{"type":"message","role":"user","content":"q"}]
+        });
+        let p = minimax_provider();
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        // 至少 2 段 system(30000 / 24000 = 2 切片)+ 1 user → ≥3 messages
+        assert!(messages.len() >= 3, "30000 char instructions 应切 ≥2 段");
+        // 全部应是 user role(没 system 残留)
+        for msg in messages {
+            assert_ne!(msg["role"], "system");
+        }
+        // 第一段含 [System part i/N] prefix
+        let first_content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            first_content.starts_with("[System part 1/"),
+            "切片第一段应带 part 1/N marker,got: {}",
+            &first_content[..40.min(first_content.len())]
+        );
+    }
+
+    #[test]
+    fn minimax_system_role_completely_eliminated_in_final_body() {
+        // issue #139 防御:sanitize 后 messages 数组里**绝不应**有任何 role=system
+        // (MiniMax API 直接 400 拒绝 role=system)
+        let req = json!({
+            "model": "MiniMax-M2.7",
+            "stream": true,
+            "instructions": "outer system",
+            "input": [
+                {"type":"message","role":"system","content":"inner system"},
+                {"type":"message","role":"user","content":"q"}
+            ]
+        });
+        let p = minimax_provider();
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        for msg in messages {
+            assert_ne!(
+                msg["role"], "system",
+                "MiniMax sanitize 后绝不应保留 role=system,违反 MiniMax /v1/chat/completions API"
+            );
+        }
+    }
+
+    #[test]
+    fn minimax_empty_system_content_skipped() {
+        // 防御:空 system content 不发 raw `[System]\n` 空 user message
+        let mut body = json!({
+            "model": "MiniMax-M2.7",
+            "messages": [
+                {"role":"system","content":""},
+                {"role":"user","content":"q"}
+            ]
+        })
+        .as_object()
+        .expect("json object")
+        .clone();
+        convert_minimax_system_to_user_prefix(&mut body, 1000);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "空 system 应跳过");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "q");
     }
 
     #[test]
