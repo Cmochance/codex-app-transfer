@@ -124,7 +124,14 @@ mod contract_tests {
             )
             .unwrap();
         assert_common_request_contract(&cloud_code_plan);
-        assert!(cloud_code_plan.response_session.is_none());
+        // **task 25 修(2026-05-13)**:cloud_code 之前 hardcoded `response_session: None`,
+        // 把 prod silent history loss bug 当 invariant 锁定。task 25 修复后
+        // cloud_code 也走 session cache(跟 gemini_native 主路径一致),response_session
+        // 必填 Some 让流末 converter 写 cache。
+        assert!(
+            cloud_code_plan.response_session.is_some(),
+            "task 25 修后 cloud_code 必须 emit response_session 供 SSE 流末 cache write"
+        );
     }
 
     #[test]
