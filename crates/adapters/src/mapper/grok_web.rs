@@ -73,7 +73,7 @@ pub(crate) fn prepare_grok_web_request(
     let conversion = responses_body_to_grok_request_with_session(
         &parsed,
         provider,
-        Some(global_response_session_cache()),
+        global_response_session_cache(),
     )?;
     let grok_body = serialize_grok_request(&conversion.request)?;
 
