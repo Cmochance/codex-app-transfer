@@ -200,9 +200,14 @@ fn responses_body_to_grok_request_internal(
 /// 拼接规则(参考 chenyme/grok2api 类似 pattern):
 /// - `system` / `developer` → `"System: <content>"`
 /// - `user` → `"User: <content>"`
-/// - `assistant` → `"Assistant: <content>"`
-/// - `tool` → `"Tool Result: <content>"`(grok 自己 server-side state 处理 tool,
-///   塞进文本作 context;不映射到 function_call/function_call_output schema)
+/// - `assistant` → `"Assistant: <content>"` 或 `"Assistant (tool call): name({args})"`
+///   (task 20 / code-reviewer H3 修:**Codex CLI 多轮 tool use 时 assistant
+///   message 是 `{role:"assistant", content:"", tool_calls:[...]}`** —— 空 content
+///   被原 `if content.is_empty() continue` 整段 drop,导致 grok 看不到 cause-effect
+///   chain — 后续 tool_call_output 出现就 orphan。新行为:tool_calls 非空时,渲染
+///   `Assistant (tool call): <name>(<args>)` 行,**每个 call 独立一段**)
+/// - `tool` / `function` → `"Tool Result: <content>"`(grok 自己 server-side state
+///   处理 tool,塞进文本作 context;不映射到 function_call/function_call_output schema)
 /// - 各 turn 用 `\n\n` 分隔
 ///
 /// content 兼容 string / array of {type:text|input_text|output_text, text:"..."}。
@@ -211,7 +216,24 @@ fn flatten_messages_to_grok_single_string(messages: &[Value]) -> String {
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
         let content_str = extract_message_content_text(msg.get("content"));
-        if content_str.is_empty() {
+        // task 20 / code-reviewer H3:assistant message 的 tool_calls 字段
+        // (Codex CLI 多轮 tool use 期间常见的 `{role:assistant, content:"",
+        // tool_calls:[...]}` 形态)在旧逻辑里被 content_str.is_empty() drop,
+        // grok 看不到 tool call 事实 — 用 function_call_output 续轮时 grok 觉得
+        // 是凭空冒出的 Tool Result。本段把 tool_calls 渲染成独立 prefix 段。
+        //
+        // **role gate**(silent-failure H3/H4 + code-reviewer Important #1 修):
+        // 只对 `role=="assistant"` 渲染 tool_calls。non-assistant role 含
+        // tool_calls 是协议违反,warn 后 skip,**不再用 `Assistant (tool call):`
+        // 误标其他 role 的 tool call**(那是 fabricate assistant turn,worse than
+        // silent drop)。
+        let tool_calls_rendered = if role == "assistant" {
+            render_assistant_tool_calls(msg)
+        } else {
+            warn_if_tool_calls_on_non_assistant_role(msg, role);
+            String::new()
+        };
+        if content_str.is_empty() && tool_calls_rendered.is_empty() {
             continue;
         }
         let prefix = match role {
@@ -222,14 +244,169 @@ fn flatten_messages_to_grok_single_string(messages: &[Value]) -> String {
             other if !other.is_empty() => other, // 防御未知角色:原样保留 prefix
             _ => continue,                       // 无 role 丢弃
         };
-        if !out.is_empty() {
-            out.push_str("\n\n");
+        if !content_str.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(prefix);
+            out.push_str(": ");
+            out.push_str(&content_str);
         }
-        out.push_str(prefix);
-        out.push_str(": ");
-        out.push_str(&content_str);
+        if !tool_calls_rendered.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&tool_calls_rendered);
+        }
     }
     out
+}
+
+/// non-assistant role 含 tool_calls(协议违反)warn 一次。
+fn warn_if_tool_calls_on_non_assistant_role(msg: &Value, role: &str) {
+    let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) else {
+        return;
+    };
+    if calls.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        error_id = "GROK_WEB_FLATTEN_TOOL_CALLS_ON_NON_ASSISTANT_ROLE",
+        role,
+        count = calls.len(),
+        "non-assistant message 含 tool_calls 数组(协议违反),drop 这些 tool_calls 不渲染"
+    );
+}
+
+/// 渲染 assistant message 的 `tool_calls` 数组成 grok-readable prefix 段。
+///
+/// 输入形态(OpenAI chat completions spec):
+/// ```json
+/// {"role":"assistant", "content":"", "tool_calls":[
+///   {"id":"call_abc","type":"function","function":{"name":"web_search","arguments":"{\"q\":\"x\"}"}}
+/// ]}
+/// ```
+///
+/// 输出形态:
+/// ```text
+/// Assistant (tool call): web_search({"q":"x"})
+/// ```
+///
+/// 多个 tool_calls 各占一行(用 `\n` 分隔同一 turn 内多个 call):
+/// ```text
+/// Assistant (tool call): web_search({"q":"x"})
+/// Assistant (tool call): read_file({"path":"a.rs"})
+/// ```
+///
+/// 边界处理(silent-failure-hunter + code-reviewer + type-design 共识修复):
+/// - `tool_calls` 缺失 / null → 返回空字符串
+/// - `tool_calls` 存在但**非 array**(协议违反)→ warn + 返回空字符串
+/// - `tool_calls` 空 array → 返回空字符串
+/// - 单个 call 不是 object → warn + skip 该 call
+/// - tool_call 缺 `function.name` → 该条记为 `<unknown>` 名字(**HIGH-1**:整批
+///   nameless 时也要保留占位行,否则后续 `tool` role 续轮失去 anchor 出现 orphan
+///   Tool Result),warn 一次。
+/// - `function.arguments` 缺失 / null / 空字符串 → 当 empty object `{}`(标准约定)
+/// - `function.arguments` **是 object / array**(非 OpenAI 标准但 chenyme/grok2api
+///   类历史输入见过)→ 用 `serde_json::to_string` 序列化(**HIGH-2 修**:不再
+///   silent `{}`)
+/// - args 内的换行折叠为空格(防止 `Assistant (tool call): ... \n ...` 误读为
+///   下一段 prefix)
+/// - 调用方负责 role gate(只对 `role=="assistant"` 调本 fn);non-assistant role
+///   含 tool_calls 由 caller 的 `warn_if_tool_calls_on_non_assistant_role` 处理
+fn render_assistant_tool_calls(msg: &Value) -> String {
+    let Some(raw_tool_calls) = msg.get("tool_calls") else {
+        return String::new();
+    };
+    if raw_tool_calls.is_null() {
+        return String::new();
+    }
+    let Some(calls) = raw_tool_calls.as_array() else {
+        tracing::warn!(
+            error_id = "GROK_WEB_FLATTEN_TOOL_CALLS_NOT_ARRAY",
+            kind = json_value_kind(raw_tool_calls),
+            "assistant message 的 tool_calls 字段不是 array(协议违反),drop"
+        );
+        return String::new();
+    };
+    if calls.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(calls.len());
+    for call in calls {
+        if !call.is_object() {
+            tracing::warn!(
+                error_id = "GROK_WEB_FLATTEN_TOOL_CALL_NOT_OBJECT",
+                kind = json_value_kind(call),
+                "tool_calls 数组元素不是 object(协议违反),skip 该条"
+            );
+            continue;
+        }
+        let function = call.get("function");
+        let name = function
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    error_id = "GROK_WEB_FLATTEN_TOOL_CALL_NO_NAME",
+                    "tool_call 缺 function.name,用 <unknown> 占位保留 anchor 防 orphan Tool Result"
+                );
+                "<unknown>".to_owned()
+            });
+        let args_owned = render_tool_call_arguments(function.and_then(|f| f.get("arguments")));
+        let args_one_line = if args_owned.contains('\n') {
+            args_owned.replace('\n', " ")
+        } else {
+            args_owned
+        };
+        lines.push(format!("Assistant (tool call): {name}({args_one_line})"));
+    }
+    lines.join("\n")
+}
+
+/// arguments 字段渲染。
+///
+/// OpenAI 协议规定 `function.arguments` 是 **string**(已 JSON 序列化的 args),
+/// 但实际有不少上游 / mock / 历史代码直接发 object/array。本 fn 容忍这两种形态:
+/// - string 非空 → 原样返回(**不做 JSON 验证**,grok 看得懂 raw blob 即可)
+/// - string 空 → `"{}"`
+/// - object / array → `serde_json::to_string` 序列化(silent-failure HIGH-2 修)
+/// - null / 缺失 → `"{}"`
+/// - 其他标量(number / bool)→ `serde_json::to_string` 序列化(虽不合理,
+///   但渲染让 user 看到比 silent `{}` 强)
+fn render_tool_call_arguments(args: Option<&Value>) -> String {
+    let Some(value) = args else {
+        return "{}".to_owned();
+    };
+    if value.is_null() {
+        return "{}".to_owned();
+    }
+    if let Some(s) = value.as_str() {
+        if s.is_empty() {
+            return "{}".to_owned();
+        }
+        return s.to_owned();
+    }
+    serde_json::to_string(value).unwrap_or_else(|err| {
+        tracing::warn!(
+            error_id = "GROK_WEB_FLATTEN_TOOL_CALL_ARGS_SERIALIZE_FAIL",
+            error = %err,
+            "tool_call arguments 序列化失败,fallback {{}}"
+        );
+        "{}".to_owned()
+    })
+}
+
+fn json_value_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 /// 抽 chat message 的 content 字段成 text(兼容 string / array of parts)。
@@ -462,6 +639,289 @@ mod tests {
             req.message,
             "User: first user\n\nAssistant: model reply\n\nUser: second user"
         );
+    }
+
+    // ── task 20 / code-reviewer H3:tool_calls flatten ──────────────────
+
+    #[test]
+    fn assistant_with_only_tool_calls_renders_tool_call_segment() {
+        // 核心修复:Codex CLI 多轮 tool use 期间 assistant message 形态:
+        // `{role:"assistant", content:"", tool_calls:[...]}`,旧实现 content_str
+        // 空 → 整段 drop → grok 看不到 cause-effect chain → 后续 tool_call_output
+        // orphan。新实现 emit `Assistant (tool call): name(args)`。
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "web_search", "arguments": r#"{"q":"hello"}"#}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(out, r#"Assistant (tool call): web_search({"q":"hello"})"#);
+    }
+
+    #[test]
+    fn assistant_multiple_tool_calls_each_get_own_line() {
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "search", "arguments": r#"{"q":"x"}"#}},
+                {"function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(
+            out,
+            "Assistant (tool call): search({\"q\":\"x\"})\nAssistant (tool call): read_file({\"path\":\"a.rs\"})"
+        );
+    }
+
+    #[test]
+    fn assistant_with_content_and_tool_calls_renders_both() {
+        // assistant 同时有 text response 跟 tool_call 时,两段都 emit
+        // (content 先,tool_calls 后,各自 \n\n 分隔)
+        let messages = [json!({
+            "role": "assistant",
+            "content": "let me search",
+            "tool_calls": [
+                {"function": {"name": "web_search", "arguments": r#"{"q":"x"}"#}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(
+            out,
+            "Assistant: let me search\n\nAssistant (tool call): web_search({\"q\":\"x\"})"
+        );
+    }
+
+    #[test]
+    fn tool_call_then_tool_result_full_chain_flattened() {
+        // 完整 cause-effect chain:user → assistant tool_call → tool result → user follow
+        // MED-8 修:除了存在性,还要验**顺序**(顺序错位 grok 仍然误读)。
+        let messages = [
+            json!({"role": "user", "content": "search rust"}),
+            json!({"role": "assistant", "content": "",
+                   "tool_calls": [{"function": {"name": "web_search", "arguments": r#"{"q":"rust"}"#}}]}),
+            json!({"role": "tool", "content": r#"{"results":["..."]}"#}),
+            json!({"role": "assistant", "content": "Rust is..."}),
+            json!({"role": "user", "content": "tell me more"}),
+        ];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        let pos_user1 = out.find("User: search rust").expect("user1 present");
+        let pos_call = out
+            .find(r#"Assistant (tool call): web_search({"q":"rust"})"#)
+            .unwrap_or_else(|| panic!("tool_call segment missing, got: {out}"));
+        let pos_result = out
+            .find(r#"Tool Result: {"results":["..."]}"#)
+            .expect("tool result present");
+        let pos_asst2 = out.find("Assistant: Rust is...").expect("asst2 present");
+        let pos_user2 = out.find("User: tell me more").expect("user2 present");
+        assert!(
+            pos_user1 < pos_call
+                && pos_call < pos_result
+                && pos_result < pos_asst2
+                && pos_asst2 < pos_user2,
+            "cause-effect chain 顺序错,grok 会把 Tool Result 当成无来源数据: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_call_missing_name_uses_unknown_placeholder() {
+        // **HIGH-1 修**:某 tool_call 缺 function.name 时,**emit `<unknown>` 占位**
+        // 而不是 silent skip。原因:整批 nameless 时若全 skip,后续 `tool` role
+        // 的 Tool Result 段失去 anchor → orphan(grok 看到 "Tool Result: ..."
+        // 凭空冒出),正是 task 20 要修的整体 chain break 病根。
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"arguments": r#"{"x":1}"#}}, // 无 name
+                {"function": {"name": "good_call", "arguments": "{}"}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(
+            out,
+            "Assistant (tool call): <unknown>({\"x\":1})\nAssistant (tool call): good_call({})",
+            "nameless call 应用 <unknown> 占位保留 anchor"
+        );
+    }
+
+    #[test]
+    fn all_nameless_tool_calls_still_emit_anchor_for_orphan_prevention() {
+        // **HIGH-1 关键 case**:整批 tool_calls 都 nameless 时,旧实现整段 drop,
+        // 后续 Tool Result 变 orphan。新实现保留 `<unknown>` 占位 anchor。
+        let messages = [
+            json!({"role": "assistant", "content": "",
+                   "tool_calls": [{"function": {"arguments": r#"{"q":"x"}"#}}]}),
+            json!({"role": "tool", "content": "result data"}),
+        ];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        let pos_call = out
+            .find("Assistant (tool call): <unknown>")
+            .expect("placeholder anchor must be emitted");
+        let pos_result = out.find("Tool Result:").expect("tool result emitted");
+        assert!(
+            pos_call < pos_result,
+            "Tool Result 必须有前置 anchor,否则 grok 看不出来源: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_call_missing_arguments_uses_empty_object() {
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "no_args"}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(out, "Assistant (tool call): no_args({})");
+    }
+
+    #[test]
+    fn empty_tool_calls_array_treated_as_no_tool_calls() {
+        // tool_calls 字段存在但空 array → 跟 absent 等价,assistant 段不 emit
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": []
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert!(out.is_empty(), "空 tool_calls + 空 content 应整段 drop");
+    }
+
+    #[test]
+    fn tool_call_arguments_as_object_gets_serialized() {
+        // **HIGH-2 修**:OpenAI 协议 arguments 是 string,但实际 mock / 上游历史
+        // 代码常常直接发 object → 旧实现 `as_str` 失败后 silent `{}` → grok 拿到
+        // 假 args → tool call 行为偏差。新实现 `serde_json::to_string` 序列化。
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "fn1", "arguments": {"k": "v", "n": 42}}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        // serde_json 输出 key 顺序按 insertion(serde_json 默认 BTreeMap 排序受 features 控制)
+        // 用 contains 验关键字段保 robust
+        assert!(
+            out.starts_with("Assistant (tool call): fn1("),
+            "prefix shape wrong: {out}"
+        );
+        assert!(
+            out.contains(r#""k":"v""#),
+            "k:v should be serialized: {out}"
+        );
+        assert!(
+            out.contains(r#""n":42"#),
+            "n:42 should be serialized: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_call_arguments_empty_string_uses_empty_object() {
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "fn1", "arguments": ""}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(out, "Assistant (tool call): fn1({})");
+    }
+
+    #[test]
+    fn tool_call_arguments_null_uses_empty_object() {
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "fn1", "arguments": null}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(out, "Assistant (tool call): fn1({})");
+    }
+
+    #[test]
+    fn tool_call_arguments_with_newlines_collapsed() {
+        // args 含 \n 会被 grok 误读为下一段 prefix(`Assistant (tool call): xx(\n
+        // {...}\n)` 第二段 grok 看到 `{...}` 不再认 Assistant 段)。新实现折叠
+        // \n → ' '。
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "fn1", "arguments": "{\n  \"q\": \"x\"\n}"}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert!(
+            !out.contains('\n') || out.matches('\n').count() == 0,
+            "no \\n inside the tool_call line: {out}"
+        );
+    }
+
+    #[test]
+    fn non_assistant_role_with_tool_calls_dropped_not_mislabeled() {
+        // **HIGH-3 / HIGH-4 修**:system / user / tool role 含 tool_calls 是协议
+        // 违反。旧实现会用 "Assistant (tool call):" prefix 渲染 → fabricate
+        // assistant turn(比 silent drop 更糟)。新实现 caller gate:non-assistant
+        // 不调 render fn,且会 warn,不 emit。
+        let messages = [
+            json!({
+                "role": "system",
+                "content": "you are helpful",
+                "tool_calls": [{"function": {"name": "ghost", "arguments": "{}"}}]
+            }),
+            json!({"role": "user", "content": "real user msg"}),
+        ];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert!(
+            !out.contains("Assistant (tool call): ghost"),
+            "system role 的 tool_calls 不能误标为 Assistant: {out}"
+        );
+        assert!(
+            out.contains("System: you are helpful"),
+            "system content 保留"
+        );
+        assert!(out.contains("User: real user msg"), "user content 保留");
+    }
+
+    #[test]
+    fn tool_calls_not_array_dropped_with_warn() {
+        // tool_calls 字段是 object / string(协议违反)→ warn + drop,不 panic
+        let messages = [json!({
+            "role": "assistant",
+            "content": "hi",
+            "tool_calls": "not an array"
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(
+            out, "Assistant: hi",
+            "非 array tool_calls drop,content 保留"
+        );
+    }
+
+    #[test]
+    fn tool_calls_with_null_element_skipped() {
+        // 单个 call 不是 object(null / 标量)→ skip 该条,其他正常
+        let messages = [json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                null,
+                {"function": {"name": "real_call", "arguments": "{}"}}
+            ]
+        })];
+        let out = flatten_messages_to_grok_single_string(&messages);
+        assert_eq!(out, "Assistant (tool call): real_call({})");
     }
 
     #[test]
