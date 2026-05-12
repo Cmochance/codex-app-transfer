@@ -177,8 +177,28 @@ pub fn responses_body_to_normalized_chat(body: &Value) -> Result<Value, AdapterE
 
     // P2 收敛:messages + previous_response_id 恢复 + tool_call_cache 修复接线
     // 统一复用 responses 输入主管道,避免 gemini_native 维护一套独立映射实现。
-    let conversion =
-        crate::responses::responses_body_to_chat_body_for_provider_with_session(body, None, None)?;
+    //
+    // **task 24 HIGH-1 修(2026-05-13)**:本 fn 仅做 chat-shape 归一化(不拉历史 —
+    // 历史在 `responses_body_to_gemini_request_with_session` 上层用真实 cache
+    // 重新调一遍 core fn 拿)。如果直接把含 `previous_response_id` 的 body 传给
+    // core fn,core/input.rs 的 `CORE_INPUT_PREV_ID_WITHOUT_CACHE` warn 会**每个
+    // gemini 多轮请求误报一次**(prod 噪音 + 让真问题埋没)。
+    //
+    // 解法:clone body + 删 prev_id 字段后再调 core fn。core fn 在 line 34
+    // (`previous_response_id.is_empty()`)直接 early return,不进 warn 分支,
+    // 也不需要 cache。chat-shape 归一化语义不变。
+    let body_for_normalize = if body_obj.contains_key("previous_response_id") {
+        let mut cloned = body_obj.clone();
+        cloned.remove("previous_response_id");
+        Value::Object(cloned)
+    } else {
+        body.clone()
+    };
+    let conversion = crate::responses::responses_body_to_chat_body_for_provider_with_session(
+        &body_for_normalize,
+        None,
+        None,
+    )?;
     let mut chat_body =
         conversion.body.as_object().cloned().ok_or_else(|| {
             AdapterError::Internal("responses conversion must return object".into())
