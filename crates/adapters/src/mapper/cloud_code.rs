@@ -323,8 +323,29 @@ pub(crate) fn prepare_cloud_code_request(
     let flavor = CloudCodeApiFlavor::from_api_format(&provider.api_format);
     let project_id = resolve_cloud_code_project_id(provider)?;
 
-    let inner = crate::gemini_native::request::responses_body_to_gemini_request(&parsed, provider)?;
-    let mut inner_value = serde_json::to_value(&inner).map_err(AdapterError::BodyDecode)?;
+    // **task 25 / silent-failure-hunter PR #145 HIGH-2 修(2026-05-13)**:旧
+    // 实现调 `responses_body_to_gemini_request`(无 _with_session 版本),完全
+    // 不传 session_cache → cloud_code prod 路径(gemini_cli OAuth)multi-turn
+    // 历史完全丢失,autocompact / function_call_output 全断,触发 task #24 加
+    // 的 `CORE_INPUT_PREV_ID_WITHOUT_CACHE` warn。
+    //
+    // 修复:改用 `_with_session` + `global_response_session_cache()`,跟 gemini_native
+    // mapper(主路径 `mapper/gemini_native.rs:63-67`)对齐。response_session 同步
+    // 注入 RequestPlan,让 SSE 流末 converter 把 user+assistant messages append
+    // 进 cache 供下轮 `previous_response_id` 拉历史。
+    //
+    // OAuth 路径跟 API key 路径共用同一全局 cache(`~/.codex-app-transfer/sessions.db`)。
+    // 不需要 user/session 隔离 — `response_id` 形如 `resp_<unix_nanos_hex>`
+    // (`core/input::response_id_for_session()`),OAuth 跟 API key 走**同一个生成器**,
+    // collision domain 跟既有 gemini_native 主路径完全一致,本 PR 不引入新碰撞风险;
+    // 切换用户重新 OAuth 后旧 response_id 不可能被新 session 反查到,行为天然隔离。
+    let conversion = crate::gemini_native::request::responses_body_to_gemini_request_with_session(
+        &parsed,
+        provider,
+        Some(crate::responses::session::global_response_session_cache()),
+    )?;
+    let mut inner_value =
+        serde_json::to_value(&conversion.request).map_err(AdapterError::BodyDecode)?;
     apply_cloud_code_request_compat(&mut inner_value, flavor);
 
     let outer = wrap_cloud_code_envelope(&model, &project_id, inner_value).map_err(|e| {
@@ -342,7 +363,7 @@ pub(crate) fn prepare_cloud_code_request(
     Ok(RequestPlan {
         upstream_path: cloud_code_upstream_path(stream),
         body: bytes::Bytes::from(outer_body),
-        response_session: None,
+        response_session: Some(conversion.response_session),
         is_compact: false,
         original_responses_request: Some(parsed),
     })
