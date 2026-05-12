@@ -138,7 +138,10 @@ impl ResponseSessionCache {
 
         // L2 sqlite write-through(毫秒级)。失败仅 log,不影响 L1。
         if let Err(e) = self.persist_save(response_id, &messages) {
-            log_db_warning(&format!("sessions.db save failed: {e}"));
+            log_db_warning(
+                "SESSIONS_DB_SAVE_FAILED",
+                format!("save response_id={response_id} failed: {e}"),
+            );
         }
     }
 
@@ -182,7 +185,10 @@ impl ResponseSessionCache {
             }
             Ok(None) => None,
             Err(e) => {
-                log_db_warning(&format!("sessions.db load failed: {e}"));
+                log_db_warning(
+                    "SESSIONS_DB_LOAD_FAILED",
+                    format!("load response_id={response_id} failed: {e}"),
+                );
                 None
             }
         }
@@ -219,7 +225,11 @@ impl ResponseSessionCache {
             return Ok(0);
         };
         conn.execute("DELETE FROM response_sessions", [])
-            .map_err(|e| format!("sessions.db clear failed: {e}"))
+            .map_err(|e| {
+                let detail = format!("clear failed: {e}");
+                log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
+                detail
+            })
     }
 
     /// 启动时清 L2 过期 entry(`last_access_unix < now - persisted_ttl`)。
@@ -241,7 +251,23 @@ impl ResponseSessionCache {
         let Some(conn) = guard.as_mut() else {
             return Ok(());
         };
-        let json = serde_json::to_string(messages).unwrap_or_else(|_| "[]".to_owned());
+        // **silent-failure H1 修**:旧实现 `unwrap_or_else(|_| "[]")` 让编码失败
+        // 静默覆盖原本有效的 row(`ON CONFLICT DO UPDATE`)→ 后续 get 返空历史 →
+        // 用户视角是 silent context loss。新实现编码失败 warn + **跳过本次写入**
+        // 让 L2 原 row 保留(L1 内存层已 save,本轮请求仍正常)。
+        let json = match serde_json::to_string(messages) {
+            Ok(s) => s,
+            Err(e) => {
+                log_db_warning(
+                    "SESSIONS_DB_SAVE_ENCODE_FAILED",
+                    format!(
+                        "json encode failed for response_id={response_id}, \
+                         skip L2 write to preserve any prior row: {e}"
+                    ),
+                );
+                return Ok(());
+            }
+        };
         let now = unix_now();
         conn.execute(
             "INSERT INTO response_sessions \
@@ -274,19 +300,42 @@ impl ResponseSessionCache {
             return Ok(None);
         };
         // 命中后更新 last_access_unix(顺手 +access_count 便于将来观测)
+        // **silent-failure H2 修**:旧 `let _ = ...` 静默 UPDATE 失败 → row 的
+        // `last_access_unix` 永远不前进 → 下次 `evict_expired_persisted` 把活会话
+        // 当过期删 → 用户视角 history 凭空消失。新实现 warn 不 panic,let read
+        // 路径仍 return 数据。
         let now = unix_now();
-        let _ = conn.execute(
+        if let Err(e) = conn.execute(
             "UPDATE response_sessions SET last_access_unix = ?1, access_count = access_count + 1 \
              WHERE response_id = ?2",
             params![now, response_id],
-        );
+        ) {
+            log_db_warning(
+                "SESSIONS_DB_TOUCH_FAILED",
+                format!(
+                    "last_access_unix UPDATE failed for response_id={response_id} \
+                     (read served from L2,but TTL refresh skipped — row 可能被 evict): {e}"
+                ),
+            );
+        }
         match serde_json::from_str::<Vec<Value>>(&json) {
             Ok(messages) => Ok(Some(messages)),
-            Err(_) => {
-                // 历史格式损坏 → 删除该行,当 miss 处理
-                let _ = conn.execute(
+            Err(parse_err) => {
+                // 历史格式损坏 → 删除该行,当 miss 处理。
+                // **F6 follow-up**(code-reviewer IMPORTANT #2 修):旧实现 silent
+                // delete,operator 无从观测数据损坏率。新实现 emit warn 让磁盘
+                // corruption / schema drift / 手工编辑 db 等异常路径有信号。
+                let delete_result = conn.execute(
                     "DELETE FROM response_sessions WHERE response_id = ?1",
                     params![response_id],
+                );
+                log_db_warning(
+                    "SESSIONS_DB_ROW_CORRUPT",
+                    format!(
+                        "messages_json parse failed for response_id={response_id} \
+                         (delete_ok={}): {parse_err}",
+                        delete_result.is_ok()
+                    ),
                 );
                 Ok(None)
             }
@@ -315,13 +364,34 @@ fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .unwrap_or_else(|e| {
+            // **silent-failure M4 修**:SystemTime pre-epoch(系统时钟漂移到
+            // 1970 前)极罕见但会让 TTL evict 全 no-op + 新 row created_unix=0,
+            // 默默丢失观测;此处 warn 一次保留信号。
+            log_db_warning(
+                "SESSIONS_DB_CLOCK_PRE_EPOCH",
+                format!("SystemTime before UNIX_EPOCH: {e} — falling back to 0"),
+            );
+            0
+        })
 }
 
 /// 初始化 sqlite db。schema 检测 + 不匹配时备份 + 重建。
 fn init_db(db_path: &Path, _persisted_ttl: Duration) -> rusqlite::Result<Connection> {
     if let Some(parent) = db_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        // **silent-failure M1 修**:旧 `let _ = create_dir_all` 让 fs 错误被
+        // 后续 `Connection::open` 的 generic sqlite error 掩盖。warn 让 operator
+        // 知道根因是 fs perm / parent-is-file 还是 sqlite 真坏。
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log_db_warning(
+                "SESSIONS_DB_PARENT_DIR_FAILED",
+                format!(
+                    "create_dir_all({}) failed: {e} — Connection::open 可能也会失败,\
+                     真根因是 fs 不是 sqlite",
+                    parent.display()
+                ),
+            );
+        }
     }
     let conn = open_db_with_pragmas(db_path)?;
     if needs_rebuild(&conn)? {
@@ -338,10 +408,23 @@ fn init_db(db_path: &Path, _persisted_ttl: Duration) -> rusqlite::Result<Connect
 fn open_db_with_pragmas(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     // WAL = 单写多读不互锁,显著提升并发读性能(代理常见用法)
-    let _ = conn.pragma_update(None, "journal_mode", "WAL");
     // synchronous=NORMAL = 放松 fsync 频率,在系统崩溃时可能丢最后几条但
     // 不会损坏 db。session cache 重建即可,可接受。
-    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    // **silent-failure M2 修**:pragma 失败(read-only FS / 网络 mount)会让
+    // doc-comment 的"WAL 单写多读"承诺破裂 + 并发降级,旧 `let _ =` 静默 → 没
+    // 人看得到。emit warn 不 fail open(degrade 仍能跑,只是慢)。
+    if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
+        log_db_warning(
+            "SESSIONS_DB_PRAGMA_FAILED",
+            format!("pragma journal_mode=WAL failed: {e} — concurrent reads will block writes"),
+        );
+    }
+    if let Err(e) = conn.pragma_update(None, "synchronous", "NORMAL") {
+        log_db_warning(
+            "SESSIONS_DB_PRAGMA_FAILED",
+            format!("pragma synchronous=NORMAL failed: {e} — fsync frequency unchanged"),
+        );
+    }
     Ok(conn)
 }
 
@@ -408,18 +491,74 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 
 fn backup_corrupt_db(db_path: &Path) {
     let bak = PathBuf::from(format!("{}.bak.{}", db_path.display(), unix_now()));
-    let _ = std::fs::rename(db_path, &bak);
-    log_db_warning(&format!(
-        "sessions.db schema mismatch — backed up to {} and rebuilding empty db",
-        bak.display()
-    ));
+    // **silent-failure M3 修**:旧 `let _ = rename(...)` 静默 → rename 失败时
+    // 后续会基于**原 corrupt db** 重建 schema(可能成功也可能挂);上层 warn
+    // 文案仍宣称"backed up + rebuilding",撒谎给 operator。新实现区分两条
+    // 路径,rename 失败时换 error_id 让 operator 看到真实状态。
+    match std::fs::rename(db_path, &bak) {
+        Ok(()) => log_db_warning(
+            "SESSIONS_DB_SCHEMA_MISMATCH",
+            format!(
+                "schema mismatch at {} — backed up to {} and rebuilding empty db",
+                db_path.display(),
+                bak.display()
+            ),
+        ),
+        Err(e) => log_db_warning(
+            "SESSIONS_DB_BACKUP_FAILED",
+            format!(
+                "schema mismatch at {} but backup rename to {} failed: {e} — \
+                 重建会基于 corrupt db,可能继续异常",
+                db_path.display(),
+                bak.display()
+            ),
+        ),
+    }
 }
 
-fn log_db_warning(msg: &str) {
-    // 这里不直接依赖 proxy::telemetry(避免循环依赖),用 eprintln 让 log file
-    // 路径由调用方上层捕获(Tauri 默认把 stderr 重定向到 ~/.codex-app-transfer
-    // /logs/proxy-<date>.log)。
-    eprintln!("warning: {msg}");
+/// L2 sqlite 失败 surface(F6 修):
+///
+/// 既走 `tracing::warn!`(带 **stable `error_id`** 字段)让 telemetry pipeline /
+/// log search / 任何 tracing subscriber 都能定位 + 聚合,又**保留 `eprintln!`
+/// 兜底** — proxy 启动时把 stderr 重定向到 `~/.codex-app-transfer/logs/proxy-
+/// <date>.log`,即便 tracing subscriber 未配 / panic,这条日志仍能落盘。
+///
+/// `error_id` 是稳定 token,grep / metrics rollup 用,**不要随版本改**:
+///
+/// 上层失败:
+/// - `SESSIONS_DB_INIT_FAILED` — sqlite 打不开 / schema 建不出来,fallback 纯内存
+/// - `SESSIONS_DB_SAVE_FAILED` — write-through INSERT/UPDATE 失败(L1 未受影响)
+/// - `SESSIONS_DB_LOAD_FAILED` — SELECT 失败,本次 get 返 None
+/// - `SESSIONS_DB_SCHEMA_MISMATCH` — schema_version 不匹配,db 已备份重建
+/// - `SESSIONS_DB_CLEAR_FAILED` — admin DELETE 失败(也通过 Result 返调用方)
+/// - `SESSIONS_DB_EVICT_FAILED` — 过期清理失败(non-fatal,启动时 best-effort)
+///
+/// 子路径失败(silent-failure-hunter task 21 追加):
+/// - `SESSIONS_DB_SAVE_ENCODE_FAILED` — `serde_json::to_string(messages)` 失败,
+///   **跳过本次 L2 写入**保留原 row(防 silent context loss,H1)
+/// - `SESSIONS_DB_TOUCH_FAILED` — read 命中后 `last_access_unix` UPDATE 失败,
+///   row 可能被错 evict(H2)
+/// - `SESSIONS_DB_ROW_CORRUPT` — `messages_json` parse 失败,该 row 已删(code-reviewer #2)
+/// - `SESSIONS_DB_PARENT_DIR_FAILED` — `create_dir_all` 失败,sqlite 错误根因是 fs(M1)
+/// - `SESSIONS_DB_PRAGMA_FAILED` — `journal_mode=WAL` / `synchronous=NORMAL` 失败,
+///   并发 / fsync 行为退化(M2)
+/// - `SESSIONS_DB_BACKUP_FAILED` — schema-mismatch 时 rename 失败,后续重建基于
+///   corrupt db,可能继续异常(M3)
+/// - `SESSIONS_DB_CLOCK_PRE_EPOCH` — `SystemTime::now() < UNIX_EPOCH`,TTL evict
+///   退化为 no-op(M4)
+///
+/// `error_id` 必须用 `&'static str`(literal)以保跨版本稳定;`detail` 给人类
+/// 阅读的上下文(path / error message),不进 metric label。
+///
+/// **deferred suggestion**(type-design-analyzer):升级为 `enum SessionDbErrorId`
+/// 获取 compile-time enforcement。本 PR 暂用 literal 跟 codebase 其他
+/// `tracing::warn!(error_id=...)` 用法一致(`tool_call_cache.rs` / `request.rs`
+/// 同模式),若未来 error_id 数量翻倍或出现拼写漂移再升级。
+fn log_db_warning(error_id: &'static str, detail: String) {
+    tracing::warn!(error_id, detail = %detail, "sessions.db");
+    // 兼容老路径:Tauri proxy log file 收 stderr,保留 eprintln 兜底防 tracing
+    // subscriber 未初始化(早期启动期 / unit test)时丢日志。
+    eprintln!("warning: [{error_id}] {detail}");
 }
 
 /// 全局单例,生产代理路径用。
@@ -440,11 +579,11 @@ pub fn global_response_session_cache() -> &'static ResponseSessionCache {
                     &path,
                 );
                 if let Some(msg) = warn {
-                    log_db_warning(&msg);
+                    log_db_warning("SESSIONS_DB_INIT_FAILED", msg);
                 }
                 // 启动时清一遍 L2 过期 row;失败仅 log
                 if let Err(e) = cache.evict_expired_persisted() {
-                    log_db_warning(&e);
+                    log_db_warning("SESSIONS_DB_EVICT_FAILED", e);
                 }
                 cache
             }
