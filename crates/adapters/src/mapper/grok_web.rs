@@ -12,11 +12,13 @@ use http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode};
 use serde_json::Value;
 
 use crate::grok_web::{
-    auth::generate_uuid_v4,
-    request::{responses_body_to_grok_request, serialize_grok_request, GROK_CHAT_PATH},
+    request::{
+        responses_body_to_grok_request_with_session, serialize_grok_request, GROK_CHAT_PATH,
+    },
     response::{convert_grok_error_to_responses_failure_stream, convert_grok_sse_to_responses_sse},
 };
 use crate::mapper::{RequestMapper, ResponseMapper};
+use crate::responses::global_response_session_cache;
 use crate::types::{AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -54,23 +56,31 @@ impl ResponseMapper for GrokWebMapper {
 
 /// grok_web 请求侧:Codex Responses body → grok chat payload + headers。
 ///
-/// R3 PoC 暂不支持 `/responses/compact`(grok.com 后端不暴露独立 compact endpoint);
-/// 如果 client_path 是 compact,fallback 当普通 chat 请求处理 + warn log。
+/// **多轮上下文 + autocompact**(2026-05-12 task 18,对齐 ARCHITECTURE_PROTOCOL_GUIDE):
+/// 接 `global_response_session_cache()`(L1 LRU + L2 SQLite 持久化
+/// `~/.codex-app-transfer/sessions.db`,30 天 TTL),走 `core::input` 共性
+/// 历史拼接 + `responses/compact.rs` 三种 compaction variant 自动展开。
+/// 双保险:client 端历史 flatten 进 grok message + grok 服务端 DAG 用
+/// `parent_response_id`(`ParentResponseTracker` 命中时传)。
+///
+/// `/responses/compact` 端点 grok.com 后端不暴露(R3 PoC 注释),目前 mapper
+/// 也是 fallback 当普通 chat 请求处理,后续可加 compact 短路。
 pub(crate) fn prepare_grok_web_request(
     body: Bytes,
     provider: &Provider,
 ) -> Result<RequestPlan, AdapterError> {
     let parsed: Value = serde_json::from_slice(&body)?;
-    let grok_req = responses_body_to_grok_request(&parsed, provider)?;
-    let grok_body = serialize_grok_request(&grok_req)?;
-
-    // R3 PoC:暂不维护 session,后续 R1 用 ParentResponseTracker.record 在响应侧
-    // 流末把(client 看到的 response_id, grok 返回的 modelResponse.responseId)记入。
+    let conversion = responses_body_to_grok_request_with_session(
+        &parsed,
+        provider,
+        Some(global_response_session_cache()),
+    )?;
+    let grok_body = serialize_grok_request(&conversion.request)?;
 
     Ok(RequestPlan {
         upstream_path: GROK_CHAT_PATH.to_owned(),
         body: grok_body,
-        response_session: None,
+        response_session: Some(conversion.response_session),
         is_compact: false,
         original_responses_request: Some(parsed),
     })
@@ -91,9 +101,20 @@ pub(crate) fn transform_grok_web_response_stream(
     _upstream_headers: HeaderMap,
     upstream_stream: ByteStream,
     _provider: &Provider,
-    _request_plan: &RequestPlan,
+    request_plan: &RequestPlan,
 ) -> Result<ResponsePlan, AdapterError> {
-    let response_id = format!("resp_grok_{}", generate_uuid_v4());
+    // **task 18 code-reviewer C2 修**:SSE response_id 必须 **复用 RequestPlan
+    // 里 response_session.response_id**(由 `responses_body_to_grok_request_with_session`
+    // 一次性铸造)。否则:
+    //   - response_session.response_id 作 cache key 写盘
+    //   - SSE event 用另一个 `resp_grok_<uuid>` 给客户端
+    //   - 下轮客户端拿 SSE id 查 cache → key mismatch → 永远 miss
+    // 没 response_session(eg fallback test fixture)时,fall back 到 `resp_grok_<uuid>`。
+    let response_id = request_plan
+        .response_session
+        .as_ref()
+        .map(|s| s.response_id.clone())
+        .unwrap_or_else(|| format!("resp_grok_{}", crate::grok_web::auth::generate_uuid_v4()));
 
     if !upstream_status.is_success() {
         // 翻译成合规 Responses failure SSE 流(review-feedback A1):
@@ -111,7 +132,11 @@ pub(crate) fn transform_grok_web_response_stream(
         });
     }
 
-    let downstream = convert_grok_sse_to_responses_sse(upstream_stream, response_id);
+    // **C1 修**:把 RequestPlan.response_session clone 进 ConvState,流末 save
+    // 累积的 assistant text 到 global cache,下轮 previous_response_id 可命中。
+    let response_session = request_plan.response_session.clone();
+    let downstream =
+        convert_grok_sse_to_responses_sse(upstream_stream, response_id, response_session);
     Ok(ResponsePlan {
         status: StatusCode::OK,
         headers: build_sse_headers(),

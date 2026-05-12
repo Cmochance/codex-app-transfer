@@ -84,6 +84,7 @@ pub(crate) fn extract_response_frame(envelope: &serde_json::Value) -> Option<Gro
 pub fn convert_grok_sse_to_responses_sse(
     upstream_stream: ByteStream,
     response_id: String,
+    response_session: Option<crate::types::ResponseSessionPlan>,
 ) -> ByteStream {
     let mut state = ConvState {
         upstream: upstream_stream,
@@ -99,6 +100,8 @@ pub fn convert_grok_sse_to_responses_sse(
         pending_url_citations: Vec::new(),
         grok_render_strip: GrokRenderStrip::new(),
         sequence_number: 0,
+        response_session,
+        cache_save_done: false,
     };
     // 先把 response.created 塞进 pending(unfold 第一步立即 yield),
     // 并把 sequence_number 注入 — state.sequence_number 从 0 起,emit_response_created
@@ -158,6 +161,11 @@ pub fn convert_grok_sse_to_responses_sse(
                         // - message item 同理
                         close_reasoning_if_open(&mut s);
                         close_message_if_open(&mut s);
+                        // **多轮 session cache save**(2026-05-12 task 18,code-reviewer C1):
+                        // 流末把 assistant text 累积进 response_session.messages,save 回
+                        // global cache 让下轮 previous_response_id 命中。C2 防御:cache key
+                        // 用 state.response_id(跟 SSE response.created emit 的 id 一致)。
+                        save_session_to_global_cache(&mut s);
                         // pending 可能多了 close 事件,优先 yield 它们
                         if let Some(event) = s.pending.pop_front() {
                             return Some((Ok(event), s));
@@ -595,6 +603,58 @@ struct ConvState {
     /// proxy log 验证 events 真发出,Codex APP SDK 不识别就丢)。gemini_native
     /// 同字段(`response.rs:158 sequence_number: u64`)gemini OK,grok 缺这个是根因。
     sequence_number: u64,
+    /// **多轮 session cache 锚定**(2026-05-12 task 18,code-reviewer C1+C2 修):
+    /// mapper 在 `RequestPlan.response_session` 塞进来,流末 emit assistant text
+    /// 累积进 `messages` + 用 `state.response_id` 作 cache key 调
+    /// `global_response_session_cache().save(...)`。下轮 `previous_response_id`
+    /// 命中时 core 自动拉历史。**`response_session.response_id` 必须跟
+    /// `state.response_id` 一致**(由 mapper 用同一份 String init,避免
+    /// cache key mismatch — C2)。
+    response_session: Option<crate::types::ResponseSessionPlan>,
+    /// 流末防御:`response.completed` / `response.failed` 之前 save 一次 cache;
+    /// 防止 unfold 多次走 exhausted 分支(eg pending 残留 yield 后再走一遍)
+    /// 重复 save 浪费 IO。
+    cache_save_done: bool,
+}
+
+/// 把 ConvState 累积的 assistant text 当 assistant 消息追加进
+/// `response_session.messages`,然后用 `state.response_id` 作 key
+/// save 到 `global_response_session_cache()`(L1+L2 sqlite 持久化)。
+///
+/// **idempotent**:cache_save_done=true 时跳过(防 unfold 多次进 exhausted 分支)。
+/// **`state.response_id` = SSE 给 client 的 response_id**(由 mapper init 时跟
+/// `response_session.response_id` 同步,避免下轮 client 拿 SSE id 查 cache miss)。
+///
+/// 2026-05-12 task 18 code-reviewer C1+C2 修。
+fn save_session_to_global_cache(state: &mut ConvState) {
+    if state.cache_save_done {
+        return;
+    }
+    state.cache_save_done = true;
+    let Some(plan) = state.response_session.take() else {
+        return;
+    };
+    let assistant_text = state
+        .open_message
+        .as_ref()
+        .map(|m| m.text_acc.clone())
+        .unwrap_or_default();
+    let mut messages = plan.messages;
+    if !assistant_text.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": assistant_text,
+        }));
+    }
+    // 注:reasoning summary 不写进 cache(它是 client UI 渲染数据,不是历史
+    // 上下文)。tool_calls / function_call_output 后续 R2 加 — 当前不处理。
+    crate::responses::global_response_session_cache().save(&state.response_id, messages);
+    tracing::debug!(
+        error_id = "GROK_SESSION_CACHE_SAVED",
+        response_id = %state.response_id,
+        message_count = state.open_message.is_some() as u32 + 1,
+        "grok_web: 流末 save session 到 global cache,下轮 previous_response_id 可命中"
+    );
 }
 
 /// 从 `line_buf` 切出所有完整 line,parse 成 Codex SSE events 入 pending。
@@ -1984,6 +2044,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "resp_abc".into(),
+            None,
         ))
         .await;
         assert!(out.contains("event: response.created"));
@@ -2009,6 +2070,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         // 1. output_item.added (type=reasoning, in_progress)
@@ -2055,6 +2117,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         let created_count = out.matches("event: response.created").count();
@@ -2075,6 +2138,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         assert!(out.contains("event: response.created"));
@@ -2101,7 +2165,12 @@ mod tests {
             Err(std::io::Error::other("simulated network drop")),
         ];
         let upstream: ByteStream = Box::pin(stream::iter(chunks));
-        let out = collect(convert_grok_sse_to_responses_sse(upstream, "r".into())).await;
+        let out = collect(convert_grok_sse_to_responses_sse(
+            upstream,
+            "r".into(),
+            None,
+        ))
+        .await;
         assert!(out.contains(r#""delta":"partial""#));
         assert!(out.contains("event: response.failed"));
         assert!(out.contains(r#""code":"upstream_transport_error""#));
@@ -2118,6 +2187,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         assert!(out.contains("event: response.failed"));
@@ -2140,6 +2210,7 @@ mod tests {
         let _ = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             codex_id.clone(),
+            None,
         ))
         .await;
         // 流执行后 tracker 应有记录
@@ -2201,6 +2272,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         // tool_usage_card 帧应作为 reasoning summary text.delta emit
@@ -2227,6 +2299,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         assert!(
@@ -2248,6 +2321,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         assert!(out.contains("[MCP Home](https://modelcontextprotocol.io)"));
@@ -2267,6 +2341,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         assert!(out.contains("💻 code_execution stdout"));
@@ -2286,6 +2361,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         assert!(out.contains("💻 code_execution stderr"));
@@ -2306,6 +2382,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         // reasoning bullet
@@ -2328,6 +2405,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         assert!(!out.contains("🔎 ragResults"));
@@ -2348,6 +2426,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         // 1. message item 已开
@@ -2383,6 +2462,7 @@ mod tests {
         let out = collect(convert_grok_sse_to_responses_sse(
             build_byte_stream(lines),
             "r".into(),
+            None,
         ))
         .await;
         assert!(out.contains("event: response.output_item.added"));
@@ -2408,7 +2488,12 @@ mod tests {
             )),
         ];
         let upstream: ByteStream = Box::pin(stream::iter(chunks));
-        let out = collect(convert_grok_sse_to_responses_sse(upstream, "r".into())).await;
+        let out = collect(convert_grok_sse_to_responses_sse(
+            upstream,
+            "r".into(),
+            None,
+        ))
+        .await;
         assert!(out.contains(r#""delta":"x""#));
         assert_eq!(out.matches("event: response.completed").count(), 1);
     }
