@@ -64,36 +64,21 @@ pub struct GrokRequestConversion {
     pub response_session: ResponseSessionPlan,
 }
 
-/// **测试 fixture / 兼容入口**(2026-05-12 task 18 后,silent-failure-hunter F1
-/// 反馈降级 `pub(crate)`):Codex Responses body → grok payload,**无 session cache,
-/// 不走 core,会丢历史 message + compaction + function_call_output + reasoning
-/// 等非 `type=message` 输入项**。
-///
-/// **生产 mapper 必须走 [`responses_body_to_grok_request_with_session`]**,
-/// 本入口仅供 unit test fixture。`pub(crate)` 物理上禁止跨 crate 误用。
-pub(crate) fn responses_body_to_grok_request(
-    body: &Value,
-    provider: &Provider,
-) -> Result<GrokChatRequest, AdapterError> {
-    responses_body_to_grok_request_with_tracker(body, provider, Some(global_tracker()))
-}
-
-/// **测试 fixture**(无 session_cache,跟 [`responses_body_to_grok_request`] 同
-/// 一降级路径,只是允许注入 tracker)。降级 `pub(crate)` 防止 prod 误用。
-pub(crate) fn responses_body_to_grok_request_with_tracker(
-    body: &Value,
-    provider: &Provider,
-    tracker: Option<&ParentResponseTracker>,
-) -> Result<GrokChatRequest, AdapterError> {
-    let conversion = responses_body_to_grok_request_internal(body, provider, None, tracker)?;
-    Ok(conversion.request)
-}
-
-/// **主入口**(对齐 ARCHITECTURE_PROTOCOL_GUIDE Phase 4):接 `ResponseSessionCache`
+/// **生产主入口**(对齐 ARCHITECTURE_PROTOCOL_GUIDE Phase 4):接 `ResponseSessionCache`
 /// (sqlite 持久化 `~/.codex-app-transfer/sessions.db`),走 `core::input` 共性
 /// 历史拼接 + `responses/compact.rs` 三种 compaction variant 自动展开。
 ///
-/// 双保险:
+/// **task 22 / I7 修(2026-05-12)**:`session_cache` 改**必填**(`&ResponseSessionCache`,
+/// 非 `Option`)。原 `Option` 设计是 foot-gun:任何 caller(typo、误改、误删)传
+/// `None` 进来 prod 仍会 silently 走 input-only 降级路径,丢历史 + compaction +
+/// function_call_output。新签名让"无 cache prod 路径"在类型系统层面变成 impossible
+/// state。本 fn 虽 `pub`,但当前唯一 caller 是同 crate 的
+/// [`crate::mapper::grok_web::prepare_grok_web_request`](已同步改);外部 crate
+/// 无引用,签名 break 实际影响为零。Test fixture 路径走
+/// [`responses_body_to_grok_request`] / [`responses_body_to_grok_request_with_tracker`]
+/// (`pub(crate)` 物理隔离,跨 crate 不可见)。
+///
+/// 双保险(grok.com 后端契约层面):
 /// 1. **client 端历史拼接**(本 fn 主路径):把 merged messages flatten 成 grok
 ///    single message string,角色 prefix(`User: ...\n\nAssistant: ...`),grok
 ///    模型自己理解 context。即便 grok.com 服务端 DAG miss 也能 work。
@@ -103,77 +88,34 @@ pub(crate) fn responses_body_to_grok_request_with_tracker(
 pub fn responses_body_to_grok_request_with_session(
     body: &Value,
     provider: &Provider,
-    session_cache: Option<&ResponseSessionCache>,
+    session_cache: &ResponseSessionCache,
 ) -> Result<GrokRequestConversion, AdapterError> {
-    responses_body_to_grok_request_internal(body, provider, session_cache, Some(global_tracker()))
-}
-
-fn responses_body_to_grok_request_internal(
-    body: &Value,
-    provider: &Provider,
-    session_cache: Option<&ResponseSessionCache>,
-    tracker: Option<&ParentResponseTracker>,
-) -> Result<GrokRequestConversion, AdapterError> {
-    let codex_model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AdapterError::BadRequest("missing `model` field".into()))?;
+    let codex_model = body.get("model").and_then(Value::as_str).ok_or_else(|| {
+        AdapterError::BadRequest(format!(
+            "missing `model` field in Codex Responses body (provider.id={})",
+            provider.id
+        ))
+    })?;
     let mode_id = resolve_mode_id(codex_model, provider)?;
 
-    // 走 core/responses 共性历史拼接(2026-05-12 task 18,对齐架构):
+    // 走 core/responses 共性历史拼接:
     // - `responses_body_to_chat_body_for_provider_with_session` 内部调
     //   `build_messages_from_input` → 处理 previous_response_id 历史合并 +
     //   `type=compaction` 三 variant 自动展开成 user message + tool_call_repair。
     // - cache miss + input 空 → `PreviousResponseNotFound`(forward 转标准 400)
     // - cache miss + input 非空 → 降级仅本轮(已含 codex 当前输入展开)
     //
-    // **silent-failure F3 修**:fallback 路径(无 session_cache,test fixture)
-    // 必须独立处理 `body.instructions` —— 否则 instructions 字段被静默丢弃。
-    // 走 core 路径时 instructions 已合并进 messages[0]=system,无需重复。
-    let (message, merged_messages, fallback_instructions) = if session_cache.is_some() {
-        let conversion = crate::responses::responses_body_to_chat_body_for_provider_with_session(
-            body,
-            None,
-            session_cache,
-        )?;
-        let msgs = conversion.response_session.messages;
-        let flat = flatten_messages_to_grok_single_string(&msgs);
-        (flat, msgs, None)
-    } else {
-        // 无 cache 路径(test fixture / backwards compat):仅 flatten 当前 body.input
-        // 不走 core,**会丢历史 + 非 type=message 输入项**(compaction /
-        // function_call_output / reasoning)。生产路径绝不应进这里。
-        // silent-failure F1:在内部 warn 让 operator 看到本流程降级
-        tracing::warn!(
-            error_id = "GROK_WEB_NO_SESSION_FALLBACK",
-            "grok_web 走无 session_cache 降级路径(test fixture only,prod 不该命中);\
-             历史 message + compaction + function_call_output 等非 type=message 输入项被丢弃"
-        );
-        let messages = extract_messages_from_input_only(body)?;
-        let flat = flatten_messages_to_grok_single_string(&messages);
-        // silent-failure F3:fallback 单独处理 instructions(走 customInstructions
-        // 字段塞 grok wire,因为 messages 数组里没 system 段)
-        let instructions = body
-            .get("instructions")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        (flat, messages, instructions)
-    };
+    // 走 core 路径时 instructions 已合并进 messages[0]=system,本 fn 不再
+    // 单独 emit `custom_instructions`(留 None,跟原 cache 路径行为一致)。
+    let conversion = crate::responses::responses_body_to_chat_body_for_provider_with_session(
+        body,
+        None,
+        Some(session_cache),
+    )?;
+    let merged_messages = conversion.response_session.messages;
+    let message = flatten_messages_to_grok_single_string(&merged_messages);
 
-    let parent_response_id = body
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .and_then(|prev| {
-            tracker.and_then(|t| {
-                t.get(&crate::grok_web::parent_response::CodexResponseId::from(
-                    prev,
-                ))
-                .map(|g| g.into_inner())
-            })
-        });
-
+    let parent_response_id = resolve_parent_response_id(body, Some(global_tracker()));
     let is_reasoning = parse_reasoning_flag(body);
 
     Ok(GrokRequestConversion {
@@ -182,7 +124,7 @@ fn responses_body_to_grok_request_internal(
             mode_id,
             parent_response_id,
             is_reasoning,
-            custom_instructions: fallback_instructions,
+            custom_instructions: None,
             ..GrokChatRequest::default()
         },
         response_session: ResponseSessionPlan {
@@ -190,6 +132,96 @@ fn responses_body_to_grok_request_internal(
             messages: merged_messages,
         },
     })
+}
+
+/// **测试 fixture / 兼容入口**(`pub(crate)` 物理隔离 prod 误用):Codex Responses
+/// body → grok payload,**不走 core**,会丢历史 message + compaction +
+/// function_call_output + reasoning 等非 `type=message` 输入项。
+///
+/// 此路径**只在 unit test 用**作为 cache-free 简化 harness;prod 必须走
+/// [`responses_body_to_grok_request_with_session`]。
+///
+/// `instructions` 字段:本 fn 单独抽出来塞进 `custom_instructions` 字段(走
+/// grok wire `customInstructions`)— core 路径在 messages[0]=system 里处理,
+/// 本 fn 不走 core,messages 不含 system,故必须独立 surface。
+pub(crate) fn responses_body_to_grok_request(
+    body: &Value,
+    provider: &Provider,
+) -> Result<GrokChatRequest, AdapterError> {
+    responses_body_to_grok_request_with_tracker(body, provider, Some(global_tracker()))
+}
+
+/// **测试 fixture**(允许注入 tracker)。`pub(crate)` 物理隔离 prod 误用。
+pub(crate) fn responses_body_to_grok_request_with_tracker(
+    body: &Value,
+    provider: &Provider,
+    tracker: Option<&ParentResponseTracker>,
+) -> Result<GrokChatRequest, AdapterError> {
+    let codex_model = body.get("model").and_then(Value::as_str).ok_or_else(|| {
+        AdapterError::BadRequest(format!(
+            "missing `model` field in Codex Responses body (provider.id={})",
+            provider.id
+        ))
+    })?;
+    let mode_id = resolve_mode_id(codex_model, provider)?;
+
+    let messages = extract_messages_from_input_only(body)?;
+    let message = flatten_messages_to_grok_single_string(&messages);
+    let custom_instructions = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    let parent_response_id = resolve_parent_response_id(body, tracker);
+    let is_reasoning = parse_reasoning_flag(body);
+
+    Ok(GrokChatRequest {
+        message,
+        mode_id,
+        parent_response_id,
+        is_reasoning,
+        custom_instructions,
+        ..GrokChatRequest::default()
+    })
+}
+
+fn resolve_parent_response_id(
+    body: &Value,
+    tracker: Option<&ParentResponseTracker>,
+) -> Option<String> {
+    let prev = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let Some(t) = tracker else {
+        // tracker None 是 test fixture 才有的状态(prod 永远传 Some(global_tracker())),
+        // 不算 silent failure,但 debug 留信号便于 grep。
+        tracing::debug!(
+            error_id = "GROK_WEB_PARENT_LOOKUP_NO_TRACKER",
+            previous_response_id = %prev,
+            "previous_response_id 存在但 tracker=None(test fixture path),grok wire 不带 parent_response_id"
+        );
+        return None;
+    };
+    let codex_id = crate::grok_web::parent_response::CodexResponseId::from(prev);
+    match t.get(&codex_id) {
+        Some(g) => Some(g.into_inner()),
+        None => {
+            // **silent-failure MED-2 修**:用户认为是续轮但 tracker miss
+            // (上轮没记 mapping / .app 重启 tracker 丢 / response_id 不对),
+            // grok wire 不带 parent_response_id → grok 服务端起新对话。
+            // client 端 flatten 历史通常可弥补,但 cache miss + tracker miss
+            // 时上下文是真断掉的。debug 让 operator 能 grep 区分"主动无 prev id"
+            // 跟"prev id 给了但 tracker resolve 失败"两种 case。
+            tracing::debug!(
+                error_id = "GROK_WEB_PARENT_LOOKUP_MISS",
+                previous_response_id = %prev,
+                "previous_response_id 在 tracker 里未命中 mapping,grok wire 不带 parent_response_id"
+            );
+            None
+        }
+    }
 }
 
 /// 把 chat-shape messages 数组 flatten 成 grok 协议的 single message string。
@@ -1059,19 +1091,34 @@ mod tests {
 
     // ── task 18:with_session 路径(对齐 ARCHITECTURE_PROTOCOL_GUIDE)─────────
 
+    // task 22 / I7 修:删 `with_session_no_cache_falls_back_to_input_only_path`
+    // 测试 — 验"None 时降级"恰好是本 PR 砍掉的 foot-gun。`session_cache: &...`
+    // 必填后,`None` 在类型系统层面变 impossible state,无 test 可写。
+    // Test fixture 路径已迁回 `responses_body_to_grok_request_with_tracker`,
+    // 由本 mod 其他 tests 覆盖(见 `serialized_payload_excludes_connector_fields`
+    // 等)。
+
     #[test]
-    fn with_session_no_cache_falls_back_to_input_only_path() {
-        // session_cache 缺省时走 fallback,跟 with_tracker(None) 等价
+    fn with_session_no_history_emits_single_message_plan() {
+        // **silent-failure LOW-1 修**:补 with_session 路径下"空 cache + 仅本轮
+        // 输入"的最小 case,验 ResponseSessionPlan 形状正确(messages.len()=1 +
+        // response_id 已生成),防 with_session 入口 plan 字段被 future refactor
+        // 误回归。
+        let cache = ResponseSessionCache::new(8, std::time::Duration::from_secs(60));
         let body = json!({
             "model": "gpt_5_codex",
             "input": [{"type": "message", "role": "user", "content": "hi"}]
         });
         let p = make_provider();
-        let conv = responses_body_to_grok_request_with_session(&body, &p, None).unwrap();
+        let conv = responses_body_to_grok_request_with_session(&body, &p, &cache).unwrap();
         assert_eq!(conv.request.message, "User: hi");
-        // response_session 仍 emit(供 mapper 注入 RequestPlan,即便 messages 没历史)
         assert!(!conv.response_session.response_id.is_empty());
-        assert_eq!(conv.response_session.messages.len(), 1);
+        assert_eq!(
+            conv.response_session.messages.len(),
+            1,
+            "无历史 + 单 user message 时 plan 应只含本轮 1 条消息,got: {:?}",
+            conv.response_session.messages
+        );
     }
 
     #[test]
@@ -1093,7 +1140,7 @@ mod tests {
             "previous_response_id": "resp_prev_grok"
         });
         let p = make_provider();
-        let conv = responses_body_to_grok_request_with_session(&body, &p, Some(&cache)).unwrap();
+        let conv = responses_body_to_grok_request_with_session(&body, &p, &cache).unwrap();
         // 验证 grok message 包含完整 history + 当前 follow-up
         assert!(
             conv.request.message.contains("User: what is Rust?"),
@@ -1130,7 +1177,7 @@ mod tests {
         });
         let p = make_provider();
         let cache = ResponseSessionCache::new(8, std::time::Duration::from_secs(60));
-        let conv = responses_body_to_grok_request_with_session(&body, &p, Some(&cache)).unwrap();
+        let conv = responses_body_to_grok_request_with_session(&body, &p, &cache).unwrap();
         // compaction item 展开后作 user message 注入(具体 prefix 行为由
         // responses/request.rs::build_messages_from_input 控制),只要文本能在 grok
         // 看到 final message 里就 OK
