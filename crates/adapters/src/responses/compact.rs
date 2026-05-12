@@ -127,6 +127,16 @@ const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve th
 /// `COMPACT_USER_MESSAGE_MAX_TOKENS` from `codex-rs/core/src/compact.rs:48`.
 const COMPACT_MAX_OUTPUT_TOKENS: u32 = 20_000;
 
+/// Compact must reserve room for the summarization prompt and the generated
+/// summary. This is a byte budget over the final Chat `messages` array, applied
+/// after Responses-to-Chat conversion because that is the real upstream shape.
+const COMPACT_CHAT_MESSAGES_MAX_BYTES: usize = 120 * 1024;
+const COMPACT_OMISSION_NOTICE_MAX_CHARS: usize = 8_000;
+const COMPACT_SINGLE_MESSAGE_MAX_CHARS: usize = 8_000;
+const COMPACT_TOOL_ARGUMENTS_MAX_CHARS: usize = 3_000;
+const COMPACT_EXCERPT_HEAD_CHARS: usize = 1_800;
+const COMPACT_EXCERPT_TAIL_CHARS: usize = 1_000;
+
 /// 收上游 chat completions 响应的最大字节数,防止异常 provider 把我们打挂内存。
 /// 32 MB 远超合理 chat completion 响应大小(typical 几十 KB)。
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -228,8 +238,286 @@ pub(crate) fn build_compact_chat_request(
 
     let chat_body =
         responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))?;
+    let chat_body = enforce_compact_chat_message_budget(chat_body);
     serde_json::to_vec(&chat_body)
         .map_err(|e| AdapterError::Internal(format!("re-serialize compact body: {e}")))
+}
+
+fn enforce_compact_chat_message_budget(mut chat_body: Value) -> Value {
+    let Some(messages) = chat_body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return chat_body;
+    };
+    let original_bytes = serialized_messages_len(messages);
+    if original_bytes <= COMPACT_CHAT_MESSAGES_MAX_BYTES {
+        return chat_body;
+    }
+    let Some(prompt_message) = messages.pop() else {
+        return chat_body;
+    };
+    let original_message_count = messages.len() + 1;
+    let groups = group_chat_messages(std::mem::take(messages));
+    let prompt_bytes = serialized_messages_len(&[prompt_message.clone()]);
+    let history_budget = COMPACT_CHAT_MESSAGES_MAX_BYTES
+        .saturating_sub(prompt_bytes)
+        .saturating_sub(COMPACT_OMISSION_NOTICE_MAX_CHARS + 512);
+
+    let mut retained_rev: Vec<Vec<Value>> = Vec::new();
+    let mut retained_bytes = 0usize;
+    let mut split_at = groups.len();
+
+    for idx in (0..groups.len()).rev() {
+        let compacted = compact_group_for_budget(groups[idx].clone());
+        let group_bytes = serialized_messages_len(&compacted);
+        if retained_bytes + group_bytes > history_budget && !retained_rev.is_empty() {
+            split_at = idx + 1;
+            break;
+        }
+        retained_bytes = retained_bytes.saturating_add(group_bytes);
+        retained_rev.push(compacted);
+        split_at = idx;
+    }
+
+    retained_rev.reverse();
+    let mut retained_groups = retained_rev;
+    let mut new_messages: Vec<Value> = Vec::new();
+    if original_bytes > COMPACT_CHAT_MESSAGES_MAX_BYTES {
+        new_messages.push(build_compact_omission_notice(
+            &groups[..split_at],
+            original_message_count,
+            original_bytes,
+        ));
+    }
+    for group in &retained_groups {
+        new_messages.extend(group.iter().cloned());
+    }
+    new_messages.push(prompt_message.clone());
+
+    while serialized_messages_len(&new_messages) > COMPACT_CHAT_MESSAGES_MAX_BYTES
+        && !retained_groups.is_empty()
+    {
+        retained_groups.remove(0);
+        let omitted_count = groups.len().saturating_sub(retained_groups.len());
+        new_messages.clear();
+        new_messages.push(build_compact_omission_notice(
+            &groups[..omitted_count],
+            original_message_count,
+            original_bytes,
+        ));
+        for group in &retained_groups {
+            new_messages.extend(group.iter().cloned());
+        }
+        new_messages.push(prompt_message.clone());
+    }
+
+    if serialized_messages_len(&new_messages) > COMPACT_CHAT_MESSAGES_MAX_BYTES {
+        new_messages.clear();
+        new_messages.push(build_compact_omission_notice(
+            &groups,
+            original_message_count,
+            original_bytes,
+        ));
+        new_messages.push(prompt_message);
+    }
+
+    *messages = new_messages;
+    chat_body
+}
+
+fn serialized_messages_len(messages: &[Value]) -> usize {
+    serde_json::to_vec(messages)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn group_chat_messages(messages: Vec<Value>) -> Vec<Vec<Value>> {
+    let mut groups = Vec::new();
+    let mut idx = 0usize;
+    while idx < messages.len() {
+        let mut group = vec![messages[idx].clone()];
+        let is_assistant_tool_call = messages[idx].get("role").and_then(|v| v.as_str())
+            == Some("assistant")
+            && messages[idx]
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .is_some_and(|calls| !calls.is_empty());
+        idx += 1;
+        if is_assistant_tool_call {
+            while idx < messages.len()
+                && messages[idx].get("role").and_then(|v| v.as_str()) == Some("tool")
+            {
+                group.push(messages[idx].clone());
+                idx += 1;
+            }
+        }
+        groups.push(group);
+    }
+    groups
+}
+
+fn compact_group_for_budget(group: Vec<Value>) -> Vec<Value> {
+    group.into_iter().map(compact_message_for_budget).collect()
+}
+
+fn compact_message_for_budget(mut message: Value) -> Value {
+    if serialized_messages_len(&[message.clone()]) <= COMPACT_SINGLE_MESSAGE_MAX_CHARS {
+        return message;
+    }
+
+    if let Some(calls) = message.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
+        for call in calls {
+            if let Some(args) = call
+                .pointer_mut("/function/arguments")
+                .and_then(|v| v.as_str().map(ToOwned::to_owned))
+            {
+                if args.chars().count() > COMPACT_TOOL_ARGUMENTS_MAX_CHARS {
+                    call["function"]["arguments"] = Value::String(shortened_text(
+                        "Tool call arguments shortened for compact input",
+                        &args,
+                        COMPACT_TOOL_ARGUMENTS_MAX_CHARS,
+                    ));
+                }
+            }
+        }
+    }
+
+    if serialized_messages_len(&[message.clone()]) <= COMPACT_SINGLE_MESSAGE_MAX_CHARS {
+        return message;
+    }
+
+    let role = message
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("message")
+        .to_owned();
+    let text = message_text(&message);
+    if let Some(obj) = message.as_object_mut() {
+        obj.insert(
+            "content".to_owned(),
+            Value::String(shortened_text(
+                &format!("{role} message shortened for compact input"),
+                &text,
+                COMPACT_SINGLE_MESSAGE_MAX_CHARS,
+            )),
+        );
+    }
+    message
+}
+
+fn build_compact_omission_notice(
+    omitted_groups: &[Vec<Value>],
+    original_message_count: usize,
+    original_bytes: usize,
+) -> Value {
+    let omitted_messages: usize = omitted_groups.iter().map(Vec::len).sum();
+    let omitted_bytes: usize = omitted_groups
+        .iter()
+        .map(|group| serialized_messages_len(group))
+        .sum();
+    let mut notice = String::new();
+    notice.push_str("[Compact input budget applied]\n");
+    notice.push_str(
+        "Older conversation blocks were omitted or shortened from this compact request so the compact request itself stays below the upstream context limit. Newest blocks and the summarization instructions were preserved.\n",
+    );
+    notice.push_str(&format!(
+        "Original messages: {original_message_count}. Omitted messages: {omitted_messages}. Original chat messages JSON bytes: {original_bytes}. Omitted JSON bytes: {omitted_bytes}.\n"
+    ));
+
+    let user_excerpts = omitted_user_excerpts(omitted_groups, 12);
+    if !user_excerpts.is_empty() {
+        notice.push_str("Omitted user-message excerpts:\n");
+        for excerpt in user_excerpts {
+            notice.push_str("- ");
+            notice.push_str(&excerpt);
+            notice.push('\n');
+        }
+    }
+
+    if notice.chars().count() > COMPACT_OMISSION_NOTICE_MAX_CHARS {
+        notice = take_first_chars(&notice, COMPACT_OMISSION_NOTICE_MAX_CHARS);
+        notice.push_str("\n[Omission notice truncated to compact budget.]");
+    }
+
+    json!({
+        "role": "user",
+        "content": notice,
+    })
+}
+
+fn omitted_user_excerpts(groups: &[Vec<Value>], max: usize) -> Vec<String> {
+    let mut excerpts = Vec::new();
+    for message in groups.iter().flatten() {
+        if message.get("role").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let text = message_text(message);
+        if text.trim().is_empty() {
+            continue;
+        }
+        excerpts.push(short_excerpt(&text, 500));
+        if excerpts.len() >= max {
+            break;
+        }
+    }
+    excerpts
+}
+
+fn message_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+            if out.is_empty() {
+                serde_json::to_string(parts).unwrap_or_default()
+            } else {
+                out
+            }
+        }
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        None => serde_json::to_string(message).unwrap_or_default(),
+    }
+}
+
+fn shortened_text(label: &str, text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let head = take_first_chars(text, COMPACT_EXCERPT_HEAD_CHARS.min(max_chars / 2));
+    let tail = take_last_chars(text, COMPACT_EXCERPT_TAIL_CHARS.min(max_chars / 3));
+    format!(
+        "[{label}]\nOriginal size: {} chars.\n--- Begin head excerpt ---\n{}\n--- End head excerpt ---\n--- Begin tail excerpt ---\n{}\n--- End tail excerpt ---\n[Omitted middle content from compact request.]",
+        text.chars().count(),
+        head,
+        tail
+    )
+}
+
+fn short_excerpt(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        normalized
+    } else {
+        let mut excerpt = take_first_chars(&normalized, max_chars);
+        excerpt.push_str("...");
+        excerpt
+    }
+}
+
+fn take_first_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+fn take_last_chars(value: &str, max: usize) -> String {
+    let mut chars = value.chars().rev().take(max).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 /// 把上游 `/chat/completions` 的非流式 JSON 响应包装成 Codex CLI 期待的
@@ -418,6 +706,140 @@ mod tests {
                 .is_some(),
             "thinking 启用时 assistant tool_call 必须带 reasoning_content 字段(可以是单空格占位)"
         );
+    }
+
+    #[test]
+    fn build_compact_chat_request_bounds_large_tool_output_before_prompt() {
+        let p = make_provider();
+        let huge_line = "const minified='x';".repeat(3_000);
+        let raw_output = format!(
+            "Chunk ID: 44d863\n\
+             Wall time: 0.1540 seconds\n\
+             Process exited with code 0\n\
+             Original token count: 924828\n\
+             Output:\n\
+             Total output lines: 18\n\n\
+             /tmp/codex-asar/webview/assets/plugins-page-selectors.js:{huge_line}"
+        );
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [
+                {"type": "function_call", "call_id": "tool_large", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "tool_large", "output": raw_output}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let tool_msg = messages
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("compact 请求中应保留 bounded tool message");
+        let content = tool_msg["content"].as_str().unwrap();
+
+        assert_eq!(tool_msg["tool_call_id"], "tool_large");
+        assert!(content.contains("[Tool output stored outside model context]"));
+        assert!(content.contains("Artifact ID: tool_artifact_"));
+        assert!(content.contains("Original token count: 924828"));
+        assert!(
+            content.len() < 20_000,
+            "compact 前 tool.content 应被有界化,实际长度 {}",
+            content.len()
+        );
+        assert!(
+            messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|text| text
+                    .contains("Your task is to create a detailed CONTEXT CHECKPOINT summary")),
+            "compact summary prompt 仍应作为最后一条 user message 注入"
+        );
+    }
+
+    #[test]
+    fn build_compact_chat_request_prunes_chat_messages_to_compact_budget() {
+        let p = make_provider();
+        let old_huge = "old research detail ".repeat(10_000);
+        let recent = "recent user instruction that must remain visible";
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [
+                {"type": "message", "role": "user", "content": old_huge},
+                {"type": "message", "role": "assistant", "content": "ack"},
+                {"type": "message", "role": "user", "content": recent}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let messages_bytes = serde_json::to_vec(messages).unwrap().len();
+
+        assert!(
+            messages_bytes <= COMPACT_CHAT_MESSAGES_MAX_BYTES,
+            "compact messages must be budgeted before upstream request; actual={messages_bytes}"
+        );
+        assert!(
+            messages.iter().any(|m| {
+                m["role"] == "user"
+                    && m["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("[Compact input budget applied]")
+            }),
+            "budget pruning must be explicit, not silent"
+        );
+        assert!(
+            messages.iter().any(|m| {
+                m["role"] == "user" && m["content"].as_str().unwrap_or("").contains(recent)
+            }),
+            "recent user message should be retained"
+        );
+        assert!(
+            messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(|v| v.as_str())
+                .is_some_and(|text| text.contains("CONTEXT CHECKPOINT")),
+            "summarization prompt must remain the last message"
+        );
+    }
+
+    #[test]
+    fn build_compact_chat_request_keeps_tail_tool_chain_together_after_pruning() {
+        let p = make_provider();
+        let old_huge = "old context ".repeat(10_000);
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [
+                {"type": "message", "role": "user", "content": old_huge},
+                {"type": "function_call", "call_id": "tail_tool", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "tail_tool", "output": "short result"},
+                {"type": "message", "role": "user", "content": "continue from the tool result"}
+            ],
+            "tools": [{"type": "function", "name": "shell"}]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+
+        let assistant_idx = messages
+            .iter()
+            .position(|m| {
+                m["role"] == "assistant"
+                    && m.get("tool_calls")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|calls| calls.iter().any(|call| call["id"] == "tail_tool"))
+            })
+            .expect("tail assistant tool call should be retained");
+        let tool_msg = messages
+            .get(assistant_idx + 1)
+            .expect("tool response should immediately follow assistant tool call");
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["tool_call_id"], "tail_tool");
     }
 
     #[test]

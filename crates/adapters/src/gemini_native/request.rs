@@ -355,10 +355,10 @@ fn responses_input_to_chat_messages(
                     .unwrap_or("call_unknown")
                     .to_owned();
                 let output = obj.get("output").cloned().unwrap_or(Value::Null);
-                let content_str = match &output {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
+                let content_str = crate::responses::request::normalize_tool_output_for_context(
+                    Some(call_id.as_str()),
+                    output,
+                );
                 // P0-G + Bug B 修复:Codex.app 不重发 prior function_call,但 Gemini
                 // 强制要求 functionCall turn(model role) 紧跟 functionResponse turn
                 // (user role)。从 global ToolCallCache 拿 (name, arguments) 在 messages
@@ -2104,6 +2104,40 @@ mod tests {
         let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
         assert_eq!(tool["tool_call_id"], "c1");
         assert_eq!(tool["content"], "sunny");
+    }
+
+    #[test]
+    fn large_function_call_output_is_bounded_in_gemini_normalized_chat() {
+        let huge_line = "const minified='x';".repeat(3_000);
+        let raw_output = format!(
+            "Chunk ID: 44d863\n\
+             Wall time: 0.1540 seconds\n\
+             Process exited with code 0\n\
+             Original token count: 924828\n\
+             Output:\n\
+             Total output lines: 18\n\n\
+             /tmp/codex-asar/webview/assets/plugins-page-selectors.js:{huge_line}"
+        );
+        let body = serde_json::json!({
+            "input": [
+                {"type":"function_call","call_id":"tool_large","name":"exec_command","arguments":"{}"},
+                {"type":"function_call_output","call_id":"tool_large","output": raw_output}
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let msgs = chat["messages"].as_array().unwrap();
+        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        let content = tool["content"].as_str().unwrap();
+
+        assert_eq!(tool["tool_call_id"], "tool_large");
+        assert!(content.contains("[Tool output stored outside model context]"));
+        assert!(content.contains("Artifact ID: tool_artifact_"));
+        assert!(content.contains("Original token count: 924828"));
+        assert!(
+            content.len() < 20_000,
+            "Gemini normalized chat tool.content 应被有界化,实际长度 {}",
+            content.len()
+        );
     }
 
     /// **Bug 真因回归测试** (2026-05-11):encoded call_id (含 `~~sig~~<sig>`

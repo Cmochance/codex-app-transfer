@@ -31,6 +31,11 @@ pub struct ResponsesBodyConversion {
     pub response_session: ResponseSessionPlan,
 }
 
+const TOOL_OUTPUT_INLINE_MAX_CHARS: usize = 4_000;
+const TOOL_OUTPUT_HEAD_CHARS: usize = 1_200;
+const TOOL_OUTPUT_TAIL_CHARS: usize = 1_200;
+const TOOL_OUTPUT_VISIBLE_MAX_CHARS: usize = 5_000;
+
 /// 把 Responses API 请求体转换成 OpenAI Chat Completions 请求体.
 pub fn responses_body_to_chat_body(input: &Value) -> Result<Value, AdapterError> {
     responses_body_to_chat_body_for_provider(input, None)
@@ -467,10 +472,8 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 .get("output")
                 .cloned()
                 .unwrap_or(Value::String(String::new()));
-            let output_str = match output_value {
-                Value::String(s) => s,
-                other => serde_json::to_string(&other).unwrap_or_default(),
-            };
+            let output_str =
+                normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
             vec![json!({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -575,6 +578,211 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
             }
         }
     }
+}
+
+pub(crate) fn normalize_tool_output_for_context(
+    call_id: Option<&str>,
+    output_value: Value,
+) -> String {
+    normalize_tool_output_for_context_with_store(
+        call_id,
+        output_value,
+        Some(super::artifact_store::global_tool_artifact_store()),
+    )
+}
+
+pub(crate) fn normalize_tool_output_for_context_with_store(
+    call_id: Option<&str>,
+    output_value: Value,
+    artifact_store: Option<&super::artifact_store::ToolArtifactStore>,
+) -> String {
+    let raw = match output_value {
+        Value::String(s) => s,
+        other => serde_json::to_string(&other).unwrap_or_default(),
+    };
+    if raw.chars().count() <= TOOL_OUTPUT_INLINE_MAX_CHARS {
+        return raw;
+    }
+    let kind = classify_tool_output(&raw);
+    let artifact = artifact_store.map(|store| store.save(call_id, kind, &raw));
+    build_bounded_tool_output_summary(&raw, kind, artifact.as_ref())
+}
+
+fn build_bounded_tool_output_summary(
+    raw: &str,
+    kind: &str,
+    artifact: Option<&super::artifact_store::StoredToolArtifact>,
+) -> String {
+    let original_chars = raw.chars().count();
+    let original_lines = raw.lines().count();
+    let mut out = String::new();
+
+    out.push_str("[Tool output stored outside model context]\n");
+    out.push_str("Visible content below is a bounded evidence summary, not the full raw output.\n");
+    if let Some(artifact) = artifact {
+        out.push_str(&format!("Artifact ID: {}\n", artifact.artifact_id));
+        if let Some(call_id) = artifact.call_id.as_deref() {
+            out.push_str(&format!("Tool call ID: {call_id}\n"));
+        }
+    } else {
+        out.push_str("Artifact ID: unavailable; raw payload could not be stored.\n");
+    }
+    out.push_str(&format!("Artifact kind: {kind}\n"));
+    out.push_str(&format!(
+        "Original size: {original_chars} chars across {original_lines} lines.\n"
+    ));
+    if let Some(token_count) = extract_marker_value(raw, "Original token count:") {
+        out.push_str(&format!("Original token count: {token_count}\n"));
+    }
+    if let Some(total_lines) = extract_marker_value(raw, "Total output lines:") {
+        out.push_str(&format!("Reported output lines: {total_lines}\n"));
+    }
+
+    let path_hints = extract_path_hints(raw, 12);
+    if !path_hints.is_empty() {
+        out.push_str("Path hints:\n");
+        for path in path_hints {
+            out.push_str("- ");
+            out.push_str(&path);
+            out.push('\n');
+        }
+    }
+
+    let url_hints = extract_url_hints(raw, 12);
+    if !url_hints.is_empty() {
+        out.push_str("URL hints:\n");
+        for url in url_hints {
+            out.push_str("- ");
+            out.push_str(&url);
+            out.push('\n');
+        }
+    }
+
+    out.push_str("\n--- Begin head excerpt ---\n");
+    out.push_str(&take_first_chars(raw, TOOL_OUTPUT_HEAD_CHARS));
+    out.push_str("\n--- End head excerpt ---\n");
+    out.push_str("\n--- Begin tail excerpt ---\n");
+    out.push_str(&take_last_chars(raw, TOOL_OUTPUT_TAIL_CHARS));
+    out.push_str("\n--- End tail excerpt ---\n");
+    out.push_str(&format!(
+        "\n[Omitted raw tool output from model context. Original size: {original_chars} chars.]"
+    ));
+
+    if out.chars().count() > TOOL_OUTPUT_VISIBLE_MAX_CHARS {
+        let mut trimmed = take_first_chars(&out, TOOL_OUTPUT_VISIBLE_MAX_CHARS);
+        trimmed.push_str("\n[Tool output compression summary truncated to visible budget.]");
+        return trimmed;
+    }
+    out
+}
+
+fn classify_tool_output(raw: &str) -> &'static str {
+    let sample = raw.chars().take(20_000).collect::<String>();
+    let trimmed = sample.trim_start();
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && serde_json::from_str::<Value>(trimmed).is_ok()
+    {
+        return "json";
+    }
+    if sample.contains("https://")
+        || sample.contains("http://")
+        || sample.contains("web_search")
+        || sample.contains("Search results")
+        || sample.contains("source:")
+    {
+        return "web_or_search";
+    }
+    if sample.contains("Process exited with code")
+        || sample.contains("Exit code")
+        || sample.contains("Wall time:")
+        || sample.contains("Output:")
+    {
+        return "command_output";
+    }
+    if !extract_path_hints(&sample, 1).is_empty() {
+        return "file_or_code_output";
+    }
+    "opaque_tool_output"
+}
+
+fn extract_marker_value(raw: &str, marker: &str) -> Option<String> {
+    let start = raw.find(marker)?;
+    let rest = &raw[start + marker.len()..];
+    let value = rest
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn extract_url_hints(raw: &str, max: usize) -> Vec<String> {
+    let mut urls = Vec::new();
+    for token in raw.lines().take(200).flat_map(str::split_whitespace) {
+        let candidate = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+            )
+        });
+        if !(candidate.starts_with("http://") || candidate.starts_with("https://")) {
+            continue;
+        }
+        if urls.iter().any(|existing| existing == candidate) {
+            continue;
+        }
+        urls.push(candidate.to_owned());
+        if urls.len() >= max {
+            break;
+        }
+    }
+    urls
+}
+
+fn extract_path_hints(raw: &str, max: usize) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in raw.lines().take(200) {
+        for token in line.split_whitespace() {
+            let candidate = token
+                .trim_matches(|ch: char| {
+                    matches!(
+                        ch,
+                        '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                    )
+                })
+                .split(':')
+                .next()
+                .unwrap_or("");
+            if !(candidate.starts_with('/') || candidate.starts_with("./")) {
+                continue;
+            }
+            if !candidate.contains('.') {
+                continue;
+            }
+            if paths.iter().any(|existing| existing == candidate) {
+                continue;
+            }
+            paths.push(candidate.to_owned());
+            if paths.len() >= max {
+                return paths;
+            }
+        }
+    }
+    paths
+}
+
+fn take_first_chars(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+fn take_last_chars(value: &str, max: usize) -> String {
+    let mut chars = value.chars().rev().take(max).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 fn convert_file_item_to_message(item: &serde_json::Map<String, Value>) -> Vec<Value> {
@@ -4130,6 +4338,84 @@ mod tests {
             .find(|m| m["role"] == "tool")
             .expect("应当有 tool 消息");
         assert_eq!(tool_msg["content"], "{\"temp\":72}");
+    }
+
+    #[test]
+    fn large_function_call_output_is_bounded_before_chat_history() {
+        let huge_line = "function veryLongMinifiedBundle(){return 'x';}".repeat(2_000);
+        let raw_output = format!(
+            "Chunk ID: 44d863\n\
+             Wall time: 0.1540 seconds\n\
+             Process exited with code 0\n\
+             Original token count: 924828\n\
+             Output:\n\
+             Total output lines: 18\n\n\
+             /tmp/codex-asar/webview/assets/plugins-page-selectors.js:{huge_line}"
+        );
+
+        let out = convert(json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "tool_large",
+                "output": raw_output
+            }]
+        }));
+        let tool_msg = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("应当有 tool 消息");
+
+        assert_eq!(tool_msg["tool_call_id"], "tool_large");
+        let content = tool_msg["content"].as_str().unwrap();
+        assert!(
+            content.contains("[Tool output stored outside model context]"),
+            "大工具结果必须显式标记为外置存储,实际: {content}"
+        );
+        assert!(
+            content.contains("Artifact ID: tool_artifact_"),
+            "大工具结果必须带可追踪 artifact id,实际: {content}"
+        );
+        assert!(
+            content.contains("Original token count: 924828"),
+            "应保留原始工具输出 token 规模线索"
+        );
+        assert!(
+            content.len() < 20_000,
+            "模型可见 tool.content 应有界,实际长度 {}",
+            content.len()
+        );
+    }
+
+    #[test]
+    fn large_function_call_output_raw_payload_round_trips_via_artifact_store() {
+        let store = super::super::artifact_store::ToolArtifactStore::new(
+            8,
+            std::time::Duration::from_secs(60),
+        );
+        let raw_output = format!(
+            "Process exited with code 0\nOriginal token count: 9000\n{}",
+            "raw-line\n".repeat(900)
+        );
+        let content = normalize_tool_output_for_context_with_store(
+            Some("call_artifact"),
+            Value::String(raw_output.clone()),
+            Some(&store),
+        );
+        let artifact_id = content
+            .lines()
+            .find_map(|line| line.strip_prefix("Artifact ID: "))
+            .expect("summary must expose artifact id");
+        let stored = store.get(artifact_id).expect("raw artifact must be stored");
+
+        assert_eq!(stored.call_id.as_deref(), Some("call_artifact"));
+        assert_eq!(stored.kind, "command_output");
+        assert_eq!(stored.raw_content, raw_output);
+        assert!(
+            content.len() < raw_output.len(),
+            "model-visible summary must be smaller than raw payload"
+        );
     }
 
     #[test]

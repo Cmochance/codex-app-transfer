@@ -13,6 +13,7 @@ const CONFIG_FILE_NAME: &str = "config.json";
 const LIBRARY_DIR_NAME: &str = "configLibrary";
 const BACKUPS_DIR_NAME: &str = "backups";
 const SESSIONS_DB_NAME: &str = "sessions.db";
+const TOOL_ARTIFACTS_DB_NAME: &str = "tool_artifacts.db";
 
 /// 解析当前用户的 home 目录:`$HOME` 优先,`$USERPROFILE`(Windows GUI 进程
 /// 默认值)回退;空字符串视作未设。返 `None` 时调用方应映射为各自的
@@ -62,6 +63,12 @@ pub fn backups_dir() -> Option<PathBuf> {
 /// `~/.codex-app-transfer/sessions.db`。
 pub fn sessions_db_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join(SESSIONS_DB_NAME))
+}
+
+/// SQLite 持久化的工具原始输出 sidecar store 路径,
+/// `~/.codex-app-transfer/tool_artifacts.db`。
+pub fn tool_artifacts_db_file() -> Option<PathBuf> {
+    config_dir().map(|d| d.join(TOOL_ARTIFACTS_DB_NAME))
 }
 
 #[cfg(test)]
@@ -115,5 +122,15 @@ mod tests {
     fn resolve_home_returns_none_when_both_missing() {
         let env = |_k: &str| None;
         assert_eq!(resolve_home_from(env), None);
+    }
+
+    #[test]
+    fn tool_artifacts_db_file_lives_under_config_dir() {
+        let home = PathBuf::from("/Users/me");
+        let path = home.join(CONFIG_DIR_NAME).join(TOOL_ARTIFACTS_DB_NAME);
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/me/.codex-app-transfer/tool_artifacts.db")
+        );
     }
 }
