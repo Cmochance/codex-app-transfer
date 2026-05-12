@@ -1140,14 +1140,21 @@ fn convert_minimax_system_to_user_prefix(body: &mut Map<String, Value>, max_char
             );
             continue;
         }
-        if max_chars == 0 || normalized.chars().count() <= max_chars {
+        if max_chars == 0
+            || normalized.chars().count() + SYSTEM_PREFIX_SINGLE.chars().count() <= max_chars
+        {
+            // 单段 fast path:整段(含 `[System]\n` prefix)≤ max_chars,直接 emit
             rewritten.push(json!({
                 "role": "user",
                 "content": format!("{SYSTEM_PREFIX_SINGLE}{normalized}"),
             }));
             continue;
         }
-        let chunks = split_string_by_char_limit(&normalized, max_chars);
+        // 切片 path(chatgpt-codex P1 修):先**预估 prefix 长度**算进每片预算,
+        // 保证最终 emit 的每条 user message **整体 chars().count() ≤ max_chars**
+        // (之前直接 split(content, max_chars) 后加 prefix → 每条 ≈ max_chars + 22
+        //  char 超限,MiniMax 仍 400)
+        let chunks = split_system_content_for_prefix(&normalized, max_chars);
         let total = chunks.len();
         tracing::info!(
             error_id = "MINIMAX_SYS_CONVERT_SPLIT",
@@ -1165,6 +1172,41 @@ fn convert_minimax_system_to_user_prefix(body: &mut Map<String, Value>, max_char
         }
     }
     *messages = rewritten;
+}
+
+/// 抽 MiniMax system message 的 content 文本(silent-failure F2 修)。
+///
+/// 接受形态:
+/// 给 `[System part i/N]\n` prefix 留预算后切 system content。
+///
+/// **不变量(chatgpt-codex P1 修)**:返回的每个 chunk 加上其最终 prefix 后
+/// `chars().count() ≤ max_chars`。算法两轮迭代:
+/// 1. 第一轮假设 N ≤ 9(1 digit prefix `[System part 1/9]\n` = 19 char)算 budget
+/// 2. 若实际切出 chunks ≥ 10 → digit 数升,用更大 prefix length 再算一次
+///
+/// 99 段以内单 / 双轮收敛(99 段 prefix 最长 21 char,极少触发);MAX_CHARS=24000
+/// 下 system 内容 > 24000*99 ≈ 2.3MB 才可能 99+ 段,实际不可能。
+///
+/// **edge case**:`max_chars ≤ prefix_max` 时 budget=0,降级为 budget=1
+/// (`.max(1)`)避免无限切割空 chunk。这种 misconfiguration 下 emit 单字符
+/// chunks 但仍保证 invariant(prefix + 1 char ≤ max_chars 要求 max_chars ≥ 22,
+/// MAX_CHARS=24000 远高于此)。
+fn split_system_content_for_prefix(normalized: &str, max_chars: usize) -> Vec<String> {
+    let estimate_budget = |n_digits: usize| -> usize {
+        // prefix 形 "[System part {i}/{N}]\n",静态部分 "[System part /]\n" + 2*N digits
+        // 保守按"i 也用 N 位数"估上限
+        const STATIC_LEN: usize = "[System part /]\n".len();
+        let prefix_max = STATIC_LEN + 2 * n_digits;
+        max_chars.saturating_sub(prefix_max).max(1)
+    };
+    // 第一轮:假设 N ≤ 9(1 digit)
+    let chunks = split_string_by_char_limit(normalized, estimate_budget(1));
+    if chunks.len() <= 9 {
+        return chunks;
+    }
+    // 第二轮:N ≥ 10,用更大 prefix budget 重切
+    let n_digits = chunks.len().to_string().len();
+    split_string_by_char_limit(normalized, estimate_budget(n_digits))
 }
 
 /// 抽 MiniMax system message 的 content 文本(silent-failure F2 修)。
@@ -2433,44 +2475,55 @@ mod tests {
         // issue #139 修:超 max_chars 切片,每片独立 role=user + 标记部分编号
         // `[System part i/N]\n` prefix(silent-failure F4:让模型看出是同一逻辑
         // 段落的连续分片);单段不切则用 `[System]\n`。
-        let long = "a".repeat(12);
+        //
+        // chatgpt-codex P1 修后,budget 算法减去 prefix 长度:max_chars=50,
+        // prefix `[System part i/N]\n` static 16 char + 2*N digit;N=4 时 prefix
+        // 长度 16+2 = 18 → budget=32。system 121 char(60+1+60)→ 切 4 段
+        // (32+32+32+25)。
+        let long_a = "a".repeat(60);
+        let long_b = "b".repeat(60);
         let mut body = json!({
             "model": "MiniMax-M2.7",
             "messages": [
-                {"role":"system","content": format!("{}\r\n{}", long, long)},
+                {"role":"system","content": format!("{long_a}\r\n{long_b}")},
                 {"role":"user","content":"hi"}
             ]
         })
         .as_object()
         .expect("json object")
         .clone();
-        convert_minimax_system_to_user_prefix(&mut body, 10);
+        convert_minimax_system_to_user_prefix(&mut body, 50);
         let messages = body["messages"].as_array().unwrap();
-        // 原 system 24-char → 切成 3 段(10 + 10 + 5)→ 3 个 user message + 1 user follow
-        assert_eq!(messages.len(), 4);
-        for i in 0..3 {
-            assert_eq!(
-                messages[i]["role"], "user",
-                "split chunk {i} should be user"
+        let split_count = messages.len() - 1; // 最后一条是 follow user
+        assert!(
+            split_count >= 3,
+            "121 char 应至少切 3 段,实际 {split_count} 段"
+        );
+        for (i, msg) in messages.iter().enumerate() {
+            assert_eq!(msg["role"], "user", "msg {i} should be user");
+            // **chatgpt-codex P1 invariant**:每条 user message(含 prefix)≤ max_chars
+            let len = msg["content"].as_str().unwrap().chars().count();
+            assert!(
+                len <= 50,
+                "msg {i} len {len} > max_chars 50,违反 P1 invariant"
             );
         }
-        assert_eq!(messages[3]["role"], "user");
-        assert_eq!(messages[3]["content"], "hi");
-        // 验证 prefix 用 part i/N 标记 + 重组原文
-        let prefixes = [
-            "[System part 1/3]\n",
-            "[System part 2/3]\n",
-            "[System part 3/3]\n",
-        ];
+        assert_eq!(
+            messages.last().unwrap()["content"],
+            "hi",
+            "last 应是 follow user"
+        );
+        // 验证 prefix marker + 重组原文(N 由实际切片数决定)
         let mut joined = String::new();
-        for (i, expected_prefix) in prefixes.iter().enumerate() {
+        for i in 0..split_count {
             let content = messages[i]["content"].as_str().unwrap();
-            let chunk = content.strip_prefix(expected_prefix).unwrap_or_else(|| {
+            let expected_prefix = format!("[System part {}/{split_count}]\n", i + 1);
+            let chunk = content.strip_prefix(&expected_prefix).unwrap_or_else(|| {
                 panic!("chunk {i} missing prefix {expected_prefix:?}, got: {content}")
             });
             joined.push_str(chunk);
         }
-        assert_eq!(joined, format!("{long}\n{long}"));
+        assert_eq!(joined, format!("{long_a}\n{long_b}"));
         assert!(!joined.contains('\r'));
     }
 
@@ -2523,6 +2576,43 @@ mod tests {
         assert_eq!(messages.len(), 1, "image-only system 跳过,只剩 user");
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "q");
+    }
+
+    #[test]
+    fn minimax_chunked_messages_total_length_within_max_chars() {
+        // **chatgpt-codex P1 不变量验证**(2026-05-12):chunk + prefix 后**每条
+        // emitted user message 的 chars().count() ≤ max_chars**。之前直接
+        // split(content, max_chars) 后加 prefix → 每条 ≈ max_chars + 22 char
+        // 超限,MiniMax 仍 400。本测试用极端长 content + 小 max_chars 验证。
+        let long = "a".repeat(1_000);
+        let mut body = json!({
+            "model": "MiniMax-M2.7",
+            "messages": [
+                {"role":"system","content": long.clone()},
+                {"role":"user","content":"q"}
+            ]
+        })
+        .as_object()
+        .expect("json object")
+        .clone();
+        const MAX: usize = 100;
+        convert_minimax_system_to_user_prefix(&mut body, MAX);
+        let messages = body["messages"].as_array().unwrap();
+        // 全部 user role,no system
+        for (i, msg) in messages.iter().enumerate() {
+            assert_eq!(msg["role"], "user", "msg {i} should be user");
+            let content_len = msg["content"].as_str().unwrap().chars().count();
+            // **关键 invariant**:整条 user message(含 prefix)≤ MAX
+            assert!(
+                content_len <= MAX,
+                "msg {i} content len {} > MAX {}, violates chatgpt-codex P1 invariant",
+                content_len,
+                MAX,
+            );
+        }
+        // 验证 last user message 不变(role=user 但不是 split chunk)
+        let last = messages.last().unwrap();
+        assert_eq!(last["content"], "q");
     }
 
     #[test]
