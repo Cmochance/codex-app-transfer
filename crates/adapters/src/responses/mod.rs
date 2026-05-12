@@ -8,6 +8,7 @@
 //! - **响应侧**:Chat SSE → Responses SSE 状态机(text-only)。tool / reasoning /
 //!   function call 留 Stage 3.3。
 
+pub mod artifact_store;
 pub mod compact;
 pub mod converter;
 pub mod request;
@@ -15,6 +16,7 @@ pub mod session;
 pub mod stream;
 pub mod tool_call_cache;
 
+pub use artifact_store::{global_tool_artifact_store, ToolArtifactStore};
 pub use converter::ChatToResponsesConverter;
 pub use request::{
     responses_body_to_chat_body, responses_body_to_chat_body_for_provider,
