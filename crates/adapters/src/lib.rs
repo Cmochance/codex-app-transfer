@@ -23,6 +23,7 @@ pub mod registry;
 pub mod responses;
 pub mod types;
 
+pub use anthropic_messages::AnthropicMessagesAdapter;
 pub use gemini_cli::GeminiCliAdapter;
 pub use gemini_native::GeminiNativeAdapter;
 pub use grok_web::GrokWebAdapter;

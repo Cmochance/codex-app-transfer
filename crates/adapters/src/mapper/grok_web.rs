@@ -80,7 +80,9 @@ pub(crate) fn prepare_grok_web_request(
     Ok(RequestPlan {
         upstream_path: GROK_CHAT_PATH.to_owned(),
         body: grok_body,
+        upstream_headers: http::HeaderMap::new(),
         response_session: Some(conversion.response_session),
+        adapter_metadata: None,
         is_compact: false,
         original_responses_request: Some(parsed),
     })

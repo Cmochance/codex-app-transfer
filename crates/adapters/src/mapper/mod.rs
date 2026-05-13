@@ -4,6 +4,7 @@ use http::{HeaderMap, StatusCode};
 
 use crate::types::{AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
+pub(crate) mod anthropic_messages;
 pub(crate) mod chat;
 pub(crate) mod cloud_code;
 pub(crate) mod gemini_native;
@@ -77,7 +78,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn request_mapper_contracts_hold_for_three_mappers() {
+    fn request_mapper_contracts_hold_for_four_mappers() {
         let responses_provider = make_provider(
             "openai-chat",
             "OpenAI Chat",
@@ -131,6 +132,27 @@ mod contract_tests {
         assert!(
             cloud_code_plan.response_session.is_some(),
             "task 25 修后 cloud_code 必须 emit response_session 供 SSE 流末 cache write"
+        );
+
+        let anthropic_provider = make_provider(
+            "claude",
+            "Claude",
+            "https://api.anthropic.com/v1",
+            "anthropic_messages",
+        );
+        let anthropic_plan = crate::mapper::anthropic_messages::AnthropicMessagesMapper
+            .map_request("/v1/responses", responses_body_bytes(), &anthropic_provider)
+            .unwrap();
+        assert_common_request_contract(&anthropic_plan);
+        assert_eq!(anthropic_plan.upstream_path, "/messages");
+        assert!(anthropic_plan.response_session.is_some());
+        assert!(anthropic_plan.adapter_metadata.is_some());
+        assert_eq!(
+            anthropic_plan
+                .upstream_headers
+                .get("anthropic-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("2023-06-01")
         );
     }
 
@@ -231,6 +253,36 @@ mod contract_tests {
         assert_eq!(cloud_code_response.status, StatusCode::OK);
         assert_eq!(
             cloud_code_response
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let anthropic_provider = make_provider(
+            "claude",
+            "Claude",
+            "https://api.anthropic.com/v1",
+            "anthropic_messages",
+        );
+        let anthropic_plan = crate::mapper::anthropic_messages::AnthropicMessagesMapper
+            .map_request("/v1/responses", responses_body_bytes(), &anthropic_provider)
+            .unwrap();
+        let mut anthropic_headers = HeaderMap::new();
+        anthropic_headers.insert(CONTENT_LENGTH, "123".parse().unwrap());
+        anthropic_headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let anthropic_response = crate::mapper::anthropic_messages::AnthropicMessagesMapper
+            .map_response(
+                StatusCode::OK,
+                anthropic_headers,
+                Box::pin(stream::empty()),
+                &anthropic_provider,
+                &anthropic_plan,
+            )
+            .unwrap();
+        assert_eq!(anthropic_response.status, StatusCode::OK);
+        assert_eq!(
+            anthropic_response
                 .headers
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),

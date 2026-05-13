@@ -363,7 +363,9 @@ pub(crate) fn prepare_cloud_code_request(
     Ok(RequestPlan {
         upstream_path: cloud_code_upstream_path(stream),
         body: bytes::Bytes::from(outer_body),
+        upstream_headers: http::HeaderMap::new(),
         response_session: Some(conversion.response_session),
+        adapter_metadata: None,
         is_compact: false,
         original_responses_request: Some(parsed),
     })

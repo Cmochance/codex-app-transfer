@@ -37,7 +37,9 @@ pub(crate) fn prepare_responses_request(
         return Ok(RequestPlan {
             upstream_path: "/chat/completions".to_owned(),
             body: Bytes::from(new_body),
+            upstream_headers: http::HeaderMap::new(),
             response_session: None,
+            adapter_metadata: None,
             is_compact: true,
             original_responses_request: None,
         });
@@ -57,7 +59,9 @@ pub(crate) fn prepare_responses_request(
     Ok(RequestPlan {
         upstream_path,
         body: Bytes::from(new_body),
+        upstream_headers: http::HeaderMap::new(),
         response_session: Some(conversion.response_session),
+        adapter_metadata: None,
         is_compact: false,
         original_responses_request,
     })

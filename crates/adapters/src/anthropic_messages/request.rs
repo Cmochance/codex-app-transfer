@@ -4,6 +4,7 @@ use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
 use http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use http::HeaderMap;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::responses::{
@@ -15,7 +16,7 @@ use crate::types::{AdapterError, RequestPlan, ResponseSessionPlan};
 const DEFAULT_MAX_TOKENS: u64 = 4096;
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnthropicToolNameMaps {
     pub forward: BTreeMap<String, String>,
     pub reverse: BTreeMap<String, String>,
@@ -114,10 +115,13 @@ pub fn prepare_anthropic_messages_request(
 }
 
 pub fn into_request_plan(prepared: AnthropicMessagesPreparedRequest) -> RequestPlan {
+    let adapter_metadata = serde_json::to_value(&prepared.tool_name_maps).ok();
     RequestPlan {
         upstream_path: prepared.upstream_path,
         body: prepared.body,
+        upstream_headers: prepared.headers,
         response_session: prepared.response_session,
+        adapter_metadata,
         is_compact: prepared.is_compact,
         original_responses_request: prepared.original_responses_request,
     }

@@ -2,12 +2,13 @@
 //!
 //! 当前内置:
 //! - `openai_chat` → `OpenAiChatAdapter`
-//!
-//! Stage 3.2 起会注册 `responses` adapter,以及为部分 provider 注册其
-//! 专用 workaround adapter(如 deepseek 的 reasoning_content 字段处理)。
+//! - `responses` → `ResponsesAdapter`
+//! - `anthropic_messages` → `AnthropicMessagesAdapter`
+//! - `gemini_native` / `gemini_cli_oauth` / `grok_web` 等 provider-specific adapter
 
 use std::sync::Arc;
 
+use crate::anthropic_messages::AnthropicMessagesAdapter;
 use crate::core::routes;
 use crate::gemini_cli::GeminiCliAdapter;
 use crate::gemini_native::GeminiNativeAdapter;
@@ -22,6 +23,7 @@ pub struct AdapterRegistry {
     openai_chat: Arc<dyn Adapter>,
     responses: Arc<dyn Adapter>,
     responses_passthrough: Arc<dyn Adapter>,
+    anthropic_messages: Arc<dyn Adapter>,
     gemini_native: Arc<dyn Adapter>,
     gemini_cli: Arc<dyn Adapter>,
     grok_web: Arc<dyn Adapter>,
@@ -33,6 +35,7 @@ impl AdapterRegistry {
             openai_chat: Arc::new(OpenAiChatAdapter),
             responses: Arc::new(ResponsesAdapter),
             responses_passthrough: Arc::new(ResponsesPassthroughAdapter),
+            anthropic_messages: Arc::new(AnthropicMessagesAdapter),
             gemini_native: Arc::new(GeminiNativeAdapter),
             gemini_cli: Arc::new(GeminiCliAdapter),
             grok_web: Arc::new(GrokWebAdapter),
@@ -43,8 +46,8 @@ impl AdapterRegistry {
     ///
     /// - `openai` / `openai_chat` / `chat_completions` → `openai_chat` adapter
     /// - `responses` / `openai_responses` → `responses` adapter(协议转换层)
-    /// - **`anthropic` / `claude` / `messages`** Python 历史配置兼容值,归一到
-    ///   `responses` adapter(详见 docs/refactor/migration.md)
+    /// - `anthropic_messages` / `anthropic` / `claude` / `messages` /
+    ///   `claude_messages` → `anthropic_messages` adapter
     /// - **空 / 未知值 fallback 到 `openai_chat`**(跟 `Provider::api_format`
     ///   schema serde default 一致):本项目核心是 chat ↔ responses 协议转换
     ///   器,默认走 chat completions 转发更安全;客户端发 `/responses` 路径时
@@ -56,8 +59,9 @@ impl AdapterRegistry {
         let normalized = api_format.trim().to_ascii_lowercase().replace('-', "_");
         match normalized.as_str() {
             "openai" | "openai_chat" | "chat_completions" => self.openai_chat.clone(),
-            "responses" | "openai_responses" | "anthropic" | "claude" | "messages" => {
-                self.responses.clone()
+            "responses" | "openai_responses" => self.responses.clone(),
+            "anthropic_messages" | "anthropic" | "claude" | "messages" | "claude_messages" => {
+                self.anthropic_messages.clone()
             }
             "gemini_native" | "google_ai_studio" | "gemini" => self.gemini_native.clone(),
             "gemini_cli_oauth" | "gemini_cli" | "google_oauth_cloud_code" => {
@@ -91,8 +95,9 @@ impl AdapterRegistry {
         let normalized = api_format.trim().to_ascii_lowercase().replace('-', "_");
         // 用户显式选 responses 透传 + 入站是 /responses 路径 → 字节级透传给上游。
         // 上游需原生实现 OpenAI Responses API(如 OpenAI 官方 / 自建反代);
-        // anthropic/claude/messages 是 Python 历史兼容值,继续走 ResponsesAdapter
-        // 本地协议转换,不在此分支(后续若加 native Anthropic Messages 透传再扩)。
+        // anthropic/claude/messages 是 Python 历史兼容值,现在走
+        // AnthropicMessagesAdapter 做 Responses ↔ Anthropic Messages 转换,
+        // 不在 responses passthrough 分支。
         //
         // **关键例外**:`/responses/compact` 是本仓库私有扩展(不是 OpenAI 官方
         // 端点),OpenAI 上游不实现 → 必须走 ResponsesAdapter 在本地包装成 chat
@@ -187,15 +192,28 @@ mod tests {
     #[test]
     fn lookup_responses_aliases() {
         let r = AdapterRegistry::with_builtins();
+        for v in ["responses", "openai_responses", "Openai-Responses"] {
+            assert_eq!(r.lookup(v).name(), "responses", "{v} 应解析到 responses");
+        }
+    }
+
+    #[test]
+    fn lookup_anthropic_messages_aliases() {
+        let r = AdapterRegistry::with_builtins();
         for v in [
-            "responses",
-            "openai_responses",
-            "Openai-Responses",
+            "anthropic_messages",
             "anthropic",
             "claude",
             "messages",
+            "claude_messages",
+            "Anthropic-Messages",
+            "CLAUDE",
         ] {
-            assert_eq!(r.lookup(v).name(), "responses", "{v} 应解析到 responses");
+            assert_eq!(
+                r.lookup(v).name(),
+                "anthropic_messages",
+                "{v} 应解析到 anthropic_messages"
+            );
         }
     }
 
@@ -224,9 +242,9 @@ mod tests {
         let r = AdapterRegistry::with_builtins();
         assert_eq!(r.lookup("").name(), "openai_chat");
         assert_eq!(r.lookup("unknown_format").name(), "openai_chat");
-        // 显式 responses / anthropic / claude / messages 仍走 responses adapter
+        // 显式 responses 仍走 responses adapter;Anthropic 历史别名走新 adapter。
         assert_eq!(r.lookup("responses").name(), "responses");
-        assert_eq!(r.lookup("anthropic").name(), "responses");
+        assert_eq!(r.lookup("anthropic").name(), "anthropic_messages");
     }
 
     #[test]
@@ -321,16 +339,15 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_aliases_still_use_local_responses_adapter_not_passthrough() {
-        // anthropic/claude/messages 是 Python 历史兼容值 → 继续走 ResponsesAdapter
-        // 本地协议转换,不进 passthrough 分支(后续若加 Anthropic Messages 原生
-        // 透传需要再扩 lookup_for_request)
+    fn anthropic_aliases_use_anthropic_messages_adapter_not_passthrough() {
+        // anthropic/claude/messages 是 Python 历史兼容值 → 走
+        // AnthropicMessagesAdapter 本地协议转换,不进 responses passthrough 分支。
         let r = AdapterRegistry::with_builtins();
-        for api_format in ["anthropic", "claude", "messages"] {
+        for api_format in ["anthropic", "claude", "messages", "claude_messages"] {
             assert_eq!(
                 r.lookup_for_request(api_format, "/v1/responses").name(),
-                "responses",
-                "{api_format} 必须走 ResponsesAdapter 本地转换,不走 passthrough"
+                "anthropic_messages",
+                "{api_format} 必须走 AnthropicMessagesAdapter 本地转换,不走 passthrough"
             );
         }
     }

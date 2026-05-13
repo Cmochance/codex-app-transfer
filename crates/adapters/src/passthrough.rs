@@ -60,7 +60,9 @@ impl Adapter for ResponsesPassthroughAdapter {
         Ok(RequestPlan {
             upstream_path: rewrite_local_path_for_upstream(client_path),
             body,
+            upstream_headers: http::HeaderMap::new(),
             response_session: None,
+            adapter_metadata: None,
             is_compact: false,
             original_responses_request: None,
         })

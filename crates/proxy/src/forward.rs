@@ -6,7 +6,8 @@
 //! 3. 按 `provider.api_format` 查 adapter,跑 `prepare_request` 得到上游路径 + 改写后的 body
 //! 4. 复制非 hop / 非 Authorization 头到出站
 //! 5. 按 `provider.auth_scheme` 注入上游凭据(Bearer 或 X-Api-Key)
-//! 6. 注入 `provider.extra_headers`(如 kimi-code 的 User-Agent)
+//! 6. 注入 `provider.extra_headers`(如 kimi-code 的 User-Agent)和 adapter
+//!    默认协议头(如 Anthropic `anthropic-version`)
 //! 7. 若 body 中 `model` 是 `"<slug>/<real>"` 形式,把 `<slug>/` 剥掉
 //! 8. 用 reqwest 发起出站
 //! 9. 用 adapter `transform_response_stream`(默认透传)把响应灌回 axum
@@ -364,6 +365,7 @@ pub async fn forward_handler(
         &parts.headers,
         &resolved,
         &plan.body,
+        &plan.upstream_headers,
         &upstream_url,
     )
     .await?;
@@ -427,6 +429,7 @@ pub async fn forward_handler(
                 &parts.headers,
                 &resolved,
                 &plan.body,
+                &plan.upstream_headers,
                 &upstream_url,
             )
             .await?;
@@ -654,12 +657,14 @@ fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
 }
 
 /// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
-/// **extras 同名 header 走 override 语义**:reqwest `RequestBuilder::header()`
+/// **extras / adapter 同名 header 走 override 语义**:reqwest `RequestBuilder::header()`
 /// 是 append,不是 replace。如果客户端(例如 Codex CLI 自己加的
 /// `User-Agent: codex-cli/...`)和 `provider.extraHeaders`(例如 kimi-code
-/// 的 `User-Agent: KimiCLI/1.40.0`)同名,两条值都会上线,部分上游严格按
-/// "首条 UA"判定接入身份就会绕过我们的伪装。这里在复制客户端 header 时,
-/// 先把 extras 已经覆盖的名字过滤掉,保证最终只有 extras 的值出去。
+/// 的 `User-Agent: KimiCLI/1.40.0`)同名,或客户端 header 跟协议 adapter 的
+/// 默认头(如 `anthropic-version`)同名,两条值都会上线,部分上游严格按首条值
+/// 判定接入身份。这里在复制客户端 header 时先过滤掉将由 extras / adapter
+/// 写入的名字,保证最终只有一份明确值出去。provider.extraHeaders 优先级高于
+/// adapter defaults。
 ///
 /// 抽成 helper 是为了 web_search transparent retry 路径复用同一份 header /
 /// auth 构造逻辑(forward 主路径调一次,4xx web_search 拒绝时再调一次)。
@@ -669,6 +674,7 @@ async fn build_and_send_upstream(
     inbound_headers: &HeaderMap,
     resolved: &ResolvedProvider,
     plan_body: &Bytes,
+    adapter_headers: &HeaderMap,
     upstream_url: &str,
 ) -> Result<(reqwest::Response, HeaderMap), ForwardError> {
     // GoogleOauthCloudCode / GoogleOauthAntigravity authScheme:provider.api_key
@@ -728,6 +734,9 @@ async fn build_and_send_upstream(
         if resolved.extra_headers.contains_key(name) {
             continue;
         }
+        if adapter_headers.contains_key(name) {
+            continue;
+        }
         // dup-header 防御(review-feedback A4):GrokCookie scheme 下,grok.com
         // 必需的 headers(Cookie / Origin / Referer / Accept-* / Sec-Fetch-* /
         // x-statsig-id / x-xai-request-id / traceparent)由 grok_web::auth 统一
@@ -741,6 +750,12 @@ async fn build_and_send_upstream(
     }
     up = inject_auth(up, resolved, oauth_bearer.as_deref());
     for (name, value) in resolved.extra_headers.iter() {
+        up = up.header(name, value);
+    }
+    for (name, value) in adapter_headers.iter() {
+        if resolved.extra_headers.contains_key(name) {
+            continue;
+        }
         up = up.header(name, value);
     }
     // Cloud Code Assist 上游 OAuth providers **必须**用各自 UA + X-Goog-Api-Client

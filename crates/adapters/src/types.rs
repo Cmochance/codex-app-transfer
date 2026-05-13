@@ -40,10 +40,18 @@ pub struct RequestPlan {
     pub upstream_path: String,
     /// 改写后的请求体。openai_chat 路径下与入参等同。
     pub body: Bytes,
+    /// Adapter-provided outbound headers that belong to the upstream protocol.
+    /// proxy applies these after provider `extra_headers`, without overriding
+    /// user-configured provider headers.
+    pub upstream_headers: HeaderMap,
     /// Responses adapter uses this to save the Chat messages that produced the
     /// outbound response, so future `previous_response_id` requests can restore
     /// history.
     pub response_session: Option<ResponseSessionPlan>,
+    /// Adapter-specific request state that response mappers may need later.
+    /// This stays internal to the adapter/proxy boundary and must not be exposed
+    /// as part of the user-facing protocol.
+    pub adapter_metadata: Option<Value>,
     /// 是否是 `/responses/compact` 请求(由 Responses adapter 转换成 chat
     /// completions 模拟 compact 端点)。`transform_response_stream` 据此选择
     /// 直接 SSE 转换还是包装成 `{"output":[{"type":"compaction",...}]}` 响应。

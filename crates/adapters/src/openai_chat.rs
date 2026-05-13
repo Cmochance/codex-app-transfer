@@ -43,7 +43,9 @@ impl Adapter for OpenAiChatAdapter {
         Ok(RequestPlan {
             upstream_path: normalize_v1_prefix(client_path),
             body,
+            upstream_headers: http::HeaderMap::new(),
             response_session: None,
+            adapter_metadata: None,
             is_compact: false,
             // openai_chat 路径直接 passthrough,入站本来就是 chat 格式,
             // 无 namespace 包装也无 Responses API envelope 字段需求,留 None。

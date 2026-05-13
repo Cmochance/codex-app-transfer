@@ -2,7 +2,7 @@
 
 > 当前任务: 为 Claude 系列模型新增 `anthropic_messages` 协议适配。
 > 方案文档: `docs/plans/2026-05-13-messages-responses-protocol.md`
-> 当前状态: P4 Response Mapper 已完成;`anthropic_messages` 尚未接入 adapter/registry,不会暴露给 UI 或 provider preset。
+> 当前状态: P5 Adapter 与 Registry 已完成;`anthropic_messages` 已可通过 provider `apiFormat` 路由,但尚未接入配置/UI/preset。
 
 ## 已确认事实
 
@@ -55,11 +55,12 @@
 
 ### P5 Adapter 与 Registry
 
-- [ ] 新增 `AnthropicMessagesAdapter`。
-- [ ] 新增 `mapper::anthropic_messages::AnthropicMessagesMapper`。
-- [ ] 更新 `lib.rs`、`mapper/mod.rs`、`registry.rs`。
-- [ ] 更新 mapper contract tests。
-- [ ] 更新 registry alias tests。
+- [x] 新增 `AnthropicMessagesAdapter`。
+- [x] 新增 `mapper::anthropic_messages::AnthropicMessagesMapper`。
+- [x] 更新 `lib.rs`、`mapper/mod.rs`、`registry.rs`。
+- [x] 更新 mapper contract tests。
+- [x] 更新 registry alias tests。
+- [x] 接通 adapter 默认 outbound headers 到 proxy 转发路径。
 
 ### P6 配置与 UI
 
@@ -82,7 +83,7 @@
 
 ## 当前下一步
 
-进入 P5 Adapter 与 Registry:把已完成的 request/response mapper 接入 mapper trait、adapter 与 registry。仍然不要先改 UI 或 preset,避免用户看到一个尚未完成真实验证的 Claude 协议入口。
+进入 P6 配置与 UI:让 backend/provider normalization 能保存并使用 `anthropic_messages`,并补齐 provider test/model-list 分支。仍然不要添加 Claude preset,直到 P7 真实 Claude 验证完成。
 
 ## 执行记录
 
@@ -139,6 +140,20 @@
 - 将 compact response 的 summary 包装逻辑从 `responses::compact` 提成 `compact_response_body_from_summary_text`,让 Anthropic compact 路径复用同一个 `COMPACT_SUMMARY_PREFIX` 与 `<summary>` 抽取规则。
 - 新增 `crates/adapters/tests/anthropic_messages_response.rs`,覆盖 text、thinking、tool_use、sanitized tool name reverse、error、unknown event、max_tokens、stream interrupted、session cache 与 Anthropic compact response。
 
+### 2026-05-13 P5
+
+- 新增 `mapper::anthropic_messages::AnthropicMessagesMapper`,实现 `RequestMapper` / `ResponseMapper`,把 P3 request mapper 与 P4 response mapper接入统一 mapper trait。
+- 新增薄层 `AnthropicMessagesAdapter`,只负责调用 mapper 层,不承载复杂 provider-specific 分支。
+- 更新 `AdapterRegistry`:
+  - canonical `anthropic_messages` 接入新 adapter;
+  - 历史别名 `anthropic` / `claude` / `messages` / `claude_messages` 现在路由到 `anthropic_messages`;
+  - `responses` / `openai_responses` 仍保持 OpenAI Responses 语义与 passthrough 例外。
+- 更新 `lib.rs` 和 `mapper/mod.rs`,公开 adapter 并纳入 mapper contract tests。
+- 步骤级调整:新增 `RequestPlan.upstream_headers` 与 `adapter_metadata`。原因:
+  - P3 已生成 Anthropic 必需默认头,但旧 `RequestPlan` 没有字段传给 proxy,真实请求会丢 `anthropic-version`;
+  - P4 response mapper 需要 P3 的 tool name reverse map,否则 registry 接入后 sanitized tool name 无法可靠还原。
+- proxy 出站请求现在会合并 adapter 默认协议头,并保持 `provider.extraHeaders` 覆盖 adapter defaults;新增回归测试确认客户端同名 header 不会重复上线。
+
 ## 验证记录
 
 - 已通过: `cargo fmt --all`
@@ -161,3 +176,15 @@
 - 已通过: `cargo test -p codex-app-transfer-adapters`
   - P4 后结果:483 unit tests passed;12 `anthropic_messages_request` integration tests passed;10 `anthropic_messages_response` integration tests passed;3 `responses_streaming` integration tests passed。
   - 既有 warning 仍为 `gemini_oauth` 未使用 import 与 `grok_web` dead_code,非本次 P4 新增。
+- 已通过: `cargo fmt --all --check`
+- 已通过: `cargo test -p codex-app-transfer-adapters --test anthropic_messages_request --test anthropic_messages_response`
+  - P5 后结果:12 request tests passed;10 response tests passed。
+- 已通过: `cargo test -p codex-app-transfer-adapters`
+  - P5 后结果:484 unit tests passed;12 `anthropic_messages_request` integration tests passed;10 `anthropic_messages_response` integration tests passed;3 `responses_streaming` integration tests passed。
+  - 既有 warning 仍为 `gemini_oauth` 未使用 import 与 `grok_web` dead_code,非本次 P5 新增。
+- 已通过: `cargo test -p codex-app-transfer-proxy --test auth_and_routing anthropic_messages_forward_injects_adapter_protocol_headers`
+  - 说明:沙箱内第一次因本地端口绑定权限失败;提升权限后通过。
+- 已通过: `cargo test -p codex-app-transfer-proxy --test auth_and_routing`
+  - P5 后结果:15 passed。
+- 已通过: `cargo check --workspace`
+  - 既有 warning 仍为 `gemini_oauth` 未使用 import、`grok_web` dead_code、`src-tauri` unused doc/dead_code,非本次 P5 新增。
