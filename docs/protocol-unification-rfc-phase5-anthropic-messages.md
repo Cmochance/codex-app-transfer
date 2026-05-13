@@ -1,6 +1,6 @@
 # Protocol Unification RFC (Phase 5 Anthropic Messages)
 
-> Status: Draft, P2 scaffold completed on 2026-05-13.
+> Status: Draft, P3 request mapper completed on 2026-05-13.
 > Scope: Add a first-class `anthropic_messages` protocol adapter for Claude-family providers.
 
 ## Goal
@@ -154,7 +154,7 @@ P2 tests:
 - Parse and validate fixture shape.
 - Compile ignored request-mapper tests that intentionally fail when run with `--ignored`.
 
-P3 promotes those ignored tests by replacing the placeholder panic with real mapper calls.
+P3 promoted those ignored tests by replacing the placeholder panic with real mapper calls and adding request-side coverage for path/header defaults, compact lowering, tool-name sanitization, `tool_choice`, thinking, metadata filtering, and orphan tool-result diagnostics.
 
 Expected commands after P2:
 

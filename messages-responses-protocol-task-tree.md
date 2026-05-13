@@ -2,7 +2,7 @@
 
 > 当前任务: 为 Claude 系列模型新增 `anthropic_messages` 协议适配。
 > 方案文档: `docs/plans/2026-05-13-messages-responses-protocol.md`
-> 当前状态: P2 RFC、Anthropic SSE fixtures、request mapper TDD 骨架已完成;生产 mapper 代码尚未改动。
+> 当前状态: P3 Request Mapper 已完成;`anthropic_messages` 尚未接入 adapter/registry,不会暴露给 UI 或 provider preset。
 
 ## 已确认事实
 
@@ -38,12 +38,12 @@
 
 ### P3 Request Mapper
 
-- [ ] 新增 `crates/adapters/src/anthropic_messages/request.rs`。
-- [ ] 复用 Responses input/session pipeline。
-- [ ] 实现 chat-shape -> Anthropic Messages lowering。
-- [ ] 实现 tool name sanitize 与 reverse map。
-- [ ] 实现 Anthropic path/header/max_tokens/thinking/tool_choice 映射。
-- [ ] 通过请求侧单测。
+- [x] 新增 `crates/adapters/src/anthropic_messages/request.rs`。
+- [x] 复用 Responses input/session pipeline。
+- [x] 实现 chat-shape -> Anthropic Messages lowering。
+- [x] 实现 tool name sanitize 与 reverse map。
+- [x] 实现 Anthropic path/header/max_tokens/thinking/tool_choice 映射。
+- [x] 通过请求侧单测。
 
 ### P4 Response Mapper
 
@@ -82,7 +82,7 @@
 
 ## 当前下一步
 
-进入 P3 Request Mapper:新增 `anthropic_messages` 请求映射模块,先让 P2 中的 ignored TDD 用例接到真实 mapper,再补 tool name sanitize、tool result pairing、headers/path/max_tokens/thinking/tool_choice 的单元覆盖。不要先改 UI 或 preset,避免用户看到一个尚未闭环的 Claude 协议入口。
+进入 P4 Response Mapper:新增 `anthropic_messages` 响应状态机,把 Anthropic Messages SSE 转回 Responses SSE。不要先改 UI 或 preset,避免用户看到一个尚未闭环的 Claude 协议入口。
 
 ## 执行记录
 
@@ -95,6 +95,32 @@
 - 新增 request mapper JSON fixture,覆盖纯文本请求和 tool_use/tool_result pairing。
 - 新增 `crates/adapters/tests/anthropic_messages_request.rs`:默认测试校验 fixture 可解析;两个 `#[ignore]` 测试作为 P3 的 request mapper TDD 入口。
 
+### 2026-05-13 P3
+
+- 新增 `crates/adapters/src/anthropic_messages/mod.rs` 与 `request.rs`,只落请求侧转换能力,尚未接入 adapter/registry。
+- 请求侧复用 `responses_body_to_chat_body_for_provider_with_session`,因此保留现有 `previous_response_id`、tool-call repair、compact prompt 和 history budget 行为。
+- 实现 chat-shape -> Anthropic Messages lowering:
+  - `system` / `developer` 汇总为 top-level `system`;
+  - user/assistant text 转 `text` block;
+  - assistant `tool_calls` 转 `tool_use` block;
+  - `tool` message 转 user `tool_result` block;
+  - image URL/data URL 转 Anthropic image block;
+  - assistant `reasoning_content` 转 thinking block。
+- 实现 tool name sanitize:
+  - 非 `^[a-zA-Z0-9_-]{1,128}$` 字符替换为 `_`;
+  - 合法前导 `_` 保持不变;
+  - 碰撞时追加数字后缀;
+  - 返回 forward/reverse map,供 P4 response mapper 还原工具名。
+- 实现 Anthropic 请求侧参数:
+  - upstream path 根据 base URL 是否已含 `/v1` 选择 `/messages` 或 `/v1/messages`;
+  - default headers 暴露 `anthropic-version: 2023-06-01` 与 `content-type: application/json`,P5 接 proxy 时再合并进出站请求;
+  - `max_tokens` 必填,缺省使用 `4096`;
+  - compact 请求使用 `stream:false`,普通请求使用 `stream:true`;
+  - `tool_choice` 与 `parallel_tool_calls` 映射为 Anthropic `tool_choice.disable_parallel_tool_use`;
+  - `reasoning_effort` 映射为 Anthropic `thinking`;
+  - email/phone 形态 user id 不写入 `metadata.user_id`。
+- 孤立 tool result 现在在请求 mapper 返回可诊断 `BadRequest`,避免把不合法 tool_result 静默发给 Anthropic。
+
 ## 验证记录
 
 - 已通过: `cargo fmt --all`
@@ -104,3 +130,9 @@
 - 已确认预期失败: `cargo test -p codex-app-transfer-adapters --test anthropic_messages_request -- --ignored`
   - 结果:2 failed。
   - 失败原因:两个 ignored 测试均命中 `P3 must call the real Anthropic Messages request mapper here` 占位 panic,说明 P3 接入真实 request mapper 后有明确 TDD 入口。
+- 已通过: `cargo test -p codex-app-transfer-adapters --test anthropic_messages_request`
+  - P3 后结果:12 passed,0 ignored。
+  - 覆盖 text fixture、tool_use/tool_result fixture、tool name sanitize/reverse map、tool_choice/parallel mapping、reasoning/metadata、compact 非流式 request、upstream path/default headers、orphan tool result BadRequest。
+- 已通过: `cargo test -p codex-app-transfer-adapters`
+  - 结果:483 unit tests passed;12 `anthropic_messages_request` integration tests passed;3 `responses_streaming` integration tests passed。
+  - 既有 warning 仍为 `gemini_oauth` 未使用 import 与 `grok_web` dead_code,非本次 P3 新增。
