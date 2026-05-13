@@ -62,6 +62,15 @@
 - **创建日期**: 2026-05-13(原 task #23 创建 2026-05-12,本条是评估降级后的接续 ticket)
 - **关联 PR**: 当前无未合 PR;原触发是 PR #135-#138 grok_web 引入 web search 阶段,后续讨论在 PR #146 task 25 流程中
 
+### #24 [P3 / 协议兼容] Vertex/Azure Claude 去除 cache_control.scope
+
+- **触发上下文**: 2026-05-14 Messages <=> Responses 对齐 LiteLLM 排查。用户明确要求当前不实现 Vertex/Azure 分支,因为使用量很少,需要后续再做。
+- **问题描述**: 当前 `anthropic_messages` 直转路径会保留 Anthropic 原生 `cache_control` 对象,包括 `scope` 字段。LiteLLM 在 Vertex AI Anthropic passthrough、Azure AI Foundry Anthropic Messages、Bedrock Anthropic 路径中会移除 `cache_control.scope`,因为这些上游只接受 `type`/`ttl` 等子集。当前项目尚未实现 Vertex/Azure 专属 Claude provider,因此直接保留会在未来新增相关 provider 时触发上游 400。
+- **已有调研**: 本地 LiteLLM `docs/litellm` 已确认三处参考实现:`litellm/llms/anthropic/experimental_pass_through/messages/transformation.py` 的 `_remove_scope_from_cache_control`,Vertex AI Anthropic passthrough 调用该方法,以及 `litellm/llms/azure_ai/anthropic/messages_transformation.py` 的 Azure 专用实现。处理范围都是 `system` list 与 `messages[].content[]` 中带 `cache_control` 的 block。
+- **风险 / 不确定性**: 需要先确认本项目未来 provider 分类字段如何表达 Vertex/Azure/Bedrock Claude,避免把官方 Anthropic 或 Anyrouter 的 `prompt-caching-scope-2026-01-05` 能力误删。Anyrouter 当前依赖完整 Claude Code beta 与 scope 能力,不能用全局清理。
+- **建议方向**: 新增 Vertex/Azure/Bedrock Anthropic provider 时,在 provider-specific request option 或 adapter post-processing 分支中按 LiteLLM 范围移除 `cache_control.scope`,并补一个 request fixture 覆盖 `system` 与 `messages` 两处。不要把该逻辑放到通用 `anthropic_messages` 基础转换中。
+- **创建日期**: 2026-05-14
+
 ---
 
 ## Resolved

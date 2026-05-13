@@ -173,6 +173,78 @@ pub fn into_request_plan(prepared: AnthropicMessagesPreparedRequest) -> RequestP
     }
 }
 
+pub fn is_anthropic_invalid_thinking_signature_error(body_bytes: &[u8]) -> bool {
+    let Ok(body) = std::str::from_utf8(body_bytes) else {
+        return false;
+    };
+    let lower = body.to_ascii_lowercase();
+    lower.contains("invalid")
+        && lower.contains("signature")
+        && lower.contains("thinking")
+        && lower.contains("block")
+}
+
+pub fn strip_thinking_blocks_for_invalid_signature_retry(
+    plan: &mut RequestPlan,
+) -> Result<bool, AdapterError> {
+    let mut request: Value = serde_json::from_slice(&plan.body)?;
+    let changed = strip_thinking_blocks_from_anthropic_messages_request_value(&mut request);
+    if !changed {
+        return Ok(false);
+    }
+
+    plan.body = Bytes::from(serde_json::to_vec(&request).map_err(AdapterError::BodyDecode)?);
+    if let Some(session) = plan.response_session.as_mut() {
+        strip_thinking_blocks_from_anthropic_messages(&mut session.messages);
+    }
+    Ok(true)
+}
+
+fn strip_thinking_blocks_from_anthropic_messages_request_value(request: &mut Value) -> bool {
+    let Some(body) = request.as_object_mut() else {
+        return false;
+    };
+    let mut changed = body.remove("thinking").is_some();
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        changed |= strip_thinking_blocks_from_anthropic_messages(messages);
+    }
+    changed
+}
+
+fn strip_thinking_blocks_from_anthropic_messages(messages: &mut Vec<Value>) -> bool {
+    let mut changed = false;
+    let mut next = Vec::with_capacity(messages.len());
+    for mut message in std::mem::take(messages) {
+        if strip_thinking_blocks_from_anthropic_message(&mut message, &mut changed) {
+            next.push(message);
+        } else {
+            changed = true;
+        }
+    }
+    *messages = next;
+    changed
+}
+
+fn strip_thinking_blocks_from_anthropic_message(message: &mut Value, changed: &mut bool) -> bool {
+    let Some(obj) = message.as_object_mut() else {
+        return true;
+    };
+    let Some(content) = obj.get_mut("content").and_then(Value::as_array_mut) else {
+        return true;
+    };
+    let before = content.len();
+    content.retain(|block| {
+        !matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+    });
+    if content.len() != before {
+        *changed = true;
+    }
+    !content.is_empty()
+}
+
 pub fn responses_body_to_anthropic_messages_request(
     input: &Value,
     provider: &Provider,
@@ -2702,6 +2774,94 @@ mod tests {
         assert_eq!(
             headers.get(ACCEPT).and_then(|v| v.to_str().ok()),
             Some("application/json")
+        );
+    }
+
+    #[test]
+    fn invalid_thinking_signature_error_detector_matches_litellm_keywords() {
+        assert!(is_anthropic_invalid_thinking_signature_error(
+            br#"{"error":{"message":"messages.3.content.0: Invalid `signature` in `thinking` block"}}"#
+        ));
+        assert!(!is_anthropic_invalid_thinking_signature_error(
+            br#"{"error":{"message":"Invalid model name"}}"#
+        ));
+        assert!(!is_anthropic_invalid_thinking_signature_error(&[
+            0xff, 0xfe, 0xfd,
+        ]));
+    }
+
+    #[test]
+    fn invalid_signature_retry_strips_thinking_blocks_from_body_and_session() {
+        let mut plan = RequestPlan {
+            upstream_path: "/v1/messages".into(),
+            body: Bytes::from(
+                json!({
+                    "model": "claude-opus-4-7",
+                    "stream": true,
+                    "thinking": {"type": "adaptive"},
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "old", "signature": "bad"},
+                                {"type": "redacted_thinking", "data": "sealed"},
+                                {"type": "text", "text": "visible"}
+                            ]
+                        },
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "only thinking", "signature": "bad"}
+                            ]
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            upstream_headers: HeaderMap::new(),
+            response_session: Some(ResponseSessionPlan {
+                response_id: "resp_retry".into(),
+                messages: vec![
+                    json!({
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "old", "signature": "bad"},
+                            {"type": "text", "text": "visible"}
+                        ]
+                    }),
+                    json!({
+                        "role": "assistant",
+                        "content": [
+                            {"type": "redacted_thinking", "data": "sealed"}
+                        ]
+                    }),
+                ],
+            }),
+            adapter_metadata: None,
+            is_compact: false,
+            original_responses_request: None,
+        };
+
+        assert!(strip_thinking_blocks_for_invalid_signature_retry(&mut plan).unwrap());
+        let body: Value = serde_json::from_slice(&plan.body).unwrap();
+        assert!(body.get("thinking").is_none());
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            2,
+            "messages whose content becomes empty must be omitted"
+        );
+        assert_eq!(
+            messages[1]["content"],
+            json!([{"type": "text", "text": "visible"}])
+        );
+        assert_eq!(
+            plan.response_session.as_ref().unwrap().messages,
+            vec![json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "visible"}]
+            })]
         );
     }
 
