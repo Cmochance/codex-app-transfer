@@ -55,6 +55,7 @@ pub(super) fn default_config_value() -> Value {
             "autoApplyOnStart": true,
             "exposeAllProviderModels": false,
             "restoreCodexOnExit": true,
+            "autoUnlockCodexPlugins": false,
             "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
         }
     })

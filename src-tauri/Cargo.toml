@@ -46,12 +46,15 @@ sha2 = "0.10"
 # 进程内 std::sync::Mutex 不管多 OS 进程,fs2::FileExt::lock_exclusive 走 fcntl
 # (POSIX) / LockFileEx (Windows),OS 级独占。
 fs2 = "0.4"
+# CDP WebSocket 连接（Codex Plugins 解锁器）
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# futures 用于 WebSocket Stream/Sink 的 split 操作
+futures = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = "0.2"
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplication"] }
-
 
 [features]
 # 默认空,自定义 protocol 在打包时启用

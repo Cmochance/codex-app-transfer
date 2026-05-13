@@ -62,33 +62,6 @@
 - **创建日期**: 2026-05-13(原 task #23 创建 2026-05-12,本条是评估降级后的接续 ticket)
 - **关联 PR**: 当前无未合 PR;原触发是 PR #135-#138 grok_web 引入 web search 阶段,后续讨论在 PR #146 task 25 流程中
 
-### #24 [P3 / 协议兼容] Vertex/Azure Claude 去除 cache_control.scope
-
-- **触发上下文**: 2026-05-14 Messages <=> Responses 对齐 LiteLLM 排查。用户明确要求当前不实现 Vertex/Azure 分支,因为使用量很少,需要后续再做。
-- **问题描述**: 当前 `anthropic_messages` 直转路径会保留 Anthropic 原生 `cache_control` 对象,包括 `scope` 字段。LiteLLM 在 Vertex AI Anthropic passthrough、Azure AI Foundry Anthropic Messages、Bedrock Anthropic 路径中会移除 `cache_control.scope`,因为这些上游只接受 `type`/`ttl` 等子集。当前项目尚未实现 Vertex/Azure 专属 Claude provider,因此直接保留会在未来新增相关 provider 时触发上游 400。
-- **已有调研**: 本地 LiteLLM `docs/litellm` 已确认三处参考实现:`litellm/llms/anthropic/experimental_pass_through/messages/transformation.py` 的 `_remove_scope_from_cache_control`,Vertex AI Anthropic passthrough 调用该方法,以及 `litellm/llms/azure_ai/anthropic/messages_transformation.py` 的 Azure 专用实现。处理范围都是 `system` list 与 `messages[].content[]` 中带 `cache_control` 的 block。
-- **风险 / 不确定性**: 需要先确认本项目未来 provider 分类字段如何表达 Vertex/Azure/Bedrock Claude,避免把官方 Anthropic 或 Anyrouter 的 `prompt-caching-scope-2026-01-05` 能力误删。Anyrouter 当前依赖完整 Claude Code beta 与 scope 能力,不能用全局清理。
-- **建议方向**: 新增 Vertex/Azure/Bedrock Anthropic provider 时,在 provider-specific request option 或 adapter post-processing 分支中按 LiteLLM 范围移除 `cache_control.scope`,并补一个 request fixture 覆盖 `system` 与 `messages` 两处。不要把该逻辑放到通用 `anthropic_messages` 基础转换中。
-- **创建日期**: 2026-05-14
-
-### #25 [P1 / 真实验证] 官方 Claude API 端到端验证后启用 preset
-
-- **触发上下文**: 2026-05-14 Messages <=> Responses 任务树 P7 复盘。用户确认 Anyrouter 端到端与手动完整 coding 已可视为 Claude-compatible 验证完成,但官方 Claude API 要等后续用户有 Claude API key 后再测试。
-- **问题描述**: 当前 `anthropic_messages` 直转路径已通过本地单测、proxy 回归和 Anyrouter 真实探针,但还没有用官方 Anthropic/Claude API provider 跑 text、tool-call、`previous_response_id` continuation、upstream error 四类真实路径。因此官方 Claude API preset 仍不能宣称完成验收。
-- **已有调研**: 当前项目已经支持 `apiFormat=anthropic_messages`、`authScheme=bearer`/`x-api-key`、Anthropic 默认协议头、`sk-ant-oat*` 手动 token header 兼容、invalid thinking signature 一次性恢复重试。此前只读探测未发现 shell 中有 `ANTHROPIC_API_KEY` / `CLAUDE_API_KEY`,`~/.codex-app-transfer/config.json` 也没有官方 Anthropic/Claude provider。
-- **风险 / 不确定性**: Anyrouter 成功不等价于官方 Anthropic 成功。官方 API 对 beta header、web_search、1M context、thinking signature、tool result continuation 的约束可能与 Anyrouter 不完全一致。不能在未跑官方上游前把官方 Claude preset 标为 fully verified。
-- **建议方向**: 用户提供 Claude API key 后,先新增临时官方 Anthropic provider 草稿,baseUrl 使用 `https://api.anthropic.com`,apiFormat 使用 `anthropic_messages`,再跑 text、forced tool-call + `function_call_output` continuation、upstream 4xx/invalid thinking signature、web_search 与长上下文 smoke。通过后再添加官方 Claude API preset,并同步更新 task tree/README/release notes。
-- **创建日期**: 2026-05-14
-
-### #26 [P2 / 认证路径] Anthropic/Claude 账号 OAuth 登录路径调研
-
-- **触发上下文**: 2026-05-14 用户询问“目前有通过登陆授权实现通信的路径吗”。当前结论是项目只有 API key/手动 token 路径,没有类似 Gemini CLI / Antigravity 的 Anthropic 账号 OAuth 登录授权流程。
-- **问题描述**: `anthropic_messages` 当前可以把用户手动提供的 `sk-ant-oat*` token 按 LiteLLM 方式转成 `Authorization: Bearer` 并合并 `oauth-2025-04-20` beta,但这不是登录流程。项目还没有获取、刷新、持久化 Anthropic/Claude OAuth token 的前端 UI、后端 auth flow、token 文件格式或安全边界。
-- **已有调研**: 本轮只确认 LiteLLM 处理“已给定 token”的 header 兼容逻辑,没有看到可直接搬用的 Anthropic 账号 OAuth 登录流程。本项目现有 OAuth 基础设施集中在 Google Gemini CLI / Antigravity,鉴权上游、客户端身份、token 生命周期与 Anthropic 不同,不能直接套用。
-- **风险 / 不确定性**: 需要先确认 Anthropic/Claude Code 官方或事实上的 OAuth 流程是否允许第三方客户端使用,以及是否存在封号、TOS、客户端识别或 token 刷新风险。不能为了省 API key 而把不明确的 Claude Code impersonation 路径做成默认推荐。
-- **建议方向**: 后续若要支持 Claude 账号登录,先从官方 Anthropic 文档、Claude Code 本地凭据行为和 LiteLLM/社区实现三侧交叉验证。形成单独方案后再决定是否新增 `authScheme=anthropic_oauth`、前端登录卡片、token 存储和退出登录能力。
-- **创建日期**: 2026-05-14
-
 ---
 
 ## Resolved

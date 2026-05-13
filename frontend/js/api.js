@@ -44,7 +44,6 @@
     aliyun: { logo: 'assets/providers/aliyun.ico' },
     minimax: { logo: 'assets/providers/minimax.ico' },
     minimaxi: { logo: 'assets/providers/minimax.ico' },
-    anyrouter: { icon: 'bi-diagram-3-fill' },
     // Gemini CLI(OAuth)provider — 用 Gemini 品牌四角星 spark 图标(brand mark
     // 跟 gemini.google.com 一致)。**必须放在 'gemini' 通用规则前**(JS object
     // iteration 顺序 = insertion 顺序),computeIcon 子串匹配 'gemini-cli' 命中
@@ -245,7 +244,6 @@
         baseUrlOptions: p.baseUrlOptions || [],
         baseUrlHint: p.baseUrlHint || '',
         requestOptionPresets: p.requestOptionPresets || {},
-        notices: p.notices || [],
         extraHeaders: p.extraHeaders || {},
         modelCapabilities: p.modelCapabilities || {},
         requestOptions: p.requestOptions || {},
@@ -496,3 +494,29 @@
     },
   };
 })();
+
+// ── Codex Desktop Plugins 解锁 API ──
+
+window.CCAPI = window.CCAPI || {};
+
+window.CCAPI.pluginUnlock = {
+  /** 查询解锁状态 */
+  async status() {
+    return api('GET', '/api/desktop/plugin-unlock/status');
+  },
+
+  /** 启动解锁服务 */
+  async start() {
+    return api('POST', '/api/desktop/plugin-unlock/start');
+  },
+
+  /** 停止解锁服务 */
+  async stop() {
+    return api('POST', '/api/desktop/plugin-unlock/stop');
+  },
+
+  /** 手动触发重新注入 */
+  async reinject() {
+    return api('POST', '/api/desktop/plugin-unlock/reinject');
+  },
+};

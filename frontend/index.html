@@ -78,6 +78,16 @@
             <span class="large-dot"></span>
             <strong id="dashboardProviderName">DeepSeek</strong>
           </article>
+          <article class="status-card" id="pluginUnlockCard">
+            <h2 data-i18n="dashboard.pluginUnlockStatus">Plugins 解锁</h2>
+            <div class="hero-status muted" id="pluginUnlockIcon"><i class="bi bi-lock"></i></div>
+            <strong class="muted-text" id="pluginUnlockStatus" data-i18n="status.notRunning">未运行</strong>
+            <div class="plugin-unlock-actions" style="margin-top:8px;display:none;" id="pluginUnlockActions">
+              <button class="btn btn-outline-primary btn-sm" type="button" data-action="plugin-unlock-start"><i class="bi bi-play"></i><span data-i18n="common.start">启动</span></button>
+              <button class="btn btn-outline-secondary btn-sm" type="button" data-action="plugin-unlock-reinject"><i class="bi bi-arrow-repeat"></i><span data-i18n="common.reinject">重新注入</span></button>
+              <button class="btn btn-outline-danger btn-sm" type="button" data-action="plugin-unlock-stop"><i class="bi bi-stop"></i><span data-i18n="common.stop">停止</span></button>
+            </div>
+          </article>
         </div>
         <div class="desktop-warning" id="dashboardDesktopWarning" hidden>
           <i class="bi bi-exclamation-triangle"></i>
@@ -396,6 +406,14 @@
             <div>
               <label class="switch-label only-switch"><input type="checkbox" id="autoApplyOnStart" checked><span class="switch-ui"></span></label>
               <p class="settings-note" data-i18n="settings.autoApplyOnStartHint">启动时自动应用当前提供商的 Codex 配置；如该提供商需要转发服务，会同时启动转发。关闭则需要手动点「应用配置」。</p>
+            </div>
+          </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.autoUnlockCodexPlugins">自动解锁 Codex Plugins</strong>
+            <div>
+              <label class="switch-label only-switch"><input type="checkbox" id="autoUnlockCodexPlugins"><span class="switch-ui"></span></label>
+              <p class="settings-note" data-i18n="settings.autoUnlockCodexPluginsHint">开启后，应用启动时会自动检测 Codex Desktop 并通过 CDP 注入脚本解锁 Plugins 选项卡。需要 Codex Desktop 以 --remote-debugging-port=9222 启动。</p>
+              <p class="settings-note" id="pluginUnlockRuntimeStatus" data-i18n="settings.pluginUnlockRuntimeStatus">运行时状态: 未检测</p>
             </div>
           </div>
           <div class="settings-row settings-row-stack">

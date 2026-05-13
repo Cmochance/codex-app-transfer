@@ -161,9 +161,10 @@ pub(crate) fn is_compact_path(path: &str) -> bool {
 /// - 丢弃 `instructions`(摘要任务不应受原任务 system prompt 影响)
 /// - 保留 `tools`(`ensure_thinking_tool_call_reasoning` 的 `has_tool_loop`
 ///   检测需要,且第三方 provider 看到 tools 字段不会 400)
-pub(crate) fn build_compact_responses_request_body(
+pub(crate) fn build_compact_chat_request(
     body_bytes: &[u8],
-) -> Result<Value, AdapterError> {
+    provider: &Provider,
+) -> Result<Vec<u8>, AdapterError> {
     let parsed: Value = serde_json::from_slice(body_bytes)
         .map_err(|e| AdapterError::BadRequest(format!("compact body 不是合法 JSON: {e}")))?;
     let model = parsed.get("model").cloned().unwrap_or(Value::Null);
@@ -234,15 +235,6 @@ pub(crate) fn build_compact_responses_request_body(
         // 的 has_tool_loop 检测,以及万一上游借 tool 信息提取上下文)。
         synthetic_responses_body["tools"] = tools.clone();
     }
-
-    Ok(synthetic_responses_body)
-}
-
-pub(crate) fn build_compact_chat_request(
-    body_bytes: &[u8],
-    provider: &Provider,
-) -> Result<Vec<u8>, AdapterError> {
-    let synthetic_responses_body = build_compact_responses_request_body(body_bytes)?;
 
     let chat_body =
         responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))?;

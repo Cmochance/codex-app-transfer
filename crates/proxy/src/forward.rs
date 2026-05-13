@@ -15,7 +15,7 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderName, Method, StatusCode},
     response::Response,
 };
 use std::pin::Pin;
@@ -24,12 +24,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use codex_app_transfer_adapters::{
-    anthropic_messages::request::{
-        is_anthropic_invalid_thinking_signature_error,
-        strip_thinking_blocks_for_invalid_signature_retry,
-    },
-    registry::is_local_responses_route,
-    AdapterError, AdapterRegistry,
+    registry::is_local_responses_route, AdapterError, AdapterRegistry,
 };
 use codex_app_transfer_registry::strip_internal_model_suffix;
 use futures_core::Stream;
@@ -51,8 +46,6 @@ pub struct ProxyState {
 /// UA 又被 `is_strip_on_forward` 剔除后兜底用,**绝不能含 codex/openai/codex_cli
 /// 等关键字**(否则等于把 strip 的 UA 又自己写回来)。
 const DEFAULT_OUTBOUND_USER_AGENT: &str = concat!("Codex-App-Transfer/", env!("CARGO_PKG_VERSION"));
-const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
-const ANTHROPIC_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
 impl ProxyState {
     pub fn new(resolver: SharedResolver) -> Self {
@@ -328,9 +321,7 @@ pub async fn forward_handler(
         }
     }
 
-    if !crate::resolver::provider_preserves_internal_model_suffix(&resolved.provider) {
-        strip_model_suffix_in_place(&mut body_bytes);
-    }
+    strip_model_suffix_in_place(&mut body_bytes);
     let resolved_model = body_model(&body_bytes);
 
     // 4. 走 adapter 拿到上游路径 + 改写后的 body。Codex 的本地
@@ -452,49 +443,6 @@ pub async fn forward_handler(
             );
             live_resp = Some(pair.0);
             outbound_headers_snapshot = pair.1;
-        } else if is_anthropic_invalid_thinking_signature_error(&body_bytes) {
-            match strip_thinking_blocks_for_invalid_signature_retry(&mut plan) {
-                Ok(true) => {
-                    telemetry.logs.add(
-                        "WARN",
-                        format!(
-                            "Anthropic Messages upstream rejected thinking signature for provider {}; stripped thinking blocks and retrying once...",
-                            resolved.provider.id
-                        ),
-                    );
-                    let pair = build_and_send_upstream(
-                        &state,
-                        &parts.method,
-                        &parts.headers,
-                        &resolved,
-                        &plan.body,
-                        &plan.upstream_headers,
-                        &upstream_url,
-                    )
-                    .await?;
-                    telemetry.logs.add(
-                        "INFO",
-                        format!(
-                            "invalid thinking signature retry status {} for provider {}",
-                            pair.0.status().as_u16(),
-                            resolved.provider.id
-                        ),
-                    );
-                    live_resp = Some(pair.0);
-                    outbound_headers_snapshot = pair.1;
-                }
-                Ok(false) => {
-                    telemetry.logs.add(
-                        "WARN",
-                        format!(
-                            "Anthropic Messages upstream reported invalid thinking signature for provider {}, but request body contained no strip-able thinking blocks",
-                            resolved.provider.id
-                        ),
-                    );
-                    captured_4xx = Some((st, hs, body_bytes));
-                }
-                Err(err) => return Err(ForwardError::Adapter(err)),
-            }
         } else {
             // 非 web_search 4xx,resp 已被 bytes() 消费,把三元组保存
             captured_4xx = Some((st, hs, body_bytes));
@@ -774,11 +722,6 @@ async fn build_and_send_upstream(
         _ => None,
     };
 
-    let mut effective_adapter_headers = adapter_headers.clone();
-    if is_anthropic_oauth_token(&resolved.api_key) {
-        merge_anthropic_oauth_adapter_headers(&mut effective_adapter_headers)?;
-    }
-
     let mut up = state
         .http
         .request(method.clone(), upstream_url)
@@ -791,7 +734,7 @@ async fn build_and_send_upstream(
         if resolved.extra_headers.contains_key(name) {
             continue;
         }
-        if effective_adapter_headers.contains_key(name) {
+        if adapter_headers.contains_key(name) {
             continue;
         }
         // dup-header 防御(review-feedback A4):GrokCookie scheme 下,grok.com
@@ -807,16 +750,9 @@ async fn build_and_send_upstream(
     }
     up = inject_auth(up, resolved, oauth_bearer.as_deref());
     for (name, value) in resolved.extra_headers.iter() {
-        if name.as_str().eq_ignore_ascii_case("anthropic-beta") {
-            if let Some(adapter_value) = effective_adapter_headers.get(name) {
-                let merged = merge_comma_header_values(value, adapter_value);
-                up = up.header(name, merged);
-                continue;
-            }
-        }
         up = up.header(name, value);
     }
-    for (name, value) in effective_adapter_headers.iter() {
+    for (name, value) in adapter_headers.iter() {
         if resolved.extra_headers.contains_key(name) {
             continue;
         }
@@ -902,57 +838,6 @@ async fn build_and_send_upstream(
     let outbound_headers_snapshot = req.headers().clone();
     let resp = state.http.execute(req).await?;
     Ok((resp, outbound_headers_snapshot))
-}
-
-fn merge_comma_header_values(
-    primary: &reqwest::header::HeaderValue,
-    secondary: &reqwest::header::HeaderValue,
-) -> String {
-    let mut values = std::collections::BTreeSet::new();
-    if let Ok(primary) = primary.to_str() {
-        for value in primary.split(',') {
-            let value = value.trim();
-            if !value.is_empty() {
-                values.insert(value.to_owned());
-            }
-        }
-    }
-    if let Ok(secondary) = secondary.to_str() {
-        for value in secondary.split(',') {
-            let value = value.trim();
-            if !value.is_empty() {
-                values.insert(value.to_owned());
-            }
-        }
-    }
-    values.into_iter().collect::<Vec<_>>().join(",")
-}
-
-fn is_anthropic_oauth_token(value: &str) -> bool {
-    let token = value.strip_prefix("Bearer ").unwrap_or(value);
-    token.starts_with(ANTHROPIC_OAUTH_TOKEN_PREFIX)
-}
-
-fn anthropic_oauth_token_body(value: &str) -> &str {
-    value.strip_prefix("Bearer ").unwrap_or(value)
-}
-
-fn merge_anthropic_oauth_adapter_headers(headers: &mut HeaderMap) -> Result<(), ForwardError> {
-    let beta_name = HeaderName::from_static("anthropic-beta");
-    let oauth_beta = HeaderValue::from_static(ANTHROPIC_OAUTH_BETA_HEADER);
-    let beta_value = headers
-        .get(&beta_name)
-        .map(|existing| merge_comma_header_values(existing, &oauth_beta))
-        .unwrap_or_else(|| ANTHROPIC_OAUTH_BETA_HEADER.to_owned());
-    headers.insert(
-        beta_name,
-        HeaderValue::from_str(&beta_value).map_err(|e| ForwardError::Header(e.to_string()))?,
-    );
-    headers.insert(
-        HeaderName::from_static("anthropic-dangerous-direct-browser-access"),
-        HeaderValue::from_static("true"),
-    );
-    Ok(())
 }
 
 /// 检测上游 4xx 响应 body 是否是"web search plugin / Web Search 能力未开"
@@ -1168,24 +1053,10 @@ fn inject_auth(
 ) -> reqwest::RequestBuilder {
     match resolved.auth_scheme {
         AuthScheme::Bearer => {
-            if is_anthropic_oauth_token(&resolved.api_key) {
-                req = req.header(
-                    "authorization",
-                    format!("Bearer {}", anthropic_oauth_token_body(&resolved.api_key)),
-                );
-            } else {
-                req = req.header("authorization", format!("Bearer {}", resolved.api_key));
-            }
+            req = req.header("authorization", format!("Bearer {}", resolved.api_key));
         }
         AuthScheme::XApiKey => {
-            if is_anthropic_oauth_token(&resolved.api_key) {
-                req = req.header(
-                    "authorization",
-                    format!("Bearer {}", anthropic_oauth_token_body(&resolved.api_key)),
-                );
-            } else {
-                req = req.header("x-api-key", resolved.api_key.clone());
-            }
+            req = req.header("x-api-key", resolved.api_key.clone());
         }
         AuthScheme::GoogleApiKey => {
             req = req.header("x-goog-api-key", resolved.api_key.clone());

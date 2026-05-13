@@ -429,7 +429,7 @@ fn generic_model_template() -> Value {
         "availability_nux": null,
         "upgrade": null,
         "base_instructions": "",
-        "supports_reasoning_summaries": true,
+        "supports_reasoning_summaries": false,
         "default_reasoning_summary": "auto",
         "support_verbosity": false,
         "default_verbosity": null,
@@ -513,16 +513,6 @@ mod tests {
         assert_eq!(entry["supports_search_tool"], true);
         assert_eq!(entry["supports_reasoning_summaries"], true);
         assert_eq!(entry["web_search_tool_type"], "text_and_image");
-    }
-
-    #[test]
-    fn generic_fallback_catalog_enables_reasoning_summaries() {
-        let models = catalog_models_for_provider("Kimi", "kimi-for-coding", false, None, None);
-        let kimi = models.iter().find(|m| m.slug == "kimi-for-coding").unwrap();
-        let entry = model_to_json(kimi);
-
-        assert_eq!(entry["supports_reasoning_summaries"], true);
-        assert_eq!(entry["default_reasoning_summary"], "auto");
     }
 
     #[test]

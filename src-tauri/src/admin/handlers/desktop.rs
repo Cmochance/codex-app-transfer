@@ -114,26 +114,48 @@ fn quit_command(platform: &str, force: bool) -> Vec<String> {
 
 /// 启动命令.macOS 优先用解析后的 .app 路径,fallback 到 `open -a Codex`
 /// 让 LaunchServices 自己找。
-fn open_command(platform: &str, resolved_macos_app: Option<&str>) -> Vec<String> {
+/// 
+/// `extra_args`: 附加给 Codex Desktop 本身的参数(如 `--remote-debugging-port=9222`)。
+/// macOS 通过 `open` 的 `--args` 传递;Linux 直接追加到命令;Windows Store
+/// 应用暂不支持命令行参数(忽略)。
+fn open_command(platform: &str, resolved_macos_app: Option<&str>, extra_args: &[String]) -> Vec<String> {
     match platform {
         // `-n`:即使 LaunchServices 缓存还以为 Codex 在运行,也强制启动一个新
         // 实例。我们刚 SIGTERM 杀过主进程,launchd 偶尔会在 reap 完成前误把
         // `open -a` 解读为 activate 已有实例 → 啥也不发生。`-n` 绕过这条。
-        "macos" => vec![
-            "open".into(),
-            "-n".into(),
-            "-a".into(),
-            resolved_macos_app.unwrap_or(MACOS_APP_NAME).into(),
-        ],
-        "windows" => vec![
-            "explorer.exe".into(),
-            format!("shell:AppsFolder\\{WINDOWS_STORE_APP_ID}"),
-        ],
-        _ => vec![
-            "sh".into(),
-            "-c".into(),
-            format!("{LINUX_BIN_NAME} >/dev/null 2>&1 &"),
-        ],
+        "macos" => {
+            let mut cmd = vec![
+                "open".into(),
+                "-n".into(),
+                "-a".into(),
+                resolved_macos_app.unwrap_or(MACOS_APP_NAME).into(),
+            ];
+            if !extra_args.is_empty() {
+                cmd.push("--args".into());
+                cmd.extend(extra_args.iter().cloned());
+            }
+            cmd
+        }
+        "windows" => {
+            // Windows Store 应用不支持通过 explorer.exe 传递命令行参数。
+            // 如需调试端口，需用户手动修改快捷方式或使用其他启动方式。
+            vec![
+                "explorer.exe".into(),
+                format!("shell:AppsFolder\\{WINDOWS_STORE_APP_ID}"),
+            ]
+        }
+        _ => {
+            let args_str = if extra_args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", extra_args.join(" "))
+            };
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("{LINUX_BIN_NAME}{args_str} >/dev/null 2>&1 &"),
+            ]
+        },
     }
 }
 
@@ -226,13 +248,33 @@ fn quit_codex_app_with_retries(platform: &str) -> Result<(), String> {
     Err("Codex 未能正常退出,请手动关闭后重试".to_owned())
 }
 
+/// 读取设置判断是否应附加调试端口参数
+fn should_attach_debug_port() -> Vec<String> {
+    match crate::admin::registry_io::load() {
+        Ok(cfg) => {
+            let auto_unlock = cfg
+                .get("settings")
+                .and_then(|s| s.get("autoUnlockCodexPlugins"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if auto_unlock {
+                vec!["--remote-debugging-port=9222".into()]
+            } else {
+                vec![]
+            }
+        }
+        Err(_) => vec![],
+    }
+}
+
 fn open_codex_app(platform: &str) -> Result<(), String> {
     let resolved = if platform == "macos" {
         resolve_macos_app_path()
     } else {
         None
     };
-    let cmd = open_command(platform, resolved.as_deref());
+    let extra_args = should_attach_debug_port();
+    let cmd = open_command(platform, resolved.as_deref(), &extra_args);
     let Some((program, args)) = cmd.split_first() else {
         return Err("open command is empty".to_owned());
     };
@@ -823,6 +865,8 @@ pub async fn restart_codex_app() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::super::common::test_support::with_isolated_home;
 
@@ -854,6 +898,28 @@ mod tests {
                 "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
             }
         })
+    }
+
+    fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: Value) {
+        let payload = json!({
+            "sessionId": "bf3f9f",
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/Users/alysechen/alysechen/github/codex-app-transfer/.cursor/debug-bf3f9f.log")
+        {
+            let _ = writeln!(f, "{}", payload);
+        }
     }
 
     #[test]
@@ -899,19 +965,24 @@ mod tests {
         // macOS 必带 `-n` 强制新实例(重启场景下 LaunchServices 缓存仍以为
         // 旧 Codex 在运行,不加 -n 会让 `open -a` 静默 no-op)。
         assert_eq!(
-            open_command("macos", Some("/Applications/Codex.app")),
+            open_command("macos", Some("/Applications/Codex.app"), &[]),
             vec!["open", "-n", "-a", "/Applications/Codex.app"]
         );
         // 落空时回到裸 app 名,让 LaunchServices 找
         assert_eq!(
-            open_command("macos", None),
+            open_command("macos", None, &[]),
             vec!["open", "-n", "-a", "Codex"]
         );
-        let windows = open_command("windows", None);
+        // 带调试参数时通过 --args 传递
+        assert_eq!(
+            open_command("macos", None, &["--remote-debugging-port=9222".into()]),
+            vec!["open", "-n", "-a", "Codex", "--args", "--remote-debugging-port=9222"]
+        );
+        let windows = open_command("windows", None, &[]);
         assert_eq!(windows[0], "explorer.exe");
         assert!(windows[1].starts_with("shell:AppsFolder\\"));
         assert!(windows[1].contains("OpenAI.Codex"));
-        let linux = open_command("linux", None);
+        let linux = open_command("linux", None, &[]);
         assert_eq!(linux[0], "sh");
         assert_eq!(linux[1], "-c");
         assert!(linux[2].contains("codex"));
@@ -1425,6 +1496,103 @@ mod tests {
                 .collect();
             assert!(codes.contains(&"not_managed_by_cas"));
             assert!(codes.contains(&"gateway_base_url_mismatch"));
+        });
+    }
+
+    #[test]
+    fn qwen_local_proxy_apply_writes_codex_auth_and_base_url() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        with_isolated_home(|home| {
+            runtime.block_on(async {
+                let mut cfg = config_with_secret();
+                cfg["activeProvider"] = json!("qwen");
+                cfg["gatewayApiKey"] = Value::Null;
+                cfg["settings"]["proxyPort"] = json!(19091);
+                cfg["providers"] = json!([{
+                    "id": "qwen",
+                    "name": "Qwen",
+                    "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "authScheme": "bearer",
+                    "apiFormat": "openai_chat",
+                    "apiKey": "sk-qwen-upstream",
+                    "models": {"default": "qwen3.6-plus"},
+                    "sortIndex": 0
+                }]);
+                save_registry(&cfg).unwrap();
+                fs::create_dir_all(home.join(".codex")).unwrap();
+
+                // #region agent log
+                agent_debug_log(
+                    "H1",
+                    "src-tauri/src/admin/handlers/desktop.rs:qwen_local_proxy_apply_writes_codex_auth_and_base_url:before_sync",
+                    "prepared qwen provider config",
+                    json!({
+                        "activeProvider": "qwen",
+                        "proxyPort": 19091,
+                        "providerModel": "qwen3.6-plus",
+                        "gatewayApiKeyNull": true
+                    }),
+                );
+                // #endregion
+
+                let manager = Arc::new(ProxyManager::new());
+                let result = switch_provider_and_sync(Arc::clone(&manager), "qwen".to_owned()).await;
+
+                // #region agent log
+                agent_debug_log(
+                    "H1",
+                    "src-tauri/src/admin/handlers/desktop.rs:qwen_local_proxy_apply_writes_codex_auth_and_base_url:after_sync",
+                    "desktop sync result for qwen",
+                    json!({
+                        "success": result["success"],
+                        "desktopSyncSuccess": result["desktopSync"]["success"],
+                        "desktopMode": result["desktopSync"]["mode"],
+                        "requiresProxy": result["desktopSync"]["requiresProxy"],
+                    }),
+                );
+                // #endregion
+
+                assert_eq!(result["success"], json!(true));
+                assert_eq!(result["desktopSync"]["success"], json!(true));
+                assert_eq!(result["desktopSync"]["mode"], json!("local_proxy"));
+                assert_eq!(result["desktopSync"]["requiresProxy"], json!(true));
+
+                let toml = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
+                let auth_raw = fs::read_to_string(home.join(".codex").join("auth.json")).unwrap();
+                let auth_json: Value = serde_json::from_str(&auth_raw).unwrap();
+                let injected_key = auth_json["OPENAI_API_KEY"].as_str().unwrap_or_default();
+
+                // #region agent log
+                agent_debug_log(
+                    "H2",
+                    "src-tauri/src/admin/handlers/desktop.rs:qwen_local_proxy_apply_writes_codex_auth_and_base_url:codex_files",
+                    "verified codex files after qwen apply",
+                    json!({
+                        "tomlHasProxyBaseUrl": toml.contains("openai_base_url = \"http://127.0.0.1:19091\""),
+                        "tomlHas1m": toml.contains("model_context_window = 1000000"),
+                        "authMode": auth_json["auth_mode"],
+                        "injectedKeyPrefix": injected_key.get(0..4).unwrap_or(""),
+                        "injectedKeyLen": injected_key.len(),
+                    }),
+                );
+                // #endregion
+
+                assert!(toml.contains("openai_base_url = \"http://127.0.0.1:19091\""));
+                assert!(
+                    toml.contains("model_context_window = 1000000"),
+                    "qwen3.6-* should be treated as 1M-capable"
+                );
+                assert_eq!(auth_json["auth_mode"], json!("apikey"));
+                assert!(
+                    injected_key.starts_with("cas_") && !injected_key.is_empty(),
+                    "qwen local_proxy should inject gateway key into auth.json"
+                );
+                manager.stop_silent();
+            });
         });
     }
 }

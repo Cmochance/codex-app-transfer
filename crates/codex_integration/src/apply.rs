@@ -18,14 +18,11 @@ use crate::CodexError;
 /// 我们 apply 时实际触碰的 auth 字段(restore 时只动这些,其它字段保留)。
 const MANAGED_AUTH_KEYS: &[&str] = &["auth_mode", "OPENAI_API_KEY"];
 
-const CODEX_MODEL_SUPPORTS_REASONING_SUMMARIES_KEY: &str = "model_supports_reasoning_summaries";
-
 /// 我们 apply 时实际触碰的 config.toml 根级别字段(restore 时只动这些)。
 const MANAGED_TOML_KEYS: &[&str] = &[
     "openai_base_url",
     "model_context_window",
     CODEX_MODEL_CATALOG_KEY,
-    CODEX_MODEL_SUPPORTS_REASONING_SUMMARIES_KEY,
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,13 +86,6 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         &paths.config_toml,
         CODEX_MODEL_CATALOG_KEY,
         Some(&catalog_literal),
-    )?;
-    // Codex CLI 0.130 会用该 root override 打开未知模型的 reasoning summary
-    // 请求与主 UI 渲染路径,否则第三方模型 slug 会走 fallback=false。
-    sync_root_value(
-        &paths.config_toml,
-        CODEX_MODEL_SUPPORTS_REASONING_SUMMARIES_KEY,
-        Some("true"),
     )?;
     let models = catalog_models_for_provider(
         cfg.provider_name,
@@ -238,15 +228,6 @@ mod tests {
         assert!(!toml.contains("model_context_window"));
         // model_catalog_json 始终在 config.toml 里
         assert!(toml.contains("model_catalog_json"));
-        assert!(toml.contains("model_supports_reasoning_summaries = true"));
-        let app_config = read_app_config(&paths);
-        let models = app_config["models"]
-            .as_array()
-            .expect("apply 应写入顶层 models catalog");
-        assert!(
-            models.iter().any(|m| m["slug"] == "mock-model"),
-            "默认真实模型也应作为 catalog fallback entry 写入"
-        );
 
         let auth = read_auth_value(&paths);
         assert_eq!(auth["auth_mode"], "apikey");
@@ -273,7 +254,6 @@ mod tests {
         let toml = read_toml(&paths);
         assert!(toml.contains("model_context_window = 1000000"));
         assert!(toml.contains("model_catalog_json = "));
-        assert!(toml.contains("model_supports_reasoning_summaries = true"));
         assert!(toml.contains(".codex-app-transfer"));
         assert!(toml.contains("config.json"));
         let catalog: serde_json::Value =
@@ -465,10 +445,6 @@ mod tests {
             !toml.contains("model_context_window"),
             "原状态没有 1M 字段,还原后也不应有"
         );
-        assert!(
-            !toml.contains("model_supports_reasoning_summaries"),
-            "原状态没有 reasoning summary override,还原后也不应有"
-        );
         assert!(toml.contains("[profiles]"), "用户的 [profiles] 应保留");
 
         let auth = read_auth_value(&paths);
@@ -521,44 +497,12 @@ mod tests {
     }
 
     #[test]
-    fn restore_with_snapshot_restores_user_reasoning_summary_override() {
-        let (_t, paths) = setup();
-        std::fs::create_dir_all(&paths.codex_home).unwrap();
-        std::fs::write(
-            &paths.config_toml,
-            "model_supports_reasoning_summaries = false\n",
-        )
-        .unwrap();
-
-        apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "http://127.0.0.1:18080",
-                gateway_api_key: "cas_proxy",
-                supports_1m: false,
-                provider_name: "Mock",
-                default_model: "mock-model",
-                model_mappings: None,
-                model_capabilities: None,
-                app_version: "v",
-            },
-        )
-        .unwrap();
-        assert!(read_toml(&paths).contains("model_supports_reasoning_summaries = true"));
-
-        restore_codex_state(&paths).unwrap();
-
-        let toml = read_toml(&paths);
-        assert!(toml.contains("model_supports_reasoning_summaries = false"));
-    }
-
-    #[test]
     fn restore_without_snapshot_falls_back_to_remove_managed_keys() {
         let (_t, paths) = setup();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(
             &paths.config_toml,
-            "openai_base_url = \"http://leftover\"\nmodel_context_window = 1000000\nmodel_catalog_json = \"leftover.json\"\nmodel_supports_reasoning_summaries = true\nfoo = 1\n",
+            "openai_base_url = \"http://leftover\"\nmodel_context_window = 1000000\nmodel_catalog_json = \"leftover.json\"\nfoo = 1\n",
         )
         .unwrap();
         codex_app_transfer_registry::save_raw_config(
@@ -581,7 +525,6 @@ mod tests {
         assert!(!toml.contains("openai_base_url"));
         assert!(!toml.contains("model_context_window"));
         assert!(!toml.contains(CODEX_MODEL_CATALOG_KEY));
-        assert!(!toml.contains("model_supports_reasoning_summaries"));
         assert!(toml.contains("foo = 1"));
         assert!(read_app_config(&paths).get("models").is_none());
         let auth = read_auth_value(&paths);

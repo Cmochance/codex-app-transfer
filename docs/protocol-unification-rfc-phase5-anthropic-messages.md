@@ -1,6 +1,6 @@
 # Protocol Unification RFC (Phase 5 Anthropic Messages)
 
-> Status: P10 LiteLLM Claude capability parity follow-up complete on 2026-05-13; real Claude / Anyrouter validation remains before a generic Claude preset is enabled.
+> Status: P6 complete on 2026-05-13; P7 documentation, full acceptance, and real Claude validation remain.
 > Scope: Add a first-class `anthropic_messages` protocol adapter for Claude-family providers.
 
 ## Goal
@@ -52,13 +52,11 @@ The MVP includes:
 - Unknown Anthropic SSE event tolerance.
 - `/responses/compact` support for Claude-compatible providers.
 
-The MVP originally did not include full Anthropic server tool and structured output support. P8-P10 later expanded the request mapper to cover the LiteLLM-confirmed Claude capability surface that is required for Anyrouter and Claude-family providers.
+The MVP does not include:
 
-Still out of scope before real-provider validation:
-
-- generic Claude preset exposure before end-to-end validation;
-- pretending OpenAI-only Responses tools such as `file_search` or `image_generation` are native Claude executable tools when no Anthropic equivalent exists;
-- converting Anthropic server tool results into local Codex function tools unless the Responses contract has a real equivalent.
+- Anthropic server tool support.
+- Anthropic JSON schema guarantees beyond the fields already proven in fixtures.
+- UI preset exposure before end-to-end validation.
 
 ## Compact Decision
 
@@ -105,13 +103,8 @@ Required mappings:
 - `parallel_tool_calls` -> Anthropic `disable_parallel_tool_use` with inverted meaning.
 - `max_output_tokens` -> Anthropic required `max_tokens`.
 - `stop` -> `stop_sequences`.
-- `reasoning` / `reasoning_effort` -> Anthropic `thinking`; adaptive Claude 4.6/4.7 models use `thinking.type=adaptive + output_config.effort`.
+- `reasoning` / `reasoning_effort` -> Anthropic `thinking` conservatively.
 - `user` or `metadata.user` -> `metadata.user_id` after Anthropic-safe filtering.
-- Responses `text.format` / chat `response_format` -> Anthropic `output_format` with unsupported Claude output schema constraints filtered into descriptions.
-- Anthropic-native top-level fields `context_management`, `container`, `output_config`, `output_format`, `speed`, and `cache_control` pass through when present.
-- Claude `document` and `container_upload` content blocks are preserved; `container_upload` auto-adds the Anthropic code execution hosted tool if no code execution tool is already present.
-- Tool result blocks preserve string content, rich text/image/document arrays, `is_error`, and `cache_control`.
-- `anthropic-beta` is generated from the final Anthropic request body for computer use, MCP client, advanced tool use, file-id documents, code execution, container skills, context management / compact, structured output, effort, web fetch, fast mode, and advisor tool features. The proxy merge step keeps these dynamic beta values together with any provider-configured static `anthropic-beta` in one outbound header.
 
 Mapper must return a diagnostic 400 when a tool result cannot be associated with a prior tool use after the existing cache repair path has run.
 
@@ -174,12 +167,6 @@ P6 added admin/provider and UI coverage:
 - model-list discovery derives `/v1/models` from Anthropic Messages endpoints;
 - direct mode bypass remains restricted to `responses` / `openai_responses`;
 - frontend custom provider save/display/i18n now uses canonical `anthropic_messages`.
-
-P8-P10 added protocol-fidelity follow-up coverage:
-
-- P8 verifies Anyrouter hosted web search, server-side web search result annotations, thinking signatures, and forced default model routing for Claude-triggered alternate model names.
-- P9 verifies namespace/custom tool metadata, Anthropic hosted tools, MCP server mapping, and unsupported Anthropic result blocks preserved as trace items.
-- P10 verifies Anthropic top-level fields, structured output mapping, adaptive thinking for Claude 4.6/4.7, container upload/code execution, rich tool results, and LiteLLM-derived `anthropic-beta` generation.
 
 Expected commands after P2:
 

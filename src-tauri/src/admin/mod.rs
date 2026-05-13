@@ -158,6 +158,8 @@ pub fn build_app_router(state: AdminState) -> Router {
         .route("/api/feedback", post(handlers::feedback::submit_feedback))
         // Gemini CLI OAuth (login / status / logout)
         .merge(handlers::gemini_oauth::routes())
+        // Plugin Unlock (CDP injection for Codex Desktop)
+        .merge(handlers::plugin_unlock::routes())
         // Antigravity OAuth (login / status / logout / cancel)
         .merge(handlers::antigravity_oauth::routes())
         // 静态文件兜底

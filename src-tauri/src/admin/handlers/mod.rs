@@ -7,6 +7,7 @@
 //! - `settings`:`/api/settings` + `/api/config/*`
 //! - `update`:`/api/update/*`
 //! - `desktop`:`/api/desktop/*` + Codex.app 进程管理 + apply/restore
+//! - `plugin_unlock`:`/api/desktop/plugin-unlock/*` + Codex Desktop Plugins CDP 注入
 //! - `providers`:`/api/providers/*` + `/api/presets`(二级再拆 crud/test/models/balance/presets)
 
 pub mod antigravity_oauth;
@@ -14,6 +15,7 @@ pub mod common;
 pub mod desktop;
 pub mod feedback;
 pub mod gemini_oauth;
+pub mod plugin_unlock;
 pub mod providers;
 pub mod proxy;
 pub mod settings;

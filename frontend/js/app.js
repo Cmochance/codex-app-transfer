@@ -410,17 +410,6 @@
     if (Object.keys(responsesBlock).length) result.responses = responsesBlock;
     const chatBlock = normalizeChatBlock(options.chat);
     if (Object.keys(chatBlock).length) result.chat = chatBlock;
-    const anthropicMessagesBlock = {};
-    const anthropicMessagesSource = options.anthropic_messages && typeof options.anthropic_messages === "object"
-      ? options.anthropic_messages
-      : null;
-    if (typeof anthropicMessagesSource?.claude_code_compat === "boolean") {
-      anthropicMessagesBlock.claude_code_compat = anthropicMessagesSource.claude_code_compat;
-    }
-    if (anthropicMessagesSource?.thinking && typeof anthropicMessagesSource.thinking === "object") {
-      anthropicMessagesBlock.thinking = { ...anthropicMessagesSource.thinking };
-    }
-    if (Object.keys(anthropicMessagesBlock).length) result.anthropic_messages = anthropicMessagesBlock;
     // **顶级 boolean / 标量字段**:web_search_enabled 由 backend
     // `convert_web_search_tool` 读 `provider.request_options.web_search_enabled`
     // 决定是否启用 web 搜索(MiMo / Kimi / Gemini 等支持 web_search 的 provider)。
@@ -428,12 +417,6 @@
     // 手改 config.json,UX 痛点。本字段必须保留(boolean),否则功能失效。
     if (typeof options.web_search_enabled === "boolean") {
       result.web_search_enabled = options.web_search_enabled;
-    }
-    // 部分上游可能把模型名后缀 `[1m]` 当路由开关。本工具默认会把
-    // `[1m]` 当内部上下文标记剥掉;该 provider 级选项用于明确保留后缀
-    // 出站,且只对 opt-in provider 生效。
-    if (typeof options.preserve_internal_model_suffix === "boolean") {
-      result.preserve_internal_model_suffix = options.preserve_internal_model_suffix;
     }
     return result;
   }
@@ -446,15 +429,6 @@
     if (Object.keys(responsesMerged).length) merged.responses = responsesMerged;
     const chatMerged = { ...(baseNorm.chat || {}), ...(extraNorm.chat || {}) };
     if (Object.keys(chatMerged).length) merged.chat = chatMerged;
-    const anthropicMessagesMerged = { ...(baseNorm.anthropic_messages || {}), ...(extraNorm.anthropic_messages || {}) };
-    if (Object.keys(anthropicMessagesMerged).length) merged.anthropic_messages = anthropicMessagesMerged;
-    for (const key of ['web_search_enabled', 'preserve_internal_model_suffix']) {
-      if (Object.prototype.hasOwnProperty.call(extraNorm, key)) {
-        merged[key] = extraNorm[key];
-      } else if (Object.prototype.hasOwnProperty.call(baseNorm, key)) {
-        merged[key] = baseNorm[key];
-      }
-    }
     return normalizeRequestOptions(merged);
   }
 
@@ -471,17 +445,6 @@
       const block = { ...baseNorm.chat };
       Object.keys(optionNorm.chat || {}).forEach((key) => { delete block[key]; });
       if (Object.keys(block).length) next.chat = block;
-    }
-    if (baseNorm.anthropic_messages) {
-      const block = { ...baseNorm.anthropic_messages };
-      Object.keys(optionNorm.anthropic_messages || {}).forEach((key) => { delete block[key]; });
-      if (Object.keys(block).length) next.anthropic_messages = block;
-    }
-    for (const key of ['web_search_enabled', 'preserve_internal_model_suffix']) {
-      if (Object.prototype.hasOwnProperty.call(baseNorm, key)
-          && !Object.prototype.hasOwnProperty.call(optionNorm, key)) {
-        next[key] = baseNorm[key];
-      }
     }
     return normalizeRequestOptions(next);
   }
@@ -1146,6 +1109,35 @@
     enableProviderReorder($("[data-provider-list]", target));
   }
 
+
+  // ── Plugin Unlock 状态刷新 ──
+  async function refreshPluginUnlockStatus() {
+    try {
+      const unlock = await CCAPI.pluginUnlock.status();
+      const icon = $("#pluginUnlockIcon");
+      const statusText = $("#pluginUnlockStatus");
+      const actions = $("#pluginUnlockActions");
+      if (!icon || !statusText) return;
+
+      icon.classList.remove("muted", "success", "warning", "danger");
+      const statusMap = {
+        disconnected: { icon: "bi-lock", class: "muted", text: t("pluginUnlock.disconnected") || "未运行" },
+        connecting: { icon: "bi-arrow-repeat", class: "warning", text: t("pluginUnlock.connecting") || "连接中..." },
+        connected: { icon: "bi-plug", class: "warning", text: t("pluginUnlock.connected") || "已连接" },
+        injected: { icon: "bi-unlock", class: "success", text: t("pluginUnlock.injected") || "已解锁" },
+        failed: { icon: "bi-exclamation-triangle", class: "danger", text: unlock.message || "失败" },
+      };
+      const s = statusMap[unlock.status] || statusMap.disconnected;
+      icon.innerHTML = `<i class="bi ${s.icon}"></i>`;
+      icon.classList.add(s.class);
+      statusText.classList.toggle("muted-text", s.class === "muted");
+      statusText.textContent = s.text;
+      if (actions) actions.style.display = unlock.status === "injected" || unlock.status === "connected" ? "block" : "none";
+    } catch (e) {
+      console.log("[PluginUnlock] status refresh failed:", e);
+    }
+  }
+
   async function renderDashboard() {
     const status = await CCApi.getStatus();
     const activities = await CCApi.getActivities();
@@ -1163,6 +1155,8 @@
     renderDesktopHealthWarning("#dashboardDesktopWarning", health);
     $("#dashboardProxyStatus").textContent = status.proxyRunning ? `${t("status.running")} :${status.proxyPort}` : t("status.stopped");
     $("#dashboardProviderName").textContent = status.activeProvider.name;
+    // Plugin Unlock 状态刷新
+    refreshPluginUnlockStatus();
     $("#activityList").innerHTML = activities.map((item) => (
       `<div class="activity-row"><time>${escapeHtml(item.time)}</time><span>${escapeHtml(item.text)}</span></div>`
     )).join("");
@@ -1917,6 +1911,7 @@
     $("#settingsProxyPort").value = settings.proxyPort;
     $("#settingsAdminPort").value = settings.adminPort;
     $("#autoApplyOnStart").checked = settings.autoApplyOnStart !== false;
+    $("#autoUnlockCodexPlugins").checked = !!settings.autoUnlockCodexPlugins;
     $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
@@ -2002,6 +1997,7 @@
       proxyPort: Number($("#settingsProxyPort").value),
       adminPort: Number($("#settingsAdminPort").value),
       autoApplyOnStart: $("#autoApplyOnStart")?.checked !== false,
+      autoUnlockCodexPlugins: $("#autoUnlockCodexPlugins")?.checked || false,
       exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
@@ -2958,6 +2954,30 @@
     $("#settingsAdminPort").addEventListener("change", saveSettingsFromForm);
     $("#settingsUpdateUrl").addEventListener("change", saveSettingsFromForm);
     $("#autoApplyOnStart")?.addEventListener("change", saveSettingsFromForm);
+    $("#autoUnlockCodexPlugins")?.addEventListener("change", saveSettingsFromForm);
+
+    // Plugin Unlock 按钮事件
+    $("[data-action=plugin-unlock-start]")?.addEventListener("click", async () => {
+      try {
+        await CCAPI.pluginUnlock.start();
+        showToast(t("pluginUnlock.started") || "解锁服务已启动");
+        setTimeout(refreshPluginUnlockStatus, 1000);
+      } catch (e) { showToast(e.message); }
+    });
+    $("[data-action=plugin-unlock-stop]")?.addEventListener("click", async () => {
+      try {
+        await CCAPI.pluginUnlock.stop();
+        showToast(t("pluginUnlock.stopped") || "解锁服务已停止");
+        setTimeout(refreshPluginUnlockStatus, 500);
+      } catch (e) { showToast(e.message); }
+    });
+    $("[data-action=plugin-unlock-reinject]")?.addEventListener("click", async () => {
+      try {
+        await CCAPI.pluginUnlock.reinject();
+        showToast(t("pluginUnlock.reinjecting") || "正在重新注入...");
+        setTimeout(refreshPluginUnlockStatus, 1500);
+      } catch (e) { showToast(e.message); }
+    });
     $("#exposeAllProviderModels").addEventListener("change", saveSettingsFromForm);
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#configImportFile")?.addEventListener("change", (event) => {
