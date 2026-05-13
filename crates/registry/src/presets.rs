@@ -34,15 +34,57 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 12 条 builtin presets:
+        // 当前 13 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
-        // / zhipu / bailian / minimax / grok-web / google-ai-studio
+        // / zhipu / bailian / minimax / anyrouter / grok-web / google-ai-studio
         // / gemini-cli-oauth / antigravity-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
         // (2026-05-11 加 Gemini CLI OAuth login preset)
         // (2026-05-11 加 Antigravity OAuth preset)
         // (2026-05-12 加 Grok Web 反代 preset,见 R1 Plan A)
-        assert_eq!(builtin_presets().len(), 12);
+        // (2026-05-13 加 Anyrouter Anthropic Messages preset)
+        assert_eq!(builtin_presets().len(), 13);
+    }
+
+    #[test]
+    fn anyrouter_preset_enables_claude_code_compat_shape() {
+        let anyrouter = builtin_presets()
+            .iter()
+            .find(|p| p["id"] == "anyrouter")
+            .expect("Anyrouter preset must exist as builtin entry");
+        assert_eq!(anyrouter["baseUrl"], "https://anyrouter.top");
+        assert_eq!(anyrouter["apiFormat"], "anthropic_messages");
+        assert_eq!(anyrouter["authScheme"], "bearer");
+        assert_eq!(
+            anyrouter["models"]["default"], "claude-opus-4-7",
+            "Anyrouter currently works through the unsuffixed Claude Code model route"
+        );
+        assert_eq!(
+            anyrouter["requestOptions"]["preserve_internal_model_suffix"],
+            serde_json::Value::Null,
+            "Anyrouter should use the default proxy stripping behavior for [1m] markers"
+        );
+        assert_eq!(
+            anyrouter["requestOptions"]["proxy"]["force_default_model"], true,
+            "Anyrouter must force every incoming model alias to the provider default route"
+        );
+        assert_eq!(
+            anyrouter["requestOptions"]["web_search_enabled"], true,
+            "Anyrouter Opus should receive Anthropic native web_search instead of local fallback"
+        );
+        assert_eq!(
+            anyrouter["requestOptions"]["anthropic_messages"]["claude_code_compat"], true,
+            "Anyrouter requires Claude Code compatibility metadata and headers"
+        );
+        assert_eq!(
+            anyrouter["requestOptions"]["anthropic_messages"]["thinking"]["type"], "adaptive",
+            "Anyrouter Opus 4.7 accepts adaptive thinking; fixed enabled budget failed live"
+        );
+        assert!(anyrouter["extraHeaders"]["anthropic-beta"]
+            .as_str()
+            .unwrap()
+            .contains("claude-code-20250219"));
+        assert_eq!(anyrouter["isBuiltin"], true);
     }
 
     #[test]

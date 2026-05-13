@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::core::tool_output::{StoredToolOutput, ToolOutputArtifactStore};
+
 const SCHEMA_VERSION: i64 = 1;
 const DEFAULT_PERSISTED_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 const DEFAULT_L1_SIZE: usize = 64;
@@ -58,6 +60,21 @@ pub struct ToolArtifactStore {
     persisted_ttl: Duration,
     inner: Mutex<ArtifactStoreInner>,
     db: Mutex<Option<Connection>>,
+}
+
+impl ToolOutputArtifactStore for ToolArtifactStore {
+    fn save_tool_output(
+        &self,
+        call_id: Option<&str>,
+        kind: &'static str,
+        raw: &str,
+    ) -> StoredToolOutput {
+        let stored = self.save(call_id, kind, raw);
+        StoredToolOutput {
+            artifact_id: stored.artifact_id,
+            call_id: stored.call_id,
+        }
+    }
 }
 
 impl ToolArtifactStore {

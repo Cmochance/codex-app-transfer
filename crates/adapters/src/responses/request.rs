@@ -23,6 +23,7 @@ use serde_json::{json, Map, Value};
 
 use super::session::ResponseSessionCache;
 use crate::core::input::{merge_messages_with_previous_response, response_id_for_session};
+use crate::core::tool_output::normalize_tool_output_for_context_with_store;
 use crate::types::{AdapterError, ResponseSessionPlan};
 
 #[derive(Debug, Clone)]
@@ -30,11 +31,6 @@ pub struct ResponsesBodyConversion {
     pub body: Value,
     pub response_session: ResponseSessionPlan,
 }
-
-const TOOL_OUTPUT_INLINE_MAX_CHARS: usize = 4_000;
-const TOOL_OUTPUT_HEAD_CHARS: usize = 1_200;
-const TOOL_OUTPUT_TAIL_CHARS: usize = 1_200;
-const TOOL_OUTPUT_VISIBLE_MAX_CHARS: usize = 5_000;
 
 /// 把 Responses API 请求体转换成 OpenAI Chat Completions 请求体.
 pub fn responses_body_to_chat_body(input: &Value) -> Result<Value, AdapterError> {
@@ -162,8 +158,15 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         }
     }
 
-    // reasoning → reasoning_effort
-    if let Some(reasoning_effort) = body.get("reasoning").and_then(build_reasoning_effort) {
+    // reasoning → reasoning_effort. Anthropic Messages preserves Claude's
+    // xhigh/max effort names because LiteLLM maps them into output_config.effort.
+    let reasoning_effort = if provider_is_anthropic_messages(provider) {
+        body.get("reasoning")
+            .and_then(build_anthropic_reasoning_effort)
+    } else {
+        body.get("reasoning").and_then(build_reasoning_effort)
+    };
+    if let Some(reasoning_effort) = reasoning_effort {
         result.insert("reasoning_effort".into(), reasoning_effort);
     }
 
@@ -212,6 +215,12 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         "safety_identifier",
         "safety_settings",
         "context",
+        "context_management",
+        "container",
+        "output_config",
+        "output_format",
+        "speed",
+        "cache_control",
         "truncate",
         "prompt_truncation",
         "extra_headers",
@@ -436,7 +445,21 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
         "message" => {
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             let content = normalize_message_content(item.get("content").unwrap_or(&Value::Null));
-            vec![json!({ "role": role, "content": content })]
+            let mut msg = json!({ "role": role, "content": content });
+            if role == "assistant" {
+                for key in ["reasoning_content", "anthropic_thinking_blocks"] {
+                    if let Some(value) = item.get(key) {
+                        msg[key] = value.clone();
+                    }
+                }
+            } else if role == "tool" {
+                for key in ["tool_call_id", "is_error", "cache_control"] {
+                    if let Some(value) = item.get(key) {
+                        msg[key] = value.clone();
+                    }
+                }
+            }
+            vec![msg]
         }
         "function_call" => {
             let call_id = item
@@ -580,209 +603,12 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
     }
 }
 
-pub(crate) fn normalize_tool_output_for_context(
-    call_id: Option<&str>,
-    output_value: Value,
-) -> String {
+fn normalize_tool_output_for_context(call_id: Option<&str>, output_value: Value) -> String {
     normalize_tool_output_for_context_with_store(
         call_id,
         output_value,
         Some(super::artifact_store::global_tool_artifact_store()),
     )
-}
-
-pub(crate) fn normalize_tool_output_for_context_with_store(
-    call_id: Option<&str>,
-    output_value: Value,
-    artifact_store: Option<&super::artifact_store::ToolArtifactStore>,
-) -> String {
-    let raw = match output_value {
-        Value::String(s) => s,
-        other => serde_json::to_string(&other).unwrap_or_default(),
-    };
-    if raw.chars().count() <= TOOL_OUTPUT_INLINE_MAX_CHARS {
-        return raw;
-    }
-    let kind = classify_tool_output(&raw);
-    let artifact = artifact_store.map(|store| store.save(call_id, kind, &raw));
-    build_bounded_tool_output_summary(&raw, kind, artifact.as_ref())
-}
-
-fn build_bounded_tool_output_summary(
-    raw: &str,
-    kind: &str,
-    artifact: Option<&super::artifact_store::StoredToolArtifact>,
-) -> String {
-    let original_chars = raw.chars().count();
-    let original_lines = raw.lines().count();
-    let mut out = String::new();
-
-    out.push_str("[Tool output stored outside model context]\n");
-    out.push_str("Visible content below is a bounded evidence summary, not the full raw output.\n");
-    if let Some(artifact) = artifact {
-        out.push_str(&format!("Artifact ID: {}\n", artifact.artifact_id));
-        if let Some(call_id) = artifact.call_id.as_deref() {
-            out.push_str(&format!("Tool call ID: {call_id}\n"));
-        }
-    } else {
-        out.push_str("Artifact ID: unavailable; raw payload could not be stored.\n");
-    }
-    out.push_str(&format!("Artifact kind: {kind}\n"));
-    out.push_str(&format!(
-        "Original size: {original_chars} chars across {original_lines} lines.\n"
-    ));
-    if let Some(token_count) = extract_marker_value(raw, "Original token count:") {
-        out.push_str(&format!("Original token count: {token_count}\n"));
-    }
-    if let Some(total_lines) = extract_marker_value(raw, "Total output lines:") {
-        out.push_str(&format!("Reported output lines: {total_lines}\n"));
-    }
-
-    let path_hints = extract_path_hints(raw, 12);
-    if !path_hints.is_empty() {
-        out.push_str("Path hints:\n");
-        for path in path_hints {
-            out.push_str("- ");
-            out.push_str(&path);
-            out.push('\n');
-        }
-    }
-
-    let url_hints = extract_url_hints(raw, 12);
-    if !url_hints.is_empty() {
-        out.push_str("URL hints:\n");
-        for url in url_hints {
-            out.push_str("- ");
-            out.push_str(&url);
-            out.push('\n');
-        }
-    }
-
-    out.push_str("\n--- Begin head excerpt ---\n");
-    out.push_str(&take_first_chars(raw, TOOL_OUTPUT_HEAD_CHARS));
-    out.push_str("\n--- End head excerpt ---\n");
-    out.push_str("\n--- Begin tail excerpt ---\n");
-    out.push_str(&take_last_chars(raw, TOOL_OUTPUT_TAIL_CHARS));
-    out.push_str("\n--- End tail excerpt ---\n");
-    out.push_str(&format!(
-        "\n[Omitted raw tool output from model context. Original size: {original_chars} chars.]"
-    ));
-
-    if out.chars().count() > TOOL_OUTPUT_VISIBLE_MAX_CHARS {
-        let mut trimmed = take_first_chars(&out, TOOL_OUTPUT_VISIBLE_MAX_CHARS);
-        trimmed.push_str("\n[Tool output compression summary truncated to visible budget.]");
-        return trimmed;
-    }
-    out
-}
-
-fn classify_tool_output(raw: &str) -> &'static str {
-    let sample = raw.chars().take(20_000).collect::<String>();
-    let trimmed = sample.trim_start();
-    if (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && serde_json::from_str::<Value>(trimmed).is_ok()
-    {
-        return "json";
-    }
-    if sample.contains("https://")
-        || sample.contains("http://")
-        || sample.contains("web_search")
-        || sample.contains("Search results")
-        || sample.contains("source:")
-    {
-        return "web_or_search";
-    }
-    if sample.contains("Process exited with code")
-        || sample.contains("Exit code")
-        || sample.contains("Wall time:")
-        || sample.contains("Output:")
-    {
-        return "command_output";
-    }
-    if !extract_path_hints(&sample, 1).is_empty() {
-        return "file_or_code_output";
-    }
-    "opaque_tool_output"
-}
-
-fn extract_marker_value(raw: &str, marker: &str) -> Option<String> {
-    let start = raw.find(marker)?;
-    let rest = &raw[start + marker.len()..];
-    let value = rest
-        .trim_start()
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
-fn extract_url_hints(raw: &str, max: usize) -> Vec<String> {
-    let mut urls = Vec::new();
-    for token in raw.lines().take(200).flat_map(str::split_whitespace) {
-        let candidate = token.trim_matches(|ch: char| {
-            matches!(
-                ch,
-                '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
-            )
-        });
-        if !(candidate.starts_with("http://") || candidate.starts_with("https://")) {
-            continue;
-        }
-        if urls.iter().any(|existing| existing == candidate) {
-            continue;
-        }
-        urls.push(candidate.to_owned());
-        if urls.len() >= max {
-            break;
-        }
-    }
-    urls
-}
-
-fn extract_path_hints(raw: &str, max: usize) -> Vec<String> {
-    let mut paths = Vec::new();
-    for line in raw.lines().take(200) {
-        for token in line.split_whitespace() {
-            let candidate = token
-                .trim_matches(|ch: char| {
-                    matches!(
-                        ch,
-                        '"' | '\'' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
-                    )
-                })
-                .split(':')
-                .next()
-                .unwrap_or("");
-            if !(candidate.starts_with('/') || candidate.starts_with("./")) {
-                continue;
-            }
-            if !candidate.contains('.') {
-                continue;
-            }
-            if paths.iter().any(|existing| existing == candidate) {
-                continue;
-            }
-            paths.push(candidate.to_owned());
-            if paths.len() >= max {
-                return paths;
-            }
-        }
-    }
-    paths
-}
-
-fn take_first_chars(value: &str, max: usize) -> String {
-    value.chars().take(max).collect()
-}
-
-fn take_last_chars(value: &str, max: usize) -> String {
-    let mut chars = value.chars().rev().take(max).collect::<Vec<_>>();
-    chars.reverse();
-    chars.into_iter().collect()
 }
 
 fn convert_file_item_to_message(item: &serde_json::Map<String, Value>) -> Vec<Value> {
@@ -1756,7 +1582,9 @@ fn normalize_message_content(content: &Value) -> Value {
             let mut text_only = true;
             for block in arr {
                 let t = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                if !matches!(t, "input_text" | "output_text" | "text") {
+                if block.get("cache_control").is_some()
+                    || !matches!(t, "input_text" | "output_text" | "text")
+                {
                     text_only = false;
                     break;
                 }
@@ -1817,7 +1645,13 @@ fn responses_block_to_chat_block(block: &Value) -> Option<Value> {
                 .get("text")
                 .map(value_to_chat_string)
                 .unwrap_or_default();
-            Some(json!({ "type": "text", "text": text }))
+            let mut out = serde_json::Map::new();
+            out.insert("type".into(), Value::String("text".into()));
+            out.insert("text".into(), Value::String(text));
+            if let Some(cache_control) = obj.get("cache_control") {
+                out.insert("cache_control".into(), cache_control.clone());
+            }
+            Some(Value::Object(out))
         }
         "input_image" => {
             let detail = obj.get("detail").and_then(|v| v.as_str()).unwrap_or("auto");
@@ -1845,6 +1679,7 @@ fn responses_block_to_chat_block(block: &Value) -> Option<Value> {
             "type": "refusal",
             "refusal": obj.get("refusal").cloned().unwrap_or_else(|| json!("")),
         })),
+        "document" | "container_upload" => Some(block.clone()),
         "input_file" => {
             let marker = obj
                 .get("filename")
@@ -2000,12 +1835,43 @@ fn build_reasoning_effort(reasoning: &Value) -> Option<Value> {
     }
 }
 
+fn build_anthropic_reasoning_effort(reasoning: &Value) -> Option<Value> {
+    match reasoning {
+        Value::String(s) => normalize_anthropic_reasoning_effort(s),
+        Value::Object(obj) => {
+            if let Some(effort) = obj.get("effort") {
+                if let Some(effort) = effort.as_str() {
+                    return normalize_anthropic_reasoning_effort(effort);
+                }
+                return Some(effort.clone());
+            }
+            if obj.contains_key("summary") {
+                return Some(reasoning.clone());
+            }
+            Some(reasoning.clone())
+        }
+        Value::Null => None,
+        other => Some(other.clone()),
+    }
+}
+
 fn normalize_chat_reasoning_effort(effort: &str) -> Option<Value> {
     match effort.trim().to_ascii_lowercase().as_str() {
         "minimal" | "low" | "medium" | "high" => {
             Some(Value::String(effort.trim().to_ascii_lowercase()))
         }
         "xhigh" | "max" | "highest" => Some(Value::String("high".into())),
+        "none" | "off" | "auto" | "" => None,
+        _ => None,
+    }
+}
+
+fn normalize_anthropic_reasoning_effort(effort: &str) -> Option<Value> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
+            Some(Value::String(effort.trim().to_ascii_lowercase()))
+        }
+        "highest" => Some(Value::String("xhigh".into())),
         "none" | "off" | "auto" | "" => None,
         _ => None,
     }
@@ -2122,6 +1988,13 @@ fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>
     let Some(ttype) = obj.get("type").and_then(|v| v.as_str()) else {
         return vec![];
     };
+    if provider_is_anthropic_messages(provider)
+        && !matches!(ttype, "web_search" | "web_search_preview")
+    {
+        if let Some(tool) = convert_responses_tool_to_anthropic_native_chat_tool(obj, ttype) {
+            return vec![tool];
+        }
+    }
     match ttype {
         "function" => {
             let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2136,7 +2009,7 @@ fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>
                 }
             }
             let strict = obj.get("strict").and_then(|v| v.as_bool()).unwrap_or(false);
-            vec![json!({
+            let mut tool = json!({
                 "type": "function",
                 "function": {
                     "name": name,
@@ -2144,7 +2017,9 @@ fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>
                     "parameters": parameters,
                     "strict": strict,
                 },
-            })]
+            });
+            copy_responses_tool_extensions(obj, &mut tool);
+            vec![tool]
         }
         "custom" => {
             // Custom tool(无 JSON schema)降级为接受单字符串 input 的 function
@@ -2153,7 +2028,9 @@ fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            vec![json!({
+            let description = custom_tool_description_with_format(description, obj.get("format"));
+            let input_description = custom_tool_input_description(obj.get("format"));
+            let mut tool = json!({
                 "type": "function",
                 "function": {
                     "name": name,
@@ -2163,14 +2040,16 @@ fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>
                         "properties": {
                             "input": {
                                 "type": "string",
-                                "description": "Free-form input passed verbatim to the tool.",
+                                "description": input_description,
                             }
                         },
                         "required": ["input"],
                     },
                     "strict": false,
                 },
-            })]
+            });
+            copy_responses_tool_extensions(obj, &mut tool);
+            vec![tool]
         }
         "namespace" => {
             // Codex CLI 用 `type:"namespace"` 包装 MCP server 工具集 — 实测
@@ -2203,10 +2082,14 @@ fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>
                 );
                 return vec![];
             };
-            inner
+            let mut expanded = inner
                 .iter()
                 .flat_map(|inner_tool| convert_responses_tool_to_chat_tool(inner_tool, provider))
-                .collect()
+                .collect::<Vec<_>>();
+            if provider_is_anthropic_messages(provider) {
+                inject_namespace_context_into_tool_descriptions(obj, &mut expanded);
+            }
+            expanded
         }
         // Codex.app 默认每轮都给 tools 数组传 `{type:"web_search",
         // external_web_access:true, search_content_types:["text","image"]}`
@@ -2223,6 +2106,179 @@ fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>
             crate::warn_once_drop_tool(other);
             vec![]
         }
+    }
+}
+
+fn copy_responses_tool_extensions(source: &Map<String, Value>, target: &mut Value) {
+    let Some(target_obj) = target.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "cache_control",
+        "defer_loading",
+        "allowed_callers",
+        "input_examples",
+    ] {
+        if let Some(value) = source.get(key) {
+            target_obj.insert(key.to_owned(), value.clone());
+        }
+    }
+}
+
+fn provider_is_anthropic_messages(provider: Option<&Provider>) -> bool {
+    provider.is_some_and(|p| {
+        p.api_format.eq_ignore_ascii_case("anthropic_messages")
+            || provider_looks_like(p, "anthropic")
+            || provider_looks_like(p, "claude")
+            || provider_looks_like(p, "anyrouter")
+    })
+}
+
+fn convert_responses_tool_to_anthropic_native_chat_tool(
+    obj: &Map<String, Value>,
+    ttype: &str,
+) -> Option<Value> {
+    match ttype {
+        "computer_use_preview" | "computer_use" | "computer" => {
+            let width = obj
+                .get("display_width_px")
+                .or_else(|| obj.get("display_width"))
+                .and_then(Value::as_u64)?;
+            let height = obj
+                .get("display_height_px")
+                .or_else(|| obj.get("display_height"))
+                .and_then(Value::as_u64)?;
+            let mut out = Map::new();
+            out.insert("type".into(), Value::String("computer_20250124".into()));
+            out.insert(
+                "name".into(),
+                obj.get("name")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String("computer".into())),
+            );
+            out.insert("display_width_px".into(), Value::Number(width.into()));
+            out.insert("display_height_px".into(), Value::Number(height.into()));
+            if let Some(display_number) = obj.get("display_number") {
+                out.insert("display_number".into(), display_number.clone());
+            }
+            return Some(Value::Object(out));
+        }
+        "mcp" => {
+            let mut out = Map::new();
+            out.insert("type".into(), Value::String("mcp".into()));
+            for key in ["server_url", "server_label", "headers", "allowed_tools"] {
+                if let Some(value) = obj.get(key) {
+                    out.insert(key.to_owned(), value.clone());
+                }
+            }
+            return Some(Value::Object(out));
+        }
+        _ => {}
+    }
+    if is_anthropic_native_tool_type(ttype) {
+        let mut out = obj.clone();
+        out.entry("name")
+            .or_insert_with(|| Value::String(default_anthropic_native_tool_name(ttype).into()));
+        return Some(Value::Object(out));
+    }
+    None
+}
+
+fn is_anthropic_native_tool_type(ttype: &str) -> bool {
+    [
+        "web_search",
+        "bash",
+        "text_editor",
+        "code_execution",
+        "web_fetch",
+        "memory",
+        "tool_search_tool",
+        "advisor_",
+        "computer_",
+    ]
+    .iter()
+    .any(|prefix| ttype.starts_with(prefix))
+}
+
+fn default_anthropic_native_tool_name(ttype: &str) -> &'static str {
+    if ttype.starts_with("code_execution") {
+        "code_execution"
+    } else if ttype.starts_with("web_fetch") {
+        "web_fetch"
+    } else if ttype.starts_with("web_search") {
+        "web_search"
+    } else if ttype.starts_with("text_editor") {
+        "str_replace_editor"
+    } else if ttype.starts_with("computer_") {
+        "computer"
+    } else if ttype.starts_with("memory") {
+        "memory"
+    } else if ttype.starts_with("tool_search_tool") {
+        "tool_search_tool"
+    } else if ttype.starts_with("advisor_") {
+        "advisor"
+    } else {
+        "bash"
+    }
+}
+
+fn custom_tool_description_with_format(description: &str, format: Option<&Value>) -> String {
+    let Some(format) = format else {
+        return description.to_owned();
+    };
+    let format_text = value_to_chat_string(format);
+    if description.trim().is_empty() {
+        format!("Responses custom tool format: {format_text}")
+    } else {
+        format!("{description}\n\nResponses custom tool format: {format_text}")
+    }
+}
+
+fn custom_tool_input_description(format: Option<&Value>) -> String {
+    let Some(format) = format else {
+        return "Free-form input passed verbatim to the tool.".into();
+    };
+    format!(
+        "Free-form input passed verbatim to the tool. The input must follow this Responses custom tool format: {}",
+        value_to_chat_string(format)
+    )
+}
+
+fn inject_namespace_context_into_tool_descriptions(
+    namespace: &Map<String, Value>,
+    tools: &mut [Value],
+) {
+    let ns_name = namespace
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ns_desc = namespace
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let prefix = match (ns_name, ns_desc) {
+        (Some(name), Some(desc)) => format!("[MCP server `{name}`: {desc}]"),
+        (Some(name), None) => format!("[MCP server `{name}`]"),
+        (None, Some(desc)) => format!("[MCP server: {desc}]"),
+        (None, None) => return,
+    };
+    for tool in tools {
+        let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let original = function
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let description = if original.trim().is_empty() {
+            prefix.clone()
+        } else {
+            format!("{prefix}\n\n{original}")
+        };
+        function.insert("description".into(), Value::String(description));
     }
 }
 
@@ -2302,6 +2358,36 @@ fn convert_web_search_tool(
         })];
     }
 
+    if provider
+        .api_format
+        .eq_ignore_ascii_case("anthropic_messages")
+        || provider_looks_like(provider, "anthropic")
+        || provider_looks_like(provider, "claude")
+        || provider_looks_like(provider, "anyrouter")
+    {
+        // LiteLLM Anthropic mapper (`map_web_search_tool`) 将 OpenAI
+        // web_search_options 映射为 Anthropic hosted server tool:
+        // `{type:"web_search_20250305", name:"web_search"}`。Codex.app
+        // 默认在 Responses tools[] 里传 `web_search`,这里对齐为
+        // Anthropic Messages 原生 server-side web search,避免退回本地 MCP
+        // web_search 路径。
+        let mut out = serde_json::Map::new();
+        out.insert("type".into(), Value::String("web_search_20250305".into()));
+        out.insert("name".into(), Value::String("web_search".into()));
+        if let Some(max_uses) = anthropic_web_search_max_uses(obj.get("search_context_size")) {
+            out.insert("max_uses".into(), Value::Number(max_uses.into()));
+        }
+        if let Some(user_location) = anthropic_web_search_user_location(obj.get("user_location")) {
+            out.insert("user_location".into(), user_location);
+        }
+        for field in ["allowed_domains", "blocked_domains"] {
+            if let Some(v) = obj.get(field) {
+                out.insert(field.to_owned(), v.clone());
+            }
+        }
+        return vec![Value::Object(out)];
+    }
+
     // ── 文档实证不支持 web_search 的 provider ──
     // 这些 provider 的 chat completions API 明确只接受 `type:"function"`,
     // 没有 builtin web_search / native search / extra_body 顶级开关等任何
@@ -2336,6 +2422,31 @@ fn convert_web_search_tool(
     // 后续逐家移植后会让模型直接走 chat 原生 web search,效率更高。
     crate::warn_once_drop_tool("web_search:provider-not-implemented");
     vec![]
+}
+
+fn anthropic_web_search_max_uses(search_context_size: Option<&Value>) -> Option<u64> {
+    match search_context_size.and_then(Value::as_str) {
+        Some("low") => Some(1),
+        Some("medium") => Some(5),
+        Some("high") => Some(10),
+        _ => None,
+    }
+}
+
+fn anthropic_web_search_user_location(user_location: Option<&Value>) -> Option<Value> {
+    let obj = user_location?.as_object()?;
+    let approximate = obj
+        .get("approximate")
+        .and_then(Value::as_object)
+        .unwrap_or(obj);
+    let mut out = serde_json::Map::new();
+    out.insert("type".into(), Value::String("approximate".into()));
+    for field in ["city", "region", "country", "timezone"] {
+        if let Some(v) = approximate.get(field) {
+            out.insert(field.to_owned(), v.clone());
+        }
+    }
+    Some(Value::Object(out))
 }
 
 /// 扫 outbound tools 数组,看是否含 Kimi 内置 `$web_search`

@@ -168,10 +168,11 @@ fn load_resolver_snapshot() -> Result<ResolverSnapshot, String> {
     }
     let s = std::fs::read_to_string(&path).map_err(|e| format!("read config.json failed: {e}"))?;
     // 先 raw Value 解析 + healing(强制覆盖 builtin provider 的 apiFormat /
-    // authScheme / extraHeaders),再转 typed Config。proxy 这条路径**不写回
-    // 磁盘**(避免与 admin 路径写盘竞争),仅在内存中保证当前 resolver 拿到
-    // 修过的配置;真正的盘写入由 admin/registry_io.rs::load 在用户打开应用
-    // 时触发。详见 registry::healing 模块说明。
+    // authScheme / extraHeaders,以及 Anyrouter 等 provider 的定向协议字段),再
+    // 转 typed Config。proxy 这条路径**不写回磁盘**(避免与 admin 路径写盘竞争),
+    // 仅在内存中保证当前 resolver 拿到修过的配置;真正的盘写入由
+    // admin/registry_io.rs::load 在用户打开应用时触发。详见 registry::healing
+    // 模块说明。
     let mut raw: serde_json::Value =
         serde_json::from_str(&s).map_err(|e| format!("parse config.json failed: {e}"))?;
     codex_app_transfer_registry::heal_builtin_provider_fields(&mut raw);

@@ -33,6 +33,7 @@ use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
 use crate::core::input::response_id_for_session;
+use crate::core::tool_output::normalize_tool_output_for_context_with_store;
 use crate::responses::ResponseSessionCache;
 use crate::types::{AdapterError, ResponseSessionPlan};
 
@@ -355,9 +356,10 @@ fn responses_input_to_chat_messages(
                     .unwrap_or("call_unknown")
                     .to_owned();
                 let output = obj.get("output").cloned().unwrap_or(Value::Null);
-                let content_str = crate::responses::request::normalize_tool_output_for_context(
+                let content_str = normalize_tool_output_for_context_with_store(
                     Some(call_id.as_str()),
                     output,
+                    Some(crate::responses::global_tool_artifact_store()),
                 );
                 // P0-G + Bug B 修复:Codex.app 不重发 prior function_call,但 Gemini
                 // 强制要求 functionCall turn(model role) 紧跟 functionResponse turn

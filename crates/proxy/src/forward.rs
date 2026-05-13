@@ -321,7 +321,9 @@ pub async fn forward_handler(
         }
     }
 
-    strip_model_suffix_in_place(&mut body_bytes);
+    if !crate::resolver::provider_preserves_internal_model_suffix(&resolved.provider) {
+        strip_model_suffix_in_place(&mut body_bytes);
+    }
     let resolved_model = body_model(&body_bytes);
 
     // 4. 走 adapter 拿到上游路径 + 改写后的 body。Codex 的本地
@@ -750,6 +752,13 @@ async fn build_and_send_upstream(
     }
     up = inject_auth(up, resolved, oauth_bearer.as_deref());
     for (name, value) in resolved.extra_headers.iter() {
+        if name.as_str().eq_ignore_ascii_case("anthropic-beta") {
+            if let Some(adapter_value) = adapter_headers.get(name) {
+                let merged = merge_comma_header_values(value, adapter_value);
+                up = up.header(name, merged);
+                continue;
+            }
+        }
         up = up.header(name, value);
     }
     for (name, value) in adapter_headers.iter() {
@@ -838,6 +847,30 @@ async fn build_and_send_upstream(
     let outbound_headers_snapshot = req.headers().clone();
     let resp = state.http.execute(req).await?;
     Ok((resp, outbound_headers_snapshot))
+}
+
+fn merge_comma_header_values(
+    primary: &reqwest::header::HeaderValue,
+    secondary: &reqwest::header::HeaderValue,
+) -> String {
+    let mut values = std::collections::BTreeSet::new();
+    if let Ok(primary) = primary.to_str() {
+        for value in primary.split(',') {
+            let value = value.trim();
+            if !value.is_empty() {
+                values.insert(value.to_owned());
+            }
+        }
+    }
+    if let Ok(secondary) = secondary.to_str() {
+        for value in secondary.split(',') {
+            let value = value.trim();
+            if !value.is_empty() {
+                values.insert(value.to_owned());
+            }
+        }
+    }
+    values.into_iter().collect::<Vec<_>>().join(",")
 }
 
 /// 检测上游 4xx 响应 body 是否是"web search plugin / Web Search 能力未开"

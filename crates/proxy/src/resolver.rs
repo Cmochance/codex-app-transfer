@@ -15,6 +15,7 @@ use codex_app_transfer_registry::model_alias::{
     normalize_model_mappings, openai_model_slot, provider_slug, strip_internal_model_suffix,
 };
 use codex_app_transfer_registry::Provider;
+use serde_json::Value;
 use thiserror::Error;
 
 /// 已解析的"下一跳上游"信息.
@@ -79,6 +80,43 @@ impl AuthScheme {
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
         }
+    }
+}
+
+pub(crate) fn provider_preserves_internal_model_suffix(provider: &Provider) -> bool {
+    provider
+        .request_options
+        .get("preserve_internal_model_suffix")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || provider
+            .request_options
+            .get("proxy")
+            .and_then(|v| v.get("preserve_internal_model_suffix"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+pub(crate) fn provider_forces_default_model(provider: &Provider) -> bool {
+    provider
+        .request_options
+        .get("force_default_model")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || provider
+            .request_options
+            .get("proxy")
+            .and_then(|v| v.get("force_default_model"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn upstream_model_for_provider(provider: &Provider, model: &str) -> String {
+    let trimmed = model.trim();
+    if provider_preserves_internal_model_suffix(provider) {
+        trimmed.to_owned()
+    } else {
+        strip_internal_model_suffix(trimmed)
     }
 }
 
@@ -155,15 +193,18 @@ impl StaticResolver {
     fn map_model_for_provider(&self, provider: &Provider, requested_model: &str) -> Option<String> {
         let mappings_value = serde_json::to_value(&provider.models).ok();
         let mappings = normalize_model_mappings(mappings_value.as_ref());
+        let default = mappings.get("default").map(|s| s.trim()).unwrap_or("");
+        if provider_forces_default_model(provider) && !default.is_empty() {
+            return Some(upstream_model_for_provider(provider, default));
+        }
         let slot = openai_model_slot(requested_model);
         if let Some(slot) = slot {
             let mapped = mappings.get(slot).map(|s| s.trim()).unwrap_or("");
             if !mapped.is_empty() {
-                return Some(strip_internal_model_suffix(mapped));
+                return Some(upstream_model_for_provider(provider, mapped));
             }
-            let default = mappings.get("default").map(|s| s.trim()).unwrap_or("");
             if !default.is_empty() {
-                return Some(strip_internal_model_suffix(default));
+                return Some(upstream_model_for_provider(provider, default));
             }
         }
         None
@@ -284,7 +325,12 @@ fn decide_provider<'a>(
         if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
             if let Some((slug, real)) = model.split_once('/') {
                 if let Some(p) = res.find_by_slug(slug) {
-                    return Some((p, Some(strip_internal_model_suffix(real))));
+                    if provider_forces_default_model(p) {
+                        if let Some(mapped) = res.map_model_for_provider(p, real) {
+                            return Some((p, Some(mapped)));
+                        }
+                    }
+                    return Some((p, Some(upstream_model_for_provider(p, real))));
                 }
             }
         }
@@ -477,6 +523,89 @@ mod tests {
         let res = r.resolve(&p, body).unwrap();
         assert_eq!(res.provider_id, "deepseek");
         assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn configured_provider_preserves_internal_suffix_for_upstream() {
+        let mut anyrouter = provider("anyrouter", "https://anyrouter.top", "sk-2");
+        anyrouter.request_options.insert(
+            "proxy".into(),
+            serde_json::json!({"preserve_internal_model_suffix": true}),
+        );
+        anyrouter
+            .models
+            .insert("default".into(), "claude-opus-4-7[1m]".into());
+        let r = StaticResolver::new(None, vec![anyrouter], Some("anyrouter".into()));
+        let p = parts_with(&[]);
+        let body = br#"{"model":"gpt-5.5"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "anyrouter");
+        assert_eq!(res.rewritten_model.as_deref(), Some("claude-opus-4-7[1m]"));
+    }
+
+    #[test]
+    fn force_default_model_maps_unknown_model_to_default() {
+        let mut anyrouter = provider("anyrouter", "https://anyrouter.top", "sk-2");
+        anyrouter.request_options.insert(
+            "proxy".into(),
+            serde_json::json!({"force_default_model": true}),
+        );
+        anyrouter
+            .models
+            .insert("default".into(), "claude-opus-4-7".into());
+        let r = StaticResolver::new(None, vec![anyrouter], Some("anyrouter".into()));
+        let p = parts_with(&[]);
+        let body = br#"{"model":"claude-3-5-haiku-latest"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "anyrouter");
+        assert_eq!(res.rewritten_model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn force_default_model_overrides_slug_route_model() {
+        let mut anyrouter = provider("anyrouter", "https://anyrouter.top", "sk-2");
+        anyrouter.request_options.insert(
+            "proxy".into(),
+            serde_json::json!({"force_default_model": true}),
+        );
+        anyrouter
+            .models
+            .insert("default".into(), "claude-opus-4-7".into());
+        let r = StaticResolver::new(None, vec![anyrouter], Some("anyrouter".into()));
+        let p = parts_with(&[]);
+        let body = br#"{"model":"anyrouter/claude-3-5-sonnet-latest"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "anyrouter");
+        assert_eq!(res.rewritten_model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn slash_route_preserves_explicit_openai_slot_without_force_default() {
+        let mut deepseek = provider("deepseek", "https://up-2", "sk-2");
+        deepseek
+            .models
+            .insert("default".into(), "deepseek-v4-pro".into());
+        let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
+        let p = parts_with(&[]);
+        let body = br#"{"model":"deepseek/gpt-5.5"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "deepseek");
+        assert_eq!(res.rewritten_model.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn slash_route_preserves_internal_suffix_when_provider_opts_in() {
+        let mut anyrouter = provider("anyrouter", "https://anyrouter.top", "sk-2");
+        anyrouter.request_options.insert(
+            "proxy".into(),
+            serde_json::json!({"preserve_internal_model_suffix": true}),
+        );
+        let r = StaticResolver::new(None, vec![anyrouter], Some("anyrouter".into()));
+        let p = parts_with(&[]);
+        let body = br#"{"model":"anyrouter/claude-opus-4-7[1m]"}"#;
+        let res = r.resolve(&p, body).unwrap();
+        assert_eq!(res.provider_id, "anyrouter");
+        assert_eq!(res.rewritten_model.as_deref(), Some("claude-opus-4-7[1m]"));
     }
 
     #[test]

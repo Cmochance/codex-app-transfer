@@ -28,7 +28,8 @@ pub fn load() -> Result<RawConfig, String> {
     }
     let mut cfg = load_raw_config(&path).map_err(|e| format!("read config.json failed: {e}"))?;
     // 强制覆盖 builtin provider 的"非用户配置"字段(apiFormat / authScheme /
-    // extraHeaders) — 详见 codex_app_transfer_registry::healing 模块说明。
+    // extraHeaders,以及 Anyrouter 等 provider 的定向协议字段) — 详见
+    // codex_app_transfer_registry::healing 模块说明。
     // 老版本(v1.x)写入或用户手改可能让这些字段不对(空字符串 / "responses" /
     // 缺失等),触发 MiMo 404 / Kimi 403 等绕过代理的功能性 bug。
     //

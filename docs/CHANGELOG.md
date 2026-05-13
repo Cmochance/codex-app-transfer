@@ -6,7 +6,13 @@
 
 **Anthropic Messages 协议适配**:新增 canonical `apiFormat=anthropic_messages`,将 Codex CLI Responses 请求转换到 Anthropic `/v1/messages`,并把 Anthropic Messages SSE 还原为 Responses SSE。当前 PR 已覆盖 text、thinking、tool_use、tool_result repair、`previous_response_id`、compact response、upstream error、provider test/model list 与 UI 保存显示路径。
 
-Claude preset 暂不开放:需要 P7 真实 Claude text、tool-call、`previous_response_id`、upstream error 验证通过后再加入默认 preset。
+**Anthropic Messages 协议保真补齐**:对齐 LiteLLM Anthropic tool 映射规则,补齐 namespace 元数据、custom grammar/schema、`strict`、`cache_control`、`defer_loading`、`allowed_callers`、`input_examples`、Anthropic hosted tools、Responses `computer_use_preview` 与 MCP `mcp_servers` 映射。非 web 的 Anthropic `*_tool_result` 与未知 content block 现在以 Responses reasoning trace 保留,不再静默丢弃。
+
+**Claude 原生能力补齐**:继续以 LiteLLM Anthropic 实现为基准,补齐 `context_management`、`container`、`output_config`、`output_format`、`speed`、`cache_control` 等 Anthropic top-level 字段;Responses `text.format` 现在会映射到 Claude structured output `output_format`,并过滤 Claude output schema 不支持的约束字段;Claude 4.6/4.7 系列会用 `thinking.type=adaptive + output_config.effort` 表达 reasoning effort;`document`、`container_upload`、富 `tool_result` 内容、`is_error` 与 `cache_control` 会继续保留。请求会按实际使用的 computer、MCP、tool search、programmatic tool calling、input examples、file-id documents、code execution、container skills、context management、structured output、effort、fast mode 与 advisor tool 自动追加 Anthropic beta header,proxy 转发层会把这些动态 beta 与 provider 已配置的 `anthropic-beta` 合并为单个 header。
+
+**Anyrouter 专属 preset**:新增 Anyrouter provider 卡片,默认 `baseUrl=https://anyrouter.top`、`apiFormat=anthropic_messages`、`claude-opus-4-7`,并定向启用 Claude Code 兼容形态:完整 `anthropic-beta`、`X-Claude-Code-Session-Id`、`x-app: cli`、Claude Code system 指纹、JSON 字符串形态 `metadata.user_id` 与 `thinking.type=adaptive`。P8 起 Anyrouter 强制所有入站模型别名回到 `models.default`,并将 Codex Responses `web_search` 转为 Anthropic 原生 hosted web search,避免 Claude 自动触发的子模型名或本地 web search fallback 造成偏航。2026-05-13 实测同一 key 下旧方案 `claude-opus-4-7[1m]` 返回 429/503,新方案非流式与流式均返回 200。
+
+通用 Claude preset 暂不开放:需要 P7 真实 Claude text、tool-call、`previous_response_id`、upstream error 验证通过后再加入默认 preset。
 
 ## v2.1.6 — 2026-05-12
 

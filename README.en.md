@@ -89,7 +89,7 @@ If the desktop window can't open (rare — usually Tauri webview init failed / s
 | MiniMax M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` → user (v2.1.6 fix for 400) |
 | Google AI Studio (`gemini_native`) | ✅ | ✅ | ✅ | Auto-selects Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` |
 | Google Gemini CLI OAuth | ✅ | ✅ | ✅ | Browser login once; no API key needed |
-| Anthropic Messages (custom Claude-compatible) | ✅ (PR #153) | ✅ (PR #153) | ✅ (PR #153) | `apiFormat=anthropic_messages`; Claude preset pending real validation |
+| Anthropic Messages (custom Claude-compatible) | ✅ (PR #153) | ✅ (PR #153) | ✅ (PR #153) | `apiFormat=anthropic_messages`; Anyrouter preset forces inbound model aliases to default and supports Anthropic native web search; generic Claude preset pending real validation |
 | Grok Web (SuperGrok / X Premium+) | ✅ | ✅ | ✅ (v2.1.6 adds tool_calls flatten) | Experimental, TOS gray area, personal use only |
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | Backend ready, UI pending |
 | Zhipu GLM / Alibaba Cloud Bailian | ⚠️ experimental | — | — | OpenAI Chat-compatible reverse proxy |

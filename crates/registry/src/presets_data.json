@@ -237,6 +237,52 @@
     "isBuiltin": true
   },
   {
+    "id": "anyrouter",
+    "name": "Anyrouter",
+    "baseUrl": "https://anyrouter.top",
+    "docsUrl": "https://anyrouter.top",
+    "authScheme": "bearer",
+    "apiFormat": "anthropic_messages",
+    "models": {
+      "default": "claude-opus-4-7"
+    },
+    "modelCapabilities": {
+      "claude-opus-4-7": {
+        "context_window": 1000000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "Anyrouter 的 Claude Opus 4.7 需要 Claude Code 兼容请求形态。本预设默认使用 `claude-opus-4-7`，自动补 Claude Code system 指纹、metadata.user_id、X-Claude-Code-Session-Id、完整 beta header、adaptive thinking 与 Anthropic 原生 web_search。"
+      },
+      {
+        "type": "warning",
+        "text": "不要把 `claude-opus-4-7[1m]` 作为默认上游模型。2026-05-13 实测同一 key 下 `[1m]` 路由返回 429/Service Unavailable，而 `claude-opus-4-7` + Claude Code 兼容形态可正常返回。"
+      },
+      {
+        "type": "warning",
+        "text": "Claude/Codex 在子任务中可能发起 `gpt-5.4`、`gpt-5.4-mini` 等非默认模型名。本预设强制把所有入站模型别名转回 `models.default`，避免触发 Anyrouter 未授权模型路由。"
+      }
+    ],
+    "requestOptions": {
+      "web_search_enabled": true,
+      "proxy": {
+        "force_default_model": true
+      },
+      "anthropic_messages": {
+        "claude_code_compat": true,
+        "thinking": {
+          "type": "adaptive"
+        }
+      }
+    },
+    "extraHeaders": {
+      "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,fast-mode-2026-02-01"
+    },
+    "isBuiltin": true
+  },
+  {
     "id": "grok-web",
     "name": "Grok(Web)",
     "baseUrl": "https://grok.com",

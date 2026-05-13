@@ -310,6 +310,7 @@ async fn anthropic_messages_forward_injects_adapter_protocol_headers() {
     let call = &calls[0];
     assert_eq!(call["path"], "/v1/messages");
     assert_eq!(call["headers"]["anthropic-version"], "2023-06-01");
+    assert_eq!(call["headers"]["accept"], "application/json");
     assert_eq!(call["headers"]["content-type"], "application/json");
     assert_eq!(
         call["headers_all"]["anthropic-version"]
@@ -323,6 +324,62 @@ async fn anthropic_messages_forward_injects_adapter_protocol_headers() {
     assert_eq!(body["model"], "claude-3-5-sonnet-latest");
     assert_eq!(body["stream"], true);
     assert_eq!(body["messages"][0]["role"], "user");
+}
+
+#[tokio::test]
+async fn anthropic_messages_forward_merges_provider_and_adapter_beta_headers() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn(anthropic_sse_capture_mock(calls.clone())).await;
+    let mut claude = provider(
+        "claude-provider",
+        &format!("http://{upstream}/v1"),
+        "sk-claude",
+        "bearer",
+        &[("anthropic-beta", "provider-static-beta")],
+    );
+    claude.api_format = "anthropic_messages".into();
+    let resolver = Arc::new(StaticResolver::new(
+        Some("cas_test_gw".into()),
+        vec![claude],
+        Some("claude-provider".into()),
+    ));
+    let proxy = spawn(build_router(resolver)).await;
+
+    let resp = client()
+        .post(format!("http://{proxy}/v1/responses"))
+        .header("authorization", "Bearer cas_test_gw")
+        .body(
+            json!({
+                "model": "claude-provider/claude-opus-4-7",
+                "stream": true,
+                "input": "hi",
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "schema": {"type": "object"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let _ = resp.bytes().await.unwrap();
+
+    let calls = calls.lock().unwrap();
+    let call = &calls[0];
+    let beta = call["headers"]["anthropic-beta"].as_str().unwrap();
+    assert!(beta.contains("provider-static-beta"));
+    assert!(beta.contains("structured-outputs-2025-11-13"));
+    assert_eq!(
+        call["headers_all"]["anthropic-beta"]
+            .as_array()
+            .expect("anthropic-beta header list")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

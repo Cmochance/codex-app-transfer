@@ -2,7 +2,7 @@
 
 > 日期: 2026-05-13
 > 目标: 为 Claude 系列模型新增一条一等公民的 Anthropic Messages 协议适配路径,让本地 Codex Responses 请求可以转换为上游 `/v1/messages`,并把上游 Anthropic Messages SSE 转回 OpenAI Responses SSE。
-> 当前状态: P6 配置与 UI 已完成;`anthropic_messages` 已可保存、展示、测速、抓取模型并通过 registry/proxy 路由。P7 正在补文档、全量验收与真实 Claude 验证;Claude preset 仍未添加。
+> 当前状态: P14 已按 LiteLLM 默认路径将 `anthropic_messages` 主链路改成 Responses <-> Anthropic Messages 直接转换,并继续补齐顶层 Anthropic 参数、system block cache、tool_use extension fields、server_tool_use usage、provider metadata 与 code execution result 映射。Anyrouter 实测已确认连接、default model 路由与 Anthropic native web search 可用;tool-call / continuation 仍被 Anyrouter 429 `Service Unavailable` 阻断,未能端到端确认。Claude preset 仍未添加。
 
 ## 1. 结论
 
@@ -98,7 +98,7 @@ P6 前行为不是原生 Anthropic Messages:
 crates/adapters/src/
   anthropic_messages/
     mod.rs              # AnthropicMessagesAdapter 薄编排
-    request.rs          # chat-shape / Responses normalized data -> Anthropic Messages body
+    request.rs          # Responses input item -> Anthropic Messages body direct conversion
     response.rs         # Anthropic Messages SSE -> Responses SSE
     types.rs            # 内部状态机与 Anthropic block helper,按需要添加
   mapper/
@@ -136,7 +136,7 @@ docs/protocol-unification-rfc-phase4.md 或新 Phase 5 RFC
 ## 4.1 P2-P6 落地状态
 
 - P2:新增 Phase 5 RFC、Anthropic request/SSE fixtures、request mapper TDD 入口。
-- P3:完成 Responses -> Anthropic Messages request mapper,复用 Responses session/tool-call repair/compact pipeline。
+- P3:完成 Responses -> Anthropic Messages request mapper。P13 已修正为直接转换路径,不再经由 OpenAI Chat body。
 - P4:完成 Anthropic Messages SSE -> Responses SSE response mapper,写入 `ToolCallCache` 与 `ResponseSessionCache`。
 - P5:接入 `AnthropicMessagesAdapter`、`mapper::anthropic_messages`、registry alias、proxy adapter headers。
 - P6:接入 admin/provider/UI:
@@ -155,27 +155,31 @@ docs/protocol-unification-rfc-phase4.md 或新 Phase 5 RFC
 主路径:
 
 1. adapter 接收入站 body,保留完整 `original_responses_request`。
-2. normal `/responses` / `/messages` 请求复用现有 Responses 输入管道:
-   - `previous_response_id` 历史恢复;
-   - `ResponseSessionCache` 拼接;
-   - `ToolCallCache` 修复孤立 tool result;
-   - 工具 artifact normalization;
-   - provider model rewrite。
-3. 得到 chat-shape `messages` 后,由 `anthropic_messages/request.rs` 降为 Anthropic Messages:
+2. normal `/responses` / `/messages` 请求直接解析 Responses body:
+   - `input` item 直接转 Anthropic user/assistant content block;
+   - `previous_response_id` 只复用 `ResponseSessionCache` 合并历史;
+   - `function_call_output` 只复用 `ToolCallCache` 修复被截断的 tool_use 关联;
+   - 大 tool output 只复用 artifact normalization;
+   - 不调用 `responses_body_to_chat_body_for_provider_with_session`,也不生成 OpenAI Chat body 作为中间态。
+3. 由 `anthropic_messages/request.rs` 直接输出 Anthropic Messages:
    - `system` / `developer` / `instructions` -> top-level `system`;
    - user text -> `{ "type": "text", "text": ... }`;
    - user image -> `{ "type": "image", "source": ... }`,支持 URL 与可识别的 data URL/base64;
    - assistant text -> `text` block;
-   - assistant `tool_calls` -> assistant `tool_use` block;
-   - chat `tool` message 或 Responses `function_call_output` -> 后续 user `tool_result` block;
+   - Responses `function_call` -> assistant `tool_use` block;
+   - Responses `function_call_output` 或 role=`tool` message -> 后续 user `tool_result` block;
    - `tools[].function` -> Anthropic `tools[]` 的 `name` / `description` / `input_schema`;
    - `tool_choice=auto|required|none|function name` -> `auto|any|none|tool`;
    - `parallel_tool_calls` -> Anthropic `disable_parallel_tool_use` 反向布尔值;
-   - `max_output_tokens` 或 chat `max_tokens` -> Anthropic `max_tokens`;
-   - `stop` -> `stop_sequences`;
-   - `reasoning` / `reasoning_effort` -> Anthropic `thinking`,先做保守 token budget 映射;
+   - `max_output_tokens` -> Anthropic `max_tokens`;
+   - `stop` / `stop_sequences` -> `stop_sequences`;
+   - `reasoning` / `reasoning_effort` -> Anthropic `thinking`;Claude 4.6/4.7 这类 adaptive thinking 模型按 LiteLLM 规则转为 `thinking.type=adaptive + output_config.effort`;
    - `metadata.user` / `user` -> `metadata.user_id`,但需要过滤 email/phone 形态,避免 Anthropic 拒绝;
-   - `response_format` / Responses `text.format` -> 先纳入后续项,MVP 不强行承诺 JSON schema,除非 fixture 验证通过。
+   - Responses `text.format` -> Anthropic `output_format`,并按 LiteLLM `filter_anthropic_output_schema` 规则过滤 Claude structured output 不支持的 schema 约束字段;
+   - Anthropic 原生 top-level 字段 `context_management`、`container`、`output_config`、`output_format`、`speed`、`cache_control`、`inference_geo`、`mcp_servers` 允许穿透到 `/messages`;
+   - system / developer / `instructions` 带 Anthropic text block 或 `cache_control` 时保留为 top-level `system` block list,普通纯文本仍输出 string;
+   - assistant `tool_use.cache_control` / `tool_use.caller` 在 direct path 中保留;
+   - Claude `document` / `container_upload` content block 与富 `tool_result` 内容保留;`container_upload` 出现时自动补 Anthropic `code_execution_20250522` hosted tool。
 4. 强制 `stream: true`,因为本地 Codex Responses 主链路预期 SSE。
 5. 上游路径使用 `/messages`;如果 provider base URL 不含 `/v1`,由 proxy URL 拼接规范决定是否生成 `/v1/messages`。实施前必须补路径测试覆盖以下 base URL:
    - `https://api.anthropic.com/v1`
@@ -184,7 +188,7 @@ docs/protocol-unification-rfc-phase4.md 或新 Phase 5 RFC
 6. 请求 header:
    - 默认补 `anthropic-version: 2023-06-01`;
    - 保留用户配置的 extra headers;
-   - 若启用 beta 功能,集中追加 `anthropic-beta`,不要覆盖用户已有值。
+   - 若启用 beta 功能,集中追加 `anthropic-beta`;当前按 LiteLLM 对齐 computer use、MCP client、advanced tool use、file-id documents、code execution、container skills、context management / compact、structured output、effort、web fetch、fast mode 与 advisor tool 生成 beta header。proxy 转发层需要把 adapter 动态 beta 与用户 provider 卡片中已有的 `anthropic-beta` 合并为单个 header,不能让 provider 静态 header 覆盖动态能力开关。
 
 请求侧必须主动校验的规则:
 
@@ -209,12 +213,16 @@ docs/protocol-unification-rfc-phase4.md 或新 Phase 5 RFC
    - `text` -> open Responses message output item,emit `response.output_item.added` 与 `response.content_part.added`;
    - `thinking` / `redacted_thinking` -> open Responses reasoning item,emit reasoning summary part;
    - `tool_use` -> open Responses function_call item,记录 `call_id`、工具名、参数 accumulator;
-   - `server_tool_use` -> MVP 作为 provider diagnostic metadata 或可诊断 unsupported,不要转换成 Codex function call。
+   - `server_tool_use(name=web_search)` -> Responses `web_search_call`;
+   - 非 web `server_tool_use` -> Responses `function_call`,并保留 `caller` / `cache_control` 等 Anthropic extension fields;
+   - `bash_code_execution_tool_result` / `code_execution_tool_result` -> Responses `code_interpreter_call`;
+   - 未知 block -> Responses `reasoning` trace item,避免静默丢失。
 3. `content_block_delta`
    - `text_delta.text` -> `response.output_text.delta`;
    - `thinking_delta.thinking` -> `response.reasoning_summary_text.delta`;
    - `input_json_delta.partial_json` -> `response.function_call_arguments.delta`,并追加到参数 accumulator;
-   - `signature_delta` -> trace-level 记录或内部 metadata,不暴露到公共 Responses 字段。
+   - `signature_delta` -> session-only Anthropic thinking block signature,供续轮回灌;
+   - 未知 delta -> Responses `reasoning` trace item。
 4. `content_block_stop`
    - text -> emit `response.output_text.done`、`response.content_part.done`、`response.output_item.done`;
    - thinking -> emit reasoning done 与 output item done;
@@ -225,7 +233,8 @@ docs/protocol-unification-rfc-phase4.md 或新 Phase 5 RFC
    - `stop_reason=tool_use` -> completed,但 completed output 内必须含 function_call;
    - `stop_reason=max_tokens` -> `response.incomplete`,reason=`max_output_tokens`;
    - `stop_reason=stop_sequence` -> completed,可保留 stop_sequence metadata;
-   - usage 映射为 `input_tokens`、`output_tokens`,cache tokens 放入 `input_tokens_details`。
+   - usage 映射为 `input_tokens`、`output_tokens`,cache tokens 放入 `input_tokens_details`,Anthropic `server_tool_use` 保留到 Responses `usage.server_tool_use`;
+   - `container`、`context_management`、`compaction` 等 provider-specific 字段放入 Responses `metadata.anthropic_*`。
 6. `message_stop`
    - emit `response.completed` 或 `response.incomplete`;
    - 将本轮 assistant message 合并进 `ResponseSessionCache`。
@@ -392,8 +401,8 @@ npm run build
 ### P3 请求 mapper
 
 - [ ] 新增 `crates/adapters/src/anthropic_messages/request.rs`。
-- [ ] 复用 Responses input/session pipeline。
-- [ ] 实现 chat-shape -> Anthropic Messages lowering。
+- [x] 直接解析 Responses `input` / `tools` / `text.format` / `reasoning` / `context_management`,不经 OpenAI Chat body。
+- [x] 仅复用 `ResponseSessionCache`、`ToolCallCache`、artifact output 压缩等协议无关能力。
 - [ ] 实现 tool name sanitize/reverse map。
 - [ ] 实现 path/header/max_tokens/thinking/tool_choice 映射。
 - [ ] 请求侧单测全部通过。
@@ -442,3 +451,22 @@ npm run build
 ## 12. 当前建议
 
 先按 P2-P5 完成 adapters 层闭环,不要一开始就加 preset。等 adapter 单测、registry 回归、provider test 分支都稳定后,再做 P6 的 UI 和 preset。这样可以把协议风险限制在 Rust adapter 层,避免半成品配置入口让用户误选。
+
+## 13. 当前 P15 补充结论
+
+2026-05-13 继续按 LiteLLM native Messages passthrough 与 Anthropic 类型定义对照后,确认 `anthropic_messages` 入口已经不再经过 Chat 降级。新发现并补齐的剩余 drop 面集中在直转内部字段保真:
+
+- request side 保留 Responses content array 上的 Anthropic `cache_control`,覆盖 text、image、document、thinking/redacted thinking;document 同时保留 `title`、`context`、`citations`。
+- assistant history 直接携带的 `server_tool_use`、`web_search_tool_result`、`web_fetch_tool_result`、`tool_search_tool_result`、`advisor_tool_result`、`compaction` 与其他 `*_tool_result` 现在按 Anthropic 原生 block 保留,不再字符串化。
+- response side 的 `previous_response_id` session cache 改为优先保存 Anthropic 原生 assistant content block list,避免下一轮回灌时把 server tool use/result、code execution result 或 thinking 降级为 Responses/Chat 形态。
+- 同步保留 message `name`、Anthropic native `tool_choice.disable_parallel_tool_use`,并按 LiteLLM 行为过滤 `x-anthropic-billing-header:` system block。
+- 同步 LiteLLM native Messages 的 advisor history 规则:未启用 `advisor_20260301` tool 时移除历史里的 advisor server tool/result block,启用 advisor tool 时原样保留。
+
+本轮未修改 chat、gemini_native 或其他协议转换区块。验证通过:
+
+```bash
+rustfmt --edition 2021 crates/adapters/src/anthropic_messages/request.rs crates/adapters/src/anthropic_messages/response.rs crates/adapters/tests/anthropic_messages_request.rs crates/adapters/tests/anthropic_messages_response.rs
+cargo test -p codex-app-transfer-adapters --test anthropic_messages_request --test anthropic_messages_response
+git diff --check -- crates/adapters/src/anthropic_messages/request.rs crates/adapters/src/anthropic_messages/response.rs crates/adapters/tests/anthropic_messages_request.rs crates/adapters/tests/anthropic_messages_response.rs
+rg -n "responses_body_to_chat|chat_body_to_anthropic|build_compact_chat|compact_chat|chat_body" crates/adapters/src/anthropic_messages crates/adapters/src/mapper/anthropic_messages.rs crates/adapters/tests/anthropic_messages_request.rs crates/adapters/tests/anthropic_messages_response.rs
+```

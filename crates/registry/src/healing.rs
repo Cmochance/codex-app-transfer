@@ -34,13 +34,18 @@
 //! - `extraHeaders` —— 反爬 UA 等 client 标识头,由 preset 内置
 //! - `isBuiltin` —— 命中即视作内置,UI 后续会防止用户改 baseUrl / authScheme
 //!
+//! provider 定向覆盖:
+//! - Anyrouter 的 `requestOptions` / `modelCapabilities` —— 这是 Claude Code
+//!   兼容形态、强制 default model、native web search 与 1M 能力声明的协议开关。
+//!   旧 Anyrouter 卡片缺这些字段会导致真实请求偏航,因此按 preset 自愈。
+//!
 //! 保留用户配置(**绝不动**):
 //! - `id` —— 改 id 会破坏 `activeProvider` 引用
 //! - `name` —— 用户可改显示名
 //! - `baseUrl` —— 用户可能选了 `baseUrlOptions` 里的备选集群(MiMo 的 sgp/ams
 //!   等),原样保留;preset 命中靠 normalize 后比对,不强制把 baseUrl 改回 preset 默认值
 //! - `apiKey` —— 用户的 API key,绝不能覆盖
-//! - `models` / `modelCapabilities` / `requestOptions` —— 用户可调
+//! - `models` / 非定向 provider 的 `modelCapabilities` / `requestOptions` —— 用户可调
 //! - `sortIndex` —— 排序,用户可改
 
 use std::collections::HashMap;
@@ -52,6 +57,9 @@ use crate::presets::builtin_presets;
 /// 必须强制覆盖为 builtin preset 字面值的字段(忽略用户编辑).
 /// 见模块头注 §"覆盖范围"小节.
 const ENFORCED_BUILTIN_FIELDS: &[&str] = &["apiFormat", "authScheme", "extraHeaders"];
+
+/// Anyrouter 这些字段是协议能力开关,旧本地卡片缺失时会直接影响真实可用性。
+const ANYROUTER_ENFORCED_PROTOCOL_FIELDS: &[&str] = &["requestOptions", "modelCapabilities"];
 
 /// 对 cfg 里所有 **baseUrl 命中 builtin preset** 的 provider,把
 /// `ENFORCED_BUILTIN_FIELDS` 列出的字段(以及 `isBuiltin`)强制覆盖为对应
@@ -129,9 +137,19 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
         //    指定"—— 不覆盖用户字段。多数 preset 把空 extraHeaders 写成 null
         //    而用户配置写成 `{}`,行为等价但语义不同;不应该把用户的 `{}` 改成
         //    `null`,反之亦然。
-        for field in ENFORCED_BUILTIN_FIELDS {
-            let preset_value = preset.get(*field).cloned();
-            let current_value = obj.get(*field).cloned();
+        let provider_specific_fields =
+            if preset.get("id").and_then(|v| v.as_str()) == Some("anyrouter") {
+                ANYROUTER_ENFORCED_PROTOCOL_FIELDS
+            } else {
+                &[]
+            };
+        for field in ENFORCED_BUILTIN_FIELDS
+            .iter()
+            .chain(provider_specific_fields.iter())
+            .copied()
+        {
+            let preset_value = preset.get(field).cloned();
+            let current_value = obj.get(field).cloned();
             let preset_specifies = !matches!(preset_value, None | Some(Value::Null));
             if !preset_specifies {
                 continue;
@@ -148,7 +166,7 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
             // 修复路径:用户在 UI 上看 chat 报"apiFormat=openai_chat 但 baseUrl 是
             // grok.com"对应错误更直观,引导用户**删了 provider 重建走 Grok(Web)
             // preset 卡片**(那条路径才会带上 grokWeb form 收集 cookies)。
-            if *field == "apiFormat"
+            if field == "apiFormat"
                 && preset_value.as_str() == Some("grok_web")
                 && !has_valid_grok_web_credentials(obj)
             {
@@ -168,7 +186,7 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
                     // C1 (2026-05-10):apiFormat 被强制覆盖时 telemetry warn,让用户在
                     // 日志面板看清"我的 direct 透传为啥失效了"—— baseUrl 命中 builtin
                     // preset 即触发,direct 透传需要 baseUrl 不命中任何 builtin。
-                    if *field == "apiFormat" {
+                    if field == "apiFormat" {
                         tracing::warn!(
                             provider_id = %obj.get("id").and_then(|v| v.as_str()).unwrap_or(""),
                             base_url = %obj.get("baseUrl").and_then(|v| v.as_str()).unwrap_or(""),
@@ -177,11 +195,11 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
                             "healing: apiFormat 被强制覆盖回 preset 字面值(baseUrl 命中 builtin preset);direct 透传需要 baseUrl 不命中任何 builtin"
                         );
                     }
-                    obj.insert((*field).to_owned(), preset_value);
+                    obj.insert(field.to_owned(), preset_value);
                     changed = true;
                 }
                 None => {
-                    obj.insert((*field).to_owned(), preset_value);
+                    obj.insert(field.to_owned(), preset_value);
                     changed = true;
                 }
             }
@@ -640,6 +658,54 @@ mod tests {
     }
 
     #[test]
+    fn anyrouter_builtin_healing_restores_protocol_request_options() {
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "3312eb08",
+                    "name": "Anyrouter",
+                    "baseUrl": "https://anyrouter.top",
+                    "isBuiltin": true,
+                    "apiKey": "sk-user-custom-key",
+                    "apiFormat": "anthropic_messages",
+                    "authScheme": "bearer",
+                    "models": {
+                        "default": "claude-opus-4-7",
+                        "gpt_5_4": "",
+                        "gpt_5_4_mini": ""
+                    },
+                    "requestOptions": {
+                        "anthropic_messages": {
+                            "claude_code_compat": true,
+                            "thinking": {"type": "adaptive"}
+                        }
+                    },
+                    "extraHeaders": {
+                        "anthropic-beta": "claude-code-20250219"
+                    }
+                }
+            ]
+        });
+
+        assert!(heal_builtin_provider_fields(&mut cfg));
+        let provider = &cfg["providers"][0];
+        assert_eq!(
+            provider["requestOptions"]["proxy"]["force_default_model"], true,
+            "Anyrouter stale config must recover force-default routing"
+        );
+        assert_eq!(
+            provider["requestOptions"]["web_search_enabled"], true,
+            "Anyrouter stale config must recover native web search"
+        );
+        assert_eq!(
+            provider["modelCapabilities"]["claude-opus-4-7"]["context_window"], 1_000_000,
+            "Anyrouter stale config must recover 1M capability metadata"
+        );
+        assert_eq!(provider["apiKey"], "sk-user-custom-key", "apiKey 绝不动");
+        assert_eq!(provider["models"]["gpt_5_4"], "", "models 仍保留用户配置");
+    }
+
+    #[test]
     fn no_op_when_already_aligned_with_preset() {
         let mut cfg = json!({
             "providers": [
@@ -649,7 +715,10 @@ mod tests {
                     "isBuiltin": true,
                     "apiFormat": "openai_chat",
                     "authScheme": "bearer",
-                    "extraHeaders": {"User-Agent": "KimiCLI/1.40.0"}
+                    "extraHeaders": {"User-Agent": "KimiCLI/1.40.0"},
+                    "modelCapabilities": {
+                        "kimi-for-coding": {"context_window": 262144}
+                    }
                 }
             ]
         });

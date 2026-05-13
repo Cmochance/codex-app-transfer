@@ -17,6 +17,7 @@ use crate::types::{AdapterError, ByteStream, ResponsePlan, ResponseSessionPlan};
 use super::request::AnthropicToolNameMaps;
 
 const MAX_COMPACT_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const PROVIDER_TRACE_MAX_CHARS: usize = 4_000;
 
 fn synthesize_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -256,6 +257,12 @@ pub struct AnthropicMessagesToResponsesConverter {
     next_output_index: u32,
     open_blocks: BTreeMap<u32, OpenBlock>,
     closed_items: Vec<(u32, Value)>,
+    closed_session_items: Vec<(u32, Value)>,
+    closed_session_blocks: Vec<(u32, Value)>,
+    pending_annotations: Vec<Value>,
+    provider_metadata: serde_json::Map<String, Value>,
+    code_by_call_id: BTreeMap<String, String>,
+    container_id: Option<String>,
     final_stop_reason: Option<String>,
     final_stop_sequence: Option<String>,
     final_usage: Option<Value>,
@@ -266,6 +273,8 @@ enum OpenBlock {
     Text(OpenText),
     Reasoning(OpenReasoning),
     Tool(OpenToolCall),
+    WebSearch(OpenWebSearchCall),
+    CodeInterpreter(OpenCodeInterpreterCall),
     Ignored,
 }
 
@@ -273,23 +282,54 @@ enum OpenBlock {
 struct OpenText {
     item_id: String,
     output_index: u32,
+    source_index: u32,
     text_acc: String,
+    annotations_acc: Vec<Value>,
 }
 
 #[derive(Debug)]
 struct OpenReasoning {
     item_id: String,
     output_index: u32,
+    source_index: u32,
     text_acc: String,
+    block_type: String,
+    signature: Option<String>,
+    redacted_data: Option<String>,
 }
 
 #[derive(Debug)]
 struct OpenToolCall {
     item_id: String,
     output_index: u32,
+    source_index: u32,
     call_id: String,
     name: String,
+    upstream_name: String,
+    block_type: String,
     arguments_acc: String,
+    caller: Option<Value>,
+    cache_control: Option<Value>,
+}
+
+#[derive(Debug)]
+struct OpenWebSearchCall {
+    item_id: String,
+    output_index: u32,
+    source_index: u32,
+    arguments_acc: String,
+}
+
+#[derive(Debug)]
+struct OpenCodeInterpreterCall {
+    item_id: String,
+    output_index: u32,
+    source_index: u32,
+    call_id: String,
+    block_type: String,
+    code: String,
+    logs_acc: String,
+    raw_content: Option<Value>,
 }
 
 impl AnthropicMessagesToResponsesConverter {
@@ -315,6 +355,12 @@ impl AnthropicMessagesToResponsesConverter {
             next_output_index: 0,
             open_blocks: BTreeMap::new(),
             closed_items: Vec::new(),
+            closed_session_items: Vec::new(),
+            closed_session_blocks: Vec::new(),
+            pending_annotations: Vec::new(),
+            provider_metadata: serde_json::Map::new(),
+            code_by_call_id: BTreeMap::new(),
+            container_id: None,
             final_stop_reason: None,
             final_stop_sequence: None,
             final_usage: None,
@@ -368,9 +414,20 @@ impl AnthropicMessagesToResponsesConverter {
         if self.terminal_status.as_deref() == Some("failed") {
             return None;
         }
-        let mut items = self.closed_items.clone();
-        items.sort_by_key(|(idx, _)| *idx);
-        assistant_message_from_output_items(items.iter().map(|(_, item)| item))
+        if !self.closed_session_blocks.is_empty() {
+            let mut session_blocks = self.closed_session_blocks.clone();
+            session_blocks.sort_by_key(|(idx, _)| *idx);
+            return Some(json!({
+                "role": "assistant",
+                "content": session_blocks
+                    .into_iter()
+                    .map(|(_, block)| block)
+                    .collect::<Vec<_>>(),
+            }));
+        }
+        let mut session_items = self.closed_session_items.clone();
+        session_items.sort_by_key(|(idx, _)| *idx);
+        assistant_message_from_output_items(session_items.iter().map(|(_, item)| item))
     }
 
     fn handle_frame(&mut self, frame: &[u8], out: &mut Vec<u8>) {
@@ -411,6 +468,16 @@ impl AnthropicMessagesToResponsesConverter {
         if let Some(usage) = data.pointer("/message/usage") {
             self.merge_usage(usage);
         }
+        if let Some(container) = data.pointer("/message/container") {
+            self.capture_container(container);
+            self.capture_provider_field("anthropic_container", container);
+        }
+        if let Some(context_management) = data.pointer("/message/context_management") {
+            self.capture_provider_field("anthropic_context_management", context_management);
+        }
+        if let Some(compaction) = data.pointer("/message/compaction") {
+            self.capture_provider_field("anthropic_compaction", compaction);
+        }
         if !self.lifecycle_opened {
             self.emit_lifecycle_open(out);
         }
@@ -427,24 +494,61 @@ impl AnthropicMessagesToResponsesConverter {
         match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "text" => {
                 let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                self.open_text(index, text, out);
+                let mut annotations = anthropic_citations_to_annotations(block.get("citations"));
+                annotations.append(&mut self.pending_annotations);
+                self.open_text(index, text, annotations, out);
             }
-            "thinking" | "redacted_thinking" => {
+            "thinking" => {
                 let text = block
                     .get("thinking")
                     .or_else(|| block.get("text"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                self.open_reasoning(index, text, out);
+                let signature = block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.open_reasoning(index, "thinking", text, signature, None, out);
+            }
+            "redacted_thinking" => {
+                let data = block.get("data").and_then(Value::as_str).map(str::to_owned);
+                self.open_reasoning(index, "redacted_thinking", "", None, data, out);
             }
             "tool_use" => {
                 self.open_tool_call(index, block, out);
             }
+            "server_tool_use" => {
+                if block.get("name").and_then(Value::as_str) == Some("web_search") {
+                    self.open_web_search_call(index, block, out);
+                } else {
+                    self.open_tool_call(index, block, out);
+                }
+            }
+            "bash_code_execution_tool_result" | "code_execution_tool_result" => {
+                self.open_code_interpreter_result(index, block, out);
+            }
+            "web_search_tool_result" | "web_fetch_tool_result" => {
+                let annotations = anthropic_web_search_result_annotations(block);
+                self.pending_annotations.extend(annotations);
+                self.closed_session_blocks.push((index, block.clone()));
+                self.open_blocks.insert(index, OpenBlock::Ignored);
+            }
+            block_type @ ("tool_search_tool_result" | "advisor_tool_result" | "compaction") => {
+                self.closed_session_blocks.push((index, block.clone()));
+                self.emit_provider_trace_item(index, block_type, block, out);
+                self.open_blocks.insert(index, OpenBlock::Ignored);
+            }
+            other if other.ends_with("_tool_result") => {
+                self.closed_session_blocks.push((index, block.clone()));
+                self.emit_provider_trace_item(index, other, block, out);
+                self.open_blocks.insert(index, OpenBlock::Ignored);
+            }
             other => {
                 tracing::trace!(
                     content_block_type = other,
-                    "ignoring unsupported Anthropic content block"
+                    "preserving unsupported Anthropic content block as trace item"
                 );
+                self.emit_provider_trace_item(index, other, block, out);
                 self.open_blocks.insert(index, OpenBlock::Ignored);
             }
         }
@@ -456,23 +560,58 @@ impl AnthropicMessagesToResponsesConverter {
         };
         let delta = data.get("delta").unwrap_or(&Value::Null);
         let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let mut handled = false;
         match (self.open_blocks.get_mut(&index), delta_type) {
             (Some(OpenBlock::Text(text)), "text_delta") => {
                 if let Some(value) = delta.get("text").and_then(|v| v.as_str()) {
                     emit_text_delta(text, &mut self.sequence_number, out, value);
+                    handled = true;
                 }
+            }
+            (Some(OpenBlock::Text(text)), "citation_delta") => {
+                let annotations = anthropic_citations_to_annotations(delta.get("citation"));
+                emit_text_annotations(text, &mut self.sequence_number, out, annotations);
+                handled = true;
             }
             (Some(OpenBlock::Reasoning(reasoning)), "thinking_delta") => {
                 if let Some(value) = delta.get("thinking").and_then(|v| v.as_str()) {
                     emit_reasoning_delta(reasoning, &mut self.sequence_number, out, value);
+                    handled = true;
+                }
+            }
+            (Some(OpenBlock::Reasoning(reasoning)), "signature_delta") => {
+                if let Some(value) = delta.get("signature").and_then(Value::as_str) {
+                    reasoning.signature = Some(value.to_owned());
+                    handled = true;
                 }
             }
             (Some(OpenBlock::Tool(tool)), "input_json_delta") => {
                 if let Some(value) = delta.get("partial_json").and_then(|v| v.as_str()) {
                     emit_tool_arguments_delta(tool, &mut self.sequence_number, out, value);
+                    handled = true;
                 }
             }
+            (Some(OpenBlock::WebSearch(search)), "input_json_delta") => {
+                if let Some(value) = delta.get("partial_json").and_then(Value::as_str) {
+                    search.arguments_acc.push_str(value);
+                    handled = true;
+                }
+            }
+            (Some(OpenBlock::CodeInterpreter(code)), _) => {
+                append_code_interpreter_delta(code, delta);
+                handled = true;
+            }
             _ => {}
+        }
+        if delta_type != "citation_delta" {
+            if let Some(OpenBlock::Text(text)) = self.open_blocks.get_mut(&index) {
+                let mut annotations = anthropic_citations_to_annotations(delta.get("citation"));
+                annotations.extend(anthropic_citations_to_annotations(delta.get("citations")));
+                emit_text_annotations(text, &mut self.sequence_number, out, annotations);
+            }
+        }
+        if !handled && !delta_type.is_empty() {
+            self.emit_provider_trace_item(index, &format!("delta:{delta_type}"), delta, out);
         }
     }
 
@@ -487,6 +626,8 @@ impl AnthropicMessagesToResponsesConverter {
             OpenBlock::Text(text) => self.close_text(text, out),
             OpenBlock::Reasoning(reasoning) => self.close_reasoning(reasoning, out),
             OpenBlock::Tool(tool) => self.close_tool_call(tool, out),
+            OpenBlock::WebSearch(search) => self.close_web_search_call(search, out),
+            OpenBlock::CodeInterpreter(code) => self.close_code_interpreter_result(code, out),
             OpenBlock::Ignored => {}
         }
     }
@@ -509,6 +650,25 @@ impl AnthropicMessagesToResponsesConverter {
         if let Some(usage) = data.get("usage") {
             self.merge_usage(usage);
         }
+        if let Some(container) = data
+            .pointer("/delta/container")
+            .or_else(|| data.get("container"))
+        {
+            self.capture_container(container);
+            self.capture_provider_field("anthropic_container", container);
+        }
+        if let Some(context_management) = data
+            .pointer("/delta/context_management")
+            .or_else(|| data.get("context_management"))
+        {
+            self.capture_provider_field("anthropic_context_management", context_management);
+        }
+        if let Some(compaction) = data
+            .pointer("/delta/compaction")
+            .or_else(|| data.get("compaction"))
+        {
+            self.capture_provider_field("anthropic_compaction", compaction);
+        }
     }
 
     fn handle_error(&mut self, data: &Value, out: &mut Vec<u8>) {
@@ -523,7 +683,61 @@ impl AnthropicMessagesToResponsesConverter {
         self.emit_failure(code, message, out);
     }
 
-    fn open_text(&mut self, index: u32, initial_text: &str, out: &mut Vec<u8>) {
+    fn emit_provider_trace_item(
+        &mut self,
+        _index: u32,
+        block_type: &str,
+        block: &Value,
+        out: &mut Vec<u8>,
+    ) {
+        let item_id = format!("rs_{}", synthesize_id());
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let summary = format!(
+            "Anthropic content block preserved as JSON trace ({block_type}): {}",
+            bounded_json_trace(block)
+        );
+        let item = json!({
+            "type": "reasoning",
+            "id": item_id,
+            "status": "completed",
+            "summary": [{
+                "type": "summary_text",
+                "text": summary,
+            }],
+            "content": null,
+            "encrypted_content": null,
+        });
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": item.clone(),
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item.clone(),
+            }),
+        );
+        self.closed_items.push((output_index, item));
+    }
+
+    fn open_text(
+        &mut self,
+        index: u32,
+        initial_text: &str,
+        initial_annotations: Vec<Value>,
+        out: &mut Vec<u8>,
+    ) {
         let item_id = format!("msg_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;
@@ -558,8 +772,16 @@ impl AnthropicMessagesToResponsesConverter {
         let mut text = OpenText {
             item_id,
             output_index,
+            source_index: index,
             text_acc: String::new(),
+            annotations_acc: Vec::new(),
         };
+        emit_text_annotations(
+            &mut text,
+            &mut self.sequence_number,
+            out,
+            initial_annotations,
+        );
         if !initial_text.is_empty() {
             emit_text_delta(&mut text, &mut self.sequence_number, out, initial_text);
         }
@@ -579,6 +801,7 @@ impl AnthropicMessagesToResponsesConverter {
                 "text": text.text_acc,
             }),
         );
+        let annotations = Value::Array(text.annotations_acc.clone());
         emit_event(
             out,
             &mut self.sequence_number,
@@ -591,7 +814,7 @@ impl AnthropicMessagesToResponsesConverter {
                 "part": {
                     "type": "output_text",
                     "text": text.text_acc,
-                    "annotations": [],
+                    "annotations": annotations,
                 },
             }),
         );
@@ -603,7 +826,7 @@ impl AnthropicMessagesToResponsesConverter {
             "content": [{
                 "type": "output_text",
                 "text": text.text_acc,
-                "annotations": [],
+                "annotations": text.annotations_acc,
             }],
         });
         emit_event(
@@ -616,10 +839,28 @@ impl AnthropicMessagesToResponsesConverter {
                 "item": item.clone(),
             }),
         );
-        self.closed_items.push((text.output_index, item));
+        self.closed_items.push((text.output_index, item.clone()));
+        self.closed_session_items.push((text.output_index, item));
+        if !text.text_acc.is_empty() {
+            self.closed_session_blocks.push((
+                text.source_index,
+                json!({
+                    "type": "text",
+                    "text": text.text_acc,
+                }),
+            ));
+        }
     }
 
-    fn open_reasoning(&mut self, index: u32, initial_text: &str, out: &mut Vec<u8>) {
+    fn open_reasoning(
+        &mut self,
+        index: u32,
+        block_type: &str,
+        initial_text: &str,
+        signature: Option<String>,
+        redacted_data: Option<String>,
+        out: &mut Vec<u8>,
+    ) {
         let item_id = format!("rs_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;
@@ -655,7 +896,11 @@ impl AnthropicMessagesToResponsesConverter {
         let mut reasoning = OpenReasoning {
             item_id,
             output_index,
+            source_index: index,
             text_acc: String::new(),
+            block_type: block_type.to_owned(),
+            signature,
+            redacted_data,
         };
         if !initial_text.is_empty() {
             emit_reasoning_delta(&mut reasoning, &mut self.sequence_number, out, initial_text);
@@ -713,7 +958,14 @@ impl AnthropicMessagesToResponsesConverter {
                 "item": item.clone(),
             }),
         );
+        let session_item = merge_anthropic_thinking_context(item.clone(), &reasoning);
         self.closed_items.push((reasoning.output_index, item));
+        self.closed_session_items
+            .push((reasoning.output_index, session_item));
+        if let Some(block) = anthropic_thinking_block_from_reasoning(&reasoning) {
+            self.closed_session_blocks
+                .push((reasoning.source_index, block));
+        }
     }
 
     fn open_tool_call(&mut self, index: u32, block: &Value, out: &mut Vec<u8>) {
@@ -727,6 +979,10 @@ impl AnthropicMessagesToResponsesConverter {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("call_{}", synthesize_id()));
         let upstream_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("tool_use");
         let name = self.restore_tool_name(upstream_name);
         let mut item = json!({
             "type": "function_call",
@@ -736,6 +992,8 @@ impl AnthropicMessagesToResponsesConverter {
             "arguments": "",
             "status": "in_progress",
         });
+        copy_json_field(block, &mut item, "caller");
+        copy_json_field(block, &mut item, "cache_control");
         if let Some(namespace) = self.lookup_namespace_for(&name) {
             item["namespace"] = Value::String(namespace.to_owned());
         }
@@ -753,9 +1011,14 @@ impl AnthropicMessagesToResponsesConverter {
         let mut tool = OpenToolCall {
             item_id,
             output_index,
+            source_index: index,
             call_id,
             name,
+            upstream_name: upstream_name.to_owned(),
+            block_type: block_type.to_owned(),
             arguments_acc: String::new(),
+            caller: block.get("caller").cloned(),
+            cache_control: block.get("cache_control").cloned(),
         };
         if let Some(initial) = block.get("input").filter(|v| !is_empty_json_object(v)) {
             let initial = serde_json::to_string(initial).unwrap_or_else(|_| "{}".to_owned());
@@ -768,6 +1031,7 @@ impl AnthropicMessagesToResponsesConverter {
         if tool.arguments_acc.is_empty() {
             tool.arguments_acc.push_str("{}");
         }
+        let session_block = anthropic_tool_call_block_from_open_tool(&tool);
         emit_event(
             out,
             &mut self.sequence_number,
@@ -787,12 +1051,31 @@ impl AnthropicMessagesToResponsesConverter {
             "arguments": tool.arguments_acc,
             "status": "completed",
         });
+        if let Some(caller) = tool.caller.take() {
+            item["caller"] = caller;
+        }
+        if let Some(cache_control) = tool.cache_control.take() {
+            item["cache_control"] = cache_control;
+        }
         if let Some(namespace) = self.lookup_namespace_for(
             item.get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default(),
         ) {
             item["namespace"] = Value::String(namespace.to_owned());
+        }
+        if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+            if is_code_execution_tool_name(item.get("name").and_then(Value::as_str).unwrap_or(""))
+                || item.get("caller").is_some()
+            {
+                if let Some(code) = code_from_tool_arguments(
+                    item.get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ) {
+                    self.code_by_call_id.insert(call_id.to_owned(), code);
+                }
+            }
         }
         emit_event(
             out,
@@ -821,7 +1104,207 @@ impl AnthropicMessagesToResponsesConverter {
                 },
             );
         }
-        self.closed_items.push((tool.output_index, item));
+        self.closed_items.push((tool.output_index, item.clone()));
+        self.closed_session_items.push((tool.output_index, item));
+        self.closed_session_blocks
+            .push((tool.source_index, session_block));
+    }
+
+    fn open_web_search_call(&mut self, index: u32, block: &Value, out: &mut Vec<u8>) {
+        let item_id = block
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("ws_{}", synthesize_id()));
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let item = json!({
+            "type": "web_search_call",
+            "id": item_id,
+            "status": "in_progress",
+        });
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": item,
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.web_search_call.in_progress",
+            json!({
+                "type": "response.web_search_call.in_progress",
+                "item_id": item_id.clone(),
+                "output_index": output_index,
+            }),
+        );
+        let mut search = OpenWebSearchCall {
+            item_id,
+            output_index,
+            source_index: index,
+            arguments_acc: String::new(),
+        };
+        if let Some(initial) = block.get("input").filter(|v| !is_empty_json_object(v)) {
+            search.arguments_acc = serde_json::to_string(initial).unwrap_or_default();
+        }
+        self.open_blocks.insert(index, OpenBlock::WebSearch(search));
+    }
+
+    fn close_web_search_call(&mut self, search: OpenWebSearchCall, out: &mut Vec<u8>) {
+        let item_id = search.item_id.clone();
+        let mut item = json!({
+            "type": "web_search_call",
+            "id": item_id,
+            "status": "completed",
+        });
+        if let Some(action) = web_search_action_from_arguments(&search.arguments_acc) {
+            item["action"] = action;
+        }
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.web_search_call.completed",
+            json!({
+                "type": "response.web_search_call.completed",
+                "item_id": item["id"].clone(),
+                "output_index": search.output_index,
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": search.output_index,
+                "item": item.clone(),
+            }),
+        );
+        self.closed_items.push((search.output_index, item.clone()));
+        self.closed_session_items.push((search.output_index, item));
+        let input = serde_json::from_str(&search.arguments_acc).unwrap_or_else(|_| json!({}));
+        self.closed_session_blocks.push((
+            search.source_index,
+            json!({
+                "type": "server_tool_use",
+                "id": item_id,
+                "name": "web_search",
+                "input": input,
+            }),
+        ));
+    }
+
+    fn open_code_interpreter_result(&mut self, index: u32, block: &Value, out: &mut Vec<u8>) {
+        let item_id = format!("ci_{}", synthesize_id());
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let call_id = block
+            .get("tool_use_id")
+            .or_else(|| block.get("id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("call_{}", synthesize_id()));
+        let code = self
+            .code_by_call_id
+            .get(&call_id)
+            .cloned()
+            .unwrap_or_default();
+        let logs_acc = block
+            .get("content")
+            .map(anthropic_content_to_text)
+            .unwrap_or_default();
+        let raw_content = block.get("content").cloned();
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("bash_code_execution_tool_result")
+            .to_owned();
+        let mut item = json!({
+            "type": "code_interpreter_call",
+            "id": item_id,
+            "call_id": call_id,
+            "status": "in_progress",
+            "code": code,
+            "outputs": [],
+        });
+        if let Some(container_id) = self.container_id.as_deref().filter(|s| !s.is_empty()) {
+            item["container_id"] = Value::String(container_id.to_owned());
+        }
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": item,
+            }),
+        );
+        self.open_blocks.insert(
+            index,
+            OpenBlock::CodeInterpreter(OpenCodeInterpreterCall {
+                item_id,
+                output_index,
+                source_index: index,
+                call_id,
+                block_type,
+                code,
+                logs_acc,
+                raw_content,
+            }),
+        );
+    }
+
+    fn close_code_interpreter_result(&mut self, code: OpenCodeInterpreterCall, out: &mut Vec<u8>) {
+        let mut outputs = Vec::new();
+        if !code.logs_acc.trim().is_empty() {
+            outputs.push(json!({
+                "type": "logs",
+                "logs": code.logs_acc.clone(),
+            }));
+        }
+        let mut item = json!({
+            "type": "code_interpreter_call",
+            "id": code.item_id.clone(),
+            "call_id": code.call_id.clone(),
+            "status": "completed",
+            "code": code.code.clone(),
+            "outputs": outputs,
+        });
+        if let Some(container_id) = self.container_id.as_deref().filter(|s| !s.is_empty()) {
+            item["container_id"] = Value::String(container_id.to_owned());
+        }
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": code.output_index,
+                "item": item.clone(),
+            }),
+        );
+        self.closed_items.push((code.output_index, item));
+        self.closed_session_blocks.push((
+            code.source_index,
+            json!({
+                "type": code.block_type,
+                "tool_use_id": code.call_id,
+                "content": code.raw_content.unwrap_or_else(|| {
+                    Value::Array(vec![json!({
+                        "type": "text",
+                        "text": code.logs_acc,
+                    })])
+                }),
+            }),
+        ));
     }
 
     fn emit_lifecycle_open(&mut self, out: &mut Vec<u8>) {
@@ -917,6 +1400,10 @@ impl AnthropicMessagesToResponsesConverter {
                     OpenBlock::Text(text) => self.close_text(text, out),
                     OpenBlock::Reasoning(reasoning) => self.close_reasoning(reasoning, out),
                     OpenBlock::Tool(tool) => self.close_tool_call(tool, out),
+                    OpenBlock::WebSearch(search) => self.close_web_search_call(search, out),
+                    OpenBlock::CodeInterpreter(code) => {
+                        self.close_code_interpreter_result(code, out)
+                    }
                     OpenBlock::Ignored => {}
                 }
             }
@@ -949,7 +1436,7 @@ impl AnthropicMessagesToResponsesConverter {
             "parallel_tool_calls": self.req_field_or("parallel_tool_calls", json!(true)),
             "reasoning": self.req_field_or("reasoning", json!({"effort": null, "summary": null})),
             "text": self.req_field_or("text", json!({"format": {"type": "text"}})),
-            "metadata": self.req_field_or("metadata", Value::Null),
+            "metadata": self.response_metadata(),
             "previous_response_id": self.req_field_or("previous_response_id", Value::Null),
             "instructions": self.req_field_or("instructions", Value::Null),
             "temperature": self.req_field_or("temperature", Value::Null),
@@ -979,6 +1466,13 @@ impl AnthropicMessagesToResponsesConverter {
             .unwrap_or(fallback)
     }
 
+    fn response_metadata(&self) -> Value {
+        merge_metadata_map(
+            self.req_field_or("metadata", Value::Null),
+            &self.provider_metadata,
+        )
+    }
+
     fn lookup_namespace_for(&self, tool_name: &str) -> Option<&str> {
         self.tool_namespace_map.get(tool_name).map(String::as_str)
     }
@@ -1003,6 +1497,24 @@ impl AnthropicMessagesToResponsesConverter {
             merged.insert(key.clone(), value.clone());
         }
         self.final_usage = Some(Value::Object(merged));
+    }
+
+    fn capture_container(&mut self, value: &Value) {
+        if let Some(container_id) = value
+            .get("id")
+            .or_else(|| value.get("container_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            self.container_id = Some(container_id.to_owned());
+        }
+    }
+
+    fn capture_provider_field(&mut self, key: &str, value: &Value) {
+        if value.is_null() {
+            return;
+        }
+        self.provider_metadata.insert(key.to_owned(), value.clone());
     }
 }
 
@@ -1072,6 +1584,256 @@ fn emit_tool_arguments_delta(
     );
 }
 
+fn emit_text_annotations(
+    text: &mut OpenText,
+    seq: &mut u64,
+    out: &mut Vec<u8>,
+    annotations: Vec<Value>,
+) {
+    for annotation in annotations {
+        let annotation_index = text.annotations_acc.len();
+        text.annotations_acc.push(annotation.clone());
+        emit_event(
+            out,
+            seq,
+            "response.output_text.annotation.added",
+            json!({
+                "type": "response.output_text.annotation.added",
+                "item_id": text.item_id,
+                "output_index": text.output_index,
+                "content_index": 0,
+                "annotation_index": annotation_index,
+                "annotation": annotation,
+            }),
+        );
+    }
+}
+
+fn append_code_interpreter_delta(code: &mut OpenCodeInterpreterCall, delta: &Value) {
+    let text = delta
+        .get("text")
+        .or_else(|| delta.get("logs"))
+        .or_else(|| delta.get("partial_json"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            delta
+                .get("content")
+                .map(anthropic_content_to_text)
+                .unwrap_or_default()
+        });
+    if !text.trim().is_empty() {
+        if !code.logs_acc.is_empty() && !code.logs_acc.ends_with('\n') {
+            code.logs_acc.push('\n');
+        }
+        code.logs_acc.push_str(&text);
+    }
+}
+
+fn anthropic_citations_to_annotations(value: Option<&Value>) -> Vec<Value> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(anthropic_citation_to_annotation)
+            .collect(),
+        Some(Value::Object(_)) => value
+            .and_then(anthropic_citation_to_annotation)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn anthropic_citation_to_annotation(value: &Value) -> Option<Value> {
+    let obj = value.as_object()?;
+    let url = obj
+        .get("url")
+        .or_else(|| obj.get("uri"))
+        .and_then(Value::as_str)?;
+    if url.trim().is_empty() {
+        return None;
+    }
+    let title = obj
+        .get("title")
+        .or_else(|| obj.get("source_title"))
+        .or_else(|| obj.get("page_title"))
+        .and_then(Value::as_str)
+        .unwrap_or(url);
+    let mut out = serde_json::Map::new();
+    out.insert("type".into(), Value::String("url_citation".into()));
+    out.insert("url".into(), Value::String(url.to_owned()));
+    out.insert("title".into(), Value::String(title.to_owned()));
+    out.insert("start_index".into(), json!(0));
+    out.insert("end_index".into(), json!(0));
+    if let Some(snippet) = obj
+        .get("cited_text")
+        .or_else(|| obj.get("snippet"))
+        .or_else(|| obj.get("text"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.insert("snippet".into(), Value::String(snippet.to_owned()));
+    }
+    Some(Value::Object(out))
+}
+
+fn anthropic_web_search_result_annotations(block: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    collect_web_search_result_annotations(block.get("content").unwrap_or(block), &mut out);
+    out
+}
+
+fn collect_web_search_result_annotations(value: &Value, out: &mut Vec<Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_web_search_result_annotations(item, out);
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(annotation) = anthropic_citation_to_annotation(value) {
+                out.push(annotation);
+            }
+            for key in ["content", "results", "citations"] {
+                if let Some(child) = obj.get(key) {
+                    collect_web_search_result_annotations(child, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn web_search_action_from_arguments(arguments: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(arguments).ok()?;
+    let query = parsed
+        .get("query")
+        .or_else(|| parsed.get("q"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())?;
+    Some(json!({
+        "type": "search",
+        "query": query,
+    }))
+}
+
+fn anthropic_content_to_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(anthropic_content_to_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(obj) => {
+            for key in ["text", "content", "output", "logs"] {
+                if let Some(text) = obj.get(key).and_then(Value::as_str) {
+                    return text.to_owned();
+                }
+            }
+            for key in ["content", "output", "outputs", "results"] {
+                if let Some(child) = obj.get(key) {
+                    let text = anthropic_content_to_text(child);
+                    if !text.trim().is_empty() {
+                        return text;
+                    }
+                }
+            }
+            bounded_json_trace(value)
+        }
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn is_code_execution_tool_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("code_execution") || lower == "bash" || lower.ends_with("_bash")
+}
+
+fn code_from_tool_arguments(arguments: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(arguments).ok()?;
+    for key in ["command", "code", "script", "input"] {
+        if let Some(value) = parsed.get(key).and_then(Value::as_str) {
+            if !value.trim().is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn copy_json_field(source: &Value, target: &mut Value, key: &str) {
+    if let Some(value) = source.get(key) {
+        target[key] = value.clone();
+    }
+}
+
+fn bounded_json_trace(value: &Value) -> String {
+    let text = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    let total = text.chars().count();
+    if total <= PROVIDER_TRACE_MAX_CHARS {
+        return text;
+    }
+    let kept = text
+        .chars()
+        .take(PROVIDER_TRACE_MAX_CHARS)
+        .collect::<String>();
+    format!(
+        "{kept}...(+{} chars truncated)",
+        total - PROVIDER_TRACE_MAX_CHARS
+    )
+}
+
+fn merge_anthropic_thinking_context(mut item: Value, reasoning: &OpenReasoning) -> Value {
+    let Some(obj) = item.as_object_mut() else {
+        return item;
+    };
+    let Some(block) = anthropic_thinking_block_from_reasoning(reasoning) else {
+        return item;
+    };
+    obj.insert("anthropic_thinking".into(), block);
+    item
+}
+
+fn anthropic_thinking_block_from_reasoning(reasoning: &OpenReasoning) -> Option<Value> {
+    let mut block = serde_json::Map::new();
+    if reasoning.block_type == "redacted_thinking" {
+        let data = reasoning.redacted_data.as_deref()?;
+        block.insert("type".into(), Value::String("redacted_thinking".into()));
+        block.insert("data".into(), Value::String(data.to_owned()));
+    } else {
+        if reasoning.text_acc.is_empty() {
+            return None;
+        }
+        block.insert("type".into(), Value::String("thinking".into()));
+        block.insert("thinking".into(), Value::String(reasoning.text_acc.clone()));
+        if let Some(signature) = reasoning.signature.as_deref().filter(|s| !s.is_empty()) {
+            block.insert("signature".into(), Value::String(signature.to_owned()));
+        }
+    }
+    Some(Value::Object(block))
+}
+
+fn anthropic_tool_call_block_from_open_tool(tool: &OpenToolCall) -> Value {
+    let mut block = serde_json::Map::new();
+    block.insert("type".into(), Value::String(tool.block_type.clone()));
+    block.insert("id".into(), Value::String(tool.call_id.clone()));
+    block.insert("name".into(), Value::String(tool.upstream_name.clone()));
+    block.insert(
+        "input".into(),
+        serde_json::from_str(&tool.arguments_acc).unwrap_or_else(|_| json!({})),
+    );
+    if let Some(caller) = tool.caller.clone() {
+        block.insert("caller".into(), caller);
+    }
+    if let Some(cache_control) = tool.cache_control.clone() {
+        block.insert("cache_control".into(), cache_control);
+    }
+    Value::Object(block)
+}
+
 fn is_empty_json_object(value: &Value) -> bool {
     value.as_object().map(|obj| obj.is_empty()).unwrap_or(false)
 }
@@ -1102,7 +1864,7 @@ fn normalize_anthropic_usage(usage: Option<&Value>) -> Value {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    json!({
+    let mut out = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
@@ -1113,7 +1875,11 @@ fn normalize_anthropic_usage(usage: Option<&Value>) -> Value {
         "output_tokens_details": {
             "reasoning_tokens": reasoning_tokens,
         },
-    })
+    });
+    if let Some(server_tool_use) = map.get("server_tool_use") {
+        out["server_tool_use"] = server_tool_use.clone();
+    }
+    out
 }
 
 fn zero_usage() -> Value {
@@ -1130,22 +1896,32 @@ fn merge_metadata_field(mut metadata: Value, key: &str, value: String) -> Value 
     if value.is_empty() {
         return metadata;
     }
-    match metadata {
-        Value::Object(ref mut obj) => {
-            obj.insert(key.to_owned(), Value::String(value));
-            metadata
-        }
-        Value::Null => json!({ key: value }),
-        other => json!({ "user": other, key: value }),
+    merge_metadata_value(&mut metadata, key, Value::String(value));
+    metadata
+}
+
+fn merge_metadata_map(mut metadata: Value, fields: &serde_json::Map<String, Value>) -> Value {
+    for (key, value) in fields {
+        merge_metadata_value(&mut metadata, key, value.clone());
+    }
+    metadata
+}
+
+fn merge_metadata_value(metadata: &mut Value, key: &str, value: Value) {
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(key.to_owned(), value);
+    } else if metadata.is_null() {
+        *metadata = json!({ key: value });
+    } else {
+        let old = std::mem::replace(metadata, Value::Null);
+        *metadata = json!({ "user": old, key: value });
     }
 }
 
 fn assistant_message_from_output_items<'a>(
     output_items: impl Iterator<Item = &'a Value>,
 ) -> Option<Value> {
-    let mut text_parts = Vec::new();
-    let mut reasoning_parts = Vec::new();
-    let mut tool_calls = Vec::new();
+    let mut blocks = Vec::new();
 
     for item in output_items {
         match item.get("type").and_then(|v| v.as_str()) {
@@ -1155,7 +1931,10 @@ fn assistant_message_from_output_items<'a>(
                         if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
                             if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                 if !text.is_empty() {
-                                    text_parts.push(text.to_owned());
+                                    blocks.push(json!({
+                                        "type": "text",
+                                        "text": text,
+                                    }));
                                 }
                             }
                         }
@@ -1163,12 +1942,17 @@ fn assistant_message_from_output_items<'a>(
                 }
             }
             Some("reasoning") => {
-                if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
+                if let Some(block) = item.get("anthropic_thinking").filter(|v| v.is_object()) {
+                    blocks.push(block.clone());
+                } else if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
                     for part in summary {
                         if part.get("type").and_then(|v| v.as_str()) == Some("summary_text") {
                             if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                 if !text.is_empty() {
-                                    reasoning_parts.push(text.to_owned());
+                                    blocks.push(json!({
+                                        "type": "thinking",
+                                        "thinking": text,
+                                    }));
                                 }
                             }
                         }
@@ -1176,44 +1960,57 @@ fn assistant_message_from_output_items<'a>(
                 }
             }
             Some("function_call") => {
-                tool_calls.push(json!({
-                    "id": item
-                        .get("call_id")
+                let mut block = serde_json::Map::new();
+                block.insert("type".into(), Value::String("tool_use".into()));
+                block.insert(
+                    "id".into(),
+                    item.get("call_id")
                         .or_else(|| item.get("id"))
                         .cloned()
                         .unwrap_or(Value::Null),
-                    "type": "function",
-                    "function": {
-                        "name": item
-                            .get("name")
-                            .cloned()
-                            .unwrap_or(Value::String(String::new())),
-                        "arguments": item
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or(Value::String("{}".to_owned())),
-                    },
-                }));
+                );
+                block.insert(
+                    "name".into(),
+                    item.get("name")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new())),
+                );
+                block.insert(
+                    "input".into(),
+                    tool_input_from_response_arguments(item.get("arguments")),
+                );
+                for key in ["caller", "cache_control"] {
+                    if let Some(value) = item.get(key) {
+                        block.insert(key.to_owned(), value.clone());
+                    }
+                }
+                blocks.push(Value::Object(block));
             }
             _ => {}
         }
     }
 
-    if text_parts.is_empty() && reasoning_parts.is_empty() && tool_calls.is_empty() {
+    if blocks.is_empty() {
         return None;
     }
 
-    let mut message = json!({
+    Some(json!({
         "role": "assistant",
-        "content": text_parts.join("\n"),
-    });
-    if !reasoning_parts.is_empty() {
-        message["reasoning_content"] = Value::String(reasoning_parts.join("\n"));
+        "content": blocks,
+    }))
+}
+
+fn tool_input_from_response_arguments(arguments: Option<&Value>) -> Value {
+    let Some(arguments) = arguments.and_then(Value::as_str) else {
+        return json!({});
+    };
+    let parsed = serde_json::from_str::<Value>(arguments)
+        .unwrap_or_else(|_| Value::String(arguments.to_owned()));
+    if parsed.is_object() {
+        parsed
+    } else {
+        json!({ "input": parsed })
     }
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = Value::Array(tool_calls);
-    }
-    Some(message)
 }
 
 fn drain_one_frame(buf: &mut BytesMut) -> Option<Bytes> {
