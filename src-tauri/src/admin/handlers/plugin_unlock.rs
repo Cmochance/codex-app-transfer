@@ -28,9 +28,7 @@ static UNLOCK_SERVICE: OnceCell<Arc<PluginUnlockService>> = OnceCell::const_new(
 
 async fn get_service() -> Arc<PluginUnlockService> {
     UNLOCK_SERVICE
-        .get_or_init(|| async {
-            Arc::new(PluginUnlockService::default_new())
-        })
+        .get_or_init(|| async { Arc::new(PluginUnlockService::default_new()) })
         .await
         .clone()
 }
@@ -109,5 +107,8 @@ pub fn routes() -> Router<AdminState> {
         .route("/api/desktop/plugin-unlock/status", get(status_handler))
         .route("/api/desktop/plugin-unlock/start", post(start_handler))
         .route("/api/desktop/plugin-unlock/stop", post(stop_handler))
-        .route("/api/desktop/plugin-unlock/reinject", post(reinject_handler))
+        .route(
+            "/api/desktop/plugin-unlock/reinject",
+            post(reinject_handler),
+        )
 }

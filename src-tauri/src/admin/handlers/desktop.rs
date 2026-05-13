@@ -114,11 +114,15 @@ fn quit_command(platform: &str, force: bool) -> Vec<String> {
 
 /// 启动命令.macOS 优先用解析后的 .app 路径,fallback 到 `open -a Codex`
 /// 让 LaunchServices 自己找。
-/// 
+///
 /// `extra_args`: 附加给 Codex Desktop 本身的参数(如 `--remote-debugging-port=9222`)。
 /// macOS 通过 `open` 的 `--args` 传递;Linux 直接追加到命令;Windows Store
 /// 应用暂不支持命令行参数(忽略)。
-fn open_command(platform: &str, resolved_macos_app: Option<&str>, extra_args: &[String]) -> Vec<String> {
+fn open_command(
+    platform: &str,
+    resolved_macos_app: Option<&str>,
+    extra_args: &[String],
+) -> Vec<String> {
     match platform {
         // `-n`:即使 LaunchServices 缓存还以为 Codex 在运行,也强制启动一个新
         // 实例。我们刚 SIGTERM 杀过主进程,launchd 偶尔会在 reap 完成前误把
@@ -155,7 +159,7 @@ fn open_command(platform: &str, resolved_macos_app: Option<&str>, extra_args: &[
                 "-c".into(),
                 format!("{LINUX_BIN_NAME}{args_str} >/dev/null 2>&1 &"),
             ]
-        },
+        }
     }
 }
 
@@ -976,7 +980,14 @@ mod tests {
         // 带调试参数时通过 --args 传递
         assert_eq!(
             open_command("macos", None, &["--remote-debugging-port=9222".into()]),
-            vec!["open", "-n", "-a", "Codex", "--args", "--remote-debugging-port=9222"]
+            vec![
+                "open",
+                "-n",
+                "-a",
+                "Codex",
+                "--args",
+                "--remote-debugging-port=9222"
+            ]
         );
         let windows = open_command("windows", None, &[]);
         assert_eq!(windows[0], "explorer.exe");

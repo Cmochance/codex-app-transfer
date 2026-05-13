@@ -60,7 +60,7 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 // 延迟 5 秒，等桌面 apply + Codex 启动完成后再检测
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                
+
                 // 从 registry 中读取开关状态
                 let auto_unlock = match crate::admin::registry_io::load() {
                     Ok(cfg) => cfg
@@ -70,13 +70,15 @@ fn main() {
                         .unwrap_or(false),
                     Err(_) => false,
                 };
-                
+
                 if auto_unlock {
                     tracing::info!("[PluginUnlock] autoUnlockCodexPlugins=true, starting service");
                     let service = crate::codex_plugin_unlocker::PluginUnlockService::default_new();
                     service.start();
                 } else {
-                    tracing::debug!("[PluginUnlock] autoUnlockCodexPlugins=false, skipping auto-start");
+                    tracing::debug!(
+                        "[PluginUnlock] autoUnlockCodexPlugins=false, skipping auto-start"
+                    );
                 }
             });
 
