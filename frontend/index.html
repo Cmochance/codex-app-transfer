@@ -413,7 +413,12 @@
             <div>
               <label class="switch-label only-switch"><input type="checkbox" id="autoUnlockCodexPlugins"><span class="switch-ui"></span></label>
               <p class="settings-note" data-i18n="settings.autoUnlockCodexPluginsHint">开启后，应用启动时会自动检测 Codex Desktop 并通过 CDP 注入脚本解锁 Plugins 选项卡。需要 Codex Desktop 以 --remote-debugging-port=9222 启动。</p>
-              <p class="settings-note" id="pluginUnlockRuntimeStatus" data-i18n="settings.pluginUnlockRuntimeStatus">运行时状态: 未检测</p>
+             <p class="settings-note" id="pluginUnlockRuntimeStatus" data-i18n="settings.pluginUnlockRuntimeStatus">运行时状态: 未检测</p>
+           </div>
+            <div class="settings-row">
+              <strong data-i18n="settings.autoWakeCodexPet">自动唤醒 Codex Pet</strong>
+              <label class="switch-label only-switch"><input type="checkbox" id="autoWakeCodexPet"><span class="switch-ui"></span></label>
+              <p class="settings-note" data-i18n="settings.autoWakeCodexPetHint">开启后，启动 Codex Desktop 时会自动唤醒宠物（修改 ~/.codex/.codex-global-state.json 中的 electron-avatar-overlay-open 为 true）。</p>
             </div>
           </div>
           <div class="settings-row settings-row-stack">

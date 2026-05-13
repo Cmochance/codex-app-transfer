@@ -252,6 +252,46 @@ fn quit_codex_app_with_retries(platform: &str) -> Result<(), String> {
     Err("Codex 未能正常退出,请手动关闭后重试".to_owned())
 }
 
+/// 如果设置中开启了 autoWakeCodexPet，在启动 Codex 前将其全局状态中的
+/// electron-avatar-overlay-open 设为 true，使宠物自动唤醒。
+fn maybe_wake_codex_pet() {
+    let cfg = match crate::admin::registry_io::load() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let enabled = cfg
+        .get("settings")
+        .and_then(|s| s.get("autoWakeCodexPet"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+    let home = match codex_app_transfer_registry::paths::resolve_home() {
+        Some(h) => h,
+        None => return,
+    };
+    let path = home.join(".codex").join(".codex-global-state.json");
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut state: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if let Some(obj) = state.as_object_mut() {
+        obj.insert(
+            "electron-avatar-overlay-open".to_string(),
+            Value::Bool(true),
+        );
+    }
+    let _ = fs::write(
+        &path,
+        serde_json::to_string_pretty(&state).unwrap_or_default(),
+    );
+}
+
 /// 读取设置判断是否应附加调试端口参数
 fn should_attach_debug_port() -> Vec<String> {
     match crate::admin::registry_io::load() {
@@ -272,6 +312,7 @@ fn should_attach_debug_port() -> Vec<String> {
 }
 
 fn open_codex_app(platform: &str) -> Result<(), String> {
+    maybe_wake_codex_pet();
     let resolved = if platform == "macos" {
         resolve_macos_app_path()
     } else {

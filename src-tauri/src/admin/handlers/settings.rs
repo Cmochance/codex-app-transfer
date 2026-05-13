@@ -51,12 +51,13 @@ pub(super) fn default_config_value() -> Value {
             "language": "zh",
             "proxyPort": 18080,
             "adminPort": 18081,
-            "autoStart": false,
-            "autoApplyOnStart": true,
-            "exposeAllProviderModels": false,
-            "restoreCodexOnExit": true,
-            "autoUnlockCodexPlugins": false,
-            "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+           "autoStart": false,
+           "autoApplyOnStart": true,
+           "exposeAllProviderModels": false,
+           "restoreCodexOnExit": true,
+           "autoUnlockCodexPlugins": false,
+            "autoWakeCodexPet": true,
+           "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
         }
     })
 }

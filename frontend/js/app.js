@@ -1911,8 +1911,9 @@
     $("#settingsProxyPort").value = settings.proxyPort;
     $("#settingsAdminPort").value = settings.adminPort;
     $("#autoApplyOnStart").checked = settings.autoApplyOnStart !== false;
-    $("#autoUnlockCodexPlugins").checked = !!settings.autoUnlockCodexPlugins;
-    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
+   $("#autoUnlockCodexPlugins").checked = !!settings.autoUnlockCodexPlugins;
+    $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
+   $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
     renderModelMenuModeState(settings);
@@ -1997,8 +1998,9 @@
       proxyPort: Number($("#settingsProxyPort").value),
       adminPort: Number($("#settingsAdminPort").value),
       autoApplyOnStart: $("#autoApplyOnStart")?.checked !== false,
-      autoUnlockCodexPlugins: $("#autoUnlockCodexPlugins")?.checked || false,
-      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
+     autoUnlockCodexPlugins: $("#autoUnlockCodexPlugins")?.checked || false,
+      autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
+     exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
@@ -2954,9 +2956,10 @@
     $("#settingsAdminPort").addEventListener("change", saveSettingsFromForm);
     $("#settingsUpdateUrl").addEventListener("change", saveSettingsFromForm);
     $("#autoApplyOnStart")?.addEventListener("change", saveSettingsFromForm);
-    $("#autoUnlockCodexPlugins")?.addEventListener("change", saveSettingsFromForm);
+   $("#autoUnlockCodexPlugins")?.addEventListener("change", saveSettingsFromForm);
+    $("#autoWakeCodexPet")?.addEventListener("change", saveSettingsFromForm);
 
-    // Plugin Unlock 按钮事件
+   // Plugin Unlock 按钮事件
     $("[data-action=plugin-unlock-start]")?.addEventListener("click", async () => {
       try {
         await CCAPI.pluginUnlock.start();
