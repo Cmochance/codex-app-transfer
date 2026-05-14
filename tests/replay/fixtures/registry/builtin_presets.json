@@ -208,7 +208,14 @@
         "text": "Qwen 3.6 Plus / Flash 默认提供 1M 上下文，本应用直接透传，无需额外开关。"
       }
     ],
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "qwen3.6-plus": {
+        "context_window": 1000000
+      },
+      "qwen3.6-flash": {
+        "context_window": 1000000
+      }
+    },
     "requestOptions": {},
     "isBuiltin": true
   },
@@ -228,7 +235,14 @@
         "text": "Token Plan 团队版 API Key 与按量计费/Coding Plan 不互通，请确保 Base URL 与 API Key 来自同一套餐。"
       }
     ],
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "qwen3.6-plus": {
+        "context_window": 1000000
+      },
+      "qwen3.6-flash": {
+        "context_window": 1000000
+      }
+    },
     "requestOptions": {},
     "isBuiltin": true
   },
@@ -242,7 +256,11 @@
     "models": {
       "default": "MiniMax-M2.7"
     },
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "MiniMax-M2.7": {
+        "context_window": 204800
+      }
+    },
     "notices": [
       {
         "type": "info",
@@ -294,7 +312,11 @@
     "models": {
       "default": "gemini-3.1-flash-lite"
     },
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "gemini-3.1-flash-lite": {
+        "context_window": 1000000
+      }
+    },
     "notices": [
       {
         "type": "info",
@@ -326,7 +348,11 @@
     "models": {
       "default": "gemini-2.5-flash"
     },
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "gemini-2.5-flash": {
+        "context_window": 1000000
+      }
+    },
     "notices": [
       {
         "type": "info",
@@ -364,7 +390,11 @@
     "models": {
       "default": "gemini-3-flash"
     },
-    "modelCapabilities": {},
+    "modelCapabilities": {
+      "gemini-3-flash": {
+        "context_window": 1000000
+      }
+    },
     "notices": [
       {
         "type": "info",

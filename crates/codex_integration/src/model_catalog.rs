@@ -11,8 +11,8 @@
 //! `models` array from the configured JSON path.
 
 use codex_app_transfer_registry::{
-    has_internal_one_m_suffix, load_raw_config, normalize_model_mappings, save_raw_config,
-    strip_internal_model_suffix, MODEL_SLOTS,
+    documented_context_window, load_raw_config, model_supports_1m, normalize_model_mappings,
+    save_raw_config, strip_internal_model_suffix, MODEL_SLOTS,
 };
 use serde_json::{json, Value};
 
@@ -167,6 +167,9 @@ fn context_window_for_model(
     if let Some(n) = explicit_context_window(original_model, clean_model, model_capabilities) {
         return n;
     }
+    if let Some(n) = documented_context_window(clean_model) {
+        return n;
+    }
     // 2. 二档 fallback:default_model + supports_1m / known prefix / supports1m bool
     if clean_model == default_model {
         if default_supports_1m {
@@ -174,7 +177,7 @@ fn context_window_for_model(
         } else {
             DEFAULT_CONTEXT_WINDOW
         }
-    } else if model_supports_1m(original_model, clean_model, model_capabilities) {
+    } else if model_supports_1m(original_model, model_capabilities) {
         ONE_M_CONTEXT_WINDOW
     } else {
         DEFAULT_CONTEXT_WINDOW
@@ -204,33 +207,6 @@ fn explicit_context_window(
         }
     }
     None
-}
-
-fn model_supports_1m(
-    original_model: &str,
-    clean_model: &str,
-    model_capabilities: Option<&Value>,
-) -> bool {
-    if has_internal_one_m_suffix(original_model) {
-        return true;
-    }
-    let lower = clean_model.to_ascii_lowercase();
-    if lower.starts_with("deepseek-v4-") || lower.starts_with("qwen3.6-") {
-        return true;
-    }
-    let Some(caps) = model_capabilities.and_then(Value::as_object) else {
-        return false;
-    };
-    for key in [clean_model, original_model.trim()] {
-        if let Some(b) = caps
-            .get(key)
-            .and_then(|v| v.get("supports1m"))
-            .and_then(Value::as_bool)
-        {
-            return b;
-        }
-    }
-    false
 }
 
 fn catalog_model(
@@ -705,11 +681,74 @@ mod tests {
 
     #[test]
     fn no_explicit_context_window_keeps_two_tier_fallback() {
-        // 没填 context_window:旧逻辑保持,supports_1m=true 走 1M,false 走 258_400
-        let mappings = json!({"default": "kimi-k2.6"});
-        let models = catalog_models_for_provider("Kimi", "kimi-k2.6", false, Some(&mappings), None);
-        let entry = models.iter().find(|m| m.slug == "kimi-k2.6").unwrap();
+        // 没填 context_window、且非文档内置模型:旧逻辑,supports_1m=true 走 1M,false 走 258_400
+        let mappings = json!({"default": "undocumented-custom-model"});
+        let models = catalog_models_for_provider(
+            "Custom",
+            "undocumented-custom-model",
+            false,
+            Some(&mappings),
+            None,
+        );
+        let entry = models
+            .iter()
+            .find(|m| m.slug == "undocumented-custom-model")
+            .unwrap();
         assert_eq!(entry.context_window, 258_400, "fallback to 258_400");
+    }
+
+    #[test]
+    fn kimi_for_coding_uses_kimi_cli_documented_context_window() {
+        // Kimi Code CLI 官方示例: max_context_size = 262144 (≠ DEFAULT_CONTEXT_WINDOW)
+        let models =
+            catalog_models_for_provider("Kimi Code", "kimi-for-coding", false, None, None);
+        let gpt55 = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
+        assert_eq!(gpt55.context_window, 262_144);
+    }
+
+    #[test]
+    fn kimi_k2_6_and_mimo_v2_5_use_documented_context_without_capabilities() {
+        let kimi = catalog_models_for_provider("Kimi", "kimi-k2.6", false, None, None);
+        assert_eq!(
+            kimi.iter().find(|m| m.slug == "gpt-5.5").unwrap().context_window,
+            262_144
+        );
+        let kimi_alt = catalog_models_for_provider("Kimi", "kimi-2.6", false, None, None);
+        assert_eq!(
+            kimi_alt.iter().find(|m| m.slug == "gpt-5.5").unwrap().context_window,
+            262_144
+        );
+
+        let mimo = catalog_models_for_provider("MiMo", "mimo-v2.5", false, None, None);
+        assert_eq!(
+            mimo.iter().find(|m| m.slug == "gpt-5.5").unwrap().context_window,
+            1_000_000
+        );
+        let mimo_pro = catalog_models_for_provider("MiMo", "mimo-v2.5-pro", false, None, None);
+        assert_eq!(
+            mimo_pro.iter().find(|m| m.slug == "gpt-5.5").unwrap().context_window,
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn documented_context_aligns_with_builtin_preset_model_capabilities() {
+        let cases = [
+            ("moonshot-v1-8k", 8192u64),
+            ("moonshot-v1-32k", 32_768),
+            ("moonshot-v1-auto", 131_072),
+            ("glm-5.1", 200_000),
+            ("minimax-m2.7", 204_800),
+            ("qwen3.6-plus", 1_000_000),
+            ("gemini-3.1-flash-lite", 1_000_000),
+            ("deepseek-v4-flash", 1_000_000),
+            ("mimo-v2-omni", 262_144),
+        ];
+        for (model_id, want) in cases {
+            let models = catalog_models_for_provider("P", model_id, false, None, None);
+            let row = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
+            assert_eq!(row.context_window, want, "model_id={model_id}");
+        }
     }
 
     #[test]

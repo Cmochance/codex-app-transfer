@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codex_app_transfer_registry::{
-    normalize_model_mappings, strip_internal_model_suffix, RawConfig, MODEL_ORDER,
+    model_supports_1m, normalize_model_mappings, strip_internal_model_suffix, RawConfig,
+    MODEL_ORDER,
 };
 use serde_json::{json, Value};
 
@@ -44,22 +45,7 @@ pub(super) fn provider_supports_1m(provider: &Value) -> bool {
         .and_then(|m| m.get("default"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if codex_app_transfer_registry::has_internal_one_m_suffix(default_raw) {
-        return true;
-    }
-    let default = strip_internal_model_suffix(default_raw).to_lowercase();
-    if default.starts_with("deepseek-v4-") || default.starts_with("qwen3.6-") {
-        return true;
-    }
-    if let Some(b) = provider
-        .get("modelCapabilities")
-        .and_then(|c| c.get(&default))
-        .and_then(|v| v.get("supports1m"))
-        .and_then(|v| v.as_bool())
-    {
-        return b;
-    }
-    false
+    model_supports_1m(default_raw, provider.get("modelCapabilities"))
 }
 
 pub(super) fn provider_default_model(provider: &Value) -> String {
