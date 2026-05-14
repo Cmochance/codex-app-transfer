@@ -213,6 +213,26 @@
     "isBuiltin": true
   },
   {
+    "id": "bailian-token-plan",
+    "name": "阿里云百炼 (Token Plan)",
+    "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    "docsUrl": "https://help.aliyun.com/zh/model-studio/token-plan-quickstart",
+    "authScheme": "bearer",
+    "apiFormat": "responses",
+    "models": {
+      "default": "qwen3.6-plus"
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "Token Plan 团队版 API Key 与按量计费/Coding Plan 不互通，请确保 Base URL 与 API Key 来自同一套餐。"
+      }
+    ],
+    "modelCapabilities": {},
+    "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
     "id": "minimax",
     "name": "MiniMax",
     "baseUrl": "https://api.minimaxi.com/v1",
