@@ -53,12 +53,22 @@ pub fn model_supports_1m(original_model: &str, model_capabilities: Option<&Value
         return true;
     }
 
-    if let Some(b) = capability_bool(model_capabilities, original_model, clean_model, "supports1m") {
+    if let Some(b) = capability_bool(
+        model_capabilities,
+        original_model,
+        clean_model,
+        "supports1m",
+    ) {
         return b;
     }
 
-    capability_u64(model_capabilities, original_model, clean_model, "context_window")
-        .is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW)
+    capability_u64(
+        model_capabilities,
+        original_model,
+        clean_model,
+        "context_window",
+    )
+    .is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW)
 }
 
 fn capability_bool(

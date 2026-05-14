@@ -14,8 +14,8 @@
 //!   按 docs/refactor/migration.md §4 拆分,留给 Stage 2.5 的 `crates/codex_integration`。
 
 pub mod healing;
-pub mod model_context_policy;
 pub mod model_alias;
+pub mod model_context_policy;
 pub mod paths;
 pub mod presets;
 pub mod raw_io;
@@ -24,10 +24,12 @@ pub mod schema;
 #[allow(deprecated)]
 pub use healing::heal_builtin_extra_headers;
 pub use healing::heal_builtin_provider_fields;
-pub use model_context_policy::{documented_context_window, model_supports_1m, ONE_M_CONTEXT_WINDOW};
 pub use model_alias::{
     empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
     provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
+};
+pub use model_context_policy::{
+    documented_context_window, model_supports_1m, ONE_M_CONTEXT_WINDOW,
 };
 pub use paths::{
     config_dir, config_file, library_dir, resolve_home, sessions_db_file, tool_artifacts_db_file,

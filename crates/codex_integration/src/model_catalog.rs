@@ -700,8 +700,7 @@ mod tests {
     #[test]
     fn kimi_for_coding_uses_kimi_cli_documented_context_window() {
         // Kimi Code CLI 官方示例: max_context_size = 262144 (≠ DEFAULT_CONTEXT_WINDOW)
-        let models =
-            catalog_models_for_provider("Kimi Code", "kimi-for-coding", false, None, None);
+        let models = catalog_models_for_provider("Kimi Code", "kimi-for-coding", false, None, None);
         let gpt55 = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
         assert_eq!(gpt55.context_window, 262_144);
     }
@@ -710,23 +709,37 @@ mod tests {
     fn kimi_k2_6_and_mimo_v2_5_use_documented_context_without_capabilities() {
         let kimi = catalog_models_for_provider("Kimi", "kimi-k2.6", false, None, None);
         assert_eq!(
-            kimi.iter().find(|m| m.slug == "gpt-5.5").unwrap().context_window,
+            kimi.iter()
+                .find(|m| m.slug == "gpt-5.5")
+                .unwrap()
+                .context_window,
             262_144
         );
         let kimi_alt = catalog_models_for_provider("Kimi", "kimi-2.6", false, None, None);
         assert_eq!(
-            kimi_alt.iter().find(|m| m.slug == "gpt-5.5").unwrap().context_window,
+            kimi_alt
+                .iter()
+                .find(|m| m.slug == "gpt-5.5")
+                .unwrap()
+                .context_window,
             262_144
         );
 
         let mimo = catalog_models_for_provider("MiMo", "mimo-v2.5", false, None, None);
         assert_eq!(
-            mimo.iter().find(|m| m.slug == "gpt-5.5").unwrap().context_window,
+            mimo.iter()
+                .find(|m| m.slug == "gpt-5.5")
+                .unwrap()
+                .context_window,
             1_000_000
         );
         let mimo_pro = catalog_models_for_provider("MiMo", "mimo-v2.5-pro", false, None, None);
         assert_eq!(
-            mimo_pro.iter().find(|m| m.slug == "gpt-5.5").unwrap().context_window,
+            mimo_pro
+                .iter()
+                .find(|m| m.slug == "gpt-5.5")
+                .unwrap()
+                .context_window,
             1_000_000
         );
     }
