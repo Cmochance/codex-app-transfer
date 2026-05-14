@@ -24,6 +24,8 @@
   let formRequestOptions = {};
   let providerFormMappings = {};
   let providerFormRows = [...providerFormDefaultRows];
+  let providerFormCustomLabels = {};
+  let customRowCounter = 0;
   let providerAvailableModels = [];
   let openProviderSlotMenuIndex = null;
   let openProviderModelMenuKey = null;
@@ -352,6 +354,12 @@
     return Object.fromEntries(providerFormModelSlots.map((slot) => [slot.key, ""]));
   }
 
+  const predefinedSlotKeys = new Set(providerFormModelSlots.map((s) => s.key));
+
+  function isCustomMappingRow(key) {
+    return key.startsWith("_custom_");
+  }
+
   function normalizeMappings(mappings = {}) {
     const normalized = emptyMappings();
     if (!mappings || typeof mappings !== "object") return normalized;
@@ -361,6 +369,13 @@
     normalized.gpt_5_4_mini = String(mappings.gpt_5_4_mini || "").trim();
     normalized.gpt_5_3_codex = String(mappings.gpt_5_3_codex || "").trim();
     normalized.gpt_5_2 = String(mappings.gpt_5_2 || "").trim();
+    // preserve custom (non-predefined) keys
+    for (const [key, value] of Object.entries(mappings)) {
+      if (!predefinedSlotKeys.has(key)) {
+        const trimmed = String(value || "").trim();
+        if (trimmed) normalized[key] = trimmed;
+      }
+    }
     return normalized;
   }
 
@@ -577,6 +592,16 @@
         rows.push(slot.key);
       }
     });
+    // restore custom mapping rows (keys not in predefined slots)
+    providerFormCustomLabels = {};
+    for (const [key, value] of Object.entries(mappings)) {
+      if (!predefinedSlotKeys.has(key) && String(value || "").trim()) {
+        const customKey = `_custom_${customRowCounter++}`;
+        rows.push(customKey);
+        providerFormMappings[customKey] = String(value || "").trim();
+        providerFormCustomLabels[customKey] = key;
+      }
+    }
     return rows;
   }
 
@@ -655,8 +680,65 @@
     );
   }
 
+  function customMappingRowMarkup(rowKey, index) {
+    const customLabel = providerFormCustomLabels[rowKey] || "";
+    const currentProviderModel = providerFormMappings[rowKey] || "";
+    return `
+      <article class="form-mapping-row">
+        <div class="form-mapping-left">
+          <label class="form-label visually-hidden" for="providerMappingSlot-${index}">${t("providersAdd.claudeModel")}</label>
+          <div class="mapping-select-wrap">
+            <span class="mapping-icon default"><i class="bi bi-pencil"></i></span>
+            <input
+              class="form-control form-select custom-model-name-input"
+              id="providerMappingSlot-${index}"
+              data-custom-model-label="${escapeHtml(rowKey)}"
+              value="${escapeHtml(customLabel)}"
+              placeholder="${escapeHtml(t("providersAdd.customModelPlaceholder"))}"
+            >
+          </div>
+        </div>
+        <div class="form-mapping-right">
+          <label class="form-label visually-hidden" for="providerMappingValue-${index}">${t("providersAdd.providerModel")}</label>
+          <div class="provider-model-input-wrap ${openProviderModelMenuKey === rowKey ? "open" : ""}">
+            <input
+              class="form-control provider-model-input"
+              id="providerMappingValue-${index}"
+              data-provider-model-input="${escapeHtml(rowKey)}"
+              value="${escapeHtml(currentProviderModel)}"
+              placeholder="${escapeHtml(t("providersAdd.providerModelPlaceholder"))}"
+            >
+            <button
+              class="provider-model-trigger"
+              type="button"
+              data-action="toggle-provider-model-menu"
+              data-row-key="${escapeHtml(rowKey)}"
+              ${providerAvailableModels.length ? "" : "disabled"}
+              aria-haspopup="listbox"
+              aria-expanded="${providerAvailableModels.length && openProviderModelMenuKey === rowKey ? "true" : "false"}"
+              aria-label="${escapeHtml(t("providersAdd.providerModel"))}"
+            >
+              <i class="bi bi-chevron-down" aria-hidden="true"></i>
+            </button>
+            ${providerAvailableModels.length ? `
+              <div class="mapping-slot-menu provider-model-menu" role="listbox" aria-labelledby="providerMappingValue-${index}">
+                ${providerModelOptionsMarkup(currentProviderModel)}
+              </div>
+            ` : ""}
+          </div>
+        </div>
+        <div class="form-mapping-actions">
+          <button class="btn btn-outline-secondary btn-sm mapping-remove-button" type="button" data-action="remove-provider-model-row" data-row-index="${index}" aria-label="${escapeHtml(t("providersAdd.removeMapping"))}">${escapeHtml(t("providersAdd.removeMapping"))}</button>
+        </div>
+      </article>
+    `;
+  }
+
   function formMappingMarkup() {
     return providerFormRows.map((rowKey, index) => {
+      if (isCustomMappingRow(rowKey)) {
+        return customMappingRowMarkup(rowKey, index);
+      }
       const slot = slotByKey(rowKey);
       // direct 模式不需要 model alias 映射,default 字段也可空;其他场景仍 required
       const isRequired = rowKey === "default" && !isDirectResponsesMode();
@@ -719,14 +801,13 @@
     if (openProviderModelMenuKey !== null && !providerFormRows.includes(openProviderModelMenuKey)) {
       openProviderModelMenuKey = null;
     }
-    const canAddMoreRows = providerFormModelSlots.some((slot) => !providerFormRows.includes(slot.key));
     stack.innerHTML = `
       <div class="provider-mapping-card">
         <div class="provider-mapping-list">
           ${formMappingMarkup()}
         </div>
         <div class="provider-mapping-footer">
-          <button class="btn btn-outline-primary btn-sm" type="button" data-action="add-provider-model-row" ${canAddMoreRows ? "" : "disabled"}>
+          <button class="btn btn-outline-primary btn-sm" type="button" data-action="add-provider-model-row">
             <i class="bi bi-plus-lg"></i><span>${escapeHtml(t("providersAdd.addMapping"))}</span>
           </button>
         </div>
@@ -743,6 +824,23 @@
     openProviderSlotMenuIndex = null;
     openProviderModelMenuKey = null;
     renderProviderMappings();
+  }
+
+  function collectProviderMappingsWithCustom() {
+    const base = normalizeMappings(providerFormMappings);
+    // convert _custom_N internal keys to the user-typed model name
+    const result = {};
+    for (const [key, value] of Object.entries(base)) {
+      if (isCustomMappingRow(key)) {
+        const label = (providerFormCustomLabels[key] || "").trim();
+        if (label && String(value || "").trim()) {
+          result[label] = String(value).trim();
+        }
+      } else {
+        result[key] = value;
+      }
+    }
+    return result;
   }
 
   function updateProviderModelInput(slotKey, value) {
@@ -768,8 +866,15 @@
     const remaining = providerFormModelSlots
       .map((slot) => slot.key)
       .find((key) => !providerFormRows.includes(key));
-    if (!remaining) return;
-    providerFormRows = [...providerFormRows, remaining];
+    if (remaining) {
+      providerFormRows = [...providerFormRows, remaining];
+    } else {
+      // all predefined slots used — add a custom row
+      const customKey = `_custom_${customRowCounter++}`;
+      providerFormRows = [...providerFormRows, customKey];
+      providerFormMappings[customKey] = "";
+      providerFormCustomLabels[customKey] = "";
+    }
     openProviderSlotMenuIndex = null;
     openProviderModelMenuKey = null;
     renderProviderMappings();
@@ -779,7 +884,12 @@
     const key = providerFormRows[index];
     if (!key || key === "default") return;
     providerFormRows = providerFormRows.filter((_, rowIndex) => rowIndex !== index);
-    providerFormMappings[key] = "";
+    if (isCustomMappingRow(key)) {
+      delete providerFormMappings[key];
+      delete providerFormCustomLabels[key];
+    } else {
+      providerFormMappings[key] = "";
+    }
     openProviderSlotMenuIndex = null;
     if (openProviderModelMenuKey === key) openProviderModelMenuKey = null;
     renderProviderMappings();
@@ -889,7 +999,7 @@
   }
 
   function collectProviderMappings() {
-    return normalizeMappings(providerFormMappings);
+    return collectProviderMappingsWithCustom();
   }
 
   function providerPayloadFromForm(includeModels = true) {
@@ -2918,6 +3028,11 @@
     document.addEventListener("input", (event) => {
       if (event.target.id === "providerBaseUrl") {
         renderBaseUrlOptions();
+      }
+      const customLabelInput = event.target.closest("[data-custom-model-label]");
+      if (customLabelInput) {
+        const customKey = customLabelInput.dataset.customModelLabel;
+        providerFormCustomLabels[customKey] = customLabelInput.value;
       }
       const mappingInput = event.target.closest("[data-provider-model-input]");
       if (!mappingInput) return;

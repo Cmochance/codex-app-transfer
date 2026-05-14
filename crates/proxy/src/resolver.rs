@@ -155,17 +155,33 @@ impl StaticResolver {
     fn map_model_for_provider(&self, provider: &Provider, requested_model: &str) -> Option<String> {
         let mappings_value = serde_json::to_value(&provider.models).ok();
         let mappings = normalize_model_mappings(mappings_value.as_ref());
+
+        // 1. 已知 slot(gpt-5.5 → gpt_5_5 等):优先用 slot 映射
         let slot = openai_model_slot(requested_model);
         if let Some(slot) = slot {
             let mapped = mappings.get(slot).map(|s| s.trim()).unwrap_or("");
             if !mapped.is_empty() {
                 return Some(strip_internal_model_suffix(mapped));
             }
-            let default = mappings.get("default").map(|s| s.trim()).unwrap_or("");
-            if !default.is_empty() {
-                return Some(strip_internal_model_suffix(default));
+        }
+
+        // 2. 自定义映射:直接在 provider.models 中按 key 匹配(case-insensitive)
+        let requested_lower = requested_model.trim().to_ascii_lowercase();
+        for (key, value) in &provider.models {
+            if key.trim().to_ascii_lowercase() == requested_lower {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(strip_internal_model_suffix(trimmed));
+                }
             }
         }
+
+        // 3. 所有未匹配的模型均降级到 default
+        let default = mappings.get("default").map(|s| s.trim()).unwrap_or("");
+        if !default.is_empty() {
+            return Some(strip_internal_model_suffix(default));
+        }
+
         None
     }
 
@@ -534,19 +550,60 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_default_when_no_slash_in_model() {
-        let r = StaticResolver::new(
-            None,
-            vec![
-                provider("openai", "https://up-1", "sk-1"),
-                provider("deepseek", "https://up-2", "sk-2"),
-            ],
-            Some("deepseek".into()),
-        );
+    fn unknown_model_falls_back_to_default_mapping() {
+        let mut deepseek = provider("deepseek", "https://up-2", "sk-2");
+        deepseek
+            .models
+            .insert("default".into(), "deepseek-v4-pro".into());
+        let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
         let p = parts_with(&[]);
+        // "any-name" is not a known slot nor a custom key → should fall back to default
         let res = r.resolve(&p, br#"{"model":"any-name"}"#).unwrap();
         assert_eq!(res.provider_id, "deepseek");
-        assert_eq!(res.rewritten_model, None);
+        assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn custom_key_mapping_matches_directly() {
+        let mut deepseek = provider("deepseek", "https://up-2", "sk-2");
+        deepseek
+            .models
+            .insert("default".into(), "deepseek-v4-pro".into());
+        deepseek
+            .models
+            .insert("gpt-4o".into(), "deepseek-v4-lite".into());
+        let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
+        let p = parts_with(&[]);
+        let res = r.resolve(&p, br#"{"model":"gpt-4o"}"#).unwrap();
+        assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-lite"));
+    }
+
+    #[test]
+    fn custom_key_mapping_is_case_insensitive() {
+        let mut deepseek = provider("deepseek", "https://up-2", "sk-2");
+        deepseek
+            .models
+            .insert("My-Custom-Model".into(), "real-model".into());
+        let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
+        let p = parts_with(&[]);
+        let res = r.resolve(&p, br#"{"model":"my-custom-model"}"#).unwrap();
+        assert_eq!(res.rewritten_model.as_deref(), Some("real-model"));
+    }
+
+    #[test]
+    fn known_slot_takes_priority_over_custom_key() {
+        let mut deepseek = provider("deepseek", "https://up-2", "sk-2");
+        deepseek
+            .models
+            .insert("gpt_5_5".into(), "slot-model".into());
+        // even if there's a custom key "gpt-5.5", the slot lookup wins
+        deepseek
+            .models
+            .insert("gpt-5.5".into(), "custom-model".into());
+        let r = StaticResolver::new(None, vec![deepseek], Some("deepseek".into()));
+        let p = parts_with(&[]);
+        let res = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();
+        assert_eq!(res.rewritten_model.as_deref(), Some("slot-model"));
     }
 
     #[test]
