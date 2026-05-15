@@ -359,7 +359,11 @@
 
     async stopProxy() {
       await api('POST', '/api/proxy/stop');
-      return { running: false };
+      const status = await api('GET', '/api/status');
+      return {
+        running: !!status.proxyRunning,
+        port: status.proxyPort || 18080,
+      };
     },
 
     async getProxyLogs() {

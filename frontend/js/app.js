@@ -1263,7 +1263,18 @@
       ? t("status.needsApply")
       : status.desktopConfigured ? t("status.configured") : t("status.notConfigured");
     renderDesktopHealthWarning("#dashboardDesktopWarning", health);
-    $("#dashboardProxyStatus").textContent = status.proxyRunning ? `${t("status.running")} :${status.proxyPort}` : t("status.stopped");
+    // ── proxy 状态卡片:图标颜色 + 文字颜色跟随 running 状态 ──
+    const proxyIcon = $("#dashboardProxyIcon");
+    if (proxyIcon) {
+      proxyIcon.classList.toggle("success", !!status.proxyRunning);
+      proxyIcon.classList.toggle("muted", !status.proxyRunning);
+      proxyIcon.innerHTML = status.proxyRunning
+        ? '<i class="bi bi-hdd-network"></i><i class="bi bi-activity badge-icon"></i>'
+        : '<i class="bi bi-hdd-network"></i>';
+    }
+    const proxyStatusEl = $("#dashboardProxyStatus");
+    proxyStatusEl.textContent = status.proxyRunning ? `${t("status.running")} :${status.proxyPort}` : t("status.stopped");
+    proxyStatusEl.classList.toggle("muted-text", !status.proxyRunning);
     $("#dashboardProviderName").textContent = status.activeProvider.name;
     // Plugin Unlock 状态刷新
     refreshPluginUnlockStatus();
@@ -2009,6 +2020,20 @@
     $("#proxyPort").value = status.proxyPort;
     $("#settingsProxyPort").value = status.proxyPort;
     $("#proxyStateText").textContent = status.proxyRunning ? t("status.running") : t("status.stopped");
+    // ── 停止态视觉反馈:pulse-dot 灰色 + 状态文字灰色 ──
+    const proxyRunningEl = document.querySelector(".proxy-running");
+    if (proxyRunningEl) proxyRunningEl.classList.toggle("stopped", !status.proxyRunning);
+    // ── toggle 按钮:running → Stop(danger),stopped → Start(success) ──
+    const toggleBtn = $("#proxyToggleBtn");
+    if (toggleBtn) {
+      if (status.proxyRunning) {
+        toggleBtn.className = "btn btn-danger btn-lg";
+        toggleBtn.innerHTML = `<i class="bi bi-stop-fill"></i><span>${t("proxy.stop")}</span>`;
+      } else {
+        toggleBtn.className = "btn btn-success btn-lg";
+        toggleBtn.innerHTML = `<i class="bi bi-play"></i><span>${t("proxy.start")}</span>`;
+      }
+    }
     bindProxyLogScroll();
     proxyLogAtBottom = true;
     await refreshProxyLog();
@@ -2647,6 +2672,19 @@
         await renderProxy();
         await renderDashboard();
         showToast(t("toast.proxyStopped"));
+      }
+
+      if (action === "proxy-toggle") {
+        const currentStatus = await CCApi.getProxyStatus();
+        if (currentStatus.running) {
+          await CCApi.stopProxy();
+          showToast(t("toast.proxyStopped"));
+        } else {
+          await CCApi.startProxy($("#proxyPort") ? $("#proxyPort").value : 18080);
+          showToast(t("toast.proxyStarted"));
+        }
+        await renderProxy();
+        await renderDashboard();
       }
 
       if (action === "clear-logs") {

@@ -67,18 +67,31 @@ pub async fn start_proxy(
         .or_else(|| load_registry().ok().map(|cfg| read_proxy_port(&cfg)))
         .unwrap_or(18080);
     match state.proxy_manager.start(port).await {
-        Ok(s) => Json(json!({
-            "success": true,
-            "running": s.running,
-            "port": s.addr.and_then(|a| a.split(':').last().and_then(|p| p.parse::<u16>().ok())).unwrap_or(port),
-        }))
-        .into_response(),
+        Ok(s) => {
+            let actual_port = s
+                .addr
+                .as_ref()
+                .and_then(|a| a.split(':').last().and_then(|p| p.parse::<u16>().ok()))
+                .unwrap_or(port);
+            proxy_telemetry()
+                .logs
+                .add("INFO", format!("forwarding started :{actual_port}"));
+            Json(json!({
+                "success": true,
+                "running": s.running,
+                "port": actual_port,
+            }))
+            .into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
 pub async fn stop_proxy(State(state): State<AdminState>) -> impl IntoResponse {
     state.proxy_manager.stop_silent();
+    proxy_telemetry()
+        .logs
+        .add("INFO", "forwarding stopped".to_owned());
     Json(json!({"success": true, "running": false})).into_response()
 }
 

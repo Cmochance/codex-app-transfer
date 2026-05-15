@@ -334,8 +334,16 @@ label[for],
   display: inline-grid;
   place-items: center;
   min-height: 92px;
-  color: var(--success);
+  color: var(--muted);
   font-size: 80px;
+}
+
+.hero-line-icon.success {
+  color: var(--success);
+}
+
+.hero-line-icon.muted {
+  color: var(--muted);
 }
 
 .badge-icon {
@@ -1045,13 +1053,12 @@ label[for],
 
 .proxy-control {
   display: grid;
-  grid-template-columns: 1.5fr 1fr 190px 190px;
+  grid-template-columns: 1.5fr 1fr 220px;
   align-items: center;
   gap: 28px;
   margin-bottom: 18px;
 }
 
-.proxy-control [data-action="proxy-start"],
 .terminal-toolbar [data-action="clear-logs"] {
   --bs-btn-hover-color: var(--primary);
   --bs-btn-hover-bg: var(--primary-soft);
@@ -1114,6 +1121,17 @@ label[for],
     radial-gradient(circle at center, var(--success) 0 20%, transparent 22%),
     radial-gradient(circle at center, rgba(17, 181, 109, .26) 0 42%, transparent 44%),
     radial-gradient(circle at center, rgba(17, 181, 109, .12) 0 65%, transparent 67%);
+}
+
+.proxy-running.stopped .pulse-dot {
+  background:
+    radial-gradient(circle at center, var(--muted) 0 20%, transparent 22%),
+    radial-gradient(circle at center, rgba(100, 116, 139, .22) 0 42%, transparent 44%),
+    radial-gradient(circle at center, rgba(100, 116, 139, .10) 0 65%, transparent 67%);
+}
+
+.proxy-running.stopped strong {
+  color: var(--muted);
 }
 
 .terminal-panel {
@@ -2991,7 +3009,7 @@ body {
 }
 
 .proxy-control {
-  grid-template-columns: minmax(0, 1fr) minmax(260px, auto) 110px 110px;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, auto) 140px;
   gap: 12px;
   padding: 16px;
 }

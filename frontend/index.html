@@ -70,7 +70,7 @@
           </article>
           <article class="status-card">
             <h2 data-i18n="dashboard.proxyStatus">代理状态</h2>
-            <div class="hero-line-icon success"><i class="bi bi-hdd-network"></i><i class="bi bi-activity badge-icon"></i></div>
+            <div class="hero-line-icon" id="dashboardProxyIcon"><i class="bi bi-hdd-network"></i><i class="bi bi-activity badge-icon"></i></div>
             <strong id="dashboardProxyStatus">运行中 :18080</strong>
           </article>
           <article class="status-card">
@@ -357,8 +357,7 @@
             <label class="form-label" for="proxyPort" data-i18n="settings.proxyPort">转发端口</label>
             <input class="form-control form-control-lg" type="number" id="proxyPort" value="18080">
           </div>
-          <button class="btn btn-outline-secondary btn-lg" type="button" data-action="proxy-start"><i class="bi bi-play"></i><span data-i18n="proxy.start">启动转发</span></button>
-          <button class="btn btn-danger btn-lg" type="button" data-action="proxy-stop"><i class="bi bi-stop-fill"></i><span data-i18n="proxy.stop">停止转发</span></button>
+          <button class="btn btn-success btn-lg" type="button" id="proxyToggleBtn" data-action="proxy-toggle"><i class="bi bi-play"></i><span data-i18n="proxy.start">启动转发</span></button>
         </article>
 
         <article class="terminal-panel">
