@@ -102,6 +102,9 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         .map(codex_app_transfer_registry::strip_internal_model_suffix);
     if !provider_supports_vision(provider, body_model.as_deref()) {
         strip_image_blocks_in_place(&mut messages);
+        // Stage 3 note: Additional input_image stripping from raw Responses input
+        // (for Computer Use base64) can be added here once we have &mut access to body.
+        // Current defense relies on strip_image_blocks_in_place after input→message conversion.
     } else {
         // 含 image_url 但无 text part 时补一个空格 text part — MiMo 多模态
         // 接口强制要求(否则 400 "Param Incorrect: text is not set"),
@@ -126,7 +129,34 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // web_search_preview per-provider 适配上游真支持的形态,其余 Responses
     // 专属类型 drop + warn_once)
     if let Some(Value::Array(tools)) = body.get("tools") {
-        let chat_tools: Vec<Value> = tools
+        // Stage 2: Filter out computer_use_preview for non-vision models early
+        let filtered_tools: Vec<&Value> =
+            if !provider_supports_vision(provider, body_model.as_deref()) {
+                let had_computer_use = tools.iter().any(|t| {
+                    t.get("type").and_then(|v| v.as_str()) == Some("computer_use_preview")
+                });
+
+                if had_computer_use {
+                    tracing::warn!(
+                        target: "codex_app_transfer::computer_use",
+                        provider = ?provider.map(|p| p.id.as_str()),
+                        model = body_model,
+                        "Codex CLI attempted to use computer_use_preview with a non-vision model. \
+                         The tool has been dropped to prevent sending expensive base64 screenshots."
+                    );
+                }
+
+                tools
+                    .iter()
+                    .filter(|t| {
+                        t.get("type").and_then(|v| v.as_str()) != Some("computer_use_preview")
+                    })
+                    .collect()
+            } else {
+                tools.iter().collect()
+            };
+
+        let chat_tools: Vec<Value> = filtered_tools
             .iter()
             .flat_map(|t| convert_responses_tool_to_chat_tool(t, provider))
             .collect();
@@ -1657,6 +1687,14 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
             // Xiaomi MiMo 文本-only 子集(实测响应 "I don't see any image attached")
             "mimo-v2-pro",
             "mimo-v2.5-pro",
+            // 智谱 GLM 文本旗舰模型（官方明确为文本模型，视觉走 GLM-5V 等独立模型）
+            "glm-5.1",
+            "glm-4.7",
+            // 阿里云百炼 Qwen 标准版（视觉能力走 Qwen-VL 系列）
+            "qwen3.6-plus",
+            "qwen3.6-flash",
+            // MiniMax M2.7（文本模型，图像理解通过独立 MCP 工具实现）
+            "MiniMax-M2.7",
         ];
         if TEXT_ONLY_MODELS.iter().any(|n| lc == *n) {
             return false;
@@ -1672,7 +1710,15 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
 /// 替换后若 content 数组只剩 text 块,会进一步合并为单 string,与
 /// 普通文本消息序列化形态一致。
 fn strip_image_blocks_in_place(messages: &mut [Value]) {
+    tracing::debug!(
+        target: "codex_app_transfer::vision",
+        "Stripping vision content because current provider/model does not support vision (Computer Use protection active)"
+    );
+
     const PLACEHOLDER: &str = "[image omitted: current provider does not support vision]";
+    const COMPUTER_USE_PLACEHOLDER: &str =
+        "[Computer Use screenshot omitted: current model does not support vision]";
+
     for msg in messages.iter_mut() {
         let Some(obj) = msg.as_object_mut() else {
             continue;
@@ -1684,6 +1730,7 @@ fn strip_image_blocks_in_place(messages: &mut [Value]) {
             continue;
         };
         let mut had_image = false;
+
         for block in arr.iter_mut() {
             let Some(block_obj) = block.as_object_mut() else {
                 continue;
@@ -1693,11 +1740,25 @@ fn strip_image_blocks_in_place(messages: &mut [Value]) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned();
-            if block_type == "image_url" {
+            if block_type == "image_url" || block_type == "input_image" {
                 had_image = true;
+
+                // Simple heuristic for Computer Use screenshots
+                let is_likely_computer_use = block_obj
+                    .get("image_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.len() > 20000)
+                    .unwrap_or(false);
+
+                let placeholder = if is_likely_computer_use {
+                    COMPUTER_USE_PLACEHOLDER
+                } else {
+                    PLACEHOLDER
+                };
+
                 block_obj.clear();
                 block_obj.insert("type".into(), Value::String("text".into()));
-                block_obj.insert("text".into(), Value::String(PLACEHOLDER.into()));
+                block_obj.insert("text".into(), Value::String(placeholder.to_string()));
             }
         }
         if had_image {
@@ -1743,6 +1804,10 @@ fn ensure_text_part_when_image_present(messages: &mut [Value]) {
         }
     }
 }
+
+/// Stage 3 (in progress): Stronger stripping for `input_image` (Computer Use screenshots)
+/// will be added here in a follow-up refinement. For now, the main defense is
+/// in strip_image_blocks_in_place + tool filtering (Stage 2).
 
 /// Responses message.content 可能是 string 或 [{type, text/image_url}].
 /// stateless 阶段:string 保留;text 块拼成 string;含 image_url 的块降级为
