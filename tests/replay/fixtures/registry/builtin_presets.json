@@ -11,10 +11,12 @@
     },
     "modelCapabilities": {
       "deepseek-v4-pro": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       },
       "deepseek-v4-flash": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       }
     },
     "notices": [
@@ -114,19 +116,23 @@
     },
     "modelCapabilities": {
       "mimo-v2-pro": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       },
       "mimo-v2-flash": {
-        "context_window": 262144
+        "context_window": 262144,
+        "supports_vision": false
       },
       "mimo-v2-omni": {
         "context_window": 262144
       },
       "mimo-v2.5": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       },
       "mimo-v2.5-pro": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       }
     },
     "isBuiltin": true
@@ -164,10 +170,12 @@
         "context_window": 262144
       },
       "mimo-v2.5": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       },
       "mimo-v2.5-pro": {
-        "context_window": 1000000
+        "context_window": 1000000,
+        "supports_vision": false
       }
     },
     "isBuiltin": true
