@@ -388,6 +388,9 @@ fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), C
     std::fs::rename(dir, &target)?;
     let mut recovery_manifest = manifest;
     recovery_manifest.schema_version = SNAPSHOT_SCHEMA_VERSION;
+    if let Some(target_id) = dir_name(&target) {
+        recovery_manifest.snapshot_id = target_id;
+    }
     write_manifest_to_dir(&target, &recovery_manifest)?;
     Ok(())
 }
@@ -608,6 +611,51 @@ mod tests {
         assert!(snapshots
             .iter()
             .any(|s| s.kind == "recovery" && s.id == "old-session"));
+    }
+
+    #[test]
+    fn recovery_snapshot_ids_follow_unique_target_dirs() {
+        let (_t, paths) = paths_with_tmp();
+        let first_dir = paths.active_snapshots_dir.join("first-session");
+        let second_dir = paths.active_snapshots_dir.join("second-session");
+
+        for (dir, config) in [
+            (&first_dir, "openai_base_url = \"first\"\n"),
+            (&second_dir, "openai_base_url = \"second\"\n"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(config_path(dir), config).unwrap();
+            std::fs::write(
+                manifest_path(dir),
+                serde_json::to_string(&SnapshotManifest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    snapshot_id: "old-session".to_owned(),
+                    session_id: dir_name(dir).unwrap(),
+                    snapshot_at: "2026-05-15T01:00:00".to_owned(),
+                    config_existed: true,
+                    auth_existed: false,
+                    app_version: "v-old".to_owned(),
+                    provider_name: Some("Old".to_owned()),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        move_snapshot_dir_to_recovery(&paths, &first_dir).unwrap();
+        move_snapshot_dir_to_recovery(&paths, &second_dir).unwrap();
+
+        let snapshots = list_snapshots(&paths);
+        assert!(snapshots
+            .iter()
+            .any(|s| s.kind == "recovery" && s.id == "old-session"));
+        assert!(snapshots
+            .iter()
+            .any(|s| s.kind == "recovery" && s.id == "old-session-2"));
+        assert_eq!(
+            read_snapshot_config_by_id(&paths, "old-session-2").unwrap(),
+            "openai_base_url = \"second\"\n"
+        );
     }
 
     #[test]
