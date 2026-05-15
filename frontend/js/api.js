@@ -341,8 +341,19 @@
     },
 
     async clearDesktop() {
-      await api('POST', '/api/desktop/clear');
-      return this.getDesktopStatus();
+      return api('POST', '/api/desktop/clear');
+    },
+
+    async getDesktopSnapshots() {
+      const data = await api('GET', '/api/desktop/snapshots');
+      return data.snapshots || [];
+    },
+
+    async restoreDesktopSnapshot(snapshotId) {
+      return api('POST', '/api/desktop/restore', {
+        snapshotId,
+        cleanupAll: true,
+      });
     },
 
     async startProxy(port) {

@@ -22,11 +22,12 @@ use std::time::Duration;
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::{
-    apply_provider, catalog_models_for_provider, has_snapshot, read_auth, restore_codex_state,
-    ApplyConfig, CodexPaths,
+    apply_provider, catalog_models_for_provider, get_snapshot_status, has_snapshot, list_snapshots,
+    read_auth, restore_codex_snapshot, restore_codex_state, ApplyConfig, CodexPaths,
 };
 use codex_app_transfer_proxy::proxy_telemetry;
 use codex_app_transfer_registry::RawConfig;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::proxy_runner::ProxyManager;
@@ -59,6 +60,15 @@ const QUIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// 退出确认后,等 launchd reap 完旧进程的 grace 窗口。低于 ~250ms 时
 /// `open -a` 仍可能误命中"已在运行"缓存。
 const POST_QUIT_LAUNCHD_GRACE: Duration = Duration::from_millis(400);
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopRestoreRequest {
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    #[serde(default)]
+    cleanup_all: bool,
+}
 
 /// 平台检测命令(可纯函数测试).返回 (program, args).第一个元素总是命令名。
 fn running_check_command(platform: &str) -> Vec<String> {
@@ -885,7 +895,36 @@ pub async fn desktop_clear() -> impl IntoResponse {
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     match restore_codex_state(&paths) {
-        Ok(_) => Json(json!({"success": true})).into_response(),
+        Ok(restored) => Json(json!({"success": true, "restored": restored})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn desktop_snapshots() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    Json(json!({
+        "snapshots": list_snapshots(&paths),
+    }))
+    .into_response()
+}
+
+pub async fn desktop_restore(Json(payload): Json<DesktopRestoreRequest>) -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let snapshot_id = payload.snapshot_id.unwrap_or_default();
+    match restore_codex_snapshot(&paths, &snapshot_id, payload.cleanup_all) {
+        Ok(restored) => Json(json!({
+            "success": true,
+            "restored": restored,
+            "snapshotId": if snapshot_id.is_empty() { Value::Null } else { Value::String(snapshot_id) },
+            "cleanupAll": payload.cleanup_all,
+        }))
+        .into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -895,8 +934,15 @@ pub async fn desktop_snapshot_status() -> impl IntoResponse {
         Ok(p) => p,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let status = get_snapshot_status(&paths);
     Json(json!({
-        "hasSnapshot": has_snapshot(&paths),
+        "hasSnapshot": status.has_snapshot,
+        "snapshotAt": status.snapshot_at,
+        "configExisted": status.config_existed,
+        "authExisted": status.auth_existed,
+        "appVersion": status.app_version,
+        "restorableCount": status.restorable_count,
+        "recoveryCount": status.recovery_count,
     }))
     .into_response()
 }

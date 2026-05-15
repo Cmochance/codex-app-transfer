@@ -9,8 +9,9 @@ use crate::model_catalog::{
 };
 use crate::paths::CodexPaths;
 use crate::snapshot::{
-    drop_snapshot, has_snapshot, read_snapshot_auth, read_snapshot_config, snapshot_codex_state,
-    snapshot_toml_value_literal,
+    drop_all_snapshots, drop_snapshot, drop_snapshot_by_id, has_snapshot, list_snapshots,
+    read_snapshot_auth, read_snapshot_auth_by_id, read_snapshot_config, read_snapshot_config_by_id,
+    snapshot_codex_state, snapshot_toml_value_literal,
 };
 use crate::toml_sync::{sync_root_value, toml_string_literal};
 use crate::CodexError;
@@ -23,6 +24,8 @@ const MANAGED_TOML_KEYS: &[&str] = &[
     "openai_base_url",
     "model_context_window",
     CODEX_MODEL_CATALOG_KEY,
+    "model",
+    "model_provider",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +67,7 @@ pub struct ApplyResult {
 pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResult, CodexError> {
     // 1. snapshot(幂等;已有快照不会覆盖)
     let snapshot_taken_now = !has_snapshot(paths);
-    snapshot_codex_state(paths, cfg.app_version)?;
+    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name)?;
 
     // 2. config.toml: openai_base_url
     if cfg.base_url.is_empty() {
@@ -132,31 +135,76 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
 pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
     if !has_snapshot(paths) {
         // 没快照时退化为旧版"删除我们的 key"逻辑,与 Python 行为对齐
-        for key in MANAGED_TOML_KEYS {
-            sync_root_value(&paths.config_toml, key, None)?;
-        }
-        clear_catalog_models(&paths.model_catalog_json)?;
-        if paths.auth_json.exists() {
-            let mut auth = read_auth(&paths.auth_json)?;
-            if let Some(obj) = auth.as_object_mut() {
-                for key in MANAGED_AUTH_KEYS {
-                    obj.remove(*key);
-                }
-            }
-            write_auth(&paths.auth_json, &auth)?;
-        }
+        clear_managed_codex_state(paths)?;
         return Ok(false);
     }
 
-    // 1. config.toml:对每个 managed key 用快照里的字面量还原;快照里没有就删
     let snapshot_config = read_snapshot_config(paths).unwrap_or_default();
+    let snapshot_auth = read_snapshot_auth(paths);
+    restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth)?;
+
+    drop_snapshot(paths)?;
+    clear_catalog_models(&paths.model_catalog_json)?;
+    Ok(true)
+}
+
+/// 人工恢复指定快照。恢复成功后默认删除该快照;当 `drop_remaining_snapshots`
+/// 为 true 时,按 UI 选择恢复语义清理所有剩余 active/recovery/legacy 快照。
+pub fn restore_codex_snapshot(
+    paths: &CodexPaths,
+    snapshot_id: &str,
+    drop_remaining_snapshots: bool,
+) -> Result<bool, CodexError> {
+    if snapshot_id.trim().is_empty() {
+        return restore_codex_state(paths);
+    }
+    if !list_snapshots(paths).iter().any(|s| s.id == snapshot_id) {
+        return Err(CodexError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("snapshot not found: {snapshot_id}"),
+        )));
+    }
+    let snapshot_config = read_snapshot_config_by_id(paths, snapshot_id).unwrap_or_default();
+    let snapshot_auth = read_snapshot_auth_by_id(paths, snapshot_id);
+    restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth)?;
+    if drop_remaining_snapshots {
+        drop_all_snapshots(paths)?;
+    } else {
+        drop_snapshot_by_id(paths, snapshot_id)?;
+    }
+    clear_catalog_models(&paths.model_catalog_json)?;
+    Ok(true)
+}
+
+fn clear_managed_codex_state(paths: &CodexPaths) -> Result<(), CodexError> {
     for key in MANAGED_TOML_KEYS {
-        let literal = snapshot_toml_value_literal(&snapshot_config, key);
+        sync_root_value(&paths.config_toml, key, None)?;
+    }
+    clear_catalog_models(&paths.model_catalog_json)?;
+    if paths.auth_json.exists() {
+        let mut auth = read_auth(&paths.auth_json)?;
+        if let Some(obj) = auth.as_object_mut() {
+            for key in MANAGED_AUTH_KEYS {
+                obj.remove(*key);
+            }
+        }
+        write_auth(&paths.auth_json, &auth)?;
+    }
+    Ok(())
+}
+
+fn restore_from_snapshot_values(
+    paths: &CodexPaths,
+    snapshot_config: &str,
+    snapshot_auth: &serde_json::Value,
+) -> Result<(), CodexError> {
+    // 1. config.toml:对每个 managed key 用快照里的字面量还原;快照里没有就删
+    for key in MANAGED_TOML_KEYS {
+        let literal = snapshot_toml_value_literal(snapshot_config, key);
         sync_root_value(&paths.config_toml, key, literal.as_deref())?;
     }
 
     // 2. auth.json:对每个 managed key,快照里有就改回快照值,没有就 remove
-    let snapshot_auth = read_snapshot_auth(paths);
     let mut current = read_auth(&paths.auth_json)?;
     if let Some(obj) = current.as_object_mut() {
         for key in MANAGED_AUTH_KEYS {
@@ -171,10 +219,7 @@ pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
         }
     }
     write_auth(&paths.auth_json, &current)?;
-
-    drop_snapshot(paths)?;
-    clear_catalog_models(&paths.model_catalog_json)?;
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -409,7 +454,7 @@ mod tests {
         // 用户原本的状态:有 base_url 和 auth.OPENAI_API_KEY
         std::fs::write(
             &paths.config_toml,
-            "openai_base_url = \"https://api.openai.com/v1\"\n[profiles]\nfoo = 1\n",
+            "openai_base_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-5.5\"\n[profiles]\nfoo = 1\n",
         )
         .unwrap();
         std::fs::write(
@@ -432,6 +477,8 @@ mod tests {
             },
         )
         .unwrap();
+        // 模拟 Codex 在接管期间把 UI 模型选择写成第三方映射模型。
+        sync_root_value(&paths.config_toml, "model", Some("\"deepseek-v4-pro\"")).unwrap();
         // 还原
         let restored = restore_codex_state(&paths).unwrap();
         assert!(restored, "有快照时 restore 应返回 true");
@@ -444,6 +491,10 @@ mod tests {
         assert!(
             !toml.contains("model_context_window"),
             "原状态没有 1M 字段,还原后也不应有"
+        );
+        assert!(
+            toml.contains("model = \"gpt-5.5\""),
+            "Codex 模型选择应还原为用户原值"
         );
         assert!(toml.contains("[profiles]"), "用户的 [profiles] 应保留");
 
@@ -502,7 +553,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(
             &paths.config_toml,
-            "openai_base_url = \"http://leftover\"\nmodel_context_window = 1000000\nmodel_catalog_json = \"leftover.json\"\nfoo = 1\n",
+            "openai_base_url = \"http://leftover\"\nmodel_context_window = 1000000\nmodel_catalog_json = \"leftover.json\"\nmodel = \"deepseek-v4-pro\"\nmodel_provider = \"codex-app-transfer\"\nfoo = 1\n",
         )
         .unwrap();
         codex_app_transfer_registry::save_raw_config(
@@ -525,12 +576,81 @@ mod tests {
         assert!(!toml.contains("openai_base_url"));
         assert!(!toml.contains("model_context_window"));
         assert!(!toml.contains(CODEX_MODEL_CATALOG_KEY));
+        assert!(!toml.contains("model = "));
+        assert!(!toml.contains("model_provider = "));
         assert!(toml.contains("foo = 1"));
         assert!(read_app_config(&paths).get("models").is_none());
         let auth = read_auth_value(&paths);
         assert!(auth.get("OPENAI_API_KEY").is_none());
         assert!(auth.get("auth_mode").is_none());
         assert_eq!(auth["keep"], 1);
+    }
+
+    #[test]
+    fn restore_snapshot_by_id_restores_chosen_backup_and_cleans_all_snapshots() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(
+            &paths.config_toml,
+            "openai_base_url = \"active-original\"\nmodel = \"gpt-5.5\"\n",
+        )
+        .unwrap();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://active-managed",
+                gateway_api_key: "cas_active",
+                supports_1m: false,
+                provider_name: "Active",
+                default_model: "active-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v-active",
+            },
+        )
+        .unwrap();
+
+        let recovery_dir = paths.recovery_snapshots_dir.join("older-backup");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        std::fs::write(
+            recovery_dir.join("config.toml"),
+            "openai_base_url = \"older-original\"\nmodel = \"gpt-5.4\"\n",
+        )
+        .unwrap();
+        std::fs::write(recovery_dir.join("auth.json"), "{\"keep\":1}\n").unwrap();
+        std::fs::write(
+            recovery_dir.join("manifest.json"),
+            json!({
+                "schema_version": 2,
+                "snapshot_id": "older-backup",
+                "session_id": "older-session",
+                "snapshot_at": "2026-05-15T02:00:00",
+                "config_existed": true,
+                "auth_existed": true,
+                "app_version": "v-old",
+                "provider_name": "Older"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        sync_root_value(
+            &paths.config_toml,
+            "openai_base_url",
+            Some("\"http://managed\""),
+        )
+        .unwrap();
+        sync_root_value(&paths.config_toml, "model", Some("\"deepseek-v4-pro\"")).unwrap();
+
+        let restored = restore_codex_snapshot(&paths, "older-backup", true).unwrap();
+        assert!(restored);
+        let toml = read_toml(&paths);
+        assert!(toml.contains("openai_base_url = \"older-original\""));
+        assert!(toml.contains("model = \"gpt-5.4\""));
+        assert!(
+            crate::snapshot::list_snapshots(&paths).is_empty(),
+            "manual restore should clear all remaining backups after success"
+        );
     }
 
     #[test]

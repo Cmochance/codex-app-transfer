@@ -10,7 +10,7 @@
 //! - [`restore_codex_state`]:基于快照精确还原我们改过的 key,**不动**用户
 //!   在我们运行期间手动加的内容
 //! - [`snapshot_codex_state`]:首次 apply 前自动调一次,把原状态打包到
-//!   `~/.codex-app-transfer/codex-snapshot/`
+//!   `~/.codex-app-transfer/codex-snapshots/active/<session>/`
 //!
 //! 路径解析全部走 [`CodexPaths`],测试可注入临时目录。
 
@@ -21,12 +21,15 @@ pub mod paths;
 pub mod snapshot;
 pub mod toml_sync;
 
-pub use apply::{apply_provider, restore_codex_state, ApplyConfig, ApplyResult};
+pub use apply::{
+    apply_provider, restore_codex_snapshot, restore_codex_state, ApplyConfig, ApplyResult,
+};
 pub use auth::{read_auth, write_auth};
 pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, upsert_catalog_models};
 pub use paths::CodexPaths;
 pub use snapshot::{
-    get_snapshot_status, has_snapshot, snapshot_codex_state, SnapshotManifest, SnapshotStatus,
+    get_snapshot_status, has_snapshot, list_snapshots, snapshot_codex_state, SnapshotInfo,
+    SnapshotManifest, SnapshotStatus,
 };
 pub use toml_sync::sync_root_value;
 

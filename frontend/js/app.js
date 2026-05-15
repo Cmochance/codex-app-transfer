@@ -2079,12 +2079,52 @@
         target.textContent = tFmt("settings.codexSnapshotStatusActive", {
           time: status.snapshotAt || "",
         });
+      } else if (status && status.restorableCount > 0) {
+        target.textContent = tFmt("settings.codexSnapshotStatusRecovery", {
+          count: status.restorableCount,
+        });
       } else {
         target.textContent = t("settings.codexSnapshotStatusEmpty");
       }
     } catch (error) {
       target.textContent = t("settings.codexSnapshotStatusEmpty");
     }
+  }
+
+  function formatCodexSnapshotChoice(snapshot, index) {
+    const kind = t(`settings.codexSnapshotKind.${snapshot.kind || "unknown"}`);
+    const provider = snapshot.providerName || t("settings.codexSnapshotProviderUnknown");
+    const time = snapshot.snapshotAt || t("settings.codexSnapshotTimeUnknown");
+    const version = snapshot.appVersion || t("settings.codexSnapshotVersionUnknown");
+    const files = [
+      snapshot.configExisted ? "config.toml" : null,
+      snapshot.authExisted ? "auth.json" : null,
+    ].filter(Boolean).join(" + ") || t("settings.codexSnapshotFilesNone");
+    return `${index + 1}. ${time} | ${kind} | ${provider} | ${version} | ${files}`;
+  }
+
+  async function chooseCodexRestoreTarget() {
+    const snapshots = await CCApi.getDesktopSnapshots();
+    if (!snapshots.length) {
+      return window.confirm(t("confirm.desktopClearFallback")) ? { fallback: true } : null;
+    }
+    if (snapshots.length === 1) {
+      const summary = formatCodexSnapshotChoice(snapshots[0], 0);
+      return window.confirm(tFmt("confirm.desktopSnapshotRestoreSingle", { summary }))
+        ? { snapshotId: snapshots[0].id }
+        : null;
+    }
+    const list = snapshots.map(formatCodexSnapshotChoice).join("\n");
+    const input = window.prompt(tFmt("confirm.desktopSnapshotSelect", { list }));
+    if (input === null) return null;
+    const selectedIndex = Number.parseInt(String(input).trim(), 10) - 1;
+    if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= snapshots.length) {
+      showToast(t("toast.desktopSnapshotInvalid"));
+      return null;
+    }
+    const summary = formatCodexSnapshotChoice(snapshots[selectedIndex], selectedIndex);
+    if (!window.confirm(tFmt("confirm.desktopSnapshotRestoreSelected", { summary }))) return null;
+    return { snapshotId: snapshots[selectedIndex].id };
   }
 
   async function renderRoute(route) {
@@ -2646,8 +2686,11 @@
       }
 
       if (action === "clear-desktop") {
-        if (!window.confirm(t("confirm.desktopClear"))) return;
-        const result = await CCApi.clearDesktop();
+        const target = await chooseCodexRestoreTarget();
+        if (!target) return;
+        const result = target.snapshotId
+          ? await CCApi.restoreDesktopSnapshot(target.snapshotId)
+          : await CCApi.clearDesktop();
         const route = routeFromHash();
         if (route === "dashboard") {
           await renderDashboard();

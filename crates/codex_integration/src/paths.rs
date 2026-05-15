@@ -1,4 +1,4 @@
-//! 路径解析:`~/.codex/{config.toml,auth.json}` + `~/.codex-app-transfer/codex-snapshot/`.
+//! 路径解析:`~/.codex/{config.toml,auth.json}` + 本应用 Codex 快照目录.
 
 use std::path::{Path, PathBuf};
 
@@ -11,10 +11,14 @@ pub struct CodexPaths {
     pub config_toml: PathBuf,
     pub auth_json: PathBuf,
     pub model_catalog_json: PathBuf,
+    /// Legacy single-snapshot path kept for upgrade compatibility.
     pub snapshot_dir: PathBuf,
     pub snapshot_config: PathBuf,
     pub snapshot_auth: PathBuf,
     pub snapshot_manifest: PathBuf,
+    pub snapshots_dir: PathBuf,
+    pub active_snapshots_dir: PathBuf,
+    pub recovery_snapshots_dir: PathBuf,
 }
 
 impl CodexPaths {
@@ -33,6 +37,9 @@ impl CodexPaths {
         let codex_home = home.join(".codex");
         let app_home = home.join(".codex-app-transfer");
         let snapshot_dir = app_home.join("codex-snapshot");
+        let snapshots_dir = app_home.join("codex-snapshots");
+        let active_snapshots_dir = snapshots_dir.join("active");
+        let recovery_snapshots_dir = snapshots_dir.join("recovery");
         Self {
             config_toml: codex_home.join("config.toml"),
             auth_json: codex_home.join("auth.json"),
@@ -41,6 +48,9 @@ impl CodexPaths {
             snapshot_auth: snapshot_dir.join("auth.json"),
             snapshot_manifest: snapshot_dir.join("manifest.json"),
             snapshot_dir,
+            snapshots_dir,
+            active_snapshots_dir,
+            recovery_snapshots_dir,
             codex_home,
             app_home,
         }
@@ -69,6 +79,18 @@ mod tests {
         assert_eq!(
             p.snapshot_manifest,
             PathBuf::from("/x/.codex-app-transfer/codex-snapshot/manifest.json")
+        );
+        assert_eq!(
+            p.snapshots_dir,
+            PathBuf::from("/x/.codex-app-transfer/codex-snapshots")
+        );
+        assert_eq!(
+            p.active_snapshots_dir,
+            PathBuf::from("/x/.codex-app-transfer/codex-snapshots/active")
+        );
+        assert_eq!(
+            p.recovery_snapshots_dir,
+            PathBuf::from("/x/.codex-app-transfer/codex-snapshots/recovery")
         );
     }
 }
