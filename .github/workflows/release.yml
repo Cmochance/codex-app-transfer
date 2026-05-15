@@ -67,6 +67,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Install Tauri Linux deps (with retry)
         if: matrix.os == 'ubuntu-22.04'
         timeout-minutes: 8
@@ -122,6 +126,10 @@ jobs:
           fi
           echo "version=$V" >> $GITHUB_OUTPUT
           echo "Resolved VERSION=$V"
+
+      - name: Verify release version sources
+        shell: bash
+        run: python3 scripts/check_release_version.py "${{ steps.ver.outputs.version }}"
 
       - name: Import macOS signing cert
         if: startsWith(matrix.os, 'macos-') && env.CERT != ''
@@ -331,6 +339,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - uses: actions/download-artifact@v4
         with:
           path: dist-incoming
@@ -353,6 +365,10 @@ jobs:
             V="${GITHUB_REF_NAME#v}"
           fi
           echo "version=$V" >> $GITHUB_OUTPUT
+
+      - name: Verify release version sources
+        shell: bash
+        run: python3 scripts/check_release_version.py "${{ steps.ver.outputs.version }}"
 
       - name: Write release signing key
         env:

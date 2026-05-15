@@ -9,6 +9,10 @@ PyInstaller / Python venv 来出三平台 release;本地 Makefile 只保留:
 
 唯一版本源:`src-tauri/Cargo.toml` 的 `[package].version`(`tauri.conf.json`
 也带一份,**保持两处一致**;后续 Phase 4 会做单向同步)。
+发布工作流会在打包前执行 `python3 scripts/check_release_version.py <version>`,
+如果 workflow/tag 解析出的版本、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`
+三者不一致,会直接 fail-fast,避免再次出现资产文件名 / `latest.json`
+是新版本但安装包内部版本仍是旧版本的 release。
 
 ## 三平台 release 触发
 
