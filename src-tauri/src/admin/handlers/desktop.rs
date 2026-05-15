@@ -36,12 +36,12 @@ use super::super::registry_io::save_for_test as save_registry;
 use super::super::registry_io::{load as load_registry, with_config_write, ConfigMutation};
 use super::super::state::AdminState;
 use super::common::{active_provider_name, err, read_setting_bool, APP_VERSION};
-use codex_app_transfer_registry::DEFAULT_UPDATE_URL;
 use super::providers::{
     active_provider, provider_api_key, provider_default_model, provider_display_name,
     provider_index, provider_model_capabilities, provider_model_mappings, provider_supports_1m,
 };
 use super::proxy::{ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed};
+use codex_app_transfer_registry::DEFAULT_UPDATE_URL;
 
 const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 

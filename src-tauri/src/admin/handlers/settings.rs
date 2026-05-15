@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
-use codex_app_transfer_registry::{config_dir, normalize_model_mappings, DEFAULT_UPDATE_URL, RawConfig};
+use codex_app_transfer_registry::{
+    config_dir, normalize_model_mappings, RawConfig, DEFAULT_UPDATE_URL,
+};
 use serde_json::{json, Value};
 
 #[cfg(test)]

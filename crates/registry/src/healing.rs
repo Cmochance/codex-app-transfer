@@ -204,10 +204,7 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
 pub fn heal_legacy_update_url(cfg: &mut Value) -> bool {
     const LEGACY_OWNERS: &[&str] = &["lonr-6/codex-app-transfer"];
 
-    let Some(settings) = cfg
-        .get_mut("settings")
-        .and_then(|v| v.as_object_mut())
-    else {
+    let Some(settings) = cfg.get_mut("settings").and_then(|v| v.as_object_mut()) else {
         return false;
     };
 
@@ -215,9 +212,7 @@ pub fn heal_legacy_update_url(cfg: &mut Value) -> bool {
         return false;
     };
 
-    let is_legacy = LEGACY_OWNERS
-        .iter()
-        .any(|owner| update_url.contains(owner));
+    let is_legacy = LEGACY_OWNERS.iter().any(|owner| update_url.contains(owner));
 
     if !is_legacy {
         return false;

@@ -19,7 +19,10 @@ fn main() {
         "https://github.com/{}/releases/latest/download/latest.json",
         repo
     );
-    println!("cargo:rustc-env=CODEX_APP_TRANSFER_DEFAULT_UPDATE_URL={}", update_url);
+    println!(
+        "cargo:rustc-env=CODEX_APP_TRANSFER_DEFAULT_UPDATE_URL={}",
+        update_url
+    );
     println!("cargo:rerun-if-env-changed=CODEX_APP_TRANSFER_REPO");
 
     tauri_build::build()

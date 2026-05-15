@@ -2,7 +2,7 @@
 
 use codex_app_transfer_registry::{
     config_file, heal_builtin_provider_fields, heal_legacy_update_url, load_raw_config,
-    save_raw_config, DEFAULT_UPDATE_URL, RawConfig,
+    save_raw_config, RawConfig, DEFAULT_UPDATE_URL,
 };
 use serde_json::{json, Value};
 
