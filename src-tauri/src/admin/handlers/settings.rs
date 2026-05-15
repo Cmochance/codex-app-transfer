@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
-use codex_app_transfer_registry::{config_dir, normalize_model_mappings, RawConfig};
+use codex_app_transfer_registry::{config_dir, normalize_model_mappings, DEFAULT_UPDATE_URL, RawConfig};
 use serde_json::{json, Value};
 
 #[cfg(test)]
@@ -57,7 +57,7 @@ pub(super) fn default_config_value() -> Value {
            "restoreCodexOnExit": true,
            "autoUnlockCodexPlugins": false,
             "autoWakeCodexPet": true,
-           "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+           "updateUrl": DEFAULT_UPDATE_URL
         }
     })
 }
@@ -479,7 +479,7 @@ mod tests {
                 "autoApplyOnStart": true,
                 "exposeAllProviderModels": false,
                 "restoreCodexOnExit": true,
-                "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+                "updateUrl": DEFAULT_UPDATE_URL
             }
         })
     }

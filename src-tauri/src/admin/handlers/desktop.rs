@@ -36,6 +36,7 @@ use super::super::registry_io::save_for_test as save_registry;
 use super::super::registry_io::{load as load_registry, with_config_write, ConfigMutation};
 use super::super::state::AdminState;
 use super::common::{active_provider_name, err, read_setting_bool, APP_VERSION};
+use codex_app_transfer_registry::DEFAULT_UPDATE_URL;
 use super::providers::{
     active_provider, provider_api_key, provider_default_model, provider_display_name,
     provider_index, provider_model_capabilities, provider_model_mappings, provider_supports_1m,
@@ -940,7 +941,7 @@ mod tests {
                 "autoApplyOnStart": true,
                 "exposeAllProviderModels": false,
                 "restoreCodexOnExit": true,
-                "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+                "updateUrl": DEFAULT_UPDATE_URL
             }
         })
     }

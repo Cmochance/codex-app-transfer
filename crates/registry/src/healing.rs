@@ -190,6 +190,51 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
     changed
 }
 
+/// 迁移历史 fork 残留的 `settings.updateUrl` 到当前规范仓库（Cmochance）。
+///
+/// 背景：本项目由 lonr-6/cc-desktop-switch 及后续 fork 演化而来，早期默认
+/// updateUrl 指向 `lonr-6/codex-app-transfer`。用户老 config.json 里残留该值时，
+/// “设置页检查更新”就会去另一个项目的 releases 拉 latest.json（用户反馈的根源）。
+///
+/// 策略：
+/// - 只认已知 legacy owner（"lonr-6/codex-app-transfer" 等）才迁移，避免误伤
+///   用户故意指向自己 fork 的自定义 updateUrl。
+/// - 有变更就写回磁盘（与 provider healing 一致的 aggressive 策略）。
+/// - 未来若出现新 legacy，可在此列表追加。
+pub fn heal_legacy_update_url(cfg: &mut Value) -> bool {
+    const LEGACY_OWNERS: &[&str] = &["lonr-6/codex-app-transfer"];
+
+    let Some(settings) = cfg
+        .get_mut("settings")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return false;
+    };
+
+    let Some(update_url) = settings.get_mut("updateUrl").and_then(|v| v.as_str()) else {
+        return false;
+    };
+
+    let is_legacy = LEGACY_OWNERS
+        .iter()
+        .any(|owner| update_url.contains(owner));
+
+    if !is_legacy {
+        return false;
+    }
+
+    // 统一写回当前库常量（Cmochance）。注意：这里直接用字符串字面，
+    // 因为 healing 运行在 registry 上下文，build-time env 只对 Tauri binary 有效。
+    // 这样保证 healing 永远把老用户“拉回”官方源，实现“统一为 Cmochance”。
+    let canonical = crate::DEFAULT_UPDATE_URL;
+    if update_url == canonical {
+        return false;
+    }
+
+    settings.insert("updateUrl".to_owned(), Value::String(canonical.to_owned()));
+    true
+}
+
 /// provider 是否有合法的 `grokWeb.cookies.sso` JWT(非空 string)。
 ///
 /// 用于 [`heal_builtin_provider_fields`] 检测 grok-web preset 半残不变量:

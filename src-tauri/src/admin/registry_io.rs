@@ -1,7 +1,8 @@
 //! 用户注册表 (~/.codex-app-transfer/config.json) 读写助手.
 
 use codex_app_transfer_registry::{
-    config_file, heal_builtin_provider_fields, load_raw_config, save_raw_config, RawConfig,
+    config_file, heal_builtin_provider_fields, heal_legacy_update_url, load_raw_config,
+    save_raw_config, DEFAULT_UPDATE_URL, RawConfig,
 };
 use serde_json::{json, Value};
 
@@ -22,7 +23,7 @@ pub fn load() -> Result<RawConfig, String> {
                 "autoApplyOnStart": true,
                 "exposeAllProviderModels": false,
                 "restoreCodexOnExit": true,
-                "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+                "updateUrl": DEFAULT_UPDATE_URL
             }
         }));
     }
@@ -34,7 +35,14 @@ pub fn load() -> Result<RawConfig, String> {
     //
     // 策略:有改动 → **写回磁盘**(2026-05-08 用户确认:这类内部协议路由信号
     // 不支持用户自定义,直接覆盖磁盘旧配置,以后不再因残留而出错)。
-    if heal_builtin_provider_fields(&mut cfg) {
+    let mut healed = heal_builtin_provider_fields(&mut cfg);
+    // 迁移老 fork 的 updateUrl（lonr-6 等）→ Cmochance（任务 2+3）。
+    // 与 provider healing 相同策略：有变更就尽量写回磁盘，避免用户下次启动
+    // 仍被残留的旧仓库 URL 带偏“检查更新”。
+    if heal_legacy_update_url(&mut cfg) {
+        healed = true;
+    }
+    if healed {
         // 写回失败不致命:内存里 heal 过的版本仍可用,下次启动再尝试同步盘
         if let Err(e) = save_raw_config(&path, &cfg) {
             eprintln!("warning: write back config.json after heal failed (in-memory healed version still in effect for this session): {e}");

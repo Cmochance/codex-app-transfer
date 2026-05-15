@@ -247,6 +247,17 @@ pub(super) fn launch_update_installer(
         .map_err(|e| format!("launch installer failed: {e}"))
 }
 
+/// 返回当前 binary 真正使用的“规范更新地址”。
+/// 优先级：
+/// 1. build.rs 通过 CODEX_APP_TRANSFER_REPO 注入的 `CODEX_APP_TRANSFER_DEFAULT_UPDATE_URL`
+///    （CI release 时等于实际发布仓库的 latest.json，满足“跟随当前发布仓库”）
+/// 2. 库常量 DEFAULT_UPDATE_URL（Cmochance，统一官方源，本地 dev fallback）。
+pub(super) fn canonical_update_url() -> String {
+    option_env!("CODEX_APP_TRANSFER_DEFAULT_UPDATE_URL")
+        .map(str::to_owned)
+        .unwrap_or_else(|| DEFAULT_UPDATE_URL.to_owned())
+}
+
 pub(super) fn configured_update_url(input: Option<&str>) -> String {
     if let Some(url) = input.map(str::trim).filter(|url| !url.is_empty()) {
         return url.to_owned();
@@ -261,7 +272,7 @@ pub(super) fn configured_update_url(input: Option<&str>) -> String {
                 .filter(|url| !url.is_empty())
                 .map(str::to_owned)
         })
-        .unwrap_or_else(|| DEFAULT_UPDATE_URL.to_owned())
+        .unwrap_or_else(canonical_update_url)
 }
 
 pub(super) async fn fetch_latest_json(

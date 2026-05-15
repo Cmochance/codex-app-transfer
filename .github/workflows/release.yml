@@ -165,6 +165,10 @@ jobs:
           APPLE_SIGNING_IDENTITY_RAW: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER_RAW: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_RAW: ${{ secrets.APPLE_API_KEY }}
+          # 让 binary 里 baked 的 updateUrl 默认值跟随本次实际发布的仓库（任务 1+4）。
+          # 结合 src-tauri/build.rs 的 option_env! 实现：用户下载这个 release 的 .app/.exe
+          # 后，设置页“检查更新”默认就去本仓库的 releases 拉 latest.json。
+          CODEX_APP_TRANSFER_REPO: ${{ github.repository }}
         run: |
           [[ -n "$APPLE_SIGNING_IDENTITY_RAW" ]] && export APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY_RAW"
           [[ -n "$APPLE_API_ISSUER_RAW" ]] && export APPLE_API_ISSUER="$APPLE_API_ISSUER_RAW"
