@@ -149,11 +149,22 @@ pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
 
     let snapshot_config = read_snapshot_config(paths).unwrap_or_default();
     let snapshot_auth = read_snapshot_auth(paths);
-    restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth)?;
+    restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth, RestoreMode::Auto)?;
 
     drop_snapshot(paths)?;
     clear_catalog_models(&paths.model_catalog_json)?;
     Ok(true)
+}
+
+/// 区分两种 restore 流程:
+/// - `Auto`:stop app 自动 restore。快照里没有 `model` 时保留当前 CLI 写入的活跃
+///   选择(避免擦掉用户用 Codex CLI picker 选过的模型)。
+/// - `Manual`:UI 手动选某个 snapshot 恢复。语义是"完全回到那个快照的状态",
+///   `model` 也必须严格按快照恢复(没有就移除)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreMode {
+    Auto,
+    Manual,
 }
 
 /// 人工恢复指定快照。恢复成功后默认删除该快照;当 `drop_remaining_snapshots`
@@ -174,7 +185,7 @@ pub fn restore_codex_snapshot(
     }
     let snapshot_config = read_snapshot_config_by_id(paths, snapshot_id).unwrap_or_default();
     let snapshot_auth = read_snapshot_auth_by_id(paths, snapshot_id);
-    restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth)?;
+    restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth, RestoreMode::Manual)?;
     if drop_remaining_snapshots {
         drop_all_snapshots(paths)?;
     } else {
@@ -205,16 +216,22 @@ fn restore_from_snapshot_values(
     paths: &CodexPaths,
     snapshot_config: &str,
     snapshot_auth: &serde_json::Value,
+    mode: RestoreMode,
 ) -> Result<(), CodexError> {
     // 1. config.toml:对每个 managed key 用快照里的字面量还原;快照里没有就删。
     //
-    // `model` 是例外:apply 不写它,但用户在 app 接管期间可能通过 Codex CLI 模型
-    // 选择器选过模型,CLI 会把选择 `model = "..."` 写回 config.toml。若快照里没有
-    // `model`,我们不应擦掉用户的活跃选择,只在快照里有时还原回原值。
+    // `model` 在 `RestoreMode::Auto`(stop app 自动 restore)下是例外:apply 不写
+    // 它,但用户在 app 接管期间可能通过 Codex CLI 模型选择器选过模型,CLI 会把
+    // 选择 `model = "..."` 写回 config.toml。若快照里没有 `model`,自动 restore
+    // 不应擦掉用户的活跃选择,只在快照里有时还原回原值。
+    //
+    // `RestoreMode::Manual`(UI 手动选某个 snapshot 恢复)的语义是"完全回到那个
+    // 快照的状态",所以 `model` 也必须严格按快照恢复 —— 没有就移除,否则用户选
+    // 老备份反而沿用了 post-snapshot 的 model 映射。
     for key in MANAGED_TOML_KEYS {
         let literal = snapshot_toml_value_literal(snapshot_config, key);
-        match (*key, literal.as_deref()) {
-            ("model", None) => continue,
+        match (*key, literal.as_deref(), mode) {
+            ("model", None, RestoreMode::Auto) => continue,
             _ => sync_root_value(&paths.config_toml, key, literal.as_deref())?,
         }
     }
@@ -887,6 +904,57 @@ mod tests {
         assert!(
             restored.contains("openai_base_url = \"https://stale.example.com/v1\""),
             "openai_base_url 也应退回用户原值"
+        );
+    }
+
+    /// UI 手动选某个 snapshot 恢复时,语义是"完全回到那个快照的状态"。即使快照里
+    /// 没有 `model`,也必须把当前 `model` 移除(否则用户选老备份反而沿用了
+    /// post-snapshot 的 model 映射)。RestoreMode::Auto 才保留 CLI 写入的选择,
+    /// Manual 不应享受这个例外。
+    #[test]
+    fn manual_restore_strictly_matches_snapshot_even_for_model_key() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(
+            &paths.config_toml,
+            "openai_base_url = \"original\"\n",
+        )
+        .unwrap();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        // 模拟接管期间 CLI picker 写入的活跃 model。
+        sync_root_value(&paths.config_toml, "model", Some("\"deepseek-v4-pro\"")).unwrap();
+
+        // 拿到 active snapshot id,走手动恢复路径。
+        let snapshots = crate::snapshot::list_snapshots(&paths);
+        let snapshot_id = snapshots
+            .iter()
+            .find(|s| s.kind == "active")
+            .expect("apply 应创建 active snapshot")
+            .id
+            .clone();
+        restore_codex_snapshot(&paths, &snapshot_id, false).unwrap();
+
+        let toml = read_toml(&paths);
+        assert!(
+            !toml.contains("model = "),
+            "manual restore 必须严格按快照恢复;快照无 model 时应移除当前值,实际 toml:\n{toml}"
+        );
+        assert!(
+            toml.contains("openai_base_url = \"original\""),
+            "openai_base_url 也按快照退回"
         );
     }
 
