@@ -915,11 +915,7 @@ mod tests {
     fn manual_restore_strictly_matches_snapshot_even_for_model_key() {
         let (_t, paths) = setup();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
-        std::fs::write(
-            &paths.config_toml,
-            "openai_base_url = \"original\"\n",
-        )
-        .unwrap();
+        std::fs::write(&paths.config_toml, "openai_base_url = \"original\"\n").unwrap();
         apply_provider(
             &paths,
             &ApplyConfig {
