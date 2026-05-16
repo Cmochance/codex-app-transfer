@@ -77,6 +77,14 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         sync_root_value(&paths.config_toml, "openai_base_url", Some(&literal))?;
     }
 
+    // 2b. 强制 model_provider = "openai":Codex CLI 只有在 openai provider 下
+    // 才会读 openai_base_url。用户旧 config 里可能残留 model_provider = "custom"
+    // (历史教程 / 旧版 CLI 自己写的),配合 [model_providers.custom] 段会把流量
+    // 旁路到第三方 base_url,导致我们的 proxy 被绕过。Codex CLI 0.126+ 把端点
+    // 从 /v1/responses 切到 /responses,在残留路径上直接表现为 404(issue #178)。
+    // 快照已在第 1 步拿到用户原值,restore 时能完整退回。
+    sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
+
     // 3. config.toml: model_context_window(旧版兼容) + model_catalog_json(Codex 0.128+)
     //
     // catalog 始终写(2026-05-06):之前只在 `supports_1m=true` 时写,导致非 1M
@@ -198,10 +206,17 @@ fn restore_from_snapshot_values(
     snapshot_config: &str,
     snapshot_auth: &serde_json::Value,
 ) -> Result<(), CodexError> {
-    // 1. config.toml:对每个 managed key 用快照里的字面量还原;快照里没有就删
+    // 1. config.toml:对每个 managed key 用快照里的字面量还原;快照里没有就删。
+    //
+    // `model` 是例外:apply 不写它,但用户在 app 接管期间可能通过 Codex CLI 模型
+    // 选择器选过模型,CLI 会把选择 `model = "..."` 写回 config.toml。若快照里没有
+    // `model`,我们不应擦掉用户的活跃选择,只在快照里有时还原回原值。
     for key in MANAGED_TOML_KEYS {
         let literal = snapshot_toml_value_literal(snapshot_config, key);
-        sync_root_value(&paths.config_toml, key, literal.as_deref())?;
+        match (*key, literal.as_deref()) {
+            ("model", None) => continue,
+            _ => sync_root_value(&paths.config_toml, key, literal.as_deref())?,
+        }
     }
 
     // 2. auth.json:对每个 managed key,快照里有就改回快照值,没有就 remove
@@ -814,5 +829,101 @@ mod tests {
         assert_eq!(auth_after["tokens"]["access_token"], "ya29.xxx");
         assert!(auth_after.get("OPENAI_API_KEY").is_none());
         assert!(auth_after.get("auth_mode").is_none());
+    }
+
+    /// issue #178:用户旧 config 残留 `model_provider = "custom"` + `[model_providers.custom]`
+    /// 段时,apply 必须把 `model_provider` 拉到 `"openai"`,否则 Codex CLI 把流量
+    /// 旁路到 custom block 的 base_url,绕过 proxy(0.126+ 表现为 /v1/responses 404)。
+    #[test]
+    fn apply_normalizes_legacy_custom_model_provider() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(
+            &paths.config_toml,
+            concat!(
+                "model_provider = \"custom\"\n",
+                "openai_base_url = \"https://stale.example.com/v1\"\n",
+                "[model_providers.custom]\n",
+                "name = \"Custom\"\n",
+                "base_url = \"https://stale.example.com/v1\"\n",
+            ),
+        )
+        .unwrap();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains("model_provider = \"openai\""),
+            "apply 必须把 model_provider 拉正到 openai,实际 toml:\n{toml}"
+        );
+        assert!(
+            toml.contains("openai_base_url = \"http://127.0.0.1:18080\""),
+            "openai_base_url 应指向 app proxy"
+        );
+        assert!(
+            toml.contains("[model_providers.custom]"),
+            "[model_providers.custom] 不是我们管的段,保留即可"
+        );
+
+        // restore 必须把 model_provider 退回到用户原值 "custom"。
+        restore_codex_state(&paths).unwrap();
+        let restored = read_toml(&paths);
+        assert!(
+            restored.contains("model_provider = \"custom\""),
+            "restore 应把 model_provider 退回为用户原值,实际 toml:\n{restored}"
+        );
+        assert!(
+            restored.contains("openai_base_url = \"https://stale.example.com/v1\""),
+            "openai_base_url 也应退回用户原值"
+        );
+    }
+
+    /// 用户首次安装时 config.toml 没有 `model`,apply 也不写 `model`。但用户在
+    /// Codex CLI 模型选择器里选过模型后,CLI 会把 `model = "..."` 写回 config.toml。
+    /// restore 时快照里没有 `model`,我们不应把 CLI 写入的活跃选择擦掉。
+    #[test]
+    fn restore_preserves_user_model_picked_via_codex_cli() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(
+            &paths.config_toml,
+            "openai_base_url = \"https://api.openai.com/v1\"\n",
+        )
+        .unwrap();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_proxy",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+            },
+        )
+        .unwrap();
+        // 模拟 Codex CLI picker 在 app 接管期间把 model 写回 config.toml。
+        sync_root_value(&paths.config_toml, "model", Some("\"kimi-k2.6\"")).unwrap();
+
+        restore_codex_state(&paths).unwrap();
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains("model = \"kimi-k2.6\""),
+            "快照里没有 model 时,restore 应保留 CLI 写入的活跃选择,实际 toml:\n{toml}"
+        );
     }
 }
