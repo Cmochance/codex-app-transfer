@@ -69,6 +69,9 @@
     // `grok-web` 子串命中 preset id / apiFormat;不加更宽的 `grok` 防误命中用户
     // 自定义 provider 名含 "grok" 但实际不是 web 反代场景
     'grok-web': { logo: 'assets/providers/grok.svg' },
+    // AnyRouter 第三方聚合 — 用 anyrouter.top 官方 logo。
+    // `anyrouter` 子串命中 preset id / name / baseUrl 任一。
+    anyrouter: { logo: 'assets/providers/anyrouter.png' },
   };
 
   function buildCustomThirdPartyPreset() {

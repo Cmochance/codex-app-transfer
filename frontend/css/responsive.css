@@ -1,19 +1,24 @@
 /* ============================================================
    responsive.css — Responsive breakpoints
-   @media 1100 (layer1) + 720 (layer1) + reduced-motion + @media 720 (layer2)
-   ============================================================ */
+   @media 1100 (layer1 small-window 1col fallback)
+   @media 720  (layer1 + layer2 small-window 1col fallback)
+   @media prefers-reduced-motion
+   ============================================================
+   重要: 拆分时为保持原 style.css cascade 语义, 必须删掉 layer2 已经
+   主动重写 grid-template-columns 的 selector (.stats-grid 4列 /
+   .proxy-control 3列 / .mapping-card 3列 / .two-column 1列重复 /
+   .provider-table-header display:none 重复 / .settings-row 因
+   .settings-panel .settings-row 重写)。
+   原 style.css 这些 @media 行规则就是 dead code (layer2 后到赢),
+   保留它们会因 @import 顺序 (responsive.css 最后) 倒序错误覆盖
+   layer2 desktop 多列布局, 让窗口=1100px 时所有 .proxy-control /
+   .stats-grid / .mapping-card 退化成 1 列 (用户实际看到的 regression)。 */
 
 @media (max-width: 1100px) {
   .status-grid,
   .quick-actions,
-  .two-column,
-  .desktop-layout,
-  .stats-grid {
+  .desktop-layout {
     grid-template-columns: 1fr;
-  }
-
-  .provider-table-header {
-    display: none;
   }
 
   .provider-row {
@@ -27,12 +32,6 @@
   .row-actions {
     justify-content: flex-start;
     flex-wrap: wrap;
-  }
-
-  .mapping-card,
-  .proxy-control,
-  .settings-row {
-    grid-template-columns: 1fr;
   }
 
   .proxy-running {
