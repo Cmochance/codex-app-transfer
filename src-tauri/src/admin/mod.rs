@@ -173,18 +173,30 @@ pub fn build_app_router(state: AdminState) -> Router {
         // Antigravity OAuth (login / status / logout / cancel)
         .merge(handlers::antigravity_oauth::routes())
         // Codex AGENTS.md 受管块管理(#24 / #25 Agents tab MVP, 借鉴 borawong/AiMaMi)
-        .route("/api/codex/agents-md/status", get(handlers::agents_md::status))
+        .route(
+            "/api/codex/agents-md/status",
+            get(handlers::agents_md::status),
+        )
         .route(
             "/api/codex/agents-md/preview",
             post(handlers::agents_md::preview),
         )
-        .route("/api/codex/agents-md/apply", post(handlers::agents_md::apply))
+        .route(
+            "/api/codex/agents-md/apply",
+            post(handlers::agents_md::apply),
+        )
         .route(
             "/api/codex/agents-md/rollback",
             post(handlers::agents_md::rollback),
         )
-        .route("/api/codex/agents-md/clear", post(handlers::agents_md::clear))
-        .route("/api/codex/agents-md/history", get(handlers::agents_md::history))
+        .route(
+            "/api/codex/agents-md/clear",
+            post(handlers::agents_md::clear),
+        )
+        .route(
+            "/api/codex/agents-md/history",
+            get(handlers::agents_md::history),
+        )
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)

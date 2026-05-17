@@ -10,17 +10,12 @@
 
 use std::path::PathBuf;
 
-use axum::{
-    extract::Query,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::json;
 
+use super::super::services::managed_block::{ManagedBlock, MarkdownManagedBlock};
 use super::common::err;
-use super::super::services::managed_block::{MarkdownManagedBlock, ManagedBlock};
 
 /// 解析 `~/` 路径(支持 macOS / Linux / Windows USERPROFILE)
 fn resolve_home() -> Option<PathBuf> {

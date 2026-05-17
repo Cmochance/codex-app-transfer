@@ -197,9 +197,8 @@ pub trait ManagedBlock {
         };
         let path = self.target_path();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                ManagedBlockError::Io(format!("mkdir {}: {e}", parent.display()))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| ManagedBlockError::Io(format!("mkdir {}: {e}", parent.display())))?;
         }
         fs::write(path, &new_file)
             .map_err(|e| ManagedBlockError::Io(format!("write {}: {e}", path.display())))?;
@@ -298,9 +297,8 @@ pub trait ManagedBlock {
     fn write_history(&self, history: &[HistoryEntry]) -> Result<(), ManagedBlockError> {
         let path = self.history_path();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                ManagedBlockError::Io(format!("mkdir {}: {e}", parent.display()))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| ManagedBlockError::Io(format!("mkdir {}: {e}", parent.display())))?;
         }
         let json = serde_json::to_string_pretty(history)
             .map_err(|e| ManagedBlockError::Serialization(e.to_string()))?;
@@ -578,7 +576,11 @@ mod tests {
             b.apply(&format!("v{i}")).unwrap();
         }
         let hist = b.read_history().unwrap();
-        assert_eq!(hist.len(), HISTORY_LIMIT, "history must cap at HISTORY_LIMIT");
+        assert_eq!(
+            hist.len(),
+            HISTORY_LIMIT,
+            "history must cap at HISTORY_LIMIT"
+        );
         // 最老的 v0..v4 被丢, 留 v5..v14
         assert_eq!(hist[0].applied_content, "v5");
         assert_eq!(hist.last().unwrap().applied_content, "v14");
