@@ -142,7 +142,15 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
 /// 还原成功后清掉快照。
 pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
     if !has_snapshot(paths) {
-        // 没快照时退化为旧版"删除我们的 key"逻辑,与 Python 行为对齐
+        // 没快照时退化为旧版"删除我们的 key"逻辑,与 Python 行为对齐。
+        //
+        // ⚠️ **layered defense 注意(防回归)**:`desktop_clear` handler
+        // (src-tauri desktop.rs:910) 已在 has_snapshot=false 时**先 noop
+        // 返回**不调本函数,守门 follow-up #28(用户从未 apply 但手写过
+        // ~/.codex/config.toml managed key 时不应被清)。**不要**因为
+        // "外层已 guard 这里 fallback 是 dead code"就 DRY 删掉本分支 ——
+        // 其他 caller (测试 / 其它 endpoint / 未来新 handler) 仍可能直
+        // 接调 restore_codex_state,本兜底保持 Python 行为兼容。
         clear_managed_codex_state(paths)?;
         return Ok(false);
     }

@@ -22,6 +22,11 @@ use crate::CodexError;
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
+/// `gc_trash_older_than` 的默认保留天数 — daemon startup 调一次时用。
+/// 30 天是"误点 cleanup_all 后用户还有月内时间发现并从 trash/ 恢复"的
+/// 平衡点。若未来开 UI/CLI 配置入口,改 caller 传值,这条常量做 fallback。
+pub const TRASH_RETENTION_DAYS: u64 = 30;
+
 static CURRENT_SESSION_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -249,11 +254,28 @@ fn move_dir_to_trash(src: &Path, dst: &Path) -> Result<(), CodexError> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if std::fs::rename(src, dst).is_ok() {
-        return Ok(());
-    }
-    copy_dir_recursive(src, dst)?;
-    std::fs::remove_dir_all(src)?;
+    // rename 成功直接返。失败原因(跨 FS EXDEV / 权限 EACCES / 磁盘满 ENOSPC /
+    // Windows ERROR_SHARING_VIOLATION 等)在 fallback 失败时拼进 err message
+    // 防丢上下文 —— 之前 `.is_ok()` 直接吞所有 rename err 让 debug 无从下手
+    // (silent-failure-hunter review H1)。
+    let rename_err = match std::fs::rename(src, dst) {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    copy_dir_recursive(src, dst).map_err(|copy_err| {
+        CodexError::Io(std::io::Error::other(format!(
+            "move_dir_to_trash: rename failed ({rename_err}), copy fallback also failed: {copy_err}"
+        )))
+    })?;
+    std::fs::remove_dir_all(src).map_err(|remove_err| {
+        // copy 成功但 src 删失败 → trash 有副本 + src 残留,语义破。caller 应
+        // 拿 err message 提示用户手动清理 src 防 has_snapshot 误判 active 仍存在
+        // (silent-failure-hunter review H2)。
+        CodexError::Io(std::io::Error::other(format!(
+            "move_dir_to_trash: rename failed ({rename_err}), copy ok but src removal failed: {remove_err}. \
+             trash 已有副本,src 残留需手动清理避免 has_snapshot 误判"
+        )))
+    })?;
     Ok(())
 }
 
@@ -275,30 +297,39 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), CodexError> {
 
 /// GC `trash/` 下 mtime 超过 `retention_days` 天的 bucket。
 ///
-/// 返删除的 bucket 数(诊断用)。任何子目录 remove 失败仅 warn 不 fail —
-/// trash GC 不是关键路径,部分失败不应该阻塞 caller。
+/// 返 `(removed, failed)` 计数:成功删的 bucket 数 + 应删但失败的 bucket 数。
+/// 任何子目录 remove 失败不 propagate(GC 不是关键路径),但**计数失败**让
+/// caller 能 log 区分 "trash 是空(removed=0/failed=0)" vs "GC 跑了但全
+/// 失败(removed=0/failed=N)"。修 silent-failure-hunter review H3。
 ///
-/// 建议 caller:daemon / app 启动时调一次 `gc_trash_older_than(paths, 30)`。
-pub fn gc_trash_older_than(paths: &CodexPaths, retention_days: u64) -> usize {
+/// 入参 `retention_days` 极大值溢出 → 返 (0, 0),语义"留所有 bucket"。
+///
+/// 建议 caller:daemon / app 启动时调一次 `gc_trash_older_than(paths,
+/// TRASH_RETENTION_DAYS)`。
+pub fn gc_trash_older_than(paths: &CodexPaths, retention_days: u64) -> (usize, usize) {
     let Ok(read) = std::fs::read_dir(&paths.trash_snapshots_dir) else {
-        return 0;
+        return (0, 0);
     };
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(retention_days * 86_400));
+    let cutoff = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(
+        retention_days.saturating_mul(86_400),
+    ));
     let Some(cutoff) = cutoff else {
-        return 0;
+        return (0, 0);
     };
     let mut removed = 0usize;
+    let mut failed = 0usize;
     for entry in read.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
         if mtime < cutoff {
             if std::fs::remove_dir_all(entry.path()).is_ok() {
                 removed += 1;
+            } else {
+                failed += 1;
             }
         }
     }
-    removed
+    (removed, failed)
 }
 
 fn read_manifest_from_dir(dir: &Path) -> Result<SnapshotManifest, CodexError> {
@@ -658,8 +689,9 @@ mod tests {
         f.set_modified(ancient).unwrap();
         drop(f);
 
-        let removed = gc_trash_older_than(&paths, 30);
+        let (removed, failed) = gc_trash_older_than(&paths, 30);
         assert_eq!(removed, 1, "应该清掉 1 个 100 天老 bucket");
+        assert_eq!(failed, 0, "无 remove 失败");
         assert!(!old.exists(), "old bucket 应已被清");
         assert!(fresh.exists(), "fresh bucket 必须保留");
     }

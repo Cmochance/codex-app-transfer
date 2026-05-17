@@ -29,7 +29,7 @@ pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, upsert_
 pub use paths::CodexPaths;
 pub use snapshot::{
     gc_trash_older_than, get_snapshot_status, has_snapshot, list_snapshots, snapshot_codex_state,
-    SnapshotInfo, SnapshotManifest, SnapshotStatus,
+    SnapshotInfo, SnapshotManifest, SnapshotStatus, TRASH_RETENTION_DAYS,
 };
 pub use toml_sync::sync_root_value;
 
