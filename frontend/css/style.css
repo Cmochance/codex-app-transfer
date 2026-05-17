@@ -3067,6 +3067,13 @@ body {
   padding: 14px 0;
 }
 
+.settings-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .settings-actions {
   display: flex;
   flex-wrap: wrap;

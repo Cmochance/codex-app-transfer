@@ -3184,6 +3184,20 @@
     });
     $("#restartReminderLater")?.addEventListener("click", dismissRestartReminderLater);
     $("#restartReminderNow")?.addEventListener("click", restartCodexAppNow);
+    $("#autoUnlockRestartCodex")?.addEventListener("click", async () => {
+      const btn = $("#autoUnlockRestartCodex");
+      const original = btn?.textContent;
+      try {
+        if (btn) { btn.disabled = true; btn.textContent = t("restartReminder.restarting") || "重启中…"; }
+        await CCApi.restartCodexApp();
+        showToast(t("toast.codexAppRestartRequested"));
+      } catch (error) {
+        console.error(error);
+        showToast(error.message || t("toast.codexAppRestartFailed"));
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = original || t("settings.autoUnlockRestartCodex"); }
+      }
+    });
 
     $("#confirmDelete").addEventListener("click", async () => {
       if (!pendingDeleteId) return;
