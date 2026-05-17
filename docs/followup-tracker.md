@@ -84,6 +84,12 @@ related_pr: <PR# 或 null>
 - [#25 P2 MCP / Skills / Memories / Agents 四合一管理页(借鉴 AiMaMi)](followup/25-codex-mgmt-four-in-one-page.md) — 用户 Q3 需求,sidebar+lazy+tanstack-query,依赖 #24
 - [#26 P2 Plugins / MCP 跟"协议转发"绑定 — UI / README 显式提示](followup/26-plugins-mcp-protocol-binding-ui-hint.md) — Responses 直连 provider 启 Plugins 工具静默丢,设计性 gap 需提示
 - [#27 P3 打开 Plugins 后 Codex Desktop 二次 splash 根因诊断](followup/27-codex-desktop-double-splash-on-plugin-unlock.md) — 疑似 setAuthMethod 触发 AuthContext 重 mount,先关 unlock 复测验证
+- [#28 P0 账号还原:desktop_clear 无 has_snapshot guard 删用户手写 managed key](followup/28-account-restore-desktop-clear-no-snapshot-guard.md) — UI 点"清除"按钮 + 未 apply 用户的手写配置会丢
+- [#29 P0 账号还原:cleanup_all=true 物理删光所有 snapshot](followup/29-account-restore-cleanup-all-destructive.md) — 缺二次确认 / 软删除,recovery 里真原始可能一起丢
+- [#30 P1 账号还原:snapshot 单点存储无冗余 / 无导出入口](followup/30-account-restore-single-storage-no-redundancy.md) — 卸载 / 换机 / 用户清理 → 真原始永久丢失
+- [#31 P1 账号还原:跨版本 MANAGED_KEYS 升级可能误删旧 snapshot 未记的用户 key](followup/31-account-restore-cross-version-managed-keys.md) — schema_version 无 managed_keys_at_snapshot 字段,版本演化兼容性风险
+- [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
+- [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,推荐 Method 1+6,需 Windows 真机 spike 验
 
 ---
 
