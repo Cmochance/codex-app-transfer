@@ -2,9 +2,21 @@
 id: 28
 priority: P0
 type: bug
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+resolved_pr: 194
+resolved_date: 2026-05-17
+resolution_summary: |
+  PR #194 实施修法 B(minimal noop guard):desktop_clear handler 加
+  has_snapshot 前置判断,false 时直接返结构化 message
+  {success:true, restored:false, message:"no snapshot to clear..."} 不调
+  restore_codex_state 不走 clear_managed_codex_state。P0 核心风险
+  (新用户手写 ~/.codex/config.toml managed key 被 UI 清除按钮一刀删
+  光)已堵。
+  剩余 enhancement 修法 A(pre-clear 备份让"清除"操作可逆 — has_snapshot=
+  false 时先 snapshot 当前 ~/.codex 到 recovery/<timestamp>-pre-clear/
+  再清)未实施,ROI 低(P0 已堵 + 用户场景罕见),真有需求再开新
+  followup,本条目不阻塞 close。
 ---
 
 # 账号还原 D1:`desktop_clear` 无 `has_snapshot` guard,无快照时会删用户手写的 managed key

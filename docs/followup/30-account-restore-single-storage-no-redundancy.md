@@ -2,9 +2,25 @@
 id: 30
 priority: P1
 type: refactor
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+resolved_pr: 201
+resolved_date: 2026-05-17
+resolution_summary: |
+  PR #201 实施跨平台 external_backup_dir 自动镜像。paths.rs 加
+  external_backup_dir 字段,cfg(target_os) 决定路径:
+  - macOS: ~/Library/Application Support/CodexAppTransfer/snapshot-backups/
+  - Windows: %APPDATA%\CodexAppTransfer\snapshot-backups\
+  - Linux: $XDG_DATA_HOME/CodexAppTransfer/snapshot-backups/
+  snapshot_codex_state 写完 active manifest 后调
+  mirror_snapshot_to_external_backup, fire-and-forget silent ignore
+  (主路径已成功不应被 backup 失败阻塞)。
+  不引入 dirs crate 保 codex_integration 边界干净, 自己 env var fallback。
+  P1 核心数据安全风险("~/.codex-app-transfer/ 整目录被用户/卸载脚本/磁盘
+  清理误删 → 真原始账号永久丢失")已堵, 系统级用户数据目录冗余备份给
+  跨机器恢复留路径。
+  剩余 enhancement(UI 导出/导入按钮 + 卸载脚本保留确认)未实施, 真有
+  用户需求再开新 followup, 本条目不阻塞 close。
 ---
 
 # 账号还原 A2 + D4:snapshot 单点存储无冗余,卸载 / 换机 / 用户清除 → 一起丢

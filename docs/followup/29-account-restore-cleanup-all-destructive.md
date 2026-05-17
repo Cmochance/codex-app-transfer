@@ -2,9 +2,27 @@
 id: 29
 priority: P0
 type: bug
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+resolved_pr: 194
+resolved_date: 2026-05-17
+resolution_summary: |
+  PR #194 实施软删除替物理删 + 30 天 GC:
+  - snapshot.rs::drop_all_snapshots 改成 move active/recovery/legacy
+    三目录到 trash/<UTC-timestamp>-cleanup/{active,recovery,legacy}/。
+    跨 FS rename 失败 fallback 到 copy + remove 保证软删除语义。
+  - 加 gc_trash_older_than(paths, retention_days) helper,daemon 启动
+    fire-and-forget 调一次清 >30 天 trash bucket。
+  - paths.rs 加 trash_snapshots_dir 字段。
+  - PR #194 第二轮 review 修 silent-failure-hunter H1/H3 — move_dir_to_
+    trash rename 失败 enriched err message,gc_trash_older_than 返
+    (removed, failed) tuple 让 caller 区分 silent 失败。
+  P0 核心风险("误点 cleanup_all 一次性物理删光所有 recovery 真原始账号
+  备份")已堵 — 30 天 trash 窗口给用户从 ~/.codex-app-transfer/codex-
+  snapshots/trash/ 手动恢复机会。
+  剩余 enhancement(后端 dry-run preview 端点 + UI 二次确认 modal 列出
+  会被删的所有 snapshot 详情)未实施,ROI 低(P0 已堵 + 用户已有 trash
+  恢复窗口),真有需求再开新 followup,本条目不阻塞 close。
 ---
 
 # 账号还原 C5:`desktop_restore` 接 `cleanup_all=true` 物理删光所有 snapshot,无二次确认 / 无软删除
