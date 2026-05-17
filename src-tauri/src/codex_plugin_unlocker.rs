@@ -347,53 +347,159 @@ async fn inject_unlock_script(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     set_status(status, UnlockStatus::Connected).await;
 
+    // 注入脚本 — 解锁 Codex Desktop Plugins 选项卡。
+    //
+    // 算法借鉴 galaxywk223/codex-plugin-unlocker (MIT, 2026-05-11)
+    //   https://github.com/galaxywk223/codex-plugin-unlocker/blob/main/codex_plugin_unlocker/inject/plugin-unlock.js
+    //
+    // 关键差异 vs. 早期版本(找 useState hook 链上的 setAuthMethod setter):
+    // - 新策略走 React Context — 从 plugin 入口 DOM 节点拿 fiber,沿 `fiber.return`
+    //   向上爬,检查每层 `memoizedProps.value` / `pendingProps.value`,找带
+    //   `setAuthMethod` + `authMethod` 字段的对象(即 `AuthContext.Provider` value)
+    // - Codex Desktop 26.513+ 的 React state 结构变了,旧 hook-scan 策略失效;
+    //   Context.Provider 是 React 公开 API,比 hook 链表稳定得多
+    // - 加 DOM-level enable(清 disabled / __reactProps disabled),即使 setter
+    //   找不到也能让按钮可点(strict fallback)
+    // - 加 MutationObserver,SPA 路由跳转重渲时自动重跑
+    //
+    // 异步包装:返回 Promise<bool>,通过 awaitPromise: true 拿到结果。
+    // 内部最多 6 次重试(每次 500ms 间隔)等 plugin 按钮 DOM 出现。
     let unlock_script = r#"
-(function() {
-    function findReactRoots() {
-        const roots = [];
-        document.querySelectorAll('*').forEach(node => {
-            const key = Object.keys(node).find(k =>
-                k.startsWith('__reactContainer') || k.startsWith('__reactFiber')
-            );
-            if (key) roots.push(node[key]);
-        });
-        const bodyKey = Object.keys(document.body).find(k =>
-            k.startsWith('__reactContainer') || k.startsWith('__reactFiber')
-        );
-        if (bodyKey) roots.push(document.body[bodyKey]);
-        return roots;
+(async function() {
+    const MARKER = '__codexAppTransferPluginUnlocker';
+    window[MARKER] = window[MARKER] || { version: '2.1.10', unlocked: false };
+
+    const selectors = {
+        disabledInstallButton: 'button:disabled.w-full.justify-center, [role="button"][aria-disabled="true"].cursor-not-allowed',
+        pluginNavButton: 'nav[role="navigation"] button.h-token-nav-row.w-full',
+        pluginSvgPath: 'svg path[d^="M7.94562 14.0277"]',
+    };
+
+    function reactFiberFrom(element) {
+        const key = Object.keys(element).find((k) => k.startsWith('__reactFiber'));
+        return key ? element[key] : null;
     }
-    function findAuthStateInFiber(fiber) {
-        if (!fiber) return null;
-        let hook = fiber.memoizedState;
-        while (hook) {
-            if (hook.memoizedState && typeof hook.memoizedState === 'object') {
-                const state = hook.memoizedState;
-                if (state.setAuthMethod && typeof state.setAuthMethod === 'function') {
-                    return state;
+    function reactPropsKeyFrom(element) {
+        return Object.keys(element).find((k) => k.startsWith('__reactProps'));
+    }
+    function authContextValueFrom(element) {
+        for (let fiber = reactFiberFrom(element); fiber; fiber = fiber.return) {
+            for (const v of [fiber.memoizedProps?.value, fiber.pendingProps?.value]) {
+                if (v && typeof v === 'object'
+                    && typeof v.setAuthMethod === 'function'
+                    && 'authMethod' in v) {
+                    return v;
                 }
             }
-            hook = hook.next;
-        }
-        let child = fiber.child;
-        while (child) {
-            const result = findAuthStateInFiber(child);
-            if (result) return result;
-            child = child.sibling;
         }
         return null;
     }
-    const roots = findReactRoots();
-    for (const root of roots) {
-        const authState = findAuthStateInFiber(root);
-        if (authState && authState.setAuthMethod) {
-            authState.setAuthMethod('chatgpt');
-            console.log('[CAS PluginUnlock] ✅ Plugins unlocked via setAuthMethod');
-            return true;
+    function spoofChatGPTAuthMethod(element) {
+        const auth = authContextValueFrom(element);
+        if (!auth) return false;
+        if (auth.authMethod === 'chatgpt') { window[MARKER].unlocked = true; return true; }
+        auth.setAuthMethod('chatgpt');
+        window[MARKER].unlocked = true;
+        return true;
+    }
+    function pluginEntryButton() {
+        const byIcon = document.querySelector(
+            selectors.pluginNavButton + ' ' + selectors.pluginSvgPath
+        )?.closest('button');
+        if (byIcon) return byIcon;
+        return Array.from(document.querySelectorAll(selectors.pluginNavButton)).find((b) => {
+            const t = (b.textContent || '').trim();
+            return /^(插件|Plugins)(\s+-\s+.*)?$/i.test(t);
+        }) || null;
+    }
+    function normalizePluginEntryLabel(button) {
+        const node = Array.from(button.querySelectorAll('span, div')).reverse()
+            .flatMap((n) => Array.from(n.childNodes))
+            .find((n) => n.nodeType === 3
+                && /^(插件|Plugins)( - 已解锁| - Unlocked)?$/i.test((n.nodeValue || '').trim()));
+        if (!node) return;
+        const cur = (node.nodeValue || '').trim();
+        node.nodeValue = /^Plugins/i.test(cur) ? 'Plugins' : '插件';
+    }
+    function enablePluginEntry() {
+        const btn = pluginEntryButton();
+        if (!btn) return false;
+        spoofChatGPTAuthMethod(btn);
+        btn.disabled = false;
+        btn.removeAttribute('disabled');
+        btn.style.display = '';
+        btn.querySelectorAll('*').forEach((n) => { n.style.display = ''; });
+        normalizePluginEntryLabel(btn);
+        const propsKey = reactPropsKeyFrom(btn);
+        if (propsKey) { btn[propsKey].disabled = false; }
+        if (btn.dataset.codexAppTransferPluginUnlocked !== 'true') {
+            btn.dataset.codexAppTransferPluginUnlocked = 'true';
+            btn.addEventListener('click', () => spoofChatGPTAuthMethod(btn), true);
+        }
+        return true;
+    }
+    function unblockButtonElement(button) {
+        button.disabled = false;
+        button.removeAttribute('disabled');
+        button.removeAttribute('aria-disabled');
+        button.classList.remove('disabled', 'opacity-50', 'cursor-not-allowed', 'pointer-events-none');
+        button.style.pointerEvents = 'auto';
+        button.tabIndex = 0;
+        const propsKey = reactPropsKeyFrom(button);
+        if (propsKey) {
+            button[propsKey].disabled = false;
+            button[propsKey]['aria-disabled'] = false;
         }
     }
-    console.log('[CAS PluginUnlock] ❌ setAuthMethod not found');
-    return false;
+    function labelForcedInstallButton(button) {
+        const node = Array.from(button.childNodes).find((n) => {
+            const t = (n.nodeValue || '').trim();
+            return n.nodeType === 3
+                && (/^安装\s/.test(t) || /^Install\s/.test(t) || t === '强制安装');
+        });
+        if (node) node.nodeValue = '强制安装';
+    }
+    function unblockPluginInstallButtons() {
+        document.querySelectorAll(selectors.disabledInstallButton).forEach((b) => {
+            const t = (b.textContent || '').trim();
+            if (!/^安装\s/.test(t) && !/^Install\s/.test(t) && t !== '强制安装') return;
+            unblockButtonElement(b);
+            labelForcedInstallButton(b);
+        });
+    }
+    function runUnlock() {
+        try {
+            enablePluginEntry();
+            unblockPluginInstallButtons();
+        } catch (e) {
+            window[MARKER].lastError = String(e?.stack || e);
+        }
+    }
+    function scheduleUnlock() {
+        if (window[MARKER].scanPending) return;
+        window[MARKER].scanPending = true;
+        setTimeout(() => {
+            window[MARKER].scanPending = false;
+            runUnlock();
+        }, 200);
+    }
+
+    // 重试等 plugin 按钮 DOM 出现(SPA 刚加载完时按钮可能还在 lazy mount)
+    for (let i = 0; i < 6; i++) {
+        runUnlock();
+        if (window[MARKER].unlocked) break;
+        await new Promise((r) => setTimeout(r, 500));
+    }
+
+    // SPA 路由跳转 / sidebar 重渲会冲掉我们的 DOM mutation,装 observer 持续 enforce
+    window[MARKER].observer?.disconnect();
+    window[MARKER].observer = new MutationObserver(scheduleUnlock);
+    window[MARKER].observer.observe(
+        document.body || document.documentElement,
+        { childList: true, subtree: true }
+    );
+
+    return window[MARKER].unlocked === true;
 })()
 "#;
 
