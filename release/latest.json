@@ -1,0 +1,76 @@
+{
+  "name": "Codex App Transfer",
+  "version": "1.0.3",
+  "pub_date": "2026-05-02T16:04:01Z",
+  "notes": "Release for Codex App Transfer v1.0.3.",
+  "update_protocol": 1,
+  "minimum_supported_version": "1.0.0",
+  "platforms": {
+    "linux-x86_64": {
+      "assets": [
+        {
+          "name": "Codex-App-Transfer-v1.0.3-Linux-x86_64",
+          "url": "Codex-App-Transfer-v1.0.3-Linux-x86_64",
+          "signature": "Codex-App-Transfer-v1.0.3-Linux-x86_64.sig",
+          "sha256": "cb06e2846014e970049251a7cb2290c643e8195e574456598c40bc52308a455e",
+          "size": 36719272
+        },
+        {
+          "name": "Codex-App-Transfer-v1.0.3-Linux-x86_64.tar.gz",
+          "url": "Codex-App-Transfer-v1.0.3-Linux-x86_64.tar.gz",
+          "signature": "Codex-App-Transfer-v1.0.3-Linux-x86_64.tar.gz.sig",
+          "sha256": "746b626e647c2df3d04bf85eda3623d7e386d405754154bf256e2863ba6eafc1",
+          "size": 36657909
+        }
+      ]
+    },
+    "macos-arm64": {
+      "assets": [
+        {
+          "name": "Codex-App-Transfer-v1.0.3-macOS-arm64.dmg",
+          "url": "Codex-App-Transfer-v1.0.3-macOS-arm64.dmg",
+          "signature": "Codex-App-Transfer-v1.0.3-macOS-arm64.dmg.sig",
+          "sha256": "52ec8d28d99a2f59bea8037416faad0a7bf76e5a8f7cd15f7464694291235c0c",
+          "size": 36169063
+        },
+        {
+          "name": "Codex-App-Transfer-v1.0.3-macOS-arm64.pkg",
+          "url": "Codex-App-Transfer-v1.0.3-macOS-arm64.pkg",
+          "signature": "Codex-App-Transfer-v1.0.3-macOS-arm64.pkg.sig",
+          "sha256": "2730caa11613d08c24627025ca66ae07f3ff688f33f44222ca4254cf3436b746",
+          "size": 32278137
+        }
+      ]
+    },
+    "windows-x64": {
+      "assets": [
+        {
+          "name": "Codex-App-Transfer-v1.0.3-Windows-Portable.zip",
+          "url": "Codex-App-Transfer-v1.0.3-Windows-Portable.zip",
+          "signature": "Codex-App-Transfer-v1.0.3-Windows-Portable.zip.sig",
+          "sha256": "d5d365fdef4ca7f9b2fb7f1e74f7c39e2c77cd1338bbc1dcb4af96c3daace1a7",
+          "size": 24679324
+        },
+        {
+          "name": "Codex-App-Transfer-v1.0.3-Windows-Setup.exe",
+          "url": "Codex-App-Transfer-v1.0.3-Windows-Setup.exe",
+          "signature": "Codex-App-Transfer-v1.0.3-Windows-Setup.exe.sig",
+          "sha256": "4d1d7bab80bb678cbaa8fa146513e2e384cea36570f46ae7213db13d006d13e0",
+          "size": 24768554
+        },
+        {
+          "name": "Codex-App-Transfer-v1.0.3-Windows-x64.exe",
+          "url": "Codex-App-Transfer-v1.0.3-Windows-x64.exe",
+          "signature": "Codex-App-Transfer-v1.0.3-Windows-x64.exe.sig",
+          "sha256": "cdffabd568345e522c1a0c2f8403c301f9e536d3fcdee541bbc9176726096bcc",
+          "size": 24805786
+        }
+      ]
+    }
+  },
+  "signature": {
+    "algorithm": "RSA-PKCS1-V15-SHA256",
+    "public_key": "Codex-App-Transfer-release-public.pem",
+    "format": "base64 raw signature over file bytes"
+  }
+}

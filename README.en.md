@@ -125,6 +125,31 @@ cargo tauri build --bundles nsis,msi         # Windows x64
 cargo tauri build --bundles deb,appimage     # Linux x86_64
 ```
 
+### Tweaking the UI
+
+`frontend/css/` is organized as a small component library — no need to grep the whole `style.css`:
+
+| What to tweak | Where to edit |
+|---|---|
+| Theme colors / radius / shadow / spacing (design tokens) | `frontend/css/tokens.css` (129 vars + 6 themes) |
+| Global reset / body font / focus ring | `frontend/css/base.css` |
+| Buttons / cards / forms / badges / modals etc. | `frontend/css/components/<name>.css` |
+| Page-specific styles for dashboard / providers / proxy / settings / guide | `frontend/css/pages/<route>.css` |
+| Responsive breakpoints (1100px / 720px) | `frontend/css/responsive.css` |
+
+Preview every component + variant + theme switching:
+
+```bash
+# Open directly in your browser (no dev server needed)
+open frontend/gallery.html        # macOS
+xdg-open frontend/gallery.html    # Linux
+start frontend/gallery.html       # Windows
+```
+
+`gallery.html` has a theme picker + dark/light toggle at the top, refresh after editing component css to see changes. `frontend/index.html`'s `<link href="css/style.css">` does not need to change — `style.css` is just an `@import` entry that aggregates every sub-file.
+
+To add a new component: create `components/<name>.css` + add a line `@import url("components/<name>.css");` to `style.css` + add a section in `gallery.html`.
+
 ## Troubleshooting
 
 ### Codex CLI reports `404 Not Found url: http://127.0.0.1:18080/responses`
@@ -154,6 +179,19 @@ v2 only listens on `18080` (forwarding) by default; the admin UI now uses Tauri 
 ### Windows "unknown publisher" warning
 
 The current Windows build is not Authenticode-signed. The Release page provides `.sha256` and `.sig` to verify the installer hasn't been tampered with.
+
+### Self-host / custom update URL
+
+From v2.1.12+ the client **enforces** RSA-3072 PKCS#1-v1.5-SHA256 verification on `latest.json` and every installer. The upgrade flow fetches `<url>.sig` alongside the file and verifies against the build-time embedded official public key (`release/Codex-App-Transfer-release-public.pem`). Failure is fatal — no SHA256-only fallback.
+
+**A custom update URL must be self-signed to work**:
+
+1. Fork the repo and replace `release/Codex-App-Transfer-release-public.pem` with your own public key.
+2. Run `cargo run -p xtask --release -- release-bundle` with the matching private key to sign `latest.json` and every installer.
+3. Rebuild the client so the public key is embedded.
+4. Users point Settings → Update URL at your `latest.json` endpoint.
+
+Design intent: the client trusts only the build-time embedded public key and never lets a runtime URL replace it, blocking MITM rewrites of `latest.json` (the public PEM lives in `release/` but pulling it from the same origin as the update URL would dissolve the trust anchor).
 
 ### Where are the logs?
 

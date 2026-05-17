@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="zh-CN" data-bs-theme="light">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Codex App Transfer — UI 组件库预览</title>
+    <link href="vendor/bootstrap@5.3.3/bootstrap.min.css" rel="stylesheet">
+    <link href="vendor/bootstrap-icons@1.11.3/bootstrap-icons.css" rel="stylesheet">
+    <link rel="icon" href="assets/app-icon.png">
+    <link href="css/style.css" rel="stylesheet">
+    <style>
+      body { display: grid; grid-template-columns: 240px 1fr; height: 100vh; overflow: hidden; flex-direction: row; }
+      .gallery-sidebar { padding: 18px 12px; border-right: 1px solid var(--line); background: var(--surface); overflow-y: auto; }
+      .gallery-sidebar h1 { font-size: 16px; font-weight: 700; margin: 0 0 4px 4px; color: var(--text); }
+      .gallery-sidebar p.gallery-meta { margin: 0 0 16px 4px; color: var(--muted); font-size: 12px; }
+      .gallery-sidebar nav { display: grid; gap: 2px; }
+      .gallery-sidebar nav a { padding: 6px 10px; border-radius: 8px; color: var(--muted); font-size: 13px; font-weight: 600; }
+      .gallery-sidebar nav a:hover { background: var(--primary-soft); color: var(--primary); }
+      .gallery-main { overflow-y: auto; padding: 24px 32px 60px; }
+      .gallery-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; margin-bottom: 24px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--app-bg); z-index: 10; }
+      .gallery-toolbar h2 { margin: 0; font-size: 22px; font-weight: 700; color: var(--text); }
+      .gallery-toolbar-controls { display: flex; gap: 14px; align-items: center; }
+      .gallery-toolbar-controls label { font-size: 12px; color: var(--muted); font-weight: 600; margin-right: 6px; }
+      .gallery-toolbar-controls select { min-width: 110px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); font-size: 13px; }
+      .gallery-toolbar-controls button { padding: 4px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); font-size: 13px; cursor: pointer; }
+      .gallery-section { margin-bottom: 48px; padding: 24px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+      .gallery-section h3 { font-size: 18px; font-weight: 700; margin: 0 0 6px; color: var(--text); }
+      .gallery-section .gallery-section-meta { font-size: 12px; color: var(--muted); margin: 0 0 18px; font-family: "Fira Code", Consolas, monospace; }
+      .gallery-variant { display: flex; flex-direction: column; gap: 8px; padding: 16px; margin: 12px 0; border: 1px dashed var(--line); border-radius: 10px; }
+      .gallery-variant-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+      .gallery-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+      .gallery-grid { display: grid; gap: 12px; }
+    </style>
+  </head>
+  <body data-theme-palette="default">
+    <aside class="gallery-sidebar">
+      <h1>UI 组件库</h1>
+      <p class="gallery-meta">点击切换组件 · 顶部切主题预览</p>
+      <nav>
+        <a href="#section-button">Button</a>
+        <a href="#section-card">Card / Panel</a>
+        <a href="#section-badge">Badge / Status</a>
+        <a href="#section-form">Form Controls</a>
+        <a href="#section-baseurl-menu">BaseURL Menu</a>
+        <a href="#section-info-box">Info Box</a>
+        <a href="#section-segmented">Segmented</a>
+        <a href="#section-switch">Switch</a>
+        <a href="#section-step">Step List</a>
+        <a href="#section-feedback">Feedback Dropzone</a>
+        <a href="#section-update-badge">Update Badge</a>
+        <a href="#section-modal">Modal (restart)</a>
+        <a href="#section-desktop-warning">Desktop Warning</a>
+        <a href="#section-nav">Nav Tabs</a>
+        <a href="#section-page">Page Container</a>
+        <a href="#section-activity">Activity Row</a>
+        <a href="#section-header">App Header</a>
+      </nav>
+    </aside>
+
+    <main class="gallery-main">
+      <div class="gallery-toolbar">
+        <h2>组件预览</h2>
+        <div class="gallery-toolbar-controls">
+          <span>
+            <label>主题</label>
+            <select id="themePicker">
+              <option value="default">Default 蓝</option>
+              <option value="green">Green</option>
+              <option value="orange">Orange</option>
+              <option value="gray">Gray</option>
+              <option value="dark">Dark palette</option>
+              <option value="white">White</option>
+            </select>
+          </span>
+          <button id="darkToggle" type="button"><i class="bi bi-moon"></i> 切深浅</button>
+        </div>
+      </div>
+
+      <!-- BUTTON -->
+      <section id="section-button" class="gallery-section">
+        <h3>Button</h3>
+        <p class="gallery-section-meta">components/button.css · `.btn` + Bootstrap btn-primary/outline/success + `.action-button` / `.btn-lg` / `.button-row`</p>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Variants</span>
+          <div class="gallery-row">
+            <button class="btn btn-primary">Primary</button>
+            <button class="btn btn-outline-primary">Outline</button>
+            <button class="btn btn-success">Success</button>
+            <button class="btn btn-primary" disabled>Disabled</button>
+          </div>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Sizes</span>
+          <div class="gallery-row">
+            <button class="btn btn-primary btn-sm">btn-sm</button>
+            <button class="btn btn-primary">default</button>
+            <button class="btn btn-primary btn-lg action-button">btn-lg / action-button</button>
+          </div>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Button row 布局</span>
+          <div class="button-row">
+            <button class="btn btn-outline-primary">取消</button>
+            <button class="btn btn-primary">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- CARD / PANEL -->
+      <section id="section-card" class="gallery-section">
+        <h3>Card / Panel</h3>
+        <p class="gallery-section-meta">components/card.css · `.panel` / `.status-card` / `.stat-card` / `.terminal-panel` / `.soft-icon`</p>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Panel (普通容器)</span>
+          <div class="panel">
+            <div class="panel-header"><div class="title-with-icon"><span class="soft-icon"><i class="bi bi-box"></i></span><h2>容器标题</h2></div></div>
+            <p style="margin: 14px 0 0; color: var(--muted);">这是 .panel 容器的内容。</p>
+          </div>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Stat card 4 列网格</span>
+          <div class="stats-grid">
+            <div class="stat-card"><i class="bi bi-bar-chart"></i><div><strong>1,234</strong><span>累计请求</span></div></div>
+            <div class="stat-card"><i class="bi bi-clock"></i><div><strong>248ms</strong><span>平均延迟</span></div></div>
+            <div class="stat-card"><i class="bi bi-check2-circle"></i><div><strong>99.2%</strong><span>成功率</span></div></div>
+            <div class="stat-card"><i class="bi bi-cpu"></i><div><strong>3</strong><span>provider</span></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- BADGE -->
+      <section id="section-badge" class="gallery-section">
+        <h3>Badge / Status</h3>
+        <p class="gallery-section-meta">components/badge.css · `.status-badge` / `.hero-status` / `.circle-check` / `.badge-icon` / `.update-status`</p>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Status badge</span>
+          <div class="gallery-row">
+            <span class="status-badge"><i class="bi bi-pause-circle"></i> 待启用</span>
+            <span class="status-badge active"><i class="bi bi-check-circle"></i> 已启用</span>
+          </div>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Hero status (dashboard)</span>
+          <div class="gallery-row">
+            <span class="hero-status"><i class="bi bi-check"></i></span>
+            <span class="hero-status muted"><i class="bi bi-exclamation"></i></span>
+            <span class="circle-check"><i class="bi bi-check"></i></span>
+            <span class="circle-check warning"><i class="bi bi-exclamation"></i></span>
+          </div>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Update status text</span>
+          <p class="update-status">检查中…</p>
+          <p class="update-status available">有新版本 v2.2.0 可用</p>
+        </div>
+      </section>
+
+      <!-- FORM -->
+      <section id="section-form" class="gallery-section">
+        <h3>Form Controls</h3>
+        <p class="gallery-section-meta">components/form.css · `.form-control` / `.form-select` / `.form-label` / `.form-panel` / `.input-with-button`</p>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">基础输入</span>
+          <div class="gallery-grid" style="grid-template-columns: 1fr 1fr;">
+            <div><label class="form-label required">名称</label><input class="form-control" placeholder="My provider"></div>
+            <div><label class="form-label">备注</label><input class="form-control" placeholder="可选"></div>
+          </div>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">下拉</span>
+          <select class="form-select" style="max-width: 320px;"><option>OpenAI 兼容</option><option>Anthropic Messages</option><option>Gemini native</option></select>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">大尺寸 (.form-control-lg compact 38px)</span>
+          <input class="form-control form-control-lg" style="max-width: 420px;" placeholder="API Key sk-xxx">
+        </div>
+      </section>
+
+      <!-- BASEURL MENU -->
+      <section id="section-baseurl-menu" class="gallery-section">
+        <h3>BaseURL Menu</h3>
+        <p class="gallery-section-meta">components/baseurl-menu.css · `.baseurl-input-wrap` 内嵌下拉</p>
+        <div class="gallery-variant">
+          <div class="baseurl-input-wrap open" style="max-width: 480px;">
+            <input class="form-control" value="https://api.openai.com/v1">
+            <button class="baseurl-trigger" type="button"><i class="bi bi-chevron-down"></i></button>
+            <div class="baseurl-menu">
+              <button class="baseurl-option selected" type="button"><span>OpenAI 官方</span><small>https://api.openai.com/v1</small><i class="bi bi-check"></i></button>
+              <button class="baseurl-option" type="button"><span>Azure</span><small>https://&lt;your-resource&gt;.openai.azure.com</small></button>
+              <button class="baseurl-option" type="button"><span>本地中转</span><small>http://localhost:8000/v1</small></button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- INFO BOX -->
+      <section id="section-info-box" class="gallery-section">
+        <h3>Info Box</h3>
+        <p class="gallery-section-meta">components/info-box.css · `.info-box` 内嵌提示</p>
+        <div class="gallery-variant">
+          <div class="info-box"><i class="bi bi-info-circle"></i><p>这是 info-box 提示框,用于在 provider mapping / 表单底部展示说明文字。</p></div>
+        </div>
+      </section>
+
+      <!-- SEGMENTED -->
+      <section id="section-segmented" class="gallery-section">
+        <h3>Segmented Control</h3>
+        <p class="gallery-section-meta">components/segmented.css · `.segmented` 分段按钮 + `.theme-segment` 主题色板</p>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">普通分段</span>
+          <div class="segmented">
+            <button class="btn active">中文</button>
+            <button class="btn">English</button>
+          </div>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">主题色板(完整 6 套)</span>
+          <div class="segmented theme-segment">
+            <button class="btn theme-swatch theme-swatch-default active" type="button"></button>
+            <button class="btn theme-swatch theme-swatch-green" type="button"></button>
+            <button class="btn theme-swatch theme-swatch-orange" type="button"></button>
+            <button class="btn theme-swatch theme-swatch-gray" type="button"></button>
+            <button class="btn theme-swatch theme-swatch-dark" type="button"></button>
+            <button class="btn theme-swatch theme-swatch-white" type="button"></button>
+          </div>
+        </div>
+      </section>
+
+      <!-- SWITCH -->
+      <section id="section-switch" class="gallery-section">
+        <h3>Switch</h3>
+        <p class="gallery-section-meta">components/switch.css · `.switch-label` + `.switch-ui`</p>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">开关状态</span>
+          <div class="gallery-row">
+            <label class="switch-label"><input type="checkbox" checked><span class="switch-ui"></span><span>已开</span></label>
+            <label class="switch-label"><input type="checkbox"><span class="switch-ui"></span><span>已关</span></label>
+          </div>
+        </div>
+      </section>
+
+      <!-- STEP -->
+      <section id="section-step" class="gallery-section">
+        <h3>Step List</h3>
+        <p class="gallery-section-meta">components/step.css · `.mini-steps` + `.mini-step` 用在引导页</p>
+        <div class="gallery-variant">
+          <div class="mini-steps">
+            <div class="mini-step"><span>1</span><i class="bi bi-download"></i><div><strong>下载安装包</strong><p>从 Releases 页选最新 .pkg / .dmg / .exe 下载</p></div></div>
+            <div class="mini-step"><span>2</span><i class="bi bi-gear"></i><div><strong>添加 provider</strong><p>填 API Key + base URL + 模型映射</p></div></div>
+            <div class="mini-step"><span>3</span><i class="bi bi-check2"></i><div><strong>启用并运行</strong><p>点击启用,Codex 自动用此 provider</p></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- FEEDBACK DROPZONE -->
+      <section id="section-feedback" class="gallery-section">
+        <h3>Feedback Dropzone</h3>
+        <p class="gallery-section-meta">components/feedback.css · `.feedback-dropzone` + `.feedback-attachment-*`</p>
+        <div class="gallery-variant">
+          <div class="feedback-dropzone"><p class="feedback-dropzone-hint">把截图 / 日志拖到这里,或点击上传</p></div>
+          <ul class="feedback-attachment-list">
+            <li class="feedback-attachment-item"><i class="bi bi-file-image"></i><span>screenshot.png</span><small>112 KB</small><button class="btn-link">×</button></li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- UPDATE BADGE -->
+      <section id="section-update-badge" class="gallery-section">
+        <h3>Update Badge</h3>
+        <p class="gallery-section-meta">components/update-badge.css · `.update-badge` pill 标签(切换器栏 + dashboard 用)</p>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">可点击</span>
+          <button class="update-badge"><i class="bi bi-arrow-up-circle"></i> v2.2.0 可用</button>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">下载中(disabled)</span>
+          <button class="update-badge" disabled>下载中…</button>
+        </div>
+      </section>
+
+      <!-- MODAL -->
+      <section id="section-modal" class="gallery-section">
+        <h3>Modal (restart confirmation)</h3>
+        <p class="gallery-section-meta">components/modal.css · `.restart-modal-content` 配 Bootstrap modal</p>
+        <div class="gallery-variant">
+          <div class="modal show" style="display: block; position: relative; background: rgba(0,0,0,.04); padding: 18px; border-radius: 12px;">
+            <div class="modal-dialog" style="margin: 0 auto;">
+              <div class="modal-content restart-modal-content">
+                <div class="modal-body"><p>已配置变更,是否立即重启 Codex Desktop?</p></div>
+                <div class="modal-footer restart-modal-footer">
+                  <button class="btn restart-modal-later">稍后</button>
+                  <button class="btn restart-modal-now">立即重启</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- DESKTOP WARNING -->
+      <section id="section-desktop-warning" class="gallery-section">
+        <h3>Desktop Warning</h3>
+        <p class="gallery-section-meta">components/desktop-warning.css · `.desktop-warning` 内嵌提示</p>
+        <div class="gallery-variant">
+          <div class="desktop-warning"><i class="bi bi-exclamation-triangle"></i><p>Codex Desktop 未运行,启用此 provider 后请手动启动 Codex。</p></div>
+        </div>
+        <div class="gallery-variant">
+          <span class="gallery-variant-label">Compact variant</span>
+          <div class="desktop-warning compact"><i class="bi bi-info-circle"></i><p>~/.codex/config.toml 已被 Codex App Transfer 接管。</p></div>
+        </div>
+      </section>
+
+      <!-- NAV -->
+      <section id="section-nav" class="gallery-section">
+        <h3>Nav Tabs (Route)</h3>
+        <p class="gallery-section-meta">components/nav.css · `.route-tabs` + `.route-tab` (compact 模式只显图标)</p>
+        <div class="gallery-variant">
+          <nav class="route-tabs">
+            <a href="#" class="route-tab active" title="Dashboard"><i class="bi bi-speedometer2"></i><span>仪表盘</span></a>
+            <a href="#" class="route-tab" title="Providers"><i class="bi bi-plug"></i><span>提供商</span></a>
+            <a href="#" class="route-tab" title="Forwarding"><i class="bi bi-broadcast-pin"></i><span>转发</span></a>
+            <a href="#" class="route-tab" title="Settings"><i class="bi bi-gear"></i><span>设置</span></a>
+          </nav>
+        </div>
+      </section>
+
+      <!-- PAGE -->
+      <section id="section-page" class="gallery-section">
+        <h3>Page Container</h3>
+        <p class="gallery-section-meta">components/page.css · `.page` + `.page-title` + `.title-with-back` + `.square-button`</p>
+        <div class="gallery-variant">
+          <div class="page active">
+            <div class="page-title with-action">
+              <div class="title-with-back"><button class="square-button"><i class="bi bi-arrow-left"></i></button><div><h1>页面标题</h1><p>页面副标题描述</p></div></div>
+              <button class="btn btn-primary">主操作</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ACTIVITY -->
+      <section id="section-activity" class="gallery-section">
+        <h3>Activity Row</h3>
+        <p class="gallery-section-meta">components/activity.css · `.activity-list` + `.activity-row` (dashboard 用)</p>
+        <div class="gallery-variant">
+          <div class="activity-list">
+            <div class="activity-row"><time>11:32</time><span>切换到 OpenAI 官方</span></div>
+            <div class="activity-row"><time>10:18</time><span>启用 provider: Azure GPT-4</span></div>
+            <div class="activity-row"><time>09:05</time><span>更新模型映射 default → gpt-4o</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- HEADER -->
+      <section id="section-header" class="gallery-section">
+        <h3>App Header</h3>
+        <p class="gallery-section-meta">components/header.css · `.app-header` + `.brand` + `.brand-mark` + `.brand-title` + `.header-actions` + `.theme-btn`</p>
+        <div class="gallery-variant">
+          <header class="app-header" style="min-height: 60px; padding: 0 24px;">
+            <div class="header-actions-left"><button class="btn btn-outline-primary btn-sm"><i class="bi bi-chat-dots"></i> 反馈</button></div>
+            <a class="brand" href="#"><span class="brand-mark"><img src="assets/app-icon.png" alt=""></span><span class="brand-title">Codex App Transfer</span></a>
+            <div class="header-actions">
+              <span class="header-divider"></span>
+              <button class="theme-btn" type="button" aria-label="Toggle theme"><i class="bi bi-moon"></i></button>
+            </div>
+          </header>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const root = document.documentElement;
+      const body = document.body;
+      const picker = document.getElementById("themePicker");
+      const darkBtn = document.getElementById("darkToggle");
+
+      picker.addEventListener("change", (e) => {
+        body.setAttribute("data-theme-palette", e.target.value);
+      });
+
+      darkBtn.addEventListener("click", () => {
+        const next = root.getAttribute("data-bs-theme") === "dark" ? "light" : "dark";
+        root.setAttribute("data-bs-theme", next);
+        darkBtn.innerHTML = next === "dark" ? '<i class="bi bi-sun"></i> 浅色' : '<i class="bi bi-moon"></i> 深色';
+      });
+    </script>
+  </body>
+</html>

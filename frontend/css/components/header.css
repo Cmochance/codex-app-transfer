@@ -1,0 +1,169 @@
+/* ============================================================
+   components/header.css — Top app header + brand + theme/lang switch
+   layer1: line 77-167  (.app-header / .brand / .header-* / .theme-btn / .text-button)
+   layer2: line 1878-1946 (compact desktop override)
+   ============================================================ */
+
+.app-header {
+  position: relative;
+  flex-shrink: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 92px;
+  padding: 0 34px;
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  border-bottom: 1px solid var(--line);
+  box-shadow: 0 2px 12px rgba(16, 18, 32, .08);
+  backdrop-filter: blur(16px);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 22px;
+  color: var(--text);
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 58px;
+  height: 58px;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #fff;
+  box-shadow: 0 8px 18px rgba(37, 99, 235, .18);
+}
+
+.brand-mark img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.brand-title {
+  font-size: 30px;
+  font-weight: 750;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.header-actions-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.header-divider {
+  width: 1px;
+  height: 36px;
+  background: var(--line);
+}
+
+.text-button {
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.text-button.active {
+  color: var(--primary);
+}
+
+.theme-btn {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 22px;
+  cursor: pointer;
+  transition: background .2s, color .2s;
+}
+
+.theme-btn:hover {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+/* === Layer 2: compact desktop === */
+
+.app-header {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  min-height: 74px;
+  padding: 0 32px;
+  border-bottom: 0;
+  box-shadow: none;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+}
+
+.brand {
+  gap: 10px;
+}
+
+.brand-mark {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  box-shadow: none;
+}
+
+.brand-title {
+  color: var(--primary);
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.header-actions {
+  justify-self: end;
+  gap: 10px;
+}
+
+.lang-switch,
+.header-divider {
+  display: none;
+}
+
+.theme-btn,
+.square-button,
+.icon-action,
+.round-add {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  color: #667085;
+  font-size: 17px;
+}
+
+.round-add {
+  border-color: color-mix(in srgb, var(--primary) 38%, var(--line));
+  border-radius: 12px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 18px;
+  box-shadow: none;
+}
+
+.theme-btn:hover,
+.icon-action:hover,
+.square-button:hover,
+.round-add:hover {
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 38%, var(--line));
+  background: var(--primary-soft);
+}

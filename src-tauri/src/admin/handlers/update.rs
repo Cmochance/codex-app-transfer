@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::super::registry_io::load as load_registry;
+use super::super::signature::verify_signed_bytes;
 use super::common::{err, APP_VERSION};
 
 pub(super) fn current_update_platform() -> String {
@@ -275,13 +276,52 @@ pub(super) fn configured_update_url(input: Option<&str>) -> String {
         .unwrap_or_else(canonical_update_url)
 }
 
+/// 从原 URL 推导对应 `.sig` URL —— 注入到 path 段而非裸字符串拼接,
+/// 这样 query string / fragment 会被保留 (S3 presigned URL / CDN cache-bust
+/// 等场景必要)。
+///
+/// 例:
+/// - `https://host/latest.json?token=abc` → `https://host/latest.json.sig?token=abc`
+/// - `https://host/path/installer.dmg#frag` → `https://host/path/installer.dmg.sig#frag`
+///
+/// codex-bot PR #197 review thread PRRT_kwDOSRcxvM6CpmHk 修 — 之前
+/// `format!("{url}.sig")` 在 query string URL 下生成 `?token=abc.sig` 错路径。
+fn sig_url_for(url: &str) -> Result<String, String> {
+    let mut parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("URL parse for .sig failed: {e}"))?;
+    let new_path = format!("{}.sig", parsed.path());
+    parsed.set_path(&new_path);
+    Ok(parsed.to_string())
+}
+
+/// 拉同名 `.sig` 文件文本(base64 编码 RSA 签名)。
+///
+/// 失败原因:
+/// - 网络 / DNS 错
+/// - HTTP 4xx/5xx (404 = 服务端漏签,严重错误,客户端必须硬拒)
+/// - 响应非合法 UTF-8 文本
+async fn fetch_signature_text(client: &reqwest::Client, sig_url: &str) -> Result<String, String> {
+    let response = client
+        .get(sig_url)
+        .send()
+        .await
+        .map_err(|e| format!("signature request failed: {e}"))?;
+    response
+        .error_for_status_ref()
+        .map_err(|e| format!("signature request failed: {e}"))?;
+    response
+        .text()
+        .await
+        .map_err(|e| format!("signature read failed: {e}"))
+}
+
 pub(super) async fn fetch_latest_json(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<Value, String> {
     let safe_url = validate_update_url(url)?;
     let response = client
-        .get(safe_url)
+        .get(&safe_url)
         .send()
         .await
         .map_err(|e| format!("update URL request failed: {e}"))?;
@@ -292,6 +332,17 @@ pub(super) async fn fetch_latest_json(
         .bytes()
         .await
         .map_err(|e| format!("update URL request failed: {e}"))?;
+
+    // RSA 验签 latest.json (防 MITM 改 url + sha256 推任意 installer)。
+    // sig URL 约定 path 段后缀 `.sig` — 跟 xtask release-bundle 输出对齐, 通过
+    // sig_url_for() 保留 query string / fragment (S3 presigned 等场景必要)。
+    // 失败硬 fail:不 fallback sha256-only 也不接受未签 URL (followup #34 决策)。
+    let sig_url = sig_url_for(&safe_url)?;
+    let sig = fetch_signature_text(client, &sig_url)
+        .await
+        .map_err(|e| format!("latest.json signature unavailable: {e}"))?;
+    verify_signed_bytes(&bytes, &sig).map_err(|e| format!("latest.json signature invalid: {e}"))?;
+
     let data = serde_json::from_slice::<Value>(&bytes).or_else(|_| {
         let without_bom = bytes
             .strip_prefix(&[0xEF, 0xBB, 0xBF])
@@ -349,6 +400,9 @@ pub(super) async fn download_asset_impl(
     platform: &str,
 ) -> Result<Value, String> {
     let url = validate_update_url(asset.get("url").and_then(|v| v.as_str()).unwrap_or(""))?;
+    // 算 sig URL 必须在 url 被 client.get() 消费之前 (后续 line 393 moves url)。
+    // 用 sig_url_for 保留 query string / fragment (S3 presigned 必要)。
+    let installer_sig_url = sig_url_for(&url)?;
     let raw_name = asset
         .get("name")
         .and_then(|v| v.as_str())
@@ -415,10 +469,41 @@ pub(super) async fn download_asset_impl(
     }
     .await;
     if let Err(e) = download_result {
-        let _ = fs::remove_file(&partial);
+        if let Err(rm_err) = fs::remove_file(&partial) {
+            tracing::warn!("failed to remove partial after download err: {rm_err}");
+        }
         return Err(e);
     }
 
+    // RSA 验签 installer bytes — true trust gate, 必须先于 sha256 check:
+    //   - sha256 是 attacker-controlled(它在 latest.json 里, latest.json 改 url
+    //     的同时可同步改 sha256, sha256 mismatch 只是 backup signal)
+    //   - RSA sig 由 CI 用私钥离线签, attacker 无私钥不能伪造
+    // 失败删 partial + 拒绝继续。code-reviewer #196 IMPORTANT-1 修。
+    let installer_sig = fetch_signature_text(client, &installer_sig_url)
+        .await
+        .map_err(|e| {
+            if let Err(rm_err) = fs::remove_file(&partial) {
+                tracing::warn!("failed to remove partial after sig fetch err: {rm_err}");
+            }
+            format!("installer signature unavailable: {e}")
+        })?;
+    let installer_bytes = fs::read(&partial).map_err(|e| {
+        if let Err(rm_err) = fs::remove_file(&partial) {
+            tracing::warn!("failed to remove partial after read err: {rm_err}");
+        }
+        format!("read installer for verify failed: {e}")
+    })?;
+    if let Err(e) = verify_signed_bytes(&installer_bytes, &installer_sig) {
+        if let Err(rm_err) = fs::remove_file(&partial) {
+            tracing::warn!("failed to remove partial after verify err: {rm_err}");
+        }
+        return Err(format!("installer signature invalid: {e}"));
+    }
+
+    // sha256 redundant integrity check — RSA verify 已过,这里只是 defense-in-depth
+    // 跟 release_bundle.rs 写的 sha256 字段对账。expected_sha 缺字段时跳过 (latest.json
+    // 旧 schema 兼容)。
     let actual_sha = file_sha256(&partial)?;
     let expected_sha = asset
         .get("sha256")
@@ -427,7 +512,9 @@ pub(super) async fn download_asset_impl(
         .trim()
         .to_ascii_lowercase();
     if !expected_sha.is_empty() && actual_sha.to_ascii_lowercase() != expected_sha {
-        let _ = fs::remove_file(&partial);
+        if let Err(rm_err) = fs::remove_file(&partial) {
+            tracing::warn!("failed to remove partial after sha mismatch: {rm_err}");
+        }
         return Err("installer checksum mismatch, install cancelled".to_owned());
     }
 
@@ -636,6 +723,30 @@ mod tests {
 
     use super::super::common::random_hex;
 
+    /// sig_url_for 必须把 `.sig` 插到 URL path 段后缀 (而非裸字符串拼接),
+    /// 这样 query string / fragment 在 self-host presigned URL / CDN
+    /// cache-bust 场景下保留。codex-bot PR #197 PRRT_kwDOSRcxvM6CpmHk 修
+    /// 之前 `format!("{url}.sig")` 让 `?token=abc` 变 `?token=abc.sig` 错路径。
+    #[test]
+    fn sig_url_preserves_query_string_and_fragment() {
+        assert_eq!(
+            sig_url_for("https://host/latest.json").unwrap(),
+            "https://host/latest.json.sig"
+        );
+        assert_eq!(
+            sig_url_for("https://host/latest.json?token=abc").unwrap(),
+            "https://host/latest.json.sig?token=abc"
+        );
+        assert_eq!(
+            sig_url_for("https://host/path/to/installer.dmg?ver=1&x=2").unwrap(),
+            "https://host/path/to/installer.dmg.sig?ver=1&x=2"
+        );
+        assert_eq!(
+            sig_url_for("https://host/latest.json#frag").unwrap(),
+            "https://host/latest.json.sig#frag"
+        );
+    }
+
     #[test]
     fn update_platform_version_and_installer_selection_match_legacy() {
         assert_eq!(
@@ -703,33 +814,167 @@ mod tests {
         );
     }
 
+    /// fetch_latest_json + 验签 end-to-end:
+    /// mock server serve `release/latest.json` 真签名 + `release/latest.json.sig`,
+    /// 用 embedded 官方公钥 verify → check_update_impl 返回 v1.0.3 + platforms。
+    /// 任何篡改 (URL host 改, latest.json byte 改) 都会 verify 失败。
     #[test]
-    fn update_check_reads_latest_json_and_platform_assets() {
+    fn fetch_latest_json_verifies_real_signature_end_to_end() {
+        let release_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("release");
+        let json_path = release_dir.join("latest.json");
+        let sig_path = release_dir.join("latest.json.sig");
+        if !json_path.exists() || !sig_path.exists() {
+            eprintln!(
+                "skipping: {} / {} missing (run `cargo run -p xtask -- release-bundle` first)",
+                json_path.display(),
+                sig_path.display()
+            );
+            return;
+        }
+        let json_bytes = std::fs::read(&json_path).unwrap();
+        let sig_text = std::fs::read_to_string(&sig_path).unwrap();
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
-
         runtime.block_on(async {
             use axum::{routing::get, Router};
             use tokio::net::TcpListener;
 
+            let json_bytes_clone = Arc::new(json_bytes);
+            let sig_text_clone = Arc::new(sig_text);
+
+            let app = Router::new()
+                .route("/latest.json", {
+                    let json_bytes = Arc::clone(&json_bytes_clone);
+                    get(move || {
+                        let json_bytes = Arc::clone(&json_bytes);
+                        async move {
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                json_bytes.as_ref().clone(),
+                            )
+                        }
+                    })
+                })
+                .route("/latest.json.sig", {
+                    let sig_text = Arc::clone(&sig_text_clone);
+                    get(move || {
+                        let sig_text = Arc::clone(&sig_text);
+                        async move { sig_text.as_ref().clone() }
+                    })
+                });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+
+            // Happy path: 真签名 + 真 latest.json → check_update_impl 返结果。
+            // 平台用 linux-x86_64 (1.0.3 真 fixture 含此键)。
+            let result = check_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "0.9.0",
+                "linux-x86_64",
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["success"], json!(true));
+            assert_eq!(result["updateAvailable"], json!(true));
+            assert_eq!(result["latestVersion"], json!("1.0.3"));
+            assert_eq!(result["platform"], json!("linux-x86_64"));
+            assert!(
+                result["assets"][0]["sha256"].is_string(),
+                "real latest.json must carry asset sha256"
+            );
+
+            server.abort();
+        });
+    }
+
+    /// 验签失败路径: mock server serve latest.json 但 sig URL 返回随机 base64
+    /// → fetch_latest_json 必须 Err 含 "signature invalid",不能 fallback 用未签数据。
+    #[test]
+    fn fetch_latest_json_rejects_invalid_signature() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            let app = Router::new()
+                .route(
+                    "/latest.json",
+                    get(|| async {
+                        Json(json!({
+                            "version": "9.9.9",
+                            "platforms": {"macos-arm64": {"assets": []}}
+                        }))
+                    }),
+                )
+                .route(
+                    "/latest.json.sig",
+                    get(|| async {
+                        // 合法 base64 但 RSA verify 必失败(随机 384 bytes 非签名)
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                    }),
+                );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let err = check_update_impl(
+                &client,
+                &format!("http://{addr}/latest.json"),
+                "0.0.1",
+                "macos-arm64",
+            )
+            .await
+            .unwrap_err();
+            server.abort();
+            assert!(
+                err.contains("signature"),
+                "verify err must mention signature, got: {err}"
+            );
+        });
+    }
+
+    /// 验签失败路径: sig URL 404 → fetch_latest_json 必须 Err
+    /// "signature unavailable" (不接受未签 URL — followup #34 决策)。
+    #[test]
+    fn fetch_latest_json_rejects_missing_signature() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use axum::{routing::get, Router};
+            use tokio::net::TcpListener;
+
+            // 故意不 register .sig 路由 — 404
             let app = Router::new().route(
                 "/latest.json",
                 get(|| async {
                     Json(json!({
-                        "version": "2.0.2",
-                        "pub_date": "2026-05-06",
-                        "notes": "update notes",
-                        "minimum_supported_version": "2.0.0",
-                        "update_protocol": 1,
-                        "platforms": {
-                            "macos-arm64": {
-                                "assets": [
-                                    {"name": "Codex-App-Transfer.pkg", "url": "https://example.com/Codex-App-Transfer.pkg"}
-                                ]
-                            }
-                        }
+                        "version": "1.0.0",
+                        "platforms": {"macos-arm64": {"assets": []}}
                     }))
                 }),
             );
@@ -743,196 +988,49 @@ mod tests {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap();
-            let result = check_update_impl(
+            let err = check_update_impl(
                 &client,
                 &format!("http://{addr}/latest.json"),
-                "2.0.1",
+                "0.0.1",
                 "macos-arm64",
-            )
-            .await
-            .unwrap();
-            server.abort();
-
-            assert_eq!(result["success"], json!(true));
-            assert_eq!(result["updateAvailable"], json!(true));
-            assert_eq!(result["currentVersion"], json!("2.0.1"));
-            assert_eq!(result["latestVersion"], json!("2.0.2"));
-            assert_eq!(result["platform"], json!("macos-arm64"));
-            assert_eq!(result["pubDate"], json!("2026-05-06"));
-            assert_eq!(result["notes"], json!("update notes"));
-            assert_eq!(result["minimumSupportedVersion"], json!("2.0.0"));
-            assert_eq!(result["updateProtocol"], json!(1));
-            assert_eq!(
-                result["assets"][0]["name"],
-                json!("Codex-App-Transfer.pkg")
-            );
-        });
-    }
-
-    #[test]
-    fn update_downloads_installer_and_checks_sha256() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            use axum::{routing::get, Router};
-            use tokio::net::TcpListener;
-
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let installer_bytes = Arc::new(b"pkg-bytes".to_vec());
-            let installer_sha = format!("{:x}", Sha256::digest(installer_bytes.as_ref()));
-            let app = Router::new()
-                .route(
-                    "/latest.json",
-                    get({
-                        let installer_sha = installer_sha.clone();
-                        move || async move {
-                            Json(json!({
-                                "version": "2.0.2",
-                                "platforms": {
-                                    "macos-arm64": {
-                                        "assets": [{
-                                            "name": "../Codex-App-Transfer.pkg",
-                                            "url": format!("http://{addr}/Codex-App-Transfer.pkg"),
-                                            "sha256": installer_sha,
-                                        }]
-                                    }
-                                }
-                            }))
-                        }
-                    }),
-                )
-                .route(
-                    "/Codex-App-Transfer.pkg",
-                    get({
-                        let installer_bytes = Arc::clone(&installer_bytes);
-                        move || {
-                            let installer_bytes = Arc::clone(&installer_bytes);
-                            async move { installer_bytes.as_ref().clone() }
-                        }
-                    }),
-                );
-            let server = tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
-            });
-
-            let target_dir = std::env::temp_dir().join(format!(
-                "cas-update-download-{}-{}",
-                std::process::id(),
-                random_hex(6)
-            ));
-            let _ = fs::remove_dir_all(&target_dir);
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap();
-            let result = download_update_impl(
-                &client,
-                &format!("http://{addr}/latest.json"),
-                "2.0.1",
-                "macos-arm64",
-                Some(&target_dir),
-            )
-            .await
-            .unwrap();
-            server.abort();
-
-            assert_eq!(result["downloaded"], json!(true));
-            assert_eq!(
-                result["installerAsset"]["name"],
-                json!("../Codex-App-Transfer.pkg")
-            );
-            assert_eq!(result["installerSha256"], json!(installer_sha));
-            assert_eq!(result["installerSize"], json!(9));
-            let installer_path = result["installerPath"].as_str().unwrap();
-            assert!(installer_path.ends_with("Codex-App-Transfer.pkg"));
-            assert_eq!(fs::read(installer_path).unwrap(), b"pkg-bytes");
-            let _ = fs::remove_dir_all(&target_dir);
-        });
-    }
-
-    #[test]
-    fn update_download_rejects_bad_sha_and_unsupported_platform() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            use axum::{routing::get, Router};
-            use tokio::net::TcpListener;
-
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let app = Router::new()
-                .route(
-                    "/latest.json",
-                    get(move || async move {
-                        Json(json!({
-                            "version": "2.0.2",
-                            "platforms": {
-                                "macos-arm64": {
-                                    "assets": [{
-                                        "name": "Codex-App-Transfer.pkg",
-                                        "url": format!("http://{addr}/Codex-App-Transfer.pkg"),
-                                        "sha256": "bad-sha",
-                                    }]
-                                },
-                                "linux-x64": {
-                                    "assets": [{
-                                        "name": "Codex-App-Transfer.AppImage",
-                                        "url": format!("http://{addr}/Codex-App-Transfer.AppImage")
-                                    }]
-                                }
-                            }
-                        }))
-                    }),
-                )
-                .route(
-                    "/Codex-App-Transfer.pkg",
-                    get(|| async { b"pkg-bytes".to_vec() }),
-                );
-            let server = tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
-            });
-
-            let target_dir = std::env::temp_dir().join(format!(
-                "cas-update-bad-sha-{}-{}",
-                std::process::id(),
-                random_hex(6)
-            ));
-            let _ = fs::remove_dir_all(&target_dir);
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap();
-
-            let bad_sha = download_update_impl(
-                &client,
-                &format!("http://{addr}/latest.json"),
-                "2.0.1",
-                "macos-arm64",
-                Some(&target_dir),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(bad_sha, "installer checksum mismatch, install cancelled");
-
-            let unsupported = download_update_impl(
-                &client,
-                &format!("http://{addr}/latest.json"),
-                "2.0.1",
-                "linux-x64",
-                Some(&target_dir),
             )
             .await
             .unwrap_err();
             server.abort();
+            assert!(
+                err.contains("signature unavailable"),
+                "missing sig URL must produce 'signature unavailable', got: {err}"
+            );
+        });
+    }
+
+    /// download_asset_impl unsupported-platform fast-fail 保留(纯 logic,无 verify 依赖)。
+    #[test]
+    fn download_asset_unsupported_platform_rejected() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap();
+            let asset = json!({
+                "name": "Codex-App-Transfer.AppImage",
+                "url": "https://example.com/Codex-App-Transfer.AppImage"
+            });
+            let target_dir = std::env::temp_dir().join(format!(
+                "cas-update-unsupported-{}-{}",
+                std::process::id(),
+                random_hex(6)
+            ));
+            let _ = fs::remove_dir_all(&target_dir);
+            let err = download_asset_impl(&client, &asset, Some(&target_dir), "linux-x64")
+                .await
+                .unwrap_err();
             assert_eq!(
-                unsupported,
+                err,
                 "in-app install is not supported on platform: linux-x64"
             );
             let _ = fs::remove_dir_all(&target_dir);

@@ -41,7 +41,13 @@ include_dir = "0.7"
 mime_guess = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "http2"] }
-sha2 = "0.10"
+# sha2 "oid" feature 让 `Pkcs1v15Sign::new::<Sha256>()` 编译过 (admin/signature.rs
+# 客户端验签需要 OID-tagged Sha256, 跟 xtask/Cargo.toml 设置对齐避免 cross-impl drift)。
+sha2 = { version = "0.10", features = ["oid"] }
+# RSA-3072 PKCS1-v15-SHA256 客户端验签 (update.rs:fetch_latest_json + download_asset_impl
+# 双侧 verify 通过 admin::signature::verify_signed_bytes)。算法跟 xtask/release_bundle.rs
+# 对称: xtask sign side / src-tauri verify side 同 crate 同版本, 防 cross-impl drift。
+rsa = { version = "0.9", features = ["sha2", "pem"] }
 # cross-process file locking — config.json RMW 跨实例(双开 .app)防 lost-update。
 # 进程内 std::sync::Mutex 不管多 OS 进程,fs2::FileExt::lock_exclusive 走 fcntl
 # (POSIX) / LockFileEx (Windows),OS 级独占。

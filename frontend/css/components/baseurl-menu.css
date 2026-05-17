@@ -1,0 +1,87 @@
+/* ============================================================
+   components/baseurl-menu.css — Base URL dropdown picker (used by add-provider form)
+   layer1: line 537-618 (.baseurl-input-wrap / .baseurl-trigger / .baseurl-menu / .baseurl-option)
+   ============================================================ */
+
+.baseurl-input-wrap {
+  position: relative;
+}
+
+.baseurl-input-wrap .form-control {
+  padding-right: 64px;
+}
+
+.baseurl-trigger {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  bottom: 1px;
+  width: 54px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 0 10px 10px 0;
+  background: transparent;
+  color: var(--text);
+}
+
+.baseurl-trigger i {
+  font-size: 16px;
+  transition: transform .18s ease;
+}
+
+.baseurl-input-wrap.open .baseurl-trigger i {
+  transform: rotate(180deg);
+}
+
+.baseurl-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface) 92%, white);
+  box-shadow: 0 16px 34px rgba(15, 23, 42, 0.12);
+}
+
+.baseurl-input-wrap:not(.open) .baseurl-menu {
+  display: none;
+}
+
+.baseurl-option {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.baseurl-option:hover,
+.baseurl-option:focus-visible {
+  background: color-mix(in srgb, var(--primary-soft) 72%, var(--surface));
+  outline: none;
+}
+
+.baseurl-option.selected {
+  font-weight: 700;
+}
+
+.baseurl-option small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.baseurl-option i {
+  justify-self: end;
+  color: var(--primary);
+}

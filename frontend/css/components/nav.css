@@ -1,0 +1,80 @@
+/* ============================================================
+   components/nav.css — Route tabs (top-level navigation pills)
+   layer1: line 176-209  (.route-tabs / .route-tab)
+   layer2: line 1955-1991 (icon-only compact pills)
+   ============================================================ */
+
+.route-tabs {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 28px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.route-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.route-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 44px;
+  padding: 0 15px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  white-space: nowrap;
+  background: var(--surface);
+  font-weight: 650;
+}
+
+.route-tab.active,
+.route-tab:hover {
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--line));
+  background: var(--primary-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
+/* === Layer 2: compact desktop === */
+
+.route-tabs {
+  position: static;
+  justify-self: center;
+  gap: 4px;
+  max-width: 360px;
+  margin: 0;
+  padding: 5px;
+  border-radius: 14px;
+  background: #f4f5f7;
+  transform: none;
+}
+
+.route-tab {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  min-width: 42px;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: #667085;
+  font-size: 17px;
+}
+
+.route-tab span {
+  display: none;
+}
+
+.route-tab.active,
+.route-tab:hover {
+  color: var(--primary);
+  border: 0;
+  background: var(--surface);
+  box-shadow: 0 3px 10px rgba(16, 24, 40, .08);
+}

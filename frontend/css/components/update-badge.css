@@ -1,0 +1,52 @@
+/* ============================================================
+   components/update-badge.css — Update available pill (.update-badge with dark variant)
+   layer2 only: line 2132-2178
+   ============================================================ */
+
+.update-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 8px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #b45309;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  font-size: 12px;
+  font-weight: 650;
+  font-family: inherit;
+  line-height: 1.25;
+  vertical-align: middle;
+  cursor: pointer;
+}
+
+.update-badge:hover {
+  border-color: #fb923c;
+  background: #ffedd5;
+}
+
+.update-badge:disabled {
+  opacity: .7;
+  cursor: not-allowed;
+  border-color: #fed7aa;
+  background: #fff7ed;
+}
+
+.update-badge[hidden] {
+  display: none;
+}
+
+[data-bs-theme="dark"] .update-badge {
+  color: #fdba74;
+  background: rgba(251, 146, 60, .13);
+  border-color: rgba(251, 146, 60, .34);
+}
+
+[data-bs-theme="dark"] .update-badge:hover {
+  background: rgba(251, 146, 60, .2);
+}
+
+[data-bs-theme="dark"] .update-badge:disabled {
+  background: rgba(251, 146, 60, .13);
+}

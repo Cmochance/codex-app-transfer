@@ -1,0 +1,99 @@
+/* ============================================================
+   components/badge.css — Status badges, hero status circles, large dots, status/update badges
+   layer1: line 316-372 (.hero-status / .circle-check / .badge-icon / .large-dot / .hero-line-icon)
+          + 777-794 (.status-badge + .active variant)
+          + 1402-1416 (.update-status text)
+   ============================================================ */
+
+.hero-status,
+.circle-check {
+  display: inline-grid;
+  place-items: center;
+  width: 86px;
+  height: 86px;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--success);
+  font-size: 48px;
+}
+
+.hero-status.muted {
+  background: var(--warning);
+}
+
+.hero-line-icon {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  min-height: 92px;
+  color: var(--muted);
+  font-size: 80px;
+}
+
+.hero-line-icon.success {
+  color: var(--success);
+}
+
+.hero-line-icon.muted {
+  color: var(--muted);
+}
+
+.badge-icon {
+  position: absolute;
+  right: -18px;
+  bottom: 8px;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--success);
+  border: 5px solid var(--surface);
+  font-size: 28px;
+}
+
+.large-dot {
+  display: inline-block;
+  width: 48px;
+  height: 48px;
+  margin-top: 30px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  padding: 10px 14px;
+  border-radius: 10px;
+  color: var(--muted);
+  background: var(--soft-surface);
+  border: 1px solid var(--line);
+  font-weight: 730;
+}
+
+.status-badge.active {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: color-mix(in srgb, var(--success) 35%, var(--line));
+}
+
+.update-status {
+  min-height: 24px;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.update-status:empty {
+  display: none;
+}
+
+.update-status.available {
+  color: var(--success);
+  font-weight: 700;
+}
