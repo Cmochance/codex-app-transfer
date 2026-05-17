@@ -181,7 +181,22 @@ pub(super) fn pick_platform_installer(assets: &[Value], platform: &str) -> Resul
 
 pub(super) fn install_command_parts(path: &str, platform: &str) -> Result<Vec<String>, String> {
     if platform.starts_with("windows-") {
-        return Ok(vec![path.to_owned()]);
+        // follow-up #36: NSIS installer 默认装到编译时 hardcoded InstallDir
+        // (通常 C:\Program Files\Codex App Transfer\)。如果用户原本装在非
+        // 默认目录(D:\Apps\... / `\\server\share\...`),NSIS update 不传
+        // 安装位置会**双装**或回 C:\Program Files,丢用户原选择。
+        //
+        // 借鉴 AiMaMi `src-tauri/src/admin/update.rs:7-23`:把当前 .exe
+        // parent dir 用 NSIS `/D=<path>` 参数透传给 installer。NSIS 语法
+        // 限制:`/D=` 必须**最后一个 arg** + 不带引号(整段是字面字符串)。
+        //
+        // dev 模式当前 .exe 在 target/debug 或 target/release,update 本来
+        // 就不会真跑(用户不会从 cargo run 触发 update),不需要特化判断。
+        let mut cmd = vec![path.to_owned()];
+        if let Some(install_dir) = current_exe_parent_dir() {
+            cmd.push(format!("/D={install_dir}"));
+        }
+        return Ok(cmd);
     }
     if platform.starts_with("macos-") {
         return Ok(vec!["open".to_owned(), path.to_owned()]);
@@ -189,6 +204,70 @@ pub(super) fn install_command_parts(path: &str, platform: &str) -> Result<Vec<St
     Err(format!(
         "in-app install is not supported on platform: {platform}"
     ))
+}
+
+/// 返回当前 binary 的 parent dir(字符串形式)。用于 Windows `/D=` 参数。
+/// 失败(current_exe / parent / to_str)返 None,caller 应不传 `/D=` 走默认。
+fn current_exe_parent_dir() -> Option<String> {
+    std::env::current_exe()
+        .ok()?
+        .parent()?
+        .to_str()
+        .map(str::to_owned)
+}
+
+/// follow-up #35 a: macOS Gatekeeper translocation 检测。
+///
+/// 当用户**直接从 .dmg 打开**本 app(未拖到 /Applications/),macOS 把 .app
+/// "translocate"到只读临时挂载点 `/private/var/folders/.../AppTranslocation/`
+/// 路径下执行 — 此时跑 update install 会失败(translocation 是 read-only)
+/// 或装到错位置(替换 mount 副本不影响真 .app)。
+///
+/// 检测当前 binary 路径含 `/AppTranslocation/`,有则 hard fail 让用户先把
+/// .app 拖到 /Applications/ 再升级。借鉴 AiMaMi `update.rs:47-113`。
+///
+/// 非-macOS 平台 / 检测失败一律返 Ok (不能因边界 case 卡住 update flow)。
+pub(super) fn macos_translocation_precheck() -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(exe) = std::env::current_exe().ok() else {
+            return Ok(());
+        };
+        let exe_str = exe.to_string_lossy();
+        if exe_str.contains("/AppTranslocation/") {
+            return Err(
+                "Codex App Transfer 当前从 .dmg 临时挂载点 (AppTranslocation) 运行 — \
+                 请先把 .app 拖到 /Applications/ 再执行升级,否则 macOS Gatekeeper 会让升级失败"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// follow-up #35 b: 清掉 downloaded installer 的 `com.apple.quarantine`
+/// xattr — 否则装完 Gatekeeper 会弹"是否打开此应用"二次弹窗影响体验。
+///
+/// macOS-only,失败 silent ignore(xattr 不存在是 happy path,权限失败
+/// 不应该阻塞 install 主路径)。借鉴 AiMaMi `update.rs:47-113`。
+pub(super) fn macos_strip_quarantine(path: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("xattr")
+            .args(["-d", "com.apple.quarantine", path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path; // unused on non-macOS
+    }
 }
 
 #[cfg(test)]
@@ -217,6 +296,11 @@ pub(super) fn launch_update_installer(
     installer_path: &str,
     platform: &str,
 ) -> Result<bool, String> {
+    // follow-up #35 b: macOS 装前 strip quarantine xattr,防 Gatekeeper
+    // 弹"是否打开此应用"二次弹窗。失败 silent ignore 不阻塞主路径。
+    if platform.starts_with("macos-") {
+        macos_strip_quarantine(installer_path);
+    }
     let command = install_command_parts(installer_path, platform)?;
     let Some((program, args)) = command.split_first() else {
         return Err("install command is empty".to_owned());
@@ -658,6 +742,13 @@ pub async fn update_check(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
 }
 
 pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl IntoResponse {
+    // follow-up #35 a: macOS translocation 前置检查 — 当前 .app 在 .dmg
+    // 临时挂载点跑时 hard fail,提示用户先拖到 /Applications/ 再升级。
+    // 早期 reject 避免下载完 installer 才发现装不上浪费带宽 + 给用户
+    // 清晰错误指引。
+    if let Err(e) = macos_translocation_precheck() {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
     let input = body.map(|value| value.0).unwrap_or_default();
     let update_url = configured_update_url(input.url.as_deref());
     if update_url.trim().is_empty() {
@@ -841,10 +932,24 @@ mod tests {
             install_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64").unwrap(),
             vec!["open", "/tmp/Codex-App-Transfer.pkg"]
         );
-        assert_eq!(
+        // follow-up #36: Windows 现在追加 /D=<current_exe parent> (NSIS 安装
+        // 目录保持)。测试在 macOS/Linux CI 跑时 current_exe parent 是 cargo
+        // target/.../deps,不是真 Windows install dir,但 helper 行为对称 —
+        // 验 vec 至少有 installer + 可能有 /D= 参数(若 current_exe 可解析)。
+        let win_cmd =
             install_command_parts("C:\\Codex-App-Transfer-Windows-Setup.exe", "windows-x64")
-                .unwrap(),
-            vec!["C:\\Codex-App-Transfer-Windows-Setup.exe"]
+                .unwrap();
+        assert_eq!(win_cmd[0], "C:\\Codex-App-Transfer-Windows-Setup.exe");
+        // current_exe 在 test runner 下基本必然解析成功
+        assert_eq!(
+            win_cmd.len(),
+            2,
+            "expected installer + /D= arg, got: {win_cmd:?}"
+        );
+        assert!(
+            win_cmd[1].starts_with("/D="),
+            "second arg must be NSIS /D= form, got: {}",
+            win_cmd[1]
         );
         assert_eq!(
             install_after_quit_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64", 1234)
@@ -862,6 +967,35 @@ mod tests {
             install_after_quit_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64", 0)
                 .unwrap_err(),
             "wait-for-exit pid is invalid"
+        );
+    }
+
+    /// follow-up #35 a: macOS translocation 前置检查在非 translocation
+    /// 路径(cargo test runner exe 路径)必须返 Ok。non-macOS 平台一律
+    /// silent Ok(target_os 不为 macos)。真正的 translocation 路径
+    /// `/private/var/folders/.../AppTranslocation/` 行为靠 #[cfg] guard +
+    /// 真机 verify (单测 mock current_exe 复杂度高,跳过)。
+    #[test]
+    fn macos_translocation_precheck_under_cargo_test_returns_ok() {
+        // cargo test 跑在 target/.../deps 路径,不含 /AppTranslocation/
+        // 所以无论 macOS 还是其他平台都应该 Ok。
+        assert!(macos_translocation_precheck().is_ok());
+    }
+
+    /// follow-up #36: current_exe_parent_dir 在 cargo test 下能解析成功
+    /// (返 cargo target/.../deps 目录)。
+    #[test]
+    fn current_exe_parent_dir_resolves_in_test_runner() {
+        let parent = current_exe_parent_dir();
+        assert!(
+            parent.is_some(),
+            "current_exe parent must resolve in test runner"
+        );
+        let p = parent.unwrap();
+        // cargo test runner 路径必含 "target" 段
+        assert!(
+            p.contains("target") || p.contains("Target"),
+            "expected target dir in path, got: {p}"
         );
     }
 

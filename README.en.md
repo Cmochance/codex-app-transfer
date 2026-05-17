@@ -93,7 +93,7 @@ If the desktop window can't open (rare — usually Tauri webview init failed / s
 | Grok Web (SuperGrok / X Premium+) | ✅ | ✅ | ✅ (v2.1.6 adds tool_calls flatten) | Experimental, TOS gray area, personal use only |
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | Backend ready, UI pending |
 | Zhipu GLM / Alibaba Cloud Bailian | ⚠️ experimental | — | — | OpenAI Chat-compatible reverse proxy |
-| Responses passthrough (custom) | — | — | — | Direct upstream connection, bypasses proxy (suitable for OpenAI official / native Responses reverse proxy) |
+| Responses passthrough (custom) | — | — | — | Direct upstream connection, bypasses proxy (suitable for OpenAI official / native Responses reverse proxy); ⚠️ Plugins/MCP `namespace` tool bundle is NOT flattened — some upstreams silently drop tools |
 
 ## Model mapping
 
