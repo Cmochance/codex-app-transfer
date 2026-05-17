@@ -107,7 +107,8 @@ mod tests {
             "百炼 Token Plan 上游只支持 chat completions 兼容,必须配 openai_chat 走协议转换"
         );
         assert_eq!(
-            p["baseUrl"], "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+            p["baseUrl"],
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
         );
     }
 
