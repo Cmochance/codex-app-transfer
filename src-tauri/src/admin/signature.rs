@@ -54,7 +54,10 @@ impl fmt::Display for VerifyError {
             VerifyError::PublicKeyParse(e) => write!(f, "embedded public key parse failed: {e}"),
             VerifyError::SignatureDecode(e) => write!(f, "signature decode failed: {e}"),
             VerifyError::SignatureRejected(e) => {
-                write!(f, "signature verify failed (data tampered or wrong key): {e}")
+                write!(
+                    f,
+                    "signature verify failed (data tampered or wrong key): {e}"
+                )
             }
         }
     }
@@ -122,7 +125,8 @@ mod tests {
         }
         let data = std::fs::read(&json_path).expect("read latest.json");
         let sig = std::fs::read_to_string(&sig_path).expect("read latest.json.sig");
-        verify_signed_bytes(&data, &sig).expect("real release latest.json must verify against embedded pubkey");
+        verify_signed_bytes(&data, &sig)
+            .expect("real release latest.json must verify against embedded pubkey");
     }
 
     /// 篡改 1 byte 后 verify 必须 Err(SignatureRejected),不能 panic 不能 OK。

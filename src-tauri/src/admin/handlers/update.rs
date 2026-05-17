@@ -282,10 +282,7 @@ pub(super) fn configured_update_url(input: Option<&str>) -> String {
 /// - 网络 / DNS 错
 /// - HTTP 4xx/5xx (404 = 服务端漏签,严重错误,客户端必须硬拒)
 /// - 响应非合法 UTF-8 文本
-async fn fetch_signature_text(
-    client: &reqwest::Client,
-    sig_url: &str,
-) -> Result<String, String> {
+async fn fetch_signature_text(client: &reqwest::Client, sig_url: &str) -> Result<String, String> {
     let response = client
         .get(sig_url)
         .send()
@@ -325,8 +322,7 @@ pub(super) async fn fetch_latest_json(
     let sig = fetch_signature_text(client, &sig_url)
         .await
         .map_err(|e| format!("latest.json signature unavailable: {e}"))?;
-    verify_signed_bytes(&bytes, &sig)
-        .map_err(|e| format!("latest.json signature invalid: {e}"))?;
+    verify_signed_bytes(&bytes, &sig).map_err(|e| format!("latest.json signature invalid: {e}"))?;
 
     let data = serde_json::from_slice::<Value>(&bytes).or_else(|_| {
         let without_bom = bytes
@@ -989,7 +985,10 @@ mod tests {
             let err = download_asset_impl(&client, &asset, Some(&target_dir), "linux-x64")
                 .await
                 .unwrap_err();
-            assert_eq!(err, "in-app install is not supported on platform: linux-x64");
+            assert_eq!(
+                err,
+                "in-app install is not supported on platform: linux-x64"
+            );
             let _ = fs::remove_dir_all(&target_dir);
         });
     }
