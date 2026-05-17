@@ -425,8 +425,9 @@ async fn inject_unlock_script(
                 set_status(
                     status,
                     UnlockStatus::Failed {
-                        error: "注入脚本未找到 React setAuthMethod hook,Codex Desktop 版本可能不兼容"
-                            .into(),
+                        error:
+                            "注入脚本未找到 React setAuthMethod hook,Codex Desktop 版本可能不兼容"
+                                .into(),
                     },
                 )
                 .await;
