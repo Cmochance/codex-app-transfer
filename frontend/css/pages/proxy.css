@@ -1,0 +1,165 @@
+/* ============================================================
+   pages/proxy.css — 代理转发 page (.proxy-* / .terminal-* / .port-control / .pulse-dot / .log-line / .log-level)
+   layer1: line 1054-1184
+   layer2: line 3010-3034 (.proxy-control / .proxy-running / .port-control / .pulse-dot / .terminal-log compact)
+   ============================================================ */
+
+.proxy-control {
+  display: grid;
+  grid-template-columns: 1.5fr 1fr 220px;
+  align-items: center;
+  gap: 28px;
+  margin-bottom: 18px;
+}
+
+.terminal-toolbar [data-action="clear-logs"] {
+  --bs-btn-hover-color: var(--primary);
+  --bs-btn-hover-bg: var(--primary-soft);
+  --bs-btn-hover-border-color: color-mix(in srgb, var(--primary) 42%, var(--line));
+  --bs-btn-active-color: var(--primary);
+  --bs-btn-active-bg: var(--primary-soft);
+  --bs-btn-active-border-color: color-mix(in srgb, var(--primary) 42%, var(--line));
+}
+
+.proxy-running {
+  display: flex;
+  align-items: flex-end;
+  gap: 24px;
+  padding-right: 28px;
+  border-right: 1px solid var(--line);
+}
+
+.proxy-running-meta {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  min-width: 0;
+}
+
+.proxy-running strong {
+  color: var(--success);
+  font-size: 30px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.proxy-running p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.port-control {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+
+.port-control .form-label {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.port-control .form-control {
+  max-width: 190px;
+}
+
+.pulse-dot {
+  width: 86px;
+  height: 86px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at center, var(--success) 0 20%, transparent 22%),
+    radial-gradient(circle at center, rgba(17, 181, 109, .26) 0 42%, transparent 44%),
+    radial-gradient(circle at center, rgba(17, 181, 109, .12) 0 65%, transparent 67%);
+}
+
+.proxy-running.stopped .pulse-dot {
+  background:
+    radial-gradient(circle at center, var(--muted) 0 20%, transparent 22%),
+    radial-gradient(circle at center, rgba(100, 116, 139, .22) 0 42%, transparent 44%),
+    radial-gradient(circle at center, rgba(100, 116, 139, .10) 0 65%, transparent 67%);
+}
+
+.proxy-running.stopped strong {
+  color: var(--muted);
+}
+
+.terminal-panel {
+  overflow: hidden;
+  background: #171b29;
+  color: #e9eefb;
+}
+
+.terminal-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 28px;
+  min-height: 60px;
+  padding: 0 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, .14);
+}
+
+.terminal-log {
+  max-height: 410px;
+  overflow-y: auto;
+  padding: 16px 24px 22px;
+  font-family: "Fira Code", Consolas, "Cascadia Mono", monospace;
+  font-size: 18px;
+  line-height: 1.48;
+}
+
+.log-line {
+  display: grid;
+  grid-template-columns: 96px 86px 1fr;
+  gap: 12px;
+  white-space: nowrap;
+}
+
+.log-level.info {
+  color: #6da4ff;
+}
+
+.log-level.success {
+  color: #57e45d;
+}
+
+.log-level.warn {
+  color: #ffd02e;
+}
+
+.log-level.error {
+  color: #ff4d57;
+}
+
+
+/* === Layer 2: compact desktop === */
+
+.proxy-control {
+  grid-template-columns: minmax(0, 1fr) minmax(260px, auto) 140px;
+  gap: 12px;
+  padding: 16px;
+}
+
+.proxy-running,
+.proxy-running-meta,
+.port-control {
+  align-items: center;
+}
+
+.proxy-running strong {
+  font-size: 20px;
+}
+/* .stat-card strong 同 20px 共享值已搬到 components/card.css 末段 */
+
+.pulse-dot {
+  width: 42px;
+  height: 42px;
+}
+
+.terminal-log {
+  font-size: 13px;
+}

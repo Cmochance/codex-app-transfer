@@ -1,0 +1,123 @@
+/* ============================================================
+   components/form.css — Form layout (.form-control / .form-select / .form-label / .form-panel / .input-with-button / .input-icon / .two-column / .narrow-field / .label-line / .field-hint)
+   layer1: line 485-535 (.two-column / .form-panel / .form-label / .form-control / .form-select / .form-control-lg / .input-with-button) + 620-629 (.input-icon) + 807-808 (.narrow-field)
+   layer2: line 2851-2854 (.two-column 1col) + 2924-2962 (.form-label compact + .label-line + .link-action + .field-hint + #providerBaseUrlHint)
+   ============================================================ */
+
+.two-column {
+  display: grid;
+  grid-template-columns: minmax(0, 1.8fr) minmax(340px, 1fr);
+  gap: 28px;
+}
+
+/* .form-panel padding: 34px (layer1) 是 dead code —— layer2
+   `.form-panel, .panel { padding: 24px }` 在 components/card.css 末段
+   总后到赢(card.css 跟 form.css 都在 components/, layer2 segment 跨
+   in-file 顺序无关), 拆分时若保留 layer1 padding: 34px 会因 form.css
+   alphabetical 比 card.css 晚 import 反向覆盖 layer2 compact 24px。
+   原 v2.1.11 cascade 这条本来就是 dead code, 删除等价。
+   codex-bot PR #195 review thread PRRT_kwDOSRcxvM6CpUX_ 修。 */
+
+.form-label {
+  color: var(--text);
+  font-size: 19px;
+  font-weight: 730;
+}
+
+.required::after {
+  content: " *";
+  color: var(--danger);
+}
+
+.form-control,
+.form-select {
+  border-color: var(--line);
+  border-radius: 10px;
+  background-color: var(--surface);
+  color: var(--text);
+}
+
+.form-control:focus,
+.form-select:focus {
+  border-color: color-mix(in srgb, var(--primary) 42%, var(--line));
+  background-color: var(--surface);
+  color: var(--text);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 24%, transparent);
+}
+
+/* .form-control-lg / .form-select-lg layer1 70px (line 522-527 of orig)
+   是 dead code —— layer2 `.form-control-lg, .form-select-lg, .action-button,
+   .btn-lg { min-height: 38px }` 在 components/button.css 末段已经接管。
+   保留会因 form.css alphabetical 晚于 button.css import 反向覆盖 layer2
+   compact 38px → 控件回到 70px 大尺寸 (settings / add-provider 页 input)。
+   codex-bot PR #195 review thread PRRT_kwDOSRcxvM6CpUX_ 修。 */
+
+.input-with-button {
+  position: relative;
+}
+
+.input-with-button .form-control {
+  padding-right: 66px;
+}
+
+.input-icon {
+  position: absolute;
+  right: 18px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 24px;
+}
+
+.narrow-field {
+  max-width: 650px;
+}
+
+/* === Layer 2: compact desktop === */
+
+.two-column {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+
+.form-label {
+  margin-bottom: 8px;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.label-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.link-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.link-action:hover {
+  color: var(--primary);
+}
+
+.field-hint {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-line;
+}
+
+#providerBaseUrlHint {
+  color: var(--danger);
+  font-weight: 700;
+}

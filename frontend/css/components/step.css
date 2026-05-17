@@ -1,0 +1,56 @@
+/* ============================================================
+   components/step.css — Numbered step list (.mini-steps / .mini-step)
+   layer1: line 1002-1052
+   ============================================================ */
+
+.mini-steps {
+  display: grid;
+  gap: 26px;
+}
+
+.mini-step {
+  display: grid;
+  grid-template-columns: 44px 88px 1fr;
+  align-items: center;
+  gap: 18px;
+  padding-bottom: 26px;
+  border-bottom: 1px solid var(--line);
+}
+
+.mini-step:last-child {
+  border-bottom: 0;
+}
+
+.mini-step span {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  color: var(--primary);
+  background: var(--primary-soft);
+  font-size: 23px;
+  font-weight: 800;
+}
+
+.mini-step i {
+  display: grid;
+  place-items: center;
+  width: 88px;
+  height: 88px;
+  border-radius: 16px;
+  color: var(--primary);
+  background: var(--primary-soft);
+  font-size: 43px;
+}
+
+.mini-step strong {
+  display: block;
+  font-size: 19px;
+}
+
+.mini-step p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 17px;
+}

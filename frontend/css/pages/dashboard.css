@@ -1,0 +1,183 @@
+/* ============================================================
+   pages/dashboard.css — 仪表盘 page (.quick-actions / .desktop-* / .switch-board / .dashboard-* / .provider-card-list / .section-title-row.compact / .desktop-explain)
+   layer1: line 373-378 (.quick-actions) + 889-919 (.desktop-layout / .desktop-card / .configured-row / .circle-check sizes)
+          + 953-1000 (.config-list / .config-row / .code-block / .danger-outline)
+   layer2: line 2012-2016 (#page-dashboard hide layer1)
+          + 2022-2048 (.switch-board / .switch-board-actions / .dashboard-*-button)
+          + 2119-2130 (.switch-board-head h1/p)
+          + 2180-2210 (.provider-card-list / .provider-configured-list / .dashboard-preset-section / .section-title-row.compact)
+          + 2819-2821 (.desktop-explain margin)
+   ============================================================ */
+
+.quick-actions {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 28px;
+  margin: 36px 0;
+}
+
+.desktop-layout {
+  grid-template-columns: minmax(0, 2fr) 450px;
+}
+
+.desktop-card h2,
+.details-panel h2,
+.guide-panel h2 {
+  margin-bottom: 26px;
+}
+
+.configured-row {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  margin-bottom: 22px;
+}
+
+.configured-row strong {
+  color: var(--success);
+  font-size: 31px;
+}
+
+.circle-check {
+  width: 54px;
+  height: 54px;
+  font-size: 30px;
+}
+
+.circle-check.warning {
+  background: var(--warning);
+}
+
+
+.config-list {
+  margin-bottom: 22px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.config-row {
+  display: grid;
+  grid-template-columns: 44px 1fr 1.3fr;
+  align-items: center;
+  gap: 14px;
+  min-height: 64px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.config-row:last-child {
+  border-bottom: 0;
+}
+
+.config-row i {
+  color: var(--success);
+  font-size: 22px;
+}
+
+.config-row span {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.code-block {
+  min-height: 124px;
+  margin: 0;
+  padding: 20px 24px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--soft-surface);
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1.65;
+}
+
+.danger-outline {
+  margin-top: 18px;
+  background: transparent;
+}
+
+/* === Layer 2: compact desktop === */
+
+#page-dashboard .status-grid,
+#page-dashboard .quick-actions,
+#page-dashboard > .panel {
+  display: none;
+}
+
+.switch-board {
+  padding-top: 16px;
+}
+
+.switch-board-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.switch-board-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.dashboard-clear-button,
+.dashboard-feedback-button {
+  min-height: 38px;
+  padding-inline: 14px;
+  border-radius: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.switch-board-head h1 {
+  margin: 0 0 3px;
+  color: var(--primary);
+  font-size: 21px;
+  font-weight: 700;
+}
+
+.switch-board-head p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.provider-card-list,
+#providerRows {
+  display: grid;
+  gap: 12px;
+}
+
+.provider-configured-list,
+.provider-preset-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.dashboard-preset-section {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.section-title-row.compact {
+  margin-bottom: 0;
+}
+
+.section-title-row.compact h2 {
+  font-size: 14px;
+}
+
+.section-title-row.compact p {
+  font-size: 12px;
+}
+
+.desktop-explain {
+  margin: 0 0 14px;
+}

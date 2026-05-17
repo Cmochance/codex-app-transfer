@@ -1,0 +1,168 @@
+/* ============================================================
+   tokens.css — Design tokens + 6 套主题
+   layer1 :root + dark (line 3-32) + layer2 :root + 6 themes (1740-1870)
+   ============================================================ */
+
+:root {
+  --app-bg: #f6f8fb;
+  --surface: #ffffff;
+  --soft-surface: #eef3f9;
+  --line: #dbe3ef;
+  --text: #0f172a;
+  --muted: #475569;
+  --primary: #2563eb;
+  --primary-soft: #dbeafe;
+  --success: #11b56d;
+  --success-soft: #e8f9f1;
+  --danger: #ef383f;
+  --warning: #f0bd12;
+  --shadow: 0 10px 28px rgba(20, 23, 44, .08);
+  --radius: 18px;
+  color-scheme: light;
+}
+
+[data-bs-theme="dark"] {
+  --app-bg: #0f172a;
+  --surface: #172033;
+  --soft-surface: #1e293b;
+  --line: #334155;
+  --text: #f1f5f9;
+  --muted: #cbd5e1;
+  --primary: #3b82f6;
+  --primary-soft: rgba(59, 130, 246, .18);
+  --success-soft: rgba(17, 181, 109, .16);
+  --shadow: 0 14px 34px rgba(0, 0, 0, .34);
+  color-scheme: dark;
+}
+
+/* Compact desktop utility surface */
+:root {
+  --app-bg: #ffffff;
+  --surface: #ffffff;
+  --soft-surface: #f7f8fb;
+  --line: #e4e7ec;
+  --text: #111827;
+  --muted: #667085;
+  --primary: #1476ff;
+  --primary-soft: #eef6ff;
+  --success: #16a34a;
+  --success-soft: #ecfdf3;
+  --danger: #ff4d4f;
+  --warning: #f59e0b;
+  --shadow: none;
+  --radius: 14px;
+}
+
+[data-bs-theme="dark"] {
+  --app-bg: #111318;
+  --surface: #171a21;
+  --soft-surface: #20242d;
+  --line: #2d3440;
+  --text: #f8fafc;
+  --muted: #aab2c0;
+  --primary-soft: rgba(20, 118, 255, .16);
+}
+
+[data-theme-palette="default"] {
+  --app-bg: #ffffff;
+  --surface: #ffffff;
+  --soft-surface: #f7f8fb;
+  --line: #e4e7ec;
+  --text: #111827;
+  --muted: #667085;
+  --primary: #1476ff;
+  --primary-soft: #eef6ff;
+  --success: #16a34a;
+  --success-soft: #ecfdf3;
+  --danger: #ff4d4f;
+  --warning: #f59e0b;
+  --shadow: none;
+  --radius: 14px;
+}
+
+/* 非 dark 主题只换主题特征色（primary / primary-soft），
+   保持中性的白色/浅灰背景与 default 一致，避免页面整体被染色。 */
+[data-theme-palette="green"] {
+  --app-bg: #ffffff;
+  --surface: #ffffff;
+  --soft-surface: #f7f8fb;
+  --line: #e4e7ec;
+  --text: #111827;
+  --muted: #667085;
+  --primary: #1f9d55;
+  --primary-soft: #e4f6ea;
+  --success: #16a34a;
+  --success-soft: #ecfdf3;
+  --danger: #ff4d4f;
+  --warning: #f59e0b;
+  --shadow: none;
+  --radius: 14px;
+}
+
+[data-theme-palette="orange"] {
+  --app-bg: #ffffff;
+  --surface: #ffffff;
+  --soft-surface: #f7f8fb;
+  --line: #e4e7ec;
+  --text: #111827;
+  --muted: #667085;
+  --primary: #f97316;
+  --primary-soft: #fff0e4;
+  --success: #16a34a;
+  --success-soft: #ecfdf3;
+  --danger: #ff4d4f;
+  --warning: #f59e0b;
+  --shadow: none;
+  --radius: 14px;
+}
+
+[data-theme-palette="gray"] {
+  --app-bg: #ffffff;
+  --surface: #ffffff;
+  --soft-surface: #f7f8fb;
+  --line: #e4e7ec;
+  --text: #111827;
+  --muted: #667085;
+  --primary: #64748b;
+  --primary-soft: #e8edf3;
+  --success: #16a34a;
+  --success-soft: #ecfdf3;
+  --danger: #ff4d4f;
+  --warning: #f59e0b;
+  --shadow: none;
+  --radius: 14px;
+}
+
+[data-theme-palette="dark"] {
+  --app-bg: #111318;
+  --surface: #171a21;
+  --soft-surface: #20242d;
+  --line: #2d3440;
+  --text: #f8fafc;
+  --muted: #aab2c0;
+  --primary: #60a5fa;
+  --primary-soft: rgba(96, 165, 250, .18);
+  --success: #34d399;
+  --success-soft: rgba(52, 211, 153, .16);
+  --danger: #fb7185;
+  --warning: #fbbf24;
+  --shadow: none;
+  --radius: 14px;
+}
+
+[data-theme-palette="white"] {
+  --app-bg: #ffffff;
+  --surface: #ffffff;
+  --soft-surface: #f7f8fb;
+  --line: #e4e7ec;
+  --text: #111827;
+  --muted: #667085;
+  --primary: #94a3b8;
+  --primary-soft: #f1f5f9;
+  --success: #16a34a;
+  --success-soft: #ecfdf3;
+  --danger: #ff4d4f;
+  --warning: #f59e0b;
+  --shadow: none;
+  --radius: 14px;
+}

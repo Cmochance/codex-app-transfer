@@ -1,0 +1,78 @@
+/* ============================================================
+   components/button.css — Buttons (.btn / .btn-primary / .btn-outline / .btn-success / .action-button / .btn-lg / .button-row)
+   layer1: line 380-418 (.action-button / .btn-* / .btn-primary etc) + 631-640 (.button-row)
+   layer2: line 2964-2982 (compact 38px buttons + .button-row layout)
+   ============================================================ */
+
+.action-button,
+.btn-lg {
+  min-height: 70px;
+  border-radius: 12px;
+  font-size: 21px;
+  font-weight: 750;
+}
+
+.btn-primary {
+  --bs-btn-color: #fff;
+  --bs-btn-bg: var(--primary);
+  --bs-btn-border-color: var(--primary);
+  --bs-btn-hover-bg: color-mix(in srgb, var(--primary) 86%, #000);
+  --bs-btn-hover-border-color: color-mix(in srgb, var(--primary) 86%, #000);
+  --bs-btn-active-bg: var(--primary);
+  --bs-btn-active-border-color: var(--primary);
+  --bs-btn-disabled-color: #fff;
+  --bs-btn-disabled-bg: var(--primary);
+  --bs-btn-disabled-border-color: var(--primary);
+}
+
+.btn-outline-primary {
+  --bs-btn-color: var(--primary);
+  --bs-btn-border-color: var(--primary);
+  --bs-btn-hover-bg: var(--primary);
+  --bs-btn-hover-border-color: var(--primary);
+}
+
+.btn-success {
+  --bs-btn-bg: var(--success);
+  --bs-btn-border-color: var(--success);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 28px;
+  margin-top: 28px;
+}
+
+.button-row .btn {
+  min-width: 210px;
+}
+
+/* === Layer 2: compact desktop === */
+
+.form-control-lg,
+.form-select-lg,
+.action-button,
+.btn-lg {
+  min-height: 38px;
+  padding-inline: 12px;
+  border-radius: 9px;
+  font-size: 14px;
+}
+
+.button-row {
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.button-row .btn {
+  min-width: 92px;
+}

@@ -1,0 +1,35 @@
+/* ============================================================
+   components/activity.css — Activity list rows (.activity-list / .activity-row)
+   layer1: line 454-483
+   ============================================================ */
+
+.activity-list {
+  max-height: 340px;
+  margin-top: 18px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+}
+
+.activity-row {
+  display: grid;
+  grid-template-columns: 28px 100px 1fr;
+  gap: 22px;
+  align-items: center;
+  min-height: 70px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 19px;
+}
+
+.activity-row::before {
+  content: "";
+  width: 16px;
+  height: 16px;
+  margin-left: 10px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.activity-row time {
+  color: var(--muted);
+}
