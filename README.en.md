@@ -192,6 +192,7 @@ Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) in
 - [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web reverse-engineering reference + dynamic statsig algorithm + tool_calls flatten pattern
 - [`galaxywk223/codex-plugin-unlocker`](https://github.com/galaxywk223/codex-plugin-unlocker) — Codex Desktop Plugins unlock injection script (React Context-value walk-up + DOM enable + MutationObserver, MIT)
 - [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) — Alibaba's official Qwen CLI, Bailian Token Plan (`*.maas.aliyuncs.com`) hardcoded model registry pattern (`TOKEN_PLAN_MODELS` in `packages/cli/src/auth/providers/alibaba/tokenPlan.ts`, Apache-2.0)
+- [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows MSIX Codex Desktop CDP injection path (`IApplicationActivationManager` COM + AUMID auto-resolve + cmdline serialization, `codex_session_delete/launcher.py`, MIT)
 
 ### Community contributors
 

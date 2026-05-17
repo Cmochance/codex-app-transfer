@@ -256,6 +256,28 @@
 - **代码层引用**(`models.rs:380-394` 节选):
   > **百炼 Token Plan 套餐** (`token-plan.cn-beijing.maas.aliyuncs.com`) 不暴露 `compatible-mode/v1/models` endpoint(网关在所有 unknown path 都返 401,routing 在 auth 之后)。阿里官方 Qwen CLI 自身就走静态硬编码 — 见 QwenLM/qwen-code `packages/cli/src/auth/providers/alibaba/tokenPlan.ts` 里 `TOKEN_PLAN_MODELS` 数组(Apache-2.0)。这里跟 Qwen CLI 的 canonical 4 条对齐。
 
+## BigPizzaV3/CodexPlusPlus
+
+- **Link**: https://github.com/BigPizzaV3/CodexPlusPlus
+- **License**: **MIT**(明确,本项目代码注释固化)
+- **借鉴形式**: 算法 1:1 复刻(Rust 翻译版)+ Wire-level 对齐(COM API 调用)
+- **首次借鉴 PR / 时间**: PR #191(2026-05-17,Windows Plugin Unlock MSIX 实施)
+- **借鉴清单**:
+  - **`IApplicationActivationManager::ActivateApplication` Win32 COM 调用**(`launcher.py:347-395`,CLSID `45BA127D-...` + IID `2e941141-...` + vtable[3])→ `src-tauri/src/windows_msix.rs:50-96` `activate_packaged_app`(Rust 用 windows-rs 官方 binding 而非手搓 ctypes COM)
+  - **AUMID 自动解析**(`launcher.py:298-304` + `app_paths.py:30-49`):`Get-AppxPackage` PowerShell 反推 `OpenAI.Codex_<publisher>!App` → `src-tauri/src/windows_msix.rs:111-137` `resolve_codex_aumid`
+  - **cmdline 序列化**(`launcher.py:411` 用 `subprocess.list2cmdline`):MSIX activation 的 `arguments` 参数是单一 PWSTR 不是 argv 数组 → `src-tauri/src/windows_msix.rs:157-199` `list2cmdline` + `escape_cmdline`(Windows `CommandLineToArgvW` quoting 规则)
+  - **Codex Desktop 启动入口 Windows 分支**:`open_codex_app` 走 COM activation 替代 `explorer.exe shell:AppsFolder\...`(后者剥 args)→ `src-tauri/src/admin/handlers/desktop.rs:335-405`
+- **本项目差异 / 扩展**:
+  - Rust 实现用 `windows` crate 0.59+ 官方 binding(`Win32_UI_Shell` feature)而非 Python ctypes 手搓 vtable
+  - ActivateApplication 失败时 fallback 到老 `explorer.exe` 路径让 Codex 至少能启动(args 丢失,Plugin Unlock 在 fallback 路径下不工作,但 Codex 本身可用)
+  - 端口冲突处理、PowerShell CIM 进程清理 等后续 PR 再补(对照 launcher.py:267-281 / 434-451,follow-up #33 P2)
+- **同步策略**:
+  - 上游 launcher.py COM 调用约定变动(Microsoft 更新 ActivateApplication 接口的可能性极低)→ 跟踪 windows-rs major version 升级
+  - AUMID 解析逻辑跟随 Codex Desktop AppxManifest 命名约定;若 OpenAI 改 package family name 命名(如改 `OpenAI.CodexCLI`),`resolve_codex_aumid` 的 PowerShell `-Name 'OpenAI.Codex'` filter 需更新
+- **关联 PR / followup**: PR #191(主修),[follow-up #33](docs/followup/33-windows-plugin-unlock-msix-store.md)
+- **代码层引用**(`windows_msix.rs:18-25` 节选):
+  > 实现路径 1:1 借鉴 `BigPizzaV3/CodexPlusPlus`(MIT,2699 stars)的 Python 实现 `codex_session_delete/launcher.py:283-451`(2026-05-17 同步)。同道项目实证可工作。本 Rust 实现用 `windows` crate 官方 binding 而非手搓 ctypes COM,稳定性更好。
+
 ---
 
 ## 维护规则

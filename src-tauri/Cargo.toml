@@ -56,6 +56,18 @@ objc2 = "0.5"
 objc2-foundation = "0.2"
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplication"] }
 
+# Windows MSIX Codex Desktop 启动 — IApplicationActivationManager COM 调用
+# 让 packaged Codex.exe 接收 `--remote-debugging-port=9222` 启动参数,
+# 绕过 explorer.exe shell:AppsFolder 协议剥 args 的限制。
+# 借鉴 BigPizzaV3/CodexPlusPlus `codex_session_delete/launcher.py:347-395`,
+# 用 windows-rs 官方 binding 而非手搓 ctypes COM,稳定性更好。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
 [features]
 # 默认空,自定义 protocol 在打包时启用
 default = ["custom-protocol"]

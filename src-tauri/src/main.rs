@@ -7,6 +7,8 @@ mod admin;
 mod codex_plugin_unlocker;
 mod proxy_runner;
 mod telemetry_bridge;
+#[cfg(target_os = "windows")]
+mod windows_msix;
 
 use std::sync::Arc;
 
