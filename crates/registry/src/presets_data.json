@@ -233,7 +233,7 @@
     "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
     "docsUrl": "https://help.aliyun.com/zh/model-studio/token-plan-quickstart",
     "authScheme": "bearer",
-    "apiFormat": "responses",
+    "apiFormat": "openai_chat",
     "models": {
       "default": "qwen3.6-plus"
     },

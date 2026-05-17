@@ -91,6 +91,27 @@ mod tests {
     }
 
     #[test]
+    fn bailian_token_plan_preset_uses_openai_chat_format() {
+        // 百炼 Token Plan 的 `/compatible-mode/v1` 入口实际只支持 OpenAI Chat
+        // Completions 兼容(参考 docsUrl `help.aliyun.com/zh/model-studio/
+        // token-plan-quickstart`),不支持 `/v1/responses`。
+        // apiFormat 必须是 openai_chat 走 ResponsesAdapter 做协议转换,不能配
+        // responses 走 passthrough 直传(否则上游必返 404/invalid)。
+        let p = builtin_presets()
+            .iter()
+            .find(|p| p["id"] == "bailian-token-plan")
+            .expect("bailian-token-plan preset must exist as builtin entry")
+            .clone();
+        assert_eq!(
+            p["apiFormat"], "openai_chat",
+            "百炼 Token Plan 上游只支持 chat completions 兼容,必须配 openai_chat 走协议转换"
+        );
+        assert_eq!(
+            p["baseUrl"], "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        );
+    }
+
+    #[test]
     fn every_preset_has_id_name_baseurl() {
         for p in builtin_presets() {
             let obj = p.as_object().expect("preset 必须是对象");
