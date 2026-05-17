@@ -24,16 +24,23 @@ const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u64 = 95;
 const DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
 const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
-/// Codex CLI 触发自动 compact 的阈值百分比:`auto_compact_token_limit = context_window × 75%`。
+/// Codex CLI 触发自动 compact 的阈值百分比:`auto_compact_token_limit = context_window × 80%`。
 ///
 /// 根因:Codex CLI 在 `total_usage_tokens >= auto_compact_token_limit` 时触发摘要
-/// (`codex-rs/core/src/session/turn.rs:736-748`),如果 catalog model 没写这个字段
-/// 会 fallback `i64::MAX` → **永不触发**(实测 245K 上限 90% 仍不动)。
+/// (`codex-rs/core/src/session/turn.rs:271/582/693`,三处全部读同一函数,无 PreTurn /
+/// MidTurn 双阈值分支),如果 catalog model 没写这个字段会 fallback `i64::MAX` →
+/// **永不触发**(实测 245K 上限 90% 仍不动)。
 ///
-/// 75% 留 25% buffer 给 summarize 请求本身(~20K max_output_tokens + system
-/// prompt + 当轮 input + 工具开销)。256K 触发于 192K,1M 触发于 750K,与
-/// litellm `effective_context_window_percent` 行业惯例对齐。
-const AUTO_COMPACT_TRIGGER_PERCENT: u64 = 75;
+/// 上游默认 90%(`codex-rs/protocol/src/openai_models.rs` 的
+/// `auto_compact_token_limit()`:`(context_window * 9) / 10`)。我们用 80% 而非
+/// 90%,是因为 Codex CLI 在 `run_pre_sampling_compact`(`turn.rs:808-835`,PreTurn 阶段)
+/// 与 turn 中段 sampling 后判定(`turn.rs:271-289`,MidTurn 阶段)共用同一阈值。80%
+/// 给"上一 turn 结束 → 下一 turn 入口"留 20% buffer(256K 上下文 ≈ 51K),足以
+/// 覆盖几乎所有单 turn token 增量,让 PreTurn 在 turn 入口先抢断、避免落入 MidTurn
+/// 中段打断任务。再降到 70% 以下会显著抬高 compact 频次得不偿失。
+///
+/// 256K 触发于 ~206_720,1M 触发于 800K。
+const AUTO_COMPACT_TRIGGER_PERCENT: u64 = 80;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogModel {
@@ -492,26 +499,26 @@ mod tests {
     }
 
     #[test]
-    fn catalog_model_writes_auto_compact_token_limit_at_75_percent() {
-        // 1M context: 触发于 750K(留 25% buffer)
+    fn catalog_model_writes_auto_compact_token_limit_at_80_percent() {
+        // 1M context: 触发于 800K(留 20% buffer)
         let big = catalog_models_for_provider("Big", "deepseek-v4-pro", true, None, None);
         let entry = model_to_json(big.iter().find(|m| m.slug == "gpt-5.5").unwrap());
         assert_eq!(entry["context_window"], 1_000_000);
         assert_eq!(
-            entry["auto_compact_token_limit"], 750_000,
-            "1M provider 应在 75% (750K) 触发自动 compact"
+            entry["auto_compact_token_limit"], 800_000,
+            "1M provider 应在 80% (800K) 触发自动 compact"
         );
 
-        // 258_400 context(默认 supports_1m=false):触发于 193_800
+        // 258_400 context(默认 supports_1m=false):触发于 206_720
         let mid = catalog_models_for_provider("Mid", "mock-model", false, None, None);
         let entry_mid = model_to_json(mid.iter().find(|m| m.slug == "gpt-5.5").unwrap());
         assert_eq!(entry_mid["context_window"], 258_400);
         assert_eq!(
-            entry_mid["auto_compact_token_limit"], 193_800,
-            "默认 258K provider 应在 75% (193_800) 触发自动 compact"
+            entry_mid["auto_compact_token_limit"], 206_720,
+            "默认 258K provider 应在 80% (206_720) 触发自动 compact"
         );
 
-        // 显式 32K context(moonshot-v1-32k): 触发于 24_576
+        // 显式 32K context(moonshot-v1-32k): 触发于 26_214(32_768 × 80 / 100 整数除)
         let mappings = json!({"default": "moonshot-v1-32k"});
         let capabilities = json!({"moonshot-v1-32k": {"context_window": 32_768}});
         let small = catalog_models_for_provider(
@@ -524,8 +531,8 @@ mod tests {
         let entry_small = model_to_json(small.iter().find(|m| m.slug == "gpt-5.5").unwrap());
         assert_eq!(entry_small["context_window"], 32_768);
         assert_eq!(
-            entry_small["auto_compact_token_limit"], 24_576,
-            "32K context 应在 75% (24_576) 触发"
+            entry_small["auto_compact_token_limit"], 26_214,
+            "32K context 应在 80% (26_214) 触发"
         );
     }
 
