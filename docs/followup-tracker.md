@@ -83,13 +83,11 @@ related_pr: <PR# 或 null>
 - [#24 P2 RFC: Codex AGENTS.md / config.toml 受管块管理(借鉴 AiMaMi)](followup/24-codex-agents-md-managed-block.md) — Q3 四合一管理页的底层基础,marker + history + Protected 模式
 - [#25 P2 MCP / Skills / Memories / Agents 四合一管理页(借鉴 AiMaMi)](followup/25-codex-mgmt-four-in-one-page.md) — 用户 Q3 需求,sidebar+lazy+tanstack-query,依赖 #24
 - [#26 P2 Plugins / MCP 跟"协议转发"绑定 — UI / README 显式提示](followup/26-plugins-mcp-protocol-binding-ui-hint.md) — Responses 直连 provider 启 Plugins 工具静默丢,设计性 gap 需提示
-- [#27 P3 打开 Plugins 后 Codex Desktop 二次 splash 根因诊断](followup/27-codex-desktop-double-splash-on-plugin-unlock.md) — 疑似 setAuthMethod 触发 AuthContext 重 mount,先关 unlock 复测验证
 - [#28 P0 账号还原:desktop_clear 无 has_snapshot guard 删用户手写 managed key](followup/28-account-restore-desktop-clear-no-snapshot-guard.md) — UI 点"清除"按钮 + 未 apply 用户的手写配置会丢 · **PR #194 已实施修法 B(noop guard + 结构化 message,核心 P0 守门)**;修法 A(pre-clear 备份让操作可逆)待评估
 - [#29 P0 账号还原:cleanup_all=true 物理删光所有 snapshot](followup/29-account-restore-cleanup-all-destructive.md) — 缺二次确认 / 软删除,recovery 里真原始可能一起丢 · **PR #194 已实施软删除 (drop_all_snapshots → trash/<timestamp>/) + 30 天 GC**;P1 dry-run preview + UI 二次确认待补
-- [#30 P1 账号还原:snapshot 单点存储无冗余 / 无导出入口](followup/30-account-restore-single-storage-no-redundancy.md) — 卸载 / 换机 / 用户清理 → 真原始永久丢失
-- [#31 P1 账号还原:跨版本 MANAGED_KEYS 升级可能误删旧 snapshot 未记的用户 key](followup/31-account-restore-cross-version-managed-keys.md) — schema_version 无 managed_keys_at_snapshot 字段,版本演化兼容性风险
+- [#30 P1 账号还原:snapshot 单点存储无冗余 / 无导出入口](followup/30-account-restore-single-storage-no-redundancy.md) — 卸载 / 换机 / 用户清理 → 真原始永久丢失 · **PR 实施跨平台 external_backup_dir 自动镜像(macOS Application Support / Windows %APPDATA% / Linux XDG_DATA_HOME)**;UI 导出/导入按钮 + 卸载脚本保留确认待补
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
-- [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,推荐 Method 1+6,需 Windows 真机 spike 验
+- [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,**PR #191 已实施 Method 1 (COM activation) 核心 + 本 PR 实施 PowerShell CIM 进程清理替 taskkill (绕 MSIX access-denied)**;P2 剩端口冲突探测 + 非-Store .exe fallback
 - [#34 P2 客户端 latest.json + installer RSA 验签(签了但客户端不验)](followup/34-update-client-rsa-signature-verify.md) — 公钥+CI签名都在,只差客户端 verify;MITM 改 sha256 即可推任意 installer
 - [#35 P3 macOS update 加 translocation / quarantine 前置检查](followup/35-macos-update-translocation-quarantine-precheck.md) — 借鉴 AiMaMi update.rs:47-113;场景 dmg 直跑用户升级失败 + quarantine 二次弹窗
 - [#36 P3 Windows update 走 NSIS /D=install_dir 保持安装目录](followup/36-windows-update-nsis-install-dir-preserve.md) — 借鉴 AiMaMi update.rs:7-23;非默认目录用户升级会双装或回 C:\Program Files
@@ -100,6 +98,9 @@ related_pr: <PR# 或 null>
 ## Resolved
 
 (完成条目移这里,1 行索引 + PR ref;详情文件保留作历史归档,30 天后批量进 archive/)
+
+- ~~#27 打开 Plugins 后 Codex Desktop 二次 splash 根因诊断~~ → PR #191 (2026-05-17),实际是"一次刷新解锁"的早期描述,setAuthMethod 触发 React 重渲不可消除转 [#32](followup/32-plugin-unlock-react-context-rerender.md)
+- ~~#31 账号还原:跨版本 MANAGED_KEYS 升级误删用户 key~~ → **dropped 2026-05-17**,false alarm:整文件 cp 已保留任何 root key,managed list 只影响 restore 操作不影响存储
 
 <!-- 示例:
 - ~~#25 cloud_code Gemini mapper 漏配 session_cache~~ → PR #146 (2026-05-13)

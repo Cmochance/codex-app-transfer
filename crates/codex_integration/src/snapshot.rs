@@ -194,7 +194,36 @@ pub fn snapshot_codex_state(
         },
     };
     write_manifest_to_dir(&current_dir, &manifest)?;
+
+    // follow-up #30 守门: 在系统级用户数据目录额外 cp 一份冗余备份,防
+    // ~/.codex-app-transfer/ 整目录被用户/卸载脚本/磁盘清理误删 → 真原始
+    // 账号永久丢失。冗余备份失败 silently ignore(主路径已成功,backup 是
+    // P1 enhancement 不该阻塞 apply 流程);codex_integration 无 tracing
+    // dep 不能 warn,但 caller (src-tauri) 可通过比对 active_snapshots_dir
+    // vs external_backup_dir 状态主动 health check 暴露 backup 失败。
+    let _ = mirror_snapshot_to_external_backup(paths, &current_dir);
+
     Ok(manifest)
+}
+
+/// 把当前 session 的 active snapshot 镜像到系统级用户数据目录(冗余备份)。
+/// 失败 silently 返 Err(主 snapshot 已成功不应 propagate)。
+///
+/// 镜像策略: `external_backup_dir/<session-id>/` 下放 manifest.json +
+/// 可选的 config.toml / auth.json 整文件副本。已存在的同名目录直接覆盖
+/// (同 session 多次 apply 幂等)。
+fn mirror_snapshot_to_external_backup(
+    paths: &CodexPaths,
+    source_dir: &Path,
+) -> Result<(), CodexError> {
+    let session_id = current_session_id();
+    let target_dir = paths.external_backup_dir.join(session_id);
+    if target_dir.exists() {
+        let _ = std::fs::remove_dir_all(&target_dir);
+    }
+    std::fs::create_dir_all(&target_dir)?;
+    copy_dir_recursive(source_dir, &target_dir)?;
+    Ok(())
 }
 
 /// 删除整个快照目录(restore 完成后的清理)。
