@@ -1,7 +1,7 @@
 //! `/api/update/*` —— 升级检查 + 安装包下载 + 平台判断.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -104,22 +104,6 @@ pub(super) fn asset_filename_from_url(url: &str) -> String {
                 .map(|name| name.to_owned())
         })
         .unwrap_or_default()
-}
-
-pub(super) fn file_sha256(path: &FsPath) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| format!("read installer failed: {e}"))?;
-    let mut digest = Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| format!("read installer failed: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 pub(super) fn pick_platform_data<'a>(
@@ -296,23 +280,58 @@ fn sig_url_for(url: &str) -> Result<String, String> {
 
 /// 拉同名 `.sig` 文件文本(base64 编码 RSA 签名)。
 ///
-/// 失败原因:
-/// - 网络 / DNS 错
-/// - HTTP 4xx/5xx (404 = 服务端漏签,严重错误,客户端必须硬拒)
-/// - 响应非合法 UTF-8 文本
+/// 错误信息只 emit HTTP status 数字 + 简短诊断 hint,不附完整 URL — self-host 用
+/// token-query URL 时 reqwest `error_for_status_ref()` 默认 format 会把全 URL
+/// 含 query 塞错误链, 通过 stderr / 日志 / UI 反馈泄漏。code-reviewer PR #197 NIT-3 修。
+/// 区分 404 (操作员漏签) vs 5xx (源站故障) vs 其他 — silent-failure-hunter
+/// followup #37 IMPORTANT-2 (诊断 actionability)。
 async fn fetch_signature_text(client: &reqwest::Client, sig_url: &str) -> Result<String, String> {
     let response = client
         .get(sig_url)
         .send()
         .await
         .map_err(|e| format!("signature request failed: {e}"))?;
-    response
-        .error_for_status_ref()
-        .map_err(|e| format!("signature request failed: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        let hint = if code == 404 {
+            " (check whether .sig is published)"
+        } else if status.is_server_error() {
+            " (origin error)"
+        } else {
+            ""
+        };
+        return Err(format!("signature request failed: HTTP {code}{hint}"));
+    }
     response
         .text()
         .await
         .map_err(|e| format!("signature read failed: {e}"))
+}
+
+/// in-memory installer 单文件 hard cap, 防 self-host 操作员误配置 / latest.json
+/// asset.size 字段失实导致 Vec 无界扩张 OOM 整个 Tauri 进程 (silent-failure-hunter
+/// followup #37 IMPORTANT-1)。
+///
+/// 500MB 是合理上限:历史最大 installer ~50MB (Linux x86_64 .tar.gz),
+/// 留 10x headroom 给 SDK 内置 deps / multi-arch fat binary。超此值视为攻击 /
+/// 错配 / 自伤场景, 早 fail。
+const INSTALLER_SIZE_HARD_CAP: u64 = 500 * 1024 * 1024;
+
+/// 校验 installer bytes sha256 跟 latest.json 声明值匹配。
+///
+/// 返回 actual sha256 hex (lowercase) 供 caller 写进 download_asset_impl 返回的 JSON。
+/// expected_sha 空白 / 缺字段时跳过比较 (latest.json 旧 schema 兼容)。
+///
+/// 抽独立函数让 update.rs::tests 可以单测 sha256 mismatch 路径,不依赖 mock server +
+/// 真签名 (code-reviewer PR #197 IMPORTANT-2 — bad-sha 测试 re-add)。
+fn verify_installer_sha256(bytes: &[u8], expected_sha: &str) -> Result<String, String> {
+    let actual_sha = format!("{:x}", Sha256::digest(bytes));
+    let expected_lower = expected_sha.trim().to_ascii_lowercase();
+    if !expected_lower.is_empty() && actual_sha.to_ascii_lowercase() != expected_lower {
+        return Err("installer checksum mismatch, install cancelled".to_owned());
+    }
+    Ok(actual_sha)
 }
 
 pub(super) async fn fetch_latest_json(
@@ -442,6 +461,26 @@ pub(super) async fn download_asset_impl(
             .unwrap_or("update")
     ));
 
+    // download installer 同时写 partial + 累积 in-memory Vec<u8>。
+    // verify + sha256 都用 in_memory 一份 bytes, 不再 fs::read 二次读 partial:
+    //   - 防 silent-failure-hunter PR #197 IMPORTANT-2 报的 TOCTOU window
+    //     (Linux 共享 /tmp, 别用户 swap partial 在 sig fetch await 期间)
+    //   - 简化 cleanup: 不再保留 partial 仅用于 verify, 仅用于 rename 到 target
+    // peak RAM ~ installer size (35MB dmg / 30MB exe) — desktop Tauri 可接受;
+    // 但流式 length check 仍必要防 latest.json size 字段失实 → in-stream OOM。
+    let declared_size = asset.get("size").and_then(|v| v.as_u64());
+    if let Some(size) = declared_size {
+        if size > INSTALLER_SIZE_HARD_CAP {
+            return Err(format!(
+                "installer size {} exceeds hard cap {} bytes",
+                size, INSTALLER_SIZE_HARD_CAP
+            ));
+        }
+    }
+    let initial_cap = declared_size
+        .map(|s| s.min(INSTALLER_SIZE_HARD_CAP) as usize)
+        .unwrap_or(64 * 1024);
+    let mut in_memory: Vec<u8> = Vec::with_capacity(initial_cap);
     let download_result: Result<(), String> = async {
         let mut response = client
             .get(url)
@@ -459,6 +498,17 @@ pub(super) async fn download_asset_impl(
             .map_err(|e| format!("download installer failed: {e}"))?
         {
             if !chunk.is_empty() {
+                // in-stream cap check 防 latest.json size 字段失实 / 缺失:
+                // 累积超过 hard cap 时 fail 早, 不耗光 RAM。
+                if (in_memory.len() as u64).saturating_add(chunk.len() as u64)
+                    > INSTALLER_SIZE_HARD_CAP
+                {
+                    return Err(format!(
+                        "installer download exceeded hard cap {} bytes",
+                        INSTALLER_SIZE_HARD_CAP
+                    ));
+                }
+                in_memory.extend_from_slice(&chunk);
                 file.write_all(&chunk)
                     .map_err(|e| format!("write installer failed: {e}"))?;
             }
@@ -470,12 +520,15 @@ pub(super) async fn download_asset_impl(
     .await;
     if let Err(e) = download_result {
         if let Err(rm_err) = fs::remove_file(&partial) {
-            tracing::warn!("failed to remove partial after download err: {rm_err}");
+            tracing::warn!(
+                "failed to remove partial {} after download err: {rm_err}",
+                partial.display()
+            );
         }
         return Err(e);
     }
 
-    // RSA 验签 installer bytes — true trust gate, 必须先于 sha256 check:
+    // RSA 验签 in_memory — true trust gate, 必须先于 sha256 check:
     //   - sha256 是 attacker-controlled(它在 latest.json 里, latest.json 改 url
     //     的同时可同步改 sha256, sha256 mismatch 只是 backup signal)
     //   - RSA sig 由 CI 用私钥离线签, attacker 无私钥不能伪造
@@ -484,39 +537,45 @@ pub(super) async fn download_asset_impl(
         .await
         .map_err(|e| {
             if let Err(rm_err) = fs::remove_file(&partial) {
-                tracing::warn!("failed to remove partial after sig fetch err: {rm_err}");
+                tracing::warn!(
+                    "failed to remove partial {} after sig fetch err: {rm_err}",
+                    partial.display()
+                );
             }
             format!("installer signature unavailable: {e}")
         })?;
-    let installer_bytes = fs::read(&partial).map_err(|e| {
+    if let Err(e) = verify_signed_bytes(&in_memory, &installer_sig) {
         if let Err(rm_err) = fs::remove_file(&partial) {
-            tracing::warn!("failed to remove partial after read err: {rm_err}");
-        }
-        format!("read installer for verify failed: {e}")
-    })?;
-    if let Err(e) = verify_signed_bytes(&installer_bytes, &installer_sig) {
-        if let Err(rm_err) = fs::remove_file(&partial) {
-            tracing::warn!("failed to remove partial after verify err: {rm_err}");
+            tracing::warn!(
+                "failed to remove partial {} after verify err: {rm_err}",
+                partial.display()
+            );
         }
         return Err(format!("installer signature invalid: {e}"));
     }
 
-    // sha256 redundant integrity check — RSA verify 已过,这里只是 defense-in-depth
-    // 跟 release_bundle.rs 写的 sha256 字段对账。expected_sha 缺字段时跳过 (latest.json
-    // 旧 schema 兼容)。
-    let actual_sha = file_sha256(&partial)?;
-    let expected_sha = asset
-        .get("sha256")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if !expected_sha.is_empty() && actual_sha.to_ascii_lowercase() != expected_sha {
-        if let Err(rm_err) = fs::remove_file(&partial) {
-            tracing::warn!("failed to remove partial after sha mismatch: {rm_err}");
-        }
-        return Err("installer checksum mismatch, install cancelled".to_owned());
+    // sha256 redundant integrity check on in_memory bytes (defense-in-depth)。
+    // verify_installer_sha256 抽独立函数便于单测 mismatch 路径
+    // (code-reviewer PR #197 IMPORTANT-2 测试 re-add)。
+    let expected_sha = asset.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+    if expected_sha.trim().is_empty() {
+        // RSA verify 已经把住 trust gate, 缺 sha256 不影响安全, 但 self-host
+        // 操作员可能误 drop latest.json sha256 字段 — debug log 帮排查。
+        // 用 partial.display() 因 filename String 已被 updates_dir.join() move。
+        tracing::debug!(
+            "latest.json asset {} missing sha256, relying on RSA signature only",
+            partial.display()
+        );
     }
+    let actual_sha = verify_installer_sha256(&in_memory, expected_sha).map_err(|e| {
+        if let Err(rm_err) = fs::remove_file(&partial) {
+            tracing::warn!(
+                "failed to remove partial {} after sha mismatch: {rm_err}",
+                partial.display()
+            );
+        }
+        e
+    })?;
 
     if target.exists() {
         fs::remove_file(&target).map_err(|e| format!("write installer failed: {e}"))?;
@@ -722,6 +781,37 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::common::random_hex;
+
+    /// verify_installer_sha256 happy / mismatch / empty / whitespace 路径。
+    /// code-reviewer PR #197 IMPORTANT-2: bad-sha 测试 re-add — 抽 verify_installer_sha256
+    /// 独立函数让单测不需 mock server。
+    #[test]
+    fn verify_installer_sha256_paths() {
+        use sha2::Digest;
+        let bytes: &[u8] = b"hello-installer-bytes";
+        let real_sha = format!("{:x}", Sha256::digest(bytes));
+
+        // Happy: actual == expected
+        assert_eq!(verify_installer_sha256(bytes, &real_sha).unwrap(), real_sha);
+
+        // Mismatch: 期望 error string 完全匹配 ("installer checksum mismatch, install cancelled")
+        let bad = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let err = verify_installer_sha256(bytes, bad).unwrap_err();
+        assert_eq!(err, "installer checksum mismatch, install cancelled");
+
+        // Empty expected (latest.json 缺 sha256 字段): 跳过比较, 返 actual_sha
+        assert_eq!(verify_installer_sha256(bytes, "").unwrap(), real_sha);
+        assert_eq!(verify_installer_sha256(bytes, "   ").unwrap(), real_sha);
+
+        // Whitespace 容忍 + case-insensitive (xtask 输出小写, 但 self-host
+        // 用户可能写大写 hex)
+        assert_eq!(
+            verify_installer_sha256(bytes, &format!("  {real_sha}  ")).unwrap(),
+            real_sha
+        );
+        let upper = real_sha.to_ascii_uppercase();
+        assert_eq!(verify_installer_sha256(bytes, &upper).unwrap(), real_sha);
+    }
 
     /// sig_url_for 必须把 `.sig` 插到 URL path 段后缀 (而非裸字符串拼接),
     /// 这样 query string / fragment 在 self-host presigned URL / CDN
