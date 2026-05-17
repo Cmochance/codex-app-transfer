@@ -10,9 +10,13 @@
   gap: 28px;
 }
 
-.form-panel {
-  padding: 34px;
-}
+/* .form-panel padding: 34px (layer1) 是 dead code —— layer2
+   `.form-panel, .panel { padding: 24px }` 在 components/card.css 末段
+   总后到赢(card.css 跟 form.css 都在 components/, layer2 segment 跨
+   in-file 顺序无关), 拆分时若保留 layer1 padding: 34px 会因 form.css
+   alphabetical 比 card.css 晚 import 反向覆盖 layer2 compact 24px。
+   原 v2.1.11 cascade 这条本来就是 dead code, 删除等价。
+   codex-bot PR #195 review thread PRRT_kwDOSRcxvM6CpUX_ 修。 */
 
 .form-label {
   color: var(--text);
@@ -41,12 +45,12 @@
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 24%, transparent);
 }
 
-.form-control-lg,
-.form-select-lg {
-  min-height: 70px;
-  padding-inline: 24px;
-  font-size: 22px;
-}
+/* .form-control-lg / .form-select-lg layer1 70px (line 522-527 of orig)
+   是 dead code —— layer2 `.form-control-lg, .form-select-lg, .action-button,
+   .btn-lg { min-height: 38px }` 在 components/button.css 末段已经接管。
+   保留会因 form.css alphabetical 晚于 button.css import 反向覆盖 layer2
+   compact 38px → 控件回到 70px 大尺寸 (settings / add-provider 页 input)。
+   codex-bot PR #195 review thread PRRT_kwDOSRcxvM6CpUX_ 修。 */
 
 .input-with-button {
   position: relative;
