@@ -63,16 +63,20 @@
     restartReminderModal?.hide();
   }
 
-  async function restartCodexAppNow() {
-    const button = $("#restartReminderNow");
+  async function restartCodexAppNow({
+    buttonId = "restartReminderNow",
+    fallbackLabelKey = "restartReminder.now",
+    hideModal = true,
+  } = {}) {
+    const button = $(`#${buttonId}`);
     const original = button?.textContent;
     try {
       if (button) {
         button.disabled = true;
-        button.textContent = t("restartReminder.restarting");
+        button.textContent = t("restartReminder.restarting") || "重启中…";
       }
       await CCApi.restartCodexApp();
-      restartReminderModal?.hide();
+      if (hideModal) restartReminderModal?.hide();
       showToast(t("toast.codexAppRestartRequested"));
     } catch (error) {
       console.error(error);
@@ -80,7 +84,7 @@
     } finally {
       if (button) {
         button.disabled = false;
-        button.textContent = original || t("restartReminder.now");
+        button.textContent = original || t(fallbackLabelKey);
       }
     }
   }
@@ -1243,6 +1247,15 @@
       statusText.classList.toggle("muted-text", s.class === "muted");
       statusText.textContent = s.text;
       if (actions) actions.style.display = unlock.status === "injected" || unlock.status === "connected" ? "block" : "none";
+
+      // 同步设置页"运行时状态"提示。dashboard 卡片跟 settings 页用同一份
+      // /api/desktop/plugin-unlock/status 数据,文案前缀 "运行时状态：" 标识
+      // 这是 daemon 当前态(跟用户配置区分开)。
+      const runtimeNote = $("#pluginUnlockRuntimeStatus");
+      if (runtimeNote) {
+        const prefix = t("settings.pluginUnlockRuntimeStatusPrefix") || "运行时状态：";
+        runtimeNote.textContent = `${prefix}${s.text}`;
+      }
     } catch (e) {
       console.log("[PluginUnlock] status refresh failed:", e);
     }
@@ -2046,7 +2059,7 @@
     $("#settingsProxyPort").value = settings.proxyPort;
     $("#settingsAdminPort").value = settings.adminPort;
     $("#autoApplyOnStart").checked = settings.autoApplyOnStart !== false;
-   $("#autoUnlockCodexPlugins").checked = !!settings.autoUnlockCodexPlugins;
+   $("#autoUnlockCodexPlugins").checked = settings.autoUnlockCodexPlugins !== false;
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
@@ -3183,7 +3196,14 @@
       importConfigFile(event.target.files?.[0]);
     });
     $("#restartReminderLater")?.addEventListener("click", dismissRestartReminderLater);
-    $("#restartReminderNow")?.addEventListener("click", restartCodexAppNow);
+    $("#restartReminderNow")?.addEventListener("click", () => restartCodexAppNow());
+    $("#autoUnlockRestartCodex")?.addEventListener("click", () =>
+      restartCodexAppNow({
+        buttonId: "autoUnlockRestartCodex",
+        fallbackLabelKey: "settings.autoUnlockRestartCodex",
+        hideModal: false,
+      })
+    );
 
     $("#confirmDelete").addEventListener("click", async () => {
       if (!pendingDeleteId) return;

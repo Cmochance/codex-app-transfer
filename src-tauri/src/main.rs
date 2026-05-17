@@ -56,24 +56,26 @@ fn main() {
             });
 
             // ── Plugin Unlock 守护进程自动启动 ──
-            // 如果用户开启了 "autoUnlockCodexPlugins" 设置，启动 CDP 注入守护
+            // 默认开启;用户显式关掉 autoUnlockCodexPlugins=false 才跳过 auto-start。
+            // 必须复用 handlers::plugin_unlock 的 OnceCell 单例,否则会跟前端
+            // 手动 start 出来的 service 各自跑一份,frontend 查 status 看到的
+            // 是 OnceCell 那份 → 永远 Disconnected。
             tauri::async_runtime::spawn(async move {
                 // 延迟 5 秒，等桌面 apply + Codex 启动完成后再检测
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-                // 从 registry 中读取开关状态
                 let auto_unlock = match crate::admin::registry_io::load() {
                     Ok(cfg) => cfg
                         .get("settings")
                         .and_then(|s| s.get("autoUnlockCodexPlugins"))
                         .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    Err(_) => false,
+                        .unwrap_or(true),
+                    Err(_) => true,
                 };
 
                 if auto_unlock {
                     tracing::info!("[PluginUnlock] autoUnlockCodexPlugins=true, starting service");
-                    let service = crate::codex_plugin_unlocker::PluginUnlockService::default_new();
+                    let service = handlers::plugin_unlock::get_service().await;
                     service.start();
                 } else {
                     tracing::debug!(

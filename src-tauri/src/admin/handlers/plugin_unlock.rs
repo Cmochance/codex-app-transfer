@@ -26,9 +26,11 @@ use tokio::sync::OnceCell;
 
 static UNLOCK_SERVICE: OnceCell<Arc<PluginUnlockService>> = OnceCell::const_new();
 
-async fn get_service() -> Arc<PluginUnlockService> {
+/// 拿 OnceCell 内的解锁服务单例,前端 HTTP handler 跟 `main.rs` setup hook
+/// 都通过这个共享同一实例,避免 auto-start 跟手动 start 各跑一份 daemon。
+pub async fn get_service() -> Arc<PluginUnlockService> {
     UNLOCK_SERVICE
-        .get_or_init(|| async { Arc::new(PluginUnlockService::default_new()) })
+        .get_or_init(|| async { Arc::new(PluginUnlockService::with_defaults()) })
         .await
         .clone()
 }

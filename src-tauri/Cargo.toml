@@ -1,6 +1,6 @@
 [package]
 name = "codex-app-transfer"
-version = "2.1.8"
+version = "2.1.9"
 description = "Codex App Transfer - Tauri 2 shell"
 edition.workspace = true
 rust-version.workspace = true

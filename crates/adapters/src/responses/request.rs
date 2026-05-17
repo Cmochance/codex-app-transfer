@@ -990,26 +990,28 @@ fn provider_is_openai_official(provider: &Provider) -> bool {
     name.contains("openai") && !name.contains("azure")
 }
 
-/// 修复 / 重建工具调用 id 关联。
+/// 修复 / 重建工具调用 id 关联(双向)。
 ///
-/// 改造前 Python `responses_adapter.py:466-597 _repair_tool_call_ids` 的行为
-/// 等价 Rust 实现 + 把孤儿 tool 的"直接丢弃"换成"用 ToolCallCache 兜底重建,
-/// 否则插占位 assistant"。
-///
-/// 三类输入:
+/// **正向(tool message 找 assistant.tool_calls)**:
 ///   1. tool_call_id 为空 → 从前一条 assistant.tool_calls 顺序补 id
 ///   2. tool_call_id 非空且能在前 assistant.tool_calls 找到 → 直接 ack 通过
 ///   3. tool_call_id 非空但前 assistant 不含该 id(history 被压缩 / 截断 /
 ///      跨 session 续接)→ 查 ToolCallCache:
 ///        - 命中:把 tool_call 注回最近一条 assistant 的 tool_calls 列表
-///        - 未命中:在前面塞一条占位 assistant `{role:assistant, content:"",
-///          tool_calls:[{id, type:function, function:{name:"", arguments:""}}]}`,
-///          让 Chat 上游(Kimi / DeepSeek 严格校验)能匹配上不报 400
+///        - 未命中:在前面塞一条占位 assistant
 ///   4. 完全没有前置 assistant + cache 也没有 → 插占位 assistant + 保留 tool
 ///
-/// 与 litellm 1.84.0 `transformation.py:802-948
-/// _ensure_tool_results_have_corresponding_tool_calls` 行为一致(只是 litellm
-/// 还做 Anthropic 合并,本仓库不需要)。
+/// **反向(assistant.tool_calls 找 tool message)** (issue #180):
+///   - assistant.tool_calls = [a, b, c] 但只跟了 tool b → DeepSeek / Kimi 严格
+///     校验时 400("tool result without matching tool_use" 等)。
+///   - 解决:在三个状态切换点 flush pending —— 进新 assistant message / 进
+///     user/system/developer / 遍历末尾 —— 对每个未应答 id 注入占位 tool
+///     消息,id 严格匹配上一条 assistant.tool_calls,content 用 litellm 同款
+///     "[System: Tool execution skipped/interrupted by user. ...]"。
+///
+/// 与 litellm 1.84.0 `factory.py::_add_missing_tool_results` +
+/// `transformation.py::_ensure_tool_results_have_corresponding_tool_calls`
+/// 行为一致(只是 litellm 还做 Anthropic 合并,本仓库不需要)。
 fn repair_tool_call_ids(
     messages: &mut Vec<Value>,
     tool_call_cache: &super::tool_call_cache::ToolCallCache,
@@ -1026,6 +1028,13 @@ fn repair_tool_call_ids(
             .unwrap_or("")
             .to_owned();
         if role == "assistant" {
+            // 进新 assistant 前:把上一个 assistant 还没答完的 tool_calls
+            // 用占位 tool 消息补齐(issue #180 反向修复点 1/3)。
+            flush_pending_tool_calls_as_placeholders(
+                &mut repaired,
+                &mut pending_call_ids,
+                tool_call_cache,
+            );
             if let Some(calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                 pending_call_ids = calls
                     .iter()
@@ -1106,14 +1115,53 @@ fn repair_tool_call_ids(
         }
 
         if matches!(role.as_str(), "user" | "system" | "developer") {
-            pending_call_ids.clear();
+            // 进新一轮对话前:flush 上一轮未答完的 tool_calls(issue #180
+            // 并行工具调用部分应答场景的核心修复点 2/3)。
+            flush_pending_tool_calls_as_placeholders(
+                &mut repaired,
+                &mut pending_call_ids,
+                tool_call_cache,
+            );
             last_assistant_idx = None;
         }
 
         repaired.push(msg);
     }
 
+    // 末尾 flush:整段 input 末尾 assistant.tool_calls 没有任何 tool 应答
+    // (Codex CLI 中断生成 / 续轮时可能出现) (issue #180 修复点 3/3)。
+    flush_pending_tool_calls_as_placeholders(&mut repaired, &mut pending_call_ids, tool_call_cache);
+
     *messages = repaired;
+}
+
+/// 把 `pending_call_ids` 里每个未应答的 tool_call id 翻成一条占位 tool 消息,
+/// 直接 append 到 `repaired` 末尾(调用点保证此时插入位置是正确的:即上一条
+/// assistant.tool_calls 之后、下一条非 tool 消息之前)。
+fn flush_pending_tool_calls_as_placeholders(
+    repaired: &mut Vec<Value>,
+    pending_call_ids: &mut Vec<String>,
+    tool_call_cache: &super::tool_call_cache::ToolCallCache,
+) {
+    if pending_call_ids.is_empty() {
+        return;
+    }
+    for call_id in pending_call_ids.drain(..) {
+        let tool_name = tool_call_cache
+            .get(&call_id)
+            .map(|entry| entry.name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "unknown_tool".to_owned());
+        let content = format!(
+            "[System: Tool execution skipped/interrupted by user. \
+             No result provided for tool '{tool_name}'.]"
+        );
+        repaired.push(json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content,
+        }));
+    }
 }
 
 fn ensure_thinking_tool_call_reasoning(
@@ -4584,6 +4632,269 @@ mod tests {
         );
         let tool_msg = messages.iter().find(|m| m["role"] == "tool").unwrap();
         assert_eq!(tool_msg["tool_call_id"], "call_after_user");
+    }
+
+    /// issue #180:并行工具调用部分应答 —— assistant.tool_calls = [a, b, c],
+    /// 只有 tool b 跟上,然后 user 发新消息。DeepSeek / Kimi 严格校验时 400。
+    /// 修复后:user 之前应该插 a 和 c 的占位 tool 消息。
+    #[test]
+    fn parallel_tool_calls_partial_answer_gets_placeholder_for_missing_ids() {
+        let cache = empty_tool_cache();
+        let mut messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "shell", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"name": "shell", "arguments": "{}"}},
+                    {"id": "c", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            }),
+            json!({"role": "tool", "tool_call_id": "b", "content": "result_b"}),
+            json!({"role": "user", "content": "继续"}),
+        ];
+        repair_tool_call_ids(&mut messages, &cache);
+
+        // 期望顺序: assistant → tool(b) → placeholder(a) → placeholder(c) → user
+        assert_eq!(
+            messages.len(),
+            5,
+            "应当补齐 a/c 两条占位,实际 {:#?}",
+            messages
+        );
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "b");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "a");
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Tool execution skipped/interrupted"));
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "c");
+        assert_eq!(messages[4]["role"], "user");
+    }
+
+    /// 末尾 flush:整段 input 末尾 assistant.tool_calls 没有任何 tool 应答
+    /// (Codex CLI 中断 / 续轮时偶发)。修复后末尾应当补占位 tool。
+    #[test]
+    fn trailing_unanswered_tool_calls_get_placeholder_at_end() {
+        let cache = empty_tool_cache();
+        let mut messages = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "shell", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"name": "shell", "arguments": "{}"}},
+                ],
+            }),
+        ];
+        repair_tool_call_ids(&mut messages, &cache);
+
+        // 期望: user → assistant → placeholder(a) → placeholder(b)
+        assert_eq!(
+            messages.len(),
+            4,
+            "末尾 pending 必须 flush,实际 {:#?}",
+            messages
+        );
+        assert_eq!(messages[2]["tool_call_id"], "a");
+        assert_eq!(messages[3]["tool_call_id"], "b");
+    }
+
+    /// 连续 assistant message 之间没有 tool 应答:老 pending 应在新 assistant
+    /// 之前 flush,而不是被静默覆盖。
+    #[test]
+    fn consecutive_assistants_flush_pending_before_overwrite() {
+        let cache = empty_tool_cache();
+        let mut messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "old", "type": "function", "function": {"name": "shell", "arguments": "{}"}},
+                ],
+            }),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "new", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            }),
+        ];
+        repair_tool_call_ids(&mut messages, &cache);
+
+        // 期望: assistant1 → placeholder(old) → assistant2 → placeholder(new)
+        assert_eq!(messages.len(), 4, "实际 {:#?}", messages);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "old");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "old");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "new");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "new");
+    }
+
+    /// flush 时优先从 ToolCallCache 拿真实 tool name,占位 content 带工具名。
+    #[test]
+    fn flush_uses_tool_name_from_cache_when_available() {
+        let cache = empty_tool_cache();
+        cache.save(
+            "call_a",
+            super::super::tool_call_cache::ToolCallEntry {
+                name: "web_search".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        );
+        let mut messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "web_search", "arguments": "{}"}},
+                ],
+            }),
+            json!({"role": "user", "content": "stop"}),
+        ];
+        repair_tool_call_ids(&mut messages, &cache);
+        let placeholder = messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "call_a")
+            .expect("应有占位 tool");
+        let content = placeholder["content"].as_str().unwrap();
+        assert!(
+            content.contains("'web_search'"),
+            "cache 命中时占位 content 应带真实 tool name,实际 {content}"
+        );
+    }
+
+    /// cache 没命中时,占位 content 应当退化为 'unknown_tool'(还是带文案,
+    /// 上游能 match id 不报 400)。
+    #[test]
+    fn flush_falls_back_to_unknown_tool_when_cache_misses() {
+        let cache = empty_tool_cache();
+        let mut messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "ghost", "type": "function", "function": {"name": "shell", "arguments": "{}"}},
+                ],
+            }),
+            json!({"role": "user", "content": "stop"}),
+        ];
+        repair_tool_call_ids(&mut messages, &cache);
+        let placeholder = messages
+            .iter()
+            .find(|m| m["tool_call_id"] == "ghost")
+            .expect("应有占位 tool");
+        let content = placeholder["content"].as_str().unwrap();
+        assert!(
+            content.contains("'unknown_tool'"),
+            "cache miss 时占位文案应退化为 unknown_tool,实际 {content}"
+        );
+    }
+
+    /// 综合回归:同一段 history 里既有正向孤儿(tool 找不到 assistant.tool_calls)
+    /// 又有反向孤儿(assistant.tool_calls 找不到 tool),两侧都要修。
+    #[test]
+    fn forward_and_reverse_orphans_both_get_repaired() {
+        // history(模拟 Codex CLI 长会话压缩 + 并行工具调用部分应答):
+        //   tool a (孤儿,没有 assistant)
+        //   assistant{tool_calls:[b, c]}
+        //   tool b
+        //   user
+        let cache = empty_tool_cache();
+        cache.save(
+            "a",
+            super::super::tool_call_cache::ToolCallEntry {
+                name: "shell".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        );
+        let mut messages = vec![
+            json!({"role": "tool", "tool_call_id": "a", "content": "result_a"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "b", "type": "function", "function": {"name": "shell", "arguments": "{}"}},
+                    {"id": "c", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            }),
+            json!({"role": "tool", "tool_call_id": "b", "content": "result_b"}),
+            json!({"role": "user", "content": "继续"}),
+        ];
+        repair_tool_call_ids(&mut messages, &cache);
+
+        // 正向:tool a 前应有占位 assistant
+        let first = &messages[0];
+        assert_eq!(
+            first["role"], "assistant",
+            "正向孤儿应插占位 assistant 在前"
+        );
+        assert_eq!(first["tool_calls"][0]["id"], "a");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "a");
+
+        // 反向:assistant{b,c} → tool b → 应有占位 tool c → user
+        let assistant_bc = messages
+            .iter()
+            .find(|m| {
+                m["role"] == "assistant" && m["tool_calls"].as_array().map(|a| a.len()) == Some(2)
+            })
+            .expect("应有 [b,c] 的 assistant");
+        assert_eq!(assistant_bc["tool_calls"][0]["id"], "b");
+        assert_eq!(assistant_bc["tool_calls"][1]["id"], "c");
+        let placeholder_c = messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c")
+            .expect("应有 c 的占位 tool");
+        assert!(placeholder_c["content"]
+            .as_str()
+            .unwrap()
+            .contains("Tool execution skipped/interrupted"));
+        assert_eq!(messages.last().unwrap()["role"], "user");
+    }
+
+    /// 端到端:走完整 convert(包含 build_messages_from_input +
+    /// merge_consecutive_assistant_messages + repair_tool_call_ids),复现
+    /// issue #180 用户描述的 Responses input → Chat messages 转换路径。
+    #[test]
+    fn issue_180_responses_input_parallel_partial_answer_end_to_end() {
+        let out = convert(json!({
+            "input": [
+                {"type": "function_call", "call_id": "a", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "b", "name": "shell", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c", "name": "search", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "b", "output": "result_b"},
+                {"type": "message", "role": "user", "content": "继续"}
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+
+        // 期望: assistant{a,b,c} → tool b → placeholder a → placeholder c → user
+        assert_eq!(msgs.len(), 5, "端到端 messages 长度,实际 {:#?}", msgs);
+        assert_eq!(msgs[0]["role"], "assistant");
+        let tool_calls = msgs[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 3);
+        assert_eq!(tool_calls[0]["id"], "a");
+        assert_eq!(tool_calls[1]["id"], "b");
+        assert_eq!(tool_calls[2]["id"], "c");
+        assert_eq!(msgs[1]["tool_call_id"], "b");
+        assert_eq!(msgs[1]["content"], "result_b");
+        assert_eq!(msgs[2]["tool_call_id"], "a");
+        assert!(msgs[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("skipped/interrupted"));
+        assert_eq!(msgs[3]["tool_call_id"], "c");
+        assert_eq!(msgs[4]["role"], "user");
     }
 
     #[test]
