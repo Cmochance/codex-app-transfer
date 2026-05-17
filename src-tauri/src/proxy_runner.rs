@@ -22,6 +22,7 @@ use codex_app_transfer_registry::{config_file, Config};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct ProxyStatus {
@@ -37,6 +38,15 @@ pub struct ProxyStatus {
 struct ProxyHandle {
     addr: SocketAddr,
     shutdown_tx: oneshot::Sender<()>,
+    /// axum::serve task 的 JoinHandle — stop / stop_silent 在发 graceful
+    /// shutdown 信号**之后**立刻 task.abort() 强制 drop server future,
+    /// listener 同步 drop → 端口立刻释放。
+    ///
+    /// 修 silent failure:graceful_shutdown 等所有 in-flight connection
+    /// 完成才 drop listener,SSE / long-polling / hung connection 可能
+    /// 永远等不到 → 端口不释放,但 UI / log 已 "stopped" → 用户感知
+    /// "停了但端口还占"。abort 保证 stop_silent 同步返时端口必释放。
+    task: JoinHandle<()>,
     gateway_auth: bool,
     provider_count: usize,
     active_provider: Option<String>,
@@ -78,7 +88,7 @@ impl ProxyManager {
             .map_err(|e| format!("cannot read listener address: {e}"))?;
         let router = build_router(Arc::new(snapshot.resolver));
         let (tx, rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _ = axum::serve(listener, router.into_make_service())
                 .with_graceful_shutdown(async move {
                     let _ = rx.await;
@@ -90,14 +100,17 @@ impl ProxyManager {
         let new_handle = ProxyHandle {
             addr,
             shutdown_tx: tx,
+            task,
             gateway_auth: snapshot.gateway_auth,
             provider_count: snapshot.provider_count,
             active_provider: snapshot.active_provider.clone(),
         };
         let mut guard = self.handle.lock().unwrap();
         if guard.is_some() {
-            // race condition,自己的 listener 让出去:发 shutdown 给自己再报错
+            // race condition,自己的 listener 让出去:发 shutdown + abort task
+            // (abort 同步 drop listener,端口立刻释放,不依赖 graceful drain)
             let _ = new_handle.shutdown_tx.send(());
+            new_handle.task.abort();
             return Err("proxy already started by another path".to_owned());
         }
         *guard = Some(new_handle);
@@ -110,13 +123,21 @@ impl ProxyManager {
         })
     }
 
-    /// 触发 graceful shutdown。未 running 时报错。
+    /// 触发 graceful shutdown 后立刻 abort task 释放端口。未 running 时报错。
+    ///
+    /// **为什么两步**:`shutdown_tx.send(())` 给 axum graceful drain 机会让
+    /// 正常完成的 request 跑完;紧跟 `task.abort()` 同步 drop server future
+    /// → listener drop → **端口立刻释放**,不会卡在 in-flight SSE / long
+    /// polling / hung connection 上(那种 connection 可能永远 drain 不完)。
+    /// 代价:in-flight connection 被强断,client 见 connection reset —
+    /// 但"用户点停止 = 真要停",这是合理 trade-off。
     #[allow(dead_code)]
     pub fn stop(&self) -> Result<(), String> {
         let mut guard = self.handle.lock().unwrap();
         match guard.take() {
             Some(h) => {
                 let _ = h.shutdown_tx.send(());
+                h.task.abort();
                 Ok(())
             }
             None => Err("proxy is not running".to_owned()),
@@ -124,10 +145,12 @@ impl ProxyManager {
     }
 
     /// 静默 stop:用于 app exit / 异常路径,不报错只尽力关。
+    /// 同样走 send signal + abort 双保险确保端口释放(详见 [`Self::stop`])。
     pub fn stop_silent(&self) {
         let mut guard = self.handle.lock().unwrap();
         if let Some(h) = guard.take() {
             let _ = h.shutdown_tx.send(());
+            h.task.abort();
         }
     }
 
