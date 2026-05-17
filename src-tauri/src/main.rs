@@ -52,6 +52,23 @@ fn main() {
         .setup(|app| {
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
+            // follow-up #29:GC ~/.codex-app-transfer/codex-snapshots/trash/ 下
+            // mtime > 30 天的软删 bucket。fire-and-forget,失败仅 warn,不阻塞
+            // startup。retention=30 给用户"误点 cleanup_all 后还有 30 天可在
+            // trash/ 手动恢复"的窗口。
+            tauri::async_runtime::spawn(async {
+                if let Ok(paths) = codex_app_transfer_codex_integration::CodexPaths::from_home_env()
+                {
+                    let removed =
+                        codex_app_transfer_codex_integration::gc_trash_older_than(&paths, 30);
+                    if removed > 0 {
+                        tracing::info!(
+                            removed,
+                            "snapshot trash GC: removed buckets older than 30 days"
+                        );
+                    }
+                }
+            });
             tauri::async_runtime::spawn(async move {
                 let _ = handlers::desktop::auto_apply_on_startup_if_enabled(startup_proxy_manager)
                     .await;
