@@ -80,6 +80,8 @@ related_pr: <PR# 或 null>
 ## Active
 
 - [#23 P3 grok_web 末尾 url_citation 列表是否冗余](followup/23-grok-web-url-citation-redundancy.md) — 跟正文 markdown link 重复,实施前需真机看 Codex CLI 渲染
+- [#24 P2 RFC: Codex AGENTS.md / config.toml 受管块管理(借鉴 AiMaMi)](followup/24-codex-agents-md-managed-block.md) — Q3 四合一管理页的底层基础,marker + history + Protected 模式
+- [#25 P2 MCP / Skills / Memories / Agents 四合一管理页(借鉴 AiMaMi)](followup/25-codex-mgmt-four-in-one-page.md) — 用户 Q3 需求,sidebar+lazy+tanstack-query,依赖 #24
 
 ---
 
