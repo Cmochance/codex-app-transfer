@@ -68,6 +68,19 @@ fn classify_upstream_error_code(status: u16, raw: Option<&str>) -> &'static str 
     }
 }
 
+/// 检测 provider baseUrl 是否落在阿里云百炼 Token Plan MaaS host
+/// `token-plan.cn-beijing.maas.aliyuncs.com`。普通百炼
+/// `dashscope.aliyuncs.com` 不命中。
+fn provider_is_bailian_token_plan(provider: &Value) -> bool {
+    let Some(base_url) = provider.get("baseUrl").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    reqwest::Url::parse(base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
+        .is_some_and(|host| host == "token-plan.cn-beijing.maas.aliyuncs.com")
+}
+
 fn model_endpoint_candidates(provider: &Value) -> Vec<String> {
     let base_url = clean_base_url(
         provider
@@ -381,6 +394,33 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
         return fetch_antigravity_models_impl().await;
     }
 
+    // **百炼 Token Plan 套餐** (`token-plan.cn-beijing.maas.aliyuncs.com`) 不暴露
+    // `compatible-mode/v1/models` endpoint(网关在所有 unknown path 都返 401,
+    // routing 在 auth 之后)。阿里官方 Qwen CLI 自身就走静态硬编码,见
+    // QwenLM/qwen-code `packages/cli/src/auth/providers/alibaba/tokenPlan.ts`
+    // 里 `TOKEN_PLAN_MODELS` 数组(Apache-2.0)。对照另一组实证:
+    //   - aliyun/iac-code `src/iac_code/providers/dashscope_provider.py:13`
+    //     同样静态注册,不调 list models
+    //   - VicBilibily/GCMP `src/providers/config/dashscope.json` 给 token-plan
+    //     建静态 9 条 model registry(扩展候选,但部分 v4-* 套餐不一定都给)
+    // 这里跟 Qwen CLI 的 canonical 4 条对齐;用户仍可手工填充未列出的 model id。
+    // 普通百炼 (`dashscope.aliyuncs.com/compatible-mode/v1`) 的 `/models` 经
+    // 用户实测可用 → 不走这条 short-circuit,继续走通用 HTTP probe 路径。
+    if provider_is_bailian_token_plan(provider) {
+        let model_ids = vec![
+            "qwen3.6-plus".to_owned(),
+            "deepseek-v3.2".to_owned(),
+            "glm-5".to_owned(),
+            "MiniMax-M2.5".to_owned(),
+        ];
+        return json!({
+            "success": true,
+            "endpoint": "(static: bailian token-plan hardcoded list, upstream gateway 无 /models)",
+            "models": model_ids.clone(),
+            "suggested": suggest_model_mappings(&model_ids),
+        });
+    }
+
     let endpoints = model_endpoint_candidates(provider);
     if endpoints.is_empty() {
         return json!({
@@ -579,6 +619,53 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_is_bailian_token_plan_matches_only_token_plan_host() {
+        assert!(provider_is_bailian_token_plan(&json!({
+            "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        })));
+        // host 大小写不敏感
+        assert!(provider_is_bailian_token_plan(&json!({
+            "baseUrl": "https://Token-Plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+        })));
+        // 普通百炼 dashscope host 不命中 — 它有可用的 /models endpoint,
+        // 保留通用 HTTP probe 路径
+        assert!(!provider_is_bailian_token_plan(&json!({
+            "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        })));
+        assert!(!provider_is_bailian_token_plan(
+            &json!({"baseUrl": "https://api.openai.com/v1"})
+        ));
+        assert!(!provider_is_bailian_token_plan(&json!({})));
+    }
+
+    #[test]
+    fn fetch_provider_models_bailian_token_plan_returns_static_list_no_http() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(fetch_provider_models_impl(&json!({
+            "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            "apiFormat": "openai_chat",
+        })));
+        assert_eq!(result["success"], json!(true));
+        let models: Vec<String> = result["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        // 跟 QwenLM/qwen-code packages/cli/src/auth/providers/alibaba/tokenPlan.ts
+        // 里 TOKEN_PLAN_MODELS 数组对齐(Apache-2.0,2026-05 同步)
+        assert_eq!(
+            models,
+            vec!["qwen3.6-plus", "deepseek-v3.2", "glm-5", "MiniMax-M2.5"]
+        );
+        // endpoint 标识必须明示是 static,不能让用户误以为真打了 HTTP
+        assert!(result["endpoint"].as_str().unwrap_or("").contains("static"));
+    }
 
     #[test]
     fn model_endpoint_candidates_anthropic_messages_use_models_endpoint() {
