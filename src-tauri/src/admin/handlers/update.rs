@@ -181,22 +181,16 @@ pub(super) fn pick_platform_installer(assets: &[Value], platform: &str) -> Resul
 
 pub(super) fn install_command_parts(path: &str, platform: &str) -> Result<Vec<String>, String> {
     if platform.starts_with("windows-") {
-        // follow-up #36: NSIS installer 默认装到编译时 hardcoded InstallDir
-        // (通常 C:\Program Files\Codex App Transfer\)。如果用户原本装在非
-        // 默认目录(D:\Apps\... / `\\server\share\...`),NSIS update 不传
-        // 安装位置会**双装**或回 C:\Program Files,丢用户原选择。
+        // **/D= 参数不在 args vec 里** — NSIS `/D=` 必须不带引号,但
+        // std::process::Command Windows 序列化时对含空格的 arg 自动加
+        // 引号(CommandLineToArgvW 反向规则),会让 /D=D:\\Apps\\Codex App
+        // Transfer 被包成 "/D=D:\\Apps\\Codex App Transfer" → NSIS 忽略
+        // /D 回默认 InstallDir(chatgpt-codex PR #205 P2 review 指出)。
         //
-        // 借鉴 AiMaMi `src-tauri/src/admin/update.rs:7-23`:把当前 .exe
-        // parent dir 用 NSIS `/D=<path>` 参数透传给 installer。NSIS 语法
-        // 限制:`/D=` 必须**最后一个 arg** + 不带引号(整段是字面字符串)。
-        //
-        // dev 模式当前 .exe 在 target/debug 或 target/release,update 本来
-        // 就不会真跑(用户不会从 cargo run 触发 update),不需要特化判断。
-        let mut cmd = vec![path.to_owned()];
-        if let Some(install_dir) = current_exe_parent_dir() {
-            cmd.push(format!("/D={install_dir}"));
-        }
-        return Ok(cmd);
+        // 真实 /D= 通过 launch_update_installer Windows 路径的
+        // CommandExt::raw_arg() bypass quoting 注入,这里 args vec 只放
+        // installer path 本身。follow-up #36 的语义不变,实现路径分两层。
+        return Ok(vec![path.to_owned()]);
     }
     if platform.starts_with("macos-") {
         return Ok(vec!["open".to_owned(), path.to_owned()]);
@@ -208,6 +202,11 @@ pub(super) fn install_command_parts(path: &str, platform: &str) -> Result<Vec<St
 
 /// 返回当前 binary 的 parent dir(字符串形式)。用于 Windows `/D=` 参数。
 /// 失败(current_exe / parent / to_str)返 None,caller 应不传 `/D=` 走默认。
+///
+/// `#[cfg(any(target_os = "windows", test))]`:production only-Windows
+/// 用(launch_update_installer raw_arg),非-Windows production dead 但
+/// test 仍跑(verify cargo test runner 路径可解析)。
+#[cfg(any(target_os = "windows", test))]
 fn current_exe_parent_dir() -> Option<String> {
     std::env::current_exe()
         .ok()?
@@ -305,12 +304,23 @@ pub(super) fn launch_update_installer(
     let Some((program, args)) = command.split_first() else {
         return Err("install command is empty".to_owned());
     };
-    Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    // follow-up #36 真正注入 /D= NSIS install dir — 必须 raw_arg bypass
+    // Rust 自动 quoting(否则含空格路径如 `D:\Apps\Codex App Transfer`
+    // 会被包成 `"/D=D:\\Apps\\Codex App Transfer"` 让 NSIS ignore /D=)。
+    // raw_arg 直接 append 到 command line,Windows-only。
+    #[cfg(target_os = "windows")]
+    if platform.starts_with("windows-") {
+        if let Some(install_dir) = current_exe_parent_dir() {
+            use std::os::windows::process::CommandExt;
+            cmd.raw_arg(format!("/D={install_dir}"));
+        }
+    }
+    cmd.spawn()
         .map(|_| false)
         .map_err(|e| format!("launch installer failed: {e}"))
 }
@@ -932,24 +942,15 @@ mod tests {
             install_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64").unwrap(),
             vec!["open", "/tmp/Codex-App-Transfer.pkg"]
         );
-        // follow-up #36: Windows 现在追加 /D=<current_exe parent> (NSIS 安装
-        // 目录保持)。测试在 macOS/Linux CI 跑时 current_exe parent 是 cargo
-        // target/.../deps,不是真 Windows install dir,但 helper 行为对称 —
-        // 验 vec 至少有 installer + 可能有 /D= 参数(若 current_exe 可解析)。
-        let win_cmd =
-            install_command_parts("C:\\Codex-App-Transfer-Windows-Setup.exe", "windows-x64")
-                .unwrap();
-        assert_eq!(win_cmd[0], "C:\\Codex-App-Transfer-Windows-Setup.exe");
-        // current_exe 在 test runner 下基本必然解析成功
+        // follow-up #36: Windows 路径返单 installer arg。NSIS /D= 在
+        // launch_update_installer Windows 路径走 CommandExt::raw_arg
+        // 注入(不在 args vec 里),原因:std::process::Command 自动对
+        // 含空格 arg 加引号,会让 NSIS ignore /D= 落回默认 InstallDir
+        // (chatgpt-codex PR #205 P2 review 指出)。
         assert_eq!(
-            win_cmd.len(),
-            2,
-            "expected installer + /D= arg, got: {win_cmd:?}"
-        );
-        assert!(
-            win_cmd[1].starts_with("/D="),
-            "second arg must be NSIS /D= form, got: {}",
-            win_cmd[1]
+            install_command_parts("C:\\Codex-App-Transfer-Windows-Setup.exe", "windows-x64")
+                .unwrap(),
+            vec!["C:\\Codex-App-Transfer-Windows-Setup.exe"]
         );
         assert_eq!(
             install_after_quit_command_parts("/tmp/Codex-App-Transfer.pkg", "macos-arm64", 1234)
