@@ -2,9 +2,20 @@
 id: 34
 priority: P2
 type: bug
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+resolved_pr: 197
+resolved_date: 2026-05-17
+resolution_summary: |
+  PR #197 (commit 528bdf1) 实施客户端 RSA-3072 验签:
+  - src-tauri/src/admin/signature.rs 新建 verify_signed_bytes (line 74) —
+    PKCS#1 v1.5 SHA-256 验签 helper,公钥嵌入 release/Codex-App-Transfer-
+    release-public.pem。
+  - update.rs:15 import + line 521 download_asset_impl 流程中"先验签后
+    sha256" 双 gate,attacker 改 sha256 也过不了 RSA 验签关。
+  - 配套生成 release/latest.json + latest.json.sig (CI 签),客户端用嵌入
+    公钥 verify, MITM 替换 sha256 推任意 installer 的攻击路径已堵。
+  P2 核心安全风险("签了但客户端不验")已 closed。
 ---
 
 # 客户端 latest.json + installer RSA 验签(签了但客户端不验)

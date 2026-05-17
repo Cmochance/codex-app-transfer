@@ -2,9 +2,23 @@
 id: 37
 priority: P3
 type: refactor
-status: active
+status: resolved
 created: 2026-05-17
 related_pr: 196
+resolved_pr: 199
+resolved_date: 2026-05-17
+resolution_summary: |
+  PR #199 (commit 36f5b1c) 实施完整:
+  - download_asset_impl (update.rs:414+) 重写: stream 进 in_memory: Vec<u8>
+    (line 479-505),验签 + sha256 双 gate 通过后才 fs::write 落盘
+    (line 546)。彻底消除 Linux /tmp 共享目录 TOCTOU window (attacker
+    swap 中间 partial file 已不可能 — 中间过程没文件)。
+  - 加 max size cap 防 OOM (line 497 saturating_add 检查)。
+  - bad-sha256 mismatch 单测 re-add (update.rs:750-764
+    verify_installer_sha256_paths 覆盖 happy / mismatch / empty /
+    whitespace 4 路径)。
+  - URL leak 防御 (PR #199 review 派生): 错误消息脱敏 URL 防外发。
+  PR #196 review 派生的所有改进项 closed。
 ---
 
 # update.rs download_asset_impl: in-memory bytes 防 TOCTOU + 重 add bad-sha256 mismatch 单测
