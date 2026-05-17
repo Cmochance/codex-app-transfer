@@ -61,8 +61,12 @@ fn main() {
             // 手动 start 出来的 service 各自跑一份,frontend 查 status 看到的
             // 是 OnceCell 那份 → 永远 Disconnected。
             tauri::async_runtime::spawn(async move {
-                // 延迟 5 秒，等桌面 apply + Codex 启动完成后再检测
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                // 启动延迟 1 秒(原 5 秒)。daemon 内部有指数退避 retry
+                // (1s→30s),首次 detect_cdp 失败会自动重试;5 秒太长导致
+                // 用户开 Codex Desktop 后 Plugins 锁定状态可见时间 ~5s+,
+                // 改 1s 让 daemon 更早 connect + 更早 inject,把"可见
+                // 锁定时间"压到 ~1-2s。
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 let auto_unlock = match crate::admin::registry_io::load() {
                     Ok(cfg) => cfg
