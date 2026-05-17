@@ -335,35 +335,11 @@ fn should_attach_debug_port() -> Vec<String> {
 fn open_codex_app(platform: &str) -> Result<(), String> {
     maybe_wake_codex_pet();
 
-    // Windows MSIX activation: see `windows_msix.rs` module docs。
-    // 失败时(MSIX 包未装 / PowerShell 不可用 / COM 调用 fail)fallthrough
-    // 到下方 explorer.exe shell:AppsFolder 老路径(args 会丢失,Plugin
-    // Unlock 不工作但至少能启动 Codex)。
+    // Windows MSIX activation: 见 `windows_msix.rs` module docs。失败时
+    // fallthrough 到 explorer.exe shell:AppsFolder 老路径(args 丢失)。
     #[cfg(target_os = "windows")]
-    if let Some(aumid) = crate::windows_msix::resolve_codex_aumid() {
-        let extra_args = should_attach_debug_port();
-        let cmdline = crate::windows_msix::list2cmdline(&extra_args);
-        tracing::info!(
-            aumid = %aumid,
-            cmdline = %cmdline,
-            "launching Codex Desktop via IApplicationActivationManager"
-        );
-        match crate::windows_msix::activate_packaged_app(&aumid, &cmdline) {
-            Ok(pid) => {
-                tracing::info!(pid, "Codex Desktop activated via COM");
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "ActivateApplication failed, falling back to explorer.exe shell:AppsFolder (无 debug port)"
-                );
-            }
-        }
-    } else {
-        tracing::warn!(
-            "MSIX package not found via Get-AppxPackage, falling back to explorer.exe shell:AppsFolder (无 debug port)"
-        );
+    if crate::windows_msix::try_launch_codex(&should_attach_debug_port()) {
+        return Ok(());
     }
 
     let resolved = if platform == "macos" {

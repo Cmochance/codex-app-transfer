@@ -133,6 +133,41 @@ pub fn resolve_codex_aumid() -> Option<String> {
     Some(format!("{pfn}!App"))
 }
 
+/// 完整的 "尝试用 ActivateApplication 启动 Codex MSIX" 流程封装。
+///
+/// 返 `true` = 成功(caller 应该立刻 return,不走 fallback);`false` =
+/// 应 fall through 到 explorer.exe `shell:AppsFolder` 老路径(args 会丢失,
+/// Plugin Unlock 在 fallback 下不工作,但 Codex 至少能启动)。
+///
+/// 失败原因 + 成功 PID 都记 tracing,caller 不用再 log。
+pub fn try_launch_codex(extra_args: &[String]) -> bool {
+    let Some(aumid) = resolve_codex_aumid() else {
+        tracing::warn!(
+            "MSIX package not found via Get-AppxPackage, falling back to explorer.exe shell:AppsFolder (无 debug port)"
+        );
+        return false;
+    };
+    let cmdline = list2cmdline(extra_args);
+    tracing::info!(
+        aumid = %aumid,
+        cmdline = %cmdline,
+        "launching Codex Desktop via IApplicationActivationManager"
+    );
+    match activate_packaged_app(&aumid, &cmdline) {
+        Ok(pid) => {
+            tracing::info!(pid, "Codex Desktop activated via COM");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ActivateApplication failed, falling back to explorer.exe shell:AppsFolder (无 debug port)"
+            );
+            false
+        }
+    }
+}
+
 /// 把 `Vec<String>` 按 Windows cmdline quoting 规则序列化成单一 PWSTR-ready
 /// 字符串,等价于 Python `subprocess.list2cmdline`。
 ///
