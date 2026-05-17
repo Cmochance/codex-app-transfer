@@ -1,7 +1,6 @@
 //! `/api/update/*` —— 升级检查 + 安装包下载 + 平台判断.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -452,22 +451,19 @@ pub(super) async fn download_asset_impl(
             .join("updates")
     });
     fs::create_dir_all(&updates_dir).map_err(|e| format!("write installer failed: {e}"))?;
-    let target = updates_dir.join(filename);
-    let partial = target.with_file_name(format!(
-        "{}.download",
-        target
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("update")
-    ));
+    let target = updates_dir.join(&filename);
 
-    // download installer 同时写 partial + 累积 in-memory Vec<u8>。
-    // verify + sha256 都用 in_memory 一份 bytes, 不再 fs::read 二次读 partial:
-    //   - 防 silent-failure-hunter PR #197 IMPORTANT-2 报的 TOCTOU window
-    //     (Linux 共享 /tmp, 别用户 swap partial 在 sig fetch await 期间)
-    //   - 简化 cleanup: 不再保留 partial 仅用于 verify, 仅用于 rename 到 target
-    // peak RAM ~ installer size (35MB dmg / 30MB exe) — desktop Tauri 可接受;
-    // 但流式 length check 仍必要防 latest.json size 字段失实 → in-stream OOM。
+    // 流式 download 只累积到 in-memory Vec<u8> — **不写 partial 文件**。
+    // 防 codex-bot PR #199 P1 报的 TOCTOU: 之前先写 partial 再 rename, attacker
+    // 可在 sig fetch await 期间 swap partial 文件, 让 verify pass 在
+    // in_memory 但 rename 安装 attacker 的 payload。skip partial 完全消除
+    // 中间文件 race window —— verify pass 后才一次性 fs::write target。
+    //
+    // 也顺带防 silent-failure-hunter PR #197 IMPORTANT-2 的 Linux /tmp TOCTOU
+    // (verify 跟 sha256 都 in-memory 一份 bytes, 不再 fs::read)。
+    //
+    // peak RAM ~ installer size (35MB dmg / 30MB exe) — desktop Tauri 可接受。
+    // 流式 length check 仍必要防 latest.json size 字段失实 → in-stream OOM。
     let declared_size = asset.get("size").and_then(|v| v.as_u64());
     if let Some(size) = declared_size {
         if size > INSTALLER_SIZE_HARD_CAP {
@@ -490,8 +486,6 @@ pub(super) async fn download_asset_impl(
         response
             .error_for_status_ref()
             .map_err(|e| format!("download installer failed: {e}"))?;
-        let mut file =
-            fs::File::create(&partial).map_err(|e| format!("write installer failed: {e}"))?;
         while let Some(chunk) = response
             .chunk()
             .await
@@ -509,48 +503,22 @@ pub(super) async fn download_asset_impl(
                     ));
                 }
                 in_memory.extend_from_slice(&chunk);
-                file.write_all(&chunk)
-                    .map_err(|e| format!("write installer failed: {e}"))?;
             }
         }
-        file.flush()
-            .map_err(|e| format!("write installer failed: {e}"))?;
         Ok(())
     }
     .await;
-    if let Err(e) = download_result {
-        if let Err(rm_err) = fs::remove_file(&partial) {
-            tracing::warn!(
-                "failed to remove partial {} after download err: {rm_err}",
-                partial.display()
-            );
-        }
-        return Err(e);
-    }
+    download_result?;
 
     // RSA 验签 in_memory — true trust gate, 必须先于 sha256 check:
     //   - sha256 是 attacker-controlled(它在 latest.json 里, latest.json 改 url
     //     的同时可同步改 sha256, sha256 mismatch 只是 backup signal)
     //   - RSA sig 由 CI 用私钥离线签, attacker 无私钥不能伪造
-    // 失败删 partial + 拒绝继续。code-reviewer #196 IMPORTANT-1 修。
+    // code-reviewer #196 IMPORTANT-1 修。
     let installer_sig = fetch_signature_text(client, &installer_sig_url)
         .await
-        .map_err(|e| {
-            if let Err(rm_err) = fs::remove_file(&partial) {
-                tracing::warn!(
-                    "failed to remove partial {} after sig fetch err: {rm_err}",
-                    partial.display()
-                );
-            }
-            format!("installer signature unavailable: {e}")
-        })?;
+        .map_err(|e| format!("installer signature unavailable: {e}"))?;
     if let Err(e) = verify_signed_bytes(&in_memory, &installer_sig) {
-        if let Err(rm_err) = fs::remove_file(&partial) {
-            tracing::warn!(
-                "failed to remove partial {} after verify err: {rm_err}",
-                partial.display()
-            );
-        }
         return Err(format!("installer signature invalid: {e}"));
     }
 
@@ -561,29 +529,22 @@ pub(super) async fn download_asset_impl(
     if expected_sha.trim().is_empty() {
         // RSA verify 已经把住 trust gate, 缺 sha256 不影响安全, 但 self-host
         // 操作员可能误 drop latest.json sha256 字段 — debug log 帮排查。
-        // 用 partial.display() 因 filename String 已被 updates_dir.join() move。
         tracing::debug!(
             "latest.json asset {} missing sha256, relying on RSA signature only",
-            partial.display()
+            target.display()
         );
     }
-    let actual_sha = verify_installer_sha256(&in_memory, expected_sha).map_err(|e| {
-        if let Err(rm_err) = fs::remove_file(&partial) {
-            tracing::warn!(
-                "failed to remove partial {} after sha mismatch: {rm_err}",
-                partial.display()
-            );
-        }
-        e
-    })?;
+    let actual_sha = verify_installer_sha256(&in_memory, expected_sha)?;
 
+    // verify pass 后才把 in_memory 写到 target — attacker 无中间文件可 swap。
+    // 不用 partial + rename 因为引入 race window (codex-bot #199 P1);
+    // fs::write 不 atomic 但 target 在 install 流程下次启动时仍由 launch_update_installer
+    // 直接读 — 单 process 写入完整, 不会被半截 file 触发安装 (write 是 sequential)。
     if target.exists() {
         fs::remove_file(&target).map_err(|e| format!("write installer failed: {e}"))?;
     }
-    fs::rename(&partial, &target).map_err(|e| format!("write installer failed: {e}"))?;
-    let size = fs::metadata(&target)
-        .map_err(|e| format!("read installer failed: {e}"))?
-        .len();
+    fs::write(&target, &in_memory).map_err(|e| format!("write installer failed: {e}"))?;
+    let size = in_memory.len() as u64;
     Ok(json!({
         "asset": asset,
         "path": target.to_string_lossy(),
