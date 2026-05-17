@@ -15,6 +15,7 @@
 //! - 监听 `Page.loadEventFired`,刷新后自动重新注入
 //! - 断开时指数退避重连
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio::time::{interval, sleep};
+use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -47,24 +48,20 @@ pub enum UnlockStatus {
 pub struct UnlockConfig {
     /// CDP HTTP 端点（获取 WebSocket URL）
     pub cdp_http_url: String,
-    /// 检测间隔（毫秒）
-    pub detect_interval_ms: u64,
-    /// 重连退避:初始延迟（毫秒）
+    /// 重连退避:初始延迟（毫秒）。第一次失败后等这么久重试,
+    /// 每次失败 ×2 直到 `reconnect_max_ms`。1s 起够快,不会让用户感觉卡。
     pub reconnect_base_ms: u64,
-    /// 重连退避:最大延迟（毫秒）
+    /// 重连退避上限。30s 是经验值:Codex 启动 / 系统休眠唤醒最长 ~30s 内
+    /// CDP 必然就绪,再长意义不大。
     pub reconnect_max_ms: u64,
-    /// 启动 Codex 时附加的调试参数
-    pub codex_debug_args: Vec<String>,
 }
 
 impl Default for UnlockConfig {
     fn default() -> Self {
         Self {
             cdp_http_url: "http://127.0.0.1:9222/json/list".into(),
-            detect_interval_ms: 3_000,
             reconnect_base_ms: 1_000,
             reconnect_max_ms: 30_000,
-            codex_debug_args: vec!["--remote-debugging-port=9222".into()],
         }
     }
 }
@@ -108,8 +105,8 @@ pub struct PluginUnlockService {
     /// 控制守护循环的通道
     cmd_tx: mpsc::Sender<ServiceCommand>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<ServiceCommand>>>,
-    /// 当前 CDP 消息 ID 计数器
-    msg_id: Arc<Mutex<u64>>,
+    /// CDP 消息 ID 单调递增计数器(无锁,daemon + tests 共享)
+    msg_id: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -127,8 +124,14 @@ impl PluginUnlockService {
             status: Arc::new(RwLock::new(UnlockStatus::Disconnected)),
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(cmd_rx)),
-            msg_id: Arc::new(Mutex::new(0)),
+            msg_id: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 使用默认配置创建。前端 HTTP handler 跟 setup hook 都通过这个共享同
+    /// 一份 OnceCell 实例,见 `admin::handlers::plugin_unlock::get_service`。
+    pub fn with_defaults() -> Self {
+        Self::new(UnlockConfig::default())
     }
 
     /// 获取当前状态
@@ -164,13 +167,15 @@ async fn run_daemon(
     config: UnlockConfig,
     status: Arc<RwLock<UnlockStatus>>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<ServiceCommand>>>,
-    msg_id: Arc<Mutex<u64>>,
+    msg_id: Arc<AtomicU64>,
 ) {
     let mut reconnect_delay = config.reconnect_base_ms;
-    let mut detect_tick = interval(Duration::from_millis(config.detect_interval_ms));
 
     loop {
-        // 检查是否有外部命令
+        // 检查是否有外部命令(此时未连 WS — 真正注入态的 Reinject 在
+        // `connect_and_monitor` 内 select! 处理)。未连接时收到 Reinject
+        // 视作"加速重连请求":reset backoff 让下一次 detect 立即跑,
+        // 而不是静默 noop。
         {
             let mut rx = cmd_rx.lock().await;
             if let Ok(cmd) = rx.try_recv() {
@@ -181,8 +186,10 @@ async fn run_daemon(
                         return;
                     }
                     ServiceCommand::Reinject => {
-                        tracing::info!("[PluginUnlock] reinject requested");
-                        // 直接跳到注入逻辑
+                        tracing::info!(
+                            "[PluginUnlock] reinject requested while disconnected, resetting backoff"
+                        );
+                        reconnect_delay = config.reconnect_base_ms;
                     }
                 }
             }
@@ -233,15 +240,15 @@ async fn run_daemon(
                 }
             }
             None => {
-                // CDP 不可用，保持 Disconnected
-                set_status_if_not(&status, UnlockStatus::Disconnected).await;
+                // CDP 不可用,保持 Disconnected。set_status 内部已做 != 比对,
+                // 无需额外 if_not 包装。
+                set_status(&status, UnlockStatus::Disconnected).await;
             }
         }
 
-        // 退避等待
+        // 指数退避:1s → 2s → 4s → ... → 30s 封顶
         sleep(Duration::from_millis(reconnect_delay)).await;
         reconnect_delay = (reconnect_delay * 2).min(config.reconnect_max_ms);
-        detect_tick.tick().await;
     }
 }
 
@@ -269,7 +276,7 @@ async fn detect_cdp(url: &str) -> Option<Vec<CdpPage>> {
 async fn connect_and_monitor(
     ws_url: &str,
     cmd_rx: &Arc<Mutex<mpsc::Receiver<ServiceCommand>>>,
-    msg_id_counter: &Arc<Mutex<u64>>,
+    msg_id_counter: &AtomicU64,
     status: &Arc<RwLock<UnlockStatus>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _) = connect_async(ws_url).await?;
@@ -277,13 +284,12 @@ async fn connect_and_monitor(
 
     // 1. 启用 Runtime domain
     let (runtime_enable, runtime_enable_id) =
-        make_cdp_msg(msg_id_counter, "Runtime.enable", json!({})).await;
+        make_cdp_msg(msg_id_counter, "Runtime.enable", json!({}));
     write.send(WsMessage::Text(runtime_enable)).await?;
     let _ = await_cdp_response(&mut read, runtime_enable_id, Duration::from_secs(5)).await;
 
     // 2. 启用 Page domain（监听刷新事件）
-    let (page_enable, page_enable_id) =
-        make_cdp_msg(msg_id_counter, "Page.enable", json!({})).await;
+    let (page_enable, page_enable_id) = make_cdp_msg(msg_id_counter, "Page.enable", json!({}));
     write.send(WsMessage::Text(page_enable)).await?;
     let _ = await_cdp_response(&mut read, page_enable_id, Duration::from_secs(5)).await;
 
@@ -340,7 +346,7 @@ async fn connect_and_monitor(
             _ = sleep(Duration::from_secs(30)) => {
                 // 发送一个简单的 Runtime.evaluate 来检测连接;响应会从外层
                 // select! 的 read.next() 分支流回,被忽略(不是 Page.loadEventFired)
-                let (ping, _ping_id) = make_cdp_msg(msg_id_counter, "Runtime.evaluate", json!({"expression": "1+1"})).await;
+                let (ping, _ping_id) = make_cdp_msg(msg_id_counter, "Runtime.evaluate", json!({"expression": "1+1"}));
                 if let Err(e) = write.send(WsMessage::Text(ping)).await {
                     tracing::warn!("[PluginUnlock] ping failed, connection dead: {}", e);
                     break;
@@ -356,7 +362,7 @@ async fn connect_and_monitor(
 async fn inject_unlock_script(
     write: &mut (impl Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     read: &mut (impl Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
-    msg_id_counter: &Arc<Mutex<u64>>,
+    msg_id_counter: &AtomicU64,
     status: &Arc<RwLock<UnlockStatus>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     set_status(status, UnlockStatus::Connected).await;
@@ -525,8 +531,7 @@ async fn inject_unlock_script(
             "awaitPromise": true,
             "returnByValue": true
         }),
-    )
-    .await;
+    );
 
     write.send(WsMessage::Text(evaluate)).await?;
 
@@ -617,23 +622,15 @@ async fn await_cdp_response(
 
 /// 生成 CDP 消息 JSON,返回 `(序列化后的 text frame, 该消息的 id)`。
 /// 调用方需保留 `id` 用于 `await_cdp_response` 匹配响应。
-async fn make_cdp_msg(
-    counter: &Arc<Mutex<u64>>,
-    method: &str,
-    params: serde_json::Value,
-) -> (String, u64) {
-    let mut id = counter.lock().await;
-    *id += 1;
-    let current_id = *id;
-    drop(id);
-
+fn make_cdp_msg(counter: &AtomicU64, method: &str, params: serde_json::Value) -> (String, u64) {
+    let id = counter.fetch_add(1, Ordering::Relaxed) + 1;
     let json = json!({
-        "id": current_id,
+        "id": id,
         "method": method,
-        "params": params
+        "params": params,
     })
     .to_string();
-    (json, current_id)
+    (json, id)
 }
 
 /// 设置状态（带日志）
@@ -642,24 +639,6 @@ async fn set_status(status: &Arc<RwLock<UnlockStatus>>, new: UnlockStatus) {
     if *s != new {
         tracing::info!("[PluginUnlock] status: {:?} → {:?}", *s, new);
         *s = new;
-    }
-}
-
-/// 仅在当前状态不等于目标时才设置（避免频繁写锁）
-async fn set_status_if_not(status: &Arc<RwLock<UnlockStatus>>, new: UnlockStatus) {
-    let s = status.read().await;
-    if *s != new {
-        drop(s);
-        set_status(status, new).await;
-    }
-}
-
-// ── 便捷构造函数 ──
-
-impl PluginUnlockService {
-    /// 使用默认配置创建
-    pub fn default_new() -> Self {
-        Self::new(UnlockConfig::default())
     }
 }
 

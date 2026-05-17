@@ -75,7 +75,7 @@ fn main() {
 
                 if auto_unlock {
                     tracing::info!("[PluginUnlock] autoUnlockCodexPlugins=true, starting service");
-                    let service = handlers::plugin_unlock::shared_service().await;
+                    let service = handlers::plugin_unlock::get_service().await;
                     service.start();
                 } else {
                     tracing::debug!(
