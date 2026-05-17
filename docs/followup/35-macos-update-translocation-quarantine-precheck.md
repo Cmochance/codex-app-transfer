@@ -2,9 +2,22 @@
 id: 35
 priority: P3
 type: bug
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+resolved_pr: 205
+resolved_date: 2026-05-18
+resolution_summary: |
+  PR #205 实施 macOS translocation + quarantine 两个前置/善后 helper:
+  - macos_translocation_precheck (update.rs:219+): 检测 current_exe 路径
+    含 /AppTranslocation/ → hard fail 提示用户先拖 .app 到 /Applications/
+    再升级。update_install handler 入口前置 reject, 早期省下载带宽。
+  - macos_strip_quarantine (update.rs:255+): xattr -d com.apple.quarantine
+    清掉 downloaded installer 防 Gatekeeper 二次弹窗。失败 silent ignore
+    不阻塞主路径。launch_update_installer macOS 路径前调。
+  - 借鉴 AiMaMi update.rs:47-113。非-macOS 平台 #[cfg(target_os = "macos")]
+    guard, 一律 noop。
+  - 测试: macos_translocation_precheck_under_cargo_test_returns_ok 验
+    cargo test runner 路径不命中 translocation。
 ---
 
 # macOS update 加 translocation / quarantine 前置检查(借鉴 AiMaMi)

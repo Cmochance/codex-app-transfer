@@ -2,9 +2,22 @@
 id: 36
 priority: P3
 type: bug
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+resolved_pr: 205
+resolved_date: 2026-05-18
+resolution_summary: |
+  PR #205 实施: install_command_parts Windows 分支 (update.rs:182+) 改成
+  vec![installer.exe, /D=<current_exe parent>], NSIS 接 /D= 参数保持
+  原安装目录, 防双装/回 C:\Program Files。
+  - current_exe_parent_dir helper 解析当前 .exe parent (update.rs:209+),
+    失败返 None 不传 /D= 走 NSIS 默认, 不阻塞主路径。
+  - 借鉴 AiMaMi update.rs:7-23。NSIS /D= 语法限制: 必须最后一个 arg
+    + 不带引号 + 整段字面字符串。
+  - 现有 install_command_parts test 更新匹配 Windows /D= 新行为 (assert
+    vec[0] installer + vec[1].starts_with("/D="))。
+  - 加 current_exe_parent_dir_resolves_in_test_runner 单测验 cargo test
+    runner 路径可解析。
 ---
 
 # Windows update 走 NSIS `/D=<install_dir>` 保持安装目录(借鉴 AiMaMi)

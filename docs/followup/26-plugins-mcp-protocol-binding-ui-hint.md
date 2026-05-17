@@ -2,9 +2,22 @@
 id: 26
 priority: P2
 type: refactor
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+resolved_pr: 205
+resolved_date: 2026-05-18
+resolution_summary: |
+  PR #205 实施第一处提示(Plugins 设置开关旁文案补充):
+  - frontend/js/i18n.js settings.autoUnlockCodexPluginsHint 中英两版加
+    句"Plugins/MCP 仅在协议转发路径(apiFormat=openai_chat/anthropic_
+    messages/gemini_native)生效;Responses 直连 provider 走字节级
+    passthrough, MCP namespace 工具包不展平, 部分上游会忽略导致工具
+    列表静默丢失。"
+  - README.md / README.en.md 供应商兼容矩阵 "Responses 协议透传" 行加
+    ⚠️ 备注。
+  原 followup 提到的 3 处提示, 实施第 1 处(Plugins 设置开关旁) + 第 3 处
+  (README 稳定性矩阵); 第 2 处(provider 表单 inline warning) 改 frontend
+  JS state 工程量大, enhancement 留 followup 真有需求再开。
 ---
 
 # Plugins / MCP namespace 工具只在 chat 转发路径生效 — UI / README 需提示

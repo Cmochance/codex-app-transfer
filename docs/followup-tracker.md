@@ -82,11 +82,8 @@ related_pr: <PR# 或 null>
 - [#23 P3 grok_web 末尾 url_citation 列表是否冗余](followup/23-grok-web-url-citation-redundancy.md) — 跟正文 markdown link 重复,实施前需真机看 Codex CLI 渲染
 - [#24 P2 RFC: Codex AGENTS.md / config.toml 受管块管理(借鉴 AiMaMi)](followup/24-codex-agents-md-managed-block.md) — Q3 四合一管理页的底层基础,marker + history + Protected 模式
 - [#25 P2 MCP / Skills / Memories / Agents 四合一管理页(借鉴 AiMaMi)](followup/25-codex-mgmt-four-in-one-page.md) — 用户 Q3 需求,sidebar+lazy+tanstack-query,依赖 #24
-- [#26 P2 Plugins / MCP 跟"协议转发"绑定 — UI / README 显式提示](followup/26-plugins-mcp-protocol-binding-ui-hint.md) — Responses 直连 provider 启 Plugins 工具静默丢,设计性 gap 需提示
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
 - [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,**PR #191 已实施 Method 1 (COM activation) 核心 + 本 PR 实施 PowerShell CIM 进程清理替 taskkill (绕 MSIX access-denied)**;P2 剩端口冲突探测 + 非-Store .exe fallback
-- [#35 P3 macOS update 加 translocation / quarantine 前置检查](followup/35-macos-update-translocation-quarantine-precheck.md) — 借鉴 AiMaMi update.rs:47-113;场景 dmg 直跑用户升级失败 + quarantine 二次弹窗
-- [#36 P3 Windows update 走 NSIS /D=install_dir 保持安装目录](followup/36-windows-update-nsis-install-dir-preserve.md) — 借鉴 AiMaMi update.rs:7-23;非默认目录用户升级会双装或回 C:\Program Files
 
 ---
 
@@ -101,6 +98,9 @@ related_pr: <PR# 或 null>
 - ~~#31 账号还原:跨版本 MANAGED_KEYS 升级误删用户 key~~ → **dropped 2026-05-17**,false alarm:整文件 cp 已保留任何 root key,managed list 只影响 restore 操作不影响存储
 - ~~#34 客户端 latest.json + installer RSA 验签~~ → PR #197 (2026-05-17),公钥 build-time embed + verify_signed_bytes 接 fetch_latest_json + download_asset_impl,8 单测覆盖
 - ~~#37 update.rs download_asset_impl: in-memory bytes 防 TOCTOU + 重 add bad-sha256 mismatch 单测~~ → PR #199 (2026-05-17),完全 skip partial 文件消除 verify→rename race + verify_installer_sha256 抽函数 5-case 单测 + 500MB hard cap + 4xx/5xx 错误分类不附 URL
+- ~~#26 Plugins / MCP 跟"协议转发"绑定 UI/README 显式提示~~ → PR #205 (2026-05-18),i18n autoUnlockCodexPluginsHint 加协议路径生效说明 + README 兼容矩阵 ⚠️ 备注;provider 表单 inline warning enhancement 留 followup
+- ~~#35 macOS update translocation / quarantine 前置检查~~ → PR #205 (2026-05-18),macos_translocation_precheck (update_install 入口早期 reject) + macos_strip_quarantine (launch 前 xattr -d) 借鉴 AiMaMi update.rs:47-113
+- ~~#36 Windows update 走 NSIS /D=install_dir 保持安装目录~~ → PR #205 (2026-05-18),install_command_parts Windows 分支追 /D=<current_exe parent> + current_exe_parent_dir helper 借鉴 AiMaMi update.rs:7-23
 
 <!-- 示例:
 - ~~#25 cloud_code Gemini mapper 漏配 session_cache~~ → PR #146 (2026-05-13)
