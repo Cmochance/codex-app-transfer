@@ -276,6 +276,24 @@ pub(super) fn configured_update_url(input: Option<&str>) -> String {
         .unwrap_or_else(canonical_update_url)
 }
 
+/// 从原 URL 推导对应 `.sig` URL —— 注入到 path 段而非裸字符串拼接,
+/// 这样 query string / fragment 会被保留 (S3 presigned URL / CDN cache-bust
+/// 等场景必要)。
+///
+/// 例:
+/// - `https://host/latest.json?token=abc` → `https://host/latest.json.sig?token=abc`
+/// - `https://host/path/installer.dmg#frag` → `https://host/path/installer.dmg.sig#frag`
+///
+/// codex-bot PR #197 review thread PRRT_kwDOSRcxvM6CpmHk 修 — 之前
+/// `format!("{url}.sig")` 在 query string URL 下生成 `?token=abc.sig` 错路径。
+fn sig_url_for(url: &str) -> Result<String, String> {
+    let mut parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("URL parse for .sig failed: {e}"))?;
+    let new_path = format!("{}.sig", parsed.path());
+    parsed.set_path(&new_path);
+    Ok(parsed.to_string())
+}
+
 /// 拉同名 `.sig` 文件文本(base64 编码 RSA 签名)。
 ///
 /// 失败原因:
@@ -316,9 +334,10 @@ pub(super) async fn fetch_latest_json(
         .map_err(|e| format!("update URL request failed: {e}"))?;
 
     // RSA 验签 latest.json (防 MITM 改 url + sha256 推任意 installer)。
-    // sig URL 约定 `<latest.json url>.sig` — 跟 xtask release-bundle 输出对齐。
+    // sig URL 约定 path 段后缀 `.sig` — 跟 xtask release-bundle 输出对齐, 通过
+    // sig_url_for() 保留 query string / fragment (S3 presigned 等场景必要)。
     // 失败硬 fail:不 fallback sha256-only 也不接受未签 URL (followup #34 决策)。
-    let sig_url = format!("{safe_url}.sig");
+    let sig_url = sig_url_for(&safe_url)?;
     let sig = fetch_signature_text(client, &sig_url)
         .await
         .map_err(|e| format!("latest.json signature unavailable: {e}"))?;
@@ -382,7 +401,8 @@ pub(super) async fn download_asset_impl(
 ) -> Result<Value, String> {
     let url = validate_update_url(asset.get("url").and_then(|v| v.as_str()).unwrap_or(""))?;
     // 算 sig URL 必须在 url 被 client.get() 消费之前 (后续 line 393 moves url)。
-    let installer_sig_url = format!("{url}.sig");
+    // 用 sig_url_for 保留 query string / fragment (S3 presigned 必要)。
+    let installer_sig_url = sig_url_for(&url)?;
     let raw_name = asset
         .get("name")
         .and_then(|v| v.as_str())
@@ -702,6 +722,30 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::common::random_hex;
+
+    /// sig_url_for 必须把 `.sig` 插到 URL path 段后缀 (而非裸字符串拼接),
+    /// 这样 query string / fragment 在 self-host presigned URL / CDN
+    /// cache-bust 场景下保留。codex-bot PR #197 PRRT_kwDOSRcxvM6CpmHk 修
+    /// 之前 `format!("{url}.sig")` 让 `?token=abc` 变 `?token=abc.sig` 错路径。
+    #[test]
+    fn sig_url_preserves_query_string_and_fragment() {
+        assert_eq!(
+            sig_url_for("https://host/latest.json").unwrap(),
+            "https://host/latest.json.sig"
+        );
+        assert_eq!(
+            sig_url_for("https://host/latest.json?token=abc").unwrap(),
+            "https://host/latest.json.sig?token=abc"
+        );
+        assert_eq!(
+            sig_url_for("https://host/path/to/installer.dmg?ver=1&x=2").unwrap(),
+            "https://host/path/to/installer.dmg.sig?ver=1&x=2"
+        );
+        assert_eq!(
+            sig_url_for("https://host/latest.json#frag").unwrap(),
+            "https://host/latest.json.sig#frag"
+        );
+    }
 
     #[test]
     fn update_platform_version_and_installer_selection_match_legacy() {
