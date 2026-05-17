@@ -2,9 +2,18 @@
 id: 31
 priority: P1
 type: bug
-status: active
+status: dropped
 created: 2026-05-17
-related_pr: null
+dropped_date: 2026-05-17
+dropped_reason: |
+  False alarm — 原 agent 调研推测"manifest 只记 managed-key 字面量"实际
+  错。verify 完代码:snapshot_codex_state (snapshot.rs:167-178) 用
+  std::fs::copy 整文件 cp 进 snapshot dir;restore_from_snapshot_values
+  调 snapshot_toml_value_literal(snapshot_config, key) 在整 content 中
+  line 扫找 root key 字面量(snapshot.rs:600-624)。即便快照写入时 MANAGED
+  list 不含某 key,只要用户手写过这一行,整文件 cp 已保留,restore 时仍能
+  grep 出回填。**managed list 只决定 restore 操作哪些 key,不影响快照
+  存储**。本条目实际不是 bug,drop。
 ---
 
 # 账号还原 C1:跨版本 `MANAGED_TOML_KEYS` 升级,restore 旧 snapshot 会按新 list 删除用户原有 key

@@ -101,12 +101,30 @@ fn quit_command(platform: &str, force: bool) -> Vec<String> {
             "-x".into(),
             MACOS_APP_NAME.into(),
         ],
-        ("windows", false) => vec!["taskkill".into(), "/IM".into(), WINDOWS_PROCESS_NAME.into()],
+        // follow-up #33 P2-b:从 `taskkill /IM` 切到 PowerShell CIM 路径。
+        //
+        // taskkill 在 Codex Desktop 这种 MSIX packaged Store app 上经常报
+        // access-denied(packaged app 进程隔离机制),失败时本项目 quit_codex_
+        // app_with_retries 走 KILL 路径仍是 taskkill,**两层 fallback 都失败**
+        // → Codex 永远关不掉 → "重启 Codex" 实际只 ActivateApplication
+        // 把现有进程带到前台,config.toml 不重读。
+        //
+        // PowerShell `Get-CimInstance Win32_Process` 走 WMI 拿到 process ID
+        // 后 `Stop-Process -Id` 优雅清理,绕过 MSIX 进程隔离的 taskkill 限制。
+        // 借鉴 BigPizzaV3/CodexPlusPlus `codex_session_delete/launcher.py:
+        // 434-451`(MIT)实证可用。`hide_console_window` (line 192-202) 已加
+        // CREATE_NO_WINDOW flag 给 powershell,不弹 console。
+        ("windows", false) => vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "Get-CimInstance Win32_Process -Filter \"Name='Codex.exe' OR Name='codex.exe'\" | ForEach-Object { Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }".into(),
+        ],
         ("windows", true) => vec![
-            "taskkill".into(),
-            "/F".into(),
-            "/IM".into(),
-            WINDOWS_PROCESS_NAME.into(),
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            "Get-CimInstance Win32_Process -Filter \"Name='Codex.exe' OR Name='codex.exe'\" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }".into(),
         ],
         (_, false) => vec![
             "pkill".into(),
@@ -1077,7 +1095,7 @@ mod tests {
 
     #[test]
     fn quit_command_uses_term_then_kill() {
-        // graceful = SIGTERM / 普通 taskkill;force = SIGKILL / taskkill /F
+        // graceful = SIGTERM / PowerShell Stop-Process;force = SIGKILL / Stop-Process -Force
         assert_eq!(
             quit_command("macos", false),
             vec!["pkill", "-TERM", "-x", "Codex"]
@@ -1086,14 +1104,25 @@ mod tests {
             quit_command("macos", true),
             vec!["pkill", "-KILL", "-x", "Codex"]
         );
-        assert_eq!(
-            quit_command("windows", false),
-            vec!["taskkill", "/IM", "Codex.exe"]
+        // Windows: follow-up #33 P2-b 切到 PowerShell CIM,绕过 taskkill 对
+        // MSIX packaged Store app 的 access-denied 限制。
+        let win_graceful = quit_command("windows", false);
+        assert_eq!(win_graceful[0], "powershell");
+        assert_eq!(win_graceful[1], "-NoProfile");
+        assert_eq!(win_graceful[2], "-Command");
+        assert!(win_graceful[3].contains("Get-CimInstance Win32_Process"));
+        assert!(win_graceful[3].contains("Codex.exe"));
+        assert!(win_graceful[3].contains("Stop-Process"));
+        assert!(
+            !win_graceful[3].contains("-Force"),
+            "graceful 不应该有 -Force"
         );
-        assert_eq!(
-            quit_command("windows", true),
-            vec!["taskkill", "/F", "/IM", "Codex.exe"]
-        );
+
+        let win_force = quit_command("windows", true);
+        assert_eq!(win_force[0], "powershell");
+        assert!(win_force[3].contains("Stop-Process"));
+        assert!(win_force[3].contains("-Force"), "force 必须有 -Force");
+
         assert_eq!(
             quit_command("linux", false),
             vec!["pkill", "-TERM", "-x", "codex"]

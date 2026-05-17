@@ -23,6 +23,17 @@ pub struct CodexPaths {
     /// move 到 `trash/<UTC-timestamp>/`,保留 N 天后由 `gc_trash_older_than`
     /// 清理。给用户"误点 cleanup_all 还能恢复"窗口,follow-up #29 守门。
     pub trash_snapshots_dir: PathBuf,
+    /// 跨平台冗余备份目录 — `snapshot_codex_state` 写完 active/ 后,
+    /// 在系统级用户数据目录额外 cp 一份,防 `~/.codex-app-transfer/`
+    /// 整目录被用户/卸载脚本/磁盘清理误删 → 真原始账号永久丢失。
+    /// follow-up #30 守门。
+    ///
+    /// 路径(cfg(target_os) 决定):
+    /// - macOS: `~/Library/Application Support/CodexAppTransfer/snapshot-backups/`
+    /// - Windows: `%APPDATA%\CodexAppTransfer\snapshot-backups\`
+    /// - Linux/BSD: `$XDG_DATA_HOME/CodexAppTransfer/snapshot-backups/`
+    ///   (无 XDG_DATA_HOME 时 fallback `~/.local/share/.../`)
+    pub external_backup_dir: PathBuf,
 }
 
 impl CodexPaths {
@@ -45,6 +56,7 @@ impl CodexPaths {
         let active_snapshots_dir = snapshots_dir.join("active");
         let recovery_snapshots_dir = snapshots_dir.join("recovery");
         let trash_snapshots_dir = snapshots_dir.join("trash");
+        let external_backup_dir = resolve_external_backup_dir(home);
         Self {
             config_toml: codex_home.join("config.toml"),
             auth_json: codex_home.join("auth.json"),
@@ -57,9 +69,35 @@ impl CodexPaths {
             active_snapshots_dir,
             recovery_snapshots_dir,
             trash_snapshots_dir,
+            external_backup_dir,
             codex_home,
             app_home,
         }
+    }
+}
+
+/// 跨平台系统级用户数据目录下 `CodexAppTransfer/snapshot-backups/` 路径。
+/// 不引入 `dirs` crate 保 codex_integration 边界干净,自己 cfg(target_os)
+/// + env var fallback。
+fn resolve_external_backup_dir(home: &Path) -> PathBuf {
+    const APP_SUBDIR: &str = "CodexAppTransfer/snapshot-backups";
+    #[cfg(target_os = "macos")]
+    {
+        return home.join("Library/Application Support").join(APP_SUBDIR);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Roaming"));
+        return appdata.join(APP_SUBDIR);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let xdg = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        return xdg.join(APP_SUBDIR);
     }
 }
 
@@ -101,6 +139,14 @@ mod tests {
         assert_eq!(
             p.trash_snapshots_dir,
             PathBuf::from("/x/.codex-app-transfer/codex-snapshots/trash")
+        );
+        // external_backup_dir 跨平台变化 — 验当前 host 路径含 CodexAppTransfer/snapshot-backups
+        let backup_str = p.external_backup_dir.to_string_lossy();
+        assert!(
+            backup_str.contains("CodexAppTransfer/snapshot-backups")
+                || backup_str.contains("CodexAppTransfer\\snapshot-backups"),
+            "external_backup_dir 必须含 CodexAppTransfer/snapshot-backups,实际: {}",
+            p.external_backup_dir.display()
         );
     }
 }

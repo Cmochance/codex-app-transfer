@@ -2,9 +2,17 @@
 id: 27
 priority: P3
 type: bug
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+resolved_pr: 191
+resolved_date: 2026-05-17
+resolution_summary: |
+  PR #191 (macOS plugin unlock 优化) 已覆盖用户原痛点。真机 4 次循环验证:
+  第一次 Codex 启动后 ~1s 内刷新解锁,后续 3 次均在启动后立即刷新。
+  "二次 splash" 实际是用户早期对"一次刷新解锁"现象的不同描述
+  (setAuthMethod('chatgpt') 触发 React AuthContext 整树重渲那一瞬的
+  视觉转变),并非真"两次 splash"。物理消除该重渲转交 follow-up #32
+  长期跟踪。
 ---
 
 # 打开 Plugins 后启动 Codex Desktop 看到两次启动界面 — 根因诊断
