@@ -318,7 +318,15 @@ fn should_attach_debug_port() -> Vec<String> {
         Err(_) => true,
     };
     if auto_unlock {
-        vec!["--remote-debugging-port=9222".into()]
+        // `--remote-allow-origins=*` 是 Chrome 111+ / Electron 同代起的硬性
+        // 要求:不带它,CDP HTTP /json/list 仍工作,但 WebSocket upgrade 完成
+        // 后会被远端 reset(我们 log 里见过 "Connection reset without closing
+        // handshake")。galaxywk223/codex-plugin-unlocker (MIT) 同样加这个
+        // flag,见其 `launcher.py:55-58`。
+        vec![
+            "--remote-debugging-port=9222".into(),
+            "--remote-allow-origins=*".into(),
+        ]
     } else {
         vec![]
     }

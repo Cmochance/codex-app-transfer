@@ -191,8 +191,22 @@ async fn run_daemon(
         // 阶段 1: 检测 CDP 端口是否可用
         match detect_cdp(&config.cdp_http_url).await {
             Some(pages) => {
-                // 找到合适的 page（主窗口，type=page）
-                let target = pages.into_iter().find(|p| p.page_type == "page");
+                // Codex Desktop 同时开多个 BrowserWindow:主窗口
+                // `app://-/index.html` + 宠物悬浮窗 `app://-/index.html?initialRoute=
+                // %2Favatar-overlay` + 可能的 DevTools / extension。我们只想注主
+                // 窗口(那里才有 Plugins UI 跟 AuthContext)。
+                //
+                // 早期版本 `find(|p| p.page_type == "page")` 拿第一个 — 真机
+                // 发现宠物窗排第一,导致一直注错地方(log 里 "找不到
+                // setAuthMethod hook" 正是因为宠物窗根本没这个 Context)。
+                //
+                // 筛选规则:type=page + URL 含 `index.html` + 不含 `avatar-overlay`
+                // (宠物窗用 query param 路由,主窗口无 query 或别的路由)。
+                let target = pages.into_iter().find(|p| {
+                    p.page_type == "page"
+                        && p.url.contains("index.html")
+                        && !p.url.contains("avatar-overlay")
+                });
                 if let Some(page) = target {
                     if let Some(ws_url) = page.ws_url {
                         set_status(&status, UnlockStatus::Connecting).await;
