@@ -959,7 +959,19 @@ pub async fn desktop_snapshot_status() -> impl IntoResponse {
 
 pub async fn restart_codex_app() -> impl IntoResponse {
     match launch_codex_app_restart(std::env::consts::OS) {
-        Ok(_) => Json(json!({"success": true})).into_response(),
+        Ok(_) => {
+            // 通知 plugin_unlock daemon 重置 backoff 立刻重新 detect_cdp。
+            // 没这条联动时,用户场景"Codex Desktop 已关闭一段时间,daemon 持续
+            // detect 失败 backoff 涨到 ~8s → 点'重新启动'按钮 → Codex 1s 内
+            // 启动 + CDP 监听 → daemon 仍在 sleep 中,等当前 backoff 醒来才
+            // re-detect" 会让解锁延迟 5-8s。
+            // ServiceCommand::Reinject 在 disconnected 状态下被 run_daemon
+            // (codex_plugin_unlocker.rs:188-193) 解读为"加速重连请求 — reset
+            // backoff",已经是处理这场景的正确机制,只是之前没人触发它。
+            let service = super::plugin_unlock::get_service().await;
+            service.reinject().await;
+            Json(json!({"success": true})).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
