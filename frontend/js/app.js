@@ -1705,21 +1705,6 @@
     }
   }
 
-  function isVerifiedProviderId(id) {
-    const value = String(id || "").toLowerCase();
-    if (value === "kimi" || value === "kimi-code" || value.startsWith("kimi-")) return true;
-    if (value === "xiaomi-mimo-token-plan" || value === "xiaomi-mimo-payg") return true;
-    if (value === "deepseek") return true;
-    if (value === "gemini-cli-oauth") return true;
-    if (value === "antigravity-oauth") return true;
-    return false;
-  }
-
-  function setUnverifiedBanner(show) {
-    const banner = $("#providerUnverifiedBanner");
-    if (banner) banner.hidden = !show;
-  }
-
   function resetProviderForm() {
     editingProviderId = null;
     selectedPreset = null;
@@ -1747,7 +1732,6 @@
     fillGrokWebFormFromProvider(null);
     setWebSearchRow(false, false, null);
     setProviderMappings(emptyMappings());
-    setUnverifiedBanner(false);
   }
 
   function applyPresetToForm(preset, notify = true) {
@@ -1792,7 +1776,6 @@
     setProviderMappings(preset.models || emptyMappings());
     renderPresetOptions(preset, preset.models || emptyMappings());
     updatePresetSelection();
-    setUnverifiedBanner(!isVerifiedProviderId(preset.id));
     if (notify) showToast(`${preset.name} ${t("toast.presetFilled")}`);
   }
 
@@ -1853,7 +1836,6 @@
     setProviderMappings(provider.mappings || emptyMappings());
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
     updatePresetSelection();
-    setUnverifiedBanner(!isVerifiedProviderId(matchedPreset?.id || provider.id));
   }
 
   async function renderProviderForm() {
