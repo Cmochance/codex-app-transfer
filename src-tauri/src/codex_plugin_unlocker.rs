@@ -209,20 +209,26 @@ async fn run_daemon(
                 //
                 // 筛选规则:type=page + URL 含 `index.html` + 不含 `avatar-overlay`
                 // (宠物窗用 query param 路由,主窗口无 query 或别的路由)。
-                let target = pages.into_iter().find(|p| {
-                    p.page_type == "page"
-                        && p.url.contains("index.html")
-                        && !p.url.contains("avatar-overlay")
-                });
+                let (target, all_pages_for_log) = {
+                    let snapshot: Vec<String> = pages
+                        .iter()
+                        .filter(|p| p.page_type == "page")
+                        .map(|p| p.url.clone())
+                        .collect();
+                    let target = pages.into_iter().find(|p| {
+                        p.page_type == "page"
+                            && p.url.contains("index.html")
+                            && !p.url.contains("avatar-overlay")
+                    });
+                    (target, snapshot)
+                };
                 if let Some(page) = target {
                     if let Some(ws_url) = page.ws_url {
                         set_status(&status, UnlockStatus::Connecting).await;
                         tracing::info!("[PluginUnlock] connecting to CDP: {}", ws_url);
-
                         match connect_and_monitor(&ws_url, &cmd_rx, &msg_id, &status).await {
                             Ok(()) => {
                                 tracing::info!("[PluginUnlock] connection ended gracefully");
-                                // 重置退避
                                 reconnect_delay = config.reconnect_base_ms;
                             }
                             Err(e) => {
@@ -237,6 +243,17 @@ async fn run_daemon(
                             }
                         }
                     }
+                } else {
+                    // CDP 在跑但没找到主窗口 — 可能 Codex 还在 mount / 只
+                    // 开了宠物悬浮窗 / 未来 Codex URL schema 变了。warn 级日志
+                    // 列出我们看到的全部 page URLs,方便 support 诊断"我的
+                    // Codex 在开但 daemon 一直显示 Disconnected"。状态保持
+                    // Disconnected 让 backoff 重试。
+                    tracing::warn!(
+                        "[PluginUnlock] CDP reachable but no main window matched (need URL containing 'index.html' and not 'avatar-overlay'); visible pages={:?}",
+                        all_pages_for_log
+                    );
+                    set_status(&status, UnlockStatus::Disconnected).await;
                 }
             }
             None => {
