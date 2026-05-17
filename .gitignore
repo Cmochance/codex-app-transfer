@@ -25,13 +25,23 @@ Thumbs.db
 # Build outputs and signed release artifacts
 build/
 dist/
-release/
+# `release/*` 而非 `release/` — 让 git 进入目录 + ignore 内容, 然后 ! negation
+# 可以 re-include 个别文件 (git 文档: ignored 父目录里的 file 用 negation 不可达,
+# 必须 selective glob)。
+release/*
 *.zip
 *.exe
 *.dmg
 *.pkg
 *.tar.gz
 *.sig
+
+# 例外: 公钥 PEM 跟 latest.json 必须进 git, 客户端 build-time include_str!
+# 嵌公钥 + signature.rs 单测用真 latest.json/.sig 做 round-trip。
+# 私钥永不 commit (CI 通过 RELEASE_PRIVATE_KEY_PEM secret 注入到 .release-signing/)。
+!release/Codex-App-Transfer-release-public.pem
+!release/latest.json
+!release/latest.json.sig
 
 # Generated NSIS installer at project root (named Codex-App-Transfer-Setup-<v>.exe)
 Codex-App-Transfer-Setup-*.exe

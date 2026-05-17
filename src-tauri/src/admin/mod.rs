@@ -11,6 +11,7 @@
 
 pub mod handlers;
 pub mod registry_io;
+pub mod signature;
 pub mod state;
 pub mod static_files;
 

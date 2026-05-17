@@ -155,6 +155,19 @@ v2 only listens on `18080` (forwarding) by default; the admin UI now uses Tauri 
 
 The current Windows build is not Authenticode-signed. The Release page provides `.sha256` and `.sig` to verify the installer hasn't been tampered with.
 
+### Self-host / custom update URL
+
+From v2.1.12+ the client **enforces** RSA-3072 PKCS#1-v1.5-SHA256 verification on `latest.json` and every installer. The upgrade flow fetches `<url>.sig` alongside the file and verifies against the build-time embedded official public key (`release/Codex-App-Transfer-release-public.pem`). Failure is fatal — no SHA256-only fallback.
+
+**A custom update URL must be self-signed to work**:
+
+1. Fork the repo and replace `release/Codex-App-Transfer-release-public.pem` with your own public key.
+2. Run `cargo run -p xtask --release -- release-bundle` with the matching private key to sign `latest.json` and every installer.
+3. Rebuild the client so the public key is embedded.
+4. Users point Settings → Update URL at your `latest.json` endpoint.
+
+Design intent: the client trusts only the build-time embedded public key and never lets a runtime URL replace it, blocking MITM rewrites of `latest.json` (the public PEM lives in `release/` but pulling it from the same origin as the update URL would dissolve the trust anchor).
+
 ### Where are the logs?
 
 - App UI: real-time panel below the forwarding page, auto-refreshes every 2s
