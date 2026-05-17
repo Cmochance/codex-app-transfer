@@ -335,43 +335,35 @@ fn should_attach_debug_port() -> Vec<String> {
 fn open_codex_app(platform: &str) -> Result<(), String> {
     maybe_wake_codex_pet();
 
-    // Windows MSIX 特化路径:Microsoft Store / packaged Codex Desktop 的
-    // `explorer.exe shell:AppsFolder\...` 启动协议**剥所有命令行参数**,
-    // 导致 `--remote-debugging-port=9222` 静默丢失 Plugin Unlock 不工作。
-    // 改用 `IApplicationActivationManager::ActivateApplication` Win32 COM
-    // 调用,这是 Microsoft 给 packaged app 传 args 的官方入口。
-    // 借鉴 BigPizzaV3/CodexPlusPlus `launcher.py:347-411`(MIT)。
-    //
-    // 失败时(无 MSIX 包 / COM 调用 fail)fallback 到 launch via explorer.exe
-    // shell:AppsFolder(老路径,虽然 args 丢失但至少能启动)。后续 PR 加非
-    // Store 直装 .exe 检测作 P2 fallback。详 docs/followup/33。
+    // Windows MSIX activation: see `windows_msix.rs` module docs。
+    // 失败时(MSIX 包未装 / PowerShell 不可用 / COM 调用 fail)fallthrough
+    // 到下方 explorer.exe shell:AppsFolder 老路径(args 会丢失,Plugin
+    // Unlock 不工作但至少能启动 Codex)。
     #[cfg(target_os = "windows")]
-    {
-        if platform == "windows" {
-            let extra_args = should_attach_debug_port();
-            let cmdline = crate::windows_msix::list2cmdline(&extra_args);
-            let aumid = crate::windows_msix::resolve_codex_aumid()
-                .unwrap_or_else(|| crate::windows_msix::OPENAI_CODEX_AUMID_FALLBACK.to_owned());
-            tracing::info!(
-                aumid = %aumid,
-                cmdline = %cmdline,
-                "launching Codex Desktop via IApplicationActivationManager"
-            );
-            match crate::windows_msix::activate_packaged_app(&aumid, &cmdline) {
-                Ok(pid) => {
-                    tracing::info!(pid, "Codex Desktop activated via COM");
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "ActivateApplication failed, falling back to explorer.exe shell:AppsFolder (无 debug port)"
-                    );
-                    // 继续往下走 explorer.exe fallback(args 会丢失,Plugin
-                    // Unlock 在 fallback 路径下不可工作,但至少能启动 Codex)
-                }
+    if let Some(aumid) = crate::windows_msix::resolve_codex_aumid() {
+        let extra_args = should_attach_debug_port();
+        let cmdline = crate::windows_msix::list2cmdline(&extra_args);
+        tracing::info!(
+            aumid = %aumid,
+            cmdline = %cmdline,
+            "launching Codex Desktop via IApplicationActivationManager"
+        );
+        match crate::windows_msix::activate_packaged_app(&aumid, &cmdline) {
+            Ok(pid) => {
+                tracing::info!(pid, "Codex Desktop activated via COM");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ActivateApplication failed, falling back to explorer.exe shell:AppsFolder (无 debug port)"
+                );
             }
         }
+    } else {
+        tracing::warn!(
+            "MSIX package not found via Get-AppxPackage, falling back to explorer.exe shell:AppsFolder (无 debug port)"
+        );
     }
 
     let resolved = if platform == "macos" {

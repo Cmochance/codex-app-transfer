@@ -81,9 +81,6 @@ pub fn activate_packaged_app(aumid: &str, args: &str) -> Result<u32, String> {
             windows::Win32::UI::Shell::AO_NONE,
         );
 
-        // manager Arc 被 drop 时 IUnknown::Release 自动调
-        drop(manager);
-
         if need_uninit {
             CoUninitialize();
         }
@@ -104,10 +101,10 @@ pub fn activate_packaged_app(aumid: &str, args: &str) -> Result<u32, String> {
 /// alias,从 AppxManifest 来,绝大多数 Electron MSIX 用 `!App`)。
 ///
 /// 1:1 借鉴 `BigPizzaV3/CodexPlusPlus` `codex_session_delete/launcher.py:298-304`
-/// + `app_paths.py:30-49`。
-///
-/// 返 `None` 时调用方应回退到 [`OPENAI_CODEX_AUMID_FALLBACK`] 或 last-resort
-/// 走 Method 6(非 Store 直装 .exe)。
+/// + `app_paths.py:30-49`。上游同样没硬编码 fallback —— 找不到包就 None,
+/// 让 caller 走 explorer.exe 老路径或 last-resort Method 6(非 Store 直装 .exe);
+/// 写死 publisher hash 作 fallback 会让 ActivateApplication 用错的 AUMID 报错
+/// 比 None 更难诊断,且 explorer.exe fallback 已是 safety net。
 pub fn resolve_codex_aumid() -> Option<String> {
     // PowerShell `Get-AppxPackage` 需要 `-NoProfile` 加速启动(否则会跑
     // 用户 PSProfile 几百 ms 起步)
@@ -135,13 +132,6 @@ pub fn resolve_codex_aumid() -> Option<String> {
     // PackageFamilyName 形如 `OpenAI.Codex_<publisher_id>`,直接拼 `!App`
     Some(format!("{pfn}!App"))
 }
-
-/// Codex Desktop AUMID fallback(如果 `Get-AppxPackage` 失败时尝试)。
-///
-/// 这是个**保守**默认值,实际 publisher hash 跨用户跨版本可能不同 —
-/// 应该优先用 [`resolve_codex_aumid`] 动态解析。仅在 PowerShell 不可用
-/// 等极边界场景用作 last-resort。
-pub const OPENAI_CODEX_AUMID_FALLBACK: &str = "OpenAI.Codex_2p2nqsd0c76g0!App";
 
 /// 把 `Vec<String>` 按 Windows cmdline quoting 规则序列化成单一 PWSTR-ready
 /// 字符串,等价于 Python `subprocess.list2cmdline`。
@@ -231,12 +221,5 @@ mod tests {
             list2cmdline(&args),
             "--remote-debugging-port=9222 --remote-allow-origins=http://127.0.0.1:9222"
         );
-    }
-
-    #[test]
-    fn aumid_fallback_format_matches_msix_convention() {
-        // <package-family-name>!<entry-point-alias>
-        assert!(OPENAI_CODEX_AUMID_FALLBACK.contains("!App"));
-        assert!(OPENAI_CODEX_AUMID_FALLBACK.starts_with("OpenAI.Codex_"));
     }
 }
