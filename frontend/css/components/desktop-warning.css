@@ -1,0 +1,38 @@
+/* ============================================================
+   components/desktop-warning.css — Inline warning callout (.desktop-warning + compact variant + dark)
+   layer1: line 921-952
+   note: ABT 'desktop-warning' is the only consumer today but the style is generic alert callout 形态, 留 components 便于复用
+   ============================================================ */
+
+.desktop-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 12px 0 0;
+  padding: 11px 12px;
+  border: 1px solid #fed7aa;
+  border-radius: 12px;
+  color: #9a3412;
+  background: #fff7ed;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.desktop-warning[hidden] {
+  display: none;
+}
+
+.desktop-warning i {
+  margin-top: 1px;
+  color: #f97316;
+}
+
+.desktop-warning.compact {
+  margin: 0 0 14px;
+}
+
+[data-bs-theme="dark"] .desktop-warning {
+  color: #fdba74;
+  background: rgba(251, 146, 60, .12);
+  border-color: rgba(251, 146, 60, .34);
+}

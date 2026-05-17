@@ -1,0 +1,50 @@
+/* ============================================================
+   components/switch.css — Toggle switch (.switch-label / .switch-ui / .only-switch)
+   layer1: line 1335-1378
+   note: settings-panel-specific switch compact tweaks (3206-3219) 放 pages/settings.css
+   ============================================================ */
+
+.switch-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  color: #e9eefb;
+  font-size: 18px;
+}
+
+.switch-label input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.switch-ui {
+  position: relative;
+  width: 58px;
+  height: 32px;
+  border-radius: 999px;
+  background: var(--primary);
+}
+
+.switch-ui::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.switch-label input:not(:checked) + .switch-ui {
+  background: #9aa1b5;
+}
+
+.switch-label input:not(:checked) + .switch-ui::after {
+  right: 30px;
+}
+
+.only-switch {
+  justify-self: end;
+}

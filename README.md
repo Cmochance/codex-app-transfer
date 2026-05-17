@@ -125,6 +125,31 @@ cargo tauri build --bundles nsis,msi         # Windows x64
 cargo tauri build --bundles deb,appimage     # Linux x86_64
 ```
 
+### 想改 UI 样式怎么改
+
+`frontend/css/` 走"组件库"形式拆开,不需要全文 grep `style.css`:
+
+| 想改什么 | 改哪个文件 |
+|---|---|
+| 主题色 / 圆角 / 阴影 / 间距等 design tokens | `frontend/css/tokens.css`(129 vars + 6 套主题) |
+| 全局 reset / body 字体 / focus 描边 | `frontend/css/base.css` |
+| 按钮 / 卡片 / 表单 / 徽章 / 模态等组件 | `frontend/css/components/<name>.css` |
+| 仪表盘 / 提供商 / 转发 / 设置 / 引导某一页专属样式 | `frontend/css/pages/<route>.css` |
+| 响应式断点 / 1100px / 720px | `frontend/css/responsive.css` |
+
+预览所有组件 + 各状态 + 主题切换:
+
+```bash
+# 浏览器直接打开(不需 dev server)
+open frontend/gallery.html        # macOS
+xdg-open frontend/gallery.html    # Linux
+start frontend/gallery.html       # Windows
+```
+
+`gallery.html` 顶部有主题切换 + 深浅色按钮,改 component css 后刷新即看。`frontend/index.html` 主入口 `<link href="css/style.css">` 不需要改 — `style.css` 只是 @import 入口聚合所有子文件。
+
+加新组件: 在 `components/` 建 `<name>.css` + 在 `style.css` 加一行 `@import url("components/<name>.css");` + 在 `gallery.html` 加 section。
+
 ## 常见问题
 
 ### Codex CLI 提示 `404 Not Found url: http://127.0.0.1:18080/responses`

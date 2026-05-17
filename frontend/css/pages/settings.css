@@ -1,0 +1,346 @@
+/* ============================================================
+   pages/settings.css — 设置 page (.settings-* / .about-* / .compatibility-* / .backup-list / .inline-status / settings-panel 美化大段)
+   layer1: 1227-1246 (.settings-panel / .settings-row) + 1380-1422 (.about-panel / .about-row / .update-status text / .about-panel a)
+   layer2: 3054-3084 (.settings-row compact / .settings-row-stack / .settings-inline-actions / .inline-actions)
+          + 3086-3235 (.settings-panel 美化大段 — input / segmented / theme swatch / switch compact / settings-row-stack / about-panel compact)
+          + 3265-3284 (.backup-list / .settings-note)
+          + 3286-3343 (.compatibility-list / .compatibility-empty / .compatibility-item + variants)
+          + 3345-3350 (.inline-status)
+   ============================================================ */
+
+.settings-panel {
+  display: grid;
+  gap: 0;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: 1fr minmax(300px, 650px);
+  align-items: center;
+  min-height: 94px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-row:last-child {
+  border-bottom: 0;
+}
+
+.settings-row strong {
+  font-size: 23px;
+}
+
+.about-panel {
+  margin-top: 26px;
+}
+
+.about-panel h2 {
+  margin-bottom: 18px;
+}
+
+.about-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 58px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 18px;
+}
+
+.about-row:last-of-type {
+  border-bottom: 0;
+}
+
+.update-status {
+  min-height: 24px;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.update-status:empty {
+  display: none;
+}
+
+.update-status.available {
+  color: var(--success);
+  font-weight: 700;
+}
+
+.about-panel strong,
+.about-panel a {
+  color: var(--text);
+  font-weight: 650;
+}
+
+/* === Layer 2: compact desktop === */
+
+.settings-row {
+  min-height: 64px;
+}
+
+.settings-row strong {
+  font-size: 16px;
+}
+/* .panel h2 / .timeline-card h2 同 16px 共享值已搬到各自 component:
+   components/card.css 末段 (.panel h2) + pages/guide.css 末段 (.timeline-card h2) */
+
+.settings-row-stack {
+  align-items: start;
+  padding: 14px 0;
+}
+
+.settings-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.inline-actions {
+  justify-content: flex-end;
+}
+
+/* ───────────── 设置页面板美化 ───────────── */
+.settings-panel {
+  padding: 8px 24px;
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 0 0 1px var(--line);
+}
+
+.settings-panel .settings-row {
+  grid-template-columns: minmax(140px, 200px) 1fr;
+  gap: 16px;
+  min-height: 56px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-panel .settings-row:last-child {
+  border-bottom: 0;
+}
+
+.settings-panel .settings-row strong {
+  align-self: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-panel .settings-row > :nth-child(2),
+.settings-panel .settings-row > div:not(:first-child) {
+  justify-self: end;
+  width: 100%;
+  max-width: 540px;
+}
+
+.settings-panel .settings-row .only-switch {
+  width: auto;
+  justify-self: end;
+}
+
+/* 输入框：去掉 lg 巨人感 */
+.settings-panel .settings-row .form-control,
+.settings-panel .settings-row .form-control-lg {
+  height: 38px;
+  padding: 6px 12px;
+  font-size: 14px;
+  border-radius: 10px;
+}
+
+/* 分段按钮：缩小并对齐右侧 */
+.settings-panel .segmented {
+  width: auto;
+  justify-self: end;
+  border-radius: 10px;
+  background: var(--soft-surface);
+  padding: 3px;
+  border: 1px solid var(--line);
+  gap: 2px;
+}
+
+.settings-panel .segmented .btn {
+  min-width: 64px;
+  min-height: 32px;
+  padding: 4px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  background: transparent;
+  color: var(--muted);
+}
+
+.settings-panel .segmented .btn.active {
+  background: var(--surface);
+  color: var(--primary);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .08);
+}
+
+/* 主题色板：圆形小色块 */
+.settings-panel .theme-segment {
+  width: auto;
+  display: inline-flex;
+  grid-template-columns: none;
+  gap: 8px;
+  padding: 4px;
+}
+
+.settings-panel .theme-swatch {
+  position: relative;
+  min-width: 36px;
+  min-height: 36px;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.settings-panel .theme-swatch::before {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 0;
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, .08);
+}
+
+.settings-panel .theme-swatch-default::before { background: #1476ff; }
+.settings-panel .theme-swatch-green::before   { background: #1f9d55; }
+.settings-panel .theme-swatch-orange::before  { background: #f97316; }
+.settings-panel .theme-swatch-gray::before    { background: #64748b; }
+.settings-panel .theme-swatch-dark::before    { background: #111318; box-shadow: inset 0 0 0 1px rgba(255,255,255,.12); }
+.settings-panel .theme-swatch-white::before   { background: #ffffff; box-shadow: inset 0 0 0 1px #d5dbe3; }
+
+.settings-panel .theme-swatch.active,
+.settings-panel .theme-segment .btn.active {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 28%, transparent);
+}
+
+/* 开关：稍紧凑 */
+.settings-panel .switch-ui {
+  width: 44px;
+  height: 24px;
+}
+.settings-panel .switch-ui::after {
+  top: 3px;
+  right: 3px;
+  width: 18px;
+  height: 18px;
+}
+.settings-panel .switch-label input:not(:checked) + .switch-ui::after {
+  right: 23px;
+}
+
+/* 多行 stack 行：保留顶部对齐与上下间距 */
+.settings-panel .settings-row.settings-row-stack {
+  align-items: start;
+  padding: 16px 0;
+}
+
+.settings-panel .settings-row.settings-row-stack > div {
+  width: 100%;
+}
+
+/* 关于面板间距统一 */
+.about-panel {
+  margin-top: 18px;
+  padding: 18px 24px;
+}
+
+.backup-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 14px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.backup-list span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-note {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.compatibility-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.compatibility-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.compatibility-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.compatibility-item.stable {
+  border-color: color-mix(in srgb, var(--success) 35%, var(--line));
+  background: var(--success-soft);
+}
+
+.compatibility-item.experimental {
+  border-color: #fed7aa;
+  background: #fff7ed;
+}
+
+[data-bs-theme="dark"] .compatibility-item.experimental {
+  background: rgba(251, 146, 60, .12);
+  border-color: rgba(251, 146, 60, .34);
+}
+
+.compatibility-item strong,
+.compatibility-item span {
+  display: block;
+}
+
+.compatibility-item strong {
+  font-size: 13px;
+}
+
+.compatibility-item span,
+.compatibility-item em {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.compatibility-item em {
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.inline-status {
+  min-height: 18px;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}

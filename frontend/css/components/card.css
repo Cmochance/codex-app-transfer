@@ -1,0 +1,161 @@
+/* ============================================================
+   components/card.css — Panels, status cards, stat cards (.panel / .status-card / .stat-card / .terminal-panel / .soft-icon)
+   layer1: line 272-310 + 420-452 + 1185-1225
+   layer2: line 2860-2865 + 3036-3052 (compact override)
+   ============================================================ */
+
+.panel,
+.status-card,
+.terminal-panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 28px;
+}
+
+.status-card {
+  min-height: 278px;
+  padding: 32px 24px;
+  text-align: center;
+}
+
+.status-card h2 {
+  margin: 0 0 26px;
+  color: var(--muted);
+  font-size: 25px;
+  font-weight: 750;
+}
+
+.status-card strong {
+  display: block;
+  margin-top: 22px;
+  color: var(--success);
+  font-size: 31px;
+  font-weight: 800;
+}
+
+.status-card:nth-child(3) strong {
+  color: var(--text);
+}
+
+.status-card strong.muted-text {
+  color: var(--warning);
+}
+
+.panel {
+  padding: 28px;
+}
+
+.panel-header,
+.title-with-icon {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.title-with-icon {
+  justify-content: flex-start;
+}
+
+.panel h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 26px;
+  font-weight: 760;
+}
+
+.soft-icon {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
+  color: var(--primary);
+  background: var(--primary-soft);
+  font-size: 26px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 24px;
+  margin-top: 22px;
+}
+
+.stat-card {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  min-height: 135px;
+  padding: 26px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.stat-card i {
+  display: grid;
+  place-items: center;
+  width: 70px;
+  height: 70px;
+  border-radius: 50%;
+  color: var(--primary);
+  background: var(--primary-soft);
+  font-size: 34px;
+}
+
+.stat-card strong {
+  display: block;
+  color: var(--text);
+  font-size: 36px;
+}
+
+.stat-card span {
+  color: var(--muted);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+/* === Layer 2: compact desktop === */
+
+.form-panel,
+.panel {
+  padding: 24px;
+  border-radius: 14px;
+  box-shadow: none;
+}
+
+.stats-grid {
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+.stat-card {
+  min-height: 82px;
+  padding: 14px;
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+.stat-card i {
+  width: 36px;
+  height: 36px;
+  font-size: 18px;
+}
+
+/* === Cross-component layer2 拆出 (原 line 3022 + 3058 复合 selector 拆解) === */
+.stat-card strong {
+  font-size: 20px;
+}
+
+.panel h2 {
+  font-size: 16px;
+}

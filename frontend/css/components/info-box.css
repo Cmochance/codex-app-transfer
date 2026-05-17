@@ -1,0 +1,35 @@
+/* ============================================================
+   components/info-box.css — Inline info / hint card (.info-box)
+   layer1: line 867-887
+   layer2 (font tweak): line 3004-3008 (.alias-pill, .source-model, .info-box font shrink)
+   ============================================================ */
+
+.info-box {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  margin-top: 30px;
+  padding: 22px 26px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--soft-surface);
+  color: var(--muted);
+  font-size: 18px;
+}
+
+.info-box i {
+  color: var(--primary);
+  font-size: 38px;
+}
+
+.info-box p {
+  margin: 0;
+}
+
+/* === Layer 2: compact desktop === */
+
+.alias-pill,
+.source-model,
+.info-box {
+  font-size: 13px;
+}

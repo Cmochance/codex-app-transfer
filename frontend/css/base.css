@@ -1,0 +1,55 @@
+/* ============================================================
+   base.css — Global reset, body, focus, scroll, transitions
+   layer1 fira import + reset/body/links (line 1, 35-75)
+   layer2 body (line 1872-1876)
+   ============================================================ */
+
+@import url("../vendor/fira/fira.css");
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  margin: 0;
+  overflow: hidden;
+  background: var(--app-bg);
+  color: var(--text);
+  font-family: "Fira Sans", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  letter-spacing: 0;
+}
+
+a {
+  text-decoration: none;
+}
+
+button,
+a,
+select,
+input,
+.preset-item,
+.route-tab {
+  transition: background-color .2s ease, border-color .2s ease, color .2s ease, box-shadow .2s ease, opacity .2s ease;
+}
+
+button,
+a,
+.preset-item,
+label[for],
+.switch-label {
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--primary) 70%, #fff);
+  outline-offset: 3px;
+}
+
+body {
+  background: var(--app-bg);
+  font-family: Inter, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+}

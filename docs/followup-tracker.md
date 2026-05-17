@@ -90,6 +90,9 @@ related_pr: <PR# 或 null>
 - [#31 P1 账号还原:跨版本 MANAGED_KEYS 升级可能误删旧 snapshot 未记的用户 key](followup/31-account-restore-cross-version-managed-keys.md) — schema_version 无 managed_keys_at_snapshot 字段,版本演化兼容性风险
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
 - [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,推荐 Method 1+6,需 Windows 真机 spike 验
+- [#34 P2 客户端 latest.json + installer RSA 验签(签了但客户端不验)](followup/34-update-client-rsa-signature-verify.md) — 公钥+CI签名都在,只差客户端 verify;MITM 改 sha256 即可推任意 installer
+- [#35 P3 macOS update 加 translocation / quarantine 前置检查](followup/35-macos-update-translocation-quarantine-precheck.md) — 借鉴 AiMaMi update.rs:47-113;场景 dmg 直跑用户升级失败 + quarantine 二次弹窗
+- [#36 P3 Windows update 走 NSIS /D=install_dir 保持安装目录](followup/36-windows-update-nsis-install-dir-preserve.md) — 借鉴 AiMaMi update.rs:7-23;非默认目录用户升级会双装或回 C:\Program Files
 
 ---
 
