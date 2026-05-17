@@ -513,21 +513,11 @@ async fn inject_unlock_script(
         }
     }
     function scheduleUnlock() {
-        // unlocked=true 后 observer 已被 disconnect,但保险加这条 early-return
-        // 防 race(observer disconnect 跟 mutation 派发是异步,可能仍触发一次)。
-        if (window[MARKER].unlocked) return;
         if (window[MARKER].scanPending) return;
         window[MARKER].scanPending = true;
         setTimeout(() => {
             window[MARKER].scanPending = false;
             runUnlock();
-            // runUnlock 后若已 unlocked,主动 disconnect observer 停止后续抖动
-            // (setAuthMethod 触发 React 整树重渲会派发大量 mutation,observer
-            // 反复触发 scheduleUnlock 200ms 后再 runUnlock,造成视觉抖动)
-            if (window[MARKER].unlocked) {
-                window[MARKER].observer?.disconnect();
-                window[MARKER].observer = null;
-            }
         }, 200);
     }
 
@@ -538,20 +528,20 @@ async fn inject_unlock_script(
         await new Promise((r) => setTimeout(r, 500));
     }
 
-    // SPA 路由跳转 / sidebar 重渲会冲掉我们的 DOM mutation。
-    // **unlocked 后立刻不装 observer** — 已经 setAuthMethod('chatgpt') 让
-    // React 顶层 AuthContext 切到已登录态,SPA route 跳转重渲也会保持解锁
-    // (因为 React 用新 props 重绘按钮),不需要 observer 反复 enforce。
-    // 未 unlocked(注入失败)才装 observer 兜底等下次 DOM 出现 plugin 按钮再试。
+    // SPA 路由跳转 / sidebar 重渲会冲掉我们的 DOM mutation,装 observer 持续 enforce。
+    // **不基于 unlocked 标志决定是否 disconnect** — `window[MARKER].unlocked`
+    // 一旦置 true 永不 reset(marker 用 `|| { ... }` 复用),但用户后续 logout /
+    // 切账号会让 authMethod 切回非 chatgpt 重新锁 Plugins;observer 必须始终在
+    // 装,才能在 re-lock 场景下被 mutation 触发重新跑 runUnlock → 重 inject
+    // setAuthMethod('chatgpt') 解锁。`spoofChatGPTAuthMethod` 内 early-return
+    // (line 437)已保证已 chatgpt 不重复调 setAuthMethod,所以已解锁后 observer
+    // 反复 fire 也不会触发 React 重渲 → 不会有视觉抖动。
     window[MARKER].observer?.disconnect();
-    window[MARKER].observer = null;
-    if (!window[MARKER].unlocked) {
-        window[MARKER].observer = new MutationObserver(scheduleUnlock);
-        window[MARKER].observer.observe(
-            document.body || document.documentElement,
-            { childList: true, subtree: true }
-        );
-    }
+    window[MARKER].observer = new MutationObserver(scheduleUnlock);
+    window[MARKER].observer.observe(
+        document.body || document.documentElement,
+        { childList: true, subtree: true }
+    );
 
     return window[MARKER].unlocked === true;
 })()
