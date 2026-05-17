@@ -2,9 +2,11 @@
 id: 37
 priority: P3
 type: refactor
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: 196
+related_pr: 199
+resolved_pr: 199
+resolved_date: 2026-05-17
 ---
 
 # update.rs download_asset_impl: in-memory bytes 防 TOCTOU + 重 add bad-sha256 mismatch 单测

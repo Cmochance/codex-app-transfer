@@ -85,10 +85,8 @@ related_pr: <PR# 或 null>
 - [#26 P2 Plugins / MCP 跟"协议转发"绑定 — UI / README 显式提示](followup/26-plugins-mcp-protocol-binding-ui-hint.md) — Responses 直连 provider 启 Plugins 工具静默丢,设计性 gap 需提示
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
 - [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,**PR #191 已实施 Method 1 (COM activation) 核心 + 本 PR 实施 PowerShell CIM 进程清理替 taskkill (绕 MSIX access-denied)**;P2 剩端口冲突探测 + 非-Store .exe fallback
-- [#34 P2 客户端 latest.json + installer RSA 验签(签了但客户端不验)](followup/34-update-client-rsa-signature-verify.md) — 公钥+CI签名都在,只差客户端 verify;MITM 改 sha256 即可推任意 installer
 - [#35 P3 macOS update 加 translocation / quarantine 前置检查](followup/35-macos-update-translocation-quarantine-precheck.md) — 借鉴 AiMaMi update.rs:47-113;场景 dmg 直跑用户升级失败 + quarantine 二次弹窗
 - [#36 P3 Windows update 走 NSIS /D=install_dir 保持安装目录](followup/36-windows-update-nsis-install-dir-preserve.md) — 借鉴 AiMaMi update.rs:7-23;非默认目录用户升级会双装或回 C:\Program Files
-- [#37 P3 update.rs download_asset_impl: in-memory bytes 防 TOCTOU + 重 add bad-sha256 mismatch 单测](followup/37-download-asset-toctou-and-bad-sha-test.md) — PR #196 review 派生, Linux 共享 /tmp TOCTOU window + 丢的 sha256 测试 re-add
 
 ---
 
@@ -101,6 +99,8 @@ related_pr: <PR# 或 null>
 - ~~#29 账号还原:cleanup_all=true 物理删光所有 snapshot~~ → PR #194 (2026-05-17),软删除 → trash/ + 30 天 GC 堵核心 P0;dry-run preview + UI 二次确认 enhancement 微小不开新 followup
 - ~~#30 账号还原:snapshot 单点存储无冗余 / 无导出入口~~ → PR #201 (2026-05-17),跨平台 external_backup_dir 自动镜像(macOS / Windows / Linux)堵核心 P1;UI 导出/导入按钮 enhancement 真有需求再开新 followup
 - ~~#31 账号还原:跨版本 MANAGED_KEYS 升级误删用户 key~~ → **dropped 2026-05-17**,false alarm:整文件 cp 已保留任何 root key,managed list 只影响 restore 操作不影响存储
+- ~~#34 客户端 latest.json + installer RSA 验签~~ → PR #197 (2026-05-17),公钥 build-time embed + verify_signed_bytes 接 fetch_latest_json + download_asset_impl,8 单测覆盖
+- ~~#37 update.rs download_asset_impl: in-memory bytes 防 TOCTOU + 重 add bad-sha256 mismatch 单测~~ → PR #199 (2026-05-17),完全 skip partial 文件消除 verify→rename race + verify_installer_sha256 抽函数 5-case 单测 + 500MB hard cap + 4xx/5xx 错误分类不附 URL
 
 <!-- 示例:
 - ~~#25 cloud_code Gemini mapper 漏配 session_cache~~ → PR #146 (2026-05-13)

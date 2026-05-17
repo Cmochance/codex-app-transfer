@@ -2,9 +2,11 @@
 id: 34
 priority: P2
 type: bug
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+related_pr: 197
+resolved_pr: 197
+resolved_date: 2026-05-17
 ---
 
 # 客户端 latest.json + installer RSA 验签(签了但客户端不验)
