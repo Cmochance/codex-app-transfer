@@ -262,14 +262,16 @@ async fn connect_and_monitor(
     let (mut write, mut read) = ws_stream.split();
 
     // 1. 启用 Runtime domain
-    let runtime_enable = make_cdp_msg(msg_id_counter, "Runtime.enable", json!({})).await;
+    let (runtime_enable, runtime_enable_id) =
+        make_cdp_msg(msg_id_counter, "Runtime.enable", json!({})).await;
     write.send(WsMessage::Text(runtime_enable)).await?;
-    let _ = read.next().await;
+    let _ = await_cdp_response(&mut read, runtime_enable_id, Duration::from_secs(5)).await;
 
     // 2. 启用 Page domain（监听刷新事件）
-    let page_enable = make_cdp_msg(msg_id_counter, "Page.enable", json!({})).await;
+    let (page_enable, page_enable_id) =
+        make_cdp_msg(msg_id_counter, "Page.enable", json!({})).await;
     write.send(WsMessage::Text(page_enable)).await?;
-    let _ = read.next().await;
+    let _ = await_cdp_response(&mut read, page_enable_id, Duration::from_secs(5)).await;
 
     // 3. 首次注入
     inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
@@ -322,8 +324,9 @@ async fn connect_and_monitor(
 
             // 心跳检测：如果 30 秒没有收到任何消息，检查连接是否仍然活跃
             _ = sleep(Duration::from_secs(30)) => {
-                // 发送一个简单的 Runtime.getProperties 来检测连接
-                let ping = make_cdp_msg(msg_id_counter, "Runtime.evaluate", json!({"expression": "1+1"})).await;
+                // 发送一个简单的 Runtime.evaluate 来检测连接;响应会从外层
+                // select! 的 read.next() 分支流回,被忽略(不是 Page.loadEventFired)
+                let (ping, _ping_id) = make_cdp_msg(msg_id_counter, "Runtime.evaluate", json!({"expression": "1+1"})).await;
                 if let Err(e) = write.send(WsMessage::Text(ping)).await {
                     tracing::warn!("[PluginUnlock] ping failed, connection dead: {}", e);
                     break;
@@ -394,7 +397,7 @@ async fn inject_unlock_script(
 })()
 "#;
 
-    let evaluate = make_cdp_msg(
+    let (evaluate, evaluate_id) = make_cdp_msg(
         msg_id_counter,
         "Runtime.evaluate",
         json!({
@@ -407,31 +410,38 @@ async fn inject_unlock_script(
 
     write.send(WsMessage::Text(evaluate)).await?;
 
-    // 等待响应。脚本只在 React fiber 上确实拿到 setAuthMethod 且调用成功时
-    // 才返回 true;返回 false 或无 result.value 都视为注入失败,必须 surface
-    // 给前端 — 不能 fallback 到"也算成功"(否则 UI 显示绿色 Injected 但
-    // Plugins tab 实际没出现,违反 no-silent-destructive-fallback 规则)。
-    if let Some(Ok(WsMessage::Text(resp))) = read.next().await {
-        let parsed: CdpResponse = serde_json::from_str(&resp)?;
-        if let Some(error) = parsed.error {
-            return Err(format!("CDP error {}: {}", error.code, error.message).into());
+    // 必须按 CDP message id 匹配响应,而不是简单读"下一帧"。
+    // 注入脚本内 `console.log` 会触发 `Runtime.consoleAPICalled` 事件帧,
+    // 30 秒心跳的 evaluate 响应也可能排队 — 这些都不带 evaluate_id,
+    // 会跟我们的目标响应交错。await_cdp_response 循环丢弃非目标 id 的帧。
+    let parsed = match await_cdp_response(read, evaluate_id, Duration::from_secs(8)).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            set_status(
+                status,
+                UnlockStatus::Failed {
+                    error: format!("CDP Runtime.evaluate 响应等待失败: {e}"),
+                },
+            )
+            .await;
+            return Err(e.into());
         }
-        if let Some(result) = parsed.result {
-            if let Some(val) = result.get("result").and_then(|v| v.get("value")) {
-                if val.as_bool() == Some(true) {
-                    set_status(status, UnlockStatus::Injected).await;
-                    return Ok(());
-                }
-                set_status(
-                    status,
-                    UnlockStatus::Failed {
-                        error:
-                            "注入脚本未找到 React setAuthMethod hook,Codex Desktop 版本可能不兼容"
-                                .into(),
-                    },
-                )
-                .await;
-                return Err("inject script returned non-true".into());
+    };
+
+    if let Some(error) = parsed.error {
+        let msg = format!("CDP error {}: {}", error.code, error.message);
+        set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+        return Err(msg.into());
+    }
+
+    // 脚本只在 React fiber 上确实拿到 setAuthMethod 且调用成功时才返回 true;
+    // 返回 false 或无 result.value 都视为注入失败 — 不能 fallback 到"也算
+    // 成功"(违反 no-silent-destructive-fallback 规则)。
+    if let Some(result) = parsed.result {
+        if let Some(val) = result.get("result").and_then(|v| v.get("value")) {
+            if val.as_bool() == Some(true) {
+                set_status(status, UnlockStatus::Injected).await;
+                return Ok(());
             }
         }
     }
@@ -439,30 +449,71 @@ async fn inject_unlock_script(
     set_status(
         status,
         UnlockStatus::Failed {
-            error: "CDP Runtime.evaluate 未返回有效响应".into(),
+            error: "注入脚本未找到 React setAuthMethod hook,Codex Desktop 版本可能不兼容".into(),
         },
     )
     .await;
-    Err("no CDP response for inject script".into())
+    Err("inject script returned non-true".into())
 }
 
-/// 生成 CDP 消息 JSON
+/// 循环读 WebSocket 帧,丢弃非目标 id 的事件 / 响应,直到拿到 `target_id`
+/// 对应的响应或超时。
+///
+/// CDP 协议在 active session 上会持续推送各种事件帧(`Runtime.consoleAPICalled`
+/// / `Page.loadEventFired` / 其他 request 的 response),不能假设"下一帧
+/// 就是我刚发的 request 的 reply"— 必须按 `resp.id == Some(target_id)`
+/// 精确匹配。
+async fn await_cdp_response(
+    read: &mut (impl Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    target_id: u64,
+    timeout: Duration,
+) -> Result<CdpResponse, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, read.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(e))) => return Err(format!("ws read error: {e}")),
+            Ok(None) => return Err("ws closed before response".into()),
+            Err(_) => return Err(format!("timed out waiting for id={target_id}")),
+        };
+        let WsMessage::Text(text) = frame else {
+            continue;
+        };
+        let resp: CdpResponse = match serde_json::from_str(&text) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if resp.id == Some(target_id) {
+            return Ok(resp);
+        }
+        tracing::trace!(
+            target_id,
+            dropped_id = ?resp.id,
+            dropped_method = ?resp.method,
+            "[PluginUnlock] dropping non-target CDP frame while awaiting response"
+        );
+    }
+}
+
+/// 生成 CDP 消息 JSON,返回 `(序列化后的 text frame, 该消息的 id)`。
+/// 调用方需保留 `id` 用于 `await_cdp_response` 匹配响应。
 async fn make_cdp_msg(
     counter: &Arc<Mutex<u64>>,
     method: &str,
     params: serde_json::Value,
-) -> String {
+) -> (String, u64) {
     let mut id = counter.lock().await;
     *id += 1;
     let current_id = *id;
     drop(id);
 
-    json!({
+    let json = json!({
         "id": current_id,
         "method": method,
         "params": params
     })
-    .to_string()
+    .to_string();
+    (json, current_id)
 }
 
 /// 设置状态（带日志）
