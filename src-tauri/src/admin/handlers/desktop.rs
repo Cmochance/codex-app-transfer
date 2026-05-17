@@ -912,6 +912,28 @@ pub async fn desktop_clear() -> impl IntoResponse {
         Ok(p) => p,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // follow-up #28 P0 守门:无快照时**直接 noop 不动文件**。
+    //
+    // 老逻辑直接调 restore_codex_state → has_snapshot=false 走
+    // clear_managed_codex_state 一刀删 MANAGED_TOML_KEYS + MANAGED_AUTH_KEYS
+    // 全部字段(`openai_base_url` / `model_provider` / `model` / `OPENAI_API_KEY`
+    // / `auth_mode` 等)。复现:用户从未用过本 app,自己手写过 ~/.codex/config.toml
+    // 含 `openai_base_url = "https://my-proxy"` + `model_provider = "azure"`,
+    // 装本 app 后**没 apply**就点 "清除桌面配置" 按钮 → 用户手写的 managed
+    // key 被全删 → Codex CLI 直接使用立刻坏。
+    //
+    // 修法 B(最小守门): has_snapshot=false 时直接返结构化 message,
+    // 不动文件。语义:没本 app apply 过 = 没东西要还原 = noop 安全。用户
+    // 真想清自己写的 config 应该手动编辑 ~/.codex/config.toml,而不是
+    // 走本 app 的"清除桌面配置"按钮。
+    if !has_snapshot(&paths) {
+        return Json(json!({
+            "success": true,
+            "restored": false,
+            "message": "no snapshot to clear (本应用未对 ~/.codex/ 做过任何修改,无需清除)",
+        }))
+        .into_response();
+    }
     match restore_codex_state(&paths) {
         Ok(restored) => Json(json!({"success": true, "restored": restored})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

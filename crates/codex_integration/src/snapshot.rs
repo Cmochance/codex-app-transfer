@@ -22,6 +22,11 @@ use crate::CodexError;
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
+/// `gc_trash_older_than` 的默认保留天数 — daemon startup 调一次时用。
+/// 30 天是"误点 cleanup_all 后用户还有月内时间发现并从 trash/ 恢复"的
+/// 平衡点。若未来开 UI/CLI 配置入口,改 caller 传值,这条常量做 fallback。
+pub const TRASH_RETENTION_DAYS: u64 = 30;
+
 static CURRENT_SESSION_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -208,18 +213,123 @@ pub fn drop_snapshot_by_id(paths: &CodexPaths, snapshot_id: &str) -> Result<(), 
     Ok(())
 }
 
-/// 删除所有 active/recovery/legacy 快照。仅用于人工选择恢复成功后的清理。
+/// 软删除所有 active/recovery/legacy 快照 — **移动**到 `trash/<UTC-timestamp>/`
+/// 而不是物理 `remove_dir_all`。给用户"误点 cleanup_all 还能从 trash 恢复"
+/// 窗口,follow-up #29 守门防真原始账号信息被一次性删光。
+///
+/// trash 目录由 [`gc_trash_older_than`] 定期清理(daemon 启动调一次,默认
+/// 保留 30 天)。即便 GC 不跑,trash 也只 grow 不丢历史。
+///
+/// 任何子 move 失败(典型场景: trash 跨文件系统不支持 rename)fallback 到
+/// "copy + remove_dir_all" 保证软删除语义(数据先到 trash 再清旧位)。
 pub fn drop_all_snapshots(paths: &CodexPaths) -> Result<(), CodexError> {
-    if paths.active_snapshots_dir.exists() {
-        std::fs::remove_dir_all(&paths.active_snapshots_dir)?;
-    }
-    if paths.recovery_snapshots_dir.exists() {
-        std::fs::remove_dir_all(&paths.recovery_snapshots_dir)?;
-    }
-    if paths.snapshot_dir.exists() {
-        std::fs::remove_dir_all(&paths.snapshot_dir)?;
+    let trash_bucket = paths.trash_snapshots_dir.join(format!(
+        "{}-cleanup",
+        Local::now().format("%Y%m%dT%H%M%S%3f")
+    ));
+    std::fs::create_dir_all(&trash_bucket)?;
+
+    move_dir_to_trash(&paths.active_snapshots_dir, &trash_bucket.join("active"))?;
+    move_dir_to_trash(
+        &paths.recovery_snapshots_dir,
+        &trash_bucket.join("recovery"),
+    )?;
+    move_dir_to_trash(&paths.snapshot_dir, &trash_bucket.join("legacy"))?;
+
+    // trash_bucket 空(没东西可移)→ 清掉空目录避免日积月累空 bucket 堆积
+    if trash_bucket
+        .read_dir()
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(&trash_bucket);
     }
     Ok(())
+}
+
+fn move_dir_to_trash(src: &Path, dst: &Path) -> Result<(), CodexError> {
+    if !src.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // rename 成功直接返。失败原因(跨 FS EXDEV / 权限 EACCES / 磁盘满 ENOSPC /
+    // Windows ERROR_SHARING_VIOLATION 等)在 fallback 失败时拼进 err message
+    // 防丢上下文 —— 之前 `.is_ok()` 直接吞所有 rename err 让 debug 无从下手
+    // (silent-failure-hunter review H1)。
+    let rename_err = match std::fs::rename(src, dst) {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    copy_dir_recursive(src, dst).map_err(|copy_err| {
+        CodexError::Io(std::io::Error::other(format!(
+            "move_dir_to_trash: rename failed ({rename_err}), copy fallback also failed: {copy_err}"
+        )))
+    })?;
+    std::fs::remove_dir_all(src).map_err(|remove_err| {
+        // copy 成功但 src 删失败 → trash 有副本 + src 残留,语义破。caller 应
+        // 拿 err message 提示用户手动清理 src 防 has_snapshot 误判 active 仍存在
+        // (silent-failure-hunter review H2)。
+        CodexError::Io(std::io::Error::other(format!(
+            "move_dir_to_trash: rename failed ({rename_err}), copy ok but src removal failed: {remove_err}. \
+             trash 已有副本,src 残留需手动清理避免 has_snapshot 误判"
+        )))
+    })?;
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), CodexError> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// GC `trash/` 下 mtime 超过 `retention_days` 天的 bucket。
+///
+/// 返 `(removed, failed)` 计数:成功删的 bucket 数 + 应删但失败的 bucket 数。
+/// 任何子目录 remove 失败不 propagate(GC 不是关键路径),但**计数失败**让
+/// caller 能 log 区分 "trash 是空(removed=0/failed=0)" vs "GC 跑了但全
+/// 失败(removed=0/failed=N)"。修 silent-failure-hunter review H3。
+///
+/// 入参 `retention_days` 极大值溢出 → 返 (0, 0),语义"留所有 bucket"。
+///
+/// 建议 caller:daemon / app 启动时调一次 `gc_trash_older_than(paths,
+/// TRASH_RETENTION_DAYS)`。
+pub fn gc_trash_older_than(paths: &CodexPaths, retention_days: u64) -> (usize, usize) {
+    let Ok(read) = std::fs::read_dir(&paths.trash_snapshots_dir) else {
+        return (0, 0);
+    };
+    let cutoff = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(
+        retention_days.saturating_mul(86_400),
+    ));
+    let Some(cutoff) = cutoff else {
+        return (0, 0);
+    };
+    let mut removed = 0usize;
+    let mut failed = 0usize;
+    for entry in read.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if mtime < cutoff {
+            if std::fs::remove_dir_all(entry.path()).is_ok() {
+                removed += 1;
+            } else {
+                failed += 1;
+            }
+        }
+    }
+    (removed, failed)
 }
 
 fn read_manifest_from_dir(dir: &Path) -> Result<SnapshotManifest, CodexError> {
@@ -521,6 +631,69 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CodexPaths::from_home_dir(tmp.path());
         (tmp, paths)
+    }
+
+    #[test]
+    fn drop_all_snapshots_moves_to_trash_not_physical_delete() {
+        // follow-up #29 守门:cleanup_all=true 不能物理删 active/recovery,
+        // 必须移到 trash/ 保留恢复窗口。
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(&paths.config_toml, "openai_base_url = \"x\"\n").unwrap();
+        std::fs::write(&paths.auth_json, "{\"OPENAI_API_KEY\":\"sk-real\"}\n").unwrap();
+        snapshot_codex_state(&paths, "v-test", "Mock").unwrap();
+        assert!(has_snapshot(&paths));
+
+        drop_all_snapshots(&paths).unwrap();
+
+        // active/ 已被 move 走
+        assert!(!has_snapshot(&paths));
+        // trash/ 下应有一个 <timestamp>-cleanup bucket,内含 active 子目录
+        let trash_buckets: Vec<_> = std::fs::read_dir(&paths.trash_snapshots_dir)
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(trash_buckets.len(), 1, "trash 应该有 1 个 bucket");
+        let bucket = trash_buckets[0].path();
+        assert!(
+            bucket.join("active").exists(),
+            "active 应被 move 到 trash/<bucket>/active"
+        );
+    }
+
+    #[test]
+    fn drop_all_snapshots_when_nothing_to_move_does_not_create_empty_bucket() {
+        // 三个目录都不存在时不应留空 bucket 在 trash/
+        let (_t, paths) = paths_with_tmp();
+        drop_all_snapshots(&paths).unwrap();
+        let trash_count = std::fs::read_dir(&paths.trash_snapshots_dir)
+            .map(|it| it.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(trash_count, 0, "trash 不应有空 bucket");
+    }
+
+    #[test]
+    fn gc_trash_removes_old_buckets_keeps_fresh() {
+        // GC 按 mtime 区分新旧 bucket
+        use std::time::{Duration, SystemTime};
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.trash_snapshots_dir).unwrap();
+        let old = paths.trash_snapshots_dir.join("20200101T000000000-cleanup");
+        let fresh = paths.trash_snapshots_dir.join("20260517T000000000-cleanup");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&fresh).unwrap();
+
+        // 把 old 的 mtime 设到 100 天前,fresh 保持当前
+        let ancient = SystemTime::now() - Duration::from_secs(100 * 86_400);
+        let f = std::fs::File::open(&old).unwrap();
+        f.set_modified(ancient).unwrap();
+        drop(f);
+
+        let (removed, failed) = gc_trash_older_than(&paths, 30);
+        assert_eq!(removed, 1, "应该清掉 1 个 100 天老 bucket");
+        assert_eq!(failed, 0, "无 remove 失败");
+        assert!(!old.exists(), "old bucket 应已被清");
+        assert!(fresh.exists(), "fresh bucket 必须保留");
     }
 
     #[test]

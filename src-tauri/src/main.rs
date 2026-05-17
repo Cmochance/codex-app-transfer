@@ -52,6 +52,45 @@ fn main() {
         .setup(|app| {
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
+            // follow-up #29:GC ~/.codex-app-transfer/codex-snapshots/trash/ 下
+            // mtime > TRASH_RETENTION_DAYS 天的软删 bucket。fire-and-forget,
+            // 失败 warn 不阻塞 startup。retention 给用户"误点 cleanup_all 后
+            // 还有窗口期可在 trash/ 手动恢复"的安全网。
+            //
+            // always log:`removed=0/failed=0` = trash 空 / 无东西要清(健康),
+            // `removed=0/failed=N` = GC 跑了但全失败(权限 / 锁 / 异常 FS),
+            // 必须区分让运维诊断 trash 持续 grow 的根因。
+            tauri::async_runtime::spawn(async {
+                use codex_app_transfer_codex_integration::{
+                    gc_trash_older_than, CodexPaths, TRASH_RETENTION_DAYS,
+                };
+                match CodexPaths::from_home_env() {
+                    Ok(paths) => {
+                        let (removed, failed) =
+                            gc_trash_older_than(&paths, TRASH_RETENTION_DAYS);
+                        if failed > 0 {
+                            tracing::warn!(
+                                removed,
+                                failed,
+                                retention_days = TRASH_RETENTION_DAYS,
+                                "snapshot trash GC: some buckets failed to remove (检查 trash/ 目录权限 / 文件锁)"
+                            );
+                        } else {
+                            tracing::info!(
+                                removed,
+                                retention_days = TRASH_RETENTION_DAYS,
+                                "snapshot trash GC: removed expired buckets"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "snapshot trash GC skipped: CodexPaths::from_home_env() failed"
+                        );
+                    }
+                }
+            });
             tauri::async_runtime::spawn(async move {
                 let _ = handlers::desktop::auto_apply_on_startup_if_enabled(startup_proxy_manager)
                     .await;

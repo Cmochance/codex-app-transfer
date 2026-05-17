@@ -19,6 +19,10 @@ pub struct CodexPaths {
     pub snapshots_dir: PathBuf,
     pub active_snapshots_dir: PathBuf,
     pub recovery_snapshots_dir: PathBuf,
+    /// 软删除目录 — `drop_all_snapshots` 不再物理 remove_dir_all,而是
+    /// move 到 `trash/<UTC-timestamp>/`,保留 N 天后由 `gc_trash_older_than`
+    /// 清理。给用户"误点 cleanup_all 还能恢复"窗口,follow-up #29 守门。
+    pub trash_snapshots_dir: PathBuf,
 }
 
 impl CodexPaths {
@@ -40,6 +44,7 @@ impl CodexPaths {
         let snapshots_dir = app_home.join("codex-snapshots");
         let active_snapshots_dir = snapshots_dir.join("active");
         let recovery_snapshots_dir = snapshots_dir.join("recovery");
+        let trash_snapshots_dir = snapshots_dir.join("trash");
         Self {
             config_toml: codex_home.join("config.toml"),
             auth_json: codex_home.join("auth.json"),
@@ -51,6 +56,7 @@ impl CodexPaths {
             snapshots_dir,
             active_snapshots_dir,
             recovery_snapshots_dir,
+            trash_snapshots_dir,
             codex_home,
             app_home,
         }
@@ -91,6 +97,10 @@ mod tests {
         assert_eq!(
             p.recovery_snapshots_dir,
             PathBuf::from("/x/.codex-app-transfer/codex-snapshots/recovery")
+        );
+        assert_eq!(
+            p.trash_snapshots_dir,
+            PathBuf::from("/x/.codex-app-transfer/codex-snapshots/trash")
         );
     }
 }

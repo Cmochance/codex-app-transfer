@@ -26,6 +26,7 @@
 
 #![cfg(target_os = "windows")]
 
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use windows::core::{HSTRING, PCWSTR};
@@ -107,13 +108,20 @@ pub fn activate_packaged_app(aumid: &str, args: &str) -> Result<u32, String> {
 /// 比 None 更难诊断,且 explorer.exe fallback 已是 safety net。
 pub fn resolve_codex_aumid() -> Option<String> {
     // PowerShell `Get-AppxPackage` 需要 `-NoProfile` 加速启动(否则会跑
-    // 用户 PSProfile 几百 ms 起步)
+    // 用户 PSProfile 几百 ms 起步)。
+    // `CREATE_NO_WINDOW = 0x0800_0000`:防止 powershell 在前台 flash 一个
+    // console 黑框(本项目 GUI app 无 stdio,console 弹出会被用户感知为
+    // "终端窗口"打扰)。跟 `desktop.rs::hide_console_window` 同模式
+    // (借鉴 codex-account-switch `src-tauri/win/runtime/process.rs::
+    // hide_console_window`)。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
             "Get-AppxPackage -Name 'OpenAI.Codex' | Select-Object -ExpandProperty PackageFamilyName",
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
