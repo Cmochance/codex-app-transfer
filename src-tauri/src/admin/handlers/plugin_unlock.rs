@@ -33,6 +33,12 @@ async fn get_service() -> Arc<PluginUnlockService> {
         .clone()
 }
 
+/// 供 `main.rs` setup hook auto-start 复用同一个 OnceCell 实例,避免
+/// 跟前端 HTTP handler 手动 start 出来的实例各跑一份 daemon。
+pub async fn shared_service() -> Arc<PluginUnlockService> {
+    get_service().await
+}
+
 // ── HTTP Handlers ──
 
 /// GET /api/desktop/plugin-unlock/status

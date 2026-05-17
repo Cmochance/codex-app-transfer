@@ -2046,7 +2046,7 @@
     $("#settingsProxyPort").value = settings.proxyPort;
     $("#settingsAdminPort").value = settings.adminPort;
     $("#autoApplyOnStart").checked = settings.autoApplyOnStart !== false;
-   $("#autoUnlockCodexPlugins").checked = !!settings.autoUnlockCodexPlugins;
+   $("#autoUnlockCodexPlugins").checked = settings.autoUnlockCodexPlugins !== false;
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;

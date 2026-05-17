@@ -407,26 +407,42 @@ async fn inject_unlock_script(
 
     write.send(WsMessage::Text(evaluate)).await?;
 
-    // 等待响应
+    // 等待响应。脚本只在 React fiber 上确实拿到 setAuthMethod 且调用成功时
+    // 才返回 true;返回 false 或无 result.value 都视为注入失败,必须 surface
+    // 给前端 — 不能 fallback 到"也算成功"(否则 UI 显示绿色 Injected 但
+    // Plugins tab 实际没出现,违反 no-silent-destructive-fallback 规则)。
     if let Some(Ok(WsMessage::Text(resp))) = read.next().await {
         let parsed: CdpResponse = serde_json::from_str(&resp)?;
         if let Some(error) = parsed.error {
             return Err(format!("CDP error {}: {}", error.code, error.message).into());
         }
-        // 检查返回值
         if let Some(result) = parsed.result {
             if let Some(val) = result.get("result").and_then(|v| v.get("value")) {
                 if val.as_bool() == Some(true) {
                     set_status(status, UnlockStatus::Injected).await;
                     return Ok(());
                 }
+                set_status(
+                    status,
+                    UnlockStatus::Failed {
+                        error: "注入脚本未找到 React setAuthMethod hook,Codex Desktop 版本可能不兼容"
+                            .into(),
+                    },
+                )
+                .await;
+                return Err("inject script returned non-true".into());
             }
         }
     }
 
-    // 如果没有明确成功，也算成功（可能已经注入了）
-    set_status(status, UnlockStatus::Injected).await;
-    Ok(())
+    set_status(
+        status,
+        UnlockStatus::Failed {
+            error: "CDP Runtime.evaluate 未返回有效响应".into(),
+        },
+    )
+    .await;
+    Err("no CDP response for inject script".into())
 }
 
 /// 生成 CDP 消息 JSON

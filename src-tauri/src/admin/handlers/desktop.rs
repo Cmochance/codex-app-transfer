@@ -303,22 +303,24 @@ fn maybe_wake_codex_pet() {
     );
 }
 
-/// 读取设置判断是否应附加调试端口参数
+/// 读取设置判断是否应附加调试端口参数。
+///
+/// 默认 true:setting key 缺失或 registry 读失败时,仍附加 debug port,以便
+/// 新装/初始化场景下 Plugins 解锁开箱即用。用户显式关闭(=false)时才不附加。
+/// 跟 main.rs setup hook 中的 auto-start 默认值保持一致。
 fn should_attach_debug_port() -> Vec<String> {
-    match crate::admin::registry_io::load() {
-        Ok(cfg) => {
-            let auto_unlock = cfg
-                .get("settings")
-                .and_then(|s| s.get("autoUnlockCodexPlugins"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if auto_unlock {
-                vec!["--remote-debugging-port=9222".into()]
-            } else {
-                vec![]
-            }
-        }
-        Err(_) => vec![],
+    let auto_unlock = match crate::admin::registry_io::load() {
+        Ok(cfg) => cfg
+            .get("settings")
+            .and_then(|s| s.get("autoUnlockCodexPlugins"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        Err(_) => true,
+    };
+    if auto_unlock {
+        vec!["--remote-debugging-port=9222".into()]
+    } else {
+        vec![]
     }
 }
 
