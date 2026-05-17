@@ -180,6 +180,8 @@ Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) in
 
 ## Acknowledgements
 
+> One-line summaries below. For the full **borrowing form / itemized list / corresponding file:line in this codebase**, see [ACKNOWLEDGEMENTS.md](./ACKNOWLEDGEMENTS.md).
+
 - [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) — provider switching paradigm inspiration
 - [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x desktop shell skeleton + README structure reference
 - [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — bidirectional protocol translation patterns
