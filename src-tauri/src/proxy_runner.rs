@@ -165,6 +165,22 @@ impl ProxyManager {
                     _ = &mut rx => break,
                     accept = listener.accept() => {
                         let Ok((stream, _peer)) = accept else { continue };
+                        // **强制 close socket 三保险**:dup 一份 socket fd
+                        // 给 sub-task 持有,cancel 时直接调 `shutdown(SHUT_RDWR)`
+                        // OS-level 强制 close。**经验**:hyper conn future drop
+                        // 不可靠让 socket 真 close(2026-05-18 真机第三次复现:
+                        // listener drop ✓ 但 ESTABLISHED 持续不消失);raw fd
+                        // shutdown 绕开 hyper / tokio 间接 cancellation,直接
+                        // 让 OS kernel 发 FIN/RST。
+                        #[cfg(unix)]
+                        let dup_fd = {
+                            use std::os::fd::AsRawFd;
+                            let raw = stream.as_raw_fd();
+                            let dup = unsafe { libc::dup(raw) };
+                            if dup < 0 { None } else { Some(dup) }
+                        };
+                        #[cfg(not(unix))]
+                        let dup_fd: Option<i32> = None; // TODO: Windows WSADuplicateSocket
                         let io = TokioIo::new(stream);
                         let tower_service = router.clone().map_request(
                             |req: Request<Incoming>| req.map(Body::new),
@@ -178,9 +194,17 @@ impl ProxyManager {
                             tokio::select! {
                                 _ = conn.as_mut() => {}
                                 _ = conn_cancel.cancelled() => {
-                                    // cancel 触发 → select 退 → conn 在 scope
-                                    // 退出时 drop → socket close → client 断
+                                    #[cfg(unix)]
+                                    if let Some(fd) = dup_fd {
+                                        // OS-level shutdown:client 立即收 FIN/RST
+                                        unsafe { libc::shutdown(fd, libc::SHUT_RDWR); }
+                                    }
                                 }
+                            }
+                            // close dup fd(无论哪个 arm 走完都要释放)
+                            #[cfg(unix)]
+                            if let Some(fd) = dup_fd {
+                                unsafe { libc::close(fd); }
                             }
                         });
                     }

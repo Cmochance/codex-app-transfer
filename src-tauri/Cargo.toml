@@ -34,6 +34,9 @@ axum = { version = "0.8", features = ["http1", "tokio", "macros"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 tokio-util = { version = "0.7", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 base64 = "0.22"
 getrandom = "0.2"
 # 以下 5 项为 cas:// scheme 静态文件路由的跨平台依赖,
