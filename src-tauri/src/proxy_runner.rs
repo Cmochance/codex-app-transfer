@@ -12,12 +12,13 @@
 //! 是 tokio 提供的 OS-level "杀光所有 task" 原语,不需要 user-space cancel chain。
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::{mpsc, Arc};
 
 use codex_app_transfer_proxy::{build_router, StaticResolver};
 use codex_app_transfer_registry::{config_file, Config};
 use serde::Serialize;
+use tokio::sync::oneshot;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct ProxyStatus {
@@ -71,9 +72,11 @@ impl ProxyManager {
         let snapshot = load_resolver_snapshot()?;
 
         // 3. 创建 dedicated runtime + 启 server
-        //    Runtime::new 不能在 async context 内调,用 spawn_blocking 包。
+        //    Runtime::new 不能在 async context 内调,用 std::thread 包。
+        //    用 tokio::sync::oneshot 而非 std::sync::mpsc,让 receiver 端 .await
+        //    yield Tauri worker thread 而不是同步 block(Devin review fix)。
         let (addr_tx, addr_rx) =
-            mpsc::channel::<Result<(SocketAddr, tokio::runtime::Runtime), String>>();
+            oneshot::channel::<Result<(SocketAddr, tokio::runtime::Runtime), String>>();
         let resolver = Arc::new(snapshot.resolver);
         std::thread::Builder::new()
             .name(format!("cas-proxy-bootstrap-{port}"))
@@ -119,8 +122,8 @@ impl ProxyManager {
             .map_err(|e| format!("spawn proxy thread failed: {e}"))?;
 
         let (addr, runtime) = addr_rx
-            .recv()
-            .map_err(|e| format!("proxy bootstrap channel error: {e}"))??;
+            .await
+            .map_err(|_| "proxy bootstrap channel closed".to_owned())??;
 
         // 4. 落盘 handle(短锁;若期间被另一路径插入,关掉自己回滚)
         let new_handle = ProxyHandle {
@@ -132,7 +135,7 @@ impl ProxyManager {
         };
         let mut guard = self.handle.lock().unwrap();
         if guard.is_some() {
-            Self::drop_runtime_off_thread(new_handle);
+            new_handle.runtime.shutdown_background();
             return Err("proxy already started by another path".to_owned());
         }
         *guard = Some(new_handle);
@@ -147,12 +150,18 @@ impl ProxyManager {
 
     /// 停止转发 —— 一键 drop 整个 dedicated runtime,所有 spawn task 同步 abort,
     /// worker thread 退出,所有 fd / 连接 cleanup,**只保留 Tauri 主界面**。
+    ///
+    /// `Runtime::shutdown_background` 是 tokio 显式提供的 "from within another
+    /// runtime 安全 shutdown" API,不触发 "async context drop runtime" panic
+    /// (tokio docs: "useful if you want to drop a runtime from within another
+    /// runtime")。所以即使 stop_proxy admin handler 是 async fn 在此调用,
+    /// 也无需 std::thread 包装。
     #[allow(dead_code)]
     pub fn stop(&self) -> Result<(), String> {
         let mut guard = self.handle.lock().unwrap();
         match guard.take() {
             Some(h) => {
-                Self::drop_runtime_off_thread(h);
+                h.runtime.shutdown_background();
                 Ok(())
             }
             None => Err("proxy is not running".to_owned()),
@@ -163,28 +172,8 @@ impl ProxyManager {
     pub fn stop_silent(&self) {
         let mut guard = self.handle.lock().unwrap();
         if let Some(h) = guard.take() {
-            Self::drop_runtime_off_thread(h);
+            h.runtime.shutdown_background();
         }
-    }
-
-    /// 把 ProxyHandle(含 dedicated Runtime)move 到独立 std::thread 里 drop,
-    /// 避开 `Runtime::drop` "在 async context 内 drop 触发 panic" 的检查 ——
-    /// 我们的 stop_silent 经 admin handler(async fn)/ RunEvent::Exit(sync)
-    /// 两条路径调用,async 路径理论上踩 panic 红线(实测 tokio multi-thread
-    /// + cross-runtime 没触发,但 tokio 升级可能变严)。Move 到外部 std::thread
-    /// 内 drop = 远离任何 async context,100% 安全。
-    ///
-    /// thread 在 closure 跑完(shutdown_background 立刻返,然后 h 出 scope drop)
-    /// 后自动 exit,不 leak。Runtime drop 等所有 worker thread 退出,几 ms 内
-    /// 完成,thread 短命无负担。
-    fn drop_runtime_off_thread(h: ProxyHandle) {
-        std::thread::Builder::new()
-            .name("cas-proxy-shutdown".to_owned())
-            .spawn(move || {
-                h.runtime.shutdown_background();
-                // h 在此 thread scope 退出时 drop, Runtime drop in sync context: safe
-            })
-            .ok();
     }
 
     pub fn status(&self) -> ProxyStatus {
