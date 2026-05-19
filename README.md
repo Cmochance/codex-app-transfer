@@ -154,7 +154,7 @@ start frontend/gallery.html       # Windows
 
 ### Codex 模型不能用 curl 等联网命令 / 弹审批弹窗
 
-本应用 v2.1.13+ 默认在 apply 时把 `sandbox_mode = "danger-full-access"` + `approval_policy = "never"` 同时写入 `~/.codex/config.toml`(Codex 官方推荐的 **"Full access" 配对**,跨平台真正无审批弹窗联网),小白用户开箱即用。可在 设置 → "允许 Codex 联网工具(全权限模式)" 开关里关闭(#215)。
+本应用默认在 apply 时把 `sandbox_mode = "danger-full-access"` + `approval_policy = "never"` 同时写入 `~/.codex/config.toml`(Codex 官方推荐的 **"Full access" 配对**,跨平台真正无审批弹窗联网),小白用户开箱即用。可在 设置 → "允许 Codex 联网工具(全权限模式)" 开关里关闭(#215)。
 
 > **⚠️ 安全权衡**:full-access 模式模型可读写任何文件 + 所有命令无审批 = **完全信任模型**(等同 Codex 官方文档的 "Full access" 档位)。toggle off 后 Codex 回 read-only 沙箱 + on-request 审批,无网络,仅能用所选模型自带的 `web_search` 能力;若模型不支持 web_search 则完全无法联网搜索。
 
