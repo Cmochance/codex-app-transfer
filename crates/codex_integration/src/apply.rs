@@ -26,6 +26,11 @@ const MANAGED_TOML_KEYS: &[&str] = &[
     CODEX_MODEL_CATALOG_KEY,
     "model",
     "model_provider",
+    // #212:`sandbox_mode` 必须显式设成 `workspace-write` 才能让
+    // `[sandbox_workspace_write]` 段生效;Codex CLI 默认 `sandbox_mode =
+    // read-only` 时整个 workspace_write 段被忽略(`config_types.rs::SandboxMode`
+    // 的 `#[default] ReadOnly`)。toggle off 时 strip,让 Codex 回 default。
+    "sandbox_mode",
 ];
 
 /// 我们 apply 时实际触碰的 `[section]` 段内字段。restore 时按 `(section, key)`
@@ -98,24 +103,41 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // 快照已在第 1 步拿到用户原值,restore 时能完整退回。
     sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
 
-    // 2c. **#212 网络访问默认开**:Codex 默认 `sandbox_mode = workspace-write`
-    // 下 `network_access = false`,模型用 `curl` 会被 sandbox 拦截。小白用户
-    // 看到 Codex 联网失败不知所措。这里按 caller 传入(Settings.codex_network_access,
-    // 默认 `true`)写入 `[sandbox_workspace_write] network_access = …` section
-    // 形式 —— 跟 Codex docs / `codex exec` 输出对齐。**不**用 root-level dotted
-    // key 形式(2026-05-19 code-reviewer 抓到的 BLOCKER):dotted root key 跟
-    // 同名 `[section]` table 并存会触发 TOML duplicate table parse error,
-    // Codex CLI 会无法加载 config.toml。专业用户可在 UI 上自行关闭。
-    sync_table_field(
-        &paths.config_toml,
-        "sandbox_workspace_write",
-        "network_access",
-        Some(if cfg.codex_network_access {
-            "true"
-        } else {
-            "false"
-        }),
-    )?;
+    // 2c. **#212 网络访问默认开**(双 key 一体):Codex CLI 默认
+    // `sandbox_mode = read-only`(`config_types.rs::SandboxMode` 的
+    // `#[default] ReadOnly`),**read-only 模式下 `[sandbox_workspace_write]`
+    // 段被完全忽略** —— 单写 network_access = true 无效, 必须同时把
+    // `sandbox_mode` 显式提升到 `workspace-write` 段才生效。
+    //
+    // toggle on:`sandbox_mode = "workspace-write"` + `[sandbox_workspace_write]
+    //   network_access = true`(curl/wget 等 shell 联网可用,模型也获得编辑
+    //   workspace 文件权限 — Codex 设计的"功能档位",这两件事一体不分)
+    // toggle off:strip 两条,让 Codex 回 read-only 默认(纯阅读 sandbox,
+    //   仅靠模型自带 web_search 能力联网,若模型不支持 web_search 则无网)
+    //
+    // **不**用 root-level dotted key 形式(reviewer BLOCKER 修):dotted root
+    // key 跟同名 `[section]` 并存会触发 TOML duplicate table parse error。
+    if cfg.codex_network_access {
+        sync_root_value(
+            &paths.config_toml,
+            "sandbox_mode",
+            Some("\"workspace-write\""),
+        )?;
+        sync_table_field(
+            &paths.config_toml,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        )?;
+    } else {
+        sync_root_value(&paths.config_toml, "sandbox_mode", None)?;
+        sync_table_field(
+            &paths.config_toml,
+            "sandbox_workspace_write",
+            "network_access",
+            None,
+        )?;
+    }
 
     // 3. config.toml: model_context_window(旧版兼容) + model_catalog_json(Codex 0.128+)
     //
@@ -357,7 +379,9 @@ mod tests {
         assert!(!toml.contains("model_context_window"));
         // model_catalog_json 始终在 config.toml 里
         assert!(toml.contains("model_catalog_json"));
-        // #212: codex_network_access=true 写 [sandbox_workspace_write] section
+        // #212: codex_network_access=true 写 sandbox_mode + section field 一体
+        // (单写 section 在 Codex 默认 sandbox_mode=read-only 下不生效)
+        assert!(toml.contains("sandbox_mode = \"workspace-write\""));
         assert!(toml.contains("[sandbox_workspace_write]"));
         assert!(toml.contains("network_access = true"));
 
@@ -366,11 +390,12 @@ mod tests {
         assert_eq!(auth["OPENAI_API_KEY"], "cas_test");
     }
 
-    /// #212 covering test:**显式 false 也写入** TOML section field(不依赖
-    /// Codex 默认),让用户在 UI 上选 off 后行为可预测。
-    /// **section-form 写入**(reviewer 抓的 BLOCKER 修),不再用 dotted root key。
+    /// #212 covering test:**toggle off 时 strip 两条**(sandbox_mode +
+    /// network_access),让 Codex 回 default read-only。不能像之前 explicit
+    /// 写 false —— 单留 false 仍可能让 sandbox_mode 残留 workspace-write,
+    /// 跟 toggle off 的语义("回原默认 sandbox")不一致。
     #[test]
-    fn apply_with_network_access_false_writes_false() {
+    fn apply_with_network_access_false_strips_both_keys() {
         let (_t, paths) = setup();
         apply_provider(
             &paths,
@@ -389,23 +414,12 @@ mod tests {
         .unwrap();
         let toml = read_toml(&paths);
         assert!(
-            toml.contains("[sandbox_workspace_write]"),
-            "expected section header: {toml}"
+            !toml.contains("sandbox_mode"),
+            "toggle off 应 strip sandbox_mode(回 Codex default read-only): {toml}"
         );
         assert!(
-            toml.contains("network_access = false"),
-            "expected explicit false: {toml}"
-        );
-        assert!(
-            !toml.contains("network_access = true"),
-            "should not contain true line: {toml}"
-        );
-        // 唯一性 invariant(reviewer NIT #3 守门):network_access 在文件里
-        // 只能出现一次,防 strip 失效导致 duplicate 出现
-        assert_eq!(
-            toml.matches("network_access").count(),
-            1,
-            "network_access 应唯一出现一次: {toml}"
+            !toml.contains("network_access"),
+            "toggle off 应 strip network_access: {toml}"
         );
     }
 
@@ -463,8 +477,8 @@ mod tests {
     }
 
     /// #212 restore round-trip(reviewer IMPORTANT #2):快照里没有
-    /// network_access → restore 后该 key 被 strip,但 section 仍保留
-    /// (用户其它 sandbox key 不该被误删)。
+    /// network_access / sandbox_mode → restore 后**两条 managed key 都 strip**,
+    /// 但 section header 仍保留(用户其它 sandbox key 不该被误删)。
     #[test]
     fn restore_strips_managed_network_access_keeps_user_section() {
         let (_t, paths) = setup();
@@ -497,12 +511,16 @@ mod tests {
         )
         .unwrap();
         assert!(read_toml(&paths).contains("network_access = true"));
-        // restore 应去掉 network_access 但保留 section 跟用户原 key
+        // restore 应去掉 network_access + sandbox_mode 但保留 section + 用户原 key
         restore_codex_state(&paths).unwrap();
         let restored = read_toml(&paths);
         assert!(
             !restored.contains("network_access"),
             "restore 应 strip 我们的 network_access: {restored}"
+        );
+        assert!(
+            !restored.contains("sandbox_mode"),
+            "restore 应 strip 我们的 sandbox_mode: {restored}"
         );
         assert!(
             restored.contains("[sandbox_workspace_write]"),

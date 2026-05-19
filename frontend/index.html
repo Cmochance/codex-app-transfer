@@ -433,7 +433,7 @@
             <strong data-i18n="settings.codexNetworkAccess">允许 Codex 联网工具</strong>
             <div>
               <label class="switch-label only-switch"><input type="checkbox" id="codexNetworkAccess" checked><span class="switch-ui"></span></label>
-              <p class="settings-note" data-i18n="settings.codexNetworkAccessHint">默认开启。允许 Codex 通过 shell 调用 curl / wget 等联网命令获取实时网页内容；关闭后 Codex 仅能用内置的 web_search 缓存查询。专业用户若担心 prompt injection 可手动关闭。</p>
+              <p class="settings-note" data-i18n="settings.codexNetworkAccessHint">默认开启。让 Codex 走 workspace-write 沙箱：可以用 curl / wget 等联网命令获取实时网页，同时模型也获得编辑工作目录文件的权限（Codex 设计为一体档位）。关闭后 Codex 回 read-only 沙箱：无网络，仅能用模型自带的 web_search 能力；如果所选模型不支持 web_search，则完全无法联网搜索。</p>
             </div>
           </div>
           <div class="settings-row" hidden aria-hidden="true">

@@ -154,7 +154,7 @@ start frontend/gallery.html       # Windows
 
 ### Codex 模型不能用 curl 等联网命令 / 看似卡在网络
 
-本应用 v2.1.12+ 默认在 apply 时把 `sandbox_workspace_write.network_access = true` 写入 `~/.codex/config.toml`(Codex 默认 `false` 会让 sandbox 拦截 `curl` 等命令),小白用户开箱即用。可在 设置 → "允许 Codex 联网工具" 开关里关闭(#212)。关闭后 Codex 仅能用内置的 `web_search` 缓存查询。
+本应用 v2.1.12+ 默认在 apply 时把 `sandbox_mode = "workspace-write"` + `[sandbox_workspace_write] network_access = true` 同时写入 `~/.codex/config.toml`(Codex CLI 默认 `sandbox_mode = read-only` 会忽略 `[sandbox_workspace_write]` 段),小白用户开箱即用。可在 设置 → "允许 Codex 联网工具" 开关里关闭(#212)。**关闭后 Codex 回 read-only 沙箱无网络,仅能用所选模型自带的 `web_search` 能力;若模型不支持 web_search 则完全无法联网搜索**。
 
 ### Codex CLI 提示 `404 Not Found url: http://127.0.0.1:18080/responses`
 
