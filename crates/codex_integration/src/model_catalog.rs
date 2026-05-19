@@ -394,6 +394,11 @@ fn codex_model_template(
 }
 
 fn generic_model_template() -> Value {
+    // fix(#222): 工具支持字段反映 App Transfer adapter 的能力,不是上游模型的
+    // intrinsic 能力。所有走 chat-completions 转换的 provider 都经 adapter 拿到
+    // freeform apply_patch + 并行 tool calls 支持(see crates/adapters/src/
+    // responses/request.rs::convert_responses_tool_to_chat_tool)。如果以后接入
+    // 某个真的不支持 tool calls 的 provider,再加 per-provider opt-out。
     json!({
         "slug": "",
         "display_name": "",
@@ -404,7 +409,7 @@ fn generic_model_template() -> Value {
             {"effort": "medium", "description": "Balanced speed and reasoning depth"},
             {"effort": "high", "description": "Greater reasoning depth for complex tasks"}
         ],
-        "shell_type": "default",
+        "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
         "priority": 10,
@@ -416,10 +421,10 @@ fn generic_model_template() -> Value {
         "default_reasoning_summary": "auto",
         "support_verbosity": false,
         "default_verbosity": null,
-        "apply_patch_tool_type": null,
+        "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "bytes", "limit": 4000000},
-        "supports_parallel_tool_calls": false,
+        "supports_parallel_tool_calls": true,
         "supports_image_detail_original": false,
         "context_window": 258400,
         "max_context_window": 258400,
