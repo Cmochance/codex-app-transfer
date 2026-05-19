@@ -305,16 +305,23 @@ impl ToolCallCache {
     }
 }
 
-/// 默认持久化路径:`$HOME/.codex-app-transfer/tool_call_cache.json`。
-/// HOME 不可用(eg sandboxed test runner)→ 回退纯内存
+/// 默认持久化路径:`<home>/.codex-app-transfer/tool_call_cache.json`。
+///
+/// `<home>` 解析走 `codex_app_transfer_registry::paths::resolve_home()`(统一入口,
+/// `HOME` → `USERPROFILE` fallback,见 PR #115)— 直接读 `std::env::var_os("HOME")`
+/// 在 Windows GUI 进程会失败,导致 tool_call_cache 退到纯内存(跨进程 session
+/// 恢复失效)。这是 issue #219 用户上报"`WARN tool_call_cache: HOME 未设置,
+/// tool call cache 退到纯内存模式`"的根因。
+///
+/// 任何一个变量都未设(罕见 sandboxed test runner)→ 回退纯内存。
 pub fn global_tool_call_cache() -> &'static ToolCallCache {
     static CACHE: OnceLock<ToolCallCache> = OnceLock::new();
     CACHE.get_or_init(|| {
         let cap = 1000;
         let ttl = Duration::from_secs(3600);
-        match std::env::var_os("HOME") {
+        match codex_app_transfer_registry::paths::resolve_home() {
             Some(home) => {
-                let path = PathBuf::from(home)
+                let path: PathBuf = home
                     .join(".codex-app-transfer")
                     .join("tool_call_cache.json");
                 ToolCallCache::with_persistence(cap, ttl, path)
@@ -322,7 +329,7 @@ pub fn global_tool_call_cache() -> &'static ToolCallCache {
             None => {
                 tracing::warn!(
                     error_id = "TOOL_CALL_CACHE_NO_HOME",
-                    "HOME 未设置,tool call cache 退到纯内存模式 \
+                    "HOME / USERPROFILE 均未设置,tool call cache 退到纯内存模式 \
                      (跨重启会话恢复不可用)"
                 );
                 ToolCallCache::new(cap, ttl)
