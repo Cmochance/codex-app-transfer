@@ -13,18 +13,27 @@ pub(crate) fn response_id_for_session() -> String {
     format!("resp_{nanos:x}")
 }
 
+/// `merge_messages_with_previous_response` 的返回值，携带 messages 及
+/// 是否发生了 session 历史丢失的信号。
+pub(crate) struct MergeResult {
+    pub messages: Vec<Value>,
+    /// `true` 表示 `previous_response_id` 存在但 cache miss，已降级为仅本轮
+    /// messages（历史丢失）。调用方可据此在响应中注入信号头。
+    pub history_lost: bool,
+}
+
 /// 按 `previous_response_id` 把历史消息与当前消息合并。
 ///
 /// 语义对齐现有 `responses`/`gemini_native` 路径:
 /// - cache 命中: 历史 + 当前
 /// - cache miss 且当前为空: `PreviousResponseNotFound`
-/// - cache miss 且当前非空: 降级为仅当前
+/// - cache miss 且当前非空: 降级为仅当前（`history_lost = true`）
 /// - 若历史里已有 system/developer 且当前首条是 system,去重当前首 system
 pub(crate) fn merge_messages_with_previous_response(
     mut current_messages: Vec<Value>,
     original_body: &Value,
     session_cache: Option<&ResponseSessionCache>,
-) -> Result<Vec<Value>, AdapterError> {
+) -> Result<MergeResult, AdapterError> {
     let previous_response_id = original_body
         .get("previous_response_id")
         .and_then(|v| v.as_str())
@@ -32,7 +41,7 @@ pub(crate) fn merge_messages_with_previous_response(
         .trim();
 
     if previous_response_id.is_empty() {
-        return Ok(current_messages);
+        return Ok(MergeResult { messages: current_messages, history_lost: false });
     }
 
     let Some(cache) = session_cache else {
@@ -51,7 +60,7 @@ pub(crate) fn merge_messages_with_previous_response(
             "core::input::build_messages_from_input 接到 previous_response_id={previous_response_id} \
              但 session_cache=None — adapter caller 漏配 cache,本轮历史完全丢失"
         );
-        return Ok(current_messages);
+        return Ok(MergeResult { messages: current_messages, history_lost: true });
     };
 
     if let Some(history) = cache.get(previous_response_id) {
@@ -72,7 +81,7 @@ pub(crate) fn merge_messages_with_previous_response(
         }
         let mut messages = history;
         messages.extend(current_messages);
-        return Ok(messages);
+        return Ok(MergeResult { messages, history_lost: false });
     }
 
     if current_messages.is_empty() {
@@ -97,5 +106,5 @@ pub(crate) fn merge_messages_with_previous_response(
          降级为仅本轮 messages(历史丢失)"
     );
 
-    Ok(current_messages)
+    Ok(MergeResult { messages: current_messages, history_lost: true })
 }

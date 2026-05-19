@@ -178,6 +178,23 @@ async fn stream_forward_response_to_websocket(
     let mut pending = String::new();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else {
+            // fix(#210 P1-2): 流中断时先发 response.failed 事件让 Codex CLI
+            // 明确知道本轮回复已终止(而不是继续等待更多 SSE 数据),再发 error
+            // 描述。这样客户端可以正确清理本轮状态并进入重试/新对话路径。
+            let failed_event = serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "status_details": {
+                        "type": "error",
+                        "error": "stream_interrupted",
+                        "message": "upstream stream read failed — response incomplete"
+                    }
+                }
+            });
+            let _ = socket
+                .send(Message::Text(failed_event.to_string().into()))
+                .await;
             send_ws_error(socket, "stream read failed").await;
             return true;
         };

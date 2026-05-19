@@ -22,13 +22,16 @@ use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
 use super::session::ResponseSessionCache;
-use crate::core::input::{merge_messages_with_previous_response, response_id_for_session};
+use crate::core::input::{merge_messages_with_previous_response, response_id_for_session, MergeResult};
 use crate::types::{AdapterError, ResponseSessionPlan};
 
 #[derive(Debug, Clone)]
 pub struct ResponsesBodyConversion {
     pub body: Value,
     pub response_session: ResponseSessionPlan,
+    /// `true` 表示 `previous_response_id` cache miss 后降级为仅本轮 messages，
+    /// 历史已丢失。调用方可据此在响应 header 中注入信号。
+    pub history_lost: bool,
 }
 
 const TOOL_OUTPUT_INLINE_MAX_CHARS: usize = 4_000;
@@ -75,7 +78,9 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // **cache miss + input 空** → build_messages_from_input 返回
     // PreviousResponseNotFound,proxy 层 IntoResponse 会转成标准 OpenAI 400
     // (`code: "previous_response_not_found"`)让 Codex CLI fail-fast。
-    let mut messages = build_messages_from_input(input, session_cache)?;
+    let merge_result = build_messages_from_input(input, session_cache)?;
+    let history_lost = merge_result.history_lost;
+    let mut messages = merge_result.messages;
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -273,13 +278,14 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
             response_id: response_id_for_session(),
             messages: session_messages,
         },
+        history_lost,
     })
 }
 
 fn build_messages_from_input(
     body: &Value,
     session_cache: Option<&ResponseSessionCache>,
-) -> Result<Vec<Value>, AdapterError> {
+) -> Result<MergeResult, AdapterError> {
     let mut messages: Vec<Value> = Vec::new();
     if let Some(msg) = body
         .get("instructions")
