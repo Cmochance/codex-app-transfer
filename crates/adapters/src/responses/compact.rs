@@ -547,8 +547,8 @@ pub(crate) fn build_compact_response_plan(
                 let error_body = json!({
                     "error": {
                         "message": e.to_string(),
-                        "type": "compact_quality_check_failed",
-                        "code": "compact_summary_invalid",
+                        "type": "compact_error",
+                        "code": "compact_failed",
                     }
                 });
                 let bytes =
