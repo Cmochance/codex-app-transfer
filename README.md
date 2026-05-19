@@ -152,16 +152,13 @@ start frontend/gallery.html       # Windows
 
 ## 常见问题
 
-### Codex 模型不能用 curl 等联网命令 / 看似卡在网络
+### Codex 模型不能用 curl 等联网命令 / 弹审批弹窗
 
-本应用 v2.1.12+ 默认在 apply 时把 `sandbox_mode = "workspace-write"` + `[sandbox_workspace_write] network_access = true` 同时写入 `~/.codex/config.toml`(Codex CLI 默认 `sandbox_mode = read-only` 会忽略 `[sandbox_workspace_write]` 段),小白用户开箱即用。可在 设置 → "允许 Codex 联网工具" 开关里关闭(#212)。**关闭后 Codex 回 read-only 沙箱无网络,仅能用所选模型自带的 `web_search` 能力;若模型不支持 web_search 则完全无法联网搜索**。
+本应用 v2.1.13+ 默认在 apply 时把 `sandbox_mode = "danger-full-access"` + `approval_policy = "never"` 同时写入 `~/.codex/config.toml`(Codex 官方推荐的 **"Full access" 配对**,跨平台真正无审批弹窗联网),小白用户开箱即用。可在 设置 → "允许 Codex 联网工具(全权限模式)" 开关里关闭(#215)。
 
-> **⚠️ macOS 已知上游 bug**:[openai/codex#10390](https://github.com/openai/codex/issues/10390)。macOS 的 seatbelt 沙箱**静默忽略** config.toml 里的 `network_access`,本开关在 macOS 上**写得对但不生效**(Linux / Windows 正常)。OpenAI 官方 issue 仍 Open,**workaround = 命令行参数**:
-> ```bash
-> codex --sandbox danger-full-access "your prompt"
-> # 或永久 alias
-> alias codex='CODEX_SANDBOX_NETWORK_DISABLED=0 codex --sandbox danger-full-access'
-> ```
+> **⚠️ 安全权衡**:full-access 模式模型可读写任何文件 + 所有命令无审批 = **完全信任模型**(等同 Codex 官方文档的 "Full access" 档位)。toggle off 后 Codex 回 read-only 沙箱 + on-request 审批,无网络,仅能用所选模型自带的 `web_search` 能力;若模型不支持 web_search 则完全无法联网搜索。
+
+v2.1.12 之前尝试用 `workspace-write` + `network_access = true` 路径,但 macOS [seatbelt bug #10390](https://github.com/openai/codex/issues/10390) 跟 Windows `is_safe_command()` 仍触发审批弹窗,都不彻底。#215 改用 Codex 官方 "Full access" 配对作为 toggle on 的语义。
 
 ### Codex CLI 提示 `404 Not Found url: http://127.0.0.1:18080/responses`
 

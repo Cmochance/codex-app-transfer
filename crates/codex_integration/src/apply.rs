@@ -26,11 +26,14 @@ const MANAGED_TOML_KEYS: &[&str] = &[
     CODEX_MODEL_CATALOG_KEY,
     "model",
     "model_provider",
-    // #212:`sandbox_mode` 必须显式设成 `workspace-write` 才能让
-    // `[sandbox_workspace_write]` 段生效;Codex CLI 默认 `sandbox_mode =
-    // read-only` 时整个 workspace_write 段被忽略(`config_types.rs::SandboxMode`
-    // 的 `#[default] ReadOnly`)。toggle off 时 strip,让 Codex 回 default。
+    // #212 / #215:`sandbox_mode` + `approval_policy` 一对(Codex docs "Full
+    // access" 配对:`danger-full-access` + `never`)。toggle on 写两条让
+    // 模型完全无审批联网;off 时全 strip 让 Codex 回 default(read-only +
+    // on-request)。仅写 sandbox_mode 不够 —— Codex 默认 approval_policy =
+    // OnRequest(`protocol.rs::AskForApproval` `#[default] OnRequest`),
+    // 即便 sandbox 允许,Codex `is_safe_command()` 不认的命令仍弹审批。
     "sandbox_mode",
+    "approval_policy",
 ];
 
 /// 我们 apply 时实际触碰的 `[section]` 段内字段。restore 时按 `(section, key)`
@@ -103,34 +106,39 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // 快照已在第 1 步拿到用户原值,restore 时能完整退回。
     sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
 
-    // 2c. **#212 网络访问默认开**(双 key 一体):Codex CLI 默认
-    // `sandbox_mode = read-only`(`config_types.rs::SandboxMode` 的
-    // `#[default] ReadOnly`),**read-only 模式下 `[sandbox_workspace_write]`
-    // 段被完全忽略** —— 单写 network_access = true 无效, 必须同时把
-    // `sandbox_mode` 显式提升到 `workspace-write` 段才生效。
+    // 2c. **#212/#215 Codex 联网默认开**(Codex docs "Full access" 配对):
+    // 之前 #212 用 workspace-write + network_access 真机仍弹审批弹窗 ——
+    // Codex 默认 `approval_policy = OnRequest`(`protocol.rs::AskForApproval`
+    // 的 `#[default] OnRequest`),sandbox 允许 ≠ 不弹窗,`is_safe_command()`
+    // 把 curl 等判定"非 safe" 仍 escalate user 审批。#215 改 Codex 官方
+    // 推荐的 "Full access" 配对:`sandbox_mode = danger-full-access` +
+    // `approval_policy = never`,模型完全无审批 + 全部 sandbox 限制解除。
     //
-    // toggle on:`sandbox_mode = "workspace-write"` + `[sandbox_workspace_write]
-    //   network_access = true`(curl/wget 等 shell 联网可用,模型也获得编辑
-    //   workspace 文件权限 — Codex 设计的"功能档位",这两件事一体不分)
-    // toggle off:strip 两条,让 Codex 回 read-only 默认(纯阅读 sandbox,
-    //   仅靠模型自带 web_search 能力联网,若模型不支持 web_search 则无网)
+    // toggle on:写 sandbox_mode + approval_policy,strip 之前 #212 可能
+    //   写入的 `[sandbox_workspace_write] network_access` 残留(避免 stale
+    //   entry 让 user 误以为还走 workspace-write)
+    // toggle off:strip 全部三条,让 Codex 回 default(read-only + on-request)
     //
-    // **不**用 root-level dotted key 形式(reviewer BLOCKER 修):dotted root
-    // key 跟同名 `[section]` 并存会触发 TOML duplicate table parse error。
+    // **Trade-off**:full-access + never 模型可读写任何文件 + 联网无审批
+    // (Codex docs: "Full access means `danger-full-access` together with
+    // `never`")。toggle 默认 on 接受 prompt-injection 风险换"小白开箱用",
+    // 专业用户 toggle off 自己回 Codex default 沙箱。
     if cfg.codex_network_access {
         sync_root_value(
             &paths.config_toml,
             "sandbox_mode",
-            Some("\"workspace-write\""),
+            Some("\"danger-full-access\""),
         )?;
+        sync_root_value(&paths.config_toml, "approval_policy", Some("\"never\""))?;
         sync_table_field(
             &paths.config_toml,
             "sandbox_workspace_write",
             "network_access",
-            Some("true"),
+            None,
         )?;
     } else {
         sync_root_value(&paths.config_toml, "sandbox_mode", None)?;
+        sync_root_value(&paths.config_toml, "approval_policy", None)?;
         sync_table_field(
             &paths.config_toml,
             "sandbox_workspace_write",
@@ -379,11 +387,12 @@ mod tests {
         assert!(!toml.contains("model_context_window"));
         // model_catalog_json 始终在 config.toml 里
         assert!(toml.contains("model_catalog_json"));
-        // #212: codex_network_access=true 写 sandbox_mode + section field 一体
-        // (单写 section 在 Codex 默认 sandbox_mode=read-only 下不生效)
-        assert!(toml.contains("sandbox_mode = \"workspace-write\""));
-        assert!(toml.contains("[sandbox_workspace_write]"));
-        assert!(toml.contains("network_access = true"));
+        // #215: codex_network_access=true 写 danger-full-access + never
+        //(Codex docs "Full access" 配对,真正无审批弹窗联网)
+        assert!(toml.contains("sandbox_mode = \"danger-full-access\""));
+        assert!(toml.contains("approval_policy = \"never\""));
+        // strip 之前 #212 可能写过的 workspace_write.network_access(stale)
+        assert!(!toml.contains("network_access"));
 
         let auth = read_auth_value(&paths);
         assert_eq!(auth["auth_mode"], "apikey");
@@ -416,6 +425,10 @@ mod tests {
         assert!(
             !toml.contains("sandbox_mode"),
             "toggle off 应 strip sandbox_mode(回 Codex default read-only): {toml}"
+        );
+        assert!(
+            !toml.contains("approval_policy"),
+            "toggle off 应 strip approval_policy(回 Codex default on-request): {toml}"
         );
         assert!(
             !toml.contains("network_access"),
@@ -455,15 +468,22 @@ mod tests {
         // 必须可 parse(无 duplicate table)
         let parsed: toml::Value =
             toml::from_str(&toml_str).expect("output 必须是合法 TOML, 否则 Codex CLI 加载会失败");
+        // #215: 写 root-level danger-full-access + never,不再 touch
+        // [sandbox_workspace_write] section,用户原 section + keys 完整保留
+        assert_eq!(
+            parsed.get("sandbox_mode").and_then(|v| v.as_str()),
+            Some("danger-full-access")
+        );
+        assert_eq!(
+            parsed.get("approval_policy").and_then(|v| v.as_str()),
+            Some("never")
+        );
         let section = parsed
             .get("sandbox_workspace_write")
             .and_then(|v| v.as_table())
-            .expect("section 必存在");
-        assert_eq!(
-            section.get("network_access").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        // 用户原 key 完整保留
+            .expect("用户原 section 必保留");
+        // network_access 既不在(没启 workspace-write 路径)
+        assert!(section.get("network_access").is_none());
         assert_eq!(
             section
                 .get("exclude_tmpdir_env_var")
@@ -476,11 +496,11 @@ mod tests {
         );
     }
 
-    /// #212 restore round-trip(reviewer IMPORTANT #2):快照里没有
-    /// network_access / sandbox_mode → restore 后**两条 managed key 都 strip**,
-    /// 但 section header 仍保留(用户其它 sandbox key 不该被误删)。
+    /// #215 restore round-trip:apply (toggle on) 写 sandbox_mode + approval_policy
+    /// + strip network_access,restore 后**全部三条 managed 都 strip**,
+    /// 用户原 section header + 其它 keys 完整保留。
     #[test]
-    fn restore_strips_managed_network_access_keeps_user_section() {
+    fn restore_strips_managed_keys_keeps_user_section() {
         let (_t, paths) = setup();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         // 用户原本只有 sandbox section + 其它 key,**没有** network_access
@@ -494,7 +514,6 @@ mod tests {
             &json!({"providers": []}),
         )
         .unwrap();
-        // apply 写入 network_access = true
         apply_provider(
             &paths,
             &ApplyConfig {
@@ -510,17 +529,23 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(read_toml(&paths).contains("network_access = true"));
-        // restore 应去掉 network_access + sandbox_mode 但保留 section + 用户原 key
+        let after_apply = read_toml(&paths);
+        assert!(after_apply.contains("sandbox_mode = \"danger-full-access\""));
+        assert!(after_apply.contains("approval_policy = \"never\""));
+        assert!(
+            !after_apply.contains("network_access"),
+            "apply (toggle on) 不应写 network_access (走 full-access 路径不需要): {after_apply}"
+        );
+        // restore 应去掉 sandbox_mode + approval_policy,保留 section + 用户原 key
         restore_codex_state(&paths).unwrap();
         let restored = read_toml(&paths);
         assert!(
-            !restored.contains("network_access"),
-            "restore 应 strip 我们的 network_access: {restored}"
+            !restored.contains("sandbox_mode"),
+            "restore 应 strip sandbox_mode: {restored}"
         );
         assert!(
-            !restored.contains("sandbox_mode"),
-            "restore 应 strip 我们的 sandbox_mode: {restored}"
+            !restored.contains("approval_policy"),
+            "restore 应 strip approval_policy: {restored}"
         );
         assert!(
             restored.contains("[sandbox_workspace_write]"),
@@ -551,7 +576,8 @@ mod tests {
             &json!({"providers": []}),
         )
         .unwrap();
-        // apply 覆盖成 true(走 dotted-root 替换路径,不破坏用户形式)
+        // #215: apply (toggle on) strip 用户原 dotted network_access(走
+        // full-access 路径),restore 必须恢复用户原 false,**不**永久丢失
         apply_provider(
             &paths,
             &ApplyConfig {
@@ -569,15 +595,24 @@ mod tests {
         .unwrap();
         let after_apply = read_toml(&paths);
         assert!(
-            after_apply.contains("sandbox_workspace_write.network_access = true"),
-            "apply 应在原 dotted form 行替换 value: {after_apply}"
+            !after_apply.contains("network_access"),
+            "apply (toggle on full-access) 应 strip 用户原 dotted network_access: {after_apply}"
         );
-        // restore 必须恢复用户原 false,**不**把行删掉
+        // restore 必须恢复用户原 false 语义(不论是 dotted form 还是 section
+        // form,TOML 两种等价 —— 当前 restore impl 走 section form 写回,
+        // 关键是 value=false 恢复了,**不**永久丢失)
         restore_codex_state(&paths).unwrap();
         let restored = read_toml(&paths);
-        assert!(
-            restored.contains("sandbox_workspace_write.network_access = false"),
-            "restore 必须恢复用户原 dotted-form false 值: {restored}"
+        let parsed: toml::Value =
+            toml::from_str(&restored).expect("restored output 必须是合法 TOML");
+        let actual = parsed
+            .get("sandbox_workspace_write")
+            .and_then(|v| v.get("network_access"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(
+            actual,
+            Some(false),
+            "restore 必须恢复用户原 network_access=false 语义: {restored}"
         );
         assert_eq!(
             restored.matches("network_access").count(),
@@ -603,7 +638,7 @@ mod tests {
             &json!({"providers": []}),
         )
         .unwrap();
-        // apply(默认 true)覆盖成 true
+        // #215: apply (toggle on) strip 用户原 section network_access
         apply_provider(
             &paths,
             &ApplyConfig {
@@ -619,7 +654,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(read_toml(&paths).contains("network_access = true"));
+        let after_apply = read_toml(&paths);
+        assert!(
+            !after_apply.contains("network_access"),
+            "apply (toggle on full-access) 应 strip 用户原 section network_access: {after_apply}"
+        );
         // restore 应恢复 false
         restore_codex_state(&paths).unwrap();
         let restored = read_toml(&paths);

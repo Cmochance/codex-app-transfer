@@ -2,10 +2,13 @@
 id: 38
 priority: P2
 type: bug
-status: active
+status: resolved
 created: 2026-05-19
 related_pr: 213
+resolved_pr: 215
+resolved_date: 2026-05-20
 upstream_issue: https://github.com/openai/codex/issues/10390
+resolved_note: "PR #215 改用 Codex 官方 'Full access' 配对(danger-full-access + never)绕过 macOS seatbelt + Windows is_safe_command 两个限制点;不再依赖 [sandbox_workspace_write].network_access 字段。上游 issue 仍 Open 但本项目已不受影响。"
 ---
 
 # macOS Codex CLI seatbelt 静默忽略 config.toml 的 network_access(等 OpenAI 修上游)
