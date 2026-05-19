@@ -120,20 +120,50 @@
 - **同步策略**: Tauri 主线版本升级走 `cargo update -p tauri` + 跑 CI(workspace check + Tauri check)
 - **关联 PR / followup**: 整个 v2 架构迁移历史在 git log;v1→v2 切换是分水岭 commit
 
+## openai/codex
+
+- **Link**: https://github.com/openai/codex
+- **License**: Apache-2.0
+- **借鉴形式**: Prompt 蓝本(精简移植)+ 协议反查(数据模式参照)
+- **首次借鉴 PR / 时间**: v2.0.x 起协议结构反查;fix/219 起 prompt 结构借鉴
+- **借鉴清单**:
+  - `COMPACT_SUMMARIZATION_PROMPT` 基础骨架 → `crates/adapters/src/responses/compact.rs:82-92`
+    (源文件:`codex-rs/core/templates/compact/prompt.md`,~460 chars)
+  - `COMPACT_SUMMARY_PREFIX` 常量文本(明文,历史字段名 `encrypted_content` 是包袱)
+    → `crates/adapters/src/responses/compact.rs:97`
+    (源文件:`codex-rs/core/templates/compact/summary_prefix.md`)
+  - `CompactionInput` 请求结构 → `compact.rs` 反序列化逻辑
+    (源文件:`codex-rs/codex-api/src/common.rs`)
+  - `CompactHistoryResponse { output: Vec<ResponseItem> }` + `ResponseItem::Compaction { encrypted_content }` 响应结构
+    → `compact.rs` 序列化路径
+    (源文件:`codex-rs/codex-api/src/endpoint/compact.rs` + `codex-rs/protocol/src/models.rs:882`)
+- **本项目差异 / 扩展**:
+  - prompt 补两条 Claude Code 关键 bullet("All user messages verbatim" + "Next Step verbatim quote"),
+    借鉴自 Piebald-AI/claude-code-system-prompts 反编译公开版本第 6 / 9 段(见下方同名 entry)
+  - 本地加 quality-check gate(`validate_compact_summary_quality`) + input budget pruning,
+    upstream codex-rs 无对应逻辑
+- **同步策略**: `codex-rs/core/templates/compact/` 路径改动时手动 diff `prompt.md` / `summary_prefix.md`
+
 ## Piebald-AI/claude-code-system-prompts
 
 - **Link**: https://github.com/Piebald-AI/claude-code-system-prompts
 - **License**: 反编译公开版本,作者发布(见上游 LICENSE)
 - **借鉴形式**: Prompt 蓝本(精简移植)
-- **首次借鉴 PR / 时间**: v2.0.12(从原 Codex CLI 86 字符 prompt 升级)
+- **首次借鉴 PR / 时间**: v2.0.12(从原 Codex CLI 86 字符 prompt 升级为 9-section 长 prompt);fix/219 简化为 2 条补充 bullet
 - **借鉴清单**:
-  - 9-section 结构化 autocompact prompt(`agent-prompt-conversation-summarization.md` 反编译公开版本) → `crates/adapters/src/responses/compact.rs:42-70` SUMMARIZATION_PROMPT
+  - **v2.0.12(历史,已替换)**:9-section 结构化 autocompact prompt 整体骨架
+    (`agent-prompt-conversation-summarization.md` 反编译公开版本)
+  - **fix/219(当前)**:"All user messages verbatim" + "Next Step verbatim quote" 两条 bullet 措辞
+    → `crates/adapters/src/responses/compact.rs:89-90`
+    (对应原文第 6 / 9 段)
 - **本项目差异 / 扩展**:
-  - 按 codex-app-transfer 场景做了精简(去掉 Claude Code 工作流相关 section)
-  - 保留 9-section 骨架与 Claude Code 风格的 directives 措辞
-- **同步策略**: 上游 prompt 变化频率低;若 Claude Code 主线 prompt 大改可手动 diff 同步 9-section 标题与关键 directives
+  - fix/219 起,主 prompt 骨架改从 `openai/codex` 借(见上方 entry);Piebald-AI 仅贡献 2 条锚定 bullet
+  - 去掉了 `<analysis>` + `<summary>` 二段输出 schema、9-section 强结构、few-shot example
+- **同步策略**: 上游 prompt 变化频率低;若 Claude Code 主线 prompt 大改可手动 diff 第 6 / 9 段措辞
 - **代码层引用**(`crates/adapters/src/responses/compact.rs` 节选):
   > **v2.0.12 prompt rewrite**:从原 Codex CLI 的 86 字符 prompt 改为 Claude Code 风格的 9-section 结构化 prompt(精简移植自 Piebald-AI/claude-code-system-prompts 反编译公开版本 `agent-prompt-conversation-summarization.md`)。
+  >
+  > **fix/219 prompt simplification**:回退到 `openai/codex` 短 prompt 骨架(~460 chars),补充 Piebald-AI 第 6/9 段两条锚定 bullet,合计 ~800 chars。真机 DeepSeek v4-pro:比 9-section 长版本快 ~40% / 省 ~48% token。
 
 ## 7as0nch/mimo2codex
 

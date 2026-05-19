@@ -224,7 +224,8 @@ Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) in
 - [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x desktop shell skeleton + README structure reference
 - [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — bidirectional protocol translation patterns
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` architecture base
-- [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact prompt blueprint
+- [`openai/codex`](https://github.com/openai/codex) — autocompact prompt base structure + compact protocol reverse-reference (Apache-2.0)
+- [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact anchor bullets (All user messages verbatim + Next Step verbatim)
 - [`7as0nch/mimo2codex`](https://github.com/7as0nch/mimo2codex) — MiMo protocol reference
 - [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) — Gemini OAuth wire-level reference
 - [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web reverse-engineering reference + dynamic statsig algorithm + tool_calls flatten pattern
