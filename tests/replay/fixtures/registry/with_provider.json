@@ -34,6 +34,7 @@
     "autoApplyOnStart": true,
     "exposeAllProviderModels": false,
     "restoreCodexOnExit": true,
-    "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json"
+    "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json",
+    "codexNetworkAccess": true
   }
 }
