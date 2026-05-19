@@ -84,6 +84,7 @@ related_pr: <PR# 或 null>
 - [#25 P2 MCP / Skills / Memories / Agents 四合一管理页(借鉴 AiMaMi)](followup/25-codex-mgmt-four-in-one-page.md) — 用户 Q3 需求,sidebar+lazy+tanstack-query,依赖 #24
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
 - [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,**PR #191 已实施 Method 1 (COM activation) 核心 + 本 PR 实施 PowerShell CIM 进程清理替 taskkill (绕 MSIX access-denied)**;P2 剩端口冲突探测 + 非-Store .exe fallback
+- [#38 P2 macOS Codex seatbelt 静默忽略 config.toml network_access](followup/38-codex-macos-seatbelt-network-access-bug.md) — 等上游 openai/codex#10390 修;#212 toggle 在 Linux/Windows work,macOS 用户暂用 `--sandbox danger-full-access` CLI flag
 
 ---
 

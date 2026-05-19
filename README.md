@@ -156,6 +156,13 @@ start frontend/gallery.html       # Windows
 
 本应用 v2.1.12+ 默认在 apply 时把 `sandbox_mode = "workspace-write"` + `[sandbox_workspace_write] network_access = true` 同时写入 `~/.codex/config.toml`(Codex CLI 默认 `sandbox_mode = read-only` 会忽略 `[sandbox_workspace_write]` 段),小白用户开箱即用。可在 设置 → "允许 Codex 联网工具" 开关里关闭(#212)。**关闭后 Codex 回 read-only 沙箱无网络,仅能用所选模型自带的 `web_search` 能力;若模型不支持 web_search 则完全无法联网搜索**。
 
+> **⚠️ macOS 已知上游 bug**:[openai/codex#10390](https://github.com/openai/codex/issues/10390)。macOS 的 seatbelt 沙箱**静默忽略** config.toml 里的 `network_access`,本开关在 macOS 上**写得对但不生效**(Linux / Windows 正常)。OpenAI 官方 issue 仍 Open,**workaround = 命令行参数**:
+> ```bash
+> codex --sandbox danger-full-access "your prompt"
+> # 或永久 alias
+> alias codex='CODEX_SANDBOX_NETWORK_DISABLED=0 codex --sandbox danger-full-access'
+> ```
+
 ### Codex CLI 提示 `404 Not Found url: http://127.0.0.1:18080/responses`
 
 老版本只有 `/v1/responses`,Codex CLI 0.126 起回退到 `/responses`(不带 `/v1/`)。本工具已加路由别名,更新到 v1.0.1+ 即可。
