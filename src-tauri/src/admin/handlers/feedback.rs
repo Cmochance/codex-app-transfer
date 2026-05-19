@@ -20,8 +20,13 @@ use serde_json::{json, Value};
 use super::super::registry_io::load as load_registry;
 use super::common::{active_provider_name, current_epoch_secs, err, APP_VERSION};
 
-pub(super) const FEEDBACK_WORKER_URL: &str =
-    "https://codex-app-transfer-feedback.alysechencn.workers.dev";
+/// Cloudflare Worker 反馈 endpoint。
+///
+/// 2026-05-20 切自定义域名:之前用 `*.workers.dev` 在国内部分 ISP / DNS
+/// 被污染,用户必须走代理才能反馈,但代理又抢走 127.0.0.1:18080 协议转发的
+/// 路由 → 反馈跟主功能二选一。改 `mochance.xyz` 子域名 + Cloudflare custom
+/// domain,Cloudflare anycast IP 国内可达性 ↑,**默认 DNS 解得到 + 不依赖代理**。
+pub(super) const FEEDBACK_WORKER_URL: &str = "https://codex-app-transfer-feedback.mochance.xyz";
 
 pub(super) struct FeedbackThrottleState {
     pub(super) last_success: Option<Instant>,

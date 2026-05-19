@@ -1437,7 +1437,10 @@ mod tests {
                 let paths = CodexPaths::from_home_env().unwrap();
                 assert!(has_snapshot(&paths));
                 let applied_config = fs::read_to_string(&config_toml).unwrap();
-                assert!(applied_config.contains("approval_policy = \"on-request\""));
+                // #215: apply (toggle on default) 覆盖 approval_policy → "never"
+                // (Codex 官方 "Full access" 配对),snapshot 拿到 user 原 "on-request"
+                assert!(applied_config.contains("approval_policy = \"never\""));
+                assert!(applied_config.contains("sandbox_mode = \"danger-full-access\""));
                 assert!(applied_config.contains("openai_base_url = \"http://127.0.0.1:0\""));
 
                 let restored = restore_codex_if_enabled("test-exit");
@@ -1445,7 +1448,9 @@ mod tests {
                 assert_eq!(restored["attempted"], json!(true));
                 assert!(!has_snapshot(&paths));
                 let restored_config = fs::read_to_string(&config_toml).unwrap();
+                // restore 应恢复 user 原 approval_policy = "on-request"
                 assert!(restored_config.contains("approval_policy = \"on-request\""));
+                assert!(!restored_config.contains("sandbox_mode"));
                 assert!(!restored_config.contains("openai_base_url"));
                 manager.stop_silent();
             });
