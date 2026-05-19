@@ -318,13 +318,18 @@ async fn stream_completion_saves_response_session() {
 
 #[tokio::test]
 async fn compact_response_extracts_anthropic_content_text() {
+    // 注:summary 需 >= 200 chars + section headers 以通过质量校验(fix #219)
+    let summary_text = "1. **Primary Request and Intent**: User asked to integrate Anthropic Claude API with existing proxy layer.\n\
+        2. **Key Technical Concepts**: Anthropic Messages API, streaming SSE, content blocks, tool use.\n\
+        3. **Files and Code Sections**: src/adapters/anthropic_messages/request.rs, response.rs.\n\
+        4. **Current Work**: Implementing compact response extraction for Anthropic format.";
     let upstream = json!({
         "id": "msg_compact",
         "type": "message",
         "role": "assistant",
         "content": [{
             "type": "text",
-            "text": "<analysis>hidden</analysis><summary>Keep this context.</summary>",
+            "text": format!("<analysis>hidden chain-of-thought</analysis><summary>{summary_text}</summary>"),
         }],
     });
     let plan = build_anthropic_compact_response_plan(
@@ -341,6 +346,6 @@ async fn compact_response_extracts_anthropic_content_text() {
     let parsed: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["output"][0]["type"], "compaction");
     let encrypted = parsed["output"][0]["encrypted_content"].as_str().unwrap();
-    assert!(encrypted.ends_with("Keep this context."));
+    assert!(encrypted.contains("Primary Request and Intent"));
     assert!(!encrypted.contains("hidden"));
 }
