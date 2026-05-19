@@ -41,7 +41,10 @@ pub(crate) fn merge_messages_with_previous_response(
         .trim();
 
     if previous_response_id.is_empty() {
-        return Ok(MergeResult { messages: current_messages, history_lost: false });
+        return Ok(MergeResult {
+            messages: current_messages,
+            history_lost: false,
+        });
     }
 
     let Some(cache) = session_cache else {
@@ -60,7 +63,10 @@ pub(crate) fn merge_messages_with_previous_response(
             "core::input::build_messages_from_input 接到 previous_response_id={previous_response_id} \
              但 session_cache=None — adapter caller 漏配 cache,本轮历史完全丢失"
         );
-        return Ok(MergeResult { messages: current_messages, history_lost: true });
+        return Ok(MergeResult {
+            messages: current_messages,
+            history_lost: true,
+        });
     };
 
     if let Some(history) = cache.get(previous_response_id) {
@@ -81,7 +87,10 @@ pub(crate) fn merge_messages_with_previous_response(
         }
         let mut messages = history;
         messages.extend(current_messages);
-        return Ok(MergeResult { messages, history_lost: false });
+        return Ok(MergeResult {
+            messages,
+            history_lost: false,
+        });
     }
 
     if current_messages.is_empty() {
@@ -106,5 +115,8 @@ pub(crate) fn merge_messages_with_previous_response(
          降级为仅本轮 messages(历史丢失)"
     );
 
-    Ok(MergeResult { messages: current_messages, history_lost: true })
+    Ok(MergeResult {
+        messages: current_messages,
+        history_lost: true,
+    })
 }

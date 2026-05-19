@@ -22,7 +22,9 @@ use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
 use super::session::ResponseSessionCache;
-use crate::core::input::{merge_messages_with_previous_response, response_id_for_session, MergeResult};
+use crate::core::input::{
+    merge_messages_with_previous_response, response_id_for_session, MergeResult,
+};
 use crate::types::{AdapterError, ResponseSessionPlan};
 
 #[derive(Debug, Clone)]
