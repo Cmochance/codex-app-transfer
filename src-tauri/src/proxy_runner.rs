@@ -170,6 +170,19 @@ impl ProxyManager {
 
     /// 静默 stop:app exit / 异常路径用,不报错只尽力关。
     pub fn stop_silent(&self) {
+        // fix(#210 P2): 停止前 flush L1 session cache 到 L2 sqlite,
+        // 减少重启后 previous_response_id cache miss 导致对话中断。
+        // flush 是同步操作(纯 mutex lock + sqlite write),不需要 runtime。
+        let (total, failed) =
+            codex_app_transfer_adapters::responses::session::global_response_session_cache()
+                .flush_to_persistent();
+        if total > 0 {
+            codex_app_transfer_proxy::proxy_telemetry().logs.add(
+                "INFO",
+                format!("session cache flush before stop: {total} entries, {failed} failed"),
+            );
+        }
+
         let mut guard = self.handle.lock().unwrap();
         if let Some(h) = guard.take() {
             h.runtime.shutdown_background();

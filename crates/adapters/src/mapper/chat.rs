@@ -56,12 +56,19 @@ pub(crate) fn prepare_responses_request(
     )?;
     let new_body = serde_json::to_vec(&conversion.body)
         .map_err(|e| AdapterError::Internal(format!("re-serialize: {e}")))?;
+    // fix(#210 P1-1): 传递 history_lost 标志到 adapter_metadata,
+    // transform_response_stream 据此注入 X-Session-History-Lost header
+    let adapter_metadata = if conversion.history_lost {
+        Some(serde_json::json!({"history_lost": true}))
+    } else {
+        None
+    };
     Ok(RequestPlan {
         upstream_path,
         body: Bytes::from(new_body),
         upstream_headers: http::HeaderMap::new(),
         response_session: Some(conversion.response_session),
-        adapter_metadata: None,
+        adapter_metadata,
         is_compact: false,
         original_responses_request,
     })
@@ -88,6 +95,19 @@ pub(crate) fn transform_responses_response_stream(
         http::header::CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream"),
     );
+    // fix(#210 P1-1): cache miss 降级时注入信号 header,让客户端感知历史丢失
+    if request_plan
+        .adapter_metadata
+        .as_ref()
+        .and_then(|m| m.get("history_lost"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        upstream_headers.insert(
+            http::HeaderName::from_static("x-session-history-lost"),
+            HeaderValue::from_static("1"),
+        );
+    }
     let enable_think_tag_split = provider_needs_think_tag_split(provider);
     Ok(ResponsePlan {
         status: upstream_status,

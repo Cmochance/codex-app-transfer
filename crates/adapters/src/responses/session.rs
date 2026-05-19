@@ -246,6 +246,37 @@ impl ResponseSessionCache {
         .map_err(|e| format!("sessions.db evict expired failed: {e}"))
     }
 
+    /// fix(#210 P2): Proxy 停止前把 L1 内存中所有活跃 entry 重新写入 L2。
+    ///
+    /// 正常情况下 L2 已通过 write-through 保持一致，但瞬时 IO 错误可能导致部分
+    /// entry 仅存在于 L1。此方法在进程 shutdown 前做最后一次批量 flush，尽力
+    /// 补齐可能的 L2 漏洞，减少重启后 `previous_response_id` cache miss。
+    ///
+    /// 返回 `(attempted, failed)` 分别表示尝试写入的条目数和失败条数。
+    pub fn flush_to_persistent(&self) -> (usize, usize) {
+        let entries: Vec<(String, Vec<Value>)> = {
+            let inner = self.inner.lock().expect("session cache mutex poisoned");
+            inner
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.ts.elapsed() <= self.ttl)
+                .map(|(k, v)| (k.clone(), v.messages.clone()))
+                .collect()
+        };
+        let total = entries.len();
+        let mut failed = 0usize;
+        for (response_id, messages) in &entries {
+            if let Err(e) = self.persist_save(response_id, messages) {
+                log_db_warning(
+                    "SESSIONS_DB_FLUSH_FAILED",
+                    format!("flush response_id={response_id} failed: {e}"),
+                );
+                failed += 1;
+            }
+        }
+        (total, failed)
+    }
+
     fn persist_save(&self, response_id: &str, messages: &[Value]) -> rusqlite::Result<()> {
         let mut guard = self.db.lock().expect("session cache db mutex poisoned");
         let Some(conn) = guard.as_mut() else {
