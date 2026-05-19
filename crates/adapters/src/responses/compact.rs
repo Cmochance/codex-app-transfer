@@ -796,8 +796,7 @@ mod tests {
                 .last()
                 .and_then(|m| m.get("content"))
                 .and_then(|v| v.as_str())
-                .is_some_and(|text| text
-                    .contains("performing a CONTEXT CHECKPOINT COMPACTION")),
+                .is_some_and(|text| text.contains("performing a CONTEXT CHECKPOINT COMPACTION")),
             "compact summary prompt 仍应作为最后一条 user message 注入"
         );
     }
