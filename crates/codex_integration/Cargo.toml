@@ -17,3 +17,6 @@ codex-app-transfer-registry = { path = "../registry" }
 
 [dev-dependencies]
 tempfile = "3"
+# #212 防回归:sync_table_field output 必须可被 toml crate 正常 parse,
+# 守住 TOML spec 兼容性(避免 dotted-root + section-form 混用触发 duplicate)。
+toml = "0.8"

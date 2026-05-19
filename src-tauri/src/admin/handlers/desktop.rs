@@ -406,6 +406,9 @@ pub(super) struct DesktopConfigTarget {
     pub(super) requires_proxy: bool,
     pub(super) mode: &'static str,
     pub(super) proxy_port: u16,
+    /// #212:是否允许 Codex shell 工具网络访问(从 `Settings.codexNetworkAccess`
+    /// 读取,默认 `true`)。写入 `sandbox_workspace_write.network_access`。
+    pub(super) codex_network_access: bool,
 }
 
 fn desktop_config_target_for_provider(
@@ -450,6 +453,8 @@ fn desktop_config_target_for_provider(
         && !provider_base_url.is_empty()
         && !direct_api_key.is_empty();
 
+    let codex_network_access = super::proxy::read_codex_network_access(cfg);
+
     if bypass_proxy {
         return DesktopConfigTarget {
             base_url: provider_base_url,
@@ -462,6 +467,7 @@ fn desktop_config_target_for_provider(
             requires_proxy: false,
             mode: "direct",
             proxy_port,
+            codex_network_access,
         };
     }
 
@@ -481,6 +487,7 @@ fn desktop_config_target_for_provider(
         requires_proxy: true,
         mode: "local_proxy",
         proxy_port,
+        codex_network_access,
     }
 }
 
@@ -712,6 +719,7 @@ fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
             model_mappings: Some(&target.model_mappings),
             model_capabilities: Some(&target.model_capabilities),
             app_version: APP_VERSION,
+            codex_network_access: target.codex_network_access,
         },
     )
     .map_err(|e| format!("apply 失败: {e}"))?;

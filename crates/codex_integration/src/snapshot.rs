@@ -627,7 +627,36 @@ fn dir_name(dir: &Path) -> Option<String> {
 /// 的字面量(可能包含两侧引号、整数无引号等);该字面量可直接喂回
 /// [`crate::toml_sync::sync_root_value`]。
 pub(crate) fn snapshot_toml_value_literal(content: &str, key: &str) -> Option<String> {
-    for line in content.lines() {
+    extract_literal_in_lines(content.lines(), key)
+}
+
+/// 解析快照 config.toml 中 `[section]` table 内某个 key 的字面量。仅在 section
+/// body(从 `[section]` 到下一个 section header 或 EOF)内查找,**不**回退到
+/// root level —— 因为 #212 起 managed 字段全用 section-form,避免跟 root-level
+/// 同名 key 混淆。
+pub(crate) fn snapshot_table_field_literal(
+    content: &str,
+    section: &str,
+    key: &str,
+) -> Option<String> {
+    let header = format!("[{section}]");
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.iter().position(|l| l.trim() == header.as_str())?;
+    let mut end = lines.len();
+    for (offset, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.trim_start().starts_with('[') {
+            end = offset;
+            break;
+        }
+    }
+    extract_literal_in_lines(lines[start + 1..end].iter().copied(), key)
+}
+
+fn extract_literal_in_lines<'a, I: Iterator<Item = &'a str>>(
+    lines: I,
+    key: &str,
+) -> Option<String> {
+    for line in lines {
         let stripped = line.trim_start();
         if !stripped.starts_with(key) {
             continue;

@@ -60,6 +60,21 @@ pub struct Settings {
     pub expose_all_provider_models: bool,
     pub restore_codex_on_exit: bool,
     pub update_url: String,
+    /// 是否允许 Codex shell 工具(`curl` / 网络命令)进行网络访问。
+    ///
+    /// 写入 `~/.codex/config.toml` 的 `sandbox_workspace_write.network_access`,
+    /// 控制 `sandbox_mode = workspace-write`(Codex 默认)下 shell 能否联网。
+    ///
+    /// **默认 `true`**(#212):解决小白配置完后撞"Codex 看似挂了"的 pain point
+    /// (Codex CLI 默认 `false`,模型用 `curl` 被 sandbox 拦截)。专业用户可在
+    /// UI 上自行关闭。关闭**不影响** Codex 内置 `web_search` 工具(走 OpenAI
+    /// 缓存,不需要 `network_access`)。
+    #[serde(default = "default_codex_network_access")]
+    pub codex_network_access: bool,
+}
+
+fn default_codex_network_access() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -74,6 +89,7 @@ impl Default for Settings {
             expose_all_provider_models: false,
             restore_codex_on_exit: true,
             update_url: DEFAULT_UPDATE_URL.to_owned(),
+            codex_network_access: true,
         }
     }
 }
