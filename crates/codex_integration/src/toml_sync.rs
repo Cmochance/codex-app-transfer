@@ -109,13 +109,25 @@ pub fn sync_table_field_in_memory(
     key: &str,
     raw_value: Option<&str>,
 ) -> String {
+    // **优先级 1**:用户已用 root-level **dotted key** 形式(等价合法 TOML,
+    // `sandbox_workspace_write.network_access = false`)。chatgpt-codex P2#2
+    // 反馈:若我们不识别此形式直接 append `[section]` 会跟 dotted key 隐式
+    // 定义的同名 table 撞 duplicate → 用户 config 失效。改成走 root-level
+    // 替换路径,保留用户原形式不破坏。
+    let dotted_key = format!("{section}.{key}");
+    if has_root_key_line(current, &dotted_key) {
+        return sync_root_value_in_memory(current, &dotted_key, raw_value);
+    }
+
     let section_header = format!("[{section}]");
     let mut lines: Vec<String> = current.lines().map(String::from).collect();
 
-    // 找 section header 行(精确 trim 匹配,允许前后空白)
+    // **section header 匹配**:除精确 trim 匹配,**额外兼容尾部注释**
+    // (chatgpt-codex P2#1):`[sandbox_workspace_write] # local comment`
+    // TOML spec 合法,精确匹配 miss 后 append 会造成 duplicate。
     let section_start = lines
         .iter()
-        .position(|l| l.trim() == section_header.as_str());
+        .position(|l| matches_section_header(l, &section_header));
 
     if let Some(start_idx) = section_start {
         // section body 结束位置:下一个 `[` 开头的 section header 或 EOF
@@ -158,6 +170,30 @@ pub fn sync_table_field_in_memory(
         result.push('\n');
     }
     result
+}
+
+/// 检查 `current` 任一行是否是 root-level `<key> = ...` 形式。复用
+/// [`line_matches_root_key`] 的严格匹配规则(防 `foo_bar` 误匹 `foo`)。
+fn has_root_key_line(current: &str, key: &str) -> bool {
+    current
+        .lines()
+        .any(|line| line_matches_root_key(line.trim_start(), key))
+}
+
+/// section header 匹配:精确 `[section]` 或带尾部 `#` 注释。
+/// TOML spec 允许 `[section] # comment`,exact-string 比较会漏。
+fn matches_section_header(line: &str, header: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == header {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix(header) {
+        // header 后必须是空白 + 可选 `#` 注释才算同 section,避免误匹
+        // `[sandbox_workspace_write_alt]` 这种前缀同名 section。
+        let rest = rest.trim_start();
+        return rest.is_empty() || rest.starts_with('#');
+    }
+    false
 }
 
 fn line_matches_root_key(stripped_left: &str, key: &str) -> bool {
@@ -356,6 +392,56 @@ openai_base_url = \"old\"
         // 新 section append 到末尾
         assert!(out.contains("[sandbox_workspace_write]"));
         assert!(out.contains("network_access = true"));
+    }
+
+    // **chatgpt-codex P2#1 防回归**:section header 同行带 `#` 注释
+    // (TOML spec 合法形式)我们必须识别,否则 append 新 section 撞 duplicate。
+    #[test]
+    fn table_field_recognizes_section_header_with_trailing_comment() {
+        let input =
+            "[sandbox_workspace_write] # local sandbox settings\nexclude_tmpdir_env_var = false\n";
+        let out = sync_table_field_in_memory(
+            input,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        // 不重复 section header(若 miss 识别会 append 第二份)
+        assert_eq!(
+            out.matches("[sandbox_workspace_write]").count(),
+            1,
+            "must reuse existing section, not duplicate: {out}"
+        );
+        assert!(out.contains("network_access = true"));
+        // 验 toml crate 能正常 parse
+        let _: toml::Value = toml::from_str(&out).expect("output must parse as valid TOML");
+    }
+
+    // **chatgpt-codex P2#2 防回归**:用户已用 root-level dotted key 形式
+    // (等价合法 TOML)→ 我们必须 in-place replace,不能 append 新
+    // `[section]` 否则跟 dotted key 隐式定义的同名 table 撞 duplicate。
+    #[test]
+    fn table_field_replaces_existing_dotted_root_key_form() {
+        let input = "sandbox_workspace_write.network_access = false\nother = 1\n";
+        let out = sync_table_field_in_memory(
+            input,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        // 保持 dotted 形式(尊重用户原格式), value 改成 true
+        assert!(
+            out.contains("sandbox_workspace_write.network_access = true"),
+            "must replace dotted-key value, not append [section]: {out}"
+        );
+        // 绝不能同时出现 dotted key 跟 [section] 两种形式
+        assert!(
+            !out.contains("[sandbox_workspace_write]"),
+            "must not append section table when dotted form exists (duplicate-table TOML): {out}"
+        );
+        assert!(out.contains("other = 1"), "other root keys preserved");
+        // 验 toml crate 能正常 parse
+        let _: toml::Value = toml::from_str(&out).expect("output must parse as valid TOML");
     }
 
     /// **#212 BLOCKER 防回归**:确保 sync_table_field 写出的 TOML 可被
