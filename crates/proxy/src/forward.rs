@@ -52,6 +52,11 @@ impl ProxyState {
         Self {
             http: reqwest::Client::builder()
                 .pool_idle_timeout(std::time::Duration::from_secs(30))
+                // fix(#210): 添加连接超时 + 读超时,防止上游 provider 卡住时
+                // proxy 无限等待导致客户端"失联"。LLM reasoning 可能长达数分钟,
+                // 设 15 分钟作为绝对上限;connect_timeout 10 秒足够建连。
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(900))
                 // 显式设 default UA:client header 复制循环已 strip 客户端
                 // user-agent;若 provider.extra_headers 也没配 UA,reqwest
                 // 默认会用 `reqwest/<ver>` 作为 default UA,部分 provider
