@@ -532,6 +532,60 @@ mod tests {
         );
     }
 
+    /// #212 Devin BLOCKER 防回归:用户原 config 用 **root-level dotted key 形式**
+    /// `sandbox_workspace_write.network_access = false`(合法 TOML 等价形式)→
+    /// snapshot read 路径必须识别此形式,否则 restore 返 None → caller 误删
+    /// 用户原行 → 用户 security 设置永久丢失。
+    #[test]
+    fn restore_preserves_user_dotted_root_form_network_access() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        // 用户用 dotted root 形式显式配 false(合法 TOML)
+        std::fs::write(
+            &paths.config_toml,
+            "sandbox_workspace_write.network_access = false\n",
+        )
+        .unwrap();
+        codex_app_transfer_registry::save_raw_config(
+            &paths.model_catalog_json,
+            &json!({"providers": []}),
+        )
+        .unwrap();
+        // apply 覆盖成 true(走 dotted-root 替换路径,不破坏用户形式)
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+            },
+        )
+        .unwrap();
+        let after_apply = read_toml(&paths);
+        assert!(
+            after_apply.contains("sandbox_workspace_write.network_access = true"),
+            "apply 应在原 dotted form 行替换 value: {after_apply}"
+        );
+        // restore 必须恢复用户原 false,**不**把行删掉
+        restore_codex_state(&paths).unwrap();
+        let restored = read_toml(&paths);
+        assert!(
+            restored.contains("sandbox_workspace_write.network_access = false"),
+            "restore 必须恢复用户原 dotted-form false 值: {restored}"
+        );
+        assert_eq!(
+            restored.matches("network_access").count(),
+            1,
+            "只一行 network_access: {restored}"
+        );
+    }
+
     /// #212 restore round-trip:快照里**有** network_access(用户原显式配过) →
     /// restore 后恢复用户原值(不被我们的 default-on 污染)。
     #[test]
