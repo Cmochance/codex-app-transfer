@@ -538,10 +538,24 @@ pub(crate) fn build_compact_response_plan(
     upstream_headers.remove(http::header::TRANSFER_ENCODING);
 
     let stream_with_logic = Box::pin(futures_util::stream::once(async move {
-        let body = collect_and_wrap_compact_body(upstream_status, upstream_stream)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        Ok::<Bytes, std::io::Error>(Bytes::from(body))
+        match collect_and_wrap_compact_body(upstream_status, upstream_stream).await {
+            Ok(body) => Ok::<Bytes, std::io::Error>(Bytes::from(body)),
+            Err(e) => {
+                // fix #219: 当 compact summary 质量校验失败时,返回结构化
+                // 错误 JSON body(模拟 OpenAI 错误格式),让 Codex CLI 感知
+                // compact 失败并保留原上下文,而非收到流中断。
+                let error_body = json!({
+                    "error": {
+                        "message": e.to_string(),
+                        "type": "compact_quality_check_failed",
+                        "code": "compact_summary_invalid",
+                    }
+                });
+                let bytes =
+                    serde_json::to_vec(&error_body).unwrap_or_else(|_| e.to_string().into_bytes());
+                Ok(Bytes::from(bytes))
+            }
+        }
     }));
 
     Ok(ResponsePlan {
@@ -599,6 +613,21 @@ pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u
     // 的 meta-discussion 进 history 后会让续轮模型被带偏)。
     let summary = extract_summary_section(raw).trim().to_owned();
 
+    // B2 (fix #219): 校验 summary 输出质量。第三方模型(DeepSeek 等)可能:
+    // - 只回显 prompt 模板/few-shot example 而不填充实际内容
+    // - 输出过短无信息量
+    // - 输出整段格式说明
+    // 校验失败时返回错误,让 Codex CLI 保留原上下文不压缩(优于注入无效摘要)。
+    if let Err(reason) = validate_compact_summary_quality(&summary) {
+        return Err(AdapterError::Internal(format!(
+            "compact summary quality check failed: {reason}. \
+             The model did not produce a valid context summary. \
+             Raw output length: {} chars, summary length: {} chars.",
+            raw.len(),
+            summary.len(),
+        )));
+    }
+
     let encrypted_content = format!("{COMPACT_SUMMARY_PREFIX}\n{summary}");
     let compact_response = json!({
         "output": [{
@@ -610,15 +639,108 @@ pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u
         .map_err(|e| AdapterError::Internal(format!("serialize compact response: {e}")))
 }
 
+/// 校验 compact summary 的输出质量。
+///
+/// 第三方模型(尤其 DeepSeek)在执行 compact 任务时可能:
+/// 1. 回显 few-shot example 内容而非实际对话摘要
+/// 2. 输出过短(< 200 字符)无信息量
+/// 3. 只输出格式模板但不填充内容
+///
+/// 返回 `Ok(())` 表示通过,`Err(reason)` 表示校验失败(附原因说明)。
+fn validate_compact_summary_quality(summary: &str) -> Result<(), String> {
+    // C1: 空或过短(200 字符以下不可能覆盖九部分有效内容)
+    if summary.len() < 200 {
+        return Err(format!(
+            "summary too short ({} chars, minimum 200)",
+            summary.len()
+        ));
+    }
+
+    // C2: 检测 few-shot example 内容回显 — prompt 里的 example 包含这些
+    // 独特关键词组合,实际对话几乎不可能同时出现
+    let example_fingerprints = [
+        "review the auth module for race conditions",
+        "TOCTOU race, session token validation, cache invalidation, tokio Mutex",
+        "src/auth/login.rs:120-180",
+        "src/auth/refresh.rs:45-90",
+        "actually the bug is in refresh, not login",
+        "add a regression test for the refresh race",
+    ];
+    let example_matches = example_fingerprints
+        .iter()
+        .filter(|fp| summary.contains(*fp))
+        .count();
+    if example_matches >= 3 {
+        return Err(format!(
+            "summary appears to be an echo of the few-shot example \
+             ({example_matches}/6 fingerprints matched)"
+        ));
+    }
+
+    // C3: 检测模板格式指令回显 — 如果 summary 包含 prompt 里的格式指令
+    // 但没有实际填充内容
+    let template_instructions = [
+        "Your task is to create a detailed CONTEXT CHECKPOINT",
+        "wrap your analysis in <analysis> tags",
+        "provide your summary inside <summary> tags using EXACTLY these nine sections",
+        "Be thorough and structured. Do NOT compress at the cost of losing",
+    ];
+    let template_matches = template_instructions
+        .iter()
+        .filter(|t| summary.contains(*t))
+        .count();
+    if template_matches >= 2 {
+        return Err(format!(
+            "summary contains prompt template instructions \
+             ({template_matches}/4 matched), \
+             model echoed instructions instead of producing content"
+        ));
+    }
+
+    // C4: 检查是否包含至少 2 个 section header(九部分格式)
+    // 如果模型正确执行了压缩任务,至少会有几个 section
+    let section_headers = [
+        "Primary Request",
+        "Key Technical Concepts",
+        "Files and Code",
+        "Errors and Fixes",
+        "Problem Solving",
+        "All User Messages",
+        "Pending Tasks",
+        "Current Work",
+        "Next Step",
+    ];
+    let section_count = section_headers
+        .iter()
+        .filter(|h| summary.contains(*h))
+        .count();
+    // 放宽要求:如果模型没严格遵循九部分格式但输出了有实质内容(> 500 字符),
+    // 也允许通过(阶段二行为:模型可能用自由格式输出摘要)
+    if section_count < 2 && summary.len() < 500 {
+        return Err(format!(
+            "summary has too few section headers ({section_count}/9) and is short \
+             ({} chars), likely not a valid context summary",
+            summary.len()
+        ));
+    }
+
+    Ok(())
+}
+
 /// 从模型输出中抽 `<summary>...</summary>` 段落 — 配合 v2.0.12 prompt 强制
 /// `<analysis>` + `<summary>` 二段输出。容错策略:
 ///
-/// - 找到第一个 `<summary>` 和最后一个 `</summary>`,返回中间内容
-/// - 无 `<summary>` tag → 返回 raw(可能模型没遵守格式,先用着,日志会
-///   反映 summary 质量)
+/// - 找到**最后一个** `<summary>` 和其后的 `</summary>`,返回中间内容
+///   (fix #219: 用 last occurrence 而非 first,跳过 few-shot example 中的
+///   `<summary>` tag echo)
+/// - 无 `<summary>` tag → 返回 raw(可能模型没遵守格式,先用着)
 /// - 有 `<summary>` 无 `</summary>`(模型截断) → 返回 `<summary>` 之后所有文本
 fn extract_summary_section(raw: &str) -> &str {
-    let Some(start) = raw.find("<summary>") else {
+    // fix #219: 使用 rfind 取最后一个 <summary>,跳过 few-shot example 中的
+    // tag echo。模型正常输出时只有一个 <summary>…</summary> 对;异常时
+    // 可能 echo prompt 里的 example,此时 example 的 <summary> 在前面,
+    // 实际输出(如有)的 <summary> 在后面。
+    let Some(start) = raw.rfind("<summary>") else {
         return raw;
     };
     let after = &raw[start + "<summary>".len()..];
@@ -1035,14 +1157,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_summary_section_picks_outermost_when_nested_or_repeated() {
-        // 防御:few-shot example 里也有 `<summary>` 被模型直接 echo 出来时
-        // 用 first-open + last-close,取最外层。
-        let raw = "<summary>real <summary>nested example</summary> content</summary>";
+    fn extract_summary_section_picks_last_when_echo_present() {
+        // fix #219: rfind 取最后一个 <summary>,跳过 few-shot example echo。
+        // 当模型 echo prompt example 后再输出自己的 summary 时,取最后一个。
+        let raw =
+            "<summary>example echo content</summary>\n<summary>actual model output here</summary>";
         assert_eq!(
             extract_summary_section(raw).trim(),
-            "real <summary>nested example</summary> content"
+            "actual model output here"
         );
+    }
+
+    #[test]
+    fn extract_summary_section_single_pair_unchanged() {
+        // 单对 <summary>...</summary> 行为不变
+        let raw = "<analysis>meta</analysis>\n<summary>good summary content</summary>";
+        assert_eq!(extract_summary_section(raw).trim(), "good summary content");
     }
 
     fn one_chunk_stream(bytes: Vec<u8>) -> ByteStream {
@@ -1053,12 +1183,17 @@ mod tests {
 
     #[tokio::test]
     async fn collect_and_wrap_extracts_summary_into_compaction_item() {
+        // 注:summary 需 >= 200 chars + section headers 以通过质量校验(fix #219)
+        let summary_content = "1. **Primary Request and Intent**: User asked to refactor the authentication module to support OAuth2 flows and PKCE.\n\
+            2. **Key Technical Concepts**: OAuth2, PKCE, token refresh, session management, reqwest client.\n\
+            3. **Files and Code Sections**: src/auth/oauth2.rs:45-120, src/config/providers.toml.\n\
+            4. **Current Work**: Implementing the token refresh logic in oauth2.rs with proper error handling.";
         let upstream_body = serde_json::to_vec(&json!({
             "id": "chatcmpl_x",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "summary text body"},
+                "message": {"role": "assistant", "content": summary_content},
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
@@ -1077,7 +1212,7 @@ mod tests {
             enc.starts_with(COMPACT_SUMMARY_PREFIX),
             "encrypted_content 必须以 SUMMARY_PREFIX 开头(Codex CLI 用它识别 summary)"
         );
-        assert!(enc.ends_with("summary text body"));
+        assert!(enc.contains("Primary Request and Intent"));
     }
 
     #[tokio::test]
@@ -1085,15 +1220,19 @@ mod tests {
         // v2.0.12 关键回归:上游模型按 prompt 输出 `<analysis>` + `<summary>`,
         // 我们必须只把 `<summary>` 段塞进 encrypted_content,不能把 analysis
         // chain-of-thought 也塞进下一轮 history(会污染续轮模型注意力)。
+        // 注:summary 需 >= 200 chars 以通过质量校验(fix #219)。
         let model_output = "<analysis>\n\
-            User asked X, I did Y, then user corrected to Z.\n\
+            User asked X, I did Y, then user corrected to Z. This is detailed chain-of-thought.\n\
             </analysis>\n\
             <summary>\n\
-            1. Primary Request: do Z\n\
-            2. Files: /abs/foo.rs\n\
-            6. All User Messages:\n\
+            1. **Primary Request and Intent**: User requested to do Z after initially asking X.\n\
+            2. **Key Technical Concepts**: Rust async runtime, tokio task spawning, signal handling.\n\
+            3. **Files and Code Sections**: /abs/foo.rs:120-180, /abs/bar.rs:45-90.\n\
+            4. **Errors and Fixes**: Initially tried X approach, user corrected to Z.\n\
+            6. **All User Messages**:\n\
             - \"do X\"\n\
             - \"actually do Z\"\n\
+            7. **Current Work**: Implementing Z in foo.rs with proper error handling and tests.\n\
             </summary>";
         let upstream_body = serde_json::to_vec(&json!({
             "choices": [{
@@ -1119,7 +1258,7 @@ mod tests {
             "analysis chain-of-thought 内容不应被保留"
         );
         // summary 内容保留
-        assert!(enc.contains("Primary Request: do Z"));
+        assert!(enc.contains("Primary Request and Intent"));
         assert!(enc.contains("All User Messages"));
         assert!(enc.contains("\"actually do Z\""));
     }
@@ -1127,8 +1266,13 @@ mod tests {
     #[tokio::test]
     async fn collect_and_wrap_chunked_upstream_response() {
         // 上游分多 chunk 来,我们应该正确拼接后解析
+        // 注:summary 需 >= 200 chars 以通过质量校验(fix #219)
+        let chunked_summary = "1. **Primary Request and Intent**: User asked to implement chunked transfer encoding support for the proxy layer.\n\
+            2. **Key Technical Concepts**: HTTP chunked transfer, hyper body streaming, bytes crate, async IO.\n\
+            3. **Files and Code Sections**: src/proxy/forward.rs:100-200, src/proxy/stream.rs.\n\
+            4. **Current Work**: Testing chunked response assembly in integration tests with various payload sizes.";
         let upstream_body = serde_json::to_vec(&json!({
-            "choices": [{"message": {"content": "chunked summary"}, "finish_reason": "stop"}]
+            "choices": [{"message": {"content": chunked_summary}, "finish_reason": "stop"}]
         }))
         .unwrap();
         let mid = upstream_body.len() / 2;
@@ -1145,7 +1289,7 @@ mod tests {
         assert!(parsed["output"][0]["encrypted_content"]
             .as_str()
             .unwrap()
-            .ends_with("chunked summary"));
+            .contains("chunked transfer encoding"));
     }
 
     #[tokio::test]
@@ -1179,5 +1323,79 @@ mod tests {
         assert!(err
             .to_string()
             .contains("missing choices[0].message.content"));
+    }
+
+    // ── validate_compact_summary_quality (fix #219) ──────────────────
+
+    #[test]
+    fn quality_check_rejects_too_short_summary() {
+        assert!(validate_compact_summary_quality("short").is_err());
+        assert!(validate_compact_summary_quality("").is_err());
+        assert!(validate_compact_summary_quality(&"a".repeat(199)).is_err());
+    }
+
+    #[test]
+    fn quality_check_rejects_few_shot_example_echo() {
+        let echo = "1. **Primary Request**: review the auth module for race conditions\n\
+            2. **Key Technical Concepts**: TOCTOU race, session token validation, cache invalidation, tokio Mutex.\n\
+            3. **Files**: src/auth/login.rs:120-180, src/auth/refresh.rs:45-90\n\
+            4. **Errors**: actually the bug is in refresh, not login\n\
+            9. **Next Step**: add a regression test for the refresh race";
+        let result = validate_compact_summary_quality(echo);
+        assert!(result.is_err(), "should reject few-shot example echo");
+        assert!(result.unwrap_err().contains("few-shot example"));
+    }
+
+    #[test]
+    fn quality_check_rejects_template_instructions_echo() {
+        let template_echo = "Your task is to create a detailed CONTEXT CHECKPOINT summary of the conversation. \
+            Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts. \
+            provide your summary inside <summary> tags using EXACTLY these nine sections in this order. \
+            Be thorough and structured. Do NOT compress at the cost of losing file paths.";
+        let result = validate_compact_summary_quality(template_echo);
+        assert!(result.is_err(), "should reject template instructions echo");
+        assert!(result.unwrap_err().contains("template instructions"));
+    }
+
+    #[test]
+    fn quality_check_passes_valid_summary() {
+        let valid = "1. **Primary Request and Intent**: User wants to add dark mode toggle to settings page.\n\
+            2. **Key Technical Concepts**: CSS custom properties, React context, localStorage persistence.\n\
+            3. **Files and Code Sections**: src/components/Settings.tsx:45-80, src/theme/dark.css.\n\
+            4. **Errors and Fixes**: Initial attempt broke mobile layout, fixed by using media queries.\n\
+            5. **Problem Solving**: Theme context provider wraps App component for global access.\n\
+            6. **All User Messages**: \"add dark mode\", \"make sure it persists across sessions\".\n\
+            7. **Pending Tasks**: Write unit tests for theme toggle.\n\
+            8. **Current Work**: Implementing localStorage persistence in useTheme hook.\n\
+            9. **Next Step**: Write tests per user request.";
+        assert!(validate_compact_summary_quality(valid).is_ok());
+    }
+
+    #[test]
+    fn quality_check_passes_long_free_form_without_section_headers() {
+        // 模型没用九部分格式但输出了实质性内容(> 500 chars),也应该通过
+        let free_form = "The user has been working on implementing a WebSocket server \
+            for real-time notifications. They started by setting up the tokio runtime \
+            and configuring the hyper server to handle upgrade requests. The main files \
+            involved are src/ws/server.rs and src/ws/handler.rs. They encountered an \
+            issue with the handshake failing due to missing Sec-WebSocket-Accept header \
+            computation. This was fixed by using the sha1 crate to compute the correct \
+            response hash. The user then asked to add message broadcasting to all \
+            connected clients using a shared state protected by Arc<RwLock>. Current \
+            work is on implementing the broadcast channel pattern with tokio::sync::broadcast.";
+        assert!(validate_compact_summary_quality(free_form).is_ok());
+    }
+
+    #[tokio::test]
+    async fn collect_and_wrap_returns_error_on_quality_failure() {
+        // fix #219: 当 summary 质量校验失败时,应返回错误
+        let upstream_body = serde_json::to_vec(&json!({
+            "choices": [{"message": {"content": "too short"}, "finish_reason": "stop"}]
+        }))
+        .unwrap();
+        let err = collect_and_wrap_compact_body(StatusCode::OK, one_chunk_stream(upstream_body))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("quality check failed"));
     }
 }
