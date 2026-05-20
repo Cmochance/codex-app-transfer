@@ -14,7 +14,9 @@ use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::super::services::managed_block::{ManagedBlock, ManagedBlockError, MarkdownManagedBlock};
+use super::super::services::managed_block::{
+    ManagedBlock, ManagedBlockError, MarkdownManagedBlock,
+};
 use super::common::err;
 
 /// 解析 `~/` 路径(支持 macOS / Linux / Windows USERPROFILE)

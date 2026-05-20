@@ -751,20 +751,20 @@ mod tests {
         let (target, history) = tmp_paths();
         fs::write(&target, "## User\n\noriginal\n").unwrap();
         let b = block(&target, &history);
-        
+
         let parsed = b.parse().unwrap();
         let sig = calculate_outer_signature(&parsed.before_user, &parsed.after_user);
-        
+
         // 1. Correct signature succeeds
         b.apply("managed 1", Some(&sig)).unwrap();
-        
+
         // 2. Modify target externally
         fs::write(&target, "## User\n\nmodified externally\n<!-- cas:managed:agents:v1:start -->\nmanaged 1\n<!-- cas:managed:agents:v1:end -->\n").unwrap();
-        
+
         // 3. Applying with old signature fails due to ProtectedCollision
         let err = b.apply("managed 2", Some(&sig)).unwrap_err();
         assert!(matches!(err, ManagedBlockError::ProtectedCollision(_)));
-        
+
         let _ = fs::remove_dir_all(target.parent().unwrap());
     }
 
