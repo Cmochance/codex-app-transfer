@@ -1953,6 +1953,101 @@ fn function_call_output_becomes_tool_message_with_placeholder_assistant() {
 }
 
 #[test]
+fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
+    // 真机稳定性测试发现:即使 wire 桥接通了 + tool description 有 V4A
+    // 规则,DeepSeek 在 chat-path 上仍会反复尝试错误的 anchor / Add+Update
+    // 组合 / 空文件 Update 等无效路径,平均每次任务摸索 1-3 分钟。为节省
+    // tokens 和提升首次成功率,adapter 在 tools 数组里注册了 apply_patch
+    // 的 turn 注入一段独立 system message 告知 chat-path 实战 workaround。
+    let out = convert(json!({
+        "input": [{"type": "message", "role": "user", "content": "edit foo.py"}],
+        "instructions": "You are a coding assistant.",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the `apply_patch` tool to edit files."
+        }]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+
+    // Codex CLI 原 instructions 必须保留在第一条
+    assert_eq!(messages[0]["role"], "system");
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("coding assistant"),
+        "Codex 原 instructions 不应被覆盖"
+    );
+
+    // 紧跟在 Codex instructions 之后必须有一条 adapter-injected guidance
+    assert_eq!(messages[1]["role"], "system");
+    let guidance = messages[1]["content"].as_str().unwrap_or_default();
+    assert!(
+        guidance.contains("apply_patch chat-path guidance"),
+        "注入的指引必须带可识别 marker:{guidance}"
+    );
+    // 4 个核心 workaround 都要含进去
+    assert!(guidance.contains("empty line") || guidance.contains("EMPTY LINE"));
+    assert!(guidance.contains("Add File") && guidance.contains("Update File"));
+    assert!(guidance.contains("empty file") || guidance.contains("totally empty"));
+    assert!(guidance.contains("APPEND") || guidance.contains("append"));
+}
+
+#[test]
+fn apply_patch_chat_path_guidance_skipped_when_tool_not_registered() {
+    // 非 apply_patch 任务不应注入指引,避免污染 token / 模型注意力
+    let out = convert(json!({
+        "input": [{"type": "message", "role": "user", "content": "list files"}],
+        "instructions": "You are a coding assistant.",
+        "tools": [{
+            "type": "function",
+            "name": "shell_command",
+            "description": "Run a shell command",
+            "parameters": {"type": "object", "properties": {}}
+        }]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let has_guidance = messages.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("apply_patch chat-path guidance")
+    });
+    assert!(
+        !has_guidance,
+        "无 apply_patch 注册时不应注入 chat-path guidance"
+    );
+}
+
+#[test]
+fn apply_patch_chat_path_guidance_idempotent_across_turns() {
+    // 防止 merge_consecutive_system_messages 把 adapter-injected guidance
+    // 跟 Codex instructions 拼到一起后,反复 convert 时被重复累积(连发 3 个
+    // turn,每 turn 转换出的 messages 里仍只含 1 段 guidance)。
+    let one_turn = json!({
+        "input": [{"type": "message", "role": "user", "content": "edit"}],
+        "instructions": "You are helpful.",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "edit"
+        }]
+    });
+    for _ in 0..3 {
+        let out = convert(one_turn.clone());
+        let guidance_count = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or_default())
+            .filter(|c| c.contains("apply_patch chat-path guidance"))
+            .count();
+        assert_eq!(guidance_count, 1, "每次 convert 仅注入一次 guidance");
+    }
+}
+
+#[test]
 fn custom_tool_call_input_item_lowered_to_assistant_tool_calls() {
     // 回归保护(issue #235):turn N+1 Codex CLI 回放上一轮的
     // `ResponseItem::CustomToolCall { name, input, call_id }`,我们必须把它

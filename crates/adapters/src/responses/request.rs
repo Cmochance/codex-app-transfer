@@ -296,6 +296,14 @@ fn build_messages_from_input(
         messages.push(msg);
     }
 
+    // 紧跟 Codex CLI 自带 instructions 之后注入 apply_patch chat-path 指引
+    // (仅当本 turn 真正注册了 apply_patch 工具时)。位置选择:Codex 系统
+    // 指令之后,user input 之前 — 既不污染 Codex 原指令,又确保模型在
+    // 读完工具列表准备调 apply_patch 时已经见过 chat-path 限制。
+    if tools_register_apply_patch(body) {
+        messages.push(apply_patch_chat_guidance_message());
+    }
+
     let current_messages = body
         .get("input")
         .map(input_field_to_messages)
@@ -2271,4 +2279,48 @@ mod tests;
 
 use tools::{
     contains_kimi_web_search_tool, convert_responses_tool_to_chat_tool, normalize_tool_choice,
+    APPLY_PATCH_TOOL_NAME,
 };
+
+/// chat-path 实战指引,作为独立 `role:"system"` 注入,仅在该 turn 的 tools
+/// 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试
+/// (DeepSeek 跑 10 个 Level 共发现的 4 个 chat-path 行为):tool/参数
+/// description 同时含紧凑版作 fallback,但 system message 在多数 chat
+/// 上游里被赋予更高权重,且模型在 system 块里读到的指引更难被遗忘 / 截断。
+const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
+    "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
+    "When you call the `apply_patch` tool, follow these rules empirically observed with non-OpenAI chat providers:\n",
+    "\n",
+    "1. Use an EMPTY LINE as the `@@` anchor whenever possible. Non-empty anchors (e.g. `@@ Hello World!`) frequently fail to match on this path. ",
+    "If the target file lacks a blank line near your hunk, first run `printf '\\n' >> <path>` via shell to seed one, then use `@@` with empty content as the anchor, and clean up extra blank lines after the patch lands.\n",
+    "\n",
+    "2. Do NOT combine `*** Add File: <path>` and `*** Update File: <path>` for the same path in a single patch. ",
+    "The Update step reads the file before the Add step lands on disk, so it sees an empty file and fails. Either: (a) make `*** Add File:` write the final content in one shot, or (b) split into two separate `apply_patch` invocations.\n",
+    "\n",
+    "3. `*** Update File:` cannot operate on a totally empty file. If the target is empty, first use shell (e.g. `printf '\\n' > <path>`) to write at least one line, then call `apply_patch`.\n",
+    "\n",
+    "4. In a multi-line file, lone `+` lines following an `@@` anchor APPEND below the anchor — they do NOT replace the anchor line. To change an existing line, you must include BOTH a `-` line to remove the old content AND a `+` line to add the new content. Do not omit the `-` line.\n",
+    "\n",
+    "Following these rules avoids retry storms and improves the success rate on first attempt."
+);
+
+/// 检测 Responses request body 的 tools 数组是否注册了 `apply_patch` 工具。
+/// `apply_patch` 在 Responses 协议里以 `type:"custom", name:"apply_patch"` 出现,
+/// 在被 [`convert_responses_tool_to_chat_tool`] 降级前。
+/// 用于决定本 turn 是否注入 [`APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE`]。
+fn tools_register_apply_patch(body: &Value) -> bool {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return false;
+    };
+    tools.iter().any(|t| {
+        t.get("name").and_then(Value::as_str) == Some(APPLY_PATCH_TOOL_NAME)
+            && t.get("type").and_then(Value::as_str) == Some("custom")
+    })
+}
+
+fn apply_patch_chat_guidance_message() -> Value {
+    json!({
+        "role": "system",
+        "content": APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE,
+    })
+}

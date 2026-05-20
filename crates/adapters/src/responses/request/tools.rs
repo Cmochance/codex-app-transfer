@@ -58,7 +58,15 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "     println!(\"{}\", x);\n",
     "*** End Patch\n",
     "Notice: `fn main() {` appears in `@@ ... @@` once as the anchor, NOT again as a space-prefixed line below. ",
-    "The first content line under the anchor is the line immediately after `fn main() {` in the file."
+    "The first content line under the anchor is the line immediately after `fn main() {` in the file.\n\n",
+    "CHAT-PATH GOTCHAS (the lark grammar is gone here; observed empirically with non-OpenAI providers):\n",
+    "1. Prefer matching an empty line as the `@@` anchor. Non-empty anchors often fail to match on this path. ",
+    "If needed, run `printf '\\n' >> <path>` first to seed a blank line, then `@@` with empty content, then clean up extra blank lines afterward.\n",
+    "2. Do NOT combine `*** Add File: foo` and `*** Update File: foo` in the SAME patch — Update reads the file before Add lands on disk. ",
+    "Either make Add File write the final content in one shot, or split into two separate patches.\n",
+    "3. `*** Update File:` cannot operate on a completely empty file. Use shell to write at least one line first, then apply_patch.\n",
+    "4. In a multi-line file, lone `+` lines AFTER an `@@` anchor APPEND below the anchor — they do NOT replace the anchor line. ",
+    "To change a line, use `-` to remove the old line AND `+` to add the new one; do not omit the `-`."
 );
 
 /// Chat-path replacement for the freeform `input` parameter description.
@@ -73,7 +81,10 @@ pub(crate) const APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Use `*** Add File:`, `*** Update File:`, or `*** Delete File:` headers and ",
     "`@@ <context> @@` hunks with ` `/`+`/`-` line prefixes. Relative paths only. ",
     "CRITICAL: in an Update hunk the `@@ <line> @@` anchor is a SINGLE existing file line; ",
-    "the space-prefixed lines following the anchor describe lines AFTER it (do not repeat the anchor)."
+    "the space-prefixed lines following the anchor describe lines AFTER it (do not repeat the anchor). ",
+    "Chat-path gotchas: prefer empty-line anchors (seed with `printf '\\n' >> file` if needed); ",
+    "do not Add+Update the same path in one patch; Update cannot operate on a totally empty file; ",
+    "lone `+` lines after `@@` APPEND below the anchor (use `-` + `+` to replace a line)."
 );
 
 /// Responses tool 定义 → Chat tool 定义.
