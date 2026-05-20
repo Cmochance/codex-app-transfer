@@ -1,9 +1,9 @@
-use super::*;
 use super::tools::*;
+use super::*;
+use crate::types::AdapterError;
 use codex_app_transfer_registry::Provider;
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
-use crate::types::AdapterError;
 
 fn convert(body: Value) -> Value {
     responses_body_to_chat_body(&body).unwrap()
@@ -685,8 +685,7 @@ fn text_only_provider_image_only_still_strips_to_placeholder() {
             ]
         }]
     });
-    let out =
-        responses_body_to_chat_body_for_provider(&req, Some(&deepseek_provider())).unwrap();
+    let out = responses_body_to_chat_body_for_provider(&req, Some(&deepseek_provider())).unwrap();
     let serialized = serde_json::to_string(&out["messages"]).unwrap();
     assert!(
         !serialized.contains("\"image_url\""),
@@ -1336,8 +1335,7 @@ fn explicit_supports_vision_true_overrides_text_only_blacklist() {
             "type":"input_image","image_url":"data:image/png;base64,AAA"
         }]
     });
-    let out =
-        responses_body_to_chat_body_for_provider(&req, Some(&deepseek_with_vision)).unwrap();
+    let out = responses_body_to_chat_body_for_provider(&req, Some(&deepseek_with_vision)).unwrap();
     let serialized = serde_json::to_string(&out["messages"]).unwrap();
     assert!(serialized.contains("\"image_url\""));
 }
@@ -2024,10 +2022,8 @@ fn large_function_call_output_is_bounded_before_chat_history() {
 
 #[test]
 fn large_function_call_output_raw_payload_round_trips_via_artifact_store() {
-    let store = super::super::artifact_store::ToolArtifactStore::new(
-        8,
-        std::time::Duration::from_secs(60),
-    );
+    let store =
+        super::super::artifact_store::ToolArtifactStore::new(8, std::time::Duration::from_secs(60));
     let raw_output = format!(
         "Process exited with code 0\nOriginal token count: 9000\n{}",
         "raw-line\n".repeat(900)

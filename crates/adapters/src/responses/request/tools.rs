@@ -18,7 +18,10 @@ use super::provider_looks_like;
 /// - `custom` × 28 / 轮(`apply_patch` 用 lark grammar)
 /// - `web_search` × 28 / 轮(server-side built-in,无 name/parameters,
 ///   chat 端无等价,继续 drop + warn_once 提示用户)
-pub fn convert_responses_tool_to_chat_tool(tool: &Value, provider: Option<&Provider>) -> Vec<Value> {
+pub fn convert_responses_tool_to_chat_tool(
+    tool: &Value,
+    provider: Option<&Provider>,
+) -> Vec<Value> {
     let Some(obj) = tool.as_object() else {
         return vec![];
     };

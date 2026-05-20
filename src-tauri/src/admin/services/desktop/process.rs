@@ -1,8 +1,8 @@
+use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use serde_json::Value;
 
 const MACOS_APP_NAME: &str = "Codex";
 const WINDOWS_PROCESS_NAME: &str = "Codex.exe";

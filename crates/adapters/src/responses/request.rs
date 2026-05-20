@@ -2200,10 +2200,11 @@ fn value_to_chat_string(value: &Value) -> String {
     }
 }
 
-
 pub mod tools;
 
 #[cfg(test)]
 mod tests;
 
-use tools::{convert_responses_tool_to_chat_tool, contains_kimi_web_search_tool, normalize_tool_choice};
+use tools::{
+    contains_kimi_web_search_tool, convert_responses_tool_to_chat_tool, normalize_tool_choice,
+};

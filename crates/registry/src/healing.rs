@@ -860,10 +860,10 @@ mod tests {
         assert!(changed);
         let p = &cfg["providers"][0];
         assert_eq!(p["isBuiltin"], json!(true));
-        
+
         // apiFormat must be healed/overridden to "openai_chat" because it is in enforcedFields
         assert_eq!(p["apiFormat"], "openai_chat");
-        
+
         // authScheme and extraHeaders must NOT be touched because they are NOT in enforcedFields
         assert_eq!(p["authScheme"], "custom-auth");
         assert_eq!(p["extraHeaders"]["User-Agent"], "Custom-UA");

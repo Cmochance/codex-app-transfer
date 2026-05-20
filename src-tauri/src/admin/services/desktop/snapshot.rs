@@ -10,15 +10,17 @@ use codex_app_transfer_proxy::proxy_telemetry;
 use codex_app_transfer_registry::RawConfig;
 use serde_json::{json, Value};
 
-use crate::proxy_runner::ProxyManager;
-use crate::admin::registry_io::{load as load_registry, with_config_write, ConfigMutation};
-use crate::admin::state::AdminState;
 use crate::admin::handlers::common::{active_provider_name, read_setting_bool, APP_VERSION};
 use crate::admin::handlers::providers::{
     active_provider, provider_api_key, provider_default_model, provider_display_name,
     provider_index, provider_model_capabilities, provider_model_mappings, provider_supports_1m,
 };
-use crate::admin::handlers::proxy::{ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed};
+use crate::admin::handlers::proxy::{
+    ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed,
+};
+use crate::admin::registry_io::{load as load_registry, with_config_write, ConfigMutation};
+use crate::admin::state::AdminState;
+use crate::proxy_runner::ProxyManager;
 
 pub const ONE_M_CONTEXT_WINDOW: u64 = 1_000_000;
 
@@ -485,10 +487,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::admin::handlers::common::test_support::with_isolated_home;
-    use crate::admin::registry_io::save_for_test as save_registry;
     use crate::admin::handlers::desktop::desktop_status;
-    use axum::response::IntoResponse;
+    use crate::admin::registry_io::save_for_test as save_registry;
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use codex_app_transfer_registry::DEFAULT_UPDATE_URL;
 
     fn config_with_secret() -> Value {

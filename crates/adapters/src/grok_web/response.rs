@@ -1261,8 +1261,6 @@ fn format_generic_search_results_for_reasoning(
     s
 }
 
-
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Event 构造 helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1550,8 +1548,6 @@ fn close_message_if_open(state: &mut ConvState) {
         }),
     ));
 }
-
-
 
 /// 合规 OpenAI Responses `response.failed` 事件构造。
 ///

@@ -20,9 +20,9 @@ use crate::admin::registry_io::load as load_registry;
 // Re-export core services to preserve public API / downstream integration stability (e.g. called by main.rs)
 pub use crate::admin::services::desktop::process::is_codex_app_running;
 pub use crate::admin::services::desktop::snapshot::{
-    auto_apply_on_startup_if_enabled, restore_codex_if_enabled, switch_provider_and_sync,
-    read_codex_toml_root_string, codex_openai_api_key_present,
-    desktop_target_for_active_provider, desktop_health,
+    auto_apply_on_startup_if_enabled, codex_openai_api_key_present, desktop_health,
+    desktop_target_for_active_provider, read_codex_toml_root_string, restore_codex_if_enabled,
+    switch_provider_and_sync,
 };
 
 use crate::admin::services::desktop::{process, snapshot};
