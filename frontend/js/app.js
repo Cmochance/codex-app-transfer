@@ -1,5 +1,5 @@
 (function () {
-  const routes = ["dashboard", "providers/add", "providers", "desktop", "proxy", "settings", "guide"];
+  const routes = ["dashboard", "providers/add", "providers", "desktop", "proxy", "settings", "codex", "guide"];
   const providerFormModelSlots = [
     { key: "default", label: "Default", icon: "bi-circle-fill", iconClass: "default", source: "未配置映射时默认使用这一项", required: true },
     { key: "gpt_5_5", label: "gpt-5.5", icon: "bi-circle", iconClass: "default", source: "gpt-5.5" },
@@ -2136,6 +2136,7 @@
     if (route === "desktop") await renderDesktop();
     if (route === "proxy") await renderProxy();
     if (route === "settings") await renderSettings();
+    if (route === "codex") await renderCodexAssets();
   }
 
   let currentTheme = "default";
@@ -2847,9 +2848,357 @@
       if (action === "apply-provider-desktop") {
         await applyProviderToDesktop(actionEl);
       }
+
+      // ── Codex 资产管理 (#24 / #25, Agents + MCP + Skills tab) ──
+      if (action === "codex-block-preview") {
+        await codexBlockPreview(currentCodexBlockType());
+      }
+      if (action === "codex-block-apply") {
+        await codexBlockApply(currentCodexBlockType());
+      }
+      if (action === "codex-block-history-toggle") {
+        await codexBlockToggleHistory(currentCodexBlockType());
+      }
+      if (action === "codex-block-clear") {
+        if (window.confirm(t("codex.confirmClear"))) {
+          await codexBlockClear(currentCodexBlockType());
+        }
+      }
+      if (action === "codex-block-rollback") {
+        const idx = Number(actionEl.dataset.idx);
+        const type = actionEl.dataset.type || currentCodexBlockType();
+        if (!Number.isFinite(idx)) return;
+        if (window.confirm(tFmt("codex.confirmRollback", { type, idx }))) {
+          await codexBlockRollback(type, idx);
+        }
+      }
+      if (action === "codex-skills-backup") {
+        await codexSkillsBackup();
+      }
+      if (action === "codex-skills-refresh") {
+        await codexSkillsLoadAndRender();
+      }
+      if (action === "codex-skills-restore") {
+        const filename = actionEl.dataset.filename;
+        if (!filename) return;
+        if (window.confirm(tFmt("codex.confirmSkillsRestore", { filename }))) {
+          await codexSkillsRestore(filename);
+        }
+      }
     } catch (error) {
       console.error(error);
       showToast(error.message || t("toast.requestFailed"));
+    }
+  }
+
+  // ── Codex 资产管理: marker 受管块 (agents + mcp 共享, type ∈ {agents, mcp}) ──
+
+  /** URL prefix for managed-block endpoints */
+  function codexBlockUrl(type) {
+    if (type === "mcp") return "/api/codex/mcp-toml";
+    if (type === "memories") return "/api/codex/memories-md";
+    return "/api/codex/agents-md";
+  }
+
+  function currentCodexTab() {
+    return $("#codexSidebar .codex-sidebar-item.active")?.dataset?.codexTab || "agents";
+  }
+
+  function currentCodexBlockType() {
+    const tab = currentCodexTab();
+    if (tab === "mcp") return "mcp";
+    if (tab === "memories") return "memories";
+    return "agents";
+  }
+
+  async function codexBlockFetchStatus(type) {
+    const r = await fetch(`${codexBlockUrl(type)}/status`);
+    if (!r.ok) throw new Error("status request failed");
+    return r.json();
+  }
+
+  async function codexBlockLoadAndRender(type) {
+    const status = await codexBlockFetchStatus(type);
+    const el = $("#codexBlockStatus");
+    if (!el) return;
+    const lastApply = status.lastApply
+      ? new Date(status.lastApply * 1000).toLocaleString()
+      : t("codex.statusNone");
+    const stateLabel = status.hasManaged ? t("codex.statusManaged") : t("codex.statusEmpty");
+    el.innerHTML = `<i class="bi bi-info-circle"></i><p>
+      <strong>${escapeHtml(t("codex.statusBlockState"))}(${escapeHtml(type)}):</strong> ${escapeHtml(stateLabel)}<br>
+      <strong>${escapeHtml(t("codex.statusUserBytes"))}:</strong> ${status.beforeUserBytes + status.afterUserBytes} ${escapeHtml(t("codex.statusBytesSuffix"))}<br>
+      <strong>${escapeHtml(t("codex.statusHistoryCount"))}:</strong> ${status.historyCount} ${escapeHtml(t("codex.statusHistoryCountSuffix"))}<br>
+      <strong>${escapeHtml(t("codex.statusLastApply"))}:</strong> ${escapeHtml(lastApply)}<br>
+      <strong>${escapeHtml(t("codex.statusTargetFile"))}:</strong> <code>${escapeHtml(status.targetPath || "")}</code>
+    </p>`;
+    const ta = $("#codexBlockContent");
+    if (ta) {
+      if (status.outerSignature !== undefined) {
+        ta.dataset.outerSignature = status.outerSignature;
+      }
+      if (status.managedContent !== undefined && !ta.dataset.dirty) {
+        ta.value = status.managedContent || "";
+      }
+    }
+  }
+
+  async function codexBlockPreview(type) {
+    const content = $("#codexBlockContent")?.value ?? "";
+    const r = await fetch(`${codexBlockUrl(type)}/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+    if (!r.ok) throw new Error("preview failed");
+    const j = await r.json();
+    const pre = $("#codexBlockPreviewArea");
+    if (pre) {
+      pre.textContent = j.rendered ?? "(empty)";
+      pre.hidden = false;
+    }
+  }
+
+  async function codexBlockApply(type) {
+    const ta = $("#codexBlockContent");
+    const content = ta?.value ?? "";
+    const expectedOuterSignature = ta?.dataset?.outerSignature || null;
+    const body = { content };
+    if (expectedOuterSignature) {
+      body.expectedOuterSignature = expectedOuterSignature;
+    }
+    const r = await fetch(`${codexBlockUrl(type)}/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.error || "apply failed");
+    }
+    if (ta) delete ta.dataset.dirty;
+    await codexBlockLoadAndRender(type);
+    showToast(tFmt("codex.toastApplied", { type }));
+  }
+
+  async function codexBlockClear(type) {
+    const r = await fetch(`${codexBlockUrl(type)}/clear`, { method: "POST" });
+    if (!r.ok) throw new Error("clear failed");
+    await codexBlockLoadAndRender(type);
+    showToast(tFmt("codex.toastCleared", { type }));
+  }
+
+  async function codexBlockRollback(type, idx) {
+    const r = await fetch(`${codexBlockUrl(type)}/rollback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ index: idx }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.error || "rollback failed");
+    }
+    await codexBlockLoadAndRender(type);
+    await codexBlockRenderHistory(type);
+    showToast(tFmt("codex.toastRollbacked", { type, idx }));
+  }
+
+  async function codexBlockRenderHistory(type) {
+    const r = await fetch(`${codexBlockUrl(type)}/history`);
+    if (!r.ok) throw new Error("history failed");
+    const j = await r.json();
+    const list = $("#codexBlockHistoryList");
+    if (!list) return;
+    const items = (j.history || []).map((entry) => {
+      const ts = new Date(entry.timestamp * 1000).toLocaleString();
+      const preview = (entry.managedContent || "").slice(0, 80).replace(/\n/g, " ⏎ ");
+      return `<li style="padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+          <span style="font-family: monospace; font-size: 12px; color: var(--muted);">[${entry.index}] ${ts}</span>
+          <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-block-rollback" data-type="${type}" data-idx="${entry.index}"><i class="bi bi-arrow-counterclockwise"></i> Rollback</button>
+        </div>
+        <pre style="font-size: 12px; max-height: 60px; overflow: hidden; margin: 4px 0 0; color: var(--muted);">${escapeHtml(preview) || "(empty)"}</pre>
+      </li>`;
+    });
+    list.innerHTML =
+      items.join("") || `<li><em>${escapeHtml(t("codex.historyEmpty"))}</em></li>`;
+  }
+
+  async function codexBlockToggleHistory(type) {
+    const el = $("#codexBlockHistory");
+    if (!el) return;
+    if (el.hidden) {
+      await codexBlockRenderHistory(type);
+      el.hidden = false;
+    } else {
+      el.hidden = true;
+    }
+  }
+
+  // ── Skills tab (file-snapshot backup / restore, 独立 ManagedBlock 之外) ──
+
+  async function codexSkillsLoadAndRender() {
+    const [listR, backupsR] = await Promise.all([
+      fetch("/api/codex/skills/list"),
+      fetch("/api/codex/skills/backups"),
+    ]);
+    if (!listR.ok || !backupsR.ok) throw new Error("skills load failed");
+    const list = await listR.json();
+    const backups = await backupsR.json();
+
+    const statusEl = $("#codexSkillsStatus");
+    if (statusEl) {
+      const countSuffix = t("codex.skillsCountSuffix");
+      const backupsSuffix = t("codex.skillsBackupsCountSuffix");
+      statusEl.innerHTML = `<i class="bi bi-info-circle"></i><p>
+        <strong>${escapeHtml(t("codex.skillsDirLabel"))}:</strong> <code>${escapeHtml(list.skillsDir || "")}</code><br>
+        <strong>${escapeHtml(t("codex.skillsInstalledLabel"))}:</strong> ${list.count}${countSuffix ? " " + escapeHtml(countSuffix) : ""}<br>
+        <strong>${escapeHtml(t("codex.skillsBackupDirLabel"))}:</strong> <code>${escapeHtml(backups.backupDir || "")}</code><br>
+        <strong>${escapeHtml(t("codex.skillsBackupsLabel"))}:</strong> ${backups.count}${backupsSuffix ? " " + escapeHtml(backupsSuffix) : ""}
+      </p>`;
+    }
+
+    const ul = $("#codexSkillsList");
+    if (ul) {
+      const filesSuffix = t("codex.skillsFilesSuffix");
+      const rows = (list.entries || []).map((entry) => {
+        const md = entry.has_skill_md
+          ? t("codex.skillsHasSkillMd")
+          : t("codex.skillsNoSkillMd");
+        return `<li style="display: flex; justify-content: space-between; padding: 4px 8px; border-bottom: 1px dashed var(--line);">
+          <span>${escapeHtml(entry.name)}</span>
+          <small style="color: var(--muted);">${escapeHtml(md)} · ${entry.files_count} ${escapeHtml(filesSuffix)}</small>
+        </li>`;
+      });
+      ul.innerHTML =
+        rows.join("") || `<li><em>${escapeHtml(t("codex.skillsListEmpty"))}</em></li>`;
+    }
+
+    const backupList = $("#codexSkillsBackupsList");
+    if (backupList) {
+      const rows = (backups.backups || []).map((entry) => {
+        const ts = new Date(entry.created_unix * 1000).toLocaleString();
+        const sizeKb = (entry.size_bytes / 1024).toFixed(1);
+        return `<li style="padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+          <span><strong>${escapeHtml(entry.filename)}</strong> <small style="color: var(--muted);">${sizeKb} KB · ${ts}</small></span>
+          <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-skills-restore" data-filename="${escapeHtml(entry.filename)}"><i class="bi bi-arrow-counterclockwise"></i> Restore</button>
+        </li>`;
+      });
+      backupList.innerHTML =
+        rows.join("") || `<li><em>${escapeHtml(t("codex.backupsListEmpty"))}</em></li>`;
+    }
+  }
+
+  async function codexSkillsBackup() {
+    const r = await fetch("/api/codex/skills/backup", { method: "POST" });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.error || "backup failed");
+    }
+    const j = await r.json();
+    showToast(tFmt("codex.toastSkillsBackedUp", { name: j.backupPath?.split("/").pop() || "ok" }));
+    await codexSkillsLoadAndRender();
+  }
+
+  async function codexSkillsRestore(filename) {
+    const r = await fetch("/api/codex/skills/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.error || "restore failed");
+    }
+    showToast(tFmt("codex.toastSkillsRestored", { filename }));
+    await codexSkillsLoadAndRender();
+  }
+
+  // ── sidebar tab switch + renderCodexAssets entry (#25 sidebar + lazy + 转场) ──
+
+  /** sidebar tab visibility:active class + fade slide pane */
+  function codexShowTab(tab) {
+    const blockPane = $("#codexBlockTab");
+    const skillsPane = $("#codexSkillsTab");
+    const wantBlock = tab === "agents" || tab === "mcp" || tab === "memories";
+    if (blockPane) {
+      blockPane.hidden = !wantBlock;
+      blockPane.classList.toggle("active", wantBlock);
+    }
+    if (skillsPane) {
+      skillsPane.hidden = tab !== "skills";
+      skillsPane.classList.toggle("active", tab === "skills");
+    }
+    // 切 tab 时收起 History 面板和 Preview 区域,防止残留的 rollback 按钮
+    // data-type 指向旧 tab 导致 rollback 操作类型错误 (Devin Review BUG_..._0001)
+    const historyEl = $("#codexBlockHistory");
+    if (historyEl) historyEl.hidden = true;
+    const previewEl = $("#codexBlockPreviewArea");
+    if (previewEl) previewEl.hidden = true;
+
+    // sidebar item active state
+    $all("#codexSidebar .codex-sidebar-item").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.codexTab === tab);
+    });
+  }
+
+  /** lazy load + 状态 badge 刷新 (sidebar 上各 item 显 ✓ / 数字) */
+  async function codexLoadTab(tab) {
+    if (tab === "skills") {
+      await codexSkillsLoadAndRender();
+    } else {
+      await codexBlockLoadAndRender(tab);
+    }
+    await codexRefreshSidebarBadges();
+  }
+
+  /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
+  async function codexRefreshSidebarBadges() {
+    try {
+      const [agents, mcp, memories, skills] = await Promise.all([
+        fetch("/api/codex/agents-md/status").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/mcp-toml/status").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/memories-md/status").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/skills/list").then((r) => (r.ok ? r.json() : null)),
+      ]);
+      const setBadge = (id, text) => {
+        const el = $(id);
+        if (el) el.textContent = text;
+      };
+      setBadge("#codexSidebarBadge-agents", agents?.hasManaged ? "ON" : "—");
+      setBadge("#codexSidebarBadge-mcp", mcp?.hasManaged ? "ON" : "—");
+      setBadge("#codexSidebarBadge-memories", memories?.hasManaged ? "ON" : "—");
+      setBadge("#codexSidebarBadge-skills", skills?.count != null ? String(skills.count) : "—");
+    } catch {
+      // best-effort, 静默
+    }
+  }
+
+  async function renderCodexAssets() {
+    const sidebar = $("#codexSidebar");
+    const initialTab = currentCodexTab();
+    codexShowTab(initialTab);
+    await codexLoadTab(initialTab);
+
+    // textarea dirty 标记: user 编辑后 status 重 load 不覆盖
+    const ta = $("#codexBlockContent");
+    if (ta && !ta.dataset.bound) {
+      ta.dataset.bound = "1";
+      ta.addEventListener("input", () => (ta.dataset.dirty = "1"));
+    }
+
+    // sidebar click → 切 tab + lazy load
+    if (sidebar && !sidebar.dataset.bound) {
+      sidebar.dataset.bound = "1";
+      sidebar.addEventListener("click", async (evt) => {
+        const btn = evt.target.closest(".codex-sidebar-item");
+        if (!btn) return;
+        const tab = btn.dataset.codexTab;
+        if (!tab) return;
+        if (ta) delete ta.dataset.dirty;
+        codexShowTab(tab);
+        await codexLoadTab(tab);
+      });
     }
   }
 

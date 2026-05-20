@@ -1,0 +1,121 @@
+/* Codex 资产管理 sidebar + content layout
+   借鉴 borawong/AiMaMi:src/components/layout/sidebar.tsx (icon-collapsible) 跟
+   src/main-app.tsx:177-187 (相邻页同时挂载 + slide 转场). 用 vanilla CSS 实现
+   sidebar(180px / collapse 64px) + content 区域 + 切 tab 时 fade+slide 转场。 */
+
+.codex-layout {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.codex-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  position: sticky;
+  top: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.codex-sidebar-item {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.codex-sidebar-item i {
+  font-size: 16px;
+  color: var(--muted);
+}
+
+.codex-sidebar-item:hover {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.codex-sidebar-item:hover i {
+  color: var(--primary);
+}
+
+.codex-sidebar-item.active {
+  background: var(--primary-soft);
+  color: var(--primary);
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+
+.codex-sidebar-item.active i {
+  color: var(--primary);
+}
+
+.codex-sidebar-badge {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+  min-width: 18px;
+  text-align: center;
+}
+
+.codex-sidebar-item.active .codex-sidebar-badge {
+  color: var(--primary);
+  background: var(--surface);
+}
+
+.codex-content {
+  min-width: 0;
+  position: relative;
+}
+
+/* 相邻 pane 同时挂载 (lazy load 仍 fetch only on activation), 切 tab 用 fade+slide 转场
+   而非 hidden flicker — 借鉴 AiMaMi PageStage 滑动模式 */
+.codex-pane {
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.codex-pane[hidden] {
+  display: none;
+}
+
+.codex-pane.active {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+/* small viewport: sidebar collapse 成 icon only (60px wide) */
+@media (max-width: 720px) {
+  .codex-layout {
+    grid-template-columns: 60px minmax(0, 1fr);
+    gap: 10px;
+  }
+  .codex-sidebar-item {
+    grid-template-columns: 22px;
+    justify-content: center;
+  }
+  .codex-sidebar-item span,
+  .codex-sidebar-badge {
+    display: none;
+  }
+}

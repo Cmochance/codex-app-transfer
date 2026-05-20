@@ -35,6 +35,7 @@
         <a href="#providers" class="route-tab" data-nav="providers" title="Providers"><i class="bi bi-plug"></i><span data-i18n="nav.providers">提供商</span></a>
         <a href="#proxy" class="route-tab" data-nav="proxy" title="Forwarding"><i class="bi bi-broadcast-pin"></i><span data-i18n="nav.proxy">转发</span></a>
         <a href="#settings" class="route-tab" data-nav="settings" title="Settings"><i class="bi bi-gear"></i><span data-i18n="nav.settings">设置</span></a>
+        <a href="#codex" class="route-tab" data-nav="codex" title="Codex 资产"><i class="bi bi-bookmark"></i><span data-i18n="nav.codex">Codex 资产</span></a>
         <a href="#guide" class="route-tab" data-nav="guide" title="Guide"><i class="bi bi-book"></i><span data-i18n="nav.guide">引导</span></a>
       </nav>
       <div class="header-actions">
@@ -486,6 +487,91 @@
           <p class="update-status" id="updateStatus"></p>
           <div class="about-row"><span>GitHub</span><a href="https://github.com/Cmochance/codex-app-transfer" target="_blank" rel="noreferrer"><i class="bi bi-box-arrow-up-right"></i></a></div>
         </article>
+      </section>
+
+      <section class="page" id="page-codex" data-page="codex">
+        <header class="page-title">
+          <h1 data-i18n="codex.title">Codex 资产管理</h1>
+          <p data-i18n="codex.subtitle">管 Codex CLI 全局 AGENTS.md / config.toml MCP / Skills 等。借鉴 borawong/AiMaMi — Agents/MCP 用 marker 受管块, Skills 用 file-level tar.gz 备份/还原。</p>
+        </header>
+
+        <div class="codex-layout">
+          <!-- Sidebar (借鉴 AiMaMi src/components/layout/sidebar.tsx — icon + label, badge 显状态) -->
+          <nav class="codex-sidebar" id="codexSidebar" aria-label="Codex assets">
+            <button type="button" class="codex-sidebar-item active" data-codex-tab="agents">
+              <i class="bi bi-file-text"></i>
+              <span data-i18n="codex.tabAgents">AGENTS.md</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-agents"></small>
+            </button>
+            <button type="button" class="codex-sidebar-item" data-codex-tab="mcp">
+              <i class="bi bi-plug"></i>
+              <span data-i18n="codex.tabMcp">MCP servers</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-mcp"></small>
+            </button>
+            <button type="button" class="codex-sidebar-item" data-codex-tab="memories">
+              <i class="bi bi-journal-text"></i>
+              <span data-i18n="codex.tabMemories">Memories</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-memories"></small>
+            </button>
+            <button type="button" class="codex-sidebar-item" data-codex-tab="skills">
+              <i class="bi bi-collection"></i>
+              <span data-i18n="codex.tabSkills">Skills</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-skills"></small>
+            </button>
+          </nav>
+
+          <article class="panel codex-content" id="codex-assets-panel">
+          <!-- block tab (Agents + MCP 共享 marker 模式 UI: textarea + 4 button + history) -->
+          <div class="codex-block-tab codex-pane active" id="codexBlockTab" data-codex-pane="block">
+            <div class="codex-status info-box" id="codexBlockStatus" style="margin-top: 16px;">
+              <i class="bi bi-info-circle"></i>
+              <p><span data-i18n="codex.statusLoading">状态加载中…</span></p>
+            </div>
+
+            <div class="form-group" style="margin-top: 16px;">
+              <label class="form-label" for="codexBlockContent" data-i18n="codex.managedContent">受管块内容(start/end marker 之间的内容)</label>
+              <textarea class="form-control" id="codexBlockContent" rows="10" data-i18n-attr="placeholder|codex.placeholder" placeholder="贴入 app 受管段(留空 = Apply 创建空块或 Preview 看 marker 注入位置)"></textarea>
+            </div>
+
+            <div class="button-row">
+              <button class="btn btn-outline-primary" type="button" data-action="codex-block-preview"><i class="bi bi-eye"></i><span data-i18n="codex.preview">Preview</span></button>
+              <button class="btn btn-primary" type="button" data-action="codex-block-apply"><i class="bi bi-check2-circle"></i><span data-i18n="codex.apply">Apply</span></button>
+              <button class="btn btn-outline-primary" type="button" data-action="codex-block-history-toggle"><i class="bi bi-clock-history"></i><span data-i18n="codex.history">History</span></button>
+              <button class="btn btn-outline-danger" type="button" data-action="codex-block-clear"><i class="bi bi-x-circle"></i><span data-i18n="codex.clear">Clear</span></button>
+            </div>
+
+            <div class="codex-history" id="codexBlockHistory" hidden style="margin-top: 16px;">
+              <h3 style="font-size: 16px; font-weight: 700;" data-i18n="codex.historyTitle">History(最多 10 条 snapshot)</h3>
+              <ul id="codexBlockHistoryList" style="list-style: none; padding: 0;"></ul>
+            </div>
+
+            <pre class="code-block" id="codexBlockPreviewArea" hidden style="margin-top: 16px; max-height: 400px; overflow: auto;"></pre>
+          </div>
+
+          <!-- Skills 独立 UI (list + backup / restore) -->
+          <div class="codex-skills-tab codex-pane" id="codexSkillsTab" data-codex-pane="skills" hidden>
+            <div class="codex-status info-box" id="codexSkillsStatus" style="margin-top: 16px;">
+              <i class="bi bi-info-circle"></i>
+              <p><span data-i18n="codex.statusLoading">状态加载中…</span></p>
+            </div>
+
+            <div class="form-group" style="margin-top: 16px;">
+              <label class="form-label" data-i18n="codex.skillsList">已安装 skill</label>
+              <ul id="codexSkillsList" style="list-style: none; padding: 0; max-height: 280px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 8px;"></ul>
+            </div>
+
+            <div class="button-row">
+              <button class="btn btn-primary" type="button" data-action="codex-skills-backup"><i class="bi bi-archive"></i><span data-i18n="codex.skillsBackup">Backup now</span></button>
+              <button class="btn btn-outline-primary" type="button" data-action="codex-skills-refresh"><i class="bi bi-arrow-clockwise"></i><span data-i18n="codex.skillsRefresh">Refresh</span></button>
+            </div>
+
+            <div class="form-group" style="margin-top: 16px;">
+              <label class="form-label" data-i18n="codex.skillsBackups">已有备份(tar.gz, 最新在上)</label>
+              <ul id="codexSkillsBackupsList" style="list-style: none; padding: 0;"></ul>
+            </div>
+          </div>
+          </article>
+        </div>
       </section>
 
       <section class="page" id="page-guide" data-page="guide">

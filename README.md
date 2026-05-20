@@ -240,6 +240,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 - [`galaxywk223/codex-plugin-unlocker`](https://github.com/galaxywk223/codex-plugin-unlocker) — Codex Desktop Plugins 解锁注入脚本(React Context-value 反查 + DOM enable + MutationObserver,MIT)
 - [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) — 阿里官方 Qwen CLI,百炼 Token Plan (`*.maas.aliyuncs.com`) 模型清单硬编码模式(`packages/cli/src/auth/providers/alibaba/tokenPlan.ts` 的 `TOKEN_PLAN_MODELS`,Apache-2.0)
 - [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows MSIX Codex Desktop CDP 注入路径(`IApplicationActivationManager` COM + AUMID 自动解析 + cmdline 序列化,`codex_session_delete/launcher.py`,MIT)
+- [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — Codex 资产管理"受管块"设计:marker + parse/preview/apply/rollback/clear/history 六操作 + Protected 模式(`src-tauri/src/core/custom_instructions.rs:1-130`,MIT)— 本项目 `src-tauri/src/admin/services/managed_block.rs` 借鉴算法,marker prefix 改 `cas:` 项目独立
 
 ### 社区贡献者
 

@@ -2,9 +2,11 @@
 id: 24
 priority: P2
 type: research
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+related_pr: 206, 229
+resolved_pr: 206, 229
+resolved_date: 2026-05-20
 ---
 
 # #24 RFC: Codex 全局 AGENTS.md / 配置文件"受管块"管理(借鉴 AiMaMi)

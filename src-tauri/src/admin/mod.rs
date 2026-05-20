@@ -11,6 +11,7 @@
 
 pub mod handlers;
 pub mod registry_io;
+pub mod services;
 pub mod signature;
 pub mod state;
 pub mod static_files;
@@ -171,6 +172,92 @@ pub fn build_app_router(state: AdminState) -> Router {
         .merge(handlers::plugin_unlock::routes())
         // Antigravity OAuth (login / status / logout / cancel)
         .merge(handlers::antigravity_oauth::routes())
+        // Codex AGENTS.md 受管块管理(#24 / #25 Agents tab MVP, 借鉴 borawong/AiMaMi)
+        .route(
+            "/api/codex/agents-md/status",
+            get(handlers::agents_md::status),
+        )
+        .route(
+            "/api/codex/agents-md/preview",
+            post(handlers::agents_md::preview),
+        )
+        .route(
+            "/api/codex/agents-md/apply",
+            post(handlers::agents_md::apply),
+        )
+        .route(
+            "/api/codex/agents-md/rollback",
+            post(handlers::agents_md::rollback),
+        )
+        .route(
+            "/api/codex/agents-md/clear",
+            post(handlers::agents_md::clear),
+        )
+        .route(
+            "/api/codex/agents-md/history",
+            get(handlers::agents_md::history),
+        )
+        // MCP servers 受管块 (#24 #25 PR-A, config.toml TOML 变种)
+        .route(
+            "/api/codex/mcp-toml/status",
+            get(handlers::mcp_toml::status),
+        )
+        .route(
+            "/api/codex/mcp-toml/preview",
+            post(handlers::mcp_toml::preview),
+        )
+        .route("/api/codex/mcp-toml/apply", post(handlers::mcp_toml::apply))
+        .route(
+            "/api/codex/mcp-toml/rollback",
+            post(handlers::mcp_toml::rollback),
+        )
+        .route("/api/codex/mcp-toml/clear", post(handlers::mcp_toml::clear))
+        .route(
+            "/api/codex/mcp-toml/history",
+            get(handlers::mcp_toml::history),
+        )
+        // Memories 受管块 (#25 ~/.codex/memories/MEMORY.md 层次化索引)
+        .route(
+            "/api/codex/memories-md/status",
+            get(handlers::memories_md::status),
+        )
+        .route(
+            "/api/codex/memories-md/preview",
+            post(handlers::memories_md::preview),
+        )
+        .route(
+            "/api/codex/memories-md/apply",
+            post(handlers::memories_md::apply),
+        )
+        .route(
+            "/api/codex/memories-md/rollback",
+            post(handlers::memories_md::rollback),
+        )
+        .route(
+            "/api/codex/memories-md/clear",
+            post(handlers::memories_md::clear),
+        )
+        .route(
+            "/api/codex/memories-md/history",
+            get(handlers::memories_md::history),
+        )
+        // Skills file-snapshot backup / restore (#24 #25 PR-B)
+        .route(
+            "/api/codex/skills/list",
+            get(handlers::skills::list_handler),
+        )
+        .route(
+            "/api/codex/skills/backup",
+            post(handlers::skills::backup_handler),
+        )
+        .route(
+            "/api/codex/skills/backups",
+            get(handlers::skills::backups_handler),
+        )
+        .route(
+            "/api/codex/skills/restore",
+            post(handlers::skills::restore_handler),
+        )
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)
