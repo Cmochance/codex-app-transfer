@@ -52,6 +52,8 @@ pub enum ManagedBlockError {
     HistoryAccess(String),
     /// JSON 解析 / 序列化失败 (history snapshot 文件 schema 损坏)
     Serialization(String),
+    /// Protected 模式下检测到外围用户手写区被外部修改了
+    ProtectedCollision(String),
 }
 
 impl std::fmt::Display for ManagedBlockError {
@@ -66,6 +68,9 @@ impl std::fmt::Display for ManagedBlockError {
             }
             ManagedBlockError::Serialization(e) => {
                 write!(f, "managed-block serialization failed: {e}")
+            }
+            ManagedBlockError::ProtectedCollision(e) => {
+                write!(f, "managed-block protected check failed: {e}")
             }
         }
     }
@@ -177,8 +182,24 @@ pub trait ManagedBlock {
         parse_markdown_managed_block(&content, &self.start_marker(), &self.end_marker())
     }
 
+    /// 验 new_content **不含** start/end marker 字符串 — 否则写盘后 file 出现
+    /// 嵌套 marker, 下次 parse 报 MalformedMarker (`matches().count() > 1`),
+    /// 锁住整个 managed block — 必须手工编辑 ~/.codex/AGENTS.md / config.toml
+    /// 才能恢复 (Devin Review #206 BUG_..._0001 报告的 file-corruption 路径)。
+    fn check_no_marker_in_content(&self, new_content: &str) -> Result<(), ManagedBlockError> {
+        let start = self.start_marker();
+        let end = self.end_marker();
+        if new_content.contains(&start) || new_content.contains(&end) {
+            return Err(ManagedBlockError::MalformedMarker(format!(
+                "content must not contain marker strings ({start}, {end}) — would nest the managed block and corrupt the file"
+            )));
+        }
+        Ok(())
+    }
+
     /// 算"如果 apply new_content 文件会变成什么样" —— 只返新文件内容,不写盘
     fn preview(&self, new_content: &str) -> Result<String, ManagedBlockError> {
+        self.check_no_marker_in_content(new_content)?;
         let mut parsed = self.parse()?;
         parsed.managed = Some(new_content.to_string());
         Ok(parsed.render(&self.start_marker(), &self.end_marker()))
@@ -193,8 +214,24 @@ pub trait ManagedBlock {
     ///   - P2 fix (codex-bot #206): atomicity — target write 失败时 pop 刚加的
     ///     history entry + best-effort 重写 history, 防止"history 多 1 条但 target
     ///     没变" 不一致 state
-    fn apply(&self, new_content: &str) -> Result<(), ManagedBlockError> {
+    fn apply(
+        &self,
+        new_content: &str,
+        expected_outer_signature: Option<&str>,
+    ) -> Result<(), ManagedBlockError> {
+        self.check_no_marker_in_content(new_content)?;
         let parsed = self.parse()?;
+
+        // Protected 模式校验: 如果检测到外围用户手写区在 apply 间隔内发生变化，主动跳过本次 apply 并报警告
+        if let Some(expected) = expected_outer_signature {
+            let current_sig = calculate_outer_signature(&parsed.before_user, &parsed.after_user);
+            if current_sig != expected {
+                return Err(ManagedBlockError::ProtectedCollision(
+                    "检测到外部修改了用户手写区，请刷新后重试以避免覆盖您的修改。 (External changes detected in user hand-written areas; please refresh to avoid overwriting)".to_string()
+                ));
+            }
+        }
+
         let old_managed = parsed.managed.clone().unwrap_or_default();
 
         // P1: propagate history corruption
@@ -372,6 +409,7 @@ pub trait ManagedBlock {
     fn status_json(&self) -> Result<Value, ManagedBlockError> {
         let parsed = self.parse()?;
         let history = self.read_history().unwrap_or_default();
+        let outer_sig = calculate_outer_signature(&parsed.before_user, &parsed.after_user);
         Ok(json!({
             "blockType": self.block_type(),
             "targetPath": self.target_path().display().to_string(),
@@ -379,6 +417,7 @@ pub trait ManagedBlock {
             "managedContent": parsed.managed.clone().unwrap_or_default(),
             "beforeUserBytes": parsed.before_user.len(),
             "afterUserBytes": parsed.after_user.len(),
+            "outerSignature": outer_sig,
             "historyCount": history.len(),
             "lastApply": history.last().map(|e| e.timestamp),
             "markerVersion": self.marker_version(),
@@ -505,6 +544,15 @@ pub fn parse_markdown_managed_block(
     })
 }
 
+pub fn calculate_outer_signature(before_user: &str, after_user: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(before_user.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(after_user.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -597,7 +645,7 @@ mod tests {
         fs::write(&target, "## User\n\noriginal\n").unwrap();
         let b = block(&target, &history);
 
-        b.apply("# managed v1\n- item 1\n- item 2").unwrap();
+        b.apply("# managed v1\n- item 1\n- item 2", None).unwrap();
         let after = fs::read_to_string(&target).unwrap();
         assert!(after.contains("<!-- cas:managed:agents:v1:start -->"));
         assert!(after.contains("# managed v1"));
@@ -631,8 +679,8 @@ mod tests {
         let (target, history) = tmp_paths();
         fs::write(&target, "user\n").unwrap();
         let b = block(&target, &history);
-        b.apply("v1").unwrap();
-        b.apply("v2").unwrap();
+        b.apply("v1", None).unwrap();
+        b.apply("v2", None).unwrap();
         // 状态: file managed = v2, history = [v0→v1, v1→v2]
         let hist = b.read_history().unwrap();
         assert_eq!(hist.len(), 2);
@@ -648,7 +696,7 @@ mod tests {
         let (target, history) = tmp_paths();
         fs::write(&target, "user\n").unwrap();
         let b = block(&target, &history);
-        b.apply("managed").unwrap();
+        b.apply("managed", None).unwrap();
         b.clear().unwrap();
         let parsed = b.parse().unwrap();
         assert!(parsed.managed.is_none(), "clear should remove marker");
@@ -666,7 +714,7 @@ mod tests {
         fs::write(&target, "user\n").unwrap();
         let b = block(&target, &history);
         for i in 0..(HISTORY_LIMIT + 5) {
-            b.apply(&format!("v{i}")).unwrap();
+            b.apply(&format!("v{i}"), None).unwrap();
         }
         let hist = b.read_history().unwrap();
         assert_eq!(
@@ -690,11 +738,33 @@ mod tests {
         assert_eq!(status["hasManaged"], false);
         assert_eq!(status["historyCount"], 0);
 
-        b.apply("content").unwrap();
+        b.apply("content", None).unwrap();
         let status = b.status_json().unwrap();
         assert_eq!(status["hasManaged"], true);
         assert_eq!(status["managedContent"], "content");
         assert_eq!(status["historyCount"], 1);
+        let _ = fs::remove_dir_all(target.parent().unwrap());
+    }
+
+    #[test]
+    fn apply_with_matching_signature_succeeds_and_mismatch_fails() {
+        let (target, history) = tmp_paths();
+        fs::write(&target, "## User\n\noriginal\n").unwrap();
+        let b = block(&target, &history);
+        
+        let parsed = b.parse().unwrap();
+        let sig = calculate_outer_signature(&parsed.before_user, &parsed.after_user);
+        
+        // 1. Correct signature succeeds
+        b.apply("managed 1", Some(&sig)).unwrap();
+        
+        // 2. Modify target externally
+        fs::write(&target, "## User\n\nmodified externally\n<!-- cas:managed:agents:v1:start -->\nmanaged 1\n<!-- cas:managed:agents:v1:end -->\n").unwrap();
+        
+        // 3. Applying with old signature fails due to ProtectedCollision
+        let err = b.apply("managed 2", Some(&sig)).unwrap_err();
+        assert!(matches!(err, ManagedBlockError::ProtectedCollision(_)));
+        
         let _ = fs::remove_dir_all(target.parent().unwrap());
     }
 

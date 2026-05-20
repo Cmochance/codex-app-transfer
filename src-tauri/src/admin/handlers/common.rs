@@ -20,9 +20,10 @@ use super::super::state::AdminState;
 pub(super) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(super) fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    let msg_str = msg.into();
     (
         status,
-        Json(json!({"success": false, "message": msg.into()})),
+        Json(json!({"success": false, "error": msg_str, "message": msg_str})),
     )
 }
 

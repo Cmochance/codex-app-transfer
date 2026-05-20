@@ -14,7 +14,7 @@ use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::super::services::managed_block::{ManagedBlock, MarkdownManagedBlock};
+use super::super::services::managed_block::{ManagedBlock, ManagedBlockError, MarkdownManagedBlock};
 use super::common::err;
 
 /// 解析 `~/` 路径(支持 macOS / Linux / Windows USERPROFILE)
@@ -43,8 +43,10 @@ fn build_block() -> Result<MarkdownManagedBlock, String> {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ApplyInput {
     pub content: String,
+    pub expected_outer_signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -90,12 +92,18 @@ pub async fn apply(Json(input): Json<ApplyInput>) -> impl IntoResponse {
         Ok(b) => b,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    match block.apply(&input.content) {
+    match block.apply(&input.content, input.expected_outer_signature.as_deref()) {
         Ok(()) => match block.status_json() {
             Ok(v) => Json(json!({"success": true, "status": v})).into_response(),
             Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            let status = match e {
+                ManagedBlockError::ProtectedCollision(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            err(status, e.to_string()).into_response()
+        }
     }
 }
 

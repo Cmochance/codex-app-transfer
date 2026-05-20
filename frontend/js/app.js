@@ -2929,8 +2929,13 @@
       <strong>目标文件:</strong> <code>${escapeHtml(status.targetPath || "")}</code>
     </p>`;
     const ta = $("#codexBlockContent");
-    if (ta && status.managedContent !== undefined && !ta.dataset.dirty) {
-      ta.value = status.managedContent || "";
+    if (ta) {
+      if (status.outerSignature !== undefined) {
+        ta.dataset.outerSignature = status.outerSignature;
+      }
+      if (status.managedContent !== undefined && !ta.dataset.dirty) {
+        ta.value = status.managedContent || "";
+      }
     }
   }
 
@@ -2951,17 +2956,22 @@
   }
 
   async function codexBlockApply(type) {
-    const content = $("#codexBlockContent")?.value ?? "";
+    const ta = $("#codexBlockContent");
+    const content = ta?.value ?? "";
+    const expectedOuterSignature = ta?.dataset?.outerSignature || null;
+    const body = { content };
+    if (expectedOuterSignature) {
+      body.expectedOuterSignature = expectedOuterSignature;
+    }
     const r = await fetch(`${codexBlockUrl(type)}/apply`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       throw new Error(err.error || "apply failed");
     }
-    const ta = $("#codexBlockContent");
     if (ta) delete ta.dataset.dirty;
     await codexBlockLoadAndRender(type);
     showToast(`${type} 受管块已 apply`);
