@@ -14,7 +14,7 @@ use super::super::registry_io::load as load_registry;
 use super::super::state::AdminState;
 use super::common::{err, generate_gateway_key_value, open_directory};
 
-pub(super) fn read_proxy_port(cfg: &RawConfig) -> u16 {
+pub(crate) fn read_proxy_port(cfg: &RawConfig) -> u16 {
     cfg.get("settings")
         .and_then(|s| s.get("proxyPort"))
         .and_then(|v| v.as_u64())
@@ -23,21 +23,21 @@ pub(super) fn read_proxy_port(cfg: &RawConfig) -> u16 {
 }
 
 /// 读 `settings.codexNetworkAccess`,默认 `true`(#212)。
-pub(super) fn read_codex_network_access(cfg: &RawConfig) -> bool {
+pub(crate) fn read_codex_network_access(cfg: &RawConfig) -> bool {
     cfg.get("settings")
         .and_then(|s| s.get("codexNetworkAccess"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
 }
 
-pub(super) fn read_gateway_key(cfg: &RawConfig) -> String {
+pub(crate) fn read_gateway_key(cfg: &RawConfig) -> String {
     cfg.get("gatewayApiKey")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_owned()
 }
 
-pub(super) fn ensure_gateway_key(cfg: &mut RawConfig) -> String {
+pub(crate) fn ensure_gateway_key(cfg: &mut RawConfig) -> String {
     let existing = read_gateway_key(cfg);
     if !existing.is_empty() {
         return existing;
@@ -49,7 +49,7 @@ pub(super) fn ensure_gateway_key(cfg: &mut RawConfig) -> String {
     gateway_key
 }
 
-pub(super) async fn start_proxy_if_needed(
+pub(crate) async fn start_proxy_if_needed(
     manager: &ProxyManager,
     port: u16,
 ) -> Result<bool, String> {

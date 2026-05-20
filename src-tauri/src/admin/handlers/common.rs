@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use super::super::registry_io::{load as load_registry, public_provider};
 use super::super::state::AdminState;
 
-pub(super) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(super) fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     let msg_str = msg.into();
@@ -47,7 +47,7 @@ pub(super) fn open_directory(path: &PathBuf) -> Result<(), String> {
         .map_err(|e| format!("cannot open log directory: {e}"))
 }
 
-pub(super) fn active_provider_name(config: &Value) -> String {
+pub(crate) fn active_provider_name(config: &Value) -> String {
     let active_id = config.get("activeProvider").and_then(|v| v.as_str());
     config
         .get("providers")
@@ -73,7 +73,7 @@ pub(super) fn current_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-pub(super) fn read_setting_bool(cfg: &RawConfig, key: &str, default: bool) -> bool {
+pub(crate) fn read_setting_bool(cfg: &RawConfig, key: &str, default: bool) -> bool {
     cfg.get("settings")
         .and_then(|settings| settings.get(key))
         .and_then(|v| v.as_bool())

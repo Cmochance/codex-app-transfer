@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-pub(super) fn fresh_provider_id(existing: &[String]) -> String {
+pub(crate) fn fresh_provider_id(existing: &[String]) -> String {
     loop {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -39,7 +39,7 @@ pub(super) fn fresh_provider_id(existing: &[String]) -> String {
     }
 }
 
-pub(super) fn provider_supports_1m(provider: &Value) -> bool {
+pub(crate) fn provider_supports_1m(provider: &Value) -> bool {
     let default_raw = provider
         .get("models")
         .and_then(|m| m.get("default"))
@@ -48,7 +48,7 @@ pub(super) fn provider_supports_1m(provider: &Value) -> bool {
     model_supports_1m(default_raw, provider.get("modelCapabilities"))
 }
 
-pub(super) fn provider_default_model(provider: &Value) -> String {
+pub(crate) fn provider_default_model(provider: &Value) -> String {
     let raw = provider
         .get("models")
         .and_then(|m| m.get("default"))
@@ -57,18 +57,18 @@ pub(super) fn provider_default_model(provider: &Value) -> String {
     strip_internal_model_suffix(raw)
 }
 
-pub(super) fn provider_model_mappings(provider: &Value) -> Value {
+pub(crate) fn provider_model_mappings(provider: &Value) -> Value {
     provider.get("models").cloned().unwrap_or_else(|| json!({}))
 }
 
-pub(super) fn provider_model_capabilities(provider: &Value) -> Value {
+pub(crate) fn provider_model_capabilities(provider: &Value) -> Value {
     provider
         .get("modelCapabilities")
         .cloned()
         .unwrap_or_else(|| json!({}))
 }
 
-pub(super) fn provider_display_name(provider: &Value) -> String {
+pub(crate) fn provider_display_name(provider: &Value) -> String {
     provider
         .get("name")
         .and_then(|v| v.as_str())
@@ -164,7 +164,7 @@ mod tests {
     }
 }
 
-pub(super) fn provider_api_key(provider: &Value) -> String {
+pub(crate) fn provider_api_key(provider: &Value) -> String {
     provider
         .get("apiKey")
         .and_then(|v| v.as_str())
@@ -191,7 +191,7 @@ pub(super) fn provider_test_model(provider: &Value) -> String {
     "claude-sonnet-4-6".to_owned()
 }
 
-pub(super) fn provider_index(cfg: &RawConfig, id: &str) -> Option<usize> {
+pub(crate) fn provider_index(cfg: &RawConfig, id: &str) -> Option<usize> {
     cfg.get("providers")
         .and_then(|v| v.as_array())?
         .iter()
@@ -203,7 +203,7 @@ pub(super) fn provider_index(cfg: &RawConfig, id: &str) -> Option<usize> {
         })
 }
 
-pub(super) fn active_provider(cfg: &RawConfig) -> Option<Value> {
+pub(crate) fn active_provider(cfg: &RawConfig) -> Option<Value> {
     let active_id = cfg
         .get("activeProvider")
         .and_then(|v| v.as_str())
