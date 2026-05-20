@@ -83,7 +83,6 @@ related_pr: <PR# 或 null>
 - [#24 P2 RFC: Codex AGENTS.md / config.toml 受管块管理(借鉴 AiMaMi)](followup/24-codex-agents-md-managed-block.md) — Q3 四合一管理页的底层基础,marker + history + Protected 模式
 - [#25 P2 MCP / Skills / Memories / Agents 四合一管理页(借鉴 AiMaMi)](followup/25-codex-mgmt-four-in-one-page.md) — 用户 Q3 需求,sidebar+lazy+tanstack-query,依赖 #24
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
-- [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,**PR #191 已实施 Method 1 (COM activation) 核心 + 本 PR 实施 PowerShell CIM 进程清理替 taskkill (绕 MSIX access-denied)**;P2 剩端口冲突探测 + 非-Store .exe fallback
 
 ---
 
@@ -96,11 +95,13 @@ related_pr: <PR# 或 null>
 - ~~#29 账号还原:cleanup_all=true 物理删光所有 snapshot~~ → PR #194 (2026-05-17),软删除 → trash/ + 30 天 GC 堵核心 P0;dry-run preview + UI 二次确认 enhancement 微小不开新 followup
 - ~~#30 账号还原:snapshot 单点存储无冗余 / 无导出入口~~ → PR #201 (2026-05-17),跨平台 external_backup_dir 自动镜像(macOS / Windows / Linux)堵核心 P1;UI 导出/导入按钮 enhancement 真有需求再开新 followup
 - ~~#31 账号还原:跨版本 MANAGED_KEYS 升级误删用户 key~~ → **dropped 2026-05-17**,false alarm:整文件 cp 已保留任何 root key,managed list 只影响 restore 操作不影响存储
+- ~~#38 P2 macOS Codex seatbelt 静默忽略 config.toml network_access~~ → PR #215 (2026-05-20),改用 Codex 官方 "Full access" 配对(danger-full-access + never)绕过,不再依赖 [sandbox_workspace_write].network_access 字段;上游 issue 仍 Open 但本项目已不受影响
 - ~~#34 客户端 latest.json + installer RSA 验签~~ → PR #197 (2026-05-17),公钥 build-time embed + verify_signed_bytes 接 fetch_latest_json + download_asset_impl,8 单测覆盖
 - ~~#37 update.rs download_asset_impl: in-memory bytes 防 TOCTOU + 重 add bad-sha256 mismatch 单测~~ → PR #199 (2026-05-17),完全 skip partial 文件消除 verify→rename race + verify_installer_sha256 抽函数 5-case 单测 + 500MB hard cap + 4xx/5xx 错误分类不附 URL
 - ~~#26 Plugins / MCP 跟"协议转发"绑定 UI/README 显式提示~~ → PR #205 (2026-05-18),i18n autoUnlockCodexPluginsHint 加协议路径生效说明 + README 兼容矩阵 ⚠️ 备注;provider 表单 inline warning enhancement 留 followup
 - ~~#35 macOS update translocation / quarantine 前置检查~~ → PR #205 (2026-05-18),macos_translocation_precheck (update_install 入口早期 reject) + macos_strip_quarantine (launch 前 xattr -d) 借鉴 AiMaMi update.rs:47-113
 - ~~#36 Windows update 走 NSIS /D=install_dir 保持安装目录~~ → PR #205 (2026-05-18),install_command_parts Windows 分支追 /D=<current_exe parent> + current_exe_parent_dir helper 借鉴 AiMaMi update.rs:7-23
+- ~~#33 P1 Plugin Unlock Windows MSIX 启动限制~~ → PR #191 / #194 / #201 (v2.1.11) + PR #227 (2026-05-20),P1 主体 + P2 Task 1 端口冲突探测全实施;P2 Task 2 非-Store .exe fallback **dropped**(只针对官方 Store 用户 scope,能直装 .exe 的用户能自己跑 Codex.exe --remote-debugging-port 启动,不需要本工具适配;issue #226 closed)
 
 <!-- 示例:
 - ~~#25 cloud_code Gemini mapper 漏配 session_cache~~ → PR #146 (2026-05-13)

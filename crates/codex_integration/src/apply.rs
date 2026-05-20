@@ -11,9 +11,9 @@ use crate::paths::CodexPaths;
 use crate::snapshot::{
     drop_all_snapshots, drop_snapshot, drop_snapshot_by_id, has_snapshot, list_snapshots,
     read_snapshot_auth, read_snapshot_auth_by_id, read_snapshot_config, read_snapshot_config_by_id,
-    snapshot_codex_state, snapshot_toml_value_literal,
+    snapshot_codex_state, snapshot_table_field_literal, snapshot_toml_value_literal,
 };
-use crate::toml_sync::{sync_root_value, toml_string_literal};
+use crate::toml_sync::{sync_root_value, sync_table_field, toml_string_literal};
 use crate::CodexError;
 
 /// 我们 apply 时实际触碰的 auth 字段(restore 时只动这些,其它字段保留)。
@@ -26,7 +26,24 @@ const MANAGED_TOML_KEYS: &[&str] = &[
     CODEX_MODEL_CATALOG_KEY,
     "model",
     "model_provider",
+    // #212 / #215:`sandbox_mode` + `approval_policy` 一对(Codex docs "Full
+    // access" 配对:`danger-full-access` + `never`)。toggle on 写两条让
+    // 模型完全无审批联网;off 时全 strip 让 Codex 回 default(read-only +
+    // on-request)。仅写 sandbox_mode 不够 —— Codex 默认 approval_policy =
+    // OnRequest(`protocol.rs::AskForApproval` `#[default] OnRequest`),
+    // 即便 sandbox 允许,Codex `is_safe_command()` 不认的命令仍弹审批。
+    "sandbox_mode",
+    "approval_policy",
 ];
+
+/// 我们 apply 时实际触碰的 `[section]` 段内字段。restore 时按 `(section, key)`
+/// 逐个 strip,**保留** section header 跟其它用户 key,避免误删。
+///
+/// #212 起加 `sandbox_workspace_write.network_access`(用 TOML section-table
+/// 形式写,跟 Codex docs / `codex exec` 输出对齐;**不可** 用 root-level dotted
+/// key 形式,会跟用户已有 `[sandbox_workspace_write]` 段并存触发 duplicate
+/// table parse error,详见 [`crate::toml_sync::sync_table_field`])。
+const MANAGED_TOML_TABLE_FIELDS: &[(&str, &str)] = &[("sandbox_workspace_write", "network_access")];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyConfig<'a> {
@@ -51,6 +68,10 @@ pub struct ApplyConfig<'a> {
     pub model_capabilities: Option<&'a serde_json::Value>,
     /// 应用版本(写入快照 manifest,便于诊断)。
     pub app_version: &'a str,
+    /// 是否允许 Codex shell 工具网络访问(写入 `[sandbox_workspace_write]
+    /// network_access` section field)。控制小白用户能否用 `curl` 等命令联网。
+    /// Caller 从 `Settings.codex_network_access`(默认 `true`)读取(#212)。
+    pub codex_network_access: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,6 +105,47 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // 从 /v1/responses 切到 /responses,在残留路径上直接表现为 404(issue #178)。
     // 快照已在第 1 步拿到用户原值,restore 时能完整退回。
     sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
+
+    // 2c. **#212/#215 Codex 联网默认开**(Codex docs "Full access" 配对):
+    // 之前 #212 用 workspace-write + network_access 真机仍弹审批弹窗 ——
+    // Codex 默认 `approval_policy = OnRequest`(`protocol.rs::AskForApproval`
+    // 的 `#[default] OnRequest`),sandbox 允许 ≠ 不弹窗,`is_safe_command()`
+    // 把 curl 等判定"非 safe" 仍 escalate user 审批。#215 改 Codex 官方
+    // 推荐的 "Full access" 配对:`sandbox_mode = danger-full-access` +
+    // `approval_policy = never`,模型完全无审批 + 全部 sandbox 限制解除。
+    //
+    // toggle on:写 sandbox_mode + approval_policy,strip 之前 #212 可能
+    //   写入的 `[sandbox_workspace_write] network_access` 残留(避免 stale
+    //   entry 让 user 误以为还走 workspace-write)
+    // toggle off:strip 全部三条,让 Codex 回 default(read-only + on-request)
+    //
+    // **Trade-off**:full-access + never 模型可读写任何文件 + 联网无审批
+    // (Codex docs: "Full access means `danger-full-access` together with
+    // `never`")。toggle 默认 on 接受 prompt-injection 风险换"小白开箱用",
+    // 专业用户 toggle off 自己回 Codex default 沙箱。
+    if cfg.codex_network_access {
+        sync_root_value(
+            &paths.config_toml,
+            "sandbox_mode",
+            Some("\"danger-full-access\""),
+        )?;
+        sync_root_value(&paths.config_toml, "approval_policy", Some("\"never\""))?;
+        sync_table_field(
+            &paths.config_toml,
+            "sandbox_workspace_write",
+            "network_access",
+            None,
+        )?;
+    } else {
+        sync_root_value(&paths.config_toml, "sandbox_mode", None)?;
+        sync_root_value(&paths.config_toml, "approval_policy", None)?;
+        sync_table_field(
+            &paths.config_toml,
+            "sandbox_workspace_write",
+            "network_access",
+            None,
+        )?;
+    }
 
     // 3. config.toml: model_context_window(旧版兼容) + model_catalog_json(Codex 0.128+)
     //
@@ -207,6 +269,9 @@ fn clear_managed_codex_state(paths: &CodexPaths) -> Result<(), CodexError> {
     for key in MANAGED_TOML_KEYS {
         sync_root_value(&paths.config_toml, key, None)?;
     }
+    for (section, key) in MANAGED_TOML_TABLE_FIELDS {
+        sync_table_field(&paths.config_toml, section, key, None)?;
+    }
     clear_catalog_models(&paths.model_catalog_json)?;
     if paths.auth_json.exists() {
         let mut auth = read_auth(&paths.auth_json)?;
@@ -242,6 +307,14 @@ fn restore_from_snapshot_values(
             ("model", None, RestoreMode::Auto) => continue,
             _ => sync_root_value(&paths.config_toml, key, literal.as_deref())?,
         }
+    }
+
+    // #212:table-form managed 字段,从快照对应 section body 还原字面量;
+    // 快照里没有(用户原本没配 sandbox 段)→ 删 key,保留 section
+    // (用户其它 key 可能还在,详见 `sync_table_field` doc)。
+    for (section, key) in MANAGED_TOML_TABLE_FIELDS {
+        let literal = snapshot_table_field_literal(snapshot_config, section, key);
+        sync_table_field(&paths.config_toml, section, key, literal.as_deref())?;
     }
 
     // 2. auth.json:对每个 managed key,快照里有就改回快照值,没有就 remove
@@ -299,6 +372,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v2.0.0-stage2.5",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -313,10 +387,290 @@ mod tests {
         assert!(!toml.contains("model_context_window"));
         // model_catalog_json 始终在 config.toml 里
         assert!(toml.contains("model_catalog_json"));
+        // #215: codex_network_access=true 写 danger-full-access + never
+        //(Codex docs "Full access" 配对,真正无审批弹窗联网)
+        assert!(toml.contains("sandbox_mode = \"danger-full-access\""));
+        assert!(toml.contains("approval_policy = \"never\""));
+        // strip 之前 #212 可能写过的 workspace_write.network_access(stale)
+        assert!(!toml.contains("network_access"));
 
         let auth = read_auth_value(&paths);
         assert_eq!(auth["auth_mode"], "apikey");
         assert_eq!(auth["OPENAI_API_KEY"], "cas_test");
+    }
+
+    /// #212 covering test:**toggle off 时 strip 两条**(sandbox_mode +
+    /// network_access),让 Codex 回 default read-only。不能像之前 explicit
+    /// 写 false —— 单留 false 仍可能让 sandbox_mode 残留 workspace-write,
+    /// 跟 toggle off 的语义("回原默认 sandbox")不一致。
+    #[test]
+    fn apply_with_network_access_false_strips_both_keys() {
+        let (_t, paths) = setup();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: false,
+            },
+        )
+        .unwrap();
+        let toml = read_toml(&paths);
+        assert!(
+            !toml.contains("sandbox_mode"),
+            "toggle off 应 strip sandbox_mode(回 Codex default read-only): {toml}"
+        );
+        assert!(
+            !toml.contains("approval_policy"),
+            "toggle off 应 strip approval_policy(回 Codex default on-request): {toml}"
+        );
+        assert!(
+            !toml.contains("network_access"),
+            "toggle off 应 strip network_access: {toml}"
+        );
+    }
+
+    /// #212 防 BLOCKER 回归:apply 后 config.toml 必须可被 `toml` crate 正常
+    /// parse;如果未来谁改回 root-level dotted key 形式跟用户原 [section]
+    /// 并存,会触发 duplicate table 让此测试 fail。
+    #[test]
+    fn apply_output_parses_with_pre_existing_sandbox_section() {
+        let (_t, paths) = setup();
+        // 模拟用户已显式配 [sandbox_workspace_write] 段(Codex docs 推荐形式)
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(
+            &paths.config_toml,
+            "model_provider = \"openai\"\n\n[sandbox_workspace_write]\nexclude_tmpdir_env_var = false\nexclude_slash_tmp = false\n",
+        )
+        .unwrap();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+            },
+        )
+        .unwrap();
+        let toml_str = read_toml(&paths);
+        // 必须可 parse(无 duplicate table)
+        let parsed: toml::Value =
+            toml::from_str(&toml_str).expect("output 必须是合法 TOML, 否则 Codex CLI 加载会失败");
+        // #215: 写 root-level danger-full-access + never,不再 touch
+        // [sandbox_workspace_write] section,用户原 section + keys 完整保留
+        assert_eq!(
+            parsed.get("sandbox_mode").and_then(|v| v.as_str()),
+            Some("danger-full-access")
+        );
+        assert_eq!(
+            parsed.get("approval_policy").and_then(|v| v.as_str()),
+            Some("never")
+        );
+        let section = parsed
+            .get("sandbox_workspace_write")
+            .and_then(|v| v.as_table())
+            .expect("用户原 section 必保留");
+        // network_access 既不在(没启 workspace-write 路径)
+        assert!(section.get("network_access").is_none());
+        assert_eq!(
+            section
+                .get("exclude_tmpdir_env_var")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            section.get("exclude_slash_tmp").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    /// #215 restore round-trip:apply (toggle on) 写 sandbox_mode + approval_policy
+    /// + strip network_access,restore 后**全部三条 managed 都 strip**,
+    /// 用户原 section header + 其它 keys 完整保留。
+    #[test]
+    fn restore_strips_managed_keys_keeps_user_section() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        // 用户原本只有 sandbox section + 其它 key,**没有** network_access
+        std::fs::write(
+            &paths.config_toml,
+            "[sandbox_workspace_write]\nexclude_tmpdir_env_var = false\n",
+        )
+        .unwrap();
+        codex_app_transfer_registry::save_raw_config(
+            &paths.model_catalog_json,
+            &json!({"providers": []}),
+        )
+        .unwrap();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+            },
+        )
+        .unwrap();
+        let after_apply = read_toml(&paths);
+        assert!(after_apply.contains("sandbox_mode = \"danger-full-access\""));
+        assert!(after_apply.contains("approval_policy = \"never\""));
+        assert!(
+            !after_apply.contains("network_access"),
+            "apply (toggle on) 不应写 network_access (走 full-access 路径不需要): {after_apply}"
+        );
+        // restore 应去掉 sandbox_mode + approval_policy,保留 section + 用户原 key
+        restore_codex_state(&paths).unwrap();
+        let restored = read_toml(&paths);
+        assert!(
+            !restored.contains("sandbox_mode"),
+            "restore 应 strip sandbox_mode: {restored}"
+        );
+        assert!(
+            !restored.contains("approval_policy"),
+            "restore 应 strip approval_policy: {restored}"
+        );
+        assert!(
+            restored.contains("[sandbox_workspace_write]"),
+            "section header 必须保留: {restored}"
+        );
+        assert!(
+            restored.contains("exclude_tmpdir_env_var = false"),
+            "用户原 key 必须保留: {restored}"
+        );
+    }
+
+    /// #212 Devin BLOCKER 防回归:用户原 config 用 **root-level dotted key 形式**
+    /// `sandbox_workspace_write.network_access = false`(合法 TOML 等价形式)→
+    /// snapshot read 路径必须识别此形式,否则 restore 返 None → caller 误删
+    /// 用户原行 → 用户 security 设置永久丢失。
+    #[test]
+    fn restore_preserves_user_dotted_root_form_network_access() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        // 用户用 dotted root 形式显式配 false(合法 TOML)
+        std::fs::write(
+            &paths.config_toml,
+            "sandbox_workspace_write.network_access = false\n",
+        )
+        .unwrap();
+        codex_app_transfer_registry::save_raw_config(
+            &paths.model_catalog_json,
+            &json!({"providers": []}),
+        )
+        .unwrap();
+        // #215: apply (toggle on) strip 用户原 dotted network_access(走
+        // full-access 路径),restore 必须恢复用户原 false,**不**永久丢失
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+            },
+        )
+        .unwrap();
+        let after_apply = read_toml(&paths);
+        assert!(
+            !after_apply.contains("network_access"),
+            "apply (toggle on full-access) 应 strip 用户原 dotted network_access: {after_apply}"
+        );
+        // restore 必须恢复用户原 false 语义(不论是 dotted form 还是 section
+        // form,TOML 两种等价 —— 当前 restore impl 走 section form 写回,
+        // 关键是 value=false 恢复了,**不**永久丢失)
+        restore_codex_state(&paths).unwrap();
+        let restored = read_toml(&paths);
+        let parsed: toml::Value =
+            toml::from_str(&restored).expect("restored output 必须是合法 TOML");
+        let actual = parsed
+            .get("sandbox_workspace_write")
+            .and_then(|v| v.get("network_access"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(
+            actual,
+            Some(false),
+            "restore 必须恢复用户原 network_access=false 语义: {restored}"
+        );
+        assert_eq!(
+            restored.matches("network_access").count(),
+            1,
+            "只一行 network_access: {restored}"
+        );
+    }
+
+    /// #212 restore round-trip:快照里**有** network_access(用户原显式配过) →
+    /// restore 后恢复用户原值(不被我们的 default-on 污染)。
+    #[test]
+    fn restore_brings_back_user_network_access_value() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        // 用户原本显式配了 network_access = false(出于安全考虑)
+        std::fs::write(
+            &paths.config_toml,
+            "[sandbox_workspace_write]\nnetwork_access = false\n",
+        )
+        .unwrap();
+        codex_app_transfer_registry::save_raw_config(
+            &paths.model_catalog_json,
+            &json!({"providers": []}),
+        )
+        .unwrap();
+        // #215: apply (toggle on) strip 用户原 section network_access
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+            },
+        )
+        .unwrap();
+        let after_apply = read_toml(&paths);
+        assert!(
+            !after_apply.contains("network_access"),
+            "apply (toggle on full-access) 应 strip 用户原 section network_access: {after_apply}"
+        );
+        // restore 应恢复 false
+        restore_codex_state(&paths).unwrap();
+        let restored = read_toml(&paths);
+        assert!(
+            restored.contains("network_access = false"),
+            "restore 应恢复用户显式配的 false: {restored}"
+        );
+        assert_eq!(
+            restored.matches("network_access").count(),
+            1,
+            "唯一一行 network_access: {restored}"
+        );
     }
 
     #[test]
@@ -333,6 +687,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -376,6 +731,7 @@ mod tests {
                 model_mappings: Some(&mappings),
                 model_capabilities: Some(&capabilities),
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -410,6 +766,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -426,6 +783,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -473,6 +831,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -514,6 +873,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -574,6 +934,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -646,6 +1007,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v-active",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -710,6 +1072,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -726,6 +1089,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -756,6 +1120,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -778,6 +1143,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -807,6 +1173,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -842,6 +1209,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -885,6 +1253,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -935,6 +1304,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();
@@ -985,6 +1355,7 @@ mod tests {
                 model_mappings: None,
                 model_capabilities: None,
                 app_version: "v",
+                codex_network_access: true,
             },
         )
         .unwrap();

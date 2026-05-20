@@ -394,6 +394,11 @@ fn codex_model_template(
 }
 
 fn generic_model_template() -> Value {
+    // fix(#222): 工具支持字段反映 App Transfer adapter 的能力,不是上游模型的
+    // intrinsic 能力。所有走 chat-completions 转换的 provider 都经 adapter 拿到
+    // freeform apply_patch + 并行 tool calls 支持(see crates/adapters/src/
+    // responses/request.rs::convert_responses_tool_to_chat_tool)。如果以后接入
+    // 某个真的不支持 tool calls 的 provider,再加 per-provider opt-out。
     json!({
         "slug": "",
         "display_name": "",
@@ -404,7 +409,7 @@ fn generic_model_template() -> Value {
             {"effort": "medium", "description": "Balanced speed and reasoning depth"},
             {"effort": "high", "description": "Greater reasoning depth for complex tasks"}
         ],
-        "shell_type": "default",
+        "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": true,
         "priority": 10,
@@ -416,10 +421,10 @@ fn generic_model_template() -> Value {
         "default_reasoning_summary": "auto",
         "support_verbosity": false,
         "default_verbosity": null,
-        "apply_patch_tool_type": null,
+        "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text",
         "truncation_policy": {"mode": "bytes", "limit": 4000000},
-        "supports_parallel_tool_calls": false,
+        "supports_parallel_tool_calls": true,
         "supports_image_detail_original": false,
         "context_window": 258400,
         "max_context_window": 258400,
@@ -496,6 +501,31 @@ mod tests {
         assert_eq!(entry["supports_search_tool"], true);
         assert_eq!(entry["supports_reasoning_summaries"], true);
         assert_eq!(entry["web_search_tool_type"], "text_and_image");
+    }
+
+    #[test]
+    fn fallback_entry_declares_apply_patch_freeform_for_non_builtin_slug() {
+        // 回归保护(#222 修了 generic_model_template 但没加测试):
+        // Codex Desktop UI 选 default_model slug(如 `deepseek-v4-pro`)而非
+        // gpt-5.5 时,Codex CLI 读 catalog 中该 slug 的 entry。若
+        // `generic_model_template` 声明 `apply_patch_tool_type: null` →
+        // Codex CLI 完全不发 apply_patch 工具,但 system prompt 仍要求调用 →
+        // abort。fallback entry 必须声明 freeform,让 apply_patch 工具被注册。
+        let models = catalog_models_for_provider("DeepSeek", "deepseek-v4-pro", true, None, None);
+        let fallback = models
+            .iter()
+            .find(|m| m.slug == "deepseek-v4-pro")
+            .expect("default_model slug 的 fallback entry 必须存在");
+        let entry = model_to_json(fallback);
+
+        assert_eq!(
+            entry["apply_patch_tool_type"], "freeform",
+            "fallback entry 必须声明 apply_patch_tool_type=freeform,否则 Codex CLI 选此 slug 时 apply_patch 会全部 abort"
+        );
+        assert_eq!(
+            entry["supports_parallel_tool_calls"], true,
+            "fallback entry 应允许并行 tool call,与 codex_builtin slug 行为一致"
+        );
     }
 
     #[test]

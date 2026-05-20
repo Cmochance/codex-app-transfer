@@ -430,6 +430,13 @@
               <p class="settings-note" id="codexSnapshotStatus" data-i18n="settings.codexSnapshotStatusUnknown">正在读取快照状态…</p>
             </div>
           </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.codexNetworkAccess">允许 Codex 联网工具（全权限模式）</strong>
+            <div>
+              <label class="switch-label only-switch"><input type="checkbox" id="codexNetworkAccess" checked><span class="switch-ui"></span></label>
+              <p class="settings-note" data-i18n="settings.codexNetworkAccessHint">⚠️ 默认开启。让 Codex 走 danger-full-access 沙箱 + approval_policy=never（Codex 官方推荐的 "Full access" 配对）：模型可以读写任何文件、用 curl / wget 等联网命令获取实时网页，且所有命令无审批弹窗。**等于完全信任模型**。关闭后 Codex 回 read-only 沙箱 + on-request 审批：无网络，仅能用所选模型自带的 web_search 能力；若模型不支持 web_search，则完全无法联网搜索。</p>
+            </div>
+          </div>
           <div class="settings-row" hidden aria-hidden="true">
             <strong data-i18n="settings.exposeAllModels">Claude 模型菜单</strong>
             <label class="switch-label only-switch"><input type="checkbox" id="exposeAllProviderModels"><span class="switch-ui"></span></label>

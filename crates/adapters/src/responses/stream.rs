@@ -85,6 +85,11 @@ fn convert_chat_to_responses_stream_inner(
                     }
                     Some(Err(e)) => {
                         s.finished = true;
+                        // fix(#210): 流中断时也保存已累积的 session 历史,避免
+                        // 下一轮 `previous_response_id` 续轮时 cache miss →
+                        // `previous_response_not_found` → 对话彻底断裂。即使
+                        // 本轮 assistant 回复不完整,保留已有部分也好过全丢。
+                        save_response_session(&mut s);
                         return Some((Err(e), s));
                     }
                     None => {

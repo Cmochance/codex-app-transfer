@@ -627,7 +627,66 @@ fn dir_name(dir: &Path) -> Option<String> {
 /// 的字面量(可能包含两侧引号、整数无引号等);该字面量可直接喂回
 /// [`crate::toml_sync::sync_root_value`]。
 pub(crate) fn snapshot_toml_value_literal(content: &str, key: &str) -> Option<String> {
-    for line in content.lines() {
+    extract_literal_in_lines(content.lines(), key)
+}
+
+/// 解析快照 config.toml 中 `[section]` table 内某个 key 的字面量。
+///
+/// **读写对称**(2026-05-19 Devin BLOCKER 修):跟 `sync_table_field_in_memory`
+/// 对称识别两种合法 TOML 形式:
+/// 1. root-level dotted key `<section>.<key> = ...`
+/// 2. `[section]` table 内 `<key> = ...`
+///
+/// 之前只识别形式 2 → 若用户原 config 用形式 1 写,snapshot lookup 返 None
+/// → restore 把用户原行当作"没有"误删 → 用户原 security 设置丢失。
+///
+/// section header 匹配跟 `sync_table_field` 一致兼容尾部 `# comment`。
+pub(crate) fn snapshot_table_field_literal(
+    content: &str,
+    section: &str,
+    key: &str,
+) -> Option<String> {
+    // 形式 1:dotted root key 优先(若用户原 config 这么写,直接返字面量)
+    let dotted_key = format!("{section}.{key}");
+    if let result @ Some(_) = snapshot_toml_value_literal(content, &dotted_key) {
+        return result;
+    }
+
+    // 形式 2:`[section]` table body 内查找
+    let header = format!("[{section}]");
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| matches_section_header(l, &header))?;
+    let mut end = lines.len();
+    for (offset, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.trim_start().starts_with('[') {
+            end = offset;
+            break;
+        }
+    }
+    extract_literal_in_lines(lines[start + 1..end].iter().copied(), key)
+}
+
+/// section header 匹配:精确 `[section]` 或带尾部 `#` 注释。
+/// 与 `toml_sync::matches_section_header` 行为对称(跟 sync_table_field 同步)。
+fn matches_section_header(line: &str, header: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == header {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix(header) {
+        let rest = rest.trim_start();
+        return rest.is_empty() || rest.starts_with('#');
+    }
+    false
+}
+
+fn extract_literal_in_lines<'a, I: Iterator<Item = &'a str>>(
+    lines: I,
+    key: &str,
+) -> Option<String> {
+    for line in lines {
         let stripped = line.trim_start();
         if !stripped.starts_with(key) {
             continue;

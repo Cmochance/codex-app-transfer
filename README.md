@@ -152,6 +152,14 @@ start frontend/gallery.html       # Windows
 
 ## 常见问题
 
+### Codex 模型不能用 curl 等联网命令 / 弹审批弹窗
+
+本应用默认在 apply 时把 `sandbox_mode = "danger-full-access"` + `approval_policy = "never"` 同时写入 `~/.codex/config.toml`(Codex 官方推荐的 **"Full access" 配对**,跨平台真正无审批弹窗联网),小白用户开箱即用。可在 设置 → "允许 Codex 联网工具(全权限模式)" 开关里关闭(#215)。
+
+> **⚠️ 安全权衡**:full-access 模式模型可读写任何文件 + 所有命令无审批 = **完全信任模型**(等同 Codex 官方文档的 "Full access" 档位)。toggle off 后 Codex 回 read-only 沙箱 + on-request 审批,无网络,仅能用所选模型自带的 `web_search` 能力;若模型不支持 web_search 则完全无法联网搜索。
+
+v2.1.12 之前尝试用 `workspace-write` + `network_access = true` 路径,但 macOS [seatbelt bug #10390](https://github.com/openai/codex/issues/10390) 跟 Windows `is_safe_command()` 仍触发审批弹窗,都不彻底。#215 改用 Codex 官方 "Full access" 配对作为 toggle on 的语义。
+
 ### Codex CLI 提示 `404 Not Found url: http://127.0.0.1:18080/responses`
 
 老版本只有 `/v1/responses`,Codex CLI 0.126 起回退到 `/responses`(不带 `/v1/`)。本工具已加路由别名,更新到 v1.0.1+ 即可。
@@ -224,7 +232,8 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 - [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x 桌面壳骨架 + README 结构参考
 - [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — 协议双向转换思路
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` 架构基座
-- [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact prompt 蓝本
+- [`openai/codex`](https://github.com/openai/codex) — autocompact prompt 骨架 + compact 协议结构反查(Apache-2.0)
+- [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact prompt 锚定 bullet(All user messages verbatim + Next Step verbatim)
 - [`7as0nch/mimo2codex`](https://github.com/7as0nch/mimo2codex) — MiMo 协议借鉴
 - [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) — Gemini OAuth wire 参考
 - [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web 反向工程参考 + dynamic statsig 算法 + tool_calls flatten 模式

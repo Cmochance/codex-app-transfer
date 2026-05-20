@@ -1,9 +1,12 @@
-//! `~/.codex/config.toml` 根级别 key-value 同步.
+//! `~/.codex/config.toml` 增量同步(根级别 key + section table field).
 //!
 //! **不用真 TOML parser**:Codex CLI 用户可能在文件里写注释 / 多 section,
-//! 真 parser round-trip 会丢这些。我们做最小改动:
-//! 1. 删除所有现有的 root-level `<key> = ...` 行
-//! 2. 在第一个 `[section]` 标题之前插入新行;没有节则追加到末尾
+//! 真 parser round-trip 会丢这些。我们做最小行级改动:
+//!
+//! - [`sync_root_value`]:root-level `<key> = ...`(写在第一个 section 之前)
+//! - [`sync_table_field`]:`[section]` 内 `<key> = ...`(#212 起加,Codex
+//!   docs / `codex exec` 输出的标准形式,**不可** 用 root-level dotted key
+//!   形式跟 Codex 已有 `[section]` 段并存,会触发 TOML duplicate table error)
 //!
 //! 1:1 对齐 Python `_sync_codex_toml_value`(`backend/registry.py:872-903`)。
 
@@ -67,6 +70,130 @@ pub fn sync_root_value_in_memory(current: &str, key: &str, raw_value: Option<&st
 /// string 与 JSON string 的转义规则在常见字符上一致)。
 pub fn toml_string_literal(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
+}
+
+/// 在 `[section]` table 里 insert/replace `key = raw_value`,用 TOML
+/// **section table 形式**(Codex docs 推荐+exec 输出的标准形式)。
+///
+/// **为什么不用 root-level dotted key**(2026-05-19 #212 code-reviewer
+/// blocker 修):TOML 1.0 spec 禁止 dotted root key 跟同名 `[section]`
+/// 并存(`sandbox_workspace_write.foo = …` 隐式创建 `sandbox_workspace_write`
+/// table,后面再写 `[sandbox_workspace_write]` = duplicate table parse
+/// error)。Codex `[sandbox_workspace_write]` 在文档/`codex exec` 输出里
+/// 都是 section 形式,本 helper 跟它对齐,避免 mix-form 让 Codex CLI
+/// 加载 config.toml 失败。
+///
+/// 行为:
+/// - section + key 都存在 → 替换 `key = value` 那一行
+/// - section 在但 key 不在 → 在 section body 末尾(下一个 `[header]` 或
+///   EOF 前)插入 `key = value`
+/// - section 不在 → append `[section]\nkey = value` 到文件末尾
+/// - `raw_value = None` → 删 `key` 那一行,**保留** section(用户其它
+///   key 可能也在同 section)
+pub fn sync_table_field(
+    config_toml_path: &Path,
+    section: &str,
+    key: &str,
+    raw_value: Option<&str>,
+) -> Result<(), CodexError> {
+    let current = read_or_empty(config_toml_path)?;
+    let new_content = sync_table_field_in_memory(&current, section, key, raw_value);
+    write_atomic(config_toml_path, &new_content)?;
+    Ok(())
+}
+
+/// 纯函数版本,便于单测。详见 [`sync_table_field`]。
+pub fn sync_table_field_in_memory(
+    current: &str,
+    section: &str,
+    key: &str,
+    raw_value: Option<&str>,
+) -> String {
+    // **优先级 1**:用户已用 root-level **dotted key** 形式(等价合法 TOML,
+    // `sandbox_workspace_write.network_access = false`)。chatgpt-codex P2#2
+    // 反馈:若我们不识别此形式直接 append `[section]` 会跟 dotted key 隐式
+    // 定义的同名 table 撞 duplicate → 用户 config 失效。改成走 root-level
+    // 替换路径,保留用户原形式不破坏。
+    let dotted_key = format!("{section}.{key}");
+    if has_root_key_line(current, &dotted_key) {
+        return sync_root_value_in_memory(current, &dotted_key, raw_value);
+    }
+
+    let section_header = format!("[{section}]");
+    let mut lines: Vec<String> = current.lines().map(String::from).collect();
+
+    // **section header 匹配**:除精确 trim 匹配,**额外兼容尾部注释**
+    // (chatgpt-codex P2#1):`[sandbox_workspace_write] # local comment`
+    // TOML spec 合法,精确匹配 miss 后 append 会造成 duplicate。
+    let section_start = lines
+        .iter()
+        .position(|l| matches_section_header(l, &section_header));
+
+    if let Some(start_idx) = section_start {
+        // section body 结束位置:下一个 `[` 开头的 section header 或 EOF
+        let mut end_idx = lines.len();
+        for (offset, line) in lines.iter().enumerate().skip(start_idx + 1) {
+            if line.trim_start().starts_with('[') {
+                end_idx = offset;
+                break;
+            }
+        }
+        // 在 section body 内找 key
+        let key_offset = lines[start_idx + 1..end_idx]
+            .iter()
+            .position(|l| line_matches_root_key(l.trim_start(), key));
+
+        match (key_offset, raw_value) {
+            (Some(off), Some(v)) => {
+                lines[start_idx + 1 + off] = format!("{key} = {v}");
+            }
+            (Some(off), None) => {
+                lines.remove(start_idx + 1 + off);
+            }
+            (None, Some(v)) => {
+                lines.insert(end_idx, format!("{key} = {v}"));
+            }
+            (None, None) => {}
+        }
+    } else if let Some(v) = raw_value {
+        // section 不存在 → append `[section]\nkey = value` 到文件末尾,
+        // 前面留一行空行(若已有内容)以增强可读性。
+        if !lines.is_empty() && !lines.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
+            lines.push(String::new());
+        }
+        lines.push(section_header);
+        lines.push(format!("{key} = {v}"));
+    }
+
+    let mut result = lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// 检查 `current` 任一行是否是 root-level `<key> = ...` 形式。复用
+/// [`line_matches_root_key`] 的严格匹配规则(防 `foo_bar` 误匹 `foo`)。
+fn has_root_key_line(current: &str, key: &str) -> bool {
+    current
+        .lines()
+        .any(|line| line_matches_root_key(line.trim_start(), key))
+}
+
+/// section header 匹配:精确 `[section]` 或带尾部 `#` 注释。
+/// TOML spec 允许 `[section] # comment`,exact-string 比较会漏。
+fn matches_section_header(line: &str, header: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == header {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix(header) {
+        // header 后必须是空白 + 可选 `#` 注释才算同 section,避免误匹
+        // `[sandbox_workspace_write_alt]` 这种前缀同名 section。
+        let rest = rest.trim_start();
+        return rest.is_empty() || rest.starts_with('#');
+    }
+    false
 }
 
 fn line_matches_root_key(stripped_left: &str, key: &str) -> bool {
@@ -179,6 +306,174 @@ openai_base_url = \"old\"
     fn integer_value_no_quotes() {
         let out = sync_root_value_in_memory("", "model_context_window", Some("1000000"));
         assert_eq!(out, "model_context_window = 1000000\n");
+    }
+
+    // ── sync_table_field tests(#212)──────────────────────────────
+
+    #[test]
+    fn table_field_inserts_section_when_missing() {
+        let out = sync_table_field_in_memory(
+            "",
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        assert!(out.contains("[sandbox_workspace_write]"));
+        assert!(out.contains("network_access = true"));
+    }
+
+    #[test]
+    fn table_field_replaces_existing_key_in_section() {
+        let input = "[sandbox_workspace_write]\nnetwork_access = false\n";
+        let out = sync_table_field_in_memory(
+            input,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        assert!(out.contains("network_access = true"));
+        assert!(
+            !out.contains("network_access = false"),
+            "旧值必须被替换:{out}"
+        );
+        // 不重复 section header
+        assert_eq!(out.matches("[sandbox_workspace_write]").count(), 1);
+    }
+
+    #[test]
+    fn table_field_appends_key_to_existing_section() {
+        let input = "[sandbox_workspace_write]\nexclude_tmpdir_env_var = false\n";
+        let out = sync_table_field_in_memory(
+            input,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        // 保留用户原 key + 加新 key
+        assert!(out.contains("exclude_tmpdir_env_var = false"));
+        assert!(out.contains("network_access = true"));
+        assert_eq!(out.matches("[sandbox_workspace_write]").count(), 1);
+    }
+
+    #[test]
+    fn table_field_delete_removes_key_keeps_section() {
+        // section 内还有用户的其它 key,删 network_access 时保留 section + 其它 key
+        let input =
+            "[sandbox_workspace_write]\nnetwork_access = true\nexclude_tmpdir_env_var = false\n";
+        let out =
+            sync_table_field_in_memory(input, "sandbox_workspace_write", "network_access", None);
+        assert!(!out.contains("network_access"));
+        assert!(out.contains("[sandbox_workspace_write]"));
+        assert!(out.contains("exclude_tmpdir_env_var = false"));
+    }
+
+    #[test]
+    fn table_field_delete_when_key_absent_is_noop() {
+        let input = "[sandbox_workspace_write]\nexclude_tmpdir_env_var = false\n";
+        let out =
+            sync_table_field_in_memory(input, "sandbox_workspace_write", "network_access", None);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn table_field_does_not_touch_other_sections() {
+        let input = "[profiles]\napi_key = \"x\"\n\n[other]\nfoo = 1\n";
+        let out = sync_table_field_in_memory(
+            input,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        // 用户 section 保留
+        assert!(out.contains("[profiles]"));
+        assert!(out.contains("api_key = \"x\""));
+        assert!(out.contains("[other]"));
+        assert!(out.contains("foo = 1"));
+        // 新 section append 到末尾
+        assert!(out.contains("[sandbox_workspace_write]"));
+        assert!(out.contains("network_access = true"));
+    }
+
+    // **chatgpt-codex P2#1 防回归**:section header 同行带 `#` 注释
+    // (TOML spec 合法形式)我们必须识别,否则 append 新 section 撞 duplicate。
+    #[test]
+    fn table_field_recognizes_section_header_with_trailing_comment() {
+        let input =
+            "[sandbox_workspace_write] # local sandbox settings\nexclude_tmpdir_env_var = false\n";
+        let out = sync_table_field_in_memory(
+            input,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        // 不重复 section header(若 miss 识别会 append 第二份)
+        assert_eq!(
+            out.matches("[sandbox_workspace_write]").count(),
+            1,
+            "must reuse existing section, not duplicate: {out}"
+        );
+        assert!(out.contains("network_access = true"));
+        // 验 toml crate 能正常 parse
+        let _: toml::Value = toml::from_str(&out).expect("output must parse as valid TOML");
+    }
+
+    // **chatgpt-codex P2#2 防回归**:用户已用 root-level dotted key 形式
+    // (等价合法 TOML)→ 我们必须 in-place replace,不能 append 新
+    // `[section]` 否则跟 dotted key 隐式定义的同名 table 撞 duplicate。
+    #[test]
+    fn table_field_replaces_existing_dotted_root_key_form() {
+        let input = "sandbox_workspace_write.network_access = false\nother = 1\n";
+        let out = sync_table_field_in_memory(
+            input,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        // 保持 dotted 形式(尊重用户原格式), value 改成 true
+        assert!(
+            out.contains("sandbox_workspace_write.network_access = true"),
+            "must replace dotted-key value, not append [section]: {out}"
+        );
+        // 绝不能同时出现 dotted key 跟 [section] 两种形式
+        assert!(
+            !out.contains("[sandbox_workspace_write]"),
+            "must not append section table when dotted form exists (duplicate-table TOML): {out}"
+        );
+        assert!(out.contains("other = 1"), "other root keys preserved");
+        // 验 toml crate 能正常 parse
+        let _: toml::Value = toml::from_str(&out).expect("output must parse as valid TOML");
+    }
+
+    /// **#212 BLOCKER 防回归**:确保 sync_table_field 写出的 TOML 可被
+    /// `toml` crate 正常 parse(不触发 duplicate table error)。这是
+    /// reviewer 提的 round-trip 验证 —— 之前的 dotted-root-key 方案就在
+    /// 这里炸,本测试守住 section-form 实现不再回归。
+    #[test]
+    fn table_field_output_parses_as_valid_toml() {
+        // 模拟 Codex 默认 sandbox_workspace_write section 已存在的真实 case
+        let input = "model_provider = \"openai\"\n\n[sandbox_workspace_write]\nexclude_tmpdir_env_var = false\nexclude_slash_tmp = false\n";
+        let out = sync_table_field_in_memory(
+            input,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        );
+        let parsed: toml::Value = toml::from_str(&out).expect("output must parse as valid TOML");
+        let section = parsed
+            .get("sandbox_workspace_write")
+            .and_then(|v| v.as_table())
+            .expect("section 必存在");
+        assert_eq!(
+            section.get("network_access").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // 用户原 key 保留
+        assert_eq!(
+            section
+                .get("exclude_tmpdir_env_var")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 
     #[test]

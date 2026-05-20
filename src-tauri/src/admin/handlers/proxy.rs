@@ -22,6 +22,14 @@ pub(super) fn read_proxy_port(cfg: &RawConfig) -> u16 {
         .unwrap_or(18080)
 }
 
+/// 读 `settings.codexNetworkAccess`,默认 `true`(#212)。
+pub(super) fn read_codex_network_access(cfg: &RawConfig) -> bool {
+    cfg.get("settings")
+        .and_then(|s| s.get("codexNetworkAccess"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
 pub(super) fn read_gateway_key(cfg: &RawConfig) -> String {
     cfg.get("gatewayApiKey")
         .and_then(|v| v.as_str())

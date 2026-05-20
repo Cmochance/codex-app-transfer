@@ -2045,6 +2045,7 @@
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
+    $("#codexNetworkAccess").checked = settings.codexNetworkAccess !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
     renderModelMenuModeState(settings);
     await refreshAppVersion();
@@ -2173,6 +2174,7 @@
       autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
+      codexNetworkAccess: $("#codexNetworkAccess")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
     await CCApi.saveSettings(settings);
@@ -3492,6 +3494,7 @@
     });
     $("#exposeAllProviderModels").addEventListener("change", saveSettingsFromForm);
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
+    $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
     $("#configImportFile")?.addEventListener("change", (event) => {
       importConfigFile(event.target.files?.[0]);
     });

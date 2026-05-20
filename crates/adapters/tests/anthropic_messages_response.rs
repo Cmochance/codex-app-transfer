@@ -318,13 +318,21 @@ async fn stream_completion_saves_response_session() {
 
 #[tokio::test]
 async fn compact_response_extracts_anthropic_content_text() {
+    // 注:summary 需 >= 800 chars + markdown header 以通过质量校验(fix #219)
+    let mut summary_text = String::from(
+        "## Context Checkpoint Summary\n\nPrimary Request: User asked to integrate Anthropic Claude API with existing proxy layer.\n\n",
+    );
+    let padding = "Additional handoff context preserved verbatim from prior turns to ensure the next LLM can resume without re-asking. ";
+    while summary_text.len() < 850 {
+        summary_text.push_str(padding);
+    }
     let upstream = json!({
         "id": "msg_compact",
         "type": "message",
         "role": "assistant",
         "content": [{
             "type": "text",
-            "text": "<analysis>hidden</analysis><summary>Keep this context.</summary>",
+            "text": format!("<analysis>hidden chain-of-thought</analysis><summary>{summary_text}</summary>"),
         }],
     });
     let plan = build_anthropic_compact_response_plan(
@@ -341,6 +349,6 @@ async fn compact_response_extracts_anthropic_content_text() {
     let parsed: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["output"][0]["type"], "compaction");
     let encrypted = parsed["output"][0]["encrypted_content"].as_str().unwrap();
-    assert!(encrypted.ends_with("Keep this context."));
+    assert!(encrypted.contains("Anthropic Claude API"));
     assert!(!encrypted.contains("hidden"));
 }
