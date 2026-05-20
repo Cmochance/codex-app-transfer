@@ -2896,8 +2896,13 @@
     return type === "mcp" ? "/api/codex/mcp-toml" : "/api/codex/agents-md";
   }
 
+  function currentCodexTab() {
+    return $("#codexSidebar .codex-sidebar-item.active")?.dataset?.codexTab || "agents";
+  }
+
   function currentCodexBlockType() {
-    return $("#codexAssetTabSelect")?.value === "mcp" ? "mcp" : "agents";
+    const tab = currentCodexTab();
+    return tab === "mcp" ? "mcp" : "agents";
   }
 
   async function codexBlockFetchStatus(type) {
@@ -3085,30 +3090,62 @@
     await codexSkillsLoadAndRender();
   }
 
-  // ── dropdown tab switch + renderCodexAssets entry ──
+  // ── sidebar tab switch + renderCodexAssets entry (#25 sidebar + lazy + 转场) ──
 
-  function codexShowTab(type) {
-    const block = $("#codexBlockTab");
-    const skills = $("#codexSkillsTab");
-    if (type === "skills") {
-      if (block) block.hidden = true;
-      if (skills) skills.hidden = false;
+  /** sidebar tab visibility:active class + fade slide pane */
+  function codexShowTab(tab) {
+    const blockPane = $("#codexBlockTab");
+    const skillsPane = $("#codexSkillsTab");
+    const wantBlock = tab === "agents" || tab === "mcp";
+    if (blockPane) {
+      blockPane.hidden = !wantBlock;
+      blockPane.classList.toggle("active", wantBlock);
+    }
+    if (skillsPane) {
+      skillsPane.hidden = tab !== "skills";
+      skillsPane.classList.toggle("active", tab === "skills");
+    }
+    // sidebar item active state
+    $all("#codexSidebar .codex-sidebar-item").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.codexTab === tab);
+    });
+  }
+
+  /** lazy load + 状态 badge 刷新 (sidebar 上各 item 显 ✓ / 数字) */
+  async function codexLoadTab(tab) {
+    if (tab === "skills") {
+      await codexSkillsLoadAndRender();
     } else {
-      if (block) block.hidden = false;
-      if (skills) skills.hidden = true;
+      await codexBlockLoadAndRender(tab);
+    }
+    await codexRefreshSidebarBadges();
+  }
+
+  /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
+  async function codexRefreshSidebarBadges() {
+    try {
+      const [agents, mcp, skills] = await Promise.all([
+        fetch("/api/codex/agents-md/status").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/mcp-toml/status").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/skills/list").then((r) => (r.ok ? r.json() : null)),
+      ]);
+      const setBadge = (id, text) => {
+        const el = $(id);
+        if (el) el.textContent = text;
+      };
+      setBadge("#codexSidebarBadge-agents", agents?.hasManaged ? "ON" : "—");
+      setBadge("#codexSidebarBadge-mcp", mcp?.hasManaged ? "ON" : "—");
+      setBadge("#codexSidebarBadge-skills", skills?.count != null ? String(skills.count) : "—");
+    } catch {
+      // best-effort, 静默
     }
   }
 
   async function renderCodexAssets() {
-    const select = $("#codexAssetTabSelect");
-    const type = currentCodexBlockType();
-    codexShowTab(select?.value === "skills" ? "skills" : "block");
-
-    if (select?.value === "skills") {
-      await codexSkillsLoadAndRender();
-    } else {
-      await codexBlockLoadAndRender(type);
-    }
+    const sidebar = $("#codexSidebar");
+    const initialTab = currentCodexTab();
+    codexShowTab(initialTab);
+    await codexLoadTab(initialTab);
 
     // textarea dirty 标记: user 编辑后 status 重 load 不覆盖
     const ta = $("#codexBlockContent");
@@ -3116,18 +3153,18 @@
       ta.dataset.bound = "1";
       ta.addEventListener("input", () => (ta.dataset.dirty = "1"));
     }
-    // dropdown change → 切 tab + reload
-    if (select && !select.dataset.bound) {
-      select.dataset.bound = "1";
-      select.addEventListener("change", async () => {
-        codexShowTab(select.value === "skills" ? "skills" : "block");
-        // reset textarea dirty flag when switching block type
+
+    // sidebar click → 切 tab + lazy load
+    if (sidebar && !sidebar.dataset.bound) {
+      sidebar.dataset.bound = "1";
+      sidebar.addEventListener("click", async (evt) => {
+        const btn = evt.target.closest(".codex-sidebar-item");
+        if (!btn) return;
+        const tab = btn.dataset.codexTab;
+        if (!tab) return;
         if (ta) delete ta.dataset.dirty;
-        if (select.value === "skills") {
-          await codexSkillsLoadAndRender();
-        } else {
-          await codexBlockLoadAndRender(select.value);
-        }
+        codexShowTab(tab);
+        await codexLoadTab(tab);
       });
     }
   }

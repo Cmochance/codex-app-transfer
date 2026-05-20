@@ -488,18 +488,29 @@
           <p data-i18n="codex.subtitle">管 Codex CLI 全局 AGENTS.md / config.toml MCP / Skills 等。借鉴 borawong/AiMaMi — Agents/MCP 用 marker 受管块, Skills 用 file-level tar.gz 备份/还原。</p>
         </header>
 
-        <article class="panel" id="codex-assets-panel">
-          <div class="form-group">
-            <label class="form-label" for="codexAssetTabSelect" data-i18n="codex.assetType">资产类型</label>
-            <select class="form-select" id="codexAssetTabSelect">
-              <option value="agents" data-i18n="codex.tabAgents">AGENTS.md(全局 instructions)</option>
-              <option value="mcp" data-i18n="codex.tabMcp">MCP servers(config.toml)</option>
-              <option value="skills" data-i18n="codex.tabSkills">Skills(文件级备份/还原)</option>
-            </select>
-          </div>
+        <div class="codex-layout">
+          <!-- Sidebar (借鉴 AiMaMi src/components/layout/sidebar.tsx — icon + label, badge 显状态) -->
+          <nav class="codex-sidebar" id="codexSidebar" aria-label="Codex assets">
+            <button type="button" class="codex-sidebar-item active" data-codex-tab="agents">
+              <i class="bi bi-file-text"></i>
+              <span data-i18n="codex.tabAgents">AGENTS.md</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-agents"></small>
+            </button>
+            <button type="button" class="codex-sidebar-item" data-codex-tab="mcp">
+              <i class="bi bi-plug"></i>
+              <span data-i18n="codex.tabMcp">MCP servers</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-mcp"></small>
+            </button>
+            <button type="button" class="codex-sidebar-item" data-codex-tab="skills">
+              <i class="bi bi-collection"></i>
+              <span data-i18n="codex.tabSkills">Skills</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-skills"></small>
+            </button>
+          </nav>
 
-          <!-- Agents / MCP 共享 marker 模式 UI (textarea + 4 button + history) -->
-          <div class="codex-block-tab" id="codexBlockTab">
+          <article class="panel codex-content" id="codex-assets-panel">
+          <!-- block tab (Agents + MCP 共享 marker 模式 UI: textarea + 4 button + history) -->
+          <div class="codex-block-tab codex-pane active" id="codexBlockTab" data-codex-pane="block">
             <div class="codex-status info-box" id="codexBlockStatus" style="margin-top: 16px;">
               <i class="bi bi-info-circle"></i>
               <p><span data-i18n="codex.statusLoading">状态加载中…</span></p>
@@ -526,7 +537,7 @@
           </div>
 
           <!-- Skills 独立 UI (list + backup / restore) -->
-          <div class="codex-skills-tab" id="codexSkillsTab" hidden>
+          <div class="codex-skills-tab codex-pane" id="codexSkillsTab" data-codex-pane="skills" hidden>
             <div class="codex-status info-box" id="codexSkillsStatus" style="margin-top: 16px;">
               <i class="bi bi-info-circle"></i>
               <p><span data-i18n="codex.statusLoading">状态加载中…</span></p>
@@ -547,7 +558,8 @@
               <ul id="codexSkillsBackupsList" style="list-style: none; padding: 0;"></ul>
             </div>
           </div>
-        </article>
+          </article>
+        </div>
       </section>
 
       <section class="page" id="page-guide" data-page="guide">
