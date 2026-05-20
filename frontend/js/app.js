@@ -3121,6 +3121,13 @@
       skillsPane.hidden = tab !== "skills";
       skillsPane.classList.toggle("active", tab === "skills");
     }
+    // 切 tab 时收起 History 面板和 Preview 区域,防止残留的 rollback 按钮
+    // data-type 指向旧 tab 导致 rollback 操作类型错误 (Devin Review BUG_..._0001)
+    const historyEl = $("#codexBlockHistory");
+    if (historyEl) historyEl.hidden = true;
+    const previewEl = $("#codexBlockPreviewArea");
+    if (previewEl) previewEl.hidden = true;
+
     // sidebar item active state
     $all("#codexSidebar .codex-sidebar-item").forEach((btn) => {
       btn.classList.toggle("active", btn.dataset.codexTab === tab);
