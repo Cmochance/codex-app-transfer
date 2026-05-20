@@ -2,9 +2,11 @@
 id: 25
 priority: P2
 type: feature
-status: active
+status: resolved
 created: 2026-05-17
-related_pr: null
+related_pr: 206, 229
+resolved_pr: 206, 229
+resolved_date: 2026-05-20
 ---
 
 # #25 MCP / Skills / Memories / Agents 四合一管理页(借鉴 AiMaMi)
