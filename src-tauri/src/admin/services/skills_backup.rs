@@ -284,9 +284,12 @@ mod tests {
     #[test]
     fn list_backups_orders_newest_first() {
         let dir = tmp_dir("list-backups");
-        // 模拟 2 个 .tar.gz file 不同 mtime
+        // 模拟 2 个 .tar.gz file 不同 mtime。
+        // **必须跨秒 sleep**: Linux ext4 / GitHub Actions runner 文件系统 mtime
+        // 精度通常秒级 (有的 fs 才纳秒), 20ms 间隔会让两个文件 mtime 相同 → sort
+        // 不稳定 → test fail (2026-05-20 实测在 GitHub runner Linux 复现)。
         fs::write(dir.join("skills-100.tar.gz"), b"old").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(dir.join("skills-200.tar.gz"), b"new").unwrap();
         // 加一个非 .tar.gz 应被忽略
         fs::write(dir.join("readme.txt"), b"info").unwrap();
