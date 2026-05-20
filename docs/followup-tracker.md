@@ -83,7 +83,6 @@ related_pr: <PR# 或 null>
 - [#24 P2 RFC: Codex AGENTS.md / config.toml 受管块管理(借鉴 AiMaMi)](followup/24-codex-agents-md-managed-block.md) — Q3 四合一管理页的底层基础,marker + history + Protected 模式
 - [#25 P2 MCP / Skills / Memories / Agents 四合一管理页(借鉴 AiMaMi)](followup/25-codex-mgmt-four-in-one-page.md) — 用户 Q3 需求,sidebar+lazy+tanstack-query,依赖 #24
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
-- [#33 P1 Plugin Unlock Windows:MSIX Store 启动限制实施 IApplicationActivationManager + 非-Store .exe fallback](followup/33-windows-plugin-unlock-msix-store.md) — agent evidence-based 6 方案对比,**PR #191 已实施 Method 1 (COM activation) 核心 + 本 PR 实施 PowerShell CIM 进程清理替 taskkill (绕 MSIX access-denied)**;P2 剩端口冲突探测 + 非-Store .exe fallback
 
 ---
 
@@ -102,6 +101,7 @@ related_pr: <PR# 或 null>
 - ~~#26 Plugins / MCP 跟"协议转发"绑定 UI/README 显式提示~~ → PR #205 (2026-05-18),i18n autoUnlockCodexPluginsHint 加协议路径生效说明 + README 兼容矩阵 ⚠️ 备注;provider 表单 inline warning enhancement 留 followup
 - ~~#35 macOS update translocation / quarantine 前置检查~~ → PR #205 (2026-05-18),macos_translocation_precheck (update_install 入口早期 reject) + macos_strip_quarantine (launch 前 xattr -d) 借鉴 AiMaMi update.rs:47-113
 - ~~#36 Windows update 走 NSIS /D=install_dir 保持安装目录~~ → PR #205 (2026-05-18),install_command_parts Windows 分支追 /D=<current_exe parent> + current_exe_parent_dir helper 借鉴 AiMaMi update.rs:7-23
+- ~~#33 P1 Plugin Unlock Windows MSIX 启动限制~~ → PR #191 / #194 / #201 (v2.1.11) + PR #227 (2026-05-20),P1 主体 + P2 Task 1 端口冲突探测全实施;P2 Task 2 非-Store .exe fallback **dropped**(只针对官方 Store 用户 scope,能直装 .exe 的用户能自己跑 Codex.exe --remote-debugging-port 启动,不需要本工具适配;issue #226 closed)
 
 <!-- 示例:
 - ~~#25 cloud_code Gemini mapper 漏配 session_cache~~ → PR #146 (2026-05-13)
