@@ -216,6 +216,31 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/mcp-toml/history",
             get(handlers::mcp_toml::history),
         )
+        // Memories 受管块 (#25 ~/.codex/memories/MEMORY.md 层次化索引)
+        .route(
+            "/api/codex/memories-md/status",
+            get(handlers::memories_md::status),
+        )
+        .route(
+            "/api/codex/memories-md/preview",
+            post(handlers::memories_md::preview),
+        )
+        .route(
+            "/api/codex/memories-md/apply",
+            post(handlers::memories_md::apply),
+        )
+        .route(
+            "/api/codex/memories-md/rollback",
+            post(handlers::memories_md::rollback),
+        )
+        .route(
+            "/api/codex/memories-md/clear",
+            post(handlers::memories_md::clear),
+        )
+        .route(
+            "/api/codex/memories-md/history",
+            get(handlers::memories_md::history),
+        )
         // Skills file-snapshot backup / restore (#24 #25 PR-B)
         .route(
             "/api/codex/skills/list",

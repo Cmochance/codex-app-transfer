@@ -2895,7 +2895,9 @@
 
   /** URL prefix for managed-block endpoints */
   function codexBlockUrl(type) {
-    return type === "mcp" ? "/api/codex/mcp-toml" : "/api/codex/agents-md";
+    if (type === "mcp") return "/api/codex/mcp-toml";
+    if (type === "memories") return "/api/codex/memories-md";
+    return "/api/codex/agents-md";
   }
 
   function currentCodexTab() {
@@ -2904,7 +2906,9 @@
 
   function currentCodexBlockType() {
     const tab = currentCodexTab();
-    return tab === "mcp" ? "mcp" : "agents";
+    if (tab === "mcp") return "mcp";
+    if (tab === "memories") return "memories";
+    return "agents";
   }
 
   async function codexBlockFetchStatus(type) {
@@ -3108,7 +3112,7 @@
   function codexShowTab(tab) {
     const blockPane = $("#codexBlockTab");
     const skillsPane = $("#codexSkillsTab");
-    const wantBlock = tab === "agents" || tab === "mcp";
+    const wantBlock = tab === "agents" || tab === "mcp" || tab === "memories";
     if (blockPane) {
       blockPane.hidden = !wantBlock;
       blockPane.classList.toggle("active", wantBlock);
@@ -3136,9 +3140,10 @@
   /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
   async function codexRefreshSidebarBadges() {
     try {
-      const [agents, mcp, skills] = await Promise.all([
+      const [agents, mcp, memories, skills] = await Promise.all([
         fetch("/api/codex/agents-md/status").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/mcp-toml/status").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/memories-md/status").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/skills/list").then((r) => (r.ok ? r.json() : null)),
       ]);
       const setBadge = (id, text) => {
@@ -3147,6 +3152,7 @@
       };
       setBadge("#codexSidebarBadge-agents", agents?.hasManaged ? "ON" : "—");
       setBadge("#codexSidebarBadge-mcp", mcp?.hasManaged ? "ON" : "—");
+      setBadge("#codexSidebarBadge-memories", memories?.hasManaged ? "ON" : "—");
       setBadge("#codexSidebarBadge-skills", skills?.count != null ? String(skills.count) : "—");
     } catch {
       // best-effort, 静默
