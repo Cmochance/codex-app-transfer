@@ -2,9 +2,11 @@
 id: 23
 priority: P3
 type: research
-status: active
+status: resolved
 created: 2026-05-13
-related_pr: null
+related_pr: 233
+resolved_pr: 233
+resolved_date: 2026-05-20
 ---
 
 # #23 grok_web 末尾 url_citation 列表是否冗余

@@ -79,7 +79,6 @@ related_pr: <PR# 或 null>
 
 ## Active
 
-- [#23 P3 grok_web 末尾 url_citation 列表是否冗余](followup/23-grok-web-url-citation-redundancy.md) — 跟正文 markdown link 重复,实施前需真机看 Codex CLI 渲染
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
 
 ---
@@ -88,6 +87,7 @@ related_pr: <PR# 或 null>
 
 (完成条目移这里,1 行索引 + PR ref;详情文件保留作历史归档,30 天后批量进 archive/)
 
+- ~~#23 P3 grok_web 末尾 url_citation 列表是否冗余~~ → PR #233 (2026-05-20),`accumulate_*_url_citations` 路径剥离,完全依托 Reasoning 段 markdown link 渲染,消除重复
 - ~~#24 P2 RFC: Codex AGENTS.md / config.toml 受管块管理~~ → PR #206 #229 (2026-05-20),`MarkdownManagedBlock` / `TomlManagedBlock` 双 impl + Protected Mode(`outer_signature` SHA-256 防外部并改)+ 10 条 history ring buffer + 17 单测;Agents/MCP/Skills/Memories 四类资产已上 prod
 - ~~#25 P2 MCP / Skills / Memories / Agents 四合一管理页~~ → PR #206 #229 (2026-05-20),sidebar + lazy load + 转场动效 4 个 tab(Agents/MCP/Memories marker / Skills file-snapshot)+ 完整 i18n zh/en + Devin Review BUG_0001 hardcoded Chinese 全修
 - ~~#27 打开 Plugins 后 Codex Desktop 二次 splash 根因诊断~~ → PR #191 (2026-05-17),实际是"一次刷新解锁"的早期描述,setAuthMethod 触发 React 重渲不可消除转 [#32](followup/32-plugin-unlock-react-context-rerender.md)
