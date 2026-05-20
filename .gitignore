@@ -89,3 +89,6 @@ src-tauri/gen/
 # Tauri auto-generated mobile icons(本仓不发移动端;`cargo tauri icon` 重生即可)
 src-tauri/icons/android/
 src-tauri/icons/ios/
+
+# Gemini review documents
+docs/gemini-review-0520/
