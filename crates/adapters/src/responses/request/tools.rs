@@ -16,6 +16,18 @@ pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 /// argument is a JSON string containing the V4A patch. We rewrite the
 /// description so the model sees instructions consistent with the wire
 /// format it has to produce.
+///
+/// **重要:hunk body 的 space-prefixed 行语义** — 上游 freeform 工具用 lark
+/// grammar 强制约束,模型在受约束的解码空间里不会搞错;但 chat function-call
+/// 没有 grammar 约束,只剩 description。实测(issue #235 真机)DeepSeek
+/// 反复在一个具体语义上栽跟头:
+///
+/// > `@@ <context> @@` 标记后的 space-prefixed 行 = 文件中 context 锚点
+/// > **之后**的行,**不是** context 行本身的重复
+///
+/// 不显式说清这个,模型会把 context 行当成 space 行再写一次,parse_patch
+/// 找不到双行 → 整个 patch 拒收。本 description 通过显式规则 + 一个最小
+/// 可执行的更新文件 example 让模型看到正确形态。
 pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Edit files using the apply_patch tool. ",
     "Call this function with a single `input` string containing a V4A patch. ",
@@ -26,17 +38,42 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Within Update hunks, use `@@ <context> @@` markers, prefix unchanged lines ",
     "with a single space, removed lines with `-`, and added lines with `+`. ",
     "Use relative paths only (never absolute). ",
-    "Embed real newlines as `\\n` inside the JSON string value for `input`."
+    "Embed real newlines as `\\n` inside the JSON string value for `input`.\n\n",
+    "CRITICAL HUNK SEMANTICS (the most common cause of patch rejection):\n",
+    "`@@ <context line> @@` is an anchor that names ONE existing line in the file. ",
+    "Every space-prefixed line that follows the `@@` marker corresponds to lines ",
+    "AFTER the anchor in the file (not the anchor itself). ",
+    "Do NOT repeat the anchor line as the first space-prefixed line — the parser will reject it.\n\n",
+    "EXAMPLE — to change `let x = 1;` to `let x = 2;` in a file whose lines around the change read:\n",
+    "  fn main() {\n",
+    "      let x = 1;\n",
+    "      println!(\"{}\", x);\n",
+    "  }\n",
+    "The correct patch is:\n",
+    "*** Begin Patch\n",
+    "*** Update File: src/main.rs\n",
+    "@@ fn main() {\n",
+    "-    let x = 1;\n",
+    "+    let x = 2;\n",
+    "     println!(\"{}\", x);\n",
+    "*** End Patch\n",
+    "Notice: `fn main() {` appears in `@@ ... @@` once as the anchor, NOT again as a space-prefixed line below. ",
+    "The first content line under the anchor is the line immediately after `fn main() {` in the file."
 );
 
 /// Chat-path replacement for the freeform `input` parameter description.
 /// Mirrors `APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT` but at the parameter level,
 /// so the model sees the format constraint regardless of whether providers
 /// surface tool-level or parameter-level descriptions more prominently.
+/// Same anchor-vs-space-line gotcha called out here in compact form (some
+/// providers truncate or de-emphasize tool-level descriptions on long
+/// histories — keep the rule visible at parameter level too).
 pub(crate) const APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT: &str = concat!(
     "A V4A patch starting with `*** Begin Patch` and ending with `*** End Patch`. ",
     "Use `*** Add File:`, `*** Update File:`, or `*** Delete File:` headers and ",
-    "`@@ ... @@` hunks with ` `/`+`/`-` line prefixes. Relative paths only."
+    "`@@ <context> @@` hunks with ` `/`+`/`-` line prefixes. Relative paths only. ",
+    "CRITICAL: in an Update hunk the `@@ <line> @@` anchor is a SINGLE existing file line; ",
+    "the space-prefixed lines following the anchor describe lines AFTER it (do not repeat the anchor)."
 );
 
 /// Responses tool 定义 → Chat tool 定义.

@@ -2770,6 +2770,36 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
         input_desc.contains("V4A") && input_desc.contains("*** Begin Patch"),
         "input description 应含 V4A 与边界标记:{input_desc}"
     );
+
+    // 回归保护(issue #235 真机验证暴露的二级问题):tool 描述必须显式解释
+    // hunk semantics —— context 锚点 vs space-prefixed 行的区别。DeepSeek 在没
+    // 有 lark grammar 强约束的 chat 路径上反复栽在这里(把 anchor 当 space 行
+    // 重复一次),花 20 分钟、25+ 次 retry 最后 fallback 到 sed。description
+    // 必须含可执行的最小示例 + 显式的"do not repeat the anchor"指引。
+    let outer_lc = outer.to_lowercase();
+    assert!(
+        outer.contains("@@") && outer.contains("anchor"),
+        "tool description 必须解释 hunk anchor 语义:{outer}"
+    );
+    assert!(
+        outer.contains("AFTER the anchor") || outer.contains("after it"),
+        "必须显式说明 space 行对应 anchor *之后* 的位置:{outer}"
+    );
+    assert!(
+        outer_lc.contains("do not repeat the anchor") || outer_lc.contains("not again as a space"),
+        "必须显式禁止把 anchor 当 space 行重复:{outer}"
+    );
+    assert!(
+        outer.contains("*** Update File:") && outer.contains("@@ fn main()"),
+        "必须包含一个最小可执行 V4A 示例:{outer}"
+    );
+
+    // 参数描述同样必须保留紧凑版的语义提示
+    assert!(
+        input_desc.contains("anchor")
+            && (input_desc.contains("AFTER") || input_desc.contains("after")),
+        "input description 必须保留 anchor 语义紧凑版:{input_desc}"
+    );
 }
 
 #[test]
