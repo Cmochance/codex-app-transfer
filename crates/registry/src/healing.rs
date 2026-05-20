@@ -124,12 +124,24 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
             changed = true;
         }
 
-        // 3. ENFORCED_BUILTIN_FIELDS 强制覆盖为 preset 字面值。
-        //    特殊处理:preset 字面值是 `null`(serde_json::Value::Null)视作"未
-        //    指定"—— 不覆盖用户字段。多数 preset 把空 extraHeaders 写成 null
-        //    而用户配置写成 `{}`,行为等价但语义不同;不应该把用户的 `{}` 改成
-        //    `null`,反之亦然。
-        for field in ENFORCED_BUILTIN_FIELDS {
+        // 3. 决定要强制覆盖的字段列表:
+        //    - 如果 preset 内定义了 "enforcedFields" 且是一个 array,则使用其中的字符串;
+        //    - 否则 fallback 默认使用 ENFORCED_BUILTIN_FIELDS。
+        let mut dynamic_fields = Vec::new();
+        if let Some(arr) = preset.get("enforcedFields").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    dynamic_fields.push(s);
+                }
+            }
+        }
+        let fields_to_enforce: &[&str] = if !dynamic_fields.is_empty() {
+            &dynamic_fields
+        } else {
+            ENFORCED_BUILTIN_FIELDS
+        };
+
+        for field in fields_to_enforce {
             let preset_value = preset.get(*field).cloned();
             let current_value = obj.get(*field).cloned();
             let preset_specifies = !matches!(preset_value, None | Some(Value::Null));
@@ -827,5 +839,34 @@ mod tests {
             cfg["providers"][0]["apiFormat"], "openai_chat",
             "sso 空字符串等同于缺失,不强改 apiFormat"
         );
+    }
+
+    #[test]
+    fn respects_custom_enforced_fields_declared_in_preset() {
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "test-provider",
+                    "name": "Healing Test Preset",
+                    "baseUrl": "https://api.healing-test.com",
+                    "isBuiltin": false,
+                    "apiFormat": "responses",         // preset specifies "openai_chat" (enforced)
+                    "authScheme": "custom-auth",       // preset specifies "bearer" (NOT enforced)
+                    "extraHeaders": {"User-Agent": "Custom-UA"} // preset specifies {"X-Healing-Test": "Passed"} (NOT enforced)
+                }
+            ]
+        });
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(changed);
+        let p = &cfg["providers"][0];
+        assert_eq!(p["isBuiltin"], json!(true));
+        
+        // apiFormat must be healed/overridden to "openai_chat" because it is in enforcedFields
+        assert_eq!(p["apiFormat"], "openai_chat");
+        
+        // authScheme and extraHeaders must NOT be touched because they are NOT in enforcedFields
+        assert_eq!(p["authScheme"], "custom-auth");
+        assert_eq!(p["extraHeaders"]["User-Agent"], "Custom-UA");
+        assert!(p["extraHeaders"].get("X-Healing-Test").is_none());
     }
 }

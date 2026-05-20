@@ -97,7 +97,6 @@ pub fn convert_grok_sse_to_responses_sse(
         next_output_index: 0,
         open_reasoning: None,
         open_message: None,
-        pending_url_citations: Vec::new(),
         grok_render_strip: GrokRenderStrip::new(),
         sequence_number: 0,
         response_session,
@@ -583,9 +582,6 @@ struct ConvState {
     open_reasoning: Option<OpenReasoning>,
     /// 当前打开中的 message item(R1 PR-3);final token 触发 open,soft_stop / 上游中断 close。
     open_message: Option<OpenMessage>,
-    /// thinking 阶段累积的 url citation(webSearchResults / xSearchResults),
-    /// 第一个 final token 触发 open_message 后 flush 为 annotation.added 事件。
-    pending_url_citations: Vec<serde_json::Value>,
     /// **grok:render 块跨 token 切线安全 strip 器**(2026-05-12 task 11):
     /// grok 把 inline image card / search card 引用嵌进 message text:
     ///   `<grok:render card_id="..." card_type="image_card" ...>
@@ -727,8 +723,6 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
     // 改造 — 包进 message item lifecycle 而不是裸 push output_text.delta。
     // 首个非空 final token 触发 open_message_if_needed(emit output_item.added(message)
     // + content_part.added(output_text)),然后 emit output_text.delta。
-    // pending_url_citations(thinking 阶段累积的 webSearchResults)在首次 open
-    // 后立即 flush 为 annotation.added 事件,关联 message item_id。
     if matches!(tag, Some(GrokMessageTag::Final)) && frame.is_thinking != Some(true) {
         if let Some(tok) = &frame.token {
             if !tok.is_empty() {
@@ -750,10 +744,9 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
                             &clean,
                         ));
                         state.received_any_final_token = true;
-                        flush_pending_url_citations(state);
                     }
                 } else {
-                    // token 全被吞但仍要记 received_any_final_token,防止流末
+                    // token 全被吞 but 仍要记 received_any_final_token,防止流末
                     // 误判"上游中断未收到任何最终 token"补 response.failed
                     state.received_any_final_token = true;
                 }
@@ -888,9 +881,8 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         }
     }
 
-    // raw_function_result 数据帧(R1 PR-2 + PR-3 + PR-5):
+    // raw_function_result 数据帧(R1 PR-2 + PR-5):
     // - PR-2:webSearchResults / xSearchResults 转 markdown bullet 拼 reasoning(已有)
-    // - PR-3:同时累积 url_citation 到 pending(message open 后 flush annotation.added)
     // - PR-5:**codeExecutionResult** 转 markdown fenced code block + 拼 reasoning。
     //   grok.com 内置 `code_execution` 工具(_TOOL_FMT 已识别)的输出帧。
     //   实测帧形态:`{stdout, stderr?, exitCode?}`(部分字段缺时跳过)。
@@ -898,11 +890,9 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         let mut summary = String::new();
         if let Some(wsr) = &frame.web_search_results {
             summary.push_str(&format_web_search_results_for_reasoning(wsr));
-            accumulate_web_search_url_citations(state, wsr);
         }
         if let Some(xsr) = &frame.x_search_results {
             summary.push_str(&format_x_search_results_for_reasoning(xsr));
-            accumulate_x_search_url_citations(state, xsr);
         }
         if let Some(cer) = &frame.code_execution_result {
             summary.push_str(&format_code_execution_result_for_reasoning(cer));
@@ -920,7 +910,6 @@ fn translate_frame(state: &mut ConvState, frame: &GrokResponseFrame) {
         ] {
             if let Some(grouping) = frame.extra.get(key) {
                 summary.push_str(&format_generic_search_results_for_reasoning(grouping, key));
-                accumulate_generic_search_url_citations(state, grouping);
             }
         }
         if !summary.is_empty() {
@@ -1272,33 +1261,7 @@ fn format_generic_search_results_for_reasoning(
     s
 }
 
-/// 把通用 search 帧的 url citation 累积到 pending,等 message open 后 flush。
-/// 同样保守:只取 url + title 字段。
-fn accumulate_generic_search_url_citations(state: &mut ConvState, grouping: &serde_json::Value) {
-    let Some(results) = grouping.get("results").and_then(|v| v.as_array()) else {
-        return;
-    };
-    for r in results {
-        let Some(url) = r.get("url").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if url.is_empty() {
-            continue;
-        }
-        let title = r
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or(url)
-            .to_owned();
-        state.pending_url_citations.push(serde_json::json!({
-            "type": "url_citation",
-            "url": url,
-            "title": title,
-            "start_index": 0,
-            "end_index": 0,
-        }));
-    }
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Event 构造 helpers
@@ -1588,108 +1551,7 @@ fn close_message_if_open(state: &mut ConvState) {
     ));
 }
 
-/// 把 pending_url_citations 全部 emit 为 `response.output_text.annotation.added` 事件。
-///
-/// 只在 message 已 open 时调用(由 final-token 分支触发)。
-/// emit 后 pending 清空(annotations_acc 累积到 message item state,供 done 回灌)。
-fn flush_pending_url_citations(state: &mut ConvState) {
-    if state.pending_url_citations.is_empty() {
-        return;
-    }
-    let Some(msg) = state.open_message.as_mut() else {
-        return;
-    };
-    let item_id = msg.item_id.clone();
-    let output_index = msg.output_index;
-    let citations = std::mem::take(&mut state.pending_url_citations);
-    for (annotation_index, citation) in citations.into_iter().enumerate() {
-        state.pending.push_back(emit_event(
-            &mut state.sequence_number,
-            "response.output_text.annotation.added",
-            serde_json::json!({
-                "type": "response.output_text.annotation.added",
-                "item_id": item_id,
-                "output_index": output_index,
-                "content_index": 0,
-                "annotation_index": annotation_index + msg.annotations_acc.len(),
-                "annotation": citation,
-            }),
-        ));
-        msg.annotations_acc.push(citation);
-    }
-}
 
-/// 把 grok webSearchResults.results 转成 OpenAI Responses url_citation 标准 annotation,
-/// 累积到 pending_url_citations 等 message open 后 flush。
-///
-/// OpenAI url_citation schema:
-/// ```json
-/// {"type":"url_citation","url":"...","title":"...","start_index":0,"end_index":0}
-/// ```
-/// start/end index 对应 message text 内位置 — R3 阶段尚不支持精确定位,统一设 0(标记
-/// 整条 message 与该 url 相关)。R1 后续 PR 加 inline `[N]` 定位再 update。
-fn accumulate_web_search_url_citations(state: &mut ConvState, wsr: &serde_json::Value) {
-    let Some(results) = wsr.get("results").and_then(|v| v.as_array()) else {
-        return;
-    };
-    for r in results {
-        let Some(url) = r.get("url").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if url.is_empty() {
-            continue;
-        }
-        let title = r
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or(url)
-            .to_owned();
-        state.pending_url_citations.push(serde_json::json!({
-            "type": "url_citation",
-            "url": url,
-            "title": title,
-            "start_index": 0,
-            "end_index": 0,
-        }));
-    }
-}
-
-/// X 帖子转 url_citation(URL = https://x.com/<username>/status/<postId>)。
-fn accumulate_x_search_url_citations(state: &mut ConvState, xsr: &serde_json::Value) {
-    let Some(results) = xsr.get("results").and_then(|v| v.as_array()) else {
-        return;
-    };
-    for r in results {
-        let username = r.get("username").and_then(|v| v.as_str());
-        let post_id = r.get("postId").and_then(|v| v.as_str());
-        let (Some(u), Some(p)) = (username, post_id) else {
-            continue;
-        };
-        if u.is_empty() || p.is_empty() {
-            continue;
-        }
-        let url = format!("https://x.com/{u}/status/{p}");
-        let text_preview: String = r
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .chars()
-            .take(80)
-            .collect();
-        let title = if text_preview.is_empty() {
-            format!("𝕏 @{u}")
-        } else {
-            format!("𝕏 @{u}: {text_preview}")
-        };
-        state.pending_url_citations.push(serde_json::json!({
-            "type": "url_citation",
-            "url": url,
-            "title": title,
-            "start_index": 0,
-            "end_index": 0,
-        }));
-    }
-}
 
 /// 合规 OpenAI Responses `response.failed` 事件构造。
 ///
@@ -2370,10 +2232,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_search_results_appends_to_reasoning_and_emits_citation() {
+    async fn connector_search_results_appends_to_reasoning_without_redundant_citation() {
         // R1 PR-6:connectorSearchResults 帧(Notion/Linear/MCP connector
-        // emit)→ 同 webSearchResults 处理:reasoning summary bullet +
-        // url_citation annotation。
+        // emit)→ 同 webSearchResults 处理:reasoning summary bullet，但删除了冗余的二级引用。
         let lines = vec![
             r#"{"result":{"response":{"messageTag":"raw_function_result","connectorSearchResults":{"results":[{"url":"https://notion.so/abc","title":"Notes Page"},{"url":"https://notion.so/xyz","title":"Tasks DB"}]}}}}"#,
             r#"{"result":{"response":{"token":"done","messageTag":"final","isThinking":false}}}"#,
@@ -2388,10 +2249,8 @@ mod tests {
         // reasoning bullet
         assert!(out.contains("🔎 connectorSearchResults"));
         assert!(out.contains("[Notes Page](https://notion.so/abc)"));
-        // url_citation annotation
-        assert!(out.contains("event: response.output_text.annotation.added"));
-        assert!(out.contains(r#""url":"https://notion.so/abc""#));
-        assert!(out.contains(r#""url":"https://notion.so/xyz""#));
+        // url_citation annotation 不再被 emit
+        assert!(!out.contains("event: response.output_text.annotation.added"));
     }
 
     #[tokio::test]
@@ -2412,10 +2271,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_search_emits_url_citation_annotations_on_message() {
-        // R1 PR-3:webSearchResults 累积 → 首个 final token open_message →
-        // flush pending_url_citations 为 annotation.added 事件 → close 时回灌
-        // 完整 annotations 数组到 output_text.done / content_part.done / output_item.done。
+    async fn web_search_no_longer_emits_redundant_url_citations_on_message() {
+        // Grok Web 最终回答已由原生 markdown 格式提供链接，我们删除了冗余的二级引用积累，
+        // 验证不再 emit 冗余的 response.output_text.annotation.added 事件，
+        // 但 reasoning 和 message 的正常 lifecycle 依然完整。
         let lines = vec![
             r#"{"result":{"response":{"messageTag":"tool_usage_card","isThinking":true,"toolUsageCardId":"c1","toolUsageCard":{"toolUsageCardId":"c1","webSearch":{"args":{"query":"MCP"}}}}}}"#,
             r#"{"result":{"response":{"messageTag":"raw_function_result","webSearchResults":{"results":[{"url":"https://modelcontextprotocol.io","title":"MCP Home"}]}}}}"#,
@@ -2438,11 +2297,8 @@ mod tests {
         assert!(out.contains(r#""content_index":0"#));
         assert!(out.contains(r#""delta":"hello""#));
         assert!(out.contains(r#""delta":" world""#));
-        // 3. url_citation annotation.added 事件
-        assert!(out.contains("event: response.output_text.annotation.added"));
-        assert!(out.contains(r#""type":"url_citation""#));
-        assert!(out.contains(r#""url":"https://modelcontextprotocol.io""#));
-        assert!(out.contains(r#""title":"MCP Home""#));
+        // 3. url_citation annotation.added 事件不应被 emit
+        assert!(!out.contains("event: response.output_text.annotation.added"));
         // 4. close 三段
         assert!(out.contains("event: response.output_text.done"));
         assert!(out.contains("event: response.content_part.done"));

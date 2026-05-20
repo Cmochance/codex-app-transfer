@@ -304,7 +304,7 @@
       },
       {
         "type": "info",
-        "text": "**当前能力**:文本对话、reasoning summary、Web Search citations、Connectors / Collections / RAG Search 引用、MCP via `call_connected_tool`(三下划线 namespace 如 `test___ask_question`)、跨轮 `parent_response_id` 自动追踪。**已知限制**:inline `[N]` 精确位置 citation 暂未实现(仅追加在结尾);`cardAttachment` 帧未解析;sso JWT 失效时需重新登录 grok.com 重新复制 cookie。"
+        "text": "**当前能力**:文本对话、reasoning summary (包含联网搜索步骤)、Connectors / Collections / RAG Search 联网步骤显示、MCP via `call_connected_tool`(三下划线 namespace 如 `test___ask_question`)、跨轮 `parent_response_id` 自动追踪。**已知限制**:Grok Web 原生在最终回答中渲染 Markdown 格式链接，本 provider 移除了冗余的二级引用积累以实现最佳渲染效果；`cardAttachment` 帧未解析；sso JWT 失效时需重新登录 grok.com 重新复制 cookie。"
       }
     ],
     "requestOptions": {},
@@ -415,6 +415,20 @@
       }
     ],
     "requestOptions": {},
+    "isBuiltin": true
+  },
+  {
+    "id": "healing-test-preset",
+    "name": "Healing Test Preset",
+    "baseUrl": "https://api.healing-test.com",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "extraHeaders": {
+      "X-Healing-Test": "Passed"
+    },
+    "enforcedFields": [
+      "apiFormat"
+    ],
     "isBuiltin": true
   }
 ]
