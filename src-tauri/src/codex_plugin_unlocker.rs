@@ -15,9 +15,30 @@
 //! - 监听 `Page.loadEventFired`,刷新后自动重新注入
 //! - 断开时指数退避重连
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// CDP debug port 默认值。Chrome / Electron 约定俗成的 remote debugging port。
+pub const DEFAULT_CDP_PORT: u16 = 9222;
+
+/// 全局共享的 CDP port — desktop.rs 启动 Codex Desktop 前探测可用端口写入,
+/// daemon loop 每次 `detect_cdp` 时读取拼 URL。9222 被 Chrome / Edge / 其它
+/// Electron 占用时,desktop.rs 会 fallback 到 OS 分配的随机空闲端口,daemon
+/// 通过这个 atomic 看到新值,无需重启。
+///
+/// 借鉴 `BigPizzaV3/CodexPlusPlus` `launcher.py:267-281`(MIT)端口冲突探测
+/// 思路(本仓 Rust 实现用 `TcpListener::bind` 探测,不用 `SO_EXCLUSIVEADDRUSE`
+/// 因为 Tokio + std::net::TcpListener 在 Linux/macOS 跨平台一致行为足够)。
+pub static CDP_PORT: AtomicU16 = AtomicU16::new(DEFAULT_CDP_PORT);
+
+/// 拼当前 CDP `/json/list` URL,使用 [`CDP_PORT`] 的最新值。
+pub fn current_cdp_url() -> String {
+    format!(
+        "http://127.0.0.1:{}/json/list",
+        CDP_PORT.load(Ordering::Relaxed)
+    )
+}
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -44,10 +65,12 @@ pub enum UnlockStatus {
 }
 
 /// 服务配置
+///
+/// **注**:CDP HTTP URL 不在这里 — 改用全局 [`CDP_PORT`] atomic 让 desktop.rs
+/// 启动 Codex Desktop 时动态写入(端口冲突 fallback)。daemon loop 每次
+/// detect 时通过 [`current_cdp_url`] 读最新 port。
 #[derive(Debug, Clone)]
 pub struct UnlockConfig {
-    /// CDP HTTP 端点（获取 WebSocket URL）
-    pub cdp_http_url: String,
     /// 重连退避:初始延迟（毫秒）。第一次失败后等这么久重试,
     /// 每次失败 ×2 直到 `reconnect_max_ms`。1s 起够快,不会让用户感觉卡。
     pub reconnect_base_ms: u64,
@@ -59,7 +82,6 @@ pub struct UnlockConfig {
 impl Default for UnlockConfig {
     fn default() -> Self {
         Self {
-            cdp_http_url: "http://127.0.0.1:9222/json/list".into(),
             reconnect_base_ms: 1_000,
             reconnect_max_ms: 30_000,
         }
@@ -195,8 +217,10 @@ async fn run_daemon(
             }
         }
 
-        // 阶段 1: 检测 CDP 端口是否可用
-        match detect_cdp(&config.cdp_http_url).await {
+        // 阶段 1: 检测 CDP 端口是否可用 — 用 current_cdp_url() 每次重新拼,
+        // 这样 desktop.rs 在端口冲突 fallback 时写入 CDP_PORT atomic 后,daemon
+        // 下一轮 loop 立刻看到新 port,无需重启。
+        match detect_cdp(&current_cdp_url()).await {
             Some(pages) => {
                 // Codex Desktop 同时开多个 BrowserWindow:主窗口
                 // `app://-/index.html` + 宠物悬浮窗 `app://-/index.html?initialRoute=
@@ -680,8 +704,23 @@ mod tests {
     }
 
     #[test]
-    fn test_default_config() {
+    fn test_default_config_has_reconnect_bounds() {
         let c = UnlockConfig::default();
-        assert_eq!(c.cdp_http_url, "http://127.0.0.1:9222/json/list");
+        assert_eq!(c.reconnect_base_ms, 1_000);
+        assert_eq!(c.reconnect_max_ms, 30_000);
+    }
+
+    #[test]
+    fn current_cdp_url_reflects_cdp_port_atomic() {
+        // 防止默认 9222 假阴性:跨测试可能其它 case 改过 CDP_PORT,显式设回 9222
+        CDP_PORT.store(DEFAULT_CDP_PORT, Ordering::Relaxed);
+        assert_eq!(current_cdp_url(), "http://127.0.0.1:9222/json/list");
+
+        // 模拟 desktop.rs 端口冲突 fallback 写入随机端口
+        CDP_PORT.store(54321, Ordering::Relaxed);
+        assert_eq!(current_cdp_url(), "http://127.0.0.1:54321/json/list");
+
+        // 恢复默认避免污染其它测试
+        CDP_PORT.store(DEFAULT_CDP_PORT, Ordering::Relaxed);
     }
 }

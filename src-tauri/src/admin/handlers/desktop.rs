@@ -321,11 +321,49 @@ fn maybe_wake_codex_pet() {
     );
 }
 
+/// 探测一个可用的 CDP debug port:**优先 9222**(默认值,跟 Chrome 一致),
+/// 占用时 fallback OS 分配的随机空闲端口。
+///
+/// 借鉴 `BigPizzaV3/CodexPlusPlus` `launcher.py:267-281`(MIT)端口冲突探测
+/// 思路。本 Rust 实现用 `std::net::TcpListener::bind` 尝试占位,**立刻 drop
+/// 释放**(只确认"该端口此刻可绑"),Codex Desktop 的 bind 在 ms 级内接管。
+/// 时间窗口里被第三方进程抢占的概率极低;即便抢了,Codex 启动会报端口占用
+/// 由用户视觉感知,daemon 会继续 backoff 重试不至于卡死。
+///
+/// 完全失败(连 port 0 都拿不到 — 系统资源枯竭)时 fallback 到
+/// [`DEFAULT_CDP_PORT`](crate::codex_plugin_unlocker::DEFAULT_CDP_PORT)。
+pub(crate) fn detect_free_cdp_port() -> u16 {
+    detect_free_cdp_port_using(|port| {
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+    })
+}
+
+/// 纯函数版本 — 注入端口探测器给单测调用,避免在测试中跟真实 OS 端口耦合
+/// (CI 上 9222 可能被某些 sidecar 占用导致测试 flaky)。模式跟
+/// `registry/src/paths.rs::resolve_home_from` 一致。
+fn detect_free_cdp_port_using<F>(try_bind: F) -> u16
+where
+    F: Fn(u16) -> Option<u16>,
+{
+    use crate::codex_plugin_unlocker::DEFAULT_CDP_PORT;
+    if try_bind(DEFAULT_CDP_PORT) == Some(DEFAULT_CDP_PORT) {
+        return DEFAULT_CDP_PORT;
+    }
+    try_bind(0).unwrap_or(DEFAULT_CDP_PORT)
+}
+
 /// 读取设置判断是否应附加调试端口参数。
 ///
 /// 默认 true:setting key 缺失或 registry 读失败时,仍附加 debug port,以便
 /// 新装/初始化场景下 Plugins 解锁开箱即用。用户显式关闭(=false)时才不附加。
 /// 跟 main.rs setup hook 中的 auto-start 默认值保持一致。
+///
+/// **#33 P2 端口冲突探测**(issue #226 Task 1):用 [`detect_free_cdp_port`]
+/// 找空闲端口(优先 9222,占用 fallback OS 分配),把结果写入 `CDP_PORT`
+/// atomic,plugin_unlock daemon 通过 `current_cdp_url()` 看到最新值。
 fn should_attach_debug_port() -> Vec<String> {
     let auto_unlock = match crate::admin::registry_io::load() {
         Ok(cfg) => cfg
@@ -336,13 +374,21 @@ fn should_attach_debug_port() -> Vec<String> {
         Err(_) => true,
     };
     if auto_unlock {
+        let port = detect_free_cdp_port();
+        crate::codex_plugin_unlocker::CDP_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+        if port != crate::codex_plugin_unlocker::DEFAULT_CDP_PORT {
+            tracing::info!(
+                cdp_port = port,
+                "[PluginUnlock] 9222 occupied, falling back to OS-assigned port"
+            );
+        }
         // `--remote-allow-origins=*` 是 Chrome 111+ / Electron 同代起的硬性
         // 要求:不带它,CDP HTTP /json/list 仍工作,但 WebSocket upgrade 完成
         // 后会被远端 reset(我们 log 里见过 "Connection reset without closing
         // handshake")。galaxywk223/codex-plugin-unlocker (MIT) 同样加这个
         // flag,见其 `launcher.py:55-58`。
         vec![
-            "--remote-debugging-port=9222".into(),
+            format!("--remote-debugging-port={port}"),
             "--remote-allow-origins=*".into(),
         ]
     } else {
@@ -1099,6 +1145,35 @@ mod tests {
         assert_eq!(windows[0], "tasklist");
         assert!(windows.iter().any(|a| a == "IMAGENAME eq Codex.exe"));
         assert_eq!(running_check_command("linux"), vec!["pgrep", "-x", "codex"]);
+    }
+
+    // ── #33 P2 端口冲突探测(issue #226 Task 1)──────────────────────
+
+    #[test]
+    fn detect_free_cdp_port_uses_9222_when_available() {
+        // probe 模拟"9222 空闲"— 任何 port 都返回 Some(port)
+        let port = detect_free_cdp_port_using(|p| Some(p.max(1)));
+        assert_eq!(port, crate::codex_plugin_unlocker::DEFAULT_CDP_PORT);
+    }
+
+    #[test]
+    fn detect_free_cdp_port_falls_back_to_os_assigned_when_9222_taken() {
+        // probe 模拟"9222 被占,OS 分配 54321"
+        let port = detect_free_cdp_port_using(|p| {
+            if p == crate::codex_plugin_unlocker::DEFAULT_CDP_PORT {
+                None
+            } else {
+                Some(54321)
+            }
+        });
+        assert_eq!(port, 54321);
+    }
+
+    #[test]
+    fn detect_free_cdp_port_falls_back_to_default_when_everything_fails() {
+        // 极端 case:连 port 0 都失败(系统资源枯竭)— 仍返默认 9222 让 caller 保持原行为
+        let port = detect_free_cdp_port_using(|_| None);
+        assert_eq!(port, crate::codex_plugin_unlocker::DEFAULT_CDP_PORT);
     }
 
     #[test]

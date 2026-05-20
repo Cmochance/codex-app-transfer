@@ -297,10 +297,13 @@
   - **AUMID 自动解析**(`launcher.py:298-304` + `app_paths.py:30-49`):`Get-AppxPackage` PowerShell 反推 `OpenAI.Codex_<publisher>!App` → `src-tauri/src/windows_msix.rs:111-137` `resolve_codex_aumid`
   - **cmdline 序列化**(`launcher.py:411` 用 `subprocess.list2cmdline`):MSIX activation 的 `arguments` 参数是单一 PWSTR 不是 argv 数组 → `src-tauri/src/windows_msix.rs:157-199` `list2cmdline` + `escape_cmdline`(Windows `CommandLineToArgvW` quoting 规则)
   - **Codex Desktop 启动入口 Windows 分支**:`open_codex_app` 走 COM activation 替代 `explorer.exe shell:AppsFolder\...`(后者剥 args)→ `src-tauri/src/admin/handlers/desktop.rs:335-405`
+  - **端口冲突探测**(`launcher.py:267-281` `SO_EXCLUSIVEADDRUSE` socket 占位探测思路):9222 被占时 fallback OS 分配的随机空闲端口,daemon 通过 `CDP_PORT` atomic 读最新值 → `src-tauri/src/admin/handlers/desktop.rs::detect_free_cdp_port` + `src-tauri/src/codex_plugin_unlocker.rs::CDP_PORT` / `current_cdp_url`(issue #226 Task 1,PR 同期落地)
 - **本项目差异 / 扩展**:
   - Rust 实现用 `windows` crate 0.59+ 官方 binding(`Win32_UI_Shell` feature)而非 Python ctypes 手搓 vtable
   - ActivateApplication 失败时 fallback 到老 `explorer.exe` 路径让 Codex 至少能启动(args 丢失,Plugin Unlock 在 fallback 路径下不工作,但 Codex 本身可用)
-  - 端口冲突处理、PowerShell CIM 进程清理 等后续 PR 再补(对照 launcher.py:267-281 / 434-451,follow-up #33 P2)
+  - PowerShell CIM 进程清理已在 PR #201 实施(对照 `launcher.py:434-451`)
+  - 端口探测 Rust 用 `std::net::TcpListener::bind` 而非 Python `SO_EXCLUSIVEADDRUSE` socket option — Tokio + std 在跨平台 bind 行为已足够区分占用,无需 Windows 专属 socket option(跨平台一致更易测)
+  - 非-Store .exe fallback(Method 6)留作 issue #226 Task 2 后续 PR
 - **同步策略**:
   - 上游 launcher.py COM 调用约定变动(Microsoft 更新 ActivateApplication 接口的可能性极低)→ 跟踪 windows-rs major version 升级
   - AUMID 解析逻辑跟随 Codex Desktop AppxManifest 命名约定;若 OpenAI 改 package family name 命名(如改 `OpenAI.CodexCLI`),`resolve_codex_aumid` 的 PowerShell `-Name 'OpenAI.Codex'` filter 需更新
