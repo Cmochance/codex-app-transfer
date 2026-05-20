@@ -5,3 +5,4 @@
 //! - `services/`:无 HTTP 概念,纯函数 + Result,可独立单测
 
 pub mod managed_block;
+pub mod skills_backup;

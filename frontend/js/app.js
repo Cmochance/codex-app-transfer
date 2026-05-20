@@ -2847,26 +2847,40 @@
         await applyProviderToDesktop(actionEl);
       }
 
-      // ── Codex 资产管理 (#24 / #25 Agents tab MVP) ──
-      if (action === "codex-agents-preview") {
-        await codexAgentsPreview();
+      // ── Codex 资产管理 (#24 / #25, Agents + MCP + Skills tab) ──
+      if (action === "codex-block-preview") {
+        await codexBlockPreview(currentCodexBlockType());
       }
-      if (action === "codex-agents-apply") {
-        await codexAgentsApply();
+      if (action === "codex-block-apply") {
+        await codexBlockApply(currentCodexBlockType());
       }
-      if (action === "codex-agents-history-toggle") {
-        await codexAgentsToggleHistory();
+      if (action === "codex-block-history-toggle") {
+        await codexBlockToggleHistory(currentCodexBlockType());
       }
-      if (action === "codex-agents-clear") {
+      if (action === "codex-block-clear") {
         if (window.confirm("确认 Clear 受管块?会删除 marker + 内容(进 history 可 rollback)")) {
-          await codexAgentsClear();
+          await codexBlockClear(currentCodexBlockType());
         }
       }
-      if (action === "codex-agents-rollback") {
+      if (action === "codex-block-rollback") {
         const idx = Number(actionEl.dataset.idx);
+        const type = actionEl.dataset.type || currentCodexBlockType();
         if (!Number.isFinite(idx)) return;
-        if (window.confirm(`确认 Rollback 到 history[${idx}]?`)) {
-          await codexAgentsRollback(idx);
+        if (window.confirm(`确认 Rollback ${type} 到 history[${idx}]?`)) {
+          await codexBlockRollback(type, idx);
+        }
+      }
+      if (action === "codex-skills-backup") {
+        await codexSkillsBackup();
+      }
+      if (action === "codex-skills-refresh") {
+        await codexSkillsLoadAndRender();
+      }
+      if (action === "codex-skills-restore") {
+        const filename = actionEl.dataset.filename;
+        if (!filename) return;
+        if (window.confirm(`确认从 ${filename} 还原 skills/?会覆盖当前 ~/.codex/skills 内容!`)) {
+          await codexSkillsRestore(filename);
         }
       }
     } catch (error) {
@@ -2875,54 +2889,63 @@
     }
   }
 
-  // ── Codex 资产管理 functions (#24 #25 Agents tab MVP) ──
+  // ── Codex 资产管理: marker 受管块 (agents + mcp 共享, type ∈ {agents, mcp}) ──
 
-  async function codexAgentsFetchStatus() {
-    const r = await fetch("/api/codex/agents-md/status");
+  /** URL prefix for managed-block endpoints */
+  function codexBlockUrl(type) {
+    return type === "mcp" ? "/api/codex/mcp-toml" : "/api/codex/agents-md";
+  }
+
+  function currentCodexBlockType() {
+    return $("#codexAssetTabSelect")?.value === "mcp" ? "mcp" : "agents";
+  }
+
+  async function codexBlockFetchStatus(type) {
+    const r = await fetch(`${codexBlockUrl(type)}/status`);
     if (!r.ok) throw new Error("status request failed");
     return r.json();
   }
 
-  async function codexAgentsLoadAndRender() {
-    const status = await codexAgentsFetchStatus();
-    const el = $("#codexAgentsStatus");
+  async function codexBlockLoadAndRender(type) {
+    const status = await codexBlockFetchStatus(type);
+    const el = $("#codexBlockStatus");
     if (!el) return;
     const lastApply = status.lastApply
       ? new Date(status.lastApply * 1000).toLocaleString()
       : "无";
     const stateLabel = status.hasManaged ? "已注入" : "未注入";
     el.innerHTML = `<i class="bi bi-info-circle"></i><p>
-      <strong>受管块状态:</strong> ${stateLabel}<br>
+      <strong>受管块状态(${type}):</strong> ${stateLabel}<br>
       <strong>用户区(marker 外):</strong> ${status.beforeUserBytes + status.afterUserBytes} bytes<br>
       <strong>历史快照:</strong> ${status.historyCount} 条(上限 10)<br>
       <strong>上次 apply:</strong> ${lastApply}<br>
       <strong>目标文件:</strong> <code>${escapeHtml(status.targetPath || "")}</code>
     </p>`;
-    const ta = $("#codexAgentsContent");
+    const ta = $("#codexBlockContent");
     if (ta && status.managedContent !== undefined && !ta.dataset.dirty) {
       ta.value = status.managedContent || "";
     }
   }
 
-  async function codexAgentsPreview() {
-    const content = $("#codexAgentsContent")?.value ?? "";
-    const r = await fetch("/api/codex/agents-md/preview", {
+  async function codexBlockPreview(type) {
+    const content = $("#codexBlockContent")?.value ?? "";
+    const r = await fetch(`${codexBlockUrl(type)}/preview`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
     });
     if (!r.ok) throw new Error("preview failed");
     const j = await r.json();
-    const pre = $("#codexAgentsPreviewArea");
+    const pre = $("#codexBlockPreviewArea");
     if (pre) {
       pre.textContent = j.rendered ?? "(empty)";
       pre.hidden = false;
     }
   }
 
-  async function codexAgentsApply() {
-    const content = $("#codexAgentsContent")?.value ?? "";
-    const r = await fetch("/api/codex/agents-md/apply", {
+  async function codexBlockApply(type) {
+    const content = $("#codexBlockContent")?.value ?? "";
+    const r = await fetch(`${codexBlockUrl(type)}/apply`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
@@ -2931,21 +2954,21 @@
       const err = await r.json().catch(() => ({}));
       throw new Error(err.error || "apply failed");
     }
-    const ta = $("#codexAgentsContent");
+    const ta = $("#codexBlockContent");
     if (ta) delete ta.dataset.dirty;
-    await codexAgentsLoadAndRender();
-    showToast("受管块已 apply");
+    await codexBlockLoadAndRender(type);
+    showToast(`${type} 受管块已 apply`);
   }
 
-  async function codexAgentsClear() {
-    const r = await fetch("/api/codex/agents-md/clear", { method: "POST" });
+  async function codexBlockClear(type) {
+    const r = await fetch(`${codexBlockUrl(type)}/clear`, { method: "POST" });
     if (!r.ok) throw new Error("clear failed");
-    await codexAgentsLoadAndRender();
-    showToast("受管块已 clear(进 history)");
+    await codexBlockLoadAndRender(type);
+    showToast(`${type} 受管块已 clear(进 history)`);
   }
 
-  async function codexAgentsRollback(idx) {
-    const r = await fetch("/api/codex/agents-md/rollback", {
+  async function codexBlockRollback(type, idx) {
+    const r = await fetch(`${codexBlockUrl(type)}/rollback`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ index: idx }),
@@ -2954,24 +2977,24 @@
       const err = await r.json().catch(() => ({}));
       throw new Error(err.error || "rollback failed");
     }
-    await codexAgentsLoadAndRender();
-    await codexAgentsRenderHistory();
-    showToast(`已 rollback 到 history[${idx}]`);
+    await codexBlockLoadAndRender(type);
+    await codexBlockRenderHistory(type);
+    showToast(`已 rollback ${type} 到 history[${idx}]`);
   }
 
-  async function codexAgentsRenderHistory() {
-    const r = await fetch("/api/codex/agents-md/history");
+  async function codexBlockRenderHistory(type) {
+    const r = await fetch(`${codexBlockUrl(type)}/history`);
     if (!r.ok) throw new Error("history failed");
     const j = await r.json();
-    const list = $("#codexAgentsHistoryList");
+    const list = $("#codexBlockHistoryList");
     if (!list) return;
-    const items = (j.history || []).map((entry, _i) => {
+    const items = (j.history || []).map((entry) => {
       const ts = new Date(entry.timestamp * 1000).toLocaleString();
       const preview = (entry.managedContent || "").slice(0, 80).replace(/\n/g, " ⏎ ");
       return `<li style="padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px;">
         <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
           <span style="font-family: monospace; font-size: 12px; color: var(--muted);">[${entry.index}] ${ts}</span>
-          <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-agents-rollback" data-idx="${entry.index}"><i class="bi bi-arrow-counterclockwise"></i> Rollback</button>
+          <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-block-rollback" data-type="${type}" data-idx="${entry.index}"><i class="bi bi-arrow-counterclockwise"></i> Rollback</button>
         </div>
         <pre style="font-size: 12px; max-height: 60px; overflow: hidden; margin: 4px 0 0; color: var(--muted);">${escapeHtml(preview) || "(empty)"}</pre>
       </li>`;
@@ -2979,24 +3002,133 @@
     list.innerHTML = items.join("") || "<li><em>暂无 history snapshot</em></li>";
   }
 
-  async function codexAgentsToggleHistory() {
-    const el = $("#codexAgentsHistory");
+  async function codexBlockToggleHistory(type) {
+    const el = $("#codexBlockHistory");
     if (!el) return;
     if (el.hidden) {
-      await codexAgentsRenderHistory();
+      await codexBlockRenderHistory(type);
       el.hidden = false;
     } else {
       el.hidden = true;
     }
   }
 
+  // ── Skills tab (file-snapshot backup / restore, 独立 ManagedBlock 之外) ──
+
+  async function codexSkillsLoadAndRender() {
+    const [listR, backupsR] = await Promise.all([
+      fetch("/api/codex/skills/list"),
+      fetch("/api/codex/skills/backups"),
+    ]);
+    if (!listR.ok || !backupsR.ok) throw new Error("skills load failed");
+    const list = await listR.json();
+    const backups = await backupsR.json();
+
+    const statusEl = $("#codexSkillsStatus");
+    if (statusEl) {
+      statusEl.innerHTML = `<i class="bi bi-info-circle"></i><p>
+        <strong>Skills 目录:</strong> <code>${escapeHtml(list.skillsDir || "")}</code><br>
+        <strong>已安装 skill:</strong> ${list.count} 个<br>
+        <strong>备份目录:</strong> <code>${escapeHtml(backups.backupDir || "")}</code><br>
+        <strong>已有备份:</strong> ${backups.count} 份
+      </p>`;
+    }
+
+    const ul = $("#codexSkillsList");
+    if (ul) {
+      const rows = (list.entries || []).map((entry) => {
+        const md = entry.has_skill_md ? "✓ SKILL.md" : "✗ no SKILL.md";
+        return `<li style="display: flex; justify-content: space-between; padding: 4px 8px; border-bottom: 1px dashed var(--line);">
+          <span>${escapeHtml(entry.name)}</span>
+          <small style="color: var(--muted);">${md} · ${entry.files_count} files</small>
+        </li>`;
+      });
+      ul.innerHTML = rows.join("") || "<li><em>暂无 skill</em></li>";
+    }
+
+    const backupList = $("#codexSkillsBackupsList");
+    if (backupList) {
+      const rows = (backups.backups || []).map((entry) => {
+        const ts = new Date(entry.created_unix * 1000).toLocaleString();
+        const sizeKb = (entry.size_bytes / 1024).toFixed(1);
+        return `<li style="padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+          <span><strong>${escapeHtml(entry.filename)}</strong> <small style="color: var(--muted);">${sizeKb} KB · ${ts}</small></span>
+          <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-skills-restore" data-filename="${escapeHtml(entry.filename)}"><i class="bi bi-arrow-counterclockwise"></i> Restore</button>
+        </li>`;
+      });
+      backupList.innerHTML = rows.join("") || "<li><em>暂无备份(点 Backup now 创建)</em></li>";
+    }
+  }
+
+  async function codexSkillsBackup() {
+    const r = await fetch("/api/codex/skills/backup", { method: "POST" });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.error || "backup failed");
+    }
+    const j = await r.json();
+    showToast(`备份完成: ${j.backupPath?.split("/").pop() || "ok"}`);
+    await codexSkillsLoadAndRender();
+  }
+
+  async function codexSkillsRestore(filename) {
+    const r = await fetch("/api/codex/skills/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.error || "restore failed");
+    }
+    showToast(`已从 ${filename} 还原`);
+    await codexSkillsLoadAndRender();
+  }
+
+  // ── dropdown tab switch + renderCodexAssets entry ──
+
+  function codexShowTab(type) {
+    const block = $("#codexBlockTab");
+    const skills = $("#codexSkillsTab");
+    if (type === "skills") {
+      if (block) block.hidden = true;
+      if (skills) skills.hidden = false;
+    } else {
+      if (block) block.hidden = false;
+      if (skills) skills.hidden = true;
+    }
+  }
+
   async function renderCodexAssets() {
-    await codexAgentsLoadAndRender();
+    const select = $("#codexAssetTabSelect");
+    const type = currentCodexBlockType();
+    codexShowTab(select?.value === "skills" ? "skills" : "block");
+
+    if (select?.value === "skills") {
+      await codexSkillsLoadAndRender();
+    } else {
+      await codexBlockLoadAndRender(type);
+    }
+
     // textarea dirty 标记: user 编辑后 status 重 load 不覆盖
-    const ta = $("#codexAgentsContent");
+    const ta = $("#codexBlockContent");
     if (ta && !ta.dataset.bound) {
       ta.dataset.bound = "1";
       ta.addEventListener("input", () => (ta.dataset.dirty = "1"));
+    }
+    // dropdown change → 切 tab + reload
+    if (select && !select.dataset.bound) {
+      select.dataset.bound = "1";
+      select.addEventListener("change", async () => {
+        codexShowTab(select.value === "skills" ? "skills" : "block");
+        // reset textarea dirty flag when switching block type
+        if (ta) delete ta.dataset.dirty;
+        if (select.value === "skills") {
+          await codexSkillsLoadAndRender();
+        } else {
+          await codexBlockLoadAndRender(select.value);
+        }
+      });
     }
   }
 

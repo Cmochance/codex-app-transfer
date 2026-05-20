@@ -197,6 +197,42 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/agents-md/history",
             get(handlers::agents_md::history),
         )
+        // MCP servers 受管块 (#24 #25 PR-A, config.toml TOML 变种)
+        .route(
+            "/api/codex/mcp-toml/status",
+            get(handlers::mcp_toml::status),
+        )
+        .route(
+            "/api/codex/mcp-toml/preview",
+            post(handlers::mcp_toml::preview),
+        )
+        .route("/api/codex/mcp-toml/apply", post(handlers::mcp_toml::apply))
+        .route(
+            "/api/codex/mcp-toml/rollback",
+            post(handlers::mcp_toml::rollback),
+        )
+        .route("/api/codex/mcp-toml/clear", post(handlers::mcp_toml::clear))
+        .route(
+            "/api/codex/mcp-toml/history",
+            get(handlers::mcp_toml::history),
+        )
+        // Skills file-snapshot backup / restore (#24 #25 PR-B)
+        .route(
+            "/api/codex/skills/list",
+            get(handlers::skills::list_handler),
+        )
+        .route(
+            "/api/codex/skills/backup",
+            post(handlers::skills::backup_handler),
+        )
+        .route(
+            "/api/codex/skills/backups",
+            get(handlers::skills::backups_handler),
+        )
+        .route(
+            "/api/codex/skills/restore",
+            post(handlers::skills::restore_handler),
+        )
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)

@@ -386,7 +386,7 @@ pub trait ManagedBlock {
     }
 }
 
-/// Markdown 文件的受管块实现 (适用 AGENTS.md 等).
+/// Markdown 文件的受管块实现 (适用 AGENTS.md 等). marker 走 HTML 注释 `<!-- ... -->`.
 pub struct MarkdownManagedBlock {
     pub block_type: &'static str,
     pub target: PathBuf,
@@ -402,6 +402,45 @@ impl ManagedBlock for MarkdownManagedBlock {
     }
     fn history_path(&self) -> &Path {
         &self.history
+    }
+}
+
+/// TOML 文件的受管块实现 (适用 `config.toml` MCP servers 段). marker 走行注释 `# ...`.
+///
+/// **schema 假设**: 受管块内是 TOML 合法片段 (典型: 多个 `[mcp_servers.<name>]` table),
+/// app 自动给受管 server name 加 `cas-` 或 `app-` prefix 避免跟用户区 server 冲突。
+/// `toml_edit` 解析时受管块在 marker 之间,作为 raw text 处理 (不参与 TOML AST),
+/// render 写回时保留原顺序 + 注释 — 用户区的 TOML 字段顺序跟注释**永远不被 app 触碰**。
+pub struct TomlManagedBlock {
+    pub block_type: &'static str,
+    pub target: PathBuf,
+    pub history: PathBuf,
+}
+
+impl ManagedBlock for TomlManagedBlock {
+    fn block_type(&self) -> &'static str {
+        self.block_type
+    }
+    fn target_path(&self) -> &Path {
+        &self.target
+    }
+    fn history_path(&self) -> &Path {
+        &self.history
+    }
+    fn start_marker(&self) -> String {
+        // TOML 用 `#` 行注释作 marker (HTML 注释在 TOML parser 看是非法字符)
+        format!(
+            "# cas:managed:{}:{}:start",
+            self.block_type(),
+            self.marker_version()
+        )
+    }
+    fn end_marker(&self) -> String {
+        format!(
+            "# cas:managed:{}:{}:end",
+            self.block_type(),
+            self.marker_version()
+        )
     }
 }
 

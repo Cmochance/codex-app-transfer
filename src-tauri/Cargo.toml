@@ -48,6 +48,10 @@ sha2 = { version = "0.10", features = ["oid"] }
 # 双侧 verify 通过 admin::signature::verify_signed_bytes)。算法跟 xtask/release_bundle.rs
 # 对称: xtask sign side / src-tauri verify side 同 crate 同版本, 防 cross-impl drift。
 rsa = { version = "0.9", features = ["sha2", "pem"] }
+# toml_edit 保留注释 / 字段顺序 / 空行,用于 #24 MCP tab 的 config.toml 受管块
+# (TomlManagedBlock variant 解析 [mcp_servers.<name>] table 时不能丢用户注释)。
+# 普通 `toml` crate from_str + to_string 会丢注释 → marker 注释失效, 不可用。
+toml_edit = "0.22"
 # cross-process file locking — config.json RMW 跨实例(双开 .app)防 lost-update。
 # 进程内 std::sync::Mutex 不管多 OS 进程,fs2::FileExt::lock_exclusive 走 fcntl
 # (POSIX) / LockFileEx (Windows),OS 级独占。
