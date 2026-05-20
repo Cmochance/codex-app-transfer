@@ -592,8 +592,8 @@ pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u
             "compact summary quality check failed: {reason}. \
              The model did not produce a valid context summary. \
              Raw output length: {} chars, summary length: {} chars.",
-            raw.len(),
-            summary.len(),
+            raw.chars().count(),
+            summary.chars().count(),
         )));
     }
 
@@ -623,22 +623,26 @@ pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u
 /// 用户原话被当成模板回显)。
 ///
 /// 返回 `Ok(())` 表示通过,`Err(reason)` 表示校验失败(附原因说明)。
+///
+/// **必须用 `chars().count()` 而非 `len()`**:本项目大量中文用户,中文每字符
+/// UTF-8 是 3 bytes,`.len()` 用 byte 计数会让 800 byte ≈ 267 中文字符就通过,
+/// 阈值实际比文档/错误消息标注的 "800 chars" 宽松 3 倍。同模块其它字符计数
+/// 路径(`shortened_text` 等)已用 `chars().count()`,这里对齐。
 fn validate_compact_summary_quality(summary: &str) -> Result<(), String> {
-    if summary.len() < 800 {
+    let char_count = summary.chars().count();
+    if char_count < 800 {
         return Err(format!(
-            "summary too short ({} chars, minimum 800)",
-            summary.len()
+            "summary too short ({char_count} chars, minimum 800)"
         ));
     }
 
     let has_markdown_header = summary
         .lines()
         .any(|line| matches!(line.trim_start().as_bytes(), [b'#', ..]));
-    if !has_markdown_header && summary.len() < 1500 {
+    if !has_markdown_header && char_count < 1500 {
         return Err(format!(
-            "summary lacks markdown headers and is short ({} chars); \
-             likely not a valid context summary",
-            summary.len()
+            "summary lacks markdown headers and is short ({char_count} chars); \
+             likely not a valid context summary"
         ));
     }
 
@@ -1253,6 +1257,24 @@ mod tests {
         assert!(validate_compact_summary_quality("short").is_err());
         assert!(validate_compact_summary_quality("").is_err());
         assert!(validate_compact_summary_quality(&"a".repeat(799)).is_err());
+    }
+
+    #[test]
+    fn quality_check_counts_characters_not_bytes_for_cjk() {
+        // 防 byte/chars 回归(Devin Review):中文每字符 UTF-8 是 3 bytes。
+        // 300 个汉字 = 900 bytes 但只 300 字符,应该 reject(< 800 char 门槛)。
+        let cjk_300 = "中".repeat(300);
+        assert_eq!(cjk_300.len(), 900, "前置断言:确认 byte 长度 ≥ 800");
+        assert_eq!(cjk_300.chars().count(), 300);
+        let result = validate_compact_summary_quality(&cjk_300);
+        assert!(
+            result.is_err(),
+            "300 中文字符必须被判过短(不能因 900 byte 误判通过)"
+        );
+        assert!(
+            result.unwrap_err().contains("300 chars"),
+            "错误消息必须显示字符数而非字节数"
+        );
     }
 
     #[test]
