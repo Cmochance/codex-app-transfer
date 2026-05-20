@@ -39,85 +39,57 @@ use crate::types::{AdapterError, ByteStream, ResponsePlan};
 
 use super::request::responses_body_to_chat_body_for_provider;
 
-/// **v2.0.12 prompt rewrite**:从原 Codex CLI 的 86 字符 prompt 改为 Claude Code
-/// 风格的 9-section 结构化 prompt(精简移植自 Piebald-AI/claude-code-system-prompts
-/// 反编译公开版本 `agent-prompt-conversation-summarization.md`)。
+/// **#219 fix prompt rewrite**:从 v2.0.12 的 9-section + few-shot example
+/// 长 prompt(~3300 chars)换回上游 Codex CLI 的短指令风格(~460 chars),
+/// 仅补两条 Claude Code 关键锚定 bullet(All User Messages verbatim +
+/// Next Step verbatim quote)。最终 ~800 chars,真机 DeepSeek v4-pro 实测:
+/// 相对 9-section 长版本快 ~40% / 省 ~48% token,但保留下一轮任务锚定能力。
 ///
-/// ## 为什么改
+/// ## 借鉴出处
 ///
-/// 原 Codex prompt(86 字符)对 GPT-5 系列指令遵循够用,但接到第三方 provider
-/// (Kimi/MiMo/DeepSeek)指令遵循能力相对弱,实测 summary 只记最近 1-2 个动作,
-/// 丢任务目标 / 文件路径 / 历次 user 主诉 → 用户体感"compact 后断片"。
-/// (用户反馈截图:"在 curl 网页"不知道 curl 什么 / 为什么。)
+/// - 基础结构:`openai/codex` 仓库 `codex-rs/core/templates/compact/prompt.md`
+///   (Apache-2,460 字符,适配 GPT-5 强指令遵循)。
+/// - "All user messages verbatim" + "Next Step verbatim quote" 两条 bullet
+///   措辞:Piebald-AI/claude-code-system-prompts 反编译公开版本
+///   `agent-prompt-conversation-summarization.md` 的第 6 / 9 段。
 ///
-/// Claude Code "几乎感觉不到断点" 不是模型更强,是 **prompt 把"必须保留什么"
-/// 枚举死了**:9 个固定 section、chronological 强制要求、ALL user messages
-/// 逐字列、Next Step 强制 verbatim quote 最近用户诉求。
+/// ## 为什么换回短 prompt
 ///
-/// ## 关键设计点
+/// v2.0.12 加 9-section schema + few-shot example 的初衷是"用结构强约束让
+/// 弱指令模型必填字段",但反直觉的是:
 ///
-/// 1. **`<analysis>` + `<summary>` 二段输出**:让模型先做时序 chain-of-thought
-///    再生 summary;`collect_and_wrap_compact_body` 抽 `<summary>` 段落注入
-///    下一轮(避免 analysis 部分污染 history)。
-/// 2. **9 section 强 schema**:每条 section 用 markdown header,模型只能填空。
-/// 3. **All User Messages 必须逐字列**(section 6):防丢历次主诉 —
-///    用户中途换需求 / 给反馈是最常被压缩掉的信息。
-/// 4. **Next Step 强制 verbatim quote**(section 9):最近用户原话引用,防 drift。
-/// 5. **Files and Code Sections 含具体文件路径 + 完整 snippets**(section 3):
-///    防丢实现细节(用户截图里 "curl 网页"不知道 curl 什么 = 这条 section 没填)。
-/// 6. **末尾 few-shot example**:第三方 provider 没 example 时输出格式飘,
-///    给一段示范让模型对齐结构(花费几百 token 换稳定输出)。
-const COMPACT_SUMMARIZATION_PROMPT: &str = "Your task is to create a detailed CONTEXT CHECKPOINT summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions. This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing the work without losing context.
+/// 1. **DeepSeek v4-pro 真机测试**:9-section 长 prompt 与短 prompt 都正常
+///    产出 summary,无模板/example 回显。issue #219 阶段三那次"模板回显"
+///    可能是 sampling 偶发或上下文极致超长触发的退化,常规 case 不复现。
+/// 2. **长 prompt 反而拖慢**:同一对话历史,长 prompt 94s / 4254 tokens,
+///    短 prompt 44s / 1699 tokens,混合版 57s / 2198 tokens。
+/// 3. **业界共识**:long prompts 稀释模型注意力,chunk-and-merge 比单轮
+///    长 prompt 更可靠。
+///
+/// ## 保留的关键能力(借鉴 Claude Code 第 6/9 段)
+///
+/// 1. **All User Messages verbatim 列表**:防丢用户中途意图变化 —
+///    任何长对话中,用户的修正 / 反馈 / 换需求是最易被压缩掉的信息。
+/// 2. **Next Step + 最近用户原话 verbatim quote**:防任务漂移 —
+///    下一轮模型读到原话引用即知道"我接续到哪里",不靠总结模型的推断。
+///
+/// ## 不保留的字段(相对 v2.0.12)
+///
+/// `<analysis>` / `<summary>` 二段输出、9-section 强 schema、few-shot
+/// example 全部移除。模型可自由选择 markdown / 段落 / 列表组织答案,
+/// `extract_summary_section` 在无 `<summary>` tag 时直接 raw fallback
+/// (本来就是容错路径,现在成为常规路径)。
+const COMPACT_SUMMARIZATION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts. In your analysis:
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
+- **All user messages so far, verbatim or near-verbatim, in chronological order** — this preserves intent shifts that get lost otherwise
+- **Next Step** — the immediate next action aligned with the user's most recent explicit request. Include a **verbatim direct quote** from the most recent user message showing exactly where you left off; this prevents task drift.
 
-1. Chronologically walk through every message in the conversation. For each message identify:
-   - The user's explicit requests and intents
-   - Your approach to addressing those requests
-   - Key decisions, technical concepts, and code patterns
-   - Specific details: file paths, full code snippets, function signatures, command-line invocations, URLs, configuration values
-   - Errors encountered and how they were fixed
-   - Any user feedback that asked you to do something differently — capture this verbatim
-
-2. Double-check that your analysis covers every request the user made and every concrete artifact (file, command, URL, error message) referenced.
-
-After the analysis, provide your summary inside <summary> tags using EXACTLY these nine sections in this order:
-
-1. **Primary Request and Intent**: All of the user's explicit requests captured in detail. Include the original phrasing where possible.
-2. **Key Technical Concepts**: Technologies, frameworks, libraries, protocols, and tools that came up.
-3. **Files and Code Sections**: Enumerate every file you examined / modified / created. Use absolute paths when known. Include the most important code snippets verbatim.
-4. **Errors and Fixes**: Every error you ran into and exactly how it was resolved. Note any user correction verbatim.
-5. **Problem Solving**: Problems solved and ongoing troubleshooting threads.
-6. **All User Messages**: List ALL user messages (excluding tool results) verbatim or near-verbatim, in chronological order. This is critical — it preserves intent shifts that get lost otherwise.
-7. **Pending Tasks**: Tasks the user explicitly asked for that are not yet completed.
-8. **Current Work**: Precisely what was being worked on right before this checkpoint. Include relevant file names and code snippets.
-9. **Next Step**: The immediate next action, DIRECTLY in line with the user's most recent explicit request. Include a verbatim direct quote from the most recent user message showing exactly where you left off — this prevents task drift.
-
-Be thorough and structured. Do NOT compress at the cost of losing file paths, command-line invocations, URLs, error messages, or the user's literal words. The next LLM should be able to seamlessly continue the work without asking the user to re-explain anything.
-
-<example>
-<analysis>
-The user started by asking to review the auth module for race conditions. I read src/auth/login.rs:120-180 and found a TOCTOU on session_token validation. The user then corrected me, saying \"actually the bug is in refresh, not login\". I switched to src/auth/refresh.rs:45-90 and found the actual race in cache invalidation. Final user message before this checkpoint: \"add a regression test for the refresh race\".
-</analysis>
-
-<summary>
-1. **Primary Request and Intent**: Review the auth module for race conditions; the user clarified the bug was in the refresh path, not login.
-2. **Key Technical Concepts**: TOCTOU race, session token validation, cache invalidation, tokio Mutex.
-3. **Files and Code Sections**:
-   - `src/auth/login.rs:120-180`: original suspicion (false positive — no actual race here).
-   - `src/auth/refresh.rs:45-90`: actual race in cache invalidation between `lookup` and `replace`.
-4. **Errors and Fixes**: Initially misidentified the buggy file. User correction (verbatim): \"actually the bug is in refresh, not login\".
-5. **Problem Solving**: Identified the race, designed fix using `tokio::sync::Mutex` around the lookup-replace section.
-6. **All User Messages**:
-   - \"review the auth module for race conditions\"
-   - \"actually the bug is in refresh, not login\"
-   - \"add a regression test for the refresh race\"
-7. **Pending Tasks**:
-   - Add regression test for the refresh race.
-8. **Current Work**: Just identified the race in `src/auth/refresh.rs:45-90`; designed the Mutex fix but have not yet written code.
-9. **Next Step**: Add a regression test for the refresh race, per user's most recent message: \"add a regression test for the refresh race\".
-</summary>
-</example>";
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.";
 
 /// 抄自 `openai/codex` 仓库 `codex-rs/core/templates/compact/summary_prefix.md` (Apache-2).
 /// Codex CLI 反序列化 compact 响应后,通过 `is_summary_message`(`startswith(PREFIX)`)
@@ -538,10 +510,24 @@ pub(crate) fn build_compact_response_plan(
     upstream_headers.remove(http::header::TRANSFER_ENCODING);
 
     let stream_with_logic = Box::pin(futures_util::stream::once(async move {
-        let body = collect_and_wrap_compact_body(upstream_status, upstream_stream)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        Ok::<Bytes, std::io::Error>(Bytes::from(body))
+        match collect_and_wrap_compact_body(upstream_status, upstream_stream).await {
+            Ok(body) => Ok::<Bytes, std::io::Error>(Bytes::from(body)),
+            Err(e) => {
+                // fix #219: 当 compact summary 质量校验失败时,返回结构化
+                // 错误 JSON body(模拟 OpenAI 错误格式),让 Codex CLI 感知
+                // compact 失败并保留原上下文,而非收到流中断。
+                let error_body = json!({
+                    "error": {
+                        "message": e.to_string(),
+                        "type": "compact_error",
+                        "code": "compact_failed",
+                    }
+                });
+                let bytes =
+                    serde_json::to_vec(&error_body).unwrap_or_else(|_| e.to_string().into_bytes());
+                Ok(Bytes::from(bytes))
+            }
+        }
     }));
 
     Ok(ResponsePlan {
@@ -593,11 +579,23 @@ async fn collect_and_wrap_compact_body(
 }
 
 pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u8>, AdapterError> {
-    // B1:抽 `<summary>...</summary>` tag 内容(配合 v2.0.12 prompt 强制
-    // `<analysis>` + `<summary>` 二段输出),无 tag 时容错回退原文。
-    // 不抽 analysis 部分,避免污染下一轮 history(模型 chain-of-thought
-    // 的 meta-discussion 进 history 后会让续轮模型被带偏)。
+    // B1:抽 `<summary>...</summary>` tag 内容。新短 prompt 不要求此格式,
+    // raw fallback(无 tag 时返回原文)是常规路径;tag 解析保留作向后容错。
     let summary = extract_summary_section(raw).trim().to_owned();
+
+    // B2 (fix #219): 校验 summary 输出质量。第三方模型(DeepSeek 等)可能:
+    // - 输出过短无信息量
+    // - 输出整段格式说明而非实际 summary
+    // 校验失败时返回错误,让 Codex CLI 保留原上下文不压缩(优于注入无效摘要)。
+    if let Err(reason) = validate_compact_summary_quality(&summary) {
+        return Err(AdapterError::Internal(format!(
+            "compact summary quality check failed: {reason}. \
+             The model did not produce a valid context summary. \
+             Raw output length: {} chars, summary length: {} chars.",
+            raw.chars().count(),
+            summary.chars().count(),
+        )));
+    }
 
     let encrypted_content = format!("{COMPACT_SUMMARY_PREFIX}\n{summary}");
     let compact_response = json!({
@@ -610,15 +608,61 @@ pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u
         .map_err(|e| AdapterError::Internal(format!("serialize compact response: {e}")))
 }
 
-/// 从模型输出中抽 `<summary>...</summary>` 段落 — 配合 v2.0.12 prompt 强制
-/// `<analysis>` + `<summary>` 二段输出。容错策略:
+/// 校验 compact summary 的输出质量。
 ///
-/// - 找到第一个 `<summary>` 和最后一个 `</summary>`,返回中间内容
-/// - 无 `<summary>` tag → 返回 raw(可能模型没遵守格式,先用着,日志会
-///   反映 summary 质量)
+/// **#219 fix 后的精简策略**(2 道校验,从 v2.0.12 的 4 道砍掉 2 道):
+///
+/// 1. **C1 长度门槛**(800 字符):合格 summary 实测 1.4K-7K chars,800 留余量。
+/// 2. **C4 通用结构信号**:summary 必须含至少 1 个 markdown header
+///    (`#`, `##`, `###` 开头的行)或长度 ≥ 1500 chars 自由格式 — 防短而无结构
+///    的"我不知道怎么总结"式无效输出。
+///
+/// 删掉的 C2 / C3(few-shot 指纹 / 模板指令回显)是为 v2.0.12 长 prompt
+/// 配套的防御,新短 prompt 没 few-shot example、也没 9-section 强 schema,
+/// 这两类回显模式不存在,继续校验只会误伤合法输出(如 `<analysis>` 段引用
+/// 用户原话被当成模板回显)。
+///
+/// 返回 `Ok(())` 表示通过,`Err(reason)` 表示校验失败(附原因说明)。
+///
+/// **必须用 `chars().count()` 而非 `len()`**:本项目大量中文用户,中文每字符
+/// UTF-8 是 3 bytes,`.len()` 用 byte 计数会让 800 byte ≈ 267 中文字符就通过,
+/// 阈值实际比文档/错误消息标注的 "800 chars" 宽松 3 倍。同模块其它字符计数
+/// 路径(`shortened_text` 等)已用 `chars().count()`,这里对齐。
+fn validate_compact_summary_quality(summary: &str) -> Result<(), String> {
+    let char_count = summary.chars().count();
+    if char_count < 800 {
+        return Err(format!(
+            "summary too short ({char_count} chars, minimum 800)"
+        ));
+    }
+
+    let has_markdown_header = summary
+        .lines()
+        .any(|line| matches!(line.trim_start().as_bytes(), [b'#', ..]));
+    if !has_markdown_header && char_count < 1500 {
+        return Err(format!(
+            "summary lacks markdown headers and is short ({char_count} chars); \
+             likely not a valid context summary"
+        ));
+    }
+
+    Ok(())
+}
+
+/// 从模型输出中抽 `<summary>...</summary>` 段落。
+///
+/// **现状(#219 fix 后)**:新短 prompt 不要求 `<analysis>` + `<summary>` 二段输出,
+/// 模型通常直接以 markdown / 段落形式回复,**raw fallback 是常规路径**。
+///
+/// `<summary>` tag 解析保留作向后容错:若未来某个 prompt 变体重新用 XML 包裹,
+/// 或极少数模型自发输出 `<summary>` 标签,此分支仍可正确提取。
+///
+/// - 无 `<summary>` tag → 返回 raw(常规路径)
+/// - 有 `<summary>` tag → 取**最后一个**出现点之后的内容(防历史遗留 prompt echo)
 /// - 有 `<summary>` 无 `</summary>`(模型截断) → 返回 `<summary>` 之后所有文本
 fn extract_summary_section(raw: &str) -> &str {
-    let Some(start) = raw.find("<summary>") else {
+    // 取最后一个 <summary> 避免遗留 prompt echo 干扰。
+    let Some(start) = raw.rfind("<summary>") else {
         return raw;
     };
     let after = &raw[start + "<summary>".len()..];
@@ -756,8 +800,7 @@ mod tests {
                 .last()
                 .and_then(|m| m.get("content"))
                 .and_then(|v| v.as_str())
-                .is_some_and(|text| text
-                    .contains("Your task is to create a detailed CONTEXT CHECKPOINT summary")),
+                .is_some_and(|text| text.contains("performing a CONTEXT CHECKPOINT COMPACTION")),
             "compact summary prompt 仍应作为最后一条 user message 注入"
         );
     }
@@ -887,12 +930,12 @@ mod tests {
             "last user message 必须含 SUMMARIZATION_PROMPT 关键字 'CONTEXT CHECKPOINT',实际:{last_content}"
         );
         assert!(
-            last_content.contains("All User Messages"),
-            "9-section schema 必须含 'All User Messages' 段名"
+            last_content.contains("All user messages"),
+            "prompt 必须含 'All user messages' bullet(下一轮模型 verbatim 锚定)"
         );
         assert!(
-            last_content.contains("<analysis>") && last_content.contains("<summary>"),
-            "二段输出格式必须出现在 prompt 里"
+            last_content.contains("Next Step") && last_content.contains("verbatim direct quote"),
+            "prompt 必须含 Next Step + verbatim quote bullet(防任务漂移)"
         );
 
         // 原 instructions **不应**进 system/任何 message(摘要任务不受原任务 system 影响)
@@ -1035,14 +1078,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_summary_section_picks_outermost_when_nested_or_repeated() {
-        // 防御:few-shot example 里也有 `<summary>` 被模型直接 echo 出来时
-        // 用 first-open + last-close,取最外层。
-        let raw = "<summary>real <summary>nested example</summary> content</summary>";
+    fn extract_summary_section_picks_last_when_echo_present() {
+        // rfind 取最后一个 <summary>,跳过历史遗留 prompt echo 干扰。
+        // 当模型 echo 旧格式 prompt 后再输出自己的 summary 时,取最后一个。
+        let raw =
+            "<summary>example echo content</summary>\n<summary>actual model output here</summary>";
         assert_eq!(
             extract_summary_section(raw).trim(),
-            "real <summary>nested example</summary> content"
+            "actual model output here"
         );
+    }
+
+    #[test]
+    fn extract_summary_section_single_pair_unchanged() {
+        // 单对 <summary>...</summary> 行为不变
+        let raw = "<analysis>meta</analysis>\n<summary>good summary content</summary>";
+        assert_eq!(extract_summary_section(raw).trim(), "good summary content");
     }
 
     fn one_chunk_stream(bytes: Vec<u8>) -> ByteStream {
@@ -1051,14 +1102,32 @@ mod tests {
         }))
     }
 
+    /// 测试用 helper:把 caller 给的 marker 文本包成至少 850 字符 + 带 markdown
+    /// header,以同时满足 `validate_compact_summary_quality` 的 C1(≥800 chars)
+    /// 和 C4(至少 1 个 markdown header)门槛。
+    fn long_valid_summary(marker: &str) -> String {
+        let mut out = String::from("## Context Checkpoint Summary\n\n");
+        out.push_str(marker);
+        out.push_str("\n\n");
+        let padding = "Additional handoff context preserved verbatim from prior turns to ensure the next LLM can resume without re-asking. ";
+        while out.len() < 850 {
+            out.push_str(padding);
+        }
+        out
+    }
+
     #[tokio::test]
     async fn collect_and_wrap_extracts_summary_into_compaction_item() {
+        // summary 需 >= 800 chars + markdown header 以通过质量校验(fix #219)
+        let summary_content = long_valid_summary(
+            "Primary Request: refactor the authentication module to support OAuth2 flows and PKCE.",
+        );
         let upstream_body = serde_json::to_vec(&json!({
             "id": "chatcmpl_x",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": "summary text body"},
+                "message": {"role": "assistant", "content": summary_content},
                 "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
@@ -1077,24 +1146,23 @@ mod tests {
             enc.starts_with(COMPACT_SUMMARY_PREFIX),
             "encrypted_content 必须以 SUMMARY_PREFIX 开头(Codex CLI 用它识别 summary)"
         );
-        assert!(enc.ends_with("summary text body"));
+        assert!(enc.contains("OAuth2 flows and PKCE"));
     }
 
     #[tokio::test]
     async fn collect_and_wrap_strips_analysis_keeps_only_summary_in_encrypted_content() {
-        // v2.0.12 关键回归:上游模型按 prompt 输出 `<analysis>` + `<summary>`,
-        // 我们必须只把 `<summary>` 段塞进 encrypted_content,不能把 analysis
-        // chain-of-thought 也塞进下一轮 history(会污染续轮模型注意力)。
-        let model_output = "<analysis>\n\
-            User asked X, I did Y, then user corrected to Z.\n\
-            </analysis>\n\
-            <summary>\n\
-            1. Primary Request: do Z\n\
-            2. Files: /abs/foo.rs\n\
-            6. All User Messages:\n\
-            - \"do X\"\n\
-            - \"actually do Z\"\n\
-            </summary>";
+        // 即便新 prompt 不再要求 `<analysis>` + `<summary>` 二段输出,模型如果
+        // 自发产出二段格式时 `extract_summary_section` 仍应正确剥离 analysis
+        // chain-of-thought(避免污染下一轮 history)。函数仍是 raw fallback 容错
+        // 兼 tag 抽取,本测试验证 tag 抽取分支的行为。
+        // 注:`<summary>` 内文本仍需 >= 800 chars + markdown header 通过质量校验。
+        let summary_inner = long_valid_summary(
+            "Primary Request: User requested to do Z after initially asking X. \
+             Last user message verbatim: \"actually do Z\".",
+        );
+        let model_output = format!(
+            "<analysis>\nUser asked X, I did Y, then user corrected to Z. This is detailed chain-of-thought.\n</analysis>\n<summary>\n{summary_inner}\n</summary>"
+        );
         let upstream_body = serde_json::to_vec(&json!({
             "choices": [{
                 "message": {"role": "assistant", "content": model_output},
@@ -1109,7 +1177,6 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         let enc = parsed["output"][0]["encrypted_content"].as_str().unwrap();
         assert!(enc.starts_with(COMPACT_SUMMARY_PREFIX));
-        // 只保留 summary 部分
         assert!(
             !enc.contains("<analysis>") && !enc.contains("</analysis>"),
             "analysis tag 不应进 encrypted_content"
@@ -1118,17 +1185,19 @@ mod tests {
             !enc.contains("User asked X, I did Y"),
             "analysis chain-of-thought 内容不应被保留"
         );
-        // summary 内容保留
-        assert!(enc.contains("Primary Request: do Z"));
-        assert!(enc.contains("All User Messages"));
+        assert!(enc.contains("Primary Request"));
         assert!(enc.contains("\"actually do Z\""));
     }
 
     #[tokio::test]
     async fn collect_and_wrap_chunked_upstream_response() {
         // 上游分多 chunk 来,我们应该正确拼接后解析
+        // 注:summary 需 >= 800 chars + markdown header 以通过质量校验
+        let chunked_summary = long_valid_summary(
+            "Primary Request: User asked to implement chunked transfer encoding support for the proxy layer.",
+        );
         let upstream_body = serde_json::to_vec(&json!({
-            "choices": [{"message": {"content": "chunked summary"}, "finish_reason": "stop"}]
+            "choices": [{"message": {"content": chunked_summary}, "finish_reason": "stop"}]
         }))
         .unwrap();
         let mid = upstream_body.len() / 2;
@@ -1145,7 +1214,7 @@ mod tests {
         assert!(parsed["output"][0]["encrypted_content"]
             .as_str()
             .unwrap()
-            .ends_with("chunked summary"));
+            .contains("chunked transfer encoding"));
     }
 
     #[tokio::test]
@@ -1179,5 +1248,83 @@ mod tests {
         assert!(err
             .to_string()
             .contains("missing choices[0].message.content"));
+    }
+
+    // ── validate_compact_summary_quality (fix #219) ──────────────────
+
+    #[test]
+    fn quality_check_rejects_too_short_summary() {
+        assert!(validate_compact_summary_quality("short").is_err());
+        assert!(validate_compact_summary_quality("").is_err());
+        assert!(validate_compact_summary_quality(&"a".repeat(799)).is_err());
+    }
+
+    #[test]
+    fn quality_check_counts_characters_not_bytes_for_cjk() {
+        // 防 byte/chars 回归(Devin Review):中文每字符 UTF-8 是 3 bytes。
+        // 300 个汉字 = 900 bytes 但只 300 字符,应该 reject(< 800 char 门槛)。
+        let cjk_300 = "中".repeat(300);
+        assert_eq!(cjk_300.len(), 900, "前置断言:确认 byte 长度 ≥ 800");
+        assert_eq!(cjk_300.chars().count(), 300);
+        let result = validate_compact_summary_quality(&cjk_300);
+        assert!(
+            result.is_err(),
+            "300 中文字符必须被判过短(不能因 900 byte 误判通过)"
+        );
+        assert!(
+            result.unwrap_err().contains("300 chars"),
+            "错误消息必须显示字符数而非字节数"
+        );
+    }
+
+    #[test]
+    fn quality_check_passes_summary_with_markdown_header() {
+        // C4 通用化:任何 `#` 起头的 markdown header 都算合法结构信号,
+        // 不再要求严格九段 schema(已不强制九段了)
+        let summary = long_valid_summary(
+            "Primary Request: User wants to add dark mode toggle to settings page. \
+             Next Step (verbatim): \"make sure it persists across sessions\".",
+        );
+        assert!(validate_compact_summary_quality(&summary).is_ok());
+    }
+
+    #[test]
+    fn quality_check_passes_long_free_form_without_headers() {
+        // 没有 markdown header 但实质内容超长(≥ 1500 chars)的自由格式仍应通过 —
+        // 一些模型会用纯段落而不是 markdown 结构作答
+        let free_form_chunk = "The user has been working on implementing a WebSocket server \
+            for real-time notifications. They started by setting up the tokio runtime \
+            and configuring the hyper server to handle upgrade requests. The main files \
+            involved are src/ws/server.rs and src/ws/handler.rs. They encountered an \
+            issue with the handshake failing due to missing Sec-WebSocket-Accept header \
+            computation. This was fixed by using the sha1 crate to compute the correct \
+            response hash. The user then asked to add message broadcasting to all \
+            connected clients using a shared state protected by Arc<RwLock>. ";
+        let free_form = format!("{free_form_chunk}{free_form_chunk}{free_form_chunk}");
+        assert!(free_form.len() >= 1500);
+        assert!(validate_compact_summary_quality(&free_form).is_ok());
+    }
+
+    #[test]
+    fn quality_check_rejects_short_summary_without_header() {
+        // ≥ 800 chars 但 < 1500 chars 且无 markdown header → 拒绝
+        let s = "x".repeat(1000);
+        assert!(!s.lines().any(|l| l.starts_with('#')));
+        let result = validate_compact_summary_quality(&s);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("lacks markdown headers"));
+    }
+
+    #[tokio::test]
+    async fn collect_and_wrap_returns_error_on_quality_failure() {
+        // 当 summary 质量校验失败时,应返回错误
+        let upstream_body = serde_json::to_vec(&json!({
+            "choices": [{"message": {"content": "too short"}, "finish_reason": "stop"}]
+        }))
+        .unwrap();
+        let err = collect_and_wrap_compact_body(StatusCode::OK, one_chunk_stream(upstream_body))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("quality check failed"));
     }
 }

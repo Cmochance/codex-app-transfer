@@ -84,10 +84,23 @@ pub fn build_anthropic_compact_response_plan(
     upstream_headers.remove(http::header::TRANSFER_ENCODING);
 
     let stream_with_logic = Box::pin(stream::once(async move {
-        let body = collect_and_wrap_anthropic_compact_body(upstream_status, upstream_stream)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        Ok::<Bytes, std::io::Error>(Bytes::from(body))
+        match collect_and_wrap_anthropic_compact_body(upstream_status, upstream_stream).await {
+            Ok(body) => Ok::<Bytes, std::io::Error>(Bytes::from(body)),
+            Err(e) => {
+                // fix #219: 与 OpenAI compact path 对齐 — 质量校验失败时返回
+                // 结构化错误 JSON,而非流中断。
+                let error_body = serde_json::json!({
+                    "error": {
+                        "message": e.to_string(),
+                        "type": "compact_error",
+                        "code": "compact_failed",
+                    }
+                });
+                let bytes =
+                    serde_json::to_vec(&error_body).unwrap_or_else(|_| e.to_string().into_bytes());
+                Ok(Bytes::from(bytes))
+            }
+        }
     }));
 
     Ok(ResponsePlan {
