@@ -3,6 +3,42 @@ use serde_json::{json, Value};
 
 use super::provider_looks_like;
 
+/// Codex freeform tool name we special-case. See the `"custom" =>` arm in
+/// `convert_responses_tool_to_chat_tool` below for the request-side rewrite
+/// rationale, and `converter.rs::close_tool_call` for the response-side
+/// wire re-shape — they must trigger on the exact same tool name.
+pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
+
+/// Chat-path replacement for Codex CLI's freeform `apply_patch` description.
+/// Original upstream text says "do not wrap the patch in JSON" because the
+/// Responses API freeform/lark grammar accepts raw text — but on the
+/// chat-completions path the model MUST emit a function call whose `input`
+/// argument is a JSON string containing the V4A patch. We rewrite the
+/// description so the model sees instructions consistent with the wire
+/// format it has to produce.
+pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
+    "Edit files using the apply_patch tool. ",
+    "Call this function with a single `input` string containing a V4A patch. ",
+    "The patch must start with `*** Begin Patch` and end with `*** End Patch`. ",
+    "Each file operation header is one of `*** Add File: <path>`, ",
+    "`*** Update File: <path>` (optionally followed by `*** Move to: <path>`), ",
+    "or `*** Delete File: <path>`. ",
+    "Within Update hunks, use `@@ <context> @@` markers, prefix unchanged lines ",
+    "with a single space, removed lines with `-`, and added lines with `+`. ",
+    "Use relative paths only (never absolute). ",
+    "Embed real newlines as `\\n` inside the JSON string value for `input`."
+);
+
+/// Chat-path replacement for the freeform `input` parameter description.
+/// Mirrors `APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT` but at the parameter level,
+/// so the model sees the format constraint regardless of whether providers
+/// surface tool-level or parameter-level descriptions more prominently.
+pub(crate) const APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT: &str = concat!(
+    "A V4A patch starting with `*** Begin Patch` and ending with `*** End Patch`. ",
+    "Use `*** Add File:`, `*** Update File:`, or `*** Delete File:` headers and ",
+    "`@@ ... @@` hunks with ` `/`+`/`-` line prefixes. Relative paths only."
+);
+
 /// Responses tool 定义 → Chat tool 定义.
 /// 把单个 Responses API tool 转成零或多个 Chat Completions tool。
 ///
@@ -53,23 +89,51 @@ pub fn convert_responses_tool_to_chat_tool(
             })]
         }
         "custom" => {
-            // Custom tool(无 JSON schema)降级为接受单字符串 input 的 function
+            // Custom tool(Responses API freeform tool,无 JSON schema)降级为
+            // 接受单字符串 input 的 function tool — chat completions 不认
+            // `type:"custom"`,DeepSeek / Kimi / MiMo 等 chat 上游必须走 function。
+            //
+            // **apply_patch 特判**:Codex CLI 把 apply_patch 作为 freeform 工具
+            // 注册,wire description 是 "Use the `apply_patch` tool to edit files.
+            // This is a FREEFORM tool, so do not wrap the patch in JSON."
+            // (上游 `codex-rs/core/src/tools/handlers/apply_patch_spec.rs` 实证)。
+            // 经 chat function-call 反而**必须**把 patch 包进 JSON 字符串值 ——
+            // 上游的 "do not wrap in JSON" 指令在 chat 路径下会误导模型,
+            // 且原 description 没给 V4A 格式样例。这里替换成对 chat 路径准确
+            // 的指引,把 V4A 关键字 / 文件操作头 / hunk 标记列清楚,让 DeepSeek
+            // 之类的模型知道 input 字段该填什么。
+            // 响应侧(converter.rs::close_tool_call)对 name==apply_patch 特判,
+            // 把模型回来的 function_call 重新打包成 custom_tool_call wire,
+            // 让 Codex CLI router (`ResponseItem::CustomToolCall`) 正确路由到
+            // apply_patch handler(handler 硬要求 `ToolPayload::Custom { input }`,
+            // 见 `codex-rs/core/src/tools/handlers/apply_patch.rs:324`)。
             let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let description = obj
+            let original_description = obj
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let (tool_description, input_description) = if name == APPLY_PATCH_TOOL_NAME {
+                (
+                    APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT.to_owned(),
+                    APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT.to_owned(),
+                )
+            } else {
+                (
+                    original_description.to_owned(),
+                    "Free-form input passed verbatim to the tool.".to_owned(),
+                )
+            };
             vec![json!({
                 "type": "function",
                 "function": {
                     "name": name,
-                    "description": description,
+                    "description": tool_description,
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "input": {
                                 "type": "string",
-                                "description": "Free-form input passed verbatim to the tool.",
+                                "description": input_description,
                             }
                         },
                         "required": ["input"],

@@ -65,6 +65,41 @@ struct PendingToolCall {
     name: String,
     args_acc: String,
     closed: bool,
+    /// 首帧 name == `apply_patch` 时置 true,整个 item 走 Responses
+    /// `custom_tool_call` wire(`output_item.added/done` 的 `type` 字段、
+    /// 流式事件 name、args 解包都按 custom 路径走)而不是 `function_call`。
+    /// 见 [`is_apply_patch_tool_name`] 和 `close_tool_call` 注释。
+    is_apply_patch: bool,
+    /// `response.output_item.added` 是否已经 emit 过 — 一旦 emit,后续帧
+    /// 补全的 `tc.id` 不再覆盖 `call_id`,避免 `output_item.added` 用旧 id 而
+    /// 后续 `input.delta` / `output_item.done` 用新 id,严格客户端会两次解读
+    /// 为不同 item。
+    output_item_added_emitted: bool,
+    /// 仅 apply_patch 用:`close_tool_call` 把 args_acc 解出的裸 V4A 文本
+    /// 缓存到这里;`tool_call_item_completed` 读这个字段而不是重新 parse,
+    /// 保证流式 `output_item.done` 跟 envelope `output[]` 的 input 字符串
+    /// 完全一致(避免 args_acc 在 close 与 envelope 构造之间发生变化时
+    /// 静默 drift)。
+    apply_patch_input: Option<String>,
+}
+
+/// Codex CLI 把 `apply_patch` 作为 freeform 工具注册
+/// (`codex-rs/core/src/tools/handlers/apply_patch_spec.rs` —
+/// `ToolSpec::Freeform { name: "apply_patch", ... }`),响应侧 router
+/// (`codex-rs/core/src/tools/router.rs:92-130`)按 wire item type 路由:
+/// `ResponseItem::FunctionCall` → `ToolPayload::Function { arguments }`,
+/// `ResponseItem::CustomToolCall` → `ToolPayload::Custom { input }`,而
+/// apply_patch handler 硬要求 `ToolPayload::Custom`,收 Function 直接返回
+/// `"apply_patch handler received unsupported payload"` → abort
+/// (`codex-rs/core/src/tools/handlers/apply_patch.rs:324`)。本 adapter
+/// 把 chat completions provider(DeepSeek / Kimi / MiMo 等)回来的
+/// `tool_calls[]` 默认渲染成 `function_call` wire,所以必须对 apply_patch
+/// 特判 — 用 `custom_tool_call` wire 给 Codex CLI 才不 abort。
+///
+/// 名字以常量集中是为了和 `request/tools.rs::APPLY_PATCH_TOOL_NAME` 对齐
+/// 字符串一致性(请求侧的特判描述 / 响应侧的 wire 重打包必须按同一 name 触发)。
+fn is_apply_patch_tool_name(name: &str) -> bool {
+    name == "apply_patch"
 }
 
 #[derive(Debug)]
@@ -489,6 +524,13 @@ impl ChatToResponsesConverter {
                 .clone()
                 .unwrap_or_else(|| format!("call_{}_{}", self.fc_id_seed, openai_index));
             let name = tc.function.name.clone().unwrap_or_default();
+            // **取舍**:wire 形态(function_call vs custom_tool_call)在 open
+            // 时一次性根据**首帧 name** 决定,后续帧补全 name 不改 wire。
+            // 实测 DeepSeek / Kimi / MiMo 都在首帧带 name。极端情况下首帧
+            // name 为空、后续才补 apply_patch,会 fallback 到 function_call
+            // wire(同当前行为,Codex CLI 仍会 abort apply_patch 一次),不
+            // 比修复前差。
+            let is_apply_patch = is_apply_patch_tool_name(&name);
             self.tool_calls.insert(
                 openai_index,
                 PendingToolCall {
@@ -498,35 +540,79 @@ impl ChatToResponsesConverter {
                     name: name.clone(),
                     args_acc: String::new(),
                     closed: false,
+                    is_apply_patch,
+                    output_item_added_emitted: false,
+                    apply_patch_input: None,
                 },
             );
-            // 如果 function name 来自 namespace 包(从 original_request.tools
-            // 反查表查到),给 item 加 `namespace` 字段 — Codex.app 客户端
-            // dispatch namespace 工具时这是必要字段(strings 实证 binary 含
-            // `dynamic tool namespace must not be empty for` 校验,缺字段会
-            // 报 `unsupported call: <name>`)。
-            let namespace = self.lookup_namespace_for(&name).map(str::to_owned);
-            let mut item = json!({
-                "type": "function_call",
-                "id": fc_id,
-                "call_id": call_id,
-                "name": name,
-                "arguments": "",
-                "status": "in_progress",
-            });
-            if let Some(ns) = namespace.as_ref() {
-                item["namespace"] = Value::String(ns.clone());
+            // apply_patch:wire 必须是 `custom_tool_call`(裸 `input` 字段)。
+            // 中间增量 delta **不 emit** — chat 上游给的 args 是 JSON 字符串
+            // 增量(`{"input": "*** Begin Patch\n..."`),从 JSON 字符串拼接
+            // 过程中流式提取 `input` 字段值需要专门的 streaming JSON state
+            // machine,本提交不引入。退而求其次:close 时一次性解 args 再
+            // emit input.delta + output_item.done,代价是客户端看不到逐字
+            // 流出的 diff(一次性出现整段 patch)。对一个长期完全不工作的
+            // 功能,这是合理的第一步;后续可优化为真流式。
+            if is_apply_patch {
+                tracing::info!(
+                    target = "adapters::apply_patch",
+                    call_id = %call_id,
+                    "apply_patch shim engaged: rewriting chat function_call wire to Responses custom_tool_call",
+                );
+                let item = json!({
+                    "type": "custom_tool_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "input": "",
+                    "status": "in_progress",
+                });
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
+            } else {
+                // 如果 function name 来自 namespace 包(从 original_request.tools
+                // 反查表查到),给 item 加 `namespace` 字段 — Codex.app 客户端
+                // dispatch namespace 工具时这是必要字段(strings 实证 binary 含
+                // `dynamic tool namespace must not be empty for` 校验,缺字段会
+                // 报 `unsupported call: <name>`)。
+                let namespace = self.lookup_namespace_for(&name).map(str::to_owned);
+                let mut item = json!({
+                    "type": "function_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                    "status": "in_progress",
+                });
+                if let Some(ns) = namespace.as_ref() {
+                    item["namespace"] = Value::String(ns.clone());
+                }
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
             }
-            emit_event(
-                out,
-                &mut self.sequence_number,
-                "response.output_item.added",
-                json!({
-                    "type": "response.output_item.added",
-                    "output_index": output_index,
-                    "item": item,
-                }),
-            );
+            // output_item.added 已 emit。后续帧 backfill `id` 不应再换 call_id
+            // (否则 `output_item.added` 与后续 `input.delta` / `output_item.done`
+            // 用不同 call_id,严格客户端会两次解读为不同 item)。同样地,
+            // apply_patch 的 `is_apply_patch` 决策也已固定。
+            if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                pending.output_item_added_emitted = true;
+            }
         }
 
         // 后续帧可能补全 name(罕见但兼容)
@@ -535,16 +621,31 @@ impl ChatToResponsesConverter {
                 if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
                     if pending.name.is_empty() {
                         pending.name = name.to_owned();
+                        if is_apply_patch_tool_name(name) && !pending.is_apply_patch {
+                            // 罕见极端:首帧 name 为空,后续才补 apply_patch。
+                            // `output_item.added` 已经 emit `function_call` wire,
+                            // 不能回退。这一调用 Codex CLI 仍会 abort,但起码我们
+                            // 在日志里能看到根因。
+                            tracing::warn!(
+                                target = "adapters::apply_patch",
+                                call_id = %pending.call_id,
+                                "apply_patch tool name arrived AFTER first frame; wire stays function_call and Codex CLI will reject. Investigate upstream provider chunking.",
+                            );
+                        }
                     }
                 }
             }
         }
-        // call_id 也可能在后续帧才出现
+        // call_id 也可能在后续帧才出现 — 但只在 `output_item.added` 还没 emit
+        // 时才允许替换。已 emit 后再换会让客户端看到同一 item 用两个不同
+        // call_id。
         if let Some(id) = tc.id.as_deref() {
             if !id.is_empty() {
                 if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
-                    // 只在首次给出 id 时覆盖(避免相同 index 不同 id 的混乱)
-                    if pending.call_id.starts_with("call_") && pending.call_id.contains('_') {
+                    if pending.output_item_added_emitted {
+                        // 不再覆盖 — 同 item 已经对外暴露 call_id。
+                    } else if pending.call_id.starts_with("call_") && pending.call_id.contains('_')
+                    {
                         // 兜底生成的 call_id 形如 `call_<seed>_<idx>`,真 id 来了就替换
                         if !pending.call_id.starts_with(id) && pending.call_id != id {
                             pending.call_id = id.to_owned();
@@ -554,11 +655,16 @@ impl ChatToResponsesConverter {
             }
         }
 
-        // arguments delta(增量字符串)
+        // arguments delta(增量字符串)。apply_patch 路径**只**累积不 emit
+        // (理由见上文 open 处注释);非 apply_patch 仍逐 chunk emit
+        // `function_call_arguments.delta` 让客户端看到逐字流。
         if let Some(args) = tc.function.arguments.as_deref() {
             if !args.is_empty() {
                 if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
                     pending.args_acc.push_str(args);
+                    if pending.is_apply_patch {
+                        return;
+                    }
                     let item_id = pending.fc_id.clone();
                     let output_index = pending.output_index;
                     emit_event(
@@ -577,10 +683,10 @@ impl ChatToResponsesConverter {
         }
     }
 
-    fn close_tool_call(&mut self, openai_index: u32, out: &mut Vec<u8>) {
+    fn close_tool_call(&mut self, openai_index: u32, interrupted: bool, out: &mut Vec<u8>) {
         // 先把所有需要的字段 clone 出来,避免 mutable borrow 跟
         // self.lookup_namespace_for 的 immutable borrow 冲突
-        let (fc_id, call_id, name, args_acc, output_index, already_closed) = {
+        let (fc_id, call_id, name, args_acc, output_index, already_closed, is_apply_patch) = {
             let Some(pending) = self.tool_calls.get(&openai_index) else {
                 return;
             };
@@ -591,11 +697,132 @@ impl ChatToResponsesConverter {
                 pending.args_acc.clone(),
                 pending.output_index,
                 pending.closed,
+                pending.is_apply_patch,
             )
         };
         if already_closed {
             return;
         }
+
+        if is_apply_patch {
+            // 从累积的 chat function args(标准形态 `{"input":"<V4A patch>"}`)
+            // 提取裸 V4A 文本。降级:模型可能直接吐裸 V4A(不包 JSON)— 历史
+            // 上 freeform 工具的输出就是这个形态,某些 chat 上游可能没把它
+            // 重新包成 JSON。fallback 把 args_acc 整段当 input,让上游能看到
+            // 解析失败的具体内容(对调试 + 让 apply_patch parser 给出可读
+            // 错误而不是静默 abort 都有用)。
+            if args_acc.trim().is_empty() {
+                tracing::warn!(
+                    target = "adapters::apply_patch",
+                    call_id = %call_id,
+                    "apply_patch tool was called with empty arguments — model likely misbehaving or provider stripped args",
+                );
+            }
+            let input = extract_apply_patch_input(&args_acc);
+            // 缓存 input 到 pending,供 `tool_call_item_completed`(envelope
+            // output[] 终态)读,避免重复 parse 与潜在 drift。
+            if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                pending.apply_patch_input = Some(input.clone());
+            }
+            // interrupted 中断时,patch 文本可能 mid-stream 被截断 — emit
+            // `status="incomplete"` 让 Codex CLI 看到 apply_patch handler 不
+            // 应该执行 partial patch(apply_patch destructive,partial 执行
+            // 可能在意外目标上写入意外内容)。同时 skip `input.done`(很多
+            // 严格客户端在 `.done` 才触发执行)。
+            if interrupted {
+                tracing::warn!(
+                    target = "adapters::apply_patch",
+                    call_id = %call_id,
+                    args_len = args_acc.len(),
+                    "apply_patch tool call cut off mid-stream (no finish_reason and not from [DONE]). Emitting output_item with status=incomplete; skipping input.done to prevent partial patch execution.",
+                );
+                let item = json!({
+                    "type": "custom_tool_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "input": input,
+                    "status": "incomplete",
+                });
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
+                // 不存 cache(下一轮如果引用此 call_id 重建会拿到 incomplete
+                // 上下文,反而误导;让 orphan repair 路径补占位)。
+                if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                    pending.closed = true;
+                }
+                return;
+            }
+            // open 阶段 emit 了空 input 的 output_item.added;这里一次性补
+            // input.delta + output_item.done,让 Codex CLI 的 streaming
+            // parser(`StreamingPatchParser`)拿到完整 patch 文本后 finish。
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.custom_tool_call_input.delta",
+                json!({
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": fc_id,
+                    "output_index": output_index,
+                    "call_id": call_id,
+                    "delta": input,
+                }),
+            );
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.custom_tool_call_input.done",
+                json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": fc_id,
+                    "output_index": output_index,
+                    "call_id": call_id,
+                    "input": input,
+                }),
+            );
+            let item = json!({
+                "type": "custom_tool_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "name": name,
+                "input": input,
+                "status": "completed",
+            });
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                }),
+            );
+            // ToolCallCache 用于下一轮 Codex CLI 发 tool output 时重建工具
+            // 调用上下文。回灌走 chat completions(messages.tool_calls.function
+            // .arguments 是 JSON 字符串),所以这里仍存原始 args_acc(JSON 形态)
+            // 而不是 input 裸文本,与 `assistant_message` 的 tool_calls 形态对齐。
+            global_tool_call_cache().save(
+                &call_id,
+                ToolCallEntry {
+                    name: name.clone(),
+                    arguments: args_acc.clone(),
+                },
+            );
+            if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                pending.closed = true;
+            }
+            return;
+        }
+
         emit_event(
             out,
             &mut self.sequence_number,
@@ -811,6 +1038,28 @@ impl ChatToResponsesConverter {
     }
 
     fn tool_call_item_completed(&self, pending: &PendingToolCall) -> Value {
+        if pending.is_apply_patch {
+            // envelope.output[] 终态必须和流式 `response.output_item.done`
+            // 的 item 一致(见 close_tool_call apply_patch 分支),否则严格
+            // 客户端会两次解读为不同 item。读 close 时缓存好的 input,
+            // 不重新 parse args_acc — 万一 args_acc 在 close 与 envelope
+            // 构造之间发生意外变化(目前看不会,但防御性写法),两侧仍一致。
+            // 缓存缺失时(理论上 close 一定先于 envelope build 跑,不应触发)
+            // fallback 到 raw args_acc,而不是再次 parse,避免重复 emit
+            // 任何 telemetry。
+            let input = pending
+                .apply_patch_input
+                .clone()
+                .unwrap_or_else(|| pending.args_acc.clone());
+            return json!({
+                "type": "custom_tool_call",
+                "id": pending.fc_id,
+                "call_id": pending.call_id,
+                "name": pending.name,
+                "input": input,
+                "status": "completed",
+            });
+        }
         let mut item = json!({
             "type": "function_call",
             "id": pending.fc_id,
@@ -1054,10 +1303,16 @@ impl ChatToResponsesConverter {
         if self.message_open && !self.message_closed {
             self.close_message(out);
         }
-        // tool_calls 按 OpenAI index 顺序闭合(BTreeMap 自然有序)
+        // tool_calls 按 OpenAI index 顺序闭合(BTreeMap 自然有序)。
+        // `interrupted` = 没有 finish_reason **且**不是因 `[DONE]` 自然结束。
+        // 这是用于让 apply_patch 在 close_tool_call 里 emit
+        // `status="incomplete"` 而不是 `completed`,防止严格客户端在 stream
+        // 半截断时仍把 partial patch 当成完整 tool 调用执行
+        // (apply_patch 是 destructive,partial 执行风险高)。
+        let interrupted = self.finish_reason.is_none() && !from_done;
         let tc_indices: Vec<u32> = self.tool_calls.keys().copied().collect();
         for idx in tc_indices {
-            self.close_tool_call(idx, out);
+            self.close_tool_call(idx, interrupted, out);
         }
 
         // finish_reason → status / incomplete_details 映射。保留现有 5 路径
@@ -1250,6 +1505,60 @@ fn translate_annotation(a: &Value) -> Value {
 
 fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value) {
     emit_sse_event(out, seq, event_name, payload);
+}
+
+/// 从 chat function args(标准形态 `{"input": "<V4A patch>"}`)提取裸 V4A
+/// 文本,供 `custom_tool_call.input` 字段使用。
+///
+/// 降级路径分两类,通过 tracing 区分以便事后定位:
+///
+/// 1. **JSON parse 失败 + 看起来像裸 V4A**(以 `*** Begin Patch` 开头):
+///    debug 级,预期 happy path —— 上游 chat provider 把 freeform 工具
+///    输出原样透传未包 JSON。
+/// 2. **JSON parse 失败 + 不像 V4A**:warn 级,通常是 stream 截断 / UTF-8
+///    损坏 / 上游加 markdown fence。把整段透传给 Codex CLI 至少能让用户
+///    看到 `apply_patch verification failed: <parse_error>` 而不是 abort
+///    无线索。
+/// 3. **JSON valid 但缺 `input` 字段**:warn 级,通常是 schema drift
+///    (模型用了 `patch` 而不是 `input` 等)。整段透传暴露真坏。
+///
+/// 借鉴上游 `codex-rs/apply-patch/apply_patch_tool_instructions.md` 的
+/// V4A 格式约束。不做 V4A 语法校验 — 留给 Codex CLI 端的 `parse_patch`。
+fn extract_apply_patch_input(args_acc: &str) -> String {
+    let trimmed = args_acc.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) => match parsed.get("input").and_then(Value::as_str) {
+            Some(s) => s.to_owned(),
+            None => {
+                tracing::warn!(
+                    target = "adapters::apply_patch",
+                    args_preview = %args_acc.chars().take(120).collect::<String>(),
+                    "apply_patch args parsed as JSON but missing `input` string field; passing raw args to Codex CLI",
+                );
+                args_acc.to_owned()
+            }
+        },
+        Err(err) => {
+            if trimmed.starts_with("*** Begin Patch") {
+                tracing::debug!(
+                    target = "adapters::apply_patch",
+                    "apply_patch args are bare V4A (no JSON wrapper); passthrough",
+                );
+            } else {
+                tracing::warn!(
+                    target = "adapters::apply_patch",
+                    error = %err,
+                    args_len = args_acc.len(),
+                    args_preview = %args_acc.chars().take(120).collect::<String>(),
+                    "apply_patch args failed JSON parse and don't look like bare V4A; falling back to raw passthrough — likely truncation or schema drift",
+                );
+            }
+            args_acc.to_owned()
+        }
+    }
 }
 
 fn drain_one_frame(buf: &mut BytesMut) -> Option<Bytes> {
@@ -2499,6 +2808,203 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
             .find(|(n, _)| n == "response.function_call_arguments.done")
             .unwrap();
         assert_eq!(done.1["arguments"], "{\"a\":1}");
+    }
+
+    #[test]
+    fn apply_patch_tool_call_emits_custom_tool_call_wire_not_function_call() {
+        // 回归保护(issue #235):chat 上游(DeepSeek 等)用 function call 返回
+        // apply_patch 时,adapter 必须把 wire 重打包成 Codex CLI 期望的
+        // `custom_tool_call` 形态(上游 router 按 wire type 路由,apply_patch
+        // handler 硬要求 `ToolPayload::Custom { input }`)。
+        // patch 文本走标准 JSON 转义:在 args.arguments 字符串里,V4A 原文的
+        // `\n` 被双重转义成 `\\n`(JSON 字符串里写 `\n`)。
+        let mut c = fixed();
+        // 真实 chat 上游 wire 中,tool_call.arguments 是 JSON 字符串字面值,
+        // patch 里的换行必须双重转义(SSE outer JSON 的 string value 里写
+        // `\\n`,解码后是 `\n` 字面;`arguments` 值再被 client 当 JSON 解一次
+        // 得到 `*** Begin Patch\n...` 真换行的 V4A patch)。
+        let chunks = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ap","type":"function","function":{"name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: foo.py\\n@@\\n-old\\n+new\\n*** End Patch\\n\"}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = c.feed(chunks.as_bytes());
+        let events = parse_emitted(&out);
+        let kinds = names(&events);
+        // open 必须用 custom_tool_call 而不是 function_call
+        let added = events
+            .iter()
+            .find(|(n, _)| n == "response.output_item.added")
+            .expect("应当 emit output_item.added");
+        assert_eq!(
+            added.1["item"]["type"], "custom_tool_call",
+            "apply_patch wire 必须是 custom_tool_call,实际 events: {kinds:?}"
+        );
+        assert_eq!(added.1["item"]["name"], "apply_patch");
+        // 中间不应有 function_call_arguments.delta(apply_patch 路径 close 时
+        // 一次性 emit custom_tool_call_input.delta)
+        assert!(
+            !kinds.contains(&"response.function_call_arguments.delta"),
+            "apply_patch 路径不应 emit function_call_arguments.delta,events: {kinds:?}"
+        );
+        // close 必须 emit custom_tool_call_input.delta + .done
+        let input_delta = events
+            .iter()
+            .find(|(n, _)| n == "response.custom_tool_call_input.delta")
+            .expect("应当 emit custom_tool_call_input.delta");
+        let expected_v4a =
+            "*** Begin Patch\n*** Update File: foo.py\n@@\n-old\n+new\n*** End Patch\n";
+        assert_eq!(input_delta.1["delta"], expected_v4a);
+        assert_eq!(input_delta.1["call_id"], "call_ap");
+        // envelope.output[] 终态也必须是 custom_tool_call
+        let completed = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let output = &completed.1["response"]["output"][0];
+        assert_eq!(output["type"], "custom_tool_call");
+        assert_eq!(output["input"], expected_v4a);
+        assert_eq!(output["call_id"], "call_ap");
+    }
+
+    #[test]
+    fn apply_patch_falls_back_to_raw_args_when_not_json() {
+        // 模型直接吐裸 V4A 而不包 JSON(某些 chat 上游可能这样转译 freeform)。
+        // adapter 必须把整段 args_acc 当 input 而不是空字符串,让 Codex CLI
+        // 至少能看到 patch 内容并尝试解析。
+        let raw_v4a = "*** Begin Patch\n*** Add File: a.md\n+hi\n*** End Patch\n";
+        // serde_json::to_string 自动产生合法 JSON 字符串 escape(`\n` → `\\n`
+        // 字面、引号转义、反斜杠转义),比手工 replace 链可靠且贴近真实 wire。
+        let args_json_string = serde_json::to_string(raw_v4a).unwrap();
+        let mut c = fixed();
+        let frame = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_ap\",\"type\":\"function\",\"function\":{{\"name\":\"apply_patch\",\"arguments\":{args_json_string}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            args_json_string = args_json_string,
+        );
+        let out = c.feed(frame.as_bytes());
+        let events = parse_emitted(&out);
+        let delta = events
+            .iter()
+            .find(|(n, _)| n == "response.custom_tool_call_input.delta")
+            .expect("custom_tool_call_input.delta 应当 emit");
+        assert_eq!(
+            delta.1["delta"], raw_v4a,
+            "非 JSON args 应整段当 input(裸 V4A 兜底)"
+        );
+    }
+
+    #[test]
+    fn apply_patch_interrupted_stream_emits_incomplete_status_skips_input_done() {
+        // 回归保护:apply_patch 是 destructive 工具,stream 中途断开 → close
+        // 必须 emit `status="incomplete"` 且 skip `custom_tool_call_input.done`,
+        // 让 Codex CLI 看到不完整状态而不是执行 partial patch。
+        let partial_v4a = "*** Begin Patch\n*** Update File: foo.py\n@@\n-old\n"; // 截断在 @@ 之后
+        let inner = serde_json::to_string(&json!({ "input": partial_v4a })).unwrap();
+        let args_json_string = serde_json::to_string(&inner).unwrap();
+        let mut c = fixed();
+        // 仅 emit tool_call 增量与 lifecycle 开头,不 emit finish_reason / [DONE],
+        // 模拟 upstream EOF 中断。
+        let frame = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_ap\",\"type\":\"function\",\"function\":{{\"name\":\"apply_patch\",\"arguments\":{args_json_string}}}}}]}}}}]}}\n\n",
+            args_json_string = args_json_string,
+        );
+        let _ = c.feed(frame.as_bytes());
+        let out = c.finish();
+        let events = parse_emitted(&out);
+        let kinds = names(&events);
+        // 必须 NOT 出现 .delta 或 .done 的 custom_tool_call_input(防止 client
+        // 在 .done 时触发执行 partial patch)
+        assert!(
+            !kinds.contains(&"response.custom_tool_call_input.done"),
+            "interrupted 时禁止 emit custom_tool_call_input.done,events: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"response.custom_tool_call_input.delta"),
+            "interrupted 时禁止 emit custom_tool_call_input.delta(避免提前触发执行),events: {kinds:?}"
+        );
+        // output_item.done item 必须含 status=incomplete
+        let done = events
+            .iter()
+            .find(|(n, _)| n == "response.output_item.done")
+            .expect("interrupted 仍应 emit output_item.done");
+        assert_eq!(done.1["item"]["type"], "custom_tool_call");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "interrupted apply_patch 必须 status=incomplete"
+        );
+        // envelope 也是 incomplete + interrupted
+        let completed = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        assert_eq!(completed.1["response"]["status"], "incomplete");
+        assert_eq!(
+            completed.1["response"]["incomplete_details"]["reason"],
+            "interrupted"
+        );
+    }
+
+    #[test]
+    fn apply_patch_streaming_input_matches_envelope_output() {
+        // 防御性回归:`response.output_item.done` 的 `item.input` 必须跟
+        // `response.completed.output[].input` 完全一致,避免两次 emit 路径
+        // 在未来重构时 drift。
+        let patch = "*** Begin Patch\n*** Update File: x.txt\n@@\n-a\n+b\n*** End Patch\n";
+        // chat wire 里 `arguments` 是 JSON-string(双重编码):先把 V4A 包成
+        // `{"input": "<V4A>"}` JSON 文本,再 JSON-quote 一次作为字符串值。
+        let inner = serde_json::to_string(&json!({ "input": patch })).unwrap();
+        let args_json_string = serde_json::to_string(&inner).unwrap();
+        let mut c = fixed();
+        let frame = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_match\",\"type\":\"function\",\"function\":{{\"name\":\"apply_patch\",\"arguments\":{args_json_string}}}}}]}}}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            args_json_string = args_json_string,
+        );
+        let out = c.feed(frame.as_bytes());
+        let events = parse_emitted(&out);
+        let done = events
+            .iter()
+            .find(|(n, v)| {
+                n == "response.output_item.done" && v["item"]["type"] == "custom_tool_call"
+            })
+            .expect("应当有 custom_tool_call output_item.done");
+        let streamed_input = done.1["item"]["input"].as_str().unwrap().to_owned();
+        let completed = events
+            .iter()
+            .rev()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let envelope_input = completed.1["response"]["output"][0]["input"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            streamed_input, envelope_input,
+            "streamed output_item.done.input 必须跟 envelope.output[].input 完全一致"
+        );
+        assert_eq!(streamed_input, patch);
+    }
+
+    #[test]
+    fn extract_apply_patch_input_extracts_or_falls_back() {
+        // happy path:`{input: string}` 提出 string 字段
+        assert_eq!(
+            extract_apply_patch_input(r#"{"input":"*** Begin Patch\nfoo"}"#),
+            "*** Begin Patch\nfoo"
+        );
+        // 非 JSON:整段透传
+        let raw = "*** Begin Patch\nfoo\n*** End Patch\n";
+        assert_eq!(extract_apply_patch_input(raw), raw);
+        // JSON 但无 input 字段:整段透传
+        assert_eq!(
+            extract_apply_patch_input(r#"{"other":"x"}"#),
+            r#"{"other":"x"}"#
+        );
+        // 空字符串:返回空
+        assert_eq!(extract_apply_patch_input(""), "");
     }
 
     #[test]

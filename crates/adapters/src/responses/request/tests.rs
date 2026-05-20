@@ -1953,6 +1953,81 @@ fn function_call_output_becomes_tool_message_with_placeholder_assistant() {
 }
 
 #[test]
+fn custom_tool_call_input_item_lowered_to_assistant_tool_calls() {
+    // 回归保护(issue #235):turn N+1 Codex CLI 回放上一轮的
+    // `ResponseItem::CustomToolCall { name, input, call_id }`,我们必须把它
+    // 转成 chat completions 的 `assistant.tool_calls` 形态(function-call),
+    // 否则模型完全看不到上一轮 apply_patch 调用 → 多轮上下文丢失。
+    // arguments 必须是 JSON 字符串 `{"input":"<V4A>"}`,与首轮在请求侧
+    // lowering 的形态保持一致,模型才不失忆。
+    let patch_text = "*** Begin Patch\n*** Update File: a.py\n@@\n-x\n+y\n*** End Patch\n";
+    let out = convert(json!({
+        "input": [{
+            "type": "custom_tool_call",
+            "id": "ctc_1",
+            "call_id": "call_ap_1",
+            "name": "apply_patch",
+            "input": patch_text,
+            "status": "completed",
+        }]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
+        .expect("custom_tool_call 应当映射成 assistant.tool_calls");
+    let tc = &assistant["tool_calls"][0];
+    assert_eq!(tc["type"], "function");
+    assert_eq!(tc["id"], "call_ap_1");
+    assert_eq!(tc["function"]["name"], "apply_patch");
+    // arguments 是 JSON 字符串值。serde_json 解一次得到 {input: <V4A>},
+    // 再 V4A 的换行已被正常 JSON-escape(`\n` 字面值)。
+    let args_str = tc["function"]["arguments"].as_str().unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(args_str).expect("arguments 必须是合法 JSON");
+    assert_eq!(parsed["input"], patch_text);
+}
+
+#[test]
+fn custom_tool_call_output_input_item_lowered_to_role_tool() {
+    // 回归保护(issue #235):`ResponseItem::CustomToolCallOutput { call_id, output }`
+    // 回放时必须转成 chat 端的 `role:"tool"` message,tool_call_id 跟前面的
+    // assistant.tool_calls.id 配对,否则 chat 上游会因 orphan tool message 400。
+    let out = convert(json!({
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_ap_2",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Add File: b.md\n+hi\n*** End Patch\n",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_ap_2",
+                "output": "Patch applied successfully",
+            }
+        ]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let tool_msg = messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("custom_tool_call_output 应当映射成 role:tool");
+    assert_eq!(tool_msg["tool_call_id"], "call_ap_2");
+    assert_eq!(tool_msg["content"], "Patch applied successfully");
+    // 同 PR 还要保证 assistant 在 tool 前(orphan repair 不会插占位)
+    let assistant_idx = messages
+        .iter()
+        .position(|m| m["role"] == "assistant")
+        .unwrap();
+    let tool_idx = messages.iter().position(|m| m["role"] == "tool").unwrap();
+    assert!(
+        assistant_idx < tool_idx,
+        "assistant.tool_calls 必须在 role:tool 之前出现"
+    );
+}
+
+#[test]
 fn function_call_output_non_string_is_json_serialized() {
     // 走完整 convert 路径(global cache 在生产里就这条路);
     // 这里只关心 content 序列化,不关心占位 assistant 行为(见上一条测试)。
@@ -2644,6 +2719,57 @@ fn tools_custom_type_is_lowered_to_function_with_input() {
         "string"
     );
     assert_eq!(tool["function"]["parameters"]["required"][0], "input");
+    // 非 apply_patch 的 custom 工具仍透传 outer description,input 用泛指
+    // 兜底描述,不注入 V4A 提示。
+    assert_eq!(tool["function"]["description"], "anything");
+    assert!(
+        tool["function"]["parameters"]["properties"]["input"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verbatim"),
+        "非 apply_patch 应保留泛指 input 描述,实际:{}",
+        tool["function"]["parameters"]["properties"]["input"]["description"]
+    );
+}
+
+#[test]
+fn tools_custom_apply_patch_injects_v4a_format_hint() {
+    // 回归保护(issue #235):chat 上游(DeepSeek 等)拿到 freeform apply_patch
+    // 时,上游的 "do not wrap in JSON" 描述会误导模型;且原始描述里没有 V4A
+    // 格式样例。adapter 必须替换描述为 chat 路径准确的 V4A 指引,模型才能
+    // 正确填充 `input` 字段。
+    let out = convert(json!({
+        "input": "hi",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON."
+        }]
+    }));
+    let tool = &out["tools"][0];
+    assert_eq!(tool["type"], "function");
+    assert_eq!(tool["function"]["name"], "apply_patch");
+
+    // outer description 必须替换(不能保留误导性的 "do not wrap" 文本)
+    let outer = tool["function"]["description"].as_str().unwrap_or_default();
+    assert!(!outer.contains("do not wrap"), "误导性原描述未替换:{outer}");
+    assert!(
+        outer.contains("V4A"),
+        "outer description 应当包含 V4A 关键字:{outer}"
+    );
+    assert!(
+        outer.contains("*** Begin Patch"),
+        "outer description 应当含 V4A 边界标记:{outer}"
+    );
+
+    // input 参数描述必须含 V4A 格式约束(provider 可能更看 parameter desc)
+    let input_desc = tool["function"]["parameters"]["properties"]["input"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        input_desc.contains("V4A") && input_desc.contains("*** Begin Patch"),
+        "input description 应含 V4A 与边界标记:{input_desc}"
+    );
 }
 
 #[test]

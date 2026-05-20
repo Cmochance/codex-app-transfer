@@ -518,6 +518,70 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 "content": output_str,
             })]
         }
+        "custom_tool_call" => {
+            // Codex CLI 把 freeform apply_patch 的回放 wire 包成
+            // `ResponseItem::CustomToolCall { name, input, call_id, ... }`
+            // (`codex-rs/protocol/src/models.rs:824-832`)。我们在 turn N 通过
+            // `converter.rs::close_tool_call` apply_patch 分支 emit 了它;
+            // Codex CLI 在 turn N+1 把同一 item 通过 `input[]` 回放给我们。
+            // 转下游 chat completions 时必须重新打包成 `assistant.tool_calls`
+            // 的 `type:"function"` 形态(chat 端不认 custom_tool_call),且
+            // `function.arguments` 必须是 JSON 字符串 `{"input":"<V4A>"}`
+            // (与首轮在 `tools.rs::convert_responses_tool_to_chat_tool` 的
+            // `"custom" =>` 分支 lowering 形态保持一致)—— 模型才不会因
+            // wire 形态变化失忆。
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_owned();
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let input_text = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+            // arguments 必须是 chat function-call 的标准 JSON 字符串形态。
+            // serde_json::to_string 自动处理换行 / 引号 / 反斜杠等所有转义。
+            let arguments_json = serde_json::to_string(&json!({ "input": input_text }))
+                .unwrap_or_else(|_| {
+                    // to_string 在 input 是 valid UTF-8 string 时不会失败;若
+                    // 真发生,fallback 到空对象保持下游 chat schema 合法。
+                    "{}".to_owned()
+                });
+            let arguments = sanitize_tool_arguments_json_string(&arguments_json);
+            vec![json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": if call_id.is_empty() { "call_unknown".to_owned() } else { call_id },
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                }],
+            })]
+        }
+        "custom_tool_call_output" => {
+            // `ResponseItem::CustomToolCallOutput { call_id, output, ... }`
+            // (`codex-rs/protocol/src/models.rs:839-847`)使用与 function_call_output
+            // 相同的 `output` payload encoding(string 或 content_items array)。
+            // 转 chat 时只需把 wire item type 对齐到普通 `role:"tool"` message,
+            // tool_call_id 来源仍按 call_id / tool_call_id / id 三级兜底。
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("tool_call_id").and_then(|v| v.as_str()))
+                .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_owned();
+            let output_value = item
+                .get("output")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
+            let output_str =
+                normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
+            vec![json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": output_str,
+            })]
+        }
         "input_image" => {
             let image_url = item
                 .get("image_url")
