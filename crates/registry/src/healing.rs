@@ -66,7 +66,15 @@ const ENFORCED_BUILTIN_FIELDS: &[&str] = &["apiFormat", "authScheme", "extraHead
 /// 用户可定制的字段(`apiKey` / `baseUrl` / `models` / 等)**绝不动**;详见
 /// 模块头注 "命中后做什么 / 不做什么" 小节。
 pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
-    let presets_index = build_preset_index();
+    heal_with_preset_index(cfg, &build_preset_index())
+}
+
+/// 内部接受 preset index 注入 — 让单测可以用 mock preset 而不污染 production
+/// `builtin_presets()`(避免 fake test fixture 进 `/api/presets` 暴露给用户)。
+pub(crate) fn heal_with_preset_index(
+    cfg: &mut Value,
+    presets_index: &HashMap<String, Vec<Map<String, Value>>>,
+) -> bool {
     if presets_index.is_empty() {
         return false;
     }
@@ -125,21 +133,23 @@ pub fn heal_builtin_provider_fields(cfg: &mut Value) -> bool {
         }
 
         // 3. 决定要强制覆盖的字段列表:
-        //    - 如果 preset 内定义了 "enforcedFields" 且是一个 array,则使用其中的字符串;
-        //    - 否则 fallback 默认使用 ENFORCED_BUILTIN_FIELDS。
-        let mut dynamic_fields = Vec::new();
-        if let Some(arr) = preset.get("enforcedFields").and_then(|v| v.as_array()) {
-            for v in arr {
-                if let Some(s) = v.as_str() {
-                    dynamic_fields.push(s);
+        //    - 如果 preset 内有 "enforcedFields" array(含 explicit `[]`)→ 用其中的
+        //      字符串;`[]` 表示 "声明式 no-enforcement",尊重用户配置不强改。
+        //    - 如果 "enforcedFields" 缺失 / 非 array → fallback `ENFORCED_BUILTIN_FIELDS`
+        //      (向后兼容:没声明的 builtin preset 仍按内置默认覆盖)。
+        let mut dynamic_fields: Vec<&str> = Vec::new();
+        let fields_to_enforce: &[&str] =
+            match preset.get("enforcedFields").and_then(|v| v.as_array()) {
+                Some(arr) => {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            dynamic_fields.push(s);
+                        }
+                    }
+                    &dynamic_fields
                 }
-            }
-        }
-        let fields_to_enforce: &[&str] = if !dynamic_fields.is_empty() {
-            &dynamic_fields
-        } else {
-            ENFORCED_BUILTIN_FIELDS
-        };
+                None => ENFORCED_BUILTIN_FIELDS,
+            };
 
         for field in fields_to_enforce {
             let preset_value = preset.get(*field).cloned();
@@ -841,8 +851,33 @@ mod tests {
         );
     }
 
+    /// Helper: 构造 single-preset index for test (走 inject 路径,不污染 production)
+    fn single_preset_index(preset: Value) -> HashMap<String, Vec<Map<String, Value>>> {
+        let mut idx: HashMap<String, Vec<Map<String, Value>>> = HashMap::new();
+        let obj = preset.as_object().expect("preset must be object").clone();
+        let url = obj
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .expect("preset must have baseUrl");
+        idx.insert(normalize_base_url(url), vec![obj]);
+        idx
+    }
+
     #[test]
     fn respects_custom_enforced_fields_declared_in_preset() {
+        // Test-only preset (不进 production builtin_presets() / /api/presets)
+        let mock_preset = json!({
+            "id": "healing-test-preset",
+            "name": "Healing Test Preset",
+            "baseUrl": "https://api.healing-test.com",
+            "authScheme": "bearer",
+            "apiFormat": "openai_chat",
+            "extraHeaders": {"X-Healing-Test": "Passed"},
+            "enforcedFields": ["apiFormat"],
+            "isBuiltin": true,
+        });
+        let presets_index = single_preset_index(mock_preset);
+
         let mut cfg = json!({
             "providers": [
                 {
@@ -856,7 +891,7 @@ mod tests {
                 }
             ]
         });
-        let changed = heal_builtin_provider_fields(&mut cfg);
+        let changed = heal_with_preset_index(&mut cfg, &presets_index);
         assert!(changed);
         let p = &cfg["providers"][0];
         assert_eq!(p["isBuiltin"], json!(true));
@@ -868,5 +903,47 @@ mod tests {
         assert_eq!(p["authScheme"], "custom-auth");
         assert_eq!(p["extraHeaders"]["User-Agent"], "Custom-UA");
         assert!(p["extraHeaders"].get("X-Healing-Test").is_none());
+    }
+
+    #[test]
+    fn explicit_empty_enforced_fields_disables_all_enforcement() {
+        // 覆盖 codex-bot #233 P2 反馈:`enforcedFields: []` 必须当成
+        // declarative "no enforcement",**不能** fallback 到 ENFORCED_BUILTIN_FIELDS
+        let mock_preset = json!({
+            "id": "no-enforce-preset",
+            "name": "No Enforce Preset",
+            "baseUrl": "https://api.no-enforce.com",
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "extraHeaders": {"X-Default": "value"},
+            "enforcedFields": [],
+            "isBuiltin": true,
+        });
+        let presets_index = single_preset_index(mock_preset);
+
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "u1",
+                    "name": "No Enforce Preset",
+                    "baseUrl": "https://api.no-enforce.com",
+                    "isBuiltin": false,                 // 仍会被改 true(isBuiltin 独立 enforce)
+                    "apiFormat": "responses",            // empty enforcedFields → 不改
+                    "authScheme": "custom-auth",         // empty enforcedFields → 不改
+                    "extraHeaders": {"User-Agent": "Custom-UA"}
+                }
+            ]
+        });
+        let _ = heal_with_preset_index(&mut cfg, &presets_index);
+        let p = &cfg["providers"][0];
+        assert_eq!(p["isBuiltin"], json!(true), "isBuiltin 仍被改");
+        // 三个 ENFORCED_BUILTIN_FIELDS 默认字段都不能动(因为 enforcedFields 是 explicit [])
+        assert_eq!(
+            p["apiFormat"], "responses",
+            "explicit [] 必须 disable apiFormat enforcement"
+        );
+        assert_eq!(p["authScheme"], "custom-auth");
+        assert_eq!(p["extraHeaders"]["User-Agent"], "Custom-UA");
+        assert!(p["extraHeaders"].get("X-Default").is_none());
     }
 }

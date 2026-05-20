@@ -34,16 +34,15 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 14 条 builtin presets:
+        // 当前 13 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
         // / zhipu / bailian / bailian-token-plan / minimax / grok-web / google-ai-studio
-        // / gemini-cli-oauth / antigravity-oauth / healing-test-preset
+        // / gemini-cli-oauth / antigravity-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
         // (2026-05-11 加 Gemini CLI OAuth login preset)
         // (2026-05-11 加 Antigravity OAuth preset)
         // (2026-05-12 加 Grok Web 反代 preset,见 R1 Plan A)
-        // (2026-05-20 加 healing-test-preset 用以支持自定义 enforcedFields 单元测试)
-        assert_eq!(builtin_presets().len(), 14);
+        assert_eq!(builtin_presets().len(), 13);
     }
 
     #[test]

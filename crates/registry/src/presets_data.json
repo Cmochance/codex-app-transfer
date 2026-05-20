@@ -416,19 +416,5 @@
     ],
     "requestOptions": {},
     "isBuiltin": true
-  },
-  {
-    "id": "healing-test-preset",
-    "name": "Healing Test Preset",
-    "baseUrl": "https://api.healing-test.com",
-    "authScheme": "bearer",
-    "apiFormat": "openai_chat",
-    "extraHeaders": {
-      "X-Healing-Test": "Passed"
-    },
-    "enforcedFields": [
-      "apiFormat"
-    ],
-    "isBuiltin": true
   }
 ]
