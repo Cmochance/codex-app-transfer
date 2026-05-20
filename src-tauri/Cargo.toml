@@ -40,7 +40,7 @@ bytes = "1"
 include_dir = "0.7"
 mime_guess = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "http2", "socks", "system-proxy"] }
 # sha2 "oid" feature 让 `Pkcs1v15Sign::new::<Sha256>()` 编译过 (admin/signature.rs
 # 客户端验签需要 OID-tagged Sha256, 跟 xtask/Cargo.toml 设置对齐避免 cross-impl drift)。
 sha2 = { version = "0.10", features = ["oid"] }

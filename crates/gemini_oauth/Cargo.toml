@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 # 核心:HTTPS POST oauth2.googleapis.com/token + cloudcode-pa.googleapis.com/v1internal:* 两类调用
 # 选 rustls-tls 而非 native-tls,跨平台一致(避免 Windows schannel / macOS securetransport 行为差异)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks", "system-proxy"] }
 # loopback redirect URI HTTP server(接 OAuth code grant callback)— axum 0.8 跟 proxy/forward.rs 一致版本
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 tokio = { version = "1", features = ["sync", "net", "rt-multi-thread", "time", "macros"] }
