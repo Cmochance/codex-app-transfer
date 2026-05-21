@@ -2315,6 +2315,9 @@ use tools::{
 ///   4. 加 "If Update repeatedly fails, fall back to Delete + Add File" 兜底
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
     "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
+    "\n",
+    "**ALWAYS use the `apply_patch` tool for any file creation or modification** — including new files, single-line edits, and full-file rewrites. **NEVER use shell `cat <<EOF > file` / `printf > file` / `echo > file` / any `>` redirect to bypass apply_patch** — doing so loses the Codex diff UI and audit trail. For full-file rewrites or large changes where almost every line differs, use `*** Delete File: <path>` followed by `*** Add File: <path>` (every line of the new content prefixed with `+`) inside the same patch — this is more concise than a long `-`/`+` diff and is the correct apply_patch idiom for large rewrites.\n",
+    "\n",
     "When you call the `apply_patch` tool, follow these rules empirically observed with non-OpenAI chat providers:\n",
     "\n",
     "1. PREFERRED Update File form is MINIMAL: just `-line` (the row to remove, byte-exact) and `+line` (the new row) directly after `*** Update File: <path>` — NO `@@`, NO context lines. ",

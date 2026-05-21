@@ -30,6 +30,9 @@ pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 /// 可执行的更新文件 example 让模型看到正确形态。
 pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Edit files using the apply_patch tool. ",
+    "**ALWAYS use this tool for any file creation or modification** — including new files, single-line edits, and full-file rewrites. ",
+    "**NEVER use shell `cat <<EOF > file` / `printf > file` / `echo > file` / any `>` redirect to bypass apply_patch** — doing so loses the Codex diff UI and audit trail. ",
+    "For full-file rewrites or large changes where almost every line differs, use `*** Delete File: <path>` followed by `*** Add File: <path>` (with `+` prefix on every line of the new content) inside a single patch — this is more concise than a long `-`/`+` diff and is the correct apply_patch idiom for large rewrites. ",
     "Call this function with a single `input` string containing a V4A patch. ",
     "**The patch MUST start with `*** Begin Patch` as the literal first line** (no leading whitespace, no other content before it), and end with `*** End Patch`. ",
     "Each file operation header is one of `*** Add File: <path>`, ",
