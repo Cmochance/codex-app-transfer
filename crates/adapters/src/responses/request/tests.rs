@@ -2018,6 +2018,19 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
         guidance.contains("Delete File + Add File"),
         "guidance 必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{guidance}"
     );
+    // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
+    assert!(
+        guidance.contains("`*** Begin Patch` MUST be the literal first line"),
+        "guidance 必须显式要求 Begin Patch 是第一行:{guidance}"
+    );
+    assert!(
+        guidance.contains("Move to:") && guidance.contains("REQUIRES at least one hunk"),
+        "guidance 必须显式要求 Move to 配非空 hunk:{guidance}"
+    );
+    assert!(
+        guidance.contains("For pure rename"),
+        "guidance 必须给纯重命名的 Delete+Add 替代方案:{guidance}"
+    );
 }
 
 #[test]
@@ -2965,6 +2978,20 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
     assert!(
         outer.contains("Delete File + Add File"),
         "必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{outer}"
+    );
+    // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
+    assert!(
+        outer.contains("`*** Begin Patch` as the literal first line")
+            || outer.contains("`*** Begin Patch` MUST be the literal first line"),
+        "outer description 必须显式要求 Begin Patch 是第一行:{outer}"
+    );
+    assert!(
+        outer.contains("RENAME / MOVE FILE") && outer.contains("at least one hunk"),
+        "outer description 必须含 RENAME/MOVE 章节 + Move 配非空 hunk 规则:{outer}"
+    );
+    assert!(
+        outer.contains("pure rename") && outer.contains("Delete File"),
+        "outer description 必须给纯重命名的 Delete+Add 替代方案:{outer}"
     );
 
     // 参数描述紧凑版必须含同样核心规则(round 4 修复后)

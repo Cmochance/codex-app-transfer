@@ -31,9 +31,9 @@ pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Edit files using the apply_patch tool. ",
     "Call this function with a single `input` string containing a V4A patch. ",
-    "The patch must start with `*** Begin Patch` and end with `*** End Patch`. ",
+    "**The patch MUST start with `*** Begin Patch` as the literal first line** (no leading whitespace, no other content before it), and end with `*** End Patch`. ",
     "Each file operation header is one of `*** Add File: <path>`, ",
-    "`*** Update File: <path>` (optionally followed by `*** Move to: <path>`), ",
+    "`*** Update File: <path>` (optionally followed by `*** Move to: <path>`, but Update with Move STILL requires at least one hunk — see RENAME / MOVE FILE section), ",
     "or `*** Delete File: <path>`. ",
     "Within Update hunks, the simplest form is just `-`/`+` lines with no `@@` and ",
     "no context (suitable when the `-` line is unique in the file). If disambiguation ",
@@ -62,6 +62,10 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Add File block — they are reserved for Update File. Writing raw source code ",
     "(e.g. `def main():` with no `+` prefix) directly after `*** Add File:` causes ",
     "`'def main():' is not a valid hunk header` errors.\n\n",
+    "RENAME / MOVE FILE (`*** Move to:` always needs ≥1 hunk, never empty):\n",
+    "`*** Update File: <old>\\n*** Move to: <new>` followed by **at least one hunk** with `-`/`+` lines (or `*** End of File` marker). An empty Update+Move block fails with `Update file hunk for path '<old>' is empty`. ",
+    "**For pure rename (no content change)**: use a Delete + Add File pair within the same patch instead — `*** Delete File: <old>` followed by `*** Add File: <new>` with every original line prefixed `+`. ",
+    "**For rename WITH content change**: keep `*** Update File:` + `*** Move to:` and include the actual `-`/`+` hunks for the changes.\n\n",
     "LINE PREFIX FORMAT (zero whitespace between prefix and content):\n",
     "Every line in a hunk starts with exactly ONE character followed by content with ",
     "NO intervening space — `-line_content` (NOT `- line_content`), `+line_content` ",
@@ -129,7 +133,9 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "3. `*** Update File:` cannot operate on a completely empty file. Use shell to write at least one line first, then apply_patch.\n",
     "4. In a multi-line file, lone `+` lines without a corresponding `-` APPEND below the previous context — they do NOT replace any existing line. ",
     "To change a line, use `-` to remove the old line AND `+` to add the new one; do not omit the `-`.\n",
-    "5. If multiple Update attempts on the same file fail with `Failed to find context` errors, fall back to a Delete File + Add File pair within the same patch (semantically equivalent to a full rewrite) — this avoids anchor-matching fragility."
+    "5. If multiple Update attempts on the same file fail with `Failed to find context` errors, fall back to a Delete File + Add File pair within the same patch (semantically equivalent to a full rewrite) — this avoids anchor-matching fragility.\n",
+    "6. `*** Begin Patch` MUST be the literal first line of `input` — no preamble, no whitespace, no `*** Add File:` directly. Forgetting it causes `invalid patch: The first line of the patch must be '*** Begin Patch'`.\n",
+    "7. `*** Update File: <old>` + `*** Move to: <new>` requires at least one hunk (rename-only is NOT supported via Move). For pure rename without content change, use `*** Delete File: <old>` + `*** Add File: <new>` (copy original content with `+` prefix). Empty Update+Move fails with `Update file hunk for path '<old>' is empty`."
 );
 
 /// Chat-path replacement for the freeform `input` parameter description.
@@ -154,7 +160,9 @@ pub(crate) const APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT: &str = concat!(
     "(read via `cat <path>` first if unsure) — guessing produces `Failed to find context` errors. ",
     "Chat-path gotchas: do not Add+Update the same path in one patch; Update cannot ",
     "operate on a totally empty file; lone `+` without `-` appends instead of replacing. ",
-    "If Update fails repeatedly, fall back to Delete File + Add File in one patch."
+    "If Update fails repeatedly, fall back to Delete File + Add File in one patch. ",
+    "**`*** Begin Patch` MUST be the literal first line of `input`** (no preamble). ",
+    "**`*** Update File: <old>` + `*** Move to: <new>` requires ≥1 hunk** — for pure rename use `*** Delete File:` + `*** Add File:` instead."
 );
 
 /// Responses tool 定义 → Chat tool 定义.
