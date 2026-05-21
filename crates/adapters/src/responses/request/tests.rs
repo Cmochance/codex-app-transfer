@@ -1987,11 +1987,35 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
         guidance.contains("apply_patch chat-path guidance"),
         "注入的指引必须带可识别 marker:{guidance}"
     );
-    // 4 个核心 workaround 都要含进去
-    assert!(guidance.contains("empty line") || guidance.contains("EMPTY LINE"));
+    // 关键规则覆盖(round 4 capture 实证根因修复后):
+    // (1) `@@` 单端语法(NEVER trailing `@@`)— 旧版双端误导已删除
+    assert!(
+        guidance.contains("SINGLE-SIDED") && guidance.contains("never"),
+        "guidance 必须强调 @@ 单端语法 + 禁尾随 @@:{guidance}"
+    );
+    assert!(
+        !guidance.contains("EMPTY LINE as the `@@` anchor"),
+        "旧版 EMPTY LINE anchor 误导已删除:{guidance}"
+    );
+    // (2) Add File 全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
+    assert!(
+        guidance.contains("prefix EVERY line") && guidance.contains("`+`"),
+        "guidance 必须强调 Add File 全 `+` 前缀:{guidance}"
+    );
+    // (3) byte-exact matching
+    assert!(
+        guidance.contains("byte-for-byte"),
+        "guidance 必须含 byte-exact 匹配规则:{guidance}"
+    );
+    // (4) Add+Update 同 path conflict
     assert!(guidance.contains("Add File") && guidance.contains("Update File"));
+    // (5) 空文件 + lone `+` APPEND + Delete+Add fallback 兜底
     assert!(guidance.contains("empty file") || guidance.contains("totally empty"));
     assert!(guidance.contains("APPEND") || guidance.contains("append"));
+    assert!(
+        guidance.contains("Delete File + Add File"),
+        "guidance 必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{guidance}"
+    );
 }
 
 #[test]
@@ -2871,29 +2895,57 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
     // 有 lark grammar 强约束的 chat 路径上反复栽在这里(把 anchor 当 space 行
     // 重复一次),花 20 分钟、25+ 次 retry 最后 fallback 到 sed。description
     // 必须含可执行的最小示例 + 显式的"do not repeat the anchor"指引。
+    // 关键断言(round 4 真机 capture 修复后):
+    // (1) 单端 `@@ <header>` 语法(禁双端 `@@ ... @@` — round 4 根因)
+    assert!(
+        outer.contains("single-sided") && outer.contains("@@"),
+        "tool description 必须显式说明 @@ 单端语法:{outer}"
+    );
     let outer_lc = outer.to_lowercase();
     assert!(
-        outer.contains("@@") && outer.contains("anchor"),
-        "tool description 必须解释 hunk anchor 语义:{outer}"
+        outer_lc.contains("never write a trailing")
+            || outer_lc.contains("never add a trailing")
+            || outer.contains("no trailing `@@`"),
+        "必须显式禁止尾随 @@:{outer}"
     );
+    // (2) Add File 全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
     assert!(
-        outer.contains("AFTER the anchor") || outer.contains("after it"),
-        "必须显式说明 space 行对应 anchor *之后* 的位置:{outer}"
+        outer.contains("prefix EVERY line") || outer.contains("prefixed with `+`"),
+        "Add File 必须强调每行 `+` 前缀:{outer}"
     );
+    // (3) byte-exact matching(对抗 Failed to find context)
     assert!(
-        outer_lc.contains("do not repeat the anchor") || outer_lc.contains("not again as a space"),
-        "必须显式禁止把 anchor 当 space 行重复:{outer}"
+        outer.contains("byte-for-byte") || outer.contains("byte-exact"),
+        "必须含 byte-exact 匹配规则:{outer}"
     );
+    // (4) 完整 V4A example 必须包含
     assert!(
         outer.contains("*** Update File:") && outer.contains("@@ fn main()"),
-        "必须包含一个最小可执行 V4A 示例:{outer}"
+        "必须包含一个最小可执行 V4A Update example:{outer}"
+    );
+    assert!(
+        outer.contains("*** Add File: hello.py"),
+        "必须包含一个 Add File example:{outer}"
+    );
+    // (5) Delete + Add File fallback 兜底(Update 反复失败时)
+    assert!(
+        outer.contains("Delete File + Add File"),
+        "必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{outer}"
     );
 
-    // 参数描述同样必须保留紧凑版的语义提示
+    // 参数描述紧凑版必须含同样核心规则(round 4 修复后)
     assert!(
-        input_desc.contains("anchor")
-            && (input_desc.contains("AFTER") || input_desc.contains("after")),
-        "input description 必须保留 anchor 语义紧凑版:{input_desc}"
+        input_desc.contains("single-sided") && input_desc.contains("@@"),
+        "input description 必须含 @@ 单端语法紧凑版:{input_desc}"
+    );
+    let input_lc = input_desc.to_lowercase();
+    assert!(
+        input_lc.contains("never write a trailing") || input_desc.contains("trailing `@@`"),
+        "input description 必须含禁尾随 @@ 紧凑版:{input_desc}"
+    );
+    assert!(
+        input_desc.contains("byte-exact") || input_desc.contains("byte-for-byte"),
+        "input description 必须含 byte-exact 紧凑版:{input_desc}"
     );
 }
 

@@ -2283,23 +2283,39 @@ use tools::{
 };
 
 /// chat-path 实战指引,作为独立 `role:"system"` 注入,仅在该 turn 的 tools
-/// 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试
-/// (DeepSeek 跑 10 个 Level 共发现的 4 个 chat-path 行为):tool/参数
-/// description 同时含紧凑版作 fallback,但 system message 在多数 chat
-/// 上游里被赋予更高权重,且模型在 system 块里读到的指引更难被遗忘 / 截断。
+/// 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试。
+///
+/// **本版本(round 4 capture 实证根因修复)** :
+/// 旧版第 1 条"Use an EMPTY LINE as the `@@` anchor"是事实错误 — 上游
+/// V4A 官方规范(`codex-rs/core/prompt_with_apply_patch_instructions.md`
+/// L298-314)的 `@@` 是**单端语法**:`@@ <header>` 命名 class/function 等
+/// section,**不带尾随 `@@`**。旧版误写为 `@@ <context> @@` 双端 + 推荐
+/// "empty content as anchor" 双重错误导致 Codex Desktop V4A applier
+/// 全程匹配失败(`Failed to find context '... @@'`)。本次修订:
+///   1. 删除 EMPTY LINE anchor 建议(误导)
+///   2. 显式说明 `@@` 单端语法 + 给出 `@@ class X` / `@@ def f():` 示例
+///   3. 加 Add File 必须每行 `+` 前缀的强调
+///   4. 加 "If Update repeatedly fails, fall back to Delete + Add File" 兜底
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
     "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
     "When you call the `apply_patch` tool, follow these rules empirically observed with non-OpenAI chat providers:\n",
     "\n",
-    "1. Use an EMPTY LINE as the `@@` anchor whenever possible. Non-empty anchors (e.g. `@@ Hello World!`) frequently fail to match on this path. ",
-    "If the target file lacks a blank line near your hunk, first run `printf '\\n' >> <path>` via shell to seed one, then use `@@` with empty content as the anchor, and clean up extra blank lines after the patch lands.\n",
+    "1. The V4A `@@` operator is SINGLE-SIDED: write `@@ <header>` (e.g. `@@ class MyClass`, `@@ def my_function():`, `@@ fn main() {`) — **never** add a trailing `@@`. ",
+    "Writing `@@ <header> @@` (double-sided) causes Codex Desktop's V4A applier to treat the trailing `@@` as literal text and fail with `Failed to find context '... @@'`. ",
+    "The `@@ <header>` line itself is OPTIONAL: if 3 lines of surrounding space-prefixed context already uniquely identify the location, omit `@@` entirely. ",
+    "If a single `@@` is ambiguous (e.g. same method name in multiple classes), use MULTIPLE `@@` lines on separate rows (`@@ class Outer\\n@@ def inner():`).\n",
     "\n",
-    "2. Do NOT combine `*** Add File: <path>` and `*** Update File: <path>` for the same path in a single patch. ",
-    "The Update step reads the file before the Add step lands on disk, so it sees an empty file and fails. Either: (a) make `*** Add File:` write the final content in one shot, or (b) split into two separate `apply_patch` invocations.\n",
+    "2. Add File uses NO `@@` markers and NO hunks. After `*** Add File: <path>`, prefix EVERY line of the new file's content with `+`, including blank lines (write them as a bare `+` on its own row). Raw source code without `+` prefix (e.g. `def main():` directly) causes `'def main():' is not a valid hunk header` errors.\n",
     "\n",
-    "3. `*** Update File:` cannot operate on a totally empty file. If the target is empty, first use shell (e.g. `printf '\\n' > <path>`) to write at least one line, then call `apply_patch`.\n",
+    "3. Every `-` line and space-prefixed context line MUST match the file byte-for-byte (same leading whitespace, no trimmed trailing spaces, exact characters). If unsure, run `cat <path>` or `sed -n '1,80p' <path>` via shell first, then compose the patch from real bytes. Guessing produces `Failed to find context '<your guess>'` errors.\n",
     "\n",
-    "4. In a multi-line file, lone `+` lines following an `@@` anchor APPEND below the anchor — they do NOT replace the anchor line. To change an existing line, you must include BOTH a `-` line to remove the old content AND a `+` line to add the new content. Do not omit the `-` line.\n",
+    "4. Do NOT combine `*** Add File: <path>` and `*** Update File: <path>` for the same path in a single patch. The Update step reads the file before the Add step lands on disk, so it sees an empty file and fails. Either: (a) make `*** Add File:` write the final content in one shot, or (b) split into two separate `apply_patch` invocations.\n",
+    "\n",
+    "5. `*** Update File:` cannot operate on a totally empty file. If the target is empty, first use shell (e.g. `printf '\\n' > <path>`) to write at least one line, then call `apply_patch`.\n",
+    "\n",
+    "6. In a multi-line file, lone `+` lines without a corresponding `-` line APPEND below the previous context — they do NOT replace any existing line. To change an existing line, you MUST include BOTH a `-` line (removing the old content) AND a `+` line (adding the new content).\n",
+    "\n",
+    "7. If repeated Update File attempts on the same target fail with `Failed to find context` errors, fall back to a Delete File + Add File pair within the same patch (semantically equivalent to a full rewrite, avoids anchor-matching fragility).\n",
     "\n",
     "Following these rules avoids retry storms and improves the success rate on first attempt."
 );
