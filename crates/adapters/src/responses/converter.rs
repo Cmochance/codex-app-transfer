@@ -3722,7 +3722,10 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
             })
             .expect("custom_tool_call output_item.added 必须 emit");
         assert_eq!(added.1["item"]["name"], "apply_patch");
-        assert_eq!(added.1["item"]["call_id"], "call_test_1", "call_id 必须复用模型原 exec_command call_id");
+        assert_eq!(
+            added.1["item"]["call_id"], "call_test_1",
+            "call_id 必须复用模型原 exec_command call_id"
+        );
 
         // V4A input.done 含 Add File header + 行 `+` 前缀
         let inputs = collect_apply_patch_inputs(&events);
@@ -3750,7 +3753,10 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
             item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call")
                 && item.get("name").and_then(|v| v.as_str()) == Some("apply_patch")
         });
-        assert!(has_apply_patch, "envelope final output 必须含 apply_patch item");
+        assert!(
+            has_apply_patch,
+            "envelope final output 必须含 apply_patch item"
+        );
     }
 
     #[test]
@@ -3812,7 +3818,10 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
             .iter()
             .find(|(n, p)| {
                 n == "response.function_call_arguments.delta"
-                    && p["delta"].as_str().map(|s| s.contains("ls -la")).unwrap_or(false)
+                    && p["delta"]
+                        .as_str()
+                        .map(|s| s.contains("ls -la"))
+                        .unwrap_or(false)
             })
             .expect("deferred function_call_arguments.delta 必须含完整 args");
         let _ = args_delta;
@@ -3826,7 +3835,10 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
             n == "response.output_item.added"
                 && p["item"].get("name").and_then(|v| v.as_str()) == Some("apply_patch")
         });
-        assert!(!has_apply_patch, "非 file-write 不应被 normalize 成 apply_patch");
+        assert!(
+            !has_apply_patch,
+            "非 file-write 不应被 normalize 成 apply_patch"
+        );
     }
 
     #[test]

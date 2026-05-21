@@ -129,8 +129,8 @@ fn regex_word_match(cmd: &str, needle: &str) -> bool {
     let mut i = 0;
     while i + nlen <= bytes.len() {
         if &bytes[i..i + nlen] == needle.as_bytes() {
-            let prev_ok = i == 0
-                || matches!(bytes[i - 1], b' ' | b'\t' | b';' | b'\n' | b'(' | b'|');
+            let prev_ok =
+                i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b';' | b'\n' | b'(' | b'|');
             let next_ok = i + nlen == bytes.len()
                 || matches!(
                     bytes[i + nlen],
@@ -223,8 +223,8 @@ fn strip_heredoc_terminator<'a>(
         let idx = slice.find(terminator)?;
         let absolute_idx = search_from + idx;
         // 检查 terminator 前一字符是不是 newline(或 body 开头)
-        let prev_is_nl = absolute_idx == 0
-            || body_with_terminator.as_bytes()[absolute_idx - 1] == b'\n';
+        let prev_is_nl =
+            absolute_idx == 0 || body_with_terminator.as_bytes()[absolute_idx - 1] == b'\n';
         // 检查 terminator 后跟的是 newline / EOF(允许 trailing whitespace
         // 直到 newline / 字符串末尾)
         let after = &body_with_terminator[absolute_idx + terminator.len()..];
@@ -234,7 +234,11 @@ fn strip_heredoc_terminator<'a>(
             .unwrap_or_else(|| after.chars().all(char::is_whitespace));
         if prev_is_nl && trailing_only_ws_then_nl_or_eof {
             // body 不含末尾的 newline + terminator 行
-            let body_end = if absolute_idx > 0 { absolute_idx - 1 } else { 0 };
+            let body_end = if absolute_idx > 0 {
+                absolute_idx - 1
+            } else {
+                0
+            };
             return Some(&body_with_terminator[..body_end]);
         }
         search_from = absolute_idx + terminator.len();
@@ -587,7 +591,9 @@ mod tests {
     fn empty_body_single_plus_line() {
         let cmd = "echo '' > /tmp/empty.txt";
         let p = detect_shell_file_write(cmd).unwrap();
-        assert!(p.patch_input.contains("*** Add File: /tmp/empty.txt\n+\n*** End Patch\n"));
+        assert!(p
+            .patch_input
+            .contains("*** Add File: /tmp/empty.txt\n+\n*** End Patch\n"));
     }
 
     #[test]
