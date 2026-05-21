@@ -2031,6 +2031,27 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
         guidance.contains("For pure rename"),
         "guidance 必须给纯重命名的 Delete+Add 替代方案:{guidance}"
     );
+    // 用户实测反馈(2026-05-22):模型在"几乎全替换"场景倾向用 `cat > file`
+    // 绕过 apply_patch。prompt 必须强 normative 明示:任何文件操作走 apply_patch,
+    // 全文 rewrite 用 Delete File + Add File。
+    assert!(
+        guidance.contains("ALWAYS use the `apply_patch` tool")
+            && guidance.contains("NEVER use shell"),
+        "guidance 必须强 normative 禁 shell redirect:{guidance}"
+    );
+    assert!(
+        guidance.contains("full-file rewrites")
+            && guidance.contains("`*** Delete File:")
+            && guidance.contains("`*** Add File:"),
+        "guidance 必须明示 large rewrite 走 Delete File + Add File:{guidance}"
+    );
+    // 必须含 rule 5 `printf '\n' > <path>` carve-out 明示
+    // (防 Devin pre-merge review 报跟 rule 5 冲突,2026-05-22)
+    assert!(
+        guidance.contains("narrow exception in rule 5")
+            && guidance.contains("preparation step, not a content bypass"),
+        "guidance 必须 carve-out rule 5 的 `printf '\\n' > <path>` setup 用法:{guidance}"
+    );
 }
 
 #[test]
@@ -2992,6 +3013,19 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
     assert!(
         outer.contains("pure rename") && outer.contains("Delete File"),
         "outer description 必须给纯重命名的 Delete+Add 替代方案:{outer}"
+    );
+    // 用户实测反馈(2026-05-22)— 全文 rewrite 倾向 shell 绕过:
+    assert!(
+        outer.contains("ALWAYS use this tool") && outer.contains("NEVER use shell"),
+        "outer description 必须强 normative 禁 shell redirect:{outer}"
+    );
+    assert!(
+        outer.contains("full-file rewrites") && outer.contains("`*** Delete File:"),
+        "outer description 必须明示 large rewrite 走 Delete + Add File:{outer}"
+    );
+    assert!(
+        outer.contains("narrow exception is seeding a totally empty file"),
+        "outer description 必须 carve-out 空文件 seed 用法:{outer}"
     );
 
     // 参数描述紧凑版必须含同样核心规则(round 4 修复后)
