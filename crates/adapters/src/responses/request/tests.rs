@@ -2045,6 +2045,13 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
             && guidance.contains("`*** Add File:"),
         "guidance 必须明示 large rewrite 走 Delete File + Add File:{guidance}"
     );
+    // 必须含 rule 5 `printf '\n' > <path>` carve-out 明示
+    // (防 Devin pre-merge review 报跟 rule 5 冲突,2026-05-22)
+    assert!(
+        guidance.contains("narrow exception in rule 5")
+            && guidance.contains("preparation step, not a content bypass"),
+        "guidance 必须 carve-out rule 5 的 `printf '\\n' > <path>` setup 用法:{guidance}"
+    );
 }
 
 #[test]
@@ -3015,6 +3022,10 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
     assert!(
         outer.contains("full-file rewrites") && outer.contains("`*** Delete File:"),
         "outer description 必须明示 large rewrite 走 Delete + Add File:{outer}"
+    );
+    assert!(
+        outer.contains("narrow exception is seeding a totally empty file"),
+        "outer description 必须 carve-out 空文件 seed 用法:{outer}"
     );
 
     // 参数描述紧凑版必须含同样核心规则(round 4 修复后)
