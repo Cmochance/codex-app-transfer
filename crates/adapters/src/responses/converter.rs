@@ -81,6 +81,13 @@ struct PendingToolCall {
     /// 完全一致(避免 args_acc 在 close 与 envelope 构造之间发生变化时
     /// 静默 drift)。
     apply_patch_input: Option<String>,
+    /// `close_tool_call` 在 interrupted apply_patch 路径 emit
+    /// `response.output_item.done` 时强制 `status="incomplete"`(防 Codex CLI
+    /// 在 partial V4A 上跑 destructive apply)。**envelope 终态必须保持一致**
+    /// (`tool_call_item_completed` 也得读 incomplete 才不会跟流式 done event
+    /// 矛盾,严格客户端读 envelope 误以为完成会执行 partial patch)。
+    /// Devin AI BUG_pr-review-job 报告修复。
+    interrupted_during_close: bool,
 }
 
 /// Codex CLI 把 `apply_patch` 作为 freeform 工具注册
@@ -543,6 +550,7 @@ impl ChatToResponsesConverter {
                     is_apply_patch,
                     output_item_added_emitted: false,
                     apply_patch_input: None,
+                    interrupted_during_close: false,
                 },
             );
             // apply_patch:wire 必须是 `custom_tool_call`(裸 `input` 字段)。
@@ -756,8 +764,12 @@ impl ChatToResponsesConverter {
                 );
                 // 不存 cache(下一轮如果引用此 call_id 重建会拿到 incomplete
                 // 上下文,反而误导;让 orphan repair 路径补占位)。
+                // 标记 interrupted 让 `tool_call_item_completed` 在 envelope
+                // 终态也 emit `status="incomplete"`,严格客户端读 envelope
+                // 才不会误以为 patch 完整(Devin pre-merge review 修复)。
                 if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
                     pending.closed = true;
+                    pending.interrupted_during_close = true;
                 }
                 return;
             }
@@ -1051,13 +1063,22 @@ impl ChatToResponsesConverter {
                 .apply_patch_input
                 .clone()
                 .unwrap_or_else(|| pending.args_acc.clone());
+            // interrupted apply_patch envelope 终态必须跟流式 done event 一致
+            // 为 `incomplete`,否则严格客户端读 envelope output[] 看到
+            // `completed` 会执行 partial V4A patch(destructive)— Devin
+            // pre-merge review 报告 BUG_pr-review-job-9600e18f8e4c4a90 修复。
+            let status = if pending.interrupted_during_close {
+                "incomplete"
+            } else {
+                "completed"
+            };
             return json!({
                 "type": "custom_tool_call",
                 "id": pending.fc_id,
                 "call_id": pending.call_id,
                 "name": pending.name,
                 "input": input,
-                "status": "completed",
+                "status": status,
             });
         }
         let mut item = json!({
@@ -2945,6 +2966,21 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
         assert_eq!(
             completed.1["response"]["incomplete_details"]["reason"],
             "interrupted"
+        );
+
+        // Devin pre-merge review BUG_pr-review-job-9600e18f8e4c4a90 防御回归:
+        // envelope.output[] 终态 item.status 必须跟流式 `response.output_item.done`
+        // 一致(都是 `incomplete`);若 envelope 写 `completed` 而流式 done 写
+        // `incomplete`,严格客户端读 envelope 会误执行 partial V4A patch
+        // (destructive)。
+        let final_output = completed.1["response"]["output"].as_array().unwrap();
+        let final_apply_patch_item = final_output
+            .iter()
+            .find(|item| item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call"))
+            .expect("envelope.output 必须含 apply_patch custom_tool_call item");
+        assert_eq!(
+            final_apply_patch_item["status"], "incomplete",
+            "interrupted apply_patch envelope.output[] item.status 必须跟流式 done event 一致(都是 incomplete)"
         );
     }
 
