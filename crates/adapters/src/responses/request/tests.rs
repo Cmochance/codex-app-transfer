@@ -1989,8 +1989,10 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
     );
     // 关键规则覆盖(round 4 capture 实证根因修复后):
     // (1) `@@` 单端语法(NEVER trailing `@@`)— 旧版双端误导已删除
+    // 注意:用精确大写 "NEVER add a trailing" 匹配本规则,不能用小写 "never"
+    // (会被 "whenever" 等无关词的子串误命中,Devin pre-merge review 修复)。
     assert!(
-        guidance.contains("SINGLE-SIDED") && guidance.contains("never"),
+        guidance.contains("SINGLE-SIDED") && guidance.contains("NEVER add a trailing"),
         "guidance 必须强调 @@ 单端语法 + 禁尾随 @@:{guidance}"
     );
     assert!(
