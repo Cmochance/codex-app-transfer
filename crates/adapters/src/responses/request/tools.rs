@@ -32,7 +32,7 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Edit files using the apply_patch tool. ",
     "**ALWAYS use this tool to write file content** — new files, single-line edits, and full-file rewrites alike. ",
     "**NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. ",
-    "(The narrow exception is seeding a totally empty file with `printf '\\n' > <path>` before calling `*** Update File:` — see gotcha 5; that's a setup step, not a content bypass.) ",
+    "(The narrow exception is seeding a totally empty file with `printf '\\n' > <path>` before calling `*** Update File:` — see gotcha 3; that's a setup step, not a content bypass.) ",
     "For full-file rewrites or large changes where almost every line differs, use `*** Delete File: <path>` followed by `*** Add File: <path>` (with `+` prefix on every line of the new content) inside a single patch — this is more concise than a long `-`/`+` diff and is the correct apply_patch idiom for large rewrites. ",
     "Call this function with a single `input` string containing a V4A patch. ",
     "**The patch MUST start with `*** Begin Patch` as the literal first line** (no leading whitespace, no other content before it), and end with `*** End Patch`. ",
