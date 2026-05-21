@@ -233,7 +233,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 - [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x 桌面壳骨架 + README 结构参考
 - [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — 协议双向转换思路
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` 架构基座
-- [`openai/codex`](https://github.com/openai/codex) — autocompact prompt 骨架 + compact 协议结构反查(Apache-2.0)
+- [`openai/codex`](https://github.com/openai/codex) — autocompact prompt 骨架 + compact 协议结构反查 + apply_patch V4A chat-path system guidance verbatim 引用(`codex-rs/core/prompt_with_apply_patch_instructions.md` L277-L351 @ commit `0b4f86095c8005d8f74e9c62b971d72c1670aa88`,Apache-2.0)
 - [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact prompt 锚定 bullet(All user messages verbatim + Next Step verbatim)
 - [`7as0nch/mimo2codex`](https://github.com/7as0nch/mimo2codex) — MiMo 协议借鉴
 - [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) — Gemini OAuth wire 参考

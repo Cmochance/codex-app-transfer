@@ -2283,25 +2283,56 @@ use tools::{
 };
 
 /// chat-path 实战指引,作为独立 `role:"system"` 注入,仅在该 turn 的 tools
-/// 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试
-/// (DeepSeek 跑 10 个 Level 共发现的 4 个 chat-path 行为):tool/参数
-/// description 同时含紧凑版作 fallback,但 system message 在多数 chat
-/// 上游里被赋予更高权重,且模型在 system 块里读到的指引更难被遗忘 / 截断。
+/// 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试:
+/// chat-completions providers 上无 lark grammar 兜底,模型生成的 V4A 内容
+/// 在 6 / 7 个 turn 失败(直接吐 Python 代码 / `-` 行不 byte-exact / 选 exec_command)。
+///
+/// 结构 = 三段:
+///   (1) Tool selection 顶层引导 (对抗 exec_command 偏好)
+///   (2) [include_str!] V4A 完整教学块 — verbatim 借鉴自上游 Codex CLI
+///       openai/codex @ commit `0b4f86095c8005d8f74e9c62b971d72c1670aa88`,
+///       codex-rs/core/prompt_with_apply_patch_instructions.md L277-L351,
+///       Apache-2.0 licensed,Copyright 2025 OpenAI。
+///       attribution 同时见 NOTICE 文件 + README 中英致谢段 +
+///       ACKNOWLEDGEMENTS.md + `apply_patch_v4a_reference.md` 文件头部
+///       adapter note。
+///       上游若发版,**同步**更新 5 处 commit SHA:
+///         - `apply_patch_v4a_reference.md` 文件头部 adapter note
+///         - 本常量上方 doc comment(本处)
+///         - `ACKNOWLEDGEMENTS.md` openai/codex section
+///         - `README.md` 致谢段
+///         - `README.en.md` 致谢段
+///         - `NOTICE` 文件 third-party attribution 段
+///       再用 fresh upstream slice 覆盖 `apply_patch_v4a_reference.md` 正文。
+///   (3) Chat-path specific gotchas — 真机 capture (issue #235) 沉淀的 5 条
+///       failure mode workaround,补 V4A 通用规则未覆盖的 non-OpenAI provider 差异。
+///
+/// 总长约 3KB。已对照 Anthropic `Define tools` best practice ("at least 3-4
+/// sentences per tool description, more if the tool is complex")。
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
     "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
-    "When you call the `apply_patch` tool, follow these rules empirically observed with non-OpenAI chat providers:\n",
     "\n",
-    "1. Use an EMPTY LINE as the `@@` anchor whenever possible. Non-empty anchors (e.g. `@@ Hello World!`) frequently fail to match on this path. ",
-    "If the target file lacks a blank line near your hunk, first run `printf '\\n' >> <path>` via shell to seed one, then use `@@` with empty content as the anchor, and clean up extra blank lines after the patch lands.\n",
+    "## Tool selection\n",
     "\n",
-    "2. Do NOT combine `*** Add File: <path>` and `*** Update File: <path>` for the same path in a single patch. ",
-    "The Update step reads the file before the Add step lands on disk, so it sees an empty file and fails. Either: (a) make `*** Add File:` write the final content in one shot, or (b) split into two separate `apply_patch` invocations.\n",
+    "When the user asks you to create, edit, refactor, or delete file content, you MUST use the `apply_patch` tool. Do NOT shell out to `sed` / `awk` / `cat <<EOF` / `python -c` / `echo > file` / `printf > file` to write or modify file content — those produce inconsistent diffs across reruns, bypass the diff UI, and frequently leave whitespace mismatches that break subsequent edits. Reserve shell tools for reads (`cat`, `sed -n '1,80p' <path>`, `ls`), execution, and tests.\n",
     "\n",
-    "3. `*** Update File:` cannot operate on a totally empty file. If the target is empty, first use shell (e.g. `printf '\\n' > <path>`) to write at least one line, then call `apply_patch`.\n",
+    "## V4A patch format\n",
     "\n",
-    "4. In a multi-line file, lone `+` lines following an `@@` anchor APPEND below the anchor — they do NOT replace the anchor line. To change an existing line, you must include BOTH a `-` line to remove the old content AND a `+` line to add the new content. Do not omit the `-` line.\n",
+    include_str!("apply_patch_v4a_reference.md"),
     "\n",
-    "Following these rules avoids retry storms and improves the success rate on first attempt."
+    "## Chat-path specific gotchas (codex-app-transfer adapter, empirically observed with non-OpenAI providers)\n",
+    "\n",
+    "1. Match `-` lines BYTE-EXACT to the file's current content — same leading whitespace, no trimmed trailing spaces, no normalized newlines. If you are not certain what the lines look like, first run `cat <path>` or `sed -n '1,80p' <path>` via shell to read the file, then compose the patch from the actual bytes. Guessing `-` content is the #1 cause of `Failed to find expected lines` errors on this path.\n",
+    "\n",
+    "2. Empty-line `@@` anchors only work if a blank line actually exists at that position in the file. If you need an anchor in a file with no blank lines, prefer a non-empty `@@ <header>` anchor (e.g. `@@ def add(a, b):`) over forcing a blank line.\n",
+    "\n",
+    "3. Do NOT combine `*** Add File: <path>` and `*** Update File: <path>` for the same path in a single patch. The Update step reads the file before the Add step lands on disk, so it sees an empty file and fails. Either: (a) make `*** Add File:` write the final content in one shot, or (b) split into two separate `apply_patch` invocations.\n",
+    "\n",
+    "4. `*** Update File:` cannot operate on a totally empty file. If the target is empty, first use shell (e.g. `printf '\\n' > <path>`) to write at least one line, then call `apply_patch`.\n",
+    "\n",
+    "5. In a multi-line file, lone `+` lines AFTER an `@@` anchor APPEND below the anchor — they do NOT replace the anchor line. To change a line, you must include BOTH a `-` line to remove the old content AND a `+` line to add the new one; do not omit the `-`.\n",
+    "\n",
+    "Following the V4A grammar above plus these chat-path rules avoids retry storms and improves first-attempt success rate substantially on non-OpenAI providers."
 );
 
 /// 检测 Responses request body 的 tools 数组是否注册了 `apply_patch` 工具。

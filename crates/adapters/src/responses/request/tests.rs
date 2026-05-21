@@ -1987,8 +1987,35 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
         guidance.contains("apply_patch chat-path guidance"),
         "注入的指引必须带可识别 marker:{guidance}"
     );
-    // 4 个核心 workaround 都要含进去
-    assert!(guidance.contains("empty line") || guidance.contains("EMPTY LINE"));
+    let guidance_lc = guidance.to_lowercase();
+    // (1) Tool selection 顶层引导(对抗 exec_command 偏好)
+    assert!(
+        guidance.contains("Tool selection") && guidance.contains("Do NOT shell out"),
+        "guidance 必须含 tool selection 顶层引导:{guidance}"
+    );
+    // (2) Verbatim 借鉴的上游 V4A reference 已被 include_str! 拼装进来
+    assert!(
+        guidance.contains("*** Begin Patch") && guidance.contains("*** End Patch"),
+        "guidance 必须含 V4A 完整 envelope 教学:{guidance}"
+    );
+    assert!(
+        guidance.contains("Patch := Begin { FileOp } End"),
+        "guidance 必须含上游 EBNF 语法块(verbatim 引用证据):{guidance}"
+    );
+    assert!(
+        guidance.contains("@@ class BaseClass"),
+        "guidance 必须含上游双锚点 example(verbatim 引用证据):{guidance}"
+    );
+    // (3) chat-path 4 条 gotchas + byte-exact 规则
+    assert!(
+        guidance_lc.contains("byte-exact") || guidance_lc.contains("byte-for-byte"),
+        "guidance 必须含 byte-exact 匹配规则(turn 0010 失败修复):{guidance}"
+    );
+    // Empty-line anchor gotcha #2 是 chat-path 关键规则之一,锁定确切措辞防 wording drift
+    assert!(
+        guidance.contains("Empty-line `@@` anchors only work"),
+        "chat-path gotcha #2 (Empty-line anchor 仅当 blank 行存在) 必须保留:{guidance}"
+    );
     assert!(guidance.contains("Add File") && guidance.contains("Update File"));
     assert!(guidance.contains("empty file") || guidance.contains("totally empty"));
     assert!(guidance.contains("APPEND") || guidance.contains("append"));
@@ -2894,6 +2921,47 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
         input_desc.contains("anchor")
             && (input_desc.contains("AFTER") || input_desc.contains("after")),
         "input description 必须保留 anchor 语义紧凑版:{input_desc}"
+    );
+
+    // 回归保护(issue #235 真机 capture 28-turn 数据,7 个 apply_patch tool_call
+    // 中 6 个失败 → 失败率 85.7% 触发):
+    // tool description 在 3 个新维度上必须有显式引导。
+    let outer_lc = outer.to_lowercase();
+
+    // (a) Tool selection 顶层引导(对抗模型选 exec_command 而非 apply_patch)
+    assert!(
+        outer.contains("Use this tool for ANY file content change")
+            && outer_lc.contains("do not shell out"),
+        "outer description 必须显式指引用 apply_patch 而非 sed/echo/python -c 等 shell 改文件:{outer}"
+    );
+
+    // (b) Byte-exact 匹配规则(对抗 turn 0010 \"Failed to find expected lines\")
+    assert!(
+        outer_lc.contains("byte-exact") || outer_lc.contains("byte-for-byte"),
+        "outer description 必须含 `-` 行 byte-exact 匹配规则:{outer}"
+    );
+    assert!(
+        input_desc.to_lowercase().contains("byte-exact"),
+        "input description 紧凑版必须同步含 byte-exact 规则:{input_desc}"
+    );
+
+    // (c) 至少 3 个 positive example(Anthropic best practice + 上游借鉴):
+    //     Example 1: 改一行
+    //     Example 2: Add File 新建
+    //     Example 3: 多 hunk Update(双锚点)
+    assert!(
+        outer.contains("EXAMPLE 1") && outer.contains("EXAMPLE 2") && outer.contains("EXAMPLE 3"),
+        "outer description 必须含 3 个 positive example:{outer}"
+    );
+    assert!(
+        outer.contains("*** Add File: hello.py"),
+        "outer description 必须含 Add File example:{outer}"
+    );
+
+    // (d) Anti-pattern reminder(对抗 turn 0016/0019/0022 直接吐 Python 代码)
+    assert!(
+        outer.contains("NOT pass raw source code"),
+        "outer description 必须显式提醒不要直接传 raw source code:{outer}"
     );
 }
 

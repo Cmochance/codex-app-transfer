@@ -124,8 +124,8 @@
 
 - **Link**: https://github.com/openai/codex
 - **License**: Apache-2.0
-- **借鉴形式**: Prompt 蓝本(精简移植)+ 协议反查(数据模式参照)
-- **首次借鉴 PR / 时间**: v2.0.x 起协议结构反查;fix/219 起 prompt 结构借鉴
+- **借鉴形式**: Prompt 蓝本(精简移植)+ 协议反查(数据模式参照)+ V4A apply_patch system guidance(verbatim 引用)
+- **首次借鉴 PR / 时间**: v2.0.x 起协议结构反查;fix/219 起 compact prompt 结构借鉴;PR #235 后续(post-#236)起 apply_patch V4A chat-path guidance verbatim 引用
 - **借鉴清单**:
   - `COMPACT_SUMMARIZATION_PROMPT` 基础骨架 → `crates/adapters/src/responses/compact.rs:82-92`
     (源文件:`codex-rs/core/templates/compact/prompt.md`,~460 chars)
@@ -137,6 +137,12 @@
   - `CompactHistoryResponse { output: Vec<ResponseItem> }` + `ResponseItem::Compaction { encrypted_content }` 响应结构
     → `compact.rs` 序列化路径
     (源文件:`codex-rs/codex-api/src/endpoint/compact.rs` + `codex-rs/protocol/src/models.rs:882`)
+  - apply_patch V4A chat-path system guidance(verbatim 引用)→
+    `crates/adapters/src/responses/apply_patch_v4a_reference.md`(verbatim 镜像,头部加 adapter note 显式 override "shell command" 字眼为 "function-call tool",其余原文未改动)
+    由 `crates/adapters/src/responses/request.rs::APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE`(`include_str!`)拼装注入
+    源文件:`codex-rs/core/prompt_with_apply_patch_instructions.md` 的 L277-L351 @ commit `0b4f86095c8005d8f74e9c62b971d72c1670aa88`
+    动机:issue #235 真机 capture 28-turn / 26MB DeepSeek+Kimi 数据,模型生成 V4A patch 在 chat-path 失败率 6 / 7 个 turn,需要在 prompt 注入完整 V4A 教学(envelope / hunks / `@@` 锚点 / 3-line context / EBNF / 多操作 example)。chat-path 无 lark grammar 兜底,只能靠 prompt 引导。
+    上游 SHA 升级时:同步更新本文件 + `apply_patch_v4a_reference.md` 头部 + `request.rs::APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE` doc comment + `README.md` / `README.en.md` 致谢段 + `NOTICE` 文件共 6 处 commit SHA,再 fresh slice 覆盖 reference 正文。
 - **本项目差异 / 扩展**:
   - prompt 补两条 Claude Code 关键 bullet("All user messages verbatim" + "Next Step verbatim quote"),
     借鉴自 Piebald-AI/claude-code-system-prompts 反编译公开版本第 6 / 9 段(见下方同名 entry)

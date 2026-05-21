@@ -24,7 +24,7 @@
 | instructions(dict.text/content) | ✓ | ✓ | ✓ | |
 | max_output_tokens → max_tokens | ✓ | ✓ | ✓ | |
 | tools.function | ✓ | ✓ | ✓ | parameters 缺 type 自动补 object |
-| tools.custom → function (input:string) | ✓ | 部分 | ✓ | litellm 走 apply_patch 单分支 |
+| tools.custom → function (input:string) | ✓ | 部分 | ✓ | litellm 走 apply_patch 单分支;Rust 自 PR #236 起对 apply_patch 特判重写 description,post-#236 进一步扩展(verbatim 借鉴上游 V4A 完整教学 + BYTE-EXACT 规则 + 3 正例 + 5 gotcha + Tool selection 顶层引导) |
 | tools.web_search/file_search/mcp/computer_use 等丢弃 | ✓ | ✗(转译) | ✓ | Codex 不需要 |
 | tool_choice "auto"/"none"/"required" | ✓ | ✓ | ✓ | |
 | tool_choice {type:function, function:{name}} | ✓ | ✓ | ✓ | |
@@ -32,6 +32,8 @@
 | input.message(含多模态 blocks) | ✓ | ✓ | ✓ | |
 | input.function_call | ✓ | ✓ | ✓ | |
 | input.function_call_output(call_id 别名 tool_call_id/id 兜底) | ✓ | ✓ | ✓ | |
+| input.custom_tool_call(apply_patch 多轮回放 → assistant.tool_calls) | ✗ | ✗ | ✓ | PR #236 新增;`call_id`/`id` 兜底;arguments 序列化为 `{"input":"<V4A>"}` JSON 字符串 |
+| input.custom_tool_call_output(apply_patch 结果回放 → role:tool) | ✗ | ✗ | ✓ | PR #236 新增;`call_id`/`tool_call_id`/`id` 三级兜底;output 走同 normalize_tool_output_for_context |
 | input.input_image / input_file / input_audio / input_video | ✓ | ✓ | ✓ | |
 | input.reasoning(opaque)挂下一条 assistant | ✓ | 部分 | ✓ | Rust 用单空格占位 |
 | 连续 user / assistant 合并 | ✓ | 部分 | ✓ | |
