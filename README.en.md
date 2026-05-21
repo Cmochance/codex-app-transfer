@@ -1,5 +1,14 @@
 # Codex App Transfer
 
+> [!IMPORTANT]
+> 🔴 **Test coverage notice**
+>
+> This project has currently completed **end-to-end real-world testing only for Kimi For Coding and Xiaomi MiMo (Token Plan)**.
+>
+> Other built-in chat-completions-compatible providers (including **DeepSeek, Kimi (Moonshot Platform), Xiaomi MiMo (Pay for Token), Zhipu GLM, Aliyun Bailian (API Key / Token Plan), MiniMax**) **have not undergone long-term real-world regression** — they sit at unit-test + occasional user-report level only.
+>
+> If you'd be willing to **provide an API key from another provider for testing**, it would be deeply appreciated! Reach out via **QQ: `3216202644`** or email. The author guarantees the **API key will only be used for actual testing of this project**, destroyed immediately after testing, never repurposed.
+
 <p align="center">
   <a href="README.md">简体中文</a> |
   <a href="README.en.md">English</a> |
@@ -14,13 +23,11 @@
   <a href="https://github.com/Cmochance/codex-app-transfer/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/Cmochance/codex-app-transfer/total?label=downloads"></a>
 </p>
 
-Codex App Transfer is a lightweight desktop config + forwarding tool for the **OpenAI Codex CLI**. It runs a local gateway that translates Codex CLI's Responses API requests (HTTP streaming / non-streaming + `/responses` fallback) into Chat Completions / Gemini Native / Anthropic Messages / Grok Web / other upstream formats, then forwards them to your chosen provider.
+Codex App Transfer is a lightweight desktop config + forwarding tool for the **OpenAI Codex App**. It runs a local gateway that translates Codex App's Responses API requests (HTTP streaming / non-streaming + `/responses`) into Chat Completions and other upstream formats, then forwards them to your chosen provider. The desktop UI manages providers, model mappings, the forwarding port, and the logs panel, letting Codex App talk to any third-party chat/completions inference service.
 
-Unlike `farion1231/cc-switch` and similar Anthropic-oriented Claude Code tools, this project focuses on **OpenAI Codex CLI**: manage providers, model mapping, forwarding ports, and a logs panel from a desktop UI so Codex CLI can talk to any third-party OpenAI / Gemini / Claude-compatible / Grok inference endpoint.
+After starting forwarding, Codex App talks to this tool at `127.0.0.1:18080`. Closing the window minimizes the app to the system tray; right-click the tray icon and choose "Exit" to fully quit.
 
-After starting forwarding, Codex CLI talks to this tool at `127.0.0.1:18080`. Closing the window minimizes the app to the system tray; right-click the tray icon and choose "Exit" to fully quit.
-
-Current version **v2.1.6** (see [Changelog](docs/CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
+Current version **v2.1.12** (see [Changelog](docs/CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
 
 ## Preview
 
@@ -30,20 +37,20 @@ Current version **v2.1.6** (see [Changelog](docs/CHANGELOG.md) and [Releases](ht
 | **Settings** | **Logs** |
 | ![Settings](docs/img/Settings.png) | ![Logs](docs/img/Logs.png) |
 
-### Codex CLI in action
+### Codex App in action
 
-With any provider enabled, Codex CLI's model picker shows `<provider> / <real-model>`-style real model names. Tool loops / `previous_response_id` history replay / thinking-mode reasoning_content injection are all handled transparently by the local proxy:
+With any provider enabled, Codex App's model picker shows `<provider> / <real-model>`-style real model names. Tool loops / `previous_response_id` history replay / thinking-mode reasoning_content injection are all handled transparently by the local proxy:
 
-![Codex CLI real conversation](docs/img/codex-cli-real-chat.png)
+![Codex App real conversation](docs/img/codex-cli-real-chat.png)
 
 ## What it does
 
 - Manage multiple providers; map OpenAI model names (`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`) to the provider's real model IDs
-- Translate Codex CLI's Responses API streaming / non-streaming requests into upstream protocols: Chat Completions, Gemini Native (`:streamGenerateContent`), Gemini CLI OAuth (Cloud Code Assist), Anthropic Messages (`/v1/messages`), Grok Web (`/rest/app-chat/conversations/new`), Responses passthrough, etc.
+- Translate Codex App's Responses API streaming / non-streaming requests into upstream protocols: Chat Completions, Gemini Native (`:streamGenerateContent`), Gemini CLI OAuth (Cloud Code Assist), Anthropic Messages (`/v1/messages`), Grok Web (`/rest/app-chat/conversations/new`), Responses passthrough, etc.
 - Multi-turn tool conversation context + `previous_response_id` history replay + autocompact expansion + thinking / reasoning_content injection — all aligned with the OpenAI Responses API protocol
-- Codex CLI's freeform `apply_patch` tool (edit-file +/- diff UI) works on DeepSeek / Kimi / MiMo and other chat-completions providers: the adapter bridges Responses `custom_tool_call` ↔ chat `function_call` wire forms, the model emits V4A-format patches, Codex CLI renders the diff (issue #235)
+- Codex App's freeform `apply_patch` tool (edit-file +/- diff UI) works on chat-completions providers: the adapter bridges Responses `custom_tool_call` ↔ chat `function_call` wire forms, the model emits V4A-format patches, Codex App renders the diff (issue #235)
 - **Two-layer session history persistence**: L1 in-memory LRU + L2 sqlite with 30-day TTL (`~/.codex-app-transfer/sessions.db`), preserving history across `.app` restarts
-- Codex CLI config guardrails: snapshots `~/.codex/{config.toml,auth.json}` before apply; restores via per-key smart merge on exit / next start
+- Codex App config guardrails: snapshots `~/.codex/{config.toml,auth.json}` before apply; restores via per-key smart merge on exit / next start
 - Real-time logs panel auto-refreshing every 2s; unified `tracing::warn!(error_id, detail)` with stable tokens — operators can grep / aggregate
 - Feedback dialog automatically attaches diagnostic material (environment info, sanitized config, recent error snapshot with full request / response) — fewer back-and-forth follow-ups
 - Chinese / English UI; light / dark / green / orange / gray / white themes
@@ -69,16 +76,13 @@ Each binary ships with `.sha256` and `.sig` (RSA-3072 PKCS#1 v1.5 + SHA-256); th
 
 Windows builds are not Authenticode-signed yet, so Windows may show an "unknown publisher" warning — use the `.sha256` / `.sig` to verify download integrity.
 
+macOS builds are **not yet signed with an Apple Developer ID** and **not yet Notarized**, so Gatekeeper blocks first launch with "cannot be opened because it is from an unidentified developer". Workarounds: `right-click → Open` to allow once; or verify download integrity with `.sha256` / `.sig`, then click "Open Anyway" under `System Settings → Privacy & Security`.
+
 ## Quick Start
 
 1. Launch Codex App Transfer; the desktop window opens
-2. On the dashboard, click the top-right "+" → pick a preset or add a custom provider; fill in API Base URL, API Key, model mappings
-3. On the "Forwarding" page, click "Start" — the local port `18080` begins listening
-4. In Codex CLI's config (`~/.codex/config.toml`), point `base_url` to `http://127.0.0.1:18080` and set the API Key to the Gateway API Key shown in this tool
-5. Reopen Codex CLI; the model picker auto-lists the current provider's model mappings
-6. ⚠️ **Switch Codex CLI to Full access** (`/approvals` → "Full access"): third-party providers will get stuck on the approval prompt under Codex CLI's default `auto` approval mode. Full access lets tool calls through directly — this is a **practical prerequisite** for using third-party providers
-
-If the desktop window can't open (rare — usually Tauri webview init failed / system webview missing), try restarting first; if it persists, re-download from [Releases](https://github.com/Cmochance/codex-app-transfer/releases) and check `~/.codex-app-transfer/logs/proxy-*.log`, or open an [Issue](https://github.com/Cmochance/codex-app-transfer/issues). v2 has no standalone HTTP admin UI (the admin panel runs in-process via Tauri's `cas://` scheme — **port 18081 is no longer listened on**).
+2. On the dashboard, click the top-right "+" → pick a preset or add a custom provider; fill in API Base URL, API Key, then "Fetch models" and add model mappings
+3. Click the **Apply** button at the bottom and confirm restarting Codex App to start using it (if a provider is already configured, just click the **Apply** button on its card on the home page)
 
 ## Provider compatibility matrix
 
@@ -98,9 +102,9 @@ If the desktop window can't open (rare — usually Tauri webview init failed / s
 
 ## Model mapping
 
-Codex CLI prompts by OpenAI model names; third-party providers use real IDs like `deepseek-v4-pro` / `kimi-k2.6` / `glm-5.1` / `gemini-3-pro`.
+Codex App prompts by OpenAI model names; third-party providers use real IDs like `deepseek-v4-pro` / `kimi-k2.6` / `glm-5.1` / `gemini-3-pro`.
 
-This tool maps via `provider.models[slot]` (`gpt-5.5` → `deepseek-v4-pro` etc.); Codex CLI's model picker shows `<provider> / <real-model>` real names. Upstream `chatcmpl-...` response IDs are auto-rewritten to Codex CLI-validatable `resp_<base64>`, preserving deployment-affinity encoding so `previous_response_id` is consistent across turns.
+This tool maps via `provider.models[slot]` (`gpt-5.5` → `deepseek-v4-pro` etc.); Codex App's model picker shows `<provider> / <real-model>` real names. Upstream `chatcmpl-...` response IDs are auto-rewritten to Codex App-validatable `resp_<base64>`, preserving deployment-affinity encoding so `previous_response_id` is consistent across turns.
 
 ## Development (v2 / Rust)
 
@@ -153,17 +157,23 @@ To add a new component: create `components/<name>.css` + add a line `@import url
 
 ## Troubleshooting
 
-### Codex CLI reports `404 Not Found url: http://127.0.0.1:18080/responses`
+### Codex models can't run `curl` and similar network commands / approval prompt stuck
 
-Old versions only exposed `/v1/responses`; Codex CLI 0.126+ falls back to `/responses` (without `/v1/`). This tool added the route alias — update to v1.0.1+.
+`curl` requires elevated permissions. Third-party models currently cannot trigger the macOS escalation prompt, so this app writes `sandbox_mode = "danger-full-access"` + `approval_policy = "never"` into `~/.codex/config.toml` by default on apply. On Windows, or if you have other reasons, you can turn this off in Settings → "Allow Codex network tools (full-access mode)" (#215).
 
-### Codex CLI reports `stream disconnected before completion`
+> **⚠️ Security trade-off**: full-access mode lets the model read/write any file and run every command without approval = **fully trust the model** (equivalent to Codex's official "Full access" tier). With the toggle off, Codex falls back to the read-only sandbox + on-request approval. macOS still cannot trigger the elevation prompt, so there is no network access — only the selected model's built-in `web_search` capability is usable. If the model doesn't support `web_search`, all search calls return empty results.
 
-Usually means `response.id` / `response.model` weren't returned in the shape Codex CLI expects. This tool rewrites upstream `chatcmpl-...` to `resp_<base64>` while preserving the requested model name — confirm forwarding logs show `resp_...` instead of `chatcmpl-...`.
+### Codex App reports `404 Not Found url: http://127.0.0.1:18080/responses`
+
+Old versions only exposed `/v1/responses`; Codex CLI 0.126+ falls back to `/responses` (without `/v1/`). This tool added the route alias — **v1.0.1 and later all support it** (current v2.x series ships it by default, no extra config needed).
+
+### Codex App reports `stream disconnected before completion`
+
+Usually means `response.id` / `response.model` weren't returned in the shape Codex App expects. This tool rewrites upstream `chatcmpl-...` to `resp_<base64>` while preserving the requested model name — confirm forwarding logs show `resp_...` instead of `chatcmpl-...`.
 
 ### Upstream 400: `thinking is enabled but reasoning_content is missing`
 
-Kimi / DeepSeek with thinking enabled require historical assistant messages with `tool_call` to carry `reasoning_content`. v1.0.1+ auto-fills a default empty string and maps reasoning items from Responses input to the corresponding assistant message.
+Kimi / DeepSeek with thinking enabled require historical assistant messages with `tool_call` to carry `reasoning_content`. This tool **auto-fills a default empty string since v1.0.1** and maps reasoning items from Responses input to the corresponding assistant message.
 
 ### Upstream 400: `'reasoning_effort' does not support 'xhigh'`
 
@@ -194,7 +204,7 @@ From v2.1.12+ the client **enforces** RSA-3072 PKCS#1-v1.5-SHA256 verification o
 
 Design intent: the client trusts only the build-time embedded public key and never lets a runtime URL replace it, blocking MITM rewrites of `latest.json` (the public PEM lives in `release/` but pulling it from the same origin as the update URL would dissolve the trust anchor).
 
-### Where are the logs?
+### Logs
 
 - App UI: real-time panel below the forwarding page, auto-refreshes every 2s
 - Disk: `~/.codex-app-transfer/logs/proxy-YYYY-MM-DD.log` — click "View Logs" to open directly
@@ -206,27 +216,27 @@ Design intent: the client trusts only the build-time embedded public key and nev
 - **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
 - **Frontend**: HTML + CSS + vanilla JavaScript + Bootstrap 5.3.3 (localized, no CDN dependency)
 - **Desktop shell**: Tauri 2 + tray-icon 0.23; the `cas://` URI scheme glues frontend/ and axum in-process, no TCP loopback
-- **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex/{config.toml,auth.json}` (Codex CLI integration)
+- **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex/{config.toml,auth.json}` (Codex App integration)
 - **Packaging**: `cargo tauri build` single command produces dmg/AppImage/deb/exe/msi; `xtask release-bundle` finalizes sha256 + RSA-3072 sig + latest.json + draft GitHub release
 
 ## Disclaimer
 
-This project focuses on **OpenAI Codex CLI** integration; it is **not** an official OpenAI / Anthropic / Google / xAI project and does not reuse their trademarks / logos / release identities.
+This project focuses on **OpenAI Codex App** integration; it is **not** an official OpenAI / Anthropic / Google / xAI project and does not reuse their trademarks / logos / release identities.
 
-Upstream API keys / OAuth tokens are stored locally in `~/.codex-app-transfer/` (Unix 0600 + atomic write); the forwarding service only listens on `127.0.0.1` and does not hijack the system proxy.
+Upstream API keys / OAuth tokens are stored locally in `~/.codex-app-transfer/` (Unix 0600 + atomic write); the forwarding service only listens on `127.0.0.1` and does not hijack the system proxy. Apart from the feedback feature, this tool performs no third-party network access.
 
-Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) involve upstream TOS gray areas — Grok Web reverse-proxies grok.com's Web backend, Gemini CLI OAuth uses the undocumented internal endpoint `cloudcode-pa.googleapis.com/v1internal` — strictly limited to **personal use**, **must not** be deployed as a public service, **users assume the risk**.
+Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) involve upstream TOS gray areas — Grok Web reverse-proxies grok.com's Web backend, Gemini CLI OAuth uses the undocumented internal endpoint `cloudcode-pa.googleapis.com/v1internal` — strictly limited to **personal use**, **must not** be deployed as a public service, **carries a real account-ban risk**, **users assume the risk**.
 
 ## Acknowledgements
 
-> One-line summaries below. For the full **borrowing form / itemized list / corresponding file:line in this codebase**, see [ACKNOWLEDGEMENTS.md](./ACKNOWLEDGEMENTS.md).
+> Overview list below. For the full **borrowing form / itemized list / corresponding file:line in this codebase**, see [ACKNOWLEDGEMENTS.md](./ACKNOWLEDGEMENTS.md).
 
 - [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) — provider switching paradigm inspiration
 - [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x desktop shell skeleton + README structure reference
 - [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — bidirectional protocol translation patterns
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` architecture base
-- [`openai/codex`](https://github.com/openai/codex) — autocompact prompt base structure + compact protocol reverse-reference (Apache-2.0)
-- [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact anchor bullets (All user messages verbatim + Next Step verbatim)
+- [`openai/codex`](https://github.com/openai/codex) — autocompact prompt base structure + compact protocol reverse-reference
+- [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact anchor bullets
 - [`7as0nch/mimo2codex`](https://github.com/7as0nch/mimo2codex) — MiMo protocol reference
 - [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) — Gemini OAuth wire-level reference
 - [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web reverse-engineering reference + dynamic statsig algorithm + tool_calls flatten pattern
