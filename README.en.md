@@ -7,7 +7,7 @@
 >
 > Other built-in chat-completions-compatible providers (including **DeepSeek, Kimi (Moonshot Platform), Xiaomi MiMo (Pay for Token), Zhipu GLM, Aliyun Bailian (API Key / Token Plan), MiniMax**) **have not undergone long-term real-world regression** — they sit at unit-test + occasional user-report level only.
 >
-> If you'd be willing to **provide an API key from another provider for testing**, it would be deeply appreciated! Reach out via **QQ: `3216202644`** or email. The author guarantees the **API key will only be used for actual testing of this project**, destroyed immediately after testing, never repurposed.
+> If you'd be willing to **provide an API key from another provider for testing**, it would be deeply appreciated! Reach out via **QQ: `3216202644`** or email — the author guarantees the **API key will only be used for actual testing of this project**.
 
 <p align="center">
   <a href="README.md">简体中文</a> |

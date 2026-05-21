@@ -80,6 +80,7 @@ related_pr: <PR# 或 null>
 ## Active
 
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
+- [#39 P3 shell→apply_patch normalize 兜底(prompt-only 失效再激活)](followup/39-shell-to-apply-patch-normalize-fallback.md) — issue #235 通过 PR #236+#240 prompt-only 修复,PR #239 server-side normalize 暂时不需要;若未来某 provider 模型完全无视 prompt 走 shell file-write 再 cherry-pick PR #239 复活
 
 ---
 

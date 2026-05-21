@@ -7,7 +7,7 @@
 >
 > 其他已内置的 chat-completions 兼容供应商(包括 **DeepSeek、Kimi(月之暗面)、Xiaomi MiMo(Pay for Token)、智谱 GLM、阿里云百炼(API Key / Token Plan)、MiniMax**)**未做长期真机回归**,仅停留在单元测试 + 偶发用户反馈层面。
 >
-> 如果你愿意**提供其他供应商的 API key 用于测试**,将万分感激!可通过 **QQ:`3216202644`** 或邮箱联系作者。作者保证 **API key 仅用于本项目实际测试**,测试结束后立即销毁,绝不挪作他用。
+> 如果你愿意**提供其他供应商的 API key 用于测试**,将万分感激!可通过 **QQ:`3216202644`** 或邮箱联系作者,作者保证 **API key 仅用于本项目实际测试**。
 
 <p align="center">
   <a href="README.md">简体中文</a> |
