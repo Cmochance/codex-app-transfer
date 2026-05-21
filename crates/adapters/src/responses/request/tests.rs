@@ -2047,6 +2047,38 @@ fn apply_patch_chat_path_guidance_skipped_when_tool_not_registered() {
 }
 
 #[test]
+fn apply_patch_chat_path_guidance_skipped_when_previous_response_id_set() {
+    // Devin pre-merge review BUG 修复:带 previous_response_id 的后续 turn,
+    // history 已经从 session cache 拼回来(其中含上一轮注入的 guidance),
+    // 当前 turn **不应**再注入,否则每 turn 累积一份 ~2KB,N 轮后 N 份
+    // 浪费 token + 挤出上下文。
+    let out = convert(json!({
+        "input": [{"type": "message", "role": "user", "content": "another edit"}],
+        "instructions": "You are a coding assistant.",
+        "previous_response_id": "resp_18b_some_prior",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the `apply_patch` tool to edit files."
+        }]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let guidance_count = messages
+        .iter()
+        .filter(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("apply_patch chat-path guidance")
+        })
+        .count();
+    assert_eq!(
+        guidance_count, 0,
+        "后续 turn(previous_response_id 非空)不应再注入 guidance(history 已含)"
+    );
+}
+
+#[test]
 fn apply_patch_chat_path_guidance_idempotent_across_turns() {
     // 防止 merge_consecutive_system_messages 把 adapter-injected guidance
     // 跟 Codex instructions 拼到一起后,反复 convert 时被重复累积(连发 3 个

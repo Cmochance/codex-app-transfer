@@ -297,10 +297,27 @@ fn build_messages_from_input(
     }
 
     // 紧跟 Codex CLI 自带 instructions 之后注入 apply_patch chat-path 指引
-    // (仅当本 turn 真正注册了 apply_patch 工具时)。位置选择:Codex 系统
-    // 指令之后,user input 之前 — 既不污染 Codex 原指令,又确保模型在
-    // 读完工具列表准备调 apply_patch 时已经见过 chat-path 限制。
-    if tools_register_apply_patch(body) {
+    // (仅当本 turn 真正注册了 apply_patch 工具 **且** 本轮是 first turn 时)。
+    // 位置选择:Codex 系统指令之后,user input 之前 — 既不污染 Codex 原指令,
+    // 又确保模型在读完工具列表准备调 apply_patch 时已经见过 chat-path 限制。
+    //
+    // **仅 first turn 注入**(Devin pre-merge review BUG 修复):带
+    // `previous_response_id` 的后续 turn,`merge_messages_with_previous_response`
+    // 把 cached history 拼到 current_messages 前面,history 已经包含上一轮注入的
+    // guidance(session_cache 保存 merged messages)。如果继续注入,每 turn 都会
+    // 加一份 ~2KB guidance,N 轮后 N 份,token 浪费 + 长 apply_patch 工作流
+    // (5-10 turn)上下文被挤出。merge 阶段只去重 `messages[0]` instructions,
+    // 不去重 guidance(它在 index 1),所以必须 caller 这里做 turn-gating。
+    //
+    // 边界:如果 first turn 没注册 apply_patch、中段 turn 才首次注册,会 miss
+    // 注入 — 实测罕见(Codex Desktop 启动即注册 apply_patch tool),且 tool
+    // description 本身已含完整 V4A 规则,模型仍能正确生成 patch。
+    let is_first_turn = body
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    if is_first_turn && tools_register_apply_patch(body) {
         messages.push(apply_patch_chat_guidance_message());
     }
 
