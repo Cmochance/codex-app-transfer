@@ -13,6 +13,7 @@ pub mod compact;
 pub mod converter;
 pub mod request;
 pub mod session;
+pub mod shell_to_apply_patch;
 pub mod stream;
 pub mod tool_call_cache;
 

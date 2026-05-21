@@ -70,6 +70,24 @@ struct PendingToolCall {
     /// 流式事件 name、args 解包都按 custom 路径走)而不是 `function_call`。
     /// 见 [`is_apply_patch_tool_name`] 和 `close_tool_call` 注释。
     is_apply_patch: bool,
+    /// **server-side normalize 路径**:首帧 name == `exec_command` 时置 true。
+    /// 整个 item **不立即** emit `output_item.added`,而是先 buffer 全部 args,
+    /// `close_tool_call` 才 run `detect_shell_file_write`:
+    ///   - 检测到 file-write 模式 → 改 wire 为 `custom_tool_call apply_patch`
+    ///     并合成 V4A patch,让 Codex Desktop 自家 V4A applier 渲染 diff UI
+    ///     而不是跑 shell。
+    ///   - 未检测到 → 在 close 阶段补 emit 完整 function_call SSE 序列:
+    ///     `response.output_item.added`(function_call type)+
+    ///     `response.function_call_arguments.delta`(一次性整段 args)+
+    ///     `response.function_call_arguments.done` +
+    ///     `response.output_item.done`(`status=completed`),
+    ///     Codex Desktop 当作普通 shell 调用执行,行为跟改前 100% 一致。
+    /// trade-off:正常 shell 调用失去逐字符流式 UI(用户看不到 args 逐字出),
+    /// 延迟在 first frame → close 之间。args 体积受上游 chat completions
+    /// tool_call schema 约束(实测 issue #235 capture 数据 round 1/2 中
+    /// exec_command tool_call args 远小于 reasoning/message 文本 stream),
+    /// 实际延迟可接受;具体数据在 PR 完成 round 3 真机后回填 PR 评论。
+    is_exec_command: bool,
     /// `response.output_item.added` 是否已经 emit 过 — 一旦 emit,后续帧
     /// 补全的 `tc.id` 不再覆盖 `call_id`,避免 `output_item.added` 用旧 id 而
     /// 后续 `input.delta` / `output_item.done` 用新 id,严格客户端会两次解读
@@ -100,6 +118,15 @@ struct PendingToolCall {
 /// 字符串一致性(请求侧的特判描述 / 响应侧的 wire 重打包必须按同一 name 触发)。
 fn is_apply_patch_tool_name(name: &str) -> bool {
     name == "apply_patch"
+}
+
+/// Codex CLI 的 shell 工具名(从 strings dump 验证:`exec_command` 是 Codex
+/// CLI 在 chat function-call provider 上注册的 shell 工具)。
+/// 命中此名 + args.cmd 是 file-write 模式 → 触发 `shell_to_apply_patch` server-side
+/// normalize,改写 wire 为 `custom_tool_call apply_patch` 让 Codex Desktop 的
+/// V4A applier 渲染 diff UI,而不是真跑 shell。
+fn is_exec_command_tool_name(name: &str) -> bool {
+    name == "exec_command"
 }
 
 #[derive(Debug)]
@@ -531,6 +558,7 @@ impl ChatToResponsesConverter {
             // wire(同当前行为,Codex CLI 仍会 abort apply_patch 一次),不
             // 比修复前差。
             let is_apply_patch = is_apply_patch_tool_name(&name);
+            let is_exec_command = is_exec_command_tool_name(&name);
             self.tool_calls.insert(
                 openai_index,
                 PendingToolCall {
@@ -541,6 +569,7 @@ impl ChatToResponsesConverter {
                     args_acc: String::new(),
                     closed: false,
                     is_apply_patch,
+                    is_exec_command,
                     output_item_added_emitted: false,
                     apply_patch_input: None,
                 },
@@ -577,6 +606,17 @@ impl ChatToResponsesConverter {
                         "item": item,
                     }),
                 );
+            } else if is_exec_command {
+                // server-side normalize:不立即 emit `output_item.added`。
+                // 整个 item 走 buffer 路径,到 `close_tool_call` run detector
+                // 后再决定 wire 形态(custom_tool_call apply_patch 或回退
+                // function_call exec_command)。output_item_added_emitted
+                // 保持 false,delta/done 都延迟到 close。
+                tracing::debug!(
+                    target = "adapters::shell_to_apply_patch",
+                    call_id = %call_id,
+                    "exec_command buffering engaged; SSE emit deferred until close (file-write detection)",
+                );
             } else {
                 // 如果 function name 来自 namespace 包(从 original_request.tools
                 // 反查表查到),给 item 加 `namespace` 字段 — Codex.app 客户端
@@ -610,8 +650,14 @@ impl ChatToResponsesConverter {
             // (否则 `output_item.added` 与后续 `input.delta` / `output_item.done`
             // 用不同 call_id,严格客户端会两次解读为不同 item)。同样地,
             // apply_patch 的 `is_apply_patch` 决策也已固定。
+            //
+            // 例外:`is_exec_command` 走 server-side normalize buffer 路径,
+            // 当前 frame **没有** emit `output_item.added`(延迟到 close),
+            // 后续帧 backfill 的 call_id 仍可替换。
             if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
-                pending.output_item_added_emitted = true;
+                if !pending.is_exec_command {
+                    pending.output_item_added_emitted = true;
+                }
             }
         }
 
@@ -665,6 +711,12 @@ impl ChatToResponsesConverter {
                     if pending.is_apply_patch {
                         return;
                     }
+                    // server-side normalize buffer 路径:exec_command 不 emit
+                    // 增量 delta,close 时一次性 emit(改写为 apply_patch 或
+                    // 回退 function_call)。
+                    if pending.is_exec_command {
+                        return;
+                    }
                     let item_id = pending.fc_id.clone();
                     let output_index = pending.output_index;
                     emit_event(
@@ -686,7 +738,16 @@ impl ChatToResponsesConverter {
     fn close_tool_call(&mut self, openai_index: u32, interrupted: bool, out: &mut Vec<u8>) {
         // 先把所有需要的字段 clone 出来,避免 mutable borrow 跟
         // self.lookup_namespace_for 的 immutable borrow 冲突
-        let (fc_id, call_id, name, args_acc, output_index, already_closed, is_apply_patch) = {
+        let (
+            fc_id,
+            call_id,
+            name,
+            args_acc,
+            output_index,
+            already_closed,
+            is_apply_patch,
+            is_exec_command,
+        ) = {
             let Some(pending) = self.tool_calls.get(&openai_index) else {
                 return;
             };
@@ -698,10 +759,112 @@ impl ChatToResponsesConverter {
                 pending.output_index,
                 pending.closed,
                 pending.is_apply_patch,
+                pending.is_exec_command,
             )
         };
         if already_closed {
             return;
+        }
+
+        // ===== server-side normalize: exec_command → apply_patch =====
+        // 仅在非 interrupted 路径检测;interrupted 时模型未完成意图表达,即使
+        // detect 在 partial args 上意外匹配也不应执行(等同于伪造模型本不打算
+        // 的 apply_patch 调用)。强制让 interrupted exec_command 走"incomplete
+        // 占位"路径,**对称** apply_patch interrupted 处理:emit
+        // `status="incomplete"` 让 Codex Desktop 看到 partial item 不去执行
+        // shell(防止跑半截 here-doc 等 destructive 行为 — code-reviewer
+        // IMPORTANT-3 修复)。
+        if is_exec_command && interrupted {
+            tracing::warn!(
+                target = "adapters::shell_to_apply_patch",
+                call_id = %call_id,
+                args_len = args_acc.len(),
+                "exec_command tool call cut off mid-stream. Emitting output_item with status=incomplete to prevent Codex Desktop from executing partial shell (e.g. truncated here-doc).",
+            );
+            // buffer 期 added 没 emit,补 emit 一个 in_progress 占位让客户端
+            // 看到这条 item 存在(否则后续 output_item.done 会找不到对应 item)。
+            self.emit_deferred_exec_command_added(&fc_id, &call_id, &name, output_index, out);
+            if !args_acc.is_empty() {
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": fc_id,
+                        "output_index": output_index,
+                        "delta": args_acc,
+                    }),
+                );
+            }
+            // 直接 emit `output_item.done status=incomplete` 不走下方默认
+            // function_call 路径(那条会 emit `status=completed`,Codex
+            // Desktop 看到 completed 就执行 shell)。**不**写 ToolCallCache,
+            // 让 orphan-repair 路径补占位避免 partial 上下文污染下一 turn。
+            let namespace = self.lookup_namespace_for(&name).map(str::to_owned);
+            let mut item = json!({
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "name": name,
+                "arguments": args_acc,
+                "status": "incomplete",
+            });
+            if let Some(ns) = namespace.as_ref() {
+                item["namespace"] = Value::String(ns.clone());
+            }
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                }),
+            );
+            if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                pending.closed = true;
+            }
+            return;
+        } else if is_exec_command && !interrupted {
+            if let Some(patch) = detect_shell_file_write_in_exec_args(&args_acc) {
+                tracing::info!(
+                    target = "adapters::shell_to_apply_patch",
+                    call_id = %call_id,
+                    target_path = %patch.target_path,
+                    patch_bytes = patch.patch_input.len(),
+                    "rewriting exec_command file-write to apply_patch custom_tool_call",
+                );
+                self.emit_normalized_apply_patch(
+                    openai_index,
+                    &fc_id,
+                    &call_id,
+                    output_index,
+                    patch.patch_input,
+                    out,
+                );
+                return;
+            }
+            // 未匹配 file-write → 继续走下方 function_call 路径,但需要补
+            // emit `output_item.added` + `function_call_arguments.delta`(open
+            // 阶段被 buffer 跳过了,客户端收不到 delta 累积,需要在 .done
+            // 之前补一段含整个 args 的 delta 让客户端按协议拼装)。
+            self.emit_deferred_exec_command_added(&fc_id, &call_id, &name, output_index, out);
+            if !args_acc.is_empty() {
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": fc_id,
+                        "output_index": output_index,
+                        "delta": args_acc,
+                    }),
+                );
+            }
+            // fall through to function_call close path
         }
 
         if is_apply_patch {
@@ -869,6 +1032,153 @@ impl ChatToResponsesConverter {
         if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
             pending.closed = true;
         }
+    }
+
+    /// server-side normalize:detected file-write exec_command 转 apply_patch
+    /// custom_tool_call。一次性 emit 完整序列(added → input.delta → input.done
+    /// → output_item.done),让 Codex Desktop 把它当 apply_patch 调用渲染 diff UI。
+    ///
+    /// **call_id 复用**:用模型原 exec_command 的 call_id,这样下一 turn
+    /// Codex Desktop 把 apply_patch 执行结果(custom_tool_call_output)按同
+    /// call_id 回灌给模型,模型按自己的 turn 历史关联得上。
+    ///
+    /// **名字改为 `apply_patch`**:Codex Desktop V4A applier 看 name 字段
+    /// dispatch handler,必须是 `apply_patch` 才会跑 V4A parse + diff UI
+    /// 渲染。
+    ///
+    /// **缓存**:apply_patch_input 缓到 pending,envelope 终态读这个;同时
+    /// ToolCallCache 用合成的 `{"input":<V4A>}` JSON 形态存,跟 chat
+    /// completions assistant.tool_calls.function.arguments 形态对齐(下一
+    /// turn `repair_tool_call_ids` 路径 B 重建上下文用)。
+    fn emit_normalized_apply_patch(
+        &mut self,
+        openai_index: u32,
+        fc_id: &str,
+        call_id: &str,
+        output_index: u32,
+        v4a_input: String,
+        out: &mut Vec<u8>,
+    ) {
+        const APPLY_PATCH_NAME: &str = "apply_patch";
+        // output_item.added(空 input,in_progress)— Codex Desktop 看到这条
+        // 才会创建 pending custom_tool_call item;后续 delta/done 在同一
+        // item 上累积。
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "name": APPLY_PATCH_NAME,
+                    "input": "",
+                    "status": "in_progress",
+                },
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.custom_tool_call_input.delta",
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": fc_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "delta": v4a_input,
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.custom_tool_call_input.done",
+            json!({
+                "type": "response.custom_tool_call_input.done",
+                "item_id": fc_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "input": v4a_input,
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "name": APPLY_PATCH_NAME,
+                    "input": v4a_input,
+                    "status": "completed",
+                },
+            }),
+        );
+        // 缓存:envelope 终态读 apply_patch_input;ToolCallCache 存 chat
+        // 形态 `{"input":<V4A>}` 让下一 turn repair 路径用合成 args 重建上下文,
+        // 同时把 name 切换为 apply_patch 让 cache 一致。
+        let synthetic_args =
+            serde_json::to_string(&json!({ "input": v4a_input })).unwrap_or_default();
+        global_tool_call_cache().save(
+            call_id,
+            ToolCallEntry {
+                name: APPLY_PATCH_NAME.to_string(),
+                arguments: synthetic_args.clone(),
+            },
+        );
+        if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+            pending.name = APPLY_PATCH_NAME.to_string();
+            // IMPORTANT-1 修复(code-reviewer pre-push):pending.args_acc 必须
+            // 跟 normalize 后的 wire 形态 + ToolCallCache 同步,否则
+            // `assistant_message()` 用 (name=apply_patch, args_acc=原 {"cmd":...})
+            // 不一致组合写进 `global_response_session_cache`,下一 turn
+            // `previous_response_id` 重建走 `request.rs::build_messages_from_input`
+            // 时,upstream 看到 name/args 不匹配的 assistant tool_call → 严格
+            // provider 直接 400,宽松 provider 误导模型记忆。
+            pending.args_acc = synthetic_args;
+            pending.is_apply_patch = true;
+            pending.is_exec_command = false;
+            pending.apply_patch_input = Some(v4a_input);
+            pending.output_item_added_emitted = true;
+            pending.closed = true;
+        }
+    }
+
+    /// 在 exec_command 进入普通 function_call 关闭路径之前,补 emit `output_item.added`
+    /// — open 阶段被 buffer 路径跳过了。namespace 字段对 exec_command 不适用
+    /// (Codex CLI 内置工具,不在 namespace 包里),不加。
+    fn emit_deferred_exec_command_added(
+        &mut self,
+        fc_id: &str,
+        call_id: &str,
+        name: &str,
+        output_index: u32,
+        out: &mut Vec<u8>,
+    ) {
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "type": "function_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            }),
+        );
     }
 
     fn emit_reasoning_delta(&mut self, text: &str, out: &mut Vec<u8>) {
@@ -1559,6 +1869,29 @@ fn extract_apply_patch_input(args_acc: &str) -> String {
             args_acc.to_owned()
         }
     }
+}
+
+/// 从 `exec_command` 工具调用的累积 args(chat completions function_call
+/// arguments,标准形态 `{"cmd":"<shell command>", ...}`)里抽出 `cmd` 字符串,
+/// 跑 [`crate::responses::shell_to_apply_patch::detect_shell_file_write`]
+/// 判断是不是 MVP scope 内的 file-write 模式。
+///
+/// 三层 fallback:
+/// 1. **JSON valid + `cmd` 字段**:主路径,直接 detect。
+/// 2. **JSON valid 但缺 `cmd` 字段**:`return None`(透传 exec_command,避免
+///    误判)。
+/// 3. **JSON 解析失败**:`return None`(args 还在 streaming / 模型乱发,
+///    透传安全)。
+fn detect_shell_file_write_in_exec_args(
+    args_acc: &str,
+) -> Option<crate::responses::shell_to_apply_patch::V4APatch> {
+    let trimmed = args_acc.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(trimmed).ok()?;
+    let cmd = parsed.get("cmd").and_then(Value::as_str)?;
+    crate::responses::shell_to_apply_patch::detect_shell_file_write(cmd)
 }
 
 fn drain_one_frame(buf: &mut BytesMut) -> Option<Bytes> {
@@ -3317,5 +3650,332 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
         assert_eq!(usage["input_tokens"], 4);
         assert_eq!(usage["output_tokens"], 6);
         assert_eq!(usage["total_tokens"], 10);
+    }
+
+    // ===== server-side normalize: exec_command → apply_patch =====
+    // 关键回归保护(issue #235 round 2 真机数据):chat-completions provider
+    // (Kimi 实测 t0024/t0027/t0030/t0037)调 exec_command 跑 `cat <<EOF >`
+    // `printf > file` `echo > file` 写文件,Codex Desktop 看不到 apply_patch
+    // wire → 不渲染 diff UI(4+2 元素全失效)。adapter 在 server-side normalize
+    // 这三种 shell file-write 为 custom_tool_call apply_patch SSE,让 Codex
+    // Desktop V4A applier 渲染 diff card / 行号 / +N -M / 文件清单。
+
+    fn exec_command_sse_chunk(cmd_value: &str) -> Vec<u8> {
+        // 构造单 chunk 含完整 exec_command tool_call:首帧 name + 完整 args
+        // (chat 上游一般首帧带 name,中间帧追加 args delta;我们 buffer
+        // 整段 args 后才决策,所以单 chunk vs 多 chunk 等价测)
+        //
+        // chat completions schema: `function.arguments` 是个**JSON 字符串**,
+        // 它的 value 又是个 JSON object 字面('{"cmd":"<cmd>"}')。因此需要
+        // **双重 JSON encode**:先把 `{"cmd": cmd_value}` 序列化成 JSON 字符串,
+        // 再把这个字符串当 string value 序列化进 SSE chunk。
+        let args_obj = serde_json::to_string(&serde_json::json!({"cmd": cmd_value})).unwrap();
+        let escaped_args = serde_json::to_string(&args_obj).unwrap();
+        format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"call_test_1","function":{{"name":"exec_command","arguments":{escaped_args}}}}}]}},"finish_reason":"tool_calls"}}]}}
+
+"#
+        )
+        .into_bytes()
+    }
+
+    fn collect_apply_patch_inputs(events: &[(String, Value)]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|(n, _)| n == "response.custom_tool_call_input.done")
+            .filter_map(|(_, p)| p["input"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn find_function_call_done_with_name<'a>(
+        events: &'a [(String, Value)],
+        name: &str,
+    ) -> Option<&'a Value> {
+        events.iter().find_map(|(n, p)| {
+            if n == "response.output_item.done"
+                && p["item"].get("type").and_then(|v| v.as_str()) == Some("function_call")
+                && p["item"].get("name").and_then(|v| v.as_str()) == Some(name)
+            {
+                Some(p)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn exec_command_here_doc_rewritten_to_apply_patch_custom_tool_call() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        // 真机 round 2 turn 0024 Kimi 同款 `cat <<'PYEOF' > /tmp/...py\n...\nPYEOF`
+        let cmd = "cat <<'PYEOF' > /tmp/apply-patch-test-A/app-1.py\ndef main():\n    pass\n\n\nif __name__ == \"__main__\":\n    main()\nPYEOF";
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        // emit 含完整 custom_tool_call apply_patch 序列
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("type").and_then(|v| v.as_str()) == Some("custom_tool_call")
+            })
+            .expect("custom_tool_call output_item.added 必须 emit");
+        assert_eq!(added.1["item"]["name"], "apply_patch");
+        assert_eq!(added.1["item"]["call_id"], "call_test_1", "call_id 必须复用模型原 exec_command call_id");
+
+        // V4A input.done 含 Add File header + 行 `+` 前缀
+        let inputs = collect_apply_patch_inputs(&events);
+        assert_eq!(inputs.len(), 1, "应只有 1 个 apply_patch input.done");
+        let v4a = &inputs[0];
+        assert!(v4a.starts_with("*** Begin Patch\n"));
+        assert!(v4a.contains("*** Add File: /tmp/apply-patch-test-A/app-1.py"));
+        assert!(v4a.contains("+def main():"));
+        assert!(v4a.contains("+    pass"));
+        assert!(v4a.ends_with("*** End Patch\n"));
+
+        // 不应再 emit 原 exec_command function_call 序列
+        assert!(
+            find_function_call_done_with_name(&events, "exec_command").is_none(),
+            "exec_command 已被 normalize,不应再有 function_call.done with name=exec_command"
+        );
+
+        // response.completed.output 数组里的 final item 应为 custom_tool_call apply_patch
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed 必须 emit");
+        let final_output = completed.1["response"]["output"].as_array().unwrap();
+        let has_apply_patch = final_output.iter().any(|item| {
+            item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call")
+                && item.get("name").and_then(|v| v.as_str()) == Some("apply_patch")
+        });
+        assert!(has_apply_patch, "envelope final output 必须含 apply_patch item");
+    }
+
+    #[test]
+    fn exec_command_printf_with_escapes_rewritten_to_apply_patch() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        // 真机 round 2 turn 0027/0030 Kimi 同款 `printf '...\n' > file`
+        let cmd = r#"printf '# 测试笔记\n\n今天天气不错。\n' > /tmp/apply-patch-test-B/note.md"#;
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        let inputs = collect_apply_patch_inputs(&events);
+        assert_eq!(inputs.len(), 1);
+        let v4a = &inputs[0];
+        assert!(v4a.contains("*** Add File: /tmp/apply-patch-test-B/note.md"));
+        // \n 转义应展开成真实 newline,每个非空行 `+` 前缀
+        assert!(v4a.contains("+# 测试笔记"));
+        assert!(v4a.contains("+今天天气不错。"));
+    }
+
+    #[test]
+    fn exec_command_echo_simple_rewritten_to_apply_patch() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        let cmd = "echo 'hello world' > /tmp/x.txt";
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        let inputs = collect_apply_patch_inputs(&events);
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].contains("*** Add File: /tmp/x.txt"));
+        assert!(inputs[0].contains("+hello world"));
+    }
+
+    #[test]
+    fn exec_command_non_file_write_passes_through_as_function_call() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        // `ls -la /tmp` 不是 file-write 模式 → 走 function_call 透传
+        let cmd = "ls -la /tmp";
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        // 应 emit 完整 function_call exec_command 序列(added/delta/done/output_item.done)
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("name").and_then(|v| v.as_str()) == Some("exec_command")
+            })
+            .expect("exec_command output_item.added 必须 emit(buffer 期延迟后补)");
+        assert_eq!(added.1["item"]["type"], "function_call");
+
+        // function_call_arguments.delta 应含完整 args(buffer 期没 emit,close 时一次补)
+        let args_delta = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.function_call_arguments.delta"
+                    && p["delta"].as_str().map(|s| s.contains("ls -la")).unwrap_or(false)
+            })
+            .expect("deferred function_call_arguments.delta 必须含完整 args");
+        let _ = args_delta;
+
+        let done = find_function_call_done_with_name(&events, "exec_command")
+            .expect("function_call.done exec_command 必须 emit");
+        assert_eq!(done["item"]["status"], "completed");
+
+        // 不应有 custom_tool_call apply_patch
+        let has_apply_patch = events.iter().any(|(n, p)| {
+            n == "response.output_item.added"
+                && p["item"].get("name").and_then(|v| v.as_str()) == Some("apply_patch")
+        });
+        assert!(!has_apply_patch, "非 file-write 不应被 normalize 成 apply_patch");
+    }
+
+    #[test]
+    fn exec_command_append_redirect_passes_through() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        // `>>` append 模式被 detector reject,透传 function_call
+        let cmd = "echo 'log line' >> /tmp/app.log";
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        assert!(
+            find_function_call_done_with_name(&events, "exec_command").is_some(),
+            "append redirect 透传为 function_call exec_command"
+        );
+        assert!(
+            collect_apply_patch_inputs(&events).is_empty(),
+            "append redirect 不应被 normalize"
+        );
+    }
+
+    #[test]
+    fn exec_command_multi_command_passes_through() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        // multi-cmd `&&` reject
+        let cmd = "mkdir -p /tmp/d && echo 'x' > /tmp/d/a.txt";
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        assert!(find_function_call_done_with_name(&events, "exec_command").is_some());
+        assert!(collect_apply_patch_inputs(&events).is_empty());
+    }
+
+    #[test]
+    fn exec_command_var_substitution_passes_through() {
+        let mut c = fixed();
+        let mut all = Vec::new();
+        let cmd = r#"echo "$(date)" > /tmp/timestamp.txt"#;
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        assert!(find_function_call_done_with_name(&events, "exec_command").is_some());
+        assert!(collect_apply_patch_inputs(&events).is_empty());
+    }
+
+    #[test]
+    fn normalized_apply_patch_envelope_assistant_message_uses_synthetic_args() {
+        // IMPORTANT-1 修复(code-reviewer):normalize 后 pending.args_acc 必须
+        // 跟 wire 形态 + ToolCallCache 同步,否则 `assistant_message()` 用
+        // (name=apply_patch, args_acc=原 {"cmd":...}) 写进 response_session_cache,
+        // 下一 turn previous_response_id 重建给上游 name/args mismatch 数据。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        let cmd = "echo 'hello' > /tmp/x.txt";
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        // envelope.output[] 含 custom_tool_call apply_patch + input = V4A
+        let completed = events
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed");
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        let apply_patch_item = output
+            .iter()
+            .find(|item| {
+                item.get("type").and_then(|v| v.as_str()) == Some("custom_tool_call")
+                    && item.get("name").and_then(|v| v.as_str()) == Some("apply_patch")
+            })
+            .expect("envelope.output 含 apply_patch");
+        let input = apply_patch_item["input"].as_str().expect("input field");
+        assert!(input.contains("*** Add File: /tmp/x.txt"));
+        assert!(input.contains("+hello"));
+    }
+
+    #[test]
+    fn exec_command_interrupted_emits_incomplete_not_completed() {
+        // IMPORTANT-3 修复(code-reviewer):exec_command 在 partial args 上被
+        // 中断时(stream 没收到 finish_reason / [DONE]),必须 emit
+        // `status="incomplete"`,防止 Codex Desktop 跑半截 shell(truncated
+        // here-doc 等 destructive 行为)。原默认 function_call 关闭路径 emit
+        // `status="completed"`,对 interrupted exec_command 必须特判。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        // 不带 finish_reason,模拟 stream 中断
+        all.extend(c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_partial","function":{"name":"exec_command","arguments":"{\"cmd\": \"cat <<EOF > /tmp/x.py\nincomplete"}}]}}]}
+
+"#,
+        ));
+        // **不**发 [DONE],直接 finish() 触发 interrupted
+        let final_out = c.finish();
+        all.extend(final_out);
+
+        let events = parse_emitted(&all);
+
+        // exec_command output_item.done 必须 status=incomplete
+        let done = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done"
+                    && p["item"].get("name").and_then(|v| v.as_str()) == Some("exec_command")
+            })
+            .expect("interrupted exec_command output_item.done 必须 emit");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "interrupted exec_command 必须 emit status=incomplete 防 Codex Desktop 跑半截 shell"
+        );
+    }
+
+    #[test]
+    fn normalized_apply_patch_call_id_reused_for_tool_output_correlation() {
+        // 关键:下一 turn Codex Desktop 把 apply_patch 执行结果通过同 call_id
+        // 回灌给模型,模型按 call_id 关联到自己原 exec_command 的 tool_call。
+        // 必须 call_id 100% 复用,否则模型看到 orphan tool result。
+        let mut c = fixed();
+        let mut all = Vec::new();
+        let cmd = "echo 'x' > /tmp/a.txt";
+        all.extend(c.feed(&exec_command_sse_chunk(cmd)));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+
+        let added = events
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.added"
+                    && p["item"].get("name").and_then(|v| v.as_str()) == Some("apply_patch")
+            })
+            .unwrap();
+        assert_eq!(
+            added.1["item"]["call_id"], "call_test_1",
+            "normalize 后 call_id 必须复用模型原 exec_command call_id"
+        );
+
+        let done_item_call_id = events
+            .iter()
+            .find_map(|(n, p)| {
+                if n == "response.output_item.done"
+                    && p["item"].get("name").and_then(|v| v.as_str()) == Some("apply_patch")
+                {
+                    p["item"]["call_id"].as_str().map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(done_item_call_id, "call_test_1");
     }
 }

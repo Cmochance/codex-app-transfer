@@ -2,11 +2,18 @@
 
 逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `docs/release-notes/v*.md`。
 
-## Unreleased — PR #153 draft
+## Unreleased — PR #153 draft + post-#236 shell→apply_patch server-side normalize
 
 **Anthropic Messages 协议适配**:新增 canonical `apiFormat=anthropic_messages`,将 Codex CLI Responses 请求转换到 Anthropic `/v1/messages`,并把 Anthropic Messages SSE 还原为 Responses SSE。当前 PR 已覆盖 text、thinking、tool_use、tool_result repair、`previous_response_id`、compact response、upstream error、provider test/model list 与 UI 保存显示路径。
 
 Claude preset 暂不开放:需要 P7 真实 Claude text、tool-call、`previous_response_id`、upstream error 验证通过后再加入默认 preset。
+
+**shell→apply_patch server-side normalize**(post-PR #236 follow-up,issue #235):chat-completions provider 上模型偏好 `exec_command` 跑 `cat <<EOF > file` / `printf '...' > file` / `echo '...' > file` 一次性写文件,绕过 `apply_patch` 工具 → Codex Desktop 收不到 `custom_tool_call` apply_patch 事件 → 不渲染 diff UI(代码块行号 / `+N -M` 增减 / 文件清单 / 颜色高亮 / 工具调用抬头 / 可点击文件名 6 个元素全失效)。设计灵感取自 Antigravity Go agent(`~/.local/bin/agy` strings dump 实证含 `FILE_CHANGE_TYPE_EDIT` / `file_diff` / `trajectory_file_diffs` 等 token,印证 server-side 统一 diff 事件模型),具体 shell → V4A 规则自创。本次 adapter 在 SSE 转换层归一化 file-write shell 意图为 apply_patch wire 事件:
+- **MVP scope**:`cat <<EOF > /path` / `printf '<content>' > /path` / `echo '<content>' > /path` 三种 happy pattern → 重写为 `custom_tool_call apply_patch` SSE 序列(added → input.delta → input.done → output_item.done),`call_id` 复用模型原 exec_command call_id 让下一 turn tool result 回灌正确关联。
+- **严格 reject**(透传 `function_call exec_command` 不动):`>>` append / `sed -i` in-place / `tee` / 多命令组合(`;` `&&` `||` `|`)/ 变量替换(`$(...)` `` `...` ``)/ 多 `>` / `2>` / `&>` / `echo -e/-n` flags / `printf %s` 格式串。
+- **新增模块** `crates/adapters/src/responses/shell_to_apply_patch.rs` + `crates/adapters/src/responses/converter.rs` 中加 `is_exec_command` flag + `emit_normalized_apply_patch` + `emit_deferred_exec_command_added` helper。
+- **Trade-off**:正常 shell 调用失去逐字符流式 UI(args buffer 到 close 阶段一次性 emit),但 args 通常 <1KB,first frame → close 间隔 <2s,可接受。
+- **Follow-up**(`docs/followup-tracker.md`):Edit / append (`>>`) / `sed -i` in-place / `tee -a` / output normalize(把 apply_patch 执行结果反向映射为 shell-style 输出避免模型困惑)。
 
 ## v2.1.6 — 2026-05-12
 
