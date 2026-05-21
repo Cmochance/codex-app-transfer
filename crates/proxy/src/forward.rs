@@ -35,92 +35,6 @@ use crate::diagnostics::{write_upstream_error_bundle, UpstreamErrorBundleInput};
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
 
-// =============================================================================
-// !!! DEBUG ONLY — DO NOT MERGE !!!
-// =============================================================================
-// 临时 instrumentation: 抓 apply_patch 全链路 I/O 到
-//   ~/.codex-app-transfer/logs/apply-patch-debug/<ts>-<seq>-<stage>.txt
-// 4 stage: inbound / outbound / upstream_raw / downstream_emit
-// 完整规则同 issue #235 debug worktree。本 PR 仅用于回归测试 + 多 provider
-// 验证,**绝不 merge**。
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static DEBUG_APPLY_PATCH_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn debug_apply_patch_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = std::path::PathBuf::from(home).join(".codex-app-transfer/logs/apply-patch-debug");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
-}
-
-fn debug_apply_patch_dump(stage: &str, request_id: u64, payload: &[u8]) {
-    let Some(dir) = debug_apply_patch_dir() else {
-        return;
-    };
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = dir.join(format!("{ts:013}-{request_id:04}-{stage}.txt"));
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-    {
-        use std::io::Write as _;
-        let _ = f.write_all(payload);
-    }
-}
-
-struct DebugTeeStream {
-    inner: codex_app_transfer_adapters::ByteStream,
-    request_id: u64,
-    stage: &'static str,
-    accumulator: Vec<u8>,
-}
-
-impl DebugTeeStream {
-    fn new(
-        inner: codex_app_transfer_adapters::ByteStream,
-        request_id: u64,
-        stage: &'static str,
-    ) -> Self {
-        Self {
-            inner,
-            request_id,
-            stage,
-            accumulator: Vec::new(),
-        }
-    }
-}
-
-impl Stream for DebugTeeStream {
-    type Item = Result<Bytes, std::io::Error>;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.as_mut().get_mut();
-        match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                this.accumulator.extend_from_slice(&chunk);
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            other => other,
-        }
-    }
-}
-
-impl Drop for DebugTeeStream {
-    fn drop(&mut self) {
-        if !self.accumulator.is_empty() {
-            debug_apply_patch_dump(self.stage, self.request_id, &self.accumulator);
-        }
-    }
-}
-// =============================================================================
-// !!! END DEBUG ONLY !!!
-// =============================================================================
-
 #[derive(Clone)]
 pub struct ProxyState {
     pub http: reqwest::Client,
@@ -393,10 +307,6 @@ pub async fn forward_handler(
     // 1. 收齐入站 body
     let mut body_bytes: Bytes = axum::body::to_bytes(body, usize::MAX).await?;
 
-    // !!! DEBUG ONLY — DO NOT MERGE (post-merge regression test) !!!
-    let debug_request_id = DEBUG_APPLY_PATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-    debug_apply_patch_dump("inbound", debug_request_id, &body_bytes);
-
     // 2. 解析(鉴权 + 路由)
     let client_path = parts
         .uri
@@ -429,9 +339,6 @@ pub async fn forward_handler(
     // disable web_search,prepare_request 会输出不带 web_search 工具的 body。
     let original_body_bytes_for_retry = body_bytes.clone();
     let mut plan = adapter.prepare_request(&client_path, body_bytes, &resolved.provider)?;
-
-    // !!! DEBUG ONLY — DO NOT MERGE (post-merge regression test) !!!
-    debug_apply_patch_dump("outbound", debug_request_id, &plan.body);
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
     let upstream_url = build_upstream_url(&resolved.upstream_base, &plan.upstream_path);
@@ -600,11 +507,8 @@ pub async fn forward_handler(
                 resp.bytes_stream()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
             );
-            // !!! DEBUG ONLY — DO NOT MERGE !!!
-            let raw_tee: codex_app_transfer_adapters::ByteStream =
-                Box::pin(DebugTeeStream::new(raw, debug_request_id, "upstream_raw"));
             Box::pin(TracedStream::new(
-                raw_tee,
+                raw,
                 t_send,
                 st.as_u16(),
                 upstream_url.clone(),
@@ -650,19 +554,13 @@ pub async fn forward_handler(
         (st, hs, stream)
     };
 
-    let mut response_plan = adapter.transform_response_stream(
+    let response_plan = adapter.transform_response_stream(
         status,
         upstream_headers,
         upstream_stream,
         &resolved.provider,
         &plan,
     )?;
-    // !!! DEBUG ONLY — DO NOT MERGE !!!
-    response_plan.stream = Box::pin(DebugTeeStream::new(
-        response_plan.stream,
-        debug_request_id,
-        "downstream_emit",
-    ));
     let success = response_plan.status.is_success();
     telemetry.stats.record(success);
     telemetry.logs.add(
