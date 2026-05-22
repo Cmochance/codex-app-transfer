@@ -490,10 +490,6 @@
       </section>
 
       <section class="page" id="page-codex" data-page="codex">
-        <header class="page-title">
-          <h1 data-i18n="codex.title">Codex 文档管理</h1>
-        </header>
-
         <div class="codex-layout">
           <!-- Sidebar (借鉴 AiMaMi src/components/layout/sidebar.tsx — icon + label, badge 显状态) -->
           <nav class="codex-sidebar" id="codexSidebar" aria-label="Codex assets">
@@ -599,31 +595,112 @@
             </div>
           </div>
 
-          <!-- marker 模式 pane(MCP 仍用) -->
-          <div class="codex-block-tab codex-pane" id="codexBlockTab" data-codex-pane="block" hidden>
-            <div class="codex-status info-box" id="codexBlockStatus" style="margin-top: 16px;">
-              <i class="bi bi-info-circle"></i>
-              <p><span data-i18n="codex.statusLoading">状态加载中…</span></p>
+          <!-- MCP tab 完整重做 — 3 sub-tab(Servers form / Plugins / Marketplace) -->
+          <div class="codex-mcp-tab codex-pane" id="codexMcpTab" data-codex-pane="mcp" hidden>
+            <div class="codex-mcp-subnav" id="codexMcpSubnav">
+              <button class="codex-mcp-subnav-item active" type="button" data-mcp-sub="servers"><i class="bi bi-hdd-network"></i><span data-i18n="codex.mcp.servers">Servers</span></button>
+              <button class="codex-mcp-subnav-item" type="button" data-mcp-sub="plugins"><i class="bi bi-box-seam"></i><span data-i18n="codex.mcp.plugins">Plugins</span></button>
+              <!-- Marketplace + Deeplink 进 followup #40,暂不暴露给用户(后端代码保留可工作) -->
             </div>
 
-            <div class="form-group" style="margin-top: 16px;">
-              <label class="form-label" for="codexBlockContent" data-i18n="codex.managedContent">受管块内容(start/end marker 之间的内容)</label>
-              <textarea class="form-control" id="codexBlockContent" rows="10" data-i18n-attr="placeholder|codex.placeholder" placeholder="贴入 app 受管段(留空 = Apply 创建空块或 Preview 看 marker 注入位置)"></textarea>
+            <!-- Servers sub-pane -->
+            <div class="codex-mcp-subpane active" data-mcp-sub-pane="servers">
+              <div class="codex-agents-warning">
+                <i class="bi bi-exclamation-triangle-fill"></i>
+                <span data-i18n="codex.mcp.serversWarn">修改 MCP servers 会改 ~/.codex/config.toml 全局生效</span>
+              </div>
+
+              <div class="codex-mcp-split">
+                <div class="codex-mcp-list-col" id="codexMcpServersList"></div>
+                <div class="codex-mcp-form-col" id="codexMcpServerForm"></div>
+              </div>
+
+              <div class="button-row" style="margin-top: 10px;">
+                <button class="btn btn-primary" type="button" data-action="codex-mcp-server-new"><i class="bi bi-plus-lg"></i><span>新增</span></button>
+                <button class="btn btn-outline-primary" type="button" data-action="codex-mcp-server-edit" id="codexMcpEditBtn"><i class="bi bi-pencil"></i><span id="codexMcpEditBtnText">编辑</span></button>
+              </div>
+
+              <!-- 新增 server modal — 输入新 server 名 -->
+              <div class="codex-modal-backdrop" id="codexMcpNewServerModal" hidden>
+                <div class="codex-modal" role="dialog" aria-modal="true">
+                  <div class="codex-modal-header">
+                    <h3>新增 MCP server</h3>
+                    <button class="codex-modal-close" type="button" data-action="codex-mcp-new-cancel"><i class="bi bi-x-lg"></i></button>
+                  </div>
+                  <p class="codex-modal-desc">为新 server 起一个唯一名字(仅字母数字 / 短横 / 下划线 / 点);名字一旦确定不可修改</p>
+                  <div class="form-group">
+                    <label class="form-label">Server 名</label>
+                    <input type="text" class="form-control" id="codexMcpNewServerNameInput" placeholder="my-server" />
+                  </div>
+                  <div class="button-row">
+                    <button class="btn btn-primary" type="button" data-action="codex-mcp-new-confirm"><i class="bi bi-check2"></i><span>确认创建</span></button>
+                    <button class="btn btn-outline-danger" type="button" data-action="codex-mcp-new-cancel"><i class="bi bi-x"></i><span>取消</span></button>
+                  </div>
+                </div>
+              </div>
             </div>
 
-            <div class="button-row">
-              <button class="btn btn-outline-primary" type="button" data-action="codex-block-preview"><i class="bi bi-eye"></i><span data-i18n="codex.preview">Preview</span></button>
-              <button class="btn btn-primary" type="button" data-action="codex-block-apply"><i class="bi bi-check2-circle"></i><span data-i18n="codex.apply">Apply</span></button>
-              <button class="btn btn-outline-primary" type="button" data-action="codex-block-history-toggle"><i class="bi bi-clock-history"></i><span data-i18n="codex.history">History</span></button>
-              <button class="btn btn-outline-danger" type="button" data-action="codex-block-clear"><i class="bi bi-x-circle"></i><span data-i18n="codex.clear">Clear</span></button>
+            <!-- Plugins sub-pane -->
+            <div class="codex-mcp-subpane" data-mcp-sub-pane="plugins" hidden>
+              <div class="codex-agents-warning">
+                <i class="bi bi-exclamation-triangle-fill"></i>
+                <span data-i18n="codex.mcp.pluginsWarn">Plugin 来自 marketplace 安装到 ~/.codex/plugins/cache/,卸载将删除整个 cache 目录</span>
+              </div>
+              <ul class="codex-mcp-plugin-list" id="codexMcpPluginsList"></ul>
             </div>
 
-            <div class="codex-history" id="codexBlockHistory" hidden style="margin-top: 16px;">
-              <h3 style="font-size: 16px; font-weight: 700;" data-i18n="codex.historyTitle">History(最多 10 条 snapshot)</h3>
-              <ul id="codexBlockHistoryList" style="list-style: none; padding: 0;"></ul>
+            <!-- Marketplace sub-pane -->
+            <div class="codex-mcp-subpane" data-mcp-sub-pane="marketplace" hidden>
+              <div class="codex-mcp-sources-row" id="codexMcpSourcesRow"></div>
+              <div class="codex-mcp-marketplace-toolbar">
+                <input type="search" id="codexMcpMarketSearch" placeholder="搜索 server / plugin" data-i18n-attr="placeholder|codex.mcp.searchPlaceholder" class="form-control" />
+                <button class="btn btn-outline-primary" type="button" data-action="codex-mcp-market-refresh"><i class="bi bi-arrow-clockwise"></i><span data-i18n="codex.mcp.refresh">刷新</span></button>
+                <button class="btn btn-outline-primary" type="button" data-action="codex-mcp-source-add-open"><i class="bi bi-plus-lg"></i><span data-i18n="codex.mcp.sourceAdd">添加源</span></button>
+              </div>
+              <h3 class="codex-mcp-section-title" data-i18n="codex.mcp.serverPresets">Server 预设(一键加进 Servers tab)</h3>
+              <ul class="codex-mcp-market-list" id="codexMcpMarketServersList"></ul>
+              <h3 class="codex-mcp-section-title" data-i18n="codex.mcp.pluginBundles">Plugin 安装包(一键安装)</h3>
+              <ul class="codex-mcp-market-list" id="codexMcpMarketPluginsList"></ul>
             </div>
+          </div>
 
-            <pre class="code-block" id="codexBlockPreviewArea" hidden style="margin-top: 16px; max-height: 400px; overflow: auto;"></pre>
+          <!-- 添加 marketplace source modal -->
+          <div class="codex-modal-backdrop" id="codexMcpAddSourceModal" hidden>
+            <div class="codex-modal" role="dialog" aria-modal="true">
+              <div class="codex-modal-header">
+                <h3 data-i18n="codex.mcp.sourceAddTitle">添加 marketplace 源</h3>
+                <button class="codex-modal-close" type="button" data-action="codex-mcp-source-modal-close"><i class="bi bi-x-lg"></i></button>
+              </div>
+              <p class="codex-modal-desc" data-i18n="codex.mcp.sourceAddPrompt">输入 https registry.json 的完整 URL,跟一个友好名字</p>
+              <div class="form-group">
+                <label class="form-label">Name</label>
+                <input type="text" class="form-control" id="codexMcpSourceNameInput" placeholder="My Custom Source" />
+              </div>
+              <div class="form-group">
+                <label class="form-label">URL</label>
+                <input type="url" class="form-control" id="codexMcpSourceUrlInput" placeholder="https://example.com/registry.json" />
+              </div>
+              <div class="button-row">
+                <button class="btn btn-primary" type="button" data-action="codex-mcp-source-modal-confirm"><i class="bi bi-check2"></i><span data-i18n="codex.mcp.sourceAddConfirm">添加</span></button>
+                <button class="btn btn-outline-danger" type="button" data-action="codex-mcp-source-modal-close"><i class="bi bi-x"></i><span data-i18n="codex.agentsCancel">Cancel</span></button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Deeplink confirmation modal -->
+          <div class="codex-modal-backdrop" id="codexMcpDeeplinkModal" hidden>
+            <div class="codex-modal codex-modal-large" role="dialog" aria-modal="true">
+              <div class="codex-modal-header">
+                <h3 data-i18n="codex.mcp.deeplinkConfirmTitle">确认导入</h3>
+                <button class="codex-modal-close" type="button" data-action="codex-mcp-deeplink-cancel"><i class="bi bi-x-lg"></i></button>
+              </div>
+              <p class="codex-modal-desc" data-i18n="codex.mcp.deeplinkConfirmDesc">外部 URL 请求导入以下条目,请确认后再继续</p>
+              <pre class="codex-agents-preview" id="codexMcpDeeplinkPreview" style="max-height: 300px;"></pre>
+              <div class="button-row">
+                <button class="btn btn-primary" type="button" data-action="codex-mcp-deeplink-confirm"><i class="bi bi-check2-circle"></i><span data-i18n="codex.mcp.deeplinkConfirmYes">确认导入</span></button>
+                <button class="btn btn-outline-danger" type="button" data-action="codex-mcp-deeplink-cancel"><i class="bi bi-x"></i><span data-i18n="codex.agentsCancel">Cancel</span></button>
+              </div>
+            </div>
           </div>
 
           <!-- Skills tab raw 模式(SKILL.md preview/edit + 打开文件夹) -->

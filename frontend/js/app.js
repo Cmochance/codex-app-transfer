@@ -2911,6 +2911,94 @@
       if (action === "codex-skills-reveal") {
         await codexSkillsOnReveal();
       }
+      // ── MCP ──
+      if (action === "codex-mcp-server-new") {
+        codexMcpServerNew();
+      }
+      if (action === "codex-mcp-new-cancel") {
+        codexMcpServerNewCancel();
+      }
+      if (action === "codex-mcp-new-confirm") {
+        codexMcpServerNewConfirm();
+      }
+      if (action === "codex-mcp-server-edit") {
+        codexMcpServerEditToggle();
+      }
+      if (action === "codex-mcp-server-delete") {
+        await codexMcpServerDelete();
+      }
+      if (action === "codex-mcp-servers-backup") {
+        await codexMcpServersBackup();
+      }
+      if (action === "codex-mcp-servers-history") {
+        await codexMcpServersOpenHistory();
+      }
+      if (action === "codex-mcp-raw-toggle") {
+        await codexMcpRawToggle();
+      }
+      if (action === "codex-mcp-raw-apply") {
+        await codexMcpRawApply();
+      }
+      if (action === "codex-mcp-raw-cancel") {
+        codexMcpRawCancel();
+      }
+      if (action === "codex-mcp-form-toggle-advanced") {
+        const pane = $("#codexMcpAdvancedPane");
+        if (pane) pane.hidden = !pane.hidden;
+      }
+      if (action === "codex-mcp-form-add-arg") { codexMcpAddArgRow(); }
+      if (action === "codex-mcp-form-remove-arg") { codexMcpRemoveArgRow(actionEl.dataset.idx); }
+      if (action === "codex-mcp-form-add-env") { codexMcpAddKvRow("env"); }
+      if (action === "codex-mcp-form-add-hh") { codexMcpAddKvRow("hh"); }
+      if (action === "codex-mcp-form-add-ehh") { codexMcpAddKvRow("ehh"); }
+      if (action === "codex-mcp-form-remove-kv") { codexMcpRemoveKvRow(actionEl.dataset.prefix, actionEl.dataset.idx); }
+      if (action === "codex-mcp-plugin-toggle") {
+        const key = actionEl.dataset.key;
+        const enabled = !!actionEl.checked;
+        await codexMcpPluginToggle(key, enabled);
+      }
+      if (action === "codex-mcp-plugin-toggle-btn") {
+        const key = actionEl.dataset.key;
+        const wasEnabled = actionEl.dataset.enabled === "true";
+        await codexMcpPluginToggle(key, !wasEnabled);
+      }
+      if (action === "codex-mcp-plugin-uninstall") {
+        const key = actionEl.dataset.key;
+        await codexMcpPluginUninstall(key);
+      }
+      if (action === "codex-mcp-source-add-open") {
+        codexMcpSourceAddOpen();
+      }
+      if (action === "codex-mcp-source-modal-close") {
+        codexMcpSourceAddClose();
+      }
+      if (action === "codex-mcp-source-modal-confirm") {
+        await codexMcpSourceAddConfirm();
+      }
+      if (action === "codex-mcp-source-toggle") {
+        const id = actionEl.dataset.id;
+        const enabled = actionEl.dataset.enabled === "true";
+        await codexMcpSourceToggle(id, enabled);
+      }
+      if (action === "codex-mcp-source-remove") {
+        const id = actionEl.dataset.id;
+        await codexMcpSourceRemove(id);
+      }
+      if (action === "codex-mcp-market-refresh") {
+        await codexMcpReloadMarketIndex(true);
+      }
+      if (action === "codex-mcp-market-install-server") {
+        await codexMcpMarketInstallServer(actionEl.dataset.id);
+      }
+      if (action === "codex-mcp-market-install-plugin") {
+        await codexMcpMarketInstallPlugin(actionEl.dataset.id, actionEl.dataset.marketplace);
+      }
+      if (action === "codex-mcp-deeplink-cancel") {
+        codexMcpDeeplinkCancel();
+      }
+      if (action === "codex-mcp-deeplink-confirm") {
+        await codexMcpDeeplinkConfirm();
+      }
       if (action === "codex-add-path-cancel") {
         codexAgentsClosePathModal();
       }
@@ -3422,7 +3510,9 @@
     const cur = cache.find((e) => e.hash === hash);
     const ts = new Date(entry.timestamp * 1000).toLocaleString();
     let prefix = "";
-    if (cur) {
+    if (resource === "mcp") {
+      prefix = "config.toml";
+    } else if (cur) {
       if (resource === "skills") {
         prefix = cur.name || "?";
       } else if (cur.category === "global") {
@@ -3562,6 +3652,21 @@
     const entry = codexHistoryEntries[codexHistorySelectedIdx];
     if (!confirm(t("codex.agentsRestoreConfirm"))) return;
     const resource = codexDocActiveResource;
+    // MCP 走独立 endpoint(无 hash,操作整个 config.toml)
+    if (resource === "mcp") {
+      try {
+        const r = await fetch("/api/codex/mcp/servers/restore", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ index: entry.index }),
+        });
+        if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "restore failed"); }
+        showToast(t("codex.agentsRestoreOk"));
+        codexHistoryClose();
+        await codexMcpReloadServers();
+      } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+      return;
+    }
     const hash = codexDocCurrentHash(resource);
     if (!hash) return;
     try {
@@ -3578,6 +3683,7 @@
       codexHistoryClose();
       if (resource === "memories") await codexMemoriesRawLoadAndRender();
       else if (resource === "skills") await codexSkillsRawLoadAndRender();
+      else if (resource === "mcp") await codexMcpReloadServers();
       else await codexAgentsRawLoadAndRender();
     } catch (e) {
       showToast(e.message || t("toast.requestFailed"));
@@ -4027,6 +4133,944 @@
     } catch (e) { showToast(e.message || t("toast.requestFailed")); }
   }
 
+  // ── MCP tab: Servers form + Plugins + Marketplace + Deeplink ──
+
+  let codexMcpCurrentSubpane = "servers";
+  let codexMcpServersCache = [];
+  let codexMcpCurrentServerName = null;
+  let codexMcpFormDirty = false;
+  let codexMcpPluginsCache = [];
+  let codexMcpSourcesCache = [];
+  let codexMcpMarketIndex = { servers: [], plugins: [], errors: {} };
+  let codexMcpMarketFilter = "";
+  let codexMcpRawSnapshot = "";
+  let codexMcpPendingDeeplink = null;
+
+  function codexMcpSetSubpaneVisible(sub) {
+    codexMcpCurrentSubpane = sub;
+    $all("#codexMcpSubnav .codex-mcp-subnav-item").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.mcpSub === sub);
+    });
+    $all('#codexMcpTab .codex-mcp-subpane').forEach((pane) => {
+      const match = pane.dataset.mcpSubPane === sub;
+      pane.hidden = !match;
+      pane.classList.toggle("active", match);
+    });
+    const rawWrap = $("#codexMcpRawWrap");
+    if (rawWrap && sub !== "servers") rawWrap.hidden = true;
+  }
+
+  async function codexMcpOpenSubpane(sub) {
+    codexMcpSetSubpaneVisible(sub);
+    if (sub === "servers") {
+      await codexMcpReloadServers();
+    } else if (sub === "plugins") {
+      await codexMcpReloadPlugins();
+    } else if (sub === "marketplace") {
+      await codexMcpReloadSources();
+      await codexMcpReloadMarketIndex(false);
+    }
+  }
+
+  // ── Servers ──
+
+  async function codexMcpReloadServers() {
+    try {
+      const r = await fetch("/api/codex/mcp/servers");
+      if (!r.ok) throw new Error("list servers failed");
+      const j = await r.json();
+      codexMcpServersCache = j.servers || [];
+      if (
+        codexMcpCurrentServerName &&
+        !codexMcpServersCache.some((s) => s.name === codexMcpCurrentServerName)
+      ) {
+        codexMcpCurrentServerName = null;
+      }
+      codexMcpRenderServersList();
+      codexMcpRenderForm();
+    } catch (e) {
+      console.error("codexMcpReloadServers:", e);
+      codexMcpServersCache = [];
+      codexMcpRenderServersList();
+    }
+  }
+
+  function codexMcpRenderServersList() {
+    const wrap = $("#codexMcpServersList");
+    if (!wrap) return;
+    if (codexMcpServersCache.length === 0) {
+      wrap.innerHTML = `<div class="codex-mcp-empty-form">${escapeHtml(t("codex.mcp.serversEmpty"))}</div>`;
+      return;
+    }
+    wrap.innerHTML = codexMcpServersCache
+      .map((s) => {
+        const active = s.name === codexMcpCurrentServerName ? " active" : "";
+        const disabled = s.enabled === false ? " disabled" : "";
+        const chip = s.transport === "stdio"
+          ? `<span class="codex-mcp-chip stdio">本机</span>`
+          : `<span class="codex-mcp-chip http">远程</span>`;
+        const offChip = s.enabled === false ? `<span class="codex-mcp-chip disabled">disabled</span>` : "";
+        return `<div class="codex-mcp-list-item${active}${disabled}" data-server="${escapeHtml(s.name)}">
+          <div class="codex-mcp-list-item-name">${chip}${offChip}${escapeHtml(s.name)}</div>
+        </div>`;
+      })
+      .join("");
+  }
+
+  function codexMcpEmptyServerSpec() {
+    return {
+      name: "",
+      transport: "stdio",
+      command: "",
+      args: [],
+      env: {},
+      cwd: null,
+      url: null,
+      bearerTokenEnvVar: null,
+      httpHeaders: {},
+      envHttpHeaders: {},
+      enabled: true,
+      required: false,
+      supportsParallelToolCalls: false,
+      experimentalEnvironment: null,
+      startupTimeoutSec: null,
+      toolTimeoutSec: null,
+      defaultToolsApprovalMode: null,
+      enabledTools: null,
+      disabledTools: null,
+      _isNew: true,
+    };
+  }
+
+  /** JSON 编辑模式 — 当前选中 server / 新增的 JSON read-only pre + 编辑 textarea 切换 */
+  let codexMcpJsonEditMode = false;
+  let codexMcpJsonDraft = "";
+
+  function codexMcpServerSpecToJsonText(spec) {
+    // 清掉内部字段 _isNew + null/undefined,然后 JSON.stringify pretty
+    const out = {};
+    const skipKeys = new Set(["_isNew", "name", "disabledReason", "transport"]);
+    // 保留 transport 字段在输出
+    if (spec.transport) out.transport = spec.transport;
+    for (const [k, v] of Object.entries(spec)) {
+      if (skipKeys.has(k)) continue;
+      if (v == null) continue;
+      if (Array.isArray(v) && v.length === 0) continue;
+      if (typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 0) continue;
+      out[k] = v;
+    }
+    return JSON.stringify(out, null, 2);
+  }
+
+  function codexMcpRenderForm() {
+    const wrap = $("#codexMcpServerForm");
+    const editBtnText = $("#codexMcpEditBtnText");
+    const editBtn = $("#codexMcpEditBtn");
+    if (!wrap) return;
+    let spec = null;
+    let isNew = false;
+    if (codexMcpCurrentServerName === "__new__") {
+      spec = codexMcpEmptyServerSpec();
+      isNew = true;
+    } else if (codexMcpCurrentServerName) {
+      spec = codexMcpServersCache.find((s) => s.name === codexMcpCurrentServerName);
+    }
+    if (!spec) {
+      wrap.innerHTML = `<div class="codex-mcp-empty-form">从左侧列表选一个 server,或点底部「新增」</div>`;
+      if (editBtn) editBtn.disabled = true;
+      if (editBtnText) editBtnText.textContent = "编辑";
+      codexMcpJsonEditMode = false;
+      return;
+    }
+    if (editBtn) editBtn.disabled = false;
+    const jsonText = codexMcpJsonEditMode && codexMcpJsonDraft
+      ? codexMcpJsonDraft
+      : codexMcpServerSpecToJsonText(spec);
+    const title = `<div class="codex-mcp-json-header">
+      <span class="codex-mcp-json-name">${escapeHtml(spec.name || "(新)")}</span>
+      ${isNew ? "" : `<button class="btn-icon-only codex-mcp-json-delete" type="button" data-action="codex-mcp-server-delete" title="删除"><i class="bi bi-trash"></i></button>`}
+    </div>`;
+    wrap.innerHTML = `
+      ${title}
+      ${codexMcpJsonEditMode
+        ? `<textarea class="form-control codex-mcp-json-area" id="codexMcpJsonTextarea" spellcheck="false">${escapeHtml(jsonText)}</textarea>
+           <div id="codexMcpJsonError" class="codex-mcp-json-error" hidden></div>`
+        : `<pre class="codex-mcp-json-pre" id="codexMcpJsonPre">${escapeHtml(jsonText)}</pre>`
+      }
+    `;
+    if (editBtnText) editBtnText.textContent = codexMcpJsonEditMode ? (isNew ? "确认创建" : "保存") : "编辑";
+    if (editBtn) {
+      const icon = editBtn.querySelector("i");
+      if (icon) icon.className = codexMcpJsonEditMode ? "bi bi-check2-circle" : "bi bi-pencil";
+    }
+  }
+
+  /** args 列表 — 每个 1 个 input row,带删除按钮(legacy,JSON 模式不用) */
+  function codexMcpRenderArgRows(args) {
+    const list = args || [];
+    if (list.length === 0) {
+      return `<div class="codex-mcp-arg-list" id="codexMcpArgList"></div>`;
+    }
+    return `<div class="codex-mcp-arg-list" id="codexMcpArgList">${list
+      .map(
+        (a, i) => `<div class="codex-mcp-arg-row" data-arg-idx="${i}">
+          <input type="text" class="form-control codex-mcp-arg-input" value="${escapeHtml(a)}" placeholder="-y" />
+          <button type="button" class="btn-icon-only" data-action="codex-mcp-form-remove-arg" data-idx="${i}"><i class="bi bi-x-lg"></i></button>
+        </div>`,
+      )
+      .join("")}</div>`;
+  }
+
+  /** env / headers — KEY=VALUE row pair list */
+  function codexMcpRenderKvRows(prefix, map) {
+    const entries = map ? Object.entries(map) : [];
+    if (entries.length === 0) {
+      return `<div class="codex-mcp-kv-list" id="codexMcpKvList-${prefix}"></div>`;
+    }
+    return `<div class="codex-mcp-kv-list" id="codexMcpKvList-${prefix}">${entries
+      .map(
+        ([k, v], i) => `<div class="codex-mcp-kv-row" data-kv-prefix="${prefix}" data-kv-idx="${i}">
+          <input type="text" class="form-control codex-mcp-kv-key" value="${escapeHtml(k)}" placeholder="KEY" />
+          <span class="codex-mcp-kv-eq">=</span>
+          <input type="text" class="form-control codex-mcp-kv-val" value="${escapeHtml(v)}" placeholder="VALUE" />
+          <button type="button" class="btn-icon-only" data-action="codex-mcp-form-remove-kv" data-prefix="${prefix}" data-idx="${i}"><i class="bi bi-x-lg"></i></button>
+        </div>`,
+      )
+      .join("")}</div>`;
+  }
+
+  /** add row button helpers — 直接 append DOM,不重 render 整个 form */
+  function codexMcpAddArgRow() {
+    const list = $("#codexMcpArgList");
+    if (!list) return;
+    const idx = list.children.length;
+    const row = document.createElement("div");
+    row.className = "codex-mcp-arg-row";
+    row.dataset.argIdx = String(idx);
+    row.innerHTML = `<input type="text" class="form-control codex-mcp-arg-input" placeholder="-y" />
+      <button type="button" class="btn-icon-only" data-action="codex-mcp-form-remove-arg" data-idx="${idx}"><i class="bi bi-x-lg"></i></button>`;
+    list.appendChild(row);
+    row.querySelector("input")?.focus();
+  }
+  function codexMcpAddKvRow(prefix) {
+    const list = $(`#codexMcpKvList-${prefix}`);
+    if (!list) return;
+    const idx = list.children.length;
+    const row = document.createElement("div");
+    row.className = "codex-mcp-kv-row";
+    row.dataset.kvPrefix = prefix;
+    row.dataset.kvIdx = String(idx);
+    row.innerHTML = `<input type="text" class="form-control codex-mcp-kv-key" placeholder="KEY" />
+      <span class="codex-mcp-kv-eq">=</span>
+      <input type="text" class="form-control codex-mcp-kv-val" placeholder="VALUE" />
+      <button type="button" class="btn-icon-only" data-action="codex-mcp-form-remove-kv" data-prefix="${prefix}" data-idx="${idx}"><i class="bi bi-x-lg"></i></button>`;
+    list.appendChild(row);
+    row.querySelector("input")?.focus();
+  }
+  function codexMcpRemoveArgRow(idx) {
+    const row = document.querySelector(`#codexMcpArgList .codex-mcp-arg-row[data-arg-idx="${idx}"]`);
+    if (row) row.remove();
+  }
+  function codexMcpRemoveKvRow(prefix, idx) {
+    const row = document.querySelector(`#codexMcpKvList-${prefix} .codex-mcp-kv-row[data-kv-idx="${idx}"]`);
+    if (row) row.remove();
+  }
+
+  function codexMcpCollectKvRows(prefix) {
+    const rows = $all(`#codexMcpKvList-${prefix} .codex-mcp-kv-row`);
+    const out = {};
+    for (const row of rows) {
+      const k = row.querySelector(".codex-mcp-kv-key")?.value?.trim();
+      const v = row.querySelector(".codex-mcp-kv-val")?.value?.trim() ?? "";
+      if (k) out[k] = v;
+    }
+    return out;
+  }
+
+  function codexMcpRenderKvLines(map) {
+    if (!map || Object.keys(map).length === 0) return "";
+    return Object.entries(map).map(([k, v]) => `${k}=${v}`).join("\n");
+  }
+  function codexMcpParseKvLines(text) {
+    const out = {};
+    for (const line of (text || "").split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const idx = trimmed.indexOf("=");
+      if (idx <= 0) continue;
+      const k = trimmed.slice(0, idx).trim();
+      const v = trimmed.slice(idx + 1).trim();
+      if (k) out[k] = v;
+    }
+    return out;
+  }
+  function codexMcpParseCsvList(text) {
+    if (!text) return null;
+    const arr = text
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    return arr.length === 0 ? null : arr;
+  }
+
+  function codexMcpCollectFormSpec() {
+    const transport = (document.querySelector('input[name="codexMcpTransport"]:checked')?.value) || "stdio";
+    const name = ($("#codexMcpFormName")?.value || "").trim();
+    const spec = {
+      name,
+      transport,
+      enabled: !!$("#codexMcpFormEnabled")?.checked,
+      required: !!$("#codexMcpFormRequired")?.checked,
+      supportsParallelToolCalls: !!$("#codexMcpFormParallel")?.checked,
+    };
+    if (transport === "stdio") {
+      spec.command = ($("#codexMcpFormCommand")?.value || "").trim();
+      const argInputs = $all("#codexMcpArgList .codex-mcp-arg-input");
+      spec.args = argInputs
+        .map((el) => (el.value || "").trim())
+        .filter((s) => s.length > 0);
+      const envMap = codexMcpCollectKvRows("env");
+      spec.env = Object.keys(envMap).length > 0 ? envMap : null;
+      const cwd = ($("#codexMcpFormCwd")?.value || "").trim();
+      spec.cwd = cwd || null;
+    } else {
+      spec.url = ($("#codexMcpFormUrl")?.value || "").trim();
+      const bearer = ($("#codexMcpFormBearerEnv")?.value || "").trim();
+      spec.bearerTokenEnvVar = bearer || null;
+      const hh = codexMcpCollectKvRows("hh");
+      spec.httpHeaders = Object.keys(hh).length > 0 ? hh : null;
+      const ehh = codexMcpCollectKvRows("ehh");
+      spec.envHttpHeaders = Object.keys(ehh).length > 0 ? ehh : null;
+    }
+    const startup = parseInt($("#codexMcpFormStartupTimeout")?.value, 10);
+    spec.startupTimeoutSec = isFinite(startup) && startup >= 0 ? startup : null;
+    const toolTo = parseInt($("#codexMcpFormToolTimeout")?.value, 10);
+    spec.toolTimeoutSec = isFinite(toolTo) && toolTo >= 0 ? toolTo : null;
+    const mode = ($("#codexMcpFormApprovalMode")?.value || "").trim();
+    spec.defaultToolsApprovalMode = mode || null;
+    spec.enabledTools = codexMcpParseCsvList($("#codexMcpFormEnabledTools")?.value);
+    spec.disabledTools = codexMcpParseCsvList($("#codexMcpFormDisabledTools")?.value);
+    const expEnv = ($("#codexMcpFormExperimental")?.value || "").trim();
+    spec.experimentalEnvironment = expEnv || null;
+    return spec;
+  }
+
+  /** 进入 / 退出编辑模式 — toggle JSON read-only ↔ textarea */
+  function codexMcpServerEditToggle() {
+    if (codexMcpJsonEditMode) {
+      // 当前编辑模式 → 保存
+      codexMcpJsonSave();
+    } else {
+      // 进入编辑模式 — draft 用 nul,让 render 读 current spec
+      codexMcpJsonDraft = "";
+      codexMcpJsonEditMode = true;
+      codexMcpRenderForm();
+    }
+  }
+
+  function codexMcpJsonErrShow(msg) {
+    const el = $("#codexMcpJsonError");
+    if (!el) { showToast(msg); return; }
+    el.textContent = msg;
+    el.hidden = false;
+  }
+
+  function codexMcpJsonErrClear() {
+    const el = $("#codexMcpJsonError");
+    if (el) el.hidden = true;
+  }
+
+  async function codexMcpJsonSave() {
+    const ta = $("#codexMcpJsonTextarea");
+    if (!ta) return;
+    codexMcpJsonErrClear();
+    let parsed;
+    try {
+      parsed = JSON.parse(ta.value || "{}");
+    } catch (e) {
+      codexMcpJsonErrShow("JSON 解析失败:" + (e.message || e));
+      return;
+    }
+    if (typeof parsed !== "object" || Array.isArray(parsed) || parsed === null) {
+      codexMcpJsonErrShow("JSON 必须是一个 object(花括号 {...})");
+      return;
+    }
+    const isNew = codexMcpCurrentServerName === "__new__";
+    const name = isNew ? codexMcpPendingNewName : codexMcpCurrentServerName;
+    if (!name) {
+      codexMcpJsonErrShow("server 名缺失");
+      return;
+    }
+    // 推断 transport:JSON 里有 transport 字段优先;否则按 command/url 启发判断
+    let transport = parsed.transport;
+    if (!transport) {
+      if (typeof parsed.command === "string" && parsed.command.length > 0) transport = "stdio";
+      else if (typeof parsed.url === "string" && parsed.url.length > 0) transport = "streamable_http";
+      else transport = "stdio";
+    }
+    if (transport !== "stdio" && transport !== "streamable_http") {
+      codexMcpJsonErrShow(`transport 仅支持 "stdio" 跟 "streamable_http",收到:${transport}`);
+      return;
+    }
+    const spec = {
+      name,
+      transport,
+      command: parsed.command ?? null,
+      args: Array.isArray(parsed.args) ? parsed.args : null,
+      env: parsed.env && typeof parsed.env === "object" ? parsed.env : null,
+      cwd: parsed.cwd ?? null,
+      url: parsed.url ?? null,
+      bearerTokenEnvVar: parsed.bearerTokenEnvVar ?? parsed.bearer_token_env_var ?? null,
+      httpHeaders: parsed.httpHeaders ?? parsed.http_headers ?? null,
+      envHttpHeaders: parsed.envHttpHeaders ?? parsed.env_http_headers ?? null,
+      enabled: parsed.enabled !== false,
+      required: !!parsed.required,
+      supportsParallelToolCalls: !!(parsed.supportsParallelToolCalls ?? parsed.supports_parallel_tool_calls),
+      experimentalEnvironment: parsed.experimentalEnvironment ?? parsed.experimental_environment ?? null,
+      startupTimeoutSec: parsed.startupTimeoutSec ?? parsed.startup_timeout_sec ?? null,
+      toolTimeoutSec: parsed.toolTimeoutSec ?? parsed.tool_timeout_sec ?? null,
+      defaultToolsApprovalMode: parsed.defaultToolsApprovalMode ?? parsed.default_tools_approval_mode ?? null,
+      enabledTools: Array.isArray(parsed.enabledTools ?? parsed.enabled_tools) ? (parsed.enabledTools ?? parsed.enabled_tools) : null,
+      disabledTools: Array.isArray(parsed.disabledTools ?? parsed.disabled_tools) ? (parsed.disabledTools ?? parsed.disabled_tools) : null,
+    };
+    try {
+      const r = await fetch("/api/codex/mcp/servers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(spec),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        codexMcpJsonErrShow(j.error || "save failed");
+        return;
+      }
+      showToast(t("codex.mcp.saveOk"));
+      codexMcpCurrentServerName = name;
+      codexMcpPendingNewName = null;
+      codexMcpJsonEditMode = false;
+      codexMcpJsonDraft = "";
+      await codexMcpReloadServers();
+    } catch (e) { codexMcpJsonErrShow(e.message || t("toast.requestFailed")); }
+  }
+
+  async function codexMcpServerDelete() {
+    if (!codexMcpCurrentServerName || codexMcpCurrentServerName === "__new__") return;
+    if (!confirm(`确认删除 server "${codexMcpCurrentServerName}"?(会同步删 ~/.codex/config.toml 对应节)`)) return;
+    try {
+      const r = await fetch("/api/codex/mcp/servers/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: codexMcpCurrentServerName }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || "delete failed");
+      }
+      codexMcpCurrentServerName = null;
+      await codexMcpReloadServers();
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  let codexMcpPendingNewName = null;
+
+  function codexMcpServerNew() {
+    // 弹 inline modal 收 name
+    const modal = $("#codexMcpNewServerModal");
+    const input = $("#codexMcpNewServerNameInput");
+    if (!modal || !input) return;
+    input.value = "";
+    modal.hidden = false;
+    setTimeout(() => input.focus(), 50);
+  }
+
+  function codexMcpServerNewCancel() {
+    const modal = $("#codexMcpNewServerModal");
+    if (modal) modal.hidden = true;
+    codexMcpPendingNewName = null;
+  }
+
+  function codexMcpServerNewConfirm() {
+    const input = $("#codexMcpNewServerNameInput");
+    const name = ((input?.value) || "").trim();
+    if (!name) { showToast("名字不能为空"); return; }
+    if (!/^[A-Za-z0-9_.\-]+$/.test(name)) {
+      showToast("名字仅允许字母数字 / 短横 / 下划线 / 点");
+      return;
+    }
+    if (codexMcpServersCache.some((s) => s.name === name)) {
+      showToast(`server "${name}" 已存在`);
+      return;
+    }
+    codexMcpPendingNewName = name;
+    codexMcpCurrentServerName = "__new__";
+    codexMcpJsonEditMode = true;
+    codexMcpJsonDraft = JSON.stringify({
+      transport: "stdio",
+      command: "npx",
+      args: [],
+      enabled: true,
+    }, null, 2);
+    const modal = $("#codexMcpNewServerModal");
+    if (modal) modal.hidden = true;
+    codexMcpRenderServersList();
+    codexMcpRenderForm();
+  }
+
+  async function codexMcpServersBackup() {
+    try {
+      const r = await fetch("/api/codex/mcp/servers/backup", { method: "POST" });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || "backup failed");
+      }
+      showToast(t("codex.agentsBackupOk"));
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  async function codexMcpServersOpenHistory() {
+    codexDocActiveResource = "mcp";
+    try {
+      const r = await fetch("/api/codex/mcp/servers/history");
+      if (!r.ok) throw new Error("history failed");
+      const j = await r.json();
+      const entries = j.history || [];
+      codexHistoryEntries = entries.slice().reverse();
+      codexHistorySelectedIdx = codexHistoryEntries.length > 0 ? 0 : null;
+      codexHistoryRenderToggle();
+      codexHistoryRenderMenu();
+      codexHistoryRenderDiff();
+      const modal = $("#codexHistoryModal");
+      if (modal) modal.hidden = false;
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  async function codexMcpRawToggle() {
+    const wrap = $("#codexMcpRawWrap");
+    const ta = $("#codexMcpRawTextarea");
+    if (!wrap || !ta) return;
+    if (wrap.hidden) {
+      try {
+        const r = await fetch("/api/codex/mcp/config/raw");
+        if (!r.ok) throw new Error("raw fetch failed");
+        const j = await r.json();
+        codexMcpRawSnapshot = j.content || "";
+        ta.value = codexMcpRawSnapshot;
+        wrap.hidden = false;
+      } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+    } else {
+      wrap.hidden = true;
+    }
+  }
+
+  async function codexMcpRawApply() {
+    const ta = $("#codexMcpRawTextarea");
+    if (!ta) return;
+    try {
+      const r = await fetch("/api/codex/mcp/config/raw", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: ta.value }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || "apply raw failed");
+      }
+      showToast(t("codex.mcp.saveOk"));
+      $("#codexMcpRawWrap").hidden = true;
+      await codexMcpReloadServers();
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  function codexMcpRawCancel() {
+    const ta = $("#codexMcpRawTextarea");
+    if (ta) ta.value = codexMcpRawSnapshot;
+    $("#codexMcpRawWrap").hidden = true;
+  }
+
+  // ── Plugins ──
+
+  async function codexMcpReloadPlugins() {
+    try {
+      const r = await fetch("/api/codex/mcp/plugins");
+      if (!r.ok) throw new Error("list plugins failed");
+      const j = await r.json();
+      codexMcpPluginsCache = j.plugins || [];
+      codexMcpRenderPlugins();
+    } catch (e) {
+      console.error("codexMcpReloadPlugins:", e);
+      codexMcpPluginsCache = [];
+      codexMcpRenderPlugins();
+    }
+  }
+
+  function codexMcpRenderPlugins() {
+    const wrap = $("#codexMcpPluginsList");
+    if (!wrap) return;
+    if (codexMcpPluginsCache.length === 0) {
+      wrap.innerHTML = `<li class="codex-mcp-empty-form">${escapeHtml(t("codex.mcp.pluginsEmpty"))}</li>`;
+      return;
+    }
+    wrap.innerHTML = codexMcpPluginsCache
+      .map((p) => {
+        const enableIcon = p.enabled ? "bi-check2-square" : "bi-square";
+        const enableLabel = p.enabled ? "已启用" : "已关闭";
+        return `<li class="codex-mcp-plugin-item" data-plugin-key="${escapeHtml(p.key)}">
+          <div class="codex-mcp-plugin-item-head">
+            <span class="codex-mcp-plugin-name">${escapeHtml(p.name)}</span>
+            <span class="codex-mcp-plugin-version">@${escapeHtml(p.marketplace)} · v${escapeHtml(p.version)}</span>
+          </div>
+          <div class="codex-mcp-plugin-actions">
+            <button class="btn btn-outline-primary" type="button" data-action="codex-mcp-plugin-toggle-btn" data-key="${escapeHtml(p.key)}" data-enabled="${p.enabled}"><i class="bi ${enableIcon}"></i>${enableLabel}</button>
+            <button class="btn btn-outline-danger" type="button" data-action="codex-mcp-plugin-uninstall" data-key="${escapeHtml(p.key)}"><i class="bi bi-trash"></i>卸载</button>
+          </div>
+        </li>`;
+      })
+      .join("");
+  }
+
+  async function codexMcpPluginToggle(key, enabled) {
+    try {
+      const r = await fetch("/api/codex/mcp/plugins/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, enabled }),
+      });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "toggle failed"); }
+      await codexMcpReloadPlugins();
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  async function codexMcpPluginUninstall(key) {
+    if (!confirm(`确认卸载 plugin "${key}"?会同步删除 ~/.codex/plugins/cache/ 下整个目录`)) return;
+    try {
+      const r = await fetch("/api/codex/mcp/plugins/uninstall", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key }),
+      });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "uninstall failed"); }
+      showToast(t("codex.mcp.uninstallOk"));
+      await codexMcpReloadPlugins();
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  // ── Marketplace ──
+
+  async function codexMcpReloadSources() {
+    try {
+      const r = await fetch("/api/codex/mcp/marketplace/sources");
+      if (!r.ok) throw new Error("sources failed");
+      const j = await r.json();
+      codexMcpSourcesCache = j.sources || [];
+      codexMcpRenderSources();
+    } catch (e) {
+      console.error("codexMcpReloadSources:", e);
+      codexMcpSourcesCache = [];
+      codexMcpRenderSources();
+    }
+  }
+
+  function codexMcpRenderSources() {
+    const wrap = $("#codexMcpSourcesRow");
+    if (!wrap) return;
+    wrap.innerHTML = codexMcpSourcesCache
+      .map((s) => {
+        const active = s.enabled ? " active" : "";
+        const disabled = s.enabled ? "" : " disabled";
+        const removeBtn = s.official
+          ? ""
+          : `<button class="codex-mcp-source-remove" data-action="codex-mcp-source-remove" data-id="${escapeHtml(s.id)}" title="删除该源"><i class="bi bi-x"></i></button>`;
+        return `<span class="codex-mcp-source-chip${active}${disabled}" data-action="codex-mcp-source-toggle" data-id="${escapeHtml(s.id)}" data-enabled="${!s.enabled}">
+          <i class="bi bi-${s.official ? "patch-check-fill" : "globe2"}"></i>
+          ${escapeHtml(s.name)}
+          ${removeBtn}
+        </span>`;
+      })
+      .join("");
+  }
+
+  async function codexMcpSourceToggle(id, enabled) {
+    try {
+      const r = await fetch("/api/codex/mcp/marketplace/sources/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, enabled }),
+      });
+      if (!r.ok) throw new Error("toggle source failed");
+      await codexMcpReloadSources();
+      await codexMcpReloadMarketIndex(true);
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  async function codexMcpSourceRemove(id) {
+    if (!confirm("删除该 marketplace 源?(官方源不可删)")) return;
+    try {
+      const r = await fetch("/api/codex/mcp/marketplace/sources/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+      if (!r.ok) throw new Error("remove source failed");
+      await codexMcpReloadSources();
+      await codexMcpReloadMarketIndex(true);
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  function codexMcpSourceAddOpen() {
+    const modal = $("#codexMcpAddSourceModal");
+    const nameInp = $("#codexMcpSourceNameInput");
+    const urlInp = $("#codexMcpSourceUrlInput");
+    if (!modal || !nameInp || !urlInp) return;
+    nameInp.value = "";
+    urlInp.value = "";
+    modal.hidden = false;
+    setTimeout(() => nameInp.focus(), 50);
+  }
+
+  function codexMcpSourceAddClose() {
+    const modal = $("#codexMcpAddSourceModal");
+    if (modal) modal.hidden = true;
+  }
+
+  async function codexMcpSourceAddConfirm() {
+    const name = ($("#codexMcpSourceNameInput")?.value || "").trim();
+    const url = ($("#codexMcpSourceUrlInput")?.value || "").trim();
+    if (!name || !url) { showToast("name 跟 url 都必填"); return; }
+    try {
+      const r = await fetch("/api/codex/mcp/marketplace/sources/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, url }),
+      });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "add source failed"); }
+      codexMcpSourceAddClose();
+      await codexMcpReloadSources();
+      await codexMcpReloadMarketIndex(true);
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  async function codexMcpReloadMarketIndex(forceRefresh) {
+    try {
+      const r = await fetch(`/api/codex/mcp/marketplace/index${forceRefresh ? "?force_refresh=true" : ""}`);
+      if (!r.ok) throw new Error("market index failed");
+      const j = await r.json();
+      codexMcpMarketIndex = j.index || { servers: [], plugins: [], errors: {} };
+      codexMcpRenderMarketIndex();
+    } catch (e) {
+      console.error("codexMcpReloadMarketIndex:", e);
+      codexMcpMarketIndex = { servers: [], plugins: [], errors: {} };
+      codexMcpRenderMarketIndex();
+    }
+  }
+
+  function codexMcpRenderMarketIndex() {
+    const serversWrap = $("#codexMcpMarketServersList");
+    const pluginsWrap = $("#codexMcpMarketPluginsList");
+    const filter = (codexMcpMarketFilter || "").trim().toLowerCase();
+    const matches = (txt) => !filter || (txt || "").toLowerCase().includes(filter);
+
+    const errEntries = Object.entries(codexMcpMarketIndex.errors || {});
+    let errHtml = "";
+    if (errEntries.length > 0) {
+      errHtml = errEntries
+        .map(([id, msg]) => `<div class="codex-mcp-market-error">源 <code>${escapeHtml(id)}</code> fetch 失败:${escapeHtml(msg)}</div>`)
+        .join("");
+    }
+
+    if (serversWrap) {
+      const filtered = (codexMcpMarketIndex.servers || []).filter(
+        (s) => matches(s.id) || matches(s.name) || matches(s.description) || matches(s.transport),
+      );
+      const html = filtered
+        .map((s) => {
+          const chip = s.transport === "stdio"
+            ? `<span class="codex-mcp-chip stdio">Stdio</span>`
+            : `<span class="codex-mcp-chip http">HTTP</span>`;
+          return `<li class="codex-mcp-market-item">
+            <div class="codex-mcp-market-item-body">
+              <div class="codex-mcp-market-item-name">${chip}<span>${escapeHtml(s.name || s.id)}</span><span class="codex-mcp-market-source-tag">${escapeHtml(s.source || "?")}</span></div>
+              ${s.description ? `<div class="codex-mcp-market-item-desc">${escapeHtml(s.description)}</div>` : ""}
+            </div>
+            <div class="codex-mcp-market-item-action">
+              <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-mcp-market-install-server" data-id="${escapeHtml(s.id)}"><i class="bi bi-download"></i>添加到 Servers</button>
+            </div>
+          </li>`;
+        })
+        .join("");
+      serversWrap.innerHTML = errHtml + (filtered.length === 0
+        ? `<li class="codex-mcp-empty-form">${escapeHtml(t("codex.mcp.marketEmpty"))}</li>`
+        : html);
+    }
+    if (pluginsWrap) {
+      const filtered = (codexMcpMarketIndex.plugins || []).filter(
+        (p) => matches(p.id) || matches(p.description) || matches(p.marketplace),
+      );
+      const html = filtered
+        .map((p) => {
+          const caps = p.capabilities ? `mcp:${p.capabilities.mcpServers || 0} skills:${p.capabilities.skills || 0} apps:${p.capabilities.apps || 0}` : "";
+          return `<li class="codex-mcp-market-item">
+            <div class="codex-mcp-market-item-body">
+              <div class="codex-mcp-market-item-name"><span>${escapeHtml(p.id)}</span><span class="codex-mcp-plugin-version">@${escapeHtml(p.marketplace)} v${escapeHtml(p.version)}</span><span class="codex-mcp-market-source-tag">${escapeHtml(p.source || "?")}</span></div>
+              ${p.description ? `<div class="codex-mcp-market-item-desc">${escapeHtml(p.description)}</div>` : ""}
+              ${caps ? `<div class="codex-mcp-plugin-caps">${caps}</div>` : ""}
+            </div>
+            <div class="codex-mcp-market-item-action">
+              <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-mcp-market-install-plugin" data-id="${escapeHtml(p.id)}" data-marketplace="${escapeHtml(p.marketplace)}"><i class="bi bi-download"></i>安装</button>
+            </div>
+          </li>`;
+        })
+        .join("");
+      pluginsWrap.innerHTML = filtered.length === 0
+        ? `<li class="codex-mcp-empty-form">${escapeHtml(t("codex.mcp.marketEmpty"))}</li>`
+        : html;
+    }
+  }
+
+  async function codexMcpMarketInstallServer(id) {
+    const item = (codexMcpMarketIndex.servers || []).find((s) => s.id === id);
+    if (!item) return;
+    const spec = {
+      name: item.id,
+      transport: item.transport === "stdio" ? "stdio" : "streamable_http",
+      enabled: true,
+      required: false,
+      supportsParallelToolCalls: false,
+    };
+    if (item.transport === "stdio") {
+      spec.command = item.command || "";
+      spec.args = item.args || [];
+    } else {
+      spec.url = item.url || "";
+      spec.bearerTokenEnvVar = item.bearerTokenEnvVar || null;
+    }
+    try {
+      const r = await fetch("/api/codex/mcp/servers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(spec),
+      });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "install server failed"); }
+      showToast(t("codex.mcp.installServerOk"));
+      codexMcpCurrentServerName = item.id;
+      codexMcpSetSubpaneVisible("servers");
+      await codexMcpReloadServers();
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  async function codexMcpMarketInstallPlugin(id, marketplace) {
+    const item = (codexMcpMarketIndex.plugins || []).find(
+      (p) => p.id === id && p.marketplace === marketplace,
+    );
+    if (!item) return;
+    if (!confirm(`下载并安装 plugin "${id}@${marketplace}" v${item.version}?\n\n来源:${item.tarballUrl}\n会解压到 ~/.codex/plugins/cache/${marketplace}/${id}/${item.version}/`)) return;
+    try {
+      showToast("正在下载 + 解压…");
+      const r = await fetch("/api/codex/mcp/plugins/install", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: id,
+          marketplace,
+          version: item.version,
+          tarballUrl: item.tarballUrl,
+        }),
+      });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "install plugin failed"); }
+      showToast(t("codex.mcp.installPluginOk"));
+      codexMcpSetSubpaneVisible("plugins");
+      await codexMcpReloadPlugins();
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  // ── Deeplink import ──
+  // 处理 codex-app-transfer://v1/import?resource=mcp-server|plugin&...
+
+  function codexMcpDeeplinkOpenConfirm(payload) {
+    codexMcpPendingDeeplink = payload;
+    const modal = $("#codexMcpDeeplinkModal");
+    const pre = $("#codexMcpDeeplinkPreview");
+    if (!modal || !pre) return;
+    pre.textContent = JSON.stringify(payload, null, 2);
+    modal.hidden = false;
+  }
+
+  function codexMcpDeeplinkCancel() {
+    codexMcpPendingDeeplink = null;
+    const modal = $("#codexMcpDeeplinkModal");
+    if (modal) modal.hidden = true;
+  }
+
+  async function codexMcpDeeplinkConfirm() {
+    const p = codexMcpPendingDeeplink;
+    codexMcpDeeplinkCancel();
+    if (!p) return;
+    try {
+      if (p.resource === "mcp-server") {
+        const r = await fetch("/api/codex/mcp/servers", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(p.spec),
+        });
+        if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "deeplink install server failed"); }
+        showToast(t("codex.mcp.deeplinkInstallOk"));
+        window.location.hash = "codex";
+        codexMcpSetSubpaneVisible("servers");
+        await codexMcpReloadServers();
+      } else if (p.resource === "plugin") {
+        const r = await fetch("/api/codex/mcp/plugins/install", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(p.input),
+        });
+        if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || "deeplink install plugin failed"); }
+        showToast(t("codex.mcp.deeplinkInstallOk"));
+        window.location.hash = "codex";
+        codexMcpSetSubpaneVisible("plugins");
+        await codexMcpReloadPlugins();
+      }
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  /** 解析 deeplink URL,弹 confirmation modal。供 Tauri deep-link plugin / 也支持手动 paste 触发。 */
+  function codexMcpHandleDeeplink(url) {
+    try {
+      const u = new URL(url);
+      if (u.protocol !== "codex-app-transfer:") return false;
+      const action = (u.pathname || "").replace(/^\/+/, "") || u.host;
+      // 形态 1:/v1/import?...   形态 2:host=v1/import
+      if (!action.includes("import")) return false;
+      const resource = u.searchParams.get("resource");
+      if (resource === "mcp-server") {
+        const configB64 = u.searchParams.get("config");
+        if (!configB64) { showToast("deeplink 缺 config 参数"); return false; }
+        if (configB64.length > 16 * 1024) { showToast("deeplink config 过大(>16KB)"); return false; }
+        let raw;
+        try { raw = atob(configB64); } catch { showToast("deeplink config base64 解码失败"); return false; }
+        let spec;
+        try { spec = JSON.parse(raw); } catch { showToast("deeplink config 不是合法 JSON"); return false; }
+        codexMcpDeeplinkOpenConfirm({ resource: "mcp-server", spec });
+        return true;
+      }
+      if (resource === "plugin") {
+        const name = u.searchParams.get("name") || u.searchParams.get("id");
+        const marketplace = u.searchParams.get("marketplace") || "official";
+        const version = u.searchParams.get("version") || "local";
+        const tarballUrl = u.searchParams.get("tarball_url") || u.searchParams.get("url");
+        if (!name || !tarballUrl) { showToast("deeplink plugin 缺 name 或 tarball_url"); return false; }
+        if (!tarballUrl.startsWith("https://")) { showToast("deeplink tarball_url 必须 https"); return false; }
+        codexMcpDeeplinkOpenConfirm({
+          resource: "plugin",
+          input: { name, marketplace, version, tarballUrl },
+        });
+        return true;
+      }
+    } catch (e) {
+      console.error("codexMcpHandleDeeplink:", e);
+    }
+    return false;
+  }
+  window.codexMcpHandleDeeplink = codexMcpHandleDeeplink;
+
   async function codexBlockLoadAndRender(type) {
     const status = await codexBlockFetchStatus(type);
     const el = $("#codexBlockStatus");
@@ -4244,16 +5288,11 @@
       skillsRawPane.hidden = tab !== "skills";
       skillsRawPane.classList.toggle("active", tab === "skills");
     }
-    const wantBlock = tab === "mcp";
-    if (blockPane) {
-      blockPane.hidden = !wantBlock;
-      blockPane.classList.toggle("active", wantBlock);
+    const mcpPane = $("#codexMcpTab");
+    if (mcpPane) {
+      mcpPane.hidden = tab !== "mcp";
+      mcpPane.classList.toggle("active", tab === "mcp");
     }
-    // 切 tab 时收起 marker pane 的 History 跟 Preview 区域
-    const historyEl = $("#codexBlockHistory");
-    if (historyEl) historyEl.hidden = true;
-    const previewEl = $("#codexBlockPreviewArea");
-    if (previewEl) previewEl.hidden = true;
     // 切 tab 时把非当前 tab 的 Edit 模式回退 preview
     if (tab !== "agents") codexAgentsSwitchMode("preview");
     if (tab !== "memories") codexMemoriesSwitchMode("preview");
@@ -4276,8 +5315,8 @@
     } else if (tab === "memories") {
       await codexMemoriesReloadPaths();
       await codexMemoriesRawLoadAndRender();
-    } else {
-      await codexBlockLoadAndRender(tab);
+    } else if (tab === "mcp") {
+      await codexMcpOpenSubpane(codexMcpCurrentSubpane || "servers");
     }
     await codexRefreshSidebarBadges();
   }
@@ -4285,10 +5324,11 @@
   /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
   async function codexRefreshSidebarBadges() {
     try {
-      const [agentsPaths, memPaths, mcp, skillsPaths] = await Promise.all([
+      const [agentsPaths, memPaths, mcpServers, mcpPlugins, skillsPaths] = await Promise.all([
         fetch("/api/codex/agents-md/paths").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/memories-md/paths").then((r) => (r.ok ? r.json() : null)),
-        fetch("/api/codex/mcp-toml/status").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/mcp/servers").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/mcp/plugins").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/skills-md/paths").then((r) => (r.ok ? r.json() : null)),
       ]);
       const setBadge = (id, text) => {
@@ -4297,10 +5337,13 @@
       };
       const agentsCount = agentsPaths?.entries?.length || 0;
       const memCount = memPaths?.entries?.length || 0;
+      const mcpServersCount = mcpServers?.servers?.length || 0;
+      const mcpPluginsCount = mcpPlugins?.plugins?.length || 0;
+      const mcpTotal = mcpServersCount + mcpPluginsCount;
       const skillsCount = skillsPaths?.entries?.length || 0;
       setBadge("#codexSidebarBadge-agents", agentsCount > 0 ? String(agentsCount) : "—");
       setBadge("#codexSidebarBadge-memories", memCount > 0 ? String(memCount) : "—");
-      setBadge("#codexSidebarBadge-mcp", mcp?.hasManaged ? "ON" : "—");
+      setBadge("#codexSidebarBadge-mcp", mcpTotal > 0 ? String(mcpTotal) : "—");
       setBadge("#codexSidebarBadge-skills", skillsCount > 0 ? String(skillsCount) : "—");
     } catch {
       // best-effort, 静默
@@ -4461,6 +5504,76 @@
         if (ta) delete ta.dataset.dirty;
         codexShowTab(tab);
         await codexLoadTab(tab);
+      });
+    }
+
+    // MCP sub-nav 切换
+    const mcpSubnav = $("#codexMcpSubnav");
+    if (mcpSubnav && !mcpSubnav.dataset.bound) {
+      mcpSubnav.dataset.bound = "1";
+      mcpSubnav.addEventListener("click", async (evt) => {
+        const btn = evt.target.closest(".codex-mcp-subnav-item");
+        if (!btn) return;
+        const sub = btn.dataset.mcpSub;
+        if (!sub) return;
+        await codexMcpOpenSubpane(sub);
+      });
+    }
+
+    // MCP servers list item click → 选 server
+    const mcpServersList = $("#codexMcpServersList");
+    if (mcpServersList && !mcpServersList.dataset.bound) {
+      mcpServersList.dataset.bound = "1";
+      mcpServersList.addEventListener("click", (evt) => {
+        const li = evt.target.closest(".codex-mcp-list-item");
+        if (!li) return;
+        const name = li.dataset.server;
+        if (!name) return;
+        codexMcpCurrentServerName = name;
+        codexMcpJsonEditMode = false;
+        codexMcpJsonDraft = "";
+        codexMcpPendingNewName = null;
+        codexMcpRenderServersList();
+        codexMcpRenderForm();
+      });
+    }
+
+    // MCP marketplace search input
+    const mcpSearch = $("#codexMcpMarketSearch");
+    if (mcpSearch && !mcpSearch.dataset.bound) {
+      mcpSearch.dataset.bound = "1";
+      mcpSearch.addEventListener("input", () => {
+        codexMcpMarketFilter = mcpSearch.value;
+        codexMcpRenderMarketIndex();
+      });
+    }
+
+    // MCP modal backdrop close
+    const mcpAddSourceModal = $("#codexMcpAddSourceModal");
+    if (mcpAddSourceModal && !mcpAddSourceModal.dataset.bound) {
+      mcpAddSourceModal.dataset.bound = "1";
+      mcpAddSourceModal.addEventListener("click", (e) => {
+        if (e.target === mcpAddSourceModal) codexMcpSourceAddClose();
+      });
+    }
+    const mcpDeeplinkModal = $("#codexMcpDeeplinkModal");
+    if (mcpDeeplinkModal && !mcpDeeplinkModal.dataset.bound) {
+      mcpDeeplinkModal.dataset.bound = "1";
+      mcpDeeplinkModal.addEventListener("click", (e) => {
+        if (e.target === mcpDeeplinkModal) codexMcpDeeplinkCancel();
+      });
+    }
+
+    const mcpNewModal = $("#codexMcpNewServerModal");
+    if (mcpNewModal && !mcpNewModal.dataset.bound) {
+      mcpNewModal.dataset.bound = "1";
+      mcpNewModal.addEventListener("click", (e) => {
+        if (e.target === mcpNewModal) codexMcpServerNewCancel();
+      });
+      // Enter 直接 confirm
+      $("#codexMcpNewServerNameInput")?.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") codexMcpServerNewConfirm();
+        if (e.key === "Escape") codexMcpServerNewCancel();
       });
     }
   }
@@ -4845,5 +5958,18 @@
     applyTheme(settings.theme || "default");
     if (!window.location.hash) window.location.hash = "dashboard";
     await renderRoute(routeFromHash());
+
+    // Tauri deeplink listener — Rust backend emit("codex-deeplink", url) 时触发
+    try {
+      const event = window.__TAURI__?.event;
+      if (event && typeof event.listen === "function") {
+        await event.listen("codex-deeplink", (e) => {
+          const url = typeof e.payload === "string" ? e.payload : "";
+          if (url) codexMcpHandleDeeplink(url);
+        });
+      }
+    } catch (err) {
+      console.error("deeplink listen:", err);
+    }
   });
 })();

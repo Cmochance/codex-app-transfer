@@ -19,7 +19,8 @@ use std::io::Write;
 
 use tauri::menu::{Menu, MenuBuilder, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, WindowEvent};
+use tauri_plugin_deep_link::DeepLinkExt;
 use tower::ServiceExt;
 
 use admin::{build_app_router, handlers, AdminState};
@@ -39,8 +40,17 @@ fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app);
+            // single-instance 启动时如果带 deeplink URL,argv 里会有,转发给前端
+            for arg in _argv.iter().skip(1) {
+                if arg.starts_with("codex-app-transfer:") {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.emit("codex-deeplink", arg.clone());
+                    }
+                }
+            }
         }))
         .manage(proxy_manager)
         .register_asynchronous_uri_scheme_protocol("cas", move |_app, request, responder| {
@@ -53,6 +63,19 @@ fn main() {
         .setup(|app| {
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
+
+            // Deep link scheme handler:codex-app-transfer://v1/import?...
+            // 转发 URL 给前端 codexMcpHandleDeeplink() 弹 confirmation modal。
+            let app_handle_for_deeplink = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                let urls = event.urls();
+                for url in urls {
+                    if let Some(window) = app_handle_for_deeplink.get_webview_window("main") {
+                        let _ = window.set_focus();
+                        let _ = window.emit("codex-deeplink", url.to_string());
+                    }
+                }
+            });
             // follow-up #29:GC ~/.codex-app-transfer/codex-snapshots/trash/ 下
             // mtime > TRASH_RETENTION_DAYS 天的软删 bucket。fire-and-forget,
             // 失败 warn 不阻塞 startup。retention 给用户"误点 cleanup_all 后

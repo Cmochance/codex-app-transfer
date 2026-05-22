@@ -81,6 +81,7 @@ related_pr: <PR# 或 null>
 
 - [#32 P2 Plugin Unlock macOS:setAuthMethod 触发 React 整树重渲(物理消除可行性调研)](followup/32-plugin-unlock-react-context-rerender.md) — PR #191 已 P0 缓解,长期消除需 hook Codex Desktop preload 跨版本不稳
 - [#39 P3 shell→apply_patch normalize 兜底(prompt-only 失效再激活)](followup/39-shell-to-apply-patch-normalize-fallback.md) — issue #235 通过 PR #236+#240 prompt-only 修复,PR #239 server-side normalize 暂时不需要;若未来某 provider 模型完全无视 prompt 走 shell file-write 再 cherry-pick PR #239 复活
+- [#40 P2 MCP Marketplace + Deeplink 暂隐藏(后端已实现,等 registry 起好再暴露)](followup/40-mcp-marketplace-deeplink-hide.md) — MCP tab 重做 PR ship 时 Servers+Plugins 立即可用;Marketplace/Deeplink 全栈代码完整,只 hide sub-nav 入口,等 `Cmochance/codex-app-transfer-registry` 起好 + curate preset 再取消注释激活
 
 ---
 

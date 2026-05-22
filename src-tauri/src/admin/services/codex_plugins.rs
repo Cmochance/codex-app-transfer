@@ -1,0 +1,397 @@
+//! Codex plugins 管理 — 扫 `~/.codex/plugins/cache/<market>/<plugin>/<ver>/` 列出
+//! 已安装 plugin,读 `.codex-plugin/plugin.json`(fallback `.claude-plugin/plugin.json`)
+//! 拿 capabilities;读写 `~/.codex/config.toml` 的 `[plugins."name@market"]` 节
+//! 控制 enabled / per-tool policy。
+//!
+//! 跟 mcp_servers.rs 互补:`mcp_servers` 管直配单 server,`codex_plugins` 管 plugin
+//! bundle(plugin 内部含多 MCP server + skill + app + hook)。
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use toml_edit::{value, DocumentMut, Item, Table};
+
+use super::mcp_servers;
+
+const DEFAULT_VERSION: &str = "local";
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginEntry {
+    /// plugin 在 user TOML 里的 key — `name@marketplace`
+    pub key: String,
+    pub name: String,
+    pub marketplace: String,
+    pub version: String,
+    /// plugin 内部声明
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub mcp_server_names: Vec<String>,
+    #[serde(default)]
+    pub skill_names: Vec<String>,
+    #[serde(default)]
+    pub app_count: usize,
+    #[serde(default)]
+    pub hook_count: usize,
+    /// `[plugins."key"]` 节里的 enabled(默认 true)
+    pub enabled: bool,
+    /// plugin 安装目录(reveal 用)
+    pub install_dir: String,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PluginManifest {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    /// plugin manifest 里 mcpServers / mcp_servers 都接受
+    #[serde(alias = "mcp_servers")]
+    pub mcp_servers: Option<serde_json::Value>,
+    pub skills: Option<serde_json::Value>,
+    pub apps: Option<serde_json::Value>,
+    pub hooks: Option<serde_json::Value>,
+}
+
+fn resolve_home() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .map(PathBuf::from)
+}
+
+pub fn codex_home() -> Result<PathBuf, String> {
+    let home = resolve_home().ok_or_else(|| "HOME / USERPROFILE not set".to_owned())?;
+    Ok(home.join(".codex"))
+}
+
+pub fn plugins_cache_root() -> Result<PathBuf, String> {
+    Ok(codex_home()?.join("plugins").join("cache"))
+}
+
+fn read_doc() -> Result<DocumentMut, String> {
+    let path = mcp_servers::config_path()?;
+    if !path.exists() {
+        return Ok(DocumentMut::new());
+    }
+    let raw = fs::read_to_string(&path).map_err(|e| format!("read config.toml: {e}"))?;
+    raw.parse::<DocumentMut>()
+        .map_err(|e| format!("parse config.toml: {e}"))
+}
+
+fn write_doc(doc: &DocumentMut) -> Result<(), String> {
+    let path = mcp_servers::config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir: {e}"))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, doc.to_string()).map_err(|e| format!("write tmp: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("rename tmp: {e}"))?;
+    Ok(())
+}
+
+/// 解析 plugin key:`name@marketplace` → (name, marketplace);兼容无 @ 的旧 key
+fn parse_key(key: &str) -> (String, String) {
+    if let Some((name, market)) = key.split_once('@') {
+        (name.to_owned(), market.to_owned())
+    } else {
+        (key.to_owned(), "official".to_owned())
+    }
+}
+
+fn load_manifest(dir: &Path) -> Option<PluginManifest> {
+    for rel in [".codex-plugin/plugin.json", ".claude-plugin/plugin.json"] {
+        let p = dir.join(rel);
+        if p.exists() {
+            let raw = fs::read_to_string(&p).ok()?;
+            return serde_json::from_str::<PluginManifest>(&raw).ok();
+        }
+    }
+    None
+}
+
+/// 找 plugin 的 active version 目录 — 简单实现:取 lexicographic 最大 version dir,
+/// 找不到则用 `local`。codex 真实实现在 `core-plugins/src/store.rs` 更复杂(active
+/// pointer),本工具暂用简化版。
+fn active_version_dir(plugin_root: &Path) -> Option<(String, PathBuf)> {
+    if !plugin_root.is_dir() {
+        return None;
+    }
+    let local = plugin_root.join(DEFAULT_VERSION);
+    if local.is_dir() {
+        return Some((DEFAULT_VERSION.to_owned(), local));
+    }
+    let mut versions: Vec<(String, PathBuf)> = fs::read_dir(plugin_root)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if !p.is_dir() {
+                return None;
+            }
+            let name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_owned())?;
+            Some((name, p))
+        })
+        .collect();
+    versions.sort_by(|a, b| b.0.cmp(&a.0)); // 最大版本号在前
+    versions.into_iter().next()
+}
+
+fn extract_names_from_value(v: &serde_json::Value) -> Vec<String> {
+    match v {
+        serde_json::Value::Object(m) => m.keys().cloned().collect(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|x| {
+                x.as_str()
+                    .map(|s| s.to_owned())
+                    .or_else(|| x.get("name").and_then(|n| n.as_str()).map(|s| s.to_owned()))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn count_top(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Object(m) => m.len(),
+        serde_json::Value::Array(a) => a.len(),
+        _ => 0,
+    }
+}
+
+/// 列已安装 plugin(扫 ~/.codex/plugins/cache/)
+pub fn list_installed() -> Result<Vec<PluginEntry>, String> {
+    let root = plugins_cache_root()?;
+    let mut out = Vec::new();
+    let Ok(markets) = fs::read_dir(&root) else {
+        return Ok(out);
+    };
+    // 读 user toml 的 plugins 节,拿 enabled 状态
+    let doc = read_doc()?;
+    let plugins_tbl = doc
+        .get("plugins")
+        .and_then(|i| i.as_table())
+        .cloned()
+        .unwrap_or_default();
+
+    for market_entry in markets.flatten() {
+        let market_dir = market_entry.path();
+        if !market_dir.is_dir() {
+            continue;
+        }
+        let marketplace = market_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_owned();
+        let Ok(plugins) = fs::read_dir(&market_dir) else {
+            continue;
+        };
+        for plugin_entry in plugins.flatten() {
+            let plugin_root = plugin_entry.path();
+            if !plugin_root.is_dir() {
+                continue;
+            }
+            let name = plugin_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_owned();
+            let Some((version, install_dir)) = active_version_dir(&plugin_root) else {
+                continue;
+            };
+            let key = format!("{name}@{marketplace}");
+            let manifest = load_manifest(&install_dir).unwrap_or_default();
+            let mcp_server_names = manifest
+                .mcp_servers
+                .as_ref()
+                .map(extract_names_from_value)
+                .unwrap_or_default();
+            let skill_names = manifest
+                .skills
+                .as_ref()
+                .map(extract_names_from_value)
+                .unwrap_or_default();
+            let app_count = manifest.apps.as_ref().map(count_top).unwrap_or(0);
+            let hook_count = manifest.hooks.as_ref().map(count_top).unwrap_or(0);
+            let enabled = plugins_tbl
+                .get(&key)
+                .and_then(|i| i.as_table())
+                .and_then(|t| t.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            out.push(PluginEntry {
+                key,
+                name,
+                marketplace: marketplace.clone(),
+                version,
+                description: manifest.description.clone(),
+                mcp_server_names,
+                skill_names,
+                app_count,
+                hook_count,
+                enabled,
+                install_dir: install_dir.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(out)
+}
+
+/// 设 `[plugins."name@market"] enabled = <bool>`
+pub fn set_enabled(key: &str, enabled: bool) -> Result<(), String> {
+    let mut doc = read_doc()?;
+    if !doc.contains_key("plugins") {
+        let mut t = Table::new();
+        t.set_implicit(true);
+        doc["plugins"] = Item::Table(t);
+    }
+    let plugins = doc["plugins"]
+        .as_table_mut()
+        .ok_or_else(|| "plugins is not a table".to_owned())?;
+    plugins.set_implicit(true);
+    if !plugins.contains_key(key) {
+        plugins.insert(key, Item::Table(Table::new()));
+    }
+    let tbl = plugins
+        .get_mut(key)
+        .and_then(|i| i.as_table_mut())
+        .ok_or_else(|| format!("plugins.{key} not a table"))?;
+    tbl["enabled"] = value(enabled);
+    write_doc(&doc)
+}
+
+/// 卸载 plugin — 删 cache 目录 + 删 `[plugins."name@market"]` 节
+pub fn uninstall(key: &str) -> Result<(), String> {
+    let (name, marketplace) = parse_key(key);
+    let cache_dir = plugins_cache_root()?.join(&marketplace).join(&name);
+    if cache_dir.exists() {
+        fs::remove_dir_all(&cache_dir).map_err(|e| format!("rm cache dir: {e}"))?;
+    }
+    let mut doc = read_doc()?;
+    if let Some(plugins) = doc.get_mut("plugins").and_then(|i| i.as_table_mut()) {
+        plugins.remove(key);
+    }
+    write_doc(&doc)
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct InstallInput {
+    pub name: String,
+    pub marketplace: String,
+    pub version: String,
+    /// HTTPS URL,必须 https 防 MITM
+    pub tarball_url: String,
+}
+
+/// 安装 plugin — 下载 tar.gz → 解压到 cache_dir(staged tempdir + atomic rename)+
+/// 写 `[plugins."name@market"] enabled = true`
+pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String> {
+    if !input.tarball_url.starts_with("https://") {
+        return Err(format!(
+            "tarball_url 必须 https(防 MITM):{}",
+            input.tarball_url
+        ));
+    }
+    for c in input.name.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(format!("plugin name '{}' 含非法字符", input.name));
+        }
+    }
+    for c in input.marketplace.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(format!("marketplace '{}' 含非法字符", input.marketplace));
+        }
+    }
+    // 下载
+    let bytes = reqwest::get(&input.tarball_url)
+        .await
+        .map_err(|e| format!("download: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("http error: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("read bytes: {e}"))?;
+    // 大小限制 50 MB
+    if bytes.len() > 50 * 1024 * 1024 {
+        return Err(format!("tarball too large(>50MB): {} bytes", bytes.len()));
+    }
+    // 解压到 staged tempdir
+    let target_dir = plugins_cache_root()?
+        .join(&input.marketplace)
+        .join(&input.name)
+        .join(&input.version);
+    let staged = target_dir.with_extension("staged.tmp");
+    if staged.exists() {
+        fs::remove_dir_all(&staged).map_err(|e| format!("clean staged: {e}"))?;
+    }
+    fs::create_dir_all(&staged).map_err(|e| format!("mkdir staged: {e}"))?;
+    let cursor = Cursor::new(&bytes[..]);
+    let decoder = flate2::read::GzDecoder::new(cursor);
+    let mut archive = tar::Archive::new(decoder);
+    // path traversal safety:tar crate 默认会拒绝绝对路径 + ..(只要不调 set_preserve_permissions(true))
+    archive.unpack(&staged).map_err(|e| format!("untar: {e}"))?;
+    // 验证 plugin.json 存在(防 marketplace 投毒)
+    let candidate_a = staged.join(".codex-plugin").join("plugin.json");
+    let candidate_b = staged.join(".claude-plugin").join("plugin.json");
+    if !candidate_a.exists() && !candidate_b.exists() {
+        // 可能 tar 内还有一层 wrapper dir,展开一次
+        if let Ok(read) = fs::read_dir(&staged) {
+            let dirs: Vec<_> = read
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.path())
+                .collect();
+            if dirs.len() == 1 {
+                let inner = &dirs[0];
+                if inner.join(".codex-plugin/plugin.json").exists()
+                    || inner.join(".claude-plugin/plugin.json").exists()
+                {
+                    // 把内层 dir 提升为 staged 内容
+                    let inner_clone = inner.clone();
+                    for entry in fs::read_dir(&inner_clone).map_err(|e| format!("flat: {e}"))? {
+                        let entry = entry.map_err(|e| format!("flat iter: {e}"))?;
+                        let from = entry.path();
+                        let to = staged.join(from.strip_prefix(&inner_clone).unwrap());
+                        fs::rename(&from, &to).map_err(|e| format!("flat mv: {e}"))?;
+                    }
+                    fs::remove_dir_all(&inner_clone).ok();
+                }
+            }
+        }
+    }
+    if !staged.join(".codex-plugin/plugin.json").exists()
+        && !staged.join(".claude-plugin/plugin.json").exists()
+    {
+        let _ = fs::remove_dir_all(&staged);
+        return Err(
+            "tarball 内未找到 .codex-plugin/plugin.json 或 .claude-plugin/plugin.json".into(),
+        );
+    }
+    // atomic rename:删旧 target_dir → mv staged
+    if target_dir.exists() {
+        fs::remove_dir_all(&target_dir).map_err(|e| format!("rm old target: {e}"))?;
+    }
+    if let Some(parent) = target_dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir target parent: {e}"))?;
+    }
+    fs::rename(&staged, &target_dir).map_err(|e| format!("rename staged: {e}"))?;
+    // 写 [plugins."name@market"] enabled = true
+    let key = format!("{}@{}", input.name, input.marketplace);
+    set_enabled(&key, true)?;
+    // 返新条目
+    let installed = list_installed()?;
+    installed
+        .into_iter()
+        .find(|e| e.key == key)
+        .ok_or_else(|| format!("install ok but not found in list: {key}"))
+}

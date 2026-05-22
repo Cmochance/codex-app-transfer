@@ -107,15 +107,6 @@
   min-height: 0;
 }
 
-#page-codex.active > .page-title {
-  margin-bottom: 14px;
-}
-
-#page-codex.active > .page-title h1 {
-  font-size: clamp(24px, 2.4vw, 32px);
-  margin-bottom: 0;
-}
-
 /* 抵消 .app-main 的 padding-bottom: 34px,让底部空隙跟左右(24px)一致。
    :has() 选择器精确命中 codex page,不影响其他 page。 */
 .app-main:has(#page-codex.active) {

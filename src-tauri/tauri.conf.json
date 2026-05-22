@@ -47,5 +47,12 @@
         ]
       }
     }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["codex-app-transfer"]
+      }
+    }
   }
 }

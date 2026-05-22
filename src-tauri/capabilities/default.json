@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "shell:allow-open",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "deep-link:default"
   ]
 }

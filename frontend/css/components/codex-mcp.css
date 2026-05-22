@@ -1,0 +1,671 @@
+/* Codex 文档管理 → MCP tab 专属布局
+   3 sub-tab(Servers form / Plugins / Marketplace),sub-nav + 内容 flex 自适应 */
+
+.codex-mcp-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.codex-mcp-subnav {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+
+.codex-mcp-subnav-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  border-bottom: 2px solid transparent;
+  border-radius: 6px 6px 0 0;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.codex-mcp-subnav-item:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.codex-mcp-subnav-item.active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.codex-mcp-subpane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Servers 2-column split ── */
+
+.codex-mcp-split {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+  margin-top: 10px;
+}
+
+.codex-mcp-list-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.codex-mcp-list-col {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: auto;
+  background: var(--surface);
+  padding: 6px;
+  flex: 1;
+  min-height: 0;
+}
+
+.codex-mcp-list-legend {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  background: var(--surface);
+}
+
+.codex-mcp-list-legend div {
+  margin-bottom: 4px;
+}
+
+.codex-mcp-list-legend div:last-child {
+  margin-bottom: 0;
+}
+
+.codex-mcp-list-legend code {
+  font-size: 11px;
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.codex-mcp-form-col {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: auto;
+  background: var(--surface);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.codex-mcp-json-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.codex-mcp-json-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.codex-mcp-json-delete {
+  color: var(--muted);
+}
+
+.codex-mcp-json-pre {
+  flex: 1;
+  min-height: 200px;
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text);
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.codex-mcp-json-area {
+  flex: 1;
+  min-height: 240px;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  resize: none;
+}
+
+.codex-mcp-json-error {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.codex-mcp-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  margin-bottom: 4px;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.codex-mcp-list-item:hover {
+  background: var(--primary-soft);
+}
+
+.codex-mcp-list-item.active {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+}
+
+.codex-mcp-list-item.disabled {
+  opacity: 0.5;
+}
+
+.codex-mcp-list-item-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  word-break: break-word;
+}
+
+.codex-mcp-list-item-meta {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* transport chip:HTTP 蓝 / Stdio 橙 */
+.codex-mcp-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.codex-mcp-chip.http {
+  background: rgba(59, 130, 246, 0.15);
+  color: #2563eb;
+}
+
+.codex-mcp-chip.stdio {
+  background: rgba(245, 158, 11, 0.15);
+  color: #d97706;
+}
+
+.codex-mcp-chip.disabled {
+  background: rgba(148, 163, 184, 0.2);
+  color: var(--muted);
+}
+
+/* form 字段密度 */
+
+.codex-mcp-form-col .form-group {
+  margin-bottom: 10px;
+}
+
+.codex-mcp-form-col .form-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+
+.codex-mcp-form-col .form-control {
+  font-size: 13px;
+  padding: 6px 10px;
+}
+
+.codex-mcp-form-col .codex-mcp-radio-row {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+
+.codex-mcp-form-col .codex-mcp-radio-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.codex-mcp-form-col .codex-mcp-advanced-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--primary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.codex-mcp-form-col .codex-mcp-advanced-pane {
+  border-top: 1px dashed var(--line);
+  margin-top: 8px;
+  padding-top: 10px;
+}
+
+.codex-mcp-empty-form {
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 32px 12px;
+}
+
+/* ── 卡片 + 可视化 form ── */
+
+.codex-mcp-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  background: var(--bg);
+}
+
+.codex-mcp-card-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.codex-mcp-required {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.codex-mcp-hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.codex-mcp-hint code {
+  background: var(--surface);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10.5px;
+}
+
+.codex-mcp-transport-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  background: var(--surface);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.codex-mcp-transport-option:hover {
+  border-color: var(--primary);
+}
+
+.codex-mcp-transport-option.selected {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.codex-mcp-transport-option input[type="radio"] {
+  margin-top: 3px;
+  cursor: pointer;
+}
+
+.codex-mcp-transport-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.codex-mcp-transport-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.codex-mcp-transport-desc {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.codex-mcp-transport-desc code {
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.codex-mcp-checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.codex-mcp-checkbox-row input[type="checkbox"] {
+  margin-top: 3px;
+  cursor: pointer;
+}
+
+.codex-mcp-checkbox-row strong {
+  font-weight: 600;
+}
+
+.codex-mcp-checkbox-row code {
+  font-size: 11px;
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.codex-mcp-arg-list,
+.codex-mcp-kv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.codex-mcp-arg-row,
+.codex-mcp-kv-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.codex-mcp-arg-row .form-control,
+.codex-mcp-kv-key,
+.codex-mcp-kv-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.codex-mcp-kv-eq {
+  color: var(--muted);
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.btn-icon-only {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 6px;
+  cursor: pointer;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-icon-only:hover {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.codex-mcp-add-row {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.codex-mcp-advanced-details {
+  margin-top: 4px;
+}
+
+.codex-mcp-advanced-details > summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--primary);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  list-style: none;
+  user-select: none;
+}
+
+.codex-mcp-advanced-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.codex-mcp-advanced-details > summary::before {
+  content: "▸ ";
+  color: var(--muted);
+}
+
+.codex-mcp-advanced-details[open] > summary::before {
+  content: "▾ ";
+}
+
+/* ── Plugins list ── */
+
+.codex-mcp-plugin-list {
+  list-style: none;
+  padding: 0;
+  margin: 10px 0 0;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.codex-mcp-plugin-item {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  background: var(--surface);
+}
+
+.codex-mcp-plugin-item-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.codex-mcp-plugin-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.codex-mcp-plugin-version {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.codex-mcp-plugin-desc {
+  font-size: 13px;
+  color: var(--text);
+  margin: 6px 0;
+  word-break: break-word;
+}
+
+.codex-mcp-plugin-caps {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 4px 0;
+}
+
+.codex-mcp-plugin-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* ── Marketplace ── */
+
+.codex-mcp-sources-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+
+.codex-mcp-source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--surface);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.codex-mcp-source-chip.active {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.codex-mcp-source-chip.disabled {
+  opacity: 0.5;
+}
+
+.codex-mcp-source-remove {
+  background: none;
+  border: none;
+  padding: 0;
+  margin-left: 2px;
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.codex-mcp-marketplace-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  align-items: center;
+}
+
+.codex-mcp-marketplace-toolbar .form-control {
+  flex: 1;
+  font-size: 13px;
+}
+
+.codex-mcp-section-title {
+  font-size: 14px;
+  font-weight: 700;
+  margin: 10px 0 6px;
+  color: var(--text);
+}
+
+.codex-mcp-market-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 10px;
+}
+
+.codex-mcp-market-item {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  background: var(--surface);
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.codex-mcp-market-item-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.codex-mcp-market-item-name {
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.codex-mcp-market-item-desc {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+  word-break: break-word;
+}
+
+.codex-mcp-market-item-action {
+  flex-shrink: 0;
+}
+
+.codex-mcp-market-source-tag {
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
+.codex-mcp-market-error {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--danger);
+  margin-bottom: 8px;
+}
