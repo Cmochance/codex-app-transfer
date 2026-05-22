@@ -202,8 +202,13 @@ pub async fn restore_raw(
             return err(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")).into_response();
         }
     }
-    if let Err(e) = fs::write(&target, &restore_content) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
+    // atomic tmp+rename 防 crash 中段留 partial SKILL.md
+    let tmp = target.with_extension("md.tmp");
+    if let Err(e) = fs::write(&tmp, &restore_content) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write tmp: {e}")).into_response();
+    }
+    if let Err(e) = fs::rename(&tmp, &target) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
     }
     Json(json!({"success": true})).into_response()
 }

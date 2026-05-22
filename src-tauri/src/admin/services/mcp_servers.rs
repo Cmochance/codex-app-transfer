@@ -428,7 +428,10 @@ pub fn restore_from_history(index: usize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
-    fs::write(&path, content).map_err(|e| format!("write: {e}"))?;
+    // atomic tmp+rename 防 crash 中段留 partial config.toml(否则下次 codex 启动炸)
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, content).map_err(|e| format!("write tmp: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
 }
 
