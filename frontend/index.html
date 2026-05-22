@@ -626,26 +626,38 @@
             <pre class="code-block" id="codexBlockPreviewArea" hidden style="margin-top: 16px; max-height: 400px; overflow: auto;"></pre>
           </div>
 
-          <!-- Skills 独立 UI (list + backup / restore) -->
-          <div class="codex-skills-tab codex-pane" id="codexSkillsTab" data-codex-pane="skills" hidden>
-            <div class="codex-status info-box" id="codexSkillsStatus" style="margin-top: 16px;">
-              <i class="bi bi-info-circle"></i>
-              <p><span data-i18n="codex.statusLoading">状态加载中…</span></p>
+          <!-- Skills tab raw 模式(SKILL.md preview/edit + 打开文件夹) -->
+          <div class="codex-agents-raw-tab codex-pane" id="codexSkillsRawTab" data-codex-pane="skills-raw" hidden>
+            <div class="codex-agents-paths" id="codexSkillsPaths">
+              <div class="codex-path-picker" id="codexSkillsPathPicker">
+                <button class="codex-path-picker-toggle" type="button" id="codexSkillsPathToggle">
+                  <span class="codex-path-picker-current">
+                    <span class="codex-path-empty" data-i18n="codex.skillsLoading">扫描 ~/.codex/skills/…</span>
+                  </span>
+                  <i class="bi bi-chevron-down codex-path-picker-caret"></i>
+                </button>
+                <ul class="codex-path-picker-menu" id="codexSkillsPathMenu" hidden role="listbox"></ul>
+              </div>
+              <button class="btn btn-outline-primary codex-agents-path-add" type="button" data-action="codex-skills-reveal" id="codexSkillsRevealBtn" title="打开当前 skill 所在目录">
+                <i class="bi bi-folder2-open"></i>
+                <span data-i18n="codex.skillsReveal">打开文件夹</span>
+              </button>
             </div>
 
-            <div class="form-group" style="margin-top: 16px;">
-              <label class="form-label" data-i18n="codex.skillsList">已安装 skill</label>
-              <ul id="codexSkillsList" style="list-style: none; padding: 0; max-height: 280px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 8px;"></ul>
+            <div class="codex-agents-warning" style="margin-top: 10px;">
+              <i class="bi bi-exclamation-triangle-fill"></i>
+              <span data-i18n="codex.skillsWarn">SKILL.md 决定 AI 是否找到 / 用对工具,请谨慎修改;其他子文件请通过"打开文件夹"在 Finder 编辑</span>
             </div>
 
-            <div class="button-row">
-              <button class="btn btn-primary" type="button" data-action="codex-skills-backup"><i class="bi bi-archive"></i><span data-i18n="codex.skillsBackup">Backup now</span></button>
-              <button class="btn btn-outline-primary" type="button" data-action="codex-skills-refresh"><i class="bi bi-arrow-clockwise"></i><span data-i18n="codex.skillsRefresh">Refresh</span></button>
-            </div>
+            <pre class="codex-agents-preview" id="codexSkillsPreview" style="margin-top: 10px;"></pre>
+            <textarea class="form-control codex-agents-edit" id="codexSkillsEdit" hidden style="margin-top: 10px;"></textarea>
 
-            <div class="form-group" style="margin-top: 16px;">
-              <label class="form-label" data-i18n="codex.skillsBackups">已有备份(tar.gz, 最新在上)</label>
-              <ul id="codexSkillsBackupsList" style="list-style: none; padding: 0;"></ul>
+            <div class="button-row" style="margin-top: 10px;">
+              <button class="btn btn-primary" type="button" data-action="codex-skills-edit-start" id="codexSkillsEditBtn"><i class="bi bi-pencil"></i><span data-i18n="codex.agentsEdit">Edit</span></button>
+              <button class="btn btn-outline-primary" type="button" data-action="codex-skills-backup-md" id="codexSkillsBackupBtn"><i class="bi bi-archive"></i><span data-i18n="codex.agentsBackup">Backup</span></button>
+              <button class="btn btn-primary" type="button" data-action="codex-skills-apply" id="codexSkillsApplyBtn" hidden><i class="bi bi-check2-circle"></i><span data-i18n="codex.apply">Apply</span></button>
+              <button class="btn btn-outline-danger" type="button" data-action="codex-skills-cancel" id="codexSkillsCancelBtn" hidden><i class="bi bi-x"></i><span data-i18n="codex.agentsCancel">Cancel</span></button>
+              <button class="btn btn-outline-primary" type="button" data-action="codex-skills-history-toggle"><i class="bi bi-clock-history"></i><span data-i18n="codex.history">History</span></button>
             </div>
           </div>
           </article>

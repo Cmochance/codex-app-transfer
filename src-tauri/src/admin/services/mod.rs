@@ -9,3 +9,4 @@ pub mod desktop;
 pub mod managed_block;
 pub mod memories_md_paths;
 pub mod skills_backup;
+pub mod skills_md_paths;

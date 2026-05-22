@@ -2893,6 +2893,24 @@
       if (action === "codex-memories-history-toggle") {
         await codexMemoriesToggleHistory();
       }
+      if (action === "codex-skills-edit-start") {
+        await codexSkillsOnEditStart();
+      }
+      if (action === "codex-skills-apply") {
+        await codexSkillsOnApply();
+      }
+      if (action === "codex-skills-cancel") {
+        codexSkillsOnCancel();
+      }
+      if (action === "codex-skills-backup-md") {
+        await codexSkillsOnBackup();
+      }
+      if (action === "codex-skills-history-toggle") {
+        await codexSkillsToggleHistory();
+      }
+      if (action === "codex-skills-reveal") {
+        await codexSkillsOnReveal();
+      }
       if (action === "codex-add-path-cancel") {
         codexAgentsClosePathModal();
       }
@@ -2923,19 +2941,6 @@
       if (action === "codex-history-restore") {
         await codexHistoryRestore();
       }
-      if (action === "codex-skills-backup") {
-        await codexSkillsBackup();
-      }
-      if (action === "codex-skills-refresh") {
-        await codexSkillsLoadAndRender();
-      }
-      if (action === "codex-skills-restore") {
-        const filename = actionEl.dataset.filename;
-        if (!filename) return;
-        if (window.confirm(tFmt("codex.confirmSkillsRestore", { filename }))) {
-          await codexSkillsRestore(filename);
-        }
-      }
     } catch (error) {
       console.error(error);
       showToast(error.message || t("toast.requestFailed"));
@@ -2948,20 +2953,27 @@
   let currentAgentsHash = null;
   /** 当前选中的 MEMORY.md 路径 hash */
   let currentMemoriesHash = null;
-  /** Add modal / History modal 当前服务的 resource("agents" / "memories")*/
+  /** 当前选中的 SKILL.md 路径 hash */
+  let currentSkillsHash = null;
+  /** Add modal / History modal 当前服务的 resource("agents" / "memories" / "skills")*/
   let codexDocActiveResource = "agents";
 
   /** resource → API base */
   function codexDocApiBase(resource) {
-    return resource === "memories" ? "/api/codex/memories-md" : "/api/codex/agents-md";
+    if (resource === "memories") return "/api/codex/memories-md";
+    if (resource === "skills") return "/api/codex/skills-md";
+    return "/api/codex/agents-md";
   }
 
   /** resource → 当前 hash */
   function codexDocCurrentHash(resource) {
-    return resource === "memories" ? currentMemoriesHash : currentAgentsHash;
+    if (resource === "memories") return currentMemoriesHash;
+    if (resource === "skills") return currentSkillsHash;
+    return currentAgentsHash;
   }
   function codexDocSetCurrentHash(resource, hash) {
     if (resource === "memories") currentMemoriesHash = hash;
+    else if (resource === "skills") currentSkillsHash = hash;
     else currentAgentsHash = hash;
   }
 
@@ -3401,13 +3413,19 @@
   /** entry label:"项目名 / 子目录路径 · YYYY-MM-DD HH:MM:SS" — 项目 / 子目录从当前 active resource 的 path 推断 */
   function codexHistoryEntryLabel(entry) {
     const resource = codexDocActiveResource;
-    const cache = resource === "memories" ? codexMemoriesEntriesCache : codexAgentsEntriesCache;
-    const hash = resource === "memories" ? currentMemoriesHash : currentAgentsHash;
+    const cache =
+      resource === "memories" ? codexMemoriesEntriesCache :
+      resource === "skills" ? codexSkillsEntriesCache : codexAgentsEntriesCache;
+    const hash =
+      resource === "memories" ? currentMemoriesHash :
+      resource === "skills" ? currentSkillsHash : currentAgentsHash;
     const cur = cache.find((e) => e.hash === hash);
     const ts = new Date(entry.timestamp * 1000).toLocaleString();
     let prefix = "";
     if (cur) {
-      if (cur.category === "global") {
+      if (resource === "skills") {
+        prefix = cur.name || "?";
+      } else if (cur.category === "global") {
         prefix = t("codex.agentsPath.global");
       } else if (cur.category === "project-root") {
         prefix = cur.projectName || "?";
@@ -3462,6 +3480,8 @@
     const oldContent =
       codexDocActiveResource === "memories"
         ? codexMemoriesLastFullContent || ""
+        : codexDocActiveResource === "skills"
+        ? codexSkillsLastFullContent || ""
         : codexAgentsLastFullContent || "";
     const diff = codexLineDiff(oldContent, newContent);
     pre.removeAttribute("data-empty-hint");
@@ -3551,6 +3571,7 @@
       showToast(t("codex.agentsRestoreOk"));
       codexHistoryClose();
       if (resource === "memories") await codexMemoriesRawLoadAndRender();
+      else if (resource === "skills") await codexSkillsRawLoadAndRender();
       else await codexAgentsRawLoadAndRender();
     } catch (e) {
       showToast(e.message || t("toast.requestFailed"));
@@ -3803,6 +3824,203 @@
     await codexHistoryOpen();
   }
 
+  // ── Skills 镜像 Agents/Memories,扫 ~/.codex/skills/<name>/SKILL.md ──
+
+  let codexSkillsEntriesCache = [];
+  let codexSkillsMode = "preview";
+  let codexSkillsLastFullContent = "";
+
+  /** skill chip:只显 skill 名(绿)*/
+  function codexSkillsChipsHtml(entry) {
+    return `<span class="codex-path-chip codex-path-chip-project-root">${escapeHtml(entry.name)}</span>`;
+  }
+
+  function codexSkillsRenderToggle() {
+    const cur = $("#codexSkillsPathPicker .codex-path-picker-current");
+    if (!cur) return;
+    const entry = codexSkillsEntriesCache.find((e) => e.hash === currentSkillsHash);
+    if (!entry) {
+      cur.innerHTML = `<span class="codex-path-empty">${escapeHtml(t("codex.skillsEmpty"))}</span>`;
+      return;
+    }
+    cur.innerHTML = `${codexSkillsChipsHtml(entry)}<span class="codex-path-text" title="${escapeHtml(entry.path)}">${escapeHtml(entry.path)}</span>`;
+  }
+
+  function codexSkillsRenderMenu() {
+    const menu = $("#codexSkillsPathMenu");
+    if (!menu) return;
+    if (codexSkillsEntriesCache.length === 0) {
+      menu.innerHTML = `<li class="codex-path-picker-item" aria-disabled="true"><span class="codex-path-empty">${escapeHtml(t("codex.skillsEmpty"))}</span></li>`;
+      return;
+    }
+    menu.innerHTML = codexSkillsEntriesCache
+      .map((e) => {
+        const selected = e.hash === currentSkillsHash ? " selected" : "";
+        return `<li class="codex-path-picker-item${selected}" role="option" data-hash="${escapeHtml(e.hash)}" data-kind="${escapeHtml(e.kind)}">
+          ${codexSkillsChipsHtml(e)}
+          <span class="codex-path-text" title="${escapeHtml(e.path)}">${escapeHtml(e.path)}</span>
+        </li>`;
+      })
+      .join("");
+  }
+
+  async function codexSkillsReloadPaths() {
+    try {
+      const r = await fetch("/api/codex/skills-md/paths");
+      if (!r.ok) throw new Error("skills paths request failed");
+      const j = await r.json();
+      codexSkillsEntriesCache = j.entries || [];
+      if (
+        !currentSkillsHash ||
+        !codexSkillsEntriesCache.some((e) => e.hash === currentSkillsHash)
+      ) {
+        currentSkillsHash = codexSkillsEntriesCache[0]?.hash || null;
+      }
+      codexSkillsRenderToggle();
+      codexSkillsRenderMenu();
+      return codexSkillsEntriesCache;
+    } catch (e) {
+      console.error("codexSkillsReloadPaths:", e);
+      codexSkillsEntriesCache = [];
+      codexSkillsRenderToggle();
+      codexSkillsRenderMenu();
+      return [];
+    }
+  }
+
+  async function codexSkillsSelectHash(hash) {
+    if (!hash) return;
+    currentSkillsHash = hash;
+    codexSkillsRenderToggle();
+    codexSkillsRenderMenu();
+    codexSkillsClosePicker();
+    try {
+      await codexSkillsRawLoadAndRender();
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  function codexSkillsOpenPicker() {
+    const picker = $("#codexSkillsPathPicker");
+    const menu = $("#codexSkillsPathMenu");
+    if (!picker || !menu) return;
+    if (codexSkillsEntriesCache.length === 0) return;
+    picker.classList.add("open");
+    menu.hidden = false;
+  }
+  function codexSkillsClosePicker() {
+    const picker = $("#codexSkillsPathPicker");
+    const menu = $("#codexSkillsPathMenu");
+    if (!picker || !menu) return;
+    picker.classList.remove("open");
+    menu.hidden = true;
+  }
+  function codexSkillsTogglePicker() {
+    const picker = $("#codexSkillsPathPicker");
+    if (!picker) return;
+    if (picker.classList.contains("open")) codexSkillsClosePicker();
+    else codexSkillsOpenPicker();
+  }
+
+  async function codexSkillsRawLoadAndRender() {
+    const pre = $("#codexSkillsPreview");
+    const ta = $("#codexSkillsEdit");
+    if (!pre || !ta) return;
+    codexSkillsSwitchMode("preview");
+    if (!currentSkillsHash) {
+      pre.textContent = "";
+      pre.setAttribute("data-empty-hint", t("codex.skillsEmpty"));
+      ta.value = "";
+      codexSkillsLastFullContent = "";
+      return;
+    }
+    try {
+      const r = await fetch(`/api/codex/skills-md/raw?hash=${encodeURIComponent(currentSkillsHash)}`);
+      if (!r.ok) throw new Error("raw fetch failed");
+      const j = await r.json();
+      codexSkillsLastFullContent = j.content || "";
+      pre.textContent = codexSkillsLastFullContent;
+      pre.removeAttribute("data-empty-hint");
+      ta.value = codexSkillsLastFullContent;
+    } catch (e) {
+      pre.textContent = "";
+      pre.setAttribute("data-empty-hint", `读取失败: ${e.message || e}`);
+    }
+  }
+
+  function codexSkillsSwitchMode(mode) {
+    codexSkillsMode = mode;
+    const pre = $("#codexSkillsPreview");
+    const ta = $("#codexSkillsEdit");
+    const editBtn = $("#codexSkillsEditBtn");
+    const backupBtn = $("#codexSkillsBackupBtn");
+    const applyBtn = $("#codexSkillsApplyBtn");
+    const cancelBtn = $("#codexSkillsCancelBtn");
+    if (mode === "edit") {
+      if (pre) pre.hidden = true;
+      if (ta) { ta.hidden = false; ta.value = codexSkillsLastFullContent; }
+      if (editBtn) editBtn.hidden = true;
+      if (backupBtn) backupBtn.hidden = true;
+      if (applyBtn) applyBtn.hidden = false;
+      if (cancelBtn) cancelBtn.hidden = false;
+    } else {
+      if (pre) pre.hidden = false;
+      if (ta) ta.hidden = true;
+      if (editBtn) editBtn.hidden = false;
+      if (backupBtn) backupBtn.hidden = false;
+      if (applyBtn) applyBtn.hidden = true;
+      if (cancelBtn) cancelBtn.hidden = true;
+    }
+  }
+
+  async function codexSkillsOnEditStart() {
+    if (!currentSkillsHash) { showToast(t("codex.skillsEmpty")); return; }
+    codexSkillsSwitchMode("edit");
+    setTimeout(() => $("#codexSkillsEdit")?.focus(), 50);
+  }
+
+  async function codexSkillsOnApply() {
+    if (!currentSkillsHash) return;
+    const ta = $("#codexSkillsEdit");
+    const content = ta?.value ?? "";
+    try {
+      const r = await fetch(`/api/codex/skills-md/raw?hash=${encodeURIComponent(currentSkillsHash)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      });
+      if (!r.ok) { const err = await r.json().catch(() => ({})); throw new Error(err.error || "write failed"); }
+      showToast(t("codex.agentsApplyOk"));
+      await codexSkillsRawLoadAndRender();
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  function codexSkillsOnCancel() { codexSkillsSwitchMode("preview"); }
+
+  async function codexSkillsOnBackup() {
+    if (!currentSkillsHash) { showToast(t("codex.skillsEmpty")); return; }
+    try {
+      const r = await fetch(`/api/codex/skills-md/backup?hash=${encodeURIComponent(currentSkillsHash)}`, { method: "POST" });
+      if (!r.ok) { const err = await r.json().catch(() => ({})); throw new Error(err.error || "backup failed"); }
+      showToast(t("codex.agentsBackupOk"));
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
+  async function codexSkillsToggleHistory() {
+    codexDocActiveResource = "skills";
+    await codexHistoryOpen();
+  }
+
+  /** 打开当前 skill 所在目录(macOS:open / Linux:xdg-open / Windows:explorer)*/
+  async function codexSkillsOnReveal() {
+    if (!currentSkillsHash) { showToast(t("codex.skillsEmpty")); return; }
+    try {
+      const r = await fetch(`/api/codex/skills-md/reveal?hash=${encodeURIComponent(currentSkillsHash)}`, { method: "POST" });
+      if (!r.ok) { const err = await r.json().catch(() => ({})); throw new Error(err.error || "open dir failed"); }
+    } catch (e) { showToast(e.message || t("toast.requestFailed")); }
+  }
+
   async function codexBlockLoadAndRender(type) {
     const status = await codexBlockFetchStatus(type);
     const el = $("#codexBlockStatus");
@@ -4006,8 +4224,8 @@
   function codexShowTab(tab) {
     const agentsPane = $("#codexAgentsRawTab");
     const memoriesPane = $("#codexMemoriesRawTab");
+    const skillsRawPane = $("#codexSkillsRawTab");
     const blockPane = $("#codexBlockTab");
-    const skillsPane = $("#codexSkillsTab");
     if (agentsPane) {
       agentsPane.hidden = tab !== "agents";
       agentsPane.classList.toggle("active", tab === "agents");
@@ -4016,14 +4234,14 @@
       memoriesPane.hidden = tab !== "memories";
       memoriesPane.classList.toggle("active", tab === "memories");
     }
+    if (skillsRawPane) {
+      skillsRawPane.hidden = tab !== "skills";
+      skillsRawPane.classList.toggle("active", tab === "skills");
+    }
     const wantBlock = tab === "mcp";
     if (blockPane) {
       blockPane.hidden = !wantBlock;
       blockPane.classList.toggle("active", wantBlock);
-    }
-    if (skillsPane) {
-      skillsPane.hidden = tab !== "skills";
-      skillsPane.classList.toggle("active", tab === "skills");
     }
     // 切 tab 时收起 marker pane 的 History 跟 Preview 区域
     const historyEl = $("#codexBlockHistory");
@@ -4033,6 +4251,7 @@
     // 切 tab 时把非当前 tab 的 Edit 模式回退 preview
     if (tab !== "agents") codexAgentsSwitchMode("preview");
     if (tab !== "memories") codexMemoriesSwitchMode("preview");
+    if (tab !== "skills") codexSkillsSwitchMode("preview");
 
     // sidebar item active state
     $all("#codexSidebar .codex-sidebar-item").forEach((btn) => {
@@ -4043,7 +4262,8 @@
   /** lazy load + 状态 badge 刷新 (sidebar 上各 item 显 ✓ / 数字) */
   async function codexLoadTab(tab) {
     if (tab === "skills") {
-      await codexSkillsLoadAndRender();
+      await codexSkillsReloadPaths();
+      await codexSkillsRawLoadAndRender();
     } else if (tab === "agents") {
       await codexAgentsReloadPaths();
       await codexAgentsRawLoadAndRender();
@@ -4059,11 +4279,11 @@
   /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
   async function codexRefreshSidebarBadges() {
     try {
-      const [agentsPaths, memPaths, mcp, skills] = await Promise.all([
+      const [agentsPaths, memPaths, mcp, skillsPaths] = await Promise.all([
         fetch("/api/codex/agents-md/paths").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/memories-md/paths").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/mcp-toml/status").then((r) => (r.ok ? r.json() : null)),
-        fetch("/api/codex/skills/list").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/skills-md/paths").then((r) => (r.ok ? r.json() : null)),
       ]);
       const setBadge = (id, text) => {
         const el = $(id);
@@ -4071,10 +4291,11 @@
       };
       const agentsCount = agentsPaths?.entries?.length || 0;
       const memCount = memPaths?.entries?.length || 0;
+      const skillsCount = skillsPaths?.entries?.length || 0;
       setBadge("#codexSidebarBadge-agents", agentsCount > 0 ? String(agentsCount) : "—");
       setBadge("#codexSidebarBadge-memories", memCount > 0 ? String(memCount) : "—");
       setBadge("#codexSidebarBadge-mcp", mcp?.hasManaged ? "ON" : "—");
-      setBadge("#codexSidebarBadge-skills", skills?.count != null ? String(skills.count) : "—");
+      setBadge("#codexSidebarBadge-skills", skillsCount > 0 ? String(skillsCount) : "—");
     } catch {
       // best-effort, 静默
     }
@@ -4119,10 +4340,12 @@
         if (aPicker && !aPicker.contains(e.target)) codexAgentsClosePicker();
         const mPicker = $("#codexMemoriesPathPicker");
         if (mPicker && !mPicker.contains(e.target)) codexMemoriesClosePicker();
+        const sPicker = $("#codexSkillsPathPicker");
+        if (sPicker && !sPicker.contains(e.target)) codexSkillsClosePicker();
       });
     }
 
-    // Memories picker:toggle + menu item click
+    // Memories picker
     const memToggle = $("#codexMemoriesPathToggle");
     const memMenu = $("#codexMemoriesPathMenu");
     if (memToggle && !memToggle.dataset.bound) {
@@ -4139,6 +4362,26 @@
         if (!li || li.getAttribute("aria-disabled") === "true") return;
         const hash = li.dataset.hash;
         if (hash) codexMemoriesSelectHash(hash);
+      });
+    }
+
+    // Skills picker
+    const skToggle = $("#codexSkillsPathToggle");
+    const skMenu = $("#codexSkillsPathMenu");
+    if (skToggle && !skToggle.dataset.bound) {
+      skToggle.dataset.bound = "1";
+      skToggle.addEventListener("click", (e) => {
+        e.stopPropagation();
+        codexSkillsTogglePicker();
+      });
+    }
+    if (skMenu && !skMenu.dataset.bound) {
+      skMenu.dataset.bound = "1";
+      skMenu.addEventListener("click", (e) => {
+        const li = e.target.closest(".codex-path-picker-item");
+        if (!li || li.getAttribute("aria-disabled") === "true") return;
+        const hash = li.dataset.hash;
+        if (hash) codexSkillsSelectHash(hash);
       });
     }
 

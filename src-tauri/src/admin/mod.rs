@@ -306,6 +306,31 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/skills/restore",
             post(handlers::skills::restore_handler),
         )
+        // Skills SKILL.md raw 编辑 + 打开文件夹(新)
+        .route(
+            "/api/codex/skills-md/paths",
+            get(handlers::skills_md::list_paths),
+        )
+        .route(
+            "/api/codex/skills-md/raw",
+            get(handlers::skills_md::raw_get).post(handlers::skills_md::raw_write),
+        )
+        .route(
+            "/api/codex/skills-md/backup",
+            post(handlers::skills_md::backup),
+        )
+        .route(
+            "/api/codex/skills-md/restore-raw",
+            post(handlers::skills_md::restore_raw),
+        )
+        .route(
+            "/api/codex/skills-md/history",
+            get(handlers::skills_md::history),
+        )
+        .route(
+            "/api/codex/skills-md/reveal",
+            post(handlers::skills_md::reveal),
+        )
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)

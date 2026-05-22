@@ -23,4 +23,5 @@ pub mod providers;
 pub mod proxy;
 pub mod settings;
 pub mod skills;
+pub mod skills_md;
 pub mod update;
