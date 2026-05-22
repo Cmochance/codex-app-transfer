@@ -3512,7 +3512,13 @@
     const hash = codexDocCurrentHash(resource);
     if (!hash) {
       showToast(
-        t(resource === "memories" ? "codex.memoriesPathEmpty" : "codex.agentsPathEmpty"),
+        t(
+          resource === "memories"
+            ? "codex.memoriesPathEmpty"
+            : resource === "skills"
+            ? "codex.skillsEmpty"
+            : "codex.agentsPathEmpty",
+        ),
       );
       return;
     }
