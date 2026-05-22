@@ -385,7 +385,12 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
         .join(&input.marketplace)
         .join(&input.name)
         .join(&input.version);
-    let staged = target_dir.with_extension("staged.tmp");
+    // 不用 with_extension — 版本号 "1.0.0" 含点,with_extension 会替换最后段 ".0" →
+    // "1.0.staged.tmp",跟 "1.0.1" 撞 staged path。改成显式拼父目录 + "<ver>.staged.tmp"。
+    let staged = target_dir
+        .parent()
+        .ok_or_else(|| "target_dir 无父目录".to_owned())?
+        .join(format!("{}.staged.tmp", input.version));
     if staged.exists() {
         fs::remove_dir_all(&staged).map_err(|e| format!("clean staged: {e}"))?;
     }
