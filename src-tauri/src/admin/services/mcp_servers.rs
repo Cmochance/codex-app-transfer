@@ -171,12 +171,26 @@ fn parse_server_table(name: &str, tbl: &Table) -> Option<McpServerSpec> {
                 .collect::<Vec<_>>()
         })
     };
+    // env / http_headers 既可能写成 inline table `env = { K = "V" }`,也可能写成
+    // regular table `[mcp_servers.foo.env]\nK = "V"`。两种 toml_edit 类型不同,
+    // 都要支持(否则 user-edit-and-save 会丢字段)
     let s_map_str = |k: &str| {
-        tbl.get(k).and_then(|v| v.as_inline_table()).map(|t| {
-            t.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.to_owned(), s.to_owned())))
-                .collect::<HashMap<_, _>>()
-        })
+        let item = tbl.get(k)?;
+        if let Some(t) = item.as_inline_table() {
+            return Some(
+                t.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.to_owned(), s.to_owned())))
+                    .collect::<HashMap<_, _>>(),
+            );
+        }
+        if let Some(t) = item.as_table() {
+            return Some(
+                t.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.to_owned(), s.to_owned())))
+                    .collect::<HashMap<_, _>>(),
+            );
+        }
+        None
     };
     Some(McpServerSpec {
         name: name.to_owned(),

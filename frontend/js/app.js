@@ -3968,7 +3968,7 @@
     menu.innerHTML = codexSkillsEntriesCache
       .map((e) => {
         const selected = e.hash === currentSkillsHash ? " selected" : "";
-        return `<li class="codex-path-picker-item${selected}" role="option" data-hash="${escapeHtml(e.hash)}" data-kind="${escapeHtml(e.kind)}">
+        return `<li class="codex-path-picker-item${selected}" role="option" data-hash="${escapeHtml(e.hash)}">
           ${codexSkillsChipsHtml(e)}
           <span class="codex-path-text" title="${escapeHtml(e.path)}">${escapeHtml(e.path)}</span>
         </li>`;

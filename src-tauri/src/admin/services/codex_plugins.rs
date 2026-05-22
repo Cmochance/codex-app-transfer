@@ -285,11 +285,12 @@ pub fn uninstall(key: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct InstallInput {
     pub name: String,
     pub marketplace: String,
     pub version: String,
-    /// HTTPS URL,必须 https 防 MITM
+    /// HTTPS URL,必须 https 防 MITM(JSON 接 camelCase `tarballUrl`)
     pub tarball_url: String,
 }
 
@@ -310,6 +311,15 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
     for c in input.marketplace.chars() {
         if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
             return Err(format!("marketplace '{}' 含非法字符", input.marketplace));
+        }
+    }
+    // version 也必须做 char 校验 — deeplink path 直接拼进 cache 目录,防 `../` traversal
+    if input.version.is_empty() {
+        return Err("version 不能为空".into());
+    }
+    for c in input.version.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(format!("version '{}' 含非法字符", input.version));
         }
     }
     // 下载
