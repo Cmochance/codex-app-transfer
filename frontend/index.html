@@ -491,8 +491,7 @@
 
       <section class="page" id="page-codex" data-page="codex">
         <header class="page-title">
-          <h1 data-i18n="codex.title">Codex 资产管理</h1>
-          <p data-i18n="codex.subtitle">管 Codex CLI 全局 AGENTS.md / config.toml MCP / Skills 等。借鉴 borawong/AiMaMi — Agents/MCP 用 marker 受管块, Skills 用 file-level tar.gz 备份/还原。</p>
+          <h1 data-i18n="codex.title">Codex 文档管理</h1>
         </header>
 
         <div class="codex-layout">
@@ -500,18 +499,18 @@
           <nav class="codex-sidebar" id="codexSidebar" aria-label="Codex assets">
             <button type="button" class="codex-sidebar-item active" data-codex-tab="agents">
               <i class="bi bi-file-text"></i>
-              <span data-i18n="codex.tabAgents">AGENTS.md</span>
+              <span data-i18n="codex.tabAgents">Agents</span>
               <small class="codex-sidebar-badge" id="codexSidebarBadge-agents"></small>
-            </button>
-            <button type="button" class="codex-sidebar-item" data-codex-tab="mcp">
-              <i class="bi bi-plug"></i>
-              <span data-i18n="codex.tabMcp">MCP servers</span>
-              <small class="codex-sidebar-badge" id="codexSidebarBadge-mcp"></small>
             </button>
             <button type="button" class="codex-sidebar-item" data-codex-tab="memories">
               <i class="bi bi-journal-text"></i>
               <span data-i18n="codex.tabMemories">Memories</span>
               <small class="codex-sidebar-badge" id="codexSidebarBadge-memories"></small>
+            </button>
+            <button type="button" class="codex-sidebar-item" data-codex-tab="mcp">
+              <i class="bi bi-plug"></i>
+              <span data-i18n="codex.tabMcp">MCP</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-mcp"></small>
             </button>
             <button type="button" class="codex-sidebar-item" data-codex-tab="skills">
               <i class="bi bi-collection"></i>
@@ -521,8 +520,87 @@
           </nav>
 
           <article class="panel codex-content" id="codex-assets-panel">
-          <!-- block tab (Agents + MCP 共享 marker 模式 UI: textarea + 4 button + history) -->
-          <div class="codex-block-tab codex-pane active" id="codexBlockTab" data-codex-pane="block">
+          <!-- Agents tab 独立 raw 模式 pane(Preview/Edit + Backup + History) -->
+          <div class="codex-agents-raw-tab codex-pane active" id="codexAgentsRawTab" data-codex-pane="agents-raw">
+            <!-- AGENTS.md 路径 picker -->
+            <div class="codex-agents-paths" id="codexAgentsPaths">
+              <div class="codex-path-picker" id="codexAgentsPathPicker">
+                <button class="codex-path-picker-toggle" type="button" id="codexAgentsPathToggle">
+                  <span class="codex-path-picker-current">
+                    <span class="codex-path-empty" data-i18n="codex.agentsPathEmpty">未检测到 AGENTS.md,请通过右侧"添加"按钮指定</span>
+                  </span>
+                  <i class="bi bi-chevron-down codex-path-picker-caret"></i>
+                </button>
+                <ul class="codex-path-picker-menu" id="codexAgentsPathMenu" hidden role="listbox"></ul>
+              </div>
+              <button class="btn btn-outline-primary codex-agents-path-add" type="button" data-action="codex-agents-path-add" title="添加自定义 AGENTS.md 路径">
+                <i class="bi bi-plus-lg"></i>
+                <span data-i18n="codex.agentsPathAdd">添加</span>
+              </button>
+              <button class="btn btn-outline-danger codex-agents-path-remove" type="button" data-action="codex-agents-path-remove" id="codexAgentsPathRemoveBtn" hidden title="删除当前选中的自定义路径">
+                <i class="bi bi-trash"></i>
+              </button>
+            </div>
+
+            <!-- 警告 banner -->
+            <div class="codex-agents-warning" style="margin-top: 10px;">
+              <i class="bi bi-exclamation-triangle-fill"></i>
+              <span data-i18n="codex.agentsWarn">AGENTS.md 会严重影响 AI 的行为,请谨慎修改</span>
+            </div>
+
+            <!-- Preview 全文(read-only pre) -->
+            <pre class="codex-agents-preview" id="codexAgentsPreview" style="margin-top: 10px;"></pre>
+
+            <!-- Edit 模式 textarea(默认 hidden,Edit 后显示) -->
+            <textarea class="form-control codex-agents-edit" id="codexAgentsEdit" hidden style="margin-top: 10px;"></textarea>
+
+            <!-- 按钮 row -->
+            <div class="button-row" style="margin-top: 10px;">
+              <!-- Preview mode buttons -->
+              <button class="btn btn-primary" type="button" data-action="codex-agents-edit-start" id="codexAgentsEditBtn"><i class="bi bi-pencil"></i><span data-i18n="codex.agentsEdit">Edit</span></button>
+              <button class="btn btn-outline-primary" type="button" data-action="codex-agents-backup" id="codexAgentsBackupBtn"><i class="bi bi-archive"></i><span data-i18n="codex.agentsBackup">Backup</span></button>
+              <!-- Edit mode buttons(默认 hidden) -->
+              <button class="btn btn-primary" type="button" data-action="codex-agents-apply" id="codexAgentsApplyBtn" hidden><i class="bi bi-check2-circle"></i><span data-i18n="codex.apply">Apply</span></button>
+              <button class="btn btn-outline-danger" type="button" data-action="codex-agents-cancel" id="codexAgentsCancelBtn" hidden><i class="bi bi-x"></i><span data-i18n="codex.agentsCancel">Cancel</span></button>
+              <!-- History 两种 mode 都显示 -->
+              <button class="btn btn-outline-primary" type="button" data-action="codex-agents-history-toggle"><i class="bi bi-clock-history"></i><span data-i18n="codex.history">History</span></button>
+            </div>
+
+          </div>
+
+          <!-- Memories tab 独立 raw 模式 pane(跟 Agents 一致,但不显示全局首条) -->
+          <div class="codex-agents-raw-tab codex-pane" id="codexMemoriesRawTab" data-codex-pane="memories-raw" hidden>
+            <div class="codex-agents-paths" id="codexMemoriesPaths">
+              <div class="codex-path-picker" id="codexMemoriesPathPicker">
+                <button class="codex-path-picker-toggle" type="button" id="codexMemoriesPathToggle">
+                  <span class="codex-path-picker-current">
+                    <span class="codex-path-empty" data-i18n="codex.memoriesLoading">加载中…</span>
+                  </span>
+                  <i class="bi bi-chevron-down codex-path-picker-caret"></i>
+                </button>
+                <ul class="codex-path-picker-menu" id="codexMemoriesPathMenu" hidden role="listbox"></ul>
+              </div>
+            </div>
+
+            <div class="codex-agents-warning" style="margin-top: 10px;">
+              <i class="bi bi-exclamation-triangle-fill"></i>
+              <span data-i18n="codex.memoriesWarn">MEMORY.md 是 AI 长期记忆索引,请谨慎修改</span>
+            </div>
+
+            <pre class="codex-agents-preview" id="codexMemoriesPreview" style="margin-top: 10px;"></pre>
+            <textarea class="form-control codex-agents-edit" id="codexMemoriesEdit" hidden style="margin-top: 10px;"></textarea>
+
+            <div class="button-row" style="margin-top: 10px;">
+              <button class="btn btn-primary" type="button" data-action="codex-memories-edit-start" id="codexMemoriesEditBtn"><i class="bi bi-pencil"></i><span data-i18n="codex.agentsEdit">Edit</span></button>
+              <button class="btn btn-outline-primary" type="button" data-action="codex-memories-backup" id="codexMemoriesBackupBtn"><i class="bi bi-archive"></i><span data-i18n="codex.agentsBackup">Backup</span></button>
+              <button class="btn btn-primary" type="button" data-action="codex-memories-apply" id="codexMemoriesApplyBtn" hidden><i class="bi bi-check2-circle"></i><span data-i18n="codex.apply">Apply</span></button>
+              <button class="btn btn-outline-danger" type="button" data-action="codex-memories-cancel" id="codexMemoriesCancelBtn" hidden><i class="bi bi-x"></i><span data-i18n="codex.agentsCancel">Cancel</span></button>
+              <button class="btn btn-outline-primary" type="button" data-action="codex-memories-history-toggle"><i class="bi bi-clock-history"></i><span data-i18n="codex.history">History</span></button>
+            </div>
+          </div>
+
+          <!-- marker 模式 pane(MCP 仍用) -->
+          <div class="codex-block-tab codex-pane" id="codexBlockTab" data-codex-pane="block" hidden>
             <div class="codex-status info-box" id="codexBlockStatus" style="margin-top: 16px;">
               <i class="bi bi-info-circle"></i>
               <p><span data-i18n="codex.statusLoading">状态加载中…</span></p>
@@ -571,6 +649,63 @@
             </div>
           </div>
           </article>
+        </div>
+
+        <!-- History 大 modal(顶部 history picker + 应用按钮 + diff preview) -->
+        <div class="codex-modal-backdrop" id="codexHistoryModal" hidden>
+          <div class="codex-modal codex-modal-large" role="dialog" aria-modal="true" aria-labelledby="codexHistoryModalTitle">
+            <div class="codex-modal-header">
+              <h3 id="codexHistoryModalTitle" data-i18n="codex.historyTitle">History</h3>
+              <button class="codex-modal-close" type="button" data-action="codex-history-close" aria-label="关闭">
+                <i class="bi bi-x-lg"></i>
+              </button>
+            </div>
+
+            <!-- history picker row(下拉 + 应用按钮)-->
+            <div class="codex-agents-paths">
+              <div class="codex-path-picker" id="codexHistoryPicker">
+                <button class="codex-path-picker-toggle" type="button" id="codexHistoryToggle">
+                  <span class="codex-path-picker-current">
+                    <span class="codex-path-empty" data-i18n="codex.historyEmpty">暂无 History snapshot</span>
+                  </span>
+                  <i class="bi bi-chevron-down codex-path-picker-caret"></i>
+                </button>
+                <ul class="codex-path-picker-menu" id="codexHistoryMenu" hidden role="listbox"></ul>
+              </div>
+              <button class="btn btn-primary codex-agents-path-add" type="button" data-action="codex-history-restore" id="codexHistoryRestoreBtn">
+                <i class="bi bi-check2-circle"></i>
+                <span data-i18n="codex.historyApply">应用</span>
+              </button>
+            </div>
+
+            <!-- 警告(应用提示)-->
+            <div class="codex-agents-warning" style="margin-top: 12px;">
+              <i class="bi bi-exclamation-triangle-fill"></i>
+              <span data-i18n="codex.historyWarn">应用后当前 AGENTS.md 会被替换,旧版本会自动加入 History</span>
+            </div>
+
+            <!-- diff preview(红 = 删除,绿 = 新增,灰 = 不变)-->
+            <pre class="codex-agents-diff" id="codexHistoryDiff" style="margin-top: 12px;"></pre>
+          </div>
+        </div>
+
+        <!-- 添加 AGENTS.md 路径 modal(替代 window.prompt,Tauri webview prompt 不可用) -->
+        <div class="codex-modal-backdrop" id="codexAddPathModal" hidden>
+          <div class="codex-modal" role="dialog" aria-modal="true" aria-labelledby="codexAddPathModalTitle">
+            <h3 id="codexAddPathModalTitle" data-i18n="codex.agentsPathAddTitle">添加自定义 AGENTS.md 路径</h3>
+            <p class="codex-modal-desc" data-i18n="codex.agentsPathAddPrompt">点击"浏览"打开系统文件选择,或直接粘贴 AGENTS.md 的绝对路径(可同时使用)</p>
+            <div class="codex-modal-row">
+              <input type="text" class="form-control" id="codexAddPathInput" placeholder="/path/to/AGENTS.md">
+              <button class="btn btn-outline-primary codex-modal-browse" type="button" data-action="codex-add-path-browse">
+                <i class="bi bi-folder2-open"></i>
+                <span data-i18n="codex.agentsPathBrowse">浏览</span>
+              </button>
+            </div>
+            <div class="button-row codex-modal-buttons">
+              <button class="btn btn-outline-primary" type="button" data-action="codex-add-path-cancel" data-i18n="codex.agentsCancel">Cancel</button>
+              <button class="btn btn-primary" type="button" data-action="codex-add-path-confirm" data-i18n="codex.agentsPathAddOkBtn">添加</button>
+            </div>
+          </div>
         </div>
       </section>
 
