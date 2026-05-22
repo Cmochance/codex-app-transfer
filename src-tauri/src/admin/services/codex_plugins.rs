@@ -271,8 +271,24 @@ pub fn set_enabled(key: &str, enabled: bool) -> Result<(), String> {
 }
 
 /// 卸载 plugin — 删 cache 目录 + 删 `[plugins."name@market"]` 节
+///
+/// **安全**:parse_key 后的 name/marketplace 都进 path join + `remove_dir_all`,必须防
+/// path traversal — 攻击者可以提交 `../../foo@../../bar` 类 key 删除任意 user 目录。
 pub fn uninstall(key: &str) -> Result<(), String> {
     let (name, marketplace) = parse_key(key);
+    for (label, val) in [("name", &name), ("marketplace", &marketplace)] {
+        if val.is_empty() {
+            return Err(format!("plugin {label} 不能为空"));
+        }
+        if val == "." || val == ".." {
+            return Err(format!("plugin {label} '{val}' 不安全(禁止 . / ..)"));
+        }
+        for c in val.chars() {
+            if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+                return Err(format!("plugin {label} '{val}' 含非法字符"));
+            }
+        }
+    }
     let cache_dir = plugins_cache_root()?.join(&marketplace).join(&name);
     if cache_dir.exists() {
         fs::remove_dir_all(&cache_dir).map_err(|e| format!("rm cache dir: {e}"))?;
@@ -303,23 +319,24 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
             input.tarball_url
         ));
     }
-    for c in input.name.chars() {
-        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-            return Err(format!("plugin name '{}' 含非法字符", input.name));
+    // name / marketplace / version 都 path join 进 cache 目录,必须严防 path traversal:
+    // (1) 非空 (2) 不允许 `.` `..`(整字符串拒)(3) 不允许 `/` `\`(单 char 拒)
+    //     (4) 其他 char 限制为 [A-Za-z0-9_.-]
+    for (label, val) in [
+        ("name", &input.name),
+        ("marketplace", &input.marketplace),
+        ("version", &input.version),
+    ] {
+        if val.is_empty() {
+            return Err(format!("plugin {label} 不能为空"));
         }
-    }
-    for c in input.marketplace.chars() {
-        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-            return Err(format!("marketplace '{}' 含非法字符", input.marketplace));
+        if val == "." || val == ".." {
+            return Err(format!("plugin {label} '{val}' 不安全(禁止 . / ..)"));
         }
-    }
-    // version 也必须做 char 校验 — deeplink path 直接拼进 cache 目录,防 `../` traversal
-    if input.version.is_empty() {
-        return Err("version 不能为空".into());
-    }
-    for c in input.version.chars() {
-        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-            return Err(format!("version '{}' 含非法字符", input.version));
+        for c in val.chars() {
+            if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+                return Err(format!("plugin {label} '{val}' 含非法字符"));
+            }
         }
     }
     // 下载
