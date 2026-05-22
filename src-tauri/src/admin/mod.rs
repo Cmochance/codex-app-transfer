@@ -197,6 +197,30 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/agents-md/history",
             get(handlers::agents_md::history),
         )
+        .route(
+            "/api/codex/agents-md/paths",
+            get(handlers::agents_md::list_paths),
+        )
+        .route(
+            "/api/codex/agents-md/paths/add",
+            post(handlers::agents_md::add_path),
+        )
+        .route(
+            "/api/codex/agents-md/paths/remove",
+            post(handlers::agents_md::remove_path),
+        )
+        .route(
+            "/api/codex/agents-md/raw",
+            get(handlers::agents_md::raw_get).post(handlers::agents_md::raw_write),
+        )
+        .route(
+            "/api/codex/agents-md/backup",
+            post(handlers::agents_md::backup),
+        )
+        .route(
+            "/api/codex/agents-md/restore-raw",
+            post(handlers::agents_md::restore_raw),
+        )
         // MCP servers 受管块 (#24 #25 PR-A, config.toml TOML 变种)
         .route(
             "/api/codex/mcp-toml/status",
@@ -239,7 +263,31 @@ pub fn build_app_router(state: AdminState) -> Router {
         )
         .route(
             "/api/codex/memories-md/history",
-            get(handlers::memories_md::history),
+            get(handlers::memories_md::history_raw),
+        )
+        .route(
+            "/api/codex/memories-md/paths",
+            get(handlers::memories_md::list_paths),
+        )
+        .route(
+            "/api/codex/memories-md/paths/add",
+            post(handlers::memories_md::add_path),
+        )
+        .route(
+            "/api/codex/memories-md/paths/remove",
+            post(handlers::memories_md::remove_path),
+        )
+        .route(
+            "/api/codex/memories-md/raw",
+            get(handlers::memories_md::raw_get).post(handlers::memories_md::raw_write),
+        )
+        .route(
+            "/api/codex/memories-md/backup",
+            post(handlers::memories_md::backup),
+        )
+        .route(
+            "/api/codex/memories-md/restore-raw",
+            post(handlers::memories_md::restore_raw),
         )
         // Skills file-snapshot backup / restore (#24 #25 PR-B)
         .route(

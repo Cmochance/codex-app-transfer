@@ -2872,6 +2872,57 @@
           await codexBlockRollback(type, idx);
         }
       }
+      if (action === "codex-agents-path-add") {
+        codexAgentsOnPathAdd("agents");
+      }
+      if (action === "codex-agents-path-remove") {
+        await codexAgentsOnPathRemove();
+      }
+      if (action === "codex-memories-edit-start") {
+        await codexMemoriesOnEditStart();
+      }
+      if (action === "codex-memories-apply") {
+        await codexMemoriesOnApply();
+      }
+      if (action === "codex-memories-cancel") {
+        codexMemoriesOnCancel();
+      }
+      if (action === "codex-memories-backup") {
+        await codexMemoriesOnBackup();
+      }
+      if (action === "codex-memories-history-toggle") {
+        await codexMemoriesToggleHistory();
+      }
+      if (action === "codex-add-path-cancel") {
+        codexAgentsClosePathModal();
+      }
+      if (action === "codex-add-path-browse") {
+        await codexAgentsOnBrowse();
+      }
+      if (action === "codex-add-path-confirm") {
+        await codexAgentsConfirmPathAdd();
+      }
+      if (action === "codex-agents-edit-start") {
+        await codexAgentsOnEditStart();
+      }
+      if (action === "codex-agents-apply") {
+        await codexAgentsOnApply();
+      }
+      if (action === "codex-agents-cancel") {
+        codexAgentsOnCancel();
+      }
+      if (action === "codex-agents-backup") {
+        await codexAgentsOnBackup();
+      }
+      if (action === "codex-agents-history-toggle") {
+        await codexHistoryOpen();
+      }
+      if (action === "codex-history-close") {
+        codexHistoryClose();
+      }
+      if (action === "codex-history-restore") {
+        await codexHistoryRestore();
+      }
       if (action === "codex-skills-backup") {
         await codexSkillsBackup();
       }
@@ -2891,13 +2942,40 @@
     }
   }
 
-  // ── Codex 资产管理: marker 受管块 (agents + mcp 共享, type ∈ {agents, mcp}) ──
+  // ── Codex 文档管理: marker 受管块 (agents + mcp 共享, type ∈ {agents, mcp}) ──
 
-  /** URL prefix for managed-block endpoints */
+  /** 当前选中的 AGENTS.md 路径 hash(null = 默认全局)*/
+  let currentAgentsHash = null;
+  /** 当前选中的 MEMORY.md 路径 hash */
+  let currentMemoriesHash = null;
+  /** Add modal / History modal 当前服务的 resource("agents" / "memories")*/
+  let codexDocActiveResource = "agents";
+
+  /** resource → API base */
+  function codexDocApiBase(resource) {
+    return resource === "memories" ? "/api/codex/memories-md" : "/api/codex/agents-md";
+  }
+
+  /** resource → 当前 hash */
+  function codexDocCurrentHash(resource) {
+    return resource === "memories" ? currentMemoriesHash : currentAgentsHash;
+  }
+  function codexDocSetCurrentHash(resource, hash) {
+    if (resource === "memories") currentMemoriesHash = hash;
+    else currentAgentsHash = hash;
+  }
+
+  /** URL prefix for managed-block endpoints。agents tab 自动拼 ?hash=<currentAgentsHash> */
   function codexBlockUrl(type) {
     if (type === "mcp") return "/api/codex/mcp-toml";
     if (type === "memories") return "/api/codex/memories-md";
     return "/api/codex/agents-md";
+  }
+
+  /** agents endpoint suffix(hash query)— 仅 type=agents 时拼 */
+  function codexAgentsHashSuffix(type) {
+    if (type !== "agents") return "";
+    return currentAgentsHash ? `?hash=${encodeURIComponent(currentAgentsHash)}` : "";
   }
 
   function currentCodexTab() {
@@ -2912,9 +2990,817 @@
   }
 
   async function codexBlockFetchStatus(type) {
-    const r = await fetch(`${codexBlockUrl(type)}/status`);
+    const r = await fetch(`${codexBlockUrl(type)}/status${codexAgentsHashSuffix(type)}`);
     if (!r.ok) throw new Error("status request failed");
     return r.json();
+  }
+
+  // ── AGENTS.md 自定义路径 dropdown ──
+
+  /** 路径 chip(s) HTML — 按 category 决定单 chip 或双 chip */
+  function codexAgentsChipsHtml(entry) {
+    if (entry.category === "global") {
+      return `<span class="codex-path-chip codex-path-chip-global">${escapeHtml(t("codex.agentsPath.global"))}</span>`;
+    }
+    if (entry.category === "project-root") {
+      const name = entry.projectName || "?";
+      return `<span class="codex-path-chip codex-path-chip-project-root">${escapeHtml(name)}</span>`;
+    }
+    // subdir → 项目名(绿) + 子目录路径(橙)
+    const project = entry.projectName || "?";
+    const subdir = entry.subdirPath || "?";
+    return `<span class="codex-path-chip codex-path-chip-project-root">${escapeHtml(project)}</span><span class="codex-path-chip codex-path-chip-subdir">${escapeHtml(subdir)}</span>`;
+  }
+
+  /** 缓存当前 picker 显示的 entries(供 toggle 渲染 + change 处理用)*/
+  let codexAgentsEntriesCache = [];
+
+  /** 渲染当前选中条目到 toggle button 内 */
+  function codexAgentsRenderToggle() {
+    const cur = $("#codexAgentsPathPicker .codex-path-picker-current");
+    if (!cur) return;
+    const entry = codexAgentsEntriesCache.find((e) => e.hash === currentAgentsHash);
+    if (!entry) {
+      cur.innerHTML = `<span class="codex-path-empty">${escapeHtml(t("codex.agentsPathEmpty"))}</span>`;
+      return;
+    }
+    cur.innerHTML = `${codexAgentsChipsHtml(entry)}<span class="codex-path-text" title="${escapeHtml(entry.path)}">${escapeHtml(entry.path)}</span>`;
+  }
+
+  /** 渲染下拉菜单 ul li 列表 */
+  function codexAgentsRenderMenu() {
+    const menu = $("#codexAgentsPathMenu");
+    if (!menu) return;
+    if (codexAgentsEntriesCache.length === 0) {
+      menu.innerHTML = `<li class="codex-path-picker-item" aria-disabled="true"><span class="codex-path-empty">${escapeHtml(t("codex.agentsPathEmpty"))}</span></li>`;
+      return;
+    }
+    menu.innerHTML = codexAgentsEntriesCache
+      .map((e) => {
+        const selected = e.hash === currentAgentsHash ? " selected" : "";
+        return `<li class="codex-path-picker-item${selected}" role="option" data-hash="${escapeHtml(e.hash)}" data-category="${escapeHtml(e.category)}">
+          ${codexAgentsChipsHtml(e)}
+          <span class="codex-path-text" title="${escapeHtml(e.path)}">${escapeHtml(e.path)}</span>
+        </li>`;
+      })
+      .join("");
+  }
+
+  /** 调后端 /paths 拉列表 + 刷 picker UI */
+  async function codexAgentsReloadPaths() {
+    try {
+      const r = await fetch("/api/codex/agents-md/paths");
+      if (!r.ok) throw new Error("paths request failed");
+      const j = await r.json();
+      codexAgentsEntriesCache = j.entries || [];
+      // 保留当前选中,若不在新 list 则回退到第一条(可能空)
+      if (
+        !currentAgentsHash ||
+        !codexAgentsEntriesCache.some((e) => e.hash === currentAgentsHash)
+      ) {
+        currentAgentsHash = codexAgentsEntriesCache[0]?.hash || null;
+      }
+      codexAgentsRenderToggle();
+      codexAgentsRenderMenu();
+      // 删除按钮:仅在非全局选中时显示
+      const removeBtn = $("#codexAgentsPathRemoveBtn");
+      if (removeBtn) {
+        const cur = codexAgentsEntriesCache.find((e) => e.hash === currentAgentsHash);
+        removeBtn.hidden = !cur || cur.category === "global";
+      }
+      return codexAgentsEntriesCache;
+    } catch (e) {
+      console.error("codexAgentsReloadPaths:", e);
+      codexAgentsEntriesCache = [];
+      codexAgentsRenderToggle();
+      codexAgentsRenderMenu();
+      return [];
+    }
+  }
+
+  /** dropdown item click → 切换当前 hash + 刷新该 path 的 status/content */
+  async function codexAgentsSelectHash(hash) {
+    if (!hash) return;
+    currentAgentsHash = hash;
+    codexAgentsRenderToggle();
+    codexAgentsRenderMenu();
+    const removeBtn = $("#codexAgentsPathRemoveBtn");
+    if (removeBtn) {
+      const cur = codexAgentsEntriesCache.find((e) => e.hash === hash);
+      removeBtn.hidden = !cur || cur.category === "global";
+    }
+    codexAgentsClosePicker();
+    try {
+      await codexAgentsRawLoadAndRender();
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  /** picker toggle open/close + outside click */
+  function codexAgentsOpenPicker() {
+    const picker = $("#codexAgentsPathPicker");
+    const menu = $("#codexAgentsPathMenu");
+    if (!picker || !menu) return;
+    if (codexAgentsEntriesCache.length === 0) return; // 空态 toggle 不开
+    picker.classList.add("open");
+    menu.hidden = false;
+  }
+  function codexAgentsClosePicker() {
+    const picker = $("#codexAgentsPathPicker");
+    const menu = $("#codexAgentsPathMenu");
+    if (!picker || !menu) return;
+    picker.classList.remove("open");
+    menu.hidden = true;
+  }
+  function codexAgentsTogglePicker() {
+    const picker = $("#codexAgentsPathPicker");
+    if (!picker) return;
+    if (picker.classList.contains("open")) codexAgentsClosePicker();
+    else codexAgentsOpenPicker();
+  }
+
+  /** 添加按钮 → inline modal(替代 window.prompt)。resource 默认 agents */
+  function codexAgentsOnPathAdd(resource = "agents") {
+    const modal = $("#codexAddPathModal");
+    const input = $("#codexAddPathInput");
+    if (!modal || !input) return;
+    codexDocActiveResource = resource;
+    input.value = "";
+    // 切换 title / desc 文案到对应 resource
+    const titleEl = $("#codexAddPathModalTitle");
+    const descEl = $("#codexAddPathModal .codex-modal-desc");
+    const placeholder = resource === "memories" ? "/path/to/project-root" : "/path/to/AGENTS.md";
+    if (titleEl) {
+      titleEl.textContent = t(
+        resource === "memories" ? "codex.memoriesPathAddTitle" : "codex.agentsPathAddTitle",
+      );
+    }
+    if (descEl) {
+      descEl.textContent = t(
+        resource === "memories" ? "codex.memoriesPathAddPrompt" : "codex.agentsPathAddPrompt",
+      );
+    }
+    input.placeholder = placeholder;
+    modal.hidden = false;
+    setTimeout(() => input.focus(), 50);
+  }
+
+  function codexAgentsClosePathModal() {
+    const modal = $("#codexAddPathModal");
+    if (modal) modal.hidden = true;
+  }
+
+  /** 浏览按钮:打开 Tauri file/dir dialog。Memories tab 选**目录**,Agents 选 .md 文件。*/
+  async function codexAgentsOnBrowse() {
+    try {
+      const dialog = window.__TAURI__?.dialog;
+      if (!dialog || typeof dialog.open !== "function") {
+        showToast("Tauri dialog API 不可用 — 请直接粘贴绝对路径");
+        return;
+      }
+      const input = $("#codexAddPathInput");
+      const raw = (input?.value || "").trim();
+      const defaultPath = raw && raw.startsWith("/") ? raw : undefined;
+      const isMemories = codexDocActiveResource === "memories";
+      const selected = await dialog.open({
+        title: t(isMemories ? "codex.memoriesPathAddTitle" : "codex.agentsPathAddTitle"),
+        multiple: false,
+        directory: isMemories, // memories 选目录,agents 选文件
+        defaultPath,
+        filters: isMemories
+          ? undefined
+          : [
+              { name: "AGENTS.md", extensions: ["md", "MD"] },
+              { name: "All files", extensions: ["*"] },
+            ],
+      });
+      if (typeof selected === "string" && selected) {
+        if (input) input.value = selected;
+      }
+    } catch (e) {
+      console.error("dialog open:", e);
+      showToast(e.message || "dialog open failed");
+    }
+  }
+
+  async function codexAgentsConfirmPathAdd() {
+    const input = $("#codexAddPathInput");
+    const raw = input?.value || "";
+    const path = raw.trim();
+    if (!path) {
+      showToast(t("codex.agentsPathAddEmpty"));
+      return;
+    }
+    const resource = codexDocActiveResource;
+    try {
+      const r = await fetch(`${codexDocApiBase(resource)}/paths/add`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || "add path failed");
+      }
+      const j = await r.json();
+      codexDocSetCurrentHash(resource, j.entry?.hash || null);
+      codexAgentsClosePathModal();
+      if (resource === "memories") {
+        await codexMemoriesReloadPaths();
+        await codexMemoriesRawLoadAndRender();
+      } else {
+        await codexAgentsReloadPaths();
+        await codexAgentsRawLoadAndRender();
+      }
+      showToast(t("codex.agentsPathAddOk"));
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  /** 删除按钮 → POST /paths/remove(全局路径按钮自动隐藏)*/
+  async function codexAgentsOnPathRemove() {
+    if (!currentAgentsHash) return;
+    if (!confirm(t("codex.agentsPathRemoveConfirm"))) return;
+    try {
+      const r = await fetch("/api/codex/agents-md/paths/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hash: currentAgentsHash }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || "remove path failed");
+      }
+      currentAgentsHash = null; // 回退到全局
+      await codexAgentsReloadPaths();
+      await codexAgentsRawLoadAndRender();
+      showToast(t("codex.agentsPathRemoveOk"));
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  // ── Agents raw mode(Preview/Edit/Backup/History)──
+
+  /** UI mode 状态:"preview" / "edit" */
+  let codexAgentsMode = "preview";
+  /** Preview 模式下缓存的原内容(用于 Edit→Cancel 回退)*/
+  let codexAgentsLastFullContent = "";
+
+  /** 加载 raw 全文 → 写入 preview pre */
+  async function codexAgentsRawLoadAndRender() {
+    const pre = $("#codexAgentsPreview");
+    const ta = $("#codexAgentsEdit");
+    if (!pre || !ta) return;
+    // 切换路径或重新加载时强制回 preview 模式
+    codexAgentsSwitchMode("preview");
+    if (!currentAgentsHash) {
+      pre.textContent = "";
+      pre.setAttribute("data-empty-hint", t("codex.agentsPathEmpty"));
+      ta.value = "";
+      codexAgentsLastFullContent = "";
+      return;
+    }
+    try {
+      const r = await fetch(`/api/codex/agents-md/raw?hash=${encodeURIComponent(currentAgentsHash)}`);
+      if (!r.ok) throw new Error("raw fetch failed");
+      const j = await r.json();
+      codexAgentsLastFullContent = j.content || "";
+      pre.textContent = codexAgentsLastFullContent;
+      pre.removeAttribute("data-empty-hint");
+      ta.value = codexAgentsLastFullContent;
+    } catch (e) {
+      pre.textContent = "";
+      pre.setAttribute("data-empty-hint", `读取失败: ${e.message || e}`);
+    }
+  }
+
+  /** 切换 mode("preview" / "edit"),同步按钮 + pre/textarea 显示 */
+  function codexAgentsSwitchMode(mode) {
+    codexAgentsMode = mode;
+    const pre = $("#codexAgentsPreview");
+    const ta = $("#codexAgentsEdit");
+    const editBtn = $("#codexAgentsEditBtn");
+    const backupBtn = $("#codexAgentsBackupBtn");
+    const applyBtn = $("#codexAgentsApplyBtn");
+    const cancelBtn = $("#codexAgentsCancelBtn");
+    if (mode === "edit") {
+      if (pre) pre.hidden = true;
+      if (ta) {
+        ta.hidden = false;
+        ta.value = codexAgentsLastFullContent;
+      }
+      if (editBtn) editBtn.hidden = true;
+      if (backupBtn) backupBtn.hidden = true;
+      if (applyBtn) applyBtn.hidden = false;
+      if (cancelBtn) cancelBtn.hidden = false;
+    } else {
+      if (pre) pre.hidden = false;
+      if (ta) ta.hidden = true;
+      if (editBtn) editBtn.hidden = false;
+      if (backupBtn) backupBtn.hidden = false;
+      if (applyBtn) applyBtn.hidden = true;
+      if (cancelBtn) cancelBtn.hidden = true;
+    }
+  }
+
+  async function codexAgentsOnEditStart() {
+    if (!currentAgentsHash) {
+      showToast(t("codex.agentsPathEmpty"));
+      return;
+    }
+    codexAgentsSwitchMode("edit");
+    setTimeout(() => $("#codexAgentsEdit")?.focus(), 50);
+  }
+
+  async function codexAgentsOnApply() {
+    if (!currentAgentsHash) return;
+    const ta = $("#codexAgentsEdit");
+    const content = ta?.value ?? "";
+    try {
+      const r = await fetch(`/api/codex/agents-md/raw?hash=${encodeURIComponent(currentAgentsHash)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || "write failed");
+      }
+      showToast(t("codex.agentsApplyOk"));
+      await codexAgentsRawLoadAndRender();
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  function codexAgentsOnCancel() {
+    codexAgentsSwitchMode("preview");
+  }
+
+  async function codexAgentsOnBackup() {
+    if (!currentAgentsHash) {
+      showToast(t("codex.agentsPathEmpty"));
+      return;
+    }
+    try {
+      const r = await fetch(`/api/codex/agents-md/backup?hash=${encodeURIComponent(currentAgentsHash)}`, {
+        method: "POST",
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || "backup failed");
+      }
+      showToast(t("codex.agentsBackupOk"));
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  // ── History 大 modal:picker + 应用 + diff preview ──
+
+  /** history entries 缓存(reversed,最新在前)+ 当前选中 index */
+  let codexHistoryEntries = [];
+  let codexHistorySelectedIdx = null;
+
+  /** LCS-based line diff(O(m*n) — 5K 行 OK)
+   * 返回 [{ type: "ctx"|"add"|"del", text }]
+   */
+  function codexLineDiff(oldText, newText) {
+    const oldLines = oldText.split("\n");
+    const newLines = newText.split("\n");
+    const m = oldLines.length;
+    const n = newLines.length;
+    // dp[i][j] = LCS length for oldLines[0..i], newLines[0..j]
+    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+    for (let i = 0; i < m; i++) {
+      for (let j = 0; j < n; j++) {
+        if (oldLines[i] === newLines[j]) dp[i + 1][j + 1] = dp[i][j] + 1;
+        else dp[i + 1][j + 1] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    const result = [];
+    let i = m, j = n;
+    while (i > 0 || j > 0) {
+      if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+        result.unshift({ type: "ctx", text: oldLines[i - 1] });
+        i--; j--;
+      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+        result.unshift({ type: "add", text: newLines[j - 1] });
+        j--;
+      } else {
+        result.unshift({ type: "del", text: oldLines[i - 1] });
+        i--;
+      }
+    }
+    return result;
+  }
+
+  /** entry label:"项目名 / 子目录路径 · YYYY-MM-DD HH:MM:SS" — 项目 / 子目录从当前 active resource 的 path 推断 */
+  function codexHistoryEntryLabel(entry) {
+    const resource = codexDocActiveResource;
+    const cache = resource === "memories" ? codexMemoriesEntriesCache : codexAgentsEntriesCache;
+    const hash = resource === "memories" ? currentMemoriesHash : currentAgentsHash;
+    const cur = cache.find((e) => e.hash === hash);
+    const ts = new Date(entry.timestamp * 1000).toLocaleString();
+    let prefix = "";
+    if (cur) {
+      if (cur.category === "global") {
+        prefix = t("codex.agentsPath.global");
+      } else if (cur.category === "project-root") {
+        prefix = cur.projectName || "?";
+      } else {
+        prefix = `${cur.projectName || "?"} / ${cur.subdirPath || "?"}`;
+      }
+    }
+    return prefix ? `${prefix} · ${ts}` : ts;
+  }
+
+  /** render history picker toggle button(selected entry)*/
+  function codexHistoryRenderToggle() {
+    const cur = $("#codexHistoryPicker .codex-path-picker-current");
+    if (!cur) return;
+    if (codexHistorySelectedIdx == null || !codexHistoryEntries[codexHistorySelectedIdx]) {
+      cur.innerHTML = `<span class="codex-path-empty">${escapeHtml(t("codex.historyEmpty"))}</span>`;
+      return;
+    }
+    const entry = codexHistoryEntries[codexHistorySelectedIdx];
+    cur.innerHTML = `<span class="codex-path-text" title="${escapeHtml(codexHistoryEntryLabel(entry))}">${escapeHtml(codexHistoryEntryLabel(entry))}</span>`;
+  }
+
+  /** render history picker dropdown menu */
+  function codexHistoryRenderMenu() {
+    const menu = $("#codexHistoryMenu");
+    if (!menu) return;
+    if (codexHistoryEntries.length === 0) {
+      menu.innerHTML = `<li class="codex-path-picker-item" aria-disabled="true"><span class="codex-path-empty">${escapeHtml(t("codex.historyEmpty"))}</span></li>`;
+      return;
+    }
+    menu.innerHTML = codexHistoryEntries
+      .map((entry, i) => {
+        const selected = i === codexHistorySelectedIdx ? " selected" : "";
+        return `<li class="codex-path-picker-item${selected}" role="option" data-history-idx="${i}">
+          <span class="codex-path-text">${escapeHtml(codexHistoryEntryLabel(entry))}</span>
+        </li>`;
+      })
+      .join("");
+  }
+
+  /** 渲染当前选中 history 对比 file 当前内容的 diff */
+  function codexHistoryRenderDiff() {
+    const pre = $("#codexHistoryDiff");
+    if (!pre) return;
+    if (codexHistorySelectedIdx == null || !codexHistoryEntries[codexHistorySelectedIdx]) {
+      pre.innerHTML = "";
+      pre.setAttribute("data-empty-hint", t("codex.historyDiffEmpty"));
+      return;
+    }
+    const entry = codexHistoryEntries[codexHistorySelectedIdx];
+    const newContent = entry.appliedContent || entry.managedContent || "";
+    const oldContent =
+      codexDocActiveResource === "memories"
+        ? codexMemoriesLastFullContent || ""
+        : codexAgentsLastFullContent || "";
+    const diff = codexLineDiff(oldContent, newContent);
+    pre.removeAttribute("data-empty-hint");
+    pre.innerHTML = diff
+      .map((d) => `<span class="codex-diff-line ${d.type}">${escapeHtml(d.text) || "&nbsp;"}</span>`)
+      .join("");
+  }
+
+  function codexHistoryPickerToggle() {
+    const picker = $("#codexHistoryPicker");
+    const menu = $("#codexHistoryMenu");
+    if (!picker || !menu) return;
+    if (codexHistoryEntries.length === 0) return;
+    const open = picker.classList.toggle("open");
+    menu.hidden = !open;
+  }
+
+  function codexHistoryPickerClose() {
+    const picker = $("#codexHistoryPicker");
+    const menu = $("#codexHistoryMenu");
+    if (!picker || !menu) return;
+    picker.classList.remove("open");
+    menu.hidden = true;
+  }
+
+  async function codexHistoryOpen() {
+    const resource = codexDocActiveResource;
+    const hash = codexDocCurrentHash(resource);
+    if (!hash) {
+      showToast(
+        t(resource === "memories" ? "codex.memoriesPathEmpty" : "codex.agentsPathEmpty"),
+      );
+      return;
+    }
+    try {
+      const r = await fetch(`${codexDocApiBase(resource)}/history?hash=${encodeURIComponent(hash)}`);
+      if (!r.ok) throw new Error("history failed");
+      const j = await r.json();
+      const entries = j.history || [];
+      codexHistoryEntries = entries.slice().reverse();
+      codexHistorySelectedIdx = codexHistoryEntries.length > 0 ? 0 : null;
+      codexHistoryRenderToggle();
+      codexHistoryRenderMenu();
+      codexHistoryRenderDiff();
+      const modal = $("#codexHistoryModal");
+      if (modal) modal.hidden = false;
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  function codexHistoryClose() {
+    const modal = $("#codexHistoryModal");
+    if (modal) modal.hidden = true;
+    codexHistoryPickerClose();
+  }
+
+  function codexHistorySelect(idx) {
+    if (idx < 0 || idx >= codexHistoryEntries.length) return;
+    codexHistorySelectedIdx = idx;
+    codexHistoryRenderToggle();
+    codexHistoryRenderMenu();
+    codexHistoryRenderDiff();
+    codexHistoryPickerClose();
+  }
+
+  async function codexHistoryRestore() {
+    if (codexHistorySelectedIdx == null || !codexHistoryEntries[codexHistorySelectedIdx]) {
+      showToast(t("codex.historyEmpty"));
+      return;
+    }
+    const entry = codexHistoryEntries[codexHistorySelectedIdx];
+    if (!confirm(t("codex.agentsRestoreConfirm"))) return;
+    const resource = codexDocActiveResource;
+    const hash = codexDocCurrentHash(resource);
+    if (!hash) return;
+    try {
+      const r = await fetch(`${codexDocApiBase(resource)}/restore-raw?hash=${encodeURIComponent(hash)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ index: entry.index }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || "restore failed");
+      }
+      showToast(t("codex.agentsRestoreOk"));
+      codexHistoryClose();
+      if (resource === "memories") await codexMemoriesRawLoadAndRender();
+      else await codexAgentsRawLoadAndRender();
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  // 旧 toggle 函数名保持给 action 用 — 等价于 open
+  async function codexAgentsToggleHistory() {
+    codexDocActiveResource = "agents";
+    await codexHistoryOpen();
+  }
+
+  // ── Memories 完全镜像 Agents,但用 currentMemoriesHash + memories endpoints ──
+
+  let codexMemoriesEntriesCache = [];
+  let codexMemoriesMode = "preview";
+  let codexMemoriesLastFullContent = "";
+
+  /** Memories 用 2 固定 entry,chip 按文件名分色:MEMORY.md 蓝(主索引)/ summary 绿 */
+  function codexMemoriesChipsHtml(entry) {
+    const filename = entry.path.split("/").pop() || "";
+    if (filename === "MEMORY.md") {
+      return `<span class="codex-path-chip codex-path-chip-global">${escapeHtml(t("codex.memoriesPath.index"))}</span>`;
+    }
+    if (filename === "memory_summary.md") {
+      return `<span class="codex-path-chip codex-path-chip-project-root">${escapeHtml(t("codex.memoriesPath.summary"))}</span>`;
+    }
+    return `<span class="codex-path-chip codex-path-chip-project-root">${escapeHtml(filename)}</span>`;
+  }
+
+  function codexMemoriesRenderToggle() {
+    const cur = $("#codexMemoriesPathPicker .codex-path-picker-current");
+    if (!cur) return;
+    const entry = codexMemoriesEntriesCache.find((e) => e.hash === currentMemoriesHash);
+    if (!entry) {
+      cur.innerHTML = `<span class="codex-path-empty">${escapeHtml(t("codex.memoriesPathEmpty"))}</span>`;
+      return;
+    }
+    cur.innerHTML = `${codexMemoriesChipsHtml(entry)}<span class="codex-path-text" title="${escapeHtml(entry.path)}">${escapeHtml(entry.path)}</span>`;
+  }
+
+  function codexMemoriesRenderMenu() {
+    const menu = $("#codexMemoriesPathMenu");
+    if (!menu) return;
+    if (codexMemoriesEntriesCache.length === 0) {
+      menu.innerHTML = `<li class="codex-path-picker-item" aria-disabled="true"><span class="codex-path-empty">${escapeHtml(t("codex.memoriesPathEmpty"))}</span></li>`;
+      return;
+    }
+    menu.innerHTML = codexMemoriesEntriesCache
+      .map((e) => {
+        const selected = e.hash === currentMemoriesHash ? " selected" : "";
+        return `<li class="codex-path-picker-item${selected}" role="option" data-hash="${escapeHtml(e.hash)}" data-category="${escapeHtml(e.category)}">
+          ${codexMemoriesChipsHtml(e)}
+          <span class="codex-path-text" title="${escapeHtml(e.path)}">${escapeHtml(e.path)}</span>
+        </li>`;
+      })
+      .join("");
+  }
+
+  async function codexMemoriesReloadPaths() {
+    try {
+      const r = await fetch("/api/codex/memories-md/paths");
+      if (!r.ok) throw new Error("memories paths request failed");
+      const j = await r.json();
+      codexMemoriesEntriesCache = j.entries || [];
+      if (
+        !currentMemoriesHash ||
+        !codexMemoriesEntriesCache.some((e) => e.hash === currentMemoriesHash)
+      ) {
+        currentMemoriesHash = codexMemoriesEntriesCache[0]?.hash || null;
+      }
+      codexMemoriesRenderToggle();
+      codexMemoriesRenderMenu();
+      return codexMemoriesEntriesCache;
+    } catch (e) {
+      console.error("codexMemoriesReloadPaths:", e);
+      codexMemoriesEntriesCache = [];
+      codexMemoriesRenderToggle();
+      codexMemoriesRenderMenu();
+      return [];
+    }
+  }
+
+  async function codexMemoriesSelectHash(hash) {
+    if (!hash) return;
+    currentMemoriesHash = hash;
+    codexMemoriesRenderToggle();
+    codexMemoriesRenderMenu();
+    codexMemoriesClosePicker();
+    try {
+      await codexMemoriesRawLoadAndRender();
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  function codexMemoriesOpenPicker() {
+    const picker = $("#codexMemoriesPathPicker");
+    const menu = $("#codexMemoriesPathMenu");
+    if (!picker || !menu) return;
+    if (codexMemoriesEntriesCache.length === 0) return;
+    picker.classList.add("open");
+    menu.hidden = false;
+  }
+  function codexMemoriesClosePicker() {
+    const picker = $("#codexMemoriesPathPicker");
+    const menu = $("#codexMemoriesPathMenu");
+    if (!picker || !menu) return;
+    picker.classList.remove("open");
+    menu.hidden = true;
+  }
+  function codexMemoriesTogglePicker() {
+    const picker = $("#codexMemoriesPathPicker");
+    if (!picker) return;
+    if (picker.classList.contains("open")) codexMemoriesClosePicker();
+    else codexMemoriesOpenPicker();
+  }
+
+  async function codexMemoriesOnPathRemove() {
+    if (!currentMemoriesHash) return;
+    if (!confirm(t("codex.agentsPathRemoveConfirm"))) return;
+    try {
+      const r = await fetch("/api/codex/memories-md/paths/remove", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hash: currentMemoriesHash }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || "remove path failed");
+      }
+      currentMemoriesHash = null;
+      await codexMemoriesReloadPaths();
+      await codexMemoriesRawLoadAndRender();
+      showToast(t("codex.agentsPathRemoveOk"));
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  async function codexMemoriesRawLoadAndRender() {
+    const pre = $("#codexMemoriesPreview");
+    const ta = $("#codexMemoriesEdit");
+    if (!pre || !ta) return;
+    codexMemoriesSwitchMode("preview");
+    if (!currentMemoriesHash) {
+      pre.textContent = "";
+      pre.setAttribute("data-empty-hint", t("codex.memoriesLoading"));
+      ta.value = "";
+      codexMemoriesLastFullContent = "";
+      return;
+    }
+    try {
+      const r = await fetch(`/api/codex/memories-md/raw?hash=${encodeURIComponent(currentMemoriesHash)}`);
+      if (!r.ok) throw new Error("raw fetch failed");
+      const j = await r.json();
+      codexMemoriesLastFullContent = j.content || "";
+      pre.textContent = codexMemoriesLastFullContent;
+      pre.removeAttribute("data-empty-hint");
+      ta.value = codexMemoriesLastFullContent;
+    } catch (e) {
+      pre.textContent = "";
+      pre.setAttribute("data-empty-hint", `读取失败: ${e.message || e}`);
+    }
+  }
+
+  function codexMemoriesSwitchMode(mode) {
+    codexMemoriesMode = mode;
+    const pre = $("#codexMemoriesPreview");
+    const ta = $("#codexMemoriesEdit");
+    const editBtn = $("#codexMemoriesEditBtn");
+    const backupBtn = $("#codexMemoriesBackupBtn");
+    const applyBtn = $("#codexMemoriesApplyBtn");
+    const cancelBtn = $("#codexMemoriesCancelBtn");
+    if (mode === "edit") {
+      if (pre) pre.hidden = true;
+      if (ta) {
+        ta.hidden = false;
+        ta.value = codexMemoriesLastFullContent;
+      }
+      if (editBtn) editBtn.hidden = true;
+      if (backupBtn) backupBtn.hidden = true;
+      if (applyBtn) applyBtn.hidden = false;
+      if (cancelBtn) cancelBtn.hidden = false;
+    } else {
+      if (pre) pre.hidden = false;
+      if (ta) ta.hidden = true;
+      if (editBtn) editBtn.hidden = false;
+      if (backupBtn) backupBtn.hidden = false;
+      if (applyBtn) applyBtn.hidden = true;
+      if (cancelBtn) cancelBtn.hidden = true;
+    }
+  }
+
+  async function codexMemoriesOnEditStart() {
+    if (!currentMemoriesHash) {
+      showToast(t("codex.memoriesPathEmpty"));
+      return;
+    }
+    codexMemoriesSwitchMode("edit");
+    setTimeout(() => $("#codexMemoriesEdit")?.focus(), 50);
+  }
+
+  async function codexMemoriesOnApply() {
+    if (!currentMemoriesHash) return;
+    const ta = $("#codexMemoriesEdit");
+    const content = ta?.value ?? "";
+    try {
+      const r = await fetch(`/api/codex/memories-md/raw?hash=${encodeURIComponent(currentMemoriesHash)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || "write failed");
+      }
+      showToast(t("codex.agentsApplyOk"));
+      await codexMemoriesRawLoadAndRender();
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  function codexMemoriesOnCancel() {
+    codexMemoriesSwitchMode("preview");
+  }
+
+  async function codexMemoriesOnBackup() {
+    if (!currentMemoriesHash) {
+      showToast(t("codex.memoriesPathEmpty"));
+      return;
+    }
+    try {
+      const r = await fetch(`/api/codex/memories-md/backup?hash=${encodeURIComponent(currentMemoriesHash)}`, {
+        method: "POST",
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || "backup failed");
+      }
+      showToast(t("codex.agentsBackupOk"));
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+  }
+
+  async function codexMemoriesToggleHistory() {
+    codexDocActiveResource = "memories";
+    await codexHistoryOpen();
   }
 
   async function codexBlockLoadAndRender(type) {
@@ -2945,7 +3831,7 @@
 
   async function codexBlockPreview(type) {
     const content = $("#codexBlockContent")?.value ?? "";
-    const r = await fetch(`${codexBlockUrl(type)}/preview`, {
+    const r = await fetch(`${codexBlockUrl(type)}/preview${codexAgentsHashSuffix(type)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
@@ -2967,7 +3853,7 @@
     if (expectedOuterSignature) {
       body.expectedOuterSignature = expectedOuterSignature;
     }
-    const r = await fetch(`${codexBlockUrl(type)}/apply`, {
+    const r = await fetch(`${codexBlockUrl(type)}/apply${codexAgentsHashSuffix(type)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -2982,14 +3868,14 @@
   }
 
   async function codexBlockClear(type) {
-    const r = await fetch(`${codexBlockUrl(type)}/clear`, { method: "POST" });
+    const r = await fetch(`${codexBlockUrl(type)}/clear${codexAgentsHashSuffix(type)}`, { method: "POST" });
     if (!r.ok) throw new Error("clear failed");
     await codexBlockLoadAndRender(type);
     showToast(tFmt("codex.toastCleared", { type }));
   }
 
   async function codexBlockRollback(type, idx) {
-    const r = await fetch(`${codexBlockUrl(type)}/rollback`, {
+    const r = await fetch(`${codexBlockUrl(type)}/rollback${codexAgentsHashSuffix(type)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ index: idx }),
@@ -3004,7 +3890,7 @@
   }
 
   async function codexBlockRenderHistory(type) {
-    const r = await fetch(`${codexBlockUrl(type)}/history`);
+    const r = await fetch(`${codexBlockUrl(type)}/history${codexAgentsHashSuffix(type)}`);
     if (!r.ok) throw new Error("history failed");
     const j = await r.json();
     const list = $("#codexBlockHistoryList");
@@ -3118,9 +4004,19 @@
 
   /** sidebar tab visibility:active class + fade slide pane */
   function codexShowTab(tab) {
+    const agentsPane = $("#codexAgentsRawTab");
+    const memoriesPane = $("#codexMemoriesRawTab");
     const blockPane = $("#codexBlockTab");
     const skillsPane = $("#codexSkillsTab");
-    const wantBlock = tab === "agents" || tab === "mcp" || tab === "memories";
+    if (agentsPane) {
+      agentsPane.hidden = tab !== "agents";
+      agentsPane.classList.toggle("active", tab === "agents");
+    }
+    if (memoriesPane) {
+      memoriesPane.hidden = tab !== "memories";
+      memoriesPane.classList.toggle("active", tab === "memories");
+    }
+    const wantBlock = tab === "mcp";
     if (blockPane) {
       blockPane.hidden = !wantBlock;
       blockPane.classList.toggle("active", wantBlock);
@@ -3129,12 +4025,14 @@
       skillsPane.hidden = tab !== "skills";
       skillsPane.classList.toggle("active", tab === "skills");
     }
-    // 切 tab 时收起 History 面板和 Preview 区域,防止残留的 rollback 按钮
-    // data-type 指向旧 tab 导致 rollback 操作类型错误 (Devin Review BUG_..._0001)
+    // 切 tab 时收起 marker pane 的 History 跟 Preview 区域
     const historyEl = $("#codexBlockHistory");
     if (historyEl) historyEl.hidden = true;
     const previewEl = $("#codexBlockPreviewArea");
     if (previewEl) previewEl.hidden = true;
+    // 切 tab 时把非当前 tab 的 Edit 模式回退 preview
+    if (tab !== "agents") codexAgentsSwitchMode("preview");
+    if (tab !== "memories") codexMemoriesSwitchMode("preview");
 
     // sidebar item active state
     $all("#codexSidebar .codex-sidebar-item").forEach((btn) => {
@@ -3146,6 +4044,12 @@
   async function codexLoadTab(tab) {
     if (tab === "skills") {
       await codexSkillsLoadAndRender();
+    } else if (tab === "agents") {
+      await codexAgentsReloadPaths();
+      await codexAgentsRawLoadAndRender();
+    } else if (tab === "memories") {
+      await codexMemoriesReloadPaths();
+      await codexMemoriesRawLoadAndRender();
     } else {
       await codexBlockLoadAndRender(tab);
     }
@@ -3155,19 +4059,21 @@
   /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
   async function codexRefreshSidebarBadges() {
     try {
-      const [agents, mcp, memories, skills] = await Promise.all([
-        fetch("/api/codex/agents-md/status").then((r) => (r.ok ? r.json() : null)),
+      const [agentsPaths, memPaths, mcp, skills] = await Promise.all([
+        fetch("/api/codex/agents-md/paths").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/codex/memories-md/paths").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/mcp-toml/status").then((r) => (r.ok ? r.json() : null)),
-        fetch("/api/codex/memories-md/status").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/skills/list").then((r) => (r.ok ? r.json() : null)),
       ]);
       const setBadge = (id, text) => {
         const el = $(id);
         if (el) el.textContent = text;
       };
-      setBadge("#codexSidebarBadge-agents", agents?.hasManaged ? "ON" : "—");
+      const agentsCount = agentsPaths?.entries?.length || 0;
+      const memCount = memPaths?.entries?.length || 0;
+      setBadge("#codexSidebarBadge-agents", agentsCount > 0 ? String(agentsCount) : "—");
+      setBadge("#codexSidebarBadge-memories", memCount > 0 ? String(memCount) : "—");
       setBadge("#codexSidebarBadge-mcp", mcp?.hasManaged ? "ON" : "—");
-      setBadge("#codexSidebarBadge-memories", memories?.hasManaged ? "ON" : "—");
       setBadge("#codexSidebarBadge-skills", skills?.count != null ? String(skills.count) : "—");
     } catch {
       // best-effort, 静默
@@ -3185,6 +4091,114 @@
     if (ta && !ta.dataset.bound) {
       ta.dataset.bound = "1";
       ta.addEventListener("input", () => (ta.dataset.dirty = "1"));
+    }
+
+    // AGENTS.md 路径 picker:toggle button click + menu item click + outside click
+    const pathToggle = $("#codexAgentsPathToggle");
+    const pathMenu = $("#codexAgentsPathMenu");
+    if (pathToggle && !pathToggle.dataset.bound) {
+      pathToggle.dataset.bound = "1";
+      pathToggle.addEventListener("click", (e) => {
+        e.stopPropagation();
+        codexAgentsTogglePicker();
+      });
+    }
+    if (pathMenu && !pathMenu.dataset.bound) {
+      pathMenu.dataset.bound = "1";
+      pathMenu.addEventListener("click", (e) => {
+        const li = e.target.closest(".codex-path-picker-item");
+        if (!li || li.getAttribute("aria-disabled") === "true") return;
+        const hash = li.dataset.hash;
+        if (hash) codexAgentsSelectHash(hash);
+      });
+    }
+    if (!document.body.dataset.codexPathPickerOutsideBound) {
+      document.body.dataset.codexPathPickerOutsideBound = "1";
+      document.addEventListener("click", (e) => {
+        const aPicker = $("#codexAgentsPathPicker");
+        if (aPicker && !aPicker.contains(e.target)) codexAgentsClosePicker();
+        const mPicker = $("#codexMemoriesPathPicker");
+        if (mPicker && !mPicker.contains(e.target)) codexMemoriesClosePicker();
+      });
+    }
+
+    // Memories picker:toggle + menu item click
+    const memToggle = $("#codexMemoriesPathToggle");
+    const memMenu = $("#codexMemoriesPathMenu");
+    if (memToggle && !memToggle.dataset.bound) {
+      memToggle.dataset.bound = "1";
+      memToggle.addEventListener("click", (e) => {
+        e.stopPropagation();
+        codexMemoriesTogglePicker();
+      });
+    }
+    if (memMenu && !memMenu.dataset.bound) {
+      memMenu.dataset.bound = "1";
+      memMenu.addEventListener("click", (e) => {
+        const li = e.target.closest(".codex-path-picker-item");
+        if (!li || li.getAttribute("aria-disabled") === "true") return;
+        const hash = li.dataset.hash;
+        if (hash) codexMemoriesSelectHash(hash);
+      });
+    }
+
+    // 添加 modal:Enter 确认,Esc 取消
+    const addInput = $("#codexAddPathInput");
+    if (addInput && !addInput.dataset.bound) {
+      addInput.dataset.bound = "1";
+      addInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          codexAgentsConfirmPathAdd();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          codexAgentsClosePathModal();
+        }
+      });
+    }
+    // modal backdrop 点击关闭
+    const modalBackdrop = $("#codexAddPathModal");
+    if (modalBackdrop && !modalBackdrop.dataset.bound) {
+      modalBackdrop.dataset.bound = "1";
+      modalBackdrop.addEventListener("click", (e) => {
+        if (e.target === modalBackdrop) codexAgentsClosePathModal();
+      });
+    }
+
+    // History modal:toggle picker + menu item click + backdrop close + Esc
+    const histToggle = $("#codexHistoryToggle");
+    const histMenu = $("#codexHistoryMenu");
+    if (histToggle && !histToggle.dataset.bound) {
+      histToggle.dataset.bound = "1";
+      histToggle.addEventListener("click", (e) => {
+        e.stopPropagation();
+        codexHistoryPickerToggle();
+      });
+    }
+    if (histMenu && !histMenu.dataset.bound) {
+      histMenu.dataset.bound = "1";
+      histMenu.addEventListener("click", (e) => {
+        const li = e.target.closest(".codex-path-picker-item");
+        if (!li || li.getAttribute("aria-disabled") === "true") return;
+        const idx = Number(li.dataset.historyIdx);
+        if (Number.isFinite(idx)) codexHistorySelect(idx);
+      });
+    }
+    const histModal = $("#codexHistoryModal");
+    if (histModal && !histModal.dataset.bound) {
+      histModal.dataset.bound = "1";
+      histModal.addEventListener("click", (e) => {
+        if (e.target === histModal) codexHistoryClose();
+      });
+    }
+    if (!document.body.dataset.codexHistoryEscBound) {
+      document.body.dataset.codexHistoryEscBound = "1";
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+          const m = $("#codexHistoryModal");
+          if (m && !m.hidden) codexHistoryClose();
+        }
+      });
     }
 
     // sidebar click → 切 tab + lazy load

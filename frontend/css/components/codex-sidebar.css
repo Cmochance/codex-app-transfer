@@ -6,8 +6,10 @@
 .codex-layout {
   display: grid;
   grid-template-columns: 180px minmax(0, 1fr);
-  gap: 18px;
-  align-items: start;
+  gap: 12px;
+  align-items: stretch; /* 让 content 能撑满父容器高度,Agents pane 内 flex 自适应才生效 */
+  flex: 1; /* 在 page-codex flex column 链路里自动撑满剩余高度 */
+  min-height: 0; /* flex item 必须有 min-height: 0 才能让内部 overflow 生效 */
 }
 
 .codex-sidebar {
@@ -57,7 +59,6 @@
 .codex-sidebar-item.active {
   background: var(--primary-soft);
   color: var(--primary);
-  box-shadow: inset 2px 0 0 var(--primary);
 }
 
 .codex-sidebar-item.active i {
@@ -82,7 +83,43 @@
 
 .codex-content {
   min-width: 0;
+  min-height: 0;
   position: relative;
+  display: flex;
+  flex-direction: column;
+  /* panel 默认 padding: 28px 偏大 — 收紧让 preview 占更多空间 */
+  padding: 16px;
+}
+
+/* 当 Agents raw pane 是 active 时,撑满 codex-content 高度 */
+.codex-content > .codex-pane.active {
+  flex: 1;
+  min-height: 0;
+}
+
+/* page-codex 是 flex column 时 codex-layout 才能 flex:1 占满 */
+#page-codex.active {
+  display: flex;
+  flex-direction: column;
+  /* 严格 = 父容器(.app-main padding 区)可见高度,内部用 flex 压缩到视口,
+     preview 内部 overflow 滚动,而非整页滚 → 底部按钮始终可见 */
+  height: 100%;
+  min-height: 0;
+}
+
+#page-codex.active > .page-title {
+  margin-bottom: 14px;
+}
+
+#page-codex.active > .page-title h1 {
+  font-size: clamp(24px, 2.4vw, 32px);
+  margin-bottom: 0;
+}
+
+/* 抵消 .app-main 的 padding-bottom: 34px,让底部空隙跟左右(24px)一致。
+   :has() 选择器精确命中 codex page,不影响其他 page。 */
+.app-main:has(#page-codex.active) {
+  padding-bottom: 24px;
 }
 
 /* 相邻 pane 同时挂载 (lazy load 仍 fetch only on activation), 切 tab 用 fade+slide 转场
