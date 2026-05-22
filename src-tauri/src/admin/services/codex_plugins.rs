@@ -436,26 +436,42 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
             let _ = fs::remove_dir_all(&staged);
             return Err("malformed tarball:wrapper dir 内仍无 plugin.json".into());
         }
-        // collision check:此时 staged 根除 wrapper 外应该空,inner 子条目跟 staged 不冲突。
-        // 再校验一次防边界 race。
-        for entry in fs::read_dir(&inner).map_err(|e| format!("flat iter init: {e}"))? {
+        // 先把 wrapper dir 移到 staged 兄弟位置(用 PID 防多并发 install 撞名),让 staged
+        // 变空 — 这样 inner/child 跟 wrapper 同名也不会假阳性 collision(原 staged.join(name)
+        // 会指到 wrapper 自己,误判 collision)
+        let inner_holding = staged
+            .parent()
+            .ok_or_else(|| "staged 无父目录".to_owned())?
+            .join(format!(
+                ".inner-hold-{}-{}",
+                std::process::id(),
+                input.version
+            ));
+        if inner_holding.exists() {
+            fs::remove_dir_all(&inner_holding).ok();
+        }
+        fs::rename(&inner, &inner_holding).map_err(|e| format!("move wrapper out: {e}"))?;
+        // 现在 staged 是空目录,collision check 干净
+        for entry in fs::read_dir(&inner_holding).map_err(|e| format!("flat iter init: {e}"))? {
             let entry = entry.map_err(|e| format!("flat iter: {e}"))?;
             let name = entry.file_name();
             if staged.join(&name).exists() {
+                // 这种情况只有 staged 不是干净空 dir 才会触发,本不该发生(staged 是新 tempdir 解压结果)
                 let _ = fs::remove_dir_all(&staged);
+                let _ = fs::remove_dir_all(&inner_holding);
                 return Err(format!(
                     "malformed tarball:扁平化时 inner/{} 跟 staged 冲突",
                     name.to_string_lossy()
                 ));
             }
         }
-        for entry in fs::read_dir(&inner).map_err(|e| format!("flat iter: {e}"))? {
+        for entry in fs::read_dir(&inner_holding).map_err(|e| format!("flat iter: {e}"))? {
             let entry = entry.map_err(|e| format!("flat iter: {e}"))?;
             let from = entry.path();
-            let to = staged.join(from.strip_prefix(&inner).unwrap());
+            let to = staged.join(from.strip_prefix(&inner_holding).unwrap());
             fs::rename(&from, &to).map_err(|e| format!("flat mv: {e}"))?;
         }
-        fs::remove_dir_all(&inner).ok();
+        fs::remove_dir_all(&inner_holding).ok();
     }
     if !staged.join(".codex-plugin/plugin.json").exists()
         && !staged.join(".claude-plugin/plugin.json").exists()

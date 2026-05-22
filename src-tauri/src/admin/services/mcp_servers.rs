@@ -251,11 +251,14 @@ pub fn validate_spec(spec: &McpServerSpec) -> Result<(), String> {
     Ok(())
 }
 
-/// upsert 一条 `[mcp_servers.<name>]` — 不动其他节,只覆盖目标节字段
+/// upsert 一条 `[mcp_servers.<name>]` — 保留未建模字段(`tools` per-tool approval map /
+/// `env_vars` / codex 未来新加字段),只 set/remove 本工具明确建模的字段。
+///
+/// **Why**: 之前"先清后写"会把用户手写的 `[mcp_servers.foo.tools] bash = "auto"` 等未建模
+/// 字段静默删除。改成 read-modify-set,只覆盖建模字段,跨 transport 切换时显式删对端独有字段。
 pub fn upsert_server(spec: &McpServerSpec) -> Result<(), String> {
     validate_spec(spec)?;
     let mut doc = read_doc()?;
-    // 确保顶层 mcp_servers 节存在
     if !doc.contains_key("mcp_servers") {
         let mut t = toml_edit::Table::new();
         t.set_implicit(true);
@@ -265,14 +268,44 @@ pub fn upsert_server(spec: &McpServerSpec) -> Result<(), String> {
         .as_table_mut()
         .ok_or_else(|| "mcp_servers is not a table".to_owned())?;
     servers.set_implicit(true);
-    // 重建目标 server table — 简单 strategy,先清后写(老字段不残留)
-    let mut tbl = Table::new();
+    // 拿现有 table(保留未建模字段如 `tools` per-tool approval / `env_vars`)或新建空 table。
+    // write_spec_to_table 内部 sweep MODELED_KEYS 后 conditional set,跨 transport 切换时
+    // 对端独有字段(url/bearer 等)也在 sweep 范围,自然清理。
+    let existing = servers.get(&spec.name).and_then(|i| i.as_table()).cloned();
+    let mut tbl = existing.unwrap_or_default();
     write_spec_to_table(&mut tbl, spec);
     servers.insert(&spec.name, Item::Table(tbl));
     write_doc(&doc)
 }
 
+/// 本工具明确建模的 keys — 写前 sweep 清掉,防 spec.None 字段后旧值残留;
+/// 不在此清单的 key(如 `tools` per-tool approval map / `env_vars` / codex 未来新字段)
+/// 保留不动。
+const MODELED_KEYS: &[&str] = &[
+    "command",
+    "args",
+    "env",
+    "cwd",
+    "url",
+    "bearer_token_env_var",
+    "http_headers",
+    "env_http_headers",
+    "enabled",
+    "required",
+    "supports_parallel_tool_calls",
+    "experimental_environment",
+    "startup_timeout_sec",
+    "tool_timeout_sec",
+    "default_tools_approval_mode",
+    "enabled_tools",
+    "disabled_tools",
+];
+
 fn write_spec_to_table(tbl: &mut Table, spec: &McpServerSpec) {
+    // 先 sweep 建模 keys(防 spec 字段 None 时旧值残留;未建模字段不动)
+    for k in MODELED_KEYS {
+        tbl.remove(k);
+    }
     match spec.transport {
         McpTransport::Stdio => {
             if let Some(cmd) = &spec.command {
