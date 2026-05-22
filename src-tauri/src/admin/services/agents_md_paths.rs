@@ -124,9 +124,7 @@ pub fn classify_path_full(path: &Path) -> (PathCategory, Option<String>, Option<
     };
     // case 1: 父目录就是项目根(直接含 .git)
     if parent.join(".git").exists() {
-        let project_name = parent
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned());
+        let project_name = parent.file_name().map(|s| s.to_string_lossy().into_owned());
         return (PathCategory::ProjectRoot, project_name, None);
     }
     // case 2: 沿父目录上溯找 `.git/`,找到 → subdir + 项目名 + 子目录相对路径
@@ -143,9 +141,7 @@ pub fn classify_path_full(path: &Path) -> (PathCategory, Option<String>, Option<
         cur = p.parent();
     }
     // case 3: 找不到 `.git/` — 用户没用 git,用 path.parent 的 file_name 当 fallback project name
-    let project_name = parent
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned());
+    let project_name = parent.file_name().map(|s| s.to_string_lossy().into_owned());
     (PathCategory::ProjectRoot, project_name, None)
 }
 
@@ -251,7 +247,9 @@ pub fn add_path(raw_path: &str) -> Result<AgentsPathEntry, String> {
 pub fn remove_by_hash(hash: &str) -> Result<bool, String> {
     let mut store = load_store()?;
     let before = store.agents.len();
-    store.agents.retain(|p| path_hash(&PathBuf::from(p)) != hash);
+    store
+        .agents
+        .retain(|p| path_hash(&PathBuf::from(p)) != hash);
     let removed = store.agents.len() != before;
     if removed {
         save_store(&store)?;

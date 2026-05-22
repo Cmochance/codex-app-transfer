@@ -103,10 +103,7 @@ pub async fn preview(
     }
 }
 
-pub async fn apply(
-    Query(q): Query<HashQuery>,
-    Json(input): Json<ApplyInput>,
-) -> impl IntoResponse {
+pub async fn apply(Query(q): Query<HashQuery>, Json(input): Json<ApplyInput>) -> impl IntoResponse {
     let block = match build_block_for_hash(q.hash.as_deref()) {
         Ok(b) => b,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -235,9 +232,7 @@ fn now_unix() -> u64 {
 }
 
 /// 解析 hash → target_path + history_path
-fn resolve_target_and_history(
-    hash: Option<&str>,
-) -> Result<(PathBuf, PathBuf), String> {
+fn resolve_target_and_history(hash: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
     let target = match hash {
         Some(h) if !h.is_empty() => agents_md_paths::resolve_path_by_hash(h)?,
         _ => agents_md_paths::global_agents_path()?,
@@ -281,10 +276,7 @@ fn write_history_raw(history_path: &PathBuf, mut history: Vec<HistoryEntry>) -> 
 /// - 否则 → 正常 push 新条目
 ///
 /// 这避免反复 backup / pre-apply backup 产生大量重复条目。
-fn snapshot_current_to_history(
-    target: &PathBuf,
-    history_path: &PathBuf,
-) -> Result<(), String> {
+fn snapshot_current_to_history(target: &PathBuf, history_path: &PathBuf) -> Result<(), String> {
     let content = if target.exists() {
         fs::read_to_string(target).map_err(|e| format!("read target: {e}"))?
     } else {
@@ -321,8 +313,11 @@ pub async fn raw_get(Query(q): Query<HashQuery>) -> impl IntoResponse {
     let content = match fs::read_to_string(&target) {
         Ok(c) => c,
         Err(e) => {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("read failed: {e}"))
-                .into_response()
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read failed: {e}"),
+            )
+            .into_response()
         }
     };
     Json(json!({
@@ -349,18 +344,15 @@ pub async fn raw_write(
     }
     if let Some(parent) = target.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}"))
-                .into_response();
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")).into_response();
         }
     }
     let tmp = target.with_extension("md.tmp");
     if let Err(e) = fs::write(&tmp, &input.content) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write tmp: {e}"))
-            .into_response();
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write tmp: {e}")).into_response();
     }
     if let Err(e) = fs::rename(&tmp, &target) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}"))
-            .into_response();
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
     }
     Json(json!({"success": true})).into_response()
 }
@@ -401,14 +393,11 @@ pub async fn restore_raw(
     }
     if let Some(parent) = target.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}"))
-                .into_response();
+            return err(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")).into_response();
         }
     }
     if let Err(e) = fs::write(&target, &restore_content) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
-            .into_response();
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
     }
     Json(json!({"success": true})).into_response()
 }
-

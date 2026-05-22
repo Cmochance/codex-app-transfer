@@ -75,9 +75,7 @@ pub fn classify_path_full(path: &Path) -> (PathCategory, Option<String>, Option<
         return (PathCategory::ProjectRoot, None, None);
     };
     if parent.join(".git").exists() {
-        let project_name = parent
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned());
+        let project_name = parent.file_name().map(|s| s.to_string_lossy().into_owned());
         return (PathCategory::ProjectRoot, project_name, None);
     }
     let mut cur = parent.parent();
@@ -92,9 +90,7 @@ pub fn classify_path_full(path: &Path) -> (PathCategory, Option<String>, Option<
         }
         cur = p.parent();
     }
-    let project_name = parent
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned());
+    let project_name = parent.file_name().map(|s| s.to_string_lossy().into_owned());
     (PathCategory::ProjectRoot, project_name, None)
 }
 
