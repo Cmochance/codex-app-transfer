@@ -620,24 +620,6 @@
                 <button class="btn btn-outline-primary" type="button" data-action="codex-mcp-server-edit" id="codexMcpEditBtn"><i class="bi bi-pencil"></i><span id="codexMcpEditBtnText">编辑</span></button>
               </div>
 
-              <!-- 新增 server modal — 输入新 server 名 -->
-              <div class="codex-modal-backdrop" id="codexMcpNewServerModal" hidden>
-                <div class="codex-modal" role="dialog" aria-modal="true">
-                  <div class="codex-modal-header">
-                    <h3>新增 MCP server</h3>
-                    <button class="codex-modal-close" type="button" data-action="codex-mcp-new-cancel"><i class="bi bi-x-lg"></i></button>
-                  </div>
-                  <p class="codex-modal-desc">为新 server 起一个唯一名字(仅字母数字 / 短横 / 下划线 / 点);名字一旦确定不可修改</p>
-                  <div class="form-group">
-                    <label class="form-label">Server 名</label>
-                    <input type="text" class="form-control" id="codexMcpNewServerNameInput" placeholder="my-server" />
-                  </div>
-                  <div class="button-row">
-                    <button class="btn btn-primary" type="button" data-action="codex-mcp-new-confirm"><i class="bi bi-check2"></i><span>确认创建</span></button>
-                    <button class="btn btn-outline-danger" type="button" data-action="codex-mcp-new-cancel"><i class="bi bi-x"></i><span>取消</span></button>
-                  </div>
-                </div>
-              </div>
             </div>
 
             <!-- Plugins sub-pane -->
@@ -661,6 +643,25 @@
               <ul class="codex-mcp-market-list" id="codexMcpMarketServersList"></ul>
               <h3 class="codex-mcp-section-title" data-i18n="codex.mcp.pluginBundles">Plugin 安装包(一键安装)</h3>
               <ul class="codex-mcp-market-list" id="codexMcpMarketPluginsList"></ul>
+            </div>
+          </div>
+
+          <!-- 新增 server modal — 输入新 server 名(跟其他 modal 平级,避免 sub-pane hidden 时 modal 也被 hide)-->
+          <div class="codex-modal-backdrop" id="codexMcpNewServerModal" hidden>
+            <div class="codex-modal" role="dialog" aria-modal="true">
+              <div class="codex-modal-header">
+                <h3>新增 MCP server</h3>
+                <button class="codex-modal-close" type="button" data-action="codex-mcp-new-cancel"><i class="bi bi-x-lg"></i></button>
+              </div>
+              <p class="codex-modal-desc">为新 server 起一个唯一名字(仅字母数字 / 短横 / 下划线 / 点);名字一旦确定不可修改</p>
+              <div class="form-group">
+                <label class="form-label">Server 名</label>
+                <input type="text" class="form-control" id="codexMcpNewServerNameInput" placeholder="my-server" />
+              </div>
+              <div class="button-row">
+                <button class="btn btn-primary" type="button" data-action="codex-mcp-new-confirm"><i class="bi bi-check2"></i><span>确认创建</span></button>
+                <button class="btn btn-outline-danger" type="button" data-action="codex-mcp-new-cancel"><i class="bi bi-x"></i><span>取消</span></button>
+              </div>
             </div>
           </div>
 

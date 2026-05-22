@@ -294,10 +294,15 @@ pub fn uninstall(key: &str) -> Result<(), String> {
         fs::remove_dir_all(&cache_dir).map_err(|e| format!("rm cache dir: {e}"))?;
     }
     let mut doc = read_doc()?;
+    let mut toml_removed = false;
     if let Some(plugins) = doc.get_mut("plugins").and_then(|i| i.as_table_mut()) {
-        plugins.remove(key);
+        toml_removed = plugins.remove(key).is_some();
     }
-    write_doc(&doc)
+    // 只有 toml 真有 entry 被删才写盘 — 避免对不存在 plugin 调 uninstall 也 churn config.toml
+    if toml_removed {
+        write_doc(&doc)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -394,30 +399,58 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
     let candidate_a = staged.join(".codex-plugin").join("plugin.json");
     let candidate_b = staged.join(".claude-plugin").join("plugin.json");
     if !candidate_a.exists() && !candidate_b.exists() {
-        // 可能 tar 内还有一层 wrapper dir,展开一次
-        if let Ok(read) = fs::read_dir(&staged) {
-            let dirs: Vec<_> = read
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .map(|e| e.path())
-                .collect();
-            if dirs.len() == 1 {
-                let inner = &dirs[0];
-                if inner.join(".codex-plugin/plugin.json").exists()
-                    || inner.join(".claude-plugin/plugin.json").exists()
-                {
-                    // 把内层 dir 提升为 staged 内容
-                    let inner_clone = inner.clone();
-                    for entry in fs::read_dir(&inner_clone).map_err(|e| format!("flat: {e}"))? {
-                        let entry = entry.map_err(|e| format!("flat iter: {e}"))?;
-                        let from = entry.path();
-                        let to = staged.join(from.strip_prefix(&inner_clone).unwrap());
-                        fs::rename(&from, &to).map_err(|e| format!("flat mv: {e}"))?;
-                    }
-                    fs::remove_dir_all(&inner_clone).ok();
-                }
+        // tar 内可能多包一层 wrapper dir(github tarball 默认行为),展开
+        // **严格校验**:staged 根必须只含**单个**子目录,无任何 root-level 文件,
+        // 且 collision check 防 inner 子条目跟 staged 根残留冲突。一旦异常立即清 staged
+        // 报错(防 malformed tarball 走到后续校验)
+        let entries: Vec<_> = fs::read_dir(&staged)
+            .map_err(|e| format!("read staged: {e}"))?
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        let dirs: Vec<&PathBuf> = entries.iter().filter(|p| p.is_dir()).collect();
+        let non_dirs: Vec<&PathBuf> = entries.iter().filter(|p| !p.is_dir()).collect();
+        if !non_dirs.is_empty() {
+            let _ = fs::remove_dir_all(&staged);
+            return Err(format!(
+                "malformed tarball:无 plugin.json 但根含 {} 个 root-level 文件",
+                non_dirs.len()
+            ));
+        }
+        if dirs.len() != 1 {
+            let _ = fs::remove_dir_all(&staged);
+            return Err(format!(
+                "malformed tarball:无 plugin.json 且根含 {} 个子目录(应单一 wrapper)",
+                dirs.len()
+            ));
+        }
+        let inner = dirs[0].clone();
+        if !inner.join(".codex-plugin/plugin.json").exists()
+            && !inner.join(".claude-plugin/plugin.json").exists()
+        {
+            let _ = fs::remove_dir_all(&staged);
+            return Err("malformed tarball:wrapper dir 内仍无 plugin.json".into());
+        }
+        // collision check:此时 staged 根除 wrapper 外应该空,inner 子条目跟 staged 不冲突。
+        // 再校验一次防边界 race。
+        for entry in fs::read_dir(&inner).map_err(|e| format!("flat iter init: {e}"))? {
+            let entry = entry.map_err(|e| format!("flat iter: {e}"))?;
+            let name = entry.file_name();
+            if staged.join(&name).exists() {
+                let _ = fs::remove_dir_all(&staged);
+                return Err(format!(
+                    "malformed tarball:扁平化时 inner/{} 跟 staged 冲突",
+                    name.to_string_lossy()
+                ));
             }
         }
+        for entry in fs::read_dir(&inner).map_err(|e| format!("flat iter: {e}"))? {
+            let entry = entry.map_err(|e| format!("flat iter: {e}"))?;
+            let from = entry.path();
+            let to = staged.join(from.strip_prefix(&inner).unwrap());
+            fs::rename(&from, &to).map_err(|e| format!("flat mv: {e}"))?;
+        }
+        fs::remove_dir_all(&inner).ok();
     }
     if !staged.join(".codex-plugin/plugin.json").exists()
         && !staged.join(".claude-plugin/plugin.json").exists()
