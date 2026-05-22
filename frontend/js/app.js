@@ -2915,7 +2915,7 @@
         await codexAgentsOnBackup();
       }
       if (action === "codex-agents-history-toggle") {
-        await codexHistoryOpen();
+        await codexAgentsToggleHistory();
       }
       if (action === "codex-history-close") {
         codexHistoryClose();
