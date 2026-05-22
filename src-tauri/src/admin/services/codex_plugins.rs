@@ -339,19 +339,42 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
             }
         }
     }
-    // 下载
-    let bytes = reqwest::get(&input.tarball_url)
+    // 下载 — 严防 OOM 攻击:
+    // (1) timeout 60s(防慢速 / 永不结束的连接占内存)
+    // (2) Content-Length 预检 > 50MB 直接拒(防 server 谎报大文件)
+    // (3) streaming 累计字节,边读边检查 > 50MB 立即 abort(防 server 不发 Content-Length 但实际超大)
+    const MAX_TARBALL_BYTES: usize = 50 * 1024 * 1024;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("reqwest build: {e}"))?;
+    let resp = client
+        .get(&input.tarball_url)
+        .send()
         .await
         .map_err(|e| format!("download: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("http error: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("read bytes: {e}"))?;
-    // 大小限制 50 MB
-    if bytes.len() > 50 * 1024 * 1024 {
-        return Err(format!("tarball too large(>50MB): {} bytes", bytes.len()));
+        .map_err(|e| format!("http error: {e}"))?;
+    if let Some(cl) = resp.content_length() {
+        if cl > MAX_TARBALL_BYTES as u64 {
+            return Err(format!(
+                "tarball too large per Content-Length: {cl} bytes (max {MAX_TARBALL_BYTES})"
+            ));
+        }
     }
+    let mut stream = resp.bytes_stream();
+    use futures::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("read chunk: {e}"))?;
+        if buf.len() + chunk.len() > MAX_TARBALL_BYTES {
+            return Err(format!(
+                "tarball exceeded {MAX_TARBALL_BYTES} bytes mid-download — aborted"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let bytes = buf;
     // 解压到 staged tempdir
     let target_dir = plugins_cache_root()?
         .join(&input.marketplace)
