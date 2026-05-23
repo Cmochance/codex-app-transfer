@@ -51,6 +51,11 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - Codex APP 的 freeform `apply_patch` 工具(编辑文件 +/- diff UI)在 DeepSeek / Kimi / MiMo 等 chat-completions provider 上正常工作:adapter 双向桥接 Responses `custom_tool_call` ↔ chat `function_call` 形态,模型按 V4A 格式生成 patch,Codex APP 渲染为 diff(issue #235)
 - 会话历史**两层持久化**:L1 内存 LRU + L2 sqlite 30 天 TTL(`~/.codex-app-transfer/sessions.db`),`.app` 重启不丢历史
 - Codex APP 原配置守护:apply 前自动快照 `~/.codex/{config.toml,auth.json}`,退出 / 下次启动按 key 智能合并还原
+- **Codex 文档管理**(Sidebar → Codex):
+  - **Agents**:任意位置 `AGENTS.md` raw 全文 read/write + 文件系统选择;按 `.git/` 自动分类 project-root / subdir 显示 chip
+  - **Memories**:固定管理 `~/.codex/memories/MEMORY.md`(主索引)+ `memory_summary.md`(摘要)— codex 唯二 user-editable 的 AI 实际读取索引
+  - **Skills**:扫描 `~/.codex/skills/<name>/SKILL.md` 全列表 raw 编辑;"打开文件夹"按钮调系统 `open` 让用户在 Finder/资源管理器 改 SKILL.md 之外的子文件(scripts / examples / templates 等)
+  - **MCP**:结构化 JSON 编辑 `~/.codex/config.toml` 的 `[mcp_servers.*]` 节(`toml_edit` round-trip 保留注释 + 其他配置节)+ Plugins 子页扫 `~/.codex/plugins/cache/` 列已安装 plugin(enable toggle / uninstall);所有改动 atomic write + 独立 history 互不交叉(SHA-256 hash 路径)
 - 实时日志面板,2 秒自动刷新;统一 `tracing::warn!(error_id, detail)` + 稳定 token,operator 可 grep / 聚合
 - 反馈弹窗附带诊断材料(环境信息、脱敏配置、最近错误快照及完整请求 / 响应),减少手工补材料
 - 中文 / 英文界面,浅色 / 深色 / 绿色 / 橙色 / 灰色 / 白色多种主题

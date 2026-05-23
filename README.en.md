@@ -51,6 +51,11 @@ With any provider enabled, Codex App's model picker shows `<provider> / <real-mo
 - Codex App's freeform `apply_patch` tool (edit-file +/- diff UI) works on chat-completions providers: the adapter bridges Responses `custom_tool_call` ↔ chat `function_call` wire forms, the model emits V4A-format patches, Codex App renders the diff (issue #235)
 - **Two-layer session history persistence**: L1 in-memory LRU + L2 sqlite with 30-day TTL (`~/.codex-app-transfer/sessions.db`), preserving history across `.app` restarts
 - Codex App config guardrails: snapshots `~/.codex/{config.toml,auth.json}` before apply; restores via per-key smart merge on exit / next start
+- **Codex Doc Management** (Sidebar → Codex):
+  - **Agents**: raw read/write `AGENTS.md` at any path with file system picker; auto-classify project-root / subdir via `.git/` detection with chip labels
+  - **Memories**: fixed two entries `~/.codex/memories/MEMORY.md` (main index) + `memory_summary.md` (auto summary) — the only two user-editable AI memory indexes that codex actually reads
+  - **Skills**: scan `~/.codex/skills/<name>/SKILL.md` for raw editing; "Open folder" button shells out to `open` so users edit non-SKILL.md companion files (scripts / examples / templates) in Finder/Explorer
+  - **MCP**: structured JSON editing on the `[mcp_servers.*]` section of `~/.codex/config.toml` (`toml_edit` round-trip preserves comments + sibling config sections); Plugins sub-tab scans `~/.codex/plugins/cache/` for installed bundles (enable toggle / uninstall); all writes are atomic + independent history per SHA-256 path hash (no cross-tab interference)
 - Real-time logs panel auto-refreshing every 2s; unified `tracing::warn!(error_id, detail)` with stable tokens — operators can grep / aggregate
 - Feedback dialog automatically attaches diagnostic material (environment info, sanitized config, recent error snapshot with full request / response) — fewer back-and-forth follow-ups
 - Chinese / English UI; light / dark / green / orange / gray / white themes
