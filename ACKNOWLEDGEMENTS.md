@@ -17,7 +17,7 @@
 - **索引**:每个上游唯一 `### 项目名` section,GitHub 自动生成 TOC,Ctrl+F 项目名即跳。
 - **更新**:
   - **小修**(同步常量 / fix bug):按"借鉴清单"定位 file:line,改完同步 entry 的"代码层引用 quote"
-  - **上游主线大改 / 失效**:在 [docs/followup-tracker.md](docs/followup-tracker.md) 开 followup ticket,长跨度跟踪
+  - **上游主线大改 / 失效**:在 **Linear workspace `Mochance`**(team Mochance,label `Improvement`)开 followup issue,长跨度跟踪
   - **License 变更 / 上游归档**:必看 entry 的 License + TOS 字段做合规判断
 
 ## Entry Schema
@@ -255,11 +255,11 @@
 - **本项目差异 / 扩展**:
   - **关键改造**:上游早期版本走 useState hook 链找 setter;Codex Desktop 26.513+ 之后 React state 结构改了导致 hook-scan 失效。本项目改走 React Context.Provider 反查,更稳定
   - 加 DOM-level strict fallback:即使 setter 找不到也能让按钮可点
-  - inject script 内 short-circuit `if (auth.authMethod === 'chatgpt') return true;`(避免重复注入,但首次必然触发一次 — 关联 followup [#27](docs/followup/27-codex-desktop-double-splash-on-plugin-unlock.md))
+  - inject script 内 short-circuit `if (auth.authMethod === 'chatgpt') return true;`(避免重复注入,但首次必然触发一次 — 历史 followup #27 已 resolved by PR #191,详情归档在本地 `docs/`)
 - **同步策略**:
   - Codex Desktop 主线升级若让脚本失效,**优先**看 galaxywk223 主线是否有修
   - 若上游也跟进新版 Codex Desktop,本项目同步 inject script(注意保留本地 React Context 改造跟 DOM fallback)
-- **关联 PR / followup**: [#27 P3 二次 splash 诊断](docs/followup/27-codex-desktop-double-splash-on-plugin-unlock.md)(setAuthMethod 触发 AuthContext 重 mount 嫌疑)
+- **关联 PR / followup**: PR #191 主修;长期"setAuthMethod 触发 AuthContext 重 mount"消除调研 → Linear [MOC-5](https://linear.app/mochance/issue/MOC-5)
 - **代码层引用**(`codex_plugin_unlocker.rs:389-401` 节选):
   > 算法借鉴 galaxywk223/codex-plugin-unlocker (MIT, 2026-05-11)
   > https://github.com/galaxywk223/codex-plugin-unlocker/blob/main/codex_plugin_unlocker/inject/plugin-unlock.js
@@ -307,7 +307,7 @@
 - **同步策略**:
   - 上游 launcher.py COM 调用约定变动(Microsoft 更新 ActivateApplication 接口的可能性极低)→ 跟踪 windows-rs major version 升级
   - AUMID 解析逻辑跟随 Codex Desktop AppxManifest 命名约定;若 OpenAI 改 package family name 命名(如改 `OpenAI.CodexCLI`),`resolve_codex_aumid` 的 PowerShell `-Name 'OpenAI.Codex'` filter 需更新
-- **关联 PR / followup**: PR #191(主修),[follow-up #33](docs/followup/33-windows-plugin-unlock-msix-store.md)
+- **关联 PR / followup**: PR #191(主修),历史 followup #33 已 resolved by PR #227(端口冲突探测)+ Task 2 非-Store .exe fallback dropped(issue #226 closed)
 - **代码层引用**(`windows_msix.rs:18-25` 节选):
   > 实现路径 1:1 借鉴 `BigPizzaV3/CodexPlusPlus`(MIT,2699 stars)的 Python 实现 `codex_session_delete/launcher.py:283-451`(2026-05-17 同步)。同道项目实证可工作。本 Rust 实现用 `windows` crate 官方 binding 而非手搓 ctypes COM,稳定性更好。
 
@@ -319,4 +319,4 @@
 - **修改已有借鉴**:本项目代码 file:line 变了 → 同步 entry 的"借鉴清单";本项目差异扩展了 → 加到"本项目差异 / 扩展"
 - **删除借鉴**(代码被重写不再依赖):entry 移到末尾 `## 已不再依赖的历史借鉴` section 保留追溯,**不直接删** — 历史归属信息必须可回溯
 - **License 合规**:任何"算法 1:1 复刻 / 整体借鉴 / 数据模式参照 / Wire-level 对齐" 必须保留 license + 作者署名(代码注释 + 本文档双重记录)
-- **上游主线大改 / 失效跟踪**:走 [docs/followup-tracker.md](docs/followup-tracker.md) 开 followup ticket(本文档只放当前状态 catalog,长跨度跟踪走 tracker)
+- **上游主线大改 / 失效跟踪**:走 **Linear workspace `Mochance`**(team Mochance)开 followup issue(本文档只放当前状态 catalog,长跨度跟踪走 Linear)

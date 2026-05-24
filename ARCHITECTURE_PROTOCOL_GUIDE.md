@@ -79,9 +79,10 @@
 ### 3.4 文档与变更同步规则
 
 - 实现完成后必须同步：
-  - `docs/protocol-unification-rfc-phase4.md`（或后续 RFC，例如 Phase 5）
+  - 本文档（`ARCHITECTURE_PROTOCOL_GUIDE.md`）若架构层次改动
+  - 维护者本地 `docs/` 下对应 RFC（`docs/` 已 gitignored，不入 remote；Phase 4 / 5 等 RFC 历史归档在本地）
   - 变更清单（涉及文件、测试结果、已知风险）
-- 保持“代码结构说明”与“实际目录结构”一致，避免文档漂移
+- 保持"代码结构说明"与"实际目录结构"一致，避免文档漂移
 
 ### 3.5 已落地 canonical protocol
 

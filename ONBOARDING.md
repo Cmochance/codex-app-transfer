@@ -6,10 +6,12 @@
 >
 > **配套阅读**:
 > - 架构纪律 → `ARCHITECTURE_PROTOCOL_GUIDE.md`
-> - 协议演进历史 → `docs/protocol-unification-rfc-phase{1,4,5}.md`
-> - 构建流程 → `docs/build.md`(release 细节)
-> - Followup 制度 → `docs/followup-tracker.md`
+> - 协议演进历史 → 维护者本地 `docs/`(gitignored,Phase 1/4 已 ship,Phase 5 Anthropic Messages active)
+> - 构建流程 → 维护者本地 `docs/build.md`(release 细节)
+> - Followup 制度 → Linear workspace `Mochance`(team `Mochance`,label `Improvement`)
 > - 上游借鉴致谢 → `ACKNOWLEDGEMENTS.md`
+>
+> **关于 `docs/`**:整目录已 gitignored(2026-05-24)— 维护者本地放调研 / RFC / refactor / archive / 上游 reference / agent review / wire dump / 反馈分析,**不入 remote**。只有 `README*.md` / `CHANGELOG.md` / `AGENTS.md` / `ACKNOWLEDGEMENTS.md` / `ARCHITECTURE_PROTOCOL_GUIDE.md` / `ONBOARDING.md` 6 文件 + `release-notes/` + `img/` 在 git。
 
 ---
 
@@ -117,13 +119,10 @@ codex-app-transfer/
 ├── release/                    # 内置公钥 PEM (build-time include_str!)
 ├── .release-signing/           # ★ private key (gitignored, secret 源)
 │
-├── docs/
-│   ├── followup-tracker.md     # 长期 backlog 索引
-│   ├── followup/<id>-<slug>.md # 每条 followup 详情 (强制格式见 tracker.md)
-│   ├── protocol-unification-rfc-phase{1,4,5}.md  # 架构演进 RFC
-│   ├── CHANGELOG.md            # 用户面向 release notes
-│   ├── build.md                # release pipeline 细节
-│   └── release-notes/          # 每版 GitHub release body 模板
+├── docs/                       # ★ gitignored — 维护者本地放调研 / RFC / archive,不入 remote
+├── release-notes/              # 每版 GitHub release body 模板(tracked,user-facing)
+├── img/                        # README 截图(tracked,user-facing)
+├── CHANGELOG.md                # 用户面向 release notes 索引(tracked,user-facing)
 │
 ├── tests/replay/fixtures/      # 反向 diff fixture (xtask gen-fixtures 产生)
 ├── ARCHITECTURE_PROTOCOL_GUIDE.md  # ★ 架构纪律 (新协议必读)
@@ -245,7 +244,7 @@ gh release edit v2.1.12 --draft=false --prerelease=false --latest
 
 ### 5.7 Release notes 模板
 
-`docs/release-notes/<version>.md` 走严格模板(参考 `v2.1.7.md`):
+`release-notes/<version>.md`(root,tracked)走严格模板(参考 `v2.1.7.md`):
 - **单一 `###` 主题**(多修复合并成综合主题 + bullets)
 - 允许 inline `code` / code block 区分技术名词
 - **禁用** 粗体 / 斜体 / 删除线 / 中文引号等强调
@@ -414,7 +413,7 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 
 按 `ARCHITECTURE_PROTOCOL_GUIDE.md §3` 严格执行:
 
-1. **写 RFC**(`docs/protocol-unification-rfc-phase<N>.md`):目标 / 边界 / 风险 / 回滚
+1. **写 RFC**(维护者本地 `docs/protocol-unification-rfc-phase<N>.md`,`docs/` 已 gitignored):目标 / 边界 / 风险 / 回滚
 2. 新建 `crates/adapters/src/mapper/<protocol>.rs` 实现 `RequestMapper` + `ResponseMapper` trait
 3. 新建 `crates/adapters/src/<protocol>/mod.rs` 薄编排,**禁止**写复杂 provider 分支
 4. 在 `AdapterRegistry::lookup`(`crates/adapters/src/registry.rs`)加 canonical name + 老别名归一
@@ -473,16 +472,17 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 
 ## 12. Followup 制度
 
-**核心约束**:任何"当前 PR 范围内不修但值得跟踪"的问题**必须**落:
+**2026-05-24 起改走 Linear**(workspace `Mochance`,team `Mochance`)。任何"当前 PR 范围内不修但值得跟踪"的问题**必须**:
 
-1. `docs/followup/<id>-<slug>.md` — 单条详情(强制 YAML frontmatter + 6 段正文,见 `docs/followup-tracker.md`)
-2. `docs/followup-tracker.md` Active 段加 1 行索引(≤150 字符)
+1. 开 Linear issue:`mcp__linear__save_issue(team="Mochance", labels=["Improvement"], priority=P1=1/P2=3/P3=4, state="Todo" 或 "Backlog")`
+2. description 写够详细(触发上下文 + 问题描述 + 已有调研 + 风险 + 建议方向 + 关联资源,半年后回看不用重新调研,含 file:line / 真实数据样本路径 / 决策推导链)
+3. 关联 PR / GitHub issue 挂 `links` 字段
 
-**强制详细**:详情文件必须写到"半年后回看不需要重新调研"的程度。包含 file:line 引用 / 真实数据样本路径 / 决策推导链。
+**resolve 时**:`mcp__linear__save_issue(id="MOC-N", state="Done")`,body 末尾追加 `- resolved by PR #N (YYYY-MM-DD)`
 
-**resolve 时**:把详情文件 frontmatter `status: active` 改 `resolved` + 加 `resolved_pr` + `resolved_date`,索引行从 Active 段移到 Resolved 段。
+**为什么这个制度重要**:这个项目唯一对抗 bus-factor 的机制就是这套 followup 制度。Cmochance 离开后,新维护者读 Linear backlog 就知道每个未决问题的完整背景。**不要省略任何条目**。
 
-**为什么这个制度重要**:这个项目唯一对抗 bus-factor 的机制就是 followup tracker。Cmochance 离开后,新维护者读 tracker 就知道每个未决问题的完整背景。**不要省略任何条目**。
+**历史制度**:2026-05-24 前用 `docs/followup-tracker.md` + `docs/followup/<id>-<slug>.md` 详情两级结构,迁 Linear + `docs/` 整目录 gitignored 后停用。旧详情文件维护者本地 `docs/archive/followup/` 仍可读。首批迁移 MOC-5..MOC-11 跨原 #32 / #39 / #40 / #41 / #42 / #44 / #45。
 
 ---
 
@@ -558,13 +558,13 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 接手前**一定**全读一遍:
 
 1. `ARCHITECTURE_PROTOCOL_GUIDE.md`(架构纪律)
-2. `docs/build.md`(release 细节)
-3. `docs/followup-tracker.md`(未决问题全景)
-4. `docs/protocol-unification-rfc-phase4.md`(最重要的架构演进)
-5. `ACKNOWLEDGEMENTS.md`(法律 / 上游借鉴)
-6. `AGENTS.md`(AI 协作规范)
-7. `README.md` + `README.en.md`(用户视角)
-8. 本文档
+2. `CHANGELOG.md`(版本演进概览)
+3. `ACKNOWLEDGEMENTS.md`(法律 / 上游借鉴)
+4. `AGENTS.md`(AI 协作规范)
+5. `README.md` + `README.en.md`(用户视角)
+6. 本文档
+7. Linear workspace `Mochance`(未决 followup 全景 — Todo / Backlog)
+8. 维护者本地 `docs/build.md` + `docs/protocol-unification-rfc-phase{1,4,5}.md`(`docs/` gitignored;build 细节 + 架构演进 RFC)
 
 ---
 
@@ -581,7 +581,7 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 - [ ] 跑一次 rc release(`gh workflow run release.yml -f version=X.Y.Z-rc1`),全平台手测
 - [ ] 真机 Codex Desktop 测 Plugin Unlocker(macOS + Windows MSIX)
 - [ ] 验证 macOS translocation precheck(把 .app 留在 .dmg 里挂载点跑)
-- [ ] 把 `docs/followup-tracker.md` Active 段每条点开读详情
+- [ ] 把 Linear workspace `Mochance` 的 Active(Todo / Backlog)followup 每条点开读详情
 
 第 3-4 周:
 - [ ] 拆 `crates/adapters/src/responses/request.rs`(5396 行)— 第一个大文件

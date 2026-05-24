@@ -12,7 +12,7 @@
 <p align="center">
   <a href="README.md">简体中文</a> |
   <a href="README.en.md">English</a> |
-  <a href="docs/CHANGELOG.md">Changelog</a>
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center">
@@ -27,21 +27,21 @@ Codex App Transfer is a lightweight desktop config + forwarding tool for the **O
 
 After starting forwarding, Codex App talks to this tool at `127.0.0.1:18080`. Closing the window minimizes the app to the system tray; right-click the tray icon and choose "Exit" to fully quit.
 
-Current version **v2.1.14** (see [Changelog](docs/CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
+Current version **v2.1.14** (see [Changelog](CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
 
 ## Preview
 
 | Dashboard | Providers |
 |---|---|
-| ![Board](docs/img/Board.png) | ![Providers](docs/img/Providers.png) |
+| ![Board](img/Board.png) | ![Providers](img/Providers.png) |
 | **Settings** | **Logs** |
-| ![Settings](docs/img/Settings.png) | ![Logs](docs/img/Logs.png) |
+| ![Settings](img/Settings.png) | ![Logs](img/Logs.png) |
 
 ### Codex App in action
 
 With any provider enabled, Codex App's model picker shows `<provider> / <real-model>`-style real model names. Tool loops / `previous_response_id` history replay / thinking-mode reasoning_content injection are all handled transparently by the local proxy:
 
-![Codex App real conversation](docs/img/codex-cli-real-chat.png)
+![Codex App real conversation](img/codex-cli-real-chat.png)
 
 ## What it does
 

@@ -12,7 +12,7 @@
 <p align="center">
   <a href="README.md">简体中文</a> |
   <a href="README.en.md">English</a> |
-  <a href="docs/CHANGELOG.md">Changelog</a>
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center">
@@ -27,21 +27,21 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 启动转发后,Codex APP 通过本机 `127.0.0.1:18080` 与本工具通信。关闭窗口会缩到系统托盘继续运行,右键托盘"退出"才完全退出。
 
-当前版本 **v2.1.14**(详见 [Changelog](docs/CHANGELOG.md) 与 [Releases](https://github.com/Cmochance/codex-app-transfer/releases))。
+当前版本 **v2.1.14**(详见 [Changelog](CHANGELOG.md) 与 [Releases](https://github.com/Cmochance/codex-app-transfer/releases))。
 
 ## 界面预览
 
 | 仪表盘 | 供应商 |
 |---|---|
-| ![Board](docs/img/Board.png) | ![Providers](docs/img/Providers.png) |
+| ![Board](img/Board.png) | ![Providers](img/Providers.png) |
 | **设置** | **日志** |
-| ![Settings](docs/img/Settings.png) | ![Logs](docs/img/Logs.png) |
+| ![Settings](img/Settings.png) | ![Logs](img/Logs.png) |
 
 ### Codex APP 实际接入
 
 启用任意供应商后,Codex APP 模型选择器会显示「<provider> / <real-model>」形式的真实模型名,对话过程中工具循环 / `previous_response_id` 历史回放 / thinking 模式 reasoning_content 注入全部由本地代理透明处理:
 
-![Codex APP 实际对话](docs/img/codex-cli-real-chat.png)
+![Codex APP 实际对话](img/codex-cli-real-chat.png)
 
 ## 能做什么
 

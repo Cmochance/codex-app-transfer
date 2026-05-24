@@ -1,6 +1,6 @@
 # Changelog
 
-逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `docs/release-notes/v*.md`。
+逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
 ## Unreleased — PR #153 draft
 
@@ -67,7 +67,7 @@ MCP 工具调用 + namespace(`type:"namespace"` 包递归展平 + function_call 
 
 ## v2.0.x
 
-Python → Rust/Tauri 全栈重写,重写过程 7 阶段 + 30+ 修订日志见 [`docs/refactor/migration.md`](refactor/migration.md),核心结论 + 量化对比见 [`docs/release-notes/v2.0.0.md`](release-notes/v2.0.0.md)。
+Python → Rust/Tauri 全栈重写,核心结论 + 量化对比见 [`release-notes/v2.0.0.md`](release-notes/v2.0.0.md)。重写过程 7 阶段 + 30+ 修订日志归档在维护者本地 `docs/`(`docs/` 已 gitignored,见 .gitignore Local-only docs 段)。
 
 逐版本 release notes:[v2.0.0](release-notes/v2.0.0.md) / [v2.0.2](release-notes/v2.0.2.md) / [v2.0.3](release-notes/v2.0.3.md) / [v2.0.4](release-notes/v2.0.4.md) / [v2.0.5](release-notes/v2.0.5.md) / [v2.0.6](release-notes/v2.0.6.md) / [v2.0.7](release-notes/v2.0.7.md) / [v2.0.8](release-notes/v2.0.8.md)(无 v2.0.1 release notes — 跟随 v2.0.0 工程修订发布)。
 
@@ -77,4 +77,4 @@ Python + cryptography 验签时代,已被 v2.x Rust 主线全面取代,新装请
 
 ---
 
-> Followup backlog(跨 session 长期持有的研究 / refactor / 观测 tickets)见 [`docs/followup-tracker.md`](followup-tracker.md) + `docs/followup/<id>-<slug>.md` 详情。
+> Followup backlog(跨 session 长期持有的研究 / refactor / 观测 tickets)在 **Linear workspace `Mochance`**(team Mochance,label `Improvement`)。历史 `docs/followup-tracker.md` + `docs/followup/` 详情已归档到维护者本地 `docs/`(gitignored)。

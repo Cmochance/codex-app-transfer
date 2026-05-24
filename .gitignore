@@ -64,10 +64,15 @@ macos/assets/app-icon.icns
 macos/assets/app-icon.iconset/
 macos/assets/app-icon-prepared.png
 
-# Internal-only docs (kept locally; not part of the public repo)
-docs/grok/
-docs/litellm/
-docs/plan/
+# === Local-only docs ===
+# 整个 docs/ 不入仓库(2026-05-24 决定 — Linear 跟踪 followup,GitHub release notes
+# 替代 docs/release-notes/,根目录 README + CHANGELOG + ACKNOWLEDGEMENTS + AGENTS +
+# ONBOARDING + ARCHITECTURE_PROTOCOL_GUIDE 6 文件足够公开文档)。
+# 维护者本地可在 docs/ 放任意调研 / 历史归档 / 上游 reference / agent review 报告 /
+# wire dumps / 反馈分析 — 都不会进 remote。
+docs/
+
+# User-private feedback bundles (PDFs, configs, logs from real users — PII risk)
 反馈/
 
 # Feedback Worker secrets / 本地缓存
@@ -89,6 +94,3 @@ src-tauri/gen/
 # Tauri auto-generated mobile icons(本仓不发移动端;`cargo tauri icon` 重生即可)
 src-tauri/icons/android/
 src-tauri/icons/ios/
-
-# Gemini review documents
-docs/gemini-review-0520/
