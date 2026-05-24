@@ -29,7 +29,7 @@
 //!   (`codex-rs/core/src/compact.rs:262`)。
 
 use bytes::Bytes;
-use codex_app_transfer_registry::Provider;
+use codex_app_transfer_registry::{compact_disable_thinking_wire, Provider};
 use futures_util::stream::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::{json, Value};
@@ -211,8 +211,28 @@ pub(crate) fn build_compact_chat_request(
     let chat_body =
         responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))?;
     let chat_body = enforce_compact_chat_message_budget(chat_body);
+    let chat_body = inject_compact_disable_thinking_if_supported(chat_body);
     serde_json::to_vec(&chat_body)
         .map_err(|e| AdapterError::Internal(format!("re-serialize compact body: {e}")))
+}
+
+/// 按 chat body 的 `model` 字段查 `compact_thinking_policy` 注册表,命中即注入
+/// 对应 wire(派 A `thinking.type=disabled` / 派 B `enable_thinking=false`)。
+///
+/// 注册表覆盖范围、入表四证、不入表的故意决策见
+/// `codex_app_transfer_registry::compact_thinking_policy` 模块顶部文档。
+/// 本函数只做 "查表 + 注入" 两步,**不在此处** inline 任何 provider / model 判定 —
+/// 加新模型走"加 registry entry + 加 registry 单测"路径,无需改本文件。
+fn inject_compact_disable_thinking_if_supported(mut chat_body: Value) -> Value {
+    let model_id = chat_body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    if let Some(wire) = compact_disable_thinking_wire(&model_id) {
+        wire.inject(&mut chat_body);
+    }
+    chat_body
 }
 
 fn enforce_compact_chat_message_budget(mut chat_body: Value) -> Value {
@@ -1326,5 +1346,136 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("quality check failed"));
+    }
+
+    // ── compact_thinking_policy 注册表接入(issue #248) ─────────────────
+    //
+    // 这些测试只断言 "build_compact_chat_request 末尾正确调用了 registry 注入"
+    // 这一**集成点**,不重复 registry 自己的 entry-by-entry 覆盖测试
+    // (那些在 `codex_app_transfer_registry::compact_thinking_policy::tests`)。
+    // 加新模型走 registry 单测;本处只验"接入路径活着"。
+
+    /// 构造一个除 model 字段外都跟 `make_provider()` 一致的 provider。
+    /// 用于断言"注入决策只看 chat body 的 model 字段,不看 provider"。
+    fn provider_with_model(model_id: &str) -> Provider {
+        let mut p = make_provider();
+        p.models.insert("default".into(), model_id.into());
+        p
+    }
+
+    fn simple_compact_body(model: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "model": model,
+            "input": [
+                {"type": "message", "role": "user", "content": "hello"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn compact_injects_thinking_type_disabled_for_glm_5_1() {
+        // issue #248 主修复:GLM-5.1 强制 thinking,本 PR 注入 thinking.disabled
+        // 把 max_tokens 全留给 summary content。
+        let p = provider_with_model("glm-5.1");
+        let chat = build_compact_chat_request(&simple_compact_body("glm-5.1"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert_eq!(
+            parsed["thinking"],
+            json!({"type": "disabled"}),
+            "glm-5.1 必须命中 compact_thinking_policy 派 A,chat body 含 thinking.type=disabled"
+        );
+    }
+
+    #[test]
+    fn compact_injects_enable_thinking_false_for_qwen3() {
+        // 派 B:Qwen 3.x 用 enable_thinking=false wire,确认接入对派 B 也活着
+        let p = provider_with_model("qwen3.6-plus");
+        let chat = build_compact_chat_request(&simple_compact_body("qwen3.6-plus"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert_eq!(
+            parsed["enable_thinking"],
+            json!(false),
+            "qwen3.6-plus 必须命中 compact_thinking_policy 派 B,chat body 含 enable_thinking=false"
+        );
+    }
+
+    #[test]
+    fn compact_does_not_inject_for_minimax_no_disable_wire() {
+        // MiniMax M2.x 故意不入表(上游不支持 disable),compact body 必须**不含**
+        // thinking / enable_thinking 字段,避免给不认识的 endpoint 发 unknown field
+        let p = provider_with_model("MiniMax-M2.7");
+        let chat = build_compact_chat_request(&simple_compact_body("MiniMax-M2.7"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none(),
+            "MiniMax 不在 compact_thinking_policy 白名单,chat body 不应有 thinking 字段"
+        );
+        assert!(
+            parsed.get("enable_thinking").is_none(),
+            "MiniMax 不在 compact_thinking_policy 白名单,chat body 不应有 enable_thinking 字段"
+        );
+    }
+
+    #[test]
+    fn compact_does_not_inject_for_moonshot_v1_no_thinking_mode() {
+        // moonshot-v1 老 base 模型没有 thinking 模式,故意不入表
+        let p = provider_with_model("moonshot-v1-32k");
+        let chat = build_compact_chat_request(&simple_compact_body("moonshot-v1-32k"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none(),
+            "moonshot-v1 老模型无 thinking 模式,chat body 不应有 thinking 字段"
+        );
+        assert!(
+            parsed.get("enable_thinking").is_none(),
+            "moonshot-v1 老模型无 thinking 模式,chat body 不应有 enable_thinking 字段"
+        );
+    }
+
+    #[test]
+    fn compact_does_not_inject_for_unknown_model() {
+        // 用户自定义 / 未收录的 model:保守不注入,保持 current behavior
+        let p = provider_with_model("some-custom-model");
+        let chat =
+            build_compact_chat_request(&simple_compact_body("some-custom-model"), &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none()
+                && parsed.get("enable_thinking").is_none(),
+            "未知 model 不应触发 compact_thinking_policy 注入"
+        );
+    }
+
+    #[test]
+    fn compact_does_not_inject_when_model_field_missing_or_null() {
+        // 防御性:`inject_compact_disable_thinking_if_supported` 用
+        // `unwrap_or("")` 兜底缺失/null model,registry 对空 string 返 None,
+        // 整条链路应静默 no-op 而非 panic。
+        let p = provider_with_model("glm-5.1");
+        // 缺 model 字段
+        let body_missing = serde_json::to_vec(&json!({
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let chat = build_compact_chat_request(&body_missing, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none(),
+            "缺 model 字段时不应注入(model 字段在 chat body 也会缺,query 不到 wire)"
+        );
+
+        // model: null
+        let body_null = serde_json::to_vec(&json!({
+            "model": null,
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let chat = build_compact_chat_request(&body_null, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        assert!(
+            parsed.get("thinking").is_none(),
+            "model:null 时不应注入"
+        );
     }
 }
