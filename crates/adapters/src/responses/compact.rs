@@ -1441,8 +1441,7 @@ mod tests {
             build_compact_chat_request(&simple_compact_body("some-custom-model"), &p).unwrap();
         let parsed: Value = serde_json::from_slice(&chat).unwrap();
         assert!(
-            parsed.get("thinking").is_none()
-                && parsed.get("enable_thinking").is_none(),
+            parsed.get("thinking").is_none() && parsed.get("enable_thinking").is_none(),
             "未知 model 不应触发 compact_thinking_policy 注入"
         );
     }
@@ -1473,9 +1472,6 @@ mod tests {
         .unwrap();
         let chat = build_compact_chat_request(&body_null, &p).unwrap();
         let parsed: Value = serde_json::from_slice(&chat).unwrap();
-        assert!(
-            parsed.get("thinking").is_none(),
-            "model:null 时不应注入"
-        );
+        assert!(parsed.get("thinking").is_none(), "model:null 时不应注入");
     }
 }
