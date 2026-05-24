@@ -83,6 +83,8 @@ related_pr: <PR# 或 null>
 - [#39 P3 shell→apply_patch normalize 兜底(prompt-only 失效再激活)](followup/39-shell-to-apply-patch-normalize-fallback.md) — issue #235 通过 PR #236+#240 prompt-only 修复,PR #239 server-side normalize 暂时不需要;若未来某 provider 模型完全无视 prompt 走 shell file-write 再 cherry-pick PR #239 复活
 - [#40 P2 MCP Marketplace + Deeplink 暂隐藏(后端已实现,等 registry 起好再暴露)](followup/40-mcp-marketplace-deeplink-hide.md) — MCP tab 重做 PR ship 时 Servers+Plugins 立即可用;Marketplace/Deeplink 全栈代码完整,只 hide sub-nav 入口,等 `Cmochance/codex-app-transfer-registry` 起好 + curate preset 再取消注释激活
 - [#41 P3 ~/.codex/config.toml 并发 RMW 加 fs2 lock(理论 race,实际无 trigger)](followup/41-config-toml-rmw-locking.md) — PR #245 Devin 标 🟡;Tauri single-instance + UI 顺序操作天然防并发,实际 trigger 场景为零;留 followup 等真实 race 报告再激活 with_locked_doc 实现
+- [#42 P3 飞书 MCP(`@larksuiteoapi/lark-mcp`)真实 token 占用实测调研](followup/42-lark-mcp-token-footprint-instrumentation.md) — issue #248 触发场景,与 GLM compact 修复无因果;后续要做 per-MCP-tool budget / artifact 外置阈值时再激活,需用户在真实工作流跑 + 日志抓包采样
+- [#44 P2 compact 路径剥离历史 reasoning_content(仿 Claude Code stale thinking 管理)](followup/44-compact-strip-history-reasoning-content.md) — issue #248 配套优化;本 PR `compact_thinking_policy` 只做 output 侧 disable,input 侧历史 reasoning 剥离是独立 PR;Anthropic 文档 + Claude Code 行为都印证历史 reasoning 在 compact 任务下无价值
 
 ---
 

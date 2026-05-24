@@ -101,7 +101,8 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Anthropic Messages(custom Claude-compatible) | ✅(PR #153) | ✅(PR #153) | ✅(PR #153) | `apiFormat=anthropic_messages`,Claude preset 待真实验证后开放 |
 | Grok Web(SuperGrok / X Premium+) | ✅ | ✅ | ✅(v2.1.6 加 tool_calls flatten) | 实验性,TOS 灰色,仅本机个人使用 |
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | 后端就绪,UI 待 PR |
-| 智谱 GLM / 阿里云百炼 | ⚠️ 实验兼容 | — | — | OpenAI Chat 兼容反代 |
+| 智谱 GLM(5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
+| 阿里云百炼(Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
 | Responses 协议透传(custom) | — | — | — | 直连上游不经代理(适合 OpenAI 官方 / 原生 Responses 反代);⚠️ Plugins/MCP `namespace` 工具包不展平,部分上游会静默丢工具 |
 
 ## 模型映射
