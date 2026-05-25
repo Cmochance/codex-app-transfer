@@ -224,7 +224,23 @@ pub fn snapshot_codex_state(
             &paths.electron_global_state,
             crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
         ) {
-            Ok(Some(v)) => (v.as_bool(), false),
+            // Devin Review BUG-003 fix:atom 可能被 user 手动 / 未来 Codex Desktop
+            // 写成非 boolean(number / string),`as_bool()` 返 None 会被误当成
+            // "原本无字段" → restore 走 remove 误删 user 真实值。改成显式 mark
+            // capture_failed 防 silent loss。
+            Ok(Some(v)) => match v.as_bool() {
+                Some(b) => (Some(b), false),
+                None => {
+                    tracing::warn!(
+                        target: "codex_integration::snapshot",
+                        path = %paths.electron_global_state.display(),
+                        value = %v,
+                        "status-section atom is not a boolean; marking capture as failed \
+                         to avoid silent loss on restore",
+                    );
+                    (None, true)
+                }
+            },
             Ok(None) => (None, false),
             Err(e) => {
                 tracing::warn!(

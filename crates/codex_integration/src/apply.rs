@@ -368,6 +368,18 @@ fn restore_status_section_from_manifest(
         );
         return Ok(());
     }
+    // Devin Review BUG-002 fix:pre-v3 manifest 没有 atom 追踪字段(serde default
+    // 给 pre_value=None + capture_failed=false),那时的 transfer 根本没管这个
+    // atom,user 的 `/status` 偏好是他自己设的。restore 时**不动**避免误删。
+    if m.schema_version < 3 {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            schema_version = m.schema_version,
+            "pre-v3 manifest did not track status-section atom; skipping atom restore \
+             to avoid silently removing user's current value",
+        );
+        return Ok(());
+    }
     match m.electron_status_section_pre_value {
         Some(value) => crate::electron_state::write_atom(
             &paths.electron_global_state,
@@ -1584,6 +1596,103 @@ mod tests {
             .unwrap(),
             None,
             "restore 必须 strip 我们写入的 atom(因为 snapshot 拍到 user 原本没此字段)"
+        );
+    }
+
+    /// Devin Review BUG-002 防回归:pre-v3 manifest(schema_version=2)由旧 transfer
+    /// 写,根本没追踪 atom。restore 必须**不动** atom 避免误删 user 升级后的手动设置。
+    #[test]
+    fn restore_does_not_touch_atom_for_pre_v3_manifest() {
+        let (_t, paths) = setup();
+        let global_state = &paths.electron_global_state;
+
+        // 模拟 user 升级前手动 toggle 过 `/status` → atom=true
+        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
+        std::fs::write(
+            global_state,
+            r#"{"electron-persisted-atom-state":{"local-conversation-status-section-visible":true}}"#,
+        )
+        .unwrap();
+
+        // 模拟旧 transfer (schema v2) 的 manifest:没 atom 字段
+        let pre_v3_manifest = crate::snapshot::SnapshotManifest {
+            schema_version: 2,
+            snapshot_id: "legacy".into(),
+            session_id: "legacy".into(),
+            snapshot_at: "2026-05-01T00:00:00".into(),
+            config_existed: false,
+            auth_existed: false,
+            app_version: "v-old".into(),
+            provider_name: None,
+            // serde default 模拟:旧 manifest 没这俩字段
+            electron_status_section_pre_value: None,
+            electron_status_section_capture_failed: false,
+        };
+
+        restore_status_section_from_manifest(&paths, Some(pre_v3_manifest)).unwrap();
+
+        // user 的 atom=true 必须**不被删** —— 旧 transfer 没管它,新版 restore 也不该删
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
+        assert_eq!(
+            after.pointer(
+                "/electron-persisted-atom-state/local-conversation-status-section-visible"
+            ),
+            Some(&json!(true)),
+            "pre-v3 manifest restore 必须不动 atom(旧 transfer 没追踪此字段,user 手动设置不该被删)"
+        );
+    }
+
+    /// Devin Review BUG-003 防回归:snapshot 时 atom 是 non-boolean 值(手改 / 未来
+    /// Codex Desktop 改格式)→ snapshot 必须记 capture_failed=true,restore 必须不动。
+    #[test]
+    fn snapshot_marks_capture_failed_when_atom_is_not_boolean() {
+        let (_t, paths) = setup();
+        let global_state = &paths.electron_global_state;
+
+        // 模拟 user atom 是非 boolean (手改或未来 schema 变化)
+        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
+        std::fs::write(
+            global_state,
+            r#"{"electron-persisted-atom-state":{"local-conversation-status-section-visible":"yes"}}"#,
+        )
+        .unwrap();
+
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+            },
+        )
+        .unwrap();
+
+        let manifest =
+            crate::snapshot::read_current_manifest(&paths).expect("snapshot 应已写 manifest");
+        assert!(
+            manifest.electron_status_section_capture_failed,
+            "non-boolean atom 必须 mark capture_failed=true(否则 restore 会误删)"
+        );
+
+        // restore 必须**不动** atom — apply 写入的 true 留在那(没原值可退回)
+        restore_codex_state(&paths).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
+        // 关键:atom 字段没被 remove(restore short-circuit 跳过 atom touching)
+        assert!(
+            after.pointer(
+                "/electron-persisted-atom-state/local-conversation-status-section-visible"
+            )
+            .is_some(),
+            "capture_failed=true 时 restore 必须不调 remove_atom,atom 字段必须保留"
         );
     }
 
