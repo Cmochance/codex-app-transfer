@@ -337,15 +337,40 @@ async fn connect_and_monitor(
     // 3. 首次注入
     inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
 
-    // 4. 持续监控：监听 Page.loadEventFired 和外部命令
+    // 4. 持续监控:监听 Page.loadEventFired / 外部命令 / 心跳响应
+    //
+    // 重要不变量:WS read 流**只能由 select! 的 read.next() 分支消费**,绝不能
+    // 在 select! 的其它分支内 `await read.next()` 或 `await_cdp_response(read, …)`
+    // —— 否则会从公用 stream 里抢走 `Page.loadEventFired` 等无 id 事件帧,导致
+    // 整页 reload 后 daemon 失去重新注入触发(Devin Review BUG-0002 在 PR #255
+    // 抓到的回归)。所以心跳采用 fire-and-forget 风格:send ping,把 ping_id
+    // 寄存到 `pending_heartbeat_id`,主 read 分支统一匹配并处理响应。
+    let mut pending_heartbeat_id: Option<u64> = None;
+
     loop {
         tokio::select! {
-            // 监听 WebSocket 消息
+            // 监听 WebSocket 消息(唯一的 read 消费者)
             msg = read.next() => {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Ok(resp) = serde_json::from_str::<CdpResponse>(&text) {
-                            // 检测 Page.loadEventFired 事件
+                            // 心跳响应 — 提取 unlocked flag,把 in-page MutationObserver
+                            // 异步解锁的状态升级到 daemon 端 Injected。
+                            if pending_heartbeat_id.is_some() && resp.id == pending_heartbeat_id {
+                                pending_heartbeat_id = None;
+                                let unlocked = resp
+                                    .result
+                                    .as_ref()
+                                    .and_then(|r| r.get("result"))
+                                    .and_then(|r| r.get("value"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                if unlocked {
+                                    set_status(status, UnlockStatus::Injected).await;
+                                }
+                                continue;
+                            }
+                            // 整页 reload — 重新注入
                             if resp.method.as_deref() == Some("Page.loadEventFired") {
                                 tracing::info!("[PluginUnlock] page refreshed, reinjecting...");
                                 inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
@@ -383,15 +408,19 @@ async fn connect_and_monitor(
                 }
             }
 
-            // 心跳 + 状态回收:每 30s eval `window.__codexAppTransferPluginUnlocker?.unlocked`
-            // 兼任两职 ——
-            //   1. 探活 WS / Codex Desktop 还在响应
-            //   2. 把页内 MutationObserver(`scheduleUnlock` 路径)在登录态 mount 后异步
-            //      成功的状态,**round-trip 回 Rust 端**。`Page.loadEventFired` 不会
-            //      在 SPA 内 router 切换 / OAuth 登录回调时触发,只有 MutationObserver
+            // 心跳 + 状态回收(fire-and-forget):每 30s eval
+            // `window.__codexAppTransferPluginUnlocker?.unlocked` ——
+            //   1. 探活 WS / Codex Desktop 还在响应(send 失败即 WS 死)
+            //   2. 把页内 MutationObserver 在登录态 mount 后异步成功的状态
+            //      **round-trip 回 Rust 端**。`Page.loadEventFired` 不会在
+            //      SPA 内 router 切换 / OAuth 登录回调时触发,只有 MutationObserver
             //      跑得到;那条路径完成解锁后只更新了 in-page `window[MARKER].unlocked`,
-            //      没途径告诉 daemon。这里轮询补这条信号通道。
+            //      靠这里 30s 轮询补回 Rust 端的可观察信号。
+            //
+            // 不在这里 await 响应 —— 见上方"重要不变量"。
             _ = sleep(Duration::from_secs(30)) => {
+                // 上一轮心跳还没回包就丢弃 id 不追了(网络慢 / Codex stutter),
+                // 用新 id 重发。旧响应到达时不匹配 pending_heartbeat_id 会被忽略。
                 let (ping, ping_id) = make_cdp_msg(
                     msg_id_counter,
                     "Runtime.evaluate",
@@ -404,26 +433,7 @@ async fn connect_and_monitor(
                     tracing::warn!("[PluginUnlock] heartbeat send failed, connection dead: {}", e);
                     break;
                 }
-                match await_cdp_response(&mut read, ping_id, Duration::from_secs(5)).await {
-                    Ok(resp) => {
-                        let unlocked = resp
-                            .result
-                            .as_ref()
-                            .and_then(|r| r.get("result"))
-                            .and_then(|r| r.get("value"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        if unlocked {
-                            // 仅在状态实际变化时 set_status 会日志;Connected → Injected
-                            // 的过渡正是"observer 在登录后成功解锁"的可观察信号。
-                            set_status(status, UnlockStatus::Injected).await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("[PluginUnlock] heartbeat response failed: {}", e);
-                        break;
-                    }
-                }
+                pending_heartbeat_id = Some(ping_id);
             }
         }
     }
