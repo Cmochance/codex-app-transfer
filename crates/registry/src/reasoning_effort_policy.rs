@@ -315,10 +315,7 @@ mod tests {
     #[test]
     fn deepseek_unknown_drops_field() {
         // 未知 effort 字符串走 warn log + drop(测试不验 log,只验行为)
-        assert!(apply("deepseek", "ultra")
-            .as_object()
-            .unwrap()
-            .is_empty());
+        assert!(apply("deepseek", "ultra").as_object().unwrap().is_empty());
     }
 
     // ─── Drop 类:全部不写 reasoning_effort ─────────────────────────────

@@ -2251,8 +2251,11 @@ fn apply_codex_reasoning_effort_for_provider(
             );
             // 用空 id 复用同一个 wire enum 路径,保持行为跟"未知自定义 provider"完全一致 +
             // 自带未知 effort 的 warn log,DRY 避免双份映射表
-            codex_app_transfer_registry::ReasoningEffortWire::OpenAIEnum
-                .apply(body, &effort, "<no-provider>");
+            codex_app_transfer_registry::ReasoningEffortWire::OpenAIEnum.apply(
+                body,
+                &effort,
+                "<no-provider>",
+            );
         }
     }
 }

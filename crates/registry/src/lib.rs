@@ -24,9 +24,6 @@ pub mod reasoning_effort_policy;
 pub mod schema;
 
 pub use compact_thinking_policy::{compact_disable_thinking_wire, DisableThinkingWire};
-pub use reasoning_effort_policy::{
-    apply_reasoning_effort, reasoning_effort_wire, ReasoningEffortWire,
-};
 #[allow(deprecated)]
 pub use healing::heal_builtin_extra_headers;
 pub use healing::heal_builtin_provider_fields;
@@ -43,4 +40,7 @@ pub use paths::{
 };
 pub use presets::builtin_presets;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};
+pub use reasoning_effort_policy::{
+    apply_reasoning_effort, reasoning_effort_wire, ReasoningEffortWire,
+};
 pub use schema::{Config, ModelSlotKey, Provider, Settings, APP_VERSION, DEFAULT_UPDATE_URL};
