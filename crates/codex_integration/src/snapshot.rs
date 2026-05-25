@@ -607,8 +607,17 @@ fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), C
     std::fs::create_dir_all(&paths.recovery_snapshots_dir)?;
     let target = unique_recovery_dir(paths, &manifest.snapshot_id);
     std::fs::rename(dir, &target)?;
+    // Devin Review BUG-004 fix:升级 schema_version 到 v3 之前先存原版本,
+    // 如果是 pre-v3 manifest(没追踪 status-section atom),升 schema 后
+    // 必须**同时**设 capture_failed=true,否则 manual restore 时 atom 三态
+    // 全是 default(None+false)→ 误判为"snapshot 时 atom 不存在"→ remove_atom
+    // → silently 抹掉 user 升级后手动设的 `/status` 偏好(见 apply.rs#L374 guard 设计)。
+    let original_schema = manifest.schema_version;
     let mut recovery_manifest = manifest;
     recovery_manifest.schema_version = SNAPSHOT_SCHEMA_VERSION;
+    if original_schema < 3 {
+        recovery_manifest.electron_status_section_capture_failed = true;
+    }
     if let Some(target_id) = dir_name(&target) {
         recovery_manifest.snapshot_id = target_id;
     }
@@ -956,6 +965,57 @@ mod tests {
         assert!(snapshots
             .iter()
             .any(|s| s.kind == "recovery" && s.id == "old-session"));
+    }
+
+    /// Devin Review BUG-004 防回归:pre-v3 (schema_version=2) 的 stale active
+    /// 被升级到 recovery 时,必须**同时**标 capture_failed=true,否则后续 manual
+    /// restore 时(schema 已升 v3 + 三态默认 None/false)会误判"snapshot 时 atom
+    /// 不存在" → remove_atom → silently 抹掉 user 升级后手动设的 `/status` 偏好。
+    #[test]
+    fn pre_v3_stale_recovery_upgrade_marks_capture_failed() {
+        let (_t, paths) = paths_with_tmp();
+
+        // 模拟旧 transfer 写的 schema_version=2 manifest(没追踪 atom 字段,但
+        // 序列化时 serde 给 default 值 — pre_value=None + capture_failed=false)
+        let stale_dir = paths.active_snapshots_dir.join("v2-session");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(config_path(&stale_dir), "openai_base_url = \"old\"\n").unwrap();
+        let v2_manifest_json = serde_json::json!({
+            "schema_version": 2,
+            "snapshot_id": "v2-session",
+            "session_id": "v2-session",
+            "snapshot_at": "2026-05-01T01:00:00",
+            "config_existed": true,
+            "auth_existed": false,
+            "app_version": "v-old",
+            "provider_name": "Old"
+            // 故意 omit electron_status_section_* — 模拟真实 v2 manifest 没这俩字段
+        });
+        std::fs::write(manifest_path(&stale_dir), v2_manifest_json.to_string()).unwrap();
+
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(&paths.config_toml, "openai_base_url = \"new\"\n").unwrap();
+
+        // trigger move_stale_active_snapshots_to_recovery via snapshot_codex_state
+        snapshot_codex_state(&paths, "v-new", "New").unwrap();
+
+        // 找新生成的 recovery manifest,核对 schema 升 v3 + capture_failed=true
+        let recovery_dirs: Vec<_> = std::fs::read_dir(&paths.recovery_snapshots_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert!(!recovery_dirs.is_empty(), "应有 recovery 目录");
+        let recovery_manifest =
+            read_manifest_from_dir(&recovery_dirs[0]).expect("应读到 recovery manifest");
+        assert_eq!(
+            recovery_manifest.schema_version, SNAPSHOT_SCHEMA_VERSION,
+            "schema_version 应升到 v3"
+        );
+        assert!(
+            recovery_manifest.electron_status_section_capture_failed,
+            "pre-v3 manifest 升 v3 时必须 mark capture_failed=true(防 manual restore 误删 user atom)"
+        );
     }
 
     #[test]
