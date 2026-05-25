@@ -104,13 +104,23 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         sync_root_value(&paths.config_toml, "openai_base_url", Some(&literal))?;
     }
 
-    // 2b. 强制 model_provider = "openai":Codex CLI 只有在 openai provider 下
-    // 才会读 openai_base_url。用户旧 config 里可能残留 model_provider = "custom"
-    // (历史教程 / 旧版 CLI 自己写的),配合 [model_providers.custom] 段会把流量
-    // 旁路到第三方 base_url,导致我们的 proxy 被绕过。Codex CLI 0.126+ 把端点
-    // 从 /v1/responses 切到 /responses,在残留路径上直接表现为 404(issue #178)。
-    // 快照已在第 1 步拿到用户原值,restore 时能完整退回。
-    sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
+    // 2b. **无条件 strip model_provider 字段**(#258 验证后强约束):
+    //
+    // 用户硬性要求 — 使用本项目时 config.toml **必须没有 model_provider 这一项**。
+    // 残留 user 之前配过的 model_provider(任何值,包括 "openai")可能让 Codex CLI
+    // 走非预期 provider 路径,**导致回话丢失**(endpoint 走 stale custom block /
+    // history 链断 / autocompact 找不到 prior turn 等)。
+    //
+    // 等价性:Codex CLI 在缺失字段时 fallback 到 openai,跟显式写
+    // `model_provider = "openai"` 行为等价(都会读 openai_base_url 走 proxy);
+    // 但**只有 strip 才能确保不残留任何 user-set 值**。
+    //
+    // 不留 env opt-in:任何允许写回 `model_provider = "openai"` 的 escape hatch
+    // 都可能让上面"回话丢失"风险复发,所以无条件 strip。如果未来 Codex CLI
+    // 真的需要显式 openai 字段才生效,再 reopen 这条决策。
+    //
+    // 快照已在第 1 步拿到用户原值,restore 时能完整退回原值(包括 custom)。
+    sync_root_value(&paths.config_toml, "model_provider", None)?;
 
     // 2c. **#212/#215 Codex 联网默认开**(Codex docs "Full access" 配对):
     // 之前 #212 用 workspace-write + network_access 真机仍弹审批弹窗 ——
@@ -1386,11 +1396,15 @@ mod tests {
         assert!(auth_after.get("auth_mode").is_none());
     }
 
-    /// issue #178:用户旧 config 残留 `model_provider = "custom"` + `[model_providers.custom]`
-    /// 段时,apply 必须把 `model_provider` 拉到 `"openai"`,否则 Codex CLI 把流量
-    /// 旁路到 custom block 的 base_url,绕过 proxy(0.126+ 表现为 /v1/responses 404)。
+    /// #258:apply 无条件 strip `model_provider` 字段 —— Codex CLI 缺失时 fallback
+    /// 到 openai 跟显式写等价,strip 避开"显式字段触发上游 UI surface" 的潜在路径。
+    /// 注:这意味着 user 旧 config 残留 `model_provider = "custom"` 也会被 strip,
+    /// 走 CLI default openai —— 跟 #178 强制覆盖逻辑等价(都不会让流量进入
+    /// `[model_providers.custom]` 段),但 footprint 更小。无 env opt-in 写回:
+    /// 任何允许 model_provider 字段写回 config 的 escape hatch 都可能让"残留
+    /// model_provider 导致回话丢失"风险复发,所以 strip 是终态。
     #[test]
-    fn apply_normalizes_legacy_custom_model_provider() {
+    fn apply_strips_legacy_custom_model_provider() {
         let (_t, paths) = setup();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(
@@ -1422,8 +1436,8 @@ mod tests {
         .unwrap();
         let toml = read_toml(&paths);
         assert!(
-            toml.contains("model_provider = \"openai\""),
-            "apply 必须把 model_provider 拉正到 openai,实际 toml:\n{toml}"
+            !toml.contains("model_provider ="),
+            "apply 应 strip model_provider 字段,实际 toml:\n{toml}"
         );
         assert!(
             toml.contains("openai_base_url = \"http://127.0.0.1:18080\""),
