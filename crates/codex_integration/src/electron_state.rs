@@ -134,11 +134,20 @@ pub fn remove_atom(path: &Path, atom_key: &str) -> Result<(), CodexError> {
     write_atomic(path, &root_value)
 }
 
-/// 读顶层 object,文件不存在或非 object 时返空 map(后续 write 会创建)。
-/// 非合法 JSON 返错误 —— 不要 silently 覆盖 user 已有的(可能损坏但可恢复的)文件。
+/// 读顶层 object,文件不存在时返空 map(后续 write 会创建)。
+/// 非合法 JSON / 顶层非 object 返错误 —— 不要 silently 覆盖 user 已有的
+/// (可能损坏但可恢复的)文件。
+///
+/// **Devin Review BUG-001 fix**:严格区分 ENOENT vs 其它 IO 错误。原版用
+/// `let Ok(text) = ...` 把 EIO / EACCES / FUSE 超时全当 ENOENT,导致
+/// `write_atom` 用空 map 覆盖整个 user 文件 → 丢 workspace roots / window
+/// bounds / prompt history / 其它 atom 全部数据。对称 `read_atom` 已经修过,
+/// 这里同步。
 fn read_root_or_empty(path: &Path) -> Result<Map<String, Value>, CodexError> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Ok(Map::new());
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(e) => return Err(CodexError::Io(e)),
     };
     if text.trim().is_empty() {
         return Ok(Map::new());
@@ -198,6 +207,29 @@ mod tests {
     fn read_atom_returns_none_when_file_missing() {
         let (_t, p) = tmp_path();
         assert!(read_atom(&p, STATUS_SECTION_VISIBLE_KEY).unwrap().is_none());
+    }
+
+    /// Devin Review BUG-001 防回归:`write_atom` 在 user 文件存在但非合法 JSON 时,
+    /// 必须**拒绝写入**(返 Err),不能 silently 用空 map 覆盖丢 user 数据。
+    #[test]
+    fn write_atom_does_not_overwrite_when_existing_file_is_corrupt() {
+        let (_t, p) = tmp_path();
+        // 模拟 user 已有数据但文件损坏(EIO 中途读 / 手改坏 / mid-write 崩)
+        let original_corrupt = "{ corrupt but irreplaceable workspace state";
+        std::fs::write(&p, original_corrupt).unwrap();
+
+        let err = write_atom(&p, STATUS_SECTION_VISIBLE_KEY, json!(true)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not valid JSON") || msg.contains("refusing to overwrite"),
+            "expected refusal, got: {msg}"
+        );
+        // 文件内容必须**未被改动** — user 的损坏文件还有手动恢复机会
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            original_corrupt,
+            "write_atom 必须拒绝写入,不能 silently 用空 map 覆盖 user 文件"
+        );
     }
 
     /// silent-failure-hunter CRITICAL #1:corrupt JSON 必须返 Err,不能 silently
