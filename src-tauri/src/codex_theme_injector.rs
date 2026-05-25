@@ -39,6 +39,13 @@ pub struct ThemeMeta {
     pub display_name_zh: &'static str,
     pub display_name_en: &'static str,
     pub has_mascot: bool,
+    /// `background-size` 策略。Portrait 比例(高远大于宽)的图用 "cover" 会被
+    /// 严重拉伸只剩头部,改 "contain" + center 居中让整张图完整显示;letterbox
+    /// 空白由 body `background-color: #1a1010` 填充。
+    pub bg_fit: &'static str,
+    /// `background-position`。cover 模式锚 `center top` 保头部;contain 模式
+    /// `center` 居中。
+    pub bg_position: &'static str,
 }
 
 /// 所有内置主题 metadata。
@@ -49,30 +56,40 @@ pub fn all_themes() -> Vec<ThemeMeta> {
             display_name_zh: "Carton",
             display_name_en: "Carton",
             has_mascot: true,
+            bg_fit: "cover",
+            bg_position: "center top",
         },
         ThemeMeta {
             id: "changli",
             display_name_zh: "长离",
             display_name_en: "Changli",
             has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "center top",
         },
         ThemeMeta {
             id: "azurlane",
             display_name_zh: "碧蓝航线",
             display_name_en: "Azur Lane",
             has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "center top",
         },
         ThemeMeta {
             id: "nailin",
             display_name_zh: "乃琳",
             display_name_en: "Nailin",
             has_mascot: false,
+            bg_fit: "contain",
+            bg_position: "center",
         },
         ThemeMeta {
             id: "zani",
             display_name_zh: "赞妮",
             display_name_en: "Zani",
             has_mascot: false,
+            bg_fit: "contain",
+            bg_position: "center",
         },
     ]
 }
@@ -350,6 +367,12 @@ async fn drain_one(
 /// 一致(`--color-token-*` 系列),改它们等于 hot reskin。
 fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
     let bg = &assets.bg_data_uri;
+    // 按 theme 查 bg_fit / bg_position(portrait 图用 contain 不裁头)
+    let (bg_fit, bg_position) = all_themes()
+        .into_iter()
+        .find(|m| m.id == theme_id)
+        .map(|m| (m.bg_fit, m.bg_position))
+        .unwrap_or(("cover", "center top"));
     let mascot_block = match &assets.mascot_data_uri {
         Some(m) => format!(
             r#"
@@ -416,11 +439,12 @@ fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
   style.setAttribute('data-cat-theme', '{theme_id}');
   style.textContent = `
     body {{
+      background-color: #1a1010 !important;
       background-image: linear-gradient(rgba(22, 13, 13, 0.45), rgba(22, 13, 13, 0.45)), url('{bg}') !important;
-      background-size: cover !important;
-      background-position: center top !important;
-      background-repeat: no-repeat !important;
-      background-attachment: fixed !important;
+      background-size: cover, {bg_fit} !important;
+      background-position: center, {bg_position} !important;
+      background-repeat: no-repeat, no-repeat !important;
+      background-attachment: fixed, fixed !important;
     }}
     #root, .app-shell, .app-shell-main, main.main-surface {{ background: transparent !important; }}
 
