@@ -3453,3 +3453,112 @@ fn effort_string_form_also_extracted() {
     .unwrap();
     assert_eq!(out["reasoning_effort"], "max");
 }
+
+// ── #262: prompt i18n tests ──────────────────────────────────────────
+
+/// 串行化 i18n 测试 — 共享全局 USER_LANGUAGE state 不能并发跑。
+use std::sync::Mutex;
+static LANG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn with_user_language<F: FnOnce()>(lang: &str, f: F) {
+    let _guard = LANG_TEST_LOCK.lock().unwrap();
+    crate::core::language::set_user_language(lang);
+    f();
+    crate::core::language::set_user_language("en");
+}
+
+fn first_turn_request_with_apply_patch() -> Value {
+    json!({
+        "instructions": "test",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        "tools": [{"type": "custom", "name": "apply_patch"}],
+    })
+}
+
+#[test]
+fn apply_patch_guidance_injected_in_english_by_default() {
+    with_user_language("en", || {
+        let out = convert(first_turn_request_with_apply_patch());
+        let messages = out["messages"].as_array().unwrap();
+        // messages[0] = instructions, messages[1] = apply_patch guidance
+        let guidance = messages[1]["content"].as_str().unwrap();
+        assert!(
+            guidance.contains("[apply_patch chat-path guidance"),
+            "EN guidance header missing"
+        );
+        assert!(
+            guidance.contains("ALWAYS use the `apply_patch` tool"),
+            "EN guidance body missing"
+        );
+        assert!(
+            !guidance.contains("务必使用"),
+            "EN guidance must not contain ZH text"
+        );
+    });
+}
+
+#[test]
+fn apply_patch_guidance_injected_in_chinese_when_language_zh() {
+    with_user_language("zh-CN", || {
+        let out = convert(first_turn_request_with_apply_patch());
+        let guidance = out["messages"][1]["content"].as_str().unwrap();
+        assert!(
+            guidance.contains("[apply_patch chat-path 指引"),
+            "ZH guidance header missing"
+        );
+        assert!(
+            guidance.contains("务必使用 `apply_patch` tool"),
+            "ZH guidance body missing"
+        );
+        // V4A 关键字必须保英文(Codex CLI parser 不接受翻译)
+        for keyword in &[
+            "*** Begin Patch",
+            "*** Update File:",
+            "*** Add File:",
+            "*** Delete File:",
+            "*** Move to:",
+            "*** End of File",
+            "@@ <header>",
+            "apply_patch",
+        ] {
+            assert!(
+                guidance.contains(keyword),
+                "ZH guidance must keep V4A keyword `{keyword}` in English"
+            );
+        }
+        // 错误消息必须保英文(Codex CLI 抛的就是英文 + user grep 用)
+        for msg in &[
+            "Failed to find context",
+            "is not a valid hunk header",
+            "invalid patch: The first line of the patch must be '*** Begin Patch'",
+            "Update file hunk for path",
+        ] {
+            assert!(
+                guidance.contains(msg),
+                "ZH guidance must keep error message `{msg}` in English"
+            );
+        }
+    });
+}
+
+#[test]
+fn apply_patch_guidance_zh_covers_all_nine_rules() {
+    with_user_language("zh", || {
+        let out = convert(first_turn_request_with_apply_patch());
+        let guidance = out["messages"][1]["content"].as_str().unwrap();
+        // 9 条规则编号都必须出现(防漏译)
+        for n in 1..=9 {
+            let marker = format!("{n}.");
+            assert!(
+                guidance.contains(&marker),
+                "ZH guidance must cover rule {n} (marker `{marker}` missing)"
+            );
+        }
+        // 引言段强调词翻译完整
+        assert!(
+            guidance.contains("务必使用"),
+            "missing **ALWAYS** equivalent"
+        );
+        assert!(guidance.contains("绝不"), "missing **NEVER** equivalent");
+    });
+}

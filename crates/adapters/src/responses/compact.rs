@@ -79,7 +79,7 @@ use super::request::responses_body_to_chat_body_for_provider;
 /// example 全部移除。模型可自由选择 markdown / 段落 / 列表组织答案,
 /// `extract_summary_section` 在无 `<summary>` tag 时直接 raw fallback
 /// (本来就是容错路径,现在成为常规路径)。
-const COMPACT_SUMMARIZATION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+const COMPACT_SUMMARIZATION_PROMPT_EN: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
 Include:
 - Current progress and key decisions made
@@ -90,6 +90,34 @@ Include:
 - **Next Step** — the immediate next action aligned with the user's most recent explicit request. Include a **verbatim direct quote** from the most recent user message showing exactly where you left off; this prevents task drift.
 
 Be concise, structured, and focused on helping the next LLM seamlessly continue the work.";
+
+/// COMPACT 总结提示词中文版(#262)。
+///
+/// **翻译原则**:
+/// - 跟英文版**逐条对应** — 不漏 emphasis(**verbatim** / **All user messages**)
+/// - 技术词保英文:`LLM` / `Next Step`(英文章节名,跟英文版结构对齐)
+/// - **不**翻译 [`COMPACT_SUMMARY_PREFIX`] — Codex CLI 用 `startswith` 识别该前缀,
+///   字面英文不能动。此处仅翻译要模型 **写** summary 的 prompt(输入侧)
+const COMPACT_SUMMARIZATION_PROMPT_ZH: &str = "你正在执行 CONTEXT CHECKPOINT COMPACTION(上下文检查点压缩)。为下一个接手任务的 LLM 写一份交接总结。
+
+包含:
+- 当前进度和已做出的关键决策
+- 重要 context、约束、或 user 偏好
+- 还有什么待办(清晰的下一步)
+- 继续任务所需的关键数据、示例、引用
+- **截至目前的所有 user message,按时间顺序逐字或近似逐字保留** —— 这能保留其它方式会丢失的 intent 演变
+- **Next Step** —— 跟 user 最近一次显式请求对齐的下一个动作。包含从 user 最近一条 message 中**逐字引用**的直接 quote,标明你停在了哪里;这能防止任务漂移。
+
+精简、结构化,聚焦于帮助下一个 LLM 无缝接续工作。";
+
+/// 按当前 user 语言偏好选 compact summarization prompt(#262)。
+fn compact_summarization_prompt_for_current_language() -> &'static str {
+    use crate::core::language::{current_language, Language};
+    match current_language() {
+        Language::Chinese => COMPACT_SUMMARIZATION_PROMPT_ZH,
+        Language::English => COMPACT_SUMMARIZATION_PROMPT_EN,
+    }
+}
 
 /// 抄自 `openai/codex` 仓库 `codex-rs/core/templates/compact/summary_prefix.md` (Apache-2).
 /// Codex CLI 反序列化 compact 响应后,通过 `is_summary_message`(`startswith(PREFIX)`)
@@ -180,7 +208,7 @@ pub(crate) fn build_compact_chat_request(
     input_array.push(json!({
         "type": "message",
         "role": "user",
-        "content": COMPACT_SUMMARIZATION_PROMPT,
+        "content": compact_summarization_prompt_for_current_language(),
     }));
     let input = Value::Array(input_array);
 
@@ -1473,5 +1501,62 @@ mod tests {
         let chat = build_compact_chat_request(&body_null, &p).unwrap();
         let parsed: Value = serde_json::from_slice(&chat).unwrap();
         assert!(parsed.get("thinking").is_none(), "model:null 时不应注入");
+    }
+
+    // ── #262: compact prompt i18n tests ──────────────────────────────
+
+    use std::sync::Mutex;
+    static LANG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_user_language<F: FnOnce()>(lang: &str, f: F) {
+        let _guard = LANG_TEST_LOCK.lock().unwrap();
+        crate::core::language::set_user_language(lang);
+        f();
+        crate::core::language::set_user_language("en");
+    }
+
+    fn compact_prompt_text_for_lang(lang: &str) -> String {
+        let mut out = String::new();
+        with_user_language(lang, || {
+            out = compact_summarization_prompt_for_current_language().to_string();
+        });
+        out
+    }
+
+    #[test]
+    fn compact_summarization_prompt_english_by_default() {
+        let prompt = compact_prompt_text_for_lang("en");
+        assert!(prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
+        assert!(prompt.contains("Be concise, structured"));
+        assert!(!prompt.contains("精简、结构化"));
+    }
+
+    #[test]
+    fn compact_summarization_prompt_chinese_when_language_zh() {
+        let prompt = compact_prompt_text_for_lang("zh-CN");
+        assert!(prompt.contains("CONTEXT CHECKPOINT COMPACTION(上下文检查点压缩)"));
+        assert!(prompt.contains("精简、结构化"));
+        // 关键技术词保英文 — LLM / Next Step / context 等
+        for keyword in &["LLM", "Next Step", "context"] {
+            assert!(
+                prompt.contains(keyword),
+                "ZH compact prompt must keep keyword `{keyword}` in English"
+            );
+        }
+        // emphasis 翻译完整
+        assert!(prompt.contains("**逐字引用**"));
+        assert!(prompt.contains("**截至目前的所有 user message"));
+    }
+
+    /// `COMPACT_SUMMARY_PREFIX` 必须保字面英文(Codex CLI startswith 识别) —
+    /// 这条 const 不该被任何 i18n 路径覆盖。防回归。
+    #[test]
+    fn compact_summary_prefix_stays_english_regardless_of_user_language() {
+        with_user_language("zh-CN", || {
+            assert!(COMPACT_SUMMARY_PREFIX.starts_with("Another language model"));
+        });
+        with_user_language("en", || {
+            assert!(COMPACT_SUMMARY_PREFIX.starts_with("Another language model"));
+        });
     }
 }
