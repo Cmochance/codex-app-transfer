@@ -473,8 +473,8 @@ fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
     [role="menu"], [role="listbox"], [role="dialog"], [data-radix-menu-content],
     [data-browser-comment-editor-surface], .bg-token-dropdown-background {{
       background-color: rgba(22, 13, 13, 0.65) !important;
-      backdrop-filter: blur(12px) saturate(125%) !important;
-      -webkit-backdrop-filter: blur(12px) saturate(125%) !important;
+      backdrop-filter: blur(4px) saturate(120%) !important;
+      -webkit-backdrop-filter: blur(4px) saturate(120%) !important;
       border: 1px solid rgba(230, 70, 70, 0.18) !important;
     }}
 

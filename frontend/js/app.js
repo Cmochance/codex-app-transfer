@@ -5407,7 +5407,7 @@
       return `
         <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" onclick="window.__themePickHandler && window.__themePickHandler('${idEscaped}')">
           ${checkBadge}
-          <img src="${th.bgDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:16/10;object-fit:cover;display:block;pointer-events:none;">
+          <img src="${th.bgDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:4/3;object-fit:contain;display:block;pointer-events:none;background:linear-gradient(135deg,#1a1a1a,#2a2a2a);">
           <div style="padding:8px 10px;pointer-events:none;text-align:center;">
             <div style="font-weight:600;font-size:14px;">${escapeHtml(displayName)}</div>
           </div>
