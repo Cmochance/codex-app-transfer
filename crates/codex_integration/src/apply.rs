@@ -98,13 +98,34 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         sync_root_value(&paths.config_toml, "openai_base_url", Some(&literal))?;
     }
 
-    // 2b. 强制 model_provider = "openai":Codex CLI 只有在 openai provider 下
+    // 2b. 默认强制 model_provider = "openai":Codex CLI 只有在 openai provider 下
     // 才会读 openai_base_url。用户旧 config 里可能残留 model_provider = "custom"
     // (历史教程 / 旧版 CLI 自己写的),配合 [model_providers.custom] 段会把流量
     // 旁路到第三方 base_url,导致我们的 proxy 被绕过。Codex CLI 0.126+ 把端点
     // 从 /v1/responses 切到 /responses,在残留路径上直接表现为 404(issue #178)。
     // 快照已在第 1 步拿到用户原值,restore 时能完整退回。
-    sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
+    //
+    // **#258 调研 env override**:`CAT_SKIP_MODEL_PROVIDER_WRITE=1` 时改成"显式
+    // strip" 该字段(不写入)。用于验证"显式 model_provider = openai 是否触发
+    // Codex Desktop 26.519 隐藏 context window 圆环 UI"假设。CLI 默认 fallback
+    // 也是 openai provider,功能等价;只在 session_meta / turn_context 序列化层
+    // 可能有 None vs Some("openai") 差异,从而触发 UI 不同分支。
+    //
+    // **不绕过 #178 防御**:env 关掉时仍强制写;只有 user 显式 opt-in env 才跳。
+    if std::env::var("CAT_SKIP_MODEL_PROVIDER_WRITE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!(
+            "[codex_integration::apply] CAT_SKIP_MODEL_PROVIDER_WRITE=1: \
+             stripping model_provider field for #258 verification \
+             (this disables #178 defense — only use for debugging)"
+        );
+        sync_root_value(&paths.config_toml, "model_provider", None)?;
+    } else {
+        sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
+    }
 
     // 2c. **#212/#215 Codex 联网默认开**(Codex docs "Full access" 配对):
     // 之前 #212 用 workspace-write + network_access 真机仍弹审批弹窗 ——
