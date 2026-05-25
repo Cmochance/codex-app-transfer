@@ -61,6 +61,16 @@ fn main() {
             });
         })
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window_vibrancy::apply_vibrancy(
+                    &window,
+                    window_vibrancy::NSVisualEffectMaterial::Sidebar,
+                    None,
+                    None,
+                );
+            }
+
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
 

@@ -58,7 +58,7 @@ With any provider enabled, Codex App's model picker shows `<provider> / <real-mo
   - **MCP**: structured JSON editing on the `[mcp_servers.*]` section of `~/.codex/config.toml` (`toml_edit` round-trip preserves comments + sibling config sections); Plugins sub-tab scans `~/.codex/plugins/cache/` for installed bundles (enable toggle / uninstall); all writes are atomic + independent history per SHA-256 path hash (no cross-tab interference)
 - Real-time logs panel auto-refreshing every 2s; unified `tracing::warn!(error_id, detail)` with stable tokens — operators can grep / aggregate
 - Feedback dialog automatically attaches diagnostic material (environment info, sanitized config, recent error snapshot with full request / response) — fewer back-and-forth follow-ups
-- Chinese / English UI; light / dark / green / orange / gray / white themes
+- Chinese / English UI, styled with macOS Classic glassmorphism UI design (Frosted Glass Vibrancy) + auto dark/light theme switching
 - Cross-platform single-instance lock (double-click brings the existing window forward) + cross-process file lock prevents multi-instance config-write lost-updates
 - Windows / macOS / Linux system tray
 
@@ -138,28 +138,18 @@ cargo tauri build --bundles deb,appimage     # Linux x86_64
 
 ### Tweaking the UI
 
-`frontend/css/` is organized as a small component library — no need to grep the whole `style.css`:
+The frontend has been refactored to **Svelte 5 + TypeScript + Vite**, using scoped styles for componentized style management under macOS Classic glassmorphism design:
 
-| What to tweak | Where to edit |
-|---|---|
-| Theme colors / radius / shadow / spacing (design tokens) | `frontend/css/tokens.css` (129 vars + 6 themes) |
-| Global reset / body font / focus ring | `frontend/css/base.css` |
-| Buttons / cards / forms / badges / modals etc. | `frontend/css/components/<name>.css` |
-| Page-specific styles for dashboard / providers / proxy / settings / guide | `frontend/css/pages/<route>.css` |
-| Responsive breakpoints (1100px / 720px) | `frontend/css/responsive.css` |
-
-Preview every component + variant + theme switching:
-
-```bash
-# Open directly in your browser (no dev server needed)
-open frontend/gallery.html        # macOS
-xdg-open frontend/gallery.html    # Linux
-start frontend/gallery.html       # Windows
-```
-
-`gallery.html` has a theme picker + dark/light toggle at the top, refresh after editing component css to see changes. `frontend/index.html`'s `<link href="css/style.css">` does not need to change — `style.css` is just an `@import` entry that aggregates every sub-file.
-
-To add a new component: create `components/<name>.css` + add a line `@import url("components/<name>.css");` to `style.css` + add a section in `gallery.html`.
+- **Global Styles & Design Tokens**: `frontend/src/app.css` defines all global CSS variables (including glassmorphism backgrounds, backdrop blurs, typography, gradients, border radius, etc.) and macOS system-level themes.
+- **Component Styles**: Styles specific to individual components (e.g. `Titlebar.svelte`, `Sidebar.svelte`) are declared directly inside their corresponding `.svelte` files.
+- **Page Styles**: Individual page styles (e.g. Dashboard, Providers, etc.) are located in their respective Svelte pages inside `frontend/src/pages/`.
+- **Local Development**:
+  ```bash
+  cd frontend
+  npm run dev          # Start Vite dev server for frontend previewing
+  # Or in the root directory
+  cargo tauri dev      # Start Tauri app window with hot reloading enabled
+  ```
 
 ## Troubleshooting
 
@@ -220,7 +210,7 @@ Design intent: the client trusts only the build-time embedded public key and nev
 
 - **Backend / forwarding**: Rust 1.80+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio
 - **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
-- **Frontend**: HTML + CSS + vanilla JavaScript + Bootstrap 5.3.3 (localized, no CDN dependency)
+- **Frontend**: Svelte 5 + TypeScript + Vite + custom Vanilla CSS glassmorphism UI
 - **Desktop shell**: Tauri 2 + tray-icon 0.23; the `cas://` URI scheme glues frontend/ and axum in-process, no TCP loopback
 - **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex/{config.toml,auth.json}` (Codex App integration)
 - **Packaging**: `cargo tauri build` single command produces dmg/AppImage/deb/exe/msi; `xtask release-bundle` finalizes sha256 + RSA-3072 sig + latest.json + draft GitHub release

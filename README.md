@@ -58,7 +58,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
   - **MCP**:结构化 JSON 编辑 `~/.codex/config.toml` 的 `[mcp_servers.*]` 节(`toml_edit` round-trip 保留注释 + 其他配置节)+ Plugins 子页扫 `~/.codex/plugins/cache/` 列已安装 plugin(enable toggle / uninstall);所有改动 atomic write + 独立 history 互不交叉(SHA-256 hash 路径)
 - 实时日志面板,2 秒自动刷新;统一 `tracing::warn!(error_id, detail)` + 稳定 token,operator 可 grep / 聚合
 - 反馈弹窗附带诊断材料(环境信息、脱敏配置、最近错误快照及完整请求 / 响应),减少手工补材料
-- 中文 / 英文界面,浅色 / 深色 / 绿色 / 橙色 / 灰色 / 白色多种主题
+- 中文 / 英文界面, 适配 macOS 经典玻璃质感设计 (Frosted Glass Vibrancy) + 自动深浅色切换
 - 跨平台单实例锁定(双击启动自动唤起已有窗口)+ 跨进程 file lock 防多实例同时写 config 丢更新
 - Windows / macOS / Linux 系统托盘
 
@@ -137,28 +137,18 @@ cargo tauri build --bundles deb,appimage     # Linux x86_64
 
 ### 想改 UI 样式怎么改
 
-`frontend/css/` 走"组件库"形式拆开,不需要全文 grep `style.css`:
+本项目前端已重构为 **Svelte 5 + TypeScript + Vite**，采用 scoped styles 进行组件化样式管理，并遵循 macOS 经典玻璃质感设计规范：
 
-| 想改什么 | 改哪个文件 |
-|---|---|
-| 主题色 / 圆角 / 阴影 / 间距等 design tokens | `frontend/css/tokens.css`(129 vars + 6 套主题) |
-| 全局 reset / body 字体 / focus 描边 | `frontend/css/base.css` |
-| 按钮 / 卡片 / 表单 / 徽章 / 模态等组件 | `frontend/css/components/<name>.css` |
-| 仪表盘 / 提供商 / 转发 / 设置 / 引导某一页专属样式 | `frontend/css/pages/<route>.css` |
-| 响应式断点 / 1100px / 720px | `frontend/css/responsive.css` |
-
-预览所有组件 + 各状态 + 主题切换:
-
-```bash
-# 浏览器直接打开(不需 dev server)
-open frontend/gallery.html        # macOS
-xdg-open frontend/gallery.html    # Linux
-start frontend/gallery.html       # Windows
-```
-
-`gallery.html` 顶部有主题切换 + 深浅色按钮,改 component css 后刷新即看。`frontend/index.html` 主入口 `<link href="css/style.css">` 不需要改 — `style.css` 只是 @import 入口聚合所有子文件。
-
-加新组件: 在 `components/` 建 `<name>.css` + 在 `style.css` 加一行 `@import url("components/<name>.css");` + 在 `gallery.html` 加 section。
+- **全局样式与 Design Tokens**: `frontend/src/app.css` 定义了所有全局 CSS 变量（如玻璃质感的背景色、毛玻璃模糊度、字体、渐变及圆角等）和 macOS 系统级的主题配置。
+- **组件样式**: 各组件的专属样式均直接声明在对应的 `.svelte` 文件内（如 `Titlebar.svelte`、`Sidebar.svelte`）。
+- **页面样式**: 各页面（如 Dashboard、Providers 等）的样式声明在 `frontend/src/pages/` 下的对应 Svelte 页面中。
+- **本地开发**:
+  ```bash
+  cd frontend
+  npm run dev          # 启动 Vite 开发服务器进行前端预览
+  # 或者在根目录下
+  cargo tauri dev      # 启动 Tauri 窗口并启用热重载
+  ```
 
 ## 常见问题
 
@@ -219,7 +209,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 - **后端 / 转发**:Rust 1.80+ · axum 0.8 · reqwest 0.12(rustls-tls)· tokio
 - **协议适配**:`crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web 互转(请求 body + 流式响应状态机 + reasoning_content + tool_calls)
-- **前端**:HTML + CSS + 原生 JavaScript + Bootstrap 5.3.3(本地化,无 CDN 依赖)
+- **前端**: Svelte 5 + TypeScript + Vite + custom Vanilla CSS glassmorphism UI
 - **桌面壳**:Tauri 2 + tray-icon 0.23,通过 `cas://` URI scheme 把 frontend/ 与 axum 同进程串起来,无 TCP loopback
 - **存储**:`~/.codex-app-transfer/config.json`(配置,与 v1.x 互通)、`~/.codex-app-transfer/sessions.db`(L2 sqlite 会话持久化)、`~/.codex/{config.toml,auth.json}`(Codex APP 集成)
 - **打包**:`cargo tauri build` 单命令出 dmg/AppImage/deb/exe/msi;`xtask release-bundle` 收口出 sha256 + RSA-3072 sig + latest.json + draft GitHub release
