@@ -5390,8 +5390,9 @@
     }
     const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
 
-    // 3. 渲染主题卡(grid 4 列 + 缩略图)— bg data URI 直接 <img src>。
-    //    选中卡片高亮 border;只显示一种名称(按 UI 语言),没看板娘 badge。
+    // 3. 渲染主题卡(grid 4 列 + 缩略图)。inline onclick → 全局
+    //    window.__themePickHandler,absolutely reliable(避开任何 event
+    //    delegation / closure / listener-loss bug)。
     container.style.display = "grid";
     container.style.gridTemplateColumns = "repeat(4, 1fr)";
     container.style.gap = "14px";
@@ -5402,8 +5403,9 @@
         ? "border:2px solid var(--bs-primary);box-shadow:0 0 0 3px rgba(13,110,253,0.18);"
         : "border:1px solid var(--bs-border-color);";
       const checkBadge = checked ? `<span style="position:absolute;top:6px;left:8px;background:var(--bs-primary);color:#fff;font-size:11px;padding:2px 8px;border-radius:8px;pointer-events:none;z-index:2;">✓</span>` : "";
+      const idEscaped = String(th.id).replace(/'/g, "\\'");
       return `
-        <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" data-theme-id="${th.id}">
+        <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" onclick="window.__themePickHandler && window.__themePickHandler('${idEscaped}')">
           ${checkBadge}
           <img src="${th.bgDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:16/10;object-fit:cover;display:block;pointer-events:none;">
           <div style="padding:8px 10px;pointer-events:none;text-align:center;">
@@ -5412,9 +5414,6 @@
         </div>
       `;
     }).join("");
-
-    // 4. click handler 在 bindThemeEvents 里用 event delegation 绑到 container 一次,
-    //    避免 renderTheme 反复 innerHTML 覆盖元素后 listener 丢。
 
     // 5. 刷新 status badge
     try {
@@ -5481,26 +5480,27 @@
       }
     });
 
-    // 卡片点击 — event delegation 绑到 container 一次,renderTheme 反复改 innerHTML
-    // 也不会丢 listener。selectedThemeId 改后只刷新视觉(re-render),不触发 apply。
-    $("#themeListContainer")?.addEventListener("click", async (e) => {
-      const card = e.target.closest(".card-theme-pick");
-      if (!card) return;
-      selectedThemeId = card.dataset.themeId;
-      // 如果 toggle 已开启,选新卡同时立刻 apply 新主题(无感切换)
+    // 卡片点击 — 全局 fn `window.__themePickHandler`,inline onclick 触发。
+    // 避开任何 event delegation / closure / listener-loss bug,绝对 reliable。
+    window.__themePickHandler = async (themeId) => {
+      console.log("[theme] pick", themeId);
+      selectedThemeId = themeId;
       const enabled = $("#codexUiThemeEnabled")?.checked;
-      if (enabled) {
-        await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
-        try {
-          await CCAPI.theme.apply(selectedThemeId);
+      try {
+        if (enabled) {
+          await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: themeId });
+          await CCAPI.theme.apply(themeId);
           showToast(t("theme.appliedToast") || "主题已应用");
-        } catch (err) { showToast(err.message); }
-      } else {
-        // toggle 关时,只持久化 user 的选择(不调 apply,toggle 开时再 apply)
-        await CCAPI.saveSettings({ codexUiTheme: selectedThemeId });
+        } else {
+          // toggle 关时,只持久化 user 的选择(不调 apply,toggle 开时再 apply)
+          await CCAPI.saveSettings({ codexUiTheme: themeId });
+        }
+      } catch (err) {
+        console.error("[theme] pick failed:", err);
+        showToast(err.message);
       }
       await renderTheme();
-    });
+    };
   }
 
   async function renderCodexAssets() {
