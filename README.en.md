@@ -106,6 +106,16 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Alibaba Cloud Bailian (Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
 | Responses passthrough (custom) | — | — | — | Direct upstream connection, bypasses proxy (suitable for OpenAI official / native Responses reverse proxy); ⚠️ Plugins/MCP `namespace` tool bundle is NOT flattened — some upstreams silently drop tools |
 
+## Reasoning effort mapping (chat-compat `reasoning_effort`)
+
+How Codex's `low/medium/high/xhigh` is dispatched per chat-completions upstream (issue #254):
+
+| Provider | `xhigh` / `max` | Other tiers | Notes |
+|---|---|---|---|
+| **DeepSeek V4** | `reasoning_effort: "max"` | `low/medium/high` → `"high"` | Only chat upstream that accepts a true max tier |
+| **Kimi / Kimi Code / GLM / Bailian Qwen / Xiaomi MiMo / MiniMax** | field dropped | field dropped | Upstreams don't accept `reasoning_effort`; default thinking applies. Set provider-native fields in `requestOptions` to control explicitly |
+| **Custom chat-compat** | clamp to `"high"` | passthrough | OpenAI standard enum conservative fallback |
+
 ## Model mapping
 
 Codex App prompts by OpenAI model names; third-party providers use real IDs like `deepseek-v4-pro` / `kimi-k2.6` / `glm-5.1` / `gemini-3-pro`.
@@ -183,11 +193,7 @@ Kimi / DeepSeek with thinking enabled require historical assistant messages with
 
 ### Upstream 400: `'reasoning_effort' does not support 'xhigh'`
 
-v2.1.14 and earlier silently clamped `xhigh` / `max` to `high` for all providers (issue #254). **v2.1.15+ switches to a per-provider policy**:
-
-- **DeepSeek V4**: `xhigh` / `max` → real `reasoning_effort: "max"`; `low` / `medium` / `high` → `"high"` (per official docs at `api-docs.deepseek.com/guides/thinking_mode`)
-- **Kimi / GLM / MiMo / MiniMax / Qwen (Bailian)**: `reasoning_effort` is dropped entirely — LiteLLM's `get_supported_openai_params` whitelists confirm these upstreams do not accept the field; upstream default thinking behavior applies
-- **Custom / unknown providers**: conservative fallback — `xhigh` / `max` still clamp to `"high"`, standard enum values pass through
+v2.1.14 and earlier clamped `xhigh` / `max` to `high` for all providers (issue #254). **v2.1.15+ uses a per-provider policy** — DeepSeek truly reaches max; Kimi / GLM / MiMo / MiniMax / Qwen drop the field (upstream doesn't accept it); custom proxies clamp conservatively. See the [reasoning effort mapping table](#reasoning-effort-mapping-chat-compat-reasoning_effort) above for the full matrix.
 
 `auto` / `none` / `disabled` and similar values that Chat endpoints do not accept are always dropped.
 
