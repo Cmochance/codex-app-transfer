@@ -5392,34 +5392,37 @@
 
     // 3. 渲染主题卡(grid 4 列 + 缩略图)— bg data URI 直接 <img src>。
     //    选中卡片高亮 border;hasMascot 角标 ★。
+    //    用 <div> 不用 <label>(label 跟内嵌 input 在某些 webview 上点击被
+    //    img/外部元素拦截);显式 click handler 选中,避开 label/radio 绑定。
     container.style.display = "grid";
     container.style.gridTemplateColumns = "repeat(4, 1fr)";
     container.style.gap = "14px";
     container.innerHTML = themeListCache.map((th) => {
       const displayName = lang === "en" ? th.displayNameEn : th.displayNameZh;
       const checked = th.id === selectedThemeId;
-      const mascotBadge = th.hasMascot ? `<span title="${lang === 'en' ? 'with mascot' : '含看板娘'}" style="position:absolute;top:6px;right:8px;background:var(--bs-warning);color:#000;font-size:10px;padding:1px 6px;border-radius:8px;">★ ${lang === 'en' ? 'mascot' : '看板娘'}</span>` : "";
+      const mascotBadge = th.hasMascot ? `<span title="${lang === 'en' ? 'with mascot' : '含看板娘'}" style="position:absolute;top:6px;right:8px;background:var(--bs-warning);color:#000;font-size:10px;padding:2px 8px;border-radius:8px;pointer-events:none;z-index:2;">★ ${lang === 'en' ? 'mascot' : '看板娘'}</span>` : "";
       const borderStyle = checked
         ? "border:2px solid var(--bs-primary);box-shadow:0 0 0 3px rgba(13,110,253,0.18);"
         : "border:1px solid var(--bs-border-color);";
+      const checkBadge = checked ? `<span style="position:absolute;top:6px;left:8px;background:var(--bs-primary);color:#fff;font-size:11px;padding:2px 8px;border-radius:8px;pointer-events:none;z-index:2;">✓</span>` : "";
       return `
-        <label class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;" data-theme-id="${th.id}">
-          <input type="radio" name="themeRadio" value="${th.id}" ${checked ? "checked" : ""} style="position:absolute;top:6px;left:8px;z-index:2;">
+        <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" data-theme-id="${th.id}">
+          ${checkBadge}
           ${mascotBadge}
-          <img src="${th.bgDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:16/10;object-fit:cover;display:block;">
-          <div style="padding:8px 10px;">
+          <img src="${th.bgDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:16/10;object-fit:cover;display:block;pointer-events:none;">
+          <div style="padding:8px 10px;pointer-events:none;">
             <div style="font-weight:600;font-size:14px;">${escapeHtml(displayName)}</div>
             <div class="settings-note" style="font-size:11px;margin-top:2px;opacity:0.7;font-family:monospace;">${th.id}</div>
           </div>
-        </label>
+        </div>
       `;
     }).join("");
 
-    // 4. radio change → update selectedThemeId(不立即 apply, user 按 Apply 触发)
-    container.querySelectorAll('input[name="themeRadio"]').forEach((r) => {
-      r.addEventListener("change", (e) => {
-        selectedThemeId = e.target.value;
-        renderTheme();  // re-render 高亮选中卡
+    // 4. card click → update selectedThemeId
+    container.querySelectorAll('.card-theme-pick').forEach((card) => {
+      card.addEventListener("click", () => {
+        selectedThemeId = card.dataset.themeId;
+        renderTheme();  // re-render 高亮新选中卡
       });
     });
 
