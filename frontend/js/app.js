@@ -5373,15 +5373,20 @@
     toggle.checked = settings.codexUiThemeEnabled === true;
     selectedThemeId = settings.codexUiTheme || null;
 
-    // 2. 拉主题列表(缓存避免反复请求)
-    if (!themeListCache) {
-      try {
-        const res = await CCAPI.theme.list();
-        themeListCache = res.themes || [];
-      } catch (e) {
-        themeListCache = [];
-        showToast(`${t("theme.loadFailed") || "主题列表加载失败"}: ${e.message}`);
+    // 2. 拉主题列表 — **每次 renderTheme 都重拉**(不缓存):避免 v1 cache-empty
+    //    bug(一旦失败 set 成 [],之后永不重试)+ 主题列表本身就是 5 项,
+    //    每次 ~5MB(含 base64 缩略图)由 webview 本地 IPC 走,延迟可忽略
+    try {
+      const res = await CCAPI.theme.list();
+      themeListCache = res.themes || [];
+      if (themeListCache.length === 0) {
+        console.warn("[theme] list returned empty:", res);
+        showToast("主题列表为空 — 检查 backend route 是否注册");
       }
+    } catch (e) {
+      themeListCache = [];
+      console.error("[theme] list failed:", e);
+      showToast(`${t("theme.loadFailed") || "主题列表加载失败"}: ${e.message}`);
     }
     const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
 
