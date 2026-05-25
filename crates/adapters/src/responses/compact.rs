@@ -1505,8 +1505,10 @@ mod tests {
 
     // ── #262: compact prompt i18n tests ──────────────────────────────
 
-    use std::sync::Mutex;
-    static LANG_TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// Devin BUG-003 fix:跟 [`crate::core::language::TEST_I18N_LOCK`] 共用同一把
+    /// 锁,跨模块 serialize 同一全局 `USER_LANGUAGE`。原版每模块独立 mutex 无法
+    /// serialize cargo test 跨模块的并发,会 race。
+    use crate::core::language::TEST_I18N_LOCK as LANG_TEST_LOCK;
 
     fn with_user_language<F: FnOnce()>(lang: &str, f: F) {
         let _guard = LANG_TEST_LOCK.lock().unwrap();

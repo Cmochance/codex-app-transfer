@@ -64,13 +64,19 @@ impl Language {
     }
 }
 
+/// #262 Devin BUG-003 fix:**所有 i18n 相关 cfg(test)** 共享同一把锁来 serialize
+/// `USER_LANGUAGE` 全局状态访问。原来 3 个模块(`core/language.rs`、
+/// `responses/compact.rs`、`responses/request/tests.rs`)各自定义独立 `Mutex` ——
+/// cargo test 跨模块并发跑,3 个 mutex 不能 serialize 同一全局,会 race。
+///
+/// 现在只能从这一个 pub static 锁,跨模块所有 test 串行。
+#[cfg(test)]
+pub static TEST_I18N_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use super::TEST_I18N_LOCK as TEST_LOCK;
     use super::*;
-    use std::sync::Mutex;
-
-    /// 测试串行化:全局 atomic state 在并发测试间互相干扰,加 mutex 让 set/get 配对独立。
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_lang<F: FnOnce()>(lang: Option<&str>, f: F) {
         let _guard = TEST_LOCK.lock().unwrap();

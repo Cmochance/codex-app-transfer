@@ -3457,8 +3457,11 @@ fn effort_string_form_also_extracted() {
 // ── #262: prompt i18n tests ──────────────────────────────────────────
 
 /// 串行化 i18n 测试 — 共享全局 USER_LANGUAGE state 不能并发跑。
-use std::sync::Mutex;
-static LANG_TEST_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Devin BUG-003 fix:跟 [`crate::core::language::TEST_I18N_LOCK`] 共用同一把
+/// 锁,跨模块 serialize 同一全局 `USER_LANGUAGE`。原版每模块独立 mutex 无法
+/// serialize cargo test 跨模块的并发,会 race。
+use crate::core::language::TEST_I18N_LOCK as LANG_TEST_LOCK;
 
 fn with_user_language<F: FnOnce()>(lang: &str, f: F) {
     let _guard = LANG_TEST_LOCK.lock().unwrap();
