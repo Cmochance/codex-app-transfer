@@ -33,9 +33,6 @@
   <!-- Native macOS drag region -->
   <div class="drag-region" data-tauri-drag-region></div>
 
-  <!-- Space for macOS native window control buttons -->
-  <div class="titlebar-left-placeholder"></div>
-
   <!-- Window title in the center -->
   <div class="titlebar-center">
     {$t('nav.' + $activeTab, { defaultValue: 'Codex App Transfer' })}

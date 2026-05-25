@@ -20,8 +20,7 @@
         "minHeight": 600,
         "resizable": true,
         "fullscreen": false,
-        "transparent": true,
-        "titleBarStyle": "Transparent"
+        "transparent": true
       }
     ],
     "security": {
