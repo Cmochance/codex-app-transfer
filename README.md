@@ -60,6 +60,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - 反馈弹窗附带诊断材料(环境信息、脱敏配置、最近错误快照及完整请求 / 响应),减少手工补材料
 - 中文 / 英文界面,浅色 / 深色 / 绿色 / 橙色 / 灰色 / 白色多种主题
 - **注入的 system prompts 跟随界面语言**:本项目对非 OpenAI provider 注入的 `apply_patch` chat-path 规则 + autocompact 总结提示词,跟设置里 `语言 / Language` 一致(中文用户 → 中文 prompt,避免模型中英混杂思考);V4A 关键字(`*** Begin Patch` / `@@ <header>` 等)+ Codex CLI 错误消息原文保英文(parser / matcher 不接受翻译)
+- **Codex Desktop 主题(可选,默认关)**:Theme 页内置 5 套动漫主题(`carton` 含浮动看板娘 + `changli` / `azurlane` / `nailin` / `zani` 单背景),通过 CDP 向 Codex Desktop 注入 CSS token 覆盖 + 背景图。开关跟 Plugin Unlock 独立,page reload 自动重应用
 - 跨平台单实例锁定(双击启动自动唤起已有窗口)+ 跨进程 file lock 防多实例同时写 config 丢更新
 - Windows / macOS / Linux 系统托盘
 

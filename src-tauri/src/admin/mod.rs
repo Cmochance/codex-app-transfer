@@ -170,6 +170,8 @@ pub fn build_app_router(state: AdminState) -> Router {
         .merge(handlers::gemini_oauth::routes())
         // Plugin Unlock (CDP injection for Codex Desktop)
         .merge(handlers::plugin_unlock::routes())
+        // Codex Desktop UI Theme (#264, 独立 toggle 不依赖 plugin_unlock)
+        .merge(handlers::theme::routes())
         // Antigravity OAuth (login / status / logout / cancel)
         .merge(handlers::antigravity_oauth::routes())
         // Codex AGENTS.md 受管块管理(#24 / #25 Agents tab MVP, 借鉴 borawong/AiMaMi)

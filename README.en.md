@@ -60,6 +60,7 @@ With any provider enabled, Codex App's model picker shows `<provider> / <real-mo
 - Feedback dialog automatically attaches diagnostic material (environment info, sanitized config, recent error snapshot with full request / response) — fewer back-and-forth follow-ups
 - Chinese / English UI; light / dark / green / orange / gray / white themes
 - **Injected system prompts follow the UI language**: the `apply_patch` chat-path rules + autocompact summarization prompt that this project injects for non-OpenAI providers track the `语言 / Language` setting (Chinese users → Chinese prompts, avoiding mixed-language model thinking); V4A keywords (`*** Begin Patch` / `@@ <header>` etc.) + Codex CLI error message originals stay in English (parser / matcher does not accept translations)
+- **Codex Desktop Theme (optional, off by default)**: Theme page ships 5 built-in anime themes (`carton` with a floating mascot + `changli` / `azurlane` / `nailin` / `zani` background-only), injects CSS token overrides + background image into Codex Desktop via CDP. Toggle is independent from Plugin Unlock; page reload re-applies automatically
 - Cross-platform single-instance lock (double-click brings the existing window forward) + cross-process file lock prevents multi-instance config-write lost-updates
 - Windows / macOS / Linux system tray
 

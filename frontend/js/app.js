@@ -2138,6 +2138,7 @@
     if (route === "proxy") await renderProxy();
     if (route === "settings") await renderSettings();
     if (route === "codex") await renderCodexAssets();
+    if (route === "theme") await renderTheme();
   }
 
   let currentTheme = "default";
@@ -5352,6 +5353,131 @@
     }
   }
 
+  // ── #264 Codex Desktop Theme page ─────────────────────────────────
+  let themeListCache = null;
+  let selectedThemeId = null;
+
+  async function renderTheme() {
+    const container = $("#themeListContainer");
+    const toggle = $("#codexUiThemeEnabled");
+    const badge = $("#themeStatusBadge");
+    if (!container || !toggle) return;
+
+    // 1. 读 settings.codexUiThemeEnabled + codexUiTheme
+    let settings;
+    try {
+      settings = await CCAPI.getSettings();
+    } catch (e) {
+      settings = {};
+    }
+    toggle.checked = settings.codexUiThemeEnabled === true;
+    selectedThemeId = settings.codexUiTheme || null;
+
+    // 2. 拉主题列表(缓存避免反复请求)
+    if (!themeListCache) {
+      try {
+        const res = await CCAPI.theme.list();
+        themeListCache = res.themes || [];
+      } catch (e) {
+        themeListCache = [];
+        showToast(`${t("theme.loadFailed") || "主题列表加载失败"}: ${e.message}`);
+      }
+    }
+    const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
+
+    // 3. 渲染主题卡(radio + 缩略图)— 缩略图用同样 CDP 注入路径 GET asset 太重,
+    //    简单版用 emoji + 主题名占位,user 拿到 UI 后真机看图自己识别。
+    //    v2 followup:加 thumbnail API endpoint /api/desktop/theme/thumbnail/<id>
+    container.innerHTML = themeListCache.map((th) => {
+      const displayName = lang === "en" ? th.displayNameEn : th.displayNameZh;
+      const checked = th.id === selectedThemeId ? "checked" : "";
+      const mascotIcon = th.hasMascot ? `<span title="${lang === 'en' ? 'with mascot' : '含看板娘'}" style="font-size:11px;color:var(--bs-success);margin-left:6px;">★</span>` : "";
+      return `
+        <label class="card-theme-pick" style="border:1px solid var(--bs-border-color);border-radius:8px;padding:12px;cursor:pointer;display:flex;align-items:center;gap:10px;${checked ? 'background:var(--bs-primary-bg-subtle);border-color:var(--bs-primary);' : ''}">
+          <input type="radio" name="themeRadio" value="${th.id}" ${checked}>
+          <div style="flex:1;">
+            <div style="font-weight:600;">${escapeHtml(displayName)}${mascotIcon}</div>
+            <div class="settings-note" style="font-size:11px;margin-top:2px;opacity:0.7;">${th.id}</div>
+          </div>
+        </label>
+      `;
+    }).join("");
+
+    // 4. radio change → update selectedThemeId(不立即 apply, user 按 Apply 触发)
+    container.querySelectorAll('input[name="themeRadio"]').forEach((r) => {
+      r.addEventListener("change", (e) => {
+        selectedThemeId = e.target.value;
+        renderTheme();  // re-render 高亮选中卡
+      });
+    });
+
+    // 5. 刷新 status badge
+    try {
+      const st = await CCAPI.theme.status();
+      const sObj = st.status;
+      if (sObj && typeof sObj === "object") {
+        if (sObj.Applied) badge.textContent = `${t("theme.applied") || "已应用"}: ${sObj.Applied.theme_id}`;
+        else if (sObj.Failed) badge.textContent = `${t("theme.failed") || "失败"}: ${sObj.Failed.error}`;
+        else badge.textContent = "";
+      } else if (sObj === "Disabled") {
+        badge.textContent = t("theme.disabled") || "未启用";
+      }
+    } catch (e) {
+      badge.textContent = "";
+    }
+  }
+
+  // bind apply / clear / toggle events 一次性,避免 renderTheme 反复绑定
+  let themeEventsBound = false;
+  function bindThemeEvents() {
+    if (themeEventsBound) return;
+    themeEventsBound = true;
+    $("[data-action=theme-apply]")?.addEventListener("click", async () => {
+      if (!selectedThemeId) {
+        showToast(t("theme.pickFirst") || "请先选一个主题");
+        return;
+      }
+      try {
+        // 持久化 settings: enabled=true + theme=selectedThemeId
+        await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
+        $("#codexUiThemeEnabled").checked = true;
+        // 真机应用
+        await CCAPI.theme.apply(selectedThemeId);
+        showToast(t("theme.appliedToast") || `主题已应用: ${selectedThemeId}`);
+        await renderTheme();
+      } catch (e) {
+        showToast(`${t("theme.applyFailed") || "应用失败"}: ${e.message}`);
+      }
+    });
+    $("[data-action=theme-clear]")?.addEventListener("click", async () => {
+      try {
+        await CCAPI.saveSettings({ codexUiThemeEnabled: false });
+        $("#codexUiThemeEnabled").checked = false;
+        await CCAPI.theme.clear();
+        showToast(t("theme.clearedToast") || "主题已清除");
+        await renderTheme();
+      } catch (e) {
+        showToast(`${t("theme.clearFailed") || "清除失败"}: ${e.message}`);
+      }
+    });
+    $("#codexUiThemeEnabled")?.addEventListener("change", async (e) => {
+      // toggle 直接 apply/clear,不需要按 Apply 按钮
+      if (e.target.checked) {
+        if (!selectedThemeId) {
+          showToast(t("theme.pickFirst") || "请先选一个主题再开启");
+          e.target.checked = false;
+          return;
+        }
+        await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
+        try { await CCAPI.theme.apply(selectedThemeId); } catch (err) { showToast(err.message); }
+      } else {
+        await CCAPI.saveSettings({ codexUiThemeEnabled: false });
+        try { await CCAPI.theme.clear(); } catch (err) { showToast(err.message); }
+      }
+      await renderTheme();
+    });
+  }
+
   async function renderCodexAssets() {
     const sidebar = $("#codexSidebar");
     const initialTab = currentCodexTab();
@@ -5952,6 +6078,7 @@
     toast = new bootstrap.Toast($("#appToast"), { delay: 2200 });
     bindEvents();
     bindFeedbackEvents();
+    bindThemeEvents();
     const settings = await CCApi.getSettings();
     const finalLang = settings.language || "zh";
     if (finalLang !== CCI18n.language) {

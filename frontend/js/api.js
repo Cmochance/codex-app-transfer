@@ -538,3 +538,22 @@ window.CCAPI.pluginUnlock = {
     return api('POST', '/api/desktop/plugin-unlock/reinject');
   },
 };
+
+window.CCAPI.theme = {
+  /** 列出内置主题(#264) */
+  async list() {
+    return api('GET', '/api/desktop/theme/list');
+  },
+  /** 当前注入状态 */
+  async status() {
+    return api('GET', '/api/desktop/theme/status');
+  },
+  /** 应用指定主题 */
+  async apply(themeId) {
+    return api('POST', '/api/desktop/theme/apply', { theme_id: themeId });
+  },
+  /** 清除主题(回原生 Codex UI) */
+  async clear() {
+    return api('POST', '/api/desktop/theme/clear');
+  },
+};
