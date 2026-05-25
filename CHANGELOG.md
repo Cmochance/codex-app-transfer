@@ -12,6 +12,8 @@ Claude preset 暂不开放:需要 P7 真实 Claude text、tool-call、`previous_
 
 **Per-provider `reasoning_effort` 策略**:修复 DeepSeek xhigh/max 档位被一刀切降级到 high 的问题(issue #254)。新建 `crates/registry/src/reasoning_effort_policy.rs` 注册表:DeepSeek 真实 xhigh→max;Kimi/GLM/MiMo/MiniMax/Qwen 不传 `reasoning_effort` 字段(LiteLLM 白名单实证不承认);自定义 provider 保守 fallback。同时删除已冗余的 `deepseek_max_effort` preset 死字段。
 
+**Provider 识别用自然主键(substring)而非 id 精确匹配**:实机抓 wire 验证(2026-05-25)暴露:本项目 healing 流程会把 builtin preset 的 id 换成 UUID(`34fe2433`),precise `provider.id == "deepseek"` 匹配在用户真实 saved config 上永远不命中,issue #254 修复对真实用户失效。改用 `provider.id` / `name` / `base_url` 三字段大小写不敏感 substring 匹配(跟 `provider_looks_like` 同款范式)。同时 audit 出阿里云百炼 (Token Plan) 第二个漏网点:baseUrl `token-plan.cn-beijing.maas.aliyuncs.com` 不含 `dashscope`,name 不含 `bailian`,补 needle `maas.aliyuncs` + `百炼` 兜底。
+
 ## v2.1.14 — 2026-05-23
 
 **Codex 文档管理 4 子页完整重做**:Sidebar → Codex 整页改成 Agents / Memories / Skills / MCP 四 sub-tab,每个 sub-tab raw 模式编辑对应 codex 配置,SHA-256 hash 独立 history 互不交叉。

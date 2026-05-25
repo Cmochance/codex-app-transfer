@@ -160,6 +160,17 @@ impl ReasoningEffortWire {
 
 /// 按 provider 查 reasoning_effort wire 策略.
 ///
+/// **匹配方式**:对 `provider.id` / `provider.name` / `provider.base_url` 做
+/// 大小写不敏感的 substring 匹配。**故意不只看 `provider.id`** — 因为本项目
+/// healing 流程会把 builtin preset 的 id 替换成 UUID(`crates/registry/src/healing.rs`),
+/// `provider.id == "deepseek"` 精确匹配在用户真实 saved config 上**永远不会命中**
+/// (id 被改成 UUID 但 name/baseUrl 保留原值)。这跟 [`provider_looks_like`]
+/// (`crates/adapters/src/responses/request.rs:1320`) 同款匹配范式,确保兼容
+/// builtin preset id 跟用户自定义 provider 的命名习惯。
+///
+/// **needle 安全性**:每个 needle 设计成"足够特殊不误伤其他 provider"。
+/// 不用过短 needle(如 `glm`)防自定义 provider 名字偶然命中。
+///
 /// 返回值约定:
 /// - `HighMax` — DeepSeek 专属
 /// - `Drop` — Kimi/GLM/MiMo/MiniMax/Qwen 等明确不收的上游
@@ -167,70 +178,121 @@ impl ReasoningEffortWire {
 pub fn reasoning_effort_wire(provider: &Provider) -> ReasoningEffortWire {
     use ReasoningEffortWire::*;
 
-    // 按 provider.id 精确匹配 builtin preset(`presets_data.json` 各家 `id` 字段)。
-    // 自定义 provider 的 id 通常是用户输入的任意字符串,不命中任何 arm → 走 fallback。
-    match provider.id.as_str() {
-        // ─── DeepSeek V4 ─────────────────────────────────────────────────
-        //
-        // 官方文档(api-docs.deepseek.com/guides/thinking_mode)原话:
-        // "在思考模式中,为了兼容性,`low` 和 `medium` 被映射到 `high`,
-        // `xhigh` 被映射到 `max`。在思考模式中,常规请求的默认努力程度为 `high`;
-        // 对于某些复杂代理请求(如 Claude Code、OpenCode),努力程度自动设置为 `max`"。
-        //
-        // OpenAI 格式 wire:`{"reasoning_effort": "high|max"}`
-        // Anthropic 格式 wire:`{"output_config": {"effort": "high|max"}}`
-        //
-        // LiteLLM `llms/deepseek/chat/transformation.py:41-63` 实际把所有非 none
-        // 折叠成 `thinking.type=enabled`,**不区分档位** — 比官方 docs 保守。本
-        // 项目信官方 docs(issue #254 报告:LiteLLM 这种处理让用户选 xhigh 时
-        // DeepSeek max 档完全不可达,违反预期)。
-        "deepseek" => HighMax,
-
-        // ─── 不收 reasoning_effort 的上游(LiteLLM 实证) ─────────────────
-        //
-        // Kimi (Moonshot) — `llms/moonshot/chat/transformation.py:91-146` 的
-        // `get_supported_openai_params` 不收 reasoning_effort;reasoning 走
-        // `fill_reasoning_content` 多轮 tool_call 注入路径(line 148-194),跟
-        // effort 档位无关。官方文档(platform.kimi.com/docs/guide/use-kimi-k2-thinking-model)
-        // 只暴露 `thinking.type: enabled|disabled` binary 开关 + `keep: "all"` 多轮保留。
-        "kimi" | "kimi-code" => Drop,
-
-        // 智谱 GLM (Z.AI) — `llms/zai/chat/transformation.py:36-58` 的
-        // `get_supported_openai_params` 只承认 `thinking` 字段,不收 reasoning_effort。
-        // 官方文档(docs.bigmodel.cn/cn/guide/develop/openai/introduction)只展示
-        // `extra_body: {thinking: {type: enabled}}`,无 effort/budget 档位。
-        "zhipu" => Drop,
-
-        // 阿里云百炼 Qwen — `llms/dashscope/chat/transformation.py` 全文 82 行,
-        // **没有** `get_supported_openai_params` 也没有 `map_openai_params`,
-        // 走父类 OpenAIGPTConfig 默认透传(可能被 dashscope silent ignored)。
-        // 官方文档(help.aliyun.com/zh/model-studio/deep-thinking)用 `enable_thinking: bool`
-        // + `thinking_budget: int` (tokens) — **数值预算**,不是字符串档位。
-        // LiteLLM 未给出 effort→budget 数值映射,本项目也不拍脑袋猜 — 让用户
-        // 通过 `provider.requestOptions` 显式设 thinking_budget 即可。
-        "bailian" | "bailian-token-plan" => Drop,
-
-        // 小米 MiMo v2 — LiteLLM `types/utils.py:3333` 仅 `XIAOMI_MIMO = "xiaomi_mimo"`
-        // enum 注册,**无 `llms/xiaomi_mimo/` 目录**,无 transformation。走
-        // openai_like 通用路径 = 零处理。本项目代码 [`compact_thinking_policy`]
-        // 推断 MiMo v2 走 `enable_thinking: false` wire(派 B,跟 Qwen 同款)。
-        // reasoning_effort 字段在 MiMo 文档(mimo-v2.com/zh/docs)没有提及,Drop。
-        "xiaomi-mimo-payg" | "xiaomi-mimo-token-plan" => Drop,
-
-        // MiniMax M2.x — `llms/minimax/chat/transformation.py:87-102` 的
-        // `get_supported_openai_params` 只承认 `thinking` + 自有 `reasoning_split`,
-        // **不收** reasoning_effort。本项目 `sanitize_minimax_chat_body` 已主动
-        // 剥掉(详见 [`crate::compact_thinking_policy::__unsupported_model_anchors`])。
-        // Drop 是更早一步声明,语义更清晰。
-        "minimax" => Drop,
-
-        // ─── Fallback:自定义 / 未知 chat-compat 上游 ────────────────────
-        //
-        // 没有明确证据时走 OpenAI 标准 enum,因为:
-        // 1. 该路径是"无害降级"(标准 enum 上限是 high,xhigh 砍到 high 不丢命)
-        // 2. 用户自定义反代 / 兼容端点最可能就是 OpenAI 标准
-        _ => OpenAIEnum,
+    // ─── DeepSeek V4 ─────────────────────────────────────────────────
+    //
+    // 官方文档(api-docs.deepseek.com/guides/thinking_mode)原话:
+    // "在思考模式中,为了兼容性,`low` 和 `medium` 被映射到 `high`,
+    // `xhigh` 被映射到 `max`。在思考模式中,常规请求的默认努力程度为 `high`;
+    // 对于某些复杂代理请求(如 Claude Code、OpenCode),努力程度自动设置为 `max`"。
+    //
+    // OpenAI 格式 wire:`{"reasoning_effort": "high|max"}`
+    // Anthropic 格式 wire:`{"output_config": {"effort": "high|max"}}`
+    //
+    // LiteLLM `llms/deepseek/chat/transformation.py:41-63` 实际把所有非 none
+    // 折叠成 `thinking.type=enabled`,**不区分档位** — 比官方 docs 保守。本
+    // 项目信官方 docs(issue #254 报告:LiteLLM 这种处理让用户选 xhigh 时
+    // DeepSeek max 档完全不可达,违反预期)。
+    //
+    // needle 选择:`"deepseek"` — id slug / name "DeepSeek" / baseUrl
+    // "api.deepseek.com" 三者都含此子串,UUID id 也可被 name/baseUrl 兜住。
+    if provider_matches(provider, "deepseek") {
+        return HighMax;
     }
+
+    // ─── 不收 reasoning_effort 的上游(LiteLLM 实证) ─────────────────
+    //
+    // Kimi (Moonshot) + Kimi Code — `llms/moonshot/chat/transformation.py:91-146`
+    // 的 `get_supported_openai_params` 不收 reasoning_effort;reasoning 走
+    // `fill_reasoning_content` 多轮 tool_call 注入路径(line 148-194),跟
+    // effort 档位无关。官方文档(platform.kimi.com/docs/guide/use-kimi-k2-thinking-model)
+    // 只暴露 `thinking.type: enabled|disabled` binary 开关 + `keep: "all"` 多轮保留。
+    //
+    // needle:`"kimi"` 覆盖 builtin "kimi" + "kimi-code" + baseUrl "kimi.com";
+    // `"moonshot"` 兜底 baseUrl "api.moonshot.cn"(name 没 kimi 子串的 legacy
+    // 配置)。两个 needle 都不会命中 MiniMax / MiMo / DeepSeek / GLM / Qwen。
+    if provider_matches(provider, "kimi") || provider_matches(provider, "moonshot") {
+        return Drop;
+    }
+
+    // 智谱 GLM (Z.AI) — `llms/zai/chat/transformation.py:36-58` 的
+    // `get_supported_openai_params` 只承认 `thinking` 字段,不收 reasoning_effort。
+    // 官方文档(docs.bigmodel.cn/cn/guide/develop/openai/introduction)只展示
+    // `extra_body: {thinking: {type: enabled}}`,无 effort/budget 档位。
+    //
+    // needle:`"zhipu"`(builtin id)/ `"bigmodel"`(baseUrl "open.bigmodel.cn")
+    // 故意不用 `"glm"` — 太短,可能误伤自定义 "glm-proxy" 之类。
+    if provider_matches(provider, "zhipu") || provider_matches(provider, "bigmodel") {
+        return Drop;
+    }
+
+    // 阿里云百炼 Qwen — `llms/dashscope/chat/transformation.py` 全文 82 行,
+    // **没有** `get_supported_openai_params` 也没有 `map_openai_params`,
+    // 走父类 OpenAIGPTConfig 默认透传(可能被 dashscope silent ignored)。
+    // 官方文档(help.aliyun.com/zh/model-studio/deep-thinking)用 `enable_thinking: bool`
+    // + `thinking_budget: int` (tokens) — **数值预算**,不是字符串档位。
+    // LiteLLM 未给出 effort→budget 数值映射,本项目也不拍脑袋猜 — 让用户
+    // 通过 `provider.requestOptions` 显式设 thinking_budget 即可。
+    //
+    // needle 多路覆盖(builtin 两套 baseUrl 域不同):
+    // - `"bailian"`:id slug "bailian" / "bailian-token-plan"
+    // - `"dashscope"`:按量计费 baseUrl "dashscope.aliyuncs.com"
+    // - `"maas.aliyuncs"`:Token Plan baseUrl "token-plan.cn-beijing.maas.aliyuncs.com"
+    //   (阿里云 MaaS 子域专属,不会误伤其他 aliyuncs 反代)
+    // - `"百炼"`:中文 name 兜底(用户 healed config name 保留中文)
+    //
+    // 实机验证 2026-05-25 暴露 audit miss:Token Plan baseUrl 不含 dashscope,
+    // name "阿里云百炼 (Token Plan)" 不含 bailian — 漏掉这家 provider 让 Qwen
+    // Token Plan 误走 OpenAIEnum fallback、wire 上写 reasoning_effort=high。
+    if provider_matches(provider, "bailian")
+        || provider_matches(provider, "dashscope")
+        || provider_matches(provider, "maas.aliyuncs")
+        || provider_matches(provider, "百炼")
+    {
+        return Drop;
+    }
+
+    // 小米 MiMo v2 — LiteLLM `types/utils.py:3333` 仅 `XIAOMI_MIMO = "xiaomi_mimo"`
+    // enum 注册,**无 `llms/xiaomi_mimo/` 目录**,无 transformation。走
+    // openai_like 通用路径 = 零处理。本项目代码 [`compact_thinking_policy`]
+    // 推断 MiMo v2 走 `enable_thinking: false` wire(派 B,跟 Qwen 同款)。
+    // reasoning_effort 字段在 MiMo 文档(mimo-v2.com/zh/docs)没有提及,Drop。
+    //
+    // needle:`"mimo"`(覆盖 builtin "xiaomi-mimo-payg" / "xiaomi-mimo-token-plan"
+    // + baseUrl "api.xiaomimimo.com" / "token-plan-*.xiaomimimo.com")。
+    if provider_matches(provider, "mimo") {
+        return Drop;
+    }
+
+    // MiniMax M2.x — `llms/minimax/chat/transformation.py:87-102` 的
+    // `get_supported_openai_params` 只承认 `thinking` + 自有 `reasoning_split`,
+    // **不收** reasoning_effort。本项目 `sanitize_minimax_chat_body` 已主动
+    // 剥掉(详见 [`crate::compact_thinking_policy::__unsupported_model_anchors`])。
+    // Drop 是更早一步声明,语义更清晰。
+    //
+    // needle:`"minimax"`(覆盖 builtin id "minimax" + baseUrl "api.minimaxi.com"
+    // — substring `minimax` 也命中 `minimaxi`)。
+    if provider_matches(provider, "minimax") {
+        return Drop;
+    }
+
+    // ─── Fallback:自定义 / 未知 chat-compat 上游 ────────────────────
+    //
+    // 没有明确证据时走 OpenAI 标准 enum,因为:
+    // 1. 该路径是"无害降级"(标准 enum 上限是 high,xhigh 砍到 high 不丢命)
+    // 2. 用户自定义反代 / 兼容端点最可能就是 OpenAI 标准
+    OpenAIEnum
+}
+
+/// `provider.id` / `provider.name` / `provider.base_url` 任一字段(大小写不敏感)
+/// 含 `needle` 子串即返回 true.
+///
+/// 跟 `crates/adapters/src/responses/request.rs::provider_looks_like` 同款匹配
+/// 范式,但因 registry crate 不能反向依赖 adapters,在此独立实现。
+fn provider_matches(provider: &Provider, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    [&provider.id, &provider.name, &provider.base_url]
+        .iter()
+        .any(|value| value.to_ascii_lowercase().contains(&needle))
 }
 
 /// 便捷函数:按 provider 查 policy + 写 effort.
@@ -255,10 +317,14 @@ mod tests {
     use indexmap::IndexMap;
 
     fn provider(id: &str) -> Provider {
+        provider_full(id, id, "https://example.test")
+    }
+
+    fn provider_full(id: &str, name: &str, base_url: &str) -> Provider {
         Provider {
             id: id.into(),
-            name: id.into(),
-            base_url: "https://example.test".into(),
+            name: name.into(),
+            base_url: base_url.into(),
             api_format: "openai_chat".into(),
             auth_scheme: "bearer".into(),
             api_key: String::new(),
@@ -442,5 +508,127 @@ mod tests {
             reasoning_effort_wire(&provider("unknown-custom")),
             ReasoningEffortWire::OpenAIEnum
         );
+    }
+
+    // ─── healed config 形态(UUID id + 自然 name/baseUrl) ───────────────────
+    //
+    // healing 流程会把 builtin preset 的 id 替换成 UUID,真实用户 saved config
+    // 的 DeepSeek provider id 形如 "34fe2433"。precise id 匹配在此场景会失效 —
+    // 必须 fallback 到 name / baseUrl substring(本测试组验证)。
+
+    #[test]
+    fn deepseek_uuid_id_matched_by_name() {
+        let p = provider_full("34fe2433", "DeepSeek", "https://api.deepseek.com/v1");
+        assert_eq!(
+            reasoning_effort_wire(&p),
+            ReasoningEffortWire::HighMax,
+            "healed UUID id 必须靠 name/baseUrl 兜住,否则 issue #254 修复对真实用户无效"
+        );
+    }
+
+    #[test]
+    fn deepseek_uuid_id_xhigh_real_user_e2e() {
+        // 真实用户 config 形态端到端测试:Codex 发 xhigh → wire 上是 max
+        let p = provider_full("34fe2433", "DeepSeek", "https://api.deepseek.com/v1");
+        let mut body = Map::new();
+        apply_reasoning_effort(&mut body, &p, "xhigh");
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn kimi_uuid_id_matched_by_baseurl() {
+        // Kimi builtin healed:UUID id + name "Kimi (月之暗面)" + baseUrl moonshot.cn
+        let p = provider_full("11e7e07c", "Kimi", "https://api.moonshot.cn/v1");
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::Drop);
+    }
+
+    #[test]
+    fn mimo_uuid_id_matched_by_baseurl() {
+        let p = provider_full(
+            "b863a67c",
+            "Xiaomi MiMo (Token Plan)",
+            "https://token-plan-sgp.xiaomimimo.com/v1",
+        );
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::Drop);
+    }
+
+    #[test]
+    fn minimax_uuid_id_matched_by_baseurl() {
+        let p = provider_full("abc123", "MiniMax", "https://api.minimaxi.com/v1");
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::Drop);
+    }
+
+    #[test]
+    fn zhipu_uuid_id_matched_by_baseurl() {
+        let p = provider_full("xyz789", "GLM", "https://open.bigmodel.cn/api/paas/v4");
+        // 注:zhipu 走 bigmodel needle 而非 glm(glm 太短易误伤)
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::Drop);
+    }
+
+    #[test]
+    fn bailian_uuid_id_matched_by_baseurl() {
+        let p = provider_full(
+            "qwe456",
+            "阿里云百炼",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        );
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::Drop);
+    }
+
+    #[test]
+    fn bailian_token_plan_uuid_matched_by_maas_subdomain() {
+        // 实机暴露 audit miss(2026-05-25):Token Plan baseUrl 域不同于按量计费,
+        // 必须有 needle 兜住,否则 Qwen Token Plan 会走 OpenAIEnum fallback。
+        let p = provider_full(
+            "tokenplan-uuid",
+            "阿里云百炼 (Token Plan)",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        );
+        assert_eq!(
+            reasoning_effort_wire(&p),
+            ReasoningEffortWire::Drop,
+            "阿里云百炼 Token Plan(maas.aliyuncs 子域)必须命中 Drop"
+        );
+    }
+
+    #[test]
+    fn bailian_token_plan_matched_by_chinese_name() {
+        // baseUrl 完全没 maas / aliyuncs 关键字时,中文 name "百炼" 兜底
+        let p = provider_full("custom-uuid", "百炼自建反代", "https://my.proxy.example/v1");
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::Drop);
+    }
+
+    // ─── 防误伤测试:确保 needle 不会把无关 provider 错分类 ─────────────────
+
+    #[test]
+    fn custom_proxy_without_any_needle_stays_openai_enum() {
+        let p = provider_full(
+            "user-proxy-1",
+            "my-internal-proxy",
+            "https://api.foo.bar/v1",
+        );
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::OpenAIEnum);
+    }
+
+    #[test]
+    fn openai_official_stays_openai_enum() {
+        // OpenAI 官方 chat completions 应走 OpenAIEnum(虽然 OpenAI 自家 chat 不暴露
+        // reasoning_effort,但 fallback 路径下 wire 写出来是无害的标准字段)
+        let p = provider_full("openai", "OpenAI", "https://api.openai.com/v1");
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::OpenAIEnum);
+    }
+
+    #[test]
+    fn needle_kimi_does_not_match_unrelated() {
+        // 自定义 provider 名字偶然不含 kimi/moonshot 不该被误判
+        let p = provider_full("custom", "MyProxy", "https://example.com");
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::OpenAIEnum);
+    }
+
+    #[test]
+    fn minimax_substring_in_minimaxi_baseurl_matches() {
+        // baseUrl 真实形态 api.minimaxi.com 含 "minimax" 子串,需保证命中
+        let p = provider_full("xx", "MiniMax", "https://api.minimaxi.com/v1");
+        assert_eq!(reasoning_effort_wire(&p), ReasoningEffortWire::Drop);
     }
 }
