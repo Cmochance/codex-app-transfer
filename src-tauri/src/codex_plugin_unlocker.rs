@@ -665,7 +665,13 @@ async fn inject_unlock_script(
     // 注入脚本内 `console.log` 会触发 `Runtime.consoleAPICalled` 事件帧,
     // 30 秒心跳的 evaluate 响应也可能排队 — 这些都不带 evaluate_id,
     // 会跟我们的目标响应交错。await_cdp_response 循环丢弃非目标 id 的帧。
-    let parsed = match await_cdp_response(read, evaluate_id, Duration::from_secs(8)).await {
+    //
+    // 超时预算 = JS 内部 30 × 500ms 重试窗口 (15s) + WS / 序列化开销 buffer。
+    // `awaitPromise: true` 使 CDP 必须等到 Promise resolve 才返回,如果这里
+    // 超时小于 JS 重试窗口,daemon 会在脚本还在重试时就 tear down WS,把 15s
+    // 耐心变成 dead code。20s 给 5s buffer 容 React 重渲 / GC stutter。
+    // (Devin Review BUG-0001 在 PR #255 抓到的初始 8s 超时不够。)
+    let parsed = match await_cdp_response(read, evaluate_id, Duration::from_secs(20)).await {
         Ok(resp) => resp,
         Err(e) => {
             set_status(
