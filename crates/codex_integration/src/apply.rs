@@ -98,33 +98,28 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         sync_root_value(&paths.config_toml, "openai_base_url", Some(&literal))?;
     }
 
-    // 2b. 默认强制 model_provider = "openai":Codex CLI 只有在 openai provider 下
-    // 才会读 openai_base_url。用户旧 config 里可能残留 model_provider = "custom"
-    // (历史教程 / 旧版 CLI 自己写的),配合 [model_providers.custom] 段会把流量
-    // 旁路到第三方 base_url,导致我们的 proxy 被绕过。Codex CLI 0.126+ 把端点
-    // 从 /v1/responses 切到 /responses,在残留路径上直接表现为 404(issue #178)。
-    // 快照已在第 1 步拿到用户原值,restore 时能完整退回。
+    // 2b. **默认 strip model_provider 字段**(#258 验证后改默认行为):
+    // - Codex CLI 在缺失 model_provider 时 fallback 到 openai,跟显式写
+    //   `model_provider = "openai"` 行为等价 —— 都会读 openai_base_url 走 proxy
+    // - #258 真机验证:strip 后日常使用无异常(完整对话 / tool call / autocompact)
+    // - 不显式写还顺便避开"显式 provider 字段可能触发上游 UI 隐藏 context 圆环"
+    //   的潜在 surface(虽然 #258 验证 1 证伪了这条因果,strip 仍是更小的 footprint)
     //
-    // **#258 调研 env override**:`CAT_SKIP_MODEL_PROVIDER_WRITE=1` 时改成"显式
-    // strip" 该字段(不写入)。用于验证"显式 model_provider = openai 是否触发
-    // Codex Desktop 26.519 隐藏 context window 圆环 UI"假设。CLI 默认 fallback
-    // 也是 openai provider,功能等价;只在 session_meta / turn_context 序列化层
-    // 可能有 None vs Some("openai") 差异,从而触发 UI 不同分支。
+    // **#178 防御保留为 env opt-in**:`CAT_FORCE_MODEL_PROVIDER_OPENAI=1` 时
+    // 仍强制写 openai 覆盖。该防御针对"用户旧 config 残留 model_provider = custom
+    // + [model_providers.custom] 段把流量旁路到第三方 base_url 绕过 proxy"的历史
+    // 场景。现行 user 几乎不会自己写 [model_providers.<name>] 段(Codex CLI
+    // 0.130+ 主流配置不需要),如果真踩到 set env 重启即可恢复强制覆盖行为。
     //
-    // **不绕过 #178 防御**:env 关掉时仍强制写;只有 user 显式 opt-in env 才跳。
-    if std::env::var("CAT_SKIP_MODEL_PROVIDER_WRITE")
+    // 快照已在第 1 步拿到用户原值,restore 时能完整退回原值(包括 custom)。
+    if std::env::var("CAT_FORCE_MODEL_PROVIDER_OPENAI")
         .ok()
         .as_deref()
         == Some("1")
     {
-        eprintln!(
-            "[codex_integration::apply] CAT_SKIP_MODEL_PROVIDER_WRITE=1: \
-             stripping model_provider field for #258 verification \
-             (this disables #178 defense — only use for debugging)"
-        );
-        sync_root_value(&paths.config_toml, "model_provider", None)?;
-    } else {
         sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
+    } else {
+        sync_root_value(&paths.config_toml, "model_provider", None)?;
     }
 
     // 2c. **#212/#215 Codex 联网默认开**(Codex docs "Full access" 配对):
@@ -1245,11 +1240,14 @@ mod tests {
         assert!(auth_after.get("auth_mode").is_none());
     }
 
-    /// issue #178:用户旧 config 残留 `model_provider = "custom"` + `[model_providers.custom]`
-    /// 段时,apply 必须把 `model_provider` 拉到 `"openai"`,否则 Codex CLI 把流量
-    /// 旁路到 custom block 的 base_url,绕过 proxy(0.126+ 表现为 /v1/responses 404)。
+    /// #258:apply 默认 strip `model_provider` 字段 —— Codex CLI 缺失时 fallback
+    /// 到 openai 跟显式写等价,strip 避开"显式字段触发上游 UI surface" 的潜在路径。
+    /// 注:这意味着 user 旧 config 残留 `model_provider = "custom"` 也会被 strip,
+    /// 走 CLI default openai —— 跟 #178 强制覆盖逻辑等价(都不会让流量进入
+    /// `[model_providers.custom]` 段),但 footprint 更小。#178 强制覆盖行为
+    /// 通过 `CAT_FORCE_MODEL_PROVIDER_OPENAI=1` env 可重新启用(opt-in)。
     #[test]
-    fn apply_normalizes_legacy_custom_model_provider() {
+    fn apply_strips_legacy_custom_model_provider() {
         let (_t, paths) = setup();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(
@@ -1280,8 +1278,8 @@ mod tests {
         .unwrap();
         let toml = read_toml(&paths);
         assert!(
-            toml.contains("model_provider = \"openai\""),
-            "apply 必须把 model_provider 拉正到 openai,实际 toml:\n{toml}"
+            !toml.contains("model_provider ="),
+            "apply 应 strip model_provider 字段,实际 toml:\n{toml}"
         );
         assert!(
             toml.contains("openai_base_url = \"http://127.0.0.1:18080\""),
