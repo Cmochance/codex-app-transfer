@@ -1674,10 +1674,9 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
         // 关键:atom 字段没被 remove(restore short-circuit 跳过 atom touching)
         assert!(
-            after.pointer(
-                "/electron-persisted-atom-state/local-conversation-status-section-visible"
-            )
-            .is_some(),
+            after
+                .pointer("/electron-persisted-atom-state/local-conversation-status-section-visible")
+                .is_some(),
             "capture_failed=true 时 restore 必须不调 remove_atom,atom 字段必须保留"
         );
     }
