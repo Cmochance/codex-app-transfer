@@ -462,6 +462,16 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
     if let Err(e) = result {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    // #262 Devin BUG-002 fix:import_config 替换整 config 也可能改 settings.language,
+    // 必须同步 adapters 全局,否则 import 后 prompt 注入仍跟 import 前的语言一致
+    // (silent failure)。失败 silent ok — language sync 是 UI 偏好不该 block import。
+    if let Ok(reloaded) = load_registry() {
+        let settings = reloaded
+            .get("settings")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        sync_user_language_from_settings(&settings);
+    }
     Json(json!({
         "success": true,
         "message": "config imported",
