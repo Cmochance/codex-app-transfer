@@ -1234,12 +1234,13 @@ mod tests {
         assert!(auth_after.get("auth_mode").is_none());
     }
 
-    /// #258:apply 默认 strip `model_provider` 字段 —— Codex CLI 缺失时 fallback
+    /// #258:apply 无条件 strip `model_provider` 字段 —— Codex CLI 缺失时 fallback
     /// 到 openai 跟显式写等价,strip 避开"显式字段触发上游 UI surface" 的潜在路径。
     /// 注:这意味着 user 旧 config 残留 `model_provider = "custom"` 也会被 strip,
     /// 走 CLI default openai —— 跟 #178 强制覆盖逻辑等价(都不会让流量进入
-    /// `[model_providers.custom]` 段),但 footprint 更小。#178 强制覆盖行为
-    /// 通过 `CAT_FORCE_MODEL_PROVIDER_OPENAI=1` env 可重新启用(opt-in)。
+    /// `[model_providers.custom]` 段),但 footprint 更小。无 env opt-in 写回:
+    /// 任何允许 model_provider 字段写回 config 的 escape hatch 都可能让"残留
+    /// model_provider 导致回话丢失"风险复发,所以 strip 是终态。
     #[test]
     fn apply_strips_legacy_custom_model_provider() {
         let (_t, paths) = setup();
