@@ -511,9 +511,12 @@
       return api('GET', '/api/antigravity-oauth/models');
     },
   };
-})();
 
 // ── Codex Desktop Plugins 解锁 API ──
+// **#264 fix**: pluginUnlock + theme 必须留在 IIFE **内**(line 1 `(function () {`),
+// 否则 IIFE close 后 `api()` fn 不可见,调用报 `Can't find variable: api`。
+// 原版 line 514 的 `})()` 提前关 IIFE 是 bug(plugin unlock UI 实际很少触发,
+// 没暴露);改成 IIFE 包到文件末尾。
 
 window.CCAPI = window.CCAPI || {};
 
@@ -557,3 +560,6 @@ window.CCAPI.theme = {
     return api('POST', '/api/desktop/theme/clear');
   },
 };
+
+})();
+
