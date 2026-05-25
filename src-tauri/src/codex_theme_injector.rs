@@ -18,7 +18,6 @@
 //! **资源**:5 套内置主题在 `src-tauri/resources/themes/<name>/{bg.{png,jpg},mascot.png?}`,
 //! 编译时 `include_bytes!` 嵌进 binary,运行时 base64 编码注入 data URI。
 
-
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -229,47 +228,43 @@ pub fn load_theme_assets(theme_id: &str) -> Option<ThemeAssets> {
         return load_custom_theme_assets();
     }
     // include_bytes! 必须用字面路径,所以每条 theme 显式 match
-    let (bg_bytes, bg_mime, mascot, preview_bytes): (
-        &[u8],
-        &str,
-        Option<(&[u8], &str)>,
-        &[u8],
-    ) = match theme_id {
-        "carton" => (
-            include_bytes!("../resources/themes/carton/bg.jpg"),
-            "image/jpeg",
-            Some((
-                include_bytes!("../resources/themes/carton/mascot.png"),
-                "image/png",
-            )),
-            include_bytes!("../resources/themes/carton/preview.jpg"),
-        ),
-        "changli" => (
-            include_bytes!("../resources/themes/changli/bg.jpg"),
-            "image/jpeg",
-            None,
-            include_bytes!("../resources/themes/changli/preview.jpg"),
-        ),
-        "azurlane" => (
-            include_bytes!("../resources/themes/azurlane/bg.jpg"),
-            "image/jpeg",
-            None,
-            include_bytes!("../resources/themes/azurlane/preview.jpg"),
-        ),
-        "nailin" => (
-            include_bytes!("../resources/themes/nailin/bg.jpg"),
-            "image/jpeg",
-            None,
-            include_bytes!("../resources/themes/nailin/preview.jpg"),
-        ),
-        "zani" => (
-            include_bytes!("../resources/themes/zani/bg.jpg"),
-            "image/jpeg",
-            None,
-            include_bytes!("../resources/themes/zani/preview.jpg"),
-        ),
-        _ => return None,
-    };
+    let (bg_bytes, bg_mime, mascot, preview_bytes): (&[u8], &str, Option<(&[u8], &str)>, &[u8]) =
+        match theme_id {
+            "carton" => (
+                include_bytes!("../resources/themes/carton/bg.jpg"),
+                "image/jpeg",
+                Some((
+                    include_bytes!("../resources/themes/carton/mascot.png"),
+                    "image/png",
+                )),
+                include_bytes!("../resources/themes/carton/preview.jpg"),
+            ),
+            "changli" => (
+                include_bytes!("../resources/themes/changli/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/changli/preview.jpg"),
+            ),
+            "azurlane" => (
+                include_bytes!("../resources/themes/azurlane/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/azurlane/preview.jpg"),
+            ),
+            "nailin" => (
+                include_bytes!("../resources/themes/nailin/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/nailin/preview.jpg"),
+            ),
+            "zani" => (
+                include_bytes!("../resources/themes/zani/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/zani/preview.jpg"),
+            ),
+            _ => return None,
+        };
     Some(ThemeAssets {
         bg_data_uri: encode_data_uri(bg_mime, bg_bytes),
         mascot_data_uri: mascot.map(|(b, m)| encode_data_uri(m, b)),
@@ -722,8 +717,7 @@ pub fn read_settings(settings: &Value) -> ThemeSettings {
         .and_then(Value::as_str)
         .map(|s| s.to_owned())
         .filter(|s| {
-            THEME_IDS.contains(&s.as_str())
-                || (s == CUSTOM_THEME_ID && custom_theme_exists())
+            THEME_IDS.contains(&s.as_str()) || (s == CUSTOM_THEME_ID && custom_theme_exists())
         });
     ThemeSettings { enabled, theme_id }
 }

@@ -18,8 +18,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::codex_theme_injector::{
-    all_themes, apply_theme, clear_theme, delete_custom_theme,
-    get_status as get_theme_status, load_theme_assets, reload_codex_page, save_custom_theme,
+    all_themes, apply_theme, clear_theme, delete_custom_theme, get_status as get_theme_status,
+    load_theme_assets, reload_codex_page, save_custom_theme,
 };
 use axum::routing::delete;
 
@@ -105,9 +105,7 @@ pub struct CustomUploadPayload {
 /// 接 user 上传的图片(JPG / PNG)→ 后端中心 crop 方形 + resize 2048 + JPEG
 /// encode → 写 `~/.codex-app-transfer/themes/custom/bg.jpg` + `preview.jpg`。
 /// 接着前端 list 会拿到 custom 卡片(在内置 5 个之后第 6 位)。
-pub async fn custom_upload_handler(
-    Json(payload): Json<CustomUploadPayload>,
-) -> impl IntoResponse {
+pub async fn custom_upload_handler(Json(payload): Json<CustomUploadPayload>) -> impl IntoResponse {
     use base64::{engine::general_purpose, Engine as _};
 
     let comma = match payload.data_uri.find(',') {
@@ -168,8 +166,5 @@ pub fn routes() -> Router<AdminState> {
             "/api/desktop/theme/custom/upload",
             post(custom_upload_handler),
         )
-        .route(
-            "/api/desktop/theme/custom",
-            delete(custom_delete_handler),
-        )
+        .route("/api/desktop/theme/custom", delete(custom_delete_handler))
 }
