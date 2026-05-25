@@ -5391,16 +5391,13 @@
     const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
 
     // 3. 渲染主题卡(grid 4 列 + 缩略图)— bg data URI 直接 <img src>。
-    //    选中卡片高亮 border;hasMascot 角标 ★。
-    //    用 <div> 不用 <label>(label 跟内嵌 input 在某些 webview 上点击被
-    //    img/外部元素拦截);显式 click handler 选中,避开 label/radio 绑定。
+    //    选中卡片高亮 border;只显示一种名称(按 UI 语言),没看板娘 badge。
     container.style.display = "grid";
     container.style.gridTemplateColumns = "repeat(4, 1fr)";
     container.style.gap = "14px";
     container.innerHTML = themeListCache.map((th) => {
       const displayName = lang === "en" ? th.displayNameEn : th.displayNameZh;
       const checked = th.id === selectedThemeId;
-      const mascotBadge = th.hasMascot ? `<span title="${lang === 'en' ? 'with mascot' : '含看板娘'}" style="position:absolute;top:6px;right:8px;background:var(--bs-warning);color:#000;font-size:10px;padding:2px 8px;border-radius:8px;pointer-events:none;z-index:2;">★ ${lang === 'en' ? 'mascot' : '看板娘'}</span>` : "";
       const borderStyle = checked
         ? "border:2px solid var(--bs-primary);box-shadow:0 0 0 3px rgba(13,110,253,0.18);"
         : "border:1px solid var(--bs-border-color);";
@@ -5408,23 +5405,16 @@
       return `
         <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" data-theme-id="${th.id}">
           ${checkBadge}
-          ${mascotBadge}
           <img src="${th.bgDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:16/10;object-fit:cover;display:block;pointer-events:none;">
-          <div style="padding:8px 10px;pointer-events:none;">
+          <div style="padding:8px 10px;pointer-events:none;text-align:center;">
             <div style="font-weight:600;font-size:14px;">${escapeHtml(displayName)}</div>
-            <div class="settings-note" style="font-size:11px;margin-top:2px;opacity:0.7;font-family:monospace;">${th.id}</div>
           </div>
         </div>
       `;
     }).join("");
 
-    // 4. card click → update selectedThemeId
-    container.querySelectorAll('.card-theme-pick').forEach((card) => {
-      card.addEventListener("click", () => {
-        selectedThemeId = card.dataset.themeId;
-        renderTheme();  // re-render 高亮新选中卡
-      });
-    });
+    // 4. click handler 在 bindThemeEvents 里用 event delegation 绑到 container 一次,
+    //    避免 renderTheme 反复 innerHTML 覆盖元素后 listener 丢。
 
     // 5. 刷新 status badge
     try {
@@ -5442,41 +5432,14 @@
     }
   }
 
-  // bind apply / clear / toggle events 一次性,避免 renderTheme 反复绑定
+  // bind toggle + reload/restart + card click(delegation)一次性,避免 renderTheme 反复绑定丢
   let themeEventsBound = false;
   function bindThemeEvents() {
     if (themeEventsBound) return;
     themeEventsBound = true;
-    $("[data-action=theme-apply]")?.addEventListener("click", async () => {
-      if (!selectedThemeId) {
-        showToast(t("theme.pickFirst") || "请先选一个主题");
-        return;
-      }
-      try {
-        // 持久化 settings: enabled=true + theme=selectedThemeId
-        await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
-        $("#codexUiThemeEnabled").checked = true;
-        // 真机应用
-        await CCAPI.theme.apply(selectedThemeId);
-        showToast(t("theme.appliedToast") || `主题已应用: ${selectedThemeId}`);
-        await renderTheme();
-      } catch (e) {
-        showToast(`${t("theme.applyFailed") || "应用失败"}: ${e.message}`);
-      }
-    });
-    $("[data-action=theme-clear]")?.addEventListener("click", async () => {
-      try {
-        await CCAPI.saveSettings({ codexUiThemeEnabled: false });
-        $("#codexUiThemeEnabled").checked = false;
-        await CCAPI.theme.clear();
-        showToast(t("theme.clearedToast") || "主题已清除");
-        await renderTheme();
-      } catch (e) {
-        showToast(`${t("theme.clearFailed") || "清除失败"}: ${e.message}`);
-      }
-    });
+
+    // toggle 直接 apply/clear,不需要按 Apply 按钮
     $("#codexUiThemeEnabled")?.addEventListener("change", async (e) => {
-      // toggle 直接 apply/clear,不需要按 Apply 按钮
       if (e.target.checked) {
         if (!selectedThemeId) {
           showToast(t("theme.pickFirst") || "请先选一个主题再开启");
@@ -5484,10 +5447,57 @@
           return;
         }
         await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
-        try { await CCAPI.theme.apply(selectedThemeId); } catch (err) { showToast(err.message); }
+        try {
+          await CCAPI.theme.apply(selectedThemeId);
+          showToast(t("theme.appliedToast") || "主题已应用");
+        } catch (err) { showToast(err.message); }
       } else {
         await CCAPI.saveSettings({ codexUiThemeEnabled: false });
-        try { await CCAPI.theme.clear(); } catch (err) { showToast(err.message); }
+        try {
+          await CCAPI.theme.clear();
+          showToast(t("theme.clearedToast") || "主题已清除");
+        } catch (err) { showToast(err.message); }
+      }
+      await renderTheme();
+    });
+
+    // Reload Codex Desktop 当前 page(theme 自动重应用)
+    $("[data-action=theme-reload]")?.addEventListener("click", async () => {
+      try {
+        await CCAPI.theme.reload();
+        showToast(t("theme.reloadToast") || "已请求 Codex Desktop 刷新");
+      } catch (err) {
+        showToast(`${t("theme.reloadFailed") || "刷新失败"}: ${err.message}`);
+      }
+    });
+
+    // Restart Codex.app(完全 quit + 重启,走 transfer 已有 endpoint)
+    $("[data-action=theme-restart-codex]")?.addEventListener("click", async () => {
+      try {
+        await CCAPI.theme.restartCodex();
+        showToast(t("theme.restartToast") || "已请求重启 Codex");
+      } catch (err) {
+        showToast(`${t("theme.restartFailed") || "重启失败"}: ${err.message}`);
+      }
+    });
+
+    // 卡片点击 — event delegation 绑到 container 一次,renderTheme 反复改 innerHTML
+    // 也不会丢 listener。selectedThemeId 改后只刷新视觉(re-render),不触发 apply。
+    $("#themeListContainer")?.addEventListener("click", async (e) => {
+      const card = e.target.closest(".card-theme-pick");
+      if (!card) return;
+      selectedThemeId = card.dataset.themeId;
+      // 如果 toggle 已开启,选新卡同时立刻 apply 新主题(无感切换)
+      const enabled = $("#codexUiThemeEnabled")?.checked;
+      if (enabled) {
+        await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
+        try {
+          await CCAPI.theme.apply(selectedThemeId);
+          showToast(t("theme.appliedToast") || "主题已应用");
+        } catch (err) { showToast(err.message); }
+      } else {
+        // toggle 关时,只持久化 user 的选择(不调 apply,toggle 开时再 apply)
+        await CCAPI.saveSettings({ codexUiTheme: selectedThemeId });
       }
       await renderTheme();
     });

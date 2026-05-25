@@ -195,6 +195,27 @@ pub async fn apply_theme(theme_id: &str) -> Result<(), String> {
     }
 }
 
+/// 重载 Codex Desktop 当前 page(走 CDP `Page.reload`)。Theme 用
+/// `addScriptToEvaluateOnNewDocument` 注册的脚本会在重载后**自动**触发,
+/// 等于"全页强刷"应用主题(也可用来快速验证 inject 是否完整生效)。
+pub async fn reload_codex_page() -> Result<(), String> {
+    match run_reload().await {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+async fn run_reload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ws_url = locate_main_window_ws().await?;
+    let (ws_stream, _) = connect_async(&ws_url).await?;
+    let (mut write, mut read) = ws_stream.split();
+    let (msg, _) = make_msg(1, "Page.reload", json!({ "ignoreCache": true }));
+    write.send(WsMessage::Text(msg)).await?;
+    drain_one(&mut read).await;
+    let _ = write.close().await;
+    Ok(())
+}
+
 /// 清除主题:CDP connect → 注入 removal script(移除 style + mascot DOM)+
 /// Runtime.evaluate 立即生效 → disconnect。
 ///

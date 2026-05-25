@@ -19,6 +19,7 @@ use serde_json::json;
 
 use crate::codex_theme_injector::{
     all_themes, apply_theme, clear_theme, get_status as get_theme_status, load_theme_assets,
+    reload_codex_page,
 };
 
 use super::super::state::AdminState;
@@ -78,6 +79,19 @@ pub async fn clear_handler() -> impl IntoResponse {
     }
 }
 
+/// CDP Page.reload 当前 Codex Desktop page(常用来强制重应用主题 /
+/// 快速 verify 注入)。
+pub async fn reload_handler() -> impl IntoResponse {
+    match reload_codex_page().await {
+        Ok(()) => Json(json!({
+            "success": true,
+            "message": "已发送 reload 请求 / Reload requested",
+        }))
+        .into_response(),
+        Err(e) => err(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 /// 组装路由 — 在 `admin/mod.rs` 调 `.merge(handlers::theme::routes())` 挂载。
 pub fn routes() -> Router<AdminState> {
     Router::new()
@@ -85,4 +99,5 @@ pub fn routes() -> Router<AdminState> {
         .route("/api/desktop/theme/status", get(status_handler))
         .route("/api/desktop/theme/apply", post(apply_handler))
         .route("/api/desktop/theme/clear", post(clear_handler))
+        .route("/api/desktop/theme/reload", post(reload_handler))
 }

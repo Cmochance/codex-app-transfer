@@ -559,6 +559,14 @@ window.CCAPI.theme = {
   async clear() {
     return api('POST', '/api/desktop/theme/clear');
   },
+  /** 刷新 Codex Desktop 当前 page(theme 自动重应用) */
+  async reload() {
+    return api('POST', '/api/desktop/theme/reload');
+  },
+  /** 重启 Codex.app(quit + 启动)— 复用 desktop handler */
+  async restartCodex() {
+    return api('POST', '/api/desktop/restart-codex-app');
+  },
 };
 
 })();

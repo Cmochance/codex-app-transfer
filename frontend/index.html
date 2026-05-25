@@ -808,28 +808,18 @@
       </section>
 
       <section class="page" id="page-theme" data-page="theme">
-        <header class="page-header">
-          <h1 data-i18n="theme.title">Codex Desktop 主题</h1>
-          <p class="settings-note" data-i18n="theme.subtitle">向运行中的 Codex Desktop 通过 CDP 注入 CSS / DOM,覆盖原生外观。默认关闭;启用后选一个内置主题。改动后 Codex Desktop 整页 reload 会自动重应用;Codex.app 完全重启需要回此页重点 Apply。</p>
-        </header>
-
-        <div class="settings-row settings-row-stack">
-          <strong data-i18n="theme.toggleLabel">启用 Codex Desktop 主题</strong>
-          <div>
-            <label class="switch-label only-switch"><input type="checkbox" id="codexUiThemeEnabled"><span class="switch-ui"></span></label>
-            <p class="settings-note" data-i18n="theme.toggleHint">开启后立即应用当前选定的主题;关闭后清除主题(回原生 Codex UI)。状态独立于 Plugin Unlock,互不影响。</p>
-          </div>
+        <div class="settings-row" style="display:flex;align-items:center;gap:12px;">
+          <strong data-i18n="theme.toggleLabel" style="flex:1;">启用 Codex Desktop 主题</strong>
+          <label class="switch-label only-switch"><input type="checkbox" id="codexUiThemeEnabled"><span class="switch-ui"></span></label>
+          <button class="btn btn-outline-secondary btn-sm" type="button" data-action="theme-reload" title="刷新 Codex Desktop 当前 page(主题会自动重应用)"><i class="bi bi-arrow-clockwise"></i><span data-i18n="theme.reloadBtn">Reload</span></button>
+          <button class="btn btn-outline-danger btn-sm" type="button" data-action="theme-restart-codex" title="完全 quit + 重启 Codex.app"><i class="bi bi-power"></i><span data-i18n="theme.restartCodexBtn">Restart Codex</span></button>
         </div>
 
-        <div id="themeListContainer" class="theme-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin-top:14px;">
+        <div id="themeListContainer" style="margin-top:14px;">
           <!-- renderTheme() 动态填充 5 个主题卡 -->
         </div>
 
-        <div class="settings-actions" style="margin-top:14px;">
-          <button class="btn btn-primary btn-sm" type="button" data-action="theme-apply"><i class="bi bi-magic"></i><span data-i18n="theme.applyBtn">应用</span></button>
-          <button class="btn btn-outline-secondary btn-sm" type="button" data-action="theme-clear"><i class="bi bi-eraser"></i><span data-i18n="theme.clearBtn">清除</span></button>
-          <span id="themeStatusBadge" class="settings-note" style="margin-left:12px;"></span>
-        </div>
+        <span id="themeStatusBadge" class="settings-note" style="display:block;margin-top:10px;"></span>
       </section>
 
       <section class="page" id="page-guide" data-page="guide">
