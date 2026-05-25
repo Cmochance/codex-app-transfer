@@ -198,10 +198,22 @@ pub async fn apply_theme(theme_id: &str) -> Result<(), String> {
 /// 重载 Codex Desktop 当前 page(走 CDP `Page.reload`)。Theme 用
 /// `addScriptToEvaluateOnNewDocument` 注册的脚本会在重载后**自动**触发,
 /// 等于"全页强刷"应用主题(也可用来快速验证 inject 是否完整生效)。
+///
+/// **503 / connection refused 友好处理**(#264 user 反馈):Codex.app
+/// reload 中 / debug port 短暂不可用是预期 transient,自动 retry 1 次 +
+/// 200ms 延迟。仍失败则返友好 hint,user 可以重试或先确认 Codex 在跑。
 pub async fn reload_codex_page() -> Result<(), String> {
     match run_reload().await {
         Ok(()) => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            match run_reload().await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(format!(
+                    "Codex Desktop CDP 暂不可达({e}) — 确认 Codex.app 正在运行,稍后重试"
+                )),
+            }
+        }
     }
 }
 
