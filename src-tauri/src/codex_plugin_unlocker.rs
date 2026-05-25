@@ -337,15 +337,40 @@ async fn connect_and_monitor(
     // 3. 首次注入
     inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
 
-    // 4. 持续监控：监听 Page.loadEventFired 和外部命令
+    // 4. 持续监控:监听 Page.loadEventFired / 外部命令 / 心跳响应
+    //
+    // 重要不变量:WS read 流**只能由 select! 的 read.next() 分支消费**,绝不能
+    // 在 select! 的其它分支内 `await read.next()` 或 `await_cdp_response(read, …)`
+    // —— 否则会从公用 stream 里抢走 `Page.loadEventFired` 等无 id 事件帧,导致
+    // 整页 reload 后 daemon 失去重新注入触发(Devin Review BUG-0002 在 PR #255
+    // 抓到的回归)。所以心跳采用 fire-and-forget 风格:send ping,把 ping_id
+    // 寄存到 `pending_heartbeat_id`,主 read 分支统一匹配并处理响应。
+    let mut pending_heartbeat_id: Option<u64> = None;
+
     loop {
         tokio::select! {
-            // 监听 WebSocket 消息
+            // 监听 WebSocket 消息(唯一的 read 消费者)
             msg = read.next() => {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Ok(resp) = serde_json::from_str::<CdpResponse>(&text) {
-                            // 检测 Page.loadEventFired 事件
+                            // 心跳响应 — 提取 unlocked flag,把 in-page MutationObserver
+                            // 异步解锁的状态升级到 daemon 端 Injected。
+                            if pending_heartbeat_id.is_some() && resp.id == pending_heartbeat_id {
+                                pending_heartbeat_id = None;
+                                let unlocked = resp
+                                    .result
+                                    .as_ref()
+                                    .and_then(|r| r.get("result"))
+                                    .and_then(|r| r.get("value"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                if unlocked {
+                                    set_status(status, UnlockStatus::Injected).await;
+                                }
+                                continue;
+                            }
+                            // 整页 reload — 重新注入
                             if resp.method.as_deref() == Some("Page.loadEventFired") {
                                 tracing::info!("[PluginUnlock] page refreshed, reinjecting...");
                                 inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
@@ -383,15 +408,32 @@ async fn connect_and_monitor(
                 }
             }
 
-            // 心跳检测：如果 30 秒没有收到任何消息，检查连接是否仍然活跃
+            // 心跳 + 状态回收(fire-and-forget):每 30s eval
+            // `window.__codexAppTransferPluginUnlocker?.unlocked` ——
+            //   1. 探活 WS / Codex Desktop 还在响应(send 失败即 WS 死)
+            //   2. 把页内 MutationObserver 在登录态 mount 后异步成功的状态
+            //      **round-trip 回 Rust 端**。`Page.loadEventFired` 不会在
+            //      SPA 内 router 切换 / OAuth 登录回调时触发,只有 MutationObserver
+            //      跑得到;那条路径完成解锁后只更新了 in-page `window[MARKER].unlocked`,
+            //      靠这里 30s 轮询补回 Rust 端的可观察信号。
+            //
+            // 不在这里 await 响应 —— 见上方"重要不变量"。
             _ = sleep(Duration::from_secs(30)) => {
-                // 发送一个简单的 Runtime.evaluate 来检测连接;响应会从外层
-                // select! 的 read.next() 分支流回,被忽略(不是 Page.loadEventFired)
-                let (ping, _ping_id) = make_cdp_msg(msg_id_counter, "Runtime.evaluate", json!({"expression": "1+1"}));
+                // 上一轮心跳还没回包就丢弃 id 不追了(网络慢 / Codex stutter),
+                // 用新 id 重发。旧响应到达时不匹配 pending_heartbeat_id 会被忽略。
+                let (ping, ping_id) = make_cdp_msg(
+                    msg_id_counter,
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": "window.__codexAppTransferPluginUnlocker?.unlocked === true",
+                        "returnByValue": true
+                    }),
+                );
                 if let Err(e) = write.send(WsMessage::Text(ping)).await {
-                    tracing::warn!("[PluginUnlock] ping failed, connection dead: {}", e);
+                    tracing::warn!("[PluginUnlock] heartbeat send failed, connection dead: {}", e);
                     break;
                 }
+                pending_heartbeat_id = Some(ping_id);
             }
         }
     }
@@ -410,7 +452,11 @@ async fn inject_unlock_script(
 
     // 注入脚本 — 解锁 Codex Desktop Plugins 选项卡。
     //
-    // 算法借鉴 galaxywk223/codex-plugin-unlocker (MIT, 2026-05-11)
+    // 算法借鉴 galaxywk223/codex-plugin-unlocker (MIT, 2026-05-11);上游
+    // 2026-05-20 commit `47d0b0a` 引入 `wait_for_injection`(90s 等可注入页面),
+    // 我们在脚本内做同等耐心(30 × 500ms = 15s),外层 daemon 维持指数 backoff
+    // 重连,组合后总体耐心 ≈ 15s 内部 + 30s backoff 上限,够 Codex Desktop
+    // 首启慢机器场景。
     //   https://github.com/galaxywk223/codex-plugin-unlocker/blob/main/codex_plugin_unlocker/inject/plugin-unlock.js
     //
     // 关键差异 vs. 早期版本(找 useState hook 链上的 setAuthMethod setter):
@@ -418,17 +464,25 @@ async fn inject_unlock_script(
     //   向上爬,检查每层 `memoizedProps.value` / `pendingProps.value`,找带
     //   `setAuthMethod` + `authMethod` 字段的对象(即 `AuthContext.Provider` value)
     // - Codex Desktop 26.513+ 的 React state 结构变了,旧 hook-scan 策略失效;
-    //   Context.Provider 是 React 公开 API,比 hook 链表稳定得多
+    //   Context.Provider 是 React 公开 API,比 hook 链表稳定得多(实测 26.519
+    //   仍有效,见 #253)
     // - 加 DOM-level enable(清 disabled / __reactProps disabled),即使 setter
     //   找不到也能让按钮可点(strict fallback)
     // - 加 MutationObserver,SPA 路由跳转重渲时自动重跑
     //
-    // 异步包装:返回 Promise<bool>,通过 awaitPromise: true 拿到结果。
-    // 内部最多 6 次重试(每次 500ms 间隔)等 plugin 按钮 DOM 出现。
+    // 异步包装:返回 Promise<{ ok, reason, error? }>,通过 awaitPromise: true 拿到结果。
+    // `reason` 取值:
+    //   - `unlocked`         setAuthMethod('chatgpt') 已调用成功(或本来就是 chatgpt)
+    //   - `no_plugin_button` 重试窗口内 DOM 始终没渲染 Plugins 入口(未登录 /
+    //                       SPA 还在 mount / 在 onboarding 页等)— 可恢复,不算 Failed
+    //   - `no_auth_context`  按钮渲染了但 fiber 链上爬不到 AuthContext.Provider
+    //                       value —— 真版本不兼容信号
+    //   - `setter_threw`     setAuthMethod 调用本身抛错 —— React 内部异常
+    // 内部最多 30 次重试(每次 500ms 间隔)等 plugin 按钮 DOM 出现 + Context 就绪。
     let unlock_script = r#"
 (async function() {
     const MARKER = '__codexAppTransferPluginUnlocker';
-    window[MARKER] = window[MARKER] || { version: '2.1.10', unlocked: false };
+    window[MARKER] = window[MARKER] || { version: '2.1.15', unlocked: false };
 
     const selectors = {
         disabledInstallButton: 'button:disabled.w-full.justify-center, [role="button"][aria-disabled="true"].cursor-not-allowed',
@@ -455,13 +509,25 @@ async fn inject_unlock_script(
         }
         return null;
     }
+    // 返回值约定:
+    //   'unlocked'       已成功(本来就是 chatgpt 或刚 set 成 chatgpt)
+    //   'no_auth_context' fiber 爬不到带 setAuthMethod 的 Context value
+    //   'setter_threw'    setAuthMethod 调用本身抛错
     function spoofChatGPTAuthMethod(element) {
         const auth = authContextValueFrom(element);
-        if (!auth) return false;
-        if (auth.authMethod === 'chatgpt') { window[MARKER].unlocked = true; return true; }
-        auth.setAuthMethod('chatgpt');
+        if (!auth) return 'no_auth_context';
+        if (auth.authMethod === 'chatgpt') {
+            window[MARKER].unlocked = true;
+            return 'unlocked';
+        }
+        try {
+            auth.setAuthMethod('chatgpt');
+        } catch (e) {
+            window[MARKER].lastError = String(e?.stack || e);
+            return 'setter_threw';
+        }
         window[MARKER].unlocked = true;
-        return true;
+        return 'unlocked';
     }
     function pluginEntryButton() {
         const byIcon = document.querySelector(
@@ -482,10 +548,13 @@ async fn inject_unlock_script(
         const cur = (node.nodeValue || '').trim();
         node.nodeValue = /^Plugins/i.test(cur) ? 'Plugins' : '插件';
     }
+    // 返回:
+    //   'no_plugin_button'  按钮还没渲染(DOM 尚未就绪)
+    //   spoof 函数的返回值('unlocked' / 'no_auth_context' / 'setter_threw')
     function enablePluginEntry() {
         const btn = pluginEntryButton();
-        if (!btn) return false;
-        spoofChatGPTAuthMethod(btn);
+        if (!btn) return 'no_plugin_button';
+        const reason = spoofChatGPTAuthMethod(btn);
         btn.disabled = false;
         btn.removeAttribute('disabled');
         btn.style.display = '';
@@ -497,7 +566,7 @@ async fn inject_unlock_script(
             btn.dataset.codexAppTransferPluginUnlocked = 'true';
             btn.addEventListener('click', () => spoofChatGPTAuthMethod(btn), true);
         }
-        return true;
+        return reason;
     }
     function unblockButtonElement(button) {
         button.disabled = false;
@@ -529,12 +598,22 @@ async fn inject_unlock_script(
         });
     }
     function runUnlock() {
+        // 拆开 try block:enablePluginEntry 决定 reason,unblockPluginInstallButtons
+        // 的异常不应该污染主入口的 reason(install 按钮装饰失败 ≠ entry button 解锁失败)
+        let reason;
         try {
-            enablePluginEntry();
-            unblockPluginInstallButtons();
+            reason = enablePluginEntry();
         } catch (e) {
             window[MARKER].lastError = String(e?.stack || e);
+            return 'setter_threw';
         }
+        try {
+            unblockPluginInstallButtons();
+        } catch (e) {
+            // 仅记录,不降级 reason — entry 已成功解锁,install 按钮装饰是 nice-to-have
+            window[MARKER].lastError = String(e?.stack || e);
+        }
+        return reason;
     }
     function scheduleUnlock() {
         if (window[MARKER].scanPending) return;
@@ -545,10 +624,15 @@ async fn inject_unlock_script(
         }, 200);
     }
 
-    // 重试等 plugin 按钮 DOM 出现(SPA 刚加载完时按钮可能还在 lazy mount)
-    for (let i = 0; i < 6; i++) {
-        runUnlock();
-        if (window[MARKER].unlocked) break;
+    // 重试等 plugin 按钮 DOM 出现 + AuthContext 就绪。30 × 500ms = 15 秒预算,
+    // 覆盖 Codex Desktop 首启慢 / 登录态异步 mount / SPA 路由切换。
+    // 早停规则:一旦拿到 'unlocked' 就 break;'no_auth_context' / 'setter_threw'
+    // 是"按钮在但 Context 异常"信号,继续等也大概率不会变(版本不兼容)— 但仍
+    // 让循环跑完,因为有可能 React 在重渲过程中暂时性 Context 缺失。
+    let lastReason = 'no_plugin_button';
+    for (let i = 0; i < 30; i++) {
+        lastReason = runUnlock();
+        if (lastReason === 'unlocked') break;
         await new Promise((r) => setTimeout(r, 500));
     }
 
@@ -558,7 +642,7 @@ async fn inject_unlock_script(
     // 切账号会让 authMethod 切回非 chatgpt 重新锁 Plugins;observer 必须始终在
     // 装,才能在 re-lock 场景下被 mutation 触发重新跑 runUnlock → 重 inject
     // setAuthMethod('chatgpt') 解锁。`spoofChatGPTAuthMethod` 内 early-return
-    // (line 437)已保证已 chatgpt 不重复调 setAuthMethod,所以已解锁后 observer
+    // 已保证已 chatgpt 不重复调 setAuthMethod,所以已解锁后 observer
     // 反复 fire 也不会触发 React 重渲 → 不会有视觉抖动。
     window[MARKER].observer?.disconnect();
     window[MARKER].observer = new MutationObserver(scheduleUnlock);
@@ -567,7 +651,11 @@ async fn inject_unlock_script(
         { childList: true, subtree: true }
     );
 
-    return window[MARKER].unlocked === true;
+    return {
+        ok: lastReason === 'unlocked',
+        reason: lastReason,
+        error: window[MARKER].lastError || null,
+    };
 })()
 "#;
 
@@ -587,7 +675,13 @@ async fn inject_unlock_script(
     // 注入脚本内 `console.log` 会触发 `Runtime.consoleAPICalled` 事件帧,
     // 30 秒心跳的 evaluate 响应也可能排队 — 这些都不带 evaluate_id,
     // 会跟我们的目标响应交错。await_cdp_response 循环丢弃非目标 id 的帧。
-    let parsed = match await_cdp_response(read, evaluate_id, Duration::from_secs(8)).await {
+    //
+    // 超时预算 = JS 内部 30 × 500ms 重试窗口 (15s) + WS / 序列化开销 buffer。
+    // `awaitPromise: true` 使 CDP 必须等到 Promise resolve 才返回,如果这里
+    // 超时小于 JS 重试窗口,daemon 会在脚本还在重试时就 tear down WS,把 15s
+    // 耐心变成 dead code。20s 给 5s buffer 容 React 重渲 / GC stutter。
+    // (Devin Review BUG-0001 在 PR #255 抓到的初始 8s 超时不够。)
+    let parsed = match await_cdp_response(read, evaluate_id, Duration::from_secs(20)).await {
         Ok(resp) => resp,
         Err(e) => {
             set_status(
@@ -607,26 +701,114 @@ async fn inject_unlock_script(
         return Err(msg.into());
     }
 
-    // 脚本只在 React fiber 上确实拿到 setAuthMethod 且调用成功时才返回 true;
-    // 返回 false 或无 result.value 都视为注入失败 — 不能 fallback 到"也算
-    // 成功"(违反 no-silent-destructive-fallback 规则)。
-    if let Some(result) = parsed.result {
-        if let Some(val) = result.get("result").and_then(|v| v.get("value")) {
-            if val.as_bool() == Some(true) {
-                set_status(status, UnlockStatus::Injected).await;
-                return Ok(());
+    // 脚本返回 `{ ok, reason, error? }`,按 reason 分流:
+    // - unlocked: 成功,状态 Injected
+    // - no_plugin_button: DOM 尚未渲染(未登录/SPA mount 中),保持 Connected
+    //   不报 Failed,observer 装好后会自动重试。返回 Ok 让 daemon 继续维持 WS
+    // - no_auth_context / setter_threw / unknown: 真版本不兼容或 React 异常,
+    //   报 Failed 并返回 Err 让外层 backoff 重连
+    let raw_value = parsed
+        .result
+        .as_ref()
+        .and_then(|r| r.get("result"))
+        .and_then(|r| r.get("value"));
+    let outcome = classify_inject_outcome(raw_value);
+
+    match outcome {
+        InjectOutcome::Unlocked => {
+            set_status(status, UnlockStatus::Injected).await;
+            Ok(())
+        }
+        InjectOutcome::NoPluginButton => {
+            tracing::info!(
+                "[PluginUnlock] inject pending: Codex Desktop 主界面尚未渲染 Plugins 入口 \
+                 (可能未登录 / 启动中 / 在 onboarding 页),DOM observer 将在 mount 时自动重试"
+            );
+            // 不切 Failed — 保持 Connected。回收路径有两条:
+            //   1. 整页 reload 时 `Page.loadEventFired` 触发 daemon 重新 inject
+            //   2. 页内 MutationObserver 检测到 DOM mount 后跑 runUnlock 直接置
+            //      `window[MARKER].unlocked = true`;daemon 30s 心跳轮询该 flag,
+            //      读到 true 后把状态升级到 Injected
+            // 路径 2 是 SPA 登录回调 / 路由切换场景的主要恢复通道
+            // (`loadEventFired` 不会在 SPA 内 nav 时触发)。
+            Ok(())
+        }
+        InjectOutcome::NoAuthContext { script_error } => {
+            let mut msg = "找到 Plugins 入口但未发现 React AuthContext.Provider — \
+                 Codex Desktop 版本可能不兼容,请在 issue 中附 Codex Desktop 版本号"
+                .to_string();
+            if let Some(err) = script_error {
+                msg.push_str(&format!(" (脚本日志: {err})"));
             }
+            set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            Err(msg.into())
+        }
+        InjectOutcome::SetterThrew { script_error } => {
+            let msg = format!(
+                "调用 React setAuthMethod 时抛错: {}",
+                script_error.unwrap_or_else(|| "未知错误".into())
+            );
+            set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            Err(msg.into())
+        }
+        InjectOutcome::Unknown { raw } => {
+            let msg = format!("注入脚本返回未知形态: {raw}");
+            set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            Err(msg.into())
         }
     }
+}
 
-    set_status(
-        status,
-        UnlockStatus::Failed {
-            error: "注入脚本未找到 React setAuthMethod hook,Codex Desktop 版本可能不兼容".into(),
+/// 注入脚本返回值的分类。
+///
+/// 跟 JS 端 return shape 严格对应:`{ ok, reason, error? }`。从纯 JSON 推断
+/// 解出来,跟 daemon 状态切换逻辑解耦,方便单元测试。
+#[derive(Debug, Clone, PartialEq)]
+enum InjectOutcome {
+    /// 已成功调用 `setAuthMethod('chatgpt')`(或 authMethod 本来就是 chatgpt)
+    Unlocked,
+    /// DOM 还没渲染 Plugins 按钮 —— 可恢复(未登录 / SPA mount 中 / onboarding 页)
+    NoPluginButton,
+    /// 按钮在 DOM 里但 fiber 链上爬不到 AuthContext.Provider value —— 版本不兼容
+    NoAuthContext { script_error: Option<String> },
+    /// `setAuthMethod` 调用本身抛错
+    SetterThrew { script_error: Option<String> },
+    /// 脚本返回了我们不认识的形态(老/新版本协议错位 / CDP 异常)
+    Unknown { raw: String },
+}
+
+/// 解析脚本 `Runtime.evaluate` 的 `result.value` 字段。
+///
+/// 严格只接受新版 object 形态:`{ ok, reason, error? }`。脚本跟 daemon 同 binary
+/// 发布,不存在版本错位场景 —— 不接受 `bool` 等老形态作为 fallback("假设最
+/// 常见 reason" 违反 no-silent-destructive-fallback 规则,会让真正的 selector
+/// 漂移失败被静默归类为"DOM 还没就绪"而被吞掉)。
+///
+/// - `null` / 缺失 → `Unknown`
+/// - object 带认识的 `reason` → 对应 variant
+/// - object 带不认识的 `reason` / 非 object → `Unknown`(报 Failed,不静默)
+fn classify_inject_outcome(raw: Option<&serde_json::Value>) -> InjectOutcome {
+    let Some(value) = raw else {
+        return InjectOutcome::Unknown {
+            raw: "<missing>".into(),
+        };
+    };
+
+    let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    let script_error = value
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    match reason {
+        "unlocked" => InjectOutcome::Unlocked,
+        "no_plugin_button" => InjectOutcome::NoPluginButton,
+        "no_auth_context" => InjectOutcome::NoAuthContext { script_error },
+        "setter_threw" => InjectOutcome::SetterThrew { script_error },
+        _ => InjectOutcome::Unknown {
+            raw: value.to_string(),
         },
-    )
-    .await;
-    Err("inject script returned non-true".into())
+    }
 }
 
 /// 循环读 WebSocket 帧,丢弃非目标 id 的事件 / 响应,直到拿到 `target_id`
@@ -708,6 +890,64 @@ mod tests {
         let c = UnlockConfig::default();
         assert_eq!(c.reconnect_base_ms, 1_000);
         assert_eq!(c.reconnect_max_ms, 30_000);
+    }
+
+    #[test]
+    fn classify_inject_outcome_handles_new_object_shape() {
+        // 新脚本 happy path
+        let v = json!({"ok": true, "reason": "unlocked", "error": null});
+        assert_eq!(classify_inject_outcome(Some(&v)), InjectOutcome::Unlocked);
+
+        // 新脚本:DOM 没渲染(可恢复)
+        let v = json!({"ok": false, "reason": "no_plugin_button"});
+        assert_eq!(
+            classify_inject_outcome(Some(&v)),
+            InjectOutcome::NoPluginButton
+        );
+
+        // 新脚本:版本不兼容 + 带脚本错误信息
+        let v = json!({"ok": false, "reason": "no_auth_context", "error": "TypeError: x"});
+        assert_eq!(
+            classify_inject_outcome(Some(&v)),
+            InjectOutcome::NoAuthContext {
+                script_error: Some("TypeError: x".into())
+            }
+        );
+
+        // 新脚本:setter 抛错
+        let v = json!({"ok": false, "reason": "setter_threw", "error": "boom"});
+        assert_eq!(
+            classify_inject_outcome(Some(&v)),
+            InjectOutcome::SetterThrew {
+                script_error: Some("boom".into())
+            }
+        );
+
+        // 新脚本:不认识的 reason(未来扩展或协议错位)
+        let v = json!({"ok": false, "reason": "weird"});
+        match classify_inject_outcome(Some(&v)) {
+            InjectOutcome::Unknown { raw } => assert!(raw.contains("weird")),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_inject_outcome_rejects_non_object_returns() {
+        // bool 不再被静默兼容 —— 必须走对象形态,不然算 Unknown(报 Failed)
+        for raw in [json!(true), json!(false), json!(0), json!("ok"), json!([])] {
+            match classify_inject_outcome(Some(&raw)) {
+                InjectOutcome::Unknown { .. } => {}
+                other => panic!("expected Unknown for {raw:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_inject_outcome_missing_value_is_unknown() {
+        match classify_inject_outcome(None) {
+            InjectOutcome::Unknown { raw } => assert_eq!(raw, "<missing>"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
     }
 
     #[test]
