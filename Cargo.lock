@@ -734,6 +734,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.2",
+ "tracing",
 ]
 
 [[package]]

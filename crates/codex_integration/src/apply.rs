@@ -72,6 +72,12 @@ pub struct ApplyConfig<'a> {
     /// network_access` section field)。控制小白用户能否用 `curl` 等命令联网。
     /// Caller 从 `Settings.codex_network_access`(默认 `true`)读取(#212)。
     pub codex_network_access: bool,
+    /// Codex Desktop 对话页底部 context 圆环 + tokens/s 显示开关(#258)。
+    /// 写到 `~/.codex/.codex-global-state.json` 的
+    /// `electron-persisted-atom-state.local-conversation-status-section-visible`。
+    /// `true` → ensure 开启,`false` → ensure 关闭。
+    /// Caller 从 `Settings.codex_status_section_default_visible`(默认 `true`)读取。
+    pub codex_status_section_default_visible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -201,6 +207,35 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     }
     write_auth(&paths.auth_json, &auth)?;
 
+    // 5. Codex Desktop UI 偏好:ensure `local-conversation-status-section-visible`
+    // 跟 user 设置一致(默认 true,圆环可见)。详见 #258 真因:0.132+ 版本该
+    // atom 默认 false,新装/升级 user 看不到 context 圆环,我们通过这个写
+    // restore-friendly 的 single-atom-key 操作把 UI 偏好同步成 user 期望值。
+    //
+    // **Race 提醒**:Codex Desktop 跑着的时候 in-memory atom 会在它下次 persist
+    // 时把我们的写入**覆盖**回去。所以这步**只在 Codex Desktop 启动前**有效,
+    // 跟 transfer "先 apply 再启动 desktop" 的时序天然配合;如果 user 在 Codex
+    // 跑着的时候切 provider,新值要重启 Codex 才生效。
+    //
+    // **best-effort**(silent-failure-hunter HIGH #3):atom write 在 step 1-4
+    // (snapshot + config.toml + auth.json)都成功后才跑。如果失败 → propagate
+    // 会让 apply 整体报 Err,但 config.toml / auth.json 已写,partial-apply 错误
+    // 框架。改成 warn + 继续,跟 restore-side 对称(UI preference 失败不该 block
+    // 主路径)。失败的 user 可手动 `/status` toggle 修正。
+    if let Err(e) = crate::electron_state::write_atom(
+        &paths.electron_global_state,
+        crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+        serde_json::Value::Bool(cfg.codex_status_section_default_visible),
+    ) {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            path = %paths.electron_global_state.display(),
+            error = %e,
+            "best-effort status-section atom write failed; provider apply continues. \
+             User can manually toggle via `/status` slash command in Codex Desktop.",
+        );
+    }
+
     Ok(ApplyResult {
         config_toml_path: paths.config_toml.display().to_string(),
         auth_json_path: paths.auth_json.display().to_string(),
@@ -231,8 +266,22 @@ pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
     let snapshot_auth = read_snapshot_auth(paths);
     restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth, RestoreMode::Auto)?;
 
+    // 先读 manifest 拿到 atom pre-value(下面 drop_snapshot 后就读不到了),
+    // **best-effort** atom restore — UI preference 失败不 block 主路径。
+    let manifest = crate::snapshot::read_current_manifest(paths);
+
     drop_snapshot(paths)?;
     clear_catalog_models(&paths.model_catalog_json)?;
+
+    if let Err(e) = restore_status_section_from_manifest(paths, manifest) {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            error = %e,
+            "best-effort status-section atom restore failed; config/auth already restored, \
+             snapshot dropped — restore success reported overall",
+        );
+    }
+
     Ok(true)
 }
 
@@ -266,13 +315,70 @@ pub fn restore_codex_snapshot(
     let snapshot_config = read_snapshot_config_by_id(paths, snapshot_id).unwrap_or_default();
     let snapshot_auth = read_snapshot_auth_by_id(paths, snapshot_id);
     restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth, RestoreMode::Manual)?;
+
+    // 先读 manifest 拿 atom pre-value(drop 后读不到),best-effort 适用同
+    // restore_codex_state。
+    let manifest = crate::snapshot::read_manifest_by_id(paths, snapshot_id);
+
     if drop_remaining_snapshots {
         drop_all_snapshots(paths)?;
     } else {
         drop_snapshot_by_id(paths, snapshot_id)?;
     }
     clear_catalog_models(&paths.model_catalog_json)?;
+
+    if let Err(e) = restore_status_section_from_manifest(paths, manifest) {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            error = %e,
+            "best-effort status-section atom restore (manual snapshot pick) failed; \
+             config/auth already restored, snapshots dropped — restore success reported overall",
+        );
+    }
+
     Ok(true)
+}
+
+/// 把 `~/.codex/.codex-global-state.json` 里
+/// `electron-persisted-atom-state.local-conversation-status-section-visible`
+/// 退回到 snapshot 拍摄时的原值。
+///
+/// **三态语义**(配合 `SnapshotManifest.electron_status_section_capture_failed`):
+/// - `capture_failed=true` → snapshot 时读 atom 失败 → **不动**(避免 silently 抹
+///   user 真实原值;tracing::warn! 记一条 audit trail)
+/// - `capture_failed=false` + `pre_value=Some(b)` → 原值就是 b,write_atom 复原
+/// - `capture_failed=false` + `pre_value=None` → atom 原本不存在,remove_atom 物理删除
+/// - `manifest=None`(没快照 / 损坏 manifest)→ capture_failed=true 行为(不动)
+fn restore_status_section_from_manifest(
+    paths: &CodexPaths,
+    manifest: Option<crate::snapshot::SnapshotManifest>,
+) -> Result<(), CodexError> {
+    let Some(m) = manifest else {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            "no manifest for status-section atom restore; skipping to avoid silent loss",
+        );
+        return Ok(());
+    };
+    if m.electron_status_section_capture_failed {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            "snapshot manifest marked status-section atom capture as failed; \
+             skipping restore to avoid silent loss of user's real original value",
+        );
+        return Ok(());
+    }
+    match m.electron_status_section_pre_value {
+        Some(value) => crate::electron_state::write_atom(
+            &paths.electron_global_state,
+            crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+            serde_json::Value::Bool(value),
+        ),
+        None => crate::electron_state::remove_atom(
+            &paths.electron_global_state,
+            crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+        ),
+    }
 }
 
 fn clear_managed_codex_state(paths: &CodexPaths) -> Result<(), CodexError> {
@@ -291,6 +397,30 @@ fn clear_managed_codex_state(paths: &CodexPaths) -> Result<(), CodexError> {
             }
         }
         write_auth(&paths.auth_json, &auth)?;
+    }
+    // 没快照 fallback 路径:**不动** electron_global_state 的 atom 字段。
+    //
+    // Why: 用户全局规则"不主动进行任何破坏性降级"(feedback_no_silent_destructive_fallback)。
+    // 走到这里说明 transfer 从未 apply 过(没 snapshot),user 的 atom 值就是
+    // user 自己 manually 设的(包括 `/status` 手动 toggle,或者新装从未碰过)。
+    // strip 掉等于擅自抹掉 user 配置,违反规则。
+    //
+    // Trade-off: 如果上版本 transfer 写过 atom 但未生成新 schema 的 snapshot,
+    // 这里清不掉残留 — 接受这个边缘 case 换"绝不擅动 user 偏好"的稳态。
+    //
+    // **silent-failure-hunter HIGH #5**:explicit log 让 upgrade-stale 场景留 audit
+    // trail。检测当前 atom 是否存在,有则告诉 user 怎么手动重置。
+    let current = crate::electron_state::read_atom(
+        &paths.electron_global_state,
+        crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+    );
+    if let Ok(Some(_)) = current {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            "no snapshot but managed atom key still present in .codex-global-state.json \
+             (likely from older transfer version) — leaving in place per no-destructive-fallback rule. \
+             User can manually reset via `/status` slash command in Codex Desktop.",
+        );
     }
     Ok(())
 }
@@ -383,6 +513,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v2.0.0-stage2.5",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -428,6 +559,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: false,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -471,6 +603,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -536,6 +669,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -600,6 +734,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -661,6 +796,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -698,6 +834,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -742,6 +879,7 @@ mod tests {
                 model_capabilities: Some(&capabilities),
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -777,6 +915,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -794,6 +933,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -842,6 +982,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -884,6 +1025,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -945,6 +1087,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1018,6 +1161,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v-active",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1083,6 +1227,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1100,6 +1245,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1131,6 +1277,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1154,6 +1301,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1184,6 +1332,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1220,6 +1369,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1268,6 +1418,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1319,6 +1470,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1370,6 +1522,7 @@ mod tests {
                 model_capabilities: None,
                 app_version: "v",
                 codex_network_access: true,
+                codex_status_section_default_visible: true,
             },
         )
         .unwrap();
@@ -1381,6 +1534,177 @@ mod tests {
         assert!(
             toml.contains("model = \"kimi-k2.6\""),
             "快照里没有 model 时,restore 应保留 CLI 写入的活跃选择,实际 toml:\n{toml}"
+        );
+    }
+
+    /// #258:apply 把 `local-conversation-status-section-visible` ensure 成 user 设置值,
+    /// restore 严格退回到 snapshot 拍摄时的原值(包括"原本不存在" → strip 退路)。
+    #[test]
+    fn apply_writes_status_section_atom_and_restore_reverts_to_snapshot_original() {
+        let (_t, paths) = setup();
+        let global_state = &paths.electron_global_state;
+
+        // 模拟 user 原本完全没设过该 atom(文件压根不存在)
+        assert!(!global_state.exists());
+
+        // apply with default_visible=true (transfer 默认行为)
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+            },
+        )
+        .unwrap();
+        // atom 被写入 true
+        assert_eq!(
+            crate::electron_state::read_atom(
+                global_state,
+                crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+            )
+            .unwrap(),
+            Some(json!(true))
+        );
+
+        // restore:user 原本无此 atom → restore 应 strip,文件里该 key 应消失
+        restore_codex_state(&paths).unwrap();
+        assert_eq!(
+            crate::electron_state::read_atom(
+                global_state,
+                crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+            )
+            .unwrap(),
+            None,
+            "restore 必须 strip 我们写入的 atom(因为 snapshot 拍到 user 原本没此字段)"
+        );
+    }
+
+    /// silent-failure-hunter CRITICAL #1 防回归:snapshot 时 `.codex-global-state.json`
+    /// 损坏 → snapshot 应记 capture_failed=true,restore **不动** atom 防 silent 抹原值。
+    #[test]
+    fn restore_does_not_touch_atom_when_snapshot_capture_failed() {
+        let (_t, paths) = setup();
+        let global_state = &paths.electron_global_state;
+
+        // 模拟 user 真实场景:.codex-global-state.json 内容损坏(可能 mid-write 崩),
+        // 但里面 ATOM_STATE 段实际上仍有 atom=true(我们看不到,因为整体非法 JSON)。
+        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
+        std::fs::write(global_state, "{ corrupt json garbage").unwrap();
+
+        // apply 应**不 panic**(best-effort + tracing warn 即可)
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+            },
+        )
+        .expect("apply must not fail when atom file is corrupt — UI preference best-effort");
+
+        // 验证 manifest 标了 capture_failed
+        let manifest =
+            crate::snapshot::read_current_manifest(&paths).expect("snapshot 应已写 manifest");
+        assert!(
+            manifest.electron_status_section_capture_failed,
+            "snapshot 必须把 capture 失败信号写进 manifest"
+        );
+        assert_eq!(
+            manifest.electron_status_section_pre_value, None,
+            "capture failed 时 pre_value 必须留 None"
+        );
+
+        // restore 应不动文件(保持 corrupt 原样,让 user 自己处理),并且不 panic
+        restore_codex_state(&paths).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(global_state).unwrap(),
+            "{ corrupt json garbage",
+            "restore 必须不动损坏文件(防 silently 抹 user 真实原 atom 值)"
+        );
+    }
+
+    /// #258:user **原本**已经手动 toggle 过 `/status` 为 false,apply 又把它改为 true,
+    /// restore 必须退回 false(尊重 user 原选择,不留 transfer 写入的 true)。
+    #[test]
+    fn restore_preserves_user_original_status_section_value() {
+        let (_t, paths) = setup();
+        let global_state = &paths.electron_global_state;
+
+        // user 已有的 global-state 文件,手动 toggle 过 /status off,且有其它字段
+        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
+        std::fs::write(
+            global_state,
+            r#"{"electron-saved-workspace-roots":["/tmp/proj"],"electron-persisted-atom-state":{"local-conversation-status-section-visible":false,"composer-auto-context-enabled":true}}"#,
+        )
+        .unwrap();
+
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Mock",
+                default_model: "mock-model",
+                model_mappings: None,
+                model_capabilities: None,
+                app_version: "v",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+            },
+        )
+        .unwrap();
+        // apply 覆盖成 true,其它字段保留
+        let after_apply: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
+        assert_eq!(
+            after_apply
+                .pointer("/electron-persisted-atom-state/local-conversation-status-section-visible"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            after_apply.pointer("/electron-persisted-atom-state/composer-auto-context-enabled"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            after_apply.get("electron-saved-workspace-roots"),
+            Some(&json!(["/tmp/proj"]))
+        );
+
+        // restore:atom 退回 user 原值 false,其它字段仍保留
+        restore_codex_state(&paths).unwrap();
+        let after_restore: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
+        assert_eq!(
+            after_restore
+                .pointer("/electron-persisted-atom-state/local-conversation-status-section-visible"),
+            Some(&json!(false)),
+            "restore 必须用 snapshot 记录的 user 原值 false 复原,不留 transfer 写入的 true"
+        );
+        assert_eq!(
+            after_restore.pointer("/electron-persisted-atom-state/composer-auto-context-enabled"),
+            Some(&json!(true)),
+            "我们 only-touch 单 atom,user 同段其它 atom 必须原样保留"
+        );
+        assert_eq!(
+            after_restore.get("electron-saved-workspace-roots"),
+            Some(&json!(["/tmp/proj"])),
+            "user 顶层字段必须原样保留"
         );
     }
 }

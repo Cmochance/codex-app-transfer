@@ -30,6 +30,15 @@ pub(crate) fn read_codex_network_access(cfg: &RawConfig) -> bool {
         .unwrap_or(true)
 }
 
+/// 读 `settings.codexStatusSectionDefaultVisible`,默认 `true`(#258)。
+/// 控制 Codex Desktop 对话页底部 context 圆环 + tokens/s 的默认显示开关。
+pub(crate) fn read_codex_status_section_default_visible(cfg: &RawConfig) -> bool {
+    cfg.get("settings")
+        .and_then(|s| s.get("codexStatusSectionDefaultVisible"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
 pub(crate) fn read_gateway_key(cfg: &RawConfig) -> String {
     cfg.get("gatewayApiKey")
         .and_then(|v| v.as_str())
