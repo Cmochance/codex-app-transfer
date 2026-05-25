@@ -281,8 +281,12 @@ fn encode_data_uri(mime: &str, bytes: &[u8]) -> String {
 }
 
 /// 主题注入状态(给前端展示)。
+///
+/// 序列化保留 PascalCase(serde 默认):前端 `frontend/js/app.js` 状态
+/// badge 用 `sObj.Applied` / `sObj.Failed` / `sObj === "Disabled"` 检
+/// 查,跟枚举 variant 名严格对齐。修过一次 `rename_all = "snake_case"`
+/// 让 badge 永远 falsy,见 PR #265 review。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
 pub enum ThemeStatus {
     /// 未启用(transfer settings.codexUiThemeEnabled = false 或没 apply 过)
     Disabled,
@@ -728,7 +732,14 @@ mod tests {
 
     #[test]
     fn theme_ids_match_all_themes_metadata() {
-        let metas: Vec<&str> = all_themes().iter().map(|m| m.id).collect();
+        // 跳过 custom — `all_themes()` 在 user 上传过自定义主题时会追加
+        // 一条 `CUSTOM_THEME_ID` 项,本机有 ~/.codex-app-transfer/themes/
+        // custom/bg.jpg 时直接比较会让测试随机挂。
+        let metas: Vec<&str> = all_themes()
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| *id != CUSTOM_THEME_ID)
+            .collect();
         let ids: Vec<&str> = THEME_IDS.iter().copied().collect();
         assert_eq!(metas, ids, "THEME_IDS 必须跟 all_themes() 严格对齐");
     }
