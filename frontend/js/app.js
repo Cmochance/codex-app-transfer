@@ -5357,6 +5357,161 @@
   let themeListCache = null;
   let selectedThemeId = null;
 
+  /**
+   * 1:1 crop 弹窗 — user 上传图后用来选 crop 区域。
+   *
+   * UI:全屏暗背景 modal + 中央"舞台"显示原图(等比 fit 进 stage),叠一个
+   * 居中的方形 selection box(初始为 stage 短边 × 0.9)。
+   * 交互:
+   *   - 拖动:mousedown 在 stage 任意位置即开始(不限 box 内)→ 拖动 box 位置
+   *     (clamp 到 stage 内)
+   *   - 滚轮缩放:wheel up/down → box 边长 ±5%(min 40px 绝对值 / max stage 短边)
+   *   - 确认:canvas.drawImage 把选区缩到 `min(2048, selectionPixels)` 方形 →
+   *     toDataURL JPEG 92%
+   *   - 取消 / 点遮罩 / 图片 decode 失败:resolve(null)
+   *
+   * @param {string} srcDataUri  原图 data:image/...;base64,...
+   * @returns {Promise<string|null>}  cropped JPEG data URI;null = user 取消
+   */
+  function openCropModal(srcDataUri) {
+    return new Promise((resolve) => {
+      const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
+      const overlay = document.createElement("div");
+      overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.78);z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;";
+      const panel = document.createElement("div");
+      panel.style.cssText = "background:#1a1a1a;border:1px solid #444;border-radius:12px;padding:18px;max-width:90vw;max-height:90vh;display:flex;flex-direction:column;gap:12px;";
+      const title = document.createElement("div");
+      title.style.cssText = "color:#eee;font-size:15px;font-weight:600;";
+      title.textContent = lang === "en"
+        ? "Crop 1:1 (drag to move, scroll to zoom)"
+        : "1:1 截取(拖动调整位置,滚轮缩放)";
+      const stage = document.createElement("div");
+      stage.style.cssText = "position:relative;background:#000;border-radius:6px;overflow:hidden;cursor:move;user-select:none;";
+      const img = new Image();
+      img.style.cssText = "display:block;max-width:70vw;max-height:65vh;width:auto;height:auto;pointer-events:none;";
+      const box = document.createElement("div");
+      box.style.cssText = "position:absolute;border:2px solid rgba(255,255,255,0.95);box-shadow:0 0 0 9999px rgba(0,0,0,0.55);box-sizing:border-box;pointer-events:none;";
+      stage.appendChild(img);
+      stage.appendChild(box);
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText = "display:flex;justify-content:flex-end;gap:10px;";
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "btn btn-outline-secondary btn-sm";
+      cancelBtn.type = "button";
+      cancelBtn.textContent = lang === "en" ? "Cancel" : "取消";
+      const okBtn = document.createElement("button");
+      okBtn.className = "btn btn-primary btn-sm";
+      okBtn.type = "button";
+      okBtn.textContent = lang === "en" ? "Use this crop" : "使用此截取";
+      btnRow.appendChild(cancelBtn);
+      btnRow.appendChild(okBtn);
+      panel.appendChild(title);
+      panel.appendChild(stage);
+      panel.appendChild(btnRow);
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+
+      // box 状态(相对 stage 像素 — 显示坐标),img.naturalW/H = 原始像素
+      let boxX = 0, boxY = 0, boxSize = 0;
+      let stageW = 0, stageH = 0;
+
+      function clampBox() {
+        if (boxSize > Math.min(stageW, stageH)) boxSize = Math.min(stageW, stageH);
+        if (boxSize < 40) boxSize = 40;
+        if (boxX < 0) boxX = 0;
+        if (boxY < 0) boxY = 0;
+        if (boxX + boxSize > stageW) boxX = stageW - boxSize;
+        if (boxY + boxSize > stageH) boxY = stageH - boxSize;
+      }
+      function applyBox() {
+        clampBox();
+        box.style.left = boxX + "px";
+        box.style.top = boxY + "px";
+        box.style.width = boxSize + "px";
+        box.style.height = boxSize + "px";
+      }
+
+      // OK 默认 disabled,等 img.onload 才放行 — 防 0x0 canvas 路径
+      okBtn.disabled = true;
+      okBtn.style.opacity = "0.5";
+      img.onload = () => {
+        stage.style.width = img.offsetWidth + "px";
+        stage.style.height = img.offsetHeight + "px";
+        stageW = img.offsetWidth;
+        stageH = img.offsetHeight;
+        boxSize = Math.min(stageW, stageH) * 0.9;
+        boxX = (stageW - boxSize) / 2;
+        boxY = (stageH - boxSize) / 2;
+        applyBox();
+        okBtn.disabled = false;
+        okBtn.style.opacity = "";
+      };
+      img.onerror = () => {
+        showToast(`${t("theme.uploadFailed") || "上传失败"}: ${lang === "en" ? "Image could not be decoded — try a different file" : "图片无法解码,请换一张"}`);
+        done(null);
+      };
+      img.src = srcDataUri;
+
+      // 拖动 + 滚轮缩放 — listener 显式 remove 在 done() 防 modal 多次打开累积 leak
+      let dragging = false, dragOX = 0, dragOY = 0;
+      const onMouseDown = (e) => {
+        dragging = true;
+        const r = stage.getBoundingClientRect();
+        dragOX = e.clientX - r.left - boxX;
+        dragOY = e.clientY - r.top - boxY;
+        e.preventDefault();
+      };
+      const onMouseMove = (e) => {
+        if (!dragging) return;
+        const r = stage.getBoundingClientRect();
+        boxX = e.clientX - r.left - dragOX;
+        boxY = e.clientY - r.top - dragOY;
+        applyBox();
+      };
+      const onMouseUp = () => { dragging = false; };
+      const onWheel = (e) => {
+        e.preventDefault();
+        const cx = boxX + boxSize / 2;
+        const cy = boxY + boxSize / 2;
+        const delta = e.deltaY < 0 ? 1.05 : 0.95;
+        boxSize = boxSize * delta;
+        boxX = cx - boxSize / 2;
+        boxY = cy - boxSize / 2;
+        applyBox();
+      };
+      stage.addEventListener("mousedown", onMouseDown);
+      window.addEventListener("mousemove", onMouseMove);
+      window.addEventListener("mouseup", onMouseUp);
+      stage.addEventListener("wheel", onWheel, { passive: false });
+
+      function done(result) {
+        window.removeEventListener("mousemove", onMouseMove);
+        window.removeEventListener("mouseup", onMouseUp);
+        overlay.remove();
+        resolve(result);
+      }
+      cancelBtn.addEventListener("click", () => done(null));
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) done(null); });
+      okBtn.addEventListener("click", () => {
+        // 显示坐标 → 原图坐标
+        const scaleX = img.naturalWidth / stageW;
+        const scaleY = img.naturalHeight / stageH;
+        const sx = boxX * scaleX;
+        const sy = boxY * scaleY;
+        const ssize = boxSize * scaleX; // 1:1 所以 X/Y scale 相同
+        const outSize = Math.min(2048, Math.round(ssize)); // 不放大,只缩(或保持)
+        const canvas = document.createElement("canvas");
+        canvas.width = outSize;
+        canvas.height = outSize;
+        const ctx = canvas.getContext("2d");
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(img, sx, sy, ssize, ssize, 0, 0, outSize, outSize);
+        const out = canvas.toDataURL("image/jpeg", 0.92);
+        done(out);
+      });
+    });
+  }
+
   async function renderTheme() {
     const container = $("#themeListContainer");
     const toggle = $("#codexUiThemeEnabled");
@@ -5372,10 +5527,11 @@
     }
     toggle.checked = settings.codexUiThemeEnabled === true;
     selectedThemeId = settings.codexUiTheme || null;
+    const hiddenIds = Array.isArray(settings.themeHiddenIds) ? settings.themeHiddenIds : [];
 
     // 2. 拉主题列表 — **每次 renderTheme 都重拉**(不缓存):避免 v1 cache-empty
-    //    bug(一旦失败 set 成 [],之后永不重试)+ 主题列表本身就是 5 项,
-    //    每次 ~5MB(含 base64 缩略图)由 webview 本地 IPC 走,延迟可忽略
+    //    bug(一旦失败 set 成 [],之后永不重试)+ 主题列表 5-6 项;响应只含 640px
+    //    preview base64(~40KB/张,5-6 张合计 ~250KB),走 webview 本地 IPC 延迟可忽略
     try {
       const res = await CCApi.theme.list();
       themeListCache = res.themes || [];
@@ -5396,7 +5552,26 @@
     container.style.display = "grid";
     container.style.gridTemplateColumns = "repeat(4, 1fr)";
     container.style.gap = "14px";
-    container.innerHTML = themeListCache.map((th) => {
+    // 过滤掉已隐藏(themeHiddenIds 内的)— custom 不能被隐藏,只能 delete
+    const visibleThemes = themeListCache.filter((th) => !hiddenIds.includes(th.id));
+
+    // 顶部"已隐藏 N" + "恢复"入口(仅 N > 0 显示)
+    const hiddenBadge = $("#themeHiddenBadge");
+    const restoreBtn = $("#themeRestoreHidden");
+    const hiddenCount = hiddenIds.length;
+    if (hiddenBadge && restoreBtn) {
+      if (hiddenCount > 0) {
+        hiddenBadge.textContent = lang === "en"
+          ? `${hiddenCount} hidden`
+          : `已隐藏 ${hiddenCount} 个`;
+        hiddenBadge.style.display = "";
+        restoreBtn.style.display = "";
+      } else {
+        hiddenBadge.style.display = "none";
+        restoreBtn.style.display = "none";
+      }
+    }
+    const cards = visibleThemes.map((th) => {
       const displayName = lang === "en" ? th.displayNameEn : th.displayNameZh;
       const checked = th.id === selectedThemeId;
       const borderStyle = checked
@@ -5404,16 +5579,39 @@
         : "border:1px solid var(--bs-border-color);";
       const checkBadge = checked ? `<span style="position:absolute;top:6px;left:8px;background:var(--bs-primary);color:#fff;font-size:11px;padding:2px 8px;border-radius:8px;pointer-events:none;z-index:2;">✓</span>` : "";
       const idEscaped = String(th.id).replace(/'/g, "\\'");
+      const isCustom = th.id === "custom";
+      // 右上"替换"小角标 — 仅 custom
+      const replaceBadge = isCustom
+        ? `<span class="theme-custom-replace" title="${escapeHtml(lang === "en" ? "Replace image" : "替换图片")}" style="position:absolute;top:6px;right:36px;background:rgba(0,0,0,0.55);color:#fff;font-size:11px;padding:2px 8px;border-radius:8px;cursor:pointer;z-index:3;" onclick="event.stopPropagation();window.__themeUploadHandler && window.__themeUploadHandler();">${escapeHtml(lang === "en" ? "Replace" : "替换")}</span>`
+        : "";
+      // 右上 X 删除按钮 — 每张都有。内置 = 隐藏(持久化 themeHiddenIds);custom = 真删 disk。
+      const deleteBtn = `<span class="theme-delete-btn" title="${escapeHtml(isCustom ? (lang === "en" ? "Delete" : "删除") : (lang === "en" ? "Hide" : "隐藏"))}" style="position:absolute;top:6px;right:8px;background:rgba(0,0,0,0.55);color:#fff;font-size:14px;line-height:1;width:22px;height:22px;border-radius:11px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;" onclick="event.stopPropagation();window.__themeDeleteHandler && window.__themeDeleteHandler('${idEscaped}', ${isCustom});">×</span>`;
       return `
         <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" onclick="window.__themePickHandler && window.__themePickHandler('${idEscaped}')">
           ${checkBadge}
-          <img src="${th.bgDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:4/3;object-fit:contain;display:block;pointer-events:none;background:linear-gradient(135deg,#1a1a1a,#2a2a2a);">
+          ${replaceBadge}
+          ${deleteBtn}
+          <img src="${th.previewDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:16/9;object-fit:cover;display:block;pointer-events:none;background:#1a1010;">
           <div style="padding:8px 10px;pointer-events:none;text-align:center;">
             <div style="font-weight:600;font-size:14px;">${escapeHtml(displayName)}</div>
           </div>
         </div>
       `;
-    }).join("");
+    });
+
+    // 末尾追加"+ 添加自定义"上传卡(仅当 visible 列表里还没 custom 时显示)
+    const hasCustom = visibleThemes.some((th) => th.id === "custom");
+    if (!hasCustom) {
+      cards.push(`
+        <div class="card-theme-add" style="position:relative;border:1.5px dashed var(--bs-border-color);border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);user-select:none;" onclick="window.__themeUploadHandler && window.__themeUploadHandler();">
+          <div style="width:100%;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--bs-secondary-color);font-size:42px;background:linear-gradient(135deg,#1f1414,#2a1818);"><i class="bi bi-plus-circle"></i></div>
+          <div style="padding:8px 10px;text-align:center;">
+            <div style="font-weight:600;font-size:14px;color:var(--bs-secondary-color);">${escapeHtml(lang === "en" ? "Add custom" : "添加自定义")}</div>
+          </div>
+        </div>
+      `);
+    }
+    container.innerHTML = cards.join("");
 
     // 5. 刷新 status badge
     try {
@@ -5437,7 +5635,11 @@
     if (themeEventsBound) return;
     themeEventsBound = true;
 
-    // toggle 直接 apply/clear,不需要按 Apply 按钮
+    // toggle 直接 apply/clear,不需要按 Apply 按钮。
+    //
+    // **对称语义**(R1 / R-NEW-2):on / off 两条路径都遵守"先做副作用(apply/clear),
+    // success 才 persist settings;失败 rollback toggle DOM 状态"— 否则 settings
+    // 跟 Codex CSS / toggle DOM 三方会 desync。
     $("#codexUiThemeEnabled")?.addEventListener("change", async (e) => {
       if (e.target.checked) {
         if (!selectedThemeId) {
@@ -5445,30 +5647,33 @@
           e.target.checked = false;
           return;
         }
-        await CCApi.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
+        // apply 先,success 后才 saveSettings — 失败则 toggle 弹回 off,settings 保留不变
         try {
           await CCApi.theme.apply(selectedThemeId);
+          await CCApi.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
           showToast(t("theme.appliedToast") || "主题已应用");
-        } catch (err) { showToast(err.message); }
+        } catch (err) {
+          e.target.checked = false;
+          showToast(`${t("theme.applyFailed") || "应用失败"}: ${err.message}`);
+        }
       } else {
-        await CCApi.saveSettings({ codexUiThemeEnabled: false });
+        // **clear 先,success 后才 saveSettings** — clear 失败(Codex 不在跑 / CDP 不可达)
+        // 时,如果先把 enabled=false 写进 settings,user 看见 toast 失败但 toggle
+        // 已弹回开,设置实际已变 disabled → 下次启动 Codex 不会 auto-apply,旧 CSS
+        // 残留在 Codex DOM 直到 Codex 重启;state 跟 settings 长期不同步。
         try {
           await CCApi.theme.clear();
+          await CCApi.saveSettings({ codexUiThemeEnabled: false });
           showToast(t("theme.clearedToast") || "主题已清除");
-        } catch (err) { showToast(err.message); }
+        } catch (err) {
+          // clear 失败 → settings 保留 enabled=true,toggle 弹回 checked 状态保持一致
+          e.target.checked = true;
+          showToast(`${t("theme.clearFailed") || "清除失败"}: ${err.message}`);
+        }
       }
       await renderTheme();
     });
 
-    // Reload Codex Desktop 当前 page(theme 自动重应用)
-    $("[data-action=theme-reload]")?.addEventListener("click", async () => {
-      try {
-        await CCApi.theme.reload();
-        showToast(t("theme.reloadToast") || "已请求 Codex Desktop 刷新");
-      } catch (err) {
-        showToast(`${t("theme.reloadFailed") || "刷新失败"}: ${err.message}`);
-      }
-    });
 
     // Restart Codex.app(完全 quit + 重启,走 transfer 已有 endpoint)
     $("[data-action=theme-restart-codex]")?.addEventListener("click", async () => {
@@ -5480,8 +5685,143 @@
       }
     });
 
+    // "+ 添加自定义" / "替换" — 全局 fn `window.__themeUploadHandler`。
+    // 流程:file picker → FileReader.readAsDataURL → **弹 1:1 crop 弹窗**让 user
+    // 选 crop 区域 → canvas crop 出方形 JPEG → POST 给后端 → renderTheme + 自动
+    // 选中 custom + apply。
+    //
+    // crop 在前端完成(canvas):后端 save_custom_theme 收到已是方形图,只做
+    // resize + JPEG encode 不再二次 crop;user 可拖框 + 滚轮 zoom 自由选定。
+    window.__themeUploadHandler = async () => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/jpeg,image/png,image/jpg";
+      input.style.display = "none";
+      document.body.appendChild(input);
+      input.addEventListener("change", async () => {
+        const file = input.files && input.files[0];
+        input.remove();
+        if (!file) return;
+        if (file.size > 20 * 1024 * 1024) {
+          showToast(t("theme.uploadTooLarge") || "图片过大(>20MB)");
+          return;
+        }
+        try {
+          const srcDataUri = await new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = () => resolve(r.result);
+            r.onerror = () => reject(r.error);
+            r.readAsDataURL(file);
+          });
+          // 弹 1:1 crop modal,user 确认后返 cropped data URI(JPEG)
+          const croppedDataUri = await openCropModal(srcDataUri);
+          if (!croppedDataUri) return; // user cancel
+          await CCApi.theme.uploadCustom(croppedDataUri);
+          showToast(t("theme.uploadOk") || "自定义主题已保存");
+          themeListCache = null;
+          await renderTheme();
+          await window.__themePickHandler("custom");
+        } catch (err) {
+          console.error("[theme] upload failed:", err);
+          showToast(`${t("theme.uploadFailed") || "上传失败"}: ${err.message || err}`);
+        }
+      });
+      input.click();
+    };
+
+    // 删除 / 隐藏卡 — 全局 fn `window.__themeDeleteHandler`。内置 = 隐藏(写
+    // settings.themeHiddenIds),custom = 真删 disk(API + 切默认主题)。
+    window.__themeDeleteHandler = async (themeId, isCustom) => {
+      const lang2 = CCI18n && CCI18n.language === "en" ? "en" : "zh";
+      const confirmMsg = isCustom
+        ? (lang2 === "en" ? "Delete custom theme image? This cannot be undone." : "确认删除自定义主题图片?此操作不可恢复。")
+        : (lang2 === "en" ? `Hide theme "${themeId}"? You can restore from the top of the page.` : `隐藏主题"${themeId}"?顶部可"恢复隐藏"。`);
+      if (!confirm(confirmMsg)) return;
+      try {
+        let curSettings;
+        try { curSettings = await CCApi.getSettings(); } catch { curSettings = {}; }
+        const curSelected = curSettings.codexUiTheme;
+        const curEnabled = curSettings.codexUiThemeEnabled === true;
+        // 共用 fallback 选择器:返 `{ id, unhide }` 二元组。优先找已 visible 的内置;
+        // 找不到(carton 都被隐藏 + 删 custom)→ 强制选第一个内置 + 把它从 hidden 列表
+        // 移除(`unhide=true`),确保 selected card 在 grid 可见。**绝不**返个还在
+        // hidden 列表里的 id 给 caller — 那会让 selected 卡在不可见状态。
+        const pickFallback = (hiddenList) => {
+          const visible = themeListCache.find(th =>
+            th.id !== "custom" && th.id !== themeId && !hiddenList.includes(th.id)
+          );
+          if (visible) return { id: visible.id, unhide: null };
+          // 全 hidden 的极端 case:挑第一个非 custom 内置,自动 unhide
+          const anyBuiltin = themeListCache.find(th => th.id !== "custom" && th.id !== themeId);
+          const id = anyBuiltin ? anyBuiltin.id : "carton";
+          return { id, unhide: id };
+        };
+        if (isCustom) {
+          await CCApi.theme.deleteCustom();
+          if (curSelected === "custom") {
+            const hidden = Array.isArray(curSettings.themeHiddenIds) ? curSettings.themeHiddenIds.slice() : [];
+            const fb = pickFallback(hidden);
+            const patch = { codexUiTheme: fb.id };
+            // 极端 case 自动 unhide fallback 保证 selected 在 grid 可见
+            if (fb.unhide) {
+              patch.themeHiddenIds = hidden.filter(id => id !== fb.unhide);
+            }
+            await CCApi.saveSettings(patch);
+            if (curEnabled) {
+              try {
+                await CCApi.theme.apply(fb.id);
+              } catch (e) {
+                console.error("[theme] post-delete apply failed:", e);
+                showToast(`${t("theme.applyFailed") || "应用失败"}: ${e.message || e} — 请重启 Codex 看效果`);
+              }
+            }
+          }
+        } else {
+          const hidden = Array.isArray(curSettings.themeHiddenIds) ? curSettings.themeHiddenIds.slice() : [];
+          if (!hidden.includes(themeId)) hidden.push(themeId);
+          const patch = { themeHiddenIds: hidden };
+          if (curSelected === themeId) {
+            const fb = pickFallback(hidden);
+            patch.codexUiTheme = fb.id;
+            if (fb.unhide) {
+              patch.themeHiddenIds = hidden.filter(id => id !== fb.unhide);
+            }
+            if (curEnabled) {
+              try {
+                await CCApi.theme.apply(fb.id);
+              } catch (e) {
+                console.error("[theme] post-hide apply failed:", e);
+                showToast(`${t("theme.applyFailed") || "应用失败"}: ${e.message || e} — 请重启 Codex 看效果`);
+              }
+            }
+          }
+          await CCApi.saveSettings(patch);
+        }
+        themeListCache = null;
+        await renderTheme();
+      } catch (err) {
+        console.error("[theme] delete failed:", err);
+        showToast(err.message || String(err));
+      }
+    };
+
+    // 顶部"恢复隐藏" — 清空 themeHiddenIds + 重渲染
+    $("#themeRestoreHidden")?.addEventListener("click", async () => {
+      try {
+        await CCApi.saveSettings({ themeHiddenIds: [] });
+        themeListCache = null;
+        await renderTheme();
+      } catch (err) {
+        showToast(err.message || String(err));
+      }
+    });
+
     // 卡片点击 — 全局 fn `window.__themePickHandler`,inline onclick 触发。
     // 避开任何 event delegation / closure / listener-loss bug,绝对 reliable。
+    //
+    // 热更新(#264):toggle 开 + 点卡片 → save settings → apply → 立即切换
+    // 主题(IIFE 进来先 remove 旧 style + mascot 再 inject 新的,**不需要**
+    // reload Codex page;reload 会扰乱当前对话 React state)。
     window.__themePickHandler = async (themeId) => {
       console.log("[theme] pick", themeId);
       selectedThemeId = themeId;

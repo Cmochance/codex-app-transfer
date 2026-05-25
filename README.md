@@ -43,6 +43,18 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 ![Codex APP 实际对话](img/codex-cli-real-chat.png)
 
+### Codex Desktop 背景主题(可选)
+
+为 Codex Desktop(Electron 客户端)注入背景图 + 半透明玻璃面板 CSS,内置 5 套二次元主题 + 自定义上传。不修改 Codex 的 binary,基于 Chromium DevTools Protocol 运行时注入,Theme 页关闭 toggle 即恢复原生 UI。
+
+| 长离 (Changli) | 碧蓝航线 (Azur Lane) |
+|---|---|
+| ![Changli](img/codex-theme/codex-theme-changli.jpg) | ![Azur Lane](img/codex-theme/codex-theme-azurlane.jpg) |
+| **乃琳 (Nailin)** | **赞妮 (Zani)** |
+| ![Nailin](img/codex-theme/codex-theme-nailin.jpg) | ![Zani](img/codex-theme/codex-theme-zani.jpg) |
+
+第 6 套 Carton 自带右下角漂浮立绘(随鼠标动)。**自定义背景**:Theme 页 → "+ 添加自定义" → 选 JPG/PNG → 1:1 crop 弹窗自由选截取区域(拖拽 + 滚轮缩放)→ 应用。Codex 启动时如已开启 toggle 会自动注入已选主题,不需手动操作。
+
 ## 能做什么
 
 - 管理多套供应商,按 OpenAI 模型名(`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`)映射到供应商真实模型 ID

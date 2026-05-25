@@ -43,6 +43,18 @@ With any provider enabled, Codex App's model picker shows `<provider> / <real-mo
 
 ![Codex App real conversation](img/codex-cli-real-chat.png)
 
+### Codex Desktop background themes (optional)
+
+Inject background image + frosted-glass panel CSS into Codex Desktop (the Electron client). Five built-in anime themes plus user upload. The Codex binary is not modified — runtime injection via Chromium DevTools Protocol; turn the toggle off on the Theme page to restore the native UI.
+
+| Changli | Azur Lane |
+|---|---|
+| ![Changli](img/codex-theme/codex-theme-changli.jpg) | ![Azur Lane](img/codex-theme/codex-theme-azurlane.jpg) |
+| **Nailin** | **Zani** |
+| ![Nailin](img/codex-theme/codex-theme-nailin.jpg) | ![Zani](img/codex-theme/codex-theme-zani.jpg) |
+
+A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts to the cursor. **Custom backgrounds**: Theme page → "+ Add custom" → pick a JPG/PNG → 1:1 crop modal (drag + scroll to zoom) → apply. If the toggle is on at Codex launch, the selected theme auto-injects — no manual step needed.
+
 ## What it does
 
 - Manage multiple providers; map OpenAI model names (`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`) to the provider's real model IDs

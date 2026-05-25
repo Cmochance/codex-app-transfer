@@ -322,15 +322,23 @@ where
 /// 旧 [`detect_free_cdp_port`] try_bind 预检路径仍保留(单测覆盖 + 跨平台
 /// fallback:Windows / Linux 没有 DevToolsActivePort 路径,继续走预检)。
 fn should_attach_debug_port() -> Vec<String> {
-    let auto_unlock = match crate::admin::registry_io::load() {
-        Ok(cfg) => cfg
-            .get("settings")
-            .and_then(|s| s.get("autoUnlockCodexPlugins"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        Err(_) => true,
-    };
-    if !auto_unlock {
+    // **任一为 true 都带 CDP 调试端口**(#264):plugin_unlock 跟 theme 是两个
+    // 独立 toggle,user 可能只开 theme 不开 plugin_unlock。CDP 端口缺失会让
+    // [`auto_apply_theme_on_startup`] 跑空,所以两者任一开启都要带 port。
+    let cfg = crate::admin::registry_io::load().ok();
+    let plugin_unlock = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("autoUnlockCodexPlugins"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let theme_enabled = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("codexUiThemeEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !plugin_unlock && !theme_enabled {
         return vec![];
     }
 
@@ -342,7 +350,9 @@ fn should_attach_debug_port() -> Vec<String> {
         // 预先把 CDP_PORT atomic 设为 0(sentinel:还没拿到真实端口),daemon
         // 检测到 0 应该暂时等待。
         crate::codex_plugin_unlocker::CDP_PORT.store(0, std::sync::atomic::Ordering::Relaxed);
-        // 异步起一个 task poll DevToolsActivePort,拿到端口写 atomic
+        // 异步起一个 task poll DevToolsActivePort,拿到端口写 atomic + 自动
+        // 注入主题(#264 user 反馈:开了 theme toggle 后从本应用启动 Codex 应
+        // 直接应用已选主题,不需要 user 再去 Theme 页点一下)。
         tokio::spawn(async {
             if let Some(port) = wait_for_devtools_port(Duration::from_secs(15)).await {
                 tracing::info!(
@@ -351,14 +361,21 @@ fn should_attach_debug_port() -> Vec<String> {
                 );
                 crate::codex_plugin_unlocker::CDP_PORT
                     .store(port, std::sync::atomic::Ordering::Relaxed);
+                auto_apply_theme_on_startup().await;
             } else {
+                // **不**写 stale 9222 进 CDP_PORT — Codex 启动传 `--remote-debugging-port=0`,
+                // Chromium 选了某个真实端口但 DevToolsActivePort 文件没出现(可能 sandbox /
+                // 文件系统权限 / Codex 版本变更)。强行 fallback 9222 会让所有 CDP 调用
+                // 连到一个 Codex 没监听的端口,user 手动 apply 也跟着失败,且看不到根因。
+                // 保留 CDP_PORT=0(sentinel)→ [`codex_theme_injector::locate_main_window_ws`]
+                // 检测到 0 时返"CDP 端口尚未就绪 — Codex Desktop 可能还在启动中,稍候重试"
+                // 这种 actionable 错误,比 reqwest 报的"tcp connect error: Cannot assign
+                // requested address"准确。同样 skip auto-apply(必然 ECONNREFUSED)。
                 tracing::warn!(
                     "[PluginUnlock] DevToolsActivePort not produced within 15s; \
-                     falling back to default 9222 (CDP may be unreachable until Codex restart)"
-                );
-                crate::codex_plugin_unlocker::CDP_PORT.store(
-                    crate::codex_plugin_unlocker::DEFAULT_CDP_PORT,
-                    std::sync::atomic::Ordering::Relaxed,
+                     CDP_PORT left at 0 sentinel — manual theme apply will report \
+                     'port not detected' instead of failing on a stale port. \
+                     Possible causes: Codex sandbox / version change / FS permission."
                 );
             }
         });
@@ -417,6 +434,62 @@ async fn wait_for_devtools_port(timeout: Duration) -> Option<u16> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     None
+}
+
+/// Codex 启动 + CDP 端口 ready 后,如果 user 开了 `codexUiThemeEnabled`
+/// settings 就自动 apply 已选主题(#264)。Codex 主 page 可能还在 mount,
+/// 用 3 次 retry(delay 500ms / 1000ms / 1500ms)cover 慢启动场景;3 次仍失败 warn 退场,
+/// 不打扰 user(主题没 apply 不影响 Codex 正常用)。
+#[cfg(target_os = "macos")]
+async fn auto_apply_theme_on_startup() {
+    let theme_id = match read_theme_settings() {
+        Some(id) => id,
+        None => return,
+    };
+    for attempt in 0..3u32 {
+        let delay_ms = 500 + (attempt as u64) * 500; // 500 / 1000 / 1500
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        match crate::codex_theme_injector::apply_theme(&theme_id).await {
+            Ok(()) => {
+                tracing::info!(
+                    theme_id = %theme_id,
+                    attempt,
+                    "[Theme] auto-applied on Codex startup"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    theme_id = %theme_id,
+                    attempt,
+                    error = %e,
+                    "[Theme] auto-apply attempt failed, retrying"
+                );
+            }
+        }
+    }
+    tracing::warn!(
+        theme_id = %theme_id,
+        "[Theme] auto-apply gave up after 3 attempts (user can still apply manually)"
+    );
+}
+
+/// 读 transfer settings,看 user 是否开了 theme + 选了哪个。返 `None` =
+/// 未开 toggle / 没选主题 / theme_id 无效 → auto-apply 跳过。
+///
+/// **复用** [`crate::codex_theme_injector::read_settings`] 而不是再写一遍
+/// parsing — 后者已经过滤了 `THEME_IDS` allowlist + custom-exists 检查,这里
+/// 单独复写会 drift(typo'd / corrupted codexUiTheme 会绕过校验,产生 3 次
+/// retry warning 无果)。
+#[cfg(target_os = "macos")]
+fn read_theme_settings() -> Option<String> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let s = crate::codex_theme_injector::read_settings(cfg.get("settings")?);
+    if s.enabled {
+        s.theme_id
+    } else {
+        None
+    }
 }
 
 fn open_codex_app(platform: &str) -> Result<(), String> {

@@ -9,14 +9,15 @@
 //!   navigation / reload 时**自动**执行,一次注入持久生效
 //! - 因此不需要 daemon 持续 reinject(plugin_unlocker 那种 deeply nested race
 //!   监控不需要)
-//! - **limitation v1**:Codex.app 完全重启 → target ID 变 → `addScriptToEvaluateOnNewDocument`
-//!   注册失效,需要 user 在 transfer Theme 页点 "Apply" 重做。后续 v2 可加 daemon
-//!   监控 Codex.app target 变化自动重注入。
+//! - **target ID 变化 cover**:Codex.app 完全重启 → target ID 变 → 之前注册的
+//!   `addScriptToEvaluateOnNewDocument` 自然失效。通过 transfer 内"重启 Codex"
+//!   按钮 / auto-launch 启动时,[`crate::admin::services::desktop::process::auto_apply_theme_on_startup`]
+//!   poll `DevToolsActivePort` 拿到端口后自动 re-inject。**仅 user 绕过 transfer
+//!   直接启 Codex.app(Spotlight / 系统重启 / kill -9 等)时需要手动 apply 一次**。
 //!
 //! **资源**:5 套内置主题在 `src-tauri/resources/themes/<name>/{bg.{png,jpg},mascot.png?}`,
 //! 编译时 `include_bytes!` 嵌进 binary,运行时 base64 编码注入 data URI。
 
-use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -28,8 +29,12 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use crate::codex_plugin_unlocker::current_cdp_url;
 
 /// 主题列表 — 字符串 ID 跟 `src-tauri/resources/themes/<id>/` 目录名匹配。
-/// **不变量**:每条 ID 都对应一组 (bg, mascot?) 资源 + i18n 显示名。
+/// **不变量**:每条 ID 都对应一组 (bg, mascot?) 资源 + 中英显示名(`ThemeMeta.display_name_{zh,en}`,
+/// Rust hardcoded,**不**走 frontend `i18n.js` keys)。
 pub const THEME_IDS: &[&str] = &["carton", "changli", "azurlane", "nailin", "zani"];
+
+/// 自定义主题 id(动态加在 [`THEME_IDS`] 之后,仅当 `custom_theme_exists()` true 时存在)。
+pub const CUSTOM_THEME_ID: &str = "custom";
 
 /// 内置主题元数据。display name 给 frontend 渲染;`has_mascot` 决定是否注入
 /// 浮动看板娘(目前仅 `carton` 有)。
@@ -39,18 +44,116 @@ pub struct ThemeMeta {
     pub display_name_zh: &'static str,
     pub display_name_en: &'static str,
     pub has_mascot: bool,
-    /// `background-size` 策略。Portrait 比例(高远大于宽)的图用 "cover" 会被
-    /// 严重拉伸只剩头部,改 "contain" + center 居中让整张图完整显示;letterbox
-    /// 空白由 body `background-color: #1a1010` 填充。
+    /// `background-size`(`build_inject_script` 直接展开进 CSS)。**当前所有 6
+    /// 套主题统一 `"cover"`**:内置 5 张 bg 已替换为 3840×3840 方图,custom 在前端
+    /// 1:1 crop 后也是方图,cover 在 Codex 1900×1100 landscape viewport 下显示头部
+    /// 到胸口刚好。字段保留供未来非方图 portrait 主题用(可设 `"contain"` 整图显示,
+    /// letterbox 用 body `background-color` 填)。
     pub bg_fit: &'static str,
-    /// `background-position`。cover 模式锚 `center top` 保头部;contain 模式
-    /// `center` 居中。
+    /// `background-position`。当前都 `"center top"` 锚顶部(保头部)。cover + 方图
+    /// 组合下 viewport bottom 800px 被裁掉,锚 top 保留人物上半身。
     pub bg_position: &'static str,
 }
 
-/// 所有内置主题 metadata。
+/// 自定义主题资源目录:`~/.codex-app-transfer/themes/custom/`。
+pub fn custom_theme_dir() -> Option<std::path::PathBuf> {
+    codex_app_transfer_registry::paths::resolve_home()
+        .map(|h| h.join(".codex-app-transfer").join("themes").join("custom"))
+}
+
+fn custom_bg_path() -> Option<std::path::PathBuf> {
+    custom_theme_dir().map(|d| d.join("bg.jpg"))
+}
+
+fn custom_preview_path() -> Option<std::path::PathBuf> {
+    custom_theme_dir().map(|d| d.join("preview.jpg"))
+}
+
+/// User 是否上传过自定义主题图(bg.jpg 存在即视为存在)。
+pub fn custom_theme_exists() -> bool {
+    custom_bg_path().map(|p| p.exists()).unwrap_or(false)
+}
+
+/// User 上传图 bytes(JPG / PNG)→ **中心 crop 方形**(safety net:正常路径前端
+/// `openCropModal` 已 1:1 crop,这里 crop 已是方图时 no-op;兜底直接 POST raw
+/// image 不走 modal 的场景)→ resize 到 max 2048(节约 disk + base64 体积)→
+/// JPEG 90% 写 `bg.jpg`;同步生成 640px preview 写 `preview.jpg`。写入用 .tmp
+/// + rename 原子化避免半截文件。
+pub fn save_custom_theme(image_bytes: &[u8]) -> Result<(), String> {
+    use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView};
+
+    let img = image::load_from_memory(image_bytes)
+        .map_err(|e| format!("无法解析图片(请用 JPG 或 PNG): {e}"))?;
+    let (w, h) = img.dimensions();
+    let side = w.min(h);
+    let x = (w - side) / 2;
+    let y = (h - side) / 2;
+    let cropped = img.crop_imm(x, y, side, side);
+
+    let bg = cropped.resize(2048, 2048, FilterType::Lanczos3);
+    let preview = cropped.resize(640, 640, FilterType::Lanczos3);
+
+    let dir = custom_theme_dir().ok_or_else(|| "无法解析 home 目录".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+
+    fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
+        let mut buf = Vec::new();
+        let encoder = JpegEncoder::new_with_quality(&mut buf, quality);
+        img.to_rgb8()
+            .write_with_encoder(encoder)
+            .map_err(|e| format!("JPEG encode 失败: {e}"))?;
+        Ok(buf)
+    }
+
+    let bg_bytes = encode_jpeg(&bg, 90)?;
+    let preview_bytes = encode_jpeg(&preview, 85)?;
+
+    let bg_final = dir.join("bg.jpg");
+    let preview_final = dir.join("preview.jpg");
+    let bg_tmp = dir.join("bg.jpg.tmp");
+    let preview_tmp = dir.join("preview.jpg.tmp");
+    std::fs::write(&bg_tmp, &bg_bytes).map_err(|e| format!("写 bg 失败: {e}"))?;
+    std::fs::rename(&bg_tmp, &bg_final).map_err(|e| format!("rename bg 失败: {e}"))?;
+    std::fs::write(&preview_tmp, &preview_bytes).map_err(|e| format!("写 preview 失败: {e}"))?;
+    std::fs::rename(&preview_tmp, &preview_final)
+        .map_err(|e| format!("rename preview 失败: {e}"))?;
+
+    Ok(())
+}
+
+/// 删除 user 上传的自定义主题:rm `bg.jpg` + `preview.jpg`(同时清理可能残留
+/// 的 .tmp 文件)。文件不存在视为已删除返 Ok(幂等)。
+pub fn delete_custom_theme() -> Result<(), String> {
+    let dir = match custom_theme_dir() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    if !dir.exists() {
+        return Ok(());
+    }
+    for name in ["bg.jpg", "preview.jpg", "bg.jpg.tmp", "preview.jpg.tmp"] {
+        let p = dir.join(name);
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| format!("删除 {name} 失败: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn load_custom_theme_assets() -> Option<ThemeAssets> {
+    let bg_bytes = std::fs::read(custom_bg_path()?).ok()?;
+    let preview_bytes = std::fs::read(custom_preview_path()?).ok()?;
+    Some(ThemeAssets {
+        bg_data_uri: encode_data_uri("image/jpeg", &bg_bytes),
+        mascot_data_uri: None,
+        preview_data_uri: encode_data_uri("image/jpeg", &preview_bytes),
+    })
+}
+
+/// 所有主题 metadata。内置 5 套固定;`custom` 仅当 user 上传过(disk 文件存在)
+/// 时追加在末尾。
 pub fn all_themes() -> Vec<ThemeMeta> {
-    vec![
+    let mut v = vec![
         ThemeMeta {
             id: "carton",
             display_name_zh: "Carton",
@@ -80,64 +183,97 @@ pub fn all_themes() -> Vec<ThemeMeta> {
             display_name_zh: "乃琳",
             display_name_en: "Nailin",
             has_mascot: false,
-            bg_fit: "contain",
-            bg_position: "center",
+            bg_fit: "cover",
+            bg_position: "center top",
         },
         ThemeMeta {
             id: "zani",
             display_name_zh: "赞妮",
             display_name_en: "Zani",
             has_mascot: false,
-            bg_fit: "contain",
-            bg_position: "center",
+            bg_fit: "cover",
+            bg_position: "center top",
         },
-    ]
+    ];
+    if custom_theme_exists() {
+        v.push(ThemeMeta {
+            id: CUSTOM_THEME_ID,
+            display_name_zh: "自定义",
+            display_name_en: "Custom",
+            has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "center top",
+        });
+    }
+    v
 }
 
-/// 主题资源(bg + 可选 mascot)— 编译时嵌进 binary 的 base64 data URI。
+/// 主题资源 — 编译时嵌进 binary 的 base64 data URI。
+///
+/// - `bg_data_uri`:**原始大背景图**,inject 到 Codex Desktop body 用。
+/// - `mascot_data_uri`:carton 主题专属漂浮立绘。
+/// - `preview_data_uri`:**Theme 页缩略图**(实际 Codex Desktop 主题应用效果
+///   截图,左侧 sidebar 已 GaussianBlur 防隐私泄露),~40KB / 张。
 #[derive(Debug, Clone)]
 pub struct ThemeAssets {
     pub bg_data_uri: String,
     pub mascot_data_uri: Option<String>,
+    pub preview_data_uri: String,
 }
 
-/// 拿指定主题的资源。返回 None = 该 theme_id 不在 [`THEME_IDS`]。
+/// 拿指定主题的资源。返回 None = 该 theme_id 既不在 [`THEME_IDS`] 也没有
+/// 对应的 custom disk 资源。`custom` 走 [`load_custom_theme_assets`] disk 读路径,
+/// 其他走 `include_bytes!` 静态嵌入。
 pub fn load_theme_assets(theme_id: &str) -> Option<ThemeAssets> {
+    if theme_id == CUSTOM_THEME_ID {
+        return load_custom_theme_assets();
+    }
     // include_bytes! 必须用字面路径,所以每条 theme 显式 match
-    let (bg_bytes, bg_mime, mascot): (&[u8], &str, Option<(&[u8], &str)>) = match theme_id {
+    let (bg_bytes, bg_mime, mascot, preview_bytes): (
+        &[u8],
+        &str,
+        Option<(&[u8], &str)>,
+        &[u8],
+    ) = match theme_id {
         "carton" => (
-            include_bytes!("../resources/themes/carton/bg.png"),
-            "image/png",
+            include_bytes!("../resources/themes/carton/bg.jpg"),
+            "image/jpeg",
             Some((
                 include_bytes!("../resources/themes/carton/mascot.png"),
                 "image/png",
             )),
+            include_bytes!("../resources/themes/carton/preview.jpg"),
         ),
         "changli" => (
             include_bytes!("../resources/themes/changli/bg.jpg"),
             "image/jpeg",
             None,
+            include_bytes!("../resources/themes/changli/preview.jpg"),
         ),
         "azurlane" => (
             include_bytes!("../resources/themes/azurlane/bg.jpg"),
             "image/jpeg",
             None,
+            include_bytes!("../resources/themes/azurlane/preview.jpg"),
         ),
         "nailin" => (
             include_bytes!("../resources/themes/nailin/bg.jpg"),
             "image/jpeg",
             None,
+            include_bytes!("../resources/themes/nailin/preview.jpg"),
         ),
         "zani" => (
             include_bytes!("../resources/themes/zani/bg.jpg"),
             "image/jpeg",
             None,
+            include_bytes!("../resources/themes/zani/preview.jpg"),
         ),
         _ => return None,
     };
     Some(ThemeAssets {
         bg_data_uri: encode_data_uri(bg_mime, bg_bytes),
         mascot_data_uri: mascot.map(|(b, m)| encode_data_uri(m, b)),
+        preview_data_uri: encode_data_uri("image/jpeg", preview_bytes),
     })
 }
 
@@ -248,9 +384,13 @@ async fn run_reload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// 清除主题:CDP connect → 注入 removal script(移除 style + mascot DOM)+
 /// Runtime.evaluate 立即生效 → disconnect。
 ///
-/// **不**清 `Page.addScriptToEvaluateOnNewDocument` 注册(CDP 没暴露 list 接口
-/// 拿 identifier;一次性 transient 移除够 v1,Codex.app 重启 target ID 变了
-/// 之前注册自然失效)。
+/// **不**清 `Page.addScriptToEvaluateOnNewDocument` 注册:`addScriptToEvaluateOnNewDocument`
+/// 调用本身返回 identifier,实现选择不存(简单 + transient remove 够 v1)。
+///
+/// ⚠️ **副作用**:注册仍存活,Codex 任何 page navigation / reload 都会再跑一次 IIFE
+/// 把主题装回来。**只有 user 完整 quit Codex.app(target ID 变)注册才彻底失效**。
+/// v1 user 关 toggle → clear 立即视觉清除,如果在 Codex 内手动 reload 会"复发",
+/// 但 transfer 不会主动 reload Codex,所以 v1 流程下不可见。
 pub async fn clear_theme() -> Result<(), String> {
     match run_clear().await {
         Ok(()) => {
@@ -326,6 +466,17 @@ async fn run_clear() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// 复用 plugin_unlocker 的 page-filter 思路:type=page + URL 含 `index.html` +
 /// 不含 `avatar-overlay`(过滤宠物悬浮窗)。
 async fn locate_main_window_ws() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // **CDP_PORT=0 sentinel 检查**:Codex 启动后 0–15s 内,或 DevToolsActivePort
+    // 永远没出现的极端 case,`current_cdp_url()` 会返 `http://127.0.0.1:0/...`,
+    // 直接走 reqwest 会冒出"tcp connect error: Cannot assign requested address"
+    // 这种 OS 原始错误,user 看不懂根因。这里 early-return 友好错误。
+    use crate::codex_plugin_unlocker::CDP_PORT;
+    if CDP_PORT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return Err(
+            "CDP 端口尚未就绪 — Codex Desktop 可能还在启动中,稍候重试 / 或确认 Codex.app 正在运行"
+                .into(),
+        );
+    }
     let url = current_cdp_url();
     let resp = reqwest::get(&url).await?;
     if !resp.status().is_success() {
@@ -431,8 +582,15 @@ fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
         r#"
 (function() {{
   // codex-app-transfer theme inject (#264). theme={theme_id}
-  // 幂等:用固定 id 的 <style>,二次注入直接 short-circuit
-  if (document.getElementById('cat-theme-style')) return;
+  // **切换主题语义**:进来先 cleanup 旧 style + mascot(如有),再 inject 新的。
+  // 早期版本用 `if (existing) return` short-circuit,导致从主题 A apply 到主题 B
+  // 时 Runtime.evaluate 因 'cat-theme-style' 已存在直接 return,新主题没注入 —
+  // user 必须 reload Codex page 才能切换。改成 remove-then-create 后,apply
+  // 调用即立即切到新主题(单步生效)。
+  var oldStyle = document.getElementById('cat-theme-style');
+  if (oldStyle) oldStyle.remove();
+  var oldMascot = document.getElementById('cat-theme-mascot');
+  if (oldMascot) oldMascot.remove();
 
   var style = document.createElement('style');
   style.id = 'cat-theme-style';
@@ -563,7 +721,10 @@ pub fn read_settings(settings: &Value) -> ThemeSettings {
         .get("codexUiTheme")
         .and_then(Value::as_str)
         .map(|s| s.to_owned())
-        .filter(|s| THEME_IDS.contains(&s.as_str()));
+        .filter(|s| {
+            THEME_IDS.contains(&s.as_str())
+                || (s == CUSTOM_THEME_ID && custom_theme_exists())
+        });
     ThemeSettings { enabled, theme_id }
 }
 
@@ -619,13 +780,20 @@ mod tests {
 
     #[test]
     fn build_inject_script_includes_mascot_only_for_carton() {
+        // 验证 mascot CSS rule + mount block 只出现在 carton script,changli 等无 mascot
+        // 主题没有。**不**直接 grep "cat-theme-mascot" 字符串 — 切换主题语义改造后
+        // 所有 script 头都有 `getElementById('cat-theme-mascot')` cleanup line(用于
+        // 切到非 mascot 主题时移除旧 carton mascot),仅 mascot CSS rule 跟 mount
+        // 代码是 carton 专属。
         let carton = load_theme_assets("carton").unwrap();
         let carton_script = build_inject_script("carton", &carton);
-        assert!(carton_script.contains("cat-theme-mascot"));
+        assert!(carton_script.contains(".cat-theme-mascot {"));
+        assert!(carton_script.contains("m.className = 'cat-theme-mascot'"));
 
         let changli = load_theme_assets("changli").unwrap();
         let changli_script = build_inject_script("changli", &changli);
-        assert!(!changli_script.contains("cat-theme-mascot"));
+        assert!(!changli_script.contains(".cat-theme-mascot {"));
+        assert!(!changli_script.contains("m.className = 'cat-theme-mascot'"));
     }
 
     #[test]

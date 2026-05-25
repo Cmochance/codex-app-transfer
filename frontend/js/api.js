@@ -559,13 +559,25 @@ window.CCApi.theme = {
   async clear() {
     return api('POST', '/api/desktop/theme/clear');
   },
-  /** 刷新 Codex Desktop 当前 page(theme 自动重应用) */
+  /** 刷新 Codex Desktop 当前 page。v1 无前端调用(主题切换 IIFE 即刻生效不需 reload);
+   *  保留对应后端 endpoint 做开发 / 测试备用 */
   async reload() {
     return api('POST', '/api/desktop/theme/reload');
   },
   /** 重启 Codex.app(quit + 启动)— 复用 desktop handler */
   async restartCodex() {
     return api('POST', '/api/desktop/restart-codex-app');
+  },
+  /** 上传 / 替换自定义主题图。流程:前端 `openCropModal` 让 user 拖选 1:1
+   *  区域 → canvas 已 crop 成方形 JPEG → 后端再 center-crop(已是方图时 no-op)
+   *  + resize 2048 + JPEG encode 写 `~/.codex-app-transfer/themes/custom/`。
+   *  `dataUri` 形如 `data:image/jpeg;base64,...` */
+  async uploadCustom(dataUri) {
+    return api('POST', '/api/desktop/theme/custom/upload', { data_uri: dataUri });
+  },
+  /** 删除自定义主题(rm disk) */
+  async deleteCustom() {
+    return api('DELETE', '/api/desktop/theme/custom');
   },
 };
 
