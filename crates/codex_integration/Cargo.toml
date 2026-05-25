@@ -13,6 +13,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# #258 best-effort 写入路径需要 user-visible warn 日志(经 telemetry_bridge
+# 路由到 in-app logs)。eprintln! 在 .app 启动时无 stderr,被 launchd 吞。
+tracing = "0.1"
 codex-app-transfer-registry = { path = "../registry" }
 
 [dev-dependencies]

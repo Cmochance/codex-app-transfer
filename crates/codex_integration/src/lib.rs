@@ -16,6 +16,7 @@
 
 pub mod apply;
 pub mod auth;
+pub mod electron_state;
 pub mod model_catalog;
 pub mod paths;
 pub mod snapshot;
@@ -45,4 +46,8 @@ pub enum CodexError {
     RegistryIo(#[from] codex_app_transfer_registry::IoError),
     #[error("home directory not resolved: set $HOME or pass paths explicitly")]
     NoHome,
+    /// 通用领域错误,用于 electron-state JSON 形态非法等场景 — 区别于
+    /// `Json(serde_json::Error)`(解析失败)给上层"我故意拒绝处理"的语义。
+    #[error("{0}")]
+    Other(String),
 }

@@ -38,6 +38,11 @@ pub struct DesktopConfigTarget {
     /// #212:是否允许 Codex shell 工具网络访问(从 `Settings.codexNetworkAccess`
     /// 读取,默认 `true`)。写入 `sandbox_workspace_write.network_access`。
     pub codex_network_access: bool,
+    /// #258:Codex Desktop 对话页底部 context 圆环 + tokens/s 默认显示开关
+    /// (从 `Settings.codexStatusSectionDefaultVisible` 读取,默认 `true`)。
+    /// 写入 `~/.codex/.codex-global-state.json` 的
+    /// `electron-persisted-atom-state.local-conversation-status-section-visible`。
+    pub codex_status_section_default_visible: bool,
 }
 
 pub fn desktop_config_target_for_provider(
@@ -83,6 +88,8 @@ pub fn desktop_config_target_for_provider(
         && !direct_api_key.is_empty();
 
     let codex_network_access = crate::admin::handlers::proxy::read_codex_network_access(cfg);
+    let codex_status_section_default_visible =
+        crate::admin::handlers::proxy::read_codex_status_section_default_visible(cfg);
 
     if bypass_proxy {
         return DesktopConfigTarget {
@@ -97,6 +104,7 @@ pub fn desktop_config_target_for_provider(
             mode: "direct",
             proxy_port,
             codex_network_access,
+            codex_status_section_default_visible,
         };
     }
 
@@ -117,6 +125,7 @@ pub fn desktop_config_target_for_provider(
         mode: "local_proxy",
         proxy_port,
         codex_network_access,
+        codex_status_section_default_visible,
     }
 }
 
@@ -340,6 +349,7 @@ pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, Strin
             model_capabilities: Some(&target.model_capabilities),
             app_version: APP_VERSION,
             codex_network_access: target.codex_network_access,
+            codex_status_section_default_visible: target.codex_status_section_default_visible,
         },
     )
     .map_err(|e| format!("apply 失败: {e}"))?;

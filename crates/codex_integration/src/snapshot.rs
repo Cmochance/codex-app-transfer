@@ -20,7 +20,7 @@ use crate::paths::CodexPaths;
 use crate::toml_sync::write_atomic;
 use crate::CodexError;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
 /// `gc_trash_older_than` 的默认保留天数 — daemon startup 调一次时用。
 /// 30 天是"误点 cleanup_all 后用户还有月内时间发现并从 trash/ 恢复"的
@@ -43,6 +43,24 @@ pub struct SnapshotManifest {
     pub app_version: String,
     #[serde(default)]
     pub provider_name: Option<String>,
+    /// `~/.codex/.codex-global-state.json` 里
+    /// `electron-persisted-atom-state.local-conversation-status-section-visible`
+    /// 在 snapshot 拍摄时的原值。
+    ///
+    /// **三态语义**(配合 `electron_status_section_capture_failed`):
+    /// - `capture_failed=false` + `Some(v)` → snapshot 时已读到该值,restore 走 write_atom 复原
+    /// - `capture_failed=false` + `None` → snapshot 时确认 atom 不存在,restore 走 remove_atom
+    /// - `capture_failed=true` + `None` → snapshot 时读 atom 失败(IO/parse 错误),
+    ///   restore **不动** atom(避免 silently 抹掉 user 真实原值)
+    ///
+    /// `#[serde(default)]` 保证旧 manifest(schema_version < 3 没有此字段)
+    /// deserialize 到 `None` + `capture_failed=false`,等同"原本无该字段" → restore 走 remove。
+    #[serde(default)]
+    pub electron_status_section_pre_value: Option<bool>,
+    /// `electron_status_section_pre_value` capture 失败 sentinel。详见上面三态。
+    /// 旧 manifest 默认 false(snapshot 老路径全是成功 capture,行为不变)。
+    #[serde(default)]
+    pub electron_status_section_capture_failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -70,6 +88,20 @@ pub struct SnapshotInfo {
 }
 
 /// 是否有未还原的快照。
+/// 读当前快照的 manifest(走 active / 兼容 legacy)。
+/// 没快照或读失败返 `None`,caller(`apply::restore_*`)按"原本就没记录"语义走。
+pub fn read_current_manifest(paths: &CodexPaths) -> Option<SnapshotManifest> {
+    if let Some(dir) = current_snapshot_dir(paths) {
+        return read_manifest_from_dir(&dir).ok();
+    }
+    None
+}
+
+/// 读指定 snapshot_id 的 manifest。
+pub fn read_manifest_by_id(paths: &CodexPaths, snapshot_id: &str) -> Option<SnapshotManifest> {
+    snapshot_dir_by_id(paths, snapshot_id).and_then(|dir| read_manifest_from_dir(&dir).ok())
+}
+
 pub fn has_snapshot(paths: &CodexPaths) -> bool {
     current_session_snapshot_dir(paths)
         .map(|dir| manifest_path(&dir).exists())
@@ -178,6 +210,34 @@ pub fn snapshot_codex_state(
         }
     }
 
+    // 读 `~/.codex/.codex-global-state.json` 里 status section atom 的原值。
+    // None = 文件不存在 / 段不存在 / atom 缺失,restore 时走 remove。
+    //
+    // **错误处理 silent-failure-hunter CRITICAL fix**:read_atom 现在区分
+    // ENOENT (Ok(None)) vs 其它 IO / parse 错误 (Err)。读错时**不能**默认 None ——
+    // 否则后续 restore 用 None 当"原本无此字段" → remove_atom → silent 丢
+    // user 真实原值。改成读错时:warn 一行 + manifest pre_value 保留 None,
+    // 但 restore 路径会 short-circuit"不动 atom"(见 apply.rs restore 改动)。
+    // 这里用 capture-failed sentinel 区分清楚两种 None。
+    let (electron_status_section_pre_value, electron_status_section_capture_failed) =
+        match crate::electron_state::read_atom(
+            &paths.electron_global_state,
+            crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+        ) {
+            Ok(Some(v)) => (v.as_bool(), false),
+            Ok(None) => (None, false),
+            Err(e) => {
+                tracing::warn!(
+                    target: "codex_integration::snapshot",
+                    path = %paths.electron_global_state.display(),
+                    error = %e,
+                    "snapshot pre-value capture failed for status-section atom; \
+                     restore will skip atom touching to avoid silent loss",
+                );
+                (None, true)
+            }
+        };
+
     let session_id = current_session_id().to_owned();
     let manifest = SnapshotManifest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -192,6 +252,8 @@ pub fn snapshot_codex_state(
         } else {
             Some(provider_name.to_owned())
         },
+        electron_status_section_pre_value,
+        electron_status_section_capture_failed,
     };
     write_manifest_to_dir(&current_dir, &manifest)?;
 
@@ -521,6 +583,10 @@ fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), C
             auth_existed: auth_path(dir).exists(),
             app_version: String::new(),
             provider_name: None,
+            // 损坏快照的兜底 manifest 没原值信息。capture_failed=true 让 restore
+            // 安全 short-circuit"不动 atom"(防 silent 抹 user 原值)。
+            electron_status_section_pre_value: None,
+            electron_status_section_capture_failed: true,
         });
     std::fs::create_dir_all(&paths.recovery_snapshots_dir)?;
     let target = unique_recovery_dir(paths, &manifest.snapshot_id);
@@ -855,6 +921,8 @@ mod tests {
                 auth_existed: false,
                 app_version: "v-old".to_owned(),
                 provider_name: Some("Old".to_owned()),
+                electron_status_section_pre_value: None,
+                electron_status_section_capture_failed: false,
             })
             .unwrap(),
         )
@@ -897,6 +965,8 @@ mod tests {
                     auth_existed: false,
                     app_version: "v-old".to_owned(),
                     provider_name: Some("Old".to_owned()),
+                    electron_status_section_pre_value: None,
+                    electron_status_section_capture_failed: false,
                 })
                 .unwrap(),
             )
