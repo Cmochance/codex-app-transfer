@@ -5385,19 +5385,26 @@
     }
     const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
 
-    // 3. 渲染主题卡(radio + 缩略图)— 缩略图用同样 CDP 注入路径 GET asset 太重,
-    //    简单版用 emoji + 主题名占位,user 拿到 UI 后真机看图自己识别。
-    //    v2 followup:加 thumbnail API endpoint /api/desktop/theme/thumbnail/<id>
+    // 3. 渲染主题卡(grid 4 列 + 缩略图)— bg data URI 直接 <img src>。
+    //    选中卡片高亮 border;hasMascot 角标 ★。
+    container.style.display = "grid";
+    container.style.gridTemplateColumns = "repeat(4, 1fr)";
+    container.style.gap = "14px";
     container.innerHTML = themeListCache.map((th) => {
       const displayName = lang === "en" ? th.displayNameEn : th.displayNameZh;
-      const checked = th.id === selectedThemeId ? "checked" : "";
-      const mascotIcon = th.hasMascot ? `<span title="${lang === 'en' ? 'with mascot' : '含看板娘'}" style="font-size:11px;color:var(--bs-success);margin-left:6px;">★</span>` : "";
+      const checked = th.id === selectedThemeId;
+      const mascotBadge = th.hasMascot ? `<span title="${lang === 'en' ? 'with mascot' : '含看板娘'}" style="position:absolute;top:6px;right:8px;background:var(--bs-warning);color:#000;font-size:10px;padding:1px 6px;border-radius:8px;">★ ${lang === 'en' ? 'mascot' : '看板娘'}</span>` : "";
+      const borderStyle = checked
+        ? "border:2px solid var(--bs-primary);box-shadow:0 0 0 3px rgba(13,110,253,0.18);"
+        : "border:1px solid var(--bs-border-color);";
       return `
-        <label class="card-theme-pick" style="border:1px solid var(--bs-border-color);border-radius:8px;padding:12px;cursor:pointer;display:flex;align-items:center;gap:10px;${checked ? 'background:var(--bs-primary-bg-subtle);border-color:var(--bs-primary);' : ''}">
-          <input type="radio" name="themeRadio" value="${th.id}" ${checked}>
-          <div style="flex:1;">
-            <div style="font-weight:600;">${escapeHtml(displayName)}${mascotIcon}</div>
-            <div class="settings-note" style="font-size:11px;margin-top:2px;opacity:0.7;">${th.id}</div>
+        <label class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;" data-theme-id="${th.id}">
+          <input type="radio" name="themeRadio" value="${th.id}" ${checked ? "checked" : ""} style="position:absolute;top:6px;left:8px;z-index:2;">
+          ${mascotBadge}
+          <img src="${th.bgDataUri}" alt="${escapeHtml(displayName)}" style="width:100%;aspect-ratio:16/10;object-fit:cover;display:block;">
+          <div style="padding:8px 10px;">
+            <div style="font-weight:600;font-size:14px;">${escapeHtml(displayName)}</div>
+            <div class="settings-note" style="font-size:11px;margin-top:2px;opacity:0.7;font-family:monospace;">${th.id}</div>
           </div>
         </label>
       `;

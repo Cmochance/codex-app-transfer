@@ -18,21 +18,28 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::codex_theme_injector::{
-    all_themes, apply_theme, clear_theme, get_status as get_theme_status,
+    all_themes, apply_theme, clear_theme, get_status as get_theme_status, load_theme_assets,
 };
 
 use super::super::state::AdminState;
 use super::common::err;
 
 pub async fn list_handler() -> impl IntoResponse {
+    // **附带 bg data URI**(#264 缩略图):前端 grid 卡片直接 `<img src>`,
+    // 不需要新 endpoint。响应大小 ~5MB(5 张原图 base64 + JSON 包装),用户
+    // 只在第一次进 Theme 页时拉,接受;比加 thumbnail endpoint + 二次解析路径轻。
     let themes: Vec<_> = all_themes()
         .into_iter()
         .map(|m| {
+            let bg_data_uri = load_theme_assets(m.id)
+                .map(|a| a.bg_data_uri)
+                .unwrap_or_default();
             json!({
                 "id": m.id,
                 "displayNameZh": m.display_name_zh,
                 "displayNameEn": m.display_name_en,
                 "hasMascot": m.has_mascot,
+                "bgDataUri": bg_data_uri,
             })
         })
         .collect();

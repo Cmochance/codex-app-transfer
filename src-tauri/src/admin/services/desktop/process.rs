@@ -270,17 +270,17 @@ fn maybe_wake_codex_pet() {
     );
 }
 
-/// 探测一个可用的 CDP debug port:**优先 9222**(默认值,跟 Chrome 一致),
+/// 探测一个可用的 CDP debug port(非 macOS):**优先 9222**(跟 Chrome 一致),
 /// 占用时 fallback OS 分配的随机空闲端口。
 ///
-/// 借鉴 `BigPizzaV3/CodexPlusPlus` `launcher.py:267-281`(MIT)端口冲突探测
-/// 思路。本 Rust 实现用 `std::net::TcpListener::bind` 尝试占位,**立刻 drop
-/// 释放**(只确认"该端口此刻可绑"),Codex Desktop 的 bind 在 ms 级内接管。
-/// 时间窗口里被第三方进程抢占的概率极低;即便抢了,Codex 启动会报端口占用
-/// 由用户视觉感知,daemon 会继续 backoff重试不至于卡死。
+/// **macOS 不走此路径**(#264):改用 `--remote-debugging-port=0` + 异步 poll
+/// `DevToolsActivePort` 文件,消除 try_bind 预检 vs Codex 真实 bind 的 race。
+/// 见 `should_attach_debug_port()` 的 `#[cfg(target_os = "macos")]` 分支。
 ///
-/// 完全失败(连 port 0 都拿不到 — 系统资源枯竭)时 fallback 到
-/// [`DEFAULT_CDP_PORT`](crate::codex_plugin_unlocker::DEFAULT_CDP_PORT)。
+/// 借鉴 `BigPizzaV3/CodexPlusPlus` `launcher.py:267-281`(MIT)端口冲突探测
+/// 思路。Rust 实现用 `std::net::TcpListener::bind` 尝试占位,**立刻 drop**;
+/// 完全失败时 fallback 到 [`DEFAULT_CDP_PORT`](crate::codex_plugin_unlocker::DEFAULT_CDP_PORT)。
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn detect_free_cdp_port() -> u16 {
     detect_free_cdp_port_using(|port| {
         std::net::TcpListener::bind(("127.0.0.1", port))
@@ -293,6 +293,7 @@ pub(crate) fn detect_free_cdp_port() -> u16 {
 /// 纯函数版本 — 注入端口探测器给单测调用,避免在测试中跟真实 OS 端口耦合
 /// (CI 上 9222 可能被某些 sidecar 占用导致测试 flaky)。模式跟
 /// `registry/src/paths.rs::resolve_home_from` 一致。
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn detect_free_cdp_port_using<F>(try_bind: F) -> u16
 where
     F: Fn(u16) -> Option<u16>,
@@ -310,9 +311,16 @@ where
 /// 新装/初始化场景下 Plugins 解锁开箱即用。用户显式关闭(=false)时才不附加。
 /// 跟 main.rs setup hook 中的 auto-start 默认值保持一致。
 ///
-/// **#33 P2 端口冲突探测**(issue #226 Task 1):用 [`detect_free_cdp_port`]
-/// 找空闲端口(优先 9222,占用 fallback OS 分配),把结果写入 `CDP_PORT`
-/// atomic,plugin_unlock daemon 通过 `current_cdp_url()` 看到最新值。
+/// **#264 改用 Chromium 随机端口**(从 codex-theme launcher.js 借的模式,user
+/// 本地手搓不需致谢):
+/// - `--remote-debugging-port=0` 让 Chromium 自己 atomic 选空闲端口,**消除**
+///   Rust 端 try_bind 预检 + Codex 真实 bind 之间的 race window
+/// - 启动后另起一个 task poll `~/Library/Application Support/Codex/DevToolsActivePort`
+///   文件(Chromium 把真实端口写第一行),拿到端口写进 `CDP_PORT` atomic
+/// - daemon 通过 `current_cdp_url()` 看到最新端口,无感切换
+///
+/// 旧 [`detect_free_cdp_port`] try_bind 预检路径仍保留(单测覆盖 + 跨平台
+/// fallback:Windows / Linux 没有 DevToolsActivePort 路径,继续走预检)。
 fn should_attach_debug_port() -> Vec<String> {
     let auto_unlock = match crate::admin::registry_io::load() {
         Ok(cfg) => cfg
@@ -322,7 +330,49 @@ fn should_attach_debug_port() -> Vec<String> {
             .unwrap_or(true),
         Err(_) => true,
     };
-    if auto_unlock {
+    if !auto_unlock {
+        return vec![];
+    }
+
+    // macOS:用 port=0 + 异步 poll DevToolsActivePort(无 race)
+    #[cfg(target_os = "macos")]
+    {
+        // 启动前清掉 stale DevToolsActivePort(否则可能读到上次启动的旧端口)
+        let _ = std::fs::remove_file(devtools_active_port_path());
+        // 预先把 CDP_PORT atomic 设为 0(sentinel:还没拿到真实端口),daemon
+        // 检测到 0 应该暂时等待。
+        crate::codex_plugin_unlocker::CDP_PORT.store(0, std::sync::atomic::Ordering::Relaxed);
+        // 异步起一个 task poll DevToolsActivePort,拿到端口写 atomic
+        tokio::spawn(async {
+            if let Some(port) = wait_for_devtools_port(Duration::from_secs(15)).await {
+                tracing::info!(
+                    cdp_port = port,
+                    "[PluginUnlock] DevToolsActivePort resolved to {port}"
+                );
+                crate::codex_plugin_unlocker::CDP_PORT
+                    .store(port, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                tracing::warn!(
+                    "[PluginUnlock] DevToolsActivePort not produced within 15s; \
+                     falling back to default 9222 (CDP may be unreachable until Codex restart)"
+                );
+                crate::codex_plugin_unlocker::CDP_PORT.store(
+                    crate::codex_plugin_unlocker::DEFAULT_CDP_PORT,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        });
+        return vec![
+            "--remote-debugging-port=0".into(),
+            "--remote-allow-origins=*".into(),
+        ];
+    }
+
+    // 非 macOS(Windows / Linux):走旧 try_bind 预检路径。
+    // DevToolsActivePort 路径在 Windows / Linux 的 Codex Desktop 上行为
+    // 未实测,保持旧机制稳态;后续如有需求再单独 port=0 化。
+    #[cfg(not(target_os = "macos"))]
+    {
         let port = detect_free_cdp_port();
         crate::codex_plugin_unlocker::CDP_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
         if port != crate::codex_plugin_unlocker::DEFAULT_CDP_PORT {
@@ -331,18 +381,42 @@ fn should_attach_debug_port() -> Vec<String> {
                 "[PluginUnlock] 9222 occupied, falling back to OS-assigned port"
             );
         }
-        // `--remote-allow-origins=*` 是 Chrome 111+ / Electron 同代起的硬性
-        // 要求:不带它,CDP HTTP /json/list 仍工作,但 WebSocket upgrade 完成
-        // 后会被远端 reset(我们 log 里见过 "Connection reset without closing
-        // handshake")。galaxywk223/codex-plugin-unlocker (MIT) 同样加这个
-        // flag,见其 `launcher.py:55-58`。
-        vec![
+        return vec![
             format!("--remote-debugging-port={port}"),
             "--remote-allow-origins=*".into(),
-        ]
-    } else {
-        vec![]
+        ];
     }
+}
+
+/// `~/Library/Application Support/Codex/DevToolsActivePort` 路径。
+/// Chromium 进程启动 `--remote-debugging-port=0` 后会把真实分配的端口写到这个
+/// 文件第一行(第二行是 target ID / browser GUID,我们不用)。
+#[cfg(target_os = "macos")]
+fn devtools_active_port_path() -> std::path::PathBuf {
+    let home = codex_app_transfer_registry::paths::resolve_home()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    home.join("Library/Application Support/Codex/DevToolsActivePort")
+}
+
+/// Poll `DevToolsActivePort` 文件首行拿端口号,最长等 `timeout`。
+/// 文件第一行是端口数字(如 `54321`),第二行 GUID 不解析。
+#[cfg(target_os = "macos")]
+async fn wait_for_devtools_port(timeout: Duration) -> Option<u16> {
+    let path = devtools_active_port_path();
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(first_line) = text.lines().next() {
+                if let Ok(port) = first_line.trim().parse::<u16>() {
+                    if port > 0 {
+                        return Some(port);
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    None
 }
 
 fn open_codex_app(platform: &str) -> Result<(), String> {
