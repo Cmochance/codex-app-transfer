@@ -1659,8 +1659,9 @@ mod tests {
         let after_apply: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
         assert_eq!(
-            after_apply
-                .pointer("/electron-persisted-atom-state/local-conversation-status-section-visible"),
+            after_apply.pointer(
+                "/electron-persisted-atom-state/local-conversation-status-section-visible"
+            ),
             Some(&json!(true))
         );
         assert_eq!(
@@ -1677,8 +1678,9 @@ mod tests {
         let after_restore: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
         assert_eq!(
-            after_restore
-                .pointer("/electron-persisted-atom-state/local-conversation-status-section-visible"),
+            after_restore.pointer(
+                "/electron-persisted-atom-state/local-conversation-status-section-visible"
+            ),
             Some(&json!(false)),
             "restore 必须用 snapshot 记录的 user 原值 false 复原,不留 transfer 写入的 true"
         );

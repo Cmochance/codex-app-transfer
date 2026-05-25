@@ -265,7 +265,9 @@ mod tests {
         let modified: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         // 我们 target 的字段被改
         assert_eq!(
-            modified.pointer("/electron-persisted-atom-state/local-conversation-status-section-visible"),
+            modified.pointer(
+                "/electron-persisted-atom-state/local-conversation-status-section-visible"
+            ),
             Some(&json!(true))
         );
         // 同段其它 atom 原样
@@ -317,7 +319,9 @@ mod tests {
         remove_atom(&p, STATUS_SECTION_VISIBLE_KEY).unwrap();
         let content: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(
-            content.pointer("/electron-persisted-atom-state/local-conversation-status-section-visible"),
+            content.pointer(
+                "/electron-persisted-atom-state/local-conversation-status-section-visible"
+            ),
             None
         );
         assert_eq!(
