@@ -8,6 +8,10 @@
 
 Claude preset 暂不开放:需要 P7 真实 Claude text、tool-call、`previous_response_id`、upstream error 验证通过后再加入默认 preset。
 
+## Unreleased — fix #254
+
+**Per-provider `reasoning_effort` 策略**:修复 DeepSeek xhigh/max 档位被一刀切降级到 high 的问题(issue #254)。新建 `crates/registry/src/reasoning_effort_policy.rs` 注册表:DeepSeek 真实 xhigh→max;Kimi/GLM/MiMo/MiniMax/Qwen 不传 `reasoning_effort` 字段(LiteLLM 白名单实证不承认);自定义 provider 保守 fallback。同时删除已冗余的 `deepseek_max_effort` preset 死字段。
+
 ## v2.1.14 — 2026-05-23
 
 **Codex 文档管理 4 子页完整重做**:Sidebar → Codex 整页改成 Agents / Memories / Skills / MCP 四 sub-tab,每个 sub-tab raw 模式编辑对应 codex 配置,SHA-256 hash 独立 history 互不交叉。

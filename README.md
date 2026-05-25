@@ -93,7 +93,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Provider | 多轮历史 | autocompact | tool_call_repair | 备注 |
 |---|---|---|---|---|
 | Kimi(Moonshot Platform / Kimi For Coding) | ✅ | ✅ | ✅ | thinking 三层防御 |
-| DeepSeek V4(含 Max 思维) | ✅ | ✅ | ✅ | 视觉输入剥离避免 400 |
+| DeepSeek V4(含 Max 思维) | ✅ | ✅ | ✅ | 视觉输入剥离避免 400;xhigh → max 真实到达(#254) |
 | Xiaomi MiMo(Token Plan / Pay for Token) | ✅ | ✅ | ✅ | 纯图请求兜底空格 text part |
 | MiniMax M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` 转 user 防 400(v2.1.6) |
 | Google AI Studio(`gemini_native`) | ✅ | ✅ | ✅ | Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` 自动选 |
@@ -182,7 +182,13 @@ Kimi / DeepSeek 开启 thinking 后强制要求历史中带 tool_call 的 assist
 
 ### 上游 400:`'reasoning_effort' does not support 'xhigh'`
 
-Codex 用户配置里若把 `model_reasoning_effort` 设成 `xhigh` / `max`,本工具自动降级到 `high`。`auto` / `none` 等 Chat 端不接受的值会被丢弃。
+v2.1.14 及之前会把 `xhigh` / `max` 一刀切降级到 `high`(issue #254)。**v2.1.15+ 改为 per-provider 策略**:
+
+- **DeepSeek V4**:`xhigh` / `max` → 真实 `reasoning_effort: "max"`,`low` / `medium` / `high` → `"high"`(官方文档 `api-docs.deepseek.com/guides/thinking_mode`)
+- **Kimi / GLM / MiMo / MiniMax / Qwen(百炼)**:不传 `reasoning_effort` 字段(LiteLLM 白名单实证这些上游不承认该字段),交由上游默认 thinking 行为处理
+- **自定义 / 未知 provider**:保守 fallback — `xhigh` / `max` 仍降为 `"high"`,标准 enum 透传
+
+`auto` / `none` / `disabled` 等 Chat 端不接受的值始终丢弃。
 
 ### MiniMax 400:`invalid message role: system (2013)`
 
@@ -238,7 +244,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 - [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) — provider 切换形态启发
 - [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x 桌面壳骨架 + README 结构参考
-- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — 协议双向转换思路
+- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — 协议双向转换思路;per-provider `get_supported_openai_params` 白名单作为 reasoning_effort 入表证据交叉验证(DeepSeek / Kimi / GLM / MiniMax / Qwen / MiMo)
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` 架构基座
 - [`openai/codex`](https://github.com/openai/codex) — autocompact prompt 骨架 + compact 协议结构反查
 - [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact prompt 锚定 bullet

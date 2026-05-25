@@ -91,17 +91,30 @@
   - usage 字段规范化(litellm `_transform_chat_completion_usage_to_responses_usage` 字段映射,chat→responses reasoning_tokens / cached_tokens / total_tokens 等) → `crates/adapters/src/responses/converter.rs`(grep `litellm` 多处)
   - Vertex AI TypedDict 1:1 镜像(`litellm/types/llms/vertex_ai.py`) → `crates/adapters/src/gemini_native/types.rs`(顶部注释明示 "1:1 镜像")
   - tool result 配对修复(防 Anthropic 400 invalid request) → `crates/adapters/src/responses/request.rs`
+  - per-provider `get_supported_openai_params` 白名单(各家 `llms/<provider>/chat/transformation.py`)作为 reasoning_effort 入表证据交叉验证:
+    - `llms/deepseek/chat/transformation.py:41-63` — DeepSeek 折叠 all non-none 到 thinking.type=enabled(本项目信官方 docs 而非 LiteLLM 保守实现,见 issue #254)
+    - `llms/moonshot/chat/transformation.py:91-146` `get_supported_openai_params` — Kimi 不收 reasoning_effort
+    - `llms/zai/chat/transformation.py:36-58` `get_supported_openai_params` — GLM 只承认 `thinking` 字段
+    - `llms/minimax/chat/transformation.py:87-102` `get_supported_openai_params` — MiniMax 只承认 `thinking` + `reasoning_split`
+    - `llms/dashscope/chat/transformation.py`(全文 82 行,无 `get_supported_openai_params`)— 百炼 Qwen 走父类透传,effort 字段可能被 silent ignored
+    → `crates/registry/src/reasoning_effort_policy.rs`(各 match arm 注释引用上游 file:line)
 - **本项目差异 / 扩展**:
   - 按 Rust 类型系统重写,不引入 PyO3 / pyo3-runtime
   - 转换逻辑保留 litellm 行为语义,但实现路径完全独立(Rust async/await 而非 Python)
   - usage 字段映射跟随 litellm 主线;本项目额外加了 reasoning_tokens 非 0 校验防上游 0 漏统计
+  - DeepSeek reasoning_effort 映射**主动偏离** litellm 保守实现(litellm 折叠成 thinking.type=enabled,不区分档位);本项目按官方 docs xhigh→max 真实映射(issue #254 用户报告 litellm 行为让 max 档不可达)
 - **同步策略**:
   - litellm 主线 issue 关注协议层变更(尤其 OpenAI/Anthropic protocol updates)
   - 类型镜像变更时手动 diff `litellm/types/llms/vertex_ai.py` 同步 `gemini_native/types.rs`
+  - 各 provider `get_supported_openai_params` 变更时同步 `reasoning_effort_policy.rs` 对应 match arm
 - **代码层引用**(节选):
   > //! 1:1 镜像 LiteLLM `litellm/types/llms/vertex_ai.py` 的 TypedDict 定义
   > `response.in_progress`,严格客户端(litellm 自身、Anthropic 工具链)
   > 与 litellm 的 `_transform_chat_completion_usage_to_responses_usage` (docs/litellm/.../litellm_completion_transformation/transformation.py)
+  > LiteLLM `llms/deepseek/chat/transformation.py:41-63` 实际把所有非 none 折叠成 `thinking.type=enabled`,**不区分档位** — 比官方 docs 保守。本项目信官方 docs。
+  > Kimi (Moonshot) — `llms/moonshot/chat/transformation.py:91-146` `get_supported_openai_params` 不收 reasoning_effort。
+  > 智谱 GLM (Z.AI) — `llms/zai/chat/transformation.py:36-58` `get_supported_openai_params` 只承认 `thinking` 字段。
+  > MiniMax M2.x — `llms/minimax/chat/transformation.py:87-102` `get_supported_openai_params` 只承认 `thinking` + `reasoning_split`。
 
 ## tauri-apps/tauri
 

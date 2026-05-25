@@ -20,9 +20,13 @@ pub mod model_context_policy;
 pub mod paths;
 pub mod presets;
 pub mod raw_io;
+pub mod reasoning_effort_policy;
 pub mod schema;
 
 pub use compact_thinking_policy::{compact_disable_thinking_wire, DisableThinkingWire};
+pub use reasoning_effort_policy::{
+    apply_reasoning_effort, reasoning_effort_wire, ReasoningEffortWire,
+};
 #[allow(deprecated)]
 pub use healing::heal_builtin_extra_headers;
 pub use healing::heal_builtin_provider_fields;

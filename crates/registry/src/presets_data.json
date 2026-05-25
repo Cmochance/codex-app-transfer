@@ -26,20 +26,6 @@
       }
     ],
     "requestOptions": {},
-    "requestOptionPresets": {
-      "deepseek_max_effort": {
-        "label": "DeepSeek Max 思维",
-        "description": "Low：更快更省，适合简单任务。\nMedium：速度和效果平衡，适合日常使用。\nHigh：更认真思考，适合复杂代码和排错。\n勾选后：本工具会按 DeepSeek Max 转发；未勾选则使用 Claude 当前默认配置。",
-        "requestOptions": {
-          "chat": {
-            "thinking": {
-              "type": "enabled"
-            },
-            "reasoning_effort": "max"
-          }
-        }
-      }
-    },
     "extraHeaders": {},
     "isBuiltin": true
   },

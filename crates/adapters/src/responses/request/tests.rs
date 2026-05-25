@@ -3308,3 +3308,148 @@ fn non_object_body_rejected() {
     let err = responses_body_to_chat_body(&json!("not an object"));
     assert!(matches!(err, Err(AdapterError::BadRequest(_))));
 }
+
+// ─── reasoning_effort per-provider 映射矩阵(issue #254) ───────────────────
+//
+// 覆盖 reasoning_effort_policy 的 3 个 wire 分支 × 5 个 Codex effort 档位。
+// 端到端验证从 Codex `reasoning.effort` 到上游 chat body 字段的转换正确性。
+
+fn chat_provider(id: &str) -> Provider {
+    let mut p = provider(id, id, "https://example.test");
+    p.api_format = "openai_chat".into();
+    p
+}
+
+fn effort_for(provider_id: &str, effort: &str) -> Value {
+    responses_body_to_chat_body_for_provider(
+        &json!({
+            "input": "hi",
+            "reasoning": {"effort": effort},
+        }),
+        Some(&chat_provider(provider_id)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn effort_deepseek_xhigh_maps_to_max() {
+    let out = effort_for("deepseek", "xhigh");
+    assert_eq!(out["reasoning_effort"], "max");
+}
+
+#[test]
+fn effort_deepseek_max_maps_to_max() {
+    let out = effort_for("deepseek", "max");
+    assert_eq!(out["reasoning_effort"], "max");
+}
+
+#[test]
+fn effort_deepseek_high_stays_high() {
+    let out = effort_for("deepseek", "high");
+    assert_eq!(out["reasoning_effort"], "high");
+}
+
+#[test]
+fn effort_deepseek_low_normalizes_to_high() {
+    // DeepSeek 官方:上游会把 low/medium 升到 high。本端也 normalize 一次(冗余但
+    // 语义明确,真机抓包能直接看到 wire 上是 "high")。
+    let out = effort_for("deepseek", "low");
+    assert_eq!(out["reasoning_effort"], "high");
+}
+
+#[test]
+fn effort_deepseek_none_drops() {
+    let out = effort_for("deepseek", "none");
+    assert!(out.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn effort_kimi_all_levels_drop() {
+    for effort in ["low", "medium", "high", "xhigh", "max"] {
+        let out = effort_for("kimi", effort);
+        assert!(
+            out.get("reasoning_effort").is_none(),
+            "kimi effort={effort} 不应写 reasoning_effort"
+        );
+    }
+}
+
+#[test]
+fn effort_kimi_code_drops() {
+    let out = effort_for("kimi-code", "xhigh");
+    assert!(out.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn effort_zhipu_drops() {
+    let out = effort_for("zhipu", "high");
+    assert!(out.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn effort_bailian_drops() {
+    let out = effort_for("bailian", "xhigh");
+    assert!(out.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn effort_bailian_token_plan_drops() {
+    let out = effort_for("bailian-token-plan", "max");
+    assert!(out.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn effort_mimo_payg_drops() {
+    let out = effort_for("xiaomi-mimo-payg", "high");
+    assert!(out.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn effort_mimo_token_plan_drops() {
+    let out = effort_for("xiaomi-mimo-token-plan", "xhigh");
+    assert!(out.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn effort_minimax_drops() {
+    let out = effort_for("minimax", "high");
+    assert!(out.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn effort_custom_provider_xhigh_clamps_to_high() {
+    // 自定义 / 未知 provider id → OpenAI 标准 enum fallback
+    let out = effort_for("my-custom-proxy", "xhigh");
+    assert_eq!(out["reasoning_effort"], "high");
+}
+
+#[test]
+fn effort_custom_provider_low_passthrough() {
+    let out = effort_for("my-custom-proxy", "low");
+    assert_eq!(out["reasoning_effort"], "low");
+}
+
+#[test]
+fn effort_no_provider_uses_openai_enum_fallback() {
+    // 不传 provider(测试 / 旁路场景)走 OpenAI 标准 enum
+    let out = responses_body_to_chat_body(&json!({
+        "input": "hi",
+        "reasoning": {"effort": "xhigh"},
+    }))
+    .unwrap();
+    assert_eq!(out["reasoning_effort"], "high");
+}
+
+#[test]
+fn effort_string_form_also_extracted() {
+    // Codex 协议可能也发 "reasoning": "high"(字符串形态,非对象)
+    let out = responses_body_to_chat_body_for_provider(
+        &json!({
+            "input": "hi",
+            "reasoning": "xhigh",
+        }),
+        Some(&chat_provider("deepseek")),
+    )
+    .unwrap();
+    assert_eq!(out["reasoning_effort"], "max");
+}

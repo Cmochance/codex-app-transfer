@@ -37,6 +37,11 @@
 //!
 //! ## 跟其它独立优化的关系
 //!
+//! - **[`crate::reasoning_effort_policy`]**:本模块的对偶 —— 本模块管 compact 路径
+//!   强制 disable thinking(已开 → 关);`reasoning_effort_policy` 管正常请求按
+//!   Codex effort 档位映射 thinking(关 → 按档位决定开多深)。compact 路径同时经过
+//!   两个 policy 时,disable 优先级高(本模块注入先到位,`reasoning_effort_policy`
+//!   不翻案)。
 //! - **历史 reasoning_content 剥离**(`docs/followup/44-compact-strip-history-reasoning-content.md`):
 //!   独立的 input 侧优化,跟本模块的 output 侧 disable 互补。Anthropic 文档 +
 //!   Claude Code 行为都印证历史 reasoning 在 compact 任务下无价值。

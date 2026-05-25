@@ -199,10 +199,14 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         }
     }
 
-    // reasoning → reasoning_effort
-    if let Some(reasoning_effort) = body.get("reasoning").and_then(build_reasoning_effort) {
-        result.insert("reasoning_effort".into(), reasoning_effort);
-    }
+    // reasoning → upstream effort/budget(按 provider 走 reasoning_effort_policy)
+    //
+    // 改前(v2.1.14 及更早):全 chat 上游共用 `normalize_chat_reasoning_effort`
+    // 把 xhigh/max 砍到 high — 对 DeepSeek 致命(issue #254:max 档不可达),
+    // 对 Kimi/GLM/MiMo/MiniMax/Qwen 也只是塞它们不认的字段。
+    // 改后:按 provider 查 [`codex_app_transfer_registry::reasoning_effort_wire`],
+    // DeepSeek 走 high/max 二档、其他 chat 上游 Drop、自定义 fallback 走 OpenAI enum。
+    apply_codex_reasoning_effort_for_provider(&mut result, body, provider);
 
     // max_output_tokens → max_tokens
     if let Some(v) = body.get("max_output_tokens") {
@@ -2190,34 +2194,66 @@ fn provider_supports_json_schema_response_format(provider: Option<&Provider>) ->
         .any(|needle| provider_looks_like(p, needle))
 }
 
-fn build_reasoning_effort(reasoning: &Value) -> Option<Value> {
-    match reasoning {
-        Value::String(s) => normalize_chat_reasoning_effort(s),
-        Value::Object(obj) => {
-            if let Some(effort) = obj.get("effort") {
-                if let Some(effort) = effort.as_str() {
-                    return normalize_chat_reasoning_effort(effort);
-                }
-                return Some(effort.clone());
-            }
-            if obj.contains_key("summary") {
-                return Some(reasoning.clone());
-            }
-            Some(reasoning.clone())
+/// 从 Codex `reasoning` 字段抽出 effort 字符串.
+///
+/// Codex 协议两种形态都接受:
+/// - `"reasoning": "high"`(legacy 字符串)
+/// - `"reasoning": {"effort": "high", "summary": "..."}`(标准对象)
+///
+/// 抽出后已做 trim + lowercase,empty 返回 None。其他字段(summary 等)在
+/// chat 协议里无对应,丢弃。
+///
+/// 非预期 JSON 形态(Array / Bool / Number 等)走 `warn` log 后 drop —
+/// 这通常是 Codex 协议变更或调用方协议错误,需告警以便 debug。
+fn extract_codex_effort(reasoning: Option<&Value>) -> Option<String> {
+    let reasoning = reasoning?;
+    let raw = match reasoning {
+        Value::String(s) => s.as_str(),
+        Value::Object(obj) => obj.get("effort").and_then(|v| v.as_str())?,
+        Value::Null => return None,
+        other => {
+            tracing::warn!(
+                target: "adapters::responses::request",
+                reasoning_kind = ?other,
+                "unexpected reasoning field shape in codex request; dropping effort (possible protocol change)"
+            );
+            return None;
         }
-        Value::Null => None,
-        other => Some(other.clone()),
-    }
+    };
+    let trimmed = raw.trim().to_ascii_lowercase();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn normalize_chat_reasoning_effort(effort: &str) -> Option<Value> {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "minimal" | "low" | "medium" | "high" => {
-            Some(Value::String(effort.trim().to_ascii_lowercase()))
+/// 按 provider 把 Codex reasoning.effort 写进 chat body.
+///
+/// `provider == Some` 时走 [`codex_app_transfer_registry::apply_reasoning_effort`]
+/// 的 per-provider 注册表;`provider == None` 时走 OpenAI 标准 enum 保守 fallback,
+/// 并发出 `debug` log 标注路径(生产代码应始终有 provider 上下文,None 是
+/// 测试 / 早期协议解析旁路场景,意外走 None 会让 effort 被砍回 OpenAI 上限 high
+/// — 即 issue #254 同款症状,debug log 让 troubleshooting 有线索)。
+fn apply_codex_reasoning_effort_for_provider(
+    body: &mut Map<String, Value>,
+    src: &Map<String, Value>,
+    provider: Option<&Provider>,
+) {
+    let Some(effort) = extract_codex_effort(src.get("reasoning")) else {
+        return;
+    };
+    match provider {
+        Some(p) => {
+            codex_app_transfer_registry::apply_reasoning_effort(body, p, &effort);
         }
-        "xhigh" | "max" | "highest" => Some(Value::String("high".into())),
-        "none" | "off" | "auto" | "" => None,
-        _ => None,
+        None => {
+            tracing::debug!(
+                target: "adapters::responses::request",
+                codex_effort = %effort,
+                "no provider context; falling back to OpenAI enum reasoning_effort (test / bypass path)"
+            );
+            // 用空 id 复用同一个 wire enum 路径,保持行为跟"未知自定义 provider"完全一致 +
+            // 自带未知 effort 的 warn log,DRY 避免双份映射表
+            codex_app_transfer_registry::ReasoningEffortWire::OpenAIEnum
+                .apply(body, &effort, "<no-provider>");
+        }
     }
 }
 
