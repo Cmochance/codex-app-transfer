@@ -1227,7 +1227,7 @@
   // ── Plugin Unlock 状态刷新 ──
   async function refreshPluginUnlockStatus() {
     try {
-      const unlock = await CCAPI.pluginUnlock.status();
+      const unlock = await CCApi.pluginUnlock.status();
       const icon = $("#pluginUnlockIcon");
       const statusText = $("#pluginUnlockStatus");
       const actions = $("#pluginUnlockActions");
@@ -5366,7 +5366,7 @@
     // 1. 读 settings.codexUiThemeEnabled + codexUiTheme
     let settings;
     try {
-      settings = await CCAPI.getSettings();
+      settings = await CCApi.getSettings();
     } catch (e) {
       settings = {};
     }
@@ -5377,7 +5377,7 @@
     //    bug(一旦失败 set 成 [],之后永不重试)+ 主题列表本身就是 5 项,
     //    每次 ~5MB(含 base64 缩略图)由 webview 本地 IPC 走,延迟可忽略
     try {
-      const res = await CCAPI.theme.list();
+      const res = await CCApi.theme.list();
       themeListCache = res.themes || [];
       if (themeListCache.length === 0) {
         console.warn("[theme] list returned empty:", res);
@@ -5417,7 +5417,7 @@
 
     // 5. 刷新 status badge
     try {
-      const st = await CCAPI.theme.status();
+      const st = await CCApi.theme.status();
       const sObj = st.status;
       if (sObj && typeof sObj === "object") {
         if (sObj.Applied) badge.textContent = `${t("theme.applied") || "已应用"}: ${sObj.Applied.theme_id}`;
@@ -5445,15 +5445,15 @@
           e.target.checked = false;
           return;
         }
-        await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
+        await CCApi.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
         try {
-          await CCAPI.theme.apply(selectedThemeId);
+          await CCApi.theme.apply(selectedThemeId);
           showToast(t("theme.appliedToast") || "主题已应用");
         } catch (err) { showToast(err.message); }
       } else {
-        await CCAPI.saveSettings({ codexUiThemeEnabled: false });
+        await CCApi.saveSettings({ codexUiThemeEnabled: false });
         try {
-          await CCAPI.theme.clear();
+          await CCApi.theme.clear();
           showToast(t("theme.clearedToast") || "主题已清除");
         } catch (err) { showToast(err.message); }
       }
@@ -5463,7 +5463,7 @@
     // Reload Codex Desktop 当前 page(theme 自动重应用)
     $("[data-action=theme-reload]")?.addEventListener("click", async () => {
       try {
-        await CCAPI.theme.reload();
+        await CCApi.theme.reload();
         showToast(t("theme.reloadToast") || "已请求 Codex Desktop 刷新");
       } catch (err) {
         showToast(`${t("theme.reloadFailed") || "刷新失败"}: ${err.message}`);
@@ -5473,7 +5473,7 @@
     // Restart Codex.app(完全 quit + 重启,走 transfer 已有 endpoint)
     $("[data-action=theme-restart-codex]")?.addEventListener("click", async () => {
       try {
-        await CCAPI.theme.restartCodex();
+        await CCApi.theme.restartCodex();
         showToast(t("theme.restartToast") || "已请求重启 Codex");
       } catch (err) {
         showToast(`${t("theme.restartFailed") || "重启失败"}: ${err.message}`);
@@ -5488,12 +5488,12 @@
       const enabled = $("#codexUiThemeEnabled")?.checked;
       try {
         if (enabled) {
-          await CCAPI.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: themeId });
-          await CCAPI.theme.apply(themeId);
+          await CCApi.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: themeId });
+          await CCApi.theme.apply(themeId);
           showToast(t("theme.appliedToast") || "主题已应用");
         } else {
           // toggle 关时,只持久化 user 的选择(不调 apply,toggle 开时再 apply)
-          await CCAPI.saveSettings({ codexUiTheme: themeId });
+          await CCApi.saveSettings({ codexUiTheme: themeId });
         }
       } catch (err) {
         console.error("[theme] pick failed:", err);
@@ -6033,21 +6033,21 @@
    // Plugin Unlock 按钮事件
     $("[data-action=plugin-unlock-start]")?.addEventListener("click", async () => {
       try {
-        await CCAPI.pluginUnlock.start();
+        await CCApi.pluginUnlock.start();
         showToast(t("pluginUnlock.started") || "解锁服务已启动");
         setTimeout(refreshPluginUnlockStatus, 1000);
       } catch (e) { showToast(e.message); }
     });
     $("[data-action=plugin-unlock-stop]")?.addEventListener("click", async () => {
       try {
-        await CCAPI.pluginUnlock.stop();
+        await CCApi.pluginUnlock.stop();
         showToast(t("pluginUnlock.stopped") || "解锁服务已停止");
         setTimeout(refreshPluginUnlockStatus, 500);
       } catch (e) { showToast(e.message); }
     });
     $("[data-action=plugin-unlock-reinject]")?.addEventListener("click", async () => {
       try {
-        await CCAPI.pluginUnlock.reinject();
+        await CCApi.pluginUnlock.reinject();
         showToast(t("pluginUnlock.reinjecting") || "正在重新注入...");
         setTimeout(refreshPluginUnlockStatus, 1500);
       } catch (e) { showToast(e.message); }

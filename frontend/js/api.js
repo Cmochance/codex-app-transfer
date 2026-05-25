@@ -518,9 +518,9 @@
 // 原版 line 514 的 `})()` 提前关 IIFE 是 bug(plugin unlock UI 实际很少触发,
 // 没暴露);改成 IIFE 包到文件末尾。
 
-window.CCAPI = window.CCAPI || {};
+window.CCApi = window.CCApi || {};
 
-window.CCAPI.pluginUnlock = {
+window.CCApi.pluginUnlock = {
   /** 查询解锁状态 */
   async status() {
     return api('GET', '/api/desktop/plugin-unlock/status');
@@ -542,7 +542,7 @@ window.CCAPI.pluginUnlock = {
   },
 };
 
-window.CCAPI.theme = {
+window.CCApi.theme = {
   /** 列出内置主题(#264) */
   async list() {
     return api('GET', '/api/desktop/theme/list');
