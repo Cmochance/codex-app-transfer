@@ -98,29 +98,23 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         sync_root_value(&paths.config_toml, "openai_base_url", Some(&literal))?;
     }
 
-    // 2b. **默认 strip model_provider 字段**(#258 验证后改默认行为):
-    // - Codex CLI 在缺失 model_provider 时 fallback 到 openai,跟显式写
-    //   `model_provider = "openai"` 行为等价 —— 都会读 openai_base_url 走 proxy
-    // - #258 真机验证:strip 后日常使用无异常(完整对话 / tool call / autocompact)
-    // - 不显式写还顺便避开"显式 provider 字段可能触发上游 UI 隐藏 context 圆环"
-    //   的潜在 surface(虽然 #258 验证 1 证伪了这条因果,strip 仍是更小的 footprint)
+    // 2b. **无条件 strip model_provider 字段**(#258 验证后强约束):
     //
-    // **#178 防御保留为 env opt-in**:`CAT_FORCE_MODEL_PROVIDER_OPENAI=1` 时
-    // 仍强制写 openai 覆盖。该防御针对"用户旧 config 残留 model_provider = custom
-    // + [model_providers.custom] 段把流量旁路到第三方 base_url 绕过 proxy"的历史
-    // 场景。现行 user 几乎不会自己写 [model_providers.<name>] 段(Codex CLI
-    // 0.130+ 主流配置不需要),如果真踩到 set env 重启即可恢复强制覆盖行为。
+    // 用户硬性要求 — 使用本项目时 config.toml **必须没有 model_provider 这一项**。
+    // 残留 user 之前配过的 model_provider(任何值,包括 "openai")可能让 Codex CLI
+    // 走非预期 provider 路径,**导致回话丢失**(endpoint 走 stale custom block /
+    // history 链断 / autocompact 找不到 prior turn 等)。
+    //
+    // 等价性:Codex CLI 在缺失字段时 fallback 到 openai,跟显式写
+    // `model_provider = "openai"` 行为等价(都会读 openai_base_url 走 proxy);
+    // 但**只有 strip 才能确保不残留任何 user-set 值**。
+    //
+    // 不留 env opt-in:任何允许写回 `model_provider = "openai"` 的 escape hatch
+    // 都可能让上面"回话丢失"风险复发,所以无条件 strip。如果未来 Codex CLI
+    // 真的需要显式 openai 字段才生效,再 reopen 这条决策。
     //
     // 快照已在第 1 步拿到用户原值,restore 时能完整退回原值(包括 custom)。
-    if std::env::var("CAT_FORCE_MODEL_PROVIDER_OPENAI")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        sync_root_value(&paths.config_toml, "model_provider", Some("\"openai\""))?;
-    } else {
-        sync_root_value(&paths.config_toml, "model_provider", None)?;
-    }
+    sync_root_value(&paths.config_toml, "model_provider", None)?;
 
     // 2c. **#212/#215 Codex 联网默认开**(Codex docs "Full access" 配对):
     // 之前 #212 用 workspace-write + network_access 真机仍弹审批弹窗 ——
