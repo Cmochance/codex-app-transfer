@@ -1273,11 +1273,28 @@
   }
 
   async function renderDashboard() {
-    const status = await CCApi.getStatus();
-    const activities = await CCApi.getActivities();
+    // **#249 fix**:getStatus / getActivities 分别 try-catch,任一失败
+    // 仍渲染其余卡片,避免单个 API 崩溃 → 整个 dashboard 白屏。
+    let status;
+    try {
+      status = await CCApi.getStatus();
+    } catch (err) {
+      console.error("[renderDashboard] getStatus failed:", err);
+      status = {};
+    }
+    let activities = [];
+    try {
+      activities = await CCApi.getActivities();
+    } catch (err) {
+      console.error("[renderDashboard] getActivities failed:", err);
+    }
     const health = status.desktopHealth || {};
     const desktopReady = status.desktopConfigured && !health.needsApply;
-    await renderProviderCards("#dashboardProviderCards", { includePresets: true });
+    try {
+      await renderProviderCards("#dashboardProviderCards", { includePresets: true });
+    } catch (err) {
+      console.error("[renderDashboard] renderProviderCards failed:", err);
+    }
     const desktopIcon = $("#dashboardDesktopIcon");
     desktopIcon.classList.toggle("muted", !desktopReady);
     desktopIcon.innerHTML = `<i class="bi ${desktopReady ? "bi-check-lg" : "bi-exclamation-lg"}"></i>`;
@@ -1299,7 +1316,7 @@
     const proxyStatusEl = $("#dashboardProxyStatus");
     proxyStatusEl.textContent = status.proxyRunning ? `${t("status.running")} :${status.proxyPort}` : t("status.stopped");
     proxyStatusEl.classList.toggle("muted-text", !status.proxyRunning);
-    $("#dashboardProviderName").textContent = status.activeProvider.name;
+    $("#dashboardProviderName").textContent = status.activeProvider?.name ?? "—";
     // Plugin Unlock 状态刷新
     refreshPluginUnlockStatus();
     // MOC-32 PR-2b: silently dropped Responses tool types
@@ -1307,7 +1324,11 @@
     $("#activityList").innerHTML = activities.map((item) => (
       `<div class="activity-row"><time>${escapeHtml(item.time)}</time><span>${escapeHtml(item.text)}</span></div>`
     )).join("");
-    await refreshUpdateBadge();
+    try {
+      await refreshUpdateBadge();
+    } catch (err) {
+      console.error("[renderDashboard] refreshUpdateBadge failed:", err);
+    }
   }
 
   /// MOC-32 PR-2b: query /api/diagnostic/dropped-tools, total>0 时弹 warning
@@ -2271,15 +2292,28 @@
       tab.classList.toggle("active", tab.dataset.nav === key);
     });
     if (route !== "proxy") stopProxyLogAutoRefresh();
-    if (route === "dashboard") await renderDashboard();
-    if (route === "providers/add") await renderProviderForm();
-    if (route === "providers") await renderProviders();
-    if (route === "desktop") await renderDesktop();
-    if (route === "proxy") await renderProxy();
-    if (route === "usage") await renderUsage();
-    if (route === "settings") await renderSettings();
-    if (route === "codex") await renderCodexAssets();
-    if (route === "theme") await renderTheme();
+    // **#249 fix**:每个 render 函数单独 try-catch,防止单页 API 失败
+    // 级联阻断其他页面渲染 / 首屏白屏。路由表保持与原 if 链一致(含 usage / theme)。
+    const renders = {
+      dashboard: renderDashboard,
+      "providers/add": renderProviderForm,
+      providers: renderProviders,
+      desktop: renderDesktop,
+      proxy: renderProxy,
+      usage: renderUsage,
+      settings: renderSettings,
+      codex: renderCodexAssets,
+      theme: renderTheme,
+    };
+    const fn = renders[route];
+    if (fn) {
+      try {
+        await fn();
+      } catch (err) {
+        console.error(`[renderRoute] ${route} failed:`, err);
+        showToast(err.message || t("toast.requestFailed"));
+      }
+    }
   }
 
   // ── Usage 页 (#279) — token 统计 ────────────────────────────────────────────
@@ -7718,7 +7752,16 @@
       console.error("event listen:", err);
     }
 
-    const settings = await CCApi.getSettings();
+    // **#249 fix**:getSettings 失败时用默认值,确保 renderRoute 始终执行。
+    // 之前无 try-catch,config.json 锁/损坏/权限问题 → getSettings 500 →
+    // 整条初始化链断裂 → 白屏。
+    let settings;
+    try {
+      settings = await CCApi.getSettings();
+    } catch (err) {
+      console.error("[init] getSettings failed, using defaults:", err);
+      settings = {};
+    }
     const finalLang = settings.language || "zh";
     if (finalLang !== CCI18n.language) {
       // backend settings 跟 cache/navigator 不一致才再 apply,正常路径无 op
@@ -7726,6 +7769,13 @@
     }
     applyTheme(settings.theme || "default");
     if (!window.location.hash) window.location.hash = "dashboard";
-    await renderRoute(routeFromHash());
+    // **#249 fix**:renderRoute 外层兜底 try-catch,防初始路由渲染异常逃逸 → 白屏。
+    // (codex-deeplink / residual-scan-report listener 已在上方 race-fix 块提前注册,
+    // 此处不再重复注册,避免 codex-deeplink 监听器重复绑定。)
+    try {
+      await renderRoute(routeFromHash());
+    } catch (err) {
+      console.error("[init] renderRoute failed:", err);
+    }
   });
 })();
