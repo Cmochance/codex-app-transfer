@@ -84,11 +84,40 @@
 </div>
 
 <style>
+  :global(html, body, #app) {
+    background: transparent !important;
+    background-color: transparent !important;
+  }
+
   /* App Root fills the viewport completely */
   #app-root {
     display: flex;
     flex-direction: column;
     height: 100vh;
     width: 100vw;
+    background-color: var(--mac-bg-window) !important;
+    backdrop-filter: blur(var(--mac-blur)) saturate(var(--mac-saturate));
+    -webkit-backdrop-filter: blur(var(--mac-blur)) saturate(var(--mac-saturate));
+    border: var(--mac-border-window);
+    border-radius: var(--radius-window);
+    box-shadow: var(--mac-shadow-window);
+    overflow: hidden;
+    position: relative;
+  }
+
+  .app-workspace {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    background-color: transparent !important;
+  }
+
+  .app-viewport {
+    flex: 1;
+    background-color: transparent !important;
+    overflow-y: auto;
+    padding: 24px;
+    position: relative;
   }
 </style>

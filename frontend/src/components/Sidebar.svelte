@@ -42,6 +42,17 @@
 </aside>
 
 <style>
+  .app-sidebar {
+    width: 220px;
+    background-color: var(--mac-bg-sidebar) !important;
+    border-right: 1px solid var(--mac-border-separator);
+    display: flex;
+    flex-direction: column;
+    padding: 16px 8px;
+    overflow-y: auto;
+    gap: 4px;
+  }
+
   .sidebar-header-spacer {
     height: 12px;
   }
