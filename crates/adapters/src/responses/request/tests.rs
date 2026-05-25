@@ -1959,125 +1959,134 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
     // 组合 / 空文件 Update 等无效路径,平均每次任务摸索 1-3 分钟。为节省
     // tokens 和提升首次成功率,adapter 在 tools 数组里注册了 apply_patch
     // 的 turn 注入一段独立 system message 告知 chat-path 实战 workaround。
-    let out = convert(json!({
-        "input": [{"type": "message", "role": "user", "content": "edit foo.py"}],
-        "instructions": "You are a coding assistant.",
-        "tools": [{
-            "type": "custom",
-            "name": "apply_patch",
-            "description": "Use the `apply_patch` tool to edit files."
-        }]
-    }));
-    let messages = out["messages"].as_array().unwrap();
+    //
+    // **#262 Devin BUG-004 fix**:此 test 断言英文 guidance 字面,必须持
+    // `LANG_TEST_LOCK` 锁住 USER_LANGUAGE = "en",否则跟新 i18n test 设的
+    // "zh" 并发 race 时会读到中文 guidance → 英文 assertion 失败。
+    with_user_language("en", || {
+        let out = convert(json!({
+            "input": [{"type": "message", "role": "user", "content": "edit foo.py"}],
+            "instructions": "You are a coding assistant.",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Use the `apply_patch` tool to edit files."
+            }]
+        }));
+        let messages = out["messages"].as_array().unwrap();
 
-    // Codex CLI 原 instructions 必须保留在第一条
-    assert_eq!(messages[0]["role"], "system");
-    assert!(
-        messages[0]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("coding assistant"),
-        "Codex 原 instructions 不应被覆盖"
-    );
+        // Codex CLI 原 instructions 必须保留在第一条
+        assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("coding assistant"),
+            "Codex 原 instructions 不应被覆盖"
+        );
 
-    // 紧跟在 Codex instructions 之后必须有一条 adapter-injected guidance
-    assert_eq!(messages[1]["role"], "system");
-    let guidance = messages[1]["content"].as_str().unwrap_or_default();
-    assert!(
-        guidance.contains("apply_patch chat-path guidance"),
-        "注入的指引必须带可识别 marker:{guidance}"
-    );
-    // 关键规则覆盖(round 4 capture 实证根因修复后):
-    // (1) `@@` 单端语法(NEVER trailing `@@`)— 旧版双端误导已删除
-    // 注意:用精确大写 "NEVER add a trailing" 匹配本规则,不能用小写 "never"
-    // (会被 "whenever" 等无关词的子串误命中,Devin pre-merge review 修复)。
-    assert!(
-        guidance.contains("SINGLE-SIDED") && guidance.contains("NEVER add a trailing"),
-        "guidance 必须强调 @@ 单端语法 + 禁尾随 @@:{guidance}"
-    );
-    assert!(
-        !guidance.contains("EMPTY LINE as the `@@` anchor"),
-        "旧版 EMPTY LINE anchor 误导已删除:{guidance}"
-    );
-    // (2) Add File 全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
-    assert!(
-        guidance.contains("prefix EVERY line") && guidance.contains("`+`"),
-        "guidance 必须强调 Add File 全 `+` 前缀:{guidance}"
-    );
-    // (3) byte-exact matching
-    assert!(
-        guidance.contains("byte-for-byte"),
-        "guidance 必须含 byte-exact 匹配规则:{guidance}"
-    );
-    // (4) Add+Update 同 path conflict
-    assert!(guidance.contains("Add File") && guidance.contains("Update File"));
-    // (5) 空文件 + lone `+` APPEND + Delete+Add fallback 兜底
-    assert!(guidance.contains("empty file") || guidance.contains("totally empty"));
-    assert!(guidance.contains("APPEND") || guidance.contains("append"));
-    assert!(
-        guidance.contains("Delete File + Add File"),
-        "guidance 必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{guidance}"
-    );
-    // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
-    assert!(
-        guidance.contains("`*** Begin Patch` MUST be the literal first line"),
-        "guidance 必须显式要求 Begin Patch 是第一行:{guidance}"
-    );
-    assert!(
-        guidance.contains("Move to:") && guidance.contains("REQUIRES at least one hunk"),
-        "guidance 必须显式要求 Move to 配非空 hunk:{guidance}"
-    );
-    assert!(
-        guidance.contains("For pure rename"),
-        "guidance 必须给纯重命名的 Delete+Add 替代方案:{guidance}"
-    );
-    // 用户实测反馈(2026-05-22):模型在"几乎全替换"场景倾向用 `cat > file`
-    // 绕过 apply_patch。prompt 必须强 normative 明示:任何文件操作走 apply_patch,
-    // 全文 rewrite 用 Delete File + Add File。
-    assert!(
-        guidance.contains("ALWAYS use the `apply_patch` tool")
-            && guidance.contains("NEVER use shell"),
-        "guidance 必须强 normative 禁 shell redirect:{guidance}"
-    );
-    assert!(
-        guidance.contains("full-file rewrites")
-            && guidance.contains("`*** Delete File:")
-            && guidance.contains("`*** Add File:"),
-        "guidance 必须明示 large rewrite 走 Delete File + Add File:{guidance}"
-    );
-    // 必须含 rule 5 `printf '\n' > <path>` carve-out 明示
-    // (防 Devin pre-merge review 报跟 rule 5 冲突,2026-05-22)
-    assert!(
-        guidance.contains("narrow exception in rule 5")
-            && guidance.contains("preparation step, not a content bypass"),
-        "guidance 必须 carve-out rule 5 的 `printf '\\n' > <path>` setup 用法:{guidance}"
-    );
+        // 紧跟在 Codex instructions 之后必须有一条 adapter-injected guidance
+        assert_eq!(messages[1]["role"], "system");
+        let guidance = messages[1]["content"].as_str().unwrap_or_default();
+        assert!(
+            guidance.contains("apply_patch chat-path guidance"),
+            "注入的指引必须带可识别 marker:{guidance}"
+        );
+        // 关键规则覆盖(round 4 capture 实证根因修复后):
+        // (1) `@@` 单端语法(NEVER trailing `@@`)— 旧版双端误导已删除
+        // 注意:用精确大写 "NEVER add a trailing" 匹配本规则,不能用小写 "never"
+        // (会被 "whenever" 等无关词的子串误命中,Devin pre-merge review 修复)。
+        assert!(
+            guidance.contains("SINGLE-SIDED") && guidance.contains("NEVER add a trailing"),
+            "guidance 必须强调 @@ 单端语法 + 禁尾随 @@:{guidance}"
+        );
+        assert!(
+            !guidance.contains("EMPTY LINE as the `@@` anchor"),
+            "旧版 EMPTY LINE anchor 误导已删除:{guidance}"
+        );
+        // (2) Add File 全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
+        assert!(
+            guidance.contains("prefix EVERY line") && guidance.contains("`+`"),
+            "guidance 必须强调 Add File 全 `+` 前缀:{guidance}"
+        );
+        // (3) byte-exact matching
+        assert!(
+            guidance.contains("byte-for-byte"),
+            "guidance 必须含 byte-exact 匹配规则:{guidance}"
+        );
+        // (4) Add+Update 同 path conflict
+        assert!(guidance.contains("Add File") && guidance.contains("Update File"));
+        // (5) 空文件 + lone `+` APPEND + Delete+Add fallback 兜底
+        assert!(guidance.contains("empty file") || guidance.contains("totally empty"));
+        assert!(guidance.contains("APPEND") || guidance.contains("append"));
+        assert!(
+            guidance.contains("Delete File + Add File"),
+            "guidance 必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{guidance}"
+        );
+        // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
+        assert!(
+            guidance.contains("`*** Begin Patch` MUST be the literal first line"),
+            "guidance 必须显式要求 Begin Patch 是第一行:{guidance}"
+        );
+        assert!(
+            guidance.contains("Move to:") && guidance.contains("REQUIRES at least one hunk"),
+            "guidance 必须显式要求 Move to 配非空 hunk:{guidance}"
+        );
+        assert!(
+            guidance.contains("For pure rename"),
+            "guidance 必须给纯重命名的 Delete+Add 替代方案:{guidance}"
+        );
+        // 用户实测反馈(2026-05-22):模型在"几乎全替换"场景倾向用 `cat > file`
+        // 绕过 apply_patch。prompt 必须强 normative 明示:任何文件操作走 apply_patch,
+        // 全文 rewrite 用 Delete File + Add File。
+        assert!(
+            guidance.contains("ALWAYS use the `apply_patch` tool")
+                && guidance.contains("NEVER use shell"),
+            "guidance 必须强 normative 禁 shell redirect:{guidance}"
+        );
+        assert!(
+            guidance.contains("full-file rewrites")
+                && guidance.contains("`*** Delete File:")
+                && guidance.contains("`*** Add File:"),
+            "guidance 必须明示 large rewrite 走 Delete File + Add File:{guidance}"
+        );
+        // 必须含 rule 5 `printf '\n' > <path>` carve-out 明示
+        // (防 Devin pre-merge review 报跟 rule 5 冲突,2026-05-22)
+        assert!(
+            guidance.contains("narrow exception in rule 5")
+                && guidance.contains("preparation step, not a content bypass"),
+            "guidance 必须 carve-out rule 5 的 `printf '\\n' > <path>` setup 用法:{guidance}"
+        );
+    });
 }
 
 #[test]
 fn apply_patch_chat_path_guidance_skipped_when_tool_not_registered() {
     // 非 apply_patch 任务不应注入指引,避免污染 token / 模型注意力
-    let out = convert(json!({
-        "input": [{"type": "message", "role": "user", "content": "list files"}],
-        "instructions": "You are a coding assistant.",
-        "tools": [{
-            "type": "function",
-            "name": "shell_command",
-            "description": "Run a shell command",
-            "parameters": {"type": "object", "properties": {}}
-        }]
-    }));
-    let messages = out["messages"].as_array().unwrap();
-    let has_guidance = messages.iter().any(|m| {
-        m["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("apply_patch chat-path guidance")
+    // #262 BUG-004: 持英文 lang 确保 marker 字面一致,且跟 i18n test 串行。
+    with_user_language("en", || {
+        let out = convert(json!({
+            "input": [{"type": "message", "role": "user", "content": "list files"}],
+            "instructions": "You are a coding assistant.",
+            "tools": [{
+                "type": "function",
+                "name": "shell_command",
+                "description": "Run a shell command",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }));
+        let messages = out["messages"].as_array().unwrap();
+        let has_guidance = messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("apply_patch chat-path guidance")
+        });
+        assert!(
+            !has_guidance,
+            "无 apply_patch 注册时不应注入 chat-path guidance"
+        );
     });
-    assert!(
-        !has_guidance,
-        "无 apply_patch 注册时不应注入 chat-path guidance"
-    );
 }
 
 #[test]
@@ -2086,30 +2095,33 @@ fn apply_patch_chat_path_guidance_skipped_when_previous_response_id_set() {
     // history 已经从 session cache 拼回来(其中含上一轮注入的 guidance),
     // 当前 turn **不应**再注入,否则每 turn 累积一份 ~2KB,N 轮后 N 份
     // 浪费 token + 挤出上下文。
-    let out = convert(json!({
-        "input": [{"type": "message", "role": "user", "content": "another edit"}],
-        "instructions": "You are a coding assistant.",
-        "previous_response_id": "resp_18b_some_prior",
-        "tools": [{
-            "type": "custom",
-            "name": "apply_patch",
-            "description": "Use the `apply_patch` tool to edit files."
-        }]
-    }));
-    let messages = out["messages"].as_array().unwrap();
-    let guidance_count = messages
-        .iter()
-        .filter(|m| {
-            m["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("apply_patch chat-path guidance")
-        })
-        .count();
-    assert_eq!(
-        guidance_count, 0,
-        "后续 turn(previous_response_id 非空)不应再注入 guidance(history 已含)"
-    );
+    // #262 BUG-004: 持英文 lang,marker 字面 + 串行。
+    with_user_language("en", || {
+        let out = convert(json!({
+            "input": [{"type": "message", "role": "user", "content": "another edit"}],
+            "instructions": "You are a coding assistant.",
+            "previous_response_id": "resp_18b_some_prior",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Use the `apply_patch` tool to edit files."
+            }]
+        }));
+        let messages = out["messages"].as_array().unwrap();
+        let guidance_count = messages
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("apply_patch chat-path guidance")
+            })
+            .count();
+        assert_eq!(
+            guidance_count, 0,
+            "后续 turn(previous_response_id 非空)不应再注入 guidance(history 已含)"
+        );
+    });
 }
 
 #[test]
@@ -2117,26 +2129,30 @@ fn apply_patch_chat_path_guidance_idempotent_across_turns() {
     // 防止 merge_consecutive_system_messages 把 adapter-injected guidance
     // 跟 Codex instructions 拼到一起后,反复 convert 时被重复累积(连发 3 个
     // turn,每 turn 转换出的 messages 里仍只含 1 段 guidance)。
-    let one_turn = json!({
-        "input": [{"type": "message", "role": "user", "content": "edit"}],
-        "instructions": "You are helpful.",
-        "tools": [{
-            "type": "custom",
-            "name": "apply_patch",
-            "description": "edit"
-        }]
+    // #262 BUG-004: 持英文 lang 确保 marker 字面 + 串行(否则中文 inject 不被 EN
+    // marker count 算 → count=0,assertion=1 失败)。
+    with_user_language("en", || {
+        let one_turn = json!({
+            "input": [{"type": "message", "role": "user", "content": "edit"}],
+            "instructions": "You are helpful.",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "edit"
+            }]
+        });
+        for _ in 0..3 {
+            let out = convert(one_turn.clone());
+            let guidance_count = out["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap_or_default())
+                .filter(|c| c.contains("apply_patch chat-path guidance"))
+                .count();
+            assert_eq!(guidance_count, 1, "每次 convert 仅注入一次 guidance");
+        }
     });
-    for _ in 0..3 {
-        let out = convert(one_turn.clone());
-        let guidance_count = out["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m["content"].as_str().unwrap_or_default())
-            .filter(|c| c.contains("apply_patch chat-path guidance"))
-            .count();
-        assert_eq!(guidance_count, 1, "每次 convert 仅注入一次 guidance");
-    }
 }
 
 #[test]
@@ -3452,4 +3468,116 @@ fn effort_string_form_also_extracted() {
     )
     .unwrap();
     assert_eq!(out["reasoning_effort"], "max");
+}
+
+// ── #262: prompt i18n tests ──────────────────────────────────────────
+
+/// 串行化 i18n 测试 — 共享全局 USER_LANGUAGE state 不能并发跑。
+///
+/// Devin BUG-003 fix:跟 [`crate::core::language::TEST_I18N_LOCK`] 共用同一把
+/// 锁,跨模块 serialize 同一全局 `USER_LANGUAGE`。原版每模块独立 mutex 无法
+/// serialize cargo test 跨模块的并发,会 race。
+use crate::core::language::TEST_I18N_LOCK as LANG_TEST_LOCK;
+
+fn with_user_language<F: FnOnce()>(lang: &str, f: F) {
+    let _guard = LANG_TEST_LOCK.lock().unwrap();
+    crate::core::language::set_user_language(lang);
+    f();
+    crate::core::language::set_user_language("en");
+}
+
+fn first_turn_request_with_apply_patch() -> Value {
+    json!({
+        "instructions": "test",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        "tools": [{"type": "custom", "name": "apply_patch"}],
+    })
+}
+
+#[test]
+fn apply_patch_guidance_injected_in_english_by_default() {
+    with_user_language("en", || {
+        let out = convert(first_turn_request_with_apply_patch());
+        let messages = out["messages"].as_array().unwrap();
+        // messages[0] = instructions, messages[1] = apply_patch guidance
+        let guidance = messages[1]["content"].as_str().unwrap();
+        assert!(
+            guidance.contains("[apply_patch chat-path guidance"),
+            "EN guidance header missing"
+        );
+        assert!(
+            guidance.contains("ALWAYS use the `apply_patch` tool"),
+            "EN guidance body missing"
+        );
+        assert!(
+            !guidance.contains("务必使用"),
+            "EN guidance must not contain ZH text"
+        );
+    });
+}
+
+#[test]
+fn apply_patch_guidance_injected_in_chinese_when_language_zh() {
+    with_user_language("zh-CN", || {
+        let out = convert(first_turn_request_with_apply_patch());
+        let guidance = out["messages"][1]["content"].as_str().unwrap();
+        assert!(
+            guidance.contains("[apply_patch chat-path 指引"),
+            "ZH guidance header missing"
+        );
+        assert!(
+            guidance.contains("务必使用 `apply_patch` tool"),
+            "ZH guidance body missing"
+        );
+        // V4A 关键字必须保英文(Codex CLI parser 不接受翻译)
+        for keyword in &[
+            "*** Begin Patch",
+            "*** Update File:",
+            "*** Add File:",
+            "*** Delete File:",
+            "*** Move to:",
+            "*** End of File",
+            "@@ <header>",
+            "apply_patch",
+        ] {
+            assert!(
+                guidance.contains(keyword),
+                "ZH guidance must keep V4A keyword `{keyword}` in English"
+            );
+        }
+        // 错误消息必须保英文(Codex CLI 抛的就是英文 + user grep 用)
+        for msg in &[
+            "Failed to find context",
+            "is not a valid hunk header",
+            "invalid patch: The first line of the patch must be '*** Begin Patch'",
+            "Update file hunk for path",
+        ] {
+            assert!(
+                guidance.contains(msg),
+                "ZH guidance must keep error message `{msg}` in English"
+            );
+        }
+    });
+}
+
+#[test]
+fn apply_patch_guidance_zh_covers_all_nine_rules() {
+    with_user_language("zh", || {
+        let out = convert(first_turn_request_with_apply_patch());
+        let guidance = out["messages"][1]["content"].as_str().unwrap();
+        // 9 条规则编号都必须出现(防漏译)
+        for n in 1..=9 {
+            let marker = format!("{n}.");
+            assert!(
+                guidance.contains(&marker),
+                "ZH guidance must cover rule {n} (marker `{marker}` missing)"
+            );
+        }
+        // 引言段强调词翻译完整
+        assert!(
+            guidance.contains("务必使用"),
+            "missing **ALWAYS** equivalent"
+        );
+        assert!(guidance.contains("绝不"), "missing **NEVER** equivalent");
+    });
 }

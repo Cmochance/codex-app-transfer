@@ -64,6 +64,14 @@ fn main() {
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
 
+            // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
+            // startup 后第一个 user 请求的 prompt 注入就是正确语言。后续 user
+            // 切语言由 `save_settings` 内的 hot reload(同模块 fn)处理。
+            if let Ok(cfg) = handlers::settings::load_registry_for_startup_language_sync() {
+                let settings = cfg.get("settings").cloned().unwrap_or_else(|| serde_json::json!({}));
+                handlers::settings::sync_user_language_from_settings(&settings);
+            }
+
             // Deep link scheme handler:codex-app-transfer://v1/import?...
             // 转发 URL 给前端 codexMcpHandleDeeplink() 弹 confirmation modal。
             let app_handle_for_deeplink = app.handle().clone();

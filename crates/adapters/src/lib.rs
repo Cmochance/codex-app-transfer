@@ -12,7 +12,10 @@
 //! 为 0 复制 / 0 缓冲。Stage 3.2 起的 SSE 状态机适配器会重写这条流。
 
 pub mod anthropic_messages;
-pub(crate) mod core;
+/// `core` 内部模块,**仅** `language` 子模块对外暴露(#262 让 src-tauri 同步
+/// user 语言到 adapters 全局)。其它子模块 (`events` / `input` / `routes`)
+/// 仍是 crate-private — language 的 pub-mod 表现在 [`core::language`] level。
+pub mod core;
 pub mod gemini_cli;
 pub mod gemini_native;
 pub mod grok_web;

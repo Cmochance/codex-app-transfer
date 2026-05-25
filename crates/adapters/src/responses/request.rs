@@ -2338,8 +2338,8 @@ use tools::{
     APPLY_PATCH_TOOL_NAME,
 };
 
-/// chat-path 实战指引,作为独立 `role:"system"` 注入,仅在该 turn 的 tools
-/// 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试。
+/// chat-path 实战指引(英文版),作为独立 `role:"system"` 注入,仅在该 turn 的
+/// tools 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试。
 ///
 /// **本版本(round 4 capture 实证根因修复)** :
 /// 旧版第 1 条"Use an EMPTY LINE as the `@@` anchor"是事实错误 — 上游
@@ -2352,7 +2352,13 @@ use tools::{
 ///   2. 显式说明 `@@` 单端语法 + 给出 `@@ class X` / `@@ def f():` 示例
 ///   3. 加 Add File 必须每行 `+` 前缀的强调
 ///   4. 加 "If Update repeatedly fails, fall back to Delete + Add File" 兜底
-const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
+///
+/// **i18n**(#262):中文 user 输入 → 注入英文 system 易让模型中英混杂思考。
+/// 提供 [`APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH`] 中文翻译;V4A 关键字
+/// (`*** Begin Patch` / `@@ <header>` / `-line` / `+line` 等)+ 错误消息原文
+/// (`Failed to find context '...'` 等)+ shell 命令例子保英文,因 Codex CLI
+/// V4A parser / error matcher 接收的就是英文字面。
+const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
     "\n",
     "**ALWAYS use the `apply_patch` tool to write file content** — new files, single-line edits, and full-file rewrites alike. **NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. (The narrow exception in rule 5 below — `printf '\\n' > <path>` to seed an empty file before `*** Update File:` — is an apply_patch preparation step, not a content bypass.) For full-file rewrites or large changes where almost every line differs, use `*** Delete File: <path>` followed by `*** Add File: <path>` (every line of the new content prefixed with `+`) inside the same patch — this is more concise than a long `-`/`+` diff and is the correct apply_patch idiom for large rewrites.\n",
@@ -2390,10 +2396,74 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE: &str = concat!(
     "Following these rules avoids retry storms and improves the success rate on first attempt."
 );
 
+/// 中文版 apply_patch chat-path 指引(#262)。
+///
+/// **翻译原则**:
+/// - V4A 关键字保英文:`*** Begin Patch` / `*** Update File:` / `*** Add File:` /
+///   `*** Delete File:` / `*** Move to:` / `*** End of File` / `@@ <header>` /
+///   `-line` / `+line` / ` line`(context)— Codex CLI V4A parser 只认英文字面
+/// - 错误消息保英文:`Failed to find context '...'` / `is not a valid hunk header` /
+///   `invalid patch: The first line of the patch must be '*** Begin Patch'` /
+///   `Update file hunk for path '...' is empty` — Codex CLI 抛出的就是英文,
+///   翻成中文会让 user / 模型 grep 错错误信息
+/// - shell 命令例子保英文:`cat`, `sed`, `printf`, `echo` 等命令名,文件路径
+///   例子(`src/config.py` / `<path>`)
+/// - 程序员日常英文术语保英文:`apply_patch` / `tool` / `shell` / `hunk` /
+///   `context` / `patch` / `function` 等(混入中文反而不自然)
+/// - 强调词译:**ALWAYS** → **务必**;**NEVER** → **绝不**;**MUST** → **必须**;
+///   PREFERRED → 推荐;SINGLE-SIDED → 单端;DEEPLY NESTED → 深层嵌套
+/// - 跟英文版**逐条对应**(9 条规则 + 引言段),不简化不漏 emphasis
+const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
+    "[apply_patch chat-path 指引 — 由 codex-app-transfer adapter 注入,因为上游 lark 语法约束在 chat function-call provider 上不可用]\n",
+    "\n",
+    "**务必使用 `apply_patch` tool 写文件内容** —— 新建文件、单行编辑、整文件重写都一样。**绝不使用 shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / 任何 `>` 重定向来写实际文件内容** —— 这样做会绕过 Codex diff UI 和审计 trail。(下面规则 5 提到的窄例外 — `printf '\\n' > <path>` 在 `*** Update File:` 之前播种空文件 — 是 apply_patch 的预处理步骤,不是内容旁路。)对于整文件重写或几乎每行都不同的大改动,在同一 patch 内用 `*** Delete File: <path>` 加上 `*** Add File: <path>`(新内容每行前缀 `+`)—— 这比长 `-`/`+` diff 更精简,是大重写的正确 apply_patch 用法。\n",
+    "\n",
+    "调用 `apply_patch` tool 时,遵循以下基于非 OpenAI chat provider 实战观察总结的规则:\n",
+    "\n",
+    "1. 推荐的 Update File 形式是**最简形态**:仅 `-line`(要删的行,byte-exact)和 `+line`(新行)直接跟在 `*** Update File: <path>` 之后 —— 无 `@@`、无 context 行。",
+    "凡是 `-` 行在文件里**唯一**时(简单单行编辑、配置改动、function 签名等绝大多数场景皆是)就用这个形态。例:\n",
+    "  *** Update File: src/config.py\n",
+    "  -DEBUG = False\n",
+    "  +DEBUG = True\n",
+    "若 `-` 行单独**有歧义**(同一行文本在文件多处出现),在上方/下方加空格前缀的 context 行(` line`)钉住它。",
+    "若 context 行也不足以消歧,再在独立行上加**单端** `@@ <header>` 标记(`@@ class Foo`、`@@ def bar():`、`@@ fn main() {`)。",
+    "**绝不加尾随 `@@`**(`@@ <header> @@` 是错的)—— Codex Desktop 的 V4A applier 会把尾随 `@@` 当字面文本,报 `Failed to find context '... @@'`。",
+    "深层嵌套消歧时用**多个** `@@` 行各占一行(例如 `@@ class Outer\\n@@ def inner():`),每条都是单端。\n",
+    "\n",
+    "2. Add File **不用** `@@` 标记、**不用** hunk。`*** Add File: <path>` 之后,新文件**每一行**(包括空行,写成单个 `+` 占一行)都前缀 `+`。没 `+` 前缀的原始源码(例如直接写 `def main():`)会触发 `'def main():' is not a valid hunk header` 错误。\n",
+    "\n",
+    "3. 每个 `-` 行和空格前缀的 context 行**必须**跟文件 byte-for-byte 一致(同样的前导 whitespace,不能 trim 尾随空格,字符完全相同)。不确定时先用 shell 跑 `cat <path>` 或 `sed -n '1,80p' <path>` 查一下,再用真实字节组 patch。靠猜会触发 `Failed to find context '<your guess>'` 错误。\n",
+    "\n",
+    "3a. 行前缀是**单字符**,前缀和内容之间**没有空格**:写 `-DEBUG = False`(不是 `- DEBUG = False`)、`+DEBUG = True`(不是 `+ DEBUG = True`),context 行 ` keepme`(单个前导空格)。Codex Desktop V4A applier 可能容忍多余空格,但其它 apply_patch 实现严格 —— 前缀写紧凑。\n",
+    "\n",
+    "4. **不要**在同一 patch 内对同一路径同时用 `*** Add File: <path>` 和 `*** Update File: <path>`。Update 步骤会在 Add 步骤落盘前读文件,看到空文件后失败。要么 (a) 让 `*** Add File:` 一次性写最终内容,要么 (b) 拆成两个独立的 `apply_patch` 调用。\n",
+    "\n",
+    "5. `*** Update File:` **不能**作用于完全空的文件。目标为空时先用 shell(例如 `printf '\\n' > <path>`)写至少一行,再调 `apply_patch`。\n",
+    "\n",
+    "6. 多行文件里,**没有**对应 `-` 行的孤立 `+` 行会**追加**在上文 context 之下 —— **不会**替换任何已有行。要修改已有行,**必须**同时包含 `-` 行(删旧内容)和 `+` 行(加新内容)。\n",
+    "\n",
+    "7. 同一目标上多次 Update File 都报 `Failed to find context` 错误时,fallback 到同一 patch 内的 Delete File + Add File 组合(语义上等价于整文件重写,绕开 anchor 匹配的脆弱性)。\n",
+    "\n",
+    "8. `*** Begin Patch` **必须**是 `input` 字符串的字面第一行 —— 不能有前导空格,前面不能有其它内容,绝不能直接写 `*** Add File:` 或任何操作 header。漏了会触发 `invalid patch: The first line of the patch must be '*** Begin Patch'`。\n",
+    "\n",
+    "9. `*** Update File: <old>` + `*** Move to: <new>` **要求**至少一个 hunk(带 `-`/`+` 行或 `*** End of File` 标记)。空的 Update+Move 块会报 `Update file hunk for path '<old>' is empty`。**纯重命名不改内容**时,在同一 patch 内用 `*** Delete File: <old>` + `*** Add File: <new>`(把原内容每行前缀 `+` 复制过去)。**重命名同时改内容**时,保留 Update+Move 并写真实的 `-`/`+` hunk。\n",
+    "\n",
+    "遵循这些规则可以避免 retry 风暴,提升首次尝试的成功率。"
+);
+
+/// 按当前 user 语言偏好选 apply_patch chat-path 指引。
+fn apply_patch_chat_path_guidance_for_current_language() -> &'static str {
+    use crate::core::language::{current_language, Language};
+    match current_language() {
+        Language::Chinese => APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH,
+        Language::English => APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN,
+    }
+}
+
 /// 检测 Responses request body 的 tools 数组是否注册了 `apply_patch` 工具。
 /// `apply_patch` 在 Responses 协议里以 `type:"custom", name:"apply_patch"` 出现,
 /// 在被 [`convert_responses_tool_to_chat_tool`] 降级前。
-/// 用于决定本 turn 是否注入 [`APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE`]。
+/// 用于决定本 turn 是否注入 [`apply_patch_chat_path_guidance_for_current_language`] 的产物。
 fn tools_register_apply_patch(body: &Value) -> bool {
     let Some(tools) = body.get("tools").and_then(Value::as_array) else {
         return false;
@@ -2407,6 +2477,6 @@ fn tools_register_apply_patch(body: &Value) -> bool {
 fn apply_patch_chat_guidance_message() -> Value {
     json!({
         "role": "system",
-        "content": APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE,
+        "content": apply_patch_chat_path_guidance_for_current_language(),
     })
 }

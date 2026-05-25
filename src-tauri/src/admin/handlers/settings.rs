@@ -387,9 +387,31 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
         Ok(ConfigMutation::Modified(settings))
     });
     match result {
-        Ok(settings) => Json(json!({"success": true, "settings": settings})).into_response(),
+        Ok(settings) => {
+            // #262:settings.language 改动后 hot reload 到 adapters 全局,
+            // 让接下来的 prompt 注入跟新语言一致(用户切语言无需重启 transfer)。
+            sync_user_language_from_settings(&settings);
+            Json(json!({"success": true, "settings": settings})).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+/// #262:把 `settings.language` 同步到 adapters 全局 [`codex_app_transfer_adapters::core::language`]。
+/// caller 路径:save_settings 后 + main.rs startup 加载 settings 时各调一次。
+pub fn sync_user_language_from_settings(settings: &Value) {
+    let lang = settings
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("en");
+    codex_app_transfer_adapters::core::language::set_user_language(lang);
+}
+
+/// #262 startup helper:让 `main.rs setup` 不依赖私有 `load_registry` import,
+/// 单独暴露一个跟 startup 路径绑定的 wrapper(失败 silent ok — language sync
+/// 是 UI 偏好,不该 block 启动)。
+pub fn load_registry_for_startup_language_sync() -> Result<Value, String> {
+    load_registry()
 }
 
 // ── /api/config/* ────────────────────────────────────────────────────
@@ -439,6 +461,16 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
     });
     if let Err(e) = result {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    // #262 Devin BUG-002 fix:import_config 替换整 config 也可能改 settings.language,
+    // 必须同步 adapters 全局,否则 import 后 prompt 注入仍跟 import 前的语言一致
+    // (silent failure)。失败 silent ok — language sync 是 UI 偏好不该 block import。
+    if let Ok(reloaded) = load_registry() {
+        let settings = reloaded
+            .get("settings")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        sync_user_language_from_settings(&settings);
     }
     Json(json!({
         "success": true,
