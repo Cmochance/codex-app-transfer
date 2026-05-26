@@ -5493,7 +5493,13 @@
     rootEl._casOnChange = onChange;
     const toggle = rootEl.querySelector(".cas-dropdown-toggle");
     const menu = rootEl.querySelector(".cas-dropdown-menu");
-    toggle?.addEventListener("click", (e) => {
+    // devin #272 silent-failure-hunter fix: 必有子节点才绑;缺则 log + abort
+    // 否则点击时 menu.hidden 抛 TypeError 静默(devtools 关 user 看不到)
+    if (!toggle || !menu) {
+      console.error("cas-dropdown missing required child .cas-dropdown-toggle / .cas-dropdown-menu", rootEl);
+      return;
+    }
+    toggle.addEventListener("click", (e) => {
       e.stopPropagation();
       const isOpen = !menu.hidden;
       casDropdownCloseAll();
@@ -5522,7 +5528,7 @@
       li.dataset.value = opt.value;
       li.textContent = opt.label;
       if (opt.title) li.title = opt.title;
-      li.setAttribute("role", "option");
+      li.setAttribute("role", "menuitem");
       menu.appendChild(li);
     }
     // 当前 data-value 在新 options 里找不到时 → fallback 到第一个
@@ -5592,13 +5598,16 @@
 
   const CAS_CONV_DEFAULT_DIR_KEY = "cas.conv.defaultExportDir";
   function codexConvLoadDefaultDir() {
-    try { return localStorage.getItem(CAS_CONV_DEFAULT_DIR_KEY) || ""; } catch { return ""; }
+    try { return localStorage.getItem(CAS_CONV_DEFAULT_DIR_KEY) || ""; }
+    catch (e) { console.warn("cas: localStorage read failed for default-dir", e); return ""; }
   }
   function codexConvSaveDefaultDir(dir) {
     try {
       if (dir) localStorage.setItem(CAS_CONV_DEFAULT_DIR_KEY, dir);
       else localStorage.removeItem(CAS_CONV_DEFAULT_DIR_KEY);
-    } catch {}
+    } catch (e) {
+      console.warn("cas: localStorage write failed for default-dir", e);
+    }
   }
   function codexConvSyncDefaultDirUI() {
     const input = $("#codexConvDefaultDir");
@@ -5627,7 +5636,8 @@
       codexConvSyncDefaultDirUI();
       showToast(tFmt("codex.conv.defaultDirSet", { path: dir }));
     } catch (e) {
-      showToast(`${t("codex.conv.exportFailed") || "失败"}: ${e.message || e}`);
+      // devin #272 silent-failure-hunter MED-2: picker 失败不用 exportFailed 错误措辞
+      showToast(`${t("codex.conv.defaultDirPickFailed") || "选择目录失败"}: ${e.message || e}`);
     }
   }
   function codexConvClearDefaultDir() {
@@ -5993,11 +6003,12 @@
       const safeUrl = url.replace(/"/g, "%22");
       return `<a href="${safeUrl}" target="_blank" rel="noreferrer noopener">${text}</a>`;
     });
-    // bold **text**
-    s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-    // italic *text* / _text_(避开 ** 已处理后剩下的孤立 *)
-    s = s.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
-    s = s.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+    // bold **text** (non-greedy 防 `**a** **b**` 折叠成一段)
+    s = s.replace(/\*\*([^*\n]+?)\*\*/g, "<strong>$1</strong>");
+    // italic *text* / _text_(避开 ** 已处理后剩下的孤立 * + non-greedy
+    // 让 `*a* and *b*` 渲染成两个 em 而非一段;devin #272 code-reviewer fix)
+    s = s.replace(/(^|[\s(])\*([^*\n]+?)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+    s = s.replace(/(^|[\s(])_([^_\n]+?)_(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
     // restore inline code
     // **devin #272 review fix**:inlineCodes 里的 content 是从 `escapeHtml(text)`
     // 输出的串里捕获的,已经是 escape 后的形态(`&lt;` `&amp;` 等)。再 escape
@@ -6073,8 +6084,17 @@
         const text = await resp.text();
         throw new Error(text || `HTTP ${resp.status}`);
       }
-      const data = await resp.json();
-      showToast(tFmt("codex.conv.toastExportedTo", { count: ids.length, path: data.path }));
+      // devin #272 silent-failure-hunter HIGH-5: 按 Content-Type 分支,backend
+      // 在传 targetPath 时返 JSON,否则返二进制 body — 之前无脑 .json() 会
+      // 把成功的二进制下载误判成"导出失败"
+      const ct = resp.headers.get("content-type") || "";
+      if (ct.includes("application/json")) {
+        const data = await resp.json();
+        showToast(tFmt("codex.conv.toastExportedTo", { count: ids.length, path: data.path }));
+      } else {
+        // HTTP body 下载分支(未指定 targetPath)— 浏览器 Content-Disposition 自动落盘
+        showToast(tFmt("codex.conv.toastExported", { count: ids.length }));
+      }
     } catch (e) {
       showToast(`${t("codex.conv.exportFailed") || "导出失败"}: ${e.message || e}`);
     }
@@ -6098,10 +6118,18 @@
       }
       const data = await resp.json();
       const moved = (data.deleted || []).length;
-      const failed = (data.failed || []).length;
+      const failedItems = data.failed || [];
+      const failed = failedItems.length;
       conversationsSelected.clear();
       if (failed > 0) {
         showToast(tFmt("codex.conv.toastDeletedPartial", { moved, failed }));
+        // devin #272 silent-failure-hunter MED-7: 暴露失败 reason 给用户而非
+        // 只显示计数 — log + 弹 alert 列前 3 条让用户能 actionable
+        console.warn("cas: delete failures", failedItems);
+        const sample = failedItems.slice(0, 3)
+          .map((f) => `  - ${f.sessionId}: ${f.reason}`).join("\n");
+        const more = failed > 3 ? `\n  ... +${failed - 3} more (see console)` : "";
+        window.alert(`${t("codex.conv.deleteFailureDetail") || "部分删除失败"}:\n${sample}${more}`);
       } else {
         showToast(tFmt("codex.conv.toastDeleted", { count: moved }));
       }
@@ -6191,8 +6219,8 @@
       setBadge("#codexSidebarBadge-mcp", mcpTotal > 0 ? String(mcpTotal) : "—");
       setBadge("#codexSidebarBadge-skills", skillsCount > 0 ? String(skillsCount) : "—");
       setBadge("#codexSidebarBadge-conversations", convCount > 0 ? String(convCount) : "—");
-    } catch {
-      // best-effort, 静默
+    } catch (e) {
+      console.warn("cas: sidebar badges fetch failed", e);
     }
   }
 

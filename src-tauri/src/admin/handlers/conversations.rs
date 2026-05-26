@@ -25,9 +25,16 @@ use crate::admin::handlers::common::err;
 /// **single-shot 用**(detail 端点 1 个 id)。**批量场景**(export N 个 ids)
 /// 必须用 [`build_session_index_map`] 一次扫 + HashMap 查,否则 N 次
 /// list_sessions 是 O(N×M) 全目录扫(devin #272 review fix)。
-fn find_session_path(id: &str, codex_home: &std::path::Path) -> Option<PathBuf> {
-    let sessions = cexp::list_sessions(codex_home).ok()?;
-    sessions.into_iter().find(|s| s.id == id).map(|s| s.path)
+///
+/// `Ok(None)` = 真没找到该 id;`Err(_)` = list_sessions 失败(IO / perm)。
+/// 之前用 `.ok()?` 把两者糊在一起 → 真正的目录读权限错被报成 404 "not found",
+/// 用户去找不存在的问题(devin #272 silent-failure-hunter fix)。
+fn find_session_path(
+    id: &str,
+    codex_home: &std::path::Path,
+) -> Result<Option<PathBuf>, cexp::ExportError> {
+    let sessions = cexp::list_sessions(codex_home)?;
+    Ok(sessions.into_iter().find(|s| s.id == id).map(|s| s.path))
 }
 
 /// 构建 `session_id → path` 索引,**只扫一次目录**。批量端点 export 用,
@@ -69,11 +76,30 @@ pub async fn detail_handler(Path(id): Path<String>) -> impl IntoResponse {
         Ok(p) => p,
         Err(r) => return r,
     };
-    let Some(path) = find_session_path(&id, &codex_home) else {
-        return err(StatusCode::NOT_FOUND, format!("session not found: {id}")).into_response();
+    let path = match find_session_path(&id, &codex_home) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return err(StatusCode::NOT_FOUND, format!("session not found: {id}")).into_response()
+        }
+        Err(e) => {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
     };
     match cexp::parse_session(&path) {
-        Ok(s) => Json(s).into_response(),
+        Ok(mut s) => {
+            // **devin #272 code-reviewer fix**:detail 同样从 session_index.jsonl
+            // 注入 thread_name,跟 list view 一致(否则用户在 list 看 "分析数据",
+            // 点开变 "cwd-basename (019df883)" 像换了 session)
+            if let Some(ref mut meta) = s.meta {
+                if meta.title.is_none() {
+                    let titles = cexp::read_session_index_titles(&codex_home);
+                    if let Some(name) = titles.get(&meta.id).cloned() {
+                        meta.title = Some(name);
+                    }
+                }
+            }
+            Json(s).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -134,17 +160,39 @@ pub async fn export_handler(Json(req): Json<ExportRequest>) -> impl IntoResponse
             Err(e) => return e,
         }
     } else {
+        // devin #272 silent-failure-hunter MED-6: 批量场景下单个 id 缺失不再
+        // 整批 abort,跟 delete_handler 的 partial 语义一致;skipped 收集到
+        // 单独列表,后续打进 response(target_path 模式的 JSON,或 zip 里附
+        // skipped.txt 文件)
         let mut buf = std::io::Cursor::new(Vec::<u8>::new());
         let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(req.session_ids.len());
+        let mut skipped: Vec<String> = Vec::new();
         for id in &req.session_ids {
             let Some(path) = index.get(id) else {
-                return err(StatusCode::NOT_FOUND, format!("session not found: {id}"))
-                    .into_response();
+                skipped.push(id.clone());
+                continue;
             };
             match render_one(path, format, &req.options) {
                 Ok((bytes, name, _mime)) => entries.push((sanitize_filename(&name), bytes)),
-                Err(e) => return e,
+                Err(_) => skipped.push(id.clone()),
             }
+        }
+        if entries.is_empty() {
+            return err(
+                StatusCode::NOT_FOUND,
+                format!("all {} sessions failed; none in index", skipped.len()),
+            )
+            .into_response();
+        }
+        if !skipped.is_empty() {
+            entries.push((
+                "skipped.txt".to_string(),
+                format!(
+                    "Sessions skipped during export (not found / render failed):\n{}\n",
+                    skipped.join("\n")
+                )
+                .into_bytes(),
+            ));
         }
         if let Err(e) = cexp::write_bulk_zip(&mut buf, entries) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -159,22 +207,67 @@ pub async fn export_handler(Json(req): Json<ExportRequest>) -> impl IntoResponse
     // target_path 给了 → 服务端写盘 + 返回 JSON;没给 → 老路径 HTTP body 下载
     if let Some(target) = req.target_path.as_deref().filter(|s| !s.trim().is_empty()) {
         let target_path = std::path::PathBuf::from(target);
+        // **devin #272 code-reviewer fix #2 (security)**:
+        // 1. 必须绝对路径(避免 cwd 相对引用 leak 到不可预期位置)
+        // 2. 禁含 `..` 组件(防 path traversal)
+        // 3. 父目录**必须已存在**,不自动 create_dir_all(让用户预先 dialog 挑过
+        //    的目录写入是正常 case;静默建目录把整套 CSRF-style 攻击面打开)
+        if !target_path.is_absolute() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "targetPath must be absolute".to_string(),
+            )
+            .into_response();
+        }
+        if target_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "targetPath must not contain `..` segments".to_string(),
+            )
+            .into_response();
+        }
         if let Some(parent) = target_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    return err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to create parent dir: {e}"),
-                    )
-                    .into_response();
-                }
+            if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "parent directory does not exist: {} — pick a valid folder first",
+                        parent.display()
+                    ),
+                )
+                .into_response();
             }
         }
+        // **devin #272 silent-failure-hunter fix (HIGH-4)**:原子写入避免部分写
+        // 留下半截文件 — write to `<name>.part` 再 rename 同 fs 原子。
+        let tmp_path = target_path.with_extension({
+            let mut s = target_path
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !s.is_empty() {
+                s.push('.');
+            }
+            s.push_str("part");
+            s
+        });
         let bytes_len = bytes.len();
-        if let Err(e) = std::fs::write(&target_path, &bytes) {
+        if let Err(e) = std::fs::write(&tmp_path, &bytes) {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to write {}: {e}", target_path.display()),
+                format!("failed to write {}: {e}", tmp_path.display()),
+            )
+            .into_response();
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &target_path) {
+            // best-effort 清理 part 文件
+            let _ = std::fs::remove_file(&tmp_path);
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to finalize {}: {e}", target_path.display()),
             )
             .into_response();
         }
@@ -228,8 +321,16 @@ fn render_one(
                 )),
                 "json" => {
                     let v = cexp::export_json(&session, opts);
-                    let bytes = serde_json::to_vec_pretty(&v).unwrap_or_default();
-                    Ok((bytes, format!("{base_name}.json"), "application/json"))
+                    // devin #272 silent-failure-hunter HIGH-3: 序列化失败必须
+                    // 报 500,不能 unwrap_or_default 写 0 字节假装成功
+                    match serde_json::to_vec_pretty(&v) {
+                        Ok(bytes) => Ok((bytes, format!("{base_name}.json"), "application/json")),
+                        Err(e) => Err(err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("json serialize failed: {e}"),
+                        )
+                        .into_response()),
+                    }
                 }
                 _ => unreachable!("validated above"),
             }
@@ -258,12 +359,17 @@ pub async fn delete_handler(Json(req): Json<DeleteRequest>) -> impl IntoResponse
         .into_response();
     }
     match cexp::move_sessions_to_trash(&codex_home, &req.session_ids) {
-        Ok(result) => Json(serde_json::json!({
-            "success": true,
-            "deleted": result.deleted,
-            "failed": result.failed,
-        }))
-        .into_response(),
+        Ok(result) => {
+            // devin #272 silent-failure-hunter MED-7: 全部失败时 success=false
+            // (而不是 success=true + 空 deleted),前端能据此弹错误而非"部分成功"
+            let success = !result.deleted.is_empty();
+            Json(serde_json::json!({
+                "success": success,
+                "deleted": result.deleted,
+                "failed": result.failed,
+            }))
+            .into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

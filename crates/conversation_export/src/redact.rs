@@ -27,6 +27,10 @@ fn redact_prefix<'a>(input: Cow<'a, str>, prefix: &str, min_tail: usize) -> Cow<
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
+    // devin #272 code-reviewer fix #5: 跟 redact_bearer/redact_jwt 一致,
+    // 只有真发生 redact 才返 Owned;含 `sk-1`(短不达 min_tail)/含 `cas_` 但
+    // 后续 token 太短的情况不 alloc,守住 zero-copy 文档承诺。
+    let mut did_redact = false;
     while i < bytes.len() {
         if input[i..].starts_with(prefix) {
             let start = i;
@@ -42,6 +46,7 @@ fn redact_prefix<'a>(input: Cow<'a, str>, prefix: &str, min_tail: usize) -> Cow<
             if j - start - prefix.len() >= min_tail {
                 out.push_str("[REDACTED]");
                 i = j;
+                did_redact = true;
                 continue;
             }
         }
@@ -50,7 +55,11 @@ fn redact_prefix<'a>(input: Cow<'a, str>, prefix: &str, min_tail: usize) -> Cow<
         out.push_str(&input[i..ch_end]);
         i = ch_end;
     }
-    Cow::Owned(out)
+    if did_redact {
+        Cow::Owned(out)
+    } else {
+        input
+    }
 }
 
 fn redact_bearer<'a>(input: Cow<'a, str>) -> Cow<'a, str> {
