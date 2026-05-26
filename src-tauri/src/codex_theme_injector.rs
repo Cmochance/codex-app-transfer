@@ -375,7 +375,7 @@ async fn run_reload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut write, mut read) = ws_stream.split();
     let (msg, _) = make_msg(1, "Page.reload", json!({ "ignoreCache": true }));
     write.send(WsMessage::Text(msg)).await?;
-    drain_one(&mut read).await;
+    drain_until_response(&mut read, 1).await?;
     let _ = write.close().await;
     Ok(())
 }
@@ -417,7 +417,7 @@ async fn run_apply(
     // 1. enable Page domain(addScriptToEvaluateOnNewDocument 需要)
     let (msg, _) = make_msg(1, "Page.enable", json!({}));
     write.send(WsMessage::Text(msg)).await?;
-    drain_one(&mut read).await;
+    drain_until_response(&mut read, 1).await?;
 
     // 2. addScriptToEvaluateOnNewDocument — 每次 page navigate / reload 自动跑
     let script = build_inject_script(theme_id, assets);
@@ -427,7 +427,7 @@ async fn run_apply(
         json!({ "source": script }),
     );
     write.send(WsMessage::Text(msg)).await?;
-    drain_one(&mut read).await;
+    drain_until_response(&mut read, 2).await?;
 
     // 3. Runtime.evaluate — 立即在当前 page 跑一次(addScriptToEvaluateOnNewDocument
     //    只对**未来**的 navigation 生效,当前 page 需要单独 evaluate)
@@ -437,7 +437,7 @@ async fn run_apply(
         json!({ "expression": script, "returnByValue": true }),
     );
     write.send(WsMessage::Text(msg)).await?;
-    drain_one(&mut read).await;
+    drain_until_response(&mut read, 3).await?;
 
     let _ = write.close().await;
     Ok(())
@@ -455,7 +455,7 @@ async fn run_clear() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         json!({ "expression": script, "returnByValue": true }),
     );
     write.send(WsMessage::Text(msg)).await?;
-    drain_one(&mut read).await;
+    drain_until_response(&mut read, 1).await?;
 
     let _ = write.close().await;
     Ok(())
@@ -501,13 +501,59 @@ fn make_msg(id: u64, method: &str, params: Value) -> (String, u64) {
     (body, id)
 }
 
-/// drain 一帧 — `addScriptToEvaluateOnNewDocument` / `Runtime.evaluate` 的响应
-/// 直接丢弃,我们不解析(theme inject 没有"成功/失败" 二态需要识别,只要 CDP
-/// 没报错 frame 就行)。带 1s 超时避免永久阻塞。
-async fn drain_one(
+/// drain CDP messages until we receive the response with the matching `expected_id`.
+/// CDP 可能先发 event(无 `id` 字段)再发 response,所以必须 loop 跳过 event。
+/// 检查 response 的 `error` 字段,有错就返 Err。
+/// overall_timeout = 8s,每条 read 最多等 500ms。
+async fn drain_until_response(
     read: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
-) {
-    let _ = tokio::time::timeout(Duration::from_secs(2), read.next()).await;
+    expected_id: u64,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!("CDP response timeout for id={}", expected_id));
+        }
+        match tokio::time::timeout(Duration::from_millis(500), read.next()).await {
+            Ok(Some(Ok(WsMessage::Text(t)))) => {
+                let val: serde_json::Value = match serde_json::from_str(&t) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // event(no id) → skip
+                if val.get("id").is_none() {
+                    continue;
+                }
+                if val["id"].as_u64() != Some(expected_id) {
+                    continue;
+                }
+                if let Some(err) = val.get("error") {
+                    return Err(format!("CDP error for id={}: {}", expected_id, err));
+                }
+                if let Some(exception) = val.get("result").and_then(|r| r.get("exceptionDetails")) {
+                    return Err(format!(
+                        "CDP exception for id={}: {}",
+                        expected_id, exception
+                    ));
+                }
+                return Ok(());
+            }
+            Ok(Some(Ok(WsMessage::Binary(b)))) => {
+                let _ = b;
+                continue;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => {
+                return Err(format!("CDP read error: {}", e));
+            }
+            Ok(None) => {
+                return Err("CDP connection closed".into());
+            }
+            Err(_) => {
+                continue;
+            }
+        }
+    }
 }
 
 /// 构造注入 script — CSS variable 覆盖 + 背景图 + 可选 mascot。

@@ -6494,6 +6494,18 @@
         else badge.textContent = "";
       } else if (sObj === "Disabled") {
         badge.textContent = t("theme.disabled") || "未启用";
+        // Auto re-apply: settings say enabled + theme selected, but backend
+        // status is Disabled (e.g. after transfer app restart / Codex restart).
+        // Apply immediately so user doesn't have to manually toggle.
+        if (toggle.checked && selectedThemeId) {
+          try {
+            await CCApi.theme.apply(selectedThemeId);
+            badge.textContent = `${t("theme.applied") || "已应用"}: ${selectedThemeId}`;
+          } catch (err) {
+            console.warn("[theme] auto-re-apply failed:", err);
+            badge.textContent = `${t("theme.failed") || "失败"}: ${err.message || err}`;
+          }
+        }
       }
     } catch (e) {
       badge.textContent = "";
