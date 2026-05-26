@@ -141,7 +141,7 @@ pub fn build_app_router(state: AdminState) -> Router {
             get(handlers::conversations::list_handler),
         )
         .route(
-            "/api/conversations/:id",
+            "/api/conversations/{id}",
             get(handlers::conversations::detail_handler),
         )
         .route(
