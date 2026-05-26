@@ -66,6 +66,12 @@ pub struct ExportRequest {
     pub format: String,
     #[serde(default)]
     pub options: cexp::ExportOptions,
+    /// 可选:服务端落盘目标绝对路径。前端用 Tauri dialog.save() 让用户选好后
+    /// 传过来,backend 写入并返回 `{ success, path, bytes }`。**单条**导出
+    /// 时是文件路径;**多条**导出时也是单个 zip 文件路径(zip 内部多个 entry)。
+    /// 不传 → 走 HTTP body 返回(老路径,前端可能 fallback download)。
+    #[serde(default)]
+    pub target_path: Option<String>,
 }
 
 pub async fn export_handler(Json(req): Json<ExportRequest>) -> impl IntoResponse {
@@ -89,55 +95,76 @@ pub async fn export_handler(Json(req): Json<ExportRequest>) -> impl IntoResponse
         .into_response();
     }
 
-    // 单条 → 返回原始 body(text/json/jsonl 都按 application/octet-stream + filename header);
-    // 多条 → 打 zip + application/zip。
-    if req.session_ids.len() == 1 {
+    // 准备 bytes + filename + mime(无论是否落盘都要先 render):
+    // - 单条 → render_one 直接给一份
+    // - 多条 → 全部 render + 打 zip
+    let (bytes, default_filename, mime) = if req.session_ids.len() == 1 {
         let id = &req.session_ids[0];
         let Some(path) = find_session_path(id, &codex_home) else {
             return err(StatusCode::NOT_FOUND, format!("session not found: {id}")).into_response();
         };
-        let (bytes, filename, mime) = match render_one(&path, format, &req.options) {
+        match render_one(&path, format, &req.options) {
             Ok(t) => t,
             Err(e) => return e,
-        };
-        let safe_name = sanitize_filename(&filename);
-        let mut response = ([(header::CONTENT_TYPE, mime)], bytes).into_response();
-        response.headers_mut().insert(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{safe_name}\"")
-                .parse()
-                .unwrap(),
+        }
+    } else {
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(req.session_ids.len());
+        for id in &req.session_ids {
+            let Some(path) = find_session_path(id, &codex_home) else {
+                return err(StatusCode::NOT_FOUND, format!("session not found: {id}"))
+                    .into_response();
+            };
+            match render_one(&path, format, &req.options) {
+                Ok((bytes, name, _mime)) => entries.push((sanitize_filename(&name), bytes)),
+                Err(e) => return e,
+            }
+        }
+        if let Err(e) = cexp::write_bulk_zip(&mut buf, entries) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        let zip_name = format!(
+            "codex-conversations-{}.zip",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
         );
-        return response;
+        (buf.into_inner(), zip_name, "application/zip")
+    };
+
+    // target_path 给了 → 服务端写盘 + 返回 JSON;没给 → 老路径 HTTP body 下载
+    if let Some(target) = req.target_path.as_deref().filter(|s| !s.trim().is_empty()) {
+        let target_path = std::path::PathBuf::from(target);
+        if let Some(parent) = target_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to create parent dir: {e}"),
+                    )
+                    .into_response();
+                }
+            }
+        }
+        let bytes_len = bytes.len();
+        if let Err(e) = std::fs::write(&target_path, &bytes) {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to write {}: {e}", target_path.display()),
+            )
+            .into_response();
+        }
+        return Json(json!({
+            "success": true,
+            "path": target_path.display().to_string(),
+            "bytes": bytes_len,
+        }))
+        .into_response();
     }
 
-    // 多条 zip
-    let mut buf = std::io::Cursor::new(Vec::<u8>::new());
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(req.session_ids.len());
-    for id in &req.session_ids {
-        let Some(path) = find_session_path(id, &codex_home) else {
-            return err(StatusCode::NOT_FOUND, format!("session not found: {id}")).into_response();
-        };
-        match render_one(&path, format, &req.options) {
-            Ok((bytes, name, _mime)) => entries.push((sanitize_filename(&name), bytes)),
-            Err(e) => return e,
-        }
-    }
-    if let Err(e) = cexp::write_bulk_zip(&mut buf, entries) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    let zip_name = format!(
-        "codex-conversations-{}.zip",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    );
-    let mut response = (
-        [(header::CONTENT_TYPE, "application/zip")],
-        buf.into_inner(),
-    )
-        .into_response();
+    let safe_name = sanitize_filename(&default_filename);
+    let mut response = ([(header::CONTENT_TYPE, mime)], bytes).into_response();
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        format!("attachment; filename=\"{zip_name}\"")
+        format!("attachment; filename=\"{safe_name}\"")
             .parse()
             .unwrap(),
     );
@@ -181,6 +208,37 @@ fn render_one(
                 _ => unreachable!("validated above"),
             }
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRequest {
+    pub session_ids: Vec<String>,
+}
+
+/// `POST /api/conversations/delete` — 把选中的 rollout 文件**移到回收站**(可恢复)。
+/// 不彻底删除,用户在 Finder Trash 还能找回来。
+pub async fn delete_handler(Json(req): Json<DeleteRequest>) -> impl IntoResponse {
+    let codex_home = match codex_home_from_env() {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if req.session_ids.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "sessionIds must be non-empty".to_string(),
+        )
+        .into_response();
+    }
+    match cexp::move_sessions_to_trash(&codex_home, &req.session_ids) {
+        Ok(result) => Json(serde_json::json!({
+            "success": true,
+            "deleted": result.deleted,
+            "failed": result.failed,
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

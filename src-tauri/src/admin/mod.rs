@@ -148,6 +148,10 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/conversations/export",
             post(handlers::conversations::export_handler),
         )
+        .route(
+            "/api/conversations/delete",
+            post(handlers::conversations::delete_handler),
+        )
         // Proxy lifecycle
         .route("/api/version", get(handlers::common::version))
         .route("/api/proxy/start", post(handlers::proxy::start_proxy))

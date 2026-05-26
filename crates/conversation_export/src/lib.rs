@@ -20,12 +20,14 @@ pub mod export;
 pub mod list;
 pub mod parse;
 pub mod redact;
+pub mod trash_ops;
 pub mod types;
 
 pub use export::{export_json, export_markdown, read_raw_jsonl, write_bulk_zip};
 pub use list::{list_sessions, read_session_index_titles};
 pub use parse::parse_session;
 pub use redact::redact_secrets;
+pub use trash_ops::{move_sessions_to_trash, TrashResult};
 pub use types::{
     ExportFormat, ExportOptions, NormalizedSession, RolloutKind, SessionMeta, Turn, TurnItem,
 };

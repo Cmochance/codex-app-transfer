@@ -2812,6 +2812,10 @@
         await codexConversationsExportSelected();
         return;
       }
+      if (action === "codex-conv-delete-selected") {
+        await codexConversationsDeleteSelected();
+        return;
+      }
       if (action === "codex-conv-options") {
         codexConversationsOpenOptionsDialog();
         return;
@@ -5568,18 +5572,33 @@
   }
 
   function codexConvUpdateExportBtn() {
-    const btn = $("#codexConvExportBtn");
-    if (!btn) return;
-    btn.disabled = conversationsSelected.size === 0;
-    btn.textContent = "";
-    const icon = document.createElement("i");
-    icon.className = "bi bi-download";
-    btn.appendChild(icon);
-    const lbl = document.createElement("span");
-    lbl.textContent = conversationsSelected.size > 0
-      ? tFmt("codex.conv.exportSelectedN", { count: conversationsSelected.size })
-      : t("codex.conv.exportSelected");
-    btn.appendChild(lbl);
+    const exportBtn = $("#codexConvExportBtn");
+    const deleteBtn = $("#codexConvDeleteBtn");
+    const count = conversationsSelected.size;
+    if (exportBtn) {
+      exportBtn.disabled = count === 0;
+      exportBtn.textContent = "";
+      const icon = document.createElement("i");
+      icon.className = "bi bi-download";
+      exportBtn.appendChild(icon);
+      const lbl = document.createElement("span");
+      lbl.textContent = count > 0
+        ? tFmt("codex.conv.exportSelectedN", { count })
+        : t("codex.conv.exportSelected");
+      exportBtn.appendChild(lbl);
+    }
+    if (deleteBtn) {
+      deleteBtn.disabled = count === 0;
+      deleteBtn.textContent = "";
+      const icon = document.createElement("i");
+      icon.className = "bi bi-trash";
+      deleteBtn.appendChild(icon);
+      const lbl = document.createElement("span");
+      lbl.textContent = count > 0
+        ? tFmt("codex.conv.deleteSelectedN", { count })
+        : t("codex.conv.deleteSelected");
+      deleteBtn.appendChild(lbl);
+    }
   }
 
   async function codexConversationsOpenDetail(id) {
@@ -5622,28 +5641,151 @@
     switch (item.type) {
       case "User":
       case "user":
-        return `<div class="codex-conv-item"><div class="codex-conv-item-role">${t("codex.conv.roleUser") || "用户"}</div><div class="codex-conv-item-text">${escapeHtml(item.text || "")}</div></div>`;
+        // 用户输入通常是纯文本,但有的 IDE 会贴 markdown — 都按 md 渲染
+        return `<div class="codex-conv-item"><div class="codex-conv-item-role">${t("codex.conv.roleUser") || "用户"}</div><div class="codex-conv-item-text codex-conv-md">${renderMiniMd(item.text || "")}</div></div>`;
       case "Assistant":
       case "assistant":
-        return `<div class="codex-conv-item"><div class="codex-conv-item-role">${t("codex.conv.roleAssistant") || "助手"}</div><div class="codex-conv-item-text">${escapeHtml(item.text || "")}</div></div>`;
+        return `<div class="codex-conv-item"><div class="codex-conv-item-role">${t("codex.conv.roleAssistant") || "助手"}</div><div class="codex-conv-item-text codex-conv-md">${renderMiniMd(item.text || "")}</div></div>`;
       case "Reasoning":
       case "reasoning":
-        return `<details class="codex-conv-item"><summary>${t("codex.conv.reasoning") || "Reasoning"}</summary><div class="codex-conv-item-text">${escapeHtml(item.text || "")}</div></details>`;
+        return `<details class="codex-conv-item"><summary>${t("codex.conv.reasoning") || "Reasoning"}</summary><div class="codex-conv-item-text codex-conv-md">${renderMiniMd(item.text || "")}</div></details>`;
       case "ToolCall":
       case "toolCall":
+        // tool call 是机读 JSON/cmd,保持等宽不渲染 md
         return `<details class="codex-conv-item"><summary>🔧 ${escapeHtml(item.name || "")}</summary><div class="codex-conv-item-text codex-conv-tool">${escapeHtml(item.arguments || "")}</div></details>`;
       case "ToolOutput":
       case "toolOutput":
         return `<details class="codex-conv-item"><summary>↳ output</summary><div class="codex-conv-item-text codex-conv-tool">${escapeHtml(truncateString(item.output || "", 4000))}</div></details>`;
       case "Compacted":
       case "compacted":
-        return `<div class="codex-conv-item codex-conv-compacted">📦 ${t("codex.conv.compacted") || "Autocompact 切点"}: ${escapeHtml(item.summary || "")}</div>`;
+        return `<div class="codex-conv-item codex-conv-compacted">📦 ${t("codex.conv.compacted") || "Autocompact 切点"}: ${renderMiniMd(item.summary || "")}</div>`;
       case "System":
       case "system":
-        return `<details class="codex-conv-item"><summary>[${escapeHtml(item.role || "system")}]</summary><div class="codex-conv-item-text">${escapeHtml(item.text || "")}</div></details>`;
+        return `<details class="codex-conv-item"><summary>[${escapeHtml(item.role || "system")}]</summary><div class="codex-conv-item-text codex-conv-md">${renderMiniMd(item.text || "")}</div></details>`;
       default:
         return "";
     }
+  }
+
+  /**
+   * #271 极简 markdown 渲染(避免外部依赖 + XSS 安全)。
+   *
+   * 支持:fenced code block / inline code / headings (# .. ######) / bold /
+   * italic / unordered & ordered list / blockquote / link (仅 http(s)) /
+   * 段落 + 软换行。先 escape HTML,再按 block 状态机渲染,inline 替换在
+   * 已 escape 文本上跑。
+   */
+  function renderMiniMd(input) {
+    if (!input) return "";
+    const src = String(input).replace(/\r\n?/g, "\n");
+    // 1. 抽走 fenced code block,placeholder 占位避免 inline rule 污染
+    const codeBlocks = [];
+    let body = src.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+      const idx = codeBlocks.push({ lang, code }) - 1;
+      return `\x00CODEBLOCK${idx}\x00`;
+    });
+    // 2. 行级 + paragraph 渲染
+    const lines = body.split("\n");
+    const out = [];
+    let paragraphBuf = [];
+    let listBuf = [];   // {ord: bool, items: []}
+    const flushParagraph = () => {
+      if (paragraphBuf.length === 0) return;
+      const text = paragraphBuf.join("\n");
+      out.push(`<p>${applyInlineMd(text)}</p>`);
+      paragraphBuf = [];
+    };
+    const flushList = () => {
+      if (!listBuf.length) return;
+      const ord = listBuf._ord;
+      const tag = ord ? "ol" : "ul";
+      out.push(`<${tag}>${listBuf.map((i) => `<li>${applyInlineMd(i)}</li>`).join("")}</${tag}>`);
+      listBuf = [];
+      listBuf._ord = false;
+    };
+    for (const line of lines) {
+      // placeholder 行 → 直接放
+      const phMatch = line.match(/^\x00CODEBLOCK(\d+)\x00$/);
+      if (phMatch) {
+        flushParagraph();
+        flushList();
+        const cb = codeBlocks[Number(phMatch[1])];
+        out.push(`<pre class="codex-conv-md-code"><code>${escapeHtml(cb.code)}</code></pre>`);
+        continue;
+      }
+      if (/^\s*$/.test(line)) {
+        flushParagraph();
+        flushList();
+        continue;
+      }
+      // headings (#~######)
+      const head = line.match(/^(#{1,6})\s+(.*)$/);
+      if (head) {
+        flushParagraph();
+        flushList();
+        const level = head[1].length;
+        out.push(`<h${level}>${applyInlineMd(head[2])}</h${level}>`);
+        continue;
+      }
+      // unordered / ordered list
+      const ul = line.match(/^\s*[-*]\s+(.*)$/);
+      const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+      if (ul || ol) {
+        flushParagraph();
+        const wantOrd = !!ol;
+        if (listBuf._ord !== wantOrd && listBuf.length) {
+          flushList();
+        }
+        listBuf._ord = wantOrd;
+        listBuf.push((ul || ol)[1]);
+        continue;
+      }
+      // blockquote
+      const bq = line.match(/^>\s?(.*)$/);
+      if (bq) {
+        flushParagraph();
+        flushList();
+        out.push(`<blockquote>${applyInlineMd(bq[1])}</blockquote>`);
+        continue;
+      }
+      // horizontal rule
+      if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
+        flushParagraph();
+        flushList();
+        out.push("<hr>");
+        continue;
+      }
+      // 默认聚合到段落
+      flushList();
+      paragraphBuf.push(line);
+    }
+    flushParagraph();
+    flushList();
+    return out.join("");
+  }
+
+  function applyInlineMd(text) {
+    // 先 escape HTML,再在 escape 后的文本上跑 inline rule(安全)
+    let s = escapeHtml(text);
+    // inline code `code` — 占位防止内部 ** _ 被吃
+    const inlineCodes = [];
+    s = s.replace(/`([^`\n]+)`/g, (_, c) => {
+      const idx = inlineCodes.push(c) - 1;
+      return `\x01IC${idx}\x01`;
+    });
+    // links [text](url) — 仅 http(s)
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, text, url) => {
+      const safeUrl = url.replace(/"/g, "%22");
+      return `<a href="${safeUrl}" target="_blank" rel="noreferrer noopener">${text}</a>`;
+    });
+    // bold **text**
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    // italic *text* / _text_(避开 ** 已处理后剩下的孤立 *)
+    s = s.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+    s = s.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+    // restore inline code
+    s = s.replace(/\x01IC(\d+)\x01/g, (_, i) => `<code>${escapeHtml(inlineCodes[Number(i)])}</code>`);
+    return s;
   }
 
   function truncateString(s, n) {
@@ -5654,24 +5796,93 @@
   async function codexConversationsExportSelected() {
     if (conversationsSelected.size === 0) return;
     const format = $("#codexConvFormat")?.value || "markdown";
+    const ids = Array.from(conversationsSelected);
+    const isMulti = ids.length > 1;
+
+    // 生成默认文件名
+    const tsTag = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    let defaultName;
+    let extFilter;
+    if (isMulti) {
+      defaultName = `codex-conversations-${tsTag}.zip`;
+      extFilter = { name: "Zip", extensions: ["zip"] };
+    } else {
+      const meta = conversationsCache.find((s) => s.id === ids[0]);
+      const baseName = meta?.path?.split("/").pop()?.replace(/\.jsonl$/, "") || `session-${ids[0].slice(0, 8)}`;
+      const ext = format === "markdown" ? "md" : format === "jsonl" ? "jsonl" : "json";
+      defaultName = `${baseName}.${ext}`;
+      extFilter = { name: ext.toUpperCase(), extensions: [ext] };
+    }
+
+    // Tauri dialog.save 让用户选目标路径
+    const dialog = window.__TAURI__?.dialog;
+    if (!dialog?.save) {
+      showToast(t("codex.conv.exportFailed") + ": Tauri dialog API 不可用");
+      return;
+    }
+    let targetPath;
     try {
-      const { blob, filename } = await CCApi.exportConversations({
-        sessionIds: Array.from(conversationsSelected),
-        format,
-        options: conversationsExportOptions,
+      targetPath = await dialog.save({
+        title: isMulti ? (t("codex.conv.saveDialogMulti") || "保存对话 zip") : (t("codex.conv.saveDialogSingle") || "保存对话文件"),
+        defaultPath: defaultName,
+        filters: [extFilter],
       });
-      // 通过 anchor download 保存
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      showToast(tFmt("codex.conv.toastExported", { count: conversationsSelected.size }));
+    } catch (e) {
+      showToast(t("codex.conv.exportFailed") + ": " + (e.message || e));
+      return;
+    }
+    if (!targetPath) return; // 用户取消
+
+    try {
+      const resp = await fetch("/api/conversations/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionIds: ids,
+          format,
+          options: conversationsExportOptions,
+          targetPath,
+        }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(text || `HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      showToast(tFmt("codex.conv.toastExportedTo", { count: ids.length, path: data.path }));
     } catch (e) {
       showToast(`${t("codex.conv.exportFailed") || "导出失败"}: ${e.message || e}`);
+    }
+  }
+
+  // #271 fix #3 — 删除选中(移动到 trash,需要二次确认)
+  async function codexConversationsDeleteSelected() {
+    if (conversationsSelected.size === 0) return;
+    const ids = Array.from(conversationsSelected);
+    const confirmMsg = tFmt("codex.conv.confirmDelete", { count: ids.length });
+    if (!window.confirm(confirmMsg)) return;
+    try {
+      const resp = await fetch("/api/conversations/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionIds: ids }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(text || `HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      const moved = (data.deleted || []).length;
+      const failed = (data.failed || []).length;
+      conversationsSelected.clear();
+      if (failed > 0) {
+        showToast(tFmt("codex.conv.toastDeletedPartial", { moved, failed }));
+      } else {
+        showToast(tFmt("codex.conv.toastDeleted", { count: moved }));
+      }
+      await codexConversationsLoadAndRender();
+    } catch (e) {
+      showToast(`${t("codex.conv.deleteFailed") || "删除失败"}: ${e.message || e}`);
     }
   }
 
@@ -5731,12 +5942,13 @@
   /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
   async function codexRefreshSidebarBadges() {
     try {
-      const [agentsPaths, memPaths, mcpServers, mcpPlugins, skillsPaths] = await Promise.all([
+      const [agentsPaths, memPaths, mcpServers, mcpPlugins, skillsPaths, convs] = await Promise.all([
         fetch("/api/codex/agents-md/paths").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/memories-md/paths").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/mcp/servers").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/mcp/plugins").then((r) => (r.ok ? r.json() : null)),
         fetch("/api/codex/skills-md/paths").then((r) => (r.ok ? r.json() : null)),
+        fetch("/api/conversations/list").then((r) => (r.ok ? r.json() : null)),
       ]);
       const setBadge = (id, text) => {
         const el = $(id);
@@ -5748,10 +5960,12 @@
       const mcpPluginsCount = mcpPlugins?.plugins?.length || 0;
       const mcpTotal = mcpServersCount + mcpPluginsCount;
       const skillsCount = skillsPaths?.entries?.length || 0;
+      const convCount = convs?.sessions?.length || 0;
       setBadge("#codexSidebarBadge-agents", agentsCount > 0 ? String(agentsCount) : "—");
       setBadge("#codexSidebarBadge-memories", memCount > 0 ? String(memCount) : "—");
       setBadge("#codexSidebarBadge-mcp", mcpTotal > 0 ? String(mcpTotal) : "—");
       setBadge("#codexSidebarBadge-skills", skillsCount > 0 ? String(skillsCount) : "—");
+      setBadge("#codexSidebarBadge-conversations", convCount > 0 ? String(convCount) : "—");
     } catch {
       // best-effort, 静默
     }
