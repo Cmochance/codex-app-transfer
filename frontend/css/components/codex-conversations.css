@@ -109,32 +109,62 @@
   font-size: 13px;
   cursor: pointer;
 }
-.codex-conv-format { width: 200px; }
+.codex-conv-format { width: 150px; flex: 0 0 150px; }
 
-/* 默认导出文件夹 input group */
+/* 默认导出文件夹:二合一 input(整块可点 → 打开 dir picker) */
 .codex-conv-default-dir {
   display: inline-flex;
-  align-items: stretch;
-  gap: 0;
-  flex: 0 1 280px;
-  min-width: 200px;
-  margin-left: auto;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 220px;
+  min-width: 160px;
+  padding: 4px 8px;
+  background: var(--surface, #fff);
+  border: 1px solid var(--line, #d1d5db);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.codex-conv-default-dir:hover {
+  border-color: color-mix(in srgb, var(--primary) 50%, var(--line));
+}
+.codex-conv-default-dir-icon {
+  color: var(--muted, #6b7280);
+  font-size: 13px;
+  flex: 0 0 auto;
 }
 .codex-conv-default-dir-input {
   flex: 1;
   min-width: 0;
-  border-top-right-radius: 0;
-  border-bottom-right-radius: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 13px;
+  padding: 0;
   cursor: pointer;
   text-overflow: ellipsis;
+  color: inherit;
 }
-.codex-conv-default-dir-pick {
-  border-top-left-radius: 0;
-  border-bottom-left-radius: 0;
-  border-left: 0;
+.codex-conv-default-dir-input::placeholder {
+  color: var(--muted, #9ca3af);
 }
 .codex-conv-default-dir-clear {
-  margin-left: 4px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  border-radius: 50%;
+  color: var(--muted, #6b7280);
+  cursor: pointer;
+}
+.codex-conv-default-dir-clear:hover {
+  background: color-mix(in srgb, var(--muted, #6b7280) 18%, transparent);
+  color: var(--text, #111);
 }
 
 .codex-conv-warning {
