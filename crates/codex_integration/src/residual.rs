@@ -216,6 +216,22 @@ fn scan_one_file(
     }))
 }
 
+/// 给定一段 TOML 文本,返回应被 strip 的 root key 列表(已 dedupe + 排序)。
+///
+/// 用途场景:
+/// - 残留扫描 UI(#268)对每个文件计算 strip 计划
+/// - `apply::restore_from_snapshot_values`(#270)在按快照字面量回写前用
+///   本函数计算"snapshot 自带的污染字段集合",对这些字段不回写(写 None
+///   即 strip),防止循环固化
+pub fn signature_fields_to_strip(
+    content: &str,
+    app_config_json: &Path,
+    proxy_ports: &[u16],
+) -> Vec<String> {
+    let matched = detect_signatures_in_text(content, app_config_json, proxy_ports);
+    compute_fields_to_strip(&matched)
+}
+
 /// 纯函数:扫描一段 TOML 文本,返回命中的 signature 列表。
 pub fn detect_signatures_in_text(
     content: &str,

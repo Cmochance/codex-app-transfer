@@ -453,8 +453,35 @@ fn restore_from_snapshot_values(
     // `RestoreMode::Manual`(UI 手动选某个 snapshot 恢复)的语义是"完全回到那个
     // 快照的状态",所以 `model` 也必须严格按快照恢复 —— 没有就移除,否则用户选
     // 老备份反而沿用了 post-snapshot 的 model 映射。
+    //
+    // **#270 防污染循环固化**:若 snapshot 本身已经被 transfer apply 污染过
+    // (模型选项 `model_catalog_json` 值指向 `<app_home>/config.json`,或
+    // `openai_base_url` 指向 transfer proxy `127.0.0.1:18080`),按字面量回写
+    // 等于把残留污染再写一遍。这里**先过一遍 signature 检测**,命中的字段
+    // 视为快照里"没有"(literal = None,走 strip 分支),拒绝把 transfer 自己
+    // 的产物当成"用户原始配置"恢复。详见
+    // [`crate::residual::signature_fields_to_strip`]。
+    //
+    // 端口列表只包含历史默认 18080 — 用户改过 proxy port 后的 snapshot 这里
+    // 不识别(filter 不到),会回写老 port 的 transfer 字段;此时#268 设置页
+    // 「针对性清除」可以做最终 cleanup(扫描用 settings.proxyPort + 18080
+    // 两个 port 都会查)。
+    let polluted_fields: std::collections::HashSet<String> =
+        crate::residual::signature_fields_to_strip(
+            snapshot_config,
+            &paths.model_catalog_json,
+            &[18080],
+        )
+        .into_iter()
+        .collect();
+
     for key in MANAGED_TOML_KEYS {
-        let literal = snapshot_toml_value_literal(snapshot_config, key);
+        let literal_from_snapshot = snapshot_toml_value_literal(snapshot_config, key);
+        let literal = if polluted_fields.contains(*key) {
+            None
+        } else {
+            literal_from_snapshot
+        };
         match (*key, literal.as_deref(), mode) {
             ("model", None, RestoreMode::Auto) => continue,
             _ => sync_root_value(&paths.config_toml, key, literal.as_deref())?,
@@ -1111,6 +1138,66 @@ mod tests {
         let toml = read_toml(&paths);
         assert!(toml.contains("model_catalog_json = \"/tmp/user-catalog.json\""));
         assert!(read_app_config(&paths).get("models").is_none());
+    }
+
+    /// **#270 防回归**:snapshot 自身被 transfer apply 污染过(`model_catalog_json`
+    /// 指向 app_home,`openai_base_url` 指向 127.0.0.1:18080)的场景,
+    /// `restore_from_snapshot_values` 必须**不**把这些字段从 snapshot 字面量
+    /// 回写到 live config — 否则就是 #268 描述的循环固化 bug。
+    ///
+    /// 期望:filter 命中 catalog + base_url signature → 整组 5 个字段当 None
+    /// 处理(strip),live config 保持干净。
+    #[test]
+    fn restore_does_not_write_back_polluted_signature_fields_from_snapshot() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        std::fs::create_dir_all(&paths.snapshot_dir).unwrap();
+
+        // 模拟"已污染的快照":snapshot 自带 transfer 写过的全套字段
+        let polluted_snapshot = format!(
+            "personality = \"pragmatic\"\nopenai_base_url = \"http://127.0.0.1:18080\"\nmodel_context_window = 1000000\nmodel_catalog_json = \"{}\"\nmodel = \"gpt-5.5\"\nsandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n",
+            paths.model_catalog_json.display()
+        );
+        std::fs::write(&paths.snapshot_config, &polluted_snapshot).unwrap();
+        std::fs::write(&paths.snapshot_auth, "{}").unwrap();
+        // legacy 单 snapshot 路径(用 `paths.snapshot_manifest` 让 has_snapshot=true)
+        std::fs::write(
+            &paths.snapshot_manifest,
+            r#"{"snapshot_id":"legacy","session_id":"legacy","schema_version":1}"#,
+        )
+        .unwrap();
+
+        // live config 也含污染(模拟"apply 中"的状态)
+        std::fs::write(&paths.config_toml, &polluted_snapshot).unwrap();
+        // 给 auth.json 一个空对象避免 read 失败
+        std::fs::write(&paths.auth_json, "{}").unwrap();
+
+        restore_codex_state(&paths).unwrap();
+
+        let toml = read_toml(&paths);
+        // 用户合法字段保留
+        assert!(
+            toml.contains("personality = \"pragmatic\""),
+            "user 自有 key 必须保留: {toml}"
+        );
+        assert!(
+            toml.contains("model = \"gpt-5.5\""),
+            "user 的 model 必须保留: {toml}"
+        );
+        // 5 个 transfer signature 字段全 strip(即便快照里有)
+        for k in [
+            "openai_base_url",
+            "model_context_window",
+            "model_catalog_json",
+            "sandbox_mode",
+            "approval_policy",
+        ] {
+            assert!(
+                !toml.contains(&format!("{k} =")),
+                "snapshot 已污染时 transfer 字段 {k} 必须被 filter 而不是回写: {toml}"
+            );
+        }
     }
 
     #[test]

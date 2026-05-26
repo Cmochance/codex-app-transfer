@@ -30,8 +30,9 @@ pub use auth::{read_auth, write_auth};
 pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, upsert_catalog_models};
 pub use paths::CodexPaths;
 pub use residual::{
-    detect_signatures_in_text, repair_residual_pollution, scan_residual_pollution, MatchedSignature,
-    PollutedFile, PollutionSourceKind, RepairReport, RepairedFile, ResidualScanReport,
+    detect_signatures_in_text, repair_residual_pollution, scan_residual_pollution,
+    signature_fields_to_strip, MatchedSignature, PollutedFile, PollutionSourceKind, RepairReport,
+    RepairedFile, ResidualScanReport,
 };
 pub use snapshot::{
     gc_trash_older_than, get_snapshot_status, has_snapshot, list_snapshots, snapshot_codex_state,
