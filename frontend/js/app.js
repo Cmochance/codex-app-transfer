@@ -1,5 +1,5 @@
 (function () {
-  const routes = ["dashboard", "providers/add", "providers", "desktop", "proxy", "settings", "codex", "theme", "guide"];
+  const routes = ["dashboard", "providers/add", "providers", "desktop", "proxy", "usage", "settings", "codex", "theme", "guide"];
   const providerFormModelSlots = [
     { key: "default", label: "Default", icon: "bi-circle-fill", iconClass: "default", source: "未配置映射时默认使用这一项", required: true },
     { key: "gpt_5_5", label: "gpt-5.5", icon: "bi-circle", iconClass: "default", source: "gpt-5.5" },
