@@ -2295,10 +2295,17 @@
     }
     empty.hidden = true;
 
+    // By Model 视图下 first column = model name,第二个 models 列内容必然跟 first
+    // 列重复(每个 group 只有自己一个 model)— Devin Review #280 BUG_..._0001 fix:
+    // model view 跳过第二列;daily / conversation view 保留(本日 / 本会话用到的
+    // 模型清单是补充信息有意义)。
+    const showModelsCol = view !== "model";
+    const modelHeader = showModelsCol ? `<th>${escapeHtml(t("usage.col.model"))}</th>` : "";
+
     head.innerHTML = `
       <tr>
         <th>${escapeHtml(t(firstColKey))}</th>
-        <th>${escapeHtml(t("usage.col.model"))}</th>
+        ${modelHeader}
         <th>${escapeHtml(t("usage.col.input"))}</th>
         <th>${escapeHtml(t("usage.col.output"))}</th>
         <th>${escapeHtml(t("usage.col.reasoning"))}</th>
@@ -2314,10 +2321,14 @@
       return (b.totalTokens || 0) - (a.totalTokens || 0);
     });
 
-    body.innerHTML = sorted.map((row) => `
+    body.innerHTML = sorted.map((row) => {
+      const modelCell = showModelsCol
+        ? `<td class="usage-cell-model">${escapeHtml((row.models || []).join(", ") || "—")}</td>`
+        : "";
+      return `
       <tr>
         <td>${escapeHtml(row.group || "—")}</td>
-        <td class="usage-cell-model">${escapeHtml((row.models || []).join(", ") || "—")}</td>
+        ${modelCell}
         <td>${escapeHtml(fmtNum(row.inputTokens))}</td>
         <td>${escapeHtml(fmtNum(row.outputTokens))}</td>
         <td>${escapeHtml(fmtNum(row.reasoningOutputTokens))}</td>
@@ -2325,7 +2336,8 @@
         <td>${escapeHtml(fmtNum(row.turnCount))}</td>
         <td>${escapeHtml(fmtLastActivity(row.lastActivity))}</td>
       </tr>
-    `).join("");
+      `;
+    }).join("");
   }
 
   async function fetchUsageReport() {
