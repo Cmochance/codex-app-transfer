@@ -69,15 +69,22 @@
     hideModal = true,
   } = {}) {
     const button = $(`#${buttonId}`);
-    // MOC-20 / PR #281 fix:button 含 icon + span 时(如 dashboard 重启按钮)直接
-    // 改 button.textContent 会把 `<i>` 跟 `<span data-i18n>` 子节点都抹掉 →
-    // icon 消失 + 切语言失效。找 [data-i18n] label 子节点优先操作,fallback 到
-    // button 自身(兼容 modal 内纯文本按钮如 #restartReminderNow)。
-    const labelEl = button?.querySelector("[data-i18n]") || button;
-    const original = labelEl?.textContent;
+    // MOC-20 / PR #281 fix:三种按钮形态都要兼容,不能直接改 button.textContent 否则抹 DOM:
+    //   a) modal 内纯文本按钮(#restartReminderNow):textContent 含 label,直接改安全
+    //   b) 含 icon + label span 按钮(dashboard quick-actions 形态):必须改 [data-i18n] 子节点
+    //   c) icon-only 按钮(header `.theme-btn`):textContent = 空白,只能改 disabled + .is-loading class
+    // 判断:有 [data-i18n] 子 → label swap;无子但 button.textContent.trim() 非空 → 改 button text;
+    // 都不是 → icon-only,仅 disabled + class 反馈。
+    const labelEl = button?.querySelector("[data-i18n]");
+    const buttonHasText = button && !labelEl && button.textContent.trim().length > 0;
+    const swapEl = labelEl || (buttonHasText ? button : null);
+    const original = swapEl?.textContent;
     try {
-      if (button) button.disabled = true;
-      if (labelEl) labelEl.textContent = t("restartReminder.restarting") || "重启中…";
+      if (button) {
+        button.disabled = true;
+        button.classList.add("is-loading");
+      }
+      if (swapEl) swapEl.textContent = t("restartReminder.restarting") || "重启中…";
       await CCApi.restartCodexApp();
       if (hideModal) restartReminderModal?.hide();
       showToast(t("toast.codexAppRestartRequested"));
@@ -85,8 +92,11 @@
       console.error(error);
       showToast(error.message || t("toast.codexAppRestartFailed"));
     } finally {
-      if (button) button.disabled = false;
-      if (labelEl) labelEl.textContent = original || t(fallbackLabelKey);
+      if (button) {
+        button.disabled = false;
+        button.classList.remove("is-loading");
+      }
+      if (swapEl) swapEl.textContent = original || t(fallbackLabelKey);
     }
   }
 

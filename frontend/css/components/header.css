@@ -96,6 +96,23 @@
   color: var(--primary);
 }
 
+/* MOC-20 #281:icon-only .theme-btn 在 .is-loading 状态(如重启 Codex 进行中)
+   旋转 icon 给视觉反馈,因为 icon-only 按钮没有 text label 可以 swap "重启中…" */
+.theme-btn.is-loading {
+  pointer-events: none;
+  opacity: 0.7;
+}
+
+.theme-btn.is-loading > i {
+  animation: theme-btn-spin 1s linear infinite;
+}
+
+@keyframes theme-btn-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* === Layer 2: compact desktop === */
 
 .app-header {
