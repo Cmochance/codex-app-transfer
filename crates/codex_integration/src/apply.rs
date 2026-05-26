@@ -928,12 +928,15 @@ mod tests {
         let gpt55 = models.iter().find(|m| m["slug"] == "gpt-5.5").unwrap();
         let gpt54 = models.iter().find(|m| m["slug"] == "gpt-5.4").unwrap();
         let mini = models.iter().find(|m| m["slug"] == "gpt-5.4-mini").unwrap();
-        assert_eq!(gpt55["display_name"], "Mixed / short-context-model");
+        // user feedback (2026-05-26): display_name 不含 "Provider / " 前缀,
+        // provider 移到 description 里
+        assert_eq!(gpt55["display_name"], "short-context-model");
         assert_eq!(gpt55["context_window"], 258_400);
-        assert_eq!(gpt54["display_name"], "Mixed / custom-long-model");
+        assert!(gpt55["description"].as_str().unwrap().contains("(Mixed)"));
+        assert_eq!(gpt54["display_name"], "custom-long-model");
         assert_eq!(gpt54["context_window"], 1_000_000);
         assert_eq!(
-            mini["display_name"], "Mixed / deepseek-v4-pro",
+            mini["display_name"], "deepseek-v4-pro",
             "empty slots should document their default fallback target"
         );
         assert_eq!(mini["context_window"], 1_000_000);

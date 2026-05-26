@@ -211,6 +211,72 @@
   font-style: italic;
 }
 
+/* Preview MD 渲染模式(#271):覆盖 raw 视图的 monospace + pre-wrap */
+.codex-agents-preview.codex-md-rendered {
+  white-space: normal;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.55;
+}
+.codex-agents-preview.codex-md-rendered p { margin: 0 0 8px; }
+.codex-agents-preview.codex-md-rendered h1,
+.codex-agents-preview.codex-md-rendered h2,
+.codex-agents-preview.codex-md-rendered h3,
+.codex-agents-preview.codex-md-rendered h4,
+.codex-agents-preview.codex-md-rendered h5,
+.codex-agents-preview.codex-md-rendered h6 {
+  margin: 14px 0 6px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.codex-agents-preview.codex-md-rendered h1 { font-size: 18px; }
+.codex-agents-preview.codex-md-rendered h2 { font-size: 16px; }
+.codex-agents-preview.codex-md-rendered h3 { font-size: 14px; }
+.codex-agents-preview.codex-md-rendered h4,
+.codex-agents-preview.codex-md-rendered h5,
+.codex-agents-preview.codex-md-rendered h6 { font-size: 13px; }
+.codex-agents-preview.codex-md-rendered ul,
+.codex-agents-preview.codex-md-rendered ol {
+  margin: 0 0 8px;
+  padding-left: 22px;
+}
+.codex-agents-preview.codex-md-rendered li { margin-bottom: 3px; }
+.codex-agents-preview.codex-md-rendered blockquote {
+  margin: 0 0 8px;
+  padding: 4px 10px;
+  border-left: 3px solid color-mix(in srgb, var(--primary) 35%, transparent);
+  background: color-mix(in srgb, var(--primary) 4%, transparent);
+  color: var(--muted, #4b5563);
+}
+.codex-agents-preview.codex-md-rendered code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: color-mix(in srgb, var(--muted, #6b7280) 12%, transparent);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.codex-agents-preview.codex-md-rendered pre {
+  background: color-mix(in srgb, var(--muted, #6b7280) 10%, transparent);
+  padding: 8px 10px;
+  border-radius: 6px;
+  overflow: auto;
+  margin: 0 0 8px;
+  white-space: pre;
+}
+.codex-agents-preview.codex-md-rendered pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 12px;
+}
+.codex-agents-preview.codex-md-rendered a { color: var(--primary); }
+.codex-agents-preview.codex-md-rendered hr {
+  border: 0;
+  border-top: 1px dashed var(--line);
+  margin: 10px 0;
+}
+.codex-agents-preview.codex-md-rendered strong { font-weight: 600; }
+
 .codex-agents-edit {
   flex: 1;
   min-height: 120px;
