@@ -773,6 +773,9 @@
                 <option value="active" data-i18n="codex.conv.kindActive">Active</option>
                 <option value="archived" data-i18n="codex.conv.kindArchived">Archived</option>
               </select>
+              <select class="form-select form-select-sm codex-conv-filter-cwd" id="codexConvCwdFilter" title="按所属项目目录过滤">
+                <option value="all" data-i18n="codex.conv.cwdAll">所有项目</option>
+              </select>
               <span class="codex-conv-summary" id="codexConvSummary"></span>
               <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-refresh"><i class="bi bi-arrow-clockwise"></i><span data-i18n="codex.conv.refresh">刷新</span></button>
             </div>
@@ -790,11 +793,6 @@
               <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-options" data-i18n="codex.conv.options"><i class="bi bi-sliders"></i>选项</button>
               <button class="btn btn-primary btn-sm" type="button" data-action="codex-conv-export-selected" id="codexConvExportBtn" disabled><i class="bi bi-download"></i><span data-i18n="codex.conv.exportSelected">导出选中</span></button>
               <button class="btn btn-outline-danger btn-sm codex-conv-delete-btn" type="button" data-action="codex-conv-delete-selected" id="codexConvDeleteBtn" disabled><i class="bi bi-trash"></i><span data-i18n="codex.conv.deleteSelected">删除选中</span></button>
-            </div>
-
-            <div class="codex-conv-warning">
-              <i class="bi bi-info-circle"></i>
-              <span data-i18n="codex.conv.warnRedact">默认已 redact 密钥(sk-/cas_/JWT/Bearer)。Reasoning 默认隐藏,Tool calls 默认含,output > 2KB 截断。点「选项」调整。</span>
             </div>
 
             <div class="codex-conv-body">

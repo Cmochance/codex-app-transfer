@@ -7,8 +7,9 @@
   margin-bottom: 8px;
   flex-wrap: wrap;
 }
-.codex-conv-search { flex: 1 1 240px; min-width: 200px; }
-.codex-conv-filter { width: 130px; }
+.codex-conv-search { flex: 1 1 200px; min-width: 180px; }
+.codex-conv-filter { width: 110px; flex: 0 0 110px; }
+.codex-conv-filter-cwd { width: 200px; flex: 0 0 200px; }
 .codex-conv-summary {
   color: var(--muted, #6b7280);
   font-size: 12px;

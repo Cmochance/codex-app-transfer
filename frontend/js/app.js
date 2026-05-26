@@ -5471,6 +5471,7 @@
     _convInitDone = true;
     $("#codexConvSearch")?.addEventListener("input", codexConversationsRenderList);
     $("#codexConvKindFilter")?.addEventListener("change", codexConversationsRenderList);
+    $("#codexConvCwdFilter")?.addEventListener("change", codexConversationsRenderList);
     $("#codexConvSelectAll")?.addEventListener("change", (e) => {
       const filtered = codexConversationsFiltered();
       if (e.target.checked) {
@@ -5497,14 +5498,45 @@
     if (summary) {
       summary.textContent = tFmt("codex.conv.summary", { count: conversationsCache.length });
     }
+    codexConversationsPopulateCwdFilter();
     codexConversationsRenderList();
+  }
+
+  /** 把 conversationsCache 里所有 cwd 抽出来灌进 #codexConvCwdFilter (按出现次数倒序). */
+  function codexConversationsPopulateCwdFilter() {
+    const sel = $("#codexConvCwdFilter");
+    if (!sel) return;
+    const prev = sel.value;
+    // 统计 cwd → count
+    const counts = new Map();
+    for (const s of conversationsCache) {
+      if (!s.cwd) continue;
+      counts.set(s.cwd, (counts.get(s.cwd) || 0) + 1);
+    }
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    // 重建 options(保留 "全部" 头)
+    sel.innerHTML = `<option value="all">${t("codex.conv.cwdAll") || "所有项目"}</option>`;
+    for (const [cwd, count] of sorted) {
+      const opt = document.createElement("option");
+      opt.value = cwd;
+      const base = cwd.split("/").pop() || cwd;
+      opt.textContent = `${base} (${count})`;
+      opt.title = cwd; // hover 显完整路径
+      sel.appendChild(opt);
+    }
+    // 还原之前的选择(如果还在新选项里)
+    if (prev && [...sel.options].some((o) => o.value === prev)) {
+      sel.value = prev;
+    }
   }
 
   function codexConversationsFiltered() {
     const search = ($("#codexConvSearch")?.value || "").toLowerCase().trim();
     const kindFilter = $("#codexConvKindFilter")?.value || "all";
+    const cwdFilter = $("#codexConvCwdFilter")?.value || "all";
     return conversationsCache.filter((s) => {
       if (kindFilter !== "all" && s.kind !== kindFilter) return false;
+      if (cwdFilter !== "all" && s.cwd !== cwdFilter) return false;
       if (!search) return true;
       const hay = [s.title || "", s.id, s.cwd, s.originator, s.modelProvider]
         .join(" ")
