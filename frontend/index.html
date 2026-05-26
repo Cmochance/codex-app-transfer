@@ -533,6 +533,11 @@
               <span data-i18n="codex.tabSkills">Skills</span>
               <small class="codex-sidebar-badge" id="codexSidebarBadge-skills"></small>
             </button>
+            <button type="button" class="codex-sidebar-item" data-codex-tab="conversations">
+              <i class="bi bi-chat-dots"></i>
+              <span data-i18n="codex.tabConversations">Sessions</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-conversations"></small>
+            </button>
           </nav>
 
           <article class="panel codex-content" id="codex-assets-panel">
@@ -758,6 +763,59 @@
               <button class="btn btn-outline-primary" type="button" data-action="codex-skills-history-toggle"><i class="bi bi-clock-history"></i><span data-i18n="codex.history">History</span></button>
             </div>
           </div>
+
+          <!-- Conversations tab (#271) — Codex CLI rollout 对话导出 -->
+          <div class="codex-agents-raw-tab codex-pane" id="codexConversationsTab" data-codex-pane="conversations" hidden>
+            <div class="codex-conv-filterbar">
+              <input type="search" class="form-control form-control-sm codex-conv-search" id="codexConvSearch" data-i18n-placeholder="codex.conv.searchPlaceholder" placeholder="搜索 (title / cwd / id)">
+              <div class="cas-dropdown codex-conv-filter" id="codexConvKindFilter" data-value="all">
+                <button type="button" class="cas-dropdown-toggle" aria-haspopup="menu" aria-expanded="false">
+                  <span class="cas-dropdown-label" data-i18n="codex.conv.kindAll">全部</span>
+                  <i class="bi bi-chevron-down cas-dropdown-caret"></i>
+                </button>
+                <ul class="cas-dropdown-menu" role="menu" hidden></ul>
+              </div>
+              <div class="cas-dropdown codex-conv-filter-cwd" id="codexConvCwdFilter" data-value="all" title="按所属项目目录过滤">
+                <button type="button" class="cas-dropdown-toggle" aria-haspopup="menu" aria-expanded="false">
+                  <span class="cas-dropdown-label" data-i18n="codex.conv.cwdAll">所有项目</span>
+                  <i class="bi bi-chevron-down cas-dropdown-caret"></i>
+                </button>
+                <ul class="cas-dropdown-menu" role="menu" hidden></ul>
+              </div>
+              <span class="codex-conv-summary" id="codexConvSummary"></span>
+              <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-refresh"><i class="bi bi-arrow-clockwise"></i><span data-i18n="codex.conv.refresh">刷新</span></button>
+            </div>
+
+            <div class="codex-conv-toolbar">
+              <label class="codex-conv-select-all-label">
+                <input type="checkbox" id="codexConvSelectAll">
+                <span data-i18n="codex.conv.selectAll">全选(过滤后)</span>
+              </label>
+              <div class="cas-dropdown codex-conv-format" id="codexConvFormat" data-value="markdown">
+                <button type="button" class="cas-dropdown-toggle" aria-haspopup="menu" aria-expanded="false">
+                  <span class="cas-dropdown-label">Markdown (.md)</span>
+                  <i class="bi bi-chevron-down cas-dropdown-caret"></i>
+                </button>
+                <ul class="cas-dropdown-menu" role="menu" hidden></ul>
+              </div>
+              <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-options" data-i18n="codex.conv.options"><i class="bi bi-sliders"></i>选项</button>
+              <button class="btn btn-primary btn-sm" type="button" data-action="codex-conv-export-selected" id="codexConvExportBtn" disabled><i class="bi bi-download"></i><span data-i18n="codex.conv.exportSelected">导出选中</span></button>
+              <button class="btn btn-outline-danger btn-sm codex-conv-delete-btn" type="button" data-action="codex-conv-delete-selected" id="codexConvDeleteBtn" disabled><i class="bi bi-trash"></i><span data-i18n="codex.conv.deleteSelected">删除选中</span></button>
+              <div class="codex-conv-default-dir" title="留空则每次导出都弹窗选择;设置后默认导出到该目录" data-action="codex-conv-default-dir-pick">
+                <i class="bi bi-folder2-open codex-conv-default-dir-icon"></i>
+                <input type="text" class="codex-conv-default-dir-input" id="codexConvDefaultDir" data-i18n-placeholder="codex.conv.defaultDirPlaceholder" placeholder="设置默认导出文件夹" readonly>
+                <button class="codex-conv-default-dir-clear" type="button" data-action="codex-conv-default-dir-clear" id="codexConvDefaultDirClear" hidden title="清除"><i class="bi bi-x-lg"></i></button>
+              </div>
+            </div>
+
+            <div class="codex-conv-body">
+              <ul class="codex-conv-list" id="codexConvList"></ul>
+              <div class="codex-conv-detail" id="codexConvDetail">
+                <p class="codex-conv-detail-empty" data-i18n="codex.conv.selectPrompt">选中一条 session 看详情。</p>
+              </div>
+            </div>
+          </div>
+
           </article>
         </div>
 

@@ -368,6 +368,32 @@
       return api('POST', '/api/desktop/repair-residual', { dryRun });
     },
 
+    // #271 — Codex CLI rollout 对话导出.
+    async listConversations() {
+      const data = await api('GET', '/api/conversations/list');
+      return data?.sessions || [];
+    },
+    async getConversation(id) {
+      return api('GET', `/api/conversations/${encodeURIComponent(id)}`);
+    },
+    /** 返回 { blob, filename } — 调用方负责落盘 */
+    async exportConversations({ sessionIds, format, options }) {
+      const resp = await fetch('/api/conversations/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionIds, format, options: options || {} }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(text || `HTTP ${resp.status}`);
+      }
+      const cd = resp.headers.get('content-disposition') || '';
+      const m = cd.match(/filename="?([^";]+)"?/);
+      const filename = m ? m[1] : `conversation-${Date.now()}`;
+      const blob = await resp.blob();
+      return { blob, filename };
+    },
+
     async startProxy(port) {
       if (port) {
         await this.saveSettings({ proxyPort: Number(port) });

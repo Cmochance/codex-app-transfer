@@ -46,6 +46,10 @@ const AUTO_COMPACT_TRIGGER_PERCENT: u64 = 80;
 pub struct CatalogModel {
     pub slug: String,
     pub display_name: String,
+    /// 用于 description tooltip(`Routed through ... (<provider>) as <model>`).
+    /// display_name 现在只放模型名(避免 Codex Desktop 列表被 provider 前缀挤掉),
+    /// provider info 仅留在 description 给 hover / a11y 用。
+    pub provider_name: String,
     pub context_window: u64,
     pub effective_context_window_percent: u64,
 }
@@ -227,9 +231,14 @@ fn catalog_model(
     } else {
         default_model
     };
+    // 用户反馈:Codex Desktop 模型选择列表把整串 "Provider / model" 显示在
+    // 一行,长 provider 前缀(如 "Xiaomi MiMo (Token Plan)")挤掉了真正的
+    // 模型名,用户看不到选了什么。改成 display_name 只放模型名;
+    // provider 移到 description tooltip 里保留信息。
     CatalogModel {
         slug: slug.to_owned(),
-        display_name: format!("{provider_name} / {target}"),
+        display_name: target.to_owned(),
+        provider_name: provider_name.to_owned(),
         context_window,
         effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
     }
@@ -239,10 +248,17 @@ fn model_to_json(model: &CatalogModel) -> Value {
     let mut entry = codex_builtin_template(&model.slug).unwrap_or_else(generic_model_template);
     entry["slug"] = Value::String(model.slug.clone());
     entry["display_name"] = Value::String(model.display_name.clone());
-    entry["description"] = Value::String(format!(
-        "Routed through Codex App Transfer as {}.",
-        model.display_name
-    ));
+    entry["description"] = Value::String(if model.provider_name.is_empty() {
+        format!(
+            "Routed through Codex App Transfer as {}.",
+            model.display_name
+        )
+    } else {
+        format!(
+            "Routed through Codex App Transfer ({}) as {}.",
+            model.provider_name, model.display_name
+        )
+    });
     entry["context_window"] = json!(model.context_window);
     entry["max_context_window"] = json!(model.context_window);
     entry["effective_context_window_percent"] = json!(model.effective_context_window_percent);
@@ -591,15 +607,20 @@ mod tests {
         let mini = models.iter().find(|m| m.slug == "gpt-5.4-mini").unwrap();
         let codex = models.iter().find(|m| m.slug == "gpt-5.3-codex").unwrap();
 
-        assert_eq!(gpt55.display_name, "Mixed / short-context-model");
+        // user feedback (2026-05-26): display_name 不再含 "Provider / " 前缀,
+        // provider 移到 description 里(避免 Codex Desktop 模型列表被 provider
+        // 长前缀挤占看不到模型名)
+        assert_eq!(gpt55.display_name, "short-context-model");
+        assert_eq!(gpt55.provider_name, "Mixed");
         assert_eq!(gpt55.context_window, 258_400);
-        assert_eq!(gpt54.display_name, "Mixed / qwen3.6-plus");
+        assert_eq!(gpt54.display_name, "qwen3.6-plus");
         assert_eq!(gpt54.context_window, 1_000_000);
         assert_eq!(mini.context_window, 1_000_000);
         assert_eq!(
-            codex.display_name, "Mixed / deepseek-v4-pro",
+            codex.display_name, "deepseek-v4-pro",
             "empty slot mappings should still document the default fallback target"
         );
+        assert_eq!(codex.provider_name, "Mixed");
         assert_eq!(codex.context_window, 1_000_000);
     }
 
