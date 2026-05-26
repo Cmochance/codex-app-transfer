@@ -172,10 +172,7 @@ pub fn repair_residual_pollution(
             stripped_keys: stripped,
         });
     }
-    Ok(RepairReport {
-        repaired,
-        dry_run,
-    })
+    Ok(RepairReport { repaired, dry_run })
 }
 
 fn iter_snapshot_config_files(dir: &Path) -> Vec<PathBuf> {
@@ -353,7 +350,10 @@ mod tests {
     fn ignores_openai_base_url_pointing_to_third_party_proxy() {
         let toml = "openai_base_url = \"http://my-private-proxy.example.com:8080\"\n";
         let m = detect_signatures_in_text(toml, &app_config_json(), &[18080]);
-        assert!(m.is_empty(), "user-owned third-party proxy must not be flagged");
+        assert!(
+            m.is_empty(),
+            "user-owned third-party proxy must not be flagged"
+        );
     }
 
     #[test]
@@ -389,9 +389,7 @@ approval_policy = \"never\"
 
     #[test]
     fn fields_to_strip_for_catalog_only() {
-        let matched = vec![MatchedSignature::ModelCatalogJsonAppHome {
-            value: "x".into(),
-        }];
+        let matched = vec![MatchedSignature::ModelCatalogJsonAppHome { value: "x".into() }];
         let fields = compute_fields_to_strip(&matched);
         assert_eq!(fields, vec!["model_catalog_json"]);
     }
@@ -521,7 +519,9 @@ approval_policy = \"never\"
     fn scan_always_flags_polluted_snapshot_regardless_of_apply_state() {
         let (_t, paths) = make_paths();
         // recovery snapshot 自带 transfer 字段 = bug
-        let snap = paths.recovery_snapshots_dir.join("20260518T013518322-p7265");
+        let snap = paths
+            .recovery_snapshots_dir
+            .join("20260518T013518322-p7265");
         write(&snap.join("config.toml"), &polluted_toml(&paths.app_home));
         // live config 干净
         write(&paths.config_toml, "model = \"gpt-5.5\"\n");
@@ -544,7 +544,11 @@ approval_policy = \"never\"
         );
         write(&paths.config_toml, "model = \"gpt-5.5\"\n");
         let report = scan_residual_pollution(&paths, &[18080]).unwrap();
-        assert!(report.is_clean(), "用户自己的 catalog 路径不该被误判: {:?}", report);
+        assert!(
+            report.is_clean(),
+            "用户自己的 catalog 路径不该被误判: {:?}",
+            report
+        );
     }
 
     // ── repair_residual_pollution ─────────────────────────────────────
@@ -553,7 +557,11 @@ approval_policy = \"never\"
     fn repair_strips_only_listed_fields_keeps_user_lines() {
         let (_t, paths) = make_paths();
         let user_extras = "personality = \"pragmatic\"\nmodel = \"gpt-5.5\"\n";
-        let full = format!("{}{}", user_extras, polluted_toml_lines_only(&paths.app_home));
+        let full = format!(
+            "{}{}",
+            user_extras,
+            polluted_toml_lines_only(&paths.app_home)
+        );
         write(&paths.config_toml, &full);
 
         let report = scan_residual_pollution(&paths, &[18080]).unwrap();
@@ -567,7 +575,13 @@ approval_policy = \"never\"
         assert!(after.contains("personality = \"pragmatic\""));
         assert!(after.contains("model = \"gpt-5.5\""));
         // transfer 字段全清
-        for k in ["openai_base_url", "model_context_window", "model_catalog_json", "sandbox_mode", "approval_policy"] {
+        for k in [
+            "openai_base_url",
+            "model_context_window",
+            "model_catalog_json",
+            "sandbox_mode",
+            "approval_policy",
+        ] {
             assert!(!after.contains(k), "key {k} 应被 strip: \n{after}");
         }
 
