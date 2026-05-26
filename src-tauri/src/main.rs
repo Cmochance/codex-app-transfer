@@ -129,6 +129,61 @@ fn main() {
                     .await;
             });
 
+            // #268 启动时自检 Codex 原配置完整性:`auto_apply_on_startup_if_enabled`
+            // 与 `restore_codex_if_enabled("startup")` 跑完后,扫一次
+            // `~/.codex/config.toml` + active/recovery snapshots,看是否含
+            // transfer apply 残留字段(model_catalog_json 指向 app_home /
+            // openai_base_url 指向 transfer proxy)。发现污染 → emit Tauri
+            // event 让前端弹 banner 提示用户「针对性清除」;干净 → 静默 info!
+            // 日志一条便于诊断。
+            //
+            // 必须 sleep 一小段等 auto_apply 落盘,避免误识别"刚 apply 完的
+            // live config 含 transfer 字段"为污染(scan 已经过滤 active
+            // snapshot 存在的情况,但 apply 是异步,scan 跑得太早可能两边
+            // 状态都还没 settle)。
+            let app_handle_for_residual_scan = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use codex_app_transfer_codex_integration::{
+                    scan_residual_pollution, CodexPaths,
+                };
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                let paths = match CodexPaths::from_home_env() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "residual scan skipped: CodexPaths::from_home_env() failed"
+                        );
+                        return;
+                    }
+                };
+                // 复用 handler 一致的 port 列表(当前 settings.proxyPort + 历史默认 18080)
+                let ports = handlers::desktop::known_transfer_proxy_ports_for_startup();
+                match scan_residual_pollution(&paths, &ports) {
+                    Ok(report) => {
+                        if report.is_clean() {
+                            tracing::info!(
+                                "residual config scan: clean (transfer_currently_applied={})",
+                                report.transfer_currently_applied
+                            );
+                        } else {
+                            tracing::warn!(
+                                polluted_count = report.polluted.len(),
+                                "residual config scan: pollution detected, emitting event to UI"
+                            );
+                            if let Some(window) =
+                                app_handle_for_residual_scan.get_webview_window("main")
+                            {
+                                let _ = window.emit("residual-scan-report", &report);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "residual config scan failed");
+                    }
+                }
+            });
+
             // ── Plugin Unlock 守护进程自动启动 ──
             // 默认开启;用户显式关掉 autoUnlockCodexPlugins=false 才跳过 auto-start。
             // 必须复用 handlers::plugin_unlock 的 OnceCell 单例,否则会跟前端

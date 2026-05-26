@@ -2052,6 +2052,101 @@
     await refreshAppVersion();
     await refreshBackupList();
     await refreshCodexSnapshotStatus();
+    await refreshResidualScanStatus();
+  }
+
+  // #268 — Codex 原配置完整性自检渲染.
+  async function refreshResidualScanStatus() {
+    const statusEl = $("#residualScanStatus");
+    const repairBtn = $("#repairResidualBtn");
+    const previewEl = $("#residualScanPreview");
+    if (!statusEl) return;
+    statusEl.classList.remove("residual-clean", "residual-dirty");
+    statusEl.textContent = t("settings.residualScanStatusUnknown");
+    if (repairBtn) repairBtn.hidden = true;
+    if (previewEl) {
+      previewEl.hidden = true;
+      previewEl.textContent = "";
+    }
+    let report;
+    try {
+      report = await CCApi.scanResidualPollution();
+    } catch (error) {
+      statusEl.textContent = tFmt("settings.residualScanStatusError", {
+        error: error?.message || String(error),
+      });
+      return;
+    }
+    const count = (report?.polluted || []).length;
+    if (count === 0) {
+      statusEl.classList.add("residual-clean");
+      statusEl.textContent = report?.transferCurrentlyApplied
+        ? t("settings.residualScanStatusCleanWhileApplied")
+        : t("settings.residualScanStatusClean");
+      return;
+    }
+    statusEl.classList.add("residual-dirty");
+    statusEl.textContent = tFmt("settings.residualScanStatusDirty", { count });
+    if (repairBtn) repairBtn.hidden = false;
+  }
+
+  function formatResidualPreview(polluted) {
+    const lines = [];
+    for (const file of polluted) {
+      const kindLabel = (() => {
+        switch (file.kind) {
+          case "liveConfig":
+            return "~/.codex/config.toml";
+          case "activeSnapshot":
+            return "active snapshot";
+          case "recoverySnapshot":
+            return "recovery snapshot";
+          default:
+            return file.kind;
+        }
+      })();
+      lines.push(`[${kindLabel}] ${file.path}`);
+      for (const key of file.fieldsToStrip || []) {
+        lines.push(`  - ${key}`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  async function handleRepairResidual() {
+    const previewEl = $("#residualScanPreview");
+    let scan;
+    try {
+      scan = await CCApi.scanResidualPollution();
+    } catch (error) {
+      showToast(tFmt("settings.residualScanStatusError", {
+        error: error?.message || String(error),
+      }));
+      return;
+    }
+    if (!scan?.polluted?.length) {
+      await refreshResidualScanStatus();
+      return;
+    }
+    const preview = formatResidualPreview(scan.polluted);
+    if (previewEl) {
+      previewEl.textContent = `${t("settings.residualScanPreviewTitle")}\n\n${preview}`;
+      previewEl.hidden = false;
+    }
+    if (!window.confirm(tFmt("settings.residualScanConfirm", { preview }))) {
+      return;
+    }
+    try {
+      const result = await CCApi.repairResidualPollution({ dryRun: false });
+      const cleaned = (result?.repair?.repaired || []).length;
+      showToast(tFmt("settings.residualScanToastCleaned", { count: cleaned }));
+    } catch (error) {
+      showToast(tFmt("settings.residualScanStatusError", {
+        error: error?.message || String(error),
+      }));
+    } finally {
+      await refreshResidualScanStatus();
+    }
   }
 
   async function refreshAppVersion() {
@@ -2702,6 +2797,16 @@
         }
         const fellBackToLegacy = result && result.restored === false;
         showToast(t(fellBackToLegacy ? "toast.desktopClearedLegacy" : "toast.desktopCleared"));
+      }
+
+      if (action === "rescan-residual") {
+        await refreshResidualScanStatus();
+        return;
+      }
+
+      if (action === "repair-residual") {
+        await handleRepairResidual();
+        return;
       }
 
       if (action === "proxy-start") {
@@ -6462,9 +6567,18 @@
           const url = typeof e.payload === "string" ? e.payload : "";
           if (url) codexMcpHandleDeeplink(url);
         });
+        // #268 启动时自检 emit "residual-scan-report" 含污染文件清单 → 弹 toast
+        // 提示用户去设置页查看。干净时 backend 不 emit,这里也不会触发。
+        await event.listen("residual-scan-report", (e) => {
+          const report = e?.payload || {};
+          const count = (report.polluted || []).length;
+          if (count > 0) {
+            showToast(tFmt("settings.residualScanStartupToast", { count }));
+          }
+        });
       }
     } catch (err) {
-      console.error("deeplink listen:", err);
+      console.error("event listen:", err);
     }
   });
 })();

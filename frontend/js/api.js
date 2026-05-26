@@ -359,6 +359,15 @@
       });
     },
 
+    // #268 — Codex 原配置完整性自检.
+    async scanResidualPollution() {
+      return api('GET', '/api/desktop/scan-residual');
+    },
+
+    async repairResidualPollution({ dryRun = false } = {}) {
+      return api('POST', '/api/desktop/repair-residual', { dryRun });
+    },
+
     async startProxy(port) {
       if (port) {
         await this.saveSettings({ proxyPort: Number(port) });

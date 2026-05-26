@@ -103,6 +103,24 @@
   gap: 8px;
 }
 
+/* #268 — Codex 原配置完整性自检 preview pane */
+.settings-preview {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-2, rgba(15, 23, 42, .04));
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.settings-note.residual-clean { color: var(--success, #16a34a); }
+.settings-note.residual-dirty { color: var(--danger, #dc2626); }
+
 .inline-actions {
   justify-content: flex-end;
 }

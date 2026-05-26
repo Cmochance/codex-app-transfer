@@ -19,6 +19,7 @@ pub mod auth;
 pub mod electron_state;
 pub mod model_catalog;
 pub mod paths;
+pub mod residual;
 pub mod snapshot;
 pub mod toml_sync;
 
@@ -28,6 +29,10 @@ pub use apply::{
 pub use auth::{read_auth, write_auth};
 pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, upsert_catalog_models};
 pub use paths::CodexPaths;
+pub use residual::{
+    detect_signatures_in_text, repair_residual_pollution, scan_residual_pollution, MatchedSignature,
+    PollutedFile, PollutionSourceKind, RepairReport, RepairedFile, ResidualScanReport,
+};
 pub use snapshot::{
     gc_trash_older_than, get_snapshot_status, has_snapshot, list_snapshots, snapshot_codex_state,
     SnapshotInfo, SnapshotManifest, SnapshotStatus, TRASH_RETENTION_DAYS,

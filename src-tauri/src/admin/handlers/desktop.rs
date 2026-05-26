@@ -7,8 +7,8 @@
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::{
-    get_snapshot_status, has_snapshot, list_snapshots, restore_codex_snapshot, restore_codex_state,
-    CodexPaths,
+    get_snapshot_status, has_snapshot, list_snapshots, repair_residual_pollution,
+    restore_codex_snapshot, restore_codex_state, scan_residual_pollution, CodexPaths,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -34,6 +34,32 @@ pub struct DesktopRestoreRequest {
     pub snapshot_id: Option<String>,
     #[serde(default)]
     pub cleanup_all: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidualRepairRequest {
+    /// `true` 时只返回 strip 计划不写盘,供 UI 预览。
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// 已知 transfer proxy 端口的历史默认值。当前 settings.proxyPort 与该常量都会
+/// 参与 signature 匹配,覆盖"用户改过 port 后老 snapshot 仍保留旧 port"的场景。
+const TRANSFER_PROXY_PORT_LEGACY_DEFAULT: u16 = 18080;
+
+pub fn known_transfer_proxy_ports_for_startup() -> Vec<u16> {
+    known_transfer_proxy_ports()
+}
+
+fn known_transfer_proxy_ports() -> Vec<u16> {
+    let cfg = load_registry().unwrap_or_else(|_| json!({}));
+    let current = read_proxy_port(&cfg);
+    let mut ports = vec![current];
+    if current != TRANSFER_PROXY_PORT_LEGACY_DEFAULT {
+        ports.push(TRANSFER_PROXY_PORT_LEGACY_DEFAULT);
+    }
+    ports
 }
 
 // ── /api/desktop/* Axum HTTP Handlers ─────────────────────────────────
@@ -150,6 +176,50 @@ pub async fn desktop_restore(Json(payload): Json<DesktopRestoreRequest>) -> impl
             "restored": restored,
             "snapshotId": if snapshot_id.is_empty() { Value::Null } else { Value::String(snapshot_id) },
             "cleanupAll": payload.cleanup_all,
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/desktop/scan-residual` — #268 完整性自检.
+///
+/// 扫描 `~/.codex/config.toml` + active/recovery snapshots,返回所有含
+/// transfer apply 残留字段的文件清单。详见
+/// [`codex_app_transfer_codex_integration::residual`].
+pub async fn desktop_scan_residual() -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let ports = known_transfer_proxy_ports();
+    match scan_residual_pollution(&paths, &ports) {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/desktop/repair-residual` — 针对性 strip transfer 残留字段.
+///
+/// body: `{ "dryRun": bool }`(默认 `false`)。`dryRun=true` 时只返回 strip
+/// 计划不写盘,UI 用来弹 preview。
+pub async fn desktop_repair_residual(
+    Json(payload): Json<ResidualRepairRequest>,
+) -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let ports = known_transfer_proxy_ports();
+    let report = match scan_residual_pollution(&paths, &ports) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    match repair_residual_pollution(&report, payload.dry_run) {
+        Ok(repair) => Json(json!({
+            "success": true,
+            "scan": report,
+            "repair": repair,
         }))
         .into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

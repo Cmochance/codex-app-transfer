@@ -127,6 +127,14 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/desktop/snapshot-status",
             get(handlers::desktop::desktop_snapshot_status),
         )
+        .route(
+            "/api/desktop/scan-residual",
+            get(handlers::desktop::desktop_scan_residual),
+        )
+        .route(
+            "/api/desktop/repair-residual",
+            post(handlers::desktop::desktop_repair_residual),
+        )
         // Proxy lifecycle
         .route("/api/version", get(handlers::common::version))
         .route("/api/proxy/start", post(handlers::proxy::start_proxy))

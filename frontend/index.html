@@ -431,6 +431,18 @@
               <p class="settings-note" id="codexSnapshotStatus" data-i18n="settings.codexSnapshotStatusUnknown">正在读取快照状态…</p>
             </div>
           </div>
+          <div class="settings-row settings-row-stack" id="residualScanRow">
+            <strong data-i18n="settings.residualScanTitle">Codex 原配置完整性检查</strong>
+            <div>
+              <p class="settings-note" data-i18n="settings.residualScanHint">扫描 ~/.codex/config.toml 与本应用历史快照里是否残留 transfer apply 字段。启动时会自动扫一次，发现污染会顶部弹提示。</p>
+              <p class="settings-note" id="residualScanStatus" data-i18n="settings.residualScanStatusUnknown">正在扫描…</p>
+              <div class="settings-actions">
+                <button type="button" class="btn-secondary" data-action="rescan-residual" data-i18n="settings.residualScanRefresh">重新扫描</button>
+                <button type="button" class="btn-primary" data-action="repair-residual" id="repairResidualBtn" hidden data-i18n="settings.residualScanRepair">针对性清除</button>
+              </div>
+              <pre class="settings-preview" id="residualScanPreview" hidden></pre>
+            </div>
+          </div>
           <div class="settings-row settings-row-stack">
             <strong data-i18n="settings.codexNetworkAccess">允许 Codex 联网工具（全权限模式）</strong>
             <div>
