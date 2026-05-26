@@ -27,7 +27,7 @@ Codex App Transfer is a lightweight desktop config + forwarding tool for the **O
 
 After starting forwarding, Codex App talks to this tool at `127.0.0.1:18080`. Closing the window minimizes the app to the system tray; right-click the tray icon and choose "Exit" to fully quit.
 
-Current version **v2.1.15** (see [Changelog](CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
+Current version **v2.1.16** (see [Changelog](CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
 
 ## Preview
 

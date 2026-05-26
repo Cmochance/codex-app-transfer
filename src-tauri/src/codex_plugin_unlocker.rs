@@ -482,7 +482,7 @@ async fn inject_unlock_script(
     let unlock_script = r#"
 (async function() {
     const MARKER = '__codexAppTransferPluginUnlocker';
-    window[MARKER] = window[MARKER] || { version: '2.1.15', unlocked: false };
+    window[MARKER] = window[MARKER] || { version: '2.1.16', unlocked: false };
 
     const selectors = {
         disabledInstallButton: 'button:disabled.w-full.justify-center, [role="button"][aria-disabled="true"].cursor-not-allowed',
