@@ -1,0 +1,214 @@
+/* components/codex-conversations.css — #271 文档管理页第 5 tab 对话导出 */
+
+.codex-conv-filterbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.codex-conv-search { flex: 1 1 240px; min-width: 200px; }
+.codex-conv-filter { width: 130px; }
+.codex-conv-summary {
+  color: var(--muted, #6b7280);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+.codex-conv-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.codex-conv-select-all-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.codex-conv-format { width: 200px; }
+
+.codex-conv-warning {
+  background: color-mix(in srgb, var(--primary) 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary) 20%, transparent);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+  color: var(--muted, #4b5563);
+}
+
+.codex-conv-body {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  gap: 12px;
+  height: calc(100vh - 280px);
+  min-height: 400px;
+}
+
+.codex-conv-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.codex-conv-list-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid transparent;
+}
+.codex-conv-list-item:hover { background: color-mix(in srgb, var(--primary) 5%, transparent); }
+.codex-conv-list-item.selected {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 30%, transparent);
+}
+.codex-conv-list-item-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.codex-conv-list-checkbox { margin: 0; }
+.codex-conv-list-title {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+.codex-conv-list-kind {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.codex-conv-list-kind.active {
+  background: color-mix(in srgb, var(--success, #16a34a) 18%, transparent);
+  color: var(--success, #16a34a);
+}
+.codex-conv-list-kind.archived {
+  background: color-mix(in srgb, var(--muted, #6b7280) 18%, transparent);
+  color: var(--muted, #6b7280);
+}
+.codex-conv-list-meta {
+  font-size: 11px;
+  color: var(--muted, #6b7280);
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.codex-conv-detail {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+  overflow-y: auto;
+}
+.codex-conv-detail-empty {
+  color: var(--muted, #6b7280);
+  text-align: center;
+  margin-top: 40px;
+}
+.codex-conv-detail h3 {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+.codex-conv-detail-meta {
+  font-size: 12px;
+  color: var(--muted, #6b7280);
+  margin-bottom: 12px;
+}
+.codex-conv-turn {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px dashed var(--line);
+}
+.codex-conv-turn:last-child { border-bottom: 0; }
+.codex-conv-turn-header {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 6px;
+  color: var(--muted, #6b7280);
+}
+.codex-conv-item {
+  margin-bottom: 8px;
+}
+.codex-conv-item-role {
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--primary);
+  margin-bottom: 2px;
+}
+.codex-conv-item-text {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.codex-conv-item-text.codex-conv-tool {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  background: color-mix(in srgb, var(--muted, #6b7280) 8%, transparent);
+  padding: 6px 8px;
+  border-radius: 6px;
+  max-height: 180px;
+  overflow: auto;
+}
+.codex-conv-compacted {
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  border-left: 3px solid var(--primary);
+  padding: 6px 10px;
+  font-style: italic;
+  font-size: 12px;
+}
+
+/* Options dialog 简陋实现:用 dialog 元素 */
+dialog.codex-conv-options-dialog {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 20px;
+  background: var(--surface);
+  color: inherit;
+  width: 420px;
+  max-width: 90vw;
+}
+dialog.codex-conv-options-dialog::backdrop {
+  background: rgba(0, 0, 0, .35);
+  backdrop-filter: blur(2px);
+}
+dialog.codex-conv-options-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+.codex-conv-options-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+  font-size: 13px;
+}
+.codex-conv-options-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}

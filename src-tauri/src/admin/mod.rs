@@ -135,6 +135,19 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/desktop/repair-residual",
             post(handlers::desktop::desktop_repair_residual),
         )
+        // Conversation export (#271)
+        .route(
+            "/api/conversations/list",
+            get(handlers::conversations::list_handler),
+        )
+        .route(
+            "/api/conversations/:id",
+            get(handlers::conversations::detail_handler),
+        )
+        .route(
+            "/api/conversations/export",
+            post(handlers::conversations::export_handler),
+        )
         // Proxy lifecycle
         .route("/api/version", get(handlers::common::version))
         .route("/api/proxy/start", post(handlers::proxy::start_proxy))

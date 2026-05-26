@@ -2804,6 +2804,19 @@
         return;
       }
 
+      if (action === "codex-conv-refresh") {
+        await codexConversationsLoadAndRender();
+        return;
+      }
+      if (action === "codex-conv-export-selected") {
+        await codexConversationsExportSelected();
+        return;
+      }
+      if (action === "codex-conv-options") {
+        codexConversationsOpenOptionsDialog();
+        return;
+      }
+
       if (action === "repair-residual") {
         await handleRepairResidual();
         return;
@@ -5401,6 +5414,11 @@
       mcpPane.hidden = tab !== "mcp";
       mcpPane.classList.toggle("active", tab === "mcp");
     }
+    const convPane = $("#codexConversationsTab");
+    if (convPane) {
+      convPane.hidden = tab !== "conversations";
+      convPane.classList.toggle("active", tab === "conversations");
+    }
     // 切 tab 时把非当前 tab 的 Edit 模式回退 preview
     if (tab !== "agents") codexAgentsSwitchMode("preview");
     if (tab !== "memories") codexMemoriesSwitchMode("preview");
@@ -5425,9 +5443,290 @@
       await codexMemoriesRawLoadAndRender();
     } else if (tab === "mcp") {
       await codexMcpOpenSubpane(codexMcpCurrentSubpane || "servers");
+    } else if (tab === "conversations") {
+      await codexConversationsLoadAndRender();
     }
     await codexRefreshSidebarBadges();
   }
+
+  // ── #271 Codex CLI rollout 对话导出 ─────────────────────────────────
+  let conversationsCache = [];                  // SessionMeta[] 缓存
+  let conversationsSelected = new Set();        // 多选集合
+  let conversationsActiveId = null;             // 当前展开详情的 session
+  let conversationsExportOptions = {
+    includeReasoning: false,
+    includeToolCalls: true,
+    toolOutputMaxChars: 2048,
+    includeSystemPrompts: false,
+    redactSecrets: true,
+  };
+
+  let _convInitDone = false;
+  function codexConversationsInitOnce() {
+    if (_convInitDone) return;
+    _convInitDone = true;
+    $("#codexConvSearch")?.addEventListener("input", codexConversationsRenderList);
+    $("#codexConvKindFilter")?.addEventListener("change", codexConversationsRenderList);
+    $("#codexConvSelectAll")?.addEventListener("change", (e) => {
+      const filtered = codexConversationsFiltered();
+      if (e.target.checked) {
+        filtered.forEach((s) => conversationsSelected.add(s.id));
+      } else {
+        filtered.forEach((s) => conversationsSelected.delete(s.id));
+      }
+      codexConversationsRenderList();
+    });
+  }
+
+  async function codexConversationsLoadAndRender() {
+    codexConversationsInitOnce();
+    const list = $("#codexConvList");
+    const summary = $("#codexConvSummary");
+    if (list) list.innerHTML = `<li class="codex-conv-list-loading">${t("codex.conv.loading") || "加载中…"}</li>`;
+    try {
+      conversationsCache = await CCApi.listConversations();
+    } catch (e) {
+      conversationsCache = [];
+      if (list) list.innerHTML = `<li class="codex-conv-list-loading">${e.message || e}</li>`;
+      return;
+    }
+    if (summary) {
+      summary.textContent = tFmt("codex.conv.summary", { count: conversationsCache.length });
+    }
+    codexConversationsRenderList();
+  }
+
+  function codexConversationsFiltered() {
+    const search = ($("#codexConvSearch")?.value || "").toLowerCase().trim();
+    const kindFilter = $("#codexConvKindFilter")?.value || "all";
+    return conversationsCache.filter((s) => {
+      if (kindFilter !== "all" && s.kind !== kindFilter) return false;
+      if (!search) return true;
+      const hay = [s.title || "", s.id, s.cwd, s.originator, s.modelProvider]
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(search);
+    });
+  }
+
+  function codexConversationsRenderList() {
+    const list = $("#codexConvList");
+    if (!list) return;
+    const filtered = codexConversationsFiltered();
+    if (filtered.length === 0) {
+      list.innerHTML = `<li class="codex-conv-list-loading">${t("codex.conv.noResults") || "无匹配 session"}</li>`;
+      codexConvUpdateExportBtn();
+      return;
+    }
+    list.innerHTML = filtered.map((s) => codexConversationsItemHtml(s)).join("");
+    list.querySelectorAll(".codex-conv-list-item").forEach((el) => {
+      el.addEventListener("click", (e) => {
+        if (e.target.closest(".codex-conv-list-checkbox")) return;
+        codexConversationsOpenDetail(el.dataset.sessionId);
+      });
+    });
+    list.querySelectorAll(".codex-conv-list-checkbox").forEach((cb) => {
+      cb.addEventListener("change", (e) => {
+        const id = e.target.dataset.sessionId;
+        if (e.target.checked) conversationsSelected.add(id);
+        else conversationsSelected.delete(id);
+        codexConvUpdateExportBtn();
+      });
+    });
+    codexConvUpdateExportBtn();
+  }
+
+  function codexConversationsItemHtml(s) {
+    const title = s.title || codexConvFallbackTitle(s);
+    const kindCls = s.kind === "active" ? "active" : "archived";
+    const date = s.createdAt ? new Date(s.createdAt).toLocaleString() : "";
+    const cwdShort = s.cwd ? s.cwd.split("/").pop() || s.cwd : "";
+    const isSelected = conversationsSelected.has(s.id);
+    const isActive = conversationsActiveId === s.id;
+    return `
+      <li class="codex-conv-list-item ${isActive ? "selected" : ""}" data-session-id="${escapeHtml(s.id)}">
+        <div class="codex-conv-list-item-row">
+          <input type="checkbox" class="codex-conv-list-checkbox" data-session-id="${escapeHtml(s.id)}" ${isSelected ? "checked" : ""}>
+          <span class="codex-conv-list-title" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
+          <span class="codex-conv-list-kind ${kindCls}">${kindCls}</span>
+        </div>
+        <div class="codex-conv-list-meta">
+          <span>${escapeHtml(date)}</span>
+          <span>· ${escapeHtml(cwdShort)}</span>
+          <span>· ${s.turnCount} ${t("codex.conv.turns") || "turns"}</span>
+          ${s.modelProvider ? `<span>· ${escapeHtml(s.modelProvider)}</span>` : ""}
+        </div>
+      </li>
+    `;
+  }
+
+  function codexConvFallbackTitle(s) {
+    // 没 title 时拿 cwd basename + 短 id 做兜底
+    const cwdBase = (s.cwd || "").split("/").pop() || "";
+    const shortId = (s.id || "").slice(0, 8);
+    return cwdBase ? `${cwdBase} (${shortId})` : `Session ${shortId}`;
+  }
+
+  function codexConvUpdateExportBtn() {
+    const btn = $("#codexConvExportBtn");
+    if (!btn) return;
+    btn.disabled = conversationsSelected.size === 0;
+    btn.textContent = "";
+    const icon = document.createElement("i");
+    icon.className = "bi bi-download";
+    btn.appendChild(icon);
+    const lbl = document.createElement("span");
+    lbl.textContent = conversationsSelected.size > 0
+      ? tFmt("codex.conv.exportSelectedN", { count: conversationsSelected.size })
+      : t("codex.conv.exportSelected");
+    btn.appendChild(lbl);
+  }
+
+  async function codexConversationsOpenDetail(id) {
+    conversationsActiveId = id;
+    codexConversationsRenderList();
+    const detail = $("#codexConvDetail");
+    if (!detail) return;
+    detail.innerHTML = `<p class="codex-conv-detail-empty">${t("codex.conv.loading") || "加载中…"}</p>`;
+    let session;
+    try {
+      session = await CCApi.getConversation(id);
+    } catch (e) {
+      detail.innerHTML = `<p class="codex-conv-detail-empty">${escapeHtml(e.message || String(e))}</p>`;
+      return;
+    }
+    detail.innerHTML = codexConversationsDetailHtml(session);
+  }
+
+  function codexConversationsDetailHtml(session) {
+    const meta = session.meta || {};
+    const headerTitle = meta.title || codexConvFallbackTitle(meta);
+    let html = `<h3>${escapeHtml(headerTitle)}</h3>
+      <div class="codex-conv-detail-meta">
+        <div>ID: <code>${escapeHtml(meta.id || "")}</code></div>
+        <div>${escapeHtml(meta.cwd || "")} · ${escapeHtml(meta.originator || "")} · ${escapeHtml(meta.modelProvider || "")}</div>
+      </div>`;
+    for (let i = 0; i < (session.turns || []).length; i += 1) {
+      const turn = session.turns[i];
+      html += `<div class="codex-conv-turn"><div class="codex-conv-turn-header">Turn ${i + 1}</div>`;
+      for (const item of turn.items || []) {
+        html += codexConversationsItemDetailHtml(item);
+      }
+      html += `</div>`;
+    }
+    return html;
+  }
+
+  function codexConversationsItemDetailHtml(item) {
+    if (!item || !item.type) return "";
+    switch (item.type) {
+      case "User":
+      case "user":
+        return `<div class="codex-conv-item"><div class="codex-conv-item-role">${t("codex.conv.roleUser") || "用户"}</div><div class="codex-conv-item-text">${escapeHtml(item.text || "")}</div></div>`;
+      case "Assistant":
+      case "assistant":
+        return `<div class="codex-conv-item"><div class="codex-conv-item-role">${t("codex.conv.roleAssistant") || "助手"}</div><div class="codex-conv-item-text">${escapeHtml(item.text || "")}</div></div>`;
+      case "Reasoning":
+      case "reasoning":
+        return `<details class="codex-conv-item"><summary>${t("codex.conv.reasoning") || "Reasoning"}</summary><div class="codex-conv-item-text">${escapeHtml(item.text || "")}</div></details>`;
+      case "ToolCall":
+      case "toolCall":
+        return `<details class="codex-conv-item"><summary>🔧 ${escapeHtml(item.name || "")}</summary><div class="codex-conv-item-text codex-conv-tool">${escapeHtml(item.arguments || "")}</div></details>`;
+      case "ToolOutput":
+      case "toolOutput":
+        return `<details class="codex-conv-item"><summary>↳ output</summary><div class="codex-conv-item-text codex-conv-tool">${escapeHtml(truncateString(item.output || "", 4000))}</div></details>`;
+      case "Compacted":
+      case "compacted":
+        return `<div class="codex-conv-item codex-conv-compacted">📦 ${t("codex.conv.compacted") || "Autocompact 切点"}: ${escapeHtml(item.summary || "")}</div>`;
+      case "System":
+      case "system":
+        return `<details class="codex-conv-item"><summary>[${escapeHtml(item.role || "system")}]</summary><div class="codex-conv-item-text">${escapeHtml(item.text || "")}</div></details>`;
+      default:
+        return "";
+    }
+  }
+
+  function truncateString(s, n) {
+    if (!s || s.length <= n) return s || "";
+    return `${s.slice(0, n)}\n… [前端预览截断,导出文件含完整内容]`;
+  }
+
+  async function codexConversationsExportSelected() {
+    if (conversationsSelected.size === 0) return;
+    const format = $("#codexConvFormat")?.value || "markdown";
+    try {
+      const { blob, filename } = await CCApi.exportConversations({
+        sessionIds: Array.from(conversationsSelected),
+        format,
+        options: conversationsExportOptions,
+      });
+      // 通过 anchor download 保存
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      showToast(tFmt("codex.conv.toastExported", { count: conversationsSelected.size }));
+    } catch (e) {
+      showToast(`${t("codex.conv.exportFailed") || "导出失败"}: ${e.message || e}`);
+    }
+  }
+
+  function codexConversationsOpenOptionsDialog() {
+    let dialog = $("#codexConvOptionsDialog");
+    if (!dialog) {
+      dialog = document.createElement("dialog");
+      dialog.id = "codexConvOptionsDialog";
+      dialog.className = "codex-conv-options-dialog";
+      document.body.appendChild(dialog);
+    }
+    const o = conversationsExportOptions;
+    dialog.innerHTML = `
+      <h3>${t("codex.conv.optionsTitle") || "导出选项"}</h3>
+      <label class="codex-conv-options-row">
+        <input type="checkbox" id="optInclReasoning" ${o.includeReasoning ? "checked" : ""}>
+        <span>${t("codex.conv.optIncludeReasoning") || "包含 reasoning 块"}</span>
+      </label>
+      <label class="codex-conv-options-row">
+        <input type="checkbox" id="optInclTools" ${o.includeToolCalls ? "checked" : ""}>
+        <span>${t("codex.conv.optIncludeToolCalls") || "包含 tool calls + outputs"}</span>
+      </label>
+      <label class="codex-conv-options-row">
+        <input type="checkbox" id="optInclSystem" ${o.includeSystemPrompts ? "checked" : ""}>
+        <span>${t("codex.conv.optIncludeSystem") || "包含 developer / system 消息"}</span>
+      </label>
+      <label class="codex-conv-options-row">
+        <input type="checkbox" id="optRedact" ${o.redactSecrets ? "checked" : ""}>
+        <span>${t("codex.conv.optRedact") || "Redact 密钥 (sk- / cas_ / JWT / Bearer)"}</span>
+      </label>
+      <label class="codex-conv-options-row">
+        <span>${t("codex.conv.optToolMax") || "Tool output 截断字符数"}:</span>
+        <input type="number" id="optToolMax" min="100" max="200000" step="256" value="${o.toolOutputMaxChars}" style="width: 100px;">
+      </label>
+      <div class="codex-conv-options-actions">
+        <button type="button" class="btn btn-outline-primary btn-sm" id="optCancelBtn">${t("common.cancel") || "取消"}</button>
+        <button type="button" class="btn btn-primary btn-sm" id="optSaveBtn">${t("common.save") || "保存"}</button>
+      </div>
+    `;
+    $("#optCancelBtn").onclick = () => dialog.close();
+    $("#optSaveBtn").onclick = () => {
+      conversationsExportOptions = {
+        includeReasoning: $("#optInclReasoning").checked,
+        includeToolCalls: $("#optInclTools").checked,
+        includeSystemPrompts: $("#optInclSystem").checked,
+        redactSecrets: $("#optRedact").checked,
+        toolOutputMaxChars: Math.max(100, Number($("#optToolMax").value) || 2048),
+      };
+      dialog.close();
+      showToast(t("codex.conv.optionsSaved") || "选项已保存");
+    };
+    dialog.showModal();
+  }
+
+  // escapeHtml 复用 IIFE 顶部 line 107 的实现
 
   /** sidebar badge: 'ON' (managed) / 'OFF' / 数字(skills 数) */
   async function codexRefreshSidebarBadges() {

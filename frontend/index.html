@@ -533,6 +533,11 @@
               <span data-i18n="codex.tabSkills">Skills</span>
               <small class="codex-sidebar-badge" id="codexSidebarBadge-skills"></small>
             </button>
+            <button type="button" class="codex-sidebar-item" data-codex-tab="conversations">
+              <i class="bi bi-chat-dots"></i>
+              <span data-i18n="codex.tabConversations">Conversations</span>
+              <small class="codex-sidebar-badge" id="codexSidebarBadge-conversations"></small>
+            </button>
           </nav>
 
           <article class="panel codex-content" id="codex-assets-panel">
@@ -758,6 +763,47 @@
               <button class="btn btn-outline-primary" type="button" data-action="codex-skills-history-toggle"><i class="bi bi-clock-history"></i><span data-i18n="codex.history">History</span></button>
             </div>
           </div>
+
+          <!-- Conversations tab (#271) — Codex CLI rollout 对话导出 -->
+          <div class="codex-agents-raw-tab codex-pane" id="codexConversationsTab" data-codex-pane="conversations" hidden>
+            <div class="codex-conv-filterbar">
+              <input type="search" class="form-control form-control-sm codex-conv-search" id="codexConvSearch" data-i18n-placeholder="codex.conv.searchPlaceholder" placeholder="搜索 (title / cwd / id)">
+              <select class="form-select form-select-sm codex-conv-filter" id="codexConvKindFilter">
+                <option value="all" data-i18n="codex.conv.kindAll">全部</option>
+                <option value="active" data-i18n="codex.conv.kindActive">Active</option>
+                <option value="archived" data-i18n="codex.conv.kindArchived">Archived</option>
+              </select>
+              <span class="codex-conv-summary" id="codexConvSummary"></span>
+              <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-refresh"><i class="bi bi-arrow-clockwise"></i><span data-i18n="codex.conv.refresh">刷新</span></button>
+            </div>
+
+            <div class="codex-conv-toolbar">
+              <label class="codex-conv-select-all-label">
+                <input type="checkbox" id="codexConvSelectAll">
+                <span data-i18n="codex.conv.selectAll">全选(过滤后)</span>
+              </label>
+              <select class="form-select form-select-sm codex-conv-format" id="codexConvFormat">
+                <option value="markdown">Markdown (.md)</option>
+                <option value="json">JSON (.json)</option>
+                <option value="jsonl" data-i18n="codex.conv.formatJsonl">原始 JSONL</option>
+              </select>
+              <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-options" data-i18n="codex.conv.options"><i class="bi bi-sliders"></i>选项</button>
+              <button class="btn btn-primary btn-sm" type="button" data-action="codex-conv-export-selected" id="codexConvExportBtn" disabled><i class="bi bi-download"></i><span data-i18n="codex.conv.exportSelected">导出选中</span></button>
+            </div>
+
+            <div class="codex-conv-warning">
+              <i class="bi bi-info-circle"></i>
+              <span data-i18n="codex.conv.warnRedact">默认已 redact 密钥(sk-/cas_/JWT/Bearer)。Reasoning 默认隐藏,Tool calls 默认含,output > 2KB 截断。点「选项」调整。</span>
+            </div>
+
+            <div class="codex-conv-body">
+              <ul class="codex-conv-list" id="codexConvList"></ul>
+              <div class="codex-conv-detail" id="codexConvDetail">
+                <p class="codex-conv-detail-empty" data-i18n="codex.conv.selectPrompt">选中一条 session 看详情。</p>
+              </div>
+            </div>
+          </div>
+
           </article>
         </div>
 
