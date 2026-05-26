@@ -3482,6 +3482,7 @@
     // 切换路径或重新加载时强制回 preview 模式
     codexAgentsSwitchMode("preview");
     if (!currentAgentsHash) {
+      pre.classList.remove("codex-md-rendered");
       pre.textContent = "";
       pre.setAttribute("data-empty-hint", t("codex.agentsPathEmpty"));
       ta.value = "";
@@ -3493,10 +3494,12 @@
       if (!r.ok) throw new Error("raw fetch failed");
       const j = await r.json();
       codexAgentsLastFullContent = j.content || "";
-      pre.textContent = codexAgentsLastFullContent;
+      pre.classList.add("codex-md-rendered");
+      pre.innerHTML = renderMiniMd(codexAgentsLastFullContent);
       pre.removeAttribute("data-empty-hint");
       ta.value = codexAgentsLastFullContent;
     } catch (e) {
+      pre.classList.remove("codex-md-rendered");
       pre.textContent = "";
       pre.setAttribute("data-empty-hint", `读取失败: ${e.message || e}`);
     }
@@ -3955,6 +3958,7 @@
     if (!pre || !ta) return;
     codexMemoriesSwitchMode("preview");
     if (!currentMemoriesHash) {
+      pre.classList.remove("codex-md-rendered");
       pre.textContent = "";
       pre.setAttribute("data-empty-hint", t("codex.memoriesLoading"));
       ta.value = "";
@@ -3966,10 +3970,12 @@
       if (!r.ok) throw new Error("raw fetch failed");
       const j = await r.json();
       codexMemoriesLastFullContent = j.content || "";
-      pre.textContent = codexMemoriesLastFullContent;
+      pre.classList.add("codex-md-rendered");
+      pre.innerHTML = renderMiniMd(codexMemoriesLastFullContent);
       pre.removeAttribute("data-empty-hint");
       ta.value = codexMemoriesLastFullContent;
     } catch (e) {
+      pre.classList.remove("codex-md-rendered");
       pre.textContent = "";
       pre.setAttribute("data-empty-hint", `读取失败: ${e.message || e}`);
     }
@@ -4166,6 +4172,7 @@
     if (!pre || !ta) return;
     codexSkillsSwitchMode("preview");
     if (!currentSkillsHash) {
+      pre.classList.remove("codex-md-rendered");
       pre.textContent = "";
       pre.setAttribute("data-empty-hint", t("codex.skillsEmpty"));
       ta.value = "";
@@ -4177,10 +4184,12 @@
       if (!r.ok) throw new Error("raw fetch failed");
       const j = await r.json();
       codexSkillsLastFullContent = j.content || "";
-      pre.textContent = codexSkillsLastFullContent;
+      pre.classList.add("codex-md-rendered");
+      pre.innerHTML = renderMiniMd(codexSkillsLastFullContent);
       pre.removeAttribute("data-empty-hint");
       ta.value = codexSkillsLastFullContent;
     } catch (e) {
+      pre.classList.remove("codex-md-rendered");
       pre.textContent = "";
       pre.setAttribute("data-empty-hint", `读取失败: ${e.message || e}`);
     }
@@ -5453,6 +5462,114 @@
     await codexRefreshSidebarBadges();
   }
 
+  // ── #271 cas-dropdown 自定义下拉(替代 native <select> 让 menu 锚定在
+  //     toggle 正下方,不被 OS popup 移到选中项位置)─────────────────────
+  /**
+   * 给 `<div class="cas-dropdown" data-value="...">` 节点绑定行为:
+   * - render(options): 重建 menu items + 更新当前 label
+   * - getValue(): 返 data-value
+   * - setValue(v): 改 data-value + 同步 label + 触发 change 回调
+   * - 点击外部 / ESC → 收起
+   *
+   * options: `[{ value, label, title? }]`
+   */
+  function casDropdownBind(rootEl, { options, onChange }) {
+    if (!rootEl || rootEl._casBound) {
+      if (rootEl) {
+        // 已绑过,只刷新 options
+        casDropdownRender(rootEl, options);
+      }
+      return;
+    }
+    rootEl._casBound = true;
+    rootEl._casOnChange = onChange;
+    const toggle = rootEl.querySelector(".cas-dropdown-toggle");
+    const menu = rootEl.querySelector(".cas-dropdown-menu");
+    toggle?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isOpen = !menu.hidden;
+      casDropdownCloseAll();
+      if (!isOpen) {
+        menu.hidden = false;
+        toggle.setAttribute("aria-expanded", "true");
+      }
+    });
+    menu?.addEventListener("click", (e) => {
+      const li = e.target.closest("li[data-value]");
+      if (!li) return;
+      const newValue = li.dataset.value;
+      casDropdownSetValue(rootEl, newValue, { fireChange: true });
+      casDropdownClose(rootEl);
+    });
+    casDropdownRender(rootEl, options);
+  }
+
+  function casDropdownRender(rootEl, options) {
+    rootEl._casOptions = options || [];
+    const menu = rootEl.querySelector(".cas-dropdown-menu");
+    if (!menu) return;
+    menu.innerHTML = "";
+    for (const opt of rootEl._casOptions) {
+      const li = document.createElement("li");
+      li.dataset.value = opt.value;
+      li.textContent = opt.label;
+      if (opt.title) li.title = opt.title;
+      li.setAttribute("role", "option");
+      menu.appendChild(li);
+    }
+    // 当前 data-value 在新 options 里找不到时 → fallback 到第一个
+    const cur = rootEl.dataset.value;
+    if (!rootEl._casOptions.some((o) => o.value === cur)) {
+      const firstVal = rootEl._casOptions[0]?.value;
+      if (firstVal) casDropdownSetValue(rootEl, firstVal, { fireChange: false });
+    } else {
+      casDropdownSyncLabel(rootEl);
+    }
+  }
+
+  function casDropdownSyncLabel(rootEl) {
+    const labelEl = rootEl.querySelector(".cas-dropdown-label");
+    const cur = rootEl.dataset.value;
+    const opt = (rootEl._casOptions || []).find((o) => o.value === cur);
+    if (labelEl && opt) labelEl.textContent = opt.label;
+    // 标记 menu 内当前项
+    rootEl.querySelectorAll(".cas-dropdown-menu li").forEach((li) => {
+      li.classList.toggle("cas-dropdown-selected", li.dataset.value === cur);
+    });
+  }
+
+  function casDropdownGetValue(rootEl) {
+    return rootEl?.dataset?.value || "";
+  }
+
+  function casDropdownSetValue(rootEl, v, { fireChange } = { fireChange: true }) {
+    if (!rootEl) return;
+    rootEl.dataset.value = v;
+    casDropdownSyncLabel(rootEl);
+    if (fireChange && typeof rootEl._casOnChange === "function") {
+      rootEl._casOnChange(v);
+    }
+  }
+
+  function casDropdownClose(rootEl) {
+    const menu = rootEl?.querySelector(".cas-dropdown-menu");
+    const toggle = rootEl?.querySelector(".cas-dropdown-toggle");
+    if (menu) menu.hidden = true;
+    if (toggle) toggle.setAttribute("aria-expanded", "false");
+  }
+
+  function casDropdownCloseAll() {
+    document.querySelectorAll(".cas-dropdown").forEach(casDropdownClose);
+  }
+
+  // 全局监听一次:外部点击 + ESC → close all
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".cas-dropdown")) casDropdownCloseAll();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") casDropdownCloseAll();
+  });
+
   // ── #271 Codex CLI rollout 对话导出 ─────────────────────────────────
   let conversationsCache = [];                  // SessionMeta[] 缓存
   let conversationsSelected = new Set();        // 多选集合
@@ -5470,8 +5587,28 @@
     if (_convInitDone) return;
     _convInitDone = true;
     $("#codexConvSearch")?.addEventListener("input", codexConversationsRenderList);
-    $("#codexConvKindFilter")?.addEventListener("change", codexConversationsRenderList);
-    $("#codexConvCwdFilter")?.addEventListener("change", codexConversationsRenderList);
+    // cas-dropdown: kind / format 是固定 options,在 init 时绑一次
+    casDropdownBind($("#codexConvKindFilter"), {
+      options: [
+        { value: "all", label: t("codex.conv.kindAll") || "全部" },
+        { value: "active", label: t("codex.conv.kindActive") || "Active" },
+        { value: "archived", label: t("codex.conv.kindArchived") || "Archived" },
+      ],
+      onChange: () => codexConversationsRenderList(),
+    });
+    casDropdownBind($("#codexConvFormat"), {
+      options: [
+        { value: "markdown", label: "Markdown (.md)" },
+        { value: "json", label: "JSON (.json)" },
+        { value: "jsonl", label: t("codex.conv.formatJsonl") || "原始 JSONL" },
+      ],
+      onChange: () => {},
+    });
+    // cwd filter options 跟随 conversationsCache 重建,这里先绑 onChange + 空 options
+    casDropdownBind($("#codexConvCwdFilter"), {
+      options: [{ value: "all", label: t("codex.conv.cwdAll") || "所有项目" }],
+      onChange: () => codexConversationsRenderList(),
+    });
     $("#codexConvSelectAll")?.addEventListener("change", (e) => {
       const filtered = codexConversationsFiltered();
       if (e.target.checked) {
@@ -5502,11 +5639,10 @@
     codexConversationsRenderList();
   }
 
-  /** 把 conversationsCache 里所有 cwd 抽出来灌进 #codexConvCwdFilter (按出现次数倒序). */
+  /** 把 conversationsCache 里所有 cwd 抽出来重建 cas-dropdown 选项. */
   function codexConversationsPopulateCwdFilter() {
-    const sel = $("#codexConvCwdFilter");
-    if (!sel) return;
-    const prev = sel.value;
+    const root = $("#codexConvCwdFilter");
+    if (!root) return;
     // 统计 cwd → count
     const counts = new Map();
     for (const s of conversationsCache) {
@@ -5514,26 +5650,18 @@
       counts.set(s.cwd, (counts.get(s.cwd) || 0) + 1);
     }
     const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-    // 重建 options(保留 "全部" 头)
-    sel.innerHTML = `<option value="all">${t("codex.conv.cwdAll") || "所有项目"}</option>`;
+    const options = [{ value: "all", label: t("codex.conv.cwdAll") || "所有项目" }];
     for (const [cwd, count] of sorted) {
-      const opt = document.createElement("option");
-      opt.value = cwd;
       const base = cwd.split("/").pop() || cwd;
-      opt.textContent = `${base} (${count})`;
-      opt.title = cwd; // hover 显完整路径
-      sel.appendChild(opt);
+      options.push({ value: cwd, label: `${base} (${count})`, title: cwd });
     }
-    // 还原之前的选择(如果还在新选项里)
-    if (prev && [...sel.options].some((o) => o.value === prev)) {
-      sel.value = prev;
-    }
+    casDropdownRender(root, options);
   }
 
   function codexConversationsFiltered() {
     const search = ($("#codexConvSearch")?.value || "").toLowerCase().trim();
-    const kindFilter = $("#codexConvKindFilter")?.value || "all";
-    const cwdFilter = $("#codexConvCwdFilter")?.value || "all";
+    const kindFilter = casDropdownGetValue($("#codexConvKindFilter")) || "all";
+    const cwdFilter = casDropdownGetValue($("#codexConvCwdFilter")) || "all";
     return conversationsCache.filter((s) => {
       if (kindFilter !== "all" && s.kind !== kindFilter) return false;
       if (cwdFilter !== "all" && s.cwd !== cwdFilter) return false;
@@ -5827,7 +5955,7 @@
 
   async function codexConversationsExportSelected() {
     if (conversationsSelected.size === 0) return;
-    const format = $("#codexConvFormat")?.value || "markdown";
+    const format = casDropdownGetValue($("#codexConvFormat")) || "markdown";
     const ids = Array.from(conversationsSelected);
     const isMulti = ids.length > 1;
 

@@ -1,5 +1,84 @@
 /* components/codex-conversations.css — #271 文档管理页第 5 tab 对话导出 */
 
+/* cas-dropdown: 自定义下拉(替代原生 select,menu 锚定在 toggle 正下方) */
+.cas-dropdown {
+  position: relative;
+  display: inline-block;
+}
+.cas-dropdown-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: 13px;
+  line-height: 1.4;
+  background: var(--surface, #fff);
+  border: 1px solid var(--line, #d1d5db);
+  border-radius: 8px;
+  cursor: pointer;
+  color: inherit;
+  text-align: left;
+}
+.cas-dropdown-toggle:hover {
+  border-color: color-mix(in srgb, var(--primary) 50%, var(--line));
+}
+.cas-dropdown[aria-expanded="true"] .cas-dropdown-toggle,
+.cas-dropdown-toggle[aria-expanded="true"] {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 15%, transparent);
+}
+.cas-dropdown-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cas-dropdown-caret {
+  font-size: 11px;
+  color: var(--muted, #6b7280);
+  transition: transform 0.15s ease;
+}
+.cas-dropdown-toggle[aria-expanded="true"] .cas-dropdown-caret {
+  transform: rotate(180deg);
+}
+.cas-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 100%;
+  max-width: 320px;
+  max-height: 280px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  background: var(--surface, #fff);
+  border: 1px solid var(--line, #d1d5db);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(15, 23, 42, .12);
+  z-index: 1500;
+  list-style: none;
+}
+.cas-dropdown-menu li {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cas-dropdown-menu li:hover {
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+}
+.cas-dropdown-menu li.cas-dropdown-selected {
+  background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary);
+  font-weight: 600;
+}
+
 .codex-conv-filterbar {
   display: flex;
   gap: 8px;

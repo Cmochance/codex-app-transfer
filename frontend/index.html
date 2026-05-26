@@ -768,14 +768,20 @@
           <div class="codex-agents-raw-tab codex-pane" id="codexConversationsTab" data-codex-pane="conversations" hidden>
             <div class="codex-conv-filterbar">
               <input type="search" class="form-control form-control-sm codex-conv-search" id="codexConvSearch" data-i18n-placeholder="codex.conv.searchPlaceholder" placeholder="搜索 (title / cwd / id)">
-              <select class="form-select form-select-sm codex-conv-filter" id="codexConvKindFilter">
-                <option value="all" data-i18n="codex.conv.kindAll">全部</option>
-                <option value="active" data-i18n="codex.conv.kindActive">Active</option>
-                <option value="archived" data-i18n="codex.conv.kindArchived">Archived</option>
-              </select>
-              <select class="form-select form-select-sm codex-conv-filter-cwd" id="codexConvCwdFilter" title="按所属项目目录过滤">
-                <option value="all" data-i18n="codex.conv.cwdAll">所有项目</option>
-              </select>
+              <div class="cas-dropdown codex-conv-filter" id="codexConvKindFilter" data-value="all">
+                <button type="button" class="cas-dropdown-toggle" aria-haspopup="listbox" aria-expanded="false">
+                  <span class="cas-dropdown-label" data-i18n="codex.conv.kindAll">全部</span>
+                  <i class="bi bi-chevron-down cas-dropdown-caret"></i>
+                </button>
+                <ul class="cas-dropdown-menu" role="listbox" hidden></ul>
+              </div>
+              <div class="cas-dropdown codex-conv-filter-cwd" id="codexConvCwdFilter" data-value="all" title="按所属项目目录过滤">
+                <button type="button" class="cas-dropdown-toggle" aria-haspopup="listbox" aria-expanded="false">
+                  <span class="cas-dropdown-label" data-i18n="codex.conv.cwdAll">所有项目</span>
+                  <i class="bi bi-chevron-down cas-dropdown-caret"></i>
+                </button>
+                <ul class="cas-dropdown-menu" role="listbox" hidden></ul>
+              </div>
               <span class="codex-conv-summary" id="codexConvSummary"></span>
               <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-refresh"><i class="bi bi-arrow-clockwise"></i><span data-i18n="codex.conv.refresh">刷新</span></button>
             </div>
@@ -785,11 +791,13 @@
                 <input type="checkbox" id="codexConvSelectAll">
                 <span data-i18n="codex.conv.selectAll">全选(过滤后)</span>
               </label>
-              <select class="form-select form-select-sm codex-conv-format" id="codexConvFormat">
-                <option value="markdown">Markdown (.md)</option>
-                <option value="json">JSON (.json)</option>
-                <option value="jsonl" data-i18n="codex.conv.formatJsonl">原始 JSONL</option>
-              </select>
+              <div class="cas-dropdown codex-conv-format" id="codexConvFormat" data-value="markdown">
+                <button type="button" class="cas-dropdown-toggle" aria-haspopup="listbox" aria-expanded="false">
+                  <span class="cas-dropdown-label">Markdown (.md)</span>
+                  <i class="bi bi-chevron-down cas-dropdown-caret"></i>
+                </button>
+                <ul class="cas-dropdown-menu" role="listbox" hidden></ul>
+              </div>
               <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-options" data-i18n="codex.conv.options"><i class="bi bi-sliders"></i>选项</button>
               <button class="btn btn-primary btn-sm" type="button" data-action="codex-conv-export-selected" id="codexConvExportBtn" disabled><i class="bi bi-download"></i><span data-i18n="codex.conv.exportSelected">导出选中</span></button>
               <button class="btn btn-outline-danger btn-sm codex-conv-delete-btn" type="button" data-action="codex-conv-delete-selected" id="codexConvDeleteBtn" disabled><i class="bi bi-trash"></i><span data-i18n="codex.conv.deleteSelected">删除选中</span></button>
