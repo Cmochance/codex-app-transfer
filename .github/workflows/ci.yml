@@ -19,8 +19,12 @@ name: ci
 on:
   push:
     branches: [main]
+  # `ready_for_review` 让 draft → ready 转换触发 CI。`synchronize` 在 draft
+  # 期间仍 fire,但下面 job-level `if` 把 draft job 跳过(skip = pass,不卡
+  # required check),开发期 draft PR 全程 0 实跑 = 省 push-time CI 资源。
   # branches 不限制, 让 stacked PR (base=feature/* 而非 main) 也跑 CI.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 concurrency:
@@ -32,6 +36,9 @@ jobs:
   # tauri 输出供 rust-tauri-check job-level if 用.
   changes:
     name: Detect changed paths
+    # draft PR 期间所有 job 跳过(branch protection 把 skip 视作 pass)。
+    # push 到 main / workflow_dispatch / non-draft PR 正常跑。
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     outputs:
       tauri: ${{ steps.filter.outputs.tauri }}
@@ -54,6 +61,7 @@ jobs:
   # 因 src-tauri 编译需要 webkit2gtk 等系统依赖, 留给 rust-tauri-check.
   rust-fast-check:
     name: Rust · fast workspace check (no Tauri sysdeps)
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -84,7 +92,11 @@ jobs:
   rust-tauri-check:
     name: Rust · Tauri (src-tauri) check
     needs: changes
-    if: needs.changes.outputs.tauri == 'true'
+    # 双重条件:non-draft (省 push-time CI) + 路径变动检测命中。
+    # `needs: changes` 在 draft 时 changes 已 skip → 此 job 跟着 skip → pass。
+    if: |
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+      && needs.changes.outputs.tauri == 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
