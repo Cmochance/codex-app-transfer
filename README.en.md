@@ -101,7 +101,8 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 
 1. Launch Codex App Transfer; the desktop window opens
 2. On the dashboard, click the top-right "+" → pick a preset or add a custom provider; fill in API Base URL, API Key, then "Fetch models" and add model mappings
-3. Click the **Apply** button at the bottom and confirm restarting Codex App to start using it (if a provider is already configured, just click the **Apply** button on its card on the home page)
+3. Click the **Apply** button at the bottom — config is written and a toast confirms sync (if a provider is already configured, just click **Apply** on its card on the home page)
+4. To make Codex Desktop pick up the new config, click the ↻ **Restart Codex** button at the top-right (decoupled from Apply since #281 to avoid losing in-flight context on misclicks)
 
 ## Provider compatibility matrix
 

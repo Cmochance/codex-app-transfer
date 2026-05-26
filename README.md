@@ -100,7 +100,8 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 
 1. 启动 Codex App Transfer,弹出桌面窗口
 2. 在仪表盘点右上角加号 → 选择 preset 或自定义供应商,填入 API Base URL、API Key、获取模型、添加模型映射
-3. 点击页面底部的 应用 按钮并确认重启 Codex APP 即可使用（如果已配置好提供商，直接点击主页面提供商卡片上的 应用 按钮即可）
+3. 点击页面底部的 应用 按钮即可写入配置（toast 提示已同步;如果已配置好提供商，直接点击主页面提供商卡片上的 应用 按钮即可）
+4. 让 Codex Desktop 生效:点击右上角 ↻ **重启 Codex** 按钮(#281 起从强制 modal 解耦,避免误触杀进程丢上下文)
 
 ## 供应商兼容矩阵
 
