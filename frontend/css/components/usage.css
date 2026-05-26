@@ -114,10 +114,15 @@
   background: var(--soft-surface);
 }
 
+/* Model 列 (header + body) 统一左对齐,跟其它右对齐的数字列形成对比 */
+.usage-table .usage-col-model,
+.usage-table .usage-cell-model {
+  text-align: left;
+}
+
 .usage-table .usage-cell-model {
   color: var(--muted);
   font-size: 0.74rem;
-  text-align: left;
   max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;

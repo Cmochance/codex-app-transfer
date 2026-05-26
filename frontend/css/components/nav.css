@@ -45,7 +45,11 @@
   position: static;
   justify-self: center;
   gap: 4px;
-  max-width: 360px;
+  /* tab 数量从 7 升到 8 (#279 加 Usage),原 360px 上限让第 8 个挤出
+     pill 容器外,容器底部阴影只在 360 内,看着像被截断。改 fit-content
+     + min-width 让容器跟随实际 tab 数自适应。 */
+  max-width: fit-content;
+  min-width: 360px;
   margin: 0;
   padding: 5px;
   border-radius: 14px;

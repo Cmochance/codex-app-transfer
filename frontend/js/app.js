@@ -2301,7 +2301,7 @@
     // model view 跳过第二列;daily / conversation view 保留(本日 / 本会话用到的
     // 模型清单是补充信息有意义)。
     const showModelsCol = view !== "model";
-    const modelHeader = showModelsCol ? `<th>${escapeHtml(t("usage.col.model"))}</th>` : "";
+    const modelHeader = showModelsCol ? `<th class="usage-col-model">${escapeHtml(t("usage.col.model"))}</th>` : "";
 
     head.innerHTML = `
       <tr>
