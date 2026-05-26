@@ -7,6 +7,9 @@ name: no-ai-coauthor
 on:
   pull_request:
     branches: [main]
+    # `ready_for_review` 让 draft → ready 触发;`synchronize` 在 draft 仍 fire,
+    # 下面 job-level `if` 把 draft job skip(skip = pass,不卡 required check)。
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
@@ -16,6 +19,8 @@ permissions:
 
 jobs:
   no-ai-coauthor:
+    # draft PR 期间 skip;push/dispatch/non-draft PR 正常跑。
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
