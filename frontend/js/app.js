@@ -6549,27 +6549,23 @@
     bindEvents();
     bindFeedbackEvents();
     bindThemeEvents();
-    const settings = await CCApi.getSettings();
-    const finalLang = settings.language || "zh";
-    if (finalLang !== CCI18n.language) {
-      // backend settings 跟 cache/navigator 不一致才再 apply,正常路径无 op
-      CCI18n.apply(finalLang);
-    }
-    applyTheme(settings.theme || "default");
-    if (!window.location.hash) window.location.hash = "dashboard";
-    await renderRoute(routeFromHash());
 
-    // Tauri deeplink listener — Rust backend emit("codex-deeplink", url) 时触发
+    // **race fix** (devin #269 review thread):Tauri 后端 startup hook 会在
+    // 3s 内 emit `residual-scan-report` 跟 `codex-deeplink`,如果监听 listener
+    // 注册晚于 `await CCApi.getSettings()` / `await renderRoute()` 等异步链
+    // 落地时点,event 已经 fire 完毕 → 启动 toast 静默丢失。把 listener 注册
+    // 提到 bindEvents() 紧后(showToast / tFmt / codexMcpHandleDeeplink 等
+    // 依赖此时都已初始化),先于所有 await,确保不漏 event。
     try {
-      const event = window.__TAURI__?.event;
-      if (event && typeof event.listen === "function") {
-        await event.listen("codex-deeplink", (e) => {
+      const tauriEvent = window.__TAURI__?.event;
+      if (tauriEvent && typeof tauriEvent.listen === "function") {
+        await tauriEvent.listen("codex-deeplink", (e) => {
           const url = typeof e.payload === "string" ? e.payload : "";
           if (url) codexMcpHandleDeeplink(url);
         });
-        // #268 启动时自检 emit "residual-scan-report" 含污染文件清单 → 弹 toast
+        // #268 启动自检 emit `residual-scan-report` 含污染文件清单 → 弹 toast
         // 提示用户去设置页查看。干净时 backend 不 emit,这里也不会触发。
-        await event.listen("residual-scan-report", (e) => {
+        await tauriEvent.listen("residual-scan-report", (e) => {
           const report = e?.payload || {};
           const count = (report.polluted || []).length;
           if (count > 0) {
@@ -6580,5 +6576,15 @@
     } catch (err) {
       console.error("event listen:", err);
     }
+
+    const settings = await CCApi.getSettings();
+    const finalLang = settings.language || "zh";
+    if (finalLang !== CCI18n.language) {
+      // backend settings 跟 cache/navigator 不一致才再 apply,正常路径无 op
+      CCI18n.apply(finalLang);
+    }
+    applyTheme(settings.theme || "default");
+    if (!window.location.hash) window.location.hash = "dashboard";
+    await renderRoute(routeFromHash());
   });
 })();

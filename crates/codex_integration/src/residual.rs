@@ -284,8 +284,20 @@ fn compute_fields_to_strip(matched: &[MatchedSignature]) -> Vec<String> {
     fields
 }
 
-/// 解析 `<key> = "<value>"` 形式,返回 value(去引号)。
+/// 解析 `<key> = "<value>"` 形式,返回**已 unescape** 的 value。
+///
 /// 容忍 `=` 两侧空白,要求 key 后紧跟 `=` 或空白(防 `model` 误匹 `model_provider`)。
+///
+/// **Windows 路径 unescape**(#269 devin review #3):
+/// `crate::toml_sync::toml_string_literal` 用 `serde_json::to_string` 生成 TOML
+/// basic string 字面量,Windows 路径里的 `\` 会被写成 `\\`。读回来若不 unescape
+/// 就会拿到双反斜杠的字符串,跟 `PathBuf::to_string_lossy()` 的单反斜杠比对
+/// 永不命中 → Windows 用户的 `model_catalog_json` signature 检测永失效。
+///
+/// 实现策略:用 `serde_json::from_str` 反向 parse(TOML basic string 跟 JSON
+/// string 在我们用到的转义子集 — `\\` `\"` `\n` `\r` `\t` — 上完全一致,跟
+/// 写入端 `toml_string_literal` 对称),自动处理转义。闭合 `"` 用手工状态机
+/// 找(裸 `.find('"')` 会被字符串内的 `\"` 误终结)。
 fn parse_root_string_value(stripped: &str, key: &str) -> Option<String> {
     let rest = stripped.strip_prefix(key)?;
     let next = rest.chars().next()?;
@@ -294,9 +306,32 @@ fn parse_root_string_value(stripped: &str, key: &str) -> Option<String> {
     }
     let rest = rest.trim_start();
     let rest = rest.strip_prefix('=')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    if !rest.starts_with('"') {
+        return None;
+    }
+    // 找闭合引号位置(跳过转义的 \" )。byte-index 安全:Rust 字符串迭代用
+    // char_indices 给的是 UTF-8 byte offset,直接拿来 slice 不会破坏 UTF-8。
+    let bytes = rest.as_bytes();
+    let mut end_byte_idx = None;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate().skip(1) {
+        if esc {
+            esc = false;
+            continue;
+        }
+        if b == b'\\' {
+            esc = true;
+            continue;
+        }
+        if b == b'"' {
+            end_byte_idx = Some(i);
+            break;
+        }
+    }
+    let end = end_byte_idx?;
+    let quoted = rest.get(..=end)?;
+    // serde_json::from_str 反向 parse(对称 toml_string_literal)
+    serde_json::from_str::<String>(quoted).ok()
 }
 
 #[cfg(test)]
@@ -448,6 +483,42 @@ approval_policy = \"never\"
     fn ignores_commented_line() {
         let v = parse_root_string_value("# model = \"gpt\"", "model");
         assert!(v.is_none());
+    }
+
+    /// **devin #269 review #3 防回归**:Windows 路径 `C:\Users\…` 经
+    /// `toml_string_literal` 序列化后是 `"C:\\Users\\…"`(双反斜杠);
+    /// 读回必须 unescape 才能跟 `PathBuf::to_string_lossy()` 拿到的
+    /// 单反斜杠形态对齐,否则 signature 检测永失效。
+    #[test]
+    fn parses_windows_path_with_escaped_backslashes() {
+        let line =
+            "model_catalog_json = \"C:\\\\Users\\\\alice\\\\.codex-app-transfer\\\\config.json\"";
+        let v = parse_root_string_value(line, "model_catalog_json");
+        assert_eq!(
+            v.as_deref(),
+            Some("C:\\Users\\alice\\.codex-app-transfer\\config.json"),
+            "double-backslash 必须被 unescape 成单反斜杠(Windows path 兼容)"
+        );
+    }
+
+    /// 同上:用 Windows 风格的 app_config_json 路径,scan 必须能在
+    /// snapshot/live 文件里识别 transfer signature。
+    #[test]
+    fn detects_signature_for_windows_style_app_config_json_path() {
+        let toml =
+            "model_catalog_json = \"C:\\\\Users\\\\alice\\\\.codex-app-transfer\\\\config.json\"";
+        let app_path = PathBuf::from("C:\\Users\\alice\\.codex-app-transfer\\config.json");
+        let m = detect_signatures_in_text(toml, &app_path, &[18080]);
+        assert_eq!(m.len(), 1, "Windows path signature 必须能识别: {m:?}");
+        matches!(m[0], MatchedSignature::ModelCatalogJsonAppHome { .. });
+    }
+
+    /// 值含转义引号 `\"` 时不能被 raw `.find('"')` 截断
+    #[test]
+    fn handles_escaped_quote_inside_value() {
+        let line = "openai_base_url = \"http://example.com/\\\"path\\\"\"";
+        let v = parse_root_string_value(line, "openai_base_url");
+        assert_eq!(v.as_deref(), Some("http://example.com/\"path\""));
     }
 
     // ── scan_residual_pollution (集成) ────────────────────────────────
