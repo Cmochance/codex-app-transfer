@@ -9,24 +9,13 @@
   gap: 16px;
 }
 
-.usage-header {
+/* 顶部 view 切换器 + 刷新按钮同行,switcher 左,刷新右 */
+.usage-toolbar {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
   justify-content: space-between;
-}
-
-.usage-header h2 {
-  margin: 0;
-  font-size: 1.25rem;
-}
-
-.usage-subtitle {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.85rem;
-  flex: 1 1 320px;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .usage-view-switcher {
