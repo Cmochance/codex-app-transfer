@@ -109,18 +109,20 @@ pub enum ExportFormat {
 }
 
 /// 导出选项 — 前端 dialog 收 + 持久化到 settings.
+///
+/// **devin #272 review fix**:`#[serde(default)]` 加到 struct 级,partial
+/// payload(如 `{"options": {}}` 或缺字段)时缺的字段走 `Default` impl,
+/// 而不是 422 反序列化失败。前端 / 老客户端给不全也能跑。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct ExportOptions {
     /// 是否包含 reasoning summary 块
-    #[serde(default)]
     pub include_reasoning: bool,
     /// 是否包含 tool calls + outputs(默认 true)
     pub include_tool_calls: bool,
     /// tool output 单条最大字符数,超过截断(默认 2048)
     pub tool_output_max_chars: usize,
     /// 是否包含 system / developer 角色消息(默认 false,太冗长)
-    #[serde(default)]
     pub include_system_prompts: bool,
     /// 是否 redact `sk-…` / `cas_…` / JWT / Bearer 等密钥模式(默认 true)
     pub redact_secrets: bool,

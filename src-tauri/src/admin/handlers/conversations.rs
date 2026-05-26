@@ -20,10 +20,30 @@ use std::path::PathBuf;
 
 use crate::admin::handlers::common::err;
 
-/// 找一条 session(按 id)对应的 rollout 文件路径。线性扫 list(422 量级毫秒内)
+/// 找一条 session(按 id)对应的 rollout 文件路径。
+///
+/// **single-shot 用**(detail 端点 1 个 id)。**批量场景**(export N 个 ids)
+/// 必须用 [`build_session_index_map`] 一次扫 + HashMap 查,否则 N 次
+/// list_sessions 是 O(N×M) 全目录扫(devin #272 review fix)。
 fn find_session_path(id: &str, codex_home: &std::path::Path) -> Option<PathBuf> {
     let sessions = cexp::list_sessions(codex_home).ok()?;
     sessions.into_iter().find(|s| s.id == id).map(|s| s.path)
+}
+
+/// 构建 `session_id → path` 索引,**只扫一次目录**。批量端点 export 用,
+/// 循环内 O(1) 查表替代 N 次 list_sessions。
+fn build_session_index_map(
+    codex_home: &std::path::Path,
+) -> Result<std::collections::HashMap<String, PathBuf>, axum::response::Response> {
+    let sessions = match cexp::list_sessions(codex_home) {
+        Ok(s) => s,
+        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+    };
+    let mut map = std::collections::HashMap::with_capacity(sessions.len());
+    for s in sessions {
+        map.insert(s.id, s.path);
+    }
+    Ok(map)
 }
 
 fn codex_home_from_env() -> Result<PathBuf, axum::response::Response> {
@@ -95,15 +115,21 @@ pub async fn export_handler(Json(req): Json<ExportRequest>) -> impl IntoResponse
         .into_response();
     }
 
+    // devin #272 review fix:**只扫一次目录**构 HashMap,循环内 O(1) 查
+    let index = match build_session_index_map(&codex_home) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+
     // 准备 bytes + filename + mime(无论是否落盘都要先 render):
     // - 单条 → render_one 直接给一份
     // - 多条 → 全部 render + 打 zip
     let (bytes, default_filename, mime) = if req.session_ids.len() == 1 {
         let id = &req.session_ids[0];
-        let Some(path) = find_session_path(id, &codex_home) else {
+        let Some(path) = index.get(id) else {
             return err(StatusCode::NOT_FOUND, format!("session not found: {id}")).into_response();
         };
-        match render_one(&path, format, &req.options) {
+        match render_one(path, format, &req.options) {
             Ok(t) => t,
             Err(e) => return e,
         }
@@ -111,11 +137,11 @@ pub async fn export_handler(Json(req): Json<ExportRequest>) -> impl IntoResponse
         let mut buf = std::io::Cursor::new(Vec::<u8>::new());
         let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(req.session_ids.len());
         for id in &req.session_ids {
-            let Some(path) = find_session_path(id, &codex_home) else {
+            let Some(path) = index.get(id) else {
                 return err(StatusCode::NOT_FOUND, format!("session not found: {id}"))
                     .into_response();
             };
-            match render_one(&path, format, &req.options) {
+            match render_one(path, format, &req.options) {
                 Ok((bytes, name, _mime)) => entries.push((sanitize_filename(&name), bytes)),
                 Err(e) => return e,
             }
