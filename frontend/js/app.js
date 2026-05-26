@@ -2816,6 +2816,14 @@
         await codexConversationsDeleteSelected();
         return;
       }
+      if (action === "codex-conv-default-dir-pick") {
+        await codexConvPickDefaultDir();
+        return;
+      }
+      if (action === "codex-conv-default-dir-clear") {
+        codexConvClearDefaultDir();
+        return;
+      }
       if (action === "codex-conv-options") {
         codexConversationsOpenOptionsDialog();
         return;
@@ -5582,10 +5590,57 @@
     redactSecrets: true,
   };
 
+  const CAS_CONV_DEFAULT_DIR_KEY = "cas.conv.defaultExportDir";
+  function codexConvLoadDefaultDir() {
+    try { return localStorage.getItem(CAS_CONV_DEFAULT_DIR_KEY) || ""; } catch { return ""; }
+  }
+  function codexConvSaveDefaultDir(dir) {
+    try {
+      if (dir) localStorage.setItem(CAS_CONV_DEFAULT_DIR_KEY, dir);
+      else localStorage.removeItem(CAS_CONV_DEFAULT_DIR_KEY);
+    } catch {}
+  }
+  function codexConvSyncDefaultDirUI() {
+    const input = $("#codexConvDefaultDir");
+    const clearBtn = $("#codexConvDefaultDirClear");
+    if (!input) return;
+    const cur = codexConvLoadDefaultDir();
+    input.value = cur;
+    if (clearBtn) clearBtn.hidden = !cur;
+  }
+  async function codexConvPickDefaultDir() {
+    const dialog = window.__TAURI__?.dialog;
+    if (!dialog?.open) {
+      showToast("Tauri dialog API 不可用");
+      return;
+    }
+    try {
+      const picked = await dialog.open({
+        title: t("codex.conv.defaultDirPickTitle") || "选择默认导出文件夹",
+        directory: true,
+        multiple: false,
+        defaultPath: codexConvLoadDefaultDir() || undefined,
+      });
+      if (!picked) return;
+      const dir = Array.isArray(picked) ? picked[0] : picked;
+      codexConvSaveDefaultDir(dir);
+      codexConvSyncDefaultDirUI();
+      showToast(tFmt("codex.conv.defaultDirSet", { path: dir }));
+    } catch (e) {
+      showToast(`${t("codex.conv.exportFailed") || "失败"}: ${e.message || e}`);
+    }
+  }
+  function codexConvClearDefaultDir() {
+    codexConvSaveDefaultDir("");
+    codexConvSyncDefaultDirUI();
+    showToast(t("codex.conv.defaultDirCleared") || "已清除");
+  }
+
   let _convInitDone = false;
   function codexConversationsInitOnce() {
     if (_convInitDone) return;
     _convInitDone = true;
+    codexConvSyncDefaultDirUI();
     $("#codexConvSearch")?.addEventListener("input", codexConversationsRenderList);
     // cas-dropdown: kind / format 是固定 options,在 init 时绑一次
     casDropdownBind($("#codexConvKindFilter"), {
@@ -5944,7 +5999,11 @@
     s = s.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
     s = s.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
     // restore inline code
-    s = s.replace(/\x01IC(\d+)\x01/g, (_, i) => `<code>${escapeHtml(inlineCodes[Number(i)])}</code>`);
+    // **devin #272 review fix**:inlineCodes 里的 content 是从 `escapeHtml(text)`
+    // 输出的串里捕获的,已经是 escape 后的形态(`&lt;` `&amp;` 等)。再 escape
+    // 一次会让 `&lt;` 变 `&amp;lt;`,用户看到 literal `&lt;` 而不是 `<`。
+    // 直接拼回去即可,不可二次 escape。
+    s = s.replace(/\x01IC(\d+)\x01/g, (_, i) => `<code>${inlineCodes[Number(i)]}</code>`);
     return s;
   }
 
@@ -5974,24 +6033,30 @@
       extFilter = { name: ext.toUpperCase(), extensions: [ext] };
     }
 
-    // Tauri dialog.save 让用户选目标路径
-    const dialog = window.__TAURI__?.dialog;
-    if (!dialog?.save) {
-      showToast(t("codex.conv.exportFailed") + ": Tauri dialog API 不可用");
-      return;
-    }
+    // 优先用「默认导出文件夹」(localStorage 持久化的);留空才弹 Tauri dialog.save()
+    const defaultDir = codexConvLoadDefaultDir();
     let targetPath;
-    try {
-      targetPath = await dialog.save({
-        title: isMulti ? (t("codex.conv.saveDialogMulti") || "保存对话 zip") : (t("codex.conv.saveDialogSingle") || "保存对话文件"),
-        defaultPath: defaultName,
-        filters: [extFilter],
-      });
-    } catch (e) {
-      showToast(t("codex.conv.exportFailed") + ": " + (e.message || e));
-      return;
+    if (defaultDir) {
+      const sep = defaultDir.endsWith("/") || defaultDir.endsWith("\\") ? "" : "/";
+      targetPath = `${defaultDir}${sep}${defaultName}`;
+    } else {
+      const dialog = window.__TAURI__?.dialog;
+      if (!dialog?.save) {
+        showToast(t("codex.conv.exportFailed") + ": Tauri dialog API 不可用");
+        return;
+      }
+      try {
+        targetPath = await dialog.save({
+          title: isMulti ? (t("codex.conv.saveDialogMulti") || "保存对话 zip") : (t("codex.conv.saveDialogSingle") || "保存对话文件"),
+          defaultPath: defaultName,
+          filters: [extFilter],
+        });
+      } catch (e) {
+        showToast(t("codex.conv.exportFailed") + ": " + (e.message || e));
+        return;
+      }
+      if (!targetPath) return; // 用户取消
     }
-    if (!targetPath) return; // 用户取消
 
     try {
       const resp = await fetch("/api/conversations/export", {

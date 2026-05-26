@@ -801,6 +801,11 @@
               <button class="btn btn-outline-primary btn-sm" type="button" data-action="codex-conv-options" data-i18n="codex.conv.options"><i class="bi bi-sliders"></i>选项</button>
               <button class="btn btn-primary btn-sm" type="button" data-action="codex-conv-export-selected" id="codexConvExportBtn" disabled><i class="bi bi-download"></i><span data-i18n="codex.conv.exportSelected">导出选中</span></button>
               <button class="btn btn-outline-danger btn-sm codex-conv-delete-btn" type="button" data-action="codex-conv-delete-selected" id="codexConvDeleteBtn" disabled><i class="bi bi-trash"></i><span data-i18n="codex.conv.deleteSelected">删除选中</span></button>
+              <div class="codex-conv-default-dir" title="留空则每次导出都弹窗选择;设置后默认导出到该目录">
+                <input type="text" class="form-control form-control-sm codex-conv-default-dir-input" id="codexConvDefaultDir" data-i18n-placeholder="codex.conv.defaultDirPlaceholder" placeholder="设置默认导出文件夹" readonly>
+                <button class="btn btn-outline-primary btn-sm codex-conv-default-dir-pick" type="button" data-action="codex-conv-default-dir-pick" title="选择默认导出文件夹"><i class="bi bi-folder2-open"></i></button>
+                <button class="btn btn-outline-secondary btn-sm codex-conv-default-dir-clear" type="button" data-action="codex-conv-default-dir-clear" id="codexConvDefaultDirClear" hidden title="清除"><i class="bi bi-x-lg"></i></button>
+              </div>
             </div>
 
             <div class="codex-conv-body">

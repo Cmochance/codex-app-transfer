@@ -111,6 +111,32 @@
 }
 .codex-conv-format { width: 200px; }
 
+/* 默认导出文件夹 input group */
+.codex-conv-default-dir {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  flex: 0 1 280px;
+  min-width: 200px;
+  margin-left: auto;
+}
+.codex-conv-default-dir-input {
+  flex: 1;
+  min-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  cursor: pointer;
+  text-overflow: ellipsis;
+}
+.codex-conv-default-dir-pick {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 0;
+}
+.codex-conv-default-dir-clear {
+  margin-left: 4px;
+}
+
 .codex-conv-warning {
   background: color-mix(in srgb, var(--primary) 6%, transparent);
   border: 1px solid color-mix(in srgb, var(--primary) 20%, transparent);
