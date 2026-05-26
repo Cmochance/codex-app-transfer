@@ -180,12 +180,18 @@
   color: var(--muted, #4b5563);
 }
 
+/* filter bar + toolbar 不 grow,占自己内容高度;body 吃 pane 剩余高度 */
+#codexConversationsTab > .codex-conv-filterbar,
+#codexConversationsTab > .codex-conv-toolbar {
+  flex-shrink: 0;
+}
 .codex-conv-body {
   display: grid;
   grid-template-columns: 360px 1fr;
   gap: 12px;
-  height: calc(100vh - 280px);
-  min-height: 400px;
+  flex: 1;
+  min-height: 0; /* 让内部 overflow 生效 */
+  padding-bottom: 12px; /* 与顶部 sticky filter 上方间距对称 */
 }
 
 .codex-conv-list {
