@@ -2250,8 +2250,9 @@
 
   function fmtLastActivity(s) {
     if (!s) return "—";
-    // ccusage 写 RFC3339,前端只展示日期 + 时间(去 .000Z 尾)。
-    return s.replace("T", " ").replace(/\.\d+Z?$/, "").replace(/Z$/, "");
+    // ccusage 写 RFC3339;表格列宽紧张,只显示 YYYY-MM-DD HH:MM(秒/ms/Z/offset 全省)
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/);
+    return m ? `${m[1]} ${m[2]}` : s;
   }
 
   function renderUsageKpis(report) {

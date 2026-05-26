@@ -24,7 +24,7 @@
 
 .usage-subtitle {
   margin: 0;
-  color: var(--text-secondary);
+  color: var(--muted);
   font-size: 0.85rem;
   flex: 1 1 320px;
 }
@@ -33,7 +33,7 @@
   display: inline-flex;
   gap: 4px;
   padding: 4px;
-  background: var(--bg-secondary);
+  background: var(--soft-surface);
   border-radius: 8px;
   width: fit-content;
 }
@@ -42,7 +42,7 @@
   padding: 6px 14px;
   border: none;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--muted);
   cursor: pointer;
   border-radius: 6px;
   font-size: 0.9rem;
@@ -50,12 +50,12 @@
 }
 
 .usage-view-btn:hover {
-  color: var(--text-primary);
+  color: var(--text);
 }
 
 .usage-view-btn.active {
-  background: var(--bg-primary);
-  color: var(--text-primary);
+  background: var(--surface);
+  color: var(--text);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
 }
 
@@ -69,23 +69,26 @@
   width: 100%;
   border-collapse: collapse;
   font-variant-numeric: tabular-nums;
-  /* 数字列等宽对齐,跟 ccusage CLI 一致 */
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Cascadia Mono",
-    "Liberation Mono", monospace;
-  font-size: 0.85rem;
+  /* 数字 tabular-nums 即可,不强制 monospace — system-ui 字符更窄,
+     字号小列也能放得下,避免横向 scroll(用户反馈) */
+  font-size: 0.8rem;
+  table-layout: auto;
 }
 
 .usage-table thead {
   position: sticky;
   top: 0;
-  background: var(--bg-secondary);
-  z-index: 1;
+  /* 用实色 var(--surface) 不再 var(--bg-secondary) 这种不存在的 token,
+     之前 fallback 到 transparent 让滚动时跟数据叠在一起看不清(用户反馈) */
+  background: var(--surface);
+  z-index: 5;
+  box-shadow: 0 1px 0 var(--line);
 }
 
 .usage-table th,
 .usage-table td {
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border-color);
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
   text-align: right;
   white-space: nowrap;
 }
@@ -97,30 +100,33 @@
 
 .usage-table th {
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--muted);
   text-transform: none;
   letter-spacing: 0;
 }
 
 .usage-table tbody tr:hover {
-  background: var(--bg-hover, rgba(127, 127, 127, 0.06));
+  background: var(--soft-surface);
 }
 
 .usage-table .usage-row-total {
   font-weight: 700;
-  background: var(--bg-secondary);
+  background: var(--soft-surface);
 }
 
 .usage-table .usage-cell-model {
-  color: var(--text-secondary);
-  font-size: 0.78rem;
+  color: var(--muted);
+  font-size: 0.74rem;
   text-align: left;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .usage-empty,
 .usage-loading {
   padding: 32px 16px;
   text-align: center;
-  color: var(--text-secondary);
+  color: var(--muted);
   font-size: 0.9rem;
 }
