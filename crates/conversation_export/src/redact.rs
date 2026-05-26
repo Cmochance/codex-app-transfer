@@ -55,47 +55,62 @@ fn redact_prefix<'a>(input: Cow<'a, str>, prefix: &str, min_tail: usize) -> Cow<
 
 fn redact_bearer<'a>(input: Cow<'a, str>) -> Cow<'a, str> {
     // 命中后把 token 部分换为 [REDACTED]
-    let needle_lc = "bearer ";
-    let lower = input.to_ascii_lowercase();
-    if !lower.contains(needle_lc) {
+    let needle = b"bearer ";
+    // devin #272 review fix:用字节级 case-insensitive 扫描判 prefix 存在
+    // (避免 `to_ascii_lowercase()` 给每条 export 文本无脑 alloc 一份小写
+    // 副本 — 99% 的文本不含 "bearer ")
+    let input_bytes = input.as_bytes();
+    let has_bearer = input_bytes
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle));
+    if !has_bearer {
         return input;
     }
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
-    let bytes = input.as_bytes();
-    while i < bytes.len() {
-        let remaining_lc = &lower[i..];
-        if let Some(rel) = remaining_lc.find(needle_lc) {
-            let abs = i + rel;
-            out.push_str(&input[i..abs + needle_lc.len()]);
-            let mut j = abs + needle_lc.len();
-            while j < bytes.len() {
-                let b = bytes[j];
-                if b.is_ascii_alphanumeric()
-                    || b == b'.'
-                    || b == b'_'
-                    || b == b'-'
-                    || b == b'+'
-                    || b == b'/'
-                    || b == b'='
-                {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            if j - abs - needle_lc.len() >= 8 {
-                out.push_str("[REDACTED]");
-            } else {
-                out.push_str(&input[abs + needle_lc.len()..j]);
-            }
-            i = j;
-        } else {
+    // 同 redact_jwt:仅当真有 redaction 才返 Cow::Owned;含 "bearer " 但
+    // 后续 token 不足 8 char(如 "use bearer trust...")时回 borrow。
+    let mut did_redact = false;
+    while i < input_bytes.len() {
+        // 找下一个 "bearer "(case-insensitive)起点
+        let next_match = input_bytes[i..]
+            .windows(needle.len())
+            .position(|w| w.eq_ignore_ascii_case(needle))
+            .map(|p| i + p);
+        let Some(abs) = next_match else {
             out.push_str(&input[i..]);
             break;
+        };
+        out.push_str(&input[i..abs + needle.len()]);
+        let mut j = abs + needle.len();
+        while j < input_bytes.len() {
+            let b = input_bytes[j];
+            if b.is_ascii_alphanumeric()
+                || b == b'.'
+                || b == b'_'
+                || b == b'-'
+                || b == b'+'
+                || b == b'/'
+                || b == b'='
+            {
+                j += 1;
+            } else {
+                break;
+            }
         }
+        if j - abs - needle.len() >= 8 {
+            out.push_str("[REDACTED]");
+            did_redact = true;
+        } else {
+            out.push_str(&input[abs + needle.len()..j]);
+        }
+        i = j;
     }
-    Cow::Owned(out)
+    if did_redact {
+        Cow::Owned(out)
+    } else {
+        input
+    }
 }
 
 fn redact_jwt<'a>(input: Cow<'a, str>) -> Cow<'a, str> {
@@ -105,6 +120,9 @@ fn redact_jwt<'a>(input: Cow<'a, str>) -> Cow<'a, str> {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
+    // devin #272 review fix:跟踪是否真有 redaction 发生 — 否则任何含 `.`
+    // 的自然文本(几乎所有句子 / URL / 文件名)都会被无谓 alloc + rebuild
+    let mut did_redact = false;
     while i < bytes.len() {
         // 找一段连续 [A-Za-z0-9_-]{8,}
         let start = i;
@@ -127,6 +145,7 @@ fn redact_jwt<'a>(input: Cow<'a, str>) -> Cow<'a, str> {
                 if m - s3 >= 8 {
                     out.push_str("[REDACTED]");
                     i = m;
+                    did_redact = true;
                     continue;
                 }
             }
@@ -139,7 +158,11 @@ fn redact_jwt<'a>(input: Cow<'a, str>) -> Cow<'a, str> {
             i = ch_end;
         }
     }
-    Cow::Owned(out)
+    if did_redact {
+        Cow::Owned(out)
+    } else {
+        input
+    }
 }
 
 fn is_jwt_seg_byte(b: u8) -> bool {
@@ -194,6 +217,21 @@ mod tests {
     fn keeps_normal_text_unchanged() {
         let input = "Hello world, my user is alice and email is alice@example.com.";
         let out = redact_secrets(input);
+        assert_eq!(out.as_ref(), input);
+    }
+
+    /// **devin #272 review 防回归**:zero-copy 文档承诺 — 自然文本(含
+    /// dot / 大小写混合 "Bearer Trust 关键字" 等常见模式但无真签名)
+    /// 必须返 `Cow::Borrowed`,不能 alloc。
+    #[test]
+    fn returns_borrowed_for_text_without_real_secrets() {
+        let input =
+            "Visit https://example.com/path.html for the docs. Use bearer trust in your team.";
+        let out = redact_secrets(input);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "含 dot / 小写 bearer 关键字但无真 token,必须 borrow 不 alloc"
+        );
         assert_eq!(out.as_ref(), input);
     }
 
