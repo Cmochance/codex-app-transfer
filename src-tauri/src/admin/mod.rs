@@ -152,6 +152,11 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/conversations/delete",
             post(handlers::conversations::delete_handler),
         )
+        // Token usage stats (#279, ccusage-vendored)
+        .route(
+            "/api/usage/summary",
+            get(handlers::usage::usage_summary),
+        )
         // Proxy lifecycle
         .route("/api/version", get(handlers::common::version))
         .route("/api/proxy/start", post(handlers::proxy::start_proxy))

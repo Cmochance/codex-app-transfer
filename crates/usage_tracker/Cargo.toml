@@ -1,0 +1,28 @@
+[package]
+name = "codex-app-transfer-usage-tracker"
+version = "0.1.0"
+description = "对话 token 用量统计(#279):vendor ryoppippi/ccusage 的 Codex rollout JSONL 解析 + 自写聚合层。Phase 1 仅 token,Phase 2 再加 cost。"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# vendored ccusage 的必要依赖,版本对齐其 rust/crates/ccusage/Cargo.toml(20.0.5)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+memchr = "2"
+compact_str = "0.9"
+rustc-hash = "2"
+smallvec = "1"
+jiff = { version = "0.2.24", default-features = false, features = [
+    "std",
+    "tz-system",
+    "tzdb-zoneinfo",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,126 @@
+/* ============================================================
+   usage.css — Token 用量统计页 (#279)
+   形态参考 ryoppippi/ccusage Daily Report CLI 截图(等宽 + 简洁表格)。
+   ============================================================ */
+
+.usage-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.usage-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.usage-header h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.usage-subtitle {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  flex: 1 1 320px;
+}
+
+.usage-view-switcher {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  width: fit-content;
+}
+
+.usage-view-btn {
+  padding: 6px 14px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  transition: background 0.15s, color 0.15s;
+}
+
+.usage-view-btn:hover {
+  color: var(--text-primary);
+}
+
+.usage-view-btn.active {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.usage-table-wrap {
+  padding: 0;
+  overflow: auto;
+  max-height: 70vh;
+}
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+  /* 数字列等宽对齐,跟 ccusage CLI 一致 */
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Cascadia Mono",
+    "Liberation Mono", monospace;
+  font-size: 0.85rem;
+}
+
+.usage-table thead {
+  position: sticky;
+  top: 0;
+  background: var(--bg-secondary);
+  z-index: 1;
+}
+
+.usage-table th,
+.usage-table td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-color);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.usage-table th:first-child,
+.usage-table td:first-child {
+  text-align: left;
+}
+
+.usage-table th {
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.usage-table tbody tr:hover {
+  background: var(--bg-hover, rgba(127, 127, 127, 0.06));
+}
+
+.usage-table .usage-row-total {
+  font-weight: 700;
+  background: var(--bg-secondary);
+}
+
+.usage-table .usage-cell-model {
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  text-align: left;
+}
+
+.usage-empty,
+.usage-loading {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}

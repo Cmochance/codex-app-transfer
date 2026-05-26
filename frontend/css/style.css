@@ -46,6 +46,7 @@
 @import url("components/step.css");
 @import url("components/switch.css");
 @import url("components/update-badge.css");
+@import url("components/usage.css");
 
 /* === Pages === */
 @import url("pages/dashboard.css");

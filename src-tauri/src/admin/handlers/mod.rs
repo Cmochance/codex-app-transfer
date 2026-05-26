@@ -28,3 +28,4 @@ pub mod skills;
 pub mod skills_md;
 pub mod theme;
 pub mod update;
+pub mod usage;

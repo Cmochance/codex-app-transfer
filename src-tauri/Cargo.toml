@@ -27,6 +27,7 @@ serde_json = "1"
 codex-app-transfer-registry = { path = "../crates/registry" }
 codex-app-transfer-codex-integration = { path = "../crates/codex_integration" }
 codex-app-transfer-conversation-export = { path = "../crates/conversation_export" }
+codex-app-transfer-usage-tracker = { path = "../crates/usage_tracker" }
 codex-app-transfer-proxy = { path = "../crates/proxy" }
 codex-app-transfer-adapters = { path = "../crates/adapters" }
 codex-app-transfer-gemini-oauth = { path = "../crates/gemini_oauth" }

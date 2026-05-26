@@ -275,6 +275,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 - [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) — 阿里官方 Qwen CLI,百炼 Token Plan (`*.maas.aliyuncs.com`) 模型清单硬编码模式
 - [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows MSIX Codex Desktop CDP 注入路径
 - [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — Codex 资产管理"受管块"设计:Agents.md, MCP, Skills
+- [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage) — Codex CLI rollout JSONL token usage 解析 + Daily Report 表格形态;`crates/usage_tracker/src/vendored_ccusage/` 直接 vendor 自其 `rust/crates/ccusage/src/{adapter/codex/{parser,types,paths},types,fast,home,date_utils,utils}.rs`(MIT)
 
 ### 社区贡献者
 

@@ -324,6 +324,38 @@
 - **代码层引用**(`windows_msix.rs:18-25` 节选):
   > 实现路径 1:1 借鉴 `BigPizzaV3/CodexPlusPlus`(MIT,2699 stars)的 Python 实现 `codex_session_delete/launcher.py:283-451`(2026-05-17 同步)。同道项目实证可工作。本 Rust 实现用 `windows` crate 官方 binding 而非手搓 ctypes COM,稳定性更好。
 
+## ryoppippi/ccusage
+
+- **Link**: https://github.com/ryoppippi/ccusage
+- **License**: **MIT**(Copyright 2025 ryoppippi)
+- **借鉴形式**: 整体 vendor — Rust 源码直接复制到本仓 + namespace 重定向 + 删 CLI/terminal/output/blocks 等表现层
+- **首次借鉴 PR / 时间**: PR #279(2026-05-26,Token 用量统计功能)
+- **上游版本**: ccusage v20.0.5,upstream commit `2b9599ca`(2026-05-26 拉取)
+- **借鉴清单**(全部位于本项目 `crates/usage_tracker/src/vendored_ccusage/`):
+  - `codex/parser.rs` ← `rust/crates/ccusage/src/adapter/codex/parser.rs`(rollout JSONL line-by-line `memchr::memmem::Finder` fast-path 解析)
+  - `codex/types.rs` ← `rust/crates/ccusage/src/adapter/codex/types.rs`(`CodexSessionLogEntry` / `CodexLogEntry` / `CodexPayload` / `CodexInfo` / `CodexModelMetadata` / `CodexResultFields` / `CodexTimestamp`)
+  - `codex/paths.rs` ← `rust/crates/ccusage/src/adapter/codex/paths.rs`(`CODEX_HOME` env + 默认 `~/.codex/sessions/` 路径发现)
+  - `types.rs` ← `rust/crates/ccusage/src/types.rs`(`CodexRawUsage` / `CodexTokenUsageEvent` / `TokenUsageRaw` / `TokenCounts` / `ModelBreakdown` / `CodexGroup` 等)
+  - `fast.rs` ← `rust/crates/ccusage/src/fast.rs`(`FxHashMap` / `FxHashSet` / `ByteLines` 等基础 utility)
+  - `home.rs` ← `rust/crates/ccusage/src/home.rs`(`home_dir`)
+  - `date_utils.rs` ← `rust/crates/ccusage/src/date_utils.rs`(`TimestampMs` / `parse_ts_timestamp` / `format_date_tz` / `parse_tz` / `format_rfc3339_millis` 等)
+  - `utils.rs` ← `rust/crates/ccusage/src/utils.rs`(`json_value_u64` / `total_usage_tokens` / `apply_total_token_fallback`)
+  - `error.rs` ← `rust/crates/ccusage/src/main.rs:64-95`(`CliError` / `Result` / `cli_error` helper,ccusage 上游放 main.rs 顶层,本项目拎独立模块)
+  - MIT LICENSE 副本 + 顶层 attribution 见 `crates/usage_tracker/src/vendored_ccusage/{LICENSE,mod.rs}`
+- **本项目差异 / 扩展**:
+  - **不 vendor**:`adapter/codex/{loader,aggregate}.rs`(CLI 耦合 `SharedArgs` / `progress`)、`summary.rs` / `blocks.rs` / `output.rs` / `cli.rs` / `main.rs` / `commands/` 等 CLI 表现层 → 本项目自写薄壳 `crates/usage_tracker/src/lib.rs` 替代,算法对照 ccusage `loader.rs` / `aggregate.rs` 1:1(参 lib.rs 顶部文档)
+  - **Phase 1 不 vendor pricing / cost**:`pricing.rs` / `cost.rs` / `fast-multiplier-overrides.json` / LiteLLM JSON 嵌入留 Phase 2 加 token cost 显示时再 vendor
+  - **不并行加载**:ccusage `loader.rs` 用 `thread::scope` 并行,本项目桌面端单 user 数据量小(~250 文件 1.2GB 实测串行 ~1-2s)走串行,降并发复杂度
+  - **输出层全替**:ccusage 走 CLI stdout / terminal table,本项目走 Axum admin `/api/usage/summary` JSON + Tauri vanilla JS 前端 `<table>` 渲染
+  - **可见性**:vendor 后所有 `pub(crate)` / `pub(super)` 统一改 `pub`,保 vendor 子模块对父 crate 可见
+- **同步策略**:
+  - 上游 codex adapter 主线修改(新 token 字段 / parser bug fix)→ 跟随 ccusage 版本号手动 sync,改动小直接 cherry-pick 对应文件
+  - 上游 LiteLLM pricing snapshot 升级 → Phase 2 vendor pricing 后再考虑
+  - 不自动跟随;固定 vendor commit hash 避免 break(参 `vendored_ccusage/mod.rs` 顶部 `Upstream commit:` 注释)
+- **关联 PR / followup**: PR #279(主修),issue #279 + Linear MOC-15
+- **代码层引用**(`crates/usage_tracker/src/lib.rs:5-12` 节选):
+  > 借鉴自 ryoppippi/ccusage (MIT)。解析 + 数据类型 + paths 见 vendored_ccusage 模块,直接 vendor 自 ccusage `rust/crates/ccusage/src/adapter/codex/{parser,types,paths}.rs` 与同 crate `types.rs` / `fast.rs` / `home.rs` / `date_utils.rs` / `utils.rs`。本文件 loader + aggregator 算法 1:1 对照 ccusage `rust/crates/ccusage/src/adapter/codex/{loader.rs,aggregate.rs}`,但移除 CLI 层(`SharedArgs` / `progress::track_usage_load`)+ 不做并行。
+
 ---
 
 ## 维护规则

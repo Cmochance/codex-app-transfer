@@ -34,6 +34,7 @@
         <a href="#dashboard" class="route-tab" data-nav="dashboard" title="Providers"><i class="bi bi-speedometer2"></i><span data-i18n="nav.dashboard">仪表盘</span></a>
         <a href="#providers" class="route-tab" data-nav="providers" title="Providers"><i class="bi bi-plug"></i><span data-i18n="nav.providers">提供商</span></a>
         <a href="#proxy" class="route-tab" data-nav="proxy" title="Forwarding"><i class="bi bi-broadcast-pin"></i><span data-i18n="nav.proxy">转发</span></a>
+        <a href="#usage" class="route-tab" data-nav="usage" title="Usage"><i class="bi bi-bar-chart"></i><span data-i18n="nav.usage">用量</span></a>
         <a href="#settings" class="route-tab" data-nav="settings" title="Settings"><i class="bi bi-gear"></i><span data-i18n="nav.settings">设置</span></a>
         <a href="#codex" class="route-tab" data-nav="codex" title="Codex 资产"><i class="bi bi-bookmark"></i><span data-i18n="nav.codex">Codex 资产</span></a>
         <a href="#theme" class="route-tab" data-nav="theme" title="Theme"><i class="bi bi-palette"></i><span data-i18n="nav.theme">主题</span></a>
@@ -368,6 +369,35 @@
         </article>
 
         <div class="stats-grid" id="proxyStats"></div>
+      </section>
+
+      <section class="page" id="page-usage" data-page="usage">
+        <article class="panel usage-panel">
+          <div class="usage-header">
+            <h2 data-i18n="usage.title">Token 用量统计</h2>
+            <p class="usage-subtitle" data-i18n="usage.subtitle">基于 ~/.codex/sessions/ 的 rollout 文件 — 数据流参考 ccusage</p>
+            <button class="btn btn-outline-secondary btn-sm" type="button" id="usageRefreshBtn">
+              <i class="bi bi-arrow-clockwise"></i><span data-i18n="usage.refresh">刷新</span>
+            </button>
+          </div>
+
+          <div class="stats-grid" id="usageKpis"></div>
+
+          <div class="usage-view-switcher" role="tablist" aria-label="usage view">
+            <button class="usage-view-btn active" type="button" data-usage-view="daily" data-i18n="usage.viewDaily">按日</button>
+            <button class="usage-view-btn" type="button" data-usage-view="model" data-i18n="usage.viewModel">按模型</button>
+            <button class="usage-view-btn" type="button" data-usage-view="conversation" data-i18n="usage.viewConversation">按对话</button>
+          </div>
+
+          <article class="panel usage-table-wrap">
+            <table class="usage-table">
+              <thead id="usageTableHead"></thead>
+              <tbody id="usageTableBody"></tbody>
+            </table>
+            <div class="usage-empty" id="usageEmpty" hidden data-i18n="usage.empty">还没有用量数据 — 通过本应用转发跑过对话后会自动出现</div>
+            <div class="usage-loading" id="usageLoading" hidden data-i18n="usage.loading">扫描 rollout 中…</div>
+          </article>
+        </article>
       </section>
 
       <section class="page" id="page-settings" data-page="settings">
