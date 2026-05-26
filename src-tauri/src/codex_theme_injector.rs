@@ -530,8 +530,7 @@ async fn drain_until_response(
                 if let Some(err) = val.get("error") {
                     return Err(format!("CDP error for id={}: {}", expected_id, err));
                 }
-                if let Some(exception) = val.get("result").and_then(|r| r.get("exceptionDetails"))
-                {
+                if let Some(exception) = val.get("result").and_then(|r| r.get("exceptionDetails")) {
                     return Err(format!(
                         "CDP exception for id={}: {}",
                         expected_id, exception
