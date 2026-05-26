@@ -581,7 +581,8 @@ fn normalize_codex_timestamp(value: Option<&CodexTimestamp<'_>>) -> Option<Strin
             if text.is_empty() {
                 return None;
             }
-            super::super::date_utils::parse_ts_timestamp(text).map(super::super::date_utils::format_rfc3339_millis)
+            super::super::date_utils::parse_ts_timestamp(text)
+                .map(super::super::date_utils::format_rfc3339_millis)
         }
         CodexTimestamp::Number(raw) => {
             let millis = if *raw > 10_000_000_000 {
@@ -589,9 +590,9 @@ fn normalize_codex_timestamp(value: Option<&CodexTimestamp<'_>>) -> Option<Strin
             } else {
                 raw.checked_mul(1_000)?
             };
-            Some(super::super::date_utils::format_rfc3339_millis(TimestampMs::from_millis(
-                millis.min(i64::MAX as u64) as i64,
-            )))
+            Some(super::super::date_utils::format_rfc3339_millis(
+                TimestampMs::from_millis(millis.min(i64::MAX as u64) as i64),
+            ))
         }
     }
 }
@@ -603,7 +604,8 @@ fn normalize_value_timestamp(value: Option<&Value>) -> Option<String> {
         if text.is_empty() {
             return None;
         }
-        return super::super::date_utils::parse_ts_timestamp(text).map(super::super::date_utils::format_rfc3339_millis);
+        return super::super::date_utils::parse_ts_timestamp(text)
+            .map(super::super::date_utils::format_rfc3339_millis);
     }
     let raw = value.as_u64()?;
     let millis = if raw > 10_000_000_000 {
@@ -611,9 +613,9 @@ fn normalize_value_timestamp(value: Option<&Value>) -> Option<String> {
     } else {
         raw.checked_mul(1_000)?
     };
-    Some(super::super::date_utils::format_rfc3339_millis(TimestampMs::from_millis(
-        millis.min(i64::MAX as u64) as i64,
-    )))
+    Some(super::super::date_utils::format_rfc3339_millis(
+        TimestampMs::from_millis(millis.min(i64::MAX as u64) as i64),
+    ))
 }
 
 fn normalize_headless_codex_usage(value: &CodexLogEntry<'_>) -> Option<CodexRawUsage> {

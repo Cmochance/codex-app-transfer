@@ -41,8 +41,8 @@ use vendored_ccusage::types::CodexTokenUsageEvent;
 type CodexEventKey = (u64, u64, i64, u64, u64, u64, u64, u64);
 
 fn event_key(event: &CodexTokenUsageEvent) -> CodexEventKey {
-    use std::hash::{Hash, Hasher};
     use rustc_hash::FxHasher;
+    use std::hash::{Hash, Hasher};
     let mut session_hasher = FxHasher::default();
     event.session_id.hash(&mut session_hasher);
     let mut model_hasher = FxHasher::default();
@@ -202,13 +202,14 @@ pub fn summarize_daily(
     let mut groups: BTreeMap<String, UsageRow> = BTreeMap::new();
     let mut unknown_count: u64 = 0;
     for event in events {
-        let date = match parse_ts_timestamp(&event.timestamp).map(|ts| format_date_tz(ts, tz.as_ref())) {
-            Some(d) => d,
-            None => {
-                unknown_count += 1;
-                "unknown".to_string()
-            }
-        };
+        let date =
+            match parse_ts_timestamp(&event.timestamp).map(|ts| format_date_tz(ts, tz.as_ref())) {
+                Some(d) => d,
+                None => {
+                    unknown_count += 1;
+                    "unknown".to_string()
+                }
+            };
         let entry = groups.entry(date.clone()).or_insert_with(|| UsageRow {
             group: date,
             ..Default::default()
