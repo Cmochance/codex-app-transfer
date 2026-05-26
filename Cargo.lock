@@ -664,7 +664,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codex-app-transfer"
-version = "2.1.14"
+version = "2.1.15"
 dependencies = [
  "axum",
  "base64 0.22.1",

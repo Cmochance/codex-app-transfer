@@ -2,17 +2,20 @@
 
 逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
-## Unreleased — PR #153 draft
+## v2.1.15 — 2026-05-26
 
-**Anthropic Messages 协议适配**:新增 canonical `apiFormat=anthropic_messages`,将 Codex CLI Responses 请求转换到 Anthropic `/v1/messages`,并把 Anthropic Messages SSE 还原为 Responses SSE。当前 PR 已覆盖 text、thinking、tool_use、tool_result repair、`previous_response_id`、compact response、upstream error、provider test/model list 与 UI 保存显示路径。
+**Codex Desktop UX 集成 + 通用 provider 修复综合更新**:本版主要把 transfer 跟 Codex Desktop 的集成面继续做深(主题 / context 圆环 / system prompts i18n / plugin-unlock 强化),同时收掉一批 per-provider reasoning / autocompact 真机暴露的 bug。
 
-Claude preset 暂不开放:需要 P7 真实 Claude text、tool-call、`previous_response_id`、upstream error 验证通过后再加入默认 preset。
+- **Codex Desktop 主题页**(PR #265 / issue #264):Sidebar 加 Theme 页,内置 5 套主题(`carton` 带浮动看板娘 + `changli` / `azurlane` / `nailin` / `zani` 单背景),通过 CDP `Page.addScriptToEvaluateOnNewDocument` 一次注入持久(无 daemon)。资源 `include_bytes!` 嵌进 binary(~5MB)。跟 Plugin Unlock 完全独立 toggle(默认关)。支持 user 上传自定义主题(1:1 crop)+ 隐藏 / 删除 + 缩略图实拍(GaussianBlur 防隐私)
+- **system prompts 跟随 transfer 语言**(PR #263 / issue #262):注入 Codex 的 system prompts 改读 transfer UI 语言设置,中文 UI 下 Codex 不再固定英文回复
+- **Codex Desktop context 圆环**(PR #261 / issue #258):transfer 管理 context 使用率 atom,展示进度环 + 阈值告警 settings
+- **CAT_SKIP_MODEL_PROVIDER_WRITE env**(PR #260):配 verify 环境跳过 `model_provider` 字段写入,验证 Codex 自己持久化时不被 transfer 反复覆盖
+- **plugin-unlock 注入失败原因分流 + 15s 重试 + 心跳回收**(PR #255 / issue #253):macOS 改用 `--remote-debugging-port=0` + 异步 poll `DevToolsActivePort`(借 codex-theme launcher 同款模式),消除原 `try_bind` 预检与 Chromium bind 之间的 race window
+- **Per-provider `reasoning_effort` 策略**(PR #256 / issue #254):新建 `crates/registry/src/reasoning_effort_policy.rs` 注册表,DeepSeek 真实 xhigh→max 到达;Kimi/GLM/MiMo/MiniMax/Qwen 不传该字段(LiteLLM 白名单实证不承认);自定义 provider 保守 fallback。provider 识别改用 `id` / `name` / `base_url` substring(跟 `provider_looks_like` 同范式),修 healing UUID 让 precise id 匹配永远不命中导致整修复失效的真机 bug;补阿里云百炼 `maas.aliyuncs` / `百炼` needle
+- **GLM-5.1 autocompact**(PR #250 / issue #248):新建 model 级 `compact_thinking_policy` 注册表
+- **docs/ 整目录 gitignored + followup 迁 Linear**(PR #252):内部计划文档不入仓,跨 session followup 改 Linear (MOC-N) 跟踪
 
-## Unreleased — fix #254
-
-**Per-provider `reasoning_effort` 策略**:修复 DeepSeek xhigh/max 档位被一刀切降级到 high 的问题(issue #254)。新建 `crates/registry/src/reasoning_effort_policy.rs` 注册表:DeepSeek 真实 xhigh→max;Kimi/GLM/MiMo/MiniMax/Qwen 不传 `reasoning_effort` 字段(LiteLLM 白名单实证不承认);自定义 provider 保守 fallback。同时删除已冗余的 `deepseek_max_effort` preset 死字段。
-
-**Provider 识别用自然主键(substring)而非 id 精确匹配**:实机抓 wire 验证(2026-05-25)暴露:本项目 healing 流程会把 builtin preset 的 id 换成 UUID(`34fe2433`),precise `provider.id == "deepseek"` 匹配在用户真实 saved config 上永远不命中,issue #254 修复对真实用户失效。改用 `provider.id` / `name` / `base_url` 三字段大小写不敏感 substring 匹配(跟 `provider_looks_like` 同款范式)。同时 audit 出阿里云百炼 (Token Plan) 第二个漏网点:baseUrl `token-plan.cn-beijing.maas.aliyuncs.com` 不含 `dashscope`,name 不含 `bailian`,补 needle `maas.aliyuncs` + `百炼` 兜底。
+完整改动:[v2.1.14...v2.1.15](https://github.com/Cmochance/codex-app-transfer/compare/v2.1.14...v2.1.15)。
 
 ## v2.1.14 — 2026-05-23
 
