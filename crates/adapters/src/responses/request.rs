@@ -324,6 +324,13 @@ fn build_messages_from_input(
     if is_first_turn && tools_register_apply_patch(body) {
         messages.push(apply_patch_chat_guidance_message());
     }
+    // MOC-32 PR-2c: 同模式 inject — Codex 0.130+ `tool_search` builtin 在 chat
+    // upstream(mimo / Kimi / DeepSeek 等)默认不被识别,LLM 不主动调,fall back
+    // 到 `list_mcp_resources` 老路径返 wrong reasoning("MCP 工具未暴露,需重启")。
+    // first_turn 注入 hint 强化 prompt engineering 让 chat provider 主动用 tool_search。
+    if is_first_turn && tools_register_tool_search(body) {
+        messages.push(tool_search_chat_hint_message());
+    }
 
     let current_messages = body
         .get("input")
@@ -2478,5 +2485,95 @@ fn apply_patch_chat_guidance_message() -> Value {
     json!({
         "role": "system",
         "content": apply_patch_chat_path_guidance_for_current_language(),
+    })
+}
+
+// ── MOC-32 PR-2c: tool_search chat-path hint ─────────────────────────────────
+//
+// PR-1 + PR-2 + PR-2b 真机 verify(2026-05-28)发现:transfer 正确把 Codex 0.130+
+// `tool_search` builtin 转 chat function tool 注入 mimo 上游(133 次/单 session),
+// description 完整透传(含 "always use tool_search for MCP discovery" hint)。
+// 但 mimo (gpt-5.5 alias) **完全不主动调 tool_search**(0 次),fall back 老路径
+// `list_mcp_resources(server="notion")` 拿到 resources 但不是 tools → reasoning
+// 出 "MCP 工具未在当前会话暴露,需要重启 Codex" 这种错误结论。
+//
+// **真因**: mimo / Kimi / DeepSeek 等 chat-completions provider 训练数据没
+// Codex tool_search 概念,默认不重视 tool description 里的 hint。OpenAI 自家
+// GPT 熟悉(Codex 同 OpenAI 出品 prompt format 对齐),chat provider 需要 transfer
+// 额外注入 system message 强化 prompt engineering 才能让它们正确调 tool_search。
+//
+// 跟 apply_patch chat-path guidance 同 pattern — transfer adapter 在 chat
+// 上游不熟悉 Codex 特性时主动 inject system message,让模型行为对齐 Codex 期待。
+
+const TOOL_SEARCH_CHAT_HINT_EN: &str = concat!(
+    "[tool_search hint — injected by codex-app-transfer adapter for chat-completions providers]\n\n",
+    "If the user mentions any MCP server / tool (e.g. Notion / Linear / Figma / etc), ",
+    "or wants to perform any MCP-server-related operation:\n\n",
+    "**You MUST first call the `tool_search` tool** to discover the specific tools available ",
+    "from that server (pass the server name as `query`, e.g. `query=\"notion\"`). ",
+    "`tool_search` returns the concrete tool list exposed by that MCP server. Only then ",
+    "can you call specific `mcp__<server>__<tool>` tools in subsequent turns.\n\n",
+    "WRONG patterns (do NOT do these):\n",
+    "- ❌ Directly call `list_mcp_resources(server=\"notion\")` — resources are metadata, not callable tools\n",
+    "- ❌ Tell the user \"MCP tools are not exposed in current session, please restart\" — this is incorrect; the correct action is to call `tool_search` first to discover tools\n",
+    "- ❌ Use `exec_command` to grep filesystem for plugin config — the tool list is in `tool_search`, not on disk\n\n",
+    "CORRECT pattern:\n",
+    "1. User: \"create a Notion page about X\"\n",
+    "2. You: call `tool_search(query=\"notion\")` → see returned `mcp__notion__create_pages` etc\n",
+    "3. You: call `mcp__notion__create_pages(...)` in next turn to fulfill the request\n\n",
+    "Note: This guidance is injected by codex-app-transfer adapter because chat-completions ",
+    "upstream models (mimo / Kimi / DeepSeek / etc) typically do not have Codex's `tool_search` ",
+    "discovery convention in their training data, and tend to fall back to the legacy ",
+    "`list_mcp_resources` path or return misleading \"need restart\" advice. The hint exists ",
+    "to align chat-provider behavior with Codex's MCP tool defer mechanism (introduced in 0.130+)."
+);
+
+const TOOL_SEARCH_CHAT_HINT_ZH: &str = concat!(
+    "[tool_search 指引 — 由 codex-app-transfer adapter 为 chat-completions provider 注入]\n\n",
+    "如果用户提到任何 MCP server / 工具(如 Notion / Linear / Figma 等),",
+    "或想做 MCP server 相关操作:\n\n",
+    "**第一步必须先调 `tool_search` 工具**发现该 server 暴露的具体可用工具",
+    "(传 server 名作 `query`,如 `query=\"notion\"`)。`tool_search` 会返回该 MCP server 暴露的具体工具列表,",
+    "然后你才能在后续 turn 调用具体的 `mcp__<server>__<tool>` 工具。\n\n",
+    "错误模式(不要这样做):\n",
+    "- ❌ 直接调 `list_mcp_resources(server=\"notion\")` —— resources 是元数据,不是可调用工具\n",
+    "- ❌ 跟用户说 \"MCP 工具未在当前会话暴露,需要重启\" —— 这是错误信息;正确做法是先调 `tool_search` discover\n",
+    "- ❌ 用 `exec_command` 跑 shell 找 plugin 配置文件 —— 工具列表在 `tool_search` 里,不在磁盘上\n\n",
+    "正确模式:\n",
+    "1. 用户:\"在 Notion 中创建一个关于 X 的页面\"\n",
+    "2. 你:调 `tool_search(query=\"notion\")` → 看到返回的 `mcp__notion__create_pages` 等\n",
+    "3. 你:下一 turn 调 `mcp__notion__create_pages(...)` 完成请求\n\n",
+    "注:本指引由 codex-app-transfer adapter 注入,因为 chat-completions 上游模型",
+    "(mimo / Kimi / DeepSeek / 等)训练数据通常没有 Codex `tool_search` discovery 约定,",
+    "倾向 fall back 到老路径 `list_mcp_resources` 或给出 \"需要重启\" 类误导建议。",
+    "本指引让 chat provider 行为对齐 Codex 0.130+ 引入的 MCP tool defer 机制。"
+);
+
+/// 按当前 user 语言偏好选 tool_search chat-path 指引。
+fn tool_search_chat_hint_for_current_language() -> &'static str {
+    use crate::core::language::{current_language, Language};
+    match current_language() {
+        Language::Chinese => TOOL_SEARCH_CHAT_HINT_ZH,
+        Language::English => TOOL_SEARCH_CHAT_HINT_EN,
+    }
+}
+
+/// 检测 Responses request body 的 tools 数组是否注册了 `tool_search` 工具。
+/// `tool_search` 在 Responses 协议里以 `type:"tool_search"` 顶级 type 出现
+/// (Codex 0.130+ `Feature::ToolSearchAlwaysDeferMcpTools` 启用后)。
+/// 用于决定本 turn 是否注入 [`tool_search_chat_hint_for_current_language`]。
+fn tools_register_tool_search(body: &Value) -> bool {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return false;
+    };
+    tools
+        .iter()
+        .any(|t| t.get("type").and_then(Value::as_str) == Some("tool_search"))
+}
+
+fn tool_search_chat_hint_message() -> Value {
+    json!({
+        "role": "system",
+        "content": tool_search_chat_hint_for_current_language(),
     })
 }

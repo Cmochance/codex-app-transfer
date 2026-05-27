@@ -3649,6 +3649,108 @@ fn apply_patch_guidance_injected_in_chinese_when_language_zh() {
     });
 }
 
+// ── MOC-32 PR-2c: tool_search chat-path hint inject ──────────────────────────
+
+fn first_turn_request_with_tool_search() -> Value {
+    json!({
+        "model": "gpt-5.5",
+        "instructions": "test",
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "用 Notion 创建子页面"}]}],
+        "tools": [{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "# Tool discovery — BM25 search...",
+            "parameters": {"type": "object", "properties": {}}
+        }],
+    })
+}
+
+#[test]
+fn tool_search_hint_injected_when_tools_register_tool_search() {
+    with_user_language("zh-CN", || {
+        let out = convert(first_turn_request_with_tool_search());
+        let messages = out["messages"].as_array().unwrap();
+        // messages[0] = instructions, messages[1] = tool_search hint
+        // (apply_patch hint 不在,因为本 fixture 没注册 apply_patch)
+        let hint = messages[1]["content"].as_str().unwrap();
+        assert!(hint.contains("[tool_search 指引"), "ZH hint header missing");
+        assert!(
+            hint.contains("tool_search"),
+            "ZH hint must mention tool_search"
+        );
+        assert!(
+            hint.contains("mcp__"),
+            "ZH hint must mention mcp__<server>__<tool> pattern"
+        );
+    });
+}
+
+#[test]
+fn tool_search_hint_injected_in_english_by_default() {
+    with_user_language("en", || {
+        let out = convert(first_turn_request_with_tool_search());
+        let hint = out["messages"][1]["content"].as_str().unwrap();
+        assert!(hint.contains("[tool_search hint"), "EN hint header missing");
+        assert!(
+            hint.contains("MUST first call the `tool_search` tool"),
+            "EN hint body missing"
+        );
+        assert!(!hint.contains("务必"), "EN hint must not contain ZH text");
+    });
+}
+
+#[test]
+fn tool_search_hint_not_injected_when_tools_lack_tool_search() {
+    // 没注册 tool_search 不应 inject(避免 chat provider 看到多余 system msg
+    // 浪费 context window)
+    with_user_language("zh-CN", || {
+        let req = json!({
+            "model": "gpt-5.5",
+            "instructions": "test",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tools": [{"type": "function", "name": "exec_command", "description": "", "parameters": {}}],
+        });
+        let out = convert(req);
+        let messages = out["messages"].as_array().unwrap();
+        for m in messages {
+            let content = m["content"].as_str().unwrap_or("");
+            assert!(
+                !content.contains("[tool_search"),
+                "tool_search hint should NOT be injected when tools[] has no tool_search"
+            );
+        }
+    });
+}
+
+#[test]
+fn tool_search_hint_not_injected_on_continuation_turn() {
+    // 跟 apply_patch hint 同语义:non-first turn(有 previous_response_id)
+    // 不重复 inject,首 turn 已有 hint 模型已经知道
+    with_user_language("zh-CN", || {
+        let req = json!({
+            "model": "gpt-5.5",
+            "previous_response_id": "resp_xxx_continued",
+            "instructions": "test",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]}],
+            "tools": [{
+                "type": "tool_search",
+                "execution": "client",
+                "description": "# Tool discovery",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+        });
+        let out = convert(req);
+        let messages = out["messages"].as_array().unwrap();
+        for m in messages {
+            let content = m["content"].as_str().unwrap_or("");
+            assert!(
+                !content.contains("[tool_search 指引"),
+                "tool_search hint should NOT be injected on continuation turn"
+            );
+        }
+    });
+}
+
 #[test]
 fn apply_patch_guidance_zh_covers_all_nine_rules() {
     with_user_language("zh", || {
