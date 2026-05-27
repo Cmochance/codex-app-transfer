@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
@@ -14,6 +15,39 @@ use sha2::{Digest, Sha256};
 use super::super::registry_io::load as load_registry;
 use super::super::signature::verify_signed_bytes;
 use super::common::{err, APP_VERSION};
+
+/// Shared reqwest client for update checks (cached to avoid repeated build overhead
+/// and potential system-proxy auto-detection hangs on Windows).
+fn shared_update_check_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .map_err(|e| format!("update HTTP client init failed: {e}"))
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+/// Shared reqwest client for update install (large file download).
+fn shared_update_install_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(300))
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .map_err(|e| format!("update HTTP client init failed: {e}"))
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
 
 pub(super) fn current_update_platform() -> String {
     current_update_platform_for(std::env::consts::OS, std::env::consts::ARCH)
@@ -731,23 +765,23 @@ pub async fn update_check(Query(query): Query<UpdateCheckQuery>) -> impl IntoRes
         .filter(|v| !v.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(current_update_platform);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                format!("update URL request failed: {e}"),
-            )
-            .into_response()
-        }
+    let client = match shared_update_check_client() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    match check_update_impl(&client, &update_url, &current, &platform).await {
-        Ok(result) => Json(result).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        check_update_impl(&client, &update_url, &current, &platform),
+    )
+    .await
+    {
+        Ok(Ok(result)) => Json(result).into_response(),
+        Ok(Err(e)) => err(StatusCode::BAD_REQUEST, e).into_response(),
+        Err(_) => err(
+            StatusCode::BAD_REQUEST,
+            "update check timed out, please try again",
+        )
+        .into_response(),
     }
 }
 
@@ -782,19 +816,9 @@ pub async fn update_install(body: Option<Json<UpdateInstallInput>>) -> impl Into
         .filter(|v| !v.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(current_update_platform);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                format!("update URL request failed: {e}"),
-            )
-            .into_response()
-        }
+    let client = match shared_update_install_client() {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
     let mut result =
         match download_update_impl(&client, &update_url, &current, &platform, None).await {

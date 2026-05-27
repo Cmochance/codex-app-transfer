@@ -1,6 +1,6 @@
 [package]
 name = "codex-app-transfer"
-version = "2.1.16"
+version = "2.1.15"
 description = "Codex App Transfer - Tauri 2 shell"
 edition.workspace = true
 rust-version.workspace = true
@@ -26,12 +26,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 codex-app-transfer-registry = { path = "../crates/registry" }
 codex-app-transfer-codex-integration = { path = "../crates/codex_integration" }
-codex-app-transfer-conversation-export = { path = "../crates/conversation_export" }
-codex-app-transfer-usage-tracker = { path = "../crates/usage_tracker" }
 codex-app-transfer-proxy = { path = "../crates/proxy" }
 codex-app-transfer-adapters = { path = "../crates/adapters" }
 codex-app-transfer-gemini-oauth = { path = "../crates/gemini_oauth" }
-tokio = { version = "1", features = ["sync", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 axum = { version = "0.8", features = ["http1", "tokio", "macros"] }
@@ -47,7 +45,7 @@ bytes = "1"
 include_dir = "0.7"
 mime_guess = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "http2", "socks", "system-proxy"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "http2", "socks", "system-proxy", "gzip"] }
 # sha2 "oid" feature 让 `Pkcs1v15Sign::new::<Sha256>()` 编译过 (admin/signature.rs
 # 客户端验签需要 OID-tagged Sha256, 跟 xtask/Cargo.toml 设置对齐避免 cross-impl drift)。
 sha2 = { version = "0.10", features = ["oid"] }
