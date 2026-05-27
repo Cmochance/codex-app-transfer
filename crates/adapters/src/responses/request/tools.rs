@@ -335,9 +335,10 @@ pub fn convert_responses_tool_to_chat_tool(
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let parameters = obj.get("parameters").cloned().unwrap_or_else(
-                || json!({"type":"object","properties":{},"required":[]}),
-            );
+            let parameters = obj
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object","properties":{},"required":[]}));
             vec![json!({
                 "type": "function",
                 "function": {

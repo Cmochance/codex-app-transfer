@@ -1161,10 +1161,8 @@ impl ChatToResponsesConverter {
             // envelope.output[] 终态必须跟流式 `response.output_item.done` 的
             // item 一致(见 close_tool_call tool_search 分支),否则严格客户端
             // 会两次解读为不同 item。同样 args parse 失败 fallback {"raw":...}。
-            let arguments_value: Value =
-                serde_json::from_str(&pending.args_acc).unwrap_or_else(|_| {
-                    json!({ "raw": pending.args_acc })
-                });
+            let arguments_value: Value = serde_json::from_str(&pending.args_acc)
+                .unwrap_or_else(|_| json!({ "raw": pending.args_acc }));
             return json!({
                 "type": "tool_search_call",
                 "id": pending.fc_id,
