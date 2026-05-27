@@ -70,6 +70,12 @@ struct PendingToolCall {
     /// 流式事件 name、args 解包都按 custom 路径走)而不是 `function_call`。
     /// 见 [`is_apply_patch_tool_name`] 和 `close_tool_call` 注释。
     is_apply_patch: bool,
+    /// 首帧 name == `tool_search` 时置 true,整个 item 走 Responses
+    /// `tool_search_call` wire(Codex 0.130+ `core/src/tools/router.rs:106-122`
+    /// 按 `ResponseItem::ToolSearchCall` 路由到 `ToolPayload::ToolSearch`,
+    /// 返 `ResponseInputItem::ToolSearchOutput` 进下轮 input)。
+    /// 见 [`is_tool_search_tool_name`]。Refs MOC-32 / GH #288。
+    is_tool_search: bool,
     /// `response.output_item.added` 是否已经 emit 过 — 一旦 emit,后续帧
     /// 补全的 `tc.id` 不再覆盖 `call_id`,避免 `output_item.added` 用旧 id 而
     /// 后续 `input.delta` / `output_item.done` 用新 id,严格客户端会两次解读
@@ -107,6 +113,21 @@ struct PendingToolCall {
 /// 字符串一致性(请求侧的特判描述 / 响应侧的 wire 重打包必须按同一 name 触发)。
 fn is_apply_patch_tool_name(name: &str) -> bool {
     name == "apply_patch"
+}
+
+/// Codex 0.130+ 把 MCP server tools 全 defer 到 `tool_search` builtin
+/// (`Feature::ToolSearchAlwaysDeferMcpTools` 启用,见 `core/src/mcp_tool_exposure.rs:32-36`)。
+/// LLM 调用 `tool_search` 时,Codex 期待 `ResponseItem::ToolSearchCall` wire
+/// (`type:"tool_search_call"`,`protocol/src/models.rs:2674-2715` roundtrip 实证),
+/// router 路由到 `ToolPayload::ToolSearch`(`core/src/tools/router.rs:106-122`)
+/// 内部 BM25 dispatch。chat 上游回的 `function_call` wire 不被 Codex 这条路径
+/// 识别 → 必须像 apply_patch 一样把 wire 重打包成 `tool_search_call`。
+///
+/// 跟 `request/tools.rs` 的 `"tool_search"` match arm 字符串对齐(请求侧把
+/// tool_search 降级成 chat function;响应侧把 chat function_call 升回
+/// `tool_search_call`,name 必须一致才能触发本特判)。
+fn is_tool_search_tool_name(name: &str) -> bool {
+    name == "tool_search"
 }
 
 #[derive(Debug)]
@@ -538,6 +559,7 @@ impl ChatToResponsesConverter {
             // wire(同当前行为,Codex CLI 仍会 abort apply_patch 一次),不
             // 比修复前差。
             let is_apply_patch = is_apply_patch_tool_name(&name);
+            let is_tool_search = is_tool_search_tool_name(&name);
             self.tool_calls.insert(
                 openai_index,
                 PendingToolCall {
@@ -548,6 +570,7 @@ impl ChatToResponsesConverter {
                     args_acc: String::new(),
                     closed: false,
                     is_apply_patch,
+                    is_tool_search,
                     output_item_added_emitted: false,
                     apply_patch_input: None,
                     interrupted_during_close: false,
@@ -573,6 +596,36 @@ impl ChatToResponsesConverter {
                     "call_id": call_id,
                     "name": name,
                     "input": "",
+                    "status": "in_progress",
+                });
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
+            } else if is_tool_search {
+                // tool_search wire 跟 apply_patch 同模式:open 时 emit
+                // `response.output_item.added` 带 `type=tool_search_call`,
+                // close 时一次性 emit `output_item.done`(arguments JSON object
+                // 在 close 时 parse,中间不流式 — BM25 query 短不需要)。
+                // wire schema 实证:`protocol/src/models.rs:2674-2715` roundtrip
+                // test:`{type, call_id, execution:"client", arguments:{...}}`。
+                tracing::info!(
+                    target = "adapters::tool_search",
+                    call_id = %call_id,
+                    "tool_search shim engaged: rewriting chat function_call wire to Responses tool_search_call",
+                );
+                let item = json!({
+                    "type": "tool_search_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "execution": "client",
+                    "arguments": {},
                     "status": "in_progress",
                 });
                 emit_event(
@@ -694,7 +747,16 @@ impl ChatToResponsesConverter {
     fn close_tool_call(&mut self, openai_index: u32, interrupted: bool, out: &mut Vec<u8>) {
         // 先把所有需要的字段 clone 出来,避免 mutable borrow 跟
         // self.lookup_namespace_for 的 immutable borrow 冲突
-        let (fc_id, call_id, name, args_acc, output_index, already_closed, is_apply_patch) = {
+        let (
+            fc_id,
+            call_id,
+            name,
+            args_acc,
+            output_index,
+            already_closed,
+            is_apply_patch,
+            is_tool_search,
+        ) = {
             let Some(pending) = self.tool_calls.get(&openai_index) else {
                 return;
             };
@@ -706,6 +768,7 @@ impl ChatToResponsesConverter {
                 pending.output_index,
                 pending.closed,
                 pending.is_apply_patch,
+                pending.is_tool_search,
             )
         };
         if already_closed {
@@ -829,6 +892,50 @@ impl ChatToResponsesConverter {
                     arguments: args_acc.clone(),
                 },
             );
+            if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                pending.closed = true;
+            }
+            return;
+        }
+
+        if is_tool_search {
+            // chat 上游回的 args 是 JSON string (e.g. '{"query":"calendar"}'),
+            // 但 Codex `ResponseItem::ToolSearchCall.arguments` 字段是 JSON Value
+            // (`router.rs:107-115` 用 `serde_json::from_value::<SearchToolCallParams>`
+            // parse,接受 object 不接受 string)。parse 失败 fallback 给 raw
+            // string 包成 {"raw": "..."} — Codex 端会 fail parse,但至少能在
+            // log 看到 LLM 实际发了啥(比静默 drop 强)。
+            let arguments_value: Value = serde_json::from_str(&args_acc).unwrap_or_else(|err| {
+                tracing::warn!(
+                    target = "adapters::tool_search",
+                    call_id = %call_id,
+                    args_len = args_acc.len(),
+                    error = %err,
+                    "tool_search arguments JSON parse failed; emitting {{raw: ...}} fallback (Codex will reject but logs preserve model intent)",
+                );
+                json!({ "raw": args_acc })
+            });
+            let item = json!({
+                "type": "tool_search_call",
+                "id": fc_id,
+                "call_id": call_id,
+                "execution": "client",
+                "arguments": arguments_value,
+                "status": "completed",
+            });
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                }),
+            );
+            // 跟 apply_patch 一样不存 tool_call_cache — Codex 后续 turn 用
+            // `ResponseInputItem::ToolSearchOutput` inject 工具列表,不需要从
+            // cache 重建 call 上下文。
             if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
                 pending.closed = true;
             }
@@ -1050,6 +1157,23 @@ impl ChatToResponsesConverter {
     }
 
     fn tool_call_item_completed(&self, pending: &PendingToolCall) -> Value {
+        if pending.is_tool_search {
+            // envelope.output[] 终态必须跟流式 `response.output_item.done` 的
+            // item 一致(见 close_tool_call tool_search 分支),否则严格客户端
+            // 会两次解读为不同 item。同样 args parse 失败 fallback {"raw":...}。
+            let arguments_value: Value =
+                serde_json::from_str(&pending.args_acc).unwrap_or_else(|_| {
+                    json!({ "raw": pending.args_acc })
+                });
+            return json!({
+                "type": "tool_search_call",
+                "id": pending.fc_id,
+                "call_id": pending.call_id,
+                "execution": "client",
+                "arguments": arguments_value,
+                "status": "completed",
+            });
+        }
         if pending.is_apply_patch {
             // envelope.output[] 终态必须和流式 `response.output_item.done`
             // 的 item 一致(见 close_tool_call apply_patch 分支),否则严格
