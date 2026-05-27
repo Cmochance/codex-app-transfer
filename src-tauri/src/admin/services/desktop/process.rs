@@ -230,44 +230,72 @@ fn quit_codex_app_with_retries(platform: &str) -> Result<(), String> {
     Err("Codex 未能正常退出,请手动关闭后重试".to_owned())
 }
 
-/// 如果设置中开启了 autoWakeCodexPet，在启动 Codex 前将其全局状态中的
-/// electron-avatar-overlay-open 设为 true，使宠物自动唤醒。
-fn maybe_wake_codex_pet() {
+/// 把 autoWakeCodexPet 设置双向同步到 Codex 全局状态文件的
+/// `electron-avatar-overlay-open` 字段。enabled=true 写 true(自动开 pet),
+/// enabled=false 写 false(显式关 pet 覆盖之前残留的 true)。
+///
+/// MOC-34: 旧实现只在 enabled=true 时写,enabled=false 时 early return,导致
+/// 用户之前开过 pet(或 Codex Desktop 里手动开过)后,状态文件里残留的 true
+/// 在设置关掉后仍生效,Codex 启动时还是会自动开 pet。
+///
+/// 失败路径(state 文件不存在 / 读失败 / 解析失败 / 非 object / 写失败)都不
+/// 主动创建文件,但会 `tracing::warn!` 记录,方便复现 MOC-34 类报告 — 因为
+/// enabled=false 时的写入承载着用户的关闭意图,静默丢弃会让用户怀疑开关坏了。
+fn sync_codex_pet_state() {
     let cfg = match crate::admin::registry_io::load() {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(error = %e, "[Pet] 读 registry 失败,跳过同步");
+            return;
+        }
     };
+    // 默认 true 跟 settings.rs:61 / frontend app.js 的 `!== false` 默认对齐 —
+    // 首启 / setting key 缺失时倾向自动开 pet。
     let enabled = cfg
         .get("settings")
         .and_then(|s| s.get("autoWakeCodexPet"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    if !enabled {
+    let Some(home) = codex_app_transfer_registry::paths::resolve_home() else {
+        tracing::warn!("[Pet] 无法解析 home 目录,跳过同步");
         return;
-    }
-    let home = match codex_app_transfer_registry::paths::resolve_home() {
-        Some(h) => h,
-        None => return,
     };
     let path = home.join(".codex").join(".codex-global-state.json");
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "[Pet] 读 state 文件失败,跳过同步");
+            return;
+        }
     };
     let mut state: Value = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "[Pet] state JSON 解析失败,跳过同步");
+            return;
+        }
     };
-    if let Some(obj) = state.as_object_mut() {
-        obj.insert(
-            "electron-avatar-overlay-open".to_string(),
-            Value::Bool(true),
-        );
-    }
-    let _ = fs::write(
-        &path,
-        serde_json::to_string_pretty(&state).unwrap_or_default(),
+    let Some(obj) = state.as_object_mut() else {
+        tracing::warn!(path = %path.display(), "[Pet] state JSON 顶层非 object,跳过同步");
+        return;
+    };
+    obj.insert(
+        "electron-avatar-overlay-open".to_string(),
+        Value::Bool(enabled),
     );
+    // to_string_pretty 对合法 Value::Object 几乎不会失败,但失败时**不能** fallback
+    // 空字符串(会把 state 文件截成空 corrupt 旧值)。改成 match 显式跳过。
+    let serialized = match serde_json::to_string_pretty(&state) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "[Pet] state 序列化失败,跳过写回");
+            return;
+        }
+    };
+    if let Err(e) = fs::write(&path, serialized) {
+        tracing::warn!(path = %path.display(), error = %e, "[Pet] 写 state 失败,关闭意图可能未生效");
+    }
 }
 
 /// 探测一个可用的 CDP debug port(非 macOS):**优先 9222**(跟 Chrome 一致),
@@ -493,7 +521,7 @@ fn read_theme_settings() -> Option<String> {
 }
 
 fn open_codex_app(platform: &str) -> Result<(), String> {
-    maybe_wake_codex_pet();
+    sync_codex_pet_state();
 
     // Windows MSIX activation: 见 `windows_msix.rs` module docs。失败时
     // fallthrough 到 explorer.exe shell:AppsFolder 老路径(args 丢失)。
