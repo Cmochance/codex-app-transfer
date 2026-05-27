@@ -39,28 +39,147 @@ pub use responses::{
 };
 pub use types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
-/// 把"丢弃某个未知 Responses 工具 type"的告警在整个进程内**每个 type 只 warn 一次**。
+/// 同 tool_type 前 [`DROP_TOOL_WARN_LIMIT`] 次 warn,之后静默(但 counter 仍累加)。
 ///
-/// Codex CLI 多轮对话每轮都会重发完整 tools 列表,普通 `tracing::warn!` 会让相同
-/// 警告每轮触发一次,30 分钟攒几十行重复 warn,真有问题时埋没在噪音里。借鉴
-/// `7as0nch/mimo2codex` `reqToChat.ts:158-172` 的 `warnOnce` 思路:全局
-/// `HashSet` 记录已 warn 过的 type,后续静默 drop。
+/// **Why first-N (not first-1)**: MOC-32 PR-1 复盘 — 原 `HashSet` first-1 dedup
+/// 让 Codex 0.130+ 引入的 `tool_search` drop **每 session 只 warn 一次**,bug
+/// 长期被 noise / log rotation 掩盖,无人察觉 → MCP 工具暴露失败问题积压 1+ 月才
+/// 被诊断出来。改 first-3 让 maintainer 有 3 次机会在 log scroll 时看到 + 配合
+/// `dropped_tool_counters()` 累计 counter 让前端 UI 实时展示 drop 频率。
 ///
-/// 进程重启后重置(也就是想要的行为 — 重启可能跟版本升级 / 新 Codex CLI 行为
-/// 相关,值得再看一次)。
+/// **Why 不无限 warn**: Codex CLI 多轮对话每轮重发完整 tools 列表,无限 warn
+/// 30 分钟攒几十行,真有问题时仍埋没。first-N 是噪音 / 可见性折中。
+///
+/// 进程重启 counter 归零(重启常跟版本升级 / 新 Codex CLI 行为相关,值得再看)。
+///
+/// 借鉴 `7as0nch/mimo2codex` `reqToChat.ts:158-172` 的 `warnOnce` 思路,本次
+/// 改造改成 first-N + counter(原方案纯 dedup)。
+pub const DROP_TOOL_WARN_LIMIT: u32 = 3;
+
 pub fn warn_once_drop_tool(tool_type: &str) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let Ok(mut guard) = seen.lock() else {
+    let counters = drop_tool_counters();
+    let Ok(mut guard) = counters.lock() else {
         // poisoned mutex 在生产 unlikely;直接 warn 不重 dedup,避免 panic
         tracing::warn!(tool_type = %tool_type, "dropping unsupported responses tool type");
         return;
     };
-    if guard.insert(tool_type.to_owned()) {
-        tracing::warn!(tool_type = %tool_type, "dropping unsupported responses tool type");
+    let count = guard.entry(tool_type.to_owned()).or_insert(0);
+    *count += 1;
+    let n = *count;
+    if n <= DROP_TOOL_WARN_LIMIT {
+        if n == DROP_TOOL_WARN_LIMIT {
+            tracing::warn!(
+                tool_type = %tool_type,
+                warned_times = n,
+                limit = DROP_TOOL_WARN_LIMIT,
+                "dropping unsupported responses tool type (further drops will be silenced; use dropped_tool_counters() to inspect totals)",
+            );
+        } else {
+            tracing::warn!(tool_type = %tool_type, warned_times = n, "dropping unsupported responses tool type");
+        }
     }
+}
+
+/// `tool_type -> 累计 drop 次数` snapshot — 前端 UI / 反馈 bundle 可用此累计值
+/// 检查是否有 silently dropped 工具(避免 MOC-32 类静默 bug 再藏 N 月)。
+///
+/// **不是 dedup 状态**(`warn_once_drop_tool` 内部用同一 HashMap,后续看 first-N
+/// 是否还有名额),是 **总 drop 计数**(每次 `convert_responses_tool_to_chat_tool`
+/// 命中 unknown type 都 +1,不受 warn 抑制影响)。
+pub fn dropped_tool_counters_snapshot() -> std::collections::HashMap<String, u32> {
+    drop_tool_counters()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+fn drop_tool_counters() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+    static COUNTERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    COUNTERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 测试用 reset hook — production 永远不调,仅 `#[cfg(test)]` caller 可见。
+#[cfg(test)]
+pub(crate) fn reset_dropped_tool_counters() {
+    if let Ok(mut g) = drop_tool_counters().lock() {
+        g.clear();
+    }
+}
+
+#[cfg(test)]
+mod warn_once_tests {
+    //! `warn_once_drop_tool` first-N + counter 行为测试。
+    //!
+    //! 用 unique tool_type per test 避免并发跑时 global counter race
+    //! (cargo test 默认 thread-pool 并发,共享 OnceLock counter)。
+    use super::*;
+
+    #[test]
+    fn counter_increments_per_call() {
+        let t = "test_a_counter_increments";
+        let before = dropped_tool_counters_snapshot()
+            .get(t)
+            .copied()
+            .unwrap_or(0);
+        warn_once_drop_tool(t);
+        warn_once_drop_tool(t);
+        let snap = dropped_tool_counters_snapshot();
+        assert_eq!(snap.get(t).copied(), Some(before + 2));
+    }
+
+    #[test]
+    fn snapshot_clones_state_not_view() {
+        let t = "test_b_snapshot_clone";
+        warn_once_drop_tool(t);
+        let s1 = dropped_tool_counters_snapshot();
+        warn_once_drop_tool(t);
+        let s2 = dropped_tool_counters_snapshot();
+        // s1 应该是 snapshot 那一刻的拷贝,不被后续调用 mutate
+        assert!(s1.get(t).copied().unwrap_or(0) < s2.get(t).copied().unwrap_or(0));
+    }
+
+    #[test]
+    fn counter_distinguishes_types() {
+        let t1 = "test_c_distinct_type_1";
+        let t2 = "test_c_distinct_type_2";
+        let b1 = dropped_tool_counters_snapshot()
+            .get(t1)
+            .copied()
+            .unwrap_or(0);
+        let b2 = dropped_tool_counters_snapshot()
+            .get(t2)
+            .copied()
+            .unwrap_or(0);
+        warn_once_drop_tool(t1);
+        warn_once_drop_tool(t2);
+        warn_once_drop_tool(t1);
+        let snap = dropped_tool_counters_snapshot();
+        assert_eq!(snap.get(t1).copied(), Some(b1 + 2));
+        assert_eq!(snap.get(t2).copied(), Some(b2 + 1));
+    }
+
+    #[test]
+    fn counter_keeps_incrementing_past_warn_limit() {
+        // 验证 warn 静默后 counter 仍累加(防 MOC-32 类 silently藏 bug)
+        let t = "test_d_past_limit";
+        let before = dropped_tool_counters_snapshot()
+            .get(t)
+            .copied()
+            .unwrap_or(0);
+        for _ in 0..(DROP_TOOL_WARN_LIMIT + 5) {
+            warn_once_drop_tool(t);
+        }
+        let snap = dropped_tool_counters_snapshot();
+        assert_eq!(
+            snap.get(t).copied(),
+            Some(before + DROP_TOOL_WARN_LIMIT + 5)
+        );
+    }
+
+    // 注:不测 `reset_dropped_tool_counters()` — 它会清掉 global counter,跟
+    // 其他并发跑的 test race。reset 函数是 trivial 的 `g.clear()`,留作 future
+    // test 想 isolated state 时用。
 }
 
 /// 本进程已自动禁用 web_search 的 provider id 集合 — 4xx fallback 路径调用
