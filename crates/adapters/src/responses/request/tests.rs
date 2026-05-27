@@ -3775,6 +3775,129 @@ fn tool_search_hint_injected_per_turn_including_continuation() {
     });
 }
 
+// ── MOC-32 PR-2c followup #2: response-side trigger nudge ───────────────────
+
+fn request_with_recent_legacy_mcp_call(legacy_name: &str, server: &str) -> Value {
+    json!({
+        "model": "gpt-5.5",
+        "instructions": "test",
+        "previous_response_id": "resp_continuation",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "用 notion 创建子页面"}]},
+            {"type": "function_call", "name": legacy_name, "arguments": format!("{{\"server\":\"{server}\"}}"), "call_id": "call_abc"},
+            {"type": "function_call_output", "call_id": "call_abc", "output": "{\"resources\":[]}"},
+        ],
+        "tools": [{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "# Tool discovery",
+            "parameters": {"type": "object", "properties": {}}
+        }],
+    })
+}
+
+#[test]
+fn corrective_nudge_appended_after_list_mcp_resources_call() {
+    with_user_language("zh-CN", || {
+        let out = convert(request_with_recent_legacy_mcp_call(
+            "list_mcp_resources",
+            "notion",
+        ));
+        let messages = out["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        let content = last["content"].as_str().unwrap_or("");
+        assert!(content.contains("纠正"), "corrective nudge as last message");
+        assert!(
+            content.contains("list_mcp_resources"),
+            "name specific legacy tool"
+        );
+        assert!(content.contains("notion"), "include server arg from call");
+        assert!(content.contains("tool_search"), "direct to tool_search");
+    });
+}
+
+#[test]
+fn corrective_nudge_also_for_list_mcp_resource_templates_en() {
+    with_user_language("en", || {
+        let out = convert(request_with_recent_legacy_mcp_call(
+            "list_mcp_resource_templates",
+            "linear",
+        ));
+        let last = out["messages"].as_array().unwrap().last().unwrap().clone();
+        let content = last["content"].as_str().unwrap_or("");
+        assert!(content.contains("CORRECTION"));
+        assert!(content.contains("list_mcp_resource_templates"));
+        assert!(content.contains("linear"));
+        assert!(content.contains("`tool_search"));
+    });
+}
+
+#[test]
+fn corrective_nudge_also_for_read_mcp_resource() {
+    with_user_language("zh-CN", || {
+        let out = convert(request_with_recent_legacy_mcp_call(
+            "read_mcp_resource",
+            "figma",
+        ));
+        let last = out["messages"].as_array().unwrap().last().unwrap().clone();
+        let content = last["content"].as_str().unwrap_or("");
+        assert!(content.contains("read_mcp_resource"));
+        assert!(content.contains("figma"));
+    });
+}
+
+#[test]
+fn corrective_nudge_not_triggered_when_no_legacy_call() {
+    with_user_language("zh-CN", || {
+        let req = json!({
+            "model": "gpt-5.5",
+            "instructions": "test",
+            "previous_response_id": "resp_xxx",
+            "input": [
+                {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}", "call_id": "call_x"},
+                {"type": "function_call_output", "call_id": "call_x", "output": "[out]"},
+            ],
+            "tools": [{"type":"tool_search","execution":"client","description":"d","parameters":{"type":"object","properties":{}}}],
+        });
+        let out = convert(req);
+        for m in out["messages"].as_array().unwrap() {
+            let c = m["content"].as_str().unwrap_or("");
+            assert!(
+                !c.contains("纠正 — 上一轮你调用了"),
+                "nudge should NOT trigger when recent call is not legacy MCP"
+            );
+        }
+    });
+}
+
+#[test]
+fn corrective_nudge_not_triggered_when_already_corrected() {
+    // **只看最近 1 个 function_call** — LLM 已听 nudge 改路径,历史 legacy 不应
+    // keep triggering(防 chat history N 份相同 nudge 堆叠)
+    with_user_language("zh-CN", || {
+        let req = json!({
+            "model": "gpt-5.5",
+            "instructions": "test",
+            "previous_response_id": "resp_xxx",
+            "input": [
+                {"type": "function_call", "name": "list_mcp_resources", "arguments": "{\"server\":\"notion\"}", "call_id": "call_old"},
+                {"type": "function_call_output", "call_id": "call_old", "output": "[r]"},
+                {"type": "function_call", "name": "tool_search", "arguments": "{\"query\":\"notion\"}", "call_id": "call_new"},
+                {"type": "function_call_output", "call_id": "call_new", "output": "[t]"},
+            ],
+            "tools": [{"type":"tool_search","execution":"client","description":"d","parameters":{"type":"object","properties":{}}}],
+        });
+        let out = convert(req);
+        for m in out["messages"].as_array().unwrap() {
+            let c = m["content"].as_str().unwrap_or("");
+            assert!(
+                !c.contains("纠正 — 上一轮你调用了"),
+                "nudge should NOT trigger when most recent call is tool_search"
+            );
+        }
+    });
+}
+
 #[test]
 fn apply_patch_guidance_zh_covers_all_nine_rules() {
     with_user_language("zh", || {

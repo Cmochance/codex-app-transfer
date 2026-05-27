@@ -344,6 +344,16 @@ fn build_messages_from_input(
         .map(input_field_to_messages)
         .unwrap_or_default();
     messages.extend(current_messages);
+    // MOC-32 PR-2c followup #2: trigger-based corrective nudge — LLM 上一 turn
+    // 调过 list_mcp_resources / list_mcp_resource_templates / read_mcp_resource
+    // 时,立即 push corrective system message 让下一 turn 改调 tool_search。
+    // 位置在 current_messages 末尾(LLM 看的最 recent 一条),recency bias 最大。
+    if let Some((legacy_name, server)) = detect_recent_legacy_mcp_discovery_call(body) {
+        messages.push(tool_search_redirect_hint_message(
+            &legacy_name,
+            server.as_deref(),
+        ));
+    }
     merge_messages_with_previous_response(messages, body, session_cache)
 }
 
@@ -2588,4 +2598,87 @@ fn tool_search_chat_hint_message() -> Value {
         "role": "system",
         "content": tool_search_chat_hint_for_current_language(),
     })
+}
+
+// ── MOC-32 PR-2c followup #2: response-side trigger nudge ────────────────────
+//
+// PR-2c first round + strengthened content + per-turn re-inject 真机 verify
+// (2026-05-28 04:09 trace) 全失败:hint 100% 注入 outbound,mimo 仍 0 次主动调
+// tool_search,reasoning 4 段连续复述 hint explicit ban 的 "MCP cached connection
+// needs restart"。mimo system message 优先级低,system prompt 路径已穷尽。
+//
+// **新机制 — trigger-based**: scan inbound input[] 找 LLM 上一 turn 的
+// function_call,如果 name 命中 `list_mcp_resources` / `list_mcp_resource_templates`
+// / `read_mcp_resource`(legacy MCP discovery,**不返 callable tools**),
+// 自动在 chat messages 末尾 push 一条 corrective system message:"你刚调 X,
+// 这是 wrong path,**必须**改调 `tool_search(query='<server>')`"。
+//
+// **Why trigger-based 比 system hint 强**:LLM 看到自己**刚刚**的 tool_call 在
+// chat history 里(immediate context),corrective msg 是 chat messages 最 recent
+// 一条,recency bias + 行为级 feedback 强度远超 paragraph-form system prompt。
+// 类比:teach by show-and-correct(immediate)vs teach by manual(book)。
+//
+// 借鉴 `apply_patch` 工作原理:LLM 主动调 tool 时同时看到 tool description 强化,
+// 是"行为发生那一刻的 re-prompt"。我们这里反向 — LLM **错调**时下 turn 立刻
+// "纠正 re-prompt",同样是 behavioral-level 而非 conceptual-level conditioning。
+
+const LEGACY_MCP_DISCOVERY_TOOL_NAMES: &[&str] = &[
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+];
+
+/// Scan body.input[] 从尾到头找最近的 function_call,如果 name 命中 legacy
+/// MCP discovery 返 `(name, server_arg_if_present)`。否则 None。
+///
+/// **只看最近 1 个 function_call** — 历史 function_call 已经 trigger 过 nudge,
+/// 重复 push 会让 chat history 堆叠 N 份相同 nudge(每 turn 累加)。最近一个不
+/// 命中就不 trigger(意味着 LLM 已经听 nudge 改路径了,完成转化)。
+fn detect_recent_legacy_mcp_discovery_call(body: &Value) -> Option<(String, Option<String>)> {
+    let input = body.get("input").and_then(|v| v.as_array())?;
+    for it in input.iter().rev() {
+        let ty = it.get("type").and_then(|v| v.as_str())?;
+        if ty != "function_call" {
+            continue;
+        }
+        let name = it.get("name").and_then(|v| v.as_str())?;
+        if !LEGACY_MCP_DISCOVERY_TOOL_NAMES.contains(&name) {
+            return None; // 最近 function_call 非 legacy → 不 trigger
+        }
+        // 尝试从 arguments JSON 提取 server arg(eg `{"server":"notion"}`)
+        let server = it
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|j| j.get("server").and_then(|v| v.as_str()).map(String::from));
+        return Some((name.to_string(), server));
+    }
+    None
+}
+
+/// 构造 corrective system message — 含 specific legacy tool name + server arg,
+/// LLM 看到自己**刚刚**的 call 被点名,行为反馈强度最大。
+fn tool_search_redirect_hint_message(legacy_name: &str, server: Option<&str>) -> Value {
+    use crate::core::language::{current_language, Language};
+    let server_str = server.unwrap_or("<server_name>");
+    let content = match current_language() {
+        Language::Chinese => format!(
+            "[纠正 — 上一轮你调用了 `{legacy_name}`,这不是获取 MCP 可调用工具的正确方式]\n\n\
+             `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource` \
+             返回的是 server **resources(元数据 / 文档)**,**不是可调用的 tools**。\n\n\
+             **你必须立即改调 `tool_search(query=\"{server_str}\")`** 才能获取真正可调用的 \
+             `mcp__<server>__<tool>` 函数列表,然后下一 turn 调具体函数完成任务。\n\n\
+             不要重复调 `list_mcp_resources` 类工具 —— 重复也是错的,永远不会得到 callable tools。\n\n\
+             不要给用户回 \"MCP 工具未暴露 / 需要重启 Codex / 连接缓存\" 类答案 —— 这些都是错的,\
+             正确动作就是调 `tool_search`。"
+        ),
+        Language::English => format!(
+            "[CORRECTION — Last turn you called `{legacy_name}`, which is NOT the correct way to discover MCP callable tools]\n\n\
+             `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource` return server **resources (metadata / docs)**, NOT callable tools.\n\n\
+             **You MUST immediately call `tool_search(query=\"{server_str}\")` instead** to get the actual callable `mcp__<server>__<tool>` function list, then call the specific function in the next turn to fulfill the user's request.\n\n\
+             Do NOT re-call `list_mcp_resources`-family tools — re-calling them is also wrong, you will never get callable tools that way.\n\n\
+             Do NOT tell the user \"MCP tools not exposed / need restart Codex / connection cached\" — these answers are all WRONG. The correct action is to call `tool_search`."
+        ),
+    };
+    json!({"role": "system", "content": content})
 }
