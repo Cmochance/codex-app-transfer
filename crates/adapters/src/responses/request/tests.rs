@@ -3673,7 +3673,7 @@ fn tool_search_hint_injected_when_tools_register_tool_search() {
         // messages[0] = instructions, messages[1] = tool_search hint
         // (apply_patch hint 不在,因为本 fixture 没注册 apply_patch)
         let hint = messages[1]["content"].as_str().unwrap();
-        assert!(hint.contains("[tool_search 指引"), "ZH hint header missing");
+        assert!(hint.contains("MCP 工具发现规则"), "ZH hint header missing");
         assert!(
             hint.contains("tool_search"),
             "ZH hint must mention tool_search"
@@ -3690,12 +3690,15 @@ fn tool_search_hint_injected_in_english_by_default() {
     with_user_language("en", || {
         let out = convert(first_turn_request_with_tool_search());
         let hint = out["messages"][1]["content"].as_str().unwrap();
-        assert!(hint.contains("[tool_search hint"), "EN hint header missing");
         assert!(
-            hint.contains("MUST first call the `tool_search` tool"),
-            "EN hint body missing"
+            hint.contains("MCP tool discovery rule"),
+            "EN hint header missing"
         );
-        assert!(!hint.contains("务必"), "EN hint must not contain ZH text");
+        assert!(
+            hint.contains("FIRST tool call MUST be"),
+            "EN hint imperative body missing"
+        );
+        assert!(!hint.contains("必须"), "EN hint must not contain ZH text");
     });
 }
 
@@ -3715,7 +3718,7 @@ fn tool_search_hint_not_injected_when_tools_lack_tool_search() {
         for m in messages {
             let content = m["content"].as_str().unwrap_or("");
             assert!(
-                !content.contains("[tool_search"),
+                !content.contains("MCP 工具发现规则"),
                 "tool_search hint should NOT be injected when tools[] has no tool_search"
             );
         }
@@ -3723,15 +3726,19 @@ fn tool_search_hint_not_injected_when_tools_lack_tool_search() {
 }
 
 #[test]
-fn tool_search_hint_not_injected_on_continuation_turn() {
-    // 跟 apply_patch hint 同语义:non-first turn(有 previous_response_id)
-    // 不重复 inject,首 turn 已有 hint 模型已经知道
+fn tool_search_hint_injected_per_turn_including_continuation() {
+    // PR-2c followup: 跟 apply_patch hint 故意分歧 — tool_search hint
+    // **per-turn always inject**(不限 first-turn)。
+    // 真机 verify 2026-05-28: mimo 不听 first-turn hint,且 user 后续 turn 才
+    // 提 Notion 时 is_first_turn=false → hint 已不注入 → LLM 完全没 reminder
+    // → fall back 老 list_mcp_resources 路径。修法:per-turn re-inject 保证
+    // LLM 永远能看到提醒(context 成本 ~1KB/turn 可接受)。
     with_user_language("zh-CN", || {
         let req = json!({
             "model": "gpt-5.5",
             "previous_response_id": "resp_xxx_continued",
             "instructions": "test",
-            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续"}]}],
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "用 notion 创建子页面"}]}],
             "tools": [{
                 "type": "tool_search",
                 "execution": "client",
@@ -3741,13 +3748,30 @@ fn tool_search_hint_not_injected_on_continuation_turn() {
         });
         let out = convert(req);
         let messages = out["messages"].as_array().unwrap();
-        for m in messages {
-            let content = m["content"].as_str().unwrap_or("");
-            assert!(
-                !content.contains("[tool_search 指引"),
-                "tool_search hint should NOT be injected on continuation turn"
-            );
-        }
+        let any_hint = messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("MCP 工具发现规则")
+        });
+        assert!(
+            any_hint,
+            "tool_search hint MUST be re-injected on continuation turn (per-turn refresh, MOC-32 PR-2c followup)"
+        );
+        // sanity check 还是 1 条不是多条
+        let hint_count = messages
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("MCP 工具发现规则")
+            })
+            .count();
+        assert_eq!(
+            hint_count, 1,
+            "should inject exactly 1 hint per turn, got {hint_count}"
+        );
     });
 }
 

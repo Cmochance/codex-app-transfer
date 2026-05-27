@@ -31,7 +31,10 @@ use futures_core::Stream;
 use futures_util::TryStreamExt;
 use thiserror::Error;
 
-use crate::diagnostics::{write_upstream_error_bundle, UpstreamErrorBundleInput};
+use crate::diagnostics::{
+    headers_to_json, log_entries_to_json, write_proxy_trace_jsonl, write_upstream_error_bundle,
+    UpstreamErrorBundleInput,
+};
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
 
@@ -424,7 +427,7 @@ pub async fn forward_handler(
             // 重新调 prepare_request,B 层 cache 命中 → web_search 被 drop
             plan = adapter.prepare_request(
                 &client_path,
-                original_body_bytes_for_retry,
+                original_body_bytes_for_retry.clone(),
                 &resolved.provider,
             )?;
             // upstream_url 不变(同一 provider,plan.upstream_path 跟 web_search 无关)
@@ -481,14 +484,18 @@ pub async fn forward_handler(
         record_upstream_error_bundle(
             &parts.method,
             &client_path,
+            parts.uri.query(),
             &resolved,
             original_model.as_deref(),
             resolved_model.as_deref(),
             upstream_model_for_diag.as_deref(),
             st,
             &upstream_url,
+            &parts.headers,
+            &original_body_bytes_for_retry,
             &outbound_headers_snapshot,
             &plan.body,
+            &hs,
             &body,
         );
         let single = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body) });
@@ -503,18 +510,42 @@ pub async fn forward_handler(
         let st = resp.status();
         let hs = filter_hop_headers(resp.headers());
         let stream: codex_app_transfer_adapters::ByteStream = if st.is_success() {
-            let raw = Box::pin(
-                resp.bytes_stream()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+            // MOC-32 diagnostic build: 完整 buffer success response body 进 trace
+            let resp_headers_clone = resp.headers().clone();
+            let body_bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    telemetry.logs.add(
+                        "WARN",
+                        format!("upstream {st} body read failed (diagnostic buffer): {e}"),
+                    );
+                    Bytes::new()
+                }
+            };
+            let upstream_model_for_diag = body_model(&plan.body);
+            record_upstream_error_bundle(
+                &parts.method,
+                &client_path,
+                parts.uri.query(),
+                &resolved,
+                original_model.as_deref(),
+                resolved_model.as_deref(),
+                upstream_model_for_diag.as_deref(),
+                st,
+                &upstream_url,
+                &parts.headers,
+                &original_body_bytes_for_retry,
+                &outbound_headers_snapshot,
+                &plan.body,
+                &resp_headers_clone,
+                &body_bytes,
             );
-            Box::pin(TracedStream::new(
-                raw,
-                t_send,
-                st.as_u16(),
-                upstream_url.clone(),
-            ))
+            let single =
+                futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) });
+            Box::pin(single) as codex_app_transfer_adapters::ByteStream
         } else {
             // retry 后再次 4xx 或 5xx
+            let resp_headers_clone = resp.headers().clone();
             let body_bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -537,14 +568,18 @@ pub async fn forward_handler(
             record_upstream_error_bundle(
                 &parts.method,
                 &client_path,
+                parts.uri.query(),
                 &resolved,
                 original_model.as_deref(),
                 resolved_model.as_deref(),
                 upstream_model_for_diag.as_deref(),
                 st,
                 &upstream_url,
+                &parts.headers,
+                &original_body_bytes_for_retry,
                 &outbound_headers_snapshot,
                 &plan.body,
+                &resp_headers_clone,
                 &body_bytes,
             );
             let single =
@@ -907,19 +942,25 @@ fn log_upstream_error_diag(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_upstream_error_bundle(
     method: &http::Method,
     client_path: &str,
+    client_query: Option<&str>,
     resolved: &ResolvedProvider,
     original_model: Option<&str>,
     resolved_model: Option<&str>,
     upstream_model: Option<&str>,
     status: StatusCode,
     upstream_url: &str,
+    inbound_headers: &http::HeaderMap,
+    inbound_body_raw: &[u8],
     outbound_headers: &reqwest::header::HeaderMap,
-    request_body: &Bytes,
+    request_body_transformed: &Bytes,
+    response_headers: &reqwest::header::HeaderMap,
     response_body: &Bytes,
 ) {
+    let log_entries = crate::telemetry::proxy_telemetry().logs.get_all();
     let input = UpstreamErrorBundleInput {
         method: method.as_str().to_owned(),
         client_path: client_path.to_owned(),
@@ -931,10 +972,18 @@ fn record_upstream_error_bundle(
         resolved_model: resolved_model.map(str::to_owned),
         upstream_model: upstream_model.map(str::to_owned),
         outbound_headers_redacted: format_headers_redacted(outbound_headers),
-        request_body: request_body.to_vec(),
+        request_body: request_body_transformed.to_vec(),
         response_body: response_body.to_vec(),
+        client_query: client_query.map(str::to_owned),
+        inbound_headers_full: headers_to_json(inbound_headers),
+        inbound_body_raw: inbound_body_raw.to_vec(),
+        outbound_headers_full: headers_to_json(outbound_headers),
+        response_headers: headers_to_json(response_headers),
+        transfer_log_entries: log_entries_to_json(&log_entries),
     };
     let _ = write_upstream_error_bundle(&input);
+    // MOC-32 diagnostic build: always-on proxy trace jsonl(全字段,不 redact)
+    let _ = write_proxy_trace_jsonl(&input);
 }
 
 /// 把 HeaderMap 渲染成一行 `name=value, name=value, ...` 用于错误诊断日志。
