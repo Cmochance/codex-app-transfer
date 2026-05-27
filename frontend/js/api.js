@@ -223,6 +223,18 @@
       return (data.providers || []).map(p => mapProvider(p, data.activeId));
     },
 
+    // MOC-32 PR-2b: silently dropped Responses tool types snapshot
+    // (`{total, by_type: {tool_type: count}}`)。前端 dashboard 在 total>0 时
+    // 弹 warning 让 user / maintainer 看见 silent drop(防 MOC-32 类静默 bug
+    // 再藏 N 月);total=0 时隐藏 — 0 是 healthy 状态不要刷屏。
+    async getDroppedTools() {
+      try {
+        return await api('GET', '/api/diagnostic/dropped-tools');
+      } catch (_) {
+        return { total: 0, by_type: {} };
+      }
+    },
+
     async getProviderSecret(id) {
       return api('GET', `/api/providers/${encodeURIComponent(id)}/secret`);
     },

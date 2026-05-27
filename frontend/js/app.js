@@ -1302,10 +1302,44 @@
     $("#dashboardProviderName").textContent = status.activeProvider.name;
     // Plugin Unlock 状态刷新
     refreshPluginUnlockStatus();
+    // MOC-32 PR-2b: silently dropped Responses tool types
+    refreshDroppedToolsWarning();
     $("#activityList").innerHTML = activities.map((item) => (
       `<div class="activity-row"><time>${escapeHtml(item.time)}</time><span>${escapeHtml(item.text)}</span></div>`
     )).join("");
     await refreshUpdateBadge();
+  }
+
+  /// MOC-32 PR-2b: query /api/diagnostic/dropped-tools, total>0 时弹 warning
+  /// 让 user / maintainer 看到 transfer adapter 静默 drop 的 Responses API
+  /// 工具类型(防 MOC-32 类静默 bug 再藏 N 月)。total=0 隐藏 warning(0 是
+  /// healthy 状态不要刷屏)。
+  async function refreshDroppedToolsWarning() {
+    const warning = $("#dashboardDroppedToolsWarning");
+    if (!warning) return;
+    try {
+      const data = await CCApi.getDroppedTools();
+      const total = Number(data?.total ?? 0);
+      if (total <= 0) {
+        warning.hidden = true;
+        return;
+      }
+      const byType = data.by_type || {};
+      const types = Object.keys(byType).sort();
+      const summary = $("#dashboardDroppedToolsSummary");
+      if (summary) {
+        summary.textContent = ` (${total} ${t("dashboard.droppedToolsCalls") || "次"} / ${types.length} ${t("dashboard.droppedToolsTypes") || "种"})`;
+      }
+      const list = $("#dashboardDroppedToolsList");
+      if (list) {
+        list.innerHTML = types
+          .map((tt) => `<li><code>${escapeHtml(tt)}</code> × ${Number(byType[tt])}</li>`)
+          .join("");
+      }
+      warning.hidden = false;
+    } catch (_) {
+      warning.hidden = true;
+    }
   }
 
   async function renderPresets() {

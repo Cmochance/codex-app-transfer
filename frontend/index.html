@@ -99,6 +99,20 @@
           <i class="bi bi-exclamation-triangle"></i>
           <span></span>
         </div>
+        <!-- MOC-32 PR-2b: silently dropped Responses tool types (counter from
+             adapters::warn_once_drop_tool)。total>0 才 unhide,total=0 时隐藏。 -->
+        <div class="desktop-warning" id="dashboardDroppedToolsWarning" hidden>
+          <i class="bi bi-info-circle"></i>
+          <span>
+            <strong data-i18n="dashboard.droppedToolsTitle">transfer silently 丢弃了 Responses API 工具</strong>
+            <span class="dropped-tools-summary" id="dashboardDroppedToolsSummary"></span>
+            <details class="dropped-tools-details">
+              <summary data-i18n="dashboard.droppedToolsExpand">查看每个类型计数</summary>
+              <ul id="dashboardDroppedToolsList"></ul>
+            </details>
+            <small class="muted-text" data-i18n="dashboard.droppedToolsHint">这是 transfer adapter 不识别的 Responses API 工具类型(可能 Codex 升级引入了新 type,或第三方客户端发了非 Codex 用的 type)。本进程累计计数,重启归零。如果某 type 计数持续上升,需要在 transfer 加 explicit 适配。</small>
+          </span>
+        </div>
 
         <div class="quick-actions">
           <a href="#providers/add" class="btn btn-primary action-button"><i class="bi bi-magic"></i><span data-i18n="dashboard.configureDesktop">添加并生成配置</span></a>
