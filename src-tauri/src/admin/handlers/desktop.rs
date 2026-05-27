@@ -5,7 +5,7 @@
 //! - 桌面健康检查 + active provider 同步
 //!
 
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::{
     get_snapshot_status, has_snapshot, list_snapshots, repair_residual_pollution,
     restore_codex_snapshot, restore_codex_state, scan_residual_pollution, CodexPaths,
@@ -244,13 +244,26 @@ pub async fn desktop_snapshot_status() -> impl IntoResponse {
     .into_response()
 }
 
-pub async fn restart_codex_app() -> impl IntoResponse {
+pub async fn restart_codex_app(State(state): State<crate::admin::AdminState>) -> impl IntoResponse {
+    let desktop_sync = snapshot::sync_desktop_for_active_provider(&state).await;
+    if desktop_sync.get("attempted").and_then(|v| v.as_bool()) == Some(true)
+        && desktop_sync.get("success").and_then(|v| v.as_bool()) != Some(true)
+    {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            desktop_sync
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Codex 配置同步失败"),
+        )
+        .into_response();
+    }
     match process::launch_codex_app_restart(std::env::consts::OS) {
         Ok(_) => {
             // 通知 plugin_unlock daemon 重置 backoff 立刻重新 detect_cdp。
             let service = super::plugin_unlock::get_service().await;
             service.reinject().await;
-            Json(json!({"success": true})).into_response()
+            Json(json!({"success": true, "desktopSync": desktop_sync})).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }

@@ -582,6 +582,7 @@ pub struct UpdateModelsInput {
 }
 
 pub async fn update_models(
+    State(state): State<AdminState>,
     Path(id): Path<String>,
     Json(input): Json<UpdateModelsInput>,
 ) -> impl IntoResponse {
@@ -589,6 +590,7 @@ pub async fn update_models(
         let Some(idx) = provider_index(cfg, &id) else {
             return Err("provider not found".into());
         };
+        let was_active = cfg.get("activeProvider").and_then(|v| v.as_str()) == Some(id.as_str());
         let providers = cfg
             .get_mut("providers")
             .and_then(|v| v.as_array_mut())
@@ -596,10 +598,22 @@ pub async fn update_models(
         if let Some(o) = providers[idx].as_object_mut() {
             o.insert("models".into(), input.models.clone());
         }
-        Ok(ConfigMutation::Modified(()))
+        Ok(ConfigMutation::Modified(was_active))
     });
     match result {
-        Ok(()) => Json(json!({"success": true})).into_response(),
+        Ok(was_active) => {
+            let desktop_sync = if was_active {
+                let sync =
+                    crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(
+                        &state,
+                    )
+                    .await;
+                Some(sync)
+            } else {
+                None
+            };
+            Json(json!({"success": true, "desktopSync": desktop_sync})).into_response()
+        }
         Err(e) if e == "provider not found" => err(StatusCode::NOT_FOUND, e).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
