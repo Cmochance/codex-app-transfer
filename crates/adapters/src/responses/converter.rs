@@ -726,6 +726,15 @@ impl ChatToResponsesConverter {
                     if pending.is_apply_patch {
                         return;
                     }
+                    // tool_search 跟 apply_patch 同模式 — 中间不流式
+                    // (`open_tool_call` 处注释 "BM25 query 短不需要"),也 skip
+                    // `function_call_arguments.delta` event。否则严格 Codex
+                    // client 看到 `tool_search_call` open + `function_call_*`
+                    // delta(语义错配 — delta 属 function_call wire 不属 tool_search)
+                    // + `tool_search_call` done — 三层混乱。Devin Review 抓到。
+                    if pending.is_tool_search {
+                        return;
+                    }
                     let item_id = pending.fc_id.clone();
                     let output_index = pending.output_index;
                     emit_event(
