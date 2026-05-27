@@ -6686,23 +6686,36 @@
     try {
       const st = await CCApi.theme.status();
       const sObj = st.status;
+      const autoReapplySelectedTheme = async () => {
+        try {
+          await CCApi.theme.apply(selectedThemeId);
+          badge.textContent = `${t("theme.applied") || "已应用"}: ${selectedThemeId}`;
+        } catch (err) {
+          console.warn("[theme] auto-re-apply failed:", err);
+          badge.textContent = `${t("theme.failed") || "失败"}: ${err.message || err}`;
+        }
+      };
       if (sObj && typeof sObj === "object") {
-        if (sObj.Applied) badge.textContent = `${t("theme.applied") || "已应用"}: ${sObj.Applied.theme_id}`;
-        else if (sObj.Failed) badge.textContent = `${t("theme.failed") || "失败"}: ${sObj.Failed.error}`;
-        else badge.textContent = "";
+        if (sObj.Applied) {
+          badge.textContent = `${t("theme.applied") || "已应用"}: ${sObj.Applied.theme_id}`;
+          // 用户选了别的主题但后端还报旧 theme_id(切换 race / 重启后状态错位)→ 自动 re-apply。
+          if (toggle.checked && selectedThemeId && sObj.Applied.theme_id !== selectedThemeId) {
+            await autoReapplySelectedTheme();
+          }
+        } else if (sObj.Failed) {
+          badge.textContent = `${t("theme.failed") || "失败"}: ${sObj.Failed.error}`;
+          // 上一次 apply 失败但用户仍开着主题 + 有选中 → 自动重试一次。
+          if (toggle.checked && selectedThemeId) {
+            await autoReapplySelectedTheme();
+          }
+        } else badge.textContent = "";
       } else if (sObj === "Disabled") {
         badge.textContent = t("theme.disabled") || "未启用";
         // Auto re-apply: settings say enabled + theme selected, but backend
         // status is Disabled (e.g. after transfer app restart / Codex restart).
         // Apply immediately so user doesn't have to manually toggle.
         if (toggle.checked && selectedThemeId) {
-          try {
-            await CCApi.theme.apply(selectedThemeId);
-            badge.textContent = `${t("theme.applied") || "已应用"}: ${selectedThemeId}`;
-          } catch (err) {
-            console.warn("[theme] auto-re-apply failed:", err);
-            badge.textContent = `${t("theme.failed") || "失败"}: ${err.message || err}`;
-          }
+          await autoReapplySelectedTheme();
         }
       }
     } catch (e) {
