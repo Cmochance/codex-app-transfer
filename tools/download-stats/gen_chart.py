@@ -28,11 +28,14 @@ PAD_L, PAD_R, PAD_T, PAD_B = 16, 16, 52, 34  # plot insets
 def load_series(prev: str | None) -> list[dict]:
     if not prev:
         return []
-    try:
-        data = json.loads(pathlib.Path(prev).read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []  # missing / malformed prev (e.g. first run) -> start fresh
+    # The workflow always writes prev.json: "[]" on a confirmed 404 (first run) or the
+    # fetched body on HTTP 200. A parse failure / non-list here therefore means the
+    # published history is corrupt — raise (failing the job, set -e) rather than
+    # silently resetting the only persisted history to a single point.
+    data = json.loads(pathlib.Path(prev).read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"{prev}: expected a JSON list, got {type(data).__name__}")
+    return data
 
 
 def upsert(series: list[dict], date: str, total: int) -> list[dict]:
