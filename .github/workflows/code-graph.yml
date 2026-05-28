@@ -1,0 +1,55 @@
+name: Code Graph
+
+# Regenerate the interactive crate dependency graph from `cargo metadata` and
+# publish it to GitHub Pages. Triggers when the workspace dependency structure
+# could change (any Cargo.toml) or the generator/workflow itself changes; also
+# runnable on demand to refresh file-count stats.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - '**/Cargo.toml'
+      - 'tools/code-graph/**'
+      - '.github/workflows/code-graph.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel an in-flight Pages deploy; let queued runs finish in order.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (for cargo metadata)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate code graph
+        run: python3 tools/code-graph/gen.py --out _site/index.html
+      # Enables Pages and switches the source to "GitHub Actions" if it is still
+      # set to branch deploy — makes the gh-pages branch obsolete.
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
