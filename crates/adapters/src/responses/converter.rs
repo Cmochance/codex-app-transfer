@@ -165,6 +165,14 @@ fn normalize_tool_search_arguments(args: Value) -> Value {
     if let Some(server) = obj.get("server").and_then(|v| v.as_str()) {
         return json!({ "query": server });
     }
+    // 加固(MOC-48 observability):既无 query 也无 server(如分页 cursor / 空 args)
+    // 原样透传 —— tool_search 走本地 BM25,无 query 大概率返 0 工具(no-op)。warn 让
+    // 这种静默退化可观测:LLM 调 tool_search 没拿到工具时能从日志定位 args 形态。
+    tracing::warn!(
+        target: "adapters::tool_search",
+        args = %args,
+        "tool_search arguments have neither query nor server; passing through as-is — tool_search will likely return no tools",
+    );
     args
 }
 
@@ -607,7 +615,7 @@ impl ChatToResponsesConverter {
             // → redirect 成 tool_search(返 callable tools 而非 resources 元数据)。
             let name = if should_redirect_to_tool_search(&raw_name) {
                 tracing::info!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     from = %raw_name,
                     call_id = %call_id,
                     "redirecting legacy MCP discovery call → tool_search",
@@ -650,7 +658,7 @@ impl ChatToResponsesConverter {
             // 功能,这是合理的第一步;后续可优化为真流式。
             if is_apply_patch {
                 tracing::info!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     call_id = %call_id,
                     "apply_patch shim engaged: rewriting chat function_call wire to Responses custom_tool_call",
                 );
@@ -680,7 +688,7 @@ impl ChatToResponsesConverter {
                 // wire schema 实证:`protocol/src/models.rs:2674-2715` roundtrip
                 // test:`{type, call_id, execution:"client", arguments:{...}}`。
                 tracing::info!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     call_id = %call_id,
                     "tool_search shim engaged: rewriting chat function_call wire to Responses tool_search_call",
                 );
@@ -752,7 +760,7 @@ impl ChatToResponsesConverter {
                             // 不能回退。这一调用 Codex CLI 仍会 abort,但起码我们
                             // 在日志里能看到根因。
                             tracing::warn!(
-                                target = "adapters::apply_patch",
+                                target: "adapters::apply_patch",
                                 call_id = %pending.call_id,
                                 "apply_patch tool name arrived AFTER first frame; wire stays function_call and Codex CLI will reject. Investigate upstream provider chunking.",
                             );
@@ -857,7 +865,7 @@ impl ChatToResponsesConverter {
             // 错误而不是静默 abort 都有用)。
             if args_acc.trim().is_empty() {
                 tracing::warn!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     call_id = %call_id,
                     "apply_patch tool was called with empty arguments — model likely misbehaving or provider stripped args",
                 );
@@ -875,7 +883,7 @@ impl ChatToResponsesConverter {
             // 严格客户端在 `.done` 才触发执行)。
             if interrupted {
                 tracing::warn!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     call_id = %call_id,
                     args_len = args_acc.len(),
                     "apply_patch tool call cut off mid-stream (no finish_reason and not from [DONE]). Emitting output_item with status=incomplete; skipping input.done to prevent partial patch execution.",
@@ -980,7 +988,7 @@ impl ChatToResponsesConverter {
             // log 看到 LLM 实际发了啥(比静默 drop 强)。
             let arguments_value: Value = serde_json::from_str(&args_acc).unwrap_or_else(|err| {
                 tracing::warn!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     call_id = %call_id,
                     args_len = args_acc.len(),
                     error = %err,
@@ -998,7 +1006,7 @@ impl ChatToResponsesConverter {
             // (Devin #289 review BUG_..._0002:is_tool_search 之前无条件 completed)
             if interrupted {
                 tracing::warn!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     call_id = %call_id,
                     "tool_search call cut off mid-stream (no finish_reason and not from [DONE]); emitting status=incomplete",
                 );
@@ -1801,7 +1809,7 @@ fn extract_apply_patch_input(args_acc: &str) -> String {
             Some(s) => s.to_owned(),
             None => {
                 tracing::warn!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     args_preview = %args_acc.chars().take(120).collect::<String>(),
                     "apply_patch args parsed as JSON but missing `input` string field; passing raw args to Codex CLI",
                 );
@@ -1811,12 +1819,12 @@ fn extract_apply_patch_input(args_acc: &str) -> String {
         Err(err) => {
             if trimmed.starts_with("*** Begin Patch") {
                 tracing::debug!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     "apply_patch args are bare V4A (no JSON wrapper); passthrough",
                 );
             } else {
                 tracing::warn!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     error = %err,
                     args_len = args_acc.len(),
                     args_preview = %args_acc.chars().take(120).collect::<String>(),

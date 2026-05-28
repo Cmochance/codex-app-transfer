@@ -9,7 +9,9 @@
 //!   `seed` / `stop` / `parallel_tool_calls` / `frequency_penalty` /
 //!   `presence_penalty` / `user`
 //! - input items:`message`(role + content)/ `function_call` /
-//!   `function_call_output` / `input_image` / `input_file` / `input_audio` /
+//!   `function_call_output` / `tool_search_call`(→ assistant `tool_calls`
+//!   name="tool_search")/ `tool_search_output`(→ role:tool result + 注入
+//!   chat `tools[]`)/ `input_image` / `input_file` / `input_audio` /
 //!   `input_video`
 //! - tools:`type=function` 与 `type=custom`(custom 降级为接受单字符串
 //!   `input` 的 function)
@@ -575,7 +577,16 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
             // chat function.arguments 要 JSON **字符串**。
             let arguments_str = match item.get("arguments") {
                 Some(Value::String(s)) => s.clone(),
-                Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned()),
+                Some(other) => serde_json::to_string(other).unwrap_or_else(|_| {
+                    // 加固(MOC-48 observability):serialize 失败 fallback 到空对象会
+                    // 静默丢掉 query,LLM 的 tool_search 调用变成无参 no-op。warn 让这种
+                    // 极少见的 schema drift 可观测(Value→string 正常不会失败)。
+                    tracing::warn!(
+                        target: "adapters::tool_search",
+                        "tool_search_call arguments failed to serialize; falling back to empty object — query lost (likely Codex schema drift)",
+                    );
+                    "{}".to_owned()
+                }),
                 None => "{}".to_owned(),
             };
             let arguments = sanitize_tool_arguments_json_string(&arguments_str);
@@ -616,7 +627,7 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
             // 工具映射仍经 tools[] 注入生效,只是这条 output 配不上 pair)。
             if call_id.is_empty() {
                 tracing::warn!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     "tool_search_output missing call_id; role:tool message will be orphaned and dropped by repair_tool_call_ids — likely Codex schema drift",
                 );
             }
@@ -805,21 +816,32 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
 /// defer 到 tool_search,发现的工具只出现在 tool_search_output.tools,**不在**
 /// body.tools[];不注入 chat tools[] 则 LLM 永远看不到 → 无法调用。
 fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
-    input
-        .get("input")
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| {
-                    item.get("type").and_then(|t| t.as_str()) == Some("tool_search_output")
-                })
-                .filter_map(|item| item.get("tools").and_then(|t| t.as_array()))
-                .flatten()
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(items) = input.get("input").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let outputs: Vec<&Value> = items
+        .iter()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_search_output"))
+        .collect();
+    let discovered: Vec<Value> = outputs
+        .iter()
+        .filter_map(|item| item.get("tools").and_then(|t| t.as_array()))
+        .flatten()
+        .cloned()
+        .collect();
+    // 加固(MOC-48 observability):有 tool_search_output item 却收集到 0 个工具,
+    // 通常是 Codex schema drift(tools 字段改名/类型变)—— 不注入则 LLM 看不到工具
+    // 只能循环调 tool_search,无日志难定位。普通请求(无 tool_search_output)不打
+    // 日志避免噪音;count log 让 input malformed / 真无发现可区分。
+    if !outputs.is_empty() {
+        tracing::debug!(
+            target: "adapters::tool_search",
+            tool_search_output_items = outputs.len(),
+            discovered_tools = discovered.len(),
+            "collected discovered tools from tool_search_output for chat tools[] injection",
+        );
+    }
+    discovered
 }
 
 /// 按 `function.name` 去重 chat tools(保留首次出现 — body.tools[] builtin 在
@@ -858,6 +880,18 @@ fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) 
         } else if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
             names.push(n.to_owned());
         }
+    }
+    // 加固(MOC-48 observability):无 inner tools 的 namespace 包 / 非 namespace entry
+    // 被静默跳过。tools 非空但 names 为空,通常是 Codex 0.131+ schema drift(包结构变 /
+    // name 字段改名)→ role:tool content 退化成 "no matching tools" 误导 LLM。
+    // debug log tools.len vs names.len 让 drift 可观测。
+    if !tools.is_empty() {
+        tracing::debug!(
+            target: "adapters::tool_search",
+            input_tools = tools.len(),
+            extracted_names = names.len(),
+            "extracted tool names from tool_search_output",
+        );
     }
     names
 }
