@@ -582,7 +582,7 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                     // 静默丢掉 query,LLM 的 tool_search 调用变成无参 no-op。warn 让这种
                     // 极少见的 schema drift 可观测(Value→string 正常不会失败)。
                     tracing::warn!(
-                        target = "adapters::tool_search",
+                        target: "adapters::tool_search",
                         "tool_search_call arguments failed to serialize; falling back to empty object — query lost (likely Codex schema drift)",
                     );
                     "{}".to_owned()
@@ -627,7 +627,7 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
             // 工具映射仍经 tools[] 注入生效,只是这条 output 配不上 pair)。
             if call_id.is_empty() {
                 tracing::warn!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     "tool_search_output missing call_id; role:tool message will be orphaned and dropped by repair_tool_call_ids — likely Codex schema drift",
                 );
             }
@@ -835,7 +835,7 @@ fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
     // 日志避免噪音;count log 让 input malformed / 真无发现可区分。
     if !outputs.is_empty() {
         tracing::debug!(
-            target = "adapters::tool_search",
+            target: "adapters::tool_search",
             tool_search_output_items = outputs.len(),
             discovered_tools = discovered.len(),
             "collected discovered tools from tool_search_output for chat tools[] injection",
@@ -887,7 +887,7 @@ fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) 
     // debug log tools.len vs names.len 让 drift 可观测。
     if !tools.is_empty() {
         tracing::debug!(
-            target = "adapters::tool_search",
+            target: "adapters::tool_search",
             input_tools = tools.len(),
             extracted_names = names.len(),
             "extracted tool names from tool_search_output",

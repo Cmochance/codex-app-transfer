@@ -169,7 +169,7 @@ fn normalize_tool_search_arguments(args: Value) -> Value {
     // 原样透传 —— tool_search 走本地 BM25,无 query 大概率返 0 工具(no-op)。warn 让
     // 这种静默退化可观测:LLM 调 tool_search 没拿到工具时能从日志定位 args 形态。
     tracing::warn!(
-        target = "adapters::tool_search",
+        target: "adapters::tool_search",
         args = %args,
         "tool_search arguments have neither query nor server; passing through as-is — tool_search will likely return no tools",
     );
@@ -615,7 +615,7 @@ impl ChatToResponsesConverter {
             // → redirect 成 tool_search(返 callable tools 而非 resources 元数据)。
             let name = if should_redirect_to_tool_search(&raw_name) {
                 tracing::info!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     from = %raw_name,
                     call_id = %call_id,
                     "redirecting legacy MCP discovery call → tool_search",
@@ -688,7 +688,7 @@ impl ChatToResponsesConverter {
                 // wire schema 实证:`protocol/src/models.rs:2674-2715` roundtrip
                 // test:`{type, call_id, execution:"client", arguments:{...}}`。
                 tracing::info!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     call_id = %call_id,
                     "tool_search shim engaged: rewriting chat function_call wire to Responses tool_search_call",
                 );
@@ -988,7 +988,7 @@ impl ChatToResponsesConverter {
             // log 看到 LLM 实际发了啥(比静默 drop 强)。
             let arguments_value: Value = serde_json::from_str(&args_acc).unwrap_or_else(|err| {
                 tracing::warn!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     call_id = %call_id,
                     args_len = args_acc.len(),
                     error = %err,
@@ -1006,7 +1006,7 @@ impl ChatToResponsesConverter {
             // (Devin #289 review BUG_..._0002:is_tool_search 之前无条件 completed)
             if interrupted {
                 tracing::warn!(
-                    target = "adapters::tool_search",
+                    target: "adapters::tool_search",
                     call_id = %call_id,
                     "tool_search call cut off mid-stream (no finish_reason and not from [DONE]); emitting status=incomplete",
                 );
