@@ -7725,12 +7725,13 @@
     bindFeedbackEvents();
     bindThemeEvents();
 
-    // **race fix** (devin #269 review thread):Tauri 后端 startup hook 会在
-    // 3s 内 emit `residual-scan-report` 跟 `codex-deeplink`,如果监听 listener
-    // 注册晚于 `await CCApi.getSettings()` / `await renderRoute()` 等异步链
-    // 落地时点,event 已经 fire 完毕 → 启动 toast 静默丢失。把 listener 注册
-    // 提到 bindEvents() 紧后(showToast / tFmt / codexMcpHandleDeeplink 等
-    // 依赖此时都已初始化),先于所有 await,确保不漏 event。
+    // **race fix** (devin #269 review thread):Tauri 后端 startup hook 会
+    // emit `residual-scan-report`(残留扫描;#MOC-54 起改为等 auto_apply 落盘后
+    // 才发,时机不固定、最长 ~30s)跟 `codex-deeplink`,如果监听 listener 注册
+    // 晚于 `await CCApi.getSettings()` / `await renderRoute()` 等异步链落地时点,
+    // event 可能已 fire 完毕 → 启动 toast 静默丢失。把 listener 注册提到
+    // bindEvents() 紧后(showToast / tFmt / codexMcpHandleDeeplink 等依赖此时
+    // 都已初始化),先于所有 await,确保不漏 event(时机越不固定越要早注册)。
     try {
       const tauriEvent = window.__TAURI__?.event;
       if (tauriEvent && typeof tauriEvent.listen === "function") {
