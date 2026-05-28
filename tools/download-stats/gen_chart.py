@@ -81,20 +81,43 @@ def render_svg(series: list[dict]) -> str:
         f'font-size="20" font-weight="800">{esc(fmt(latest))}</text>'
     )
 
+    x0, x1 = PAD_L, W - PAD_R
+    y0, y1 = PAD_T, H - PAD_B
+    grid = "".join(
+        f'<line x1="{x0}" y1="{y0 + (y1-y0)*k/3:.1f}" x2="{x1}" '
+        f'y2="{y0 + (y1-y0)*k/3:.1f}" stroke="rgba(27,31,36,0.06)"/>'
+        for k in range(4)
+    )
+
+    # Fewer than two points: a trend line needs at least two, and GitHub exposes only the
+    # current cumulative count (no history) so earlier points can't be backfilled — the
+    # line draws itself once the daily cron lands a 2nd point. Render the grid (so the card
+    # reads as a chart that has started) plus, for the single point, a centred marker and
+    # caption, instead of an empty card with one floating line of text.
     if len(series) < 2:
-        sub = (
-            f'<text x="{W/2}" y="{H/2+8}" text-anchor="middle" fill="#57606a" font-size="13">'
-            + (f"tracking since {esc(series[0]['date'])} — chart fills in over time"
-               if series else "no release downloads yet")
-            + "</text>"
+        if not series:
+            body = (
+                grid
+                + f'<text x="{(x0+x1)/2:.1f}" y="{(y0+y1)/2:.1f}" text-anchor="middle" '
+                'dominant-baseline="middle" fill="#57606a" font-size="13">'
+                "no release downloads yet</text>"
+            )
+            return head + big + body + "</svg>"
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        d0 = esc(series[0]["date"])
+        body = (
+            grid
+            + f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="8" fill="{accent}" opacity="0.25"/>'
+            + f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4.5" fill="{accent}"/>'
+            + f'<text x="{cx:.1f}" y="{cy+26:.1f}" text-anchor="middle" fill="#57606a" '
+            f'font-size="12">tracking since {d0} · trend line fills in daily</text>'
+            + f'<text x="{x0}" y="{H-12}" fill="#8b949e" font-size="11">{d0}</text>'
         )
-        return head + big + sub + "</svg>"
+        return head + big + body + "</svg>"
 
     totals = [p["total"] for p in series]
     lo, hi = min(totals), max(totals)
     span = (hi - lo) or 1
-    x0, x1 = PAD_L, W - PAD_R
-    y0, y1 = PAD_T, H - PAD_B
     n = len(series)
 
     def px(i: int) -> float:
@@ -111,11 +134,6 @@ def render_svg(series: list[dict]) -> str:
         + f" L{pts[-1][0]:.1f},{y1:.1f} Z"
     )
 
-    grid = "".join(
-        f'<line x1="{x0}" y1="{y0 + (y1-y0)*k/3:.1f}" x2="{x1}" '
-        f'y2="{y0 + (y1-y0)*k/3:.1f}" stroke="rgba(27,31,36,0.06)"/>'
-        for k in range(4)
-    )
     lx, ly = pts[-1]
     body = (
         grid
