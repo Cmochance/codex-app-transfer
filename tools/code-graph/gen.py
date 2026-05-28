@@ -15,6 +15,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import subprocess
 
 
@@ -111,10 +112,10 @@ def render(graph: dict, commit: str) -> str:
         "__EDGES__": str(len(graph["links"])),
         "__FILES__": str(graph["file_total"]),
     }
-    html = HTML_TEMPLATE
-    for token, value in tokens.items():
-        html = html.replace(token, value)
-    return html
+    # single-pass substitution: already-injected content (e.g. the JSON, which may
+    # contain a literal "__VERSION__" inside a crate description) is never re-scanned
+    pattern = re.compile("|".join(re.escape(k) for k in tokens))
+    return pattern.sub(lambda m: tokens[m.group(0)], HTML_TEMPLATE)
 
 
 def main() -> None:
