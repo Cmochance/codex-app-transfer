@@ -2331,6 +2331,22 @@
     return `<td>${escapeHtml(txt)}</td>`;
   }
 
+  // 「按对话」首列:显示 Codex 对话名(session_index thread_name)前 5 字,全名 +
+  // rollout 路径放 hover;无名时回退日期(MM/DD)。其余视图原样(日期 / 模型)。
+  function firstColCell(row, view) {
+    if (view !== "conversation") return `<td>${escapeHtml(row.group || "—")}</td>`;
+    const name = (row.displayName || "").trim();
+    let label;
+    if (name) {
+      label = name.length > 5 ? `${name.slice(0, 5)}…` : name;
+    } else {
+      const m = (row.group || "").match(/^\d{4}\/(\d{2})\/(\d{2})\//);
+      label = m ? `${m[1]}/${m[2]}` : "—";
+    }
+    const full = name ? `${name}\n${row.group || ""}` : (row.group || "");
+    return `<td title="${escapeHtml(full)}">${escapeHtml(label)}</td>`;
+  }
+
   async function openCacheHitModal(session) {
     const modal = $("#usageCacheModal");
     const chart = $("#usageCacheChart");
@@ -2442,7 +2458,7 @@
         : "";
       return `
       <tr>
-        <td>${escapeHtml(row.group || "—")}</td>
+        ${firstColCell(row, view)}
         ${modelCell}
         <td>${escapeHtml(fmtNum(row.inputTokens))}</td>
         <td>${escapeHtml(fmtNum(row.outputTokens))}</td>

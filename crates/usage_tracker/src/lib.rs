@@ -161,6 +161,9 @@ pub struct UsageRow {
     pub turn_count: u64,
     /// last activity (RFC3339,ccusage 同款)
     pub last_activity: Option<String>,
+    /// 人类可读对话名(Codex `session_index.jsonl` 的 `thread_name`)。仅
+    /// by_conversation 行填充;daily/model 行为 None。前端用它替代 rollout 路径显示。
+    pub display_name: Option<String>,
 }
 
 impl UsageRow {
@@ -270,10 +273,21 @@ pub struct UsageReport {
 pub fn load_usage_report(timezone: Option<&str>) -> Result<UsageReport> {
     let events = load_codex_events()?;
     let (daily, unknown_timestamp_events) = summarize_daily(&events, timezone);
+    // by_conversation 行用 session_index.jsonl 的 thread_name 填人类可读名,
+    // 前端据此显示而非 rollout 路径(用户反馈:路径对不上)。
+    let mut by_conversation = summarize_by_conversation(&events);
+    let titles = read_session_index_titles();
+    if !titles.is_empty() {
+        for row in &mut by_conversation {
+            if let Some(name) = session_uuid_from_group(&row.group).and_then(|u| titles.get(&u)) {
+                row.display_name = Some(name.clone());
+            }
+        }
+    }
     let mut report = UsageReport {
         daily,
         by_model: summarize_by_model(&events),
-        by_conversation: summarize_by_conversation(&events),
+        by_conversation,
         unknown_timestamp_events,
         ..Default::default()
     };
@@ -286,6 +300,60 @@ pub fn load_usage_report(timezone: Option<&str>) -> Result<UsageReport> {
     }
     report.total_conversations = report.by_conversation.len() as u64;
     Ok(report)
+}
+
+/// `session_index.jsonl` 一行(Codex Desktop 写):`id`(uuid)→ `thread_name`(标题)。
+#[derive(serde::Deserialize)]
+struct SessionIndexLine {
+    id: String,
+    #[serde(default)]
+    thread_name: Option<String>,
+}
+
+/// 读各 codex_home 下 `session_index.jsonl`,合并 `{ uuid → thread_name }`。缺文件 /
+/// parse 失败 → 跳过(降级)。借鉴 `conversation_export::list`(本 crate 不依赖它避免
+/// 循环依赖,故就地小实现)。
+fn read_session_index_titles() -> BTreeMap<String, String> {
+    use std::io::{BufRead, BufReader};
+    let mut out = BTreeMap::new();
+    let Ok(dirs) = codex_usage_paths() else {
+        return out;
+    };
+    for sessions_dir in dirs {
+        let Some(home) = sessions_dir.parent() else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(home.join("session_index.jsonl")) else {
+            continue;
+        };
+        for line in BufReader::new(file)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<SessionIndexLine>(trimmed) {
+                if let Some(name) = parsed.thread_name.filter(|s| !s.trim().is_empty()) {
+                    out.insert(parsed.id, name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 从 by_conversation 的 `group`(rollout 相对路径,如
+/// `2026/04/28/rollout-2026-04-28T00-11-10-019dcfb5-7925-7a63-8b9d-d6afcaf9212e`)
+/// 取末尾 session uuid(末 5 个 `-` 分段),用于查 session_index 标题。
+fn session_uuid_from_group(group: &str) -> Option<String> {
+    let file = group.rsplit('/').next().unwrap_or(group);
+    let parts: Vec<&str> = file.split('-').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    Some(parts[parts.len() - 5..].join("-"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -350,6 +418,18 @@ pub fn cache_series_for_conversation(session_id: &str) -> Result<Vec<CacheBucket
 #[cfg(test)]
 mod cache_series_tests {
     use super::*;
+
+    #[test]
+    fn session_uuid_extracted_from_group_path() {
+        assert_eq!(
+            session_uuid_from_group(
+                "2026/04/28/rollout-2026-04-28T00-11-10-019dcfb5-7925-7a63-8b9d-d6afcaf9212e"
+            )
+            .as_deref(),
+            Some("019dcfb5-7925-7a63-8b9d-d6afcaf9212e")
+        );
+        assert_eq!(session_uuid_from_group("short").as_deref(), None);
+    }
 
     #[test]
     fn one_bucket_per_turn_when_le_max() {
