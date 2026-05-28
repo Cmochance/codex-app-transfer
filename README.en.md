@@ -75,6 +75,7 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 - **Codex Desktop Theme (optional, off by default)**: Theme page ships 5 built-in anime themes (`carton` with a floating mascot + `changli` / `azurlane` / `nailin` / `zani` background-only), injects CSS token overrides + background image into Codex Desktop via CDP. Toggle is independent from Plugin Unlock; page reload re-applies automatically
 - Cross-platform single-instance lock (double-click brings the existing window forward) + cross-process file lock prevents multi-instance config-write lost-updates
 - Windows / macOS / Linux system tray
+- **Code Graph**: [View code dependency graph online](https://cmochance.github.io/codex-app-transfer/)
 
 ## Download
 
@@ -294,3 +295,18 @@ If you've submitted a PR and want to rename / add a link / remove yourself, open
 ## License
 
 MIT License. Full text at [LICENSE.txt](LICENSE.txt).
+
+## Project Activity
+
+<table>
+<tr>
+<td width="50%" align="center">
+<a href="https://github.com/Cmochance/codex-app-transfer/releases"><img src="https://cmochance.github.io/codex-app-transfer/downloads.svg" alt="Download trend" width="100%"></a>
+<br/><sub>Download trend (refreshed daily)</sub>
+</td>
+<td width="50%" align="center">
+<a href="https://star-history.com/#Cmochance/codex-app-transfer&Date"><img src="https://api.star-history.com/svg?repos=Cmochance/codex-app-transfer&type=Date&theme=dark" alt="Star history" width="100%"></a>
+<br/><sub>Star history</sub>
+</td>
+</tr>
+</table>
