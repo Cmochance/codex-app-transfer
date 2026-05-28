@@ -1,9 +1,14 @@
-name: Code Graph
+name: Project Site
 
-# Regenerate the interactive crate dependency graph from `cargo metadata` and
-# publish it to GitHub Pages. Triggers when the workspace dependency structure
-# could change (any Cargo.toml) or the generator/workflow itself changes; also
-# runnable on demand to refresh file-count stats.
+# Builds the project's GitHub Pages site and publishes it via GitHub Actions
+# (no gh-pages branch, no commits to main):
+#   - index.html      interactive crate dependency graph, from `cargo metadata`
+#   - downloads.json  cumulative release-download time series (read back from the
+#                     live site each run and appended — GitHub exposes no history)
+#   - downloads.svg   rendered download-trend chart embedded in the README
+#
+# Runs when the dependency structure / generators change, daily (to add a download
+# data point), and on demand.
 on:
   push:
     branches: [main]
@@ -11,7 +16,10 @@ on:
       - 'Cargo.toml'
       - '**/Cargo.toml'
       - 'tools/code-graph/**'
+      - 'tools/download-stats/**'
       - '.github/workflows/code-graph.yml'
+  schedule:
+    - cron: '17 3 * * *'   # daily — refresh the download-count series
   workflow_dispatch:
 
 permissions:
@@ -36,6 +44,16 @@ jobs:
           python-version: '3.12'
       - name: Generate code graph
         run: python3 tools/code-graph/gen.py --out _site/index.html
+      - name: Update download-count series + chart
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # read back the previously-published series (first run / 404 -> start empty)
+          curl -fsSL https://cmochance.github.io/codex-app-transfer/downloads.json -o prev.json || echo '[]' > prev.json
+          # current cumulative downloads summed across every release asset (all pages)
+          total=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[].assets[].download_count' | awk '{s+=$1} END {print s+0}')
+          python3 tools/download-stats/gen_chart.py --prev prev.json --add "$total" \
+            --out-json _site/downloads.json --out-svg _site/downloads.svg
       # Enables Pages and switches the source to "GitHub Actions" if it is still
       # set to branch deploy — makes the gh-pages branch obsolete.
       - uses: actions/configure-pages@v5
