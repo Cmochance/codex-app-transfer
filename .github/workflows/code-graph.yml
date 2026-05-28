@@ -48,6 +48,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -eo pipefail
           # read back the previously-published series. The history lives only in the
           # deployed JSON, so ONLY a confirmed 404 (first run / not yet published) may
           # start from []; any other failure (network, 5xx, TLS) aborts the job so a
@@ -55,8 +56,11 @@ jobs:
           status=$(curl -sS -o prev.json -w '%{http_code}' https://cmochance.github.io/codex-app-transfer/downloads.json || echo 000)
           if [ "$status" = 404 ]; then echo '[]' > prev.json;
           elif [ "$status" != 200 ]; then echo "::error::fetch downloads.json failed (HTTP $status); aborting to preserve history"; exit 1; fi
-          # current cumulative downloads summed across every release asset (all pages)
-          total=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[].assets[].download_count' | awk '{s+=$1} END {print s+0}')
+          # current cumulative downloads. Fetch first so a failed gh api (network/auth/
+          # pagination) aborts the job via set -e instead of silently summing to 0 and
+          # truncating the persisted history; then aggregate.
+          counts=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[].assets[].download_count')
+          total=$(printf '%s\n' "$counts" | awk '{s+=$1} END {print s+0}')
           python3 tools/download-stats/gen_chart.py --prev prev.json --add "$total" \
             --out-json _site/downloads.json --out-svg _site/downloads.svg
       # The repo's Pages was previously a branch deploy (gh-pages). configure-pages

@@ -50,16 +50,16 @@ def esc(s: str) -> str:
 
 
 def render_svg(series: list[dict]) -> str:
-    accent, accent2 = "#5eead4", "#22d3ee"
+    accent, accent2 = "#0d9488", "#0891b2"  # teal/cyan — readable on a light card
     head = (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
         f'font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif">'
         '<defs>'
         '<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">'
-        '<stop offset="0" stop-color="#10182b"/><stop offset="1" stop-color="#0a0e1a"/>'
+        '<stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f3f6fa"/>'
         '</linearGradient>'
         f'<linearGradient id="area" x1="0" y1="0" x2="0" y2="1">'
-        f'<stop offset="0" stop-color="{accent}" stop-opacity="0.42"/>'
+        f'<stop offset="0" stop-color="{accent}" stop-opacity="0.20"/>'
         f'<stop offset="1" stop-color="{accent}" stop-opacity="0"/>'
         '</linearGradient>'
         f'<linearGradient id="line" x1="0" y1="0" x2="1" y2="0">'
@@ -68,8 +68,8 @@ def render_svg(series: list[dict]) -> str:
         '</defs>'
         f'<rect width="{W}" height="{H}" rx="16" fill="url(#bg)"/>'
         f'<rect x="0.5" y="0.5" width="{W-1}" height="{H-1}" rx="15.5" fill="none" '
-        'stroke="rgba(255,255,255,0.08)"/>'
-        '<text x="20" y="30" fill="#e8edf6" font-size="15" font-weight="700">Total Downloads</text>'
+        'stroke="#d0d7de"/>'
+        '<text x="20" y="30" fill="#1f2328" font-size="15" font-weight="700">Total Downloads</text>'
     )
 
     latest = series[-1]["total"] if series else 0
@@ -80,7 +80,7 @@ def render_svg(series: list[dict]) -> str:
 
     if len(series) < 2:
         sub = (
-            f'<text x="{W/2}" y="{H/2+8}" text-anchor="middle" fill="#8b97b0" font-size="13">'
+            f'<text x="{W/2}" y="{H/2+8}" text-anchor="middle" fill="#57606a" font-size="13">'
             + (f"tracking since {esc(series[0]['date'])} — chart fills in over time"
                if series else "no release downloads yet")
             + "</text>"
@@ -110,7 +110,7 @@ def render_svg(series: list[dict]) -> str:
 
     grid = "".join(
         f'<line x1="{x0}" y1="{y0 + (y1-y0)*k/3:.1f}" x2="{x1}" '
-        f'y2="{y0 + (y1-y0)*k/3:.1f}" stroke="rgba(255,255,255,0.05)"/>'
+        f'y2="{y0 + (y1-y0)*k/3:.1f}" stroke="rgba(27,31,36,0.06)"/>'
         for k in range(4)
     )
     lx, ly = pts[-1]
@@ -121,10 +121,10 @@ def render_svg(series: list[dict]) -> str:
         'stroke-linejoin="round" stroke-linecap="round"/>'
         + f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="4.5" fill="{accent}"/>'
         + f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="8" fill="{accent}" opacity="0.25"/>'
-        + f'<text x="{x0}" y="{H-12}" fill="#5b6680" font-size="11">{esc(series[0]["date"])}</text>'
-        + f'<text x="{x1}" y="{H-12}" text-anchor="end" fill="#5b6680" font-size="11">'
+        + f'<text x="{x0}" y="{H-12}" fill="#8b949e" font-size="11">{esc(series[0]["date"])}</text>'
+        + f'<text x="{x1}" y="{H-12}" text-anchor="end" fill="#8b949e" font-size="11">'
         f'{esc(series[-1]["date"])}</text>'
-        + f'<text x="{x0}" y="{y0-6}" fill="#5b6680" font-size="10">peak {esc(fmt(hi))}</text>'
+        + f'<text x="{x0}" y="{y0-6}" fill="#8b949e" font-size="10">peak {esc(fmt(hi))}</text>'
     )
     return head + big + body + "</svg>"
 

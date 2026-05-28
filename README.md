@@ -12,7 +12,8 @@
 <p align="center">
   <a href="README.md">简体中文</a> |
   <a href="README.en.md">English</a> |
-  <a href="CHANGELOG.md">Changelog</a>
+  <a href="CHANGELOG.md">Changelog</a> |
+  <a href="https://cmochance.github.io/codex-app-transfer/">Code Graph</a>
 </p>
 
 <p align="center">
@@ -75,7 +76,6 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - **Codex Desktop 主题(可选,默认关)**:Theme 页内置 5 套动漫主题(`carton` 含浮动看板娘 + `changli` / `azurlane` / `nailin` / `zani` 单背景),通过 CDP 向 Codex Desktop 注入 CSS token 覆盖 + 背景图。开关跟 Plugin Unlock 独立,page reload 自动重应用
 - 跨平台单实例锁定(双击启动自动唤起已有窗口)+ 跨进程 file lock 防多实例同时写 config 丢更新
 - Windows / macOS / Linux 系统托盘
-- **Code Graph**: [在线查看代码依赖图](https://cmochance.github.io/codex-app-transfer/)
 
 ## 下载
 
@@ -301,10 +301,10 @@ MIT License。完整文本见 [LICENSE.txt](LICENSE.txt)。
 <tr>
 <td width="50%" align="center">
 <a href="https://github.com/Cmochance/codex-app-transfer/releases"><img src="https://cmochance.github.io/codex-app-transfer/downloads.svg" alt="下载量趋势" width="100%"></a>
-<br/><sub>下载量趋势(每日自动刷新)</sub>
+<br/><sub>下载量趋势</sub>
 </td>
 <td width="50%" align="center">
-<a href="https://star-history.com/#Cmochance/codex-app-transfer&Date"><img src="https://api.star-history.com/svg?repos=Cmochance/codex-app-transfer&type=Date&theme=dark" alt="Star 趋势" width="100%"></a>
+<a href="https://star-history.com/#Cmochance/codex-app-transfer&Date"><img src="https://api.star-history.com/svg?repos=Cmochance/codex-app-transfer&type=Date" alt="Star 趋势" width="100%"></a>
 <br/><sub>Star 趋势</sub>
 </td>
 </tr>

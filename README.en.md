@@ -12,7 +12,8 @@
 <p align="center">
   <a href="README.md">简体中文</a> |
   <a href="README.en.md">English</a> |
-  <a href="CHANGELOG.md">Changelog</a>
+  <a href="CHANGELOG.md">Changelog</a> |
+  <a href="https://cmochance.github.io/codex-app-transfer/">Code Graph</a>
 </p>
 
 <p align="center">
@@ -75,7 +76,6 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 - **Codex Desktop Theme (optional, off by default)**: Theme page ships 5 built-in anime themes (`carton` with a floating mascot + `changli` / `azurlane` / `nailin` / `zani` background-only), injects CSS token overrides + background image into Codex Desktop via CDP. Toggle is independent from Plugin Unlock; page reload re-applies automatically
 - Cross-platform single-instance lock (double-click brings the existing window forward) + cross-process file lock prevents multi-instance config-write lost-updates
 - Windows / macOS / Linux system tray
-- **Code Graph**: [View code dependency graph online](https://cmochance.github.io/codex-app-transfer/)
 
 ## Download
 
@@ -302,10 +302,10 @@ MIT License. Full text at [LICENSE.txt](LICENSE.txt).
 <tr>
 <td width="50%" align="center">
 <a href="https://github.com/Cmochance/codex-app-transfer/releases"><img src="https://cmochance.github.io/codex-app-transfer/downloads.svg" alt="Download trend" width="100%"></a>
-<br/><sub>Download trend (refreshed daily)</sub>
+<br/><sub>Download trend</sub>
 </td>
 <td width="50%" align="center">
-<a href="https://star-history.com/#Cmochance/codex-app-transfer&Date"><img src="https://api.star-history.com/svg?repos=Cmochance/codex-app-transfer&type=Date&theme=dark" alt="Star history" width="100%"></a>
+<a href="https://star-history.com/#Cmochance/codex-app-transfer&Date"><img src="https://api.star-history.com/svg?repos=Cmochance/codex-app-transfer&type=Date" alt="Star history" width="100%"></a>
 <br/><sub>Star history</sub>
 </td>
 </tr>
