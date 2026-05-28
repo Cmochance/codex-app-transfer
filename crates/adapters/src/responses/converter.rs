@@ -658,7 +658,7 @@ impl ChatToResponsesConverter {
             // 功能,这是合理的第一步;后续可优化为真流式。
             if is_apply_patch {
                 tracing::info!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     call_id = %call_id,
                     "apply_patch shim engaged: rewriting chat function_call wire to Responses custom_tool_call",
                 );
@@ -760,7 +760,7 @@ impl ChatToResponsesConverter {
                             // 不能回退。这一调用 Codex CLI 仍会 abort,但起码我们
                             // 在日志里能看到根因。
                             tracing::warn!(
-                                target = "adapters::apply_patch",
+                                target: "adapters::apply_patch",
                                 call_id = %pending.call_id,
                                 "apply_patch tool name arrived AFTER first frame; wire stays function_call and Codex CLI will reject. Investigate upstream provider chunking.",
                             );
@@ -865,7 +865,7 @@ impl ChatToResponsesConverter {
             // 错误而不是静默 abort 都有用)。
             if args_acc.trim().is_empty() {
                 tracing::warn!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     call_id = %call_id,
                     "apply_patch tool was called with empty arguments — model likely misbehaving or provider stripped args",
                 );
@@ -883,7 +883,7 @@ impl ChatToResponsesConverter {
             // 严格客户端在 `.done` 才触发执行)。
             if interrupted {
                 tracing::warn!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     call_id = %call_id,
                     args_len = args_acc.len(),
                     "apply_patch tool call cut off mid-stream (no finish_reason and not from [DONE]). Emitting output_item with status=incomplete; skipping input.done to prevent partial patch execution.",
@@ -1809,7 +1809,7 @@ fn extract_apply_patch_input(args_acc: &str) -> String {
             Some(s) => s.to_owned(),
             None => {
                 tracing::warn!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     args_preview = %args_acc.chars().take(120).collect::<String>(),
                     "apply_patch args parsed as JSON but missing `input` string field; passing raw args to Codex CLI",
                 );
@@ -1819,12 +1819,12 @@ fn extract_apply_patch_input(args_acc: &str) -> String {
         Err(err) => {
             if trimmed.starts_with("*** Begin Patch") {
                 tracing::debug!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     "apply_patch args are bare V4A (no JSON wrapper); passthrough",
                 );
             } else {
                 tracing::warn!(
-                    target = "adapters::apply_patch",
+                    target: "adapters::apply_patch",
                     error = %err,
                     args_len = args_acc.len(),
                     args_preview = %args_acc.chars().take(120).collect::<String>(),
