@@ -1793,8 +1793,8 @@ fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value
 ///    `{"patch": "*** Begin Patch…"}`),仅当值含 `*** Begin Patch` 才取。
 /// 3. 裸 V4A(JSON parse 失败但含 `*** Begin Patch`,可能被 markdown fence 包裹)。
 ///
-/// 取到候选后过 [`repair_v4a_envelope`] 规整信封(剥 fence / 前后杂散行、规范
-/// 首尾 sentinel)。取不到候选(截断 / 非 V4A 垃圾)则**原样透传**,交给 Codex
+/// 取到候选后过 [`repair_v4a_envelope`] 规整信封(剥 markdown fence / Begin 前
+/// End 后的杂散行)。取不到候选(截断 / 非 V4A 垃圾)则**原样透传**,交给 Codex
 /// CLI `parse_patch` 暴露真坏 —— 绝不静默吞、不截断正文。不做 V4A 语法校验。
 fn extract_apply_patch_input(args_acc: &str) -> String {
     let trimmed = args_acc.trim();
@@ -1856,23 +1856,29 @@ fn extract_apply_patch_input(args_acc: &str) -> String {
 /// `*** Begin Patch` 的字符串才回收,避免误取无关字段。
 const APPLY_PATCH_ALT_KEYS: &[&str] = &["patch", "diff", "apply_patch", "input_text", "content"];
 
-/// 一行去掉杂散 `+` / 前后空白后,是否恰为 V4A 的 Begin/End sentinel。
+/// 一行是否为 V4A 的 Begin/End sentinel —— **仅认列 0、无前缀的整行**(容忍尾部空白)。
+///
+/// 刻意**不**剥前导空白 / `+`:V4A 控制行恒在列 0 且无前缀,而正文行恒有前缀
+/// (Add File `+`、context ` `、删除 `-`)。若把 `+*** End Patch` 也当 sentinel,
+/// 遇到「文件内容恰含一行 `*** End Patch` + 流被截断在真正结尾之前」时,会把这条
+/// **正文**行误当信封结尾、合成一个"完整"补丁 → Codex 静默执行被截断的 patch
+/// (破坏性降级)。故前缀行一律按正文处理,交给 raw passthrough 让 Codex `parse_patch`
+/// 暴露 incomplete。(见 #302 codex-connector P2;stray-`+` sentinel 的安全消歧留 MOC-57。)
 fn v4a_sentinel(line: &str) -> Option<&'static str> {
-    match line.trim_matches(|c: char| c == '+' || c.is_whitespace()) {
+    match line.trim_end() {
         "*** Begin Patch" => Some("*** Begin Patch"),
         "*** End Patch" => Some("*** End Patch"),
         _ => None,
     }
 }
 
-/// 非破坏性 V4A 信封修复(见 #302):
-/// - 丢掉首个 `*** Begin Patch` 之前、末个 `*** End Patch` 之后的杂散行
-///   (markdown fence / 解释性散文 / 空行);
-/// - 把这两行 sentinel 去掉杂散 `+`/前导空白后规范化。
+/// 非破坏性 V4A 信封修复(见 #302):丢掉首个 `*** Begin Patch` 之前、末个
+/// `*** End Patch` 之后的杂散行(markdown fence / 解释性散文 / 空行)。
 ///
-/// **绝不改动 Begin..End 之间的 `+`/`-`/context 正文行。** 仅匹配**整行**(去
-/// `+`/空白后)恰为 sentinel 的行,故正文里含 `*** End Patch` 子串的行不受影响。
-/// 找不到顺序正确的 `Begin..End` 信封时原样返回,交给 Codex `parse_patch`。
+/// **绝不改动 Begin..End 之间的 `+`/`-`/context 正文行。** sentinel 仅认列 0、
+/// 无前缀的整行(见 [`v4a_sentinel`]),故 `+`/空格前缀的正文行(哪怕内容恰为
+/// `*** End Patch`)绝不会被误当信封边界。找不到顺序正确的 `Begin..End` 时原样
+/// 返回,交给 Codex `parse_patch` 暴露真坏。
 fn repair_v4a_envelope(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
     let begin = lines
@@ -3384,12 +3390,22 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
     }
 
     #[test]
-    fn extract_apply_patch_stray_plus_on_end_sentinel_normalized() {
-        let args = r#"{"input": "*** Begin Patch\n*** Add File: a.txt\n+x\n+*** End Patch"}"#;
-        assert_eq!(
-            extract_apply_patch_input(args),
-            "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch"
-        );
+    fn extract_apply_patch_plus_prefixed_end_not_synthesized() {
+        // 安全性(#302 codex-connector P2):`+*** End Patch` 可能是被截断的正文行,
+        // 不得当作信封结尾合成"完整"补丁。无列 0 裸 End → 原样透传,让 Codex 暴露 incomplete。
+        let body = "*** Begin Patch\n*** Add File: a.txt\n+x\n+*** End Patch";
+        let args = serde_json::json!({ "input": body }).to_string();
+        assert_eq!(extract_apply_patch_input(&args), body);
+    }
+
+    #[test]
+    fn extract_apply_patch_real_bare_end_after_plus_end_content_preserved() {
+        // 正文行恰为 `+*** End Patch`,其后有真正的列 0 裸 `*** End Patch`:
+        // 真 End 被识别,`+*** End Patch` 正文行完整保留(不被误当结尾截断)。
+        let body =
+            "*** Begin Patch\n*** Add File: doc.md\n+intro\n+*** End Patch\n+outro\n*** End Patch";
+        let args = serde_json::json!({ "input": body }).to_string();
+        assert_eq!(extract_apply_patch_input(&args), body);
     }
 
     #[test]
