@@ -1259,16 +1259,29 @@ impl ChatToResponsesConverter {
         if pending.is_tool_search {
             // envelope.output[] 终态必须跟流式 `response.output_item.done` 的
             // item 一致(见 close_tool_call tool_search 分支),否则严格客户端
-            // 会两次解读为不同 item。同样 args parse 失败 fallback {"raw":...}。
+            // 会两次解读为不同 item。三处都要对齐流式侧:
+            // ① args parse 失败 fallback {"raw":...};
+            // ② normalize(redirect 来的 {server[,uri]} → {query})——
+            //    Devin #293 BUG_..._0001:envelope 漏 normalize → 跟流式
+            //    arguments mismatch;
+            // ③ interrupted_during_close → status="incomplete" —— Devin #293
+            //    BUG_..._0002:envelope 之前写死 "completed",跟流式 incomplete
+            //    不一致,严格客户端读 envelope output[] 会误以为 tool_search 完整。
             let arguments_value: Value = serde_json::from_str(&pending.args_acc)
                 .unwrap_or_else(|_| json!({ "raw": pending.args_acc }));
+            let arguments_value = normalize_tool_search_arguments(arguments_value);
+            let status = if pending.interrupted_during_close {
+                "incomplete"
+            } else {
+                "completed"
+            };
             return json!({
                 "type": "tool_search_call",
                 "id": pending.fc_id,
                 "call_id": pending.call_id,
                 "execution": "client",
                 "arguments": arguments_value,
-                "status": "completed",
+                "status": status,
             });
         }
         if pending.is_apply_patch {
