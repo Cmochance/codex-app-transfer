@@ -63,16 +63,9 @@ jobs:
           total=$(printf '%s\n' "$counts" | awk '{s+=$1} END {print s+0}')
           python3 tools/download-stats/gen_chart.py --prev prev.json --add "$total" \
             --out-json _site/downloads.json --out-svg _site/downloads.svg
-      # The repo's Pages was previously a branch deploy (gh-pages). configure-pages
-      # alone does NOT switch an already-enabled site to Actions, so flip build_type
-      # explicitly before deploying (idempotent) — otherwise the first deploy can't
-      # replace the old gh-pages content. Makes the gh-pages branch obsolete.
-      - name: Switch Pages source to GitHub Actions
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api --method PUT "repos/${GITHUB_REPOSITORY}/pages" -f build_type=workflow \
-            || gh api --method POST "repos/${GITHUB_REPOSITORY}/pages" -f build_type=workflow
+      # Pages "Source" is set to "GitHub Actions" once in repo Settings → Pages (the
+      # Actions GITHUB_TOKEN cannot change the Pages source via the API — it returns
+      # 403). configure-pages then resolves the site metadata for deploy-pages.
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
