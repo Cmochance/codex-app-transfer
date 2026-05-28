@@ -411,6 +411,18 @@
             <div class="usage-empty" id="usageEmpty" hidden data-i18n="usage.empty">还没有用量数据 — 通过本应用转发跑过对话后会自动出现</div>
             <div class="usage-loading" id="usageLoading" hidden data-i18n="usage.loading">扫描 rollout 中…</div>
           </article>
+
+          <!-- 缓存命中分布弹窗(#304):点击「按对话」视图的命中率数字打开 -->
+          <div class="codex-modal-backdrop" id="usageCacheModal" hidden>
+            <div class="codex-modal" role="dialog" aria-modal="true">
+              <div class="codex-modal-header">
+                <h3 data-i18n="usage.cacheModal.title">缓存命中分布</h3>
+                <button class="codex-modal-close" type="button" data-action="usage-cache-modal-close"><i class="bi bi-x-lg"></i></button>
+              </div>
+              <p class="codex-modal-desc" id="usageCacheModalSummary"></p>
+              <div class="usage-cache-chart" id="usageCacheChart"></div>
+            </div>
+          </div>
         </article>
       </section>
 

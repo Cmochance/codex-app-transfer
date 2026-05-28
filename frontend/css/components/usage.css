@@ -124,3 +124,83 @@
   color: var(--muted);
   font-size: 0.9rem;
 }
+
+/* 缓存命中分布(#304)— 命中率数字按钮 + 弹窗逐轮直方图 */
+.usage-cache-hit {
+  border: none;
+  background: transparent;
+  color: var(--accent, #3b82f6);
+  cursor: pointer;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 6px;
+  border-radius: 6px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition: background 0.15s;
+}
+
+.usage-cache-hit:hover {
+  background: var(--soft-surface);
+}
+
+.usage-cache-chart {
+  min-height: 200px;
+  padding: 8px 4px 4px;
+}
+
+.usage-cache-loading {
+  padding: 48px 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.ucbars {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 200px;
+  padding-top: 8px;
+}
+
+.ucbar {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ucbar-track {
+  width: 100%;
+  max-width: 48px;
+  height: 150px;
+  display: flex;
+  align-items: flex-end;
+  background: var(--soft-surface);
+  border-radius: 4px 4px 0 0;
+  overflow: hidden;
+}
+
+.ucbar-fill {
+  width: 100%;
+  background: var(--accent, #3b82f6);
+  border-radius: 4px 4px 0 0;
+  transition: height 0.2s;
+  min-height: 2px;
+}
+
+.ucbar-pct {
+  font-size: 0.72rem;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.ucbar-x {
+  font-size: 0.68rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}

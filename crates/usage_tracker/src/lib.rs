@@ -287,3 +287,123 @@ pub fn load_usage_report(timezone: Option<&str>) -> Result<UsageReport> {
     report.total_conversations = report.by_conversation.len() as u64;
     Ok(report)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 单对话逐轮缓存命中(#304)— Usage tab 点击命中率数字弹窗用。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 直方图一根柱:某对话内一段连续轮次(`turn_start..=turn_end`,1-based)的
+/// token 加权缓存命中。命中率 = `cached_input_tokens / input_tokens`(前端算)。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheBucket {
+    pub turn_start: usize,
+    pub turn_end: usize,
+    pub cached_input_tokens: u64,
+    pub input_tokens: u64,
+}
+
+/// 把逐轮 `(cached_input, input)` 序列分成**至多 `max_buckets` 根柱**:
+/// - 轮数 ≤ max:一轮一柱;
+/// - 轮数 > max:等分成 max 桶,桶大小 `floor(n/max)` 或 `+1`,**余数分给靠后的桶**
+///   (从后往前递加,见 #304);每桶 token 加权(cached / input 各自求和)。
+fn bucket_series(points: &[(u64, u64)], max_buckets: usize) -> Vec<CacheBucket> {
+    let n = points.len();
+    if n == 0 || max_buckets == 0 {
+        return Vec::new();
+    }
+    let k = n.min(max_buckets);
+    let base = n / k;
+    let rem = n % k; // 最后 rem 个桶各 +1(余数从后往前递加)
+    let mut out = Vec::with_capacity(k);
+    let mut idx = 0usize;
+    for i in 0..k {
+        let size = base + usize::from(i >= k - rem);
+        let slice = &points[idx..idx + size];
+        out.push(CacheBucket {
+            turn_start: idx + 1,
+            turn_end: idx + size,
+            cached_input_tokens: slice.iter().map(|p| p.0).sum(),
+            input_tokens: slice.iter().map(|p| p.1).sum(),
+        });
+        idx += size;
+    }
+    out
+}
+
+/// 某对话(`session_id`)逐轮缓存命中,分桶成 ≤10 根柱供前端直方图(#304)。
+/// 按需调用(点击命中率数字时);复用全量解析后按 session 过滤 + 按 timestamp 升序。
+pub fn cache_series_for_conversation(session_id: &str) -> Result<Vec<CacheBucket>> {
+    let mut events: Vec<CodexTokenUsageEvent> = load_codex_events()?
+        .into_iter()
+        .filter(|e| e.session_id == session_id)
+        .collect();
+    // Codex rollout 同 session 内 ts 单调,字符串比较即时序(对照本文件 last_activity)。
+    events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    let points: Vec<(u64, u64)> = events
+        .iter()
+        .map(|e| (e.cached_input_tokens.min(e.input_tokens), e.input_tokens))
+        .collect();
+    Ok(bucket_series(&points, 10))
+}
+
+#[cfg(test)]
+mod cache_series_tests {
+    use super::*;
+
+    #[test]
+    fn one_bucket_per_turn_when_le_max() {
+        let pts = vec![(10, 100), (50, 100), (90, 100)];
+        let b = bucket_series(&pts, 10);
+        assert_eq!(b.len(), 3);
+        assert_eq!(
+            b[0],
+            CacheBucket {
+                turn_start: 1,
+                turn_end: 1,
+                cached_input_tokens: 10,
+                input_tokens: 100
+            }
+        );
+        assert_eq!(b[2].turn_start, 3);
+        assert_eq!(b[2].turn_end, 3);
+    }
+
+    #[test]
+    fn even_split_remainder_to_back() {
+        // 23 轮 → 10 桶:base=2, rem=3 → 前 7 桶 size2,后 3 桶 size3
+        let pts: Vec<(u64, u64)> = (0..23).map(|_| (1u64, 2u64)).collect();
+        let b = bucket_series(&pts, 10);
+        assert_eq!(b.len(), 10);
+        let sizes: Vec<usize> = b.iter().map(|x| x.turn_end - x.turn_start + 1).collect();
+        assert_eq!(sizes, vec![2, 2, 2, 2, 2, 2, 2, 3, 3, 3]);
+        assert_eq!(b[0].turn_start, 1);
+        assert_eq!(b.last().unwrap().turn_end, 23);
+    }
+
+    #[test]
+    fn token_weighted_within_bucket() {
+        // turn1 0%(0/100)+ turn2 100%(100/100)合并 → 100/200 = 50%
+        let pts = vec![(0, 100), (100, 100)];
+        let b = bucket_series(&pts, 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].cached_input_tokens, 100);
+        assert_eq!(b[0].input_tokens, 200);
+    }
+
+    #[test]
+    fn empty_series_no_buckets() {
+        assert!(bucket_series(&[], 10).is_empty());
+    }
+
+    #[test]
+    fn buckets_are_contiguous_and_cover_all() {
+        let pts: Vec<(u64, u64)> = (0..47).map(|i| (i, 100)).collect();
+        let b = bucket_series(&pts, 10);
+        assert_eq!(b[0].turn_start, 1);
+        for w in b.windows(2) {
+            assert_eq!(w[1].turn_start, w[0].turn_end + 1);
+        }
+        assert_eq!(b.last().unwrap().turn_end, 47);
+    }
+}

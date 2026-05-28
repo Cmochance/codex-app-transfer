@@ -2314,6 +2314,74 @@
     `).join("");
   }
 
+  // 缓存命中率(#304):整体 hit% = cachedInput / input;input=0 → null(显示 —)
+  function cacheHitPct(row) {
+    const input = row.inputTokens || 0;
+    if (input <= 0) return null;
+    return Math.round(((row.cachedInputTokens || 0) / input) * 100);
+  }
+
+  // 按对话视图把命中率做成可点击(打开逐轮分布弹窗);其余视图纯数字。
+  function cacheHitCell(row, view) {
+    const pct = cacheHitPct(row);
+    const txt = pct == null ? "—" : `${pct}%`;
+    if (view === "conversation" && pct != null && row.group) {
+      return `<td><button type="button" class="usage-cache-hit" data-session="${escapeHtml(row.group)}" title="${escapeHtml(t("usage.cacheModal.title"))}">${escapeHtml(txt)}</button></td>`;
+    }
+    return `<td>${escapeHtml(txt)}</td>`;
+  }
+
+  async function openCacheHitModal(session) {
+    const modal = $("#usageCacheModal");
+    const chart = $("#usageCacheChart");
+    const summary = $("#usageCacheModalSummary");
+    if (!modal || !chart) return;
+    if (summary) summary.textContent = session || "";
+    chart.innerHTML = `<div class="usage-cache-loading">${escapeHtml(t("usage.cacheModal.loading"))}</div>`;
+    modal.hidden = false;
+    try {
+      const res = await fetch(`/api/usage/conversation/cache-series?session=${encodeURIComponent(session)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      renderCacheChart(chart, summary, await res.json(), session);
+    } catch (e) {
+      console.warn("cas: load cache series failed", e);
+      chart.innerHTML = `<div class="usage-cache-loading">${escapeHtml(t("usage.loadError"))}: ${escapeHtml(e?.message || String(e))}</div>`;
+    }
+  }
+
+  // ≤10 桶后端已分好;每柱高度 = 该桶 token 加权命中率(cached/input)。
+  function renderCacheChart(chart, summary, buckets, session) {
+    if (!Array.isArray(buckets) || buckets.length === 0) {
+      chart.innerHTML = `<div class="usage-cache-loading">${escapeHtml(t("usage.cacheModal.empty"))}</div>`;
+      if (summary) summary.textContent = session || "";
+      return;
+    }
+    let totCached = 0;
+    let totInput = 0;
+    buckets.forEach((b) => {
+      totCached += b.cachedInputTokens || 0;
+      totInput += b.inputTokens || 0;
+    });
+    const overall = totInput > 0 ? Math.round((100 * totCached) / totInput) : 0;
+    if (summary) {
+      summary.textContent = `${t("usage.cacheModal.overall")}: ${overall}%  ·  ${fmtNum(totCached)} / ${fmtNum(totInput)}`;
+    }
+    const turnUnit = t("usage.cacheModal.turn");
+    const bars = buckets.map((b) => {
+      const input = b.inputTokens || 0;
+      const cached = b.cachedInputTokens || 0;
+      const pct = input > 0 ? Math.round((100 * cached) / input) : 0;
+      const range = b.turnStart === b.turnEnd ? `${b.turnStart}` : `${b.turnStart}–${b.turnEnd}`;
+      const title = `${turnUnit} ${range} · ${pct}% · ${fmtNum(cached)}/${fmtNum(input)}`;
+      return `<div class="ucbar" title="${escapeHtml(title)}">
+        <div class="ucbar-track"><div class="ucbar-fill" style="height:${pct}%"></div></div>
+        <div class="ucbar-pct">${pct}%</div>
+        <div class="ucbar-x">${escapeHtml(range)}</div>
+      </div>`;
+    }).join("");
+    chart.innerHTML = `<div class="ucbars">${bars}</div>`;
+  }
+
   function renderUsageTable(report, view) {
     const head = $("#usageTableHead");
     const body = $("#usageTableBody");
@@ -2356,6 +2424,7 @@
         <th>${escapeHtml(t("usage.col.output"))}</th>
         <th>${escapeHtml(t("usage.col.reasoning"))}</th>
         <th>${escapeHtml(t("usage.col.total"))}</th>
+        <th>${escapeHtml(t("usage.col.cacheHit"))}</th>
         <th>${escapeHtml(t("usage.col.turns"))}</th>
         <th>${escapeHtml(t("usage.col.lastActivity"))}</th>
       </tr>
@@ -2379,6 +2448,7 @@
         <td>${escapeHtml(fmtNum(row.outputTokens))}</td>
         <td>${escapeHtml(fmtNum(row.reasoningOutputTokens))}</td>
         <td><strong>${escapeHtml(fmtNum(row.totalTokens))}</strong></td>
+        ${cacheHitCell(row, view)}
         <td>${escapeHtml(fmtNum(row.turnCount))}</td>
         <td>${escapeHtml(fmtLastActivity(row.lastActivity))}</td>
       </tr>
@@ -2449,6 +2519,16 @@
       usageActiveView = view;
       $all(".usage-view-btn").forEach((b) => b.classList.toggle("active", b.dataset.usageView === view));
       renderUsageTable(usageCache || { daily: [], byModel: [], byConversation: [] }, view);
+      return;
+    }
+    const hitBtn = e.target.closest(".usage-cache-hit");
+    if (hitBtn) {
+      openCacheHitModal(hitBtn.dataset.session);
+      return;
+    }
+    if (e.target.closest('[data-action="usage-cache-modal-close"]') || e.target.id === "usageCacheModal") {
+      const m = $("#usageCacheModal");
+      if (m) m.hidden = true;
       return;
     }
     if (e.target.closest("#usageRefreshBtn")) {
