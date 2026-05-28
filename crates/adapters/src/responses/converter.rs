@@ -1650,6 +1650,17 @@ impl Default for ChatToResponsesConverter {
     }
 }
 
+/// 各 provider 把「缓存命中 token 数」放在 usage **顶层**的非标准字段名。
+/// 归一化时若上游没发标准嵌套 `prompt_tokens_details.cached_tokens`,就从这里
+/// 兜底取值映射进标准槽 —— 绝不覆盖已存在的嵌套值。借鉴 litellm 的 per-provider
+/// usage 归一化(机制通用、各家私有 key 当数据)。
+///
+/// - DeepSeek:`prompt_cache_hit_tokens`(它不发嵌套 `cached_tokens`,命中数只在顶层)。
+///
+/// 其余 chat provider(Kimi / GLM / Qwen / MiniMax)实测都发标准嵌套
+/// `prompt_tokens_details.cached_tokens`,已被下方逻辑直接透传,无需在此登记。
+const TOP_LEVEL_CACHED_TOKEN_ALIASES: &[&str] = &["prompt_cache_hit_tokens"];
+
 /// 把 Chat Completions 风格的 `usage`(prompt_tokens / completion_tokens /
 /// total_tokens / *_tokens_details)统一翻译为 Responses 风格(input_tokens /
 /// output_tokens / total_tokens / input_tokens_details / output_tokens_details)。
@@ -1659,7 +1670,8 @@ impl Default for ChatToResponsesConverter {
 ///   "missing field input_tokens" 报错断流(2026-05-06)。
 /// - 与 litellm 的 `_transform_chat_completion_usage_to_responses_usage`
 ///   (docs/litellm/.../litellm_completion_transformation/transformation.py)
-///   语义一致,仅做静态字段重命名,不引入业务行为差异。
+///   语义一致:字段重命名 + 各 provider 私有 cache 命中字段归一
+///   (见 [`TOP_LEVEL_CACHED_TOKEN_ALIASES`])。
 fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
     let zero = json!({
         "input_tokens": 0,
@@ -1716,6 +1728,17 @@ fn normalize_usage_to_responses_shape(usage: Option<Value>) -> Value {
         (Some(Value::Object(d)), _) | (_, Some(Value::Object(d))) => d,
         _ => serde_json::Map::new(),
     };
+    // 标准嵌套 `cached_tokens` 缺失时,识别已知 provider 的非标准顶层别名
+    // (如 DeepSeek `prompt_cache_hit_tokens`)映射进标准槽。标准嵌套存在则
+    // 原样保留,绝不覆盖上游显式值。
+    if !input_details.contains_key("cached_tokens") {
+        if let Some(hit) = TOP_LEVEL_CACHED_TOKEN_ALIASES
+            .iter()
+            .find_map(|key| map.get(*key).filter(|v| v.is_number()).cloned())
+        {
+            input_details.insert("cached_tokens".to_owned(), hit);
+        }
+    }
     input_details
         .entry("cached_tokens".to_owned())
         .or_insert(json!(0));
@@ -3524,6 +3547,48 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
         let usage = &events.last().unwrap().1["response"]["usage"];
         assert_eq!(usage["input_tokens_details"]["cached_tokens"], 0);
         assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 0);
+    }
+
+    /// DeepSeek 把缓存命中数放 usage 顶层的非标准 `prompt_cache_hit_tokens`,
+    /// 且不发标准嵌套 `prompt_tokens_details`。归一化必须把它映射进
+    /// `input_tokens_details.cached_tokens`,否则 Codex rollout JSONL 的
+    /// `cached_input_tokens` 恒 0、Usage 页命中率永远显示不出来(#295 / #299)。
+    #[test]
+    fn deepseek_top_level_prompt_cache_hit_tokens_mapped_to_cached_tokens() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\"total_tokens\":1050,\"prompt_cache_hit_tokens\":768,\"prompt_cache_miss_tokens\":232}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 1000);
+        assert_eq!(
+            usage["input_tokens_details"]["cached_tokens"], 768,
+            "DeepSeek 顶层 prompt_cache_hit_tokens 必须映射进 cached_tokens"
+        );
+        // 非标准顶层别名不应泄漏进 Responses usage。
+        assert!(usage.get("prompt_cache_hit_tokens").is_none());
+        assert!(usage.get("prompt_cache_miss_tokens").is_none());
+    }
+
+    /// 上游已发标准嵌套 `cached_tokens` 时,顶层别名(若同时出现)绝不覆盖它 ——
+    /// 标准字段永远优先,别名只在缺失时兜底。
+    #[test]
+    fn standard_nested_cached_tokens_not_overridden_by_top_level_alias() {
+        let mut c = fixed();
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\"total_tokens\":1050,\"prompt_tokens_details\":{\"cached_tokens\":2},\"prompt_cache_hit_tokens\":999}}\n\n");
+        let out = c.feed(b"data: [DONE]\n\n");
+        let events = parse_emitted(&out);
+        let usage = &events.last().unwrap().1["response"]["usage"];
+        assert_eq!(
+            usage["input_tokens_details"]["cached_tokens"], 2,
+            "标准嵌套 cached_tokens 必须优先,不被顶层别名覆盖"
+        );
     }
 
     // ── null 容忍(MiMo 真实帧形态)─────────────────────────────────────
