@@ -1,0 +1,90 @@
+name: Project Site
+
+# Builds the project's GitHub Pages site and publishes it via GitHub Actions
+# (no gh-pages branch, no commits to main):
+#   - index.html      interactive crate dependency graph, from `cargo metadata`
+#   - downloads.json  cumulative release-download time series (read back from the
+#                     live site each run and appended — GitHub exposes no history)
+#   - downloads.svg   rendered download-trend chart embedded in the README
+#
+# Runs when the dependency structure / generators change, daily (to add a download
+# data point), and on demand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - '**/Cargo.toml'
+      - 'tools/code-graph/**'
+      - 'tools/download-stats/**'
+      - '.github/workflows/code-graph.yml'
+  schedule:
+    - cron: '17 3 * * *'   # daily — refresh the download-count series
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel an in-flight Pages deploy; let queued runs finish in order.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (for cargo metadata)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate code graph
+        run: python3 tools/code-graph/gen.py --out _site/index.html
+      - name: Update download-count series + chart
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail
+          # read back the previously-published series. The history lives only in the
+          # deployed JSON, so ONLY a confirmed 404 (first run / not yet published) may
+          # start from []; any other failure (network, 5xx, TLS) aborts the job so a
+          # transient blip can't permanently truncate the chart.
+          status=$(curl -sS -o prev.json -w '%{http_code}' https://cmochance.github.io/codex-app-transfer/downloads.json || echo 000)
+          if [ "$status" = 404 ]; then echo '[]' > prev.json;
+          elif [ "$status" != 200 ]; then echo "::error::fetch downloads.json failed (HTTP $status); aborting to preserve history"; exit 1; fi
+          # current cumulative downloads. Fetch first so a failed gh api (network/auth/
+          # pagination) aborts the job via set -e instead of silently summing to 0 and
+          # truncating the persisted history; then aggregate.
+          counts=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[].assets[].download_count')
+          total=$(printf '%s\n' "$counts" | awk '{s+=$1} END {print s+0}')
+          python3 tools/download-stats/gen_chart.py --prev prev.json --add "$total" \
+            --out-json _site/downloads.json --out-svg _site/downloads.svg
+      # The repo's Pages was previously a branch deploy (gh-pages). configure-pages
+      # alone does NOT switch an already-enabled site to Actions, so flip build_type
+      # explicitly before deploying (idempotent) — otherwise the first deploy can't
+      # replace the old gh-pages content. Makes the gh-pages branch obsolete.
+      - name: Switch Pages source to GitHub Actions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/pages" -f build_type=workflow \
+            || gh api --method POST "repos/${GITHUB_REPOSITORY}/pages" -f build_type=workflow
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

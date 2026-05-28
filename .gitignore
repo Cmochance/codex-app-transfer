@@ -97,3 +97,7 @@ src-tauri/icons/ios/
 
 # Codex Desktop theme 本地素材(用户私人壁纸 / 版权资源, 不入仓)
 img/codex-theme/
+
+# Code graph: generated site output + local preview/test artifacts
+_site/
+.playwright-mcp/
