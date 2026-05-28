@@ -179,17 +179,27 @@
   height: 150px;
   display: flex;
   align-items: flex-end;
-  background: var(--soft-surface);
-  border-radius: 4px 4px 0 0;
-  overflow: hidden;
+  justify-content: center;
 }
 
-.ucbar-fill {
+/* 总计输入柱(高度 ∝ 该桶 token 量),miss 部分露出底色 */
+.ucbar-total {
   width: 100%;
-  background: var(--accent, #3b82f6);
+  background: var(--soft-surface);
   border-radius: 4px 4px 0 0;
+  display: flex;
+  align-items: flex-end;
+  overflow: hidden;
   transition: height 0.2s;
   min-height: 2px;
+}
+
+/* 命中部分(含于总计柱内,从底部起,accent 色) */
+.ucbar-hit {
+  width: 100%;
+  background: var(--accent, #3b82f6);
+  transition: height 0.2s;
+  min-height: 0;
 }
 
 .ucbar-pct {

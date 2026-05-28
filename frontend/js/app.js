@@ -2374,25 +2374,42 @@
     }
     let totCached = 0;
     let totInput = 0;
+    let totOutput = 0;
+    let maxInput = 0;
     buckets.forEach((b) => {
       totCached += b.cachedInputTokens || 0;
       totInput += b.inputTokens || 0;
+      totOutput += b.outputTokens || 0;
+      maxInput = Math.max(maxInput, b.inputTokens || 0);
     });
     const overall = totInput > 0 ? Math.round((100 * totCached) / totInput) : 0;
     if (summary) {
-      summary.textContent = `${t("usage.cacheModal.overall")}: ${overall}%  ·  ${fmtNum(totCached)} / ${fmtNum(totInput)}`;
+      summary.textContent =
+        `${t("usage.cacheModal.overall")}: ${overall}%  ·  ${fmtNum(totCached)} / ${fmtNum(totInput)}` +
+        `  ·  ${t("usage.cacheModal.output")} ${fmtNum(totOutput)}`;
     }
-    const turnUnit = t("usage.cacheModal.turn");
+    const totalTurns = buckets[buckets.length - 1].turnEnd || 1;
+    const lblHit = t("usage.cacheModal.hitInput");
+    const lblTotal = t("usage.cacheModal.totalInput");
+    const lblOut = t("usage.cacheModal.output");
     const bars = buckets.map((b) => {
       const input = b.inputTokens || 0;
       const cached = b.cachedInputTokens || 0;
+      const output = b.outputTokens || 0;
       const pct = input > 0 ? Math.round((100 * cached) / input) : 0;
-      const range = b.turnStart === b.turnEnd ? `${b.turnStart}` : `${b.turnStart}–${b.turnEnd}`;
-      const title = `${turnUnit} ${range} · ${pct}% · ${fmtNum(cached)}/${fmtNum(input)}`;
+      // 柱高 = 该桶总输入相对全局最大输入(体现 token 量);柱内命中部分(底部、
+      // 不同色)= cached/input —— 命中包含在总计里。
+      const barH = maxInput > 0 ? Math.round((100 * input) / maxInput) : 0;
+      const posPct = Math.round((100 * b.turnEnd) / totalTurns);
+      const title = `${lblHit}: ${fmtNum(cached)}\n${lblTotal}: ${fmtNum(input)}\n${lblOut}: ${fmtNum(output)}`;
       return `<div class="ucbar" title="${escapeHtml(title)}">
-        <div class="ucbar-track"><div class="ucbar-fill" style="height:${pct}%"></div></div>
+        <div class="ucbar-track">
+          <div class="ucbar-total" style="height:${barH}%">
+            <div class="ucbar-hit" style="height:${pct}%"></div>
+          </div>
+        </div>
         <div class="ucbar-pct">${pct}%</div>
-        <div class="ucbar-x">${escapeHtml(range)}</div>
+        <div class="ucbar-x">${posPct}%</div>
       </div>`;
     }).join("");
     chart.innerHTML = `<div class="ucbars">${bars}</div>`;

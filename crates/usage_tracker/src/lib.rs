@@ -369,13 +369,14 @@ pub struct CacheBucket {
     pub turn_end: usize,
     pub cached_input_tokens: u64,
     pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
-/// 把逐轮 `(cached_input, input)` 序列分成**至多 `max_buckets` 根柱**:
+/// 把逐轮 `(cached_input, input, output)` 序列分成**至多 `max_buckets` 根柱**:
 /// - 轮数 ≤ max:一轮一柱;
 /// - 轮数 > max:等分成 max 桶,桶大小 `floor(n/max)` 或 `+1`,**余数分给靠后的桶**
-///   (从后往前递加,见 #304);每桶 token 加权(cached / input 各自求和)。
-fn bucket_series(points: &[(u64, u64)], max_buckets: usize) -> Vec<CacheBucket> {
+///   (从后往前递加,见 #304);每桶 token 加权(cached / input / output 各自求和)。
+fn bucket_series(points: &[(u64, u64, u64)], max_buckets: usize) -> Vec<CacheBucket> {
     let n = points.len();
     if n == 0 || max_buckets == 0 {
         return Vec::new();
@@ -393,6 +394,7 @@ fn bucket_series(points: &[(u64, u64)], max_buckets: usize) -> Vec<CacheBucket> 
             turn_end: idx + size,
             cached_input_tokens: slice.iter().map(|p| p.0).sum(),
             input_tokens: slice.iter().map(|p| p.1).sum(),
+            output_tokens: slice.iter().map(|p| p.2).sum(),
         });
         idx += size;
     }
@@ -408,9 +410,15 @@ pub fn cache_series_for_conversation(session_id: &str) -> Result<Vec<CacheBucket
         .collect();
     // Codex rollout 同 session 内 ts 单调,字符串比较即时序(对照本文件 last_activity)。
     events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    let points: Vec<(u64, u64)> = events
+    let points: Vec<(u64, u64, u64)> = events
         .iter()
-        .map(|e| (e.cached_input_tokens.min(e.input_tokens), e.input_tokens))
+        .map(|e| {
+            (
+                e.cached_input_tokens.min(e.input_tokens),
+                e.input_tokens,
+                e.output_tokens,
+            )
+        })
         .collect();
     Ok(bucket_series(&points, 10))
 }
@@ -433,7 +441,7 @@ mod cache_series_tests {
 
     #[test]
     fn one_bucket_per_turn_when_le_max() {
-        let pts = vec![(10, 100), (50, 100), (90, 100)];
+        let pts = vec![(10, 100, 5), (50, 100, 8), (90, 100, 3)];
         let b = bucket_series(&pts, 10);
         assert_eq!(b.len(), 3);
         assert_eq!(
@@ -442,7 +450,8 @@ mod cache_series_tests {
                 turn_start: 1,
                 turn_end: 1,
                 cached_input_tokens: 10,
-                input_tokens: 100
+                input_tokens: 100,
+                output_tokens: 5
             }
         );
         assert_eq!(b[2].turn_start, 3);
@@ -452,7 +461,7 @@ mod cache_series_tests {
     #[test]
     fn even_split_remainder_to_back() {
         // 23 轮 → 10 桶:base=2, rem=3 → 前 7 桶 size2,后 3 桶 size3
-        let pts: Vec<(u64, u64)> = (0..23).map(|_| (1u64, 2u64)).collect();
+        let pts: Vec<(u64, u64, u64)> = (0..23).map(|_| (1u64, 2u64, 1u64)).collect();
         let b = bucket_series(&pts, 10);
         assert_eq!(b.len(), 10);
         let sizes: Vec<usize> = b.iter().map(|x| x.turn_end - x.turn_start + 1).collect();
@@ -464,11 +473,12 @@ mod cache_series_tests {
     #[test]
     fn token_weighted_within_bucket() {
         // turn1 0%(0/100)+ turn2 100%(100/100)合并 → 100/200 = 50%
-        let pts = vec![(0, 100), (100, 100)];
+        let pts = vec![(0, 100, 10), (100, 100, 20)];
         let b = bucket_series(&pts, 1);
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].cached_input_tokens, 100);
         assert_eq!(b[0].input_tokens, 200);
+        assert_eq!(b[0].output_tokens, 30);
     }
 
     #[test]
@@ -478,7 +488,7 @@ mod cache_series_tests {
 
     #[test]
     fn buckets_are_contiguous_and_cover_all() {
-        let pts: Vec<(u64, u64)> = (0..47).map(|i| (i, 100)).collect();
+        let pts: Vec<(u64, u64, u64)> = (0..47).map(|i| (i, 100, 0)).collect();
         let b = bucket_series(&pts, 10);
         assert_eq!(b[0].turn_start, 1);
         for w in b.windows(2) {
