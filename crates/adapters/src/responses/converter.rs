@@ -165,6 +165,14 @@ fn normalize_tool_search_arguments(args: Value) -> Value {
     if let Some(server) = obj.get("server").and_then(|v| v.as_str()) {
         return json!({ "query": server });
     }
+    // 加固(MOC-48 observability):既无 query 也无 server(如分页 cursor / 空 args)
+    // 原样透传 —— tool_search 走本地 BM25,无 query 大概率返 0 工具(no-op)。warn 让
+    // 这种静默退化可观测:LLM 调 tool_search 没拿到工具时能从日志定位 args 形态。
+    tracing::warn!(
+        target = "adapters::tool_search",
+        args = %args,
+        "tool_search arguments have neither query nor server; passing through as-is — tool_search will likely return no tools",
+    );
     args
 }
 

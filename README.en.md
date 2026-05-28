@@ -121,6 +121,8 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Alibaba Cloud Bailian (Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
 | Responses passthrough (custom) | — | — | — | Direct upstream connection, bypasses proxy (suitable for OpenAI official / native Responses reverse proxy); ⚠️ Plugins/MCP `namespace` tool bundle is NOT flattened — some upstreams silently drop tools |
 
+> **MCP tools (Codex 0.130+ `tool_search` mechanism)**: Codex 0.130+ defers server-side MCP tools (`mcp__notion__*` / `mcp__linear__*`, etc.) to `tool_search` instead of placing them directly in `tools[]`. The proxy wires the full chain on the **chat path** — discovering tools from `tool_search_output` → injecting them into chat `tools[]` → routing back upstream by `namespace` (#293). **Applies to all chat-compat providers in the table above**; only the Responses passthrough row (last row, bypasses the proxy) is excluded.
+
 ## Reasoning effort mapping (chat-compat `reasoning_effort`)
 
 How Codex's `low/medium/high/xhigh` is dispatched per chat-completions upstream (issue #254):
