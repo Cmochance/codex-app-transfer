@@ -48,8 +48,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # read back the previously-published series (first run / 404 -> start empty)
-          curl -fsSL https://cmochance.github.io/codex-app-transfer/downloads.json -o prev.json || echo '[]' > prev.json
+          # read back the previously-published series. The history lives only in the
+          # deployed JSON, so ONLY a confirmed 404 (first run / not yet published) may
+          # start from []; any other failure (network, 5xx, TLS) aborts the job so a
+          # transient blip can't permanently truncate the chart.
+          status=$(curl -sS -o prev.json -w '%{http_code}' https://cmochance.github.io/codex-app-transfer/downloads.json || echo 000)
+          if [ "$status" = 404 ]; then echo '[]' > prev.json;
+          elif [ "$status" != 200 ]; then echo "::error::fetch downloads.json failed (HTTP $status); aborting to preserve history"; exit 1; fi
           # current cumulative downloads summed across every release asset (all pages)
           total=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[].assets[].download_count' | awk '{s+=$1} END {print s+0}')
           python3 tools/download-stats/gen_chart.py --prev prev.json --add "$total" \
