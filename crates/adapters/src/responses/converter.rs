@@ -392,12 +392,24 @@ impl ChatToResponsesConverter {
                 .tool_calls
                 .values()
                 .map(|pending| {
+                    // tool_search(redirect 来的)args 必须跟 wire(close_tool_call /
+                    // tool_call_item_completed)一致 normalize {server[,uri]}→{query};
+                    // 否则 session cache 回灌 chat 历史跟 wire mismatch,LLM 下轮看
+                    // history 学到错的 args 形态(Devin #293 BUG_..._0001 第 3 处)。
+                    let arguments = if pending.is_tool_search {
+                        serde_json::from_str::<Value>(&pending.args_acc)
+                            .map(normalize_tool_search_arguments)
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|_| pending.args_acc.clone())
+                    } else {
+                        pending.args_acc.clone()
+                    };
                     json!({
                         "id": pending.call_id.clone(),
                         "type": "function",
                         "function": {
                             "name": pending.name.clone(),
-                            "arguments": pending.args_acc.clone(),
+                            "arguments": arguments,
                         },
                     })
                 })
