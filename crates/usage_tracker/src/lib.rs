@@ -164,6 +164,9 @@ pub struct UsageRow {
     /// 人类可读对话名(Codex `session_index.jsonl` 的 `thread_name`)。仅
     /// by_conversation 行填充;daily/model 行为 None。前端用它替代 rollout 路径显示。
     pub display_name: Option<String>,
+    /// 真实上游模型(proxy 写的 `session-models.jsonl`,见 forward.rs)。仅
+    /// by_conversation 行、且本版本之后跑过的对话有;否则 None,前端回退 rollout 模型名。
+    pub upstream_model: Option<String>,
 }
 
 impl UsageRow {
@@ -273,14 +276,21 @@ pub struct UsageReport {
 pub fn load_usage_report(timezone: Option<&str>) -> Result<UsageReport> {
     let events = load_codex_events()?;
     let (daily, unknown_timestamp_events) = summarize_daily(&events, timezone);
-    // by_conversation 行用 session_index.jsonl 的 thread_name 填人类可读名,
-    // 前端据此显示而非 rollout 路径(用户反馈:路径对不上)。
+    // by_conversation 行用 session uuid 关联两份本地旁路数据:
+    // - session_index.jsonl 的 thread_name → 人类可读对话名(替代 rollout 路径);
+    // - session-models.jsonl 的真实上游模型 → 替代 Codex 客户端占位名(gpt-5.x)。
     let mut by_conversation = summarize_by_conversation(&events);
     let titles = read_session_index_titles();
-    if !titles.is_empty() {
+    let upstream_models = read_session_upstream_models();
+    if !titles.is_empty() || !upstream_models.is_empty() {
         for row in &mut by_conversation {
-            if let Some(name) = session_uuid_from_group(&row.group).and_then(|u| titles.get(&u)) {
-                row.display_name = Some(name.clone());
+            if let Some(uuid) = session_uuid_from_group(&row.group) {
+                if let Some(name) = titles.get(&uuid) {
+                    row.display_name = Some(name.clone());
+                }
+                if let Some(model) = upstream_models.get(&uuid) {
+                    row.upstream_model = Some(model.clone());
+                }
             }
         }
     }
@@ -354,6 +364,42 @@ fn session_uuid_from_group(group: &str) -> Option<String> {
         return None;
     }
     Some(parts[parts.len() - 5..].join("-"))
+}
+
+/// `session-models.jsonl` 一行(proxy 写,见 forward.rs):`id`(session uuid)→ `model`(真实上游模型)。
+#[derive(serde::Deserialize)]
+struct SessionModelLine {
+    id: String,
+    model: String,
+}
+
+/// 读 `~/.codex-app-transfer/session-models.jsonl`,返回 `{ session_uuid → 真实上游模型 }`。
+/// 同 id 取**最后一条**(append-only,模型若中途变以最新为准)。缺文件 / parse 失败 → 跳过。
+fn read_session_upstream_models() -> BTreeMap<String, String> {
+    use std::io::{BufRead, BufReader};
+    let mut out = BTreeMap::new();
+    let Ok(home) = std::env::var("HOME") else {
+        return out;
+    };
+    let path = std::path::Path::new(&home).join(".codex-app-transfer/session-models.jsonl");
+    let Ok(file) = std::fs::File::open(&path) else {
+        return out;
+    };
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<SessionModelLine>(trimmed) {
+            if !parsed.model.trim().is_empty() {
+                out.insert(parsed.id, parsed.model); // 后写覆盖 → 取最后一条
+            }
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

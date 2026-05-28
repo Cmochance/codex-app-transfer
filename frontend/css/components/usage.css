@@ -64,11 +64,12 @@
   table-layout: auto;
 }
 
-.usage-table thead {
+/* sticky 表头:sticky + 背景必须落到 `th`(border-collapse 下 thead/tr 的背景
+   不渲染,会透出下滑的后方行)。th 各自不透明背景 + top:0 才与顶部相接、完全遮住。
+   用实色 var(--surface) 不用 var(--bg-secondary)(不存在,会 fallback transparent)。 */
+.usage-table thead th {
   position: sticky;
   top: 0;
-  /* 用实色 var(--surface) 不再 var(--bg-secondary) 这种不存在的 token,
-     之前 fallback 到 transparent 让滚动时跟数据叠在一起看不清(用户反馈) */
   background: var(--surface);
   z-index: 5;
   box-shadow: 0 1px 0 var(--line);

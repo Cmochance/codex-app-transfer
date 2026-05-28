@@ -2286,7 +2286,7 @@
   // 数据流: GET /api/usage/summary → 后端 codex-app-transfer-usage-tracker
   // 扫 ~/.codex/sessions/ rollout JSONL,解析层 vendor 自 ryoppippi/ccusage(MIT)。
   let usageCache = null;
-  let usageActiveView = "daily"; // daily | model | conversation
+  let usageActiveView = "conversation"; // conversation | daily | model
 
   function fmtNum(n) {
     if (n === null || n === undefined) return "—";
@@ -2453,11 +2453,11 @@
       <tr>
         <th>${escapeHtml(t(firstColKey))}</th>
         ${modelHeader}
+        <th>${escapeHtml(t("usage.col.cacheHit"))}</th>
         <th>${escapeHtml(t("usage.col.input"))}</th>
         <th>${escapeHtml(t("usage.col.output"))}</th>
         <th>${escapeHtml(t("usage.col.reasoning"))}</th>
         <th>${escapeHtml(t("usage.col.total"))}</th>
-        <th>${escapeHtml(t("usage.col.cacheHit"))}</th>
         <th>${escapeHtml(t("usage.col.turns"))}</th>
         <th>${escapeHtml(t("usage.col.lastActivity"))}</th>
       </tr>
@@ -2470,18 +2470,23 @@
     });
 
     body.innerHTML = sorted.map((row) => {
+      // 按对话视图优先显示真实上游模型(proxy 本地记录);无则回退 rollout 客户端模型名。
+      const modelText =
+        view === "conversation" && row.upstreamModel
+          ? row.upstreamModel
+          : (row.models || []).join(", ") || "—";
       const modelCell = showModelsCol
-        ? `<td class="usage-cell-model">${escapeHtml((row.models || []).join(", ") || "—")}</td>`
+        ? `<td class="usage-cell-model">${escapeHtml(modelText)}</td>`
         : "";
       return `
       <tr>
         ${firstColCell(row, view)}
         ${modelCell}
+        ${cacheHitCell(row, view)}
         <td>${escapeHtml(fmtNum(row.inputTokens))}</td>
         <td>${escapeHtml(fmtNum(row.outputTokens))}</td>
         <td>${escapeHtml(fmtNum(row.reasoningOutputTokens))}</td>
         <td><strong>${escapeHtml(fmtNum(row.totalTokens))}</strong></td>
-        ${cacheHitCell(row, view)}
         <td>${escapeHtml(fmtNum(row.turnCount))}</td>
         <td>${escapeHtml(fmtLastActivity(row.lastActivity))}</td>
       </tr>
