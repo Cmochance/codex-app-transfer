@@ -268,20 +268,22 @@ Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) in
 
 > Overview list below. For the full **borrowing form / itemized list / corresponding file:line in this codebase**, see [ACKNOWLEDGEMENTS.md](./ACKNOWLEDGEMENTS.md).
 
-- [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) — provider switching paradigm inspiration
-- [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x desktop shell skeleton + README structure reference
-- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — bidirectional protocol translation patterns; per-provider `get_supported_openai_params` whitelists used as cross-validation evidence for `reasoning_effort` policy (DeepSeek / Kimi / GLM / MiniMax / Qwen / MiMo)
+<!-- Acknowledgements overview rule: each entry's description (after " — ") is a terse tag, ≤ 40 chars; full borrowing form / license / file:line goes in ACKNOWLEDGEMENTS.md. Enforced in CI by scripts/check_acknowledgements.py — over budget fails the build. -->
+
+- [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) — provider switching paradigm
+- [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x desktop shell skeleton
+- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — bidirectional protocol translation
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` architecture base
-- [`openai/codex`](https://github.com/openai/codex) — autocompact prompt base structure + compact protocol reverse-reference
+- [`openai/codex`](https://github.com/openai/codex) — compact prompt base structure
 - [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact anchor bullets
 - [`7as0nch/mimo2codex`](https://github.com/7as0nch/mimo2codex) — MiMo protocol reference
 - [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) — Gemini OAuth wire-level reference
-- [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web reverse-engineering reference + dynamic statsig algorithm + tool_calls flatten pattern
-- [`galaxywk223/codex-plugin-unlocker`](https://github.com/galaxywk223/codex-plugin-unlocker) — Codex Desktop Plugins unlock injection script (React Context-value walk-up + DOM enable + MutationObserver, MIT)
-- [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) — Alibaba's official Qwen CLI, Bailian Token Plan (`*.maas.aliyuncs.com`) hardcoded model registry pattern (`TOKEN_PLAN_MODELS` in `packages/cli/src/auth/providers/alibaba/tokenPlan.ts`, Apache-2.0)
-- [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows MSIX Codex Desktop CDP injection path (`IApplicationActivationManager` COM + AUMID auto-resolve + cmdline serialization, `codex_session_delete/launcher.py`, MIT)
-- [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — Codex asset "managed-block" design: marker + parse/preview/apply/rollback/clear/history six operations + Protected mode (`src-tauri/src/core/custom_instructions.rs:1-130`, MIT) — our `src-tauri/src/admin/services/managed_block.rs` borrows the algorithm; marker prefix changed to `cas:` for project isolation
-- [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage) — Codex CLI rollout JSONL token usage parser + Daily Report table layout; `crates/usage_tracker/src/vendored_ccusage/` is directly vendored from its `rust/crates/ccusage/src/{adapter/codex/{parser,types,paths},types,fast,home,date_utils,utils}.rs` (MIT)
+- [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web reverse-engineering ref
+- [`galaxywk223/codex-plugin-unlocker`](https://github.com/galaxywk223/codex-plugin-unlocker) — Codex Desktop Plugins unlock script
+- [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) — Qwen Token Plan model registry
+- [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows MSIX CDP injection path
+- [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — managed-block six-op design
+- [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage) — rollout JSONL token-usage parser
 
 ### Community contributors
 

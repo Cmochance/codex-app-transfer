@@ -1,4 +1,4 @@
-//! Codex 配置文件"受管块"管理 — 借鉴 borawong/AiMaMi:src-tauri/src/core/custom_instructions.rs.
+//! Codex 配置文件"受管块"管理 — 借鉴 borawong/AiMaMi(MIT):src-tauri/src/core/custom_instructions.rs:1-130。
 //!
 //! ## 设计目标
 //!

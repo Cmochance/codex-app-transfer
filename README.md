@@ -267,20 +267,22 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 > 以下列表为概览。**完整借鉴形式 / 借鉴清单 / 本项目对应 file:line** 见 [ACKNOWLEDGEMENTS.md](./ACKNOWLEDGEMENTS.md)。
 
+<!-- 致谢概览规则:每条 " — " 之后的描述 ≤ 20 字(极简标签,只写"借鉴了什么");完整借鉴形式 / license / file:line 一律进 ACKNOWLEDGEMENTS.md。长度由 scripts/check_acknowledgements.py 在 CI 强制,超标即 fail。 -->
+
 - [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) — provider 切换形态启发
-- [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x 桌面壳骨架 + README 结构参考
-- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — 协议双向转换思路;per-provider `get_supported_openai_params` 白名单作为 reasoning_effort 入表证据交叉验证(DeepSeek / Kimi / GLM / MiniMax / Qwen / MiMo)
+- [`lonr-6/cc-desktop-switch`](https://github.com/lonr-6/cc-desktop-switch) — v1.x 桌面壳骨架
+- [`BerriAI/litellm`](https://github.com/BerriAI/litellm) — 协议双向转换思路
 - [`tauri-apps/tauri`](https://tauri.app/) — v2 + `cas://` 架构基座
-- [`openai/codex`](https://github.com/openai/codex) — autocompact prompt 骨架 + compact 协议结构反查
-- [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — autocompact prompt 锚定 bullet
+- [`openai/codex`](https://github.com/openai/codex) — compact prompt 骨架
+- [`Piebald-AI/claude-code-system-prompts`](https://github.com/Piebald-AI/claude-code-system-prompts) — prompt 锚定 bullet
 - [`7as0nch/mimo2codex`](https://github.com/7as0nch/mimo2codex) — MiMo 协议借鉴
 - [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) — Gemini OAuth wire 参考
-- [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web 反向工程参考 + dynamic statsig 算法 + tool_calls flatten 模式
-- [`galaxywk223/codex-plugin-unlocker`](https://github.com/galaxywk223/codex-plugin-unlocker) — Codex Desktop Plugins 解锁注入脚本
-- [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) — 阿里官方 Qwen CLI,百炼 Token Plan (`*.maas.aliyuncs.com`) 模型清单硬编码模式
-- [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows MSIX Codex Desktop CDP 注入路径
-- [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — Codex 资产管理"受管块"设计:Agents.md, MCP, Skills
-- [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage) — Codex CLI rollout JSONL token usage 解析 + Daily Report 表格形态;`crates/usage_tracker/src/vendored_ccusage/` 直接 vendor 自其 `rust/crates/ccusage/src/{adapter/codex/{parser,types,paths},types,fast,home,date_utils,utils}.rs`(MIT)
+- [`chenyme/grok2api`](https://github.com/chenyme/grok2api) — Grok Web 反向工程参考
+- [`galaxywk223/codex-plugin-unlocker`](https://github.com/galaxywk223/codex-plugin-unlocker) — Plugins 解锁注入脚本
+- [`QwenLM/qwen-code`](https://github.com/QwenLM/qwen-code) — Qwen 模型清单硬编码
+- [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows CDP 注入路径
+- [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — 受管块六操作设计
+- [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage) — rollout token 用量解析
 
 ### 社区贡献者
 

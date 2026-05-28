@@ -139,3 +139,19 @@ jobs:
 
       - name: cargo test -p codex-app-transfer
         run: cargo test -p codex-app-transfer --no-fail-fast
+
+  # 文档门禁: always runs, 纯 stdlib Python, 无 apt (~15s). 强制 README 致谢
+  # 概览描述长度 (README.md ≤20 字 / README.en.md ≤40 字), 防新增致谢条目膨胀
+  # 成段落 — 写在文档里的规则历史上反复被忽略, 改成机器门禁. 详见
+  # scripts/check_acknowledgements.py + ACKNOWLEDGEMENTS.md「维护规则」.
+  docs-acknowledgements:
+    name: Docs · acknowledgements length
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check README acknowledgements length
+        run: python3 scripts/check_acknowledgements.py

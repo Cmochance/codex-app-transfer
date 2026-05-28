@@ -324,6 +324,21 @@
 - **代码层引用**(`windows_msix.rs:18-25` 节选):
   > 实现路径 1:1 借鉴 `BigPizzaV3/CodexPlusPlus`(MIT,2699 stars)的 Python 实现 `codex_session_delete/launcher.py:283-451`(2026-05-17 同步)。同道项目实证可工作。本 Rust 实现用 `windows` crate 官方 binding 而非手搓 ctypes COM,稳定性更好。
 
+## borawong/AiMaMi
+
+- **Link**: https://github.com/borawong/AiMaMi
+- **License**: **MIT**(明确,本项目 `managed_block.rs` 头注释固化)
+- **借鉴形式**: 算法借鉴(受管块设计:marker 切分 + 六操作 + Protected mode;细节本地重写)
+- **首次借鉴 PR / 时间**: PR #206(2026-05-20,Codex 资产管理 managed block + Agents tab MVP);Protected mode 后续 PR #229
+- **借鉴清单**:
+  - **受管块算法**(上游 `src-tauri/src/core/custom_instructions.rs:1-130`):注释 marker 把"app 受管区"与"用户手写区"物理隔离 + parse / preview / apply / rollback / clear / history 六操作 + Protected mode → 本项目 `src-tauri/src/admin/services/managed_block.rs`
+- **本项目差异 / 扩展**:
+  - marker 前缀改成 `cas:`(如 `cas:managed:agents:v1:start`)做项目隔离,避免与上游 / 其他工具 marker 冲突
+  - 受管对象从单一 custom instructions 扩展到 `~/.codex/AGENTS.md` + `config.toml` MCP 段 + `skills/*/SKILL.md` 三类
+- **关联 PR / followup / issue**: PR #206(主修)/ PR #229(Protected mode);issue #24 #25
+- **代码层引用**(`managed_block.rs:1` 节选):
+  > Codex 配置文件"受管块"管理 — 借鉴 borawong/AiMaMi(MIT):`src-tauri/src/core/custom_instructions.rs:1-130`。
+
 ## ryoppippi/ccusage
 
 - **Link**: https://github.com/ryoppippi/ccusage
@@ -361,6 +376,7 @@
 ## 维护规则
 
 - **新增借鉴**:1 个 PR 内 ① README 致谢段加一行概览 ② 本文档加完整 entry(必填字段全),缺一不可
+  - **概览长度硬约束**:README 致谢每行 " — " 之后的描述只写极简标签 —— `README.md` ≤ 20 字、`README.en.md` ≤ 40 字(均按 Unicode 码点计,中英文 / 标点 / 反引号 / 空格各算 1)。完整借鉴形式 / license / file:line / 路径一律放本文档,**不**塞进 README 概览。由 `scripts/check_acknowledgements.py` 在 CI(`docs-acknowledgements` job)强制,超标即 fail —— 写规则没用过(历史上新增条目反复超标),这条改成机器门禁
 - **修改已有借鉴**:本项目代码 file:line 变了 → 同步 entry 的"借鉴清单";本项目差异扩展了 → 加到"本项目差异 / 扩展"
 - **删除借鉴**(代码被重写不再依赖):entry 移到末尾 `## 已不再依赖的历史借鉴` section 保留追溯,**不直接删** — 历史归属信息必须可回溯
 - **License 合规**:任何"算法 1:1 复刻 / 整体借鉴 / 数据模式参照 / Wire-level 对齐" 必须保留 license + 作者署名(代码注释 + 本文档双重记录)
