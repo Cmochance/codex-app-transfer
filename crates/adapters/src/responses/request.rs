@@ -609,6 +609,17 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 .or_else(|| item.get("id").and_then(|v| v.as_str()))
                 .unwrap_or("")
                 .to_owned();
+            // 加固(silent-failure review):call_id 缺失 → 下面 emit 的 role:tool
+            // message 成孤儿(repair_tool_call_ids 静默 drop)→ 静默重现本 PR 修的
+            // "工具静默消失" bug 类。tool_search_call / tool_search_output 本应按
+            // call_id 配对,缺失通常是 Codex schema drift,warn 让它可观测(发现的
+            // 工具映射仍经 tools[] 注入生效,只是这条 output 配不上 pair)。
+            if call_id.is_empty() {
+                tracing::warn!(
+                    target = "adapters::tool_search",
+                    "tool_search_output missing call_id; role:tool message will be orphaned and dropped by repair_tool_call_ids — likely Codex schema drift",
+                );
+            }
             let names = extract_tool_search_output_tool_names(item);
             let content = if names.is_empty() {
                 "tool_search returned no matching tools.".to_owned()

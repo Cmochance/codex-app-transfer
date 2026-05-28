@@ -980,6 +980,40 @@ impl ChatToResponsesConverter {
             // 形态 ({server[,uri]}),转成 tool_search 期望的 {query}。LLM 直接调
             // tool_search ({query}) 则原样透传。
             let arguments_value = normalize_tool_search_arguments(arguments_value);
+            // interrupted 中断(stream 截断,无 finish_reason 且非 [DONE]):对齐
+            // apply_patch 分支 emit `status="incomplete"` + 标记 interrupted_during_close,
+            // 避免 Codex CLI 把半截的 tool_search call 当完整执行。
+            // (Devin #289 review BUG_..._0002:is_tool_search 之前无条件 completed)
+            if interrupted {
+                tracing::warn!(
+                    target = "adapters::tool_search",
+                    call_id = %call_id,
+                    "tool_search call cut off mid-stream (no finish_reason and not from [DONE]); emitting status=incomplete",
+                );
+                let item = json!({
+                    "type": "tool_search_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "execution": "client",
+                    "arguments": arguments_value,
+                    "status": "incomplete",
+                });
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
+                if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                    pending.closed = true;
+                    pending.interrupted_during_close = true;
+                }
+                return;
+            }
             let item = json!({
                 "type": "tool_search_call",
                 "id": fc_id,
