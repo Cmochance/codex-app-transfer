@@ -842,6 +842,95 @@ fn nested_namespace_inside_namespace_recursively_flattens() {
     assert_eq!(names, vec!["deep_tool", "sibling"]);
 }
 
+// ── MOC-32 / GH #288: tool_search converter ──────────────────────────
+//
+// Codex 0.130+ 把 MCP server tools 全 defer 到 `tool_search` builtin
+// (`Feature::ToolSearchAlwaysDeferMcpTools`)。chat completions 上游不认
+// `type=tool_search`,必须降级成 chat `function` tool,LLM 调用后由
+// converter.rs::close_tool_call 把 chat function_call wire 重打包成 Codex
+// `tool_search_call` wire。本节测试请求侧 wire 转换正确性。
+
+#[test]
+fn convert_tool_search_to_chat_function() {
+    let req = json!({
+        "model": "kimi-for-coding",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "# Tool discovery\n\nSearches over deferred tool metadata with BM25...",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["query"]
+            }
+        }]
+    });
+    let out = convert(req);
+    let tools = out["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1, "tool_search 应转成 1 个 chat function tool");
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["function"]["name"], "tool_search");
+    assert!(
+        tools[0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("BM25"),
+        "description 应完整透传 BM25 关键词"
+    );
+    let params = &tools[0]["function"]["parameters"];
+    assert_eq!(params["type"], "object");
+    assert_eq!(params["properties"]["query"]["type"], "string");
+    assert_eq!(params["required"][0], "query");
+}
+
+#[test]
+fn convert_tool_search_with_empty_description_does_not_panic() {
+    let req = json!({
+        "model": "x",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [{"type": "tool_search", "execution": "client"}]
+    });
+    let out = convert(req);
+    let tools = out["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "tool_search");
+    assert_eq!(tools[0]["function"]["description"], "");
+    assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+}
+
+#[test]
+fn convert_tool_search_alongside_other_types() {
+    let req = json!({
+        "model": "x",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type": "function", "name": "fn1", "description": "", "parameters": {}},
+            {"type": "tool_search", "execution": "client", "description": "discovery", "parameters": {}},
+            {"type": "custom", "name": "apply_patch", "description": "", "format": {}},
+            {"type": "namespace", "name": "codex_app", "tools": [
+                {"type": "function", "name": "ns_inner", "description": "", "parameters": {}}
+            ]}
+        ]
+    });
+    let out = convert(req);
+    let tools = out["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+        .collect();
+    assert!(names.contains(&"tool_search"), "tool_search 应在 outbound");
+    assert!(names.contains(&"fn1"));
+    assert!(names.contains(&"apply_patch"));
+    assert!(names.contains(&"ns_inner"), "namespace 内层 fn 应展平");
+}
+
 #[test]
 fn unknown_tool_type_dropped_via_warn_once_path_does_not_panic() {
     // web_search / file_search / code_interpreter / image_generation 等

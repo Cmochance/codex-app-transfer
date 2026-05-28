@@ -316,6 +316,39 @@ pub fn convert_responses_tool_to_chat_tool(
         // DeepSeek / MiniMax / Qwen / GLM 留 TODO,逐家文档实证后跟进。
         // 实施跟踪见 `docs/web-search-implementation-tracker.md`。
         "web_search" | "web_search_preview" => convert_web_search_tool(obj, provider),
+        // Codex 0.130+ 引入的 `tool_search` builtin — `Feature::ToolSearchAlwaysDeferMcpTools`
+        // 启用后所有 MCP server tools 都 defer 到 `tool_search`,LLM 通过它 BM25 query
+        // 来发现具体工具。chat completions API 不认 `type=tool_search`,降级成普通
+        // function tool(name=tool_search,description+parameters 透传)→ 给 LLM 完整
+        // hint 看到 deferred server 列表。LLM 调用后由 `converter.rs::close_tool_call`
+        // 把 chat function_call wire 重写成 Responses API `tool_search_call`,Codex
+        // router (`core/src/tools/router.rs:106-122`) 路由到 `ToolPayload::ToolSearch`
+        // 内部 BM25 dispatch,返 `ResponseInputItem::ToolSearchOutput` 进下轮 input。
+        //
+        // Wire schema 实证:`openai/codex` upstream `protocol/src/models.rs:2674-2740`
+        // (rust-v0.133.0 tag)的 roundtrip test。
+        //
+        // Refs: MOC-32 / Linear document
+        // `moc-32-方向-b-transfer-adapter-全面对接-codex-0130-responses-api-tool-types`
+        "tool_search" => {
+            let description = obj
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let parameters = obj
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object","properties":{},"required":[]}));
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "description": description,
+                    "parameters": parameters,
+                    "strict": false,
+                },
+            })]
+        }
         // Responses 专属类型(local_shell / file_search / computer_use* /
         // code_interpreter / image_generation / mcp 等)Chat 端点不认,丢弃。
         // warn_once 防多轮重发刷屏(借鉴 mimo2codex `reqToChat.ts:158-172` warnOnce)。
