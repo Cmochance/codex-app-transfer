@@ -295,3 +295,18 @@ If you've submitted a PR and want to rename / add a link / remove yourself, open
 ## License
 
 MIT License. Full text at [LICENSE.txt](LICENSE.txt).
+
+## Project Activity
+
+<table>
+<tr>
+<td width="50%" align="center">
+<a href="https://github.com/Cmochance/codex-app-transfer/releases"><img src="https://cmochance.github.io/codex-app-transfer/downloads.svg" alt="Download trend" width="100%"></a>
+<br/><sub>Download trend (refreshed daily)</sub>
+</td>
+<td width="50%" align="center">
+<a href="https://star-history.com/#Cmochance/codex-app-transfer&Date"><img src="https://api.star-history.com/svg?repos=Cmochance/codex-app-transfer&type=Date&theme=dark" alt="Star history" width="100%"></a>
+<br/><sub>Star history</sub>
+</td>
+</tr>
+</table>
