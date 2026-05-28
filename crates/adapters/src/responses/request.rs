@@ -163,10 +163,18 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
                 tools.iter().collect()
             };
 
-        let chat_tools: Vec<Value> = filtered_tools
+        let mut chat_tools: Vec<Value> = filtered_tools
             .iter()
             .flat_map(|t| convert_responses_tool_to_chat_tool(t, provider))
             .collect();
+        // 实验 exp/resources-to-tool-search:注入 tool_search 发现的工具。Codex
+        // 0.130+ 把 MCP 工具 defer 到 tool_search,发现的具体工具只在 input[] 的
+        // tool_search_output.tools 里,不在 body.tools[]。不注入则 LLM 看不到 →
+        // 无法调用 → 只能循环调 tool_search。展平复用 namespace 同一路径。
+        for discovered in discovered_tools_from_tool_search_output(input) {
+            chat_tools.extend(convert_responses_tool_to_chat_tool(&discovered, provider));
+        }
+        dedup_chat_tools_by_name(&mut chat_tools);
         if !chat_tools.is_empty() {
             // **Kimi `$web_search` 强制 thinking disabled**:Kimi 官方文档
             // (`platform.kimi.ai/docs/guide/use-web-search`)明确写
@@ -547,6 +555,76 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 "content": output_str,
             })]
         }
+        "tool_search_call" => {
+            // 实验 exp/resources-to-tool-search:input history 里 Codex 回放的
+            // `ResponseItem::ToolSearchCall { call_id, execution, arguments }`
+            // (codex `protocol/src/models.rs:792`)。这是 assistant 侧的工具调用
+            // (converter.rs 把 LLM 的 tool_search / redirect 来的 list_mcp_resources
+            // 改写成的 tool_search_call wire,Codex 执行后回放)。**必须**转成 chat
+            // `assistant.tool_calls`(name="tool_search"),与下面 tool_search_output
+            // 转的 `role:tool` message 配对 —— 否则 tool message 成孤儿,
+            // repair_tool_call_ids 补空 name tool_call → 上游 400
+            // (`messages[N].tool_calls[0] is missing a function name`)。
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_owned();
+            // arguments 在 Responses 是 JSON Value(object,如 {"query":"notion"});
+            // chat function.arguments 要 JSON **字符串**。
+            let arguments_str = match item.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned()),
+                None => "{}".to_owned(),
+            };
+            let arguments = sanitize_tool_arguments_json_string(&arguments_str);
+            vec![json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": if call_id.is_empty() { "call_unknown".to_owned() } else { call_id },
+                    "type": "function",
+                    "function": { "name": "tool_search", "arguments": arguments },
+                }],
+            })]
+        }
+        "tool_search_output" => {
+            // 实验 exp/resources-to-tool-search:Codex 0.130+ 把 LLM 调的
+            // tool_search 路由到本地 BM25,返 `ResponseItem::ToolSearchOutput
+            // { call_id, status, execution, tools }`(codex `protocol/src/models.rs:839`)
+            // 进下轮 input。**结构是 `tools` 字段,不是 `content`/`output`**,所以
+            // 之前落默认 arm(无 content)被静默丢弃 → repair_tool_call_ids 补
+            // "[Tool execution skipped... unknown_]" 误导占位 → LLM 以为工具失败
+            // 死循环调 tool_search。
+            //
+            // 发现的具体工具走 `discovered_tools_from_tool_search_output` 注入
+            // chat `tools[]`(LLM 才真正可调)。这里把 item 转成 role:tool message
+            // 给 call_id 一个**真实** result 消除 repair 占位,content 列出工具名
+            // 提示 LLM 可直接调用。
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("tool_call_id").and_then(|v| v.as_str()))
+                .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_owned();
+            let names = extract_tool_search_output_tool_names(item);
+            let content = if names.is_empty() {
+                "tool_search returned no matching tools.".to_owned()
+            } else {
+                format!(
+                    "tool_search discovered {} tool(s), now available to call directly: {}",
+                    names.len(),
+                    names.join(", ")
+                )
+            };
+            vec![json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content,
+            })]
+        }
         "custom_tool_call" => {
             // Codex CLI 把 freeform apply_patch 的回放 wire 包成
             // `ResponseItem::CustomToolCall { name, input, call_id, ... }`
@@ -709,6 +787,68 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
             }
         }
     }
+}
+
+/// 实验 exp/resources-to-tool-search:从 input[] 的 `tool_search_output` items
+/// 收集 Codex 发现的工具(namespace/function 结构)。Codex 0.130+ 把 MCP 工具
+/// defer 到 tool_search,发现的工具只出现在 tool_search_output.tools,**不在**
+/// body.tools[];不注入 chat tools[] 则 LLM 永远看不到 → 无法调用。
+fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
+    input
+        .get("input")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("type").and_then(|t| t.as_str()) == Some("tool_search_output")
+                })
+                .filter_map(|item| item.get("tools").and_then(|t| t.as_array()))
+                .flatten()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 按 `function.name` 去重 chat tools(保留首次出现 — body.tools[] builtin 在
+/// 发现工具之前 extend,故 builtin 优先)。空 name 不参与去重(全保留)。
+fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
+    let mut seen = std::collections::HashSet::new();
+    tools.retain(|t| {
+        let name = t
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        if name.is_empty() {
+            return true;
+        }
+        seen.insert(name.to_owned())
+    });
+}
+
+/// 提取 tool_search_output.tools 里所有具体工具名(namespace 包展开内层
+/// function.name;顶级 function 直接取 name)。用于 role:tool message content。
+fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) -> Vec<String> {
+    let Some(tools) = item.get("tools").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for tool in tools {
+        if tool.get("type").and_then(|t| t.as_str()) == Some("namespace") {
+            if let Some(inner) = tool.get("tools").and_then(|v| v.as_array()) {
+                for f in inner {
+                    if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                        names.push(n.to_owned());
+                    }
+                }
+            }
+        } else if let Some(n) = tool.get("name").and_then(|v| v.as_str()) {
+            names.push(n.to_owned());
+        }
+    }
+    names
 }
 
 pub(crate) fn normalize_tool_output_for_context(
