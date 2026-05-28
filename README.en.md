@@ -75,6 +75,7 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 - **Codex Desktop Theme (optional, off by default)**: Theme page ships 5 built-in anime themes (`carton` with a floating mascot + `changli` / `azurlane` / `nailin` / `zani` background-only), injects CSS token overrides + background image into Codex Desktop via CDP. Toggle is independent from Plugin Unlock; page reload re-applies automatically
 - Cross-platform single-instance lock (double-click brings the existing window forward) + cross-process file lock prevents multi-instance config-write lost-updates
 - Windows / macOS / Linux system tray
+- **Code Graph**: [View code dependency graph online](https://cmochance.github.io/codex-app-transfer/)
 
 ## Download
 
