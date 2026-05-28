@@ -130,6 +130,44 @@ fn is_tool_search_tool_name(name: &str) -> bool {
     name == "tool_search"
 }
 
+// ── 实验 exp/resources-to-tool-search ────────────────────────────────────────
+//
+// MOC-32: chat-completions LLM (mimo 等) 调 `list_mcp_resources` /
+// `read_mcp_resource` / `list_mcp_resource_templates` 想 discover MCP 工具,但这
+// 三个 builtin 返的是 resources(文档/URI 元数据)不是 callable tools — 跟 LLM
+// 想要的对不上。真正返 callable tools 的是 `tool_search`。
+//
+// 本实验:LLM 调上述 legacy MCP discovery 工具时,response 侧把 wire **redirect**
+// 成 `tool_search_call` 给 Codex,arguments `{server:X[,uri:Y]}` 转成
+// `{query:X}`。Codex tool_search 返 callable tools → LLM 拿到真正能调的工具。
+//
+// 这是给 user 真机迭代实验的最小可行版,根据真实抓取再调对接细节。
+const REDIRECT_TO_TOOL_SEARCH_NAMES: &[&str] = &[
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+];
+
+fn should_redirect_to_tool_search(name: &str) -> bool {
+    REDIRECT_TO_TOOL_SEARCH_NAMES.contains(&name)
+}
+
+/// tool_search 期望 arguments `{query, limit?}`。redirect 来的 legacy 工具
+/// arguments 是 `{server:X[, uri:Y]}` / `{cursor:...}` 等,转成 `{query:X}`。
+/// 已经是 `{query}` 形态(LLM 直接调 tool_search)则原样返回。
+fn normalize_tool_search_arguments(args: Value) -> Value {
+    let Some(obj) = args.as_object() else {
+        return args;
+    };
+    if obj.contains_key("query") {
+        return args; // tool_search 原生
+    }
+    if let Some(server) = obj.get("server").and_then(|v| v.as_str()) {
+        return json!({ "query": server });
+    }
+    args
+}
+
 #[derive(Debug)]
 pub struct ChatToResponsesConverter {
     state: State,
@@ -354,12 +392,24 @@ impl ChatToResponsesConverter {
                 .tool_calls
                 .values()
                 .map(|pending| {
+                    // tool_search(redirect 来的)args 必须跟 wire(close_tool_call /
+                    // tool_call_item_completed)一致 normalize {server[,uri]}→{query};
+                    // 否则 session cache 回灌 chat 历史跟 wire mismatch,LLM 下轮看
+                    // history 学到错的 args 形态(Devin #293 BUG_..._0001 第 3 处)。
+                    let arguments = if pending.is_tool_search {
+                        serde_json::from_str::<Value>(&pending.args_acc)
+                            .map(normalize_tool_search_arguments)
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|_| pending.args_acc.clone())
+                    } else {
+                        pending.args_acc.clone()
+                    };
                     json!({
                         "id": pending.call_id.clone(),
                         "type": "function",
                         "function": {
                             "name": pending.name.clone(),
-                            "arguments": pending.args_acc.clone(),
+                            "arguments": arguments,
                         },
                     })
                 })
@@ -551,7 +601,21 @@ impl ChatToResponsesConverter {
                 .id
                 .clone()
                 .unwrap_or_else(|| format!("call_{}_{}", self.fc_id_seed, openai_index));
-            let name = tc.function.name.clone().unwrap_or_default();
+            let raw_name = tc.function.name.clone().unwrap_or_default();
+            // 实验 exp/resources-to-tool-search: LLM 调 legacy MCP discovery
+            // (list_mcp_resources / read_mcp_resource / list_mcp_resource_templates)
+            // → redirect 成 tool_search(返 callable tools 而非 resources 元数据)。
+            let name = if should_redirect_to_tool_search(&raw_name) {
+                tracing::info!(
+                    target = "adapters::tool_search",
+                    from = %raw_name,
+                    call_id = %call_id,
+                    "redirecting legacy MCP discovery call → tool_search",
+                );
+                "tool_search".to_string()
+            } else {
+                raw_name.clone()
+            };
             // **取舍**:wire 形态(function_call vs custom_tool_call)在 open
             // 时一次性根据**首帧 name** 决定,后续帧补全 name 不改 wire。
             // 实测 DeepSeek / Kimi / MiMo 都在首帧带 name。极端情况下首帧
@@ -924,6 +988,44 @@ impl ChatToResponsesConverter {
                 );
                 json!({ "raw": args_acc })
             });
+            // 实验 exp/resources-to-tool-search: redirect 来的 args 是 legacy 工具
+            // 形态 ({server[,uri]}),转成 tool_search 期望的 {query}。LLM 直接调
+            // tool_search ({query}) 则原样透传。
+            let arguments_value = normalize_tool_search_arguments(arguments_value);
+            // interrupted 中断(stream 截断,无 finish_reason 且非 [DONE]):对齐
+            // apply_patch 分支 emit `status="incomplete"` + 标记 interrupted_during_close,
+            // 避免 Codex CLI 把半截的 tool_search call 当完整执行。
+            // (Devin #289 review BUG_..._0002:is_tool_search 之前无条件 completed)
+            if interrupted {
+                tracing::warn!(
+                    target = "adapters::tool_search",
+                    call_id = %call_id,
+                    "tool_search call cut off mid-stream (no finish_reason and not from [DONE]); emitting status=incomplete",
+                );
+                let item = json!({
+                    "type": "tool_search_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "execution": "client",
+                    "arguments": arguments_value,
+                    "status": "incomplete",
+                });
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                );
+                if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
+                    pending.closed = true;
+                    pending.interrupted_during_close = true;
+                }
+                return;
+            }
             let item = json!({
                 "type": "tool_search_call",
                 "id": fc_id,
@@ -1169,16 +1271,29 @@ impl ChatToResponsesConverter {
         if pending.is_tool_search {
             // envelope.output[] 终态必须跟流式 `response.output_item.done` 的
             // item 一致(见 close_tool_call tool_search 分支),否则严格客户端
-            // 会两次解读为不同 item。同样 args parse 失败 fallback {"raw":...}。
+            // 会两次解读为不同 item。三处都要对齐流式侧:
+            // ① args parse 失败 fallback {"raw":...};
+            // ② normalize(redirect 来的 {server[,uri]} → {query})——
+            //    Devin #293 BUG_..._0001:envelope 漏 normalize → 跟流式
+            //    arguments mismatch;
+            // ③ interrupted_during_close → status="incomplete" —— Devin #293
+            //    BUG_..._0002:envelope 之前写死 "completed",跟流式 incomplete
+            //    不一致,严格客户端读 envelope output[] 会误以为 tool_search 完整。
             let arguments_value: Value = serde_json::from_str(&pending.args_acc)
                 .unwrap_or_else(|_| json!({ "raw": pending.args_acc }));
+            let arguments_value = normalize_tool_search_arguments(arguments_value);
+            let status = if pending.interrupted_during_close {
+                "incomplete"
+            } else {
+                "completed"
+            };
             return json!({
                 "type": "tool_search_call",
                 "id": pending.fc_id,
                 "call_id": pending.call_id,
                 "execution": "client",
                 "arguments": arguments_value,
-                "status": "completed",
+                "status": status,
             });
         }
         if pending.is_apply_patch {
