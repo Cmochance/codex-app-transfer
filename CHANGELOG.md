@@ -2,6 +2,27 @@
 
 逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
+## v2.1.17 — 2026-05-29
+
+**tool_search 工具链打通 + MCP 授权可移植保险箱 + Usage 命中率 + Code Graph + 稳定性修复**:自 v2.1.16 起合入 16 个 PR。
+
+- **`tool_search` 工具链全链路**(#289 / #290 / #291 / #293 / MOC-48 #296):Codex 0.130+ 把 server-side MCP 工具 defer 到 `tool_search`、不再直接进 `tools[]`,代理此前会 silently drop;现 chat 路径打通(`tool_search_output` 发现工具 → 注入 chat `tools[]` → 按 `namespace` 路由回上游),新增 dropped-tools 计数器 dashboard + observability,README 兼容矩阵补说明
+- **MCP 授权可移植保险箱**(MOC-62 #307,默认开):Codex MCP OAuth 凭据改存可移植文件 `~/.codex/.credentials.json`(0o600)+ 在 `~/.codex` 之外维护镜像;整个凭据文件被切账号 / 误删 / 换机清掉时,下次启动弹确认从备份恢复,单个 server 的主动登出不复活;不解决 OAuth 自然过期,token 明文落盘(0o600)
+- **Usage 缓存命中率**(#305):按对话视图显示缓存命中率 + 逐轮命中率直方图;proxy 本地记录 `session → 真实上游模型`,模型列显示真实上游模型而非 `gpt-5.x` 占位
+- **Code Graph 自动生成 + Pages 部署**(MOC-52 #298 / #300 / #297):`cargo metadata` 生成交互式 crate 依赖图,GitHub Actions 直接部署 Pages(无 gh-pages 分支、不提交 main)
+- **稳定性修复**:`apply_patch` chat 长文档信封修复(#303)、启动防白屏 try-catch(#257)、`model_catalog.json` 自动同步(#266 / #287)、桌面宠物开关真正关闭(MOC-34 #286)、残留扫描启动竞态 + 致谢长度 CI 门禁 + 活跃度图单点态(MOC-54 #306)、fetch 失败修复(#285)
+
+完整改动:[v2.1.16...v2.1.17](https://github.com/Cmochance/codex-app-transfer/compare/v2.1.16...v2.1.17)。
+
+## v2.1.16 — 2026-05-26
+
+**Token 用量统计 + 启用按钮重启解耦**:新增 Usage tab 展示对话 token 用量,并把启用按钮跟重启 Codex Desktop 解耦。
+
+- **Usage tab**(MOC-15 / PR #280):sidebar 第 4 个入口,4 张顶部 KPI 卡 + 三视图(按日 / 按模型 / 按对话),ccusage 同款表格形态;用量解析层 vendor 自 [ryoppippi/ccusage](https://github.com/ryoppippi/ccusage)(MIT)
+- **解耦启用与重启 Codex**(MOC-20 / PR #282):Apply 现在只写配置 + toast,不再强制弹重启 modal,避免误点重启杀 Codex 进程丢对话上下文 / 草稿 / 思考
+
+完整改动:[v2.1.15...v2.1.16](https://github.com/Cmochance/codex-app-transfer/compare/v2.1.15...v2.1.16)。
+
 ## v2.1.15 — 2026-05-26
 
 **Codex Desktop UX 集成 + 通用 provider 修复综合更新**:本版主要把 transfer 跟 Codex Desktop 的集成面继续做深(主题 / context 圆环 / system prompts i18n / plugin-unlock 强化),同时收掉一批 per-provider reasoning / autocompact 真机暴露的 bug。
