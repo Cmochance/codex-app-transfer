@@ -665,7 +665,24 @@ fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
     } else {
         format!("/{}", upstream_path)
     };
-    format!("{}{}", upstream_base.trim_end_matches('/'), path)
+    let base = upstream_base.trim_end_matches('/');
+    // 容错:用户把完整 endpoint(如 `…/v1/chat/completions`、`…/v1/messages`、
+    // `…/responses`)整段填进 base_url 时,adapter 仍会再拼一遍标准 endpoint,
+    // 拼成 `…/chat/completions/chat/completions` 等 → 上游 404
+    // (反馈 fb-3093a382:误把 opencode zen 完整地址填进 baseUrl,MOC-72)。
+    // 若 base 末尾已等于待拼 endpoint(忽略 query)则不重复拼,query 原样保留
+    // (非破坏性,仅去重);endpoint 为空 / "/" 时不触发,避免误判 root 路径。
+    let (path_no_query, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path.as_str(), None),
+    };
+    if path_no_query != "/" && !path_no_query.is_empty() && base.ends_with(path_no_query) {
+        return match query {
+            Some(q) => format!("{base}?{q}"),
+            None => base.to_string(),
+        };
+    }
+    format!("{base}{path}")
 }
 
 /// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
@@ -1689,5 +1706,60 @@ mod tests {
         // 上游返回非 UTF-8 时不 panic,认为不匹配
         let body: &[u8] = &[0xff, 0xfe, 0xfd, 0x00];
         assert!(!is_web_search_upstream_reject(body));
+    }
+
+    #[test]
+    fn build_upstream_url_dedups_endpoint_suffix_in_base() {
+        // 正常路径:base 不含 endpoint → 照常拼(回归保护)
+        assert_eq!(
+            build_upstream_url("https://api.moonshot.cn/v1", "/chat/completions"),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        // base 误填完整 chat endpoint(反馈 fb-3093a382:opencode zen)→ 去重不翻倍
+        assert_eq!(
+            build_upstream_url(
+                "https://opencode.ai/zen/go/v1/chat/completions",
+                "/chat/completions"
+            ),
+            "https://opencode.ai/zen/go/v1/chat/completions"
+        );
+        // 去重时保留 query
+        assert_eq!(
+            build_upstream_url(
+                "https://opencode.ai/zen/go/v1/chat/completions",
+                "/chat/completions?stream=true"
+            ),
+            "https://opencode.ai/zen/go/v1/chat/completions?stream=true"
+        );
+        // anthropic:base 误填 /v1/messages → 去重
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/v1/messages", "/v1/messages"),
+            "https://relay.example.com/v1/messages"
+        );
+        // anthropic 正常:base 不含 endpoint → 照常补 /v1/messages
+        assert_eq!(
+            build_upstream_url("https://api.anthropic.com", "/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        // responses:base 误填 /responses → 去重
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/responses", "/responses"),
+            "https://relay.example.com/responses"
+        );
+        // 不误伤:base=/v1 + /responses(OpenAI 官方 responses-direct)照常拼
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1", "/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+        // 不误伤:responses 子路径(cancel)且 base 不含完整路径 → 照常拼
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1", "/responses/resp_abc/cancel"),
+            "https://api.openai.com/v1/responses/resp_abc/cancel"
+        );
+        // base 末尾 / 归一后再判断
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1/", "/responses"),
+            "https://api.openai.com/v1/responses"
+        );
     }
 }
