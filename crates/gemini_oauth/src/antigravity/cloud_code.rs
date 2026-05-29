@@ -3,44 +3,40 @@
 //! 跟父 crate `cloud_code.rs` 共用 `cloudcode-pa.googleapis.com/v1internal:*`
 //! 端点(底层 wire 一样),但用不同 ClientMetadata + UA。
 //!
-//! ## 关键差异
+//! ## 关键差异(2026-05-29 本机 mitmproxy 抓包实证,推翻原 CLIProxyAPI 推测)
 //!
-//! - **ClientMetadata shape**(`auth/antigravity/auth.go:163-169`):
-//!   - antigravity: `{ide_type:"ANTIGRAVITY", ide_name:"antigravity", ide_version:<v>}`
-//!   - gemini-cli: `{ideType:"IDE_UNSPECIFIED", platform:"DARWIN_ARM64", pluginType:"GEMINI", pluginVersion:"0.34.0"}`
-//! - **UA loadCodeAssist**: `antigravity/<v> darwin/arm64 google-api-nodejs-client/10.3.0`
-//! - **X-Goog-Api-Client**: `gl-node/22.21.1`
-//! - **CLIProxyAPI 实测**:loadCodeAssist 直接返已有 project,不需要 LRO
-//!   polling(只在 `cloudaicompanionProject` 缺失时才 onboard)
+//! - **ClientMetadata**:antigravity 只发 `{"ideType":"ANTIGRAVITY"}`(camelCase,单字段);
+//!   不再是旧推测的 `{ide_type, ide_name, ide_version}`(snake_case)。
+//! - **UA**(loadCodeAssist + onboardUser 控制面):跟 chat **统一**为
+//!   `antigravity/hub/<ver> <plat>/<arch>`,**无** `google-api-nodejs-client` 后缀。
+//! - **X-Goog-Api-Client**:控制面**不发**(原推测 `gl-node/22.21.1` 被实证推翻)。
+//! - **loadCodeAssist 直接返已有 project**,不需要 LRO polling(只在
+//!   `cloudaicompanionProject` 缺失时才 onboard)。
+//! - 详见 memory `reference_antigravity_wire_fingerprint`。
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use super::super::cloud_code::CloudCodeError;
-use super::super::constants::{
-    antigravity_user_agent_loadcodeassist, ANTIGRAVITY_VERSION, ANTIGRAVITY_X_GOOG_API_CLIENT,
-    CLOUD_CODE_BASE_URL,
-};
+use super::super::constants::{antigravity_user_agent_loadcodeassist, CLOUD_CODE_BASE_URL};
 
-/// Antigravity 客户端元数据 — 跟 gemini-cli 的 `ClientMetadata` shape 不同。
-/// 字段值字面对齐 CLIProxyAPI `auth/antigravity/auth.go:163-169` + `:256-260`。
+/// Antigravity 客户端元数据。**2026-05-29 实证抓包**:loadCodeAssist 的 body 是
+/// `{"metadata":{"ideType":"ANTIGRAVITY"}}` —— camelCase,且**只有 `ideType` 一个字段**
+/// (没有 ideName/ideVersion/pluginType/pluginVersion/platform;proto 定义里有这些字段
+/// 不代表 wire 上发)。推翻了之前基于 CLIProxyAPI 的 `{ide_type,ide_name,ide_version}`
+/// (snake_case) 假设。见 memory `reference_antigravity_wire_fingerprint`。
 #[derive(Debug, Clone, Serialize)]
 pub struct AntigravityClientMetadata {
-    /// 永远 `"ANTIGRAVITY"` —— Google 上游识别字段
+    /// 永远 `"ANTIGRAVITY"` —— Google 上游识别字段。序列化为 camelCase `ideType`。
+    #[serde(rename = "ideType")]
     pub ide_type: &'static str,
-    /// 永远 `"antigravity"`
-    pub ide_name: &'static str,
-    /// Antigravity 版本号(`1.21.9` fallback 或动态拉的最新版)
-    pub ide_version: String,
 }
 
 impl AntigravityClientMetadata {
     pub fn current() -> Self {
         Self {
             ide_type: "ANTIGRAVITY",
-            ide_name: "antigravity",
-            ide_version: ANTIGRAVITY_VERSION.to_owned(),
         }
     }
 }
@@ -118,7 +114,7 @@ pub(crate) async fn bootstrap_project_at(
         .post(&load_url)
         .bearer_auth(access_token)
         .header("User-Agent", &user_agent)
-        .header("X-Goog-Api-Client", ANTIGRAVITY_X_GOOG_API_CLIENT)
+        // 实证(2026-05-29):Antigravity 控制面**不发** X-Goog-Api-Client
         .json(&load_req)
         .send()
         .await?;
@@ -185,7 +181,7 @@ async fn onboard_user_at(
             .post(&onboard_url)
             .bearer_auth(access_token)
             .header("User-Agent", user_agent)
-            .header("X-Goog-Api-Client", ANTIGRAVITY_X_GOOG_API_CLIENT)
+            // 实证(2026-05-29):Antigravity 控制面**不发** X-Goog-Api-Client
             .json(&req)
             .send()
             .await?;
@@ -247,14 +243,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_serializes_with_antigravity_fields() {
+    fn metadata_serializes_as_ide_type_only() {
+        // 实证(2026-05-29 抓包):loadCodeAssist body = {"metadata":{"ideType":"ANTIGRAVITY"}}
         let m = AntigravityClientMetadata::current();
         let json = serde_json::to_string(&m).unwrap();
-        assert!(json.contains("\"ide_type\":\"ANTIGRAVITY\""));
-        assert!(json.contains("\"ide_name\":\"antigravity\""));
-        assert!(json.contains("\"ide_version\":"));
-        // **不**含 gemini-cli 特有字段(防 antigravity 误用 gemini metadata)
-        assert!(!json.contains("ideType"));
+        assert_eq!(json, r#"{"ideType":"ANTIGRAVITY"}"#);
+        // 不再发 snake_case 或额外字段(推翻旧 CLIProxyAPI `{ide_type,ide_name,ide_version}` 假设)
+        assert!(!json.contains("ide_type"));
+        assert!(!json.contains("ide_name"));
+        assert!(!json.contains("ide_version"));
         assert!(!json.contains("pluginType"));
         assert!(!json.contains("platform"));
     }
