@@ -161,6 +161,12 @@ pub struct UsageRow {
     pub turn_count: u64,
     /// last activity (RFC3339,ccusage 同款)
     pub last_activity: Option<String>,
+    /// 人类可读对话名(Codex `session_index.jsonl` 的 `thread_name`)。仅
+    /// by_conversation 行填充;daily/model 行为 None。前端用它替代 rollout 路径显示。
+    pub display_name: Option<String>,
+    /// 真实上游模型(proxy 写的 `session-models.jsonl`,见 forward.rs)。仅
+    /// by_conversation 行、且本版本之后跑过的对话有;否则 None,前端回退 rollout 模型名。
+    pub upstream_model: Option<String>,
 }
 
 impl UsageRow {
@@ -270,10 +276,28 @@ pub struct UsageReport {
 pub fn load_usage_report(timezone: Option<&str>) -> Result<UsageReport> {
     let events = load_codex_events()?;
     let (daily, unknown_timestamp_events) = summarize_daily(&events, timezone);
+    // by_conversation 行用 session uuid 关联两份本地旁路数据:
+    // - session_index.jsonl 的 thread_name → 人类可读对话名(替代 rollout 路径);
+    // - session-models.jsonl 的真实上游模型 → 替代 Codex 客户端占位名(gpt-5.x)。
+    let mut by_conversation = summarize_by_conversation(&events);
+    let titles = read_session_index_titles();
+    let upstream_models = read_session_upstream_models();
+    if !titles.is_empty() || !upstream_models.is_empty() {
+        for row in &mut by_conversation {
+            if let Some(uuid) = session_uuid_from_group(&row.group) {
+                if let Some(name) = titles.get(&uuid) {
+                    row.display_name = Some(name.clone());
+                }
+                if let Some(model) = upstream_models.get(&uuid) {
+                    row.upstream_model = Some(model.clone());
+                }
+            }
+        }
+    }
     let mut report = UsageReport {
         daily,
         by_model: summarize_by_model(&events),
-        by_conversation: summarize_by_conversation(&events),
+        by_conversation,
         unknown_timestamp_events,
         ..Default::default()
     };
@@ -286,4 +310,236 @@ pub fn load_usage_report(timezone: Option<&str>) -> Result<UsageReport> {
     }
     report.total_conversations = report.by_conversation.len() as u64;
     Ok(report)
+}
+
+/// `session_index.jsonl` 一行(Codex Desktop 写):`id`(uuid)→ `thread_name`(标题)。
+#[derive(serde::Deserialize)]
+struct SessionIndexLine {
+    id: String,
+    #[serde(default)]
+    thread_name: Option<String>,
+}
+
+/// 读各 codex_home 下 `session_index.jsonl`,合并 `{ uuid → thread_name }`。缺文件 /
+/// parse 失败 → 跳过(降级)。借鉴 `conversation_export::list`(本 crate 不依赖它避免
+/// 循环依赖,故就地小实现)。
+fn read_session_index_titles() -> BTreeMap<String, String> {
+    use std::io::{BufRead, BufReader};
+    let mut out = BTreeMap::new();
+    let Ok(dirs) = codex_usage_paths() else {
+        return out;
+    };
+    for sessions_dir in dirs {
+        let Some(home) = sessions_dir.parent() else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(home.join("session_index.jsonl")) else {
+            continue;
+        };
+        for line in BufReader::new(file)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<SessionIndexLine>(trimmed) {
+                if let Some(name) = parsed.thread_name.filter(|s| !s.trim().is_empty()) {
+                    out.insert(parsed.id, name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 从 by_conversation 的 `group`(rollout 相对路径,如
+/// `2026/04/28/rollout-2026-04-28T00-11-10-019dcfb5-7925-7a63-8b9d-d6afcaf9212e`)
+/// 取末尾 session uuid(末 5 个 `-` 分段),用于查 session_index 标题。
+fn session_uuid_from_group(group: &str) -> Option<String> {
+    let file = group.rsplit('/').next().unwrap_or(group);
+    let parts: Vec<&str> = file.split('-').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    Some(parts[parts.len() - 5..].join("-"))
+}
+
+/// `session-models.jsonl` 一行(proxy 写,见 forward.rs):`id`(session uuid)→ `model`(真实上游模型)。
+#[derive(serde::Deserialize)]
+struct SessionModelLine {
+    id: String,
+    model: String,
+}
+
+/// 读 `~/.codex-app-transfer/session-models.jsonl`,返回 `{ session_uuid → 真实上游模型 }`。
+/// 同 id 取**最后一条**(append-only,模型若中途变以最新为准)。缺文件 / parse 失败 → 跳过。
+fn read_session_upstream_models() -> BTreeMap<String, String> {
+    use std::io::{BufRead, BufReader};
+    let mut out = BTreeMap::new();
+    let Some(home) = vendored_ccusage::home::home_dir() else {
+        return out;
+    };
+    let path = home.join(".codex-app-transfer/session-models.jsonl");
+    let Ok(file) = std::fs::File::open(&path) else {
+        return out;
+    };
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(std::result::Result::ok)
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<SessionModelLine>(trimmed) {
+            if !parsed.model.trim().is_empty() {
+                out.insert(parsed.id, parsed.model); // 后写覆盖 → 取最后一条
+            }
+        }
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 单对话逐轮缓存命中(#304)— Usage tab 点击命中率数字弹窗用。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 直方图一根柱:某对话内一段连续轮次(`turn_start..=turn_end`,1-based)的
+/// token 加权缓存命中。命中率 = `cached_input_tokens / input_tokens`(前端算)。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheBucket {
+    pub turn_start: usize,
+    pub turn_end: usize,
+    pub cached_input_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// 把逐轮 `(cached_input, input, output)` 序列分成**至多 `max_buckets` 根柱**:
+/// - 轮数 ≤ max:一轮一柱;
+/// - 轮数 > max:等分成 max 桶,桶大小 `floor(n/max)` 或 `+1`,**余数分给靠后的桶**
+///   (从后往前递加,见 #304);每桶 token 加权(cached / input / output 各自求和)。
+fn bucket_series(points: &[(u64, u64, u64)], max_buckets: usize) -> Vec<CacheBucket> {
+    let n = points.len();
+    if n == 0 || max_buckets == 0 {
+        return Vec::new();
+    }
+    let k = n.min(max_buckets);
+    let base = n / k;
+    let rem = n % k; // 最后 rem 个桶各 +1(余数从后往前递加)
+    let mut out = Vec::with_capacity(k);
+    let mut idx = 0usize;
+    for i in 0..k {
+        let size = base + usize::from(i >= k - rem);
+        let slice = &points[idx..idx + size];
+        out.push(CacheBucket {
+            turn_start: idx + 1,
+            turn_end: idx + size,
+            cached_input_tokens: slice.iter().map(|p| p.0).sum(),
+            input_tokens: slice.iter().map(|p| p.1).sum(),
+            output_tokens: slice.iter().map(|p| p.2).sum(),
+        });
+        idx += size;
+    }
+    out
+}
+
+/// 某对话(`session_id`)逐轮缓存命中,分桶成 ≤10 根柱供前端直方图(#304)。
+/// 按需调用(点击命中率数字时);复用全量解析后按 session 过滤 + 按 timestamp 升序。
+pub fn cache_series_for_conversation(session_id: &str) -> Result<Vec<CacheBucket>> {
+    let mut events: Vec<CodexTokenUsageEvent> = load_codex_events()?
+        .into_iter()
+        .filter(|e| e.session_id == session_id)
+        .collect();
+    // Codex rollout 同 session 内 ts 单调,字符串比较即时序(对照本文件 last_activity)。
+    events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    let points: Vec<(u64, u64, u64)> = events
+        .iter()
+        .map(|e| {
+            (
+                e.cached_input_tokens.min(e.input_tokens),
+                e.input_tokens,
+                e.output_tokens,
+            )
+        })
+        .collect();
+    Ok(bucket_series(&points, 10))
+}
+
+#[cfg(test)]
+mod cache_series_tests {
+    use super::*;
+
+    #[test]
+    fn session_uuid_extracted_from_group_path() {
+        assert_eq!(
+            session_uuid_from_group(
+                "2026/04/28/rollout-2026-04-28T00-11-10-019dcfb5-7925-7a63-8b9d-d6afcaf9212e"
+            )
+            .as_deref(),
+            Some("019dcfb5-7925-7a63-8b9d-d6afcaf9212e")
+        );
+        assert_eq!(session_uuid_from_group("short").as_deref(), None);
+    }
+
+    #[test]
+    fn one_bucket_per_turn_when_le_max() {
+        let pts = vec![(10, 100, 5), (50, 100, 8), (90, 100, 3)];
+        let b = bucket_series(&pts, 10);
+        assert_eq!(b.len(), 3);
+        assert_eq!(
+            b[0],
+            CacheBucket {
+                turn_start: 1,
+                turn_end: 1,
+                cached_input_tokens: 10,
+                input_tokens: 100,
+                output_tokens: 5
+            }
+        );
+        assert_eq!(b[2].turn_start, 3);
+        assert_eq!(b[2].turn_end, 3);
+    }
+
+    #[test]
+    fn even_split_remainder_to_back() {
+        // 23 轮 → 10 桶:base=2, rem=3 → 前 7 桶 size2,后 3 桶 size3
+        let pts: Vec<(u64, u64, u64)> = (0..23).map(|_| (1u64, 2u64, 1u64)).collect();
+        let b = bucket_series(&pts, 10);
+        assert_eq!(b.len(), 10);
+        let sizes: Vec<usize> = b.iter().map(|x| x.turn_end - x.turn_start + 1).collect();
+        assert_eq!(sizes, vec![2, 2, 2, 2, 2, 2, 2, 3, 3, 3]);
+        assert_eq!(b[0].turn_start, 1);
+        assert_eq!(b.last().unwrap().turn_end, 23);
+    }
+
+    #[test]
+    fn token_weighted_within_bucket() {
+        // turn1 0%(0/100)+ turn2 100%(100/100)合并 → 100/200 = 50%
+        let pts = vec![(0, 100, 10), (100, 100, 20)];
+        let b = bucket_series(&pts, 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].cached_input_tokens, 100);
+        assert_eq!(b[0].input_tokens, 200);
+        assert_eq!(b[0].output_tokens, 30);
+    }
+
+    #[test]
+    fn empty_series_no_buckets() {
+        assert!(bucket_series(&[], 10).is_empty());
+    }
+
+    #[test]
+    fn buckets_are_contiguous_and_cover_all() {
+        let pts: Vec<(u64, u64, u64)> = (0..47).map(|i| (i, 100, 0)).collect();
+        let b = bucket_series(&pts, 10);
+        assert_eq!(b[0].turn_start, 1);
+        for w in b.windows(2) {
+            assert_eq!(w[1].turn_start, w[0].turn_end + 1);
+        }
+        assert_eq!(b.last().unwrap().turn_end, 47);
+    }
 }

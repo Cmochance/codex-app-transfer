@@ -154,6 +154,10 @@ pub fn build_app_router(state: AdminState) -> Router {
         )
         // Token usage stats (#279, ccusage-vendored)
         .route("/api/usage/summary", get(handlers::usage::usage_summary))
+        .route(
+            "/api/usage/conversation/cache-series",
+            get(handlers::usage::cache_series),
+        )
         // Proxy lifecycle
         .route("/api/version", get(handlers::common::version))
         .route("/api/proxy/start", post(handlers::proxy::start_proxy))

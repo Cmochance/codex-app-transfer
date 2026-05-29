@@ -47,3 +47,35 @@ pub async fn usage_summary(Query(query): Query<UsageSummaryQuery>) -> impl IntoR
         }
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct CacheSeriesQuery {
+    /// 对话 session_id(= usage report `by_conversation` 行的 `group`)。
+    pub session: String,
+}
+
+/// `GET /api/usage/conversation/cache-series?session=<id>` — 该对话逐轮缓存命中
+/// 分桶(≤10 根柱),供 Usage tab 点击命中率数字弹窗画直方图(#304)。点击才调用。
+pub async fn cache_series(Query(query): Query<CacheSeriesQuery>) -> impl IntoResponse {
+    let session = query.session;
+    match tokio::task::spawn_blocking(move || usage::cache_series_for_conversation(&session)).await
+    {
+        Ok(Ok(buckets)) => Json(buckets).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "cache_series: load failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("load cache series failed: {e}"),
+            )
+            .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "cache_series: spawn_blocking join failed");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cache series task join failed: {e}"),
+            )
+            .into_response()
+        }
+    }
+}

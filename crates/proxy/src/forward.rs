@@ -355,12 +355,19 @@ pub async fn forward_handler(
     telemetry
         .logs
         .add("INFO", format!("forwarding → {upstream_url}"));
-    if let Some(upstream_model) = body_model(&plan.body) {
-        let mapped = resolved_model.as_deref().unwrap_or(&upstream_model);
+    let upstream_model = body_model(&plan.body);
+    if let Some(upstream_model) = &upstream_model {
+        let mapped = resolved_model.as_deref().unwrap_or(upstream_model);
         telemetry
             .logs
             .add("INFO", format!("model: {mapped} → {upstream_model}"));
     }
+    // [#304] 本地记录 session → 真实上游模型,供 Usage 页显示真实模型而非 Codex
+    // 客户端占位名。只落本地 jsonl,**不进 Codex rollout / 不影响对话**;forward-only。
+    // 用 `resolved_model`(rewrite/strip 后、adapter 重定位前的 body model)而非
+    // `upstream_model`(adapter 后的 plan.body):gemini_native 等把 model 挪进 URL 的
+    // adapter,plan.body 已无 model 字段,只有 resolved_model 仍持有真实上游模型。
+    record_session_upstream_model(&parts.headers, resolved_model.as_deref());
 
     // 6/7. 构造 reqwest 请求 + 发送(抽到 `build_and_send_upstream`,
     // transparent retry 复用)。
@@ -877,6 +884,42 @@ fn is_web_search_upstream_reject(body_bytes: &[u8]) -> bool {
         || lower.contains("not activated")
         || lower.contains("disabled");
     mentions_web_search && mentions_not_available
+}
+
+/// [#304] 本地记录 `session_id → 真实上游模型` 到 `~/.codex-app-transfer/session-models.jsonl`。
+/// Codex 入站带 `x-session-id` / `session_id` 头(= rollout session uuid),配上 adapter
+/// 解析后的真实上游模型,Usage 页据此显示真实模型而非客户端占位名(gpt-5.x)。
+///
+/// **只本地落 jsonl,不写 Codex rollout、不改回包,故不进对话 / 不影响对话。**
+/// best-effort:缺 session 头 / 模型 / 写失败均静默跳过,绝不阻塞转发。forward-only(历史
+/// 对话无记录,Usage 页对其仍显示 rollout 里的客户端模型名)。每请求 append 一行,读侧取
+/// 每 session 最后一条;文件增长可后续 compact(followup)。
+fn record_session_upstream_model(headers: &HeaderMap, upstream_model: Option<&str>) {
+    use std::io::Write;
+    let Some(model) = upstream_model.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let session_id = headers
+        .get("x-session-id")
+        .or_else(|| headers.get("session_id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let Some(dir) = codex_app_transfer_registry::config_dir() else {
+        return;
+    };
+    let path = dir.join("session-models.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let line = serde_json::json!({ "id": session_id, "model": model }).to_string();
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 fn log_upstream_error_diag(

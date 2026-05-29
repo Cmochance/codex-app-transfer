@@ -2286,7 +2286,7 @@
   // 数据流: GET /api/usage/summary → 后端 codex-app-transfer-usage-tracker
   // 扫 ~/.codex/sessions/ rollout JSONL,解析层 vendor 自 ryoppippi/ccusage(MIT)。
   let usageCache = null;
-  let usageActiveView = "daily"; // daily | model | conversation
+  let usageActiveView = "conversation"; // conversation | daily | model
 
   function fmtNum(n) {
     if (n === null || n === undefined) return "—";
@@ -2312,6 +2312,107 @@
     el.innerHTML = kpis.map((kpi) => `
       <article class="stat-card"><i class="bi ${kpi.icon}"></i><div><span>${escapeHtml(kpi.label)}</span><strong>${escapeHtml(kpi.value)}</strong></div></article>
     `).join("");
+  }
+
+  // 缓存命中率(#304):整体 hit% = cachedInput / input;input=0 → null(显示 —)
+  function cacheHitPct(row) {
+    const input = row.inputTokens || 0;
+    if (input <= 0) return null;
+    return Math.round(((row.cachedInputTokens || 0) / input) * 100);
+  }
+
+  // 按对话视图把命中率做成可点击(打开逐轮分布弹窗);其余视图纯数字。
+  function cacheHitCell(row, view) {
+    const pct = cacheHitPct(row);
+    const txt = pct == null ? "—" : `${pct}%`;
+    if (view === "conversation" && pct != null && row.group) {
+      return `<td><button type="button" class="usage-cache-hit" data-session="${escapeHtml(row.group)}" title="${escapeHtml(t("usage.cacheModal.title"))}">${escapeHtml(txt)}</button></td>`;
+    }
+    return `<td>${escapeHtml(txt)}</td>`;
+  }
+
+  // 「按对话」首列:显示 Codex 对话名(session_index thread_name)前 5 字,全名 +
+  // rollout 路径放 hover;无名时回退日期(MM/DD)。其余视图原样(日期 / 模型)。
+  function firstColCell(row, view) {
+    if (view !== "conversation") return `<td>${escapeHtml(row.group || "—")}</td>`;
+    const name = (row.displayName || "").trim();
+    let label;
+    if (name) {
+      label = name.length > 5 ? `${name.slice(0, 5)}…` : name;
+    } else {
+      const m = (row.group || "").match(/^\d{4}\/(\d{2})\/(\d{2})\//);
+      label = m ? `${m[1]}/${m[2]}` : "—";
+    }
+    const full = name ? `${name}\n${row.group || ""}` : (row.group || "");
+    return `<td title="${escapeHtml(full)}">${escapeHtml(label)}</td>`;
+  }
+
+  async function openCacheHitModal(session) {
+    const modal = $("#usageCacheModal");
+    const chart = $("#usageCacheChart");
+    const summary = $("#usageCacheModalSummary");
+    if (!modal || !chart) return;
+    if (summary) summary.textContent = session || "";
+    chart.innerHTML = `<div class="usage-cache-loading">${escapeHtml(t("usage.cacheModal.loading"))}</div>`;
+    modal.hidden = false;
+    try {
+      const res = await fetch(`/api/usage/conversation/cache-series?session=${encodeURIComponent(session)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      renderCacheChart(chart, summary, await res.json(), session);
+    } catch (e) {
+      console.warn("cas: load cache series failed", e);
+      chart.innerHTML = `<div class="usage-cache-loading">${escapeHtml(t("usage.loadError"))}: ${escapeHtml(e?.message || String(e))}</div>`;
+    }
+  }
+
+  // ≤10 桶后端已分好;每柱高度 = 该桶 token 加权命中率(cached/input)。
+  function renderCacheChart(chart, summary, buckets, session) {
+    if (!Array.isArray(buckets) || buckets.length === 0) {
+      chart.innerHTML = `<div class="usage-cache-loading">${escapeHtml(t("usage.cacheModal.empty"))}</div>`;
+      if (summary) summary.textContent = session || "";
+      return;
+    }
+    let totCached = 0;
+    let totInput = 0;
+    let totOutput = 0;
+    let maxInput = 0;
+    buckets.forEach((b) => {
+      totCached += b.cachedInputTokens || 0;
+      totInput += b.inputTokens || 0;
+      totOutput += b.outputTokens || 0;
+      maxInput = Math.max(maxInput, b.inputTokens || 0);
+    });
+    const overall = totInput > 0 ? Math.round((100 * totCached) / totInput) : 0;
+    if (summary) {
+      summary.textContent =
+        `${t("usage.cacheModal.overall")}: ${overall}%  ·  ${fmtNum(totCached)} / ${fmtNum(totInput)}` +
+        `  ·  ${t("usage.cacheModal.output")} ${fmtNum(totOutput)}`;
+    }
+    const totalTurns = buckets[buckets.length - 1].turnEnd || 1;
+    const lblHit = t("usage.cacheModal.hitInput");
+    const lblTotal = t("usage.cacheModal.totalInput");
+    const lblOut = t("usage.cacheModal.output");
+    const bars = buckets.map((b) => {
+      const input = b.inputTokens || 0;
+      const cached = b.cachedInputTokens || 0;
+      const output = b.outputTokens || 0;
+      const pct = input > 0 ? Math.round((100 * cached) / input) : 0;
+      // 柱高 = 该桶总输入相对全局最大输入(体现 token 量);柱内命中部分(底部、
+      // 不同色)= cached/input —— 命中包含在总计里。
+      const barH = maxInput > 0 ? Math.round((100 * input) / maxInput) : 0;
+      const posPct = Math.round((100 * b.turnEnd) / totalTurns);
+      const title = `${lblHit}: ${fmtNum(cached)}\n${lblTotal}: ${fmtNum(input)}\n${lblOut}: ${fmtNum(output)}`;
+      return `<div class="ucbar" title="${escapeHtml(title)}">
+        <div class="ucbar-track">
+          <div class="ucbar-total" style="height:${barH}%">
+            <div class="ucbar-hit" style="height:${pct}%"></div>
+          </div>
+        </div>
+        <div class="ucbar-pct">${pct}%</div>
+        <div class="ucbar-x">${posPct}%</div>
+      </div>`;
+    }).join("");
+    chart.innerHTML = `<div class="ucbars">${bars}</div>`;
   }
 
   function renderUsageTable(report, view) {
@@ -2352,6 +2453,7 @@
       <tr>
         <th>${escapeHtml(t(firstColKey))}</th>
         ${modelHeader}
+        <th>${escapeHtml(t("usage.col.cacheHit"))}</th>
         <th>${escapeHtml(t("usage.col.input"))}</th>
         <th>${escapeHtml(t("usage.col.output"))}</th>
         <th>${escapeHtml(t("usage.col.reasoning"))}</th>
@@ -2368,13 +2470,19 @@
     });
 
     body.innerHTML = sorted.map((row) => {
+      // 按对话视图优先显示真实上游模型(proxy 本地记录);无则回退 rollout 客户端模型名。
+      const modelText =
+        view === "conversation" && row.upstreamModel
+          ? row.upstreamModel
+          : (row.models || []).join(", ") || "—";
       const modelCell = showModelsCol
-        ? `<td class="usage-cell-model">${escapeHtml((row.models || []).join(", ") || "—")}</td>`
+        ? `<td class="usage-cell-model">${escapeHtml(modelText)}</td>`
         : "";
       return `
       <tr>
-        <td>${escapeHtml(row.group || "—")}</td>
+        ${firstColCell(row, view)}
         ${modelCell}
+        ${cacheHitCell(row, view)}
         <td>${escapeHtml(fmtNum(row.inputTokens))}</td>
         <td>${escapeHtml(fmtNum(row.outputTokens))}</td>
         <td>${escapeHtml(fmtNum(row.reasoningOutputTokens))}</td>
@@ -2449,6 +2557,16 @@
       usageActiveView = view;
       $all(".usage-view-btn").forEach((b) => b.classList.toggle("active", b.dataset.usageView === view));
       renderUsageTable(usageCache || { daily: [], byModel: [], byConversation: [] }, view);
+      return;
+    }
+    const hitBtn = e.target.closest(".usage-cache-hit");
+    if (hitBtn) {
+      openCacheHitModal(hitBtn.dataset.session);
+      return;
+    }
+    if (e.target.closest('[data-action="usage-cache-modal-close"]') || e.target.id === "usageCacheModal") {
+      const m = $("#usageCacheModal");
+      if (m) m.hidden = true;
       return;
     }
     if (e.target.closest("#usageRefreshBtn")) {
