@@ -540,6 +540,7 @@ fn apply_mcp_portable_store(enabled: bool, reason: &str) -> Value {
                 reason,
                 restored = rep.restored,
                 captured = rep.captured,
+                dropped = rep.dropped,
                 live_written = rep.live_written,
                 mirror_written = rep.mirror_written,
                 skipped = ?rep.skipped,
@@ -571,7 +572,8 @@ fn mcp_credentials_capture_after_switch() {
             Ok(rep) => tracing::info!(
                 captured = rep.captured,
                 restored = rep.restored,
-                "mcp-cred: capture after provider switch"
+                dropped = rep.dropped,
+                "mcp-cred: sync after provider switch"
             ),
             Err(e) => tracing::warn!(error = %e, "mcp-cred: capture after switch failed"),
         }
