@@ -135,6 +135,15 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/desktop/repair-residual",
             post(handlers::desktop::desktop_repair_residual),
         )
+        // MOC-62:MCP 凭据"可移植保险箱"——文件丢失时用户确认恢复 / 忽略。
+        .route(
+            "/api/desktop/mcp-credentials/restore",
+            post(handlers::desktop::mcp_credentials_restore),
+        )
+        .route(
+            "/api/desktop/mcp-credentials/discard",
+            post(handlers::desktop::mcp_credentials_discard),
+        )
         // Conversation export (#271)
         .route(
             "/api/conversations/list",

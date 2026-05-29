@@ -55,6 +55,39 @@
     toast.show();
   }
 
+  // MOC-62:MCP 凭据文件整个丢失但镜像有备份时弹确认。原生 dialog.ask(yes/no):
+  // 确认 → 从备份恢复;否 → 忽略(删镜像,停止再弹,接受"凭据已不在")。
+  // dialog 不可用时退回 window.confirm。
+  async function mcpCredentialsHandleRestorePrompt(count) {
+    let restore;
+    try {
+      const dialog = window.__TAURI__?.dialog;
+      const body = tFmt("mcp.restorePromptBody", { count });
+      if (dialog && typeof dialog.ask === "function") {
+        restore = await dialog.ask(body, {
+          title: t("mcp.restorePromptTitle"),
+          kind: "warning",
+        });
+      } else {
+        restore = window.confirm(`${t("mcp.restorePromptTitle")}\n\n${body}`);
+      }
+    } catch (err) {
+      console.error("mcp restore prompt:", err);
+      return;
+    }
+    try {
+      if (restore) {
+        const r = await CCApi.restoreMcpCredentials();
+        showToast(tFmt("mcp.restoreDone", { count: r?.restored ?? count }));
+      } else {
+        await CCApi.discardMcpCredentialsMirror();
+        showToast(t("mcp.restoreDismissed"));
+      }
+    } catch (err) {
+      showToast(err.message || t("toast.requestFailed"));
+    }
+  }
+
   function showRestartReminder() {
     restartReminderModal?.show();
   }
@@ -7750,6 +7783,13 @@
           if (count > 0) {
             showToast(tFmt("settings.residualScanStartupToast", { count }));
           }
+        });
+        // MOC-62:MCP 凭据文件整个丢失 + 镜像有备份 → 弹确认让用户决定恢复 / 忽略
+        // (登出全部 / 误删 / 换机 同步时无从区分,故不静默复活已撤销的凭据)。
+        await tauriEvent.listen("mcp-credentials-restore-available", async (e) => {
+          const count = Number(e?.payload?.count) || 0;
+          if (count <= 0) return;
+          await mcpCredentialsHandleRestorePrompt(count);
         });
       }
     } catch (err) {

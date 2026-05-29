@@ -495,63 +495,68 @@ pub async fn switch_provider_and_sync(
 }
 
 /// MOC-62:启动时按 `mcpCredentialsPortableStore` 开关(默认开)把 Codex 切到 file
-/// 存储 + 同步 transfer 镜像。**关闭时启动不动** —— 关闭的回退动作只在用户当场切关
-/// 时由 [`mcp_credentials_on_setting_changed`] 跑一次,避免每次启动都去删 key 误伤
-/// 用户手设的 `keyring`。调用点在 `main.rs` 的 post-apply task 末尾(已 await
-/// auto_apply,config.toml 写已落定 → 不与 apply 抢写)。
-pub fn mcp_credentials_startup_sync(reason: &str) -> Value {
+/// 存储 + 同步 transfer 镜像,返回 `restore_available`(live 整文件缺失 + 镜像有 N 条 →
+/// >0 时由 `main.rs` emit 事件让前端弹"从备份恢复?"确认)。**关闭时启动不动** ——
+/// 关闭的回退只在用户当场切关时由 [`mcp_credentials_on_setting_changed`] 跑一次,避免
+/// 每次启动都去删 key 误伤用户手设的 `keyring`。调用点在 `main.rs` 的 post-apply task
+/// 末尾(已 await auto_apply,config.toml 写已落定 → 不与 apply 抢写)。
+pub fn mcp_credentials_startup_sync(reason: &str) -> usize {
     let cfg = match load_registry() {
         Ok(c) => c,
         Err(e) => {
-            return json!({"ok": false, "reason": reason, "message": format!("load_registry: {e}")})
+            tracing::warn!(reason, "mcp-cred: load_registry failed: {e}");
+            return 0;
         }
     };
     if !read_setting_bool(&cfg, "mcpCredentialsPortableStore", true) {
-        return json!({"enabled": false, "reason": reason, "action": "skip"});
+        return 0;
     }
     apply_mcp_portable_store(true, reason)
 }
 
 /// MOC-62:用户在设置页切 `mcpCredentialsPortableStore` 时调用。开→切 file 模式 +
 /// 同步;关→删 config key 回退 Codex 默认(`.credentials.json` **保留**,非破坏)。
-pub fn mcp_credentials_on_setting_changed(enabled: bool) -> Value {
+pub fn mcp_credentials_on_setting_changed(enabled: bool) -> usize {
     apply_mcp_portable_store(enabled, "setting-changed")
 }
 
-fn apply_mcp_portable_store(enabled: bool, reason: &str) -> Value {
+/// 返回 `restore_available`(>0 = live 整文件缺失且镜像有备份,需弹恢复确认);
+/// disabled / error / 无可恢复都返回 0。
+fn apply_mcp_portable_store(enabled: bool, reason: &str) -> usize {
     let paths = match CodexPaths::from_home_env() {
         Ok(p) => p,
-        Err(e) => return json!({"ok": false, "reason": reason, "message": e.to_string()}),
+        Err(e) => {
+            tracing::warn!(error = %e, reason, "mcp-cred: CodexPaths::from_home_env failed");
+            return 0;
+        }
     };
     if let Err(e) = ensure_file_store_mode(&paths, enabled) {
         tracing::warn!(error = %e, reason, enabled, "mcp-cred: ensure_file_store_mode failed");
-        return json!({"ok": false, "enabled": enabled, "reason": reason, "message": e.to_string()});
+        return 0;
     }
     if !enabled {
         tracing::info!(
             reason,
             "mcp-cred: portable store disabled, config key reverted (file kept)"
         );
-        return json!({"ok": true, "enabled": false, "reason": reason, "action": "reverted"});
+        return 0;
     }
     match sync_mcp_credentials(&paths) {
         Ok(rep) => {
             tracing::info!(
                 reason,
-                restored = rep.restored,
                 captured = rep.captured,
                 dropped = rep.dropped,
-                live_written = rep.live_written,
                 mirror_written = rep.mirror_written,
+                restore_available = rep.restore_available,
                 skipped = ?rep.skipped,
                 "mcp-cred: portable store synced"
             );
-            json!({"ok": true, "enabled": true, "reason": reason,
-                   "restored": rep.restored, "captured": rep.captured, "skipped": rep.skipped})
+            rep.restore_available
         }
         Err(e) => {
             tracing::warn!(error = %e, reason, "mcp-cred: sync failed");
-            json!({"ok": false, "enabled": true, "reason": reason, "message": e.to_string()})
+            0
         }
     }
 }
@@ -571,8 +576,8 @@ fn mcp_credentials_capture_after_switch() {
         match sync_mcp_credentials(&paths) {
             Ok(rep) => tracing::info!(
                 captured = rep.captured,
-                restored = rep.restored,
                 dropped = rep.dropped,
+                restore_available = rep.restore_available,
                 "mcp-cred: sync after provider switch"
             ),
             Err(e) => tracing::warn!(error = %e, "mcp-cred: capture after switch failed"),
