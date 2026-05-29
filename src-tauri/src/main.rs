@@ -190,6 +190,11 @@ fn main() {
                         tracing::warn!(error = %e, "residual config scan failed");
                     }
                 }
+                // #MOC-62:复用同一 post-apply task —— 此刻已 await 完 auto_apply 且
+                // residual scan 跑完,config.toml 的 apply 写已落定,这里再同步 MCP
+                // 凭据"可移植保险箱"(file 模式 + 镜像)不会与 apply 抢写 config.toml。
+                // 开关关闭时该调用内部直接 skip。
+                let _ = handlers::desktop::mcp_credentials_startup_sync("startup");
             });
 
             // ── Plugin Unlock 守护进程自动启动 ──

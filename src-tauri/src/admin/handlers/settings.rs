@@ -57,6 +57,7 @@ pub(super) fn default_config_value() -> Value {
            "autoApplyOnStart": true,
            "exposeAllProviderModels": false,
            "restoreCodexOnExit": true,
+           "mcpCredentialsPortableStore": true,
            "autoUnlockCodexPlugins": false,
             "autoWakeCodexPet": true,
            "updateUrl": DEFAULT_UPDATE_URL
@@ -377,6 +378,13 @@ pub async fn get_settings() -> impl IntoResponse {
 
 pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
     let result = with_config_write(|cfg| {
+        // #MOC-62:记下旧值,只在 mcpCredentialsPortableStore 真变了才触发即时生效
+        // (避免改主题等无关 settings 也去写 config.toml)。
+        let old_portable = cfg
+            .get("settings")
+            .and_then(|s| s.get("mcpCredentialsPortableStore"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let s = ensure_settings_object(cfg);
         if let Some(obj) = input.as_object() {
             for (k, v) in obj {
@@ -384,13 +392,24 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             }
         }
         let settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
-        Ok(ConfigMutation::Modified(settings))
+        let new_portable = settings
+            .get("mcpCredentialsPortableStore")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let portable_changed = (new_portable != old_portable).then_some(new_portable);
+        Ok(ConfigMutation::Modified((settings, portable_changed)))
     });
     match result {
-        Ok(settings) => {
+        Ok((settings, portable_changed)) => {
             // #262:settings.language 改动后 hot reload 到 adapters 全局,
             // 让接下来的 prompt 注入跟新语言一致(用户切语言无需重启 transfer)。
             sync_user_language_from_settings(&settings);
+            // #MOC-62:开关当场变更即时生效 —— 开→切 Codex file 模式 + 同步镜像;
+            // 关→删 config key 回退默认(`.credentials.json` 保留,非破坏)。
+            if let Some(enabled) = portable_changed {
+                let _ =
+                    crate::admin::handlers::desktop::mcp_credentials_on_setting_changed(enabled);
+            }
             Json(json!({"success": true, "settings": settings})).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

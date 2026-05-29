@@ -22,6 +22,19 @@ pub struct CodexPaths {
     /// (e.g. 圆环默认显示),避免新 user / 升级 reset 后看不到关键 UI。运行时改
     /// 会被 Codex 内存 atom 覆盖,所以必须先于 Codex 启动。
     pub electron_global_state: PathBuf,
+    /// Codex MCP OAuth 凭据的 file-store 落点(`~/.codex/.credentials.json`)。
+    ///
+    /// 当 `mcp_oauth_credentials_store = "file"` 时,Codex 把每个 MCP server 的
+    /// OAuth token 写进这个单一 JSON blob(`server_name|hash` → entry,0o600)。
+    /// 默认 `Auto`/`Keyring` 模式下凭据在 OS 钥匙串,此文件不存在。MOC-62 的
+    /// "可移植保险箱"开关开启时强制 file 模式 + 镜像此文件。
+    pub mcp_credentials: PathBuf,
+    /// transfer 为 MCP 凭据维护的镜像(`~/.codex-app-transfer/mcp-credentials.json`)。
+    ///
+    /// 在 `~/.codex` 之外,所以 `codex switch` 的 `rsync --delete` / 误删 / 换机
+    /// 都碰不到它。启动 + apply 后与 [`Self::mcp_credentials`] 并集合并(缺失则
+    /// 恢复、存在则捕获),使 MCP 授权可恢复、可迁移。MOC-62。
+    pub mcp_credentials_mirror: PathBuf,
     /// Legacy single-snapshot path kept for upgrade compatibility.
     pub snapshot_dir: PathBuf,
     pub snapshot_config: PathBuf,
@@ -73,6 +86,8 @@ impl CodexPaths {
             auth_json: codex_home.join("auth.json"),
             model_catalog_json: app_home.join("config.json"),
             electron_global_state: codex_home.join(".codex-global-state.json"),
+            mcp_credentials: codex_home.join(".credentials.json"),
+            mcp_credentials_mirror: app_home.join("mcp-credentials.json"),
             snapshot_config: snapshot_dir.join("config.toml"),
             snapshot_auth: snapshot_dir.join("auth.json"),
             snapshot_manifest: snapshot_dir.join("manifest.json"),
@@ -131,6 +146,14 @@ mod tests {
         assert_eq!(
             p.electron_global_state,
             PathBuf::from("/x/.codex/.codex-global-state.json")
+        );
+        assert_eq!(
+            p.mcp_credentials,
+            PathBuf::from("/x/.codex/.credentials.json")
+        );
+        assert_eq!(
+            p.mcp_credentials_mirror,
+            PathBuf::from("/x/.codex-app-transfer/mcp-credentials.json")
         );
         assert_eq!(
             p.snapshot_dir,

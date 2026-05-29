@@ -11,12 +11,18 @@
 //!   在我们运行期间手动加的内容
 //! - [`snapshot_codex_state`]:首次 apply 前自动调一次,把原状态打包到
 //!   `~/.codex-app-transfer/codex-snapshots/active/<session>/`
+//! - [`ensure_file_store_mode`]:向 `~/.codex/config.toml` 写 / 删
+//!   `mcp_oauth_credentials_store = "file"`,切换 Codex MCP OAuth 凭据存储模式
+//!   (MOC-62 可移植保险箱开关)
+//! - [`sync_mcp_credentials`]:把 `~/.codex/.credentials.json` 与
+//!   `~/.codex-app-transfer/mcp-credentials.json` 镜像做并集合并(MOC-62)
 //!
 //! 路径解析全部走 [`CodexPaths`],测试可注入临时目录。
 
 pub mod apply;
 pub mod auth;
 pub mod electron_state;
+pub mod mcp_credentials;
 pub mod model_catalog;
 pub mod paths;
 pub mod residual;
@@ -27,6 +33,7 @@ pub use apply::{
     apply_provider, restore_codex_snapshot, restore_codex_state, ApplyConfig, ApplyResult,
 };
 pub use auth::{read_auth, write_auth};
+pub use mcp_credentials::{ensure_file_store_mode, sync_mcp_credentials, SyncReport};
 pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, upsert_catalog_models};
 pub use paths::CodexPaths;
 pub use residual::{

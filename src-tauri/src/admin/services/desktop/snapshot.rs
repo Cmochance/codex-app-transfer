@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_app_transfer_codex_integration::{
-    apply_provider, catalog_models_for_provider, get_snapshot_status, has_snapshot, list_snapshots,
-    read_auth, restore_codex_snapshot, restore_codex_state, ApplyConfig, CodexPaths,
+    apply_provider, catalog_models_for_provider, ensure_file_store_mode, get_snapshot_status,
+    has_snapshot, list_snapshots, read_auth, restore_codex_snapshot, restore_codex_state,
+    sync_mcp_credentials, ApplyConfig, CodexPaths,
 };
 use codex_app_transfer_proxy::proxy_telemetry;
 use codex_app_transfer_registry::RawConfig;
@@ -483,11 +484,98 @@ pub async fn switch_provider_and_sync(
     }
     let state = AdminState { proxy_manager };
     let desktop_sync = sync_desktop_for_active_provider(&state).await;
+    // MOC-62:切换后做一次 MCP 凭据并集同步(capture 新授权 + 必要时 restore;
+    // 只动两个凭据文件,不碰 config.toml)。
+    mcp_credentials_capture_after_switch();
     json!({
         "success": true,
         "message": "default provider updated",
         "desktopSync": desktop_sync,
     })
+}
+
+/// MOC-62:启动时按 `mcpCredentialsPortableStore` 开关(默认开)把 Codex 切到 file
+/// 存储 + 同步 transfer 镜像。**关闭时启动不动** —— 关闭的回退动作只在用户当场切关
+/// 时由 [`mcp_credentials_on_setting_changed`] 跑一次,避免每次启动都去删 key 误伤
+/// 用户手设的 `keyring`。调用点在 `main.rs` 的 post-apply task 末尾(已 await
+/// auto_apply,config.toml 写已落定 → 不与 apply 抢写)。
+pub fn mcp_credentials_startup_sync(reason: &str) -> Value {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(e) => {
+            return json!({"ok": false, "reason": reason, "message": format!("load_registry: {e}")})
+        }
+    };
+    if !read_setting_bool(&cfg, "mcpCredentialsPortableStore", true) {
+        return json!({"enabled": false, "reason": reason, "action": "skip"});
+    }
+    apply_mcp_portable_store(true, reason)
+}
+
+/// MOC-62:用户在设置页切 `mcpCredentialsPortableStore` 时调用。开→切 file 模式 +
+/// 同步;关→删 config key 回退 Codex 默认(`.credentials.json` **保留**,非破坏)。
+pub fn mcp_credentials_on_setting_changed(enabled: bool) -> Value {
+    apply_mcp_portable_store(enabled, "setting-changed")
+}
+
+fn apply_mcp_portable_store(enabled: bool, reason: &str) -> Value {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return json!({"ok": false, "reason": reason, "message": e.to_string()}),
+    };
+    if let Err(e) = ensure_file_store_mode(&paths, enabled) {
+        tracing::warn!(error = %e, reason, enabled, "mcp-cred: ensure_file_store_mode failed");
+        return json!({"ok": false, "enabled": enabled, "reason": reason, "message": e.to_string()});
+    }
+    if !enabled {
+        tracing::info!(
+            reason,
+            "mcp-cred: portable store disabled, config key reverted (file kept)"
+        );
+        return json!({"ok": true, "enabled": false, "reason": reason, "action": "reverted"});
+    }
+    match sync_mcp_credentials(&paths) {
+        Ok(rep) => {
+            tracing::info!(
+                reason,
+                restored = rep.restored,
+                captured = rep.captured,
+                live_written = rep.live_written,
+                mirror_written = rep.mirror_written,
+                skipped = ?rep.skipped,
+                "mcp-cred: portable store synced"
+            );
+            json!({"ok": true, "enabled": true, "reason": reason,
+                   "restored": rep.restored, "captured": rep.captured, "skipped": rep.skipped})
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, reason, "mcp-cred: sync failed");
+            json!({"ok": false, "enabled": true, "reason": reason, "message": e.to_string()})
+        }
+    }
+}
+
+/// MOC-62:provider 交互式切换后做一次 MCP 凭据并集同步(仅开关开时)。本质是完整的
+/// `sync_mcp_credentials`(capture 新授权进镜像 + 必要时从镜像 restore 回 live),只动
+/// 两个凭据文件、**不碰 config.toml**。缩短"新授权还没进镜像就被外部擦掉"的窗口。
+fn mcp_credentials_capture_after_switch() {
+    let cfg = match load_registry() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if !read_setting_bool(&cfg, "mcpCredentialsPortableStore", true) {
+        return;
+    }
+    if let Ok(paths) = CodexPaths::from_home_env() {
+        match sync_mcp_credentials(&paths) {
+            Ok(rep) => tracing::info!(
+                captured = rep.captured,
+                restored = rep.restored,
+                "mcp-cred: capture after provider switch"
+            ),
+            Err(e) => tracing::warn!(error = %e, "mcp-cred: capture after switch failed"),
+        }
+    }
 }
 
 #[cfg(test)]

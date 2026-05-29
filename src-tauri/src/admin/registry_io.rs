@@ -23,6 +23,7 @@ pub fn load() -> Result<RawConfig, String> {
                 "autoApplyOnStart": true,
                 "exposeAllProviderModels": false,
                 "restoreCodexOnExit": true,
+                "mcpCredentialsPortableStore": true,
                 "updateUrl": DEFAULT_UPDATE_URL
             }
         }));
