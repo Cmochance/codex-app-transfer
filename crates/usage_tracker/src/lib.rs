@@ -378,10 +378,10 @@ struct SessionModelLine {
 fn read_session_upstream_models() -> BTreeMap<String, String> {
     use std::io::{BufRead, BufReader};
     let mut out = BTreeMap::new();
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home) = vendored_ccusage::home::home_dir() else {
         return out;
     };
-    let path = std::path::Path::new(&home).join(".codex-app-transfer/session-models.jsonl");
+    let path = home.join(".codex-app-transfer/session-models.jsonl");
     let Ok(file) = std::fs::File::open(&path) else {
         return out;
     };

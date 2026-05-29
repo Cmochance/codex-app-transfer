@@ -364,7 +364,10 @@ pub async fn forward_handler(
     }
     // [#304] 本地记录 session → 真实上游模型,供 Usage 页显示真实模型而非 Codex
     // 客户端占位名。只落本地 jsonl,**不进 Codex rollout / 不影响对话**;forward-only。
-    record_session_upstream_model(&parts.headers, upstream_model.as_deref());
+    // 用 `resolved_model`(rewrite/strip 后、adapter 重定位前的 body model)而非
+    // `upstream_model`(adapter 后的 plan.body):gemini_native 等把 model 挪进 URL 的
+    // adapter,plan.body 已无 model 字段,只有 resolved_model 仍持有真实上游模型。
+    record_session_upstream_model(&parts.headers, resolved_model.as_deref());
 
     // 6/7. 构造 reqwest 请求 + 发送(抽到 `build_and_send_upstream`,
     // transparent retry 复用)。
@@ -905,10 +908,10 @@ fn record_session_upstream_model(headers: &HeaderMap, upstream_model: Option<&st
     let Some(session_id) = session_id else {
         return;
     };
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(dir) = codex_app_transfer_registry::config_dir() else {
         return;
     };
-    let path = std::path::Path::new(&home).join(".codex-app-transfer/session-models.jsonl");
+    let path = dir.join("session-models.jsonl");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
