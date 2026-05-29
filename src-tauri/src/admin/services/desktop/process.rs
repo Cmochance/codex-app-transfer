@@ -426,6 +426,28 @@ fn should_attach_debug_port() -> Vec<String> {
                 "[PluginUnlock] 9222 occupied, falling back to OS-assigned port"
             );
         }
+        // MOC-73 / 反馈 fb-09ef05c2:Win 上点"重启 Codex"后主题不自动应用,要手动
+        // 进 Theme 页点一下才生效 —— 原因是"重启后自动注入主题"过去只在 macOS 分支
+        // (DevToolsActivePort resolved 后)调,Win/Linux 分支只 store 端口就 return。
+        // 这里补上跨平台 auto-apply:Win/Linux 没有 DevToolsActivePort 这种"Codex 已
+        // 就绪"信号(端口是启动前 try_bind 预检的),所以先等一个 grace 窗口让 Codex
+        // 冷启动 + bind CDP,再调 auto_apply_theme_on_startup(其内部还有
+        // 500/1000/1500ms 三次 retry)。失败只 warn 退场、退回原有"进 Theme 页"前端
+        // 兜底,不变更现状(非破坏性),所以即使端口预检 race / MSIX 没透传也只是
+        // 多一次无害尝试。仅在 theme toggle 开启时 spawn(只开 plugin_unlock 不需要)。
+        //
+        // ⚠️ 待 Windows 真机验证(MOC-73):① MSIX COM activation 是否真把
+        //    `--remote-debugging-port` 透传给 Codex(explorer.exe fallback 路径会丢参);
+        //    ② try_bind 预检端口与 Codex 实际监听端口是否一致。验证前开启此尝试是
+        //    安全的,但"能否真正生效"取决于上述两点;若实测无效,需改走类似 macOS 的
+        //    端口探测(Win 无 DevToolsActivePort,可能要别的就绪信号)。
+        if theme_enabled {
+            tokio::spawn(async {
+                // Codex Desktop 冷启动较慢(尤其 Windows MSIX),给 ~2s grace 再尝试。
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+                auto_apply_theme_on_startup().await;
+            });
+        }
         return vec![
             format!("--remote-debugging-port={port}"),
             "--remote-allow-origins=*".into(),
@@ -468,7 +490,9 @@ async fn wait_for_devtools_port(timeout: Duration) -> Option<u16> {
 /// settings 就自动 apply 已选主题(#264)。Codex 主 page 可能还在 mount,
 /// 用 3 次 retry(delay 500ms / 1000ms / 1500ms)cover 慢启动场景;3 次仍失败 warn 退场,
 /// 不打扰 user(主题没 apply 不影响 Codex 正常用)。
-#[cfg(target_os = "macos")]
+///
+/// **跨平台**(MOC-73):macOS 在 DevToolsActivePort resolved 后调;Windows / Linux
+/// 没有该信号,由 [`should_attach_debug_port`] 的非 macOS 分支在固定 grace 窗口后调。
 async fn auto_apply_theme_on_startup() {
     let theme_id = match read_theme_settings() {
         Some(id) => id,
@@ -509,7 +533,6 @@ async fn auto_apply_theme_on_startup() {
 /// parsing — 后者已经过滤了 `THEME_IDS` allowlist + custom-exists 检查,这里
 /// 单独复写会 drift(typo'd / corrupted codexUiTheme 会绕过校验,产生 3 次
 /// retry warning 无果)。
-#[cfg(target_os = "macos")]
 fn read_theme_settings() -> Option<String> {
     let cfg = crate::admin::registry_io::load().ok()?;
     let s = crate::codex_theme_injector::read_settings(cfg.get("settings")?);
