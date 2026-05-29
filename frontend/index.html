@@ -487,6 +487,13 @@
               <p class="settings-note" id="codexSnapshotStatus" data-i18n="settings.codexSnapshotStatusUnknown">正在读取快照状态…</p>
             </div>
           </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.mcpCredentialsPortableStore">MCP 授权可移植保险箱</strong>
+            <div>
+              <label class="switch-label only-switch"><input type="checkbox" id="mcpCredentialsPortableStore" checked><span class="switch-ui"></span></label>
+              <p class="settings-note" data-i18n="settings.mcpCredentialsPortableStoreHint">开启后把 Codex 的 MCP 授权改存为可移植文件(~/.codex/.credentials.json),并由本应用在 ~/.codex 之外维护一份镜像;即使切账号 / 误删 / 换机把授权清掉,也能自动恢复。注意:授权 token 将明文存盘(权限 0o600,与其它 CLI agent 一致);此功能不解决授权自然过期(过期仍需重新授权)。</p>
+            </div>
+          </div>
           <div class="settings-row settings-row-stack" id="residualScanRow">
             <strong data-i18n="settings.residualScanTitle">Codex 原配置完整性检查</strong>
             <div>

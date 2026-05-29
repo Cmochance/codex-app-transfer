@@ -2111,6 +2111,7 @@
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
+    $("#mcpCredentialsPortableStore").checked = settings.mcpCredentialsPortableStore !== false;
     $("#codexNetworkAccess").checked = settings.codexNetworkAccess !== false;
     $("#codexStatusSectionDefaultVisible").checked = settings.codexStatusSectionDefaultVisible !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
@@ -2644,6 +2645,7 @@
       autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
+      mcpCredentialsPortableStore: $("#mcpCredentialsPortableStore")?.checked !== false,
       codexNetworkAccess: $("#codexNetworkAccess")?.checked !== false,
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
@@ -7649,6 +7651,7 @@
     $("#autoApplyOnStart")?.addEventListener("change", saveSettingsFromForm);
    $("#autoUnlockCodexPlugins")?.addEventListener("change", saveSettingsFromForm);
     $("#autoWakeCodexPet")?.addEventListener("change", saveSettingsFromForm);
+    $("#mcpCredentialsPortableStore")?.addEventListener("change", saveSettingsFromForm);
 
    // Plugin Unlock 按钮事件
     $("[data-action=plugin-unlock-start]")?.addEventListener("click", async () => {
