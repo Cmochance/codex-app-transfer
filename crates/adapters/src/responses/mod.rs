@@ -18,6 +18,8 @@ pub mod tool_call_cache;
 
 pub use artifact_store::{global_tool_artifact_store, ToolArtifactStore};
 pub use converter::ChatToResponsesConverter;
+// [MOC-75] gemini_native 复用 chat 的 apply_patch input 解析(alt-key 容错一致)
+pub(crate) use converter::extract_apply_patch_input;
 pub use request::{
     responses_body_to_chat_body, responses_body_to_chat_body_for_provider,
     responses_body_to_chat_body_for_provider_with_session,

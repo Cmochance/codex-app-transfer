@@ -33,6 +33,10 @@ use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
 use crate::core::input::response_id_for_session;
+use crate::responses::request::tools::{
+    APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT, APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT,
+    APPLY_PATCH_TOOL_NAME,
+};
 use crate::responses::ResponseSessionCache;
 use crate::types::{AdapterError, ResponseSessionPlan};
 
@@ -667,17 +671,48 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                 out.push(Value::Object(m));
             }
             "custom" => {
-                // Codex.app 私有 custom tool — 当 function declaration 处理
+                // Codex.app custom freeform tool(Responses API freeform,无 JSON
+                // schema —— apply_patch 的 patch 是纯文本、靠 lark grammar 约束)。
+                // Gemini functionDeclaration 只认 structured parameters;直接透传
+                // custom(它本就无 `parameters`)会让 Gemini 不知道 patch 该放哪个
+                // arg → 给空 args → Codex 执行 apply_patch 拿不到内容 → aborted
+                // (MOC-75 实证:6 次 apply_patch 全 `arguments={}` → `aborted`)。
+                //
+                // 对齐 chat 路径 `responses/request/tools.rs:221 "custom"=>`:降级成
+                // 接受单 `input` string 的 function,并把 lark grammar 语义改写进
+                // 强化 description(grammar 没了,只能靠 description 教模型怎么填
+                // patch)。响应侧 `response.rs` 再把 Gemini 回来的 functionCall 重打
+                // 包成 `custom_tool_call` wire(否则 Codex CLI router 收 Function
+                // payload 仍 abort,见 converter.rs::close_tool_call 注释)。
+                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let original_description = obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let (tool_description, input_description) = if name == APPLY_PATCH_TOOL_NAME {
+                    (
+                        APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT.to_owned(),
+                        APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT.to_owned(),
+                    )
+                } else {
+                    (
+                        original_description.to_owned(),
+                        "Free-form input passed verbatim to the tool.".to_owned(),
+                    )
+                };
                 let mut func = Map::new();
-                if let Some(n) = obj.get("name") {
-                    func.insert("name".into(), n.clone());
-                }
-                if let Some(d) = obj.get("description") {
-                    func.insert("description".into(), d.clone());
-                }
-                if let Some(p) = obj.get("parameters") {
-                    func.insert("parameters".into(), p.clone());
-                }
+                func.insert("name".into(), Value::String(name.to_owned()));
+                func.insert("description".into(), Value::String(tool_description));
+                func.insert(
+                    "parameters".into(),
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "input": { "type": "string", "description": input_description }
+                        },
+                        "required": ["input"],
+                    }),
+                );
                 let mut wrapper = Map::new();
                 wrapper.insert("type".into(), Value::String("function".into()));
                 wrapper.insert("function".into(), Value::Object(func));
@@ -2337,6 +2372,67 @@ mod tests {
         assert!(names.contains(&"notion_search"));
         assert!(names.contains(&"notion_create_pages"));
         assert_eq!(names.len(), 3);
+    }
+
+    // [MOC-75] apply_patch 是 custom freeform tool(无 parameters),转 Gemini 必须补
+    // `input` 参数 + 强化 description,否则 Gemini 不知道 patch 放哪 → 空 args → aborted。
+    #[test]
+    fn custom_apply_patch_tool_gets_input_parameter_and_rewritten_description() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"edit a file"}],
+            "tools": [
+                {"type":"custom","name":"apply_patch",
+                 "description":"Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+                 "format":{"type":"grammar","syntax":"lark","definition":"start: begin_patch"}}
+            ]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let f = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "apply_patch")
+            .expect("apply_patch tool 必须保留");
+        let func = &f["function"];
+        // 关键修复:补了 input string 参数(原 custom 透传会整个丢 parameters → 空 args → aborted)
+        assert_eq!(func["parameters"]["properties"]["input"]["type"], "string");
+        assert_eq!(func["parameters"]["required"], serde_json::json!(["input"]));
+        // description 强化:替换掉对 chat/gemini 路径误导的 "do not wrap in JSON"
+        let desc = func["description"].as_str().unwrap();
+        assert!(
+            !desc.contains("do not wrap the patch in JSON"),
+            "误导 description 应被替换为 chat/gemini 路径准确指引,实际: {desc}"
+        );
+        // 正向:description 教了 V4A patch 格式(*** 文件操作头),防 description 常量退化
+        assert!(
+            desc.contains("***"),
+            "强化 description 应含 V4A patch 格式指引(*** ...),实际: {desc}"
+        );
+    }
+
+    // [MOC-75 review C8] 非 apply_patch 的 custom freeform tool:同样降级成接受
+    // input 的 function,但 description 原样透传(不被 apply_patch 强化 description 污染)。
+    #[test]
+    fn non_apply_patch_custom_tool_keeps_own_description_with_generic_input() {
+        let body = serde_json::json!({
+            "input": [{"type":"message","role":"user","content":"x"}],
+            "tools": [{"type":"custom","name":"free_text_tool","description":"my own custom tool"}]
+        });
+        let chat = responses_body_to_normalized_chat(&body).unwrap();
+        let func = &chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "free_text_tool")
+            .expect("custom tool 必须保留")["function"];
+        // 原 description 原样透传,不被 apply_patch 强化描述污染
+        assert_eq!(func["description"], "my own custom tool");
+        // 仍补 input 参数(所有 custom freeform 都降级成接受 input 的 function)
+        assert_eq!(func["parameters"]["properties"]["input"]["type"], "string");
+        assert!(func["parameters"]["properties"]["input"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("verbatim"));
     }
 
     /// 空 namespace `tools: []` silently dropped(对齐

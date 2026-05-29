@@ -53,6 +53,7 @@ use serde_json::{json, Value};
 
 use crate::core::events::{build_tool_namespace_map, emit_sse_event as emit_event};
 use crate::responses::global_response_session_cache;
+use crate::responses::request::tools::APPLY_PATCH_TOOL_NAME;
 use crate::types::{ByteStream, ResponseSessionPlan};
 
 use super::grounding::convert_grounding_metadata_to_annotations;
@@ -141,6 +142,11 @@ struct ClosedFunctionCall {
     /// `Some("mcp__<server>__")` 当 function.name 来自 namespace 包装。
     /// envelope output[] emit 时回灌成 item.namespace 字段。
     namespace: Option<String>,
+    /// [MOC-75] `Some(patch)` 当 name==apply_patch:envelope output[] 要 emit 成
+    /// `custom_tool_call` item(`input`=patch),而非 function_call —— Codex CLI
+    /// router 对 apply_patch 硬要求 `ToolPayload::Custom{input}`,收 Function
+    /// payload 直接 abort(见 responses/converter.rs::close_tool_call 注释)。
+    apply_patch_input: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -909,15 +915,28 @@ impl GeminiToResponsesConverter {
         all_items.extend(self.closed_reasonings.drain(..));
         all_items.extend(self.closed_other_items.drain(..));
         for fc in self.closed_function_calls.drain(..) {
-            let mut item = json!({
-                "type": "function_call",
-                "id": fc.item_id,
-                "call_id": fc.call_id,
-                "name": fc.name,
-                "arguments": fc.arguments_json_str,
-                "status": "completed",
-            });
-            // namespace 字段(Codex.app dispatch MCP server 必填)
+            // [MOC-75] apply_patch 的 envelope item 也必须是 custom_tool_call(input=
+            // patch),跟流式 wire 一致 —— 否则严格客户端读 envelope 终态会当成
+            // function_call → Codex router abort。其余工具仍走 function_call。
+            let mut item = match &fc.apply_patch_input {
+                Some(input) => json!({
+                    "type": "custom_tool_call",
+                    "id": fc.item_id.clone(),
+                    "call_id": fc.call_id.clone(),
+                    "name": fc.name.clone(),
+                    "input": input,
+                    "status": "completed",
+                }),
+                None => json!({
+                    "type": "function_call",
+                    "id": fc.item_id.clone(),
+                    "call_id": fc.call_id.clone(),
+                    "name": fc.name.clone(),
+                    "arguments": fc.arguments_json_str.clone(),
+                    "status": "completed",
+                }),
+            };
+            // namespace 字段(Codex.app dispatch MCP server 必填;apply_patch 无 namespace)
             if let Some(ns) = fc.namespace.as_ref() {
                 item["namespace"] = Value::String(ns.clone());
             }
@@ -1289,6 +1308,107 @@ impl GeminiToResponsesConverter {
             }
         };
 
+        // [MOC-75] apply_patch:Codex freeform custom tool,Codex CLI router 硬要求
+        // `custom_tool_call` wire(ToolPayload::Custom{input}),收 function_call 的
+        // Function payload 直接 abort。请求侧已把它降级成带 `input` 的 function,
+        // Gemini 回来的 args 形如 {"input":"*** Begin Patch..."}。这里解出 input、
+        // 一次性重打包成 custom_tool_call wire(对齐 chat responses/converter.rs::
+        // close_tool_call;Gemini 不增量,无 interrupted 半截风险,故不走 incomplete)。
+        if name == APPLY_PATCH_TOOL_NAME {
+            let input = crate::responses::extract_apply_patch_input(&args_json_str);
+            // [MOC-75 review] Gemini 没按 `input` 填(空 args / 填错 key / 裸串)时,
+            // extract 会原样回吐非 V4A 串,下面照样 emit status=completed →
+            // Codex `parse_patch` 失败 → aborted。这里在 gemini 层显式 warn 带 model
+            // 上下文(对齐 chat converter.rs:866-871),否则排障看不到是哪个 Gemini
+            // 模型 misbehave、会误以为 MOC-75 没修好。判据用 `*** Begin Patch` 而非
+            // is_empty(),能同时抓住 `{}` / 错 key / 裸串三种畸形。
+            if !input.contains("*** Begin Patch") {
+                tracing::warn!(
+                    target: "adapters::gemini::apply_patch",
+                    call_id = %call_id,
+                    model = %self.model,
+                    args_preview = %args_json_str.chars().take(120).collect::<String>(),
+                    "Gemini apply_patch 回包不含 V4A 信封(没按 `input` 填 / 填错 key);\
+                     原样透传给 Codex,parse_patch 将失败 — 排查该 Gemini 模型 misbehave",
+                );
+            }
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "custom_tool_call",
+                        "id": item_id.clone(),
+                        "call_id": call_id.clone(),
+                        "name": name,
+                        "input": "",
+                        "status": "in_progress",
+                    },
+                }),
+            );
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.custom_tool_call_input.delta",
+                json!({
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": item_id.clone(),
+                    "output_index": output_index,
+                    "call_id": call_id.clone(),
+                    "delta": input.clone(),
+                }),
+            );
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.custom_tool_call_input.done",
+                json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": item_id.clone(),
+                    "output_index": output_index,
+                    "call_id": call_id.clone(),
+                    "input": input.clone(),
+                }),
+            );
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "custom_tool_call",
+                        "id": item_id.clone(),
+                        "call_id": call_id.clone(),
+                        "name": name,
+                        "input": input.clone(),
+                        "status": "completed",
+                    },
+                }),
+            );
+            crate::responses::global_tool_call_cache().save(
+                &call_id,
+                crate::responses::ToolCallEntry {
+                    name: name.to_owned(),
+                    arguments: args_json_str.clone(),
+                },
+            );
+            self.closed_function_calls.push(ClosedFunctionCall {
+                item_id,
+                output_index,
+                call_id,
+                name: name.to_owned(),
+                arguments_json_str: args_json_str,
+                namespace: None,
+                apply_patch_input: Some(input),
+            });
+            return;
+        }
+
         // **MCP namespace 字段**:如 function.name 来自 namespace 包装(从
         // `tool_namespace_map` 反查表查到),给 output_item.added / .done /
         // envelope item 全部加 `namespace: "mcp__<server>__"` —— Codex.app
@@ -1371,6 +1491,7 @@ impl GeminiToResponsesConverter {
             name: name.to_owned(),
             arguments_json_str: args_json_str,
             namespace: namespace_for,
+            apply_patch_input: None,
         });
     }
 
@@ -1909,6 +2030,87 @@ mod tests {
         let args: Value = serde_json::from_str(args_str).unwrap();
         assert_eq!(args["q"], "weather");
         assert!(fc["call_id"].as_str().unwrap().starts_with("call_"));
+    }
+
+    // [MOC-75] apply_patch 必须重打包成 custom_tool_call wire(Codex CLI router
+    // 硬要求),且 input 必须是完整 patch 文本 —— 修复前 args 空 → aborted。
+    #[test]
+    fn apply_patch_function_call_rewritten_to_custom_tool_call_with_input() {
+        // 请求侧已给 apply_patch 补了 `input` 参数,Gemini 回来的 args={"input": patch}
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        // 必走 custom_tool_call wire,**不**走 function_call_arguments wire
+        assert!(
+            names.contains(&"response.custom_tool_call_input.delta".into()),
+            "events: {names:?}"
+        );
+        assert!(names.contains(&"response.custom_tool_call_input.done".into()));
+        assert!(
+            !names.contains(&"response.function_call_arguments.delta".into()),
+            "apply_patch 不该走 function_call wire(否则 Codex router abort)"
+        );
+        // output_item.added item.type == custom_tool_call
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.output_item.added")
+            .unwrap();
+        assert_eq!(added.1["item"]["type"], "custom_tool_call");
+        // completed envelope output[] 是 custom_tool_call + input 完整(根因修复点)
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(item["type"], "custom_tool_call");
+        let input = item["input"].as_str().unwrap();
+        assert!(
+            input.contains("*** Begin Patch") && input.contains("+hello"),
+            "input 必须是完整 patch 文本(非空),实际: {input:?}"
+        );
+    }
+
+    // [MOC-75 review C7] Gemini 没按 `input` 填(原 bug 形态 args={}):仍走
+    // custom_tool_call wire(不 panic、不回落 function_call),input 无 V4A 信封
+    // (warn 已在主路径记;Codex parse_patch 会 surface 真错,非破坏性)。
+    #[test]
+    fn apply_patch_empty_args_still_emits_custom_tool_call_wire() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        // 仍走 custom_tool_call wire(不回落 function_call → 不会被 router 当 Function abort)
+        assert!(
+            names.contains(&"response.custom_tool_call_input.done".into()),
+            "空 args 也必须走 custom_tool_call wire,events: {names:?}"
+        );
+        assert!(!names.contains(&"response.function_call_arguments.delta".into()));
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(item["type"], "custom_tool_call");
+        // 空 args → input 无 V4A 信封(确认没把 "{}" 当成有效 patch)
+        assert!(!item["input"].as_str().unwrap().contains("*** Begin Patch"));
     }
 
     #[test]

@@ -1796,7 +1796,7 @@ fn emit_event(out: &mut Vec<u8>, seq: &mut u64, event_name: &str, payload: Value
 /// 取到候选后过 [`repair_v4a_envelope`] 规整信封(剥 markdown fence / Begin 前
 /// End 后的杂散行)。取不到候选(截断 / 非 V4A 垃圾)则**原样透传**,交给 Codex
 /// CLI `parse_patch` 暴露真坏 —— 绝不静默吞、不截断正文。不做 V4A 语法校验。
-fn extract_apply_patch_input(args_acc: &str) -> String {
+pub(crate) fn extract_apply_patch_input(args_acc: &str) -> String {
     let trimmed = args_acc.trim();
     if trimmed.is_empty() {
         return String::new();
