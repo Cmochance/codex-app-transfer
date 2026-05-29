@@ -75,6 +75,13 @@ pub struct AntigravityModelEntry {
     pub context_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u64>,
+    /// 上游 `recommended` 字段 —— 官方 Antigravity IDE 下拉**只列 `recommended:true`**
+    /// 的款(MOC-69 实证)。前端据此置顶/标记推荐款。seed / 上游缺字段时 default false。
+    #[serde(default)]
+    pub recommended: bool,
+    /// 上游 `tagTitle`(如 "Fast" / "New")—— IDE 在模型名旁显示的小标签。无则 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_title: Option<String>,
 }
 
 /// 拉取 antigravity 上游可用模型清单 — 1:1 移植 CLIProxyAPI `fetchModels()`。
@@ -177,6 +184,16 @@ pub async fn fetch_antigravity_available_models(
                 .get("maxOutputTokens")
                 .and_then(|v| v.as_u64())
                 .filter(|n| *n > 0);
+            // 官方 IDE 下拉只列 recommended:true 的款(MOC-69 实证);tagTitle 如 "Fast"/"New"
+            let recommended = model_data
+                .get("recommended")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let tag_title = model_data
+                .get("tagTitle")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             models.push(AntigravityModelEntry {
                 id: model_id.clone(),
                 object: "model".into(),
@@ -187,6 +204,8 @@ pub async fn fetch_antigravity_available_models(
                 description: display_name,
                 context_length,
                 max_completion_tokens,
+                recommended,
+                tag_title,
             });
         }
 
@@ -286,5 +305,28 @@ mod tests {
             "gemini-2.5-pro",
         ];
         assert_eq!(SKIP_MODEL_IDS, expected);
+    }
+
+    #[test]
+    fn entry_parses_and_serializes_recommended_and_tag() {
+        // 上游缺字段 → recommended default false, tag_title None(向后兼容旧 seed)
+        let e: AntigravityModelEntry = serde_json::from_value(json!({
+            "id":"x","object":"model","owned_by":"antigravity","type":"antigravity",
+            "display_name":"X","name":"x","description":"X"
+        }))
+        .unwrap();
+        assert!(!e.recommended);
+        assert!(e.tag_title.is_none());
+        // 有 recommended:true + tag_title → 解析 + 序列化保留(前端据此置顶/标记)
+        let e2: AntigravityModelEntry = serde_json::from_value(json!({
+            "id":"y","object":"model","owned_by":"antigravity","type":"antigravity",
+            "display_name":"Y","name":"y","description":"Y","recommended":true,"tag_title":"Fast"
+        }))
+        .unwrap();
+        assert!(e2.recommended);
+        assert_eq!(e2.tag_title.as_deref(), Some("Fast"));
+        let j = serde_json::to_string(&e2).unwrap();
+        assert!(j.contains("\"recommended\":true"));
+        assert!(j.contains("\"tag_title\":\"Fast\""));
     }
 }
