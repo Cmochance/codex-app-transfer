@@ -7601,7 +7601,12 @@
         closeProviderModelMenu();
       }
       const langButton = event.target.closest("[data-lang]");
-      if (langButton) CCI18n.apply(langButton.dataset.lang);
+      if (langButton) {
+        const lang = langButton.dataset.lang;
+        CCI18n.apply(lang);
+        // 落盘后端 settings,重启时 getSettings 能读回,避免回退默认语言 (MOC-70)
+        await CCApi.saveSettings({ language: lang });
+      }
       const addLink = event.target.closest("a[href='#providers/add']");
       if (addLink) {
         editingProviderId = null;
