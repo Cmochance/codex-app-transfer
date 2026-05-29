@@ -6,7 +6,11 @@ name: no-ai-coauthor
 
 on:
   pull_request:
-    branches: [main]
+    # 不限制 base 分支(跟 ci.yml 一致):stacked PR(base=feature 分支)在底 PR 合并后
+    # 自动 retarget 到 main 时,若加 `branches:[main]` 过滤会漏跑 —— retarget 不是触发
+    # 事件类型,且 retarget 瞬间 base 未稳定到 main 会被过滤掉,导致该 required check 缺失
+    # → PR BLOCKED,只能手动 close+reopen 补跑(MOC-64)。job 内按 PR_BASE_SHA..PR_HEAD_SHA
+    # 扫 commit,对任意 base 都正确,去掉 base 过滤无副作用。
     # `ready_for_review` 让 draft → ready 触发;`synchronize` 在 draft 仍 fire,
     # 下面 job-level `if` 把 draft job skip(skip = pass,不卡 required check)。
     types: [opened, synchronize, reopened, ready_for_review]
