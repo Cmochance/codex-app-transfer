@@ -60,7 +60,8 @@ const SKIP_MODEL_IDS: &[&str] = &[
 /// 一条模型记录 — 字段集对齐 CLIProxyAPI `modelEntry` struct
 /// (`fetch_antigravity_models/main.go:55-65`)。OpenAI `/v1/models` 响应需要的
 /// 字段(id / object / owned_by) + 我们额外保留的 capability(context_length /
-/// max_completion_tokens / display_name)
+/// max_completion_tokens / display_name) + MOC-69 新增展示字段(recommended /
+/// tag_title)供前端置顶推荐款 + 显示小标签
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AntigravityModelEntry {
     pub id: String,
