@@ -667,22 +667,31 @@ fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
     };
     let base = upstream_base.trim_end_matches('/');
     // 容错:用户把完整 endpoint(如 `…/v1/chat/completions`、`…/v1/messages`、
-    // `…/responses`)整段填进 base_url 时,adapter 仍会再拼一遍标准 endpoint,
+    // `…/responses`)整段填进 base_url 时,adapter 仍会按协议拼标准 endpoint,
     // 拼成 `…/chat/completions/chat/completions` 等 → 上游 404
     // (反馈 fb-3093a382:误把 opencode zen 完整地址填进 baseUrl,MOC-72)。
-    // 若 base 末尾已等于待拼 endpoint(忽略 query)则不重复拼,query 原样保留
-    // (非破坏性,仅去重);endpoint 为空 / "/" 时不触发,避免误判 root 路径。
+    // 做法:取 path 在 `/` 段边界上、同时也是 base 末尾的最长前缀作为"重叠段"去掉再拼。
+    // 既覆盖 create 路径(base 末尾 `/responses` + path `/responses`),也覆盖子路径
+    // (base 末尾 `/responses` + path `/responses/{id}/cancel` → `…/responses/{id}/cancel`,
+    // 不翻倍);query 原样保留。非破坏性:base 不含 endpoint 时 overlap=0,按原样拼。
     let (path_no_query, query) = match path.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (path.as_str(), None),
     };
-    if path_no_query != "/" && !path_no_query.is_empty() && base.ends_with(path_no_query) {
-        return match query {
-            Some(q) => format!("{base}?{q}"),
-            None => base.to_string(),
-        };
+    let mut overlap = 0usize;
+    let mut acc = String::new();
+    for seg in path_no_query.split('/').skip(1) {
+        acc.push('/');
+        acc.push_str(seg);
+        if base.ends_with(&acc) {
+            overlap = acc.len();
+        }
     }
-    format!("{base}{path}")
+    let rest = &path_no_query[overlap..];
+    match query {
+        Some(q) => format!("{base}{rest}?{q}"),
+        None => format!("{base}{rest}"),
+    }
 }
 
 /// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
@@ -1751,10 +1760,23 @@ mod tests {
             build_upstream_url("https://api.openai.com/v1", "/responses"),
             "https://api.openai.com/v1/responses"
         );
-        // 不误伤:responses 子路径(cancel)且 base 不含完整路径 → 照常拼
+        // 不误伤:responses 子路径(cancel)且 base 不含 endpoint → 照常拼
         assert_eq!(
             build_upstream_url("https://api.openai.com/v1", "/responses/resp_abc/cancel"),
             "https://api.openai.com/v1/responses/resp_abc/cancel"
+        );
+        // codex-connector P2:base 误填 /responses + 子路径(cancel/retrieve)→ 段边界去重,不翻倍
+        assert_eq!(
+            build_upstream_url(
+                "https://relay.example.com/responses",
+                "/responses/resp_abc/cancel"
+            ),
+            "https://relay.example.com/responses/resp_abc/cancel"
+        );
+        // 段边界:base 末尾 /v1 + path /v1/responses → 只去掉重叠的 /v1,不误删
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/v1", "/v1/responses"),
+            "https://relay.example.com/v1/responses"
         );
         // base 末尾 / 归一后再判断
         assert_eq!(
