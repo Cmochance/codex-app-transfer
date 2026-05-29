@@ -31,16 +31,13 @@ pub const SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/userinfo.profile",
 ];
 
-/// 出站 User-Agent —— impersonate gemini-cli。Google 上游会按这个字段做客户端
-/// 识别,跟 `X-Goog-Api-Client` 一起出现在所有 cloudcode-pa 请求里。值跟
-/// CLIProxyAPI `header_utils.go::DetectUserAgent` 一致(format
-/// `GeminiCLI/0.34.0 (<platform>; <arch>; terminal)`,platform/arch 跟
-/// `process.platform` / `process.arch` 一致 — `darwin`/`linux`/`win32`,
-/// `arm64`/`x64`/`ia32`)。
+/// `(platform, arch)` 运行时检测,跟 Node `process.platform`/`process.arch` 对齐
+/// (`darwin`/`linux`/`win32`,`arm64`/`x64`/`ia32`)。**gemini-cli 和 antigravity 的
+/// UA 都用它** —— 单一来源,避免两份 OS/ARCH 映射 drift。
 ///
-/// **不能 hardcode**:Linux 用户上传 `darwin; arm64` UA 会让 Google 上游 telemetry
-/// 把 Linux 流量当 macOS 统计 + 部分 quota / abuse 检测可能 trip。
-pub fn detect_user_agent() -> String {
+/// **不能 hardcode**:Linux/Intel 用户上传 `darwin`/`arm64` 会让 Google telemetry
+/// 误统计 + 部分 quota / abuse 检测可能 trip。
+fn node_platform_arch() -> (&'static str, &'static str) {
     let platform = match std::env::consts::OS {
         "macos" => "darwin",
         "linux" => "linux",
@@ -53,6 +50,15 @@ pub fn detect_user_agent() -> String {
         "x86" => "ia32",
         other => other,
     };
+    (platform, arch)
+}
+
+/// 出站 User-Agent —— impersonate gemini-cli。Google 上游按此字段做客户端识别,跟
+/// `X-Goog-Api-Client` 一起出现在所有 cloudcode-pa 请求里。format
+/// `GeminiCLI/0.34.0 (<platform>; <arch>; terminal)`,对齐 CLIProxyAPI
+/// `header_utils.go::DetectUserAgent`。
+pub fn detect_user_agent() -> String {
+    let (platform, arch) = node_platform_arch();
     format!("GeminiCLI/0.34.0 ({platform}; {arch}; terminal)")
 }
 
@@ -103,29 +109,45 @@ pub const ANTIGRAVITY_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/experimentsandconfigs",
 ];
 
-/// Antigravity 出站 X-Goog-Api-Client header。CLIProxyAPI `antigravity_version.go:23`。
+/// Antigravity 出站 X-Goog-Api-Client header 值(历史:CLIProxyAPI `antigravity_version.go:23`)。
+///
+/// **2026-05-29 实证抓包(本机 mitmproxy local 模式,Antigravity IDE 2.0.10):
+/// Antigravity 对 cloudcode-pa 的请求(chat 和控制面 loadCodeAssist/fetchAvailableModels)
+/// 都不发 `X-Goog-Api-Client`**。此常量仅保留以填充 `OauthProviderConfig.x_goog_api_client`
+/// 结构字段;antigravity 路径实际不注入该 header(见 antigravity/cloud_code.rs 与
+/// proxy/forward.rs)。见 memory `reference_antigravity_wire_fingerprint`。
 pub const ANTIGRAVITY_X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
-/// Antigravity 版本号(hardcode fallback,跟 CLIProxyAPI `antigravity_version.go:19`
-/// `antigravityFallbackVersion` 一致)。CLIProxyAPI 有 background goroutine 拉
-/// `https://antigravity-auto-updater-974169037036.us-central1.run.app/releases`
-/// 拿最新版,我们暂时只用 fallback。
+/// Antigravity 版本号。**2026-05-29 实证抓包**:真实 UA 里的版本就是 Antigravity IDE
+/// 版本 `2.0.10`(推翻了之前 CLIProxyAPI 推测的 `1.23.2`)。
 ///
-/// **2026-05-11**:1.21.9 已被 Google upstream 拒(返 "This version of Antigravity
-/// is no longer supported")。auto-updater 当前 stable = 1.23.2,bump 跟上。
-/// followup PR 应实现跟 CLIProxyAPI 一致的 6h-cached HTTP poll updater
-pub const ANTIGRAVITY_VERSION: &str = "1.23.2";
+/// followup(MOC-59):实现 6h-cached HTTP poll updater 动态拿最新版,替代 hardcode
+/// (`https://antigravity-auto-updater-974169037036.us-central1.run.app/releases`)。
+pub const ANTIGRAVITY_VERSION: &str = "2.0.10";
 
-/// Antigravity chat / generate request UA(短形式,无 nodejs-client 后缀)。
-/// CLIProxyAPI `antigravity_version.go:132`。
-pub fn antigravity_user_agent_chat() -> String {
-    format!("antigravity/{ANTIGRAVITY_VERSION} darwin/arm64")
+/// Antigravity subclient 标识。实证 UA 形如 `antigravity/<subclient>/<ver> <plat>/<arch>`,
+/// 中间这段是 subclient —— Agent Manager / Hub 客户端发 `hub`。
+pub const ANTIGRAVITY_SUBCLIENT: &str = "hub";
+
+/// Antigravity 出站 User-Agent。**chat 和控制面(loadCodeAssist / onboardUser /
+/// fetchAvailableModels)统一用这个** —— 2026-05-29 实证抓包都是
+/// `antigravity/hub/2.0.10 darwin/arm64`,**不带** `google-api-nodejs-client` 后缀
+/// (推翻了之前 CLIProxyAPI 的"控制面长形式 UA"假设)。平台/架构运行时检测,跟
+/// gemini-cli 共享 [`node_platform_arch`]。
+pub fn antigravity_user_agent() -> String {
+    let (platform, arch) = node_platform_arch();
+    format!("antigravity/{ANTIGRAVITY_SUBCLIENT}/{ANTIGRAVITY_VERSION} {platform}/{arch}")
 }
 
-/// Antigravity loadCodeAssist / onboardUser control-plane UA(长形式,带
-/// nodejs-client 后缀)。CLIProxyAPI `antigravity_version.go:138-151`。
+/// 兼容旧调用方(chat 路径)。chat 与控制面 UA 实证完全相同,统一走 [`antigravity_user_agent`]。
+pub fn antigravity_user_agent_chat() -> String {
+    antigravity_user_agent()
+}
+
+/// 兼容旧调用方(loadCodeAssist / onboardUser)。实证控制面 UA 跟 chat 一样
+/// (无 nodejs-client 后缀),统一走 [`antigravity_user_agent`]。
 pub fn antigravity_user_agent_loadcodeassist() -> String {
-    format!("antigravity/{ANTIGRAVITY_VERSION} darwin/arm64 google-api-nodejs-client/10.3.0")
+    antigravity_user_agent()
 }
 
 /// Antigravity 用户信息端点 — 用 v2 (gemini-cli 用 v3 openidconnect),
@@ -202,5 +224,23 @@ mod tests {
     fn cloud_code_base_url_is_internal_endpoint() {
         // 不能误用 generativelanguage.googleapis.com — 那是 API-key 路径。
         assert_eq!(CLOUD_CODE_BASE_URL, "https://cloudcode-pa.googleapis.com");
+    }
+
+    #[test]
+    fn antigravity_user_agent_matches_captured_format() {
+        // 实证(2026-05-29 抓包):chat + 控制面统一 `antigravity/hub/<ver> <plat>/<arch>`,
+        // 无 google-api-nodejs-client 后缀。
+        let ua = antigravity_user_agent();
+        assert!(
+            ua.starts_with("antigravity/hub/2.0.10 "),
+            "格式应为 antigravity/hub/<ver> <plat>/<arch>,实际:{ua}"
+        );
+        assert!(
+            !ua.contains("google-api-nodejs-client"),
+            "实证 chat/控制面都不带 nodejs-client 后缀"
+        );
+        // chat 与控制面 UA 实证相同,旧两个入口都收敛到统一实现
+        assert_eq!(ua, antigravity_user_agent_chat());
+        assert_eq!(ua, antigravity_user_agent_loadcodeassist());
     }
 }

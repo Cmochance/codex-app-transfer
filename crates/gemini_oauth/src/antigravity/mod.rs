@@ -7,7 +7,11 @@
 //! 路径(已端到端验证 + 大量单测覆盖,改动风险大)。后续如果出现第 3 个 OAuth
 //! provider,再考虑抽公共 trait。
 //!
-//! ## 跟 gemini-cli 差异(file:line 引自 CLIProxyAPI)
+//! ## 跟 gemini-cli 差异
+//!
+//! OAuth / scope / callback 等来源引自 CLIProxyAPI;**UA / X-Goog-Api-Client /
+//! ClientMetadata 三行已按 2026-05-29 本机 mitmproxy 抓包(Antigravity IDE 2.0.10)
+//! 更正,推翻了原 CLIProxyAPI 的推测值** —— 见 memory `reference_antigravity_wire_fingerprint`。
 //!
 //! | 维度 | gemini-cli | antigravity | 来源 |
 //! |---|---|---|---|
@@ -15,10 +19,9 @@
 //! | callback port | dynamic | 固定 51121 | `:8` |
 //! | scopes | 3 | +2 (`cclog`, `experimentsandconfigs`) | `:12-18` |
 //! | auth URL | (default) | 加 `prompt=consent` | `auth.go:61-68` |
-//! | UA loadCodeAssist | `GeminiCLI/0.34.0 (...)` | `antigravity/<v> darwin/arm64 google-api-nodejs-client/10.3.0` | `antigravity_version.go:138-151` |
-//! | UA chat | 同上 | `antigravity/<v> darwin/arm64`(短形式) | `:132` |
-//! | X-Goog-Api-Client | `google-genai-sdk/1.41.0 gl-node/v22.19.0` | `gl-node/22.21.1` | `antigravity_version.go:23` |
-//! | ClientMetadata | `{ideType, platform, pluginType, pluginVersion}` | `{ide_type:ANTIGRAVITY, ide_name, ide_version}` | `auth.go:163-169` |
+//! | UA(chat 与控制面**统一**) | `GeminiCLI/0.34.0 (...)` | `antigravity/hub/2.0.10 <plat>/<arch>`(无 nodejs-client 后缀) | 抓包实证 |
+//! | X-Goog-Api-Client | `google-genai-sdk/1.41.0 gl-node/v22.19.0` | **不发**(chat 与控制面都不发) | 抓包实证 |
+//! | ClientMetadata | `{ideType, platform, pluginType, pluginVersion}` | `{"ideType":"ANTIGRAVITY"}`(camelCase,仅此字段) | 抓包实证 |
 //! | 上游 endpoint | `cloudcode-pa.googleapis.com/v1internal:*` | **同样** | `executor:46-48` |
 //! | token 文件 | `~/.codex-app-transfer/gemini-oauth.json` | `~/.codex-app-transfer/antigravity-oauth.json` | (本实现) |
 

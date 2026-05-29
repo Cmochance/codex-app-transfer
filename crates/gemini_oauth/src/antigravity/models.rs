@@ -12,8 +12,8 @@
 //! - headers:
 //!   - `Content-Type: application/json`
 //!   - `Authorization: Bearer <access_token>`
-//!   - `User-Agent: antigravity/<version> darwin/arm64`(**chat 短 UA**,
-//!     不发 `X-Goog-Api-Client` —— 跟 `loadCodeAssist` 不一样)
+//!   - `User-Agent: antigravity/hub/<version> <platform>/<arch>`(chat 与控制面统一,
+//!     2026-05-29 抓包实证),不发 `X-Goog-Api-Client`
 //!
 //! ## 响应
 //!

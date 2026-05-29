@@ -787,13 +787,14 @@ async fn build_and_send_upstream(
             );
         }
         crate::resolver::AuthScheme::GoogleOauthAntigravity => {
-            // chat path 用短 UA 形式(不带 google-api-nodejs-client 后缀)。
-            // **不发 X-Goog-Api-Client** —— 实证 CLIProxyAPI `antigravity_executor.go`
-            // `buildRequest` (line 1987-1997) chat 路径只 set Authorization +
-            // User-Agent + Content-Type;`X-Goog-Api-Client` 仅 loadCodeAssist
-            // (line 1817) 跟 onboardUser (auth.go:288) 发。chat 多发会让上游
-            // 识别成"非 canonical client" → stricter rate limit / 429
-            // (2026-05-11 实测 429 修)
+            // **2026-05-29 本机 mitmproxy 抓包实证(Antigravity IDE 2.0.10)**:
+            // 对 cloudcode-pa 的所有请求(chat `streamGenerateContent` + 控制面
+            // `loadCodeAssist`/`fetchAvailableModels`)统一用 UA
+            // `antigravity/hub/<ver> <plat>/<arch>`,且**都不发** `X-Goog-Api-Client`
+            // (只 Authorization + User-Agent + Content-Type + Accept-Encoding)。
+            // 这推翻了之前基于 CLIProxyAPI 的"控制面才发 x-goog / 控制面用 nodejs-client
+            // 长 UA"假设。chat 多发 x-goog 会被上游识别成"非 canonical client" →
+            // stricter rate limit / 429。见 memory `reference_antigravity_wire_fingerprint`。
             up = up.header(
                 "User-Agent",
                 codex_app_transfer_gemini_oauth::antigravity_user_agent_chat(),

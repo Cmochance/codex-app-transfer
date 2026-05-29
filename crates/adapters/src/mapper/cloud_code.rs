@@ -123,16 +123,32 @@ pub(crate) fn apply_antigravity_transform(
         Value::String(if is_image { "image_gen" } else { "agent" }.into()),
     );
 
+    // requestId 格式对齐官方抓包(2026-05-29 实证):agent 路径形如
+    // `agent/<execution_uuid>/<unix_ms>/<trajectory_uuid>/<seq>`
+    // (实证 `agent/a65d590f-…/1780060921687/17e30eb2-…/85`)。我们没有真实的
+    // trajectory/step 连续性,用随机 uuid + 当前 ms + seq(以 contents 条数近似 step
+    // index,随多轮递增)。见 memory `reference_antigravity_wire_fingerprint`。
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     let request_id = if is_image {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
         format!("image_gen/{}/{}/12", now_ms, uuid_v4()?)
     } else {
-        format!("agent-{}", uuid_v4()?)
+        let seq = envelope_obj
+            .get("request")
+            .and_then(|v| v.as_object())
+            .and_then(|r| r.get("contents"))
+            .and_then(|c| c.as_array())
+            .map(|a| a.len())
+            .unwrap_or(1);
+        format!("agent/{}/{}/{}/{}", uuid_v4()?, now_ms, uuid_v4()?, seq)
     };
     envelope_obj.insert("requestId".into(), Value::String(request_id));
+    // 官方 antigravity envelope **不含** `user_prompt_id`(2026-05-29 实证);它是
+    // gemini-cli 路径才有的字段,而 `wrap_cloud_code_envelope` 给两边都加了 ——
+    // 在 antigravity 路径移除,避免 wire 上出现 gemini-cli 特有字段被上游识别。
+    envelope_obj.remove("user_prompt_id");
 
     if let Some(request_obj) = envelope_obj
         .get_mut("request")
@@ -697,7 +713,21 @@ mod tests {
         );
 
         let rid = out.get("requestId").and_then(|v| v.as_str()).unwrap();
-        assert!(rid.starts_with("agent-"));
+        // 实证格式 agent/<uuid>/<ms>/<uuid>/<seq>(2026-05-29 抓包)
+        assert!(
+            rid.starts_with("agent/"),
+            "requestId 应为 agent/<uuid>/<ms>/<uuid>/<seq>,实际:{rid}"
+        );
+        assert_eq!(
+            rid.matches('/').count(),
+            4,
+            "agent/uuid/ms/uuid/seq 应有 4 个斜杠,实际:{rid}"
+        );
+        // antigravity envelope 不含 user_prompt_id(实证),transform 应删除
+        assert!(
+            out.get("user_prompt_id").is_none(),
+            "antigravity 路径应移除 user_prompt_id"
+        );
 
         let req = out.get("request").and_then(|v| v.as_object()).unwrap();
         assert!(!req.contains_key("safetySettings"));
