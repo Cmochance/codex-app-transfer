@@ -64,7 +64,7 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 - Codex App's freeform `apply_patch` tool (edit-file +/- diff UI) works on chat-completions providers: the adapter bridges Responses `custom_tool_call` ↔ chat `function_call` wire forms, the model emits V4A-format patches, Codex App renders the diff (issue #235)
 - **Two-layer session history persistence**: L1 in-memory LRU + L2 sqlite with 30-day TTL (`~/.codex-app-transfer/sessions.db`), preserving history across `.app` restarts
 - **Usage stats** (Sidebar → Usage): parses `~/.codex/sessions/` rollout JSONL, aggregating token usage by conversation / day / model (parser vendored from ryoppippi/ccusage). The by-conversation view shows each conversation's **cache hit rate**; clicking the number opens a **per-prompt hit-rate histogram** (cached contained within total, two-tone; hover for cached / total input / output). The proxy locally records `session → real upstream model` (for conversations run after this version), so the by-conversation model column shows the real upstream model instead of Codex's client placeholder (`gpt-5.x`)
-- Codex App config guardrails: snapshots `~/.codex/{config.toml,auth.json}` before apply; restores via per-key smart merge on exit / next start
+- Codex App config guardrails: snapshots `~/.codex/{config.toml,auth.json}` before apply; restores via per-key smart merge on exit / next start; **Portable MCP auth vault** (on by default): switches MCP OAuth credential storage to a portable file (`~/.codex/.credentials.json`, mode 0o600) and keeps a mirror outside `~/.codex` (`~/.codex-app-transfer/mcp-credentials.json`); credentials lost due to account switch / accidental delete / new machine are restored automatically on startup (note: does not fix natural OAuth expiry)
 - **Codex Doc Management** (Sidebar → Codex):
   - **Agents**: raw read/write `AGENTS.md` at any path with file system picker; auto-classify project-root / subdir via `.git/` detection with chip labels
   - **Memories**: fixed two entries `~/.codex/memories/MEMORY.md` (main index) + `memory_summary.md` (auto summary) — the only two user-editable AI memory indexes that codex actually reads
@@ -253,7 +253,7 @@ Design intent: the client trusts only the build-time embedded public key and nev
 - **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
 - **Frontend**: HTML + CSS + vanilla JavaScript + Bootstrap 5.3.3 (localized, no CDN dependency)
 - **Desktop shell**: Tauri 2 + tray-icon 0.23; the `cas://` URI scheme glues frontend/ and axum in-process, no TCP loopback
-- **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex/{config.toml,auth.json}` (Codex App integration)
+- **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex/{config.toml,auth.json,.credentials.json}` (Codex App integration), `~/.codex-app-transfer/mcp-credentials.json` (MCP credential mirror, outside `~/.codex`)
 - **Packaging**: `cargo tauri build` single command produces dmg/AppImage/deb/exe/msi; `xtask release-bundle` finalizes sha256 + RSA-3072 sig + latest.json + draft GitHub release
 
 ## Disclaimer

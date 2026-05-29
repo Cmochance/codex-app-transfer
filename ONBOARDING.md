@@ -107,7 +107,7 @@ codex-app-transfer/
 │   │   └── tests/              # contract + golden + streaming
 │   ├── proxy/                  # axum server + forward / resolve / telemetry / fixture
 │   ├── registry/               # ~/.codex-app-transfer/config.json schema + presets + healing
-│   ├── codex_integration/      # 守护 ~/.codex/{config.toml,auth.json} 快照 / 还原
+│   ├── codex_integration/      # 守护 ~/.codex/{config.toml,auth.json} 快照 / 还原 + MCP OAuth 凭据可移植保险箱
 │   └── gemini_oauth/           # Gemini CLI + Antigravity OAuth flow
 │
 ├── frontend/                   # 前端 (静态文件被 include_dir! 编进二进制)
