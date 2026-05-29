@@ -57,34 +57,53 @@
 
   // MOC-62:MCP 凭据文件整个丢失但镜像有备份时弹确认。原生 dialog.ask(yes/no):
   // 确认 → 从备份恢复;否 → 忽略(删镜像,停止再弹,接受"凭据已不在")。
-  // dialog 不可用时退回 window.confirm。
+  // dialog 不可用时退回 window.confirm。in-flight guard 防重入重复弹。
+  let mcpRestorePromptInFlight = false;
   async function mcpCredentialsHandleRestorePrompt(count) {
-    let restore;
+    if (mcpRestorePromptInFlight) return;
+    mcpRestorePromptInFlight = true;
     try {
-      const dialog = window.__TAURI__?.dialog;
-      const body = tFmt("mcp.restorePromptBody", { count });
-      if (dialog && typeof dialog.ask === "function") {
-        restore = await dialog.ask(body, {
-          title: t("mcp.restorePromptTitle"),
-          kind: "warning",
-        });
-      } else {
-        restore = window.confirm(`${t("mcp.restorePromptTitle")}\n\n${body}`);
+      let restore;
+      try {
+        const dialog = window.__TAURI__?.dialog;
+        const body = tFmt("mcp.restorePromptBody", { count });
+        if (dialog && typeof dialog.ask === "function") {
+          restore = await dialog.ask(body, {
+            title: t("mcp.restorePromptTitle"),
+            kind: "warning",
+          });
+        } else {
+          restore = window.confirm(`${t("mcp.restorePromptTitle")}\n\n${body}`);
+        }
+      } catch (err) {
+        console.error("mcp restore prompt:", err);
+        return;
       }
-    } catch (err) {
-      console.error("mcp restore prompt:", err);
-      return;
+      try {
+        if (restore) {
+          const r = await CCApi.restoreMcpCredentials();
+          showToast(tFmt("mcp.restoreDone", { count: r?.restored ?? count }));
+        } else {
+          await CCApi.discardMcpCredentialsMirror();
+          showToast(t("mcp.restoreDismissed"));
+        }
+      } catch (err) {
+        showToast(err.message || t("toast.requestFailed"));
+      }
+    } finally {
+      mcpRestorePromptInFlight = false;
     }
+  }
+
+  // MOC-62:load 时查询是否有可恢复的 MCP 凭据备份(整文件丢失 + 镜像有备份),有则弹
+  // 确认。轮询比一次性 startup event 可靠(后者可能在 listener 注册前 emit 丢失)。
+  async function mcpCredentialsCheckRestoreOnLoad() {
     try {
-      if (restore) {
-        const r = await CCApi.restoreMcpCredentials();
-        showToast(tFmt("mcp.restoreDone", { count: r?.restored ?? count }));
-      } else {
-        await CCApi.discardMcpCredentialsMirror();
-        showToast(t("mcp.restoreDismissed"));
-      }
+      const s = await CCApi.getMcpCredentialsStatus();
+      const count = Number(s?.restoreAvailable) || 0;
+      if (count > 0) await mcpCredentialsHandleRestorePrompt(count);
     } catch (err) {
-      showToast(err.message || t("toast.requestFailed"));
+      console.error("mcp restore status:", err);
     }
   }
 
@@ -7784,17 +7803,15 @@
             showToast(tFmt("settings.residualScanStartupToast", { count }));
           }
         });
-        // MOC-62:MCP 凭据文件整个丢失 + 镜像有备份 → 弹确认让用户决定恢复 / 忽略
-        // (登出全部 / 误删 / 换机 同步时无从区分,故不静默复活已撤销的凭据)。
-        await tauriEvent.listen("mcp-credentials-restore-available", async (e) => {
-          const count = Number(e?.payload?.count) || 0;
-          if (count <= 0) return;
-          await mcpCredentialsHandleRestorePrompt(count);
-        });
       }
     } catch (err) {
       console.error("event listen:", err);
     }
+
+    // MOC-62:load 时轮询"是否有可恢复的 MCP 凭据备份"(整文件丢失 + 镜像有备份)→ 弹确认。
+    // 用轮询而非一次性 startup event —— 后者可能在此 listener 注册前就 emit 而丢失
+    // (chatgpt-codex-connector P2)。fire-and-forget,不阻塞 init。
+    mcpCredentialsCheckRestoreOnLoad();
 
     // **#249 fix**:getSettings 失败时用默认值,确保 renderRoute 始终执行。
     // 之前无 try-catch,config.json 锁/损坏/权限问题 → getSettings 500 →

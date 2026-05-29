@@ -190,6 +190,20 @@ pub fn discard_mcp_mirror(paths: &CodexPaths) -> Result<(), CodexError> {
     }
 }
 
+/// 只读检查:live 整文件缺失、且镜像非空 → 返回镜像可恢复条数;否则 0。**无副作用**。
+/// 供前端 load 时轮询(状态端点),避免一次性 startup event 在 listener 注册前就 emit
+/// 而丢失(chatgpt-codex-connector P2)。live 存在 / 损坏、镜像缺失 / 损坏 / 空都返回 0。
+pub fn restore_available_count(paths: &CodexPaths) -> usize {
+    // live 存在(含 `{}`)/ 损坏 → 不是"整文件丢失",无需提示恢复。
+    if !matches!(read_creds(&paths.mcp_credentials), CredRead::Missing) {
+        return 0;
+    }
+    match read_creds(&paths.mcp_credentials_mirror) {
+        CredRead::Parsed(m) => m.len(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +340,24 @@ mod tests {
         );
         // 再删一次(已不存在)不报错
         discard_mcp_mirror(&paths).unwrap();
+    }
+
+    #[test]
+    fn restore_available_count_only_when_live_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        assert_eq!(restore_available_count(&paths), 0, "都不存在 → 0");
+        write_json(
+            &paths.mcp_credentials_mirror,
+            &json!({"a|1": entry("a"), "b|2": entry("b")}),
+        );
+        assert_eq!(
+            restore_available_count(&paths),
+            2,
+            "live 缺失 + 镜像 2 条 → 2"
+        );
+        write_json(&paths.mcp_credentials, &json!({}));
+        assert_eq!(restore_available_count(&paths), 0, "live 存在(含空)→ 0");
     }
 
     #[test]

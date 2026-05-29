@@ -144,6 +144,10 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/desktop/mcp-credentials/discard",
             post(handlers::desktop::mcp_credentials_discard),
         )
+        .route(
+            "/api/desktop/mcp-credentials/status",
+            get(handlers::desktop::mcp_credentials_status),
+        )
         // Conversation export (#271)
         .route(
             "/api/conversations/list",

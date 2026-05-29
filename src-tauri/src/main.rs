@@ -193,19 +193,11 @@ fn main() {
                 // #MOC-62:复用同一 post-apply task —— 此刻已 await 完 auto_apply 且
                 // residual scan 跑完,config.toml 的 apply 写已落定,这里再同步 MCP
                 // 凭据"可移植保险箱"(file 模式 + 镜像)不会与 apply 抢写 config.toml。
-                // 开关关闭时内部直接返回 0。返回 restore_available:>0 表示 live 整文件
-                // 缺失但镜像有备份(登出全部 / 误删 / 换机,同步时无从区分)→ emit 事件让
-                // 前端弹确认,由用户决定恢复 / 忽略(不静默复活已撤销的凭据)。
-                let mcp_restore_available =
-                    handlers::desktop::mcp_credentials_startup_sync("startup");
-                if mcp_restore_available > 0 {
-                    if let Some(window) = app_handle_for_residual_scan.get_webview_window("main") {
-                        let _ = window.emit(
-                            "mcp-credentials-restore-available",
-                            serde_json::json!({ "count": mcp_restore_available }),
-                        );
-                    }
-                }
+                // 开关关闭时内部直接返回 0。startup_sync 负责 ensure file 模式 + 镜像跟随;
+                // "live 整文件丢失需恢复"的提示**不**走一次性 event(会在前端 listener 注册
+                // 前 emit 丢失,见 chatgpt-codex-connector P2),改由前端 load 时轮询
+                // `GET /api/desktop/mcp-credentials/status` 决定是否弹确认。
+                let _ = handlers::desktop::mcp_credentials_startup_sync("startup");
             });
 
             // ── Plugin Unlock 守护进程自动启动 ──

@@ -254,6 +254,12 @@ pub async fn mcp_credentials_discard() -> impl IntoResponse {
     }
 }
 
+/// MOC-62:前端 load 时轮询 —— 是否有可恢复的 MCP 凭据备份(>0 → 弹恢复确认)。
+/// 比一次性 startup event 可靠(避免 event 在 listener 注册前 emit 丢失)。只读。
+pub async fn mcp_credentials_status() -> impl IntoResponse {
+    Json(json!({"restoreAvailable": snapshot::mcp_credentials_restore_status()})).into_response()
+}
+
 pub async fn desktop_snapshot_status() -> impl IntoResponse {
     let paths = match CodexPaths::from_home_env() {
         Ok(p) => p,

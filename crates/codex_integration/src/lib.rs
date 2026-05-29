@@ -34,8 +34,8 @@ pub use apply::{
 };
 pub use auth::{read_auth, write_auth};
 pub use mcp_credentials::{
-    discard_mcp_mirror, ensure_file_store_mode, restore_mcp_credentials_from_mirror,
-    sync_mcp_credentials, SyncReport,
+    discard_mcp_mirror, ensure_file_store_mode, restore_available_count,
+    restore_mcp_credentials_from_mirror, sync_mcp_credentials, SyncReport,
 };
 pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, upsert_catalog_models};
 pub use paths::CodexPaths;
