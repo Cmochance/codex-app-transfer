@@ -516,6 +516,35 @@ impl GeminiToResponsesConverter {
                         }
                     }));
                 }
+                // [MOC-75] apply_patch(及其它 lowered custom freeform 工具)的 envelope item
+                // 是 `custom_tool_call`(裸 `input`=patch)。session 历史用 chat-format,必须
+                // 重建成 function-type tool_call、arguments=`{"input":<patch>}` —— 与请求侧
+                // `responses/request.rs` 的 `custom_tool_call` 回放 arm 形态一致。否则下一轮
+                // `previous_response_id` 续话时 assistant 历史缺这条 apply_patch call,新进来的
+                // `custom_tool_call_output`(functionResponse)无匹配 functionCall → Gemini
+                // BadRequest / 多轮 apply_patch 断(devin BUG 反馈,response.rs:953 缓存路径)。
+                Some("custom_tool_call") => {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let name = item
+                        .get("name")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("apply_patch".into()));
+                    let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = serde_json::to_string(&json!({ "input": input }))
+                        .unwrap_or_else(|_| "{}".to_owned());
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }));
+                }
                 _ => {}
             }
         }
@@ -2727,6 +2756,42 @@ mod tests {
             added.1["item"].get("namespace").is_none(),
             "顶级 function 不该带 namespace 字段,实际 {:?}",
             added.1["item"].get("namespace")
+        );
+    }
+
+    /// [MOC-75 devin BUG 回归] `build_assistant_message_for_session` 必须把
+    /// `custom_tool_call`(apply_patch)纳入 session 历史 —— 重建成 function-type
+    /// tool_call、arguments=`{"input":<patch>}`(与请求侧 `custom_tool_call` 回放一致)。
+    /// 否则下一轮 `previous_response_id` 续话缺这条 apply_patch call,新进来的
+    /// `custom_tool_call_output`(functionResponse)无匹配 functionCall → 多轮断。
+    #[test]
+    fn session_assistant_message_includes_apply_patch_custom_tool_call() {
+        let output_items = vec![json!({
+            "type": "custom_tool_call",
+            "call_id": "call_ap1",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** End Patch",
+            "status": "completed"
+        })];
+        let msg = GeminiToResponsesConverter::build_assistant_message_for_session(&output_items)
+            .expect("custom_tool_call 必须产出 session assistant message");
+        let tcs = msg["tool_calls"]
+            .as_array()
+            .expect("session message 必须含 tool_calls");
+        assert_eq!(
+            tcs.len(),
+            1,
+            "apply_patch custom_tool_call 必须进 session tool_calls(不能被 _=>{{}} 丢弃)"
+        );
+        let tc = &tcs[0];
+        assert_eq!(tc["id"], "call_ap1");
+        assert_eq!(tc["type"], "function", "session 历史用 chat function-type");
+        assert_eq!(tc["function"]["name"], "apply_patch");
+        let args: Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["input"], "*** Begin Patch\n*** End Patch",
+            "arguments 必须是 {{\"input\":<patch>}},与请求侧回放形态一致"
         );
     }
 }
