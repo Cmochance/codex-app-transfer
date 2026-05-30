@@ -2,9 +2,18 @@
 
 逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
-## Unreleased
+## v2.1.18 — 2026-05-31
 
-- **Codex 主题模块化升级**:换肤引擎重写为「每主题调色板 + 共享结构」。内置主题 5 → 11(新增 `frost` / `nocturne` / `duet` / `rose` / `sonata` / `studio`),每套按背景图独立调出暗玻璃 + 强调色(不再统一红调)。注入改为覆盖 Codex 当前版本的设计令牌(`--color-token-*` + 运行时内联在 `<html>` 的 `--color-*` 层),修好设置页白卡、侧栏 resize 手柄亮带、折叠侧栏浮层透明、顶部内容阴影常驻、侧栏/主区接缝、composer 容器等各视图;改用轻量 6px 玻璃模糊。`carton` 浮动看板娘保留。
+**主题引擎模块化(5→11)+ Gemini 系一致性修复 + Windows 启动提速**:自 v2.1.17 起合入 14 个 PR。
+
+- **Codex 主题引擎模块化**(MOC-97 #331):换肤引擎重写为「每主题调色板 + 共享结构」,内置主题 5 → 11(新增 `frost` / `nocturne` / `duet` / `rose` / `sonata` / `studio`),每套按背景图独立调出暗玻璃 + 强调色(不再统一红调)。注入改为覆盖 Codex 当前版本的设计令牌(`--color-token-*` + 运行时内联在 `<html>` 的 `--color-*` 层),修好设置页白卡、侧栏 resize 手柄亮带、折叠侧栏浮层透明、顶部内容阴影常驻、侧栏/主区接缝、composer 容器等各视图,改用轻量 6px 玻璃模糊,`carton` 浮动看板娘保留;配合 Win/Linux 重启 Codex 后自动重新应用主题(MOC-73 #315)
+- **Gemini / antigravity 系一致性**:传输指纹层对齐官方客户端(MOC-59 #310)、模型列表补 `displayName` + recommended 排序 + 过滤两款 claude(MOC-69 #316)、`apply_patch` 等 freeform 工具修复(请求补 input + 响应 `custom_tool_call`,MOC-75 #314)、上游非 2xx 对齐 Codex 重试白名单,永久错误 surface 不卡死(MOC-79 #325)
+- **compact 跨协议支持**:compact 注入 disable-thinking 时同步删 `reasoning_effort`(MOC-87 #327)、compact 支持 Gemini 系(antigravity / Google AI Studio)(MOC-92 #328)
+- **`apply_patch` 健壮性**:chat-path 截断检测 + V4A 后验校验(MOC-57 #322)
+- **Windows 原生进程操作**:Codex 启动提速(原生进程枚举替 `tasklist` + AUMID 缓存,MOC-94 #329)、退出改用原生 `PostMessage(WM_CLOSE)` 替 PowerShell-WMI(MOC-95 #330)
+- **设置 / 配置**:设置页加开关隐藏灰色(TOS-gray)provider preset、默认隐藏(MOC-91 #326),反馈批处理(语言持久化 MOC-70 + baseUrl endpoint 去重 MOC-72 + FAQ,#313),直连模式只写上游配置、不注入 transfer 私货(#318)
+
+完整改动:[v2.1.17...v2.1.18](https://github.com/Cmochance/codex-app-transfer/compare/v2.1.17...v2.1.18)。
 
 ## v2.1.17 — 2026-05-29
 
