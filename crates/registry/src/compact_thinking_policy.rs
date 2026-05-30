@@ -91,10 +91,19 @@ impl DisableThinkingWire {
     /// **不覆盖**已有的 `thinking` / `enable_thinking` 字段 —— 语义保守,允许
     /// 上层(future caller)显式开 thinking 的极少数边界场景(虽然 compact 路径
     /// 当前没这种场景,但接口契约不应强制覆盖)。
+    ///
+    /// **同时移除 `reasoning_effort`**(MOC-87):thinking 关掉后 `reasoning_effort`
+    /// 已无意义,且 DeepSeek V4 强制「`thinking.type=disabled` 与 `reasoning_effort`
+    /// 不可并存」—— 二者并存会被上游拒成 400(真机实证 `thinking options type cannot
+    /// be disabled when reasoning_effort is set`)。两派 disable 都删:Kimi / MiMo
+    /// 删它同样安全(同为「关思考」语义,`reasoning_effort` 此时无效)。
     pub fn inject(self, chat_body: &mut Value) {
         let Some(obj) = chat_body.as_object_mut() else {
             return;
         };
+        // MOC-87:关思考的同时必须删 reasoning_effort —— 否则 deepseek-v4 收到
+        // thinking.disabled + reasoning_effort 并存直接 400(compact 必中)。
+        obj.remove("reasoning_effort");
         match self {
             Self::ThinkingTypeDisabled => {
                 obj.entry("thinking".to_owned())
@@ -472,6 +481,38 @@ mod tests {
             json!(true),
             "已有 enable_thinking 字段时 inject 不应覆盖"
         );
+    }
+
+    #[test]
+    fn inject_strips_reasoning_effort_when_disabling_thinking_moc87() {
+        // MOC-87 回归守卫:deepseek-v4(派A)compact body 带 reasoning_effort 时,
+        // inject 必须**删掉** reasoning_effort 并加 thinking.disabled —— 否则二者并存
+        // 被 DeepSeek V4 拒成 400(thinking options type cannot be disabled when
+        // reasoning_effort is set)。
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [],
+            "reasoning_effort": "medium"
+        });
+        DisableThinkingWire::ThinkingTypeDisabled.inject(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "关思考后必须删 reasoning_effort,否则 deepseek-v4 compact 400;实际:{body}"
+        );
+        // 派B(enable_thinking=false)同样删:reasoning_effort 此时无意义
+        let mut body = json!({
+            "model": "mimo-v2-omni",
+            "messages": [],
+            "reasoning_effort": "high"
+        });
+        DisableThinkingWire::EnableThinkingFalse.inject(&mut body);
+        assert_eq!(body["enable_thinking"], json!(false));
+        assert!(body.get("reasoning_effort").is_none());
+        // 没有 reasoning_effort 时不报错(remove 幂等)
+        let mut body = json!({"model": "deepseek-v4-flash", "messages": []});
+        DisableThinkingWire::ThinkingTypeDisabled.inject(&mut body);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
     }
 
     #[test]
