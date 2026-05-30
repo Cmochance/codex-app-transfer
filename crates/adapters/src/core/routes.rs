@@ -51,6 +51,15 @@ pub(crate) fn is_exact_responses_compact_path(client_path: &str) -> bool {
     let normalized = normalize_local_responses_path(path);
     normalized.trim_end_matches('/') == "/responses/compact"
 }
+/// 是否命中任意 compact 端点(含 `/responses/compact` 与 `/chat/completions/compact` 两种 Codex 发送路径)。
+/// 允许 query 和尾部 `/`。
+pub(crate) fn is_any_compact_endpoint(client_path: &str) -> bool {
+    let path = client_path.split('?').next().unwrap_or(client_path);
+    let normalized = normalize_local_responses_path(path);
+    let trimmed = normalized.trim_end_matches('/');
+    trimmed == "/responses/compact" || trimmed == "/chat/completions/compact"
+}
+
 
 /// 是否是本地 Responses 路由:
 /// `/responses`、`/responses/*`、`/messages`、`/messages/*`
@@ -104,5 +113,21 @@ mod tests {
         assert!(!is_exact_responses_compact_path("/responses"));
         assert!(!is_exact_responses_compact_path("/responses/compact/extra"));
         assert!(!is_exact_responses_compact_path("/responses/compact_alt"));
+    }
+    #[test]
+    fn any_compact_endpoint_matches_chat_completions_compact() {
+        assert!(is_any_compact_endpoint("/chat/completions/compact"));
+        assert!(is_any_compact_endpoint("/v1/chat/completions/compact"));
+        assert!(is_any_compact_endpoint("/chat/completions/compact?stream=false"));
+        assert!(is_any_compact_endpoint("/chat/completions/compact/"));
+        // 也匹配已有的 responses compact
+        assert!(is_any_compact_endpoint("/responses/compact"));
+        assert!(is_any_compact_endpoint("/v1/responses/compact"));
+        // 负向
+        assert!(!is_any_compact_endpoint("/chat/completions"));
+        assert!(!is_any_compact_endpoint("/v1/chat/completions"));
+        assert!(!is_any_compact_endpoint("/chat/completions/compact_alt"));
+        assert!(!is_any_compact_endpoint("/responses"));
+        assert!(!is_any_compact_endpoint("/responses/compact/extra"));
     }
 }

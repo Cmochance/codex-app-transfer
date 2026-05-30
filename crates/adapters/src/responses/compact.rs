@@ -143,7 +143,7 @@ const MAX_UPSTREAM_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// 判断入站 path 是否是 `/responses/compact`(含可选 `/v1/`、`/openai/v1/` 前缀)。
 pub(crate) fn is_compact_path(path: &str) -> bool {
-    routes::is_exact_responses_compact_path(path)
+    routes::is_any_compact_endpoint(path)
 }
 
 /// 把 Codex CLI 的 `CompactionInput` JSON 改写成上游 `/chat/completions` 请求体。
@@ -756,10 +756,17 @@ mod tests {
         assert!(is_compact_path("/openai/v1/responses/compact"));
         assert!(is_compact_path("/responses/compact?foo=bar"));
         assert!(is_compact_path("/responses/compact/"));
+        // chat/completions compact（MOC-87）
+        assert!(is_compact_path("/chat/completions/compact"));
+        assert!(is_compact_path("/v1/chat/completions/compact"));
+        assert!(is_compact_path("/chat/completions/compact?stream=false"));
+        assert!(is_compact_path("/chat/completions/compact/"));
         // 负向
         assert!(!is_compact_path("/responses"));
         assert!(!is_compact_path("/responses/compact/extra"));
         assert!(!is_compact_path("/chat/completions"));
+        assert!(!is_compact_path("/v1/chat/completions"));
+        assert!(!is_compact_path("/chat/completions/compact_alt"));
     }
 
     #[test]

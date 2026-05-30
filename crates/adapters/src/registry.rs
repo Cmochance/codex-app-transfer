@@ -93,6 +93,11 @@ impl AdapterRegistry {
     /// `/responses` directly.
     pub fn lookup_for_request(&self, api_format: &str, client_path: &str) -> Arc<dyn Adapter> {
         let normalized = api_format.trim().to_ascii_lowercase().replace('-', "_");
+        // Compact 路径统一走 ResponsesAdapter 本地实现,覆盖 `/responses/compact`
+        // 与 `/chat/completions/compact` 两种 Codex CLI compact 请求路径(MOC-87)。
+        if routes::is_any_compact_endpoint(client_path) {
+            return self.responses.clone();
+        }
         // 用户显式选 responses 透传 + 入站是 /responses 路径 → 字节级透传给上游。
         // 上游需原生实现 OpenAI Responses API(如 OpenAI 官方 / 自建反代);
         // anthropic/claude/messages 是 Python 历史兼容值,现在走
@@ -394,6 +399,43 @@ mod tests {
             r.lookup_for_request("responses", "/v1/responses/compact_alt")
                 .name(),
             "responses_passthrough"
+        );
+    }
+    #[test]
+    fn chat_completions_compact_routes_to_responses_adapter_regardless_of_api_format() {
+        // MOC-87: /chat/completions/compact（及带 /v1 前缀的变体）必须走 ResponsesAdapter
+        // 本地 compact 实现,不能透传给上游(上游不支持 /compact 后缀)。
+        let r = AdapterRegistry::with_builtins();
+        for path in [
+            "/chat/completions/compact",
+            "/chat/completions/compact?stream=false",
+            "/v1/chat/completions/compact",
+            "/chat/completions/compact/",
+        ] {
+            assert_eq!(
+                r.lookup_for_request("openai_chat", path).name(),
+                "responses",
+                "{path} openai_chat format 必须走 ResponsesAdapter compact"
+            );
+            assert_eq!(
+                r.lookup_for_request("openai", path).name(),
+                "responses",
+                "{path} openai format 必须走 ResponsesAdapter compact"
+            );
+            assert_eq!(
+                r.lookup_for_request("chat_completions", path).name(),
+                "responses",
+                "{path} chat_completions format 必须走 ResponsesAdapter compact"
+            );
+        }
+        // responses compact 路径也仍然正确
+        assert_eq!(
+            r.lookup_for_request("openai_chat", "/responses/compact").name(),
+            "responses"
+        );
+        assert_eq!(
+            r.lookup_for_request("openai_chat", "/v1/responses/compact").name(),
+            "responses"
         );
     }
 
