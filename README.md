@@ -120,7 +120,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | 后端就绪,UI 待 PR |
 | 智谱 GLM(5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
 | 阿里云百炼(Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
-| Responses 协议透传(custom) | — | — | — | 直连上游不经代理(适合 OpenAI 官方 / 原生 Responses 反代);⚠️ Plugins/MCP `namespace` 工具包不展平,部分上游会静默丢工具 |
+| Responses 协议透传(custom) | — | — | — | 直连上游不经代理,**仅写上游 base_url + key**(不注入 transfer 沙箱 / 模型目录,#317);适合 OpenAI 官方 / 原生 Responses 反代;⚠️ Plugins/MCP `namespace` 工具包不展平,部分上游会静默丢工具 |
 
 > **MCP 工具(Codex 0.130+ `tool_search` 机制)**:Codex 0.130+ 把 server-side MCP 工具(`mcp__notion__*` / `mcp__linear__*` 等)defer 到 `tool_search`,不再直接放进 `tools[]`。代理在 **chat 路径**已打通全链路 —— 从 `tool_search_output` 发现工具 → 注入 chat `tools[]` → 按 `namespace` 路由回上游(#293)。**上表所有 chat-compat provider 通用**;仅 Responses 协议透传(末行,不经代理)不适用。
 
