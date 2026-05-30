@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_app_transfer_codex_integration::{
-    apply_provider, catalog_models_for_provider, ensure_file_store_mode, get_snapshot_status,
-    has_snapshot, list_snapshots, read_auth, restore_available_count, restore_codex_snapshot,
-    restore_codex_state, sync_mcp_credentials, ApplyConfig, CodexPaths,
+    apply_provider, catalog_models_for_provider_with_display_names, ensure_file_store_mode,
+    get_snapshot_status, has_snapshot, list_snapshots, read_auth, restore_available_count,
+    restore_codex_snapshot, restore_codex_state, sync_mcp_credentials, ApplyConfig, CodexPaths,
 };
+use codex_app_transfer_gemini_oauth::antigravity_static_models;
 use codex_app_transfer_proxy::proxy_telemetry;
 use codex_app_transfer_registry::RawConfig;
 use serde_json::{json, Value};
@@ -44,6 +45,29 @@ pub struct DesktopConfigTarget {
     /// 写入 `~/.codex/.codex-global-state.json` 的
     /// `electron-persisted-atom-state.local-conversation-status-section-visible`。
     pub codex_status_section_default_visible: bool,
+    /// [MOC-69] model id → 人类可读 displayName(JSON object)。仅 antigravity 非空
+    /// (从 static seed 构建);Codex Desktop model catalog 的 `display_name` 优先用它,
+    /// 让 Codex 自己的 model picker 显示 displayName 而非 raw id。其他 provider 为
+    /// `Value::Null`,catalog 回退 raw id(行为不变)。
+    pub model_display_names: Value,
+}
+
+/// [MOC-69] 给 antigravity provider 构建 model id → displayName 反查表(JSON object),
+/// 喂给 Codex model catalog 让其 picker 显示 displayName。数据源是 static seed
+/// (`antigravity_static_models`,2026-05-30 实时上游刷新,已 SKIP 过滤),同步、无网络:
+/// 避免在 config-apply 热路径(启动 / 切 provider / restore 都走)塞网络 I/O + 失败态。
+/// 非 antigravity → `Value::Null`(catalog 回退 raw id)。
+fn antigravity_display_names(api_format_lower: &str) -> Value {
+    if !matches!(api_format_lower, "antigravity_oauth" | "antigravity") {
+        return Value::Null;
+    }
+    let mut map = serde_json::Map::new();
+    for m in antigravity_static_models() {
+        if !m.display_name.is_empty() {
+            map.insert(m.id, Value::String(m.display_name));
+        }
+    }
+    Value::Object(map)
 }
 
 pub fn desktop_config_target_for_provider(
@@ -106,6 +130,7 @@ pub fn desktop_config_target_for_provider(
             proxy_port,
             codex_network_access,
             codex_status_section_default_visible,
+            model_display_names: antigravity_display_names(&api_format_lower),
         };
     }
 
@@ -127,6 +152,7 @@ pub fn desktop_config_target_for_provider(
         proxy_port,
         codex_network_access,
         codex_status_section_default_visible,
+        model_display_names: antigravity_display_names(&api_format_lower),
     }
 }
 
@@ -141,12 +167,13 @@ pub fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConf
 }
 
 pub fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> {
-    catalog_models_for_provider(
+    catalog_models_for_provider_with_display_names(
         &target.provider_name,
         &target.default_model,
         target.supports_1m,
         Some(&target.model_mappings),
         Some(&target.model_capabilities),
+        Some(&target.model_display_names),
     )
     .into_iter()
     .map(|model| {
@@ -355,6 +382,7 @@ pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, Strin
             default_model: &target.default_model,
             model_mappings: Some(&target.model_mappings),
             model_capabilities: Some(&target.model_capabilities),
+            model_display_names: Some(&target.model_display_names),
             app_version: APP_VERSION,
             codex_network_access: target.codex_network_access,
             codex_status_section_default_visible: target.codex_status_section_default_visible,
@@ -1254,6 +1282,7 @@ mod tests {
             default_model: "gpt-5.5[1m]".into(),
             model_mappings: Value::Null,
             model_capabilities: Value::Null,
+            model_display_names: serde_json::Value::Null,
             requires_proxy: false,
             mode: "direct",
             proxy_port: 0,

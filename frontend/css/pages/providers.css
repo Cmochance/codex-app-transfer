@@ -716,6 +716,13 @@
   padding-right: 48px;
 }
 
+/* [MOC-69] 映射选框只读显示 displayName(实际存储/发上游仍是 raw id,从右侧下拉选)。
+   保持普通输入外观 + cursor 提示可点开下拉,隐藏文本光标。 */
+.provider-model-input-readonly {
+  cursor: pointer;
+  caret-color: transparent;
+}
+
 .provider-model-trigger {
   position: absolute;
   top: 1px;

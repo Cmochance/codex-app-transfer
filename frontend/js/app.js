@@ -711,6 +711,15 @@
     return tag || t("common.recommended");
   }
 
+  // [MOC-69] 按 raw id 在 providerAvailableModels 里反查 entry —— 给映射「选框」显示
+  // displayName 用。case-insensitive;找不到返回 null(其他 provider / 未拉取 /
+  // 自定义 id → 选框 fallback 显 raw id,行为同改前)。
+  function modelEntryById(id) {
+    const target = String(id || "").trim().toLowerCase();
+    if (!target) return null;
+    return providerAvailableModels.find((e) => modelEntryId(e).trim().toLowerCase() === target) || null;
+  }
+
   function providerModelOptionsMarkup(currentValue = "") {
     // recommended:true 置顶,其余保持原相对顺序(稳定排序);非推荐仍全量保留可见。
     // 其他 provider(全 string entry)recommended 恒 false,排序 no-op,行为同改前。
@@ -740,6 +749,38 @@
       </button>
     `;
     }).join("");
+  }
+
+  // [MOC-69] 映射「选框」渲染 —— raw id 能反查到带 displayName 的 entry 时,**只读**显示
+  // displayName(用户只看 displayName,实际存储/发上游仍是 raw id,从右侧下拉选);否则
+  // (未拉取 / 其他 provider / 自定义 id)保持可编辑输入显示 raw id,行为同改前。
+  // 只读分支**不带** data-provider-model-input → input 事件不会用 displayName 覆盖存储值;
+  // title 悬停可看真实 raw id。
+  function providerModelValueInputMarkup(rowKey, index, currentProviderModel, isRequired) {
+    const entry = modelEntryById(currentProviderModel);
+    const displayName = entry ? modelEntryDisplayLabel(entry) : "";
+    if (entry && displayName && displayName !== currentProviderModel) {
+      return `
+              <input
+                class="form-control provider-model-input provider-model-input-readonly"
+                id="providerMappingValue-${index}"
+                value="${escapeHtml(displayName)}"
+                data-model-value="${escapeHtml(currentProviderModel)}"
+                data-action="toggle-provider-model-menu"
+                data-row-key="${escapeHtml(rowKey)}"
+                title="${escapeHtml(currentProviderModel)}"
+                readonly
+              >`;
+    }
+    return `
+              <input
+                class="form-control provider-model-input"
+                id="providerMappingValue-${index}"
+                data-provider-model-input="${escapeHtml(rowKey)}"
+                value="${escapeHtml(currentProviderModel)}"
+                placeholder="${escapeHtml(t("providersAdd.providerModelPlaceholder"))}"
+                ${isRequired ? "required" : ""}
+              >`;
   }
 
   function slotMenuMarkup(rowKey, index) {
@@ -813,13 +854,7 @@
         <div class="form-mapping-right">
           <label class="form-label visually-hidden" for="providerMappingValue-${index}">${t("providersAdd.providerModel")}</label>
           <div class="provider-model-input-wrap ${openProviderModelMenuKey === rowKey ? "open" : ""}">
-            <input
-              class="form-control provider-model-input"
-              id="providerMappingValue-${index}"
-              data-provider-model-input="${escapeHtml(rowKey)}"
-              value="${escapeHtml(currentProviderModel)}"
-              placeholder="${escapeHtml(t("providersAdd.providerModelPlaceholder"))}"
-            >
+            ${providerModelValueInputMarkup(rowKey, index, currentProviderModel, false)}
             <button
               class="provider-model-trigger"
               type="button"
@@ -867,14 +902,7 @@
           <div class="form-mapping-right">
             <label class="form-label visually-hidden" for="providerMappingValue-${index}">${t("providersAdd.providerModel")}</label>
             <div class="provider-model-input-wrap ${openProviderModelMenuKey === rowKey ? "open" : ""}">
-              <input
-                class="form-control provider-model-input"
-                id="providerMappingValue-${index}"
-                data-provider-model-input="${escapeHtml(rowKey)}"
-                value="${escapeHtml(providerFormMappings[rowKey] || "")}"
-                placeholder="${escapeHtml(t("providersAdd.providerModelPlaceholder"))}"
-                ${isRequired ? "required" : ""}
-              >
+              ${providerModelValueInputMarkup(rowKey, index, currentProviderModel, isRequired)}
               <button
                 class="provider-model-trigger"
                 type="button"
@@ -936,6 +964,30 @@
     openProviderSlotMenuIndex = null;
     openProviderModelMenuKey = null;
     renderProviderMappings();
+  }
+
+  // [MOC-69] 编辑 antigravity provider 时静默拉一次模型列表,让映射选框立即显示 displayName
+  // (否则要手点「获取模型」才有反查表)。失败 / 离线 → 保持现状(选框显示 raw id),
+  // 不报错不清空(非破坏性 fallback)。antigravity 上游 list 走 OAuth token,不依赖 apiKey。
+  async function autoFetchModelsForDisplay() {
+    try {
+      const payload = providerPayloadFromForm(false);
+      if (editingProviderId && !payload.apiKey) {
+        try {
+          const secret = await CCApi.getProviderSecret(editingProviderId);
+          if (secret.apiKey) payload.apiKey = secret.apiKey;
+        } catch (e) { /* ignore — antigravity OAuth 不依赖 apiKey */ }
+      }
+      const result = await CCApi.fetchProviderModelsPayload(payload);
+      const models = Array.isArray(result.models) ? result.models.slice() : [];
+      if (models.length) {
+        setProviderMappings(providerFormMappings, { availableModels: models });
+      }
+    } catch (e) {
+      // 非破坏性 fallback:保持选框 raw id 显示,不弹 toast 不打扰用户;但留 devtools
+      // 面包屑便于诊断(显式「获取模型」按钮才 surface 错误给用户)。
+      console.warn("[autoFetchModelsForDisplay] displayName 预取失败,保持 raw id 显示:", e);
+    }
   }
 
   function collectProviderMappingsWithCustom() {
@@ -1999,6 +2051,11 @@
     setProviderMappings(provider.mappings || emptyMappings());
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
     updatePresetSelection();
+    // [MOC-69] antigravity 自动拉模型列表,让映射选框立即显示 displayName(不必手点「获取模型」);
+    // 失败/离线静默保持 raw id 显示。只对 antigravity(唯一带 displayName 的 provider)生效。
+    if ((effectiveFormat || provider.apiFormat) === "antigravity_oauth") {
+      await autoFetchModelsForDisplay();
+    }
   }
 
   async function renderProviderForm() {
