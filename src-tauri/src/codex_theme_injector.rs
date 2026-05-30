@@ -1329,18 +1329,14 @@ mod tests {
 
     #[test]
     fn per_theme_palette_and_converged_structure_in_script() {
-        // each theme threads ITS OWN accent + the converged engine markers
-        // (runtime --color-* layer, top-of-content fade, transparent main element).
-        for (id, accent) in [
-            ("changli", "#e08a55"),
-            ("frost", "#4f6cb0"),
-            ("carton", "#ff5a36"),
-            ("nocturne", "#7cc5d6"),
-            ("rose", "#e8475a"),
-        ] {
-            let assets = load_theme_assets(id).unwrap();
+        // 1) EVERY built-in theme must build a complete script —— 无未填占位符(`__`)
+        //    + converged 引擎标记(runtime --color-* 层 / top-fade / 透明 main /
+        //    style id)。覆盖全 11 套,关闭「未测主题可能带畸形 palette / 占位符 ship
+        //    green」的防御 gap(code-reviewer MOC-97 IMPORTANT)。
+        for id in THEME_IDS {
+            let assets = load_theme_assets(id).unwrap_or_else(|| panic!("{id} assets must load"));
             let script = build_inject_script(id, &assets);
-            assert!(script.contains(accent), "{id} missing its accent {accent}");
+            assert!(!script.contains("__"), "{id} has unfilled placeholder");
             assert!(
                 script.contains("--color-background-panel:var(--cl-glass-strong)"),
                 "{id} missing settings-card override"
@@ -1357,7 +1353,19 @@ mod tests {
                 script.contains("main.main-surface") && script.contains("cat-theme-style"),
                 "{id} missing transparent main / style id"
             );
-            assert!(!script.contains("__"), "{id} has unfilled placeholder");
+        }
+        // 2) 代表性 spot-check:每套 thread 自己**独立**的 accent(证 per-theme palette
+        //    接线正确,不是共享 accent)。
+        for (id, accent) in [
+            ("changli", "#e08a55"),
+            ("frost", "#4f6cb0"),
+            ("carton", "#ff5a36"),
+            ("nocturne", "#7cc5d6"),
+            ("rose", "#e8475a"),
+        ] {
+            let assets = load_theme_assets(id).unwrap();
+            let script = build_inject_script(id, &assets);
+            assert!(script.contains(accent), "{id} missing its accent {accent}");
         }
         // accent-less custom theme omits the accent block (keeps native blue)
         let custom_css = render_theme_css(None, "data:image/jpeg;base64,AA==");
