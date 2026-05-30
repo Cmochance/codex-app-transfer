@@ -265,6 +265,9 @@
         // supportsWebSearch:preset 标记是否支持 web_search 配置开关(MiMo /
         // Kimi / Gemini 三家)。frontend form 据此决定是否渲染开关 UI。
         supportsWebSearch: !!p.supportsWebSearch,
+        // MOC-91:gray=true 标记 TOS 灰色 / 实验性 preset。getPresets 显式挑字段,
+        // **必须透传 gray**,否则前端 visiblePresets() 拿不到它 → 隐藏开关失效。
+        gray: p.gray === true,
         ...computeIcon(p),
       }));
       return [...builtin, buildCustomThirdPartyPreset()];

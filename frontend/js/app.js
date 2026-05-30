@@ -19,6 +19,9 @@
   let pendingDeleteId = null;
   let selectedPreset = null;
   let presetCache = [];
+  // MOC-91:是否在 preset 选择器里展示「灰色」(TOS-gray / 实验性)preset。默认 false
+  // (隐藏)。仅过滤**展示**,presetCache 始终保留全量供已配置 provider 反查 preset。
+  let showGrayPresets = false;
   let formApiFormatValue = "openai_chat";
   let formModelCapabilities = {};
   let formRequestOptions = {};
@@ -1372,11 +1375,11 @@
       ? `<div class="provider-configured-list" data-provider-list>${providers.map(providerCardMarkup).join("")}</div>`
       : "";
     if (!providers.length) {
-      target.innerHTML = `<div class="provider-preset-grid">${presetCache.map((preset) => providerPresetCardMarkup(preset)).join("")}</div>`;
+      target.innerHTML = `<div class="provider-preset-grid">${visiblePresets().map((preset) => providerPresetCardMarkup(preset)).join("")}</div>`;
       return;
     }
     if (options.includePresets) {
-      target.innerHTML = `${providerList}${dashboardPresetSectionMarkup(providers, presetCache)}`;
+      target.innerHTML = `${providerList}${dashboardPresetSectionMarkup(providers, visiblePresets())}`;
     } else {
       target.innerHTML = providerList;
     }
@@ -1512,9 +1515,18 @@
     }
   }
 
+  // MOC-91:展示用的 preset 列表 —— `showGrayPresets=false` 时滤掉灰色(`gray:true`)preset。
+  // **只过滤展示**,不动 presetCache 本身(它还要供已配置 provider 反查 preset:logo /
+  // notices / 默认值 —— 见 presetMatchesProvider / showProviderForm),否则已添加的灰色
+  // provider 会匹配不到自己的 preset。
+  function visiblePresets(list) {
+    const src = list || presetCache;
+    return showGrayPresets ? src : src.filter((p) => p && p.gray !== true);
+  }
+
   async function renderPresets() {
     presetCache = await CCApi.getPresets();
-    $("#presetList").innerHTML = presetCache.map((preset) => {
+    $("#presetList").innerHTML = visiblePresets().map((preset) => {
       const active = selectedPreset?.id === preset.id;
       const isCustom = preset.id === "custom-third-party";
       const nameMarkup = isCustom
@@ -2264,6 +2276,8 @@
    $("#autoUnlockCodexPlugins").checked = settings.autoUnlockCodexPlugins !== false;
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
+    showGrayPresets = settings.showGrayProviders === true;
+    $("#showGrayProviders").checked = showGrayPresets;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#mcpCredentialsPortableStore").checked = settings.mcpCredentialsPortableStore !== false;
     $("#codexNetworkAccess").checked = settings.codexNetworkAccess !== false;
@@ -2798,6 +2812,7 @@
      autoUnlockCodexPlugins: $("#autoUnlockCodexPlugins")?.checked || false,
       autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
+      showGrayProviders: $("#showGrayProviders")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       mcpCredentialsPortableStore: $("#mcpCredentialsPortableStore")?.checked !== false,
       codexNetworkAccess: $("#codexNetworkAccess")?.checked !== false,
@@ -7835,6 +7850,12 @@
       } catch (e) { showToast(e.message); }
     });
     $("#exposeAllProviderModels").addEventListener("change", saveSettingsFromForm);
+    $("#showGrayProviders")?.addEventListener("change", async () => {
+      // MOC-91:更新展示过滤缓存 + 持久化。设置页当前不展示 preset,无需即时重渲染;
+      // 下次进「添加 provider」/ dashboard 时 visiblePresets() 即按新值过滤。
+      showGrayPresets = $("#showGrayProviders")?.checked === true;
+      await saveSettingsFromForm();
+    });
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
     $("#codexStatusSectionDefaultVisible")?.addEventListener("change", saveSettingsFromForm);
@@ -7930,6 +7951,9 @@
       console.error("[init] getSettings failed, using defaults:", err);
       settings = {};
     }
+    // MOC-91:在首屏 renderRoute 之前就同步灰色 preset 可见性,确保用户直接进
+    // 「添加 provider」时 visiblePresets() 已用上正确的设置值(默认隐藏)。
+    showGrayPresets = settings.showGrayProviders === true;
     const finalLang = settings.language || "zh";
     if (finalLang !== CCI18n.language) {
       // backend settings 跟 cache/navigator 不一致才再 apply,正常路径无 op

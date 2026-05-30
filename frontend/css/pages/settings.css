@@ -120,6 +120,8 @@
 
 .settings-note.residual-clean { color: var(--success, #16a34a); }
 .settings-note.residual-dirty { color: var(--danger, #dc2626); }
+/* MOC-91:灰色提供商的封号风险警告 —— danger 色 + 加粗,醒目区别于普通 note */
+.settings-note.settings-note-danger { color: var(--danger, #dc2626); font-weight: 600; }
 
 .inline-actions {
   justify-content: flex-end;

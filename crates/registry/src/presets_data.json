@@ -270,6 +270,7 @@
   },
   {
     "id": "grok-web",
+    "gray": true,
     "name": "Grok(Web)",
     "baseUrl": "https://grok.com",
     "docsUrl": "https://grok.com",
@@ -334,6 +335,7 @@
   },
   {
     "id": "gemini-cli-oauth",
+    "gray": true,
     "name": "Gemini CLI",
     "baseUrl": "https://cloudcode-pa.googleapis.com",
     "docsUrl": "https://github.com/google-gemini/gemini-cli",
@@ -370,6 +372,7 @@
   },
   {
     "id": "antigravity-oauth",
+    "gray": true,
     "name": "Antigravity",
     "baseUrl": "https://daily-cloudcode-pa.googleapis.com",
     "baseUrlOptions": [

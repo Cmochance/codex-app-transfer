@@ -56,6 +56,7 @@ pub(super) fn default_config_value() -> Value {
            "autoStart": false,
            "autoApplyOnStart": true,
            "exposeAllProviderModels": false,
+           "showGrayProviders": false,
            "restoreCodexOnExit": true,
            "mcpCredentialsPortableStore": true,
            "autoUnlockCodexPlugins": false,
