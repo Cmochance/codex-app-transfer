@@ -46,12 +46,18 @@ const ANTIGRAVITY_FETCH_HOSTS: &[&str] = &[
 
 const ANTIGRAVITY_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
 
-/// 模型过滤清单。两类:
+/// 模型过滤清单。三类:
 /// 1. CLIProxyAPI `cmd/fetch_antigravity_models/main.go:227-229` 硬编码 skip
 ///    (内部/实验性,公开调用会拒)
 /// 2. [MOC-69] 产品决策不提供给用户的款 —— claude 两款(antigravity 上游虽返回,
 ///    但本项目不暴露给 Codex 用户;走 cloud_code envelope 的 claude 在 Codex 工具
 ///    映射下行为未验证,主动隐藏)
+/// 3. [MOC-69] 上游返回但**实测彻底不可服务**的款 —— `gemini-pro-agent`
+///    (2026-05-30 直发 streamGenerateContent 实测:minimal / +thinkingLevel 任意值
+///    全部 400 INVALID_ARGUMENT,无任何可用组合)。它 displayName 跟可用的
+///    `gemini-3.1-pro-high` 同为 "Gemini 3.1 Pro (High)",留着会让用户在下拉里
+///    误选到死款。注:`gemini-3.1-pro-high` 本身可用(只是拒 thinkingLevel,见 MOC-79),
+///    **不**过滤。
 ///
 /// **实时 fetch(`fetch_antigravity_available_models`)和静态 seed
 /// (`static_models::seed_models`)都过此清单**,保证两条路径一致。
@@ -65,6 +71,8 @@ const SKIP_MODEL_IDS: &[&str] = &[
     // [MOC-69] claude 两款不提供给用户
     "claude-opus-4-6-thinking",
     "claude-sonnet-4-6",
+    // [MOC-69] 实测彻底不可服务(全 400),且 displayName 跟 gemini-3.1-pro-high 撞名
+    "gemini-pro-agent",
 ];
 
 /// `id` 是否在过滤清单内(实时 fetch + seed 共用,保证两路径一致)。
@@ -308,7 +316,8 @@ mod tests {
         assert_eq!(without, "{}");
     }
 
-    /// SKIP_MODEL_IDS 锚定 — 防修代码时不小心动了清单(含 [MOC-69] claude 两款)
+    /// SKIP_MODEL_IDS 锚定 — 防修代码时不小心动了清单(含 [MOC-69] claude 两款 +
+    /// 实测全 400 的 gemini-pro-agent)
     #[test]
     fn skip_list_matches_expected() {
         let expected = [
@@ -320,16 +329,20 @@ mod tests {
             "gemini-2.5-pro",
             "claude-opus-4-6-thinking",
             "claude-sonnet-4-6",
+            "gemini-pro-agent",
         ];
         assert_eq!(SKIP_MODEL_IDS, expected);
     }
 
-    /// [MOC-69] claude 两款必须在过滤清单内(产品决策不提供给用户)
+    /// [MOC-69] claude 两款 + gemini-pro-agent(实测全 400)必须在过滤清单内
     #[test]
-    fn claude_models_are_skipped() {
+    fn unservable_models_are_skipped() {
         assert!(is_skipped_model_id("claude-opus-4-6-thinking"));
         assert!(is_skipped_model_id("claude-sonnet-4-6"));
-        // gemini 款不受影响
+        // gemini-pro-agent: 实测 minimal/+thinkingLevel 全 400,过滤掉
+        assert!(is_skipped_model_id("gemini-pro-agent"));
+        // gemini-3.1-pro-high 本身可用(拒 thinkingLevel 是另一回事,MOC-79),不过滤
+        assert!(!is_skipped_model_id("gemini-3.1-pro-high"));
         assert!(!is_skipped_model_id("gemini-3.1-pro-low"));
     }
 }
