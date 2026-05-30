@@ -1735,38 +1735,31 @@ const MAX_USER_ERROR_MESSAGE_CHARS: usize = 2000;
 /// 实测 `gemini-3.1-pro-high` 400 INVALID_ARGUMENT 被 Codex 重发 12 次卡死,正是因为
 /// 旧实现 emit 的 `error.code = "bad_request"` 不在 Codex 白名单 → 落 Retryable。
 ///
-/// **映射原则**:
-/// - **永久性**错误(retry 同一请求结果不会变:400 bad_request / 400 content_filter /
-///   401 auth / 403 permission)→ `invalid_prompt`,让 Codex surface 错误 + 停手,用户
-///   能看到原因并换模型(MOC-79 的目标)。
-/// - **日级配额耗尽**(403/429 quota_exceeded)→ `insufficient_quota`(QuotaExceeded,
-///   当天 retry 无意义)。
-/// - **瞬时**错误(408 timeout / 429 rate_limited / 503 service_unavailable / 5xx
-///   server_error / upstream_error / upstream_transport_error)→ **保留原语义 code**,
-///   故意落 Codex `Retryable` —— 这是**期望行为**(指数退避重试可能成功),不要动。
-///   注意 503 **不**映射成 `server_is_overloaded`:Codex 的 `ServerOverloaded` 的
-///   `is_retryable()==false`(立即失败),会让本应重试的瞬时 503 直接断对话。
+/// **映射原则 —— 只有「无歧义永久性」错误才映射成非重试 code**:
+/// - retry 同一请求**必定**得到同样失败的(400 bad_request / 400 content_filter /
+///   401 auth / 403 permission)→ `invalid_prompt`(`InvalidRequest`,is_retryable=false),
+///   让 Codex surface 错误 + 停手,用户能看到原因并换模型(MOC-79 的目标)。
+/// - **其余分类一律保留原 code → 落 Codex `Retryable`**:瞬时错误(超时 / 限流 / 5xx /
+///   transport)退避重试可恢复;真不可恢复的(如日级配额)退避到 max_retries 后 surface,
+///   = pre-PR 行为,不误杀。**拿不准就别加白名单 —— 留 Retryable 比误判成非重试安全**。
+///
+/// 两次实证教训(chatgpt-codex-connector P2),都因把「半永久」错误当永久而误判:
+/// - 503 `service_unavailable` 是**瞬时过载**,若映射 `server_is_overloaded`
+///   (`ServerOverloaded`,is_retryable=false)会让本应重试的 503 立即断对话;
+/// - 429 `quota_exceeded` 在 Gemini 把 **per-minute 限流**和日级配额混在一起,若映射
+///   `insufficient_quota`(非重试)会让常见的 per-minute 限流立即失败。
+/// 两者都保留原 code 走 Retryable。
 ///
 /// 原始语义分类仍由 `emit_failure` 写进 `error.upstream_error_kind` + operator-side
 /// `tracing` 日志保留,不丢诊断信息。
 fn codex_retry_code(upstream_kind: &str) -> &str {
     match upstream_kind {
-        // ── 永久性 → Codex 白名单(is_retryable()=false,surface + 停)──
+        // 无歧义永久性(retry 同一请求必得同样失败)→ Codex 非重试 code,surface + 停
         "bad_request" | "content_filter" | "auth_error" | "permission_denied" => "invalid_prompt",
-        "quota_exceeded" => "insufficient_quota",
-        // ── 瞬时 → 保留原 code,故意落 Codex Retryable(指数退避重试可能成功)──
-        // 503 service_unavailable 也在此:Codex 的 `server_is_overloaded` → `ServerOverloaded`
-        // 的 `is_retryable()==false`(立即失败),用它会让本应重试的瞬时 503 直接断
-        // (chatgpt-codex-connector P2)。保留原 code → 落 Retryable。
-        "timeout"
-        | "rate_limited"
-        | "server_error"
-        | "service_unavailable"
-        | "upstream_error"
-        | "upstream_transport_error" => upstream_kind,
-        // 上面已穷举 `convert_gemini_error_to_responses_failure_stream` 当前产出的全部 11 个
-        // 语义 kind。未知 kind 理论不可达;**新增分类(尤其永久性的)必须在上面显式登记**,
-        // 否则会静默落到这里按"瞬时/可重试"处理 → 重蹈 MOC-79 卡死且无编译期信号。
+        // 其余(timeout / rate_limited / quota_exceeded / server_error / service_unavailable /
+        // upstream_error / upstream_transport_error)→ 保留原 code → Codex Retryable。
+        // **仅当确信是「无歧义永久性」分类时**才加到上面白名单;拿不准留这里(Retryable
+        // 比误杀安全,见上方两次 P2 教训)。
         other => other,
     }
 }
@@ -1783,11 +1776,12 @@ fn codex_retry_code(upstream_kind: &str) -> &str {
 /// - 401 / UNAUTHENTICATED → `auth_error` → `invalid_prompt`(永久,surface)
 /// - 403 / PERMISSION_DENIED → `permission_denied` → `invalid_prompt`(永久,surface)
 /// - 408 / 504 → `timeout` → 保留(瞬时,Codex 重试)
-/// - 429 + RESOURCE_EXHAUSTED → `quota_exceeded` → `insufficient_quota`(日级,停)
+/// - 429 + RESOURCE_EXHAUSTED → `quota_exceeded` → 保留(瞬时:Gemini 429 混 per-minute
+///   限流与日级配额,无法可靠区分 → 走 Codex 重试,见 [`codex_retry_code`])
 /// - 429 其他 → `rate_limited` → 保留(瞬时,指数退避 retry)
 /// - 400 + SAFETY/blockReason → `content_filter` → `invalid_prompt`(永久,surface)
 /// - 400 其他 → `bad_request` → `invalid_prompt`(永久,surface;**MOC-79 卡死点**)
-/// - 503 → `service_unavailable` → `server_is_overloaded`
+/// - 503 → `service_unavailable` → 保留(瞬时过载,Codex 重试;**不**用 `server_is_overloaded`)
 /// - 502 / 5xx 其他 → `server_error` → 保留(瞬时,Codex 重试)
 /// - 其他 → `upstream_error` → 保留(瞬时)
 ///
@@ -2682,9 +2676,10 @@ mod tests {
         assert!(s.contains("event: response.created"));
         assert!(s.contains("event: response.in_progress"));
         assert!(s.contains("event: response.failed"));
-        // 日级配额耗尽 → Codex 认识的 insufficient_quota(非重试);语义分类保留在 upstream_error_kind
-        assert!(s.contains("\"code\":\"insufficient_quota\""));
+        // 429 quota 保留 quota_exceeded(瞬时/混 per-minute → Codex Retryable,不映射非重试)
+        assert!(s.contains("\"code\":\"quota_exceeded\""));
         assert!(s.contains("\"upstream_error_kind\":\"quota_exceeded\""));
+        assert!(!s.contains("\"code\":\"insufficient_quota\""));
         assert!(s.contains("\"type\":\"upstream_http_429\""));
         assert!(s.contains("Quota exceeded"));
     }
@@ -2741,9 +2736,9 @@ mod tests {
         // 让 client UI 显示"次日重置"
         let body = r#"{"error":{"code":403,"message":"Quota exceeded for cloudaicompanionProject 'xxx-default-1234'.","status":"PERMISSION_DENIED"}}"#;
         let s = drive_failure_stream(403, body);
-        // 分类 quota_exceeded → Codex insufficient_quota(非重试)
+        // 分类 quota_exceeded;保留原 code(走 Codex Retryable),不映射非重试 insufficient_quota
         assert!(s.contains("\"upstream_error_kind\":\"quota_exceeded\""));
-        assert!(s.contains("\"code\":\"insufficient_quota\""));
+        assert!(s.contains("\"code\":\"quota_exceeded\""));
         assert!(s.contains("Free-tier daily quota exhausted"));
         // 不应误归 permission_denied
         assert!(!s.contains("\"upstream_error_kind\":\"permission_denied\""));
@@ -2819,9 +2814,10 @@ mod tests {
         assert_eq!(codex_retry_code("content_filter"), "invalid_prompt");
         assert_eq!(codex_retry_code("auth_error"), "invalid_prompt");
         assert_eq!(codex_retry_code("permission_denied"), "invalid_prompt");
-        assert_eq!(codex_retry_code("quota_exceeded"), "insufficient_quota");
-        // 瞬时错误 → 保留原 code,故意落 Codex Retryable(该重试,别动)
-        // 503 service_unavailable 必须留在瞬时:server_is_overloaded 在 Codex 是非重试态
+        // 其余一律保留原 code → Codex Retryable(该重试 / 拿不准别误杀,别动)
+        // quota_exceeded:Gemini 429 混 per-minute 限流,不映射非重试 insufficient_quota
+        assert_eq!(codex_retry_code("quota_exceeded"), "quota_exceeded");
+        // service_unavailable:瞬时过载,不映射非重试 server_is_overloaded
         assert_eq!(
             codex_retry_code("service_unavailable"),
             "service_unavailable"
@@ -2864,7 +2860,7 @@ mod tests {
         let body = r#"[{"error":{"code":429,"message":"array-form quota exceeded","status":"RESOURCE_EXHAUSTED"}}]"#;
         let s = drive_failure_stream(429, body);
         assert!(s.contains("array-form quota exceeded"));
-        assert!(s.contains("\"code\":\"insufficient_quota\""));
+        assert!(s.contains("\"code\":\"quota_exceeded\""));
         assert!(s.contains("\"upstream_error_kind\":\"quota_exceeded\""));
     }
 
@@ -2946,7 +2942,7 @@ mod tests {
         );
         let s = drive_failure_stream(429, &body);
         assert!(s.contains("…"));
-        assert!(s.contains("\"code\":\"insufficient_quota\""));
+        assert!(s.contains("\"code\":\"quota_exceeded\""));
     }
 
     #[test]
