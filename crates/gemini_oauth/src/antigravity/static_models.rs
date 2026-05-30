@@ -41,11 +41,11 @@ pub fn antigravity_static_models() -> Vec<AntigravityModelEntry> {
 mod tests {
     use super::*;
 
-    /// 锚定 seed 数量 = 8(CLIProxyAPI antigravity slice 10 条 - [MOC-69] 过滤掉
-    /// claude 两款)
+    /// 锚定 seed 数量 = 7(CLIProxyAPI antigravity slice 10 条 - [MOC-69] 过滤掉
+    /// claude 两款 + 用户实测不可用的 gemini-3.1-pro-high)
     #[test]
     fn seed_count_after_skip_filter() {
-        assert_eq!(antigravity_static_models().len(), 8);
+        assert_eq!(antigravity_static_models().len(), 7);
     }
 
     /// 锚定关键 model id 存在(防 seed 被意外清空 / 改名)
