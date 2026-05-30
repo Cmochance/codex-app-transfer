@@ -92,27 +92,37 @@ impl DisableThinkingWire {
     /// 上层(future caller)显式开 thinking 的极少数边界场景(虽然 compact 路径
     /// 当前没这种场景,但接口契约不应强制覆盖)。
     ///
-    /// **同时移除 `reasoning_effort`**(MOC-87):thinking 关掉后 `reasoning_effort`
-    /// 已无意义,且 DeepSeek V4 强制「`thinking.type=disabled` 与 `reasoning_effort`
-    /// 不可并存」—— 二者并存会被上游拒成 400(真机实证 `thinking options type cannot
-    /// be disabled when reasoning_effort is set`)。两派 disable 都删:Kimi / MiMo
-    /// 删它同样安全(同为「关思考」语义,`reasoning_effort` 此时无效)。
+    /// **当 thinking 确实被关掉时移除 `reasoning_effort`**(MOC-87):thinking 关掉后
+    /// `reasoning_effort` 已无意义,且 DeepSeek V4 强制「`thinking.type=disabled` 与
+    /// `reasoning_effort` 不可并存」—— 二者并存会被上游拒成 400(真机实证 `thinking
+    /// options type cannot be disabled when reasoning_effort is set`)。两派 disable
+    /// 都删:Kimi / MiMo 删它同样安全(同为「关思考」语义,`reasoning_effort` 此时无效)。
+    ///
+    /// **仅在 disable 真正生效时删**(chatgpt-codex-connector P2):因为本方法不覆盖
+    /// 已有的 `thinking`/`enable_thinking`,若 body 已显式 **enable** thinking,则不关
+    /// 思考、也保留用户/provider 的 `reasoning_effort`(不能无脑删,否则丢配置)。
     pub fn inject(self, chat_body: &mut Value) {
         let Some(obj) = chat_body.as_object_mut() else {
             return;
         };
-        // MOC-87:关思考的同时必须删 reasoning_effort —— 否则 deepseek-v4 收到
-        // thinking.disabled + reasoning_effort 并存直接 400(compact 必中)。
-        obj.remove("reasoning_effort");
-        match self {
+        // 先 insert disable wire(不覆盖已有值),并判定 thinking 最终是否真被关。
+        let disabled = match self {
             Self::ThinkingTypeDisabled => {
-                obj.entry("thinking".to_owned())
+                let entry = obj
+                    .entry("thinking".to_owned())
                     .or_insert_with(|| serde_json::json!({"type": "disabled"}));
+                entry.get("type").and_then(|t| t.as_str()) == Some("disabled")
             }
             Self::EnableThinkingFalse => {
-                obj.entry("enable_thinking".to_owned())
+                let entry = obj
+                    .entry("enable_thinking".to_owned())
                     .or_insert_with(|| serde_json::json!(false));
+                entry.as_bool() == Some(false)
             }
+        };
+        // 仅当 thinking 确实被关掉才删 reasoning_effort(见上方 P2 说明)。
+        if disabled {
+            obj.remove("reasoning_effort");
         }
     }
 }
@@ -513,6 +523,47 @@ mod tests {
         let mut body = json!({"model": "deepseek-v4-flash", "messages": []});
         DisableThinkingWire::ThinkingTypeDisabled.inject(&mut body);
         assert_eq!(body["thinking"], json!({"type": "disabled"}));
+    }
+
+    #[test]
+    fn inject_keeps_reasoning_effort_when_thinking_explicitly_enabled() {
+        // chatgpt-codex-connector P2:body 已显式 enable thinking 时,inject 不覆盖
+        // (思考没关)→ 必须**保留** reasoning_effort,不能误删用户/provider 的配置。
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [],
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high"
+        });
+        DisableThinkingWire::ThinkingTypeDisabled.inject(&mut body);
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled"}),
+            "不覆盖已有 enabled"
+        );
+        assert_eq!(
+            body["reasoning_effort"], "high",
+            "思考没被关时必须保留 reasoning_effort"
+        );
+        // 派B 同理:已显式 enable_thinking:true → 保留 reasoning_effort
+        let mut body = json!({
+            "model": "mimo-v2-omni",
+            "messages": [],
+            "enable_thinking": true,
+            "reasoning_effort": "medium"
+        });
+        DisableThinkingWire::EnableThinkingFalse.inject(&mut body);
+        assert_eq!(body["enable_thinking"], json!(true));
+        assert_eq!(body["reasoning_effort"], "medium");
+        // 已有值就是 disabled/false 时,仍删(disable 生效)
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [],
+            "thinking": {"type": "disabled"},
+            "reasoning_effort": "low"
+        });
+        DisableThinkingWire::ThinkingTypeDisabled.inject(&mut body);
+        assert!(body.get("reasoning_effort").is_none(), "已 disabled 时也删");
     }
 
     #[test]
