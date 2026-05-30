@@ -681,20 +681,65 @@
     return providerFormModelSlots.filter((slot) => !used.has(slot.key));
   }
 
+  // [MOC-69] provider 可用 model 列表项可能是 raw id string(gemini-cli / 普通
+  // OpenAI provider),也可能是带元数据的 object(Antigravity `/api/antigravity-oauth/
+  // models` 的 entry,含 display_name / recommended / tag_title)。下面 helper 统一
+  // 抽取,**只影响展示文本 / 排序 / 标记,绝不改提交的 value** —— value 永远是 raw id。
+  function modelEntryId(entry) {
+    // 【硬约束】写进 select / mapping 的 value 永远是 raw id,绝不用 display_name。
+    if (typeof entry === "string") return entry;
+    if (!entry || typeof entry !== "object") return "";
+    return entry.id || entry.model || "";
+  }
+
+  function modelEntryDisplayLabel(entry) {
+    // 显示文本优先 display_name(如 "Gemini 3.5 Flash (High)"),fallback name -> id。
+    // 其他 provider 的 entry(string / 无 display_name 的 object)自动回退到 id。
+    if (typeof entry === "string") return entry;
+    if (!entry || typeof entry !== "object") return "";
+    return entry.display_name || entry.name || entry.id || entry.model || "";
+  }
+
+  function modelEntryIsRecommended(entry) {
+    return !!(entry && typeof entry === "object" && entry.recommended === true);
+  }
+
+  function modelEntryTagLabel(entry) {
+    // recommended model 的标记:优先 tag_title(如 "Fast"),没有就 i18n "推荐"。
+    if (!modelEntryIsRecommended(entry)) return "";
+    const tag = (entry && typeof entry.tag_title === "string") ? entry.tag_title.trim() : "";
+    return tag || t("common.recommended");
+  }
+
   function providerModelOptionsMarkup(currentValue = "") {
-    return providerAvailableModels.map((modelId) => (`
+    // recommended:true 置顶,其余保持原相对顺序(稳定排序);非推荐仍全量保留可见。
+    // 其他 provider(全 string entry)recommended 恒 false,排序 no-op,行为同改前。
+    const indexed = providerAvailableModels.map((entry, i) => ({ entry, i }));
+    indexed.sort((a, b) => {
+      const ra = modelEntryIsRecommended(a.entry) ? 0 : 1;
+      const rb = modelEntryIsRecommended(b.entry) ? 0 : 1;
+      if (ra !== rb) return ra - rb;
+      return a.i - b.i;
+    });
+    return indexed.map(({ entry }) => {
+      const modelId = modelEntryId(entry);
+      const label = modelEntryDisplayLabel(entry);
+      const isRecommended = modelEntryIsRecommended(entry);
+      const tagLabel = modelEntryTagLabel(entry);
+      return `
       <button
-        class="mapping-slot-option ${modelId === currentValue ? "selected" : ""}"
+        class="mapping-slot-option ${modelId === currentValue ? "selected" : ""} ${isRecommended ? "recommended" : ""}"
         type="button"
         role="option"
         data-action="select-provider-model-option"
         data-model-value="${escapeHtml(modelId)}"
         aria-selected="${modelId === currentValue ? "true" : "false"}"
       >
-        <span>${escapeHtml(modelId)}</span>
+        <span>${escapeHtml(label)}${tagLabel ? `<span class="model-option-tag" style="margin-left:6px;padding:1px 6px;border-radius:999px;font-size:11px;line-height:1.5;background:var(--primary-soft,#dbeafe);color:var(--primary,#2563eb);vertical-align:middle;">${escapeHtml(tagLabel)}</span>` : ""}</span>
         ${modelId === currentValue ? '<i class="bi bi-check2"></i>' : ""}
       </button>
-    `)).join("");
+    `;
+    }).join("");
   }
 
   function slotMenuMarkup(rowKey, index) {
