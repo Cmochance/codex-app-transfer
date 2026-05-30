@@ -1893,9 +1893,9 @@ fn repair_v4a_envelope(body: &str) -> String {
 ///
 /// 来源:MOC-57(#321,作者 @Alpaca233114514)。
 #[derive(Debug, Clone)]
-struct V4aError {
-    line: usize,
-    message: String,
+pub(crate) struct V4aError {
+    pub(crate) line: usize,
+    pub(crate) message: String,
 }
 
 /// 检测 chat function args(JSON 形态)是否被流式截断:未闭合字符串(奇数个
@@ -1980,7 +1980,7 @@ fn detect_v4a_truncation(v4a: &str) -> Option<String> {
 /// 行被 trim 后误当 operation header。
 ///
 /// 来源:MOC-57(#321,作者 @Alpaca233114514);bug 修复见 PR #322 review。
-fn validate_v4a_syntax(input: &str) -> Result<(), V4aError> {
+pub(crate) fn validate_v4a_syntax(input: &str) -> Result<(), V4aError> {
     let lines: Vec<&str> = input.lines().collect();
     if lines.is_empty() {
         return Err(V4aError {

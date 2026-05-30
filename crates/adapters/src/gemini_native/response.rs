@@ -147,6 +147,10 @@ struct ClosedFunctionCall {
     /// router 对 apply_patch 硬要求 `ToolPayload::Custom{input}`,收 Function
     /// payload 直接 abort(见 responses/converter.rs::close_tool_call 注释)。
     apply_patch_input: Option<String>,
+    /// [MOC-75] V4A 后验校验失败(完整但畸形的 patch)→ envelope custom_tool_call 也
+    /// emit `status="incomplete"`,让严格读 envelope 终态的客户端不把畸形 patch 当完整
+    /// 执行(破坏性半应用防护,对齐 #322)。仅 apply_patch 分支可能置 true。
+    apply_patch_incomplete: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -954,7 +958,8 @@ impl GeminiToResponsesConverter {
                     "call_id": fc.call_id.clone(),
                     "name": fc.name.clone(),
                     "input": input,
-                    "status": "completed",
+                    // [MOC-75] 畸形 patch envelope 终态也 incomplete(对齐流式 + 破坏性防护)
+                    "status": if fc.apply_patch_incomplete { "incomplete" } else { "completed" },
                 }),
                 None => json!({
                     "type": "function_call",
@@ -1345,15 +1350,37 @@ impl GeminiToResponsesConverter {
         // close_tool_call;Gemini 不增量,无 interrupted 半截风险,故不走 incomplete)。
         if name == APPLY_PATCH_TOOL_NAME {
             let input = crate::responses::extract_apply_patch_input(&args_json_str);
-            // [MOC-75 review] Gemini 没按 `input` 填(空 args / 填错 key / 裸串)时,
-            // extract 会原样回吐非 V4A 串,下面照样 emit status=completed →
-            // Codex `parse_patch` 失败 → aborted。这里在 gemini 层显式 warn 带 model
-            // 上下文(对齐 chat converter.rs:866-871),否则排障看不到是哪个 Gemini
-            // 模型 misbehave、会误以为 MOC-75 没修好。判据用 `*** Begin Patch` 而非
-            // is_empty(),能同时抓住 `{}` / 错 key / 裸串三种畸形。
-            if !input.contains("*** Begin Patch") {
+            let has_begin = input.contains("*** Begin Patch");
+            // [MOC-75 silent-failure review] 完整但畸形的 V4A patch(有 `*** Begin Patch`
+            // 头但 hunk header / operation marker / 结构非法)→ emit `status="incomplete"`,
+            // 阻止 Codex 执行 partial/invalid patch(apply_patch destructive,partial 执行
+            // 可能在意外目标写入意外内容 —— 对齐 #322 MOC-57 chat 路径破坏性半应用防护)。
+            // Gemini 的 `functionCall.args` 是一次性完整结构(非 OpenAI 式 token 增量),
+            // 无流式截断风险,故只做语法后验、不复用 chat 的截断双检测器。
+            //
+            // 空 / 裸串(无 `*** Begin Patch`,如 `{}` / 错 key)无 hunk 可半应用 → 保持
+            // `completed` 原样透传,让 Codex `parse_patch` 报错(非破坏性;test 2116 行为不变)。
+            let v4a_err = if has_begin {
+                crate::responses::validate_v4a_syntax(&input).err()
+            } else {
+                None
+            };
+            let incomplete = v4a_err.is_some();
+            if let Some(ref e) = v4a_err {
                 tracing::warn!(
                     target: "adapters::gemini::apply_patch",
+                    error_id = "GEMINI_APPLY_PATCH_V4A_INVALID",
+                    call_id = %call_id,
+                    model = %self.model,
+                    line = e.line,
+                    message = %e.message,
+                    "Gemini apply_patch V4A 语法校验失败(完整但畸形)→ emit status=incomplete \
+                     阻止破坏性半应用;排查该 Gemini 模型 misbehave",
+                );
+            } else if !has_begin {
+                tracing::warn!(
+                    target: "adapters::gemini::apply_patch",
+                    error_id = "GEMINI_APPLY_PATCH_NO_V4A_ENVELOPE",
                     call_id = %call_id,
                     model = %self.model,
                     args_preview = %args_json_str.chars().take(120).collect::<String>(),
@@ -1361,6 +1388,11 @@ impl GeminiToResponsesConverter {
                      原样透传给 Codex,parse_patch 将失败 — 排查该 Gemini 模型 misbehave",
                 );
             }
+            let status = if incomplete {
+                "incomplete"
+            } else {
+                "completed"
+            };
             emit_event(
                 out,
                 &mut self.sequence_number,
@@ -1378,30 +1410,34 @@ impl GeminiToResponsesConverter {
                     },
                 }),
             );
-            emit_event(
-                out,
-                &mut self.sequence_number,
-                "response.custom_tool_call_input.delta",
-                json!({
-                    "type": "response.custom_tool_call_input.delta",
-                    "item_id": item_id.clone(),
-                    "output_index": output_index,
-                    "call_id": call_id.clone(),
-                    "delta": input.clone(),
-                }),
-            );
-            emit_event(
-                out,
-                &mut self.sequence_number,
-                "response.custom_tool_call_input.done",
-                json!({
-                    "type": "response.custom_tool_call_input.done",
-                    "item_id": item_id.clone(),
-                    "output_index": output_index,
-                    "call_id": call_id.clone(),
-                    "input": input.clone(),
-                }),
-            );
+            // incomplete 时跳过 input.delta + input.done —— 不发"输入已就绪"信号,
+            // 对齐 chat 路径(防 Codex 把畸形 patch 当 ready 去执行)。
+            if !incomplete {
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.custom_tool_call_input.delta",
+                    json!({
+                        "type": "response.custom_tool_call_input.delta",
+                        "item_id": item_id.clone(),
+                        "output_index": output_index,
+                        "call_id": call_id.clone(),
+                        "delta": input.clone(),
+                    }),
+                );
+                emit_event(
+                    out,
+                    &mut self.sequence_number,
+                    "response.custom_tool_call_input.done",
+                    json!({
+                        "type": "response.custom_tool_call_input.done",
+                        "item_id": item_id.clone(),
+                        "output_index": output_index,
+                        "call_id": call_id.clone(),
+                        "input": input.clone(),
+                    }),
+                );
+            }
             emit_event(
                 out,
                 &mut self.sequence_number,
@@ -1415,17 +1451,21 @@ impl GeminiToResponsesConverter {
                         "call_id": call_id.clone(),
                         "name": name,
                         "input": input.clone(),
-                        "status": "completed",
+                        "status": status,
                     },
                 }),
             );
-            crate::responses::global_tool_call_cache().save(
-                &call_id,
-                crate::responses::ToolCallEntry {
-                    name: name.to_owned(),
-                    arguments: args_json_str.clone(),
-                },
-            );
+            // incomplete 不写 cache —— 下一轮引用此 call_id 会拿到 incomplete 上下文反而
+            // 误导;让 orphan repair 路径补占位(对齐 chat 路径)。
+            if !incomplete {
+                crate::responses::global_tool_call_cache().save(
+                    &call_id,
+                    crate::responses::ToolCallEntry {
+                        name: name.to_owned(),
+                        arguments: args_json_str.clone(),
+                    },
+                );
+            }
             self.closed_function_calls.push(ClosedFunctionCall {
                 item_id,
                 output_index,
@@ -1434,6 +1474,7 @@ impl GeminiToResponsesConverter {
                 arguments_json_str: args_json_str,
                 namespace: None,
                 apply_patch_input: Some(input),
+                apply_patch_incomplete: incomplete,
             });
             return;
         }
@@ -1521,6 +1562,7 @@ impl GeminiToResponsesConverter {
             arguments_json_str: args_json_str,
             namespace: namespace_for,
             apply_patch_input: None,
+            apply_patch_incomplete: false,
         });
     }
 
@@ -2140,6 +2182,54 @@ mod tests {
         assert_eq!(item["type"], "custom_tool_call");
         // 空 args → input 无 V4A 信封(确认没把 "{}" 当成有效 patch)
         assert!(!item["input"].as_str().unwrap().contains("*** Begin Patch"));
+    }
+
+    /// [MOC-75 silent-failure review] 完整但畸形的 V4A patch(有 `*** Begin Patch` 头
+    /// 但非法 operation marker)→ emit `status=incomplete` 阻止 Codex 破坏性半应用,
+    /// 且跳过 `custom_tool_call_input.done`,envelope 终态也 incomplete(对齐 #322 chat 路径)。
+    #[test]
+    fn apply_patch_malformed_v4a_emits_incomplete() {
+        // 有 Begin/End Patch 但 operation 非法(Frobnicate)→ validate_v4a_syntax 拒绝;
+        // repair 无法把未知 operation 修成合法 → incomplete。
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Frobnicate File: a.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|e| parse_event(e)).collect();
+        // 仍走 custom_tool_call wire(不回落 function_call)
+        let done = parsed
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done" && p["item"]["type"] == "custom_tool_call"
+            })
+            .expect("custom_tool_call output_item.done 应 emit");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "完整但畸形的 V4A 必须 status=incomplete(阻止破坏性半应用)"
+        );
+        // incomplete 不发 input.done(不发就绪信号)
+        assert!(
+            !parsed
+                .iter()
+                .any(|(n, _)| n == "response.custom_tool_call_input.done"),
+            "incomplete 路径不该 emit custom_tool_call_input.done"
+        );
+        // envelope 终态也 incomplete
+        let completed = parsed
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let item = completed.1["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(
+            item["status"], "incomplete",
+            "envelope 终态也必须 incomplete"
+        );
     }
 
     #[test]

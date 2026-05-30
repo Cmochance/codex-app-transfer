@@ -20,6 +20,9 @@ pub use artifact_store::{global_tool_artifact_store, ToolArtifactStore};
 pub use converter::ChatToResponsesConverter;
 // [MOC-75] gemini_native 复用 chat 的 apply_patch input 解析(alt-key 容错一致)
 pub(crate) use converter::extract_apply_patch_input;
+// [MOC-75] gemini_native 复用 chat 的 V4A 后验语法校验(完整但畸形的 patch → emit
+// status=incomplete,对齐 #322 MOC-57 破坏性半应用防护)
+pub(crate) use converter::{validate_v4a_syntax, V4aError};
 pub use request::{
     responses_body_to_chat_body, responses_body_to_chat_body_for_provider,
     responses_body_to_chat_body_for_provider_with_session,
