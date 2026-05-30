@@ -68,6 +68,10 @@ const SKIP_MODEL_IDS: &[&str] = &[
     "tab_jump_flash_lite_preview",
     "gemini-2.5-flash-thinking",
     "gemini-2.5-pro",
+    // [MOC-69] gemini-2.5-flash / -lite 上游 displayName 假冒成 "Gemini 3.1 Flash
+    // Lite"(名实不符,实证 fetchAvailableModels),且是旧版,过滤掉不给用户
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     // [MOC-69] claude 两款不提供给用户
     "claude-opus-4-6-thinking",
     "claude-sonnet-4-6",
@@ -327,6 +331,8 @@ mod tests {
             "tab_jump_flash_lite_preview",
             "gemini-2.5-flash-thinking",
             "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
             "claude-opus-4-6-thinking",
             "claude-sonnet-4-6",
             "gemini-3.1-pro-high",
