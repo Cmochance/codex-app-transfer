@@ -185,12 +185,43 @@ pub fn restore_backup(
             "-C",
             &skills_dir.display().to_string(),
         ])
+        .arg("--no-same-owner")
+        .arg("--no-overwrite-dir")
         .status()
         .map_err(|e| SkillsBackupError::TarFailed(format!("spawn tar: {e}")))?;
     if !status.success() {
         return Err(SkillsBackupError::TarFailed(format!(
             "tar exit status: {status}"
         )));
+    }
+    // post-extract path escape check: walk skills_dir 确保没有文件逃逸到外部
+    // (防御恶意 tar 含 symlink 指向 .. / 绝对路径等,虽 tar 默认拒绝绝对路径,
+    // 但某些 bsdtar 版本行为不一致;做 defense-in-depth 二次校验)。
+    {
+        fn check_dir_escape(dir: &Path, root: &Path) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for ent in entries.flatten() {
+                    let p = ent.path();
+                    if let Ok(canon) = p.canonicalize() {
+                        if !canon.starts_with(root) {
+                            tracing::error!(
+                                "skills restore: escaped path detected and cleaned: {} → {}",
+                                p.display(),
+                                canon.display()
+                            );
+                            let _ = std::fs::remove_dir_all(dir);
+                            return;
+                        }
+                    }
+                    if p.is_dir() {
+                        check_dir_escape(&p, root);
+                    }
+                }
+            }
+        }
+        let skills_canonical =
+            skills_dir.canonicalize().unwrap_or_else(|_| skills_dir.to_path_buf());
+        check_dir_escape(skills_dir, &skills_canonical);
     }
     Ok(())
 }

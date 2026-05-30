@@ -215,6 +215,62 @@ fn parse_server_table(name: &str, tbl: &Table) -> Option<McpServerSpec> {
     })
 }
 
+fn command_basename(command: &str) -> String {
+    let trimmed = command.trim().trim_matches('"').trim_matches('\'');
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(trimmed)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase()
+}
+
+fn command_is_shell(command: &str) -> bool {
+    matches!(
+        command_basename(command).as_str(),
+        "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ksh"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "powershell.exe"
+            | "pwsh"
+            | "pwsh.exe"
+    )
+}
+
+fn cwd_is_sensitive(cwd: &str) -> bool {
+    let path = PathBuf::from(cwd.trim());
+    if !path.is_absolute() {
+        return true;
+    }
+    let normalized = cwd.replace('\\', "/").to_ascii_lowercase();
+    let sensitive_parts = [
+        "/windows",
+        "/system32",
+        "/program files",
+        "/program files (x86)",
+        "/programdata",
+        "/users",
+        "/appdata",
+        "/etc",
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/private/etc",
+    ];
+    let root_like = path.parent().is_none()
+        || normalized == "/"
+        || normalized.ends_with(":/")
+        || normalized.ends_with(':');
+    root_like || sensitive_parts.iter().any(|needle| normalized.contains(needle))
+}
+
 /// 校验 spec — stdio 必须 command,http 必须 url。失败返带说明的 error。
 pub fn validate_spec(spec: &McpServerSpec) -> Result<(), String> {
     if spec.name.is_empty() {
@@ -232,8 +288,21 @@ pub fn validate_spec(spec: &McpServerSpec) -> Result<(), String> {
     }
     match spec.transport {
         McpTransport::Stdio => {
-            if spec.command.as_deref().unwrap_or("").is_empty() {
+            let command = spec.command.as_deref().unwrap_or("").trim();
+            if command.is_empty() {
                 return Err("stdio transport 必须填 command".into());
+            }
+            if command_is_shell(command) {
+                return Err(format!(
+                    "stdio transport 拒绝直接使用 shell 解释器 command={command:?};请改用明确的 MCP 可执行文件"
+                ));
+            }
+            if let Some(cwd) = spec.cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty()) {
+                if cwd_is_sensitive(cwd) {
+                    return Err(format!(
+                        "stdio transport cwd 不安全:{cwd};请选择具体项目目录或用户明确管理的数据目录"
+                    ));
+                }
             }
             if spec.url.is_some() {
                 return Err("stdio transport 不允许设 url(请切换 streamable_http)".into());
@@ -496,4 +565,63 @@ pub fn write_raw(content: &str) -> Result<(), String> {
 #[allow(dead_code)]
 pub fn _verify_path_exists(_p: &Path) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stdio_spec(command: &str) -> McpServerSpec {
+        McpServerSpec {
+            name: "safe-server".to_owned(),
+            transport: McpTransport::Stdio,
+            command: Some(command.to_owned()),
+            args: Some(vec!["server".to_owned()]),
+            env: None,
+            cwd: None,
+            url: None,
+            bearer_token_env_var: None,
+            http_headers: None,
+            env_http_headers: None,
+            enabled: true,
+            required: false,
+            supports_parallel_tool_calls: false,
+            experimental_environment: None,
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            default_tools_approval_mode: None,
+            enabled_tools: None,
+            disabled_tools: None,
+        }
+    }
+
+    #[test]
+    fn validate_spec_rejects_shell_commands() {
+        for command in ["sh", "bash", "cmd.exe", "powershell.exe", "pwsh"] {
+            let err = validate_spec(&stdio_spec(command)).unwrap_err();
+            assert!(
+                err.contains("shell"),
+                "command {command} should be rejected with shell error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_spec_allows_common_mcp_launchers() {
+        for command in ["node", "npx", "python", "uvx"] {
+            validate_spec(&stdio_spec(command)).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_spec_rejects_sensitive_cwd() {
+        let mut spec = stdio_spec("node");
+        spec.cwd = Some(if cfg!(windows) {
+            "C:\\Windows\\System32".to_owned()
+        } else {
+            "/etc".to_owned()
+        });
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.contains("cwd 不安全"), "got: {err}");
+    }
 }

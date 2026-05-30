@@ -98,6 +98,8 @@ pub enum ForwardError {
     Resolve(#[from] ResolveError),
     #[error("adapter: {0}")]
     Adapter(#[from] AdapterError),
+    #[error("bad request: {0}")]
+    BadRequest(String),
     /// OAuth bearer 不可用(用户没登过 / refresh 失败 / token 文件 IO 错)。
     /// 跟 generic Header 错误区分,IntoResponse 走 401 + 结构化 code 提示用户
     /// 重新登录,**不**走 502 generic 错误体(2026-05-11 silent-failure 修)。
@@ -185,6 +187,7 @@ impl axum::response::IntoResponse for ForwardError {
         }
 
         let (status, body) = match &self {
+            ForwardError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ForwardError::Resolve(re) => (re.status(), format!("proxy resolve error: {re}")),
             ForwardError::Adapter(ae) => (
                 StatusCode::BAD_REQUEST,
@@ -342,6 +345,7 @@ pub async fn forward_handler(
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
     let upstream_url = build_upstream_url(&resolved.upstream_base, &plan.upstream_path);
+    check_ssrf_safe(&upstream_url)?;
     let telemetry = proxy_telemetry();
     telemetry
         .logs
@@ -691,6 +695,68 @@ fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
     match query {
         Some(q) => format!("{base}{rest}?{q}"),
         None => format!("{base}{rest}"),
+    }
+}
+
+/// SSRF 防护:检查 upstream URL host 不是私有/内部/环回地址。
+/// 防御场景:config.json 被篡改,provider.baseUrl 指向云 metadata(169.254.169.254)
+/// 或本地服务(127.0.0.1:6379 Redis 等),proxy 再代为转发请求。
+fn check_ssrf_safe(upstream_url: &str) -> Result<(), ForwardError> {
+    let uri: http::Uri = upstream_url
+        .parse()
+        .map_err(|e| ForwardError::BadRequest(format!("invalid upstream URL: {e}")))?;
+    let host = uri.host().unwrap_or("");
+    if host.is_empty() {
+        return Err(ForwardError::BadRequest("upstream URL has no host".into()));
+    }
+    // 直接 IP 检查
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_private_or_loopback_ip(ip) {
+            return Err(ForwardError::BadRequest(format!(
+                "upstream URL points to private/loopback IP: {host}"
+            )));
+        }
+        return Ok(());
+    }
+    // hostname 检查
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower == "metadata.google.internal"
+    {
+        return Err(ForwardError::BadRequest(format!(
+            "upstream URL points to internal hostname: {host}"
+        )));
+    }
+    // DNS rebinding 防御:解析 hostname,拒接任何解析到私有 IP 的 host
+    use std::net::ToSocketAddrs;
+    let addr_str = format!("{host}:443");
+    if let Ok(addrs) = addr_str.to_socket_addrs() {
+        for addr in addrs {
+            if is_private_or_loopback_ip(addr.ip()) {
+                return Err(ForwardError::BadRequest(format!(
+                    "upstream URL {host} resolves to private/loopback IP: {}",
+                    addr.ip()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_private_or_loopback_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || (v4.octets()[0] == 100 && v4.octets()[1] >= 64 && v4.octets()[1] <= 127)
+                || (v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19))
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified()
+        }
     }
 }
 

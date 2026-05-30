@@ -398,8 +398,86 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
     let cursor = Cursor::new(&bytes[..]);
     let decoder = flate2::read::GzDecoder::new(cursor);
     let mut archive = tar::Archive::new(decoder);
-    // path traversal safety:tar crate 默认会拒绝绝对路径 + ..(只要不调 set_preserve_permissions(true))
-    archive.unpack(&staged).map_err(|e| format!("untar: {e}"))?;
+    // path traversal + symlink safety:
+    // - tar crate unpack() 拒绝绝对路径 / .. 但不拒绝 symlink。
+    //   恶意 tarball 可含指向 /etc/passwd 或 ../.ssh/ 的 symlink,
+    //   后续 archive 条目若跟 symlink 同 path 就会覆写外部文件。
+    // - 改用 entries() 迭代,每条校验:
+    //   (1) path 不逃逸 staged 目录(canonicalize 后仍以 staged 为前缀)
+    //   (2) 拒绝 symlink 类型(平台通用;即使 target 合法,也防止后续条目
+    //       写到 symlink 指向的外部路径)
+    //   (3) 拒绝硬链接(unix 才出现;防御多引用攻击)
+    //   任何违反 → 清 staged 报错,绝不部分解压。
+    //
+    // 不信任 archive.unpack() 的默认防护:tar crate 0.4 的 unpack_internal
+    // 只 reject 绝对路径 + windows 盘符 + `..` 组件,不拦截 symlink 创建。
+    {
+        let staged_canonical = staged
+            .canonicalize()
+            .map_err(|e| format!("cannot canonicalize staged dir: {e}"))?;
+        for entry in archive
+            .entries()
+            .map_err(|e| format!("read tar entries: {e}"))?
+        {
+            let mut entry = entry.map_err(|e| format!("tar entry error: {e}"))?;
+            let entry_path = entry
+                .path()
+                .map_err(|e| format!("tar entry path error: {e}"))?
+                .into_owned();
+            // (1) path escape check — 先拼完整路径再 canonicalize
+            let full = staged.join(&entry_path);
+            // canonicalize 要求路径存在;对新建文件/目录先检查 parent
+            let check_path = if full.exists() {
+                full.canonicalize().map_err(|e| {
+                    format!("cannot canonicalize entry {}: {e}", entry_path.display())
+                })?
+            } else if let Some(parent) = full.parent() {
+                // parent 必须已存在(由 tar 条目顺序保证目录先于文件)
+                let parent_canon = if parent.exists() {
+                    parent.canonicalize().map_err(|e| {
+                        format!(
+                            "cannot canonicalize parent of {}: {e}",
+                            entry_path.display()
+                        )
+                    })?
+                } else {
+                    parent.to_path_buf()
+                };
+                parent_canon.join(
+                    full.file_name()
+                        .ok_or_else(|| {
+                            format!("entry has no filename: {}", entry_path.display())
+                        })?,
+                )
+            } else {
+                return Err(format!(
+                    "entry has no parent: {}",
+                    entry_path.display()
+                ));
+            };
+            if !check_path.starts_with(&staged_canonical) {
+                let _ = fs::remove_dir_all(&staged);
+                return Err(format!(
+                    "tarball entry escapes staged dir: {} → {}",
+                    entry_path.display(),
+                    check_path.display()
+                ));
+            }
+            // (2) reject symlinks and hard links
+            let header = entry.header();
+            if header.entry_type().is_symlink() || header.entry_type().is_hard_link() {
+                let _ = fs::remove_dir_all(&staged);
+                return Err(format!(
+                    "tarball contains forbidden symlink/hardlink: {}",
+                    entry_path.display()
+                ));
+            }
+            // (3) extract this entry
+            entry
+                .unpack_in(&staged)
+                .map_err(|e| format!("untar entry {}: {e}", entry_path.display()))?;
+        }
+    }
     // 验证 plugin.json 存在(防 marketplace 投毒)
     let candidate_a = staged.join(".codex-plugin").join("plugin.json");
     let candidate_b = staged.join(".claude-plugin").join("plugin.json");

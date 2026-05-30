@@ -37,10 +37,35 @@ pub async fn serve_static(req: Request) -> Response {
 
 fn file_response(path: &str, bytes: &'static [u8]) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime.essence_str())
-        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CACHE_CONTROL, "no-cache");
+    // CSP 头 — 防御 XSS → Tauri IPC 提权(AP-006)。
+    // Tauri webview 内 JS 可调 `window.__TAURI__` invoke Rust command,
+    // XSS 一旦执行就能读取文件系统 / 启动进程。严格 CSP 降低注入面:
+    // - script-src 'self': 拒绝 inline script / eval,只允许同源 .js
+    // - connect-src 'self' http://127.0.0.1:*: 允许 fetch 管理 API
+    // - default-src 'none' + 逐资源类型放行:最小权限
+    // - frame-ancestors 'none': 防 clickjacking 嵌入
+    builder = builder.header(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; \
+         script-src 'self'; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; \
+         font-src 'self'; \
+         connect-src 'self' http://127.0.0.1:*; \
+         frame-ancestors 'none'; \
+         base-uri 'self'; \
+         form-action 'none'",
+    );
+    // 额外安全头
+    builder = builder
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::X_FRAME_OPTIONS, "DENY")
+        .header(header::REFERRER_POLICY, "no-referrer");
+    builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "build response").into_response())
 }
