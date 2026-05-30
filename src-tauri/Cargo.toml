@@ -85,6 +85,9 @@ objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplic
 windows = { version = "0.59", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
+    # MOC-94:原生进程枚举(替 spawn tasklist)判断 Codex 是否在运行
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [features]

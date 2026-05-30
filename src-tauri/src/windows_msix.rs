@@ -28,10 +28,15 @@
 
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager};
 
@@ -93,6 +98,68 @@ pub fn activate_packaged_app(aumid: &str, args: &str) -> Result<u32, String> {
     }
 }
 
+/// AUMID 进程内缓存(MOC-94)。**只缓存成功值** —— 同一 Codex 安装内 AUMID 恒定,
+/// 但首次解析失败(Codex 未装 / PowerShell 瞬时失败)不能缓存 None 永久毒化(否则
+/// 后续即便 Codex 装好也永远走 explorer.exe fallback 丢 debug 参数),失败下次重试。
+/// (沿用 MOC-91 `update.rs` "只 cache 成功 Client" 的教训。)
+static CACHED_AUMID: OnceLock<String> = OnceLock::new();
+
+/// 解析 Codex Desktop 的 AUMID,带进程内缓存(避免每次启动 spawn PowerShell
+/// `Get-AppxPackage` ~150–400ms,MOC-94)。首次解析成功后缓存,后续直接返回;
+/// 解析失败不缓存,下次再试。
+pub fn resolve_codex_aumid() -> Option<String> {
+    if let Some(cached) = CACHED_AUMID.get() {
+        return Some(cached.clone());
+    }
+    let resolved = resolve_codex_aumid_uncached()?;
+    // set 可能因并发竞争失败(另一线程已写),无所谓 —— 值相同。
+    let _ = CACHED_AUMID.set(resolved.clone());
+    Some(resolved)
+}
+
+/// 用原生 `CreateToolhelp32Snapshot` 进程枚举判断 Codex Desktop 是否在运行
+/// (MOC-94,替代 spawn `tasklist` —— quit 轮询里高频调用,每次 spawn 进程
+/// 在 Windows 上 ~50–200ms)。比较 `Codex.exe`(大小写不敏感)。
+///
+/// 返回:
+/// - `Some(true)` / `Some(false)`:确切判定。
+/// - `None`:快照创建失败,无法判定 → caller 应 fallback 到 tasklist。
+pub fn is_codex_running() -> Option<bool> {
+    // SAFETY:Toolhelp32 API 全程在 unsafe 块内按文档用法调用 —— snapshot 句柄
+    // 创建成功后保证 CloseHandle;PROCESSENTRY32W 按 dwSize 初始化;遍历到 NULL
+    // 终止符截断进程名。所有原始指针来自栈上 entry,无悬垂。
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = false;
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                if name.eq_ignore_ascii_case(WINDOWS_PROCESS_NAME) {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        Some(found)
+    }
+}
+
+/// Codex Desktop 的 Windows 进程名(与 `process.rs::WINDOWS_PROCESS_NAME` 一致)。
+const WINDOWS_PROCESS_NAME: &str = "Codex.exe";
+
 /// 用 PowerShell `Get-AppxPackage -Name "OpenAI.Codex"` 反推 Codex Desktop
 /// 的 AUMID。
 ///
@@ -106,7 +173,7 @@ pub fn activate_packaged_app(aumid: &str, args: &str) -> Result<u32, String> {
 /// 让 caller 走 explorer.exe 老路径或 last-resort Method 6(非 Store 直装 .exe);
 /// 写死 publisher hash 作 fallback 会让 ActivateApplication 用错的 AUMID 报错
 /// 比 None 更难诊断,且 explorer.exe fallback 已是 safety net。
-pub fn resolve_codex_aumid() -> Option<String> {
+fn resolve_codex_aumid_uncached() -> Option<String> {
     // PowerShell `Get-AppxPackage` 需要 `-NoProfile` 加速启动(否则会跑
     // 用户 PSProfile 几百 ms 起步)。
     // `CREATE_NO_WINDOW = 0x0800_0000`:防止 powershell 在前台 flash 一个
