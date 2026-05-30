@@ -1741,10 +1741,11 @@ const MAX_USER_ERROR_MESSAGE_CHARS: usize = 2000;
 ///   能看到原因并换模型(MOC-79 的目标)。
 /// - **日级配额耗尽**(403/429 quota_exceeded)→ `insufficient_quota`(QuotaExceeded,
 ///   当天 retry 无意义)。
-/// - **上游过载**(503 service_unavailable)→ `server_is_overloaded`(Codex 有专门 UX)。
-/// - **瞬时**错误(408 timeout / 429 rate_limited / 5xx server_error / upstream_error /
-///   upstream_transport_error)→ **保留原语义 code**,故意落 Codex `Retryable` —— 这是
-///   **期望行为**(指数退避重试可能成功),不要动。
+/// - **瞬时**错误(408 timeout / 429 rate_limited / 503 service_unavailable / 5xx
+///   server_error / upstream_error / upstream_transport_error)→ **保留原语义 code**,
+///   故意落 Codex `Retryable` —— 这是**期望行为**(指数退避重试可能成功),不要动。
+///   注意 503 **不**映射成 `server_is_overloaded`:Codex 的 `ServerOverloaded` 的
+///   `is_retryable()==false`(立即失败),会让本应重试的瞬时 503 直接断对话。
 ///
 /// 原始语义分类仍由 `emit_failure` 写进 `error.upstream_error_kind` + operator-side
 /// `tracing` 日志保留,不丢诊断信息。
@@ -1753,11 +1754,14 @@ fn codex_retry_code(upstream_kind: &str) -> &str {
         // ── 永久性 → Codex 白名单(is_retryable()=false,surface + 停)──
         "bad_request" | "content_filter" | "auth_error" | "permission_denied" => "invalid_prompt",
         "quota_exceeded" => "insufficient_quota",
-        "service_unavailable" => "server_is_overloaded",
         // ── 瞬时 → 保留原 code,故意落 Codex Retryable(指数退避重试可能成功)──
+        // 503 service_unavailable 也在此:Codex 的 `server_is_overloaded` → `ServerOverloaded`
+        // 的 `is_retryable()==false`(立即失败),用它会让本应重试的瞬时 503 直接断
+        // (chatgpt-codex-connector P2)。保留原 code → 落 Retryable。
         "timeout"
         | "rate_limited"
         | "server_error"
+        | "service_unavailable"
         | "upstream_error"
         | "upstream_transport_error" => upstream_kind,
         // 上面已穷举 `convert_gemini_error_to_responses_failure_stream` 当前产出的全部 11 个
@@ -2816,11 +2820,12 @@ mod tests {
         assert_eq!(codex_retry_code("auth_error"), "invalid_prompt");
         assert_eq!(codex_retry_code("permission_denied"), "invalid_prompt");
         assert_eq!(codex_retry_code("quota_exceeded"), "insufficient_quota");
+        // 瞬时错误 → 保留原 code,故意落 Codex Retryable(该重试,别动)
+        // 503 service_unavailable 必须留在瞬时:server_is_overloaded 在 Codex 是非重试态
         assert_eq!(
             codex_retry_code("service_unavailable"),
-            "server_is_overloaded"
+            "service_unavailable"
         );
-        // 瞬时错误 → 保留原 code,故意落 Codex Retryable(该重试,别动)
         assert_eq!(codex_retry_code("timeout"), "timeout");
         assert_eq!(codex_retry_code("rate_limited"), "rate_limited");
         assert_eq!(codex_retry_code("server_error"), "server_error");
@@ -2843,10 +2848,12 @@ mod tests {
     #[test]
     fn failure_stream_503_service_unavailable_distinct_from_500() {
         let s = drive_failure_stream(503, r#"{"error":{"message":"overloaded"}}"#);
-        // 503 → Codex server_is_overloaded(ServerOverloaded UX);语义 kind 仍是 service_unavailable
-        assert!(s.contains("\"code\":\"server_is_overloaded\""));
+        // 503 是瞬时 → 保留 service_unavailable(落 Codex Retryable,该重试);
+        // **不**映射 server_is_overloaded(那会变 is_retryable=false 立即断,见 codex_retry_code)
+        assert!(s.contains("\"code\":\"service_unavailable\""));
+        assert!(!s.contains("\"code\":\"server_is_overloaded\""));
         assert!(s.contains("\"upstream_error_kind\":\"service_unavailable\""));
-        // 500 是瞬时 → 保留 server_error(落 Codex Retryable,该重试)
+        // 500 也是瞬时 → 保留 server_error(落 Codex Retryable,该重试)
         let s = drive_failure_stream(500, r#"{"error":{"message":"internal"}}"#);
         assert!(s.contains("\"code\":\"server_error\""));
     }
