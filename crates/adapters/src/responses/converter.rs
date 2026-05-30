@@ -876,102 +876,81 @@ impl ChatToResponsesConverter {
             if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
                 pending.apply_patch_input = Some(input.clone());
             }
-            // interrupted 中断时,patch 文本可能 mid-stream 被截断 — emit
-            // `status="incomplete"` 让 Codex CLI 看到 apply_patch handler 不
-            // 应该执行 partial patch(apply_patch destructive,partial 执行
-            // 可能在意外目标上写入意外内容)。同时 skip `input.done`(很多
-            // 严格客户端在 `.done` 才触发执行)。
-            if interrupted {
+            // [MOC-57] 截断检测(JSON 结构 + V4A 信封双层级)。#303 只靠
+            // `interrupted` 模糊信号判断 patch 是否完整;这里主动检测 args 是否
+            // 被流式切断,即使上游没断流也能发现。
+            let json_truncation = detect_json_truncation(&args_acc);
+            let v4a_truncation = detect_v4a_truncation(&input);
+            let is_truncated = json_truncation.is_some() || v4a_truncation.is_some();
+            // [MOC-57] V4A 后验语法校验(仅非截断时做,截断本身已是 invalid)。
+            let v4a_validation = if is_truncated {
+                None
+            } else {
+                validate_v4a_syntax(&input).err()
+            };
+            if let Some(ref err) = v4a_validation {
+                tracing::warn!(
+                    target: "adapters::apply_patch",
+                    call_id = %call_id,
+                    line = err.line,
+                    message = %err.message,
+                    "apply_patch V4A syntax validation failed",
+                );
+            }
+            // interrupted / 截断 / 语法错误任一成立 → emit `status="incomplete"`,
+            // 让 Codex CLI 看到 apply_patch handler 不应执行 partial/invalid patch
+            // (apply_patch destructive,partial 执行可能在意外目标写入意外内容)。
+            let should_incomplete = interrupted || is_truncated || v4a_validation.is_some();
+            if should_incomplete {
                 tracing::warn!(
                     target: "adapters::apply_patch",
                     call_id = %call_id,
                     args_len = args_acc.len(),
-                    "apply_patch tool call cut off mid-stream (no finish_reason and not from [DONE]). Emitting output_item with status=incomplete; skipping input.done to prevent partial patch execution.",
+                    interrupted,
+                    json_truncated = json_truncation.is_some(),
+                    v4a_truncated = v4a_truncation.is_some(),
+                    v4a_invalid = v4a_validation.is_some(),
+                    detail = %json_truncation
+                        .as_deref()
+                        .or(v4a_truncation.as_deref())
+                        .unwrap_or(""),
+                    "apply_patch tool call incomplete (interrupted/truncated/invalid). Emitting output_item with status=incomplete; skipping input.done to prevent partial patch execution.",
                 );
-                let item = json!({
-                    "type": "custom_tool_call",
-                    "id": fc_id,
-                    "call_id": call_id,
-                    "name": name,
-                    "input": input,
-                    "status": "incomplete",
-                });
-                emit_event(
+                // emit incomplete 不写 cache(下一轮引用此 call_id 会拿到 incomplete
+                // 上下文,反而误导;让 orphan repair 路径补占位)。标记
+                // interrupted_during_close 让 `tool_call_item_completed` 在 envelope
+                // 终态也 emit incomplete(严格客户端读 envelope 才不误以为 patch 完整)。
+                emit_apply_patch_output(
+                    &fc_id,
+                    &call_id,
+                    &name,
+                    &input,
+                    &args_acc,
+                    output_index,
+                    /* interrupted = */ true,
                     out,
                     &mut self.sequence_number,
-                    "response.output_item.done",
-                    json!({
-                        "type": "response.output_item.done",
-                        "output_index": output_index,
-                        "item": item,
-                    }),
+                    &mut self.tool_calls,
+                    openai_index,
                 );
-                // 不存 cache(下一轮如果引用此 call_id 重建会拿到 incomplete
-                // 上下文,反而误导;让 orphan repair 路径补占位)。
-                // 标记 interrupted 让 `tool_call_item_completed` 在 envelope
-                // 终态也 emit `status="incomplete"`,严格客户端读 envelope
-                // 才不会误以为 patch 完整(Devin pre-merge review 修复)。
                 if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
                     pending.closed = true;
-                    pending.interrupted_during_close = true;
                 }
                 return;
             }
-            // open 阶段 emit 了空 input 的 output_item.added;这里一次性补
-            // input.delta + output_item.done,让 Codex CLI 的 streaming
-            // parser(`StreamingPatchParser`)拿到完整 patch 文本后 finish。
-            emit_event(
-                out,
-                &mut self.sequence_number,
-                "response.custom_tool_call_input.delta",
-                json!({
-                    "type": "response.custom_tool_call_input.delta",
-                    "item_id": fc_id,
-                    "output_index": output_index,
-                    "call_id": call_id,
-                    "delta": input,
-                }),
-            );
-            emit_event(
-                out,
-                &mut self.sequence_number,
-                "response.custom_tool_call_input.done",
-                json!({
-                    "type": "response.custom_tool_call_input.done",
-                    "item_id": fc_id,
-                    "output_index": output_index,
-                    "call_id": call_id,
-                    "input": input,
-                }),
-            );
-            let item = json!({
-                "type": "custom_tool_call",
-                "id": fc_id,
-                "call_id": call_id,
-                "name": name,
-                "input": input,
-                "status": "completed",
-            });
-            emit_event(
-                out,
-                &mut self.sequence_number,
-                "response.output_item.done",
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": output_index,
-                    "item": item,
-                }),
-            );
-            // ToolCallCache 用于下一轮 Codex CLI 发 tool output 时重建工具
-            // 调用上下文。回灌走 chat completions(messages.tool_calls.function
-            // .arguments 是 JSON 字符串),所以这里仍存原始 args_acc(JSON 形态)
-            // 而不是 input 裸文本,与 `assistant_message` 的 tool_calls 形态对齐。
-            global_tool_call_cache().save(
+            // 完整 patch:emit input.delta + done + completed item + 写 cache。
+            emit_apply_patch_output(
+                &fc_id,
                 &call_id,
-                ToolCallEntry {
-                    name: name.clone(),
-                    arguments: args_acc.clone(),
-                },
+                &name,
+                &input,
+                &args_acc,
+                output_index,
+                /* interrupted = */ false,
+                out,
+                &mut self.sequence_number,
+                &mut self.tool_calls,
+                openai_index,
             );
             if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
                 pending.closed = true;
@@ -1907,6 +1886,282 @@ fn repair_v4a_envelope(body: &str) -> String {
     out.extend(lines[b + 1..e].iter().map(|l| (*l).to_owned()));
     out.push("*** End Patch".to_owned());
     out.join("\n")
+}
+
+/// V4A 后验语法校验错误(行号 + 人类可读消息),供 close_tool_call 的
+/// `tracing::warn!` 定位。
+///
+/// 来源:MOC-57(#321,作者 @Alpaca233114514)。
+#[derive(Debug, Clone)]
+struct V4aError {
+    line: usize,
+    message: String,
+}
+
+/// 检测 chat function args(JSON 形态)是否被流式截断:未闭合字符串(奇数个
+/// 未转义 `"`)或 `{}` 不平衡。返回 `Some(detail)` 描述截断原因,`None` 表示
+/// JSON 结构完整。**只看结构、不校验 V4A 语义**(那是 [`detect_v4a_truncation`]
+/// 与 Codex CLI `parse_patch` 的事)。
+///
+/// 价值:#303 只靠 `interrupted` 这个模糊信号(流断 / [DONE] 缺失)判断 patch
+/// 是否完整;本函数主动检测 JSON 结构截断,即使上游没断流也能发现 args 被切。
+///
+/// 来源:MOC-57(#321,作者 @Alpaca233114514);返回类型从原 `TruncationInfo`
+/// struct 简化为 `Option<String>`(原 `level` 字段从未被读,去掉避免 dead_code)。
+fn detect_json_truncation(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 单趟扫描:同时跟 in_string 状态 + 只统计**字符串外**的 `{}`。
+    // [MOC-57 review #2/#3] 不能数整串 `{}` —— V4A patch 正文(在 JSON string
+    // value 内)常含不平衡括号(如 `+fn main() {` 单独一行),那是字符串内容、
+    // 无 JSON 结构意义。早期实现数整串会把这类合法 patch 误判 truncated → emit
+    // incomplete 阻止执行。这里只数 string 外的 brace,得到真实 JSON 结构平衡度。
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth: i64 = 0;
+    for ch in trimmed.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    if in_string {
+        return Some("unclosed JSON string (odd number of unescaped quotes)".to_owned());
+    }
+    if depth != 0 {
+        return Some(format!(
+            "unbalanced JSON structure (brace depth {depth} at end)"
+        ));
+    }
+    None
+}
+
+/// 检测提取出的 V4A 文本是否被截断(缺少列 0 裸 `*** End Patch` sentinel)。
+/// 返回 `Some(detail)` 表示截断,`None` 表示有正常结尾。复用 [`v4a_sentinel`]
+/// 的安全判定(仅认列 0、无前缀整行),故正文里的 `+*** End Patch` 不会误判为结尾。
+///
+/// 来源:MOC-57(#321,作者 @Alpaca233114514)。
+fn detect_v4a_truncation(v4a: &str) -> Option<String> {
+    if v4a.is_empty() {
+        return None;
+    }
+    let has_end = v4a
+        .lines()
+        .any(|l| v4a_sentinel(l) == Some("*** End Patch"));
+    if !has_end {
+        return Some("missing *** End Patch sentinel — V4A patch truncated".to_owned());
+    }
+    None
+}
+
+/// V4A 后验语法校验:检查首行 `*** Begin Patch` / 末行 `*** End Patch` sentinel +
+/// 列 0 控制标记(`*** Add/Update/Delete File:` / `*** Move to:` / `*** End of File` /
+/// `@@` hunk header)+ 正文行前缀(`+` / `-` / 空格)合法性。**不校验语义正确性**
+/// (文件存在性、行匹配等留给 Codex CLI `parse_patch`)。仅在 args 未截断时调用。
+///
+/// **关键(MOC-57 review)**:先按**原始行首字符**判正文前缀再 fall through 到 `***`
+/// 判定 —— 正文行恒有 `+`/`-`/` ` 前缀,据此先分流,避免空格前缀的 ` *** xxx` context
+/// 行被 trim 后误当 operation header。
+///
+/// 来源:MOC-57(#321,作者 @Alpaca233114514);bug 修复见 PR #322 review。
+fn validate_v4a_syntax(input: &str) -> Result<(), V4aError> {
+    let lines: Vec<&str> = input.lines().collect();
+    if lines.is_empty() {
+        return Err(V4aError {
+            line: 1,
+            message: "empty V4A patch".to_owned(),
+        });
+    }
+    if v4a_sentinel(lines[0]) != Some("*** Begin Patch") {
+        return Err(V4aError {
+            line: 1,
+            message: format!(
+                "expected '*** Begin Patch' on line 1, got '{}'",
+                lines[0].chars().take(80).collect::<String>()
+            ),
+        });
+    }
+    let last = lines.len();
+    if v4a_sentinel(lines[last - 1]) != Some("*** End Patch") {
+        return Err(V4aError {
+            line: last,
+            message: format!(
+                "expected '*** End Patch' on line {last}, got '{}'",
+                lines[last - 1].chars().take(80).collect::<String>()
+            ),
+        });
+    }
+    // V4A 列 0 控制标记全集(对齐本仓 apply_patch prompt,见 request.rs
+    // 的 V4A 格式说明)。[MOC-57 review #6] 必须含 `*** End of File`,否则用
+    // EOF marker 的合法 rename/update patch 被误判。
+    let valid_markers: &[&str] = &[
+        "*** Add File:",
+        "*** Update File:",
+        "*** Delete File:",
+        "*** Move to:",
+        "*** End of File",
+    ];
+    for (i, line) in lines.iter().enumerate().skip(1).take(last - 2) {
+        // [MOC-57 review #4/#5] **先按原始行首字符判正文前缀**,再 fall through
+        // 到 `***` header 判定。绝不能先 trim 再判 `***`:正文行 ` *** rule`
+        // (空格前缀的 context 行,内容恰以 `***` 开头,如 markdown 分隔线)trim
+        // 后会变成 `*** rule` 被误当 operation header 拒掉。V4A 控制行恒在列 0
+        // 无前缀;正文行恒有 `+`/`-`/` ` 前缀,据此先分流。
+        match line.chars().next() {
+            // 正文行(含内容以 `***` 开头的)/ 空 context 行 → 合法,跳过
+            Some('+') | Some('-') | Some(' ') => continue,
+            None => continue, // 空行
+            _ => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // `@@` / `@@ <context>` 是 Update File hunk header(列 0,无 +/-/空格前缀),合法
+        if trimmed.starts_with("@@") {
+            continue;
+        }
+        // 列 0 的 `*** End Patch`(理论上是末行,已被上面 last-1 排除;防御性放行)
+        if trimmed == "*** End Patch" {
+            continue;
+        }
+        if trimmed.starts_with("***") {
+            if !valid_markers.iter().any(|h| trimmed.starts_with(h)) {
+                return Err(V4aError {
+                    line: i + 1,
+                    message: format!(
+                        "unrecognized V4A operation on line {}: '{}'",
+                        i + 1,
+                        trimmed.chars().take(80).collect::<String>()
+                    ),
+                });
+            }
+        } else {
+            // 列 0、非控制标记、又无 +/-/空格 前缀 → 真非法
+            return Err(V4aError {
+                line: i + 1,
+                message: format!(
+                    "line {} missing V4A prefix (expected '+', '-', ' ', '@@', or '*** ' marker): '{}'",
+                    i + 1,
+                    line.chars().take(80).collect::<String>()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// emit apply_patch 的 `custom_tool_call` wire(从 `close_tool_call` 抽出,
+/// interrupted / completed 两条路径共用)。`interrupted=true` 时只 emit 一条
+/// `output_item.done` 带 `status="incomplete"`(skip input.delta/done,防 Codex CLI
+/// 执行 partial/invalid patch),且**不写** ToolCallCache(避免下轮引用到 incomplete
+/// 上下文);`interrupted=false` 时 emit 完整 delta/done + completed + 写 cache。
+///
+/// 来源:MOC-57(#321,作者 @Alpaca233114514)的重构,让截断 / 语法错误 / 流中断
+/// 三种 incomplete 路径复用同一 emit 逻辑。
+#[allow(clippy::too_many_arguments)]
+fn emit_apply_patch_output(
+    fc_id: &str,
+    call_id: &str,
+    name: &str,
+    input: &str,
+    args_acc: &str,
+    output_index: u32,
+    interrupted: bool,
+    out: &mut Vec<u8>,
+    sequence_number: &mut u64,
+    tool_calls: &mut BTreeMap<u32, PendingToolCall>,
+    openai_index: u32,
+) {
+    if interrupted {
+        let item = json!({
+            "type": "custom_tool_call",
+            "id": fc_id,
+            "call_id": call_id,
+            "name": name,
+            "input": input,
+            "status": "incomplete",
+        });
+        emit_event(
+            out,
+            sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item,
+            }),
+        );
+        if let Some(pending) = tool_calls.get_mut(&openai_index) {
+            pending.interrupted_during_close = true;
+        }
+        return;
+    }
+    emit_event(
+        out,
+        sequence_number,
+        "response.custom_tool_call_input.delta",
+        json!({
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": fc_id,
+            "output_index": output_index,
+            "call_id": call_id,
+            "delta": input,
+        }),
+    );
+    emit_event(
+        out,
+        sequence_number,
+        "response.custom_tool_call_input.done",
+        json!({
+            "type": "response.custom_tool_call_input.done",
+            "item_id": fc_id,
+            "output_index": output_index,
+            "call_id": call_id,
+            "input": input,
+        }),
+    );
+    let item = json!({
+        "type": "custom_tool_call",
+        "id": fc_id,
+        "call_id": call_id,
+        "name": name,
+        "input": input,
+        "status": "completed",
+    });
+    emit_event(
+        out,
+        sequence_number,
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        }),
+    );
+    global_tool_call_cache().save(
+        call_id,
+        ToolCallEntry {
+            name: name.to_owned(),
+            arguments: args_acc.to_owned(),
+        },
+    );
 }
 
 fn drain_one_frame(buf: &mut BytesMut) -> Option<Bytes> {
@@ -3435,6 +3690,162 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
         assert_eq!(
             extract_apply_patch_input(args),
             "*** Begin Patch\n*** Add File: a.txt\n+partial"
+        );
+    }
+
+    // ── [MOC-57] 截断检测 + V4A 后验校验(移植自 #321 @Alpaca233114514)──
+
+    #[test]
+    fn detect_json_truncation_unclosed_string() {
+        let s = r#"{"input": "*** Begin Patch"#;
+        assert!(detect_json_truncation(s).is_some());
+    }
+
+    #[test]
+    fn detect_json_truncation_unbalanced_brace() {
+        let s = r#"{"input": "ok""#;
+        assert!(detect_json_truncation(s).is_some());
+    }
+
+    #[test]
+    fn detect_json_truncation_valid_json_passes() {
+        let s = r#"{"input": "*** Begin Patch\n*** End Patch"}"#;
+        assert!(detect_json_truncation(s).is_none());
+    }
+
+    #[test]
+    fn detect_json_truncation_escaped_quote_not_miscounted() {
+        // 转义引号不应被当成字符串边界 → 结构完整
+        let s = r#"{"input": "say \"hi\""}"#;
+        assert!(detect_json_truncation(s).is_none());
+    }
+
+    #[test]
+    fn detect_v4a_truncation_missing_end() {
+        let v4a = "*** Begin Patch\n*** Add File: a.txt\n+x";
+        assert!(detect_v4a_truncation(v4a).is_some());
+    }
+
+    #[test]
+    fn detect_v4a_truncation_complete_passes() {
+        let v4a = "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch";
+        assert!(detect_v4a_truncation(v4a).is_none());
+    }
+
+    #[test]
+    fn validate_v4a_syntax_valid_patch_passes() {
+        let v4a = "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch";
+        assert!(validate_v4a_syntax(v4a).is_ok());
+    }
+
+    #[test]
+    fn validate_v4a_syntax_missing_begin_rejected() {
+        let v4a = "*** Add File: a.txt\n+hello\n*** End Patch";
+        let err = validate_v4a_syntax(v4a).unwrap_err();
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn validate_v4a_syntax_missing_end_rejected() {
+        let v4a = "*** Begin Patch\n*** Add File: a.txt\n+hello";
+        assert!(validate_v4a_syntax(v4a).is_err());
+    }
+
+    #[test]
+    fn validate_v4a_syntax_unknown_operation_rejected() {
+        let v4a = "*** Begin Patch\n*** Frobnicate File: a.txt\n+x\n*** End Patch";
+        assert!(validate_v4a_syntax(v4a).is_err());
+    }
+
+    #[test]
+    fn validate_v4a_syntax_missing_line_prefix_rejected() {
+        // 正文行缺 +/-/空格 前缀
+        let v4a = "*** Begin Patch\n*** Update File: a.txt\nbad line no prefix\n*** End Patch";
+        assert!(validate_v4a_syntax(v4a).is_err());
+    }
+
+    #[test]
+    fn validate_v4a_syntax_hunk_marker_allowed() {
+        // `@@` / `@@ <context>` 是 Update File 的 hunk 标记,必须当合法(否则
+        // 所有真实 Update File patch 都被误判截断)。
+        let v4a = "*** Begin Patch\n*** Update File: foo.py\n@@\n-old\n+new\n*** End Patch";
+        assert!(validate_v4a_syntax(v4a).is_ok());
+        let v4a_ctx =
+            "*** Begin Patch\n*** Update File: foo.py\n@@ def main():\n ctx\n-old\n+new\n*** End Patch";
+        assert!(validate_v4a_syntax(v4a_ctx).is_ok());
+    }
+
+    // ── [MOC-57 PR #322 review] 4 个 bot 揪出的误判合法 patch bug 的回归测试 ──
+
+    #[test]
+    fn detect_json_truncation_unbalanced_brace_inside_string_is_valid() {
+        // review #2/#3:patch 正文(JSON string value 内)含不平衡 `{` 不是 JSON 截断。
+        // 合法完整 JSON,但 patch 内容有 `+fn main() {` 单边括号。
+        let args = r#"{"input": "*** Begin Patch\n*** Add File: a.rs\n+fn main() {\n+    todo!()\n*** End Patch"}"#;
+        assert!(
+            detect_json_truncation(args).is_none(),
+            "字符串内的不平衡括号不该被判 JSON 截断"
+        );
+    }
+
+    #[test]
+    fn detect_json_truncation_real_structural_truncation_still_caught() {
+        // 反向:真 JSON 结构截断(外层 `{` 没闭合)仍要抓到
+        let args = r#"{"input": "*** Begin Patch\n*** End Patch""#; // 缺末尾 }
+        assert!(detect_json_truncation(args).is_some());
+    }
+
+    #[test]
+    fn validate_v4a_syntax_context_line_starting_with_stars_allowed() {
+        // review #4/#5:context 行(空格前缀)内容恰以 `***` 开头(markdown 分隔线等)
+        // 不该被 trim 后误当 operation header。
+        let v4a =
+            "*** Begin Patch\n*** Update File: doc.md\n@@\n *** a markdown rule\n+new line\n*** End Patch";
+        assert!(
+            validate_v4a_syntax(v4a).is_ok(),
+            "空格前缀的 ` *** ...` context 行应合法"
+        );
+        // `+` 前缀的 added 行内容以 `***` 开头同理合法
+        let v4a_add = "*** Begin Patch\n*** Add File: doc.md\n+*** heading\n*** End Patch";
+        assert!(validate_v4a_syntax(v4a_add).is_ok());
+    }
+
+    #[test]
+    fn validate_v4a_syntax_end_of_file_marker_allowed() {
+        // review #6:`*** End of File` 是本仓 apply_patch prompt 文档化的合法 marker。
+        let v4a =
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n+last line\n*** End of File\n*** End Patch";
+        assert!(validate_v4a_syntax(v4a).is_ok());
+    }
+
+    #[test]
+    fn validate_v4a_syntax_truly_invalid_operation_still_rejected() {
+        // 反向:真未知 operation header(列 0、`***` 前缀、非合法 marker)仍要拒
+        let v4a = "*** Begin Patch\n*** Frobnicate File: a.txt\n+x\n*** End Patch";
+        assert!(validate_v4a_syntax(v4a).is_err());
+    }
+
+    #[test]
+    fn apply_patch_truncated_args_emit_incomplete_status() {
+        // 端到端:apply_patch 的 args JSON 被截断(未闭合)→ close 时应 emit
+        // custom_tool_call status=incomplete,不走 completed(防 Codex 执行 partial)。
+        let chunk = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_t\",\"type\":\"function\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\": \\\"*** Begin Patch\\\\n+partial\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+        let mut c = fixed();
+        let mut out = c.feed(chunk);
+        out.extend(c.finish());
+        let events = parse_emitted(&out);
+        let done = events
+            .iter()
+            .find(|(n, v)| {
+                n == "response.output_item.done"
+                    && v["item"]["type"] == "custom_tool_call"
+                    && v["item"]["name"] == "apply_patch"
+            })
+            .expect("apply_patch custom_tool_call done event");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "截断的 apply_patch 必须 emit incomplete,实际事件: {:?}",
+            done.1
         );
     }
 
