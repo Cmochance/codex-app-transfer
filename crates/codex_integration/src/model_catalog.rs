@@ -106,6 +106,28 @@ pub fn catalog_models_for_provider(
     model_mappings: Option<&Value>,
     model_capabilities: Option<&Value>,
 ) -> Vec<CatalogModel> {
+    catalog_models_for_provider_with_display_names(
+        provider_name,
+        default_model,
+        supports_1m,
+        model_mappings,
+        model_capabilities,
+        None,
+    )
+}
+
+/// [MOC-69] 同 `catalog_models_for_provider`,额外接受 `display_names`(model id →
+/// 人类可读名,如 antigravity `gemini-3.5-flash-low` → "Gemini 3.5 Flash (Medium)")。
+/// catalog 的 `display_name`(Codex Desktop model picker 显示的名字)优先用它,反查
+/// 不到则 fallback raw 模型 id。`slug`(Codex 实际发出去的标识)与路由不受影响。
+pub fn catalog_models_for_provider_with_display_names(
+    provider_name: &str,
+    default_model: &str,
+    supports_1m: bool,
+    model_mappings: Option<&Value>,
+    model_capabilities: Option<&Value>,
+    display_names: Option<&Value>,
+) -> Vec<CatalogModel> {
     let default_model_clean = strip_internal_model_suffix(default_model);
     let default_model = default_model_clean.trim();
     let mappings = normalize_model_mappings(model_mappings);
@@ -133,6 +155,7 @@ pub fn catalog_models_for_provider(
             provider_name,
             target_clean.trim(),
             context_window,
+            display_names,
         ));
     }
     if !default_model.is_empty() && !models.iter().any(|m| m.slug == default_model) {
@@ -151,6 +174,7 @@ pub fn catalog_models_for_provider(
             provider_name,
             default_model,
             fallback_window,
+            display_names,
         ));
     }
     models
@@ -225,6 +249,7 @@ fn catalog_model(
     provider_name: &str,
     default_model: &str,
     context_window: u64,
+    display_names: Option<&Value>,
 ) -> CatalogModel {
     let target = if default_model.is_empty() {
         slug
@@ -235,13 +260,27 @@ fn catalog_model(
     // 一行,长 provider 前缀(如 "Xiaomi MiMo (Token Plan)")挤掉了真正的
     // 模型名,用户看不到选了什么。改成 display_name 只放模型名;
     // provider 移到 description tooltip 里保留信息。
+    // [MOC-69] antigravity 等带 displayName 的 provider:display_name 优先用人类可读名
+    // (raw id → "Gemini 3.5 Flash (Medium)"),反查不到 fallback raw id;slug 不变。
     CatalogModel {
         slug: slug.to_owned(),
-        display_name: target.to_owned(),
+        display_name: resolve_display_label(target, display_names),
         provider_name: provider_name.to_owned(),
         context_window,
         effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
     }
+}
+
+/// [MOC-69] 按 model id 在 `display_names`(id → 人类可读名 JSON object)里反查显示名;
+/// 无该字段 / 反查不到 / 空串 → fallback raw id(其他 provider 行为不变)。
+fn resolve_display_label(model_id: &str, display_names: Option<&Value>) -> String {
+    display_names
+        .and_then(|v| v.get(model_id))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| model_id.to_owned())
 }
 
 fn model_to_json(model: &CatalogModel) -> Value {
@@ -579,6 +618,62 @@ mod tests {
         assert_eq!(
             entry_small["auto_compact_token_limit"], 26_214,
             "32K context 应在 80% (26_214) 触发"
+        );
+    }
+
+    /// [MOC-69] display_names 反查覆盖 catalog 的 display_name:命中 → 人类名;空串 /
+    /// 缺键 / None → fallback raw id;slug(Codex 实际路由标识)始终不变。锁死
+    /// 「显示 displayName、存储/路由仍 raw id」契约。
+    #[test]
+    fn display_names_override_with_raw_id_fallback() {
+        let mappings = json!({
+            "default": "gemini-3-flash-agent",
+            "gpt_5_5": "gemini-3.5-flash-low",
+            "gpt_5_4": "gemini-3.5-flash-extra-low",
+            "gpt_5_4_mini": "gemini-pro-agent"
+        });
+        let display_names = json!({
+            "gemini-3.5-flash-low": "Gemini 3.5 Flash (Medium)",
+            "gemini-3.5-flash-extra-low": ""
+        });
+        let models = catalog_models_for_provider_with_display_names(
+            "Antigravity",
+            "gemini-3-flash-agent",
+            true,
+            Some(&mappings),
+            None,
+            Some(&display_names),
+        );
+        let dn = |slug: &str| {
+            models
+                .iter()
+                .find(|m| m.slug == slug)
+                .map(|m| m.display_name.clone())
+                .unwrap_or_default()
+        };
+        // 命中 → 人类名;slug 仍 gpt-5.5(路由不变)
+        assert_eq!(dn("gpt-5.5"), "Gemini 3.5 Flash (Medium)");
+        // 空串 → fallback raw id
+        assert_eq!(dn("gpt-5.4"), "gemini-3.5-flash-extra-low");
+        // 缺键(gemini-pro-agent 不在 display_names)→ fallback raw id
+        assert_eq!(dn("gpt-5.4-mini"), "gemini-pro-agent");
+
+        // None display_names(其他 provider)→ raw id,零回归
+        let no_names = catalog_models_for_provider_with_display_names(
+            "X",
+            "gemini-3-flash-agent",
+            true,
+            Some(&mappings),
+            None,
+            None,
+        );
+        assert_eq!(
+            no_names
+                .iter()
+                .find(|m| m.slug == "gpt-5.5")
+                .unwrap()
+                .display_name,
+            "gemini-3.5-flash-low"
         );
     }
 

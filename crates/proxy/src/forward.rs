@@ -665,7 +665,33 @@ fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
     } else {
         format!("/{}", upstream_path)
     };
-    format!("{}{}", upstream_base.trim_end_matches('/'), path)
+    let base = upstream_base.trim_end_matches('/');
+    // 容错:用户把完整 endpoint(如 `…/v1/chat/completions`、`…/v1/messages`、
+    // `…/responses`)整段填进 base_url 时,adapter 仍会按协议拼标准 endpoint,
+    // 拼成 `…/chat/completions/chat/completions` 等 → 上游 404
+    // (反馈 fb-3093a382:误把 opencode zen 完整地址填进 baseUrl,MOC-72)。
+    // 做法:取 path 在 `/` 段边界上、同时也是 base 末尾的最长前缀作为"重叠段"去掉再拼。
+    // 既覆盖 create 路径(base 末尾 `/responses` + path `/responses`),也覆盖子路径
+    // (base 末尾 `/responses` + path `/responses/{id}/cancel` → `…/responses/{id}/cancel`,
+    // 不翻倍);query 原样保留。非破坏性:base 不含 endpoint 时 overlap=0,按原样拼。
+    let (path_no_query, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path.as_str(), None),
+    };
+    let mut overlap = 0usize;
+    let mut acc = String::new();
+    for seg in path_no_query.split('/').skip(1) {
+        acc.push('/');
+        acc.push_str(seg);
+        if base.ends_with(&acc) {
+            overlap = acc.len();
+        }
+    }
+    let rest = &path_no_query[overlap..];
+    match query {
+        Some(q) => format!("{base}{rest}?{q}"),
+        None => format!("{base}{rest}"),
+    }
 }
 
 /// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
@@ -1689,5 +1715,73 @@ mod tests {
         // 上游返回非 UTF-8 时不 panic,认为不匹配
         let body: &[u8] = &[0xff, 0xfe, 0xfd, 0x00];
         assert!(!is_web_search_upstream_reject(body));
+    }
+
+    #[test]
+    fn build_upstream_url_dedups_endpoint_suffix_in_base() {
+        // 正常路径:base 不含 endpoint → 照常拼(回归保护)
+        assert_eq!(
+            build_upstream_url("https://api.moonshot.cn/v1", "/chat/completions"),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        // base 误填完整 chat endpoint(反馈 fb-3093a382:opencode zen)→ 去重不翻倍
+        assert_eq!(
+            build_upstream_url(
+                "https://opencode.ai/zen/go/v1/chat/completions",
+                "/chat/completions"
+            ),
+            "https://opencode.ai/zen/go/v1/chat/completions"
+        );
+        // 去重时保留 query
+        assert_eq!(
+            build_upstream_url(
+                "https://opencode.ai/zen/go/v1/chat/completions",
+                "/chat/completions?stream=true"
+            ),
+            "https://opencode.ai/zen/go/v1/chat/completions?stream=true"
+        );
+        // anthropic:base 误填 /v1/messages → 去重
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/v1/messages", "/v1/messages"),
+            "https://relay.example.com/v1/messages"
+        );
+        // anthropic 正常:base 不含 endpoint → 照常补 /v1/messages
+        assert_eq!(
+            build_upstream_url("https://api.anthropic.com", "/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        // responses:base 误填 /responses → 去重
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/responses", "/responses"),
+            "https://relay.example.com/responses"
+        );
+        // 不误伤:base=/v1 + /responses(OpenAI 官方 responses-direct)照常拼
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1", "/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+        // 不误伤:responses 子路径(cancel)且 base 不含 endpoint → 照常拼
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1", "/responses/resp_abc/cancel"),
+            "https://api.openai.com/v1/responses/resp_abc/cancel"
+        );
+        // codex-connector P2:base 误填 /responses + 子路径(cancel/retrieve)→ 段边界去重,不翻倍
+        assert_eq!(
+            build_upstream_url(
+                "https://relay.example.com/responses",
+                "/responses/resp_abc/cancel"
+            ),
+            "https://relay.example.com/responses/resp_abc/cancel"
+        );
+        // 段边界:base 末尾 /v1 + path /v1/responses → 只去掉重叠的 /v1,不误删
+        assert_eq!(
+            build_upstream_url("https://relay.example.com/v1", "/v1/responses"),
+            "https://relay.example.com/v1/responses"
+        );
+        // base 末尾 / 归一后再判断
+        assert_eq!(
+            build_upstream_url("https://api.openai.com/v1/", "/responses"),
+            "https://api.openai.com/v1/responses"
+        );
     }
 }

@@ -379,10 +379,27 @@
     "authScheme": "google_oauth_antigravity",
     "apiFormat": "antigravity_oauth",
     "models": {
-      "default": "gemini-3-flash"
+      "default": "gemini-3-flash-agent",
+      "gpt_5_5": "gemini-3.5-flash-low",
+      "gpt_5_4": "gemini-3.5-flash-extra-low",
+      "gpt_5_4_mini": "gemini-pro-agent",
+      "gpt_5_3_codex": "gemini-3.1-pro-low",
+      "gpt_5_2": "gemini-3-flash-agent"
     },
     "modelCapabilities": {
-      "gemini-3-flash": {
+      "gemini-3-flash-agent": {
+        "context_window": 1000000
+      },
+      "gemini-3.5-flash-low": {
+        "context_window": 1000000
+      },
+      "gemini-3.5-flash-extra-low": {
+        "context_window": 1000000
+      },
+      "gemini-pro-agent": {
+        "context_window": 1000000
+      },
+      "gemini-3.1-pro-low": {
         "context_window": 1000000
       }
     },

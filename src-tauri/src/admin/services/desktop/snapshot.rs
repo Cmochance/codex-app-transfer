@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_app_transfer_codex_integration::{
-    apply_provider, catalog_models_for_provider, ensure_file_store_mode, get_snapshot_status,
-    has_snapshot, list_snapshots, read_auth, restore_available_count, restore_codex_snapshot,
-    restore_codex_state, sync_mcp_credentials, ApplyConfig, CodexPaths,
+    apply_provider, catalog_models_for_provider_with_display_names, ensure_file_store_mode,
+    get_snapshot_status, has_snapshot, list_snapshots, read_auth, restore_available_count,
+    restore_codex_snapshot, restore_codex_state, sync_mcp_credentials, ApplyConfig, CodexPaths,
 };
+use codex_app_transfer_gemini_oauth::antigravity_static_models;
 use codex_app_transfer_proxy::proxy_telemetry;
 use codex_app_transfer_registry::RawConfig;
 use serde_json::{json, Value};
@@ -44,6 +45,29 @@ pub struct DesktopConfigTarget {
     /// 写入 `~/.codex/.codex-global-state.json` 的
     /// `electron-persisted-atom-state.local-conversation-status-section-visible`。
     pub codex_status_section_default_visible: bool,
+    /// [MOC-69] model id → 人类可读 displayName(JSON object)。仅 antigravity 非空
+    /// (从 static seed 构建);Codex Desktop model catalog 的 `display_name` 优先用它,
+    /// 让 Codex 自己的 model picker 显示 displayName 而非 raw id。其他 provider 为
+    /// `Value::Null`,catalog 回退 raw id(行为不变)。
+    pub model_display_names: Value,
+}
+
+/// [MOC-69] 给 antigravity provider 构建 model id → displayName 反查表(JSON object),
+/// 喂给 Codex model catalog 让其 picker 显示 displayName。数据源是 static seed
+/// (`antigravity_static_models`,2026-05-30 实时上游刷新,已 SKIP 过滤),同步、无网络:
+/// 避免在 config-apply 热路径(启动 / 切 provider / restore 都走)塞网络 I/O + 失败态。
+/// 非 antigravity → `Value::Null`(catalog 回退 raw id)。
+fn antigravity_display_names(api_format_lower: &str) -> Value {
+    if !matches!(api_format_lower, "antigravity_oauth" | "antigravity") {
+        return Value::Null;
+    }
+    let mut map = serde_json::Map::new();
+    for m in antigravity_static_models() {
+        if !m.display_name.is_empty() {
+            map.insert(m.id, Value::String(m.display_name));
+        }
+    }
+    Value::Object(map)
 }
 
 pub fn desktop_config_target_for_provider(
@@ -106,6 +130,7 @@ pub fn desktop_config_target_for_provider(
             proxy_port,
             codex_network_access,
             codex_status_section_default_visible,
+            model_display_names: antigravity_display_names(&api_format_lower),
         };
     }
 
@@ -127,6 +152,7 @@ pub fn desktop_config_target_for_provider(
         proxy_port,
         codex_network_access,
         codex_status_section_default_visible,
+        model_display_names: antigravity_display_names(&api_format_lower),
     }
 }
 
@@ -141,12 +167,13 @@ pub fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConf
 }
 
 pub fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> {
-    catalog_models_for_provider(
+    catalog_models_for_provider_with_display_names(
         &target.provider_name,
         &target.default_model,
         target.supports_1m,
         Some(&target.model_mappings),
         Some(&target.model_capabilities),
+        Some(&target.model_display_names),
     )
     .into_iter()
     .map(|model| {
@@ -206,6 +233,13 @@ pub fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
 }
 
 pub fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -> bool {
+    // issue #317:direct 直连模式不写 model_catalog_json(用 Codex 默认 catalog),
+    // 「1M catalog 是否写入」对 direct 无意义 —— 视为就绪。否则 desktop_health 会
+    // 因 config.toml 没有 model_catalog_json 而永远返回 false → needsApply 死循环
+    // (direct + default model 带 [1m] 后缀的 provider)。
+    if !target.requires_proxy {
+        return true;
+    }
     let one_million_names: Vec<String> = desktop_expected_model_items(target)
         .into_iter()
         .filter_map(|item| {
@@ -348,9 +382,12 @@ pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, Strin
             default_model: &target.default_model,
             model_mappings: Some(&target.model_mappings),
             model_capabilities: Some(&target.model_capabilities),
+            model_display_names: Some(&target.model_display_names),
             app_version: APP_VERSION,
             codex_network_access: target.codex_network_access,
             codex_status_section_default_visible: target.codex_status_section_default_visible,
+            // issue #317:direct 直连只写上游配置,strip 全部 transfer 私货。
+            direct: target.mode == "direct",
         },
     )
     .map_err(|e| format!("apply 失败: {e}"))?;
@@ -1228,5 +1265,33 @@ mod tests {
                 manager.stop_silent();
             });
         });
+    }
+
+    /// issue #317 回归保护:direct(`requires_proxy=false`)不写 model_catalog_json,
+    /// `one_million_catalog_ready` 必须直接判就绪(short-circuit),不读 catalog
+    /// 文件。否则 direct + default model 带 [1m] 的 provider 会让 desktop_health
+    /// 永远 needsApply=true。短路在读文件之前,即便 paths 指向不存在目录也成立。
+    #[test]
+    fn one_million_catalog_ready_short_circuits_true_for_direct() {
+        let paths = CodexPaths::from_home_dir(std::path::Path::new("/nonexistent-cas-317"));
+        let direct_target = DesktopConfigTarget {
+            base_url: "https://up.example.com/v1".into(),
+            api_key: "sk".into(),
+            supports_1m: true,
+            provider_name: "Custom".into(),
+            default_model: "gpt-5.5[1m]".into(),
+            model_mappings: Value::Null,
+            model_capabilities: Value::Null,
+            model_display_names: serde_json::Value::Null,
+            requires_proxy: false,
+            mode: "direct",
+            proxy_port: 0,
+            codex_network_access: true,
+            codex_status_section_default_visible: true,
+        };
+        assert!(
+            one_million_catalog_ready(&paths, &direct_target),
+            "direct(requires_proxy=false)应直接判 1M 就绪,不依赖 catalog 文件"
+        );
     }
 }

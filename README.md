@@ -120,7 +120,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | 后端就绪,UI 待 PR |
 | 智谱 GLM(5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
 | 阿里云百炼(Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
-| Responses 协议透传(custom) | — | — | — | 直连上游不经代理(适合 OpenAI 官方 / 原生 Responses 反代);⚠️ Plugins/MCP `namespace` 工具包不展平,部分上游会静默丢工具 |
+| Responses 协议透传(custom) | — | — | — | 直连上游不经代理,**仅写上游 base_url + key**(不注入 transfer 沙箱 / 模型目录,#317);适合 OpenAI 官方 / 原生 Responses 反代;⚠️ Plugins/MCP `namespace` 工具包不展平,部分上游会静默丢工具 |
 
 > **MCP 工具(Codex 0.130+ `tool_search` 机制)**:Codex 0.130+ 把 server-side MCP 工具(`mcp__notion__*` / `mcp__linear__*` 等)defer 到 `tool_search`,不再直接放进 `tools[]`。代理在 **chat 路径**已打通全链路 —— 从 `tool_search_output` 发现工具 → 注入 chat `tools[]` → 按 `namespace` 路由回上游(#293)。**上表所有 chat-compat provider 通用**;仅 Responses 协议透传(末行,不经代理)不适用。
 
@@ -218,6 +218,14 @@ v2.1.14 及之前会把 `xhigh` / `max` 一刀切降级到 `high`(issue #254)。
 ### MiniMax 400:`invalid message role: system (2013)`
 
 v2.1.5 及之前的版本未把 `role=system` 转 `role=user`,导致 MiniMax `/v1/chat/completions` 整请求 400。v2.1.6+ 已修(close #139),所有 `role=system` 消息转 `role=user` + content 前置 `[System]\n` marker。
+
+### 上游 404 / 连不上(Base URL 填了完整 endpoint)
+
+provider 的 Base URL 只填到根或 `/v1`(例 `https://api.example.com/v1`),**不要**把完整 endpoint 路径整段粘进去。本工具会按协议自动补 `/chat/completions`、`/v1/messages`、`/responses` 等;若 Base URL 已含这些后缀(如把 `https://opencode.ai/zen/go/v1/chat/completions` 整段填入),会拼成 `…/chat/completions/chat/completions` 导致上游 404。删掉多余的 endpoint 后缀、只留到 `/v1` 即可。
+
+### Codex 提示 `Failed to revert changes`
+
+这是 Codex 客户端本地"撤销更改"操作的提示,**不经过本工具的代理**(回退由 Codex 用它维护的本地文件快照完成,与所选模型 / 中转无关)。常见原因:① 改动的文件被编辑器 / IDE / 杀毒软件占用,Windows 下回滚写不进;② 文件在 Codex 改完后又被外部改动,快照对不上无法回退;③ 本次会话 apply_patch 把文件写进了嵌套子目录,路径错乱时找不到原文件。排查:关掉占用文件的程序、确认改动落在预期目录后重试;仍失败可手动改回。
 
 ### 端口冲突
 

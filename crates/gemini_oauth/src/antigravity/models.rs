@@ -46,8 +46,21 @@ const ANTIGRAVITY_FETCH_HOSTS: &[&str] = &[
 
 const ANTIGRAVITY_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
 
-/// CLIProxyAPI `cmd/fetch_antigravity_models/main.go:227-229` 硬编码 skip list。
-/// 内部/实验性 模型,公开调用会拒
+/// 模型过滤清单。三类:
+/// 1. CLIProxyAPI `cmd/fetch_antigravity_models/main.go:227-229` 硬编码 skip
+///    (内部/实验性,公开调用会拒)
+/// 2. [MOC-69] 产品决策不提供给用户的款 —— claude 两款(antigravity 上游虽返回,
+///    但本项目不暴露给 Codex 用户;走 cloud_code envelope 的 claude 在 Codex 工具
+///    映射下行为未验证,主动隐藏)
+/// 3. [MOC-69] 用户真机(Codex app 完整伪装)实测**不可用**的款 ——
+///    `gemini-3.1-pro-high`(2026-05-30 用户在 app 内 Model 下拉实测:选它对话
+///    起不来;其余 pro-low / flash / pro-agent 正常)。它跟 `gemini-pro-agent`
+///    同 displayName "Gemini 3.1 Pro (High)",过滤掉避免用户误选到不可用款。
+///    根因(是 thinkingLevel 注入导致还是模型本身废)待 MOC-79 用 forward-trace
+///    逐字段查清;在查清前先按"用户实测不可用"过滤。**gemini-pro-agent 可用,不过滤**。
+///
+/// **实时 fetch(`fetch_antigravity_available_models`)和静态 seed
+/// (`static_models::seed_models`)都过此清单**,保证两条路径一致。
 const SKIP_MODEL_IDS: &[&str] = &[
     "chat_20706",
     "chat_23310",
@@ -55,7 +68,21 @@ const SKIP_MODEL_IDS: &[&str] = &[
     "tab_jump_flash_lite_preview",
     "gemini-2.5-flash-thinking",
     "gemini-2.5-pro",
+    // [MOC-69] gemini-2.5-flash / -lite 上游 displayName 假冒成 "Gemini 3.1 Flash
+    // Lite"(名实不符,实证 fetchAvailableModels),且是旧版,过滤掉不给用户
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    // [MOC-69] claude 两款不提供给用户
+    "claude-opus-4-6-thinking",
+    "claude-sonnet-4-6",
+    // [MOC-69] 用户真机实测不可用(对话起不来),根因待 MOC-79 查
+    "gemini-3.1-pro-high",
 ];
+
+/// `id` 是否在过滤清单内(实时 fetch + seed 共用,保证两路径一致)。
+pub(crate) fn is_skipped_model_id(id: &str) -> bool {
+    SKIP_MODEL_IDS.contains(&id)
+}
 
 /// 一条模型记录 — 字段集对齐 CLIProxyAPI `modelEntry` struct
 /// (`fetch_antigravity_models/main.go:55-65`)。OpenAI `/v1/models` 响应需要的
@@ -75,6 +102,13 @@ pub struct AntigravityModelEntry {
     pub context_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u64>,
+    /// [MOC-69] 上游 `recommended` —— 官方 Antigravity IDE 下拉只列 recommended:true
+    /// 的款。前端据此置顶/标记。seed / 上游缺字段时 default false。
+    #[serde(default)]
+    pub recommended: bool,
+    /// [MOC-69] 上游 `tagTitle`(如 "Fast"/"New")—— IDE 在模型名旁的小标签。无则 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_title: Option<String>,
 }
 
 /// 拉取 antigravity 上游可用模型清单 — 1:1 移植 CLIProxyAPI `fetchModels()`。
@@ -177,6 +211,16 @@ pub async fn fetch_antigravity_available_models(
                 .get("maxOutputTokens")
                 .and_then(|v| v.as_u64())
                 .filter(|n| *n > 0);
+            // [MOC-69] 官方 IDE 只列 recommended:true 的款;tagTitle 如 "Fast"/"New"
+            let recommended = model_data
+                .get("recommended")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let tag_title = model_data
+                .get("tagTitle")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             models.push(AntigravityModelEntry {
                 id: model_id.clone(),
                 object: "model".into(),
@@ -187,6 +231,8 @@ pub async fn fetch_antigravity_available_models(
                 description: display_name,
                 context_length,
                 max_completion_tokens,
+                recommended,
+                tag_title,
             });
         }
 
@@ -274,9 +320,10 @@ mod tests {
         assert_eq!(without, "{}");
     }
 
-    /// SKIP_MODEL_IDS 锚定 — 防修代码时不小心动了清单
+    /// SKIP_MODEL_IDS 锚定 — 防修代码时不小心动了清单(含 [MOC-69] claude 两款 +
+    /// 用户真机实测不可用的 gemini-3.1-pro-high)
     #[test]
-    fn skip_list_matches_cliproxyapi() {
+    fn skip_list_matches_expected() {
         let expected = [
             "chat_20706",
             "chat_23310",
@@ -284,7 +331,24 @@ mod tests {
             "tab_jump_flash_lite_preview",
             "gemini-2.5-flash-thinking",
             "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "claude-opus-4-6-thinking",
+            "claude-sonnet-4-6",
+            "gemini-3.1-pro-high",
         ];
         assert_eq!(SKIP_MODEL_IDS, expected);
+    }
+
+    /// [MOC-69] claude 两款 + gemini-3.1-pro-high(用户真机实测不可用)必须在过滤清单内
+    #[test]
+    fn unservable_models_are_skipped() {
+        assert!(is_skipped_model_id("claude-opus-4-6-thinking"));
+        assert!(is_skipped_model_id("claude-sonnet-4-6"));
+        // gemini-3.1-pro-high: 用户 app 内实测对话起不来,过滤(根因待 MOC-79)
+        assert!(is_skipped_model_id("gemini-3.1-pro-high"));
+        // gemini-pro-agent 用户实测可用,不过滤(虽跟 pro-high 同 displayName)
+        assert!(!is_skipped_model_id("gemini-pro-agent"));
+        assert!(!is_skipped_model_id("gemini-3.1-pro-low"));
     }
 }

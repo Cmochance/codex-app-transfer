@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{read_auth, write_auth};
 use crate::model_catalog::{
-    catalog_models_for_provider, clear_catalog_models, upsert_catalog_models,
+    catalog_models_for_provider_with_display_names, clear_catalog_models, upsert_catalog_models,
     CODEX_MODEL_CATALOG_KEY,
 };
 use crate::paths::CodexPaths;
@@ -66,6 +66,12 @@ pub struct ApplyConfig<'a> {
     /// 当前 active provider 的模型能力声明,用于按目标模型声明窗口。
     #[serde(skip)]
     pub model_capabilities: Option<&'a serde_json::Value>,
+    /// [MOC-69] model id → 人类可读 displayName 映射(JSON object)。仅 antigravity 等
+    /// 带 displayName 的 provider 才填(由 src-tauri 从 static seed 构建);catalog 的
+    /// `display_name` 优先用它,让 Codex Desktop model picker 显示 displayName 而非
+    /// raw id。其他 provider 传 `None`,行为不变。
+    #[serde(skip)]
+    pub model_display_names: Option<&'a serde_json::Value>,
     /// 应用版本(写入快照 manifest,便于诊断)。
     pub app_version: &'a str,
     /// 是否允许 Codex shell 工具网络访问(写入 `[sandbox_workspace_write]
@@ -78,6 +84,14 @@ pub struct ApplyConfig<'a> {
     /// `true` → ensure 开启,`false` → ensure 关闭。
     /// Caller 从 `Settings.codex_status_section_default_visible`(默认 `true`)读取。
     pub codex_status_section_default_visible: bool,
+    /// **direct 直连模式**(`bypass_proxy`,snapshot.rs:87-89)。为 `true` 时
+    /// apply 只写上游配置(`openai_base_url` + auth key),并 **strip** 所有
+    /// transfer 私货字段(`model_catalog_json` / catalog models /
+    /// `model_context_window` / `sandbox_mode` / `approval_policy`)—— 这一步
+    /// 同时是「从 local_proxy 切到 direct 时清掉残留私货」的清理机制;
+    /// status-section atom 既不写也不清(留用户原值)。详见 issue #317。
+    #[serde(default)]
+    pub direct: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -139,7 +153,20 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // (Codex docs: "Full access means `danger-full-access` together with
     // `never`")。toggle 默认 on 接受 prompt-injection 风险换"小白开箱用",
     // 专业用户 toggle off 自己回 Codex default 沙箱。
-    if cfg.codex_network_access {
+    if cfg.direct {
+        // === direct 直连(issue #317):strip sandbox/approval 私货。direct 唯一
+        // 职责是写上游配置,不注入 transfer 的「全访问无审批」默认,也清掉从
+        // local_proxy 切来时可能残留的这两条。Codex 回默认沙箱(read-only +
+        // on-request)。
+        sync_root_value(&paths.config_toml, "sandbox_mode", None)?;
+        sync_root_value(&paths.config_toml, "approval_policy", None)?;
+        sync_table_field(
+            &paths.config_toml,
+            "sandbox_workspace_write",
+            "network_access",
+            None,
+        )?;
+    } else if cfg.codex_network_access {
         sync_root_value(
             &paths.config_toml,
             "sandbox_mode",
@@ -170,24 +197,35 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // 选择器里 fallback 到内置 GPT 系列名("GPT-5.5"等),用户看不到真实
     // provider/model。现在每条 provider 都通过 catalog 把 display_name 设成
     // "<provider> / <real-model>",`model_context_window` 仍只在 1M 时设。
-    let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
-    sync_root_value(
-        &paths.config_toml,
-        CODEX_MODEL_CATALOG_KEY,
-        Some(&catalog_literal),
-    )?;
-    let models = catalog_models_for_provider(
-        cfg.provider_name,
-        cfg.default_model,
-        cfg.supports_1m,
-        cfg.model_mappings,
-        cfg.model_capabilities,
-    );
-    upsert_catalog_models(&paths.model_catalog_json, &models)?;
-    if cfg.supports_1m {
-        sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
-    } else {
+    if cfg.direct {
+        // === direct 直连(issue #317):strip model_catalog_json + 顶层 catalog
+        // models + model_context_window。responses 直连用 Codex 默认 OpenAI
+        // catalog(模型名同属 OpenAI 命名空间,无需 transfer 注入),这里同时
+        // 清掉从 local_proxy 切来时残留的 catalog/window。
+        sync_root_value(&paths.config_toml, CODEX_MODEL_CATALOG_KEY, None)?;
+        clear_catalog_models(&paths.model_catalog_json)?;
         sync_root_value(&paths.config_toml, "model_context_window", None)?;
+    } else {
+        let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
+        sync_root_value(
+            &paths.config_toml,
+            CODEX_MODEL_CATALOG_KEY,
+            Some(&catalog_literal),
+        )?;
+        let models = catalog_models_for_provider_with_display_names(
+            cfg.provider_name,
+            cfg.default_model,
+            cfg.supports_1m,
+            cfg.model_mappings,
+            cfg.model_capabilities,
+            cfg.model_display_names,
+        );
+        upsert_catalog_models(&paths.model_catalog_json, &models)?;
+        if cfg.supports_1m {
+            sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
+        } else {
+            sync_root_value(&paths.config_toml, "model_context_window", None)?;
+        }
     }
 
     // 4. auth.json: auth_mode + OPENAI_API_KEY
@@ -222,26 +260,30 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // 会让 apply 整体报 Err,但 config.toml / auth.json 已写,partial-apply 错误
     // 框架。改成 warn + 继续,跟 restore-side 对称(UI preference 失败不该 block
     // 主路径)。失败的 user 可手动 `/status` toggle 修正。
-    if let Err(e) = crate::electron_state::write_atom(
-        &paths.electron_global_state,
-        crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
-        serde_json::Value::Bool(cfg.codex_status_section_default_visible),
-    ) {
-        tracing::warn!(
-            target: "codex_integration::apply",
-            path = %paths.electron_global_state.display(),
-            error = %e,
-            "best-effort status-section atom write failed; provider apply continues. \
-             User can manually toggle via `/status` slash command in Codex Desktop.",
-        );
+    // direct 模式不碰 status-section atom(UI 偏好;issue #317:既不写也不强清,
+    // 留用户原值)。
+    if !cfg.direct {
+        if let Err(e) = crate::electron_state::write_atom(
+            &paths.electron_global_state,
+            crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+            serde_json::Value::Bool(cfg.codex_status_section_default_visible),
+        ) {
+            tracing::warn!(
+                target: "codex_integration::apply",
+                path = %paths.electron_global_state.display(),
+                error = %e,
+                "best-effort status-section atom write failed; provider apply continues. \
+                 User can manually toggle via `/status` slash command in Codex Desktop.",
+            );
+        }
     }
 
     Ok(ApplyResult {
         config_toml_path: paths.config_toml.display().to_string(),
         auth_json_path: paths.auth_json.display().to_string(),
         snapshot_taken: snapshot_taken_now,
-        model_context_window_set: cfg.supports_1m,
-        model_catalog_json_set: true,
+        model_context_window_set: cfg.supports_1m && !cfg.direct,
+        model_catalog_json_set: !cfg.direct,
     })
 }
 
@@ -550,9 +592,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v2.0.0-stage2.5",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -596,9 +640,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: false,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -640,9 +686,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -706,9 +754,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -771,9 +821,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -833,9 +885,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -871,9 +925,11 @@ mod tests {
                 default_model: "deepseek-v4-pro[1m]",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -916,9 +972,11 @@ mod tests {
                 default_model: "deepseek-v4-pro",
                 model_mappings: Some(&mappings),
                 model_capabilities: Some(&capabilities),
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -955,9 +1013,11 @@ mod tests {
                 default_model: "deepseek-v4-pro",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -973,9 +1033,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1022,9 +1084,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1065,9 +1129,11 @@ mod tests {
                 default_model: "deepseek-v4-pro",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1127,9 +1193,11 @@ mod tests {
                 default_model: "deepseek-v4-pro",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1261,9 +1329,11 @@ mod tests {
                 default_model: "active-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v-active",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1327,9 +1397,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1345,9 +1417,11 @@ mod tests {
                 default_model: "deepseek-v4-pro",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1377,9 +1451,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1401,9 +1477,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1432,9 +1510,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1469,9 +1549,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1518,9 +1600,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1570,9 +1654,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1622,9 +1708,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1660,9 +1748,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1758,9 +1848,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1808,9 +1900,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .expect("apply must not fail when atom file is corrupt — UI preference best-effort");
@@ -1861,9 +1955,11 @@ mod tests {
                 default_model: "mock-model",
                 model_mappings: None,
                 model_capabilities: None,
+                model_display_names: None,
                 app_version: "v",
                 codex_network_access: true,
                 codex_status_section_default_visible: true,
+                direct: false,
             },
         )
         .unwrap();
@@ -1906,5 +2002,180 @@ mod tests {
             Some(&json!(["/tmp/proj"])),
             "user 顶层字段必须原样保留"
         );
+    }
+
+    /// issue #317:direct 直连只写上游配置(openai_base_url + auth key),
+    /// **strip** 全部 transfer 私货 —— 即便 supports_1m + network_access 都为
+    /// true,也不写 catalog / model_context_window / sandbox_mode / approval_policy。
+    #[test]
+    fn apply_direct_only_writes_upstream_and_strips_private() {
+        let (_t, paths) = setup();
+        let result = apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "https://up.example.com/v1",
+                gateway_api_key: "sk-upstream",
+                supports_1m: true, // 即便 1M,direct 也不写 window
+                provider_name: "Custom",
+                default_model: "gpt-5.5",
+                model_mappings: None,
+                model_capabilities: None,
+                model_display_names: None,
+                app_version: "v",
+                codex_network_access: true, // 即便 on,direct 也不写 sandbox
+                codex_status_section_default_visible: true,
+                direct: true,
+            },
+        )
+        .unwrap();
+        assert!(!result.model_context_window_set, "direct 不应设 window");
+        assert!(!result.model_catalog_json_set, "direct 不应设 catalog");
+
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains("openai_base_url = \"https://up.example.com/v1\""),
+            "direct 必须写上游 base_url: {toml}"
+        );
+        assert!(
+            !toml.contains("model_catalog_json"),
+            "direct 不应写 catalog: {toml}"
+        );
+        assert!(
+            !toml.contains("model_context_window"),
+            "direct 不应写 window: {toml}"
+        );
+        assert!(
+            !toml.contains("sandbox_mode"),
+            "direct 不应写 sandbox: {toml}"
+        );
+        assert!(
+            !toml.contains("approval_policy"),
+            "direct 不应写 approval: {toml}"
+        );
+
+        let auth = read_auth_value(&paths);
+        assert_eq!(auth["OPENAI_API_KEY"], "sk-upstream");
+        assert_eq!(auth["auth_mode"], "apikey");
+    }
+
+    /// issue #317:从 local_proxy 切到 direct —— direct apply 的 strip 同时承担
+    /// 「清掉 local_proxy 残留私货」的清理机制,切换后 config 必须干净。
+    #[test]
+    fn switch_local_proxy_to_direct_strips_residual_private_fields() {
+        let (_t, paths) = setup();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_proxy",
+                supports_1m: true,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro",
+                model_mappings: None,
+                model_capabilities: None,
+                model_display_names: None,
+                app_version: "v",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+                direct: false,
+            },
+        )
+        .unwrap();
+        let after_proxy = read_toml(&paths);
+        assert!(after_proxy.contains("model_catalog_json"));
+        assert!(after_proxy.contains("model_context_window = 1000000"));
+        assert!(after_proxy.contains("sandbox_mode"));
+        assert!(read_app_config(&paths).get("models").is_some());
+
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "https://up.example.com/v1",
+                gateway_api_key: "sk-upstream",
+                supports_1m: true,
+                provider_name: "Custom",
+                default_model: "gpt-5.5",
+                model_mappings: None,
+                model_capabilities: None,
+                model_display_names: None,
+                app_version: "v",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+                direct: true,
+            },
+        )
+        .unwrap();
+        let after_direct = read_toml(&paths);
+        assert!(
+            after_direct.contains("openai_base_url = \"https://up.example.com/v1\""),
+            "切 direct 后 base_url 必须是上游: {after_direct}"
+        );
+        assert!(
+            !after_direct.contains("model_catalog_json"),
+            "切 direct 应清 catalog: {after_direct}"
+        );
+        assert!(
+            !after_direct.contains("model_context_window"),
+            "切 direct 应清 window: {after_direct}"
+        );
+        assert!(
+            !after_direct.contains("sandbox_mode"),
+            "切 direct 应清 sandbox: {after_direct}"
+        );
+        assert!(
+            !after_direct.contains("approval_policy"),
+            "切 direct 应清 approval: {after_direct}"
+        );
+        assert!(
+            read_app_config(&paths).get("models").is_none(),
+            "切 direct 应清掉顶层 catalog models"
+        );
+    }
+
+    /// issue #317:direct apply 后 restore 仍能恢复用户原始配置(复用 snapshot +
+    /// MANAGED_TOML_KEYS,direct 没写的字段 strip=noop,安全)。
+    #[test]
+    fn direct_apply_then_restore_brings_back_user_values() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(
+            &paths.config_toml,
+            "openai_base_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-5.5\"\n[profiles]\nfoo = 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &paths.auth_json,
+            "{\"OPENAI_API_KEY\":\"sk-original\",\"tokens\":{\"a\":1}}\n",
+        )
+        .unwrap();
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "https://up.example.com/v1",
+                gateway_api_key: "sk-upstream",
+                supports_1m: false,
+                provider_name: "Custom",
+                default_model: "gpt-5.5",
+                model_mappings: None,
+                model_capabilities: None,
+                model_display_names: None,
+                app_version: "v",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+                direct: true,
+            },
+        )
+        .unwrap();
+        assert!(read_toml(&paths).contains("openai_base_url = \"https://up.example.com/v1\""));
+
+        restore_codex_state(&paths).unwrap();
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains("openai_base_url = \"https://api.openai.com/v1\""),
+            "restore 应回用户原 base_url: {toml}"
+        );
+        assert!(toml.contains("[profiles]"), "用户 [profiles] 应保留");
+        let auth = read_auth_value(&paths);
+        assert_eq!(auth["OPENAI_API_KEY"], "sk-original");
     }
 }

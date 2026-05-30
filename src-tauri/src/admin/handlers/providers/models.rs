@@ -285,15 +285,20 @@ async fn fetch_antigravity_models_impl() -> Value {
     };
 
     // 静态 seed 总能拿到 — 即使 OAuth 没登录,UI 上至少能给 model 映射的选项
-    let seed_ids: Vec<String> = antigravity_static_models()
-        .into_iter()
-        .map(|m| m.id)
+    let seed_models = antigravity_static_models();
+    let seed_ids: Vec<String> = seed_models.iter().map(|m| m.id.clone()).collect();
+    // [MOC-69] models 返回完整 AntigravityModelEntry(含 display_name/recommended/
+    // tag_title),前端 providerModelOptionsMarkup 据此显示 displayName + recommended
+    // 置顶/标记;suggested 仍按 id。前端对 string|object 两种 shape 都 fallback。
+    let seed_entries: Vec<serde_json::Value> = seed_models
+        .iter()
+        .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
         .collect();
     let seed_response = || {
         json!({
             "success": true,
-            "endpoint": "(static seed: antigravity 10 models)",
-            "models": seed_ids.clone(),
+            "endpoint": "(static seed: antigravity models)",
+            "models": seed_entries.clone(),
             "suggested": suggest_model_mappings(&seed_ids),
         })
     };
@@ -328,11 +333,16 @@ async fn fetch_antigravity_models_impl() -> Value {
 
     match fetch_antigravity_available_models(&client, &access_token, project_id.as_deref()).await {
         Ok(models) if !models.is_empty() => {
-            let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
+            let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+            // [MOC-69] 返回完整 entry(含 display_name/recommended/tag_title)给前端展示
+            let entries: Vec<serde_json::Value> = models
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+                .collect();
             json!({
                 "success": true,
                 "endpoint": "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-                "models": ids.clone(),
+                "models": entries,
                 "suggested": suggest_model_mappings(&ids),
             })
         }

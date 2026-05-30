@@ -37,7 +37,10 @@ pub use mcp_credentials::{
     discard_mcp_mirror, ensure_file_store_mode, restore_available_count,
     restore_mcp_credentials_from_mirror, sync_mcp_credentials, SyncReport,
 };
-pub use model_catalog::{catalog_models_for_provider, strip_model_suffix, upsert_catalog_models};
+pub use model_catalog::{
+    catalog_models_for_provider, catalog_models_for_provider_with_display_names,
+    strip_model_suffix, upsert_catalog_models,
+};
 pub use paths::CodexPaths;
 pub use residual::{
     detect_signatures_in_text, repair_residual_pollution, scan_residual_pollution,
