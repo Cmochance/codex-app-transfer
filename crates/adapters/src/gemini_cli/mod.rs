@@ -325,6 +325,35 @@ mod adapter_tests {
     }
 
     #[test]
+    fn compact_path_routes_to_generate_content_and_marks_is_compact() {
+        // MOC-92:cloud_code 的 /responses/compact 必须走本地 compact —— 转 Gemini wire
+        // + 非流 generateContent + is_compact=true;否则被当普通请求 → 响应是 SSE,
+        // Codex compact client 解析失败(`expected value at line 1 column 1`)。
+        let body = serde_json::json!({
+            "model": "gemini-3-flash-agent",
+            "input": [{"type":"message","role":"user","content":"some long history to compact"}]
+        });
+        let plan = GeminiCliAdapter
+            .prepare_request(
+                "/v1/responses/compact",
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                &dummy_provider_with_project(),
+            )
+            .expect("compact prepare_request should succeed");
+        assert!(plan.is_compact, "compact path 必须标 is_compact=true");
+        assert_eq!(
+            plan.upstream_path, "/v1internal:generateContent",
+            "compact 走非流 generateContent"
+        );
+        // body 是 cloud-code envelope 裹的 gemini wire(可解析 JSON,非空)
+        let parsed: serde_json::Value = serde_json::from_slice(&plan.body).unwrap();
+        assert!(
+            parsed.is_object(),
+            "compact 出站 body 应是 cloud-code envelope JSON"
+        );
+    }
+
+    #[test]
     fn missing_project_id_returns_bad_request_with_hint() {
         // 隔离 HOME 让 token store fallback 走 None 而不是命中真实磁盘
         // ~/.codex-app-transfer/gemini-oauth.json — 否则 dev 机跑 test 会因为

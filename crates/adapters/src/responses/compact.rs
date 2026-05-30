@@ -616,14 +616,57 @@ async fn collect_and_wrap_compact_body(
             "compact upstream non-JSON response: {e}; first 500 chars: {preview}"
         ))
     })?;
-    let raw = parsed
+    let raw = extract_compact_summary_text(&parsed).ok_or_else(|| {
+        let preview: String = serde_json::to_string(&parsed)
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
+        AdapterError::Internal(format!(
+            "compact upstream missing summary text (tried chat choices[0].message.content + \
+             gemini candidates[0].content.parts[].text); first 300 chars: {preview}"
+        ))
+    })?;
+
+    compact_response_body_from_summary_text(&raw)
+}
+
+/// 从上游 compact 响应里抽 summary 文本 —— **wire 无关**,兼容三种上游形状:
+/// 1. OpenAI chat-completions:`choices[0].message.content`
+/// 2. Gemini `generateContent`(Google AI Studio):`candidates[0].content.parts[*].text` 拼接
+/// 3. Cloud Code / Antigravity:gemini 响应外裹 `{"response": {...}}`,先剥 `response` 再按 (2) 抽
+///
+/// MOC-92:此前只认 chat 形状,导致 Gemini 系(gemini_native / cloud_code)compact
+/// 全部解析失败(antigravity 还因 cloud_code 未实现 compact 路由而更早炸)。
+fn extract_compact_summary_text(parsed: &Value) -> Option<String> {
+    // chat-completions
+    if let Some(s) = parsed
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            AdapterError::Internal("compact upstream missing choices[0].message.content".to_owned())
-        })?;
-
-    compact_response_body_from_summary_text(raw)
+    {
+        return Some(s.to_owned());
+    }
+    // cloud_code/antigravity 把 gemini 响应裹在 `response` 里;gemini_native 则是直出。
+    let root = parsed.get("response").unwrap_or(parsed);
+    if let Some(parts) = root
+        .pointer("/candidates/0/content/parts")
+        .and_then(|v| v.as_array())
+    {
+        // **排除 thought 部分**:compact 请求带 reasoning_effort → 转 Gemini 时产
+        // `thinkingConfig.include_thoughts=true` → 响应可能含 `{"thought":true,"text":...}`
+        // 思维链。summary 只要结论不要过程,且全代码别处(gemini_native/response.rs 把
+        // part.thought 路由 reasoning 而非 content)一致把 thought 当非 content。不排除
+        // 会让思维链污染压缩后的上下文(code-reviewer IMPORTANT)。
+        let text: String = parts
+            .iter()
+            .filter(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true))
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
 }
 
 pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u8>, AdapterError> {
@@ -1293,9 +1336,46 @@ mod tests {
         let err = collect_and_wrap_compact_body(StatusCode::OK, one_chunk_stream(upstream_body))
             .await
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("missing choices[0].message.content"));
+        assert!(
+            err.to_string().contains("missing summary text"),
+            "实际错误:{err}"
+        );
+    }
+
+    #[test]
+    fn extract_compact_summary_text_handles_chat_gemini_and_cloudcode_shapes() {
+        // MOC-92:三种上游形状都要能抽出 summary 文本。
+        let long = "x".repeat(900); // 过质量校验无关,这里只验抽取
+                                    // 1. chat-completions
+        let chat = json!({"choices": [{"message": {"content": long}}]});
+        assert_eq!(
+            extract_compact_summary_text(&chat).as_deref(),
+            Some(long.as_str())
+        );
+        // 2. gemini generateContent(Google AI Studio,直出);thought 部分必须排除
+        let gemini = json!({"candidates": [{"content": {"parts": [
+            {"text": "chain of thought...", "thought": true},
+            {"text": "part-a "}, {"text": "part-b"}
+        ]}}]});
+        assert_eq!(
+            extract_compact_summary_text(&gemini).as_deref(),
+            Some("part-a part-b"),
+            "thought 部分应被排除,不污染 summary"
+        );
+        // 3. cloud_code / antigravity:gemini 外裹 {"response": {...}}
+        let cloud = json!({"response": {"candidates": [{"content": {"parts": [
+            {"text": "wrapped summary"}
+        ]}}]}});
+        assert_eq!(
+            extract_compact_summary_text(&cloud).as_deref(),
+            Some("wrapped summary")
+        );
+        // 4. 都不匹配 → None
+        assert_eq!(extract_compact_summary_text(&json!({"foo": "bar"})), None);
+        assert_eq!(
+            extract_compact_summary_text(&json!({"candidates": [{"content": {"parts": []}}]})),
+            None
+        );
     }
 
     // ── validate_compact_summary_quality (fix #219) ──────────────────

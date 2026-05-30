@@ -1,4 +1,7 @@
 use crate::mapper::{RequestMapper, ResponseMapper};
+use crate::responses::compact::{
+    build_compact_chat_request, build_compact_response_plan, is_compact_path,
+};
 use crate::types::AdapterError;
 use crate::types::{ByteStream, RequestPlan, ResponsePlan};
 use codex_app_transfer_registry::Provider;
@@ -322,9 +325,57 @@ fn sha256(message: &[u8]) -> [u8; 32] {
 /// - 包装 outer envelope(+ antigravity transform)
 /// - 生成 cloud-code upstream path
 pub(crate) fn prepare_cloud_code_request(
+    client_path: &str,
     body: bytes::Bytes,
     provider: &Provider,
 ) -> Result<RequestPlan, AdapterError> {
+    // MOC-92:compact 路径 —— 必须跟普通请求一样转 Gemini wire + 裹 cloud-code envelope,
+    // 但用 build_compact_chat_request(摘要 prompt + 历史预算)、走非流 generateContent、
+    // 并标 is_compact=true 让响应侧 route 到 build_compact_response_plan。否则 antigravity
+    // 的 /responses/compact 被当普通请求 → 响应是 SSE 而非 Codex compact client 要的
+    // JSON {"output":[...]} → `expected value at line 1 column 1`(对齐 gemini_native:24-52)。
+    if is_compact_path(client_path) {
+        let flavor = CloudCodeApiFlavor::from_api_format(&provider.api_format);
+        let project_id = resolve_cloud_code_project_id(provider)?;
+        let compact_chat_body = build_compact_chat_request(&body, provider)?;
+        let compact_chat_json: Value = serde_json::from_slice(&compact_chat_body)
+            .map_err(|e| AdapterError::Internal(format!("compact chat body decode: {e}")))?;
+        let model = compact_chat_json
+            .get("model")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AdapterError::BadRequest("compact body missing model".into()))?
+            .to_owned();
+        let gemini_request = crate::gemini_native::request::chat_normalized_to_gemini_request(
+            &compact_chat_json,
+            provider,
+        )?;
+        let mut inner_value =
+            serde_json::to_value(&gemini_request).map_err(AdapterError::BodyDecode)?;
+        apply_cloud_code_request_compat(&mut inner_value, flavor);
+        let outer = wrap_cloud_code_envelope(&model, &project_id, inner_value).map_err(|e| {
+            AdapterError::BadRequest(format!("OS RNG unavailable for user_prompt_id: {e}"))
+        })?;
+        let outer = if flavor.is_antigravity() {
+            apply_antigravity_transform(outer, &model).map_err(|e| {
+                AdapterError::BadRequest(format!(
+                    "OS RNG unavailable for antigravity requestId: {e}"
+                ))
+            })?
+        } else {
+            outer
+        };
+        let outer_body = serde_json::to_vec(&outer).map_err(AdapterError::BodyDecode)?;
+        return Ok(RequestPlan {
+            upstream_path: cloud_code_upstream_path(false), // 非流 → generateContent
+            body: bytes::Bytes::from(outer_body),
+            upstream_headers: http::HeaderMap::new(),
+            response_session: None,
+            adapter_metadata: None,
+            is_compact: true,
+            original_responses_request: None,
+        });
+    }
+
     let parsed: Value = serde_json::from_slice(&body)?;
     let stream = parsed
         .get("stream")
@@ -396,6 +447,12 @@ pub(crate) fn transform_cloud_code_response_stream(
     upstream_stream: ByteStream,
     request_plan: &RequestPlan,
 ) -> Result<ResponsePlan, AdapterError> {
+    // MOC-92:compact 响应走本地 compact 包装(非 SSE)。build_compact_response_plan
+    // 收原始 generateContent body(cloud-code 裹在 `{"response":{...}}` 里),
+    // extract_compact_summary_text 会剥 `response` + 抽 gemini candidates 文本。
+    if request_plan.is_compact {
+        return build_compact_response_plan(upstream_status, upstream_headers, upstream_stream);
+    }
     upstream_headers.remove(http::header::CONTENT_LENGTH);
     upstream_headers.remove(http::header::CONTENT_ENCODING);
     upstream_headers.insert(
@@ -500,11 +557,11 @@ pub(crate) fn apply_cloud_code_request_compat(inner: &mut Value, flavor: CloudCo
 impl RequestMapper for CloudCodeMapper {
     fn map_request(
         &self,
-        _client_path: &str,
+        client_path: &str,
         body: bytes::Bytes,
         provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
-        prepare_cloud_code_request(body, provider)
+        prepare_cloud_code_request(client_path, body, provider)
     }
 }
 
