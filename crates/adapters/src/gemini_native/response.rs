@@ -688,6 +688,18 @@ impl GeminiToResponsesConverter {
 
         // 处理候选(MVP 只关心 candidates[0],n>1 的多 candidate 留 follow-up)
         for candidate in &gemini.candidates {
+            // [MOC-75] **先记 finishReason,再处理 parts** —— 让下面 part 循环里的
+            // `emit_function_call`(apply_patch 分支)能看到本 chunk 的 finishReason
+            // (MAX_TOKENS / SAFETY 等响应级截断信号),据此 gate apply_patch
+            // status=incomplete(防 Codex 应用被 token 上限截断的 patch;chat 路径靠
+            // interrupted 做同样防护)。**粘性保护**:INTERRUPTED(cap-trip / upstream-Err
+            // 标记的已宣告中断)不被后续合法 chunk 的 finishReason="STOP" 覆盖回 completed,
+            // 否则"宣告 incomplete 后又静默 recover"是 silent truncation 的孪生 bug。
+            if let Some(fr) = &candidate.finish_reason {
+                if self.final_finish_reason.as_deref() != Some(FINISH_INTERRUPTED) {
+                    self.final_finish_reason = Some(fr.clone());
+                }
+            }
             if let Some(content) = &candidate.content {
                 for part in &content.parts {
                     // text part
@@ -795,16 +807,8 @@ impl GeminiToResponsesConverter {
             if let Some(tc) = candidate.token_count {
                 self.accumulated_token_counts.push(tc);
             }
-            // finishReason 累积到末态(末 chunk emit completed 时用)
-            // **粘性保护**(sanity check 报告):INTERRUPTED 是 C3b/C4 cap-trip /
-            // upstream-Err 路径标记的"已宣告中断",不能被后续合法 chunk 的
-            // finishReason="STOP" 覆盖回 completed —— 那会让"宣告 incomplete 后又
-            // 静默 recover"成 silent truncation 的孪生 bug。
-            if let Some(fr) = &candidate.finish_reason {
-                if self.final_finish_reason.as_deref() != Some(FINISH_INTERRUPTED) {
-                    self.final_finish_reason = Some(fr.clone());
-                }
-            }
+            // finishReason 已在本 candidate 循环开头记录(移到 parts 之前,见上 [MOC-75]),
+            // 让 emit_function_call(apply_patch)能据本 chunk finishReason gate incomplete。
         }
         // P0-F:promptFeedback.blockReason — Gemini 拒 user prompt(safety 拦截)→
         // 设 prompt_block_reason,emit_completed 转 status=incomplete + reason=
@@ -1351,21 +1355,39 @@ impl GeminiToResponsesConverter {
         if name == APPLY_PATCH_TOOL_NAME {
             let input = crate::responses::extract_apply_patch_input(&args_json_str);
             let has_begin = input.contains("*** Begin Patch");
-            // [MOC-75 silent-failure review] 完整但畸形的 V4A patch(有 `*** Begin Patch`
-            // 头但 hunk header / operation marker / 结构非法)→ emit `status="incomplete"`,
-            // 阻止 Codex 执行 partial/invalid patch(apply_patch destructive,partial 执行
-            // 可能在意外目标写入意外内容 —— 对齐 #322 MOC-57 chat 路径破坏性半应用防护)。
-            // Gemini 的 `functionCall.args` 是一次性完整结构(非 OpenAI 式 token 增量),
-            // 无流式截断风险,故只做语法后验、不复用 chat 的截断双检测器。
+            // [MOC-75 review] 两类畸形/截断都 emit `status="incomplete"` 阻止 Codex 执行
+            // partial/invalid apply_patch(destructive,partial 执行可能写错目标 —— 对齐
+            // #322 MOC-57 chat 路径破坏性半应用防护):
+            //   ① **完整但畸形**:有 `*** Begin Patch` 头但 hunk/operation/结构非法
+            //      (validate_v4a_syntax 拒)。
+            //   ② **响应级截断**:本 chunk finishReason=MAX_TOKENS / SAFETY 等 → patch 可能
+            //      被 token 上限切断(即使语法暂时合法)。finishReason 已在 candidate 循环
+            //      开头(part 之前)记录,故此处 self.final_finish_reason 对本 chunk 可见。
+            // Gemini functionCall.args 是一次性完整结构,不会跨 chunk 半截,故①只需语法后验、
+            // 不复用 chat 截断双检测器;②靠 finishReason 兜响应级截断。
             //
-            // 空 / 裸串(无 `*** Begin Patch`,如 `{}` / 错 key)无 hunk 可半应用 → 保持
-            // `completed` 原样透传,让 Codex `parse_patch` 报错(非破坏性;test 2116 行为不变)。
+            // 空 / 裸串(无 `*** Begin Patch`)无 hunk 可半应用 → 保持 `completed` 原样透传,
+            // 让 Codex `parse_patch` 报错(非破坏性;test 2116 不变)。
             let v4a_err = if has_begin {
                 crate::responses::validate_v4a_syntax(&input).err()
             } else {
                 None
             };
-            let incomplete = v4a_err.is_some();
+            // 正向截断信号(**不含 None** —— part 处理时 None 仅表示"本 chunk 尚无 finishReason",
+            // 后续可能 STOP 正常收尾;断流 + 完整 functionCall 非破坏性,不在此 gate)。
+            let response_truncated = matches!(
+                self.final_finish_reason.as_deref(),
+                Some("MAX_TOKENS")
+                    | Some("SAFETY")
+                    | Some("RECITATION")
+                    | Some("BLOCKLIST")
+                    | Some("PROHIBITED_CONTENT")
+                    | Some("SPII")
+                    | Some("IMAGE_SAFETY")
+                    | Some("IMAGE_PROHIBITED_CONTENT")
+            ) || self.final_finish_reason.as_deref()
+                == Some(FINISH_INTERRUPTED);
+            let incomplete = v4a_err.is_some() || response_truncated;
             if let Some(ref e) = v4a_err {
                 tracing::warn!(
                     target: "adapters::gemini::apply_patch",
@@ -1376,6 +1398,16 @@ impl GeminiToResponsesConverter {
                     message = %e.message,
                     "Gemini apply_patch V4A 语法校验失败(完整但畸形)→ emit status=incomplete \
                      阻止破坏性半应用;排查该 Gemini 模型 misbehave",
+                );
+            } else if response_truncated {
+                tracing::warn!(
+                    target: "adapters::gemini::apply_patch",
+                    error_id = "GEMINI_APPLY_PATCH_TRUNCATED",
+                    call_id = %call_id,
+                    model = %self.model,
+                    finish_reason = %self.final_finish_reason.as_deref().unwrap_or(""),
+                    "Gemini apply_patch 响应级截断(finishReason 非 STOP)→ patch 可能被切断,\
+                     emit status=incomplete 阻止 Codex 执行不完整 patch",
                 );
             } else if !has_begin {
                 tracing::warn!(
@@ -2229,6 +2261,36 @@ mod tests {
         assert_eq!(
             item["status"], "incomplete",
             "envelope 终态也必须 incomplete"
+        );
+    }
+
+    /// [MOC-75 review P1] 语法合法但响应被 `MAX_TOKENS` 截断的 apply_patch → status=incomplete
+    /// + 跳过 input.done(patch 可能被 token 上限切断)。验证 finishReason 在 part 之前记录
+    /// 使 emit_function_call 可见,防 Codex 执行被截断的 patch。
+    #[test]
+    fn apply_patch_truncated_by_max_tokens_emits_incomplete() {
+        // 合法 V4A patch,但同 chunk finishReason=MAX_TOKENS(响应级截断)
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"MAX_TOKENS"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|e| parse_event(e)).collect();
+        let done = parsed
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done" && p["item"]["type"] == "custom_tool_call"
+            })
+            .expect("custom_tool_call output_item.done 应 emit");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "MAX_TOKENS 截断的 apply_patch 必须 status=incomplete(即使语法合法)"
+        );
+        assert!(
+            !parsed
+                .iter()
+                .any(|(n, _)| n == "response.custom_tool_call_input.done"),
+            "截断路径不该 emit custom_tool_call_input.done"
         );
     }
 
