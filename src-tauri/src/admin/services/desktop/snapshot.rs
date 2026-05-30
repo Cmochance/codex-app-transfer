@@ -206,6 +206,13 @@ pub fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
 }
 
 pub fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -> bool {
+    // issue #317:direct 直连模式不写 model_catalog_json(用 Codex 默认 catalog),
+    // 「1M catalog 是否写入」对 direct 无意义 —— 视为就绪。否则 desktop_health 会
+    // 因 config.toml 没有 model_catalog_json 而永远返回 false → needsApply 死循环
+    // (direct + default model 带 [1m] 后缀的 provider)。
+    if !target.requires_proxy {
+        return true;
+    }
     let one_million_names: Vec<String> = desktop_expected_model_items(target)
         .into_iter()
         .filter_map(|item| {
@@ -351,6 +358,8 @@ pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, Strin
             app_version: APP_VERSION,
             codex_network_access: target.codex_network_access,
             codex_status_section_default_visible: target.codex_status_section_default_visible,
+            // issue #317:direct 直连只写上游配置,strip 全部 transfer 私货。
+            direct: target.mode == "direct",
         },
     )
     .map_err(|e| format!("apply 失败: {e}"))?;
@@ -1228,5 +1237,32 @@ mod tests {
                 manager.stop_silent();
             });
         });
+    }
+
+    /// issue #317 回归保护:direct(`requires_proxy=false`)不写 model_catalog_json,
+    /// `one_million_catalog_ready` 必须直接判就绪(short-circuit),不读 catalog
+    /// 文件。否则 direct + default model 带 [1m] 的 provider 会让 desktop_health
+    /// 永远 needsApply=true。短路在读文件之前,即便 paths 指向不存在目录也成立。
+    #[test]
+    fn one_million_catalog_ready_short_circuits_true_for_direct() {
+        let paths = CodexPaths::from_home_dir(std::path::Path::new("/nonexistent-cas-317"));
+        let direct_target = DesktopConfigTarget {
+            base_url: "https://up.example.com/v1".into(),
+            api_key: "sk".into(),
+            supports_1m: true,
+            provider_name: "Custom".into(),
+            default_model: "gpt-5.5[1m]".into(),
+            model_mappings: Value::Null,
+            model_capabilities: Value::Null,
+            requires_proxy: false,
+            mode: "direct",
+            proxy_port: 0,
+            codex_network_access: true,
+            codex_status_section_default_visible: true,
+        };
+        assert!(
+            one_million_catalog_ready(&paths, &direct_target),
+            "direct(requires_proxy=false)应直接判 1M 就绪,不依赖 catalog 文件"
+        );
     }
 }
