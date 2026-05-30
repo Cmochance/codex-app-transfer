@@ -21,8 +21,9 @@ pub use converter::ChatToResponsesConverter;
 // [MOC-75] gemini_native 复用 chat 的 apply_patch input 解析(alt-key 容错一致)
 pub(crate) use converter::extract_apply_patch_input;
 // [MOC-75] gemini_native 复用 chat 的 V4A 后验语法校验(完整但畸形的 patch → emit
-// status=incomplete,对齐 #322 MOC-57 破坏性半应用防护)
-pub(crate) use converter::{validate_v4a_syntax, V4aError};
+// status=incomplete,对齐 #322 MOC-57 破坏性半应用防护)。V4aError 不具名导出 —— 调用方
+// 经 `validate_v4a_syntax(..).err()` 类型推断读 line/message(pub(crate) 字段),无需 re-export。
+pub(crate) use converter::validate_v4a_syntax;
 pub use request::{
     responses_body_to_chat_body, responses_body_to_chat_body_for_provider,
     responses_body_to_chat_body_for_provider_with_session,

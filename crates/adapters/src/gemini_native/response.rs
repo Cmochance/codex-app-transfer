@@ -1373,8 +1373,16 @@ impl GeminiToResponsesConverter {
             } else {
                 None
             };
-            // 正向截断信号(**不含 None** —— part 处理时 None 仅表示"本 chunk 尚无 finishReason",
-            // 后续可能 STOP 正常收尾;断流 + 完整 functionCall 非破坏性,不在此 gate)。
+            // 正向截断/畸形信号(**不含 None** —— part 处理时 None 仅表示"本 chunk 尚无
+            // finishReason",后续可能 STOP 正常收尾;断流 + 完整 functionCall 非破坏性,不 gate)。
+            // `MALFORMED_FUNCTION_CALL` / `MALFORMED_RESPONSE` 是 Gemini **自报本次产出畸形**
+            // 的信号(types.rs map_finish_reason)—— 对 destructive 的 apply_patch 风险最高,
+            // 必须 gate(即使 patch 文本碰巧通过 validate_v4a_syntax 宽松后验)。
+            //
+            // **边界**:此 gate 依赖 finishReason 与 functionCall part 同 chunk(Gemini wire
+            // 里 functionCall 与其 finishReason 同候选末 chunk 投递,常见情形成立)。跨 chunk
+            // (functionCall 在前、finishReason 在后)时本 gate 漏判,但**结构被截断的 patch
+            // 由不依赖 chunk 时序的 validate_v4a_syntax 兜底** emit incomplete,破坏性主防护不漏。
             let response_truncated = matches!(
                 self.final_finish_reason.as_deref(),
                 Some("MAX_TOKENS")
@@ -1385,6 +1393,8 @@ impl GeminiToResponsesConverter {
                     | Some("SPII")
                     | Some("IMAGE_SAFETY")
                     | Some("IMAGE_PROHIBITED_CONTENT")
+                    | Some("MALFORMED_FUNCTION_CALL")
+                    | Some("MALFORMED_RESPONSE")
             ) || self.final_finish_reason.as_deref()
                 == Some(FINISH_INTERRUPTED);
             let incomplete = v4a_err.is_some() || response_truncated;
@@ -2291,6 +2301,29 @@ mod tests {
                 .iter()
                 .any(|(n, _)| n == "response.custom_tool_call_input.done"),
             "截断路径不该 emit custom_tool_call_input.done"
+        );
+    }
+
+    /// [MOC-75 silent-failure review] Gemini 自报 `MALFORMED_FUNCTION_CALL`(本次产出的
+    /// functionCall 畸形)→ apply_patch 即使语法看似合法也必须 status=incomplete
+    /// (destructive 风险最高的 Gemini 专属信号,必须在 gate 列表里)。
+    #[test]
+    fn apply_patch_malformed_function_call_finish_reason_emits_incomplete() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|e| parse_event(e)).collect();
+        let done = parsed
+            .iter()
+            .find(|(n, p)| {
+                n == "response.output_item.done" && p["item"]["type"] == "custom_tool_call"
+            })
+            .expect("custom_tool_call output_item.done 应 emit");
+        assert_eq!(
+            done.1["item"]["status"], "incomplete",
+            "MALFORMED_FUNCTION_CALL 的 apply_patch 必须 incomplete"
         );
     }
 
