@@ -31,7 +31,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, TRUE, WPARAM};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
 };
@@ -39,6 +39,9 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+};
 
 /// 调用 `IApplicationActivationManager::ActivateApplication` 启动 packaged
 /// Codex Desktop 并把 `args` 透传成单一 PWSTR 命令行字符串。
@@ -125,6 +128,12 @@ pub fn resolve_codex_aumid() -> Option<String> {
 /// - `Some(true)` / `Some(false)`:确切判定。
 /// - `None`:快照创建失败,无法判定 → caller 应 fallback 到 tasklist。
 pub fn is_codex_running() -> Option<bool> {
+    enum_codex_pids().map(|pids| !pids.is_empty())
+}
+
+/// 原生枚举所有 Codex 进程 PID(MOC-94/95 共用 —— is_codex_running 判存在、
+/// graceful_close_codex 据此匹配窗口)。返回 `None` = 快照创建失败(caller fallback)。
+fn enum_codex_pids() -> Option<Vec<u32>> {
     // SAFETY:Toolhelp32 API 全程在 unsafe 块内按文档用法调用 —— snapshot 句柄
     // 创建成功后保证 CloseHandle;PROCESSENTRY32W 按 dwSize 初始化;遍历到 NULL
     // 终止符截断进程名。所有原始指针来自栈上 entry,无悬垂。
@@ -134,7 +143,7 @@ pub fn is_codex_running() -> Option<bool> {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        let mut found = false;
+        let mut pids = Vec::new();
         if Process32FirstW(snapshot, &mut entry).is_ok() {
             loop {
                 let len = entry
@@ -144,8 +153,7 @@ pub fn is_codex_running() -> Option<bool> {
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
                 if name.eq_ignore_ascii_case(WINDOWS_PROCESS_NAME) {
-                    found = true;
-                    break;
+                    pids.push(entry.th32ProcessID);
                 }
                 if Process32NextW(snapshot, &mut entry).is_err() {
                     break;
@@ -153,8 +161,53 @@ pub fn is_codex_running() -> Option<bool> {
             }
         }
         let _ = CloseHandle(snapshot);
-        Some(found)
+        Some(pids)
     }
+}
+
+/// MOC-95:原生优雅关闭 Codex —— 给所有 Codex 进程的顶层窗口 `PostMessage(WM_CLOSE)`。
+///
+/// 跟 PowerShell `Stop-Process`(非 `-Force`)的 `CloseMainWindow` 是**同一机制**
+/// (都向窗口投 WM_CLOSE),但省掉 PowerShell 进程启动 + `Get-CimInstance` WMI 冷
+/// 初始化的 ~1s 开销(MOC-93 实测大头)。MSIX 允许向窗口投 WM_CLOSE(不像
+/// taskkill/TerminateProcess 那样 access-denied)。
+///
+/// 返回 PostMessage 成功的窗口数;`0` = 没找到 Codex 窗口(快照失败 / 进程无可见
+/// 顶层窗口 / 投递失败)→ caller 应 fallback 到 PowerShell graceful 兜底。
+pub fn graceful_close_codex() -> usize {
+    let pids = match enum_codex_pids() {
+        Some(p) if !p.is_empty() => p,
+        _ => return 0,
+    };
+    let mut ctx = CloseCtx {
+        pids: &pids,
+        posted: 0,
+    };
+    // SAFETY:EnumWindows 同步遍历顶层窗口,回调期间栈上的 ctx 始终有效;LPARAM
+    // 透传 ctx 裸指针,回调内解引用即取回。PostMessageW 异步投递不阻塞。
+    unsafe {
+        let _ = EnumWindows(Some(enum_close_proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    ctx.posted
+}
+
+struct CloseCtx<'a> {
+    pids: &'a [u32],
+    posted: usize,
+}
+
+/// EnumWindows 回调:窗口属于 Codex 进程则投 WM_CLOSE。返回 TRUE 继续遍历。
+unsafe extern "system" fn enum_close_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let ctx = &mut *(lparam.0 as *mut CloseCtx);
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid != 0
+        && ctx.pids.contains(&pid)
+        && PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok()
+    {
+        ctx.posted += 1;
+    }
+    TRUE
 }
 
 /// Codex Desktop 的 Windows 进程名(与 `process.rs::WINDOWS_PROCESS_NAME` 一致)。

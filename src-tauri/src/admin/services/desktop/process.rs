@@ -206,6 +206,17 @@ pub fn is_codex_app_running(platform: &str) -> bool {
 }
 
 fn run_quit_command(platform: &str, force: bool) {
+    // MOC-95:Windows 优雅退出(非 force / TERM 阶段)优先用原生 PostMessage(WM_CLOSE),
+    // 替 PowerShell `Get-CimInstance Win32_Process | Stop-Process`(WMI 冷启动 ~1s,
+    // MOC-93 实测重启路径大头)。两者同为 WM_CLOSE / CloseMainWindow 机制,native 省掉
+    // PowerShell + WMI 开销。找到并投递了 ≥1 个 Codex 窗口即返回;0 个窗口(罕见:Codex
+    // 无可见顶层窗口 / 快照失败)才 fall through 到下面 PowerShell graceful 兜底。force
+    // (KILL 阶段)保持 PowerShell `Stop-Process -Force` 不动(原生 TerminateProcess 在
+    // MSIX 上 access-denied,见 quit_command 注释)。
+    #[cfg(target_os = "windows")]
+    if platform == "windows" && !force && crate::windows_msix::graceful_close_codex() > 0 {
+        return;
+    }
     let cmd = quit_command(platform, force);
     let Some((program, args)) = cmd.split_first() else {
         return;
