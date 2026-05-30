@@ -30,13 +30,70 @@ use crate::codex_plugin_unlocker::current_cdp_url;
 /// 主题列表 — 字符串 ID 跟 `src-tauri/resources/themes/<id>/` 目录名匹配。
 /// **不变量**:每条 ID 都对应一组 (bg, mascot?) 资源 + 中英显示名(`ThemeMeta.display_name_{zh,en}`,
 /// Rust hardcoded,**不**走 frontend `i18n.js` keys)。
-pub const THEME_IDS: &[&str] = &["carton", "changli", "azurlane", "nailin", "zani"];
+pub const THEME_IDS: &[&str] = &[
+    "carton", "changli", "azurlane", "nailin", "zani", "frost", "nocturne", "duet", "rose",
+    "sonata", "studio",
+];
+
+/// Neutral cool-dark palette for the user `custom` theme (unknown artwork).
+/// `accent: ""` → no accent override, keeps Codex's native blue.
+const NEUTRAL_PALETTE: Palette = Palette {
+    ink: "#f1ece4",
+    ink2: "rgba(241,236,228,0.74)",
+    ink3: "rgba(241,236,228,0.56)",
+    ink4: "rgba(241,236,228,0.40)",
+    accent: "",
+    accent_soft: "",
+    focus: "",
+    surface: "rgba(20,20,24,0.50)",
+    glass: "rgba(24,24,29,0.60)",
+    glass_soft: "rgba(28,28,34,0.52)",
+    glass_strong: "rgba(16,16,20,0.78)",
+    border: "rgba(255,255,255,0.12)",
+    border_soft: "rgba(255,255,255,0.07)",
+    border_strong: "rgba(255,255,255,0.22)",
+    blur: "6px",
+    hover: "rgba(255,255,255,0.08)",
+    selection: "rgba(255,255,255,0.14)",
+    scrim_top: "rgba(8,8,10,0.26)",
+    scrim_mid: "rgba(8,8,10,0.34)",
+    scrim_bot: "rgba(5,5,7,0.60)",
+    base_color: "#0e0e10",
+};
 
 /// 自定义主题 id(动态加在 [`THEME_IDS`] 之后,仅当 `custom_theme_exists()` true 时存在)。
 pub const CUSTOM_THEME_ID: &str = "custom";
 
+/// 每主题调色板 — 跟图片主色调匹配的暗玻璃 + 强调色(从 agent-theme 同款微调版
+/// 同步而来)。所有值是直接展开进 CSS 的 color 字符串;`accent` 为空串表示该主题
+/// 不覆盖强调色(保留 Codex 原生蓝)。详见 [`render_theme_css`]。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Palette {
+    pub ink: &'static str,
+    pub ink2: &'static str,
+    pub ink3: &'static str,
+    pub ink4: &'static str,
+    pub accent: &'static str,
+    pub accent_soft: &'static str,
+    pub focus: &'static str,
+    pub surface: &'static str,
+    pub glass: &'static str,
+    pub glass_soft: &'static str,
+    pub glass_strong: &'static str,
+    pub border: &'static str,
+    pub border_soft: &'static str,
+    pub border_strong: &'static str,
+    pub blur: &'static str,
+    pub hover: &'static str,
+    pub selection: &'static str,
+    pub scrim_top: &'static str,
+    pub scrim_mid: &'static str,
+    pub scrim_bot: &'static str,
+    pub base_color: &'static str,
+}
+
 /// 内置主题元数据。display name 给 frontend 渲染;`has_mascot` 决定是否注入
-/// 浮动看板娘(目前仅 `carton` 有)。
+/// 浮动看板娘(目前仅 `carton` 有);`palette` 是该主题专属配色。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeMeta {
     pub id: &'static str,
@@ -49,9 +106,10 @@ pub struct ThemeMeta {
     /// 到胸口刚好。字段保留供未来非方图 portrait 主题用(可设 `"contain"` 整图显示,
     /// letterbox 用 body `background-color` 填)。
     pub bg_fit: &'static str,
-    /// `background-position`。当前都 `"center top"` 锚顶部(保头部)。cover + 方图
-    /// 组合下 viewport bottom 800px 被裁掉,锚 top 保留人物上半身。
+    /// `background-position` — 按图片构图锚定人物头部/上半身(per-theme)。
     pub bg_position: &'static str,
+    /// 该主题专属调色板(暗玻璃 + 强调色,跟图片主色匹配)。
+    pub palette: Palette,
 }
 
 /// 自定义主题资源目录:`~/.codex-app-transfer/themes/custom/`。
@@ -155,19 +213,65 @@ pub fn all_themes() -> Vec<ThemeMeta> {
     let mut v = vec![
         ThemeMeta {
             id: "carton",
-            display_name_zh: "Carton",
+            display_name_zh: "纸箱",
             display_name_en: "Carton",
             has_mascot: true,
             bg_fit: "cover",
-            bg_position: "center top",
+            bg_position: "50% 18%",
+            palette: Palette {
+                ink: "#f5ece1",
+                ink2: "rgba(245,236,225,0.74)",
+                ink3: "rgba(245,236,225,0.56)",
+                ink4: "rgba(245,236,225,0.40)",
+                accent: "#ff5a36",
+                accent_soft: "#ff9170",
+                focus: "#ff7a4f",
+                surface: "rgba(30,18,16,0.50)",
+                glass: "rgba(30,18,16,0.60)",
+                glass_soft: "rgba(30,18,16,0.52)",
+                glass_strong: "rgba(24,14,13,0.78)",
+                border: "rgba(255,228,210,0.14)",
+                border_soft: "rgba(255,228,210,0.07)",
+                border_strong: "rgba(255,228,210,0.26)",
+                blur: "6px",
+                hover: "rgba(255,228,210,0.10)",
+                selection: "rgba(255,228,210,0.16)",
+                scrim_top: "rgba(18,9,8,0.26)",
+                scrim_mid: "rgba(18,9,8,0.34)",
+                scrim_bot: "rgba(18,9,8,0.60)",
+                base_color: "#120908",
+            },
         },
         ThemeMeta {
             id: "changli",
-            display_name_zh: "长离",
+            display_name_zh: "长离 (Changli)",
             display_name_en: "Changli",
             has_mascot: false,
             bg_fit: "cover",
-            bg_position: "center top",
+            bg_position: "50% 4%",
+            palette: Palette {
+                ink: "#f4ebdf",
+                ink2: "rgba(244,235,223,.74)",
+                ink3: "rgba(244,235,223,.56)",
+                ink4: "rgba(244,235,223,.40)",
+                accent: "#e08a55",
+                accent_soft: "#e6b48a",
+                focus: "#ffce86",
+                surface: "rgba(26,18,12,.50)",
+                glass: "rgba(30,21,14,.60)",
+                glass_soft: "rgba(34,24,16,.52)",
+                glass_strong: "rgba(22,15,10,.78)",
+                border: "rgba(255,228,201,.14)",
+                border_soft: "rgba(255,228,201,.07)",
+                border_strong: "rgba(255,228,201,.26)",
+                blur: "6px",
+                hover: "rgba(255,236,210,.10)",
+                selection: "rgba(255,236,210,.16)",
+                scrim_top: "rgba(18,12,8,.26)",
+                scrim_mid: "rgba(17,11,7,.34)",
+                scrim_bot: "rgba(11,7,5,.60)",
+                base_color: "#160f0a",
+            },
         },
         ThemeMeta {
             id: "azurlane",
@@ -176,22 +280,277 @@ pub fn all_themes() -> Vec<ThemeMeta> {
             has_mascot: false,
             bg_fit: "cover",
             bg_position: "center top",
+            palette: Palette {
+                ink: "#eef2f8",
+                ink2: "rgba(238,242,248,0.74)",
+                ink3: "rgba(238,242,248,0.56)",
+                ink4: "rgba(238,242,248,0.40)",
+                accent: "#3fb6e8",
+                accent_soft: "#8fd6f2",
+                focus: "#5fc8f5",
+                surface: "rgba(20,28,42,0.50)",
+                glass: "rgba(20,28,42,0.60)",
+                glass_soft: "rgba(20,28,42,0.52)",
+                glass_strong: "rgba(20,28,42,0.78)",
+                border: "rgba(206,224,244,0.14)",
+                border_soft: "rgba(206,224,244,0.07)",
+                border_strong: "rgba(206,224,244,0.26)",
+                blur: "6px",
+                hover: "rgba(206,224,244,0.10)",
+                selection: "rgba(206,224,244,0.16)",
+                scrim_top: "rgba(12,18,28,0.26)",
+                scrim_mid: "rgba(12,18,28,0.34)",
+                scrim_bot: "rgba(12,18,28,0.60)",
+                base_color: "#0c121c",
+            },
         },
         ThemeMeta {
             id: "nailin",
-            display_name_zh: "乃琳",
+            display_name_zh: "奈琳",
             display_name_en: "Nailin",
             has_mascot: false,
             bg_fit: "cover",
             bg_position: "center top",
+            palette: Palette {
+                ink: "#f4ebdf",
+                ink2: "rgba(244,235,223,0.74)",
+                ink3: "rgba(244,235,223,0.56)",
+                ink4: "rgba(244,235,223,0.40)",
+                accent: "#ff7a33",
+                accent_soft: "#ffb27d",
+                focus: "#ff8f4d",
+                surface: "rgba(26,18,12,0.50)",
+                glass: "rgba(26,18,12,0.60)",
+                glass_soft: "rgba(26,18,12,0.52)",
+                glass_strong: "rgba(26,18,12,0.78)",
+                border: "rgba(247,233,218,0.14)",
+                border_soft: "rgba(247,233,218,0.07)",
+                border_strong: "rgba(247,233,218,0.26)",
+                blur: "6px",
+                hover: "rgba(247,233,218,0.10)",
+                selection: "rgba(247,233,218,0.16)",
+                scrim_top: "rgba(10,6,4,0.26)",
+                scrim_mid: "rgba(10,6,4,0.34)",
+                scrim_bot: "rgba(10,6,4,0.60)",
+                base_color: "#0a0604",
+            },
         },
         ThemeMeta {
             id: "zani",
-            display_name_zh: "赞妮",
+            display_name_zh: "扎妮",
             display_name_en: "Zani",
             has_mascot: false,
             bg_fit: "cover",
             bg_position: "center top",
+            palette: Palette {
+                ink: "#f1eef2",
+                ink2: "rgba(241,238,242,0.74)",
+                ink3: "rgba(241,238,242,0.56)",
+                ink4: "rgba(241,238,242,0.40)",
+                accent: "#d83a45",
+                accent_soft: "#ec7b82",
+                focus: "#f25661",
+                surface: "rgba(26,22,28,0.50)",
+                glass: "rgba(26,22,28,0.60)",
+                glass_soft: "rgba(26,22,28,0.52)",
+                glass_strong: "rgba(26,22,28,0.78)",
+                border: "rgba(241,238,242,0.14)",
+                border_soft: "rgba(241,238,242,0.07)",
+                border_strong: "rgba(241,238,242,0.26)",
+                blur: "6px",
+                hover: "rgba(241,238,242,0.10)",
+                selection: "rgba(241,238,242,0.16)",
+                scrim_top: "rgba(16,12,18,0.26)",
+                scrim_mid: "rgba(16,12,18,0.34)",
+                scrim_bot: "rgba(16,12,18,0.60)",
+                base_color: "#100c12",
+            },
+        },
+        ThemeMeta {
+            id: "frost",
+            display_name_zh: "霜银",
+            display_name_en: "Frost",
+            has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "50% 8%",
+            palette: Palette {
+                ink: "#eef1f7",
+                ink2: "rgba(238,241,247,0.74)",
+                ink3: "rgba(238,241,247,0.56)",
+                ink4: "rgba(238,241,247,0.40)",
+                accent: "#4f6cb0",
+                accent_soft: "#8fa3d8",
+                focus: "#6a86cc",
+                surface: "rgba(20,24,36,0.50)",
+                glass: "rgba(20,24,36,0.60)",
+                glass_soft: "rgba(20,24,36,0.52)",
+                glass_strong: "rgba(20,24,36,0.78)",
+                border: "rgba(206,214,235,0.14)",
+                border_soft: "rgba(206,214,235,0.07)",
+                border_strong: "rgba(206,214,235,0.26)",
+                blur: "6px",
+                hover: "rgba(206,214,235,0.10)",
+                selection: "rgba(206,214,235,0.16)",
+                scrim_top: "rgba(14,16,24,0.26)",
+                scrim_mid: "rgba(14,16,24,0.34)",
+                scrim_bot: "rgba(14,16,24,0.60)",
+                base_color: "#0e1018",
+            },
+        },
+        ThemeMeta {
+            id: "nocturne",
+            display_name_zh: "夜合",
+            display_name_en: "Nocturne",
+            has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "center top",
+            palette: Palette {
+                ink: "#eef1f7",
+                ink2: "rgba(238,241,247,0.74)",
+                ink3: "rgba(238,241,247,0.56)",
+                ink4: "rgba(238,241,247,0.40)",
+                accent: "#7cc5d6",
+                accent_soft: "#a9dde9",
+                focus: "#9bd6e4",
+                surface: "rgba(20,26,32,0.50)",
+                glass: "rgba(20,26,32,0.60)",
+                glass_soft: "rgba(20,26,32,0.52)",
+                glass_strong: "rgba(15,20,25,0.78)",
+                border: "rgba(205,221,228,0.14)",
+                border_soft: "rgba(205,221,228,0.07)",
+                border_strong: "rgba(205,221,228,0.26)",
+                blur: "6px",
+                hover: "rgba(205,221,228,0.10)",
+                selection: "rgba(124,197,214,0.16)",
+                scrim_top: "rgba(13,17,21,0.26)",
+                scrim_mid: "rgba(13,17,21,0.34)",
+                scrim_bot: "rgba(13,17,21,0.60)",
+                base_color: "#0d1115",
+            },
+        },
+        ThemeMeta {
+            id: "duet",
+            display_name_zh: "相拥",
+            display_name_en: "Duet",
+            has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "50% 4%",
+            palette: Palette {
+                ink: "#eef1f7",
+                ink2: "rgba(238,241,247,0.74)",
+                ink3: "rgba(238,241,247,0.56)",
+                ink4: "rgba(238,241,247,0.40)",
+                accent: "#32b1b7",
+                accent_soft: "#7fd4d8",
+                focus: "#46c8ce",
+                surface: "rgba(16,21,36,0.50)",
+                glass: "rgba(16,21,36,0.60)",
+                glass_soft: "rgba(16,21,36,0.52)",
+                glass_strong: "rgba(16,21,36,0.78)",
+                border: "rgba(238,241,247,0.14)",
+                border_soft: "rgba(238,241,247,0.07)",
+                border_strong: "rgba(238,241,247,0.26)",
+                blur: "6px",
+                hover: "rgba(238,241,247,0.10)",
+                selection: "rgba(238,241,247,0.16)",
+                scrim_top: "rgba(10,13,22,0.26)",
+                scrim_mid: "rgba(10,13,22,0.34)",
+                scrim_bot: "rgba(10,13,22,0.60)",
+                base_color: "#0a0d16",
+            },
+        },
+        ThemeMeta {
+            id: "rose",
+            display_name_zh: "暖玫",
+            display_name_en: "Rose",
+            has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "center 60%",
+            palette: Palette {
+                ink: "#f5ebe6",
+                ink2: "rgba(245,235,230,0.74)",
+                ink3: "rgba(245,235,230,0.56)",
+                ink4: "rgba(245,235,230,0.40)",
+                accent: "#e8475a",
+                accent_soft: "#f2899a",
+                focus: "#ff5c70",
+                surface: "rgba(32,21,25,0.50)",
+                glass: "rgba(32,21,25,0.60)",
+                glass_soft: "rgba(32,21,25,0.52)",
+                glass_strong: "rgba(32,21,25,0.78)",
+                border: "rgba(248,224,224,0.14)",
+                border_soft: "rgba(248,224,224,0.07)",
+                border_strong: "rgba(248,224,224,0.26)",
+                blur: "6px",
+                hover: "rgba(248,224,224,0.10)",
+                selection: "rgba(248,224,224,0.16)",
+                scrim_top: "rgba(18,11,14,0.26)",
+                scrim_mid: "rgba(18,11,14,0.34)",
+                scrim_bot: "rgba(18,11,14,0.60)",
+                base_color: "#120b0e",
+            },
+        },
+        ThemeMeta {
+            id: "sonata",
+            display_name_zh: "琴奏",
+            display_name_en: "Sonata",
+            has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "center top",
+            palette: Palette {
+                ink: "#eef1f7",
+                ink2: "rgba(238,241,247,0.74)",
+                ink3: "rgba(238,241,247,0.56)",
+                ink4: "rgba(238,241,247,0.40)",
+                accent: "#6e83c4",
+                accent_soft: "#9aa9d8",
+                focus: "#8497d4",
+                surface: "rgba(20,24,38,0.50)",
+                glass: "rgba(20,24,38,0.60)",
+                glass_soft: "rgba(20,24,38,0.52)",
+                glass_strong: "rgba(20,24,38,0.78)",
+                border: "rgba(216,224,242,0.14)",
+                border_soft: "rgba(216,224,242,0.07)",
+                border_strong: "rgba(216,224,242,0.26)",
+                blur: "6px",
+                hover: "rgba(216,224,242,0.10)",
+                selection: "rgba(216,224,242,0.16)",
+                scrim_top: "rgba(15,18,30,0.26)",
+                scrim_mid: "rgba(15,18,30,0.34)",
+                scrim_bot: "rgba(15,18,30,0.60)",
+                base_color: "#0f121e",
+            },
+        },
+        ThemeMeta {
+            id: "studio",
+            display_name_zh: "晴室",
+            display_name_en: "Studio",
+            has_mascot: false,
+            bg_fit: "cover",
+            bg_position: "center top",
+            palette: Palette {
+                ink: "#f4ebdf",
+                ink2: "rgba(244,235,223,0.74)",
+                ink3: "rgba(244,235,223,0.56)",
+                ink4: "rgba(244,235,223,0.40)",
+                accent: "#e0a94e",
+                accent_soft: "#f0c97d",
+                focus: "#f2b75a",
+                surface: "rgba(28,22,16,0.50)",
+                glass: "rgba(28,22,16,0.60)",
+                glass_soft: "rgba(28,22,16,0.52)",
+                glass_strong: "rgba(28,22,16,0.78)",
+                border: "rgba(244,235,223,0.14)",
+                border_soft: "rgba(244,235,223,0.07)",
+                border_strong: "rgba(244,235,223,0.26)",
+                blur: "6px",
+                hover: "rgba(244,235,223,0.10)",
+                selection: "rgba(244,235,223,0.16)",
+                scrim_top: "rgba(20,15,11,0.26)",
+                scrim_mid: "rgba(20,15,11,0.34)",
+                scrim_bot: "rgba(20,15,11,0.60)",
+                base_color: "#1b1512",
+            },
         },
     ];
     if custom_theme_exists() {
@@ -202,6 +561,7 @@ pub fn all_themes() -> Vec<ThemeMeta> {
             has_mascot: false,
             bg_fit: "cover",
             bg_position: "center top",
+            palette: NEUTRAL_PALETTE,
         });
     }
     v
@@ -262,6 +622,42 @@ pub fn load_theme_assets(theme_id: &str) -> Option<ThemeAssets> {
                 "image/jpeg",
                 None,
                 include_bytes!("../resources/themes/zani/preview.jpg"),
+            ),
+            "frost" => (
+                include_bytes!("../resources/themes/frost/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/frost/preview.jpg"),
+            ),
+            "nocturne" => (
+                include_bytes!("../resources/themes/nocturne/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/nocturne/preview.jpg"),
+            ),
+            "duet" => (
+                include_bytes!("../resources/themes/duet/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/duet/preview.jpg"),
+            ),
+            "rose" => (
+                include_bytes!("../resources/themes/rose/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/rose/preview.jpg"),
+            ),
+            "sonata" => (
+                include_bytes!("../resources/themes/sonata/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/sonata/preview.jpg"),
+            ),
+            "studio" => (
+                include_bytes!("../resources/themes/studio/bg.jpg"),
+                "image/jpeg",
+                None,
+                include_bytes!("../resources/themes/studio/preview.jpg"),
             ),
             _ => return None,
         };
@@ -556,38 +952,217 @@ async fn drain_until_response(
     }
 }
 
-/// 构造注入 script — CSS variable 覆盖 + 背景图 + 可选 mascot。
-///
-/// **CSS 借鉴 user 本地 `~/alysechen/github/codex-theme/launcher.js` 手搓**
-/// (user 明示无需致谢,非上游借鉴)。token 变量名跟 Codex Desktop UI 框架内部
-/// 一致(`--color-token-*` 系列),改它们等于 hot reskin。
+/// Modular, design-token-driven Codex reskin. Surface tokens become per-theme
+/// translucent glass (so token consumers like the collapsed-sidebar fly-out stay
+/// opaque) while the big surface ELEMENTS are forced transparent so the bg image
+/// shows; overlay modules get per-module frosted glass; the runtime `--color-*`
+/// layer (settings cards, buttons, text, icons, hover) is overridden; the resize
+/// handle + panel pseudo-elements are neutralised; the top-of-content fade is
+/// forced always-on. Per-theme values come from [`ThemeMeta::palette`]; the
+/// structure is synced from the tuned agent-theme injector. Legacy
+/// codex-app-transfer selectors (browser-mode surfaces, panel dividers) are
+/// merged in so older / browser windows stay covered. Placeholders filled below.
+const CODEX_CSS_TEMPLATE: &str = r#":root{
+--cl-ink:__INK__;--cl-ink-2:__INK2__;--cl-ink-3:__INK3__;--cl-ink-4:__INK4__;
+--cl-surface:__SURFACE__;--cl-glass:__GLASS__;--cl-glass-soft:__GLASS_SOFT__;--cl-glass-strong:__GLASS_STRONG__;
+--cl-border:__BORDER__;--cl-border-soft:__BORDER_SOFT__;--cl-border-strong:__BORDER_STRONG__;
+--cl-blur:__BLUR__;--cl-hover:__HOVER__;--cl-selection:__SELECTION__;
+--cl-scrim-top:__SCRIM_TOP__;--cl-scrim-mid:__SCRIM_MID__;--cl-scrim-bot:__SCRIM_BOT__;
+}
+html{
+color-scheme:dark !important;
+--color-token-main-surface-primary:var(--cl-surface) !important;
+--color-token-side-bar-background:var(--cl-glass) !important;
+--vscode-sideBar-background:var(--cl-glass) !important;
+--color-token-editor-background:transparent !important;
+--vscode-editor-background:transparent !important;
+--color-token-terminal-background:rgba(0,0,0,.5) !important;
+--color-token-bg-primary:var(--cl-glass) !important;
+--color-token-bg-secondary:var(--cl-glass-soft) !important;
+--color-token-bg-tertiary:var(--cl-glass-soft) !important;
+--color-token-bg-fog:var(--cl-surface) !important;
+--color-token-dropdown-background:var(--cl-glass-strong) !important;
+--vscode-dropdown-background:var(--cl-glass-strong) !important;
+--color-token-menu-background:var(--cl-glass-strong) !important;
+--vscode-menu-background:var(--cl-glass-strong) !important;
+--color-token-input-background:var(--cl-glass-soft) !important;
+--vscode-input-background:var(--cl-glass-soft) !important;
+--color-token-text-code-block-background:rgba(0,0,0,.40) !important;
+--vscode-textCodeBlock-background:rgba(0,0,0,.40) !important;
+--color-token-text-preformat-background:rgba(0,0,0,.40) !important;
+--color-token-diff-surface:rgba(255,255,255,.04) !important;
+--color-background-surface:var(--cl-surface) !important;
+--color-background-surface-under:transparent !important;
+--codex-base-surface:var(--cl-surface) !important;
+--color-background-panel:var(--cl-glass-strong) !important;
+--color-background-elevated-primary:var(--cl-glass-strong) !important;
+--color-background-elevated-primary-opaque:var(--cl-glass-strong) !important;
+--color-background-elevated-secondary:var(--cl-glass-soft) !important;
+--color-background-elevated-secondary-opaque:var(--cl-glass-soft) !important;
+--color-background-editor-opaque:var(--cl-glass-soft) !important;
+--color-background-control:var(--cl-glass-soft) !important;
+--color-background-control-opaque:var(--cl-glass-strong) !important;
+--color-token-foreground:var(--cl-ink) !important;
+--vscode-foreground:var(--cl-ink) !important;
+--color-token-text-primary:var(--cl-ink) !important;
+--color-token-text-secondary:var(--cl-ink-2) !important;
+--color-token-text-tertiary:var(--cl-ink-3) !important;
+--color-token-description-foreground:var(--cl-ink-3) !important;
+--vscode-descriptionForeground:var(--cl-ink-3) !important;
+--color-token-disabled-foreground:var(--cl-ink-4) !important;
+--color-token-icon-foreground:var(--cl-ink-2) !important;
+--vscode-icon-foreground:var(--cl-ink-2) !important;
+--color-text-foreground:var(--cl-ink) !important;
+--color-text-foreground-secondary:var(--cl-ink-2) !important;
+--color-text-foreground-tertiary:var(--cl-ink-3) !important;
+--color-text-button-secondary:var(--cl-ink) !important;
+--color-text-button-tertiary:var(--cl-ink-3) !important;
+--codex-base-ink:var(--cl-ink) !important;
+--color-icon-primary:var(--cl-ink) !important;
+--color-icon-secondary:var(--cl-ink-2) !important;
+--color-icon-tertiary:var(--cl-ink-3) !important;
+--color-token-border:var(--cl-border) !important;
+--color-token-border-default:var(--cl-border) !important;
+--color-token-border-light:var(--cl-border-soft) !important;
+--color-token-border-heavy:var(--cl-border) !important;
+--color-border:var(--cl-border) !important;
+--color-border-light:var(--cl-border-soft) !important;
+--color-border-heavy:var(--cl-border) !important;
+--color-token-list-hover-background:var(--cl-hover) !important;
+--color-token-list-active-selection-background:var(--cl-selection) !important;
+--color-token-list-active-selection-foreground:var(--cl-ink) !important;
+--color-token-toolbar-hover-background:var(--cl-hover) !important;
+--vscode-list-hoverBackground:var(--cl-hover) !important;
+--vscode-list-activeSelectionBackground:var(--cl-selection) !important;
+--vscode-toolbar-hoverBackground:var(--cl-hover) !important;
+--color-background-button-secondary-hover:var(--cl-hover) !important;
+--color-background-button-tertiary-hover:var(--cl-hover) !important;
+--color-token-scrollbar-slider-background:var(--cl-border) !important;
+--color-token-scrollbar-slider-hover-background:var(--cl-border-strong) !important;
+}
+html.electron-light,html.electron-dark,html{
+background:__BASECOLOR__ url('__HERO__') __POS__ / __FIT__ no-repeat fixed !important;
+}
+body{background:transparent !important;}
+#root > *,.app-shell,.app-shell-main,main.main-surface,.app-shell-main-content-viewport,.app-shell-main-content-frame,[class~="electron:bg-token-main-surface-primary"]{background-color:transparent !important;}
+html main.main-surface{border-radius:0 !important;}
+#root{
+background:linear-gradient(180deg,var(--cl-scrim-top) 0%,var(--cl-scrim-mid) 55%,var(--cl-scrim-bot) 100%) !important;
+}
+html .app-shell-left-panel{
+background:var(--cl-glass) !important;border-right:none !important;
+-webkit-backdrop-filter:blur(var(--cl-blur)) saturate(118%);backdrop-filter:blur(var(--cl-blur)) saturate(118%);
+}
+html aside.fixed.bottom-0.left-0{
+background:var(--cl-glass-strong) !important;
+-webkit-backdrop-filter:blur(calc(var(--cl-blur) + 4px)) saturate(120%);backdrop-filter:blur(calc(var(--cl-blur) + 4px)) saturate(120%);
+border:1px solid var(--cl-border-soft);box-shadow:0 14px 44px rgba(0,0,0,.55);
+}
+html .relative.flex.flex-col[class*="input-background"]{
+background:var(--cl-glass-soft) !important;border:1px solid var(--cl-border-strong) !important;
+box-shadow:0 10px 28px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.08) !important;
+-webkit-backdrop-filter:blur(calc(var(--cl-blur) + 4px)) saturate(120%);backdrop-filter:blur(calc(var(--cl-blur) + 4px)) saturate(120%);
+}
+html [role="dialog"],html [role="menu"],html [role="listbox"],html [data-radix-menu-content],html .dialog-layout,html [data-browser-comment-editor-surface],html .bg-token-dropdown-background{
+background-color:var(--cl-glass-strong) !important;
+-webkit-backdrop-filter:blur(calc(var(--cl-blur) + 6px)) saturate(120%);backdrop-filter:blur(calc(var(--cl-blur) + 6px)) saturate(120%);
+box-shadow:0 8px 24px rgba(0,0,0,.40) !important;
+}
+html .app-shell-left-panel::before,html .app-shell-left-panel::after,html .app-shell-main::before,html .app-shell-main::after,html .main-surface::before,html .main-surface::after,html .thread-root::before,html .thread-root::after,html .composer-root::before,html .composer-root::after,html .editor-container::before,html .editor-container::after{
+background:transparent !important;background-image:none !important;box-shadow:none !important;mask:none !important;-webkit-mask:none !important;-webkit-mask-image:none !important;mask-image:none !important;filter:none !important;
+}
+html [role="separator"][aria-orientation="vertical"],html .sidebar-resize-handle-line,html [data-panel-resize-handle],html [data-panel-resize-handle-id],html [data-panel-group],html [data-resize-handle],html .split-pane-divider,html .app-shell-divider,html .resize-handle,html .resizable-handle{
+background:transparent !important;background-image:none !important;box-shadow:none !important;border:none !important;
+}
+html .app-shell-main-content-top-fade{opacity:1 !important;}
+html [container-name="home-main-content"]{text-shadow:0 1px 16px rgba(0,0,0,.6),0 0 2px rgba(0,0,0,.45);}
+html .text-token-text-tertiary,html [class*="placeholder"]{text-shadow:0 1px 8px rgba(0,0,0,.6),0 0 2px rgba(0,0,0,.5);}
+html [container-name="home-main-content"] [role="list"] [role="listitem"]{
+background-color:rgba(0,0,0,.22);
+-webkit-backdrop-filter:blur(var(--cl-blur)) saturate(115%);backdrop-filter:blur(var(--cl-blur)) saturate(115%);
+text-shadow:0 1px 6px rgba(0,0,0,.55),0 0 1px rgba(0,0,0,.45);
+}
+html .vscode-markdown code,html .vscode-markdown pre,html .monaco-editor{text-shadow:none !important;}
+__ACCENT_BLOCK__"#;
+
+/// Accent-cohesion rules — emitted only when the theme's palette declares an accent.
+const CODEX_ACCENT_BLOCK: &str = r#":root{--cl-accent:__ACCENT__;--cl-accent-soft:__ACCENT_SOFT__;--cl-focus:__FOCUS__;}
+html{
+--codex-base-accent:var(--cl-accent) !important;
+--color-accent-blue:var(--cl-accent) !important;
+--color-text-accent:var(--cl-accent) !important;
+--color-icon-accent:var(--cl-accent) !important;
+--color-token-primary:var(--cl-accent) !important;
+--color-token-link:var(--cl-accent) !important;
+--color-token-text-link-foreground:var(--cl-accent) !important;
+--vscode-textLink-foreground:var(--cl-accent) !important;
+--color-token-focus-border:var(--cl-focus) !important;
+--color-border-focus:var(--cl-focus) !important;
+--color-background-accent:color-mix(in srgb,var(--cl-accent) 18%,transparent) !important;
+--color-background-accent-hover:color-mix(in srgb,var(--cl-accent) 24%,transparent) !important;
+--color-background-accent-active:color-mix(in srgb,var(--cl-accent) 28%,transparent) !important;
+}
+html button[data-testid="composer-send-button"],html .composer-send-button{color:var(--cl-accent) !important;border-color:color-mix(in srgb,var(--cl-accent) 30%,transparent) !important;}
+html button[data-testid="composer-send-button"]:not(:disabled),html .composer-send-button:not(:disabled){background:color-mix(in srgb,var(--cl-accent) 30%,transparent) !important;}
+html button[data-testid="composer-send-button"]:not(:disabled) svg,html .composer-send-button:not(:disabled) svg{color:var(--cl-accent) !important;opacity:1 !important;}
+::selection{background:color-mix(in srgb,var(--cl-accent) 30%,transparent);}"#;
+
+/// Fill [`CODEX_CSS_TEMPLATE`] from a theme's [`Palette`] + background data URI.
+fn render_theme_css(meta: Option<&ThemeMeta>, bg: &str) -> String {
+    let (p, pos, fit) = match meta {
+        Some(m) => (&m.palette, m.bg_position, m.bg_fit),
+        None => (&NEUTRAL_PALETTE, "center top", "cover"),
+    };
+    let accent_block = if p.accent.is_empty() {
+        String::new()
+    } else {
+        CODEX_ACCENT_BLOCK
+            .replace("__ACCENT_SOFT__", p.accent_soft)
+            .replace("__FOCUS__", p.focus)
+            .replace("__ACCENT__", p.accent)
+    };
+    CODEX_CSS_TEMPLATE
+        .replace("__HERO__", bg)
+        .replace("__BASECOLOR__", p.base_color)
+        .replace("__POS__", pos)
+        .replace("__FIT__", fit)
+        .replace("__INK2__", p.ink2)
+        .replace("__INK3__", p.ink3)
+        .replace("__INK4__", p.ink4)
+        .replace("__INK__", p.ink)
+        .replace("__SURFACE__", p.surface)
+        .replace("__GLASS_STRONG__", p.glass_strong)
+        .replace("__GLASS_SOFT__", p.glass_soft)
+        .replace("__GLASS__", p.glass)
+        .replace("__BORDER_STRONG__", p.border_strong)
+        .replace("__BORDER_SOFT__", p.border_soft)
+        .replace("__BORDER__", p.border)
+        .replace("__BLUR__", p.blur)
+        .replace("__HOVER__", p.hover)
+        .replace("__SELECTION__", p.selection)
+        .replace("__SCRIM_TOP__", p.scrim_top)
+        .replace("__SCRIM_MID__", p.scrim_mid)
+        .replace("__SCRIM_BOT__", p.scrim_bot)
+        .replace("__ACCENT_BLOCK__", &accent_block)
+}
+
+/// 构造注入 script — per-theme CSS(见 [`render_theme_css`])+ 可选 mascot,
+/// 包进 IIFE。沿用 `cat-theme-style` id + remove-then-create 切换语义。
 fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
-    let bg = &assets.bg_data_uri;
-    // 按 theme 查 bg_fit / bg_position(portrait 图用 contain 不裁头)
-    let (bg_fit, bg_position) = all_themes()
-        .into_iter()
-        .find(|m| m.id == theme_id)
-        .map(|m| (m.bg_fit, m.bg_position))
-        .unwrap_or(("cover", "center top"));
+    let metas = all_themes();
+    let meta = metas.iter().find(|m| m.id == theme_id);
+    let css = render_theme_css(meta, &assets.bg_data_uri);
+
     let mascot_block = match &assets.mascot_data_uri {
         Some(m) => format!(
             r#"
     /* Floating Mascot (carton 主题专属) */
     .cat-theme-mascot {{
-      position: fixed;
-      bottom: 15px;
-      right: 15px;
-      width: 150px;
-      height: 150px;
-      background-image: url('{m}');
-      background-size: contain;
-      background-repeat: no-repeat;
-      background-position: bottom right;
-      z-index: 9999;
-      pointer-events: none;
+      position: fixed; bottom: 15px; right: 15px; width: 150px; height: 150px;
+      background-image: url('{m}'); background-size: contain; background-repeat: no-repeat;
+      background-position: bottom right; z-index: 9999; pointer-events: none;
       transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), opacity 0.3s ease;
-      opacity: 0.85;
-      filter: drop-shadow(0 4px 12px rgba(0,0,0,0.35));
+      opacity: 0.85; filter: drop-shadow(0 4px 12px rgba(0,0,0,0.35));
     }}
 "#
         ),
@@ -596,7 +1171,6 @@ fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
 
     let mascot_js = if assets.mascot_data_uri.is_some() {
         r#"
-  // Mount mascot + rAF-throttled distance-based micro-animation
   if (!document.getElementById('cat-theme-mascot')) {
     var m = document.createElement('div');
     m.id = 'cat-theme-mascot';
@@ -626,12 +1200,8 @@ fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
     format!(
         r#"
 (function() {{
-  // codex-app-transfer theme inject (#264). theme={theme_id}
-  // **切换主题语义**:进来先 cleanup 旧 style + mascot(如有),再 inject 新的。
-  // 早期版本用 `if (existing) return` short-circuit,导致从主题 A apply 到主题 B
-  // 时 Runtime.evaluate 因 'cat-theme-style' 已存在直接 return,新主题没注入 —
-  // user 必须 reload Codex page 才能切换。改成 remove-then-create 后,apply
-  // 调用即立即切到新主题(单步生效)。
+  // codex-app-transfer modular theme inject. theme={theme_id}
+  // remove-then-create so apply 即时切换(不需 reload)。
   var oldStyle = document.getElementById('cat-theme-style');
   if (oldStyle) oldStyle.remove();
   var oldMascot = document.getElementById('cat-theme-mascot');
@@ -640,98 +1210,8 @@ fn build_inject_script(theme_id: &str, assets: &ThemeAssets) -> String {
   var style = document.createElement('style');
   style.id = 'cat-theme-style';
   style.setAttribute('data-cat-theme', '{theme_id}');
-  style.textContent = `
-    body {{
-      background-color: #1a1010 !important;
-      background-image: linear-gradient(rgba(22, 13, 13, 0.45), rgba(22, 13, 13, 0.45)), url('{bg}') !important;
-      background-size: cover, {bg_fit} !important;
-      background-position: center, {bg_position} !important;
-      background-repeat: no-repeat, no-repeat !important;
-      background-attachment: fixed, fixed !important;
-    }}
-    #root, .app-shell, .app-shell-main, main.main-surface {{ background: transparent !important; }}
-
-    :root {{
-      --color-token-main-surface-primary: rgba(22, 13, 13, 0.65) !important;
-      --color-token-bg-primary: rgba(18, 10, 10, 0.7) !important;
-      --color-token-side-bar-background: rgba(14, 6, 6, 0.75) !important;
-      --color-token-editor-background: rgba(22, 12, 12, 0.45) !important;
-      --color-token-input-background: rgba(255, 200, 200, 0.08) !important;
-      --color-background-surface: rgba(22, 13, 13, 0.65) !important;
-      --color-background-panel: rgba(22, 13, 13, 0.65) !important;
-      --color-background-elevated-primary: rgba(22, 13, 13, 0.65) !important;
-      --color-background-elevated-primary-opaque: rgba(22, 13, 13, 0.65) !important;
-      --color-background-elevated-secondary: rgba(22, 13, 13, 0.65) !important;
-      --color-background-elevated-secondary-opaque: rgba(22, 13, 13, 0.65) !important;
-      --color-background-control: rgba(22, 13, 13, 0.65) !important;
-      --color-background-control-opaque: rgba(22, 13, 13, 0.65) !important;
-      --color-token-bg-fog: rgba(22, 13, 13, 0.65) !important;
-      --color-token-dropdown-background: rgba(22, 13, 13, 0.65) !important;
-      --color-token-border: rgba(230, 70, 70, 0.18) !important;
-      --color-token-border-heavy: rgba(230, 70, 70, 0.28) !important;
-      --color-token-border-light: rgba(230, 70, 70, 0.1) !important;
-      --color-border: rgba(230, 70, 70, 0.18) !important;
-      --color-border-heavy: rgba(230, 70, 70, 0.28) !important;
-      --color-border-light: rgba(230, 70, 70, 0.1) !important;
-      --color-token-foreground: #fcfcfc !important;
-      --color-token-text-primary: #fcfcfc !important;
-      --color-token-text-secondary: rgba(250, 240, 240, 0.75) !important;
-      --color-text-foreground: #fcfcfc !important;
-      --color-text-foreground-secondary: rgba(250, 240, 240, 0.75) !important;
-      --color-text-foreground-tertiary: rgba(250, 240, 240, 0.5) !important;
-      --color-text-button-primary: #fcfcfc !important;
-      --color-text-button-secondary: #fcfcfc !important;
-      --color-text-button-tertiary: rgba(250, 240, 240, 0.75) !important;
-      --color-icon-primary: #fcfcfc !important;
-      --color-icon-secondary: rgba(250, 240, 240, 0.75) !important;
-      --color-icon-tertiary: rgba(250, 240, 240, 0.5) !important;
-      --color-token-primary: #ff4747 !important;
-      --color-token-link: #ff4747 !important;
-      --color-token-text-link-foreground: #ff4747 !important;
-      --color-token-focus-border: #ffd700 !important;
-      --color-token-scrollbar-slider-background: rgba(230, 70, 70, 0.2) !important;
-      --color-token-scrollbar-slider-hover-background: rgba(230, 70, 70, 0.4) !important;
-      --color-token-list-hover-background: rgba(230, 70, 70, 0.15) !important;
-      --color-background-button-secondary-hover: rgba(230, 70, 70, 0.2) !important;
-      --color-background-button-tertiary-hover: rgba(230, 70, 70, 0.1) !important;
-    }}
-
-    .app-shell-left-panel, .composer-root, .thread-root, .editor-container, .dialog-layout,
-    [role="menu"], [role="listbox"], [role="dialog"], [data-radix-menu-content],
-    [data-browser-comment-editor-surface], .bg-token-dropdown-background {{
-      background-color: rgba(22, 13, 13, 0.65) !important;
-      backdrop-filter: blur(4px) saturate(120%) !important;
-      -webkit-backdrop-filter: blur(4px) saturate(120%) !important;
-      border: 1px solid rgba(230, 70, 70, 0.18) !important;
-    }}
-
-    .app-shell-left-panel, .composer-root, .thread-root, .editor-container, .dialog-layout,
-    [data-browser-comment-editor-surface] {{
-      box-shadow: none !important;
-      mask: none !important; -webkit-mask: none !important;
-      mask-image: none !important; -webkit-mask-image: none !important;
-    }}
-
-    [role="menu"], [role="listbox"], [role="dialog"], [data-radix-menu-content], .bg-token-dropdown-background {{
-      box-shadow: 0 8px 24px 0 rgba(0, 0, 0, 0.4) !important;
-    }}
-
-    .app-shell-left-panel {{ border-right: none !important; }}
-
-    .app-shell-left-panel::before, .app-shell-left-panel::after, .thread-root::before, .thread-root::after,
-    .composer-root::before, .composer-root::after, .editor-container::before, .editor-container::after,
-    .app-shell-main::before, .app-shell-main::after {{
-      background: transparent !important; background-image: none !important;
-      box-shadow: none !important; mask: none !important; -webkit-mask: none !important; filter: none !important;
-    }}
-
-    [data-panel-resize-handle], [data-panel-resize-handle-id], [data-panel-group], [data-resize-handle],
-    [role="separator"], .split-pane-divider, .app-shell-divider, .resize-handle, .resizable-handle {{
-      background: transparent !important; background-image: none !important;
-      box-shadow: none !important; border: none !important;
-    }}
-    {mascot_block}
-  `;
+  style.textContent = `{css}
+{mascot_block}`;
   document.head.appendChild(style);
   {mascot_js}
 }})();
@@ -845,6 +1325,44 @@ mod tests {
         let changli_script = build_inject_script("changli", &changli);
         assert!(!changli_script.contains(".cat-theme-mascot {"));
         assert!(!changli_script.contains("m.className = 'cat-theme-mascot'"));
+    }
+
+    #[test]
+    fn per_theme_palette_and_converged_structure_in_script() {
+        // each theme threads ITS OWN accent + the converged engine markers
+        // (runtime --color-* layer, top-of-content fade, transparent main element).
+        for (id, accent) in [
+            ("changli", "#e08a55"),
+            ("frost", "#4f6cb0"),
+            ("carton", "#ff5a36"),
+            ("nocturne", "#7cc5d6"),
+            ("rose", "#e8475a"),
+        ] {
+            let assets = load_theme_assets(id).unwrap();
+            let script = build_inject_script(id, &assets);
+            assert!(script.contains(accent), "{id} missing its accent {accent}");
+            assert!(
+                script.contains("--color-background-panel:var(--cl-glass-strong)"),
+                "{id} missing settings-card override"
+            );
+            assert!(
+                script.contains("--color-text-foreground:var(--cl-ink)"),
+                "{id} missing runtime text override"
+            );
+            assert!(
+                script.contains("app-shell-main-content-top-fade"),
+                "{id} missing top-fade rule"
+            );
+            assert!(
+                script.contains("main.main-surface") && script.contains("cat-theme-style"),
+                "{id} missing transparent main / style id"
+            );
+            assert!(!script.contains("__"), "{id} has unfilled placeholder");
+        }
+        // accent-less custom theme omits the accent block (keeps native blue)
+        let custom_css = render_theme_css(None, "data:image/jpeg;base64,AA==");
+        assert!(!custom_css.contains("composer-send-button"));
+        assert!(custom_css.contains("--cl-surface"));
     }
 
     #[test]

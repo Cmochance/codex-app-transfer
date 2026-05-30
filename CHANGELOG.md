@@ -2,6 +2,10 @@
 
 逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
+## Unreleased
+
+- **Codex 主题模块化升级**:换肤引擎重写为「每主题调色板 + 共享结构」。内置主题 5 → 11(新增 `frost` / `nocturne` / `duet` / `rose` / `sonata` / `studio`),每套按背景图独立调出暗玻璃 + 强调色(不再统一红调)。注入改为覆盖 Codex 当前版本的设计令牌(`--color-token-*` + 运行时内联在 `<html>` 的 `--color-*` 层),修好设置页白卡、侧栏 resize 手柄亮带、折叠侧栏浮层透明、顶部内容阴影常驻、侧栏/主区接缝、composer 容器等各视图;改用轻量 6px 玻璃模糊。`carton` 浮动看板娘保留。
+
 ## v2.1.17 — 2026-05-29
 
 **tool_search 工具链打通 + MCP 授权可移植保险箱 + Usage 命中率 + Code Graph + 稳定性修复**:自 v2.1.16 起合入 16 个 PR。
