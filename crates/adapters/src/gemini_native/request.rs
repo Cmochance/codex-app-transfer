@@ -1804,7 +1804,19 @@ fn convert_tool_choice(tc: &Value) -> Option<ToolConfig> {
         let name = obj
             .get("function")
             .and_then(|v| v.get("name"))
-            .and_then(|v| v.as_str())?;
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                // [MOC-75] custom freeform 工具(apply_patch)的 **forced** tool_choice 形如
+                // `{"type":"custom","name":"apply_patch"}`(name 在顶层,非嵌套 function)。
+                // 请求侧已把该工具声明降级成同名 Gemini function,这里把强制选择也映射成
+                // `allowed_function_names`,否则 convert 只认 `function.name` → Gemini 收不到
+                // 强制信号、forced tool_choice 静默丢失(chatgpt review P2)。
+                if obj.get("type").and_then(|v| v.as_str()) == Some("custom") {
+                    obj.get("name").and_then(|v| v.as_str())
+                } else {
+                    None
+                }
+            })?;
         return Some(ToolConfig {
             function_calling_config: Some(FunctionCallingConfig {
                 mode: "ANY".into(),
@@ -2000,6 +2012,24 @@ mod tests {
 
     use crate::responses::ResponseSessionCache;
     use indexmap::IndexMap;
+
+    /// [MOC-75 review P2] forced custom freeform 工具 tool_choice
+    /// (`{"type":"custom","name":"apply_patch"}`)→ Gemini ToolConfig 的
+    /// allowed_function_names(否则 convert 只认 function.name,强制信号静默丢)。
+    #[test]
+    fn tool_choice_custom_forces_allowed_function_names() {
+        let tc = serde_json::json!({"type": "custom", "name": "apply_patch"});
+        let cfg = convert_tool_choice(&tc).expect("custom tool_choice 应转成 ToolConfig");
+        let fcc = cfg
+            .function_calling_config
+            .expect("function_calling_config 应存在");
+        assert_eq!(fcc.mode, "ANY", "forced 工具 mode 应为 ANY");
+        assert_eq!(
+            fcc.allowed_function_names,
+            Some(vec!["apply_patch".to_owned()]),
+            "custom tool_choice.name 必须映射成 allowed_function_names"
+        );
+    }
 
     fn dummy_provider() -> Provider {
         Provider {
