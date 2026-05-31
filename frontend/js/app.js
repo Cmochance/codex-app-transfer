@@ -7040,54 +7040,49 @@
     container.innerHTML = cards.join("");
 
     // 5. 刷新 status badge
-    // MOC-102:消费一次性抑制 flag。若刚刚 best-effort 注入失败并已提示重启,这一轮
-    // renderTheme **不**再 auto-re-apply(否则又触发同一个 502 写进 badge),改显示
-    // "待重启生效"。读后即清,只影响本次。
-    const suppressReapply = themeSuppressAutoReapplyOnce;
-    themeSuppressAutoReapplyOnce = false;
+    // MOC-102:badge 完全由「开关偏好(toggle.checked)+ 后端 status」推导,**永不**
+    // 把 raw CDP 502 暴露给 user。规则:
+    //  - 开关关:一律"未启用",无视后端 status,不 reapply、不暴露任何失败。
+    //  - 开关开 + Failed:Codex 当前注入不了(非 transfer 启动 / 调试端口不可用)=
+    //    "待重启生效";不重试(必然又失败)、不暴露 502。每次 render 都如此(持久,
+    //    不依赖一次性 flag)。
+    //  - 开关开 + Applied(别的主题)/ Disabled:CDP 可能刚恢复(transfer/Codex 重启)
+    //    → best-effort reapply,成功"已应用",失败降级"待重启生效"(仍不暴露 502)。
     try {
       const st = await CCApi.theme.status();
       const sObj = st.status;
-      const autoReapplySelectedTheme = async () => {
+      // best-effort 重应用:成功→已应用,失败→"待重启生效"(绝不把 raw 502 写进 badge)。
+      const reapplyOrPending = async () => {
         try {
           await CCApi.theme.apply(selectedThemeId);
           badge.textContent = `${t("theme.applied") || "已应用"}: ${selectedThemeId}`;
         } catch (err) {
-          console.warn("[theme] auto-re-apply failed:", err);
-          badge.textContent = `${t("theme.failed") || "失败"}: ${err.message || err}`;
+          console.warn("[theme] auto-re-apply failed (pending restart):", err);
+          badge.textContent = t("theme.pendingRestart") || "待重启生效";
         }
       };
-      if (sObj && typeof sObj === "object") {
+      if (!toggle.checked) {
+        // 开关关:偏好已禁用 → badge 一律"未启用",不碰运行态、不暴露失败。
+        badge.textContent = t("theme.disabled") || "未启用";
+      } else if (sObj && typeof sObj === "object") {
         if (sObj.Applied) {
           badge.textContent = `${t("theme.applied") || "已应用"}: ${sObj.Applied.theme_id}`;
-          // 用户选了别的主题但后端还报旧 theme_id(切换 race / 重启后状态错位)→ 自动 re-apply。
-          if (!suppressReapply && toggle.checked && selectedThemeId && sObj.Applied.theme_id !== selectedThemeId) {
-            await autoReapplySelectedTheme();
+          // 选了别的主题但后端报旧 theme_id(切换 race / 重启错位)→ best-effort 重应用。
+          if (selectedThemeId && sObj.Applied.theme_id !== selectedThemeId) {
+            await reapplyOrPending();
           }
         } else if (sObj.Failed) {
-          // MOC-102:刚 best-effort 失败 → 不重试、不暴露 raw 502,显示"待重启生效"。
-          if (suppressReapply) {
-            badge.textContent = t("theme.pendingRestart") || "待重启生效";
-          } else {
-            badge.textContent = `${t("theme.failed") || "失败"}: ${sObj.Failed.error}`;
-            // 上一次 apply 失败但用户仍开着主题 + 有选中 → 自动重试一次。
-            if (toggle.checked && selectedThemeId) {
-              await autoReapplySelectedTheme();
-            }
-          }
-        } else badge.textContent = "";
+          // Codex 当前注入不了 = 待重启生效。不重试、不暴露 raw 502。
+          badge.textContent = selectedThemeId ? (t("theme.pendingRestart") || "待重启生效") : "";
+        } else {
+          badge.textContent = "";
+        }
       } else if (sObj === "Disabled") {
-        // Auto re-apply: settings say enabled + theme selected, but backend
-        // status is Disabled (e.g. after transfer app restart / Codex restart).
-        // Apply immediately so user doesn't have to manually toggle.
-        // MOC-102:若本次刚 best-effort 失败,显示"待重启生效"而非再 apply。
-        if (suppressReapply && toggle.checked && selectedThemeId) {
-          badge.textContent = t("theme.pendingRestart") || "待重启生效";
+        // 后端 Disabled 但偏好开 + 选了主题:CDP 可能刚恢复 → best-effort 重应用。
+        if (selectedThemeId) {
+          await reapplyOrPending();
         } else {
           badge.textContent = t("theme.disabled") || "未启用";
-          if (toggle.checked && selectedThemeId) {
-            await autoReapplySelectedTheme();
-          }
         }
       }
     } catch (e) {
@@ -7097,11 +7092,6 @@
 
   // bind toggle + reload/restart + card click(delegation)一次性,避免 renderTheme 反复绑定丢
   let themeEventsBound = false;
-  // MOC-102:best-effort 即时注入刚失败、已提示重启时,置位此 flag。renderTheme
-  // 的 status badge 段会**消费一次**(读后即清):跳过 auto-re-apply(否则又 apply
-  // 一次、把 raw 502 写进 badge,等于刚告诉 user"已保存"转头又冒 502),并把 badge
-  // 显示为"待重启生效"而非原始错误。仅抑制本次交互这一次,不影响后续正常自动恢复。
-  let themeSuppressAutoReapplyOnce = false;
   // MOC-102:双按钮弹窗(立即重启 / 稍后重启),复用 openCropModal 的 overlay/panel
   // 样式。返 Promise<"now" | "later">。**不**自动重启——重启必须是用户在此显式选择
   // 「立即重启」才触发;选「稍后重启」或点遮罩/✕ 关闭则保留偏好、不动 Codex。
@@ -7157,8 +7147,6 @@
   // 弹双按钮窗让用户**自己选**立即 / 稍后重启,绝不自动重启。
   // **不**当作开关失败、**不**回退 toggle、**不**报 502 红错。
   async function promptRestartCodexForTheme() {
-    // 抑制紧随其后的 renderTheme auto-re-apply(见 themeSuppressAutoReapplyOnce 注释)
-    themeSuppressAutoReapplyOnce = true;
     const choice = await showThemeRestartDialog();
     if (choice !== "now") {
       // 稍后重启:偏好已落盘,什么都不动,badge 显示"待重启生效"。
