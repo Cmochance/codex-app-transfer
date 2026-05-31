@@ -199,6 +199,31 @@ fn main() {
                 // 前 emit 丢失,见 chatgpt-codex-connector P2),改由前端 load 时轮询
                 // `GET /api/desktop/mcp-credentials/status` 决定是否弹确认。
                 let _ = handlers::desktop::mcp_credentials_startup_sync("startup");
+
+                // [MOC-104 req#2/#5 启动调谐] **必须在 auto_apply 落盘之后**才跑 —— 否则
+                // 跟 auto_apply 抢写 `~/.codex/auth.json`:reconcile 先跑会看到上次退出
+                // 恢复的旧 chatgpt 态而 no-op,随后 auto_apply 写 apikey 把导入镜像的恢复
+                // 默默吞掉;反之又会撤销 auto_apply 的 apikey。复用本 post-apply task(已
+                // await 完 auto_apply)确定性串在 apply 之后,不再用 sleep 猜时机(MOC-54)。
+                // best-effort:无真实账号 / token 未过期则 no-op,失败只 log。
+                match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(20))
+                    .build()
+                {
+                    Ok(client) => {
+                        match crate::codex_real_account::reconcile_on_startup(&client).await {
+                            Ok(outcome) => tracing::info!(
+                                "[RealAccount] 启动调谐(刷新 + 必要时从导入镜像恢复): {outcome:?}"
+                            ),
+                            Err(e) => {
+                                tracing::warn!("[RealAccount] 启动调谐失败(忽略): {e}")
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("[RealAccount] 启动调谐跳过:HTTP client 构建失败: {e}")
+                    }
+                }
             });
 
             // ── Plugin Unlock 守护进程自动启动 ──
@@ -231,33 +256,6 @@ fn main() {
                     tracing::debug!(
                         "[PluginUnlock] autoUnlockCodexPlugins=false, skipping auto-start"
                     );
-                }
-            });
-
-            // ── 真实 ChatGPT 账号 token 启动刷新(MOC-104 req#2)──
-            // best-effort + self-gating:refresh_if_needed 仅在检测到真实 chatgpt
-            // 账号(官方活动 or transfer 备份)且 access_token 将过期时才走网络刷新,
-            // 否则 NoAccount/StillValid no-op。非破坏(只更新 token 字段原子写回),
-            // 失败只 log,绝不 block 启动。这样真实账号(尤其被改到备份的那份)的
-            // token 不会因长期不刷而过期 → 避免用户下次切回时被登出。
-            tauri::async_runtime::spawn(async move {
-                // 略晚于其它启动任务,避开启动 IO 高峰;刷新是后台续期,不抢首屏。
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                let client = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(20))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("[RealAccount] 启动刷新跳过:HTTP client 构建失败: {e}");
-                        return;
-                    }
-                };
-                match crate::codex_real_account::reconcile_on_startup(&client).await {
-                    Ok(outcome) => {
-                        tracing::info!("[RealAccount] 启动调谐(刷新 + 必要时从导入镜像恢复): {outcome:?}")
-                    }
-                    Err(e) => tracing::warn!("[RealAccount] 启动调谐失败(忽略): {e}"),
                 }
             });
 
