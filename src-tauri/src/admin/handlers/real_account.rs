@@ -88,6 +88,22 @@ pub async fn login_cancel_handler() -> impl IntoResponse {
     }))
 }
 
+/// POST /api/desktop/real-account/activate
+///
+/// 把 transfer 备份里检测到的真实 chatgpt 账号恢复到活动 `~/.codex/auth.json`
+/// (覆盖前先备份当前活动文件,时序安全)。活动已是真实账号则 no-op。
+pub async fn activate_handler() -> impl IntoResponse {
+    match codex_real_account::activate_backup_to_active() {
+        Ok(source) => Json(json!({
+            "success": true,
+            "source": source,
+            "message": "已将真实 ChatGPT 账号恢复到活动 auth.json",
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
 /// 组装路由 — 在 `admin/mod.rs` 调 `.merge(handlers::real_account::routes())` 挂载。
 pub fn routes() -> Router<AdminState> {
     Router::new()
@@ -98,4 +114,5 @@ pub fn routes() -> Router<AdminState> {
             "/api/desktop/real-account/login/cancel",
             post(login_cancel_handler),
         )
+        .route("/api/desktop/real-account/activate", post(activate_handler))
 }

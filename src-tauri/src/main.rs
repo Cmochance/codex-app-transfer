@@ -234,6 +234,33 @@ fn main() {
                 }
             });
 
+            // ── 真实 ChatGPT 账号 token 启动刷新(MOC-104 req#2)──
+            // best-effort + self-gating:refresh_if_needed 仅在检测到真实 chatgpt
+            // 账号(官方活动 or transfer 备份)且 access_token 将过期时才走网络刷新,
+            // 否则 NoAccount/StillValid no-op。非破坏(只更新 token 字段原子写回),
+            // 失败只 log,绝不 block 启动。这样真实账号(尤其被改到备份的那份)的
+            // token 不会因长期不刷而过期 → 避免用户下次切回时被登出。
+            tauri::async_runtime::spawn(async move {
+                // 略晚于其它启动任务,避开启动 IO 高峰;刷新是后台续期,不抢首屏。
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                let client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(20))
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("[RealAccount] 启动刷新跳过:HTTP client 构建失败: {e}");
+                        return;
+                    }
+                };
+                match crate::codex_real_account::refresh_if_needed(&client).await {
+                    Ok(outcome) => {
+                        tracing::info!("[RealAccount] 启动 token 刷新: {outcome:?}")
+                    }
+                    Err(e) => tracing::warn!("[RealAccount] 启动 token 刷新失败(忽略): {e}"),
+                }
+            });
+
             let menu = build_tray_menu(app)?;
             let _ = TrayIconBuilder::with_id("main")
                 .tooltip("Codex App Transfer")

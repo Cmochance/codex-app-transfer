@@ -623,6 +623,10 @@ window.CCApi.realAccount = {
   async loginCancel() {
     return api('POST', '/api/desktop/real-account/login/cancel');
   },
+  /** 把备份里检测到的真实账号恢复到活动 auth.json */
+  async activate() {
+    return api('POST', '/api/desktop/real-account/activate');
+  },
 };
 
 window.CCApi.theme = {

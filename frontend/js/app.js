@@ -1447,6 +1447,9 @@
         text = t("realAccount.notLoggedIn") || "未检测到真实 ChatGPT 账号";
       }
       el.textContent = text;
+      // 备份里有真实账号(活动是 apikey)才显示「恢复到活动」按钮。
+      const activateBtn = $("#realAccountActivateBtn");
+      if (activateBtn) activateBtn.style.display = st.source === "backup" ? "" : "none";
     } catch (e) {
       console.log("[RealAccount] status refresh failed:", e);
     }
@@ -7896,6 +7899,13 @@
           : outcome === "still_valid" ? (t("realAccount.stillValid") || "token 仍有效,无需刷新")
           : (t("realAccount.noAccount") || "未检测到真实账号");
         showToast(msg);
+        setTimeout(refreshRealAccountStatus, 500);
+      } catch (e) { showToast(e.message); }
+    });
+    $("[data-action=real-account-activate]")?.addEventListener("click", async () => {
+      try {
+        await CCApi.realAccount.activate();
+        showToast(t("realAccount.activated") || "已恢复真实账号到活动");
         setTimeout(refreshRealAccountStatus, 500);
       } catch (e) { showToast(e.message); }
     });

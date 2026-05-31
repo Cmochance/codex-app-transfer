@@ -404,21 +404,49 @@ static LOGIN: Mutex<LoginShared> = Mutex::new(LoginShared {
     last: LoginState::Idle,
 });
 
-/// 登录前把当前 `~/.codex/auth.json`(可能是 transfer 写的 apikey 态)整文件备份
-/// 到 app_home,`codex login` 覆盖后用户仍可恢复 —— 非破坏(`feedback_no_silent_
-/// destructive_fallback`)。best-effort:备份失败只 warn,不挡登录。
-fn backup_auth_before_login(paths: &CodexPaths) {
+/// 覆盖当前 `~/.codex/auth.json` 前先整文件备份到 app_home,被覆盖后用户仍可
+/// 恢复 —— 非破坏(`feedback_no_silent_destructive_fallback`)。`suffix` 区分场景
+/// (prelogin / preactivate)。best-effort:备份失败只 warn,不挡主流程。
+fn backup_active_auth(paths: &CodexPaths, suffix: &str) {
     if !paths.auth_json.is_file() {
         return;
     }
     let backup_dir = paths.app_home.join("real-account");
     if let Err(e) = std::fs::create_dir_all(&backup_dir) {
-        tracing::warn!("[RealAccount] 登录前备份目录创建失败: {e}");
+        tracing::warn!("[RealAccount] 备份目录创建失败: {e}");
         return;
     }
-    let backup = backup_dir.join("auth-prelogin-backup.json");
+    let backup = backup_dir.join(format!("auth-{suffix}-backup.json"));
     if let Err(e) = std::fs::copy(&paths.auth_json, &backup) {
-        tracing::warn!("[RealAccount] 登录前备份 auth.json 失败: {e}");
+        tracing::warn!("[RealAccount] 备份 auth.json({suffix})失败: {e}");
+    }
+}
+
+/// [MOC-104 req#5 时序] 把 transfer 备份里检测到的真实 chatgpt 账号**恢复到活动**
+/// `~/.codex/auth.json`(场景:开 transfer 后 apply 把活动文件改成 apikey,真实
+/// chatgpt 态落到快照备份;用户想让 Codex 重新用回真实账号)。
+///
+/// 时序安全(先备份再写):① 定位备份里的可用 chatgpt;② 若活动文件已经就是同一
+/// 真实账号(source=Official)则无需操作;③ 覆盖活动文件前先备份当前活动文件;
+/// ④ 用 `write_auth` 原子写回(0o600)。任何步骤失败前不动活动文件。
+pub fn activate_backup_to_active() -> Result<AuthSource, String> {
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    activate_with_paths(&paths)
+}
+
+/// [`activate_backup_to_active`] 的可注入路径内层,便于单测。
+fn activate_with_paths(paths: &CodexPaths) -> Result<AuthSource, String> {
+    let located = locate_chatgpt_auth(paths).ok_or("未检测到可恢复的真实 chatgpt 账号")?;
+    match located.source {
+        // 活动文件已经是真实 chatgpt,无需恢复。
+        AuthSource::Official => Ok(AuthSource::Official),
+        AuthSource::Backup => {
+            backup_active_auth(paths, "preactivate");
+            write_auth(&paths.auth_json, &located.value)
+                .map_err(|e| format!("恢复真实账号到活动 auth.json 失败: {e}"))?;
+            Ok(AuthSource::Backup)
+        }
+        AuthSource::None => Err("未检测到可恢复的真实 chatgpt 账号".to_owned()),
     }
 }
 
@@ -430,7 +458,7 @@ pub fn start_login() -> Result<(), String> {
     }
     let codex = resolve_codex_cli().ok_or("未找到 codex CLI;请确认已安装 Codex Desktop")?;
     if let Ok(paths) = CodexPaths::from_home_env() {
-        backup_auth_before_login(&paths);
+        backup_active_auth(&paths, "prelogin");
     }
     // 不覆盖 CODEX_HOME → codex login 写真实 `~/.codex/auth.json`,登录后即生效。
     let child = Command::new(&codex)
@@ -673,6 +701,51 @@ mod tests {
             serde_json::to_value(LoginState::Cancelled).unwrap(),
             json!({ "state": "cancelled" })
         );
+    }
+
+    #[test]
+    fn activate_promotes_backup_chatgpt_to_active_with_prebackup() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        // 活动 apikey + 备份 chatgpt
+        write_json(
+            &paths.auth_json,
+            &json!({"auth_mode": "apikey", "OPENAI_API_KEY": "cas_x"}),
+        );
+        write_json(
+            &paths.active_snapshots_dir.join("sess").join("auth.json"),
+            &chatgpt_auth(),
+        );
+        let source = activate_with_paths(&paths).unwrap();
+        assert_eq!(source, AuthSource::Backup);
+        // 活动文件现在是 chatgpt
+        let active = read_auth(&paths.auth_json).unwrap();
+        assert_eq!(active["auth_mode"], "chatgpt");
+        assert_eq!(active["tokens"]["account_id"], "acct_123");
+        // 覆盖前备份了原 apikey 活动文件(时序安全)
+        let prebackup = paths
+            .app_home
+            .join("real-account")
+            .join("auth-preactivate-backup.json");
+        assert!(prebackup.is_file(), "覆盖前应备份原活动 auth.json");
+        let backed = read_auth(&prebackup).unwrap();
+        assert_eq!(backed["auth_mode"], "apikey", "备份的是覆盖前的 apikey 态");
+    }
+
+    #[test]
+    fn activate_noop_when_active_already_official_chatgpt() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(&paths.auth_json, &chatgpt_auth());
+        assert_eq!(activate_with_paths(&paths).unwrap(), AuthSource::Official);
+    }
+
+    #[test]
+    fn activate_errs_when_no_real_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(&paths.auth_json, &json!({"auth_mode": "apikey"}));
+        assert!(activate_with_paths(&paths).is_err());
     }
 
     #[test]
