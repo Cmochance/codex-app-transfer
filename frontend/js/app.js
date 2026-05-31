@@ -7072,8 +7072,13 @@
             await reapplyOrPending();
           }
         } else if (sObj.Failed) {
-          // Codex 当前注入不了 = 待重启生效。不重试、不暴露 raw 502。
-          badge.textContent = selectedThemeId ? (t("theme.pendingRestart") || "待重启生效") : "";
+          // 后端上次失败:CDP 可能已恢复(Codex 重启后)→ best-effort 重应用,
+          // 成功"已应用",失败降级"待重启生效"(绝不暴露 raw 502)。
+          if (selectedThemeId) {
+            await reapplyOrPending();
+          } else {
+            badge.textContent = "";
+          }
         } else {
           badge.textContent = "";
         }
