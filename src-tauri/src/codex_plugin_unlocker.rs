@@ -144,6 +144,12 @@ pub struct PluginUnlockService {
     /// Disconnected 但 task 仍在跑,不能按连接状态判断);`reinject`/`stop` 用它
     /// 避免在没 daemon 时往 bounded channel 灌命令(8 次后 await 会 hang)。
     running: Arc<AtomicBool>,
+    /// [MOC-100 P2-3] 期望状态:daemon "应该"在跑(镜像 `autoUnlockCodexPlugins`)。
+    /// 与 `running`(实际在跑)解耦,用于修 toggle 关→开 race:关时 Stop 排进
+    /// channel 还没被长注入中的 daemon 消费,开时 `start` 因 `running` 仍 true 成
+    /// no-op;待 daemon 消费 Stop 退出后,reconcile 读到 `desired=true` 重启,
+    /// 兑现已保存的 enabled 设置,而不是留下"设置开着却没 daemon"。
+    desired: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -163,6 +169,7 @@ impl PluginUnlockService {
             cmd_rx: Arc::new(Mutex::new(cmd_rx)),
             msg_id: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
+            desired: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -177,8 +184,12 @@ impl PluginUnlockService {
         self.status.read().await.clone()
     }
 
-    /// 启动守护循环（非阻塞、幂等）
+    /// 启动守护循环（非阻塞、幂等、自我调谐到 `desired` 状态）
     pub fn start(&self) {
+        // 先记"期望在跑"。即使下面 CAS 失败(已有 daemon 或有一个正在退出),
+        // desired=true 也会让 reconcile 在 daemon 退出后重启 —— 这是修 toggle
+        // 关→开 race 的关键(详见 `desired` 字段注释)。
+        self.desired.store(true, Ordering::SeqCst);
         // [MOC-100 P2-2] 基于真实 running flag 幂等,而非连接状态:退避中 daemon 报
         // Disconnected 但 task 仍在跑,旧的按 status 去重会再 spawn 一个 task 跟它
         // 抢同一 receiver,且 stop 只投一条命令杀不全。compare_exchange 保证只有一个。
@@ -187,22 +198,45 @@ impl PluginUnlockService {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return; // 已在运行
+            return; // 已在运行(或正在退出 — desired=true 会触发 reconcile 重启)
         }
         let config = self.config.clone();
         let status = self.status.clone();
         let cmd_rx = self.cmd_rx.clone();
         let msg_id = self.msg_id.clone();
         let running = self.running.clone();
+        let desired = self.desired.clone();
 
         tokio::spawn(async move {
-            run_daemon(config, status, cmd_rx, msg_id).await;
+            // [MOC-100 P2-3] reconcile 循环:run_daemon 只在收到 Stop 时返回。返回后
+            // 核对 desired —— 仍为 true 说明这是关→开 race(Stop 还排在队列里没被
+            // 长注入中的 daemon 消费时 start() 已 no-op),重启 daemon 兑现已保存的
+            // enabled 设置,而不是留下"设置开着却没 daemon"的不一致。整个 reconcile
+            // 期间只有这一个 task(CAS 保证),不会起第二个 daemon。
+            loop {
+                run_daemon(
+                    config.clone(),
+                    status.clone(),
+                    cmd_rx.clone(),
+                    msg_id.clone(),
+                )
+                .await;
+                if !desired.load(Ordering::SeqCst) {
+                    break;
+                }
+                tracing::info!(
+                    "[PluginUnlock] daemon exited but desired=true (stop→start race), restarting to honor enabled setting"
+                );
+            }
             running.store(false, Ordering::SeqCst);
         });
     }
 
     /// 停止守护循环
     pub async fn stop(&self) {
+        // 先记"期望停"。daemon 退出时的 reconcile 读它决定是否重启;置 false 确保
+        // 即便有 in-flight 的关→开 race 也不会把 daemon 复活回来。
+        self.desired.store(false, Ordering::SeqCst);
         // [MOC-100 P2-1] 没在跑就不发(否则 Stop 会缓存到 channel,下次 start 的
         // daemon 一启动就被这条 stale Stop 杀掉)。在跑时用 try_send 非阻塞。
         if !self.running.load(Ordering::SeqCst) {
