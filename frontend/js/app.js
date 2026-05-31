@@ -1456,7 +1456,11 @@
       // 不再出现「获取失败却显示已开启(默默走高延迟)」。
       const runEl = $("#raRunStatus");
       if (runEl) {
-        const realActive = st.logged_in === true && !realAccountExpired;
+        // [connector review] 原生 plugins 只有在「活动 auth.json 本身是真实 chatgpt」
+        // (source=official)时才生效。仅有持久镜像但活动还是 apikey(如本 session 内
+        // apply 过 provider、reconcile 尚未恢复)→ logged_in 仍 true 但 source=imported,
+        // 此刻 plugins 并未启用,不能显示已开启。gate 在 source==official。
+        const realActive = st.logged_in === true && st.source === "official" && !realAccountExpired;
         const forceCdp = $("#autoUnlockCodexPlugins")?.checked === true;
         const on = realActive || forceCdp;
         runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";

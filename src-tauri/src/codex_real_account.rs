@@ -608,16 +608,21 @@ fn read_imported_mirror(paths: &CodexPaths) -> Option<Value> {
     parse_chatgpt_auth(&v).map(|_| v)
 }
 
-/// import 内层(**假设 caller 已持 `AUTH_LOCK`**):写持久镜像 → 备份活动 → 写活动。
+/// import 内层(**假设 caller 已持 `AUTH_LOCK`**):备份活动 → 写活动 → 提交持久镜像。
+///
+/// [connector review] 顺序是「先成功更新活动文件,再提交持久镜像」:若活动备份/写失败,
+/// 镜像还没动,不会留下「导入失败却有镜像、下次启动 reconcile 把它当成已保留账号恢复
+/// 到活动」的幽灵态。反序(先写镜像)在活动写失败时会留下孤儿镜像。
 fn import_locked(paths: &CodexPaths, value: &Value) -> Result<(), String> {
+    // 先恢复到活动(覆盖前先备份)—— 任一步失败直接返回,镜像保持原样不被污染。
+    backup_active_auth(paths, "preimport")?;
+    write_auth(&paths.auth_json, value).map_err(|e| format!("写活动 auth.json 失败: {e}"))?;
+    // 活动已成功更新后,才提交长期保留的持久镜像。
     let mirror = imported_mirror_path(paths);
     if let Some(parent) = mirror.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("镜像目录创建失败: {e}"))?;
     }
-    // 先落持久镜像(长期保留的真相源),再恢复到活动(覆盖前先备份)。
     write_auth(&mirror, value).map_err(|e| format!("写持久镜像失败: {e}"))?;
-    backup_active_auth(paths, "preimport")?;
-    write_auth(&paths.auth_json, value).map_err(|e| format!("写活动 auth.json 失败: {e}"))?;
     Ok(())
 }
 
