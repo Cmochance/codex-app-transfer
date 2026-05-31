@@ -2273,7 +2273,10 @@
     $("#settingsProxyPort").value = settings.proxyPort;
     $("#settingsAdminPort").value = settings.adminPort;
     $("#autoApplyOnStart").checked = settings.autoApplyOnStart !== false;
-   $("#autoUnlockCodexPlugins").checked = settings.autoUnlockCodexPlugins !== false;
+   // 强制关闭(hotfix MOC-98):plugins 注入硬禁用,开关锁死 OFF + 禁用,不可操作。
+   $("#autoUnlockCodexPlugins").checked = false;
+   $("#autoUnlockCodexPlugins").disabled = true;
+   if ($("#autoUnlockRestartCodex")) $("#autoUnlockRestartCodex").disabled = true;
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     showGrayPresets = settings.showGrayProviders === true;
@@ -2809,7 +2812,7 @@
       proxyPort: Number($("#settingsProxyPort").value),
       adminPort: Number($("#settingsAdminPort").value),
       autoApplyOnStart: $("#autoApplyOnStart")?.checked !== false,
-     autoUnlockCodexPlugins: $("#autoUnlockCodexPlugins")?.checked || false,
+     autoUnlockCodexPlugins: false,  // 强制关闭(hotfix MOC-98):硬写 false
       autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       showGrayProviders: $("#showGrayProviders")?.checked || false,

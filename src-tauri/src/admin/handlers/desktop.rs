@@ -294,9 +294,8 @@ pub async fn restart_codex_app(State(state): State<crate::admin::AdminState>) ->
     }
     match process::launch_codex_app_restart(std::env::consts::OS) {
         Ok(_) => {
-            // 通知 plugin_unlock daemon 重置 backoff 立刻重新 detect_cdp。
-            let service = super::plugin_unlock::get_service().await;
-            service.reinject().await;
+            // 强制关闭(hotfix MOC-98):plugins 注入硬禁用,重启 Codex 后不再触发
+            // plugin_unlock reinject。恢复时还原下方 get_service / reinject 调用。
             Json(json!({"success": true, "desktopSync": desktop_sync})).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

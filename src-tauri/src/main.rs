@@ -201,7 +201,8 @@ fn main() {
             });
 
             // ── Plugin Unlock 守护进程自动启动 ──
-            // 默认开启;用户显式关掉 autoUnlockCodexPlugins=false 才跳过 auto-start。
+            // 强制关闭(hotfix MOC-98):plugins 注入临时硬禁用,无视用户配置
+            // autoUnlockCodexPlugins,daemon 永不自动启动。恢复时还原下方读取配置的逻辑。
             // 必须复用 handlers::plugin_unlock 的 OnceCell 单例,否则会跟前端
             // 手动 start 出来的 service 各自跑一份,frontend 查 status 看到的
             // 是 OnceCell 那份 → 永远 Disconnected。
@@ -213,14 +214,8 @@ fn main() {
                 // 锁定时间"压到 ~1-2s。
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-                let auto_unlock = match crate::admin::registry_io::load() {
-                    Ok(cfg) => cfg
-                        .get("settings")
-                        .and_then(|s| s.get("autoUnlockCodexPlugins"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
-                    Err(_) => true,
-                };
+                // 强制关闭(hotfix MOC-98):无视配置,daemon 永不自动启动。
+                let auto_unlock = false;
 
                 if auto_unlock {
                     tracing::info!("[PluginUnlock] autoUnlockCodexPlugins=true, starting service");

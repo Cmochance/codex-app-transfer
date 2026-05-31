@@ -2,6 +2,10 @@
 
 逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
+## Unreleased
+
+- **Plugins 注入强制关闭**(hotfix MOC-98):Codex Plugins 注入(plugin unlock daemon)临时硬禁用,无视用户配置 `autoUnlockCodexPlugins`,对所有用户(含此前显式开启的)强制 OFF。后端:daemon 永不自动启动、手动 `start` / `reinject` API 拒绝、重启 Codex 后不再触发 reinject、不再为 plugin_unlock 申请 CDP 调试端口(theme 注入仍独立可用);前端:设置页开关锁死 OFF + 禁用、「重启 Codex」按钮禁用、hint 标注已临时禁用。各改动点带 `强制关闭(hotfix MOC-98)` 注释便于后续恢复。
+
 ## v2.1.18 — 2026-05-31
 
 **主题引擎模块化(5→11)+ Gemini 系一致性修复 + Windows 启动提速**:自 v2.1.17 起合入 14 个 PR。

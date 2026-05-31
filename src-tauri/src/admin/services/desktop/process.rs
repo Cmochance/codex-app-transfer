@@ -375,12 +375,9 @@ fn should_attach_debug_port() -> Vec<String> {
     // 独立 toggle,user 可能只开 theme 不开 plugin_unlock。CDP 端口缺失会让
     // [`auto_apply_theme_on_startup`] 跑空,所以两者任一开启都要带 port。
     let cfg = crate::admin::registry_io::load().ok();
-    let plugin_unlock = cfg
-        .as_ref()
-        .and_then(|c| c.get("settings"))
-        .and_then(|s| s.get("autoUnlockCodexPlugins"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    // 强制关闭(hotfix MOC-98):plugins 注入硬禁用,不再为 plugin_unlock 申请 CDP 端口。
+    // theme 仍独立触发 CDP(下方 theme_enabled)。恢复时还原读取配置的逻辑。
+    let plugin_unlock = false;
     let theme_enabled = cfg
         .as_ref()
         .and_then(|c| c.get("settings"))
