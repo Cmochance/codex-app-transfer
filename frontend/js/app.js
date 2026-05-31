@@ -1436,29 +1436,31 @@
       if (login.state === "running") {
         text = t("realAccount.loginRunning") || "登录中…请在浏览器完成授权";
       } else if (st.logged_in) {
-        const src =
-          st.source === "backup"
-            ? t("realAccount.sourceBackup") || "备份"
-            : t("realAccount.sourceOfficial") || "官方";
-        text = `${t("realAccount.loggedIn") || "已检测到真实 ChatGPT 账号"}(${src})`;
+        const kept = st.has_imported ? t("realAccount.kept") || "已长期保留" : "";
+        text = `${t("realAccount.loggedIn") || "已登录真实 ChatGPT 账号"}${kept ? "," + kept : ""}`;
       } else if (login.state === "failed") {
         text = `${t("realAccount.loginFailed") || "登录失败"}: ${login.message || ""}`;
       } else {
         text = t("realAccount.notLoggedIn") || "未检测到真实 ChatGPT 账号";
       }
       el.textContent = text;
-      // 活动文件不是真实账号、但镜像/备份里有 → 显示「恢复到活动」按钮。
-      const activateBtn = $("#realAccountActivateBtn");
-      if (activateBtn)
-        activateBtn.style.display =
-          st.logged_in && (st.source === "backup" || st.source === "imported") ? "" : "none";
-      // 有导入的持久镜像 → 显示「忘记导入」按钮。
+      // 有长期保留的真实账号 → 显示「清除真实账号」按钮。
       const forgetBtn = $("#realAccountForgetBtn");
       if (forgetBtn) forgetBtn.style.display = st.has_imported ? "" : "none";
+      // 登录刚成功且尚未长期保留 → 自动持久(单账号工具:登录即选择真实账号模式,
+      // 无需手动「钉住」)。has_imported 置真后不再重复触发;in-flight 用标志防抖。
+      if (login.state === "succeeded" && st.logged_in && !st.has_imported && !realAccountAutoPersisting) {
+        realAccountAutoPersisting = true;
+        CCApi.realAccount.pinCurrent()
+          .then(() => { showToast(t("realAccount.kept") || "已长期保留"); setTimeout(refreshRealAccountStatus, 300); })
+          .catch((e) => console.log("[RealAccount] auto-persist failed:", e))
+          .finally(() => { realAccountAutoPersisting = false; });
+      }
     } catch (e) {
       console.log("[RealAccount] status refresh failed:", e);
     }
   }
+  let realAccountAutoPersisting = false;
 
   async function renderDashboard() {
     // **#249 fix**:getStatus / getActivities 分别 try-catch,任一失败
@@ -7891,38 +7893,14 @@
         setTimeout(refreshPluginUnlockStatus, 1500);
       } catch (e) { showToast(e.message); }
     });
-    // MOC-104 真实账号:登录 / 刷新 / 强制开启(高延迟)
+    // MOC-104 真实账号:登录(成功后自动长期保留)/ 导入文件 / 清除
     $("[data-action=real-account-login]")?.addEventListener("click", async () => {
       try {
         await CCApi.realAccount.login();
         showToast(t("realAccount.loginStarted") || "已启动登录,请在浏览器完成授权");
-        // 登录是后台进行的,轮询几次刷新状态(用户授权 + codex 写 auth.json 后才变)
-        for (const delay of [1500, 4000, 8000, 15000]) setTimeout(refreshRealAccountStatus, delay);
-      } catch (e) { showToast(e.message); }
-    });
-    $("[data-action=real-account-refresh]")?.addEventListener("click", async () => {
-      try {
-        const r = await CCApi.realAccount.refresh();
-        const outcome = r.outcome?.outcome;
-        const msg = outcome === "refreshed" ? (t("realAccount.refreshed") || "token 已刷新")
-          : outcome === "still_valid" ? (t("realAccount.stillValid") || "token 仍有效,无需刷新")
-          : (t("realAccount.noAccount") || "未检测到真实账号");
-        showToast(msg);
-        setTimeout(refreshRealAccountStatus, 500);
-      } catch (e) { showToast(e.message); }
-    });
-    $("[data-action=real-account-activate]")?.addEventListener("click", async () => {
-      try {
-        await CCApi.realAccount.activate();
-        showToast(t("realAccount.activated") || "已恢复真实账号到活动");
-        setTimeout(refreshRealAccountStatus, 500);
-      } catch (e) { showToast(e.message); }
-    });
-    $("[data-action=real-account-pin]")?.addEventListener("click", async () => {
-      try {
-        await CCApi.realAccount.pinCurrent();
-        showToast(t("realAccount.pinned") || "已钉住当前真实账号(持久保留)");
-        setTimeout(refreshRealAccountStatus, 500);
+        // 登录是后台进行的,轮询几次刷新状态;成功后 refreshRealAccountStatus 会自动
+        // 把账号持久保留(见该函数内的 auto-persist)。
+        for (const delay of [1500, 4000, 8000, 15000, 30000]) setTimeout(refreshRealAccountStatus, delay);
       } catch (e) { showToast(e.message); }
     });
     $("[data-action=real-account-import]")?.addEventListener("click", () => {
@@ -7938,15 +7916,15 @@
         try { parsed = JSON.parse(text); }
         catch { showToast(t("realAccount.importBadJson") || "文件不是合法 JSON"); return; }
         await CCApi.realAccount.import(parsed);
-        showToast(t("realAccount.imported") || "已导入并持久保留真实账号");
+        showToast(t("realAccount.imported") || "已导入并长期保留真实账号");
         setTimeout(refreshRealAccountStatus, 500);
       } catch (e) { showToast(e.message); }
     });
     $("[data-action=real-account-forget]")?.addEventListener("click", async () => {
-      if (!window.confirm(t("realAccount.forgetConfirm") || "忘记导入的真实账号?启动将不再自动恢复它(不会删除当前活动 auth.json)。")) return;
+      if (!window.confirm(t("realAccount.forgetConfirm") || "清除真实账号?启动将不再自动恢复它(不会删除当前活动 auth.json)。")) return;
       try {
         await CCApi.realAccount.forget();
-        showToast(t("realAccount.forgotten") || "已忘记导入的真实账号");
+        showToast(t("realAccount.forgotten") || "已清除真实账号");
         setTimeout(refreshRealAccountStatus, 500);
       } catch (e) { showToast(e.message); }
     });

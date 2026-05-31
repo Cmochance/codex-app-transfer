@@ -623,10 +623,6 @@ window.CCApi.realAccount = {
   async loginCancel() {
     return api('POST', '/api/desktop/real-account/login/cancel');
   },
-  /** 把备份里检测到的真实账号恢复到活动 auth.json */
-  async activate() {
-    return api('POST', '/api/desktop/real-account/activate');
-  },
   /** 从文件导入真实账号(authJson = auth.json 的解析对象) */
   async import(authJson) {
     return api('POST', '/api/desktop/real-account/import', authJson);

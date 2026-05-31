@@ -15,8 +15,8 @@
 //!   `codex login`(它自己做 OAuth + 写 `~/.codex/auth.json`),非阻塞 + 可取消。
 //! - **导入 / 长期保留**([`import_auth`]/[`pin_current_account`]/[`forget_imported`]/
 //!   [`reconcile_on_startup`]):把真实账号写进 transfer 持久镜像(`~/.codex` 之外、
-//!   不受文件变动/快照轮转影响),启动时活动文件失效则从镜像恢复。
-//! - **恢复**([`activate_backup_to_active`]):把镜像/快照里的真实账号恢复到活动文件。
+//!   不受文件变动/快照轮转影响);登录成功后前端自动 pin,启动时活动文件失效则从
+//!   镜像自动恢复(无需手动"切换/恢复"——单账号工具不是多账号切换器)。
 //!
 //! 检测来源(优先级,用户要求:只认官方 `.codex/auth.json` + transfer 自有备份,
 //! 不依赖任何特殊文件夹结构):
@@ -127,15 +127,23 @@ fn imported_mirror_path(paths: &CodexPaths) -> PathBuf {
         .join("imported-auth.json")
 }
 
-/// 扫一个快照目录(`<dir>/<session>/auth.json`)找第一个可用 chatgpt。只读;
-/// active 与 recovery 共用此扫描。
+/// 扫一个快照目录(`<dir>/<session>/auth.json`)找**最新**的可用 chatgpt。
+/// [review #3] 按 auth.json mtime 降序,不取 `read_dir` 任意首个 —— 多份历史快照
+/// 时避免恢复到旧账号 / 拿到已轮换的旧 refresh token。只读;active/recovery 共用。
 fn scan_snapshots_for_chatgpt(dir: &std::path::Path) -> Option<(PathBuf, Value, ChatgptAuth)> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let auth_path = entry.path().join("auth.json");
         if !auth_path.is_file() {
             continue;
         }
+        let mtime = std::fs::metadata(&auth_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        candidates.push((mtime, auth_path));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0)); // 最新优先
+    for (_, auth_path) in candidates {
         if let Ok(v) = read_auth(&auth_path) {
             if let Some(parsed) = parse_chatgpt_auth(&v) {
                 return Some((auth_path, v, parsed));
@@ -385,6 +393,29 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
     let now_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     apply_refresh_response(&mut auth, &parsed, &now_iso)?;
     write_auth(&target, &auth).map_err(|e| format!("写回 auth.json 失败: {e}"))?;
+
+    // [review #4] 若刷的是 Official 活动文件、而持久镜像里是同一账号(镜像当前
+    // refresh_token == 我们刚用掉的那个),把新 token 同步进镜像 —— 否则镜像一直
+    // 留着已花掉的单次 refresh_token,日后活动文件失效从镜像恢复时下一次刷新必
+    // token-reuse 失败,"长期生效"承诺破功。
+    if source == AuthSource::Official {
+        let mirror = imported_mirror_path(&paths);
+        if mirror != target && mirror.is_file() {
+            if let Ok(mut mv) = read_auth(&mirror) {
+                let mirror_rt = mv
+                    .get("tokens")
+                    .and_then(|t| t.get("refresh_token"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if mirror_rt == refresh_token {
+                    apply_refresh_response(&mut mv, &parsed, &now_iso)?;
+                    if let Err(e) = write_auth(&mirror, &mv) {
+                        tracing::warn!("[RealAccount] 同步刷新 token 到持久镜像失败: {e}");
+                    }
+                }
+            }
+        }
+    }
     Ok(RefreshOutcome::Refreshed { source })
 }
 
@@ -484,47 +515,16 @@ fn backup_active_auth(paths: &CodexPaths, suffix: &str) -> Result<(), String> {
     }
     let backup_dir = paths.app_home.join("real-account");
     std::fs::create_dir_all(&backup_dir).map_err(|e| format!("备份目录创建失败: {e}"))?;
+    // [review I-2] 用纳秒,避免同一秒内两次同 suffix 操作覆盖彼此的备份(秒级粒度
+    // 会让"覆盖前先备份"的唯一恢复副本丢失)。
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let backup = backup_dir.join(format!("auth-{suffix}-{ts}.json"));
     std::fs::copy(&paths.auth_json, &backup)
         .map_err(|e| format!("备份活动 auth.json 失败: {e}"))?;
     Ok(())
-}
-
-/// [MOC-104 req#5 时序] 把 transfer 备份里检测到的真实 chatgpt 账号**恢复到活动**
-/// `~/.codex/auth.json`(场景:开 transfer 后 apply 把活动文件改成 apikey,真实
-/// chatgpt 态落到快照备份;用户想让 Codex 重新用回真实账号)。
-///
-/// 时序安全(先备份再写):① 定位备份里的可用 chatgpt;② 若活动文件已经就是同一
-/// 真实账号(source=Official)则无需操作;③ 覆盖活动文件前先备份当前活动文件;
-/// ④ 用 `write_auth` 原子写回(0o600)。任何步骤失败前不动活动文件。
-pub async fn activate_backup_to_active() -> Result<AuthSource, String> {
-    // [P1/I-3] 与 refresh / 启动刷新共用 AUTH_LOCK 串行化对 auth.json 的写。
-    let _guard = AUTH_LOCK.lock().await;
-    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    activate_with_paths(&paths)
-}
-
-/// [`activate_backup_to_active`] 的可注入路径内层(同步,便于单测;锁由 async
-/// 外层 `activate_backup_to_active` 持有)。
-fn activate_with_paths(paths: &CodexPaths) -> Result<AuthSource, String> {
-    let located = locate_chatgpt_auth(paths).ok_or("未检测到可恢复的真实 chatgpt 账号")?;
-    match located.source {
-        // 活动文件已经是真实 chatgpt,无需恢复。
-        AuthSource::Official => Ok(AuthSource::Official),
-        // 导入镜像 / 快照备份里的真实账号 → 恢复到活动文件。
-        // [B-1] 备份失败即中止,绝不在没备份成功的情况下覆盖活动 auth.json。
-        src @ (AuthSource::Imported | AuthSource::Backup) => {
-            backup_active_auth(paths, "preactivate")?;
-            write_auth(&paths.auth_json, &located.value)
-                .map_err(|e| format!("恢复真实账号到活动 auth.json 失败: {e}"))?;
-            Ok(src)
-        }
-        AuthSource::None => Err("未检测到可恢复的真实 chatgpt 账号".to_owned()),
-    }
 }
 
 /// 当前活动 `~/.codex/auth.json` 是否已经是可用的真实 chatgpt(决定是否需要恢复)。
@@ -543,9 +543,21 @@ fn read_imported_mirror(paths: &CodexPaths) -> Option<Value> {
     parse_chatgpt_auth(&v).map(|_| v)
 }
 
-/// [MOC-104 req] 导入一份真实 chatgpt auth(文件导入 / 钉住当前)。校验是可用
-/// chatgpt → 写进持久镜像(`~/.codex-app-transfer/real-account/imported-auth.json`,
-/// 0o600,`~/.codex` 之外不受文件变动影响)→ 同时恢复到活动文件(先备份)。
+/// import 内层(**假设 caller 已持 `AUTH_LOCK`**):写持久镜像 → 备份活动 → 写活动。
+fn import_locked(paths: &CodexPaths, value: &Value) -> Result<(), String> {
+    let mirror = imported_mirror_path(paths);
+    if let Some(parent) = mirror.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("镜像目录创建失败: {e}"))?;
+    }
+    // 先落持久镜像(长期保留的真相源),再恢复到活动(覆盖前先备份)。
+    write_auth(&mirror, value).map_err(|e| format!("写持久镜像失败: {e}"))?;
+    backup_active_auth(paths, "preimport")?;
+    write_auth(&paths.auth_json, value).map_err(|e| format!("写活动 auth.json 失败: {e}"))?;
+    Ok(())
+}
+
+/// [MOC-104 req] 导入一份真实 chatgpt auth(文件导入)。校验是可用 chatgpt → 写进
+/// 持久镜像(`~/.codex` 之外不受文件变动影响)→ 同时恢复到活动文件(先备份)。
 pub async fn import_auth(value: Value) -> Result<(), String> {
     if parse_chatgpt_auth(&value).is_none() {
         return Err(
@@ -554,29 +566,25 @@ pub async fn import_auth(value: Value) -> Result<(), String> {
     }
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    let mirror = imported_mirror_path(&paths);
-    if let Some(parent) = mirror.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("镜像目录创建失败: {e}"))?;
-    }
-    // 先落持久镜像(长期保留的真相源),再恢复到活动(覆盖前先备份)。
-    write_auth(&mirror, &value).map_err(|e| format!("写持久镜像失败: {e}"))?;
-    backup_active_auth(&paths, "preimport")?;
-    write_auth(&paths.auth_json, &value).map_err(|e| format!("写活动 auth.json 失败: {e}"))?;
-    Ok(())
+    import_locked(&paths, &value)
 }
 
 /// 钉住当前检测到的真实账号(官方活动 / 快照备份)进持久镜像。
+/// [review #5] locate + 写全程持 `AUTH_LOCK`,避免锁外读到 stale 值、随后被并发
+/// refresh 抢先轮换 token,导致 pin 用过期 access + 已花掉的 refresh 覆盖刚刷新的。
 pub async fn pin_current_account() -> Result<(), String> {
+    let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    // 注意:locate 会优先返回镜像本身;这里要的是"当前真实账号",镜像已存在就直接
-    // 视作已钉住(幂等)。否则取官方/快照那份。
     let located = locate_chatgpt_auth(&paths).ok_or("未检测到可钉住的真实 chatgpt 账号")?;
-    import_auth(located.value).await
+    import_locked(&paths, &located.value)
 }
 
 /// 忘记导入的真实账号(删持久镜像)= 退出"真实账号长期生效"。删镜像后启动不再
 /// 自动恢复。删除已不存在的镜像视作成功(幂等)。
-pub fn forget_imported() -> Result<bool, String> {
+/// [review #1] 持 `AUTH_LOCK`,避免与 in-flight refresh 竞态(删了之后 refresh
+/// 的 `write_auth` 又把镜像重建出来 → 已"忘记"的账号复活)。
+pub async fn forget_imported() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let mirror = imported_mirror_path(&paths);
     if !mirror.is_file() {
@@ -870,54 +878,38 @@ mod tests {
     }
 
     #[test]
-    fn activate_promotes_backup_chatgpt_to_active_with_prebackup() {
+    fn import_locked_writes_mirror_active_and_prebackup() {
         let dir = tempfile::tempdir().unwrap();
         let paths = CodexPaths::from_home_dir(dir.path());
-        // 活动 apikey + 备份 chatgpt
+        // 原活动是 apikey(代理模式常态)
         write_json(
             &paths.auth_json,
             &json!({"auth_mode": "apikey", "OPENAI_API_KEY": "cas_x"}),
         );
-        write_json(
-            &paths.active_snapshots_dir.join("sess").join("auth.json"),
-            &chatgpt_auth(),
+        import_locked(&paths, &chatgpt_auth()).unwrap();
+        // 持久镜像写了 chatgpt(长期保留的真相源)
+        assert!(
+            read_imported_mirror(&paths).is_some(),
+            "镜像应有可用 chatgpt"
         );
-        let source = activate_with_paths(&paths).unwrap();
-        assert_eq!(source, AuthSource::Backup);
-        // 活动文件现在是 chatgpt
-        let active = read_auth(&paths.auth_json).unwrap();
-        assert_eq!(active["auth_mode"], "chatgpt");
-        assert_eq!(active["tokens"]["account_id"], "acct_123");
-        // 覆盖前备份了原 apikey 活动文件(时序安全);文件名带时间戳(review I-2)
-        let backup_dir = paths.app_home.join("real-account");
-        let prebackup = std::fs::read_dir(&backup_dir)
+        assert_eq!(
+            read_auth(&imported_mirror_path(&paths)).unwrap()["auth_mode"],
+            "chatgpt"
+        );
+        // 活动文件也恢复成 chatgpt
+        assert_eq!(read_auth(&paths.auth_json).unwrap()["auth_mode"], "chatgpt");
+        // 覆盖活动前备份了原 apikey(时序安全,文件名带时间戳)
+        let prebackup = std::fs::read_dir(paths.app_home.join("real-account"))
             .unwrap()
             .flatten()
             .map(|e| e.path())
             .find(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("auth-preactivate-"))
+                    .is_some_and(|n| n.starts_with("auth-preimport-"))
             })
-            .expect("覆盖前应备份原活动 auth.json");
-        let backed = read_auth(&prebackup).unwrap();
-        assert_eq!(backed["auth_mode"], "apikey", "备份的是覆盖前的 apikey 态");
-    }
-
-    #[test]
-    fn activate_noop_when_active_already_official_chatgpt() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = CodexPaths::from_home_dir(dir.path());
-        write_json(&paths.auth_json, &chatgpt_auth());
-        assert_eq!(activate_with_paths(&paths).unwrap(), AuthSource::Official);
-    }
-
-    #[test]
-    fn activate_errs_when_no_real_account() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = CodexPaths::from_home_dir(dir.path());
-        write_json(&paths.auth_json, &json!({"auth_mode": "apikey"}));
-        assert!(activate_with_paths(&paths).is_err());
+            .expect("import 前应备份原活动 auth.json");
+        assert_eq!(read_auth(&prebackup).unwrap()["auth_mode"], "apikey");
     }
 
     #[test]

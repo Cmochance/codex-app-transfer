@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-- **真实 ChatGPT 账号 plugin 模式(后端 + UI 基础,MOC-104,登录待真机验证)**:CDP 伪造登录态没有真实 userID,Codex 启动要重新初始化登录态(~5.8s);新增「用真实 ChatGPT 账号」这条干净路径。Plugins 解锁卡片内新增真实账号区:检测本机真实 chatgpt 登录态(扫官方 `~/.codex/auth.json` + transfer 备份)、在应用内调起官方 `codex login` 登录、token 将过期时自动/手动刷新、把备份里的真实账号恢复到活动文件、以及「强制开启(高延迟)」按钮(二次确认走原 CDP 伪造路径)。所有写 `auth.json` 的动作先备份原文件再原子写、失败即中止(非破坏)。
+- **真实 ChatGPT 账号 plugin 模式(后端 + UI,MOC-104,登录待真机验证)**:CDP 伪造登录态没有真实 userID,Codex 启动要重新初始化登录态(~5.8s);新增「用真实 ChatGPT 账号」这条干净路径。设置页「自动解锁 Codex Plugins」下新增真实账号区:在应用内调起官方 `codex login` 登录(成功后自动长期保留)、从文件导入账号、「强制开启(高延迟)」(二次确认走原 CDP 伪造路径)、清除真实账号。账号写进 `~/.codex` 之外的持久镜像不受文件变动影响;启动刷新 token、活动 `auth.json` 失效时自动从镜像恢复。所有写 `auth.json` 的动作先备份原文件再原子写、失败即中止(非破坏)。
 - **Plugins 注入重新启用 + daemon / 重启健壮性修复**(MOC-100):撤销 v2.1.18 的临时 kill switch(MOC-98 曾强制关闭 plugins 注入),重新启用;并修掉当初触发关闭的根因 —— ① daemon 指数退避改 `tokio::select!` 可被 reinject 中断,首启延迟从最坏 ~17s 降到 ~3s;② Codex 重启改 `open -a` 单实例(去掉 `-n`)+ 主进程退出后强杀残留 Electron helper(`pkill -KILL -f`),消除多实例堆积导致的启动卡死;③ 注入前等页面 `readyState` 就绪再注,避免打到加载中页面卡加载;④ 重启切到新实例时 daemon 检测 CDP 端口变化、断开旧 WS 重连新实例,不再黏旧页;⑤ daemon 生命周期守护:`stop` / `reinject` 改非阻塞 `try_send` + `running` flag 幂等启动,修掉重启 8 次后命令灌满 bounded channel 卡死调用方、以及退避期间重复 `start` 起两个 daemon 抢同一通道;⑥ 已连 WS 态收到 Stop 现在真正退出整个守护循环(原实现把 Stop 当优雅断开立刻重连,导致 daemon 关不掉);⑦ 设置里切 `autoUnlockCodexPlugins` 开关运行时即时 start/stop daemon,无需重启 transfer 才生效。
 
 ## v2.1.18 — 2026-05-31

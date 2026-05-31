@@ -5,10 +5,9 @@
 //! - POST /api/desktop/real-account/refresh       → 刷新真实账号 token(将过期才刷)
 //! - POST /api/desktop/real-account/login         → 启动官方 codex login(非阻塞)
 //! - POST /api/desktop/real-account/login/cancel  → 取消进行中的登录
-//! - POST /api/desktop/real-account/activate      → 把检测到的真实账号恢复到活动文件
-//! - POST /api/desktop/real-account/import        → 从文件导入(body=auth.json 内容)
-//! - POST /api/desktop/real-account/pin-current   → 钉住当前真实账号(持久保留)
-//! - POST /api/desktop/real-account/forget        → 忘记导入的真实账号(删持久镜像)
+//! - POST /api/desktop/real-account/import        → 从文件导入(body=auth.json 内容,持久 + 生效)
+//! - POST /api/desktop/real-account/pin-current   → 持久保留当前真实账号(登录成功后前端自动调)
+//! - POST /api/desktop/real-account/forget        → 清除真实账号(删持久镜像,退出长期生效)
 
 use std::time::Duration;
 
@@ -90,22 +89,6 @@ pub async fn login_cancel_handler() -> impl IntoResponse {
     }))
 }
 
-/// POST /api/desktop/real-account/activate
-///
-/// 把 transfer 备份里检测到的真实 chatgpt 账号恢复到活动 `~/.codex/auth.json`
-/// (覆盖前先备份当前活动文件,时序安全)。活动已是真实账号则 no-op。
-pub async fn activate_handler() -> impl IntoResponse {
-    match codex_real_account::activate_backup_to_active().await {
-        Ok(source) => Json(json!({
-            "success": true,
-            "source": source,
-            "message": "已将真实 ChatGPT 账号恢复到活动 auth.json",
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
-    }
-}
-
 /// POST /api/desktop/real-account/import
 ///
 /// 从文件导入:body 是 chatgpt auth.json 的 JSON 内容。校验后写进 transfer 持久
@@ -134,7 +117,7 @@ pub async fn pin_current_handler() -> impl IntoResponse {
 ///
 /// 忘记导入的真实账号(删持久镜像)= 退出"长期生效",启动不再自动恢复。
 pub async fn forget_handler() -> impl IntoResponse {
-    match codex_real_account::forget_imported() {
+    match codex_real_account::forget_imported().await {
         Ok(removed) => Json(json!({
             "success": true,
             "removed": removed,
@@ -155,7 +138,6 @@ pub fn routes() -> Router<AdminState> {
             "/api/desktop/real-account/login/cancel",
             post(login_cancel_handler),
         )
-        .route("/api/desktop/real-account/activate", post(activate_handler))
         .route("/api/desktop/real-account/import", post(import_handler))
         .route(
             "/api/desktop/real-account/pin-current",
