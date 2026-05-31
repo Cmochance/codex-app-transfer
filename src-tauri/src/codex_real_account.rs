@@ -5,10 +5,13 @@
 //! 靠 CDP 注入伪造 `setAuthMethod('chatgpt')`,没有真实 userID → Codex 启动后要
 //! 重新初始化登录态(~5.8s)。真实账号模式用真 `auth.json` 取代伪造,避开代价。
 //!
-//! 本模块**纯只读**:只 `read` `~/.codex/auth.json` 与 transfer 快照备份,
-//! 不写盘、不 spawn 子进程,给上层(检测 UI / 是否需要登录 / 是否需刷新)做判断。
-//! 登录获取(spawn `codex login`)、token 刷新、强制启用等写操作在后续增量里加,
-//! 各自独立,不混进检测路径。
+//! 三块能力,各自独立:
+//! - **检测**([`detect`]):**纯只读** —— 只 `read` `~/.codex/auth.json` 与 transfer
+//!   快照备份,不写盘、不 spawn。
+//! - **token 刷新**([`refresh_if_needed`]):token 将过期才走官方 OAuth refresh,
+//!   只更新 token 字段 + `last_refresh` 原子写回(非破坏)。
+//! - **登录**([`start_login`] / [`cancel_login`] / [`login_status`]):调起官方
+//!   `codex login`(它自己做 OAuth + 写 `~/.codex/auth.json`),非阻塞 + 可取消。
 //!
 //! 检测来源(用户要求:只扫官方 `.codex/auth.json` + transfer 备份,不依赖
 //! 任何特殊文件夹结构):
@@ -17,6 +20,10 @@
 //!    —— transfer apply 前会整文件备份原 `auth.json`(见 codex_integration snapshot)。
 //!    用户开 transfer 后官方 `auth.json` 可能被 apply 改成 apikey 模式,原本的
 //!    chatgpt 登录态此时仍保留在快照里,可据此提示"备份里有真实账号可恢复"。
+
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -321,6 +328,181 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
     Ok(RefreshOutcome::Refreshed { source })
 }
 
+// ── 登录:调起官方 codex login(MOC-104 req#3)────────────────────────
+//
+// 用户在 transfer 内点"登录" → 后台 spawn 官方 `codex login`(它自己做 ChatGPT
+// OAuth 并把真实 auth.json 写到 `~/.codex`)→ 前端轮询 detect() 看是否登录成功。
+// 不自建 OpenAI OAuth(轻、稳),复用官方流程。借鉴 Codex_Account_Switch
+// `mac/runtime/process.rs::run_codex_login` + `login_cancel.rs`(README 待致谢)。
+//
+// codex login 是交互式(开浏览器等回调),会阻塞到完成/超时,所以**不能**在 HTTP
+// handler 里同步 await —— spawn 到后台线程 reap,前端轮询 [`login_status`]。
+
+/// 解析官方 codex CLI 二进制路径。macOS 优先 Codex.app 内置 `Contents/Resources/
+/// codex`(可靠,不受用户 shell 里 `codex` 函数/别名干扰),回退 PATH 扫描。
+fn resolve_codex_cli() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut apps = vec![PathBuf::from("/Applications/Codex.app")];
+        if let Some(home) = std::env::var_os("HOME") {
+            apps.push(PathBuf::from(home).join("Applications").join("Codex.app"));
+        }
+        for app in apps {
+            let cli = app.join("Contents").join("Resources").join("codex");
+            if cli.is_file() {
+                return Some(cli);
+            }
+        }
+    }
+    // PATH 扫描(各平台兜底):直接找 PATH 目录下的 `codex` 可执行文件,绕开
+    // 用户 shell 里可能定义的 `codex` 函数(那个不在 PATH 上、也不是文件)。
+    let exe = if cfg!(target_os = "windows") {
+        "codex.exe"
+    } else {
+        "codex"
+    };
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join(exe);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// 登录流程状态(前端轮询)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state", content = "message")]
+pub enum LoginState {
+    /// 没有进行中的登录(初始/上次结束后清空)。
+    Idle,
+    /// `codex login` 进行中(用户应在弹出的浏览器里完成授权)。
+    Running,
+    /// 登录成功(`codex login` 0 退出)。
+    Succeeded,
+    /// 登录失败,附 stderr/原因。
+    Failed(String),
+    /// 用户取消(cancel 杀掉了进程)。
+    Cancelled,
+}
+
+struct LoginShared {
+    running: bool,
+    /// 进行中 `codex login` 子进程 pid(用于 cancel 杀进程)。
+    pid: Option<u32>,
+    /// cancel 已请求 —— reap 时据此把非零退出标记为 Cancelled 而非 Failed。
+    cancel_requested: bool,
+    last: LoginState,
+}
+
+static LOGIN: Mutex<LoginShared> = Mutex::new(LoginShared {
+    running: false,
+    pid: None,
+    cancel_requested: false,
+    last: LoginState::Idle,
+});
+
+/// 登录前把当前 `~/.codex/auth.json`(可能是 transfer 写的 apikey 态)整文件备份
+/// 到 app_home,`codex login` 覆盖后用户仍可恢复 —— 非破坏(`feedback_no_silent_
+/// destructive_fallback`)。best-effort:备份失败只 warn,不挡登录。
+fn backup_auth_before_login(paths: &CodexPaths) {
+    if !paths.auth_json.is_file() {
+        return;
+    }
+    let backup_dir = paths.app_home.join("real-account");
+    if let Err(e) = std::fs::create_dir_all(&backup_dir) {
+        tracing::warn!("[RealAccount] 登录前备份目录创建失败: {e}");
+        return;
+    }
+    let backup = backup_dir.join("auth-prelogin-backup.json");
+    if let Err(e) = std::fs::copy(&paths.auth_json, &backup) {
+        tracing::warn!("[RealAccount] 登录前备份 auth.json 失败: {e}");
+    }
+}
+
+/// 启动 `codex login`(非阻塞)。已在进行中则返回 Err。
+pub fn start_login() -> Result<(), String> {
+    let mut g = LOGIN.lock().map_err(|_| "登录状态锁中毒".to_owned())?;
+    if g.running {
+        return Err("登录已在进行中".to_owned());
+    }
+    let codex = resolve_codex_cli().ok_or("未找到 codex CLI;请确认已安装 Codex Desktop")?;
+    if let Ok(paths) = CodexPaths::from_home_env() {
+        backup_auth_before_login(&paths);
+    }
+    // 不覆盖 CODEX_HOME → codex login 写真实 `~/.codex/auth.json`,登录后即生效。
+    let child = Command::new(&codex)
+        .arg("login")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动 codex login 失败: {e}"))?;
+    g.pid = Some(child.id());
+    g.running = true;
+    g.cancel_requested = false;
+    g.last = LoginState::Running;
+    drop(g);
+
+    // 后台线程 reap:wait_with_output 阻塞到 codex login 完成/被杀,记录结果。
+    std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let mut g = match LOGIN.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        g.running = false;
+        g.pid = None;
+        g.last = match result {
+            Ok(out) if out.status.success() => LoginState::Succeeded,
+            Ok(out) => {
+                if g.cancel_requested {
+                    LoginState::Cancelled
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    LoginState::Failed(if stderr.is_empty() {
+                        "codex login 非零退出".to_owned()
+                    } else {
+                        stderr
+                    })
+                }
+            }
+            Err(e) => LoginState::Failed(format!("等待 codex login 失败: {e}")),
+        };
+    });
+    Ok(())
+}
+
+/// 取消进行中的登录(杀 `codex login` 进程)。返回是否有进行中的登录被取消。
+pub fn cancel_login() -> bool {
+    let mut g = match LOGIN.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if !g.running {
+        return false;
+    }
+    g.cancel_requested = true;
+    if let Some(pid) = g.pid {
+        #[cfg(unix)]
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+        #[cfg(windows)]
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+    true
+}
+
+/// 当前登录流程状态(前端轮询)。
+pub fn login_status() -> LoginState {
+    LOGIN
+        .lock()
+        .map(|g| g.last.clone())
+        .unwrap_or(LoginState::Idle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +657,22 @@ mod tests {
         assert_eq!(t["account_id"], "acct_keep", "account_id 透传不动");
         assert_eq!(auth["last_refresh"], "2026-05-31T12:00:00Z");
         assert_eq!(auth["some_other_field"], "keep_me", "无关字段透传不动");
+    }
+
+    #[test]
+    fn login_state_serializes_with_tag_and_message() {
+        assert_eq!(
+            serde_json::to_value(LoginState::Running).unwrap(),
+            json!({ "state": "running" })
+        );
+        assert_eq!(
+            serde_json::to_value(LoginState::Failed("boom".to_owned())).unwrap(),
+            json!({ "state": "failed", "message": "boom" })
+        );
+        assert_eq!(
+            serde_json::to_value(LoginState::Cancelled).unwrap(),
+            json!({ "state": "cancelled" })
+        );
     }
 
     #[test]

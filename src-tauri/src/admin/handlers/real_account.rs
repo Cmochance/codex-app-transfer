@@ -1,11 +1,13 @@
 //! `/api/desktop/real-account/*` — 真实 ChatGPT 账号 plugin 模式 HTTP API(MOC-104)。
 //!
-//! 前端用这组 API 判断本机是否已有可用的真实 chatgpt 登录态、并按需刷新其 token。
-//! 本增量暴露:
-//! - GET  /api/desktop/real-account/status   → 只读检测真实 chatgpt 账号状态
-//! - POST /api/desktop/real-account/refresh  → 刷新真实账号 token(将过期才刷)
+//! 前端用这组 API:检测真实 chatgpt 登录态、刷新 token、在 transfer 内调起官方
+//! `codex login` 登录(轮询状态)。
+//! - GET  /api/desktop/real-account/status        → 检测 + 登录流程状态
+//! - POST /api/desktop/real-account/refresh       → 刷新真实账号 token(将过期才刷)
+//! - POST /api/desktop/real-account/login         → 启动官方 codex login(非阻塞)
+//! - POST /api/desktop/real-account/login/cancel  → 取消进行中的登录
 //!
-//! 登录(spawn `codex login`)、强制启用按钮等在后续增量加。
+//! 强制开启按钮 / 启动自动刷新 hook 在后续增量加。
 
 use std::time::Duration;
 
@@ -34,6 +36,7 @@ pub async fn status_handler() -> impl IntoResponse {
         "success": true,
         "message": message,
         "status": status,
+        "login": codex_real_account::login_status(),
     }))
 }
 
@@ -61,9 +64,38 @@ pub async fn refresh_handler() -> impl IntoResponse {
     }
 }
 
+/// POST /api/desktop/real-account/login
+///
+/// 启动官方 `codex login`(非阻塞,会弹浏览器做 ChatGPT OAuth)。立即返回;前端轮
+/// 询 `status` 的 `login` 字段看进度(running → succeeded/failed/cancelled)。
+pub async fn login_handler() -> impl IntoResponse {
+    match codex_real_account::start_login() {
+        Ok(()) => {
+            Json(json!({ "success": true, "message": "已启动 codex login,请在浏览器完成授权" }))
+                .into_response()
+        }
+        Err(e) => err(StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+/// POST /api/desktop/real-account/login/cancel
+pub async fn login_cancel_handler() -> impl IntoResponse {
+    let cancelled = codex_real_account::cancel_login();
+    Json(json!({
+        "success": true,
+        "cancelled": cancelled,
+        "message": if cancelled { "已取消登录" } else { "当前没有进行中的登录" },
+    }))
+}
+
 /// 组装路由 — 在 `admin/mod.rs` 调 `.merge(handlers::real_account::routes())` 挂载。
 pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/api/desktop/real-account/status", get(status_handler))
         .route("/api/desktop/real-account/refresh", post(refresh_handler))
+        .route("/api/desktop/real-account/login", post(login_handler))
+        .route(
+            "/api/desktop/real-account/login/cancel",
+            post(login_cancel_handler),
+        )
 }
