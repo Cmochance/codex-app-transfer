@@ -1397,6 +1397,30 @@
       if (!icon || !statusText) return;
 
       icon.classList.remove("muted", "success", "warning", "danger");
+
+      // [MOC-104 relay] daemon 未跑(disconnected)时,若活动是真实 chatgpt 账号,
+      // plugins 是「原生显示」(relay 模式:Codex 据 auth_mode==chatgpt 解锁,无需 CDP
+      // 注入)→ 显示成功态而非「未运行」,避免误以为解锁失效。卡片语义是「Plugins 是否
+      // 解锁」,relay 下已解锁;真实账号活动正是 daemon 不跑的**预期**原因(无高延迟)。
+      if (unlock.status === "disconnected") {
+        try {
+          const ra = await CCApi.realAccount.status();
+          const st = (ra && ra.status) || {};
+          if (st.logged_in === true && st.source === "official" && st.relogin_required !== true) {
+            icon.innerHTML = `<i class="bi bi-unlock"></i>`;
+            icon.classList.add("success");
+            statusText.classList.remove("muted-text");
+            statusText.textContent = t("pluginUnlock.nativeRelay") || "已解锁(真实账号)";
+            if (actions) actions.style.display = "none";
+            return;
+          }
+        } catch (_e) {
+          // [MEDIUM-1] 查真实账号失败 → 退回下方 daemon 态显示(方向安全、可自愈);记日志
+          // 便于排障区分「真未运行」vs「查询失败退回」(与本文件其余 catch 一致)。
+          console.log("[PluginUnlock] relay 检测 status() 失败,退回 daemon 态:", _e);
+        }
+      }
+
       const statusMap = {
         disconnected: { icon: "bi-lock", class: "muted", text: t("pluginUnlock.disconnected") || "未运行" },
         connecting: { icon: "bi-arrow-repeat", class: "warning", text: t("pluginUnlock.connecting") || "连接中..." },
@@ -1454,15 +1478,16 @@
       // ② 否则用户显式强制开启(开关=true,跑 CDP 高延迟 daemon)→ 已开启;
       // ③ 都不是 → 未开启。这样「账号获取失败 + 没强制开启」如实显示未开启,
       // 不再出现「获取失败却显示已开启(默默走高延迟)」。
+      // [MOC-104] 派生「自动解锁」开关态 + 运行状态:真实账号活动(relay,source=official、
+      // 未失效 → Codex 原生解锁)或持久强制档 → ON。每次刷新都按此派生,实现「首次加载 /
+      // 刷新按账号状态自动开/关」。relay 的 ON 由 realActive 派生维持,不写持久强制档。
+      // 仅有镜像但活动是 apikey(source=imported)→ 此刻未启用,不显示已开启(gate official)。
+      const realActive = st.logged_in === true && st.source === "official" && !realAccountExpired;
+      const on = realActive || forceUnlockPersisted;
+      const unlockToggle = $("#autoUnlockCodexPlugins");
+      if (unlockToggle) unlockToggle.checked = on;
       const runEl = $("#raRunStatus");
       if (runEl) {
-        // [connector review] 原生 plugins 只有在「活动 auth.json 本身是真实 chatgpt」
-        // (source=official)时才生效。仅有持久镜像但活动还是 apikey(如本 session 内
-        // apply 过 provider、reconcile 尚未恢复)→ logged_in 仍 true 但 source=imported,
-        // 此刻 plugins 并未启用,不能显示已开启。gate 在 source==official。
-        const realActive = st.logged_in === true && st.source === "official" && !realAccountExpired;
-        const forceCdp = $("#autoUnlockCodexPlugins")?.checked === true;
-        const on = realActive || forceCdp;
         runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
         runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
       }
@@ -1494,7 +1519,64 @@
       return undefined;
     }
   }
+
+  // [MOC-104] 「自动解锁 Codex Plugins」开关的智能 change handler:
+  // - 开启:检测账号 → 有效真实账号则 relay 原生解锁(后端自动,无需 daemon)、提示成功;
+  //   无有效账号则弹引导窗(登录优先 / 强制兜底),开关回退派生态。
+  // - 关闭:relay(有账号)态前端关不掉账号原生显示 → 提示走「清除真实账号」并弹回 ON;
+  //   强制档则持久化 false + 停 daemon。
+  async function onAutoUnlockToggle(e) {
+    const toggle = e.target;
+    let realActive = false;
+    let statusOk = false;
+    try {
+      const ra = await CCApi.realAccount.status();
+      const st = (ra && ra.status) || {};
+      realActive = st.logged_in === true && st.source === "official" && st.relogin_required !== true;
+      statusOk = true;
+    } catch (err) {
+      console.log("[RealAccount] onAutoUnlockToggle status() 失败:", err);
+    }
+    // [HIGH-1] status() 失败 ≠ 无账号(可能 admin server 启动早期 / 抖动)。不伪装成无账号
+    // 弹引导窗误导已登录用户;回退派生态 + 提示稍后重试(与 refreshRealAccountStatus 失败
+    // 时保留态的口径一致)。
+    if (!statusOk) {
+      toggle.checked = realActive || forceUnlockPersisted;
+      showToast(t("realAccount.statusUnavailable") || "暂时无法获取账号状态,请稍后重试");
+      return;
+    }
+    if (toggle.checked) {
+      if (realActive) {
+        // 有效真实账号 → relay 模式,Codex 原生显示 plugins,不启 daemon、不设强制档。
+        showToast(t("realAccount.unlockedByRealAccount") || "已开启(真实账号,原生解锁)");
+        setTimeout(refreshRealAccountStatus, 100);
+        setTimeout(refreshPluginUnlockStatus, 300);
+      } else {
+        // 无有效账号 → 引导弹窗。开关回退到派生态(强制档值,通常 OFF)。
+        toggle.checked = forceUnlockPersisted;
+        const m = $("#realAccountNoAccountModal");
+        if (m) m.hidden = false;
+      }
+    } else if (realActive) {
+      // relay:前端开关关不掉账号原生解锁 → 弹回 ON 并提示走「清除真实账号」。
+      toggle.checked = true;
+      showToast(t("realAccount.cannotDisableRelay") || "真实账号已登录,Plugins 由账号原生解锁;如需停用请点「清除真实账号」");
+    } else {
+      // 强制 daemon 档关闭:持久化 false + 停 daemon。
+      forceUnlockPersisted = false;
+      await saveSettingsFromForm();
+      try { await CCApi.pluginUnlock.stop(); } catch (_e) {}
+      setTimeout(refreshPluginUnlockStatus, 300);
+      setTimeout(refreshRealAccountStatus, 300);
+    }
+  }
+
   let realAccountAutoPersisting = false;
+  // [MOC-104] 持久「强制 CDP daemon 档」值(= settings.autoUnlockCodexPlugins)。开关 checked
+  // 是派生态(realActive || forceUnlockPersisted):真实账号活动走 relay 原生解锁、不靠它;它
+  // 只在「无账号 + 用户强制开启」时为 true。与派生 checkbox 分离,避免 saveSettings 把
+  // realActive 误存进强制档(否则账号失效后会误启 daemon)。
+  let forceUnlockPersisted = false;
   let realAccountLoginPinned = false; // 本次登录成功是否已 pin(替换镜像);新登录开始时复位
   let realAccountExpired = false; // relogin-required 事件置真 → 账号状态显示「账号已失效」
   let realAccountForgotten = false; // 用户点「清除」后置真 → 抑制本 session auto-persist 重生镜像
@@ -2366,7 +2448,10 @@
     $("#settingsProxyPort").value = settings.proxyPort;
     $("#settingsAdminPort").value = settings.adminPort;
     $("#autoApplyOnStart").checked = settings.autoApplyOnStart !== false;
-   $("#autoUnlockCodexPlugins").checked = settings.autoUnlockCodexPlugins !== false;
+   // [MOC-104] 持久强制档初值;refreshRealAccountStatus 随后按 realActive 派生修正
+   // (有账号→ON、无账号→强制档值)。migrate 后默认 false → 无账号时初始 OFF。
+   forceUnlockPersisted = settings.autoUnlockCodexPlugins === true;
+   $("#autoUnlockCodexPlugins").checked = forceUnlockPersisted;
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     showGrayPresets = settings.showGrayProviders === true;
@@ -2906,7 +2991,7 @@
       proxyPort: Number($("#settingsProxyPort").value),
       adminPort: Number($("#settingsAdminPort").value),
       autoApplyOnStart: $("#autoApplyOnStart")?.checked !== false,
-     autoUnlockCodexPlugins: $("#autoUnlockCodexPlugins")?.checked || false,
+     autoUnlockCodexPlugins: forceUnlockPersisted,
       autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       showGrayProviders: $("#showGrayProviders")?.checked || false,
@@ -7920,7 +8005,7 @@
     $("#settingsAdminPort").addEventListener("change", saveSettingsFromForm);
     $("#settingsUpdateUrl").addEventListener("change", saveSettingsFromForm);
     $("#autoApplyOnStart")?.addEventListener("change", saveSettingsFromForm);
-   $("#autoUnlockCodexPlugins")?.addEventListener("change", saveSettingsFromForm);
+   $("#autoUnlockCodexPlugins")?.addEventListener("change", onAutoUnlockToggle);
     $("#autoWakeCodexPet")?.addEventListener("change", saveSettingsFromForm);
     $("#mcpCredentialsPortableStore")?.addEventListener("change", saveSettingsFromForm);
 
@@ -8009,12 +8094,34 @@
       const m = $("#realAccountForceEnableModal");
       if (m) m.hidden = true;
       try {
+        // 强制档:持久化 autoUnlockCodexPlugins=true + 启 CDP daemon(伪造注入,高延迟)。
+        forceUnlockPersisted = true;
+        await saveSettingsFromForm();
         await CCApi.pluginUnlock.start();
         const toggle = $("#autoUnlockCodexPlugins");
-        if (toggle && !toggle.checked) { toggle.checked = true; await saveSettingsFromForm(); }
+        if (toggle) toggle.checked = true;
         showToast(t("realAccount.forceEnabled") || "已强制开启(高延迟)");
         setTimeout(refreshPluginUnlockStatus, 1000);
       } catch (e) { showToast(e.message); }
+    });
+    // [MOC-104] 无账号引导弹窗:取消 / 强制开启(转高延迟二次确认) / 登录真实账号。
+    $all("[data-action=real-account-noacct-cancel]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const nm = $("#realAccountNoAccountModal");
+        if (nm) nm.hidden = true;
+        refreshRealAccountStatus(); // 开关派生回 OFF
+      })
+    );
+    $("[data-action=real-account-noacct-force]")?.addEventListener("click", () => {
+      const nm = $("#realAccountNoAccountModal");
+      if (nm) nm.hidden = true;
+      const fm = $("#realAccountForceEnableModal"); // 转高延迟二次确认
+      if (fm) fm.hidden = false;
+    });
+    $("[data-action=real-account-noacct-login]")?.addEventListener("click", () => {
+      const nm = $("#realAccountNoAccountModal");
+      if (nm) nm.hidden = true;
+      $("[data-action=real-account-login]")?.click(); // 复用「登录真实账号」逻辑
     });
     $("#exposeAllProviderModels").addEventListener("change", saveSettingsFromForm);
     $("#showGrayProviders")?.addEventListener("change", async () => {
@@ -8101,6 +8208,7 @@
         // MOC-104:真实账号失效 → 后端已自动关「自动解锁」开关,这里提示重登 + 刷新 UI。
         await tauriEvent.listen("real-account-relogin-required", () => {
           realAccountExpired = true; // 账号状态显示「账号已失效」
+          forceUnlockPersisted = false; // 后端 reconcile 已 disable_auto_unlock(main.rs)
           showToast(t("realAccount.reloginRequired") || "真实 ChatGPT 账号已失效,已自动关闭自动解锁,请重新登录");
           const toggle = $("#autoUnlockCodexPlugins");
           if (toggle) toggle.checked = false;

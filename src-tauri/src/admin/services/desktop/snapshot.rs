@@ -372,6 +372,12 @@ pub fn desktop_health(
 
 pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
     let paths = CodexPaths::from_home_env().map_err(|e| e.to_string())?;
+    // [MOC-104] relay 模式 gate:仅 proxy 模式(非 direct)+ 活动已是可用真实
+    // chatgpt 时,apply 保留 chatgpt 登录态(让 Codex 原生显示 Plugins 入口、
+    // 不再依赖 CDP daemon 注入,消除 MOC-100 高延迟)。direct 直连 bypass proxy、
+    // 凭据直接用 auth.json 发上游,保留 chatgpt token 直连第三方会 401 → 不 relay。
+    let preserve_chatgpt_auth =
+        target.mode != "direct" && crate::codex_real_account::active_is_real_chatgpt_now();
     let result = apply_provider(
         &paths,
         &ApplyConfig {
@@ -388,6 +394,7 @@ pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, Strin
             codex_status_section_default_visible: target.codex_status_section_default_visible,
             // issue #317:direct 直连只写上游配置,strip 全部 transfer 私货。
             direct: target.mode == "direct",
+            preserve_chatgpt_auth,
         },
     )
     .map_err(|e| format!("apply 失败: {e}"))?;

@@ -506,6 +506,21 @@
               </div>
             </div>
           </div>
+          <!-- MOC-104 手动开「自动解锁」但无有效真实账号时的引导弹窗(登录优先 / 强制兜底) -->
+          <div class="codex-modal-backdrop" id="realAccountNoAccountModal" hidden>
+            <div class="codex-modal" role="dialog" aria-modal="true">
+              <div class="codex-modal-header">
+                <h3 data-i18n="realAccount.noAccountTitle">未检测到有效账号</h3>
+                <button class="codex-modal-close" type="button" data-action="real-account-noacct-cancel"><i class="bi bi-x-lg"></i></button>
+              </div>
+              <p class="codex-modal-desc" data-i18n="realAccount.noAccountDesc">未检测到有效的真实 ChatGPT 账号。请登录一个有效账号(推荐:Codex 原生显示 Plugins,无额外启动延迟),或强制开启(CDP 注入伪造登录,每次启动有明显延迟)。</p>
+              <div class="codex-modal-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-noacct-cancel" data-i18n="common.cancel">取消</button>
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-noacct-force" data-i18n="realAccount.forceEnable">强制开启(高延迟)</button>
+                <button class="btn btn-sm btn-outline-primary" type="button" data-action="real-account-noacct-login" data-i18n="realAccount.login">登录真实账号</button>
+              </div>
+            </div>
+          </div>
           <div class="settings-row settings-row-stack">
             <strong data-i18n="settings.autoWakeCodexPet">自动唤醒 Codex 桌面宠物</strong>
             <div>

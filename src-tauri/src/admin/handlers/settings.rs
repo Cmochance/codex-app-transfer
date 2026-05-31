@@ -430,11 +430,13 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             // [MOC-100 P2-3] autoUnlockCodexPlugins 开关当场生效,无需重启 transfer:
             // 开→start daemon(幂等,已在跑则 no-op);关→stop daemon(gated,没跑则
             // no-op)。否则切到 false 后 daemon 还在跑、切回 true 又得重启才生效。
-            // [MOC-104] daemon 注入是显示 plugins 所必需。开关开 → 启;开关关 → 若活动
-            // 仍是真实 chatgpt 账号(注入无高延迟、且需要)则继续跑,否则停。
+            // [MOC-104 relay] 开关 = 强制 CDP daemon 档。真实 chatgpt 活动走 relay 原生
+            // 解锁、**不靠 daemon**(与 main.rs 自启决策一致:真实账号绝不启 daemon,免
+            // MOC-100 高延迟)→ 这里**不再**因 active_is_real_chatgpt_now 而 start。
+            // 开关开(强制档)→ 启 daemon;开关关 → 停(没跑则 no-op)。
             if let Some(enabled) = auto_unlock_changed {
                 let service = crate::admin::handlers::plugin_unlock::get_service().await;
-                if enabled || crate::codex_real_account::active_is_real_chatgpt_now() {
+                if enabled {
                     service.start();
                 } else {
                     service.stop().await;
