@@ -5,6 +5,7 @@
 
 mod admin;
 mod codex_plugin_unlocker;
+mod codex_real_account;
 mod codex_theme_injector;
 mod proxy_runner;
 mod telemetry_bridge;

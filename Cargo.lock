@@ -729,6 +729,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "toml_edit 0.22.27",

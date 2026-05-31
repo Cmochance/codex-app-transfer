@@ -24,6 +24,7 @@ pub mod memories_md;
 pub mod plugin_unlock;
 pub mod providers;
 pub mod proxy;
+pub mod real_account;
 pub mod settings;
 pub mod skills;
 pub mod skills_md;

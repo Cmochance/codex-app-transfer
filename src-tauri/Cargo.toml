@@ -92,6 +92,11 @@ windows = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+# 单测用临时目录(MOC-104 real-account 检测的备份扫描测试)。与 workspace 其它
+# crate 一致用 tempfile 3,自动清理,不手搓 temp_dir + 唯一名。
+tempfile = "3"
+
 [features]
 # 默认空,自定义 protocol 在打包时启用
 default = ["custom-protocol"]
