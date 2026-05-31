@@ -1456,11 +1456,29 @@
           .catch((e) => console.log("[RealAccount] auto-persist failed:", e))
           .finally(() => { realAccountAutoPersisting = false; });
       }
+      return login.state;
     } catch (e) {
       console.log("[RealAccount] status refresh failed:", e);
+      return undefined;
     }
   }
   let realAccountAutoPersisting = false;
+  // 轮询登录直到终态(succeeded/failed/cancelled)——固定几次 setTimeout 会在 OAuth
+  // 慢于最后一次时漏掉 succeeded → auto-persist 不触发(connector P2)。running 期间
+  // 持续轮询,终态或超 5min 停。
+  let realAccountLoginPollTimer = null;
+  function pollRealAccountLogin() {
+    if (realAccountLoginPollTimer) return; // 已在轮询
+    const started = Date.now();
+    const tick = async () => {
+      realAccountLoginPollTimer = null;
+      const state = await refreshRealAccountStatus();
+      if (state === "running" && Date.now() - started < 300000) {
+        realAccountLoginPollTimer = setTimeout(tick, 2500);
+      }
+    };
+    realAccountLoginPollTimer = setTimeout(tick, 1500);
+  }
 
   async function renderDashboard() {
     // **#249 fix**:getStatus / getActivities 分别 try-catch,任一失败
@@ -7898,9 +7916,8 @@
       try {
         await CCApi.realAccount.login();
         showToast(t("realAccount.loginStarted") || "已启动登录,请在浏览器完成授权");
-        // 登录是后台进行的,轮询几次刷新状态;成功后 refreshRealAccountStatus 会自动
-        // 把账号持久保留(见该函数内的 auto-persist)。
-        for (const delay of [1500, 4000, 8000, 15000, 30000]) setTimeout(refreshRealAccountStatus, delay);
+        // 轮询到终态;成功后 refreshRealAccountStatus 会自动把账号长期保留。
+        pollRealAccountLogin();
       } catch (e) { showToast(e.message); }
     });
     $("[data-action=real-account-import]")?.addEventListener("click", () => {
@@ -7928,11 +7945,18 @@
         setTimeout(refreshRealAccountStatus, 500);
       } catch (e) { showToast(e.message); }
     });
-    $("[data-action=real-account-force-enable]")?.addEventListener("click", async () => {
-      // 二次确认 + 高延迟警告(req#4):强制开启走 CDP 伪造路径,有 ~5.8s 启动延迟。
-      const warn = t("realAccount.forceEnableWarn")
-        || "强制开启会用 CDP 注入伪造登录态,Codex 每次启动会多 ~5.8s 加载延迟。建议改用「登录真实账号」避免该延迟。确定要强制开启吗?";
-      if (!window.confirm(warn)) return;
+    // 强制开启:二次确认走 app 自己的 modal(Tauri webview 的 window.confirm 不稳定)。
+    $("[data-action=real-account-force-enable]")?.addEventListener("click", () => {
+      const m = $("#realAccountForceEnableModal");
+      if (m) m.hidden = false;
+    });
+    $("[data-action=real-account-force-cancel]")?.addEventListener("click", () => {
+      const m = $("#realAccountForceEnableModal");
+      if (m) m.hidden = true;
+    });
+    $("[data-action=real-account-force-confirm]")?.addEventListener("click", async () => {
+      const m = $("#realAccountForceEnableModal");
+      if (m) m.hidden = true;
       try {
         await CCApi.pluginUnlock.start();
         const toggle = $("#autoUnlockCodexPlugins");
