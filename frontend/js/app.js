@@ -2322,6 +2322,10 @@
     $("#codexStatusSectionDefaultVisible").checked = settings.codexStatusSectionDefaultVisible !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
     renderModelMenuModeState(settings);
+    // 设置页的 Plugins 解锁运行时状态 + 真实账号区(MOC-104)随设置页一起刷新,
+    // 不依赖用户先访问 dashboard。
+    refreshPluginUnlockStatus();
+    refreshRealAccountStatus();
     await refreshAppVersion();
     await refreshBackupList();
     await refreshCodexSnapshotStatus();

@@ -1,6 +1,11 @@
 (function () {
   const dictionaries = {
     zh: {
+      "pluginUnlock.disconnected": "未运行",
+      "pluginUnlock.connecting": "连接中…",
+      "pluginUnlock.connected": "已连接,等待注入",
+      "pluginUnlock.injected": "已解锁",
+      "realAccount.sectionHint": "真实账号模式:用真实 ChatGPT 账号取代 CDP 伪造登录,避开 Codex 启动的额外延迟。登录后可「钉住」持久保留,活动 auth.json 被改也会在启动时自动恢复。",
       "realAccount.statusUnknown": "检测中…",
       "realAccount.login": "登录真实账号",
       "realAccount.refresh": "刷新 token",
@@ -667,6 +672,11 @@
       "confirm.openDocs": "即将在浏览器打开 {provider} 的官方文档页面。继续？",
     },
     en: {
+      "pluginUnlock.disconnected": "Not running",
+      "pluginUnlock.connecting": "Connecting…",
+      "pluginUnlock.connected": "Connected, awaiting injection",
+      "pluginUnlock.injected": "Unlocked",
+      "realAccount.sectionHint": "Real-account mode: use a real ChatGPT account instead of the CDP-spoofed login to avoid Codex's extra startup latency. After logging in you can \"pin\" it to persist; if the active auth.json is overwritten it's auto-restored on startup.",
       "realAccount.statusUnknown": "Checking…",
       "realAccount.login": "Log in real account",
       "realAccount.refresh": "Refresh token",
