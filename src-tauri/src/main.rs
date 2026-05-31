@@ -241,6 +241,13 @@ fn main() {
                         tracing::warn!("[RealAccount] 启动调谐跳过:HTTP client 构建失败: {e}")
                     }
                 }
+                // [MOC-104] reconcile 已把活动账号 settle 完。若此刻活动是真实 chatgpt,
+                // 关掉可能被 daemon 自启快路径(1s sleep)在 reconcile-恢复镜像之前误起的
+                // 冗余 CDP daemon —— 闭合「强制开启 + 导入镜像」并发窗口。stop 幂等,没跑则
+                // no-op。真实账号原生显示 plugins,本就不该有 daemon。
+                if crate::codex_real_account::active_is_real_chatgpt_now() {
+                    handlers::plugin_unlock::get_service().await.stop().await;
+                }
             });
 
             // ── [MOC-104] 真实账号解锁一次性迁移 ──
