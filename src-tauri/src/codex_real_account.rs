@@ -663,6 +663,9 @@ pub async fn forget_imported() -> Result<bool, String> {
         return Ok(false);
     }
     std::fs::remove_file(&mirror).map_err(|e| format!("删持久镜像失败: {e}"))?;
+    // [connector review] 清除账号后不再有可重登的保留账号 → 清掉「需重新登录」标记,
+    // 否则 status 仍带 relogin_required=true,UI 继续提示「账号已失效」要重登。
+    set_relogin_required(false);
     Ok(true)
 }
 

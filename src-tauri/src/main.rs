@@ -243,29 +243,30 @@ fn main() {
                 }
                 // [MOC-104] reconcile 已把活动账号 settle 完。若此刻活动是真实 chatgpt,
                 // 关掉可能被 daemon 自启快路径(1s sleep)在 reconcile-恢复镜像之前误起的
-                // 冗余 CDP daemon —— 闭合「强制开启 + 导入镜像」并发窗口。stop 幂等,没跑则
-                // no-op。真实账号原生显示 plugins,本就不该有 daemon。
+                // reconcile settle 后:真实账号活动 → 确保 daemon 在跑(注入仍是显示
+                // plugins 所必需;但 auth.json 已是 chatgpt,注入不造成不匹配 → 无高延迟)。
                 if crate::codex_real_account::active_is_real_chatgpt_now() {
-                    handlers::plugin_unlock::get_service().await.stop().await;
+                    handlers::plugin_unlock::get_service().await.start();
                 }
             });
 
             // ── [MOC-104] 真实账号解锁一次性迁移 ──
             // 老版本 autoUnlockCodexPlugins 默认 true 会直接拉起 CDP 伪造注入 daemon;真实
-            // 账号模式上线后,高延迟 CDP 路径改为「显式强制开启」才走。同步执行(在 daemon
-            // 决策 + 任何 Codex 启动前),硬重置升级用户残留的旧 true。幂等。
+            // 账号模式上线后,**无真实账号时**的高延迟 CDP 路径改为「显式强制开启」才走。
+            // 同步执行(在 daemon 决策 + 任何 Codex 启动前),硬重置升级用户残留的旧 true。幂等。
             if handlers::settings::migrate_real_account_unlock_v1() {
                 tracing::info!(
-                    "[RealAccount] 一次性迁移:硬重置 autoUnlockCodexPlugins=false(高延迟 CDP 改为显式强制开启)"
+                    "[RealAccount] 一次性迁移:硬重置 autoUnlockCodexPlugins=false(无真实账号时的高延迟 CDP 改为显式强制开启)"
                 );
             }
 
-            // ── Plugin Unlock 守护进程自动启动(解耦后)──
-            // [MOC-104 解耦,借鉴 CodexPlusPlus relay 模式] CDP 伪造注入 daemon 只在
-            // ① 活动 auth.json **不是**真实 chatgpt(否则 Codex 原生显示 plugins,注入多余且
-            //    会造成不匹配 → 启动高延迟)且
-            // ② 用户**显式强制开启**(autoUnlockCodexPlugins=true,迁移后只由强制开启置位)
-            // 时才启。两者任一不满足都不启,消除「无真实账号却默默走高延迟」。
+            // ── Plugin Unlock 守护进程自动启动 ──
+            // daemon 注入(setAuthMethod('chatgpt'))是 Codex 显示 plugins 入口所**必需**的;
+            // 真机验证:仅有 chatgpt auth.json 但不注入,plugins 入口不出现。延迟问题只来自
+            // 「伪造 chatgpt 与磁盘 apikey 不匹配 → Codex 重新初始化」。因此:
+            // ① 活动是真实 chatgpt → 跑 daemon(注入与磁盘一致、无不匹配 → 无高延迟);
+            // ② 活动是 apikey + 用户显式强制开启 → 跑(伪造 → 有高延迟,用户已接受);
+            // ③ 活动是 apikey + 未强制开启 → 不跑(消除「默默高延迟」,用户原始诉求)。
             // 复用 handlers::plugin_unlock 的 OnceCell 单例(否则跟前端手动 start 各跑一份)。
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -282,11 +283,10 @@ fn main() {
                 let real_active = crate::codex_real_account::active_is_real_chatgpt_now();
 
                 if real_active {
-                    tracing::info!(
-                        "[PluginUnlock] 活动是真实 chatgpt 账号,Codex 原生显示 plugins,不启 CDP daemon"
-                    );
+                    tracing::info!("[PluginUnlock] 真实 chatgpt 账号活动,启动 daemon(注入与磁盘一致,无高延迟)");
+                    handlers::plugin_unlock::get_service().await.start();
                 } else if force_cdp {
-                    tracing::info!("[PluginUnlock] 用户强制开启(高延迟 CDP),启动 daemon");
+                    tracing::info!("[PluginUnlock] 无真实账号 + 用户强制开启(高延迟 CDP),启动 daemon");
                     handlers::plugin_unlock::get_service().await.start();
                 } else {
                     tracing::info!(
