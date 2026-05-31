@@ -269,21 +269,34 @@ fn apply_refresh_response(
     Ok(())
 }
 
+/// [MOC-104 review I-3] 串行化对活动/备份 auth.json 的 read-modify-write
+/// (refresh / activate / 启动刷新共用),避免并发写互相覆盖(lost-update)。
+/// 锁内只做同步文件读写,绝不跨 `.await`。
+static AUTH_WRITE_LOCK: Mutex<()> = Mutex::new(());
+fn auth_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    AUTH_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 启动时刷新真实 chatgpt 账号的 token(若将过期)。定位官方/备份里那份真实
 /// chatgpt `auth.json` → 检查 access_token 是否将过期 → 走 refresh_token 流 →
 /// 原子写回(`write_auth`,0o600,非 token 字段透传)。
 ///
 /// 非破坏:只更新 token 字段;无真实账号 / token 仍有效时不写盘。任何步骤失败
 /// 都返回 `Err`(由 caller 决定吞掉还是上报),不会留下半写状态(`write_auth` 原子)。
+/// [I-3] 网络往返在锁外完成;锁内 **重读** 文件 + 校验 refresh_token 未被其它写者
+/// 改动(切账号 / 并发刷新)后才 apply+write,避免把旧账号的新 token 误写。
 pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcome, String> {
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let Some(located) = locate_chatgpt_auth(&paths) else {
         return Ok(RefreshOutcome::NoAccount);
     };
     let source = located.source;
-    let mut auth = located.value;
+    let target = located.path;
 
-    let refresh_token = auth
+    let refresh_token = located
+        .value
         .get("tokens")
         .and_then(|t| t.get("refresh_token"))
         .and_then(Value::as_str)
@@ -292,7 +305,8 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
     if refresh_token.is_empty() {
         return Err("auth.json 缺 refresh_token,无法刷新".to_owned());
     }
-    let access_token = auth
+    let access_token = located
+        .value
         .get("tokens")
         .and_then(|t| t.get("access_token"))
         .and_then(Value::as_str)
@@ -302,6 +316,7 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
         return Ok(RefreshOutcome::StillValid { source });
     }
 
+    // 网络往返(锁外)。
     let resp = client
         .post(format!("{OPENAI_ISSUER}/oauth/token"))
         .form(&[
@@ -321,10 +336,23 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
         .json()
         .await
         .map_err(|e| format!("解析 OAuth refresh 响应失败: {e}"))?;
-
     let now_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    apply_refresh_response(&mut auth, &parsed, &now_iso)?;
-    write_auth(&located.path, &auth).map_err(|e| format!("写回 auth.json 失败: {e}"))?;
+
+    // 写回临界区(锁内,纯同步,无 await):重读最新文件,校验仍是我们刚刷新的
+    // 那份账号(refresh_token 未变),再 apply+write,避免 lost-update / 误写。
+    let _guard = auth_write_lock();
+    let mut fresh = read_auth(&target).map_err(|e| format!("重读 auth.json 失败: {e}"))?;
+    let cur_rt = fresh
+        .get("tokens")
+        .and_then(|t| t.get("refresh_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if cur_rt != refresh_token {
+        // 网络往返期间文件被其它写者改了(切账号 / 已并发刷新)→ 放弃写。
+        return Ok(RefreshOutcome::StillValid { source });
+    }
+    apply_refresh_response(&mut fresh, &parsed, &now_iso)?;
+    write_auth(&target, &fresh).map_err(|e| format!("写回 auth.json 失败: {e}"))?;
     Ok(RefreshOutcome::Refreshed { source })
 }
 
@@ -404,22 +432,34 @@ static LOGIN: Mutex<LoginShared> = Mutex::new(LoginShared {
     last: LoginState::Idle,
 });
 
-/// 覆盖当前 `~/.codex/auth.json` 前先整文件备份到 app_home,被覆盖后用户仍可
-/// 恢复 —— 非破坏(`feedback_no_silent_destructive_fallback`)。`suffix` 区分场景
-/// (prelogin / preactivate)。best-effort:备份失败只 warn,不挡主流程。
-fn backup_active_auth(paths: &CodexPaths, suffix: &str) {
+/// [MOC-104 review N-1] 取 LOGIN 锁,锁中毒时恢复内部值 —— 不 panic、也不把异常
+/// 静默退化成 Idle/false(那会让前端以为"没在登录"、按钮点了没反应)。
+fn login_lock() -> std::sync::MutexGuard<'static, LoginShared> {
+    LOGIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 覆盖当前 `~/.codex/auth.json` 前先整文件备份到 app_home,被覆盖后用户仍可恢复。
+///
+/// [MOC-104 review B-1] **硬前置,非 best-effort**:备份失败返回 `Err`,调用方据此
+/// 中止覆盖,绝不"备份没成功还照样覆盖活动文件"(那是 `feedback_no_silent_
+/// destructive_fallback` 禁止的破坏性降级)。活动文件不存在 = 无需备份,返 Ok。
+/// [review I-2] 文件名带 unix 时间戳,连续多次操作不互相覆盖备份(防丢失放大)。
+fn backup_active_auth(paths: &CodexPaths, suffix: &str) -> Result<(), String> {
     if !paths.auth_json.is_file() {
-        return;
+        return Ok(());
     }
     let backup_dir = paths.app_home.join("real-account");
-    if let Err(e) = std::fs::create_dir_all(&backup_dir) {
-        tracing::warn!("[RealAccount] 备份目录创建失败: {e}");
-        return;
-    }
-    let backup = backup_dir.join(format!("auth-{suffix}-backup.json"));
-    if let Err(e) = std::fs::copy(&paths.auth_json, &backup) {
-        tracing::warn!("[RealAccount] 备份 auth.json({suffix})失败: {e}");
-    }
+    std::fs::create_dir_all(&backup_dir).map_err(|e| format!("备份目录创建失败: {e}"))?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = backup_dir.join(format!("auth-{suffix}-{ts}.json"));
+    std::fs::copy(&paths.auth_json, &backup)
+        .map_err(|e| format!("备份活动 auth.json 失败: {e}"))?;
+    Ok(())
 }
 
 /// [MOC-104 req#5 时序] 把 transfer 备份里检测到的真实 chatgpt 账号**恢复到活动**
@@ -436,12 +476,15 @@ pub fn activate_backup_to_active() -> Result<AuthSource, String> {
 
 /// [`activate_backup_to_active`] 的可注入路径内层,便于单测。
 fn activate_with_paths(paths: &CodexPaths) -> Result<AuthSource, String> {
+    // [I-3] 与 refresh / 启动刷新串行化,避免并发写活动 auth.json lost-update。
+    let _guard = auth_write_lock();
     let located = locate_chatgpt_auth(paths).ok_or("未检测到可恢复的真实 chatgpt 账号")?;
     match located.source {
         // 活动文件已经是真实 chatgpt,无需恢复。
         AuthSource::Official => Ok(AuthSource::Official),
         AuthSource::Backup => {
-            backup_active_auth(paths, "preactivate");
+            // [B-1] 备份失败即中止,绝不在没备份成功的情况下覆盖活动 auth.json。
+            backup_active_auth(paths, "preactivate")?;
             write_auth(&paths.auth_json, &located.value)
                 .map_err(|e| format!("恢复真实账号到活动 auth.json 失败: {e}"))?;
             Ok(AuthSource::Backup)
@@ -452,18 +495,21 @@ fn activate_with_paths(paths: &CodexPaths) -> Result<AuthSource, String> {
 
 /// 启动 `codex login`(非阻塞)。已在进行中则返回 Err。
 pub fn start_login() -> Result<(), String> {
-    let mut g = LOGIN.lock().map_err(|_| "登录状态锁中毒".to_owned())?;
+    let mut g = login_lock();
     if g.running {
         return Err("登录已在进行中".to_owned());
     }
     let codex = resolve_codex_cli().ok_or("未找到 codex CLI;请确认已安装 Codex Desktop")?;
-    if let Ok(paths) = CodexPaths::from_home_env() {
-        backup_active_auth(&paths, "prelogin");
-    }
+    // [I-1/B-1] codex login 会整文件重写 ~/.codex/auth.json;覆盖前先备份当前活动
+    // 文件,备份失败即中止登录(非破坏)—— 不能让"换账号"丢掉原账号且无备份。
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    backup_active_auth(&paths, "prelogin")?;
     // 不覆盖 CODEX_HOME → codex login 写真实 `~/.codex/auth.json`,登录后即生效。
+    // [N-2] stdout 丢弃(只靠 stderr 做失败摘要),避免用户长时间不完成 OAuth 时
+    // codex login 往 stdout 刷日志写满 pipe 缓冲反卡住自己。
     let child = Command::new(&codex)
         .arg("login")
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("启动 codex login 失败: {e}"))?;
@@ -476,10 +522,7 @@ pub fn start_login() -> Result<(), String> {
     // 后台线程 reap:wait_with_output 阻塞到 codex login 完成/被杀,记录结果。
     std::thread::spawn(move || {
         let result = child.wait_with_output();
-        let mut g = match LOGIN.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let mut g = login_lock();
         g.running = false;
         g.pid = None;
         g.last = match result {
@@ -503,32 +546,40 @@ pub fn start_login() -> Result<(), String> {
 }
 
 /// 取消进行中的登录(杀 `codex login` 进程)。返回是否有进行中的登录被取消。
+///
+/// [I-5 已知窗口] 用裸 pid kill;若进程刚自然退出、reap 线程还没清 `pid` 时取消,
+/// 理论上可能 kill 到一个已回收/被复用的 pid。窗口是微秒级(reap 返回到拿锁清
+/// pid 之间),概率极低;cancel_requested 标记保证即便误杀也只是把本次标记为
+/// Cancelled。彻底免疫需持有 Child 句柄,当前架构 Child 在 reap 线程,留待后续。
 pub fn cancel_login() -> bool {
-    let mut g = match LOGIN.lock() {
-        Ok(g) => g,
-        Err(_) => return false,
+    // [I-4] 锁内只读 pid + 置标记,kill 移到锁外执行 —— taskkill 可能阻塞数百 ms,
+    // 不能卡住 status 轮询 / reap 线程拿同一把锁。
+    let pid = {
+        let mut g = login_lock();
+        if !g.running {
+            return false;
+        }
+        g.cancel_requested = true;
+        g.pid
     };
-    if !g.running {
-        return false;
-    }
-    g.cancel_requested = true;
-    if let Some(pid) = g.pid {
+    if let Some(pid) = pid {
         #[cfg(unix)]
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let kill = Command::new("kill").arg(pid.to_string()).status();
         #[cfg(windows)]
-        let _ = Command::new("taskkill")
+        let kill = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status();
+        // [I-4] kill 失败不再静默吞 —— 留痕便于排查"点了取消但登录还在跑"。
+        if let Err(e) = kill {
+            tracing::warn!("[RealAccount] 取消登录 kill pid={pid} 失败: {e}");
+        }
     }
     true
 }
 
-/// 当前登录流程状态(前端轮询)。
+/// 当前登录流程状态(前端轮询)。锁中毒时恢复内部值,不静默退化成 Idle(N-1)。
 pub fn login_status() -> LoginState {
-    LOGIN
-        .lock()
-        .map(|g| g.last.clone())
-        .unwrap_or(LoginState::Idle)
+    login_lock().last.clone()
 }
 
 #[cfg(test)]
@@ -722,12 +773,18 @@ mod tests {
         let active = read_auth(&paths.auth_json).unwrap();
         assert_eq!(active["auth_mode"], "chatgpt");
         assert_eq!(active["tokens"]["account_id"], "acct_123");
-        // 覆盖前备份了原 apikey 活动文件(时序安全)
-        let prebackup = paths
-            .app_home
-            .join("real-account")
-            .join("auth-preactivate-backup.json");
-        assert!(prebackup.is_file(), "覆盖前应备份原活动 auth.json");
+        // 覆盖前备份了原 apikey 活动文件(时序安全);文件名带时间戳(review I-2)
+        let backup_dir = paths.app_home.join("real-account");
+        let prebackup = std::fs::read_dir(&backup_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("auth-preactivate-"))
+            })
+            .expect("覆盖前应备份原活动 auth.json");
         let backed = read_auth(&prebackup).unwrap();
         assert_eq!(backed["auth_mode"], "apikey", "备份的是覆盖前的 apikey 态");
     }
