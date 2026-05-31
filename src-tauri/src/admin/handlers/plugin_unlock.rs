@@ -62,17 +62,9 @@ pub async fn status_handler() -> impl IntoResponse {
 pub async fn start_handler() -> impl IntoResponse {
     let service = get_service().await;
 
-    // 检查是否已经在运行（通过状态判断）
-    match service.status().await {
-        UnlockStatus::Injected | UnlockStatus::Connected | UnlockStatus::Connecting => {
-            return Json(json!({
-                "success": true,
-                "message": "解锁服务已在运行"
-            }));
-        }
-        _ => {}
-    }
-
+    // [MOC-100 P2-2] start() 现已基于 running flag 幂等,重复调用安全 —— 包括
+    // 退避中 status=Disconnected 但 daemon task 仍在跑的情况(旧的按 status 去重
+    // 会漏掉它再 spawn 一个 task 抢同一 receiver)。无需再按 status 手动去重。
     service.start();
 
     Json(json!({

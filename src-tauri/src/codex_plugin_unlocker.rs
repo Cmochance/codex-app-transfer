@@ -15,7 +15,7 @@
 //! - 监听 `Page.loadEventFired`,刷新后自动重新注入
 //! - 断开时指数退避重连
 
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -140,6 +140,10 @@ pub struct PluginUnlockService {
     cmd_rx: Arc<Mutex<mpsc::Receiver<ServiceCommand>>>,
     /// CDP 消息 ID 单调递增计数器(无锁,daemon + tests 共享)
     msg_id: Arc<AtomicU64>,
+    /// [MOC-100 P2] daemon 是否真的在跑。`start` 用它幂等(退避中 status 报
+    /// Disconnected 但 task 仍在跑,不能按连接状态判断);`reinject`/`stop` 用它
+    /// 避免在没 daemon 时往 bounded channel 灌命令(8 次后 await 会 hang)。
+    running: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -158,6 +162,7 @@ impl PluginUnlockService {
             cmd_tx,
             cmd_rx: Arc::new(Mutex::new(cmd_rx)),
             msg_id: Arc::new(AtomicU64::new(0)),
+            running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -172,26 +177,53 @@ impl PluginUnlockService {
         self.status.read().await.clone()
     }
 
-    /// 启动守护循环（非阻塞）
+    /// 启动守护循环（非阻塞、幂等）
     pub fn start(&self) {
+        // [MOC-100 P2-2] 基于真实 running flag 幂等,而非连接状态:退避中 daemon 报
+        // Disconnected 但 task 仍在跑,旧的按 status 去重会再 spawn 一个 task 跟它
+        // 抢同一 receiver,且 stop 只投一条命令杀不全。compare_exchange 保证只有一个。
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return; // 已在运行
+        }
         let config = self.config.clone();
         let status = self.status.clone();
         let cmd_rx = self.cmd_rx.clone();
         let msg_id = self.msg_id.clone();
+        let running = self.running.clone();
 
         tokio::spawn(async move {
             run_daemon(config, status, cmd_rx, msg_id).await;
+            running.store(false, Ordering::SeqCst);
         });
     }
 
     /// 停止守护循环
     pub async fn stop(&self) {
-        let _ = self.cmd_tx.send(ServiceCommand::Stop).await;
+        // [MOC-100 P2-1] 没在跑就不发(否则 Stop 会缓存到 channel,下次 start 的
+        // daemon 一启动就被这条 stale Stop 杀掉)。在跑时用 try_send 非阻塞。
+        if !self.running.load(Ordering::SeqCst) {
+            return;
+        }
+        // stop 是用户显式动作且无补偿重投(不像 reinject 有 loadEventFired 兜底),
+        // channel 满导致丢弃必须留痕,否则 daemon 停不下来时无从排查。
+        if let Err(e) = self.cmd_tx.try_send(ServiceCommand::Stop) {
+            tracing::warn!("[PluginUnlock] failed to send Stop (daemon may keep running): {e}");
+        }
     }
 
     /// 前端手动触发重新注入
     pub async fn reinject(&self) {
-        let _ = self.cmd_tx.send(ServiceCommand::Reinject).await;
+        // [MOC-100 P2-1] daemon 没在跑就不发(否则灌满 bounded channel,8 次后
+        // send().await 会 hang,卡住 restart_codex_app 等调用方)。在跑也用 try_send
+        // 非阻塞,channel 满则丢弃(loadEventFired / 退避会补做注入)。
+        if !self.running.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.cmd_tx.try_send(ServiceCommand::Reinject);
     }
 }
 
@@ -262,7 +294,16 @@ async fn run_daemon(
                         set_status(&status, UnlockStatus::Connecting).await;
                         tracing::info!("[PluginUnlock] connecting to CDP: {}", ws_url);
                         match connect_and_monitor(&ws_url, &cmd_rx, &msg_id, &status).await {
-                            Ok(()) => {
+                            Ok(LoopControl::Stop) => {
+                                // [MOC-100 P2-1] 已连 WS 态收到 Stop:退出整个守护循环
+                                // (而非重连)。run_daemon 返回后 spawn task 会清 running=false。
+                                tracing::info!(
+                                    "[PluginUnlock] daemon stopped by command (while connected)"
+                                );
+                                set_status(&status, UnlockStatus::Disconnected).await;
+                                return;
+                            }
+                            Ok(LoopControl::Reconnect) => {
                                 tracing::info!("[PluginUnlock] connection ended gracefully");
                                 reconnect_delay = config.reconnect_base_ms;
                             }
@@ -348,13 +389,26 @@ async fn detect_cdp(url: &str) -> Option<Vec<CdpPage>> {
     }
 }
 
+/// `connect_and_monitor` 正常返回(非错误)时告诉 `run_daemon` 下一步怎么走。
+///
+/// [MOC-100 P2-1] 关键:Stop 命令必须能区别于"WS 优雅断开"。早期实现两者都
+/// `Ok(())`,`run_daemon` 一律当断开重连 → 收到 Stop 后 close WS、却立刻又
+/// detect_cdp 重连,daemon 永不退出(`running` 卡 true,关 auto-unlock 实测失效)。
+#[derive(Debug, PartialEq, Eq)]
+enum LoopControl {
+    /// 连接结束(WS 关闭 / 端口变更 / 通道关闭),run_daemon 应重新 detect + 重连。
+    Reconnect,
+    /// 收到 Stop 命令,run_daemon 应退出整个守护循环。
+    Stop,
+}
+
 /// WebSocket 连接、注入、并持续监控页面刷新
 async fn connect_and_monitor(
     ws_url: &str,
     cmd_rx: &Arc<Mutex<mpsc::Receiver<ServiceCommand>>>,
     msg_id_counter: &AtomicU64,
     status: &Arc<RwLock<UnlockStatus>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<LoopControl, Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _) = connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
@@ -449,15 +503,17 @@ async fn connect_and_monitor(
                                 new_port = cur_port,
                                 "[PluginUnlock] reinject: CDP port changed (Codex restarted), dropping stale WS to reconnect to new instance"
                             );
-                            return Ok(());
+                            return Ok(LoopControl::Reconnect);
                         }
                         tracing::info!("[PluginUnlock] manual reinject requested (same instance)");
                         inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
                     }
                     Some(ServiceCommand::Stop) => {
+                        // [MOC-100 P2-1] 关键:返回 Stop 而非 Ok(()),否则 run_daemon
+                        // 当优雅断开立刻重连,daemon 停不掉(详见 LoopControl 注释)。
                         tracing::info!("[PluginUnlock] stop requested, closing connection");
                         let _ = write.close().await;
-                        return Ok(());
+                        return Ok(LoopControl::Stop);
                     }
                     None => break,
                 }
@@ -493,7 +549,8 @@ async fn connect_and_monitor(
         }
     }
 
-    Ok(())
+    // loop 经 break 退出(WS Close / Err / 通道关闭)= 连接结束,需重连。
+    Ok(LoopControl::Reconnect)
 }
 
 /// 发送注入脚本

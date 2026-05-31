@@ -386,6 +386,13 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .and_then(|s| s.get("mcpCredentialsPortableStore"))
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        // [MOC-100 P2-3] 同理记下 autoUnlockCodexPlugins 旧值,真变了才在写后
+        // 同步 start/stop daemon(默认 true,跟 main.rs 启动 gating 对齐)。
+        let old_auto_unlock = cfg
+            .get("settings")
+            .and_then(|s| s.get("autoUnlockCodexPlugins"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let s = ensure_settings_object(cfg);
         if let Some(obj) = input.as_object() {
             for (k, v) in obj {
@@ -398,10 +405,19 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let portable_changed = (new_portable != old_portable).then_some(new_portable);
-        Ok(ConfigMutation::Modified((settings, portable_changed)))
+        let new_auto_unlock = settings
+            .get("autoUnlockCodexPlugins")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let auto_unlock_changed = (new_auto_unlock != old_auto_unlock).then_some(new_auto_unlock);
+        Ok(ConfigMutation::Modified((
+            settings,
+            portable_changed,
+            auto_unlock_changed,
+        )))
     });
     match result {
-        Ok((settings, portable_changed)) => {
+        Ok((settings, portable_changed, auto_unlock_changed)) => {
             // #262:settings.language 改动后 hot reload 到 adapters 全局,
             // 让接下来的 prompt 注入跟新语言一致(用户切语言无需重启 transfer)。
             sync_user_language_from_settings(&settings);
@@ -410,6 +426,17 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             if let Some(enabled) = portable_changed {
                 let _ =
                     crate::admin::handlers::desktop::mcp_credentials_on_setting_changed(enabled);
+            }
+            // [MOC-100 P2-3] autoUnlockCodexPlugins 开关当场生效,无需重启 transfer:
+            // 开→start daemon(幂等,已在跑则 no-op);关→stop daemon(gated,没跑则
+            // no-op)。否则切到 false 后 daemon 还在跑、切回 true 又得重启才生效。
+            if let Some(enabled) = auto_unlock_changed {
+                let service = crate::admin::handlers::plugin_unlock::get_service().await;
+                if enabled {
+                    service.start();
+                } else {
+                    service.stop().await;
+                }
             }
             Json(json!({"success": true, "settings": settings})).into_response()
         }
