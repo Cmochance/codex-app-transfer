@@ -60,11 +60,24 @@ pub async fn status_handler() -> impl IntoResponse {
 
 /// POST /api/desktop/plugin-unlock/start
 pub async fn start_handler() -> impl IntoResponse {
-    // 强制关闭(hotfix MOC-98):plugins 注入功能临时禁用,拒绝手动启动。
-    // 恢复时还原下方 get_service / status / start 逻辑。
+    let service = get_service().await;
+
+    // 检查是否已经在运行（通过状态判断）
+    match service.status().await {
+        UnlockStatus::Injected | UnlockStatus::Connected | UnlockStatus::Connecting => {
+            return Json(json!({
+                "success": true,
+                "message": "解锁服务已在运行"
+            }));
+        }
+        _ => {}
+    }
+
+    service.start();
+
     Json(json!({
-        "success": false,
-        "message": "Plugins 注入已临时禁用"
+        "success": true,
+        "message": "解锁服务已启动"
     }))
 }
 
@@ -81,10 +94,12 @@ pub async fn stop_handler() -> impl IntoResponse {
 
 /// POST /api/desktop/plugin-unlock/reinject
 pub async fn reinject_handler() -> impl IntoResponse {
-    // 强制关闭(hotfix MOC-98):plugins 注入功能临时禁用,拒绝重新注入。
+    let service = get_service().await;
+    service.reinject().await;
+
     Json(json!({
-        "success": false,
-        "message": "Plugins 注入已临时禁用"
+        "success": true,
+        "message": "已请求重新注入"
     }))
 }
 

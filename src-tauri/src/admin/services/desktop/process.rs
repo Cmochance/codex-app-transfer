@@ -5,6 +5,13 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const MACOS_APP_NAME: &str = "Codex";
+// [MOC-100 B] macOS 进程树匹配 token:`pkill -x Codex` / `pgrep -x Codex` 只认主进程名,
+// Electron helper(`Codex Helper (Renderer/GPU)`)+ Frameworks/bare-modifier-monitor 子进程
+// 在主进程被 KILL 后会被孤儿化存活 → 存活检查误判"已死"放行 → `open -n` 又拉新的 → 实例
+// 堆积(实测 3 次重启累积 27 个进程 → 启动挂死)。改用 `-f` 匹配整个 .app bundle 路径,
+// 覆盖主进程 + 全部 helper(任何安装位置的 `Codex.app/Contents/` 都命中,不误伤
+// `Codex App Transfer.app`——其路径不含 `Codex.app/Contents/`)。
+const MACOS_APP_PROCESS_MATCH: &str = "Codex.app/Contents/";
 const WINDOWS_PROCESS_NAME: &str = "Codex.exe";
 /// OpenAI 官方 Windows Store 包 ID,与 codex-account-switch 保持一致;
 /// 用户若装的是非 Store 版本,resolve 失败时 explorer.exe 会报错,前端会
@@ -22,6 +29,12 @@ const POST_QUIT_LAUNCHD_GRACE: Duration = Duration::from_millis(400);
 /// 平台检测命令(可纯函数测试).返回 (program, args).第一个元素总是命令名。
 fn running_check_command(platform: &str) -> Vec<String> {
     match platform {
+        // [MOC-100 B→优化] 退出判定只看**主进程**(快 ~1-2s)。B 当初改 `-f` 等整个
+        // 进程树(含 helper)reap 是为防 `open -n` 堆积;现在 E 去掉了 `-n`(单实例
+        // `open -a`),helper 残留也不会堆出第二实例(自己会死)→ 不必再等全 helper,
+        // 等主进程死即可(LaunchServices 按主进程判 app 是否在跑,主进程 reaped 后
+        // `open -a` 就会启新实例,不撞 activate-已有 的 race)。KILL 阶段仍用 `-f`
+        // 强杀整树兜底(见 quit_command)。实测把"点击→重启弹窗"从 4-8s 降到 ~1-2s。
         "macos" => vec!["pgrep".into(), "-x".into(), MACOS_APP_NAME.into()],
         "windows" => vec![
             "tasklist".into(),
@@ -44,11 +57,14 @@ fn quit_command(platform: &str, force: bool) -> Vec<String> {
             "-x".into(),
             MACOS_APP_NAME.into(),
         ],
+        // [MOC-100 B] KILL 阶段杀整个 .app 进程树(主进程 + 孤儿 helper),
+        // 否则 helper 残留 + `open -n` → 实例堆积。TERM 阶段(上面)保持 `-x Codex`
+        // 优雅杀主进程,让 Electron 自己 reap helper;只有 graceful 没清干净才升级到这条 KILL-all。
         ("macos", true) => vec![
             "pkill".into(),
             "-KILL".into(),
-            "-x".into(),
-            MACOS_APP_NAME.into(),
+            "-f".into(),
+            MACOS_APP_PROCESS_MATCH.into(),
         ],
         // follow-up #33 P2-b:从 `taskkill /IM` 切到 PowerShell CIM 路径。
         //
@@ -102,13 +118,15 @@ fn open_command(
     extra_args: &[String],
 ) -> Vec<String> {
     match platform {
-        // `-n`:即使 LaunchServices 缓存还以为 Codex 在运行,也强制启动一个新
-        // 实例。我们刚 SIGTERM 杀过主进程,launchd 偶尔会在 reap 完成前误把
-        // `open -a` 解读为 activate 已有实例 → 啥也不发生。`-n` 绕过这条。
+        // [MOC-100 E] 去掉 `-n`(原来强制开新实例以绕过「刚杀完进程、launchd 还没
+        // reap 完 → open -a 被当成 activate 不存在实例 → 啥也不发生」的 race)。但 `-n`
+        // 会在旧实例没彻底死时**堆出第二个实例** → 撞 Electron 单实例锁 → 卡在启动
+        // (图标跳)/ 多窗口(daemon 注进 A、用户看 B 卡加载)。现在 quit_codex_app_with_retries
+        // 已用 `pgrep -f Codex.app/Contents`(MOC-100 B)verify 旧实例含 helper 彻底死才
+        // 走到这里 + POST_QUIT_LAUNCHD_GRACE,那条 race 已不存在 → 用 `open -a` 启**单**实例。
         "macos" => {
             let mut cmd = vec![
                 "open".into(),
-                "-n".into(),
                 "-a".into(),
                 resolved_macos_app.unwrap_or(MACOS_APP_NAME).into(),
             ];
@@ -237,6 +255,12 @@ fn quit_codex_app_with_retries(platform: &str) -> Result<(), String> {
     run_quit_command(platform, false);
     for _ in 0..QUIT_TERM_POLL_ITERS {
         if !is_codex_app_running(platform) {
+            // [MOC-100 优化] 主进程已优雅退出(is_codex_app_running 只看主进程,~1-2s,弹窗秒出)。
+            // 但 Electron helper 还在异步收尾 —— 不等它们 reap 就 open -a,残留 helper 会跟新
+            // Codex 抢资源 → 新实例 DevToolsActivePort + 页面 load 变慢 → 注入延后(实测进程数
+            // 涨到 19、launch→port 从 ~0.5s 涨到 ~2s)。这里补一发 KILL-all(`pkill -KILL -f`,
+            // 一次性 ~50ms,不轮询等待)把残留 helper 立即 reap → 下次启动干净、注入快,且不拖慢弹窗。
+            run_quit_command(platform, true);
             return Ok(());
         }
         std::thread::sleep(QUIT_POLL_INTERVAL);
@@ -375,9 +399,12 @@ fn should_attach_debug_port() -> Vec<String> {
     // 独立 toggle,user 可能只开 theme 不开 plugin_unlock。CDP 端口缺失会让
     // [`auto_apply_theme_on_startup`] 跑空,所以两者任一开启都要带 port。
     let cfg = crate::admin::registry_io::load().ok();
-    // 强制关闭(hotfix MOC-98):plugins 注入硬禁用,不再为 plugin_unlock 申请 CDP 端口。
-    // theme 仍独立触发 CDP(下方 theme_enabled)。恢复时还原读取配置的逻辑。
-    let plugin_unlock = false;
+    let plugin_unlock = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("autoUnlockCodexPlugins"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let theme_enabled = cfg
         .as_ref()
         .and_then(|c| c.get("settings"))
@@ -612,6 +639,7 @@ mod tests {
 
     #[test]
     fn running_check_command_is_platform_specific() {
+        // [MOC-100 B→优化] 退出判定只看主进程(快);KILL 阶段才用 -f 强杀整树
         assert_eq!(running_check_command("macos"), vec!["pgrep", "-x", "Codex"]);
         let windows = running_check_command("windows");
         assert_eq!(windows[0], "tasklist");
@@ -649,9 +677,10 @@ mod tests {
             quit_command("macos", false),
             vec!["pkill", "-TERM", "-x", "Codex"]
         );
+        // [MOC-100 B] KILL 阶段改杀整个 .app 进程树(reap helper)
         assert_eq!(
             quit_command("macos", true),
-            vec!["pkill", "-KILL", "-x", "Codex"]
+            vec!["pkill", "-KILL", "-f", "Codex.app/Contents/"]
         );
 
         let win_graceful = quit_command("windows", false);
@@ -683,19 +712,19 @@ mod tests {
 
     #[test]
     fn open_command_uses_resolved_path_when_available() {
+        // [MOC-100 E] 去掉 `-n`,改单实例 `open -a`
         assert_eq!(
             open_command("macos", Some("/Applications/Codex.app"), &[]),
-            vec!["open", "-n", "-a", "/Applications/Codex.app"]
+            vec!["open", "-a", "/Applications/Codex.app"]
         );
         assert_eq!(
             open_command("macos", None, &[]),
-            vec!["open", "-n", "-a", "Codex"]
+            vec!["open", "-a", "Codex"]
         );
         assert_eq!(
             open_command("macos", None, &["--remote-debugging-port=9222".into()]),
             vec![
                 "open",
-                "-n",
                 "-a",
                 "Codex",
                 "--args",

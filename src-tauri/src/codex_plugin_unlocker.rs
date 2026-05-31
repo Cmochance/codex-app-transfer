@@ -40,6 +40,17 @@ pub fn current_cdp_url() -> String {
     )
 }
 
+/// 从 CDP WebSocket URL(`ws://127.0.0.1:<port>/devtools/page/<id>`)解析出端口。
+/// [MOC-100 D] 用于判断 reinject 时连的是否还是同一个 Codex 实例。解析失败返 0。
+fn parse_ws_port(ws_url: &str) -> u16 {
+    ws_url
+        .split("127.0.0.1:")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0)
+}
+
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -287,9 +298,33 @@ async fn run_daemon(
             }
         }
 
-        // 指数退避:1s → 2s → 4s → ... → 30s 封顶
-        sleep(Duration::from_millis(reconnect_delay)).await;
-        reconnect_delay = (reconnect_delay * 2).min(config.reconnect_max_ms);
+        // 指数退避:1s → 2s → 4s → ... → 30s 封顶。
+        // [MOC-100 首启延迟优化] 退避期间用 select! 同时监听 cmd_rx —— restart Codex
+        // 时 restart_codex_app 发的 reinject 立即打断退避 sleep(reset 回 base 让下一轮
+        // 立刻 detect_cdp),把首启延迟从最坏 30s(干等退避睡醒)降到 ~Codex 冷启动时间。
+        // Stop 同样即时退出。原实现只在 loop 顶部 try_recv,卡在这条 sleep 时命令排队等睡醒。
+        {
+            let mut rx = cmd_rx.lock().await;
+            tokio::select! {
+                _ = sleep(Duration::from_millis(reconnect_delay)) => {
+                    reconnect_delay = (reconnect_delay * 2).min(config.reconnect_max_ms);
+                }
+                cmd = rx.recv() => match cmd {
+                    Some(ServiceCommand::Reinject) => {
+                        tracing::info!(
+                            "[PluginUnlock] reinject during backoff, waking immediately (reset backoff)"
+                        );
+                        reconnect_delay = config.reconnect_base_ms;
+                    }
+                    Some(ServiceCommand::Stop) => {
+                        tracing::info!("[PluginUnlock] daemon stopped by command (during backoff)");
+                        set_status(&status, UnlockStatus::Disconnected).await;
+                        return;
+                    }
+                    None => return,
+                }
+            }
+        }
     }
 }
 
@@ -323,6 +358,12 @@ async fn connect_and_monitor(
     let (ws_stream, _) = connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
+    // [MOC-100 D] 记下本次连接的 CDP 端口。Codex 被重启时 should_attach_debug_port 会把
+    // CDP_PORT 先置 0(sentinel)再置新实例端口;收到 reinject 时若 CDP_PORT 已变 = 不是
+    // 同一个 Codex 了 → 断开旧 WS 让 run_daemon 重新 detect 连**新**实例,而不是往旧/死页
+    // reinject(否则 daemon 黏在旧 WS 上,新实例永远不被注入 → 卡加载 / 长时间不解锁)。
+    let connected_port = parse_ws_port(ws_url);
+
     // 1. 启用 Runtime domain
     let (runtime_enable, runtime_enable_id) =
         make_cdp_msg(msg_id_counter, "Runtime.enable", json!({}));
@@ -333,6 +374,9 @@ async fn connect_and_monitor(
     let (page_enable, page_enable_id) = make_cdp_msg(msg_id_counter, "Page.enable", json!({}));
     write.send(WsMessage::Text(page_enable)).await?;
     let _ = await_cdp_response(&mut read, page_enable_id, Duration::from_secs(5)).await;
+
+    // [MOC-100 线1 回退] Network.enable + 重型逐事件落盘已撤(观察者效应:每事件同步 flush
+    // 拖慢 daemon 排 CDP → 反压到 Codex → 启动/重载变慢甚至 stall)。5.8s 分析已完成,不再需要。
 
     // 3. 首次注入
     inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
@@ -396,7 +440,18 @@ async fn connect_and_monitor(
             } => {
                 match cmd {
                     Some(ServiceCommand::Reinject) => {
-                        tracing::info!("[PluginUnlock] manual reinject requested");
+                        // [MOC-100 D] reinject 到来时若 CDP 端口已变(Codex 被重启到新实例),
+                        // 断开旧 WS → run_daemon 重新 detect 连新实例,而非往旧/死页 reinject。
+                        let cur_port = CDP_PORT.load(Ordering::Relaxed);
+                        if cur_port != connected_port {
+                            tracing::info!(
+                                connected_port,
+                                new_port = cur_port,
+                                "[PluginUnlock] reinject: CDP port changed (Codex restarted), dropping stale WS to reconnect to new instance"
+                            );
+                            return Ok(());
+                        }
+                        tracing::info!("[PluginUnlock] manual reinject requested (same instance)");
                         inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
                     }
                     Some(ServiceCommand::Stop) => {
@@ -449,6 +504,20 @@ async fn inject_unlock_script(
     status: &Arc<RwLock<UnlockStatus>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     set_status(status, UnlockStatus::Connected).await;
+
+    // [MOC-100 C] 注入前等页面 load 完(readyState complete/interactive)。否则打到
+    // mid-navigation 的页(Codex 正在加载 / 正被退出),unlock 脚本的 Runtime.evaluate
+    // (awaitPromise:true)会因执行上下文被导航销毁而**永不 resolve** → 20s 硬超时卡死
+    // (R2 实测:重启叠加时 daemon 把注入打到正被退出的旧 Codex 页 → `timed out
+    // waiting for id`)。页面在 6s 窗口内始终未就绪 = 正在导航/销毁 → 跳过本次注入,
+    // 保持 Connected,靠 loadEventFired / 重连重试,不硬等。
+    if !wait_for_page_ready(write, read, msg_id_counter, Duration::from_secs(6)).await {
+        tracing::info!(
+            "[PluginUnlock] page not ready (loading/navigating), skip inject this round; \
+             will retry on Page.loadEventFired or reconnect"
+        );
+        return Ok(());
+    }
 
     // 注入脚本 — 解锁 Codex Desktop Plugins 选项卡。
     //
@@ -808,6 +877,53 @@ fn classify_inject_outcome(raw: Option<&serde_json::Value>) -> InjectOutcome {
         _ => InjectOutcome::Unknown {
             raw: value.to_string(),
         },
+    }
+}
+
+/// [MOC-100 C] 注入前轮询 `document.readyState`,等页面 load 完才放行注入。
+///
+/// 返回 `true` = 页面就绪(`complete` / `interactive`),可以注入;
+/// `false` = `timeout` 窗口内始终未就绪(`loading` / 每次 readyState 查询都失败/超时
+/// = 页面正在导航或执行上下文被销毁)→ 调用方应跳过本次注入,不要在这种页上跑重型
+/// unlock 脚本(awaitPromise 会永不 resolve → 20s 硬超时卡死)。
+///
+/// 每次 readyState 查询单独给 2s 短超时(单次也不卡死);整体 bounded 在 `timeout`。
+/// 复用 `await_cdp_response` 按 id 匹配,丢弃中途的 `loadEventFired` 等事件帧 —— 跟
+/// `inject_unlock_script` 里 evaluate 等响应同样的消费模式,不破坏"read 只在注入序列
+/// 内被顺序消费"的不变量。
+async fn wait_for_page_ready(
+    write: &mut (impl Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    read: &mut (impl Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    msg_id_counter: &AtomicU64,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (msg, id) = make_cdp_msg(
+            msg_id_counter,
+            "Runtime.evaluate",
+            json!({ "expression": "document.readyState", "returnByValue": true }),
+        );
+        if write.send(WsMessage::Text(msg)).await.is_err() {
+            return false;
+        }
+        if let Ok(resp) = await_cdp_response(read, id, Duration::from_secs(2)).await {
+            let state = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("result"))
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if state == "complete" || state == "interactive" {
+                return true;
+            }
+            // state == "loading"(或 evaluate 因导航返空)→ 继续等到 deadline
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(300)).await;
     }
 }
 

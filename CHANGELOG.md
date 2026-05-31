@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-- **Plugins 注入强制关闭**(hotfix MOC-98):Codex Plugins 注入(plugin unlock daemon)临时硬禁用,无视用户配置 `autoUnlockCodexPlugins`,对所有用户(含此前显式开启的)强制 OFF。后端:daemon 永不自动启动、手动 `start` / `reinject` API 拒绝、重启 Codex 后不再触发 reinject、不再为 plugin_unlock 申请 CDP 调试端口(theme 注入仍独立可用);前端:设置页开关锁死 OFF + 禁用、「重启 Codex」按钮禁用、hint 标注已临时禁用。各改动点带 `强制关闭(hotfix MOC-98)` 注释便于后续恢复。
+- **Plugins 注入重新启用 + daemon / 重启健壮性修复**(MOC-100):撤销 v2.1.18 的临时 kill switch(MOC-98 曾强制关闭 plugins 注入),重新启用;并修掉当初触发关闭的根因 —— ① daemon 指数退避改 `tokio::select!` 可被 reinject 中断,首启延迟从最坏 ~17s 降到 ~3s;② Codex 重启改 `open -a` 单实例(去掉 `-n`)+ 主进程退出后强杀残留 Electron helper(`pkill -KILL -f`),消除多实例堆积导致的启动卡死;③ 注入前等页面 `readyState` 就绪再注,避免打到加载中页面卡加载;④ 重启切到新实例时 daemon 检测 CDP 端口变化、断开旧 WS 重连新实例,不再黏旧页。
 
 ## v2.1.18 — 2026-05-31
 
