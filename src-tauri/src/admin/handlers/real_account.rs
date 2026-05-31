@@ -1,17 +1,26 @@
 //! `/api/desktop/real-account/*` — 真实 ChatGPT 账号 plugin 模式 HTTP API(MOC-104)。
 //!
-//! 前端用这组 API 判断本机是否已有可用的真实 chatgpt 登录态,决定是否提示登录
-//! /可直接走真实账号模式。本增量只暴露**只读检测**;登录(spawn `codex login`)、
-//! token 刷新、强制启用等写操作在后续增量加。
+//! 前端用这组 API 判断本机是否已有可用的真实 chatgpt 登录态、并按需刷新其 token。
+//! 本增量暴露:
+//! - GET  /api/desktop/real-account/status   → 只读检测真实 chatgpt 账号状态
+//! - POST /api/desktop/real-account/refresh  → 刷新真实账号 token(将过期才刷)
 //!
-//! - GET /api/desktop/real-account/status → 检测真实 chatgpt 账号状态
+//! 登录(spawn `codex login`)、强制启用按钮等在后续增量加。
 
-use axum::{response::IntoResponse, routing::get, Json, Router};
+use std::time::Duration;
+
+use axum::{
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use serde_json::json;
 
 use crate::codex_real_account::{self, AuthSource};
 
 use super::super::state::AdminState;
+use super::common::err;
 
 /// GET /api/desktop/real-account/status
 pub async fn status_handler() -> impl IntoResponse {
@@ -28,7 +37,33 @@ pub async fn status_handler() -> impl IntoResponse {
     }))
 }
 
+/// POST /api/desktop/real-account/refresh
+///
+/// 刷新真实 chatgpt 账号(官方活动或 transfer 备份里那份)的 token —— access_token
+/// 将过期才真刷,否则报 still_valid。非破坏:只更新 token 字段 + last_refresh。
+pub async fn refresh_handler() -> impl IntoResponse {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("构建 HTTP client 失败: {e}"),
+            )
+            .into_response()
+        }
+    };
+    match codex_real_account::refresh_if_needed(&client).await {
+        Ok(outcome) => Json(json!({ "success": true, "outcome": outcome })).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 /// 组装路由 — 在 `admin/mod.rs` 调 `.merge(handlers::real_account::routes())` 挂载。
 pub fn routes() -> Router<AdminState> {
-    Router::new().route("/api/desktop/real-account/status", get(status_handler))
+    Router::new()
+        .route("/api/desktop/real-account/status", get(status_handler))
+        .route("/api/desktop/real-account/refresh", post(refresh_handler))
 }
