@@ -221,54 +221,117 @@ fn command_basename(command: &str) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(trimmed)
-        .trim_end_matches(".exe")
+        // **先小写再剥 `.exe`** —— 反过来会让 `BASH.EXE`(大写扩展名)漏判:
+        // trim_end_matches(".exe") 大小写敏感,不剥 `.EXE`,后续 lower 成 `bash.exe`
+        // 不在黑名单里 → 绕过(MOC-68 review 复盘)。
         .to_ascii_lowercase()
+        .trim_end_matches(".exe")
+        .to_string()
 }
 
-fn command_is_shell(command: &str) -> bool {
+fn is_shell_interpreter(basename: &str) -> bool {
     matches!(
-        command_basename(command).as_str(),
-        "sh"
-            | "bash"
+        basename,
+        "sh" | "bash"
             | "zsh"
             | "fish"
             | "dash"
             | "ksh"
+            | "ash"
+            | "csh"
+            | "tcsh"
             | "cmd"
-            | "cmd.exe"
             | "powershell"
-            | "powershell.exe"
             | "pwsh"
-            | "pwsh.exe"
+            | "nu"
+            | "xonsh"
+            | "busybox"
     )
 }
 
-fn cwd_is_sensitive(cwd: &str) -> bool {
-    let path = PathBuf::from(cwd.trim());
-    if !path.is_absolute() {
+/// command(或 env/wrapper 解包后的真实 command)是否是 shell 解释器。
+///
+/// **定位:防御纵深 guardrail,不是安全边界**。MCP spec 最终写入 `~/.codex/config.toml`
+/// 由 Codex CLI 直接 spawn `command + args`,"配置即可执行任意命令"本质成立 —— `node -e`
+/// / `python -c` 这类无法靠黑名单拦(拦了会误伤正常 MCP server,绝大多数 server 就是
+/// node/python/npx/uvx)。本检查只拦最直白的 `bash -c` 形态 + `env bash` 包装,降低被
+/// 诱导粘贴恶意 spec 的概率;真正的边界是"写配置需用户在 UI 显式确认"(见 Linear followup)。
+fn command_is_shell(command: &str, args: &[String]) -> bool {
+    let base = command_basename(command);
+    if is_shell_interpreter(&base) {
         return true;
     }
-    let normalized = cwd.replace('\\', "/").to_ascii_lowercase();
-    let sensitive_parts = [
+    // env / sudo / doas / wsl 等包装器:解包第一个非 `VAR=val`、非 flag 的实参作为真实
+    // command 再判一次(拦 `env bash -c …` / `/usr/bin/env sh`)。
+    if matches!(base.as_str(), "env" | "sudo" | "doas" | "wsl") {
+        if let Some(real) = args
+            .iter()
+            .find(|a| !a.starts_with('-') && !a.contains('='))
+        {
+            if is_shell_interpreter(&command_basename(real)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn cwd_is_sensitive(cwd: &str) -> bool {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    // 非绝对路径(相对 / `~` 未展开)一律拒。注意 Windows 盘符路径在非 Windows 上
+    // `is_absolute()` 为 false → 也走这里拒,语义安全。
+    if !PathBuf::from(trimmed).is_absolute() && !looks_like_windows_abs(trimmed) {
+        return true;
+    }
+    let lowered = trimmed.replace('\\', "/").to_ascii_lowercase();
+    // 去掉 Windows 盘符前缀 `c:`,统一成 `/...` 再做路径段匹配。
+    let after_drive = if lowered.len() >= 2
+        && lowered.as_bytes()[0].is_ascii_alphabetic()
+        && lowered.as_bytes()[1] == b':'
+    {
+        &lowered[2..]
+    } else {
+        lowered.as_str()
+    };
+    let after_drive = after_drive.trim_end_matches('/');
+    // 文件系统根 / 盘符根:敏感
+    if after_drive.is_empty() {
+        return true;
+    }
+    // 系统敏感根:cwd 落在这些目录**本身或其子目录**才算敏感。
+    // 用「路径段前缀」匹配(`/etc` 命中 `/etc`、`/etc/x`,但**不**误伤 `/home/x/etc-tool`)。
+    // **不含** `/users`、`/home`、`/appdata` —— 用户项目正常就在这些目录下,旧版用
+    // `contains` 子串匹配把 macOS 全部 `/Users/<name>/…` 误判为敏感、封死整个 cwd 字段
+    // (MOC-68 review 复盘)。
+    const SENSITIVE_ROOTS: &[&str] = &[
         "/windows",
         "/system32",
         "/program files",
         "/program files (x86)",
         "/programdata",
-        "/users",
-        "/appdata",
         "/etc",
+        "/private/etc",
         "/bin",
         "/sbin",
         "/usr/bin",
         "/usr/sbin",
-        "/private/etc",
+        "/boot",
+        "/sys",
+        "/proc",
     ];
-    let root_like = path.parent().is_none()
-        || normalized == "/"
-        || normalized.ends_with(":/")
-        || normalized.ends_with(':');
-    root_like || sensitive_parts.iter().any(|needle| normalized.contains(needle))
+    SENSITIVE_ROOTS
+        .iter()
+        .any(|root| after_drive == *root || after_drive.starts_with(&format!("{root}/")))
+}
+
+/// 在非 Windows 平台上识别 `C:\…` / `C:/…` 形式的 Windows 绝对路径
+/// (`PathBuf::is_absolute()` 在 Unix 上对这类返回 false,但语义上是绝对路径)。
+fn looks_like_windows_abs(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
 /// 校验 spec — stdio 必须 command,http 必须 url。失败返带说明的 error。
@@ -292,12 +355,18 @@ pub fn validate_spec(spec: &McpServerSpec) -> Result<(), String> {
             if command.is_empty() {
                 return Err("stdio transport 必须填 command".into());
             }
-            if command_is_shell(command) {
+            let args = spec.args.as_deref().unwrap_or(&[]);
+            if command_is_shell(command, args) {
                 return Err(format!(
                     "stdio transport 拒绝直接使用 shell 解释器 command={command:?};请改用明确的 MCP 可执行文件"
                 ));
             }
-            if let Some(cwd) = spec.cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty()) {
+            if let Some(cwd) = spec
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|cwd| !cwd.is_empty())
+            {
                 if cwd_is_sensitive(cwd) {
                     return Err(format!(
                         "stdio transport cwd 不安全:{cwd};请选择具体项目目录或用户明确管理的数据目录"
@@ -597,13 +666,40 @@ mod tests {
 
     #[test]
     fn validate_spec_rejects_shell_commands() {
-        for command in ["sh", "bash", "cmd.exe", "powershell.exe", "pwsh"] {
+        // 含 BASH.EXE(大写扩展名绕过回归)、全路径 /bin/zsh
+        for command in [
+            "sh",
+            "bash",
+            "cmd.exe",
+            "powershell.exe",
+            "pwsh",
+            "BASH.EXE",
+            "/bin/zsh",
+            "busybox",
+        ] {
             let err = validate_spec(&stdio_spec(command)).unwrap_err();
             assert!(
                 err.contains("shell"),
                 "command {command} should be rejected with shell error, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn validate_spec_rejects_env_wrapped_shell() {
+        // `env [VAR=val] bash -c …` 包装绕过回归
+        let mut spec = stdio_spec("env");
+        spec.args = Some(vec![
+            "FOO=bar".to_owned(),
+            "bash".to_owned(),
+            "-c".to_owned(),
+            "echo hi".to_owned(),
+        ]);
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(
+            err.contains("shell"),
+            "env bash should be rejected, got: {err}"
+        );
     }
 
     #[test]
@@ -614,14 +710,27 @@ mod tests {
     }
 
     #[test]
+    fn validate_spec_allows_user_project_cwd() {
+        // 用户项目目录不应被误判为敏感(旧版 `/users` 子串匹配把这些全封死)
+        for cwd in [
+            "/Users/alice/projects/myapp",
+            "/home/bob/dev/mcp-server",
+            "/Users/eve/.codex/data",
+        ] {
+            let mut spec = stdio_spec("node");
+            spec.cwd = Some(cwd.to_owned());
+            validate_spec(&spec).unwrap_or_else(|e| panic!("cwd {cwd} 应放行,got: {e}"));
+        }
+    }
+
+    #[test]
     fn validate_spec_rejects_sensitive_cwd() {
-        let mut spec = stdio_spec("node");
-        spec.cwd = Some(if cfg!(windows) {
-            "C:\\Windows\\System32".to_owned()
-        } else {
-            "/etc".to_owned()
-        });
-        let err = validate_spec(&spec).unwrap_err();
-        assert!(err.contains("cwd 不安全"), "got: {err}");
+        // 系统敏感根(本身或子目录)在所有平台都拒
+        for cwd in ["/etc", "/etc/ssl", "/usr/bin", "C:\\Windows\\System32", "/"] {
+            let mut spec = stdio_spec("node");
+            spec.cwd = Some(cwd.to_owned());
+            let err = validate_spec(&spec).unwrap_err();
+            assert!(err.contains("cwd 不安全"), "cwd {cwd} 应拒绝,got: {err}");
+        }
     }
 }

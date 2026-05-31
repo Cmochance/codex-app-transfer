@@ -63,6 +63,24 @@ impl ProxyState {
                 // 反爬可能 ban "reqwest" 字串。改用中性的 Codex-App-Transfer/<v>
                 // 兜底,既不命中 codex 反爬规则,也不在 reqwest 黑名单。
                 .user_agent(DEFAULT_OUTBOUND_USER_AGENT)
+                // SSRF(AP-001):对每一跳重定向目标复检 host,拒绝跳向私有/内部地址。
+                // reqwest 默认跟随最多 10 跳,只校验初始 URL 会被 `302 → 169.254.169.254`
+                // 之类绕过整个 SSRF 防护(MOC-68 review 复盘)。这里限制跳数 + 逐跳复检。
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 5 {
+                        return attempt.error("too many redirects".to_string());
+                    }
+                    let host = attempt.url().host_str().unwrap_or("").to_string();
+                    match redirect_host_is_safe(&host) {
+                        Ok(()) => attempt.follow(),
+                        Err(reason) => {
+                            proxy_telemetry()
+                                .logs
+                                .add("WARN", format!("SSRF blocked redirect → {host}: {reason}"));
+                            attempt.error(reason)
+                        }
+                    }
+                }))
                 .build()
                 .expect("reqwest client"),
             resolver,
@@ -345,7 +363,7 @@ pub async fn forward_handler(
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
     let upstream_url = build_upstream_url(&resolved.upstream_base, &plan.upstream_path);
-    check_ssrf_safe(&upstream_url)?;
+    check_ssrf_safe(&upstream_url).await?;
     let telemetry = proxy_telemetry();
     telemetry
         .logs
@@ -698,66 +716,146 @@ fn build_upstream_url(upstream_base: &str, upstream_path: &str) -> String {
     }
 }
 
-/// SSRF 防护:检查 upstream URL host 不是私有/内部/环回地址。
-/// 防御场景:config.json 被篡改,provider.baseUrl 指向云 metadata(169.254.169.254)
-/// 或本地服务(127.0.0.1:6379 Redis 等),proxy 再代为转发请求。
-fn check_ssrf_safe(upstream_url: &str) -> Result<(), ForwardError> {
+/// SSRF 防护:转发前**只拦"云 metadata"端点**,放行 loopback / 私网 LAN。
+///
+/// **为什么不拦 loopback/私网**:本 app 是桌面多 provider 代理,用户合法会把
+/// provider.baseUrl 配成本地 LLM(Ollama `127.0.0.1:11434` / LM Studio)或本地桥
+/// (实测真机就有 `http://127.0.0.1:29090`)。一刀切拦 loopback/私网会直接打断这些
+/// 核心用例(MOC-68 review:strict 版会破坏用户现有配置 + 失败 9 个集成测试)。
+/// 因此只阻断 SSRF 真正的高价值目标 —— 云 metadata(窃取实例凭据),其余放行。
+///
+/// **阻断对象(见 `is_cloud_metadata_ip`)**:169.254.0.0/16 链路本地(含
+/// 169.254.169.254 AWS/GCP/Azure/Oracle metadata)、100.100.100.200(Alibaba)、
+/// fd00:ec2::254(AWS IPv6 IMDS)、`metadata.google.internal`,及其 IPv4-mapped 形式。
+///
+/// **覆盖路径**:① 字面 IP 直接判;② hostname 异步解析后看是否落 metadata(解析失败
+/// 则放行 —— 只防 metadata,不可解析的 host 反正连不上);③ 重定向跟随由 client 的
+/// 自定义 redirect policy 对每跳复检(见 `ProxyState::new`),拦 `302 → 169.254.169.254`。
+/// **残留 TOCTOU**:检查时解析的 IP 与 reqwest 建连时再次解析的 IP 不保证一致
+/// (DNS rebinding 窗口),根治需把 IP pin 给 reqwest —— 留 followup,故不宣称完全防住。
+async fn check_ssrf_safe(upstream_url: &str) -> Result<(), ForwardError> {
     let uri: http::Uri = upstream_url
         .parse()
         .map_err(|e| ForwardError::BadRequest(format!("invalid upstream URL: {e}")))?;
     let host = uri.host().unwrap_or("");
-    if host.is_empty() {
-        return Err(ForwardError::BadRequest("upstream URL has no host".into()));
-    }
-    // 直接 IP 检查
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_private_or_loopback_ip(ip) {
-            return Err(ForwardError::BadRequest(format!(
-                "upstream URL points to private/loopback IP: {host}"
-            )));
-        }
-        return Ok(());
-    }
-    // hostname 检查
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost"
-        || lower.ends_with(".localhost")
-        || lower == "metadata.google.internal"
-    {
-        return Err(ForwardError::BadRequest(format!(
-            "upstream URL points to internal hostname: {host}"
-        )));
-    }
-    // DNS rebinding 防御:解析 hostname,拒接任何解析到私有 IP 的 host
-    use std::net::ToSocketAddrs;
-    let addr_str = format!("{host}:443");
-    if let Ok(addrs) = addr_str.to_socket_addrs() {
-        for addr in addrs {
-            if is_private_or_loopback_ip(addr.ip()) {
-                return Err(ForwardError::BadRequest(format!(
-                    "upstream URL {host} resolves to private/loopback IP: {}",
-                    addr.ip()
-                )));
+    match host_static_ssrf_verdict(host)? {
+        SsrfHostVerdict::LiteralAllowed => Ok(()),
+        SsrfHostVerdict::NeedsDnsResolution => {
+            let port = uri.port_u16().unwrap_or(443);
+            // 异步解析:proxy runtime 仅 2 worker,热路径不能用同步 to_socket_addrs 阻塞。
+            // 只为捕捉"自定义域名 A 记录指向云 metadata"。解析失败 → 放行(只防 metadata)。
+            match tokio::net::lookup_host((host, port)).await {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        if is_cloud_metadata_ip(addr.ip()) {
+                            proxy_telemetry().logs.add(
+                                "WARN",
+                                format!("SSRF blocked: {host} → cloud metadata {}", addr.ip()),
+                            );
+                            return Err(ForwardError::BadRequest(format!(
+                                "upstream URL {host} resolves to cloud metadata IP: {}",
+                                addr.ip()
+                            )));
+                        }
+                    }
+                    Ok(())
+                }
+                Err(_) => Ok(()),
             }
         }
     }
-    Ok(())
 }
 
-fn is_private_or_loopback_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || (v4.octets()[0] == 100 && v4.octets()[1] >= 64 && v4.octets()[1] <= 127)
-                || (v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19))
+enum SsrfHostVerdict {
+    /// 字面 IP 且非 metadata(含 loopback/私网/公网):无需 DNS,直接放行。
+    LiteralAllowed,
+    /// 普通 hostname:需调用方做(异步或同步)DNS 解析后看是否落 metadata。
+    NeedsDnsResolution,
+}
+
+/// SSRF 无 DNS 前置判定:空 host / 字面 metadata IP / metadata hostname → 拒;
+/// 其余字面 IP(loopback/私网/公网)→ `LiteralAllowed`;hostname → `NeedsDnsResolution`。
+/// 被转发前异步检查与 redirect policy 同步检查共用。
+fn host_static_ssrf_verdict(host: &str) -> Result<SsrfHostVerdict, ForwardError> {
+    if host.is_empty() {
+        return Err(ForwardError::BadRequest("upstream URL has no host".into()));
+    }
+    // http::Uri / Url 对 IPv6 字面量保留 `[...]`,先剥方括号再 parse,
+    // 否则 `[::ffff:169.254.169.254]`(IPv4-mapped metadata)parse 失败会绕过字面校验。
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if is_cloud_metadata_ip(ip) {
+            return Err(ForwardError::BadRequest(format!(
+                "upstream URL points to cloud metadata IP: {host}"
+            )));
         }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified()
+        return Ok(SsrfHostVerdict::LiteralAllowed);
+    }
+    let mut lower = host.to_ascii_lowercase();
+    if lower.ends_with('.') {
+        // 去尾点:`metadata.google.internal.` 等价无尾点
+        lower.pop();
+    }
+    // metadata hostname 直接拒(它本就解析到 169.254.169.254,但显式拒错误信息更清晰)。
+    // 注意:**不**拦 `localhost` —— loopback 已整体放行(本地 LLM/桥合法)。
+    if lower == "metadata.google.internal" || lower == "metadata" {
+        return Err(ForwardError::BadRequest(format!(
+            "upstream URL points to cloud metadata hostname: {host}"
+        )));
+    }
+    Ok(SsrfHostVerdict::NeedsDnsResolution)
+}
+
+/// redirect policy 用的同步 host 安全检查(重定向是少见路径,可接受同步阻塞解析)。
+/// 返回 `Err(reason)` 表示该跳目标指向云 metadata,应拒绝跟随。解析失败 → 放行。
+fn redirect_host_is_safe(host: &str) -> Result<(), String> {
+    match host_static_ssrf_verdict(host).map_err(|e| e.to_string())? {
+        SsrfHostVerdict::LiteralAllowed => Ok(()),
+        SsrfHostVerdict::NeedsDnsResolution => {
+            use std::net::ToSocketAddrs;
+            match (host, 443u16).to_socket_addrs() {
+                Ok(resolved) => {
+                    for addr in resolved {
+                        if is_cloud_metadata_ip(addr.ip()) {
+                            return Err(format!(
+                                "redirect host {host} resolves to cloud metadata IP {}",
+                                addr.ip()
+                            ));
+                        }
+                    }
+                    Ok(())
+                }
+                Err(_) => Ok(()),
+            }
         }
     }
+}
+
+/// 是否是"云 metadata"端点(SSRF 真正高价值目标)。**只拦 metadata,不拦 loopback/私网**。
+fn is_cloud_metadata_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_metadata_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            // IPv4-mapped(::ffff:a.b.c.d):映射回 v4 判断,
+            // 否则 `[::ffff:169.254.169.254]` 会绕过。
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_metadata_v4(v4);
+            }
+            // AWS IPv6 IMDS 端点 fd00:ec2::254
+            v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254)
+        }
+    }
+}
+
+fn is_metadata_v4(v4: std::net::Ipv4Addr) -> bool {
+    // 169.254.0.0/16 链路本地 —— 云 metadata 都落 169.254.169.254;link-local 不是
+    // 合法上游,整段拦掉既覆盖 metadata 又无误伤。
+    v4.is_link_local()
+        // Alibaba Cloud metadata(落在 CGNAT 100.64/10,故单独点名)
+        || v4.octets() == [100, 100, 100, 200]
 }
 
 /// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
@@ -1285,6 +1383,96 @@ fn filter_hop_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssrf_blocks_cloud_metadata_ips() {
+        use std::net::IpAddr;
+        for s in [
+            "169.254.169.254",        // AWS/GCP/Azure/Oracle metadata
+            "169.254.0.1",            // link-local(整段拦)
+            "100.100.100.200",        // Alibaba Cloud metadata
+            "::ffff:169.254.169.254", // IPv4-mapped metadata
+            "fd00:ec2::254",          // AWS IPv6 IMDS
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_cloud_metadata_ip(ip), "{s} 应判为云 metadata");
+        }
+    }
+
+    #[test]
+    fn ssrf_allows_loopback_private_and_public() {
+        use std::net::IpAddr;
+        // 桌面代理:loopback(本地 LLM/桥)+ 私网 LAN + 公网都应放行
+        for s in [
+            "127.0.0.1",            // loopback
+            "::1",                  // IPv6 loopback
+            "::ffff:127.0.0.1",     // IPv4-mapped loopback
+            "10.1.2.3",             // RFC1918
+            "192.168.1.1",          // RFC1918
+            "172.16.0.1",           // RFC1918
+            "fc00::1",              // ULA
+            "100.64.0.1",           // CGNAT(非 Alibaba metadata)
+            "8.8.8.8",              // 公网
+            "1.1.1.1",              // 公网
+            "2606:4700:4700::1111", // 公网 v6
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_cloud_metadata_ip(ip), "{s} 应放行");
+        }
+    }
+
+    #[test]
+    fn ssrf_static_verdict_blocks_metadata_allows_local() {
+        // metadata IP / hostname → 拒
+        for url_host in [
+            "169.254.169.254",
+            "[::ffff:169.254.169.254]",
+            "100.100.100.200",
+            "metadata.google.internal",
+        ] {
+            assert!(
+                host_static_ssrf_verdict(url_host).is_err(),
+                "{url_host} 应被静态判定拒绝"
+            );
+        }
+        // 字面 loopback/私网/公网 → 放行(无需 DNS)
+        for url_host in ["127.0.0.1", "[::1]", "10.0.0.1", "8.8.8.8"] {
+            assert!(
+                matches!(
+                    host_static_ssrf_verdict(url_host),
+                    Ok(SsrfHostVerdict::LiteralAllowed)
+                ),
+                "{url_host} 字面应放行"
+            );
+        }
+        // hostname(含 localhost)→ 交 DNS(localhost 解析到 loopback,非 metadata → 放行)
+        for url_host in ["api.openai.com", "localhost"] {
+            assert!(
+                matches!(
+                    host_static_ssrf_verdict(url_host),
+                    Ok(SsrfHostVerdict::NeedsDnsResolution)
+                ),
+                "{url_host} 应走 DNS"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_check_blocks_metadata_allows_loopback() {
+        // 放行:loopback 上游(本地 LLM / 本地桥,如真机 127.0.0.1:29090)
+        assert!(check_ssrf_safe("http://127.0.0.1:6379/").await.is_ok());
+        assert!(check_ssrf_safe("http://[::1]:8080/").await.is_ok());
+        assert!(check_ssrf_safe("http://127.0.0.1:29090/v1").await.is_ok());
+        // 拦:云 metadata
+        assert!(check_ssrf_safe("http://169.254.169.254/latest/meta-data/")
+            .await
+            .is_err());
+        assert!(check_ssrf_safe("http://[::ffff:169.254.169.254]/")
+            .await
+            .is_err());
+        // 非法 URL 仍拒
+        assert!(check_ssrf_safe("not a url").await.is_err());
+    }
 
     #[tokio::test]
     async fn previous_response_not_found_renders_openai_sdk_compatible_400() {

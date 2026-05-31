@@ -427,34 +427,29 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
             // (1) path escape check — 先拼完整路径再 canonicalize
             let full = staged.join(&entry_path);
             // canonicalize 要求路径存在;对新建文件/目录先检查 parent
-            let check_path = if full.exists() {
-                full.canonicalize().map_err(|e| {
-                    format!("cannot canonicalize entry {}: {e}", entry_path.display())
-                })?
-            } else if let Some(parent) = full.parent() {
-                // parent 必须已存在(由 tar 条目顺序保证目录先于文件)
-                let parent_canon = if parent.exists() {
-                    parent.canonicalize().map_err(|e| {
-                        format!(
-                            "cannot canonicalize parent of {}: {e}",
-                            entry_path.display()
-                        )
+            let check_path =
+                if full.exists() {
+                    full.canonicalize().map_err(|e| {
+                        format!("cannot canonicalize entry {}: {e}", entry_path.display())
                     })?
+                } else if let Some(parent) = full.parent() {
+                    // parent 必须已存在(由 tar 条目顺序保证目录先于文件)
+                    let parent_canon = if parent.exists() {
+                        parent.canonicalize().map_err(|e| {
+                            format!(
+                                "cannot canonicalize parent of {}: {e}",
+                                entry_path.display()
+                            )
+                        })?
+                    } else {
+                        parent.to_path_buf()
+                    };
+                    parent_canon.join(full.file_name().ok_or_else(|| {
+                        format!("entry has no filename: {}", entry_path.display())
+                    })?)
                 } else {
-                    parent.to_path_buf()
+                    return Err(format!("entry has no parent: {}", entry_path.display()));
                 };
-                parent_canon.join(
-                    full.file_name()
-                        .ok_or_else(|| {
-                            format!("entry has no filename: {}", entry_path.display())
-                        })?,
-                )
-            } else {
-                return Err(format!(
-                    "entry has no parent: {}",
-                    entry_path.display()
-                ));
-            };
             if !check_path.starts_with(&staged_canonical) {
                 let _ = fs::remove_dir_all(&staged);
                 return Err(format!(
@@ -472,10 +467,20 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
                     entry_path.display()
                 ));
             }
-            // (3) extract this entry
-            entry
+            // (3) extract this entry — 检查 unpack_in 的 bool 返回值:tar crate 对
+            // 逃逸条目(`..`/绝对路径)返回 Ok(false) **静默跳过**,`?` 只传播 Err。
+            // 前面手工 escape 校验已拦大部分,这里把 unpack_in 自带的 inside-dst 判定
+            // 作为 fail-closed backstop(与 skills_backup.rs 对齐,不静默放过)。
+            let unpacked = entry
                 .unpack_in(&staged)
                 .map_err(|e| format!("untar entry {}: {e}", entry_path.display()))?;
+            if !unpacked {
+                let _ = fs::remove_dir_all(&staged);
+                return Err(format!(
+                    "tarball entry escaped staged dir (unpack_in rejected): {}",
+                    entry_path.display()
+                ));
+            }
         }
     }
     // 验证 plugin.json 存在(防 marketplace 投毒)

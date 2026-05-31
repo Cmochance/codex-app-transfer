@@ -178,50 +178,42 @@ pub fn restore_backup(
         )));
     }
     std::fs::create_dir_all(skills_dir).map_err(|e| SkillsBackupError::Io(e.to_string()))?;
-    let status = Command::new("tar")
-        .args([
-            "-xzf",
-            &archive.display().to_string(),
-            "-C",
-            &skills_dir.display().to_string(),
-        ])
-        .arg("--no-same-owner")
-        .arg("--no-overwrite-dir")
-        .status()
-        .map_err(|e| SkillsBackupError::TarFailed(format!("spawn tar: {e}")))?;
-    if !status.success() {
-        return Err(SkillsBackupError::TarFailed(format!(
-            "tar exit status: {status}"
-        )));
-    }
-    // post-extract path escape check: walk skills_dir 确保没有文件逃逸到外部
-    // (防御恶意 tar 含 symlink 指向 .. / 绝对路径等,虽 tar 默认拒绝绝对路径,
-    // 但某些 bsdtar 版本行为不一致;做 defense-in-depth 二次校验)。
+
+    // 安全解压 —— **不再 shell out `tar -xzf`**:
+    // - `--no-overwrite-dir` 在 macOS bsdtar(主平台)不支持,直接 exit 1 让 restore 坏掉;
+    // - 旧的"解压后巡检"在 `tar` 解压**之后**才 walk,逃逸文件早已落到 skills_dir 外,
+    //   且 `remove_dir_all` 删的是内部目录而非逃逸目标,等于无效防御。
+    // 改用 Rust `tar` crate 逐条 **fail-closed** 校验(与 codex_plugins.rs::install_tarball 一致),
+    // 跨平台行为一致:拒绝 symlink/hardlink 条目 + 依赖 `unpack_in` 的 inside-dst 校验拒绝
+    // `..`/绝对路径逃逸(返回 false = 被跳过 → 视为可疑直接报错)。tar crate 默认不保留
+    // owner/permissions(等价旧 `--no-same-owner`)。
+    let file = std::fs::File::open(&archive).map_err(|e| SkillsBackupError::Io(e.to_string()))?;
+    let decoder = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
+    let mut tar = tar::Archive::new(decoder);
+    for entry in tar
+        .entries()
+        .map_err(|e| SkillsBackupError::TarFailed(format!("read tar entries: {e}")))?
     {
-        fn check_dir_escape(dir: &Path, root: &Path) {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for ent in entries.flatten() {
-                    let p = ent.path();
-                    if let Ok(canon) = p.canonicalize() {
-                        if !canon.starts_with(root) {
-                            tracing::error!(
-                                "skills restore: escaped path detected and cleaned: {} → {}",
-                                p.display(),
-                                canon.display()
-                            );
-                            let _ = std::fs::remove_dir_all(dir);
-                            return;
-                        }
-                    }
-                    if p.is_dir() {
-                        check_dir_escape(&p, root);
-                    }
-                }
-            }
+        let mut entry =
+            entry.map_err(|e| SkillsBackupError::TarFailed(format!("tar entry: {e}")))?;
+        let entry_path = entry
+            .path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<non-utf8>".to_owned());
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(SkillsBackupError::InvalidBackup(format!(
+                "backup 含禁止的 symlink/hardlink 条目: {entry_path}"
+            )));
         }
-        let skills_canonical =
-            skills_dir.canonicalize().unwrap_or_else(|_| skills_dir.to_path_buf());
-        check_dir_escape(skills_dir, &skills_canonical);
+        let unpacked = entry
+            .unpack_in(skills_dir)
+            .map_err(|e| SkillsBackupError::TarFailed(format!("unpack {entry_path}: {e}")))?;
+        if !unpacked {
+            return Err(SkillsBackupError::InvalidBackup(format!(
+                "backup 条目逃逸 skills 目录,已拒绝: {entry_path}"
+            )));
+        }
     }
     Ok(())
 }
@@ -308,6 +300,38 @@ mod tests {
         assert!(matches!(err, SkillsBackupError::InvalidBackup(_)));
         let err = restore_backup(&skills, &backups, "evil.exe").unwrap_err();
         assert!(matches!(err, SkillsBackupError::InvalidBackup(_)));
+        let _ = fs::remove_dir_all(&skills);
+        let _ = fs::remove_dir_all(&backups);
+    }
+
+    #[test]
+    fn restore_rejects_symlink_entry() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let skills = tmp_dir("skills-symlink");
+        let backups = tmp_dir("backups-symlink");
+        // 构造含 symlink 条目(指向 /etc/passwd)的恶意 tar.gz
+        let archive_path = backups.join("evil.tar.gz");
+        {
+            let f = fs::File::create(&archive_path).unwrap();
+            let enc = GzEncoder::new(f, Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            builder
+                .append_link(&mut header, "evil-link", "/etc/passwd")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let err = restore_backup(&skills, &backups, "evil.tar.gz").unwrap_err();
+        assert!(
+            matches!(err, SkillsBackupError::InvalidBackup(_)),
+            "symlink 条目应被拒绝,got: {err:?}"
+        );
+        // 逃逸目标不应被创建
+        assert!(!skills.join("evil-link").exists());
         let _ = fs::remove_dir_all(&skills);
         let _ = fs::remove_dir_all(&backups);
     }
