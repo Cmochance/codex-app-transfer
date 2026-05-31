@@ -221,6 +221,35 @@ pub fn is_web_search_disabled_for(provider_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 把上游语义 error kind 映射成 Codex `response.failed` handler 认识的
+/// retry-control code。
+///
+/// Codex 客户端只按 `error.code` 字符串决定是否重试:不认识的 code 一律落
+/// `Retryable` → `CodexErr::Stream`(`is_retryable()=true`)→ 反复重发到
+/// max_retries 卡死(MOC-79 实证, MOC-90 grok_web 同款)。
+///
+/// 映射策略(与 gemini_native / grok_web 共用):
+/// - 无歧义永久性(retry 同一请求必得同样失败)→ 映射成 Codex 非重试 code,
+///   surface 错误 + 停止。当前白名单:
+///   `bad_request`, `content_filter`, `auth_error`, `permission_denied`
+///   → `"invalid_prompt"`(`ApiError::InvalidRequest`, `is_retryable()=false`)
+/// - 其余(timeout / rate_limited / quota_exceeded / server_error /
+///   service_unavailable / upstream_error / upstream_transport_error /
+///   grok_stream_error / upstream_truncated)→ 保留原 code → Codex Retryable。
+///   **仅当确信是「无歧义永久性」分类时才加到上面白名单;拿不准留这里
+///   (Retryable 比误杀安全,见 MOC-79 PR #325 两次 P2 教训)。**
+///
+/// 原始语义分类仍由各 adapter 的 emit 函数写进 `error.upstream_error_kind`
+/// 诊断字段(Codex `Error` struct 无 `deny_unknown_fields`,该字段被安全忽略)。
+pub(crate) fn codex_retry_code(upstream_kind: &str) -> &str {
+    match upstream_kind {
+        // 无歧义永久性(retry 同一请求必得同样失败)→ Codex 非重试 code,surface + 停
+        "bad_request" | "content_filter" | "auth_error" | "permission_denied" => "invalid_prompt",
+        // 其余 → 保留原 code → Codex Retryable
+        other => other,
+    }
+}
+
 /// 把入站 `/v1/foo?bar` 规范化为 `/foo?bar`;若开头不是 `/v1/` 则原样返回。
 ///
 /// 用于把 Codex CLI 入站 Responses/Chat 路径的 `/v1` 前缀剥离 —
@@ -277,5 +306,46 @@ mod normalize_v1_prefix_tests {
     #[test]
     fn empty_becomes_root() {
         assert_eq!(normalize_v1_prefix(""), "/");
+    }
+}
+
+#[cfg(test)]
+mod codex_retry_code_tests {
+    use super::codex_retry_code;
+
+    #[test]
+    fn permanent_codes_map_to_invalid_prompt() {
+        // 无歧义永久性错误 → invalid_prompt(Codex 非重试,surface+停)
+        assert_eq!(codex_retry_code("bad_request"), "invalid_prompt");
+        assert_eq!(codex_retry_code("content_filter"), "invalid_prompt");
+        assert_eq!(codex_retry_code("auth_error"), "invalid_prompt");
+        assert_eq!(codex_retry_code("permission_denied"), "invalid_prompt");
+    }
+
+    #[test]
+    fn transient_codes_pass_through() {
+        // 瞬时/半永久错误 → 保留原 code(落 Codex Retryable)
+        assert_eq!(codex_retry_code("timeout"), "timeout");
+        assert_eq!(codex_retry_code("rate_limited"), "rate_limited");
+        assert_eq!(codex_retry_code("quota_exceeded"), "quota_exceeded");
+        assert_eq!(codex_retry_code("server_error"), "server_error");
+        assert_eq!(
+            codex_retry_code("service_unavailable"),
+            "service_unavailable"
+        );
+        assert_eq!(codex_retry_code("upstream_error"), "upstream_error");
+        assert_eq!(
+            codex_retry_code("upstream_transport_error"),
+            "upstream_transport_error"
+        );
+        assert_eq!(codex_retry_code("upstream_truncated"), "upstream_truncated");
+        assert_eq!(codex_retry_code("grok_stream_error"), "grok_stream_error");
+    }
+
+    #[test]
+    fn unknown_codes_pass_through() {
+        // 不认识 code → 保留原值(安全:落 Retryable 比误判非重试好)
+        assert_eq!(codex_retry_code("some_future_code"), "some_future_code");
+        assert_eq!(codex_retry_code(""), "");
     }
 }

@@ -236,12 +236,16 @@ const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 65_536;
 /// 2. `response.failed`(status=failed,带 classify 后的 error.code + grok message)
 ///
 /// **classify 规则**:
-/// - `401` → `auth_error`(cookie 过期 / 错误)
-/// - `403` → `permission_denied`(可能 Cloudflare 挑战 / 账号风控)
+/// - `401` → `auth_error` → `invalid_prompt`(永久,Codex surface + 停)
+/// - `403` → `permission_denied` → `invalid_prompt`(永久,Codex surface + 停)
 /// - `408` / `504` → `timeout`
 /// - `429` → `rate_limited`
 /// - `5xx` → `server_error`
 /// - 其他 → `upstream_error`
+///
+/// 语义分类经 [`crate::codex_retry_code`] 映射:永久性(401/403) → Codex 非重试
+/// `invalid_prompt`,瞬时态(timeout/rate_limited/server_error/upstream_error)
+/// 保留原 code → Codex Retryable。原始语义分类保留在 `error.upstream_error_kind`。
 ///
 /// **防御**:
 /// - body cap [`MAX_UPSTREAM_ERROR_BODY_BYTES`] 字节防 DoS
@@ -1558,13 +1562,20 @@ fn close_message_if_open(state: &mut ConvState) {
 /// - 流末无 `final` token / `isSoftStop` → `unfold` 流末防御调
 ///
 /// 字段对齐 [OpenAI Responses API spec](https://platform.openai.com/docs/api-reference/responses):
-/// `response.failed` 顶层 `error.code` + `error.message` 两个必需字段。
+/// 构造 `response.failed` SSE 事件。
+///
+/// `upstream_kind` 是内部语义分类(`auth_error` / `server_error` / …),
+/// 经 [`crate::codex_retry_code`] 映射成 Codex 客户端认识的 retry-control
+/// `error.code`(永久性 → `invalid_prompt`,瞬时态保留原值)。
+/// 原始语义分类保留在 `error.upstream_error_kind` 诊断字段
+/// (Codex `Error` struct 无 `deny_unknown_fields`,该字段被安全忽略)。
 pub(crate) fn emit_response_failed(
     seq: &mut u64,
     response_id: &str,
-    code: &str,
+    upstream_kind: &str,
     message: &str,
 ) -> Bytes {
+    let codex_code = crate::codex_retry_code(upstream_kind);
     emit_event(
         seq,
         "response.failed",
@@ -1575,8 +1586,9 @@ pub(crate) fn emit_response_failed(
                 "object": "response",
                 "status": "failed",
                 "error": {
-                    "code": code,
+                    "code": codex_code,
                     "message": message,
+                    "upstream_error_kind": upstream_kind,
                 }
             }
         }),
@@ -2089,7 +2101,8 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_4xx_translates_to_response_failed() {
-        // review-feedback A1:401 → response.failed code=auth_error
+        // MOC-90:401 → response.failed code=invalid_prompt(Codex 非重试,surface+停)
+        // upstream_error_kind 保留原始 auth_error 诊断
         let body = Bytes::from_static(b"{\"error\":\"unauthorized\"}");
         let upstream: ByteStream = Box::pin(stream::iter(vec![Ok(body)]));
         let out = collect(convert_grok_error_to_responses_failure_stream(
@@ -2100,8 +2113,27 @@ mod tests {
         .await;
         assert!(out.contains("event: response.created"));
         assert!(out.contains("event: response.failed"));
-        assert!(out.contains(r#""code":"auth_error""#));
+        // MOC-90:401 → invalid_prompt(非重试),不再 auth_error(会卡死)
+        assert!(out.contains(r#""code":"invalid_prompt""#));
+        assert!(!out.contains(r#""code":"auth_error""#));
+        assert!(out.contains(r#""upstream_error_kind":"auth_error""#));
         assert!(out.contains("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn upstream_403_maps_to_invalid_prompt_not_retryable() {
+        // MOC-90:403 → permission_denied → invalid_prompt(永久,Codex surface+停)
+        let body = Bytes::from_static(b"{\"error\":\"forbidden\"}");
+        let upstream: ByteStream = Box::pin(stream::iter(vec![Ok(body)]));
+        let out = collect(convert_grok_error_to_responses_failure_stream(
+            http::StatusCode::FORBIDDEN,
+            upstream,
+            "r".into(),
+        ))
+        .await;
+        assert!(out.contains(r#""code":"invalid_prompt""#));
+        assert!(!out.contains(r#""code":"permission_denied""#));
+        assert!(out.contains(r#""upstream_error_kind":"permission_denied""#));
     }
 
     #[tokio::test]
@@ -2114,7 +2146,9 @@ mod tests {
             "r".into(),
         ))
         .await;
+        // 5xx server_error 是瞬时 → 保留原 code(落 Codex Retryable)
         assert!(out.contains(r#""code":"server_error""#));
+        assert!(out.contains(r#""upstream_error_kind":"server_error""#));
     }
 
     #[tokio::test]

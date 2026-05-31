@@ -1716,52 +1716,10 @@ const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// 给操作者足够诊断信息(stack trace / quota detail)又不至于撑爆 SSE event。
 const MAX_USER_ERROR_MESSAGE_CHARS: usize = 2000;
 
-/// 把内部语义 error 分类(`bad_request` / `auth_error` / …)映射成 **Codex 客户端
-/// `response.failed` handler 认识的 retry-control `error.code`**。
-///
-/// **为什么必须映射(MOC-79 根因)**:Codex(对照 openai/codex `codex-rs`,2026-05 HEAD;
-/// `codex-api/src/sse/responses.rs` 的 `response.failed` 分支)**只按 `error.code` 字符串**
-/// 决定如何处理失败:
-/// - `invalid_prompt`          → `ApiError::InvalidRequest` → `CodexErr::InvalidRequest`
-/// - `insufficient_quota`      → `ApiError::QuotaExceeded`
-/// - `context_length_exceeded` → `ApiError::ContextWindowExceeded`(触发 compact)
-/// - `server_is_overloaded` / `slow_down` → `ApiError::ServerOverloaded`
-/// - `cyber_policy` / `usage_not_included` → 对应致命态
-/// - **其它任何值 → `ApiError::Retryable` → `CodexErr::Stream`**
-///
-/// 而 Codex turn loop(`core/src/session/turn.rs`)是 `if !err.is_retryable() { return Err(err) }`,
-/// 其中 `CodexErr::Stream(..).is_retryable() == true`,上面那些命名态 `== false`。所以:
-/// **不认识的 `error.code` = 可重试 = Codex 反复重发同一请求到 max_retries**。MOC-79
-/// 实测 `gemini-3.1-pro-high` 400 INVALID_ARGUMENT 被 Codex 重发 12 次卡死,正是因为
-/// 旧实现 emit 的 `error.code = "bad_request"` 不在 Codex 白名单 → 落 Retryable。
-///
-/// **映射原则 —— 只有「无歧义永久性」错误才映射成非重试 code**:
-/// - retry 同一请求**必定**得到同样失败的(400 bad_request / 400 content_filter /
-///   401 auth / 403 permission)→ `invalid_prompt`(`InvalidRequest`,is_retryable=false),
-///   让 Codex surface 错误 + 停手,用户能看到原因并换模型(MOC-79 的目标)。
-/// - **其余分类一律保留原 code → 落 Codex `Retryable`**:瞬时错误(超时 / 限流 / 5xx /
-///   transport)退避重试可恢复;真不可恢复的(如日级配额)退避到 max_retries 后 surface,
-///   = pre-PR 行为,不误杀。**拿不准就别加白名单 —— 留 Retryable 比误判成非重试安全**。
-///
-/// 两次实证教训(chatgpt-codex-connector P2),都因把「半永久」错误当永久而误判:
-/// - 503 `service_unavailable` 是**瞬时过载**,若映射 `server_is_overloaded`
-///   (`ServerOverloaded`,is_retryable=false)会让本应重试的 503 立即断对话;
-/// - 429 `quota_exceeded` 在 Gemini 把 **per-minute 限流**和日级配额混在一起,若映射
-///   `insufficient_quota`(非重试)会让常见的 per-minute 限流立即失败。
-/// 两者都保留原 code 走 Retryable。
-///
-/// 原始语义分类仍由 `emit_failure` 写进 `error.upstream_error_kind` + operator-side
-/// `tracing` 日志保留,不丢诊断信息。
+/// 薄封装:`crate::codex_retry_code`(共享于 adapters crate lib.rs)。
+/// 完整文档 + 维护见 [`crate::codex_retry_code`]。
 fn codex_retry_code(upstream_kind: &str) -> &str {
-    match upstream_kind {
-        // 无歧义永久性(retry 同一请求必得同样失败)→ Codex 非重试 code,surface + 停
-        "bad_request" | "content_filter" | "auth_error" | "permission_denied" => "invalid_prompt",
-        // 其余(timeout / rate_limited / quota_exceeded / server_error / service_unavailable /
-        // upstream_error / upstream_transport_error)→ 保留原 code → Codex Retryable。
-        // **仅当确信是「无歧义永久性」分类时**才加到上面白名单;拿不准留这里(Retryable
-        // 比误杀安全,见上方两次 P2 教训)。
-        other => other,
-    }
+    crate::codex_retry_code(upstream_kind)
 }
 
 /// 上游 4xx/5xx 错误 → Responses SSE failure 流。
@@ -1992,8 +1950,12 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                 let mut conv = GeminiToResponsesConverter::new(orig, None);
                 // `code` 是内部语义分类;真正写进 envelope.error.code 的是 Codex 认识的
                 // retry-control code(见 codex_retry_code)。语义 kind 保留在 upstream_error_kind。
-                let out =
-                    conv.emit_failure(codex_retry_code(code), code, &error_message, status_u16);
+                let out = conv.emit_failure(
+                    crate::codex_retry_code(code),
+                    code,
+                    &error_message,
+                    status_u16,
+                );
                 Some((Ok(Bytes::from(out)), (input, None, true)))
             },
         ),
