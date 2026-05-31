@@ -7102,18 +7102,69 @@
   // 一次、把 raw 502 写进 badge,等于刚告诉 user"已保存"转头又冒 502),并把 badge
   // 显示为"待重启生效"而非原始错误。仅抑制本次交互这一次,不影响后续正常自动恢复。
   let themeSuppressAutoReapplyOnce = false;
+  // MOC-102:双按钮弹窗(立即重启 / 稍后重启),复用 openCropModal 的 overlay/panel
+  // 样式。返 Promise<"now" | "later">。**不**自动重启——重启必须是用户在此显式选择
+  // 「立即重启」才触发;选「稍后重启」或点遮罩/✕ 关闭则保留偏好、不动 Codex。
+  function showThemeRestartDialog() {
+    return new Promise((resolve) => {
+      const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
+      const overlay = document.createElement("div");
+      overlay.style.cssText =
+        "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;";
+      const panel = document.createElement("div");
+      panel.style.cssText =
+        "background:var(--bs-body-bg);border-radius:12px;padding:20px;max-width:440px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,0.4);";
+      const title = document.createElement("div");
+      title.style.cssText = "font-weight:600;font-size:16px;margin-bottom:10px;";
+      title.textContent = t("theme.savedTitle") || (lang === "en" ? "Theme preference saved" : "主题偏好已保存");
+      const body = document.createElement("div");
+      body.style.cssText = "font-size:13px;color:var(--bs-secondary-color);line-height:1.6;margin-bottom:18px;";
+      body.textContent =
+        t("theme.savedPendingRestart") ||
+        "当前 Codex 未通过本工具启动或调试端口不可用,主题将在 Codex 重启后生效。";
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText = "display:flex;justify-content:flex-end;gap:10px;";
+      const laterBtn = document.createElement("button");
+      laterBtn.className = "btn btn-outline-secondary btn-sm";
+      laterBtn.type = "button";
+      laterBtn.textContent = t("theme.restartLater") || (lang === "en" ? "Restart later" : "稍后重启");
+      const nowBtn = document.createElement("button");
+      nowBtn.className = "btn btn-primary btn-sm";
+      nowBtn.type = "button";
+      nowBtn.textContent = t("theme.restartNow") || (lang === "en" ? "Restart now" : "立即重启");
+      btnRow.appendChild(laterBtn);
+      btnRow.appendChild(nowBtn);
+      panel.appendChild(title);
+      panel.appendChild(body);
+      panel.appendChild(btnRow);
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+
+      const done = (choice) => {
+        overlay.remove();
+        resolve(choice);
+      };
+      // 点遮罩空白 / 稍后 = later(默认尊重"稍后",不重启);立即 = now。
+      overlay.addEventListener("click", (e) => {
+        if (e.target === overlay) done("later");
+      });
+      laterBtn.addEventListener("click", () => done("later"));
+      nowBtn.addEventListener("click", () => done("now"));
+    });
+  }
+
   // MOC-102:即时注入失败(CDP 不可达 / Codex 非 transfer 启动)时——偏好已落盘,
-  // 仅提示「需重启 Codex 生效」,并提供一键重启(复用 transfer 现成 restart endpoint)。
+  // 弹双按钮窗让用户**自己选**立即 / 稍后重启,绝不自动重启。
   // **不**当作开关失败、**不**回退 toggle、**不**报 502 红错。
   async function promptRestartCodexForTheme() {
     // 抑制紧随其后的 renderTheme auto-re-apply(见 themeSuppressAutoReapplyOnce 注释)
     themeSuppressAutoReapplyOnce = true;
-    const msg =
-      (t("theme.savedPendingRestart") ||
-        "主题偏好已保存。当前 Codex 未通过本工具启动或调试端口不可用,需重启 Codex 后生效。") +
-      "\n\n" +
-      (t("theme.restartNowConfirm") || "是否立即重启 Codex App?");
-    if (!window.confirm(msg)) return;
+    const choice = await showThemeRestartDialog();
+    if (choice !== "now") {
+      // 稍后重启:偏好已落盘,什么都不动,badge 显示"待重启生效"。
+      showToast(t("theme.savedPendingRestartToast") || "主题已保存,Codex 重启后生效");
+      return;
+    }
     try {
       await CCApi.theme.restartCodex();
       showToast(t("theme.restartToast") || "已请求重启 Codex");
