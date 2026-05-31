@@ -398,20 +398,27 @@ fn should_attach_debug_port() -> Vec<String> {
     // **任一为 true 都带 CDP 调试端口**(#264):plugin_unlock 跟 theme 是两个
     // 独立 toggle,user 可能只开 theme 不开 plugin_unlock。CDP 端口缺失会让
     // [`auto_apply_theme_on_startup`] 跑空,所以两者任一开启都要带 port。
+    //
+    // [MOC-104 解耦] plugin_unlock 这一侧改为「CDP daemon 实际会跑」才需要端口:
+    // 仅当用户显式强制开启(autoUnlockCodexPlugins=true,迁移后只由强制开启置位)
+    // **且**活动 auth.json 不是真实 chatgpt 时,daemon 才注入。真实账号原生显示
+    // plugins、不跑 daemon → 不必为它带调试端口(theme 仍可独立要求端口)。
     let cfg = crate::admin::registry_io::load().ok();
-    let plugin_unlock = cfg
+    let force_cdp = cfg
         .as_ref()
         .and_then(|c| c.get("settings"))
         .and_then(|s| s.get("autoUnlockCodexPlugins"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
+    let plugin_unlock_needs_port =
+        force_cdp && !crate::codex_real_account::active_is_real_chatgpt_now();
     let theme_enabled = cfg
         .as_ref()
         .and_then(|c| c.get("settings"))
         .and_then(|s| s.get("codexUiThemeEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !plugin_unlock && !theme_enabled {
+    if !plugin_unlock_needs_port && !theme_enabled {
         return vec![];
     }
 

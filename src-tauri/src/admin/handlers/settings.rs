@@ -430,9 +430,11 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             // [MOC-100 P2-3] autoUnlockCodexPlugins 开关当场生效,无需重启 transfer:
             // 开→start daemon(幂等,已在跑则 no-op);关→stop daemon(gated,没跑则
             // no-op)。否则切到 false 后 daemon 还在跑、切回 true 又得重启才生效。
+            // [MOC-104 解耦] 开启时:活动已是真实 chatgpt 账号 → 原生显示 plugins,
+            // CDP daemon 多余且会造延迟,不启;只有无真实账号时(强制开启高延迟路径)才启。
             if let Some(enabled) = auto_unlock_changed {
                 let service = crate::admin::handlers::plugin_unlock::get_service().await;
-                if enabled {
+                if enabled && !crate::codex_real_account::active_is_real_chatgpt_now() {
                     service.start();
                 } else {
                     service.stop().await;
@@ -468,6 +470,31 @@ pub async fn disable_auto_unlock_codex_plugins() -> bool {
             .await;
     }
     changed
+}
+
+/// [MOC-104] 一次性迁移:老版本 `autoUnlockCodexPlugins` 默认 true 直接驱动 CDP 伪造
+/// 注入 daemon —— 但只有活动 auth.json 不是真实 chatgpt 时该注入才造成不匹配 →
+/// Codex 启动重新初始化(高延迟)。真实账号模式上线后,高延迟 CDP 路径改为「显式
+/// 强制开启」才走;升级用户残留的旧 `true` 不该默默把人按在高延迟路径上。
+///
+/// 首次启动检测到没迁移过 → **硬重置 `autoUnlockCodexPlugins=false`**(用户指示),
+/// 之后只有「强制开启」按钮 / 用户手动开开关才会置回 true。幂等:迁移标记已置则
+/// no-op,不会反复覆盖用户后来的选择。返回本次是否执行了重置(供日志)。
+pub fn migrate_real_account_unlock_v1() -> bool {
+    with_config_write(|cfg| {
+        let s = ensure_settings_object(cfg);
+        let already = s
+            .get("realAccountUnlockMigratedV1")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if already {
+            return Ok(ConfigMutation::Unchanged(false));
+        }
+        s.insert("realAccountUnlockMigratedV1".to_owned(), Value::Bool(true));
+        s.insert("autoUnlockCodexPlugins".to_owned(), Value::Bool(false));
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false)
 }
 
 /// #262:把 `settings.language` 同步到 adapters 全局 [`codex_app_transfer_adapters::core::language`]。

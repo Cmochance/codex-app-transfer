@@ -26,6 +26,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -62,6 +63,10 @@ pub struct RealAccountStatus {
     /// 是否存在用户导入/钉住的持久镜像(独立于 `source` —— 活动即便是 official,
     /// 镜像也可能并存)。前端据此显示「忘记导入」按钮。
     pub has_imported: bool,
+    /// 最近一次刷新/启动调谐判定「真实账号已失效、refresh_token 永久无效、需重新登录」。
+    /// [connector review] 持久化到可查询的 status,而非只靠一次性 `emit` 事件 —— 启动时
+    /// 若前端还没注册 listener,事件会丢;前端轮询 status 时读这个字段就不会漏报失效。
+    pub relogin_required: bool,
 }
 
 impl RealAccountStatus {
@@ -72,8 +77,33 @@ impl RealAccountStatus {
             account_id: None,
             source: AuthSource::None,
             has_imported,
+            relogin_required: relogin_required(),
         }
     }
+}
+
+/// [connector review] 进程级「需重新登录」标记 —— refresh/reconcile 判定 refresh_token
+/// 永久失效时置真,登录/导入/成功刷新后清零。比一次性 `emit` 事件可靠:前端任何时候
+/// 轮询 `status` 都能读到,不受「事件早于 listener 注册」的启动时序影响。
+static RELOGIN_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+/// 读「需重新登录」标记。
+pub fn relogin_required() -> bool {
+    RELOGIN_REQUIRED.load(Ordering::SeqCst)
+}
+
+/// 设「需重新登录」标记(refresh/reconcile 判定失效时 true;有新鲜账号时 false)。
+fn set_relogin_required(v: bool) {
+    RELOGIN_REQUIRED.store(v, Ordering::SeqCst);
+}
+
+/// 活动 `~/.codex/auth.json` 当前是否就是可用的真实 chatgpt(决定「插件解锁是否走原生
+/// 路径、无需 CDP daemon」—— 解耦的核心判据,借鉴 CodexPlusPlus relay 模式:有 chatgpt
+/// 登录态则 Codex 原生显示 plugins,不打 CDP 注入)。home 解析失败 → false。只读。
+pub fn active_is_real_chatgpt_now() -> bool {
+    CodexPaths::from_home_env()
+        .map(|p| active_is_real_chatgpt(&p))
+        .unwrap_or(false)
 }
 
 /// 从一个 `auth.json` Value 判断是否是**可用**的 chatgpt 登录态。
@@ -180,13 +210,34 @@ pub fn detect() -> RealAccountStatus {
     let active_mode = active_auth_mode(&paths);
     let has_imported = read_imported_mirror(&paths).is_some();
     match locate_chatgpt_auth(&paths) {
-        Some(found) => RealAccountStatus {
-            logged_in: true,
-            active_auth_mode: active_mode,
-            account_id: found.account_id,
-            source: found.source,
-            has_imported,
-        },
+        Some(found) => {
+            // [connector review 自愈] 活动文件本身是真实 chatgpt 且 access_token 未过期
+            // (本地 JWT exp 判断,无网络)= 账号当前确实可用 → 清掉可能 stale 的
+            // 「需重新登录」标记。覆盖用户在 app 外重新 `codex login` / 直接恢复活动文件、
+            // 不经 import/login/refresh 入口的场景。只在有「确实有效」的本地证据时清:
+            // access_token 过期则不清(避免把真失效误报成「获取成功」)。
+            if found.source == AuthSource::Official {
+                let access = found
+                    .value
+                    .get("tokens")
+                    .and_then(|t| t.get("access_token"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !access.is_empty()
+                    && !access_token_expired(access, chrono::Utc::now().timestamp())
+                {
+                    set_relogin_required(false);
+                }
+            }
+            RealAccountStatus {
+                logged_in: true,
+                active_auth_mode: active_mode,
+                account_id: found.account_id,
+                source: found.source,
+                has_imported,
+                relogin_required: relogin_required(),
+            }
+        }
         None => RealAccountStatus::none(active_mode, has_imported),
     }
 }
@@ -354,6 +405,7 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
     let now = chrono::Utc::now();
     if !access_token_expired(access_token, now.timestamp()) {
         // 持锁期间已是最新;第二个并发 caller 走到这里就 StillValid,不重复 POST。
+        set_relogin_required(false); // 账号当前有效
         return Ok(RefreshOutcome::StillValid { source });
     }
 
@@ -374,6 +426,7 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
         // ReloginRequired 让上层关「自动解锁」+ 提示重登,而非当瞬时错误吞掉。
         if looks_like_relogin_required(&format!("{status} {body}")) {
             tracing::warn!("[RealAccount] refresh 失败 = 需重新登录: {status} {body}");
+            set_relogin_required(true); // 持久标记失效,前端轮询 status 即可读到
             return Ok(RefreshOutcome::ReloginRequired { source });
         }
         return Err(format!("OAuth refresh 返回 {status}: {body}"));
@@ -427,6 +480,7 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
             }
         }
     }
+    set_relogin_required(false); // 刷新成功 = 账号恢复有效
     Ok(RefreshOutcome::Refreshed { source })
 }
 
@@ -577,7 +631,9 @@ pub async fn import_auth(value: Value) -> Result<(), String> {
     }
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    import_locked(&paths, &value)
+    import_locked(&paths, &value)?;
+    set_relogin_required(false); // 刚导入一份(校验过的)真实账号,清掉失效标记
+    Ok(())
 }
 
 /// 钉住当前检测到的真实账号(官方活动 auth.json)进持久镜像。
@@ -667,7 +723,10 @@ pub fn start_login() -> Result<(), String> {
         g.running = false;
         g.pid = None;
         g.last = match result {
-            Ok(out) if out.status.success() => LoginState::Succeeded,
+            Ok(out) if out.status.success() => {
+                set_relogin_required(false); // 登录成功 = 拿到新鲜账号
+                LoginState::Succeeded
+            }
             Ok(out) => {
                 if g.cancel_requested {
                     LoginState::Cancelled

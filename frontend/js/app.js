@@ -1426,8 +1426,10 @@
       const resp = await CCApi.realAccount.status();
       const st = resp.status || {};
       const login = resp.login || {};
-      // 登录成功 = 拿到新鲜账号,清掉「已失效」标记。
-      if (login.state === "succeeded") realAccountExpired = false;
+      // [connector review] 「账号已失效」以后端持久标记 st.relogin_required 为准 ——
+      // 不再只靠一次性事件(启动时若前端还没注册 listener 会丢)。登录成功后端会清零,
+      // 下次轮询这里自然恢复。一次性事件仍保留(更快),与此处轮询殊途同归。
+      realAccountExpired = st.relogin_required === true;
       const el = $("#raAcctStatus");
       if (el) {
         let text, color;
@@ -1447,11 +1449,16 @@
         el.textContent = text;
         el.style.color = color;
       }
-      // 运行状态 = 是否启用了「自动解锁」(跟开关一致),不看 daemon 连接态 ——
-      // 用户反馈:Codex 开着 + 开关开着却显示「未开启」很困惑。
+      // [MOC-104 解耦] 运行状态 = 解锁是否真的生效,而非旧开关原值:
+      // ① 活动是有效真实 chatgpt(原生显示 plugins,无需 daemon)→ 已开启;
+      // ② 否则用户显式强制开启(开关=true,跑 CDP 高延迟 daemon)→ 已开启;
+      // ③ 都不是 → 未开启。这样「账号获取失败 + 没强制开启」如实显示未开启,
+      // 不再出现「获取失败却显示已开启(默默走高延迟)」。
       const runEl = $("#raRunStatus");
       if (runEl) {
-        const on = $("#autoUnlockCodexPlugins")?.checked === true;
+        const realActive = st.logged_in === true && !realAccountExpired;
+        const forceCdp = $("#autoUnlockCodexPlugins")?.checked === true;
+        const on = realActive || forceCdp;
         runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
         runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
       }
