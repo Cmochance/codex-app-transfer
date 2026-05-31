@@ -675,6 +675,12 @@ pub async fn reconcile_on_startup(client: &reqwest::Client) -> Result<RefreshOut
     }
     // 先刷新(refresh_if_needed 内部持 AUTH_LOCK)。
     let outcome = refresh_if_needed(client).await?;
+    // [devin review] refresh 判定 refresh_token 永久失效 → 镜像里是同一份失效 token,
+    // 恢复到活动只会把当前可用的 apikey 配置覆盖成坏掉的 chatgpt 凭据,毫无好处
+    // (账号已死,用户必须重登)。跳过恢复,保留可用配置 + 由上层提示重登。
+    if matches!(outcome, RefreshOutcome::ReloginRequired { .. }) {
+        return Ok(outcome);
+    }
     // 再看是否要把导入镜像恢复到活动。
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;

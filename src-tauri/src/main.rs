@@ -376,6 +376,12 @@ fn main() {
                 });
                 tracing::info!(target_epoch, "app exit: epoch={target_epoch} 已退出或 timeout");
             }
+            // [devin review] 同理取消 in-flight `codex login`(真实账号登录):否则 user 在
+            // OAuth 等待期间退出 app,孤儿 codex login 进程可能在下面 restore_codex_if_enabled
+            // 恢复原配置**之后**才写 ~/.codex/auth.json,把刚恢复的状态又改脏(数据完整性)。
+            if crate::codex_real_account::cancel_login() {
+                tracing::info!("app exit: 已取消 in-flight codex login,防孤儿进程退出后改写 auth.json");
+            }
             let _ = handlers::desktop::restore_codex_if_enabled("exit");
         }
     });
