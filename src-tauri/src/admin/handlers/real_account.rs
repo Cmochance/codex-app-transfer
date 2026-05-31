@@ -30,7 +30,6 @@ pub async fn status_handler() -> impl IntoResponse {
     let message = match (status.logged_in, status.source) {
         (true, AuthSource::Official) => "已登录真实 ChatGPT 账号(官方 auth.json)",
         (true, AuthSource::Imported) => "已导入真实 ChatGPT 账号(持久保留,活动文件失效时自动恢复)",
-        (true, AuthSource::Backup) => "transfer 备份里有真实 ChatGPT 账号(活动文件已被改写,可恢复)",
         _ => "未检测到真实 ChatGPT 登录态",
     };
     Json(json!({
@@ -43,8 +42,8 @@ pub async fn status_handler() -> impl IntoResponse {
 
 /// POST /api/desktop/real-account/refresh
 ///
-/// 刷新真实 chatgpt 账号(官方活动或 transfer 备份里那份)的 token —— access_token
-/// 将过期才真刷,否则报 still_valid。非破坏:只更新 token 字段 + last_refresh。
+/// 刷新真实 chatgpt 账号(官方活动 auth.json 或导入的持久镜像)的 token ——
+/// access_token 将过期才真刷,否则报 still_valid。非破坏:只更新 token 字段 + last_refresh。
 pub async fn refresh_handler() -> impl IntoResponse {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -93,18 +92,42 @@ pub async fn login_cancel_handler() -> impl IntoResponse {
 ///
 /// 从文件导入:body 是 chatgpt auth.json 的 JSON 内容。校验后写进 transfer 持久
 /// 镜像(长期保留、不受 ~/.codex 文件变动影响)+ 恢复到活动文件(先备份)。
+///
+/// [review #3] 导入成功后立即按需刷新一次 token —— 用户导入的很可能是过期旧文件,
+/// 不刷的话活动文件里就是个 access_token 已过期的账号,plugin 模式拿去用直接 401。
+/// 刷新是 best-effort:导入(持久镜像 + 活动文件)已落盘成功,刷不动只在 outcome
+/// 里告诉前端(如 relogin_required),不把"导入成功"翻成失败。
 pub async fn import_handler(Json(input): Json<serde_json::Value>) -> impl IntoResponse {
-    match codex_real_account::import_auth(input).await {
-        Ok(()) => {
-            Json(json!({ "success": true, "message": "已导入并持久保留真实账号" })).into_response()
-        }
-        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    if let Err(e) = codex_real_account::import_auth(input).await {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
     }
+    let refresh = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+    {
+        Ok(client) => match codex_real_account::refresh_if_needed(&client).await {
+            Ok(outcome) => json!(outcome),
+            Err(e) => {
+                tracing::warn!("[RealAccount] 导入后刷新 token 失败(best-effort): {e}");
+                json!({ "error": e })
+            }
+        },
+        Err(e) => {
+            tracing::warn!("[RealAccount] 导入后构建 HTTP client 失败(best-effort): {e}");
+            json!({ "error": format!("构建 HTTP client 失败: {e}") })
+        }
+    };
+    Json(json!({
+        "success": true,
+        "message": "已导入并持久保留真实账号",
+        "refresh": refresh,
+    }))
+    .into_response()
 }
 
 /// POST /api/desktop/real-account/pin-current
 ///
-/// 钉住当前检测到的真实账号(官方活动 / 快照备份)进持久镜像。
+/// 钉住当前检测到的真实账号(官方活动 auth.json)进持久镜像。
 pub async fn pin_current_handler() -> impl IntoResponse {
     match codex_real_account::pin_current_account().await {
         Ok(()) => Json(json!({ "success": true, "message": "已钉住当前真实账号(持久保留)" }))

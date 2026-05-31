@@ -219,14 +219,14 @@ fn main() {
                                 tracing::warn!(
                                     "[RealAccount] 真实账号已失效(需重新登录),自动关闭自动解锁开关"
                                 );
-                                let turned_off =
-                                    handlers::settings::disable_auto_unlock_codex_plugins().await;
-                                if turned_off {
-                                    if let Some(window) =
-                                        app_handle_for_residual_scan.get_webview_window("main")
-                                    {
-                                        let _ = window.emit("real-account-relogin-required", ());
-                                    }
+                                // 关开关只在原本是 on 时有动作;但事件**无论开关原态都 emit**
+                                // (review #6)—— 前端靠这个事件标记「账号已失效」,开关已是
+                                // off 的新装用户也得知道账号失效,否则 detect 见 token 在就误报。
+                                let _ = handlers::settings::disable_auto_unlock_codex_plugins().await;
+                                if let Some(window) =
+                                    app_handle_for_residual_scan.get_webview_window("main")
+                                {
+                                    let _ = window.emit("real-account-relogin-required", ());
                                 }
                             }
                             Ok(outcome) => tracing::info!(

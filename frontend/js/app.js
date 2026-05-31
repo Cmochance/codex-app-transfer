@@ -1414,13 +1414,6 @@
       // 同步设置页"运行时状态"提示。dashboard 卡片跟 settings 页用同一份
       // /api/desktop/plugin-unlock/status 数据,文案前缀 "运行时状态：" 标识
       // 这是 daemon 当前态(跟用户配置区分开)。
-      // MOC-104:设置页「运行状态」简化成 已开启/未开启 + 状态色。
-      const runEl = $("#raRunStatus");
-      if (runEl) {
-        const on = ["injected", "connected", "connecting"].includes(unlock.status);
-        runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
-        runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
-      }
     } catch (e) {
       console.log("[PluginUnlock] status refresh failed:", e);
     }
@@ -1454,12 +1447,20 @@
         el.textContent = text;
         el.style.color = color;
       }
+      // 运行状态 = 是否启用了「自动解锁」(跟开关一致),不看 daemon 连接态 ——
+      // 用户反馈:Codex 开着 + 开关开着却显示「未开启」很困惑。
+      const runEl = $("#raRunStatus");
+      if (runEl) {
+        const on = $("#autoUnlockCodexPlugins")?.checked === true;
+        runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
+        runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
+      }
       // 有长期保留的真实账号 → 显示「清除真实账号」按钮。
       const forgetBtn = $("#realAccountForgetBtn");
       if (forgetBtn) forgetBtn.style.display = st.has_imported ? "" : "none";
       // 登录刚成功且尚未长期保留 → 自动持久(单账号工具:登录即选择真实账号模式,
       // 无需手动「钉住」)。has_imported 置真后不再重复触发;in-flight 用标志防抖。
-      if (login.state === "succeeded" && st.logged_in && !st.has_imported && !realAccountAutoPersisting) {
+      if (login.state === "succeeded" && st.logged_in && !st.has_imported && !realAccountAutoPersisting && !realAccountForgotten) {
         realAccountAutoPersisting = true;
         CCApi.realAccount.pinCurrent()
           .then(() => { showToast(t("realAccount.kept") || "已长期保留"); setTimeout(refreshRealAccountStatus, 300); })
@@ -1474,6 +1475,7 @@
   }
   let realAccountAutoPersisting = false;
   let realAccountExpired = false; // relogin-required 事件置真 → 账号状态显示「账号已失效」
+  let realAccountForgotten = false; // 用户点「清除」后置真 → 抑制本 session auto-persist 重生镜像
   // 轮询登录直到终态(succeeded/failed/cancelled)——固定几次 setTimeout 会在 OAuth
   // 慢于最后一次时漏掉 succeeded → auto-persist 不触发(connector P2)。running 期间
   // 持续轮询,终态或超 5min 停。
@@ -7925,6 +7927,7 @@
     // MOC-104 真实账号:登录(成功后自动长期保留)/ 导入文件 / 清除
     $("[data-action=real-account-login]")?.addEventListener("click", async () => {
       try {
+        realAccountForgotten = false; // 重新登录 = 重新选择真实账号模式,解除「已清除」抑制
         await CCApi.realAccount.login();
         showToast(t("realAccount.loginStarted") || "已启动登录,请在浏览器完成授权");
         // 轮询到终态;成功后 refreshRealAccountStatus 会自动把账号长期保留。
@@ -7943,8 +7946,17 @@
         let parsed;
         try { parsed = JSON.parse(text); }
         catch { showToast(t("realAccount.importBadJson") || "文件不是合法 JSON"); return; }
-        await CCApi.realAccount.import(parsed);
-        showToast(t("realAccount.imported") || "已导入并长期保留真实账号");
+        const resp = await CCApi.realAccount.import(parsed);
+        // 导入文件多半是旧的:后端导入后会按需刷一次 token。若刷不动且是 token
+        // 已失效(relogin_required),提示用户这份文件太旧需重新导出 / 登录,而不是
+        // 默默报"导入成功"让 plugin 模式拿过期账号去 401。
+        if (resp?.refresh?.outcome === "relogin_required") {
+          showToast(t("realAccount.importExpired") || "已导入,但该账号登录态已失效,请重新导出最新文件或改用「登录真实账号」");
+        } else {
+          showToast(t("realAccount.imported") || "已导入并长期保留真实账号");
+        }
+        // 重新导入即视为重新启用该账号,清掉本 session 的「已清除」抑制(review #1)。
+        realAccountForgotten = false;
         setTimeout(refreshRealAccountStatus, 500);
       } catch (e) { showToast(e.message); }
     });
@@ -7952,6 +7964,9 @@
       if (!window.confirm(t("realAccount.forgetConfirm") || "清除真实账号?启动将不再自动恢复它(不会删除当前活动 auth.json)。")) return;
       try {
         await CCApi.realAccount.forget();
+        // 抑制本 session 内的 auto-persist 重新生成镜像(review #1):清除后即便
+        // login.state 仍是 succeeded、活动仍是 chatgpt,也别把刚删的镜像又 pin 回来。
+        realAccountForgotten = true;
         showToast(t("realAccount.forgotten") || "已清除真实账号");
         setTimeout(refreshRealAccountStatus, 500);
       } catch (e) { showToast(e.message); }
@@ -7961,10 +7976,13 @@
       const m = $("#realAccountForceEnableModal");
       if (m) m.hidden = false;
     });
-    $("[data-action=real-account-force-cancel]")?.addEventListener("click", () => {
-      const m = $("#realAccountForceEnableModal");
-      if (m) m.hidden = true;
-    });
+    // modal 有两个取消触点(右上角 ✕ + 底部「取消」),都要绑(review #4)。
+    $all("[data-action=real-account-force-cancel]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const m = $("#realAccountForceEnableModal");
+        if (m) m.hidden = true;
+      })
+    );
     $("[data-action=real-account-force-confirm]")?.addEventListener("click", async () => {
       const m = $("#realAccountForceEnableModal");
       if (m) m.hidden = true;

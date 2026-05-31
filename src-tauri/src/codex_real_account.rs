@@ -19,10 +19,10 @@
 //!   不受文件变动/快照轮转影响);登录成功后前端自动 pin,启动时活动文件失效则从
 //!   镜像自动恢复(无需手动"切换/恢复"——单账号工具不是多账号切换器)。
 //!
-//! 检测来源(优先级,用户要求:只认官方 `.codex/auth.json` + transfer 自有备份,
-//! 不依赖任何特殊文件夹结构):
-//! ① 官方 `~/.codex/auth.json`(活动凭据)→ ② 用户导入的持久镜像 → ③ active 快照
-//! 备份 → ④ recovery 快照备份(上次 session apply 后挪过去的)。
+//! 检测来源(优先级):① 官方 `~/.codex/auth.json`(Codex 当前活动凭据)→ ② 用户
+//! 显式导入/钉住的持久镜像。**不扫 apply 快照备份** —— 那些是 transfer 改配置时的
+//! 内部备份(可能是数周前早已失效的旧 chatgpt),报成「你的真实账号」会误导(用户
+//! 实测反馈)。「长期保留」只认用户主动登录/导入产生的镜像。
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -42,8 +42,6 @@ pub enum AuthSource {
     /// 用户导入/钉住的 transfer 持久镜像(`~/.codex-app-transfer/real-account/
     /// imported-auth.json`)—— 不受 `~/.codex` 文件变动 / 快照轮转影响,长期保留。
     Imported,
-    /// transfer 快照备份(官方被改成 apikey 后,原 chatgpt 态留在 active/recovery 快照)。
-    Backup,
     /// 哪里都没找到可用的真实 chatgpt 登录态。
     None,
 }
@@ -54,8 +52,8 @@ pub struct RealAccountStatus {
     /// 是否检测到**可用**的真实 chatgpt 登录态(`auth_mode==chatgpt` + access/refresh token 齐)。
     pub logged_in: bool,
     /// 活动 `auth.json` 的 `auth_mode`(`chatgpt` / `apikey` / 缺失=None)。
-    /// 注意:这是**官方活动文件**的模式,即便可用凭据是从 backup 检测到的也反映活动态,
-    /// 便于前端区分"活动就是 chatgpt" vs "活动是 apikey、但备份里有 chatgpt"。
+    /// 注意:这是**官方活动文件**的模式,即便可用凭据是从持久镜像检测到的也反映活动态,
+    /// 便于前端区分"活动就是 chatgpt" vs "活动是 apikey、但镜像里有 chatgpt"。
     pub active_auth_mode: Option<String>,
     /// chatgpt `account_id`(从被采纳的来源里取,可能缺失)。
     pub account_id: Option<String>,
@@ -128,38 +126,13 @@ fn imported_mirror_path(paths: &CodexPaths) -> PathBuf {
         .join("imported-auth.json")
 }
 
-/// 扫一个快照目录(`<dir>/<session>/auth.json`)找**最新**的可用 chatgpt。
-/// [review #3] 按 auth.json mtime 降序,不取 `read_dir` 任意首个 —— 多份历史快照
-/// 时避免恢复到旧账号 / 拿到已轮换的旧 refresh token。只读;active/recovery 共用。
-fn scan_snapshots_for_chatgpt(dir: &std::path::Path) -> Option<(PathBuf, Value, ChatgptAuth)> {
-    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let auth_path = entry.path().join("auth.json");
-        if !auth_path.is_file() {
-            continue;
-        }
-        let mtime = std::fs::metadata(&auth_path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        candidates.push((mtime, auth_path));
-    }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0)); // 最新优先
-    for (_, auth_path) in candidates {
-        if let Ok(v) = read_auth(&auth_path) {
-            if let Some(parsed) = parse_chatgpt_auth(&v) {
-                return Some((auth_path, v, parsed));
-            }
-        }
-    }
-    None
-}
-
-/// 按优先级定位**可用**的真实 chatgpt `auth.json`:① 官方活动 → ② 用户导入的持久
-/// 镜像 → ③ active 快照备份 → ④ recovery 快照备份(上次 session apply 后被
-/// `move_stale_active_snapshots_to_recovery` 挪过去的,review P2 补)。
-/// [`detect`] / refresh / activate 共用,口径一致。只读。
+/// 定位**当前**可用的真实 chatgpt 账号:① 官方活动 `~/.codex/auth.json` → ② 用户
+/// 显式导入/钉住的持久镜像。**不扫 apply 快照备份** —— 那些是 transfer 改配置时
+/// 的内部备份(可能是几周前早已失效的旧 chatgpt),报成「你的真实账号」会误导
+/// 用户、让活动是 apikey 的人以为账号被改(用户实测反馈)。「长期保留」只认用户
+/// 主动登录/导入产生的镜像。[`detect`] / refresh / reconcile 共用,口径一致。只读。
 fn locate_chatgpt_auth(paths: &CodexPaths) -> Option<LocatedChatgptAuth> {
-    // ① 官方活动 auth.json。
+    // ① 官方活动 auth.json(Codex 当前真在用的那份)。
     if let Ok(v) = read_auth(&paths.auth_json) {
         if let Some(parsed) = parse_chatgpt_auth(&v) {
             return Some(LocatedChatgptAuth {
@@ -170,7 +143,7 @@ fn locate_chatgpt_auth(paths: &CodexPaths) -> Option<LocatedChatgptAuth> {
             });
         }
     }
-    // ② 用户导入的持久镜像(最权威的"长期保留"账号)。
+    // ② 用户导入/钉住的持久镜像(长期保留的真相源)。
     let mirror = imported_mirror_path(paths);
     if mirror.is_file() {
         if let Ok(v) = read_auth(&mirror) {
@@ -184,22 +157,11 @@ fn locate_chatgpt_auth(paths: &CodexPaths) -> Option<LocatedChatgptAuth> {
             }
         }
     }
-    // ③ active 快照 → ④ recovery 快照。
-    for dir in [&paths.active_snapshots_dir, &paths.recovery_snapshots_dir] {
-        if let Some((path, value, parsed)) = scan_snapshots_for_chatgpt(dir) {
-            return Some(LocatedChatgptAuth {
-                path,
-                source: AuthSource::Backup,
-                value,
-                account_id: parsed.account_id,
-            });
-        }
-    }
     None
 }
 
 /// 读官方活动 `auth.json` 的 `auth_mode`(不存在/坏 → None)。检测结果里单独
-/// 报告活动模式,便于前端区分"活动就是 chatgpt" vs "活动 apikey、备份有 chatgpt"。
+/// 报告活动模式,便于前端区分"活动就是 chatgpt" vs "活动 apikey、镜像有 chatgpt"。
 fn active_auth_mode(paths: &CodexPaths) -> Option<String> {
     read_auth(&paths.auth_json)
         .ok()?
@@ -208,7 +170,7 @@ fn active_auth_mode(paths: &CodexPaths) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// 检测真实 chatgpt 账号:按"官方活动 → transfer 备份"定位可用凭据(见
+/// 检测真实 chatgpt 账号:按"官方活动 → 持久镜像"定位可用凭据(见
 /// [`locate_chatgpt_auth`])。纯只读,绝不写盘 / spawn。
 pub fn detect() -> RealAccountStatus {
     let Ok(paths) = CodexPaths::from_home_env() else {
@@ -231,14 +193,14 @@ pub fn detect() -> RealAccountStatus {
 
 // ── Token 刷新(MOC-104 req#2)─────────────────────────────────────────
 //
-// 真实 chatgpt token 会过期。用户要求每次启动刷新真实账号(含 transfer 备份里
-// 的那份)的 token 避免过期。刷新走官方 OAuth refresh_token 流(常量与请求格式
-// 借鉴 Codex_Account_Switch `shared/runtime/chatgpt_api.rs`,致谢见 ACKNOWLEDGEMENTS.md):
+// 真实 chatgpt token 会过期。用户要求每次启动刷新真实账号的 token 避免过期。刷新
+// 走官方 OAuth refresh_token 流(常量与请求格式借鉴 Codex_Account_Switch
+// `shared/runtime/chatgpt_api.rs`,致谢见 ACKNOWLEDGEMENTS.md):
 //   POST https://auth.openai.com/oauth/token
 //        grant_type=refresh_token&refresh_token=<rt>&client_id=<id>
 // 响应 {access_token, id_token?, refresh_token?};只更新 tokens.{access,refresh,
 // id} + 顶层 last_refresh,其它字段透传(非破坏)。刷的是 [`locate_chatgpt_auth`]
-// 定位到的那份文件(官方活动 or 备份),与检测口径一致。
+// 定位到的那份文件(官方活动 or 持久镜像),与检测口径一致。
 
 use base64::Engine;
 
@@ -254,7 +216,7 @@ const EXPIRY_SKEW_SECONDS: i64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
 pub enum RefreshOutcome {
-    /// 没有可刷新的真实 chatgpt 账号(官方 + 备份都没有)。
+    /// 没有可刷新的真实 chatgpt 账号(官方活动 + 持久镜像都没有)。
     NoAccount,
     /// access_token 还没到期(或无法解析过期时间 → 保守视作有效),跳过刷新。
     StillValid { source: AuthSource },
@@ -348,8 +310,8 @@ fn apply_refresh_response(
 /// 锁内可跨 `.await`,故用 `tokio::sync::Mutex`。
 static AUTH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// 启动时刷新真实 chatgpt 账号的 token(若将过期)。定位官方/备份里那份真实
-/// chatgpt `auth.json` → 检查 access_token 是否将过期 → 走 refresh_token 流 →
+/// 启动时刷新真实 chatgpt 账号的 token(若将过期)。定位官方活动 / 持久镜像里
+/// 那份真实 chatgpt `auth.json` → 检查 access_token 是否将过期 → 走 refresh_token 流 →
 /// 原子写回(`write_auth`,0o600,非 token 字段透传)。
 ///
 /// 非破坏:只更新 token 字段;无真实账号 / token 仍有效时不写盘。任何步骤失败
@@ -431,9 +393,18 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if mirror_rt == refresh_token {
-                    apply_refresh_response(&mut mv, &parsed, &now_iso)?;
-                    if let Err(e) = write_auth(&mirror, &mv) {
-                        tracing::warn!("[RealAccount] 同步刷新 token 到持久镜像失败: {e}");
+                    // [review #5] 镜像同步是 best-effort:不能用 `?` 把这里的错误冒泡
+                    // 成整个 refresh 失败 —— 主活动文件这时已成功刷新写回,
+                    // 镜像写坏只 warn,不影响 Refreshed 结果 / 后续启动调谐。
+                    match apply_refresh_response(&mut mv, &parsed, &now_iso) {
+                        Ok(()) => {
+                            if let Err(e) = write_auth(&mirror, &mv) {
+                                tracing::warn!("[RealAccount] 同步刷新 token 到持久镜像失败: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("[RealAccount] 持久镜像结构异常,跳过 token 同步: {e}")
+                        }
                     }
                 }
             }
@@ -592,7 +563,7 @@ pub async fn import_auth(value: Value) -> Result<(), String> {
     import_locked(&paths, &value)
 }
 
-/// 钉住当前检测到的真实账号(官方活动 / 快照备份)进持久镜像。
+/// 钉住当前检测到的真实账号(官方活动 auth.json)进持久镜像。
 /// [review #5] locate + 写全程持 `AUTH_LOCK`,避免锁外读到 stale 值、随后被并发
 /// refresh 抢先轮换 token,导致 pin 用过期 access + 已花掉的 refresh 覆盖刚刷新的。
 pub async fn pin_current_account() -> Result<(), String> {
@@ -619,9 +590,16 @@ pub async fn forget_imported() -> Result<bool, String> {
 
 /// [MOC-104 req#5 启动调谐] 启动时:① 刷新真实账号 token(保鲜);② 若用户导入过
 /// 持久镜像、且活动 `~/.codex/auth.json` 已不是有效真实账号(被 apply 改 apikey /
-/// 登出 / 清掉)→ 从镜像恢复到活动(先备份)。**只对用户显式导入的镜像自动恢复**,
-/// 普通快照备份不自动抢活动文件(避免误覆盖代理模式的 apikey)。best-effort。
+/// 登出 / 清掉)→ 从镜像恢复到活动(先备份)。**只对用户显式导入/钉住的持久镜像
+/// 自动恢复**,其它来源不自动抢活动文件(避免误覆盖代理模式的 apikey)。best-effort。
 pub async fn reconcile_on_startup(client: &reqwest::Client) -> Result<RefreshOutcome, String> {
+    // [review #2] 有 codex login 正在进行(用户在启动窗口内点了登录)→ 跳过调谐。
+    // 否则会跟 codex login 抢写 `~/.codex/auth.json`:reconcile 刷的是登录前的旧
+    // 账号,可能盖掉 codex login 刚写入的新账号。登录成功后前端会自动 pin/刷新。
+    if matches!(login_status(), LoginState::Running) {
+        tracing::info!("[RealAccount] 启动调谐跳过:codex login 进行中");
+        return Ok(RefreshOutcome::NoAccount);
+    }
     // 先刷新(refresh_if_needed 内部持 AUTH_LOCK)。
     let outcome = refresh_if_needed(client).await?;
     // 再看是否要把导入镜像恢复到活动。
@@ -805,27 +783,36 @@ mod tests {
     }
 
     #[test]
-    fn locate_falls_back_to_backup_when_active_is_apikey() {
+    fn locate_ignores_snapshot_backups() {
+        // 用户反馈:不能把 apply 快照备份里的旧 chatgpt 报成「你的真实账号」。
+        // 活动是 apikey、镜像不存在、快照里有 chatgpt → locate 应返回 None。
         let dir = tempfile::tempdir().unwrap();
         let paths = CodexPaths::from_home_dir(dir.path());
-        // 活动文件是 apikey(transfer apply 改写后的常态)
         write_json(&paths.auth_json, &json!({"auth_mode": "apikey"}));
-        // 备份里一个 apikey session + 一个 chatgpt session
-        write_json(
-            &paths.active_snapshots_dir.join("sess-a").join("auth.json"),
-            &json!({"auth_mode": "apikey"}),
-        );
         write_json(
             &paths.active_snapshots_dir.join("sess-b").join("auth.json"),
             &chatgpt_auth(),
         );
-        let found = locate_chatgpt_auth(&paths).expect("备份里应找到 chatgpt");
-        assert_eq!(found.source, AuthSource::Backup);
-        assert!(found.path.ends_with("sess-b/auth.json"));
-
-        // detect() 同口径:报 backup、活动模式 apikey
-        // (detect 读 from_home_env,这里直接验 locate + active_auth_mode 组合即可)
+        write_json(
+            &paths.recovery_snapshots_dir.join("old").join("auth.json"),
+            &chatgpt_auth(),
+        );
+        assert!(
+            locate_chatgpt_auth(&paths).is_none(),
+            "快照备份里的 chatgpt 不应被当成当前真实账号"
+        );
         assert_eq!(active_auth_mode(&paths).as_deref(), Some("apikey"));
+    }
+
+    #[test]
+    fn locate_finds_imported_mirror_when_active_apikey() {
+        // 但用户显式导入的镜像应被认出(长期保留的真相源)。
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(&paths.auth_json, &json!({"auth_mode": "apikey"}));
+        write_json(&imported_mirror_path(&paths), &chatgpt_auth());
+        let found = locate_chatgpt_auth(&paths).expect("镜像应被认出");
+        assert_eq!(found.source, AuthSource::Imported);
     }
 
     #[test]
