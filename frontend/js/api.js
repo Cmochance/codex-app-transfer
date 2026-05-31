@@ -627,6 +627,18 @@ window.CCApi.realAccount = {
   async activate() {
     return api('POST', '/api/desktop/real-account/activate');
   },
+  /** 从文件导入真实账号(authJson = auth.json 的解析对象) */
+  async import(authJson) {
+    return api('POST', '/api/desktop/real-account/import', authJson);
+  },
+  /** 钉住当前检测到的真实账号(持久保留) */
+  async pinCurrent() {
+    return api('POST', '/api/desktop/real-account/pin-current');
+  },
+  /** 忘记导入的真实账号(删持久镜像) */
+  async forget() {
+    return api('POST', '/api/desktop/real-account/forget');
+  },
 };
 
 window.CCApi.theme = {

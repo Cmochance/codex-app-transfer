@@ -253,11 +253,11 @@ fn main() {
                         return;
                     }
                 };
-                match crate::codex_real_account::refresh_if_needed(&client).await {
+                match crate::codex_real_account::reconcile_on_startup(&client).await {
                     Ok(outcome) => {
-                        tracing::info!("[RealAccount] 启动 token 刷新: {outcome:?}")
+                        tracing::info!("[RealAccount] 启动调谐(刷新 + 必要时从导入镜像恢复): {outcome:?}")
                     }
-                    Err(e) => tracing::warn!("[RealAccount] 启动 token 刷新失败(忽略): {e}"),
+                    Err(e) => tracing::warn!("[RealAccount] 启动调谐失败(忽略): {e}"),
                 }
             });
 

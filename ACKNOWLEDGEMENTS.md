@@ -371,6 +371,29 @@
 - **代码层引用**(`crates/usage_tracker/src/lib.rs:5-12` 节选):
   > 借鉴自 ryoppippi/ccusage (MIT)。解析 + 数据类型 + paths 见 vendored_ccusage 模块,直接 vendor 自 ccusage `rust/crates/ccusage/src/adapter/codex/{parser,types,paths}.rs` 与同 crate `types.rs` / `fast.rs` / `home.rs` / `date_utils.rs` / `utils.rs`。本文件 loader + aggregator 算法 1:1 对照 ccusage `rust/crates/ccusage/src/adapter/codex/{loader.rs,aggregate.rs}`,但移除 CLI 层(`SharedArgs` / `progress::track_usage_load`)+ 不做并行。
 
+## Cmochance/Codex_Account_Switch
+
+- **Link**: https://github.com/Cmochance/Codex_Account_Switch
+- **License**: 同作者自有项目(Cmochance);借鉴仍按上游惯例记录归属。
+- **借鉴形式**: 算法借鉴(`codex login` 子进程调起 / 等待-取消模式)+ 数据模式参照(ChatGPT OAuth client_id / refresh endpoint / auth.json chatgpt 结构)+ 思路借鉴(`~/.codex` 之外维护持久镜像、Windows 进程辅助)
+- **首次借鉴 PR / 时间**: 早期 Windows 进程辅助起继承(PR #191 期);MOC-104 真实账号 plugin 模式集中借鉴(PR #338,2026-05-31)
+- **借鉴清单**:
+  - **ChatGPT OAuth 常量 + refresh 请求格式**(上游 `src-tauri/shared/runtime/chatgpt_api.rs:96-108,~400-450`):issuer `https://auth.openai.com`、public client_id `app_EMoamEEZ73f0CkXaXp7hrann`、`POST /oauth/token` `grant_type=refresh_token` 表单格式 → `src-tauri/src/codex_real_account.rs`(`OPENAI_ISSUER` / `OPENAI_OAUTH_CLIENT_ID` / `refresh_if_needed`)
+  - **chatgpt 模式 auth.json 结构**(`{auth_mode:"chatgpt", tokens:{access_token,refresh_token,id_token,account_id}, last_refresh}`)→ `codex_real_account.rs::parse_chatgpt_auth` / `apply_refresh_response`
+  - **`codex login` 子进程调起 + 等待/取消模式**(上游 `mac/runtime/process.rs::run_codex_login` + `shared/runtime/login_cancel.rs::wait_for_login_or_cancel`)→ `codex_real_account.rs::{start_login,cancel_login,login_status}`(本项目用后台线程 reap + pid kill,不 1:1 复刻)
+  - **`~/.codex` 之外维护持久镜像 + 失效恢复**思路(上游 account_backup 多账号目录 + switch overlay)→ `codex_real_account.rs::{imported_mirror_path,import_auth,reconcile_on_startup}`(本项目单账号镜像,不引多账号 switch 体系)
+  - **Windows `hide_console_window`(`CREATE_NO_WINDOW` flag)**(上游 `src-tauri/win/runtime/process.rs::hide_console_window`)→ `src-tauri/src/admin/services/desktop/process.rs:175`
+  - **OpenAI 官方 Windows Store 包 ID 对齐** → `src-tauri/src/admin/services/desktop/process.rs:16`
+  - **纯配置写入模式(代理不参与转发)思路** → `src-tauri/src/admin/services/desktop/snapshot.rs:82`
+  - **Windows 进程辅助参照** → `src-tauri/src/windows_msix.rs:235`
+- **本项目差异 / 扩展**:
+  - 不自建 OpenAI OAuth,登录复用官方 `codex login`(轻、稳、不怕 OpenAI 改 OAuth);上游也是调官方 login。
+  - 单账号持久镜像 + 「活动文件失效才自动恢复」,不引入上游的多账号 switch / overlay / plan 查询体系。
+  - token 刷新整个 exchange 在 `tokio::Mutex` 内串行,防 single-use refresh_token 并发双 POST。
+- **同步策略**: client_id / refresh endpoint 跟随官方 codex 变化(上游同源);monitor only。
+- **代码层引用**(`codex_real_account.rs` 节选):
+  > ChatGPT desktop / Codex CLI 公开 OAuth client id(借鉴 Codex_Account_Switch chatgpt_api.rs:100,该处注明已对照官方 codex 与 codex-switcher 验证)。
+
 ---
 
 ## 维护规则

@@ -293,6 +293,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 - [`BigPizzaV3/CodexPlusPlus`](https://github.com/BigPizzaV3/CodexPlusPlus) — Windows CDP 注入路径
 - [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — 受管块六操作设计
 - [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage) — rollout token 用量解析
+- [`Cmochance/Codex_Account_Switch`](https://github.com/Cmochance/Codex_Account_Switch) — 登录调起 + token 刷新
 
 ### 社区贡献者
 
