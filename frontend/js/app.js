@@ -1414,36 +1414,46 @@
       // 同步设置页"运行时状态"提示。dashboard 卡片跟 settings 页用同一份
       // /api/desktop/plugin-unlock/status 数据,文案前缀 "运行时状态：" 标识
       // 这是 daemon 当前态(跟用户配置区分开)。
-      const runtimeNote = $("#pluginUnlockRuntimeStatus");
-      if (runtimeNote) {
-        const prefix = t("settings.pluginUnlockRuntimeStatusPrefix") || "运行时状态：";
-        runtimeNote.textContent = `${prefix}${s.text}`;
+      // MOC-104:设置页「运行状态」简化成 已开启/未开启 + 状态色。
+      const runEl = $("#raRunStatus");
+      if (runEl) {
+        const on = ["injected", "connected", "connecting"].includes(unlock.status);
+        runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
+        runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
       }
     } catch (e) {
       console.log("[PluginUnlock] status refresh failed:", e);
     }
   }
 
-  // MOC-104:真实 ChatGPT 账号状态(检测 + 登录进度)。失败静默,不影响其它卡片。
+  // MOC-104:真实 ChatGPT 账号「账号状态」(获取成功/获取失败/账号已失效 + 状态色)。
+  // 失败静默,不影响其它卡片。realAccountExpired 由 relogin-required 事件置真。
   async function refreshRealAccountStatus() {
     try {
       const resp = await CCApi.realAccount.status();
-      const el = $("#realAccountStatus");
-      if (!el) return;
       const st = resp.status || {};
       const login = resp.login || {};
-      let text;
-      if (login.state === "running") {
-        text = t("realAccount.loginRunning") || "登录中…请在浏览器完成授权";
-      } else if (st.logged_in) {
-        const kept = st.has_imported ? t("realAccount.kept") || "已长期保留" : "";
-        text = `${t("realAccount.loggedIn") || "已登录真实 ChatGPT 账号"}${kept ? "," + kept : ""}`;
-      } else if (login.state === "failed") {
-        text = `${t("realAccount.loginFailed") || "登录失败"}: ${login.message || ""}`;
-      } else {
-        text = t("realAccount.notLoggedIn") || "未检测到真实 ChatGPT 账号";
+      // 登录成功 = 拿到新鲜账号,清掉「已失效」标记。
+      if (login.state === "succeeded") realAccountExpired = false;
+      const el = $("#raAcctStatus");
+      if (el) {
+        let text, color;
+        if (login.state === "running") {
+          text = t("realAccount.acctFetching") || "获取中…";
+          color = "var(--ra-muted, #999)";
+        } else if (realAccountExpired) {
+          text = t("realAccount.acctExpired") || "账号已失效";
+          color = "var(--ra-bad, #d33)";
+        } else if (st.logged_in) {
+          text = t("realAccount.acctOk") || "获取成功";
+          color = "var(--ra-ok, #1a8f3c)";
+        } else {
+          text = t("realAccount.acctFail") || "获取失败";
+          color = "var(--ra-muted, #999)";
+        }
+        el.textContent = text;
+        el.style.color = color;
       }
-      el.textContent = text;
       // 有长期保留的真实账号 → 显示「清除真实账号」按钮。
       const forgetBtn = $("#realAccountForgetBtn");
       if (forgetBtn) forgetBtn.style.display = st.has_imported ? "" : "none";
@@ -1463,6 +1473,7 @@
     }
   }
   let realAccountAutoPersisting = false;
+  let realAccountExpired = false; // relogin-required 事件置真 → 账号状态显示「账号已失效」
   // 轮询登录直到终态(succeeded/failed/cancelled)——固定几次 setTimeout 会在 OAuth
   // 慢于最后一次时漏掉 succeeded → auto-persist 不触发(connector P2)。running 期间
   // 持续轮询,终态或超 5min 停。
@@ -8046,6 +8057,14 @@
           if (count > 0) {
             showToast(tFmt("settings.residualScanStartupToast", { count }));
           }
+        });
+        // MOC-104:真实账号失效 → 后端已自动关「自动解锁」开关,这里提示重登 + 刷新 UI。
+        await tauriEvent.listen("real-account-relogin-required", () => {
+          realAccountExpired = true; // 账号状态显示「账号已失效」
+          showToast(t("realAccount.reloginRequired") || "真实 ChatGPT 账号已失效,已自动关闭自动解锁,请重新登录");
+          const toggle = $("#autoUnlockCodexPlugins");
+          if (toggle) toggle.checked = false;
+          refreshRealAccountStatus();
         });
       }
     } catch (err) {

@@ -444,6 +444,32 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
     }
 }
 
+/// [MOC-104] 真实账号失效时自动关「自动解锁 Codex Plugins」开关 + 停 daemon。
+/// 仅在当前为 on 时动作(返回 `true`),避免重复 no-op。复用 save_settings 同款
+/// "开关变更即时停 daemon"逻辑。
+pub async fn disable_auto_unlock_codex_plugins() -> bool {
+    let changed = with_config_write(|cfg| {
+        let was_on = cfg
+            .get("settings")
+            .and_then(|s| s.get("autoUnlockCodexPlugins"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !was_on {
+            return Ok(ConfigMutation::Unchanged(false));
+        }
+        ensure_settings_object(cfg).insert("autoUnlockCodexPlugins".to_owned(), Value::Bool(false));
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false);
+    if changed {
+        crate::admin::handlers::plugin_unlock::get_service()
+            .await
+            .stop()
+            .await;
+    }
+    changed
+}
+
 /// #262:把 `settings.language` 同步到 adapters 全局 [`codex_app_transfer_adapters::core::language`]。
 /// caller 路径:save_settings 后 + main.rs startup 加载 settings 时各调一次。
 pub fn sync_user_language_from_settings(settings: &Value) {

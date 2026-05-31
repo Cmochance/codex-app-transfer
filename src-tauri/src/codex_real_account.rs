@@ -3,7 +3,8 @@
 //! 「真实账号 plugin 模式」的基础:判断本机是否已有可用的真实 ChatGPT 登录态
 //! (`auth.json` 里 `auth_mode == "chatgpt"` 且 tokens 齐全)。当前 plugins 解锁
 //! 靠 CDP 注入伪造 `setAuthMethod('chatgpt')`,没有真实 userID → Codex 启动后要
-//! 重新初始化登录态(~5.8s)。真实账号模式用真 `auth.json` 取代伪造,避开代价。
+//! 重新初始化登录态(明显的额外延迟,Windows 上可能数十秒)。真实账号模式用真
+//! `auth.json` 取代伪造,避开代价。
 //!
 //! 能力(注意:**只有 [`detect`] 是纯只读**,其余按需写 `auth.json` —— 都「先备份
 //! 再原子写、失败即中止」,非破坏):
@@ -259,6 +260,22 @@ pub enum RefreshOutcome {
     StillValid { source: AuthSource },
     /// 刷新成功并写回。
     Refreshed { source: AuthSource },
+    /// 真实账号**不可用**:refresh_token 失效 / 已被用过 / invalid_grant —— 续期无望,
+    /// 需要重新登录。上层据此自动关「自动解锁」开关 + 停 daemon + 提示用户重登。
+    ReloginRequired { source: AuthSource },
+}
+
+/// 刷新失败信息是否表示"需要重新登录"(refresh_token 永久失效,不是瞬时网络错)。
+/// 借鉴 Codex_Account_Switch `chatgpt_api.rs::looks_like_relogin_required` 的签名集。
+fn looks_like_relogin_required(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("token_invalidated")
+        || m.contains("refresh_token_reused")
+        || m.contains("invalid_grant")
+        || m.contains("authentication token has been invalidated")
+        || m.contains("refresh token has already been used")
+        || m.contains("please try signing in again")
+        || m.contains("please log out and sign in again")
 }
 
 /// OAuth refresh 响应:只取我们要写回 auth.json 的字段。
@@ -383,6 +400,12 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        // refresh_token 永久失效(已用过 / invalid_grant 等)→ 续期无望,报
+        // ReloginRequired 让上层关「自动解锁」+ 提示重登,而非当瞬时错误吞掉。
+        if looks_like_relogin_required(&format!("{status} {body}")) {
+            tracing::warn!("[RealAccount] refresh 失败 = 需重新登录: {status} {body}");
+            return Ok(RefreshOutcome::ReloginRequired { source });
+        }
         return Err(format!("OAuth refresh 返回 {status}: {body}"));
     }
     let parsed: OAuthRefreshResponse = resp
@@ -910,6 +933,20 @@ mod tests {
             })
             .expect("import 前应备份原活动 auth.json");
         assert_eq!(read_auth(&prebackup).unwrap()["auth_mode"], "apikey");
+    }
+
+    #[test]
+    fn relogin_required_matches_permanent_failures_only() {
+        assert!(looks_like_relogin_required(
+            "400 {\"error\":\"invalid_grant\"}"
+        ));
+        assert!(looks_like_relogin_required(
+            "refresh token has already been used"
+        ));
+        assert!(looks_like_relogin_required("token_invalidated"));
+        // 瞬时/网络错误不算需重登
+        assert!(!looks_like_relogin_required("500 internal server error"));
+        assert!(!looks_like_relogin_required("timed out"));
     }
 
     #[test]

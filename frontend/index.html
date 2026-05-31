@@ -483,9 +483,12 @@
                 <input type="file" id="realAccountImportFile" accept=".json,application/json" style="display:none;">
               </div>
               <p class="settings-note" data-i18n="settings.autoUnlockCodexPluginsHint">此功能需要通过本应用内启动 Codex 才能正常使用。点击右侧「重启 Codex」可直接重启 Codex 并触发自动注入。</p>
-              <p class="settings-note" id="pluginUnlockRuntimeStatus" data-i18n="settings.pluginUnlockRuntimeStatus">运行时状态：未检测</p>
               <p class="settings-note" data-i18n="realAccount.sectionHint">真实账号模式:用真实 ChatGPT 账号登录,避开 CDP 伪造登录带来的额外启动延迟。登录后自动长期保留,活动 auth.json 被改写也会在启动时自动恢复。</p>
-              <p class="settings-note" id="realAccountStatus" data-i18n="realAccount.statusUnknown">检测中…</p>
+              <p class="settings-note" style="margin-top:6px;">
+                <span data-i18n="realAccount.runStatusLabel">运行状态</span>:<strong id="raRunStatus">—</strong>
+                <span style="margin:0 12px;opacity:.4;">·</span>
+                <span data-i18n="realAccount.acctStatusLabel">账号状态</span>:<strong id="raAcctStatus">—</strong>
+              </p>
             </div>
           </div>
           <!-- MOC-104 强制开启二次确认弹窗(高延迟警告)。Tauri webview 的 window.confirm
@@ -496,7 +499,7 @@
                 <h3 data-i18n="realAccount.forceEnableTitle">强制开启(高延迟)</h3>
                 <button class="codex-modal-close" type="button" data-action="real-account-force-cancel"><i class="bi bi-x-lg"></i></button>
               </div>
-              <p class="codex-modal-desc" data-i18n="realAccount.forceEnableWarn">强制开启会用 CDP 注入伪造登录态,Codex 每次启动会多 ~5.8s 加载延迟。建议改用「登录真实账号」避免该延迟。确定要强制开启吗?</p>
+              <p class="codex-modal-desc" data-i18n="realAccount.forceEnableWarn">强制开启会用 CDP 注入伪造登录态,Codex 每次启动会多一段明显的加载延迟(Windows 上可能长达数十秒)。建议改用「登录真实账号」避免该延迟。确定要强制开启吗?</p>
               <div class="codex-modal-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
                 <button class="btn btn-sm btn-outline-secondary" type="button" data-action="real-account-force-cancel" data-i18n="common.cancel">取消</button>
                 <button class="btn btn-sm btn-outline-warning" type="button" data-action="real-account-force-confirm" data-i18n="realAccount.forceEnableConfirm">确定强制开启</button>

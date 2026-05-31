@@ -211,7 +211,24 @@ fn main() {
                     .build()
                 {
                     Ok(client) => {
+                        use crate::codex_real_account::RefreshOutcome;
                         match crate::codex_real_account::reconcile_on_startup(&client).await {
+                            // [MOC-104 req] 真实账号失效(refresh_token 永久无效)→ 自动关
+                            // 「自动解锁」开关 + 停 daemon + emit 事件让前端提示重新登录。
+                            Ok(RefreshOutcome::ReloginRequired { .. }) => {
+                                tracing::warn!(
+                                    "[RealAccount] 真实账号已失效(需重新登录),自动关闭自动解锁开关"
+                                );
+                                let turned_off =
+                                    handlers::settings::disable_auto_unlock_codex_plugins().await;
+                                if turned_off {
+                                    if let Some(window) =
+                                        app_handle_for_residual_scan.get_webview_window("main")
+                                    {
+                                        let _ = window.emit("real-account-relogin-required", ());
+                                    }
+                                }
+                            }
                             Ok(outcome) => tracing::info!(
                                 "[RealAccount] 启动调谐(刷新 + 必要时从导入镜像恢复): {outcome:?}"
                             ),
