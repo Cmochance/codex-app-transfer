@@ -688,6 +688,12 @@ pub async fn reconcile_on_startup(client: &reqwest::Client) -> Result<RefreshOut
     }
     // 再看是否要把导入镜像恢复到活动。
     let _guard = AUTH_LOCK.lock().await;
+    // [connector review] 取锁后、写活动前再查一次 login:reconcile 进行中(refresh 返回
+    // 之后)用户可能点了登录,codex login 已写入新账号 → 别用旧镜像盖掉刚授权的账号。
+    if matches!(login_status(), LoginState::Running) {
+        tracing::info!("[RealAccount] reconcile 恢复跳过:codex login 进行中");
+        return Ok(outcome);
+    }
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     if active_is_real_chatgpt(&paths) {
         return Ok(outcome); // 活动已是真实账号,不动。

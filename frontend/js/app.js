@@ -1469,10 +1469,20 @@
       // 有长期保留的真实账号 → 显示「清除真实账号」按钮。
       const forgetBtn = $("#realAccountForgetBtn");
       if (forgetBtn) forgetBtn.style.display = st.has_imported ? "" : "none";
-      // 登录刚成功且尚未长期保留 → 自动持久(单账号工具:登录即选择真实账号模式,
-      // 无需手动「钉住」)。has_imported 置真后不再重复触发;in-flight 用标志防抖。
-      if (login.state === "succeeded" && st.logged_in && !st.has_imported && !realAccountAutoPersisting && !realAccountForgotten) {
+      // 新登录开始 → 复位「本次登录已持久」标记,下次成功要重新 pin(替换旧镜像)。
+      if (login.state === "running") realAccountLoginPinned = false;
+      // 自动持久(单账号工具:登录即选择真实账号模式,无需手动「钉住」):
+      // ① 登录刚成功 → 把刚授权的活动账号写进镜像,**即便已有旧镜像也要替换**
+      //    (connector review:旧镜像可能是已失效账号,不替换会在日后启动被恢复回去
+      //    盖掉刚重登的账号);每次登录成功只 pin 一次(realAccountLoginPinned 防重复)。
+      // ② 或:活动已是真实账号但还没有镜像(如 app 外登录)→ 首次持久化一次。
+      // 两种都要求活动确实是真实 chatgpt(source=official),不拿镜像态去 pin。
+      const activeReal = st.logged_in === true && st.source === "official";
+      const justLoggedIn = login.state === "succeeded" && !realAccountLoginPinned;
+      const firstPersist = activeReal && !st.has_imported;
+      if (activeReal && (justLoggedIn || firstPersist) && !realAccountAutoPersisting && !realAccountForgotten) {
         realAccountAutoPersisting = true;
+        if (justLoggedIn) realAccountLoginPinned = true;
         CCApi.realAccount.pinCurrent()
           .then(() => { showToast(t("realAccount.kept") || "已长期保留"); setTimeout(refreshRealAccountStatus, 300); })
           .catch((e) => console.log("[RealAccount] auto-persist failed:", e))
@@ -1485,6 +1495,7 @@
     }
   }
   let realAccountAutoPersisting = false;
+  let realAccountLoginPinned = false; // 本次登录成功是否已 pin(替换镜像);新登录开始时复位
   let realAccountExpired = false; // relogin-required 事件置真 → 账号状态显示「账号已失效」
   let realAccountForgotten = false; // 用户点「清除」后置真 → 抑制本 session auto-persist 重生镜像
   // 轮询登录直到终态(succeeded/failed/cancelled)——固定几次 setTimeout 会在 OAuth
