@@ -605,6 +605,26 @@ window.CCApi.pluginUnlock = {
   },
 };
 
+// MOC-104 真实 ChatGPT 账号 plugin 模式
+window.CCApi.realAccount = {
+  /** 检测真实 chatgpt 登录态 + 登录流程状态 */
+  async status() {
+    return api('GET', '/api/desktop/real-account/status');
+  },
+  /** 刷新真实账号 token(将过期才刷) */
+  async refresh() {
+    return api('POST', '/api/desktop/real-account/refresh');
+  },
+  /** 在 transfer 内调起官方 codex login(非阻塞,弹浏览器做 OAuth) */
+  async login() {
+    return api('POST', '/api/desktop/real-account/login');
+  },
+  /** 取消进行中的登录 */
+  async loginCancel() {
+    return api('POST', '/api/desktop/real-account/login/cancel');
+  },
+};
+
 window.CCApi.theme = {
   /** 列出内置主题(#264) */
   async list() {

@@ -1424,6 +1424,34 @@
     }
   }
 
+  // MOC-104:真实 ChatGPT 账号状态(检测 + 登录进度)。失败静默,不影响其它卡片。
+  async function refreshRealAccountStatus() {
+    try {
+      const resp = await CCApi.realAccount.status();
+      const el = $("#realAccountStatus");
+      if (!el) return;
+      const st = resp.status || {};
+      const login = resp.login || {};
+      let text;
+      if (login.state === "running") {
+        text = t("realAccount.loginRunning") || "登录中…请在浏览器完成授权";
+      } else if (st.logged_in) {
+        const src =
+          st.source === "backup"
+            ? t("realAccount.sourceBackup") || "备份"
+            : t("realAccount.sourceOfficial") || "官方";
+        text = `${t("realAccount.loggedIn") || "已检测到真实 ChatGPT 账号"}(${src})`;
+      } else if (login.state === "failed") {
+        text = `${t("realAccount.loginFailed") || "登录失败"}: ${login.message || ""}`;
+      } else {
+        text = t("realAccount.notLoggedIn") || "未检测到真实 ChatGPT 账号";
+      }
+      el.textContent = text;
+    } catch (e) {
+      console.log("[RealAccount] status refresh failed:", e);
+    }
+  }
+
   async function renderDashboard() {
     // **#249 fix**:getStatus / getActivities 分别 try-catch,任一失败
     // 仍渲染其余卡片,避免单个 API 崩溃 → 整个 dashboard 白屏。
@@ -1471,6 +1499,8 @@
     $("#dashboardProviderName").textContent = status.activeProvider?.name ?? "—";
     // Plugin Unlock 状态刷新
     refreshPluginUnlockStatus();
+    // MOC-104 真实账号状态刷新
+    refreshRealAccountStatus();
     // MOC-32 PR-2b: silently dropped Responses tool types
     refreshDroppedToolsWarning();
     $("#activityList").innerHTML = activities.map((item) => (
@@ -7847,6 +7877,39 @@
         await CCApi.pluginUnlock.reinject();
         showToast(t("pluginUnlock.reinjecting") || "正在重新注入...");
         setTimeout(refreshPluginUnlockStatus, 1500);
+      } catch (e) { showToast(e.message); }
+    });
+    // MOC-104 真实账号:登录 / 刷新 / 强制开启(高延迟)
+    $("[data-action=real-account-login]")?.addEventListener("click", async () => {
+      try {
+        await CCApi.realAccount.login();
+        showToast(t("realAccount.loginStarted") || "已启动登录,请在浏览器完成授权");
+        // 登录是后台进行的,轮询几次刷新状态(用户授权 + codex 写 auth.json 后才变)
+        for (const delay of [1500, 4000, 8000, 15000]) setTimeout(refreshRealAccountStatus, delay);
+      } catch (e) { showToast(e.message); }
+    });
+    $("[data-action=real-account-refresh]")?.addEventListener("click", async () => {
+      try {
+        const r = await CCApi.realAccount.refresh();
+        const outcome = r.outcome?.outcome;
+        const msg = outcome === "refreshed" ? (t("realAccount.refreshed") || "token 已刷新")
+          : outcome === "still_valid" ? (t("realAccount.stillValid") || "token 仍有效,无需刷新")
+          : (t("realAccount.noAccount") || "未检测到真实账号");
+        showToast(msg);
+        setTimeout(refreshRealAccountStatus, 500);
+      } catch (e) { showToast(e.message); }
+    });
+    $("[data-action=real-account-force-enable]")?.addEventListener("click", async () => {
+      // 二次确认 + 高延迟警告(req#4):强制开启走 CDP 伪造路径,有 ~5.8s 启动延迟。
+      const warn = t("realAccount.forceEnableWarn")
+        || "强制开启会用 CDP 注入伪造登录态,Codex 每次启动会多 ~5.8s 加载延迟。建议改用「登录真实账号」避免该延迟。确定要强制开启吗?";
+      if (!window.confirm(warn)) return;
+      try {
+        await CCApi.pluginUnlock.start();
+        const toggle = $("#autoUnlockCodexPlugins");
+        if (toggle && !toggle.checked) { toggle.checked = true; await saveSettingsFromForm(); }
+        showToast(t("realAccount.forceEnabled") || "已强制开启(高延迟)");
+        setTimeout(refreshPluginUnlockStatus, 1000);
       } catch (e) { showToast(e.message); }
     });
     $("#exposeAllProviderModels").addEventListener("change", saveSettingsFromForm);

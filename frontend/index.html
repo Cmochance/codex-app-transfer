@@ -93,6 +93,15 @@
               <button class="btn btn-outline-secondary btn-sm" type="button" data-action="plugin-unlock-reinject"><i class="bi bi-arrow-repeat"></i><span data-i18n="common.reinject">重新注入</span></button>
               <button class="btn btn-outline-danger btn-sm" type="button" data-action="plugin-unlock-stop"><i class="bi bi-stop"></i><span data-i18n="common.stop">停止</span></button>
             </div>
+            <!-- MOC-104 真实 ChatGPT 账号 plugin 模式 -->
+            <div class="real-account-block" style="margin-top:10px;border-top:1px solid var(--border, rgba(255,255,255,.08));padding-top:8px;">
+              <div class="muted-text" id="realAccountStatus" data-i18n="realAccount.statusUnknown" style="font-size:.85em;">检测中…</div>
+              <div class="real-account-actions" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+                <button class="btn btn-outline-primary btn-sm" type="button" data-action="real-account-login"><i class="bi bi-box-arrow-in-right"></i><span data-i18n="realAccount.login">登录真实账号</span></button>
+                <button class="btn btn-outline-secondary btn-sm" type="button" data-action="real-account-refresh"><i class="bi bi-arrow-clockwise"></i><span data-i18n="realAccount.refresh">刷新 token</span></button>
+                <button class="btn btn-outline-warning btn-sm" type="button" data-action="real-account-force-enable"><i class="bi bi-exclamation-triangle"></i><span data-i18n="realAccount.forceEnable">强制开启(高延迟)</span></button>
+              </div>
+            </div>
           </article>
         </div>
         <div class="desktop-warning" id="dashboardDesktopWarning" hidden>
