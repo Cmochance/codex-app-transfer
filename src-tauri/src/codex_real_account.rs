@@ -321,6 +321,14 @@ static AUTH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// 拿同一 single-use refresh_token 再 POST 一次。
 pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcome, String> {
     let _guard = AUTH_LOCK.lock().await;
+    // [connector review] codex login 是外部进程,直接写 `~/.codex/auth.json` 且**不**
+    // 走 AUTH_LOCK。若它正在进行,refresh 刷的是登录前的旧账号,写回会盖掉 login
+    // 即将/已经写入的新账号 —— 直接跳过,让 login 当唯一权威写者(reconcile 也有
+    // 同样前置守卫;这里再设一道,覆盖 manual refresh / import 后刷新等其它入口)。
+    if matches!(login_status(), LoginState::Running) {
+        tracing::info!("[RealAccount] refresh 跳过:codex login 进行中");
+        return Ok(RefreshOutcome::NoAccount);
+    }
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let Some(located) = locate_chatgpt_auth(&paths) else {
         return Ok(RefreshOutcome::NoAccount);
@@ -377,6 +385,15 @@ pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcom
 
     let now_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     apply_refresh_response(&mut auth, &parsed, &now_iso)?;
+    // [connector review] OAuth POST 期间用户可能点了登录(login 不走 AUTH_LOCK)。
+    // 写回前再查一次:login 已在跑就别把刚刷新的旧账号写回去盖掉 login 的新账号。
+    // check 与 write 之间仍有微秒级窗口(外部进程无法纳入 AUTH_LOCK),但竞态窗已
+    // 从整个 POST 时长(~1-2s)缩到一次写调用内。刚消费的 refresh_token 随之丢弃没
+    // 关系 —— login 在换全新账号,旧账号即将被取代。
+    if matches!(login_status(), LoginState::Running) {
+        tracing::info!("[RealAccount] refresh 写回跳过:codex login 在 OAuth POST 期间启动");
+        return Ok(RefreshOutcome::NoAccount);
+    }
     write_auth(&target, &auth).map_err(|e| format!("写回 auth.json 失败: {e}"))?;
 
     // [review #4] 若刷的是 Official 活动文件、而持久镜像里是同一账号(镜像当前
