@@ -178,7 +178,7 @@ pub fn _state_typecheck(_s: Arc<AdminState>) -> bool {
 /// 跨子模块的测试都通过 `super::common::test_support::with_isolated_home`
 /// 复用同一份实现 + 同一把锁(原 `_legacy.rs` 单 mod 时只有一份)。
 #[cfg(test)]
-pub(in crate::admin) mod test_support {
+pub(crate) mod test_support {
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -186,7 +186,7 @@ pub(in crate::admin) mod test_support {
 
     use super::random_hex;
 
-    pub(in crate::admin) fn with_isolated_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+    pub(crate) fn with_isolated_home<T>(f: impl FnOnce(&Path) -> T) -> T {
         static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         // 清掉之前 panic 留下的 poison —— 我们的 EnvGuard 已经把 env 还原干净
         let mutex = HOME_LOCK.get_or_init(|| Mutex::new(()));
