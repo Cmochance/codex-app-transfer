@@ -634,6 +634,14 @@ window.CCApi.realAccount = {
   },
 };
 
+// MOC-114 系统代理(梯子)连通性 —— relay 真账号/插件/第三方路由都依赖它
+window.CCApi.systemProxy = {
+  /** 探测系统代理是否挂 + 端口可连(只探代理端口,不碰 chatgpt.com) */
+  async status() {
+    return api('GET', '/api/system-proxy/status');
+  },
+};
+
 window.CCApi.theme = {
   /** 列出内置主题(#264) */
   async list() {

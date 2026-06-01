@@ -1545,17 +1545,29 @@
       showToast(t("realAccount.statusUnavailable") || "暂时无法获取账号状态,请稍后重试");
       return;
     }
+    // [MOC-114] 解锁 gate 同时要求账号有效 + 系统代理(梯子)连通。relay 真账号/插件/第三方
+    // 路由都依赖梯子可达;缺任一都会让 plugins 进"已登录却全转圈"的误导态,故 gate 住、
+    // 弹引导。探测失败**不**武断 gate(可能 admin server 抖动)→ 按连通放行,运行时错误兜底
+    // (与 status() 失败不伪装无账号的 HIGH-1 口径对称)。
+    let proxyConnected = true;
+    try {
+      const sp = await CCApi.systemProxy.status();
+      const spData = sp && sp.systemProxy;
+      // PAC 自动配置无法探端口 → fail-open(不 gate),与探测失败的乐观放行口径一致。
+      proxyConnected = !!(spData && (spData.connected || spData.kind === "pac"));
+    } catch (_e) {
+      proxyConnected = true;
+    }
     if (toggle.checked) {
-      if (realActive) {
-        // 有效真实账号 → relay 模式,Codex 原生显示 plugins,不启 daemon、不设强制档。
+      if (realActive && proxyConnected) {
+        // 账号有效 + 梯子连通 → relay 模式,Codex 原生显示 plugins,不启 daemon、不设强制档。
         showToast(t("realAccount.unlockedByRealAccount") || "已开启(真实账号,原生解锁)");
         setTimeout(refreshRealAccountStatus, 100);
         setTimeout(refreshPluginUnlockStatus, 300);
       } else {
-        // 无有效账号 → 引导弹窗。开关回退到派生态(强制档值,通常 OFF)。
+        // 缺账号 / 缺代理 → 引导弹窗(文案按缺啥动态)。开关回退派生态(强制档值,通常 OFF)。
         toggle.checked = forceUnlockPersisted;
-        const m = $("#realAccountNoAccountModal");
-        if (m) m.hidden = false;
+        showRealAccountGateModal(!realActive, !proxyConnected);
       }
     } else if (realActive) {
       // relay:前端开关关不掉账号原生解锁 → 弹回 ON 并提示走「清除真实账号」。
@@ -1569,6 +1581,33 @@
       setTimeout(refreshPluginUnlockStatus, 300);
       setTimeout(refreshRealAccountStatus, 300);
     }
+  }
+
+  // [MOC-114] 解锁引导窗 —— 按「缺账号 / 缺代理 / 都缺」动态设 title/desc 与登录按钮可见性。
+  // 缺代理时登录按钮无意义(梯子没挂,登录也连不上),隐藏之;强制开启按钮始终保留(逃生阀)。
+  function showRealAccountGateModal(needAccount, needProxy) {
+    const m = $("#realAccountNoAccountModal");
+    if (!m) return;
+    const titleEl = m.querySelector("h3");
+    const descEl = m.querySelector(".codex-modal-desc");
+    const loginBtn = m.querySelector('[data-action="real-account-noacct-login"]');
+    let titleKey, descKey;
+    if (needAccount && needProxy) {
+      titleKey = "realAccount.gateBothTitle";
+      descKey = "realAccount.gateBothDesc";
+    } else if (needProxy) {
+      titleKey = "realAccount.gateProxyTitle";
+      descKey = "realAccount.gateProxyDesc";
+    } else {
+      titleKey = "realAccount.noAccountTitle";
+      descKey = "realAccount.noAccountDesc";
+    }
+    // [review] 同步 data-i18n 到动态 key —— 否则 i18n.apply() 在语言切换时 re-walk
+    // [data-i18n] 节点会用旧的 noAccount key 覆盖回静态文案,把「缺代理」误显示成「缺账号」。
+    if (titleEl) { titleEl.dataset.i18n = titleKey; titleEl.textContent = t(titleKey) || titleEl.textContent; }
+    if (descEl) { descEl.dataset.i18n = descKey; descEl.textContent = t(descKey) || descEl.textContent; }
+    if (loginBtn) loginBtn.style.display = needAccount ? "" : "none";
+    m.hidden = false;
   }
 
   let realAccountAutoPersisting = false;
@@ -1646,6 +1685,8 @@
     refreshPluginUnlockStatus();
     // MOC-104 真实账号状态刷新
     refreshRealAccountStatus();
+    // MOC-114 网络代理(梯子)连通性刷新(独立异步,含 TCP 探测,不阻塞 dashboard 其余渲染)
+    refreshSystemProxyStatus();
     // MOC-32 PR-2b: silently dropped Responses tool types
     refreshDroppedToolsWarning();
     $("#activityList").innerHTML = activities.map((item) => (
@@ -1656,6 +1697,48 @@
     } catch (err) {
       console.error("[renderDashboard] refreshUpdateBadge failed:", err);
     }
+  }
+
+  // MOC-114:刷新「网络代理」卡片 —— 系统代理(梯子)是否挂 + 端口可连。relay 真账号、
+  // 插件、第三方路由都依赖它;探测只连代理端口、不碰 chatgpt.com。查询失败时显示「未知」
+  // 灰色,**不**伪装成未连接(避免误导已挂梯子的用户)。
+  async function refreshSystemProxyStatus() {
+    const el = $("#dashboardSystemProxyStatus");
+    const icon = $("#dashboardSystemProxyIcon");
+    if (!el) return;
+    let sp = null;
+    try {
+      const resp = await CCApi.systemProxy.status();
+      sp = resp && resp.systemProxy;
+    } catch (e) {
+      console.log("[SystemProxy] status failed:", e);
+    }
+    const setIcon = (cls, glyph) => {
+      if (!icon) return;
+      icon.classList.remove("success", "warning", "muted");
+      icon.classList.add(cls);
+      icon.innerHTML = `<i class="bi ${glyph}"></i>`;
+    };
+    if (!sp) {
+      el.textContent = t("status.unknown") || "未知";
+      el.classList.add("muted-text");
+      setIcon("muted", "bi-globe2");
+      return;
+    }
+    // [review] PAC 自动配置无固定端口、无法 TCP 探测 → 不武断报「未连接」(会误导 + 误 gate
+    // 一个代理其实正常的 PAC 用户);如实显示「自动配置」,gate 侧亦对 PAC fail-open。
+    if (sp.kind === "pac") {
+      el.textContent = t("systemProxy.pac") || "自动配置(PAC)";
+      el.classList.add("muted-text");
+      setIcon("muted", "bi-globe2");
+      return;
+    }
+    const connected = sp.connected === true;
+    el.textContent = connected
+      ? (t("systemProxy.connected") || "已连接")
+      : (t("systemProxy.disconnected") || "未连接");
+    el.classList.toggle("muted-text", !connected);
+    setIcon(connected ? "success" : "warning", connected ? "bi-globe2" : "bi-exclamation-triangle");
   }
 
   /// MOC-32 PR-2b: query /api/diagnostic/dropped-tools, total>0 时弹 warning

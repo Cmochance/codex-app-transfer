@@ -8,6 +8,7 @@ mod codex_plugin_unlocker;
 mod codex_real_account;
 mod codex_theme_injector;
 mod proxy_runner;
+mod system_proxy;
 mod telemetry_bridge;
 #[cfg(target_os = "windows")]
 mod windows_msix;

@@ -177,6 +177,10 @@ pub fn build_app_router(state: AdminState) -> Router {
         .route("/api/proxy/stop", post(handlers::proxy::stop_proxy))
         .route("/api/proxy/status", get(handlers::proxy::proxy_status))
         .route(
+            "/api/system-proxy/status",
+            get(handlers::proxy::system_proxy_status),
+        )
+        .route(
             "/api/diagnostic/dropped-tools",
             get(handlers::diagnostic::dropped_tools_status),
         )
