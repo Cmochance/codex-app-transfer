@@ -7222,39 +7222,54 @@
     container.innerHTML = cards.join("");
 
     // 5. 刷新 status badge
+    // MOC-102:badge 完全由「开关偏好(toggle.checked)+ 后端 status」推导,**永不**
+    // 把 raw CDP 502 暴露给 user。规则:
+    //  - 开关关:一律"未启用",无视后端 status,不 reapply、不暴露任何失败。
+    //  - 开关开 + Failed:Codex 当前注入不了(非 transfer 启动 / 调试端口不可用)=
+    //    "待重启生效";不重试(必然又失败)、不暴露 502。每次 render 都如此(持久,
+    //    不依赖一次性 flag)。
+    //  - 开关开 + Applied(别的主题)/ Disabled:CDP 可能刚恢复(transfer/Codex 重启)
+    //    → best-effort reapply,成功"已应用",失败降级"待重启生效"(仍不暴露 502)。
     try {
       const st = await CCApi.theme.status();
       const sObj = st.status;
-      const autoReapplySelectedTheme = async () => {
+      // best-effort 重应用:成功→已应用,失败→"待重启生效"(绝不把 raw 502 写进 badge)。
+      const reapplyOrPending = async () => {
         try {
           await CCApi.theme.apply(selectedThemeId);
           badge.textContent = `${t("theme.applied") || "已应用"}: ${selectedThemeId}`;
         } catch (err) {
-          console.warn("[theme] auto-re-apply failed:", err);
-          badge.textContent = `${t("theme.failed") || "失败"}: ${err.message || err}`;
+          console.warn("[theme] auto-re-apply failed (pending restart):", err);
+          badge.textContent = t("theme.pendingRestart") || "待重启生效";
         }
       };
-      if (sObj && typeof sObj === "object") {
+      if (!toggle.checked) {
+        // 开关关:偏好已禁用 → badge 一律"未启用",不碰运行态、不暴露失败。
+        badge.textContent = t("theme.disabled") || "未启用";
+      } else if (sObj && typeof sObj === "object") {
         if (sObj.Applied) {
           badge.textContent = `${t("theme.applied") || "已应用"}: ${sObj.Applied.theme_id}`;
-          // 用户选了别的主题但后端还报旧 theme_id(切换 race / 重启后状态错位)→ 自动 re-apply。
-          if (toggle.checked && selectedThemeId && sObj.Applied.theme_id !== selectedThemeId) {
-            await autoReapplySelectedTheme();
+          // 选了别的主题但后端报旧 theme_id(切换 race / 重启错位)→ best-effort 重应用。
+          if (selectedThemeId && sObj.Applied.theme_id !== selectedThemeId) {
+            await reapplyOrPending();
           }
         } else if (sObj.Failed) {
-          badge.textContent = `${t("theme.failed") || "失败"}: ${sObj.Failed.error}`;
-          // 上一次 apply 失败但用户仍开着主题 + 有选中 → 自动重试一次。
-          if (toggle.checked && selectedThemeId) {
-            await autoReapplySelectedTheme();
+          // 后端上次失败:CDP 可能已恢复(Codex 重启后)→ best-effort 重应用,
+          // 成功"已应用",失败降级"待重启生效"(绝不暴露 raw 502)。
+          if (selectedThemeId) {
+            await reapplyOrPending();
+          } else {
+            badge.textContent = "";
           }
-        } else badge.textContent = "";
+        } else {
+          badge.textContent = "";
+        }
       } else if (sObj === "Disabled") {
-        badge.textContent = t("theme.disabled") || "未启用";
-        // Auto re-apply: settings say enabled + theme selected, but backend
-        // status is Disabled (e.g. after transfer app restart / Codex restart).
-        // Apply immediately so user doesn't have to manually toggle.
-        if (toggle.checked && selectedThemeId) {
-          await autoReapplySelectedTheme();
+        // 后端 Disabled 但偏好开 + 选了主题:CDP 可能刚恢复 → best-effort 重应用。
+        if (selectedThemeId) {
+          await reapplyOrPending();
+        } else {
+          badge.textContent = t("theme.disabled") || "未启用";
         }
       }
     } catch (e) {
@@ -7264,15 +7279,88 @@
 
   // bind toggle + reload/restart + card click(delegation)一次性,避免 renderTheme 反复绑定丢
   let themeEventsBound = false;
+  // MOC-102:双按钮弹窗(立即重启 / 稍后重启),复用 openCropModal 的 overlay/panel
+  // 样式。返 Promise<"now" | "later">。**不**自动重启——重启必须是用户在此显式选择
+  // 「立即重启」才触发;选「稍后重启」或点遮罩/✕ 关闭则保留偏好、不动 Codex。
+  function showThemeRestartDialog() {
+    return new Promise((resolve) => {
+      const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
+      const overlay = document.createElement("div");
+      overlay.style.cssText =
+        "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;";
+      const panel = document.createElement("div");
+      panel.style.cssText =
+        "background:var(--bs-body-bg);border-radius:12px;padding:20px;max-width:440px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,0.4);";
+      const title = document.createElement("div");
+      title.style.cssText = "font-weight:600;font-size:16px;margin-bottom:10px;";
+      title.textContent = t("theme.savedTitle") || (lang === "en" ? "Theme preference saved" : "主题偏好已保存");
+      const body = document.createElement("div");
+      body.style.cssText = "font-size:13px;color:var(--bs-secondary-color);line-height:1.6;margin-bottom:18px;";
+      body.textContent =
+        t("theme.savedPendingRestart") ||
+        "当前 Codex 未通过本工具启动或调试端口不可用,主题将在 Codex 重启后生效。";
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText = "display:flex;justify-content:flex-end;gap:10px;";
+      const laterBtn = document.createElement("button");
+      laterBtn.className = "btn btn-outline-secondary btn-sm";
+      laterBtn.type = "button";
+      laterBtn.textContent = t("theme.restartLater") || (lang === "en" ? "Restart later" : "稍后重启");
+      const nowBtn = document.createElement("button");
+      nowBtn.className = "btn btn-primary btn-sm";
+      nowBtn.type = "button";
+      nowBtn.textContent = t("theme.restartNow") || (lang === "en" ? "Restart now" : "立即重启");
+      btnRow.appendChild(laterBtn);
+      btnRow.appendChild(nowBtn);
+      panel.appendChild(title);
+      panel.appendChild(body);
+      panel.appendChild(btnRow);
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+
+      const done = (choice) => {
+        overlay.remove();
+        resolve(choice);
+      };
+      // 点遮罩空白 / 稍后 = later(默认尊重"稍后",不重启);立即 = now。
+      overlay.addEventListener("click", (e) => {
+        if (e.target === overlay) done("later");
+      });
+      laterBtn.addEventListener("click", () => done("later"));
+      nowBtn.addEventListener("click", () => done("now"));
+    });
+  }
+
+  // MOC-102:即时注入失败(CDP 不可达 / Codex 非 transfer 启动)时——偏好已落盘,
+  // 弹双按钮窗让用户**自己选**立即 / 稍后重启,绝不自动重启。
+  // **不**当作开关失败、**不**回退 toggle、**不**报 502 红错。
+  async function promptRestartCodexForTheme() {
+    const choice = await showThemeRestartDialog();
+    if (choice !== "now") {
+      // 稍后重启:偏好已落盘,什么都不动,badge 显示"待重启生效"。
+      showToast(t("theme.savedPendingRestartToast") || "主题已保存,Codex 重启后生效");
+      return;
+    }
+    try {
+      await CCApi.theme.restartCodex();
+      showToast(t("theme.restartToast") || "已请求重启 Codex");
+    } catch (e) {
+      showToast(`${t("theme.restartFailed") || "重启失败"}: ${e.message || e}`);
+    }
+  }
+
   function bindThemeEvents() {
     if (themeEventsBound) return;
     themeEventsBound = true;
 
-    // toggle 直接 apply/clear,不需要按 Apply 按钮。
+    // toggle = 持久化偏好的「状态标记」,不是即时动作按钮。
     //
-    // **对称语义**(R1 / R-NEW-2):on / off 两条路径都遵守"先做副作用(apply/clear),
-    // success 才 persist settings;失败 rollback toggle DOM 状态"— 否则 settings
-    // 跟 Codex CSS / toggle DOM 三方会 desync。
+    // **状态标记语义(MOC-102)**:toggle 表示「下次从 transfer 启动 Codex 时是否
+    // 自动注入主题」。两条路径都**先落盘 settings**,再 best-effort 对当前运行中的
+    // Codex 即时 apply。开关**不被** Codex 当前运行/注入态反向驱动:CDP 不可达
+    // (Codex 非 transfer 启动 / 未带 --remote-debugging-port)时**不**回退 toggle、
+    // **不**报失败,落盘后弹「重启 Codex 生效」提示。关闭分支**不**主动跑 CDP clear
+    // (去掉旧的「clear 先、成功才保存」耦合——那会让 CDP 不可达时连开关状态都存不下、
+    // 且属于对运行态的破坏性回滚);已注入的主题保留到 Codex 下次重启自然消失。
     $("#codexUiThemeEnabled")?.addEventListener("change", async (e) => {
       if (e.target.checked) {
         if (!selectedThemeId) {
@@ -7280,28 +7368,36 @@
           e.target.checked = false;
           return;
         }
-        // apply 先,success 后才 saveSettings — 失败则 toggle 弹回 off,settings 保留不变
+        // 1) 先落盘偏好(状态标记)—— 不依赖 Codex 运行态。落盘是唯一的"真失败":
+        //    失败则回退 toggle + 提示,**不**继续注入(避免 toggle/settings desync)。
+        let saved = false;
         try {
-          await CCApi.theme.apply(selectedThemeId);
           await CCApi.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: selectedThemeId });
-          showToast(t("theme.appliedToast") || "主题已应用");
+          saved = true;
         } catch (err) {
           e.target.checked = false;
-          showToast(`${t("theme.applyFailed") || "应用失败"}: ${err.message}`);
+          showToast(`${t("theme.saveFailed") || "保存失败"}: ${err.message || err}`);
+        }
+        // 2) best-effort 即时注入:成功即生效;失败不当作开关失败(落盘已成功),
+        //    提示重启 Codex 生效。
+        if (saved) {
+          try {
+            await CCApi.theme.apply(selectedThemeId);
+            showToast(t("theme.appliedToast") || "主题已应用");
+          } catch (err) {
+            console.warn("[theme] enable apply (best-effort) failed:", err);
+            await promptRestartCodexForTheme();
+          }
         }
       } else {
-        // **clear 先,success 后才 saveSettings** — clear 失败(Codex 不在跑 / CDP 不可达)
-        // 时,如果先把 enabled=false 写进 settings,user 看见 toast 失败但 toggle
-        // 已弹回开,设置实际已变 disabled → 下次启动 Codex 不会 auto-apply,旧 CSS
-        // 残留在 Codex DOM 直到 Codex 重启;state 跟 settings 长期不同步。
+        // 关闭:只落盘 enabled=false(状态标记),不主动对 Codex 跑 CDP clear。
+        // 落盘失败 → 回退 toggle + 提示,保持 toggle/settings 一致。
         try {
-          await CCApi.theme.clear();
           await CCApi.saveSettings({ codexUiThemeEnabled: false });
-          showToast(t("theme.clearedToast") || "主题已清除");
+          showToast(t("theme.disabledPendingRestart") || "已关闭,主题将在 Codex 重启后移除");
         } catch (err) {
-          // clear 失败 → settings 保留 enabled=true,toggle 弹回 checked 状态保持一致
           e.target.checked = true;
-          showToast(`${t("theme.clearFailed") || "清除失败"}: ${err.message}`);
+          showToast(`${t("theme.saveFailed") || "保存失败"}: ${err.message || err}`);
         }
       }
       await renderTheme();
@@ -7459,18 +7555,33 @@
       console.log("[theme] pick", themeId);
       selectedThemeId = themeId;
       const enabled = $("#codexUiThemeEnabled")?.checked;
-      try {
-        if (enabled) {
+      // 状态标记语义(MOC-102):先落盘选择,再 best-effort 即时注入(仅 toggle 已开时)。
+      if (enabled) {
+        let saved = false;
+        try {
           await CCApi.saveSettings({ codexUiThemeEnabled: true, codexUiTheme: themeId });
-          await CCApi.theme.apply(themeId);
-          showToast(t("theme.appliedToast") || "主题已应用");
-        } else {
-          // toggle 关时,只持久化 user 的选择(不调 apply,toggle 开时再 apply)
-          await CCApi.saveSettings({ codexUiTheme: themeId });
+          saved = true;
+        } catch (err) {
+          console.error("[theme] pick save failed:", err);
+          showToast(`${t("theme.saveFailed") || "保存失败"}: ${err.message || err}`);
         }
-      } catch (err) {
-        console.error("[theme] pick failed:", err);
-        showToast(err.message);
+        if (saved) {
+          try {
+            await CCApi.theme.apply(themeId);
+            showToast(t("theme.appliedToast") || "主题已应用");
+          } catch (err) {
+            console.warn("[theme] pick apply (best-effort) failed:", err);
+            await promptRestartCodexForTheme();
+          }
+        }
+      } else {
+        // toggle 关时,只持久化 user 的选择(不调 apply,toggle 开时再 apply)
+        try {
+          await CCApi.saveSettings({ codexUiTheme: themeId });
+        } catch (err) {
+          console.error("[theme] pick save failed:", err);
+          showToast(`${t("theme.saveFailed") || "保存失败"}: ${err.message || err}`);
+        }
       }
       await renderTheme();
     };
