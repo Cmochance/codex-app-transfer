@@ -682,7 +682,19 @@ pub async fn reconcile_on_startup(client: &reqwest::Client) -> Result<RefreshOut
         return Ok(RefreshOutcome::NoAccount);
     }
     // 先刷新(refresh_if_needed 内部持 AUTH_LOCK)。
-    let outcome = refresh_if_needed(client).await?;
+    // [devin review] refresh 瞬时失败(网络/IO,非 refresh_token 永久失效)若用 `?` 传播会
+    // 让整个 reconcile early-return,跳过下方「从导入镜像恢复活动」—— 但恢复**不依赖**刷新
+    // 成功(下方独立判活动态 + 读镜像)。改为 Err 时 log 后继续恢复:即使 token 过期,恢复
+    // chatgpt 镜像也能让 Codex 原生显示 Plugins(relay 下过期 token 不影响,proxy 替换上游
+    // 凭据 + Codex 客户端自刷新),比「refresh 失败→活动留 apikey→plugins 不显示」更对。
+    // outcome 占位 NoAccount(仅上层判 ReloginRequired 用,非该值即只 log、不影响恢复)。
+    let outcome = match refresh_if_needed(client).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("[RealAccount] 启动 refresh 失败(忽略,继续尝试镜像恢复): {e}");
+            RefreshOutcome::NoAccount
+        }
+    };
     // [devin review] refresh 判定 refresh_token 永久失效 → 镜像里是同一份失效 token,
     // 恢复到活动只会把当前可用的 apikey 配置覆盖成坏掉的 chatgpt 凭据,毫无好处
     // (账号已死,用户必须重登)。跳过恢复,保留可用配置 + 由上层提示重登。
