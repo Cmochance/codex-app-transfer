@@ -67,11 +67,14 @@ jobs:
           COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
           echo "Commit count: $COUNT"
 
-          # AI co-author trailer pattern(全大小写;覆盖 anthropic / claude / cursor /
-          # copilot 子串)
-          TRAILER_RE='Co-[Aa]uthored-[Bb]y:.*<[^>]*(@anthropic\.com|cursor|[Cc]opilot|cursoragent|claude)'
-          # AI author email pattern
-          EMAIL_RE='@anthropic\.com|cursoragent@cursor|copilot-swe-agent|[Cc]ursor@users\.noreply|[Cc]opilot@users\.noreply'
+          # AI co-author trailer pattern —— 覆盖所有主流 AI 编码助手署名(grep -iE
+          # 大小写不敏感):anthropic/claude、openai/codex/chatgpt/gpt-、cursor、
+          # copilot、gemini、bard、devin、deepseek、qwen、mistral、llama。
+          # 整行匹配(不限 <email> 内),名字为 "Codex"/"Claude" 等也会被拦。
+          # 新 AI 署名直接往括号里加子串即可。
+          TRAILER_RE='Co-[Aa]uthored-[Bb]y:.*(anthropic|claude|openai|codex|chatgpt|gpt-|cursor|copilot|cursoragent|gemini|bard|devin|deepseek|qwen|mistral|llama)'
+          # AI author/committer email pattern —— 已知 AI bot 的 noreply 域 / 账号。
+          EMAIL_RE='@anthropic\.com|@openai\.com|cursoragent@cursor|copilot-swe-agent|[Cc]ursor@users\.noreply|[Cc]opilot@users\.noreply|noreply@google\.com|@devin\.ai'
 
           FAILED=0
           for sha in $COMMITS; do

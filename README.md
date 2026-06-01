@@ -64,13 +64,14 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - Codex APP 的 freeform `apply_patch` 工具(编辑文件 +/- diff UI)在 DeepSeek / Kimi / MiMo 等 chat-completions provider 上正常工作:adapter 双向桥接 Responses `custom_tool_call` ↔ chat `function_call` 形态,模型按 V4A 格式生成 patch,Codex APP 渲染为 diff(issue #235);Gemini 系(gemini_native + Cloud Code Assist / Antigravity,走 generateContent)已通过 MOC-75 修复同款桥接:请求侧把 freeform `custom` 工具降级成带 `input` 参数的 function(V4A description 复用 chat 常量),响应侧把 Gemini 回来的 `functionCall` 重打包成 `custom_tool_call` wire
 - Gemini 系(gemini_native + Cloud Code Assist / Antigravity)上游返 4xx/5xx 时,proxy 把错误翻译成 Codex 能识别的 `response.failed`,且 `error.code` 对齐 Codex 的重试白名单:**无歧义永久性**错误(400 INVALID_ARGUMENT / 401 鉴权 / 403 权限)直接 surface 给用户 + 停手(可换模型),不再让 Codex 反复重发同一请求卡死;**瞬时或不确定**错误(超时 / 限流 / 配额 / 5xx)保留可重试语义(指数退避;真不可恢复的退避到上限后 surface)(MOC-79)
 - Grok Web 上游返 4xx/5xx 时同上对齐 Codex 重试白名单:401 鉴权 / 403 权限 → `invalid_prompt`(永久,Codex surface + 停),不再让 Codex 反复重发卡死;瞬时错误(timeout / rate_limited / server_error)保留可重试语义(MOC-90)
+- chat-completions 兼容 provider(DeepSeek / Kimi / MiMo / GLM / 阿里云百炼 / MiniMax 等)上游返 4xx/5xx 时同款对齐:此前 proxy 原样透传 HTTP 错误状态 + JSON error body,Codex APP 期待 SSE 流而**卡 "Thinking"**(既不报错也不重试,无法进下一轮);现改写成合规 `response.failed` 流,400 请求错误 / 401 鉴权 / 403 权限 → `invalid_prompt`(永久,surface + 停手),429 限流 / 5xx / 超时等瞬时态保留可重试语义,与 grok / gemini 同走 `codex_retry_code` 白名单(MOC-103)
 - 会话历史**两层持久化**:L1 内存 LRU + L2 sqlite 30 天 TTL(`~/.codex-app-transfer/sessions.db`),`.app` 重启不丢历史
 - **用量统计**(Sidebar → 用量):解析 `~/.codex/sessions/` rollout JSONL,按对话 / 日 / 模型聚合 token 用量(解析层 vendor 自 ryoppippi/ccusage)。「按对话」视图显示每对话**缓存命中率**,点击数字弹出该对话**逐轮命中率直方图**(命中含于总计、双色,hover 看命中 / 总输入 / 输出);proxy 本地记录 `session → 真实上游模型`(本版本之后的新对话),「按对话」模型列因此显示真实上游模型而非 Codex 客户端占位名(`gpt-5.x`)
 - Codex APP 原配置守护:apply 前自动快照 `~/.codex/{config.toml,auth.json}`,退出 / 下次启动按 key 智能合并还原;**MCP 授权可移植保险箱**(默认开):把 MCP OAuth 凭据改存为可移植文件(`~/.codex/.credentials.json`,0o600),并在 `~/.codex` 之外维护镜像(`~/.codex-app-transfer/mcp-credentials.json`);整个凭据文件被账号切换 / 误删 / 换机清掉时,下次启动弹确认让你从备份恢复(单个 server 的主动登出会被尊重、不复活;注:不解决 OAuth 自然过期)
 - **Codex 文档管理**(Sidebar → Codex):
-  - **Agents**:任意位置 `AGENTS.md` raw 全文 read/write + 文件系统选择;按 `.git/` 自动分类 project-root / subdir 显示 chip
-  - **Memories**:固定管理 `~/.codex/memories/MEMORY.md`(主索引)+ `memory_summary.md`(摘要)— codex 唯二 user-editable 的 AI 实际读取索引
-  - **Skills**:扫描 `~/.codex/skills/<name>/SKILL.md` 全列表 raw 编辑;"打开文件夹"按钮调系统 `open` 让用户在 Finder/资源管理器 改 SKILL.md 之外的子文件(scripts / examples / templates 等)
+  - **Agents**:HOME 下非敏感 `AGENTS.md` raw 全文 read/write + 文件系统选择;系统目录 / 凭据目录会被拒绝,按 `.git/` 自动分类 project-root / subdir 显示 chip
+  - **Memories**:固定管理 `~/.codex/memories/MEMORY.md`(主索引)+ `memory_summary.md`(摘要),也可添加 HOME 下非敏感项目 `MEMORY.md`;系统目录 / 凭据目录会被拒绝
+  - **Skills**:扫描 `~/.codex/skills/<name>/SKILL.md` 全列表 raw 编辑,并强制限制在 skills 根目录内;"打开文件夹"按钮调系统 `open` 让用户在 Finder/资源管理器 改 SKILL.md 之外的子文件(scripts / examples / templates 等)
   - **MCP**:结构化 JSON 编辑 `~/.codex/config.toml` 的 `[mcp_servers.*]` 节(`toml_edit` round-trip 保留注释 + 其他配置节)+ Plugins 子页扫 `~/.codex/plugins/cache/` 列已安装 plugin(enable toggle / uninstall);所有改动 atomic write + 独立 history 互不交叉(SHA-256 hash 路径)
 - 实时日志面板,2 秒自动刷新;统一 `tracing::warn!(error_id, detail)` + 稳定 token,operator 可 grep / 聚合
 - 反馈弹窗附带诊断材料(环境信息、脱敏配置、最近错误快照及完整请求 / 响应),减少手工补材料

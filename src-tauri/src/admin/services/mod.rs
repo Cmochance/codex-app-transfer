@@ -11,5 +11,6 @@ pub mod managed_block;
 pub mod marketplace;
 pub mod mcp_servers;
 pub mod memories_md_paths;
+pub mod path_guard;
 pub mod skills_backup;
 pub mod skills_md_paths;

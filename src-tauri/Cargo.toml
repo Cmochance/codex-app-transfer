@@ -8,6 +8,12 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# cargo-machete 误报白名单 —— 仅 tauri-build 是工具静态分析的已知误报(不是真未使用):
+#   build.rs:28 实际调用 tauri_build::build(),但 machete 不扫 build.rs。
+# 其余 machete 报告均为真阳性,随 PR 清理。详见 #343。
+[package.metadata.cargo-machete]
+ignored = ["tauri-build"]
+
 # 二进制入口
 [[bin]]
 name = "codex-app-transfer"
@@ -72,8 +78,8 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5"
-objc2-foundation = "0.2"
+# objc2 / objc2-foundation 不直接声明:代码只 use objc2_app_kit,这俩作为
+# objc2-app-kit 的传递依赖自动可用,显式列为直接依赖是冗余(cargo-machete 真阳性)。
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplication"] }
 
 # Windows MSIX Codex Desktop 启动 — IApplicationActivationManager COM 调用

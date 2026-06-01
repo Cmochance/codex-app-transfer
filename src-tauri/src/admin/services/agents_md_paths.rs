@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::path_guard;
+
 const PATHS_STORE_FILE: &str = "codex-doc-paths.json";
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -67,10 +69,24 @@ pub struct AgentsPathEntry {
 }
 
 fn resolve_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = test_home_override() {
+        return Some(home);
+    }
     std::env::var("HOME")
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok())
         .map(PathBuf::from)
+}
+
+#[cfg(test)]
+fn test_home_override() -> Option<PathBuf> {
+    TEST_HOME.with(|home| home.borrow().clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// `~/.codex-app-transfer/codex-doc-paths.json`
@@ -83,6 +99,10 @@ fn store_file_path() -> Result<PathBuf, String> {
 pub fn global_agents_path() -> Result<PathBuf, String> {
     let home = resolve_home().ok_or_else(|| "HOME / USERPROFILE not set".to_owned())?;
     Ok(home.join(".codex").join("AGENTS.md"))
+}
+
+pub fn validated_global_agents_path() -> Result<PathBuf, String> {
+    path_guard::validate_agents_path(&global_agents_path()?)
 }
 
 /// `~/.codex-app-transfer/managed-history/agents-<hash>.json`
@@ -185,6 +205,9 @@ pub fn list_all_entries() -> Result<Vec<AgentsPathEntry>, String> {
     let mut entries: Vec<AgentsPathEntry> = Vec::new();
     if let Ok(global) = global_agents_path() {
         if global.exists() {
+            let Ok(global) = path_guard::validate_agents_path(&global) else {
+                return Ok(entries);
+            };
             entries.push(AgentsPathEntry {
                 path: global.to_string_lossy().into_owned(),
                 category: PathCategory::Global,
@@ -197,16 +220,20 @@ pub fn list_all_entries() -> Result<Vec<AgentsPathEntry>, String> {
     let store = load_store()?;
     for p in &store.agents {
         let path = PathBuf::from(p);
-        if path.exists() {
-            let (category, project_name, subdir_path) = classify_path_full(&path);
-            entries.push(AgentsPathEntry {
-                category,
-                hash: path_hash(&path),
-                path: p.clone(),
-                project_name,
-                subdir_path,
-            });
+        if !path.exists() {
+            continue;
         }
+        let Ok(path) = path_guard::validate_agents_path(&path) else {
+            continue;
+        };
+        let (category, project_name, subdir_path) = classify_path_full(&path);
+        entries.push(AgentsPathEntry {
+            category,
+            hash: path_hash(&path),
+            path: path.to_string_lossy().into_owned(),
+            project_name,
+            subdir_path,
+        });
     }
     Ok(entries)
 }
@@ -220,7 +247,8 @@ pub fn add_path(raw_path: &str) -> Result<AgentsPathEntry, String> {
     if !path.exists() {
         return Err(format!("file not found: {raw_path}"));
     }
-    let global = global_agents_path()?;
+    let path = path_guard::validate_agents_path(&path)?;
+    let global = validated_global_agents_path()?;
     if path == global {
         return Err(format!(
             "global ~/.codex/AGENTS.md already shown by default; do not add explicitly"
@@ -247,9 +275,16 @@ pub fn add_path(raw_path: &str) -> Result<AgentsPathEntry, String> {
 pub fn remove_by_hash(hash: &str) -> Result<bool, String> {
     let mut store = load_store()?;
     let before = store.agents.len();
-    store
-        .agents
-        .retain(|p| path_hash(&PathBuf::from(p)) != hash);
+    store.agents.retain(|p| {
+        let raw_path = PathBuf::from(p);
+        if path_hash(&raw_path) == hash {
+            return false;
+        }
+        match path_guard::validate_agents_path(&raw_path) {
+            Ok(path) => path_hash(&path) != hash,
+            Err(_) => true,
+        }
+    });
     let removed = store.agents.len() != before;
     if removed {
         save_store(&store)?;
@@ -259,23 +294,65 @@ pub fn remove_by_hash(hash: &str) -> Result<bool, String> {
 
 /// 根据 hash 找到 path(用于 6 endpoints 从 query 拿到具体文件)
 pub fn resolve_path_by_hash(hash: &str) -> Result<PathBuf, String> {
-    let global = global_agents_path()?;
+    let global = validated_global_agents_path()?;
     if path_hash(&global) == hash {
         return Ok(global);
     }
     let store = load_store()?;
     for p in &store.agents {
-        let path = PathBuf::from(p);
-        if path_hash(&path) == hash {
-            return Ok(path);
+        let raw_path = PathBuf::from(p);
+        if path_hash(&raw_path) == hash {
+            return path_guard::validate_agents_path(&raw_path);
+        }
+        if let Ok(path) = path_guard::validate_agents_path(&raw_path) {
+            if path_hash(&path) == hash {
+                return Ok(path);
+            }
         }
     }
     Err(format!("path hash not found: {hash}"))
 }
 
 #[cfg(test)]
+fn resolve_path_by_raw_hash_for_test(path: &Path) -> Result<PathBuf, String> {
+    let hash = path_hash(path);
+    resolve_path_by_hash(&hash)
+}
+
+#[cfg(test)]
+fn resolve_path_by_canonical_hash_for_test(path: &Path) -> Result<PathBuf, String> {
+    let path = path_guard::validate_agents_path(path)?;
+    let hash = path_hash(&path);
+    resolve_path_by_hash(&hash)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn tmp_home(label: &str) -> PathBuf {
+        let mut rand_buf = [0u8; 6];
+        let _ = getrandom::getrandom(&mut rand_buf);
+        let rand_hex: String = rand_buf.iter().map(|b| format!("{b:02x}")).collect();
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = root.join(format!("cas-agents-paths-{label}-{rand_hex}"));
+        fs::create_dir_all(&dir).unwrap();
+        // macOS /tmp is a symlink to /private/tmp — canonicalize so expected
+        // paths match the guard's canonicalize() output (no-op on Linux CI).
+        fs::canonicalize(&dir).unwrap_or(dir)
+    }
+
+    fn with_test_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        TEST_HOME.with(|slot| *slot.borrow_mut() = Some(home.to_path_buf()));
+        let out = path_guard::with_test_home(home, f);
+        TEST_HOME.with(|slot| *slot.borrow_mut() = None);
+        out
+    }
 
     #[test]
     fn classify_global_path() {
@@ -296,5 +373,55 @@ mod tests {
         let p2 = PathBuf::from("/Users/foo/myproj/AGENTS.md");
         assert_eq!(path_hash(&p1), path_hash(&p2));
         assert_eq!(path_hash(&p1).len(), 16);
+    }
+
+    #[test]
+    fn add_path_accepts_safe_agents_under_home() {
+        let home = tmp_home("safe");
+        let path = home.join("project").join("AGENTS.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "rules").unwrap();
+
+        with_test_home(&home, || {
+            let entry = add_path(path.to_str().unwrap()).unwrap();
+            assert_eq!(entry.path, path.to_string_lossy().into_owned());
+            assert_eq!(resolve_path_by_hash(&entry.hash).unwrap(), path);
+            assert_eq!(resolve_path_by_raw_hash_for_test(&path).unwrap(), path);
+            assert_eq!(
+                resolve_path_by_canonical_hash_for_test(&path).unwrap(),
+                path
+            );
+        });
+    }
+
+    #[test]
+    fn add_path_rejects_sensitive_agents_path() {
+        let home = tmp_home("sensitive");
+        let path = home.join(".ssh").join("AGENTS.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "rules").unwrap();
+
+        with_test_home(&home, || {
+            let err = add_path(path.to_str().unwrap()).unwrap_err();
+            assert!(err.contains("sensitive directory"));
+        });
+    }
+
+    #[test]
+    fn resolve_rejects_unsafe_legacy_store_path() {
+        let home = tmp_home("legacy");
+        let path = home.join(".ssh").join("AGENTS.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "rules").unwrap();
+
+        with_test_home(&home, || {
+            save_store(&AgentsMdPathsStore {
+                agents: vec![path.to_string_lossy().into_owned()],
+            })
+            .unwrap();
+            let hash = path_hash(&path);
+            let err = resolve_path_by_hash(&hash).unwrap_err();
+            assert!(err.contains("sensitive directory"));
+        });
     }
 }

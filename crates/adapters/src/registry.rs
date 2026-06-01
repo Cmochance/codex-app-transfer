@@ -99,12 +99,16 @@ impl AdapterRegistry {
         // AnthropicMessagesAdapter 做 Responses ↔ Anthropic Messages 转换,
         // 不在 responses passthrough 分支。
         //
-        // **关键例外**:`/responses/compact` 是本仓库私有扩展(不是 OpenAI 官方
-        // 端点),OpenAI 上游不实现 → 必须走 ResponsesAdapter 在本地包装成 chat
-        // completions 模拟实现。passthrough 这条路径会让上游必 404。
+        // `/responses/compact`(MOC-113):这是 OpenAI Responses API 端点,Codex CLI
+        // 原生就打它、**OpenAI 官方实现**。声明 `apiFormat=responses` 的 provider 是
+        // 忠实中转 Responses API 的上游(OpenAI 官方 / 自建反代),原生支持 compact,
+        // 应跟普通 `/responses` 一样字节透传 —— **不再排除 compact**。此前排除会强转
+        // 成本地 chat-completions 包装,打到 responses-only 上游不一定存在的
+        // `/chat/completions` 而失败。只有 `apiFormat=openai_chat` 的 chat-only
+        // provider(MiMo/Kimi/DeepSeek 等,上游无 compact 端点)才走下面 ResponsesAdapter
+        // 的本地 chat 包装(见 `responses_compact_subpath_routes_to_responses_adapter`)。
         if matches!(normalized.as_str(), "responses" | "openai_responses")
             && is_local_responses_route(client_path)
-            && !is_responses_compact_subpath(client_path)
         {
             return self.responses_passthrough.clone();
         }
@@ -129,19 +133,20 @@ pub fn rewrite_local_path_for_upstream(client_path: &str) -> String {
     routes::rewrite_local_path_for_upstream(client_path)
 }
 
-/// 是否是 `/responses/compact*` 子路径(本仓库私有扩展,OpenAI 上游不实现)。
-/// passthrough adapter 必须排除这条路径,留给 ResponsesAdapter 在本地包装实现。
+/// 是否是 `/responses/compact*` 子路径(Codex CLI 的 compact 端点)。
+/// 仅 `apiFormat=openai_chat` 的 chat-only 上游需要据此走本地包装;`apiFormat=responses`
+/// 透传上游原生支持 compact,不再据此排除(MOC-113)。
 pub fn is_responses_compact_subpath(client_path: &str) -> bool {
     routes::is_responses_compact_subpath(client_path)
 }
 
 pub fn is_local_responses_route(client_path: &str) -> bool {
-    // `/responses` / `/messages` 是 OpenAI Codex CLI 本地入站路径;
-    // `/responses/compact` 等 `/responses/*` 子路径(以及 `/messages/*`)
-    // 是 OpenAI Responses API 的私有扩展,第三方 provider 都不实现,**必须**
-    // 走 ResponsesAdapter 在本地处理而不是透传到 openai_chat 上游(否则
-    // OpenaiChatAdapter 会把 `/responses/compact` 直接转给 chat-completions
-    // 上游 base_url,触发 404)。
+    // `/responses` / `/messages` 是 OpenAI Codex CLI 本地入站路径;`/responses/compact`
+    // 等 `/responses/*` 子路径(以及 `/messages/*`)也是本地 Responses 路由。
+    // `apiFormat=openai_chat` 的 chat-only 上游下,compact 子路径走 ResponsesAdapter
+    // 本地包装成 chat-completions(上游无 compact 端点);`apiFormat=responses` 透传
+    // 上游则原样转发 `/responses/compact`(上游原生支持,见 lookup_for_request 的
+    // MOC-113 注释)。
     routes::is_local_responses_route(client_path)
 }
 
@@ -273,10 +278,11 @@ mod tests {
 
     #[test]
     fn responses_compact_subpath_routes_to_responses_adapter() {
-        // 关键回归 (2026-05-07):/responses/compact 必须命中 ResponsesAdapter,
-        // 让它在本地实现 compact 端点,而不是被 OpenaiChatAdapter 直接透传到
-        // 上游 chat-completions provider(那一定 404,因为这是 OpenAI 私有
-        // 扩展,第三方都没实现)。
+        // 关键回归 (2026-05-07):`apiFormat=openai_chat` 的 chat-only provider
+        // (MiMo/Kimi/DeepSeek 等)其 /responses/compact 必须命中 ResponsesAdapter
+        // 走本地 chat 包装,而不是透传到上游 chat-completions(那一定 404 —— chat
+        // 上游没有 compact 端点)。注:`apiFormat=responses` 透传上游则相反,走
+        // passthrough 原样转发(见 responses_passthrough_active_...,MOC-113)。
         let r = AdapterRegistry::with_builtins();
         for path in [
             "/responses/compact",
@@ -287,7 +293,7 @@ mod tests {
             assert_eq!(
                 r.lookup_for_request("openai_chat", path).name(),
                 "responses",
-                "{path} 必须走 ResponsesAdapter 本地处理(不能透传成 OpenaiChat)"
+                "{path} (openai_chat) 必须走 ResponsesAdapter 本地处理(不能透传成 OpenaiChat)"
             );
         }
     }
@@ -308,7 +314,9 @@ mod tests {
     #[test]
     fn responses_passthrough_active_for_responses_format_on_local_routes() {
         // apiFormat=responses + 入站 /responses 路径 → ResponsesPassthroughAdapter
-        // (字节级透传给上游 OpenAI Responses API,不做协议转换)
+        // (字节级透传给上游 OpenAI Responses API,不做协议转换)。
+        // MOC-113:`/responses/compact` 也在内 —— responses 透传上游(忠实中转
+        // OpenAI Responses API)原生支持 compact 端点,不再被排除强转 chat-completions。
         let r = AdapterRegistry::with_builtins();
         for path in [
             "/responses",
@@ -317,6 +325,10 @@ mod tests {
             "/openai/v1/responses",
             "/v1/responses/resp_abc/cancel",
             "/v1/messages",
+            "/responses/compact",
+            "/v1/responses/compact",
+            "/openai/v1/responses/compact",
+            "/responses/compact?foo=1",
         ] {
             assert_eq!(
                 r.lookup_for_request("responses", path).name(),
@@ -365,11 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn responses_compact_subpath_never_uses_passthrough_even_for_responses_format() {
-        // P1 (chatgpt-codex-connector review): /responses/compact 是本仓库私有扩展
-        // (不是 OpenAI 官方端点),OpenAI 上游不实现 → 必须走 ResponsesAdapter 本地
-        // 包装成 chat completions 模拟实现。即便 apiFormat=responses 也不能进 passthrough
-        // (passthrough 上去必 404)。
+    fn responses_compact_subpath_passthrough_for_responses_but_local_for_chat() {
+        // MOC-113:`/responses/compact` 是 Codex CLI 的 compact 端点,**OpenAI 官方实现**。
+        // apiFormat=responses 的上游(OpenAI 官方 / 忠实中转 Responses API 的反代)原生
+        // 支持 compact,应跟普通 /responses 一样字节透传 —— 不再排除强转本地 chat。
+        // (此前 `..._never_uses_passthrough...` 回归测试锁定相反的旧行为,基于"OpenAI 不
+        // 实现 compact、passthrough 必 404"的错误前提,本 issue 推翻。)
         let r = AdapterRegistry::with_builtins();
         for path in [
             "/responses/compact",
@@ -379,17 +392,22 @@ mod tests {
         ] {
             assert_eq!(
                 r.lookup_for_request("responses", path).name(),
-                "responses",
-                "{path} 即使 apiFormat=responses 也必须走 ResponsesAdapter,不能 passthrough"
+                "responses_passthrough",
+                "{path} apiFormat=responses 的 compact 必须透传给上游(上游原生支持)"
             );
             assert_eq!(
                 r.lookup_for_request("openai_responses", path).name(),
+                "responses_passthrough",
+                "{path} openai_responses 别名同样透传"
+            );
+            // 对照:apiFormat=openai_chat 的 chat-only 上游无 compact 端点,仍走本地包装。
+            assert_eq!(
+                r.lookup_for_request("openai_chat", path).name(),
                 "responses",
-                "{path} openai_responses 别名也必须走 ResponsesAdapter"
+                "{path} apiFormat=openai_chat 仍走 ResponsesAdapter 本地 chat 包装"
             );
         }
-        // 防回归:`/responses/compact_alt` 不属于 compact 私有扩展,仍走 passthrough
-        // (语义上是普通子路径,passthrough 让上游决定是否实现)
+        // `/responses/compact_alt` 不是 compact 端点(普通子路径),responses 格式照常透传。
         assert_eq!(
             r.lookup_for_request("responses", "/v1/responses/compact_alt")
                 .name(),

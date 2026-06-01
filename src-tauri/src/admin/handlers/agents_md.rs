@@ -33,7 +33,7 @@ use super::common::err;
 fn build_block_for_hash(hash: Option<&str>) -> Result<MarkdownManagedBlock, String> {
     let target = match hash {
         Some(h) if !h.is_empty() => agents_md_paths::resolve_path_by_hash(h)?,
-        _ => agents_md_paths::global_agents_path()?,
+        _ => agents_md_paths::validated_global_agents_path()?,
     };
     let path_hash = agents_md_paths::path_hash(&target);
     let history = agents_md_paths::history_file_for(&path_hash)?;
@@ -235,7 +235,7 @@ fn now_unix() -> u64 {
 fn resolve_target_and_history(hash: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
     let target = match hash {
         Some(h) if !h.is_empty() => agents_md_paths::resolve_path_by_hash(h)?,
-        _ => agents_md_paths::global_agents_path()?,
+        _ => agents_md_paths::validated_global_agents_path()?,
     };
     let path_hash = agents_md_paths::path_hash(&target);
     let history = agents_md_paths::history_file_for(&path_hash)?;
