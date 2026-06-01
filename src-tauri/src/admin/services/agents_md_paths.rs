@@ -342,7 +342,9 @@ mod tests {
         };
         let dir = root.join(format!("cas-agents-paths-{label}-{rand_hex}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // macOS /tmp is a symlink to /private/tmp — canonicalize so expected
+        // paths match the guard's canonicalize() output (no-op on Linux CI).
+        fs::canonicalize(&dir).unwrap_or(dir)
     }
 
     fn with_test_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
@@ -385,7 +387,10 @@ mod tests {
             assert_eq!(entry.path, path.to_string_lossy().into_owned());
             assert_eq!(resolve_path_by_hash(&entry.hash).unwrap(), path);
             assert_eq!(resolve_path_by_raw_hash_for_test(&path).unwrap(), path);
-            assert_eq!(resolve_path_by_canonical_hash_for_test(&path).unwrap(), path);
+            assert_eq!(
+                resolve_path_by_canonical_hash_for_test(&path).unwrap(),
+                path
+            );
         });
     }
 

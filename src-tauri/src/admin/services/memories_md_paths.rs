@@ -297,7 +297,9 @@ mod tests {
         };
         let dir = root.join(format!("cas-memories-paths-{label}-{rand_hex}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // macOS /tmp is a symlink to /private/tmp — canonicalize so expected
+        // paths match the guard's canonicalize() output (no-op on Linux CI).
+        fs::canonicalize(&dir).unwrap_or(dir)
     }
 
     fn with_test_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {

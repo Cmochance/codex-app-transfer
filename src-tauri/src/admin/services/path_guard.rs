@@ -167,6 +167,16 @@ fn validate_doc_path_with_home(
     }
 
     let canonical = canonicalize_for_policy(path)?;
+    // Re-check the filename on the *canonical* path, not just the raw one: a
+    // symlink named AGENTS.md can point at e.g. ~/.codex/auth.json, which would
+    // pass the raw-name gate above but resolve to a different file. Re-checking
+    // here closes that symlink/TOCTOU redirect and keeps both gates consistent.
+    if !has_expected_filename(&canonical, kind) {
+        return Err(format!(
+            "resolved path has an unexpected file name for {kind:?}: {}",
+            canonical.display()
+        ));
+    }
     let home = canonical_home(home);
     if !path_starts_with(&canonical, &home) {
         return Err(format!(
@@ -243,7 +253,9 @@ mod tests {
         };
         let dir = root.join(format!("cas-path-guard-{label}-{rand_hex}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // macOS /tmp is a symlink to /private/tmp — canonicalize so expected
+        // paths match the guard's canonicalize() output (no-op on Linux CI).
+        fs::canonicalize(&dir).unwrap_or(dir)
     }
 
     #[test]
@@ -308,5 +320,24 @@ mod tests {
 
         let validated = validate_memories_path_with_home_for_test(&target, &home).unwrap();
         assert!(validated.ends_with("MEMORY.md"));
+    }
+
+    // A symlink named AGENTS.md that resolves to a different filename (e.g.
+    // ~/.codex/auth.json) passes the raw-name gate but must be rejected by the
+    // canonical-name re-check — this is the symlink/TOCTOU redirect.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_redirecting_to_other_filename() {
+        let home = tmp_home("symlink-redirect");
+        let target = home.join(".codex").join("auth.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "secret").unwrap();
+
+        let link = home.join("project").join("AGENTS.md");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = validate_agents_path_with_home_for_test(&link, &home).unwrap_err();
+        assert!(err.contains("unexpected file name"), "got: {err}");
     }
 }

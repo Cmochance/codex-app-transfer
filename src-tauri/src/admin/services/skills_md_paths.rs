@@ -143,7 +143,9 @@ mod tests {
         };
         let dir = root.join(format!("cas-skills-md-paths-{label}-{rand_hex}"));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // macOS /tmp is a symlink to /private/tmp — canonicalize so expected
+        // paths match the guard's canonicalize() output (no-op on Linux CI).
+        fs::canonicalize(&dir).unwrap_or(dir)
     }
 
     fn with_test_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
@@ -156,7 +158,11 @@ mod tests {
     #[test]
     fn resolve_skill_hash_stays_under_skills_root() {
         let home = tmp_home("resolve");
-        let skill = home.join(".codex").join("skills").join("alpha").join("SKILL.md");
+        let skill = home
+            .join(".codex")
+            .join("skills")
+            .join("alpha")
+            .join("SKILL.md");
         fs::create_dir_all(skill.parent().unwrap()).unwrap();
         fs::write(&skill, "skill").unwrap();
 
