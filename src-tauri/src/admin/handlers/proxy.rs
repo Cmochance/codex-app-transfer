@@ -128,6 +128,17 @@ pub async fn proxy_status(State(state): State<AdminState>) -> impl IntoResponse 
     .into_response()
 }
 
+/// GET /api/system-proxy/status —— MOC-114 系统代理(梯子)连通性探测。
+///
+/// 注意:这跟 [`proxy_status`] 是两回事 —— `proxy_status` 报的是 transfer **本地转发
+/// 进程**(127.0.0.1,恒可达);本接口报的是**系统代理(科学上网梯子)**是否挂 + 端口
+/// 是否可连。relay 真账号模式的 chatgpt backend 透传与第三方路由都依赖后者,前端据此
+/// 显示「网络代理:已连接/未连接」并 gate plugins 解锁。只探代理端口、不碰 chatgpt.com。
+pub async fn system_proxy_status() -> impl IntoResponse {
+    let st = crate::system_proxy::probe().await;
+    Json(json!({ "success": true, "systemProxy": st })).into_response()
+}
+
 pub async fn proxy_logs() -> impl IntoResponse {
     Json(json!({"logs": proxy_telemetry().logs.get_all()})).into_response()
 }

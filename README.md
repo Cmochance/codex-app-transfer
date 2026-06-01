@@ -78,6 +78,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - 中文 / 英文界面,浅色 / 深色 / 绿色 / 橙色 / 灰色 / 白色多种主题
 - **注入的 system prompts 跟随界面语言**:本项目对非 OpenAI provider 注入的 `apply_patch` chat-path 规则 + autocompact 总结提示词,跟设置里 `语言 / Language` 一致(中文用户 → 中文 prompt,避免模型中英混杂思考);V4A 关键字(`*** Begin Patch` / `@@ <header>` 等)+ Codex CLI 错误消息原文保英文(parser / matcher 不接受翻译)
 - **Codex Desktop 主题(可选,默认关)**:Theme 页内置 11 套动漫主题(`carton` 含浮动看板娘,其余 `changli` / `azurlane` / `nailin` / `zani` / `frost` / `nocturne` / `duet` / `rose` / `sonata` / `studio`),每套按背景图独立调出暗玻璃 + 强调色。通过 CDP 向 Codex Desktop 注入设计令牌覆盖(`--color-token-*` + 运行时 `--color-*` 层)+ 背景图,覆盖聊天 / 设置页 / 折叠侧栏 / 弹层等各视图。开关跟 Plugin Unlock 独立,page reload 自动重应用;关闭开关只落盘清除偏好,已注入主题保留至 Codex 下次重启自然消失
+- **系统代理(梯子)连通性检测**(MOC-114):仪表盘「网络代理」卡实时显示系统代理是否活跃(已连接 / 未连接 / 自动配置 PAC / 检测中);relay 真实账号模式下「自动解锁 Codex Plugins」开关在账号有效且代理可达两条件同时满足时才激活,避免梯子没开时 plugins 静默全 502 却显示"已登录"的误导态。探测仅对代理端口做短超时 TCP 连通测试,不访问 chatgpt.com。
 - 跨平台单实例锁定(双击启动自动唤起已有窗口)+ 跨进程 file lock 防多实例同时写 config 丢更新
 - Windows / macOS / Linux 系统托盘
 

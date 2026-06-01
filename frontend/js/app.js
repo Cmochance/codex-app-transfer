@@ -1488,8 +1488,17 @@
       if (unlockToggle) unlockToggle.checked = on;
       const runEl = $("#raRunStatus");
       if (runEl) {
-        runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
-        runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
+        // [MOC-114 connector review] relay 真账号已解锁但系统代理(梯子)没开 → plugins 网络层
+        // 用不了。runtime 如实标注「网络代理未连接」(否则裸显示"已开启"会重现"已登录却转圈"
+        // 误导态);checkbox 仍 ON —— auth 层确实解锁了(Codex 据 auth_mode 原生显示 plugins)。
+        const proxyDown = realActive && !systemProxyGateOk(lastSystemProxyStatus);
+        if (proxyDown) {
+          runEl.textContent = t("realAccount.runOnProxyDown") || "已开启(网络代理未连接)";
+          runEl.style.color = "var(--ra-warn, #c80)";
+        } else {
+          runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
+          runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
+        }
       }
       // 有长期保留的真实账号 → 显示「清除真实账号」按钮。
       const forgetBtn = $("#realAccountForgetBtn");
@@ -1545,17 +1554,28 @@
       showToast(t("realAccount.statusUnavailable") || "暂时无法获取账号状态,请稍后重试");
       return;
     }
+    // [MOC-114] 解锁 gate 同时要求账号有效 + 系统代理(梯子)连通。relay 真账号/插件/第三方
+    // 路由都依赖梯子可达;缺任一都会让 plugins 进"已登录却全转圈"的误导态,故 gate 住、
+    // 弹引导。探测失败**不**武断 gate(可能 admin server 抖动)→ 按连通放行,运行时错误兜底
+    // (与 status() 失败不伪装无账号的 HIGH-1 口径对称)。
+    let proxyConnected = true;
+    try {
+      const sp = await CCApi.systemProxy.status();
+      // gate 只在「配了代理但连不上(梯子没开)」时拦;没配/PAC/查询失败均 fail-open(见 helper)。
+      proxyConnected = systemProxyGateOk(sp && sp.systemProxy);
+    } catch (_e) {
+      proxyConnected = true;
+    }
     if (toggle.checked) {
-      if (realActive) {
-        // 有效真实账号 → relay 模式,Codex 原生显示 plugins,不启 daemon、不设强制档。
+      if (realActive && proxyConnected) {
+        // 账号有效 + 梯子连通 → relay 模式,Codex 原生显示 plugins,不启 daemon、不设强制档。
         showToast(t("realAccount.unlockedByRealAccount") || "已开启(真实账号,原生解锁)");
         setTimeout(refreshRealAccountStatus, 100);
         setTimeout(refreshPluginUnlockStatus, 300);
       } else {
-        // 无有效账号 → 引导弹窗。开关回退到派生态(强制档值,通常 OFF)。
+        // 缺账号 / 缺代理 → 引导弹窗(文案按缺啥动态)。开关回退派生态(强制档值,通常 OFF)。
         toggle.checked = forceUnlockPersisted;
-        const m = $("#realAccountNoAccountModal");
-        if (m) m.hidden = false;
+        showRealAccountGateModal(!realActive, !proxyConnected);
       }
     } else if (realActive) {
       // relay:前端开关关不掉账号原生解锁 → 弹回 ON 并提示走「清除真实账号」。
@@ -1569,6 +1589,33 @@
       setTimeout(refreshPluginUnlockStatus, 300);
       setTimeout(refreshRealAccountStatus, 300);
     }
+  }
+
+  // [MOC-114] 解锁引导窗 —— 按「缺账号 / 缺代理 / 都缺」动态设 title/desc 与登录按钮可见性。
+  // 缺代理时登录按钮无意义(梯子没挂,登录也连不上),隐藏之;强制开启按钮始终保留(逃生阀)。
+  function showRealAccountGateModal(needAccount, needProxy) {
+    const m = $("#realAccountNoAccountModal");
+    if (!m) return;
+    const titleEl = m.querySelector("h3");
+    const descEl = m.querySelector(".codex-modal-desc");
+    const loginBtn = m.querySelector('[data-action="real-account-noacct-login"]');
+    let titleKey, descKey;
+    if (needAccount && needProxy) {
+      titleKey = "realAccount.gateBothTitle";
+      descKey = "realAccount.gateBothDesc";
+    } else if (needProxy) {
+      titleKey = "realAccount.gateProxyTitle";
+      descKey = "realAccount.gateProxyDesc";
+    } else {
+      titleKey = "realAccount.noAccountTitle";
+      descKey = "realAccount.noAccountDesc";
+    }
+    // [review] 同步 data-i18n 到动态 key —— 否则 i18n.apply() 在语言切换时 re-walk
+    // [data-i18n] 节点会用旧的 noAccount key 覆盖回静态文案,把「缺代理」误显示成「缺账号」。
+    if (titleEl) { titleEl.dataset.i18n = titleKey; titleEl.textContent = t(titleKey) || titleEl.textContent; }
+    if (descEl) { descEl.dataset.i18n = descKey; descEl.textContent = t(descKey) || descEl.textContent; }
+    if (loginBtn) loginBtn.style.display = needAccount ? "" : "none";
+    m.hidden = false;
   }
 
   let realAccountAutoPersisting = false;
@@ -1646,6 +1693,8 @@
     refreshPluginUnlockStatus();
     // MOC-104 真实账号状态刷新
     refreshRealAccountStatus();
+    // MOC-114 网络代理(梯子)连通性刷新(独立异步,含 TCP 探测,不阻塞 dashboard 其余渲染)
+    refreshSystemProxyStatus();
     // MOC-32 PR-2b: silently dropped Responses tool types
     refreshDroppedToolsWarning();
     $("#activityList").innerHTML = activities.map((item) => (
@@ -1656,6 +1705,78 @@
     } catch (err) {
       console.error("[renderDashboard] refreshUpdateBadge failed:", err);
     }
+  }
+
+  // MOC-114:最近一次系统代理探测结果(refreshSystemProxyStatus 写),供 refreshRealAccountStatus
+  // 派生 runtime 状态复用,避免高频轮询里重复 TCP 探测。
+  let lastSystemProxyStatus = null;
+
+  // MOC-114:系统代理是否「通过 gate」。语义:**只有「配了代理但端口连不上(梯子没开)」才算
+  // 未通过**;没配代理(configured=false,可能 TUN 模式/路由器 VPN/直连,网络本就正常)、PAC
+  // (无固定端口无法探)、查询失败(null)一律 fail-open —— 这些都无法判定「梯子没开」,武断
+  // gate 会误伤网络正常的用户(devin review),且与探测失败乐观放行口径一致。
+  function systemProxyGateOk(spData) {
+    if (!spData) return true;
+    if (spData.kind === "pac") return true;
+    if (!spData.configured) return true;
+    return spData.connected === true;
+  }
+
+  // MOC-114:刷新「网络代理」卡片 —— 系统代理(梯子)是否挂 + 端口可连。relay 真账号、
+  // 插件、第三方路由都依赖它;探测只连代理端口、不碰 chatgpt.com。查询失败时显示「未知」
+  // 灰色,**不**伪装成未连接(避免误导已挂梯子的用户)。
+  async function refreshSystemProxyStatus() {
+    const el = $("#dashboardSystemProxyStatus");
+    const icon = $("#dashboardSystemProxyIcon");
+    if (!el) return;
+    let sp = null;
+    try {
+      const resp = await CCApi.systemProxy.status();
+      sp = resp && resp.systemProxy;
+    } catch (e) {
+      console.log("[SystemProxy] status failed:", e);
+    }
+    lastSystemProxyStatus = sp; // 缓存供 refreshRealAccountStatus 派生 runtime 复用(null=查询失败)
+    const setIcon = (cls, glyph) => {
+      if (!icon) return;
+      icon.classList.remove("success", "warning", "muted");
+      icon.classList.add(cls);
+      icon.innerHTML = `<i class="bi ${glyph}"></i>`;
+    };
+    if (!sp) {
+      el.textContent = t("status.unknown") || "未知";
+      el.classList.add("muted-text");
+      setIcon("muted", "bi-globe2");
+      return;
+    }
+    // [review] PAC 自动配置无固定端口、无法 TCP 探测 → 不武断报「未连接」(会误导 + 误 gate
+    // 一个代理其实正常的 PAC 用户);如实显示「自动配置」,gate 侧亦对 PAC fail-open。
+    if (sp.kind === "pac") {
+      el.textContent = t("systemProxy.pac") || "自动配置(PAC)";
+      el.classList.add("muted-text");
+      setIcon("muted", "bi-globe2");
+      return;
+    }
+    // [review devin] 没配系统代理(configured=false)可能是 TUN 模式/路由器 VPN/直连,网络本就
+    // 正常 → 显示中性「未配置」、不报「未连接」警告(否则误导,且与 gate fail-open 口径一致)。
+    if (sp.configured === false) {
+      el.textContent = t("systemProxy.notConfigured") || "未配置";
+      el.classList.add("muted-text");
+      setIcon("muted", "bi-globe2");
+      return;
+    }
+    const connected = sp.connected === true;
+    el.textContent = connected
+      ? (t("systemProxy.connected") || "已连接")
+      : (t("systemProxy.disconnected") || "未连接");
+    el.classList.toggle("muted-text", !connected);
+    setIcon(connected ? "success" : "warning", connected ? "bi-globe2" : "bi-exclamation-triangle");
+    // [connector review] 首次加载时 refreshRealAccountStatus 先跑、彼时 lastSystemProxyStatus
+    // 还是 null → fail-open 渲染 runtime「已开启」。这里 cache 刚填好,若代理 down(gate 失败)
+    // 补触发一次 real-account 重新派生,把 runtime 修正成「已开启(网络代理未连接)」,不让误导
+    // 态持续到下次导航。单向调用(refreshRealAccountStatus 不回调本函数),无循环;仅代理 down
+    // 时多一次本地 status 请求。
+    if (!connected) refreshRealAccountStatus();
   }
 
   /// MOC-32 PR-2b: query /api/diagnostic/dropped-tools, total>0 时弹 warning
