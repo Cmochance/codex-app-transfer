@@ -142,8 +142,10 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // `/backend-api`,与默认结构对齐:proxy 收到 `/backend-api/*` 透传真
     // chatgpt.com 同 path),proxy 即可逐条 log 该链路的请求/响应,把黑盒打开。
     //
-    // 仅 relay 写;direct / apikey 态 strip(None)。snapshot 已存原值,restore 退回。
-    if cfg.preserve_chatgpt_auth && !cfg.base_url.is_empty() {
+    // [MOC-126] 总是设置 chatgpt_base_url，让 backend-api 请求都走 proxy。
+    // proxy 层根据请求是否带真实 auth/cookie 决定 mock 还是透传。
+    // snapshot 已存原值，restore 退回。
+    if !cfg.base_url.is_empty() {
         let chatgpt_base = format!("{}/backend-api", cfg.base_url.trim_end_matches('/'));
         let literal = toml_string_literal(&chatgpt_base);
         sync_root_value(&paths.config_toml, "chatgpt_base_url", Some(&literal))?;

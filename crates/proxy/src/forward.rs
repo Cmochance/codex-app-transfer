@@ -633,6 +633,63 @@ fn is_chatgpt_backend_path(path: &str) -> bool {
     p == "/backend-api" || p.starts_with("/backend-api/")
 }
 
+/// [MOC-126] 虚拟 userID，用于向 Codex 注入伪造账号信息。
+const MOCK_USER_ID: &str = "user-00000000-0000-4000-a000-000000000000";
+
+/// 检查请求是否携带真实的 ChatGPT 认证信息（Bearer token 或 session cookie）。
+/// 若携带，视为 relay 真实账号，继续透传；否则可走 mock 路径。
+fn has_real_chatgpt_auth(headers: &HeaderMap) -> bool {
+    headers.contains_key("authorization") || headers.contains_key("cookie")
+}
+
+/// [MOC-126] 尝试对 chatgpt backend 请求返回 mock 响应。
+/// 返回 Some(Response) 表示命中 mock；None 表示应继续透传。
+fn try_mock_chatgpt_backend(path: &str, method: &Method) -> Option<Response> {
+    let p = path.split('?').next().unwrap_or(path);
+    match (method.as_str(), p) {
+        ("GET", "/backend-api/getAccount") => Some(mock_json(200, serde_json::json!({
+            "id": MOCK_USER_ID,
+            "account_id": MOCK_USER_ID,
+            "user_id": MOCK_USER_ID,
+            "email": "mock@example.com",
+            "name": "Mock User",
+            "picture": null,
+            "created": "2024-01-01T00:00:00.000Z",
+            "account_plan": {
+                "is_paid_subscription_active": false,
+                "subscription_plan": "chatgpt_free",
+                "has_active_subscription": false
+            }
+        }))),
+        ("GET", "/backend-api/me") => Some(mock_json(200, serde_json::json!({
+            "id": MOCK_USER_ID,
+            "object": "user",
+            "name": "Mock User",
+            "email": "mock@example.com",
+            "picture": null,
+            "created": "2024-01-01T00:00:00.000Z"
+        }))),
+        ("GET", p) if p.starts_with("/backend-api/accounts/") => Some(mock_json(200, serde_json::json!({
+            "accounts": [{
+                "id": MOCK_USER_ID,
+                "name": "Mock User",
+                "email": "mock@example.com",
+                "status": "active"
+            }]
+        }))),
+        _ => None,
+    }
+}
+
+/// 构造 mock JSON Response。
+fn mock_json(status: u16, body: serde_json::Value) -> Response {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json; charset=utf-8")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 /// [MOC-104 relay 诊断] 把 chatgpt backend 请求透传真 chatgpt.com 同 path,逐条 log
 /// path/status/body 摘要。复用 `state.http`(走系统代理 → chatgpt.com 可达);响应整体
 /// buffer 以便 log body(getAccount/plugins 都是小 JSON、非 SSE,buffer 无碍)。
@@ -645,8 +702,18 @@ async fn passthrough_chatgpt_backend(
     client_path: &str,
     body: Bytes,
 ) -> Result<Response, ForwardError> {
-    let upstream = format!("https://chatgpt.com{client_path}");
     let telemetry = proxy_telemetry();
+    // [MOC-126] 若请求不带真实 auth/cookie，尝试返回 mock 响应注入 userID。
+    if !has_real_chatgpt_auth(headers) {
+        if let Some(mock) = try_mock_chatgpt_backend(client_path, method) {
+            telemetry.logs.add(
+                "INFO",
+                format!("[chatgpt-mock] {method} {client_path}"),
+            );
+            return Ok(mock);
+        }
+    }
+    let upstream = format!("https://chatgpt.com{client_path}");
     telemetry.logs.add(
         "INFO",
         format!("[chatgpt-relay] {method} {client_path} → {upstream}"),
@@ -2155,5 +2222,72 @@ mod tests {
             build_upstream_url("https://api.openai.com/v1/", "/responses"),
             "https://api.openai.com/v1/responses"
         );
+    }
+    // ── MOC-126: chatgpt backend mock 测试 ──
+
+    #[test]
+    fn mock_hits_get_account_without_auth() {
+        let resp = try_mock_chatgpt_backend("/backend-api/getAccount", &Method::GET)
+            .expect("应命中 mock");
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 1024);
+        let body = futures::executor::block_on(body).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], MOCK_USER_ID);
+        assert_eq!(v["account_id"], MOCK_USER_ID);
+        assert_eq!(v["user_id"], MOCK_USER_ID);
+        assert_eq!(v["email"], "mock@example.com");
+    }
+
+    #[test]
+    fn mock_misses_with_auth_header() {
+        // try_mock_chatgpt_backend 本身不检查 header，
+        // 但 has_real_chatgpt_auth 会在 passthrough_chatgpt_backend 中先拦截。
+        // 这里只测 mock 路由表对未知路径返回 None。
+        let resp = try_mock_chatgpt_backend("/backend-api/unknown", &Method::GET);
+        assert!(resp.is_none());
+    }
+
+    #[test]
+    fn mock_hits_me_endpoint() {
+        let resp = try_mock_chatgpt_backend("/backend-api/me", &Method::GET)
+            .expect("应命中 mock");
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 1024);
+        let body = futures::executor::block_on(body).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], MOCK_USER_ID);
+        assert_eq!(v["object"], "user");
+    }
+
+    #[test]
+    fn mock_ignores_query_string() {
+        let resp = try_mock_chatgpt_backend("/backend-api/getAccount?v=2", &Method::GET)
+            .expect("应命中 mock");
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 1024);
+        let body = futures::executor::block_on(body).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], MOCK_USER_ID);
+    }
+
+    #[test]
+    fn has_real_chatgpt_auth_detects_authorization() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer real-token".parse().unwrap());
+        assert!(has_real_chatgpt_auth(&h));
+    }
+
+    #[test]
+    fn has_real_chatgpt_auth_detects_cookie() {
+        let mut h = HeaderMap::new();
+        h.insert("cookie", "session=abc".parse().unwrap());
+        assert!(has_real_chatgpt_auth(&h));
+    }
+
+    #[test]
+    fn has_real_chatgpt_auth_false_when_empty() {
+        let h = HeaderMap::new();
+        assert!(!has_real_chatgpt_auth(&h));
     }
 }
