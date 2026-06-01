@@ -1771,6 +1771,12 @@
       : (t("systemProxy.disconnected") || "未连接");
     el.classList.toggle("muted-text", !connected);
     setIcon(connected ? "success" : "warning", connected ? "bi-globe2" : "bi-exclamation-triangle");
+    // [connector review] 首次加载时 refreshRealAccountStatus 先跑、彼时 lastSystemProxyStatus
+    // 还是 null → fail-open 渲染 runtime「已开启」。这里 cache 刚填好,若代理 down(gate 失败)
+    // 补触发一次 real-account 重新派生,把 runtime 修正成「已开启(网络代理未连接)」,不让误导
+    // 态持续到下次导航。单向调用(refreshRealAccountStatus 不回调本函数),无循环;仅代理 down
+    // 时多一次本地 status 请求。
+    if (!connected) refreshRealAccountStatus();
   }
 
   /// MOC-32 PR-2b: query /api/diagnostic/dropped-tools, total>0 时弹 warning
