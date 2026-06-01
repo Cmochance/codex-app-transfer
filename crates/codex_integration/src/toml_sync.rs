@@ -28,6 +28,9 @@ pub fn sync_root_value(
 ) -> Result<(), CodexError> {
     let current = read_or_empty(config_toml_path)?;
     let new_content = sync_root_value_in_memory(&current, key, raw_value);
+    if new_content == current {
+        return Ok(());
+    }
     write_atomic(config_toml_path, &new_content)?;
     Ok(())
 }
@@ -98,6 +101,9 @@ pub fn sync_table_field(
 ) -> Result<(), CodexError> {
     let current = read_or_empty(config_toml_path)?;
     let new_content = sync_table_field_in_memory(&current, section, key, raw_value);
+    if new_content == current {
+        return Ok(());
+    }
     write_atomic(config_toml_path, &new_content)?;
     Ok(())
 }
@@ -488,5 +494,76 @@ openai_base_url = \"old\"
         let input = "foo = 1\n";
         let out = sync_root_value_in_memory(input, "missing_key", None);
         assert_eq!(out, "foo = 1\n");
+    }
+
+    #[test]
+    fn file_write_is_skipped_when_root_value_is_already_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "approval_policy = \"never\"\n").unwrap();
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        sync_root_value(&path, "approval_policy", Some("\"never\"")).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "same content should not rewrite config.toml");
+    }
+
+    #[test]
+    fn file_write_is_skipped_when_table_field_is_already_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+
+        // 第一次写入建立规范格式(空文件 → 建 section)
+        sync_table_field(
+            &path,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        )
+        .unwrap();
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // 再 sync 同一目标值 → 新旧内容一致 → 不应写盘(mtime 不变)
+        sync_table_field(
+            &path,
+            "sandbox_workspace_write",
+            "network_access",
+            Some("true"),
+        )
+        .unwrap();
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "same table field content should not rewrite config.toml"
+        );
+    }
+
+    #[test]
+    fn file_is_rewritten_when_root_value_changes() {
+        // 反向守门(验收:真有变化仍正常写盘):防 skip 条件写反 / 误加无条件 return
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "approval_policy = \"never\"\n").unwrap();
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // 值真的变了 → 必须写盘
+        sync_root_value(&path, "approval_policy", Some("\"on-request\"")).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_ne!(before, after, "changed content must rewrite config.toml");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("on-request"),
+            "new value must be persisted to disk"
+        );
     }
 }

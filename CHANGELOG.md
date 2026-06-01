@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- **config.toml 无变化写盘修复**(MOC-115):`sync_root_value` / `sync_table_field` 在计算出的新内容与磁盘现有内容完全一致时跳过 `write_atomic`,消除无意义写入刷新 mtime,修复 Codex 设置页误报 "Configuration was modified since last read" 的问题。
 - **chat 路径非 2xx 错误改写为合规失败流**(MOC-103):chat-completions 兼容 provider(DeepSeek / Kimi / MiMo / GLM / 阿里云百炼 / MiniMax 等)上游返 4xx/5xx 时,proxy 此前原样透传 HTTP 错误 + JSON body,Codex APP 期待 SSE 流而卡 "Thinking";现改写成 HTTP 200 + `response.failed` SSE,401/403/400 永久错误 → `invalid_prompt`(surface + 停),429/5xx/超时等瞬时态保留可重试语义,与 grok / gemini 同走 `codex_retry_code` 白名单。
 - **Plugins 注入重新启用 + daemon / 重启健壮性修复**(MOC-100):撤销 v2.1.18 的临时 kill switch(MOC-98 曾强制关闭 plugins 注入),重新启用;并修掉当初触发关闭的根因 —— ① daemon 指数退避改 `tokio::select!` 可被 reinject 中断,首启延迟从最坏 ~17s 降到 ~3s;② Codex 重启改 `open -a` 单实例(去掉 `-n`)+ 主进程退出后强杀残留 Electron helper(`pkill -KILL -f`),消除多实例堆积导致的启动卡死;③ 注入前等页面 `readyState` 就绪再注,避免打到加载中页面卡加载;④ 重启切到新实例时 daemon 检测 CDP 端口变化、断开旧 WS 重连新实例,不再黏旧页;⑤ daemon 生命周期守护:`stop` / `reinject` 改非阻塞 `try_send` + `running` flag 幂等启动,修掉重启 8 次后命令灌满 bounded channel 卡死调用方、以及退避期间重复 `start` 起两个 daemon 抢同一通道;⑥ 已连 WS 态收到 Stop 现在真正退出整个守护循环(原实现把 Stop 当优雅断开立刻重连,导致 daemon 关不掉);⑦ 设置里切 `autoUnlockCodexPlugins` 开关运行时即时 start/stop daemon,无需重启 transfer 才生效。
 
