@@ -28,7 +28,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 启动转发后,Codex APP 通过本机 `127.0.0.1:18080` 与本工具通信。关闭窗口会缩到系统托盘继续运行,右键托盘"退出"才完全退出。
 
-当前版本 **v2.1.18**(详见 [Changelog](CHANGELOG.md) 与 [Releases](https://github.com/Cmochance/codex-app-transfer/releases))。
+当前版本 **v2.2.0**(详见 [Changelog](CHANGELOG.md) 与 [Releases](https://github.com/Cmochance/codex-app-transfer/releases))。
 
 ## 界面预览
 
@@ -67,6 +67,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - chat-completions 兼容 provider(DeepSeek / Kimi / MiMo / GLM / 阿里云百炼 / MiniMax 等)上游返 4xx/5xx 时同款对齐:此前 proxy 原样透传 HTTP 错误状态 + JSON error body,Codex APP 期待 SSE 流而**卡 "Thinking"**(既不报错也不重试,无法进下一轮);现改写成合规 `response.failed` 流,400 请求错误 / 401 鉴权 / 403 权限 → `invalid_prompt`(永久,surface + 停手),429 限流 / 5xx / 超时等瞬时态保留可重试语义,与 grok / gemini 同走 `codex_retry_code` 白名单(MOC-103)
 - 会话历史**两层持久化**:L1 内存 LRU + L2 sqlite 30 天 TTL(`~/.codex-app-transfer/sessions.db`),`.app` 重启不丢历史
 - **用量统计**(Sidebar → 用量):解析 `~/.codex/sessions/` rollout JSONL,按对话 / 日 / 模型聚合 token 用量(解析层 vendor 自 ryoppippi/ccusage)。「按对话」视图显示每对话**缓存命中率**,点击数字弹出该对话**逐轮命中率直方图**(命中含于总计、双色,hover 看命中 / 总输入 / 输出);proxy 本地记录 `session → 真实上游模型`(本版本之后的新对话),「按对话」模型列因此显示真实上游模型而非 Codex 客户端占位名(`gpt-5.x`)
+- **真实 ChatGPT 账号 Plugins 解锁**(relay 模式,v2.2.0):用真实账号而非 CDP 伪造登录态解锁 Codex Plugins —— 应用内调起官方 `codex login` / 从文件导入账号 / 强制兜底(原 CDP 路径) / 清除账号。relay 保留 `auth_mode=chatgpt` + tokens 让 Codex **原生**显示 Plugins 入口、消除 CDP 伪造的启动高延迟;第三方模型经 `openai_base_url` 走 proxy,账号 / 插件 backend 经 `chatgpt_base_url` 透传真 chatgpt.com。transfer **不刷新** single-use refresh token(与本机 Codex 双刷会 `refresh_token_reused` 烧号),刷新只归源头(本机 Codex 自刷 / 导入源刷 / `codex login` 自取)。配套**系统代理连通检测**:仪表盘「网络代理」状态卡 + 解锁 gate(账号有效 AND 系统代理可达才解锁,缺则引导开代理 / 登录 / 强制),探测只连代理端口、不碰 chatgpt.com(MOC-104 / MOC-114)
 - Codex APP 原配置守护:apply 前自动快照 `~/.codex/{config.toml,auth.json}`,退出 / 下次启动按 key 智能合并还原;**MCP 授权可移植保险箱**(默认开):把 MCP OAuth 凭据改存为可移植文件(`~/.codex/.credentials.json`,0o600),并在 `~/.codex` 之外维护镜像(`~/.codex-app-transfer/mcp-credentials.json`);整个凭据文件被账号切换 / 误删 / 换机清掉时,下次启动弹确认让你从备份恢复(单个 server 的主动登出会被尊重、不复活;注:不解决 OAuth 自然过期)
 - **Codex 文档管理**(Sidebar → Codex):
   - **Agents**:HOME 下非敏感 `AGENTS.md` raw 全文 read/write + 文件系统选择;系统目录 / 凭据目录会被拒绝,按 `.git/` 自动分类 project-root / subdir 显示 chip

@@ -2,7 +2,9 @@
 
 逐版本要点。详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
-## Unreleased
+## v2.2.0 — 2026-06-01
+
+**真实 ChatGPT 账号 plugin 模式(relay)+ 系统代理连通 gate + 协议层与稳定性修复**:自 v2.1.18 起,新增用真实 ChatGPT 账号原生解锁 Plugins 的 relay 路径(MOC-104)与配套系统代理连通检测 / 解锁 gate(MOC-114),并修复 `/responses/compact` 透传(MOC-113)、config.toml 无变化写盘误报(MOC-115)、chat 路径非 2xx 合规失败流(MOC-103)、Plugins 注入重启健壮性(MOC-100)。
 
 - **真实 ChatGPT 账号 plugin 模式(relay,MOC-104,已真机验证)**:CDP 伪造登录态没有真实 userID,Codex 启动要重新初始化登录态(明显的额外延迟,Windows 上可能数十秒);新增「用真实 ChatGPT 账号」这条干净路径。设置页「自动解锁 Codex Plugins」下新增真实账号区:应用内调起官方 `codex login`、从文件导入账号(Tauri dialog 选文件、记录源路径)、「强制开启(高延迟)」(原 CDP 伪造兜底)、清除真实账号。所有写 `auth.json` 先备份再原子写、失败即中止(非破坏)。**relay 解锁:** 真实账号活动时保留 `auth_mode=chatgpt` + tokens(不覆盖成 apikey)→ Codex 据此**原生**显示 Plugins 入口(源码核验 bundle `pluginsDisabledTooltip`「API-key 用户才禁用 Plugins nav」);第三方模型走 `openai_base_url` 经 proxy 转发,账号/插件 backend 走 `chatgpt_base_url`(经 proxy 透传真 chatgpt.com、走系统代理);真实账号活动**不启 CDP daemon**,消除启动高延迟(MOC-100)。**刷新分流(核心):** transfer 与 Codex 是两个进程、共享同一份 `~/.codex/auth.json`,双方都刷新 single-use refresh_token 会触发 `refresh_token_reused` 烧死账号 —— 故 transfer **彻底不 POST 刷新 token**,刷新只归源头:检测获取由本机 Codex 自刷、导入由源那边 Codex 刷(reconcile 从活源跟随 / 源失效回落镜像快照)、登录走 `codex login` 自取;启动只检测 + 失效时恢复,本地 JWT 过期则自动关「自动解锁」开关 + 提示重登。开关智能态:手动开启先检测账号,有效则 relay 直开、无有效账号弹引导窗(登录优先 / 强制兜底),首次加载按账号状态自动开 / 关。
 - **系统代理(梯子)连通性检测 + plugins 解锁前置 gate**(MOC-114):relay 真实账号模式下,chatgpt backend 透传(plugins/getAccount)与第三方路由均依赖系统代理可达,但账号检测是纯本地 JWT 校验、**不反映网络**,导致"账号已登录但梯子没开 → 全 502/超时"的静默失效误导态。新增 `GET /api/system-proxy/status` 端点:macOS 读 `scutil --proxy`、其他平台读 `*_PROXY` 环境变量,对代理 host:port 做 800ms 短超时 TCP 探测,返回 `{configured, connected, host, port, kind, reason}` 三态。探测**仅连代理端口本身,绝不碰 chatgpt.com**。PAC 自动配置无法探端口,fail-open 处理(不误报"梯子挂了")。仪表盘新增「网络代理」状态卡(已连接 / 未连接 / 自动配置(PAC) / 检测中);「自动解锁 Codex Plugins」开关现 gate 于(账号有效 AND 代理可达),不满足时弹引导 modal 告知缺哪个条件 + 提供强制开启兜底。7 个单元测试覆盖核心探测逻辑。
