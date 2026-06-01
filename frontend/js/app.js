@@ -8152,23 +8152,31 @@
         pollRealAccountLogin();
       } catch (e) { showToast(e.message); }
     });
-    $("[data-action=real-account-import]")?.addEventListener("click", () => {
-      $("#realAccountImportFile")?.click();
-    });
-    $("#realAccountImportFile")?.addEventListener("change", async (event) => {
-      const file = event.target.files?.[0];
-      event.target.value = ""; // 允许重选同一文件
-      if (!file) return;
+    // [MOC-104 导入分流] 用 Tauri dialog.open 选文件 —— file input 在 macOS webview 拿不到
+    // 绝对路径,而后端要记录"导入源路径"以便 reconcile 从活源跟随刷新,故必须走 dialog。
+    // 交互不变(点按钮弹系统文件选择器),只是把"读内容"换成"拿路径传后端、后端读"。
+    $("[data-action=real-account-import]")?.addEventListener("click", async () => {
+      const dialog = window.__TAURI__?.dialog;
+      if (!dialog || typeof dialog.open !== "function") {
+        showToast("Tauri dialog API 不可用 — 无法选择导入文件");
+        return;
+      }
       try {
-        const text = await file.text();
-        let parsed;
-        try { parsed = JSON.parse(text); }
-        catch { showToast(t("realAccount.importBadJson") || "文件不是合法 JSON"); return; }
-        const resp = await CCApi.realAccount.import(parsed);
-        // 导入文件多半是旧的:后端导入后会按需刷一次 token。若刷不动且是 token
-        // 已失效(relogin_required),提示用户这份文件太旧需重新导出 / 登录,而不是
-        // 默默报"导入成功"让 plugin 模式拿过期账号去 401。
-        if (resp?.refresh?.outcome === "relogin_required") {
+        const picked = await dialog.open({
+          title: t("realAccount.importPickTitle") || "选择 chatgpt 模式 auth.json(导入真实账号)",
+          multiple: false,
+          directory: false,
+          filters: [
+            { name: "auth.json", extensions: ["json"] },
+            { name: "All files", extensions: ["*"] },
+          ],
+        });
+        if (!picked) return; // 用户取消
+        const sourcePath = Array.isArray(picked) ? picked[0] : picked;
+        const resp = await CCApi.realAccount.import(sourcePath);
+        // 导入**不刷新**;后端按本地 JWT exp 判过期。relogin_required=true → 文件太旧/失效,
+        // 提示重新导出最新文件或改用登录,而非默默拿过期账号去 401。
+        if (resp?.relogin_required === true) {
           showToast(t("realAccount.importExpired") || "已导入,但该账号登录态已失效,请重新导出最新文件或改用「登录真实账号」");
         } else {
           showToast(t("realAccount.imported") || "已导入并长期保留真实账号");

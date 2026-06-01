@@ -22,6 +22,9 @@ const MANAGED_AUTH_KEYS: &[&str] = &["auth_mode", "OPENAI_API_KEY"];
 /// 我们 apply 时实际触碰的 config.toml 根级别字段(restore 时只动这些)。
 const MANAGED_TOML_KEYS: &[&str] = &[
     "openai_base_url",
+    // [MOC-104 relay] relay 写 chatgpt_base_url 引账号/插件 backend 进 proxy;restore /
+    // 切非 relay 时必须 strip,否则残留让 Codex 卸载后仍把 chatgpt backend 发去 proxy。
+    "chatgpt_base_url",
     "model_context_window",
     CODEX_MODEL_CATALOG_KEY,
     "model",
@@ -127,6 +130,25 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     } else {
         let literal = toml_string_literal(cfg.base_url);
         sync_root_value(&paths.config_toml, "openai_base_url", Some(&literal))?;
+    }
+
+    // 2a'. [MOC-104 relay 诊断] chatgpt_base_url → proxy
+    //
+    // relay 模式(`preserve_chatgpt_auth`)下,Codex 的**账号/插件/wham** 请求
+    // (getAccount → userId、plugins install/list/read 等)走 `chatgpt_base_url`
+    // (默认 `https://chatgpt.com/backend-api`),**不经** `openai_base_url`,因此
+    // 现在直连 chatgpt.com、过系统代理、TLS 黑盒 —— relay 的「启动延迟未消除 +
+    // plugins 装不上」就卡在这条看不见的链路。把它也指向本 proxy(`base_url` +
+    // `/backend-api`,与默认结构对齐:proxy 收到 `/backend-api/*` 透传真
+    // chatgpt.com 同 path),proxy 即可逐条 log 该链路的请求/响应,把黑盒打开。
+    //
+    // 仅 relay 写;direct / apikey 态 strip(None)。snapshot 已存原值,restore 退回。
+    if cfg.preserve_chatgpt_auth && !cfg.base_url.is_empty() {
+        let chatgpt_base = format!("{}/backend-api", cfg.base_url.trim_end_matches('/'));
+        let literal = toml_string_literal(&chatgpt_base);
+        sync_root_value(&paths.config_toml, "chatgpt_base_url", Some(&literal))?;
+    } else {
+        sync_root_value(&paths.config_toml, "chatgpt_base_url", None)?;
     }
 
     // 2b. **无条件 strip model_provider 字段**(#258 验证后强约束):
@@ -657,9 +679,9 @@ mod tests {
 
     /// [MOC-104] relay 模式:`preserve_chatgpt_auth=true` 时保留活动 chatgpt 登录态
     /// (`auth_mode=chatgpt` + tokens),**不**写 apikey,strip 残留 OPENAI_API_KEY;
-    /// config.toml 仍写 `openai_base_url` 指 proxy(第三方模型走 proxy;实测 chatgpt 态
-    /// 同样走 openai_base_url 而非 chatgpt_base_url),Codex 据 auth_mode==chatgpt 原生
-    /// 显示 Plugins 入口、无需 CDP daemon。
+    /// config.toml 写 `openai_base_url`(第三方模型经 proxy)**和** `chatgpt_base_url`
+    /// (诊断:Codex 的账号/插件 backend 走 chatgpt_base_url,把它也引到 proxy 透传
+    /// 真 chatgpt.com,见 §2a')。Codex 据 auth_mode==chatgpt 原生显示 Plugins 入口。
     #[test]
     fn apply_relay_preserves_chatgpt_auth_and_strips_residual_apikey() {
         let (_t, paths) = setup();
@@ -700,9 +722,15 @@ mod tests {
             auth.get("OPENAI_API_KEY").is_none(),
             "relay 应 strip 残留 OPENAI_API_KEY,保持纯 chatgpt 态"
         );
-        // config.toml 仍写 openai_base_url → proxy(第三方模型经 proxy 转发)
+        // config.toml 写 openai_base_url → proxy(第三方模型经 proxy 转发)
         let toml = read_toml(&paths);
         assert!(toml.contains("openai_base_url = \"http://127.0.0.1:18080\""));
+        // [MOC-104 relay 诊断] chatgpt_base_url 也指 proxy(+/backend-api):账号/插件
+        // backend 经 proxy 透传 chatgpt.com,把 TLS 黑盒链路变可见
+        assert!(
+            toml.contains("chatgpt_base_url = \"http://127.0.0.1:18080/backend-api\""),
+            "relay 应写 chatgpt_base_url → proxy/backend-api: {toml}"
+        );
     }
 
     /// #212 covering test:**toggle off 时 strip 两条**(sandbox_mode +

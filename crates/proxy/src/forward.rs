@@ -337,6 +337,24 @@ pub async fn forward_handler(
     if parts.method == Method::OPTIONS && is_local_responses_route(&client_path) {
         return Ok(cors_preflight_response()?);
     }
+
+    // [MOC-104 relay 诊断] chatgpt backend 透传:relay 模式 `chatgpt_base_url` 指向本
+    // proxy,`/backend-api/*` 是 Codex 的账号/插件/wham 请求(getAccount→userId、
+    // plugins install/list 等)。透传真 chatgpt.com 同 path(不走第三方 resolve/
+    // adapter),全 path+status+body 摘要落 telemetry log,把这条 TLS 黑盒链路变可见。
+    // 复用 state.http(reqwest 默认读系统代理设置 /`scutil --proxy`,跟随系统、非写死端口;
+    // chatgpt.com 必须经代理才可达,故绝不能 no_proxy)。
+    if is_chatgpt_backend_path(&client_path) {
+        return passthrough_chatgpt_backend(
+            &state,
+            &parts.method,
+            &parts.headers,
+            &client_path,
+            body_bytes,
+        )
+        .await;
+    }
+
     let original_model = body_model(&body_bytes);
     let resolved = state.resolver.resolve(&parts, &body_bytes)?;
 
@@ -604,6 +622,106 @@ pub async fn forward_handler(
         .ok_or_else(|| ForwardError::Header("response builder lacks headers".into()))?;
     *headers_out = response_plan.headers;
     Ok(builder.body(Body::from_stream(response_plan.stream))?)
+}
+
+/// [MOC-104 relay] relay 模式 `chatgpt_base_url=<proxy>/backend-api` 后,Codex 的
+/// 账号/插件/wham 请求都以 `/backend-api/` 开头(默认 chatgpt_base_url =
+/// `https://chatgpt.com/backend-api`)。这些请求不该走第三方 provider 路由,需透传
+/// 真 chatgpt.com。
+fn is_chatgpt_backend_path(path: &str) -> bool {
+    let p = path.split('?').next().unwrap_or(path);
+    p == "/backend-api" || p.starts_with("/backend-api/")
+}
+
+/// [MOC-104 relay 诊断] 把 chatgpt backend 请求透传真 chatgpt.com 同 path,逐条 log
+/// path/status/body 摘要。复用 `state.http`(走系统代理 → chatgpt.com 可达);响应整体
+/// buffer 以便 log body(getAccount/plugins 都是小 JSON、非 SSE,buffer 无碍)。
+/// header name/value 用字符串 + from_bytes 复制,避开 reqwest 与 axum 的 http 类型
+/// 是否同源的耦合。
+async fn passthrough_chatgpt_backend(
+    state: &ProxyState,
+    method: &Method,
+    headers: &HeaderMap,
+    client_path: &str,
+    body: Bytes,
+) -> Result<Response, ForwardError> {
+    let upstream = format!("https://chatgpt.com{client_path}");
+    let telemetry = proxy_telemetry();
+    telemetry.logs.add(
+        "INFO",
+        format!("[chatgpt-relay] {method} {client_path} → {upstream}"),
+    );
+
+    // [review M-2] method 解析失败**报错、不降级** —— 把 POST(plugins install 等写操作)
+    // 悄悄降级成 GET 是破坏性降级(违反"禁止破坏性降级"硬规则);axum Method 已合法,
+    // 失败仅扩展 method 边界,报 BadRequest 让上层显式处理而非吞掉请求意图。
+    let rmethod = reqwest::Method::from_bytes(method.as_str().as_bytes()).map_err(|e| {
+        ForwardError::BadRequest(format!("无法转换 chatgpt backend method {method}: {e}"))
+    })?;
+    let mut rb = state.http.request(rmethod, &upstream);
+    for (k, v) in headers.iter() {
+        let name = k.as_str();
+        // host 让 reqwest 按 upstream 重填;accept-encoding 去掉避免压缩 body 干扰 log
+        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        rb = rb.header(name, v.as_bytes());
+    }
+    if !body.is_empty() {
+        rb = rb.body(body);
+    }
+
+    let resp = rb.send().await?;
+    let status = resp.status().as_u16();
+    let resp_headers = resp.headers().clone();
+    // [review H-1] body 读失败**冒泡、不吞** —— `unwrap_or_default()` 会把上游连接 reset /
+    // TLS 截断 / 读超时伪装成"成功读到空 200",抹掉根因 + 让诊断日志说假话(本模块存在的
+    // 意义就是把 TLS 黑盒变可见)。透传场景上游断连本就该回 502 让 Codex 重试。
+    let resp_body = resp.bytes().await.map_err(ForwardError::Upstream)?;
+
+    // [review N-3] 不再 log 响应 body preview —— getAccount/plugin 响应含 account id/email,
+    // 落 telemetry 是敏感信息泄漏。只记 status + bytes 足够诊断;Authorization 本就不记。
+    telemetry.logs.add(
+        if (200..300).contains(&status) {
+            "INFO"
+        } else {
+            "WARN"
+        },
+        format!(
+            "[chatgpt-relay] resp {status} {client_path} ({} bytes)",
+            resp_body.len()
+        ),
+    );
+
+    let mut builder = Response::builder().status(status);
+    if let Some(h) = builder.headers_mut() {
+        for (k, v) in resp_headers.iter() {
+            let name = k.as_str();
+            // content-length/transfer-encoding/content-encoding 由 axum 重算
+            if name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+                || name.eq_ignore_ascii_case("content-encoding")
+            {
+                continue;
+            }
+            // [review M-1] header 解析失败记日志、不静默丢 —— chatgpt backend 响应可能带
+            // 语义 header(chatgpt-account-id / set-cookie),无声丢弃是"幽灵丢 header"、最难
+            // 排查。降级(跳过该 header)可接受,但必须可见。
+            match (
+                HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_bytes(v.as_bytes()),
+            ) {
+                (Ok(hn), Ok(hv)) => {
+                    h.append(hn, hv);
+                }
+                _ => telemetry.logs.add(
+                    "DEBUG",
+                    format!("[chatgpt-relay] 跳过无法解析的响应 header: {name}"),
+                ),
+            }
+        }
+    }
+    Ok(builder.body(Body::from(resp_body))?)
 }
 
 /// 在上游 SSE / chunked 流上叠加耗时埋点。流被 Drop(adapter 链路 / 客户端

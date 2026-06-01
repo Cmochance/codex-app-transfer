@@ -196,10 +196,19 @@ impl StaticResolver {
             .unwrap_or("");
         let token = actual.strip_prefix("Bearer ").unwrap_or(actual);
         if token == expected {
-            Ok(())
-        } else {
-            Err(ResolveError::Unauthorized)
+            return Ok(());
         }
+        // [MOC-104 relay] relay 模式下活动 `~/.codex/auth.json` 是真实 chatgpt,Codex 模型
+        // 请求发的是 chatgpt access_token(JWT,**不是** cas_ gateway key)。proxy 信任本地
+        // Codex 的真实 chatgpt 登录态、放行 —— 转发仍由 `decide_provider` 按 active_provider
+        // 决定,不依赖 gateway key。只认「带 OpenAI chatgpt 账号 claim 的 JWT」,挡掉随机乱
+        // token。安全等价:能发出有效 chatgpt token = 已持有 auth.json,同样能拿到 config
+        // 里的 cas_ gateway key,门槛相同。这才是 relay(auth_mode=chatgpt + openai_base_url
+        // → proxy)能让模型请求落地的关键 —— 否则 check_gateway 死等 cas_ 会拒掉一切。
+        if is_chatgpt_access_token(token) {
+            return Ok(());
+        }
+        Err(ResolveError::Unauthorized)
     }
 }
 
@@ -315,6 +324,31 @@ fn decide_provider<'a>(
     }
     // 没 / 或没可映射 model → 走默认 provider.
     Some((provider, None))
+}
+
+/// 判断 Bearer 是否是 OpenAI ChatGPT 的 access_token —— JWT(三段)且 payload 含
+/// `https://api.openai.com/auth.chatgpt_account_id`。relay 模式(活动 auth.json 是真实
+/// chatgpt)下 Codex 模型请求发此 token 到 proxy,`check_gateway` 据此放行(身份比静态
+/// cas_ gateway key 更硬,且 `decide_provider` 不依赖 gateway key 即可按 active_provider
+/// 转发)。验 claim 而非只看 JWT 格式,挡掉随机乱 token。
+fn is_chatgpt_access_token(token: &str) -> bool {
+    use base64::Engine;
+    // JWT = header.payload.signature,正好三段且签名非空。
+    let mut it = token.split('.');
+    let payload = match (it.next(), it.next(), it.next(), it.next()) {
+        (Some(_h), Some(p), Some(sig), None) if !sig.is_empty() && !p.is_empty() => p,
+        _ => return false,
+    };
+    let Ok(raw) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    v.get("https://api.openai.com/auth")
+        .and_then(|a| a.get("chatgpt_account_id"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 /// 让裸 Resolver 可装进 `Arc<dyn ProviderResolver>`(给 ProxyState 共享用).
@@ -461,6 +495,62 @@ mod tests {
         assert_eq!(res.provider_id, "openai");
         assert_eq!(res.api_key, "sk-1");
         assert_eq!(res.rewritten_model, None);
+    }
+
+    /// 构造一个 ChatGPT access_token(JWT,payload 含 chatgpt_account_id)用于测试。
+    fn chatgpt_jwt() -> String {
+        use base64::Engine;
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acc_test"}
+        });
+        let p = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        format!("eyJhbGciOiJub25lIn0.{p}.sig")
+    }
+
+    /// [MOC-104 relay] gateway_key 已设时,relay 模式 Codex 发的 chatgpt access_token
+    /// (非 cas_)应放行 —— check_gateway 认出它是带 chatgpt_account_id 的 JWT,之后
+    /// decide_provider 用 active_provider 转发(模型请求能落地的关键)。
+    #[test]
+    fn relay_accepts_chatgpt_token_when_gateway_set() {
+        let r = StaticResolver::new(
+            Some("cas-secret".into()),
+            vec![provider("openai", "https://up", "sk-1")],
+            Some("openai".into()),
+        );
+        let auth = format!("Bearer {}", chatgpt_jwt());
+        let p = parts_with(&[("authorization", auth.as_str())]);
+        let res = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();
+        assert_eq!(res.provider_id, "openai");
+        assert_eq!(res.api_key, "sk-1");
+    }
+
+    /// 反向:随机 token(既非 cas_ 也非 chatgpt JWT)仍拒,确保 relay 放行不过松。
+    #[test]
+    fn relay_still_rejects_random_token() {
+        use base64::Engine;
+        let r = StaticResolver::new(
+            Some("cas-secret".into()),
+            vec![provider("openai", "https://up", "sk-1")],
+            Some("openai".into()),
+        );
+        // 非 JWT 乱串
+        let p1 = parts_with(&[("authorization", "Bearer random-junk")]);
+        assert!(matches!(
+            r.resolve(&p1, b"{}").unwrap_err(),
+            ResolveError::Unauthorized
+        ));
+        // JWT 格式但 payload 无 chatgpt_account_id claim
+        let fake = format!(
+            "eyJ.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"sub\":\"x\"}")
+        );
+        let auth2 = format!("Bearer {fake}");
+        let p2 = parts_with(&[("authorization", auth2.as_str())]);
+        assert!(matches!(
+            r.resolve(&p2, b"{}").unwrap_err(),
+            ResolveError::Unauthorized
+        ));
     }
 
     #[test]

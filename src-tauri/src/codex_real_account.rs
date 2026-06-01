@@ -9,15 +9,18 @@
 //! 能力(注意:**只有 [`detect`] 是纯只读**,其余按需写 `auth.json` —— 都「先备份
 //! 再原子写、失败即中止」,非破坏):
 //! - **检测**([`detect`],只读):定位本机可用的真实 chatgpt 登录态。
-//! - **token 刷新**([`refresh_if_needed`]):将过期才走官方 OAuth refresh,只更新
-//!   token 字段 + `last_refresh` 写回。整个 exchange 在 `AUTH_LOCK` 内串行(防
-//!   single-use refresh_token 被并发双 POST → `refresh_token_reused`)。
+//! - **token 刷新分流(transfer 自己绝不 POST 刷新)**:transfer 与源头 Codex 共享同一份
+//!   single-use refresh_token,两个进程都刷会触发 `refresh_token_reused` 把账号烧死
+//!   (`AUTH_LOCK` 只串行进程内、管不到外部 codex)。故刷新**只归源头**:检测获取
+//!   (Official)由本机 Codex 自刷 `~/.codex/auth.json`;导入(Imported)由源那边 Codex
+//!   刷、本侧 [`reconcile_on_startup`] 从源跟随重读;登录走 `codex login` 自取全新账号。
+//!   [`access_token_expired`] 仅用于本地 JWT 判过期、标记 `relogin_required`,**不触发刷新**。
 //! - **登录**([`start_login`]/[`cancel_login`]/[`login_status`]):调起官方
 //!   `codex login`(它自己做 OAuth + 写 `~/.codex/auth.json`),非阻塞 + 可取消。
 //! - **导入 / 长期保留**([`import_auth`]/[`pin_current_account`]/[`forget_imported`]/
-//!   [`reconcile_on_startup`]):把真实账号写进 transfer 持久镜像(`~/.codex` 之外、
-//!   不受文件变动/快照轮转影响);登录成功后前端自动 pin,启动时活动文件失效则从
-//!   镜像自动恢复(无需手动"切换/恢复"——单账号工具不是多账号切换器)。
+//!   [`reconcile_on_startup`]):导入记录**源路径** + 写持久镜像快照;启动时活动文件失效
+//!   则恢复 —— 优先从**活源路径**重读最新(跟随源 Codex 刷新)、源失效回落镜像快照。
+//!   登录成功后前端自动 pin。单账号工具,非多账号切换器。
 //!
 //! 检测来源(优先级):① 官方 `~/.codex/auth.json`(Codex 当前活动凭据)→ ② 用户
 //! 显式导入/钉住的持久镜像。**不扫 apply 快照备份** —— 那些是 transfer 改配置时的
@@ -156,6 +159,48 @@ fn imported_mirror_path(paths: &CodexPaths) -> PathBuf {
         .join("imported-auth.json")
 }
 
+/// [MOC-104 导入分流] 记录「导入来源路径」的 metadata 文件(跟镜像同目录)。导入时
+/// 记下用户选的源文件绝对路径;`reconcile_on_startup` 据此**从源重读最新 token**
+/// (活源:另一个在跑的 Codex 的 auth.json 被那边刷新 → transfer 跟随、自己不刷新),
+/// 源不存在/不可读时回落到镜像快照(静态导入)。两种导入形态统一覆盖。
+fn imported_source_path_file(paths: &CodexPaths) -> PathBuf {
+    paths
+        .app_home
+        .join("real-account")
+        .join("imported-source.json")
+}
+
+/// 读「导入来源路径」(无记录 / 文件坏 → None)。
+fn read_imported_source_path(paths: &CodexPaths) -> Option<PathBuf> {
+    let v: Value =
+        serde_json::from_str(&std::fs::read_to_string(imported_source_path_file(paths)).ok()?)
+            .ok()?;
+    v.get("source_path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// 写「导入来源路径」metadata(`None` = 清除记录,如 pin 当前账号无外部源)。best-effort:
+/// 记录失败不该让导入整体失败(镜像 + 活动已落盘),只 warn。
+fn write_imported_source_path(paths: &CodexPaths, source_path: Option<&str>) {
+    let file = imported_source_path_file(paths);
+    match source_path {
+        Some(p) => {
+            if let Some(parent) = file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let body = serde_json::json!({ "source_path": p }).to_string();
+            if let Err(e) = std::fs::write(&file, body) {
+                tracing::warn!("[RealAccount] 记录导入来源路径失败(忽略): {e}");
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+}
+
 /// 定位**当前**可用的真实 chatgpt 账号:① 官方活动 `~/.codex/auth.json` → ② 用户
 /// 显式导入/钉住的持久镜像。**不扫 apply 快照备份** —— 那些是 transfer 改配置时
 /// 的内部备份(可能是几周前早已失效的旧 chatgpt),报成「你的真实账号」会误导
@@ -242,65 +287,23 @@ pub fn detect() -> RealAccountStatus {
     }
 }
 
-// ── Token 刷新(MOC-104 req#2)─────────────────────────────────────────
-//
-// 真实 chatgpt token 会过期。用户要求每次启动刷新真实账号的 token 避免过期。刷新
-// 走官方 OAuth refresh_token 流(常量与请求格式借鉴 Codex_Account_Switch
-// `shared/runtime/chatgpt_api.rs`,致谢见 ACKNOWLEDGEMENTS.md):
-//   POST https://auth.openai.com/oauth/token
-//        grant_type=refresh_token&refresh_token=<rt>&client_id=<id>
-// 响应 {access_token, id_token?, refresh_token?};只更新 tokens.{access,refresh,
-// id} + 顶层 last_refresh,其它字段透传(非破坏)。刷的是 [`locate_chatgpt_auth`]
-// 定位到的那份文件(官方活动 or 持久镜像),与检测口径一致。
-
 use base64::Engine;
-
-/// 官方 ChatGPT OAuth issuer。
-const OPENAI_ISSUER: &str = "https://auth.openai.com";
-/// ChatGPT desktop / Codex CLI 公开 OAuth client id(借鉴 Codex_Account_Switch
-/// chatgpt_api.rs:100,该处注明已对照官方 codex 与 codex-switcher 验证)。
-const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-/// 提前于真实过期点刷新,避免 in-flight 请求恰好撞 401。
+/// 提前于真实过期点判失效(skew),避免 in-flight 请求恰好撞 401。
 const EXPIRY_SKEW_SECONDS: i64 = 300;
 
-/// 一次刷新尝试的结果。
+/// reconcile / import 的账号检测结果(历史名沿用 `RefreshOutcome`;分流后 transfer
+/// **不再刷新**,这里只表示检测/恢复的判定,不含"刷新成功"态)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
 pub enum RefreshOutcome {
-    /// 没有可刷新的真实 chatgpt 账号(官方活动 + 持久镜像都没有)。
+    /// 没有可用的真实 chatgpt 账号(官方活动 + 持久镜像都没有)。
     NoAccount,
-    /// access_token 还没到期(或无法解析过期时间 → 保守视作有效),跳过刷新。
+    /// access_token 本地 JWT 未到期(或无法解析 → 保守视作有效),账号可用。
     StillValid { source: AuthSource },
-    /// 刷新成功并写回。
-    Refreshed { source: AuthSource },
-    /// 真实账号**不可用**:refresh_token 失效 / 已被用过 / invalid_grant —— 续期无望,
-    /// 需要重新登录。上层据此自动关「自动解锁」开关 + 停 daemon + 提示用户重登。
+    /// 真实账号**不可用**:本地 JWT 已过期 / 镜像废 token —— 需要重新登录。上层据此
+    /// 自动关「自动解锁」开关 + emit 事件提示用户重登。
     ReloginRequired { source: AuthSource },
 }
-
-/// 刷新失败信息是否表示"需要重新登录"(refresh_token 永久失效,不是瞬时网络错)。
-/// 借鉴 Codex_Account_Switch `chatgpt_api.rs::looks_like_relogin_required` 的签名集。
-fn looks_like_relogin_required(message: &str) -> bool {
-    let m = message.to_ascii_lowercase();
-    m.contains("token_invalidated")
-        || m.contains("refresh_token_reused")
-        || m.contains("invalid_grant")
-        || m.contains("authentication token has been invalidated")
-        || m.contains("refresh token has already been used")
-        || m.contains("please try signing in again")
-        || m.contains("please log out and sign in again")
-}
-
-/// OAuth refresh 响应:只取我们要写回 auth.json 的字段。
-#[derive(serde::Deserialize)]
-struct OAuthRefreshResponse {
-    access_token: String,
-    #[serde(default)]
-    id_token: Option<String>,
-    #[serde(default)]
-    refresh_token: Option<String>,
-}
-
 /// 解析 JWT 的 payload(第二段,base64url no-pad)。失败返 None。
 fn jwt_payload(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
@@ -319,170 +322,12 @@ fn access_token_expired(access_token: &str, now_unix: i64) -> bool {
     }
 }
 
-/// 把刷新响应应用到整个 auth.json 的 Value:只动 `tokens.{access_token,
-/// refresh_token,id_token}` + 顶层 `last_refresh`,其它字段透传不动。响应里
-/// 没返回的 refresh_token / id_token 保留旧值(OAuth 不一定每次都轮换)。
-///
-/// [MOC-104 review I-1] 顶层 / `tokens` 不是 object 时返回 `Err` 而非静默跳过 ——
-/// 绝不能在"没真正写入新 token"的情况下让 caller 走到 `write_auth` + 报 Refreshed
-/// (那会把"没刷成"伪装成"刷成功",真 token 过期后用户被登出)。正常路径下
-/// `locate_chatgpt_auth` 已保证结构合法,这是防御性硬化。
-fn apply_refresh_response(
-    auth: &mut Value,
-    resp: &OAuthRefreshResponse,
-    now_iso: &str,
-) -> Result<(), String> {
-    let obj = auth
-        .as_object_mut()
-        .ok_or("auth.json 顶层不是 JSON object,拒绝写回")?;
-    let tokens = obj
-        .entry("tokens".to_owned())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or("auth.json 的 tokens 字段不是 object,拒绝写回")?;
-    tokens.insert(
-        "access_token".to_owned(),
-        Value::String(resp.access_token.clone()),
-    );
-    if let Some(rt) = resp.refresh_token.as_ref().filter(|s| !s.is_empty()) {
-        tokens.insert("refresh_token".to_owned(), Value::String(rt.clone()));
-    }
-    if let Some(idt) = resp.id_token.as_ref().filter(|s| !s.is_empty()) {
-        tokens.insert("id_token".to_owned(), Value::String(idt.clone()));
-    }
-    obj.insert("last_refresh".to_owned(), Value::String(now_iso.to_owned()));
-    Ok(())
-}
-
 /// [MOC-104 review P1/I-3] 串行化对 auth.json 的整个 refresh exchange + activate
 /// 写回。**异步** mutex —— 因为 refresh 的网络 POST 必须在锁内(ChatGPT refresh_token
 /// 是单次使用,两个并发 caller 各 POST 同一 token 会触发 `refresh_token_reused`
 /// 把账号卡死,openai/codex#7144),不能像 std mutex 那样只锁同步写、把网络放锁外。
 /// 锁内可跨 `.await`,故用 `tokio::sync::Mutex`。
 static AUTH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// 启动时刷新真实 chatgpt 账号的 token(若将过期)。定位官方活动 / 持久镜像里
-/// 那份真实 chatgpt `auth.json` → 检查 access_token 是否将过期 → 走 refresh_token 流 →
-/// 原子写回(`write_auth`,0o600,非 token 字段透传)。
-///
-/// 非破坏:只更新 token 字段;无真实账号 / token 仍有效时不写盘。任何步骤失败
-/// 都返回 `Err`(由 caller 决定吞掉还是上报),不会留下半写状态(`write_auth` 原子)。
-/// [P1] **整个 exchange 在 `AUTH_LOCK` 内串行**:定位 → 判过期 → POST → 写回都持锁,
-/// 第二个并发 caller 等锁后重新定位发现 token 已刷新(未过期)→ StillValid,不会
-/// 拿同一 single-use refresh_token 再 POST 一次。
-pub async fn refresh_if_needed(client: &reqwest::Client) -> Result<RefreshOutcome, String> {
-    let _guard = AUTH_LOCK.lock().await;
-    // [connector review] codex login 是外部进程,直接写 `~/.codex/auth.json` 且**不**
-    // 走 AUTH_LOCK。若它正在进行,refresh 刷的是登录前的旧账号,写回会盖掉 login
-    // 即将/已经写入的新账号 —— 直接跳过,让 login 当唯一权威写者(reconcile 也有
-    // 同样前置守卫;这里再设一道,覆盖 manual refresh / import 后刷新等其它入口)。
-    if matches!(login_status(), LoginState::Running) {
-        tracing::info!("[RealAccount] refresh 跳过:codex login 进行中");
-        return Ok(RefreshOutcome::NoAccount);
-    }
-    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    let Some(located) = locate_chatgpt_auth(&paths) else {
-        return Ok(RefreshOutcome::NoAccount);
-    };
-    let source = located.source;
-    let target = located.path;
-    let mut auth = located.value;
-
-    let refresh_token = auth
-        .get("tokens")
-        .and_then(|t| t.get("refresh_token"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    if refresh_token.is_empty() {
-        return Err("auth.json 缺 refresh_token,无法刷新".to_owned());
-    }
-    let access_token = auth
-        .get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let now = chrono::Utc::now();
-    if !access_token_expired(access_token, now.timestamp()) {
-        // 持锁期间已是最新;第二个并发 caller 走到这里就 StillValid,不重复 POST。
-        set_relogin_required(false); // 账号当前有效
-        return Ok(RefreshOutcome::StillValid { source });
-    }
-
-    let resp = client
-        .post(format!("{OPENAI_ISSUER}/oauth/token"))
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
-            ("client_id", OPENAI_OAUTH_CLIENT_ID),
-        ])
-        .send()
-        .await
-        .map_err(|e| format!("OAuth refresh 请求失败: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        // refresh_token 永久失效(已用过 / invalid_grant 等)→ 续期无望,报
-        // ReloginRequired 让上层关「自动解锁」+ 提示重登,而非当瞬时错误吞掉。
-        if looks_like_relogin_required(&format!("{status} {body}")) {
-            tracing::warn!("[RealAccount] refresh 失败 = 需重新登录: {status} {body}");
-            set_relogin_required(true); // 持久标记失效,前端轮询 status 即可读到
-            return Ok(RefreshOutcome::ReloginRequired { source });
-        }
-        return Err(format!("OAuth refresh 返回 {status}: {body}"));
-    }
-    let parsed: OAuthRefreshResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析 OAuth refresh 响应失败: {e}"))?;
-
-    let now_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    apply_refresh_response(&mut auth, &parsed, &now_iso)?;
-    // [connector review] OAuth POST 期间用户可能点了登录(login 不走 AUTH_LOCK)。
-    // 写回前再查一次:login 已在跑就别把刚刷新的旧账号写回去盖掉 login 的新账号。
-    // check 与 write 之间仍有微秒级窗口(外部进程无法纳入 AUTH_LOCK),但竞态窗已
-    // 从整个 POST 时长(~1-2s)缩到一次写调用内。刚消费的 refresh_token 随之丢弃没
-    // 关系 —— login 在换全新账号,旧账号即将被取代。
-    if matches!(login_status(), LoginState::Running) {
-        tracing::info!("[RealAccount] refresh 写回跳过:codex login 在 OAuth POST 期间启动");
-        return Ok(RefreshOutcome::NoAccount);
-    }
-    write_auth(&target, &auth).map_err(|e| format!("写回 auth.json 失败: {e}"))?;
-
-    // [review #4] 若刷的是 Official 活动文件、而持久镜像里是同一账号(镜像当前
-    // refresh_token == 我们刚用掉的那个),把新 token 同步进镜像 —— 否则镜像一直
-    // 留着已花掉的单次 refresh_token,日后活动文件失效从镜像恢复时下一次刷新必
-    // token-reuse 失败,"长期生效"承诺破功。
-    if source == AuthSource::Official {
-        let mirror = imported_mirror_path(&paths);
-        if mirror != target && mirror.is_file() {
-            if let Ok(mut mv) = read_auth(&mirror) {
-                let mirror_rt = mv
-                    .get("tokens")
-                    .and_then(|t| t.get("refresh_token"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if mirror_rt == refresh_token {
-                    // [review #5] 镜像同步是 best-effort:不能用 `?` 把这里的错误冒泡
-                    // 成整个 refresh 失败 —— 主活动文件这时已成功刷新写回,
-                    // 镜像写坏只 warn,不影响 Refreshed 结果 / 后续启动调谐。
-                    match apply_refresh_response(&mut mv, &parsed, &now_iso) {
-                        Ok(()) => {
-                            if let Err(e) = write_auth(&mirror, &mv) {
-                                tracing::warn!("[RealAccount] 同步刷新 token 到持久镜像失败: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("[RealAccount] 持久镜像结构异常,跳过 token 同步: {e}")
-                        }
-                    }
-                }
-            }
-        }
-    }
-    set_relogin_required(false); // 刷新成功 = 账号恢复有效
-    Ok(RefreshOutcome::Refreshed { source })
-}
 
 // ── 登录:调起官方 codex login(MOC-104 req#3)────────────────────────
 //
@@ -613,7 +458,11 @@ fn read_imported_mirror(paths: &CodexPaths) -> Option<Value> {
 /// [connector review] 顺序是「先成功更新活动文件,再提交持久镜像」:若活动备份/写失败,
 /// 镜像还没动,不会留下「导入失败却有镜像、下次启动 reconcile 把它当成已保留账号恢复
 /// 到活动」的幽灵态。反序(先写镜像)在活动写失败时会留下孤儿镜像。
-fn import_locked(paths: &CodexPaths, value: &Value) -> Result<(), String> {
+fn import_locked(
+    paths: &CodexPaths,
+    value: &Value,
+    source_path: Option<&str>,
+) -> Result<(), String> {
     // 先恢复到活动(覆盖前先备份)—— 任一步失败直接返回,镜像保持原样不被污染。
     backup_active_auth(paths, "preimport")?;
     write_auth(&paths.auth_json, value).map_err(|e| format!("写活动 auth.json 失败: {e}"))?;
@@ -623,12 +472,22 @@ fn import_locked(paths: &CodexPaths, value: &Value) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("镜像目录创建失败: {e}"))?;
     }
     write_auth(&mirror, value).map_err(|e| format!("写持久镜像失败: {e}"))?;
+    // [MOC-104 导入分流] 记录/清除导入来源路径:文件导入记下源路径(reconcile 从源
+    // 跟随刷新);pin 当前账号无外部源传 None(清记录,纯快照)。best-effort,不阻断导入。
+    write_imported_source_path(paths, source_path);
     Ok(())
 }
 
-/// [MOC-104 req] 导入一份真实 chatgpt auth(文件导入)。校验是可用 chatgpt → 写进
-/// 持久镜像(`~/.codex` 之外不受文件变动影响)→ 同时恢复到活动文件(先备份)。
-pub async fn import_auth(value: Value) -> Result<(), String> {
+/// [MOC-104 req] 从**文件路径**导入真实 chatgpt auth(活源 / 静态文件统一入口)。读源
+/// 文件 → 校验可用 chatgpt → 写持久镜像快照 + **记录源路径** + 恢复到活动(先备份)。
+/// **不刷新** token(分流:刷新归源头);按本地 JWT exp 判过期设 relogin 标记。记下源路
+/// 径后,`reconcile_on_startup` 可在启动时从**活源**重读最新(跟随那边 Codex 刷新);源
+/// 失效/移除则回落到此处写的快照。前端用 Tauri dialog 选文件、把绝对路径传进来。
+pub async fn import_auth(source_path: String) -> Result<(), String> {
+    let content = std::fs::read_to_string(&source_path)
+        .map_err(|e| format!("读导入源文件失败({source_path}): {e}"))?;
+    let value: Value =
+        serde_json::from_str(&content).map_err(|e| format!("导入源不是合法 JSON: {e}"))?;
     if parse_chatgpt_auth(&value).is_none() {
         return Err(
             "不是可用的 chatgpt auth.json(需 auth_mode=chatgpt + access/refresh token)".to_owned(),
@@ -636,8 +495,16 @@ pub async fn import_auth(value: Value) -> Result<(), String> {
     }
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    import_locked(&paths, &value)?;
-    set_relogin_required(false); // 刚导入一份(校验过的)真实账号,清掉失效标记
+    import_locked(&paths, &value, Some(&source_path))?;
+    // [MOC-104 分流] 导入**不刷新** token;按本地 JWT exp 判导入文件是否已过期:有效 →
+    // 清失效标记;过期(导入旧文件)→ 置 true,前端提示重新导出 / 登录,不默默拿去 401。
+    let access = value
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expired = access.is_empty() || access_token_expired(access, chrono::Utc::now().timestamp());
+    set_relogin_required(expired);
     Ok(())
 }
 
@@ -648,7 +515,9 @@ pub async fn pin_current_account() -> Result<(), String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let located = locate_chatgpt_auth(&paths).ok_or("未检测到可钉住的真实 chatgpt 账号")?;
-    import_locked(&paths, &located.value)
+    // pin 钉的是 Official 活动账号(源即 ~/.codex,reconcile 已优先读 Official)→ 无外部源,
+    // 传 None(纯快照保留 + 清掉旧 source 记录),避免 reconcile 误从 ~/.codex 绕一圈重读。
+    import_locked(&paths, &located.value, None)
 }
 
 /// 忘记导入的真实账号(删持久镜像)= 退出"真实账号长期生效"。删镜像后启动不再
@@ -663,63 +532,95 @@ pub async fn forget_imported() -> Result<bool, String> {
         return Ok(false);
     }
     std::fs::remove_file(&mirror).map_err(|e| format!("删持久镜像失败: {e}"))?;
+    // [MOC-104 导入分流] 镜像删了,导入来源路径记录也一并清(否则 reconcile 还会从旧
+    // 源路径重读、把已"忘记"的账号复活)。
+    write_imported_source_path(&paths, None);
     // [connector review] 清除账号后不再有可重登的保留账号 → 清掉「需重新登录」标记,
     // 否则 status 仍带 relogin_required=true,UI 继续提示「账号已失效」要重登。
     set_relogin_required(false);
     Ok(true)
 }
 
-/// [MOC-104 req#5 启动调谐] 启动时:① 刷新真实账号 token(保鲜);② 若用户导入过
-/// 持久镜像、且活动 `~/.codex/auth.json` 已不是有效真实账号(被 apply 改 apikey /
-/// 登出 / 清掉)→ 从镜像恢复到活动(先备份)。**只对用户显式导入/钉住的持久镜像
-/// 自动恢复**,其它来源不自动抢活动文件(避免误覆盖代理模式的 apikey)。best-effort。
-pub async fn reconcile_on_startup(client: &reqwest::Client) -> Result<RefreshOutcome, String> {
-    // [review #2] 有 codex login 正在进行(用户在启动窗口内点了登录)→ 跳过调谐。
-    // 否则会跟 codex login 抢写 `~/.codex/auth.json`:reconcile 刷的是登录前的旧
-    // 账号,可能盖掉 codex login 刚写入的新账号。登录成功后前端会自动 pin/刷新。
+/// [MOC-104 req#5 启动调谐] 启动时(**绝不刷新 token**,见模块级分流说明):① 活动
+/// `~/.codex/auth.json` 已是有效真实 chatgpt → 共用、原样不动(本机 Codex 自维护);
+/// ② 活动失效(被 apply 改 apikey / 登出 / 清掉)且用户导入过账号 → 恢复:优先从
+/// **活源路径**重读最新(跟随源 Codex 刷新)、源失效回落镜像快照,先备份再写。**只对
+/// 用户显式导入/钉住的账号自动恢复**,不抢别的活动文件(避免误覆盖代理 apikey)。
+/// 选中那份本地 JWT 已过期 → 标记 relogin、不写废 token。best-effort。
+pub async fn reconcile_on_startup() -> Result<RefreshOutcome, String> {
+    // [review #2] 有 codex login 正在进行 → 跳过调谐,别跟 codex login 抢写 auth.json。
     if matches!(login_status(), LoginState::Running) {
         tracing::info!("[RealAccount] 启动调谐跳过:codex login 进行中");
         return Ok(RefreshOutcome::NoAccount);
     }
-    // 先刷新(refresh_if_needed 内部持 AUTH_LOCK)。
-    // [devin review] refresh 瞬时失败(网络/IO,非 refresh_token 永久失效)若用 `?` 传播会
-    // 让整个 reconcile early-return,跳过下方「从导入镜像恢复活动」—— 但恢复**不依赖**刷新
-    // 成功(下方独立判活动态 + 读镜像)。改为 Err 时 log 后继续恢复:即使 token 过期,恢复
-    // chatgpt 镜像也能让 Codex 原生显示 Plugins(relay 下过期 token 不影响,proxy 替换上游
-    // 凭据 + Codex 客户端自刷新),比「refresh 失败→活动留 apikey→plugins 不显示」更对。
-    // outcome 占位 NoAccount(仅上层判 ReloginRequired 用,非该值即只 log、不影响恢复)。
-    let outcome = match refresh_if_needed(client).await {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::warn!("[RealAccount] 启动 refresh 失败(忽略,继续尝试镜像恢复): {e}");
-            RefreshOutcome::NoAccount
-        }
-    };
-    // [devin review] refresh 判定 refresh_token 永久失效 → 镜像里是同一份失效 token,
-    // 恢复到活动只会把当前可用的 apikey 配置覆盖成坏掉的 chatgpt 凭据,毫无好处
-    // (账号已死,用户必须重登)。跳过恢复,保留可用配置 + 由上层提示重登。
-    if matches!(outcome, RefreshOutcome::ReloginRequired { .. }) {
-        return Ok(outcome);
-    }
-    // 再看是否要把导入镜像恢复到活动。
+    // [MOC-104 分流] transfer **不再**在启动时 POST 刷新 token —— 刷新权交给源头 Codex:
+    // 检测获取(Official)由本机 Codex 自刷新 `~/.codex/auth.json`;导入(Imported)由源那边
+    // 的 Codex 刷新。transfer 与 Codex 是**两个进程**、共享同一份 single-use refresh_token,
+    // 双方都刷必触发 `refresh_token_reused` 把账号烧死(`AUTH_LOCK` 只串行 transfer 进程内、
+    // 管不到外部 codex 进程 —— 实测 5月30 的 token 正因 transfer 每次启动刷新跟 Codex 撞而
+    // 失效)。故启动只做「检测 + 必要时从导入镜像恢复」,**绝不主动刷新**;唯一拿新 token
+    // 的入口是 transfer 内「登录」(`start_login` → codex login 自己换全新账号)。
     let _guard = AUTH_LOCK.lock().await;
-    // [connector review] 取锁后、写活动前再查一次 login:reconcile 进行中(refresh 返回
-    // 之后)用户可能点了登录,codex login 已写入新账号 → 别用旧镜像盖掉刚授权的账号。
     if matches!(login_status(), LoginState::Running) {
-        tracing::info!("[RealAccount] reconcile 恢复跳过:codex login 进行中");
-        return Ok(outcome);
+        tracing::info!("[RealAccount] reconcile 跳过:codex login 进行中");
+        return Ok(RefreshOutcome::NoAccount);
     }
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+
+    // 活动已是真实 chatgpt → 共用、绝不动(Codex 自维护这份,transfer 只读跟随、不覆盖)。
     if active_is_real_chatgpt(&paths) {
-        return Ok(outcome); // 活动已是真实账号,不动。
+        return Ok(RefreshOutcome::StillValid {
+            source: AuthSource::Official,
+        });
     }
-    if let Some(mirror_value) = read_imported_mirror(&paths) {
-        backup_active_auth(&paths, "prereconcile")?;
-        write_auth(&paths.auth_json, &mirror_value)
-            .map_err(|e| format!("启动恢复导入账号到活动失败: {e}"))?;
-        tracing::info!("[RealAccount] 启动调谐:活动文件非真实账号,已从导入镜像恢复");
+
+    // 活动非真实 chatgpt(apikey / 登出 / 空)→ 从用户导入的账号恢复(不刷新)。两种导入形态:
+    //   ① 活源:记录的 source_path 还在 + 可读 + 是 chatgpt → 用源**最新**(跟随那边 Codex
+    //      刷新),并顺手把它同步进镜像快照(源将来移除/失效时快照是最后一次可用账号);
+    //   ② 静态文件 / 源已移除失效 → 回落到镜像快照。
+    // 两者都**不 POST 刷新**;选中那份 access_token 本地 JWT 过期 → 标记 relogin、不写废
+    // token(否则恢复到活动只会让 chatgpt backend 全 401,不如保留可用配置 + 提示重登)。
+    let from_source = read_imported_source_path(&paths)
+        .and_then(|sp| std::fs::read_to_string(&sp).ok())
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .filter(|v| parse_chatgpt_auth(v).is_some());
+    let (chosen, from_live_source) = match from_source {
+        Some(v) => (v, true),
+        None => match read_imported_mirror(&paths) {
+            Some(v) => (v, false),
+            None => return Ok(RefreshOutcome::NoAccount),
+        },
+    };
+    let origin = if from_live_source {
+        "导入源路径(活源跟随)"
+    } else {
+        "镜像快照"
+    };
+    let access = chosen
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if access.is_empty() || access_token_expired(access, chrono::Utc::now().timestamp()) {
+        set_relogin_required(true);
+        tracing::warn!(
+            "[RealAccount] 导入账号 token 本地已过期({origin}),不恢复废 token,标记需重新登录"
+        );
+        return Ok(RefreshOutcome::ReloginRequired {
+            source: AuthSource::Imported,
+        });
     }
-    Ok(outcome)
+    backup_active_auth(&paths, "prereconcile")?;
+    write_auth(&paths.auth_json, &chosen)
+        .map_err(|e| format!("启动恢复导入账号到活动失败: {e}"))?;
+    // 活源读到的最新内容同步进镜像快照(源日后移除/失效时,快照即最后一次可用账号)。
+    if from_live_source {
+        let _ = write_auth(&imported_mirror_path(&paths), &chosen);
+    }
+    tracing::info!("[RealAccount] 启动调谐:活动非真实账号,已从{origin}恢复(不刷新)");
+    Ok(RefreshOutcome::StillValid {
+        source: AuthSource::Imported,
+    })
 }
 
 /// 启动 `codex login`(非阻塞)。已在进行中则返回 Err。
@@ -950,36 +851,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_refresh_updates_tokens_and_preserves_other_fields() {
-        let mut auth = json!({
-            "auth_mode": "chatgpt",
-            "tokens": {
-                "access_token": "old_acc",
-                "refresh_token": "old_ref",
-                "id_token": "old_id",
-                "account_id": "acct_keep"
-            },
-            "some_other_field": "keep_me"
-        });
-        let resp = OAuthRefreshResponse {
-            access_token: "new_acc".to_owned(),
-            id_token: Some("new_id".to_owned()),
-            refresh_token: None, // 不轮换 → 保留旧值
-        };
-        apply_refresh_response(&mut auth, &resp, "2026-05-31T12:00:00Z").unwrap();
-        let t = &auth["tokens"];
-        assert_eq!(t["access_token"], "new_acc");
-        assert_eq!(t["id_token"], "new_id");
-        assert_eq!(
-            t["refresh_token"], "old_ref",
-            "响应没返回则保留旧 refresh_token"
-        );
-        assert_eq!(t["account_id"], "acct_keep", "account_id 透传不动");
-        assert_eq!(auth["last_refresh"], "2026-05-31T12:00:00Z");
-        assert_eq!(auth["some_other_field"], "keep_me", "无关字段透传不动");
-    }
-
-    #[test]
     fn login_state_serializes_with_tag_and_message() {
         assert_eq!(
             serde_json::to_value(LoginState::Running).unwrap(),
@@ -1004,7 +875,7 @@ mod tests {
             &paths.auth_json,
             &json!({"auth_mode": "apikey", "OPENAI_API_KEY": "cas_x"}),
         );
-        import_locked(&paths, &chatgpt_auth()).unwrap();
+        import_locked(&paths, &chatgpt_auth(), None).unwrap();
         // 持久镜像写了 chatgpt(长期保留的真相源)
         assert!(
             read_imported_mirror(&paths).is_some(),
@@ -1028,33 +899,5 @@ mod tests {
             })
             .expect("import 前应备份原活动 auth.json");
         assert_eq!(read_auth(&prebackup).unwrap()["auth_mode"], "apikey");
-    }
-
-    #[test]
-    fn relogin_required_matches_permanent_failures_only() {
-        assert!(looks_like_relogin_required(
-            "400 {\"error\":\"invalid_grant\"}"
-        ));
-        assert!(looks_like_relogin_required(
-            "refresh token has already been used"
-        ));
-        assert!(looks_like_relogin_required("token_invalidated"));
-        // 瞬时/网络错误不算需重登
-        assert!(!looks_like_relogin_required("500 internal server error"));
-        assert!(!looks_like_relogin_required("timed out"));
-    }
-
-    #[test]
-    fn apply_refresh_errs_when_not_object() {
-        // [I-1] 顶层 / tokens 非 object → Err,绝不静默吞(否则把没刷成报成功)
-        let resp = OAuthRefreshResponse {
-            access_token: "x".to_owned(),
-            id_token: None,
-            refresh_token: None,
-        };
-        let mut not_obj = json!("i am a string");
-        assert!(apply_refresh_response(&mut not_obj, &resp, "t").is_err());
-        let mut bad_tokens = json!({ "auth_mode": "chatgpt", "tokens": "nope" });
-        assert!(apply_refresh_response(&mut bad_tokens, &resp, "t").is_err());
     }
 }

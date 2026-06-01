@@ -611,10 +611,6 @@ window.CCApi.realAccount = {
   async status() {
     return api('GET', '/api/desktop/real-account/status');
   },
-  /** 刷新真实账号 token(将过期才刷) */
-  async refresh() {
-    return api('POST', '/api/desktop/real-account/refresh');
-  },
   /** 在 transfer 内调起官方 codex login(非阻塞,弹浏览器做 OAuth) */
   async login() {
     return api('POST', '/api/desktop/real-account/login');
@@ -623,9 +619,10 @@ window.CCApi.realAccount = {
   async loginCancel() {
     return api('POST', '/api/desktop/real-account/login/cancel');
   },
-  /** 从文件导入真实账号(authJson = auth.json 的解析对象) */
-  async import(authJson) {
-    return api('POST', '/api/desktop/real-account/import', authJson);
+  /** 从文件导入真实账号(sourcePath = Tauri dialog 选的源文件绝对路径;后端读该路径
+   * 文件、记录源路径,reconcile 可从活源跟随刷新) */
+  async import(sourcePath) {
+    return api('POST', '/api/desktop/real-account/import', { source_path: sourcePath });
   },
   /** 钉住当前检测到的真实账号(持久保留) */
   async pinCurrent() {

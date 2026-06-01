@@ -2,14 +2,11 @@
 //!
 //! 前端用这组 API 管理真实 chatgpt 账号:
 //! - GET  /api/desktop/real-account/status        → 检测 + 登录流程状态
-//! - POST /api/desktop/real-account/refresh       → 刷新真实账号 token(将过期才刷)
 //! - POST /api/desktop/real-account/login         → 启动官方 codex login(非阻塞)
 //! - POST /api/desktop/real-account/login/cancel  → 取消进行中的登录
 //! - POST /api/desktop/real-account/import        → 从文件导入(body=auth.json 内容,持久 + 生效)
 //! - POST /api/desktop/real-account/pin-current   → 持久保留当前真实账号(登录成功后前端自动调)
 //! - POST /api/desktop/real-account/forget        → 清除真实账号(删持久镜像,退出长期生效)
-
-use std::time::Duration;
 
 use axum::{
     http::StatusCode,
@@ -40,30 +37,6 @@ pub async fn status_handler() -> impl IntoResponse {
     }))
 }
 
-/// POST /api/desktop/real-account/refresh
-///
-/// 刷新真实 chatgpt 账号(官方活动 auth.json 或导入的持久镜像)的 token ——
-/// access_token 将过期才真刷,否则报 still_valid。非破坏:只更新 token 字段 + last_refresh。
-pub async fn refresh_handler() -> impl IntoResponse {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("构建 HTTP client 失败: {e}"),
-            )
-            .into_response()
-        }
-    };
-    match codex_real_account::refresh_if_needed(&client).await {
-        Ok(outcome) => Json(json!({ "success": true, "outcome": outcome })).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
 /// POST /api/desktop/real-account/login
 ///
 /// 启动官方 `codex login`(非阻塞,会弹浏览器做 ChatGPT OAuth)。立即返回;前端轮
@@ -90,37 +63,30 @@ pub async fn login_cancel_handler() -> impl IntoResponse {
 
 /// POST /api/desktop/real-account/import
 ///
-/// 从文件导入:body 是 chatgpt auth.json 的 JSON 内容。校验后写进 transfer 持久
-/// 镜像(长期保留、不受 ~/.codex 文件变动影响)+ 恢复到活动文件(先备份)。
+/// 从文件**路径**导入:body = `{ "source_path": "<绝对路径>" }`(前端用 Tauri dialog
+/// 选文件、把绝对路径传进来 —— file input 在 macOS webview 拿不到路径)。后端读该路径
+/// 文件、校验是可用 chatgpt → 写持久镜像快照 + **记录源路径** + 恢复到活动(先备份)。
 ///
-/// [review #3] 导入成功后立即按需刷新一次 token —— 用户导入的很可能是过期旧文件,
-/// 不刷的话活动文件里就是个 access_token 已过期的账号,plugin 模式拿去用直接 401。
-/// 刷新是 best-effort:导入(持久镜像 + 活动文件)已落盘成功,刷不动只在 outcome
-/// 里告诉前端(如 relogin_required),不把"导入成功"翻成失败。
-pub async fn import_handler(Json(input): Json<serde_json::Value>) -> impl IntoResponse {
-    if let Err(e) = codex_real_account::import_auth(input).await {
+/// [MOC-104 分流] 导入**不刷新** token —— transfer 与源头 Codex 共享 single-use
+/// refresh_token,任何一方多刷一次都会触发 `refresh_token_reused` 把账号烧死。导入只
+/// 校验 + 落盘 + 记源路径;token 保鲜交给源头(活源:记录的路径那边 Codex 刷新,启动
+/// reconcile 从源跟随;静态文件:用快照)。`import_auth` 按本地 JWT exp 判过期设 relogin,
+/// 这里读出来回给前端:过期就提示重新导出 / 登录,而不是默默拿过期账号去 401。
+#[derive(serde::Deserialize)]
+pub struct ImportRequest {
+    /// 导入源文件的绝对路径(前端 Tauri dialog.open 返回)。
+    pub source_path: String,
+}
+
+pub async fn import_handler(Json(req): Json<ImportRequest>) -> impl IntoResponse {
+    if let Err(e) = codex_real_account::import_auth(req.source_path).await {
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }
-    let refresh = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-    {
-        Ok(client) => match codex_real_account::refresh_if_needed(&client).await {
-            Ok(outcome) => json!(outcome),
-            Err(e) => {
-                tracing::warn!("[RealAccount] 导入后刷新 token 失败(best-effort): {e}");
-                json!({ "error": e })
-            }
-        },
-        Err(e) => {
-            tracing::warn!("[RealAccount] 导入后构建 HTTP client 失败(best-effort): {e}");
-            json!({ "error": format!("构建 HTTP client 失败: {e}") })
-        }
-    };
+    let status = codex_real_account::detect();
     Json(json!({
         "success": true,
         "message": "已导入并持久保留真实账号",
-        "refresh": refresh,
+        "relogin_required": status.relogin_required,
     }))
     .into_response()
 }
@@ -155,7 +121,6 @@ pub async fn forget_handler() -> impl IntoResponse {
 pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/api/desktop/real-account/status", get(status_handler))
-        .route("/api/desktop/real-account/refresh", post(refresh_handler))
         .route("/api/desktop/real-account/login", post(login_handler))
         .route(
             "/api/desktop/real-account/login/cancel",

@@ -206,39 +206,35 @@ fn main() {
                 // 默默吞掉;反之又会撤销 auto_apply 的 apikey。复用本 post-apply task(已
                 // await 完 auto_apply)确定性串在 apply 之后,不再用 sleep 猜时机(MOC-54)。
                 // best-effort:无真实账号 / token 未过期则 no-op,失败只 log。
-                match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(20))
-                    .build()
+                // [MOC-104 分流] reconcile **不再刷新 token**(不构造 HTTP client)——刷新权
+                // 归源头 Codex(Official 本机自刷 / Imported 源那边刷)与「登录」入口。启动
+                // 只做「检测 + 必要时从导入镜像恢复」,杜绝跟外部 Codex 抢 single-use
+                // refresh_token(实测撞刷会触发 refresh_token_reused 把账号烧死)。
                 {
-                    Ok(client) => {
-                        use crate::codex_real_account::RefreshOutcome;
-                        match crate::codex_real_account::reconcile_on_startup(&client).await {
-                            // [MOC-104 req] 真实账号失效(refresh_token 永久无效)→ 自动关
-                            // 「自动解锁」开关 + 停 daemon + emit 事件让前端提示重新登录。
-                            Ok(RefreshOutcome::ReloginRequired { .. }) => {
-                                tracing::warn!(
-                                    "[RealAccount] 真实账号已失效(需重新登录),自动关闭自动解锁开关"
-                                );
-                                // 关开关只在原本是 on 时有动作;但事件**无论开关原态都 emit**
-                                // (review #6)—— 前端靠这个事件标记「账号已失效」,开关已是
-                                // off 的新装用户也得知道账号失效,否则 detect 见 token 在就误报。
-                                let _ = handlers::settings::disable_auto_unlock_codex_plugins().await;
-                                if let Some(window) =
-                                    app_handle_for_residual_scan.get_webview_window("main")
-                                {
-                                    let _ = window.emit("real-account-relogin-required", ());
-                                }
-                            }
-                            Ok(outcome) => tracing::info!(
-                                "[RealAccount] 启动调谐(刷新 + 必要时从导入镜像恢复): {outcome:?}"
-                            ),
-                            Err(e) => {
-                                tracing::warn!("[RealAccount] 启动调谐失败(忽略): {e}")
+                    use crate::codex_real_account::RefreshOutcome;
+                    match crate::codex_real_account::reconcile_on_startup().await {
+                        // [MOC-104] 真实账号失效(镜像 token 本地 JWT 已过期、无法恢复)→ 自动
+                        // 关「自动解锁」开关 + emit 事件让前端提示重新登录。
+                        Ok(RefreshOutcome::ReloginRequired { .. }) => {
+                            tracing::warn!(
+                                "[RealAccount] 真实账号已失效(需重新登录),自动关闭自动解锁开关"
+                            );
+                            // 关开关只在原本是 on 时有动作;但事件**无论开关原态都 emit**
+                            // (review #6)—— 前端靠这个事件标记「账号已失效」,开关已是
+                            // off 的新装用户也得知道账号失效,否则 detect 见 token 在就误报。
+                            let _ = handlers::settings::disable_auto_unlock_codex_plugins().await;
+                            if let Some(window) =
+                                app_handle_for_residual_scan.get_webview_window("main")
+                            {
+                                let _ = window.emit("real-account-relogin-required", ());
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!("[RealAccount] 启动调谐跳过:HTTP client 构建失败: {e}")
+                        Ok(outcome) => tracing::info!(
+                            "[RealAccount] 启动调谐(检测 + 必要时从导入镜像恢复,不刷新): {outcome:?}"
+                        ),
+                        Err(e) => {
+                            tracing::warn!("[RealAccount] 启动调谐失败(忽略): {e}")
+                        }
                     }
                 }
                 // [MOC-104] reconcile 已把活动账号 settle 完。relay 模式下真实 chatgpt
