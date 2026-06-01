@@ -1488,8 +1488,17 @@
       if (unlockToggle) unlockToggle.checked = on;
       const runEl = $("#raRunStatus");
       if (runEl) {
-        runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
-        runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
+        // [MOC-114 connector review] relay 真账号已解锁但系统代理(梯子)没开 → plugins 网络层
+        // 用不了。runtime 如实标注「网络代理未连接」(否则裸显示"已开启"会重现"已登录却转圈"
+        // 误导态);checkbox 仍 ON —— auth 层确实解锁了(Codex 据 auth_mode 原生显示 plugins)。
+        const proxyDown = realActive && !systemProxyGateOk(lastSystemProxyStatus);
+        if (proxyDown) {
+          runEl.textContent = t("realAccount.runOnProxyDown") || "已开启(网络代理未连接)";
+          runEl.style.color = "var(--ra-warn, #c80)";
+        } else {
+          runEl.textContent = on ? t("realAccount.runOn") || "已开启" : t("realAccount.runOff") || "未开启";
+          runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
+        }
       }
       // 有长期保留的真实账号 → 显示「清除真实账号」按钮。
       const forgetBtn = $("#realAccountForgetBtn");
@@ -1552,9 +1561,8 @@
     let proxyConnected = true;
     try {
       const sp = await CCApi.systemProxy.status();
-      const spData = sp && sp.systemProxy;
-      // PAC 自动配置无法探端口 → fail-open(不 gate),与探测失败的乐观放行口径一致。
-      proxyConnected = !!(spData && (spData.connected || spData.kind === "pac"));
+      // gate 只在「配了代理但连不上(梯子没开)」时拦;没配/PAC/查询失败均 fail-open(见 helper)。
+      proxyConnected = systemProxyGateOk(sp && sp.systemProxy);
     } catch (_e) {
       proxyConnected = true;
     }
@@ -1699,6 +1707,21 @@
     }
   }
 
+  // MOC-114:最近一次系统代理探测结果(refreshSystemProxyStatus 写),供 refreshRealAccountStatus
+  // 派生 runtime 状态复用,避免高频轮询里重复 TCP 探测。
+  let lastSystemProxyStatus = null;
+
+  // MOC-114:系统代理是否「通过 gate」。语义:**只有「配了代理但端口连不上(梯子没开)」才算
+  // 未通过**;没配代理(configured=false,可能 TUN 模式/路由器 VPN/直连,网络本就正常)、PAC
+  // (无固定端口无法探)、查询失败(null)一律 fail-open —— 这些都无法判定「梯子没开」,武断
+  // gate 会误伤网络正常的用户(devin review),且与探测失败乐观放行口径一致。
+  function systemProxyGateOk(spData) {
+    if (!spData) return true;
+    if (spData.kind === "pac") return true;
+    if (!spData.configured) return true;
+    return spData.connected === true;
+  }
+
   // MOC-114:刷新「网络代理」卡片 —— 系统代理(梯子)是否挂 + 端口可连。relay 真账号、
   // 插件、第三方路由都依赖它;探测只连代理端口、不碰 chatgpt.com。查询失败时显示「未知」
   // 灰色,**不**伪装成未连接(避免误导已挂梯子的用户)。
@@ -1713,6 +1736,7 @@
     } catch (e) {
       console.log("[SystemProxy] status failed:", e);
     }
+    lastSystemProxyStatus = sp; // 缓存供 refreshRealAccountStatus 派生 runtime 复用(null=查询失败)
     const setIcon = (cls, glyph) => {
       if (!icon) return;
       icon.classList.remove("success", "warning", "muted");
@@ -1729,6 +1753,14 @@
     // 一个代理其实正常的 PAC 用户);如实显示「自动配置」,gate 侧亦对 PAC fail-open。
     if (sp.kind === "pac") {
       el.textContent = t("systemProxy.pac") || "自动配置(PAC)";
+      el.classList.add("muted-text");
+      setIcon("muted", "bi-globe2");
+      return;
+    }
+    // [review devin] 没配系统代理(configured=false)可能是 TUN 模式/路由器 VPN/直连,网络本就
+    // 正常 → 显示中性「未配置」、不报「未连接」警告(否则误导,且与 gate fail-open 口径一致)。
+    if (sp.configured === false) {
+      el.textContent = t("systemProxy.notConfigured") || "未配置";
       el.classList.add("muted-text");
       setIcon("muted", "bi-globe2");
       return;
