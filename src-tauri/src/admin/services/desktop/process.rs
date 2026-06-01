@@ -409,8 +409,10 @@ fn should_attach_debug_port() -> Vec<String> {
         .and_then(|s| s.get("autoUnlockCodexPlugins"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let plugin_unlock_needs_port =
-        force_cdp || crate::codex_real_account::active_is_real_chatgpt_now();
+    // [devin review] relay 真账号活动**不启 CDP daemon**(Codex 据 auth_mode==chatgpt
+    // 原生显示 plugins),故不为它带调试端口;只有「强制开启」(force_cdp,走旧 CDP 伪造
+    // 注入 daemon)才需要端口。theme 的端口需求独立判(下方 theme_enabled)。
+    let plugin_unlock_needs_port = force_cdp;
     let theme_enabled = cfg
         .as_ref()
         .and_then(|c| c.get("settings"))

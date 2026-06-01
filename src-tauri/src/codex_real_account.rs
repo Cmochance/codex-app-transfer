@@ -493,18 +493,24 @@ pub async fn import_auth(source_path: String) -> Result<(), String> {
             "不是可用的 chatgpt auth.json(需 auth_mode=chatgpt + access/refresh token)".to_owned(),
         );
     }
-    let _guard = AUTH_LOCK.lock().await;
-    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    import_locked(&paths, &value, Some(&source_path))?;
-    // [MOC-104 分流] 导入**不刷新** token;按本地 JWT exp 判导入文件是否已过期:有效 →
-    // 清失效标记;过期(导入旧文件)→ 置 true,前端提示重新导出 / 登录,不默默拿去 401。
+    // [connector review] 导入**不刷新** token;先按本地 JWT exp 判过期 —— 过期则**拒绝导入、
+    // 不激活**(不让过期账号覆盖当前可用活动 + 镜像;否则 import_locked 已写活动,reconcile 之后
+    // 还会从过期镜像恢复,等于默默激活了死账号)。有效 token 才落盘激活。
     let access = value
         .get("tokens")
         .and_then(|t| t.get("access_token"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let expired = access.is_empty() || access_token_expired(access, chrono::Utc::now().timestamp());
-    set_relogin_required(expired);
+    if access.is_empty() || access_token_expired(access, chrono::Utc::now().timestamp()) {
+        set_relogin_required(true);
+        return Err(
+            "导入文件的登录态已过期,请重新导出最新 auth.json 或改用「登录真实账号」".to_owned(),
+        );
+    }
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    import_locked(&paths, &value, Some(&source_path))?;
+    set_relogin_required(false); // 有效账号导入成功,清失效标记
     Ok(())
 }
 
