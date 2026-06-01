@@ -28,6 +28,9 @@ pub fn sync_root_value(
 ) -> Result<(), CodexError> {
     let current = read_or_empty(config_toml_path)?;
     let new_content = sync_root_value_in_memory(&current, key, raw_value);
+    if new_content == current {
+        return Ok(());
+    }
     write_atomic(config_toml_path, &new_content)?;
     Ok(())
 }
@@ -98,6 +101,9 @@ pub fn sync_table_field(
 ) -> Result<(), CodexError> {
     let current = read_or_empty(config_toml_path)?;
     let new_content = sync_table_field_in_memory(&current, section, key, raw_value);
+    if new_content == current {
+        return Ok(());
+    }
     write_atomic(config_toml_path, &new_content)?;
     Ok(())
 }
@@ -488,5 +494,20 @@ openai_base_url = \"old\"
         let input = "foo = 1\n";
         let out = sync_root_value_in_memory(input, "missing_key", None);
         assert_eq!(out, "foo = 1\n");
+    }
+
+    #[test]
+    fn file_write_is_skipped_when_root_value_is_already_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "approval_policy = \"never\"\n").unwrap();
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        sync_root_value(&path, "approval_policy", Some("\"never\"")).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "same content should not rewrite config.toml");
     }
 }
