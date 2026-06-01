@@ -235,13 +235,15 @@ mod tests {
 
     #[test]
     fn scutil_none_when_all_disabled() {
-        let text = "  HTTPEnable : 0\n  HTTPSEnable : 0\n  SOCKSEnable : 0\n  ProxyAutoConfigEnable : 0\n";
+        let text =
+            "  HTTPEnable : 0\n  HTTPSEnable : 0\n  SOCKSEnable : 0\n  ProxyAutoConfigEnable : 0\n";
         assert!(parse_scutil(text).is_none());
     }
 
     #[test]
     fn scutil_pac_when_autoconfig_and_no_explicit() {
-        let text = "  HTTPEnable : 0\n  HTTPSEnable : 0\n  SOCKSEnable : 0\n  ProxyAutoConfigEnable : 1\n";
+        let text =
+            "  HTTPEnable : 0\n  HTTPSEnable : 0\n  SOCKSEnable : 0\n  ProxyAutoConfigEnable : 1\n";
         assert!(matches!(parse_scutil(text), Some(ProxyEndpoint::Pac)));
     }
 
