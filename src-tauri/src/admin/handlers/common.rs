@@ -80,10 +80,15 @@ pub(crate) fn read_setting_bool(cfg: &RawConfig, key: &str, default: bool) -> bo
         .unwrap_or(default)
 }
 
-pub(super) fn generate_gateway_key_value() -> String {
+pub(super) fn generate_gateway_key_value() -> Result<String, String> {
     let mut buf = [0u8; 32];
-    let _ = getrandom::getrandom(&mut buf);
-    format!("cas_{}", URL_SAFE_NO_PAD.encode(buf))
+    // 安全关键:gateway key 是 proxy 鉴权的唯一凭据。getrandom 失败时按契约
+    // **不保证**写入 buf,若忽略错误会返回全零的确定性 key `cas_AAA...`,把
+    // "强制鉴权"退化成"全球固定已知 key" —— 比无鉴权更隐蔽。故熵源失败必须
+    // 冒泡,让调用方(proxy 启动)硬失败而非裸奔。
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| format!("CSPRNG unavailable, refusing to generate gateway key: {e}"))?;
+    Ok(format!("cas_{}", URL_SAFE_NO_PAD.encode(buf)))
 }
 
 pub(super) fn random_hex(bytes_len: usize) -> String {

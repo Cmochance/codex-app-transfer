@@ -46,16 +46,16 @@ pub(crate) fn read_gateway_key(cfg: &RawConfig) -> String {
         .to_owned()
 }
 
-pub(crate) fn ensure_gateway_key(cfg: &mut RawConfig) -> String {
+pub(crate) fn ensure_gateway_key(cfg: &mut RawConfig) -> Result<String, String> {
     let existing = read_gateway_key(cfg);
-    if !existing.is_empty() {
-        return existing;
+    if !existing.trim().is_empty() {
+        return Ok(existing);
     }
-    let gateway_key = generate_gateway_key_value();
+    let gateway_key = generate_gateway_key_value()?;
     cfg.as_object_mut()
         .unwrap()
         .insert("gatewayApiKey".into(), Value::String(gateway_key.clone()));
-    gateway_key
+    Ok(gateway_key)
 }
 
 pub(crate) async fn start_proxy_if_needed(

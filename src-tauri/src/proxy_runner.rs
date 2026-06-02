@@ -237,20 +237,17 @@ fn load_resolver_snapshot() -> Result<ResolverSnapshot, String> {
         if cfg
             .gateway_api_key
             .as_deref()
-            .map(|s| !s.is_empty())
+            .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
         {
             return Ok(ConfigMutation::Unchanged(cfg));
         }
 
-        let gateway_key = ensure_gateway_key(raw);
+        let gateway_key = ensure_gateway_key(raw)?;
         cfg.gateway_api_key = Some(gateway_key);
         Ok(ConfigMutation::Modified(cfg))
     })?;
 
-    if cfg.providers.is_empty() {
-        return Err("no providers configured; add one first".to_owned());
-    }
     let gateway_key = cfg
         .gateway_api_key
         .filter(|s| !s.is_empty())
@@ -274,11 +271,11 @@ mod tests {
     use crate::admin::handlers::common::test_support::with_isolated_home;
     use crate::admin::registry_io::{load as load_registry, save_for_test as save_registry};
 
-    fn config_with_null_gateway(base_url: String) -> Value {
+    fn config_with_gateway(base_url: String, gateway: Value) -> Value {
         json!({
             "version": "2.1.15",
             "activeProvider": "p1",
-            "gatewayApiKey": null,
+            "gatewayApiKey": gateway,
             "providers": [{
                 "id": "p1",
                 "name": "Provider One",
@@ -304,6 +301,10 @@ mod tests {
                 "updateUrl": codex_app_transfer_registry::DEFAULT_UPDATE_URL
             }
         })
+    }
+
+    fn config_with_null_gateway(base_url: String) -> Value {
+        config_with_gateway(base_url, Value::Null)
     }
 
     fn echo_mock() -> Router {
@@ -373,6 +374,116 @@ mod tests {
                 let authorized = client
                     .post(format!("http://{proxy_addr}/v1/chat/completions"))
                     .header("authorization", format!("Bearer {gateway_key}"))
+                    .header("content-type", "application/json")
+                    .body(r#"{"model":"p1/model-one"}"#)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(authorized.status().as_u16(), 200);
+
+                // 错误 key 必须被拒(集成层覆盖,防 middleware 接线错误)
+                let wrong = client
+                    .post(format!("http://{proxy_addr}/v1/chat/completions"))
+                    .header("authorization", "Bearer cas_wrong_key")
+                    .header("content-type", "application/json")
+                    .body(r#"{"model":"p1/model-one"}"#)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(wrong.status().as_u16(), 401);
+
+                manager.stop_silent();
+            });
+        });
+    }
+
+    /// B1(空串 key 是裸奔的第二入口):gatewayApiKey="" 等同无 key,start 必须
+    /// 重新生成并强制鉴权,而不是把 Some("") 交给 resolver。
+    #[test]
+    fn start_regenerates_gateway_key_when_config_key_is_empty_string() {
+        with_isolated_home(|_| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let upstream = spawn(echo_mock()).await;
+                save_registry(&config_with_gateway(
+                    format!("http://{upstream}"),
+                    json!(""),
+                ))
+                .unwrap();
+
+                let manager = ProxyManager::new();
+                let status = manager.start(0).await.unwrap();
+                assert!(status.gateway_auth);
+
+                let saved = load_registry().unwrap();
+                let gateway_key = saved
+                    .get("gatewayApiKey")
+                    .and_then(|v| v.as_str())
+                    .expect("empty-string key must be regenerated");
+                assert!(
+                    gateway_key.starts_with("cas_"),
+                    "empty key must be replaced by a real cas_ key, not left empty"
+                );
+
+                let proxy_addr = status.addr.expect("proxy addr");
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap();
+                let unauthorized = client
+                    .post(format!("http://{proxy_addr}/v1/chat/completions"))
+                    .header("content-type", "application/json")
+                    .body(r#"{"model":"p1/model-one"}"#)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(unauthorized.status().as_u16(), 401);
+
+                manager.stop_silent();
+            });
+        });
+    }
+
+    /// I1(防"每次 start 覆盖用户 key"回归):已配置非空 gateway key 时,start
+    /// 走 Unchanged 分支,磁盘 key 逐字不变,且该 key 可用于鉴权。
+    #[test]
+    fn start_preserves_existing_gateway_key() {
+        with_isolated_home(|_| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let upstream = spawn(echo_mock()).await;
+                let existing = "cas_existing_user_key_do_not_touch";
+                save_registry(&config_with_gateway(
+                    format!("http://{upstream}"),
+                    json!(existing),
+                ))
+                .unwrap();
+
+                let manager = ProxyManager::new();
+                let status = manager.start(0).await.unwrap();
+                assert!(status.gateway_auth);
+
+                let saved = load_registry().unwrap();
+                assert_eq!(
+                    saved.get("gatewayApiKey").and_then(|v| v.as_str()),
+                    Some(existing),
+                    "existing user gateway key must not be overwritten on start"
+                );
+
+                let proxy_addr = status.addr.expect("proxy addr");
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap();
+                let authorized = client
+                    .post(format!("http://{proxy_addr}/v1/chat/completions"))
+                    .header("authorization", format!("Bearer {existing}"))
                     .header("content-type", "application/json")
                     .body(r#"{"model":"p1/model-one"}"#)
                     .send()
