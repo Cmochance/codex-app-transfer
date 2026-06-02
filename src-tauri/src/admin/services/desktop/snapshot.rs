@@ -138,7 +138,13 @@ pub fn desktop_config_target_for_provider(
     // extras 注入 + model 改写 + vision 剥离 + namespace MCP 展平等)→ 上游。
     // 本项目核心价值在协议转换层,默认所有 provider 走代理,需要透传必须显式选。
     let base_url = format!("http://127.0.0.1:{proxy_port}");
-    let api_key = ensure_gateway_key(cfg);
+    // 熵源失败(getrandom)时 ensure_gateway_key 返 Err。desktop 配置生成属次要
+    // 路径 —— proxy 端鉴权强制由 proxy_runner 启动路径的硬失败保证,这里降级为
+    // 空 key + loud error log,绝不写入可预测的固定 key。
+    let api_key = ensure_gateway_key(cfg).unwrap_or_else(|e| {
+        tracing::error!(error_id = "GATEWAY_KEY_CSPRNG_FAILED", "{e}");
+        String::new()
+    });
     DesktopConfigTarget {
         base_url,
         api_key,
