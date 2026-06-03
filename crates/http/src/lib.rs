@@ -7,12 +7,19 @@
 //! 用法: `should_impersonate(host)` 决定走哪个 client;
 //! `ImpersonatingClient::chrome_120()` 拿带 Chrome 120 指纹的 client, 然后 `.get(url).send().await`。
 //!
+//! ③ JS 渲染层 (MOC-143): [`headless`] 模块用 headless Chromium (CDP) 抓 ①reqwest /
+//! ②wreq 都拿不到的 JS 渲染 SPA (取渲染后 DOM)。先探测系统 Chrome, 未命中按需下载
+//! chrome-headless-shell。
+//!
 //! 非目标 (后续 PR): 不取代 workspace 其余地方 (`gemini_oauth` / `adapters` /
 //! `proxy_runner` / `admin/handlers`) 的 reqwest, 按 PR 逐个迁移; 不引入 Python
-//! sidecar (B 阶段), 留作 5% 漏网 fallback。
+//! sidecar (B 阶段), 留作 5% 漏网 fallback; ③ 层接入分层 router (空骨架检测 → 升级)
+//! 亦作后续 PR, 本 PoC 只打通 headless 抓取能力。
 
+pub mod headless;
 pub mod impersonating;
 pub mod router;
 
+pub use headless::{fetch_rendered_html, HeadlessBrowser, HeadlessConfig, HeadlessError};
 pub use impersonating::{ImpersonatingClient, ImpersonatingError};
 pub use router::{should_impersonate, IMPERSONATE_HOSTS};
