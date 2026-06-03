@@ -56,6 +56,12 @@ pub enum WebFetchError {
     Wreq(String),
     #[error("headless 抓取失败: {0}")]
     Headless(#[from] crate::headless::HeadlessError),
+    /// 资源是二进制 / 非文本 (图片/视频/音频/PDF/字节流等), 不下载正文 (MOC-152)。
+    #[error("{0}")]
+    Unsupported(String),
+    /// 资源声明体积超过下载上限, 不下载 (防 OOM, MOC-152)。
+    #[error("{0}")]
+    TooLarge(String),
 }
 
 /// 按后端抓取一个 URL, 返回页面内容。HTML (curl/wreq 按 content-type / 嗅探判定,
@@ -71,10 +77,115 @@ pub async fn web_fetch(backend: WebFetchBackend, url: &str) -> Result<String, We
         WebFetchBackend::Headless => (crate::headless::fetch_rendered_html(url).await?, true),
     };
     Ok(if is_html {
-        html_to_markdown(&cap_bytes(&body, MAX_HTML_INPUT_BYTES))
+        let capped = cap_bytes(&body, MAX_HTML_INPUT_BYTES);
+        // 先抽正文 (剥 nav/页眉/页脚/侧栏/广告), 抽取不可靠则回退整页 —— 绝不丢内容。
+        match extract_main_content(&capped, url) {
+            Some(main) => html_to_markdown(&main),
+            None => html_to_markdown(&capped),
+        }
     } else {
         body
     })
+}
+
+/// 下载体积上限 (MOC-152): 防误抓大文件把整个 body 读进内存。**靠服务器声明的 `Content-Length`**
+/// 在读取**前**早退;媒体类大文件已由 [`binary_content_kind`] 按 content-type 在读取前先挡下。
+/// 残余 (无 `Content-Length` 的分块巨型**文本**响应) 不在此拦, 由 HTTP client 30s 超时兜底,
+/// 实际极罕见 (沿用 `resp.text()` 的 charset 感知解码, 未改流式以免非 UTF-8 中文页变乱码)。
+/// 16MB 远高于正常网页 (htmd 输入另有 8MB cap)。
+const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 抽取出的正文文本下限 (MOC-152): 低于此视为抽取不可靠 (非文章页 / 误剥) → 回退整页。
+const MIN_EXTRACTED_CHARS: usize = 200;
+
+/// 命中二进制 / 非文本资源 → 返回中文类别名 (用于提示); 文本类返回 `None` (按正常抓取)。
+///
+/// 放行: `text/*`、`*json*`、`*xml*`、`*javascript*`、`*html*`、无 content-type (留嗅探)。
+/// 其余 (image/video/audio/font/pdf/octet-stream/zip…) 一律当二进制, 不下载正文。
+fn binary_content_kind(content_type: Option<&str>) -> Option<&'static str> {
+    let ct = content_type?.to_ascii_lowercase();
+    let ct = ct.split(';').next().unwrap_or("").trim();
+    if ct.is_empty()
+        || ct.starts_with("text/")
+        || ct.contains("json")
+        || ct.contains("xml")
+        || ct.contains("javascript")
+        || ct.contains("html")
+    {
+        return None;
+    }
+    if ct.starts_with("image/") {
+        return Some("图片");
+    }
+    if ct.starts_with("video/") {
+        return Some("视频");
+    }
+    if ct.starts_with("audio/") {
+        return Some("音频");
+    }
+    if ct.starts_with("font/") || ct.contains("font") {
+        return Some("字体");
+    }
+    if ct == "application/pdf" {
+        return Some("PDF");
+    }
+    Some("二进制")
+}
+
+/// 读 body **前**对响应头做闸门 (MOC-152): 二进制资源 / 声明体积超限 → 不下载, 返明确提示。
+/// 避免把图片/视频按 UTF-8 硬解成乱码塞给模型, 以及大文件读进内存 OOM。
+fn precheck_response(
+    content_type: Option<&str>,
+    content_length: Option<u64>,
+) -> Result<(), WebFetchError> {
+    if let Some(kind) = binary_content_kind(content_type) {
+        return Err(WebFetchError::Unsupported(format!(
+            "该 URL 是{kind}资源 (content-type: {}), web_fetch 只抓文本 / HTML / 文本型 API, 未下载内容。",
+            content_type.unwrap_or("?")
+        )));
+    }
+    if let Some(len) = content_length {
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(WebFetchError::TooLarge(format!(
+                "内容约 {:.1} MB, 超过下载上限 {} MB, 未抓取 —— 请抓取更具体的子页 URL。",
+                len as f64 / (1024.0 * 1024.0),
+                MAX_DOWNLOAD_BYTES / (1024 * 1024)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 正文抽取 (MOC-152, dom_smoothie / readability.js 移植): 剥 nav/页眉/页脚/侧栏/广告,
+/// 返回正文 article 的清洗后 HTML (交给 [`html_to_markdown`] 转 markdown)。
+///
+/// 返回 `None` = 抽取不可靠 / 不适用 → 调用方回退整页 (**绝不丢内容**):
+/// - 非文章页 (搜索结果 / 应用 dashboard / API JSON 列表): readability `GrabFailed` —— 预期, 静默;
+/// - 抽出正文过短 (< [`MIN_EXTRACTED_CHARS`]): 疑似误剥, 预期, 静默回退;
+/// - 其余 `ReadabilityError` (如 `BadDocumentURL`: url 非绝对): **非预期**, eprintln 留痕便于
+///   发现抽取系统性失效 (沿用本文件 eprintln 约定), 仍回退整页。
+///
+/// 输入体积由调用方转换**前**的 [`cap_bytes`] 8MB 字节上限兜底 (readability 见到的 HTML 必
+/// ≤8MB), 故默认 config **不**额外开 dom_smoothie 的 element cap —— 开了反而会对合法大页误判
+/// 回退、丢掉 PR-B 想救的大页正文。
+fn extract_main_content(html: &str, url: &str) -> Option<String> {
+    // new() 实际只可能返 BadDocumentURL (url 非绝对); 上游已校验, 理论不达 → 非预期, 留痕。
+    let mut r = match dom_smoothie::Readability::new(html, Some(url), None) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[webfetch] 正文抽取初始化失败, 回退整页 ({url}): {e}");
+            return None;
+        }
+    };
+    match r.parse() {
+        Ok(article) if article.length >= MIN_EXTRACTED_CHARS => Some(article.content.to_string()),
+        Ok(_) => None, // 正文过短: 疑似非文章页, 预期回退, 静默
+        Err(dom_smoothie::ReadabilityError::GrabFailed) => None, // 非文章页: 预期, 静默
+        Err(e) => {
+            eprintln!("[webfetch] 正文抽取失败, 回退整页 ({url}): {e}");
+            None
+        }
+    }
 }
 
 /// htmd 转换前的 HTML 输入字节上限。htmd 对完整 DOM **无深度上限地递归** walk, 病态大页 /
@@ -114,6 +225,13 @@ async fn fetch_curl(url: &str) -> Result<(String, bool), WebFetchError> {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let content_length = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    // 读 body 前闸门: 二进制 / 超大资源不下载 (避免乱码 + OOM)。
+    precheck_response(content_type.as_deref(), content_length)?;
     let body = resp
         .text()
         .await
@@ -140,6 +258,13 @@ async fn fetch_wreq(url: &str) -> Result<(String, bool), WebFetchError> {
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let content_length = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    // 读 body 前闸门: 二进制 / 超大资源不下载 (避免乱码 + OOM)。
+    precheck_response(content_type.as_deref(), content_length)?;
     let bytes = resp
         .bytes()
         .await
@@ -234,6 +359,58 @@ mod tests {
         assert!(is_html_response(None, "<HTML><body>x</body></HTML>"));
         assert!(!is_html_response(None, "{\"k\": \"<html> in a string\"}"));
         assert!(!is_html_response(None, "plain text"));
+    }
+
+    #[test]
+    fn binary_content_kind_classifies() {
+        // 文本类放行 (None)
+        for ok in [
+            "text/html; charset=utf-8",
+            "application/json",
+            "text/plain",
+            "application/xml",
+            "application/xhtml+xml",
+            "application/javascript",
+        ] {
+            assert!(binary_content_kind(Some(ok)).is_none(), "应放行: {ok}");
+        }
+        assert!(binary_content_kind(None).is_none()); // 无 content-type → 留嗅探
+                                                      // 二进制拦截 (Some(类别))
+        assert_eq!(binary_content_kind(Some("image/png")), Some("图片"));
+        assert_eq!(binary_content_kind(Some("video/mp4")), Some("视频"));
+        assert_eq!(binary_content_kind(Some("audio/mpeg")), Some("音频"));
+        assert_eq!(binary_content_kind(Some("application/pdf")), Some("PDF"));
+        assert_eq!(binary_content_kind(Some("font/woff2")), Some("字体"));
+        assert_eq!(
+            binary_content_kind(Some("application/octet-stream")),
+            Some("二进制")
+        );
+        assert_eq!(binary_content_kind(Some("application/zip")), Some("二进制"));
+    }
+
+    #[test]
+    fn precheck_rejects_binary_and_oversize() {
+        assert!(matches!(
+            precheck_response(Some("image/png"), None),
+            Err(WebFetchError::Unsupported(_))
+        ));
+        assert!(matches!(
+            precheck_response(Some("text/html"), Some(MAX_DOWNLOAD_BYTES + 1)),
+            Err(WebFetchError::TooLarge(_))
+        ));
+        // 文本 + 体积合规 → 放行
+        assert!(precheck_response(Some("text/html; charset=utf-8"), Some(1000)).is_ok());
+        assert!(precheck_response(Some("application/json"), None).is_ok());
+        assert!(precheck_response(None, None).is_ok());
+    }
+
+    #[test]
+    fn extract_main_falls_back_on_non_article() {
+        // 空 / 过短 / 无正文骨架 → None (调用方回退整页), 且不 panic。
+        assert!(extract_main_content("<div></div>", "https://example.com/x").is_none());
+        assert!(extract_main_content("", "https://example.com/x").is_none());
+        // 非绝对 URL → readability BadDocumentURL → None
+        assert!(extract_main_content("<html><body>hi</body></html>", "not-a-url").is_none());
     }
 
     #[test]

@@ -299,13 +299,21 @@ fn web_fetch_tool_def() -> Value {
     })
 }
 
-/// 按字符截断(非字节, 防截断多字节 UTF-8)。
+/// 按字符截断(非字节, 防截断多字节 UTF-8)。超限时尽量退到最近的换行边界, 避免从句中 /
+/// 词中硬切(markdown 段落更完整);仅当该边界离上限不太远(末 1/4 内)才退, 否则宁可硬切
+/// 也不浪费过多预算。提示语引导模型抓更具体子页, 而非反复抓同一巨页。
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let cut: String = s.chars().take(max).collect();
-    format!("{cut}\n\n[... 内容超过 {max} 字符已截断 ...]")
+    let mut cut: String = s.chars().take(max).collect();
+    // 退到最后一个换行边界(就近, 浪费不超过 1/4 预算时才退)。
+    if let Some(i) = cut.rfind('\n') {
+        if i >= cut.len() * 3 / 4 {
+            cut.truncate(i);
+        }
+    }
+    format!("{cut}\n\n[... 内容超过 {max} 字符已截断;需要后续内容请抓取更具体的子页 URL ...]")
 }
 
 fn tool_ok(id: Value, text: &str) -> Value {
@@ -363,6 +371,20 @@ mod tests {
         // 多字节按字符截断不 panic
         let cjk = "你好世界".repeat(5);
         let _ = truncate(&cjk, 3);
+    }
+
+    #[test]
+    fn truncate_prefers_newline_boundary() {
+        // 换行落在末 1/4 内 → 退到换行边界, 不带半行
+        let s = format!("{}\n{}", "a".repeat(16), "b".repeat(10));
+        let t = truncate(&s, 20); // 前 20 字符 = 16a + \n + 3b; \n@16 >= 15 → 退到 16
+        assert!(t.starts_with(&"a".repeat(16)), "应保留整段 a: {t}");
+        assert!(!t.contains('b'), "应退到换行边界、不含半行 b: {t}");
+        assert!(t.contains("已截断"));
+        // 换行太靠前(末 1/4 外)→ 不退, 硬切以免浪费预算
+        let s2 = format!("{}\n{}", "c".repeat(4), "d".repeat(40));
+        let t2 = truncate(&s2, 20); // \n@4 < 15 → 硬切, 含 d
+        assert!(t2.contains('d'), "边界太靠前应硬切: {t2}");
     }
 
     #[test]
