@@ -8,6 +8,8 @@
 
 **③ JS 渲染层 PoC (MOC-143)**:`crates/http` 新增 `headless` 模块,用 headless Chromium (CDP,经 `chromiumoxide` 0.9) 取 ①reqwest / ②wreq 都拿不到的 JS 渲染 SPA 的渲染后 DOM。先探测系统 Chrome,未命中按需下载 chrome-headless-shell (~86 MB) 到 `~/.codex-app-transfer/browsers/`,不打包进安装包。**本次仅打通抓取能力 (`HeadlessBrowser` / `fetch_rendered_html` / `HeadlessConfig` + `#[ignore]` 真机测试)**,尚未接入任何调用路径 — 分层 router (空骨架检测 → 升级 ③) 作后续 PR。
 
+**联网工具多级后端 + 统一抓取层 (MOC-144, step1)**:`crates/http` 新增 `web_fetch(backend, url)` 统一抓取入口,按档位路由 ①`curl`(reqwest 静态)/ ②`wreq`(浏览器 TLS 指纹绕 Cloudflare)/ ③`headless`(无头 Chrome 跑 JS 取渲染后 DOM)。设置页新增"内置联网抓取工具"多级选择项(`关闭 / curl / wreq / headless`,默认关闭,**独立于** Codex 沙箱联网开关 `codexNetworkAccess`);首次选 `headless` 会探测系统 Chrome,未装则弹窗确认下载 chrome-headless-shell(取消回退上一级)。新增 `GET /api/chrome/detect` + `POST /api/chrome/ensure`。**本次仅打通后端抓取层 + 设置 UI + Chrome 检测/下载;模型侧 web_fetch tool 注入(让 Codex 真能调到该工具)作后续 PR**。
+
 详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
 ## v2.2.0 — 2026-06-01

@@ -12,6 +12,7 @@
 
 pub mod agents_md;
 pub mod antigravity_oauth;
+pub mod chrome;
 pub mod common;
 pub mod conversations;
 pub mod desktop;

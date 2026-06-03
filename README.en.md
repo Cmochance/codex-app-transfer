@@ -270,7 +270,7 @@ Design intent: the client trusts only the build-time embedded public key and nev
 
 ## Tech Stack
 
-- **Backend / forwarding**: Rust 1.85+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio · `wreq` 6.0-rc (browser TLS fingerprint impersonation, for Cloudflare-strict `openai.com` / `chatgpt.com`; see `crates/http/`) · `chromiumoxide` 0.9 (headless Chromium to fetch JS-rendered SPAs that ①reqwest / ②wreq can't reach — detects system Chrome, else downloads chrome-headless-shell on demand to app data, not bundled; PoC for now, router integration in a later PR; see `crates/http/src/headless/`)
+- **Backend / forwarding**: Rust 1.85+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio · `wreq` 6.0-rc (browser TLS fingerprint impersonation, for Cloudflare-strict `openai.com` / `chatgpt.com`; see `crates/http/`) · `chromiumoxide` 0.9 (headless Chromium to fetch JS-rendered SPAs that ①reqwest / ②wreq can't reach — detects system Chrome, else downloads chrome-headless-shell on demand to app data, not bundled; PoC for now, router integration in a later PR; see `crates/http/src/headless/`) · `crates/http::web_fetch` (unified fetch layer routing curl/wreq/headless by the settings tier; paired with `GET /api/chrome/detect` + `POST /api/chrome/ensure`; **model-side tool injection in a later PR**)
 - **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
 - **Frontend**: HTML + CSS + vanilla JavaScript + Bootstrap 5.3.3 (localized, no CDN dependency)
 - **Desktop shell**: Tauri 2 + tray-icon 0.23; the `cas://` URI scheme glues frontend/ and axum in-process, no TCP loopback

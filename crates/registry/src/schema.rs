@@ -71,10 +71,21 @@ pub struct Settings {
     /// 缓存,不需要 `network_access`)。
     #[serde(default = "default_codex_network_access")]
     pub codex_network_access: bool,
+
+    /// 内置联网抓取工具的后端档位 (MOC-144): `off`(不暴露抓取工具) / `curl`(reqwest
+    /// 静态 GET) / `wreq`(浏览器 TLS 指纹, 绕 Cloudflare JS 挑战) / `headless`(headless
+    /// Chromium 跑 JS, 取渲染后 DOM)。**独立于** [`Self::codex_network_access`](后者管
+    /// Codex 沙箱 shell 的联网权限, 是两套机制)。默认 `off`。
+    #[serde(default = "default_web_fetch_backend")]
+    pub web_fetch_backend: String,
 }
 
 fn default_codex_network_access() -> bool {
     true
+}
+
+fn default_web_fetch_backend() -> String {
+    "off".to_owned()
 }
 
 impl Default for Settings {
@@ -90,6 +101,7 @@ impl Default for Settings {
             restore_codex_on_exit: true,
             update_url: DEFAULT_UPDATE_URL.to_owned(),
             codex_network_access: true,
+            web_fetch_backend: default_web_fetch_backend(),
         }
     }
 }

@@ -852,6 +852,7 @@ dependencies = [
  "codex-app-transfer-codex-integration",
  "codex-app-transfer-conversation-export",
  "codex-app-transfer-gemini-oauth",
+ "codex-app-transfer-http",
  "codex-app-transfer-proxy",
  "codex-app-transfer-registry",
  "codex-app-transfer-usage-tracker",

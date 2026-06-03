@@ -11,15 +11,22 @@
 //! ②wreq 都拿不到的 JS 渲染 SPA (取渲染后 DOM)。先探测系统 Chrome, 未命中按需下载
 //! chrome-headless-shell。
 //!
+//! 统一抓取层 (MOC-144): [`fetch`] 模块的 [`web_fetch`] 按设置页"内置联网抓取工具"的
+//! 档位路由: `curl`(reqwest 静态) / `wreq`(浏览器 TLS 指纹) / `headless`(Chromium CDP)。
+//! 配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure` 供设置页探测/按需下载 Chrome。
+//! **模型侧 web_fetch tool 注入(让 Codex 真能调到该工具)作后续 PR。**
+//!
 //! 非目标 (后续 PR): 不取代 workspace 其余地方 (`gemini_oauth` / `adapters` /
 //! `proxy_runner` / `admin/handlers`) 的 reqwest, 按 PR 逐个迁移; 不引入 Python
 //! sidecar (B 阶段), 留作 5% 漏网 fallback; ③ 层接入分层 router (空骨架检测 → 升级)
-//! 亦作后续 PR, 本 PoC 只打通 headless 抓取能力。
+//! 亦作后续 PR。
 
+pub mod fetch;
 pub mod headless;
 pub mod impersonating;
 pub mod router;
 
+pub use fetch::{web_fetch, WebFetchBackend, WebFetchError};
 pub use headless::{fetch_rendered_html, HeadlessBrowser, HeadlessConfig, HeadlessError};
 pub use impersonating::{ImpersonatingClient, ImpersonatingError};
 pub use router::{should_impersonate, IMPERSONATE_HOSTS};

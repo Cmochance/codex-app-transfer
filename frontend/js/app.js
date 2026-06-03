@@ -2580,6 +2580,11 @@
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#mcpCredentialsPortableStore").checked = settings.mcpCredentialsPortableStore !== false;
     $("#codexNetworkAccess").checked = settings.codexNetworkAccess !== false;
+    if ($("#webFetchBackend")) {
+      $("#webFetchBackend").value = settings.webFetchBackend || "off";
+      // 记下"已保存值", 供 select 切换失败/取消时回退(不依赖易陈旧的 focus 快照)
+      $("#webFetchBackend").dataset.saved = $("#webFetchBackend").value;
+    }
     $("#codexStatusSectionDefaultVisible").checked = settings.codexStatusSectionDefaultVisible !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
     renderModelMenuModeState(settings);
@@ -3119,6 +3124,7 @@
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       mcpCredentialsPortableStore: $("#mcpCredentialsPortableStore")?.checked !== false,
       codexNetworkAccess: $("#codexNetworkAccess")?.checked !== false,
+      webFetchBackend: $("#webFetchBackend")?.value || "off",
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
@@ -8372,6 +8378,81 @@
     });
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
+    // MOC-144 联网抓取后端多级: 选 headless 时检测 chrome, 未装弹窗确认下载, 取消/失败回退。
+    // 回退目标 = sel.dataset.saved("上次成功保存值", load + 每次成功 save 后更新), 不依赖
+    // 易陈旧的 focus 快照; _webFetchSwitching 作 in-flight guard, 防 20s 下载期间重复触发并发。
+    const _webFetchSel = $("#webFetchBackend");
+    let _webFetchSwitching = false;
+    // 存档当前 select 值: 成功更新 dataset.saved; 失败回退到上次保存值 + 明确"设置保存失败"
+    // (区分于"下载失败", 避免错误归因)。
+    async function _commitWebFetch() {
+      const val = _webFetchSel.value;
+      try {
+        await saveSettingsFromForm();
+        _webFetchSel.dataset.saved = val;
+        return true;
+      } catch (e) {
+        _webFetchSel.value = _webFetchSel.dataset.saved || "off";
+        showToast(t("settings.webFetchSaveFailed") + (e?.message ? `: ${e.message}` : ""));
+        return false;
+      }
+    }
+    _webFetchSel?.addEventListener("change", async () => {
+      if (_webFetchSwitching) {
+        // 上一次切换(检测/下载)还没完成 → 拒绝本次, 复位到上次保存值
+        _webFetchSel.value = _webFetchSel.dataset.saved || "off";
+        return;
+      }
+      if (_webFetchSel.value !== "headless") {
+        await _commitWebFetch();
+        return;
+      }
+      // 选 headless: 探测系统 Chrome(整段加 guard + 禁用 select, 防重复触发)
+      _webFetchSwitching = true;
+      _webFetchSel.disabled = true;
+      let pendingModal = false;
+      try {
+        const r = await CCApi.detectSystemChrome();
+        if (r.detected) {
+          if (await _commitWebFetch()) showToast(t("settings.headlessChromeSystemFound"));
+        } else {
+          pendingModal = true; // 未装 → 弹窗, guard/禁用 保持到 confirm/cancel 收尾
+          $("#headlessChromeDownloadModal").hidden = false;
+        }
+      } catch (e) {
+        _webFetchSel.value = _webFetchSel.dataset.saved || "off"; // 探测失败回退
+        showToast(e?.message || t("settings.headlessChromeFailed"));
+      } finally {
+        if (!pendingModal) {
+          _webFetchSwitching = false;
+          _webFetchSel.disabled = false;
+        }
+      }
+    });
+    $("[data-action=headless-chrome-confirm]")?.addEventListener("click", async () => {
+      $("#headlessChromeDownloadModal").hidden = true;
+      showToast(t("settings.headlessChromeDownloading"));
+      try {
+        await CCApi.ensureChromeHeadlessShell();
+      } catch (e) {
+        // 下载本身失败 → 回退, 报"下载失败"
+        showToast(e?.message || t("settings.headlessChromeFailed"));
+        _webFetchSel.value = _webFetchSel.dataset.saved || "off";
+        _webFetchSwitching = false;
+        _webFetchSel.disabled = false;
+        return;
+      }
+      // 下载成功 → 独立存档(失败由 _commitWebFetch 报"设置保存失败", 不误报"下载失败")
+      if (await _commitWebFetch()) showToast(t("settings.headlessChromeDownloaded"));
+      _webFetchSwitching = false;
+      _webFetchSel.disabled = false;
+    });
+    $("[data-action=headless-chrome-cancel]")?.addEventListener("click", () => {
+      $("#headlessChromeDownloadModal").hidden = true;
+      _webFetchSel.value = _webFetchSel.dataset.saved || "off"; // 取消回退到上次保存值
+      _webFetchSwitching = false;
+      _webFetchSel.disabled = false;
+    });
     $("#codexStatusSectionDefaultVisible")?.addEventListener("change", saveSettingsFromForm);
     $("#configImportFile")?.addEventListener("change", (event) => {
       importConfigFile(event.target.files?.[0]);

@@ -525,6 +525,20 @@
               </div>
             </div>
           </div>
+          <!-- MOC-144 首次开启 headless 抓取但未检测到系统 Chrome 的下载确认弹窗 -->
+          <div class="codex-modal-backdrop" id="headlessChromeDownloadModal" hidden>
+            <div class="codex-modal" role="dialog" aria-modal="true">
+              <div class="codex-modal-header">
+                <h3 data-i18n="settings.headlessChromeTitle">未检测到 Chrome</h3>
+                <button class="codex-modal-close" type="button" data-action="headless-chrome-cancel"><i class="bi bi-x-lg"></i></button>
+              </div>
+              <p class="codex-modal-desc" data-i18n="settings.headlessChromeDesc">启用 headless 抓取需要一个 Chromium 浏览器，但未在系统中检测到 Chrome / Edge / Chromium。是否下载 chrome-headless-shell（约 86MB，仅下载一次并复用，不打包进安装包）？取消则回退到上一个选项。</p>
+              <div class="codex-modal-actions" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="headless-chrome-cancel" data-i18n="common.cancel">取消</button>
+                <button class="btn btn-sm btn-outline-primary" type="button" data-action="headless-chrome-confirm" data-i18n="settings.headlessChromeConfirm">下载并启用</button>
+              </div>
+            </div>
+          </div>
           <div class="settings-row settings-row-stack">
             <strong data-i18n="settings.autoWakeCodexPet">自动唤醒 Codex 桌面宠物</strong>
             <div>
@@ -564,6 +578,18 @@
             <div>
               <label class="switch-label only-switch"><input type="checkbox" id="codexNetworkAccess" checked><span class="switch-ui"></span></label>
               <p class="settings-note" data-i18n="settings.codexNetworkAccessHint">⚠️ 默认开启。让 Codex 走 danger-full-access 沙箱 + approval_policy=never（Codex 官方推荐的 "Full access" 配对）：模型可以读写任何文件、用 curl / wget 等联网命令获取实时网页，且所有命令无审批弹窗。**等于完全信任模型**。关闭后 Codex 回 read-only 沙箱 + on-request 审批：无网络，仅能用所选模型自带的 web_search 能力；若模型不支持 web_search，则完全无法联网搜索。</p>
+            </div>
+          </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.webFetchBackend">内置联网抓取工具（transfer 代抓网页）</strong>
+            <div>
+              <select class="form-control form-control-lg" id="webFetchBackend" name="webFetchBackend" style="max-width:340px">
+                <option value="off" data-i18n="settings.webFetchBackend.off">关闭（不暴露抓取工具）</option>
+                <option value="curl" data-i18n="settings.webFetchBackend.curl">curl（静态 HTML，最快）</option>
+                <option value="wreq" data-i18n="settings.webFetchBackend.wreq">wreq（浏览器指纹，绕 Cloudflare）</option>
+                <option value="headless" data-i18n="settings.webFetchBackend.headless">headless（无头 Chrome，跑 JS 抓 SPA）</option>
+              </select>
+              <p class="settings-note" data-i18n="settings.webFetchBackendHint">transfer 自己抓取网页内容返给模型（独立于上面的 Codex 沙箱联网开关）。curl=reqwest 静态抓取；wreq=浏览器 TLS 指纹绕 Cloudflare；headless=无头 Chrome 跑 JS 抓 JS 渲染 SPA。首次选 headless 会检测系统 Chrome，未安装则提示下载 chrome-headless-shell（~86MB，仅一次，复用，不打包进安装包）。</p>
             </div>
           </div>
           <div class="settings-row settings-row-stack">

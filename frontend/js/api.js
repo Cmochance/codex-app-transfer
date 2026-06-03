@@ -478,6 +478,15 @@
       return data.settings || data;
     },
 
+    // MOC-144 联网抓取后端: headless 档需要 Chromium, 这两个给设置页探测/按需下载用。
+    async detectSystemChrome() {
+      return api('GET', '/api/chrome/detect');
+    },
+
+    async ensureChromeHeadlessShell() {
+      return api('POST', '/api/chrome/ensure', {});
+    },
+
     async checkUpdate(updateUrl) {
       const params = new URLSearchParams();
       if (updateUrl) params.set('url', updateUrl);

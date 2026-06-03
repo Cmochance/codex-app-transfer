@@ -33,6 +33,9 @@ pub fn build_app_router(state: AdminState) -> Router {
         )
         // 总状态
         .route("/api/status", get(handlers::common::status))
+        // Chrome 探测/按需下载 (MOC-144 headless 抓取后端)
+        .route("/api/chrome/detect", get(handlers::chrome::detect))
+        .route("/api/chrome/ensure", post(handlers::chrome::ensure))
         // Providers
         .route(
             "/api/providers",
