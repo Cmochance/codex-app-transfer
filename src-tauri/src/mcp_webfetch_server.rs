@@ -39,6 +39,10 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_secs(125);
 /// 防客户端 bug / 突发并发同时拉起 N 个 headless Chrome 耗尽资源。ping / initialize 等即时
 /// 响应类不走这里(inline 派发), 不受此限。
 const MAX_CONCURRENT_FETCHES: usize = 4;
+/// 喂给总结模型的网页正文上限(字符)。正文已抽取, 这里再硬截防超大页吃爆总结模型上下文。
+const SUMMARY_INPUT_CHARS: usize = 60_000;
+/// 调总结模型的超时。略宽于一般补全(慢 provider / 长正文)。
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// 入口: 读 stdin 逐行 JSON-RPC, 派发到 tokio runtime, 经单写线程串行写 stdout。
 ///
@@ -186,6 +190,11 @@ fn dispatch_line(
                 .and_then(|a| a.get("url"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string());
+            let prompt = params
+                .and_then(|p| p.get("arguments"))
+                .and_then(|a| a.get("prompt"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
             let call_id = id.clone().unwrap_or(Value::Null);
             let out = out_tx.clone();
             let sem = Arc::clone(sem);
@@ -202,6 +211,7 @@ fn dispatch_line(
                     call_id.clone(),
                     &name,
                     url,
+                    prompt,
                 ));
                 let resp = match futures::FutureExt::catch_unwind(fut).await {
                     Ok(v) => v,
@@ -223,13 +233,28 @@ fn dispatch_line(
 }
 
 /// 处理 `tools/call`。owned 参数, 避免跨 await 借用 req。
-async fn handle_web_fetch_call(id: Value, name: &str, url: Option<String>) -> Value {
+async fn handle_web_fetch_call(
+    id: Value,
+    name: &str,
+    url: Option<String>,
+    prompt: Option<String>,
+) -> Value {
     if name != "web_fetch" {
         return rpc_error(id, -32602, &format!("Unknown tool: {name}"));
     }
     let url = match url {
         Some(u) if !u.is_empty() => u,
         _ => return tool_error(id, "缺少必填参数 url(需绝对 http(s) URL)"),
+    };
+    // prompt 必填 (MOC-152): web_fetch 不返整页, 而是用『总结模型』针对 prompt 摘要/作答。
+    let prompt = match prompt {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return tool_error(
+                id,
+                "缺少必填参数 prompt(描述你想从该网页了解 / 提取什么 —— 据此生成针对性摘要)",
+            )
+        }
     };
     let backend = match current_backend() {
         Ok(Some(b)) => b,
@@ -260,8 +285,180 @@ async fn handle_web_fetch_call(id: Value, name: &str, url: Option<String>) -> Va
                 backend.as_str()
             ),
         ),
-        Ok(body) => tool_ok(id, &truncate(&body, MAX_CONTENT_CHARS)),
+        // 抓到正文 → 用总结模型针对 prompt 摘要; 摘要失败(未配/proxy 未起/模型报错/格式不支持)
+        // → 回退返回抓取的原文(绝不丢内容), 并注明摘要未生成。
+        Ok(body) => match summarize(&body, &prompt).await {
+            Ok(summary) => tool_ok(id, &truncate(&summary, MAX_CONTENT_CHARS)),
+            Err(e) => {
+                eprintln!("[cat-webfetch] 网页摘要未生成, 回退原文: {e}");
+                let note = format!("(注: 网页摘要未生成({e});以下为抓取到的网页正文原文。)\n\n");
+                tool_ok(id, &truncate(&format!("{note}{body}"), MAX_CONTENT_CHARS))
+            }
+        },
         Err(e) => tool_error(id, &format!("抓取失败(后端 {}): {e}", backend.as_str())),
+    }
+}
+
+/// 网页摘要配置(每次 `tools/call` 读 config, 改配置无需重启 Codex)。
+struct SummaryConfig {
+    proxy_port: u16,
+    /// 本地 proxy 的 gateway key(`Authorization: Bearer <key>`);MOC-108 后默认强制有。
+    gateway_key: Option<String>,
+    /// 发给本地 proxy 的 model 字段, 形如 `<provider-slug>/<summaryModel>`(slug 前缀使
+    /// proxy 逐字转发该模型, 不被重映射成 `models["default"]`)。
+    model: String,
+    /// provider 的 api 格式(决定走 chat/completions 还是其它;当前仅 openai_chat 支持摘要)。
+    api_format: String,
+}
+
+/// 读 `~/.codex-app-transfer/config.json`, 解析当前 active provider 的摘要配置。
+fn read_summary_config() -> Result<SummaryConfig, String> {
+    let path = codex_app_transfer_registry::config_file()
+        .ok_or_else(|| "无法定位 config.json(HOME 未设置?)".to_string())?;
+    let cfg = codex_app_transfer_registry::load_raw_config(&path)
+        .map_err(|e| format!("读取 config.json 失败: {e}"))?;
+    parse_summary_config(&cfg)
+}
+
+/// 从 config `Value` 解析当前 active provider 的摘要配置(纯函数, 便于单测)。
+fn parse_summary_config(cfg: &Value) -> Result<SummaryConfig, String> {
+    let proxy_port = cfg
+        .get("settings")
+        .and_then(|s| s.get("proxyPort"))
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "config 缺 settings.proxyPort".to_string())? as u16;
+    let gateway_key = cfg
+        .get("gatewayApiKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let active = cfg
+        .get("activeProvider")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "未选择当前提供商(activeProvider 为空)".to_string())?;
+    let prov_val = cfg
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(active))
+        })
+        .ok_or_else(|| format!("当前提供商({active})不在 providers 列表中"))?;
+    // 反序列化成 Provider, 复用规范的 provider_slug(slug 路由)+ extra flatten(读 summaryModel)。
+    let provider: codex_app_transfer_registry::Provider = serde_json::from_value(prov_val.clone())
+        .map_err(|e| format!("解析当前提供商配置失败: {e}"))?;
+    let api_format = provider.api_format.clone();
+    // summaryModel(经 extra flatten 透传)优先, 空/缺 → 回退 models["default"]。
+    let model_value = provider
+        .extra
+        .get("summaryModel")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            provider
+                .models
+                .get("default")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+        })
+        .ok_or_else(|| "未配置总结模型, 且该提供商 models.default 为空".to_string())?
+        .to_string();
+    // slug 前缀: 让 proxy 把该模型**逐字**转发到当前 provider —— 绕过 resolver
+    // `map_model_for_provider` 对"非 slot-key 模型"降级到 `models["default"]` 的重映射
+    // (否则用户选的 summaryModel 不生效, 永远用 default;见 decide_provider 的 `<slug>/<model>` 透传)。
+    let slug = codex_app_transfer_registry::provider_slug(&provider);
+    Ok(SummaryConfig {
+        proxy_port,
+        gateway_key,
+        model: format!("{slug}/{model_value}"),
+        api_format,
+    })
+}
+
+/// 用『总结模型』针对 `prompt` 对网页正文 `content` 作答 —— 经本地 proxy 调当前 provider 的
+/// 模型(复用其路由 + 鉴权改写)。返回 `Err` 时上层回退原文(绝不丢内容)。
+///
+/// 当前仅支持 `openai_chat` 格式 provider(`/v1/chat/completions`, 主流);其它格式返 Err →
+/// 回退原文。后续可扩 `/v1/responses` 覆盖 responses-format provider。
+async fn summarize(content: &str, prompt: &str) -> Result<String, String> {
+    let cfg = read_summary_config()?;
+    if cfg.api_format != "openai_chat" {
+        return Err(format!(
+            "当前提供商 apiFormat={} 暂不支持网页摘要(仅 openai_chat)",
+            cfg.api_format
+        ));
+    }
+    // 控制喂给总结模型的输入大小(正文已抽取, 这里再硬截一层防超大页吃爆上下文)。
+    // 截断时**显式告知模型**输入不完整 —— 否则模型会把前 N 字当全文, 给出"看似完整"实则
+    // 漏后段的答案(silent completeness failure)。
+    let total = content.chars().count();
+    let truncated = total > SUMMARY_INPUT_CHARS;
+    let capped: String = content.chars().take(SUMMARY_INPUT_CHARS).collect();
+    let trunc_hint = if truncated {
+        format!(
+            "\n\n(注意:网页正文超长, 以下仅为前 {SUMMARY_INPUT_CHARS}/{total} 字符, **可能不完整**;\
+             若关键信息可能在后段, 请在回答中明确指出内容被截断。)"
+        )
+    } else {
+        String::new()
+    };
+    let instruction = format!(
+        "你是网页内容摘要助手。下面是一篇网页的正文(已转 markdown)。请**仅依据正文**, 针对\
+         「用户需求」给出准确、简洁的回答或摘要;正文未提及的不要编造, 不确定就说明。{trunc_hint}\n\n\
+         ## 用户需求\n{prompt}\n\n## 网页正文\n{capped}"
+    );
+    let client = reqwest::Client::builder()
+        .timeout(SUMMARY_TIMEOUT)
+        .build()
+        .map_err(|e| format!("建 HTTP client 失败: {e}"))?;
+    let endpoint = format!("http://127.0.0.1:{}/v1/chat/completions", cfg.proxy_port);
+    let body = json!({
+        "model": cfg.model,
+        "messages": [{ "role": "user", "content": instruction }],
+        "stream": false,
+    });
+    let mut req = client.post(&endpoint).json(&body);
+    if let Some(k) = &cfg.gateway_key {
+        req = req.bearer_auth(k);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("调本地 proxy 摘要失败(proxy 未启动?): {e}"))?;
+    let status = resp.status();
+    // 用 map_err 而非 unwrap_or_default: body 读失败(连接中断/解码错)不该被吞成空串再误报
+    // "响应非 JSON", 给真因。
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取摘要响应体失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "摘要模型 HTTP {status}: {}",
+            text.chars().take(200).collect::<String>()
+        ));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("摘要响应非 JSON: {e}"))?;
+    let out = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| "摘要响应缺 choices[0].message.content".to_string())?;
+    if out.trim().is_empty() {
+        return Err("摘要模型返回空内容".to_string());
+    }
+    // 输入被截断时也给消费者(Codex)带一句, 不只告诉总结模型 —— 避免拿"基于部分正文的摘要"
+    // 当完整答案。
+    if truncated {
+        Ok(format!(
+            "(注:网页正文过长, 本摘要基于前 {SUMMARY_INPUT_CHARS} 字符, 可能不完整。)\n\n{out}"
+        ))
+    } else {
+        Ok(out.to_string())
     }
 }
 
@@ -285,16 +482,21 @@ fn web_fetch_tool_def() -> Value {
     json!({
         "name": "web_fetch",
         "title": "Web Fetch",
-        "description": "抓取一个 http(s) URL 的网页内容并以文本返回。由 codex-app-transfer 代抓: \
-    按设置档位走 curl(reqwest 静态)/ wreq(浏览器 TLS 指纹, 绕 Cloudflare)/ headless(无头 \
-    Chrome 跑 JS, 抓 JS 渲染 SPA)。适合读取网页正文 / 在线文档 / 文本型 API 响应。返回内容超过 \
-    约 100KB 会被截断。",
+        "description": "抓取一个 http(s) URL 的网页, 用配置的『总结模型』针对你的 prompt 生成\
+    摘要 / 回答后返回(类 Claude WebFetch, 省 context)。由 codex-app-transfer 代抓(curl / wreq / \
+    headless 三档, 绕 Cloudflare + 跑 JS)并抽取正文。**必须提供 prompt** 说明你想从该页了解 / \
+    提取什么。若未配置总结模型 / proxy 未起 / 摘要失败, 自动回退返回网页正文原文(不丢内容)。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "要抓取的绝对 http(s) URL。" }
+                "url": { "type": "string", "description": "要抓取的绝对 http(s) URL。" },
+                "prompt": {
+                    "type": "string",
+                    "description": "你想从该网页了解 / 提取什么(如『v0.136 的 breaking changes』\
+                    『把安装步骤原样列出』)。据此用总结模型生成针对性摘要 / 回答。"
+                }
             },
-            "required": ["url"]
+            "required": ["url", "prompt"]
         }
     })
 }
@@ -358,7 +560,66 @@ mod tests {
         let d = web_fetch_tool_def();
         assert_eq!(d["name"], "web_fetch");
         assert_eq!(d["inputSchema"]["required"][0], "url");
+        // MOC-152: prompt 设为必填(摘要驱动)。
+        assert_eq!(d["inputSchema"]["required"][1], "prompt");
         assert_eq!(d["inputSchema"]["properties"]["url"]["type"], "string");
+        assert_eq!(d["inputSchema"]["properties"]["prompt"]["type"], "string");
+    }
+
+    #[test]
+    fn parse_summary_config_prefers_summary_then_default() {
+        let cfg = json!({
+            "activeProvider": "p1",
+            "gatewayApiKey": "cas_x",
+            "settings": { "proxyPort": 18080 },
+            "providers": [{
+                "id": "p1", "name": "P1", "baseUrl": "https://api.p1.com/v1",
+                "apiFormat": "openai_chat",
+                "summaryModel": "deepseek-chat",
+                "models": { "default": "deepseek-reasoner" }
+            }]
+        });
+        let c = parse_summary_config(&cfg).unwrap();
+        // summaryModel 优先, 且 slug 前缀(slug("p1")="p1")绕过 proxy 重映射。
+        assert_eq!(c.model, "p1/deepseek-chat");
+        assert_eq!(c.proxy_port, 18080);
+        assert_eq!(c.gateway_key.as_deref(), Some("cas_x"));
+        assert_eq!(c.api_format, "openai_chat");
+    }
+
+    #[test]
+    fn parse_summary_config_falls_back_to_default() {
+        // summaryModel 空白 → 回退 models.default; 缺 apiFormat → 默认 openai_chat; 无 gateway key
+        let cfg = json!({
+            "activeProvider": "p1",
+            "settings": { "proxyPort": 1234 },
+            "providers": [{
+                "id": "p1", "name": "P1", "baseUrl": "https://api.p1.com/v1",
+                "summaryModel": "   ", "models": { "default": "glm-4" }
+            }]
+        });
+        let c = parse_summary_config(&cfg).unwrap();
+        assert_eq!(c.model, "p1/glm-4"); // 空白 summaryModel → default, slug 前缀
+        assert_eq!(c.api_format, "openai_chat");
+        assert!(c.gateway_key.is_none());
+    }
+
+    #[test]
+    fn parse_summary_config_errors_on_missing() {
+        // 无 activeProvider
+        assert!(parse_summary_config(&json!({ "settings": { "proxyPort": 1 } })).is_err());
+        // 缺 proxyPort
+        assert!(parse_summary_config(&json!({ "activeProvider": "p1" })).is_err());
+        // active 但既无 summaryModel 又无 models.default(provider 字段齐全, 仅模型为空)
+        let cfg = json!({
+            "activeProvider": "p1",
+            "settings": { "proxyPort": 1 },
+            "providers": [{
+                "id": "p1", "name": "P1", "baseUrl": "https://api.p1.com/v1",
+                "models": { "default": "" }
+            }]
+        });
+        assert!(parse_summary_config(&cfg).is_err());
     }
 
     #[test]

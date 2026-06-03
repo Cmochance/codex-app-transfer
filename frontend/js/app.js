@@ -956,6 +956,26 @@
         </div>
       </div>
     `;
+    refreshSummaryModelDatalist();
+  }
+
+  // web_fetch 摘要模型 (MOC-152): datalist 候选 = 当前映射里配置的模型值(去重去空)。
+  function refreshSummaryModelDatalist() {
+    const dl = $("#providerSummaryModelOptions");
+    if (!dl) return;
+    const vals = Array.from(
+      new Set(
+        Object.values(providerFormMappings || {})
+          .map((v) => String(v || "").trim())
+          .filter(Boolean),
+      ),
+    );
+    dl.innerHTML = vals.map((v) => `<option value="${escapeHtml(v)}"></option>`).join("");
+  }
+
+  function setSummaryModelField(value) {
+    const el = $("#providerSummaryModel");
+    if (el) el.value = value || "";
   }
 
   function setProviderMappings(mappings = {}, options = {}) {
@@ -1205,6 +1225,9 @@
     if (grokWebPayload) {
       payload.grokWeb = grokWebPayload;
     }
+    // web_fetch 网页摘要模型 (MOC-152):始终带上(含空串)——空串让后端 update 清除旧值、
+    // 回退 Default 映射模型;不带则清空操作丢失(见 api.js providerBody 注释)。
+    payload.summaryModel = $("#providerSummaryModel")?.value.trim() ?? "";
     return payload;
   }
 
@@ -2255,6 +2278,7 @@
     fillGrokWebFormFromProvider(null);
     setWebSearchRow(false, false, null);
     setProviderMappings(emptyMappings());
+    setSummaryModelField(""); // 新建/重置 → 清空摘要模型
   }
 
   function applyPresetToForm(preset, notify = true) {
@@ -2297,6 +2321,7 @@
     );
     providerAvailableModels = [];
     setProviderMappings(preset.models || emptyMappings());
+    setSummaryModelField(""); // preset 不带摘要模型 → 清空
     renderPresetOptions(preset, preset.models || emptyMappings());
     updatePresetSelection();
     if (notify) showToast(`${preset.name} ${t("toast.presetFilled")}`);
@@ -2357,6 +2382,7 @@
     );
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
+    setSummaryModelField(provider.summaryModel || ""); // 回填已配置的摘要模型
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
     updatePresetSelection();
     // [MOC-69] antigravity 自动拉模型列表,让映射选框立即显示 displayName(不必手点「获取模型」);
