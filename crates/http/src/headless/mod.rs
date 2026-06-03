@@ -113,7 +113,7 @@ impl HeadlessBrowser {
         // 独立临时 user-data-dir: 全新 profile, 不接管用户 Chrome、不弹窗。
         let seq = PROFILE_SEQ.fetch_add(1, Ordering::Relaxed);
         let profile_dir =
-            std::env::temp_dir().join(format!("cas-headless-{}-{seq}", std::process::id()));
+            std::env::temp_dir().join(format!("cat-headless-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&profile_dir)
             .map_err(|e| HeadlessError::Launch(format!("建临时 profile 失败: {e}")))?;
 

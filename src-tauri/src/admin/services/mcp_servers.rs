@@ -531,12 +531,12 @@ pub fn delete_server(name: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
-/// MOC-144 web_fetch MCP server 的固定 name(`[mcp_servers.cas-webfetch]`)。
-pub const WEB_FETCH_SERVER_NAME: &str = "cas-webfetch";
+/// MOC-144 web_fetch MCP server 的固定 name(`[mcp_servers.cat-webfetch]`)。
+pub const WEB_FETCH_SERVER_NAME: &str = "cat-webfetch";
 
 /// 按 `webFetchBackend` 档位注册/移除 transfer 自己的 web_fetch MCP server。
 ///
-/// - `off` / 未知 → 移除 `[mcp_servers.cas-webfetch]`
+/// - `off` / 未知 → 移除 `[mcp_servers.cat-webfetch]`
 /// - `curl` / `wreq` / `headless` → 注册(`command` = 本二进制绝对路径 + `--mcp-serve-webfetch`)
 ///
 /// 注:Codex 在启动时加载 `mcp_servers`,改档后需**重启 Codex Desktop** 才会重新加载 /

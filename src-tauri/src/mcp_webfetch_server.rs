@@ -19,7 +19,7 @@ use std::io::{BufRead, Write};
 use codex_app_transfer_http::WebFetchBackend;
 use serde_json::{json, Value};
 
-const SERVER_NAME: &str = "cas-webfetch";
+const SERVER_NAME: &str = "cat-webfetch";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// client 未给 protocolVersion 时的兜底(回显 client 的值更优, 见 spec)。
 const FALLBACK_PROTOCOL: &str = "2025-11-25";
@@ -38,7 +38,7 @@ pub fn run() {
         Ok(rt) => rt,
         Err(e) => {
             // exit(1) 而非 return: 让 Codex 从非 0 退出码识别"server 启动失败", 不当成正常退出。
-            eprintln!("[cas-webfetch] tokio runtime build 失败: {e}");
+            eprintln!("[cat-webfetch] tokio runtime build 失败: {e}");
             std::process::exit(1);
         }
     };
@@ -51,11 +51,11 @@ pub fn run() {
             // 单条非 UTF-8 坏行不该杀掉整个 server(io::Lines 在 Err 后可继续读下一行);
             // 真 IO 错误才退出, 否则一条畸形帧 = 本会话 web_fetch 全灭。
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                eprintln!("[cas-webfetch] 跳过非 UTF-8 stdin 行: {e}");
+                eprintln!("[cat-webfetch] 跳过非 UTF-8 stdin 行: {e}");
                 continue;
             }
             Err(e) => {
-                eprintln!("[cas-webfetch] stdin 读失败, 退出: {e}");
+                eprintln!("[cat-webfetch] stdin 读失败, 退出: {e}");
                 break;
             }
         };
@@ -66,7 +66,7 @@ pub fn run() {
         let req: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[cas-webfetch] JSON parse 失败: {e}");
+                eprintln!("[cat-webfetch] JSON parse 失败: {e}");
                 write_msg(&mut stdout, &rpc_error(Value::Null, -32700, "Parse error"));
                 continue;
             }
@@ -150,7 +150,7 @@ pub fn run() {
             }
         }
     }
-    eprintln!("[cas-webfetch] stdin closed, exiting");
+    eprintln!("[cat-webfetch] stdin closed, exiting");
 }
 
 /// 处理 `tools/call`。owned 参数, 避免跨 await 借用 req。
@@ -254,10 +254,10 @@ fn write_msg(out: &mut std::io::Stdout, msg: &Value) {
         Ok(s) => {
             // 写失败(EPIPE: Codex 关了 pipe / 磁盘满)记 stderr, 不静默吞。
             if let Err(e) = writeln!(out, "{s}").and_then(|_| out.flush()) {
-                eprintln!("[cas-webfetch] 写 stdout 失败: {e}");
+                eprintln!("[cat-webfetch] 写 stdout 失败: {e}");
             }
         }
-        Err(e) => eprintln!("[cas-webfetch] 消息序列化失败(逻辑 bug): {e}"),
+        Err(e) => eprintln!("[cat-webfetch] 消息序列化失败(逻辑 bug): {e}"),
     }
 }
 

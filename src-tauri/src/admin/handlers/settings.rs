@@ -456,7 +456,7 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
                     service.stop().await;
                 }
             }
-            // MOC-144:webFetchBackend 改了 → 注册/移除 [mcp_servers.cas-webfetch]。
+            // MOC-144:webFetchBackend 改了 → 注册/移除 [mcp_servers.cat-webfetch]。
             // 失败仅记日志(不阻塞 settings 保存);Codex 需重启才重新加载 mcp_servers。
             if let Some(backend) = web_fetch_changed {
                 if let Err(e) = crate::admin::services::mcp_servers::sync_web_fetch_server(&backend)
@@ -598,7 +598,7 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
             .unwrap_or_else(|| json!({}));
         sync_user_language_from_settings(&settings);
         // MOC-144:import 替换整 config 也可能改 webFetchBackend → 对齐
-        // [mcp_servers.cas-webfetch] 注册态(与 save_settings 对称;否则 import 含 headless
+        // [mcp_servers.cat-webfetch] 注册态(与 save_settings 对称;否则 import 含 headless
         // 的配置后, 工具要到下次启动 re-sync 才注册)。sync 幂等, 无条件调即可(已一致不写)。
         let backend = settings
             .get("webFetchBackend")
