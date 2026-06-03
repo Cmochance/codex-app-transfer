@@ -118,7 +118,7 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Kimi (Moonshot Platform / Kimi For Coding) | ✅ | ✅ | ✅ | Thinking 3-layer defense |
 | DeepSeek V4 (incl. Max thinking) | ✅ | ✅ | ✅ | Vision input stripped to avoid 400; xhigh → real max effort (#254) |
 | Xiaomi MiMo (Token Plan / Pay for Token) | ✅ | ✅ | ✅ | Image-only requests get space text-part fallback |
-| MiniMax M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` → user (v2.1.6 fix for 400) |
+| MiniMax M3 (1M) / M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` → user (v2.1.6 fix for 400); M3 context 1M; compact keeps tool-call args valid JSON (#356) |
 | Google AI Studio (`gemini_native`) | ✅ | ✅ | ✅ | Auto-selects Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` |
 | Google Gemini CLI OAuth | ✅ | ✅ | ✅ | Browser login once; no API key needed |
 | Anthropic Messages (custom Claude-compatible) | ✅ (PR #153) | ✅ (PR #153) | ✅ (PR #153) | `apiFormat=anthropic_messages`; Claude preset pending real validation |
@@ -224,6 +224,10 @@ v2.1.14 and earlier clamped `xhigh` / `max` to `high` for all providers (issue #
 ### MiniMax 400: `invalid message role: system (2013)`
 
 v2.1.5 and earlier did not convert `role=system` to `role=user`, causing MiniMax `/v1/chat/completions` to 400 the entire request. v2.1.6+ fixes this (closes #139): all `role=system` messages are converted to `role=user` with content prefixed by `[System]\n`.
+
+### MiniMax 400: `invalid function arguments json string` (during autocompact)
+
+During automatic context compaction, the proxy used to truncate oversized tool-call arguments by replacing `function.arguments` with a human-readable "shortened" notice, which violates the OpenAI chat protocol (`arguments` must be a valid JSON string), so strict upstreams like MiniMax returned `400 invalid params, invalid function arguments json string ... (2013)`. Fixed in #356: truncated `arguments` stays a valid JSON object, so compaction saves tokens without breaking the protocol.
 
 ### Upstream 404 / can't connect (Base URL includes the full endpoint)
 
