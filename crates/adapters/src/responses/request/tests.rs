@@ -313,6 +313,39 @@ fn minimax_sanitizes_invalid_tool_call_arguments_in_messages() {
 }
 
 #[test]
+fn minimax_m3_keeps_stream_options_but_m2_drops() {
+    // #356 用户实测病态对话根因:proxy 删 stream_options → MiniMax 不返 usage →
+    // Codex token 恒 0 → token-based auto-compact 失效 → 对话无限膨胀。M3 实测
+    // (2026-06-03)streaming + include_usage 稳定返真实 usage,必须保留;M2.x 仍删。
+    let mk = |model: &str| {
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })
+        .as_object()
+        .expect("json object")
+        .clone()
+    };
+    let mut m3 = mk("MiniMax-M3");
+    sanitize_minimax_chat_body(&mut m3);
+    assert_eq!(
+        m3.get("stream_options")
+            .and_then(|v| v.get("include_usage"))
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "M3 必须保留 stream_options.include_usage(否则 Codex token 恒 0、对话膨胀)"
+    );
+    let mut m2 = mk("MiniMax-M2.7");
+    sanitize_minimax_chat_body(&mut m2);
+    assert!(
+        !m2.contains_key("stream_options"),
+        "M2.x 仍删 stream_options(streaming 不稳定接受 include_usage)"
+    );
+}
+
+#[test]
 fn minimax_m3_keeps_system_and_standard_fields() {
     // 真机实测(2026-06-03,api.minimaxi.com 直连 MiniMax-M3):M3 原生接受
     // role=system / response_format / parallel_tool_calls(M2.x 同字段 400)。

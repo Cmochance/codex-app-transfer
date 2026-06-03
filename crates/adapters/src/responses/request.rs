@@ -1563,9 +1563,14 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
     // reasoning_split,让 thinking 单独进入 reasoning_details,避免塞进
     // content 的 <think>...</think> 里。
     body.insert("reasoning_split".into(), Value::Bool(true));
-    // MiniMax 的 OpenAI-compatible streaming 不稳定接受
-    // `stream_options.include_usage`;缺 usage 时响应转换层会补零值 usage。
-    body.remove("stream_options");
+    // M2.x 的 OpenAI-compatible streaming 不稳定接受 `stream_options.include_usage`,
+    // 删掉(响应转换层补零值 usage)。**M3 例外**:2026-06-03 真机实测 M3 streaming +
+    // include_usage 稳定返回真实 usage(total_tokens/prompt_tokens/completion_tokens),
+    // 必须保留——否则 Codex 收到的 token 恒 0,`auto_compact_token_limit`(context×80%)
+    // 永不触发,对话无限膨胀直到撞 MiniMax TPM 429(#356 用户实测病态对话根因)。
+    if !is_m3_plus {
+        body.remove("stream_options");
+    }
     merge_consecutive_system_messages(body);
     // **issue #139 修(2026-05-12)**:MiniMax M2.x /v1/chat/completions 不接受
     // role=system,400 invalid role。把 system 全转 user + [System]\n prefix。
