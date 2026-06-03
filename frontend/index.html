@@ -581,7 +581,10 @@
             </div>
           </div>
           <div class="settings-row settings-row-stack">
-            <strong data-i18n="settings.webFetchBackend">内置联网抓取工具（transfer 代抓网页）</strong>
+            <span class="settings-label-with-badge">
+              <strong data-i18n="settings.webFetchBackend">内置联网抓取工具（transfer 代抓网页）</strong>
+              <span class="new-badge" id="webFetchNewBadge" data-i18n="settings.newBadge" hidden>NEW</span>
+            </span>
             <div>
               <div class="segmented webfetch-segment" id="webFetchBackend" role="radiogroup" aria-label="web fetch backend">
                 <button class="btn active" type="button" data-webfetch="off" data-i18n="settings.webFetchBackend.off">关闭</button>
