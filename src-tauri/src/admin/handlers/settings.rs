@@ -393,6 +393,13 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .and_then(|s| s.get("autoUnlockCodexPlugins"))
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        // MOC-144:记下 webFetchBackend 旧值, 真变了才在写后注册/移除 mcp_server。
+        let old_web_fetch = cfg
+            .get("settings")
+            .and_then(|s| s.get("webFetchBackend"))
+            .and_then(Value::as_str)
+            .unwrap_or("off")
+            .to_string();
         let s = ensure_settings_object(cfg);
         if let Some(obj) = input.as_object() {
             for (k, v) in obj {
@@ -410,14 +417,21 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let auto_unlock_changed = (new_auto_unlock != old_auto_unlock).then_some(new_auto_unlock);
+        let new_web_fetch = settings
+            .get("webFetchBackend")
+            .and_then(Value::as_str)
+            .unwrap_or("off")
+            .to_string();
+        let web_fetch_changed = (new_web_fetch != old_web_fetch).then_some(new_web_fetch);
         Ok(ConfigMutation::Modified((
             settings,
             portable_changed,
             auto_unlock_changed,
+            web_fetch_changed,
         )))
     });
     match result {
-        Ok((settings, portable_changed, auto_unlock_changed)) => {
+        Ok((settings, portable_changed, auto_unlock_changed, web_fetch_changed)) => {
             // #262:settings.language 改动后 hot reload 到 adapters 全局,
             // 让接下来的 prompt 注入跟新语言一致(用户切语言无需重启 transfer)。
             sync_user_language_from_settings(&settings);
@@ -440,6 +454,16 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
                     service.start();
                 } else {
                     service.stop().await;
+                }
+            }
+            // MOC-144:webFetchBackend 改了 → 注册/移除 [mcp_servers.cas-webfetch]。
+            // 失败仅记日志(不阻塞 settings 保存);Codex 需重启才重新加载 mcp_servers。
+            if let Some(backend) = web_fetch_changed {
+                if let Err(e) = crate::admin::services::mcp_servers::sync_web_fetch_server(&backend)
+                {
+                    // error 级: 用户当面改了设置但注册到 Codex 失败 = 会产生支持工单的静默
+                    // 不一致;startup re-sync 会在下次 transfer 启动时幂等重试补偿。
+                    tracing::error!("sync web_fetch mcp_server 失败(下次启动重试): {e}");
                 }
             }
             Json(json!({"success": true, "settings": settings})).into_response()

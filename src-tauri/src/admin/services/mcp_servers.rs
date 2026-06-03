@@ -531,6 +531,73 @@ pub fn delete_server(name: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
+/// MOC-144 web_fetch MCP server 的固定 name(`[mcp_servers.cas-webfetch]`)。
+pub const WEB_FETCH_SERVER_NAME: &str = "cas-webfetch";
+
+/// 按 `webFetchBackend` 档位注册/移除 transfer 自己的 web_fetch MCP server。
+///
+/// - `off` / 未知 → 移除 `[mcp_servers.cas-webfetch]`
+/// - `curl` / `wreq` / `headless` → 注册(`command` = 本二进制绝对路径 + `--mcp-serve-webfetch`)
+///
+/// 注:Codex 在启动时加载 `mcp_servers`,改档后需**重启 Codex Desktop** 才会重新加载 /
+/// 卸载本 server;但后端档位(curl/wreq/headless)是 server 每次 `tools/call` 时读
+/// config.json 当前值, 在 server 已加载的前提下切档无需重启。
+pub fn sync_web_fetch_server(backend: &str) -> Result<(), String> {
+    let active = matches!(
+        backend.trim().to_ascii_lowercase().as_str(),
+        "curl" | "wreq" | "headless"
+    );
+    // 幂等: 先看现状, 已是目标态就不写(避免无谓重写 config.toml 触发 Codex "modified",
+    // MOC-115)。startup re-sync 每次启动都调, 必须幂等。
+    // list_servers() 的读错误要传播, 不能 .ok() 吞掉 —— 否则 off 分支会因"读不到"
+    // 当成"不存在"跳过 delete, 残留 server 还谎报成功(关不掉)。
+    let existing = list_servers()?
+        .into_iter()
+        .find(|s| s.name == WEB_FETCH_SERVER_NAME);
+    if !active {
+        if existing.is_some() {
+            delete_server(WEB_FETCH_SERVER_NAME)?;
+        }
+        return Ok(());
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("拿不到自身可执行路径: {e}"))?
+        .to_string_lossy()
+        .to_string();
+    let want_args = vec!["--mcp-serve-webfetch".to_string()];
+    if let Some(e) = &existing {
+        if e.enabled
+            && e.command.as_deref() == Some(exe.as_str())
+            && e.args.as_ref() == Some(&want_args)
+        {
+            return Ok(()); // 已注册且与目标一致, 不重写
+        }
+    }
+    let spec = McpServerSpec {
+        name: WEB_FETCH_SERVER_NAME.to_string(),
+        transport: McpTransport::Stdio,
+        command: Some(exe),
+        args: Some(want_args),
+        env: None,
+        cwd: None,
+        url: None,
+        bearer_token_env_var: None,
+        http_headers: None,
+        env_http_headers: None,
+        enabled: true,
+        required: false,
+        supports_parallel_tool_calls: false,
+        experimental_environment: None,
+        startup_timeout_sec: Some(15),
+        // headless 冷启动 chrome + 渲染可能 >30s, 给宽松些。
+        tool_timeout_sec: Some(120),
+        default_tools_approval_mode: None,
+        enabled_tools: None,
+        disabled_tools: None,
+    };
+    upsert_server(&spec)
+}
+
 // ── history snapshot:整个 config.toml 全文进 history(以便完整 rollback) ──
 
 pub fn read_history() -> Vec<HistoryEntry> {

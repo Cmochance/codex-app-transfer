@@ -7,6 +7,7 @@ mod admin;
 mod codex_plugin_unlocker;
 mod codex_real_account;
 mod codex_theme_injector;
+mod mcp_webfetch_server;
 mod proxy_runner;
 mod system_proxy;
 mod telemetry_bridge;
@@ -29,6 +30,13 @@ use tower::ServiceExt;
 use admin::{build_app_router, handlers, AdminState};
 
 fn main() {
+    // MCP stdio server 模式 (MOC-144): Codex 把本二进制作为 mcp_server spawn 时带
+    // `--mcp-serve-webfetch`。必须在任何可能写 stdout 的初始化(含 telemetry)之前分流 ——
+    // MCP stdio 要求 stdout 只能是 JSON-RPC 消息, 且此模式不启 Tauri window。
+    if std::env::args().any(|a| a == "--mcp-serve-webfetch") {
+        mcp_webfetch_server::run();
+        return;
+    }
     // 必须在所有可能 emit tracing event 的代码之前 init,否则 startup 阶段
     // (registry healing / desktop apply / proxy 拉起)的 tracing event 会被 drop。
     telemetry_bridge::init_global_subscriber();
@@ -200,6 +208,26 @@ fn main() {
                 // 前 emit 丢失,见 chatgpt-codex-connector P2),改由前端 load 时轮询
                 // `GET /api/desktop/mcp-credentials/status` 决定是否弹确认。
                 let _ = handlers::desktop::mcp_credentials_startup_sync("startup");
+
+                // MOC-144:启动时把 web_fetch MCP server 注册态对齐当前 webFetchBackend
+                // (config 已是某后端但还没注册过 → 补注册;off → 移除)。幂等:已一致则
+                // 不写 config.toml。Codex 需重启才会加载/卸载该 server。
+                {
+                    let backend = codex_app_transfer_registry::config_file()
+                        .and_then(|p| codex_app_transfer_registry::load_raw_config(&p).ok())
+                        .and_then(|c| {
+                            c.get("settings")
+                                .and_then(|s| s.get("webFetchBackend"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_else(|| "off".to_string());
+                    if let Err(e) =
+                        crate::admin::services::mcp_servers::sync_web_fetch_server(&backend)
+                    {
+                        tracing::warn!("startup sync web_fetch mcp_server 失败: {e}");
+                    }
+                }
 
                 // [MOC-104 req#2/#5 启动调谐] **必须在 auto_apply 落盘之后**才跑 —— 否则
                 // 跟 auto_apply 抢写 `~/.codex/auth.json`:reconcile 先跑会看到上次退出
