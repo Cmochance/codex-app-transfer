@@ -33,6 +33,12 @@ const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 /// 平衡点。若未来开 UI/CLI 配置入口,改 caller 传值,这条常量做 fallback。
 pub const TRASH_RETENTION_DAYS: u64 = 30;
 
+/// recovery/ 保留上限。`move_stale_active_snapshots_to_recovery` 每次 apply 都会
+/// 把上个 session 遗留的 active 快照搬进 recovery/ 当安全存档;若不封顶会无上限
+/// 累积(#268 残留扫描越来越慢 + 污染样本长期留存)。保留最近 N 份足够覆盖
+/// "崩溃/强退后想恢复上次原配置"的实际诉求(配合内容去重,N 份都是不同内容)。
+const MAX_RECOVERY_SNAPSHOTS: usize = 5;
+
 static CURRENT_SESSION_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -639,10 +645,85 @@ fn move_stale_active_snapshots_to_recovery(paths: &CodexPaths) -> Result<(), Cod
         }
         move_snapshot_dir_to_recovery(paths, &dir)?;
     }
+    // 每次 apply 顺手封顶 recovery/(也清理修复前积压的历史无上限存量)。
+    // best-effort:纯 GC,失败不冒泡阻断 apply(见 prune_recovery_snapshots)。
+    prune_recovery_snapshots(paths);
     Ok(())
 }
 
+/// 读单个文件用于去重比对,**区分"文件不存在"和"读失败"**:
+/// - 不存在(`NotFound`)→ `Some(None)`(合法的"空内容")
+/// - 存在且读成功 → `Some(Some(s))`
+/// - 存在但读失败(I/O / 权限)→ `None`(内容**不可判定**)
+///
+/// 这是 BUG-fix(MOC-148 review IMPORTANT#2):旧实现用 `.ok()` 把读失败和
+/// 不存在都折叠成 `None`,极端下会让"内容其实不同但读失败"的 stale active 被
+/// 误判为与某份"空"备份重复 → 删掉唯一副本(违反"不主动破坏性降级")。
+fn read_dedup_field(path: &Path) -> Option<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// 读快照 dir 的内容(config.toml + auth.json)用于备份去重。
+/// **不含 manifest.json**(其 timestamp/session_id/snapshot_id 每份都不同)。
+/// 任一文件"存在但读失败"→ 返回 `None`(内容不可判定,调用方据此保守不去重)。
+fn snapshot_content_for_dedup(dir: &Path) -> Option<(Option<String>, Option<String>)> {
+    let config = read_dedup_field(&config_path(dir))?;
+    let auth = read_dedup_field(&auth_path(dir))?;
+    Some((config, auth))
+}
+
+/// recovery/ 是否已存在与 `dir` 内容(config + auth)完全相同的备份。
+///
+/// 保守语义:`dir` 自身内容读不出(不可判定)→ 直接返回 `false`(当作非重复、
+/// 保留),绝不因"读不出"去删唯一副本;某份 recovery 读不出 → 该份不参与匹配。
+fn recovery_has_content_duplicate(paths: &CodexPaths, dir: &Path) -> bool {
+    let Some(target) = snapshot_content_for_dedup(dir) else {
+        return false;
+    };
+    snapshot_dirs_under(&paths.recovery_snapshots_dir)
+        .iter()
+        .any(|rec| snapshot_content_for_dedup(rec).as_ref() == Some(&target))
+}
+
+/// recovery/ 只保留最近 [`MAX_RECOVERY_SNAPSHOTS`] 份,其余物理删除。
+///
+/// 目录名形如 `20260603T210740197-pNNNN`,固定宽度时间戳前缀 → 字典序即时间序;
+/// 按名降序排,保留最新的前 N 份。
+///
+/// **best-effort**(MOC-148 review IMPORTANT#1):这是纯 GC,单个目录删失败
+/// (并发进程占用 / 权限 / 半删残留)只 warn 跳过,**绝不冒泡**——否则会让
+/// 调用链顶端的 `apply_provider` 整体失败(快照本身已成功,失败的只是清旧)。
+/// 与同文件 `gc_trash_older_than` 既有约定一致。
+fn prune_recovery_snapshots(paths: &CodexPaths) {
+    let mut dirs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+    if dirs.len() <= MAX_RECOVERY_SNAPSHOTS {
+        return;
+    }
+    dirs.sort_by_key(|d| std::cmp::Reverse(dir_name(d)));
+    for dir in dirs.into_iter().skip(MAX_RECOVERY_SNAPSHOTS) {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(
+                target: "codex_integration::snapshot",
+                dir = %dir.display(),
+                error = %e,
+                "prune recovery snapshot failed; skipping (best-effort GC)",
+            );
+        }
+    }
+}
+
 fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), CodexError> {
+    // 备份去重:recovery/ 已有内容(config+auth)相同的备份时,直接丢弃这份 stale
+    // active,不再存一份重复内容(用户要求:备份时字段比对,不留重复)。
+    if recovery_has_content_duplicate(paths, dir) {
+        std::fs::remove_dir_all(dir)?;
+        return Ok(());
+    }
+
     let fallback = dir_name(dir).unwrap_or_else(|| current_session_id().to_owned());
     let manifest = read_manifest_from_dir(dir)
         .map(|m| normalize_manifest(m, &fallback, &fallback))
@@ -1022,6 +1103,159 @@ mod tests {
         assert!(snapshots
             .iter()
             .any(|s| s.kind == "recovery" && s.id == "old-session"));
+    }
+
+    // ── MOC-148 搭车:recovery/ 去重 + 上限 ────────────────────────────
+
+    fn mk_manifest(id: &str) -> SnapshotManifest {
+        SnapshotManifest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id: id.to_owned(),
+            session_id: id.to_owned(),
+            snapshot_at: "2026-06-01T00:00:00".to_owned(),
+            config_existed: true,
+            auth_existed: false,
+            app_version: "v".to_owned(),
+            provider_name: None,
+            electron_status_section_pre_value: None,
+            electron_status_section_capture_failed: false,
+        }
+    }
+
+    fn seed_recovery(paths: &CodexPaths, name: &str, config: &str, auth: Option<&str>) -> PathBuf {
+        let dir = paths.recovery_snapshots_dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(config_path(&dir), config).unwrap();
+        if let Some(a) = auth {
+            std::fs::write(auth_path(&dir), a).unwrap();
+        }
+        write_manifest_to_dir(&dir, &mk_manifest(name)).unwrap();
+        dir
+    }
+
+    /// 备份去重:recovery/ 已有内容(config+auth)相同的备份时,stale active 被丢弃,
+    /// 不再新增一份重复内容。
+    #[test]
+    fn move_to_recovery_skips_content_duplicate() {
+        let (_t, paths) = paths_with_tmp();
+        seed_recovery(
+            &paths,
+            "20260601T000000000-p1",
+            "openai_base_url = \"X\"\n",
+            Some("{\"k\":\"A\"}"),
+        );
+
+        let stale = paths.active_snapshots_dir.join("dup-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("dup-session")).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists(), "重复内容的 stale active 应被丢弃");
+        let recs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+        assert_eq!(recs.len(), 1, "内容重复不应新增 recovery: {recs:?}");
+    }
+
+    /// 内容不同(哪怕只差一个字段)→ 视为新备份,保留。
+    #[test]
+    fn move_to_recovery_keeps_distinct_content() {
+        let (_t, paths) = paths_with_tmp();
+        seed_recovery(
+            &paths,
+            "20260601T000000000-p1",
+            "openai_base_url = \"X\"\n",
+            None,
+        );
+
+        let stale = paths.active_snapshots_dir.join("diff-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"Y\"\n").unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("diff-session")).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists());
+        let recs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+        assert_eq!(recs.len(), 2, "不同内容应新增 recovery: {recs:?}");
+    }
+
+    /// 两份都"真"没有 config/auth(NotFound,合法空原始态)→ 内容相同 → 视为重复。
+    /// (区别于"文件存在但读失败"——那种 `snapshot_content_for_dedup` 返 None,
+    /// `recovery_has_content_duplicate` 保守判非重复、保留,见 IMPORTANT#2 修复。)
+    #[test]
+    fn move_to_recovery_treats_both_genuinely_empty_as_duplicate() {
+        let (_t, paths) = paths_with_tmp();
+        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&existing).unwrap();
+        write_manifest_to_dir(&existing, &mk_manifest("existing")).unwrap();
+
+        let stale = paths.active_snapshots_dir.join("empty-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("empty-session")).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists(), "两份都(真)空 → 视为重复,stale 丢弃");
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            1,
+            "空内容重复不应新增 recovery"
+        );
+    }
+
+    /// 上限:超过 MAX_RECOVERY_SNAPSHOTS 时只保留最新 N 份(按时间戳目录名)。
+    #[test]
+    fn prune_recovery_caps_to_max_keeping_newest() {
+        let (_t, paths) = paths_with_tmp();
+        let total = MAX_RECOVERY_SNAPSHOTS + 2; // 7
+        for i in 0..total {
+            // day (i+1):20260601 .. 20260607,字典序==时间序,内容各不同
+            let name = format!("2026060{}T120000000-p{i}", i + 1);
+            seed_recovery(&paths, &name, &format!("v = {i}\n"), None);
+        }
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            total
+        );
+
+        prune_recovery_snapshots(&paths);
+
+        let remaining = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+        assert_eq!(remaining.len(), MAX_RECOVERY_SNAPSHOTS, "应封顶到 N 份");
+        let names: Vec<String> = remaining.iter().filter_map(|d| dir_name(d)).collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("20260601T")),
+            "最旧(day1)应被删: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("20260602T")),
+            "次旧(day2)应被删: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("20260607T")),
+            "最新(day7)应保留: {names:?}"
+        );
+    }
+
+    /// prune 在 snapshot_codex_state(每次 apply)里被触发 → 历史无上限积压会被收敛。
+    #[test]
+    fn snapshot_codex_state_prunes_existing_recovery_backlog() {
+        let (_t, paths) = paths_with_tmp();
+        for i in 0..(MAX_RECOVERY_SNAPSHOTS + 3) {
+            let name = format!("2026053{}T120000000-p{i}", i); // 20260530..,内容各异
+            seed_recovery(&paths, &name, &format!("v = {i}\n"), None);
+        }
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
+
+        snapshot_codex_state(&paths, "v-new", "New", true).unwrap();
+
+        assert!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
+            "apply 时应把积压 recovery 收敛到上限内"
+        );
     }
 
     /// Devin Review BUG-004 防回归:pre-v3 (schema_version=2) 的 stale active
