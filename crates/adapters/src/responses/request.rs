@@ -1887,6 +1887,16 @@ fn split_string_by_char_limit(input: &str, max_chars: usize) -> Vec<String> {
 }
 
 fn sanitize_minimax_tools(body: &mut Map<String, Value>) {
+    // M2.x 用经典 OpenAI tool schema、不接受 strict function-calling 元数据,剥掉。
+    // M3 例外:2026-06-03 真机实测 M3 接受 `function.strict:true`(200 + 正常发起
+    // tool_call),保留以获得严格 schema 输出保证(剥掉是功能损失)。
+    let is_m3_plus = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().starts_with("minimax-m3"));
+    if is_m3_plus {
+        return;
+    }
     let Some(Value::Array(tools)) = body.get_mut("tools") else {
         return;
     };
@@ -1894,8 +1904,6 @@ fn sanitize_minimax_tools(body: &mut Map<String, Value>) {
         let Some(function) = tool.get_mut("function").and_then(|v| v.as_object_mut()) else {
             continue;
         };
-        // MiniMax tool examples use the classic OpenAI tool schema and do not
-        // accept OpenAI strict function-calling metadata.
         function.remove("strict");
     }
 }

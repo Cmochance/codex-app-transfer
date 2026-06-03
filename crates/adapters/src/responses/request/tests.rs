@@ -313,6 +313,35 @@ fn minimax_sanitizes_invalid_tool_call_arguments_in_messages() {
 }
 
 #[test]
+fn minimax_m3_keeps_tool_strict_but_m2_drops() {
+    // 真机实测(2026-06-03):M3 接受 OpenAI strict function-calling(strict:true →
+    // 200 + 正常 tool_call);M2.x 不接受、剥掉。strict 是严格 schema 输出保证。
+    let mk = |model: &str| {
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "strict": true, "parameters": {"type": "object", "properties": {}}}}]
+        })
+        .as_object()
+        .expect("json object")
+        .clone()
+    };
+    let mut m3 = mk("MiniMax-M3");
+    sanitize_minimax_chat_body(&mut m3);
+    assert_eq!(
+        m3["tools"][0]["function"].get("strict").and_then(|v| v.as_bool()),
+        Some(true),
+        "M3 应保留 tool function.strict(实测接受)"
+    );
+    let mut m2 = mk("MiniMax-M2.7");
+    sanitize_minimax_chat_body(&mut m2);
+    assert!(
+        m2["tools"][0]["function"].get("strict").is_none(),
+        "M2.x 应剥 tool function.strict"
+    );
+}
+
+#[test]
 fn minimax_m3_keeps_stream_options_but_m2_drops() {
     // #356 用户实测病态对话根因:proxy 删 stream_options → MiniMax 不返 usage →
     // Codex token 恒 0 → token-based auto-compact 失效 → 对话无限膨胀。M3 实测
