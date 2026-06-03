@@ -583,15 +583,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "castaway"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -741,7 +732,6 @@ dependencies = [
 name = "codex-app-transfer-adapters"
 version = "0.1.0"
 dependencies = [
- "axum",
  "base64 0.22.1",
  "bytes",
  "codex-app-transfer-gemini-oauth",
@@ -757,7 +747,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 
@@ -784,7 +773,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "tracing",
  "trash",
  "zip",
 ]
@@ -830,10 +818,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tokio-tungstenite 0.29.0",
- "tower",
- "tower-http",
  "tracing",
 ]
 
@@ -843,7 +828,6 @@ version = "0.1.0"
 dependencies = [
  "indexmap 2.14.0",
  "once_cell",
- "pretty_assertions",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -854,15 +838,12 @@ dependencies = [
 name = "codex-app-transfer-usage-tracker"
 version = "0.1.0"
 dependencies = [
- "compact_str",
  "jiff",
  "memchr",
  "rustc-hash",
  "serde",
  "serde_json",
  "smallvec",
- "tempfile",
- "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -880,20 +861,6 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
-]
-
-[[package]]
-name = "compact_str"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fdb1325a1cece981e8a296ab8f0f9b63ae357bd0784a9faaf548cc7b480707a"
-dependencies = [
- "castaway",
- "cfg-if",
- "itoa",
- "rustversion",
- "ryu",
- "static_assertions",
 ]
 
 [[package]]
@@ -1217,12 +1184,6 @@ dependencies = [
  "rustc_version",
  "syn 2.0.117",
 ]
-
-[[package]]
-name = "diff"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "digest"
@@ -3640,16 +3601,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
-name = "pretty_assertions"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
-dependencies = [
- "diff",
- "yansi",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4666,12 +4617,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
 name = "string_cache"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5365,17 +5310,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-stream"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "tokio-tungstenite"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5591,7 +5525,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -7032,12 +6965,6 @@ dependencies = [
  "serde_json",
  "sha2",
 ]
-
-[[package]]
-name = "yansi"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"

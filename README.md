@@ -117,7 +117,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Kimi(Moonshot Platform / Kimi For Coding) | ✅ | ✅ | ✅ | thinking 三层防御 |
 | DeepSeek V4(含 Max 思维) | ✅ | ✅ | ✅ | 视觉输入剥离避免 400;xhigh → max 真实到达(#254) |
 | Xiaomi MiMo(Token Plan / Pay for Token) | ✅ | ✅ | ✅ | 纯图请求兜底空格 text part |
-| MiniMax M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` 转 user 防 400(v2.1.6) |
+| MiniMax M3(1M)/ M2.x / Text-01 | ✅ | ✅ | ✅ | `role=system` 转 user 防 400(v2.1.6);M3 上下文 1M;compact 截断工具参数保持合法 JSON(#356) |
 | Google AI Studio(`gemini_native`) | ✅ | ✅ | ✅ | Gemini 3 `/v1alpha` + Gemini 2.x `/v1beta` 自动选 |
 | Google Gemini CLI OAuth | ✅ | ✅ | ✅ | 浏览器登录 Google 一次,免 API key |
 | Anthropic Messages(custom Claude-compatible) | ✅(PR #153) | ✅(PR #153) | ✅(PR #153) | `apiFormat=anthropic_messages`,Claude preset 待真实验证后开放 |
@@ -223,6 +223,10 @@ v2.1.14 及之前会把 `xhigh` / `max` 一刀切降级到 `high`(issue #254)。
 ### MiniMax 400:`invalid message role: system (2013)`
 
 v2.1.5 及之前的版本未把 `role=system` 转 `role=user`,导致 MiniMax `/v1/chat/completions` 整请求 400。v2.1.6+ 已修(close #139),所有 `role=system` 消息转 `role=user` + content 前置 `[System]\n` marker。
+
+### MiniMax 400:`invalid function arguments json string`(自动压缩时)
+
+自动上下文压缩(autocompact)时,代理裁剪超长工具调用参数曾把 `function.arguments` 替换成人类可读的"已截断"说明文本,违反 OpenAI chat 协议(`arguments` 必须是合法 JSON 字符串),MiniMax 严格校验返回 `400 invalid params, invalid function arguments json string ... (2013)`。已修(#356):截断后 `arguments` 仍是合法 JSON object,压缩省 token 不再破坏协议。
 
 ### 上游 404 / 连不上(Base URL 填了完整 endpoint)
 

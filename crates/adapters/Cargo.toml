@@ -14,7 +14,6 @@ codex-app-transfer-registry = { path = "../registry" }
 # 缺失时直接从 ~/.codex-app-transfer/gemini-oauth.json 读 project_id(token 文件
 # 是 single source of truth,避免 sync_to_active_provider race 让 chat 路径全 fail)
 codex-app-transfer-gemini-oauth = { path = "../gemini_oauth" }
-axum = { version = "0.8", default-features = false, features = ["http1"] }
 bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"
@@ -22,7 +21,6 @@ http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio-stream = "0.1"
 # rusqlite 用 bundled feature 自带 SQLite 静态库 — 避免依赖系统 libsqlite3
 # (Windows / macOS / Linux 三平台一致),代价是编译产物 +~1.5MB,可接受。
 rusqlite = { version = "0.32", features = ["bundled"] }

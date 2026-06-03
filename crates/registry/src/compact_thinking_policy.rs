@@ -260,6 +260,13 @@ pub fn compact_disable_thinking_wire(model: &str) -> Option<DisableThinkingWire>
 //   match arm 的解释注释。reasoner alias 历史是 thinking-only 模型,
 //   disable 行为存疑;chat alias 是 non-thinking,disable 是 no-op。
 //   两个 alias 都不收,只收 `deepseek-v4-pro` / `deepseek-v4-flash` 实名。
+// - `MiniMax-M3` —— MiniMax preset 新 default(1M context,#356)。
+//   OpenRouter 抽象层(`openrouter.ai/minimax/minimax-m3`)暴露统一
+//   `reasoning` 参数(可 toggle),但本项目走**直连**(api.minimaxi.com),
+//   直连 API 的 disable-thinking wire 缺官方文档 + 真机实证;同系列
+//   `MiniMax-M2.7` 直连已知不支持 disable(见上方无解类)。保守按未实证
+//   处理:不注入(走 current behavior,功能不崩),待 M3 直连真机数据或
+//   issue 触发再定派别。
 //
 // === 未列入但应该归类的模型(future PR 或用户上报触发)===
 //
@@ -382,8 +389,9 @@ mod tests {
 
     #[test]
     fn minimax_returns_none_unsupported_disable() {
-        // MiniMax M2.x 故意不入表 —— 上游不支持 disable,无解
-        for m in ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2"] {
+        // MiniMax M2.x 故意不入表(上游不支持 disable,无解);M3 直连 disable
+        // wire 缺真机实证,按未实证保守不入表 —— 两者都应返回 None。
+        for m in ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2", "MiniMax-M3"] {
             assert!(
                 compact_disable_thinking_wire(m).is_none(),
                 "MiniMax {m} 必须返回 None(无 disable wire,见模块顶部决策锚点)"
