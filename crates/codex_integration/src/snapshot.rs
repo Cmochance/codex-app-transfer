@@ -184,6 +184,68 @@ pub fn get_snapshot_status(paths: &CodexPaths) -> SnapshotStatus {
 }
 
 /// 首次 apply 前调用。已存在快照则直接返回当前 manifest。
+/// 读当前 `~/.codex/.codex-global-state.json` 里 context-usage atom 的原值,返回
+/// `(pre_value, capture_failed)`(三态语义见 [`SnapshotManifest`])。snapshot 在
+/// apply 写 atom **之前**调,所以这里读到的是 user 写入前的原值。
+///
+/// BUG-003:atom 被手改 / 未来 Codex 改成非 boolean → `as_bool()` 返 None,不能误当
+/// "原本无字段"(restore 会 remove 误删),显式 mark capture_failed 防 silent loss。
+fn capture_context_usage_pre_value(paths: &CodexPaths) -> (Option<bool>, bool) {
+    match crate::electron_state::read_atom(
+        &paths.electron_global_state,
+        crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
+    ) {
+        Ok(Some(v)) => match v.as_bool() {
+            Some(b) => (Some(b), false),
+            None => {
+                tracing::warn!(
+                    target: "codex_integration::snapshot",
+                    path = %paths.electron_global_state.display(),
+                    value = %v,
+                    "context-usage atom is not a boolean; marking capture as failed \
+                     to avoid silent loss on restore",
+                );
+                (None, true)
+            }
+        },
+        Ok(None) => (None, false),
+        Err(e) => {
+            tracing::warn!(
+                target: "codex_integration::snapshot",
+                path = %paths.electron_global_state.display(),
+                error = %e,
+                "snapshot pre-value capture failed for context-usage atom; \
+                 restore will skip atom touching to avoid silent loss",
+            );
+            (None, true)
+        }
+    }
+}
+
+/// 复用已存在的 active / legacy snapshot manifest。若它是 `< SNAPSHOT_SCHEMA_VERSION`
+/// 的旧版本(没追踪 context-usage atom,或追踪的是已废旧 key),则**重新捕获**当前
+/// (apply 写 atom 之前)的 atom 原值、升到当前 schema 后回写。
+///
+/// [MOC-123 / PR #360 P2] 为什么必须升级而不是原样复用:apply 之后会无条件写
+/// `show-context-window-usage` atom,而 restore 现在跳过所有 `< 4` manifest —— 若复用的
+/// 旧 manifest 不升级,写进去的 atom 就**没有可 restore 的 pre-value**,transfer 退出
+/// 时清不掉、永久留在 user global-state(破坏"退出恢复 Codex 默认")。升级前的旧
+/// transfer 只写过旧 key,所以此刻读到的新 key 值就是 user 的真实原值,捕获正确。
+fn reuse_manifest_upgrading_atom(
+    paths: &CodexPaths,
+    dir: &Path,
+) -> Result<SnapshotManifest, CodexError> {
+    let mut manifest = read_manifest_from_dir(dir)?;
+    if manifest.schema_version < SNAPSHOT_SCHEMA_VERSION {
+        let (pre_value, capture_failed) = capture_context_usage_pre_value(paths);
+        manifest.electron_status_section_pre_value = pre_value;
+        manifest.electron_status_section_capture_failed = capture_failed;
+        manifest.schema_version = SNAPSHOT_SCHEMA_VERSION;
+        write_manifest_to_dir(dir, &manifest)?;
+    }
+    Ok(manifest)
+}
+
 pub fn snapshot_codex_state(
     paths: &CodexPaths,
     app_version: &str,
@@ -193,10 +255,10 @@ pub fn snapshot_codex_state(
 
     let current_dir = current_active_snapshot_dir(paths);
     if manifest_path(&current_dir).exists() {
-        return read_manifest_from_dir(&current_dir);
+        return reuse_manifest_upgrading_atom(paths, &current_dir);
     }
     if paths.snapshot_manifest.exists() {
-        return read_manifest_from_dir(&paths.snapshot_dir);
+        return reuse_manifest_upgrading_atom(paths, &paths.snapshot_dir);
     }
     std::fs::create_dir_all(&current_dir)?;
 
@@ -227,39 +289,7 @@ pub fn snapshot_codex_state(
     // 但 restore 路径会 short-circuit"不动 atom"(见 apply.rs restore 改动)。
     // 这里用 capture-failed sentinel 区分清楚两种 None。
     let (electron_status_section_pre_value, electron_status_section_capture_failed) =
-        match crate::electron_state::read_atom(
-            &paths.electron_global_state,
-            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-        ) {
-            // Devin Review BUG-003 fix:atom 可能被 user 手动 / 未来 Codex Desktop
-            // 写成非 boolean(number / string),`as_bool()` 返 None 会被误当成
-            // "原本无字段" → restore 走 remove 误删 user 真实值。改成显式 mark
-            // capture_failed 防 silent loss。
-            Ok(Some(v)) => match v.as_bool() {
-                Some(b) => (Some(b), false),
-                None => {
-                    tracing::warn!(
-                        target: "codex_integration::snapshot",
-                        path = %paths.electron_global_state.display(),
-                        value = %v,
-                        "status-section atom is not a boolean; marking capture as failed \
-                         to avoid silent loss on restore",
-                    );
-                    (None, true)
-                }
-            },
-            Ok(None) => (None, false),
-            Err(e) => {
-                tracing::warn!(
-                    target: "codex_integration::snapshot",
-                    path = %paths.electron_global_state.display(),
-                    error = %e,
-                    "snapshot pre-value capture failed for status-section atom; \
-                     restore will skip atom touching to avoid silent loss",
-                );
-                (None, true)
-            }
-        };
+        capture_context_usage_pre_value(paths);
 
     let session_id = current_session_id().to_owned();
     let manifest = SnapshotManifest {
@@ -1024,6 +1054,45 @@ mod tests {
             recovery_manifest.electron_status_section_capture_failed,
             "pre-v3 manifest 升 v3 时必须 mark capture_failed=true(防 manual restore 误删 user atom)"
         );
+    }
+
+    /// [MOC-123 / PR #360 P2] reuse 一个 legacy v3 manifest 时必须升到 v4 并重新捕获
+    /// 当前 atom 原值。否则 apply 随后无条件写的 `show-context-window-usage` 没有可
+    /// restore 的 pre-value(restore 跳过 `< 4` manifest)→ transfer 退出时清不掉。
+    /// 这里验证 user 原本无 atom 的常见场景:升级后 pre_value=None + schema v4 + 落盘,
+    /// 后续 restore 据此 remove 干净(恢复 Codex 默认)。
+    #[test]
+    fn reuse_upgrades_legacy_v3_manifest_and_recaptures_atom() {
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.snapshot_dir).unwrap();
+        let v3 = serde_json::json!({
+            "schema_version": 3,
+            "snapshot_id": "legacy-v3",
+            "session_id": "legacy-v3",
+            "snapshot_at": "2026-06-01T00:00:00",
+            "config_existed": false,
+            "auth_existed": false,
+            "app_version": "v-old",
+            "provider_name": "Old",
+            // v3 追踪的是旧 key,新 key 视角下没捕获;且 user 原本无新 key atom
+            "electron_status_section_pre_value": null,
+            "electron_status_section_capture_failed": false
+        });
+        std::fs::write(manifest_path(&paths.snapshot_dir), v3.to_string()).unwrap();
+
+        let upgraded = reuse_manifest_upgrading_atom(&paths, &paths.snapshot_dir).unwrap();
+        assert_eq!(
+            upgraded.schema_version, SNAPSHOT_SCHEMA_VERSION,
+            "legacy v3 manifest 复用时必须升到当前 schema(v4),否则写入的 atom 退出清不掉"
+        );
+        assert_eq!(
+            upgraded.electron_status_section_pre_value, None,
+            "user 原本无 atom → 重新捕获到 None(restore 会 remove,退出恢复 Codex 默认)"
+        );
+        assert!(!upgraded.electron_status_section_capture_failed);
+        // 落盘也已升级到 v4
+        let persisted = read_manifest_from_dir(&paths.snapshot_dir).unwrap();
+        assert_eq!(persisted.schema_version, SNAPSHOT_SCHEMA_VERSION);
     }
 
     #[test]
