@@ -172,6 +172,18 @@ cargo tauri build --bundles nsis,msi         # Windows x64
 cargo tauri build --bundles deb,appimage     # Linux x86_64
 ```
 
+### Pre-push gate (git hook)
+
+The repo ships a local `pre-push` gate (`.githooks/pre-push`) that mirrors CI's `rust-fast-check` lane, catching fmt / compile / unit-test failures locally before you push instead of waiting on CI. Install once per clone:
+
+```bash
+scripts/install-hooks.sh        # = git config core.hooksPath .githooks
+```
+
+Each `git push` then runs `cargo fmt --all -- --check` → `cargo check --workspace --exclude codex-app-transfer` → `cargo test --workspace --exclude codex-app-transfer` (`#[ignore]`d network tests stay off, so the gate never hits the network); non-main branches that are behind `origin/main` get a heads-up (so squash-merge isn't blocked by branch protection). Bypass temporarily with `git push --no-verify` (CI still enforces it).
+
+> This gate is the local tier of the "module update auto-check" mechanism (MOC-138): the rest is Dependabot tracking `wreq` and friends, plus a weekly CI canary verifying the Cloudflare bypass still works. Drift detection for the standalone `codex-app-transfer_test` clone lives in `scripts/check-test-repo-drift.sh`.
+
 ### Tweaking the UI
 
 `frontend/css/` is organized as a small component library — no need to grep the whole `style.css`:

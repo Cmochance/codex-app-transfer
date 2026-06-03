@@ -171,6 +171,18 @@ cargo tauri build --bundles nsis,msi         # Windows x64
 cargo tauri build --bundles deb,appimage     # Linux x86_64
 ```
 
+### 提交前自动门禁(pre-push hook)
+
+仓库自带一个本地 `pre-push` 门禁(`.githooks/pre-push`),镜像 CI 的 `rust-fast-check` 那一层,push 前先在本地挡住 fmt / 编译 / 单测失败,不用等 CI 来回。每个 clone 装一次:
+
+```bash
+scripts/install-hooks.sh        # = git config core.hooksPath .githooks
+```
+
+装好后每次 `git push` 自动跑:`cargo fmt --all -- --check` → `cargo check --workspace --exclude codex-app-transfer` → `cargo test --workspace --exclude codex-app-transfer`(`#[ignore]` 的联网测试默认不跑,门禁不触网);非 main 分支落后 `origin/main` 会提醒(避免 squash-merge 被分支保护 BLOCK)。临时绕过用 `git push --no-verify`(CI 仍会拦)。
+
+> 该门禁是「模块更新自动检查机制」(MOC-138)的本地一环:配套还有 Dependabot 跟 `wreq` 等依赖发版、周期 CI 金丝雀验 Cloudflare 绕过仍生效。独立 clone `codex-app-transfer_test` 的漂移检测见 `scripts/check-test-repo-drift.sh`。
+
 ### 想改 UI 样式怎么改
 
 `frontend/css/` 走"组件库"形式拆开,不需要全文 grep `style.css`:
