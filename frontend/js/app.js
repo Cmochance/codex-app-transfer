@@ -2563,6 +2563,27 @@
     startProxyLogAutoRefresh();
   }
 
+  // MOC-145 发现性徽章 seen 标记(localStorage, 纯 UI; try/catch 同 default-dir 范式)。
+  // 默认关 + 一次性提示: 用户与控件交互过即视为已发现, 永久隐藏「NEW」徽章。
+  // **必须放 IIFE 顶层**(非 bindEvents 内): renderSettings 与 bindEvents 是同级函数,
+  // 声明在 bindEvents 内则 renderSettings 看不到 → ReferenceError 整页崩(codex-connector P1)。
+  function webFetchHintSeen() {
+    try {
+      return localStorage.getItem("cas:webfetch-hint-seen") === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+  function markWebFetchHintSeen() {
+    try {
+      localStorage.setItem("cas:webfetch-hint-seen", "1");
+    } catch (e) {
+      /* localStorage 不可用: 徽章下次仍显示, 无害 */
+    }
+    const b = $("#webFetchNewBadge");
+    if (b) b.hidden = true;
+  }
+
   async function renderSettings() {
     const settings = await CCApi.getSettings();
     applyTheme(settings.theme || "default");
@@ -8433,24 +8454,6 @@
       $all("#webFetchBackend .btn").forEach((b) =>
         b.classList.toggle("active", b.dataset.webfetch === v)
       );
-    // MOC-145 发现性徽章 seen 标记(localStorage, 纯 UI; try/catch 同 default-dir 范式)。
-    // 默认关 + 一次性提示: 用户与控件交互过即视为已发现, 永久隐藏「NEW」徽章。
-    function webFetchHintSeen() {
-      try {
-        return localStorage.getItem("cas:webfetch-hint-seen") === "1";
-      } catch (e) {
-        return false;
-      }
-    }
-    function markWebFetchHintSeen() {
-      try {
-        localStorage.setItem("cas:webfetch-hint-seen", "1");
-      } catch (e) {
-        /* localStorage 不可用: 徽章下次仍显示, 无害 */
-      }
-      const b = $("#webFetchNewBadge");
-      if (b) b.hidden = true;
-    }
     // 存档选中档: 成功更新 dataset.saved; 失败回退高亮 + 明确"设置保存失败"(区分"下载失败")。
     // 注册到 Codex 失败(webFetchSyncWarning): 设置已存档(不回退), 但 toast 警告 + 返
     // false 让调用方跳过成功 toast(避免覆盖警告)。MOC-145。
