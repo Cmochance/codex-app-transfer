@@ -1527,10 +1527,18 @@ fn sanitize_chat_body_for_provider(body: &mut Map<String, Value>, provider: Opti
 /// "invalid params, invalid chat setting (2013)"。
 fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
     const MINIMAX_SYSTEM_MESSAGE_MAX_CHARS: usize = 24_000;
-    let response_format_allowed = body
+    // MiniMax-M3 起的新模型原生接受标准 OpenAI 字段。2026-06-03 真机实测
+    // (api.minimaxi.com 直连 MiniMax-M3):`role=system` / `response_format` /
+    // `parallel_tool_calls` 全部 200 接受,而 M2.x 对同样字段 400(invalid
+    // params 2013 / invalid role)。故 M3 走宽松路径,不做 M2.x 的字段剥离 +
+    // system→user 破坏性改写;M2.x 保持原限制(#139)。
+    let model_lc = body
         .get("model")
         .and_then(|v| v.as_str())
-        .is_some_and(|model| model.eq_ignore_ascii_case("MiniMax-Text-01"));
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_m3_plus = model_lc.starts_with("minimax-m3");
+    let response_format_allowed = is_m3_plus || model_lc == "minimax-text-01";
 
     body.retain(|key, _| {
         matches!(
@@ -1548,6 +1556,7 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
                 | "stream_options"
                 | "mask_sensitive_info"
         ) || (key == "response_format" && response_format_allowed)
+            || (is_m3_plus && key == "parallel_tool_calls")
     });
 
     // MiniMax 官方建议 OpenAI-compatible M2.7 工具调用启用
@@ -1558,9 +1567,13 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
     // `stream_options.include_usage`;缺 usage 时响应转换层会补零值 usage。
     body.remove("stream_options");
     merge_consecutive_system_messages(body);
-    // **issue #139 修(2026-05-12)**:MiniMax /v1/chat/completions 不接受
+    // **issue #139 修(2026-05-12)**:MiniMax M2.x /v1/chat/completions 不接受
     // role=system,400 invalid role。把 system 全转 user + [System]\n prefix。
-    convert_minimax_system_to_user_prefix(body, MINIMAX_SYSTEM_MESSAGE_MAX_CHARS);
+    // M3 起原生接受 role=system(2026-06-03 真机实测 200),跳过转换以免破坏
+    // system prompt 语义(system 指令权重 ≠ user message)。
+    if !is_m3_plus {
+        convert_minimax_system_to_user_prefix(body, MINIMAX_SYSTEM_MESSAGE_MAX_CHARS);
+    }
     sanitize_minimax_tool_call_arguments(body);
     sanitize_minimax_tools(body);
 

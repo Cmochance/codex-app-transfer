@@ -313,6 +313,81 @@ fn minimax_sanitizes_invalid_tool_call_arguments_in_messages() {
 }
 
 #[test]
+fn minimax_m3_keeps_system_and_standard_fields() {
+    // 真机实测(2026-06-03,api.minimaxi.com 直连 MiniMax-M3):M3 原生接受
+    // role=system / response_format / parallel_tool_calls(M2.x 同字段 400)。
+    // sanitize 不应对 M3 做 M2.x 的 system→user 改写 + 字段剥离。
+    let mut body = json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "hi"}
+        ],
+        "response_format": {"type": "json_object"},
+        "parallel_tool_calls": true
+    })
+    .as_object()
+    .expect("json object")
+    .clone();
+    sanitize_minimax_chat_body(&mut body);
+    let roles: Vec<String> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["role"].as_str().map(ToOwned::to_owned))
+        .collect();
+    assert!(
+        roles.iter().any(|r| r == "system"),
+        "M3 应保留 role=system(不转 user),实际 roles={roles:?}"
+    );
+    assert!(
+        body.contains_key("response_format"),
+        "M3 应保留 response_format(实测接受)"
+    );
+    assert!(
+        body.contains_key("parallel_tool_calls"),
+        "M3 应保留 parallel_tool_calls(实测接受)"
+    );
+}
+
+#[test]
+fn minimax_m2_still_converts_system_and_drops_unsupported_fields() {
+    // 回归保护:M2.x 必须保持 #139 的 system→user + 字段剥离(M3 的宽松路径
+    // 不能误伤 M2.x)。
+    let mut body = json!({
+        "model": "MiniMax-M2.7",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"}
+        ],
+        "response_format": {"type": "json_object"},
+        "parallel_tool_calls": true
+    })
+    .as_object()
+    .expect("json object")
+    .clone();
+    sanitize_minimax_chat_body(&mut body);
+    let roles: Vec<String> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["role"].as_str().map(ToOwned::to_owned))
+        .collect();
+    assert!(
+        !roles.iter().any(|r| r == "system"),
+        "M2.x 必须把 system 转成 user(#139),实际 roles={roles:?}"
+    );
+    assert!(
+        !body.contains_key("response_format"),
+        "M2.x(非 Text-01)必须剥 response_format"
+    );
+    assert!(
+        !body.contains_key("parallel_tool_calls"),
+        "M2.x 必须剥 parallel_tool_calls"
+    );
+}
+
+#[test]
 fn minimax_long_system_split_into_multiple_user_prefix_messages() {
     // issue #139 修:超 max_chars 切片,每片独立 role=user + 标记部分编号
     // `[System part i/N]\n` prefix(silent-failure F4:让模型看出是同一逻辑
