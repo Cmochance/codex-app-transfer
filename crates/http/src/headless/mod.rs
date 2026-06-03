@@ -13,11 +13,16 @@
 //! ## 后台无窗口
 //! headless 模式 + 独立临时 `user-data-dir` (全新 profile), **不接管用户的 Chrome、不弹窗**。
 //!
-//! ## 已知边界 (PoC)
-//! - 等渲染用 `wait_for_navigation` (load) + 固定 settle 延迟; chromiumoxide 0.9.1 无
-//!   内建 networkIdle helper, 精确化 (监听 CDP `Page.lifecycleEvent` 'networkIdle') 留 followup。
+//! ## 等渲染 (MOC-145 networkIdle 精确化)
+//! 导航前挂 CDP `Page.lifecycleEvent` 监听 + 开 `setLifecycleEventsEnabled`, 用
+//! `execute(Navigate)` 拿到本次导航的 `loaderId`, 只认该 loaderId 的 `networkIdle`
+//! (= 主文档网络静默 500ms, 等价 puppeteer networkidle0)。比固定 settle 对慢 SPA /
+//! 懒加载更可靠 (不漏内容); 超 [`HeadlessConfig::networkidle_timeout`] 仍未静默则回退
+//! 继续 (长连接 / 轮询页不至于卡死)。idle 后再小 settle 一次收尾微任务渲染。
+//!
+//! ## 已知边界
 //! - 不对抗主动反爬 (Cloudflare Turnstile/DataDome 等); 本层界定为 "抓 JS 渲染 SPA"。
-//! - 接入分层 router (检测空骨架 → 升级 ③) 作后续 PR; 本 PoC 只打通抓取能力。
+//! - 接入分层 router (检测空骨架 → 升级 ③) 作后续 PR。
 
 mod detect;
 mod download;
@@ -30,6 +35,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use chromiumoxide::cdp::browser_protocol::page::{
+    EventLifecycleEvent, NavigateParams, SetLifecycleEventsEnabledParams,
+};
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
 use thiserror::Error;
@@ -48,9 +56,11 @@ pub enum HeadlessError {
 /// 抓取配置。
 #[derive(Debug, Clone)]
 pub struct HeadlessConfig {
-    /// 导航 (load 事件) 超时。
+    /// 导航 (`Page.navigate` 命令应答) 超时。
     pub nav_timeout: Duration,
-    /// load 后额外等待 JS 渲染落定的时间 (networkIdle 的务实替代)。
+    /// 等 `networkIdle` 生命周期事件的上限; 超时则回退继续 (长连接/轮询页不卡死)。
+    pub networkidle_timeout: Duration,
+    /// networkIdle 后再小等一次, 收尾微任务渲染 (idle 已是网络静默, 这里只补最后绘制)。
     pub render_settle: Duration,
 }
 
@@ -58,21 +68,50 @@ impl Default for HeadlessConfig {
     fn default() -> Self {
         Self {
             nav_timeout: Duration::from_secs(30),
-            render_settle: Duration::from_millis(1500),
+            networkidle_timeout: Duration::from_secs(12),
+            render_settle: Duration::from_millis(250),
         }
     }
 }
 
 /// 解析出一个可用的 Chromium 二进制: 先系统探测, 未命中按需下载 chrome-headless-shell。
 ///
-/// 注: 探测 ([`detect_system_chrome`]) 仅判文件存在, 不验证可执行/CDP 可用。命中一个
-/// 损坏的系统 Chrome 时会直接返回它, 在 `launch` 阶段以 `Launch` 错误暴露 (不会静默
-/// 成功), 但不会自动回退到按需下载。followup: launch 失败时 fallback 到按需下载。
+/// 探测 ([`detect_system_chrome`]) 仅判文件存在。命中后跑一次 `--version` 自检 (MOC-145):
+/// 命中一个损坏 / 不可执行 / 残缺的系统 Chrome 时自检不过 → **回退按需下载**, 而不是把坏
+/// 二进制透到 `launch` 阶段直接打死本次抓取。自检 ~50-100ms, 相对冷启动可忽略。
 pub async fn resolve_chrome_binary() -> Result<PathBuf, HeadlessError> {
     if let Some(p) = detect_system_chrome() {
-        return Ok(p);
+        if chrome_binary_works(&p).await {
+            return Ok(p);
+        }
+        eprintln!(
+            "[headless] 系统 Chrome 自检 (--version) 未通过, 回退按需下载: {}",
+            p.display()
+        );
     }
     ensure_chrome_headless_shell().await
+}
+
+/// 二进制可用性自检: 跑 `--version` (打印版本即退, 不开窗)。spawn 失败 / 非 0 退出 = 坏。
+///
+/// **仅 Unix**。Windows 上 GUI 版 `chrome.exe --version` 不向 console 输出、exit code 不
+/// 可靠(可能误判好 Chrome → 触发无谓 ~86MB 下载), 故 Windows 跳过自检沿用旧行为(探测
+/// 命中即用, 坏二进制在 launch 阶段暴露)—— 见 [`chrome_binary_works`] 的 Windows 实现。
+#[cfg(not(target_os = "windows"))]
+async fn chrome_binary_works(bin: &std::path::Path) -> bool {
+    tokio::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Windows: 跳过 `--version` 自检(行为不可靠, 见 Unix 版 doc), 信任探测结果。坏 Chrome
+/// 仍会在 `launch` 阶段以 `Launch` 错误暴露(与 item 5 前一致, 无回归)。Win 真机验证待补。
+#[cfg(target_os = "windows")]
+async fn chrome_binary_works(_bin: &std::path::Path) -> bool {
+    true
 }
 
 // 临时 profile 目录序号: 同进程内多个实例不撞目录 (Chrome 同 profile 会 lock 冲突)。
@@ -160,8 +199,13 @@ impl HeadlessBrowser {
     }
 
     /// 抓一个 URL, 返回渲染后 (JS 执行后) 的完整 HTML。复用本实例 (开新 tab)。
+    ///
+    /// 等渲染走 networkIdle (见模块注释): 导航**前**挂 lifecycle 监听 → `Navigate` 拿
+    /// loaderId → 只认该 loaderId 的 `networkIdle`, 超时回退。避免 `new_page(url)` 直接
+    /// 导航时 idle 事件抢在监听挂上前发生而漏掉 (瞬时页) → 空等到超时。
     pub async fn fetch_rendered_html(&self, url: &str) -> Result<String, HeadlessError> {
-        let page = match self.browser.new_page(url).await {
+        // 先开空白页 (about:blank), 不直接导航到目标 —— 留出挂监听的窗口。
+        let page = match self.browser.new_page("about:blank").await {
             Ok(p) => p,
             Err(e) => {
                 // new_page 失败常因 handler 已退出 (channel closed); 拼上死因定位根因。
@@ -174,14 +218,92 @@ impl HeadlessBrowser {
             }
         };
 
-        // 等 load 事件 (0.9.1 无内建 networkIdle helper)。
-        tokio::time::timeout(self.config.nav_timeout, page.wait_for_navigation())
+        // 导航前: 开 lifecycle 事件 + 挂 networkIdle 监听 (顺序关键, 见方法 doc)。
+        page.execute(SetLifecycleEventsEnabledParams::new(true))
             .await
-            .map_err(|_| HeadlessError::Fetch("导航超时".into()))?
-            .map_err(|e| HeadlessError::Fetch(format!("wait_for_navigation 失败: {e}")))?;
+            .map_err(|e| HeadlessError::Fetch(format!("开 lifecycle 事件失败: {e}")))?;
+        let mut lifecycle = page
+            .event_listener::<EventLifecycleEvent>()
+            .await
+            .map_err(|e| HeadlessError::Fetch(format!("挂 lifecycle 监听失败: {e}")))?;
 
-        // load 后等 JS 渲染落定 (SPA 内容由 JS 填充, load 时往往还没填完)。
-        tokio::time::sleep(self.config.render_settle).await;
+        // 导航到目标; 拿本次导航的 loaderId 以过滤 networkIdle (排除 about:blank 等噪声)。
+        let nav = tokio::time::timeout(
+            self.config.nav_timeout,
+            page.execute(NavigateParams::new(url.to_string())),
+        )
+        .await
+        .map_err(|_| HeadlessError::Fetch("导航超时".into()))?
+        .map_err(|e| HeadlessError::Fetch(format!("Navigate 失败: {e}")))?;
+        if let Some(err) = &nav.result.error_text {
+            return Err(HeadlessError::Fetch(format!("导航被拒: {err}")));
+        }
+        let nav_loader = nav.result.loader_id.clone();
+
+        // 两段式等渲染。`Page.navigate` 只发起导航(commit 即返回), 不等 load —— 故不能
+        // 只用短的 networkidle_timeout 兜底, 否则慢页(load 耗时 > networkidle_timeout 但
+        // < nav_timeout)会在 load 前就超时, 读到半文档 / about:blank, 回归旧 wait_for_navigation
+        // 行为(codex-connector P2)。
+        //
+        // 只认本次导航 loaderId 的事件(排除 about:blank 等噪声; nav_loader 为 None 时不早退,
+        // 靠超时兜底 —— 跨文档导航理论上不会 None, CDP 仅 same-document 省略 loaderId)。
+        let loader_matches = |ev: &EventLifecycleEvent| nav_loader.as_ref() == Some(&ev.loader_id);
+
+        // Phase A:等文档 load(地板), cap nav_timeout。networkIdle 蕴含已 load, 先到也算完成。
+        // 返回 true = 已 idle(整体完成), false = 仅 load(进 Phase B 等 idle)。
+        let already_idle = {
+            let phase_a = async {
+                while let Some(ev) = lifecycle.next().await {
+                    if !loader_matches(&ev) {
+                        continue;
+                    }
+                    match ev.name.as_str() {
+                        "networkIdle" => return true,
+                        "load" | "DOMContentLoaded" => return false,
+                        _ => {}
+                    }
+                }
+                false
+            };
+            match tokio::time::timeout(self.config.nav_timeout, phase_a).await {
+                Ok(idle) => idle,
+                Err(_) => {
+                    // nav_timeout 内连 load 都没等到 → 放弃, 直接读(best-effort, 同旧 nav 超时)。
+                    eprintln!(
+                        "[headless] 导航/加载在 {}s 内未完成, 回退读当前 DOM: {url}",
+                        self.config.nav_timeout.as_secs()
+                    );
+                    true
+                }
+            }
+        };
+
+        // Phase B:load 后再等 networkIdle(主文档网络静默 500ms), cap networkidle_timeout。
+        // 此时读到的至少是 load 完成的文档(不会半文档/about:blank)。
+        if !already_idle {
+            let wait_idle = async {
+                while let Some(ev) = lifecycle.next().await {
+                    if ev.name == "networkIdle" && loader_matches(&ev) {
+                        return;
+                    }
+                }
+            };
+            if tokio::time::timeout(self.config.networkidle_timeout, wait_idle)
+                .await
+                .is_err()
+            {
+                // 超时回退是预期 best-effort(长连接/轮询页本就永不 idle); load 已完成, 留痕便于排查。
+                eprintln!(
+                    "[headless] networkIdle 超时 ({}s) 未静默, 回退读当前 DOM (load 已完成): {url}",
+                    self.config.networkidle_timeout.as_secs()
+                );
+            }
+        }
+
+        // idle 后小 settle 收尾微任务渲染 (idle 已网络静默, 这里只补最后绘制)。
+        if !self.config.render_settle.is_zero() {
+            tokio::time::sleep(self.config.render_settle).await;
+        }
 
         // 渲染后 DOM: page.content() 返回当前序列化文档 (= outerHTML 等价)。
         let html = page

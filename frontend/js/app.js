@@ -2563,6 +2563,27 @@
     startProxyLogAutoRefresh();
   }
 
+  // MOC-145 发现性徽章 seen 标记(localStorage, 纯 UI; try/catch 同 default-dir 范式)。
+  // 默认关 + 一次性提示: 用户与控件交互过即视为已发现, 永久隐藏「NEW」徽章。
+  // **必须放 IIFE 顶层**(非 bindEvents 内): renderSettings 与 bindEvents 是同级函数,
+  // 声明在 bindEvents 内则 renderSettings 看不到 → ReferenceError 整页崩(codex-connector P1)。
+  function webFetchHintSeen() {
+    try {
+      return localStorage.getItem("cas:webfetch-hint-seen") === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+  function markWebFetchHintSeen() {
+    try {
+      localStorage.setItem("cas:webfetch-hint-seen", "1");
+    } catch (e) {
+      /* localStorage 不可用: 徽章下次仍显示, 无害 */
+    }
+    const b = $("#webFetchNewBadge");
+    if (b) b.hidden = true;
+  }
+
   async function renderSettings() {
     const settings = await CCApi.getSettings();
     applyTheme(settings.theme || "default");
@@ -2587,6 +2608,9 @@
       $all("#webFetchBackend .btn").forEach((b) =>
         b.classList.toggle("active", b.dataset.webfetch === _wfb)
       );
+      // MOC-145 发现性徽章: 默认关 + 一次性提示。用户与控件交互过(localStorage seen)就不再显示。
+      const _wfBadge = $("#webFetchNewBadge");
+      if (_wfBadge) _wfBadge.hidden = webFetchHintSeen();
     }
     $("#codexStatusSectionDefaultVisible").checked = settings.codexStatusSectionDefaultVisible !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
@@ -3131,9 +3155,11 @@
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
-    await CCApi.saveSettings(settings);
+    const resp = await CCApi.saveSettings(settings);
     $("#proxyPort").value = settings.proxyPort;
     renderModelMenuModeState(settings);
+    // 返回后端响应:含 webFetchSyncWarning 时由 _commitWebFetch 提示(MOC-145)。
+    return resp;
   }
 
   function formatUsageItems(result) {
@@ -8429,11 +8455,17 @@
         b.classList.toggle("active", b.dataset.webfetch === v)
       );
     // 存档选中档: 成功更新 dataset.saved; 失败回退高亮 + 明确"设置保存失败"(区分"下载失败")。
+    // 注册到 Codex 失败(webFetchSyncWarning): 设置已存档(不回退), 但 toast 警告 + 返
+    // false 让调用方跳过成功 toast(避免覆盖警告)。MOC-145。
     async function _commitWebFetch(v) {
       _setWebFetchActive(v);
       try {
-        await saveSettingsFromForm();
+        const resp = await saveSettingsFromForm();
         _webFetchSeg.dataset.saved = v;
+        if (resp && resp.webFetchSyncWarning) {
+          showToast(t("settings.webFetchSyncWarning"));
+          return false;
+        }
         return true;
       } catch (e) {
         _setWebFetchActive(_webFetchSaved());
@@ -8443,6 +8475,7 @@
     }
     $all("#webFetchBackend .btn").forEach((btn) => {
       btn.addEventListener("click", async () => {
+        markWebFetchHintSeen(); // 任何交互即视为已发现, 隐藏「NEW」徽章
         const v = btn.dataset.webfetch;
         if (_webFetchSwitching || v === _webFetchSaved()) return; // 切换中 / 没变 → 忽略
         if (v !== "headless") {

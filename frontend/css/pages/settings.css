@@ -82,6 +82,26 @@
 .settings-row strong {
   font-size: 16px;
 }
+
+/* 设置项标签旁的「NEW」发现性徽章(MOC-145):默认关 + 一次性提示,用户与控件交互后
+   localStorage 标记 seen 永久隐藏。用 <span> 包裹(非 <div>)避开 settings-row-stack
+   的 `> div { width:100% }` 规则,保持 label 与徽章同行。 */
+.settings-label-with-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.new-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  letter-spacing: .3px;
+}
 /* .panel h2 / .timeline-card h2 同 16px 共享值已搬到各自 component:
    components/card.css 末段 (.panel h2) + pages/guide.css 末段 (.timeline-card h2) */
 

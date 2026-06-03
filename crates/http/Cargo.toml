@@ -36,6 +36,7 @@ futures = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # app data 目录: chrome-headless-shell 落 ~/.codex-app-transfer/browsers/ (跨平台 home_dir)。
 dirs = "6"
+htmd = "0.5"
 
 [dev-dependencies]
 # 集成测试: 真实打到 chatgpt.com 验证能过 CF (网络可达时)
