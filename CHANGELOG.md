@@ -6,6 +6,8 @@
 
 **集成 CF-resistant HTTP 客户端 (MOC-137, A 阶段)**:workspace 出向 `openai.com` / `chatgpt.com` / `help.openai.com` 等 Cloudflare 强保域,标准 `reqwest` 不跑 JS 会被 403/421。新增 `crates/http` crate,基于 `wreq` (`0x676e67/wreq`,reqwest 的浏览器 TLS + HTTP/2 指纹伪装 fork) 提供 `ImpersonatingClient::chrome_120()`,按 host 后缀自动选 `reqwest` 还是伪装 client (排除 `status.openai.com` / `community.openai.com` 等已知无 CF 子域)。**本次仅引入 crate + 单测 + 真实打 `chatgpt.com` / `help.openai.com` 200 OK 验证**,不迁任何调用点 — 后续 PR 按 `crates/proxy/src/forward.rs` → `adapters` / `gemini_oauth` / `proxy_runner` / `admin/handlers` 顺序逐个迁。
 
+**③ JS 渲染层 PoC (MOC-143)**:`crates/http` 新增 `headless` 模块,用 headless Chromium (CDP,经 `chromiumoxide` 0.9) 取 ①reqwest / ②wreq 都拿不到的 JS 渲染 SPA 的渲染后 DOM。先探测系统 Chrome,未命中按需下载 chrome-headless-shell (~86 MB) 到 `~/.codex-app-transfer/browsers/`,不打包进安装包。**本次仅打通抓取能力 (`HeadlessBrowser` / `fetch_rendered_html` / `HeadlessConfig` + `#[ignore]` 真机测试)**,尚未接入任何调用路径 — 分层 router (空骨架检测 → 升级 ③) 作后续 PR。
+
 详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
 ## v2.2.0 — 2026-06-01

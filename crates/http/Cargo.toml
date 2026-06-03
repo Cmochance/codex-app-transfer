@@ -16,12 +16,26 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 # 而 wreq-util 3.0.0-rc.11 是写给 wreq 6.0.0-rc.23 的(rc.29 重命名了 emulation
 # trait IntoEmulation/EmulationFactory → 编译 skew,#358 review 实证)。锁定经
 # cargo build 验证可一起编译的组合。default-features=false 关掉了 wreq 的
-# default(含 tokio-rt),必须显式加回 tokio-rt(否则 TcpConnector/GaiResolver 缺失)。
+# default。注: rc.23 的 runtime (TcpConnector/GaiResolver) 非 feature-gated,
+# rc.23 features 列表里没有 tokio-rt 这一项 (#358 实证),无需也无法显式开启。
 wreq = { version = "=6.0.0-rc.23", default-features = false, features = ["stream", "webpki-roots", "socks", "system-proxy"] }
 wreq-util = "=3.0.0-rc.11"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "process"] }
 # 错误类型
 thiserror = "2"
+
+# === MOC-143 ③ JS 渲染层: headless Chromium 抓 JS 渲染 SPA ===
+# ①reqwest 静态 / ②wreq CF 指纹都只能拿初始 HTML; JS 渲染 SPA 的初始 HTML 是空骨架,
+# 内容由 JS 运行时填充 → 用 headless Chromium (CDP) 真跑 JS 取渲染后 DOM。
+# chromiumoxide: CDP 客户端 (纯 Rust, tokio 原生)。0.9.1 无 tokio-runtime feature
+# (tokio 无条件依赖),caret "0.9" 锁 0.9.x。
+chromiumoxide = "0.9"
+# handler stream 必须 spawn 驱动 (StreamExt::next),否则 CDP 不前进。
+futures = "0.3"
+# 解压按需下载的 chrome-headless-shell zip (同步 API,在 spawn_blocking 里跑)。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# app data 目录: chrome-headless-shell 落 ~/.codex-app-transfer/browsers/ (跨平台 home_dir)。
+dirs = "6"
 
 [dev-dependencies]
 # 集成测试: 真实打到 chatgpt.com 验证能过 CF (网络可达时)
