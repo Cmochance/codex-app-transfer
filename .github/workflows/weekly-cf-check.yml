@@ -52,8 +52,12 @@ jobs:
               exit 0
             fi
             echo "::endgroup::"
-            echo "::warning::CF 金丝雀 attempt $attempt 失败,30s 后重试"
-            sleep 30
+            # 仅前两次失败后重试;第 3 次(最后一次)直接落到下面的 ::error::,
+            # 不打印误导的「30s 后重试」、不白等 30s。
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::CF 金丝雀 attempt $attempt 失败,30s 后重试"
+              sleep 30
+            fi
           done
           echo "::error::CF 金丝雀连续 3 次失败 —— wreq 指纹过期 / CF 改规则 / 持续网络问题"
           exit 1
