@@ -7,7 +7,7 @@
 //! {
 //!   "electron-saved-workspace-roots": [...],
 //!   "electron-persisted-atom-state": {
-//!     "local-conversation-status-section-visible": true,
+//!     "show-context-window-usage": true,
 //!     ...其它 atom...
 //!   },
 //!   ...其它顶层字段...
@@ -29,9 +29,18 @@ use serde_json::{Map, Value};
 
 use crate::CodexError;
 
-/// 上下文圆环 + tokens/s 显示开关。Codex Desktop `/status` slash command
-/// 切换的就是这个 key,默认 `false`(升级后 user 看不到圆环的真因,见 #258)。
-pub const STATUS_SECTION_VISIBLE_KEY: &str = "local-conversation-status-section-visible";
+/// Codex Desktop composer footer 的 context 用量圆环 + tokens/s 显示开关。
+///
+/// Codex 0.135+(实测 26.601.21317)把 context-usage 收敛进 composer footer,由
+/// 这个 atom key 控制,schema 默认 `false` —— 升级/新装 user 看不到圆环的真因(见
+/// #258 / MOC-123)。该 atom 的**权威源是主进程 global-state**(本文件),renderer
+/// 端 localStorage(`codex:persisted-atom:show-context-window-usage`)只是缓存、每次
+/// 加载会被这里覆盖,所以**只能写 global-state、不能写 localStorage**(CDP 注入
+/// localStorage 实测被擦,见 MOC-123 评论)。
+///
+/// 旧 key `local-conversation-status-section-visible`(0.133 时代 `/status` 右栏开关)
+/// 在 0.135+ 已不再被 footer 消费 —— 机制不变(还是写本文件的 atom),只是换了 key。
+pub const CONTEXT_USAGE_ATOM_KEY: &str = "show-context-window-usage";
 
 /// `electron-persisted-atom-state` 顶层字段名。
 const ATOM_STATE_KEY: &str = "electron-persisted-atom-state";
@@ -206,7 +215,7 @@ mod tests {
     #[test]
     fn read_atom_returns_none_when_file_missing() {
         let (_t, p) = tmp_path();
-        assert!(read_atom(&p, STATUS_SECTION_VISIBLE_KEY).unwrap().is_none());
+        assert!(read_atom(&p, CONTEXT_USAGE_ATOM_KEY).unwrap().is_none());
     }
 
     /// Devin Review BUG-001 防回归:`write_atom` 在 user 文件存在但非合法 JSON 时,
@@ -218,7 +227,7 @@ mod tests {
         let original_corrupt = "{ corrupt but irreplaceable workspace state";
         std::fs::write(&p, original_corrupt).unwrap();
 
-        let err = write_atom(&p, STATUS_SECTION_VISIBLE_KEY, json!(true)).unwrap_err();
+        let err = write_atom(&p, CONTEXT_USAGE_ATOM_KEY, json!(true)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("not valid JSON") || msg.contains("refusing to overwrite"),
@@ -238,7 +247,7 @@ mod tests {
     fn read_atom_propagates_error_on_corrupt_json() {
         let (_t, p) = tmp_path();
         std::fs::write(&p, "not json").unwrap();
-        let err = read_atom(&p, STATUS_SECTION_VISIBLE_KEY).unwrap_err();
+        let err = read_atom(&p, CONTEXT_USAGE_ATOM_KEY).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("not valid JSON") || msg.contains("Other"),
@@ -251,11 +260,11 @@ mod tests {
         let (_t, p) = tmp_path();
         std::fs::write(
             &p,
-            r#"{"electron-persisted-atom-state":{"local-conversation-status-section-visible":true,"other-atom":42}}"#,
+            r#"{"electron-persisted-atom-state":{"show-context-window-usage":true,"other-atom":42}}"#,
         )
         .unwrap();
         assert_eq!(
-            read_atom(&p, STATUS_SECTION_VISIBLE_KEY).unwrap(),
+            read_atom(&p, CONTEXT_USAGE_ATOM_KEY).unwrap(),
             Some(json!(true))
         );
         assert_eq!(read_atom(&p, "other-atom").unwrap(), Some(json!(42)));
@@ -265,11 +274,11 @@ mod tests {
     #[test]
     fn write_atom_creates_file_with_minimal_shape() {
         let (_t, p) = tmp_path();
-        write_atom(&p, STATUS_SECTION_VISIBLE_KEY, json!(true)).unwrap();
+        write_atom(&p, CONTEXT_USAGE_ATOM_KEY, json!(true)).unwrap();
         let content: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(
             content,
-            json!({"electron-persisted-atom-state":{"local-conversation-status-section-visible":true}})
+            json!({"electron-persisted-atom-state":{"show-context-window-usage":true}})
         );
     }
 
@@ -284,7 +293,7 @@ mod tests {
             "electron-persisted-atom-state": {
                 "diff-filter": "last-turn",
                 "composer-auto-context-enabled": false,
-                "local-conversation-status-section-visible": false,
+                "show-context-window-usage": false,
                 "agent-mode-by-host-id": {"local": "full-access"},
             },
             "electron-main-window-bounds": {"x": 31, "y": 56, "width": 1419, "height": 820},
@@ -292,14 +301,12 @@ mod tests {
         });
         std::fs::write(&p, original.to_string()).unwrap();
 
-        write_atom(&p, STATUS_SECTION_VISIBLE_KEY, json!(true)).unwrap();
+        write_atom(&p, CONTEXT_USAGE_ATOM_KEY, json!(true)).unwrap();
 
         let modified: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         // 我们 target 的字段被改
         assert_eq!(
-            modified.pointer(
-                "/electron-persisted-atom-state/local-conversation-status-section-visible"
-            ),
+            modified.pointer("/electron-persisted-atom-state/show-context-window-usage"),
             Some(&json!(true))
         );
         // 同段其它 atom 原样
@@ -330,7 +337,7 @@ mod tests {
     fn write_atom_refuses_to_overwrite_corrupt_json() {
         let (_t, p) = tmp_path();
         std::fs::write(&p, "this is not json {").unwrap();
-        let err = write_atom(&p, STATUS_SECTION_VISIBLE_KEY, json!(true)).unwrap_err();
+        let err = write_atom(&p, CONTEXT_USAGE_ATOM_KEY, json!(true)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.contains("not valid JSON") || msg.contains("invalid"),
@@ -345,15 +352,13 @@ mod tests {
         let (_t, p) = tmp_path();
         std::fs::write(
             &p,
-            r#"{"electron-persisted-atom-state":{"local-conversation-status-section-visible":true,"other-atom":42}}"#,
+            r#"{"electron-persisted-atom-state":{"show-context-window-usage":true,"other-atom":42}}"#,
         )
         .unwrap();
-        remove_atom(&p, STATUS_SECTION_VISIBLE_KEY).unwrap();
+        remove_atom(&p, CONTEXT_USAGE_ATOM_KEY).unwrap();
         let content: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(
-            content.pointer(
-                "/electron-persisted-atom-state/local-conversation-status-section-visible"
-            ),
+            content.pointer("/electron-persisted-atom-state/show-context-window-usage"),
             None
         );
         assert_eq!(
@@ -365,7 +370,7 @@ mod tests {
     #[test]
     fn remove_atom_noop_when_file_missing() {
         let (_t, p) = tmp_path();
-        assert!(remove_atom(&p, STATUS_SECTION_VISIBLE_KEY).is_ok());
+        assert!(remove_atom(&p, CONTEXT_USAGE_ATOM_KEY).is_ok());
         assert!(!p.exists());
     }
 }

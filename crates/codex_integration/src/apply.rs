@@ -81,11 +81,13 @@ pub struct ApplyConfig<'a> {
     /// network_access` section field)。控制小白用户能否用 `curl` 等命令联网。
     /// Caller 从 `Settings.codex_network_access`(默认 `true`)读取(#212)。
     pub codex_network_access: bool,
-    /// Codex Desktop 对话页底部 context 圆环 + tokens/s 显示开关(#258)。
+    /// Codex Desktop composer footer 的 context 圆环 + tokens/s 显示开关(#258 / MOC-123)。
     /// 写到 `~/.codex/.codex-global-state.json` 的
-    /// `electron-persisted-atom-state.local-conversation-status-section-visible`。
+    /// `electron-persisted-atom-state.show-context-window-usage`(见
+    /// [`crate::electron_state::CONTEXT_USAGE_ATOM_KEY`])。
     /// `true` → ensure 开启,`false` → ensure 关闭。
-    /// Caller 从 `Settings.codex_status_section_default_visible`(默认 `true`)读取。
+    /// Caller 从 `Settings.codex_status_section_default_visible`(默认 `true`,对应前端
+    /// settings key `codexStatusSectionDefaultVisible`,名字保留作 user-config 兼容)读取。
     pub codex_status_section_default_visible: bool,
     /// **direct 直连模式**(`bypass_proxy`,snapshot.rs:87-89)。为 `true` 时
     /// apply 只写上游配置(`openai_base_url` + auth key),并 **strip** 所有
@@ -122,7 +124,8 @@ pub struct ApplyResult {
 pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResult, CodexError> {
     // 1. snapshot(幂等;已有快照不会覆盖)
     let snapshot_taken_now = !has_snapshot(paths);
-    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name)?;
+    // manage_atom = !cfg.direct:direct 直连模式不写也不 restore context-usage atom(#317)。
+    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name, !cfg.direct)?;
 
     // 2. config.toml: openai_base_url
     if cfg.base_url.is_empty() {
@@ -298,7 +301,7 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     }
     write_auth(&paths.auth_json, &auth)?;
 
-    // 5. Codex Desktop UI 偏好:ensure `local-conversation-status-section-visible`
+    // 5. Codex Desktop UI 偏好:ensure `show-context-window-usage`
     // 跟 user 设置一致(默认 true,圆环可见)。详见 #258 真因:0.132+ 版本该
     // atom 默认 false,新装/升级 user 看不到 context 圆环,我们通过这个写
     // restore-friendly 的 single-atom-key 操作把 UI 偏好同步成 user 期望值。
@@ -312,21 +315,21 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // (snapshot + config.toml + auth.json)都成功后才跑。如果失败 → propagate
     // 会让 apply 整体报 Err,但 config.toml / auth.json 已写,partial-apply 错误
     // 框架。改成 warn + 继续,跟 restore-side 对称(UI preference 失败不该 block
-    // 主路径)。失败的 user 可手动 `/status` toggle 修正。
-    // direct 模式不碰 status-section atom(UI 偏好;issue #317:既不写也不强清,
+    // 主路径)。失败的 user 可在 Codex Settings 里手动开启,或重启 Codex 重试。
+    // direct 模式不碰 context-usage atom(UI 偏好;issue #317:既不写也不强清,
     // 留用户原值)。
     if !cfg.direct {
         if let Err(e) = crate::electron_state::write_atom(
             &paths.electron_global_state,
-            crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
             serde_json::Value::Bool(cfg.codex_status_section_default_visible),
         ) {
             tracing::warn!(
                 target: "codex_integration::apply",
                 path = %paths.electron_global_state.display(),
                 error = %e,
-                "best-effort status-section atom write failed; provider apply continues. \
-                 User can manually toggle via `/status` slash command in Codex Desktop.",
+                "best-effort context-usage atom write failed; provider apply continues. \
+                 User can enable it in Codex Desktop Settings (context usage ring) or restart Codex.",
             );
         }
     }
@@ -435,7 +438,7 @@ pub fn restore_codex_snapshot(
 }
 
 /// 把 `~/.codex/.codex-global-state.json` 里
-/// `electron-persisted-atom-state.local-conversation-status-section-visible`
+/// `electron-persisted-atom-state.show-context-window-usage`
 /// 退回到 snapshot 拍摄时的原值。
 ///
 /// **三态语义**(配合 `SnapshotManifest.electron_status_section_capture_failed`):
@@ -463,27 +466,29 @@ fn restore_status_section_from_manifest(
         );
         return Ok(());
     }
-    // Devin Review BUG-002 fix:pre-v3 manifest 没有 atom 追踪字段(serde default
-    // 给 pre_value=None + capture_failed=false),那时的 transfer 根本没管这个
-    // atom,user 的 `/status` 偏好是他自己设的。restore 时**不动**避免误删。
-    if m.schema_version < 3 {
+    // BUG-002 fix + [MOC-123] v4 bump:`schema_version < 4` 的 manifest 要么没追踪 atom
+    // (pre-v3,serde default pre_value=None + capture_failed=false),要么追踪的是**已废
+    // 旧 key** `local-conversation-status-section-visible`(v3),都不能拿来 restore 现役
+    // `show-context-window-usage` —— pre_value=None 时会误删 user 自己设的 footer 偏好
+    // (transfer 从没 capture 过)。一律跳过,留 user 原值。
+    if m.schema_version < 4 {
         tracing::warn!(
             target: "codex_integration::apply",
             schema_version = m.schema_version,
-            "pre-v3 manifest did not track status-section atom; skipping atom restore \
-             to avoid silently removing user's current value",
+            "manifest predates the show-context-window-usage atom (schema_version < 4); \
+             skipping atom restore to avoid silently removing user's current value",
         );
         return Ok(());
     }
     match m.electron_status_section_pre_value {
         Some(value) => crate::electron_state::write_atom(
             &paths.electron_global_state,
-            crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
             serde_json::Value::Bool(value),
         ),
         None => crate::electron_state::remove_atom(
             &paths.electron_global_state,
-            crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
         ),
     }
 }
@@ -509,7 +514,7 @@ fn clear_managed_codex_state(paths: &CodexPaths) -> Result<(), CodexError> {
     //
     // Why: 用户全局规则"不主动进行任何破坏性降级"(feedback_no_silent_destructive_fallback)。
     // 走到这里说明 transfer 从未 apply 过(没 snapshot),user 的 atom 值就是
-    // user 自己 manually 设的(包括 `/status` 手动 toggle,或者新装从未碰过)。
+    // user 自己 manually 设的(包括在 Codex Settings 手动开关,或者新装从未碰过)。
     // strip 掉等于擅自抹掉 user 配置,违反规则。
     //
     // Trade-off: 如果上版本 transfer 写过 atom 但未生成新 schema 的 snapshot,
@@ -519,14 +524,14 @@ fn clear_managed_codex_state(paths: &CodexPaths) -> Result<(), CodexError> {
     // trail。检测当前 atom 是否存在,有则告诉 user 怎么手动重置。
     let current = crate::electron_state::read_atom(
         &paths.electron_global_state,
-        crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+        crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
     );
     if let Ok(Some(_)) = current {
         tracing::warn!(
             target: "codex_integration::apply",
             "no snapshot but managed atom key still present in .codex-global-state.json \
              (likely from older transfer version) — leaving in place per no-destructive-fallback rule. \
-             User can manually reset via `/status` slash command in Codex Desktop.",
+             User can change it in Codex Desktop Settings (context usage ring).",
         );
     }
     Ok(())
@@ -1859,7 +1864,7 @@ mod tests {
         );
     }
 
-    /// #258:apply 把 `local-conversation-status-section-visible` ensure 成 user 设置值,
+    /// #258:apply 把 `show-context-window-usage` ensure 成 user 设置值,
     /// restore 严格退回到 snapshot 拍摄时的原值(包括"原本不存在" → strip 退路)。
     #[test]
     fn apply_writes_status_section_atom_and_restore_reverts_to_snapshot_original() {
@@ -1893,7 +1898,7 @@ mod tests {
         assert_eq!(
             crate::electron_state::read_atom(
                 global_state,
-                crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+                crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
             )
             .unwrap(),
             Some(json!(true))
@@ -1904,7 +1909,7 @@ mod tests {
         assert_eq!(
             crate::electron_state::read_atom(
                 global_state,
-                crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+                crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
             )
             .unwrap(),
             None,
@@ -1919,11 +1924,11 @@ mod tests {
         let (_t, paths) = setup();
         let global_state = &paths.electron_global_state;
 
-        // 模拟 user 升级前手动 toggle 过 `/status` → atom=true
+        // 模拟 user 升级前在 Codex Settings 开过 footer → atom=true
         std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
         std::fs::write(
             global_state,
-            r#"{"electron-persisted-atom-state":{"local-conversation-status-section-visible":true}}"#,
+            r#"{"electron-persisted-atom-state":{"show-context-window-usage":true}}"#,
         )
         .unwrap();
 
@@ -1948,11 +1953,51 @@ mod tests {
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
         assert_eq!(
-            after.pointer(
-                "/electron-persisted-atom-state/local-conversation-status-section-visible"
-            ),
+            after.pointer("/electron-persisted-atom-state/show-context-window-usage"),
             Some(&json!(true)),
             "pre-v3 manifest restore 必须不动 atom(旧 transfer 没追踪此字段,user 手动设置不该被删)"
+        );
+    }
+
+    /// [MOC-123] v4 bump 防回归:v3 manifest 由**上一版 transfer** 写,追踪的是已废旧 key
+    /// `local-conversation-status-section-visible`,其 pre_value 不代表现役
+    /// `show-context-window-usage`。restore 必须**跳过**(guard `schema_version < 4`),不能
+    /// 拿 v3 的 `None` 去 remove 新 key 误删 user 自己在 Codex Settings 开的 footer 偏好。
+    #[test]
+    fn restore_skips_v3_manifest_tracking_old_key() {
+        let (_t, paths) = setup();
+        let global_state = &paths.electron_global_state;
+
+        // user 自己在 Codex Settings 开了 footer → show-context-window-usage=true
+        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
+        std::fs::write(
+            global_state,
+            r#"{"electron-persisted-atom-state":{"show-context-window-usage":true}}"#,
+        )
+        .unwrap();
+
+        // 上一版 transfer 的 v3 manifest:追踪旧 key,新 key 视角下 pre_value=None
+        let v3_manifest = crate::snapshot::SnapshotManifest {
+            schema_version: 3,
+            snapshot_id: "v3-old-key".into(),
+            session_id: "v3-old-key".into(),
+            snapshot_at: "2026-06-01T00:00:00".into(),
+            config_existed: false,
+            auth_existed: false,
+            app_version: "v-old".into(),
+            provider_name: None,
+            electron_status_section_pre_value: None,
+            electron_status_section_capture_failed: false,
+        };
+
+        restore_status_section_from_manifest(&paths, Some(v3_manifest)).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
+        assert_eq!(
+            after.pointer("/electron-persisted-atom-state/show-context-window-usage"),
+            Some(&json!(true)),
+            "v3 manifest(追踪旧 key)restore 必须跳过,不能拿 None 误删 user 现役 footer 偏好"
         );
     }
 
@@ -1967,7 +2012,7 @@ mod tests {
         std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
         std::fs::write(
             global_state,
-            r#"{"electron-persisted-atom-state":{"local-conversation-status-section-visible":"yes"}}"#,
+            r#"{"electron-persisted-atom-state":{"show-context-window-usage":"yes"}}"#,
         )
         .unwrap();
 
@@ -2005,7 +2050,7 @@ mod tests {
         // 关键:atom 字段没被 remove(restore short-circuit 跳过 atom touching)
         assert!(
             after
-                .pointer("/electron-persisted-atom-state/local-conversation-status-section-visible")
+                .pointer("/electron-persisted-atom-state/show-context-window-usage")
                 .is_some(),
             "capture_failed=true 时 restore 必须不调 remove_atom,atom 字段必须保留"
         );
@@ -2076,7 +2121,7 @@ mod tests {
         std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
         std::fs::write(
             global_state,
-            r#"{"electron-saved-workspace-roots":["/tmp/proj"],"electron-persisted-atom-state":{"local-conversation-status-section-visible":false,"composer-auto-context-enabled":true}}"#,
+            r#"{"electron-saved-workspace-roots":["/tmp/proj"],"electron-persisted-atom-state":{"show-context-window-usage":false,"composer-auto-context-enabled":true}}"#,
         )
         .unwrap();
 
@@ -2103,9 +2148,7 @@ mod tests {
         let after_apply: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
         assert_eq!(
-            after_apply.pointer(
-                "/electron-persisted-atom-state/local-conversation-status-section-visible"
-            ),
+            after_apply.pointer("/electron-persisted-atom-state/show-context-window-usage"),
             Some(&json!(true))
         );
         assert_eq!(
@@ -2122,9 +2165,7 @@ mod tests {
         let after_restore: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
         assert_eq!(
-            after_restore.pointer(
-                "/electron-persisted-atom-state/local-conversation-status-section-visible"
-            ),
+            after_restore.pointer("/electron-persisted-atom-state/show-context-window-usage"),
             Some(&json!(false)),
             "restore 必须用 snapshot 记录的 user 原值 false 复原,不留 transfer 写入的 true"
         );
