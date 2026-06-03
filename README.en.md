@@ -233,6 +233,10 @@ Set the provider Base URL to the root or `/v1` only (e.g. `https://api.example.c
 
 This is Codex's own client-side "revert changes" message and does **not** go through this tool's proxy (the revert is performed by Codex against the local file snapshots it maintains, unrelated to the selected model or relay). Common causes: (1) the changed files are locked by an editor / IDE / antivirus, so the rollback can't write on Windows; (2) the files were modified externally after Codex edited them, so the snapshot no longer matches; (3) apply_patch wrote files into a nested subdirectory this session, so Codex can't locate the originals to revert. Close any program holding the files, verify the changes landed in the expected directory, then retry; revert manually if it still fails.
 
+### OpenAI / ChatGPT upstream returns 403 (Cloudflare challenge)
+
+`api.openai.com` / `chatgpt.com` / `help.openai.com` are behind Cloudflare's JS-challenge (TLS fingerprint + JS execution). v2.2.0 and earlier used `reqwest` only, which can't run JS, so requests got 403 / 421 before reaching the origin. From this build the new `crates/http` crate ships a `wreq`-based `ImpersonatingClient::chrome_120()` that spoofs the Chrome 120 browser fingerprint (TLS client hello + HTTP/2 SETTINGS + headers); routing is host-based (`should_impersonate` in `crates/http/src/router.rs`). **Call-site migration is staged across subsequent PRs** — until then you may still see 403 from a few outbound paths. Network-gated integration tests in `crates/http/tests/cf_bypass.rs` (run with `cargo test -p codex-app-transfer-http --test cf_bypass -- --include-ignored`) verify `chatgpt.com/` and `help.openai.com/.../codex` return 200 in real conditions.
+
 ### Port conflicts
 
 v2 only listens on `18080` (forwarding) by default; the admin UI now uses Tauri in-process `cas://` and no longer occupies 18081. Use `netstat -ano | findstr :18080` to find usage, or change the port in Settings → Port and restart forwarding.
@@ -262,7 +266,7 @@ Design intent: the client trusts only the build-time embedded public key and nev
 
 ## Tech Stack
 
-- **Backend / forwarding**: Rust 1.80+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio
+- **Backend / forwarding**: Rust 1.80+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio · `wreq` 6.0-rc (browser TLS fingerprint impersonation, for Cloudflare-strict `openai.com` / `chatgpt.com`; see `crates/http/`)
 - **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
 - **Frontend**: HTML + CSS + vanilla JavaScript + Bootstrap 5.3.3 (localized, no CDN dependency)
 - **Desktop shell**: Tauri 2 + tray-icon 0.23; the `cas://` URI scheme glues frontend/ and axum in-process, no TCP loopback

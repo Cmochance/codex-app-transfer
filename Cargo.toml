@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/http",
     "src-tauri",
     "crates/registry",
     "crates/proxy",

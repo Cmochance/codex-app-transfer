@@ -1,0 +1,28 @@
+[package]
+name = "codex-app-transfer-http"
+version = "0.1.0"
+description = "Workspace 统一 HTTP 客户端:为被 Cloudflare 强保的 OpenAI/ChatGPT 域提供浏览器 TLS 指纹伪装,其余域继续走标准 reqwest"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# 默认走标准 reqwest (跟 workspace 现状一致: rustls-tls + system-proxy + socks + http2 + stream)
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "socks", "system-proxy"] }
+# 为 OpenAI/ChatGPT 等 Cloudflare 强保域提供浏览器指纹伪装
+wreq = { version = "6.0.0-rc", default-features = false, features = ["stream", "webpki-roots", "socks", "system-proxy"] }
+wreq-util = "3.0.0-rc"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+# tracing — 跟 workspace 其它 crate 一致
+tracing = "0.1"
+# URL 解析 (用于 router 按 host 路由, 不引则 hand-roll url::Host)
+url = "2"
+# 错误类型
+thiserror = "2"
+
+[dev-dependencies]
+# 集成测试: 真实打到 chatgpt.com 验证能过 CF (网络可达时)
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
