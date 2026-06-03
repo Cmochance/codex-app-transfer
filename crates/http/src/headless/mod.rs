@@ -240,27 +240,64 @@ impl HeadlessBrowser {
         }
         let nav_loader = nav.result.loader_id.clone();
 
-        // 等本次导航的 networkIdle (主文档网络静默 500ms); 超时回退继续 (best-effort)。
-        let wait_idle = async {
-            while let Some(ev) = lifecycle.next().await {
-                // 只认本次导航 loaderId 的 networkIdle。nav_loader 为 None(跨文档导航理论上
-                // 不会, CDP 仅 same-document 省略 loaderId)时不早退, 靠 networkidle_timeout
-                // 兜底 —— 避免误把 about:blank 残留的 networkIdle 当目标页 idle 提前 break (NIT)。
-                if ev.name == "networkIdle" && nav_loader.as_ref() == Some(&ev.loader_id) {
-                    break;
+        // 两段式等渲染。`Page.navigate` 只发起导航(commit 即返回), 不等 load —— 故不能
+        // 只用短的 networkidle_timeout 兜底, 否则慢页(load 耗时 > networkidle_timeout 但
+        // < nav_timeout)会在 load 前就超时, 读到半文档 / about:blank, 回归旧 wait_for_navigation
+        // 行为(codex-connector P2)。
+        //
+        // 只认本次导航 loaderId 的事件(排除 about:blank 等噪声; nav_loader 为 None 时不早退,
+        // 靠超时兜底 —— 跨文档导航理论上不会 None, CDP 仅 same-document 省略 loaderId)。
+        let loader_matches = |ev: &EventLifecycleEvent| nav_loader.as_ref() == Some(&ev.loader_id);
+
+        // Phase A:等文档 load(地板), cap nav_timeout。networkIdle 蕴含已 load, 先到也算完成。
+        // 返回 true = 已 idle(整体完成), false = 仅 load(进 Phase B 等 idle)。
+        let already_idle = {
+            let phase_a = async {
+                while let Some(ev) = lifecycle.next().await {
+                    if !loader_matches(&ev) {
+                        continue;
+                    }
+                    match ev.name.as_str() {
+                        "networkIdle" => return true,
+                        "load" | "DOMContentLoaded" => return false,
+                        _ => {}
+                    }
+                }
+                false
+            };
+            match tokio::time::timeout(self.config.nav_timeout, phase_a).await {
+                Ok(idle) => idle,
+                Err(_) => {
+                    // nav_timeout 内连 load 都没等到 → 放弃, 直接读(best-effort, 同旧 nav 超时)。
+                    eprintln!(
+                        "[headless] 导航/加载在 {}s 内未完成, 回退读当前 DOM: {url}",
+                        self.config.nav_timeout.as_secs()
+                    );
+                    true
                 }
             }
         };
-        if tokio::time::timeout(self.config.networkidle_timeout, wait_idle)
-            .await
-            .is_err()
-        {
-            // 超时回退是预期的 best-effort (长连接/轮询页本就永不 idle), 但留 stderr 痕迹:
-            // 否则慢 SPA 抓回半渲染内容时无任何线索可排查 (review MEDIUM)。
-            eprintln!(
-                "[headless] networkIdle 超时 ({}s) 未静默, 回退读当前 DOM (可能半渲染): {url}",
-                self.config.networkidle_timeout.as_secs()
-            );
+
+        // Phase B:load 后再等 networkIdle(主文档网络静默 500ms), cap networkidle_timeout。
+        // 此时读到的至少是 load 完成的文档(不会半文档/about:blank)。
+        if !already_idle {
+            let wait_idle = async {
+                while let Some(ev) = lifecycle.next().await {
+                    if ev.name == "networkIdle" && loader_matches(&ev) {
+                        return;
+                    }
+                }
+            };
+            if tokio::time::timeout(self.config.networkidle_timeout, wait_idle)
+                .await
+                .is_err()
+            {
+                // 超时回退是预期 best-effort(长连接/轮询页本就永不 idle); load 已完成, 留痕便于排查。
+                eprintln!(
+                    "[headless] networkIdle 超时 ({}s) 未静默, 回退读当前 DOM (load 已完成): {url}",
+                    self.config.networkidle_timeout.as_secs()
+                );
+            }
         }
 
         // idle 后小 settle 收尾微任务渲染 (idle 已网络静默, 这里只补最后绘制)。
