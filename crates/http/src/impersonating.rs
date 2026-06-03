@@ -33,6 +33,10 @@ impl ImpersonatingClient {
     pub fn chrome_120() -> Result<Self, ImpersonatingError> {
         let inner = Client::builder()
             .emulation(Emulation::Chrome120)
+            // wreq 默认不跟随重定向,而本 client 要替代 reqwest(默认跟随)。保持
+            // limited(10) 同 reqwest 行为,否则 call site 迁移到 301/302 页会拿到
+            // 跳转响应而非最终资源(#358 chatgpt review P2)。
+            .redirect(wreq::redirect::Policy::limited(10))
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()
