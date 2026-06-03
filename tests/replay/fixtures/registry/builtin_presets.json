@@ -248,9 +248,12 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "default": "MiniMax-M2.7"
+      "default": "MiniMax-M3"
     },
     "modelCapabilities": {
+      "MiniMax-M3": {
+        "context_window": 1000000
+      },
       "MiniMax-M2.7": {
         "context_window": 204800
       }
@@ -258,7 +261,7 @@
     "notices": [
       {
         "type": "info",
-        "text": "MiniMax M2.x 走 OpenAI 兼容 chat completions 端点,代理自动剥不兼容字段(reasoning_effort / response_format / parallel_tool_calls 等)+ tool 剥 strict + 连续 system 合并;响应侧 reasoning_details 拆 reasoning + <think> 兜底拆分仅对 MiniMax 启用。"
+        "text": "MiniMax M2.x / M3 走 OpenAI 兼容 chat completions 端点,代理自动剥不兼容字段(reasoning_effort / response_format / parallel_tool_calls 等)+ tool 剥 strict + 连续 system 合并;响应侧 reasoning_details 拆 reasoning + <think> 兜底拆分仅对 MiniMax 启用。M3 上下文 1M(官方 1,048,576,本项目按 1M 判定)。"
       },
       {
         "type": "info",

@@ -905,6 +905,7 @@ mod tests {
             ("moonshot-v1-auto", 131_072),
             ("glm-5.1", 200_000),
             ("minimax-m2.7", 204_800),
+            ("minimax-m3", 1_000_000),
             ("qwen3.6-plus", 1_000_000),
             ("gemini-3.1-flash-lite", 1_000_000),
             ("deepseek-v4-flash", 1_000_000),

@@ -54,12 +54,16 @@ mod tests {
         assert_eq!(minimax["baseUrl"], "https://api.minimaxi.com/v1");
         assert_eq!(minimax["apiFormat"], "openai_chat");
         assert_eq!(minimax["isBuiltin"], true);
+        let default_model = minimax["models"]["default"].as_str().unwrap_or("");
         assert!(
-            minimax["models"]["default"]
-                .as_str()
-                .unwrap_or("")
-                .starts_with("MiniMax-M2"),
-            "default model 必须是 MiniMax-M2.x 系列"
+            default_model.starts_with("MiniMax-M3"),
+            "default model 应为 MiniMax-M3(当前旗舰,1M 上下文),实际:{default_model}"
+        );
+        // default model 必须在 modelCapabilities 里配 context_window,否则 catalog
+        // 会回退到 documented_context_window 默认值(issue #356)。
+        assert!(
+            minimax["modelCapabilities"][default_model]["context_window"].is_number(),
+            "default model {default_model} 必须在 modelCapabilities 配 context_window"
         );
     }
 

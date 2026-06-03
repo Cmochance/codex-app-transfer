@@ -26,6 +26,7 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
         "qwen3.6-plus" | "qwen3.6-flash" => Some(ONE_M_CONTEXT_WINDOW),
         // MiniMax
         "minimax-m2.7" => Some(204_800),
+        "minimax-m3" => Some(ONE_M_CONTEXT_WINDOW),
         // Google Gemini (当前 preset 默认模型)
         "gemini-3.1-flash-lite" | "gemini-2.5-flash" | "gemini-3-flash" => {
             Some(ONE_M_CONTEXT_WINDOW)
@@ -134,6 +135,7 @@ mod tests {
         assert_eq!(documented_context_window("moonshot-v1-8k"), Some(8192));
         assert_eq!(documented_context_window("qwen3.6-plus"), Some(1_000_000));
         assert_eq!(documented_context_window("MiniMax-M2.7"), Some(204_800));
+        assert_eq!(documented_context_window("MiniMax-M3"), Some(1_000_000));
         assert_eq!(documented_context_window("unknown-model"), None);
     }
 

@@ -308,7 +308,21 @@ pub fn apply_reasoning_effort(
     if codex_effort.is_empty() {
         return;
     }
-    reasoning_effort_wire(provider).apply(body, codex_effort, &provider.id);
+    let mut wire = reasoning_effort_wire(provider);
+    // MiniMax-M3 起原生接受 `reasoning_effort`(2026-06-03 真机实测 api.minimaxi.com
+    // 直连:200;M2.x 同字段 400)。即便实测当前档位不改变 M3 思考深度,也按 OpenAI
+    // 规范把客户端意图透传给上游(交由上游决定),不主动剥除。M2.x 仍 Drop(白名单外
+    // 字段会 400)。model 取实际请求体(可能非 provider.default)。
+    if matches!(wire, ReasoningEffortWire::Drop)
+        && provider_matches(provider, "minimax")
+        && body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.to_ascii_lowercase().starts_with("minimax-m3"))
+    {
+        wire = ReasoningEffortWire::OpenAIEnum;
+    }
+    wire.apply(body, codex_effort, &provider.id);
 }
 
 #[cfg(test)]
@@ -438,6 +452,31 @@ mod tests {
     #[test]
     fn minimax_drops() {
         assert!(apply("minimax", "high").as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn minimax_m3_passes_through_reasoning_effort_but_m2_drops() {
+        // 真机实测(2026-06-03,api.minimaxi.com 直连):MiniMax-M3 接受
+        // reasoning_effort(200),M2.x 同字段 400。M3 按 OpenAI 规范透传给上游
+        // (不主动剥),M2.x 仍 Drop。model 取请求体实际值(可能非 provider.default)。
+        let p = provider_full("minimax", "MiniMax", "https://api.minimaxi.com/v1");
+
+        let mut m3 = Map::new();
+        m3.insert("model".into(), Value::String("MiniMax-M3".into()));
+        apply_reasoning_effort(&mut m3, &p, "high");
+        assert_eq!(
+            m3.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high"),
+            "M3 应透传 reasoning_effort=high"
+        );
+
+        let mut m2 = Map::new();
+        m2.insert("model".into(), Value::String("MiniMax-M2.7".into()));
+        apply_reasoning_effort(&mut m2, &p, "high");
+        assert!(
+            !m2.contains_key("reasoning_effort"),
+            "M2.x 必须 Drop reasoning_effort(白名单外字段会 400)"
+        );
     }
 
     // ─── Fallback (自定义 provider): OpenAI 标准 enum ────────────────────

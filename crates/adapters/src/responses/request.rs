@@ -1527,10 +1527,18 @@ fn sanitize_chat_body_for_provider(body: &mut Map<String, Value>, provider: Opti
 /// "invalid params, invalid chat setting (2013)"。
 fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
     const MINIMAX_SYSTEM_MESSAGE_MAX_CHARS: usize = 24_000;
-    let response_format_allowed = body
+    // MiniMax-M3 起的新模型原生接受标准 OpenAI 字段。2026-06-03 真机实测
+    // (api.minimaxi.com 直连 MiniMax-M3):`role=system` / `response_format` /
+    // `parallel_tool_calls` 全部 200 接受,而 M2.x 对同样字段 400(invalid
+    // params 2013 / invalid role)。故 M3 走宽松路径,不做 M2.x 的字段剥离 +
+    // system→user 破坏性改写;M2.x 保持原限制(#139)。
+    let model_lc = body
         .get("model")
         .and_then(|v| v.as_str())
-        .is_some_and(|model| model.eq_ignore_ascii_case("MiniMax-Text-01"));
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_m3_plus = model_lc.starts_with("minimax-m3");
+    let response_format_allowed = is_m3_plus || model_lc == "minimax-text-01";
 
     body.retain(|key, _| {
         matches!(
@@ -1548,28 +1556,43 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
                 | "stream_options"
                 | "mask_sensitive_info"
         ) || (key == "response_format" && response_format_allowed)
+            || (is_m3_plus && matches!(key.as_str(), "parallel_tool_calls" | "reasoning_effort"))
     });
 
     // MiniMax 官方建议 OpenAI-compatible M2.7 工具调用启用
     // reasoning_split,让 thinking 单独进入 reasoning_details,避免塞进
     // content 的 <think>...</think> 里。
     body.insert("reasoning_split".into(), Value::Bool(true));
-    // MiniMax 的 OpenAI-compatible streaming 不稳定接受
-    // `stream_options.include_usage`;缺 usage 时响应转换层会补零值 usage。
-    body.remove("stream_options");
+    // M2.x 的 OpenAI-compatible streaming 不稳定接受 `stream_options.include_usage`,
+    // 删掉(响应转换层补零值 usage)。**M3 例外**:2026-06-03 真机实测 M3 streaming +
+    // include_usage 稳定返回真实 usage(total_tokens/prompt_tokens/completion_tokens),
+    // 必须保留——否则 Codex 收到的 token 恒 0,`auto_compact_token_limit`(context×80%)
+    // 永不触发,对话无限膨胀直到撞 MiniMax TPM 429(#356 用户实测病态对话根因)。
+    if !is_m3_plus {
+        body.remove("stream_options");
+    }
     merge_consecutive_system_messages(body);
-    // **issue #139 修(2026-05-12)**:MiniMax /v1/chat/completions 不接受
+    // **issue #139 修(2026-05-12)**:MiniMax M2.x /v1/chat/completions 不接受
     // role=system,400 invalid role。把 system 全转 user + [System]\n prefix。
-    convert_minimax_system_to_user_prefix(body, MINIMAX_SYSTEM_MESSAGE_MAX_CHARS);
+    // M3 起原生接受 role=system(2026-06-03 真机实测 200),跳过转换以免破坏
+    // system prompt 语义(system 指令权重 ≠ user message)。
+    if !is_m3_plus {
+        convert_minimax_system_to_user_prefix(body, MINIMAX_SYSTEM_MESSAGE_MAX_CHARS);
+    }
     sanitize_minimax_tool_call_arguments(body);
     sanitize_minimax_tools(body);
 
-    if let Some(choice) = body.get_mut("tool_choice") {
-        let allowed = choice
-            .as_str()
-            .is_some_and(|s| matches!(s, "auto" | "none"));
-        if !allowed {
-            *choice = Value::String("auto".into());
+    // M2.x 只接受 tool_choice=auto/none,其它(required / 具名 function)降级到 auto。
+    // M3 起支持 required(2026-06-03 真机实测:tool_choice=required → 200 且真的发起
+    // tool_call),不降级,保留客户端的强制调用意图。
+    if !is_m3_plus {
+        if let Some(choice) = body.get_mut("tool_choice") {
+            let allowed = choice
+                .as_str()
+                .is_some_and(|s| matches!(s, "auto" | "none"));
+            if !allowed {
+                *choice = Value::String("auto".into());
+            }
         }
     }
 
@@ -1864,6 +1887,16 @@ fn split_string_by_char_limit(input: &str, max_chars: usize) -> Vec<String> {
 }
 
 fn sanitize_minimax_tools(body: &mut Map<String, Value>) {
+    // M2.x 用经典 OpenAI tool schema、不接受 strict function-calling 元数据,剥掉。
+    // M3 例外:2026-06-03 真机实测 M3 接受 `function.strict:true`(200 + 正常发起
+    // tool_call),保留以获得严格 schema 输出保证(剥掉是功能损失)。
+    let is_m3_plus = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.to_ascii_lowercase().starts_with("minimax-m3"));
+    if is_m3_plus {
+        return;
+    }
     let Some(Value::Array(tools)) = body.get_mut("tools") else {
         return;
     };
@@ -1871,8 +1904,6 @@ fn sanitize_minimax_tools(body: &mut Map<String, Value>) {
         let Some(function) = tool.get_mut("function").and_then(|v| v.as_object_mut()) else {
             continue;
         };
-        // MiniMax tool examples use the classic OpenAI tool schema and do not
-        // accept OpenAI strict function-calling metadata.
         function.remove("strict");
     }
 }

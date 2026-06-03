@@ -17,7 +17,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 移动 session rollout 文件到系统回收站(macOS Trash / Win Recycle Bin)
 # 而非 unlink:用户可在 Finder Trash 恢复(#271 删除选中功能)。
 trash = "5"
-tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

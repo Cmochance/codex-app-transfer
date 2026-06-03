@@ -390,8 +390,7 @@ fn compact_message_for_budget(mut message: Value) -> Value {
                 .and_then(|v| v.as_str().map(ToOwned::to_owned))
             {
                 if args.chars().count() > COMPACT_TOOL_ARGUMENTS_MAX_CHARS {
-                    call["function"]["arguments"] = Value::String(shortened_text(
-                        "Tool call arguments shortened for compact input",
+                    call["function"]["arguments"] = Value::String(shortened_tool_arguments(
                         &args,
                         COMPACT_TOOL_ARGUMENTS_MAX_CHARS,
                     ));
@@ -517,6 +516,23 @@ fn shortened_text(label: &str, text: &str, max_chars: usize) -> String {
         head,
         tail
     )
+}
+
+/// 把超长的 `tool_call.function.arguments` 截断到 compact 预算内,**同时保持
+/// 结果仍是合法 JSON 字符串**。
+///
+/// OpenAI chat completions 协议要求 `function.arguments` 是合法 JSON 字符串。
+/// 旧实现直接塞 [`shortened_text`] 的人类可读说明(`[... shortened ...]\n---
+/// Begin head excerpt ---`),它不是 JSON,严格校验的上游(如 MiniMax)会返回
+/// `400 invalid params, invalid function arguments json string`(issue #356)。
+/// 这里把说明包进一个合法 JSON object,既省 token 又不违反协议。
+fn shortened_tool_arguments(arguments: &str, max_chars: usize) -> String {
+    let note = shortened_text(
+        "Tool call arguments shortened for compact input",
+        arguments,
+        max_chars,
+    );
+    json!({ "_compacted_arguments": note }).to_string()
 }
 
 fn short_excerpt(text: &str, max_chars: usize) -> String {
@@ -790,6 +806,75 @@ mod tests {
         };
         p.models.insert("default".into(), "mimo-v2.5".into());
         p
+    }
+
+    #[test]
+    fn shortened_tool_arguments_stays_valid_json() {
+        // issue #356:截断超长 tool_call arguments 后必须仍是合法 JSON 字符串
+        // (OpenAI chat 协议),否则严格校验的上游(MiniMax)返回
+        // 400 invalid function arguments json string。
+        let huge = format!("{{\"path\":\"/x\",\"content\":\"{}\"}}", "A".repeat(20_000));
+        let out = shortened_tool_arguments(&huge, COMPACT_TOOL_ARGUMENTS_MAX_CHARS);
+        let parsed: Value =
+            serde_json::from_str(&out).expect("shortened tool arguments 必须是合法 JSON");
+        assert!(
+            parsed
+                .get("_compacted_arguments")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "截断说明应包在合法 JSON object 里"
+        );
+        assert!(
+            out.chars().count() < huge.chars().count(),
+            "截断后应短于原始 arguments"
+        );
+    }
+
+    #[test]
+    fn build_compact_chat_request_keeps_tool_arguments_valid_json_after_budget() {
+        // 端到端回归(issue #356):compact messages 超预算触发裁剪、且历史里有
+        // 超长 arguments 的 tool_call 时,产出的每个 tool_call arguments 都必须是
+        // 合法 JSON 字符串。
+        let p = make_provider();
+        let huge_args = format!("{{\"content\":\"{}\"}}", "A".repeat(50_000));
+        let filler = "x".repeat(200_000);
+        let body = json!({
+            "model": "mimo-v2.5",
+            "input": [
+                {"type": "message", "role": "user", "content": filler},
+                {"type": "function_call", "call_id": "call_big", "name": "write", "arguments": huge_args},
+                {"type": "function_call_output", "call_id": "call_big", "output": "ok"},
+                {"type": "message", "role": "user", "content": "continue"}
+            ],
+            "tools": [{"type": "function", "name": "write"}]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let mut checked = 0;
+        let mut saw_compacted = false;
+        for m in messages {
+            if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                for call in calls {
+                    let args = call["function"]["arguments"].as_str().unwrap();
+                    serde_json::from_str::<Value>(args).unwrap_or_else(|e| {
+                        panic!("compact 后 tool_call arguments 必须是合法 JSON: {args:?} ({e})")
+                    });
+                    if args.contains("_compacted_arguments") {
+                        saw_compacted = true;
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "应至少校验一个 tool_call arguments");
+        // 防 no-op 假绿:确认确实走了截断路径(而非 budget 逻辑变动导致 call_big
+        // 整条被丢/未截断)。截断标记由 shortened_tool_arguments 注入。
+        assert!(
+            saw_compacted,
+            "测试应实际触发 arguments 截断;若 budget 逻辑改动导致未命中,请调整 fixture 规模"
+        );
     }
 
     #[test]
