@@ -20,7 +20,13 @@ use crate::paths::CodexPaths;
 use crate::toml_sync::write_atomic;
 use crate::CodexError;
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+/// v3:开始追踪 context-usage atom 的 pre-value(`electron_status_section_*` 字段)。
+/// v4 [MOC-123]:追踪的 atom key 从已废 `local-conversation-status-section-visible` 换成
+/// 现役 `show-context-window-usage`(见 [`crate::electron_state::CONTEXT_USAGE_ATOM_KEY`])。
+/// v3 manifest 存的是**旧 key** 的 pre-value,**不能**拿去 restore 新 key —— 否则
+/// `None` 会误删 user 自己设的 footer 偏好(transfer 从没 capture 过)。restore + 迁移
+/// 路径据此 `< 4` 跳过 / 标 capture_failed(见 PR #360 chatgpt-codex-connector P2)。
+const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 
 /// `gc_trash_older_than` 的默认保留天数 — daemon startup 调一次时用。
 /// 30 天是"误点 cleanup_all 后用户还有月内时间发现并从 trash/ 恢复"的
@@ -608,15 +614,16 @@ fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), C
     std::fs::create_dir_all(&paths.recovery_snapshots_dir)?;
     let target = unique_recovery_dir(paths, &manifest.snapshot_id);
     std::fs::rename(dir, &target)?;
-    // Devin Review BUG-004 fix:升级 schema_version 到 v3 之前先存原版本,
-    // 如果是 pre-v3 manifest(没追踪 status-section atom),升 schema 后
-    // 必须**同时**设 capture_failed=true,否则 manual restore 时 atom 三态
-    // 全是 default(None+false)→ 误判为"snapshot 时 atom 不存在"→ remove_atom
-    // → silently 抹掉 user 手动设的 context-usage 偏好(Codex Settings)(见 apply.rs#L374 guard 设计)。
+    // BUG-004 fix + [MOC-123] v4 bump:升级 schema_version 到当前版本前先存原版本。
+    // 原版本 `< 4` 的 manifest 要么没追踪 atom(pre-v3),要么追踪的是已废旧 key
+    // `local-conversation-status-section-visible`(v3)—— 升 schema 后必须**同时**设
+    // capture_failed=true,否则 manual restore 把(旧 key 的 / 缺失的)pre_value 当成
+    // 现役 `show-context-window-usage` 的权威值 → None 时 remove_atom 误删 user 自己设的
+    // footer 偏好(见 apply.rs restore guard 设计)。
     let original_schema = manifest.schema_version;
     let mut recovery_manifest = manifest;
     recovery_manifest.schema_version = SNAPSHOT_SCHEMA_VERSION;
-    if original_schema < 3 {
+    if original_schema < 4 {
         recovery_manifest.electron_status_section_capture_failed = true;
     }
     if let Some(target_id) = dir_name(&target) {

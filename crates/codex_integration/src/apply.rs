@@ -465,15 +465,17 @@ fn restore_status_section_from_manifest(
         );
         return Ok(());
     }
-    // Devin Review BUG-002 fix:pre-v3 manifest 没有 atom 追踪字段(serde default
-    // 给 pre_value=None + capture_failed=false),那时的 transfer 根本没管这个
-    // atom,user 的 context-usage 偏好是他自己设的(Codex Settings)。restore 时**不动**避免误删。
-    if m.schema_version < 3 {
+    // BUG-002 fix + [MOC-123] v4 bump:`schema_version < 4` 的 manifest 要么没追踪 atom
+    // (pre-v3,serde default pre_value=None + capture_failed=false),要么追踪的是**已废
+    // 旧 key** `local-conversation-status-section-visible`(v3),都不能拿来 restore 现役
+    // `show-context-window-usage` —— pre_value=None 时会误删 user 自己设的 footer 偏好
+    // (transfer 从没 capture 过)。一律跳过,留 user 原值。
+    if m.schema_version < 4 {
         tracing::warn!(
             target: "codex_integration::apply",
             schema_version = m.schema_version,
-            "pre-v3 manifest did not track status-section atom; skipping atom restore \
-             to avoid silently removing user's current value",
+            "manifest predates the show-context-window-usage atom (schema_version < 4); \
+             skipping atom restore to avoid silently removing user's current value",
         );
         return Ok(());
     }
@@ -1921,7 +1923,7 @@ mod tests {
         let (_t, paths) = setup();
         let global_state = &paths.electron_global_state;
 
-        // 模拟 user 升级前手动 toggle 过 `/status` → atom=true
+        // 模拟 user 升级前在 Codex Settings 开过 footer → atom=true
         std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
         std::fs::write(
             global_state,
@@ -1953,6 +1955,48 @@ mod tests {
             after.pointer("/electron-persisted-atom-state/show-context-window-usage"),
             Some(&json!(true)),
             "pre-v3 manifest restore 必须不动 atom(旧 transfer 没追踪此字段,user 手动设置不该被删)"
+        );
+    }
+
+    /// [MOC-123] v4 bump 防回归:v3 manifest 由**上一版 transfer** 写,追踪的是已废旧 key
+    /// `local-conversation-status-section-visible`,其 pre_value 不代表现役
+    /// `show-context-window-usage`。restore 必须**跳过**(guard `schema_version < 4`),不能
+    /// 拿 v3 的 `None` 去 remove 新 key 误删 user 自己在 Codex Settings 开的 footer 偏好。
+    #[test]
+    fn restore_skips_v3_manifest_tracking_old_key() {
+        let (_t, paths) = setup();
+        let global_state = &paths.electron_global_state;
+
+        // user 自己在 Codex Settings 开了 footer → show-context-window-usage=true
+        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
+        std::fs::write(
+            global_state,
+            r#"{"electron-persisted-atom-state":{"show-context-window-usage":true}}"#,
+        )
+        .unwrap();
+
+        // 上一版 transfer 的 v3 manifest:追踪旧 key,新 key 视角下 pre_value=None
+        let v3_manifest = crate::snapshot::SnapshotManifest {
+            schema_version: 3,
+            snapshot_id: "v3-old-key".into(),
+            session_id: "v3-old-key".into(),
+            snapshot_at: "2026-06-01T00:00:00".into(),
+            config_existed: false,
+            auth_existed: false,
+            app_version: "v-old".into(),
+            provider_name: None,
+            electron_status_section_pre_value: None,
+            electron_status_section_capture_failed: false,
+        };
+
+        restore_status_section_from_manifest(&paths, Some(v3_manifest)).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
+        assert_eq!(
+            after.pointer("/electron-persisted-atom-state/show-context-window-usage"),
+            Some(&json!(true)),
+            "v3 manifest(追踪旧 key)restore 必须跳过,不能拿 None 误删 user 现役 footer 偏好"
         );
     }
 
