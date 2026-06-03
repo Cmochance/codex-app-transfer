@@ -39,3 +39,39 @@
    - **e5. `.app` build + 转主仓 `dist/mac/`（必须 `test ` 前缀）**：主仓 main 跑 `make mac-app` 输出 `dist/mac/Codex App Transfer.app` → rename 为 `dist/mac/test Codex App Transfer.app`（`test ` 前缀避免跟 `/Applications/Codex App Transfer.app` 用户正式版同名，Dock / Cmd-Tab 可区分）→ `pkill -f "Codex App Transfer"` 强 kill 旧 instance → `open "dist/mac/test Codex App Transfer.app"`（不 pkill 看的是旧 binary）。**绝不**擅动 `/Applications/Codex App Transfer.app`（用户正式版）。
    - **e6. 关联 issue + Linear followup 更新**：`gh issue view <ISSUE#> --json state,closedByPullRequestsReferences` 验证是否被 PR `Closes #N` 自动关，否则手动 `gh issue close <N>`。**Linear followup（workspace Mochance / team Mochance / label Improvement）跟 GitHub issue 是两套独立系统**：本次 PR 实施掉的 Linear issue（MOC-N）用 `mcp__linear__save_issue` 改 `state=Done`，并在 issue body 末尾追加 resolved PR 链接。（历史 `docs/followup-tracker.md` 制度 2026-05-24 起停用，新工作流不再写本地 .md。`docs/` 整目录已 gitignored。）
 
+5. **任务推进文档强制规则**（必须严格遵循）：
+
+   **a. 何时创建任务推进文档**：
+   - 接收新任务、涉及多步推进 / 跨 session / 含 PR 生命周期时
+   - **微改动不创建**：1 行 yaml / typo / dep bump / README link 修等仍按既有的「微改动不立即开 PR」规则处理，不强制建文档
+   - **先**于代码 / PR / Linear issue 操作
+
+   **b. 文档位置**：
+   - 活动文档：`~/alysechen/github/任务推进/<task-slug>.md`
+   - 完成后归档：`~/alysechen/github/归档/<project>/<file>.md`
+   - 命名约定（跟现有 `归档/codex-app-transfer/` 内 10 个文档一致）：`<MOC-id 或 moc###>-<kebab-desc>-YYYY-MM-DD.md`
+   - 无 MOC id 时用 `<topic>-<kebab-desc>-YYYY-MM-DD.md` 兜底
+
+   **c. 模板必含项**：
+   ```
+   # 任务推进: <task-slug>
+   **MOC / PR**: MOC-N, PR #N
+   **Worktree**: <path>
+   **起**: YYYY-MM-DD
+   **状**: 进行中 / 已完成 / 已暂停
+   ## 目标
+   <1-3 句话>
+   ## 步骤
+   - [ ] step 1
+   ## 进展
+   - YYYY-MM-DD HH:MM <action>
+   ```
+
+   **d. 推进节奏**：
+   - 步骤列表先写好再动代码
+   - 每完成一个步骤勾选 + 写进展记录
+   - scope 变化时同步改步骤列表
+
+   **e. 任务完成后归档**：
+   - `mv ~/alysechen/github/任务推进/<task-slug>.md ~/alysechen/github/归档/<project>/<MOC-id>-<kebab-desc>-YYYY-MM-DD.md`
+   - PR merge / issue Done / 主动放弃后即归档
