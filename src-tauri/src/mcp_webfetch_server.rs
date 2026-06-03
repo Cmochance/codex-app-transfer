@@ -10,14 +10,21 @@
 //! - 工具执行失败 = `result.isError=true`(让模型自我纠正), **非** JSON-RPC error;
 //!   未知 method / tool / 坏参数 = JSON-RPC error。
 //!
+//! 并发 (MOC-145): `tools/call` 在 tokio runtime 上 `spawn` 异步执行, stdin 读循环不被
+//! 长抓取阻塞 —— ping / initialize / tools/list 即时响应。出站经单写线程串行化, 防并发
+//! 响应交错写坏帧。详见 [`run`]。
+//!
 //! 后端档位(curl/wreq/headless)每次 `tools/call` 时读 `~/.codex-app-transfer/config.json`
 //! 的 `settings.webFetchBackend`(改档无需重启 Codex);`off` → isError 提示(正常此时
 //! 工具不该被注册, 防御性兜底)。
 
 use std::io::{BufRead, Write};
+use std::sync::Arc;
+use std::time::Duration;
 
 use codex_app_transfer_http::WebFetchBackend;
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 const SERVER_NAME: &str = "cat-webfetch";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,8 +32,20 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FALLBACK_PROTOCOL: &str = "2025-11-25";
 /// 返回正文截断上限(字符)。防把 MB 级页面灌给模型(类 Claude WebFetch 的 100KB 截断)。
 const MAX_CONTENT_CHARS: usize = 100_000;
+/// stdin EOF 后等在途抓取写完响应的上限(略大于单次工具超时 120s)。匹配旧同步实现
+/// "先跑完在途 fetch 再退"的行为, 不丢已在算的响应; 仍卡住的任务到点由 drop(rt) 中止。
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(125);
+/// tools/call 并发抓取上限。旧同步实现 block_on 天然串行(隐式并发=1);异步化后加显式上限,
+/// 防客户端 bug / 突发并发同时拉起 N 个 headless Chrome 耗尽资源。ping / initialize 等即时
+/// 响应类不走这里(inline 派发), 不受此限。
+const MAX_CONCURRENT_FETCHES: usize = 4;
 
-/// 入口: 阻塞读 stdin 逐行 JSON-RPC, 写 stdout。stdin EOF → 退出。
+/// 入口: 读 stdin 逐行 JSON-RPC, 派发到 tokio runtime, 经单写线程串行写 stdout。
+///
+/// **并发**(MOC-145): `tools/call` 在 runtime 上 `spawn` 异步跑, 读循环不阻塞 —— 长抓取
+/// (headless 最长 ~120s)期间 ping / initialize / tools/list 仍即时响应, 避免 Codex 依赖
+/// ping keepalive 判活时误杀本 server。出站消息经独立线程 + channel 串行化, 防多个并发
+/// 响应交错写坏帧。stdin EOF → 派发器收尾 → 有界 drain 等在途抓取写完响应 → 退出。
 pub fn run() {
     // 自带 tokio runtime(Tauri 未启动)。web_fetch 是 async, headless 还要驱动 CDP
     // handler task, 用 multi_thread 更稳。
@@ -43,114 +62,164 @@ pub fn run() {
         }
     };
 
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            // 单条非 UTF-8 坏行不该杀掉整个 server(io::Lines 在 Err 后可继续读下一行);
-            // 真 IO 错误才退出, 否则一条畸形帧 = 本会话 web_fetch 全灭。
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                eprintln!("[cat-webfetch] 跳过非 UTF-8 stdin 行: {e}");
-                continue;
-            }
-            Err(e) => {
-                eprintln!("[cat-webfetch] stdin 读失败, 退出: {e}");
-                break;
-            }
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    // 出站: 专用线程持 stdout 串行写(blocking 写不占 runtime worker; channel 序列化防
+    // 并发响应交错)。所有 sender(派发器 + 各 spawn 任务的 clone)drop 后线程退出。
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<Value>();
+    let writer = std::thread::spawn(move || {
+        let mut stdout = std::io::stdout();
+        while let Ok(msg) = out_rx.recv() {
+            write_msg(&mut stdout, &msg);
         }
-        let req: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[cat-webfetch] JSON parse 失败: {e}");
-                write_msg(&mut stdout, &rpc_error(Value::Null, -32700, "Parse error"));
-                continue;
-            }
-        };
-        let id = req.get("id").cloned(); // 通知无 id
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        match method {
-            "initialize" => {
-                let proto = req
-                    .get("params")
-                    .and_then(|p| p.get("protocolVersion"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(FALLBACK_PROTOCOL)
-                    .to_string();
-                write_msg(
-                    &mut stdout,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "protocolVersion": proto,
-                            "capabilities": { "tools": { "listChanged": false } },
-                            "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
-                        }
-                    }),
-                );
-            }
-            // 通知(无 id): 不回。
-            "notifications/initialized" | "notifications/cancelled" => {}
-            "ping" => {
-                write_msg(
-                    &mut stdout,
-                    &json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-                );
-            }
-            "tools/list" => {
-                write_msg(
-                    &mut stdout,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": { "tools": [web_fetch_tool_def()] }
-                    }),
-                );
-            }
-            "tools/call" => {
-                let params = req.get("params");
-                let name = params
-                    .and_then(|p| p.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let url = params
-                    .and_then(|p| p.get("arguments"))
-                    .and_then(|a| a.get("url"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string());
-                let call_id = id.clone().unwrap_or(Value::Null);
-                // catch_unwind: 第三方库(chromiumoxide 等)在主路径 panic 会 unwind 出
-                // block_on 杀掉整个 server 进程(panic=unwind), 使本会话 web_fetch 永久失效。
-                // 包一层 → panic 转 isError, server 存活。panic 后丢弃 future, AssertUnwindSafe 安全。
-                let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rt.block_on(handle_web_fetch_call(call_id.clone(), &name, url))
-                }))
-                .unwrap_or_else(|_| {
-                    tool_error(
-                        call_id,
-                        "抓取过程内部异常(headless 浏览器崩溃?), 已跳过本次。可重试或切换后端档位。",
-                    )
-                });
-                write_msg(&mut stdout, &resp);
-            }
-            other => {
-                // request 的未知 method → method not found;通知的未知 method → 忽略。
-                if let Some(id) = id {
-                    write_msg(
-                        &mut stdout,
-                        &rpc_error(id, -32601, &format!("Method not found: {other}")),
-                    );
+    });
+
+    // 入站: 专用线程阻塞读 stdin 逐行转发到 async 派发器(免给 src-tauri 的 tokio 加
+    // io-std/io-util feature)。EOF / 真 IO 错 → drop sender → 派发器 recv 收到 None 收尾。
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let reader = std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    if line_tx.send(l).is_err() {
+                        break; // 派发器已退出
+                    }
+                }
+                // 单条非 UTF-8 坏行不杀整个 server(Lines 在 Err 后可继续读); 真 IO 错才退。
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    eprintln!("[cat-webfetch] 跳过非 UTF-8 stdin 行: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[cat-webfetch] stdin 读失败, 退出: {e}");
+                    break;
                 }
             }
         }
-    }
+    });
+
+    // 派发循环跑在 runtime 上; tools/call spawn 进 JoinSet 并发, 不阻塞继续读。
+    rt.block_on(async move {
+        let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+        while let Some(line) = line_rx.recv().await {
+            // 顺手回收已完成 task, 防长会话内 JoinSet 无限增长。
+            while tasks.try_join_next().is_some() {}
+            dispatch_line(line, &out_tx, &mut tasks, &sem);
+        }
+        // stdin EOF: 等在途抓取写完响应再退(有界), 不丢已在算的结果(匹配旧同步行为)。
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+        // out_tx 在此 drop(closure 结束); drain 后在途 task 也都已完成并 drop 其 clone。
+    });
+
+    // drain 超时仍卡住的 task → drop(rt) 中止 → 释放其 out_tx clone → writer 收到 channel
+    // 关闭后退出。join 收尾确保 flush。
+    drop(rt);
+    let _ = writer.join();
+    let _ = reader.join();
     eprintln!("[cat-webfetch] stdin closed, exiting");
+}
+
+/// 派发一行 JSON-RPC: 即时响应类(initialize/ping/tools/list/未知)直接发 out_tx;
+/// `tools/call` spawn 进 `tasks` 并发执行(读循环不阻塞)。须在 runtime 上下文内调用。
+fn dispatch_line(
+    line: String,
+    out_tx: &std::sync::mpsc::Sender<Value>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    sem: &Arc<Semaphore>,
+) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let req: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[cat-webfetch] JSON parse 失败: {e}");
+            let _ = out_tx.send(rpc_error(Value::Null, -32700, "Parse error"));
+            return;
+        }
+    };
+    let id = req.get("id").cloned(); // 通知无 id
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    match method {
+        "initialize" => {
+            let proto = req
+                .get("params")
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(FALLBACK_PROTOCOL)
+                .to_string();
+            let _ = out_tx.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": proto,
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+                }
+            }));
+        }
+        // 通知(无 id): 不回。
+        "notifications/initialized" | "notifications/cancelled" => {}
+        "ping" => {
+            let _ = out_tx.send(json!({"jsonrpc": "2.0", "id": id, "result": {}}));
+        }
+        "tools/list" => {
+            let _ = out_tx.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "tools": [web_fetch_tool_def()] }
+            }));
+        }
+        "tools/call" => {
+            let params = req.get("params");
+            let name = params
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let url = params
+                .and_then(|p| p.get("arguments"))
+                .and_then(|a| a.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let call_id = id.clone().unwrap_or(Value::Null);
+            let out = out_tx.clone();
+            let sem = Arc::clone(sem);
+            // spawn 进 JoinSet: 抓取并发跑, 读循环立即回去处理后续消息(ping 等不被长抓取
+            // 阻塞);EOF 时可 drain 等其写完。catch_unwind: 第三方库(chromiumoxide 等)panic
+            // 只毙掉这个 task, 不杀 server(panic=unwind);转 isError 让模型自我纠正。
+            tasks.spawn(async move {
+                // 限并发抓取(满了排队); 防突发并发同时拉起 N 个 headless Chrome 耗尽资源。
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return, // semaphore 已关(收尾), 放弃本次
+                };
+                let fut = std::panic::AssertUnwindSafe(handle_web_fetch_call(
+                    call_id.clone(),
+                    &name,
+                    url,
+                ));
+                let resp = match futures::FutureExt::catch_unwind(fut).await {
+                    Ok(v) => v,
+                    Err(_) => tool_error(
+                        call_id,
+                        "抓取过程内部异常(headless 浏览器崩溃?), 已跳过本次。可重试或切换后端档位。",
+                    ),
+                };
+                let _ = out.send(resp);
+            });
+        }
+        other => {
+            // request 的未知 method → method not found;通知的未知 method → 忽略。
+            if let Some(id) = id {
+                let _ = out_tx.send(rpc_error(id, -32601, &format!("Method not found: {other}")));
+            }
+        }
+    }
 }
 
 /// 处理 `tools/call`。owned 参数, 避免跨 await 借用 req。
@@ -180,6 +249,17 @@ async fn handle_web_fetch_call(id: Value, name: &str, url: Option<String>) -> Va
         }
     };
     match codex_app_transfer_http::web_fetch(backend, &url).await {
+        // 2xx 但空 body: 不静默当成功(模型会以为抓到了空页), 给明确可操作提示。MOC-145:
+        // web_fetch 对合法空响应(如 204)返 Ok(""), 区分"空"与"抓取失败"的语义落在这里。
+        Ok(body) if body.trim().is_empty() => tool_ok(
+            id,
+            &format!(
+                "(请求成功但响应体为空 — 常见于需 JS 渲染的前端页 / 反爬拦截 / 重定向丢内容。\
+                 当前后端: {}。若内容靠 JS 渲染, 可在 codex-app-transfer 设置把内置联网抓取工具切到 \
+                 headless 档后重试; 也请确认 URL 是否正确。)",
+                backend.as_str()
+            ),
+        ),
         Ok(body) => tool_ok(id, &truncate(&body, MAX_CONTENT_CHARS)),
         Err(e) => tool_error(id, &format!("抓取失败(后端 {}): {e}", backend.as_str())),
     }

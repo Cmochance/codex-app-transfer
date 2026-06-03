@@ -3131,9 +3131,11 @@
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
-    await CCApi.saveSettings(settings);
+    const resp = await CCApi.saveSettings(settings);
     $("#proxyPort").value = settings.proxyPort;
     renderModelMenuModeState(settings);
+    // 返回后端响应:含 webFetchSyncWarning 时由 _commitWebFetch 提示(MOC-145)。
+    return resp;
   }
 
   function formatUsageItems(result) {
@@ -8429,11 +8431,17 @@
         b.classList.toggle("active", b.dataset.webfetch === v)
       );
     // 存档选中档: 成功更新 dataset.saved; 失败回退高亮 + 明确"设置保存失败"(区分"下载失败")。
+    // 注册到 Codex 失败(webFetchSyncWarning): 设置已存档(不回退), 但 toast 警告 + 返
+    // false 让调用方跳过成功 toast(避免覆盖警告)。MOC-145。
     async function _commitWebFetch(v) {
       _setWebFetchActive(v);
       try {
-        await saveSettingsFromForm();
+        const resp = await saveSettingsFromForm();
         _webFetchSeg.dataset.saved = v;
+        if (resp && resp.webFetchSyncWarning) {
+          showToast(t("settings.webFetchSyncWarning"));
+          return false;
+        }
         return true;
       } catch (e) {
         _setWebFetchActive(_webFetchSaved());
