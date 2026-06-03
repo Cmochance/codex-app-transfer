@@ -597,6 +597,16 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
             .cloned()
             .unwrap_or_else(|| json!({}));
         sync_user_language_from_settings(&settings);
+        // MOC-144:import 替换整 config 也可能改 webFetchBackend → 对齐
+        // [mcp_servers.cas-webfetch] 注册态(与 save_settings 对称;否则 import 含 headless
+        // 的配置后, 工具要到下次启动 re-sync 才注册)。sync 幂等, 无条件调即可(已一致不写)。
+        let backend = settings
+            .get("webFetchBackend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("off");
+        if let Err(e) = crate::admin::services::mcp_servers::sync_web_fetch_server(backend) {
+            tracing::error!("import 后 sync web_fetch mcp_server 失败(下次启动重试): {e}");
+        }
     }
     Json(json!({
         "success": true,
