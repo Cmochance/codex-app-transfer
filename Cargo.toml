@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/http",
     "src-tauri",
     "crates/registry",
     "crates/proxy",
@@ -19,7 +20,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 license = "MIT"
 authors = ["Codex App Transfer maintainers"]
 repository = "https://github.com/Cmochance/codex-app-transfer"

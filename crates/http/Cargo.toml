@@ -1,0 +1,28 @@
+[package]
+name = "codex-app-transfer-http"
+version = "0.1.0"
+description = "Workspace 统一 HTTP 客户端:为被 Cloudflare 强保的 OpenAI/ChatGPT 域提供浏览器 TLS 指纹伪装,其余域继续走标准 reqwest"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# 默认走标准 reqwest (跟 workspace 现状一致: rustls-tls + system-proxy + socks + http2 + stream)
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "socks", "system-proxy"] }
+# 为 OpenAI/ChatGPT 等 Cloudflare 强保域提供浏览器指纹伪装。
+# **必须 pin 死 rc 版本**:wreq/wreq-util 是 pre-release,caret 范围会解析到最新 rc,
+# 而 wreq-util 3.0.0-rc.11 是写给 wreq 6.0.0-rc.23 的(rc.29 重命名了 emulation
+# trait IntoEmulation/EmulationFactory → 编译 skew,#358 review 实证)。锁定经
+# cargo build 验证可一起编译的组合。default-features=false 关掉了 wreq 的
+# default(含 tokio-rt),必须显式加回 tokio-rt(否则 TcpConnector/GaiResolver 缺失)。
+wreq = { version = "=6.0.0-rc.23", default-features = false, features = ["stream", "webpki-roots", "socks", "system-proxy"] }
+wreq-util = "=3.0.0-rc.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+# 错误类型
+thiserror = "2"
+
+[dev-dependencies]
+# 集成测试: 真实打到 chatgpt.com 验证能过 CF (网络可达时)
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
