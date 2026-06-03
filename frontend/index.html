@@ -596,7 +596,7 @@
             <strong data-i18n="settings.codexStatusSectionDefaultVisible">Codex Desktop 对话页显示上下文圆环</strong>
             <div>
               <label class="switch-label only-switch"><input type="checkbox" id="codexStatusSectionDefaultVisible" checked><span class="switch-ui"></span></label>
-              <p class="settings-note" data-i18n="settings.codexStatusSectionDefaultVisibleHint">默认开启。让 Codex Desktop 对话页底部默认显示 context 用量圆环 + tokens/s（写到 ~/.codex/.codex-global-state.json 的 local-conversation-status-section-visible atom）。Codex Desktop 26.519+ 该字段默认 false，新装/升级 user 看不到圆环，本开关让 transfer 在 Codex 启动前 ensure 为 true。改完需要重启 Codex Desktop 生效（运行时改会被内存 atom 覆盖）。关闭则相反，由 transfer ensure 为 false。</p>
+              <p class="settings-note" data-i18n="settings.codexStatusSectionDefaultVisibleHint">默认开启。让 Codex Desktop 输入框底部（composer footer、模型名右侧）默认显示 context 用量圆环 + tokens/s（写到 ~/.codex/.codex-global-state.json 的 show-context-window-usage atom，即主进程权威源）。Codex Desktop 0.135+（实测 26.601）把该显示收敛进 footer 且默认 false，新装/升级 user 看不到圆环，本开关让 transfer 在 Codex 启动前 ensure 为 true。改完需要重启 Codex Desktop 生效（运行时改会被内存 atom 覆盖）。关闭则相反，由 transfer ensure 为 false。</p>
             </div>
           </div>
           <div class="settings-row" hidden aria-hidden="true">

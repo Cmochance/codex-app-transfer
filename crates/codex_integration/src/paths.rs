@@ -15,8 +15,8 @@ pub struct CodexPaths {
     ///
     /// Codex Desktop GUI 用 jotai `atomWithStorage` + electron-store 把若干 user-UI 偏好
     /// 持久化到这里,字段路径 `electron-persisted-atom-state.<atom-key>`。比如
-    /// `local-conversation-status-section-visible` 控制对话页底部 context 圆环 +
-    /// tokens/s 的显示(`/status` slash command 切换的就是这个 key,见 #258)。
+    /// `show-context-window-usage` 控制 composer footer 底部 context 圆环 +
+    /// tokens/s 的显示(Codex 0.135+ 收敛进 footer 的设置,见 #258 / MOC-123)。
     ///
     /// transfer 通过该路径在 Codex Desktop **启动前** ensure 某些 UI 偏好默认开启
     /// (e.g. 圆环默认显示),避免新 user / 升级 reset 后看不到关键 UI。运行时改
