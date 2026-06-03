@@ -212,11 +212,11 @@ fn main() {
                 // 只做「检测 + 必要时从导入镜像恢复」,杜绝跟外部 Codex 抢 single-use
                 // refresh_token(实测撞刷会触发 refresh_token_reused 把账号烧死)。
                 {
-                    use crate::codex_real_account::RefreshOutcome;
+                    use crate::codex_real_account::ReconcileOutcome;
                     match crate::codex_real_account::reconcile_on_startup().await {
                         // [MOC-104] 真实账号失效(镜像 token 本地 JWT 已过期、无法恢复)→ 自动
                         // 关「自动解锁」开关 + emit 事件让前端提示重新登录。
-                        Ok(RefreshOutcome::ReloginRequired { .. }) => {
+                        Ok(ReconcileOutcome::ReloginRequired { .. }) => {
                             tracing::warn!(
                                 "[RealAccount] 真实账号已失效(需重新登录),自动关闭自动解锁开关"
                             );

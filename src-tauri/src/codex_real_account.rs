@@ -66,7 +66,7 @@ pub struct RealAccountStatus {
     /// 是否存在用户导入/钉住的持久镜像(独立于 `source` —— 活动即便是 official,
     /// 镜像也可能并存)。前端据此显示「忘记导入」按钮。
     pub has_imported: bool,
-    /// 最近一次刷新/启动调谐判定「真实账号已失效、refresh_token 永久无效、需重新登录」。
+    /// 最近一次启动调谐/检测判定「真实账号已失效、refresh_token 永久无效、需重新登录」。
     /// [connector review] 持久化到可查询的 status,而非只靠一次性 `emit` 事件 —— 启动时
     /// 若前端还没注册 listener,事件会丢;前端轮询 status 时读这个字段就不会漏报失效。
     pub relogin_required: bool,
@@ -85,8 +85,8 @@ impl RealAccountStatus {
     }
 }
 
-/// [connector review] 进程级「需重新登录」标记 —— refresh/reconcile 判定 refresh_token
-/// 永久失效时置真,登录/导入/成功刷新后清零。比一次性 `emit` 事件可靠:前端任何时候
+/// [connector review] 进程级「需重新登录」标记 —— reconcile/检测判定 refresh_token
+/// 永久失效时置真,登录/导入/检测到有效账号后清零。比一次性 `emit` 事件可靠:前端任何时候
 /// 轮询 `status` 都能读到,不受「事件早于 listener 注册」的启动时序影响。
 static RELOGIN_REQUIRED: AtomicBool = AtomicBool::new(false);
 
@@ -95,7 +95,7 @@ pub fn relogin_required() -> bool {
     RELOGIN_REQUIRED.load(Ordering::SeqCst)
 }
 
-/// 设「需重新登录」标记(refresh/reconcile 判定失效时 true;有新鲜账号时 false)。
+/// 设「需重新登录」标记(reconcile/检测判定失效时 true;有新鲜账号时 false)。
 fn set_relogin_required(v: bool) {
     RELOGIN_REQUIRED.store(v, Ordering::SeqCst);
 }
@@ -205,7 +205,7 @@ fn write_imported_source_path(paths: &CodexPaths, source_path: Option<&str>) {
 /// 显式导入/钉住的持久镜像。**不扫 apply 快照备份** —— 那些是 transfer 改配置时
 /// 的内部备份(可能是几周前早已失效的旧 chatgpt),报成「你的真实账号」会误导
 /// 用户、让活动是 apikey 的人以为账号被改(用户实测反馈)。「长期保留」只认用户
-/// 主动登录/导入产生的镜像。[`detect`] / refresh / reconcile 共用,口径一致。只读。
+/// 主动登录/导入产生的镜像。[`detect`] / reconcile 共用,口径一致。只读。
 fn locate_chatgpt_auth(paths: &CodexPaths) -> Option<LocatedChatgptAuth> {
     // ① 官方活动 auth.json(Codex 当前真在用的那份)。
     if let Ok(v) = read_auth(&paths.auth_json) {
@@ -259,7 +259,7 @@ pub fn detect() -> RealAccountStatus {
             // [connector review 自愈] 活动文件本身是真实 chatgpt 且 access_token 未过期
             // (本地 JWT exp 判断,无网络)= 账号当前确实可用 → 清掉可能 stale 的
             // 「需重新登录」标记。覆盖用户在 app 外重新 `codex login` / 直接恢复活动文件、
-            // 不经 import/login/refresh 入口的场景。只在有「确实有效」的本地证据时清:
+            // 不经 import/login/reconcile 入口的场景。只在有「确实有效」的本地证据时清:
             // access_token 过期则不清(避免把真失效误报成「获取成功」)。
             if found.source == AuthSource::Official {
                 let access = found
@@ -291,11 +291,11 @@ use base64::Engine;
 /// 提前于真实过期点判失效(skew),避免 in-flight 请求恰好撞 401。
 const EXPIRY_SKEW_SECONDS: i64 = 300;
 
-/// reconcile / import 的账号检测结果(历史名沿用 `RefreshOutcome`;分流后 transfer
-/// **不再刷新**,这里只表示检测/恢复的判定,不含"刷新成功"态)。
+/// reconcile / import 的账号检测结果(transfer 分流后**绝不刷新**,故名 `ReconcileOutcome`;
+/// 只表示检测/恢复的判定,不含"刷新成功"态)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
-pub enum RefreshOutcome {
+pub enum ReconcileOutcome {
     /// 没有可用的真实 chatgpt 账号(官方活动 + 持久镜像都没有)。
     NoAccount,
     /// access_token 本地 JWT 未到期(或无法解析 → 保守视作有效),账号可用。
@@ -322,11 +322,11 @@ fn access_token_expired(access_token: &str, now_unix: i64) -> bool {
     }
 }
 
-/// [MOC-104 review P1/I-3] 串行化对 auth.json 的整个 refresh exchange + activate
-/// 写回。**异步** mutex —— 因为 refresh 的网络 POST 必须在锁内(ChatGPT refresh_token
-/// 是单次使用,两个并发 caller 各 POST 同一 token 会触发 `refresh_token_reused`
-/// 把账号卡死,openai/codex#7144),不能像 std mutex 那样只锁同步写、把网络放锁外。
-/// 锁内可跨 `.await`,故用 `tokio::sync::Mutex`。
+/// [MOC-104 review P1/I-3] 串行化 import / pin / forget / reconcile 对 auth.json + 持久镜像
+/// 的整个「读 → 判定 → 备份 → 写活动 → 写镜像」序列,防并发入口交错写互相覆盖。
+/// **异步** mutex —— 锁内跨多次 `.await`(文件 IO),不能用只锁同步段的 std mutex。
+/// 注:transfer 分流后**不在锁内做任何刷新网络 POST**(刷新归源头 Codex —— transfer 与其
+/// 共享 single-use refresh_token,自己刷会触发 `refresh_token_reused` 烧账号,openai/codex#7144)。
 static AUTH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── 登录:调起官方 codex login(MOC-104 req#3)────────────────────────
@@ -516,7 +516,7 @@ pub async fn import_auth(source_path: String) -> Result<(), String> {
 
 /// 钉住当前检测到的真实账号(官方活动 auth.json)进持久镜像。
 /// [review #5] locate + 写全程持 `AUTH_LOCK`,避免锁外读到 stale 值、随后被并发
-/// refresh 抢先轮换 token,导致 pin 用过期 access + 已花掉的 refresh 覆盖刚刷新的。
+/// reconcile/import 抢先改写 auth.json,导致 pin 钉到被覆盖前的旧值。
 pub async fn pin_current_account() -> Result<(), String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
@@ -528,7 +528,7 @@ pub async fn pin_current_account() -> Result<(), String> {
 
 /// 忘记导入的真实账号(删持久镜像)= 退出"真实账号长期生效"。删镜像后启动不再
 /// 自动恢复。删除已不存在的镜像视作成功(幂等)。
-/// [review #1] 持 `AUTH_LOCK`,避免与 in-flight refresh 竞态(删了之后 refresh
+/// [review #1] 持 `AUTH_LOCK`,避免与 in-flight reconcile/import 竞态(删了之后 reconcile
 /// 的 `write_auth` 又把镜像重建出来 → 已"忘记"的账号复活)。
 pub async fn forget_imported() -> Result<bool, String> {
     let _guard = AUTH_LOCK.lock().await;
@@ -553,11 +553,11 @@ pub async fn forget_imported() -> Result<bool, String> {
 /// **活源路径**重读最新(跟随源 Codex 刷新)、源失效回落镜像快照,先备份再写。**只对
 /// 用户显式导入/钉住的账号自动恢复**,不抢别的活动文件(避免误覆盖代理 apikey)。
 /// 选中那份本地 JWT 已过期 → 标记 relogin、不写废 token。best-effort。
-pub async fn reconcile_on_startup() -> Result<RefreshOutcome, String> {
+pub async fn reconcile_on_startup() -> Result<ReconcileOutcome, String> {
     // [review #2] 有 codex login 正在进行 → 跳过调谐,别跟 codex login 抢写 auth.json。
     if matches!(login_status(), LoginState::Running) {
         tracing::info!("[RealAccount] 启动调谐跳过:codex login 进行中");
-        return Ok(RefreshOutcome::NoAccount);
+        return Ok(ReconcileOutcome::NoAccount);
     }
     // [MOC-104 分流] transfer **不再**在启动时 POST 刷新 token —— 刷新权交给源头 Codex:
     // 检测获取(Official)由本机 Codex 自刷新 `~/.codex/auth.json`;导入(Imported)由源那边
@@ -569,13 +569,13 @@ pub async fn reconcile_on_startup() -> Result<RefreshOutcome, String> {
     let _guard = AUTH_LOCK.lock().await;
     if matches!(login_status(), LoginState::Running) {
         tracing::info!("[RealAccount] reconcile 跳过:codex login 进行中");
-        return Ok(RefreshOutcome::NoAccount);
+        return Ok(ReconcileOutcome::NoAccount);
     }
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
 
     // 活动已是真实 chatgpt → 共用、绝不动(Codex 自维护这份,transfer 只读跟随、不覆盖)。
     if active_is_real_chatgpt(&paths) {
-        return Ok(RefreshOutcome::StillValid {
+        return Ok(ReconcileOutcome::StillValid {
             source: AuthSource::Official,
         });
     }
@@ -594,7 +594,7 @@ pub async fn reconcile_on_startup() -> Result<RefreshOutcome, String> {
         Some(v) => (v, true),
         None => match read_imported_mirror(&paths) {
             Some(v) => (v, false),
-            None => return Ok(RefreshOutcome::NoAccount),
+            None => return Ok(ReconcileOutcome::NoAccount),
         },
     };
     let origin = if from_live_source {
@@ -612,7 +612,7 @@ pub async fn reconcile_on_startup() -> Result<RefreshOutcome, String> {
         tracing::warn!(
             "[RealAccount] 导入账号 token 本地已过期({origin}),不恢复废 token,标记需重新登录"
         );
-        return Ok(RefreshOutcome::ReloginRequired {
+        return Ok(ReconcileOutcome::ReloginRequired {
             source: AuthSource::Imported,
         });
     }
@@ -624,7 +624,7 @@ pub async fn reconcile_on_startup() -> Result<RefreshOutcome, String> {
         let _ = write_auth(&imported_mirror_path(&paths), &chosen);
     }
     tracing::info!("[RealAccount] 启动调谐:活动非真实账号,已从{origin}恢复(不刷新)");
-    Ok(RefreshOutcome::StillValid {
+    Ok(ReconcileOutcome::StillValid {
         source: AuthSource::Imported,
     })
 }
