@@ -325,7 +325,8 @@ fn minimax_m3_keeps_system_and_standard_fields() {
         ],
         "response_format": {"type": "json_object"},
         "parallel_tool_calls": true,
-        "reasoning_effort": "high"
+        "reasoning_effort": "high",
+        "tool_choice": "required"
     })
     .as_object()
     .expect("json object")
@@ -352,6 +353,11 @@ fn minimax_m3_keeps_system_and_standard_fields() {
     assert!(
         body.contains_key("reasoning_effort"),
         "M3 应保留 reasoning_effort(实测接受,按规范透传上游而非剥除)"
+    );
+    assert_eq!(
+        body.get("tool_choice").and_then(|v| v.as_str()),
+        Some("required"),
+        "M3 应保留 tool_choice=required(实测支持,不降级到 auto)"
     );
 }
 

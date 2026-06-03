@@ -1577,12 +1577,17 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
     sanitize_minimax_tool_call_arguments(body);
     sanitize_minimax_tools(body);
 
-    if let Some(choice) = body.get_mut("tool_choice") {
-        let allowed = choice
-            .as_str()
-            .is_some_and(|s| matches!(s, "auto" | "none"));
-        if !allowed {
-            *choice = Value::String("auto".into());
+    // M2.x 只接受 tool_choice=auto/none,其它(required / 具名 function)降级到 auto。
+    // M3 起支持 required(2026-06-03 真机实测:tool_choice=required → 200 且真的发起
+    // tool_call),不降级,保留客户端的强制调用意图。
+    if !is_m3_plus {
+        if let Some(choice) = body.get_mut("tool_choice") {
+            let allowed = choice
+                .as_str()
+                .is_some_and(|s| matches!(s, "auto" | "none"));
+            if !allowed {
+                *choice = Value::String("auto".into());
+            }
         }
     }
 
