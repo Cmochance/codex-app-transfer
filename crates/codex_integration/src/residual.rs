@@ -4,14 +4,20 @@
 //! 检测是否含 transfer apply 残留字段并提供针对性清除。
 //!
 //! 设计目标:
-//! - **高精度签名**:只用 `model_catalog_json` 指向 app_home 与 `openai_base_url`
-//!   指向 transfer proxy(`http://127.0.0.1:<port>`)这两个值绝对来自 transfer
-//!   的特征字段判定污染,避免误清用户合法手写的 `sandbox_mode` 等 key。
+//! - **高精度签名**:只用三个绝对来自 transfer 的特征字段判定污染,避免误清
+//!   用户合法手写的 `sandbox_mode` 等 key:
+//!   - `model_catalog_json` 指向 app_home
+//!   - `openai_base_url` 指向 transfer proxy(`http://127.0.0.1:<port>`)
+//!   - `chatgpt_base_url` 指向 transfer proxy 的 backend 透传口
+//!     (`http://127.0.0.1:<port>/backend-api`,MOC-104 relay 写;default 是
+//!     `https://chatgpt.com/backend-api`,绝不会是 127.0.0.1)
 //! - **关联 strip**:
 //!   - 命中 `model_catalog_json` → 删该键
 //!   - 命中 `openai_base_url` → 该键加 `model_context_window`/`sandbox_mode`/
 //!     `approval_policy` 一起删(transfer apply 套餐固定四件套,见
 //!     [`crate::apply::MANAGED_TOML_KEYS`])
+//!   - 命中 `chatgpt_base_url` → 单独删该键(relay 模式独立写入,不连带
+//!     base_url 套餐;见 [`crate::apply`] §2a')
 //! - **快照 != live**:active snapshot 存在时 live 的 transfer 字段属于当前
 //!   apply 生效状态,不算污染;但任何 snapshot 自己带 transfer 字段都算
 //!   污染 — 因为 snapshot 的语义是"apply 之前的用户原始配置"。
@@ -34,6 +40,14 @@ const BASE_URL_BUNDLE: &[&str] = &[
 /// 命中 `model_catalog_json` 时单独 strip。
 const CATALOG_KEY: &str = "model_catalog_json";
 
+/// 命中 `chatgpt_base_url` 指向 proxy 时单独 strip(MOC-104 relay 模式独立写入,
+/// 不连带 `BASE_URL_BUNDLE` 套餐)。
+const CHATGPT_BASE_URL_KEY: &str = "chatgpt_base_url";
+
+/// transfer relay 写入 `chatgpt_base_url` 时拼的 backend 透传 path 后缀
+/// (`apply.rs` §2a':`format!("{base_url}/backend-api")`)。
+const CHATGPT_BACKEND_API_SUFFIX: &str = "/backend-api";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PollutionSourceKind {
@@ -54,6 +68,11 @@ pub enum MatchedSignature {
     /// `openai_base_url` 值是 `http://127.0.0.1:<known_proxy_port>`
     #[serde(rename_all = "camelCase")]
     OpenaiBaseUrlTransferProxy { value: String, proxy_port: u16 },
+    /// `chatgpt_base_url` 值是 `http://127.0.0.1:<known_proxy_port>/backend-api`
+    /// (MOC-104 relay 模式 100% transfer 写过;Codex default 是
+    /// `https://chatgpt.com/backend-api`,绝不指向 127.0.0.1)
+    #[serde(rename_all = "camelCase")]
+    ChatgptBaseUrlTransferProxy { value: String, proxy_port: u16 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +278,23 @@ pub fn detect_signatures_in_text(
                 }
             }
         }
+
+        // MOC-148:relay 模式残留的 `chatgpt_base_url`。值是
+        // `http://127.0.0.1:<port>/backend-api`(apply.rs §2a' 拼的)。default
+        // 是 `https://chatgpt.com/backend-api`,绝不指向 127.0.0.1,所以命中
+        // 即 100% transfer 残留。
+        if let Some(value) = parse_root_string_value(stripped, "chatgpt_base_url") {
+            for port in proxy_ports {
+                let expected = format!("http://127.0.0.1:{port}{CHATGPT_BACKEND_API_SUFFIX}");
+                if value == expected {
+                    out.push(MatchedSignature::ChatgptBaseUrlTransferProxy {
+                        value: value.clone(),
+                        proxy_port: *port,
+                    });
+                    break;
+                }
+            }
+        }
     }
     out
 }
@@ -271,6 +307,9 @@ fn compute_fields_to_strip(matched: &[MatchedSignature]) -> Vec<String> {
     let has_base_url = matched
         .iter()
         .any(|m| matches!(m, MatchedSignature::OpenaiBaseUrlTransferProxy { .. }));
+    let has_chatgpt_base_url = matched
+        .iter()
+        .any(|m| matches!(m, MatchedSignature::ChatgptBaseUrlTransferProxy { .. }));
     if has_catalog {
         fields.push(CATALOG_KEY.to_string());
     }
@@ -278,6 +317,9 @@ fn compute_fields_to_strip(matched: &[MatchedSignature]) -> Vec<String> {
         for k in BASE_URL_BUNDLE {
             fields.push((*k).to_string());
         }
+    }
+    if has_chatgpt_base_url {
+        fields.push(CHATGPT_BASE_URL_KEY.to_string());
     }
     fields.sort();
     fields.dedup();
@@ -420,6 +462,72 @@ approval_policy = \"never\"
         assert_eq!(m.len(), 2, "应识别 catalog + base_url 两条签名: {m:?}");
     }
 
+    // ── detect_signatures_in_text: chatgpt_base_url (MOC-148) ──────────
+
+    #[test]
+    fn detects_chatgpt_base_url_matching_proxy_backend_api() {
+        let toml = "chatgpt_base_url = \"http://127.0.0.1:18080/backend-api\"\n";
+        let m = detect_signatures_in_text(toml, &app_config_json(), &[18080]);
+        assert_eq!(m.len(), 1);
+        match &m[0] {
+            MatchedSignature::ChatgptBaseUrlTransferProxy { proxy_port, .. } => {
+                assert_eq!(*proxy_port, 18080)
+            }
+            _ => panic!("wrong variant: {m:?}"),
+        }
+    }
+
+    #[test]
+    fn detects_chatgpt_base_url_against_multiple_known_ports() {
+        // 用户改了 proxy port 到 19000,老 snapshot 还存 18080 → 都要识别
+        let toml = "chatgpt_base_url = \"http://127.0.0.1:18080/backend-api\"\n";
+        let m = detect_signatures_in_text(toml, &app_config_json(), &[19000, 18080]);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn ignores_chatgpt_base_url_default_chatgpt_com() {
+        // Codex default,用户原值,绝不能误清
+        let toml = "chatgpt_base_url = \"https://chatgpt.com/backend-api\"\n";
+        let m = detect_signatures_in_text(toml, &app_config_json(), &[18080]);
+        assert!(m.is_empty(), "Codex 默认 chatgpt.com 后端不该被 flag");
+    }
+
+    #[test]
+    fn ignores_chatgpt_base_url_without_backend_api_suffix() {
+        // 缺 /backend-api 后缀 → 不是 transfer relay 写的形态,精确匹配不命中
+        let toml = "chatgpt_base_url = \"http://127.0.0.1:18080\"\n";
+        let m = detect_signatures_in_text(toml, &app_config_json(), &[18080]);
+        assert!(m.is_empty(), "缺 /backend-api 后缀不应命中 relay signature");
+    }
+
+    #[test]
+    fn ignores_chatgpt_base_url_unknown_localhost_port() {
+        let toml = "chatgpt_base_url = \"http://127.0.0.1:9999/backend-api\"\n";
+        let m = detect_signatures_in_text(toml, &app_config_json(), &[18080]);
+        assert!(m.is_empty(), "未知 port 不该误判");
+    }
+
+    #[test]
+    fn detects_all_three_signatures_in_full_relay_apply_toml() {
+        // relay 模式 apply 后的 config.toml 同时含 base_url + catalog + chatgpt_base_url
+        let toml = "\
+openai_base_url = \"http://127.0.0.1:18080\"
+chatgpt_base_url = \"http://127.0.0.1:18080/backend-api\"
+model_context_window = 1000000
+model_catalog_json = \"/Users/alice/.codex-app-transfer/config.json\"
+model = \"gpt-5.5\"
+sandbox_mode = \"danger-full-access\"
+approval_policy = \"never\"
+";
+        let m = detect_signatures_in_text(toml, &app_config_json(), &[18080]);
+        assert_eq!(
+            m.len(),
+            3,
+            "应识别 catalog + base_url + chatgpt_base_url: {m:?}"
+        );
+    }
+
     // ── compute_fields_to_strip ────────────────────────────────────────
 
     #[test]
@@ -459,6 +567,39 @@ approval_policy = \"never\"
         let fields = compute_fields_to_strip(&matched);
         assert_eq!(fields.len(), 5);
         assert!(fields.contains(&"model_catalog_json".to_string()));
+        assert!(fields.contains(&"openai_base_url".to_string()));
+        assert!(fields.contains(&"model_context_window".to_string()));
+        assert!(fields.contains(&"sandbox_mode".to_string()));
+        assert!(fields.contains(&"approval_policy".to_string()));
+    }
+
+    #[test]
+    fn fields_to_strip_for_chatgpt_base_url_only_is_independent() {
+        // MOC-148:命中 chatgpt_base_url 只 strip 它自己,不连带 base_url 套餐
+        let matched = vec![MatchedSignature::ChatgptBaseUrlTransferProxy {
+            value: "x".into(),
+            proxy_port: 18080,
+        }];
+        let fields = compute_fields_to_strip(&matched);
+        assert_eq!(fields, vec!["chatgpt_base_url"]);
+    }
+
+    #[test]
+    fn fields_to_strip_chatgpt_and_base_url_coexist() {
+        // relay 残留:base_url 套餐(4) + chatgpt_base_url(1) = 5,排序去重
+        let matched = vec![
+            MatchedSignature::OpenaiBaseUrlTransferProxy {
+                value: "x".into(),
+                proxy_port: 18080,
+            },
+            MatchedSignature::ChatgptBaseUrlTransferProxy {
+                value: "y".into(),
+                proxy_port: 18080,
+            },
+        ];
+        let fields = compute_fields_to_strip(&matched);
+        assert_eq!(fields.len(), 5);
+        assert!(fields.contains(&"chatgpt_base_url".to_string()));
         assert!(fields.contains(&"openai_base_url".to_string()));
         assert!(fields.contains(&"model_context_window".to_string()));
         assert!(fields.contains(&"sandbox_mode".to_string()));
