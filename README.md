@@ -19,7 +19,7 @@
 <p align="center">
   <a href="https://github.com/Cmochance/codex-app-transfer/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/Cmochance/codex-app-transfer?style=social"></a>
   <a href="LICENSE.txt"><img alt="License" src="https://img.shields.io/github/license/Cmochance/codex-app-transfer"></a>
-  <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust"></a>
+  <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust"></a>
   <a href="https://v2.tauri.app/"><img alt="Tauri" src="https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri"></a>
   <a href="https://github.com/Cmochance/codex-app-transfer/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/Cmochance/codex-app-transfer/total?label=downloads"></a>
 </p>
@@ -269,7 +269,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 ## 技术栈
 
-- **后端 / 转发**:Rust 1.80+ · axum 0.8 · reqwest 0.12(rustls-tls)· tokio · `wreq` 6.0-rc(浏览器 TLS 指纹伪装,给 Cloudflare 强保的 `openai.com` / `chatgpt.com` 用,详见 `crates/http/`)
+- **后端 / 转发**:Rust 1.85+ · axum 0.8 · reqwest 0.12(rustls-tls)· tokio · `wreq` 6.0-rc(浏览器 TLS 指纹伪装,给 Cloudflare 强保的 `openai.com` / `chatgpt.com` 用,详见 `crates/http/`)
 - **协议适配**:`crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web 互转(请求 body + 流式响应状态机 + reasoning_content + tool_calls)
 - **前端**:HTML + CSS + 原生 JavaScript + Bootstrap 5.3.3(本地化,无 CDN 依赖)
 - **桌面壳**:Tauri 2 + tray-icon 0.23,通过 `cas://` URI scheme 把 frontend/ 与 axum 同进程串起来,无 TCP loopback

@@ -18,8 +18,6 @@ pub enum ImpersonatingError {
     Build(String),
     #[error("wreq request error: {0}")]
     Request(String),
-    #[error("wreq body error: {0}")]
-    Body(String),
 }
 
 /// 浏览器指纹 HTTP 客户端 (轻量包装, 内部存一个 `wreq::Client`)
@@ -32,17 +30,14 @@ impl ImpersonatingClient {
     /// Chrome 120 指纹 (2024-01 发布的稳定 major)
     ///
     /// 配套: 30s 总超时 / 10s connect 超时 / 走 workspace rustls roots。
-    pub fn chrome_120() -> Self {
+    pub fn chrome_120() -> Result<Self, ImpersonatingError> {
         let inner = Client::builder()
             .emulation(Emulation::Chrome120)
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()
-            .map_err(|e| ImpersonatingError::Build(e.to_string()))
-            .expect(
-                "wreq Client::builder with Chrome120 emulation should not fail in normal setup",
-            );
-        Self { inner }
+            .map_err(|e| ImpersonatingError::Build(e.to_string()))?;
+        Ok(Self { inner })
     }
 
     pub fn get(&self, url: &str) -> ImpersonatingRequestBuilder<'_> {
