@@ -7315,16 +7315,17 @@
         ? "border:2px solid var(--bs-primary);box-shadow:0 0 0 3px rgba(13,110,253,0.18);"
         : "border:1px solid var(--bs-border-color);";
       const checkBadge = checked ? `<span style="position:absolute;top:6px;left:8px;background:var(--bs-primary);color:#fff;font-size:11px;padding:2px 8px;border-radius:8px;pointer-events:none;z-index:2;">✓</span>` : "";
-      const idEscaped = String(th.id).replace(/'/g, "\\'");
+      // data-theme-* 属性上下文:用 escapeHtml(转 & < > " '),旧 inline-onclick 时代的 ' 转义已不适用。
+      const idEscaped = escapeHtml(String(th.id));
       const isCustom = th.id === "custom";
       // 右上"替换"小角标 — 仅 custom
       const replaceBadge = isCustom
         ? `<span class="theme-custom-replace" title="${escapeHtml(lang === "en" ? "Replace image" : "替换图片")}" style="position:absolute;top:6px;right:36px;background:rgba(0,0,0,0.55);color:#fff;font-size:11px;padding:2px 8px;border-radius:8px;cursor:pointer;z-index:3;" data-theme-replace>${escapeHtml(lang === "en" ? "Replace" : "替换")}</span>`
         : "";
       // 右上 X 删除按钮 — 每张都有。内置 = 隐藏(持久化 themeHiddenIds);custom = 真删 disk。
-     const deleteBtn = `<span class="theme-delete-btn" title="${escapeHtml(isCustom ? (lang === "en" ? "Delete" : "删除") : (lang === "en" ? "Hide" : "隐藏"))}" style="position:absolute;top:6px;right:8px;background:rgba(0,0,0,0.55);color:#fff;font-size:14px;line-height:1;width:22px;height:22px;border-radius:11px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;" data-theme-delete data-theme-id="${idEscaped}" data-theme-custom="${isCustom}">×</span>`;
+      const deleteBtn = `<span class="theme-delete-btn" title="${escapeHtml(isCustom ? (lang === "en" ? "Delete" : "删除") : (lang === "en" ? "Hide" : "隐藏"))}" style="position:absolute;top:6px;right:8px;background:rgba(0,0,0,0.55);color:#fff;font-size:14px;line-height:1;width:22px;height:22px;border-radius:11px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;" data-theme-delete data-theme-id="${idEscaped}" data-theme-custom="${isCustom}">×</span>`;
       return `
-       <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" data-theme-pick data-theme-id="${idEscaped}">
+        <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" data-theme-pick data-theme-id="${idEscaped}">
           ${checkBadge}
           ${replaceBadge}
           ${deleteBtn}
@@ -7340,7 +7341,7 @@
     const hasCustom = visibleThemes.some((th) => th.id === "custom");
     if (!hasCustom) {
       cards.push(`
-       <div class="card-theme-add" style="position:relative;border:1.5px dashed var(--bs-border-color);border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);user-select:none;" data-theme-add>
+        <div class="card-theme-add" style="position:relative;border:1.5px dashed var(--bs-border-color);border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);user-select:none;" data-theme-add>
           <div style="width:100%;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--bs-secondary-color);font-size:42px;background:linear-gradient(135deg,#1f1414,#2a1818);"><i class="bi bi-plus-circle"></i></div>
           <div style="padding:8px 10px;text-align:center;">
             <div style="font-weight:600;font-size:14px;color:var(--bs-secondary-color);">${escapeHtml(lang === "en" ? "Add custom" : "添加自定义")}</div>
@@ -7674,7 +7675,6 @@
       }
     });
 
-    // 卡片点击 — 全局 fn `window.__themePickHandler`,inline onclick 触发。
     // 卡片点击 — CSP-compatible 事件委托:#themeListContainer 上绑一次即可,
     // 不需要 inline onclick(后者被 script-src 'self' 拦截)。
     //
