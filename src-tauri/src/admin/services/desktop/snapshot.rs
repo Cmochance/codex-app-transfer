@@ -43,7 +43,7 @@ pub struct DesktopConfigTarget {
     /// #258:Codex Desktop 对话页底部 context 圆环 + tokens/s 默认显示开关
     /// (从 `Settings.codexStatusSectionDefaultVisible` 读取,默认 `true`)。
     /// 写入 `~/.codex/.codex-global-state.json` 的
-    /// `electron-persisted-atom-state.local-conversation-status-section-visible`。
+    /// `electron-persisted-atom-state.show-context-window-usage`。
     pub codex_status_section_default_visible: bool,
     /// [MOC-69] model id → 人类可读 displayName(JSON object)。仅 antigravity 非空
     /// (从 static seed 构建);Codex Desktop model catalog 的 `display_name` 优先用它,

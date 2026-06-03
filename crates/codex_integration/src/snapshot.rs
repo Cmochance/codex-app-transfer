@@ -44,8 +44,9 @@ pub struct SnapshotManifest {
     #[serde(default)]
     pub provider_name: Option<String>,
     /// `~/.codex/.codex-global-state.json` 里
-    /// `electron-persisted-atom-state.local-conversation-status-section-visible`
-    /// 在 snapshot 拍摄时的原值。
+    /// `electron-persisted-atom-state.show-context-window-usage`
+    /// (见 [`crate::electron_state::CONTEXT_USAGE_ATOM_KEY`])在 snapshot 拍摄时的原值。
+    /// (字段名保留 `status_section` 作 manifest serde 向后兼容,语义现为 context-usage atom。)
     ///
     /// **三态语义**(配合 `electron_status_section_capture_failed`):
     /// - `capture_failed=false` + `Some(v)` → snapshot 时已读到该值,restore 走 write_atom 复原
@@ -222,7 +223,7 @@ pub fn snapshot_codex_state(
     let (electron_status_section_pre_value, electron_status_section_capture_failed) =
         match crate::electron_state::read_atom(
             &paths.electron_global_state,
-            crate::electron_state::STATUS_SECTION_VISIBLE_KEY,
+            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
         ) {
             // Devin Review BUG-003 fix:atom 可能被 user 手动 / 未来 Codex Desktop
             // 写成非 boolean(number / string),`as_bool()` 返 None 会被误当成
@@ -611,7 +612,7 @@ fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), C
     // 如果是 pre-v3 manifest(没追踪 status-section atom),升 schema 后
     // 必须**同时**设 capture_failed=true,否则 manual restore 时 atom 三态
     // 全是 default(None+false)→ 误判为"snapshot 时 atom 不存在"→ remove_atom
-    // → silently 抹掉 user 升级后手动设的 `/status` 偏好(见 apply.rs#L374 guard 设计)。
+    // → silently 抹掉 user 手动设的 context-usage 偏好(Codex Settings)(见 apply.rs#L374 guard 设计)。
     let original_schema = manifest.schema_version;
     let mut recovery_manifest = manifest;
     recovery_manifest.schema_version = SNAPSHOT_SCHEMA_VERSION;
@@ -970,7 +971,7 @@ mod tests {
     /// Devin Review BUG-004 防回归:pre-v3 (schema_version=2) 的 stale active
     /// 被升级到 recovery 时,必须**同时**标 capture_failed=true,否则后续 manual
     /// restore 时(schema 已升 v3 + 三态默认 None/false)会误判"snapshot 时 atom
-    /// 不存在" → remove_atom → silently 抹掉 user 升级后手动设的 `/status` 偏好。
+    /// 不存在" → remove_atom → silently 抹掉 user 手动设的 context-usage 偏好(Codex Settings)。
     #[test]
     fn pre_v3_stale_recovery_upgrade_marks_capture_failed() {
         let (_t, paths) = paths_with_tmp();
