@@ -329,7 +329,9 @@ fn minimax_m3_keeps_tool_strict_but_m2_drops() {
     let mut m3 = mk("MiniMax-M3");
     sanitize_minimax_chat_body(&mut m3);
     assert_eq!(
-        m3["tools"][0]["function"].get("strict").and_then(|v| v.as_bool()),
+        m3["tools"][0]["function"]
+            .get("strict")
+            .and_then(|v| v.as_bool()),
         Some(true),
         "M3 应保留 tool function.strict(实测接受)"
     );
