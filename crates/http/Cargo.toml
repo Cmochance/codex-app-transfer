@@ -33,7 +33,7 @@ chromiumoxide = "0.9"
 # handler stream 必须 spawn 驱动 (StreamExt::next),否则 CDP 不前进。
 futures = "0.3"
 # 解压按需下载的 chrome-headless-shell zip (同步 API,在 spawn_blocking 里跑)。
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # app data 目录: chrome-headless-shell 落 ~/.codex-app-transfer/browsers/ (跨平台 home_dir)。
 dirs = "6"
 htmd = "0.5"

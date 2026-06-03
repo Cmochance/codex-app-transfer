@@ -46,7 +46,7 @@ base64 = "0.22"
 # Theme 自定义背景(#264):decode 用户上传图 → 中心 crop 方形 → resize → encode JPEG。
 # default-features = false 关掉 GIF/WebP/ICO/PNM 等少用格式只保 JPG/PNG,减体积。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-getrandom = "0.2"
+getrandom = "0.4"
 # 以下 5 项为 cas:// scheme 静态文件路由的跨平台依赖,
 # 之前误放在 [target.macos] 块下导致 Linux/Windows cargo check 失败。
 tower = "0.5"
@@ -57,7 +57,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "http2", "socks", "system-proxy", "gzip"] }
 # sha2 "oid" feature 让 `Pkcs1v15Sign::new::<Sha256>()` 编译过 (admin/signature.rs
 # 客户端验签需要 OID-tagged Sha256, 跟 xtask/Cargo.toml 设置对齐避免 cross-impl drift)。
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
 # RSA-3072 PKCS1-v15-SHA256 客户端验签 (update.rs:fetch_latest_json + download_asset_impl
 # 双侧 verify 通过 admin::signature::verify_signed_bytes)。算法跟 xtask/release_bundle.rs
 # 对称: xtask sign side / src-tauri verify side 同 crate 同版本, 防 cross-impl drift。
@@ -65,7 +65,7 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 # toml_edit 保留注释 / 字段顺序 / 空行,用于 #24 MCP tab 的 config.toml 受管块
 # (TomlManagedBlock variant 解析 [mcp_servers.<name>] table 时不能丢用户注释)。
 # 普通 `toml` crate from_str + to_string 会丢注释 → marker 注释失效, 不可用。
-toml_edit = "0.22"
+toml_edit = "0.25"
 # tar / gzip — MCP plugin marketplace 安装走 tar.gz download → 解压到 ~/.codex/plugins/cache/
 tar = "0.4"
 flate2 = "1.0"
@@ -74,14 +74,14 @@ flate2 = "1.0"
 # (POSIX) / LockFileEx (Windows),OS 级独占。
 fs2 = "0.4"
 # CDP WebSocket 连接（Codex Plugins 解锁器）
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 # futures 用于 WebSocket Stream/Sink 的 split 操作
 futures = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # objc2 / objc2-foundation 不直接声明:代码只 use objc2_app_kit,这俩作为
 # objc2-app-kit 的传递依赖自动可用,显式列为直接依赖是冗余(cargo-machete 真阳性)。
-objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplication"] }
 
 # Windows MSIX Codex Desktop 启动 — IApplicationActivationManager COM 调用
 # 让 packaged Codex.exe 接收 `--remote-debugging-port=9222` 启动参数,
@@ -89,7 +89,7 @@ objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplic
 # 借鉴 BigPizzaV3/CodexPlusPlus `codex_session_delete/launcher.py:347-395`,
 # 用 windows-rs 官方 binding 而非手搓 ctypes COM,稳定性更好。
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.59", features = [
+windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     # MOC-94:原生进程枚举(替 spawn tasklist)判断 Codex 是否在运行
