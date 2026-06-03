@@ -20,9 +20,16 @@
 //! 懒加载更可靠 (不漏内容); 超 [`HeadlessConfig::networkidle_timeout`] 仍未静默则回退
 //! 继续 (长连接 / 轮询页不至于卡死)。idle 后再小 settle 一次收尾微任务渲染。
 //!
+//! ## 反检测 (MOC-152)
+//! 导航前对页面启用 stealth (chromiumoxide 自带 `enable_stealth_mode_with_agent`): 抹
+//! `navigator.webdriver`、伪造 `window.chrome` / plugins / WebGL vendor, 并把 UA 里的
+//! `HeadlessChrome` 换回 `Chrome` —— 等价 puppeteer-extra-plugin-stealth 核心 evasion,
+//! 可过**被动**指纹 / 简单 JS 挑战类 Cloudflare。
+//!
 //! ## 已知边界
-//! - 不对抗主动反爬 (Cloudflare Turnstile/DataDome 等); 本层界定为 "抓 JS 渲染 SPA"。
-//! - 接入分层 router (检测空骨架 → 升级 ③) 作后续 PR。
+//! - 过不了**交互式** 反爬 (Cloudflare Turnstile/DataDome 托管挑战等); 这类需真人机交互,
+//!   不在轻量范围。
+//! - 本层界定为 "抓 JS 渲染 SPA + 被动反爬"。
 
 mod detect;
 mod download;
@@ -114,6 +121,11 @@ async fn chrome_binary_works(_bin: &std::path::Path) -> bool {
     true
 }
 
+// stealth UA 兜底: 仅当读真实 navigator.userAgent 失败时用。优先沿用真实 Chrome UA
+// (去掉 HeadlessChrome 标记), 这里只是 best-effort 退路, 选一个近期稳定版 Chrome。
+const STEALTH_UA_FALLBACK: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 // 临时 profile 目录序号: 同进程内多个实例不撞目录 (Chrome 同 profile 会 lock 冲突)。
 static PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -166,6 +178,9 @@ impl HeadlessBrowser {
                 "--disable-dev-shm-usage",
                 "--hide-scrollbars",
                 "--disable-extensions",
+                // 反检测 (MOC-152): 关 AutomationControlled blink 特性, 浏览器层抹掉
+                // navigator.webdriver (与每页注入的 stealth 脚本互补)。
+                "--disable-blink-features=AutomationControlled",
             ])
             .build()
             .map_err(|e| HeadlessError::Launch(format!("BrowserConfig build 失败: {e}")))?;
@@ -217,6 +232,23 @@ impl HeadlessBrowser {
                 return Err(HeadlessError::Fetch(msg));
             }
         };
+
+        // 反检测 (MOC-152): 导航**前**在 about:blank 上启用 stealth —— 抹 navigator.webdriver、
+        // 伪造 window.chrome / plugins / WebGL vendor (chromiumoxide 自带, 等价
+        // puppeteer-extra-plugin-stealth 核心 evasion, 经 addScriptToEvaluateOnNewDocument
+        // 对随后导航的目标文档生效)。同时把 UA 里的 HeadlessChrome 换成 Chrome (沿用真实
+        // Chrome 版本, 不留 headless 标记 / 老版本号被被动反爬识破)。best-effort: 失败仅降低
+        // 过墙率, 不阻断本次抓取。诚实边界: 仍过不了交互式 Turnstile / DataDome。
+        let ua = page
+            .evaluate("navigator.userAgent")
+            .await
+            .ok()
+            .and_then(|r| r.into_value::<String>().ok())
+            .map(|ua| ua.replace("HeadlessChrome", "Chrome"))
+            .unwrap_or_else(|| STEALTH_UA_FALLBACK.to_string());
+        if let Err(e) = page.enable_stealth_mode_with_agent(&ua).await {
+            eprintln!("[headless] 启用 stealth 失败 (继续抓取): {e}");
+        }
 
         // 导航前: 开 lifecycle 事件 + 挂 networkIdle 监听 (顺序关键, 见方法 doc)。
         page.execute(SetLifecycleEventsEnabledParams::new(true))
