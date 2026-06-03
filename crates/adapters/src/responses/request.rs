@@ -1556,7 +1556,7 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
                 | "stream_options"
                 | "mask_sensitive_info"
         ) || (key == "response_format" && response_format_allowed)
-            || (is_m3_plus && key == "parallel_tool_calls")
+            || (is_m3_plus && matches!(key.as_str(), "parallel_tool_calls" | "reasoning_effort"))
     });
 
     // MiniMax 官方建议 OpenAI-compatible M2.7 工具调用启用

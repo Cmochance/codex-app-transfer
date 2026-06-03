@@ -324,7 +324,8 @@ fn minimax_m3_keeps_system_and_standard_fields() {
             {"role": "user", "content": "hi"}
         ],
         "response_format": {"type": "json_object"},
-        "parallel_tool_calls": true
+        "parallel_tool_calls": true,
+        "reasoning_effort": "high"
     })
     .as_object()
     .expect("json object")
@@ -347,6 +348,10 @@ fn minimax_m3_keeps_system_and_standard_fields() {
     assert!(
         body.contains_key("parallel_tool_calls"),
         "M3 应保留 parallel_tool_calls(实测接受)"
+    );
+    assert!(
+        body.contains_key("reasoning_effort"),
+        "M3 应保留 reasoning_effort(实测接受,按规范透传上游而非剥除)"
     );
 }
 
