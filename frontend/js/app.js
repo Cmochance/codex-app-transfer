@@ -7284,9 +7284,8 @@
     }
     const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
 
-    // 3. 渲染主题卡(grid 4 列 + 缩略图)。inline onclick → 全局
-    //    window.__themePickHandler,absolutely reliable(避开任何 event
-    //    delegation / closure / listener-loss bug)。
+    // 3. 渲染主题卡(grid 4 列 + 缩略图)。CSP-compatible data-theme-* 属性,
+    //    由 bindThemeEvents 中的 #themeListContainer 点击委托处理。
     container.style.display = "grid";
     container.style.gridTemplateColumns = "repeat(4, 1fr)";
     container.style.gap = "14px";
@@ -7320,12 +7319,12 @@
       const isCustom = th.id === "custom";
       // 右上"替换"小角标 — 仅 custom
       const replaceBadge = isCustom
-        ? `<span class="theme-custom-replace" title="${escapeHtml(lang === "en" ? "Replace image" : "替换图片")}" style="position:absolute;top:6px;right:36px;background:rgba(0,0,0,0.55);color:#fff;font-size:11px;padding:2px 8px;border-radius:8px;cursor:pointer;z-index:3;" onclick="event.stopPropagation();window.__themeUploadHandler && window.__themeUploadHandler();">${escapeHtml(lang === "en" ? "Replace" : "替换")}</span>`
+        ? `<span class="theme-custom-replace" title="${escapeHtml(lang === "en" ? "Replace image" : "替换图片")}" style="position:absolute;top:6px;right:36px;background:rgba(0,0,0,0.55);color:#fff;font-size:11px;padding:2px 8px;border-radius:8px;cursor:pointer;z-index:3;" data-theme-replace>${escapeHtml(lang === "en" ? "Replace" : "替换")}</span>`
         : "";
       // 右上 X 删除按钮 — 每张都有。内置 = 隐藏(持久化 themeHiddenIds);custom = 真删 disk。
-      const deleteBtn = `<span class="theme-delete-btn" title="${escapeHtml(isCustom ? (lang === "en" ? "Delete" : "删除") : (lang === "en" ? "Hide" : "隐藏"))}" style="position:absolute;top:6px;right:8px;background:rgba(0,0,0,0.55);color:#fff;font-size:14px;line-height:1;width:22px;height:22px;border-radius:11px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;" onclick="event.stopPropagation();window.__themeDeleteHandler && window.__themeDeleteHandler('${idEscaped}', ${isCustom});">×</span>`;
+     const deleteBtn = `<span class="theme-delete-btn" title="${escapeHtml(isCustom ? (lang === "en" ? "Delete" : "删除") : (lang === "en" ? "Hide" : "隐藏"))}" style="position:absolute;top:6px;right:8px;background:rgba(0,0,0,0.55);color:#fff;font-size:14px;line-height:1;width:22px;height:22px;border-radius:11px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;z-index:3;" data-theme-delete data-theme-id="${idEscaped}" data-theme-custom="${isCustom}">×</span>`;
       return `
-        <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" onclick="window.__themePickHandler && window.__themePickHandler('${idEscaped}')">
+       <div class="card-theme-pick" style="position:relative;${borderStyle}border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);transition:transform 0.12s ease, box-shadow 0.12s ease;user-select:none;" data-theme-pick data-theme-id="${idEscaped}">
           ${checkBadge}
           ${replaceBadge}
           ${deleteBtn}
@@ -7341,7 +7340,7 @@
     const hasCustom = visibleThemes.some((th) => th.id === "custom");
     if (!hasCustom) {
       cards.push(`
-        <div class="card-theme-add" style="position:relative;border:1.5px dashed var(--bs-border-color);border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);user-select:none;" onclick="window.__themeUploadHandler && window.__themeUploadHandler();">
+       <div class="card-theme-add" style="position:relative;border:1.5px dashed var(--bs-border-color);border-radius:10px;overflow:hidden;cursor:pointer;display:flex;flex-direction:column;background:var(--bs-body-bg);user-select:none;" data-theme-add>
           <div style="width:100%;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--bs-secondary-color);font-size:42px;background:linear-gradient(135deg,#1f1414,#2a1818);"><i class="bi bi-plus-circle"></i></div>
           <div style="padding:8px 10px;text-align:center;">
             <div style="font-weight:600;font-size:14px;color:var(--bs-secondary-color);">${escapeHtml(lang === "en" ? "Add custom" : "添加自定义")}</div>
@@ -7676,7 +7675,8 @@
     });
 
     // 卡片点击 — 全局 fn `window.__themePickHandler`,inline onclick 触发。
-    // 避开任何 event delegation / closure / listener-loss bug,绝对 reliable。
+    // 卡片点击 — CSP-compatible 事件委托:#themeListContainer 上绑一次即可,
+    // 不需要 inline onclick(后者被 script-src 'self' 拦截)。
     //
     // 热更新(#264):toggle 开 + 点卡片 → save settings → apply → 立即切换
     // 主题(IIFE 进来先 remove 旧 style + mascot 再 inject 新的,**不需要**
@@ -7715,6 +7715,43 @@
       }
       await renderTheme();
     };
+    // MOC-131: CSP-compatible 事件委托,取代 inline onclick。
+    const themeContainer = $("#themeListContainer");
+    if (themeContainer && !themeContainer.dataset.cspDelegate) {
+      themeContainer.dataset.cspDelegate = "1";
+      themeContainer.addEventListener("click", (evt) => {
+        const delBtn = evt.target.closest("[data-theme-delete]");
+        if (delBtn) {
+          evt.stopPropagation();
+          const tid = delBtn.dataset.themeId;
+          const isCstm = delBtn.dataset.themeCustom === "true";
+          if (tid !== undefined && window.__themeDeleteHandler) {
+            window.__themeDeleteHandler(tid, isCstm);
+          }
+          return;
+        }
+        const replaceBtn = evt.target.closest("[data-theme-replace]");
+        if (replaceBtn) {
+          evt.stopPropagation();
+          if (window.__themeUploadHandler) window.__themeUploadHandler();
+          return;
+        }
+        const addCard = evt.target.closest("[data-theme-add]");
+        if (addCard) {
+          evt.stopPropagation();
+          if (window.__themeUploadHandler) window.__themeUploadHandler();
+          return;
+        }
+        const pickCard = evt.target.closest("[data-theme-pick]");
+        if (pickCard) {
+          evt.stopPropagation();
+          const tid = pickCard.dataset.themeId;
+          if (tid && window.__themePickHandler) {
+            window.__themePickHandler(tid);
+          }
+        }
+      });
+    }
   }
 
   async function renderCodexAssets() {
