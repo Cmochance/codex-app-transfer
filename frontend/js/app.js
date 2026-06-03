@@ -8448,11 +8448,15 @@
       if (await _commitWebFetch("headless")) showToast(t("settings.headlessChromeDownloaded"));
       _webFetchSwitching = false;
     });
-    $("[data-action=headless-chrome-cancel]")?.addEventListener("click", () => {
-      $("#headlessChromeDownloadModal").hidden = true;
-      _setWebFetchActive(_webFetchSaved()); // 取消回退到上次保存值
-      _webFetchSwitching = false;
-    });
+    // 两个 cancel 触发器(✕ + 文字"取消")都要绑(沿用 real-account modal 的 $all 范式,
+    // $ 只绑第一个会让文字"取消"按钮失效 — devin review)。
+    $all("[data-action=headless-chrome-cancel]").forEach((b) =>
+      b.addEventListener("click", () => {
+        $("#headlessChromeDownloadModal").hidden = true;
+        _setWebFetchActive(_webFetchSaved()); // 取消回退到上次保存值
+        _webFetchSwitching = false;
+      })
+    );
     $("#codexStatusSectionDefaultVisible")?.addEventListener("change", saveSettingsFromForm);
     $("#configImportFile")?.addEventListener("change", (event) => {
       importConfigFile(event.target.files?.[0]);
