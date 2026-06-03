@@ -124,7 +124,8 @@ pub struct ApplyResult {
 pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResult, CodexError> {
     // 1. snapshot(幂等;已有快照不会覆盖)
     let snapshot_taken_now = !has_snapshot(paths);
-    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name)?;
+    // manage_atom = !cfg.direct:direct 直连模式不写也不 restore context-usage atom(#317)。
+    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name, !cfg.direct)?;
 
     // 2. config.toml: openai_base_url
     if cfg.base_url.is_empty() {
