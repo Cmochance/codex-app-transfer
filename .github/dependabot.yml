@@ -1,0 +1,39 @@
+# MOC-138 Tier 1: Dependabot —— wreq / wreq-util 等 cargo 依赖发版时自动起 PR,
+# 不用人盯 crates.io。配套 Tier 2 周 cron 金丝雀(验 Cloudflare 绕过仍生效)作后续 PR。
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    # 根 workspace,覆盖全部成员(crates/* + src-tauri + xtask),读根 Cargo.lock
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    # 别设太大,PR 堆着 review 不完
+    open-pull-requests-limit: 5
+    labels:
+      - "Improvement"
+    assignees:
+      - "Cmochance"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      # wreq + wreq-util 是浏览器指纹伪装对,rc 版本间有 emulation trait 重命名
+      # skew(见 crates/http/Cargo.toml 注释),必须锁步升级 → 单独 group 一次性
+      # bump,不要一个 dep 一个 PR。注:boring2 / boring-sys2 是 wreq 的传递依赖
+      # (无任何 Cargo.toml 直接声明),Dependabot 只对直接依赖起 PR,故不列 ——
+      # 会跟随 wreq 走 lockfile 自动升。若 group 内只有 wreq 单边有新 rc,bump 后
+      # 可能编译 skew,但 CI 的 cargo check --workspace 会判红兜底。
+      cf-bypass:
+        patterns:
+          - "wreq"
+          - "wreq-util"
+      # 其余依赖合并成一个 PR,跟 cf-bypass 分开,免互相干扰
+      everything-else:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "wreq"
+          - "wreq-util"
