@@ -18,7 +18,7 @@
 
 **模块更新自动检查机制 — Dependabot 依赖跟踪 (MOC-138, Tier 1)**:新增 `.github/dependabot.yml`,cargo 生态周级(周一 09:00 Asia/Shanghai)自动起依赖升级 PR,不用人盯 crates.io。`wreq` + `wreq-util`(浏览器指纹伪装对,rc 版本间有 emulation trait 重命名 skew,见 `crates/http/Cargo.toml`)单独 group `cf-bypass` 锁步升级、其余依赖合并 `everything-else` 一个 PR;`open-pull-requests-limit: 5`、贴 `Improvement` label、assign `Cmochance`。注:`boring2` / `boring-sys2` 是 `wreq` 的传递依赖、不单列(跟随 lockfile 自动升)。
 
-**模块更新自动检查机制 — 周 cron CF 金丝雀 (MOC-138, Tier 2)**:新增 `.github/workflows/weekly-cf-check.yml`,每周一定时(GitHub Actions cron `37 1 * * 1`,错峰避整点,UTC)真实打 `chatgpt.com` / `help.openai.com` 跑 `cf_bypass --include-ignored`,验 `wreq` Chrome120 指纹还能过 Cloudflare;附 OpenAI status RSS / Codex CLI release 对照,连续 3 次失败(retry×3 抗瞬时网络抖动)才 `::error::` 告警。支持 `workflow_dispatch` 手动触发。注:Actions 跑数据中心 IP,CF 策略与家宽不同 → fail 不等于用户真挂,接硬告警前需先校准命中率(故先不接 Slack)。至此 MOC-138 4 层(Tier 1/2/3/4)全部落地。
+**模块更新自动检查机制 — 周 cron CF 金丝雀 (MOC-138, Tier 2)**:新增 `.github/workflows/weekly-cf-check.yml`,每周一定时(GitHub Actions cron `37 1 * * 1`,错峰避整点,UTC)真实打 `chatgpt.com` / `help.openai.com` 跑 `cf_bypass --include-ignored`,验 `wreq` Chrome120 指纹还能过 Cloudflare;附 OpenAI status RSS / Codex CLI release 对照,连续 3 次失败(retry×3 抗瞬时网络抖动)才 `::error::` 告警。支持 `workflow_dispatch` 手动触发。注:Actions 跑数据中心 IP,CF 策略与家宽不同 → fail 不等于用户真挂,接硬告警前需先校准命中率(故先不接 Slack)。至此 MOC-138 4 层(Tier 1/2/3/4)全部落地。canary 逻辑抽成 `_reusable-cf-canary.yml`(`workflow_call`),并新增 `cf-canary-on-deps.yml` —— Dependabot 升 `wreq`/`wreq-util`(或手动改)的 PR 当场触发金丝雀(diff 含 wreq 才跑),在 merge 前就验新版本还过不过 CF,把 Tier 1↔Tier 2 连起来;该 check 非必需(DC-IP 假阳性不卡 Dependabot PR merge)。
 
 详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 

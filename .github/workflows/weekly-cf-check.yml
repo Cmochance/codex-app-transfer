@@ -1,6 +1,7 @@
 # MOC-138 Tier 2: 周 cron CF 金丝雀 —— 每周真实打 Cloudflare 强保域,验
 # `wreq` 的 Chrome120 指纹还能不能过 CF。CF 改规则 / 指纹过期是不可预测的
 # 被动事件,这层把「等用户报联网挂了」换成「每周主动验 + fail 告警」。
+# 实际 canary 逻辑在 _reusable-cf-canary.yml(本文件只管定时触发)。
 #
 # 注意: GitHub Actions cron 只认 UTC(无 timezone 字段,跟 dependabot.yml 不同);
 # 且 scheduled run 高峰会延迟甚至丢弃,只从默认分支(main)触发 —— 是提醒不是保证。
@@ -22,62 +23,5 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  cf-bypass-canary:
-    name: CF bypass canary (real network)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-
-      # @stable 对齐 ci.yml,不 pin 1.80(< 本仓 MSRV 1.85,会编译失败)
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: '. -> target'
-          key: cf-canary
-
-      # 跑 cf_bypass.rs 的 2 个 #[ignore] 网络断言:chatgpt.com 非 403 + 不含
-      # cf-chl challenge body;help.openai.com codex 集合页 200。retry×3 抗瞬时
-      # 网络抖动(测试用 .expect("send") 会 panic,单次失败无法区分 flake 与真
-      # 403)—— 真 CF block 会跨 3 次持续失败仍告警,只是吃掉偶发抖动。
-      - name: CF bypass canary (cf_bypass --include-ignored, retry x3)
-        run: |
-          for attempt in 1 2 3; do
-            echo "::group::canary attempt $attempt"
-            if cargo test -p codex-app-transfer-http --test cf_bypass \
-                 -- --include-ignored --nocapture; then
-              echo "::endgroup::"
-              echo "✅ CF 金丝雀 attempt $attempt 通过"
-              exit 0
-            fi
-            echo "::endgroup::"
-            # 仅前两次失败后重试;第 3 次(最后一次)直接落到下面的 ::error::,
-            # 不打印误导的「30s 后重试」、不白等 30s。
-            if [ "$attempt" -lt 3 ]; then
-              echo "::warning::CF 金丝雀 attempt $attempt 失败,30s 后重试"
-              sleep 30
-            fi
-          done
-          echo "::error::CF 金丝雀连续 3 次失败 —— wreq 指纹过期 / CF 改规则 / 持续网络问题"
-          exit 1
-
-      # 以下为对照信号,best-effort(|| true 永不让 job 红),fail 时帮判断
-      # 「是 CF 的事还是 OpenAI 自己 incident」。
-      - name: OpenAI status RSS (codex 相关 incident)
-        if: always()
-        run: |
-          curl -sL --max-time 10 https://status.openai.com/history.rss \
-            | grep -iE "codex|plugin|desktop" | head -10 || echo "(近期无 codex 相关 incident)"
-
-      - name: Codex CLI 最新 release(版本对照)
-        if: always()
-        run: |
-          curl -s --max-time 10 https://api.github.com/repos/openai/codex/releases/latest \
-            | python3 -c "import json,sys; print('Codex CLI latest:', json.load(sys.stdin).get('tag_name','?'))" || true
-
-      - name: 排查提示
-        if: failure()
-        run: |
-          echo "::warning::本地复现: cargo test -p codex-app-transfer-http --test cf_bypass -- --include-ignored --nocapture"
-          echo "::warning::注意 Actions 跑数据中心 IP,CF 策略与家宽不同 —— fail 不等于用户真挂,接硬告警前需先校准命中率"
+  canary:
+    uses: ./.github/workflows/_reusable-cf-canary.yml
