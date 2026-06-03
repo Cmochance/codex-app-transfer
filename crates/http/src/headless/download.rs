@@ -13,6 +13,7 @@
 //!   同一份。**跨进程并发不在 PoC 范围** (需文件锁), 同进程足够覆盖当前用法。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 
@@ -190,7 +191,15 @@ fn write_marker_atomic(marker: &Path, version: &str) -> Result<(), HeadlessError
 }
 
 async fn download_zip(url: &str) -> Result<Vec<u8>, HeadlessError> {
-    let resp = reqwest::Client::new()
+    // connect 超时 + read 超时(检测"连上后卡住不发数据"): 防下载永久 pending 把前端
+    // _webFetchSwitching 永久锁死(chatgpt review)。read_timeout 是"两次读之间的空闲
+    // 超时", 不限制正常慢速下载的总时长(86MB 在慢网下可能要几分钟)。
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| HeadlessError::Download(format!("建下载 client 失败: {e}")))?;
+    let resp = client
         .get(url)
         .send()
         .await
