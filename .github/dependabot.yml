@@ -19,6 +19,15 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    ignore:
+      # wreq 6.0.0-rc.29 经 CI canary 实证 CF 绕过回归 —— 数据中心 IP 下浏览器指纹
+      # 被 Cloudflare 识破返 403(rc.23 同环境正常,见 #371 / MOC-160)。保持 rc.23,
+      # 待 wreq 出更高 rc(rc.30+)或正式版 6.0.0 时再由 cf-bypass group 提 PR + canary
+      # 验证后评估升级。wreq-util 与 wreq 锁步,同 ignore 配对的 rc.12 及更低。
+      - dependency-name: "wreq"
+        versions: ["<= 6.0.0-rc.29"]
+      - dependency-name: "wreq-util"
+        versions: ["<= 3.0.0-rc.12"]
     groups:
       # wreq + wreq-util 是浏览器指纹伪装对,rc 版本间有 emulation trait 重命名
       # skew(见 crates/http/Cargo.toml 注释),必须锁步升级 → 单独 group 一次性
@@ -34,8 +43,9 @@ updates:
       # minor/major 不进 group、各自单独成 PR 逐个评估适配。原因:Rust 生态大量
       # crate 仍 0.x,breaking 常走 minor 段(getrandom 0.2→0.4 / sha2 0.10→0.11
       # 等),"非 patch 即单独 PR"比纯按 semver-major 过滤更稳。#372 曾一锅端 17 个
-      # 含 7~8 个 major breaking(且 sha2/rand 与未升级的 rsa 0.9 冲突)不可控,
-      # 故 MOC-160 改此策略。cf-bypass group 不设 update-types(锁步升级不分级别)。
+      # 含约 10 个 breaking,CI 实测直接挂在 getrandom 0.4 移除顶层 getrandom() 函数
+      # (源码直接调用 → E0425)、group 整体编不过,故 MOC-160 改此策略。
+      # cf-bypass group 不设 update-types(锁步升级不分级别)。
       everything-else:
         patterns:
           - "*"
