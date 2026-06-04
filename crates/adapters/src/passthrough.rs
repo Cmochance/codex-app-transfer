@@ -32,6 +32,7 @@ use codex_app_transfer_registry::Provider;
 
 use crate::registry::rewrite_local_path_for_upstream;
 use crate::types::{Adapter, AdapterError, RequestPlan};
+use crate::ensure_top_level_instructions;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ResponsesPassthroughAdapter;
@@ -53,6 +54,7 @@ impl Adapter for ResponsesPassthroughAdapter {
         body: Bytes,
         _provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
+        let body = ensure_top_level_instructions(body);
         // 用 registry::rewrite_local_path_for_upstream 完整 normalize:
         // 剥 `/openai` legacy prefix + `/claude/v1/messages` alias + `/v1` 前缀 + 保 query。
         // 不能用 `normalize_v1_prefix`(只剥 `/v1`),否则 `/openai/v1/responses` 会

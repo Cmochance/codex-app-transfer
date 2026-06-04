@@ -38,6 +38,7 @@ pub use responses::{
     responses_body_to_chat_body_for_provider, ChatToResponsesConverter, ResponsesAdapter,
 };
 pub use types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
+use bytes::Bytes;
 
 /// 同 tool_type 前 [`DROP_TOOL_WARN_LIMIT`] 次 warn,之后静默(但 counter 仍累加)。
 ///
@@ -104,6 +105,129 @@ fn drop_tool_counters() -> &'static std::sync::Mutex<std::collections::HashMap<S
 pub(crate) fn reset_dropped_tool_counters() {
     if let Ok(mut g) = drop_tool_counters().lock() {
         g.clear();
+    }
+}
+
+/// [MOC-153] 如果 JSON body 顶层 `instructions` 为空/缺失/空字符串,
+/// 注入一个默认的非空占位符,避免 OpenAI Responses 后端 400。
+///
+/// 第三方模型会话切到 GPT 时,Codex 不把身份提示回填到顶层 instructions
+/// 字段(而是塞进 input 里的 developer 消息),导致 OpenAI Responses
+/// 后端校验失败。此函数在 passthrough/relay 路径上做最小干预:
+/// 仅当 instructions 确实为空时才注入无害占位符,不覆盖已有值。
+pub fn ensure_top_level_instructions(body: Bytes) -> Bytes {
+    if body.is_empty() {
+        return body;
+    }
+    let mut v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let obj = match v.as_object_mut() {
+        Some(o) => o,
+        None => return body,
+    };
+
+    // 只处理 Responses API 请求:必须有 input 或 model 字段才可能是
+    // Responses 请求,避免误伤 getAccount 等无关 endpoint。
+    let looks_like_responses = obj.contains_key("input") || obj.contains_key("model");
+    if !looks_like_responses {
+        return body;
+    }
+
+    let needs_injection = match obj.get("instructions") {
+        None => true,
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => true,
+        _ => false,
+    };
+
+    if needs_injection {
+        obj.insert(
+            "instructions".to_owned(),
+            serde_json::Value::String("You are a helpful assistant.".to_owned()),
+        );
+        if let Ok(next) = serde_json::to_vec(&v) {
+            return Bytes::from(next);
+        }
+    }
+    body
+}
+
+#[cfg(test)]
+mod moc153_tests {
+    //! `ensure_top_level_instructions` 行为测试。
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn instructions_null_injected() {
+        let body = Bytes::from(r#"{"input":"hello","instructions":null}"#);
+        let result = ensure_top_level_instructions(body);
+        let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        let instructions = v["instructions"].as_str().unwrap();
+        assert!(!instructions.is_empty());
+        assert_eq!(instructions, "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn instructions_missing_injected() {
+        let body = Bytes::from(r#"{"input":"hello","model":"gpt-5.5"}"#);
+        let result = ensure_top_level_instructions(body);
+        let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(v["instructions"].as_str().unwrap(), "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn instructions_empty_string_injected() {
+        let body = Bytes::from(r#"{"input":"hello","instructions":""}"#);
+        let result = ensure_top_level_instructions(body);
+        let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(v["instructions"].as_str().unwrap(), "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn instructions_whitespace_injected() {
+        let body = Bytes::from("{\"input\":\"hello\",\"instructions\":\"   \"}");
+        let result = ensure_top_level_instructions(body);
+        let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(v["instructions"].as_str().unwrap(), "You are a helpful assistant.");
+    }
+
+    #[test]
+    fn instructions_present_untouched() {
+        let body = Bytes::from(r#"{"input":"hello","instructions":"real instruction"}"#);
+        let result = ensure_top_level_instructions(body);
+        let v: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(v["instructions"].as_str().unwrap(), "real instruction");
+    }
+
+    #[test]
+    fn non_responses_skipped() {
+        let body = Bytes::from(r#"{"getAccount":true}"#);
+        let result = ensure_top_level_instructions(body.clone());
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn empty_body_passthrough() {
+        let body = Bytes::new();
+        let result = ensure_top_level_instructions(body.clone());
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn invalid_json_passthrough() {
+        let body = Bytes::from("not json");
+        let result = ensure_top_level_instructions(body.clone());
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn non_object_passthrough() {
+        let body = Bytes::from("[]");
+        let result = ensure_top_level_instructions(body.clone());
+        assert_eq!(result, body);
     }
 }
 
