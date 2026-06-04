@@ -532,10 +532,13 @@ fn is_js_shell(html: &str) -> bool {
 /// (退化当短静态页放行, 拿到的空壳交模型自行判断), 优于把短静态页误升 headless。
 fn has_spa_skeleton(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
-    let has_mount = lower.contains("id=\"root\"")
-        || lower.contains("id=\"app\"")
-        || lower.contains("id=\"__next\"")
-        || lower.contains("id=\"__nuxt\"")
+    // 容忍双 / 单引号 (模板 / minifier 输出不一, chatgpt-codex review)。
+    let mount =
+        |m: &str| lower.contains(&format!("id=\"{m}\"")) || lower.contains(&format!("id='{m}'"));
+    let has_mount = mount("root")
+        || mount("app")
+        || mount("__next")
+        || mount("__nuxt")
         || lower.contains("ng-app")
         || lower.contains("data-reactroot");
     has_mount && lower.contains("<script")
@@ -866,6 +869,13 @@ mod tests {
         let shell = "<html><body><div id=\"root\"></div>\
             <script>var a=1;var b=2;</script><script src=\"/bundle.js\"></script></body></html>";
         assert!(is_js_shell(shell), "SPA 空骨架应判为 shell");
+        // 单引号挂载点变体也应判 shell (chatgpt-codex: 容忍引号种类)
+        assert!(
+            is_js_shell(
+                "<html><body><div id='root'></div><script src=/b.js></script></body></html>"
+            ),
+            "单引号挂载点也应判 shell"
+        );
         // 有真实长正文 → 不是 shell
         let real = format!(
             "<html><body><article>{}</article></body></html>",
