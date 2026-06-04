@@ -33,6 +33,12 @@ const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 /// 平衡点。若未来开 UI/CLI 配置入口,改 caller 传值,这条常量做 fallback。
 pub const TRASH_RETENTION_DAYS: u64 = 30;
 
+/// recovery/ 保留上限。`move_stale_active_snapshots_to_recovery` 每次 apply 都会
+/// 把上个 session 遗留的 active 快照搬进 recovery/ 当安全存档;若不封顶会无上限
+/// 累积(#268 残留扫描越来越慢 + 污染样本长期留存)。保留最近 N 份足够覆盖
+/// "崩溃/强退后想恢复上次原配置"的实际诉求(配合内容去重,N 份都是不同内容)。
+const MAX_RECOVERY_SNAPSHOTS: usize = 5;
+
 static CURRENT_SESSION_ID: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -633,16 +639,189 @@ fn snapshot_dir_matches_id(dir: &Path, snapshot_id: &str) -> bool {
 
 fn move_stale_active_snapshots_to_recovery(paths: &CodexPaths) -> Result<(), CodexError> {
     let current = current_session_id().to_owned();
-    for dir in snapshot_dirs_under(&paths.active_snapshots_dir) {
+    // 按目录名(固定宽度时间戳前缀 → 字典序即时间序)升序 = **旧→新**处理。
+    // 替换式去重(见 move_snapshot_dir_to_recovery)下,同内容多份 stale 时让最新那份**最后**
+    // 处理、替换掉更旧的,使留存的 recovery 副本始终是最新那份(MOC-148 review P2:否则若
+    // newer 先处理、older 后处理,older 会覆盖 newer,at-cap 时该内容可能被 prune 误删)。
+    let mut stale_dirs = snapshot_dirs_under(&paths.active_snapshots_dir);
+    stale_dirs.sort_by(|a, b| dir_name(a).cmp(&dir_name(b)));
+    for dir in stale_dirs {
         if dir_name(&dir).as_deref() == Some(current.as_str()) {
             continue;
         }
+        // 去重为**替换式**(见 move_snapshot_dir_to_recovery):命中旧重复时把更新的 stale
+        // 作为最新一份移入,内容以最新时间戳存活 → 末尾 prune 不论 cap 状态都不会误删它。
+        // 故无需"去重前先 prune"(MOC-148 review P2:那只防已超额、防不住本轮移入后才超额)。
         move_snapshot_dir_to_recovery(paths, &dir)?;
     }
+    // 每次 apply 顺手封顶 recovery/(也清理修复前积压的历史无上限存量)。
+    // best-effort:纯 GC,失败不冒泡阻断 apply(见 prune_recovery_snapshots)。
+    prune_recovery_snapshots(paths);
     Ok(())
 }
 
+/// 读单个文件用于去重比对,**区分"文件不存在"和"读失败"**:
+/// - 不存在(`NotFound`)→ `Some(None)`(合法的"空内容")
+/// - 存在且读成功 → `Some(Some(s))`
+/// - 存在但读失败(I/O / 权限)→ `None`(内容**不可判定**)
+///
+/// 这是 BUG-fix(MOC-148 review IMPORTANT#2):旧实现用 `.ok()` 把读失败和
+/// 不存在都折叠成 `None`,极端下会让"内容其实不同但读失败"的 stale active 被
+/// 误判为与某份"空"备份重复 → 删掉唯一副本(违反"不主动破坏性降级")。
+fn read_dedup_field(path: &Path) -> Option<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// 快照的 atom restore 等价类(去重指纹的一部分)。restore 行为只由 manifest 的
+/// `(capture_failed, pre_value)` 三态 + `schema_version` 决定:
+/// - `capture_failed=true`(或 `schema_version < 4` 兜底、manifest **不存在**)→ restore
+///   **不动** atom → 归一为 [`AtomRestoreKey::Untouched`];
+/// - 否则按 `pre_value` 复原(`Some(v)` 写入 / `None` 移除)→ [`AtomRestoreKey::Restore`]。
+///
+/// config/auth 相同但本键不同的两份 restore 结果不同、**不可互换**,不能去重(MOC-148
+/// review P2:否则删"重复"时会丢失只存在于 manifest 的 atom 恢复值)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AtomRestoreKey {
+    /// restore 不动 atom。
+    Untouched,
+    /// restore 按该 `pre_value` 复原(`Some(v)` 写入 / `None` 移除)。
+    Restore(Option<bool>),
+}
+
+/// manifest.json 的读取分类:区分"合法空态(不存在)"与"损坏(存在但读/解析失败)"。
+enum ManifestRead {
+    /// 文件不存在(合法:无 manifest 的空原始态)。
+    Absent,
+    /// 读取 + 解析成功。
+    Parsed(SnapshotManifest),
+    /// 文件存在但读失败 / 解析失败(损坏,内容不可判定)。
+    Corrupt,
+}
+
+fn read_manifest_classified(dir: &Path) -> ManifestRead {
+    match std::fs::read_to_string(manifest_path(dir)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ManifestRead::Absent,
+        Err(_) => ManifestRead::Corrupt,
+        Ok(s) => match serde_json::from_str::<SnapshotManifest>(&s) {
+            Ok(m) => ManifestRead::Parsed(m),
+            Err(_) => ManifestRead::Corrupt,
+        },
+    }
+}
+
+/// 读 `dir` 的 manifest 归一成 [`AtomRestoreKey`]。口径与 [`move_snapshot_dir_to_recovery`]
+/// 写 recovery manifest 一致(`schema_version < 4` 视作 capture_failed)。
+/// - manifest **不存在** → restore 兜底"不动 atom" → `Some(Untouched)`(合法空态,参与比较);
+/// - 解析成功 → `Some(Restore(..)/Untouched)`;
+/// - manifest **存在但损坏**(读/解析失败)→ `None`:内容不可判定,调用方据此保守**不去重**
+///   —— 不拿"损坏、`list_snapshots` 看不到、无法手动恢复"的份当去重目标而误删好快照
+///   (MOC-148 review P2)。
+fn snapshot_atom_restore_key(dir: &Path) -> Option<AtomRestoreKey> {
+    match read_manifest_classified(dir) {
+        ManifestRead::Absent => Some(AtomRestoreKey::Untouched),
+        ManifestRead::Parsed(m)
+            if !m.electron_status_section_capture_failed && m.schema_version >= 4 =>
+        {
+            Some(AtomRestoreKey::Restore(m.electron_status_section_pre_value))
+        }
+        ManifestRead::Parsed(_) => Some(AtomRestoreKey::Untouched),
+        ManifestRead::Corrupt => None,
+    }
+}
+
+/// 读快照 dir 的去重指纹:config.toml + auth.json 内容 + atom restore 等价键。
+/// **不含 manifest 的 timestamp/session_id/snapshot_id**(每份都不同),但**含**影响
+/// restore 的 atom 三态(见 [`AtomRestoreKey`])。
+/// config/auth 任一"存在但读失败",或 manifest **存在但损坏** → 返回 `None`
+/// (内容不可判定,调用方据此保守不去重)。
+fn snapshot_content_for_dedup(
+    dir: &Path,
+) -> Option<(Option<String>, Option<String>, AtomRestoreKey)> {
+    let config = read_dedup_field(&config_path(dir))?;
+    let auth = read_dedup_field(&auth_path(dir))?;
+    let atom = snapshot_atom_restore_key(dir)?;
+    Some((config, auth, atom))
+}
+
+/// recovery/ 中与 `dir` 内容(config + auth + atom restore 等价键)完全相同的备份目录列表。
+///
+/// 保守语义:`dir` 自身 config/auth 读不出、或 manifest **存在但损坏** → 视为内容不可判定,
+/// 返回空(当作非重复、保留),绝不因"读不出/损坏"去删唯一副本;某份 recovery config/auth
+/// 读不出或 manifest 损坏 → 该份不参与匹配(不拿无法手动恢复的损坏份当去重目标)。
+fn recovery_content_duplicate_dirs(paths: &CodexPaths, dir: &Path) -> Vec<PathBuf> {
+    let Some(target) = snapshot_content_for_dedup(dir) else {
+        return Vec::new();
+    };
+    snapshot_dirs_under(&paths.recovery_snapshots_dir)
+        .into_iter()
+        .filter(|rec| snapshot_content_for_dedup(rec).as_ref() == Some(&target))
+        .collect()
+}
+
+/// recovery/ 只保留最近 [`MAX_RECOVERY_SNAPSHOTS`] 份,其余物理删除。
+///
+/// 保留优先级:**可恢复(manifest 解析成功,即 `list_snapshots` 能看到的份)优先于损坏/
+/// 不可恢复**;同组内再按目录名(固定宽度时间戳前缀 `20260603T210740197-pNNNN` → 字典序即
+/// 时间序)新→旧。保留前 N 份、其余删除。即超额时**先淘汰损坏份**,不让较新的损坏快照挤掉
+/// 较旧但有效的备份(MOC-148 review P2:`snapshot_dirs_under` 只看 manifest 文件存在,
+/// 而 `list_snapshots` 会跳过解析失败的目录,二者口径不一致会导致只剩不可恢复的份)。
+///
+/// **best-effort**(MOC-148 review IMPORTANT#1):这是纯 GC,单个目录删失败
+/// (并发进程占用 / 权限 / 半删残留)只 warn 跳过,**绝不冒泡**——否则会让
+/// 调用链顶端的 `apply_provider` 整体失败(快照本身已成功,失败的只是清旧)。
+/// 与同文件 `gc_trash_older_than` 既有约定一致。
+fn prune_recovery_snapshots(paths: &CodexPaths) {
+    let dirs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+    if dirs.len() <= MAX_RECOVERY_SNAPSHOTS {
+        return;
+    }
+    // 每份算一次"是否可恢复"(manifest 解析成功 = `list_snapshots` 口径),避免排序中重复 IO。
+    let mut ranked: Vec<(bool, PathBuf)> = dirs
+        .into_iter()
+        .map(|d| (read_manifest_from_dir(&d).is_ok(), d))
+        .collect();
+    // 可恢复(true)优先于损坏(false);同组内按目录名(时间戳)新→旧。
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| dir_name(&b.1).cmp(&dir_name(&a.1)))
+    });
+    for (_, dir) in ranked.into_iter().skip(MAX_RECOVERY_SNAPSHOTS) {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(
+                target: "codex_integration::snapshot",
+                dir = %dir.display(),
+                error = %e,
+                "prune recovery snapshot failed; skipping (best-effort GC)",
+            );
+        }
+    }
+}
+
 fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), CodexError> {
+    // 备份去重(**替换式**,MOC-148 review P2):recovery/ 已有内容(config+auth+atom 键)
+    // 相同的旧份时,**删掉旧份、把这份更新的 stale 作为最新一份移入**(下方 rename),
+    // 而非"删 stale 保留旧份"。后者在 recovery 接近/达到上限时有内容丢失风险:旧份可能
+    // 随后被 `prune_recovery_snapshots` 清掉(本轮还有别的 stale 移入顶过上限时),导致该
+    // 内容在 recovery 里一份不剩。替换后内容以最新时间戳存活,prune 不论 cap 状态都不会
+    // 误删;且始终只保留一份,不累积重复(用户要求:备份时字段比对,不留重复)。
+    //
+    // best-effort:删旧份失败只 warn(回退为"临时多留一份重复",末尾 prune 再收敛),
+    // 不冒泡阻断 apply。
+    for old in recovery_content_duplicate_dirs(paths, dir) {
+        if let Err(e) = std::fs::remove_dir_all(&old) {
+            tracing::warn!(
+                target: "codex_integration::snapshot",
+                dir = %old.display(),
+                error = %e,
+                "remove stale recovery duplicate failed; skipping (best-effort)",
+            );
+        }
+    }
+
     let fallback = dir_name(dir).unwrap_or_else(|| current_session_id().to_owned());
     let manifest = read_manifest_from_dir(dir)
         .map(|m| normalize_manifest(m, &fallback, &fallback))
@@ -1022,6 +1201,465 @@ mod tests {
         assert!(snapshots
             .iter()
             .any(|s| s.kind == "recovery" && s.id == "old-session"));
+    }
+
+    // ── MOC-148 搭车:recovery/ 去重 + 上限 ────────────────────────────
+
+    fn mk_manifest(id: &str) -> SnapshotManifest {
+        SnapshotManifest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id: id.to_owned(),
+            session_id: id.to_owned(),
+            snapshot_at: "2026-06-01T00:00:00".to_owned(),
+            config_existed: true,
+            auth_existed: false,
+            app_version: "v".to_owned(),
+            provider_name: None,
+            electron_status_section_pre_value: None,
+            electron_status_section_capture_failed: false,
+        }
+    }
+
+    fn seed_recovery(paths: &CodexPaths, name: &str, config: &str, auth: Option<&str>) -> PathBuf {
+        let dir = paths.recovery_snapshots_dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(config_path(&dir), config).unwrap();
+        if let Some(a) = auth {
+            std::fs::write(auth_path(&dir), a).unwrap();
+        }
+        write_manifest_to_dir(&dir, &mk_manifest(name)).unwrap();
+        dir
+    }
+
+    /// 备份去重(替换式):recovery/ 已有内容相同的旧份时,删旧份、把更新的 stale 作为
+    /// 最新一份移入 —— 最终仍只一份(不累积重复),且内容以最新时间戳存活。
+    #[test]
+    fn move_to_recovery_skips_content_duplicate() {
+        let (_t, paths) = paths_with_tmp();
+        seed_recovery(
+            &paths,
+            "20260601T000000000-p1",
+            "openai_base_url = \"X\"\n",
+            Some("{\"k\":\"A\"}"),
+        );
+
+        let stale = paths.active_snapshots_dir.join("dup-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("dup-session")).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists(), "重复内容的 stale active 应被丢弃");
+        let recs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+        assert_eq!(recs.len(), 1, "内容重复不应新增 recovery: {recs:?}");
+    }
+
+    /// 内容不同(哪怕只差一个字段)→ 视为新备份,保留。
+    #[test]
+    fn move_to_recovery_keeps_distinct_content() {
+        let (_t, paths) = paths_with_tmp();
+        seed_recovery(
+            &paths,
+            "20260601T000000000-p1",
+            "openai_base_url = \"X\"\n",
+            None,
+        );
+
+        let stale = paths.active_snapshots_dir.join("diff-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"Y\"\n").unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("diff-session")).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists());
+        let recs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+        assert_eq!(recs.len(), 2, "不同内容应新增 recovery: {recs:?}");
+    }
+
+    /// MOC-148 review P2:config/auth **完全相同**但 manifest 的 atom `pre_value` 不同 →
+    /// restore 结果不同、不可互换 → **不去重**,保留两份(否则删"重复"会丢只存在于
+    /// manifest 的 atom 恢复值)。
+    #[test]
+    fn move_to_recovery_keeps_when_atom_pre_value_differs() {
+        let (_t, paths) = paths_with_tmp();
+        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&existing), "{\"k\":\"A\"}").unwrap();
+        let mut m_existing = mk_manifest("existing");
+        m_existing.electron_status_section_pre_value = Some(false);
+        write_manifest_to_dir(&existing, &m_existing).unwrap();
+
+        // config/auth 一字不差,仅 atom pre_value 不同(Some(true) vs Some(false))。
+        let stale = paths.active_snapshots_dir.join("atom-diff");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
+        let mut m_stale = mk_manifest("atom-diff");
+        m_stale.electron_status_section_pre_value = Some(true);
+        write_manifest_to_dir(&stale, &m_stale).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists(), "stale 仍应移入 recovery(rename)");
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            2,
+            "atom restore 值不同 → 不可互换 → 不去重,应保留两份"
+        );
+    }
+
+    /// `capture_failed` 差异同样使两份不可互换(一个 restore 不动 atom、一个会复原)→ 保留。
+    #[test]
+    fn move_to_recovery_keeps_when_capture_failed_differs() {
+        let (_t, paths) = paths_with_tmp();
+        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
+        let mut m_existing = mk_manifest("existing");
+        m_existing.electron_status_section_pre_value = Some(true); // Restore(Some(true))
+        write_manifest_to_dir(&existing, &m_existing).unwrap();
+
+        let stale = paths.active_snapshots_dir.join("cap-failed");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        let mut m_stale = mk_manifest("cap-failed");
+        m_stale.electron_status_section_capture_failed = true; // Untouched
+        write_manifest_to_dir(&stale, &m_stale).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists());
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            2,
+            "capture_failed 不同(不动 atom vs 复原)→ 不可互换 → 保留两份"
+        );
+    }
+
+    /// 回归:config/auth 相同且 atom 三态也相同 → 仍是真重复 → 照旧去重(本修复不误伤)。
+    #[test]
+    fn move_to_recovery_still_dedups_when_atom_state_matches() {
+        let (_t, paths) = paths_with_tmp();
+        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&existing), "{\"k\":\"A\"}").unwrap();
+        let mut m_existing = mk_manifest("existing");
+        m_existing.electron_status_section_pre_value = Some(true);
+        write_manifest_to_dir(&existing, &m_existing).unwrap();
+
+        let stale = paths.active_snapshots_dir.join("same-atom");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
+        let mut m_stale = mk_manifest("same-atom");
+        m_stale.electron_status_section_pre_value = Some(true);
+        write_manifest_to_dir(&stale, &m_stale).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists());
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            1,
+            "config/auth + atom 三态全同 → 真重复 → 去重(不新增)"
+        );
+    }
+
+    /// MOC-148 review P2(#2):recovery 超额(已有 MAX 份**更新**的 + 1 份与 stale 同内容的
+    /// **更旧**份)时,迁移不能"因旧重复存在就丢弃 stale,随后 prune 又删掉那份旧重复"——
+    /// 否则该内容在 recovery 里一份不剩。替换式去重(删旧份 + 移入更新的 stale)后内容存活。
+    #[test]
+    fn stale_content_survives_when_recovery_over_cap_with_old_duplicate() {
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.recovery_snapshots_dir).unwrap();
+
+        // 1 份"更旧"的、与 stale 同内容(C)的 recovery(最小时间戳 → prune 最先清)。
+        let old_dup = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&old_dup).unwrap();
+        std::fs::write(config_path(&old_dup), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&old_dup, &mk_manifest("old-dup")).unwrap();
+
+        // MAX 份"更新"的、内容互不相同的 recovery(时间戳更大,占满上限)。
+        for i in 0..MAX_RECOVERY_SNAPSHOTS {
+            let d = paths
+                .recovery_snapshots_dir
+                .join(format!("2026061{i}T000000000-p9"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(config_path(&d), format!("openai_base_url = \"N{i}\"\n")).unwrap();
+            write_manifest_to_dir(&d, &mk_manifest(&format!("newer-{i}"))).unwrap();
+        }
+
+        // stale active(内容 C),走完整 apply 迁移流程(含前后两次 prune)。
+        let stale = paths.active_snapshots_dir.join("20260620T000000000-p1");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("20260620T000000000-p1")).unwrap();
+
+        move_stale_active_snapshots_to_recovery(&paths).unwrap();
+
+        assert!(!stale.exists(), "stale active 应已处理(移入或去重)");
+        let content_c_survives = snapshot_dirs_under(&paths.recovery_snapshots_dir)
+            .iter()
+            .any(|d| {
+                read_snapshot_config_from_dir(d).as_deref() == Some("openai_base_url = \"C\"\n")
+            });
+        assert!(
+            content_c_survives,
+            "去重 + prune 后内容 C 仍应在 recovery 留有一份(不两头落空)"
+        );
+        assert!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
+            "recovery 仍受上限约束"
+        );
+    }
+
+    /// MOC-148 review P2:recovery **恰好 = MAX**(pre-loop prune 无效)、最旧份与某 stale 同内容,
+    /// 且本轮**另有一个新内容 stale**一起移入 → 末尾 prune 会把那份旧重复清掉。替换式去重把同
+    /// 内容 stale 提为最新份,内容随之以最新时间戳存活,不被 prune 误删。
+    #[test]
+    fn stale_content_survives_at_cap_when_sibling_move_triggers_prune() {
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.recovery_snapshots_dir).unwrap();
+
+        // recovery 恰好占满 MAX:最旧一份内容 = C(与下面 stale-C 相同),其余内容各异。
+        let old_dup_c = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&old_dup_c).unwrap();
+        std::fs::write(config_path(&old_dup_c), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&old_dup_c, &mk_manifest("old-dup-c")).unwrap();
+        for i in 1..MAX_RECOVERY_SNAPSHOTS {
+            let d = paths
+                .recovery_snapshots_dir
+                .join(format!("2026060{}T000000000-p9", i + 1));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(config_path(&d), format!("openai_base_url = \"K{i}\"\n")).unwrap();
+            write_manifest_to_dir(&d, &mk_manifest(&format!("keep-{i}"))).unwrap();
+        }
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            MAX_RECOVERY_SNAPSHOTS,
+            "前置:recovery 恰好占满 MAX(pre-loop prune 此时是 no-op)"
+        );
+
+        // 本轮两个 stale active:一个内容 C(与最旧份重复),一个新内容 NEW。
+        let stale_c = paths.active_snapshots_dir.join("20260620T000000000-p1");
+        std::fs::create_dir_all(&stale_c).unwrap();
+        std::fs::write(config_path(&stale_c), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&stale_c, &mk_manifest("20260620T000000000-p1")).unwrap();
+
+        let stale_new = paths.active_snapshots_dir.join("20260621T000000000-p1");
+        std::fs::create_dir_all(&stale_new).unwrap();
+        std::fs::write(config_path(&stale_new), "openai_base_url = \"NEW\"\n").unwrap();
+        write_manifest_to_dir(&stale_new, &mk_manifest("20260621T000000000-p1")).unwrap();
+
+        move_stale_active_snapshots_to_recovery(&paths).unwrap();
+
+        let content_c_survives = snapshot_dirs_under(&paths.recovery_snapshots_dir)
+            .iter()
+            .any(|d| {
+                read_snapshot_config_from_dir(d).as_deref() == Some("openai_base_url = \"C\"\n")
+            });
+        assert!(
+            content_c_survives,
+            "at-cap + 兄弟移入触发 prune 后,内容 C 仍应存活(替换式去重提为最新份)"
+        );
+        assert!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
+            "recovery 仍受上限约束"
+        );
+    }
+
+    /// MOC-148 review P2:active/ 有两份同内容 stale(新/旧),替换式去重必须让**最新**那份成为
+    /// 留存副本(否则旧份覆盖新份,at-cap 时可能被 prune 误删)。构造 recovery 占满 MAX(时间戳
+    /// 居中)+ 旧 stale + 新 stale 同内容 → 迁移后内容存活,且留存副本是新 stale 那份。
+    #[test]
+    fn move_to_recovery_keeps_newest_among_duplicate_stale_actives() {
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.recovery_snapshots_dir).unwrap();
+        // recovery 占满 MAX,时间戳居中(晚于旧 stale、早于新 stale),内容各异。
+        for i in 0..MAX_RECOVERY_SNAPSHOTS {
+            let d = paths
+                .recovery_snapshots_dir
+                .join(format!("20260615T00000000{i}-p9"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(config_path(&d), format!("openai_base_url = \"M{i}\"\n")).unwrap();
+            write_manifest_to_dir(&d, &mk_manifest(&format!("mid-{i}"))).unwrap();
+        }
+        // 两份同内容(C)stale:旧(20260610)+ 新(20260620)。
+        let older_c = paths.active_snapshots_dir.join("20260610T000000000-p1");
+        std::fs::create_dir_all(&older_c).unwrap();
+        std::fs::write(config_path(&older_c), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&older_c, &mk_manifest("20260610T000000000-p1")).unwrap();
+        let newer_c = paths.active_snapshots_dir.join("20260620T000000000-p1");
+        std::fs::create_dir_all(&newer_c).unwrap();
+        std::fs::write(config_path(&newer_c), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&newer_c, &mk_manifest("20260620T000000000-p1")).unwrap();
+
+        move_stale_active_snapshots_to_recovery(&paths).unwrap();
+
+        let c_dirs: Vec<_> = snapshot_dirs_under(&paths.recovery_snapshots_dir)
+            .into_iter()
+            .filter(|d| {
+                read_snapshot_config_from_dir(d).as_deref() == Some("openai_base_url = \"C\"\n")
+            })
+            .collect();
+        assert_eq!(c_dirs.len(), 1, "内容 C 应恰好留一份(替换式去重不累积)");
+        assert!(
+            dir_name(&c_dirs[0])
+                .map(|n| n.starts_with("20260620"))
+                .unwrap_or(false),
+            "留存的 C 副本应是**最新** stale(20260620)而非旧份(20260610):实际 {:?}",
+            dir_name(&c_dirs[0])
+        );
+    }
+
+    /// MOC-148 review P2:recovery 目录 manifest **存在但损坏**(解析失败)、config/auth 可读时,
+    /// 不能与 stale 判为重复 —— 否则删掉刚生成的好 stale,只剩损坏份(`list_snapshots` 看不到、
+    /// 无法手动恢复)。损坏份视为非匹配 → 好 stale 应保留移入。
+    #[test]
+    fn move_to_recovery_keeps_stale_when_recovery_manifest_corrupt() {
+        let (_t, paths) = paths_with_tmp();
+        // recovery:config/auth 与 stale 完全相同,但 manifest.json 损坏(非法 JSON)。
+        let corrupt = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(config_path(&corrupt), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&corrupt), "{\"k\":\"A\"}").unwrap();
+        std::fs::write(manifest_path(&corrupt), "{ not valid json").unwrap();
+
+        let stale = paths.active_snapshots_dir.join("good-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("good-session")).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists(), "stale 应被移入,而非因损坏份去重而丢弃");
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            2,
+            "损坏 recovery manifest 不参与去重,好 stale 应保留移入(损坏份 + 好份)"
+        );
+        assert!(
+            list_snapshots(&paths).iter().any(|s| s.kind == "recovery"),
+            "应至少有一份 manifest 完好、可被 list_snapshots 恢复的 recovery"
+        );
+    }
+
+    /// 两份都"真"没有 config/auth(NotFound,合法空原始态)→ 内容相同 → 视为重复。
+    /// (区别于"文件存在但读失败"——那种 `snapshot_content_for_dedup` 返 None,
+    /// `recovery_has_content_duplicate` 保守判非重复、保留,见 IMPORTANT#2 修复。)
+    #[test]
+    fn move_to_recovery_treats_both_genuinely_empty_as_duplicate() {
+        let (_t, paths) = paths_with_tmp();
+        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&existing).unwrap();
+        write_manifest_to_dir(&existing, &mk_manifest("existing")).unwrap();
+
+        let stale = paths.active_snapshots_dir.join("empty-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("empty-session")).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists(), "两份都(真)空 → 视为重复,stale 丢弃");
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            1,
+            "空内容重复不应新增 recovery"
+        );
+    }
+
+    /// 上限:超过 MAX_RECOVERY_SNAPSHOTS 时只保留最新 N 份(按时间戳目录名)。
+    #[test]
+    fn prune_recovery_caps_to_max_keeping_newest() {
+        let (_t, paths) = paths_with_tmp();
+        let total = MAX_RECOVERY_SNAPSHOTS + 2; // 7
+        for i in 0..total {
+            // day (i+1):20260601 .. 20260607,字典序==时间序,内容各不同
+            let name = format!("2026060{}T120000000-p{i}", i + 1);
+            seed_recovery(&paths, &name, &format!("v = {i}\n"), None);
+        }
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            total
+        );
+
+        prune_recovery_snapshots(&paths);
+
+        let remaining = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+        assert_eq!(remaining.len(), MAX_RECOVERY_SNAPSHOTS, "应封顶到 N 份");
+        let names: Vec<String> = remaining.iter().filter_map(|d| dir_name(d)).collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("20260601T")),
+            "最旧(day1)应被删: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("20260602T")),
+            "次旧(day2)应被删: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("20260607T")),
+            "最新(day7)应保留: {names:?}"
+        );
+    }
+
+    /// MOC-148 review P2:prune 应优先保留**可恢复**(manifest 解析成功)的份、先淘汰损坏份;
+    /// 不让较新的损坏快照挤掉较旧但有效的备份。
+    #[test]
+    fn prune_evicts_corrupt_before_valid_recovery() {
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.recovery_snapshots_dir).unwrap();
+        // 1 份较旧但有效的备份。
+        let valid_old = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&valid_old).unwrap();
+        std::fs::write(config_path(&valid_old), "openai_base_url = \"VALID\"\n").unwrap();
+        write_manifest_to_dir(&valid_old, &mk_manifest("valid-old")).unwrap();
+        // MAX 份较新但 manifest 损坏的份(总数 MAX+1 → 触发 prune)。
+        for i in 0..MAX_RECOVERY_SNAPSHOTS {
+            let d = paths
+                .recovery_snapshots_dir
+                .join(format!("2026069{i}T000000000-p9"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(config_path(&d), format!("openai_base_url = \"X{i}\"\n")).unwrap();
+            std::fs::write(manifest_path(&d), "{ corrupt").unwrap();
+        }
+
+        prune_recovery_snapshots(&paths);
+
+        assert!(valid_old.exists(), "可恢复的旧备份不应被较新的损坏份挤掉");
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            MAX_RECOVERY_SNAPSHOTS,
+            "prune 后应恰好 MAX 份"
+        );
+        assert!(
+            list_snapshots(&paths).iter().any(|s| s.kind == "recovery"),
+            "至少保留一份可被 list_snapshots 恢复的 recovery"
+        );
+    }
+
+    /// prune 在 snapshot_codex_state(每次 apply)里被触发 → 历史无上限积压会被收敛。
+    #[test]
+    fn snapshot_codex_state_prunes_existing_recovery_backlog() {
+        let (_t, paths) = paths_with_tmp();
+        for i in 0..(MAX_RECOVERY_SNAPSHOTS + 3) {
+            let name = format!("2026053{}T120000000-p{i}", i); // 20260530..,内容各异
+            seed_recovery(&paths, &name, &format!("v = {i}\n"), None);
+        }
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
+
+        snapshot_codex_state(&paths, "v-new", "New", true).unwrap();
+
+        assert!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
+            "apply 时应把积压 recovery 收敛到上限内"
+        );
     }
 
     /// Devin Review BUG-004 防回归:pre-v3 (schema_version=2) 的 stale active
