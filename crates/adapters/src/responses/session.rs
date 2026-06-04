@@ -229,27 +229,29 @@ impl ResponseSessionCache {
     /// `POST /api/sessions/clear` 用。返回清掉的 L2 行数(L1 总是清空)。
     pub fn clear_all_persisted(&self) -> Result<usize, String> {
         self.clear();
-        let deleted = {
-            let mut guard = self.db.lock().expect("session cache db mutex poisoned");
-            match guard.as_mut() {
-                Some(conn) => conn
-                    .execute("DELETE FROM response_sessions", [])
-                    .map_err(|e| {
-                        let detail = format!("clear failed: {e}");
-                        log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
-                        detail
-                    })?,
-                // db 不可用(sqlite init 失败 → 纯内存 fallback):L2 行数 0,但 `blobs/`
-                // 可能仍有**上次成功运行**外置的私密图(`with_db_path` 无条件按 db_path
-                // 同级建 blobs 层)。**不能**早返成功跳过 sweep —— 必须继续往下清 blob
-                // (codex-connector P2)。
-                None => 0,
-            }
+        // **全程持 db 锁**(从这里到 fn 末尾):DELETE 与 blob sweep 之间**不放锁**,杜绝
+        // 并发 `persist_save` 在两者之间 acquire 锁、externalize 新图、insert 新 row —— 否则
+        // 紧随其后的空-live sweep 会把那张刚写的 blob 当孤儿删,留下指向缺失 blob 的悬挂行
+        // → 下次 L2 load 该 response 必 miss(codex-connector P2 并发竞态)。被阻塞的 save
+        // 会排到 clear 之后执行,其 blob 不在本轮 sweep 范围,安全。db=None(纯内存)时
+        // persist_save 早返、无并发 blob 写入,持不持锁都安全。
+        let mut guard = self.db.lock().expect("session cache db mutex poisoned");
+        let deleted = match guard.as_mut() {
+            Some(conn) => conn
+                .execute("DELETE FROM response_sessions", [])
+                .map_err(|e| {
+                    let detail = format!("clear failed: {e}");
+                    log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
+                    detail
+                })?,
+            // db 不可用(sqlite init 失败 → 纯内存 fallback):L2 行数 0,但 `blobs/` 可能仍有
+            // **上次成功运行**外置的私密图(`with_db_path` 无条件按 db_path 同级建 blobs 层)。
+            // **不能**早返成功跳过 sweep —— 必须继续往下清 blob(codex-connector P2)。
+            None => 0,
         };
-        // MOC-142:行全清 → 所有 blob 成孤儿,一并清掉("彻底清除"语义)。这是**隐私
-        // 清除**端点(POST /api/sessions/clear):blob 没删干净必须**上报**(返 Err →
-        // handler 500),不能 best-effort 静默成功让私密图片残留在 blobs/(codex-connector
-        // P1)。行已删但 blob 残留时返 Err 让用户知情、可重试 / 手动删。
+        // MOC-142:行全清 → 所有 blob 成孤儿,一并清掉("彻底清除"语义)。这是**隐私清除**
+        // 端点(POST /api/sessions/clear):blob 没删干净必须**上报**(返 Err → handler 500),
+        // 不能 best-effort 静默成功让私密图片残留在 blobs/(codex-connector P1)。
         if let Some(store) = self.blobs.as_ref() {
             let stats = store.sweep(&HashSet::new()).map_err(|e| {
                 let detail = format!("blob store clear failed (private images may remain): {e}");
@@ -266,6 +268,7 @@ impl ResponseSessionCache {
                 return Err(detail);
             }
         }
+        drop(guard); // 显式:sweep 全程持锁,到此才放
         Ok(deleted)
     }
 
