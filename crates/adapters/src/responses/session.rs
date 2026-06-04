@@ -241,13 +241,24 @@ impl ResponseSessionCache {
                     detail
                 })?
         };
-        // MOC-142:行全清 → 所有 blob 成孤儿,一并清掉("彻底清除"语义)。
+        // MOC-142:行全清 → 所有 blob 成孤儿,一并清掉("彻底清除"语义)。这是**隐私
+        // 清除**端点(POST /api/sessions/clear):blob 没删干净必须**上报**(返 Err →
+        // handler 500),不能 best-effort 静默成功让私密图片残留在 blobs/(codex-connector
+        // P1)。行已删但 blob 残留时返 Err 让用户知情、可重试 / 手动删。
         if let Some(store) = self.blobs.as_ref() {
-            if let Err(e) = store.sweep(&HashSet::new()) {
-                log_db_warning(
-                    "SESSIONS_BLOB_SWEEP_FAILED",
-                    format!("clear-all sweep failed: {e}"),
+            let stats = store.sweep(&HashSet::new()).map_err(|e| {
+                let detail = format!("blob store clear failed (private images may remain): {e}");
+                log_db_warning("SESSIONS_BLOB_CLEAR_INCOMPLETE", detail.clone());
+                detail
+            })?;
+            if stats.failed > 0 {
+                let detail = format!(
+                    "session rows cleared but {} blob file(s) could not be removed from \
+                     blobs/ (private images may remain)",
+                    stats.failed
                 );
+                log_db_warning("SESSIONS_BLOB_CLEAR_INCOMPLETE", detail.clone());
+                return Err(detail);
             }
         }
         Ok(deleted)
@@ -313,9 +324,20 @@ impl ResponseSessionCache {
                 }
             }
         }
-        store
+        let stats = store
             .sweep(&live)
-            .map_err(|e| format!("sessions.db blob sweep failed: {e}"))
+            .map_err(|e| format!("sessions.db blob sweep failed: {e}"))?;
+        if stats.failed > 0 {
+            log_db_warning(
+                "SESSIONS_BLOB_SWEEP_PARTIAL",
+                format!(
+                    "startup GC: removed {} orphan blob(s), {} failed \
+                     (best-effort, retry next GC)",
+                    stats.removed, stats.failed
+                ),
+            );
+        }
+        Ok(stats.removed)
     }
 
     /// fix(#210 P2): Proxy 停止前把 L1 内存中所有活跃 entry 重新写入 L2。
@@ -699,6 +721,9 @@ fn backup_corrupt_db(db_path: &Path) {
 ///   读分片目录失败,该分片孤儿本轮未回收
 /// - `SESSIONS_BLOB_REMOVE_FAILED` — 孤儿 blob 删除失败,下次 GC 重试
 /// - `SESSIONS_BLOB_TMP_REMOVE_FAILED` — 残留 `.tmp.` 删除失败(NotFound 静默)
+/// - `SESSIONS_BLOB_SWEEP_PARTIAL` — 启动 GC 部分 blob 删失败(best-effort,下次重试)
+/// - `SESSIONS_BLOB_CLEAR_INCOMPLETE` — 隐私清除(`/api/sessions/clear`)blob 没删干净,
+///   **已 Err 上报**(行已删但私密图片可能残留;codex-connector P1)
 ///
 /// `error_id` 必须用 `&'static str`(literal)以保跨版本稳定;`detail` 给人类
 /// 阅读的上下文(path / error message),不进 metric label。
@@ -1021,5 +1046,42 @@ mod tests {
         cache.clear();
         let restored = cache.get("resp_img").expect("L2 应能读回并回填 blob");
         assert_eq!(restored, messages, "回填后必须字节级等于原始");
+    }
+
+    #[test]
+    fn clear_all_persisted_also_removes_blobs() {
+        // MOC-142 隐私清除(codex-connector P1):clear 必须连带删 blobs/,否则私密
+        // 图片残留;且 blob 没删干净要返 Err(此处正常路径应成功 + blob 清零)。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        let big = format!("data:image/png;base64,{}", "Z".repeat(20_000));
+        cache.save("resp_clear", vec![json!({"image_url": big})]);
+        let blobs_dir = path.parent().unwrap().join("blobs");
+
+        fn count_blobs(dir: &std::path::Path) -> usize {
+            let Ok(shards) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            shards
+                .flatten()
+                .filter_map(|sh| std::fs::read_dir(sh.path()).ok())
+                .flat_map(|files| files.flatten())
+                .filter(|f| {
+                    f.file_name()
+                        .to_str()
+                        .map(|s| !s.starts_with(".tmp."))
+                        .unwrap_or(false)
+                })
+                .count()
+        }
+
+        assert!(count_blobs(&blobs_dir) >= 1, "save 后 blobs/ 应有文件");
+        cache.clear_all_persisted().expect("正常路径 clear 应成功");
+        assert_eq!(count_blobs(&blobs_dir), 0, "clear 后 blob 必须清零(隐私)");
     }
 }

@@ -70,6 +70,16 @@ impl std::fmt::Display for InlineError {
     }
 }
 
+/// `sweep` 结果:成功删除的 blob 数 + **失败**数(分片读不出 / 文件删不掉)。
+/// 隐私清除(`clear_all_persisted` → `POST /api/sessions/clear`)据 `failed > 0`
+/// 上报"没清干净"(私密图片可能残留),不能 best-effort 静默成功;启动孤儿 GC
+/// 则仅观测 `failed`、不因此 abort(单个锁文件不该挡住其余回收)。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SweepStats {
+    pub removed: usize,
+    pub failed: usize,
+}
+
 impl BlobStore {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self { root }
@@ -182,13 +192,14 @@ impl BlobStore {
         Ok(n)
     }
 
-    /// mark-sweep:删掉所有不在 `live` 集合里的 blob 文件(及 `.tmp.` 残留)。
-    /// 返回删除数。blobs 根不存在 → `Ok(0)`。
-    pub(crate) fn sweep(&self, live: &HashSet<String>) -> io::Result<usize> {
-        let mut removed = 0usize;
+    /// mark-sweep:删掉所有不在 `live` 集合里的 blob 文件(及 `.tmp.` 残留)。返回
+    /// [`SweepStats`](删除数 + 失败数)。blobs 根不存在 → `Ok(default)`。分片读不出
+    /// / blob 删不掉计入 `failed`(供隐私清除路径上报),但不中断其余回收。
+    pub(crate) fn sweep(&self, live: &HashSet<String>) -> io::Result<SweepStats> {
+        let mut stats = SweepStats::default();
         let shards = match fs::read_dir(&self.root) {
             Ok(rd) => rd,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(stats),
             Err(e) => return Err(e),
         };
         for shard in shards {
@@ -199,6 +210,7 @@ impl BlobStore {
                         "SESSIONS_BLOB_SHARD_ITER_FAILED",
                         format!("blobs 分片目录项遍历失败,跳过: {e}"),
                     );
+                    stats.failed += 1;
                     continue;
                 }
             };
@@ -212,6 +224,7 @@ impl BlobStore {
                         "SESSIONS_BLOB_SHARD_READ_FAILED",
                         format!("read_dir({:?}) 失败,本分片孤儿未回收: {e}", shard.path()),
                     );
+                    stats.failed += 1;
                     continue;
                 }
             };
@@ -219,7 +232,8 @@ impl BlobStore {
                 let Ok(f) = f else { continue };
                 let name = f.file_name();
                 let Some(name) = name.to_str() else { continue };
-                // 没 rename 完的 temp 残留顺手清(NotFound = 被并发清掉,正常)。
+                // 没 rename 完的 temp 残留顺手清(NotFound = 被并发清掉,正常)。temp 不是
+                // blob 内容,删不掉不计 `failed`(不影响隐私清除完整性)。
                 if name.starts_with(".tmp.") {
                     if let Err(e) = fs::remove_file(f.path()) {
                         if e.kind() != io::ErrorKind::NotFound {
@@ -237,17 +251,20 @@ impl BlobStore {
                 }
                 if !live.contains(name) {
                     match fs::remove_file(f.path()) {
-                        Ok(()) => removed += 1,
+                        Ok(()) => stats.removed += 1,
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => warn(
-                            "SESSIONS_BLOB_REMOVE_FAILED",
-                            format!("孤儿 blob {name} 删除失败,下次 GC 重试: {e}"),
-                        ),
+                        Err(e) => {
+                            warn(
+                                "SESSIONS_BLOB_REMOVE_FAILED",
+                                format!("孤儿 blob {name} 删除失败,下次 GC 重试: {e}"),
+                            );
+                            stats.failed += 1;
+                        }
                     }
                 }
             }
         }
-        Ok(removed)
+        Ok(stats)
     }
 
     /// 收集 value 里所有 blob 引用的 hash(GC mark 用)。
@@ -414,8 +431,9 @@ mod tests {
         let orphan = s.put(&big_data_url('E')).unwrap();
         let mut live = HashSet::new();
         live.insert(keep.clone());
-        let removed = s.sweep(&live).unwrap();
-        assert_eq!(removed, 1);
+        let stats = s.sweep(&live).unwrap();
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.failed, 0);
         assert!(s.get(&keep).unwrap().is_some(), "live blob 必须保留");
         assert!(s.get(&orphan).unwrap().is_none(), "orphan blob 必须删");
     }
