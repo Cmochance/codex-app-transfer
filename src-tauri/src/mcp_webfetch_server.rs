@@ -172,10 +172,19 @@ fn dispatch_line(
             let _ = out_tx.send(json!({"jsonrpc": "2.0", "id": id, "result": {}}));
         }
         "tools/list" => {
+            // web_fetch 任意启用档都暴露(off 时本 server 根本不注册);web_search 仅 headless 档
+            // 暴露 —— 它必须 headless(DDG 反爬只有真浏览器能过), 非 headless 档列出来模型也只能被
+            // handle 拒, 徒增无效调用(用户 #386 验收反馈)。改档需重启 Codex 重新 tools/list 才反映
+            // (与 web_fetch 改 on/off 需重启一致);运行期切档的 stale 缓存由 handle_web_search_call
+            // 的 backend gate 兜底(failing 双保险)。
+            let mut tools = vec![web_fetch_tool_def()];
+            if matches!(current_backend(), Ok(Some(WebFetchBackend::Headless))) {
+                tools.push(web_search_tool_def());
+            }
             let _ = out_tx.send(json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": { "tools": [web_fetch_tool_def(), web_search_tool_def()] }
+                "result": { "tools": tools }
             }));
         }
         "tools/call" => {
