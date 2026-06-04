@@ -244,15 +244,17 @@ impl BlobStore {
                 };
                 let name = f.file_name();
                 let Some(name) = name.to_str() else { continue };
-                // 没 rename 完的 temp 残留顺手清(NotFound = 被并发清掉,正常)。temp 不是
-                // blob 内容,删不掉不计 `failed`(不影响隐私清除完整性)。
+                // 没 rename 完的 temp 残留顺手清(NotFound = 被并发清掉,正常)。**temp 文件
+                // 含 `put` 在途写入的 blob 字节(就是图片内容,只是没 rename 到位)**,所以删
+                // 不掉同样计入 `failed` —— 隐私清除必须把这些半写文件也算没清干净(P1)。
                 if name.starts_with(".tmp.") {
                     if let Err(e) = fs::remove_file(f.path()) {
                         if e.kind() != io::ErrorKind::NotFound {
                             warn(
                                 "SESSIONS_BLOB_TMP_REMOVE_FAILED",
-                                format!("残留 temp {name} 删除失败: {e}"),
+                                format!("残留 temp {name}(含在途 blob 字节)删除失败: {e}"),
                             );
+                            stats.failed += 1;
                         }
                     }
                     continue;

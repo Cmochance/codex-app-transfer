@@ -761,7 +761,8 @@ fn backup_blobs_dir(db_path: &Path, ts: i64) {
 /// - `SESSIONS_BLOB_ENTRY_FAILED` — sweep 单个文件项读取失败(计入 `failed`,防隐私
 ///   清除漏查某 blob 却误报成功)
 /// - `SESSIONS_BLOB_REMOVE_FAILED` — 孤儿 blob 删除失败,下次 GC 重试
-/// - `SESSIONS_BLOB_TMP_REMOVE_FAILED` — 残留 `.tmp.` 删除失败(NotFound 静默)
+/// - `SESSIONS_BLOB_TMP_REMOVE_FAILED` — 残留 `.tmp.`(含在途 blob 字节)删除失败,**计入
+///   `failed`** → 隐私清除据此报不完整(NotFound 静默;codex-connector P1)
 /// - `SESSIONS_BLOB_SWEEP_PARTIAL` — 启动 GC 部分 blob 删失败(best-effort,下次重试)
 /// - `SESSIONS_BLOB_CLEAR_INCOMPLETE` — 隐私清除(`/api/sessions/clear`)blob 没删干净,
 ///   **已 Err 上报**(行已删但私密图片可能残留;codex-connector P1)
