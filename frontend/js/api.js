@@ -140,6 +140,8 @@
       requestOptions: provider.requestOptions || {},
       default: provider.id === activeId,
       isBuiltin: !!provider.isBuiltin,
+      // web_fetch 网页摘要模型 (MOC-152);显式挑字段, 不加这行前端拿不到后端返的值。
+      summaryModel: provider.summaryModel || '',
       mappings: {
         default: models.default || '',
         gpt_5_5: models.gpt_5_5 || '',
@@ -196,6 +198,11 @@
     }
     if (includeModels) {
       body.models = payload.models || {};
+    }
+    // web_fetch 网页摘要模型 (MOC-152): 只要 payload 带了该键就下发(含空串 ''),否则用户
+    // 清空时前端不发 → 后端 update_provider 的 remove 分支永不触发、旧值残留(显式挑字段丢值)。
+    if (payload.summaryModel !== undefined && payload.summaryModel !== null) {
+      body.summaryModel = payload.summaryModel; // '' → 后端 remove(清除,回退 models.default)
     }
     // R1 Plan A:grokWeb extra(cookies + statsigId override + UA override)必须
     // passthrough 到 backend payload。**此前漏掉**(2026-05-12 user E2E 真机
