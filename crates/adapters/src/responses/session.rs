@@ -662,20 +662,28 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn backup_corrupt_db(db_path: &Path) {
-    let bak = PathBuf::from(format!("{}.bak.{}", db_path.display(), unix_now()));
+    let ts = unix_now();
+    let bak = PathBuf::from(format!("{}.bak.{}", db_path.display(), ts));
     // **silent-failure M3 修**:旧 `let _ = rename(...)` 静默 → rename 失败时
     // 后续会基于**原 corrupt db** 重建 schema(可能成功也可能挂);上层 warn
     // 文案仍宣称"backed up + rebuilding",撒谎给 operator。新实现区分两条
     // 路径,rename 失败时换 error_id 让 operator 看到真实状态。
     match std::fs::rename(db_path, &bak) {
-        Ok(()) => log_db_warning(
-            "SESSIONS_DB_SCHEMA_MISMATCH",
-            format!(
-                "schema mismatch at {} — backed up to {} and rebuilding empty db",
-                db_path.display(),
-                bak.display()
-            ),
-        ),
+        Ok(()) => {
+            log_db_warning(
+                "SESSIONS_DB_SCHEMA_MISMATCH",
+                format!(
+                    "schema mismatch at {} — backed up to {} and rebuilding empty db",
+                    db_path.display(),
+                    bak.display()
+                ),
+            );
+            // MOC-142 + codex-connector P2:db 备份成 `.bak` 后,新空库的启动 sweep 会把
+            // 所有 blob 当孤儿删 → `.bak` 引用的图不可恢复。连带把 `blobs/` 改名为
+            // `blobs.bak.<同一 ts>/`,让备份成对自洽(也使新库的 blobs/ 为空、sweep 无可删)。
+            // best-effort:失败仅 warn,不阻断重建。
+            backup_blobs_dir(db_path, ts);
+        }
         Err(e) => log_db_warning(
             "SESSIONS_DB_BACKUP_FAILED",
             format!(
@@ -685,6 +693,29 @@ fn backup_corrupt_db(db_path: &Path) {
                 bak.display()
             ),
         ),
+    }
+}
+
+/// 把 `sessions.db` 同级的 `blobs/` 目录随 db 一起备份成 `blobs.bak.<ts>/`(与
+/// `sessions.db.bak.<ts>` 配对)。仅 db 备份成功后调用;`blobs/` 不存在则 no-op。
+fn backup_blobs_dir(db_path: &Path, ts: i64) {
+    let Some(parent) = db_path.parent() else {
+        return;
+    };
+    let blobs = parent.join("blobs");
+    if !blobs.is_dir() {
+        return;
+    }
+    let blobs_bak = parent.join(format!("blobs.bak.{ts}"));
+    if let Err(e) = std::fs::rename(&blobs, &blobs_bak) {
+        log_db_warning(
+            "SESSIONS_BLOB_BACKUP_FAILED",
+            format!(
+                "schema mismatch: db 已备份但 blobs/ → {} rename 失败: {e} — \
+                 启动 sweep 可能删掉 .bak 引用的图",
+                blobs_bak.display()
+            ),
+        );
     }
 }
 
@@ -734,6 +765,8 @@ fn backup_corrupt_db(db_path: &Path) {
 /// - `SESSIONS_BLOB_SWEEP_PARTIAL` — 启动 GC 部分 blob 删失败(best-effort,下次重试)
 /// - `SESSIONS_BLOB_CLEAR_INCOMPLETE` — 隐私清除(`/api/sessions/clear`)blob 没删干净,
 ///   **已 Err 上报**(行已删但私密图片可能残留;codex-connector P1)
+/// - `SESSIONS_BLOB_BACKUP_FAILED` — schema 重建备份 db 后,`blobs/` → `blobs.bak.<ts>/`
+///   rename 失败(启动 sweep 可能删掉 `.bak` 引用的图;codex-connector P2)
 ///
 /// `error_id` 必须用 `&'static str`(literal)以保跨版本稳定;`detail` 给人类
 /// 阅读的上下文(path / error message),不进 metric label。
@@ -1056,6 +1089,44 @@ mod tests {
         cache.clear();
         let restored = cache.get("resp_img").expect("L2 应能读回并回填 blob");
         assert_eq!(restored, messages, "回填后必须字节级等于原始");
+    }
+
+    #[test]
+    fn schema_mismatch_also_backs_up_blobs_dir() {
+        // codex-connector P2:schema 重建把 db 备份成 .bak 时,必须连带把 blobs/ 改名走,
+        // 否则新空库的启动 sweep 会删光 blob、让 .bak 引用的图不可恢复。
+        let (_dir, path) = fresh_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT INTO sessions_meta VALUES('schema_version', '999');",
+            )
+            .unwrap();
+        }
+        let blobs = path.parent().unwrap().join("blobs");
+        std::fs::create_dir_all(blobs.join("ab")).unwrap();
+        std::fs::write(blobs.join("ab").join("deadbeef"), b"img").unwrap();
+
+        let (_cache, warn) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        assert!(warn.is_none(), "schema 重建应成功");
+        assert!(!blobs.exists(), "原 blobs/ 应被改名为 blobs.bak.*");
+        let bak_dirs = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.starts_with("blobs.bak."))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(bak_dirs, 1, "应生成一个 blobs.bak.* 备份目录");
     }
 
     #[test]
