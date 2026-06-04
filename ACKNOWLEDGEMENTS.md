@@ -137,8 +137,8 @@
 
 - **Link**: https://github.com/openai/codex
 - **License**: Apache-2.0
-- **借鉴形式**: Prompt 蓝本(精简移植)+ 协议反查(数据模式参照)+ 落盘布局思路(blob 内容寻址)
-- **首次借鉴 PR / 时间**: v2.0.x 起协议结构反查;fix/219 起 prompt 结构借鉴;MOC-142 起 blob 落盘布局
+- **借鉴形式**: Prompt 蓝本(精简移植)+ 协议反查(数据模式参照)+ 落盘布局思路(blob 内容寻址 + 会话 append-only)
+- **首次借鉴 PR / 时间**: v2.0.x 起协议结构反查;fix/219 起 prompt 结构借鉴;MOC-142 起 blob 落盘布局;MOC-168 起会话 append-only 思路
 - **借鉴清单**:
   - `COMPACT_SUMMARIZATION_PROMPT` 基础骨架 → `crates/adapters/src/responses/compact.rs:82-92`
     (源文件:`codex-rs/core/templates/compact/prompt.md`,~460 chars)
@@ -155,6 +155,11 @@
     → `crates/adapters/src/responses/blob_store.rs`
     (思路观察自 Codex `~/.codex/generated_images/ig_<hash>.png` 落盘布局;另参 Claude Code
     `~/.claude/paste-cache/<hash>.txt` 同类内容寻址 —— 均为运行时目录观察,非源码借鉴)
+  - **MOC-168 消息级内容寻址**:每条消息按 sha256 存 `message_contents` 表去重,行只留引用,
+    消除 stateless 逐轮快照对同一条消息的重复存储(实测 11 万实例 → 2687 唯一,41×,省 97%)
+    → `crates/adapters/src/responses/message_store.rs`
+    (借 Codex 会话记录 `~/.codex/sessions/.../rollout-*.jsonl` 的 per-session **append-only**
+    每 event 只落一次思路;我们 stateless 无 session 串联,用内容寻址等效"每条唯一消息只存一份")
 - **本项目差异 / 扩展**:
   - prompt 补两条 Claude Code 关键 bullet("All user messages verbatim" + "Next Step verbatim quote"),
     借鉴自 Piebald-AI/claude-code-system-prompts 反编译公开版本第 6 / 9 段(见下方同名 entry)
