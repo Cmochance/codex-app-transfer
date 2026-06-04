@@ -39,6 +39,11 @@ struct ViewerHandle {
 #[derive(Default)]
 pub struct TraceViewerManager {
     handle: Mutex<Option<ViewerHandle>>,
+    /// 串行化整个 start 序列(bind + 安装 handle),防并发 start 同时过 `handle==None` 检查
+    /// 都去 bind 18090 → 输者 bind 失败返假错误(codex-connector:并发 start race)。
+    /// 持有它跨同步 bind 是 OK 的——start 经 `spawn_blocking` 在阻塞线程跑;handle/stop/addr
+    /// 不碰它,无嵌套锁、无死锁。
+    start_lock: Mutex<()>,
 }
 
 impl TraceViewerManager {
@@ -48,8 +53,10 @@ impl TraceViewerManager {
 
     /// 启动 viewer 监听 `127.0.0.1:<port>`。已 running 则返回当前地址(幂等)。
     /// 同步:在独立 bootstrap 线程里 build runtime + bind(快),经 std mpsc 回传结果;
-    /// runtime move 进 handle 常驻,bootstrap 线程发完即退。
+    /// runtime move 进 handle 常驻,bootstrap 线程发完即退。整个序列由 `start_lock` 串行化
+    /// → 并发 start 第二个会等第一个装好 handle 后看到 Some、幂等返回,不会二次 bind。
     pub fn start(&self, port: u16) -> Result<SocketAddr, String> {
+        let _start_guard = self.start_lock.lock().unwrap();
         {
             let guard = self.handle.lock().unwrap();
             if let Some(h) = guard.as_ref() {
