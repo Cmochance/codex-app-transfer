@@ -513,6 +513,10 @@ async fn connect_and_monitor(
     // 是否已往页内 recorder 启用过采集(诊断 on 时置 true);用于 on→off 时发一次性"停采+清队列"
     // eval(关掉已注入的页内 recorder,避免 toggle off 后页未 reload 仍在渲染进程囤未脱敏流量)。
     let mut mcp_recorder_enabled = false;
+    // 录制器 JS 是否已注入当前页(gate on 首 tick 安装;reload/reinject 后页面重置 → 置回 false
+    // 下次 on tick 重装)。注入移到 drain 分支(不在 inject_unlock_script),让运行时开启诊断
+    // (daemon 已 inject、gate 当时关)也能装上,不必等页面 reload。
+    let mut mcp_recorder_installed = false;
     let mut mcp_drain_interval = tokio::time::interval(Duration::from_secs(2));
     mcp_drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     mcp_drain_interval.tick().await; // 跳过首次立即触发
@@ -563,8 +567,10 @@ async fn connect_and_monitor(
                                 // [MOC-169 P2] inject 的 await_cdp_response 会丢弃非目标帧——若在途
                                 // drain 响应正好被丢,pending_drain_id 会永不清、drain 永久 skip。
                                 // 重注入后强制清掉(那一批 spliced 条目随 reload 丢失,可接受),
-                                // 让下个 tick 重新 drain。
+                                // 让下个 tick 重新 drain。reload 后页面重置 → 录制器没了,置回
+                                // 未安装,下个 on tick 重装。
                                 pending_drain_id = None;
+                                mcp_recorder_installed = false;
                             }
                         }
                     }
@@ -610,8 +616,9 @@ async fn connect_and_monitor(
                         tracing::info!("[PluginUnlock] manual reinject requested (same instance)");
                         inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
                         // [MOC-169 P2] 同 loadEventFired:reinject 的 await_cdp_response 可能吞掉在途
-                        // drain 响应 → 清 pending_drain_id 防 drain 永久卡死。
+                        // drain 响应 → 清 pending_drain_id 防 drain 永久卡死;reinject 后录制器需重装。
                         pending_drain_id = None;
+                        mcp_recorder_installed = false;
                     }
                     Some(ServiceCommand::Stop) => {
                         // [MOC-100 P2-1] 关键:返回 Stop 而非 Ok(()),否则 run_daemon
@@ -662,19 +669,34 @@ async fn connect_and_monitor(
                 }
                 if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() {
                     mcp_recorder_enabled = true;
-                    let (drain_msg, drain_id) = make_cdp_msg(
-                        msg_id_counter,
-                        "Runtime.evaluate",
-                        json!({
-                            "expression": "window.__codexMcpTraceOn=true; (window.__codexMcpTrace && window.__codexMcpTrace.splice(0)) || []",
-                            "returnByValue": true
-                        }),
-                    );
-                    if let Err(e) = write.send(WsMessage::Text(drain_msg)).await {
-                        tracing::warn!("[McpTrace] drain send failed: {}", e);
-                        break;
+                    if !mcp_recorder_installed {
+                        // 录制器还没装(诊断刚开 / reload 后):先注入(idempotent IIFE),本 tick 不
+                        // drain,下个 tick 起 drain。fire-and-forget,响应帧 read 分支按 id 不匹配忽略。
+                        let (rec_msg, _rec_id) = make_cdp_msg(
+                            msg_id_counter,
+                            "Runtime.evaluate",
+                            json!({ "expression": MCP_RECORDER_JS, "returnByValue": true }),
+                        );
+                        if let Err(e) = write.send(WsMessage::Text(rec_msg)).await {
+                            tracing::warn!("[McpTrace] recorder install send failed: {}", e);
+                            break;
+                        }
+                        mcp_recorder_installed = true;
+                    } else {
+                        let (drain_msg, drain_id) = make_cdp_msg(
+                            msg_id_counter,
+                            "Runtime.evaluate",
+                            json!({
+                                "expression": "window.__codexMcpTraceOn=true; (window.__codexMcpTrace && window.__codexMcpTrace.splice(0)) || []",
+                                "returnByValue": true
+                            }),
+                        );
+                        if let Err(e) = write.send(WsMessage::Text(drain_msg)).await {
+                            tracing::warn!("[McpTrace] drain send failed: {}", e);
+                            break;
+                        }
+                        pending_drain_id = Some(drain_id);
                     }
-                    pending_drain_id = Some(drain_id);
                 } else if mcp_recorder_enabled {
                     // on→off:一次性关掉页内 recorder + 清队列(fire-and-forget,响应忽略),之后静默
                     mcp_recorder_enabled = false;
@@ -970,21 +992,9 @@ async fn inject_unlock_script(
         return Err(msg.into());
     }
 
-    // [MOC-169] 诊断 gate 开时注入 MCP 流量录制器(fire-and-forget:不追响应,其响应帧后续在
-    // select! read 分支按 id 不匹配被忽略)。**关时根本不注入** → 页内 `window.__codexMcpTrace`
-    // 不存在、对 Codex Desktop 零开销(默认关)。录制器 IIFE 幂等(`__codexMcpTraceInit` 守卫),
-    // reinject / reload 不重复 wrap fetch/WebSocket。运行时刚开启诊断的需 Codex 页面下次
-    // reload / reinject 才注入录制器(forward-trace 立即生效,MCP 采集滞后一个 reload)。
-    if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() {
-        let (rec_msg, _rec_id) = make_cdp_msg(
-            msg_id_counter,
-            "Runtime.evaluate",
-            json!({ "expression": MCP_RECORDER_JS, "returnByValue": true }),
-        );
-        if let Err(e) = write.send(WsMessage::Text(rec_msg)).await {
-            tracing::warn!("[McpTrace] recorder inject send failed: {}", e);
-        }
-    }
+    // [MOC-169] MCP 流量录制器的注入**不在这里**(改由 connect_and_monitor 的 drain 分支按需
+    // 安装,见 mcp_recorder_installed):这样运行时开启诊断(daemon 早已 inject 过、gate 当时关)
+    // 也能在下个 drain tick 装上录制器,不必等 Codex 页面 reload(codex-connector:install on toggle)。
 
     // 脚本返回 `{ ok, reason, error? }`,按 reason 分流:
     // - unlocked: 成功,状态 Injected
@@ -1139,14 +1149,24 @@ const MCP_RECORDER_JS: &str = r#"
         try {
             const resp = await origFetch.apply(this, arguments);
             if (capture) {
-                let respBody = null;
-                try { respBody = await resp.clone().text(); } catch (_) {}
-                push({
+                const base = {
                     kind: 'fetch', url: String(url), method: String(method),
                     req_headers: reqHeaders, req_body: truncate(reqBody),
                     resp_status: resp.status, resp_headers: headersToObj(resp.headers),
-                    resp_body: truncate(respBody), duration_ms: Date.now() - startedAt,
-                });
+                    duration_ms: Date.now() - startedAt,
+                };
+                // **绝不 await body 再 return**:SSE/streaming 响应 .text() 要等整流结束才 resolve,
+                // 会卡住 Codex 拿不到响应(MCP SSE 挂死)。流式只记元信息;非流式 fire-and-forget 读
+                // clone(读完再 push 带 body),return resp 立即返回,不阻塞调用方。
+                const ct = (resp.headers && resp.headers.get && resp.headers.get('content-type')) || '';
+                if (/event-stream|stream/i.test(ct)) {
+                    push(Object.assign({ resp_body: '<streaming ' + ct + ', body not captured>' }, base));
+                } else {
+                    resp.clone().text().then(
+                        function (b) { push(Object.assign({ resp_body: truncate(b) }, base)); },
+                        function () { push(base); }
+                    );
+                }
             }
             return resp;
         } catch (e) {
