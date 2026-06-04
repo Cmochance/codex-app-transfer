@@ -27,7 +27,7 @@ codex-app-transfer-registry = { path = "../crates/registry" }
 # release-bundle 子命令依赖 (Phase 3 Commit D):
 # rsa "pem" feature 启用 PKCS#8 PEM 编解码; sha2 "oid" feature 让 Pkcs1v15Sign::new::<Sha256> 编译过.
 rsa = { version = "0.9", features = ["sha2", "pem"] }
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = "1"
