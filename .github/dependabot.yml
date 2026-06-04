@@ -28,6 +28,29 @@ updates:
         versions: ["<= 6.0.0-rc.29"]
       - dependency-name: "wreq-util"
         versions: ["<= 3.0.0-rc.12"]
+      # sha2 0.11 切到 digest 0.11,但 rsa 0.9.x 仍锁 digest/sha2 0.10
+      # (xtask/release_bundle.rs 用 rsa::Pkcs1v15Sign + Sha256 签名)。两版本的
+      # Digest/AssociatedOid trait 不互通 → 编译 fail(E0277,见 #379 / MOC-167)。
+      # 用 update-types 只挡 minor/major(= 直接依赖从 0.10 升 0.11 的迁移),patch
+      # 放行:0.10.x bugfix / 未来若有 transitive sha2 的 patch 级安全补丁(ignore
+      # 规则会过滤 security update)都能照常提 PR。待 rsa 出兼容 digest 0.11 的版本
+      # (rsa 0.10+)再移除本条升级。
+      - dependency-name: "sha2"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # getrandom 0.3+ 移除顶层 getrandom() 函数(→ fill())并改了 Error 构造 API
+      # (cloud_code.rs 用了 0.3+ 已删的 Error::from(NonZeroU32)),涉及 src-tauri
+      # 安全关键 gateway key 生成等 ~18 处调用(见 #378 / MOC-167)。0.2 仍在维护、
+      # 无 CVE、零功能收益 → risk>benefit,挡住直接依赖 0.2→0.3/0.4 的迁移。用
+      # update-types 只挡 minor/major、放行 patch:0.2.x 仍走 everything-else,且
+      # lockfile 里 tempfile/uuid 已带 transitive getrandom 0.3.4 / 0.4.2,其 patch
+      # 级安全补丁(ignore 会过滤 security update,见 #383 review)仍能照常提 PR。
+      # 有 CVE 或 0.2 弃维护时再移除本条迁移。
+      - dependency-name: "getrandom"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
     groups:
       # wreq + wreq-util 是浏览器指纹伪装对,rc 版本间有 emulation trait 重命名
       # skew(见 crates/http/Cargo.toml 注释),必须锁步升级 → 单独 group 一次性

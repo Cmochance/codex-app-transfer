@@ -1398,6 +1398,53 @@ mod tests {
         }
     }
 
+    /// **MOC-148 防回归**:relay 模式残留的 `chatgpt_base_url = "<proxy>/backend-api"`
+    /// 进了快照基线(自我延续投毒),restore 必须把它当 signature 污染 strip 掉,
+    /// 而不是按字面量回写 —— 否则 transfer 退出后 Codex 仍把 ChatGPT 后端发往死
+    /// proxy,切 GPT 报错。用户合法字段(model)保留。
+    #[test]
+    fn restore_strips_polluted_chatgpt_base_url_from_snapshot() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        std::fs::create_dir_all(&paths.snapshot_dir).unwrap();
+
+        // 模拟真实污染快照:relay 残留 chatgpt_base_url + 用户的 model 选择
+        let polluted_snapshot = "\
+mcp_oauth_credentials_store = \"file\"
+chatgpt_base_url = \"http://127.0.0.1:18080/backend-api\"
+model = \"gpt-5.5\"
+";
+        std::fs::write(&paths.snapshot_config, polluted_snapshot).unwrap();
+        std::fs::write(&paths.snapshot_auth, "{}").unwrap();
+        std::fs::write(
+            &paths.snapshot_manifest,
+            r#"{"snapshot_id":"legacy","session_id":"legacy","schema_version":1}"#,
+        )
+        .unwrap();
+
+        // live config 也含同样残留(transfer 退出前的状态)
+        std::fs::write(&paths.config_toml, polluted_snapshot).unwrap();
+        std::fs::write(&paths.auth_json, "{}").unwrap();
+
+        restore_codex_state(&paths).unwrap();
+
+        let toml = read_toml(&paths);
+        assert!(
+            !toml.contains("chatgpt_base_url"),
+            "残留 chatgpt_base_url 必须被 strip 而不是回写: {toml}"
+        );
+        // 用户合法字段保留
+        assert!(
+            toml.contains("mcp_oauth_credentials_store = \"file\""),
+            "user 自有 key 必须保留: {toml}"
+        );
+        assert!(
+            toml.contains("model = \"gpt-5.5\""),
+            "user 的 model 必须保留(Auto restore 快照里有就还原): {toml}"
+        );
+    }
+
     #[test]
     fn restore_without_snapshot_falls_back_to_remove_managed_keys() {
         let (_t, paths) = setup();
