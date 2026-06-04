@@ -31,6 +31,10 @@ tracing = "0.1"
 getrandom = "0.2"
 # grok_web 动态 statsig-id 生成(base64-encoded 伪 JS error blob;参考 chenyme/grok2api)
 base64 = "0.22"
+# MOC-142 sessions.db blob 外置:大 data: 图片按 sha256 内容寻址去重落盘
+# (借鉴 Codex generated_images / Claude paste-cache),消除逐轮快照重复存储。
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
