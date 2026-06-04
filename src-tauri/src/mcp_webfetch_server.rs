@@ -285,7 +285,7 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
         Ok(None) => {
             return tool_error(
                 id,
-                "联网抓取工具已关闭。请在 codex-app-transfer 设置 → 内置联网抓取工具 选 curl / wreq / headless。",
+                "联网抓取工具已关闭。请在 codex-app-transfer 设置 → 内置联网抓取工具 选 auto(推荐) / curl / wreq / headless。",
             )
         }
         // 读失败(权限/损坏/无 HOME)区别于"真 off": 给真因而非误导"去开启"(server 能跑起来
@@ -304,9 +304,15 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
             id,
             &format!(
                 "(请求成功但响应体为空 — 常见于需 JS 渲染的前端页 / 反爬拦截 / 重定向丢内容。\
-                 当前后端: {}。若内容靠 JS 渲染, 可在 codex-app-transfer 设置把内置联网抓取工具切到 \
-                 headless 档后重试; 也请确认 URL 是否正确。)",
-                backend.as_str()
+                 当前后端: {}。{} 也请确认 URL 是否正确。)",
+                backend.as_str(),
+                if backend.may_use_headless() {
+                    // auto/headless 已(会)跑 headless 渲染, 别再让切 headless —— 空多半是页面真空 /
+                    // 需登录 / 被反爬, 应换更具体 URL 或确认目标 (devin review)。
+                    "该档已用真浏览器渲染, 空多半是页面本身无内容 / 需登录 / 被反爬, 换更具体的 URL 再试;"
+                } else {
+                    "若内容靠 JS 渲染, 可把内置联网抓取工具切到 auto / headless 档后重试;"
+                }
             ),
         ),
         // 抓到正文 → 用总结模型针对 prompt 摘要; 摘要失败(未配/proxy 未起/模型报错/格式不支持)

@@ -369,10 +369,19 @@ fn origin_of(url: &str) -> Option<String> {
 }
 
 /// 记住某 origin 的成功档 (per-origin 复用)。origin 无法解析则不记。
+/// **headless 降一档缓存成 wreq** (chatgpt-codex review): 同 origin 不同 URL 难度不同 —— JS app
+/// 页要 headless, 但 raw API/text endpoint 用 curl/wreq 就够 (非 HTML 2xx)。若缓存 headless 当起始
+/// 档, 下次该 origin 的 API URL 会直接走 headless → JSON 被渲染成 browser HTML 破坏结构。缓存 wreq
+/// 既省 curl 试错、又让 API URL 走 wreq 正确拿非 HTML 2xx; app 页从 wreq 起仍会升 headless。
 fn remember_origin(origin: &Option<String>, tier: WebFetchBackend) {
+    let cache_tier = if tier == WebFetchBackend::Headless {
+        WebFetchBackend::Wreq
+    } else {
+        tier
+    };
     if let Some(o) = origin {
         if let Ok(mut m) = origin_profiles().lock() {
-            m.insert(o.clone(), tier);
+            m.insert(o.clone(), cache_tier);
         }
     }
 }
