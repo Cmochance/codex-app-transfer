@@ -2,9 +2,9 @@
 //!
 //! - **L1 in-memory hot cache**(`HashMap` + LRU + TTL):热路径零 IO,跟 v1.x
 //!   行为一致(1000 条 × 60 分钟 LRU,可 `with_capacity` 调整)。
-//! - **L2 sqlite write-through**(默认 `~/.codex-app-transfer/sessions.db`,30
-//!   天 TTL):**进程重启不丢历史**。Codex CLI 用旧 `previous_response_id` 续轮
-//!   时,L1 miss → 从 L2 查回 → 升温到 L1。
+//! - **L2 sqlite write-through**(默认 `~/.codex-app-transfer/sessions.db`,**持久
+//!   化、不过期** MOC-170):**进程重启不丢历史**。Codex CLI 用旧
+//!   `previous_response_id` 续轮时,L1 miss → 从 L2 查回 → 升温到 L1。
 //!
 //! 写入双写;读取先 L1 后 L2。L2 任何 IO 错误 → log warning 后退到纯 L1,代理
 //! 仍能对外服务(只是丢"重启不丢历史"这个新增能力)。
@@ -15,7 +15,10 @@
 //!   不匹配 / 表不存在 → 备份现 db 为 `sessions.db.bak.<unix-ts>` 然后重建空
 //!   db(用户丢历史一次,但能正常运行;重启场景跟 PR 1 修的 cache miss 相同 →
 //!   返回 OpenAI SDK 兼容 400)。**当前 schema_version = 1**。
-//! - **TTL** 30 天:启动时 `DELETE WHERE last_access_unix < now - 30d` 清过期。
+//! - **持久化(MOC-170)**:L2 不再设 TTL —— 内容寻址去重(MOC-142 图 + MOC-168
+//!   消息)后体积极小,留存全部历史的磁盘成本可忽略,移除 30 天过期换"老会话永
+//!   远续得上"。`evict_expired_persisted` 机制保留(短 TTL 仍可触发,供测试 / 未
+//!   来可配置 retention),只是默认不在启动时调用。
 //! - **隐私**:db 文件包含完整对话历史(messages JSON),用户可:(a) admin
 //!   endpoint `POST /api/sessions/clear` 全清;(b) 直接删 db 文件。README 在
 //!   隐私小节里写明。
@@ -36,9 +39,18 @@ use super::message_store::{self, MsgInlineError, MSG_REF_KEY};
 /// 当前 sqlite schema 版本。改 schema 时把这个值 +1,旧 db 会被自动备份重建。
 const SCHEMA_VERSION: i64 = 1;
 
-/// 默认 L2(sqlite)TTL — 30 天,跟 OpenAI Responses API 服务端 30 天 retention
-/// 对齐(`docs/guides/conversation-state`)。
-const DEFAULT_PERSISTED_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+/// 默认 L2(sqlite)retention — **持久化、不过期**(MOC-170)。
+///
+/// 历史上是 30 天 TTL(对齐 OpenAI 服务端 retention)。MOC-142(图片 blob 外置)+
+/// MOC-168(消息内容寻址去重)后 L2 体积已极小(实测 11 万消息实例去重到 ~2,687
+/// 条唯一、省 97%,图片再走 blob 省 63%),按内容寻址存跨会话天然合并,留存全部
+/// 历史的磁盘成本可忽略;30 天 TTL 反而带来"老会话续不上"的体验损失。故改持久化。
+///
+/// 实现上用一个 ~100 年的哨兵当"永不过期",**复用现有 TTL 比较逻辑零改动**——
+/// `persist_load` 的 cutoff、`evict_expired_persisted` 在这个值下自然全 no-op
+/// (cutoff = now - 100y < 0,任何 row 的 last_access 都 > cutoff),不必给读路径
+/// 到处加 `if persistent` 分支。短 TTL(测试 / 未来可配置 retention)仍可显式传入。
+const DEFAULT_PERSISTED_TTL: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 
 /// L1 默认尺寸 / TTL,保留 v1.x 行为(1000 条 × 60 分钟 LRU)。
 const DEFAULT_L1_SIZE: usize = 1000;
@@ -93,7 +105,8 @@ impl ResponseSessionCache {
     /// 任何 sqlite 初始化错误(权限 / IO / schema 不匹配)→ 回退到纯内存,**不**
     /// 让代理启动失败;并把错误 log 到调用方传入的 `on_error`。
     ///
-    /// `persisted_ttl` 控制 L2 过期清理(默认 30 天)。
+    /// `persisted_ttl` 控制 L2 过期清理。默认 [`DEFAULT_PERSISTED_TTL`] 是 ~100 年持久
+    /// 化哨兵(MOC-170,不过期);测试 / 未来可配置 retention 可显式传短 TTL。
     pub fn with_db_path(
         max_size: usize,
         ttl: Duration,
@@ -441,6 +454,141 @@ impl ResponseSessionCache {
         (total, failed)
     }
 
+    /// MOC-170 存量一次性迁移:把 MOC-142/168 上线**之前**写入的旧行(完整 inline
+    /// base64 图 + 逐轮重复消息整存)就地 reformat 成两级内容寻址引用,回收历史膨胀
+    /// (实测某真机库 5.5GB)。**幂等**:完成置 `sessions_meta['content_addr_migrated']`
+    /// 标志,重复调用早返 `Ok(0)`;`db=None`(纯内存)同样 `Ok(0)`。
+    ///
+    /// ## 设计
+    ///
+    /// - **分批 + rowid 游标**:每批 `MIGRATE_BATCH` 行、一个事务,批间释放 db 锁让
+    ///   正常 serving(save/load)交错,不长期独占。游标 `rowid > cursor` 单调前进
+    ///   →(a)已 reformat 的行下批被 `NOT LIKE` 跳过;(b)**parse 失败跳过的坏行
+    ///   也被游标越过,不会被反复取到死循环**;(c)迁移期间用户新写的行(更大 rowid)
+    ///   若已是引用格式被 `NOT LIKE` 过滤,旧格式则顺带迁移。
+    /// - **只迁旧行**:`messages_json NOT LIKE '%__cat_msg__%'` 跳过已是引用形态的行。
+    /// - **非破坏**:每行 parse→externalize→UPDATE 同一行;单行 parse/encode 失败仅
+    ///   跳过(留 legacy,下次重迁),不中断整体。blob 写盘在事务**外**(FS),事务
+    ///   rollback 只留孤儿 blob(GC 清),行保持 legacy → 幂等可重迁。
+    /// - **收尾 VACUUM**:reformat 后大量 page 进 freelist,VACUUM 压实物理文件(临时
+    ///   空间 ≈ 压缩后体积,非原始大小)。VACUUM 失败非致命(逻辑去重已生效)。
+    ///
+    /// 返回迁移的行数。
+    pub fn migrate_existing_rows(&self) -> Result<usize, String> {
+        // 幂等:已迁移直接早返(也挡掉纯内存 db=None)。
+        {
+            let mut guard = self.db.lock().expect("session cache db mutex poisoned");
+            let Some(conn) = guard.as_mut() else {
+                return Ok(0);
+            };
+            if migration_done(conn).map_err(|e| format!("read migration flag failed: {e}"))? {
+                return Ok(0);
+            }
+        }
+
+        let like = format!("%{MSG_REF_KEY}%");
+        let mut cursor: i64 = 0;
+        let mut total = 0usize;
+        loop {
+            // 每批独立 acquire db 锁 + 事务;批末 drop 锁让 serving 交错。
+            let mut guard = self.db.lock().expect("session cache db mutex poisoned");
+            let Some(conn) = guard.as_mut() else {
+                return Ok(total); // db 中途没了(几乎不可能)→ 返已迁数
+            };
+            let batch: Vec<(i64, String, String)> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT rowid, response_id, messages_json FROM response_sessions \
+                         WHERE rowid > ?1 AND messages_json NOT LIKE ?2 \
+                         ORDER BY rowid LIMIT ?3",
+                    )
+                    .map_err(|e| format!("migrate prepare failed: {e}"))?;
+                let rows = stmt
+                    .query_map(params![cursor, like, MIGRATE_BATCH], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|e| format!("migrate query failed: {e}"))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|e| format!("migrate collect failed: {e}"))?
+            };
+            if batch.is_empty() {
+                break;
+            }
+
+            let blobs = self.blobs.as_ref();
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("migrate tx begin failed: {e}"))?;
+            for (rowid, response_id, json) in &batch {
+                cursor = (*rowid).max(cursor); // 游标单调前进,坏行也越过(防死循环)
+                let mut messages: Vec<Value> = match serde_json::from_str(json) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log_db_warning(
+                            "SESSIONS_DB_MIGRATE_ROW_SKIP",
+                            format!("response_id={response_id} parse failed, leave legacy: {e}"),
+                        );
+                        continue;
+                    }
+                };
+                externalize_for_storage(&tx, blobs, &mut messages);
+                let reformatted = match serde_json::to_string(&messages) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log_db_warning(
+                            "SESSIONS_DB_MIGRATE_ROW_SKIP",
+                            format!(
+                                "response_id={response_id} re-encode failed, leave legacy: {e}"
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                tx.execute(
+                    "UPDATE response_sessions SET messages_json = ?1 WHERE rowid = ?2",
+                    params![reformatted, rowid],
+                )
+                .map_err(|e| format!("migrate update failed: {e}"))?;
+                total += 1;
+            }
+            tx.commit()
+                .map_err(|e| format!("migrate commit failed: {e}"))?;
+            drop(guard); // 显式:批间释放 db 锁
+            tracing::debug!(
+                error_id = "SESSIONS_DB_MIGRATE_PROGRESS",
+                cursor,
+                total,
+                "sessions.db 存量迁移进度"
+            );
+        }
+
+        // 全部迁移完:VACUUM 压实物理文件 + 置幂等标志。
+        let mut guard = self.db.lock().expect("session cache db mutex poisoned");
+        let Some(conn) = guard.as_mut() else {
+            return Ok(total);
+        };
+        if let Err(e) = conn.execute_batch("VACUUM") {
+            // 逻辑去重已 commit 生效(行已 reformat、message_contents 已落),VACUUM 仅做
+            // 物理压实。失败仅 warn 不 abort —— 但后果是**物理空间未回收**,且下面置 flag
+            // 后 `migration_done` 早返、**不再重跑迁移 / 不自动重试 VACUUM**:大库(恰是
+            // 磁盘紧张、最易 VACUUM 失败的场景)需运维手动 `VACUUM` 或删库重建。解耦
+            // 重试(独立 vacuum flag,与迁移 flag 分开)留 followup。
+            log_db_warning(
+                "SESSIONS_DB_MIGRATE_VACUUM_FAILED",
+                format!(
+                    "reformat done (logical dedup live) but VACUUM failed — physical space \
+                     NOT reclaimed and will not auto-retry; run `VACUUM` manually: {e}"
+                ),
+            );
+        }
+        set_migration_done(conn).map_err(|e| format!("set migration flag failed: {e}"))?;
+        Ok(total)
+    }
+
     fn persist_save(&self, response_id: &str, messages: &[Value]) -> rusqlite::Result<()> {
         let mut guard = self.db.lock().expect("session cache db mutex poisoned");
         let Some(conn) = guard.as_mut() else {
@@ -459,12 +607,8 @@ impl ResponseSessionCache {
         // 在握(早返已挡掉纯内存态),message 层用同一连接。
         let encoded = {
             let mut slim: Vec<Value> = messages.to_vec();
-            if let Some(store) = self.blobs.as_ref() {
-                for m in &mut slim {
-                    store.externalize(m);
-                }
-            }
-            message_store::externalize(conn, &mut slim);
+            // 两级外置(blob→msg);跟存量迁移共用同一 helper 保证产出形态一致。
+            externalize_for_storage(conn, self.blobs.as_ref(), &mut slim);
             serde_json::to_string(&slim)
         };
         let json = match encoded {
@@ -614,6 +758,50 @@ impl ResponseSessionCache {
         };
         inner.entries.remove(&oldest_key);
     }
+}
+
+/// MOC-170 存量迁移每批行数。每批一个事务,批间释放 db 锁让正常 serving 交错。
+const MIGRATE_BATCH: i64 = 200;
+
+/// `sessions_meta` 里标记"存量内容寻址迁移已完成"的 key(幂等 guard)。
+const MIGRATION_FLAG_KEY: &str = "content_addr_migrated";
+
+/// 两级外置(MOC-142 blob → MOC-168 message,顺序固定):把一组消息**就地**转成
+/// 入库瘦身形态 —— ①每条消息里的大 `data:` 图换成 blob 引用(FS sidecar);②每条
+/// 消息整体(已含 blob 引用)换成 `message_contents` 引用(同 db 去重)。
+/// `blobs=None`(纯内存 fallback / 无盘)跳过 blob 级、只做 message 级。任一单条失败
+/// 留 inline(非破坏)。`persist_save`(write-through)与 `migrate_existing_rows`
+/// (存量迁移)共用,保证两条写路径产出**完全一致**的引用形态。
+///
+/// `conn` 可传 `&Connection` 或 `&Transaction`(后者经 `Deref` 强转)。
+fn externalize_for_storage(conn: &Connection, blobs: Option<&BlobStore>, messages: &mut [Value]) {
+    if let Some(store) = blobs {
+        for m in messages.iter_mut() {
+            store.externalize(m);
+        }
+    }
+    message_store::externalize(conn, messages);
+}
+
+/// 读"存量迁移已完成"标志(MOC-170 幂等 guard)。
+fn migration_done(conn: &Connection) -> rusqlite::Result<bool> {
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sessions_meta WHERE key = ?1",
+            params![MIGRATION_FLAG_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(v.as_deref() == Some("1"))
+}
+
+/// 置"存量迁移已完成"标志。
+fn set_migration_done(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO sessions_meta (key, value) VALUES (?1, '1')",
+        params![MIGRATION_FLAG_KEY],
+    )?;
+    Ok(())
 }
 
 fn unix_now() -> i64 {
@@ -864,6 +1052,17 @@ fn backup_blobs_dir(db_path: &Path, ts: i64) {
 /// - `SESSIONS_MSG_CLEAR_FAILED` — 隐私清除删 `message_contents` 失败,已 Err 上报(500)
 /// - `SESSIONS_MSG_SWEEP_FAILED` — 启动 GC mark 不完整 → abort,本轮不删任何消息
 ///
+/// MOC-170 存量迁移(后台一次性 reformat 旧 inline 行 → 内容寻址引用):
+/// - `SESSIONS_DB_MIGRATION_DONE` — 迁移完成(info 级,带 `migrated` 行数)
+/// - `SESSIONS_DB_MIGRATION_NOOP` — 无需迁移(已迁移 / 无旧行 / 纯内存;debug 级)
+/// - `SESSIONS_DB_MIGRATE_ROW_SKIP` — 单行 parse/encode 失败,跳过留 legacy(下次重迁)
+/// - `SESSIONS_DB_MIGRATE_VACUUM_FAILED` — reformat 完但 VACUUM 失败(物理文件没压实,
+///   非致命:逻辑去重已生效)
+/// - `SESSIONS_DB_MIGRATION_FAILED` — 迁移整体失败(未置完成标志,下次启动重试)
+/// - `SESSIONS_DB_MIGRATION_PANIC` — 迁移线程 panic 被 catch_unwind 捕获(未置标志,下次重试)
+/// - `SESSIONS_DB_MIGRATION_SPAWN_FAILED` — 迁移线程 spawn 失败(线程资源耗尽,罕见)
+/// - `SESSIONS_DB_MIGRATE_PROGRESS` — 分批迁移进度(debug 级,带 `cursor` / `total`)
+///
 /// `error_id` 必须用 `&'static str`(literal)以保跨版本稳定;`detail` 给人类
 /// 阅读的上下文(path / error message),不进 metric label。
 ///
@@ -903,6 +1102,13 @@ fn log_db_warning(error_id: &'static str, detail: String) {
     eprintln!("warning: [{error_id}] {detail}");
 }
 
+/// info 级结构化日志(同 `log_db_warning` 的 stable `error_id` + eprintln 兜底约定,
+/// 仅级别为 info)。用于迁移完成等正常里程碑。
+fn log_db_info(error_id: &'static str, detail: String) {
+    tracing::info!(error_id, detail = %detail, "sessions.db");
+    eprintln!("info: [{error_id}] {detail}");
+}
+
 /// 全局单例,生产代理路径用。
 ///
 /// 启动时尝试在 `~/.codex-app-transfer/sessions.db` 打开 sqlite;成功则双层模式,
@@ -923,10 +1129,10 @@ pub fn global_response_session_cache() -> &'static ResponseSessionCache {
                 if let Some(msg) = warn {
                     log_db_warning("SESSIONS_DB_INIT_FAILED", msg);
                 }
-                // 启动时清一遍 L2 过期 row;失败仅 log
-                if let Err(e) = cache.evict_expired_persisted() {
-                    log_db_warning("SESSIONS_DB_EVICT_FAILED", e);
-                }
+                // MOC-170:不再启动时按 TTL 清 L2(已改持久化,默认 100 年哨兵不
+                // 过期)。`evict_expired_persisted` 机制保留供测试 / 未来可配置
+                // retention,只是不在此自动调用。孤儿 GC(下面两步)仍保留:历史
+                // 遗留(旧 30 天 TTL 删过的 row)/ 手动 evict / clear 都可能留孤儿。
                 // MOC-168:**先**清悬挂消息(孤儿),**再**清 blob —— 这样 blob GC 扫
                 // message_contents 时只看到活消息,过期图能一次清掉(否则孤儿 blob 要延
                 // 一个重启周期才回收;codex-connector P2)。两步均失败仅 log。
@@ -941,6 +1147,50 @@ pub fn global_response_session_cache() -> &'static ResponseSessionCache {
             None => ResponseSessionCache::new(DEFAULT_L1_SIZE, DEFAULT_L1_TTL),
         }
     })
+}
+
+/// MOC-170:后台启动存量迁移。spawn 一个**独立 std 线程**跑同步的
+/// [`ResponseSessionCache::migrate_existing_rows`](SQLite 阻塞操作,不该占 tokio
+/// worker)。fire-and-forget:迁移幂等(`content_addr_migrated` 标志),失败 / panic
+/// 不影响 app —— 下次启动重试。
+///
+/// **必须从生产 app 启动调用**(`src-tauri` setup hook),**不要**塞进
+/// [`global_response_session_cache`] 初始化 —— 否则集成测试调 `global().clear()` 会
+/// 在**真机** `~/.codex-app-transfer/sessions.db` 上触发迁移(`sessions_db_file()`
+/// 在 test 下仍返真实路径,无 cfg(test) 守卫),污染开发者本地库。
+pub fn start_background_session_migration() {
+    let spawned = std::thread::Builder::new()
+        .name("cas-session-migrate".to_owned())
+        .spawn(|| {
+            // catch_unwind:迁移线程 panic(db mutex poisoned / 下游对畸形数据 panic 等)
+            // 若不捕获只进 default panic hook(stderr)、无 stable error_id,telemetry /
+            // Sentry 抓不到 → 违反 no-silent-failure 硬规则,且会"每次启动 panic→不置
+            // flag→重试 panic"循环而可观测层寂静。捕获成 error_id 让 panic 路径也可聚合。
+            let outcome = std::panic::catch_unwind(|| {
+                global_response_session_cache().migrate_existing_rows()
+            });
+            match outcome {
+                Ok(Ok(0)) => tracing::debug!(
+                    error_id = "SESSIONS_DB_MIGRATION_NOOP",
+                    "sessions.db 存量迁移:无需迁移(已迁移 / 无旧行 / 纯内存)"
+                ),
+                Ok(Ok(n)) => log_db_info(
+                    "SESSIONS_DB_MIGRATION_DONE",
+                    format!("存量迁移完成:{n} 行 reformat 成内容寻址引用"),
+                ),
+                Ok(Err(e)) => log_db_warning("SESSIONS_DB_MIGRATION_FAILED", e),
+                Err(_) => log_db_warning(
+                    "SESSIONS_DB_MIGRATION_PANIC",
+                    "migration thread panicked (caught); 未置完成标志,下次启动重试".to_owned(),
+                ),
+            }
+        });
+    if let Err(e) = spawned {
+        log_db_warning(
+            "SESSIONS_DB_MIGRATION_SPAWN_FAILED",
+            format!("could not spawn migration thread: {e}"),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1424,5 +1674,182 @@ mod tests {
         assert!(count_blobs(&blobs_dir) >= 1, "save 后 blobs/ 应有文件");
         cache.clear_all_persisted().expect("正常路径 clear 应成功");
         assert_eq!(count_blobs(&blobs_dir), 0, "clear 后 blob 必须清零(隐私)");
+    }
+
+    // ── MOC-170 存量迁移 + 持久化测试 ─────────────────────────────────
+
+    /// 直接 raw INSERT 一条"旧格式"行(完整 inline、无内容寻址引用),绕过 save 的
+    /// 自动外置,模拟 MOC-142/168 上线前写入的存量数据。
+    fn insert_legacy_row(path: &std::path::Path, id: &str, messages: &Value) {
+        let conn = Connection::open(path).unwrap();
+        let now = unix_now();
+        conn.execute(
+            "INSERT INTO response_sessions \
+             (response_id, messages_json, created_unix, last_access_unix, access_count) \
+             VALUES (?1, ?2, ?3, ?3, 0)",
+            params![id, messages.to_string(), now],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_reformats_legacy_inline_rows() {
+        // 存量旧行(完整 inline 大图 + 逐轮共享消息)迁移后 → 两级内容寻址引用、图
+        // 去重落 blob、消息去重、get 字节级还原。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        let big = format!("data:image/png;base64,{}", "A".repeat(20_000));
+        let shared = json!({"role": "system", "content": "shared-prompt"});
+        let img_user = json!({
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": big}],
+        });
+        // t1 = [shared, img_user];t2 = [shared, img_user, asst](共享前两条)。
+        let t1 = json!([shared, img_user]);
+        let t2 = json!([shared, img_user, {"role": "assistant", "content": "a"}]);
+        insert_legacy_row(&path, "r1", &t1);
+        insert_legacy_row(&path, "r2", &t2);
+
+        let migrated = cache.migrate_existing_rows().unwrap();
+        assert_eq!(migrated, 2, "两条旧行都应迁移");
+
+        // 行已 reformat:不含 inline base64,改存消息引用。
+        let raw1: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT messages_json FROM response_sessions WHERE response_id='r1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!raw1.contains("data:image"), "迁移后行不应有 inline base64");
+        assert!(raw1.contains(MSG_REF_KEY), "迁移后行应存消息引用");
+
+        // 消息去重:5 实例(shared×2, img_user×2, asst×1)→ 3 唯一。
+        let uniq: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM message_contents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uniq, 3, "共享消息去重:5 实例 → 3 唯一");
+
+        // 大图外置到 blobs/。
+        assert!(
+            path.parent().unwrap().join("blobs").exists(),
+            "图应外置到 blobs/"
+        );
+
+        // 清 L1 强制走 L2 两级回填,字节级还原。
+        cache.clear();
+        assert_eq!(
+            cache.get("r1").unwrap(),
+            *t1.as_array().unwrap(),
+            "r1 回填字节级等于原始"
+        );
+        assert_eq!(
+            cache.get("r2").unwrap(),
+            *t2.as_array().unwrap(),
+            "r2 回填字节级等于原始"
+        );
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        // 迁移完成后置标志,重复调用早返 0,不重复处理。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        insert_legacy_row(&path, "r", &json!([{"role": "user", "content": "x"}]));
+        assert_eq!(cache.migrate_existing_rows().unwrap(), 1, "首次迁移 1 行");
+        assert_eq!(
+            cache.migrate_existing_rows().unwrap(),
+            0,
+            "再次调用应早返 0(flag guard)"
+        );
+        // flag 已置 → 即便再插旧行也不迁(生产中 flag 后所有写入都走 save 外置,
+        // 不会再有旧格式行;此处仅验证 guard 行为)。
+        insert_legacy_row(&path, "r2", &json!([{"role": "user", "content": "y"}]));
+        assert_eq!(
+            cache.migrate_existing_rows().unwrap(),
+            0,
+            "flag 已置后直接早返,不再迁移"
+        );
+    }
+
+    #[test]
+    fn migrate_skips_corrupt_row_and_terminates() {
+        // 坏行(messages_json 非合法 JSON)被跳过留 legacy,rowid 游标保证不死循环;
+        // 好行正常迁移。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        {
+            let conn = Connection::open(&path).unwrap();
+            let now = unix_now();
+            conn.execute(
+                "INSERT INTO response_sessions \
+                 (response_id, messages_json, created_unix, last_access_unix, access_count) \
+                 VALUES ('bad', 'not-json{{', ?1, ?1, 0)",
+                params![now],
+            )
+            .unwrap();
+        }
+        insert_legacy_row(&path, "good", &json!([{"role": "user", "content": "ok"}]));
+
+        let migrated = cache.migrate_existing_rows().unwrap();
+        assert_eq!(migrated, 1, "只迁好行,坏行跳过");
+        // 坏行原样留存(legacy)。
+        let bad_raw: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT messages_json FROM response_sessions WHERE response_id='bad'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_raw, "not-json{{", "坏行不动,留 legacy");
+    }
+
+    #[test]
+    fn persistent_default_ttl_never_expires_old_rows() {
+        // 默认 TTL 是 ~100 年哨兵 → 即使 row 的 last_access 很旧(1970)也能 load
+        // (cutoff = now - 100y < 0 < 1,任何 row 都命中)。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            1,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        cache.save(
+            "r_persist",
+            vec![json!({"role": "user", "content": "keep-me-forever"})],
+        );
+        // 手动把 last_access_unix 改成 1(1970),模拟"很久没访问的老会话"。
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE response_sessions SET last_access_unix = 1 WHERE response_id = 'r_persist'",
+                [],
+            )
+            .unwrap();
+        }
+        cache.clear(); // 清 L1 强制走 L2
+        assert!(
+            cache.get("r_persist").is_some(),
+            "持久化默认:老会话不应过期"
+        );
     }
 }
