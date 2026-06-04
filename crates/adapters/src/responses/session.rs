@@ -239,43 +239,53 @@ impl ResponseSessionCache {
             .clear();
     }
 
-    /// **彻底清除**:L1 内存 + L2 sqlite 表。给 admin endpoint
+    /// **彻底清除**:L1 内存 + L2 sqlite 表 + blob。给 admin endpoint
     /// `POST /api/sessions/clear` 用。返回清掉的 L2 行数(L1 总是清空)。
+    ///
+    /// **db 不可用(`db=None`)时返回 `Err` 且不动 blob**(数据完整性 BLOCKER 修):`db=None`
+    /// 可能只是**瞬时**(db 文件数据完好、blob 仍被磁盘 row 有效引用,本进程只是没打开 db,
+    /// 如启动撞锁 / IO 抖动)。旧实现在此仍无条件 `store.sweep(空集)` 删光所有 blob,却没删
+    /// (删不到)磁盘 db 行 → 留下指向缺失文件的悬挂 blob 引用、丢失含图历史(真机 5.5G 库
+    /// 迁移后点清除踩此坑:blob 全删、response_sessions/message_contents 保留)。改为隐私
+    /// 清除在 db 不可达时**整体失败而非部分成功**,blob 原样保留,用户**重启应用**(db 在
+    /// `with_db_path` 一次性 init、运行期不自愈重连,故"db 恢复"= 重启 app)后重试即可完整
+    /// 清除;"db 永久坏 + blobs/ 残私密图"的极端场景留给用户手动删 blobs/。
     pub fn clear_all_persisted(&self) -> Result<usize, String> {
         self.clear();
         // **全程持 db 锁**(从这里到 fn 末尾):DELETE 与 blob sweep 之间**不放锁**,杜绝
         // 并发 `persist_save` 在两者之间 acquire 锁、externalize 新图、insert 新 row —— 否则
         // 紧随其后的空-live sweep 会把那张刚写的 blob 当孤儿删,留下指向缺失 blob 的悬挂行
         // → 下次 L2 load 该 response 必 miss(codex-connector P2 并发竞态)。被阻塞的 save
-        // 会排到 clear 之后执行,其 blob 不在本轮 sweep 范围,安全。db=None(纯内存)时
-        // persist_save 早返、无并发 blob 写入,持不持锁都安全。
+        // 会排到 clear 之后执行,其 blob 不在本轮 sweep 范围,安全。
         let mut guard = self.db.lock().expect("session cache db mutex poisoned");
-        let deleted = match guard.as_mut() {
-            Some(conn) => {
-                let n = conn
-                    .execute("DELETE FROM response_sessions", [])
-                    .map_err(|e| {
-                        let detail = format!("clear failed: {e}");
-                        log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
-                        detail
-                    })?;
-                // MOC-168:消息内容表同 db,隐私清除需连带全清。失败上报(返 Err → 500)。
-                conn.execute("DELETE FROM message_contents", [])
-                    .map_err(|e| {
-                        let detail = format!("clear message_contents failed: {e}");
-                        log_db_warning("SESSIONS_MSG_CLEAR_FAILED", detail.clone());
-                        detail
-                    })?;
-                n
-            }
-            // db 不可用(sqlite init 失败 → 纯内存 fallback):L2 行数 0,但 `blobs/` 可能仍有
-            // **上次成功运行**外置的私密图(`with_db_path` 无条件按 db_path 同级建 blobs 层)。
-            // **不能**早返成功跳过 sweep —— 必须继续往下清 blob(codex-connector P2)。
-            None => 0,
+        let Some(conn) = guard.as_mut() else {
+            // db=None:不删 blob(见上方 doc)。返回 Err 让 endpoint 返 500,用户重试。
+            let detail = "sessions.db unavailable (in-memory fallback); persisted history NOT \
+                          cleared and blobs left intact to avoid orphaning rows that may still \
+                          exist on disk — retry once the db is reachable"
+                .to_owned();
+            log_db_warning("SESSIONS_DB_CLEAR_DB_UNAVAILABLE", detail.clone());
+            return Err(detail);
         };
-        // MOC-142:行全清 → 所有 blob 成孤儿,一并清掉("彻底清除"语义)。这是**隐私清除**
-        // 端点(POST /api/sessions/clear):blob 没删干净必须**上报**(返 Err → handler 500),
-        // 不能 best-effort 静默成功让私密图片残留在 blobs/(codex-connector P1)。
+        // db 可用:DELETE 两表 → 行全清 → 所有 blob 成孤儿 → 下面 sweep 删所有(一致、彻底)。
+        let deleted = conn
+            .execute("DELETE FROM response_sessions", [])
+            .map_err(|e| {
+                let detail = format!("clear failed: {e}");
+                log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
+                detail
+            })?;
+        // MOC-168:消息内容表同 db,隐私清除需连带全清。失败上报(返 Err → 500)。
+        conn.execute("DELETE FROM message_contents", [])
+            .map_err(|e| {
+                let detail = format!("clear message_contents failed: {e}");
+                log_db_warning("SESSIONS_MSG_CLEAR_FAILED", detail.clone());
+                detail
+            })?;
+        // MOC-142:行全清 → 所有 blob 成孤儿,一并清掉("彻底清除"语义)。**隐私清除**端点:
+        // blob 没删干净必须**上报**(返 Err → handler 500),不 best-effort 静默成功让私密图
+        // 残留 blobs/(codex-connector P1)。此处 db 行已清空,sweep(空集)删所有 blob 是安全的
+        // (无任何 row 引用它们),与上面 db=None 不删 blob 的关键区别在此。
         if let Some(store) = self.blobs.as_ref() {
             let stats = store.sweep(&HashSet::new()).map_err(|e| {
                 let detail = format!("blob store clear failed (private images may remain): {e}");
@@ -2014,5 +2024,88 @@ mod tests {
             vacuumed, None,
             "legacy 库(无 pending 标记)不应被无谓 VACUUM,vacuumed 保持缺失"
         );
+    }
+
+    // 回归(真机 blob 删除根因):clear_all_persisted 在 db=None(db init 失败 fallback 纯
+    // 内存 / 瞬时撞锁)时**不删 blob**、返回 Err —— 避免删光仍被磁盘 db 行有效引用的 blob
+    // 留下悬挂引用(含图历史丢)。隐私清除在 db 不可达时失败而非部分成功,用户重试即可。
+    #[cfg(unix)] // 用 chmod 000 模拟 db init 失败,仅 Unix 适用(Windows 无 PermissionsExt)
+    #[test]
+    fn clear_with_db_none_errors_and_preserves_blobs() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = fresh_db_path();
+        let big = format!("data:image/png;base64,{}", "A".repeat(20_000));
+        // 进程A:正常 db,迁移含图 → blob + message_contents + response_sessions 持久磁盘。
+        {
+            let (cache, w) = ResponseSessionCache::with_db_path(
+                8,
+                Duration::from_secs(60),
+                DEFAULT_PERSISTED_TTL,
+                &path,
+            );
+            assert!(w.is_none(), "进程A db 应正常 init");
+            for i in 0..3 {
+                let row = json!([{"role":"user","content":[{"type":"image_url","image_url":{"url": big.clone()}}]}]);
+                insert_legacy_row(&path, &format!("r{i}"), &row);
+            }
+            cache.migrate_existing_rows().unwrap();
+        }
+        let blobdir = path.parent().unwrap().join("blobs");
+        let count_blobs = |d: &std::path::Path| -> usize {
+            let Ok(shards) = std::fs::read_dir(d) else {
+                return 0;
+            };
+            shards
+                .flatten()
+                .filter_map(|s| std::fs::read_dir(s.path()).ok())
+                .flat_map(|f| f.flatten())
+                .filter(|f| {
+                    f.file_name()
+                        .to_str()
+                        .map(|n| !n.starts_with(".tmp."))
+                        .unwrap_or(false)
+                })
+                .count()
+        };
+        let count_rows = |sql: &str| -> i64 {
+            Connection::open(&path)
+                .unwrap()
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(count_blobs(&blobdir) > 0, "迁移后应有 blob");
+        let mc_before = count_rows("SELECT COUNT(*) FROM message_contents");
+        let rs_before = count_rows("SELECT COUNT(*) FROM response_sessions");
+        assert!(mc_before > 0 && rs_before > 0);
+
+        // 进程B:chmod 000 让 sessions.db 打不开 → db init 失败 → db=None;blobs 层仍指真实目录。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (cache_b, warn_b) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        assert!(warn_b.is_some(), "db 应 init 失败 fallback 纯内存(db=None)");
+        // 用户点「清除会话历史」→ POST /api/sessions/clear → clear_all_persisted。
+        let result = cache_b.clear_all_persisted();
+
+        // 恢复权限后验证:修复后 blob 应保留、db 行不变、clear 返回 Err。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let blobs_after = count_blobs(&blobdir);
+        let mc_after = count_rows("SELECT COUNT(*) FROM message_contents");
+        let rs_after = count_rows("SELECT COUNT(*) FROM response_sessions");
+
+        // 修复后正确行为:db=None 时整体失败、blob 原样保留、db 行不动(无悬挂)。
+        assert!(
+            result.is_err(),
+            "db=None 时 clear 应返回 Err(隐私清除失败而非部分成功)"
+        );
+        assert!(
+            blobs_after > 0,
+            "修复:db=None 时 blob 必须保留(不删,避免悬挂)"
+        );
+        assert_eq!(mc_after, mc_before, "db 行保留不变");
+        assert_eq!(rs_after, rs_before, "db 行保留不变");
     }
 }
