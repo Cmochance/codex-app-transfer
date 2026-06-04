@@ -60,7 +60,7 @@ make mac-app
 # → dist/mac/Codex App Transfer.app
 ```
 
-**第一次启动后**:配置文件落在 `~/.codex-app-transfer/`,日志在 `~/.codex-app-transfer/logs/proxy-*.log`,会话历史 sqlite 在 `sessions.db`(30 天 TTL)。
+**第一次启动后**:配置文件落在 `~/.codex-app-transfer/`,日志在 `~/.codex-app-transfer/logs/proxy-*.log`,会话历史 sqlite 在 `sessions.db`(持久化不过期,MOC-170 移除了旧 30 天 TTL)。
 
 ### 2.3 git worktree 工作流(必读)
 
@@ -464,7 +464,7 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 
 ### 11.4 多轮 / autocompact 调试
 
-- 多轮历史 L1 内存 LRU + L2 sqlite(`~/.codex-app-transfer/sessions.db`,30 天 TTL)
+- 多轮历史 L1 内存 LRU + L2 sqlite(`~/.codex-app-transfer/sessions.db`,持久化不过期,旧 30 天 TTL 已移除 MOC-170)
 - `previous_response_id` 漂移 / session miss 都会 `tracing::warn!` 带 `error_id`
 - `core/input.rs` 是历史拼接入口,问题多发在这里
 

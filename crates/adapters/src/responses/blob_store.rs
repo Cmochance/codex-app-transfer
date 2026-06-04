@@ -103,7 +103,20 @@ impl BlobStore {
         match fs::rename(&tmp, &final_path) {
             Ok(()) => Ok(hash),
             Err(e) => {
-                let _ = fs::remove_file(&tmp);
+                // rename 失败留下的 `.tmp.` 含完整图片字节(隐私敏感)。删失败要 warn
+                // (与 sweep 的 `SESSIONS_BLOB_TMP_REMOVE_FAILED` 对齐)——否则含图 temp
+                // 静默残留到下次 GC;迁移会大量调 put、放大该路径。NotFound = 已被清。
+                if let Err(rm) = fs::remove_file(&tmp) {
+                    if rm.kind() != io::ErrorKind::NotFound {
+                        warn(
+                            "SESSIONS_BLOB_TMP_REMOVE_FAILED",
+                            format!(
+                                "put: rename failed + temp cleanup failed \
+                                 (image bytes may linger until GC): {rm}"
+                            ),
+                        );
+                    }
+                }
                 // 并发 put 可能已把 final 建好 → 视作成功
                 if final_path.exists() {
                     Ok(hash)

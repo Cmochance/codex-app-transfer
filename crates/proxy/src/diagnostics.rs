@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 const MAX_STORED_BUNDLES: usize = 50;
 const MAX_STORED_BODY_BYTES: usize = 256 * 1024;
 /// forward-trace jsonl 按天分文件,保留最近 N 天(防无界增长)。
-const FORWARD_TRACE_KEEP_DAYS: usize = 7;
+pub(crate) const FORWARD_TRACE_KEEP_DAYS: usize = 7;
 
 #[derive(Debug, Clone)]
 pub struct UpstreamErrorBundleInput {
@@ -350,20 +350,11 @@ fn header_content_type(h: &reqwest::header::HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
-/// 抓一条 forward 全过程 trace → jsonl。调用方须先用 [`forward_trace_enabled`] gate。
-/// append 到 `~/.codex-app-transfer/forward-trace/<YYYYMMDD>.jsonl`(每次取当天文件名,
-/// 不缓存 → 进程跨天仍正确分文件)。首写(seq==0)顺带 trim 超 [`FORWARD_TRACE_KEEP_DAYS`]
-/// 天的旧文件,避免每请求 readdir。
-pub fn write_forward_trace_jsonl(input: &ForwardTraceInput) -> Option<PathBuf> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = config_dir()?.join("forward-trace");
-    fs::create_dir_all(&dir).ok()?;
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    if seq == 0 {
-        trim_old_files(&dir, FORWARD_TRACE_KEEP_DAYS, "jsonl");
-    }
-    let path = dir.join(format!("{}.jsonl", Local::now().format("%Y%m%d")));
-    let entry = json!({
+/// 把一条 forward 全过程 trace 序列化成**已脱敏**的 JSON 对象(jsonl 行 / SSE / API 共用)。
+/// header 脱敏 + body 按 content-type 脱敏/截断;`response` 用 `response_full_len` 修正
+/// 预截断(成功路径 tee)的 `truncated_bytes`。
+pub(crate) fn build_forward_trace_value(input: &ForwardTraceInput, seq: u64) -> Value {
+    json!({
         "trace_kind": "forward_protocol",
         "captured_at": Local::now().to_rfc3339(),
         "proxy_version": env!("CARGO_PKG_VERSION"),
@@ -382,7 +373,7 @@ pub fn write_forward_trace_jsonl(input: &ForwardTraceInput) -> Option<PathBuf> {
             "headers": headers_to_json_redacted(input.outbound_headers),
             "body": redact_body(input.outbound_body, header_content_type(input.outbound_headers)),
         },
-        // ── 上游回包(raw) ── body 用 response_full_len 修正预截断(成功路径 tee)的 truncated_bytes
+        // ── 上游回包(raw) ──
         "response": {
             "status": input.status,
             "headers": headers_to_json_redacted(input.response_headers),
@@ -403,17 +394,17 @@ pub fn write_forward_trace_jsonl(input: &ForwardTraceInput) -> Option<PathBuf> {
             "resolved": input.resolved_model,
             "upstream": input.upstream_model,
         },
-    });
-    let mut line = serde_json::to_vec(&entry).ok()?;
-    line.push(b'\n');
-    use std::io::Write;
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path.as_path())
-        .ok()?;
-    f.write_all(&line).ok()?;
-    Some(path)
+    })
+}
+
+/// 抓一条 forward 全过程 trace → 统一 [`crate::trace_store`](ring + broadcast + jsonl)。
+/// 调用方须先用 [`forward_trace_enabled`] gate。返回 jsonl 路径(写盘失败 / 无 home 返
+/// `None`)供调用方判定「开了诊断却写不出」。ring/broadcast 是 best-effort,不影响返回值。
+pub fn write_forward_trace_jsonl(input: &ForwardTraceInput) -> Option<PathBuf> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let value = build_forward_trace_value(input, seq);
+    crate::trace_store::trace_store().push(crate::trace_store::TraceKind::Forward, seq, value)
 }
 
 fn trim_old_bundles(dir: &Path, keep: usize) {
@@ -421,8 +412,8 @@ fn trim_old_bundles(dir: &Path, keep: usize) {
 }
 
 /// 按 mtime 保留最近 `keep` 个指定扩展名的文件,其余删除。bundle(json,按条)与
-/// forward-trace(jsonl,按天)共用。
-fn trim_old_files(dir: &Path, keep: usize, ext: &str) {
+/// forward-trace(jsonl,按天)共用;后者由 [`crate::trace_store`] 调用。
+pub(crate) fn trim_old_files(dir: &Path, keep: usize, ext: &str) {
     let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
     let Ok(rd) = fs::read_dir(dir) else {
         return;
