@@ -422,6 +422,11 @@ async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
             }
         }
         match fetch_raw(tier, url).await {
+            // 明确客户端死链 / 权限错误 (404/410/400/401/451): 换 client、headless 渲染错误页都没
+            // 意义, 直接报 HTTP 错误 (不当成功, 对齐单档 curl/wreq 行为, chatgpt-codex review)。
+            Ok(raw) if is_hard_client_error(raw.status) => {
+                return Err(tier_http_error(tier, raw.status))
+            }
             // 拿到可用结果 (无升级信号) → 记住该档并返回。
             Ok(raw) if !needs_upgrade(&raw) => {
                 remember_origin(&origin, tier);
@@ -452,6 +457,13 @@ async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
         "所有后端均失败: {}",
         trail.join("; ")
     )))
+}
+
+/// 明确的客户端"死链 / 不可恢复"状态码: 换 client 或 headless 渲染错误页都救不了, Auto 直接报错
+/// (不升级、不当成功)。**排除 403/429** —— 反爬 / 限流换 client 或 headless+stealth 可能过; 5xx
+/// 也不在内 —— 503 常是 CF challenge, headless 可能救 (chatgpt-codex review)。
+fn is_hard_client_error(status: u16) -> bool {
+    matches!(status, 400 | 401 | 404 | 410 | 451)
 }
 
 /// Auto 档: 这次 (curl/wreq) 抓取是否需要升级到更高档。命中任一信号即升级:
@@ -817,6 +829,18 @@ mod tests {
             is_html: false,
             cf_challenge_header: false,
         }));
+    }
+
+    #[test]
+    fn hard_client_errors_not_escalated() {
+        // 死链 / 权限 → 直接报错 (不升级渲染错误页)
+        for s in [400, 401, 404, 410, 451] {
+            assert!(is_hard_client_error(s), "{s} 应是死链");
+        }
+        // 反爬 / 限流 / 5xx → 不算死链 (可能被 headless/换 client 救, 升级)
+        for s in [200, 202, 403, 429, 500, 502, 503] {
+            assert!(!is_hard_client_error(s), "{s} 不该当死链");
+        }
     }
 
     #[test]
