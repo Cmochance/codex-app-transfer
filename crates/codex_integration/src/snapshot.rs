@@ -675,7 +675,7 @@ fn read_dedup_field(path: &Path) -> Option<Option<String>> {
 
 /// 快照的 atom restore 等价类(去重指纹的一部分)。restore 行为只由 manifest 的
 /// `(capture_failed, pre_value)` 三态 + `schema_version` 决定:
-/// - `capture_failed=true`(或 `schema_version < 4` 兜底、manifest 读不出)→ restore
+/// - `capture_failed=true`(或 `schema_version < 4` 兜底、manifest **不存在**)→ restore
 ///   **不动** atom → 归一为 [`AtomRestoreKey::Untouched`];
 /// - 否则按 `pre_value` 复原(`Some(v)` 写入 / `None` 移除)→ [`AtomRestoreKey::Restore`]。
 ///
@@ -689,35 +689,66 @@ enum AtomRestoreKey {
     Restore(Option<bool>),
 }
 
+/// manifest.json 的读取分类:区分"合法空态(不存在)"与"损坏(存在但读/解析失败)"。
+enum ManifestRead {
+    /// 文件不存在(合法:无 manifest 的空原始态)。
+    Absent,
+    /// 读取 + 解析成功。
+    Parsed(SnapshotManifest),
+    /// 文件存在但读失败 / 解析失败(损坏,内容不可判定)。
+    Corrupt,
+}
+
+fn read_manifest_classified(dir: &Path) -> ManifestRead {
+    match std::fs::read_to_string(manifest_path(dir)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ManifestRead::Absent,
+        Err(_) => ManifestRead::Corrupt,
+        Ok(s) => match serde_json::from_str::<SnapshotManifest>(&s) {
+            Ok(m) => ManifestRead::Parsed(m),
+            Err(_) => ManifestRead::Corrupt,
+        },
+    }
+}
+
 /// 读 `dir` 的 manifest 归一成 [`AtomRestoreKey`]。口径与 [`move_snapshot_dir_to_recovery`]
-/// 写 recovery manifest 一致(`schema_version < 4` 视作 capture_failed)。manifest 读不出
-/// (不存在 / IO / parse 错误)→ restore 兜底"不动 atom" → [`AtomRestoreKey::Untouched`]。
-fn snapshot_atom_restore_key(dir: &Path) -> AtomRestoreKey {
-    match read_manifest_from_dir(dir) {
-        Ok(m) if !m.electron_status_section_capture_failed && m.schema_version >= 4 => {
-            AtomRestoreKey::Restore(m.electron_status_section_pre_value)
+/// 写 recovery manifest 一致(`schema_version < 4` 视作 capture_failed)。
+/// - manifest **不存在** → restore 兜底"不动 atom" → `Some(Untouched)`(合法空态,参与比较);
+/// - 解析成功 → `Some(Restore(..)/Untouched)`;
+/// - manifest **存在但损坏**(读/解析失败)→ `None`:内容不可判定,调用方据此保守**不去重**
+///   —— 不拿"损坏、`list_snapshots` 看不到、无法手动恢复"的份当去重目标而误删好快照
+///   (MOC-148 review P2)。
+fn snapshot_atom_restore_key(dir: &Path) -> Option<AtomRestoreKey> {
+    match read_manifest_classified(dir) {
+        ManifestRead::Absent => Some(AtomRestoreKey::Untouched),
+        ManifestRead::Parsed(m)
+            if !m.electron_status_section_capture_failed && m.schema_version >= 4 =>
+        {
+            Some(AtomRestoreKey::Restore(m.electron_status_section_pre_value))
         }
-        _ => AtomRestoreKey::Untouched,
+        ManifestRead::Parsed(_) => Some(AtomRestoreKey::Untouched),
+        ManifestRead::Corrupt => None,
     }
 }
 
 /// 读快照 dir 的去重指纹:config.toml + auth.json 内容 + atom restore 等价键。
 /// **不含 manifest 的 timestamp/session_id/snapshot_id**(每份都不同),但**含**影响
 /// restore 的 atom 三态(见 [`AtomRestoreKey`])。
-/// config/auth 任一"存在但读失败"→ 返回 `None`(内容不可判定,调用方据此保守不去重)。
+/// config/auth 任一"存在但读失败",或 manifest **存在但损坏** → 返回 `None`
+/// (内容不可判定,调用方据此保守不去重)。
 fn snapshot_content_for_dedup(
     dir: &Path,
 ) -> Option<(Option<String>, Option<String>, AtomRestoreKey)> {
     let config = read_dedup_field(&config_path(dir))?;
     let auth = read_dedup_field(&auth_path(dir))?;
-    Some((config, auth, snapshot_atom_restore_key(dir)))
+    let atom = snapshot_atom_restore_key(dir)?;
+    Some((config, auth, atom))
 }
 
 /// recovery/ 是否已存在与 `dir` 内容(config + auth + atom restore 等价键)完全相同的备份。
 ///
-/// 保守语义:`dir` 自身 config/auth 读不出(不可判定)→ 直接返回 `false`(当作非重复、
-/// 保留),绝不因"读不出"去删唯一副本;某份 recovery 读不出 → 该份不参与匹配。
-/// atom restore 键即使 manifest 读不出也有确定兜底(`Untouched`),始终参与比较。
+/// 保守语义:`dir` 自身 config/auth 读不出、或 manifest **存在但损坏** → 视为内容不可判定,
+/// 直接返回 `false`(当作非重复、保留),绝不因"读不出/损坏"去删唯一副本;某份 recovery
+/// config/auth 读不出或 manifest 损坏 → 该份不参与匹配(不拿无法手动恢复的损坏份当去重目标)。
 fn recovery_has_content_duplicate(paths: &CodexPaths, dir: &Path) -> bool {
     let Some(target) = snapshot_content_for_dedup(dir) else {
         return false;
@@ -1355,6 +1386,39 @@ mod tests {
         assert!(
             snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
             "recovery 仍受上限约束"
+        );
+    }
+
+    /// MOC-148 review P2:recovery 目录 manifest **存在但损坏**(解析失败)、config/auth 可读时,
+    /// 不能与 stale 判为重复 —— 否则删掉刚生成的好 stale,只剩损坏份(`list_snapshots` 看不到、
+    /// 无法手动恢复)。损坏份视为非匹配 → 好 stale 应保留移入。
+    #[test]
+    fn move_to_recovery_keeps_stale_when_recovery_manifest_corrupt() {
+        let (_t, paths) = paths_with_tmp();
+        // recovery:config/auth 与 stale 完全相同,但 manifest.json 损坏(非法 JSON)。
+        let corrupt = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(config_path(&corrupt), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&corrupt), "{\"k\":\"A\"}").unwrap();
+        std::fs::write(manifest_path(&corrupt), "{ not valid json").unwrap();
+
+        let stale = paths.active_snapshots_dir.join("good-session");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("good-session")).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists(), "stale 应被移入,而非因损坏份去重而丢弃");
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            2,
+            "损坏 recovery manifest 不参与去重,好 stale 应保留移入(损坏份 + 好份)"
+        );
+        assert!(
+            list_snapshots(&paths).iter().any(|s| s.kind == "recovery"),
+            "应至少有一份 manifest 完好、可被 list_snapshots 恢复的 recovery"
         );
     }
 
