@@ -14,7 +14,12 @@
 //! 统一抓取层 (MOC-144): [`fetch`] 模块的 [`web_fetch`] 按设置页"内置联网抓取工具"的
 //! 档位路由: `curl`(reqwest 静态) / `wreq`(浏览器 TLS 指纹) / `headless`(Chromium CDP)。
 //! 配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure` 供设置页探测/按需下载 Chrome。
-//! **模型侧 web_fetch tool 注入(让 Codex 真能调到该工具)作后续 PR。**
+//! `webFetchBackend != off` 时 transfer 自动往 `~/.codex/config.toml` 注册
+//! `[mcp_servers.cat-webfetch]`(stdio MCP server),向 Codex 模型暴露 `web_fetch` 工具。
+//!
+//! DuckDuckGo 搜索 (MOC-12): [`search`] 模块的 [`web_search`] 走 DDG HTML SSR 搜索,
+//! 内部固定 headless(DDG 对裸 HTTP 一律 202 反爬拦)。cat-webfetch MCP server 同时暴露
+//! `web_search` 工具,与 `web_fetch` 组成两段式联网。
 //!
 //! 非目标 (后续 PR): 不取代 workspace 其余地方 (`gemini_oauth` / `adapters` /
 //! `proxy_runner` / `admin/handlers`) 的 reqwest, 按 PR 逐个迁移; 不引入 Python
@@ -25,8 +30,10 @@ pub mod fetch;
 pub mod headless;
 pub mod impersonating;
 pub mod router;
+pub mod search;
 
 pub use fetch::{web_fetch, WebFetchBackend, WebFetchError};
 pub use headless::{fetch_rendered_html, HeadlessBrowser, HeadlessConfig, HeadlessError};
 pub use impersonating::{ImpersonatingClient, ImpersonatingError};
 pub use router::{should_impersonate, IMPERSONATE_HOSTS};
+pub use search::{web_search, SearchResult, WebSearchError};

@@ -41,6 +41,11 @@ htmd = "0.5"
 # 只留正文 article。底座 dom_query(html5ever 同族, 不引第二个 HTML 解析器), 自带
 # TooManyElements 守卫防病态大页。
 dom_smoothie = "0.17"
+# web_search (MOC-12): DDG html SSR 搜索结果解析。dom_query 是 dom_smoothie 的底座
+# (已在依赖树, 不引第二个 HTML 解析器), 用其 CSS selector 抽 .result__a/.result__snippet;
+# urlencoding 编码 query + 解码 DDG uddg 重定向参数里的真实 URL。
+dom_query = "0.27"
+urlencoding = "2"
 
 [dev-dependencies]
 # 集成测试: 真实打到 chatgpt.com 验证能过 CF (网络可达时)
