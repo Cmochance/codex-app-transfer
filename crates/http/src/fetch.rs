@@ -1,6 +1,8 @@
 //! 统一 web 抓取入口 (MOC-144): 按后端档位路由抓取一个 URL, 返回页面内容。
 //!
 //! "联网工具" 设置选的后端 → 这里执行:
+//! - [`WebFetchBackend::Auto`]   ⓪ **自动** (MOC-161, 推荐默认): curl→wreq→headless 按失败信号
+//!   动态升级, per-origin 记住每站最佳档 (见 [`web_fetch_auto`])。系统代理门槛在设置页(前端)把关。
 //! - [`WebFetchBackend::Curl`]   ① `reqwest` 静态 GET (不跑 JS, 最快, 拿初始 HTML)
 //! - [`WebFetchBackend::Wreq`]   ② [`crate::ImpersonatingClient`] 浏览器 TLS 指纹 (绕 CF JS 挑战)
 //! - [`WebFetchBackend::Headless`] ③ [`crate::headless`] headless Chromium (跑 JS, 取渲染后 DOM)
@@ -16,9 +18,12 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// 抓取后端档位 (与设置项 `关闭/curl/wreq/headless` 的后三档一一对应)。
+/// 抓取后端档位 (与设置项 `关闭/auto/curl/wreq/headless` 的后四档一一对应)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebFetchBackend {
+    /// ⓪ **自动** (MOC-161, 推荐默认): 按失败信号 curl→wreq→headless 动态升级;
+    /// per-origin 记住每域最佳档, 下次直接从该档起 (省试错)。语义 = "能力天花板 = headless"。
+    Auto,
     /// ① `reqwest` 静态 GET (不跑 JS)。
     Curl,
     /// ② `wreq` 浏览器 TLS 指纹 (绕 Cloudflare JS 挑战)。
@@ -31,6 +36,7 @@ impl WebFetchBackend {
     /// 解析设置字符串。`off`/`关闭`/未知 → `None` (不抓取)。
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
             "curl" => Some(Self::Curl),
             "wreq" => Some(Self::Wreq),
             "headless" => Some(Self::Headless),
@@ -41,10 +47,17 @@ impl WebFetchBackend {
     /// 设置值字符串 (存 config 用)。
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Curl => "curl",
             Self::Wreq => "wreq",
             Self::Headless => "headless",
         }
+    }
+
+    /// 该档是否"允许升到 headless"(= 可能需要 Chrome)。`Auto` / `Headless` 为真 ——
+    /// 用于上层(MCP server web_search 放行 / 设置页 Chrome consent)判定。
+    pub fn may_use_headless(&self) -> bool {
+        matches!(self, Self::Auto | Self::Headless)
     }
 }
 
@@ -62,6 +75,9 @@ pub enum WebFetchError {
     /// 资源声明体积超过下载上限, 不下载 (防 OOM, MOC-152)。
     #[error("{0}")]
     TooLarge(String),
+    /// Auto 档升级链跑完仍失败: 错误串带各档升级原因 (诊断, MOC-161 review H1)。
+    #[error("{0}")]
+    Auto(String),
 }
 
 /// 按后端抓取一个 URL, 返回页面内容。HTML (curl/wreq 按 content-type / 嗅探判定,
@@ -71,8 +87,10 @@ pub enum WebFetchError {
 /// 提示, 这里不把合法的空响应 (如 204) 当错误。
 pub async fn web_fetch(backend: WebFetchBackend, url: &str) -> Result<String, WebFetchError> {
     let (body, is_html) = match backend {
-        WebFetchBackend::Curl => fetch_curl(url).await?,
-        WebFetchBackend::Wreq => fetch_wreq(url).await?,
+        // Auto: curl→wreq→headless 按失败信号自动升级 + per-origin 复用 (MOC-161)。
+        WebFetchBackend::Auto => web_fetch_auto(url).await?,
+        WebFetchBackend::Curl => single_tier(WebFetchBackend::Curl, url).await?,
+        WebFetchBackend::Wreq => single_tier(WebFetchBackend::Wreq, url).await?,
         // headless 渲染后的 page.content() 恒为完整 HTML 文档。
         WebFetchBackend::Headless => (crate::headless::fetch_rendered_html(url).await?, true),
     };
@@ -206,8 +224,47 @@ fn cap_bytes(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(s[..end].to_string())
 }
 
-/// ① reqwest 静态 GET。返回 (body, is_html)。
-async fn fetch_curl(url: &str) -> Result<(String, bool), WebFetchError> {
+/// 一次原始抓取的产物 (curl/wreq tier): 供单档判 status / Auto 档判升级信号。
+struct RawFetch {
+    status: u16,
+    body: String,
+    is_html: bool,
+    /// CF 挑战 header (`cf-mitigated`) 是否出现 —— Auto 档据此升级 (MOC-161)。
+    cf_challenge_header: bool,
+}
+
+/// 单档 (Curl/Wreq) 抓取: raw 抓 → 非 2xx 即 Err (保持原单档语义, 不自动升级)。
+async fn single_tier(tier: WebFetchBackend, url: &str) -> Result<(String, bool), WebFetchError> {
+    let raw = fetch_raw(tier, url).await?;
+    if !(200..300).contains(&raw.status) {
+        return Err(tier_http_error(tier, raw.status));
+    }
+    Ok((raw.body, raw.is_html))
+}
+
+/// 按 tier (Curl/Wreq) 原始抓取, **不判 status** (status 判定交调用方: 单档→Err, Auto→升级信号)。
+/// Headless / Auto 不走这里。
+async fn fetch_raw(tier: WebFetchBackend, url: &str) -> Result<RawFetch, WebFetchError> {
+    match tier {
+        WebFetchBackend::Curl => fetch_curl_raw(url).await,
+        WebFetchBackend::Wreq => fetch_wreq_raw(url).await,
+        WebFetchBackend::Headless | WebFetchBackend::Auto => {
+            unreachable!("fetch_raw 只用于 Curl/Wreq tier")
+        }
+    }
+}
+
+/// tier 对应的 HTTP 错误 (单档非 2xx)。
+fn tier_http_error(tier: WebFetchBackend, status: u16) -> WebFetchError {
+    let msg = format!("HTTP {status}");
+    match tier {
+        WebFetchBackend::Wreq => WebFetchError::Wreq(msg),
+        _ => WebFetchError::Curl(msg),
+    }
+}
+
+/// ① reqwest 静态 GET。返回 RawFetch (不判 status)。
+async fn fetch_curl_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -217,9 +274,8 @@ async fn fetch_curl(url: &str) -> Result<(String, bool), WebFetchError> {
         .send()
         .await
         .map_err(|e| WebFetchError::Curl(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(WebFetchError::Curl(format!("HTTP {}", resp.status())));
-    }
+    let status = resp.status().as_u16();
+    let cf_challenge_header = resp.headers().get("cf-mitigated").is_some();
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -237,11 +293,16 @@ async fn fetch_curl(url: &str) -> Result<(String, bool), WebFetchError> {
         .await
         .map_err(|e| WebFetchError::Curl(e.to_string()))?;
     let is_html = is_html_response(content_type.as_deref(), &body);
-    Ok((body, is_html))
+    Ok(RawFetch {
+        status,
+        body,
+        is_html,
+        cf_challenge_header,
+    })
 }
 
-/// ② wreq 浏览器 TLS 指纹 (Chrome 120)。返回 (body, is_html)。
-async fn fetch_wreq(url: &str) -> Result<(String, bool), WebFetchError> {
+/// ② wreq 浏览器 TLS 指纹 (Chrome 120)。返回 RawFetch (不判 status)。
+async fn fetch_wreq_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     let client =
         crate::ImpersonatingClient::chrome_120().map_err(|e| WebFetchError::Wreq(e.to_string()))?;
     let resp = client
@@ -249,10 +310,8 @@ async fn fetch_wreq(url: &str) -> Result<(String, bool), WebFetchError> {
         .send()
         .await
         .map_err(|e| WebFetchError::Wreq(e.to_string()))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(WebFetchError::Wreq(format!("HTTP {status}")));
-    }
+    let status = resp.status().as_u16();
+    let cf_challenge_header = resp.headers().get("cf-mitigated").is_some();
     let content_type = resp
         .headers()
         .get("content-type")
@@ -271,7 +330,211 @@ async fn fetch_wreq(url: &str) -> Result<(String, bool), WebFetchError> {
         .map_err(|e| WebFetchError::Wreq(e.to_string()))?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
     let is_html = is_html_response(content_type.as_deref(), &body);
-    Ok((body, is_html))
+    Ok(RawFetch {
+        status,
+        body,
+        is_html,
+        cf_challenge_header,
+    })
+}
+
+// ===================== MOC-161 Auto 档: 升级链 + 信号检测 + per-origin 复用 =====================
+
+/// Auto 档升级链顺序 (低→高成本)。
+const AUTO_TIERS: [WebFetchBackend; 3] = [
+    WebFetchBackend::Curl,
+    WebFetchBackend::Wreq,
+    WebFetchBackend::Headless,
+];
+
+/// per-origin 最佳后端缓存 (进程内): 某 origin 升到某档成功就记住, 下次该 origin 直接从该档起,
+/// 省掉重复的低档试错。仅进程生命周期 (MCP server 重启清空), 不持久化 —— 站点反爬策略会变,
+/// 重启重新探测更安全。
+fn origin_profiles() -> &'static std::sync::Mutex<std::collections::HashMap<String, WebFetchBackend>>
+{
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, WebFetchBackend>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 取 URL 的 origin (`scheme://host`) 作 per-origin cache key。无法解析 → None (不缓存)。
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    if scheme.is_empty() || host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
+/// 记住某 origin 的成功档 (per-origin 复用)。origin 无法解析则不记。
+fn remember_origin(origin: &Option<String>, tier: WebFetchBackend) {
+    if let Some(o) = origin {
+        if let Ok(mut m) = origin_profiles().lock() {
+            m.insert(o.clone(), tier);
+        }
+    }
+}
+
+/// Auto 档: 从 per-origin 记住的档 (默认 curl) 起, 按失败信号 curl→wreq→headless 升级;
+/// 成功后记住该 origin 的成功档。返回 (body, is_html)。
+async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
+    let origin = origin_of(url);
+    // 起始档 = 该 origin 上次成功的档 (没记录则 curl)。
+    let start = origin
+        .as_ref()
+        .and_then(|o| {
+            origin_profiles()
+                .lock()
+                .ok()
+                .and_then(|m| m.get(o).copied())
+        })
+        .unwrap_or(WebFetchBackend::Curl);
+    let start_idx = AUTO_TIERS.iter().position(|&t| t == start).unwrap_or(0);
+
+    // 记每档为何升级, 最终失败时拼进错误 —— 否则只看到"headless 失败", 不知 curl/wreq 为何升级
+    // (review H1)。
+    let mut trail: Vec<String> = Vec::new();
+    for &tier in &AUTO_TIERS[start_idx..] {
+        if tier == WebFetchBackend::Headless {
+            // headless 是终极兜底 (跑 JS), 无"升级信号"可言 —— 成功即返回, 失败即整体失败。
+            match crate::headless::fetch_rendered_html(url).await {
+                Ok(body) => {
+                    remember_origin(&origin, tier);
+                    return Ok((body, true));
+                }
+                Err(e) => {
+                    return Err(WebFetchError::Auto(format!(
+                        "升级历程 [{}] 后 headless 仍失败: {e}",
+                        trail.join("; ")
+                    )))
+                }
+            }
+        }
+        match fetch_raw(tier, url).await {
+            // 拿到可用结果 (无升级信号) → 记住该档并返回。
+            Ok(raw) if !needs_upgrade(&raw) => {
+                remember_origin(&origin, tier);
+                return Ok((raw.body, raw.is_html));
+            }
+            // 有升级信号 (反爬 / 空 / JS 骨架) → 记原因, 升级到下一档。
+            Ok(raw) => {
+                trail.push(format!(
+                    "{tier:?}(status={} cf_hdr={} 空={} 骨架={})",
+                    raw.status,
+                    raw.cf_challenge_header,
+                    raw.body.trim().is_empty(),
+                    raw.is_html && is_js_shell(&raw.body)
+                ));
+                continue;
+            }
+            // 二进制 / 超大: 升级也没用 (内容本身不抓), 直接返回。
+            Err(e @ (WebFetchError::Unsupported(_) | WebFetchError::TooLarge(_))) => return Err(e),
+            // 其他硬错误 (连接 / 超时): 记原因, 升级试下一档。
+            Err(e) => {
+                trail.push(format!("{tier:?} 错误: {e}"));
+                continue;
+            }
+        }
+    }
+    // 升级链跑完仍无可用结果 (headless 分支总会 return, 正常不达此)。
+    Err(WebFetchError::Auto(format!(
+        "所有后端均失败: {}",
+        trail.join("; ")
+    )))
+}
+
+/// Auto 档: 这次 (curl/wreq) 抓取是否需要升级到更高档。命中任一信号即升级:
+/// ① 非 2xx (反爬 403 / 限流 429 / 5xx); ② CF 挑战 (header 或 body 标记);
+/// ③ 空 body; ④ JS 空骨架 (HTML 但剥 script 后几乎无可见文本 → 内容靠 JS 渲染)。
+fn needs_upgrade(raw: &RawFetch) -> bool {
+    // 只有 200 算"正常拿到内容"; 202/203/206 等对 HTML GET 异常 (反爬常用 202 软拦, 见 DDG
+    // anomaly), 一律升级 (review M1: 旧 `!(200..300)` 放过 202 反爬页当成功)。
+    if raw.status != 200 {
+        return true;
+    }
+    if raw.cf_challenge_header || is_challenge_body(&raw.body) {
+        return true;
+    }
+    if raw.body.trim().is_empty() {
+        return true;
+    }
+    raw.is_html && is_js_shell(&raw.body)
+}
+
+/// body 是否是反爬挑战 / 软拦截页 (CF + 通用反爬, 只看前 4KB)。命中即 Auto 升级。
+/// CF 的 `just a moment` 锚到 `<title>` (避免讨论 CF 的正文误判, review M2); `challenge-platform`
+/// / `_cf_chl_opt` 是 CF 专有 token; 另加通用反爬 (DDG anomaly / 限流 / "enable javascript" /
+/// DataDome / PerimeterX) marker (review M1: 非 CF 软拦截此前 slip through 当成功)。
+fn is_challenge_body(body: &str) -> bool {
+    let head: String = body
+        .chars()
+        .take(4096)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    // CF 专有
+    head.contains("challenge-platform")
+        || head.contains("cf-browser-verification")
+        || head.contains("_cf_chl_opt")
+        || head.contains("<title>just a moment")
+        // 通用反爬 / 软拦截
+        || head.contains("bots use duckduckgo")
+        || head.contains("unusual traffic")
+        || head.contains("enable javascript and cookies")
+        || head.contains("datadome")
+        || head.contains("px-captcha")
+        || head.contains("are you a robot")
+}
+
+/// JS 空骨架判定: HTML 文档但剥掉 script/style + 标签后可见文本极少 (典型 SPA 初始 HTML:
+/// `<div id="root"></div>` + bundle script, 内容全靠 JS 运行时填充)。阈值复用正文下限。
+///
+/// **已知边界 (review H2)**: 内容塞进 `<script id="__NEXT_DATA__">` 等 data island 的 SSR-light
+/// 页, 剥 script 后可见文本也偏少 → 判 shell → 升 headless。这**多花一次 headless 但结果正确**
+/// (headless 渲染出完整 DOM), per-origin cache 后续复用, 故按启发式接受不做 data-island 特判
+/// (特判反会漏真 CSR 空壳——它同样带 __NEXT_DATA__)。
+fn is_js_shell(html: &str) -> bool {
+    visible_text_len(html) < MIN_EXTRACTED_CHARS
+}
+
+/// 粗算 HTML 去掉 `<script>`/`<style>` 块 + 所有标签后的可见非空白字符数 (启发式, char-safe,
+/// 不求精确 DOM)。用于 [`is_js_shell`]。
+fn visible_text_len(html: &str) -> usize {
+    let lower = html.to_ascii_lowercase();
+    let mut out = 0usize;
+    let mut i = 0usize;
+    let n = html.len();
+    while i < n {
+        if lower[i..].starts_with("<script") {
+            match lower[i..].find("</script>") {
+                Some(rel) => i += rel + "</script>".len(),
+                None => break,
+            }
+            continue;
+        }
+        if lower[i..].starts_with("<style") {
+            match lower[i..].find("</style>") {
+                Some(rel) => i += rel + "</style>".len(),
+                None => break,
+            }
+            continue;
+        }
+        if html.as_bytes()[i] == b'<' {
+            match html[i..].find('>') {
+                Some(rel) => i += rel + 1,
+                None => break,
+            }
+            continue;
+        }
+        // 标签外的可见字符 (char-safe 推进)。
+        let ch = html[i..].chars().next().unwrap_or(' ');
+        if !ch.is_whitespace() {
+            out += 1;
+        }
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// 是否按 HTML 处理 (→ 转 markdown)。content-type 权威: 明确非 HTML (JSON/纯文本) 即
@@ -416,6 +679,7 @@ mod tests {
     #[test]
     fn parse_roundtrip_and_off() {
         for b in [
+            WebFetchBackend::Auto,
             WebFetchBackend::Curl,
             WebFetchBackend::Wreq,
             WebFetchBackend::Headless,
@@ -427,9 +691,132 @@ mod tests {
             WebFetchBackend::parse(" Headless "),
             Some(WebFetchBackend::Headless)
         );
+        assert_eq!(WebFetchBackend::parse("AUTO"), Some(WebFetchBackend::Auto));
         // 关闭 / 未知 → None
         assert_eq!(WebFetchBackend::parse("off"), None);
         assert_eq!(WebFetchBackend::parse("关闭"), None);
         assert_eq!(WebFetchBackend::parse(""), None);
+    }
+
+    #[test]
+    fn may_use_headless_flag() {
+        assert!(WebFetchBackend::Auto.may_use_headless());
+        assert!(WebFetchBackend::Headless.may_use_headless());
+        assert!(!WebFetchBackend::Curl.may_use_headless());
+        assert!(!WebFetchBackend::Wreq.may_use_headless());
+    }
+
+    #[test]
+    fn origin_of_extracts_scheme_host() {
+        assert_eq!(
+            origin_of("https://example.com/a/b?q=1#x"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            origin_of("http://sub.host.org:8080/p"),
+            Some("http://sub.host.org:8080".to_string())
+        );
+        assert_eq!(origin_of("not-a-url"), None);
+        assert_eq!(origin_of("https://"), None);
+    }
+
+    #[test]
+    fn needs_upgrade_signals() {
+        let html_ok = format!("<html><body>{}</body></html>", "正文内容很长".repeat(50));
+        // 正常 2xx + 有正文 → 不升级
+        assert!(!needs_upgrade(&RawFetch {
+            status: 200,
+            body: html_ok.clone(),
+            is_html: true,
+            cf_challenge_header: false,
+        }));
+        // 非 2xx → 升级
+        assert!(needs_upgrade(&RawFetch {
+            status: 403,
+            body: html_ok.clone(),
+            is_html: true,
+            cf_challenge_header: false,
+        }));
+        // 202 软拦 (DDG anomaly 等) → 升级 (review M1)
+        assert!(needs_upgrade(&RawFetch {
+            status: 202,
+            body: html_ok.clone(),
+            is_html: true,
+            cf_challenge_header: false,
+        }));
+        // CF header → 升级
+        assert!(needs_upgrade(&RawFetch {
+            status: 200,
+            body: html_ok.clone(),
+            is_html: true,
+            cf_challenge_header: true,
+        }));
+        // 通用反爬 body (DDG anomaly) → 升级 (review M1)
+        assert!(needs_upgrade(&RawFetch {
+            status: 200,
+            body: "<html><body>bots use duckduckgo too</body></html>".to_string(),
+            is_html: true,
+            cf_challenge_header: false,
+        }));
+        // 空 body → 升级
+        assert!(needs_upgrade(&RawFetch {
+            status: 200,
+            body: "   ".to_string(),
+            is_html: true,
+            cf_challenge_header: false,
+        }));
+        // 非 HTML (JSON API) 即使短也不当 JS 骨架 → 不升级
+        assert!(!needs_upgrade(&RawFetch {
+            status: 200,
+            body: "{\"k\":1}".to_string(),
+            is_html: false,
+            cf_challenge_header: false,
+        }));
+    }
+
+    #[test]
+    fn detects_challenge_body() {
+        // CF: just a moment 锚在 title
+        assert!(is_challenge_body(
+            "<html><head><title>Just a moment...</title></head></html>"
+        ));
+        assert!(is_challenge_body("<script>challenge-platform/x</script>"));
+        // 通用反爬 (review M1)
+        assert!(is_challenge_body("<body>Unusual traffic detected</body>"));
+        assert!(is_challenge_body("bots use duckduckgo too"));
+        // 普通页不误判 (review M2: 正文提 just a moment 但不在 title)
+        assert!(!is_challenge_body(
+            "<html><body>just a moment in history was discussed.</body></html>"
+        ));
+        assert!(!is_challenge_body("<html><body>normal page</body></html>"));
+    }
+
+    #[test]
+    fn detects_js_shell() {
+        // SPA 空骨架: 挂载点 + 一堆 script, 可见正文极少 → shell
+        let shell = "<html><body><div id=\"root\"></div>\
+            <script>var a=1;var b=2;</script><script src=\"/bundle.js\"></script></body></html>";
+        assert!(is_js_shell(shell), "SPA 空骨架应判为 shell");
+        // 有真实长正文 → 不是 shell
+        let real = format!(
+            "<html><body><article>{}</article></body></html>",
+            "这是一篇有实际内容的文章正文。".repeat(40)
+        );
+        assert!(!is_js_shell(&real), "有正文不应判为 shell");
+    }
+
+    /// 端到端真机 (网络 + headless): Auto 档抓 DDG (curl/wreq 必被 202 反爬, 应自动升到 headless
+    /// 拿到结果)。手动 `cargo test -p codex-app-transfer-http --ignored live_auto` 跑; CI 不跑。
+    #[tokio::test]
+    #[ignore = "real network + headless Chrome"]
+    async fn live_auto_escalates_to_headless() {
+        let r = web_fetch(
+            WebFetchBackend::Auto,
+            "https://html.duckduckgo.com/html/?q=rust",
+        )
+        .await;
+        eprintln!("auto fetch len: {:?}", r.as_ref().map(|s| s.len()));
+        let body = r.expect("auto 应升到 headless 并成功");
+        assert!(!body.trim().is_empty(), "expected non-empty content");
     }
 }

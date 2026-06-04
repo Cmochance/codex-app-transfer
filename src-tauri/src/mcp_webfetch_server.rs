@@ -178,7 +178,7 @@ fn dispatch_line(
             // (与 web_fetch 改 on/off 需重启一致);运行期切档的 stale 缓存由 handle_web_search_call
             // 的 backend gate 兜底(failing 双保险)。
             let mut tools = vec![web_fetch_tool_def()];
-            if matches!(current_backend(), Ok(Some(WebFetchBackend::Headless))) {
+            if matches!(current_backend(), Ok(Some(b)) if b.may_use_headless()) {
                 tools.push(web_search_tool_def());
             }
             let _ = out_tx.send(json!({
@@ -343,16 +343,17 @@ async fn handle_web_search_call(
         Some(q) if !q.is_empty() => q,
         _ => return tool_error(id, "缺少必填参数 query(搜索关键词 / 问题)"),
     };
-    // web_search 必须 headless → 要求 headless 档: off 拒(尊重关闭), curl/wreq 拒 + 引导切档
-    // (避免静默下载 Chrome), 仅 headless 档放行(其 Chrome 已走过 UI consent 下载)。
+    // web_search 必须用真浏览器(DDG 反爬)→ 要求 headless **或 auto** 档(Auto 允许升 headless、
+    // 抓 DDG 会走到 headless, MOC-161): off 拒(尊重关闭), curl/wreq 拒 + 引导切档(避免静默下载
+    // Chrome), headless/auto 放行(其 Chrome 已走过 UI consent 下载)。
     match current_backend() {
-        Ok(Some(WebFetchBackend::Headless)) => {}
+        Ok(Some(b)) if b.may_use_headless() => {}
         Ok(Some(other)) => {
             return tool_error(
                 id,
                 &format!(
-                    "web_search 需要 headless 档(DDG 反爬只有真浏览器能过)。当前是 {} 档 —— 请在 \
-                     codex-app-transfer 设置 → 内置联网抓取工具 选 headless(首次会确认下载 Chrome)再用。",
+                    "web_search 需要 auto 或 headless 档(DDG 反爬只有真浏览器能过)。当前是 {} 档 —— 请在 \
+                     codex-app-transfer 设置 → 内置联网抓取工具 选 auto 或 headless(首次会确认下载 Chrome)再用。",
                     other.as_str()
                 ),
             )
@@ -360,7 +361,7 @@ async fn handle_web_search_call(
         Ok(None) => {
             return tool_error(
                 id,
-                "联网抓取工具已关闭。web_search 需在 codex-app-transfer 设置 → 内置联网抓取工具 选 headless 后使用。",
+                "联网抓取工具已关闭。web_search 需在 codex-app-transfer 设置 → 内置联网抓取工具 选 auto 或 headless 后使用。",
             )
         }
         Err(e) => {
