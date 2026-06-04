@@ -13,12 +13,14 @@ repository.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "socks", "system-proxy"] }
 # 为 OpenAI/ChatGPT 等 Cloudflare 强保域提供浏览器指纹伪装。
 # **必须 pin 死 rc 版本**:wreq/wreq-util 是 pre-release,caret 范围会解析到最新 rc,
-# 而 wreq-util 3.0.0-rc.11 是写给 wreq 6.0.0-rc.23 的(rc.29 重命名了 emulation
-# trait IntoEmulation/EmulationFactory → 编译 skew,#358 review 实证)。锁定经
-# cargo build 验证可一起编译的组合。default-features=false 关掉了 wreq 的
-# default。注: rc.23 的 runtime (TcpConnector/GaiResolver) 非 feature-gated,
-# rc.23 features 列表里没有 tokio-rt 这一项 (#358 实证),无需也无法显式开启。
-wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["stream", "webpki-roots", "socks", "system-proxy"] }
+# 且二者锁步配对 —— wreq-util 3.0.0-rc.12 是写给 wreq 6.0.0-rc.29 的(跨 rc 的
+# emulation trait IntoEmulation/EmulationFactory 重命名会编译 skew,#358 实证)。
+# 锁定经 cargo build 验证可一起编译的组合。default-features=false 关掉 wreq 的
+# default(= [tokio-rt, webpki-roots])。注: rc.29 起把 tokio 运行时
+# (TcpConnector/GaiResolver) 拆进 feature-gated 的 `tokio-rt`(default 一员),
+# 关掉 default 后必须显式列回,否则 runtime item 被 cfg 门控掉、wreq 自身编译
+# 不过 (rc.23 时 runtime 非 feature-gated、无此项,#371 升级时补上)。
+wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "stream", "webpki-roots", "socks", "system-proxy"] }
 wreq-util = "=3.0.0-rc.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "process"] }
 # 错误类型

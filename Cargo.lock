@@ -7380,6 +7380,11 @@ name = "wreq-rt"
 version = "0.2.2-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99e9bce67a3fa3dd3f1503f066d86661c9caf399a763d3bd184da7afaf886c8b"
+dependencies = [
+ "pin-project-lite",
+ "tokio",
+ "wreq-proto",
+]
 
 [[package]]
 name = "wreq-util"
