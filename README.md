@@ -28,7 +28,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 启动转发后,Codex APP 通过本机 `127.0.0.1:18080` 与本工具通信。关闭窗口会缩到系统托盘继续运行,右键托盘"退出"才完全退出。
 
-当前版本 **v2.2.0**(详见 [Changelog](CHANGELOG.md) 与 [Releases](https://github.com/Cmochance/codex-app-transfer/releases))。
+当前版本 **v2.2.1**(详见 [Changelog](CHANGELOG.md) 与 [Releases](https://github.com/Cmochance/codex-app-transfer/releases))。
 
 ## 界面预览
 
@@ -81,7 +81,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - **Codex Desktop 主题(可选,默认关)**:Theme 页内置 11 套动漫主题(`carton` 含浮动看板娘,其余 `changli` / `azurlane` / `nailin` / `zani` / `frost` / `nocturne` / `duet` / `rose` / `sonata` / `studio`),每套按背景图独立调出暗玻璃 + 强调色。通过 CDP 向 Codex Desktop 注入设计令牌覆盖(`--color-token-*` + 运行时 `--color-*` 层)+ 背景图,覆盖聊天 / 设置页 / 折叠侧栏 / 弹层等各视图。开关跟 Plugin Unlock 独立,page reload 自动重应用;关闭开关只落盘清除偏好,已注入主题保留至 Codex 下次重启自然消失
 - **Codex Desktop 上下文用量显示(可选,默认开)**(MOC-123):让 Codex Desktop 输入框底部(composer footer、模型名右侧)显示 context 用量圆环 + tokens/s。Codex 0.135+(实测 26.601)把该显示收敛进 footer 且默认隐藏(`show-context-window-usage` 设置默认 false),升级 / 新装看不到;本开关让 transfer 在 Codex 启动前把该 atom ensure 写进 `~/.codex/.codex-global-state.json`(主进程权威源,非 renderer localStorage),改完重启 Codex 生效。设置 → 「Codex Desktop 对话页显示上下文圆环」。
 - **系统代理(梯子)连通性检测**(MOC-114):仪表盘「网络代理」卡实时显示系统代理是否活跃(已连接 / 未连接 / 自动配置 PAC / 检测中);relay 真实账号模式下「自动解锁 Codex Plugins」开关在账号有效且代理可达两条件同时满足时才激活,避免梯子没开时 plugins 静默全 502 却显示"已登录"的误导态。探测仅对代理端口做短超时 TCP 连通测试,不访问 chatgpt.com。
-- **内置联网抓取工具(web_fetch,MOC-144)**:设置页 → 「内置联网抓取工具」选 `curl` / `wreq` / `headless`(默认关闭,**独立于** Codex 沙箱联网开关),transfer 自动往 Codex 注册 `web_fetch` MCP 工具,Codex 模型可直接调该工具抓取网页 —— `curl` 走标准 HTTP、`wreq` 绕 Cloudflare TLS 挑战、`headless` 驱动无头 Chrome 取 JS 渲染后 DOM(首次选 headless 若未装 Chrome 会弹窗确认下载 chrome-headless-shell, ~86 MB)。切档即时生效(无需重启);**改"开/关"状态后需重启 Codex Desktop** 才会加载 / 卸载该 MCP server。
+- **内置联网抓取工具(web_fetch,MOC-144)**:设置页 → 「内置联网抓取工具」选 `curl` / `wreq` / `headless`(默认关闭,**独立于** Codex 沙箱联网开关),transfer 自动往 Codex 注册 `web_fetch` MCP 工具,Codex 模型可直接调该工具抓取网页 —— `curl` 走标准 HTTP、`wreq` 绕 Cloudflare TLS 挑战、`headless` 驱动无头 Chrome 取 JS 渲染后 DOM(首次选 headless 若未装 Chrome 会弹窗确认下载 chrome-headless-shell, ~86 MB)。切档即时生效(无需重启);**改"开/关"状态后需重启 Codex Desktop** 才会加载 / 卸载该 MCP server。抓到的 HTML 会自动转成 markdown 返给模型(更省 token、更干净;非 HTML 响应原样透传),headless 用 networkIdle 等渲染落定再取(MOC-145)。headless 抓取启用反检测 stealth(抹 `navigator.webdriver`、伪造 `window.chrome`/插件/WebGL、UA 去 `HeadlessChrome` 标记),可过被动指纹 / 简单 JS 挑战类 Cloudflare;交互式 Turnstile/DataDome 托管挑战仍过不了(MOC-152)。抓到的页转 markdown 前先做**正文抽取**(readability 算法剥 nav/页眉/页脚/侧栏/广告,只留正文,大页正文不再被截断挤掉;非文章页自动回退整页);图片 / 视频 / 音频 / PDF 等**二进制资源**与超 16 MB 大文件不下载、直接返提示(不再吐乱码 / 防 OOM)(MOC-152)。`web_fetch` 还支持**模型摘要**(类 Claude WebFetch):调用须带 `prompt`,抓取 + 抽正文后用「网页摘要模型」针对 prompt 作答、只回摘要(省 context)。摘要模型在提供商配置页「模型映射」下方设置(per-provider,留空用 Default 映射的模型);仅 `openai_chat` 格式 provider 支持,未配 / proxy 未起 / 报错时回退返回网页正文原文。大页(正文超 ~60k 字符)会按 prompt 的相关性挑出**全页最相关的段落**再总结(而非简单取前段),避免漏掉深处的相关内容(MOC-152 / MOC-156)。
 - 跨平台单实例锁定(双击启动自动唤起已有窗口)+ 跨进程 file lock 防多实例同时写 config 丢更新
 - Windows / macOS / Linux 系统托盘
 
@@ -170,6 +170,18 @@ cargo tauri build --bundles app,dmg          # macOS arm64
 cargo tauri build --bundles nsis,msi         # Windows x64
 cargo tauri build --bundles deb,appimage     # Linux x86_64
 ```
+
+### 提交前自动门禁(pre-push hook)
+
+仓库自带一个本地 `pre-push` 门禁(`.githooks/pre-push`),镜像 CI 的 `rust-fast-check` 那一层,push 前先在本地挡住 fmt / 编译 / 单测失败,不用等 CI 来回。每个 clone 装一次:
+
+```bash
+scripts/install-hooks.sh        # = git config core.hooksPath .githooks
+```
+
+装好后每次 `git push` 自动跑:`cargo fmt --all -- --check` → `cargo check --workspace --exclude codex-app-transfer` → `cargo test --workspace --exclude codex-app-transfer`(`#[ignore]` 的联网测试默认不跑,门禁不触网);非 main 分支落后 `origin/main` 会提醒(避免 squash-merge 被分支保护 BLOCK)。临时绕过用 `git push --no-verify`(CI 仍会拦)。
+
+> 该门禁是「模块更新自动检查机制」(MOC-138)的本地一环:配套还有 Dependabot 跟 `wreq` 等依赖发版、周期 CI 金丝雀验 Cloudflare 绕过仍生效。独立 clone `codex-app-transfer_test` 的漂移检测见 `scripts/check-test-repo-drift.sh`。
 
 ### 想改 UI 样式怎么改
 

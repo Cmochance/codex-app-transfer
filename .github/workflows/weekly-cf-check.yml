@@ -1,0 +1,27 @@
+# MOC-138 Tier 2: 周 cron CF 金丝雀 —— 每周真实打 Cloudflare 强保域,验
+# `wreq` 的 Chrome120 指纹还能不能过 CF。CF 改规则 / 指纹过期是不可预测的
+# 被动事件,这层把「等用户报联网挂了」换成「每周主动验 + fail 告警」。
+# 实际 canary 逻辑在 _reusable-cf-canary.yml(本文件只管定时触发)。
+#
+# 注意: GitHub Actions cron 只认 UTC(无 timezone 字段,跟 dependabot.yml 不同);
+# 且 scheduled run 高峰会延迟甚至丢弃,只从默认分支(main)触发 —— 是提醒不是保证。
+# 整点(HH:00)最拥挤,故用错峰分钟。
+name: weekly-cf-check
+
+on:
+  schedule:
+    # 错峰: 周一 01:37 UTC = 09:37 Asia/Shanghai。
+    # ① 避开整点 HH:00(scheduled run 最拥挤、最易被延迟的时刻);
+    # ② 用非整点/非 15·30·45 的分钟(37);
+    # ③ 落在 UTC 凌晨 1 点低流量段(欧美多在非工作时间),对应维护者上海周一早上看结果。
+    - cron: '37 1 * * 1'
+  # 手动触发(cron 不准时时的兜底 + 验收用)
+  workflow_dispatch: {}
+
+concurrency:
+  group: weekly-cf-check
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    uses: ./.github/workflows/_reusable-cf-canary.yml

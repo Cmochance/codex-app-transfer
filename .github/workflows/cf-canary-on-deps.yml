@@ -1,0 +1,50 @@
+# MOC-138 Tier1↔Tier2 连接:Dependabot 升 wreq/wreq-util 的 PR 当场触发 CF
+# 金丝雀,在 merge 前就验「新版本还能不能过 Cloudflare」,而不是等下一次周 cron
+# (最长 7 天)或用户报障才发现。手动改 wreq 的 PR 同样触发。
+#
+# ⚠️ 非必需 check(刻意不加进分支保护 required checks):Actions 跑数据中心 IP,
+# CF 对 DC IP 策略与家宽不同,canary 红可能是假阳性 —— 当信号看,别用它卡
+# Dependabot PR 的 merge。
+name: cf-canary-on-deps
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/http/Cargo.toml'
+
+concurrency:
+  group: cf-canary-on-deps-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 只有 diff 真的动了 wreq/wreq-util 才跑(网络)金丝雀,普通 dep bump 直接跳过,
+  # 不在每个依赖 PR 上白打 chatgpt.com。
+  detect-wreq:
+    name: Detect wreq change
+    runs-on: ubuntu-latest
+    outputs:
+      touched: ${{ steps.check.outputs.touched }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff "$BASE_SHA" "$HEAD_SHA" -- Cargo.lock Cargo.toml crates/http/Cargo.toml \
+               | grep -qiE '^[+-].*wreq'; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+            echo "✅ PR 改动了 wreq/wreq-util → 触发 CF 金丝雀"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ PR 未改 wreq → 跳过 CF 金丝雀"
+          fi
+
+  canary:
+    needs: detect-wreq
+    if: needs.detect-wreq.outputs.touched == 'true'
+    uses: ./.github/workflows/_reusable-cf-canary.yml

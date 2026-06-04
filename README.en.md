@@ -28,7 +28,7 @@ Codex App Transfer is a lightweight desktop config + forwarding tool for the **O
 
 After starting forwarding, Codex App talks to this tool at `127.0.0.1:18080`. Closing the window minimizes the app to the system tray; right-click the tray icon and choose "Exit" to fully quit.
 
-Current version **v2.2.0** (see [Changelog](CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
+Current version **v2.2.1** (see [Changelog](CHANGELOG.md) and [Releases](https://github.com/Cmochance/codex-app-transfer/releases)).
 
 ## Preview
 
@@ -81,7 +81,7 @@ A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts
 - **Codex Desktop Theme (optional, off by default)**: Theme page ships 11 built-in anime themes (`carton` with a floating mascot, plus `changli` / `azurlane` / `nailin` / `zani` / `frost` / `nocturne` / `duet` / `rose` / `sonata` / `studio`), each individually colour-matched to its artwork (per-theme glass + accent). Injects design-token overrides (`--color-token-*` + the runtime `--color-*` layer) + a background image into Codex Desktop via CDP, covering chat / settings / collapsed-sidebar / popovers. Toggle is independent from Plugin Unlock; page reload re-applies automatically; disabling the toggle only clears the saved preference — any already-injected theme stays until the next Codex restart
 - **Codex Desktop context-usage display (optional, on by default)** (MOC-123): shows the context-usage ring + tokens/s in Codex Desktop's composer footer (bottom of the input box, right of the model name). Codex 0.135+ (verified on 26.601) folded it into the footer and hides it by default (`show-context-window-usage` defaults to false), so upgrades / fresh installs don't see it; this toggle has transfer ensure the atom in `~/.codex/.codex-global-state.json` (the main-process source of truth, not renderer localStorage) before Codex launches — takes effect on Codex restart. Settings → "Show context usage ring in Codex Desktop conversations".
 - **System-proxy (VPN/ladder) connectivity detection** (MOC-114): the dashboard "Network Proxy" card shows live status — connected / disconnected / PAC auto-config / detecting. In relay real-account mode, the "Auto-unlock Codex Plugins" toggle gates on both conditions being met (valid account AND proxy reachable), preventing the silent-failure state where plugins spin and return 502s while the UI shows "logged in" because the proxy is down. Detection uses a short-timeout TCP connect to the proxy port only; chatgpt.com is never contacted.
-- **Built-in web fetch tool (web_fetch, MOC-144)**: Settings → "Built-in web fetch backend" — select `curl` / `wreq` / `headless` (off by default; **independent of** the Codex sandbox network toggle). Transfer automatically registers a `web_fetch` MCP tool with Codex, which the model can call directly to fetch web pages — `curl` uses standard HTTP, `wreq` bypasses Cloudflare TLS challenges, `headless` drives a headless Chrome to retrieve JS-rendered DOM (first-time headless use prompts to download chrome-headless-shell, ~86 MB, if Chrome is not installed). Switching tiers takes effect immediately (no restart needed); **toggling the feature on or off requires restarting Codex Desktop** for the MCP server to be loaded / unloaded.
+- **Built-in web fetch tool (web_fetch, MOC-144)**: Settings → "Built-in web fetch backend" — select `curl` / `wreq` / `headless` (off by default; **independent of** the Codex sandbox network toggle). Transfer automatically registers a `web_fetch` MCP tool with Codex, which the model can call directly to fetch web pages — `curl` uses standard HTTP, `wreq` bypasses Cloudflare TLS challenges, `headless` drives a headless Chrome to retrieve JS-rendered DOM (first-time headless use prompts to download chrome-headless-shell, ~86 MB, if Chrome is not installed). Switching tiers takes effect immediately (no restart needed); **toggling the feature on or off requires restarting Codex Desktop** for the MCP server to be loaded / unloaded. Fetched HTML is auto-converted to markdown before returning to the model (cleaner, fewer tokens; non-HTML responses pass through unchanged), and headless waits for networkIdle before capturing the rendered DOM (MOC-145). Headless fetches run with anti-detection stealth (strips `navigator.webdriver`, fakes `window.chrome`/plugins/WebGL, removes the `HeadlessChrome` UA token), passing passive-fingerprint / simple JS-challenge Cloudflare; interactive Turnstile/DataDome managed challenges still won't pass (MOC-152). Before markdown conversion the page goes through **main-content extraction** (readability algorithm strips nav/header/footer/sidebar/ads, keeping only the article so large-page content is no longer crowded out by truncation; non-article pages fall back to the full page); **binary resources** (image / video / audio / PDF) and files over 16 MB are not downloaded and return a clear notice instead (no more garbage bytes / OOM) (MOC-152). `web_fetch` also supports **model summarization** (like Claude's WebFetch): a `prompt` is required, and after fetching + extracting the page the configured "web summary model" answers the prompt and returns only the summary (saving context). The summary model is set on the provider config page below "Model Mapping" (per-provider; empty falls back to the Default-mapped model); only `openai_chat`-format providers are supported, and it falls back to returning the raw page text when unconfigured / the proxy is down / on error. For large pages (body over ~60k chars) it ranks paragraphs by relevance to the prompt and summarizes the **most relevant parts of the whole page** (instead of just the leading section), so deep content isn't missed (MOC-152 / MOC-156).
 - Cross-platform single-instance lock (double-click brings the existing window forward) + cross-process file lock prevents multi-instance config-write lost-updates
 - Windows / macOS / Linux system tray
 
@@ -171,6 +171,18 @@ cargo tauri build --bundles app,dmg          # macOS arm64
 cargo tauri build --bundles nsis,msi         # Windows x64
 cargo tauri build --bundles deb,appimage     # Linux x86_64
 ```
+
+### Pre-push gate (git hook)
+
+The repo ships a local `pre-push` gate (`.githooks/pre-push`) that mirrors CI's `rust-fast-check` lane, catching fmt / compile / unit-test failures locally before you push instead of waiting on CI. Install once per clone:
+
+```bash
+scripts/install-hooks.sh        # = git config core.hooksPath .githooks
+```
+
+Each `git push` then runs `cargo fmt --all -- --check` → `cargo check --workspace --exclude codex-app-transfer` → `cargo test --workspace --exclude codex-app-transfer` (`#[ignore]`d network tests stay off, so the gate never hits the network); non-main branches that are behind `origin/main` get a heads-up (so squash-merge isn't blocked by branch protection). Bypass temporarily with `git push --no-verify` (CI still enforces it).
+
+> This gate is the local tier of the "module update auto-check" mechanism (MOC-138): the rest is Dependabot tracking `wreq` and friends, plus a weekly CI canary verifying the Cloudflare bypass still works. Drift detection for the standalone `codex-app-transfer_test` clone lives in `scripts/check-test-repo-drift.sh`.
 
 ### Tweaking the UI
 

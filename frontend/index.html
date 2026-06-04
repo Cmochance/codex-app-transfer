@@ -268,6 +268,12 @@
                   <p data-i18n="providersAdd.applyHint">一键应用会保存供应商和模型映射，把它设为默认，并让 Codex CLI 连接到本工具。之后你在 Codex CLI 里发消息，本工具会自动转发到你填写的 API 地址。</p>
                 </div>
               </section>
+              <div class="mb-4" id="providerSummaryModelRow">
+                <label class="form-label" for="providerSummaryModel" data-i18n="providersAdd.summaryModel">网页摘要模型</label>
+                <input class="form-control" type="text" id="providerSummaryModel" list="providerSummaryModelOptions" autocomplete="off" data-i18n-placeholder="providersAdd.summaryModelPlaceholder" placeholder="留空 = 用 Default 映射的模型">
+                <datalist id="providerSummaryModelOptions"></datalist>
+                <p class="field-hint" data-i18n="providersAdd.summaryModelHint">web_fetch 抓取网页后,用该模型对正文生成摘要 / 按需作答再返回(省 context)。留空则用上方 Default 映射的模型。</p>
+              </div>
               <div class="button-row provider-form-actions">
                 <button class="btn btn-primary btn-lg" type="button" data-action="apply-provider-desktop"><i class="bi bi-play-fill"></i><span data-i18n="providers.enable">启用</span></button>
                 <button class="btn btn-outline-primary btn-lg" id="providerSaveOnly" type="submit" data-i18n="common.saveOnly">仅保存</button>
@@ -581,7 +587,10 @@
             </div>
           </div>
           <div class="settings-row settings-row-stack">
-            <strong data-i18n="settings.webFetchBackend">内置联网抓取工具（transfer 代抓网页）</strong>
+            <span class="settings-label-with-badge">
+              <strong data-i18n="settings.webFetchBackend">内置联网抓取工具（transfer 代抓网页）</strong>
+              <span class="new-badge" id="webFetchNewBadge" data-i18n="settings.newBadge" hidden>NEW</span>
+            </span>
             <div>
               <div class="segmented webfetch-segment" id="webFetchBackend" role="radiogroup" aria-label="web fetch backend">
                 <button class="btn active" type="button" data-webfetch="off" data-i18n="settings.webFetchBackend.off">关闭</button>

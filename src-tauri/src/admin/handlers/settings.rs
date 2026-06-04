@@ -457,16 +457,23 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
                 }
             }
             // MOC-144:webFetchBackend 改了 → 注册/移除 [mcp_servers.cat-webfetch]。
-            // 失败仅记日志(不阻塞 settings 保存);Codex 需重启才重新加载 mcp_servers。
+            // 失败不阻塞 settings 保存, 但回 webFetchSyncWarning 让前端 toast 提示用户
+            // (MOC-145:现仅 error 日志, 用户当面无感)。Codex 需重启才重新加载 mcp_servers。
+            let mut web_fetch_warning: Option<String> = None;
             if let Some(backend) = web_fetch_changed {
                 if let Err(e) = crate::admin::services::mcp_servers::sync_web_fetch_server(&backend)
                 {
                     // error 级: 用户当面改了设置但注册到 Codex 失败 = 会产生支持工单的静默
                     // 不一致;startup re-sync 会在下次 transfer 启动时幂等重试补偿。
                     tracing::error!("sync web_fetch mcp_server 失败(下次启动重试): {e}");
+                    web_fetch_warning = Some(e);
                 }
             }
-            Json(json!({"success": true, "settings": settings})).into_response()
+            let mut body = json!({"success": true, "settings": settings});
+            if let Some(w) = web_fetch_warning {
+                body["webFetchSyncWarning"] = json!(w);
+            }
+            Json(body).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }

@@ -85,7 +85,7 @@ pub(crate) fn provider_display_name(provider: &Value) -> String {
 /// `responses` / `openai_responses` 保持 OpenAI Responses 语义。历史
 /// `anthropic` / `claude` / `messages` 别名现在归一到 `anthropic_messages`,
 /// 交给 AnthropicMessagesAdapter 做 Responses ↔ Anthropic Messages 转换。
-pub(super) fn normalize_provider_api_format(api_format: Option<&str>) -> &'static str {
+pub(crate) fn normalize_provider_api_format(api_format: Option<&str>) -> &'static str {
     let normalized = api_format
         .unwrap_or("")
         .trim()

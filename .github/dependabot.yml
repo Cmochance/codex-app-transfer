@@ -1,0 +1,56 @@
+# MOC-138 Tier 1: Dependabot —— wreq / wreq-util 等 cargo 依赖发版时自动起 PR,
+# 不用人盯 crates.io。配套 Tier 2 周 cron 金丝雀(验 Cloudflare 绕过仍生效)作后续 PR。
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    # 根 workspace,覆盖全部成员(crates/* + src-tauri + xtask),读根 Cargo.lock
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Shanghai"
+    # 别设太大,PR 堆着 review 不完
+    open-pull-requests-limit: 5
+    labels:
+      - "Improvement"
+    assignees:
+      - "Cmochance"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    ignore:
+      # wreq 6.0.0-rc.29 经 CI canary 实证 CF 绕过回归 —— 数据中心 IP 下浏览器指纹
+      # 被 Cloudflare 识破返 403(rc.23 同环境正常,见 #371 / MOC-160)。保持 rc.23,
+      # 待 wreq 出更高 rc(rc.30+)或正式版 6.0.0 时再由 cf-bypass group 提 PR + canary
+      # 验证后评估升级。wreq-util 与 wreq 锁步,同 ignore 配对的 rc.12 及更低。
+      - dependency-name: "wreq"
+        versions: ["<= 6.0.0-rc.29"]
+      - dependency-name: "wreq-util"
+        versions: ["<= 3.0.0-rc.12"]
+    groups:
+      # wreq + wreq-util 是浏览器指纹伪装对,rc 版本间有 emulation trait 重命名
+      # skew(见 crates/http/Cargo.toml 注释),必须锁步升级 → 单独 group 一次性
+      # bump,不要一个 dep 一个 PR。注:boring2 / boring-sys2 是 wreq 的传递依赖
+      # (无任何 Cargo.toml 直接声明),Dependabot 只对直接依赖起 PR,故不列 ——
+      # 会跟随 wreq 走 lockfile 自动升。若 group 内只有 wreq 单边有新 rc,bump 后
+      # 可能编译 skew,但 CI 的 cargo check --workspace 会判红兜底。
+      cf-bypass:
+        patterns:
+          - "wreq"
+          - "wreq-util"
+      # 其余依赖:只把 patch 级(向后兼容 bugfix)合并成一个低风险 PR 一起合;
+      # minor/major 不进 group、各自单独成 PR 逐个评估适配。原因:Rust 生态大量
+      # crate 仍 0.x,breaking 常走 minor 段(getrandom 0.2→0.4 / sha2 0.10→0.11
+      # 等),"非 patch 即单独 PR"比纯按 semver-major 过滤更稳。#372 曾一锅端 17 个
+      # 含约 10 个 breaking,CI 实测直接挂在 getrandom 0.4 移除顶层 getrandom() 函数
+      # (源码直接调用 → E0425)、group 整体编不过,故 MOC-160 改此策略。
+      # cf-bypass group 不设 update-types(锁步升级不分级别)。
+      everything-else:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "wreq"
+          - "wreq-util"
+        update-types:
+          - "patch"

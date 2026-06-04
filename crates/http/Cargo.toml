@@ -36,6 +36,11 @@ futures = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # app data 目录: chrome-headless-shell 落 ~/.codex-app-transfer/browsers/ (跨平台 home_dir)。
 dirs = "6"
+htmd = "0.5"
+# 正文抽取 (MOC-152, PR-B): readability.js 移植, 转 markdown 前剥 nav/页眉/页脚/侧栏/广告,
+# 只留正文 article。底座 dom_query(html5ever 同族, 不引第二个 HTML 解析器), 自带
+# TooManyElements 守卫防病态大页。
+dom_smoothie = "0.17"
 
 [dev-dependencies]
 # 集成测试: 真实打到 chatgpt.com 验证能过 CF (网络可达时)

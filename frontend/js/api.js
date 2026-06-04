@@ -10,7 +10,21 @@
       opts.body = JSON.stringify(body);
     }
     const resp = await fetch(BASE + path, opts);
-    const data = await resp.json();
+    // 非 JSON 响应兜底(MOC-145):反代/网关 502/504 或长阻塞请求中断时 body 常是 HTML/
+    // 空,直接 resp.json() 抛裸 SyntaxError("Unexpected token <")误导排查。这里捕获并
+    // 抛带 HTTP status 的清晰错误,让上层 toast 有可读信息。
+    let data;
+    try {
+      data = await resp.json();
+    } catch (parseErr) {
+      const error = new Error(
+        `Request failed: ${method} ${path} — HTTP ${resp.status} ${resp.statusText || ""} ` +
+        `(非 JSON 响应,可能是网关错误或服务未就绪)`
+      );
+      error.errors = [];
+      error.responseData = { status: resp.status, parseError: String(parseErr) };
+      throw error;
+    }
     if (!resp.ok || data.success === false) {
       // baseMessage 直接用 backend message(可能是 i18n key 如 "models.fetchFailed",
       // 上层负责翻译;也可能是 raw string)。**不在这里 inline errors[0]**:
@@ -126,6 +140,8 @@
       requestOptions: provider.requestOptions || {},
       default: provider.id === activeId,
       isBuiltin: !!provider.isBuiltin,
+      // web_fetch 网页摘要模型 (MOC-152);显式挑字段, 不加这行前端拿不到后端返的值。
+      summaryModel: provider.summaryModel || '',
       mappings: {
         default: models.default || '',
         gpt_5_5: models.gpt_5_5 || '',
@@ -182,6 +198,11 @@
     }
     if (includeModels) {
       body.models = payload.models || {};
+    }
+    // web_fetch 网页摘要模型 (MOC-152): 只要 payload 带了该键就下发(含空串 ''),否则用户
+    // 清空时前端不发 → 后端 update_provider 的 remove 分支永不触发、旧值残留(显式挑字段丢值)。
+    if (payload.summaryModel !== undefined && payload.summaryModel !== null) {
+      body.summaryModel = payload.summaryModel; // '' → 后端 remove(清除,回退 models.default)
     }
     // R1 Plan A:grokWeb extra(cookies + statsigId override + UA override)必须
     // passthrough 到 backend payload。**此前漏掉**(2026-05-12 user E2E 真机
@@ -475,7 +496,14 @@
 
     async saveSettings(settings) {
       const data = await api('PUT', '/api/settings', settings);
-      return data.settings || data;
+      const out = data.settings || data;
+      // 顶层警告字段(webFetchSyncWarning)不在 settings 里, 挂回返回对象 ——
+      // 否则被 `data.settings ||` 这层 mapper 静默丢掉, _commitWebFetch 读不到、
+      // toast 成死代码(MOC-145)。
+      if (data && data.webFetchSyncWarning && out && typeof out === 'object') {
+        out.webFetchSyncWarning = data.webFetchSyncWarning;
+      }
+      return out;
     },
 
     // MOC-144 联网抓取后端: headless 档需要 Chromium, 这两个给设置页探测/按需下载用。
