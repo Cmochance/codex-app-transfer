@@ -356,23 +356,31 @@ fn is_credential_key(key: &str) -> bool {
         || norm.ends_with("apikey")
 }
 
-/// 脱敏一条 MCP-trace 记录(整个 JSON 对象,MOC-169 增量 4)。① 递归按 [`is_credential_key`]
-/// 清洗所有 credential 键(覆盖 `req_headers`/`resp_headers` 里的 authorization/api_key 等);
-/// ② body 类字符串字段(`body`/`req_body`/`resp_body`/`data`)若为完整 JSON 则解析后键级清洗
-/// 再回写(覆盖 oauth 回包 body 里的 `access_token`/`refresh_token` 等)。MCP/JSON-RPC/oauth
-/// body 多为 JSON,故覆盖主要 token;**非 JSON / 被页内截断的 body 不解析**(同 forward-trace
-/// 非 JSON body 取舍)—— MCP 采集默认关 + 仅 loopback + 仅本地,勿外传(见 README「协议转发诊断」节)。
+/// 脱敏一条 MCP-trace 记录(整个 JSON 对象,MOC-169 增量 4)。
+/// ① 递归按 [`is_credential_key`] 清洗所有 credential 键(覆盖 authorization/api_key/*_token 等);
+/// ② `req_headers`/`resp_headers` 额外按**宽 header 白名单**清洗 narrow 漏的(`cookie`/`session`/
+/// `proxy-authorization` 等会话凭据头);③ body 类字符串字段(`body`/`req_body`/`resp_body`/`data`)
+/// 若是 JSON 则解析后键级清洗,**否则按 form-urlencoded 清洗**(覆盖 oauth token 端点的
+/// `client_secret`/`refresh_token` 等 `application/x-www-form-urlencoded` 请求体)。
+/// **非 JSON / 非 form / 被页内截断的 body 不解析**(同 forward-trace 取舍)—— MCP 采集默认关 +
+/// 仅 loopback + 仅本地,勿外传(见 README「协议转发诊断」节)。
 pub fn redact_mcp_value(v: &mut Value) {
     redact_json_credentials(v);
     if let Some(obj) = v.as_object_mut() {
+        // ② headers 宽匹配补漏(narrow 的 redact_json_credentials 已处理 authorization/api_key/*_token)
+        for hk in ["req_headers", "resp_headers"] {
+            if let Some(Value::Object(hdrs)) = obj.get_mut(hk) {
+                for (name, val) in hdrs.iter_mut() {
+                    if is_wide_extra_credential_header(name) {
+                        *val = Value::String("***".to_string());
+                    }
+                }
+            }
+        }
+        // ③ body:JSON → 键级清洗;否则 form-urlencoded → 键级清洗
         for key in ["body", "req_body", "resp_body", "data"] {
             let scrubbed = match obj.get(key) {
-                Some(Value::String(s)) => {
-                    serde_json::from_str::<Value>(s).ok().map(|mut parsed| {
-                        redact_json_credentials(&mut parsed);
-                        serde_json::to_string(&parsed).unwrap_or_else(|_| "***".to_string())
-                    })
-                }
+                Some(Value::String(s)) => redact_body_string(s),
                 _ => None,
             };
             if let Some(scrubbed) = scrubbed {
@@ -380,6 +388,51 @@ pub fn redact_mcp_value(v: &mut Value) {
             }
         }
     }
+}
+
+/// MCP header 名是否属于 [`is_credential_key`] **没覆盖**的会话凭据类(cookie / session /
+/// proxy-authorization)。注:`cookie`/`set-cookie` 是浏览器 forbidden header、JS 抓不到,
+/// 这里覆盖主要是 `x-session-*` / `proxy-authorization` 这类 JS 可设可读的自定义凭据头。
+fn is_wide_extra_credential_header(name: &str) -> bool {
+    let norm: String = name
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    norm.contains("cookie") || norm.contains("session") || norm == "proxyauthorization"
+}
+
+/// 脱敏一个 body 字符串:先试 JSON(键级清洗),失败再试 form-urlencoded(`k=v&k=v`,对
+/// credential 键的值清洗)。两者都不像则返 `None`(原样保留)。返回脱敏后的字符串。
+fn redact_body_string(s: &str) -> Option<String> {
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(s) {
+        redact_json_credentials(&mut parsed);
+        return Some(serde_json::to_string(&parsed).unwrap_or_else(|_| "***".to_string()));
+    }
+    // form-urlencoded:含 `=`、不以 `{`/`[` 开头(排除残缺 JSON)
+    let trimmed = s.trim_start();
+    if s.contains('=') && !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        let mut touched = false;
+        let out = s
+            .split('&')
+            .map(|pair| {
+                let mut it = pair.splitn(2, '=');
+                let k = it.next().unwrap_or("");
+                match it.next() {
+                    Some(_) if is_credential_key(k) => {
+                        touched = true;
+                        format!("{k}=***")
+                    }
+                    _ => pair.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        if touched {
+            return Some(out);
+        }
+    }
+    None
 }
 
 fn header_content_type(h: &reqwest::header::HeaderMap) -> Option<&str> {
@@ -505,6 +558,41 @@ mod tests {
         // 诊断字段不误伤
         assert_eq!(v["max_tokens"], 8);
         assert_eq!(v["url"], "https://auth.example.com/oauth/token");
+    }
+
+    #[test]
+    fn redact_mcp_value_cleanses_form_urlencoded_body_and_session_headers() {
+        let mut v = json!({
+            "kind": "fetch",
+            "url": "https://auth.example.com/token",
+            "req_headers": {
+                "x-session-id": "sess-LEAK",
+                "proxy-authorization": "Basic LEAK",
+                "content-type": "application/x-www-form-urlencoded"
+            },
+            "req_body": "grant_type=refresh_token&refresh_token=rt-LEAK&client_secret=cs-LEAK&scope=read"
+        });
+        redact_mcp_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        // 宽 header 白名单补漏(narrow is_credential_key 没覆盖的会话凭据头)
+        assert_eq!(v["req_headers"]["x-session-id"], "***", "session 头未脱敏");
+        assert_eq!(
+            v["req_headers"]["proxy-authorization"], "***",
+            "proxy-authorization 未脱敏"
+        );
+        assert_eq!(
+            v["req_headers"]["content-type"],
+            "application/x-www-form-urlencoded"
+        );
+        // form-urlencoded body 的 credential 值脱敏,非 credential 字段保留
+        assert!(!s.contains("rt-LEAK"), "form refresh_token 泄露: {s}");
+        assert!(!s.contains("cs-LEAK"), "form client_secret 泄露");
+        let body = v["req_body"].as_str().unwrap();
+        assert!(
+            body.contains("grant_type=refresh_token"),
+            "非 credential 字段应保留"
+        );
+        assert!(body.contains("scope=read"));
     }
 
     #[test]

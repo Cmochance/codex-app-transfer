@@ -1036,11 +1036,19 @@ fn record_mcp_trace_entry(raw: &serde_json::Value) {
         }
     }
     codex_app_transfer_proxy::diagnostics::redact_mcp_value(&mut value);
-    let _ = codex_app_transfer_proxy::trace_store().push(
+    let written = codex_app_transfer_proxy::trace_store().push(
         codex_app_transfer_proxy::TraceKind::Mcp,
         seq,
         value,
     );
+    // 诊断已开但写盘失败(权限/满盘)→ 首次记一条 WARN(去重,避免每 2s drain 刷屏)。
+    if written.is_none() {
+        static MCP_WRITE_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !MCP_WRITE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!("[McpTrace] 诊断已开但 MCP trace 写盘失败(后续不再提示)");
+        }
+    }
 }
 
 /// [MOC-169] 页内 MCP 流量录制器(诊断 gate 开时注入)。wrap `fetch` / `WebSocket`,按

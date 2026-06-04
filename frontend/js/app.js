@@ -8495,7 +8495,16 @@
       try {
         if (on) {
           const r = await CCApi.traceViewerStart();
-          showToast(r?.url ? `诊断查看器已启动 ${r.url}` : "诊断查看器已启动");
+          // 后端 bind 失败时返回 200 + {success:false}(api() 不 throw),需显式判断:
+          // 回滚开关 + 隐藏按钮 + 回滚持久化,避免"开关 on 但实际没起"的假成功。
+          if (r && r.success === false) {
+            showToast("诊断查看器启动失败" + (r.error ? `:${r.error}` : ""));
+            $("#traceViewerEnabled").checked = false;
+            if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = true;
+            await saveSettingsFromForm();
+          } else {
+            showToast(r?.url ? `诊断查看器已启动 ${r.url}` : "诊断查看器已启动");
+          }
         } else {
           await CCApi.traceViewerStop();
           showToast("诊断查看器已关闭");

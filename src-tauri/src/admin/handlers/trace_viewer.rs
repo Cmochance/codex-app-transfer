@@ -17,9 +17,14 @@ fn url_of(addr: std::net::SocketAddr) -> String {
 }
 
 /// 开启诊断:置位运行时采集 gate + 起查看器(幂等)。返回 viewer URL。
+/// `start` 内部同步 block 到 bootstrap 线程 bind 完成,放 `spawn_blocking` 不卡 async worker。
 pub async fn start_trace_viewer(State(state): State<AdminState>) -> impl IntoResponse {
     set_forward_trace_enabled(true);
-    match state.trace_viewer_manager.start(DEFAULT_TRACE_VIEWER_PORT) {
+    let mgr = state.trace_viewer_manager.clone();
+    let result = tokio::task::spawn_blocking(move || mgr.start(DEFAULT_TRACE_VIEWER_PORT))
+        .await
+        .unwrap_or_else(|e| Err(format!("trace-viewer start task panicked: {e}")));
+    match result {
         Ok(addr) => Json(json!({"success": true, "running": true, "url": url_of(addr)})),
         Err(e) => Json(json!({"success": false, "running": false, "error": e})),
     }
@@ -47,7 +52,11 @@ pub async fn open_trace_viewer(State(state): State<AdminState>) -> impl IntoResp
         Some(addr) => addr,
         None => {
             set_forward_trace_enabled(true);
-            match state.trace_viewer_manager.start(DEFAULT_TRACE_VIEWER_PORT) {
+            let mgr = state.trace_viewer_manager.clone();
+            let started = tokio::task::spawn_blocking(move || mgr.start(DEFAULT_TRACE_VIEWER_PORT))
+                .await
+                .unwrap_or_else(|e| Err(format!("trace-viewer start task panicked: {e}")));
+            match started {
                 Ok(addr) => addr,
                 Err(e) => return Json(json!({"success": false, "error": e})),
             }
