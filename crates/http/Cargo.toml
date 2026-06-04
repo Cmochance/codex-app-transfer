@@ -16,7 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 # 且二者锁步配对 —— wreq-util 3.0.0-rc.12 是写给 wreq 6.0.0-rc.29 的(跨 rc 的
 # emulation trait IntoEmulation/EmulationFactory 重命名会编译 skew,#358 实证)。
 # 锁定经 cargo build 验证可一起编译的组合。default-features=false 关掉 wreq 的
-# default(= [tokio-rt, webpki-roots])。注: rc.29 起把 tokio 运行时
+# default(= [webpki-roots, tokio-rt])。注: rc.29 起把 tokio 运行时
 # (TcpConnector/GaiResolver) 拆进 feature-gated 的 `tokio-rt`(default 一员),
 # 关掉 default 后必须显式列回,否则 runtime item 被 cfg 门控掉、wreq 自身编译
 # 不过 (rc.23 时 runtime 非 feature-gated、无此项,#371 升级时补上)。
