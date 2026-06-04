@@ -469,7 +469,11 @@ pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) 
     if active_provider(&cfg).is_none() {
         return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "no active provider; skip"});
     }
-    let state = AdminState { proxy_manager };
+    // trace_viewer 不参与 desktop sync;给一个未启动的空 manager 满足 AdminState 即可。
+    let state = AdminState {
+        proxy_manager,
+        trace_viewer_manager: Arc::new(crate::trace_viewer::TraceViewerManager::new()),
+    };
     let result = sync_desktop_for_active_provider(&state).await;
     if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
         return json!({
@@ -532,7 +536,11 @@ pub async fn switch_provider_and_sync(
     if let Err(e) = result {
         return json!({"success": false, "message": e});
     }
-    let state = AdminState { proxy_manager };
+    // trace_viewer 不参与 desktop sync;给一个未启动的空 manager 满足 AdminState 即可。
+    let state = AdminState {
+        proxy_manager,
+        trace_viewer_manager: Arc::new(crate::trace_viewer::TraceViewerManager::new()),
+    };
     let desktop_sync = sync_desktop_for_active_provider(&state).await;
     // MOC-62:切换后做一次 MCP 凭据并集同步(capture 新授权 + 必要时 restore;
     // 只动两个凭据文件,不碰 config.toml)。

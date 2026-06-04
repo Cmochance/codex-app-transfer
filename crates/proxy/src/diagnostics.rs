@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -154,15 +154,26 @@ fn bytes_payload_with_len(bytes: &[u8], true_len: usize, max_bytes: usize) -> Va
 // 所以它默认关 + 仅 loopback + 仅本地,绝不随 release 给终端用户开。见 docs/forward-trace.md。
 // ───────────────────────────────────────────────────────────────────────────
 
-/// forward-trace 开关。默认**关**(普通用户零影响)。仅 env `CAS_DIAG_TRACE=1`(或
-/// `true`)开启;首次读取后缓存,后续每请求仅一次 `OnceLock` load、零额外开销。
+/// 运行时开关(app 内「诊断模式」UI toggle / 持久化 settings 自启时置位),与 env 并联。
+static RUNTIME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// forward-trace / MCP-trace 总开关。默认**关**(普通用户零影响)。两条启用路径**并联**:
+/// ① env `CAS_DIAG_TRACE=1`/`true`(首读缓存,zero-overhead);② 运行时 [`set_forward_trace_enabled`]
+/// (app 内「诊断模式」开关 / 启动时按持久化 settings 置位)。任一为真即开。关时转发热路径
+/// 仅一次 `OnceLock` load + 一次 atomic load。
 pub fn forward_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
+    static ENV_ENABLED: OnceLock<bool> = OnceLock::new();
+    let env_on = *ENV_ENABLED.get_or_init(|| {
         std::env::var("CAS_DIAG_TRACE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
-    })
+    });
+    env_on || RUNTIME_TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 运行时开/关诊断采集(app 内 toggle 用)。env 开启的不受影响(env 恒为真)。
+pub fn set_forward_trace_enabled(on: bool) {
+    RUNTIME_TRACE_ENABLED.store(on, Ordering::Relaxed);
 }
 
 /// forward 全过程 trace 入参(全引用,write 内才序列化)。成功路径由 forward.rs 的

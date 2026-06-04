@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Codex App Transfer · 诊断流量查看器</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1f232c; --border: #2a2f3a;
+    --fg: #e6e8ec; --muted: #8b93a1; --accent: #4f9cf9; --ok: #3fb950;
+    --warn: #d29922; --err: #f85149; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; align-items: center; gap: 12px; padding: 8px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--border); flex: none; }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  header .grow { flex: 1; }
+  #live { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
+  #live .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  #live.on .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  select, input, button { background: var(--panel2); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 12px; }
+  input#q { width: 200px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  main { flex: 1; display: flex; min-height: 0; }
+  #list { width: 42%; max-width: 560px; overflow-y: auto; border-right: 1px solid var(--border); }
+  .row { padding: 7px 12px; border-bottom: 1px solid var(--border); cursor: pointer; display: flex;
+    gap: 8px; align-items: baseline; }
+  .row:hover { background: var(--panel); }
+  .row.sel { background: var(--panel2); }
+  .row .ts { color: var(--muted); font: 11px var(--mono); flex: none; }
+  .row .badge { font-size: 10px; padding: 1px 5px; border-radius: 4px; flex: none; text-transform: uppercase; }
+  .badge.forward { background: #14304d; color: var(--accent); }
+  .badge.mcp { background: #3a2a14; color: var(--warn); }
+  .row .summary { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); }
+  .row .status { flex: none; font: 11px var(--mono); }
+  .st2 { color: var(--ok); } .st4, .st5 { color: var(--err); }
+  #detail { flex: 1; overflow-y: auto; padding: 14px; }
+  #detail .empty { color: var(--muted); margin-top: 40px; text-align: center; }
+  .meta { color: var(--muted); font: 11px var(--mono); margin-bottom: 12px; word-break: break-all; }
+  .seg { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
+  .seg > summary { cursor: pointer; padding: 7px 12px; background: var(--panel); font-weight: 600;
+    list-style: none; display: flex; justify-content: space-between; }
+  .seg > summary::-webkit-details-marker { display: none; }
+  .seg .body { padding: 10px 12px; }
+  table.hdr { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+  table.hdr td { padding: 2px 6px; vertical-align: top; font: 11px var(--mono); border-bottom: 1px solid var(--border); }
+  table.hdr td.k { color: var(--accent); width: 30%; word-break: break-all; }
+  table.hdr td.v { color: var(--fg); word-break: break-all; }
+  pre.payload { margin: 0; padding: 8px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; overflow-x: auto; font: 11px var(--mono); white-space: pre-wrap; word-break: break-word;
+    max-height: 420px; overflow-y: auto; }
+  .trunc { color: var(--warn); font-size: 11px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>诊断流量查看器</h1>
+    <span id="live"><span class="dot"></span><span id="livetxt">连接中…</span></span>
+    <span class="grow"></span>
+    <select id="kind">
+      <option value="all">全部</option>
+      <option value="forward">forward</option>
+      <option value="mcp">mcp</option>
+    </select>
+    <input id="q" type="search" placeholder="搜 path / provider / url…" />
+    <button id="clear">清空</button>
+  </header>
+  <main>
+    <div id="list"></div>
+    <div id="detail"><div class="empty">选择左侧一条记录查看详情</div></div>
+  </main>
+</div>
+<script>
+(function () {
+  const $ = (s) => document.querySelector(s);
+  const listEl = $("#list"), detailEl = $("#detail"), liveEl = $("#live"), liveTxt = $("#livetxt");
+  let traces = [];          // 全部记录(value 对象)
+  let selected = null;      // 当前选中的 seq
+
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  function kindOf(t) { return t && t.trace_kind === "forward_protocol" ? "forward" : "mcp"; }
+
+  function summaryOf(t) {
+    if (kindOf(t) === "forward") {
+      const ib = t.inbound || {};
+      return `${esc(ib.method || "")} ${esc(ib.client_path || "")}`;
+    }
+    return `${esc((t.event || "mcp"))} ${esc(t.url || "")}`;
+  }
+  function statusOf(t) { return (t.response && t.response.status) || t.status || ""; }
+
+  function matches(t) {
+    const k = $("#kind").value;
+    if (k !== "all" && kindOf(t) !== k) return false;
+    const q = $("#q").value.trim().toLowerCase();
+    if (!q) return true;
+    return JSON.stringify(t).toLowerCase().includes(q);
+  }
+
+  function renderList() {
+    const rows = traces.filter(matches);
+    listEl.innerHTML = rows.map((t) => {
+      const k = kindOf(t), st = statusOf(t);
+      const stCls = st ? "st" + String(st)[0] : "";
+      const ts = (t.captured_at || "").replace("T", " ").slice(5, 19);
+      return `<div class="row ${t.seq === selected ? "sel" : ""}" data-seq="${t.seq}">
+        <span class="ts">${esc(ts)}</span>
+        <span class="badge ${k}">${k}</span>
+        <span class="summary">${summaryOf(t)}</span>
+        <span class="status ${stCls}">${esc(st)}</span>
+      </div>`;
+    }).join("");
+  }
+
+  function bodyBlock(b) {
+    if (!b) return "<pre class='payload'>(无)</pre>";
+    let content = b.content;
+    if (content == null && b.encoding === "json_truncated_omitted") {
+      content = "(大 JSON 被 tee 截断、无法脱敏 → 正文省略)";
+    } else if (typeof content === "object") {
+      content = JSON.stringify(content, null, 2);
+    }
+    const trunc = b.truncated_bytes > 0
+      ? `<div class="trunc">⚠ 截断:原始 ${b.bytes} 字节,丢弃 ${b.truncated_bytes}(encoding=${esc(b.encoding)})</div>`
+      : "";
+    return `<pre class='payload'>${esc(content)}</pre>${trunc}`;
+  }
+  function hdrTable(h) {
+    if (!h || typeof h !== "object") return "";
+    const rows = Object.keys(h).map((k) =>
+      `<tr><td class="k">${esc(k)}</td><td class="v">${esc(
+        Array.isArray(h[k]) ? h[k].join(", ") : h[k])}</td></tr>`).join("");
+    return `<table class="hdr">${rows}</table>`;
+  }
+  function seg(title, sub, inner) {
+    return `<details class="seg" open><summary><span>${esc(title)}</span><span>${esc(sub || "")}</span></summary>
+      <div class="body">${inner}</div></details>`;
+  }
+
+  function renderDetail(t) {
+    if (!t) { detailEl.innerHTML = "<div class='empty'>选择左侧一条记录查看详情</div>"; return; }
+    if (kindOf(t) !== "forward") {
+      detailEl.innerHTML = `<pre class="payload">${esc(JSON.stringify(t, null, 2))}</pre>`;
+      return;
+    }
+    const p = t.provider || {}, m = t.models || {}, ib = t.inbound || {}, ob = t.outbound || {}, rs = t.response || {};
+    const meta = `provider: ${esc(p.id)} (${esc(p.api_format)} / ${esc(p.auth_scheme)}) · `
+      + `models: ${esc(m.original)} → ${esc(m.resolved)} → ${esc(m.upstream)} · seq ${esc(t.seq)} · ${esc(t.captured_at)}`;
+    detailEl.innerHTML = `<div class="meta">${meta}</div>`
+      + seg("INBOUND · Codex 原始请求", `${esc(ib.method)} ${esc(ib.client_path || "")}${ib.client_query ? "?" + esc(ib.client_query) : ""}`,
+          hdrTable(ib.headers) + bodyBlock(ib.body))
+      + seg("OUTBOUND · 转换后发上游", esc(ob.url || ""), hdrTable(ob.headers) + bodyBlock(ob.body))
+      + seg("RESPONSE · 上游回包 (raw)", "status " + esc(rs.status), hdrTable(rs.headers) + bodyBlock(rs.body));
+  }
+
+  function add(t, prepend) {
+    if (prepend) traces.unshift(t); else traces.push(t);
+    if (traces.length > 1000) traces.length = 1000;
+  }
+
+  listEl.addEventListener("click", (e) => {
+    const row = e.target.closest(".row");
+    if (!row) return;
+    selected = Number(row.dataset.seq);
+    renderList();
+    renderDetail(traces.find((t) => t.seq === selected));
+  });
+  $("#kind").addEventListener("change", renderList);
+  $("#q").addEventListener("input", renderList);
+  $("#clear").addEventListener("click", async () => {
+    await fetch("/api/clear", { method: "POST" });
+    traces = []; selected = null; renderList(); renderDetail(null);
+  });
+
+  async function loadHistory() {
+    try {
+      const r = await fetch("/api/traces");
+      const arr = await r.json();
+      traces = arr.slice().reverse();   // 后端 oldest→newest;UI 最新在上
+      renderList();
+    } catch (e) { /* 服务未就绪,SSE 会补 */ }
+  }
+
+  function connect() {
+    const es = new EventSource("/api/stream");
+    es.onopen = () => { liveEl.classList.add("on"); liveTxt.textContent = "实时"; };
+    es.onerror = () => { liveEl.classList.remove("on"); liveTxt.textContent = "重连中…"; };
+    es.onmessage = (ev) => {
+      try { add(JSON.parse(ev.data), true); renderList(); } catch (_) {}
+    };
+    es.addEventListener("lagged", () => { loadHistory(); });  // 落后 → resync
+  }
+
+  loadHistory();
+  connect();
+})();
+</script>
+</body>
+</html>

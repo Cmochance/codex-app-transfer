@@ -47,6 +47,23 @@ pub(super) fn open_directory(path: &PathBuf) -> Result<(), String> {
         .map_err(|e| format!("cannot open log directory: {e}"))
 }
 
+/// 用系统默认浏览器打开一个 URL(`open`/`explorer`/`xdg-open` 都吃 http URL)。
+/// [MOC-169] 诊断流量查看器「打开查看器」用。
+pub(super) fn open_url(url: &str) -> Result<(), String> {
+    let mut command = if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        Command::new("explorer")
+    } else {
+        Command::new("xdg-open")
+    };
+    command
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("cannot open url: {e}"))
+}
+
 pub(crate) fn active_provider_name(config: &Value) -> String {
     let active_id = config.get("activeProvider").and_then(|v| v.as_str());
     config

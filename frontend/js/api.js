@@ -486,6 +486,19 @@
       return api('POST', '/api/proxy/logs/open-dir');
     },
 
+    // [MOC-169] 诊断流量查看器开关
+    async traceViewerStart() {
+      return api('POST', '/api/trace-viewer/start');
+    },
+
+    async traceViewerStop() {
+      return api('POST', '/api/trace-viewer/stop');
+    },
+
+    async openTraceViewer() {
+      return api('POST', '/api/trace-viewer/open');
+    },
+
     async getSettings() {
       return api('GET', '/api/settings');
     },

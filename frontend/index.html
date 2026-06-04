@@ -609,6 +609,17 @@
               <p class="settings-note" data-i18n="settings.codexStatusSectionDefaultVisibleHint">默认开启。让 Codex Desktop 输入框底部（composer footer、模型名右侧）默认显示 context 用量圆环 + tokens/s（写到 ~/.codex/.codex-global-state.json 的 show-context-window-usage atom，即主进程权威源）。Codex Desktop 0.135+（实测 26.601）把该显示收敛进 footer 且默认 false，新装/升级 user 看不到圆环，本开关让 transfer 在 Codex 启动前 ensure 为 true。改完需要重启 Codex Desktop 生效（运行时改会被内存 atom 覆盖）。关闭则相反，由 transfer ensure 为 false。</p>
             </div>
           </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.traceViewerEnabled">诊断模式 · 协议流量查看器（开发者）</strong>
+            <div>
+              <label class="switch-label only-switch"><input type="checkbox" id="traceViewerEnabled"><span class="switch-ui"></span></label>
+              <button class="btn btn-outline-light btn-sm" type="button" data-action="open-trace-viewer" id="openTraceViewerBtn" hidden>
+                <i class="bi bi-box-arrow-up-right"></i>
+                <span data-i18n="settings.openTraceViewer">打开查看器</span>
+              </button>
+              <p class="settings-note" data-i18n="settings.traceViewerEnabledHint">⚠️ 开发者诊断，默认关。开启后在本机独立端口（http://127.0.0.1:18090）实时查看 Codex↔上游 协议转发全流量（原始请求 / 转换后 / 上游回包），用于排查 adapter / 协议映射问题；也可设环境变量 CAS_DIAG_TRACE=1 启动。仅本地 loopback；credential（authorization / api_key 等）落盘前脱敏，但 prompt / 代码 / 模型回复正文会完整记录，故仅供本地排查、勿外传。关闭即停止采集与查看器。</p>
+            </div>
+          </div>
           <div class="settings-row" hidden aria-hidden="true">
             <strong data-i18n="settings.exposeAllModels">Claude 模型菜单</strong>
             <label class="switch-label only-switch"><input type="checkbox" id="exposeAllProviderModels"><span class="switch-ui"></span></label>

@@ -179,6 +179,23 @@ pub fn build_app_router(state: AdminState) -> Router {
         .route("/api/proxy/start", post(handlers::proxy::start_proxy))
         .route("/api/proxy/stop", post(handlers::proxy::stop_proxy))
         .route("/api/proxy/status", get(handlers::proxy::proxy_status))
+        // [MOC-169] 诊断流量查看器开关
+        .route(
+            "/api/trace-viewer/start",
+            post(handlers::trace_viewer::start_trace_viewer),
+        )
+        .route(
+            "/api/trace-viewer/stop",
+            post(handlers::trace_viewer::stop_trace_viewer),
+        )
+        .route(
+            "/api/trace-viewer/status",
+            get(handlers::trace_viewer::trace_viewer_status),
+        )
+        .route(
+            "/api/trace-viewer/open",
+            post(handlers::trace_viewer::open_trace_viewer),
+        )
         .route(
             "/api/system-proxy/status",
             get(handlers::proxy::system_proxy_status),

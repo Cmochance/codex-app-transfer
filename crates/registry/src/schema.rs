@@ -78,6 +78,13 @@ pub struct Settings {
     /// Codex 沙箱 shell 的联网权限, 是两套机制)。默认 `off`。
     #[serde(default = "default_web_fetch_backend")]
     pub web_fetch_backend: String,
+
+    /// 「诊断模式」开关(MOC-169):开启后启动独立端口诊断流量查看器(默认 `127.0.0.1:18090`)
+    /// 并采集 forward-trace / MCP 流量。**默认 `false`** —— 纯开发者诊断,普通用户零影响、
+    /// 仅本地 loopback;正文按结构化 credential 脱敏但 prompt/代码/回复完整落盘,故默认关。
+    /// 与 env `CAS_DIAG_TRACE` 并联(任一开即采集);持久化为真时 app 启动自启查看器。
+    #[serde(default)]
+    pub trace_viewer_enabled: bool,
 }
 
 fn default_codex_network_access() -> bool {
@@ -102,6 +109,7 @@ impl Default for Settings {
             update_url: DEFAULT_UPDATE_URL.to_owned(),
             codex_network_access: true,
             web_fetch_backend: default_web_fetch_backend(),
+            trace_viewer_enabled: false,
         }
     }
 }

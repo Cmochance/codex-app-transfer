@@ -77,6 +77,8 @@ fs2 = "0.4"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 # futures 用于 WebSocket Stream/Sink 的 split 操作
 futures = "0.3"
+# 诊断流量查看器(MOC-169)SSE:把 trace_store 的 broadcast::Receiver 适配成 axum Sse Stream
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # objc2 / objc2-foundation 不直接声明:代码只 use objc2_app_kit,这俩作为

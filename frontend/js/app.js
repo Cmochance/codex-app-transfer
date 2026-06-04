@@ -2627,6 +2627,12 @@
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#mcpCredentialsPortableStore").checked = settings.mcpCredentialsPortableStore !== false;
     $("#codexNetworkAccess").checked = settings.codexNetworkAccess !== false;
+    // [MOC-169] 诊断模式开关 + 「打开查看器」按钮(仅开启时可见)
+    if ($("#traceViewerEnabled")) {
+      const _tv = settings.traceViewerEnabled === true;
+      $("#traceViewerEnabled").checked = _tv;
+      if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !_tv;
+    }
     if ($("#webFetchBackend")) {
       const _wfb = settings.webFetchBackend || "off";
       // segmented 按钮组: 高亮当前档 + 记下"已保存值"供切换失败/取消时回退。
@@ -3177,6 +3183,7 @@
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       mcpCredentialsPortableStore: $("#mcpCredentialsPortableStore")?.checked !== false,
       codexNetworkAccess: $("#codexNetworkAccess")?.checked !== false,
+      traceViewerEnabled: $("#traceViewerEnabled")?.checked === true,
       webFetchBackend: $("#webFetchBackend")?.querySelector(".btn.active")?.dataset.webfetch || "off",
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
@@ -3792,6 +3799,16 @@
           showToast(t("toast.logDirOpened"));
         } catch (err) {
           showToast(t("toast.logDirOpenFailed"));
+        }
+      }
+
+      // [MOC-169] 在系统浏览器打开诊断流量查看器(未运行则后端先 start)
+      if (action === "open-trace-viewer") {
+        try {
+          const r = await CCApi.openTraceViewer();
+          if (r && r.success === false) showToast("打开诊断查看器失败");
+        } catch (_) {
+          showToast("打开诊断查看器失败");
         }
       }
 
@@ -8470,6 +8487,23 @@
     });
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
+    // [MOC-169] 诊断模式开关:持久化 + 运行时起/停查看器服务 + 切按钮可见性
+    $("#traceViewerEnabled")?.addEventListener("change", async () => {
+      const on = $("#traceViewerEnabled")?.checked === true;
+      if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !on;
+      await saveSettingsFromForm();
+      try {
+        if (on) {
+          const r = await CCApi.traceViewerStart();
+          showToast(r?.url ? `诊断查看器已启动 ${r.url}` : "诊断查看器已启动");
+        } else {
+          await CCApi.traceViewerStop();
+          showToast("诊断查看器已关闭");
+        }
+      } catch (_) {
+        showToast("诊断查看器操作失败");
+      }
+    });
     // MOC-144 联网抓取后端: segmented 按钮组(不用原生 <select>, 避免下拉 popup 遮挡下方文字)。
     // 回退目标 = #webFetchBackend.dataset.saved("上次成功保存值", load + 每次成功 save 后更新);
     // _webFetchSwitching 作 in-flight guard, 防 20s 下载期间重复点触发并发。
