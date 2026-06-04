@@ -482,6 +482,8 @@ impl ResponseSessionCache {
                 return Ok(0);
             };
             if migration_done(conn).map_err(|e| format!("read migration flag failed: {e}"))? {
+                // MOC-171:已迁移 → 仍补跑一次 VACUUM(若上次失败 pending);解耦重试。
+                ensure_vacuumed(conn).map_err(|e| format!("vacuum retry failed: {e}"))?;
                 return Ok(0);
             }
         }
@@ -566,26 +568,16 @@ impl ResponseSessionCache {
             );
         }
 
-        // 全部迁移完:VACUUM 压实物理文件 + 置幂等标志。
+        // 全部迁移完:置迁移完成标志 + VACUUM 压实。MOC-171:VACUUM 与 migrated flag 解耦
+        // —— migrated 先置(逻辑去重已 commit 生效,标记完成避免大表每次启动全表重扫),
+        // `ensure_vacuumed` 内 VACUUM 成功才另置 vacuumed flag;失败仅 warn,下次启动经早
+        // 返分支的 ensure_vacuumed 重试,直到成功(不再"VACUUM 失败 = 永久放弃回收")。
         let mut guard = self.db.lock().expect("session cache db mutex poisoned");
         let Some(conn) = guard.as_mut() else {
             return Ok(total);
         };
-        if let Err(e) = conn.execute_batch("VACUUM") {
-            // 逻辑去重已 commit 生效(行已 reformat、message_contents 已落),VACUUM 仅做
-            // 物理压实。失败仅 warn 不 abort —— 但后果是**物理空间未回收**,且下面置 flag
-            // 后 `migration_done` 早返、**不再重跑迁移 / 不自动重试 VACUUM**:大库(恰是
-            // 磁盘紧张、最易 VACUUM 失败的场景)需运维手动 `VACUUM` 或删库重建。解耦
-            // 重试(独立 vacuum flag,与迁移 flag 分开)留 followup。
-            log_db_warning(
-                "SESSIONS_DB_MIGRATE_VACUUM_FAILED",
-                format!(
-                    "reformat done (logical dedup live) but VACUUM failed — physical space \
-                     NOT reclaimed and will not auto-retry; run `VACUUM` manually: {e}"
-                ),
-            );
-        }
         set_migration_done(conn).map_err(|e| format!("set migration flag failed: {e}"))?;
+        ensure_vacuumed(conn).map_err(|e| format!("vacuum failed: {e}"))?;
         Ok(total)
     }
 
@@ -602,18 +594,27 @@ impl ResponseSessionCache {
         // L2 存引用而非逐轮重复整张 base64。单个 blob 外置失败留 inline(非破坏);
         // L1 内存层已存完整 inline,不受影响。纯内存模式(blobs=None)行为不变。
         // MOC-142 → MOC-168 两级外置(顺序 blob→msg):①每条消息里的大 `data:` 图 → blob
-        // 引用(FS sidecar);②每条消息整体(已含 blob 引用)→ `message_contents` 引用(同
-        // db 去重)。任一步单条失败留 inline(非破坏);L1 内存层始终存完整 inline。db
-        // 在握(早返已挡掉纯内存态),message 层用同一连接。
-        let encoded = {
-            let mut slim: Vec<Value> = messages.to_vec();
-            // 两级外置(blob→msg);跟存量迁移共用同一 helper 保证产出形态一致。
-            externalize_for_storage(conn, self.blobs.as_ref(), &mut slim);
-            serde_json::to_string(&slim)
-        };
-        let json = match encoded {
+        // 引用(FS sidecar,写盘在事务外:内容寻址、孤儿可 GC、缺失走非破坏 cache-miss);
+        // ②每条消息整体(已含 blob 引用)→ `message_contents` 引用(同 db 去重)。任一步单
+        // 条失败留 inline(非破坏);L1 内存层始终存完整 inline。
+        // **MOC-171**:②的 INSERT 与下面 `response_sessions` UPSERT 包进**同一事务**(与
+        // `migrate_existing_rows` 对称)。否则各自 autocommit:UPSERT 失败时 message_contents
+        // 已写却无行引用 → 瞬时孤儿(GC 会清但两写路径语义不一致)。tx rollback 时一起回滚。
+        let mut slim: Vec<Value> = messages.to_vec();
+        if let Some(store) = self.blobs.as_ref() {
+            for m in &mut slim {
+                store.externalize(m); // blob 外置写 FS,事务外
+            }
+        }
+        let now = unix_now();
+        let tx = conn.transaction()?;
+        message_store::externalize(&tx, &mut slim); // message_contents INSERT,事务内
+        let json = match serde_json::to_string(&slim) {
             Ok(s) => s,
             Err(e) => {
+                // **silent-failure H1**:编码失败 warn + 跳过本次写入保留 L2 原 row(L1 已
+                // save,本轮正常)。tx 未 commit,drop 即 rollback,刚 INSERT 的
+                // message_contents 一起回滚、不留孤儿。
                 log_db_warning(
                     "SESSIONS_DB_SAVE_ENCODE_FAILED",
                     format!(
@@ -624,8 +625,7 @@ impl ResponseSessionCache {
                 return Ok(());
             }
         };
-        let now = unix_now();
-        conn.execute(
+        tx.execute(
             "INSERT INTO response_sessions \
              (response_id, messages_json, created_unix, last_access_unix, access_count) \
              VALUES (?1, ?2, ?3, ?3, 0) \
@@ -634,6 +634,7 @@ impl ResponseSessionCache {
                  last_access_unix = excluded.last_access_unix",
             params![response_id, json, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -766,6 +767,12 @@ const MIGRATE_BATCH: i64 = 200;
 /// `sessions_meta` 里标记"存量内容寻址迁移已完成"的 key(幂等 guard)。
 const MIGRATION_FLAG_KEY: &str = "content_addr_migrated";
 
+/// `sessions_meta` 里标记"迁移收尾 VACUUM 物理压实已完成"的 key(MOC-171)。与
+/// `MIGRATION_FLAG_KEY` **解耦**:迁移逻辑去重完成即置 migrated(避免大表每次启动全表
+/// 重扫),但 VACUUM 失败(大库磁盘紧张最易触发)时**不**置 vacuumed → 下次启动单独补跑
+/// VACUUM(不重扫表),直到成功。
+const VACUUM_FLAG_KEY: &str = "content_addr_vacuumed";
+
 /// 两级外置(MOC-142 blob → MOC-168 message,顺序固定):把一组消息**就地**转成
 /// 入库瘦身形态 —— ①每条消息里的大 `data:` 图换成 blob 引用(FS sidecar);②每条
 /// 消息整体(已含 blob 引用)换成 `message_contents` 引用(同 db 去重)。
@@ -783,24 +790,55 @@ fn externalize_for_storage(conn: &Connection, blobs: Option<&BlobStore>, message
     message_store::externalize(conn, messages);
 }
 
-/// 读"存量迁移已完成"标志(MOC-170 幂等 guard)。
-fn migration_done(conn: &Connection) -> rusqlite::Result<bool> {
+/// 读 `sessions_meta` 里某个布尔标志("1" = 真,缺失 = 假)。
+fn meta_flag_get(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
     let v: Option<String> = conn
         .query_row(
             "SELECT value FROM sessions_meta WHERE key = ?1",
-            params![MIGRATION_FLAG_KEY],
+            params![key],
             |r| r.get::<_, String>(0),
         )
         .optional()?;
     Ok(v.as_deref() == Some("1"))
 }
 
-/// 置"存量迁移已完成"标志。
-fn set_migration_done(conn: &Connection) -> rusqlite::Result<()> {
+/// 置 `sessions_meta` 里某个布尔标志为 "1"。
+fn meta_flag_set(conn: &Connection, key: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO sessions_meta (key, value) VALUES (?1, '1')",
-        params![MIGRATION_FLAG_KEY],
+        params![key],
     )?;
+    Ok(())
+}
+
+/// 读"存量迁移已完成"标志(MOC-170 幂等 guard)。
+fn migration_done(conn: &Connection) -> rusqlite::Result<bool> {
+    meta_flag_get(conn, MIGRATION_FLAG_KEY)
+}
+
+/// 置"存量迁移已完成"标志。
+fn set_migration_done(conn: &Connection) -> rusqlite::Result<()> {
+    meta_flag_set(conn, MIGRATION_FLAG_KEY)
+}
+
+/// MOC-171:确保迁移收尾的 VACUUM 物理压实完成(幂等、可断点重试)。已 vacuumed →
+/// no-op;否则跑一次 `VACUUM`,**成功才**置 vacuumed flag,失败仅 warn 留待下次启动
+/// 重试(不阻断 —— 逻辑去重已生效,VACUUM 纯物理压实)。**VACUUM 必须在无活动事务时
+/// 调**:调用点(迁移收尾 / 早返分支)的 `conn` 此时均无活动 tx。
+fn ensure_vacuumed(conn: &Connection) -> rusqlite::Result<()> {
+    if meta_flag_get(conn, VACUUM_FLAG_KEY)? {
+        return Ok(());
+    }
+    match conn.execute_batch("VACUUM") {
+        Ok(()) => meta_flag_set(conn, VACUUM_FLAG_KEY)?,
+        Err(e) => log_db_warning(
+            "SESSIONS_DB_MIGRATE_VACUUM_FAILED",
+            format!(
+                "VACUUM failed (physical space not reclaimed); logical dedup already \
+                 live, will retry on next startup: {e}"
+            ),
+        ),
+    }
     Ok(())
 }
 
@@ -1056,8 +1094,8 @@ fn backup_blobs_dir(db_path: &Path, ts: i64) {
 /// - `SESSIONS_DB_MIGRATION_DONE` — 迁移完成(info 级,带 `migrated` 行数)
 /// - `SESSIONS_DB_MIGRATION_NOOP` — 无需迁移(已迁移 / 无旧行 / 纯内存;debug 级)
 /// - `SESSIONS_DB_MIGRATE_ROW_SKIP` — 单行 parse/encode 失败,跳过留 legacy(下次重迁)
-/// - `SESSIONS_DB_MIGRATE_VACUUM_FAILED` — reformat 完但 VACUUM 失败(物理文件没压实,
-///   非致命:逻辑去重已生效)
+/// - `SESSIONS_DB_MIGRATE_VACUUM_FAILED` — VACUUM 物理压实失败(逻辑去重已生效、非致命;
+///   MOC-171:不置 vacuumed flag,下次启动经 `ensure_vacuumed` 重试直到成功)
 /// - `SESSIONS_DB_MIGRATION_FAILED` — 迁移整体失败(未置完成标志,下次启动重试)
 /// - `SESSIONS_DB_MIGRATION_PANIC` — 迁移线程 panic 被 catch_unwind 捕获(未置标志,下次重试)
 /// - `SESSIONS_DB_MIGRATION_SPAWN_FAILED` — 迁移线程 spawn 失败(线程资源耗尽,罕见)
@@ -1850,6 +1888,76 @@ mod tests {
         assert!(
             cache.get("r_persist").is_some(),
             "持久化默认:老会话不应过期"
+        );
+    }
+
+    #[test]
+    fn migrate_sets_vacuum_flag_on_success() {
+        // MOC-171:迁移成功 → migrated + vacuumed 两个 flag 都置(VACUUM 与迁移解耦但都成功)。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        insert_legacy_row(&path, "r", &json!([{"role": "user", "content": "x"}]));
+        cache.migrate_existing_rows().unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let flag = |k: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM sessions_meta WHERE key = ?1",
+                params![k],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(flag("content_addr_migrated").as_deref(), Some("1"));
+        assert_eq!(
+            flag("content_addr_vacuumed").as_deref(),
+            Some("1"),
+            "VACUUM 成功应置 vacuumed flag"
+        );
+    }
+
+    #[test]
+    fn vacuum_retries_when_pending_after_migration() {
+        // MOC-171:模拟"迁移完成但上次 VACUUM 失败(vacuumed 缺)"→ 再调 migrate_existing_rows
+        // 应经早返分支补跑 VACUUM 并置 vacuumed(不重扫表、不重迁)。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        insert_legacy_row(&path, "r", &json!([{"role": "user", "content": "x"}]));
+        cache.migrate_existing_rows().unwrap();
+        // 手动清掉 vacuumed flag,模拟上次 VACUUM 失败 pending。
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "DELETE FROM sessions_meta WHERE key = 'content_addr_vacuumed'",
+                [],
+            )
+            .unwrap();
+        }
+        // 再调:migrated=1 早返 Ok(0),但 ensure_vacuumed 补跑 VACUUM。
+        assert_eq!(cache.migrate_existing_rows().unwrap(), 0, "已迁移早返 0");
+        let conn = Connection::open(&path).unwrap();
+        let vacuumed: Option<String> = conn
+            .query_row(
+                "SELECT value FROM sessions_meta WHERE key = 'content_addr_vacuumed'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            vacuumed.as_deref(),
+            Some("1"),
+            "VACUUM pending 应在下次调用补跑并置 flag"
         );
     }
 }
