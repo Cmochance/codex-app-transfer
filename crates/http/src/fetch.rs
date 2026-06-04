@@ -532,16 +532,44 @@ fn is_js_shell(html: &str) -> bool {
 /// (退化当短静态页放行, 拿到的空壳交模型自行判断), 优于把短静态页误升 headless。
 fn has_spa_skeleton(html: &str) -> bool {
     let lower = html.to_ascii_lowercase();
-    // 容忍双 / 单引号 (模板 / minifier 输出不一, chatgpt-codex review)。
-    let mount =
-        |m: &str| lower.contains(&format!("id=\"{m}\"")) || lower.contains(&format!("id='{m}'"));
-    let has_mount = mount("root")
-        || mount("app")
-        || mount("__next")
-        || mount("__nuxt")
+    let has_mount = id_attr_matches(&lower, "root")
+        || id_attr_matches(&lower, "app")
+        || id_attr_matches(&lower, "__next")
+        || id_attr_matches(&lower, "__nuxt")
         || lower.contains("ng-app")
         || lower.contains("data-reactroot");
     has_mount && lower.contains("<script")
+}
+
+/// `id` 属性值是否命中 `mount`。容忍 `id="x"` / `id='x'` / `id=x` 及**等号周围空格**
+/// (`id = "x"`,模板 / 手写 HTML 常见, chatgpt-codex review 第 7 轮)。边界校验:`id` 前一字符
+/// 须非 ident (避免 `grid`/`void`/`width` 误命中)、`mount` 后须是引号 / 空白 / `>` / `/`
+/// (避免 `rootxxx` 误命中)。入参须已 lowercase。
+fn id_attr_matches(lower: &str, mount: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("id") {
+        let start = from + pos;
+        from = start + 2;
+        if start > 0 {
+            let p = bytes[start - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' || p == b'-' {
+                continue;
+            }
+        }
+        let rest = lower[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
+        if let Some(after) = rest.strip_prefix(mount) {
+            if after.is_empty() || after.starts_with(['"', '\'', ' ', '>', '/']) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 粗算 HTML 去掉 `<script>`/`<style>` 块 + 所有标签后的可见非空白字符数 (启发式, char-safe,
@@ -875,6 +903,20 @@ mod tests {
                 "<html><body><div id='root'></div><script src=/b.js></script></body></html>"
             ),
             "单引号挂载点也应判 shell"
+        );
+        // 等号周围空格变体也应判 shell (chatgpt-codex 第 7 轮: 容忍 id = "root")
+        assert!(
+            is_js_shell(
+                "<html><body><div id = \"root\"></div><script src=/b.js></script></body></html>"
+            ),
+            "空格挂载点变体也应判 shell"
+        );
+        // 边界: grid / rootless 等不应被误当挂载点 (id_attr_matches 的前后边界校验)
+        assert!(
+            !is_js_shell(
+                "<html><body><div class=\"grid rootless\">x</div><script>a()</script></body></html>"
+            ),
+            "grid/rootless 不应误判为挂载点"
         );
         // 有真实长正文 → 不是 shell
         let real = format!(

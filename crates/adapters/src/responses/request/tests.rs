@@ -2395,6 +2395,84 @@ fn apply_patch_chat_path_guidance_idempotent_across_turns() {
 }
 
 #[test]
+fn web_tools_guidance_injected_when_web_fetch_registered() {
+    // 注册 web_fetch/web_search 时, first turn 注入"联网优先用工具"引导; 跨 turn 幂等(只 1 段)。
+    // **真实 wire 形态**:cat-webfetch MCP 工具是 namespace 包裹(forward-trace 实证),检测器必须
+    // 递归进内层才能匹配 —— 顶层 function fixture 测不出这个(原测试的漏洞)。
+    with_user_language("en", || {
+        let one_turn = json!({
+            "input": [{"type": "message", "role": "user", "content": "find chatgpt pricing"}],
+            "instructions": "You are helpful.",
+            "tools": [{"type": "namespace", "name": "mcp__cat_webfetch", "tools": [
+                {"type": "function", "name": "web_fetch", "description": "fetch a url"},
+                {"type": "function", "name": "web_search", "description": "search"}
+            ]}]
+        });
+        for _ in 0..3 {
+            let out = convert(one_turn.clone());
+            let count = out["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap_or_default())
+                .filter(|c| c.contains("outbound network here is restricted"))
+                .count();
+            assert_eq!(count, 1, "注册 web 工具时每次 convert 仅注入一次引导");
+        }
+    });
+}
+
+#[test]
+fn no_web_tools_guidance_without_web_tools() {
+    // 没注册 web_fetch/web_search 时不注入(避免干扰纯本地任务)。
+    with_user_language("en", || {
+        let out = convert(json!({
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "instructions": "You are helpful.",
+            "tools": [{"type": "function", "name": "some_other_tool", "description": "x"}]
+        }));
+        let injected = out["messages"].as_array().unwrap().iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("outbound network here is restricted")
+        });
+        assert!(!injected, "无 web 工具时不应注入引导");
+    });
+}
+
+#[test]
+fn web_tools_guidance_skipped_when_previous_response_id_set() {
+    // 后续 turn(previous_response_id 非空)不再注入 —— history 经 session cache 已含上轮注入,
+    // 再注入会逐 turn 堆积(同 apply_patch turn-gating,共享 is_first_turn gate)。
+    with_user_language("en", || {
+        let out = convert(json!({
+            "input": [{"type": "message", "role": "user", "content": "another query"}],
+            "instructions": "You are helpful.",
+            "previous_response_id": "resp_prior_web",
+            "tools": [{"type": "namespace", "name": "mcp__cat_webfetch", "tools": [
+                {"type": "function", "name": "web_search", "description": "search"}
+            ]}]
+        }));
+        let count = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("outbound network here is restricted")
+            })
+            .count();
+        assert_eq!(
+            count, 0,
+            "后续 turn(previous_response_id 非空)不应再注入引导(history 已含)"
+        );
+    });
+}
+
+#[test]
 fn custom_tool_call_input_item_lowered_to_assistant_tool_calls() {
     // 回归保护(issue #235):turn N+1 Codex CLI 回放上一轮的
     // `ResponseItem::CustomToolCall { name, input, call_id }`,我们必须把它
