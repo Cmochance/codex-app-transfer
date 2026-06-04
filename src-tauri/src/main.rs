@@ -134,6 +134,12 @@ fn main() {
                     }
                 }
             });
+
+            // MOC-170:sessions.db 存量一次性迁移(旧 inline 大行 → 内容寻址引用,
+            // 回收历史膨胀)。独立 std 线程后台静默跑,幂等(标志位),失败下次启动
+            // 重试 —— fire-and-forget,不阻塞 startup,不在 tokio worker 上跑阻塞 IO。
+            codex_app_transfer_adapters::responses::session::start_background_session_migration();
+
             // #MOC-54:保留 JoinHandle,让下面的残留扫描能 await auto_apply
             // 真正跑完(确定性),而不是用固定 sleep 猜它有没有落盘。
             let auto_apply_handle = tauri::async_runtime::spawn(async move {
