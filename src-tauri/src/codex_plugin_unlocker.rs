@@ -557,6 +557,11 @@ async fn connect_and_monitor(
                             if resp.method.as_deref() == Some("Page.loadEventFired") {
                                 tracing::info!("[PluginUnlock] page refreshed, reinjecting...");
                                 inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
+                                // [MOC-169 P2] inject 的 await_cdp_response 会丢弃非目标帧——若在途
+                                // drain 响应正好被丢,pending_drain_id 会永不清、drain 永久 skip。
+                                // 重注入后强制清掉(那一批 spliced 条目随 reload 丢失,可接受),
+                                // 让下个 tick 重新 drain。
+                                pending_drain_id = None;
                             }
                         }
                     }
@@ -601,6 +606,9 @@ async fn connect_and_monitor(
                         }
                         tracing::info!("[PluginUnlock] manual reinject requested (same instance)");
                         inject_unlock_script(&mut write, &mut read, msg_id_counter, status).await?;
+                        // [MOC-169 P2] 同 loadEventFired:reinject 的 await_cdp_response 可能吞掉在途
+                        // drain 响应 → 清 pending_drain_id 防 drain 永久卡死。
+                        pending_drain_id = None;
                     }
                     Some(ServiceCommand::Stop) => {
                         // [MOC-100 P2-1] 关键:返回 Stop 而非 Ok(()),否则 run_daemon
