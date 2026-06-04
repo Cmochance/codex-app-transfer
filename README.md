@@ -192,7 +192,9 @@ scripts/install-hooks.sh        # = git config core.hooksPath .githooks
 CAS_DIAG_TRACE=1 cargo tauri dev      # 或给打包后的 app 设此环境变量再启动
 ```
 
-**默认关**,普通用户零影响、零开销(不设此环境变量时,连请求体都不会克隆,转发路径只多一次 atomic 判定)。credential 类 header 与 JSON body 字段(`authorization` / `api_key` / `*_token` 等)落盘前脱敏成 `***`;但请求/响应**正文**(prompt、代码、模型回复)会完整落盘 —— 这是协议诊断所必需,所以它只在本地、仅 loopback、默认关,绝不随 release 给终端用户开。字段含义、保留策略(按天保留 7 份)、脱敏边界详见 [`docs/forward-trace.md`](docs/forward-trace.md)。
+**默认关**,普通用户零影响、零开销(不设此环境变量时,连请求体都不会克隆,转发路径只多一次 atomic 判定)。credential 类 header 与 JSON body 字段(`authorization` / `api_key` / `*_token` 等)落盘前脱敏成 `***`;但请求/响应**正文**(prompt、代码、模型回复)会完整落盘 —— 这是协议诊断所必需,所以它只在本地、仅 loopback、默认关,绝不随 release 给终端用户开。jsonl 字段含义、保留策略(按天保留 7 份)、脱敏边界见 `crates/proxy/src/diagnostics.rs`(`build_forward_trace_value` / `redact_body` / `redact_mcp_value` 注释)。
+
+除了 jsonl,还可用**网页查看器**实时看:开启方式有两种 —— ① 上面的环境变量;② **设置页「诊断模式」开关**(运行时开/关,无需重启)。开启后在独立端口 **`http://127.0.0.1:18090`** 起一个只读 SSE 网页查看器(设置页「打开查看器」按钮直达),实时展示上述 forward-trace,并额外采集 Codex Desktop 的 **MCP / OAuth 流量**(经插件解锁器页内 hook,默认关时根本不注入)。同样脱敏 + 仅 loopback + 默认关。
 
 ### 想改 UI 样式怎么改
 

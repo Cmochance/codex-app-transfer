@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -151,7 +151,7 @@ fn bytes_payload_with_len(bytes: &[u8], true_len: usize, max_bytes: usize) -> Va
 // ⚠️ 定位:这是**开发者诊断**,不是「脱敏后可安全外泄」的功能。forward-trace 的价值
 // 就在抓完整 prompt / 代码 / 模型回复,这些**本身敏感且不脱敏**(脱了无诊断价值)。
 // 下面的脱敏只挡**结构化 credential**(header token / JSON 里的 api_key 等),正文照留。
-// 所以它默认关 + 仅 loopback + 仅本地,绝不随 release 给终端用户开。见 docs/forward-trace.md。
+// 所以它默认关 + 仅 loopback + 仅本地,绝不随 release 给终端用户开。见 README「协议转发诊断」节。
 // ───────────────────────────────────────────────────────────────────────────
 
 /// 运行时开关(app 内「诊断模式」UI toggle / 持久化 settings 自启时置位),与 env 并联。
@@ -356,6 +356,32 @@ fn is_credential_key(key: &str) -> bool {
         || norm.ends_with("apikey")
 }
 
+/// 脱敏一条 MCP-trace 记录(整个 JSON 对象,MOC-169 增量 4)。① 递归按 [`is_credential_key`]
+/// 清洗所有 credential 键(覆盖 `req_headers`/`resp_headers` 里的 authorization/api_key 等);
+/// ② body 类字符串字段(`body`/`req_body`/`resp_body`/`data`)若为完整 JSON 则解析后键级清洗
+/// 再回写(覆盖 oauth 回包 body 里的 `access_token`/`refresh_token` 等)。MCP/JSON-RPC/oauth
+/// body 多为 JSON,故覆盖主要 token;**非 JSON / 被页内截断的 body 不解析**(同 forward-trace
+/// 非 JSON body 取舍)—— MCP 采集默认关 + 仅 loopback + 仅本地,勿外传(见 README「协议转发诊断」节)。
+pub fn redact_mcp_value(v: &mut Value) {
+    redact_json_credentials(v);
+    if let Some(obj) = v.as_object_mut() {
+        for key in ["body", "req_body", "resp_body", "data"] {
+            let scrubbed = match obj.get(key) {
+                Some(Value::String(s)) => {
+                    serde_json::from_str::<Value>(s).ok().map(|mut parsed| {
+                        redact_json_credentials(&mut parsed);
+                        serde_json::to_string(&parsed).unwrap_or_else(|_| "***".to_string())
+                    })
+                }
+                _ => None,
+            };
+            if let Some(scrubbed) = scrubbed {
+                obj.insert(key.to_string(), Value::String(scrubbed));
+            }
+        }
+    }
+}
+
 fn header_content_type(h: &reqwest::header::HeaderMap) -> Option<&str> {
     h.get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -412,8 +438,8 @@ pub(crate) fn build_forward_trace_value(input: &ForwardTraceInput, seq: u64) -> 
 /// 调用方须先用 [`forward_trace_enabled`] gate。返回 jsonl 路径(写盘失败 / 无 home 返
 /// `None`)供调用方判定「开了诊断却写不出」。ring/broadcast 是 best-effort,不影响返回值。
 pub fn write_forward_trace_jsonl(input: &ForwardTraceInput) -> Option<PathBuf> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    // 与 MCP-trace 共用全局单调 seq(viewer 行主键全局唯一)。
+    let seq = crate::trace_store::next_seq();
     let value = build_forward_trace_value(input, seq);
     crate::trace_store::trace_store().push(crate::trace_store::TraceKind::Forward, seq, value)
 }
@@ -454,6 +480,32 @@ pub(crate) fn trim_old_files(dir: &Path, keep: usize, ext: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_mcp_value_cleanses_headers_and_oauth_body() {
+        // 模拟一条 MCP/oauth fetch 记录:headers 带 authorization,resp_body 是 oauth token JSON
+        let mut v = json!({
+            "kind": "fetch",
+            "url": "https://auth.example.com/oauth/token",
+            "req_headers": {"authorization": "Bearer SECRET", "content-type": "application/json"},
+            "resp_body": "{\"access_token\":\"at-LEAK\",\"refresh_token\":\"rt-LEAK\",\"expires_in\":3600}",
+            "max_tokens": 8
+        });
+        redact_mcp_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        // header credential 脱敏
+        assert_eq!(v["req_headers"]["authorization"], "***");
+        assert_eq!(
+            v["req_headers"]["content-type"], "application/json",
+            "协议头保留"
+        );
+        // body 里的 oauth token 脱敏(JSON 解析后 key 清洗)
+        assert!(!s.contains("at-LEAK"), "access_token 泄露: {s}");
+        assert!(!s.contains("rt-LEAK"), "refresh_token 泄露");
+        // 诊断字段不误伤
+        assert_eq!(v["max_tokens"], 8);
+        assert_eq!(v["url"], "https://auth.example.com/oauth/token");
+    }
 
     #[test]
     fn bytes_payload_preserves_utf8_and_binary() {

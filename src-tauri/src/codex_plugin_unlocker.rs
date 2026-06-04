@@ -505,6 +505,15 @@ async fn connect_and_monitor(
     // 寄存到 `pending_heartbeat_id`,主 read 分支统一匹配并处理响应。
     let mut pending_heartbeat_id: Option<u64> = None;
 
+    // [MOC-169] MCP-trace drain:每 2s drain 页内 `window.__codexMcpTrace` 队列。fire-and-forget
+    // (响应在下面 read 分支匹配 `pending_drain_id` 处理,严守"read 只在 select! read 分支消费"
+    // 不变量,防 PR#255 BUG-0002)。interval 用 Skip 防慢响应时 backlog 积压;仅诊断 gate 开时
+    // 真正发 drain(关时 recorder 根本没注入、`window.__codexMcpTrace` 不存在,这里也直接 skip)。
+    let mut pending_drain_id: Option<u64> = None;
+    let mut mcp_drain_interval = tokio::time::interval(Duration::from_secs(2));
+    mcp_drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    mcp_drain_interval.tick().await; // 跳过首次立即触发
+
     loop {
         tokio::select! {
             // 监听 WebSocket 消息(唯一的 read 消费者)
@@ -525,6 +534,22 @@ async fn connect_and_monitor(
                                     .unwrap_or(false);
                                 if unlocked {
                                     set_status(status, UnlockStatus::Injected).await;
+                                }
+                                continue;
+                            }
+                            // [MOC-169] MCP-trace drain 响应 → 逐条脱敏后推统一 store
+                            if pending_drain_id.is_some() && resp.id == pending_drain_id {
+                                pending_drain_id = None;
+                                if let Some(arr) = resp
+                                    .result
+                                    .as_ref()
+                                    .and_then(|r| r.get("result"))
+                                    .and_then(|r| r.get("value"))
+                                    .and_then(|v| v.as_array())
+                                {
+                                    for entry in arr {
+                                        record_mcp_trace_entry(entry);
+                                    }
                                 }
                                 continue;
                             }
@@ -614,6 +639,29 @@ async fn connect_and_monitor(
                     break;
                 }
                 pending_heartbeat_id = Some(ping_id);
+            }
+
+            // [MOC-169] MCP-trace drain(fire-and-forget,gated)。仅诊断开 + 上一轮已回包才发;
+            // 响应在 read 分支按 pending_drain_id 处理。drain 关时无任何 CDP 往返。
+            _ = mcp_drain_interval.tick() => {
+                if pending_drain_id.is_some()
+                    || !codex_app_transfer_proxy::diagnostics::forward_trace_enabled()
+                {
+                    continue;
+                }
+                let (drain_msg, drain_id) = make_cdp_msg(
+                    msg_id_counter,
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": "(window.__codexMcpTrace && window.__codexMcpTrace.splice(0)) || []",
+                        "returnByValue": true
+                    }),
+                );
+                if let Err(e) = write.send(WsMessage::Text(drain_msg)).await {
+                    tracing::warn!("[McpTrace] drain send failed: {}", e);
+                    break;
+                }
+                pending_drain_id = Some(drain_id);
             }
         }
     }
@@ -896,6 +944,22 @@ async fn inject_unlock_script(
         return Err(msg.into());
     }
 
+    // [MOC-169] 诊断 gate 开时注入 MCP 流量录制器(fire-and-forget:不追响应,其响应帧后续在
+    // select! read 分支按 id 不匹配被忽略)。**关时根本不注入** → 页内 `window.__codexMcpTrace`
+    // 不存在、对 Codex Desktop 零开销(默认关)。录制器 IIFE 幂等(`__codexMcpTraceInit` 守卫),
+    // reinject / reload 不重复 wrap fetch/WebSocket。运行时刚开启诊断的需 Codex 页面下次
+    // reload / reinject 才注入录制器(forward-trace 立即生效,MCP 采集滞后一个 reload)。
+    if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() {
+        let (rec_msg, _rec_id) = make_cdp_msg(
+            msg_id_counter,
+            "Runtime.evaluate",
+            json!({ "expression": MCP_RECORDER_JS, "returnByValue": true }),
+        );
+        if let Err(e) = write.send(WsMessage::Text(rec_msg)).await {
+            tracing::warn!("[McpTrace] recorder inject send failed: {}", e);
+        }
+    }
+
     // 脚本返回 `{ ok, reason, error? }`,按 reason 分流:
     // - unlocked: 成功,状态 Injected
     // - no_plugin_button: DOM 尚未渲染(未登录/SPA mount 中),保持 Connected
@@ -953,6 +1017,152 @@ async fn inject_unlock_script(
         }
     }
 }
+
+/// [MOC-169] 把一条页内抓到的 MCP 流量条目脱敏后推入统一 trace store(viewer 的 `kind:mcp`)。
+/// 套统一外壳(`trace_kind:"mcp_traffic"` + 全局唯一 `seq` + `captured_at` 沿用页内 `ts`),
+/// 经 `redact_mcp_value` 脱敏(headers credential 键 + body JSON 里的 token),再 push。
+fn record_mcp_trace_entry(raw: &serde_json::Value) {
+    let seq = codex_app_transfer_proxy::trace_store::next_seq();
+    let mut value = raw.clone();
+    if let Some(obj) = value.as_object_mut() {
+        let ts = obj.get("ts").and_then(|v| v.as_str()).map(str::to_owned);
+        obj.insert(
+            "trace_kind".to_owned(),
+            serde_json::Value::String("mcp_traffic".to_owned()),
+        );
+        obj.insert("seq".to_owned(), serde_json::json!(seq));
+        if let Some(ts) = ts {
+            obj.insert("captured_at".to_owned(), serde_json::Value::String(ts));
+        }
+    }
+    codex_app_transfer_proxy::diagnostics::redact_mcp_value(&mut value);
+    let _ = codex_app_transfer_proxy::trace_store().push(
+        codex_app_transfer_proxy::TraceKind::Mcp,
+        seq,
+        value,
+    );
+}
+
+/// [MOC-169] 页内 MCP 流量录制器(诊断 gate 开时注入)。wrap `fetch` / `WebSocket`,按
+/// `PATTERN`(mcp/linear/oauth/json-rpc/sse 等)筛选,push 到页内 `window.__codexMcpTrace`
+/// 队列(ring cap `MAX_QUEUE`,body 截断 `MAX_BODY`);daemon 每 2s drain。IIFE 幂等
+/// (`__codexMcpTraceInit` 守卫),reinject 不重复 wrap。
+const MCP_RECORDER_JS: &str = r#"
+(function installMcpTraceRecorder() {
+    if (window.__codexMcpTraceInit) return;
+    window.__codexMcpTraceInit = true;
+    window.__codexMcpTrace = [];
+    const PATTERN = /mcp|linear|oauth|authorize|callback|tools\/list|resources\/list|initialize|json[_-]?rpc|sse/i;
+    const MAX_BODY = 65536;
+    const MAX_QUEUE = 5000;
+    function shouldCapture(url, probe) {
+        if (PATTERN.test(String(url || ''))) return true;
+        if (probe && typeof probe === 'string' && PATTERN.test(probe.slice(0, 2048))) return true;
+        return false;
+    }
+    function truncate(s) {
+        if (s == null) return null;
+        const str = typeof s === 'string' ? s : String(s);
+        return str.length > MAX_BODY
+            ? str.slice(0, MAX_BODY) + '...<truncated ' + (str.length - MAX_BODY) + ' bytes>'
+            : str;
+    }
+    function push(entry) {
+        window.__codexMcpTrace.push(Object.assign({ ts: new Date().toISOString() }, entry));
+        while (window.__codexMcpTrace.length > MAX_QUEUE) window.__codexMcpTrace.shift();
+    }
+    function headersToObj(h) {
+        const out = {};
+        try {
+            if (h && typeof h.forEach === 'function') h.forEach(function (v, k) { out[k] = v; });
+            else if (h && typeof h === 'object') Object.keys(h).forEach(function (k) { out[k] = String(h[k]); });
+        } catch (_) {}
+        return out;
+    }
+    const origFetch = window.fetch;
+    window.fetch = async function (input, init) {
+        const url = typeof input === 'string' ? input : ((input && input.url) || String(input));
+        const method = (init && init.method) || (typeof input === 'object' && input && input.method) || 'GET';
+        let reqHeaders = {};
+        try {
+            if (init && init.headers) reqHeaders = headersToObj(new Headers(init.headers));
+            else if (typeof input === 'object' && input && input.headers) reqHeaders = headersToObj(input.headers);
+        } catch (_) {}
+        let reqBody = null;
+        if (init && init.body != null) {
+            try {
+                reqBody = typeof init.body === 'string'
+                    ? init.body
+                    : '<' + (init.body && init.body.constructor && init.body.constructor.name || 'unknown') + '>';
+            } catch (_) {}
+        }
+        const capture = shouldCapture(url, reqBody);
+        const startedAt = Date.now();
+        try {
+            const resp = await origFetch.apply(this, arguments);
+            if (capture) {
+                let respBody = null;
+                try { respBody = await resp.clone().text(); } catch (_) {}
+                push({
+                    kind: 'fetch', url: String(url), method: String(method),
+                    req_headers: reqHeaders, req_body: truncate(reqBody),
+                    resp_status: resp.status, resp_headers: headersToObj(resp.headers),
+                    resp_body: truncate(respBody), duration_ms: Date.now() - startedAt,
+                });
+            }
+            return resp;
+        } catch (e) {
+            if (capture) {
+                push({
+                    kind: 'fetch_error', url: String(url), method: String(method),
+                    req_headers: reqHeaders, req_body: truncate(reqBody),
+                    error: String(e && e.message || e), duration_ms: Date.now() - startedAt,
+                });
+            }
+            throw e;
+        }
+    };
+    const OrigWS = window.WebSocket;
+    function PatchedWS(url, protocols) {
+        const ws = protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
+        if (shouldCapture(url, null)) {
+            push({ kind: 'ws_open', url: String(url), protocols: protocols || null });
+            const origSend = ws.send.bind(ws);
+            ws.send = function (data) {
+                let payload;
+                try {
+                    payload = typeof data === 'string'
+                        ? data
+                        : '<binary ' + ((data && (data.byteLength || data.size)) || 0) + 'b>';
+                } catch (_) { payload = '<unserializable>'; }
+                push({ kind: 'ws_send', url: String(url), data: truncate(payload) });
+                return origSend(data);
+            };
+            ws.addEventListener('message', function (e) {
+                let payload;
+                try {
+                    payload = typeof e.data === 'string'
+                        ? e.data
+                        : '<binary ' + ((e.data && (e.data.byteLength || e.data.size)) || 0) + 'b>';
+                } catch (_) { payload = '<unserializable>'; }
+                push({ kind: 'ws_recv', url: String(url), data: truncate(payload) });
+            });
+            ws.addEventListener('close', function (e) {
+                push({ kind: 'ws_close', url: String(url), code: e.code, reason: e.reason });
+            });
+            ws.addEventListener('error', function () {
+                push({ kind: 'ws_error', url: String(url) });
+            });
+        }
+        return ws;
+    }
+    PatchedWS.prototype = OrigWS.prototype;
+    PatchedWS.CONNECTING = 0; PatchedWS.OPEN = 1; PatchedWS.CLOSING = 2; PatchedWS.CLOSED = 3;
+    window.WebSocket = PatchedWS;
+    push({ kind: 'recorder_installed', user_agent: navigator.userAgent });
+    console.log('[CodexMcpTrace] recorder installed at ' + new Date().toISOString());
+})()
+"#;
 
 /// 注入脚本返回值的分类。
 ///

@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::Local;
@@ -135,6 +135,13 @@ impl TraceStore {
 pub fn trace_store() -> &'static TraceStore {
     static STORE: OnceLock<TraceStore> = OnceLock::new();
     STORE.get_or_init(TraceStore::new)
+}
+
+/// 全 store **共享**的单调序号(forward-trace 与 MCP-trace 共用),保证 viewer 里所有记录
+/// 的 `seq` 全局唯一——viewer 按 `seq` 做行主键,forward/mcp 各自计数会撞键选错行。
+pub fn next_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
