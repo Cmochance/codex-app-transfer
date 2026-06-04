@@ -291,7 +291,13 @@ async fn handle_web_fetch_call(
             Ok(summary) => tool_ok(id, &truncate(&summary, MAX_CONTENT_CHARS)),
             Err(e) => {
                 eprintln!("[cat-webfetch] 网页摘要未生成, 回退原文: {e}");
-                let note = format!("(注: 网页摘要未生成({e});以下为抓取到的网页正文原文。)\n\n");
+                // 醒目 + 注明"非摘要" + actionable:回退原文(isError=false)只靠这段前缀区分,
+                // 否则模型可能把整页原文当成摘要直接采纳(silent-failure-hunter F3)。
+                let note = format!(
+                    "⚠️ 网页摘要未生成({e})—— 以下是抓取到的**网页正文原文(非摘要, 请勿直接当作答案)**。\
+                     若反复如此, 请检查该 provider 的「网页摘要模型」/ apiFormat(仅 openai_chat 支持)/ \
+                     本地代理是否在线。\n\n"
+                );
                 tool_ok(id, &truncate(&format!("{note}{body}"), MAX_CONTENT_CHARS))
             }
         },
@@ -446,13 +452,16 @@ async fn summarize(content: &str, prompt: &str) -> Result<String, String> {
         ));
     }
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("摘要响应非 JSON: {e}"))?;
-    let out = v
+    let raw = v
         .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|t| t.as_str())
         .ok_or_else(|| "摘要响应缺 choices[0].message.content".to_string())?;
+    // 剥掉 reasoning 模型内联的 <think>…</think> 思维链(MOC-152):否则整段 CoT 当摘要
+    // 返给 Codex = 噪声 + 浪费 token。剥后为空则保留原文(不丢内容)。
+    let out = strip_think(raw);
     if out.trim().is_empty() {
         return Err("摘要模型返回空内容".to_string());
     }
@@ -464,6 +473,37 @@ async fn summarize(content: &str, prompt: &str) -> Result<String, String> {
         ))
     } else {
         Ok(out.to_string())
+    }
+}
+
+/// 剥掉 reasoning 模型内联在 content 里的 `<think>…</think>` 思维链(可能多段)。仅处理成对
+/// 标签;遇未闭合 `<think>` 保守保留其后原文(避免误删答案)。剥后整体为空 → 返回原文(不丢
+/// 内容)。注:多数 OpenAI-compat 模型把推理放 `reasoning_content` 另字段、content 已干净,
+/// 此函数只兜底"把 CoT 内联进 content"的模型(实测某总结模型如此)。
+fn strip_think(s: &str) -> String {
+    if !s.contains("<think>") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</think>") {
+            Some(rel_end) => rest = &rest[start + rel_end + "</think>".len()..],
+            None => {
+                // 未闭合: 保守保留剩余原文。
+                out.push_str(&rest[start..]);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        s.to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -899,5 +939,25 @@ mod tests {
         assert_eq!(rpc["jsonrpc"], "2.0");
         assert_eq!(rpc["id"], 3);
         assert_eq!(rpc["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn strip_think_removes_inline_reasoning() {
+        // 典型: <think>…</think> 后接答案
+        assert_eq!(
+            strip_think("<think>盘算一下\n各种推理</think>\n# 答案\n要点 A"),
+            "# 答案\n要点 A"
+        );
+        // 多段 think
+        assert_eq!(strip_think("a<think>x</think>b<think>y</think>c"), "abc");
+        // 无 think 原样(trim)
+        assert_eq!(strip_think("纯答案"), "纯答案");
+        // 未闭合 <think> 保守保留(不误删)
+        assert!(strip_think("正文<think>未闭合的推理").contains("未闭合的推理"));
+        // 剥后为空 → 返回原文(不丢内容)
+        assert_eq!(
+            strip_think("<think>只有思维链</think>"),
+            "<think>只有思维链</think>"
+        );
     }
 }
