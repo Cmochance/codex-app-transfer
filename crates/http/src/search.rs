@@ -17,8 +17,8 @@
 //! `//duckduckgo.com/l/?uddg=<urlencoded 真实 URL>&rut=...` → 解码 `uddg` 参数拿真实落地 URL。
 //! DDG 把广告也塞进 `.result__a`(解码后是 `duckduckgo.com/y.js?ad_provider=…` 跳转)→ 过滤。
 //!
-//! 上游参考: `duckduckgo_search`(py, `.result__a`/`.result__snippet`/uddg 解码)、
-//! `h2m-search`(rust, anti-bot 挑战检测)。
+//! 上游参考: `duckduckgo_search`(py, `.result__a`/`.result__snippet`/uddg 解码模式)。
+//! anomaly 页检测 / 广告过滤按本项目 spike 实测自行实现。
 
 use dom_query::Document;
 use thiserror::Error;

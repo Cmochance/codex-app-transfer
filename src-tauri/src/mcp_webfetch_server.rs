@@ -321,8 +321,10 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
 }
 
 /// 处理 `web_search` tools/call: 走 DDG(headless)搜索, 返回结构化结果列表给模型。
-/// **web_search 不读 webFetchBackend 档位** —— DDG 必须 headless(纯 HTTP 被 202 反爬拦,
-/// spike 实测 wreq 6 变体全灭, MOC-12), 故内部固定 headless, 与 web_fetch 的档位无关。
+/// **要求 webFetchBackend == headless 档**(chatgpt-codex review #386): web_search 必须 headless
+/// (DDG 纯 HTTP 被 202 反爬拦, spike 实测 wreq 6 变体全灭, MOC-12), 故 ① 尊重 off(用户运行期
+/// 关联网即拒, 与 web_fetch 每次 re-read backend 的 runtime guard 对齐)② 不在 curl/wreq 档静默
+/// 后台下载 ~86MB chrome-headless-shell(那两档没走过 headless 的 UI consent 下载流程)。
 async fn handle_web_search_call(
     id: Value,
     query: Option<String>,
@@ -332,6 +334,33 @@ async fn handle_web_search_call(
         Some(q) if !q.is_empty() => q,
         _ => return tool_error(id, "缺少必填参数 query(搜索关键词 / 问题)"),
     };
+    // web_search 必须 headless → 要求 headless 档: off 拒(尊重关闭), curl/wreq 拒 + 引导切档
+    // (避免静默下载 Chrome), 仅 headless 档放行(其 Chrome 已走过 UI consent 下载)。
+    match current_backend() {
+        Ok(Some(WebFetchBackend::Headless)) => {}
+        Ok(Some(other)) => {
+            return tool_error(
+                id,
+                &format!(
+                    "web_search 需要 headless 档(DDG 反爬只有真浏览器能过)。当前是 {} 档 —— 请在 \
+                     codex-app-transfer 设置 → 内置联网抓取工具 选 headless(首次会确认下载 Chrome)再用。",
+                    other.as_str()
+                ),
+            )
+        }
+        Ok(None) => {
+            return tool_error(
+                id,
+                "联网抓取工具已关闭。web_search 需在 codex-app-transfer 设置 → 内置联网抓取工具 选 headless 后使用。",
+            )
+        }
+        Err(e) => {
+            return tool_error(
+                id,
+                &format!("读取联网设置失败: {e}(请检查 ~/.codex-app-transfer/config.json)"),
+            )
+        }
+    }
     let max = max_results.unwrap_or(codex_app_transfer_http::search::DEFAULT_MAX_RESULTS);
     match codex_app_transfer_http::web_search(&query, max).await {
         Ok(results) => tool_ok(
