@@ -94,11 +94,9 @@ fn main() {
             }
 
             // [MOC-169] 诊断流量查看器:env `CAS_DIAG_TRACE` 或持久化「诊断模式」开关任一开
-            // 时随 app 自启。默认关 → 不启、零开销。
-            // **运行时 gate 仅在 start 成功后置位**(codex-connector P1,同 admin start handler):
-            // 否则 18090 被占致 start 失败时,settings 路径会残留 gate 为开 → 进程继续写
-            // forward/MCP 诊断(含完整 prompt/代码/回复)而 viewer 没起。env `CAS_DIAG_TRACE`
-            // 路径不受影响(forward_trace_enabled() 里 env 项恒真,用户本就要采集)。
+            // 时随 app 自启。默认关 → 不启、零开销。运行时采集 gate 由 `vm.start`/`stop_silent`
+            // 在 start_lock 内与 viewer 生命周期原子绑定(成功才开 gate、失败不开 → 无残留),
+            // 这里不再单独动 gate。env `CAS_DIAG_TRACE` 项在 forward_trace_enabled() 里恒真、独立。
             if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() || trace_viewer_persisted
             {
                 let vm = app
@@ -106,19 +104,13 @@ fn main() {
                     .inner()
                     .clone();
                 match vm.start(trace_viewer::DEFAULT_TRACE_VIEWER_PORT) {
-                    Ok(addr) => {
-                        codex_app_transfer_proxy::diagnostics::set_forward_trace_enabled(true);
-                        codex_app_transfer_proxy::proxy_telemetry().logs.add(
-                            "INFO",
-                            format!("[trace-viewer] 诊断流量查看器已启动 http://{addr}"),
-                        );
-                    }
-                    Err(e) => {
-                        codex_app_transfer_proxy::diagnostics::set_forward_trace_enabled(false);
-                        codex_app_transfer_proxy::proxy_telemetry()
-                            .logs
-                            .add("WARN", format!("[trace-viewer] 启动失败: {e}"));
-                    }
+                    Ok(addr) => codex_app_transfer_proxy::proxy_telemetry().logs.add(
+                        "INFO",
+                        format!("[trace-viewer] 诊断流量查看器已启动 http://{addr}"),
+                    ),
+                    Err(e) => codex_app_transfer_proxy::proxy_telemetry()
+                        .logs
+                        .add("WARN", format!("[trace-viewer] 启动失败: {e}")),
                 }
             }
 

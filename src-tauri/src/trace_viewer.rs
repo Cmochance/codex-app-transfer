@@ -19,6 +19,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, Json};
 use axum::routing::{get, post};
 use axum::Router;
+use codex_app_transfer_proxy::diagnostics::set_forward_trace_enabled;
 use codex_app_transfer_proxy::trace_store;
 use futures::Stream;
 use futures::StreamExt;
@@ -60,6 +61,7 @@ impl TraceViewerManager {
         {
             let guard = self.handle.lock().unwrap();
             if let Some(h) = guard.as_ref() {
+                set_forward_trace_enabled(true);
                 return Ok(h.addr);
             }
         }
@@ -111,14 +113,22 @@ impl TraceViewerManager {
         let mut guard = self.handle.lock().unwrap();
         if guard.is_some() {
             runtime.shutdown_background();
+            set_forward_trace_enabled(true);
             return Ok(guard.as_ref().unwrap().addr);
         }
         *guard = Some(ViewerHandle { addr, runtime });
+        // gate 仅在 viewer 确认运行后开(start 失败不设 → 无残留,满足 P1);与 stop 同在
+        // start_lock 内设置,使「gate + viewer」原子一致、按锁顺序串行(并发 on/off 最后一次胜)。
+        set_forward_trace_enabled(true);
         Ok(addr)
     }
 
-    /// 静默 stop:app exit / 异常路径用,只尽力关。
+    /// 静默 stop:app exit / 诊断关 / 异常路径。**与 start 同走 start_lock 串行化**:并发
+    /// 的 in-flight start(还在 bootstrap bind)会先完成(装 handle + gate on),stop 再拿锁
+    /// 关掉它 + gate off,避免 stop 撞 handle==None 空跑、留 orphan viewer(codex-connector)。
     pub fn stop_silent(&self) {
+        let _start_guard = self.start_lock.lock().unwrap();
+        set_forward_trace_enabled(false);
         let mut guard = self.handle.lock().unwrap();
         if let Some(h) = guard.take() {
             h.runtime.shutdown_background();

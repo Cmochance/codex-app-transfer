@@ -5,7 +5,6 @@
 //! 启动自启在 `main.rs` setup 里按持久化值处理。
 
 use axum::{extract::State, response::IntoResponse, Json};
-use codex_app_transfer_proxy::diagnostics::set_forward_trace_enabled;
 use serde_json::json;
 
 use super::super::state::AdminState;
@@ -16,32 +15,24 @@ fn url_of(addr: std::net::SocketAddr) -> String {
     format!("http://{addr}")
 }
 
-/// 开启诊断:起查看器(幂等)成功后才置位运行时采集 gate。返回 viewer URL。
-/// `start` 内部同步 block 到 bootstrap 线程 bind 完成,放 `spawn_blocking` 不卡 async worker。
-/// **gate 仅在 start 成功后置位**(codex-connector P1):否则 bind 失败(如 18090 被占)时
-/// gate 残留为开 → 进程继续写 forward/MCP 诊断(含完整 prompt/代码/回复)而 UI 显示失败/关。
+/// 开启诊断:起查看器(幂等)。**采集 gate 的开关由 `manager.start`/`stop_silent` 在 start_lock
+/// 内与 viewer 生命周期原子绑定**(gate 仅在 start 成功后开、失败不开 → 无残留;并发 on/off
+/// 按锁顺序串行,最后一次胜),handler 不再单独动 gate。`start` 内部同步 block 到 bind 完成,
+/// 放 `spawn_blocking` 不卡 async worker。
 pub async fn start_trace_viewer(State(state): State<AdminState>) -> impl IntoResponse {
     let mgr = state.trace_viewer_manager.clone();
     let result = tokio::task::spawn_blocking(move || mgr.start(DEFAULT_TRACE_VIEWER_PORT))
         .await
         .unwrap_or_else(|e| Err(format!("trace-viewer start task panicked: {e}")));
     match result {
-        Ok(addr) => {
-            set_forward_trace_enabled(true);
-            Json(json!({"success": true, "running": true, "url": url_of(addr)}))
-        }
-        Err(e) => {
-            // 启动失败:确保运行时 gate 关(env CAS_DIAG_TRACE 开的不受影响,本就该采集)。
-            // 用 `message` 键 —— 前端 api() 会因 success:false throw,并取 data.message 作错误文案。
-            set_forward_trace_enabled(false);
-            Json(json!({"success": false, "running": false, "message": e}))
-        }
+        Ok(addr) => Json(json!({"success": true, "running": true, "url": url_of(addr)})),
+        // `message` 键:前端 api() 因 success:false throw 时取 data.message 作错误文案。
+        Err(e) => Json(json!({"success": false, "running": false, "message": e})),
     }
 }
 
-/// 关闭诊断:清运行时采集 gate + 关查看器。env `CAS_DIAG_TRACE` 开的不受影响(env 恒真)。
+/// 关闭诊断:关查看器(`stop_silent` 内部清运行时采集 gate;env `CAS_DIAG_TRACE` 不受影响)。
 pub async fn stop_trace_viewer(State(state): State<AdminState>) -> impl IntoResponse {
-    set_forward_trace_enabled(false);
     state.trace_viewer_manager.stop_silent();
     Json(json!({"success": true, "running": false}))
 }
@@ -60,20 +51,14 @@ pub async fn open_trace_viewer(State(state): State<AdminState>) -> impl IntoResp
     let addr = match state.trace_viewer_manager.addr() {
         Some(addr) => addr,
         None => {
+            // gate 由 manager.start 内部管理(成功才开),handler 不动 gate。
             let mgr = state.trace_viewer_manager.clone();
             let started = tokio::task::spawn_blocking(move || mgr.start(DEFAULT_TRACE_VIEWER_PORT))
                 .await
                 .unwrap_or_else(|e| Err(format!("trace-viewer start task panicked: {e}")));
             match started {
-                // gate 仅在 start 成功后置位(同 start_trace_viewer 的 P1 修复)。
-                Ok(addr) => {
-                    set_forward_trace_enabled(true);
-                    addr
-                }
-                Err(e) => {
-                    set_forward_trace_enabled(false);
-                    return Json(json!({"success": false, "message": e}));
-                }
+                Ok(addr) => addr,
+                Err(e) => return Json(json!({"success": false, "message": e})),
             }
         }
     };
