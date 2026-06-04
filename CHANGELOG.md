@@ -2,7 +2,7 @@
 
 逐版本要点。
 
-## Unreleased
+## v2.2.1 — 2026-06-04
 
 **web_fetch 模型摘要 + per-provider 总结模型 (MOC-152)**:web_fetch 工具改为「抓取 → 正文抽取 → 用『总结模型』针对调用方 prompt 作答」后返回(类 Claude Code WebFetch,只回摘要、大幅省 Codex context)。① `prompt` 参数设为**必填** —— 模型每次说明想从该页了解 / 提取什么,据此生成针对性摘要 / 回答;② 提供商配置页「模型映射」下方新增**网页摘要模型**选择(per-provider,经 `Provider.extra` flatten 透传持久化,`AddProviderInput` 同步加字段),留空 → 回退该 provider 的 `models["default"]`;③ 摘要调用经本地 proxy `/v1/chat/completions`(`Bearer gatewayApiKey`,复用路由 + 鉴权改写),按 `provider.apiFormat` 仅 `openai_chat` 支持;④ **任意失败兜底**(未配总结模型 / proxy 未起 / 模型报错 / 非 chat 格式)→ 回退返回抓取到的网页正文原文并注明,**绝不丢内容**。⑤ **大页相关性选块(MOC-156 基础)**:正文超 60k 字符时不再"取前 60k"(位置截断会漏掉深处相关段),而是全文按段落分块、用 prompt 做词法相关性(latin 词 + CJK bigram,无额外依赖/无额外模型调用)打分、选**全页最相关**的 ~60k 字符喂给模型并恢复原序,截断时显式告知模型 + 消费者可能不完整(选块仍有损,无损方案见 MOC-156 调研)。⑥ **剥离思维链**:总结模型内联在 `content` 的 `<think>…</think>` 推理在返回前剥掉(否则整段 CoT 当摘要返回 = 噪声 + 浪费 token);剥后为空则保留原文。失败回退原文时提示醒目标注"非摘要"+ 排查指引。
 
@@ -24,6 +24,8 @@
 **模块更新自动检查机制 — Dependabot 依赖跟踪 (MOC-138, Tier 1)**:新增 `.github/dependabot.yml`,cargo 生态周级(周一 09:00 Asia/Shanghai)自动起依赖升级 PR,不用人盯 crates.io。`wreq` + `wreq-util`(浏览器指纹伪装对,rc 版本间有 emulation trait 重命名 skew,见 `crates/http/Cargo.toml`)单独 group `cf-bypass` 锁步升级、其余依赖合并 `everything-else` 一个 PR;`open-pull-requests-limit: 5`、贴 `Improvement` label、assign `Cmochance`。注:`boring2` / `boring-sys2` 是 `wreq` 的传递依赖、不单列(跟随 lockfile 自动升)。
 
 **模块更新自动检查机制 — 周 cron CF 金丝雀 (MOC-138, Tier 2)**:新增 `.github/workflows/weekly-cf-check.yml`,每周一定时(GitHub Actions cron `37 1 * * 1`,错峰避整点,UTC)真实打 `chatgpt.com` / `help.openai.com` 跑 `cf_bypass --include-ignored`,验 `wreq` Chrome120 指纹还能过 Cloudflare;附 OpenAI status RSS / Codex CLI release 对照,连续 3 次失败(retry×3 抗瞬时网络抖动)才 `::error::` 告警。支持 `workflow_dispatch` 手动触发。注:Actions 跑数据中心 IP,CF 策略与家宽不同 → fail 不等于用户真挂,接硬告警前需先校准命中率(故先不接 Slack)。至此 MOC-138 4 层(Tier 1/2/3/4)全部落地。canary 逻辑抽成 `_reusable-cf-canary.yml`(`workflow_call`),并新增 `cf-canary-on-deps.yml` —— Dependabot 升 `wreq`/`wreq-util`(或手动改)的 PR 当场触发金丝雀(diff 含 wreq 才跑),在 merge 前就验新版本还过不过 CF,把 Tier 1↔Tier 2 连起来;该 check 非必需(DC-IP 假阳性不卡 Dependabot PR merge)。
+
+**其它修复与基础设施**:① proxy 启动强制生成 `gateway key`、消除无鉴权模式 (MOC-108);② 修复 MiniMax compact 工具参数截断产出非法 JSON,新增 `MiniMax-M3` (1M 上下文)(#357);③ Theme 页 CSP 兼容(inline onclick → 事件委托,MOC-131)+ app.js escape / 缩进 NIT 清理 (MOC-147);④ Codex Desktop context-usage footer 写 live atom key `show-context-window-usage` (MOC-123);⑤ 真账号 token 刷新分流后的命名 / 注释认知债清理 (MOC-104);⑥ Dependabot `everything-else` group 改为只合 patch、minor / major 各自单独 PR,并 ignore `wreq` / `wreq-util` rc.29(CI canary 实证数据中心 IP 下 CF 绕过回归、保持 rc.23,MOC-160)。
 
 详细变更见 [GitHub Releases](https://github.com/Cmochance/codex-app-transfer/releases) 与 `release-notes/v*.md`。
 
