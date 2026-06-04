@@ -185,6 +185,16 @@ Each `git push` then runs `cargo fmt --all -- --check` → `cargo check --worksp
 
 > This gate is the local tier of the "module update auto-check" mechanism (MOC-138): the rest is Dependabot tracking `wreq` and friends, plus a weekly CI canary verifying the Cloudflare bypass still works. Drift detection for the standalone `codex-app-transfer_test` clone lives in `scripts/check-test-repo-drift.sh`.
 
+### Protocol forwarding diagnostics (forward-trace, off by default)
+
+When debugging adapter / protocol-mapping bugs you can enable forward-trace: it writes the **full forwarding cycle** of each request (Codex's original request → what the adapter sends upstream → the upstream reply) as one JSON line per request to `~/.codex-app-transfer/forward-trace/<date>.jsonl`, for offline inspection with `jq`.
+
+```bash
+CAS_DIAG_TRACE=1 cargo tauri dev      # or set this env var before launching the packaged app
+```
+
+**Off by default**, with zero impact and zero overhead for normal users (without the env var the forwarding path doesn't even clone the request body — just one extra atomic check). Credential-bearing headers and JSON body fields (`authorization` / `api_key` / `*_token`, etc.) are redacted to `***` before being written; but request/response **payloads** (prompts, code, model replies) are written in full — that's required for protocol diagnosis, which is why it's local-only, loopback-only, and off by default, and is never enabled for end users in a release. Field meanings, retention (7 daily files), and redaction boundaries are in [`docs/forward-trace.md`](docs/forward-trace.md).
+
 ### Tweaking the UI
 
 `frontend/css/` is organized as a small component library — no need to grep the whole `style.css`:
@@ -289,7 +299,7 @@ Design intent: the client trusts only the build-time embedded public key and nev
 - **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
 - **Frontend**: HTML + CSS + vanilla JavaScript + Bootstrap 5.3.3 (localized, no CDN dependency)
 - **Desktop shell**: Tauri 2 + tray-icon 0.23; the `cas://` URI scheme glues frontend/ and axum in-process, no TCP loopback
-- **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex/{config.toml,auth.json,.credentials.json}` (Codex App integration), `~/.codex-app-transfer/mcp-credentials.json` (MCP credential mirror, outside `~/.codex`)
+- **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex-app-transfer/blobs/` (large in-conversation images, sha256-deduplicated out of the db; not auto-removed when you delete the db — delete it too or use `POST /api/sessions/clear`), `~/.codex/{config.toml,auth.json,.credentials.json}` (Codex App integration), `~/.codex-app-transfer/mcp-credentials.json` (MCP credential mirror, outside `~/.codex`)
 - **Packaging**: `cargo tauri build` single command produces dmg/AppImage/deb/exe/msi; `xtask release-bundle` finalizes sha256 + RSA-3072 sig + latest.json + draft GitHub release
 
 ## Disclaimer

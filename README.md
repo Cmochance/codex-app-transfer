@@ -184,6 +184,16 @@ scripts/install-hooks.sh        # = git config core.hooksPath .githooks
 
 > 该门禁是「模块更新自动检查机制」(MOC-138)的本地一环:配套还有 Dependabot 跟 `wreq` 等依赖发版、周期 CI 金丝雀验 Cloudflare 绕过仍生效。独立 clone `codex-app-transfer_test` 的漂移检测见 `scripts/check-test-repo-drift.sh`。
 
+### 协议转发诊断(forward-trace,默认关)
+
+调 adapter / 协议映射类 bug 时可开 forward-trace:把每次转发的**全过程**(Codex 原始请求 → adapter 转换后发上游 → 上游回包)一请求一行写到 `~/.codex-app-transfer/forward-trace/<日期>.jsonl`,供 `jq` 离线对照。
+
+```bash
+CAS_DIAG_TRACE=1 cargo tauri dev      # 或给打包后的 app 设此环境变量再启动
+```
+
+**默认关**,普通用户零影响、零开销(不设此环境变量时,连请求体都不会克隆,转发路径只多一次 atomic 判定)。credential 类 header 与 JSON body 字段(`authorization` / `api_key` / `*_token` 等)落盘前脱敏成 `***`;但请求/响应**正文**(prompt、代码、模型回复)会完整落盘 —— 这是协议诊断所必需,所以它只在本地、仅 loopback、默认关,绝不随 release 给终端用户开。字段含义、保留策略(按天保留 7 份)、脱敏边界详见 [`docs/forward-trace.md`](docs/forward-trace.md)。
+
 ### 想改 UI 样式怎么改
 
 `frontend/css/` 走"组件库"形式拆开,不需要全文 grep `style.css`:
@@ -288,7 +298,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 - **协议适配**:`crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web 互转(请求 body + 流式响应状态机 + reasoning_content + tool_calls)
 - **前端**:HTML + CSS + 原生 JavaScript + Bootstrap 5.3.3(本地化,无 CDN 依赖)
 - **桌面壳**:Tauri 2 + tray-icon 0.23,通过 `cas://` URI scheme 把 frontend/ 与 axum 同进程串起来,无 TCP loopback
-- **存储**:`~/.codex-app-transfer/config.json`(配置,与 v1.x 互通)、`~/.codex-app-transfer/sessions.db`(L2 sqlite 会话持久化)、`~/.codex/{config.toml,auth.json,.credentials.json}`(Codex APP 集成)、`~/.codex-app-transfer/mcp-credentials.json`(MCP 凭据镜像,在 `~/.codex` 之外)
+- **存储**:`~/.codex-app-transfer/config.json`(配置,与 v1.x 互通)、`~/.codex-app-transfer/sessions.db`(L2 sqlite 会话持久化)、`~/.codex-app-transfer/blobs/`(会话内大图按 sha256 去重外置,删 db 不会自动清,需一并删或走 `POST /api/sessions/clear`)、`~/.codex/{config.toml,auth.json,.credentials.json}`(Codex APP 集成)、`~/.codex-app-transfer/mcp-credentials.json`(MCP 凭据镜像,在 `~/.codex` 之外)
 - **打包**:`cargo tauri build` 单命令出 dmg/AppImage/deb/exe/msi;`xtask release-bundle` 收口出 sha256 + RSA-3072 sig + latest.json + draft GitHub release
 
 ## 免责声明

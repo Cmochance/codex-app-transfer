@@ -137,8 +137,8 @@
 
 - **Link**: https://github.com/openai/codex
 - **License**: Apache-2.0
-- **借鉴形式**: Prompt 蓝本(精简移植)+ 协议反查(数据模式参照)
-- **首次借鉴 PR / 时间**: v2.0.x 起协议结构反查;fix/219 起 prompt 结构借鉴
+- **借鉴形式**: Prompt 蓝本(精简移植)+ 协议反查(数据模式参照)+ 落盘布局思路(blob 内容寻址)
+- **首次借鉴 PR / 时间**: v2.0.x 起协议结构反查;fix/219 起 prompt 结构借鉴;MOC-142 起 blob 落盘布局
 - **借鉴清单**:
   - `COMPACT_SUMMARIZATION_PROMPT` 基础骨架 → `crates/adapters/src/responses/compact.rs:82-92`
     (源文件:`codex-rs/core/templates/compact/prompt.md`,~460 chars)
@@ -150,6 +150,11 @@
   - `CompactHistoryResponse { output: Vec<ResponseItem> }` + `ResponseItem::Compaction { encrypted_content }` 响应结构
     → `compact.rs` 序列化路径
     (源文件:`codex-rs/codex-api/src/endpoint/compact.rs` + `codex-rs/protocol/src/models.rs:882`)
+  - **MOC-142 内容寻址 blob 外置**:大 `data:` 图片按 sha256 落独立文件、`messages_json` 仅存轻量
+    引用,消除 stateless 逐轮快照对同一张图的重复存储(实测 64 张唯一图被存 5500 次 → 去重)
+    → `crates/adapters/src/responses/blob_store.rs`
+    (思路观察自 Codex `~/.codex/generated_images/ig_<hash>.png` 落盘布局;另参 Claude Code
+    `~/.claude/paste-cache/<hash>.txt` 同类内容寻址 —— 均为运行时目录观察,非源码借鉴)
 - **本项目差异 / 扩展**:
   - prompt 补两条 Claude Code 关键 bullet("All user messages verbatim" + "Next Step verbatim quote"),
     借鉴自 Piebald-AI/claude-code-system-prompts 反编译公开版本第 6 / 9 段(见下方同名 entry)
