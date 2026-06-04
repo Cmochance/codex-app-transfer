@@ -31,6 +31,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use super::blob_store::{BlobStore, InlineError, BLOB_REF_KEY};
+use super::message_store::{self, MsgInlineError, MSG_REF_KEY};
 
 /// 当前 sqlite schema 版本。改 schema 时把这个值 +1,旧 db 会被自动备份重建。
 const SCHEMA_VERSION: i64 = 1;
@@ -237,13 +238,23 @@ impl ResponseSessionCache {
         // persist_save 早返、无并发 blob 写入,持不持锁都安全。
         let mut guard = self.db.lock().expect("session cache db mutex poisoned");
         let deleted = match guard.as_mut() {
-            Some(conn) => conn
-                .execute("DELETE FROM response_sessions", [])
-                .map_err(|e| {
-                    let detail = format!("clear failed: {e}");
-                    log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
-                    detail
-                })?,
+            Some(conn) => {
+                let n = conn
+                    .execute("DELETE FROM response_sessions", [])
+                    .map_err(|e| {
+                        let detail = format!("clear failed: {e}");
+                        log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
+                        detail
+                    })?;
+                // MOC-168:消息内容表同 db,隐私清除需连带全清。失败上报(返 Err → 500)。
+                conn.execute("DELETE FROM message_contents", [])
+                    .map_err(|e| {
+                        let detail = format!("clear message_contents failed: {e}");
+                        log_db_warning("SESSIONS_MSG_CLEAR_FAILED", detail.clone());
+                        detail
+                    })?;
+                n
+            }
             // db 不可用(sqlite init 失败 → 纯内存 fallback):L2 行数 0,但 `blobs/` 可能仍有
             // **上次成功运行**外置的私密图(`with_db_path` 无条件按 db_path 同级建 blobs 层)。
             // **不能**早返成功跳过 sweep —— 必须继续往下清 blob(codex-connector P2)。
@@ -331,6 +342,25 @@ impl ResponseSessionCache {
                     BlobStore::collect_hashes(m, &mut live);
                 }
             }
+            // MOC-168:消息被外置后,blob 引用主要嵌在 `message_contents.json` 里(行只剩
+            // `__cat_msg__` 引用,扫行扫不到 blob 引用)。**必须**把 message_contents 里的
+            // blob 引用也收进 live,否则 blob GC 会把仍被引用的图当孤儿删(图片历史丢)。
+            // 旧 inline 行的 blob 引用仍在行内 → 两处都扫、union。同样 fail-safe abort。
+            let mut stmt2 = conn
+                .prepare("SELECT json FROM message_contents WHERE json LIKE ?1")
+                .map_err(|e| format!("sessions.db blob-ref(msg) scan prepare failed: {e}"))?;
+            let rows2 = stmt2
+                .query_map(params![like_pattern], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("sessions.db blob-ref(msg) scan failed: {e}"))?;
+            for row in rows2 {
+                let row = row.map_err(|e| {
+                    format!("sessions.db blob-ref(msg) read failed, abort sweep (no delete): {e}")
+                })?;
+                let msg: Value = serde_json::from_str(&row).map_err(|e| {
+                    format!("sessions.db blob-ref(msg) parse failed, abort sweep (no delete): {e}")
+                })?;
+                BlobStore::collect_hashes(&msg, &mut live);
+            }
         }
         let stats = store
             .sweep(&live)
@@ -346,6 +376,38 @@ impl ResponseSessionCache {
             );
         }
         Ok(stats.removed)
+    }
+
+    /// MOC-168 启动 GC:删掉 `message_contents` 里不再被任何 row 引用的孤儿消息
+    /// (过期 row 删后留下的悬挂消息)。无 db → `Ok(0)`。跟 blob sweep 同构:只扫含
+    /// `__cat_msg__` 引用的 row;mark 不完整即 **abort**(本轮不删任何消息),宁漏回收
+    /// 勿误删活消息。仅启动调一次。
+    pub fn sweep_orphan_messages(&self) -> Result<usize, String> {
+        let mut guard = self.db.lock().expect("session cache db mutex poisoned");
+        let Some(conn) = guard.as_mut() else {
+            return Ok(0);
+        };
+        let mut live: HashSet<String> = HashSet::new();
+        {
+            let like_pattern = format!("%{MSG_REF_KEY}%");
+            let mut stmt = conn
+                .prepare("SELECT messages_json FROM response_sessions WHERE messages_json LIKE ?1")
+                .map_err(|e| format!("sessions.db msg-ref scan prepare failed: {e}"))?;
+            let rows = stmt
+                .query_map(params![like_pattern], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("sessions.db msg-ref scan failed: {e}"))?;
+            for row in rows {
+                let row = row.map_err(|e| {
+                    format!("sessions.db msg-ref row read failed, abort sweep (no delete): {e}")
+                })?;
+                let messages: Vec<Value> = serde_json::from_str(&row).map_err(|e| {
+                    format!("sessions.db msg-ref row parse failed, abort sweep (no delete): {e}")
+                })?;
+                message_store::collect_hashes(&messages, &mut live);
+            }
+        }
+        sweep_message_contents(conn, &live)
+            .map_err(|e| format!("sessions.db message sweep failed: {e}"))
     }
 
     /// fix(#210 P2): Proxy 停止前把 L1 内存中所有活跃 entry 重新写入 L2。
@@ -391,15 +453,19 @@ impl ResponseSessionCache {
         // MOC-142:写盘前把大 `data:` 图片外置成 sha256 引用(内容寻址去重),只让
         // L2 存引用而非逐轮重复整张 base64。单个 blob 外置失败留 inline(非破坏);
         // L1 内存层已存完整 inline,不受影响。纯内存模式(blobs=None)行为不变。
-        let encoded = match self.blobs.as_ref() {
-            Some(store) => {
-                let mut slim: Vec<Value> = messages.to_vec();
+        // MOC-142 → MOC-168 两级外置(顺序 blob→msg):①每条消息里的大 `data:` 图 → blob
+        // 引用(FS sidecar);②每条消息整体(已含 blob 引用)→ `message_contents` 引用(同
+        // db 去重)。任一步单条失败留 inline(非破坏);L1 内存层始终存完整 inline。db
+        // 在握(早返已挡掉纯内存态),message 层用同一连接。
+        let encoded = {
+            let mut slim: Vec<Value> = messages.to_vec();
+            if let Some(store) = self.blobs.as_ref() {
                 for m in &mut slim {
                     store.externalize(m);
                 }
-                serde_json::to_string(&slim)
             }
-            None => serde_json::to_string(messages),
+            message_store::externalize(conn, &mut slim);
+            serde_json::to_string(&slim)
         };
         let json = match encoded {
             Ok(s) => s,
@@ -466,9 +532,27 @@ impl ResponseSessionCache {
         }
         match serde_json::from_str::<Vec<Value>>(&json) {
             Ok(mut messages) => {
-                // MOC-142:把 blob 引用回填成原始 `data:` 字符串。任一引用的 blob
-                // 缺失/IO 错 → 整行不可用,删行当 cache miss(绝不把引用对象泄漏
-                // 给模型)。纯内存模式(blobs=None)直接返回原 messages。
+                // MOC-168:先把消息引用回填成整条消息(内部可能仍是 blob 引用)。任一引用
+                // 缺失/损坏/db 错 → 本行无法完整回填,**非破坏**当 cache-miss 返回(不删行、
+                // 不把引用对象泄漏给模型);留待 TTL 自然淘汰。
+                if let Err(e) = message_store::inline(conn, &mut messages) {
+                    let error_id = match e {
+                        MsgInlineError::Missing(_) => "SESSIONS_DB_MSG_MISSING",
+                        MsgInlineError::Corrupt(_) => "SESSIONS_DB_MSG_CORRUPT",
+                        MsgInlineError::Db(_) => "SESSIONS_DB_MSG_DB_ERROR",
+                    };
+                    log_db_warning(
+                        error_id,
+                        format!(
+                            "message inline failed for response_id={response_id}, \
+                             serving cache-miss without delete: {e}"
+                        ),
+                    );
+                    return Ok(None);
+                }
+                // MOC-142:再把 blob 引用回填成原始 `data:` 字符串。任一引用的 blob
+                // 缺失/IO 错 → 同样**非破坏**当 cache miss(不删行、不泄漏引用)。纯内存
+                // 模式(blobs=None)直接返回。
                 if let Some(store) = self.blobs.as_ref() {
                     for m in &mut messages {
                         if let Err(e) = store.inline(m) {
@@ -571,9 +655,13 @@ fn init_db(db_path: &Path, _persisted_ttl: Duration) -> rusqlite::Result<Connect
         backup_corrupt_db(db_path);
         let conn = open_db_with_pragmas(db_path)?;
         create_schema(&conn)?;
+        // MOC-168:消息内容表 additive,无条件建(不进 SCHEMA_VERSION)。
+        message_store::ensure_table(&conn)?;
         return Ok(conn);
     }
     create_schema_if_missing(&conn)?;
+    // MOC-168:既有 db(只有 response_sessions)也补建 message_contents 表。
+    message_store::ensure_table(&conn)?;
     Ok(conn)
 }
 
@@ -769,6 +857,13 @@ fn backup_blobs_dir(db_path: &Path, ts: i64) {
 /// - `SESSIONS_BLOB_BACKUP_FAILED` — schema 重建备份 db 后,`blobs/` → `blobs.bak.<ts>/`
 ///   rename 失败(启动 sweep 可能删掉 `.bak` 引用的图;codex-connector P2)
 ///
+/// MOC-168 消息外置层(`message_contents` 同 db,故无独立备份/sweep-IO 问题):
+/// - `SESSIONS_MSG_PUT_FAILED` — 消息 INSERT 失败,该消息留 inline(非破坏)
+/// - `SESSIONS_DB_MSG_MISSING` / `SESSIONS_DB_MSG_CORRUPT` / `SESSIONS_DB_MSG_DB_ERROR` —
+///   inline 时消息引用缺失 / json 损坏 / 查库错 → 本行**非破坏**当 cache-miss(不删行)
+/// - `SESSIONS_MSG_CLEAR_FAILED` — 隐私清除删 `message_contents` 失败,已 Err 上报(500)
+/// - `SESSIONS_MSG_SWEEP_FAILED` — 启动 GC mark 不完整 → abort,本轮不删任何消息
+///
 /// `error_id` 必须用 `&'static str`(literal)以保跨版本稳定;`detail` 给人类
 /// 阅读的上下文(path / error message),不进 metric label。
 ///
@@ -776,6 +871,31 @@ fn backup_blobs_dir(db_path: &Path, ts: i64) {
 /// 获取 compile-time enforcement。本 PR 暂用 literal 跟 codebase 其他
 /// `tracing::warn!(error_id=...)` 用法一致(`tool_call_cache.rs` / `request.rs`
 /// 同模式),若未来 error_id 数量翻倍或出现拼写漂移再升级。
+/// MOC-168:删 `message_contents` 里不在 `live` 集合的孤儿消息(事务批量,startup GC)。
+fn sweep_message_contents(
+    conn: &mut Connection,
+    live: &HashSet<String>,
+) -> rusqlite::Result<usize> {
+    let all: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT hash FROM message_contents")?;
+        let it = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        it.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let orphans: Vec<&String> = all.iter().filter(|h| !live.contains(*h)).collect();
+    if orphans.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut del = tx.prepare("DELETE FROM message_contents WHERE hash = ?1")?;
+        for h in &orphans {
+            del.execute(params![h])?;
+        }
+    }
+    tx.commit()?;
+    Ok(orphans.len())
+}
+
 fn log_db_warning(error_id: &'static str, detail: String) {
     tracing::warn!(error_id, detail = %detail, "sessions.db");
     // 兼容老路径:Tauri proxy log file 收 stderr,保留 eprintln 兜底防 tracing
@@ -807,7 +927,12 @@ pub fn global_response_session_cache() -> &'static ResponseSessionCache {
                 if let Err(e) = cache.evict_expired_persisted() {
                     log_db_warning("SESSIONS_DB_EVICT_FAILED", e);
                 }
-                // MOC-142:过期 row 删完后清悬挂 blob(孤儿);失败仅 log。
+                // MOC-168:**先**清悬挂消息(孤儿),**再**清 blob —— 这样 blob GC 扫
+                // message_contents 时只看到活消息,过期图能一次清掉(否则孤儿 blob 要延
+                // 一个重启周期才回收;codex-connector P2)。两步均失败仅 log。
+                if let Err(e) = cache.sweep_orphan_messages() {
+                    log_db_warning("SESSIONS_MSG_SWEEP_FAILED", e);
+                }
                 if let Err(e) = cache.sweep_orphan_blobs() {
                     log_db_warning("SESSIONS_BLOB_SWEEP_FAILED", e);
                 }
@@ -1076,9 +1201,12 @@ mod tests {
             .unwrap()
         };
         assert!(!raw.contains("data:image"), "L2 行不应再有 inline base64");
+        // MOC-168:消息整体也被外置 → 行存的是**消息引用**(`__cat_msg__`);blob 引用
+        // (`__cat_session_blob__`)在 `message_contents` 里(下一级)。两级都不含 base64。
+        assert!(raw.contains("__cat_msg__"), "L2 行应存消息引用,实际 {raw}");
         assert!(
-            raw.contains("__cat_session_blob__"),
-            "L2 行应存 blob 引用,实际 {raw}"
+            !raw.contains("__cat_session_blob__"),
+            "blob 引用应在 message_contents 而非 row,实际 {raw}"
         );
         assert!(raw.len() < 1000, "外置后行应骤减,实际 {} 字节", raw.len());
 
@@ -1090,6 +1218,137 @@ mod tests {
         cache.clear();
         let restored = cache.get("resp_img").expect("L2 应能读回并回填 blob");
         assert_eq!(restored, messages, "回填后必须字节级等于原始");
+    }
+
+    #[test]
+    fn save_dedups_repeated_messages_and_get_rehydrates() {
+        // MOC-168 端到端:逐轮快照共享消息只存一份,L2 行存引用,get 回填字节级还原。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        let t1 = vec![
+            json!({"role": "system", "content": "S"}),
+            json!({"role": "user", "content": "u1"}),
+            json!({"role": "assistant", "content": "a1"}),
+        ];
+        let mut t2 = t1.clone();
+        t2.push(json!({"role": "user", "content": "u2"}));
+        t2.push(json!({"role": "assistant", "content": "a2"}));
+        cache.save("resp_t1", t1.clone());
+        cache.save("resp_t2", t2.clone());
+
+        // 5 条唯一消息(S,u1,a1,u2,a2),即便跨两行共出现 8 次
+        let uniq: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM message_contents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uniq, 5, "共享消息去重:应只 5 条唯一");
+
+        // L2 行存引用、不含原文
+        let raw: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT messages_json FROM response_sessions WHERE response_id = 'resp_t2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw.contains(MSG_REF_KEY), "行应存消息引用");
+        assert!(!raw.contains("\"a2\""), "行不应含消息原文");
+
+        // 清 L1 强制走 L2 + 回填,字节级还原
+        cache.clear();
+        assert_eq!(
+            cache.get("resp_t2").expect("L2 回填"),
+            t2,
+            "回填字节级等于原始"
+        );
+        assert_eq!(cache.get("resp_t1").expect("L2 回填"), t1);
+    }
+
+    #[test]
+    fn sweep_orphan_messages_removes_unreferenced() {
+        // 过期 row 删后其独有消息成孤儿 → 启动 GC 清掉。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            &path,
+        );
+        cache.save(
+            "r_old",
+            vec![json!({"role": "user", "content": "orphan-me"})],
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        cache.evict_expired_persisted().unwrap(); // 删过期 row → 消息成孤儿
+        let removed = cache.sweep_orphan_messages().unwrap();
+        assert!(removed >= 1, "孤儿消息应被清,实际 {removed}");
+        let cnt: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM message_contents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt, 0, "孤儿消息应清零");
+    }
+
+    #[test]
+    fn clear_all_persisted_also_removes_messages() {
+        // 隐私清除连带清 message_contents。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        cache.save("r", vec![json!({"role": "user", "content": "secret"})]);
+        let count = |p: &std::path::Path| -> i64 {
+            Connection::open(p)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM message_contents", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(count(&path) >= 1, "save 后应有消息");
+        cache.clear_all_persisted().unwrap();
+        assert_eq!(count(&path), 0, "clear 应连带清 message_contents");
+    }
+
+    #[test]
+    fn sweep_orphan_blobs_keeps_blob_referenced_via_message_store() {
+        // MOC-168 回归(code-reviewer BLOCKER):消息外置后 blob 引用嵌在 message_contents
+        // 里,行只剩 msg 引用。启动 blob GC 必须也扫 message_contents,否则把仍被引用的图
+        // 当孤儿删 → 图片历史丢。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        let big_image = format!("data:image/png;base64,{}", "Q".repeat(20_000));
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": big_image}],
+        })];
+        cache.save("resp_img2", messages.clone());
+
+        let removed = cache.sweep_orphan_blobs().unwrap();
+        assert_eq!(
+            removed, 0,
+            "经 message_contents 引用的活 blob 不应被删,实际 {removed}"
+        );
+
+        // 清 L1 强制走 L2,仍能两级完整回填
+        cache.clear();
+        assert_eq!(
+            cache.get("resp_img2").expect("L2 应能两级回填"),
+            messages,
+            "回填后字节级等于原始"
+        );
     }
 
     #[test]

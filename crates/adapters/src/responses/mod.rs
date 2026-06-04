@@ -13,6 +13,8 @@ pub mod artifact_store;
 mod blob_store;
 pub mod compact;
 pub mod converter;
+// MOC-168: sessions.db 每条消息内容寻址外置(收文字/tool 侧逐轮快照重复)。
+mod message_store;
 pub mod request;
 pub mod session;
 pub mod stream;
