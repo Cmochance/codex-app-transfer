@@ -31,7 +31,10 @@ use futures_core::Stream;
 use futures_util::TryStreamExt;
 use thiserror::Error;
 
-use crate::diagnostics::{write_upstream_error_bundle, UpstreamErrorBundleInput};
+use crate::diagnostics::{
+    forward_trace_enabled, write_forward_trace_jsonl, write_upstream_error_bundle,
+    ForwardTraceInput, UpstreamErrorBundleInput,
+};
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
 
@@ -327,6 +330,9 @@ pub async fn forward_handler(
 
     // 1. 收齐入站 body
     let mut body_bytes: Bytes = axum::body::to_bytes(body, usize::MAX).await?;
+    // [MOC-89 forward-trace] 默认关:仅 CAS_DIAG_TRACE=1 时才克隆一份 Codex 原始请求体
+    // (rewrite/strip 前),供全过程 trace。关时不 clone、零额外开销。
+    let trace_inbound_raw: Option<Bytes> = forward_trace_enabled().then(|| body_bytes.clone());
 
     // 2. 解析(鉴权 + 路由)
     let client_path = parts
@@ -510,6 +516,32 @@ pub async fn forward_handler(
     // 辅助定位真实 Codex CLI 流量里"几分钟"是单次 reasoning 慢、还是连续
     // 多轮工具循环放大。
     let t_send = Instant::now();
+    // [MOC-89 forward-trace] gate 开时构造 trace 请求侧 owned 快照(成功路径 ctx / 错误
+    // 路径就地 push 共用)。仅在 forward_trace_enabled() 为真的分支里调用 → 关时不构造、
+    // headers/body 不 clone。response_headers 传上游 raw(transform/filter 前)。
+    let make_trace_ctx =
+        |status: u16, response_headers: reqwest::header::HeaderMap| ForwardTraceCtx {
+            method: parts.method.as_str().to_string(),
+            client_path: client_path.clone(),
+            client_query: parts.uri.query().map(|s| s.to_string()),
+            inbound_headers: parts.headers.clone(),
+            inbound_body: trace_inbound_raw
+                .as_ref()
+                .map(|b| b.to_vec())
+                .unwrap_or_default(),
+            upstream_url: upstream_url.clone(),
+            outbound_headers: outbound_headers_snapshot.clone(),
+            outbound_body: plan.body.to_vec(),
+            status,
+            response_headers,
+            provider_id: resolved.provider.id.clone(),
+            provider_name: resolved.provider.name.clone(),
+            api_format: resolved.provider.api_format.clone(),
+            auth_scheme: format!("{:?}", resolved.auth_scheme),
+            original_model: original_model.clone(),
+            resolved_model: resolved_model.clone(),
+            upstream_model: body_model(&plan.body),
+        };
     let (status, upstream_headers, upstream_stream): (
         http::StatusCode,
         HeaderMap,
@@ -538,6 +570,10 @@ pub async fn forward_handler(
             &plan.body,
             &body,
         );
+        // [MOC-89 forward-trace] 错误路径 body 已完整 buffer,gate 开时就地 push 一行
+        if forward_trace_enabled() {
+            write_trace_from_ctx(&make_trace_ctx(st.as_u16(), hs.clone()), &body, body.len());
+        }
         let single = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body) });
         (
             st,
@@ -550,6 +586,10 @@ pub async fn forward_handler(
         let st = resp.status();
         let hs = filter_hop_headers(resp.headers());
         let stream: codex_app_transfer_adapters::ByteStream = if st.is_success() {
+            // [MOC-89 forward-trace] gate 开时先 clone 上游 raw headers 再把 resp 消费成流;
+            // 响应体由 TracedStream tee(不破流式),Drop 时连同 ctx 写一行 jsonl。
+            let trace_ctx = forward_trace_enabled()
+                .then(|| make_trace_ctx(st.as_u16(), resp.headers().clone()));
             let raw = Box::pin(
                 resp.bytes_stream()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
@@ -559,9 +599,12 @@ pub async fn forward_handler(
                 t_send,
                 st.as_u16(),
                 upstream_url.clone(),
+                trace_ctx,
             ))
         } else {
             // retry 后再次 4xx 或 5xx
+            // [MOC-89 forward-trace] gate 开时先 clone 上游 raw headers 再消费 resp body
+            let trace_resp_headers = forward_trace_enabled().then(|| resp.headers().clone());
             let body_bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
@@ -594,6 +637,14 @@ pub async fn forward_handler(
                 &plan.body,
                 &body_bytes,
             );
+            // [MOC-89 forward-trace] body 已完整 buffer,gate 开时(headers 已 clone)就地 push
+            if let Some(rh) = trace_resp_headers {
+                write_trace_from_ctx(
+                    &make_trace_ctx(st.as_u16(), rh),
+                    &body_bytes,
+                    body_bytes.len(),
+                );
+            }
             let single =
                 futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) });
             Box::pin(single)
@@ -727,6 +778,33 @@ async fn passthrough_chatgpt_backend(
 /// 在上游 SSE / chunked 流上叠加耗时埋点。流被 Drop(adapter 链路 / 客户端
 /// 中断)时,自动写一行 telemetry 日志,记录 send → 首字节(TTFB)/ 总耗时
 /// / 总字节数。**对延迟与吞吐零侵入**,只多了 Instant 比较与计数器累加。
+/// forward-trace(MOC-89)成功路径上限:tee 的响应体最多缓冲这么多字节(与 diagnostics
+/// 的 body cap 一致;`redact_body` 还会再 cap 一次)。仅 gate 开时分配。
+const MAX_TRACE_BODY_BYTES: usize = 256 * 1024;
+
+/// forward-trace 成功路径在 [`TracedStream`] 里随流携带的 owned 上下文。流走完(Drop)时
+/// 借这些字段 + tee 到的响应体构造 [`ForwardTraceInput`] 写一行 jsonl。仅 gate 开时为
+/// `Some`(关时整个 ctx 不构造、headers/body 不 clone)。
+struct ForwardTraceCtx {
+    method: String,
+    client_path: String,
+    client_query: Option<String>,
+    inbound_headers: reqwest::header::HeaderMap,
+    inbound_body: Vec<u8>,
+    upstream_url: String,
+    outbound_headers: reqwest::header::HeaderMap,
+    outbound_body: Vec<u8>,
+    status: u16,
+    response_headers: reqwest::header::HeaderMap,
+    provider_id: String,
+    provider_name: String,
+    api_format: String,
+    auth_scheme: String,
+    original_model: Option<String>,
+    resolved_model: Option<String>,
+    upstream_model: Option<String>,
+}
+
 struct TracedStream {
     inner: codex_app_transfer_adapters::ByteStream,
     started_at: Instant,
@@ -734,6 +812,10 @@ struct TracedStream {
     total_bytes: usize,
     status: u16,
     upstream_url: String,
+    /// forward-trace 上下文,仅 gate 开时 `Some`;`Drop` 时取出写 jsonl。
+    trace: Option<ForwardTraceCtx>,
+    /// tee 到的上游响应体(原样,不破流式),cap 到 [`MAX_TRACE_BODY_BYTES`]。
+    resp_buf: Vec<u8>,
 }
 
 impl TracedStream {
@@ -742,6 +824,7 @@ impl TracedStream {
         started_at: Instant,
         status: u16,
         upstream_url: String,
+        trace: Option<ForwardTraceCtx>,
     ) -> Self {
         Self {
             inner,
@@ -750,6 +833,8 @@ impl TracedStream {
             total_bytes: 0,
             status,
             upstream_url,
+            trace,
+            resp_buf: Vec::new(),
         }
     }
 }
@@ -764,6 +849,13 @@ impl Stream for TracedStream {
                     this.first_byte_at = Some(Instant::now());
                 }
                 this.total_bytes += chunk.len();
+                // [MOC-89 forward-trace] gate 开时 tee 一份响应体(cap),chunk 原样返回、
+                // 无 await、无重排 → 不破流式。关时 trace 为 None,这段跳过。
+                if this.trace.is_some() && this.resp_buf.len() < MAX_TRACE_BODY_BYTES {
+                    let room = MAX_TRACE_BODY_BYTES - this.resp_buf.len();
+                    let take = room.min(chunk.len());
+                    this.resp_buf.extend_from_slice(&chunk[..take]);
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             other => other,
@@ -790,6 +882,56 @@ impl Drop for TracedStream {
                 total.as_secs_f64(),
                 self.total_bytes,
             ),
+        );
+        // [MOC-89 forward-trace] 流走完(成功路径)→ 借 owned ctx + tee 到的响应体写一行
+        // jsonl。仅 gate 开时 trace 为 Some。同步 append(一行),与上面 telemetry 日志
+        // 同属 Drop 内轻量 IO,不阻塞客户端(流已交付完毕)。
+        if let Some(ctx) = self.trace.take() {
+            // resp_buf 可能被 cap 截断;total_bytes 是 tee 累计的真实全长 → 传它修正 truncated_bytes
+            write_trace_from_ctx(&ctx, &self.resp_buf, self.total_bytes);
+        }
+    }
+}
+
+/// forward-trace 写盘失败只在**首次**记一条 WARN(去重防每请求刷屏)。用户显式开了
+/// CAS_DIAG_TRACE 却因权限/满盘一行没写时,至少有一句提示而非完全静默。
+static TRACE_WRITE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 把 owned [`ForwardTraceCtx`] + 响应体借成 [`ForwardTraceInput`] 写一行 jsonl。成功
+/// 路径(`TracedStream::Drop`,body 来自 tee、可能被 cap 截断 → 传 `response_full_len`
+/// 为真实全长)与错误/retry 路径(handler 内,body 已完整 buffer → full_len = body.len())
+/// 共用,避免重复构造。
+fn write_trace_from_ctx(ctx: &ForwardTraceCtx, response_body: &[u8], response_full_len: usize) {
+    let input = ForwardTraceInput {
+        method: &ctx.method,
+        client_path: &ctx.client_path,
+        client_query: ctx.client_query.as_deref(),
+        inbound_headers: &ctx.inbound_headers,
+        inbound_body: &ctx.inbound_body,
+        upstream_url: &ctx.upstream_url,
+        outbound_headers: &ctx.outbound_headers,
+        outbound_body: &ctx.outbound_body,
+        status: ctx.status,
+        response_headers: &ctx.response_headers,
+        response_body,
+        response_full_len,
+        provider_id: &ctx.provider_id,
+        provider_name: &ctx.provider_name,
+        api_format: &ctx.api_format,
+        auth_scheme: &ctx.auth_scheme,
+        original_model: ctx.original_model.as_deref(),
+        resolved_model: ctx.resolved_model.as_deref(),
+        upstream_model: ctx.upstream_model.as_deref(),
+    };
+    if write_forward_trace_jsonl(&input).is_none()
+        && !TRACE_WRITE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        proxy_telemetry().logs.add(
+            "WARN",
+            "forward-trace 已开启(CAS_DIAG_TRACE)但写盘失败(后续不再提示);\
+             检查 ~/.codex-app-transfer/forward-trace/ 目录权限与磁盘空间"
+                .to_string(),
         );
     }
 }
