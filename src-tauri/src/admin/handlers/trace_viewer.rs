@@ -16,17 +16,25 @@ fn url_of(addr: std::net::SocketAddr) -> String {
     format!("http://{addr}")
 }
 
-/// 开启诊断:置位运行时采集 gate + 起查看器(幂等)。返回 viewer URL。
+/// 开启诊断:起查看器(幂等)成功后才置位运行时采集 gate。返回 viewer URL。
 /// `start` 内部同步 block 到 bootstrap 线程 bind 完成,放 `spawn_blocking` 不卡 async worker。
+/// **gate 仅在 start 成功后置位**(codex-connector P1):否则 bind 失败(如 18090 被占)时
+/// gate 残留为开 → 进程继续写 forward/MCP 诊断(含完整 prompt/代码/回复)而 UI 显示失败/关。
 pub async fn start_trace_viewer(State(state): State<AdminState>) -> impl IntoResponse {
-    set_forward_trace_enabled(true);
     let mgr = state.trace_viewer_manager.clone();
     let result = tokio::task::spawn_blocking(move || mgr.start(DEFAULT_TRACE_VIEWER_PORT))
         .await
         .unwrap_or_else(|e| Err(format!("trace-viewer start task panicked: {e}")));
     match result {
-        Ok(addr) => Json(json!({"success": true, "running": true, "url": url_of(addr)})),
-        Err(e) => Json(json!({"success": false, "running": false, "error": e})),
+        Ok(addr) => {
+            set_forward_trace_enabled(true);
+            Json(json!({"success": true, "running": true, "url": url_of(addr)}))
+        }
+        Err(e) => {
+            // 启动失败:确保运行时 gate 关(env CAS_DIAG_TRACE 开的不受影响,本就该采集)。
+            set_forward_trace_enabled(false);
+            Json(json!({"success": false, "running": false, "error": e}))
+        }
     }
 }
 
@@ -51,14 +59,20 @@ pub async fn open_trace_viewer(State(state): State<AdminState>) -> impl IntoResp
     let addr = match state.trace_viewer_manager.addr() {
         Some(addr) => addr,
         None => {
-            set_forward_trace_enabled(true);
             let mgr = state.trace_viewer_manager.clone();
             let started = tokio::task::spawn_blocking(move || mgr.start(DEFAULT_TRACE_VIEWER_PORT))
                 .await
                 .unwrap_or_else(|e| Err(format!("trace-viewer start task panicked: {e}")));
             match started {
-                Ok(addr) => addr,
-                Err(e) => return Json(json!({"success": false, "error": e})),
+                // gate 仅在 start 成功后置位(同 start_trace_viewer 的 P1 修复)。
+                Ok(addr) => {
+                    set_forward_trace_enabled(true);
+                    addr
+                }
+                Err(e) => {
+                    set_forward_trace_enabled(false);
+                    return Json(json!({"success": false, "error": e}));
+                }
             }
         }
     };
