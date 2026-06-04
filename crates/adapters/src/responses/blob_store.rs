@@ -229,7 +229,19 @@ impl BlobStore {
                 }
             };
             for f in files {
-                let Ok(f) = f else { continue };
+                // per-entry 读取错误也计入 `failed`:否则隐私清除可能漏查/漏删某 blob
+                // 却仍报 failed==0 → clear 误报成功(codex-connector P2)。
+                let f = match f {
+                    Ok(f) => f,
+                    Err(e) => {
+                        warn(
+                            "SESSIONS_BLOB_ENTRY_FAILED",
+                            format!("blobs 文件项读取失败,可能漏清: {e}"),
+                        );
+                        stats.failed += 1;
+                        continue;
+                    }
+                };
                 let name = f.file_name();
                 let Some(name) = name.to_str() else { continue };
                 // 没 rename 完的 temp 残留顺手清(NotFound = 被并发清掉,正常)。temp 不是

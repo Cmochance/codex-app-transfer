@@ -231,15 +231,20 @@ impl ResponseSessionCache {
         self.clear();
         let deleted = {
             let mut guard = self.db.lock().expect("session cache db mutex poisoned");
-            let Some(conn) = guard.as_mut() else {
-                return Ok(0);
-            };
-            conn.execute("DELETE FROM response_sessions", [])
-                .map_err(|e| {
-                    let detail = format!("clear failed: {e}");
-                    log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
-                    detail
-                })?
+            match guard.as_mut() {
+                Some(conn) => conn
+                    .execute("DELETE FROM response_sessions", [])
+                    .map_err(|e| {
+                        let detail = format!("clear failed: {e}");
+                        log_db_warning("SESSIONS_DB_CLEAR_FAILED", detail.clone());
+                        detail
+                    })?,
+                // db 不可用(sqlite init 失败 → 纯内存 fallback):L2 行数 0,但 `blobs/`
+                // 可能仍有**上次成功运行**外置的私密图(`with_db_path` 无条件按 db_path
+                // 同级建 blobs 层)。**不能**早返成功跳过 sweep —— 必须继续往下清 blob
+                // (codex-connector P2)。
+                None => 0,
+            }
         };
         // MOC-142:行全清 → 所有 blob 成孤儿,一并清掉("彻底清除"语义)。这是**隐私
         // 清除**端点(POST /api/sessions/clear):blob 没删干净必须**上报**(返 Err →
@@ -719,6 +724,8 @@ fn backup_corrupt_db(db_path: &Path) {
 /// - `SESSIONS_BLOB_SWEEP_FAILED` — 启动 GC mark 不完整 → abort,本轮不删任何 blob
 /// - `SESSIONS_BLOB_SHARD_ITER_FAILED` / `SESSIONS_BLOB_SHARD_READ_FAILED` — sweep 遍历 /
 ///   读分片目录失败,该分片孤儿本轮未回收
+/// - `SESSIONS_BLOB_ENTRY_FAILED` — sweep 单个文件项读取失败(计入 `failed`,防隐私
+///   清除漏查某 blob 却误报成功)
 /// - `SESSIONS_BLOB_REMOVE_FAILED` — 孤儿 blob 删除失败,下次 GC 重试
 /// - `SESSIONS_BLOB_TMP_REMOVE_FAILED` — 残留 `.tmp.` 删除失败(NotFound 静默)
 /// - `SESSIONS_BLOB_SWEEP_PARTIAL` — 启动 GC 部分 blob 删失败(best-effort,下次重试)
