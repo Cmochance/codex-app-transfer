@@ -639,7 +639,13 @@ fn snapshot_dir_matches_id(dir: &Path, snapshot_id: &str) -> bool {
 
 fn move_stale_active_snapshots_to_recovery(paths: &CodexPaths) -> Result<(), CodexError> {
     let current = current_session_id().to_owned();
-    for dir in snapshot_dirs_under(&paths.active_snapshots_dir) {
+    // 按目录名(固定宽度时间戳前缀 → 字典序即时间序)升序 = **旧→新**处理。
+    // 替换式去重(见 move_snapshot_dir_to_recovery)下,同内容多份 stale 时让最新那份**最后**
+    // 处理、替换掉更旧的,使留存的 recovery 副本始终是最新那份(MOC-148 review P2:否则若
+    // newer 先处理、older 后处理,older 会覆盖 newer,at-cap 时该内容可能被 prune 误删)。
+    let mut stale_dirs = snapshot_dirs_under(&paths.active_snapshots_dir);
+    stale_dirs.sort_by(|a, b| dir_name(a).cmp(&dir_name(b)));
+    for dir in stale_dirs {
         if dir_name(&dir).as_deref() == Some(current.as_str()) {
             continue;
         }
@@ -1452,6 +1458,50 @@ mod tests {
         assert!(
             snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
             "recovery 仍受上限约束"
+        );
+    }
+
+    /// MOC-148 review P2:active/ 有两份同内容 stale(新/旧),替换式去重必须让**最新**那份成为
+    /// 留存副本(否则旧份覆盖新份,at-cap 时可能被 prune 误删)。构造 recovery 占满 MAX(时间戳
+    /// 居中)+ 旧 stale + 新 stale 同内容 → 迁移后内容存活,且留存副本是新 stale 那份。
+    #[test]
+    fn move_to_recovery_keeps_newest_among_duplicate_stale_actives() {
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.recovery_snapshots_dir).unwrap();
+        // recovery 占满 MAX,时间戳居中(晚于旧 stale、早于新 stale),内容各异。
+        for i in 0..MAX_RECOVERY_SNAPSHOTS {
+            let d = paths
+                .recovery_snapshots_dir
+                .join(format!("20260615T00000000{i}-p9"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(config_path(&d), format!("openai_base_url = \"M{i}\"\n")).unwrap();
+            write_manifest_to_dir(&d, &mk_manifest(&format!("mid-{i}"))).unwrap();
+        }
+        // 两份同内容(C)stale:旧(20260610)+ 新(20260620)。
+        let older_c = paths.active_snapshots_dir.join("20260610T000000000-p1");
+        std::fs::create_dir_all(&older_c).unwrap();
+        std::fs::write(config_path(&older_c), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&older_c, &mk_manifest("20260610T000000000-p1")).unwrap();
+        let newer_c = paths.active_snapshots_dir.join("20260620T000000000-p1");
+        std::fs::create_dir_all(&newer_c).unwrap();
+        std::fs::write(config_path(&newer_c), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&newer_c, &mk_manifest("20260620T000000000-p1")).unwrap();
+
+        move_stale_active_snapshots_to_recovery(&paths).unwrap();
+
+        let c_dirs: Vec<_> = snapshot_dirs_under(&paths.recovery_snapshots_dir)
+            .into_iter()
+            .filter(|d| {
+                read_snapshot_config_from_dir(d).as_deref() == Some("openai_base_url = \"C\"\n")
+            })
+            .collect();
+        assert_eq!(c_dirs.len(), 1, "内容 C 应恰好留一份(替换式去重不累积)");
+        assert!(
+            dir_name(&c_dirs[0])
+                .map(|n| n.starts_with("20260620"))
+                .unwrap_or(false),
+            "留存的 C 副本应是**最新** stale(20260620)而非旧份(20260610):实际 {:?}",
+            dir_name(&c_dirs[0])
         );
     }
 
