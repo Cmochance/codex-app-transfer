@@ -449,8 +449,13 @@ async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
 /// ① 非 2xx (反爬 403 / 限流 429 / 5xx); ② CF 挑战 (header 或 body 标记);
 /// ③ 空 body; ④ JS 空骨架 (HTML 但剥 script 后几乎无可见文本 → 内容靠 JS 渲染)。
 fn needs_upgrade(raw: &RawFetch) -> bool {
-    // 只有 200 算"正常拿到内容"; 202/203/206 等对 HTML GET 异常 (反爬常用 202 软拦, 见 DDG
-    // anomaly), 一律升级 (review M1: 旧 `!(200..300)` 放过 202 反爬页当成功)。
+    // 非 HTML (JSON / text API): 所有 2xx 都算成功 —— 201/202/206 是合法 API 状态, 且升 headless
+    // 会把 JSON 序列化成 browser document 破坏结构 (chatgpt-codex review); 只有非 2xx 才升级。
+    if !raw.is_html {
+        return !(200..300).contains(&raw.status);
+    }
+    // 以下针对 HTML: 只 200 算"正常拿到内容"; 202 等对 HTML GET 异常 (反爬常用 202 软拦, 见 DDG
+    // anomaly), 升级 (review M1: 旧 `!(200..300)` 放过 HTML 202 反爬页当成功)。
     if raw.status != 200 {
         return true;
     }
@@ -460,7 +465,7 @@ fn needs_upgrade(raw: &RawFetch) -> bool {
     if raw.body.trim().is_empty() {
         return true;
     }
-    raw.is_html && is_js_shell(&raw.body)
+    is_js_shell(&raw.body)
 }
 
 /// body 是否是反爬挑战 / 软拦截页 (CF + 通用反爬, 只看前 4KB)。命中即 Auto 升级。
@@ -769,6 +774,20 @@ mod tests {
         assert!(!needs_upgrade(&RawFetch {
             status: 200,
             body: "{\"k\":1}".to_string(),
+            is_html: false,
+            cf_challenge_header: false,
+        }));
+        // 非 HTML 202 (合法 API Accepted) → 不升级 (chatgpt-codex: 保留 API 响应, 不升 headless)
+        assert!(!needs_upgrade(&RawFetch {
+            status: 202,
+            body: "{\"job\":\"queued\"}".to_string(),
+            is_html: false,
+            cf_challenge_header: false,
+        }));
+        // 非 HTML 非 2xx → 升级 (连接级问题, 试别的 client)
+        assert!(needs_upgrade(&RawFetch {
+            status: 500,
+            body: "err".to_string(),
             is_html: false,
             cf_challenge_header: false,
         }));
