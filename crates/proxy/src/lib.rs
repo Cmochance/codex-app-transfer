@@ -17,6 +17,7 @@ pub mod forward;
 pub mod resolver;
 pub mod server;
 pub mod telemetry;
+pub mod trace_store;
 pub mod validation;
 
 pub use diagnostics::{feedback_bundle_dir, recent_feedback_bundles};
@@ -26,3 +27,4 @@ pub use resolver::{
 };
 pub use server::build_router;
 pub use telemetry::{proxy_log_dir, proxy_telemetry, ProxyLogEntry, ProxyStatsSnapshot};
+pub use trace_store::{trace_store, TraceEntry, TraceKind, TraceStore};

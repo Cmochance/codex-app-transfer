@@ -172,10 +172,19 @@ fn dispatch_line(
             let _ = out_tx.send(json!({"jsonrpc": "2.0", "id": id, "result": {}}));
         }
         "tools/list" => {
+            // web_fetch 任意启用档都暴露(off 时本 server 根本不注册);web_search 仅 headless 档
+            // 暴露 —— 它必须 headless(DDG 反爬只有真浏览器能过), 非 headless 档列出来模型也只能被
+            // handle 拒, 徒增无效调用(用户 #386 验收反馈)。改档需重启 Codex 重新 tools/list 才反映
+            // (与 web_fetch 改 on/off 需重启一致);运行期切档的 stale 缓存由 handle_web_search_call
+            // 的 backend gate 兜底(failing 双保险)。
+            let mut tools = vec![web_fetch_tool_def()];
+            if matches!(current_backend(), Ok(Some(WebFetchBackend::Headless))) {
+                tools.push(web_search_tool_def());
+            }
             let _ = out_tx.send(json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": { "tools": [web_fetch_tool_def()] }
+                "result": { "tools": tools }
             }));
         }
         "tools/call" => {
@@ -185,16 +194,11 @@ fn dispatch_line(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let url = params
+            // 取整个 arguments 对象, 按 tool name 在 dispatch_tool_call 里分派取各自参数。
+            let arguments = params
                 .and_then(|p| p.get("arguments"))
-                .and_then(|a| a.get("url"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string());
-            let prompt = params
-                .and_then(|p| p.get("arguments"))
-                .and_then(|a| a.get("prompt"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string());
+                .cloned()
+                .unwrap_or(Value::Null);
             let call_id = id.clone().unwrap_or(Value::Null);
             let out = out_tx.clone();
             let sem = Arc::clone(sem);
@@ -207,17 +211,16 @@ fn dispatch_line(
                     Ok(p) => p,
                     Err(_) => return, // semaphore 已关(收尾), 放弃本次
                 };
-                let fut = std::panic::AssertUnwindSafe(handle_web_fetch_call(
+                let fut = std::panic::AssertUnwindSafe(dispatch_tool_call(
                     call_id.clone(),
                     &name,
-                    url,
-                    prompt,
+                    arguments,
                 ));
                 let resp = match futures::FutureExt::catch_unwind(fut).await {
                     Ok(v) => v,
                     Err(_) => tool_error(
                         call_id,
-                        "抓取过程内部异常(headless 浏览器崩溃?), 已跳过本次。可重试或切换后端档位。",
+                        "工具调用内部异常(headless 浏览器崩溃?), 已跳过本次。可重试或切换后端档位。",
                     ),
                 };
                 let _ = out.send(resp);
@@ -233,15 +236,36 @@ fn dispatch_line(
 }
 
 /// 处理 `tools/call`。owned 参数, 避免跨 await 借用 req。
-async fn handle_web_fetch_call(
-    id: Value,
-    name: &str,
-    url: Option<String>,
-    prompt: Option<String>,
-) -> Value {
-    if name != "web_fetch" {
-        return rpc_error(id, -32602, &format!("Unknown tool: {name}"));
+/// 按 tool name 分派 `tools/call`(owned 参数避免跨 await 借用 req)。新增工具在此加分支。
+async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
+    match name {
+        "web_fetch" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let prompt = args
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            handle_web_fetch_call(id, url, prompt).await
+        }
+        "web_search" => {
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let max = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            handle_web_search_call(id, query, max).await
+        }
+        other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
+}
+
+async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<String>) -> Value {
     let url = match url {
         Some(u) if !u.is_empty() => u,
         _ => return tool_error(id, "缺少必填参数 url(需绝对 http(s) URL)"),
@@ -303,6 +327,73 @@ async fn handle_web_fetch_call(
         },
         Err(e) => tool_error(id, &format!("抓取失败(后端 {}): {e}", backend.as_str())),
     }
+}
+
+/// 处理 `web_search` tools/call: 走 DDG(headless)搜索, 返回结构化结果列表给模型。
+/// **要求 webFetchBackend == headless 档**(chatgpt-codex review #386): web_search 必须 headless
+/// (DDG 纯 HTTP 被 202 反爬拦, spike 实测 wreq 6 变体全灭, MOC-12), 故 ① 尊重 off(用户运行期
+/// 关联网即拒, 与 web_fetch 每次 re-read backend 的 runtime guard 对齐)② 不在 curl/wreq 档静默
+/// 后台下载 ~86MB chrome-headless-shell(那两档没走过 headless 的 UI consent 下载流程)。
+async fn handle_web_search_call(
+    id: Value,
+    query: Option<String>,
+    max_results: Option<usize>,
+) -> Value {
+    let query = match query {
+        Some(q) if !q.is_empty() => q,
+        _ => return tool_error(id, "缺少必填参数 query(搜索关键词 / 问题)"),
+    };
+    // web_search 必须 headless → 要求 headless 档: off 拒(尊重关闭), curl/wreq 拒 + 引导切档
+    // (避免静默下载 Chrome), 仅 headless 档放行(其 Chrome 已走过 UI consent 下载)。
+    match current_backend() {
+        Ok(Some(WebFetchBackend::Headless)) => {}
+        Ok(Some(other)) => {
+            return tool_error(
+                id,
+                &format!(
+                    "web_search 需要 headless 档(DDG 反爬只有真浏览器能过)。当前是 {} 档 —— 请在 \
+                     codex-app-transfer 设置 → 内置联网抓取工具 选 headless(首次会确认下载 Chrome)再用。",
+                    other.as_str()
+                ),
+            )
+        }
+        Ok(None) => {
+            return tool_error(
+                id,
+                "联网抓取工具已关闭。web_search 需在 codex-app-transfer 设置 → 内置联网抓取工具 选 headless 后使用。",
+            )
+        }
+        Err(e) => {
+            return tool_error(
+                id,
+                &format!("读取联网设置失败: {e}(请检查 ~/.codex-app-transfer/config.json)"),
+            )
+        }
+    }
+    let max = max_results.unwrap_or(codex_app_transfer_http::search::DEFAULT_MAX_RESULTS);
+    match codex_app_transfer_http::web_search(&query, max).await {
+        Ok(results) => tool_ok(
+            id,
+            &truncate(&format_search_results(&query, &results), MAX_CONTENT_CHARS),
+        ),
+        Err(e) => tool_error(id, &format!("web_search 失败: {e}")),
+    }
+}
+
+/// 把结果列表格式化成给模型的 markdown(序号 + 标题 + URL + 摘要 + 两段式用法提示)。
+fn format_search_results(query: &str, results: &[codex_app_transfer_http::SearchResult]) -> String {
+    let mut s = format!(
+        "web_search「{query}」共 {} 条结果。挑你需要的用 web_fetch 抓 URL 取正文:\n\n",
+        results.len()
+    );
+    for (i, r) in results.iter().enumerate() {
+        s.push_str(&format!("{}. {}\n   {}\n", i + 1, r.title, r.url));
+        if !r.snippet.is_empty() {
+            s.push_str(&format!("   {}\n", r.snippet));
+        }
+        s.push('\n');
+    }
+    s
 }
 
 /// 网页摘要配置(每次 `tools/call` 读 config, 改配置无需重启 Codex)。
@@ -702,6 +793,33 @@ fn web_fetch_tool_def() -> Value {
     })
 }
 
+fn web_search_tool_def() -> Value {
+    json!({
+        "name": "web_search",
+        "title": "Web Search",
+        "description": "用 DuckDuckGo 搜索一个查询, 返回结构化结果列表(标题 + URL + 摘要)。\
+    拿到结果后用 web_fetch 抓你需要的 URL 取正文 —— 两段式: 先 search 找信息源, 再 fetch 读内容。\
+    **不知道确切 URL 时用它, 别瞎猜 URL**(尤其官方文档 / 帮助中心 / 论坛帖)。由 codex-app-transfer \
+    经 headless 浏览器代搜(免 key, 不依赖当前 provider 是否支持原生 web_search)。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键词 / 问题(如『codex cli 0.136 release notes』『openai 退款政策』)。"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "返回结果数上限(默认 8, 最多 20)。",
+                    "minimum": 1,
+                    "maximum": 20
+                }
+            },
+            "required": ["query"]
+        }
+    })
+}
+
 /// 按字符截断(非字节, 防截断多字节 UTF-8)。超限时尽量退到最近的换行边界, 避免从句中 /
 /// 词中硬切(markdown 段落更完整);仅当该边界离上限不太远(末 1/4 内)才退, 否则宁可硬切
 /// 也不浪费过多预算。提示语引导模型抓更具体子页, 而非反复抓同一巨页。
@@ -765,6 +883,30 @@ mod tests {
         assert_eq!(d["inputSchema"]["required"][1], "prompt");
         assert_eq!(d["inputSchema"]["properties"]["url"]["type"], "string");
         assert_eq!(d["inputSchema"]["properties"]["prompt"]["type"], "string");
+    }
+
+    #[test]
+    fn web_search_tool_def_shape() {
+        let d = web_search_tool_def();
+        assert_eq!(d["name"], "web_search");
+        assert_eq!(d["inputSchema"]["required"][0], "query");
+        assert_eq!(d["inputSchema"]["properties"]["query"]["type"], "string");
+        assert_eq!(
+            d["inputSchema"]["properties"]["max_results"]["type"],
+            "integer"
+        );
+    }
+
+    #[test]
+    fn format_search_results_shape() {
+        let results = vec![codex_app_transfer_http::SearchResult {
+            title: "T".into(),
+            url: "https://e.com".into(),
+            snippet: "S".into(),
+        }];
+        let out = format_search_results("q", &results);
+        assert!(out.contains("https://e.com"));
+        assert!(out.contains("web_fetch")); // 带两段式用法提示
     }
 
     #[test]
