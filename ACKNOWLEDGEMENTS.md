@@ -401,6 +401,24 @@
 
 ---
 
+## deedy5/duckduckgo_search
+
+- **Link**: https://github.com/deedy5/duckduckgo_search
+- **License**: 见上游 LICENSE(算法 / 思路借鉴,未在本项目代码固化版本)
+- **借鉴形式**: 算法借鉴 / 思路 · 模式借鉴(DDG html 版结果解析模式,代码自行实现)
+- **首次借鉴 PR / 时间**: #386 / 2026-06-04(MOC-12 web_search 工具)
+- **借鉴清单**:
+  - **DDG html 版(`html.duckduckgo.com/html/`)结果解析模式** —— `.result__a`(标题 + href)/ `.result__snippet`(摘要)CSS selector → `crates/http/src/search.rs::parse_ddg_html`
+  - **`uddg` 重定向解码** —— href `//duckduckgo.com/l/?uddg=<urlencoded 真实 URL>&rut=...` 取 `uddg` 参数 urldecode 出真实落地 URL → `crates/http/src/search.rs::decode_href`
+- **本项目差异 / 扩展**:
+  - 上游是 Python 完整 SDK(纯 HTTP 请求);本项目仅借其 html 版**解析模式**,用 Rust `dom_query` 自行实现。
+  - **关键差异:抓取走 headless 而非纯 HTTP** —— 实测 DDG 对纯 HTTP(含 wreq Chrome120 指纹 + 完整 header + POST + lite 共 6 变体)一律 202 anti-bot 拦,故经 headless Chromium 真跑 JS 过反爬(上游纯 HTTP 模式在本项目环境不可用)。
+  - 广告过滤(`is_ad`)+ anomaly 页检测(`has_anomaly_markers`)按本项目 spike 实测自行实现,非上游。
+- **同步策略**: monitor only —— DDG 改 `.result__a` / `.result__snippet` class 或 `uddg` 格式时,按借鉴清单 file:line 定位本项目解析处同步。
+- **关联**: MOC-12 / PR #386
+
+---
+
 ## 维护规则
 
 - **新增借鉴**:1 个 PR 内 ① README 致谢段加一行概览 ② 本文档加完整 entry(必填字段全),缺一不可
