@@ -30,10 +30,17 @@ updates:
         patterns:
           - "wreq"
           - "wreq-util"
-      # 其余依赖合并成一个 PR,跟 cf-bypass 分开,免互相干扰
+      # 其余依赖:只把 patch 级(向后兼容 bugfix)合并成一个低风险 PR 一起合;
+      # minor/major 不进 group、各自单独成 PR 逐个评估适配。原因:Rust 生态大量
+      # crate 仍 0.x,breaking 常走 minor 段(getrandom 0.2→0.4 / sha2 0.10→0.11
+      # 等),"非 patch 即单独 PR"比纯按 semver-major 过滤更稳。#372 曾一锅端 17 个
+      # 含 7~8 个 major breaking(且 sha2/rand 与未升级的 rsa 0.9 冲突)不可控,
+      # 故 MOC-160 改此策略。cf-bypass group 不设 update-types(锁步升级不分级别)。
       everything-else:
         patterns:
           - "*"
         exclude-patterns:
           - "wreq"
           - "wreq-util"
+        update-types:
+          - "patch"
