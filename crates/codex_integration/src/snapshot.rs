@@ -639,19 +639,16 @@ fn snapshot_dir_matches_id(dir: &Path, snapshot_id: &str) -> bool {
 
 fn move_stale_active_snapshots_to_recovery(paths: &CodexPaths) -> Result<(), CodexError> {
     let current = current_session_id().to_owned();
-    // 先封顶一次再做内容去重(MOC-148 review P2 #2):recovery 已超额时,**会被 prune 清掉的
-    // 旧份不应再左右去重判断** —— 否则"旧重复存在 → 丢弃 stale,随后 prune 又删掉那份旧
-    // 重复"会让该内容在 recovery 里一份不剩。先 prune,stale 的去重只针对会留存的集合:
-    // 命中(留存份)才丢弃 stale;未命中则把 stale 作为最新一份移入,由末尾 prune 收敛。
-    // best-effort:纯 GC,失败不冒泡(见 prune_recovery_snapshots)。
-    prune_recovery_snapshots(paths);
     for dir in snapshot_dirs_under(&paths.active_snapshots_dir) {
         if dir_name(&dir).as_deref() == Some(current.as_str()) {
             continue;
         }
+        // 去重为**替换式**(见 move_snapshot_dir_to_recovery):命中旧重复时把更新的 stale
+        // 作为最新一份移入,内容以最新时间戳存活 → 末尾 prune 不论 cap 状态都不会误删它。
+        // 故无需"去重前先 prune"(MOC-148 review P2:那只防已超额、防不住本轮移入后才超额)。
         move_snapshot_dir_to_recovery(paths, &dir)?;
     }
-    // 迁移后再封顶一次(本次新移入的份 + 修复前积压的历史无上限存量)。
+    // 每次 apply 顺手封顶 recovery/(也清理修复前积压的历史无上限存量)。
     // best-effort:纯 GC,失败不冒泡阻断 apply(见 prune_recovery_snapshots)。
     prune_recovery_snapshots(paths);
     Ok(())
@@ -744,18 +741,19 @@ fn snapshot_content_for_dedup(
     Some((config, auth, atom))
 }
 
-/// recovery/ 是否已存在与 `dir` 内容(config + auth + atom restore 等价键)完全相同的备份。
+/// recovery/ 中与 `dir` 内容(config + auth + atom restore 等价键)完全相同的备份目录列表。
 ///
 /// 保守语义:`dir` 自身 config/auth 读不出、或 manifest **存在但损坏** → 视为内容不可判定,
-/// 直接返回 `false`(当作非重复、保留),绝不因"读不出/损坏"去删唯一副本;某份 recovery
-/// config/auth 读不出或 manifest 损坏 → 该份不参与匹配(不拿无法手动恢复的损坏份当去重目标)。
-fn recovery_has_content_duplicate(paths: &CodexPaths, dir: &Path) -> bool {
+/// 返回空(当作非重复、保留),绝不因"读不出/损坏"去删唯一副本;某份 recovery config/auth
+/// 读不出或 manifest 损坏 → 该份不参与匹配(不拿无法手动恢复的损坏份当去重目标)。
+fn recovery_content_duplicate_dirs(paths: &CodexPaths, dir: &Path) -> Vec<PathBuf> {
     let Some(target) = snapshot_content_for_dedup(dir) else {
-        return false;
+        return Vec::new();
     };
     snapshot_dirs_under(&paths.recovery_snapshots_dir)
-        .iter()
-        .any(|rec| snapshot_content_for_dedup(rec).as_ref() == Some(&target))
+        .into_iter()
+        .filter(|rec| snapshot_content_for_dedup(rec).as_ref() == Some(&target))
+        .collect()
 }
 
 /// recovery/ 只保留最近 [`MAX_RECOVERY_SNAPSHOTS`] 份,其余物理删除。
@@ -786,11 +784,24 @@ fn prune_recovery_snapshots(paths: &CodexPaths) {
 }
 
 fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), CodexError> {
-    // 备份去重:recovery/ 已有内容(config+auth)相同的备份时,直接丢弃这份 stale
-    // active,不再存一份重复内容(用户要求:备份时字段比对,不留重复)。
-    if recovery_has_content_duplicate(paths, dir) {
-        std::fs::remove_dir_all(dir)?;
-        return Ok(());
+    // 备份去重(**替换式**,MOC-148 review P2):recovery/ 已有内容(config+auth+atom 键)
+    // 相同的旧份时,**删掉旧份、把这份更新的 stale 作为最新一份移入**(下方 rename),
+    // 而非"删 stale 保留旧份"。后者在 recovery 接近/达到上限时有内容丢失风险:旧份可能
+    // 随后被 `prune_recovery_snapshots` 清掉(本轮还有别的 stale 移入顶过上限时),导致该
+    // 内容在 recovery 里一份不剩。替换后内容以最新时间戳存活,prune 不论 cap 状态都不会
+    // 误删;且始终只保留一份,不累积重复(用户要求:备份时字段比对,不留重复)。
+    //
+    // best-effort:删旧份失败只 warn(回退为"临时多留一份重复",末尾 prune 再收敛),
+    // 不冒泡阻断 apply。
+    for old in recovery_content_duplicate_dirs(paths, dir) {
+        if let Err(e) = std::fs::remove_dir_all(&old) {
+            tracing::warn!(
+                target: "codex_integration::snapshot",
+                dir = %old.display(),
+                error = %e,
+                "remove stale recovery duplicate failed; skipping (best-effort)",
+            );
+        }
     }
 
     let fallback = dir_name(dir).unwrap_or_else(|| current_session_id().to_owned());
@@ -1202,8 +1213,8 @@ mod tests {
         dir
     }
 
-    /// 备份去重:recovery/ 已有内容(config+auth)相同的备份时,stale active 被丢弃,
-    /// 不再新增一份重复内容。
+    /// 备份去重(替换式):recovery/ 已有内容相同的旧份时,删旧份、把更新的 stale 作为
+    /// 最新一份移入 —— 最终仍只一份(不累积重复),且内容以最新时间戳存活。
     #[test]
     fn move_to_recovery_skips_content_duplicate() {
         let (_t, paths) = paths_with_tmp();
@@ -1343,7 +1354,7 @@ mod tests {
 
     /// MOC-148 review P2(#2):recovery 超额(已有 MAX 份**更新**的 + 1 份与 stale 同内容的
     /// **更旧**份)时,迁移不能"因旧重复存在就丢弃 stale,随后 prune 又删掉那份旧重复"——
-    /// 否则该内容在 recovery 里一份不剩。修复后(去重判断前先 prune)stale 内容应存活。
+    /// 否则该内容在 recovery 里一份不剩。替换式去重(删旧份 + 移入更新的 stale)后内容存活。
     #[test]
     fn stale_content_survives_when_recovery_over_cap_with_old_duplicate() {
         let (_t, paths) = paths_with_tmp();
@@ -1382,6 +1393,61 @@ mod tests {
         assert!(
             content_c_survives,
             "去重 + prune 后内容 C 仍应在 recovery 留有一份(不两头落空)"
+        );
+        assert!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
+            "recovery 仍受上限约束"
+        );
+    }
+
+    /// MOC-148 review P2:recovery **恰好 = MAX**(pre-loop prune 无效)、最旧份与某 stale 同内容,
+    /// 且本轮**另有一个新内容 stale**一起移入 → 末尾 prune 会把那份旧重复清掉。替换式去重把同
+    /// 内容 stale 提为最新份,内容随之以最新时间戳存活,不被 prune 误删。
+    #[test]
+    fn stale_content_survives_at_cap_when_sibling_move_triggers_prune() {
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.recovery_snapshots_dir).unwrap();
+
+        // recovery 恰好占满 MAX:最旧一份内容 = C(与下面 stale-C 相同),其余内容各异。
+        let old_dup_c = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&old_dup_c).unwrap();
+        std::fs::write(config_path(&old_dup_c), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&old_dup_c, &mk_manifest("old-dup-c")).unwrap();
+        for i in 1..MAX_RECOVERY_SNAPSHOTS {
+            let d = paths
+                .recovery_snapshots_dir
+                .join(format!("2026060{}T000000000-p9", i + 1));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(config_path(&d), format!("openai_base_url = \"K{i}\"\n")).unwrap();
+            write_manifest_to_dir(&d, &mk_manifest(&format!("keep-{i}"))).unwrap();
+        }
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            MAX_RECOVERY_SNAPSHOTS,
+            "前置:recovery 恰好占满 MAX(pre-loop prune 此时是 no-op)"
+        );
+
+        // 本轮两个 stale active:一个内容 C(与最旧份重复),一个新内容 NEW。
+        let stale_c = paths.active_snapshots_dir.join("20260620T000000000-p1");
+        std::fs::create_dir_all(&stale_c).unwrap();
+        std::fs::write(config_path(&stale_c), "openai_base_url = \"C\"\n").unwrap();
+        write_manifest_to_dir(&stale_c, &mk_manifest("20260620T000000000-p1")).unwrap();
+
+        let stale_new = paths.active_snapshots_dir.join("20260621T000000000-p1");
+        std::fs::create_dir_all(&stale_new).unwrap();
+        std::fs::write(config_path(&stale_new), "openai_base_url = \"NEW\"\n").unwrap();
+        write_manifest_to_dir(&stale_new, &mk_manifest("20260621T000000000-p1")).unwrap();
+
+        move_stale_active_snapshots_to_recovery(&paths).unwrap();
+
+        let content_c_survives = snapshot_dirs_under(&paths.recovery_snapshots_dir)
+            .iter()
+            .any(|d| {
+                read_snapshot_config_from_dir(d).as_deref() == Some("openai_base_url = \"C\"\n")
+            });
+        assert!(
+            content_c_survives,
+            "at-cap + 兄弟移入触发 prune 后,内容 C 仍应存活(替换式去重提为最新份)"
         );
         assert!(
             snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
