@@ -510,6 +510,9 @@ async fn connect_and_monitor(
     // 不变量,防 PR#255 BUG-0002)。interval 用 Skip 防慢响应时 backlog 积压;仅诊断 gate 开时
     // 真正发 drain(关时 recorder 根本没注入、`window.__codexMcpTrace` 不存在,这里也直接 skip)。
     let mut pending_drain_id: Option<u64> = None;
+    // 是否已往页内 recorder 启用过采集(诊断 on 时置 true);用于 on→off 时发一次性"停采+清队列"
+    // eval(关掉已注入的页内 recorder,避免 toggle off 后页未 reload 仍在渲染进程囤未脱敏流量)。
+    let mut mcp_recorder_enabled = false;
     let mut mcp_drain_interval = tokio::time::interval(Duration::from_secs(2));
     mcp_drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     mcp_drain_interval.tick().await; // 跳过首次立即触发
@@ -649,27 +652,42 @@ async fn connect_and_monitor(
                 pending_heartbeat_id = Some(ping_id);
             }
 
-            // [MOC-169] MCP-trace drain(fire-and-forget,gated)。仅诊断开 + 上一轮已回包才发;
-            // 响应在 read 分支按 pending_drain_id 处理。drain 关时无任何 CDP 往返。
+            // [MOC-169] MCP-trace drain(fire-and-forget,gated)。响应在 read 分支按
+            // pending_drain_id 处理。诊断 on:drain eval 顺带把页内 `__codexMcpTraceOn` 置回 true
+            // (支持 off→on 再启)。诊断 on→off(transition):发一次性 eval 停采 + 清空页内队列,
+            // 之后保持静默(不再每 2s 往返)。一直 off:无任何 CDP 往返。
             _ = mcp_drain_interval.tick() => {
-                if pending_drain_id.is_some()
-                    || !codex_app_transfer_proxy::diagnostics::forward_trace_enabled()
-                {
+                if pending_drain_id.is_some() {
                     continue;
                 }
-                let (drain_msg, drain_id) = make_cdp_msg(
-                    msg_id_counter,
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": "(window.__codexMcpTrace && window.__codexMcpTrace.splice(0)) || []",
-                        "returnByValue": true
-                    }),
-                );
-                if let Err(e) = write.send(WsMessage::Text(drain_msg)).await {
-                    tracing::warn!("[McpTrace] drain send failed: {}", e);
-                    break;
+                if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() {
+                    mcp_recorder_enabled = true;
+                    let (drain_msg, drain_id) = make_cdp_msg(
+                        msg_id_counter,
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": "window.__codexMcpTraceOn=true; (window.__codexMcpTrace && window.__codexMcpTrace.splice(0)) || []",
+                            "returnByValue": true
+                        }),
+                    );
+                    if let Err(e) = write.send(WsMessage::Text(drain_msg)).await {
+                        tracing::warn!("[McpTrace] drain send failed: {}", e);
+                        break;
+                    }
+                    pending_drain_id = Some(drain_id);
+                } else if mcp_recorder_enabled {
+                    // on→off:一次性关掉页内 recorder + 清队列(fire-and-forget,响应忽略),之后静默
+                    mcp_recorder_enabled = false;
+                    let (off_msg, _off_id) = make_cdp_msg(
+                        msg_id_counter,
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": "try{window.__codexMcpTraceOn=false;if(window.__codexMcpTrace)window.__codexMcpTrace.length=0}catch(e){}",
+                            "returnByValue": true
+                        }),
+                    );
+                    let _ = write.send(WsMessage::Text(off_msg)).await;
                 }
-                pending_drain_id = Some(drain_id);
             }
         }
     }
@@ -1068,6 +1086,9 @@ const MCP_RECORDER_JS: &str = r#"
     if (window.__codexMcpTraceInit) return;
     window.__codexMcpTraceInit = true;
     window.__codexMcpTrace = [];
+    // 运行时开关:daemon 在诊断 on→off 时置 false(停止入队 + 清队列),再 on 时 drain eval 置回
+    // true。这样 toggle off 后即便页未 reload、wrap 仍在,push 也立刻 no-op,不再在渲染进程囤流量。
+    window.__codexMcpTraceOn = true;
     const PATTERN = /mcp|linear|oauth|authorize|callback|tools\/list|resources\/list|initialize|json[_-]?rpc|sse/i;
     const MAX_BODY = 65536;
     const MAX_QUEUE = 5000;
@@ -1084,6 +1105,7 @@ const MCP_RECORDER_JS: &str = r#"
             : str;
     }
     function push(entry) {
+        if (window.__codexMcpTraceOn === false) return; // 诊断已关 → 不入队(daemon 控制)
         window.__codexMcpTrace.push(Object.assign({ ts: new Date().toISOString() }, entry));
         while (window.__codexMcpTrace.length > MAX_QUEUE) window.__codexMcpTrace.shift();
     }
