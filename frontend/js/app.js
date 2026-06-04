@@ -8494,6 +8494,11 @@
       const on = $("#traceViewerEnabled")?.checked === true;
       if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !on;
       await saveSettingsFromForm();
+      // [MOC-169] 快速 on→off 竞争:若 await 期间用户又 toggle 了(当前 checkbox 状态已与本次
+      // 捕获的 on 不符),本次是 stale handler → 放弃 start/stop,交给最新那次 change 处理。
+      // 否则 stale 的 on handler 可能在 off 之后又 start,留 viewer 开但开关显示关
+      // (后端 start_lock 排不了序,因为前端在 save 之后才发 /start)。
+      if (($("#traceViewerEnabled")?.checked === true) !== on) return;
       try {
         if (on) {
           const r = await CCApi.traceViewerStart();
