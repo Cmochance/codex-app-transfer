@@ -482,7 +482,8 @@ impl ResponseSessionCache {
                 return Ok(0);
             };
             if migration_done(conn).map_err(|e| format!("read migration flag failed: {e}"))? {
-                // MOC-171:已迁移 → 仍补跑一次 VACUUM(若上次失败 pending);解耦重试。
+                // MOC-171:已迁移 → 检查 VACUUM 是否本版本 pending("0")需补跑(解耦重试);
+                // legacy(MOC-170)库无此标记 → ensure_vacuumed 内跳过,不无谓 VACUUM(P2)。
                 ensure_vacuumed(conn).map_err(|e| format!("vacuum retry failed: {e}"))?;
                 return Ok(0);
             }
@@ -577,6 +578,10 @@ impl ResponseSessionCache {
             return Ok(total);
         };
         set_migration_done(conn).map_err(|e| format!("set migration flag failed: {e}"))?;
+        // MOC-171:标记本版本待 VACUUM(pending="0"),随即尝试(成功→"1",失败留"0"下次重试)。
+        // legacy(MOC-170)库不会有这个 "0" 标记,早返分支因此不会对它无谓 VACUUM(P2)。
+        meta_set(conn, VACUUM_FLAG_KEY, "0")
+            .map_err(|e| format!("set vacuum pending failed: {e}"))?;
         ensure_vacuumed(conn).map_err(|e| format!("vacuum failed: {e}"))?;
         Ok(total)
     }
@@ -767,10 +772,10 @@ const MIGRATE_BATCH: i64 = 200;
 /// `sessions_meta` 里标记"存量内容寻址迁移已完成"的 key(幂等 guard)。
 const MIGRATION_FLAG_KEY: &str = "content_addr_migrated";
 
-/// `sessions_meta` 里标记"迁移收尾 VACUUM 物理压实已完成"的 key(MOC-171)。与
-/// `MIGRATION_FLAG_KEY` **解耦**:迁移逻辑去重完成即置 migrated(避免大表每次启动全表
-/// 重扫),但 VACUUM 失败(大库磁盘紧张最易触发)时**不**置 vacuumed → 下次启动单独补跑
-/// VACUUM(不重扫表),直到成功。
+/// `sessions_meta` 里 VACUUM 物理压实状态 key(MOC-171)。**三态**:`"1"`=已成功、
+/// `"0"`=本版本迁移收尾标记的 pending(待跑/重试)、**缺失**=上一版本(MOC-170)迁移的
+/// legacy 库(VACUUM 态未知,不打扰)。与 `MIGRATION_FLAG_KEY` 解耦让 migrated 先置(避免
+/// 大表每次启动全表重扫),只 `"0"` 触发(重)跑 VACUUM —— 见 [`ensure_vacuumed`]。
 const VACUUM_FLAG_KEY: &str = "content_addr_vacuumed";
 
 /// 两级外置(MOC-142 blob → MOC-168 message,顺序固定):把一组消息**就地**转成
@@ -790,47 +795,52 @@ fn externalize_for_storage(conn: &Connection, blobs: Option<&BlobStore>, message
     message_store::externalize(conn, messages);
 }
 
-/// 读 `sessions_meta` 里某个布尔标志("1" = 真,缺失 = 假)。
-fn meta_flag_get(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
-    let v: Option<String> = conn
-        .query_row(
-            "SELECT value FROM sessions_meta WHERE key = ?1",
-            params![key],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(v.as_deref() == Some("1"))
+/// 读 `sessions_meta` 里某个 key 的原始值(缺失 = `None`)。
+fn meta_get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM sessions_meta WHERE key = ?1",
+        params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
 }
 
-/// 置 `sessions_meta` 里某个布尔标志为 "1"。
-fn meta_flag_set(conn: &Connection, key: &str) -> rusqlite::Result<()> {
+/// 置 `sessions_meta` 里某个 key 的值。
+fn meta_set(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO sessions_meta (key, value) VALUES (?1, '1')",
-        params![key],
+        "INSERT OR REPLACE INTO sessions_meta (key, value) VALUES (?1, ?2)",
+        params![key, value],
     )?;
     Ok(())
 }
 
 /// 读"存量迁移已完成"标志(MOC-170 幂等 guard)。
 fn migration_done(conn: &Connection) -> rusqlite::Result<bool> {
-    meta_flag_get(conn, MIGRATION_FLAG_KEY)
+    Ok(meta_get(conn, MIGRATION_FLAG_KEY)?.as_deref() == Some("1"))
 }
 
 /// 置"存量迁移已完成"标志。
 fn set_migration_done(conn: &Connection) -> rusqlite::Result<()> {
-    meta_flag_set(conn, MIGRATION_FLAG_KEY)
+    meta_set(conn, MIGRATION_FLAG_KEY, "1")
 }
 
-/// MOC-171:确保迁移收尾的 VACUUM 物理压实完成(幂等、可断点重试)。已 vacuumed →
-/// no-op;否则跑一次 `VACUUM`,**成功才**置 vacuumed flag,失败仅 warn 留待下次启动
-/// 重试(不阻断 —— 逻辑去重已生效,VACUUM 纯物理压实)。**VACUUM 必须在无活动事务时
-/// 调**:调用点(迁移收尾 / 早返分支)的 `conn` 此时均无活动 tx。
+/// MOC-171:迁移收尾 VACUUM 物理压实(可断点重试)。vacuumed [`VACUUM_FLAG_KEY`] **三态**:
+/// - `"1"` = 已成功 → no-op;
+/// - `"0"` = 本版本迁移收尾标记的 **pending**(尝试过/待跑)→ (重)跑;
+/// - **缺失** = 上一版本(MOC-170)迁移的 legacy 库,VACUUM 态未知 → **不打扰**(保持
+///   MOC-170 "不重试" 行为)。
+///
+/// 关键(codex-connector P2):只有明确写过 `"0"` 才(重)跑。否则 MOC-170 迁移过的升级
+/// 用户库(`migrated=1` 但从无 vacuumed flag)会被早返分支每次启动无谓 VACUUM,大库
+/// (尤其 MOC-170 时 VACUUM 已失败的 5.5G 库)磁盘不足时每次启动重试、持 db mutex 卡
+/// serving。VACUUM 成功 → `"1"`;失败 → 留 `"0"` 下次重试。**必须在无活动事务时调**
+/// (迁移收尾 / 早返分支的 `conn` 均无活动 tx)。
 fn ensure_vacuumed(conn: &Connection) -> rusqlite::Result<()> {
-    if meta_flag_get(conn, VACUUM_FLAG_KEY)? {
-        return Ok(());
+    if meta_get(conn, VACUUM_FLAG_KEY)?.as_deref() != Some("0") {
+        return Ok(()); // "1"=已成功 / 缺失=legacy(不打扰) → 不跑
     }
     match conn.execute_batch("VACUUM") {
-        Ok(()) => meta_flag_set(conn, VACUUM_FLAG_KEY)?,
+        Ok(()) => meta_set(conn, VACUUM_FLAG_KEY, "1")?,
         Err(e) => log_db_warning(
             "SESSIONS_DB_MIGRATE_VACUUM_FAILED",
             format!(
@@ -1934,16 +1944,16 @@ mod tests {
         );
         insert_legacy_row(&path, "r", &json!([{"role": "user", "content": "x"}]));
         cache.migrate_existing_rows().unwrap();
-        // 手动清掉 vacuumed flag,模拟上次 VACUUM 失败 pending。
+        // 手动把 vacuumed 改回 pending("0"),模拟本版本上次 VACUUM 失败留待重试。
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute(
-                "DELETE FROM sessions_meta WHERE key = 'content_addr_vacuumed'",
+                "INSERT OR REPLACE INTO sessions_meta (key, value) VALUES ('content_addr_vacuumed', '0')",
                 [],
             )
             .unwrap();
         }
-        // 再调:migrated=1 早返 Ok(0),但 ensure_vacuumed 补跑 VACUUM。
+        // 再调:migrated=1 早返 Ok(0),ensure_vacuumed 见 "0" pending → 补跑 VACUUM。
         assert_eq!(cache.migrate_existing_rows().unwrap(), 0, "已迁移早返 0");
         let conn = Connection::open(&path).unwrap();
         let vacuumed: Option<String> = conn
@@ -1958,6 +1968,48 @@ mod tests {
             vacuumed.as_deref(),
             Some("1"),
             "VACUUM pending 应在下次调用补跑并置 flag"
+        );
+    }
+
+    #[test]
+    fn legacy_migrated_db_not_vacuumed_on_upgrade() {
+        // codex-connector P2:MOC-170 迁移过的 legacy 库(migrated=1 但 vacuumed 从无,因
+        // MOC-170 没这 flag)升级 MOC-171,早返分支**不应**无谓 VACUUM —— vacuumed 保持缺失
+        // (不打扰),避免升级用户已 vacuumed 大库每次启动重跑 VACUUM、失败则每次重试卡 mutex。
+        let (_dir, path) = fresh_db_path();
+        let (cache, _) = ResponseSessionCache::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &path,
+        );
+        // 模拟 legacy MOC-170 状态:只置 migrated,无 vacuumed(MOC-170 没这个 flag)。
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions_meta (key, value) VALUES ('content_addr_migrated', '1')",
+                [],
+            )
+            .unwrap();
+        }
+        // 升级 MOC-171 首次启动:migrated=1 早返,ensure_vacuumed 见 vacuumed 缺失 → 不 VACUUM。
+        assert_eq!(
+            cache.migrate_existing_rows().unwrap(),
+            0,
+            "migrated=1 早返 0"
+        );
+        let vacuumed: Option<String> = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM sessions_meta WHERE key = 'content_addr_vacuumed'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            vacuumed, None,
+            "legacy 库(无 pending 标记)不应被无谓 VACUUM,vacuumed 保持缺失"
         );
     }
 }
