@@ -667,19 +667,51 @@ fn read_dedup_field(path: &Path) -> Option<Option<String>> {
     }
 }
 
-/// 读快照 dir 的内容(config.toml + auth.json)用于备份去重。
-/// **不含 manifest.json**(其 timestamp/session_id/snapshot_id 每份都不同)。
-/// 任一文件"存在但读失败"→ 返回 `None`(内容不可判定,调用方据此保守不去重)。
-fn snapshot_content_for_dedup(dir: &Path) -> Option<(Option<String>, Option<String>)> {
-    let config = read_dedup_field(&config_path(dir))?;
-    let auth = read_dedup_field(&auth_path(dir))?;
-    Some((config, auth))
+/// 快照的 atom restore 等价类(去重指纹的一部分)。restore 行为只由 manifest 的
+/// `(capture_failed, pre_value)` 三态 + `schema_version` 决定:
+/// - `capture_failed=true`(或 `schema_version < 4` 兜底、manifest 读不出)→ restore
+///   **不动** atom → 归一为 [`AtomRestoreKey::Untouched`];
+/// - 否则按 `pre_value` 复原(`Some(v)` 写入 / `None` 移除)→ [`AtomRestoreKey::Restore`]。
+///
+/// config/auth 相同但本键不同的两份 restore 结果不同、**不可互换**,不能去重(MOC-148
+/// review P2:否则删"重复"时会丢失只存在于 manifest 的 atom 恢复值)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AtomRestoreKey {
+    /// restore 不动 atom。
+    Untouched,
+    /// restore 按该 `pre_value` 复原(`Some(v)` 写入 / `None` 移除)。
+    Restore(Option<bool>),
 }
 
-/// recovery/ 是否已存在与 `dir` 内容(config + auth)完全相同的备份。
+/// 读 `dir` 的 manifest 归一成 [`AtomRestoreKey`]。口径与 [`move_snapshot_dir_to_recovery`]
+/// 写 recovery manifest 一致(`schema_version < 4` 视作 capture_failed)。manifest 读不出
+/// (不存在 / IO / parse 错误)→ restore 兜底"不动 atom" → [`AtomRestoreKey::Untouched`]。
+fn snapshot_atom_restore_key(dir: &Path) -> AtomRestoreKey {
+    match read_manifest_from_dir(dir) {
+        Ok(m) if !m.electron_status_section_capture_failed && m.schema_version >= 4 => {
+            AtomRestoreKey::Restore(m.electron_status_section_pre_value)
+        }
+        _ => AtomRestoreKey::Untouched,
+    }
+}
+
+/// 读快照 dir 的去重指纹:config.toml + auth.json 内容 + atom restore 等价键。
+/// **不含 manifest 的 timestamp/session_id/snapshot_id**(每份都不同),但**含**影响
+/// restore 的 atom 三态(见 [`AtomRestoreKey`])。
+/// config/auth 任一"存在但读失败"→ 返回 `None`(内容不可判定,调用方据此保守不去重)。
+fn snapshot_content_for_dedup(
+    dir: &Path,
+) -> Option<(Option<String>, Option<String>, AtomRestoreKey)> {
+    let config = read_dedup_field(&config_path(dir))?;
+    let auth = read_dedup_field(&auth_path(dir))?;
+    Some((config, auth, snapshot_atom_restore_key(dir)))
+}
+
+/// recovery/ 是否已存在与 `dir` 内容(config + auth + atom restore 等价键)完全相同的备份。
 ///
-/// 保守语义:`dir` 自身内容读不出(不可判定)→ 直接返回 `false`(当作非重复、
+/// 保守语义:`dir` 自身 config/auth 读不出(不可判定)→ 直接返回 `false`(当作非重复、
 /// 保留),绝不因"读不出"去删唯一副本;某份 recovery 读不出 → 该份不参与匹配。
+/// atom restore 键即使 manifest 读不出也有确定兜底(`Untouched`),始终参与比较。
 fn recovery_has_content_duplicate(paths: &CodexPaths, dir: &Path) -> bool {
     let Some(target) = snapshot_content_for_dedup(dir) else {
         return false;
@@ -1179,6 +1211,97 @@ mod tests {
         assert!(!stale.exists());
         let recs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
         assert_eq!(recs.len(), 2, "不同内容应新增 recovery: {recs:?}");
+    }
+
+    /// MOC-148 review P2:config/auth **完全相同**但 manifest 的 atom `pre_value` 不同 →
+    /// restore 结果不同、不可互换 → **不去重**,保留两份(否则删"重复"会丢只存在于
+    /// manifest 的 atom 恢复值)。
+    #[test]
+    fn move_to_recovery_keeps_when_atom_pre_value_differs() {
+        let (_t, paths) = paths_with_tmp();
+        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&existing), "{\"k\":\"A\"}").unwrap();
+        let mut m_existing = mk_manifest("existing");
+        m_existing.electron_status_section_pre_value = Some(false);
+        write_manifest_to_dir(&existing, &m_existing).unwrap();
+
+        // config/auth 一字不差,仅 atom pre_value 不同(Some(true) vs Some(false))。
+        let stale = paths.active_snapshots_dir.join("atom-diff");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
+        let mut m_stale = mk_manifest("atom-diff");
+        m_stale.electron_status_section_pre_value = Some(true);
+        write_manifest_to_dir(&stale, &m_stale).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists(), "stale 仍应移入 recovery(rename)");
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            2,
+            "atom restore 值不同 → 不可互换 → 不去重,应保留两份"
+        );
+    }
+
+    /// `capture_failed` 差异同样使两份不可互换(一个 restore 不动 atom、一个会复原)→ 保留。
+    #[test]
+    fn move_to_recovery_keeps_when_capture_failed_differs() {
+        let (_t, paths) = paths_with_tmp();
+        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
+        let mut m_existing = mk_manifest("existing");
+        m_existing.electron_status_section_pre_value = Some(true); // Restore(Some(true))
+        write_manifest_to_dir(&existing, &m_existing).unwrap();
+
+        let stale = paths.active_snapshots_dir.join("cap-failed");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        let mut m_stale = mk_manifest("cap-failed");
+        m_stale.electron_status_section_capture_failed = true; // Untouched
+        write_manifest_to_dir(&stale, &m_stale).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists());
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            2,
+            "capture_failed 不同(不动 atom vs 复原)→ 不可互换 → 保留两份"
+        );
+    }
+
+    /// 回归:config/auth 相同且 atom 三态也相同 → 仍是真重复 → 照旧去重(本修复不误伤)。
+    #[test]
+    fn move_to_recovery_still_dedups_when_atom_state_matches() {
+        let (_t, paths) = paths_with_tmp();
+        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&existing), "{\"k\":\"A\"}").unwrap();
+        let mut m_existing = mk_manifest("existing");
+        m_existing.electron_status_section_pre_value = Some(true);
+        write_manifest_to_dir(&existing, &m_existing).unwrap();
+
+        let stale = paths.active_snapshots_dir.join("same-atom");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
+        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
+        let mut m_stale = mk_manifest("same-atom");
+        m_stale.electron_status_section_pre_value = Some(true);
+        write_manifest_to_dir(&stale, &m_stale).unwrap();
+
+        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
+
+        assert!(!stale.exists());
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            1,
+            "config/auth + atom 三态全同 → 真重复 → 去重(不新增)"
+        );
     }
 
     /// 两份都"真"没有 config/auth(NotFound,合法空原始态)→ 内容相同 → 视为重复。
