@@ -343,10 +343,7 @@ async fn handle_web_search_call(
 }
 
 /// 把结果列表格式化成给模型的 markdown(序号 + 标题 + URL + 摘要 + 两段式用法提示)。
-fn format_search_results(
-    query: &str,
-    results: &[codex_app_transfer_http::SearchResult],
-) -> String {
+fn format_search_results(query: &str, results: &[codex_app_transfer_http::SearchResult]) -> String {
     let mut s = format!(
         "web_search「{query}」共 {} 条结果。挑你需要的用 web_fetch 抓 URL 取正文:\n\n",
         results.len()
@@ -856,7 +853,10 @@ mod tests {
         assert_eq!(d["name"], "web_search");
         assert_eq!(d["inputSchema"]["required"][0], "query");
         assert_eq!(d["inputSchema"]["properties"]["query"]["type"], "string");
-        assert_eq!(d["inputSchema"]["properties"]["max_results"]["type"], "integer");
+        assert_eq!(
+            d["inputSchema"]["properties"]["max_results"]["type"],
+            "integer"
+        );
     }
 
     #[test]

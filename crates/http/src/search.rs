@@ -233,7 +233,10 @@ mod tests {
         let ad = decode_href(
             "//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_provider%3Dx&rut=z",
         );
-        assert_eq!(ad.as_deref(), Some("https://duckduckgo.com/y.js?ad_provider=x"));
+        assert_eq!(
+            ad.as_deref(),
+            Some("https://duckduckgo.com/y.js?ad_provider=x")
+        );
         assert!(is_ad(&ad.unwrap()));
     }
 
@@ -265,6 +268,8 @@ mod tests {
         );
         assert!(!results[0].title.is_empty());
         // 广告应被过滤: 不应出现 y.js / aclick 跳转。
-        assert!(results.iter().all(|r| !r.url.contains("duckduckgo.com/y.js")));
+        assert!(results
+            .iter()
+            .all(|r| !r.url.contains("duckduckgo.com/y.js")));
     }
 }
