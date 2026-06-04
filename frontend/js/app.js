@@ -8487,7 +8487,9 @@
     });
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
-    // [MOC-169] 诊断模式开关:持久化 + 运行时起/停查看器服务 + 切按钮可见性
+    // [MOC-169] 诊断模式开关:持久化 + 运行时起/停查看器服务 + 切按钮可见性。
+    // 注意:api() 对后端返回的 `success:false`(含 bind 失败)会 **throw**(api.js:28),
+    // 所以启动失败走 catch —— 回滚必须放 catch 里(后端 start 失败已同步清运行时 gate)。
     $("#traceViewerEnabled")?.addEventListener("change", async () => {
       const on = $("#traceViewerEnabled")?.checked === true;
       if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !on;
@@ -8495,22 +8497,22 @@
       try {
         if (on) {
           const r = await CCApi.traceViewerStart();
-          // 后端 bind 失败时返回 200 + {success:false}(api() 不 throw),需显式判断:
-          // 回滚开关 + 隐藏按钮 + 回滚持久化,避免"开关 on 但实际没起"的假成功。
-          if (r && r.success === false) {
-            showToast("诊断查看器启动失败" + (r.error ? `:${r.error}` : ""));
-            $("#traceViewerEnabled").checked = false;
-            if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = true;
-            await saveSettingsFromForm();
-          } else {
-            showToast(r?.url ? `诊断查看器已启动 ${r.url}` : "诊断查看器已启动");
-          }
+          showToast(r?.url ? `诊断查看器已启动 ${r.url}` : "诊断查看器已启动");
         } else {
           await CCApi.traceViewerStop();
           showToast("诊断查看器已关闭");
         }
-      } catch (_) {
-        showToast("诊断查看器操作失败");
+      } catch (e) {
+        if (on) {
+          // 启动失败(如 18090 被占):回滚开关 + 隐藏按钮 + 回滚持久化,避免 UI 假"on"
+          // 且 traceViewerEnabled 持久化为 true 导致重启反复重试。
+          $("#traceViewerEnabled").checked = false;
+          if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = true;
+          await saveSettingsFromForm();
+          showToast("诊断查看器启动失败" + (e && e.message ? `:${e.message}` : ""));
+        } else {
+          showToast("诊断查看器关闭失败");
+        }
       }
     });
     // MOC-144 联网抓取后端: segmented 按钮组(不用原生 <select>, 避免下拉 popup 遮挡下方文字)。

@@ -32,8 +32,9 @@ pub async fn start_trace_viewer(State(state): State<AdminState>) -> impl IntoRes
         }
         Err(e) => {
             // 启动失败:确保运行时 gate 关(env CAS_DIAG_TRACE 开的不受影响,本就该采集)。
+            // 用 `message` 键 —— 前端 api() 会因 success:false throw,并取 data.message 作错误文案。
             set_forward_trace_enabled(false);
-            Json(json!({"success": false, "running": false, "error": e}))
+            Json(json!({"success": false, "running": false, "message": e}))
         }
     }
 }
@@ -71,7 +72,7 @@ pub async fn open_trace_viewer(State(state): State<AdminState>) -> impl IntoResp
                 }
                 Err(e) => {
                     set_forward_trace_enabled(false);
-                    return Json(json!({"success": false, "error": e}));
+                    return Json(json!({"success": false, "message": e}));
                 }
             }
         }
@@ -79,6 +80,6 @@ pub async fn open_trace_viewer(State(state): State<AdminState>) -> impl IntoResp
     let url = url_of(addr);
     match open_url(&url) {
         Ok(()) => Json(json!({"success": true, "url": url})),
-        Err(e) => Json(json!({"success": false, "url": url, "error": e})),
+        Err(e) => Json(json!({"success": false, "url": url, "message": e})),
     }
 }
