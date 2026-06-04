@@ -459,11 +459,13 @@ async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
     )))
 }
 
-/// 明确的客户端"死链 / 不可恢复"状态码: 换 client 或 headless 渲染错误页都救不了, Auto 直接报错
-/// (不升级、不当成功)。**排除 403/429** —— 反爬 / 限流换 client 或 headless+stealth 可能过; 5xx
-/// 也不在内 —— 503 常是 CF challenge, headless 可能救 (chatgpt-codex review)。
+/// 明确的客户端"不可恢复"状态码: 换 client 或 headless 渲染错误页都救不了, Auto 直接报错(不升级、
+/// 不当成功)。**整个 4xx 段都算**(404 不存在 / 405 GET 不允许 / 422 请求错 / 410 已删 / 451 法律
+/// 封禁…… headless 渲染这些的错误页只会被模型当成功摘要),**仅排除 403 / 429** —— 反爬 / 限流换
+/// client 或 headless+stealth 可能过。5xx 不在内 —— 503 常是 CF challenge, headless 可能救
+/// (chatgpt-codex review: 白名单只列 5 个会放过 405/422 等非反爬 4xx)。
 fn is_hard_client_error(status: u16) -> bool {
-    matches!(status, 400 | 401 | 404 | 410 | 451)
+    (400..500).contains(&status) && !matches!(status, 403 | 429)
 }
 
 /// Auto 档: 这次 (curl/wreq) 抓取是否需要升级到更高档。命中任一信号即升级:
@@ -864,11 +866,11 @@ mod tests {
 
     #[test]
     fn hard_client_errors_not_escalated() {
-        // 死链 / 权限 → 直接报错 (不升级渲染错误页)
-        for s in [400, 401, 404, 410, 451] {
-            assert!(is_hard_client_error(s), "{s} 应是死链");
+        // 整个 4xx 段(除 403/429)→ 直接报错(不升级渲染错误页);含白名单原漏的 405/422/406/409
+        for s in [400, 401, 404, 405, 406, 409, 410, 422, 451] {
+            assert!(is_hard_client_error(s), "{s} 应是不可恢复客户端错误");
         }
-        // 反爬 / 限流 / 5xx → 不算死链 (可能被 headless/换 client 救, 升级)
+        // 反爬(403) / 限流(429) / 5xx / 2xx → 不算 (可能被 headless/换 client 救, 升级)
         for s in [200, 202, 403, 429, 500, 502, 503] {
             assert!(!is_hard_client_error(s), "{s} 不该当死链");
         }
