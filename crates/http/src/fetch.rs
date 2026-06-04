@@ -422,11 +422,9 @@ async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
             }
         }
         match fetch_raw(tier, url).await {
-            // 明确客户端死链 / 权限错误 (404/410/400/401/451): 换 client、headless 渲染错误页都没
-            // 意义, 直接报 HTTP 错误 (不当成功, 对齐单档 curl/wreq 行为, chatgpt-codex review)。
-            Ok(raw) if is_hard_client_error(raw.status) => {
-                return Err(tier_http_error(tier, raw.status))
-            }
+            // 不可恢复 (4xx 死链/权限除反爬 + 5xx 无挑战的真服务器故障): 换 client、headless 渲染
+            // 错误页都没意义, 直接报 HTTP 错误 (不当成功, 对齐单档 curl/wreq 行为, chatgpt-codex)。
+            Ok(raw) if is_unrecoverable(&raw) => return Err(tier_http_error(tier, raw.status)),
             // 拿到可用结果 (无升级信号) → 记住该档并返回。
             Ok(raw) if !needs_upgrade(&raw) => {
                 remember_origin(&origin, tier);
@@ -459,13 +457,18 @@ async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
     )))
 }
 
-/// 明确的客户端"不可恢复"状态码: 换 client 或 headless 渲染错误页都救不了, Auto 直接报错(不升级、
-/// 不当成功)。**整个 4xx 段都算**(404 不存在 / 405 GET 不允许 / 422 请求错 / 410 已删 / 451 法律
-/// 封禁…… headless 渲染这些的错误页只会被模型当成功摘要),**仅排除 403 / 429** —— 反爬 / 限流换
-/// client 或 headless+stealth 可能过。5xx 不在内 —— 503 常是 CF challenge, headless 可能救
-/// (chatgpt-codex review: 白名单只列 5 个会放过 405/422 等非反爬 4xx)。
-fn is_hard_client_error(status: u16) -> bool {
-    (400..500).contains(&status) && !matches!(status, 403 | 429)
+/// 这次抓取是否"不可恢复"—— 换 client 或 headless 渲染错误页都救不了, Auto 直接报错(不升级、不当
+/// 成功)。两类:
+/// ① **4xx 除 403/429**(404 不存在 / 405 GET 不允许 / 422 请求错 / 410 已删 / 451 封禁…… headless
+///    渲染这些的错误页只会被模型当成功摘要);403/429 是反爬/限流, headless+stealth 可能过, 排除。
+/// ② **5xx 但无挑战信号**(500/502 真服务器故障, headless 渲染 500 页当成功无意义)。带 CF 挑战信号
+///    的 5xx(常见 503 challenge)**不算** —— headless 可能过挑战拿真内容 (chatgpt-codex review)。
+fn is_unrecoverable(raw: &RawFetch) -> bool {
+    let s = raw.status;
+    if (400..500).contains(&s) && !matches!(s, 403 | 429) {
+        return true;
+    }
+    (500..600).contains(&s) && !raw.cf_challenge_header && !is_challenge_body(&raw.body)
 }
 
 /// Auto 档: 这次 (curl/wreq) 抓取是否需要升级到更高档。命中任一信号即升级:
@@ -865,15 +868,36 @@ mod tests {
     }
 
     #[test]
-    fn hard_client_errors_not_escalated() {
-        // 整个 4xx 段(除 403/429)→ 直接报错(不升级渲染错误页);含白名单原漏的 405/422/406/409
+    fn unrecoverable_status_not_escalated() {
+        let raw = |status: u16, body: &str| RawFetch {
+            status,
+            body: body.to_string(),
+            is_html: true,
+            cf_challenge_header: false,
+        };
+        // 4xx 除 403/429 → 不可恢复 (含原白名单漏的 405/422/406/409)
         for s in [400, 401, 404, 405, 406, 409, 410, 422, 451] {
-            assert!(is_hard_client_error(s), "{s} 应是不可恢复客户端错误");
+            assert!(is_unrecoverable(&raw(s, "err")), "{s} 应不可恢复");
         }
-        // 反爬(403) / 限流(429) / 5xx / 2xx → 不算 (可能被 headless/换 client 救, 升级)
-        for s in [200, 202, 403, 429, 500, 502, 503] {
-            assert!(!is_hard_client_error(s), "{s} 不该当死链");
+        // 5xx 无挑战信号 → 不可恢复 (真服务器故障, 别让 headless 渲染 500 页当成功)
+        for s in [500, 502, 504] {
+            assert!(
+                is_unrecoverable(&raw(s, "Internal Server Error")),
+                "{s} 无挑战应不可恢复"
+            );
         }
+        // 反爬(403) / 限流(429) / 2xx → 可恢复, 升级
+        for s in [200, 202, 403, 429] {
+            assert!(!is_unrecoverable(&raw(s, "ok")), "{s} 不该当不可恢复");
+        }
+        // 5xx 带 CF 挑战信号 (503 challenge) → 可恢复 (headless 可能过挑战)
+        assert!(
+            !is_unrecoverable(&raw(
+                503,
+                "<html><head><title>just a moment</title></head><body>challenge-platform</body></html>"
+            )),
+            "503 带挑战信号不该当不可恢复"
+        );
     }
 
     #[test]
