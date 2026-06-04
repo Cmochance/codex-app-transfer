@@ -89,7 +89,7 @@ objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSRunningApplic
 # 借鉴 BigPizzaV3/CodexPlusPlus `codex_session_delete/launcher.py:347-395`,
 # 用 windows-rs 官方 binding 而非手搓 ctypes COM,稳定性更好。
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.59", features = [
+windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     # MOC-94:原生进程枚举(替 spawn tasklist)判断 Codex 是否在运行
