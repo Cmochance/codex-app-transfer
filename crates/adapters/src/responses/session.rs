@@ -577,11 +577,14 @@ impl ResponseSessionCache {
         let Some(conn) = guard.as_mut() else {
             return Ok(total);
         };
-        set_migration_done(conn).map_err(|e| format!("set migration flag failed: {e}"))?;
-        // MOC-171:标记本版本待 VACUUM(pending="0"),随即尝试(成功→"1",失败留"0"下次重试)。
-        // legacy(MOC-170)库不会有这个 "0" 标记,早返分支因此不会对它无谓 VACUUM(P2)。
+        // MOC-171:**先**标记 VACUUM pending("0"),**再**置 migrated —— 顺序关键(codex-connector
+        // P2):若 migrated 先,则 migrated 已置但 pending 写失败/crash 时,下次启动早返见
+        // vacuumed 缺失会误判 legacy 跳过 VACUUM → 新迁移库丢失重试保证。先置 pending 后,
+        // 最坏是"pending 置了 migrated 没置"→ 下次 migration_done=false 重迁、收尾重置,VACUUM
+        // 不丢;由此"migrated=1 且 vacuumed 缺失"只可能是 legacy(MOC-170)库,跳过它才安全。
         meta_set(conn, VACUUM_FLAG_KEY, "0")
             .map_err(|e| format!("set vacuum pending failed: {e}"))?;
+        set_migration_done(conn).map_err(|e| format!("set migration flag failed: {e}"))?;
         ensure_vacuumed(conn).map_err(|e| format!("vacuum failed: {e}"))?;
         Ok(total)
     }
