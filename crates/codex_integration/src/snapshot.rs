@@ -764,20 +764,32 @@ fn recovery_content_duplicate_dirs(paths: &CodexPaths, dir: &Path) -> Vec<PathBu
 
 /// recovery/ 只保留最近 [`MAX_RECOVERY_SNAPSHOTS`] 份,其余物理删除。
 ///
-/// 目录名形如 `20260603T210740197-pNNNN`,固定宽度时间戳前缀 → 字典序即时间序;
-/// 按名降序排,保留最新的前 N 份。
+/// 保留优先级:**可恢复(manifest 解析成功,即 `list_snapshots` 能看到的份)优先于损坏/
+/// 不可恢复**;同组内再按目录名(固定宽度时间戳前缀 `20260603T210740197-pNNNN` → 字典序即
+/// 时间序)新→旧。保留前 N 份、其余删除。即超额时**先淘汰损坏份**,不让较新的损坏快照挤掉
+/// 较旧但有效的备份(MOC-148 review P2:`snapshot_dirs_under` 只看 manifest 文件存在,
+/// 而 `list_snapshots` 会跳过解析失败的目录,二者口径不一致会导致只剩不可恢复的份)。
 ///
 /// **best-effort**(MOC-148 review IMPORTANT#1):这是纯 GC,单个目录删失败
 /// (并发进程占用 / 权限 / 半删残留)只 warn 跳过,**绝不冒泡**——否则会让
 /// 调用链顶端的 `apply_provider` 整体失败(快照本身已成功,失败的只是清旧)。
 /// 与同文件 `gc_trash_older_than` 既有约定一致。
 fn prune_recovery_snapshots(paths: &CodexPaths) {
-    let mut dirs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
+    let dirs = snapshot_dirs_under(&paths.recovery_snapshots_dir);
     if dirs.len() <= MAX_RECOVERY_SNAPSHOTS {
         return;
     }
-    dirs.sort_by_key(|d| std::cmp::Reverse(dir_name(d)));
-    for dir in dirs.into_iter().skip(MAX_RECOVERY_SNAPSHOTS) {
+    // 每份算一次"是否可恢复"(manifest 解析成功 = `list_snapshots` 口径),避免排序中重复 IO。
+    let mut ranked: Vec<(bool, PathBuf)> = dirs
+        .into_iter()
+        .map(|d| (read_manifest_from_dir(&d).is_ok(), d))
+        .collect();
+    // 可恢复(true)优先于损坏(false);同组内按目录名(时间戳)新→旧。
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| dir_name(&b.1).cmp(&dir_name(&a.1)))
+    });
+    for (_, dir) in ranked.into_iter().skip(MAX_RECOVERY_SNAPSHOTS) {
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             tracing::warn!(
                 target: "codex_integration::snapshot",
@@ -1593,6 +1605,41 @@ mod tests {
         assert!(
             names.iter().any(|n| n.starts_with("20260607T")),
             "最新(day7)应保留: {names:?}"
+        );
+    }
+
+    /// MOC-148 review P2:prune 应优先保留**可恢复**(manifest 解析成功)的份、先淘汰损坏份;
+    /// 不让较新的损坏快照挤掉较旧但有效的备份。
+    #[test]
+    fn prune_evicts_corrupt_before_valid_recovery() {
+        let (_t, paths) = paths_with_tmp();
+        std::fs::create_dir_all(&paths.recovery_snapshots_dir).unwrap();
+        // 1 份较旧但有效的备份。
+        let valid_old = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
+        std::fs::create_dir_all(&valid_old).unwrap();
+        std::fs::write(config_path(&valid_old), "openai_base_url = \"VALID\"\n").unwrap();
+        write_manifest_to_dir(&valid_old, &mk_manifest("valid-old")).unwrap();
+        // MAX 份较新但 manifest 损坏的份(总数 MAX+1 → 触发 prune)。
+        for i in 0..MAX_RECOVERY_SNAPSHOTS {
+            let d = paths
+                .recovery_snapshots_dir
+                .join(format!("2026069{i}T000000000-p9"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(config_path(&d), format!("openai_base_url = \"X{i}\"\n")).unwrap();
+            std::fs::write(manifest_path(&d), "{ corrupt").unwrap();
+        }
+
+        prune_recovery_snapshots(&paths);
+
+        assert!(valid_old.exists(), "可恢复的旧备份不应被较新的损坏份挤掉");
+        assert_eq!(
+            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
+            MAX_RECOVERY_SNAPSHOTS,
+            "prune 后应恰好 MAX 份"
+        );
+        assert!(
+            list_snapshots(&paths).iter().any(|s| s.kind == "recovery"),
+            "至少保留一份可被 list_snapshots 恢复的 recovery"
         );
     }
 
