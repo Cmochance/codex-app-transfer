@@ -296,8 +296,14 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
             "requestOptions".into(),
             input.request_options.clone().unwrap_or_else(|| json!({})),
         );
-        // web_fetch 摘要模型 (MOC-152): 仅非空时写入(空 → 不写, 后端回退 models.default)。
-        if let Some(sm) = input.summary_model.clone().filter(|s| !s.trim().is_empty()) {
+        // web_fetch 摘要模型 (MOC-152): trim 后非空才写入(空 → 不写, 后端回退 models.default)。
+        // trim 与 update_provider 对齐, 避免直连 API 存进带首尾空格的值(devin review)。
+        if let Some(sm) = input
+            .summary_model
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             new_provider.insert("summaryModel".into(), Value::String(sm));
         }
         if let Some(gw) = input.grok_web.clone() {

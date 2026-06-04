@@ -348,7 +348,12 @@ fn parse_summary_config(cfg: &Value) -> Result<SummaryConfig, String> {
     // 反序列化成 Provider, 复用规范的 provider_slug(slug 路由)+ extra flatten(读 summaryModel)。
     let provider: codex_app_transfer_registry::Provider = serde_json::from_value(prov_val.clone())
         .map_err(|e| format!("解析当前提供商配置失败: {e}"))?;
-    let api_format = provider.api_format.clone();
+    // 规范化 apiFormat: 接受 openai / chat-completions 等归一到 openai_chat 的别名(导入 / 旧 /
+    // 直连 API 配置可能未规范化), 否则严格 == 会误判不支持、跳过摘要(connector P2)。
+    let api_format = crate::admin::handlers::providers::normalize_provider_api_format(Some(
+        &provider.api_format,
+    ))
+    .to_string();
     // summaryModel(经 extra flatten 透传)优先, 空/缺 → 回退 models["default"]。
     let model_value = provider
         .extra
@@ -517,6 +522,11 @@ fn select_relevant_content(
         out.push_str(c);
         out.push('\n');
         last = Some(i);
+    }
+    // 守住 max 广告上限:单段 > max 的页(无空行巨块)会被强行选为第一块, out 可能超 max →
+    // 末尾按字符硬 cap(selected 已 true, 不完整提示已给), 防撑爆总结模型上下文(connector P2)。
+    if out.chars().count() > max {
+        out = out.chars().take(max).collect();
     }
     (out, true, picked_count, total)
 }
@@ -823,6 +833,36 @@ mod tests {
             sel.contains("XYZ"),
             "应选出含 prompt 关键词的相关段而非仅前缀: {}",
             sel.chars().take(120).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn parse_summary_config_normalizes_apiformat_alias() {
+        // apiFormat 别名(openai / chat-completions)应归一到 openai_chat 被接受。
+        for alias in ["openai", "chat-completions", "chat_completions", "OpenAI"] {
+            let cfg = json!({
+                "activeProvider": "p1",
+                "settings": { "proxyPort": 1 },
+                "providers": [{
+                    "id": "p1", "name": "P1", "baseUrl": "https://x/v1",
+                    "apiFormat": alias, "models": { "default": "m" }
+                }]
+            });
+            let c = parse_summary_config(&cfg).unwrap();
+            assert_eq!(c.api_format, "openai_chat", "别名 {alias} 应归一");
+        }
+    }
+
+    #[test]
+    fn select_relevant_caps_oversized_single_chunk() {
+        // 单段无空行 > max → 巨块被强行选为第一块, 但 out 末尾硬 cap 到 max(守广告上限)。
+        let huge = "x".repeat(10_000);
+        let (sel, selected, _picked, _total) = select_relevant_content(&huge, "query", 4000);
+        assert!(selected);
+        assert!(
+            sel.chars().count() <= 4000,
+            "out 应被 cap 到 max, 实际 {}",
+            sel.chars().count()
         );
     }
 
