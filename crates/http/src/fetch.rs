@@ -509,7 +509,24 @@ fn is_challenge_body(body: &str) -> bool {
 /// (headless 渲染出完整 DOM), per-origin cache 后续复用, 故按启发式接受不做 data-island 特判
 /// (特判反会漏真 CSR 空壳——它同样带 __NEXT_DATA__)。
 fn is_js_shell(html: &str) -> bool {
-    visible_text_len(html) < MIN_EXTRACTED_CHARS
+    // 仅"可见文本少"不够 —— 短静态页(status 页 / 小 snippet)也少, 但 curl 已成功, 升 headless
+    // 是无谓浪费、甚至(headless 不可用时)把成功变失败(chatgpt-codex review)。要求**同时**有 SPA
+    // 骨架信号(已知挂载点 + script)才判 shell; 短静态页(无挂载点)放行为成功。
+    visible_text_len(html) < MIN_EXTRACTED_CHARS && has_spa_skeleton(html)
+}
+
+/// SPA 骨架特征: 已知框架挂载点 (root/app/__next/__nuxt/ng-app/reactroot) + 页面挂着 `<script`
+/// (bundle / data island)。覆盖主流 React/Vue/Next/Nuxt/Angular; 非标准挂载点的小众 SPA 会漏判
+/// (退化当短静态页放行, 拿到的空壳交模型自行判断), 优于把短静态页误升 headless。
+fn has_spa_skeleton(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    let has_mount = lower.contains("id=\"root\"")
+        || lower.contains("id=\"app\"")
+        || lower.contains("id=\"__next\"")
+        || lower.contains("id=\"__nuxt\"")
+        || lower.contains("ng-app")
+        || lower.contains("data-reactroot");
+    has_mount && lower.contains("<script")
 }
 
 /// 粗算 HTML 去掉 `<script>`/`<style>` 块 + 所有标签后的可见非空白字符数 (启发式, char-safe,
@@ -831,6 +848,16 @@ mod tests {
             "这是一篇有实际内容的文章正文。".repeat(40)
         );
         assert!(!is_js_shell(&real), "有正文不应判为 shell");
+        // 短静态页 (无 SPA 挂载点) 即使可见文本少也不判 shell (review: 别误升 headless)
+        assert!(
+            !is_js_shell("<html><body><p>OK</p></body></html>"),
+            "短静态页(无挂载点)不应判为 shell"
+        );
+        // 有挂载点但无 script → 不算 SPA shell (has_script 必要)
+        assert!(
+            !is_js_shell("<html><body><div id=\"root\"></div></body></html>"),
+            "无 script 的挂载点不算 SPA shell"
+        );
     }
 
     /// 端到端真机 (网络 + headless): Auto 档抓 DDG (curl/wreq 必被 202 反爬, 应自动升到 headless
