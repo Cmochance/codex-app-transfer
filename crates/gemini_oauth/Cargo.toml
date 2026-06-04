@@ -27,7 +27,7 @@ tracing = "0.1"
 webbrowser = "1"
 # Crypto-secure RNG —— 给 OAuth `state` CSRF 防御 token 用(32 bytes hex)。
 # workspace 已 transitive 依赖 0.2,显式声明保证一致。
-getrandom = "0.2"
+getrandom = "0.4"
 # URL form-encode —— 构造 OAuth 授权 URL query + token endpoint POST body。
 # reqwest 内部依赖 url crate,这里直接复用 transitive。
 url = "2"
