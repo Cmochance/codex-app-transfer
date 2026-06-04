@@ -387,7 +387,55 @@ pub fn redact_mcp_value(v: &mut Value) {
                 obj.insert(key.to_string(), Value::String(scrubbed));
             }
         }
+        // ④ URL query 里的 credential(OAuth callback ?code=/?access_token=、Google ?key= 等)
+        if let Some(Value::String(u)) = obj.get("url") {
+            let red = redact_url_query(u);
+            if red != *u {
+                obj.insert("url".to_string(), Value::String(red));
+            }
+        }
     }
+}
+
+/// 脱敏 URL query 里的 credential 参数值(`?code=…&access_token=…` → `?code=***&access_token=***`)。
+/// 只动 query、保留 path/host;无 query 原样返回。判定见 [`is_credential_query_param`]。
+fn redact_url_query(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_owned();
+    };
+    let mut changed = false;
+    let out: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            let name = pair.split('=').next().unwrap_or("");
+            if pair.contains('=') && is_credential_query_param(name) {
+                changed = true;
+                format!("{name}=***")
+            } else {
+                pair.to_owned()
+            }
+        })
+        .collect();
+    if changed {
+        format!("{base}?{}", out.join("&"))
+    } else {
+        url.to_owned()
+    }
+}
+
+/// URL query 参数名是否承载 credential。比 [`is_credential_key`] 多覆盖 URL 特有的 OAuth /
+/// API-key 参数:`code`(授权码)/ `code_verifier`(PKCE)/ `key`(Google `?key=<api_key>`)/
+/// `sid` / `session*`。诊断里宁可过度脱敏也不漏 token。
+fn is_credential_query_param(name: &str) -> bool {
+    if is_credential_key(name) {
+        return true;
+    }
+    let norm: String = name
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    matches!(norm.as_str(), "code" | "codeverifier" | "key" | "sid") || norm.contains("session")
 }
 
 /// MCP header 名是否属于 [`is_credential_key`] **没覆盖**的会话凭据类(cookie / session /
@@ -604,6 +652,27 @@ mod tests {
             "非 credential 字段应保留"
         );
         assert!(body.contains("scope=read"));
+    }
+
+    #[test]
+    fn redact_mcp_value_redacts_url_query_credentials() {
+        let mut v = json!({
+            "kind": "fetch",
+            "url": "https://auth.example.com/callback?code=AUTH-LEAK&access_token=AT-LEAK&key=GKEY-LEAK&state=xyz&page=2"
+        });
+        redact_mcp_value(&mut v);
+        let u = v["url"].as_str().unwrap();
+        assert!(!u.contains("AUTH-LEAK"), "oauth code 泄露: {u}");
+        assert!(!u.contains("AT-LEAK"), "access_token 泄露");
+        assert!(!u.contains("GKEY-LEAK"), "google ?key= 泄露");
+        // 非 credential 参数 + path 保留
+        assert!(u.contains("state=xyz"), "非 credential state 应保留");
+        assert!(u.contains("page=2"));
+        assert!(u.starts_with("https://auth.example.com/callback?"));
+        // 无 query 的 URL 原样
+        let mut v2 = json!({"kind":"fetch","url":"https://x.com/mcp"});
+        redact_mcp_value(&mut v2);
+        assert_eq!(v2["url"], "https://x.com/mcp");
     }
 
     #[test]
