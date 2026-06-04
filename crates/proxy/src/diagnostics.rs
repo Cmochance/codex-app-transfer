@@ -402,15 +402,18 @@ fn is_wide_extra_credential_header(name: &str) -> bool {
     norm.contains("cookie") || norm.contains("session") || norm == "proxyauthorization"
 }
 
-/// 脱敏一个 body 字符串:先试 JSON(键级清洗),失败再试 form-urlencoded(`k=v&k=v`,对
-/// credential 键的值清洗)。两者都不像则返 `None`(原样保留)。返回脱敏后的字符串。
+/// 脱敏一个 body 字符串:① 完整 JSON → 键级清洗;② form-urlencoded(`k=v&k=v`)→ credential
+/// 键值清洗;③ **看似 JSON 但解析失败**(被页内 recorder `truncate` 截断 / 残缺)→ 无法安全
+/// 脱敏 + 前缀可能含 credential → **正文省略**(codex-connector P2:截断的 JSON 原样落盘会漏前
+/// 64KB 里的 token);④ 纯文本(SSE 等,无结构化 credential)→ 返 `None` 原样保留。
 fn redact_body_string(s: &str) -> Option<String> {
+    // ① 完整 JSON
     if let Ok(mut parsed) = serde_json::from_str::<Value>(s) {
         redact_json_credentials(&mut parsed);
         return Some(serde_json::to_string(&parsed).unwrap_or_else(|_| "***".to_string()));
     }
-    // form-urlencoded:含 `=`、不以 `{`/`[` 开头(排除残缺 JSON)
     let trimmed = s.trim_start();
+    // ② form-urlencoded:含 `=`、不以 `{`/`[` 开头(排除残缺 JSON)。即便被截断也能逐对清洗。
     if s.contains('=') && !trimmed.starts_with('{') && !trimmed.starts_with('[') {
         let mut touched = false;
         let out = s
@@ -432,6 +435,14 @@ fn redact_body_string(s: &str) -> Option<String> {
             return Some(out);
         }
     }
+    // ③ 看似 JSON 却解析失败(截断/残缺),或带页内截断标记 → 无法解析脱敏,正文省略防泄露
+    if trimmed.starts_with('{') || trimmed.starts_with('[') || s.contains("<truncated ") {
+        return Some(format!(
+            "<diagnostic: unparseable/truncated structured body omitted to avoid credential leak ({} bytes)>",
+            s.len()
+        ));
+    }
+    // ④ 纯文本(SSE / 非结构化)→ 原样保留
     None
 }
 
@@ -593,6 +604,26 @@ mod tests {
             "非 credential 字段应保留"
         );
         assert!(body.contains("scope=read"));
+    }
+
+    #[test]
+    fn redact_mcp_value_omits_truncated_json_body() {
+        // 页内 recorder 把超 64KB 的 JSON body 截断并加标记;到这里无法解析 → 正文省略防泄露
+        let mut v = json!({
+            "kind": "fetch",
+            "resp_body": "{\"access_token\":\"at-LEAK\",\"data\":\"xxxxxxxxxx...<truncated 99999 bytes>"
+        });
+        redact_mcp_value(&mut v);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("at-LEAK"), "截断 JSON 的 token 泄露了: {s}");
+        assert!(
+            v["resp_body"].as_str().unwrap().contains("omitted"),
+            "截断 JSON 正文应省略"
+        );
+        // 纯文本(SSE)不受影响,原样保留
+        let mut sse = json!({"kind":"ws_recv","data":"event: ping\ndata: hello\n\n"});
+        redact_mcp_value(&mut sse);
+        assert_eq!(sse["data"], "event: ping\ndata: hello\n\n");
     }
 
     #[test]
