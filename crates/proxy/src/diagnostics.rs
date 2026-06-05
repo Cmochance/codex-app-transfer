@@ -110,22 +110,14 @@ fn redact_bundle_body(bytes: &[u8]) -> Value {
         }
         return bytes_payload_with_len(&serialized, serialized.len(), MAX_STORED_BODY_BYTES);
     }
-    // 非 JSON 退回(HTML 401 页 / 纯文本错误等):对 utf8 正文也扫一遍 echo token,否则非 JSON
-    // 上游回包里回显的 key 经此 fallback 原样落盘随 feedback 上传(codex P1 二轮)。base64(二进制)
-    // 无可读 token,不扫。
-    let mut payload = bytes_payload(bytes, MAX_STORED_BODY_BYTES);
-    if let Some(obj) = payload.as_object_mut() {
-        if obj.get("encoding").and_then(Value::as_str) == Some("utf8") {
-            if let Some(red) = obj
-                .get("content")
-                .and_then(Value::as_str)
-                .and_then(redact_credential_tokens)
-            {
-                obj.insert("content".into(), Value::String(red));
-            }
-        }
-    }
-    payload
+    // 非 JSON 退回(HTML 401 页 / 纯文本错误 / 个别坏字节的 mostly-text 页):用 **lossy** UTF-8
+    // 解码后扫 echo token —— 不能直接信 `bytes_payload`,因为只要 body 含**任一**非法 UTF-8 字节,
+    // 它就把整段标 base64 而跳过脱敏,导致 mostly-text 错误页里回显的 `sk-…`/Bearer 经 base64
+    // 原样进 bundle 上传(codex P2)。lossy 把坏字节换 U+FFFD、ASCII 凭据照常可扫;真·二进制
+    // lossy 后是乱码、无可读 token、scrub 不命中,无害。
+    let lossy = String::from_utf8_lossy(bytes);
+    let scrubbed = redact_credential_tokens(&lossy).unwrap_or_else(|| lossy.into_owned());
+    bytes_payload(scrubbed.as_bytes(), MAX_STORED_BODY_BYTES)
 }
 
 /// 递归对 JSON 里**所有 string 值**跑 [`redact_credential_tokens`],就地脱敏 echo 进文本的凭据。
@@ -1159,5 +1151,17 @@ mod tests {
             js.contains("invalid token *** provided"),
             "应只脱敏 JWT 子串、保留上下文: {js}"
         );
+
+        // 含非法 UTF-8 字节的 mostly-text 错误页:lossy 解码后仍脱敏(不能因坏字节整体 base64 跳过)
+        let mut non_utf8 = vec![0xff, 0xfe];
+        non_utf8.extend_from_slice(b" 401: key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 end");
+        let nv = redact_bundle_body(&non_utf8);
+        assert_eq!(nv["encoding"], "utf8", "lossy 后应当 utf8 存而非 base64");
+        let ns = serde_json::to_string(&nv).unwrap();
+        assert!(
+            !ns.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "非 UTF-8 fallback key 泄漏: {ns}"
+        );
+        assert!(ns.contains("sk-***"));
     }
 }
