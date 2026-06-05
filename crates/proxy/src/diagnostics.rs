@@ -566,6 +566,19 @@ pub fn is_credential_key(key: &str) -> bool {
         || norm.contains("privatekey")
         || norm.contains("cfclearance")
         || norm.ends_with("token")
+        // 复数凭据 token 容器:`tokens`/`authTokens`/`accessTokens` 等。**不能**用 `contains("token")`
+        // 放宽 —— 会误伤 `max_tokens`/`completion_tokens`/`*_tokens` 用量诊断字段(有意保留、有测试)。
+        // 故只列举明确是凭据的复数名(codex P2:收敛后 ends_with 漏复数,但用量复数必须留)。
+        || matches!(
+            norm.as_str(),
+            "tokens"
+                | "authtokens"
+                | "accesstokens"
+                | "refreshtokens"
+                | "sessiontokens"
+                | "idtokens"
+                | "bearertokens"
+        )
         || norm.contains("apikey")
 }
 
@@ -1139,13 +1152,19 @@ mod tests {
             "api_keys",
             "accessToken",
             "client_secret",
+            "tokens",
+            "authTokens",
+            "accessTokens",
         ] {
             assert!(is_credential_key(k), "{k} 应判为 credential key");
         }
-        // 诊断/用量字段不误伤(尤其 max_tokens / *_tokens 复数;authScheme/author 不含 authorization 子串)
+        // 诊断/用量字段不误伤:max_tokens / *_tokens 复数用量字段必须保留(不能因复数 token 修复被误伤);
+        // authScheme/author 不含 authorization 子串
         for k in [
             "max_tokens",
             "completion_tokens",
+            "prompt_tokens",
+            "total_tokens",
             "model",
             "cache_key",
             "wire_api",
