@@ -430,6 +430,13 @@ fn apply_desktop_target_impl(
         },
     )
     .map_err(|e| format!("apply 失败: {e}"))?;
+    // [MOC-178 codex P2] apply direct target 时持久关真实账号模式 flag —— direct(bypass_proxy 直连)
+    // 不代理、不支持 chatgpt relay,apply 已把活动 rewrite 回 apikey。一处覆盖所有 apply direct 路径
+    // (startup auto_apply / runtime 切 provider / enable 误开),避免「flag 还 true 但 plugins locked」
+    // 状态不一致(否则 UI 据 flag 说 mode on,要等下次 startup reconcile 的 direct 收敛才纠)。
+    if target.mode == "direct" {
+        let _ = crate::admin::handlers::settings::set_real_account_mode_enabled(false);
+    }
     serde_json::to_value(result).map_err(|e| format!("apply 结果序列化失败: {e}"))
 }
 
