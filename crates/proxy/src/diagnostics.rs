@@ -116,7 +116,11 @@ fn redact_bundle_body(bytes: &[u8]) -> Value {
     // 原样进 bundle 上传(codex P2)。lossy 把坏字节换 U+FFFD、ASCII 凭据照常可扫;真·二进制
     // lossy 后是乱码、无可读 token、scrub 不命中,无害。
     let lossy = String::from_utf8_lossy(bytes);
-    let scrubbed = redact_credential_tokens(&lossy).unwrap_or_else(|| lossy.into_owned());
+    // ① 先复用 `redact_body_string`(MCP 那套):form-urlencoded 键级脱敏(`client_secret`/
+    //    `refresh_token` 等无前缀 secret,OAuth token 端点错误体常见)/ 完整 JSON 键脱 / 看似 JSON
+    //    但残缺 → 省略占位(codex P2)。② 再 echo-token 扫(纯文本里回显的 sk-/Bearer/JWT)。
+    let base = redact_body_string(&lossy).unwrap_or_else(|| lossy.into_owned());
+    let scrubbed = redact_credential_tokens(&base).unwrap_or(base);
     bytes_payload(scrubbed.as_bytes(), MAX_STORED_BODY_BYTES)
 }
 
@@ -1237,6 +1241,18 @@ mod tests {
         );
         assert!(b68s.contains("Bearer ***"), "应整段脱敏: {b68s}");
         assert!(b68s.contains("rest"), "token 后正文保留");
+
+        // form-urlencoded 非 JSON body(OAuth token 端点错误):无前缀 secret 走键级脱敏(codex P2)
+        let form = redact_bundle_body(
+            b"grant_type=refresh_token&refresh_token=rt-LEAK-val&client_secret=cs-LEAK-val",
+        );
+        let fs = serde_json::to_string(&form).unwrap();
+        assert!(!fs.contains("rt-LEAK-val"), "form refresh_token 泄漏: {fs}");
+        assert!(!fs.contains("cs-LEAK-val"), "form client_secret 泄漏: {fs}");
+        assert!(
+            fs.contains("grant_type=refresh_token"),
+            "非凭据 form 字段应保留: {fs}"
+        );
 
         // 非 JSON 上游回包(HTML 401 页 / 纯文本)里回显的 key 走 bytes_payload fallback 也要挡
         let html = redact_bundle_body(
