@@ -618,7 +618,13 @@ async fn connect_and_monitor(
                 // 在排队,drain 到任一条都会在这里先 observe desired=false 退出;channel
                 // 没满时 Stop 必被送达,同样走到这里。两种情况都不漏停止。
                 if !desired.load(Ordering::SeqCst) {
-                    tracing::info!("[PluginUnlock] desired=false observed, stopping daemon");
+                    tracing::info!(
+                        "[PluginUnlock] desired=false observed, uninstalling injection then stopping"
+                    );
+                    // [MOC-178] 退出前先卸载注入(observer.disconnect + abort listener +
+                    // setAuthMethod 回原值让 plugins 入口回 disabled),使 toggle off 真实
+                    // 生效而非只停 daemon 留注入残留。best-effort,内部吞错不阻塞退出。
+                    inject_uninstall_script(&mut write, &mut read, msg_id_counter).await;
                     disable_mcp_recorder_if_active(&mut write, msg_id_counter, mcp_recorder_enabled)
                         .await;
                     let _ = write.close().await;
@@ -799,6 +805,11 @@ async fn inject_unlock_script(
 (async function() {
     const MARKER = '__codexAppTransferPluginUnlocker';
     window[MARKER] = window[MARKER] || { version: '2.2.0', unlocked: false };
+    // [MOC-178] 重新注入(toggle on)清卸载标记。否则 toggle off 留下的 uninstalled=true
+    // 会被复用的 marker 带进来,runUnlock guard 永久挡住 → re-enable 失效直到 page reload
+    // (codex P2)。scanPending 一并清,防卡死的 debounce 标记。
+    window[MARKER].uninstalled = false;
+    window[MARKER].scanPending = false;
 
     const selectors = {
         disabledInstallButton: 'button:disabled.w-full.justify-center, [role="button"][aria-disabled="true"].cursor-not-allowed',
@@ -832,9 +843,15 @@ async fn inject_unlock_script(
     function spoofChatGPTAuthMethod(element) {
         const auth = authContextValueFrom(element);
         if (!auth) return 'no_auth_context';
+        // [MOC-178] 存 AuthContext 引用,卸载(toggle off)时反向 setAuthMethod 回原值
+        window[MARKER].authRef = auth;
         if (auth.authMethod === 'chatgpt') {
             window[MARKER].unlocked = true;
             return 'unlocked';
+        }
+        // [MOC-178] 首次 spoof 前记下原 authMethod(apikey 等),卸载时回滚让入口回 disabled
+        if (window[MARKER].originalAuthMethod == null) {
+            window[MARKER].originalAuthMethod = auth.authMethod;
         }
         try {
             auth.setAuthMethod('chatgpt');
@@ -870,6 +887,8 @@ async fn inject_unlock_script(
     function enablePluginEntry() {
         const btn = pluginEntryButton();
         if (!btn) return 'no_plugin_button';
+        // [MOC-178] 存入口 button 引用,卸载时复原 disabled + 清 dataset 标记
+        window[MARKER].entryButton = btn;
         const reason = spoofChatGPTAuthMethod(btn);
         btn.disabled = false;
         btn.removeAttribute('disabled');
@@ -880,7 +899,10 @@ async fn inject_unlock_script(
         if (propsKey) { btn[propsKey].disabled = false; }
         if (btn.dataset.codexAppTransferPluginUnlocked !== 'true') {
             btn.dataset.codexAppTransferPluginUnlocked = 'true';
-            btn.addEventListener('click', () => spoofChatGPTAuthMethod(btn), true);
+            // [MOC-178] listener 用 AbortController 管理 —— capture=true 的 listener
+            // 无引用没法 removeEventListener,卸载时靠 signal abort 一并清除
+            window[MARKER].abort = window[MARKER].abort || new AbortController();
+            btn.addEventListener('click', () => spoofChatGPTAuthMethod(btn), { capture: true, signal: window[MARKER].abort.signal });
         }
         return reason;
     }
@@ -896,6 +918,9 @@ async fn inject_unlock_script(
             button[propsKey].disabled = false;
             button[propsKey]['aria-disabled'] = false;
         }
+        // [MOC-178] 记录被 unblock 的 install 按钮,卸载(toggle off)时对称复原 disabled
+        // (否则 React 不 remount 时这些强制安装按钮残留可点;codex P2)。
+        (window[MARKER].installButtons = window[MARKER].installButtons || new Set()).add(button);
     }
     function labelForcedInstallButton(button) {
         const node = Array.from(button.childNodes).find((n) => {
@@ -914,6 +939,10 @@ async fn inject_unlock_script(
         });
     }
     function runUnlock() {
+        // [MOC-178] 卸载后(toggle off)拦住所有 runUnlock 路径(observer callback / 初始循环
+        // / 残留 setTimeout),防重新 spoof 撤销卸载。toggle on 时注入开头已 reset uninstalled,
+        // 不会永久卡死 re-enable(devin + codex P2)。
+        if (window[MARKER].uninstalled) return 'uninstalled';
         // 拆开 try block:enablePluginEntry 决定 reason,unblockPluginInstallButtons
         // 的异常不应该污染主入口的 reason(install 按钮装饰失败 ≠ entry button 解锁失败)
         let reason;
@@ -934,8 +963,11 @@ async fn inject_unlock_script(
     function scheduleUnlock() {
         if (window[MARKER].scanPending) return;
         window[MARKER].scanPending = true;
-        setTimeout(() => {
+        // [MOC-178] 存 timer id 供卸载 clearTimeout 取消这条已排队的 runUnlock(observer.
+        // disconnect 拦不住已入队的 200ms timeout)。runUnlock 开头另有 uninstalled guard 兜底。
+        window[MARKER].scanTimer = setTimeout(() => {
             window[MARKER].scanPending = false;
+            window[MARKER].scanTimer = null;
             runUnlock();
         }, 200);
     }
@@ -1061,6 +1093,11 @@ async fn inject_unlock_script(
                 msg.push_str(&format!(" (脚本日志: {err})"));
             }
             set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            // [codex P2] inject 到不兼容 path 时 enablePluginEntry 已清 button disabled + 装
+            // observer/listener,但 setAuthMethod 没成功。失败 return 前先卸载撤销这些 DOM 改动 ——
+            // 否则 daemon backoff 期间用户 toggle off,run_daemon 不 reconnect 就退、永不发 uninstall,
+            // DOM-level unlock(button enabled + 自愈 observer)残留到 Codex reload。
+            inject_uninstall_script(write, read, msg_id_counter).await;
             Err(msg.into())
         }
         InjectOutcome::SetterThrew { script_error } => {
@@ -1069,12 +1106,110 @@ async fn inject_unlock_script(
                 script_error.unwrap_or_else(|| "未知错误".into())
             );
             set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            // [codex P2] 同 NoAuthContext:撤销已改的 DOM 再 return Err(见上)。
+            inject_uninstall_script(write, read, msg_id_counter).await;
             Err(msg.into())
         }
         InjectOutcome::Unknown { raw } => {
             let msg = format!("注入脚本返回未知形态: {raw}");
             set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            // [codex P2] 同 NoAuthContext:撤销已改的 DOM 再 return Err(见上)。
+            inject_uninstall_script(write, read, msg_id_counter).await;
             Err(msg.into())
+        }
+    }
+}
+
+/// [MOC-178] 卸载注入:撤销解锁脚本装的全部副作用 —— disconnect 自愈 MutationObserver、
+/// abort click listener、`setAuthMethod` 回原 authMethod 让 Codex 据 authMethod 重渲
+/// plugins 入口回 disabled。toggle off(`desired=false`)退出前调,使关闭真实生效而非只停
+/// daemon 留注入残留。best-effort:页面正在导航/已关、CDP 无响应时静默放过,不阻塞 daemon
+/// 退出(注入若残留,下次 daemon 不再维持 + Codex 重启会清)。不刷新页面、不碰 auth.json /
+/// 真实账号那套(真实账号 daemon 本就不跑、走不到这)。
+async fn inject_uninstall_script(
+    write: &mut (impl Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    read: &mut (impl Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    msg_id_counter: &AtomicU64,
+) {
+    let uninstall_script = r#"
+(function () {
+    const M = window['__codexAppTransferPluginUnlocker'];
+    if (!M) return { ok: true, reason: 'not_installed' };
+    // 1. 停自愈 observer + 取消已排队的 scheduleUnlock(observer.disconnect 拦不住已入队
+    //    的 200ms timeout;不取消则卸载后它仍 runUnlock 重新 spoof → toggle off 失效)。
+    //    M.uninstalled 在末尾置 true 后,回调即便漏网也会自查跳过(双保险,codex P2)。
+    try { if (M.observer) { M.observer.disconnect(); M.observer = null; } } catch (e) {}
+    try { if (M.scanTimer) { clearTimeout(M.scanTimer); M.scanTimer = null; } } catch (e) {}
+    M.scanPending = false;
+    // 2. 清 click listener(capture 注册无引用,靠 AbortController signal 一并 abort)
+    try { if (M.abort) { M.abort.abort(); M.abort = null; } } catch (e) {}
+    // 3. 反向 setAuthMethod 回原值 → Codex 据 authMethod 重渲,plugins 入口回 disabled。
+    //    主路径:setter 有效时正向靠它 enable、反向靠它 disable(React 重渲驱动)。仅原值
+    //    非 chatgpt 时回滚,避免误改真实 chatgpt 账号(真实账号 daemon 本就不跑、走不到这,
+    //    双保险)。
+    let reverted = false;
+    try {
+        if (M.authRef && typeof M.authRef.setAuthMethod === 'function'
+            && M.originalAuthMethod != null && M.originalAuthMethod !== 'chatgpt') {
+            M.authRef.setAuthMethod(M.originalAuthMethod);
+            reverted = true;
+        }
+    } catch (e) { M.lastError = String(e?.stack || e); }
+    // 4. DOM 兜底 + 清标记。正向除 setAuthMethod 外还做了命令式 DOM 强改(strict fallback,
+    //    btn.disabled=false 等);若 React 不因 authMethod 翻回而重渲该 button,强改会残留 →
+    //    入口仍可点。主动把 entryButton 设回 disabled(跟反向重渲同向、不冲突;disabled 决定
+    //    可点性,display 等交给 React)+ delete dataset(否则同页 re-enable 时 enablePluginEntry
+    //    的 guard 判 true 会漏挂新 click listener)。
+    try {
+        const btn = M.entryButton;
+        if (btn) {
+            btn.disabled = true;
+            btn.setAttribute('disabled', '');
+            const propsKey = Object.keys(btn).find((k) => k.startsWith('__reactProps'));
+            if (propsKey && btn[propsKey]) { btn[propsKey].disabled = true; }
+            delete btn.dataset.codexAppTransferPluginUnlocked;
+        }
+    } catch (e) { M.lastError = String(e?.stack || e); }
+    // 5. 对称复原被 unblock 的 install 按钮(强制安装控件)回 disabled,防 React 不 remount
+    //    时残留可点(codex P2)。原值未存,只复 disabled/aria/props(决定可点性),class/文字
+    //    交给 React 重渲。
+    try {
+        if (M.installButtons && M.installButtons.forEach) {
+            M.installButtons.forEach((b) => {
+                try {
+                    b.disabled = true;
+                    b.setAttribute('aria-disabled', 'true');
+                    b.style.pointerEvents = '';
+                    const pk = Object.keys(b).find((k) => k.startsWith('__reactProps'));
+                    if (pk && b[pk]) { b[pk].disabled = true; b[pk]['aria-disabled'] = true; }
+                } catch (e) {}
+            });
+            M.installButtons.clear();
+        }
+    } catch (e) { M.lastError = String(e?.stack || e); }
+    M.unlocked = false;
+    M.uninstalled = true;
+    return { ok: true, reason: 'uninstalled', reverted: reverted };
+})()
+"#;
+    let (evaluate, evaluate_id) = make_cdp_msg(
+        msg_id_counter,
+        "Runtime.evaluate",
+        json!({ "expression": uninstall_script, "returnByValue": true }),
+    );
+    if write.send(WsMessage::Text(evaluate)).await.is_err() {
+        tracing::warn!("[PluginUnlock] uninstall script send failed (WS dead); skipping");
+        return;
+    }
+    // 卸载脚本同步执行很快;短超时等响应,超时也无妨(已发出,best-effort)。
+    match await_cdp_response(read, evaluate_id, Duration::from_secs(3)).await {
+        Ok(_) => {
+            tracing::info!(
+                "[PluginUnlock] injection uninstalled (observer/listener/spoof reverted)"
+            )
+        }
+        Err(e) => {
+            tracing::warn!("[PluginUnlock] uninstall response wait failed (best-effort): {e}")
         }
     }
 }
