@@ -132,10 +132,18 @@ pub async fn forget_handler(
     // (对比直接删活动 auth.json:那会丢 tokens、restore 恢复不回,残缺。)
     let synced =
         crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&state).await;
-    let switched = synced
+    let mut switched = synced
         .get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // [MOC-178 codex P2] sync 依赖 active provider config;无 provider(默认 activeProvider null)
+    // / apply 失败时 sync success:false、活动仍 chatgpt → 直接切活动 auth apikey 兜底(不依赖
+    // provider),确保 Codex 不留 plugins、跟 flag=false 一致(否则要等下次启动 ForceDisable)。
+    if codex_real_account::active_is_real_chatgpt_now() {
+        switched = codex_real_account::deactivate_real_account()
+            .await
+            .unwrap_or(false);
+    }
     Json(json!({
         "success": true,
         "removed": removed,
@@ -194,6 +202,10 @@ pub async fn enable_handler(
         let _ =
             crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&state)
                 .await;
+        // clearing 同样依赖 provider;无 provider / 失败时活动可能仍 chatgpt → deactivate 兜底。
+        if codex_real_account::active_is_real_chatgpt_now() {
+            let _ = codex_real_account::deactivate_real_account().await;
+        }
         return err(
             StatusCode::BAD_REQUEST,
             "开启真实账号模式失败:当前 provider 不支持 relay(如 direct 模式),或系统代理未能启动。请检查 provider / 系统代理后重试".to_owned(),

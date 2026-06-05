@@ -634,6 +634,29 @@ pub async fn activate_real_account() -> Result<bool, String> {
     Ok(false)
 }
 
+/// [MOC-178 codex P2] 关真实账号模式的 auth 兜底:直接改活动 auth.json `auth_mode=apikey`
+/// (保留 tokens),**不依赖 provider config**。forget / enable 失败回滚走的 sync 路径依赖
+/// active provider(无 provider(默认 activeProvider null)/ apply 失败 → sync success:false、
+/// 活动仍 chatgpt),用本函数兜底确保活动不留 chatgpt(否则 Codex 仍显示 plugins、跟 flag=false
+/// 不一致,要等下次启动 ForceDisable 才纠)。持 `AUTH_LOCK`。返回是否执行了切换(活动本就
+/// 非 chatgpt → `Ok(false)` no-op)。
+pub async fn deactivate_real_account() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let Ok(mut v) = read_auth(&paths.auth_json) else {
+        return Ok(false);
+    };
+    if v.get("auth_mode").and_then(Value::as_str) != Some("chatgpt") {
+        return Ok(false);
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("auth_mode".into(), Value::String("apikey".into()));
+    }
+    backup_active_auth(&paths, "predeactivate")?;
+    write_auth(&paths.auth_json, &v).map_err(|e| format!("切 apikey 失败: {e}"))?;
+    Ok(true)
+}
+
 /// [MOC-104 req#5 启动调谐] 启动时(**绝不刷新 token**,见模块级分流说明):① 活动
 /// `~/.codex/auth.json` 已是有效真实 chatgpt → 共用、原样不动(本机 Codex 自维护);
 /// ② 活动失效(被 apply 改 apikey / 登出 / 清掉)且用户导入过账号 → 恢复:优先从
