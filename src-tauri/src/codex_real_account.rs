@@ -607,15 +607,26 @@ pub async fn activate_real_account() -> Result<bool, String> {
         return Ok(true);
     }
     // 活动有有效 chatgpt tokens(但 auth_mode 非 chatgpt,如清除后的 apikey)→ 只改 auth_mode。
+    // [codex-review P2] 必须连本地 JWT 过期一起判 —— parse_chatgpt_tokens 只校验非空,清除后保留的
+    // token 会随时间过期;不检查会激活 expired token + 报 Ok(true),前端显示「已开启」但 runtime 全
+    // 401,还会 shadow 掉下面可能有效的镜像(本分支 early-return 在镜像分支前)。过期则 fall through
+    // 到镜像分支(下面会判过期再决定是否恢复)。
     if let Ok(mut v) = read_auth(&paths.auth_json) {
         if parse_chatgpt_tokens(&v).is_some() {
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
-                obj.remove("OPENAI_API_KEY");
+            let access = v
+                .get("tokens")
+                .and_then(|t| t.get("access_token"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !access_token_expired(access, chrono::Utc::now().timestamp()) {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
+                    obj.remove("OPENAI_API_KEY");
+                }
+                backup_active_auth(&paths, "preactivate")?;
+                write_auth(&paths.auth_json, &v).map_err(|e| format!("写回 chatgpt 失败: {e}"))?;
+                return Ok(true);
             }
-            backup_active_auth(&paths, "preactivate")?;
-            write_auth(&paths.auth_json, &v).map_err(|e| format!("写回 chatgpt 失败: {e}"))?;
-            return Ok(true);
         }
     }
     // 活动无 token → 从持久镜像恢复整份(镜像有效且本地 JWT 未过期)。

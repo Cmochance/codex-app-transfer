@@ -336,6 +336,10 @@ fn main() {
                             // (review #6)—— 前端靠这个事件标记「账号已失效」,开关已是
                             // off 的新装用户也得知道账号失效,否则 detect 见 token 在就误报。
                             let _ = handlers::settings::disable_auto_unlock_codex_plugins().await;
+                            // [MOC-178 codex P2] 账号 expired 无法恢复 → 也持久关真实账号模式 flag,
+                            // 否则前端据 mode_enabled 派生 toggle 仍 on、future startup 还当 enabled。
+                            // 重登成功 / 重新 import 会再开。
+                            let _ = handlers::settings::set_real_account_mode_enabled(false);
                             if let Some(window) =
                                 app_handle_for_residual_scan.get_webview_window("main")
                             {
