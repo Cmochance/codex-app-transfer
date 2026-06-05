@@ -298,6 +298,14 @@ fn main() {
                                     ),
                                 };
                                 let _ = admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&st).await;
+                                // [MOC-178 codex P2] sync 依赖 active provider;无 provider(默认
+                                // activeProvider null)/ apply 失败时活动仍 chatgpt → 下方 daemon
+                                // 决策会当 plugins 原生解锁(跟 flag=false 矛盾)。同 forget/enable
+                                // handler,加 deactivate 兜底直接切活动 apikey(不依赖 provider)。
+                                if crate::codex_real_account::active_is_real_chatgpt_now() {
+                                    let _ =
+                                        crate::codex_real_account::deactivate_real_account().await;
+                                }
                             } else {
                                 tracing::info!(
                                     "[RealAccount] 真实账号模式已关(flag=false),活动无 token,不收敛"
