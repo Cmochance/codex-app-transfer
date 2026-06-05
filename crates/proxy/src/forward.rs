@@ -887,8 +887,13 @@ impl Drop for TracedStream {
         // jsonl。仅 gate 开时 trace 为 Some。同步 append(一行),与上面 telemetry 日志
         // 同属 Drop 内轻量 IO,不阻塞客户端(流已交付完毕)。
         if let Some(ctx) = self.trace.take() {
-            // resp_buf 可能被 cap 截断;total_bytes 是 tee 累计的真实全长 → 传它修正 truncated_bytes
-            write_trace_from_ctx(&ctx, &self.resp_buf, self.total_bytes);
+            // [MOC-169] Drop 时**重查 gate**:请求开始时 gate 开才有 ctx,但若流中途用户关了
+            // 诊断,这条 in-flight trace 不再落盘(与 MCP recorder「关即停」一致 —— 关诊断后采集
+            // 立即停,不留 in-flight 残尾)。env CAS_DIAG_TRACE 开的恒真、照写。
+            if forward_trace_enabled() {
+                // resp_buf 可能被 cap 截断;total_bytes 是 tee 累计真实全长 → 传它修正 truncated_bytes
+                write_trace_from_ctx(&ctx, &self.resp_buf, self.total_bytes);
+            }
         }
     }
 }
