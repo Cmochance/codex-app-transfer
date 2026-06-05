@@ -199,19 +199,13 @@ fn redact_credential_tokens(s: &str) -> Option<String> {
     let mut rest = s;
     'scan: while !rest.is_empty() {
         // JWT 子串(`eyJ….eyJ….sig`):嵌在消息文本里(`invalid token eyJ…`)时,值层 looks_like_jwt
-        // (判整串)抓不到 → 在此按子串挡(codex P1)。is_tok 含 `.`,故 take_while 能整段取出 JWT。
-        if rest.starts_with("eyJ") {
-            let run_len: usize = rest
-                .chars()
-                .take_while(|c| is_tok(*c))
-                .map(char::len_utf8)
-                .sum();
-            if looks_like_jwt(&rest[..run_len]) {
-                out.push_str("***");
-                rest = &rest[run_len..];
-                changed = true;
-                continue 'scan;
-            }
+        // (判整串)抓不到 → 在此按子串挡(codex P1)。用 jwt_match_len **精确**匹配三段 base64url、
+        // 停在签名段末尾,**不吞尾随标点**(句号/逗号/括号等)——否则尾随 `.` 会被算成第 4 段而漏(codex P2)。
+        if let Some(n) = jwt_match_len(rest) {
+            out.push_str("***");
+            rest = &rest[n..];
+            changed = true;
+            continue 'scan;
         }
         for (pfx, minlen) in PREFIXES {
             if let Some(after) = rest.strip_prefix(*pfx) {
@@ -553,6 +547,40 @@ fn looks_like_jwt(s: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// 若 `s` **以**一个 JWT 开头,返回该 JWT 的精确字节长度(`Some(n)`),否则 `None`。用于
+/// [`redact_credential_tokens`] 在**自由文本里**就地挡 echo 的 JWT:精确匹配 `eyJ<b64url>` `.`
+/// `eyJ<b64url>` `.` `<b64url>` 三段(base64url = 字母数字 / `-` / `_`,**不含 `.`**),停在签名段
+/// 末尾 —— 因此**不吞尾随句子标点**(`eyJ….sig.` / `…sig,` / `…sig)` 都只匹配到 `sig`)。这正是
+/// [`looks_like_jwt`](判整串、`.` 当 token 会把尾随句号算成第 4 段)在子串场景下漏掉的(codex P2)。
+fn jwt_match_len(s: &str) -> Option<usize> {
+    let b64 = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let seg = |t: &str| -> usize { t.chars().take_while(|c| b64(*c)).map(char::len_utf8).sum() };
+    // seg1
+    if !s.starts_with("eyJ") {
+        return None;
+    }
+    let s1 = seg(s);
+    if s1 < 8 || s.as_bytes().get(s1) != Some(&b'.') {
+        return None;
+    }
+    // seg2(payload 也是 JSON → eyJ 开头)
+    let r2 = &s[s1 + 1..];
+    if !r2.starts_with("eyJ") {
+        return None;
+    }
+    let s2 = seg(r2);
+    if s2 < 8 || r2.as_bytes().get(s2) != Some(&b'.') {
+        return None;
+    }
+    // seg3(签名,base64url)
+    let r3 = &r2[s2 + 1..];
+    let s3 = seg(r3);
+    if s3 < 8 {
+        return None;
+    }
+    Some(s1 + 1 + s2 + 1 + s3)
 }
 
 /// 脱敏一条 MCP-trace 记录(整个 JSON 对象,MOC-169 增量 4)。
@@ -1189,6 +1217,16 @@ mod tests {
         assert!(
             js.contains("invalid token *** provided"),
             "应只脱敏 JWT 子串、保留上下文: {js}"
+        );
+
+        // JWT 紧跟句末标点(句号/逗号)也挡,且标点**保留**(codex P2:精确匹配不吞尾随 `.`)
+        let jwt_punct = format!(r#"{{"m":"token {FAKE_JWT}. next {FAKE_JWT}, end"}}"#);
+        let jp = serde_json::to_string(&redact_bundle_body(jwt_punct.as_bytes())).unwrap();
+        assert!(!jp.contains(FAKE_JWT), "句末 JWT 泄漏: {jp}");
+        assert!(jp.contains("token ***. next"), "尾随句号应保留: {jp}");
+        assert!(
+            jp.contains("*** , end") || jp.contains("***, end"),
+            "尾随逗号应保留: {jp}"
         );
 
         // 含非法 UTF-8 字节的 mostly-text 错误页:lossy 解码后仍脱敏(不能因坏字节整体 base64 跳过)
