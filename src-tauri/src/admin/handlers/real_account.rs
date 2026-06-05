@@ -92,8 +92,13 @@ async fn finalize_enable_real_account(state: &AdminState) -> Result<(), String> 
     // → abort,不 apply relay。否则会 apply relay 把活动写成 chatgpt 但 flag 仍旧值 → 前端/startup
     // 据旧 flag 当 mode off,活动却是 chatgpt,状态不一致。
     if !super::settings::set_real_account_mode_enabled(true) {
-        // [MOC-178 codex P2] abort 前先切活动回 apikey —— activate(enable)/import 已把活动写成
-        // chatgpt,若只 return Err 不切,flag false 但活动 chatgpt + plugins exposed 状态不一致。
+        // [MOC-178 codex P2] abort 前恢复活动到 enable 前的 apikey 态。activate(enable from apikey)
+        // 已把活动写 chatgpt + **删了 OPENAI_API_KEY**,只 deactivate(改 auth_mode)会留「apikey 但无
+        // key」→ Codex 没 key 可用。走 clearing apply 重写 apikey + gateway key(同下方回滚 path);
+        // clearing 切不了(无 provider)再 deactivate 兜底把 auth_mode 切回 apikey。
+        let _ =
+            crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(state)
+                .await;
         if codex_real_account::active_is_real_chatgpt_now() {
             let _ = codex_real_account::deactivate_real_account().await;
         }
