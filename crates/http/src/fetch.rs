@@ -123,6 +123,9 @@ pub async fn web_fetch(
     // 极少的占位页。占位页 + 解析出重定向 target → 换 URL 重抓 (防循环 + 记 trail)。
     let mut current = url.to_string();
     let mut hops: Vec<String> = Vec::new();
+    // 已访问 URL(精确比较防循环 + 自跳) —— 用纯 URL 列表, 不在格式化 trail 串上 `ends_with`
+    // (否则一个 URL 是另一个后缀时会误判成循环, devin review)。
+    let mut visited: Vec<String> = vec![current.clone()];
     let f = loop {
         let f = fetch_by_backend(backend, &current).await?;
         if f.is_html && hops.len() < MAX_CLIENT_REDIRECTS {
@@ -130,9 +133,10 @@ pub async fn web_fetch(
             // 仅"正文极少的占位页"才尝试跟随 —— 正常页含 meta refresh/JS 也不动 (避免误跳)。
             if visible_text_len(&capped) < MIN_EXTRACTED_CHARS {
                 if let Some(target) = detect_client_redirect(&capped, &current) {
-                    // 防自跳 / 简单循环 (A→B→A)。
-                    if target != current && !hops.iter().any(|h| h.ends_with(&target)) {
+                    // 精确 URL 比较防循环(自跳也涵盖: current 已在 visited)。
+                    if !visited.contains(&target) {
                         hops.push(format!("client-redirect → {target}"));
+                        visited.push(target.clone());
                         current = target;
                         continue;
                     }
@@ -881,8 +885,9 @@ fn parse_meta_refresh(html: &str) -> Option<String> {
             continue;
         };
         let region = start + cpos;
-        if let Some(u) = lower[region..end].find("url=") {
-            let val = html[region + u + 4..end]
+        // content 内找 url 值(容忍 `url = X` 等号空格, chatgpt review); lower/html 同字节偏移。
+        if let Some(voff) = find_url_value_offset(&lower[region..end]) {
+            let val = html[region + voff..end]
                 .trim_start_matches(['"', '\'', ' '])
                 .split(['"', '\'', '>', ' '])
                 .next()
@@ -892,6 +897,27 @@ fn parse_meta_refresh(html: &str) -> Option<String> {
                 return Some(val.to_string());
             }
         }
+    }
+    None
+}
+
+/// 在 content 属性值里找 `url`(前须非 ident, 避免 `curl` 等子串)后(**容忍等号空格** `url = X`)的值
+/// 起始字节偏移(相对入参 `s`) —— chatgpt-codex review。
+fn find_url_value_offset(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut p = 0;
+    while let Some(rel) = s[p..].find("url") {
+        let upos = p + rel;
+        p = upos + 3;
+        if upos > 0 && (bytes[upos - 1].is_ascii_alphanumeric() || bytes[upos - 1] == b'_') {
+            continue; // curl / blurl 等子串
+        }
+        let after = s[upos + 3..].trim_start();
+        let Some(rest) = after.strip_prefix('=') else {
+            continue;
+        };
+        let val = rest.trim_start();
+        return Some(s.len() - val.len());
     }
     None
 }
@@ -1002,6 +1028,11 @@ mod tests {
             )
             .as_deref(),
             Some("https://e.com/real")
+        );
+        // url = X 等号空格(chatgpt-codex review 第 2 轮)
+        assert_eq!(
+            parse_meta_refresh("<meta http-equiv='refresh' content='0; url = /spaced'>").as_deref(),
+            Some("/spaced")
         );
         // 非 refresh meta → None
         assert_eq!(parse_meta_refresh("<meta charset='utf-8'><p>hi</p>"), None);
