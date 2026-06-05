@@ -196,6 +196,9 @@ fn viewer_router() -> Router {
         .route("/api/clear", post(api_clear))
         // MOC-181: cat-webfetch 子进程反向上报内部链路(跨进程无法直接 push 本进程 store)。
         .route("/api/ingest", post(api_ingest))
+        // MOC-181: 身份探测 —— cat-webfetch 上报前 GET 此端点确认该端口上真是本 viewer
+        // (sentinel 残留 / 端口被别的进程占时拒发敏感数据, chatgpt-codex P2)。
+        .route("/api/health", get(api_health))
 }
 
 /// 单页 viewer(零外部依赖,inline CSS/JS,编进二进制)。
@@ -278,6 +281,12 @@ async fn api_ingest(Json(mut value): Json<Value>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// MOC-181: 身份探测端点。cat-webfetch 子进程上报前 GET 此端点, body 含固定 `service` 标识 →
+/// 确认 sentinel 指向的端口上真是本 viewer(而非 crash 残留后占用该端口的其它进程), 是才发诊断数据。
+async fn api_health() -> Json<Value> {
+    Json(serde_json::json!({ "service": "cas-trace-viewer" }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +327,18 @@ mod tests {
         assert!(
             arr.iter().any(|v| v["marker"] == fwd_marker),
             "forward 标记记录应出现在 /api/traces"
+        );
+
+        // ── health(MOC-181): cat-webfetch 上报前 GET /api/health 确认身份, body 带固定 service 标识。
+        let health = client
+            .get(format!("{base}/api/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status().as_u16(), 200);
+        assert!(
+            health.text().await.unwrap().contains("cas-trace-viewer"),
+            "health 应返回 viewer 身份标识"
         );
 
         // ── ingest(MOC-181): cat-webfetch 子进程 POST 一条(无 seq, viewer 自分配);非 cat_webfetch 被拒。

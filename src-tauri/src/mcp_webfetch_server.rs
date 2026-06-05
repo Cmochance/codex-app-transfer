@@ -23,8 +23,9 @@
 //! 完成后把结构化链路条目(请求参数 / 抓取档+升级链+status / 摘要 prompt+响应+延迟 / 返回字符数)
 //! POST 到 viewer 的 `POST /api/ingest`(端口取自 sentinel)。主 app 为其分配全局 seq 后 push 进
 //! trace_store, 诊断查看器 cat-webfetch 分页实时可见。**gate on running viewer**(非持久化 config):
-//! viewer 没在跑 → 无 sentinel → 不构造不上报, 既不影响工具响应、也不会把数据发给占固定端口的
-//! 其它进程(`diag_target` 读 sentinel 判活 + 拿对端口)。
+//! viewer 没在跑 → 无 sentinel → 不构造不上报。两道防线确保不把 prompt 数据发给非 viewer 进程:
+//! ① `diag_target` 读 sentinel 拿端口(sentinel 仅 viewer start 写、stop 删);② 上报前 GET
+//! `/api/health` 确认该端口上真是本 viewer(防 crash 残留 sentinel / 端口被占, chatgpt-codex P2)。
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -759,7 +760,9 @@ fn empty_body_msg(backend: WebFetchBackend) -> String {
 }
 
 /// 把诊断条目 POST 到 viewer ingest(失败静默 —— 诊断旁路绝不影响 web_fetch 主功能 / 不阻塞返回)。
-/// 短超时:viewer 没起 / 端口不通时快速放弃, 不拖慢工具响应。`port` 来自 viewer 写的 runtime sentinel。
+/// `port` 来自 viewer 写的 runtime sentinel; **POST 前先 GET `/api/health` 确认该端口上真是本
+/// viewer**(sentinel 可能 crash 残留、端口可能被别的进程占)—— 身份不符 / 探测失败就放弃, 绝不把
+/// prompt 数据发给非 viewer 进程(chatgpt-codex P2)。短超时, viewer 假死 / 端口不通时快速放弃。
 async fn post_diag_entry(port: u16, value: Value) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -768,8 +771,23 @@ async fn post_diag_entry(port: u16, value: Value) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let url = format!("http://127.0.0.1:{port}/api/ingest");
-    let _ = client.post(&url).json(&value).send().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let is_viewer = match client.get(format!("{base}/api/health")).send().await {
+        Ok(r) if r.status().is_success() => r
+            .text()
+            .await
+            .map(|t| t.contains("cas-trace-viewer"))
+            .unwrap_or(false),
+        _ => false,
+    };
+    if !is_viewer {
+        return;
+    }
+    let _ = client
+        .post(format!("{base}/api/ingest"))
+        .json(&value)
+        .send()
+        .await;
 }
 
 /// 剥掉 reasoning 模型内联在 content 里的 `<think>…</think>` 思维链(可能多段)。仅处理成对
