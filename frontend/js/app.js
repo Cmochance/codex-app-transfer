@@ -1530,10 +1530,12 @@
           runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
         }
       }
-      // [MOC-178] 「清除真实账号」按钮 = 真实账号模式开着时显示(可关)。按持久 flag,跟
-      // toggle 一致:flag 开 → 显示;flag 关 → 隐藏(已关、无需再清)。
+      // [MOC-178] 「清除真实账号」按钮显示 = 真实账号模式开(modeOn,可关)**或**有持久镜像
+      // (has_imported,可清凭据)。[codex P2] 不能只看 modeOn —— direct 下 import/auto-pin 会留
+      // has_imported=true 但 flag=false,只看 modeOn 会藏掉按钮、用户没法删镜像(唯一清除入口)。
       const forgetBtn = $("#realAccountForgetBtn");
-      if (forgetBtn) forgetBtn.style.display = modeOn ? "" : "none";
+      if (forgetBtn)
+        forgetBtn.style.display = modeOn || st.has_imported === true ? "" : "none";
       // 新登录开始 → 复位「本次登录已持久」标记,下次成功要重新 pin(替换旧镜像)。
       if (login.state === "running") realAccountLoginPinned = false;
       // 自动持久(单账号工具:登录即选择真实账号模式,无需手动「钉住」):
