@@ -682,6 +682,10 @@ window.CCApi.realAccount = {
   async forget() {
     return api('POST', '/api/desktop/real-account/forget');
   },
+  /** [MOC-178] 开真实账号模式(写持久 flag=true + 把活动写回 chatgpt + apply relay) */
+  async enable() {
+    return api('POST', '/api/desktop/real-account/enable');
+  },
 };
 
 // MOC-114 系统代理(梯子)连通性 —— relay 真账号/插件/第三方路由都依赖它
