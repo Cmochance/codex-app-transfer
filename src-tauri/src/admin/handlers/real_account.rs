@@ -82,18 +82,53 @@ pub struct ImportRequest {
     pub source_path: String,
 }
 
-pub async fn import_handler(Json(req): Json<ImportRequest>) -> impl IntoResponse {
+/// [MOC-178 codex P2] 开真实账号模式的共用收尾:写持久 flag=true + apply relay,并校验 relay
+/// 真生效。direct provider(relay gate 拒 → auth 被 rewrite 回 apikey)/ sync 失败(proxy 起不来)
+/// 导致活动留不住 chatgpt 时,回滚 flag + 把活动切回 apikey(clearing + deactivate 兜底),返 Err。
+/// enable / import / pin 共用,避免某路径漏检查(import/pin 曾只 set flag=true 不校验,direct 下
+/// 会 set flag=true 但 relay 不生效 → 状态不一致)。`Ok(())` = relay 真开了。
+async fn finalize_enable_real_account(state: &AdminState) -> Result<(), String> {
+    let _ = super::settings::set_real_account_mode_enabled(true);
+    let synced =
+        crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(state).await;
+    let sync_ok = synced
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if sync_ok && codex_real_account::active_is_real_chatgpt_now() {
+        return Ok(());
+    }
+    // relay 没真生效(direct / proxy 起不来)→ 回滚 flag + 切活动回 apikey(clearing 走 force_apikey,
+    // 即便 proxy 起不来也切;再 deactivate 兜底覆盖无 provider),避免「flag/UI 说开但 relay 没起」。
+    let _ = super::settings::set_real_account_mode_enabled(false);
+    let _ =
+        crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(state).await;
+    if codex_real_account::active_is_real_chatgpt_now() {
+        let _ = codex_real_account::deactivate_real_account().await;
+    }
+    Err("当前 provider 不支持真实账号 relay(如 direct 模式),或系统代理未能启动。请切到 local_proxy 类 provider / 检查系统代理后重试".to_owned())
+}
+
+pub async fn import_handler(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+    Json(req): Json<ImportRequest>,
+) -> impl IntoResponse {
     if let Err(e) = codex_real_account::import_auth(req.source_path).await {
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }
-    // [MOC-178 codex P2] 导入真实账号 = 用户主动建立真实账号 → 开真实账号模式持久 flag。否则
-    // clear(flag=false)→ import 后 flag 仍 false,下次启动 ForceDisable 把刚导入的账号又切回
-    // apikey(撤销导入)、UI toggle 也错显 off。
-    let _ = super::settings::set_real_account_mode_enabled(true);
+    // [MOC-178 codex P2] import_auth 已写活动 chatgpt + 镜像;走共用收尾(set flag + apply relay +
+    // 校验回滚),避免 direct provider 下 set flag=true 但 relay 不生效的状态不一致(原来无条件
+    // set flag=true)。enabled=false 表示导入成功但当前 provider 开不了 relay,凭据仍保留。
+    let enabled = finalize_enable_real_account(&state).await.is_ok();
     let status = codex_real_account::detect();
     Json(json!({
         "success": true,
-        "message": "已导入并持久保留真实账号",
+        "enabled": enabled,
+        "message": if enabled {
+            "已导入并开启真实账号模式"
+        } else {
+            "已导入真实账号;当前 provider 不支持 relay(如 direct),未开启真实账号模式,可切 local_proxy provider 后再开"
+        },
         "relogin_required": status.relogin_required,
     }))
     .into_response()
@@ -102,16 +137,25 @@ pub async fn import_handler(Json(req): Json<ImportRequest>) -> impl IntoResponse
 /// POST /api/desktop/real-account/pin-current
 ///
 /// 钉住当前检测到的真实账号(官方活动 auth.json)进持久镜像。
-pub async fn pin_current_handler() -> impl IntoResponse {
-    match codex_real_account::pin_current_account().await {
-        Ok(()) => {
-            // [MOC-178 codex P2] 钉住真实账号 = 开真实账号模式持久 flag(同 import,见上)。
-            let _ = super::settings::set_real_account_mode_enabled(true);
-            Json(json!({ "success": true, "message": "已钉住当前真实账号(持久保留)" }))
-                .into_response()
-        }
-        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+pub async fn pin_current_handler(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+) -> impl IntoResponse {
+    if let Err(e) = codex_real_account::pin_current_account().await {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
     }
+    // [MOC-178 codex P2] 同 import:走共用收尾(set flag + apply relay + 校验回滚),direct 下不留
+    // 「flag=true 但 relay 不生效」。
+    let enabled = finalize_enable_real_account(&state).await.is_ok();
+    Json(json!({
+        "success": true,
+        "enabled": enabled,
+        "message": if enabled {
+            "已钉住并开启真实账号模式"
+        } else {
+            "已钉住真实账号;当前 provider 不支持 relay(如 direct),未开启真实账号模式"
+        },
+    }))
+    .into_response()
 }
 
 /// POST /api/desktop/real-account/forget
@@ -179,38 +223,10 @@ pub async fn enable_handler(
         }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-    let _ = super::settings::set_real_account_mode_enabled(true);
-    // 活动已写回 chatgpt,apply relay 的 gate 通过 → Codex 原生显示 plugins,不启 daemon。
-    let synced =
-        crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(&state).await;
-    // [MOC-178 codex P2 ×2] 开真实账号模式要 relay 真生效才算成功,两种失败都回滚 flag + 报错,
-    // 否则「flag 说开但 relay 没起」状态不一致:
-    // ① sync 失败(success:false)—— local_proxy 的 proxy 起不来(端口冲突等)在 apply 前 return,
-    //    此时活动仍是 activate 写的 chatgpt(`active_is_real_chatgpt_now` 仍 true,单查它漏判);
-    // ② sync 后活动不再 chatgpt —— direct provider 的 relay gate(mode != "direct")把 auth
-    //    rewrite 回 apikey。
-    let sync_ok = synced
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !sync_ok || !codex_real_account::active_is_real_chatgpt_now() {
-        let _ = super::settings::set_real_account_mode_enabled(false);
-        // [MOC-178 codex P2] activate_real_account 已把活动写成 chatgpt;enable 失败必须把活动也
-        // 切回 apikey,否则「flag=false + UI off 但活动仍 chatgpt、Codex 还显示 plugins」状态不一致
-        // (要等下次启动 ForceDisable 才纠)。clearing 走 force_apikey,即便 proxy 起不来也切 auth
-        // (保留 tokens、不删镜像),把活动恢复成 enable 前的 apikey 态。
-        let _ =
-            crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&state)
-                .await;
-        // clearing 同样依赖 provider;无 provider / 失败时活动可能仍 chatgpt → deactivate 兜底。
-        if codex_real_account::active_is_real_chatgpt_now() {
-            let _ = codex_real_account::deactivate_real_account().await;
-        }
-        return err(
-            StatusCode::BAD_REQUEST,
-            "开启真实账号模式失败:当前 provider 不支持 relay(如 direct 模式),或系统代理未能启动。请检查 provider / 系统代理后重试".to_owned(),
-        )
-        .into_response();
+    // [MOC-178 codex P2] 共用收尾:set flag + apply relay + 校验回滚(direct / proxy 失败回滚
+    // flag + 切活动回 apikey)。逻辑见 finalize_enable_real_account。
+    if let Err(msg) = finalize_enable_real_account(&state).await {
+        return err(StatusCode::BAD_REQUEST, msg).into_response();
     }
     Json(json!({
         "success": true,
