@@ -62,6 +62,22 @@
   pre.diff .del { color: var(--err); }
   pre.diff .add { color: var(--ok); }
   pre.diff .ctx { color: var(--muted); }
+  /* [MOC-184] C 用量 chips / D 分组头 / E 结构化卡片 / F 键盘提示 */
+  .usage { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .uchip { font: 11px var(--mono); padding: 2px 7px; border-radius: 4px; background: var(--panel2);
+    border: 1px solid var(--border); color: var(--muted); }
+  .uchip b { color: var(--fg); font-weight: 600; }
+  .uchip.cache b { color: var(--ok); } .uchip.reason b { color: var(--warn); }
+  .group-hd { position: sticky; top: 0; padding: 4px 12px; background: var(--panel2); color: var(--accent);
+    font: 600 11px var(--mono); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; }
+  .group-hd .cnt { color: var(--muted); }
+  .card { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; background: var(--bg); }
+  .card .role { display: inline-block; font: 10px var(--mono); text-transform: uppercase; color: var(--accent);
+    background: var(--panel2); padding: 1px 6px; border-radius: 4px; margin-bottom: 6px; }
+  .card .role.tool { color: var(--ok); text-transform: none; }
+  .card .tdesc { color: var(--muted); font-size: 11px; margin-bottom: 6px; }
+  pre.payload.mini { max-height: 240px; font-size: 11px; }
+  .hint { color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -76,8 +92,14 @@
       <option value="mcp">mcp</option>
       <option value="cat_webfetch">cat-webfetch</option>
     </select>
+    <select id="group">
+      <option value="none">不分组</option>
+      <option value="provider">按 provider</option>
+      <option value="model">按 model</option>
+    </select>
     <input id="q" type="search" placeholder="搜 path / provider / url…" />
     <button id="clear">清空</button>
+    <span class="hint">j/k 导航</span>
   </header>
   <main>
     <div id="list"></div>
@@ -90,6 +112,7 @@
   const listEl = $("#list"), detailEl = $("#detail"), liveEl = $("#live"), liveTxt = $("#livetxt");
   let traces = [];          // 全部记录(value 对象)
   let selected = null;      // 当前选中的 seq
+  let visibleSeqs = [];     // [MOC-184 · F] 当前过滤/分组后可见行的 seq(视觉顺序),键盘导航用
 
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -130,18 +153,43 @@
     return JSON.stringify(t).toLowerCase().includes(q);
   }
 
-  function renderList() {
-    const rows = traces.filter(matches);
-    listEl.innerHTML = rows.map((t) => {
-      const k = kindOf(t), st = statusOf(t);
-      const stCls = st ? "st" + String(st)[0] : "";
-      const ts = (t.captured_at || "").replace("T", " ").slice(5, 19);
-      return `<div class="row ${t.seq === selected ? "sel" : ""}" data-seq="${t.seq}">
+  function rowHtml(t) {
+    const k = kindOf(t), st = statusOf(t);
+    const stCls = st ? "st" + String(st)[0] : "";
+    const ts = (t.captured_at || "").replace("T", " ").slice(5, 19);
+    return `<div class="row ${t.seq === selected ? "sel" : ""}" data-seq="${t.seq}">
         <span class="ts">${esc(ts)}</span>
         <span class="badge ${k}">${k}</span>
         <span class="summary">${summaryOf(t)}</span>
         <span class="status ${stCls}">${esc(st)}</span>
       </div>`;
+  }
+  // [MOC-184 · D] 分组键:按 provider.id 或 upstream model(forward 才有;其它类回退到 kind)。
+  function groupKeyOf(t) {
+    const g = $("#group").value;
+    if (g === "provider") return (t.provider && t.provider.id) || kindOf(t);
+    if (g === "model") { const m = t.models || {}; return m.upstream || m.resolved || m.original || kindOf(t); }
+    return null;
+  }
+  function renderList() {
+    const rows = traces.filter(matches);
+    if ($("#group").value === "none") {
+      visibleSeqs = rows.map((t) => t.seq);
+      listEl.innerHTML = rows.map(rowHtml).join("");
+      return;
+    }
+    const order = [], buckets = new Map();
+    rows.forEach((t) => {
+      const key = String(groupKeyOf(t));
+      if (!buckets.has(key)) { buckets.set(key, []); order.push(key); }
+      buckets.get(key).push(t);
+    });
+    visibleSeqs = [];
+    listEl.innerHTML = order.map((key) => {
+      const items = buckets.get(key);
+      items.forEach((t) => visibleSeqs.push(t.seq));
+      return `<div class="group-hd"><span>${esc(key)}</span><span class="cnt">${items.length}</span></div>`
+        + items.map(rowHtml).join("");
     }).join("");
   }
 
@@ -238,6 +286,140 @@
     return `<pre class="payload diff">${lines}</pre>`;
   }
 
+  // ── [MOC-184 · C] Token 用量分解 ──────────────────────────────────────────
+  // response body 是上游 raw 回包(transform 前),usage 用上游原生命名:Responses
+  // (input_tokens/output_tokens)/ Chat(prompt_tokens/completion_tokens)/ Gemini
+  // (usageMetadata.*TokenCount)/ Anthropic(cache_read_input_tokens 等)。流式时 body
+  // 是 SSE 文本,usage 在末尾事件(response.completed / 带 usage 的 chunk)里,取最后一个。
+  function findUsage(j) {
+    if (!j || typeof j !== "object") return null;
+    if (j.usage && typeof j.usage === "object") return j.usage;
+    if (j.usageMetadata && typeof j.usageMetadata === "object") return j.usageMetadata;
+    if (j.response && typeof j.response === "object") return findUsage(j.response);
+    return null;
+  }
+  function normUsage(u) {
+    if (!u || typeof u !== "object") return null;
+    const pick = (...xs) => { for (const x of xs) if (typeof x === "number") return x; return null; };
+    const inD = u.input_tokens_details || u.prompt_tokens_details || {};
+    const outD = u.output_tokens_details || u.completion_tokens_details || {};
+    const r = {
+      input: pick(u.input_tokens, u.prompt_tokens, u.promptTokenCount),
+      output: pick(u.output_tokens, u.completion_tokens, u.candidatesTokenCount),
+      total: pick(u.total_tokens, u.totalTokenCount),
+      cache: pick(inD.cached_tokens, u.cache_read_input_tokens, u.cachedContentTokenCount),
+      reasoning: pick(outD.reasoning_tokens, u.thoughtsTokenCount),
+    };
+    if (r.total == null && (r.input != null || r.output != null)) r.total = (r.input || 0) + (r.output || 0);
+    return ["input", "output", "total", "cache", "reasoning"].some((k) => r[k] != null) ? r : null;
+  }
+  function extractUsage(rs) {
+    const b = rs && rs.body;
+    if (!b) return null;
+    if (b.encoding === "json" && b.content && typeof b.content === "object") return normUsage(findUsage(b.content));
+    if (b.encoding === "utf8" && typeof b.content === "string") {
+      let found = null;
+      for (const line of b.content.split("\n")) {
+        const s = line.trim();
+        if (!s.startsWith("data:")) continue;
+        const payload = s.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        try { const u = findUsage(JSON.parse(payload)); if (u) found = u; } catch (_) {}
+      }
+      if (!found) { try { found = findUsage(JSON.parse(b.content)); } catch (_) {} }
+      return normUsage(found);
+    }
+    return null;
+  }
+  function usageBar(u) {
+    if (!u) return "";
+    const chip = (label, v, cls) => v == null ? ""
+      : `<span class="uchip ${cls || ""}">${esc(label)} <b>${esc(v.toLocaleString())}</b></span>`;
+    return `<div class="usage">`
+      + chip("输入", u.input, "in") + chip("输出", u.output, "out") + chip("总计", u.total, "tot")
+      + chip("缓存命中", u.cache, "cache") + chip("推理", u.reasoning, "reason") + `</div>`;
+  }
+
+  // ── [MOC-184 · E] forward 的结构化 tool / 消息卡片(复用 #400 per-kind 渲染思路)──
+  // INBOUND 是 Codex 原始 Responses 请求(input[]+tools[]);跨 provider 的 outbound 可能是
+  // messages[](Chat/Anthropic)或 contents[](Gemini)。尽力识别,识别不了的退回原始 <pre>
+  // (下方 INBOUND/OUTBOUND 段仍在)。
+  const MAX_CARDS = 80;
+  function partText(c) {
+    if (c == null) return "";
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) return c.map(partText).join("");
+    if (typeof c === "object") {
+      if (typeof c.text === "string") return c.text;
+      if (typeof c.input_text === "string") return c.input_text;
+      if (c.functionCall) return "→ " + (c.functionCall.name || "") + "(" + JSON.stringify(c.functionCall.args || {}) + ")";
+      if (c.functionResponse) return "← " + (c.functionResponse.name || "") + " 结果";
+      if (c.type === "function_call") return "→ " + (c.name || "") + "(" + (c.arguments || "") + ")";
+      if (c.type === "function_call_output") return "← output: " + partText(c.output);
+      if (c.type === "tool_use") return "→ " + (c.name || "") + "(" + JSON.stringify(c.input || {}) + ")";
+      if (c.type === "tool_result") return "← " + partText(c.content);
+      return JSON.stringify(c);
+    }
+    return String(c);
+  }
+  function msgItems(content) {
+    if (!content || typeof content !== "object") return null;
+    if (Array.isArray(content.input)) return { kind: "Responses input[]", items: content.input };
+    if (Array.isArray(content.messages)) return { kind: "messages[]", items: content.messages };
+    if (Array.isArray(content.contents)) return { kind: "Gemini contents[]", items: content.contents };
+    return null;
+  }
+  function roleOf(it) { return (it && (it.role || it.type || (it.functionCall ? "model" : ""))) || "msg"; }
+  function itemText(it) {
+    if (!it || typeof it !== "object") return it == null ? "(null)" : String(it);   // 畸形元素(null/原始值)不抛,退回占位
+    const parts = [];
+    if (it.content != null) parts.push(partText(it.content));
+    if (Array.isArray(it.tool_calls))
+      parts.push(it.tool_calls.map((tc) => {
+        const fn = tc.function || tc;
+        return "→ " + (fn.name || "") + "(" + (fn.arguments || "") + ")";
+      }).join("\n"));
+    if (it.parts) parts.push(partText(it.parts));
+    if (it.type === "function_call" || it.type === "function_call_output") parts.push(partText(it));
+    if (it.type === "reasoning" && !parts.length) parts.push("(reasoning)");
+    return parts.filter(Boolean).join("\n") || JSON.stringify(it);
+  }
+  function renderMsgCards(content) {
+    const mi = msgItems(content);
+    if (!mi || !mi.items.length) return null;
+    let html = mi.items.slice(0, MAX_CARDS).map((it) => {
+      let txt = itemText(it);
+      if (txt.length > 4000) txt = txt.slice(0, 4000) + " …(截断)";
+      return `<div class="card"><span class="role">${esc(roleOf(it))}</span>`
+        + `<pre class="payload mini">${esc(txt)}</pre></div>`;
+    }).join("");
+    if (mi.items.length > MAX_CARDS)
+      html += `<div class="trunc">⚠ 仅显示前 ${MAX_CARDS} / ${mi.items.length} 条,余看下方 INBOUND 原文</div>`;
+    return { count: mi.items.length, kind: mi.kind, html };
+  }
+  function toolDecls(content) {
+    if (!content || typeof content !== "object") return null;
+    let tools = content.tools;
+    if (Array.isArray(tools) && tools[0] && Array.isArray(tools[0].functionDeclarations))
+      tools = tools.flatMap((t) => t.functionDeclarations || []);   // Gemini: tools:[{functionDeclarations:[…]}]
+    return Array.isArray(tools) && tools.length ? tools : null;
+  }
+  function renderToolCards(content) {
+    const tools = toolDecls(content);
+    if (!tools) return null;
+    const html = tools.map((tl) => {
+      const fn = tl.function || tl;   // Chat 包一层 .function
+      const name = esc(fn.name || tl.name || "(anon)");
+      const desc = fn.description || tl.description || "";
+      const params = fn.parameters || tl.parameters || tl.input_schema;
+      return `<div class="card"><span class="role tool">${name}</span>`
+        + (desc ? `<div class="tdesc">${esc(desc)}</div>` : "")
+        + (params ? `<pre class="payload mini">${esc(JSON.stringify(params, null, 2))}</pre>` : "")
+        + `</div>`;
+    }).join("");
+    return { count: tools.length, html };
+  }
+
   function renderDetail(t) {
     if (!t) { detailEl.innerHTML = "<div class='empty'>选择左侧一条记录查看详情</div>"; return; }
     const k = kindOf(t);
@@ -250,12 +432,20 @@
     const p = t.provider || {}, m = t.models || {}, ib = t.inbound || {}, ob = t.outbound || {}, rs = t.response || {};
     const meta = `provider: ${esc(p.id)} (${esc(p.api_format)} / ${esc(p.auth_scheme)}) · `
       + `models: ${esc(m.original)} → ${esc(m.resolved)} → ${esc(m.upstream)} · seq ${esc(t.seq)} · ${esc(t.captured_at)}`;
+    const usage = extractUsage(rs);
+    // E 卡片基于 INBOUND(Codex 原始);body 非完整 JSON(截断/省略)时跳过,原始段仍在下方。
+    const ibStruct = ib.body && ib.body.encoding === "json" ? ib.body.content : null;
+    const toolCards = renderToolCards(ibStruct);
+    const msgCards = renderMsgCards(ibStruct);
     detailEl.innerHTML = `<div class="meta">${meta}</div>`
+      + usageBar(usage)
       + `<div class="tools">`
       +   `<button data-copy="curl">复制 OUTBOUND curl</button>`
       +   `<button data-copy="ob">复制 OUTBOUND body</button>`
       +   `<button data-copy="ib">复制 INBOUND body</button>`
       + `</div>`
+      + (toolCards ? seg(`工具 · ${toolCards.count}`, "INBOUND tools[]", toolCards.html, false) : "")
+      + (msgCards ? seg(`消息 · 结构化 (${msgCards.count})`, msgCards.kind, msgCards.html, false) : "")
       + seg("INBOUND · Codex 原始请求", `${esc(ib.method)} ${esc(ib.client_path || "")}${ib.client_query ? "?" + esc(ib.client_query) : ""}`,
           hdrTable(ib.headers) + bodyBlock(ib.body))
       + seg("OUTBOUND · 转换后发上游", esc(ob.url || ""), hdrTable(ob.headers) + bodyBlock(ob.body))
@@ -325,6 +515,25 @@
   });
   $("#kind").addEventListener("change", renderList);
   $("#q").addEventListener("input", renderList);
+  $("#group").addEventListener("change", renderList);
+  // [MOC-184 · F] j/k(或 ↑/↓)在可见列表里上下移动选中;焦点在搜索框/下拉里时不拦截(留给输入)。
+  function moveSel(delta) {
+    if (!visibleSeqs.length) return;
+    let idx = visibleSeqs.indexOf(selected);
+    if (idx === -1) idx = delta > 0 ? -1 : visibleSeqs.length;   // 未选中:j→第一条,k→最后一条
+    idx = Math.max(0, Math.min(visibleSeqs.length - 1, idx + delta));
+    selected = visibleSeqs[idx];
+    renderList();
+    renderDetail(traces.find((t) => t.seq === selected));
+    const row = listEl.querySelector(`.row[data-seq="${selected}"]`);
+    if (row) row.scrollIntoView({ block: "nearest" });
+  }
+  document.addEventListener("keydown", (e) => {
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+    if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); moveSel(1); }
+    else if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); moveSel(-1); }
+  });
   $("#clear").addEventListener("click", async () => {
     await fetch("/api/clear", { method: "POST" });
     traces = []; selected = null; renderList(); renderDetail(null);
