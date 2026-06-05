@@ -8477,6 +8477,15 @@
         // login.state 仍是 succeeded、活动仍是 chatgpt,也别把刚删的镜像又 pin 回来。
         realAccountForgotten = true;
         realAccountModeEnabled = false;
+        // [codex P2] 同 toggle off 分支:清除真实账号也清强制 daemon 档(forceUnlockPersisted)+ 停
+        // daemon。否则曾 force-enable(autoUnlockCodexPlugins=true)的用户用清除按钮清账号后,checkbox
+        // 仍 modeOn||force=on、startup 还启 CDP daemon,plugins 仍 force-unlocked(跟确认文案「Codex
+        // 不再显示 Plugins」矛盾)。
+        if (forceUnlockPersisted) {
+          forceUnlockPersisted = false;
+          await saveSettingsFromForm();
+          try { await CCApi.pluginUnlock.stop(); } catch (_e) {}
+        }
         // [MOC-178] 后端删镜像后 apply 切 apikey;失败(如 proxy 起不来)时如实提示 ——
         // 镜像已删但活动仍 chatgpt、toggle 可能没关。500ms 后 refresh 会自纠偏,但先告知。
         if (res && res.switchedToApikey === false) {
