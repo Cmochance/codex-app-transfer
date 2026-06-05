@@ -33,12 +33,15 @@ const RING_CAP: usize = 500;
 const BROADCAST_CAP: usize = 256;
 
 /// 一条记录的类别。`value` 里也带 `trace_kind` 字符串(给 jsonl / 前端),这个 enum 是
-/// Rust 侧的类型化判别,供 viewer 按类别过滤(forward / mcp)。
+/// Rust 侧的类型化判别,供 viewer 按类别过滤(forward / mcp / cat_webfetch)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceKind {
     Forward,
     Mcp,
+    /// cat-webfetch MCP 子进程内部链路 (MOC-181): 请求 / 抓取后端 + 升级链 / 选块 / 摘要
+    /// prompt + 响应 / 返回 Codex 结果。子进程经 viewer `POST /api/ingest` 反向上报。
+    CatWebfetch,
 }
 
 /// store 里的一条记录。`value` 是**已脱敏**的完整 JSON 对象(forward-trace 即

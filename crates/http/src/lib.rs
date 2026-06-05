@@ -32,7 +32,7 @@ pub mod impersonating;
 pub mod router;
 pub mod search;
 
-pub use fetch::{web_fetch, WebFetchBackend, WebFetchError};
+pub use fetch::{web_fetch, WebFetchBackend, WebFetchError, WebFetchOutcome};
 pub use headless::{fetch_rendered_html, HeadlessBrowser, HeadlessConfig, HeadlessError};
 pub use impersonating::{ImpersonatingClient, ImpersonatingError};
 pub use router::{should_impersonate, IMPERSONATE_HOSTS};

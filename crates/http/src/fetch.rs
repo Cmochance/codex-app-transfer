@@ -13,6 +13,12 @@
 //! HTML 内容统一经 [`html_to_markdown`] (htmd, Turndown 思路) 转 markdown 后返回: 比原始
 //! HTML 省 token、更干净。判定走 content-type (curl/wreq 有响应头) + body 嗅探兜底
 //! (headless 渲染后恒 HTML)。非 HTML (JSON / 纯文本 API 响应) 原样透传, 不破坏结构。
+//!
+//! ## 结构化返回值 [`WebFetchOutcome`] (MOC-181)
+//! [`web_fetch`] 由 `Result<String, …>` 改为 `Result<WebFetchOutcome, …>`:除正文
+//! (`content`) 外额外带出**实际命中档** (`final_tier`)、**升级历程** (`trail`)、**HTTP
+//! status** (`status`)。调用方(MCP server 诊断埋点)凭此构造 cat-webfetch 链路条目,
+//! 无需再次解析正文。`content` 语义与原 `String` 完全一致。
 
 use std::time::Duration;
 
@@ -80,29 +86,67 @@ pub enum WebFetchError {
     Auto(String),
 }
 
-/// 按后端抓取一个 URL, 返回页面内容。HTML (curl/wreq 按 content-type / 嗅探判定,
-/// headless 恒 HTML) 转 markdown 返回; 非 HTML (JSON / 纯文本) 原样透传。
+/// `web_fetch` 的结构化结果 (MOC-181 诊断): 正文 + 实际命中的档 + 升级历程 + HTTP status。
+/// `trail` 在**成功路径也带出** —— 空 = 单档 / auto 未升级, 非空 = auto 逐档升级原因。
+#[derive(Debug, Clone)]
+pub struct WebFetchOutcome {
+    /// 抽取 + 转 markdown 后的正文 (非 HTML 原样透传)。
+    pub content: String,
+    /// 最终命中的抓取档 (auto 升级后的实际档; 单档即入参 backend)。
+    pub final_tier: WebFetchBackend,
+    /// auto 档逐档升级原因 (成功也带); 单档 / auto 未升级为空。
+    pub trail: Vec<String>,
+    /// HTTP status (curl/wreq 有; headless 无 → None)。
+    pub status: Option<u16>,
+}
+
+/// 各档抓取的中间产物 (转 markdown 前) —— 带 final_tier/trail/status 供 [`web_fetch`] 组装 Outcome。
+struct Fetched {
+    body: String,
+    is_html: bool,
+    final_tier: WebFetchBackend,
+    trail: Vec<String>,
+    status: Option<u16>,
+}
+
+/// 按后端抓取一个 URL, 返回结构化结果 [`WebFetchOutcome`]。HTML (curl/wreq 按 content-type /
+/// 嗅探判定, headless 恒 HTML) 转 markdown 后写入 `content`; 非 HTML (JSON / 纯文本) 原样透传。
 ///
-/// 2xx 但空 body 时返回 `Ok("")` —— 上层 (MCP server) 负责把"空响应"翻成对模型清晰的
-/// 提示, 这里不把合法的空响应 (如 204) 当错误。
-pub async fn web_fetch(backend: WebFetchBackend, url: &str) -> Result<String, WebFetchError> {
-    let (body, is_html) = match backend {
+/// 2xx 但空 body 时返回 `Ok(outcome)` 且 `outcome.content` 为空字符串 —— 上层 (MCP server)
+/// 负责把"空响应"翻成对模型清晰的提示, 这里不把合法的空响应 (如 204) 当错误。
+pub async fn web_fetch(
+    backend: WebFetchBackend,
+    url: &str,
+) -> Result<WebFetchOutcome, WebFetchError> {
+    let f = match backend {
         // Auto: curl→wreq→headless 按失败信号自动升级 + per-origin 复用 (MOC-161)。
         WebFetchBackend::Auto => web_fetch_auto(url).await?,
         WebFetchBackend::Curl => single_tier(WebFetchBackend::Curl, url).await?,
         WebFetchBackend::Wreq => single_tier(WebFetchBackend::Wreq, url).await?,
-        // headless 渲染后的 page.content() 恒为完整 HTML 文档。
-        WebFetchBackend::Headless => (crate::headless::fetch_rendered_html(url).await?, true),
+        // headless 渲染后的 page.content() 恒为完整 HTML 文档 (无 HTTP status)。
+        WebFetchBackend::Headless => Fetched {
+            body: crate::headless::fetch_rendered_html(url).await?,
+            is_html: true,
+            final_tier: WebFetchBackend::Headless,
+            trail: Vec::new(),
+            status: None,
+        },
     };
-    Ok(if is_html {
-        let capped = cap_bytes(&body, MAX_HTML_INPUT_BYTES);
+    let content = if f.is_html {
+        let capped = cap_bytes(&f.body, MAX_HTML_INPUT_BYTES);
         // 先抽正文 (剥 nav/页眉/页脚/侧栏/广告), 抽取不可靠则回退整页 —— 绝不丢内容。
         match extract_main_content(&capped, url) {
             Some(main) => html_to_markdown(&main),
             None => html_to_markdown(&capped),
         }
     } else {
-        body
+        f.body
+    };
+    Ok(WebFetchOutcome {
+        content,
+        final_tier: f.final_tier,
+        trail: f.trail,
+        status: f.status,
     })
 }
 
@@ -234,12 +278,18 @@ struct RawFetch {
 }
 
 /// 单档 (Curl/Wreq) 抓取: raw 抓 → 非 2xx 即 Err (保持原单档语义, 不自动升级)。
-async fn single_tier(tier: WebFetchBackend, url: &str) -> Result<(String, bool), WebFetchError> {
+async fn single_tier(tier: WebFetchBackend, url: &str) -> Result<Fetched, WebFetchError> {
     let raw = fetch_raw(tier, url).await?;
     if !(200..300).contains(&raw.status) {
         return Err(tier_http_error(tier, raw.status));
     }
-    Ok((raw.body, raw.is_html))
+    Ok(Fetched {
+        body: raw.body,
+        is_html: raw.is_html,
+        final_tier: tier,
+        trail: Vec::new(),
+        status: Some(raw.status),
+    })
 }
 
 /// 按 tier (Curl/Wreq) 原始抓取, **不判 status** (status 判定交调用方: 单档→Err, Auto→升级信号)。
@@ -387,8 +437,8 @@ fn remember_origin(origin: &Option<String>, tier: WebFetchBackend) {
 }
 
 /// Auto 档: 从 per-origin 记住的档 (默认 curl) 起, 按失败信号 curl→wreq→headless 升级;
-/// 成功后记住该 origin 的成功档。返回 (body, is_html)。
-async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
+/// 成功后记住该 origin 的成功档。返回 [`Fetched`] (带 final_tier + 升级 trail + status)。
+async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
     let origin = origin_of(url);
     // 起始档 = 该 origin 上次成功的档 (没记录则 curl)。
     let start = origin
@@ -411,7 +461,13 @@ async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
             match crate::headless::fetch_rendered_html(url).await {
                 Ok(body) => {
                     remember_origin(&origin, tier);
-                    return Ok((body, true));
+                    return Ok(Fetched {
+                        body,
+                        is_html: true,
+                        final_tier: tier,
+                        trail,
+                        status: None,
+                    });
                 }
                 Err(e) => {
                     return Err(WebFetchError::Auto(format!(
@@ -428,7 +484,13 @@ async fn web_fetch_auto(url: &str) -> Result<(String, bool), WebFetchError> {
             // 拿到可用结果 (无升级信号) → 记住该档并返回。
             Ok(raw) if !needs_upgrade(&raw) => {
                 remember_origin(&origin, tier);
-                return Ok((raw.body, raw.is_html));
+                return Ok(Fetched {
+                    body: raw.body,
+                    is_html: raw.is_html,
+                    final_tier: tier,
+                    trail,
+                    status: Some(raw.status),
+                });
             }
             // 有升级信号 (反爬 / 空 / JS 骨架) → 记原因, 升级到下一档。
             Ok(raw) => {
@@ -972,8 +1034,15 @@ mod tests {
             "https://html.duckduckgo.com/html/?q=rust",
         )
         .await;
-        eprintln!("auto fetch len: {:?}", r.as_ref().map(|s| s.len()));
-        let body = r.expect("auto 应升到 headless 并成功");
-        assert!(!body.trim().is_empty(), "expected non-empty content");
+        eprintln!("auto fetch len: {:?}", r.as_ref().map(|o| o.content.len()));
+        let outcome = r.expect("auto 应升到 headless 并成功");
+        eprintln!(
+            "final_tier={:?} trail={:?}",
+            outcome.final_tier, outcome.trail
+        );
+        assert!(
+            !outcome.content.trim().is_empty(),
+            "expected non-empty content"
+        );
     }
 }
