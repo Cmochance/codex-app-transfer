@@ -805,6 +805,11 @@ async fn inject_unlock_script(
 (async function() {
     const MARKER = '__codexAppTransferPluginUnlocker';
     window[MARKER] = window[MARKER] || { version: '2.2.0', unlocked: false };
+    // [MOC-178] 重新注入(toggle on)清卸载标记。否则 toggle off 留下的 uninstalled=true
+    // 会被复用的 marker 带进来,runUnlock guard 永久挡住 → re-enable 失效直到 page reload
+    // (codex P2)。scanPending 一并清,防卡死的 debounce 标记。
+    window[MARKER].uninstalled = false;
+    window[MARKER].scanPending = false;
 
     const selectors = {
         disabledInstallButton: 'button:disabled.w-full.justify-center, [role="button"][aria-disabled="true"].cursor-not-allowed',
@@ -931,6 +936,10 @@ async fn inject_unlock_script(
         });
     }
     function runUnlock() {
+        // [MOC-178] 卸载后(toggle off)拦住所有 runUnlock 路径(observer callback / 初始循环
+        // / 残留 setTimeout),防重新 spoof 撤销卸载。toggle on 时注入开头已 reset uninstalled,
+        // 不会永久卡死 re-enable(devin + codex P2)。
+        if (window[MARKER].uninstalled) return 'uninstalled';
         // 拆开 try block:enablePluginEntry 决定 reason,unblockPluginInstallButtons
         // 的异常不应该污染主入口的 reason(install 按钮装饰失败 ≠ entry button 解锁失败)
         let reason;
@@ -951,12 +960,11 @@ async fn inject_unlock_script(
     function scheduleUnlock() {
         if (window[MARKER].scanPending) return;
         window[MARKER].scanPending = true;
-        // [MOC-178] 存 timer id 供卸载 clearTimeout;回调里查 uninstalled 防卸载后这条
-        // 已入队的 runUnlock 重新 spoof(observer.disconnect 拦不住已排队的 200ms timeout)。
+        // [MOC-178] 存 timer id 供卸载 clearTimeout 取消这条已排队的 runUnlock(observer.
+        // disconnect 拦不住已入队的 200ms timeout)。runUnlock 开头另有 uninstalled guard 兜底。
         window[MARKER].scanTimer = setTimeout(() => {
             window[MARKER].scanPending = false;
             window[MARKER].scanTimer = null;
-            if (window[MARKER].uninstalled) return;
             runUnlock();
         }, 200);
     }
