@@ -60,10 +60,10 @@ pub fn write_upstream_error_bundle(input: &UpstreamErrorBundleInput) -> Option<P
                 "upstream": input.upstream_model,
             },
             "outbound_headers_redacted": input.outbound_headers_redacted,
-            "body": bytes_payload(&input.request_body, MAX_STORED_BODY_BYTES),
+            "body": redact_bundle_body(&input.request_body),
         },
         "response": {
-            "body": bytes_payload(&input.response_body, MAX_STORED_BODY_BYTES),
+            "body": redact_bundle_body(&input.response_body),
         },
     });
     let ts = SystemTime::now()
@@ -80,6 +80,199 @@ pub fn write_upstream_error_bundle(input: &UpstreamErrorBundleInput) -> Option<P
     let encoded = serde_json::to_vec_pretty(&bundle).ok()?;
     fs::write(&path, encoded).ok()?;
     Some(path)
+}
+
+/// bundle(随 feedback 上传)的 request/response body 脱敏(MOC-110 / 安全审计 M-001)。
+///
+/// **此前用 `bytes_payload` 只编码不 scrub** → 完整请求/响应体里的结构化 credential(JSON 里的
+/// `api_key`/`*_token`/JWT 值等)随 feedback 原样外泄(headers 已由 `outbound_headers_redacted`
+/// 脱敏,但 body 没有)。改为:尝试当 JSON 解析 → 递归 [`redact_json_credentials`](key + JWT 值)
+/// → 序列化(超 cap 截断已脱敏文本);解析失败(SSE / HTML 错误页 / 二进制)退回 `bytes_payload`
+/// (那类是模型输出/错误页,无结构化 credential,与 forward-trace `redact_body` 同取舍)。
+/// bundle input 不带 content-type,故不依赖 content-type 判别,直接试解析。
+///
+/// **额外 [`redact_echoed_tokens`]**(MOC-110 / codex P1):上游 401/403 常把 key 回显进
+/// `error.message` 这类非凭据字段的字符串值里,key 级 / JWT 级判定抓不到,而 bundle 又随
+/// feedback **上传**(区别于仅本地的 viewer)→ 再扫一遍前缀型凭据 token(`sk-…` / `Bearer …`
+/// 等)。仅 bundle 路径做,forward-trace 本地 viewer 保「正文照留」契约不调用。
+fn redact_bundle_body(bytes: &[u8]) -> Value {
+    if let Ok(mut v) = serde_json::from_slice::<Value>(bytes) {
+        redact_json_credentials(&mut v);
+        redact_echoed_tokens(&mut v);
+        let serialized = serde_json::to_vec(&v).unwrap_or_default();
+        if serialized.len() <= MAX_STORED_BODY_BYTES {
+            return json!({
+                "encoding": "json",
+                "bytes": bytes.len(),
+                "truncated_bytes": 0,
+                "content": v,
+            });
+        }
+        return bytes_payload_with_len(&serialized, serialized.len(), MAX_STORED_BODY_BYTES);
+    }
+    // 非 JSON 退回(HTML 401 页 / 纯文本错误 / 个别坏字节的 mostly-text 页):用 **lossy** UTF-8
+    // 解码后扫 echo token —— 不能直接信 `bytes_payload`,因为只要 body 含**任一**非法 UTF-8 字节,
+    // 它就把整段标 base64 而跳过脱敏,导致 mostly-text 错误页里回显的 `sk-…`/Bearer 经 base64
+    // 原样进 bundle 上传(codex P2)。lossy 把坏字节换 U+FFFD、ASCII 凭据照常可扫;真·二进制
+    // lossy 后是乱码、无可读 token、scrub 不命中,无害。
+    let lossy = String::from_utf8_lossy(bytes);
+    // ① 先复用 `redact_body_string`(MCP 那套):form-urlencoded 键级脱敏(`client_secret`/
+    //    `refresh_token` 等无前缀 secret,OAuth token 端点错误体常见)/ 完整 JSON 键脱 / 看似 JSON
+    //    但残缺 → 省略占位(codex P2)。② 再 echo-token 扫(纯文本里回显的 sk-/Bearer/JWT)。
+    let base = redact_body_string(&lossy).unwrap_or_else(|| lossy.into_owned());
+    let scrubbed = redact_credential_tokens(&base).unwrap_or(base);
+    bytes_payload(scrubbed.as_bytes(), MAX_STORED_BODY_BYTES)
+}
+
+/// 对**已落盘**的 feedback bundle 在**上传前**再脱敏一遍(MOC-110 / codex P1)。
+///
+/// 写路径([`write_upstream_error_bundle`])只保护**新写**的 bundle;但 feedback 上传的是
+/// `recent_feedback_bundles` 的历史文件 —— 用户**升级前**旧 build 写的 bundle 里
+/// request/response body 仍是原始未脱敏,升级后下次提交 feedback 会把它原样上传。故上传前
+/// 用本函数把每条 bundle 的 `request.body` / `response.body` 段重跑 [`redact_bundle_body`]:
+/// 旧 bundle 的 `content` 是原始 body 文本(string)→ 重新解析 + 脱敏;新 bundle 的 `content`
+/// 已是脱敏结构 → 重跑幂等无变化。解析失败原样返回(bundle 是本工具写的合法 JSON,理论不触发)。
+pub fn rescrub_persisted_bundle(bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    for section in ["request", "response"] {
+        let Some(body) = v.get_mut(section).and_then(|s| s.get_mut("body")) else {
+            continue;
+        };
+        // 把 body.content 还原成「原始 body bytes」再脱一遍。旧:content 是原始文本 string
+        // (encoding utf8)或 **base64**(原始 body 有非法 UTF-8 时);新:content 是已脱敏
+        // object(encoding json),序列化后重跑(幂等)。
+        let encoding = body.get("encoding").and_then(Value::as_str);
+        let raw: Option<Vec<u8>> = match body.get("content") {
+            // 旧 base64 body:必须**先解码**回原始 bytes 再脱敏,否则扫的是 base64 文本、
+            // 解码后里面的 sk-/Bearer 漏脱(codex P2)。解码失败退回当文本扫。
+            Some(Value::String(s)) if encoding == Some("base64") => Some(
+                STANDARD
+                    .decode(s)
+                    .unwrap_or_else(|_| s.clone().into_bytes()),
+            ),
+            Some(Value::String(s)) => Some(s.clone().into_bytes()),
+            Some(other) if !other.is_null() => serde_json::to_vec(other).ok(),
+            _ => None,
+        };
+        let Some(raw) = raw else { continue };
+        // 截断的旧 body(`truncated_bytes>0`)只存了前缀:若它还**不能解析成 JSON**(大请求被
+        // 截在闭合括号前),key 级脱敏(`client_secret`/`privateKey` 等非前缀 secret)做不了,
+        // echo-scan 也只挡前缀 token → 保守**省略**正文,不冒险半脱敏上传(codex P2;尾部已丢、
+        // 无法补全)。能解析 / 完整非 JSON(SSE/HTML)则照常走 redact_bundle_body(全脱 / echo-scrub)。
+        let truncated = body
+            .get("truncated_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+        if truncated && serde_json::from_slice::<Value>(&raw).is_err() {
+            *body = json!({
+                "encoding": "omitted",
+                "bytes": body.get("bytes").cloned().unwrap_or(Value::Null),
+                "truncated_bytes": body.get("truncated_bytes").cloned().unwrap_or(Value::Null),
+                "content": Value::Null,
+                "note": "legacy truncated body omitted before feedback upload (cannot fully redact a truncated, unparseable body)",
+            });
+        } else {
+            *body = redact_bundle_body(&raw);
+        }
+    }
+    serde_json::to_vec_pretty(&v).unwrap_or_else(|_| bytes.to_vec())
+}
+
+/// 递归对 JSON 里**所有 string 值**跑 [`redact_credential_tokens`],就地脱敏 echo 进文本的凭据。
+/// 仅 [`redact_bundle_body`](feedback 上传路径)调用 —— forward-trace 本地 viewer 不调用。
+fn redact_echoed_tokens(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if let Some(red) = redact_credential_tokens(s) {
+                *s = red;
+            }
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(redact_echoed_tokens),
+        Value::Object(map) => map.values_mut().for_each(redact_echoed_tokens),
+        _ => {}
+    }
+}
+
+/// 在字符串里就地脱敏「前缀型」凭据 token —— 上游 401/403 常把 key 回显进 `error.message`
+/// 这类字符串值(`Invalid API key sk-…` / `Bearer …`),key 级判定抓不到。**只命中「已知前缀 +
+/// 足够长的 token 串」**:`sk-` 后需 ≥20 个 token 字符,故 `task-`/`ask-` 等普通正文不会误伤
+/// (token 字符 = 字母数字 / `-` / `_` / `.`)。返回 `Some(脱敏后)` / `None`(无命中)。
+fn redact_credential_tokens(s: &str) -> Option<String> {
+    // (前缀, 前缀后 token 最小长度)。覆盖主流家:OpenAI/Anthropic sk- · Groq gsk_ · xAI xai- ·
+    // Google AIza · GitHub ghp_/gho_/ghs_/github_pat_。Bearer 单独处理(token 不一定带前缀)。
+    const PREFIXES: &[(&str, usize)] = &[
+        ("sk-", 20),
+        ("gsk_", 20),
+        ("xai-", 20),
+        ("AIza", 24),
+        ("ghp_", 20),
+        ("gho_", 20),
+        ("ghs_", 20),
+        ("github_pat_", 20),
+    ];
+    let is_tok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let tok_len = |after: &str| -> usize { after.chars().take_while(|c| is_tok(*c)).count() };
+    // Bearer/OAuth opaque token 用 RFC 6750/7235 **token68** 字母表(比 prefix-key 的 is_tok 宽:
+    // 含 `~ + /`)+ 末尾可选 `=` padding(base64 标准)。否则含 `+`/`/`/`~`/`=` 的 token 会被
+    // is_tok 截断、suffix 漏脱(codex P2)。token68 全 ASCII,char 数 == byte 数。
+    let bearer_tok_len = |after: &str| -> usize {
+        let main = after
+            .chars()
+            .take_while(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~' | '+' | '/')
+            })
+            .count();
+        let pad = after.chars().skip(main).take_while(|c| *c == '=').count();
+        main + pad
+    };
+
+    let mut out = String::with_capacity(s.len());
+    let mut changed = false;
+    let mut rest = s;
+    'scan: while !rest.is_empty() {
+        // JWT 子串(`eyJ….eyJ….sig`):嵌在消息文本里(`invalid token eyJ…`)时,值层 looks_like_jwt
+        // (判整串)抓不到 → 在此按子串挡(codex P1)。用 jwt_match_len **精确**匹配三段 base64url、
+        // 停在签名段末尾,**不吞尾随标点**(句号/逗号/括号等)——否则尾随 `.` 会被算成第 4 段而漏(codex P2)。
+        if let Some(n) = jwt_match_len(rest) {
+            out.push_str("***");
+            rest = &rest[n..];
+            changed = true;
+            continue 'scan;
+        }
+        for (pfx, minlen) in PREFIXES {
+            if let Some(after) = rest.strip_prefix(*pfx) {
+                let n = tok_len(after);
+                if n >= *minlen {
+                    out.push_str(pfx);
+                    out.push_str("***");
+                    rest = &after[after.char_indices().nth(n).map_or(after.len(), |(i, _)| i)..];
+                    changed = true;
+                    continue 'scan;
+                }
+            }
+        }
+        // Bearer scheme 大小写不敏感(RFC 6750)→ `bearer`/`BEARER`/`Bearer` 都认;前 7 字节
+        // 恒为 ASCII(`bearer `),按字节判可安全切片。保留原始大小写前缀。
+        let rb = rest.as_bytes();
+        if rb.len() > 7 && rb[..6].eq_ignore_ascii_case(b"bearer") && rb[6] == b' ' {
+            let after = &rest[7..];
+            let n = bearer_tok_len(after);
+            if n >= 16 {
+                out.push_str(&rest[..7]);
+                out.push_str("***");
+                rest = &after[after.char_indices().nth(n).map_or(after.len(), |(i, _)| i)..];
+                changed = true;
+                continue 'scan;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    changed.then_some(out)
 }
 
 pub fn recent_feedback_bundles(limit: usize) -> Vec<PathBuf> {
@@ -312,7 +505,9 @@ fn redact_body_with_len(bytes: &[u8], true_len: usize, content_type: Option<&str
     bytes_payload_with_len(bytes, true_len, MAX_STORED_BODY_BYTES)
 }
 
-/// 递归把 JSON 里的 credential 字段值替换成 `***`。键判定见 [`is_credential_key`]。
+/// 递归把 JSON 里的 credential 字段值替换成 `***`。键判定见 [`is_credential_key`];另对
+/// **任意 string 值**做 [`looks_like_jwt`] 兜底(MOC-110:JWT 落在非凭据 key 的值里时,
+/// 仅靠 key 名判定会漏)。
 fn redact_json_credentials(v: &mut Value) {
     match v {
         Value::Object(map) => {
@@ -329,6 +524,9 @@ fn redact_json_credentials(v: &mut Value) {
                 redact_json_credentials(item);
             }
         }
+        Value::String(s) if looks_like_jwt(s) => {
+            *v = Value::String("***".to_string());
+        }
         _ => {}
     }
 }
@@ -340,20 +538,99 @@ fn redact_json_credentials(v: &mut Value) {
 ///
 /// **刻意用 `ends_with("token")`(单数)而非 `contains("token")`**:后者会误伤 `max_tokens`
 /// (→ `maxtokens`,结尾是 `tokens` 复数,不命中),诊断要看的字段得以保留;`completion_tokens`
-/// / `prompt_tokens` 等用量字段同理(复数)不受影响。`ends_with("apikey")` 覆盖
-/// `apiKey`/`x-api-key`/`openai_api_key` 等各写法。
-fn is_credential_key(key: &str) -> bool {
+/// / `prompt_tokens` 等用量字段同理(复数)不受影响。`apikey` 用 `contains`(非 `ends_with`)覆盖
+/// `apiKey`/`x-api-key`/`openai_api_key` + **复数 `apiKeys`/`api_keys`** 容器(收敛后 ends_with
+/// 漏复数,旧 feedback `contains` 不回归,codex P2);`apikey` 无 `max_tokens` 那种复数误伤,故可
+/// 放宽,token 仍保 `ends_with` 单数。
+///
+/// `pub`:`src-tauri` 的 feedback 诊断包脱敏(`feedback.rs`)复用同一份判定,避免两套黑名单
+/// 各自漏键再次分叉(MOC-110:此前 feedback.rs 与本函数键集合不一致)。
+///
+/// MOC-110 补漏(安全审计 AP-007/M-001):`privateKey`(`private_key`/`sshPrivateKey` 等 →
+/// 含 `privatekey`)、`cf_clearance`(Cloudflare 挑战 cookie 的独立 JSON key 形态)、字面 `jwt`
+/// 键。JWT 作为**值**(key 名不带凭据语义时)另由 [`looks_like_jwt`] 在值层兜底。
+/// `authorization` 用 `contains`(非精确相等)覆盖 `Proxy-Authorization` / `X-Authorization-*`
+/// 前缀型头 —— feedback config 附件脱敏(`feedback.rs`)收敛复用本判定,旧 `contains` 行为不回归
+/// (`authScheme`/`author` 不含 `authorization` 子串,不误伤)。
+pub fn is_credential_key(key: &str) -> bool {
     let norm: String = key
         .chars()
         .filter(|c| *c != '_' && *c != '-')
         .flat_map(|c| c.to_lowercase())
         .collect();
-    norm == "authorization"
+    norm.contains("authorization")
+        || norm == "jwt"
         || norm.contains("secret")
         || norm.contains("password")
         || norm.contains("credential")
+        || norm.contains("privatekey")
+        || norm.contains("cfclearance")
         || norm.ends_with("token")
-        || norm.ends_with("apikey")
+        // 复数凭据 token 容器:`tokens`/`authTokens`/`accessTokens` 等。**不能**用 `contains("token")`
+        // 放宽 —— 会误伤 `max_tokens`/`completion_tokens`/`*_tokens` 用量诊断字段(有意保留、有测试)。
+        // 故只列举明确是凭据的复数名(codex P2:收敛后 ends_with 漏复数,但用量复数必须留)。
+        || matches!(
+            norm.as_str(),
+            "tokens"
+                | "authtokens"
+                | "accesstokens"
+                | "refreshtokens"
+                | "sessiontokens"
+                | "idtokens"
+                | "bearertokens"
+        )
+        || norm.contains("apikey")
+}
+
+/// 极窄的 JWT **值**判定:恰好三段点分,前两段以 `eyJ`(base64url of `{"` —— JWT header/payload
+/// 必是 JSON 对象)开头。普通文本几乎不可能同时满足,误伤率极低。用于 key 名不带凭据语义
+/// (如某字段值里直接塞了 JWT)时在值层兜底脱敏(MOC-110)。
+fn looks_like_jwt(s: &str) -> bool {
+    let mut segs = s.split('.');
+    match (segs.next(), segs.next(), segs.next(), segs.next()) {
+        (Some(a), Some(b), Some(c), None) => {
+            a.len() >= 8
+                && b.len() >= 8
+                && c.len() >= 8
+                && a.starts_with("eyJ")
+                && b.starts_with("eyJ")
+        }
+        _ => false,
+    }
+}
+
+/// 若 `s` **以**一个 JWT 开头,返回该 JWT 的精确字节长度(`Some(n)`),否则 `None`。用于
+/// [`redact_credential_tokens`] 在**自由文本里**就地挡 echo 的 JWT:精确匹配 `eyJ<b64url>` `.`
+/// `eyJ<b64url>` `.` `<b64url>` 三段(base64url = 字母数字 / `-` / `_`,**不含 `.`**),停在签名段
+/// 末尾 —— 因此**不吞尾随句子标点**(`eyJ….sig.` / `…sig,` / `…sig)` 都只匹配到 `sig`)。这正是
+/// [`looks_like_jwt`](判整串、`.` 当 token 会把尾随句号算成第 4 段)在子串场景下漏掉的(codex P2)。
+fn jwt_match_len(s: &str) -> Option<usize> {
+    let b64 = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let seg = |t: &str| -> usize { t.chars().take_while(|c| b64(*c)).map(char::len_utf8).sum() };
+    // seg1
+    if !s.starts_with("eyJ") {
+        return None;
+    }
+    let s1 = seg(s);
+    if s1 < 8 || s.as_bytes().get(s1) != Some(&b'.') {
+        return None;
+    }
+    // seg2(payload 也是 JSON → eyJ 开头)
+    let r2 = &s[s1 + 1..];
+    if !r2.starts_with("eyJ") {
+        return None;
+    }
+    let s2 = seg(r2);
+    if s2 < 8 || r2.as_bytes().get(s2) != Some(&b'.') {
+        return None;
+    }
+    // seg3(签名,base64url)
+    let r3 = &r2[s2 + 1..];
+    let s3 = seg(r3);
+    if s3 < 8 {
+        return None;
+    }
+    Some(s1 + 1 + s2 + 1 + s3)
 }
 
 /// 脱敏一条 MCP-trace 记录(整个 JSON 对象,MOC-169 增量 4)。
@@ -846,5 +1123,265 @@ mod tests {
         // content-type 缺失也退回 bytes_payload
         let v2 = redact_body(br#"{"api_key":"sk"}"#, None);
         assert_eq!(v2["encoding"], "utf8");
+    }
+
+    // 一段形态合法的 JWT(header/payload 以 eyJ 开头,三段点分),仅用于测试值层兜底。
+    const FAKE_JWT: &str =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g";
+
+    #[test]
+    fn is_credential_key_covers_moc110_keys() {
+        // MOC-110 补的:privateKey / private_key / sshPrivateKey / jwt / cf_clearance
+        for k in [
+            "privateKey",
+            "private_key",
+            "sshPrivateKey",
+            "jwt",
+            "cf_clearance",
+            "cfClearance",
+        ] {
+            assert!(is_credential_key(k), "{k} 应判为 credential key");
+        }
+        // 既有覆盖不回归 + 前缀型 authorization 头(contains)+ 复数 apiKeys 容器(codex P2)
+        for k in [
+            "authorization",
+            "Proxy-Authorization",
+            "X-Authorization-Token",
+            "api_key",
+            "apiKeys",
+            "api_keys",
+            "accessToken",
+            "client_secret",
+            "tokens",
+            "authTokens",
+            "accessTokens",
+        ] {
+            assert!(is_credential_key(k), "{k} 应判为 credential key");
+        }
+        // 诊断/用量字段不误伤:max_tokens / *_tokens 复数用量字段必须保留(不能因复数 token 修复被误伤);
+        // authScheme/author 不含 authorization 子串
+        for k in [
+            "max_tokens",
+            "completion_tokens",
+            "prompt_tokens",
+            "total_tokens",
+            "model",
+            "cache_key",
+            "wire_api",
+            "authScheme",
+            "author",
+        ] {
+            assert!(!is_credential_key(k), "{k} 不应被误判为 credential");
+        }
+    }
+
+    #[test]
+    fn looks_like_jwt_detects_only_real_jwt() {
+        assert!(looks_like_jwt(FAKE_JWT));
+        // 非 JWT:段太短 / 前缀不对 / 段数不对 / 普通文本
+        assert!(!looks_like_jwt("a.b.c"));
+        assert!(!looks_like_jwt("foo.bar.baz.qux"));
+        assert!(!looks_like_jwt("https://example.com/a.b.c"));
+        assert!(!looks_like_jwt("just some normal sentence."));
+        assert!(!looks_like_jwt("eyJonly.oneeyJ")); // 仅两段
+    }
+
+    #[test]
+    fn redact_json_credentials_redacts_jwt_value_under_innocuous_key() {
+        // key 名不带凭据语义(note),但值是 JWT → 值层兜底脱敏
+        let mut v = json!({"note": FAKE_JWT, "msg": "hello world", "n": 3});
+        redact_json_credentials(&mut v);
+        assert_eq!(v["note"], "***", "JWT 值应被脱敏");
+        assert_eq!(v["msg"], "hello world", "普通文本不动");
+        assert_eq!(v["n"], 3);
+    }
+
+    #[test]
+    fn redact_bundle_body_scrubs_json_and_falls_back_for_non_json() {
+        // JSON body:key 级(api_key/privateKey)+ 值级(JWT)都脱敏,诊断字段保留
+        let body = format!(
+            r#"{{"model":"gpt-5","max_tokens":4096,"api_key":"sk-LEAK","nested":{{"privateKey":"PK-LEAK"}},"note":"{FAKE_JWT}"}}"#
+        );
+        let v = redact_bundle_body(body.as_bytes());
+        assert_eq!(v["encoding"], "json");
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("sk-LEAK"), "api_key 泄漏: {s}");
+        assert!(!s.contains("PK-LEAK"), "privateKey 泄漏");
+        assert!(!s.contains(FAKE_JWT), "JWT 值泄漏");
+        assert_eq!(v["content"]["max_tokens"], 4096, "诊断字段保留");
+        assert_eq!(v["content"]["model"], "gpt-5");
+
+        // 非 JSON(SSE / 错误页)退回 bytes_payload,正文原样(无结构化 credential)
+        let sse = redact_bundle_body(b"data: {\"delta\":\"hi\"}\n\n");
+        assert_eq!(sse["encoding"], "utf8");
+    }
+
+    #[test]
+    fn redact_bundle_body_scrubs_echoed_credential_tokens() {
+        // 上游 401 把 key 回显进 error.message(非凭据 key 的字符串值)→ bundle 路径要挡(codex P1)
+        let body = br#"{"error":{"message":"Incorrect API key provided: sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 here"}}"#;
+        let v = redact_bundle_body(body);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(
+            !s.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "echo 的 key 泄漏: {s}"
+        );
+        assert!(s.contains("sk-***"), "应保留前缀 + 脱敏: {s}");
+
+        // 普通正文不误伤:`task-list`/`ask-me` 含 `sk-` 子串但前缀后 token 长度不足
+        let benign =
+            redact_bundle_body(br#"{"messages":[{"content":"create a task-list and ask-me"}]}"#);
+        let bs = serde_json::to_string(&benign).unwrap();
+        assert!(bs.contains("task-list"), "普通正文被误伤: {bs}");
+        assert!(bs.contains("ask-me"));
+
+        // Bearer 不透明 token 也挡
+        let bearer =
+            redact_bundle_body(br#"{"detail":"auth failed Bearer abcdef0123456789ghijkl now"}"#);
+        let brs = serde_json::to_string(&bearer).unwrap();
+        assert!(
+            !brs.contains("abcdef0123456789ghijkl"),
+            "Bearer token 泄漏: {brs}"
+        );
+        assert!(brs.contains("Bearer ***"));
+
+        // bearer 大小写不敏感(RFC 6750):小写 `bearer` 也挡,保留原大小写前缀
+        let low =
+            redact_bundle_body(br#"{"detail":"invalid auth: bearer abcdef0123456789ghijkl end"}"#);
+        let ls = serde_json::to_string(&low).unwrap();
+        assert!(
+            !ls.contains("abcdef0123456789ghijkl"),
+            "小写 bearer token 泄漏: {ls}"
+        );
+        assert!(ls.contains("bearer ***"), "应保留原大小写前缀: {ls}");
+
+        // Bearer opaque token 含 token68 字符(+ / ~ = padding)整段脱敏(RFC 6750/7235,codex P2)
+        let b68 = redact_bundle_body(br#"{"d":"Bearer ab+cd/ef~gh0123456789KLMN== rest"}"#);
+        let b68s = serde_json::to_string(&b68).unwrap();
+        assert!(
+            !b68s.contains("ab+cd/ef~gh0123456789KLMN"),
+            "token68 Bearer 漏脱: {b68s}"
+        );
+        assert!(b68s.contains("Bearer ***"), "应整段脱敏: {b68s}");
+        assert!(b68s.contains("rest"), "token 后正文保留");
+
+        // form-urlencoded 非 JSON body(OAuth token 端点错误):无前缀 secret 走键级脱敏(codex P2)
+        let form = redact_bundle_body(
+            b"grant_type=refresh_token&refresh_token=rt-LEAK-val&client_secret=cs-LEAK-val",
+        );
+        let fs = serde_json::to_string(&form).unwrap();
+        assert!(!fs.contains("rt-LEAK-val"), "form refresh_token 泄漏: {fs}");
+        assert!(!fs.contains("cs-LEAK-val"), "form client_secret 泄漏: {fs}");
+        assert!(
+            fs.contains("grant_type=refresh_token"),
+            "非凭据 form 字段应保留: {fs}"
+        );
+
+        // 非 JSON 上游回包(HTML 401 页 / 纯文本)里回显的 key 走 bytes_payload fallback 也要挡
+        let html = redact_bundle_body(
+            b"<html>401 Unauthorized: key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 invalid</html>",
+        );
+        assert_eq!(html["encoding"], "utf8", "非 JSON 应走 bytes fallback");
+        let hs = serde_json::to_string(&html).unwrap();
+        assert!(
+            !hs.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "非 JSON fallback key 泄漏: {hs}"
+        );
+        assert!(hs.contains("sk-***"));
+
+        // 消息文本里**嵌**的 JWT 子串(非整串 JWT)也挡,且保留上下文(codex P1)
+        let jwt_body = format!(r#"{{"error":{{"message":"invalid token {FAKE_JWT} provided"}}}}"#);
+        let jv = redact_bundle_body(jwt_body.as_bytes());
+        let js = serde_json::to_string(&jv).unwrap();
+        assert!(!js.contains(FAKE_JWT), "嵌入的 JWT 泄漏: {js}");
+        assert!(
+            js.contains("invalid token *** provided"),
+            "应只脱敏 JWT 子串、保留上下文: {js}"
+        );
+
+        // JWT 紧跟句末标点(句号/逗号)也挡,且标点**保留**(codex P2:精确匹配不吞尾随 `.`)
+        let jwt_punct = format!(r#"{{"m":"token {FAKE_JWT}. next {FAKE_JWT}, end"}}"#);
+        let jp = serde_json::to_string(&redact_bundle_body(jwt_punct.as_bytes())).unwrap();
+        assert!(!jp.contains(FAKE_JWT), "句末 JWT 泄漏: {jp}");
+        assert!(jp.contains("token ***. next"), "尾随句号应保留: {jp}");
+        assert!(
+            jp.contains("*** , end") || jp.contains("***, end"),
+            "尾随逗号应保留: {jp}"
+        );
+
+        // 含非法 UTF-8 字节的 mostly-text 错误页:lossy 解码后仍脱敏(不能因坏字节整体 base64 跳过)
+        let mut non_utf8 = vec![0xff, 0xfe];
+        non_utf8.extend_from_slice(b" 401: key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 end");
+        let nv = redact_bundle_body(&non_utf8);
+        assert_eq!(nv["encoding"], "utf8", "lossy 后应当 utf8 存而非 base64");
+        let ns = serde_json::to_string(&nv).unwrap();
+        assert!(
+            !ns.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "非 UTF-8 fallback key 泄漏: {ns}"
+        );
+        assert!(ns.contains("sk-***"));
+    }
+
+    #[test]
+    fn rescrub_persisted_bundle_scrubs_legacy_unredacted_body() {
+        // 模拟旧 build 写的 bundle:body.content 是**原始未脱敏** body 文本(string),
+        // 含 api_key 值 + echo 进 note 的 key。上传前 rescrub 必须把它们脱掉。
+        let legacy = json!({
+            "kind": "upstream_error_bundle",
+            "request": { "body": {
+                "encoding": "utf8", "bytes": 110, "truncated_bytes": 0,
+                "content": "{\"model\":\"x\",\"api_key\":\"sk-LEAK-secret-value-1234\",\"note\":\"bad key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 here\"}"
+            }},
+            "response": { "body": {
+                "encoding": "utf8", "bytes": 24, "truncated_bytes": 0,
+                "content": "{\"error\":\"unauthorized\"}"
+            }}
+        });
+        let out = rescrub_persisted_bundle(&serde_json::to_vec(&legacy).unwrap());
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("sk-LEAK-secret-value-1234"),
+            "旧 bundle api_key 泄漏: {s}"
+        );
+        assert!(
+            !s.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "旧 bundle echo key 泄漏: {s}"
+        );
+        assert!(s.contains("unauthorized"), "非凭据内容保留");
+        // 非 bundle / 解析失败 → 原样返回,不阻断上传
+        assert_eq!(rescrub_persisted_bundle(b"not json"), b"not json");
+
+        // 旧 base64 body(原始含非法 UTF-8 被整体 base64):rescrub 要**先解码**再脱(codex P2)
+        let secret = "{\"error\":\"bad key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 x\"}";
+        let b64 = STANDARD.encode(secret);
+        let legacy_b64 = json!({
+            "kind": "upstream_error_bundle",
+            "request": { "body": {"encoding":"json","bytes":2,"truncated_bytes":0,"content":{}} },
+            "response": { "body": {"encoding":"base64","bytes": secret.len(),"truncated_bytes":0,"content": b64} }
+        });
+        let out2 = rescrub_persisted_bundle(&serde_json::to_vec(&legacy_b64).unwrap());
+        let s2 = String::from_utf8_lossy(&out2);
+        assert!(
+            !s2.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "base64 旧 bundle key 泄漏: {s2}"
+        );
+        assert!(!s2.contains(&b64), "原始可解码 base64 payload 仍在: {s2}");
+
+        // 截断的旧 body(无法解析 → key 级脱敏做不了)→ 保守省略,不半脱敏上传(codex P2)
+        let truncated_legacy = json!({
+            "kind": "upstream_error_bundle",
+            "request": { "body": {
+                "encoding": "utf8", "bytes": 400000, "truncated_bytes": 399000,
+                "content": "{\"client_secret\":\"cs-LEAK-no-prefix-value\",\"messages\":[{\"content\":\"aaa"
+            }},
+            "response": { "body": {"encoding":"utf8","bytes":8,"truncated_bytes":0,"content":"{\"ok\":1}"} }
+        });
+        let out3 = rescrub_persisted_bundle(&serde_json::to_vec(&truncated_legacy).unwrap());
+        let s3 = String::from_utf8_lossy(&out3);
+        assert!(
+            !s3.contains("cs-LEAK-no-prefix-value"),
+            "截断 body 的 client_secret 泄漏: {s3}"
+        );
+        assert!(s3.contains("omitted"), "截断且无法解析的 body 应省略: {s3}");
     }
 }
