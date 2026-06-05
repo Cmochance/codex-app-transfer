@@ -1093,6 +1093,11 @@ async fn inject_unlock_script(
                 msg.push_str(&format!(" (脚本日志: {err})"));
             }
             set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            // [codex P2] inject 到不兼容 path 时 enablePluginEntry 已清 button disabled + 装
+            // observer/listener,但 setAuthMethod 没成功。失败 return 前先卸载撤销这些 DOM 改动 ——
+            // 否则 daemon backoff 期间用户 toggle off,run_daemon 不 reconnect 就退、永不发 uninstall,
+            // DOM-level unlock(button enabled + 自愈 observer)残留到 Codex reload。
+            inject_uninstall_script(write, read, msg_id_counter).await;
             Err(msg.into())
         }
         InjectOutcome::SetterThrew { script_error } => {
@@ -1101,11 +1106,15 @@ async fn inject_unlock_script(
                 script_error.unwrap_or_else(|| "未知错误".into())
             );
             set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            // [codex P2] 同 NoAuthContext:撤销已改的 DOM 再 return Err(见上)。
+            inject_uninstall_script(write, read, msg_id_counter).await;
             Err(msg.into())
         }
         InjectOutcome::Unknown { raw } => {
             let msg = format!("注入脚本返回未知形态: {raw}");
             set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
+            // [codex P2] 同 NoAuthContext:撤销已改的 DOM 再 return Err(见上)。
+            inject_uninstall_script(write, read, msg_id_counter).await;
             Err(msg.into())
         }
     }
