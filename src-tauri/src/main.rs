@@ -283,12 +283,12 @@ fn main() {
                     // migrate(幂等,已设则 no-op),确保读到落定值(有账号→true/无→false,不再 None)。
                     let _ = handlers::settings::migrate_real_account_mode_v1();
                     let mut mode_enabled = handlers::settings::read_real_account_mode_enabled();
-                    // [MOC-178 codex P2] direct provider 不代理(bypass_proxy 直连)→ 不支持真实账号
-                    // relay。即便 flag=true(migrate 有账号落定 / pin / 历史),direct 下也持久关 flag +
-                    // 当 false 走 ForceDisable 收敛 apikey,避免 direct apply apikey 后 reconcile 又恢复
-                    // chatgpt 的反复 + UI mode 错显 on。切回 local_proxy 后用户手动再开。
+                    // [MOC-178 codex P2] provider 不支持 relay(direct 直连 **或无 active provider**)→
+                    // 真实账号 relay 无法生效。即便 flag=true(migrate 落定 / pin / 历史),也持久关 flag +
+                    // 当 false 走 ForceDisable 收敛 apikey,避免「flag on 但 plugins locked」+ direct apply
+                    // apikey 后 reconcile 又恢复 chatgpt 的反复。切回 local_proxy provider 后用户手动再开。
                     if mode_enabled == Some(true)
-                        && admin::services::desktop::snapshot::active_provider_is_direct()
+                        && !admin::services::desktop::snapshot::active_provider_supports_relay()
                     {
                         let _ = handlers::settings::set_real_account_mode_enabled(false);
                         mode_enabled = Some(false);

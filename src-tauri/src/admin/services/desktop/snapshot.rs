@@ -172,12 +172,14 @@ pub fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConf
     ))
 }
 
-/// [MOC-178 codex P2] 当前 active provider 是否 direct(bypass_proxy 直连,transfer 不代理 →
-/// 不支持真实账号 relay)。只读,不写盘。direct 下真实账号模式 flag 不该 true(startup 收敛关)。
-pub fn active_provider_is_direct() -> bool {
+/// [MOC-178 codex P2] 当前 active provider 是否支持真实账号 relay = 有 active provider 且走 proxy
+/// (local_proxy 类,requires_proxy=true)。direct(bypass_proxy 直连)**或无 provider**(默认
+/// activeProvider null、无 target)→ false:不代理 / 没法 apply relay,保不住 chatgpt 态,不该开真实
+/// 账号模式 flag(startup 收敛关 / pin 只 save 镜像)。只读,不写盘。
+pub fn active_provider_supports_relay() -> bool {
     crate::admin::registry_io::load()
         .ok()
-        .and_then(|cfg| desktop_target_for_active_provider(&cfg).map(|t| t.mode == "direct"))
+        .and_then(|cfg| desktop_target_for_active_provider(&cfg).map(|t| t.requires_proxy))
         .unwrap_or(false)
 }
 

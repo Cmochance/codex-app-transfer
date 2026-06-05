@@ -144,10 +144,12 @@ pub async fn pin_current_handler() -> impl IntoResponse {
     // [MOC-178 codex P2] pin 由前端 auto-pin **自动**调用(activeReal + 无镜像,仅打开 UI 就触发),
     // 前提是活动已 chatgpt。故**只 save 镜像**,绝不走 finalize 的 apply relay / 回滚 / deactivate
     // —— 否则 proxy 起不来时仅打开 UI 就把用户正在用的活动 chatgpt 切 apikey(回归)。
-    // flag:provider 支持 relay → true;direct(不代理、不支持 relay)→ false —— 同 startup reconcile
-    // 的 direct 收敛,纠正「runtime 切到 direct 后 flag 残留 true、toggle 错显 on 到下次重启」。
-    let direct = crate::admin::services::desktop::snapshot::active_provider_is_direct();
-    let _ = super::settings::set_real_account_mode_enabled(!direct);
+    // flag:**只在 provider 支持 relay**(有 active provider + 走 proxy)时开;direct(不代理)**或无
+    // provider**(默认 activeProvider null,没法 apply relay)→ 只 save 镜像不开 mode,避免「flag on 但
+    // 无法 relay、plugins locked」。同 startup reconcile 的收敛,纠正 runtime 切走后 flag 残留。
+    let supports_relay =
+        crate::admin::services::desktop::snapshot::active_provider_supports_relay();
+    let _ = super::settings::set_real_account_mode_enabled(supports_relay);
     Json(json!({ "success": true, "message": "已钉住当前真实账号(持久保留)" })).into_response()
 }
 
