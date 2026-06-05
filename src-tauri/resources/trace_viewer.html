@@ -227,10 +227,14 @@
 
   // [MOC-184] OUTBOUND → curl(借鉴 claude-tap)。注:headers 已脱敏(authorization=***),
   // 复刻的是请求**形状**;真要重放上游需自行把凭据填回。
-  function buildCurl(ob) {
+  // method:outbound trace 不带 method 字段,但 proxy 转发时原样沿用 inbound 的 verb
+  // (forward.rs build_and_send_upstream `method.clone()`),故用 inbound method 复刻真实
+  // 动词 —— 否则非 POST 的 passthrough(如 GET /v1/responses/{id})会被错复刻成 POST,
+  // 误把 method 专属的上游失败当成 adapter/body 问题(codex-connector P2)。
+  function buildCurl(ob, method) {
     if (!ob || !ob.url) return "";
     const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
-    let parts = ["curl -X " + (ob.method || "POST").toUpperCase() + " " + q(ob.url)];
+    let parts = ["curl -X " + (ob.method || method || "POST").toUpperCase() + " " + q(ob.url)];
     const h = ob.headers || {};
     Object.keys(h).forEach((k) => {
       parts.push("-H " + q(k + ": " + (Array.isArray(h[k]) ? h[k].join(", ") : h[k])));
@@ -507,7 +511,7 @@
     if (!t) return;
     const what = btn.dataset.copy;
     let s = "";
-    if (what === "curl") s = buildCurl(t.outbound);
+    if (what === "curl") s = buildCurl(t.outbound, (t.inbound || {}).method);
     else if (what === "ob") s = bodyText((t.outbound || {}).body) || JSON.stringify(t.outbound || {}, null, 2);
     else if (what === "ib") s = bodyText((t.inbound || {}).body) || JSON.stringify(t.inbound || {}, null, 2);
     else s = JSON.stringify(t, null, 2);
