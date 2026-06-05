@@ -278,7 +278,32 @@ fn main() {
                 // refresh_token(实测撞刷会触发 refresh_token_reused 把账号烧死)。
                 {
                     use crate::codex_real_account::ReconcileOutcome;
-                    match crate::codex_real_account::reconcile_on_startup().await {
+                    let mode_enabled = handlers::settings::read_real_account_mode_enabled();
+                    match crate::codex_real_account::reconcile_on_startup(mode_enabled).await {
+                        // [MOC-178] 用户主动关了真实账号模式(flag=false),活动可能被退出 restore
+                        // 写回 chatgpt → 收敛回 apikey(保留 tokens),在下方 daemon 决策前完成。
+                        // had_valid_token=false 则无 token 可保留,no-op。
+                        Ok(ReconcileOutcome::ForceDisable { had_valid_token }) => {
+                            if had_valid_token {
+                                tracing::info!(
+                                    "[RealAccount] 真实账号模式已关(flag=false),收敛活动回 apikey(保留 tokens)"
+                                );
+                                let st = AdminState {
+                                    proxy_manager: app_handle_for_residual_scan
+                                        .state::<Arc<ProxyManager>>()
+                                        .inner()
+                                        .clone(),
+                                    trace_viewer_manager: Arc::new(
+                                        trace_viewer::TraceViewerManager::new(),
+                                    ),
+                                };
+                                let _ = admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&st).await;
+                            } else {
+                                tracing::info!(
+                                    "[RealAccount] 真实账号模式已关(flag=false),活动无 token,不收敛"
+                                );
+                            }
+                        }
                         // [MOC-104] 真实账号失效(镜像 token 本地 JWT 已过期、无法恢复)→ 自动
                         // 关「自动解锁」开关 + emit 事件让前端提示重新登录。
                         Ok(ReconcileOutcome::ReloginRequired { .. }) => {
@@ -318,6 +343,11 @@ fn main() {
                 tracing::info!(
                     "[RealAccount] 一次性迁移:硬重置 autoUnlockCodexPlugins=false(无真实账号时的高延迟 CDP 改为显式强制开启)"
                 );
+            }
+            // [MOC-178] 一次性迁移:落定真实账号模式持久开关初值(有账号→开、无→关,不突变老用户)。
+            // 在 post-apply task 的 reconcile 读 flag 之前(同步段先于 task await 完成)。
+            if handlers::settings::migrate_real_account_mode_v1() {
+                tracing::info!("[RealAccount] 一次性迁移:落定 realAccountModeEnabled 初值");
             }
 
             // ── Plugin Unlock 守护进程自动启动 ──

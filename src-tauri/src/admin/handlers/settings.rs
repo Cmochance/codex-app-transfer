@@ -530,6 +530,46 @@ pub fn migrate_real_account_unlock_v1() -> bool {
     .unwrap_or(false)
 }
 
+/// [MOC-178] 真实账号模式持久开关(用户意图)。三态:键缺失=未设(走迁移)/ true=开 / false=
+/// 用户主动关。**独立于活动 auth.json、不被退出 restore 撤销** —— 解决「清除后重启又自动开」。
+/// 跟 `autoUnlockCodexPlugins`(无账号时的强制 CDP daemon 档)是两个独立开关。
+pub fn read_real_account_mode_enabled() -> Option<bool> {
+    crate::admin::registry_io::load().ok().and_then(|cfg| {
+        cfg.get("settings")
+            .and_then(|s| s.get("realAccountModeEnabled"))
+            .and_then(Value::as_bool)
+    })
+}
+
+/// [MOC-178] 写真实账号模式开关。toggle on / off / forget 都经这里落持久意图。
+pub fn set_real_account_mode_enabled(enabled: bool) -> bool {
+    with_config_write(|cfg| {
+        ensure_settings_object(cfg)
+            .insert("realAccountModeEnabled".to_owned(), Value::Bool(enabled));
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false)
+}
+
+/// [MOC-178] 一次性迁移:首次落定 `realAccountModeEnabled` 初值,不突变老用户。键已存在 →
+/// no-op(幂等);不存在 → 按当前是否有可用真实账号(`detect().logged_in`,新口径认 token)
+/// 决定:有账号 → true(老用户保持开)、无账号 → false(与现状一致)。返回是否执行了写入。
+pub fn migrate_real_account_mode_v1() -> bool {
+    let already = crate::admin::registry_io::load()
+        .ok()
+        .map(|cfg| {
+            cfg.get("settings")
+                .and_then(|s| s.get("realAccountModeEnabled"))
+                .is_some()
+        })
+        .unwrap_or(false);
+    if already {
+        return false;
+    }
+    let has_account = crate::codex_real_account::detect().logged_in;
+    set_real_account_mode_enabled(has_account)
+}
+
 /// #262:把 `settings.language` 同步到 adapters 全局 [`codex_app_transfer_adapters::core::language`]。
 /// caller 路径:save_settings 后 + main.rs startup 加载 settings 时各调一次。
 pub fn sync_user_language_from_settings(settings: &Value) {

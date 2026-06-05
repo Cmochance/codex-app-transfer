@@ -1505,8 +1505,13 @@
       // 未失效 → Codex 原生解锁)或持久强制档 → ON。每次刷新都按此派生,实现「首次加载 /
       // 刷新按账号状态自动开/关」。relay 的 ON 由 realActive 派生维持,不写持久强制档。
       // 仅有镜像但活动是 apikey(source=imported)→ 此刻未启用,不显示已开启(gate official)。
-      const realActive = st.logged_in === true && st.source === "official" && !realAccountExpired;
-      const on = realActive || forceUnlockPersisted;
+      // [MOC-178] toggle 派生改看持久 flag(用户意图),不再用「活动是否 chatgpt」——清除切
+      // apikey 后退出 restore 会把活动写回 chatgpt,若按活动派生会又显示 ON(关不住)。flag
+      // 是跨重启的关闭意图真相源。realActive(relay 此刻真生效)= flag 开 + 活动确实 chatgpt。
+      realAccountModeEnabled = resp.mode_enabled;
+      const modeOn = resp.mode_enabled === true;
+      const realActive = modeOn && resp.active_is_chatgpt === true && !realAccountExpired;
+      const on = modeOn || forceUnlockPersisted;
       const unlockToggle = $("#autoUnlockCodexPlugins");
       if (unlockToggle) unlockToggle.checked = on;
       const runEl = $("#raRunStatus");
@@ -1523,12 +1528,10 @@
           runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
         }
       }
-      // [MOC-178] 显示「清除真实账号」按钮:有持久镜像 OR 活动是真实 chatgpt。原来只看
-      // has_imported → 镜像删了但活动还 chatgpt 时按钮消失,用户没法清活动,跟 toggle 仍
-      // ON(realActive 派生)状态不一致。activeReal 时也给按钮,forget 会连带备份+删活动 auth。
+      // [MOC-178] 「清除真实账号」按钮 = 真实账号模式开着时显示(可关)。按持久 flag,跟
+      // toggle 一致:flag 开 → 显示;flag 关 → 隐藏(已关、无需再清)。
       const forgetBtn = $("#realAccountForgetBtn");
-      const hasRealAccount = st.has_imported || (st.logged_in === true && st.source === "official");
-      if (forgetBtn) forgetBtn.style.display = hasRealAccount ? "" : "none";
+      if (forgetBtn) forgetBtn.style.display = modeOn ? "" : "none";
       // 新登录开始 → 复位「本次登录已持久」标记,下次成功要重新 pin(替换旧镜像)。
       if (login.state === "running") realAccountLoginPinned = false;
       // 自动持久(单账号工具:登录即选择真实账号模式,无需手动「钉住」):
@@ -1540,7 +1543,9 @@
       const activeReal = st.logged_in === true && st.source === "official";
       const justLoggedIn = login.state === "succeeded" && !realAccountLoginPinned;
       const firstPersist = activeReal && !st.has_imported;
-      if (activeReal && (justLoggedIn || firstPersist) && !realAccountAutoPersisting && !realAccountForgotten) {
+      // [MOC-178] flag=false(用户主动关)时禁止 auto-pin 重生镜像 —— 否则关闭后镜像复活、
+      // reconcile 又恢复,违反「关闭持久」。flag 跨重启权威,realAccountForgotten 是 session 内双保险。
+      if (activeReal && (justLoggedIn || firstPersist) && !realAccountAutoPersisting && !realAccountForgotten && resp.mode_enabled !== false) {
         realAccountAutoPersisting = true;
         if (justLoggedIn) realAccountLoginPinned = true;
         CCApi.realAccount.pinCurrent()
@@ -1562,58 +1567,76 @@
   //   强制档则持久化 false + 停 daemon。
   async function onAutoUnlockToggle(e) {
     const toggle = e.target;
-    let realActive = false;
+    let st = {};
+    let modeEnabled = realAccountModeEnabled;
     let statusOk = false;
     try {
       const ra = await CCApi.realAccount.status();
-      const st = (ra && ra.status) || {};
-      realActive = st.logged_in === true && st.source === "official" && st.relogin_required !== true;
+      st = (ra && ra.status) || {};
+      modeEnabled = ra && ra.mode_enabled;
+      realAccountModeEnabled = modeEnabled;
       statusOk = true;
     } catch (err) {
       console.log("[RealAccount] onAutoUnlockToggle status() 失败:", err);
     }
-    // [HIGH-1] status() 失败 ≠ 无账号(可能 admin server 启动早期 / 抖动)。不伪装成无账号
-    // 弹引导窗误导已登录用户;回退派生态 + 提示稍后重试(与 refreshRealAccountStatus 失败
-    // 时保留态的口径一致)。
+    // [HIGH-1] status() 失败 ≠ 无账号(admin server 启动早期 / 抖动)。回退持久 flag 派生态 +
+    // 提示重试,不伪装无账号误导已登录用户。
     if (!statusOk) {
-      toggle.checked = realActive || forceUnlockPersisted;
+      toggle.checked = (realAccountModeEnabled === true) || forceUnlockPersisted;
       showToast(t("realAccount.statusUnavailable") || "暂时无法获取账号状态,请稍后重试");
       return;
     }
-    // [MOC-114] 解锁 gate 同时要求账号有效 + 系统代理(梯子)连通。relay 真账号/插件/第三方
-    // 路由都依赖梯子可达;缺任一都会让 plugins 进"已登录却全转圈"的误导态,故 gate 住、
-    // 弹引导。探测失败**不**武断 gate(可能 admin server 抖动)→ 按连通放行,运行时错误兜底
-    // (与 status() 失败不伪装无账号的 HIGH-1 口径对称)。
+    // [MOC-114] relay 真账号/插件/第三方路由都依赖系统代理(梯子)可达;探测失败 fail-open。
     let proxyConnected = true;
     try {
       const sp = await CCApi.systemProxy.status();
-      // gate 只在「配了代理但连不上(梯子没开)」时拦;没配/PAC/查询失败均 fail-open(见 helper)。
       proxyConnected = systemProxyGateOk(sp && sp.systemProxy);
     } catch (_e) {
       proxyConnected = true;
     }
     if (toggle.checked) {
-      if (realActive && proxyConnected) {
-        // 账号有效 + 梯子连通 → relay 模式,Codex 原生显示 plugins,不启 daemon、不设强制档。
-        showToast(t("realAccount.unlockedByRealAccount") || "已开启(真实账号,原生解锁)");
-        setTimeout(refreshRealAccountStatus, 100);
-        setTimeout(refreshPluginUnlockStatus, 300);
+      // [MOC-178] 开真实账号模式:账号有有效 token(新口径 logged_in,哪怕活动当前是 apikey)
+      // + 梯子连通 → enable(写持久 flag=true + 把活动写回 chatgpt + apply relay)。
+      if (st.logged_in && proxyConnected) {
+        try {
+          await CCApi.realAccount.enable();
+          realAccountForgotten = false;
+          realAccountModeEnabled = true;
+          showToast(t("realAccount.modeEnabled") || "已开启真实账号模式");
+          setTimeout(refreshRealAccountStatus, 100);
+          setTimeout(refreshPluginUnlockStatus, 300);
+        } catch (err) {
+          toggle.checked = false;
+          showToast((err && err.message) || "开启真实账号模式失败");
+        }
       } else {
-        // 缺账号 / 缺代理 → 引导弹窗(文案按缺啥动态)。开关回退派生态(强制档值,通常 OFF)。
+        // 无 token / 缺代理 → 引导弹窗(登录优先 / 强制兜底)。开关回退强制档值。
         toggle.checked = forceUnlockPersisted;
-        showRealAccountGateModal(!realActive, !proxyConnected);
+        showRealAccountGateModal(!st.logged_in, !proxyConnected);
       }
-    } else if (realActive) {
-      // relay:前端开关关不掉账号原生解锁 → 弹回 ON 并提示走「清除真实账号」。
-      toggle.checked = true;
-      showToast(t("realAccount.cannotDisableRelay") || "真实账号已登录,Plugins 由账号原生解锁;如需停用请点「清除真实账号」");
     } else {
-      // 强制 daemon 档关闭:持久化 false + 停 daemon。
-      forceUnlockPersisted = false;
-      await saveSettingsFromForm();
-      try { await CCApi.pluginUnlock.stop(); } catch (_e) {}
-      setTimeout(refreshPluginUnlockStatus, 300);
-      setTimeout(refreshRealAccountStatus, 300);
+      // [MOC-178] 关真实账号模式:有真实账号(flag 开 / 有 token)→ forget(切 apikey + 持久
+      // flag=false、**保留 tokens**)。不再「relay 关不掉弹回 ON」——持久 flag 关得掉、重启不复活。
+      if (modeEnabled === true || st.logged_in) {
+        try {
+          await CCApi.realAccount.forget();
+          realAccountForgotten = true;
+          realAccountModeEnabled = false;
+          showToast(t("realAccount.modeDisabled") || "已关闭真实账号模式(切 apikey,登录态保留)");
+          setTimeout(refreshRealAccountStatus, 100);
+          setTimeout(refreshPluginUnlockStatus, 300);
+        } catch (err) {
+          toggle.checked = true;
+          showToast((err && err.message) || "关闭真实账号模式失败");
+        }
+      } else {
+        // 无真实账号 → 强制 daemon 档关闭:持久化 false + 停 daemon。
+        forceUnlockPersisted = false;
+        await saveSettingsFromForm();
+        try { await CCApi.pluginUnlock.stop(); } catch (_e) {}
+        setTimeout(refreshPluginUnlockStatus, 300);
+        setTimeout(refreshRealAccountStatus, 300);
+      }
     }
   }
 
@@ -1650,6 +1673,9 @@
   // 只在「无账号 + 用户强制开启」时为 true。与派生 checkbox 分离,避免 saveSettings 把
   // realActive 误存进强制档(否则账号失效后会误启 daemon)。
   let forceUnlockPersisted = false;
+  // [MOC-178] 真实账号模式持久开关缓存(后端 settings.realAccountModeEnabled 三态:true/false/
+  // null=未设)。每次 status 刷新更新;status() 失败时回退派生用。
+  let realAccountModeEnabled = null;
   let realAccountLoginPinned = false; // 本次登录成功是否已 pin(替换镜像);新登录开始时复位
   let realAccountExpired = false; // relogin-required 事件置真 → 账号状态显示「账号已失效」
   let realAccountForgotten = false; // 用户点「清除」后置真 → 抑制本 session auto-persist 重生镜像
@@ -8432,6 +8458,7 @@
         // 抑制本 session 内的 auto-persist 重新生成镜像(review #1):清除后即便
         // login.state 仍是 succeeded、活动仍是 chatgpt,也别把刚删的镜像又 pin 回来。
         realAccountForgotten = true;
+        realAccountModeEnabled = false;
         // [MOC-178] 后端删镜像后 apply 切 apikey;失败(如 proxy 起不来)时如实提示 ——
         // 镜像已删但活动仍 chatgpt、toggle 可能没关。500ms 后 refresh 会自纠偏,但先告知。
         if (res && res.switchedToApikey === false) {

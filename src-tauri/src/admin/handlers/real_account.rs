@@ -33,6 +33,10 @@ pub async fn status_handler() -> impl IntoResponse {
         "success": true,
         "message": message,
         "status": status,
+        // [MOC-178] 真实账号模式持久开关(用户意图)+ 活动是否真 chatgpt(relay 此刻是否真生效)。
+        // 前端据 mode_enabled 派生 toggle(不再用 logged_in),据 active_is_chatgpt 判 relay 实效。
+        "mode_enabled": super::settings::read_real_account_mode_enabled(),
+        "active_is_chatgpt": codex_real_account::active_is_real_chatgpt_now(),
         "login": codex_real_account::login_status(),
     }))
 }
@@ -112,6 +116,9 @@ pub async fn forget_handler(
         Ok(r) => r,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // [MOC-178] 落「用户主动关真实账号模式」持久标志(不被退出 restore 撤销)——重启后
+    // reconcile 据此收敛回 apikey、不自动开。这是「关闭持久」的真相源。
+    let _ = super::settings::set_real_account_mode_enabled(false);
     // [MOC-178] 删镜像后 apply 当前 provider 强制切 apikey:停用真实账号(toggle 关 + Codex
     // 原生不显示 plugins),但**保留 tokens** → 退出 restore 能写回 chatgpt + tokens 完整恢复。
     // (对比直接删活动 auth.json:那会丢 tokens、restore 恢复不回,残缺。)
@@ -126,6 +133,45 @@ pub async fn forget_handler(
         "removed": removed,
         "switchedToApikey": switched,
         "message": "已清除真实账号(切回 apikey 模式,tokens 保留,退出可恢复)",
+    }))
+    .into_response()
+}
+
+/// POST /api/desktop/real-account/enable
+///
+/// [MOC-178] 开真实账号模式:校验有可用 token → 写持久 flag=true + 把活动写回 chatgpt +
+/// apply relay(Codex 原生显示 plugins)。账号有有效 token(哪怕活动当前是 apikey)就能开。
+pub async fn enable_handler(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+) -> impl IntoResponse {
+    // 账号可用性(新口径认 token,清除切 apikey 后 tokens 还在也算有)。
+    if !codex_real_account::detect().logged_in {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "无可用真实账号(需先登录 / 导入)".to_owned(),
+        )
+        .into_response();
+    }
+    match codex_real_account::activate_real_account().await {
+        Ok(true) => {}
+        Ok(false) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "账号 token 不可用(可能已过期,需重新登录)".to_owned(),
+            )
+            .into_response()
+        }
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+    let _ = super::settings::set_real_account_mode_enabled(true);
+    // 活动已写回 chatgpt,apply relay 的 gate 通过 → Codex 原生显示 plugins,不启 daemon。
+    let synced =
+        crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(&state).await;
+    Json(json!({
+        "success": true,
+        "enabled": true,
+        "applied": synced.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+        "message": "已开启真实账号模式",
     }))
     .into_response()
 }
@@ -145,4 +191,5 @@ pub fn routes() -> Router<AdminState> {
             post(pin_current_handler),
         )
         .route("/api/desktop/real-account/forget", post(forget_handler))
+        .route("/api/desktop/real-account/enable", post(enable_handler))
 }
