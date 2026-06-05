@@ -86,6 +86,10 @@ pub async fn import_handler(Json(req): Json<ImportRequest>) -> impl IntoResponse
     if let Err(e) = codex_real_account::import_auth(req.source_path).await {
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }
+    // [MOC-178 codex P2] 导入真实账号 = 用户主动建立真实账号 → 开真实账号模式持久 flag。否则
+    // clear(flag=false)→ import 后 flag 仍 false,下次启动 ForceDisable 把刚导入的账号又切回
+    // apikey(撤销导入)、UI toggle 也错显 off。
+    let _ = super::settings::set_real_account_mode_enabled(true);
     let status = codex_real_account::detect();
     Json(json!({
         "success": true,
@@ -100,8 +104,12 @@ pub async fn import_handler(Json(req): Json<ImportRequest>) -> impl IntoResponse
 /// 钉住当前检测到的真实账号(官方活动 auth.json)进持久镜像。
 pub async fn pin_current_handler() -> impl IntoResponse {
     match codex_real_account::pin_current_account().await {
-        Ok(()) => Json(json!({ "success": true, "message": "已钉住当前真实账号(持久保留)" }))
-            .into_response(),
+        Ok(()) => {
+            // [MOC-178 codex P2] 钉住真实账号 = 开真实账号模式持久 flag(同 import,见上)。
+            let _ = super::settings::set_real_account_mode_enabled(true);
+            Json(json!({ "success": true, "message": "已钉住当前真实账号(持久保留)" }))
+                .into_response()
+        }
         Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
     }
 }
@@ -167,6 +175,17 @@ pub async fn enable_handler(
     // 活动已写回 chatgpt,apply relay 的 gate 通过 → Codex 原生显示 plugins,不启 daemon。
     let synced =
         crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(&state).await;
+    // [MOC-178 codex P2] direct provider 的 relay gate(apply 的 mode != "direct")会把 auth
+    // rewrite 回 apikey → 真实账号模式实际没生效。sync 后活动不再是 chatgpt = 本 provider 不支持
+    // relay(direct 等),回滚 flag、报错,避免「flag 说开但 Codex plugins disabled」状态不一致。
+    if !codex_real_account::active_is_real_chatgpt_now() {
+        let _ = super::settings::set_real_account_mode_enabled(false);
+        return err(
+            StatusCode::BAD_REQUEST,
+            "当前 provider 不支持真实账号 relay(如 direct 模式),请切到 local_proxy 类 provider 再开".to_owned(),
+        )
+        .into_response();
+    }
     Json(json!({
         "success": true,
         "enabled": true,
