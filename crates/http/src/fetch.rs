@@ -879,22 +879,22 @@ fn parse_meta_refresh(html: &str) -> Option<String> {
         if !(tag_lower.contains("http-equiv") && tag_lower.contains("refresh")) {
             continue;
         }
-        // **锚定 content 属性值后**再找 url= —— 避免 `data-url=` 等其他属性在 content 前被误匹配
-        // (chatgpt-codex review)。ascii lowercase 不改字节长度, lower 偏移可直接用于原 html 取值。
-        let Some(cpos) = tag_lower.find("content") else {
+        // 严格提取 content 属性的**引号值**, 在值内找 url=(容忍空格), 再 decode HTML 实体:
+        // - 限 content 值内 → 不扫到 content 后的 data-url 等其他属性(chatgpt review)
+        // - `&amp;` 等实体浏览器导航前会 decode, 否则 query 串抓错(chatgpt review)
+        let Some(cval) = tag_attr_value(&html[start..end], tag_lower, "content") else {
             continue;
         };
-        let region = start + cpos;
-        // content 内找 url 值(容忍 `url = X` 等号空格, chatgpt review); lower/html 同字节偏移。
-        if let Some(voff) = find_url_value_offset(&lower[region..end]) {
-            let val = html[region + voff..end]
+        let cval_lower = cval.to_ascii_lowercase();
+        if let Some(voff) = find_url_value_offset(&cval_lower) {
+            let raw = cval[voff..]
                 .trim_start_matches(['"', '\'', ' '])
                 .split(['"', '\'', '>', ' '])
                 .next()
                 .unwrap_or("")
                 .trim();
-            if !val.is_empty() {
-                return Some(val.to_string());
+            if !raw.is_empty() {
+                return Some(decode_html_entities(raw));
             }
         }
     }
@@ -922,22 +922,90 @@ fn find_url_value_offset(s: &str) -> Option<usize> {
     None
 }
 
+/// 提取 tag 内 `attr = "value"` 的引号值(原 html 切片)。`attr` 前须非 ident(避免 `data-content`),
+/// 容忍等号周围空格 + 单/双引号。`html_tag`/`lower_tag` 须同一 tag 切片(等长, ascii lowercase)。
+fn tag_attr_value<'a>(html_tag: &'a str, lower_tag: &str, attr: &str) -> Option<&'a str> {
+    let bytes = lower_tag.as_bytes();
+    let mut p = 0;
+    while let Some(rel) = lower_tag[p..].find(attr) {
+        let a = p + rel;
+        p = a + attr.len();
+        if a > 0 {
+            let pc = bytes[a - 1];
+            if pc.is_ascii_alphanumeric() || pc == b'_' || pc == b'-' {
+                continue; // data-content / xcontent
+            }
+        }
+        let after = lower_tag[a + attr.len()..].trim_start();
+        let Some(after) = after.strip_prefix('=') else {
+            continue;
+        };
+        let after = after.trim_start();
+        let quote = match after.as_bytes().first() {
+            Some(&b'"') => '"',
+            Some(&b'\'') => '\'',
+            _ => continue,
+        };
+        let vstart = lower_tag.len() - after.len() + 1; // 引号后值起始
+        let vend_rel = html_tag.get(vstart..)?.find(quote)?;
+        return Some(&html_tag[vstart..vstart + vend_rel]);
+    }
+    None
+}
+
+/// decode meta refresh URL 里常见的 HTML 实体(浏览器导航前会 decode, 否则 `&amp;` 当字面量
+/// 抓错 query —— chatgpt review)。只覆盖 URL 里现实会出现的几个。
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&#x2f;", "/")
+        .replace("&#x2F;", "/")
+        .replace("&#47;", "/")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+/// `loc_start` 处的 `location` 是否为浏览器全局(可触发导航)—— bare `location`(前非 ident 非 `.`)
+/// 或 `window.`/`document.`/`self.`/`top.`/`globalthis.` 前缀。排除 `config.location` 等对象属性
+/// + `allocation`/`geolocation` 子串(chatgpt review)。入参 `lower` 已小写。
+fn location_is_global(lower: &str, loc_start: usize) -> bool {
+    if loc_start == 0 {
+        return true;
+    }
+    let bytes = lower.as_bytes();
+    let prev = bytes[loc_start - 1];
+    if prev == b'.' {
+        // 属性访问: `.` 前的标识符须是浏览器全局对象。
+        let before = &lower[..loc_start - 1];
+        ["window", "document", "self", "top", "globalthis"]
+            .iter()
+            .any(|g| {
+                before.ends_with(g) && {
+                    let gi = before.len() - g.len();
+                    gi == 0 || !(bytes[gi - 1].is_ascii_alphanumeric() || bytes[gi - 1] == b'_')
+                }
+            })
+    } else {
+        // 非属性访问: 须非 ident(bare location: 行首/`;`/空白/`{`/`(`)。排除 allocation/geolocation。
+        !(prev.is_ascii_alphanumeric() || prev == b'_')
+    }
+}
+
 /// 解析 JS 跳转: `location.replace('T')` / `location.assign('T')` / `location[.href] = 'T'`
 /// (`window.`/`document.` 前缀 + **等号周围空格**容忍, 排除 `==` 比较)。URL 须 `http` / `/` 开头。
-/// 遍历每个 `location` token(前须非 ident, 避免 `allocation`/`geolocation` 误命中, chatgpt review)。
+/// 遍历每个 `location` token(经 `location_is_global` 限浏览器全局, 排除对象属性 + 子串误命中)。
 fn parse_js_location(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
     let mut from = 0;
     while let Some(rel) = lower[from..].find("location") {
         let start = from + rel;
         from = start + "location".len();
-        // 边界: location 前须非 ident(避免 allocation / geolocation 等子串误匹配)。
-        if start > 0 {
-            let p = bytes[start - 1];
-            if p.is_ascii_alphanumeric() || p == b'_' {
-                continue;
-            }
+        // 边界: 须是浏览器全局 location(可触发导航)—— bare `location` 或 `window.`/`document.`
+        // 等前缀。排除 `allocation`/`geolocation` 子串 + `config.location`/`router.location` 等对象
+        // 属性(chatgpt review)。
+        if !location_is_global(&lower, start) {
+            continue;
         }
         let after = &html[from..];
         let after_lo = &lower[from..];
@@ -1034,6 +1102,19 @@ mod tests {
             parse_meta_refresh("<meta http-equiv='refresh' content='0; url = /spaced'>").as_deref(),
             Some("/spaced")
         );
+        // content="0"(值内无 url)+ data-url → 不抓 data-url(chatgpt review 第 3 轮)
+        assert_eq!(
+            parse_meta_refresh("<meta http-equiv='refresh' content='0' data-url='/next'>"),
+            None
+        );
+        // HTML 实体 decode &amp;→&(chatgpt review 第 3 轮)
+        assert_eq!(
+            parse_meta_refresh(
+                "<meta http-equiv='refresh' content='0;url=https://e.com/x?a=1&amp;b=2'>"
+            )
+            .as_deref(),
+            Some("https://e.com/x?a=1&b=2")
+        );
         // 非 refresh meta → None
         assert_eq!(parse_meta_refresh("<meta charset='utf-8'><p>hi</p>"), None);
     }
@@ -1076,6 +1157,21 @@ mod tests {
         assert_eq!(
             parse_js_location("<script>var allocation='https://x.com'</script>"),
             None
+        );
+        // config.location / router.location 对象属性不当浏览器跳转(chatgpt review 第 3 轮)
+        assert_eq!(
+            parse_js_location("<script>config.location = '/api/state'</script>"),
+            None
+        );
+        assert_eq!(
+            parse_js_location("<script>router.location.replace('/x')</script>"),
+            None
+        );
+        // window.location 浏览器全局仍正常
+        assert_eq!(
+            parse_js_location("<script>window.location.replace('https://e.com/g')</script>")
+                .as_deref(),
+            Some("https://e.com/g")
         );
     }
 
