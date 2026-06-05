@@ -239,8 +239,19 @@
     Object.keys(h).forEach((k) => {
       parts.push("-H " + q(k + ": " + (Array.isArray(h[k]) ? h[k].join(", ") : h[k])));
     });
-    const body = bodyText(ob.body);
-    if (body) parts.push("--data-raw " + q(body));
+    const ob_body = ob.body || {};
+    const truncated = (ob_body.truncated_bytes || 0) > 0 || ob_body.encoding === "json_truncated_omitted";
+    const body = bodyText(ob_body);
+    if (truncated) {
+      // body 被诊断 cap 截断/省略(见 diagnostics.rs redact_body):partial JSON 直接重放会
+      // 400/parse error,误判成 adapter/上游问题 → 用显眼占位替代静默 partial,提醒填回完整体
+      // (codex-connector P2)。
+      parts.push("--data-raw " + q("<<< 诊断 body 已截断:原 " + (ob_body.bytes != null ? ob_body.bytes : "?")
+        + " 字节、省略 " + (ob_body.truncated_bytes != null ? ob_body.truncated_bytes : "?")
+        + ";重放前请填回完整请求体 >>>"));
+    } else if (body) {
+      parts.push("--data-raw " + q(body));
+    }
     return parts.join(" \\\n  ");
   }
 
