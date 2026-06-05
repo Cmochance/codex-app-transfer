@@ -278,6 +278,10 @@ fn main() {
                 // refresh_token(实测撞刷会触发 refresh_token_reused 把账号烧死)。
                 {
                     use crate::codex_real_account::ReconcileOutcome;
+                    // [MOC-178 codex P2] 本 spawned task 与同步段的 migrate 无顺序保证 → 首次升级
+                    // 可能在 migrate 前读到 flag=None、跳过下面的 direct 收敛。reconcile 读 flag 前先跑
+                    // migrate(幂等,已设则 no-op),确保读到落定值(有账号→true/无→false,不再 None)。
+                    let _ = handlers::settings::migrate_real_account_mode_v1();
                     let mut mode_enabled = handlers::settings::read_real_account_mode_enabled();
                     // [MOC-178 codex P2] direct provider 不代理(bypass_proxy 直连)→ 不支持真实账号
                     // relay。即便 flag=true(migrate 有账号落定 / pin / 历史),direct 下也持久关 flag +
@@ -362,12 +366,6 @@ fn main() {
                     "[RealAccount] 一次性迁移:硬重置 autoUnlockCodexPlugins=false(无真实账号时的高延迟 CDP 改为显式强制开启)"
                 );
             }
-            // [MOC-178] 一次性迁移:落定真实账号模式持久开关初值(有账号→开、无→关,不突变老用户)。
-            // 在 post-apply task 的 reconcile 读 flag 之前(同步段先于 task await 完成)。
-            if handlers::settings::migrate_real_account_mode_v1() {
-                tracing::info!("[RealAccount] 一次性迁移:落定 realAccountModeEnabled 初值");
-            }
-
             // ── Plugin Unlock 守护进程自动启动 ──
             // [MOC-104] daemon = CDP 注入 `setAuthMethod('chatgpt')`,把 React authMethod
             // 伪造成 chatgpt 来解锁 Plugins 入口。它**只**对「活动 auth.json 是 apikey」的
