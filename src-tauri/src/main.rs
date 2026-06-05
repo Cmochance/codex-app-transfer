@@ -426,9 +426,24 @@ fn main() {
         if matches!(event, RunEvent::Exit) {
             let manager = app_handle.state::<Arc<ProxyManager>>();
             manager.stop_silent();
+            // gate 状态要在 stop_silent 清除前读(用于决定是否需停 Codex 页内 recorder)。
+            let diag_was_on = codex_app_transfer_proxy::diagnostics::forward_trace_enabled();
             app_handle
                 .state::<Arc<trace_viewer::TraceViewerManager>>()
                 .stop_silent();
+            // [MOC-169] 诊断开着退出:优雅停 plugin-unlock daemon,让它退出前 best-effort 停掉
+            // Codex 页内 MCP recorder(Codex 仍开时 recorder 否则留在渲染进程继续抓流量到下次
+            // reload)。stop 发 Stop 命令后短暂等 daemon 处理(发停采 eval + 退出);bounded
+            // timeout 防退出 hang;daemon 没在跑(relay/未启)时 stop 直接返回、无副作用。
+            if diag_was_on {
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_millis(600), async {
+                        handlers::plugin_unlock::get_service().await.stop().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    })
+                    .await
+                });
+            }
             // 取消任何 in-flight OAuth login —— 防 user 在 OAuth 5min 等待
             // 期间 Cmd+Q 退出 app,后台 task 残留 5min 后才超时(浪费资源,
             // 而且 callback 还可能触发 token persist 写入磁盘但 user 已经

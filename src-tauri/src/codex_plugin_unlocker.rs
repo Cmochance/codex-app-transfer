@@ -551,19 +551,29 @@ async fn connect_and_monitor(
                                 }
                                 continue;
                             }
-                            // [MOC-169] MCP-trace drain 响应 → 逐条脱敏后推统一 store
+                            // [MOC-169] MCP-trace drain 响应 → 逐条脱敏后推统一 store。drain eval 返
+                            // `{i: 录制器是否真装上(__codexMcpTraceInit), a: spliced 条目}`。
                             if pending_drain_id.is_some() && resp.id == pending_drain_id {
                                 pending_drain_id = None;
-                                // [MOC-169] 处理前**重查 gate**:drain 的 evaluate 在途时用户可能已
+                                let value = resp
+                                    .result
+                                    .as_ref()
+                                    .and_then(|r| r.get("result"))
+                                    .and_then(|r| r.get("value"));
+                                // 确认安装:install eval 是 fire-and-forget,页面导航/上下文没就绪时可能
+                                // 静默失败但 mcp_recorder_installed 乐观置了 true。若 drain 回报 i=false
+                                // (__codexMcpTrace 不存在)→ 重置 installed=false,下个 tick 重装、重试
+                                // 直到 CDP 确认(codex-connector:retry recorder install until confirmed)。
+                                let installed = value.and_then(|v| v.get("i")).and_then(|v| v.as_bool());
+                                if installed == Some(false) {
+                                    mcp_recorder_installed = false;
+                                }
+                                // [MOC-169] record 前**重查 gate**:drain 的 evaluate 在途时用户可能已
                                 // 关诊断,这批 spliced 条目不再 record(与 forward Drop 重查、MCP
                                 // recorder「关即停」一致 —— 关后采集立即停,不留 in-flight 残尾)。
                                 if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() {
-                                    if let Some(arr) = resp
-                                        .result
-                                        .as_ref()
-                                        .and_then(|r| r.get("result"))
-                                        .and_then(|r| r.get("value"))
-                                        .and_then(|v| v.as_array())
+                                    if let Some(arr) =
+                                        value.and_then(|v| v.get("a")).and_then(|v| v.as_array())
                                     {
                                         for entry in arr {
                                             record_mcp_trace_entry(entry);
@@ -609,6 +619,8 @@ async fn connect_and_monitor(
                 // 没满时 Stop 必被送达,同样走到这里。两种情况都不漏停止。
                 if !desired.load(Ordering::SeqCst) {
                     tracing::info!("[PluginUnlock] desired=false observed, stopping daemon");
+                    disable_mcp_recorder_if_active(&mut write, msg_id_counter, mcp_recorder_enabled)
+                        .await;
                     let _ = write.close().await;
                     return Ok(LoopControl::Stop);
                 }
@@ -636,6 +648,8 @@ async fn connect_and_monitor(
                         // [MOC-100 P2-1] 关键:返回 Stop 而非 Ok(()),否则 run_daemon
                         // 当优雅断开立刻重连,daemon 停不掉(详见 LoopControl 注释)。
                         tracing::info!("[PluginUnlock] stop requested, closing connection");
+                        disable_mcp_recorder_if_active(&mut write, msg_id_counter, mcp_recorder_enabled)
+                            .await;
                         let _ = write.close().await;
                         return Ok(LoopControl::Stop);
                     }
@@ -681,16 +695,8 @@ async fn connect_and_monitor(
                 // 阻塞(否则停采被推迟到 drain 响应回来才发,这期间页内 recorder 仍在抓未脱敏流量)。
                 // fire-and-forget,响应忽略;与在途 drain 互不影响(各是独立 evaluate)。
                 if !gate_on && mcp_recorder_enabled {
+                    disable_mcp_recorder_if_active(&mut write, msg_id_counter, true).await;
                     mcp_recorder_enabled = false;
-                    let (off_msg, _off_id) = make_cdp_msg(
-                        msg_id_counter,
-                        "Runtime.evaluate",
-                        json!({
-                            "expression": "try{window.__codexMcpTraceOn=false;if(window.__codexMcpTrace)window.__codexMcpTrace.length=0}catch(e){}",
-                            "returnByValue": true
-                        }),
-                    );
-                    let _ = write.send(WsMessage::Text(off_msg)).await;
                 }
                 // 有 drain 在途 → 本 tick 不再发新 install/drain(响应在 read 分支处理后清 pending)。
                 if pending_drain_id.is_some() {
@@ -716,7 +722,9 @@ async fn connect_and_monitor(
                             msg_id_counter,
                             "Runtime.evaluate",
                             json!({
-                                "expression": "window.__codexMcpTraceOn=true; (window.__codexMcpTrace && window.__codexMcpTrace.splice(0)) || []",
+                                // 返 {i: 录制器是否真装上, a: spliced 条目}。i 供 Rust 端确认安装、
+                                // 失败重试(见 drain 响应处理)。顺带把 __codexMcpTraceOn 置回 true 支持 off→on。
+                                "expression": "window.__codexMcpTraceOn=true; ({i: !!window.__codexMcpTraceInit, a: (window.__codexMcpTrace ? window.__codexMcpTrace.splice(0) : [])})",
                                 "returnByValue": true
                             }),
                         );
@@ -1379,6 +1387,29 @@ async fn await_cdp_response(
 
 /// 生成 CDP 消息 JSON,返回 `(序列化后的 text frame, 该消息的 id)`。
 /// 调用方需保留 `id` 用于 `await_cdp_response` 匹配响应。
+/// best-effort 停掉 Codex 页内 MCP recorder(关 `__codexMcpTraceOn` + 清队列)。在 daemon 优雅
+/// 停止(desired=false / Stop 命令 / app 退出走 stop)前、以及诊断 on→off 时调用,避免 daemon 走后
+/// recorder 仍在 Codex 渲染进程继续抓未脱敏流量直到下次 reload。仅 `active`(recorder 启用过)时发;
+/// fire-and-forget,响应在 read 分支按 id 不匹配忽略。
+async fn disable_mcp_recorder_if_active(
+    write: &mut (impl Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    msg_id_counter: &AtomicU64,
+    active: bool,
+) {
+    if !active {
+        return;
+    }
+    let (off_msg, _id) = make_cdp_msg(
+        msg_id_counter,
+        "Runtime.evaluate",
+        json!({
+            "expression": "try{window.__codexMcpTraceOn=false;if(window.__codexMcpTrace)window.__codexMcpTrace.length=0}catch(e){}",
+            "returnByValue": true
+        }),
+    );
+    let _ = write.send(WsMessage::Text(off_msg)).await;
+}
+
 fn make_cdp_msg(counter: &AtomicU64, method: &str, params: serde_json::Value) -> (String, u64) {
     let id = counter.fetch_add(1, Ordering::Relaxed) + 1;
     let json = json!({
