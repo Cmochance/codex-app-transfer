@@ -173,7 +173,11 @@ pub async fn pin_current_handler() -> impl IntoResponse {
     let supports_relay =
         crate::admin::services::desktop::snapshot::active_provider_supports_relay();
     let _ = super::settings::set_real_account_mode_enabled(supports_relay);
-    Json(json!({ "success": true, "message": "已钉住当前真实账号(持久保留)" })).into_response()
+    // [MOC-178 codex P2] 返回 enabled = 是否真开了 relay(supports_relay)。前端 auto-pin 据它决定
+    // 是否清 force CDP 档 —— direct/无 provider 下 pin 只 save 镜像、relay 没开,force 可能是唯一
+    // unlock path,不能因 pin succeed 就清。
+    Json(json!({ "success": true, "enabled": supports_relay, "message": "已钉住当前真实账号(持久保留)" }))
+        .into_response()
 }
 
 /// POST /api/desktop/real-account/forget
