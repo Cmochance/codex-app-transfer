@@ -174,13 +174,16 @@ pub async fn forget_handler(
     if codex_real_account::active_is_real_chatgpt_now() {
         let _ = codex_real_account::deactivate_real_account().await;
     }
-    // [MOC-178 codex P2] 成功判据 = 活动**确实**已非 chatgpt(plugins 真关了),直接看结果而非 sync
-    // 的 success(那个对「活动本就 apikey」会误报)。sync + deactivate 兜底都没切成(IO error:磁盘满 /
-    // 写权限拒)→ 活动仍 chatgpt → success:false 如实暴露,不 swallow(否则 UI 报已关但 plugins 仍 exposed)。
-    // 镜像已删 + flag 已 false(下次启动 ForceDisable 会补切),但本次让用户知道重试 / 重启。
+    // [MOC-178 codex P2] switchedToApikey = 活动**确实**已非 chatgpt(plugins 真关了),直接看结果
+    // 而非 sync 的 success(那个对「活动本就 apikey」会误报)。
     let switched = !codex_real_account::active_is_real_chatgpt_now();
     Json(json!({
-        "success": switched,
+        // [MOC-178 codex P2] success **恒 true**(forget 主操作 = 删镜像 + 关 flag 已成功),api() 不
+        // throw → 前端 partial-failure handling(置 realAccountForgotten/modeEnabled/清 force/refresh)
+        // 照常执行。切 apikey 是否成功由 `switchedToApikey` 单独标志,前端据它 warning 暴露(sync +
+        // deactivate 兜底都失败 = IO error:磁盘满 / 写权限拒 → 活动仍 chatgpt、plugins 未关)。把切
+        // apikey 失败塞进 success:false 会让 api() 抛错、跳过 handling、UI stale —— 故用非 throw envelope。
+        "success": true,
         "removed": removed,
         "switchedToApikey": switched,
         "message": if switched {

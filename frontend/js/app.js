@@ -1632,7 +1632,7 @@
       // force,误调 forget 会**删掉真实账号镜像**(数据丢失);那种情况落到下面 else 只关 force 档。
       if (modeEnabled === true) {
         try {
-          await CCApi.realAccount.forget();
+          const res = await CCApi.realAccount.forget();
           realAccountForgotten = true;
           realAccountModeEnabled = false;
           // [codex P2] 一并清强制 daemon 档:曾 force-enable(autoUnlockCodexPlugins=true)又有
@@ -1644,7 +1644,14 @@
             await saveSettingsFromForm();
             try { await CCApi.pluginUnlock.stop(); } catch (_e) {}
           }
-          showToast(t("realAccount.modeDisabled") || "已关闭真实账号模式(切 apikey,登录态保留)");
+          // [codex P2] 切 apikey 失败(IO error)→ switchedToApikey:false → warning 暴露(同清除按钮),
+          // 不报「已关」误导(活动可能仍 chatgpt、plugins 未关)。主操作(删镜像+关 flag)已成功故
+          // success:true 不 throw、上面 handling 照常执行。
+          if (res && res.switchedToApikey === false) {
+            showToast(t("realAccount.forgetApplyFailed") || "已清除镜像,但切 apikey 失败 —— Plugins 可能未关,请重试或重启 Codex");
+          } else {
+            showToast(t("realAccount.modeDisabled") || "已关闭真实账号模式(切 apikey,登录态保留)");
+          }
           setTimeout(refreshRealAccountStatus, 100);
           setTimeout(refreshPluginUnlockStatus, 300);
         } catch (err) {
