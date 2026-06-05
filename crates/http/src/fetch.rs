@@ -646,16 +646,39 @@ fn has_app_bundle_script(html: &str) -> bool {
     if !lower.contains("<script") {
         return false;
     }
-    // ESM module 声明: 三种引号变体(双 / 单 / 无)。single-quote 由 devin review 补 —— inline
-    // `<script type='module'>` 无 .js/.mjs 时原本漏判。
-    if lower.contains("type=\"module\"")
-        || lower.contains("type='module'")
-        || lower.contains("type=module")
-    {
-        return true;
+    // ESM `type=module` 声明(容忍等号空格 + 引号变体) 或外部 .js/.mjs bundle 引用。
+    has_module_type_attr(&lower) || has_js_bundle_url(&lower)
+}
+
+/// `lower`(已小写)是否有 `type` 属性值 = `module` —— ESM script 声明。容忍**等号周围空格**
+/// (`type = "module"`) + 三种引号(双 / 单 / 无), 对齐 [`id_attr_matches`] 的宽容解析(chatgpt-codex
+/// review 第 3 轮:exact substring 漏 spaced 变体)。`type` 前须非 ident 字符(避免 `mimetype` /
+/// `datatype` 误命中), `module` 后须是引号 / 空白 / `>` / `/`(避免 `module-x` 误命中)。
+fn has_module_type_attr(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("type") {
+        let start = from + pos;
+        from = start + 4;
+        if start > 0 {
+            let p = bytes[start - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' || p == b'-' {
+                continue;
+            }
+        }
+        let rest = lower[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
+        if let Some(after) = rest.strip_prefix("module") {
+            if after.is_empty() || after.starts_with(['"', '\'', ' ', '>', '/', '\t', '\n', '\r']) {
+                return true;
+            }
+        }
     }
-    // 外部 .js/.mjs bundle 引用(含 cache-bust query `app.js?v=1`, chatgpt-codex review)。
-    has_js_bundle_url(&lower)
+    false
 }
 
 /// `lower`(已小写)是否含 `.js`/`.mjs` 后接 URL 结束符的子串 —— 外部 JS bundle 引用。结束符:
@@ -1158,6 +1181,21 @@ mod tests {
                 "<html><body><p>x</p><script>fetch(\"/data.json\")</script></body></html>"
             ),
             ".json 不应误命中 .js bundle"
+        );
+        // chatgpt-codex review 第 3 轮: 等号周围空格 `type = "module"`(对齐 id_attr_matches 容忍)。
+        assert!(
+            is_js_shell(
+                "<html><body><div id=\"q\"></div>\
+                 <script type = \"module\">import {a} from '/a'; a.mount('#q')</script></body></html>"
+            ),
+            "等号空格 type = \"module\" 应判 shell"
+        );
+        // 边界: `mimetype`(type 前是字母)不应误命中 type=module。
+        assert!(
+            !is_js_shell(
+                "<html><body><p>x</p><script>var mimetype=moduleX;</script></body></html>"
+            ),
+            "mimetype 不应误命中 type=module"
         );
         // 已知 trade-off(MOC-183): 静态短页若引外部 `.js`(如 analytics)会被判 shell → auto 升
         // headless。**chatgpt-codex review 后已加兜底**: headless 失败时 web_fetch_auto 回退升级
