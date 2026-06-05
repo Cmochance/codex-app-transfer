@@ -534,17 +534,29 @@ pub async fn forget_imported() -> Result<bool, String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let mirror = imported_mirror_path(&paths);
-    if !mirror.is_file() {
-        return Ok(false);
+    let had_mirror = mirror.is_file();
+    if had_mirror {
+        std::fs::remove_file(&mirror).map_err(|e| format!("删持久镜像失败: {e}"))?;
+        // [MOC-104 导入分流] 镜像删了,导入来源路径记录也一并清(否则 reconcile 还会从旧
+        // 源路径重读、把已"忘记"的账号复活)。
+        write_imported_source_path(&paths, None);
     }
-    std::fs::remove_file(&mirror).map_err(|e| format!("删持久镜像失败: {e}"))?;
-    // [MOC-104 导入分流] 镜像删了,导入来源路径记录也一并清(否则 reconcile 还会从旧
-    // 源路径重读、把已"忘记"的账号复活)。
-    write_imported_source_path(&paths, None);
     // [connector review] 清除账号后不再有可重登的保留账号 → 清掉「需重新登录」标记,
     // 否则 status 仍带 relogin_required=true,UI 继续提示「账号已失效」要重登。
     set_relogin_required(false);
-    Ok(true)
+    // [MOC-178] 清除真实账号 = 停用,连带降级活动 auth.json:活动若仍是真实 chatgpt,先
+    // 备份再删。否则镜像删了但活动还 chatgpt → active_is_real_chatgpt_now() 仍 true →
+    // ① 前端 realActive 派生 toggle 关不掉、账号状态仍「获取成功」(清除按钮却已消失,状态
+    // 不一致) ② 切 provider 仍走 relay(preserve_chatgpt_auth)保留 chatgpt。镜像已删,
+    // reconcile_on_startup 无源可恢复,删了不复活。active_is_real_chatgpt_now 只读、不锁
+    // AUTH_LOCK,无死锁。
+    let active_was_real = active_is_real_chatgpt_now();
+    if active_was_real {
+        let _ = backup_active_auth(&paths, "preforget");
+        std::fs::remove_file(&paths.auth_json)
+            .map_err(|e| format!("删活动 auth.json 失败: {e}"))?;
+    }
+    Ok(had_mirror || active_was_real)
 }
 
 /// [MOC-104 req#5 启动调谐] 启动时(**绝不刷新 token**,见模块级分流说明):① 活动

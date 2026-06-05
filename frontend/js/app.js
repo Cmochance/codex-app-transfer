@@ -1523,9 +1523,12 @@
           runEl.style.color = on ? "var(--ra-ok, #1a8f3c)" : "var(--ra-muted, #999)";
         }
       }
-      // 有长期保留的真实账号 → 显示「清除真实账号」按钮。
+      // [MOC-178] 显示「清除真实账号」按钮:有持久镜像 OR 活动是真实 chatgpt。原来只看
+      // has_imported → 镜像删了但活动还 chatgpt 时按钮消失,用户没法清活动,跟 toggle 仍
+      // ON(realActive 派生)状态不一致。activeReal 时也给按钮,forget 会连带备份+删活动 auth。
       const forgetBtn = $("#realAccountForgetBtn");
-      if (forgetBtn) forgetBtn.style.display = st.has_imported ? "" : "none";
+      const hasRealAccount = st.has_imported || (st.logged_in === true && st.source === "official");
+      if (forgetBtn) forgetBtn.style.display = hasRealAccount ? "" : "none";
       // 新登录开始 → 复位「本次登录已持久」标记,下次成功要重新 pin(替换旧镜像)。
       if (login.state === "running") realAccountLoginPinned = false;
       // 自动持久(单账号工具:登录即选择真实账号模式,无需手动「钉住」):
