@@ -118,36 +118,66 @@ pub async fn web_fetch(
     backend: WebFetchBackend,
     url: &str,
 ) -> Result<WebFetchOutcome, WebFetchError> {
-    let f = match backend {
-        // Auto: curl→wreq→headless 按失败信号自动升级 + per-origin 复用 (MOC-161)。
-        WebFetchBackend::Auto => web_fetch_auto(url).await?,
-        WebFetchBackend::Curl => single_tier(WebFetchBackend::Curl, url).await?,
-        WebFetchBackend::Wreq => single_tier(WebFetchBackend::Wreq, url).await?,
-        // headless 渲染后的 page.content() 恒为完整 HTML 文档 (无 HTTP status)。
-        WebFetchBackend::Headless => Fetched {
-            body: crate::headless::fetch_rendered_html(url).await?,
-            is_html: true,
-            final_tier: WebFetchBackend::Headless,
-            trail: Vec::new(),
-            status: None,
-        },
+    // 客户端重定向跟随 (MOC-139): curl/reqwest 只跟 HTTP 3xx, **不跟 HTML meta refresh / JS
+    // location** —— 这类页 (如绕 Twitter/Substack title-card feud 的跳转页) curl 拿到的是正文
+    // 极少的占位页。占位页 + 解析出重定向 target → 换 URL 重抓 (防循环 + 记 trail)。
+    let mut current = url.to_string();
+    let mut hops: Vec<String> = Vec::new();
+    let f = loop {
+        let f = fetch_by_backend(backend, &current).await?;
+        if f.is_html && hops.len() < MAX_CLIENT_REDIRECTS {
+            let capped = cap_bytes(&f.body, MAX_HTML_INPUT_BYTES);
+            // 仅"正文极少的占位页"才尝试跟随 —— 正常页含 meta refresh/JS 也不动 (避免误跳)。
+            if visible_text_len(&capped) < MIN_EXTRACTED_CHARS {
+                if let Some(target) = detect_client_redirect(&capped, &current) {
+                    // 防自跳 / 简单循环 (A→B→A)。
+                    if target != current && !hops.iter().any(|h| h.ends_with(&target)) {
+                        hops.push(format!("client-redirect → {target}"));
+                        current = target;
+                        continue;
+                    }
+                }
+            }
+        }
+        break f;
     };
+    // 内容按**重定向后的最终 URL** (current) 抽取 —— base url 决定相对链接解析。
     let content = if f.is_html {
         let capped = cap_bytes(&f.body, MAX_HTML_INPUT_BYTES);
         // 先抽正文 (剥 nav/页眉/页脚/侧栏/广告), 抽取不可靠则回退整页 —— 绝不丢内容。
-        match extract_main_content(&capped, url) {
+        match extract_main_content(&capped, &current) {
             Some(main) => html_to_markdown(&main),
             None => html_to_markdown(&capped),
         }
     } else {
         f.body
     };
+    let mut trail = hops;
+    trail.extend(f.trail);
     Ok(WebFetchOutcome {
         content,
         final_tier: f.final_tier,
-        trail: f.trail,
+        trail,
         status: f.status,
     })
+}
+
+/// 按后端抓一次 (不含客户端重定向跟随) —— 供 [`web_fetch`] 的重定向 loop 每跳调用。
+async fn fetch_by_backend(backend: WebFetchBackend, url: &str) -> Result<Fetched, WebFetchError> {
+    match backend {
+        // Auto: curl→wreq→headless 按失败信号自动升级 + per-origin 复用 (MOC-161)。
+        WebFetchBackend::Auto => web_fetch_auto(url).await,
+        WebFetchBackend::Curl => single_tier(WebFetchBackend::Curl, url).await,
+        WebFetchBackend::Wreq => single_tier(WebFetchBackend::Wreq, url).await,
+        // headless 渲染后的 page.content() 恒为完整 HTML 文档 (无 HTTP status)。
+        WebFetchBackend::Headless => Ok(Fetched {
+            body: crate::headless::fetch_rendered_html(url).await?,
+            is_html: true,
+            final_tier: WebFetchBackend::Headless,
+            trail: Vec::new(),
+            status: None,
+        }),
+    }
 }
 
 /// 下载体积上限 (MOC-152): 防误抓大文件把整个 body 读进内存。**靠服务器声明的 `Content-Length`**
@@ -159,6 +189,9 @@ const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 抽取出的正文文本下限 (MOC-152): 低于此视为抽取不可靠 (非文章页 / 误剥) → 回退整页。
 const MIN_EXTRACTED_CHARS: usize = 200;
+
+/// 客户端重定向 (meta refresh / JS location) 最大跟随跳数 (MOC-139, 防循环)。
+const MAX_CLIENT_REDIRECTS: usize = 3;
 
 /// 命中二进制 / 非文本资源 → 返回中文类别名 (用于提示); 文本类返回 `None` (按正常抓取)。
 ///
@@ -820,6 +853,83 @@ fn looks_like_html(body: &str) -> bool {
         || head.starts_with("<body")
 }
 
+/// HTML 客户端重定向 (meta refresh / JS location) 的目标 URL (MOC-139), resolve 为绝对 URL。
+/// curl/reqwest 只跟 HTTP 3xx, 不跟这两类 → 占位页跟随重抓的判据。调用点已 gate "正文极少"。
+fn detect_client_redirect(html: &str, base_url: &str) -> Option<String> {
+    let target = parse_meta_refresh(html).or_else(|| parse_js_location(html))?;
+    resolve_url(&target, base_url)
+}
+
+/// 解析 `<meta http-equiv="refresh" content="0; url=TARGET">` 的 TARGET (大小写/引号/空格容忍)。
+fn parse_meta_refresh(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<meta") {
+        let start = from + rel;
+        let end = lower[start..]
+            .find('>')
+            .map(|e| start + e + 1)
+            .unwrap_or(html.len());
+        from = end;
+        let tag_lower = &lower[start..end];
+        if !(tag_lower.contains("http-equiv") && tag_lower.contains("refresh")) {
+            continue;
+        }
+        // content 里找 url= (大小写在 lower 定位, 取值用原 html 保留大小写)。
+        if let Some(u) = tag_lower.find("url=") {
+            let val = html[start + u + 4..end]
+                .trim_start_matches(['"', '\'', ' '])
+                .split(['"', '\'', '>', ' '])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 解析 JS 跳转 `window.location.replace('T')` / `location.assign('T')` / `location.href='T'`
+/// / `location='T'` 的目标 (取第一个命中)。URL 须以 `http` / `/` 开头 (排除非跳转的 location 读取)。
+fn parse_js_location(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    for pat in [
+        "location.replace(",
+        "location.assign(",
+        "location.href",
+        ".location=",
+    ] {
+        let Some(rel) = lower.find(pat) else {
+            continue;
+        };
+        // pat 后找第一个引号, 取引号内 URL。
+        let after = &html[rel + pat.len()..];
+        let Some(q) = after.find(['"', '\'']) else {
+            continue;
+        };
+        let quote = after.as_bytes()[q] as char;
+        let rest = &after[q + 1..];
+        if let Some(e) = rest.find(quote) {
+            let url = rest[..e].trim();
+            if url.starts_with("http") || url.starts_with('/') {
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 相对 URL → 绝对 (用 `base_url` 解析; 已是绝对则规范化原样返回)。
+fn resolve_url(target: &str, base_url: &str) -> Option<String> {
+    reqwest::Url::parse(base_url)
+        .ok()?
+        .join(target)
+        .ok()
+        .map(|u| u.to_string())
+}
+
 /// HTML→markdown (htmd, Turndown 思路)。剥 script/style/noscript/svg 噪声; 转换失败或
 /// 转出空 (纯 JS 骨架等) → 回退原 HTML, 绝不丢内容。
 fn html_to_markdown(html: &str) -> String {
@@ -841,6 +951,70 @@ fn html_to_markdown(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_meta_refresh_extracts_url() {
+        // meta refresh(lcamtuf 型)
+        let h = "<html><meta http-equiv='refresh' content='0; url=https://sub.example.com/p/x'><body></body></html>";
+        assert_eq!(
+            parse_meta_refresh(h).as_deref(),
+            Some("https://sub.example.com/p/x")
+        );
+        // 大写 + 双引号 + 相对路径
+        let h2 = "<META HTTP-EQUIV=\"Refresh\" CONTENT=\"5; URL=/relative/path\">";
+        assert_eq!(parse_meta_refresh(h2).as_deref(), Some("/relative/path"));
+        // 非 refresh meta → None
+        assert_eq!(parse_meta_refresh("<meta charset='utf-8'><p>hi</p>"), None);
+    }
+
+    #[test]
+    fn parse_js_location_extracts_url() {
+        assert_eq!(
+            parse_js_location("<script>window.location.replace('https://e.com/a')</script>")
+                .as_deref(),
+            Some("https://e.com/a")
+        );
+        assert_eq!(
+            parse_js_location("<script>location.href = \"/path\"</script>").as_deref(),
+            Some("/path")
+        );
+        assert_eq!(
+            parse_js_location("<script>document.location='https://e.com/b'</script>").as_deref(),
+            Some("https://e.com/b")
+        );
+        // 读取 location(无引号 URL)→ None, 不误跳
+        assert_eq!(
+            parse_js_location("<script>var x = location.href;</script>"),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_client_redirect_resolves() {
+        // 相对 URL → 用 base 解析为绝对
+        assert_eq!(
+            detect_client_redirect(
+                "<meta http-equiv='refresh' content='0;url=/p/x'>",
+                "https://lcamtuf.coredump.cx/blog/conway/"
+            )
+            .as_deref(),
+            Some("https://lcamtuf.coredump.cx/p/x")
+        );
+        // 绝对 URL 原样(规范化)
+        assert_eq!(
+            detect_client_redirect(
+                "<meta http-equiv='refresh' content='0;url=https://sub.example.com/p'>",
+                "https://lcamtuf.coredump.cx/blog/"
+            )
+            .as_deref(),
+            Some("https://sub.example.com/p")
+        );
+        // 正常页(无重定向)→ None
+        assert_eq!(
+            detect_client_redirect("<html><body>正常内容</body></html>", "https://e.com"),
+            None
+        );
+    }
 
     #[test]
     fn html_to_markdown_basic_and_skip() {
@@ -1267,5 +1441,29 @@ mod tests {
             !outcome.content.trim().is_empty(),
             "expected non-empty content"
         );
+    }
+
+    /// 端到端真机 (MOC-139): 抓客户端重定向页 (lcamtuf 绕 Substack feud 的 meta refresh + JS
+    /// location 跳转页), 应跟随到 substack 目标拿到真内容。手动 `--ignored live_client_redirect`。
+    #[tokio::test]
+    #[ignore = "real network"]
+    async fn live_client_redirect_follows() {
+        let o = web_fetch(
+            WebFetchBackend::Auto,
+            "https://lcamtuf.coredump.cx/blog/conway/",
+        )
+        .await
+        .expect("应成功");
+        eprintln!("trail={:?}", o.trail);
+        eprintln!(
+            "content len={} 头200={}",
+            o.content.len(),
+            &o.content[..o.content.len().min(200)]
+        );
+        assert!(
+            o.trail.iter().any(|t| t.contains("client-redirect")),
+            "应跟随客户端重定向"
+        );
+        assert!(o.content.len() > 1000, "应拿到 substack 真内容(非占位页)");
     }
 }
