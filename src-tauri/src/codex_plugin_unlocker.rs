@@ -547,15 +547,20 @@ async fn connect_and_monitor(
                             // [MOC-169] MCP-trace drain 响应 → 逐条脱敏后推统一 store
                             if pending_drain_id.is_some() && resp.id == pending_drain_id {
                                 pending_drain_id = None;
-                                if let Some(arr) = resp
-                                    .result
-                                    .as_ref()
-                                    .and_then(|r| r.get("result"))
-                                    .and_then(|r| r.get("value"))
-                                    .and_then(|v| v.as_array())
-                                {
-                                    for entry in arr {
-                                        record_mcp_trace_entry(entry);
+                                // [MOC-169] 处理前**重查 gate**:drain 的 evaluate 在途时用户可能已
+                                // 关诊断,这批 spliced 条目不再 record(与 forward Drop 重查、MCP
+                                // recorder「关即停」一致 —— 关后采集立即停,不留 in-flight 残尾)。
+                                if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() {
+                                    if let Some(arr) = resp
+                                        .result
+                                        .as_ref()
+                                        .and_then(|r| r.get("result"))
+                                        .and_then(|r| r.get("value"))
+                                        .and_then(|v| v.as_array())
+                                    {
+                                        for entry in arr {
+                                            record_mcp_trace_entry(entry);
+                                        }
                                     }
                                 }
                                 continue;
