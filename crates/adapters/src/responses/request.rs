@@ -335,6 +335,15 @@ fn build_messages_from_input(
         messages.push(apply_patch_chat_guidance_message());
     }
 
+    // 联网工具引导(MOC-12 followup):本 turn 注册了 web_fetch/web_search 时,在 Codex 指令之后、
+    // user input 之前注入"联网优先用工具、别 shell curl"引导。真机实测模型对"找数据"类任务
+    // shell-first(单会话 18 次 curl vs 1 次 web_search,即便工具已暴露)→ curl 抓外网被防火墙/反爬
+    // 拦截、白费多轮后退化到可能过时的训练数据。仅 first turn 注入(同 apply_patch turn-gating:
+    // 后续 turn 经 session_cache 已含上轮注入,再注入会 N 份堆积、挤占上下文)。
+    if is_first_turn && tools_register_web_fetch(body) {
+        messages.push(web_tools_guidance_message());
+    }
+
     let current_messages = body
         .get("input")
         .map(input_field_to_messages)
@@ -2676,6 +2685,23 @@ fn apply_patch_chat_path_guidance_for_current_language() -> &'static str {
     }
 }
 
+/// 内置联网工具引导(中文)。真机实测:模型对"找数据/查定价"类任务 shell-first —— 单次会话
+/// 18 次 shell curl vs 1 次 web_search(即便 web_search/web_fetch 已暴露),curl 抓外网被防火墙/
+/// 反爬拦截后白费多轮、退化到可能过时的训练数据。引导模型优先用工具(MOC-12 followup)。
+const WEB_TOOLS_SYSTEM_GUIDANCE_ZH: &str = "联网获取信息时(实时事实 / 价格 / 文档 / 新闻 / 版本号 / 任何你不确定或可能已过时的内容),**优先用 `web_search` 和 `web_fetch` 工具,不要用 shell 的 curl / wget / python 去抓 URL 或搜索引擎**。本机对外网访问受限,shell 直连通常被防火墙 / 反爬拦截(返回空或 403),会白费多轮尝试、最后只能靠可能过时的记忆作答;而这两个工具经 codex-app-transfer 代理(浏览器 TLS 指纹 + headless 渲染)能真正抓到。用法:先 `web_search(query)` 找信息源,再对结果里的 URL 用 `web_fetch(url, 你的问题)` 读正文。";
+
+/// 内置联网工具引导(English)。见 [`WEB_TOOLS_SYSTEM_GUIDANCE_ZH`]。
+const WEB_TOOLS_SYSTEM_GUIDANCE_EN: &str = "When you need information from the web (current facts, prices, docs, news, version numbers — anything you're unsure of or that may be outdated), PREFER the `web_search` and `web_fetch` tools. Do NOT use shell curl / wget / python to fetch URLs or scrape search engines: outbound network here is restricted and direct HTTP is usually blocked by firewalls / anti-bot (empty body or 403), wasting many turns before you fall back to possibly-stale memory. These two tools route through codex-app-transfer's proxy (browser TLS fingerprint + headless rendering) and actually work. Usage: `web_search(query)` to find sources, then `web_fetch(url, your-question)` to read each result's page.";
+
+/// 按当前 user 语言偏好选内置联网工具引导。
+fn web_tools_guidance_for_current_language() -> &'static str {
+    use crate::core::language::{current_language, Language};
+    match current_language() {
+        Language::Chinese => WEB_TOOLS_SYSTEM_GUIDANCE_ZH,
+        Language::English => WEB_TOOLS_SYSTEM_GUIDANCE_EN,
+    }
+}
+
 /// 检测 Responses request body 的 tools 数组是否注册了 `apply_patch` 工具。
 /// `apply_patch` 在 Responses 协议里以 `type:"custom", name:"apply_patch"` 出现,
 /// 在被 [`convert_responses_tool_to_chat_tool`] 降级前。
@@ -2694,5 +2720,46 @@ fn apply_patch_chat_guidance_message() -> Value {
     json!({
         "role": "system",
         "content": apply_patch_chat_path_guidance_for_current_language(),
+    })
+}
+
+/// 本 turn 是否注册了内置联网工具(`web_fetch` / `web_search`,cat-webfetch MCP server 暴露)。
+/// 决定本 turn 是否注入 [`web_tools_guidance_message`] 的产物。
+///
+/// **wire 形态(forward-trace 实证)**:MCP server 工具在入站 Responses body 里是 **namespace
+/// 包裹** —— `{type:"namespace", name:"mcp__cat_webfetch", tools:[{name:"web_fetch"},{name:
+/// "web_search"}]}`(server 名 `cat-webfetch` 的连字符被转成下划线)。本 fn 在 namespace 展平前跑
+/// (见 [`build_messages_from_input`] 读原始 body),故必须**递归进 namespace 内层** tools 匹配;
+/// 顶层 function 形态(非 MCP 的理论情况)也兼容直接匹配。
+///
+/// 已知边界:若用户开了 Codex `exp/resources-to-tool-search`,MCP 工具会 defer 到 input 的
+/// `tool_search_output.tools`、不在 `body.tools[]` —— 此处检测不到(实测默认不开该实验)。
+fn tools_register_web_fetch(body: &Value) -> bool {
+    fn entry_is_web_tool(t: &Value) -> bool {
+        matches!(
+            t.get("name").and_then(Value::as_str),
+            Some("web_fetch") | Some("web_search")
+        )
+    }
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools.iter().any(|t| {
+                if t.get("type").and_then(Value::as_str) == Some("namespace") {
+                    t.get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|inner| inner.iter().any(entry_is_web_tool))
+                } else {
+                    entry_is_web_tool(t)
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn web_tools_guidance_message() -> Value {
+    json!({
+        "role": "system",
+        "content": web_tools_guidance_for_current_language(),
     })
 }

@@ -594,11 +594,12 @@
             <div>
               <div class="segmented webfetch-segment" id="webFetchBackend" role="radiogroup" aria-label="web fetch backend">
                 <button class="btn active" type="button" data-webfetch="off" data-i18n="settings.webFetchBackend.off">关闭</button>
+                <button class="btn" type="button" data-webfetch="auto" data-i18n="settings.webFetchBackend.auto">auto</button>
                 <button class="btn" type="button" data-webfetch="curl">curl</button>
                 <button class="btn" type="button" data-webfetch="wreq">wreq</button>
                 <button class="btn" type="button" data-webfetch="headless">headless</button>
               </div>
-              <p class="settings-note" data-i18n="settings.webFetchBackendHint">transfer 自己抓取网页内容返给模型（独立于上面的 Codex 沙箱联网开关）。curl=reqwest 静态抓取；wreq=浏览器 TLS 指纹绕 Cloudflare；headless=无头 Chrome 跑 JS 抓 JS 渲染 SPA。首次选 headless 会检测系统 Chrome，未安装则提示下载 chrome-headless-shell（~86MB，仅一次，复用，不打包进安装包）。</p>
+              <p class="settings-note" data-i18n="settings.webFetchBackendHint">transfer 自己抓取网页内容返给模型（独立于上面的 Codex 沙箱联网开关）。auto=按页面难度自动 curl→wreq→headless 升级，并记住每站最佳档；curl=reqwest 静态抓取；wreq=浏览器 TLS 指纹绕 Cloudflare；headless=无头 Chrome 跑 JS 抓 JS 渲染 SPA。auto / headless 需系统代理（梯子）连通才能抓墙外站，否则自动降级 wreq；首次选 auto / headless 会检测系统 Chrome，未安装则提示下载 chrome-headless-shell（~86MB，仅一次，复用，不打包进安装包）。</p>
             </div>
           </div>
           <div class="settings-row settings-row-stack">

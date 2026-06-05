@@ -8475,6 +8475,7 @@
     // _webFetchSwitching 作 in-flight guard, 防 20s 下载期间重复点触发并发。
     const _webFetchSeg = $("#webFetchBackend");
     let _webFetchSwitching = false;
+    let _pendingWebFetchBackend = null; // download modal confirm 后要启用的档 (auto/headless, MOC-161)
     const _webFetchSaved = () => _webFetchSeg?.dataset.saved || "off";
     const _setWebFetchActive = (v) =>
       $all("#webFetchBackend .btn").forEach((b) =>
@@ -8504,20 +8505,37 @@
         markWebFetchHintSeen(); // 任何交互即视为已发现, 隐藏「NEW」徽章
         const v = btn.dataset.webfetch;
         if (_webFetchSwitching || v === _webFetchSaved()) return; // 切换中 / 没变 → 忽略
-        if (v !== "headless") {
+        // auto / headless 需真浏览器(Chrome) + 系统代理(梯子); 其余档(off/curl/wreq)直接存档。
+        const _needsBrowser = v === "auto" || v === "headless";
+        if (!_needsBrowser) {
           await _commitWebFetch(v);
           return;
         }
-        // 选 headless: 探测系统 Chrome(加 guard; 先视觉高亮目标)
         _webFetchSwitching = true;
-        _setWebFetchActive("headless");
+        _setWebFetchActive(v);
         let pendingModal = false;
         try {
+          // 系统代理门槛(MOC-161): 配了梯子但连不上 → 抓不到墙外站, 自动降级 wreq + 提示。
+          // 没配 / PAC / 查询失败一律 fail-open(同 systemProxyGateOk: 墙外用户本就不需梯子)。
+          let _sp = null;
+          try {
+            const _r = await CCApi.systemProxy.status();
+            _sp = _r && _r.systemProxy;
+          } catch (_e) {}
+          const _gateOk =
+            !_sp || _sp.kind === "pac" || !_sp.configured || _sp.connected === true;
+          if (!_gateOk) {
+            showToast(t("settings.webFetchAutoNeedsProxy"));
+            await _commitWebFetch("wreq"); // 降级 wreq(内部已设 active + saved)
+            return; // finally reset switching
+          }
+          // Chrome consent(同原 headless 流程, 记住要启用的档 auto/headless)。
           const r = await CCApi.detectSystemChrome();
           if (r.detected) {
-            if (await _commitWebFetch("headless")) showToast(t("settings.headlessChromeSystemFound"));
+            if (await _commitWebFetch(v)) showToast(t("settings.headlessChromeSystemFound"));
           } else {
             pendingModal = true; // 未装 → 弹窗, guard 保持到 confirm/cancel 收尾
+            _pendingWebFetchBackend = v;
             $("#headlessChromeDownloadModal").hidden = false;
           }
         } catch (e) {
@@ -8540,8 +8558,10 @@
         _webFetchSwitching = false;
         return;
       }
-      // 下载成功 → 独立存档(失败由 _commitWebFetch 报"设置保存失败", 不误报"下载失败")
-      if (await _commitWebFetch("headless")) showToast(t("settings.headlessChromeDownloaded"));
+      // 下载成功 → 启用 pending 档(auto/headless)。失败由 _commitWebFetch 报"设置保存失败"。
+      const _bk = _pendingWebFetchBackend || "headless";
+      if (await _commitWebFetch(_bk)) showToast(t("settings.headlessChromeDownloaded"));
+      _pendingWebFetchBackend = null;
       _webFetchSwitching = false;
     });
     // 两个 cancel 触发器(✕ + 文字"取消")都要绑(沿用 real-account modal 的 $all 范式,
@@ -8550,6 +8570,7 @@
       b.addEventListener("click", () => {
         $("#headlessChromeDownloadModal").hidden = true;
         _setWebFetchActive(_webFetchSaved()); // 取消回退到上次保存值
+        _pendingWebFetchBackend = null; // 清待启用档 (review NIT)
         _webFetchSwitching = false;
       })
     );

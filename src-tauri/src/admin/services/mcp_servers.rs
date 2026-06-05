@@ -545,7 +545,7 @@ pub const WEB_FETCH_SERVER_NAME: &str = "cat-webfetch";
 pub fn sync_web_fetch_server(backend: &str) -> Result<(), String> {
     let active = matches!(
         backend.trim().to_ascii_lowercase().as_str(),
-        "curl" | "wreq" | "headless"
+        "auto" | "curl" | "wreq" | "headless"
     );
     // 幂等: 先看现状, 已是目标态就不写(避免无谓重写 config.toml 触发 Codex "modified",
     // MOC-115)。startup re-sync 每次启动都调, 必须幂等。
