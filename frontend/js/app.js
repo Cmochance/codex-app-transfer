@@ -8493,7 +8493,13 @@
     $("#traceViewerEnabled")?.addEventListener("change", async () => {
       const on = $("#traceViewerEnabled")?.checked === true;
       if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !on;
-      await saveSettingsFromForm();
+      // [MOC-169] 存设置失败**不应**阻止下面起/停——尤其关时必须停掉采集(安全语义:用户关了
+      // 就不能继续抓)。save 失败只 log,继续走 start/stop。
+      try {
+        await saveSettingsFromForm();
+      } catch (e) {
+        console.warn("[trace-viewer] save settings failed, proceeding with start/stop", e);
+      }
       // [MOC-169] 快速 on→off 竞争:若 await 期间用户又 toggle 了(当前 checkbox 状态已与本次
       // 捕获的 on 不符),本次是 stale handler → 放弃 start/stop,交给最新那次 change 处理。
       // 否则 stale 的 on handler 可能在 off 之后又 start,留 viewer 开但开关显示关
@@ -8513,7 +8519,11 @@
           // 且 traceViewerEnabled 持久化为 true 导致重启反复重试。
           $("#traceViewerEnabled").checked = false;
           if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = true;
-          await saveSettingsFromForm();
+          try {
+            await saveSettingsFromForm();
+          } catch (_) {
+            /* 回滚持久化失败也不再抛:UI 已复位为 off,后端 start 已清 gate */
+          }
           showToast("诊断查看器启动失败" + (e && e.message ? `:${e.message}` : ""));
         } else {
           showToast("诊断查看器关闭失败");
