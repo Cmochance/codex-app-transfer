@@ -520,6 +520,13 @@ async fn connect_and_monitor(
     let mut mcp_drain_interval = tokio::time::interval(Duration::from_secs(2));
     mcp_drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     mcp_drain_interval.tick().await; // 跳过首次立即触发
+                                     // [MOC-169] 心跳改用**独立 pinned interval**(原是 select! 里每次迭代重建的 sleep(30s))。
+                                     // 否则 2s 的 mcp_drain_interval 每 tick 一次都会让 select! 完成一轮迭代、把重建的 30s sleep
+                                     // 重置回 0 → 心跳永远到不了 30s 被饿死(且诊断关时 drain interval 照 tick)。interval 各自
+                                     // 计时,互不重置(codex-connector:MCP ticks starving plugin heartbeats)。
+    let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
+    heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat_interval.tick().await; // 跳过首次立即触发,首个心跳在 +30s
 
     loop {
         tokio::select! {
@@ -646,7 +653,7 @@ async fn connect_and_monitor(
             //      靠这里 30s 轮询补回 Rust 端的可观察信号。
             //
             // 不在这里 await 响应 —— 见上方"重要不变量"。
-            _ = sleep(Duration::from_secs(30)) => {
+            _ = heartbeat_interval.tick() => {
                 // 上一轮心跳还没回包就丢弃 id 不追了(网络慢 / Codex stutter),
                 // 用新 id 重发。旧响应到达时不匹配 pending_heartbeat_id 会被忽略。
                 let (ping, ping_id) = make_cdp_msg(
