@@ -387,75 +387,49 @@ pub fn redact_mcp_value(v: &mut Value) {
                 obj.insert(key.to_string(), Value::String(scrubbed));
             }
         }
-        // ④ URL query 里的 credential(OAuth callback ?code=/?access_token=、Google ?key= 等)
+        // ④ URL 的 credential(query ?code=/?access_token=、Google ?key=、OAuth implicit #access_token=、
+        //    SPA hash-route #/cb?code= 等),含 fragment 与嵌套 query
         if let Some(Value::String(u)) = obj.get("url") {
-            let red = redact_url_query(u);
-            if red != *u {
+            let (red, changed) = redact_credential_params(u);
+            if changed {
                 obj.insert("url".to_string(), Value::String(red));
             }
         }
     }
 }
 
-/// 脱敏 URL **query 和 fragment** 里的 credential 参数值
-/// (`?code=…&access_token=…` / OAuth implicit 的 `#access_token=…&token_type=…` → `…=***`)。
-/// 只动 query/fragment、保留 path/host;判定见 [`is_credential_query_param`]。
-fn redact_url_query(url: &str) -> String {
-    // 拆 `path?query#fragment`:fragment 在最后(OAuth implicit 把 token 放这里)。
-    let (before_frag, frag) = match url.split_once('#') {
-        Some((b, f)) => (b, Some(f)),
-        None => (url, None),
-    };
-    let (path, query) = match before_frag.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (before_frag, None),
-    };
+/// 把 `k=v` 串里 credential 键的值清洗成 `***`,用于 URL(query/fragment)与 form-urlencoded
+/// body。按 `?` / `&` / `#` **统一切段**(保留分隔符),故能处理 `path?query#fragment`、SPA
+/// hash-route `#/route?access_token=…`(fragment 里还有嵌套 `?query`)、`#access_token=…`(OAuth
+/// implicit)、form body `k=v&k=v` 等各种嵌套;非 `k=v` 段(scheme/host/path)原样保留。
+/// 值里的 `=`(如 base64 padding)不切,不破坏 value。返回(脱敏后串, 是否有改动)。
+/// 判定见 [`is_credential_query_param`]。
+fn redact_credential_params(s: &str) -> (String, bool) {
+    let mut out = String::with_capacity(s.len());
     let mut changed = false;
-    let mut q_out = None;
-    if let Some(q) = query {
-        let (red, c) = redact_kv_params(q);
-        changed |= c;
-        q_out = Some(red);
+    let mut seg_start = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'?' || b == b'&' || b == b'#' {
+            push_redacted_param(&s[seg_start..i], &mut out, &mut changed);
+            out.push(b as char);
+            seg_start = i + 1;
+        }
     }
-    let mut f_out = None;
-    if let Some(f) = frag {
-        let (red, c) = redact_kv_params(f);
-        changed |= c;
-        f_out = Some(red);
-    }
-    if !changed {
-        return url.to_owned();
-    }
-    let mut out = path.to_owned();
-    if let Some(q) = q_out {
-        out.push('?');
-        out.push_str(&q);
-    }
-    if let Some(f) = f_out {
-        out.push('#');
-        out.push_str(&f);
-    }
-    out
+    push_redacted_param(&s[seg_start..], &mut out, &mut changed);
+    (out, changed)
 }
 
-/// 对 `k=v&k=v` 串逐对清洗 credential 键的值(URL query/fragment 与 form-urlencoded body 共用)。
-/// 返回(脱敏后串, 是否有改动)。
-fn redact_kv_params(s: &str) -> (String, bool) {
-    let mut changed = false;
-    let out = s
-        .split('&')
-        .map(|pair| {
-            let name = pair.split('=').next().unwrap_or("");
-            if pair.contains('=') && is_credential_query_param(name) {
-                changed = true;
-                format!("{name}=***")
-            } else {
-                pair.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&");
-    (out, changed)
+/// 一个 `?`/`&`/`#`-分隔段:若是 `name=value` 且 name 是 credential → `name=***`,否则原样。
+fn push_redacted_param(seg: &str, out: &mut String, changed: &mut bool) {
+    if let Some((k, _v)) = seg.split_once('=') {
+        if is_credential_query_param(k) {
+            out.push_str(k);
+            out.push_str("=***");
+            *changed = true;
+            return;
+        }
+    }
+    out.push_str(seg);
 }
 
 /// URL query 参数名是否承载 credential。比 [`is_credential_key`] 多覆盖 URL 特有的 OAuth /
@@ -497,9 +471,9 @@ fn redact_body_string(s: &str) -> Option<String> {
     }
     let trimmed = s.trim_start();
     // ② form-urlencoded:含 `=`、不以 `{`/`[` 开头(排除残缺 JSON)。即便被截断也能逐对清洗。
-    // 复用 redact_kv_params(同 URL query/fragment),覆盖 code/code_verifier/client_secret 等。
+    // 复用 redact_credential_params(同 URL),覆盖 code/code_verifier/client_secret 等。
     if s.contains('=') && !trimmed.starts_with('{') && !trimmed.starts_with('[') {
-        let (out, touched) = redact_kv_params(s);
+        let (out, touched) = redact_credential_params(s);
         if touched {
             return Some(out);
         }
@@ -709,6 +683,15 @@ mod tests {
         );
         assert!(u3.contains("state=ok"), "query 段保留");
         assert!(u3.contains('#'), "fragment 分隔符保留");
+
+        // SPA hash-route:fragment 里还有嵌套 ?query(#/callback?code=…&access_token=…)
+        let mut v4 = json!({"kind":"fetch","url":"https://app/#/oauth/callback?code=HASH-LEAK&access_token=HA-LEAK&tab=1"});
+        redact_mcp_value(&mut v4);
+        let u4 = v4["url"].as_str().unwrap();
+        assert!(!u4.contains("HASH-LEAK"), "hash-route code 泄露: {u4}");
+        assert!(!u4.contains("HA-LEAK"), "hash-route access_token 泄露");
+        assert!(u4.contains("/oauth/callback"), "hash-route path 保留");
+        assert!(u4.contains("tab=1"), "非 credential 参数保留");
     }
 
     #[test]
