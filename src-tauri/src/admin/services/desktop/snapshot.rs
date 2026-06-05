@@ -459,7 +459,16 @@ async fn sync_desktop_for_active_provider_impl(state: &AdminState, force_apikey:
         match start_proxy_if_needed(&state.proxy_manager, target.proxy_port).await {
             Ok(started) => proxy_started = started,
             Err(e) => {
-                return json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "message": e});
+                // [MOC-178 codex P2] 清除真实账号(force_apikey)只需切 auth_mode=apikey、不依赖
+                // proxy。proxy 起不来(端口冲突等)时,正常 apply 仍 return 失败;但 force_apikey
+                // 必须继续走到 auth rewrite —— 否则 flag 已置 false、镜像已删,活动却留 chatgpt,
+                // UI 显示 off 但 Codex 还显示 plugins(状态不一致)。故 force_apikey 下只 warn、继续。
+                if !force_apikey {
+                    return json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "message": e});
+                }
+                tracing::warn!(
+                    "[MOC-178] 清除真实账号:proxy 起不来({e}),仍继续切 apikey(auth rewrite 优先)"
+                );
             }
         }
     } else {
