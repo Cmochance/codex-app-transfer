@@ -1620,9 +1620,11 @@
         showRealAccountGateModal(!st.logged_in, !proxyConnected);
       }
     } else {
-      // [MOC-178] 关真实账号模式:有真实账号(flag 开 / 有 token)→ forget(切 apikey + 持久
-      // flag=false、**保留 tokens**)。不再「relay 关不掉弹回 ON」——持久 flag 关得掉、重启不复活。
-      if (modeEnabled === true || st.logged_in) {
+      // [MOC-178] 关真实账号模式:**仅当 flag 真开**(modeEnabled===true)才 forget(切 apikey + 持久
+      // flag=false、保留 tokens)。[codex P2] 不能用 st.logged_in —— modeEnabled=false 但有账号 +
+      // forceUnlockPersisted=true 时 checkbox on 只因 force CDP(on=modeOn||force),toggle off 是想关
+      // force,误调 forget 会**删掉真实账号镜像**(数据丢失);那种情况落到下面 else 只关 force 档。
+      if (modeEnabled === true) {
         try {
           await CCApi.realAccount.forget();
           realAccountForgotten = true;
