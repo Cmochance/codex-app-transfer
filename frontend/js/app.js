@@ -3531,14 +3531,15 @@
           }
           const result = await CCApi.fetchProviderModelsPayload(payload);
           providerAvailableModels = Array.isArray(result.models) ? result.models.slice() : [];
-          // **不覆盖 user 已有 mappings,只刷新下拉选项**(2026-05-11 修):
-          // 原 `setProviderMappings(result.suggested, ...)` 会用 suggested 整覆盖
-          // (suggested 后端只填 default,其他 slot 是空串)→ user 自己设的
-          // gpt_5_5 / gpt_5_4 等被清空。期望行为:获取模型只更新下拉可选项,
-          // 不清 user 已有映射(default 留空时才允许 suggested.default 填进去)
+          // **不覆盖 user 已有 mappings,只刷新下拉选项**:获取模型只更新下拉可选项,
+          // 不清 user 已列的模型。[MOC-154] 列表式下"默认"= 列表第 1 个 = gpt_5_5 槽
+          // (default 不再是独立 slot key,在 providerFormMappings 里永远 undefined),
+          // 故 guard 改判 gpt_5_5 —— 仅当用户还没配第 1 个模型(gpt_5_5 空)时才用后端
+          // suggestedDefault 填进去,否则不动用户列表(原 `!providerFormMappings.default`
+          // 列表式下永真 → 无条件覆盖 + 重排用户列表,devin review 发现)。
           const suggestedDefault = (result.suggested && result.suggested.default) || "";
-          if (suggestedDefault && !providerFormMappings.default) {
-            providerFormMappings.default = suggestedDefault;
+          if (suggestedDefault && !providerFormMappings.gpt_5_5) {
+            providerFormMappings.gpt_5_5 = suggestedDefault;
           }
           setProviderMappings(providerFormMappings, { availableModels: providerAvailableModels });
           if (resultEl) resultEl.textContent = t("models.fetchSuccess");
