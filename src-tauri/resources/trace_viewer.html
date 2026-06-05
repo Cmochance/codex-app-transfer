@@ -36,6 +36,7 @@
   .row .badge { font-size: 10px; padding: 1px 5px; border-radius: 4px; flex: none; text-transform: uppercase; }
   .badge.forward { background: #14304d; color: var(--accent); }
   .badge.mcp { background: #3a2a14; color: var(--warn); }
+  .badge.cat_webfetch { background: #14402a; color: var(--ok); }
   .row .summary { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); }
   .row .status { flex: none; font: 11px var(--mono); }
   .st2 { color: var(--ok); } .st4, .st5 { color: var(--err); }
@@ -67,6 +68,7 @@
       <option value="all">全部</option>
       <option value="forward">forward</option>
       <option value="mcp">mcp</option>
+      <option value="cat_webfetch">cat-webfetch</option>
     </select>
     <input id="q" type="search" placeholder="搜 path / provider / url…" />
     <button id="clear">清空</button>
@@ -86,16 +88,33 @@
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-  function kindOf(t) { return t && t.trace_kind === "forward_protocol" ? "forward" : "mcp"; }
+  function kindOf(t) {
+    if (!t) return "mcp";
+    if (t.trace_kind === "forward_protocol") return "forward";
+    if (t.trace_kind === "cat_webfetch") return "cat_webfetch";
+    return "mcp";
+  }
 
   function summaryOf(t) {
-    if (kindOf(t) === "forward") {
+    const k = kindOf(t);
+    if (k === "forward") {
       const ib = t.inbound || {};
       return `${esc(ib.method || "")} ${esc(ib.client_path || "")}`;
     }
+    if (k === "cat_webfetch") {
+      const r = t.request || {};
+      return `${esc(t.tool || "")} ${esc(r.url || r.query || "")}`;
+    }
     return `${esc((t.event || "mcp"))} ${esc(t.url || "")}`;
   }
-  function statusOf(t) { return (t.response && t.response.status) || t.status || ""; }
+  function statusOf(t) {
+    if (kindOf(t) === "cat_webfetch") {
+      const f = t.fetch || {}, r = t.result || {};
+      if (f.status != null) return f.status;
+      return r.is_error ? "err" : "ok";
+    }
+    return (t.response && t.response.status) || t.status || "";
+  }
 
   function matches(t) {
     const k = $("#kind").value;
@@ -147,7 +166,9 @@
 
   function renderDetail(t) {
     if (!t) { detailEl.innerHTML = "<div class='empty'>选择左侧一条记录查看详情</div>"; return; }
-    if (kindOf(t) !== "forward") {
+    const k = kindOf(t);
+    if (k === "cat_webfetch") { renderCatWebfetch(t); return; }
+    if (k !== "forward") {
       detailEl.innerHTML = `<pre class="payload">${esc(JSON.stringify(t, null, 2))}</pre>`;
       return;
     }
@@ -159,6 +180,38 @@
           hdrTable(ib.headers) + bodyBlock(ib.body))
       + seg("OUTBOUND · 转换后发上游", esc(ob.url || ""), hdrTable(ob.headers) + bodyBlock(ob.body))
       + seg("RESPONSE · 上游回包 (raw)", "status " + esc(rs.status), hdrTable(rs.headers) + bodyBlock(rs.body));
+  }
+
+  // MOC-181: cat-webfetch 链路详情(请求 / 抓取+升级链 / 摘要 prompt+响应 / 结果)。
+  function renderCatWebfetch(t) {
+    const r = t.request || {}, f = t.fetch || {}, s = t.summarize || {}, res = t.result || {};
+    let html = `<div class="meta">tool: ${esc(t.tool)} · seq ${esc(t.seq)} · ${esc(t.captured_at)}</div>`;
+    html += seg("请求 · request", esc(t.tool || ""), hdrTable(r));
+    if (f && Object.keys(f).length) {
+      const fcopy = Object.assign({}, f); delete fcopy.escalation_trail;
+      let inner = hdrTable(fcopy);
+      if (Array.isArray(f.escalation_trail) && f.escalation_trail.length) {
+        inner += `<div class="meta">升级历程 escalation_trail:</div>`
+          + `<pre class="payload">${esc(f.escalation_trail.join("\n"))}</pre>`;
+      }
+      html += seg("抓取 · fetch", esc(f.final_tier || f.backend || ""), inner);
+    }
+    if (s && Object.keys(s).length) {
+      if (s.fallback_raw) {
+        html += seg("摘要 · fallback(回退原文)", "未生成",
+          `<pre class="payload">摘要未生成: ${esc(s.error || "")}</pre>`);
+      } else {
+        const scopy = Object.assign({}, s); delete scopy.prompt_sent; delete scopy.response;
+        const inner = hdrTable(scopy)
+          + `<div class="meta">prompt_sent(完整喂给摘要模型):</div>`
+          + `<pre class="payload">${esc(s.prompt_sent || "")}</pre>`
+          + `<div class="meta">response(摘要模型原始回复):</div>`
+          + `<pre class="payload">${esc(s.response || "")}</pre>`;
+        html += seg("摘要 · summarize", esc(s.model || ""), inner);
+      }
+    }
+    html += seg("结果 · result", res.is_error ? "ERROR" : "ok", hdrTable(res));
+    detailEl.innerHTML = html;
   }
 
   function add(t, prepend) {

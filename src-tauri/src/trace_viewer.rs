@@ -1,4 +1,4 @@
-//! 诊断流量查看器服务(MOC-169 增量 2)。
+//! 诊断流量查看器服务(MOC-169 / MOC-181)。
 //!
 //! 把 [`codex_app_transfer_proxy::trace_store`] 的记录在一个**独立本地端口**
 //! (默认 `127.0.0.1:18090`)以网页 + SSE 实时展示。**为什么独立端口**:admin 走 Tauri
@@ -8,19 +8,37 @@
 //! 结构**照搬** [`crate::proxy_runner::ProxyManager`]:独立 `std::thread` + 独立
 //! `tokio::runtime::Runtime`,stop 时 `shutdown_background()` 一键 abort。无鉴权
 //! (loopback + 只读 + store 内已脱敏)。**默认关**:仅在 `CAS_DIAG_TRACE` 开 / app 内
-//! 「诊断模式」开关(后续增量)时才 start。
+//! 「诊断模式」开关时才 start。
+//!
+//! ## 路由一览
+//! - `GET  /`                  — viewer 单页 HTML(inline CSS/JS,无外部依赖)
+//! - `GET  /api/traces?kind=`  — 历史快照(`kind=forward/mcp/cat_webfetch/all`,缺省全部)
+//! - `GET  /api/stream`        — SSE 实时流(所有类别)
+//! - `POST /api/clear`         — 清空 ring
+//! - `POST /api/ingest`        — **MOC-181**:cat-webfetch 子进程反向上报内部链路;只接受
+//!   `trace_kind=cat_webfetch`,viewer 统一分配全局 seq 后 push 进 store(子进程是独立
+//!   stdio 进程,跨进程拿不到主 app 的 store,故经此 HTTP 端点上报)。
+//!
+//! ## viewer 分页
+//! - **forward** — Codex 请求 → adapter → 上游回包(协议转换诊断)
+//! - **mcp**     — Codex Desktop MCP / OAuth 流量(依赖插件解锁器 daemon)
+//! - **cat-webfetch** — 内置 web_fetch / web_search 每次调用的完整链路(MOC-181):
+//!   请求参数 / 抓取后端 + 升级链 + HTTP status / 大页选块统计 /
+//!   摘要 prompt + 模型响应 + 延迟 / 返回字符数。供 `GET /api/traces?kind=cat_webfetch`
+//!   机读(AI 调试分析)或页面实时查看。
 
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::sync::Mutex;
 
+use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use codex_app_transfer_proxy::diagnostics::set_forward_trace_enabled;
-use codex_app_transfer_proxy::trace_store;
+use codex_app_transfer_proxy::{trace_store, TraceKind};
 use futures::Stream;
 use futures::StreamExt;
 use serde_json::Value;
@@ -147,6 +165,8 @@ fn viewer_router() -> Router {
         .route("/api/traces", get(api_traces))
         .route("/api/stream", get(api_stream))
         .route("/api/clear", post(api_clear))
+        // MOC-181: cat-webfetch 子进程反向上报内部链路(跨进程无法直接 push 本进程 store)。
+        .route("/api/ingest", post(api_ingest))
 }
 
 /// 单页 viewer(零外部依赖,inline CSS/JS,编进二进制)。
@@ -154,10 +174,38 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../resources/trace_viewer.html"))
 }
 
-/// 历史快照:ring 里最近 [`TRACES_HISTORY_LIMIT`] 条(已脱敏的 value 数组)。
-async fn api_traces() -> Json<Vec<Value>> {
+/// `GET /api/traces` 查询参数。`kind=cat_webfetch`(或 forward / mcp)只返该类;缺省 / `all` 返全部。
+#[derive(serde::Deserialize)]
+struct TracesQuery {
+    kind: Option<String>,
+}
+
+/// `TraceKind` → viewer `?kind=` / select 用的字符串。**不用 `value.trace_kind`**:forward 的
+/// trace_kind 是 `"forward_protocol"`(与 select 值 `"forward"` 不一致), 故按类型化的 enum 判别。
+fn kind_str(k: TraceKind) -> &'static str {
+    match k {
+        TraceKind::Forward => "forward",
+        TraceKind::Mcp => "mcp",
+        TraceKind::CatWebfetch => "cat_webfetch",
+    }
+}
+
+/// 历史快照:ring 里最近 [`TRACES_HISTORY_LIMIT`] 条(已脱敏的 value 数组)。`?kind=` 按类型化的
+/// [`TraceKind`] 过滤 —— 供 viewer 分页 / AI 只拉某类(如 `?kind=cat_webfetch` 取 cat-webfetch
+/// 链路做调试分析)。
+async fn api_traces(Query(q): Query<TracesQuery>) -> Json<Vec<Value>> {
     let entries = trace_store().recent(TRACES_HISTORY_LIMIT);
-    Json(entries.iter().map(|e| e.value.clone()).collect())
+    let want = q.kind.as_deref().filter(|k| !k.is_empty() && *k != "all");
+    Json(
+        entries
+            .iter()
+            .filter(|e| match want {
+                Some(k) => kind_str(e.kind) == k,
+                None => true,
+            })
+            .map(|e| e.value.clone())
+            .collect(),
+    )
 }
 
 /// 实时流(SSE)。订阅 store 的 broadcast;每条记录发一个默认 message(data=已脱敏 value
@@ -185,51 +233,114 @@ async fn api_clear() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// MOC-181: cat-webfetch 子进程反向上报内部链路。子进程是独立 stdio 进程,跨进程拿不到主 app 的
+/// `trace_store()` / `next_seq()`,故把结构化 value(无 seq)POST 到此,由 viewer 统一分配全局 seq
+/// 后 push(与 forward / mcp 共用单调 seq,viewer 按 seq 做行主键)。**只收 `trace_kind=cat_webfetch`**
+/// (防别的本地进程灌噪声);loopback only(viewer 已 bind 127.0.0.1);body 超限由 axum 默认上限兜底。
+async fn api_ingest(Json(mut value): Json<Value>) -> StatusCode {
+    if value.get("trace_kind").and_then(|v| v.as_str()) != Some("cat_webfetch") {
+        return StatusCode::BAD_REQUEST;
+    }
+    let seq = trace_store::next_seq();
+    if let Value::Object(map) = &mut value {
+        map.insert("seq".to_owned(), Value::from(seq));
+    }
+    trace_store().push(TraceKind::CatWebfetch, seq, value);
+    StatusCode::NO_CONTENT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use codex_app_transfer_proxy::{trace_store, TraceKind};
     use serde_json::json;
 
+    /// MOC-169 + MOC-181: viewer 端到端 —— 历史 / ingest(cat-webfetch 子进程上报) / ?kind 过滤 / clear。
+    /// **合并为单测**:全局 `trace_store` 进程共享, 拆成多个并发 test 会因 `clear` 互相清数据而 flaky。
     #[tokio::test]
-    async fn viewer_serves_history_html_and_clear() {
+    async fn viewer_history_ingest_filter_and_clear() {
         let manager = TraceViewerManager::new();
         let addr = manager.start(0).expect("viewer start");
-
-        // 推一条带唯一标记的记录进全局 store(进程共享,故用标记搜索而非断言总数)。
-        let marker = "moc169-viewer-test-marker-7x";
-        trace_store().push(
-            TraceKind::Forward,
-            999_001,
-            json!({"trace_kind": "forward_protocol", "seq": 999_001, "marker": marker}),
-        );
-
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
         let base = format!("http://{addr}");
 
-        // GET / → HTML 外壳
+        // ── 历史(MOC-169): 推一条 forward 记录;GET / 返 HTML 外壳、GET /api/traces 能查到。
+        let fwd_marker = "moc169-viewer-test-marker-7x";
+        trace_store().push(
+            TraceKind::Forward,
+            999_001,
+            json!({"trace_kind": "forward_protocol", "seq": 999_001, "marker": fwd_marker}),
+        );
         let html = client.get(&base).send().await.unwrap();
         assert_eq!(html.status().as_u16(), 200);
         let body = html.text().await.unwrap();
         assert!(body.contains("<!doctype html") || body.contains("<!DOCTYPE html"));
-
-        // GET /api/traces → 能找到刚推的标记记录
-        let traces = client
+        let arr: Vec<Value> = client
             .get(format!("{base}/api/traces"))
             .send()
             .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
-        assert_eq!(traces.status().as_u16(), 200);
-        let arr: Vec<Value> = traces.json().await.unwrap();
         assert!(
-            arr.iter().any(|v| v["marker"] == marker),
-            "标记记录应出现在 /api/traces"
+            arr.iter().any(|v| v["marker"] == fwd_marker),
+            "forward 标记记录应出现在 /api/traces"
         );
 
-        // POST /api/clear → 204,之后 ring 空(标记记录不再出现)
+        // ── ingest(MOC-181): cat-webfetch 子进程 POST 一条(无 seq, viewer 自分配);非 cat_webfetch 被拒。
+        let cat_marker = "moc181-ingest-marker-9z";
+        let ok = client
+            .post(format!("{base}/api/ingest"))
+            .json(&json!({"trace_kind": "cat_webfetch", "tool": "web_fetch", "marker": cat_marker}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status().as_u16(), 204);
+        let bad = client
+            .post(format!("{base}/api/ingest"))
+            .json(&json!({"trace_kind": "forward_protocol"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400, "ingest 只收 cat_webfetch");
+
+        // ── ?kind 过滤(MOC-181): cat_webfetch 含刚 ingest 的(带 viewer 分配 seq)且只含该类;forward 含 fwd、不含 cat。
+        let cat: Vec<Value> = client
+            .get(format!("{base}/api/traces?kind=cat_webfetch"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let found = cat
+            .iter()
+            .find(|v| v["marker"] == cat_marker)
+            .expect("ingest 的条目应出现在 ?kind=cat_webfetch");
+        assert!(found["seq"].is_number(), "viewer 应给 ingest 条目分配 seq");
+        assert!(
+            cat.iter().all(|v| v["trace_kind"] == "cat_webfetch"),
+            "?kind=cat_webfetch 应只返 cat_webfetch"
+        );
+        let fwd: Vec<Value> = client
+            .get(format!("{base}/api/traces?kind=forward"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            fwd.iter().any(|v| v["marker"] == fwd_marker)
+                && !fwd.iter().any(|v| v["marker"] == cat_marker),
+            "?kind=forward 应含 forward、不含 cat_webfetch"
+        );
+
+        // ── clear(MOC-169): 清空 ring 后两条标记都消失。
         let cleared = client
             .post(format!("{base}/api/clear"))
             .send()
@@ -245,7 +356,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !after.iter().any(|v| v["marker"] == marker),
+            !after
+                .iter()
+                .any(|v| v["marker"] == fwd_marker || v["marker"] == cat_marker),
             "clear 后标记记录应消失"
         );
 

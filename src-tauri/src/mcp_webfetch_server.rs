@@ -17,12 +17,20 @@
 //! 后端档位(curl/wreq/headless)每次 `tools/call` 时读 `~/.codex-app-transfer/config.json`
 //! 的 `settings.webFetchBackend`(改档无需重启 Codex);`off` → isError 提示(正常此时
 //! 工具不该被注册, 防御性兜底)。
+//!
+//! ## cat-webfetch 诊断埋点 (MOC-181)
+//! `CAS_DIAG_TRACE=1` 或 config `settings.traceViewerEnabled=true` 时, 每次
+//! `tools/call` 完成后把结构化链路条目(请求参数 / 抓取档+升级链+status / 摘要 prompt+
+//! 响应+延迟 / 返回字符数)POST 到主 app 的 `POST /api/ingest`(127.0.0.1:18090)。
+//! 主 app 为其分配全局 seq 后 push 进 trace_store, 诊断查看器 cat-webfetch 分页实时可见。
+//! 诊断关时各路径不构造条目、不上报 —— 仅多一次 config 读判 gate(与 current_backend 同款、
+//! 非热路径), 不影响正常工具响应。
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use codex_app_transfer_http::WebFetchBackend;
+use codex_app_transfer_http::{WebFetchBackend, WebFetchOutcome};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
@@ -43,6 +51,9 @@ const MAX_CONCURRENT_FETCHES: usize = 4;
 const SUMMARY_INPUT_CHARS: usize = 60_000;
 /// 调总结模型的超时。略宽于一般补全(慢 provider / 长正文)。
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
+/// 诊断条目上报端口 (MOC-181): viewer ingest, 与 `trace_viewer::DEFAULT_TRACE_VIEWER_PORT` 一致。
+/// cat-webfetch 子进程跨进程拿不到主 app 的 trace store, 经此端口 HTTP 反向上报内部链路。
+const DIAG_INGEST_PORT: u16 = 18090;
 
 /// 入口: 读 stdin 逐行 JSON-RPC, 派发到 tokio runtime, 经单写线程串行写 stdout。
 ///
@@ -297,42 +308,88 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
             )
         }
     };
-    match codex_app_transfer_http::web_fetch(backend, &url).await {
+    let diag = diag_enabled();
+    let captured_at = now_iso();
+    let fetched = codex_app_transfer_http::web_fetch(backend, &url).await;
+
+    // 诊断三段 (diag 关时保持 Null、不构造)。
+    let mut fetch_v = Value::Null;
+    let mut summarize_v = Value::Null;
+    let mut result_v = Value::Null;
+
+    let resp = match fetched {
         // 2xx 但空 body: 不静默当成功(模型会以为抓到了空页), 给明确可操作提示。MOC-145:
         // web_fetch 对合法空响应(如 204)返 Ok(""), 区分"空"与"抓取失败"的语义落在这里。
-        Ok(body) if body.trim().is_empty() => tool_ok(
-            id,
-            &format!(
-                "(请求成功但响应体为空 — 常见于需 JS 渲染的前端页 / 反爬拦截 / 重定向丢内容。\
-                 当前后端: {}。{} 也请确认 URL 是否正确。)",
-                backend.as_str(),
-                if backend.may_use_headless() {
-                    // auto/headless 已(会)跑 headless 渲染, 别再让切 headless —— 空多半是页面真空 /
-                    // 需登录 / 被反爬, 应换更具体 URL 或确认目标 (devin review)。
-                    "该档已用真浏览器渲染, 空多半是页面本身无内容 / 需登录 / 被反爬, 换更具体的 URL 再试;"
-                } else {
-                    "若内容靠 JS 渲染, 可把内置联网抓取工具切到 auto / headless 档后重试;"
-                }
-            ),
-        ),
+        Ok(outcome) if outcome.content.trim().is_empty() => {
+            if diag {
+                fetch_v = fetch_value(backend, &outcome);
+                result_v = json!({ "returned_chars": 0, "is_error": false, "empty": true });
+            }
+            tool_ok(id, &empty_body_msg(backend))
+        }
         // 抓到正文 → 用总结模型针对 prompt 摘要; 摘要失败(未配/proxy 未起/模型报错/格式不支持)
         // → 回退返回抓取的原文(绝不丢内容), 并注明摘要未生成。
-        Ok(body) => match summarize(&body, &prompt).await {
-            Ok(summary) => tool_ok(id, &truncate(&summary, MAX_CONTENT_CHARS)),
-            Err(e) => {
-                eprintln!("[cat-webfetch] 网页摘要未生成, 回退原文: {e}");
-                // 醒目 + 注明"非摘要" + actionable:回退原文(isError=false)只靠这段前缀区分,
-                // 否则模型可能把整页原文当成摘要直接采纳(silent-failure-hunter F3)。
-                let note = format!(
-                    "⚠️ 网页摘要未生成({e})—— 以下是抓取到的**网页正文原文(非摘要, 请勿直接当作答案)**。\
-                     若反复如此, 请检查该 provider 的「网页摘要模型」/ apiFormat(仅 openai_chat 支持)/ \
-                     本地代理是否在线。\n\n"
-                );
-                tool_ok(id, &truncate(&format!("{note}{body}"), MAX_CONTENT_CHARS))
+        Ok(outcome) => {
+            if diag {
+                fetch_v = fetch_value(backend, &outcome);
             }
-        },
-        Err(e) => tool_error(id, &format!("抓取失败(后端 {}): {e}", backend.as_str())),
+            match summarize(&outcome.content, &prompt).await {
+                Ok(so) => {
+                    let returned = truncate(&so.summary, MAX_CONTENT_CHARS);
+                    if diag {
+                        summarize_v = summarize_value(&so);
+                        result_v = json!({
+                            "returned_chars": returned.chars().count(),
+                            "is_error": false,
+                        });
+                    }
+                    tool_ok(id, &returned)
+                }
+                Err(e) => {
+                    eprintln!("[cat-webfetch] 网页摘要未生成, 回退原文: {e}");
+                    // 醒目 + 注明"非摘要" + actionable:回退原文(isError=false)只靠这段前缀区分,
+                    // 否则模型可能把整页原文当成摘要直接采纳(silent-failure-hunter F3)。
+                    let note = format!(
+                        "⚠️ 网页摘要未生成({e})—— 以下是抓取到的**网页正文原文(非摘要, 请勿直接当作答案)**。\
+                         若反复如此, 请检查该 provider 的「网页摘要模型」/ apiFormat(仅 openai_chat 支持)/ \
+                         本地代理是否在线。\n\n"
+                    );
+                    let returned =
+                        truncate(&format!("{note}{}", outcome.content), MAX_CONTENT_CHARS);
+                    if diag {
+                        summarize_v = json!({ "fallback_raw": true, "error": e });
+                        result_v = json!({
+                            "returned_chars": returned.chars().count(),
+                            "is_error": false,
+                            "fallback_raw": true,
+                        });
+                    }
+                    tool_ok(id, &returned)
+                }
+            }
+        }
+        Err(e) => {
+            if diag {
+                fetch_v = json!({ "backend": backend.as_str(), "error": e.to_string() });
+                result_v = json!({ "is_error": true });
+            }
+            tool_error(id, &format!("抓取失败(后端 {}): {e}", backend.as_str()))
+        }
+    };
+
+    if diag {
+        post_diag_entry(json!({
+            "trace_kind": "cat_webfetch",
+            "captured_at": captured_at,
+            "tool": "web_fetch",
+            "request": { "url": url, "prompt": prompt },
+            "fetch": fetch_v,
+            "summarize": summarize_v,
+            "result": result_v,
+        }))
+        .await;
     }
+    resp
 }
 
 /// 处理 `web_search` tools/call: 走 DDG(headless)搜索, 返回结构化结果列表给模型。
@@ -378,13 +435,40 @@ async fn handle_web_search_call(
         }
     }
     let max = max_results.unwrap_or(codex_app_transfer_http::search::DEFAULT_MAX_RESULTS);
-    match codex_app_transfer_http::web_search(&query, max).await {
-        Ok(results) => tool_ok(
-            id,
-            &truncate(&format_search_results(&query, &results), MAX_CONTENT_CHARS),
-        ),
-        Err(e) => tool_error(id, &format!("web_search 失败: {e}")),
+    let diag = diag_enabled();
+    let captured_at = now_iso();
+    let mut result_v = Value::Null;
+    let resp = match codex_app_transfer_http::web_search(&query, max).await {
+        Ok(results) => {
+            let formatted = truncate(&format_search_results(&query, &results), MAX_CONTENT_CHARS);
+            if diag {
+                result_v = json!({
+                    "result_count": results.len(),
+                    "returned_chars": formatted.chars().count(),
+                    "is_error": false,
+                });
+            }
+            tool_ok(id, &formatted)
+        }
+        Err(e) => {
+            if diag {
+                result_v = json!({ "is_error": true, "error": e.to_string() });
+            }
+            tool_error(id, &format!("web_search 失败: {e}"))
+        }
+    };
+    if diag {
+        // web_search 走 DDG headless、不经摘要模型, 故只记 request + result(无 fetch/summarize 段)。
+        post_diag_entry(json!({
+            "trace_kind": "cat_webfetch",
+            "captured_at": captured_at,
+            "tool": "web_search",
+            "request": { "query": query, "max_results": max },
+            "result": result_v,
+        }))
+        .await;
     }
+    resp
 }
 
 /// 把结果列表格式化成给模型的 markdown(序号 + 标题 + URL + 摘要 + 两段式用法提示)。
@@ -486,12 +570,32 @@ fn parse_summary_config(cfg: &Value) -> Result<SummaryConfig, String> {
     })
 }
 
+/// summarize 的结构化结果 (MOC-181 诊断): 给 Codex 的最终摘要 + 链路诊断字段
+/// (喂给摘要模型的完整 prompt / 模型原始回复 / 延迟 / 大页选块统计)。
+struct SummarizeOutcome {
+    /// 给 Codex 的最终摘要 (含大页选块前缀提示)。
+    summary: String,
+    /// 摘要模型 `<slug>/<model>`。
+    model: String,
+    /// 完整喂给摘要模型的 instruction (prompt_sent —— 根因4 摘要 prompt 调试核心)。
+    prompt_sent: String,
+    /// 摘要模型原始回复 (strip_think 后)。
+    response: String,
+    /// 本次摘要 wall time (ms)。
+    latency_ms: u128,
+    /// 大页选块: 是否做了选块 + 全文段数 / 选中段数 / 选中字符数。
+    selected: bool,
+    total_chunks: usize,
+    picked: usize,
+    selected_chars: usize,
+}
+
 /// 用『总结模型』针对 `prompt` 对网页正文 `content` 作答 —— 经本地 proxy 调当前 provider 的
 /// 模型(复用其路由 + 鉴权改写)。返回 `Err` 时上层回退原文(绝不丢内容)。
 ///
 /// 当前仅支持 `openai_chat` 格式 provider(`/v1/chat/completions`, 主流);其它格式返 Err →
 /// 回退原文。后续可扩 `/v1/responses` 覆盖 responses-format provider。
-async fn summarize(content: &str, prompt: &str) -> Result<String, String> {
+async fn summarize(content: &str, prompt: &str) -> Result<SummarizeOutcome, String> {
     let cfg = read_summary_config()?;
     if cfg.api_format != "openai_chat" {
         return Err(format!(
@@ -504,6 +608,7 @@ async fn summarize(content: &str, prompt: &str) -> Result<String, String> {
     // 显式告知模型可能不完整(避免把部分正文当全文)。
     let (capped, selected, picked, total_chunks) =
         select_relevant_content(content, prompt, SUMMARY_INPUT_CHARS);
+    let selected_chars = capped.chars().count();
     let trunc_hint = if selected {
         format!(
             "\n\n(注意:网页正文超长, 已按你的「用户需求」从全文 {total_chunks} 个段落里挑出最相关的 \
@@ -525,14 +630,15 @@ async fn summarize(content: &str, prompt: &str) -> Result<String, String> {
         .map_err(|e| format!("建 HTTP client 失败: {e}"))?;
     let endpoint = format!("http://127.0.0.1:{}/v1/chat/completions", cfg.proxy_port);
     let body = json!({
-        "model": cfg.model,
-        "messages": [{ "role": "user", "content": instruction }],
+        "model": cfg.model.clone(),
+        "messages": [{ "role": "user", "content": instruction.clone() }],
         "stream": false,
     });
     let mut req = client.post(&endpoint).json(&body);
     if let Some(k) = &cfg.gateway_key {
         req = req.bearer_auth(k);
     }
+    let t0 = Instant::now();
     let resp = req
         .send()
         .await
@@ -544,6 +650,7 @@ async fn summarize(content: &str, prompt: &str) -> Result<String, String> {
         .text()
         .await
         .map_err(|e| format!("读取摘要响应体失败: {e}"))?;
+    let latency_ms = t0.elapsed().as_millis();
     if !status.is_success() {
         return Err(format!(
             "摘要模型 HTTP {status}: {}",
@@ -566,13 +673,106 @@ async fn summarize(content: &str, prompt: &str) -> Result<String, String> {
     }
     // 做了相关性选块时也给消费者(Codex)带一句, 不只告诉总结模型 —— 避免拿"基于部分正文
     // 的摘要"当完整答案。
-    if selected {
-        Ok(format!(
+    let summary = if selected {
+        format!(
             "(注:网页正文过长, 本摘要基于按相关性从全文 {total_chunks} 段中挑出的 {picked} 段, 可能不完整。)\n\n{out}"
-        ))
+        )
     } else {
-        Ok(out.to_string())
+        out.to_string()
+    };
+    Ok(SummarizeOutcome {
+        summary,
+        model: cfg.model,
+        prompt_sent: instruction,
+        response: out.to_string(),
+        latency_ms,
+        selected,
+        total_chunks,
+        picked,
+        selected_chars,
+    })
+}
+
+// ============ MOC-181 cat-webfetch 诊断埋点 (上报 viewer ingest) ============
+
+/// 诊断是否开:env `CAS_DIAG_TRACE` || config `settings.traceViewerEnabled`(与主 app viewer
+/// 启动条件对齐)。读 config 失败 → 视为关(fail-closed)。本函数每次调用读一次 config 判 gate
+/// (与 current_backend / read_summary_config 同款、非热路径); 关时各 handler 不构造诊断条目。
+fn diag_enabled() -> bool {
+    if std::env::var("CAS_DIAG_TRACE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
     }
+    codex_app_transfer_registry::config_file()
+        .and_then(|p| codex_app_transfer_registry::load_raw_config(&p).ok())
+        .and_then(|cfg| {
+            cfg.get("settings")
+                .and_then(|s| s.get("traceViewerEnabled"))
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+/// captured_at 时间戳 (RFC3339 / ISO8601 local 含时区; 与 forward-trace 其它 producer 的
+/// `to_rfc3339()` 一致、与前端解析兼容)。
+fn now_iso() -> String {
+    chrono::Local::now().to_rfc3339()
+}
+
+/// web_fetch 抓取段诊断 value: 用户选的档 + 实际命中档 + 升级链 + status + 正文字符数。
+fn fetch_value(selected: WebFetchBackend, o: &WebFetchOutcome) -> Value {
+    json!({
+        "backend": selected.as_str(),
+        "final_tier": o.final_tier.as_str(),
+        "status": o.status,
+        "escalation_trail": o.trail,
+        "body_chars": o.content.chars().count(),
+    })
+}
+
+/// summarize 段诊断 value: 模型 / 延迟 / 选块统计 / 完整 prompt_sent / 模型原始回复。
+fn summarize_value(so: &SummarizeOutcome) -> Value {
+    json!({
+        "model": so.model,
+        "latency_ms": so.latency_ms,
+        "selected": so.selected,
+        "total_chunks": so.total_chunks,
+        "picked_chunks": so.picked,
+        "selected_chars": so.selected_chars,
+        "prompt_sent": so.prompt_sent,
+        "response": so.response,
+        "fallback_raw": false,
+    })
+}
+
+/// 抓取成功但 2xx 空 body 时给模型的提示(抽成函数, handler 正常路径与诊断共用同一文案)。
+fn empty_body_msg(backend: WebFetchBackend) -> String {
+    format!(
+        "(请求成功但响应体为空 — 常见于需 JS 渲染的前端页 / 反爬拦截 / 重定向丢内容。\
+         当前后端: {}。{} 也请确认 URL 是否正确。)",
+        backend.as_str(),
+        if backend.may_use_headless() {
+            "该档已用真浏览器渲染, 空多半是页面本身无内容 / 需登录 / 被反爬, 换更具体的 URL 再试;"
+        } else {
+            "若内容靠 JS 渲染, 可把内置联网抓取工具切到 auto / headless 档后重试;"
+        }
+    )
+}
+
+/// 把诊断条目 POST 到 viewer ingest(失败静默 —— 诊断旁路绝不影响 web_fetch 主功能 / 不阻塞返回)。
+/// 短超时:viewer 没起 / 端口不通时快速放弃, 不拖慢工具响应。
+async fn post_diag_entry(value: Value) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let url = format!("http://127.0.0.1:{DIAG_INGEST_PORT}/api/ingest");
+    let _ = client.post(&url).json(&value).send().await;
 }
 
 /// 剥掉 reasoning 模型内联在 content 里的 `<think>…</think>` 思维链(可能多段)。仅处理成对
