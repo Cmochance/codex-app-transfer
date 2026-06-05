@@ -618,7 +618,13 @@ async fn connect_and_monitor(
                 // 在排队,drain 到任一条都会在这里先 observe desired=false 退出;channel
                 // 没满时 Stop 必被送达,同样走到这里。两种情况都不漏停止。
                 if !desired.load(Ordering::SeqCst) {
-                    tracing::info!("[PluginUnlock] desired=false observed, stopping daemon");
+                    tracing::info!(
+                        "[PluginUnlock] desired=false observed, uninstalling injection then stopping"
+                    );
+                    // [MOC-178] 退出前先卸载注入(observer.disconnect + abort listener +
+                    // setAuthMethod 回原值让 plugins 入口回 disabled),使 toggle off 真实
+                    // 生效而非只停 daemon 留注入残留。best-effort,内部吞错不阻塞退出。
+                    inject_uninstall_script(&mut write, &mut read, msg_id_counter).await;
                     disable_mcp_recorder_if_active(&mut write, msg_id_counter, mcp_recorder_enabled)
                         .await;
                     let _ = write.close().await;
@@ -832,9 +838,15 @@ async fn inject_unlock_script(
     function spoofChatGPTAuthMethod(element) {
         const auth = authContextValueFrom(element);
         if (!auth) return 'no_auth_context';
+        // [MOC-178] 存 AuthContext 引用,卸载(toggle off)时反向 setAuthMethod 回原值
+        window[MARKER].authRef = auth;
         if (auth.authMethod === 'chatgpt') {
             window[MARKER].unlocked = true;
             return 'unlocked';
+        }
+        // [MOC-178] 首次 spoof 前记下原 authMethod(apikey 等),卸载时回滚让入口回 disabled
+        if (window[MARKER].originalAuthMethod == null) {
+            window[MARKER].originalAuthMethod = auth.authMethod;
         }
         try {
             auth.setAuthMethod('chatgpt');
@@ -870,6 +882,8 @@ async fn inject_unlock_script(
     function enablePluginEntry() {
         const btn = pluginEntryButton();
         if (!btn) return 'no_plugin_button';
+        // [MOC-178] 存入口 button 引用,卸载时复原 disabled + 清 dataset 标记
+        window[MARKER].entryButton = btn;
         const reason = spoofChatGPTAuthMethod(btn);
         btn.disabled = false;
         btn.removeAttribute('disabled');
@@ -880,7 +894,10 @@ async fn inject_unlock_script(
         if (propsKey) { btn[propsKey].disabled = false; }
         if (btn.dataset.codexAppTransferPluginUnlocked !== 'true') {
             btn.dataset.codexAppTransferPluginUnlocked = 'true';
-            btn.addEventListener('click', () => spoofChatGPTAuthMethod(btn), true);
+            // [MOC-178] listener 用 AbortController 管理 —— capture=true 的 listener
+            // 无引用没法 removeEventListener,卸载时靠 signal abort 一并清除
+            window[MARKER].abort = window[MARKER].abort || new AbortController();
+            btn.addEventListener('click', () => spoofChatGPTAuthMethod(btn), { capture: true, signal: window[MARKER].abort.signal });
         }
         return reason;
     }
@@ -1075,6 +1092,79 @@ async fn inject_unlock_script(
             let msg = format!("注入脚本返回未知形态: {raw}");
             set_status(status, UnlockStatus::Failed { error: msg.clone() }).await;
             Err(msg.into())
+        }
+    }
+}
+
+/// [MOC-178] 卸载注入:撤销解锁脚本装的全部副作用 —— disconnect 自愈 MutationObserver、
+/// abort click listener、`setAuthMethod` 回原 authMethod 让 Codex 据 authMethod 重渲
+/// plugins 入口回 disabled。toggle off(`desired=false`)退出前调,使关闭真实生效而非只停
+/// daemon 留注入残留。best-effort:页面正在导航/已关、CDP 无响应时静默放过,不阻塞 daemon
+/// 退出(注入若残留,下次 daemon 不再维持 + Codex 重启会清)。不刷新页面、不碰 auth.json /
+/// 真实账号那套(真实账号 daemon 本就不跑、走不到这)。
+async fn inject_uninstall_script(
+    write: &mut (impl Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    read: &mut (impl Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    msg_id_counter: &AtomicU64,
+) {
+    let uninstall_script = r#"
+(function () {
+    const M = window['__codexAppTransferPluginUnlocker'];
+    if (!M) return { ok: true, reason: 'not_installed' };
+    // 1. 停自愈 observer(不再 DOM 变就重 spoof)
+    try { if (M.observer) { M.observer.disconnect(); M.observer = null; } } catch (e) {}
+    // 2. 清 click listener(capture 注册无引用,靠 AbortController signal 一并 abort)
+    try { if (M.abort) { M.abort.abort(); M.abort = null; } } catch (e) {}
+    // 3. 反向 setAuthMethod 回原值 → Codex 据 authMethod 重渲,plugins 入口回 disabled。
+    //    主路径:setter 有效时正向靠它 enable、反向靠它 disable(React 重渲驱动)。仅原值
+    //    非 chatgpt 时回滚,避免误改真实 chatgpt 账号(真实账号 daemon 本就不跑、走不到这,
+    //    双保险)。
+    let reverted = false;
+    try {
+        if (M.authRef && typeof M.authRef.setAuthMethod === 'function'
+            && M.originalAuthMethod != null && M.originalAuthMethod !== 'chatgpt') {
+            M.authRef.setAuthMethod(M.originalAuthMethod);
+            reverted = true;
+        }
+    } catch (e) { M.lastError = String(e?.stack || e); }
+    // 4. DOM 兜底 + 清标记。正向除 setAuthMethod 外还做了命令式 DOM 强改(strict fallback,
+    //    btn.disabled=false 等);若 React 不因 authMethod 翻回而重渲该 button,强改会残留 →
+    //    入口仍可点。主动把 entryButton 设回 disabled(跟反向重渲同向、不冲突;disabled 决定
+    //    可点性,display 等交给 React)+ delete dataset(否则同页 re-enable 时 enablePluginEntry
+    //    的 guard 判 true 会漏挂新 click listener)。
+    try {
+        const btn = M.entryButton;
+        if (btn) {
+            btn.disabled = true;
+            btn.setAttribute('disabled', '');
+            const propsKey = Object.keys(btn).find((k) => k.startsWith('__reactProps'));
+            if (propsKey && btn[propsKey]) { btn[propsKey].disabled = true; }
+            delete btn.dataset.codexAppTransferPluginUnlocked;
+        }
+    } catch (e) { M.lastError = String(e?.stack || e); }
+    M.unlocked = false;
+    M.uninstalled = true;
+    return { ok: true, reason: 'uninstalled', reverted: reverted };
+})()
+"#;
+    let (evaluate, evaluate_id) = make_cdp_msg(
+        msg_id_counter,
+        "Runtime.evaluate",
+        json!({ "expression": uninstall_script, "returnByValue": true }),
+    );
+    if write.send(WsMessage::Text(evaluate)).await.is_err() {
+        tracing::warn!("[PluginUnlock] uninstall script send failed (WS dead); skipping");
+        return;
+    }
+    // 卸载脚本同步执行很快;短超时等响应,超时也无妨(已发出,best-effort)。
+    match await_cdp_response(read, evaluate_id, Duration::from_secs(3)).await {
+        Ok(_) => {
+            tracing::info!(
+                "[PluginUnlock] injection uninstalled (observer/listener/spoof reverted)"
+            )
+        }
+        Err(e) => {
+            tracing::warn!("[PluginUnlock] uninstall response wait failed (best-effort): {e}")
         }
     }
 }
