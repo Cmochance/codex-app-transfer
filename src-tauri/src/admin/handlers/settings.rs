@@ -570,7 +570,12 @@ pub fn migrate_real_account_mode_v1() -> bool {
     // 后者认 token,会把「chatgpt login 后切 apikey、活动 auth_mode=apikey 但 tokens 残留」误判成
     // 有账号 → flag=true 但 reconcile 无法从 token-only apikey activate、前端却据 flag 显示 mode on
     // (plugins 仍 locked)。活动真 chatgpt 才是「之前在用真实账号 relay」的可靠信号。
-    let has_account = crate::codex_real_account::active_is_real_chatgpt_now();
+    // [MOC-178 codex P2] seed = 活动真 chatgpt(relay 在用)**或**有可恢复的导入镜像(import/pin 过、
+    // legacy reconcile 会从镜像恢复)。只认前者会把「有有效镜像但活动 apikey」的老用户误 seed false →
+    // reconcile(Some(false)) 走 ForceDisable 在读镜像前就关了,静默禁用其真实账号模式。仍排除
+    // token-only apikey 活动文件(active_is_real_chatgpt_now 要 auth_mode==chatgpt、镜像分支判过期)。
+    let has_account = crate::codex_real_account::active_is_real_chatgpt_now()
+        || crate::codex_real_account::has_restorable_imported_mirror();
     set_real_account_mode_enabled(has_account)
 }
 

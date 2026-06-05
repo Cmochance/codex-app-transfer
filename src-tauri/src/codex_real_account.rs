@@ -109,6 +109,27 @@ pub fn active_is_real_chatgpt_now() -> bool {
         .unwrap_or(false)
 }
 
+/// [MOC-178 codex P2] 是否有「可恢复的」导入镜像(存在 + access/refresh 非空 + 本地 JWT 未过期)。
+/// 供 migrate seed 判定「老用户之前在用真实账号」—— 有有效镜像 = 用户导入/钉住过、legacy
+/// reconcile 会从它恢复活动 chatgpt。只读,不写盘。
+pub fn has_restorable_imported_mirror() -> bool {
+    let Ok(paths) = CodexPaths::from_home_env() else {
+        return false;
+    };
+    let Some(v) = read_imported_mirror(&paths) else {
+        return false;
+    };
+    if parse_chatgpt_tokens(&v).is_none() {
+        return false;
+    }
+    let access = v
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    !access_token_expired(access, chrono::Utc::now().timestamp())
+}
+
 /// 从一个 `auth.json` Value 判断是否是**可用**的 chatgpt 登录态。
 /// 可用 = `auth_mode=="chatgpt"` 且 `tokens.{access_token,refresh_token}` 均非空。
 /// 返回 `account_id`(可能为 None)。
