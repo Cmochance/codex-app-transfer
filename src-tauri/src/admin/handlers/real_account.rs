@@ -137,25 +137,16 @@ pub async fn import_handler(
 /// POST /api/desktop/real-account/pin-current
 ///
 /// 钉住当前检测到的真实账号(官方活动 auth.json)进持久镜像。
-pub async fn pin_current_handler(
-    axum::extract::State(state): axum::extract::State<AdminState>,
-) -> impl IntoResponse {
+pub async fn pin_current_handler() -> impl IntoResponse {
     if let Err(e) = codex_real_account::pin_current_account().await {
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }
-    // [MOC-178 codex P2] 同 import:走共用收尾(set flag + apply relay + 校验回滚),direct 下不留
-    // 「flag=true 但 relay 不生效」。
-    let enabled = finalize_enable_real_account(&state).await.is_ok();
-    Json(json!({
-        "success": true,
-        "enabled": enabled,
-        "message": if enabled {
-            "已钉住并开启真实账号模式"
-        } else {
-            "已钉住真实账号;当前 provider 不支持 relay(如 direct),未开启真实账号模式"
-        },
-    }))
-    .into_response()
+    // [MOC-178 codex P2] pin 由前端 auto-pin **自动**调用(activeReal + 无镜像,仅打开 UI 就触发),
+    // 前提是活动已 chatgpt。故**只 save 镜像 + set flag=true**,绝不走 finalize 的 apply relay /
+    // 回滚 / deactivate —— 否则 direct provider / proxy 起不来时,仅打开 UI 就把用户正在用的活动
+    // chatgpt 切回 apikey + 隐藏 plugins(回归)。relay 的 apply 交给 enable(用户主动)/ startup。
+    let _ = super::settings::set_real_account_mode_enabled(true);
+    Json(json!({ "success": true, "message": "已钉住当前真实账号(持久保留)" })).into_response()
 }
 
 /// POST /api/desktop/real-account/forget
