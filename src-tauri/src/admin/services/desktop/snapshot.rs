@@ -1150,12 +1150,20 @@ mod tests {
         assert!(names.contains(&"gpt-5.5"));
         assert!(names.contains(&"gpt-5.4"));
         // [MOC-154] gpt_5_4_mini 槽未配置 → 跳过;fallback entry(slug=实际模型名)已删
-        assert!(!names.contains(&"gpt-5.4-mini"), "empty slot should be skipped");
-        assert!(!names.contains(&"deepseek-v4-pro"), "fallback entry removed in MOC-154");
+        assert!(
+            !names.contains(&"gpt-5.4-mini"),
+            "empty slot should be skipped"
+        );
+        assert!(
+            !names.contains(&"deepseek-v4-pro"),
+            "fallback entry removed in MOC-154"
+        );
         // [MOC-154] kimi-k2(258_400) / glm-4.6(200_000) 均非 1M;旧逻辑 fallback entry
         // deepseek-v4-pro[1m] 已删,无 supports1m=true 的 entry
         assert!(
-            models.iter().all(|item| item.get("supports1m").and_then(|v| v.as_bool()) != Some(true)),
+            models
+                .iter()
+                .all(|item| item.get("supports1m").and_then(|v| v.as_bool()) != Some(true)),
             "kimi-k2 / glm-4.6 均非 1M,不应有 supports1m=true"
         );
     }
@@ -1200,7 +1208,10 @@ mod tests {
                 assert!(!models_raw.contains("sonnet"));
                 assert!(models_raw.contains("gpt-5.5"));
                 // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 名作 display_name 出现
-                assert!(models_raw.contains("kimi-k2"), "default_model 作为 gpt-5.5 的 display_name 出现");
+                assert!(
+                    models_raw.contains("kimi-k2"),
+                    "default_model 作为 gpt-5.5 的 display_name 出现"
+                );
                 // [MOC-154] only gpt-5.5 slug exists in catalog; deepseek-v4-pro fallback entry was removed
                 assert_eq!(payload["configured"], json!(false));
                 assert_eq!(payload["health"]["needsApply"], json!(true));
@@ -1217,7 +1228,10 @@ mod tests {
                     .collect();
                 assert!(codes.contains(&"not_managed_by_cas"));
                 // [MOC-154] oneMillionReady=true → one_million_not_written issue 不再出现
-                assert!(!codes.contains(&"one_million_not_written"), "no 1M model => no one_million_not_written");
+                assert!(
+                    !codes.contains(&"one_million_not_written"),
+                    "no 1M model => no one_million_not_written"
+                );
             });
         });
     }

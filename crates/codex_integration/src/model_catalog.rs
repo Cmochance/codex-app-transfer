@@ -846,10 +846,7 @@ mod tests {
             None,
         );
         // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
-        let entry = models
-            .iter()
-            .find(|m| m.slug == "gpt-5.5")
-            .unwrap();
+        let entry = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
         assert_eq!(entry.context_window, 258_400, "fallback to 258_400");
     }
 
