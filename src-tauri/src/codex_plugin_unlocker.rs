@@ -676,10 +676,27 @@ async fn connect_and_monitor(
             // (支持 off→on 再启)。诊断 on→off(transition):发一次性 eval 停采 + 清空页内队列,
             // 之后保持静默(不再每 2s 往返)。一直 off:无任何 CDP 往返。
             _ = mcp_drain_interval.tick() => {
+                let gate_on = codex_app_transfer_proxy::diagnostics::forward_trace_enabled();
+                // on→off **优先**:即便有 drain 在途也立刻发停采 eval,不被 pending_drain_id 守卫
+                // 阻塞(否则停采被推迟到 drain 响应回来才发,这期间页内 recorder 仍在抓未脱敏流量)。
+                // fire-and-forget,响应忽略;与在途 drain 互不影响(各是独立 evaluate)。
+                if !gate_on && mcp_recorder_enabled {
+                    mcp_recorder_enabled = false;
+                    let (off_msg, _off_id) = make_cdp_msg(
+                        msg_id_counter,
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": "try{window.__codexMcpTraceOn=false;if(window.__codexMcpTrace)window.__codexMcpTrace.length=0}catch(e){}",
+                            "returnByValue": true
+                        }),
+                    );
+                    let _ = write.send(WsMessage::Text(off_msg)).await;
+                }
+                // 有 drain 在途 → 本 tick 不再发新 install/drain(响应在 read 分支处理后清 pending)。
                 if pending_drain_id.is_some() {
                     continue;
                 }
-                if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() {
+                if gate_on {
                     mcp_recorder_enabled = true;
                     if !mcp_recorder_installed {
                         // 录制器还没装(诊断刚开 / reload 后):先注入(idempotent IIFE),本 tick 不
@@ -709,18 +726,6 @@ async fn connect_and_monitor(
                         }
                         pending_drain_id = Some(drain_id);
                     }
-                } else if mcp_recorder_enabled {
-                    // on→off:一次性关掉页内 recorder + 清队列(fire-and-forget,响应忽略),之后静默
-                    mcp_recorder_enabled = false;
-                    let (off_msg, _off_id) = make_cdp_msg(
-                        msg_id_counter,
-                        "Runtime.evaluate",
-                        json!({
-                            "expression": "try{window.__codexMcpTraceOn=false;if(window.__codexMcpTrace)window.__codexMcpTrace.length=0}catch(e){}",
-                            "returnByValue": true
-                        }),
-                    );
-                    let _ = write.send(WsMessage::Text(off_msg)).await;
                 }
             }
         }
