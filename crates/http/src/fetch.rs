@@ -941,14 +941,24 @@ fn tag_attr_value<'a>(html_tag: &'a str, lower_tag: &str, attr: &str) -> Option<
             continue;
         };
         let after = after.trim_start();
-        let quote = match after.as_bytes().first() {
-            Some(&b'"') => '"',
-            Some(&b'\'') => '\'',
-            _ => continue,
-        };
-        let vstart = lower_tag.len() - after.len() + 1; // 引号后值起始
-        let vend_rel = html_tag.get(vstart..)?.find(quote)?;
-        return Some(&html_tag[vstart..vstart + vend_rel]);
+        let vbase = lower_tag.len() - after.len(); // after 在 tag 的字节偏移
+        match after.as_bytes().first() {
+            // 引号值: 取引号内到配对引号。
+            Some(&q) if q == b'"' || q == b'\'' => {
+                let vstart = vbase + 1;
+                let vend_rel = html_tag.get(vstart..)?.find(q as char)?;
+                return Some(&html_tag[vstart..vstart + vend_rel]);
+            }
+            // 无引号值(HTML 合法 `content=0;url=/x`): 到空白 / `>` / tag 末尾(chatgpt review)。
+            Some(_) => {
+                let rest = html_tag.get(vbase..)?;
+                let vend = rest
+                    .find([' ', '\t', '\n', '\r', '>'])
+                    .unwrap_or(rest.len());
+                return Some(&rest[..vend]);
+            }
+            None => continue,
+        }
     }
     None
 }
@@ -1114,6 +1124,11 @@ mod tests {
             )
             .as_deref(),
             Some("https://e.com/x?a=1&b=2")
+        );
+        // 无引号 content 值(HTML 合法 `content=0;url=/x`)(chatgpt review 第 4 轮)
+        assert_eq!(
+            parse_meta_refresh("<meta http-equiv=refresh content=0;url=/next>").as_deref(),
+            Some("/next")
         );
         // 非 refresh meta → None
         assert_eq!(parse_meta_refresh("<meta charset='utf-8'><p>hi</p>"), None);
