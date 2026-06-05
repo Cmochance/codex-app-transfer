@@ -167,25 +167,27 @@ pub async fn forget_handler(
     // [MOC-178] 删镜像后 apply 当前 provider 强制切 apikey:停用真实账号(toggle 关 + Codex
     // 原生不显示 plugins),但**保留 tokens** → 退出 restore 能写回 chatgpt + tokens 完整恢复。
     // (对比直接删活动 auth.json:那会丢 tokens、restore 恢复不回,残缺。)
-    let synced =
+    let _synced =
         crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&state).await;
-    let mut switched = synced
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     // [MOC-178 codex P2] sync 依赖 active provider config;无 provider(默认 activeProvider null)
-    // / apply 失败时 sync success:false、活动仍 chatgpt → 直接切活动 auth apikey 兜底(不依赖
-    // provider),确保 Codex 不留 plugins、跟 flag=false 一致(否则要等下次启动 ForceDisable)。
+    // / apply 失败时 sync 切不了、活动仍 chatgpt → 直接切活动 auth apikey 兜底(不依赖 provider)。
     if codex_real_account::active_is_real_chatgpt_now() {
-        switched = codex_real_account::deactivate_real_account()
-            .await
-            .unwrap_or(false);
+        let _ = codex_real_account::deactivate_real_account().await;
     }
+    // [MOC-178 codex P2] 成功判据 = 活动**确实**已非 chatgpt(plugins 真关了),直接看结果而非 sync
+    // 的 success(那个对「活动本就 apikey」会误报)。sync + deactivate 兜底都没切成(IO error:磁盘满 /
+    // 写权限拒)→ 活动仍 chatgpt → success:false 如实暴露,不 swallow(否则 UI 报已关但 plugins 仍 exposed)。
+    // 镜像已删 + flag 已 false(下次启动 ForceDisable 会补切),但本次让用户知道重试 / 重启。
+    let switched = !codex_real_account::active_is_real_chatgpt_now();
     Json(json!({
-        "success": true,
+        "success": switched,
         "removed": removed,
         "switchedToApikey": switched,
-        "message": "已清除真实账号(切回 apikey 模式,tokens 保留,退出可恢复)",
+        "message": if switched {
+            "已清除真实账号(切回 apikey 模式,tokens 保留,退出可恢复)"
+        } else {
+            "已清除镜像,但切 apikey 失败(磁盘 / 权限?)—— Plugins 可能未关,请重试或重启 Codex"
+        },
     }))
     .into_response()
 }
