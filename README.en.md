@@ -336,6 +336,7 @@ Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) in
 - [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage) — rollout JSONL token-usage parser
 - [`Cmochance/Codex_Account_Switch`](https://github.com/Cmochance/Codex_Account_Switch) — codex login spawn + token refresh
 - [`deedy5/duckduckgo_search`](https://github.com/deedy5/duckduckgo_search) — DDG result parsing reference
+- [`liaohch3/claude-tap`](https://github.com/liaohch3/claude-tap) — diagnostic traffic viewer UX
 
 ### Community contributors
 

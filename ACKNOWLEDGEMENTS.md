@@ -424,6 +424,25 @@
 
 ---
 
+## liaohch3/claude-tap
+
+- **Link**: https://github.com/liaohch3/claude-tap
+- **License**: 见上游 LICENSE(产品形态 / UX 启发,无代码层复用,本项目全自写实现)
+- **借鉴形式**: 产品形态启发 / 思路 · 模式借鉴(诊断流量查看器整体形态 + copy-as-curl / 请求结构化 diff 的 UX 概念;代码自写)
+- **首次借鉴 PR / 时间**: 形态启发 #392(MOC-169 诊断 viewer 初版)/ 2026-06-04(初版漏记,本 entry 于 MOC-184 补);UX 增强 MOC-184(copy-curl + INBOUND↔OUTBOUND diff)/ 2026-06-05
+- **借鉴清单**:
+  - **本地抓包 + 单 HTML trace viewer 整体形态**(默认本地、不外传、网页实时看 LLM 全流量)→ `src-tauri/src/trace_viewer.rs` + `src-tauri/resources/trace_viewer.html`(独立 `127.0.0.1:18090` SSE viewer)
+  - **copy-as-cURL**(从一条 trace 一键复刻请求)→ `trace_viewer.html::buildCurl`(从 OUTBOUND 生成 curl)
+  - **structural diff** 思路 → `trace_viewer.html::diffLines`(行级 LCS,本项目改成看 INBOUND↔OUTBOUND adapter 转换结果)
+- **本项目差异 / 扩展**:
+  - 上游是通用旁路代理(Python,拦 Claude/Codex/Gemini 等多 client);本项目是 Codex 专用代理**自身内嵌**诊断(流量本就经过,不拦别人),Rust + 单 HTML。
+  - diff 方向不同:claude-tap 比**相邻同格式请求**(turn-over-turn);本项目比 **INBOUND↔OUTBOUND**(跨协议,看 adapter 把请求改成了啥);同会话 turn 间 diff 留作后续。
+  - **不借鉴**:多 client 拦截 / 正反向代理切换 / i18n / dark-toggle / 易分享 HTML 导出(本项目数据含完整 prompt/代码/回复,定位仅本地勿外传)。
+- **同步策略**: monitor only(UX 概念借鉴,无代码同步需求)。
+- **关联**: MOC-169 / MOC-184 / PR #392 / #400
+
+---
+
 ## 维护规则
 
 - **新增借鉴**:1 个 PR 内 ① README 致谢段加一行概览 ② 本文档加完整 entry(必填字段全),缺一不可
