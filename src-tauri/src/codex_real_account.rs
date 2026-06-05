@@ -306,6 +306,48 @@ fn active_auth_mode(paths: &CodexPaths) -> Option<String> {
 
 /// 检测真实 chatgpt 账号:按"官方活动 → 持久镜像"定位可用凭据(见
 /// [`locate_chatgpt_auth`])。纯只读,绝不写盘 / spawn。
+/// [MOC-178 codex P2] 找「有效(非空 + 本地 JWT 未过期)」chatgpt token:活动有效 → Official;
+/// 活动无效/过期但镜像有效 → Imported;都无效 → None。区别于 `locate_chatgpt_tokens`(只判非空、
+/// 不判过期,供 reconcile「有 token 可保留」用):本函数供 detect 判「账号当前可用」——过期 token
+/// 不算可用(transfer 不刷新 token,过期只能靠重登 / 重新导入恢复)。只读。
+fn locate_valid_chatgpt_tokens(paths: &CodexPaths) -> Option<LocatedChatgptAuth> {
+    let valid = |v: &Value| -> bool {
+        let access = v
+            .get("tokens")
+            .and_then(|t| t.get("access_token"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        parse_chatgpt_tokens(v).is_some()
+            && !access_token_expired(access, chrono::Utc::now().timestamp())
+    };
+    if let Ok(v) = read_auth(&paths.auth_json) {
+        if valid(&v) {
+            let account_id = parse_chatgpt_tokens(&v).and_then(|c| c.account_id);
+            return Some(LocatedChatgptAuth {
+                path: paths.auth_json.clone(),
+                source: AuthSource::Official,
+                value: v,
+                account_id,
+            });
+        }
+    }
+    let mirror = imported_mirror_path(paths);
+    if mirror.is_file() {
+        if let Ok(v) = read_auth(&mirror) {
+            if valid(&v) {
+                let account_id = parse_chatgpt_tokens(&v).and_then(|c| c.account_id);
+                return Some(LocatedChatgptAuth {
+                    path: mirror,
+                    source: AuthSource::Imported,
+                    value: v,
+                    account_id,
+                });
+            }
+        }
+    }
+    None
+}
+
 pub fn detect() -> RealAccountStatus {
     let Ok(paths) = CodexPaths::from_home_env() else {
         // 连 home 都解析不到 —— 当作"没有",不 panic。
@@ -313,27 +355,14 @@ pub fn detect() -> RealAccountStatus {
     };
     let active_mode = active_auth_mode(&paths);
     let has_imported = read_imported_mirror(&paths).is_some();
-    // [MOC-178] 账号可用性认 token(活动或镜像有有效 chatgpt token),不看 auth_mode ——
-    // 清除切 apikey 后 tokens 仍在 → 账号状态仍「获取成功」、用户可再开真实账号模式。
-    match locate_chatgpt_tokens(&paths) {
+    // [MOC-178] 账号可用性认 token(活动或镜像有**有效**chatgpt token,含本地 JWT 未过期),不看
+    // auth_mode —— 清除切 apikey 后 tokens 仍在且未过期 → 账号状态仍「获取成功」、用户可再开。
+    match locate_valid_chatgpt_tokens(&paths) {
         Some(found) => {
-            // [connector review 自愈] 活动文件本身是真实 chatgpt 且 access_token 未过期
-            // (本地 JWT exp 判断,无网络)= 账号当前确实可用 → 清掉可能 stale 的
-            // 「需重新登录」标记。覆盖用户在 app 外重新 `codex login` / 直接恢复活动文件、
-            // 不经 import/login/reconcile 入口的场景。只在有「确实有效」的本地证据时清:
-            // access_token 过期则不清(避免把真失效误报成「获取成功」)。
+            // [connector review 自愈] 活动文件就是有效真实 chatgpt = 账号当前确实可用 → 清掉可能
+            // stale 的「需重新登录」标记(覆盖 app 外重新 codex login / 直接恢复活动文件场景)。
             if found.source == AuthSource::Official {
-                let access = found
-                    .value
-                    .get("tokens")
-                    .and_then(|t| t.get("access_token"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !access.is_empty()
-                    && !access_token_expired(access, chrono::Utc::now().timestamp())
-                {
-                    set_relogin_required(false);
-                }
+                set_relogin_required(false);
             }
             RealAccountStatus {
                 logged_in: true,
@@ -344,7 +373,15 @@ pub fn detect() -> RealAccountStatus {
                 relogin_required: relogin_required(),
             }
         }
-        None => RealAccountStatus::none(active_mode, has_imported),
+        None => {
+            // [MOC-178 codex P2] 没有**有效**token。但若有 token(非空、只是过期 —— locate_chatgpt_tokens
+            // 认非空)→ 标记需重登:清除后 tokens 留活动文件、随时间过期,不标记会让 dashboard 报账号
+            // 可用 + offer enable,enable 时 activate 才 reject expired(UI vs reality 不一致)。
+            if locate_chatgpt_tokens(&paths).is_some() {
+                set_relogin_required(true);
+            }
+            RealAccountStatus::none(active_mode, has_imported)
+        }
     }
 }
 
