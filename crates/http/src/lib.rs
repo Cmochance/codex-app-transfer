@@ -15,10 +15,10 @@
 //! 档位路由: `curl`(reqwest 静态) / `wreq`(浏览器 TLS 指纹) / `headless`(Chromium CDP)。
 //! 配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure` 供设置页探测/按需下载 Chrome。
 //! `webFetchBackend != off` 时 transfer 自动往 `~/.codex/config.toml` 注册
-//! `[mcp_servers.cat-webfetch]`(stdio MCP server),向 Codex 模型暴露 `web_fetch` 工具。
+//! `[mcp_servers.CAT-WEB-MCP]`(stdio MCP server),向 Codex 模型暴露 `web_fetch` 工具。
 //!
 //! DuckDuckGo 搜索 (MOC-12): [`search`] 模块的 [`web_search`] 走 DDG HTML SSR 搜索,
-//! 内部固定 headless(DDG 对裸 HTTP 一律 202 反爬拦)。cat-webfetch MCP server 同时暴露
+//! 内部固定 headless(DDG 对裸 HTTP 一律 202 反爬拦)。CAT-WEB-MCP 同时暴露
 //! `web_search` 工具,与 `web_fetch` 组成两段式联网。
 //!
 //! 非目标 (后续 PR): 不取代 workspace 其余地方 (`gemini_oauth` / `adapters` /

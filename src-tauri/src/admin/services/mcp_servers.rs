@@ -557,7 +557,10 @@ pub fn sync_web_fetch_server(backend: &str) -> Result<(), String> {
     // 当成"不存在"跳过 delete, 残留 server 还谎报成功(关不掉)。
     let servers = list_servers()?;
     // 迁移(MOC-139): 改名前注册过旧 cat-webfetch 的用户, 清理旧 key 避免 config 残留两个 server。
-    if servers.iter().any(|s| s.name == LEGACY_WEB_FETCH_SERVER_NAME) {
+    if servers
+        .iter()
+        .any(|s| s.name == LEGACY_WEB_FETCH_SERVER_NAME)
+    {
         delete_server(LEGACY_WEB_FETCH_SERVER_NAME)?;
     }
     let existing = servers

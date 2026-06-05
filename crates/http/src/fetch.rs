@@ -875,9 +875,14 @@ fn parse_meta_refresh(html: &str) -> Option<String> {
         if !(tag_lower.contains("http-equiv") && tag_lower.contains("refresh")) {
             continue;
         }
-        // content 里找 url= (大小写在 lower 定位, 取值用原 html 保留大小写)。
-        if let Some(u) = tag_lower.find("url=") {
-            let val = html[start + u + 4..end]
+        // **锚定 content 属性值后**再找 url= —— 避免 `data-url=` 等其他属性在 content 前被误匹配
+        // (chatgpt-codex review)。ascii lowercase 不改字节长度, lower 偏移可直接用于原 html 取值。
+        let Some(cpos) = tag_lower.find("content") else {
+            continue;
+        };
+        let region = start + cpos;
+        if let Some(u) = lower[region..end].find("url=") {
+            let val = html[region + u + 4..end]
                 .trim_start_matches(['"', '\'', ' '])
                 .split(['"', '\'', '>', ' '])
                 .next()
@@ -904,8 +909,16 @@ fn parse_js_location(html: &str) -> Option<String> {
         let Some(rel) = lower.find(pat) else {
             continue;
         };
-        // pat 后找第一个引号, 取引号内 URL。
         let after = &html[rel + pat.len()..];
+        // `location.href` 须是**赋值**(单 `=`)不是**比较**(`==`)—— 排除 `if(location.href=='x')`
+        // 这类读取(chatgpt-codex review)。replace(/assign( 是调用、.location= 已含 =, 不受此限。
+        if pat == "location.href" {
+            let t = after.trim_start();
+            if !t.starts_with('=') || t.starts_with("==") {
+                continue;
+            }
+        }
+        // pat 后找第一个引号, 取引号内 URL。
         let Some(q) = after.find(['"', '\'']) else {
             continue;
         };
@@ -963,6 +976,14 @@ mod tests {
         // 大写 + 双引号 + 相对路径
         let h2 = "<META HTTP-EQUIV=\"Refresh\" CONTENT=\"5; URL=/relative/path\">";
         assert_eq!(parse_meta_refresh(h2).as_deref(), Some("/relative/path"));
+        // data-url= 在 content 前不应被误匹配(chatgpt-codex review): 取 content 内的 url
+        assert_eq!(
+            parse_meta_refresh(
+                "<meta http-equiv='refresh' data-url='junk' content='0;url=https://e.com/real'>"
+            )
+            .as_deref(),
+            Some("https://e.com/real")
+        );
         // 非 refresh meta → None
         assert_eq!(parse_meta_refresh("<meta charset='utf-8'><p>hi</p>"), None);
     }
@@ -985,6 +1006,11 @@ mod tests {
         // 读取 location(无引号 URL)→ None, 不误跳
         assert_eq!(
             parse_js_location("<script>var x = location.href;</script>"),
+            None
+        );
+        // location.href == 比较(非赋值)不当跳转目标(chatgpt-codex review)
+        assert_eq!(
+            parse_js_location("<script>if(location.href=='https://old.com/x'){}</script>"),
             None
         );
     }

@@ -4,6 +4,10 @@
 
 ## v2.2.1 — 2026-06-04
 
+**web_fetch 客户端重定向跟随(MOC-139)**:`web_fetch` 现在能跟随 HTML `<meta http-equiv="refresh">` 与 JS `location.replace/assign/href` 跳转页(最多 3 跳,记 trail 防循环):curl/wreq/headless 三档只处理 HTTP 3xx、不识别这类客户端重定向,导致部分"占位跳转页"(如绕 Twitter/Substack 封锁的中间页)正文极少、模型"无法摘要";现跟随到目标 URL 重抓真实内容(真机验证:lcamtuf→substack 占位页 165 字符 → 真文章 10623 字符)。Refs MOC-139。
+
+**内置 MCP server 命名规范化(MOC-139 搭车)**:内置联网工具 MCP server 注册名 `cat-webfetch` → `CAT-WEB-MCP`;工具名 `web_fetch` / `web_search` 保留不变(模型识别最稳);诊断 viewer `kind=cat_webfetch` 标识符保持不变(内部诊断分类)。老用户 config 残留的 `cat-webfetch` server 条目在下次启动时自动迁移清理。Refs MOC-139。
+
 **web_fetch auto 档 — 自动升级 + per-origin 记忆 + 代理门控 (MOC-161)**:`WebFetchBackend::Auto` 成为推荐默认档,按页面难度信号自动从 curl 升级到 wreq 再到 headless;对每个域名记住上次成功档位,下次从该档起步省去无效试错;系统代理不可达时自动压制至 curl(wreq / headless 依赖代理可达),避免梯子未开时无声失败;首次升级到 headless 档同样触发 Chrome 下载确认。设置选项新增 `auto` 档。
 
 **内置 web_search 搜索工具 (MOC-12 P0)**:`crates/http` 新增 `search` 模块 —— `web_search(query, max_results)` 走 DuckDuckGo HTML SSR(`html.duckduckgo.com/html/`),用 headless Chromium 取页(DDG 对裸 HTTP 一律 202 反爬拦,必须真浏览器跑 JS),解析 `.result__a` / `.result__snippet`,解码 `uddg` redirect 拿真实落地 URL,过滤广告。返 `Vec<SearchResult>`(`title` / `url` / `snippet`);被反爬/无结果时返明确错误,不静默吐空。`mcp_webfetch_server` 同步新增 `web_search` 工具定义 + dispatch,`tools/list` 现在暴露 `web_fetch` + `web_search` 两个工具;`crates/http/Cargo.toml` 加 `dom_query` + `urlencoding`。**web_search 固定用 headless,不跟随 web_fetch 的 curl/wreq/headless 档位**(DDG 没有非 headless 可走的路径)。上游借鉴:`duckduckgo_search`(Python)/ `h2m-search`(Rust)。
