@@ -175,21 +175,28 @@ pub async fn enable_handler(
     // 活动已写回 chatgpt,apply relay 的 gate 通过 → Codex 原生显示 plugins,不启 daemon。
     let synced =
         crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(&state).await;
-    // [MOC-178 codex P2] direct provider 的 relay gate(apply 的 mode != "direct")会把 auth
-    // rewrite 回 apikey → 真实账号模式实际没生效。sync 后活动不再是 chatgpt = 本 provider 不支持
-    // relay(direct 等),回滚 flag、报错,避免「flag 说开但 Codex plugins disabled」状态不一致。
-    if !codex_real_account::active_is_real_chatgpt_now() {
+    // [MOC-178 codex P2 ×2] 开真实账号模式要 relay 真生效才算成功,两种失败都回滚 flag + 报错,
+    // 否则「flag 说开但 relay 没起」状态不一致:
+    // ① sync 失败(success:false)—— local_proxy 的 proxy 起不来(端口冲突等)在 apply 前 return,
+    //    此时活动仍是 activate 写的 chatgpt(`active_is_real_chatgpt_now` 仍 true,单查它漏判);
+    // ② sync 后活动不再 chatgpt —— direct provider 的 relay gate(mode != "direct")把 auth
+    //    rewrite 回 apikey。
+    let sync_ok = synced
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !sync_ok || !codex_real_account::active_is_real_chatgpt_now() {
         let _ = super::settings::set_real_account_mode_enabled(false);
         return err(
             StatusCode::BAD_REQUEST,
-            "当前 provider 不支持真实账号 relay(如 direct 模式),请切到 local_proxy 类 provider 再开".to_owned(),
+            "开启真实账号模式失败:当前 provider 不支持 relay(如 direct 模式),或系统代理未能启动。请检查 provider / 系统代理后重试".to_owned(),
         )
         .into_response();
     }
     Json(json!({
         "success": true,
         "enabled": true,
-        "applied": synced.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+        "applied": true,
         "message": "已开启真实账号模式",
     }))
     .into_response()
