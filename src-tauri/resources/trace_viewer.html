@@ -56,6 +56,12 @@
     border-radius: 6px; overflow-x: auto; font: 11px var(--mono); white-space: pre-wrap; word-break: break-word;
     max-height: 420px; overflow-y: auto; }
   .trunc { color: var(--warn); font-size: 11px; margin-top: 4px; }
+  .tools { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tools button { font-size: 11px; padding: 3px 8px; }
+  .tools button.done { border-color: var(--ok); color: var(--ok); }
+  pre.diff .del { color: var(--err); }
+  pre.diff .add { color: var(--ok); }
+  pre.diff .ctx { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -159,9 +165,77 @@
         Array.isArray(h[k]) ? h[k].join(", ") : h[k])}</td></tr>`).join("");
     return `<table class="hdr">${rows}</table>`;
   }
-  function seg(title, sub, inner) {
-    return `<details class="seg" open><summary><span>${esc(title)}</span><span>${esc(sub || "")}</span></summary>
+  function seg(title, sub, inner, open) {
+    const o = open === false ? "" : " open";
+    return `<details class="seg"${o}><summary><span>${esc(title)}</span><span>${esc(sub || "")}</span></summary>
       <div class="body">${inner}</div></details>`;
+  }
+
+  // [MOC-184] 取 body 文本(同 bodyBlock 的内容,用于 diff / 复制)
+  function bodyText(b) {
+    if (!b || b.content == null) return "";
+    return typeof b.content === "object" ? JSON.stringify(b.content, null, 2) : String(b.content);
+  }
+
+  // [MOC-184] OUTBOUND → curl(借鉴 claude-tap)。注:headers 已脱敏(authorization=***),
+  // 复刻的是请求**形状**;真要重放上游需自行把凭据填回。
+  function buildCurl(ob) {
+    if (!ob || !ob.url) return "";
+    const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+    let parts = ["curl -X " + (ob.method || "POST").toUpperCase() + " " + q(ob.url)];
+    const h = ob.headers || {};
+    Object.keys(h).forEach((k) => {
+      parts.push("-H " + q(k + ": " + (Array.isArray(h[k]) ? h[k].join(", ") : h[k])));
+    });
+    const body = bodyText(ob.body);
+    if (body) parts.push("--data-raw " + q(body));
+    return parts.join(" \\\n  ");
+  }
+
+  function copyText(s, btn) {
+    if (btn && !btn.dataset.orig) btn.dataset.orig = btn.textContent; // 连点也只记真正原文一次
+    const ok = () => {
+      if (!btn) return;
+      btn.classList.add("done"); btn.textContent = "已复制 ✓";
+      clearTimeout(btn._restore);
+      btn._restore = setTimeout(() => { btn.classList.remove("done"); btn.textContent = btn.dataset.orig; }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(s).then(ok, () => fallbackCopy(s, ok));
+    } else { fallbackCopy(s, ok); }
+  }
+  function fallbackCopy(s, ok) {
+    const ta = document.createElement("textarea");
+    ta.value = s; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); ok(); } catch (_) {}
+    document.body.removeChild(ta);
+  }
+
+  // [MOC-184] 行级 LCS diff(借鉴 claude-tap structural diff)。我们用 INBOUND↔OUTBOUND
+  // 看 adapter 把 Codex 请求转成了啥(跨协议会偏吵,但正是要看的转换结果)。两侧 pretty JSON 文本;
+  // 大体量降级避免 O(n·m) 爆。
+  function diffLines(aText, bText) {
+    if (!aText && !bText) return `<div class="meta">(两侧均无 body,无可 diff)</div>`;
+    const a = aText.split("\n"), b = bText.split("\n");
+    if (a.length > 1500 || b.length > 1500) {
+      return `<div class="trunc">⚠ 体量过大(${a.length}/${b.length} 行),跳过 diff,看上面两段原文</div>`;
+    }
+    const n = a.length, m = b.length;
+    const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--)
+      for (let j = m - 1; j >= 0; j--)
+        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    let i = 0, j = 0; const out = [];
+    while (i < n && j < m) {
+      if (a[i] === b[j]) { out.push(["ctx", "  " + a[i]]); i++; j++; }
+      else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push(["del", "- " + a[i]]); i++; }
+      else { out.push(["add", "+ " + b[j]]); j++; }
+    }
+    while (i < n) out.push(["del", "- " + a[i++]]);
+    while (j < m) out.push(["add", "+ " + b[j++]]);
+    const lines = out.map(([t, l]) => `<span class="${t}">${esc(l)}</span>`).join("\n");
+    return `<pre class="payload diff">${lines}</pre>`;
   }
 
   function renderDetail(t) {
@@ -169,23 +243,32 @@
     const k = kindOf(t);
     if (k === "cat_webfetch") { renderCatWebfetch(t); return; }
     if (k !== "forward") {
-      detailEl.innerHTML = `<pre class="payload">${esc(JSON.stringify(t, null, 2))}</pre>`;
+      detailEl.innerHTML = `<div class="tools"><button data-copy="full">复制 JSON</button></div>`
+        + `<pre class="payload">${esc(JSON.stringify(t, null, 2))}</pre>`;
       return;
     }
     const p = t.provider || {}, m = t.models || {}, ib = t.inbound || {}, ob = t.outbound || {}, rs = t.response || {};
     const meta = `provider: ${esc(p.id)} (${esc(p.api_format)} / ${esc(p.auth_scheme)}) · `
       + `models: ${esc(m.original)} → ${esc(m.resolved)} → ${esc(m.upstream)} · seq ${esc(t.seq)} · ${esc(t.captured_at)}`;
     detailEl.innerHTML = `<div class="meta">${meta}</div>`
+      + `<div class="tools">`
+      +   `<button data-copy="curl">复制 OUTBOUND curl</button>`
+      +   `<button data-copy="ob">复制 OUTBOUND body</button>`
+      +   `<button data-copy="ib">复制 INBOUND body</button>`
+      + `</div>`
       + seg("INBOUND · Codex 原始请求", `${esc(ib.method)} ${esc(ib.client_path || "")}${ib.client_query ? "?" + esc(ib.client_query) : ""}`,
           hdrTable(ib.headers) + bodyBlock(ib.body))
       + seg("OUTBOUND · 转换后发上游", esc(ob.url || ""), hdrTable(ob.headers) + bodyBlock(ob.body))
-      + seg("RESPONSE · 上游回包 (raw)", "status " + esc(rs.status), hdrTable(rs.headers) + bodyBlock(rs.body));
+      + seg("RESPONSE · 上游回包 (raw)", "status " + esc(rs.status), hdrTable(rs.headers) + bodyBlock(rs.body))
+      + seg("DIFF · INBOUND → OUTBOUND(adapter 改了啥)", "红=移除 绿=新增 · 跨协议偏吵正常",
+          diffLines(bodyText(ib.body), bodyText(ob.body)), false);
   }
 
   // MOC-181: cat-webfetch 链路详情(请求 / 抓取+升级链 / 摘要 prompt+响应 / 结果)。
   function renderCatWebfetch(t) {
     const r = t.request || {}, f = t.fetch || {}, s = t.summarize || {}, res = t.result || {};
     let html = `<div class="meta">tool: ${esc(t.tool)} · seq ${esc(t.seq)} · ${esc(t.captured_at)}</div>`;
+    html += `<div class="tools"><button data-copy="full">复制 JSON</button></div>`;
     html += seg("请求 · request", esc(t.tool || ""), hdrTable(r));
     if (f && Object.keys(f).length) {
       const fcopy = Object.assign({}, f); delete fcopy.escalation_trail;
@@ -225,6 +308,20 @@
     selected = Number(row.dataset.seq);
     renderList();
     renderDetail(traces.find((t) => t.seq === selected));
+  });
+  // [MOC-184] 详情区复制按钮(委托):curl / OUTBOUND body / INBOUND body / 整条 JSON
+  detailEl.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-copy]");
+    if (!btn) return;
+    const t = traces.find((x) => x.seq === selected);
+    if (!t) return;
+    const what = btn.dataset.copy;
+    let s = "";
+    if (what === "curl") s = buildCurl(t.outbound);
+    else if (what === "ob") s = bodyText((t.outbound || {}).body) || JSON.stringify(t.outbound || {}, null, 2);
+    else if (what === "ib") s = bodyText((t.inbound || {}).body) || JSON.stringify(t.inbound || {}, null, 2);
+    else s = JSON.stringify(t, null, 2);
+    copyText(s, btn);
   });
   $("#kind").addEventListener("change", renderList);
   $("#q").addEventListener("input", renderList);
