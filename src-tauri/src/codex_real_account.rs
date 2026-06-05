@@ -109,6 +109,27 @@ pub fn active_is_real_chatgpt_now() -> bool {
         .unwrap_or(false)
 }
 
+/// [MOC-178 codex P2] 是否有「可恢复的」导入镜像(存在 + access/refresh 非空 + 本地 JWT 未过期)。
+/// 供 migrate seed 判定「老用户之前在用真实账号」—— 有有效镜像 = 用户导入/钉住过、legacy
+/// reconcile 会从它恢复活动 chatgpt。只读,不写盘。
+pub fn has_restorable_imported_mirror() -> bool {
+    let Ok(paths) = CodexPaths::from_home_env() else {
+        return false;
+    };
+    let Some(v) = read_imported_mirror(&paths) else {
+        return false;
+    };
+    if parse_chatgpt_tokens(&v).is_none() {
+        return false;
+    }
+    let access = v
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    !access_token_expired(access, chrono::Utc::now().timestamp())
+}
+
 /// 从一个 `auth.json` Value 判断是否是**可用**的 chatgpt 登录态。
 /// 可用 = `auth_mode=="chatgpt"` 且 `tokens.{access_token,refresh_token}` 均非空。
 /// 返回 `account_id`(可能为 None)。
@@ -116,6 +137,14 @@ fn parse_chatgpt_auth(v: &Value) -> Option<ChatgptAuth> {
     if v.get("auth_mode").and_then(Value::as_str) != Some("chatgpt") {
         return None;
     }
+    parse_chatgpt_tokens(v)
+}
+
+/// [MOC-178] 只校验 chatgpt tokens 有效(access/refresh 非空),**不看 auth_mode**。供
+/// 「账号可用性」(`detect` 新口径)用:清除真实账号切 apikey 后 tokens 仍在活动文件 →
+/// 账号状态仍应「获取成功」、用户可再开真实账号模式。`parse_chatgpt_auth` 复用它再叠
+/// auth_mode==chatgpt 判定,供「活动当前就是 chatgpt」(relay 生效 / reconcile)用。
+fn parse_chatgpt_tokens(v: &Value) -> Option<ChatgptAuth> {
     let tokens = v.get("tokens").and_then(Value::as_object)?;
     let nonempty = |key: &str| {
         tokens
@@ -235,6 +264,36 @@ fn locate_chatgpt_auth(paths: &CodexPaths) -> Option<LocatedChatgptAuth> {
     None
 }
 
+/// [MOC-178] 定位有效 chatgpt **tokens**(不看 auth_mode):① 活动 auth.json 的 tokens 有效
+/// → Official;② 镜像有效 → Imported。供 `detect` 的「账号可用性」用 —— 清除真实账号切
+/// apikey 后活动 auth_mode=apikey 但 tokens 还在,仍定位得到(账号仍可用、可再开)。
+fn locate_chatgpt_tokens(paths: &CodexPaths) -> Option<LocatedChatgptAuth> {
+    if let Ok(v) = read_auth(&paths.auth_json) {
+        if let Some(parsed) = parse_chatgpt_tokens(&v) {
+            return Some(LocatedChatgptAuth {
+                path: paths.auth_json.clone(),
+                source: AuthSource::Official,
+                value: v,
+                account_id: parsed.account_id,
+            });
+        }
+    }
+    let mirror = imported_mirror_path(paths);
+    if mirror.is_file() {
+        if let Ok(v) = read_auth(&mirror) {
+            if let Some(parsed) = parse_chatgpt_tokens(&v) {
+                return Some(LocatedChatgptAuth {
+                    path: mirror,
+                    source: AuthSource::Imported,
+                    value: v,
+                    account_id: parsed.account_id,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// 读官方活动 `auth.json` 的 `auth_mode`(不存在/坏 → None)。检测结果里单独
 /// 报告活动模式,便于前端区分"活动就是 chatgpt" vs "活动 apikey、镜像有 chatgpt"。
 fn active_auth_mode(paths: &CodexPaths) -> Option<String> {
@@ -247,6 +306,48 @@ fn active_auth_mode(paths: &CodexPaths) -> Option<String> {
 
 /// 检测真实 chatgpt 账号:按"官方活动 → 持久镜像"定位可用凭据(见
 /// [`locate_chatgpt_auth`])。纯只读,绝不写盘 / spawn。
+/// [MOC-178 codex P2] 找「有效(非空 + 本地 JWT 未过期)」chatgpt token:活动有效 → Official;
+/// 活动无效/过期但镜像有效 → Imported;都无效 → None。区别于 `locate_chatgpt_tokens`(只判非空、
+/// 不判过期,供 reconcile「有 token 可保留」用):本函数供 detect 判「账号当前可用」——过期 token
+/// 不算可用(transfer 不刷新 token,过期只能靠重登 / 重新导入恢复)。只读。
+fn locate_valid_chatgpt_tokens(paths: &CodexPaths) -> Option<LocatedChatgptAuth> {
+    let valid = |v: &Value| -> bool {
+        let access = v
+            .get("tokens")
+            .and_then(|t| t.get("access_token"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        parse_chatgpt_tokens(v).is_some()
+            && !access_token_expired(access, chrono::Utc::now().timestamp())
+    };
+    if let Ok(v) = read_auth(&paths.auth_json) {
+        if valid(&v) {
+            let account_id = parse_chatgpt_tokens(&v).and_then(|c| c.account_id);
+            return Some(LocatedChatgptAuth {
+                path: paths.auth_json.clone(),
+                source: AuthSource::Official,
+                value: v,
+                account_id,
+            });
+        }
+    }
+    let mirror = imported_mirror_path(paths);
+    if mirror.is_file() {
+        if let Ok(v) = read_auth(&mirror) {
+            if valid(&v) {
+                let account_id = parse_chatgpt_tokens(&v).and_then(|c| c.account_id);
+                return Some(LocatedChatgptAuth {
+                    path: mirror,
+                    source: AuthSource::Imported,
+                    value: v,
+                    account_id,
+                });
+            }
+        }
+    }
+    None
+}
+
 pub fn detect() -> RealAccountStatus {
     let Ok(paths) = CodexPaths::from_home_env() else {
         // 连 home 都解析不到 —— 当作"没有",不 panic。
@@ -254,25 +355,14 @@ pub fn detect() -> RealAccountStatus {
     };
     let active_mode = active_auth_mode(&paths);
     let has_imported = read_imported_mirror(&paths).is_some();
-    match locate_chatgpt_auth(&paths) {
+    // [MOC-178] 账号可用性认 token(活动或镜像有**有效**chatgpt token,含本地 JWT 未过期),不看
+    // auth_mode —— 清除切 apikey 后 tokens 仍在且未过期 → 账号状态仍「获取成功」、用户可再开。
+    match locate_valid_chatgpt_tokens(&paths) {
         Some(found) => {
-            // [connector review 自愈] 活动文件本身是真实 chatgpt 且 access_token 未过期
-            // (本地 JWT exp 判断,无网络)= 账号当前确实可用 → 清掉可能 stale 的
-            // 「需重新登录」标记。覆盖用户在 app 外重新 `codex login` / 直接恢复活动文件、
-            // 不经 import/login/reconcile 入口的场景。只在有「确实有效」的本地证据时清:
-            // access_token 过期则不清(避免把真失效误报成「获取成功」)。
+            // [connector review 自愈] 活动文件就是有效真实 chatgpt = 账号当前确实可用 → 清掉可能
+            // stale 的「需重新登录」标记(覆盖 app 外重新 codex login / 直接恢复活动文件场景)。
             if found.source == AuthSource::Official {
-                let access = found
-                    .value
-                    .get("tokens")
-                    .and_then(|t| t.get("access_token"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !access.is_empty()
-                    && !access_token_expired(access, chrono::Utc::now().timestamp())
-                {
-                    set_relogin_required(false);
-                }
+                set_relogin_required(false);
             }
             RealAccountStatus {
                 logged_in: true,
@@ -283,7 +373,15 @@ pub fn detect() -> RealAccountStatus {
                 relogin_required: relogin_required(),
             }
         }
-        None => RealAccountStatus::none(active_mode, has_imported),
+        None => {
+            // [MOC-178 codex P2] 没有**有效**token。但若有 token(非空、只是过期 —— locate_chatgpt_tokens
+            // 认非空)→ 标记需重登:清除后 tokens 留活动文件、随时间过期,不标记会让 dashboard 报账号
+            // 可用 + offer enable,enable 时 activate 才 reject expired(UI vs reality 不一致)。
+            if locate_chatgpt_tokens(&paths).is_some() {
+                set_relogin_required(true);
+            }
+            RealAccountStatus::none(active_mode, has_imported)
+        }
     }
 }
 
@@ -303,6 +401,9 @@ pub enum ReconcileOutcome {
     /// 真实账号**不可用**:本地 JWT 已过期 / 镜像废 token —— 需要重新登录。上层据此
     /// 自动关「自动解锁」开关 + emit 事件提示用户重登。
     ReloginRequired { source: AuthSource },
+    /// [MOC-178] 用户主动关了真实账号模式(flag=false),但活动可能被退出 restore 写回 chatgpt。
+    /// caller 据此 apply 切 apikey 收敛回关闭态(保留 tokens),在 daemon 决策前执行。
+    ForceDisable { had_valid_token: bool },
 }
 /// 解析 JWT 的 payload(第二段,base64url no-pad)。失败返 None。
 fn jwt_payload(token: &str) -> Option<Value> {
@@ -534,16 +635,94 @@ pub async fn forget_imported() -> Result<bool, String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let mirror = imported_mirror_path(&paths);
-    if !mirror.is_file() {
-        return Ok(false);
+    let had_mirror = mirror.is_file();
+    if had_mirror {
+        std::fs::remove_file(&mirror).map_err(|e| format!("删持久镜像失败: {e}"))?;
+        // [MOC-104 导入分流] 镜像删了,导入来源路径记录也一并清(否则 reconcile 还会从旧
+        // 源路径重读、把已"忘记"的账号复活)。
+        write_imported_source_path(&paths, None);
     }
-    std::fs::remove_file(&mirror).map_err(|e| format!("删持久镜像失败: {e}"))?;
-    // [MOC-104 导入分流] 镜像删了,导入来源路径记录也一并清(否则 reconcile 还会从旧
-    // 源路径重读、把已"忘记"的账号复活)。
-    write_imported_source_path(&paths, None);
     // [connector review] 清除账号后不再有可重登的保留账号 → 清掉「需重新登录」标记,
     // 否则 status 仍带 relogin_required=true,UI 继续提示「账号已失效」要重登。
     set_relogin_required(false);
+    // [MOC-178] 不在这里删/改活动 auth.json —— 删整个文件会丢 tokens(退出 restore 只恢复
+    // MANAGED 的 auth_mode/OPENAI_API_KEY、tokens 恢复不回 → 残缺)。停用真实账号(让 toggle
+    // 关 + Codex 原生不显示 plugins)改由 forget_handler apply 当前 provider 强制 non-relay
+    // 完成:写 auth_mode=apikey 但**保留 tokens**,退出 restore 才能写回 chatgpt + tokens 完整恢复。
+    Ok(had_mirror)
+}
+
+/// [MOC-178] 开真实账号模式:把活动 auth.json 写回 `auth_mode=chatgpt` + 有效 tokens,使
+/// 后续 apply relay 的 gate(`active_is_real_chatgpt_now`)通过、Codex 原生显示 plugins。
+/// 优先用活动现存 tokens(清除切 apikey 后 tokens 仍在 → 只需改 auth_mode + 删 apikey key);
+/// 活动无有效 token 则从持久镜像恢复整份。先备份再写。持 `AUTH_LOCK`。返回是否成功激活
+/// (有可用 token);无可用 token → `Ok(false)`(caller 提示重登)。
+pub async fn activate_real_account() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    // 已是真实 chatgpt → no-op 成功。
+    if active_is_real_chatgpt(&paths) {
+        return Ok(true);
+    }
+    // 活动有有效 chatgpt tokens(但 auth_mode 非 chatgpt,如清除后的 apikey)→ 只改 auth_mode。
+    // [codex-review P2] 必须连本地 JWT 过期一起判 —— parse_chatgpt_tokens 只校验非空,清除后保留的
+    // token 会随时间过期;不检查会激活 expired token + 报 Ok(true),前端显示「已开启」但 runtime 全
+    // 401,还会 shadow 掉下面可能有效的镜像(本分支 early-return 在镜像分支前)。过期则 fall through
+    // 到镜像分支(下面会判过期再决定是否恢复)。
+    if let Ok(mut v) = read_auth(&paths.auth_json) {
+        if parse_chatgpt_tokens(&v).is_some() {
+            let access = v
+                .get("tokens")
+                .and_then(|t| t.get("access_token"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !access_token_expired(access, chrono::Utc::now().timestamp()) {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
+                    obj.remove("OPENAI_API_KEY");
+                }
+                backup_active_auth(&paths, "preactivate")?;
+                write_auth(&paths.auth_json, &v).map_err(|e| format!("写回 chatgpt 失败: {e}"))?;
+                return Ok(true);
+            }
+        }
+    }
+    // 活动无 token → 从持久镜像恢复整份(镜像有效且本地 JWT 未过期)。
+    if let Some(v) = read_imported_mirror(&paths) {
+        let access = v
+            .get("tokens")
+            .and_then(|t| t.get("access_token"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !access.is_empty() && !access_token_expired(access, chrono::Utc::now().timestamp()) {
+            backup_active_auth(&paths, "preactivate")?;
+            write_auth(&paths.auth_json, &v).map_err(|e| format!("从镜像恢复失败: {e}"))?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// [MOC-178 codex P2] 关真实账号模式的 auth 兜底:直接改活动 auth.json `auth_mode=apikey`
+/// (保留 tokens),**不依赖 provider config**。forget / enable 失败回滚走的 sync 路径依赖
+/// active provider(无 provider(默认 activeProvider null)/ apply 失败 → sync success:false、
+/// 活动仍 chatgpt),用本函数兜底确保活动不留 chatgpt(否则 Codex 仍显示 plugins、跟 flag=false
+/// 不一致,要等下次启动 ForceDisable 才纠)。持 `AUTH_LOCK`。返回是否执行了切换(活动本就
+/// 非 chatgpt → `Ok(false)` no-op)。
+pub async fn deactivate_real_account() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let Ok(mut v) = read_auth(&paths.auth_json) else {
+        return Ok(false);
+    };
+    if v.get("auth_mode").and_then(Value::as_str) != Some("chatgpt") {
+        return Ok(false);
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("auth_mode".into(), Value::String("apikey".into()));
+    }
+    backup_active_auth(&paths, "predeactivate")?;
+    write_auth(&paths.auth_json, &v).map_err(|e| format!("切 apikey 失败: {e}"))?;
     Ok(true)
 }
 
@@ -553,7 +732,7 @@ pub async fn forget_imported() -> Result<bool, String> {
 /// **活源路径**重读最新(跟随源 Codex 刷新)、源失效回落镜像快照,先备份再写。**只对
 /// 用户显式导入/钉住的账号自动恢复**,不抢别的活动文件(避免误覆盖代理 apikey)。
 /// 选中那份本地 JWT 已过期 → 标记 relogin、不写废 token。best-effort。
-pub async fn reconcile_on_startup() -> Result<ReconcileOutcome, String> {
+pub async fn reconcile_on_startup(mode_enabled: Option<bool>) -> Result<ReconcileOutcome, String> {
     // [review #2] 有 codex login 正在进行 → 跳过调谐,别跟 codex login 抢写 auth.json。
     if matches!(login_status(), LoginState::Running) {
         tracing::info!("[RealAccount] 启动调谐跳过:codex login 进行中");
@@ -572,6 +751,15 @@ pub async fn reconcile_on_startup() -> Result<ReconcileOutcome, String> {
         return Ok(ReconcileOutcome::NoAccount);
     }
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+
+    // [MOC-178] 用户主动关了真实账号模式(flag=false)→ 即便退出 restore 把活动写回 chatgpt,
+    // 也收敛回 apikey(由 caller apply,在 daemon 决策前),且**不**从镜像恢复活动(尊重关闭意图)。
+    if mode_enabled == Some(false) {
+        let had = active_is_real_chatgpt(&paths) || locate_chatgpt_tokens(&paths).is_some();
+        return Ok(ReconcileOutcome::ForceDisable {
+            had_valid_token: had,
+        });
+    }
 
     // 活动已是真实 chatgpt → 共用、绝不动(Codex 自维护这份,transfer 只读跟随、不覆盖)。
     if active_is_real_chatgpt(&paths) {
