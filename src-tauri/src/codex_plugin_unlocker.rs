@@ -951,8 +951,12 @@ async fn inject_unlock_script(
     function scheduleUnlock() {
         if (window[MARKER].scanPending) return;
         window[MARKER].scanPending = true;
-        setTimeout(() => {
+        // [MOC-178] 存 timer id 供卸载 clearTimeout;回调里查 uninstalled 防卸载后这条
+        // 已入队的 runUnlock 重新 spoof(observer.disconnect 拦不住已排队的 200ms timeout)。
+        window[MARKER].scanTimer = setTimeout(() => {
             window[MARKER].scanPending = false;
+            window[MARKER].scanTimer = null;
+            if (window[MARKER].uninstalled) return;
             runUnlock();
         }, 200);
     }
@@ -1111,8 +1115,12 @@ async fn inject_uninstall_script(
 (function () {
     const M = window['__codexAppTransferPluginUnlocker'];
     if (!M) return { ok: true, reason: 'not_installed' };
-    // 1. 停自愈 observer(不再 DOM 变就重 spoof)
+    // 1. 停自愈 observer + 取消已排队的 scheduleUnlock(observer.disconnect 拦不住已入队
+    //    的 200ms timeout;不取消则卸载后它仍 runUnlock 重新 spoof → toggle off 失效)。
+    //    M.uninstalled 在末尾置 true 后,回调即便漏网也会自查跳过(双保险,codex P2)。
     try { if (M.observer) { M.observer.disconnect(); M.observer = null; } } catch (e) {}
+    try { if (M.scanTimer) { clearTimeout(M.scanTimer); M.scanTimer = null; } } catch (e) {}
+    M.scanPending = false;
     // 2. 清 click listener(capture 注册无引用,靠 AbortController signal 一并 abort)
     try { if (M.abort) { M.abort.abort(); M.abort = null; } } catch (e) {}
     // 3. 反向 setAuthMethod 回原值 → Codex 据 authMethod 重渲,plugins 入口回 disabled。
