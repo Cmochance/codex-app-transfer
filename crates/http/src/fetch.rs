@@ -455,6 +455,9 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
     // 记每档为何升级, 最终失败时拼进错误 —— 否则只看到"headless 失败", 不知 curl/wreq 为何升级
     // (review H1)。
     let mut trail: Vec<String> = Vec::new();
+    // 升级链里最后一个非空 body —— headless 失败时回退它, 避免把 curl/wreq 已拿到的内容变成
+    // Auto error(启发式升级如 is_js_shell 可能误判短静态页, chatgpt-codex review)。
+    let mut last_usable: Option<Fetched> = None;
     for &tier in &AUTO_TIERS[start_idx..] {
         if tier == WebFetchBackend::Headless {
             // headless 是终极兜底 (跑 JS), 无"升级信号"可言 —— 成功即返回, 失败即整体失败。
@@ -470,10 +473,15 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
                     });
                 }
                 Err(e) => {
+                    // headless 失败但升级链中有非空 body → 回退它(非破坏性降级)。不 remember
+                    // headless(它失败了), 也不记那档(它被判过升级信号, 记了下次还从那升)。
+                    if let Some(f) = last_usable.take() {
+                        return Ok(f);
+                    }
                     return Err(WebFetchError::Auto(format!(
                         "升级历程 [{}] 后 headless 仍失败: {e}",
                         trail.join("; ")
-                    )))
+                    )));
                 }
             }
         }
@@ -494,13 +502,25 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
             }
             // 有升级信号 (反爬 / 空 / JS 骨架) → 记原因, 升级到下一档。
             Ok(raw) => {
+                let is_shell = raw.is_html && is_js_shell(&raw.body);
                 trail.push(format!(
-                    "{tier:?}(status={} cf_hdr={} 空={} 骨架={})",
+                    "{tier:?}(status={} cf_hdr={} 空={} 骨架={is_shell})",
                     raw.status,
                     raw.cf_challenge_header,
                     raw.body.trim().is_empty(),
-                    raw.is_html && is_js_shell(&raw.body)
                 ));
+                // 留作 headless 失败时的回退 —— 判据见 worth_fallback: 仅纯 JS 骨架启发式(可能误判
+                // 短静态页)才存; 反爬 / 空 / 非-200 不存(回退挑战页/空会误导模型, Auto error 更清晰)。
+                // 后到的合格档覆盖前面的。
+                if worth_fallback(&raw) {
+                    last_usable = Some(Fetched {
+                        body: raw.body,
+                        is_html: raw.is_html,
+                        final_tier: tier,
+                        trail: trail.clone(),
+                        status: Some(raw.status),
+                    });
+                }
                 continue;
             }
             // 二进制 / 超大: 升级也没用 (内容本身不抓), 直接返回。
@@ -517,6 +537,20 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
         "所有后端均失败: {}",
         trail.join("; ")
     )))
+}
+
+/// auto 升级时, 该档 raw 是否值得留作 headless 失败的回退 body。**仅纯 JS 骨架启发式** ——
+/// `is_js_shell` 可能把短静态页误判成空壳, 误升后若 headless 起不来, 回退它好过把 curl 已拿到的
+/// 成功 body 变 Auto error(破坏性降级, chatgpt-codex review)。但反爬挑战页(结构上也像 shell,
+/// `is_js_shell` 兜不住)/ 空 body / 非-200 是**确定**失败信号, 回退它们会把挑战页/空当内容误导
+/// 模型 —— 显式排除, 让 Auto error 兜底更清晰。
+fn worth_fallback(raw: &RawFetch) -> bool {
+    raw.status == 200
+        && raw.is_html
+        && !raw.cf_challenge_header
+        && !raw.body.trim().is_empty()
+        && !is_challenge_body(&raw.body)
+        && is_js_shell(&raw.body)
 }
 
 /// 这次抓取是否"不可恢复"—— 换 client 或 headless 渲染错误页都救不了, Auto 直接报错(不升级、不当
@@ -609,11 +643,44 @@ fn has_app_bundle_script(html: &str) -> bool {
     if !lower.contains("<script") {
         return false;
     }
-    lower.contains("type=\"module\"")
+    // ESM module 声明: 三种引号变体(双 / 单 / 无)。single-quote 由 devin review 补 —— inline
+    // `<script type='module'>` 无 .js/.mjs 时原本漏判。
+    if lower.contains("type=\"module\"")
+        || lower.contains("type='module'")
         || lower.contains("type=module")
-        || lower.contains(".js\"")
-        || lower.contains(".js'")
-        || lower.contains(".mjs")
+    {
+        return true;
+    }
+    // 外部 .js/.mjs bundle 引用(含 cache-bust query `app.js?v=1`, chatgpt-codex review)。
+    has_js_bundle_url(&lower)
+}
+
+/// `lower`(已小写)是否含 `.js`/`.mjs` 后接 URL 结束符的子串 —— 外部 JS bundle 引用。结束符:
+/// 引号 / query `?` / fragment `#` / 空白 / `>` / 串尾。避免 `.json`/`.jsx`(后接字母)误命中,
+/// 容忍 cache-bust query(`app.js?v=123`, chatgpt-codex)。
+fn has_js_bundle_url(lower: &str) -> bool {
+    for pat in [".mjs", ".js"] {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(pat) {
+            let end = from + rel + pat.len();
+            from = end;
+            match lower[end..].chars().next() {
+                None => return true,
+                Some(c)
+                    if c == '"'
+                        || c == '\''
+                        || c == '?'
+                        || c == '#'
+                        || c == '>'
+                        || c.is_ascii_whitespace() =>
+                {
+                    return true
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// SPA 骨架特征: 已知框架挂载点 (root/app/__next/__nuxt/ng-app/reactroot) + 页面挂着 `<script`
@@ -1066,8 +1133,67 @@ mod tests {
             !is_js_shell("<html><body><p>Status: OK</p><script>track();</script></body></html>"),
             "静态短页 + inline script(无 bundle)不应误升"
         );
-        // 已知 trade-off(MOC-183): 静态短页若引外部 `.js`(如 analytics)会被判 shell → auto 档
-        // 多花一次 headless(结果不差: headless 渲染静态页 = 同内容)。这类页 MOC-152 证明罕见。
+        // devin review: inline 单引号 `type='module'`(无 .js/.mjs)也应判 shell。
+        assert!(
+            is_js_shell(
+                "<html><body><div id=\"x\"></div>\
+                 <script type='module'>import {a} from '/a'; a.mount('#x')</script></body></html>"
+            ),
+            "单引号 type='module' 应判 shell"
+        );
+        // chatgpt-codex review: cache-bust 的 `.js?v=123` bundle 也应判 shell(.js 后跟 ?)。
+        assert!(
+            is_js_shell(
+                "<html><body><main id=\"wrap\"></main>\
+                 <script src=\"/assets/app.js?v=123\"></script></body></html>"
+            ),
+            "cache-bust .js?v= bundle 应判 shell"
+        );
+        // 边界: `.json` / `.jsx`(后接字母)不应被当 .js bundle 误命中。
+        assert!(
+            !is_js_shell(
+                "<html><body><p>x</p><script>fetch(\"/data.json\")</script></body></html>"
+            ),
+            ".json 不应误命中 .js bundle"
+        );
+        // 已知 trade-off(MOC-183): 静态短页若引外部 `.js`(如 analytics)会被判 shell → auto 升
+        // headless。**chatgpt-codex review 后已加兜底**: headless 失败时 web_fetch_auto 回退升级
+        // 链最后一个非空 body(见 last_usable), 不再把 curl 成功变 Auto error。误升仅多花一次
+        // headless(成功时结果不差), 这类页 MOC-152 证明罕见。
+    }
+
+    #[test]
+    fn worth_fallback_only_pure_js_shell() {
+        let mk = |status: u16, cf: bool, body: &str| RawFetch {
+            status,
+            body: body.to_string(),
+            is_html: true,
+            cf_challenge_header: cf,
+        };
+        let shell = "<html><body><main id=\"x\"></main>\
+            <script type=\"module\" src=\"/a.js\"></script></body></html>";
+        // 纯 JS 骨架(200 / 无反爬) → 留作回退
+        assert!(worth_fallback(&mk(200, false, shell)));
+        // CF 挑战页: 结构上也像 shell(is_js_shell=true), 但 is_challenge_body 命中 → **不留**
+        // (chatgpt-codex review: 回退挑战页会当内容误导模型)。
+        assert!(
+            !worth_fallback(&mk(
+                200,
+                false,
+                "<html><head><title>just a moment</title></head><body><div id=\"app\"></div>\
+                 <script type=\"module\" src=\"/cf.js\"></script>challenge-platform</body></html>"
+            )),
+            "CF 挑战页不应留作回退"
+        );
+        assert!(!worth_fallback(&mk(200, true, shell)), "cf header 不应留");
+        assert!(!worth_fallback(&mk(200, false, "   ")), "空 body 不应留");
+        assert!(!worth_fallback(&mk(202, false, shell)), "非-200 不应留");
+        // 内容页(vtext 够 → 非 shell)即便带 module 也不留。
+        let content = format!(
+            "<html><body><article>{}</article><script type=\"module\"></script></body></html>",
+            "正文内容".repeat(60)
+        );
+        assert!(!worth_fallback(&mk(200, false, &content)), "内容页不应留");
     }
 
     /// 端到端真机 (网络 + headless): Auto 档抓 DDG (curl/wreq 必被 202 反爬, 应自动升到 headless
