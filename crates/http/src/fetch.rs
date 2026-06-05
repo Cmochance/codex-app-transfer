@@ -896,42 +896,61 @@ fn parse_meta_refresh(html: &str) -> Option<String> {
     None
 }
 
-/// 解析 JS 跳转 `window.location.replace('T')` / `location.assign('T')` / `location.href='T'`
-/// / `location='T'` 的目标 (取第一个命中)。URL 须以 `http` / `/` 开头 (排除非跳转的 location 读取)。
+/// 解析 JS 跳转: `location.replace('T')` / `location.assign('T')` / `location[.href] = 'T'`
+/// (`window.`/`document.` 前缀 + **等号周围空格**容忍, 排除 `==` 比较)。URL 须 `http` / `/` 开头。
+/// 遍历每个 `location` token(前须非 ident, 避免 `allocation`/`geolocation` 误命中, chatgpt review)。
 fn parse_js_location(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
-    for pat in [
-        "location.replace(",
-        "location.assign(",
-        "location.href",
-        ".location=",
-    ] {
-        let Some(rel) = lower.find(pat) else {
-            continue;
-        };
-        let after = &html[rel + pat.len()..];
-        // `location.href` 须是**赋值**(单 `=`)不是**比较**(`==`)—— 排除 `if(location.href=='x')`
-        // 这类读取(chatgpt-codex review)。replace(/assign( 是调用、.location= 已含 =, 不受此限。
-        if pat == "location.href" {
-            let t = after.trim_start();
-            if !t.starts_with('=') || t.starts_with("==") {
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("location") {
+        let start = from + rel;
+        from = start + "location".len();
+        // 边界: location 前须非 ident(避免 allocation / geolocation 等子串误匹配)。
+        if start > 0 {
+            let p = bytes[start - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' {
                 continue;
             }
         }
-        // pat 后找第一个引号, 取引号内 URL。
-        let Some(q) = after.find(['"', '\'']) else {
+        let after = &html[from..];
+        let after_lo = &lower[from..];
+        // ① 函数调用: location.replace(...) / location.assign(...)。
+        if after_lo.starts_with(".replace(") || after_lo.starts_with(".assign(") {
+            if let Some(u) = first_quoted_url(after) {
+                return Some(u);
+            }
             continue;
+        }
+        // ② 赋值: location.href = 'T' 或 location = 'T'(容忍等号空格 + 引号须紧跟, 排除 == 比较)。
+        let rest = if after_lo.starts_with(".href") {
+            &after[".href".len()..]
+        } else {
+            after
         };
-        let quote = after.as_bytes()[q] as char;
-        let rest = &after[q + 1..];
-        if let Some(e) = rest.find(quote) {
-            let url = rest[..e].trim();
-            if url.starts_with("http") || url.starts_with('/') {
-                return Some(url.to_string());
+        if let Some(v) = rest.trim_start().strip_prefix('=') {
+            let v = v.trim_start();
+            if v.starts_with('=') {
+                continue; // `==` 比较, 非赋值
+            }
+            if v.starts_with(['"', '\'']) {
+                if let Some(u) = first_quoted_url(v) {
+                    return Some(u);
+                }
             }
         }
     }
     None
+}
+
+/// 取 `s` 中第一个引号包裹、`http`/`/` 开头的 URL(用于 JS 跳转目标提取)。
+fn first_quoted_url(s: &str) -> Option<String> {
+    let q = s.find(['"', '\''])?;
+    let quote = s.as_bytes()[q] as char;
+    let rest = &s[q + 1..];
+    let e = rest.find(quote)?;
+    let url = rest[..e].trim();
+    (url.starts_with("http") || url.starts_with('/')).then(|| url.to_string())
 }
 
 /// 相对 URL → 绝对 (用 `base_url` 解析; 已是绝对则规范化原样返回)。
@@ -1011,6 +1030,20 @@ mod tests {
         // location.href == 比较(非赋值)不当跳转目标(chatgpt-codex review)
         assert_eq!(
             parse_js_location("<script>if(location.href=='https://old.com/x'){}</script>"),
+            None
+        );
+        // window.location = 等号空格赋值(chatgpt-codex review 第 2 轮)
+        assert_eq!(
+            parse_js_location("<script>window.location = \"/next\"</script>").as_deref(),
+            Some("/next")
+        );
+        assert_eq!(
+            parse_js_location("<script>document.location = 'https://e.com/c'</script>").as_deref(),
+            Some("https://e.com/c")
+        );
+        // allocation / geolocation 子串不误命中 location(前是 ident)
+        assert_eq!(
+            parse_js_location("<script>var allocation='https://x.com'</script>"),
             None
         );
     }
