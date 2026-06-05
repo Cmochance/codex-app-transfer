@@ -172,6 +172,17 @@ pub fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConf
     ))
 }
 
+/// [MOC-178 codex P2] 当前 active provider 是否支持真实账号 relay = 有 active provider 且走 proxy
+/// (local_proxy 类,requires_proxy=true)。direct(bypass_proxy 直连)**或无 provider**(默认
+/// activeProvider null、无 target)→ false:不代理 / 没法 apply relay,保不住 chatgpt 态,不该开真实
+/// 账号模式 flag(startup 收敛关 / pin 只 save 镜像)。只读,不写盘。
+pub fn active_provider_supports_relay() -> bool {
+    crate::admin::registry_io::load()
+        .ok()
+        .and_then(|cfg| desktop_target_for_active_provider(&cfg).map(|t| t.requires_proxy))
+        .unwrap_or(false)
+}
+
 pub fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> {
     catalog_models_for_provider_with_display_names(
         &target.provider_name,
@@ -377,13 +388,30 @@ pub fn desktop_health(
 }
 
 pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, String> {
+    apply_desktop_target_impl(target, false)
+}
+
+/// [MOC-178] 清除真实账号专用:强制 non-relay(不看 active_is_real_chatgpt_now),apply 写
+/// auth_mode=apikey + OPENAI_API_KEY 但**保留 tokens**(MANAGED 只 auth_mode/OPENAI_API_KEY),
+/// 使 toggle 关 + Codex 原生不显示 plugins,而退出 restore 仍能写回 chatgpt + tokens 完整恢复
+/// (对比"删活动 auth.json"会丢 tokens、restore 恢复不回)。
+pub fn apply_desktop_target_clearing_real(target: &DesktopConfigTarget) -> Result<Value, String> {
+    apply_desktop_target_impl(target, true)
+}
+
+fn apply_desktop_target_impl(
+    target: &DesktopConfigTarget,
+    force_apikey: bool,
+) -> Result<Value, String> {
     let paths = CodexPaths::from_home_env().map_err(|e| e.to_string())?;
     // [MOC-104] relay 模式 gate:仅 proxy 模式(非 direct)+ 活动已是可用真实
     // chatgpt 时,apply 保留 chatgpt 登录态(让 Codex 原生显示 Plugins 入口、
     // 不再依赖 CDP daemon 注入,消除 MOC-100 高延迟)。direct 直连 bypass proxy、
     // 凭据直接用 auth.json 发上游,保留 chatgpt token 直连第三方会 401 → 不 relay。
-    let preserve_chatgpt_auth =
-        target.mode != "direct" && crate::codex_real_account::active_is_real_chatgpt_now();
+    // [MOC-178] force_apikey(清除真实账号)强制不 relay,即便活动仍是 chatgpt。
+    let preserve_chatgpt_auth = !force_apikey
+        && target.mode != "direct"
+        && crate::codex_real_account::active_is_real_chatgpt_now();
     let result = apply_provider(
         &paths,
         &ApplyConfig {
@@ -404,10 +432,27 @@ pub fn apply_desktop_target(target: &DesktopConfigTarget) -> Result<Value, Strin
         },
     )
     .map_err(|e| format!("apply 失败: {e}"))?;
+    // [MOC-178 codex P2] apply direct target 时持久关真实账号模式 flag —— direct(bypass_proxy 直连)
+    // 不代理、不支持 chatgpt relay,apply 已把活动 rewrite 回 apikey。一处覆盖所有 apply direct 路径
+    // (startup auto_apply / runtime 切 provider / enable 误开),避免「flag 还 true 但 plugins locked」
+    // 状态不一致(否则 UI 据 flag 说 mode on,要等下次 startup reconcile 的 direct 收敛才纠)。
+    if target.mode == "direct" {
+        let _ = crate::admin::handlers::settings::set_real_account_mode_enabled(false);
+    }
     serde_json::to_value(result).map_err(|e| format!("apply 结果序列化失败: {e}"))
 }
 
 pub async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
+    sync_desktop_for_active_provider_impl(state, false).await
+}
+
+/// [MOC-178] 清除真实账号:apply 当前 active provider 强制切 apikey(写 auth_mode=apikey、
+/// 保留 tokens),停用真实账号但退出 restore 能完整恢复 chatgpt。见 forget_handler。
+pub async fn sync_desktop_clearing_real_account(state: &AdminState) -> Value {
+    sync_desktop_for_active_provider_impl(state, true).await
+}
+
+async fn sync_desktop_for_active_provider_impl(state: &AdminState, force_apikey: bool) -> Value {
     let target_result = with_config_write(|cfg| {
         let Some(provider) = active_provider(cfg) else {
             return Err("no default provider".into());
@@ -432,14 +477,28 @@ pub async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
         match start_proxy_if_needed(&state.proxy_manager, target.proxy_port).await {
             Ok(started) => proxy_started = started,
             Err(e) => {
-                return json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "message": e});
+                // [MOC-178 codex P2] 清除真实账号(force_apikey)只需切 auth_mode=apikey、不依赖
+                // proxy。proxy 起不来(端口冲突等)时,正常 apply 仍 return 失败;但 force_apikey
+                // 必须继续走到 auth rewrite —— 否则 flag 已置 false、镜像已删,活动却留 chatgpt,
+                // UI 显示 off 但 Codex 还显示 plugins(状态不一致)。故 force_apikey 下只 warn、继续。
+                if !force_apikey {
+                    return json!({"attempted": true, "success": false, "mode": target.mode, "requiresProxy": target.requires_proxy, "message": e});
+                }
+                tracing::warn!(
+                    "[MOC-178] 清除真实账号:proxy 起不来({e}),仍继续切 apikey(auth rewrite 优先)"
+                );
             }
         }
     } else {
         state.proxy_manager.stop_silent();
     }
 
-    match apply_desktop_target(&target) {
+    let apply_result = if force_apikey {
+        apply_desktop_target_clearing_real(&target)
+    } else {
+        apply_desktop_target(&target)
+    };
+    match apply_result {
         Ok(mut result) => {
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("attempted".into(), Value::Bool(true));

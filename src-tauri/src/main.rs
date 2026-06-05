@@ -278,7 +278,54 @@ fn main() {
                 // refresh_token(实测撞刷会触发 refresh_token_reused 把账号烧死)。
                 {
                     use crate::codex_real_account::ReconcileOutcome;
-                    match crate::codex_real_account::reconcile_on_startup().await {
+                    // [MOC-178 codex P2] 本 spawned task 与同步段的 migrate 无顺序保证 → 首次升级
+                    // 可能在 migrate 前读到 flag=None、跳过下面的 direct 收敛。reconcile 读 flag 前先跑
+                    // migrate(幂等,已设则 no-op),确保读到落定值(有账号→true/无→false,不再 None)。
+                    let _ = handlers::settings::migrate_real_account_mode_v1();
+                    let mut mode_enabled = handlers::settings::read_real_account_mode_enabled();
+                    // [MOC-178 codex P2] provider 不支持 relay(direct 直连 **或无 active provider**)→
+                    // 真实账号 relay 无法生效。即便 flag=true(migrate 落定 / pin / 历史),也持久关 flag +
+                    // 当 false 走 ForceDisable 收敛 apikey,避免「flag on 但 plugins locked」+ direct apply
+                    // apikey 后 reconcile 又恢复 chatgpt 的反复。切回 local_proxy provider 后用户手动再开。
+                    if mode_enabled == Some(true)
+                        && !admin::services::desktop::snapshot::active_provider_supports_relay()
+                    {
+                        let _ = handlers::settings::set_real_account_mode_enabled(false);
+                        mode_enabled = Some(false);
+                    }
+                    match crate::codex_real_account::reconcile_on_startup(mode_enabled).await {
+                        // [MOC-178] 用户主动关了真实账号模式(flag=false),活动可能被退出 restore
+                        // 写回 chatgpt → 收敛回 apikey(保留 tokens),在下方 daemon 决策前完成。
+                        // had_valid_token=false 则无 token 可保留,no-op。
+                        Ok(ReconcileOutcome::ForceDisable { had_valid_token }) => {
+                            if had_valid_token {
+                                tracing::info!(
+                                    "[RealAccount] 真实账号模式已关(flag=false),收敛活动回 apikey(保留 tokens)"
+                                );
+                                let st = AdminState {
+                                    proxy_manager: app_handle_for_residual_scan
+                                        .state::<Arc<ProxyManager>>()
+                                        .inner()
+                                        .clone(),
+                                    trace_viewer_manager: Arc::new(
+                                        trace_viewer::TraceViewerManager::new(),
+                                    ),
+                                };
+                                let _ = admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&st).await;
+                                // [MOC-178 codex P2] sync 依赖 active provider;无 provider(默认
+                                // activeProvider null)/ apply 失败时活动仍 chatgpt → 下方 daemon
+                                // 决策会当 plugins 原生解锁(跟 flag=false 矛盾)。同 forget/enable
+                                // handler,加 deactivate 兜底直接切活动 apikey(不依赖 provider)。
+                                if crate::codex_real_account::active_is_real_chatgpt_now() {
+                                    let _ =
+                                        crate::codex_real_account::deactivate_real_account().await;
+                                }
+                            } else {
+                                tracing::info!(
+                                    "[RealAccount] 真实账号模式已关(flag=false),活动无 token,不收敛"
+                                );
+                            }
+                        }
                         // [MOC-104] 真实账号失效(镜像 token 本地 JWT 已过期、无法恢复)→ 自动
                         // 关「自动解锁」开关 + emit 事件让前端提示重新登录。
                         Ok(ReconcileOutcome::ReloginRequired { .. }) => {
@@ -289,6 +336,15 @@ fn main() {
                             // (review #6)—— 前端靠这个事件标记「账号已失效」,开关已是
                             // off 的新装用户也得知道账号失效,否则 detect 见 token 在就误报。
                             let _ = handlers::settings::disable_auto_unlock_codex_plugins().await;
+                            // [MOC-178 codex P2] 账号 expired 无法恢复 → 也持久关真实账号模式 flag,
+                            // 否则前端据 mode_enabled 派生 toggle 仍 on、future startup 还当 enabled。
+                            // 重登成功 / 重新 import 会再开。[本地审查 MEDIUM] 写失败留痕(本 task 是
+                            // 启动 best-effort、下次 reconcile 重试,relogin 事件已兜底告知用户)。
+                            if !handlers::settings::set_real_account_mode_enabled(false) {
+                                tracing::warn!(
+                                    "[RealAccount] ReloginRequired:flag 写 false 失败(config 不可写),下次启动 reconcile 重试"
+                                );
+                            }
                             if let Some(window) =
                                 app_handle_for_residual_scan.get_webview_window("main")
                             {
@@ -319,7 +375,6 @@ fn main() {
                     "[RealAccount] 一次性迁移:硬重置 autoUnlockCodexPlugins=false(无真实账号时的高延迟 CDP 改为显式强制开启)"
                 );
             }
-
             // ── Plugin Unlock 守护进程自动启动 ──
             // [MOC-104] daemon = CDP 注入 `setAuthMethod('chatgpt')`,把 React authMethod
             // 伪造成 chatgpt 来解锁 Plugins 入口。它**只**对「活动 auth.json 是 apikey」的
@@ -336,7 +391,24 @@ fn main() {
 
                 // [MOC-104] 真实 chatgpt 活动 → Codex 原生显示 plugins,绝不启 daemon
                 // (relay 模式核心:无注入、无不匹配、无 MOC-100 高延迟)。
-                if crate::codex_real_account::active_is_real_chatgpt_now() {
+                // [MOC-178 codex P2] 但 flag=false(用户主动关真实账号模式)时,活动 chatgpt 是退出
+                // restore 写回的 stale 态(post-apply task 的 reconcile ForceDisable 会切回 apikey)——
+                // 本 daemon task 与 reconcile 各自 spawn、无顺序保证,只看 active_is_real_chatgpt_now
+                // 会误判 relay 而 return、漏掉 force 用户的 daemon。flag=false 时按 force_cdp 判定
+                // (用持久 flag 而非 stale 活动态做决策,不依赖 sleep ordering)。
+                // [MOC-178 codex P2] daemon task 与 reconcile task 各自 spawn,migrate 在 reconcile
+                // task 内(第十二轮);本 task 读 flag 前也跑一次 migrate(幂等)保证读到落定值 —— 否则
+                // 首次启动 flag=None 时 mode_off=false、误当 relay active return,不启用户的 force daemon。
+                let _ = handlers::settings::migrate_real_account_mode_v1();
+                let mode_off =
+                    handlers::settings::read_real_account_mode_enabled() == Some(false);
+                // [MOC-178 codex P2] relay 真生效还需 provider 支持 relay —— direct/无 provider 下即使
+                // 活动是 chatgpt(exit-restore stale、reconcile 会切 apikey)也不该当 relay valid skip
+                // daemon,否则 force 用户的 CDP daemon 不启(reconcile 切 apikey 后 force 没 daemon 没解锁)。
+                if !mode_off
+                    && crate::codex_real_account::active_is_real_chatgpt_now()
+                    && admin::services::desktop::snapshot::active_provider_supports_relay()
+                {
                     tracing::info!(
                         "[PluginUnlock] 真实 chatgpt 账号活动,Codex 原生显示 plugins,不启 daemon(relay 模式)"
                     );
