@@ -538,8 +538,10 @@ fn redact_json_credentials(v: &mut Value) {
 ///
 /// **刻意用 `ends_with("token")`(单数)而非 `contains("token")`**:后者会误伤 `max_tokens`
 /// (→ `maxtokens`,结尾是 `tokens` 复数,不命中),诊断要看的字段得以保留;`completion_tokens`
-/// / `prompt_tokens` 等用量字段同理(复数)不受影响。`ends_with("apikey")` 覆盖
-/// `apiKey`/`x-api-key`/`openai_api_key` 等各写法。
+/// / `prompt_tokens` 等用量字段同理(复数)不受影响。`apikey` 用 `contains`(非 `ends_with`)覆盖
+/// `apiKey`/`x-api-key`/`openai_api_key` + **复数 `apiKeys`/`api_keys`** 容器(收敛后 ends_with
+/// 漏复数,旧 feedback `contains` 不回归,codex P2);`apikey` 无 `max_tokens` 那种复数误伤,故可
+/// 放宽,token 仍保 `ends_with` 单数。
 ///
 /// `pub`:`src-tauri` 的 feedback 诊断包脱敏(`feedback.rs`)复用同一份判定,避免两套黑名单
 /// 各自漏键再次分叉(MOC-110:此前 feedback.rs 与本函数键集合不一致)。
@@ -564,7 +566,7 @@ pub fn is_credential_key(key: &str) -> bool {
         || norm.contains("privatekey")
         || norm.contains("cfclearance")
         || norm.ends_with("token")
-        || norm.ends_with("apikey")
+        || norm.contains("apikey")
 }
 
 /// 极窄的 JWT **值**判定:恰好三段点分,前两段以 `eyJ`(base64url of `{"` —— JWT header/payload
@@ -1127,12 +1129,14 @@ mod tests {
         ] {
             assert!(is_credential_key(k), "{k} 应判为 credential key");
         }
-        // 既有覆盖不回归 + 前缀型 authorization 头(contains 而非精确,覆盖 Proxy-Authorization 等)
+        // 既有覆盖不回归 + 前缀型 authorization 头(contains)+ 复数 apiKeys 容器(codex P2)
         for k in [
             "authorization",
             "Proxy-Authorization",
             "X-Authorization-Token",
             "api_key",
+            "apiKeys",
+            "api_keys",
             "accessToken",
             "client_secret",
         ] {
