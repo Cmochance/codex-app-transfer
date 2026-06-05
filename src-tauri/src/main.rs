@@ -402,7 +402,13 @@ fn main() {
                 let _ = handlers::settings::migrate_real_account_mode_v1();
                 let mode_off =
                     handlers::settings::read_real_account_mode_enabled() == Some(false);
-                if !mode_off && crate::codex_real_account::active_is_real_chatgpt_now() {
+                // [MOC-178 codex P2] relay 真生效还需 provider 支持 relay —— direct/无 provider 下即使
+                // 活动是 chatgpt(exit-restore stale、reconcile 会切 apikey)也不该当 relay valid skip
+                // daemon,否则 force 用户的 CDP daemon 不启(reconcile 切 apikey 后 force 没 daemon 没解锁)。
+                if !mode_off
+                    && crate::codex_real_account::active_is_real_chatgpt_now()
+                    && admin::services::desktop::snapshot::active_provider_supports_relay()
+                {
                     tracing::info!(
                         "[PluginUnlock] 真实 chatgpt 账号活动,Codex 原生显示 plugins,不启 daemon(relay 模式)"
                     );
