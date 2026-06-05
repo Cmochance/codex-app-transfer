@@ -1622,6 +1622,15 @@
           await CCApi.realAccount.forget();
           realAccountForgotten = true;
           realAccountModeEnabled = false;
+          // [codex P2] 一并清强制 daemon 档:曾 force-enable(autoUnlockCodexPlugins=true)又有
+          // 真实账号的用户,若不清,forget 后 toggle 派生 modeOn||forceUnlockPersisted 仍 true
+          // (弹回 on)、启动也看 autoUnlockCodexPlugins=true 启 CDP daemon,plugins 仍被 force-unlock。
+          // 关真实账号模式 = 把整个解锁开关都关掉。
+          if (forceUnlockPersisted) {
+            forceUnlockPersisted = false;
+            await saveSettingsFromForm();
+            try { await CCApi.pluginUnlock.stop(); } catch (_e) {}
+          }
           showToast(t("realAccount.modeDisabled") || "已关闭真实账号模式(切 apikey,登录态保留)");
           setTimeout(refreshRealAccountStatus, 100);
           setTimeout(refreshPluginUnlockStatus, 300);
