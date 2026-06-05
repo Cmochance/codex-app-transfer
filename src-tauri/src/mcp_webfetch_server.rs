@@ -19,12 +19,12 @@
 //! 工具不该被注册, 防御性兜底)。
 //!
 //! ## cat-webfetch 诊断埋点 (MOC-181)
-//! `CAS_DIAG_TRACE=1` 或 config `settings.traceViewerEnabled=true` 时, 每次
-//! `tools/call` 完成后把结构化链路条目(请求参数 / 抓取档+升级链+status / 摘要 prompt+
-//! 响应+延迟 / 返回字符数)POST 到主 app 的 `POST /api/ingest`(127.0.0.1:18090)。
-//! 主 app 为其分配全局 seq 后 push 进 trace_store, 诊断查看器 cat-webfetch 分页实时可见。
-//! 诊断关时各路径不构造条目、不上报 —— 仅多一次 config 读判 gate(与 current_backend 同款、
-//! 非热路径), 不影响正常工具响应。
+//! 当主 app 诊断查看器**正在运行**(viewer start 成功写了 runtime sentinel)时, 每次 `tools/call`
+//! 完成后把结构化链路条目(请求参数 / 抓取档+升级链+status / 摘要 prompt+响应+延迟 / 返回字符数)
+//! POST 到 viewer 的 `POST /api/ingest`(端口取自 sentinel)。主 app 为其分配全局 seq 后 push 进
+//! trace_store, 诊断查看器 cat-webfetch 分页实时可见。**gate on running viewer**(非持久化 config):
+//! viewer 没在跑 → 无 sentinel → 不构造不上报, 既不影响工具响应、也不会把数据发给占固定端口的
+//! 其它进程(`diag_target` 读 sentinel 判活 + 拿对端口)。
 
 use std::io::{BufRead, Write};
 use std::sync::Arc;
@@ -51,9 +51,6 @@ const MAX_CONCURRENT_FETCHES: usize = 4;
 const SUMMARY_INPUT_CHARS: usize = 60_000;
 /// 调总结模型的超时。略宽于一般补全(慢 provider / 长正文)。
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
-/// 诊断条目上报端口 (MOC-181): viewer ingest, 与 `trace_viewer::DEFAULT_TRACE_VIEWER_PORT` 一致。
-/// cat-webfetch 子进程跨进程拿不到主 app 的 trace store, 经此端口 HTTP 反向上报内部链路。
-const DIAG_INGEST_PORT: u16 = 18090;
 
 /// 入口: 读 stdin 逐行 JSON-RPC, 派发到 tokio runtime, 经单写线程串行写 stdout。
 ///
@@ -308,7 +305,8 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
             )
         }
     };
-    let diag = diag_enabled();
+    let diag_port = diag_target();
+    let diag = diag_port.is_some();
     let captured_at = now_iso();
     let fetched = codex_app_transfer_http::web_fetch(backend, &url).await;
 
@@ -377,16 +375,19 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
         }
     };
 
-    if diag {
-        post_diag_entry(json!({
-            "trace_kind": "cat_webfetch",
-            "captured_at": captured_at,
-            "tool": "web_fetch",
-            "request": { "url": url, "prompt": prompt },
-            "fetch": fetch_v,
-            "summarize": summarize_v,
-            "result": result_v,
-        }))
+    if let Some(port) = diag_port {
+        post_diag_entry(
+            port,
+            json!({
+                "trace_kind": "cat_webfetch",
+                "captured_at": captured_at,
+                "tool": "web_fetch",
+                "request": { "url": url, "prompt": prompt },
+                "fetch": fetch_v,
+                "summarize": summarize_v,
+                "result": result_v,
+            }),
+        )
         .await;
     }
     resp
@@ -435,7 +436,8 @@ async fn handle_web_search_call(
         }
     }
     let max = max_results.unwrap_or(codex_app_transfer_http::search::DEFAULT_MAX_RESULTS);
-    let diag = diag_enabled();
+    let diag_port = diag_target();
+    let diag = diag_port.is_some();
     let captured_at = now_iso();
     let mut result_v = Value::Null;
     let resp = match codex_app_transfer_http::web_search(&query, max).await {
@@ -457,15 +459,18 @@ async fn handle_web_search_call(
             tool_error(id, &format!("web_search 失败: {e}"))
         }
     };
-    if diag {
+    if let Some(port) = diag_port {
         // web_search 走 DDG headless、不经摘要模型, 故只记 request + result(无 fetch/summarize 段)。
-        post_diag_entry(json!({
-            "trace_kind": "cat_webfetch",
-            "captured_at": captured_at,
-            "tool": "web_search",
-            "request": { "query": query, "max_results": max },
-            "result": result_v,
-        }))
+        post_diag_entry(
+            port,
+            json!({
+                "trace_kind": "cat_webfetch",
+                "captured_at": captured_at,
+                "tool": "web_search",
+                "request": { "query": query, "max_results": max },
+                "result": result_v,
+            }),
+        )
         .await;
     }
     resp
@@ -695,24 +700,16 @@ async fn summarize(content: &str, prompt: &str) -> Result<SummarizeOutcome, Stri
 
 // ============ MOC-181 cat-webfetch 诊断埋点 (上报 viewer ingest) ============
 
-/// 诊断是否开:env `CAS_DIAG_TRACE` || config `settings.traceViewerEnabled`(与主 app viewer
-/// 启动条件对齐)。读 config 失败 → 视为关(fail-closed)。本函数每次调用读一次 config 判 gate
-/// (与 current_backend / read_summary_config 同款、非热路径); 关时各 handler 不构造诊断条目。
-fn diag_enabled() -> bool {
-    if std::env::var("CAS_DIAG_TRACE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    codex_app_transfer_registry::config_file()
-        .and_then(|p| codex_app_transfer_registry::load_raw_config(&p).ok())
-        .and_then(|cfg| {
-            cfg.get("settings")
-                .and_then(|s| s.get("traceViewerEnabled"))
-                .and_then(|v| v.as_bool())
-        })
-        .unwrap_or(false)
+/// 诊断目标端口:仅当 viewer **真在跑**(start 成功写了 runtime sentinel)才返回其监听端口。
+/// **gate on running viewer** 而非持久化 config(chatgpt-codex P2):config `traceViewerEnabled`
+/// =true 但 viewer bind 失败 / app 已关时无 sentinel → 不上报, 避免把 prompt 数据 POST 给占用
+/// 固定端口的任意进程、避免每次 tool call 无谓 POST/超时。sentinel 由 `trace_viewer::start` 写、
+/// `stop_silent` 删。读不到 / 解析失败 → None(不上报)。
+fn diag_target() -> Option<u16> {
+    let path = codex_app_transfer_registry::config_dir()?.join(".trace-viewer-runtime.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("port").and_then(|p| p.as_u64()).map(|p| p as u16)
 }
 
 /// captured_at 时间戳 (RFC3339 / ISO8601 local 含时区; 与 forward-trace 其它 producer 的
@@ -762,8 +759,8 @@ fn empty_body_msg(backend: WebFetchBackend) -> String {
 }
 
 /// 把诊断条目 POST 到 viewer ingest(失败静默 —— 诊断旁路绝不影响 web_fetch 主功能 / 不阻塞返回)。
-/// 短超时:viewer 没起 / 端口不通时快速放弃, 不拖慢工具响应。
-async fn post_diag_entry(value: Value) {
+/// 短超时:viewer 没起 / 端口不通时快速放弃, 不拖慢工具响应。`port` 来自 viewer 写的 runtime sentinel。
+async fn post_diag_entry(port: u16, value: Value) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -771,7 +768,7 @@ async fn post_diag_entry(value: Value) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let url = format!("http://127.0.0.1:{DIAG_INGEST_PORT}/api/ingest");
+    let url = format!("http://127.0.0.1:{port}/api/ingest");
     let _ = client.post(&url).json(&value).send().await;
 }
 

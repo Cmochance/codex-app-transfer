@@ -28,6 +28,7 @@
 //!   机读(AI 调试分析)或页面实时查看。
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Mutex;
 
@@ -80,6 +81,7 @@ impl TraceViewerManager {
             let guard = self.handle.lock().unwrap();
             if let Some(h) = guard.as_ref() {
                 set_forward_trace_enabled(true);
+                write_sentinel(h.addr.port());
                 return Ok(h.addr);
             }
         }
@@ -132,12 +134,16 @@ impl TraceViewerManager {
         if guard.is_some() {
             runtime.shutdown_background();
             set_forward_trace_enabled(true);
-            return Ok(guard.as_ref().unwrap().addr);
+            let a = guard.as_ref().unwrap().addr;
+            write_sentinel(a.port());
+            return Ok(a);
         }
         *guard = Some(ViewerHandle { addr, runtime });
         // gate 仅在 viewer 确认运行后开(start 失败不设 → 无残留,满足 P1);与 stop 同在
         // start_lock 内设置,使「gate + viewer」原子一致、按锁顺序串行(并发 on/off 最后一次胜)。
+        // 同步写 runtime sentinel:cat-webfetch 子进程据此判 viewer 真在跑 + 拿对端口(MOC-181)。
         set_forward_trace_enabled(true);
+        write_sentinel(addr.port());
         Ok(addr)
     }
 
@@ -147,6 +153,7 @@ impl TraceViewerManager {
     pub fn stop_silent(&self) {
         let _start_guard = self.start_lock.lock().unwrap();
         set_forward_trace_enabled(false);
+        remove_sentinel();
         let mut guard = self.handle.lock().unwrap();
         if let Some(h) = guard.take() {
             h.runtime.shutdown_background();
@@ -156,6 +163,28 @@ impl TraceViewerManager {
     /// 当前监听地址(未启动返 `None`)。
     pub fn addr(&self) -> Option<SocketAddr> {
         self.handle.lock().unwrap().as_ref().map(|h| h.addr)
+    }
+}
+
+/// viewer 运行时 sentinel 路径(`{config_dir}/.trace-viewer-runtime.json`)。MOC-181:
+/// start 成功写(含实际监听 port)、stop 删 —— cat-webfetch 子进程据此判定 viewer **真在跑**
+/// (gate on running viewer 而非持久化 config)+ 拿对端口上报。viewer bind 失败 / app 关时无
+/// sentinel = 子进程不上报,避免把诊断数据发给占用固定端口的任意进程(chatgpt-codex P2)。
+fn sentinel_path() -> Option<PathBuf> {
+    Some(codex_app_transfer_registry::config_dir()?.join(".trace-viewer-runtime.json"))
+}
+
+/// 写 sentinel(失败静默 —— 写不出顶多让子进程不上报,不影响 viewer 自身)。
+fn write_sentinel(port: u16) {
+    if let Some(p) = sentinel_path() {
+        let _ = std::fs::write(&p, format!("{{\"port\":{port}}}"));
+    }
+}
+
+/// 删 sentinel(stop / 诊断关时;失败静默)。
+fn remove_sentinel() {
+    if let Some(p) = sentinel_path() {
+        let _ = std::fs::remove_file(&p);
     }
 }
 
