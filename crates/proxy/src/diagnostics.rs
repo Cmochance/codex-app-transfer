@@ -397,14 +397,52 @@ pub fn redact_mcp_value(v: &mut Value) {
     }
 }
 
-/// 脱敏 URL query 里的 credential 参数值(`?code=…&access_token=…` → `?code=***&access_token=***`)。
-/// 只动 query、保留 path/host;无 query 原样返回。判定见 [`is_credential_query_param`]。
+/// 脱敏 URL **query 和 fragment** 里的 credential 参数值
+/// (`?code=…&access_token=…` / OAuth implicit 的 `#access_token=…&token_type=…` → `…=***`)。
+/// 只动 query/fragment、保留 path/host;判定见 [`is_credential_query_param`]。
 fn redact_url_query(url: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return url.to_owned();
+    // 拆 `path?query#fragment`:fragment 在最后(OAuth implicit 把 token 放这里)。
+    let (before_frag, frag) = match url.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (url, None),
+    };
+    let (path, query) = match before_frag.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (before_frag, None),
     };
     let mut changed = false;
-    let out: Vec<String> = query
+    let mut q_out = None;
+    if let Some(q) = query {
+        let (red, c) = redact_kv_params(q);
+        changed |= c;
+        q_out = Some(red);
+    }
+    let mut f_out = None;
+    if let Some(f) = frag {
+        let (red, c) = redact_kv_params(f);
+        changed |= c;
+        f_out = Some(red);
+    }
+    if !changed {
+        return url.to_owned();
+    }
+    let mut out = path.to_owned();
+    if let Some(q) = q_out {
+        out.push('?');
+        out.push_str(&q);
+    }
+    if let Some(f) = f_out {
+        out.push('#');
+        out.push_str(&f);
+    }
+    out
+}
+
+/// 对 `k=v&k=v` 串逐对清洗 credential 键的值(URL query/fragment 与 form-urlencoded body 共用)。
+/// 返回(脱敏后串, 是否有改动)。
+fn redact_kv_params(s: &str) -> (String, bool) {
+    let mut changed = false;
+    let out = s
         .split('&')
         .map(|pair| {
             let name = pair.split('=').next().unwrap_or("");
@@ -415,12 +453,9 @@ fn redact_url_query(url: &str) -> String {
                 pair.to_owned()
             }
         })
-        .collect();
-    if changed {
-        format!("{base}?{}", out.join("&"))
-    } else {
-        url.to_owned()
-    }
+        .collect::<Vec<_>>()
+        .join("&");
+    (out, changed)
 }
 
 /// URL query 参数名是否承载 credential。比 [`is_credential_key`] 多覆盖 URL 特有的 OAuth /
@@ -462,23 +497,9 @@ fn redact_body_string(s: &str) -> Option<String> {
     }
     let trimmed = s.trim_start();
     // ② form-urlencoded:含 `=`、不以 `{`/`[` 开头(排除残缺 JSON)。即便被截断也能逐对清洗。
+    // 复用 redact_kv_params(同 URL query/fragment),覆盖 code/code_verifier/client_secret 等。
     if s.contains('=') && !trimmed.starts_with('{') && !trimmed.starts_with('[') {
-        let mut touched = false;
-        let out = s
-            .split('&')
-            .map(|pair| {
-                let mut it = pair.splitn(2, '=');
-                let k = it.next().unwrap_or("");
-                match it.next() {
-                    Some(_) if is_credential_key(k) => {
-                        touched = true;
-                        format!("{k}=***")
-                    }
-                    _ => pair.to_string(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("&");
+        let (out, touched) = redact_kv_params(s);
         if touched {
             return Some(out);
         }
@@ -673,6 +694,21 @@ mod tests {
         let mut v2 = json!({"kind":"fetch","url":"https://x.com/mcp"});
         redact_mcp_value(&mut v2);
         assert_eq!(v2["url"], "https://x.com/mcp");
+
+        // OAuth implicit flow:token 在 URL fragment(#access_token=…)也要脱敏(codex-connector)
+        let mut v3 = json!({"kind":"ws_open","url":"https://app/cb?state=ok#access_token=FRAG-LEAK&token_type=Bearer&expires_in=3600"});
+        redact_mcp_value(&mut v3);
+        let u3 = v3["url"].as_str().unwrap();
+        assert!(
+            !u3.contains("FRAG-LEAK"),
+            "fragment access_token 泄露: {u3}"
+        );
+        assert!(
+            u3.contains("token_type=Bearer"),
+            "非 credential fragment 参数保留"
+        );
+        assert!(u3.contains("state=ok"), "query 段保留");
+        assert!(u3.contains('#'), "fragment 分隔符保留");
     }
 
     #[test]
