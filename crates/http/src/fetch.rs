@@ -509,9 +509,8 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
                     raw.cf_challenge_header,
                     raw.body.trim().is_empty(),
                 ));
-                // 留作 headless 失败时的回退 —— 判据见 worth_fallback: 仅纯 JS 骨架启发式(可能误判
-                // 短静态页)才存; 反爬 / 空 / 非-200 不存(回退挑战页/空会误导模型, Auto error 更清晰)。
-                // 后到的合格档覆盖前面的。
+                // 留作 headless 失败时的回退 —— 判据见 worth_fallback(仅非标准 mount 兜底的不确定
+                // 启发式; 确认 app shell / 反爬 / 空 / 非-200 排除)。后到的合格档覆盖前面的。
                 if worth_fallback(&raw) {
                     last_usable = Some(Fetched {
                         body: raw.body,
@@ -539,18 +538,22 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
     )))
 }
 
-/// auto 升级时, 该档 raw 是否值得留作 headless 失败的回退 body。**仅纯 JS 骨架启发式** ——
-/// `is_js_shell` 可能把短静态页误判成空壳, 误升后若 headless 起不来, 回退它好过把 curl 已拿到的
-/// 成功 body 变 Auto error(破坏性降级, chatgpt-codex review)。但反爬挑战页(结构上也像 shell,
-/// `is_js_shell` 兜不住)/ 空 body / 非-200 是**确定**失败信号, 回退它们会把挑战页/空当内容误导
-/// 模型 —— 显式排除, 让 Auto error 兜底更清晰。
+/// auto 升级时, 该档 raw 是否值得留作 headless 失败的回退 body。**仅"非标准 mount 兜底"这种不确定
+/// 启发式** —— `has_app_bundle_script`(MOC-183)可能把有内容的短静态页误判成空壳, 误升后若 headless
+/// 起不来, 回退它好过把 curl 已拿到的成功 body 变 Auto error(破坏性降级)。但以下一并排除:
+/// - **标准框架 mount**(`has_spa_skeleton`)是**确认的 app shell**: headless 失败应保留 Auto error 让
+///   调用方知道 headless 依赖坏了; 回退未渲染空壳既无内容、又掩盖故障(chatgpt-codex review 第 2 轮)。
+/// - 反爬挑战页(结构也像 shell)/ 空 body / 非-200 是**确定**失败信号, 回退会把挑战页/空当内容误导模型。
+/// `visible_text < MIN` 复刻 `is_js_shell` 的 gate(只对真"可见文本极少"的页回退)。
 fn worth_fallback(raw: &RawFetch) -> bool {
     raw.status == 200
         && raw.is_html
         && !raw.cf_challenge_header
         && !raw.body.trim().is_empty()
         && !is_challenge_body(&raw.body)
-        && is_js_shell(&raw.body)
+        && visible_text_len(&raw.body) < MIN_EXTRACTED_CHARS
+        && !has_spa_skeleton(&raw.body)
+        && has_app_bundle_script(&raw.body)
 }
 
 /// 这次抓取是否"不可恢复"—— 换 client 或 headless 渲染错误页都救不了, Auto 直接报错(不升级、不当
@@ -1163,31 +1166,41 @@ mod tests {
     }
 
     #[test]
-    fn worth_fallback_only_pure_js_shell() {
+    fn worth_fallback_only_nonstandard_mount_heuristic() {
         let mk = |status: u16, cf: bool, body: &str| RawFetch {
             status,
             body: body.to_string(),
             is_html: true,
             cf_challenge_header: cf,
         };
-        let shell = "<html><body><main id=\"x\"></main>\
+        // 非标准 mount + bundle(不确定启发式, 可能误判有内容短静态页) → 留作回退。
+        let nonstd = "<html><body><main id=\"x\"></main>\
             <script type=\"module\" src=\"/a.js\"></script></body></html>";
-        // 纯 JS 骨架(200 / 无反爬) → 留作回退
-        assert!(worth_fallback(&mk(200, false, shell)));
-        // CF 挑战页: 结构上也像 shell(is_js_shell=true), 但 is_challenge_body 命中 → **不留**
-        // (chatgpt-codex review: 回退挑战页会当内容误导模型)。
+        assert!(worth_fallback(&mk(200, false, nonstd)));
+        // 标准框架 mount(确认 app shell)→ **不留**: headless 失败应保留 error, 别回退未渲染空壳
+        // 掩盖 headless 依赖故障(chatgpt-codex review 第 2 轮)。
         assert!(
             !worth_fallback(&mk(
                 200,
                 false,
-                "<html><head><title>just a moment</title></head><body><div id=\"app\"></div>\
+                "<html><body><div id=\"root\"></div>\
+                 <script src=\"/app.js\"></script></body></html>"
+            )),
+            "标准 mount 确认 shell 不应回退(保留 headless error)"
+        );
+        // CF 挑战页(非标准 mount + 结构像 shell, 但 is_challenge_body 命中)→ 不留。
+        assert!(
+            !worth_fallback(&mk(
+                200,
+                false,
+                "<html><head><title>just a moment</title></head><body><div id=\"cf-wrap\"></div>\
                  <script type=\"module\" src=\"/cf.js\"></script>challenge-platform</body></html>"
             )),
-            "CF 挑战页不应留作回退"
+            "CF 挑战页不应回退"
         );
-        assert!(!worth_fallback(&mk(200, true, shell)), "cf header 不应留");
+        assert!(!worth_fallback(&mk(200, true, nonstd)), "cf header 不应留");
         assert!(!worth_fallback(&mk(200, false, "   ")), "空 body 不应留");
-        assert!(!worth_fallback(&mk(202, false, shell)), "非-200 不应留");
+        assert!(!worth_fallback(&mk(202, false, nonstd)), "非-200 不应留");
         // 内容页(vtext 够 → 非 shell)即便带 module 也不留。
         let content = format!(
             "<html><body><article>{}</article><script type=\"module\"></script></body></html>",
