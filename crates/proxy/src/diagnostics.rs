@@ -152,7 +152,25 @@ pub fn rescrub_persisted_bundle(bytes: &[u8]) -> Vec<u8> {
             Some(other) if !other.is_null() => serde_json::to_vec(other).ok(),
             _ => None,
         };
-        if let Some(raw) = raw {
+        let Some(raw) = raw else { continue };
+        // 截断的旧 body(`truncated_bytes>0`)只存了前缀:若它还**不能解析成 JSON**(大请求被
+        // 截在闭合括号前),key 级脱敏(`client_secret`/`privateKey` 等非前缀 secret)做不了,
+        // echo-scan 也只挡前缀 token → 保守**省略**正文,不冒险半脱敏上传(codex P2;尾部已丢、
+        // 无法补全)。能解析 / 完整非 JSON(SSE/HTML)则照常走 redact_bundle_body(全脱 / echo-scrub)。
+        let truncated = body
+            .get("truncated_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0;
+        if truncated && serde_json::from_slice::<Value>(&raw).is_err() {
+            *body = json!({
+                "encoding": "omitted",
+                "bytes": body.get("bytes").cloned().unwrap_or(Value::Null),
+                "truncated_bytes": body.get("truncated_bytes").cloned().unwrap_or(Value::Null),
+                "content": Value::Null,
+                "note": "legacy truncated body omitted before feedback upload (cannot fully redact a truncated, unparseable body)",
+            });
+        } else {
             *body = redact_bundle_body(&raw);
         }
     }
@@ -1309,5 +1327,22 @@ mod tests {
             "base64 旧 bundle key 泄漏: {s2}"
         );
         assert!(!s2.contains(&b64), "原始可解码 base64 payload 仍在: {s2}");
+
+        // 截断的旧 body(无法解析 → key 级脱敏做不了)→ 保守省略,不半脱敏上传(codex P2)
+        let truncated_legacy = json!({
+            "kind": "upstream_error_bundle",
+            "request": { "body": {
+                "encoding": "utf8", "bytes": 400000, "truncated_bytes": 399000,
+                "content": "{\"client_secret\":\"cs-LEAK-no-prefix-value\",\"messages\":[{\"content\":\"aaa"
+            }},
+            "response": { "body": {"encoding":"utf8","bytes":8,"truncated_bytes":0,"content":"{\"ok\":1}"} }
+        });
+        let out3 = rescrub_persisted_bundle(&serde_json::to_vec(&truncated_legacy).unwrap());
+        let s3 = String::from_utf8_lossy(&out3);
+        assert!(
+            !s3.contains("cs-LEAK-no-prefix-value"),
+            "截断 body 的 client_secret 泄漏: {s3}"
+        );
+        assert!(s3.contains("omitted"), "截断且无法解析的 body 应省略: {s3}");
     }
 }
