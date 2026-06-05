@@ -918,6 +918,9 @@ async fn inject_unlock_script(
             button[propsKey].disabled = false;
             button[propsKey]['aria-disabled'] = false;
         }
+        // [MOC-178] 记录被 unblock 的 install 按钮,卸载(toggle off)时对称复原 disabled
+        // (否则 React 不 remount 时这些强制安装按钮残留可点;codex P2)。
+        (window[MARKER].installButtons = window[MARKER].installButtons || new Set()).add(button);
     }
     function labelForcedInstallButton(button) {
         const node = Array.from(button.childNodes).find((n) => {
@@ -1156,6 +1159,23 @@ async fn inject_uninstall_script(
             const propsKey = Object.keys(btn).find((k) => k.startsWith('__reactProps'));
             if (propsKey && btn[propsKey]) { btn[propsKey].disabled = true; }
             delete btn.dataset.codexAppTransferPluginUnlocked;
+        }
+    } catch (e) { M.lastError = String(e?.stack || e); }
+    // 5. 对称复原被 unblock 的 install 按钮(强制安装控件)回 disabled,防 React 不 remount
+    //    时残留可点(codex P2)。原值未存,只复 disabled/aria/props(决定可点性),class/文字
+    //    交给 React 重渲。
+    try {
+        if (M.installButtons && M.installButtons.forEach) {
+            M.installButtons.forEach((b) => {
+                try {
+                    b.disabled = true;
+                    b.setAttribute('aria-disabled', 'true');
+                    b.style.pointerEvents = '';
+                    const pk = Object.keys(b).find((k) => k.startsWith('__reactProps'));
+                    if (pk && b[pk]) { b[pk].disabled = true; b[pk]['aria-disabled'] = true; }
+                } catch (e) {}
+            });
+            M.installButtons.clear();
         }
     } catch (e) { M.lastError = String(e?.stack || e); }
     M.unlocked = false;

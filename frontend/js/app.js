@@ -8426,7 +8426,7 @@
       } catch (e) { showToast(e.message); }
     });
     $("[data-action=real-account-forget]")?.addEventListener("click", async () => {
-      if (!window.confirm(t("realAccount.forgetConfirm") || "清除真实账号?启动将不再自动恢复它(不会删除当前活动 auth.json)。")) return;
+      if (!window.confirm(t("realAccount.forgetConfirm") || "清除真实账号?将停用「长期保留」;若当前活动账号正是这个真实 chatgpt,会一并退出登录(已自动备份),启动不再恢复。")) return;
       try {
         await CCApi.realAccount.forget();
         // 抑制本 session 内的 auto-persist 重新生成镜像(review #1):清除后即便
