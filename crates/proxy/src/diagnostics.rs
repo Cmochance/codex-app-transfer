@@ -167,6 +167,21 @@ fn redact_credential_tokens(s: &str) -> Option<String> {
     let mut changed = false;
     let mut rest = s;
     'scan: while !rest.is_empty() {
+        // JWT 子串(`eyJ….eyJ….sig`):嵌在消息文本里(`invalid token eyJ…`)时,值层 looks_like_jwt
+        // (判整串)抓不到 → 在此按子串挡(codex P1)。is_tok 含 `.`,故 take_while 能整段取出 JWT。
+        if rest.starts_with("eyJ") {
+            let run_len: usize = rest
+                .chars()
+                .take_while(|c| is_tok(*c))
+                .map(char::len_utf8)
+                .sum();
+            if looks_like_jwt(&rest[..run_len]) {
+                out.push_str("***");
+                rest = &rest[run_len..];
+                changed = true;
+                continue 'scan;
+            }
+        }
         for (pfx, minlen) in PREFIXES {
             if let Some(after) = rest.strip_prefix(*pfx) {
                 let n = tok_len(after);
@@ -1134,5 +1149,15 @@ mod tests {
             "非 JSON fallback key 泄漏: {hs}"
         );
         assert!(hs.contains("sk-***"));
+
+        // 消息文本里**嵌**的 JWT 子串(非整串 JWT)也挡,且保留上下文(codex P1)
+        let jwt_body = format!(r#"{{"error":{{"message":"invalid token {FAKE_JWT} provided"}}}}"#);
+        let jv = redact_bundle_body(jwt_body.as_bytes());
+        let js = serde_json::to_string(&jv).unwrap();
+        assert!(!js.contains(FAKE_JWT), "嵌入的 JWT 泄漏: {js}");
+        assert!(
+            js.contains("invalid token *** provided"),
+            "应只脱敏 JWT 子串、保留上下文: {js}"
+        );
     }
 }
