@@ -13,7 +13,9 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use codex_app_transfer_codex_integration::CodexPaths;
-use codex_app_transfer_proxy::{is_credential_key, proxy_log_dir, recent_feedback_bundles};
+use codex_app_transfer_proxy::{
+    is_credential_key, proxy_log_dir, recent_feedback_bundles, rescrub_persisted_bundle,
+};
 use reqwest::{header::CONTENT_TYPE, multipart};
 use serde_json::{json, Value};
 
@@ -248,6 +250,9 @@ fn diagnostic_attachments(include_diag: bool) -> Vec<FeedbackAttachment> {
         let Ok(raw) = fs::read(&bundle_path) else {
             continue;
         };
+        // MOC-110:上传前再脱敏一遍 —— 旧 build 写的历史 bundle 的 body 仍是原始未脱敏,
+        // 写路径修复不保护它们(codex P1)。对新 bundle 幂等。
+        let raw = rescrub_persisted_bundle(&raw);
         let name = bundle_path
             .file_name()
             .and_then(|n| n.to_str())

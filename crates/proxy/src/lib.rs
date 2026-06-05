@@ -20,7 +20,9 @@ pub mod telemetry;
 pub mod trace_store;
 pub mod validation;
 
-pub use diagnostics::{feedback_bundle_dir, is_credential_key, recent_feedback_bundles};
+pub use diagnostics::{
+    feedback_bundle_dir, is_credential_key, recent_feedback_bundles, rescrub_persisted_bundle,
+};
 pub use forward::{forward_handler, ProxyState};
 pub use resolver::{
     AuthScheme, ProviderResolver, ResolveError, ResolvedProvider, SharedResolver, StaticResolver,

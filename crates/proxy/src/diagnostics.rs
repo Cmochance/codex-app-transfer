@@ -120,6 +120,36 @@ fn redact_bundle_body(bytes: &[u8]) -> Value {
     bytes_payload(scrubbed.as_bytes(), MAX_STORED_BODY_BYTES)
 }
 
+/// 对**已落盘**的 feedback bundle 在**上传前**再脱敏一遍(MOC-110 / codex P1)。
+///
+/// 写路径([`write_upstream_error_bundle`])只保护**新写**的 bundle;但 feedback 上传的是
+/// `recent_feedback_bundles` 的历史文件 —— 用户**升级前**旧 build 写的 bundle 里
+/// request/response body 仍是原始未脱敏,升级后下次提交 feedback 会把它原样上传。故上传前
+/// 用本函数把每条 bundle 的 `request.body` / `response.body` 段重跑 [`redact_bundle_body`]:
+/// 旧 bundle 的 `content` 是原始 body 文本(string)→ 重新解析 + 脱敏;新 bundle 的 `content`
+/// 已是脱敏结构 → 重跑幂等无变化。解析失败原样返回(bundle 是本工具写的合法 JSON,理论不触发)。
+pub fn rescrub_persisted_bundle(bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<Value>(bytes) else {
+        return bytes.to_vec();
+    };
+    for section in ["request", "response"] {
+        let Some(body) = v.get_mut(section).and_then(|s| s.get_mut("body")) else {
+            continue;
+        };
+        // 把 body.content 当「原始 body」再脱一遍。旧:content 是原始文本 string;
+        // 新:content 是已脱敏 object,序列化后重跑(幂等)。
+        let raw: Option<Vec<u8>> = match body.get("content") {
+            Some(Value::String(s)) => Some(s.clone().into_bytes()),
+            Some(other) if !other.is_null() => serde_json::to_vec(other).ok(),
+            _ => None,
+        };
+        if let Some(raw) = raw {
+            *body = redact_bundle_body(&raw);
+        }
+    }
+    serde_json::to_vec_pretty(&v).unwrap_or_else(|_| bytes.to_vec())
+}
+
 /// 递归对 JSON 里**所有 string 值**跑 [`redact_credential_tokens`],就地脱敏 echo 进文本的凭据。
 /// 仅 [`redact_bundle_body`](feedback 上传路径)调用 —— forward-trace 本地 viewer 不调用。
 fn redact_echoed_tokens(v: &mut Value) {
@@ -1163,5 +1193,35 @@ mod tests {
             "非 UTF-8 fallback key 泄漏: {ns}"
         );
         assert!(ns.contains("sk-***"));
+    }
+
+    #[test]
+    fn rescrub_persisted_bundle_scrubs_legacy_unredacted_body() {
+        // 模拟旧 build 写的 bundle:body.content 是**原始未脱敏** body 文本(string),
+        // 含 api_key 值 + echo 进 note 的 key。上传前 rescrub 必须把它们脱掉。
+        let legacy = json!({
+            "kind": "upstream_error_bundle",
+            "request": { "body": {
+                "encoding": "utf8", "bytes": 110, "truncated_bytes": 0,
+                "content": "{\"model\":\"x\",\"api_key\":\"sk-LEAK-secret-value-1234\",\"note\":\"bad key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 here\"}"
+            }},
+            "response": { "body": {
+                "encoding": "utf8", "bytes": 24, "truncated_bytes": 0,
+                "content": "{\"error\":\"unauthorized\"}"
+            }}
+        });
+        let out = rescrub_persisted_bundle(&serde_json::to_vec(&legacy).unwrap());
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.contains("sk-LEAK-secret-value-1234"),
+            "旧 bundle api_key 泄漏: {s}"
+        );
+        assert!(
+            !s.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "旧 bundle echo key 泄漏: {s}"
+        );
+        assert!(s.contains("unauthorized"), "非凭据内容保留");
+        // 非 bundle / 解析失败 → 原样返回,不阻断上传
+        assert_eq!(rescrub_persisted_bundle(b"not json"), b"not json");
     }
 }
