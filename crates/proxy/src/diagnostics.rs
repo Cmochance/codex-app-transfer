@@ -60,10 +60,10 @@ pub fn write_upstream_error_bundle(input: &UpstreamErrorBundleInput) -> Option<P
                 "upstream": input.upstream_model,
             },
             "outbound_headers_redacted": input.outbound_headers_redacted,
-            "body": bytes_payload(&input.request_body, MAX_STORED_BODY_BYTES),
+            "body": redact_bundle_body(&input.request_body),
         },
         "response": {
-            "body": bytes_payload(&input.response_body, MAX_STORED_BODY_BYTES),
+            "body": redact_bundle_body(&input.response_body),
         },
     });
     let ts = SystemTime::now()
@@ -80,6 +80,31 @@ pub fn write_upstream_error_bundle(input: &UpstreamErrorBundleInput) -> Option<P
     let encoded = serde_json::to_vec_pretty(&bundle).ok()?;
     fs::write(&path, encoded).ok()?;
     Some(path)
+}
+
+/// bundle(随 feedback 上传)的 request/response body 脱敏(MOC-110 / 安全审计 M-001)。
+///
+/// **此前用 `bytes_payload` 只编码不 scrub** → 完整请求/响应体里的结构化 credential(JSON 里的
+/// `api_key`/`*_token`/JWT 值等)随 feedback 原样外泄(headers 已由 `outbound_headers_redacted`
+/// 脱敏,但 body 没有)。改为:尝试当 JSON 解析 → 递归 [`redact_json_credentials`](key + JWT 值)
+/// → 序列化(超 cap 截断已脱敏文本);解析失败(SSE / HTML 错误页 / 二进制)退回 `bytes_payload`
+/// (那类是模型输出/错误页,无结构化 credential,与 forward-trace `redact_body` 同取舍)。
+/// bundle input 不带 content-type,故不依赖 content-type 判别,直接试解析。
+fn redact_bundle_body(bytes: &[u8]) -> Value {
+    if let Ok(mut v) = serde_json::from_slice::<Value>(bytes) {
+        redact_json_credentials(&mut v);
+        let serialized = serde_json::to_vec(&v).unwrap_or_default();
+        if serialized.len() <= MAX_STORED_BODY_BYTES {
+            return json!({
+                "encoding": "json",
+                "bytes": bytes.len(),
+                "truncated_bytes": 0,
+                "content": v,
+            });
+        }
+        return bytes_payload_with_len(&serialized, serialized.len(), MAX_STORED_BODY_BYTES);
+    }
+    bytes_payload(bytes, MAX_STORED_BODY_BYTES)
 }
 
 pub fn recent_feedback_bundles(limit: usize) -> Vec<PathBuf> {
@@ -312,7 +337,9 @@ fn redact_body_with_len(bytes: &[u8], true_len: usize, content_type: Option<&str
     bytes_payload_with_len(bytes, true_len, MAX_STORED_BODY_BYTES)
 }
 
-/// 递归把 JSON 里的 credential 字段值替换成 `***`。键判定见 [`is_credential_key`]。
+/// 递归把 JSON 里的 credential 字段值替换成 `***`。键判定见 [`is_credential_key`];另对
+/// **任意 string 值**做 [`looks_like_jwt`] 兜底(MOC-110:JWT 落在非凭据 key 的值里时,
+/// 仅靠 key 名判定会漏)。
 fn redact_json_credentials(v: &mut Value) {
     match v {
         Value::Object(map) => {
@@ -329,6 +356,9 @@ fn redact_json_credentials(v: &mut Value) {
                 redact_json_credentials(item);
             }
         }
+        Value::String(s) if looks_like_jwt(s) => {
+            *v = Value::String("***".to_string());
+        }
         _ => {}
     }
 }
@@ -342,18 +372,48 @@ fn redact_json_credentials(v: &mut Value) {
 /// (→ `maxtokens`,结尾是 `tokens` 复数,不命中),诊断要看的字段得以保留;`completion_tokens`
 /// / `prompt_tokens` 等用量字段同理(复数)不受影响。`ends_with("apikey")` 覆盖
 /// `apiKey`/`x-api-key`/`openai_api_key` 等各写法。
-fn is_credential_key(key: &str) -> bool {
+///
+/// `pub`:`src-tauri` 的 feedback 诊断包脱敏(`feedback.rs`)复用同一份判定,避免两套黑名单
+/// 各自漏键再次分叉(MOC-110:此前 feedback.rs 与本函数键集合不一致)。
+///
+/// MOC-110 补漏(安全审计 AP-007/M-001):`privateKey`(`private_key`/`sshPrivateKey` 等 →
+/// 含 `privatekey`)、`cf_clearance`(Cloudflare 挑战 cookie 的独立 JSON key 形态)、字面 `jwt`
+/// 键。JWT 作为**值**(key 名不带凭据语义时)另由 [`looks_like_jwt`] 在值层兜底。
+/// `authorization` 用 `contains`(非精确相等)覆盖 `Proxy-Authorization` / `X-Authorization-*`
+/// 前缀型头 —— feedback config 附件脱敏(`feedback.rs`)收敛复用本判定,旧 `contains` 行为不回归
+/// (`authScheme`/`author` 不含 `authorization` 子串,不误伤)。
+pub fn is_credential_key(key: &str) -> bool {
     let norm: String = key
         .chars()
         .filter(|c| *c != '_' && *c != '-')
         .flat_map(|c| c.to_lowercase())
         .collect();
-    norm == "authorization"
+    norm.contains("authorization")
+        || norm == "jwt"
         || norm.contains("secret")
         || norm.contains("password")
         || norm.contains("credential")
+        || norm.contains("privatekey")
+        || norm.contains("cfclearance")
         || norm.ends_with("token")
         || norm.ends_with("apikey")
+}
+
+/// 极窄的 JWT **值**判定:恰好三段点分,前两段以 `eyJ`(base64url of `{"` —— JWT header/payload
+/// 必是 JSON 对象)开头。普通文本几乎不可能同时满足,误伤率极低。用于 key 名不带凭据语义
+/// (如某字段值里直接塞了 JWT)时在值层兜底脱敏(MOC-110)。
+fn looks_like_jwt(s: &str) -> bool {
+    let mut segs = s.split('.');
+    match (segs.next(), segs.next(), segs.next(), segs.next()) {
+        (Some(a), Some(b), Some(c), None) => {
+            a.len() >= 8
+                && b.len() >= 8
+                && c.len() >= 8
+                && a.starts_with("eyJ")
+                && b.starts_with("eyJ")
+        }
+        _ => false,
+    }
 }
 
 /// 脱敏一条 MCP-trace 记录(整个 JSON 对象,MOC-169 增量 4)。
@@ -846,5 +906,88 @@ mod tests {
         // content-type 缺失也退回 bytes_payload
         let v2 = redact_body(br#"{"api_key":"sk"}"#, None);
         assert_eq!(v2["encoding"], "utf8");
+    }
+
+    // 一段形态合法的 JWT(header/payload 以 eyJ 开头,三段点分),仅用于测试值层兜底。
+    const FAKE_JWT: &str =
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g";
+
+    #[test]
+    fn is_credential_key_covers_moc110_keys() {
+        // MOC-110 补的:privateKey / private_key / sshPrivateKey / jwt / cf_clearance
+        for k in [
+            "privateKey",
+            "private_key",
+            "sshPrivateKey",
+            "jwt",
+            "cf_clearance",
+            "cfClearance",
+        ] {
+            assert!(is_credential_key(k), "{k} 应判为 credential key");
+        }
+        // 既有覆盖不回归 + 前缀型 authorization 头(contains 而非精确,覆盖 Proxy-Authorization 等)
+        for k in [
+            "authorization",
+            "Proxy-Authorization",
+            "X-Authorization-Token",
+            "api_key",
+            "accessToken",
+            "client_secret",
+        ] {
+            assert!(is_credential_key(k), "{k} 应判为 credential key");
+        }
+        // 诊断/用量字段不误伤(尤其 max_tokens / *_tokens 复数;authScheme/author 不含 authorization 子串)
+        for k in [
+            "max_tokens",
+            "completion_tokens",
+            "model",
+            "cache_key",
+            "wire_api",
+            "authScheme",
+            "author",
+        ] {
+            assert!(!is_credential_key(k), "{k} 不应被误判为 credential");
+        }
+    }
+
+    #[test]
+    fn looks_like_jwt_detects_only_real_jwt() {
+        assert!(looks_like_jwt(FAKE_JWT));
+        // 非 JWT:段太短 / 前缀不对 / 段数不对 / 普通文本
+        assert!(!looks_like_jwt("a.b.c"));
+        assert!(!looks_like_jwt("foo.bar.baz.qux"));
+        assert!(!looks_like_jwt("https://example.com/a.b.c"));
+        assert!(!looks_like_jwt("just some normal sentence."));
+        assert!(!looks_like_jwt("eyJonly.oneeyJ")); // 仅两段
+    }
+
+    #[test]
+    fn redact_json_credentials_redacts_jwt_value_under_innocuous_key() {
+        // key 名不带凭据语义(note),但值是 JWT → 值层兜底脱敏
+        let mut v = json!({"note": FAKE_JWT, "msg": "hello world", "n": 3});
+        redact_json_credentials(&mut v);
+        assert_eq!(v["note"], "***", "JWT 值应被脱敏");
+        assert_eq!(v["msg"], "hello world", "普通文本不动");
+        assert_eq!(v["n"], 3);
+    }
+
+    #[test]
+    fn redact_bundle_body_scrubs_json_and_falls_back_for_non_json() {
+        // JSON body:key 级(api_key/privateKey)+ 值级(JWT)都脱敏,诊断字段保留
+        let body = format!(
+            r#"{{"model":"gpt-5","max_tokens":4096,"api_key":"sk-LEAK","nested":{{"privateKey":"PK-LEAK"}},"note":"{FAKE_JWT}"}}"#
+        );
+        let v = redact_bundle_body(body.as_bytes());
+        assert_eq!(v["encoding"], "json");
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("sk-LEAK"), "api_key 泄漏: {s}");
+        assert!(!s.contains("PK-LEAK"), "privateKey 泄漏");
+        assert!(!s.contains(FAKE_JWT), "JWT 值泄漏");
+        assert_eq!(v["content"]["max_tokens"], 4096, "诊断字段保留");
+        assert_eq!(v["content"]["model"], "gpt-5");
+
+        // 非 JSON(SSE / 错误页)退回 bytes_payload,正文原样(无结构化 credential)
+        let sse = redact_bundle_body(b"data: {\"delta\":\"hi\"}\n\n");
+        assert_eq!(sse["encoding"], "utf8");
     }
 }
