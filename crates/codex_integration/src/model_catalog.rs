@@ -136,11 +136,23 @@ pub fn catalog_models_for_provider_with_display_names(
         let Some(openai_id) = slot.openai_id else {
             continue;
         };
-        let mapped = mappings.get(slot.key).map(|s| s.trim()).unwrap_or("");
-        let target = if mapped.is_empty() {
-            default_model
+        let slot_mapped = mappings.get(slot.key).map(|s| s.trim()).unwrap_or("");
+        // [MOC-154] 列表式 catalog(治"默认占满 → 重复模型" + 数量自适应):
+        // - `gpt_5_5` 槽空 → 用 `default_model` 填充。这与 proxy resolver 对
+        //   `gpt-5.5` 的降级行为一致(resolver 在 gpt_5_5 槽空时把 gpt-5.5 降级到
+        //   default,见 resolver.rs::map_model_for_provider),保证 catalog 显示与实际
+        //   路由一致;同时让默认模型占 gpt-5.5 slot → Codex 新对话默认(gpt-5.5
+        //   priority 0)直接用默认模型。
+        // - 其它槽空 → **跳过**(不再降级显示 default;旧逻辑会让多个空槽全显示
+        //   同一 default → 用户在 Codex 模型列表看到重复模型)。
+        let target = if slot_mapped.is_empty() {
+            if slot.key == "gpt_5_5" && !default_model.is_empty() {
+                default_model
+            } else {
+                continue;
+            }
         } else {
-            mapped
+            slot_mapped
         };
         let target_clean = strip_internal_model_suffix(target);
         let context_window = context_window_for_model(
@@ -158,25 +170,10 @@ pub fn catalog_models_for_provider_with_display_names(
             display_names,
         ));
     }
-    if !default_model.is_empty() && !models.iter().any(|m| m.slug == default_model) {
-        // 与上面 MODEL_SLOTS 走同一条 context_window_for_model,保证显式
-        // model_capabilities[<default>].context_window 在 fallback entry 上
-        // 也生效(2026-05-07 fix:之前这里硬编码二档值,绕过显式 override)。
-        let fallback_window = context_window_for_model(
-            default_model,
-            default_model,
-            default_model,
-            supports_1m,
-            model_capabilities,
-        );
-        models.push(catalog_model(
-            default_model,
-            provider_name,
-            default_model,
-            fallback_window,
-            display_names,
-        ));
-    }
+    // [MOC-154] 去掉旧 fallback entry(slug = default_model 实际模型名)。列表式下
+    // Codex `model` 字段统一锚到 gpt-5.5 slot(见 apply.rs `ensure_default_model_slot`),
+    // 不再出现 `model = 实际模型名` → 无需该 entry;且它与 gpt-5.5(空槽时 display =
+    // default)的 display 相同,会造成"默认模型显示两次"的重复。
     models
 }
 
@@ -537,10 +534,11 @@ mod tests {
     fn one_m_catalog_uses_95_percent_effective_window() {
         let models =
             catalog_models_for_provider("DeepSeek", "deepseek-v4-pro[1m]", true, None, None);
-        let deepseek = models.iter().find(|m| m.slug == "deepseek-v4-pro").unwrap();
-        assert_eq!(deepseek.context_window, 1_000_000);
-        assert_eq!(deepseek.effective_context_window_percent, 95);
-        assert!(models.iter().any(|m| m.slug == "gpt-5.5"));
+        // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
+        let gpt55 = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
+        assert_eq!(gpt55.display_name, "deepseek-v4-pro");
+        assert_eq!(gpt55.context_window, 1_000_000);
+        assert_eq!(gpt55.effective_context_window_percent, 95);
     }
 
     #[test]
@@ -561,25 +559,26 @@ mod tests {
     #[test]
     fn fallback_entry_declares_apply_patch_freeform_for_non_builtin_slug() {
         // 回归保护(#222 修了 generic_model_template 但没加测试):
-        // Codex Desktop UI 选 default_model slug(如 `deepseek-v4-pro`)而非
-        // gpt-5.5 时,Codex CLI 读 catalog 中该 slug 的 entry。若
-        // `generic_model_template` 声明 `apply_patch_tool_type: null` →
-        // Codex CLI 完全不发 apply_patch 工具,但 system prompt 仍要求调用 →
-        // abort。fallback entry 必须声明 freeform,让 apply_patch 工具被注册。
-        let models = catalog_models_for_provider("DeepSeek", "deepseek-v4-pro", true, None, None);
-        let fallback = models
-            .iter()
-            .find(|m| m.slug == "deepseek-v4-pro")
-            .expect("default_model slug 的 fallback entry 必须存在");
-        let entry = model_to_json(fallback);
+        // [MOC-154] fallback entry(slug=实际模型名)已从 catalog 删除;现在 default_model
+        // 占 gpt-5.5 slot。但 generic_model_template 仍须声明 freeform,防止将来若有
+        // 代码路径用非内置 slug 查 catalog 时 apply_patch 失效。直接构造非内置 slug
+        // 的 CatalogModel 对其跑 model_to_json 验证 generic_model_template 仍声明 freeform。
+        let non_builtin = CatalogModel {
+            slug: "custom-non-builtin".into(),
+            display_name: "custom-non-builtin".into(),
+            provider_name: "P".into(),
+            context_window: 258_400,
+            effective_context_window_percent: 95,
+        };
+        let entry = model_to_json(&non_builtin);
 
         assert_eq!(
             entry["apply_patch_tool_type"], "freeform",
-            "fallback entry 必须声明 apply_patch_tool_type=freeform,否则 Codex CLI 选此 slug 时 apply_patch 会全部 abort"
+            "generic_model_template 必须声明 apply_patch_tool_type=freeform,否则非内置 slug 时 apply_patch 会全部 abort"
         );
         assert_eq!(
             entry["supports_parallel_tool_calls"], true,
-            "fallback entry 应允许并行 tool call,与 codex_builtin slug 行为一致"
+            "generic_model_template 应允许并行 tool call"
         );
     }
 
@@ -700,7 +699,8 @@ mod tests {
         let gpt55 = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
         let gpt54 = models.iter().find(|m| m.slug == "gpt-5.4").unwrap();
         let mini = models.iter().find(|m| m.slug == "gpt-5.4-mini").unwrap();
-        let codex = models.iter().find(|m| m.slug == "gpt-5.3-codex").unwrap();
+        // [MOC-154] gpt_5_3_codex 槽未配置 → 跳过,不再生成 entry;
+        // 空槽降级 default 的旧行为已删。
 
         // user feedback (2026-05-26): display_name 不再含 "Provider / " 前缀,
         // provider 移到 description 里(避免 Codex Desktop 模型列表被 provider
@@ -711,12 +711,10 @@ mod tests {
         assert_eq!(gpt54.display_name, "qwen3.6-plus");
         assert_eq!(gpt54.context_window, 1_000_000);
         assert_eq!(mini.context_window, 1_000_000);
-        assert_eq!(
-            codex.display_name, "deepseek-v4-pro",
-            "empty slot mappings should still document the default fallback target"
+        assert!(
+            models.iter().all(|m| m.slug != "gpt-5.3-codex"),
+            "empty slot(gpt_5_3_codex)应被跳过,不生成 entry"
         );
-        assert_eq!(codex.provider_name, "Mixed");
-        assert_eq!(codex.context_window, 1_000_000);
     }
 
     // ── 新增 (2026-05-07):model_capabilities[<model>].context_window 数值
@@ -742,7 +740,8 @@ mod tests {
             Some(&mappings),
             Some(&capabilities),
         );
-        let entry = models.iter().find(|m| m.slug == "mimo-v2.5-pro").unwrap();
+        // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
+        let entry = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
         assert_eq!(
             entry.context_window, 1_000_000,
             "显式 context_window 必须越过 supports_1m=false 的二档默认 258_400"
@@ -763,7 +762,8 @@ mod tests {
             Some(&mappings),
             Some(&capabilities),
         );
-        let entry = models.iter().find(|m| m.slug == "moonshot-v1-32k").unwrap();
+        // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
+        let entry = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
         assert_eq!(entry.context_window, 32_768);
     }
 
@@ -807,7 +807,8 @@ mod tests {
             Some(&mappings),
             Some(&capabilities),
         );
-        let entry = models.iter().find(|m| m.slug == "deepseek-v4-pro").unwrap();
+        // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
+        let entry = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
         assert_eq!(
             entry.context_window, 1_000_000,
             "非法值 100 应被忽略,fallback 到 supports_1m=true 的 1M"
@@ -828,7 +829,8 @@ mod tests {
             Some(&mappings),
             Some(&capabilities),
         );
-        let entry = models.iter().find(|m| m.slug == "custom").unwrap();
+        // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
+        let entry = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
         assert_eq!(entry.context_window, 512_000);
     }
 
@@ -843,9 +845,10 @@ mod tests {
             Some(&mappings),
             None,
         );
+        // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
         let entry = models
             .iter()
-            .find(|m| m.slug == "undocumented-custom-model")
+            .find(|m| m.slug == "gpt-5.5")
             .unwrap();
         assert_eq!(entry.context_window, 258_400, "fallback to 258_400");
     }
@@ -973,11 +976,12 @@ mod tests {
         assert_eq!(v["version"], "1.0.4");
         assert_eq!(v["gatewayApiKey"], "cas_test");
         assert_eq!(v["settings"]["theme"], "default");
+        // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
         assert!(v["models"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["slug"] == "deepseek-v4-pro"));
+            .any(|m| m["slug"] == "gpt-5.5"));
         let _typed: codex_app_transfer_registry::Config =
             serde_json::from_value(v).expect("top-level models must not break registry config");
     }

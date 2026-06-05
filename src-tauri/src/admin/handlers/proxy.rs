@@ -22,12 +22,13 @@ pub(crate) fn read_proxy_port(cfg: &RawConfig) -> u16 {
         .unwrap_or(18080)
 }
 
-/// 读 `settings.codexNetworkAccess`,默认 `true`(#212)。
+/// 读 `settings.codexNetworkAccess`,默认 `false`(MOC-185:full access 全权限有风险,缺省关;
+/// 老用户已显式设过的 bool 值照旧,不覆盖)。
 pub(crate) fn read_codex_network_access(cfg: &RawConfig) -> bool {
     cfg.get("settings")
         .and_then(|s| s.get("codexNetworkAccess"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 /// 读 `settings.codexStatusSectionDefaultVisible`,默认 `true`(#258)。

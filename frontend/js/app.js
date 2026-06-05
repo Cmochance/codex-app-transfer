@@ -27,10 +27,7 @@
   let formRequestOptions = {};
   let providerFormMappings = {};
   let providerFormRows = [...providerFormDefaultRows];
-  let providerFormCustomLabels = {};
-  let customRowCounter = 0;
   let providerAvailableModels = [];
-  let openProviderSlotMenuIndex = null;
   let openProviderModelMenuKey = null;
   let baseUrlMenuOpen = false;
   let editingProviderId = null;
@@ -426,10 +423,6 @@
 
   const predefinedSlotKeys = new Set(providerFormModelSlots.map((s) => s.key));
 
-  function isCustomMappingRow(key) {
-    return key.startsWith("_custom_");
-  }
-
   function normalizeMappings(mappings = {}) {
     const normalized = emptyMappings();
     if (!mappings || typeof mappings !== "object") return normalized;
@@ -656,32 +649,32 @@
   }
 
   function formMappingRowsFromMappings(mappings = {}) {
-    const rows = [...providerFormDefaultRows];
-    providerFormModelSlots.forEach((slot) => {
-      if (slot.key !== "default" && mappings[slot.key] && !rows.includes(slot.key)) {
-        rows.push(slot.key);
+    // [MOC-154] 列表式迁移:把现有映射(default + gpt_5_x + 旧 custom 行)去重去空、
+    // 按 default 优先的顺序压成"模型列表",依次填进 gpt_5_5/gpt_5_4/... 前 N 个 slot。
+    const slotKeys = providerFormDefaultRows.filter((k) => k !== "default"); // gpt_5_5..gpt_5_2
+    const ordered = [];
+    const seen = new Set();
+    const pushVal = (v) => {
+      const s = String(v || "").trim();
+      if (s && !seen.has(s)) {
+        ordered.push(s);
+        seen.add(s);
       }
-    });
-    // restore custom mapping rows (keys not in predefined slots)
-    providerFormCustomLabels = {};
-    for (const [key, value] of Object.entries(mappings)) {
-      if (!predefinedSlotKeys.has(key) && String(value || "").trim()) {
-        const customKey = `_custom_${customRowCounter++}`;
-        rows.push(customKey);
-        providerFormMappings[customKey] = String(value || "").trim();
-        providerFormCustomLabels[customKey] = key;
-      }
+    };
+    pushVal(mappings.default);
+    slotKeys.forEach((k) => pushVal(mappings[k]));
+    for (const [k, v] of Object.entries(mappings)) {
+      if (!predefinedSlotKeys.has(k)) pushVal(v); // 旧 custom 行的值并入列表
     }
+    const list = ordered.slice(0, slotKeys.length);
+    providerFormMappings = {};
+    const rows = [];
+    list.forEach((val, i) => {
+      providerFormMappings[slotKeys[i]] = val;
+      rows.push(slotKeys[i]);
+    });
+    if (rows.length === 0) rows.push(slotKeys[0]); // 至少留 1 行(gpt_5_5=默认)
     return rows;
-  }
-
-  function slotByKey(key) {
-    return providerFormModelSlots.find((slot) => slot.key === key) || providerFormModelSlots[0];
-  }
-
-  function slotOptionsForRow(currentKey) {
-    const used = new Set(providerFormRows.filter((key) => key !== currentKey));
-    return providerFormModelSlots.filter((slot) => !used.has(slot.key));
   }
 
   // [MOC-69] provider 可用 model 列表项可能是 raw id string(gemini-cli / 普通
@@ -786,48 +779,6 @@
               >`;
   }
 
-  function slotMenuMarkup(rowKey, index) {
-    const slot = slotByKey(rowKey);
-    const isRequired = rowKey === "default";
-    const expanded = openProviderSlotMenuIndex === index;
-    const options = slotOptionsForRow(rowKey).map((option) => (`
-      <button
-        class="mapping-slot-option ${option.key === rowKey ? "selected" : ""}"
-        type="button"
-        role="option"
-        data-action="select-provider-model-slot"
-        data-row-index="${index}"
-        data-slot-key="${escapeHtml(option.key)}"
-        aria-selected="${option.key === rowKey ? "true" : "false"}"
-      >
-        <span>${escapeHtml(option.label)}</span>
-        ${option.key === rowKey ? '<i class="bi bi-check2"></i>' : ""}
-      </button>
-    `)).join("");
-    return `
-      <div class="mapping-slot-menu-wrap ${expanded ? "open" : ""}">
-        <button
-          class="form-select mapping-slot-trigger"
-          id="providerMappingSlot-${index}"
-          type="button"
-          ${isRequired ? "disabled" : ""}
-          data-action="toggle-provider-model-slot-menu"
-          data-row-index="${index}"
-          aria-haspopup="listbox"
-          aria-expanded="${expanded ? "true" : "false"}"
-        >
-          <span>${escapeHtml(slot.label)}</span>
-          <i class="bi bi-chevron-down"></i>
-        </button>
-        ${isRequired ? "" : `
-          <div class="mapping-slot-menu" role="listbox" aria-labelledby="providerMappingSlot-${index}">
-            ${options}
-          </div>
-        `}
-      </div>
-    `;
-  }
-
   function isDirectResponsesMode() {
     // 自定义第三方 + apiFormat=responses → Codex.app 直连上游(direct 模式),
     // 模型透传给上游,代理不做 alias 翻译 → default mapping 可空。
@@ -836,71 +787,22 @@
     );
   }
 
-  function customMappingRowMarkup(rowKey, index) {
-    const customLabel = providerFormCustomLabels[rowKey] || "";
-    const currentProviderModel = providerFormMappings[rowKey] || "";
-    return `
-      <article class="form-mapping-row">
-        <div class="form-mapping-left">
-          <label class="form-label visually-hidden" for="providerMappingSlot-${index}">${t("providersAdd.claudeModel")}</label>
-          <div class="mapping-select-wrap">
-            <span class="mapping-icon default"><i class="bi bi-pencil"></i></span>
-            <input
-              class="form-control form-select custom-model-name-input"
-              id="providerMappingSlot-${index}"
-              data-custom-model-label="${escapeHtml(rowKey)}"
-              value="${escapeHtml(customLabel)}"
-              placeholder="${escapeHtml(t("providersAdd.customModelPlaceholder"))}"
-            >
-          </div>
-        </div>
-        <div class="form-mapping-right">
-          <label class="form-label visually-hidden" for="providerMappingValue-${index}">${t("providersAdd.providerModel")}</label>
-          <div class="provider-model-input-wrap ${openProviderModelMenuKey === rowKey ? "open" : ""}">
-            ${providerModelValueInputMarkup(rowKey, index, currentProviderModel, false)}
-            <button
-              class="provider-model-trigger"
-              type="button"
-              data-action="toggle-provider-model-menu"
-              data-row-key="${escapeHtml(rowKey)}"
-              ${providerAvailableModels.length ? "" : "disabled"}
-              aria-haspopup="listbox"
-              aria-expanded="${providerAvailableModels.length && openProviderModelMenuKey === rowKey ? "true" : "false"}"
-              aria-label="${escapeHtml(t("providersAdd.providerModel"))}"
-            >
-              <i class="bi bi-chevron-down" aria-hidden="true"></i>
-            </button>
-            ${providerAvailableModels.length ? `
-              <div class="mapping-slot-menu provider-model-menu" role="listbox" aria-labelledby="providerMappingValue-${index}">
-                ${providerModelOptionsMarkup(currentProviderModel)}
-              </div>
-            ` : ""}
-          </div>
-        </div>
-        <div class="form-mapping-actions">
-          <button class="btn btn-outline-secondary btn-sm mapping-remove-button" type="button" data-action="remove-provider-model-row" data-row-index="${index}" aria-label="${escapeHtml(t("providersAdd.removeMapping"))}">${escapeHtml(t("providersAdd.removeMapping"))}</button>
-        </div>
-      </article>
-    `;
-  }
-
   function formMappingMarkup() {
     return providerFormRows.map((rowKey, index) => {
-      if (isCustomMappingRow(rowKey)) {
-        return customMappingRowMarkup(rowKey, index);
-      }
-      const slot = slotByKey(rowKey);
-      // direct 模式不需要 model alias 映射,default 字段也可空;其他场景仍 required
-      const isRequired = rowKey === "default" && !isDirectResponsesMode();
+      // [MOC-154] 列表式:行序自动对应 Codex slot(行0=默认→gpt_5_5+default,行1→gpt_5_4
+      // ...),用户只填"要在 Codex 显示的模型",不再手动选槽位、不再有 custom 行。
+      const isDefault = index === 0;
+      // direct 模式不需要 model alias 映射,默认行也可空;其他场景默认行仍 required
+      const isRequired = isDefault && !isDirectResponsesMode();
       const currentProviderModel = providerFormMappings[rowKey] || "";
       return `
         <article class="form-mapping-row">
           <div class="form-mapping-left">
-            <label class="form-label visually-hidden" for="providerMappingSlot-${index}">${t("providersAdd.claudeModel")}</label>
-            <div class="mapping-select-wrap">
-              <span class="mapping-icon ${slot.iconClass}"><i class="bi ${slot.icon}"></i></span>
-              ${slotMenuMarkup(rowKey, index)}
-            </div>
+            <span class="mapping-index-badge${isDefault ? " is-default" : ""}" aria-hidden="true">
+              ${isDefault
+                ? `<i class="bi bi-star-fill"></i><span>${escapeHtml(t("providersAdd.defaultModelBadge"))}</span>`
+                : `<span>${index + 1}</span>`}
+            </span>
           </div>
           <div class="form-mapping-right">
             <label class="form-label visually-hidden" for="providerMappingValue-${index}">${t("providersAdd.providerModel")}</label>
@@ -926,7 +828,7 @@
             </div>
           </div>
           <div class="form-mapping-actions">
-            ${isRequired
+            ${isDefault
               ? '<span class="mapping-remove-placeholder" aria-hidden="true"></span>'
               : `<button class="btn btn-outline-secondary btn-sm mapping-remove-button" type="button" data-action="remove-provider-model-row" data-row-index="${index}" aria-label="${escapeHtml(t("providersAdd.removeMapping"))}">${escapeHtml(t("providersAdd.removeMapping"))}</button>`}
           </div>
@@ -938,22 +840,22 @@
   function renderProviderMappings() {
     const stack = $("#providerMappingStack");
     if (!stack) return;
-    if (openProviderSlotMenuIndex !== null && !providerFormRows[openProviderSlotMenuIndex]) {
-      openProviderSlotMenuIndex = null;
-    }
     if (openProviderModelMenuKey !== null && !providerFormRows.includes(openProviderModelMenuKey)) {
       openProviderModelMenuKey = null;
     }
+    const maxRows = providerFormDefaultRows.filter((k) => k !== "default").length;
     stack.innerHTML = `
       <div class="provider-mapping-card">
         <div class="provider-mapping-list">
           ${formMappingMarkup()}
         </div>
+        ${providerFormRows.length < maxRows ? `
         <div class="provider-mapping-footer">
           <button class="btn btn-outline-primary btn-sm" type="button" data-action="add-provider-model-row">
-            <i class="bi bi-plus-lg"></i><span>${escapeHtml(t("providersAdd.addMapping"))}</span>
+            <i class="bi bi-plus-lg"></i><span>${escapeHtml(t("providersAdd.addModel"))}</span>
           </button>
         </div>
+        ` : ""}
       </div>
     `;
     refreshSummaryModelDatalist();
@@ -984,7 +886,6 @@
     if (Array.isArray(options.availableModels)) {
       providerAvailableModels = options.availableModels.slice();
     }
-    openProviderSlotMenuIndex = null;
     openProviderModelMenuKey = null;
     renderProviderMappings();
   }
@@ -1014,19 +915,14 @@
   }
 
   function collectProviderMappingsWithCustom() {
-    const base = normalizeMappings(providerFormMappings);
-    // convert _custom_N internal keys to the user-typed model name
+    // [MOC-154] 列表式:行序 → Codex slot。行0 的模型同时占 gpt_5_5 + default
+    // (Codex 新对话默认 gpt-5.5 直接用它);其余行依次填 gpt_5_4/.../gpt_5_2。
     const result = {};
-    for (const [key, value] of Object.entries(base)) {
-      if (isCustomMappingRow(key)) {
-        const label = (providerFormCustomLabels[key] || "").trim();
-        if (label && String(value || "").trim()) {
-          result[label] = String(value).trim();
-        }
-      } else {
-        result[key] = value;
-      }
-    }
+    providerFormRows.forEach((rowKey) => {
+      const val = String(providerFormMappings[rowKey] || "").trim();
+      if (val) result[rowKey] = val;
+    });
+    if (result.gpt_5_5) result.default = result.gpt_5_5;
     return result;
   }
 
@@ -1034,62 +930,27 @@
     providerFormMappings[slotKey] = value.trim();
   }
 
-  function moveProviderMappingRow(index, nextKey) {
-    const prevKey = providerFormRows[index];
-    if (!nextKey || prevKey === nextKey) return;
-    const currentValue = providerFormMappings[prevKey] || "";
-    providerFormRows[index] = nextKey;
-    if (!providerFormMappings[nextKey]) {
-      providerFormMappings[nextKey] = currentValue;
-    }
-    if (prevKey !== "default") {
-      providerFormMappings[prevKey] = "";
-    }
-    openProviderSlotMenuIndex = null;
-    renderProviderMappings();
-  }
-
   function addProviderMappingRow() {
-    const remaining = providerFormModelSlots
-      .map((slot) => slot.key)
-      .find((key) => !providerFormRows.includes(key));
-    if (remaining) {
-      providerFormRows = [...providerFormRows, remaining];
-    } else {
-      // all predefined slots used — add a custom row
-      const customKey = `_custom_${customRowCounter++}`;
-      providerFormRows = [...providerFormRows, customKey];
-      providerFormMappings[customKey] = "";
-      providerFormCustomLabels[customKey] = "";
-    }
-    openProviderSlotMenuIndex = null;
+    // [MOC-154] 列表式:按序加下一个 slot(gpt_5_5→gpt_5_4→...),最多 5 个。
+    const slotKeys = providerFormDefaultRows.filter((k) => k !== "default");
+    if (providerFormRows.length >= slotKeys.length) return;
+    providerFormRows = [...providerFormRows, slotKeys[providerFormRows.length]];
     openProviderModelMenuKey = null;
     renderProviderMappings();
   }
 
   function removeProviderMappingRow(index) {
-    const key = providerFormRows[index];
-    if (!key || key === "default") return;
-    providerFormRows = providerFormRows.filter((_, rowIndex) => rowIndex !== index);
-    if (isCustomMappingRow(key)) {
-      delete providerFormMappings[key];
-      delete providerFormCustomLabels[key];
-    } else {
-      providerFormMappings[key] = "";
-    }
-    openProviderSlotMenuIndex = null;
-    if (openProviderModelMenuKey === key) openProviderModelMenuKey = null;
-    renderProviderMappings();
-  }
-
-  function toggleProviderSlotMenu(index) {
-    openProviderSlotMenuIndex = openProviderSlotMenuIndex === index ? null : index;
-    renderProviderMappings();
-  }
-
-  function closeProviderSlotMenu() {
-    if (openProviderSlotMenuIndex === null) return;
-    openProviderSlotMenuIndex = null;
+    // [MOC-154] 列表式:行0(默认)不可删;删行后把剩余模型值按序重排回 gpt_5_5/...
+    if (index <= 0 || index >= providerFormRows.length) return;
+    const slotKeys = providerFormDefaultRows.filter((k) => k !== "default");
+    const vals = providerFormRows.map((k) => providerFormMappings[k] || "");
+    vals.splice(index, 1);
+    providerFormMappings = {};
+    providerFormRows = vals.map((val, i) => {
+      providerFormMappings[slotKeys[i]] = val;
+      return slotKeys[i];
+    });
+    openProviderModelMenuKey = null;
     renderProviderMappings();
   }
 
@@ -2696,10 +2557,17 @@
     $("#showGrayProviders").checked = showGrayPresets;
     $("#restoreCodexOnExit").checked = settings.restoreCodexOnExit !== false;
     $("#mcpCredentialsPortableStore").checked = settings.mcpCredentialsPortableStore !== false;
-    $("#codexNetworkAccess").checked = settings.codexNetworkAccess !== false;
-    // [MOC-169] 诊断模式开关 + 「打开查看器」按钮(仅开启时可见)
+    $("#codexNetworkAccess").checked = settings.codexNetworkAccess === true;
+    // [MOC-185] 诊断模式 = session 级一次性:不读持久化,改查查看器**真实运行态**
+    // (退出 transfer 即关、启动不自启;CAS_DIAG_TRACE env 例外)。切页面回来时
+    // checkbox 反映本 session 是否还开着,避免与运行态 desync。
     if ($("#traceViewerEnabled")) {
-      const _tv = settings.traceViewerEnabled === true;
+      let _tv = false;
+      try {
+        _tv = (await CCApi.traceViewerStatus())?.running === true;
+      } catch (_) {
+        /* status 查询失败(后端未就绪等):保守置关 */
+      }
       $("#traceViewerEnabled").checked = _tv;
       if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !_tv;
     }
@@ -3252,8 +3120,8 @@
       showGrayProviders: $("#showGrayProviders")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
       mcpCredentialsPortableStore: $("#mcpCredentialsPortableStore")?.checked !== false,
-      codexNetworkAccess: $("#codexNetworkAccess")?.checked !== false,
-      traceViewerEnabled: $("#traceViewerEnabled")?.checked === true,
+      codexNetworkAccess: $("#codexNetworkAccess")?.checked === true,
+      // [MOC-185] traceViewerEnabled 不再持久化(诊断改 session 级,见 toggle handler)。
       webFetchBackend: $("#webFetchBackend")?.querySelector(".btn.active")?.dataset.webfetch || "off",
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
@@ -3694,21 +3562,12 @@
         removeProviderMappingRow(Number(actionEl.dataset.rowIndex));
       }
 
-      if (action === "toggle-provider-model-slot-menu") {
-        toggleProviderSlotMenu(Number(actionEl.dataset.rowIndex));
-      }
-
       if (action === "toggle-baseurl-menu") {
         toggleBaseUrlMenu();
       }
 
       if (action === "select-baseurl-option") {
         setBaseUrlValue(actionEl.dataset.baseurlValue || "");
-      }
-
-      if (action === "select-provider-model-slot") {
-        moveProviderMappingRow(Number(actionEl.dataset.rowIndex), actionEl.dataset.slotKey);
-        renderPresetOptions(selectedPreset, collectProviderMappings());
       }
 
       if (action === "toggle-provider-model-menu") {
@@ -8307,9 +8166,6 @@
     });
 
     document.addEventListener("click", async (event) => {
-      if (!event.target.closest(".mapping-slot-menu-wrap")) {
-        closeProviderSlotMenu();
-      }
       if (!event.target.closest(".baseurl-input-wrap")) {
         closeBaseUrlMenu();
       }
@@ -8380,11 +8236,6 @@
       if (event.target.id === "providerBaseUrl") {
         renderBaseUrlOptions();
       }
-      const customLabelInput = event.target.closest("[data-custom-model-label]");
-      if (customLabelInput) {
-        const customKey = customLabelInput.dataset.customModelLabel;
-        providerFormCustomLabels[customKey] = customLabelInput.value;
-      }
       const mappingInput = event.target.closest("[data-provider-model-input]");
       if (!mappingInput) return;
       updateProviderModelInput(mappingInput.dataset.providerModelInput, mappingInput.value);
@@ -8393,7 +8244,6 @@
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         closeBaseUrlMenu();
-        closeProviderSlotMenu();
         closeProviderModelMenu();
       }
     });
@@ -8573,23 +8423,15 @@
     });
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
-    // [MOC-169] 诊断模式开关:持久化 + 运行时起/停查看器服务 + 切按钮可见性。
+    // [MOC-185] 诊断模式开关 = session 级一次性:**纯运行时**起/停查看器服务 + 切按钮可见性,
+    // **不再 saveSettingsFromForm 持久化开关态**(退出 transfer 即关、启动不自启)。
     // 注意:api() 对后端返回的 `success:false`(含 bind 失败)会 **throw**(api.js:28),
     // 所以启动失败走 catch —— 回滚必须放 catch 里(后端 start 失败已同步清运行时 gate)。
     $("#traceViewerEnabled")?.addEventListener("change", async () => {
       const on = $("#traceViewerEnabled")?.checked === true;
       if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !on;
-      // [MOC-169] 存设置失败**不应**阻止下面起/停——尤其关时必须停掉采集(安全语义:用户关了
-      // 就不能继续抓)。save 失败只 log,继续走 start/stop。
-      try {
-        await saveSettingsFromForm();
-      } catch (e) {
-        console.warn("[trace-viewer] save settings failed, proceeding with start/stop", e);
-      }
-      // [MOC-169] 快速 on→off 竞争:若 await 期间用户又 toggle 了(当前 checkbox 状态已与本次
+      // 快速 on→off 竞争:若 await(start/stop)期间用户又 toggle 了(当前 checkbox 状态已与本次
       // 捕获的 on 不符),本次是 stale handler → 放弃 start/stop,交给最新那次 change 处理。
-      // 否则 stale 的 on handler 可能在 off 之后又 start,留 viewer 开但开关显示关
-      // (后端 start_lock 排不了序,因为前端在 save 之后才发 /start)。
       if (($("#traceViewerEnabled")?.checked === true) !== on) return;
       try {
         if (on) {
@@ -8601,15 +8443,10 @@
         }
       } catch (e) {
         if (on) {
-          // 启动失败(如 18090 被占):回滚开关 + 隐藏按钮 + 回滚持久化,避免 UI 假"on"
-          // 且 traceViewerEnabled 持久化为 true 导致重启反复重试。
+          // 启动失败(如 18090 被占):回滚开关 + 隐藏按钮,避免 UI 假"on"。
+          // 诊断态不持久化(session 级),无需回滚持久化。
           $("#traceViewerEnabled").checked = false;
           if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = true;
-          try {
-            await saveSettingsFromForm();
-          } catch (_) {
-            /* 回滚持久化失败也不再抛:UI 已复位为 off,后端 start 已清 gate */
-          }
           showToast("诊断查看器启动失败" + (e && e.message ? `:${e.message}` : ""));
         } else {
           showToast("诊断查看器关闭失败");

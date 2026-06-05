@@ -257,6 +257,38 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
             cfg.model_display_names,
         );
         upsert_catalog_models(&paths.model_catalog_json, &models)?;
+        // [MOC-154] 列表式:Codex `model` 字段统一锚到 catalog 内的有效 slug。去掉旧
+        // fallback entry 后,遗留的 `model = 实际模型名`(用户在旧版映射 UI 下选过)会不在
+        // 新 catalog → Codex 选不到。仅当当前 model 非空且不在新 catalog slug 集合时,重置
+        // 为 `gpt-5.5`(= 默认模型槽,保证新对话直接用默认);已是有效 slug(用户手选的
+        // gpt-5.x)→ 保留不覆盖(守 no-silent-destructive)。snapshot 已在首次 apply 前
+        // 捕获原 model,restore 仍按快照还原用户接管前的值。
+        let current_model = match std::fs::read_to_string(&paths.config_toml) {
+            // 与同 crate `read_or_empty` 约定一致:NotFound(首次 apply、config.toml 还
+            // 不存在 → 无遗留 model)当良性、不迁移;其余 IO 错误(权限/损坏/部分读)
+            // fail-loud 向上传播,不静默吞错漏迁移。
+            Ok(content) => content
+                // root `model` key 只在第一个 `[section]` 之前出现;take_while 到首个
+                // 表头止,避免把 `[some_table]` 里的 `model = ...` 误读成根 model。
+                .lines()
+                .take_while(|line| !line.trim_start().starts_with('['))
+                .find_map(|line| {
+                    let t = line.trim_start();
+                    if t.starts_with('#') {
+                        None
+                    } else {
+                        crate::residual::parse_root_string_value(t, "model")
+                    }
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let model_needs_reset = current_model
+            .as_deref()
+            .is_some_and(|m| !m.is_empty() && !models.iter().any(|cm| cm.slug == m));
+        if model_needs_reset && models.iter().any(|cm| cm.slug == "gpt-5.5") {
+            sync_root_value(&paths.config_toml, "model", Some("\"gpt-5.5\""))?;
+        }
         if cfg.supports_1m {
             sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
         } else {
@@ -1063,11 +1095,12 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&paths.model_catalog_json).unwrap()).unwrap();
         assert_eq!(catalog["models"][0]["context_window"], 1_000_000);
         assert_eq!(catalog["models"][0]["effective_context_window_percent"], 95);
+        // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 占 gpt-5.5 slot
         assert!(catalog["models"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["slug"] == "deepseek-v4-pro"));
+            .any(|m| m["slug"] == "gpt-5.5"));
     }
 
     #[test]
@@ -1107,7 +1140,11 @@ mod tests {
         let models = catalog["models"].as_array().unwrap();
         let gpt55 = models.iter().find(|m| m["slug"] == "gpt-5.5").unwrap();
         let gpt54 = models.iter().find(|m| m["slug"] == "gpt-5.4").unwrap();
-        let mini = models.iter().find(|m| m["slug"] == "gpt-5.4-mini").unwrap();
+        // [MOC-154] gpt_5_4_mini 槽未配置 → 跳过,不生成 entry
+        assert!(
+            models.iter().all(|m| m["slug"] != "gpt-5.4-mini"),
+            "空槽 gpt_5_4_mini 应被跳过"
+        );
         // user feedback (2026-05-26): display_name 不含 "Provider / " 前缀,
         // provider 移到 description 里
         assert_eq!(gpt55["display_name"], "short-context-model");
@@ -1115,11 +1152,6 @@ mod tests {
         assert!(gpt55["description"].as_str().unwrap().contains("(Mixed)"));
         assert_eq!(gpt54["display_name"], "custom-long-model");
         assert_eq!(gpt54["context_window"], 1_000_000);
-        assert_eq!(
-            mini["display_name"], "deepseek-v4-pro",
-            "empty slots should document their default fallback target"
-        );
-        assert_eq!(mini["context_window"], 1_000_000);
     }
 
     #[test]
