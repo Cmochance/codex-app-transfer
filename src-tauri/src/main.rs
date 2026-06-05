@@ -338,8 +338,13 @@ fn main() {
                             let _ = handlers::settings::disable_auto_unlock_codex_plugins().await;
                             // [MOC-178 codex P2] 账号 expired 无法恢复 → 也持久关真实账号模式 flag,
                             // 否则前端据 mode_enabled 派生 toggle 仍 on、future startup 还当 enabled。
-                            // 重登成功 / 重新 import 会再开。
-                            let _ = handlers::settings::set_real_account_mode_enabled(false);
+                            // 重登成功 / 重新 import 会再开。[本地审查 MEDIUM] 写失败留痕(本 task 是
+                            // 启动 best-effort、下次 reconcile 重试,relogin 事件已兜底告知用户)。
+                            if !handlers::settings::set_real_account_mode_enabled(false) {
+                                tracing::warn!(
+                                    "[RealAccount] ReloginRequired:flag 写 false 失败(config 不可写),下次启动 reconcile 重试"
+                                );
+                            }
                             if let Some(window) =
                                 app_handle_for_residual_scan.get_webview_window("main")
                             {

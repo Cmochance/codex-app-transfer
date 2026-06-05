@@ -92,6 +92,11 @@ async fn finalize_enable_real_account(state: &AdminState) -> Result<(), String> 
     // → abort,不 apply relay。否则会 apply relay 把活动写成 chatgpt 但 flag 仍旧值 → 前端/startup
     // 据旧 flag 当 mode off,活动却是 chatgpt,状态不一致。
     if !super::settings::set_real_account_mode_enabled(true) {
+        // [MOC-178 codex P2] abort 前先切活动回 apikey —— activate(enable)/import 已把活动写成
+        // chatgpt,若只 return Err 不切,flag false 但活动 chatgpt + plugins exposed 状态不一致。
+        if codex_real_account::active_is_real_chatgpt_now() {
+            let _ = codex_real_account::deactivate_real_account().await;
+        }
         return Err("写入真实账号模式开关失败(配置文件不可写?),请检查权限 / 磁盘后重试".to_owned());
     }
     let synced =
@@ -105,7 +110,15 @@ async fn finalize_enable_real_account(state: &AdminState) -> Result<(), String> 
     }
     // relay 没真生效(direct / proxy 起不来)→ 回滚 flag + 切活动回 apikey(clearing 走 force_apikey,
     // 即便 proxy 起不来也切;再 deactivate 兜底覆盖无 provider),避免「flag/UI 说开但 relay 没起」。
-    let _ = super::settings::set_real_account_mode_enabled(false);
+    // [本地审查 silent-failure HIGH] 回滚 flag 写失败要留痕:supports_relay=true 但 proxy 临时挂时
+    // flag 残留 true → toggle 误显 on,且下次 startup 的 !supports_relay 收敛不触发(provider 本身
+    // 支持 relay),reconcile 正常分支可能又恢复 chatgpt 横跳;无日志会让此类报障查不到根因。
+    if !super::settings::set_real_account_mode_enabled(false) {
+        tracing::error!(
+            "[RealAccount] finalize 回滚:flag 回写 false 失败(config 不可写),flag 残留 true → \
+             UI toggle 可能误显 on 但 relay 未起;依赖下次 startup reconcile 再纠"
+        );
+    }
     let _ =
         crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(state).await;
     if codex_real_account::active_is_real_chatgpt_now() {
