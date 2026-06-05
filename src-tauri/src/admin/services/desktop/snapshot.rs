@@ -172,6 +172,15 @@ pub fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConf
     ))
 }
 
+/// [MOC-178 codex P2] 当前 active provider 是否 direct(bypass_proxy 直连,transfer 不代理 →
+/// 不支持真实账号 relay)。只读,不写盘。direct 下真实账号模式 flag 不该 true(startup 收敛关)。
+pub fn active_provider_is_direct() -> bool {
+    crate::admin::registry_io::load()
+        .ok()
+        .and_then(|cfg| desktop_target_for_active_provider(&cfg).map(|t| t.mode == "direct"))
+        .unwrap_or(false)
+}
+
 pub fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> {
     catalog_models_for_provider_with_display_names(
         &target.provider_name,

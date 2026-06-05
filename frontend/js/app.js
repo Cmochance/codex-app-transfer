@@ -1428,8 +1428,10 @@
       if (unlock.status === "disconnected") {
         try {
           const ra = await CCApi.realAccount.status();
-          const st = (ra && ra.status) || {};
-          if (st.logged_in === true && st.source === "official" && st.relogin_required !== true) {
+          // [MOC-178 codex P2] relay 实效看 active_is_chatgpt(活动 auth_mode==chatgpt),不能用
+          // source==official —— detect 认 token 后 source=Official 对「关了模式、活动 apikey 但
+          // tokens 还在」的文件也返回,会误判 plugins 已原生解锁(实际 apikey 没解锁)。
+          if (ra && ra.active_is_chatgpt === true) {
             icon.innerHTML = `<i class="bi bi-unlock"></i>`;
             icon.classList.add("success");
             statusText.classList.remove("muted-text");
@@ -1540,7 +1542,10 @@
       //    盖掉刚重登的账号);每次登录成功只 pin 一次(realAccountLoginPinned 防重复)。
       // ② 或:活动已是真实账号但还没有镜像(如 app 外登录)→ 首次持久化一次。
       // 两种都要求活动确实是真实 chatgpt(source=official),不拿镜像态去 pin。
-      const activeReal = st.logged_in === true && st.source === "official";
+      // [MOC-178 codex P2] auto-pin 只在活动**真 chatgpt**(active_is_chatgpt)时触发,不能用
+      // source==official —— 认 token 后 apikey+token 文件也 source=Official,会让关了模式的活动
+      // (apikey)误触发 auto-pin、把 apikey 态 pin 进镜像。
+      const activeReal = resp.active_is_chatgpt === true;
       const justLoggedIn = login.state === "succeeded" && !realAccountLoginPinned;
       const firstPersist = activeReal && !st.has_imported;
       // [MOC-178] flag=false(用户主动关)时禁止 auto-pin 重生镜像 —— 否则关闭后镜像复活、

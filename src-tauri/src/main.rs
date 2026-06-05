@@ -278,7 +278,17 @@ fn main() {
                 // refresh_token(实测撞刷会触发 refresh_token_reused 把账号烧死)。
                 {
                     use crate::codex_real_account::ReconcileOutcome;
-                    let mode_enabled = handlers::settings::read_real_account_mode_enabled();
+                    let mut mode_enabled = handlers::settings::read_real_account_mode_enabled();
+                    // [MOC-178 codex P2] direct provider 不代理(bypass_proxy 直连)→ 不支持真实账号
+                    // relay。即便 flag=true(migrate 有账号落定 / pin / 历史),direct 下也持久关 flag +
+                    // 当 false 走 ForceDisable 收敛 apikey,避免 direct apply apikey 后 reconcile 又恢复
+                    // chatgpt 的反复 + UI mode 错显 on。切回 local_proxy 后用户手动再开。
+                    if mode_enabled == Some(true)
+                        && admin::services::desktop::snapshot::active_provider_is_direct()
+                    {
+                        let _ = handlers::settings::set_real_account_mode_enabled(false);
+                        mode_enabled = Some(false);
+                    }
                     match crate::codex_real_account::reconcile_on_startup(mode_enabled).await {
                         // [MOC-178] 用户主动关了真实账号模式(flag=false),活动可能被退出 restore
                         // 写回 chatgpt → 收敛回 apikey(保留 tokens),在下方 daemon 决策前完成。
