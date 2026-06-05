@@ -1560,7 +1560,19 @@
         realAccountAutoPersisting = true;
         if (justLoggedIn) realAccountLoginPinned = true;
         CCApi.realAccount.pinCurrent()
-          .then(() => { showToast(t("realAccount.kept") || "已长期保留"); setTimeout(refreshRealAccountStatus, 300); })
+          .then(async () => {
+            // [codex P2] 真实账号 relay 可用 → 清强制 CDP 档(forceUnlockPersisted/autoUnlockCodexPlugins)
+            // + 停 daemon。否则曾 force-enable 的用户 login 真实账号后,stale force flag 让 checkbox
+            // modeOn||force 隐藏它、CDP daemon 仍可能跑(高延迟),且真实账号失效时又按 force 重启。同
+            // toggle off(第七轮)/ 清除按钮(第十六轮)的清 force 逻辑,补 auto-pin 这第三个入口。
+            if (forceUnlockPersisted) {
+              forceUnlockPersisted = false;
+              try { await saveSettingsFromForm(); } catch (_e) {}
+              try { await CCApi.pluginUnlock.stop(); } catch (_e) {}
+            }
+            showToast(t("realAccount.kept") || "已长期保留");
+            setTimeout(refreshRealAccountStatus, 300);
+          })
           .catch((e) => console.log("[RealAccount] auto-persist failed:", e))
           .finally(() => { realAccountAutoPersisting = false; });
       }
