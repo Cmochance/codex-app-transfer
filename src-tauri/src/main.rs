@@ -396,6 +396,10 @@ fn main() {
                 // 本 daemon task 与 reconcile 各自 spawn、无顺序保证,只看 active_is_real_chatgpt_now
                 // 会误判 relay 而 return、漏掉 force 用户的 daemon。flag=false 时按 force_cdp 判定
                 // (用持久 flag 而非 stale 活动态做决策,不依赖 sleep ordering)。
+                // [MOC-178 codex P2] daemon task 与 reconcile task 各自 spawn,migrate 在 reconcile
+                // task 内(第十二轮);本 task 读 flag 前也跑一次 migrate(幂等)保证读到落定值 —— 否则
+                // 首次启动 flag=None 时 mode_off=false、误当 relay active return,不启用户的 force daemon。
+                let _ = handlers::settings::migrate_real_account_mode_v1();
                 let mode_off =
                     handlers::settings::read_real_account_mode_enabled() == Some(false);
                 if !mode_off && crate::codex_real_account::active_is_real_chatgpt_now() {
