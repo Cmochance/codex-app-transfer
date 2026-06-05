@@ -552,7 +552,10 @@ pub async fn forget_imported() -> Result<bool, String> {
     // AUTH_LOCK,无死锁。
     let active_was_real = active_is_real_chatgpt_now();
     if active_was_real {
-        let _ = backup_active_auth(&paths, "preforget");
+        // [codex P2] 备份失败就报错、不删 —— 否则备份目录不可写 / 磁盘满时,用户被登出却没有
+        // 确认文案承诺的备份。备份是删活动 auth 的安全网,必须成功才删。
+        backup_active_auth(&paths, "preforget")
+            .map_err(|e| format!("清除前备份活动 auth 失败,已中止(未删除活动账号): {e}"))?;
         std::fs::remove_file(&paths.auth_json)
             .map_err(|e| format!("删活动 auth.json 失败: {e}"))?;
     }
