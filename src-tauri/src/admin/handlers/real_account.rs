@@ -88,7 +88,12 @@ pub struct ImportRequest {
 /// enable / import / pin 共用,避免某路径漏检查(import/pin 曾只 set flag=true 不校验,direct 下
 /// 会 set flag=true 但 relay 不生效 → 状态不一致)。`Ok(())` = relay 真开了。
 async fn finalize_enable_real_account(state: &AdminState) -> Result<(), String> {
-    let _ = super::settings::set_real_account_mode_enabled(true);
+    // [MOC-178 codex P2] 写 flag 失败(config 文件不可写:权限改了 / 配置盘满,但 auth.json 还可写)
+    // → abort,不 apply relay。否则会 apply relay 把活动写成 chatgpt 但 flag 仍旧值 → 前端/startup
+    // 据旧 flag 当 mode off,活动却是 chatgpt,状态不一致。
+    if !super::settings::set_real_account_mode_enabled(true) {
+        return Err("写入真实账号模式开关失败(配置文件不可写?),请检查权限 / 磁盘后重试".to_owned());
+    }
     let synced =
         crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(state).await;
     let sync_ok = synced
