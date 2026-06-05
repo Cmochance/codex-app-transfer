@@ -589,9 +589,31 @@ fn is_challenge_body(body: &str) -> bool {
 /// (特判反会漏真 CSR 空壳——它同样带 __NEXT_DATA__)。
 fn is_js_shell(html: &str) -> bool {
     // 仅"可见文本少"不够 —— 短静态页(status 页 / 小 snippet)也少, 但 curl 已成功, 升 headless
-    // 是无谓浪费、甚至(headless 不可用时)把成功变失败(chatgpt-codex review)。要求**同时**有 SPA
-    // 骨架信号(已知挂载点 + script)才判 shell; 短静态页(无挂载点)放行为成功。
-    visible_text_len(html) < MIN_EXTRACTED_CHARS && has_spa_skeleton(html)
+    // 是无谓浪费。要求可见文本极少 **且** 有"内容靠 JS 渲染"的信号才判 shell。
+    if visible_text_len(html) >= MIN_EXTRACTED_CHARS {
+        return false;
+    }
+    // ① 标准框架 mount + script(精确覆盖 React/Vue/Next/Nuxt/Angular)。
+    // ② MOC-183 兜底: 非标准 mount 但有 bundle 脚本(ESM `type=module` / 外部 `.js`) —— 实测
+    //    mouseless.click / doscienceto.it 这类被原 mount 白名单漏判, headless 能抓到内容
+    //    (vtext 163→1722 / 21→126)。静态短页(status/snippet)不引 module/bundle.js → 不误升,
+    //    保住"避免误升静态短页"的原 trade-off。
+    has_spa_skeleton(html) || has_app_bundle_script(html)
+}
+
+/// "加载 JS 应用"的 bundle 脚本特征 (MOC-183): ESM `<script type=module>` 或外部 `.js`/`.mjs`
+/// 引用 —— 现代构建工具 (vite/webpack/rollup) 产物。用于 [`is_js_shell`] 的非标准 mount 兜底:
+/// **仅在可见文本已极少时才查** (调用点已 gate), 故"正文里恰好提到 .js"的误判窗口极小。
+fn has_app_bundle_script(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    if !lower.contains("<script") {
+        return false;
+    }
+    lower.contains("type=\"module\"")
+        || lower.contains("type=module")
+        || lower.contains(".js\"")
+        || lower.contains(".js'")
+        || lower.contains(".mjs")
 }
 
 /// SPA 骨架特征: 已知框架挂载点 (root/app/__next/__nuxt/ng-app/reactroot) + 页面挂着 `<script`
@@ -1022,6 +1044,30 @@ mod tests {
             !is_js_shell("<html><body><div id=\"root\"></div></body></html>"),
             "无 script 的挂载点不算 SPA shell"
         );
+
+        // MOC-183: 非标准 mount 但有 bundle 脚本(实测 mouseless.click / doscienceto.it 型,
+        // 原 mount 白名单漏判, headless 实测能抓到内容)。
+        assert!(
+            is_js_shell(
+                "<html><body><div id=\"app-container\"></div>\
+                 <script type=\"module\" src=\"/assets/index-abc.js\"></script></body></html>"
+            ),
+            "非标准 mount + ESM module 脚本应判 shell"
+        );
+        assert!(
+            is_js_shell(
+                "<html><body><main id=\"wrap\"></main>\
+                 <script src=\"/static/bundle.abc.js\"></script></body></html>"
+            ),
+            "非标准 mount + 外部 .js bundle 应判 shell"
+        );
+        // 边界(不误升): 静态短页 + 纯 inline script(无 module / 无 .js bundle)→ 不判 shell。
+        assert!(
+            !is_js_shell("<html><body><p>Status: OK</p><script>track();</script></body></html>"),
+            "静态短页 + inline script(无 bundle)不应误升"
+        );
+        // 已知 trade-off(MOC-183): 静态短页若引外部 `.js`(如 analytics)会被判 shell → auto 档
+        // 多花一次 headless(结果不差: headless 渲染静态页 = 同内容)。这类页 MOC-152 证明罕见。
     }
 
     /// 端到端真机 (网络 + headless): Auto 档抓 DDG (curl/wreq 必被 202 反爬, 应自动升到 headless
