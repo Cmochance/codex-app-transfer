@@ -193,6 +193,19 @@ fn redact_credential_tokens(s: &str) -> Option<String> {
     ];
     let is_tok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
     let tok_len = |after: &str| -> usize { after.chars().take_while(|c| is_tok(*c)).count() };
+    // Bearer/OAuth opaque token 用 RFC 6750/7235 **token68** 字母表(比 prefix-key 的 is_tok 宽:
+    // 含 `~ + /`)+ 末尾可选 `=` padding(base64 标准)。否则含 `+`/`/`/`~`/`=` 的 token 会被
+    // is_tok 截断、suffix 漏脱(codex P2)。token68 全 ASCII,char 数 == byte 数。
+    let bearer_tok_len = |after: &str| -> usize {
+        let main = after
+            .chars()
+            .take_while(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~' | '+' | '/')
+            })
+            .count();
+        let pad = after.chars().skip(main).take_while(|c| *c == '=').count();
+        main + pad
+    };
 
     let mut out = String::with_capacity(s.len());
     let mut changed = false;
@@ -224,7 +237,7 @@ fn redact_credential_tokens(s: &str) -> Option<String> {
         let rb = rest.as_bytes();
         if rb.len() > 7 && rb[..6].eq_ignore_ascii_case(b"bearer") && rb[6] == b' ' {
             let after = &rest[7..];
-            let n = tok_len(after);
+            let n = bearer_tok_len(after);
             if n >= 16 {
                 out.push_str(&rest[..7]);
                 out.push_str("***");
@@ -1196,6 +1209,16 @@ mod tests {
             "小写 bearer token 泄漏: {ls}"
         );
         assert!(ls.contains("bearer ***"), "应保留原大小写前缀: {ls}");
+
+        // Bearer opaque token 含 token68 字符(+ / ~ = padding)整段脱敏(RFC 6750/7235,codex P2)
+        let b68 = redact_bundle_body(br#"{"d":"Bearer ab+cd/ef~gh0123456789KLMN== rest"}"#);
+        let b68s = serde_json::to_string(&b68).unwrap();
+        assert!(
+            !b68s.contains("ab+cd/ef~gh0123456789KLMN"),
+            "token68 Bearer 漏脱: {b68s}"
+        );
+        assert!(b68s.contains("Bearer ***"), "应整段脱敏: {b68s}");
+        assert!(b68s.contains("rest"), "token 后正文保留");
 
         // 非 JSON 上游回包(HTML 401 页 / 纯文本)里回显的 key 走 bytes_payload fallback 也要挡
         let html = redact_bundle_body(
