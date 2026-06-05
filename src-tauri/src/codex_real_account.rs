@@ -544,22 +544,11 @@ pub async fn forget_imported() -> Result<bool, String> {
     // [connector review] 清除账号后不再有可重登的保留账号 → 清掉「需重新登录」标记,
     // 否则 status 仍带 relogin_required=true,UI 继续提示「账号已失效」要重登。
     set_relogin_required(false);
-    // [MOC-178] 清除真实账号 = 停用,连带降级活动 auth.json:活动若仍是真实 chatgpt,先
-    // 备份再删。否则镜像删了但活动还 chatgpt → active_is_real_chatgpt_now() 仍 true →
-    // ① 前端 realActive 派生 toggle 关不掉、账号状态仍「获取成功」(清除按钮却已消失,状态
-    // 不一致) ② 切 provider 仍走 relay(preserve_chatgpt_auth)保留 chatgpt。镜像已删,
-    // reconcile_on_startup 无源可恢复,删了不复活。active_is_real_chatgpt_now 只读、不锁
-    // AUTH_LOCK,无死锁。
-    let active_was_real = active_is_real_chatgpt_now();
-    if active_was_real {
-        // [codex P2] 备份失败就报错、不删 —— 否则备份目录不可写 / 磁盘满时,用户被登出却没有
-        // 确认文案承诺的备份。备份是删活动 auth 的安全网,必须成功才删。
-        backup_active_auth(&paths, "preforget")
-            .map_err(|e| format!("清除前备份活动 auth 失败,已中止(未删除活动账号): {e}"))?;
-        std::fs::remove_file(&paths.auth_json)
-            .map_err(|e| format!("删活动 auth.json 失败: {e}"))?;
-    }
-    Ok(had_mirror || active_was_real)
+    // [MOC-178] 不在这里删/改活动 auth.json —— 删整个文件会丢 tokens(退出 restore 只恢复
+    // MANAGED 的 auth_mode/OPENAI_API_KEY、tokens 恢复不回 → 残缺)。停用真实账号(让 toggle
+    // 关 + Codex 原生不显示 plugins)改由 forget_handler apply 当前 provider 强制 non-relay
+    // 完成:写 auth_mode=apikey 但**保留 tokens**,退出 restore 才能写回 chatgpt + tokens 完整恢复。
+    Ok(had_mirror)
 }
 
 /// [MOC-104 req#5 启动调谐] 启动时(**绝不刷新 token**,见模块级分流说明):① 活动

@@ -8426,13 +8426,19 @@
       } catch (e) { showToast(e.message); }
     });
     $("[data-action=real-account-forget]")?.addEventListener("click", async () => {
-      if (!window.confirm(t("realAccount.forgetConfirm") || "清除真实账号?将停用「长期保留」;若当前活动账号正是这个真实 chatgpt,会一并退出登录(已自动备份),启动不再恢复。")) return;
+      if (!window.confirm(t("realAccount.forgetConfirm") || "清除真实账号?将切回 apikey 模式(Codex 不再显示 Plugins);你的登录态会保留,退出 transfer 时自动恢复。")) return;
       try {
-        await CCApi.realAccount.forget();
+        const res = await CCApi.realAccount.forget();
         // 抑制本 session 内的 auto-persist 重新生成镜像(review #1):清除后即便
         // login.state 仍是 succeeded、活动仍是 chatgpt,也别把刚删的镜像又 pin 回来。
         realAccountForgotten = true;
-        showToast(t("realAccount.forgotten") || "已清除真实账号");
+        // [MOC-178] 后端删镜像后 apply 切 apikey;失败(如 proxy 起不来)时如实提示 ——
+        // 镜像已删但活动仍 chatgpt、toggle 可能没关。500ms 后 refresh 会自纠偏,但先告知。
+        if (res && res.switchedToApikey === false) {
+          showToast(t("realAccount.forgetApplyFailed") || "已清除镜像,但切 apikey 失败 —— Plugins 可能未关,请重试或重启 Codex");
+        } else {
+          showToast(t("realAccount.forgotten") || "已清除真实账号");
+        }
         setTimeout(refreshRealAccountStatus, 500);
       } catch (e) { showToast(e.message); }
     });

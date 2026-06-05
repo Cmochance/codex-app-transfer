@@ -105,16 +105,29 @@ pub async fn pin_current_handler() -> impl IntoResponse {
 /// POST /api/desktop/real-account/forget
 ///
 /// 忘记导入的真实账号(删持久镜像)= 退出"长期生效",启动不再自动恢复。
-pub async fn forget_handler() -> impl IntoResponse {
-    match codex_real_account::forget_imported().await {
-        Ok(removed) => Json(json!({
-            "success": true,
-            "removed": removed,
-            "message": if removed { "已忘记导入的真实账号" } else { "没有导入的真实账号" },
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
+pub async fn forget_handler(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+) -> impl IntoResponse {
+    let removed = match codex_real_account::forget_imported().await {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    // [MOC-178] 删镜像后 apply 当前 provider 强制切 apikey:停用真实账号(toggle 关 + Codex
+    // 原生不显示 plugins),但**保留 tokens** → 退出 restore 能写回 chatgpt + tokens 完整恢复。
+    // (对比直接删活动 auth.json:那会丢 tokens、restore 恢复不回,残缺。)
+    let synced =
+        crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&state).await;
+    let switched = synced
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Json(json!({
+        "success": true,
+        "removed": removed,
+        "switchedToApikey": switched,
+        "message": "已清除真实账号(切回 apikey 模式,tokens 保留,退出可恢复)",
+    }))
+    .into_response()
 }
 
 /// 组装路由 — 在 `admin/mod.rs` 调 `.merge(handlers::real_account::routes())` 挂载。
