@@ -877,22 +877,41 @@ fn select_relevant_content(
         out.push('\n');
         last = Some(i);
     }
-    // 守住 max 广告上限:单段 > max 的页(无空行巨块)会被强行选为第一块, out 可能超 max →
-    // 末尾按字符硬 cap(selected 已 true, 不完整提示已给), 防撑爆总结模型上下文(connector P2)。
+    // 守住 max 上限:各块已硬切到 ≤ CHUNK_CHARS, 但拼接时每块尾 `\n` + gap 分隔符未计入 `used`
+    // 预算(used 只累加裸 chunk 字符数), out 仍可能略超 max → 末尾按字符硬 cap(selected 已 true,
+    // 不完整提示已给), 防撑爆总结模型上下文(connector P2)。
     if out.chars().count() > max {
         out = out.chars().take(max).collect();
     }
     (out, true, picked_count, total)
 }
 
-/// 把 markdown 按段落(空行分隔)贪心打包成 ≤ `chunk_chars` 的块。单段超限 → 自成一块
-/// (不硬切, 保段落完整;相关性打分不受影响)。
+/// 把 markdown 按段落(空行分隔)贪心打包成 ≤ `chunk_chars` 的块。**单段超限 → char-safe 硬切**
+/// 成多个 ≤ `chunk_chars` 块(MOC-156:旧版"自成一块"会让无空行巨段——如 Wikipedia References
+/// 列表——成一个 ~70k 巨块, 靠体量在 relevance_score 里霸榜、占满预算导致 picked=1 还选错段)。
 fn chunk_markdown(content: &str, chunk_chars: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut cur = String::new();
     for para in content.split("\n\n") {
         let para = para.trim();
         if para.is_empty() {
+            continue;
+        }
+        // 单段超限: 先冲掉 cur, 再把该段按字符硬切成多个 ≤ chunk_chars 块(不再整段塞一块)。
+        if para.chars().count() > chunk_chars {
+            if !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+            }
+            let mut buf = String::new();
+            for ch in para.chars() {
+                buf.push(ch);
+                if buf.chars().count() >= chunk_chars {
+                    chunks.push(std::mem::take(&mut buf));
+                }
+            }
+            if !buf.is_empty() {
+                chunks.push(buf);
+            }
             continue;
         }
         if !cur.is_empty() && cur.chars().count() + para.chars().count() > chunk_chars {
@@ -958,7 +977,9 @@ fn flush_cjk(cjk: &mut Vec<char>, terms: &mut Vec<String>) {
     cjk.clear();
 }
 
-/// 块对 prompt 词集的词法相关性:各词在块内(小写)出现次数之和, 用 log 阻尼高频词。
+/// 块对 prompt 词集的词法相关性:各词在块内(小写)出现次数之和(log 阻尼高频词), **末尾按块长度
+/// 归一**(MOC-156:除以 `sqrt(块字符数)`, 让"单位长度相关性高"的块胜出, 而非"绝对词数多"的巨块
+/// ——防大块靠体量霸榜。sqrt 温和归一, 不过度惩罚长块, 也避免短标题块虚高)。
 /// 注:`str::matches` 是**非重叠**计数, CJK 紧邻重复 bigram(如 `相相相` 对 `相相`)会少计一次;
 /// 仅轻微影响打分、不改相对排序(选块仍按相关性), 故按启发式接受不做重叠计数。
 fn relevance_score(chunk: &str, terms: &[String]) -> f64 {
@@ -973,7 +994,8 @@ fn relevance_score(chunk: &str, terms: &[String]) -> f64 {
             score += (1.0 + count as f64).ln();
         }
     }
-    score
+    let len = chunk.chars().count().max(1) as f64;
+    score / len.sqrt()
 }
 
 /// 读 `~/.codex-app-transfer/config.json` 的 `settings.webFetchBackend` 当前档(每次调用都读,
@@ -1260,14 +1282,56 @@ mod tests {
 
     #[test]
     fn select_relevant_caps_oversized_single_chunk() {
-        // 单段无空行 > max → 巨块被强行选为第一块, 但 out 末尾硬 cap 到 max(守广告上限)。
+        // 单段无空行 > max: MOC-156 后 chunk_markdown 硬切成多块, 选块取若干块填到 max,
+        // out ≤ max(末尾仍有硬 cap 兜底守广告上限)。
         let huge = "x".repeat(10_000);
         let (sel, selected, _picked, _total) = select_relevant_content(&huge, "query", 4000);
         assert!(selected);
         assert!(
             sel.chars().count() <= 4000,
-            "out 应被 cap 到 max, 实际 {}",
+            "out 应 ≤ max, 实际 {}",
             sel.chars().count()
+        );
+    }
+
+    #[test]
+    fn chunk_markdown_hard_splits_oversized_paragraph() {
+        // MOC-156: 单段无空行 12k > chunk_chars(4k) → 硬切成多块, 不再自成一个巨块。
+        let huge = "a".repeat(12_000);
+        let chunks = chunk_markdown(&huge, 4000);
+        assert!(
+            chunks.len() >= 3,
+            "12k 单段应硬切成 ≥3 块, 实际 {}",
+            chunks.len()
+        );
+        assert!(
+            chunks.iter().all(|c| c.chars().count() <= 4000),
+            "每块应 ≤ chunk_chars"
+        );
+    }
+
+    #[test]
+    fn select_relevant_hard_split_recovers_picked_over_one() {
+        // 复现并修 picked=1 急症: 无空行巨段(>max)旧版自成一块、独占预算 → picked=1。
+        // 硬切后巨段成多块, 选块能选多块, picked>1(让选块从"挑 1 段"恢复到"挑多段")。
+        let giant = "filler ".repeat(20_000); // ~140k 无空行巨段
+        let content = format!("{giant}\n\n## 末尾段\n关键 alpha beta 内容。");
+        let (_sel, selected, picked, total) =
+            select_relevant_content(&content, "filler alpha beta", 20_000);
+        assert!(selected, "超 max 应触发选块");
+        assert!(total > 1, "硬切应产生多块, total={total}");
+        assert!(picked > 1, "硬切后应选多块(治 picked=1), picked={picked}");
+    }
+
+    #[test]
+    fn relevance_score_length_normalized_favors_concise() {
+        // MOC-156 归一: 相同关键词命中, 单位长度相关性高的短块应胜过被大量填充稀释的长块。
+        let terms = tokenize("alpha beta");
+        let concise = relevance_score("alpha beta", &terms);
+        let diluted = relevance_score(&format!("alpha beta {}", "filler ".repeat(500)), &terms);
+        assert!(
+            concise > diluted,
+            "归一后短块应胜出: concise={concise} diluted={diluted}"
         );
     }
 
