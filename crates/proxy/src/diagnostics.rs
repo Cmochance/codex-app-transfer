@@ -179,10 +179,15 @@ fn redact_credential_tokens(s: &str) -> Option<String> {
                 }
             }
         }
-        if let Some(after) = rest.strip_prefix("Bearer ") {
+        // Bearer scheme 大小写不敏感(RFC 6750)→ `bearer`/`BEARER`/`Bearer` 都认;前 7 字节
+        // 恒为 ASCII(`bearer `),按字节判可安全切片。保留原始大小写前缀。
+        let rb = rest.as_bytes();
+        if rb.len() > 7 && rb[..6].eq_ignore_ascii_case(b"bearer") && rb[6] == b' ' {
+            let after = &rest[7..];
             let n = tok_len(after);
             if n >= 16 {
-                out.push_str("Bearer ***");
+                out.push_str(&rest[..7]);
+                out.push_str("***");
                 rest = &after[after.char_indices().nth(n).map_or(after.len(), |(i, _)| i)..];
                 changed = true;
                 continue 'scan;
@@ -1107,6 +1112,16 @@ mod tests {
             "Bearer token 泄漏: {brs}"
         );
         assert!(brs.contains("Bearer ***"));
+
+        // bearer 大小写不敏感(RFC 6750):小写 `bearer` 也挡,保留原大小写前缀
+        let low =
+            redact_bundle_body(br#"{"detail":"invalid auth: bearer abcdef0123456789ghijkl end"}"#);
+        let ls = serde_json::to_string(&low).unwrap();
+        assert!(
+            !ls.contains("abcdef0123456789ghijkl"),
+            "小写 bearer token 泄漏: {ls}"
+        );
+        assert!(ls.contains("bearer ***"), "应保留原大小写前缀: {ls}");
 
         // 非 JSON 上游回包(HTML 401 页 / 纯文本)里回显的 key 走 bytes_payload fallback 也要挡
         let html = redact_bundle_body(
