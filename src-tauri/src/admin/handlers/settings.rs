@@ -566,7 +566,11 @@ pub fn migrate_real_account_mode_v1() -> bool {
     if already {
         return false;
     }
-    let has_account = crate::codex_real_account::detect().logged_in;
+    // [MOC-178 codex P2] seed 只认「活动**真** chatgpt」(relay 在用),不用 detect().logged_in ——
+    // 后者认 token,会把「chatgpt login 后切 apikey、活动 auth_mode=apikey 但 tokens 残留」误判成
+    // 有账号 → flag=true 但 reconcile 无法从 token-only apikey activate、前端却据 flag 显示 mode on
+    // (plugins 仍 locked)。活动真 chatgpt 才是「之前在用真实账号 relay」的可靠信号。
+    let has_account = crate::codex_real_account::active_is_real_chatgpt_now();
     set_real_account_mode_enabled(has_account)
 }
 

@@ -382,7 +382,14 @@ fn main() {
 
                 // [MOC-104] 真实 chatgpt 活动 → Codex 原生显示 plugins,绝不启 daemon
                 // (relay 模式核心:无注入、无不匹配、无 MOC-100 高延迟)。
-                if crate::codex_real_account::active_is_real_chatgpt_now() {
+                // [MOC-178 codex P2] 但 flag=false(用户主动关真实账号模式)时,活动 chatgpt 是退出
+                // restore 写回的 stale 态(post-apply task 的 reconcile ForceDisable 会切回 apikey)——
+                // 本 daemon task 与 reconcile 各自 spawn、无顺序保证,只看 active_is_real_chatgpt_now
+                // 会误判 relay 而 return、漏掉 force 用户的 daemon。flag=false 时按 force_cdp 判定
+                // (用持久 flag 而非 stale 活动态做决策,不依赖 sleep ordering)。
+                let mode_off =
+                    handlers::settings::read_real_account_mode_enabled() == Some(false);
+                if !mode_off && crate::codex_real_account::active_is_real_chatgpt_now() {
                     tracing::info!(
                         "[PluginUnlock] 真实 chatgpt 账号活动,Codex 原生显示 plugins,不启 daemon(relay 模式)"
                     );
