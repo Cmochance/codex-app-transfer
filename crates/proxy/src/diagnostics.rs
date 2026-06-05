@@ -90,9 +90,15 @@ pub fn write_upstream_error_bundle(input: &UpstreamErrorBundleInput) -> Option<P
 /// → 序列化(超 cap 截断已脱敏文本);解析失败(SSE / HTML 错误页 / 二进制)退回 `bytes_payload`
 /// (那类是模型输出/错误页,无结构化 credential,与 forward-trace `redact_body` 同取舍)。
 /// bundle input 不带 content-type,故不依赖 content-type 判别,直接试解析。
+///
+/// **额外 [`redact_echoed_tokens`]**(MOC-110 / codex P1):上游 401/403 常把 key 回显进
+/// `error.message` 这类非凭据字段的字符串值里,key 级 / JWT 级判定抓不到,而 bundle 又随
+/// feedback **上传**(区别于仅本地的 viewer)→ 再扫一遍前缀型凭据 token(`sk-…` / `Bearer …`
+/// 等)。仅 bundle 路径做,forward-trace 本地 viewer 保「正文照留」契约不调用。
 fn redact_bundle_body(bytes: &[u8]) -> Value {
     if let Ok(mut v) = serde_json::from_slice::<Value>(bytes) {
         redact_json_credentials(&mut v);
+        redact_echoed_tokens(&mut v);
         let serialized = serde_json::to_vec(&v).unwrap_or_default();
         if serialized.len() <= MAX_STORED_BODY_BYTES {
             return json!({
@@ -105,6 +111,73 @@ fn redact_bundle_body(bytes: &[u8]) -> Value {
         return bytes_payload_with_len(&serialized, serialized.len(), MAX_STORED_BODY_BYTES);
     }
     bytes_payload(bytes, MAX_STORED_BODY_BYTES)
+}
+
+/// 递归对 JSON 里**所有 string 值**跑 [`redact_credential_tokens`],就地脱敏 echo 进文本的凭据。
+/// 仅 [`redact_bundle_body`](feedback 上传路径)调用 —— forward-trace 本地 viewer 不调用。
+fn redact_echoed_tokens(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if let Some(red) = redact_credential_tokens(s) {
+                *s = red;
+            }
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(redact_echoed_tokens),
+        Value::Object(map) => map.values_mut().for_each(redact_echoed_tokens),
+        _ => {}
+    }
+}
+
+/// 在字符串里就地脱敏「前缀型」凭据 token —— 上游 401/403 常把 key 回显进 `error.message`
+/// 这类字符串值(`Invalid API key sk-…` / `Bearer …`),key 级判定抓不到。**只命中「已知前缀 +
+/// 足够长的 token 串」**:`sk-` 后需 ≥20 个 token 字符,故 `task-`/`ask-` 等普通正文不会误伤
+/// (token 字符 = 字母数字 / `-` / `_` / `.`)。返回 `Some(脱敏后)` / `None`(无命中)。
+fn redact_credential_tokens(s: &str) -> Option<String> {
+    // (前缀, 前缀后 token 最小长度)。覆盖主流家:OpenAI/Anthropic sk- · Groq gsk_ · xAI xai- ·
+    // Google AIza · GitHub ghp_/gho_/ghs_/github_pat_。Bearer 单独处理(token 不一定带前缀)。
+    const PREFIXES: &[(&str, usize)] = &[
+        ("sk-", 20),
+        ("gsk_", 20),
+        ("xai-", 20),
+        ("AIza", 24),
+        ("ghp_", 20),
+        ("gho_", 20),
+        ("ghs_", 20),
+        ("github_pat_", 20),
+    ];
+    let is_tok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let tok_len = |after: &str| -> usize { after.chars().take_while(|c| is_tok(*c)).count() };
+
+    let mut out = String::with_capacity(s.len());
+    let mut changed = false;
+    let mut rest = s;
+    'scan: while !rest.is_empty() {
+        for (pfx, minlen) in PREFIXES {
+            if let Some(after) = rest.strip_prefix(*pfx) {
+                let n = tok_len(after);
+                if n >= *minlen {
+                    out.push_str(pfx);
+                    out.push_str("***");
+                    rest = &after[after.char_indices().nth(n).map_or(after.len(), |(i, _)| i)..];
+                    changed = true;
+                    continue 'scan;
+                }
+            }
+        }
+        if let Some(after) = rest.strip_prefix("Bearer ") {
+            let n = tok_len(after);
+            if n >= 16 {
+                out.push_str("Bearer ***");
+                rest = &after[after.char_indices().nth(n).map_or(after.len(), |(i, _)| i)..];
+                changed = true;
+                continue 'scan;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    changed.then_some(out)
 }
 
 pub fn recent_feedback_bundles(limit: usize) -> Vec<PathBuf> {
@@ -989,5 +1062,35 @@ mod tests {
         // 非 JSON(SSE / 错误页)退回 bytes_payload,正文原样(无结构化 credential)
         let sse = redact_bundle_body(b"data: {\"delta\":\"hi\"}\n\n");
         assert_eq!(sse["encoding"], "utf8");
+    }
+
+    #[test]
+    fn redact_bundle_body_scrubs_echoed_credential_tokens() {
+        // 上游 401 把 key 回显进 error.message(非凭据 key 的字符串值)→ bundle 路径要挡(codex P1)
+        let body = br#"{"error":{"message":"Incorrect API key provided: sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 here"}}"#;
+        let v = redact_bundle_body(body);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(
+            !s.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "echo 的 key 泄漏: {s}"
+        );
+        assert!(s.contains("sk-***"), "应保留前缀 + 脱敏: {s}");
+
+        // 普通正文不误伤:`task-list`/`ask-me` 含 `sk-` 子串但前缀后 token 长度不足
+        let benign =
+            redact_bundle_body(br#"{"messages":[{"content":"create a task-list and ask-me"}]}"#);
+        let bs = serde_json::to_string(&benign).unwrap();
+        assert!(bs.contains("task-list"), "普通正文被误伤: {bs}");
+        assert!(bs.contains("ask-me"));
+
+        // Bearer 不透明 token 也挡
+        let bearer =
+            redact_bundle_body(br#"{"detail":"auth failed Bearer abcdef0123456789ghijkl now"}"#);
+        let brs = serde_json::to_string(&bearer).unwrap();
+        assert!(
+            !brs.contains("abcdef0123456789ghijkl"),
+            "Bearer token 泄漏: {brs}"
+        );
+        assert!(brs.contains("Bearer ***"));
     }
 }
