@@ -136,9 +136,18 @@ pub fn rescrub_persisted_bundle(bytes: &[u8]) -> Vec<u8> {
         let Some(body) = v.get_mut(section).and_then(|s| s.get_mut("body")) else {
             continue;
         };
-        // 把 body.content 当「原始 body」再脱一遍。旧:content 是原始文本 string;
-        // 新:content 是已脱敏 object,序列化后重跑(幂等)。
+        // 把 body.content 还原成「原始 body bytes」再脱一遍。旧:content 是原始文本 string
+        // (encoding utf8)或 **base64**(原始 body 有非法 UTF-8 时);新:content 是已脱敏
+        // object(encoding json),序列化后重跑(幂等)。
+        let encoding = body.get("encoding").and_then(Value::as_str);
         let raw: Option<Vec<u8>> = match body.get("content") {
+            // 旧 base64 body:必须**先解码**回原始 bytes 再脱敏,否则扫的是 base64 文本、
+            // 解码后里面的 sk-/Bearer 漏脱(codex P2)。解码失败退回当文本扫。
+            Some(Value::String(s)) if encoding == Some("base64") => Some(
+                STANDARD
+                    .decode(s)
+                    .unwrap_or_else(|_| s.clone().into_bytes()),
+            ),
             Some(Value::String(s)) => Some(s.clone().into_bytes()),
             Some(other) if !other.is_null() => serde_json::to_vec(other).ok(),
             _ => None,
@@ -1223,5 +1232,21 @@ mod tests {
         assert!(s.contains("unauthorized"), "非凭据内容保留");
         // 非 bundle / 解析失败 → 原样返回,不阻断上传
         assert_eq!(rescrub_persisted_bundle(b"not json"), b"not json");
+
+        // 旧 base64 body(原始含非法 UTF-8 被整体 base64):rescrub 要**先解码**再脱(codex P2)
+        let secret = "{\"error\":\"bad key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 x\"}";
+        let b64 = STANDARD.encode(secret);
+        let legacy_b64 = json!({
+            "kind": "upstream_error_bundle",
+            "request": { "body": {"encoding":"json","bytes":2,"truncated_bytes":0,"content":{}} },
+            "response": { "body": {"encoding":"base64","bytes": secret.len(),"truncated_bytes":0,"content": b64} }
+        });
+        let out2 = rescrub_persisted_bundle(&serde_json::to_vec(&legacy_b64).unwrap());
+        let s2 = String::from_utf8_lossy(&out2);
+        assert!(
+            !s2.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "base64 旧 bundle key 泄漏: {s2}"
+        );
+        assert!(!s2.contains(&b64), "原始可解码 base64 payload 仍在: {s2}");
     }
 }
