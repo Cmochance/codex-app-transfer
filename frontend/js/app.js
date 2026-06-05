@@ -1550,9 +1550,13 @@
       const activeReal = resp.active_is_chatgpt === true;
       const justLoggedIn = login.state === "succeeded" && !realAccountLoginPinned;
       const firstPersist = activeReal && !st.has_imported;
-      // [MOC-178] flag=false(用户主动关)时禁止 auto-pin 重生镜像 —— 否则关闭后镜像复活、
+      // [MOC-178] flag=false(用户主动关)时禁止**被动** auto-pin 重生镜像 —— 否则关闭后镜像复活、
       // reconcile 又恢复,违反「关闭持久」。flag 跨重启权威,realAccountForgotten 是 session 内双保险。
-      if (activeReal && (justLoggedIn || firstPersist) && !realAccountAutoPersisting && !realAccountForgotten && resp.mode_enabled !== false) {
+      // [codex P2] 但 justLoggedIn(显式 codex login 成功)是用户主动新登录,bypass mode_enabled=false
+      // 抑制(login path 已 reset realAccountForgotten=false)—— 否则 clear/fresh 后显式登录会被挡、
+      // 登录态不 persist、toggle 弹回 off。firstPersist(被动检测到活动 chatgpt)仍尊重 flag=false。
+      const autoPinModeGate = justLoggedIn || resp.mode_enabled !== false;
+      if (activeReal && (justLoggedIn || firstPersist) && !realAccountAutoPersisting && !realAccountForgotten && autoPinModeGate) {
         realAccountAutoPersisting = true;
         if (justLoggedIn) realAccountLoginPinned = true;
         CCApi.realAccount.pinCurrent()
