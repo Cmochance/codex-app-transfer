@@ -189,8 +189,15 @@ fn sanitize_codex_toml(raw: &str) -> String {
             out.push(line.to_owned());
             continue;
         }
-        let key = trimmed.split('=').next().unwrap_or("").trim();
-        // MOC-110:同 redacted_json,复用 proxy `is_credential_key`(它内部归一化大小写/`_`/`-`)。
+        // 去掉 TOML 引号 key 的包裹引号(`"api_key" = …` / `'authorization' = …`),否则
+        // is_credential_key 的 `ends_with` 会因尾部引号失配而漏脱敏(codex P2)。
+        let key = trimmed
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'');
+        // MOC-110:复用 proxy `is_credential_key`(内部归一化大小写/`_`/`-`),与 redacted_json 同判定。
         if is_credential_key(key) {
             let prefix_len = line.find('=').unwrap_or(line.len());
             let prefix = &line[..prefix_len + 1];
@@ -790,9 +797,10 @@ mod tests {
 
     #[test]
     fn sanitize_codex_toml_covers_moc110_keys() {
-        let toml = "model = \"gpt-5\"\nprivate_key = \"PK-LEAK\"\ncf_clearance = \"CF-LEAK\"\napi_key = \"sk-LEAK\"\nmax_output_tokens = 8192\n";
+        // 含裸 key + 引号 key("..." / '...')(codex P2:引号 key 不能漏脱敏)
+        let toml = "model = \"gpt-5\"\nprivate_key = \"PK-LEAK\"\ncf_clearance = \"CF-LEAK\"\napi_key = \"sk-LEAK\"\n\"api_key\" = \"QK-LEAK\"\n'authorization' = \"QA-LEAK\"\nmax_output_tokens = 8192\n";
         let out = sanitize_codex_toml(toml);
-        for leak in ["PK-LEAK", "CF-LEAK", "sk-LEAK"] {
+        for leak in ["PK-LEAK", "CF-LEAK", "sk-LEAK", "QK-LEAK", "QA-LEAK"] {
             assert!(!out.contains(leak), "{leak} 泄漏: {out}");
         }
         assert!(out.contains("model = \"gpt-5\""), "非凭据行保留");
