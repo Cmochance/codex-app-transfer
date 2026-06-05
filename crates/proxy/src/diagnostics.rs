@@ -110,7 +110,22 @@ fn redact_bundle_body(bytes: &[u8]) -> Value {
         }
         return bytes_payload_with_len(&serialized, serialized.len(), MAX_STORED_BODY_BYTES);
     }
-    bytes_payload(bytes, MAX_STORED_BODY_BYTES)
+    // 非 JSON 退回(HTML 401 页 / 纯文本错误等):对 utf8 正文也扫一遍 echo token,否则非 JSON
+    // 上游回包里回显的 key 经此 fallback 原样落盘随 feedback 上传(codex P1 二轮)。base64(二进制)
+    // 无可读 token,不扫。
+    let mut payload = bytes_payload(bytes, MAX_STORED_BODY_BYTES);
+    if let Some(obj) = payload.as_object_mut() {
+        if obj.get("encoding").and_then(Value::as_str) == Some("utf8") {
+            if let Some(red) = obj
+                .get("content")
+                .and_then(Value::as_str)
+                .and_then(redact_credential_tokens)
+            {
+                obj.insert("content".into(), Value::String(red));
+            }
+        }
+    }
+    payload
 }
 
 /// 递归对 JSON 里**所有 string 值**跑 [`redact_credential_tokens`],就地脱敏 echo 进文本的凭据。
@@ -1092,5 +1107,17 @@ mod tests {
             "Bearer token 泄漏: {brs}"
         );
         assert!(brs.contains("Bearer ***"));
+
+        // 非 JSON 上游回包(HTML 401 页 / 纯文本)里回显的 key 走 bytes_payload fallback 也要挡
+        let html = redact_bundle_body(
+            b"<html>401 Unauthorized: key sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 invalid</html>",
+        );
+        assert_eq!(html["encoding"], "utf8", "非 JSON 应走 bytes fallback");
+        let hs = serde_json::to_string(&html).unwrap();
+        assert!(
+            !hs.contains("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"),
+            "非 JSON fallback key 泄漏: {hs}"
+        );
+        assert!(hs.contains("sk-***"));
     }
 }
