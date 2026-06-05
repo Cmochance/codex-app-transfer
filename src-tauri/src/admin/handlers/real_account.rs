@@ -187,6 +187,13 @@ pub async fn enable_handler(
         .unwrap_or(false);
     if !sync_ok || !codex_real_account::active_is_real_chatgpt_now() {
         let _ = super::settings::set_real_account_mode_enabled(false);
+        // [MOC-178 codex P2] activate_real_account 已把活动写成 chatgpt;enable 失败必须把活动也
+        // 切回 apikey,否则「flag=false + UI off 但活动仍 chatgpt、Codex 还显示 plugins」状态不一致
+        // (要等下次启动 ForceDisable 才纠)。clearing 走 force_apikey,即便 proxy 起不来也切 auth
+        // (保留 tokens、不删镜像),把活动恢复成 enable 前的 apikey 态。
+        let _ =
+            crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&state)
+                .await;
         return err(
             StatusCode::BAD_REQUEST,
             "开启真实账号模式失败:当前 provider 不支持 relay(如 direct 模式),或系统代理未能启动。请检查 provider / 系统代理后重试".to_owned(),
