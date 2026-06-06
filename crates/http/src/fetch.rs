@@ -1002,6 +1002,25 @@ fn location_is_global(lower: &str, loc_start: usize) -> bool {
     }
 }
 
+/// `pos` 是否落在 JS 注释内 —— 行注释 `//`(同行 pos 前出现)或块注释 `/* … */`(最近的 `/*`
+/// 之后到 pos 未闭合)。简化: 不排除字符串字面量里的 `//`(占位页场景足够; 误判方向是"不跟随",
+/// 保守安全, chatgpt review)。入参已小写。
+fn in_js_comment(s: &str, pos: usize) -> bool {
+    let before = &s[..pos];
+    // 行注释: 同行(最后一个换行之后)在 pos 前出现 `//`。
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    if before[line_start..].contains("//") {
+        return true;
+    }
+    // 块注释: 最近的 `/*` 之后(到 pos)没有 `*/`。
+    if let Some(open) = before.rfind("/*") {
+        if !before[open..].contains("*/") {
+            return true;
+        }
+    }
+    false
+}
+
 /// 解析 JS 跳转: `location.replace('T')` / `location.assign('T')` / `location[.href] = 'T'`
 /// (`window.`/`document.` 前缀 + **等号周围空格**容忍, 排除 `==` 比较)。URL 须 `http` / `/` 开头。
 /// 遍历每个 `location` token(经 `location_is_global` 限浏览器全局, 排除对象属性 + 子串误命中)。
@@ -1015,6 +1034,11 @@ fn parse_js_location(html: &str) -> Option<String> {
         // 等前缀。排除 `allocation`/`geolocation` 子串 + `config.location`/`router.location` 等对象
         // 属性(chatgpt review)。
         if !location_is_global(&lower, start) {
+            continue;
+        }
+        // 注释里的 location 不是可执行跳转(`// location=...` 行注释 / `/* ... */` 块注释,
+        // chatgpt review)。
+        if in_js_comment(&lower, start) {
             continue;
         }
         let after = &html[from..];
@@ -1187,6 +1211,21 @@ mod tests {
             parse_js_location("<script>window.location.replace('https://e.com/g')</script>")
                 .as_deref(),
             Some("https://e.com/g")
+        );
+        // 注释里的 location 不当跳转(chatgpt review 第 5 轮)
+        assert_eq!(
+            parse_js_location("<script>// location = '/next'</script>"),
+            None
+        );
+        assert_eq!(
+            parse_js_location("<script>/* location.replace('/x') */</script>"),
+            None
+        );
+        // 块注释**闭合后**的真 location 仍跟随
+        assert_eq!(
+            parse_js_location("<script>/* old */ location.replace('https://e.com/h')</script>")
+                .as_deref(),
+            Some("https://e.com/h")
         );
     }
 
