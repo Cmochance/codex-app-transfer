@@ -562,19 +562,9 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
             // headless 是终极兜底 (跑 JS), 无"升级信号"可言 —— 成功即返回, 失败即整体失败。
             match crate::headless::fetch_rendered_html(url).await {
                 Ok(body) => {
-                    // headless 渲染 + wait-for-clear(MOC-156 ②)后**仍是挑战页** → 交互式
-                    // Turnstile/DataDome 过不了。不能当正文返回(否则模型把 "Just a moment" CF
-                    // 脚本当内容、幻觉)。对称 curl/wreq 档: 走 last_usable 非破坏性回退(还回升级链
-                    // 里 curl/wreq 已拿的非挑战 body)或 Auto error(silent-failure review)。
-                    if is_challenge_body(&body) {
-                        if let Some(f) = last_usable.take() {
-                            return Ok(f);
-                        }
-                        return Err(WebFetchError::Auto(format!(
-                            "升级历程 [{}] 后 headless 仍是 CF/反爬挑战页(交互式挑战过不了)",
-                            trail.join("; ")
-                        )));
-                    }
+                    // headless 渲染后仍是挑战页的"判失败"已下沉到 headless 层(MOC-156 review P2:
+                    // 覆盖直选 Headless 档 + 所有 public caller, 不只 Auto)。故此处 Ok(body) 必是
+                    // 非挑战的真内容; 挑战页会从下面 Err 分支走 last_usable 非破坏回退。
                     remember_origin(&origin, tier);
                     return Ok(Fetched {
                         body,

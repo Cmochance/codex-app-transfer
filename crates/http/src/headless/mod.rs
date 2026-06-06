@@ -463,12 +463,25 @@ impl HeadlessBrowser {
             };
             match tokio::time::timeout(self.config.challenge_wait_timeout, poll).await {
                 Ok(Some(cleared)) => html = cleared,
-                // 超时仍未清 / 轮询读失败: 留之前的 html (best-effort —— 上层 is_challenge_body
-                // 兜底仍会判挑战, 但 Auto 链已无更高档, 至少不卡死)。
+                // 超时仍未清 / 轮询读失败 → 落到下面 surface error。
                 _ => eprintln!(
-                    "[headless] 挑战页 {}s 内未清除, 回退读当前 DOM: {url}",
+                    "[headless] 挑战页 {}s 内未清除: {url}",
                     self.config.challenge_wait_timeout.as_secs()
                 ),
+            }
+            // wait-for-clear 后**仍是挑战页**(交互式 Turnstile/DataDome 过不了) → headless 层
+            // **自己 surface error**, 不把挑战页当正文返回。chatgpt-codex review P2: 直选
+            // `WebFetchBackend::Headless` 档(`fetch.rs` web_fetch)/ 任何 public
+            // `fetch_rendered_html` caller 都没有 Auto 路径的 `last_usable` 兜底, 靠上层查
+            // challenge 会漏(只 web_fetch_auto 查了)。在 headless 层判失败覆盖**所有** caller;
+            // Auto 路径收到 Err 自动走其 `last_usable` 非破坏回退。no_wait(challenge_wait_timeout
+            // =0)不进本块, search 仍拿到 anomaly 页 html 自判 Blocked。
+            if crate::fetch::is_challenge_body(&html) {
+                let _ = page.close().await;
+                return Err(HeadlessError::Fetch(format!(
+                    "CF/反爬挑战页 {}s 内未清除(交互式挑战 headless+stealth 过不了)",
+                    self.config.challenge_wait_timeout.as_secs()
+                )));
             }
         }
 
