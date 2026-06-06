@@ -149,6 +149,8 @@ Codex APP 按 OpenAI 模型名提示;第三方 provider 用 `deepseek-v4-pro` / 
 
 供应商配置页的「在 Codex 中显示的模型」直接列出你想在 Codex 模型选择器看到的真实模型(最多 5 个):**第一个是默认模型、新对话直接用它**,后端自动把它们映射到 Codex 槽位(`gpt-5.5` / `gpt-5.4` / …),无需手动指定槽位。Codex APP 模型选择器里看到的就是你列的真实模型名,数量与你的配置一致(不再有"默认占满"导致的占位重复模型,MOC-154)。上游 `chatcmpl-...` 应答 ID 自动重写为 Codex APP 校验通过的 `resp_<base64>`,保留 deployment affinity 编码,`previous_response_id` 跨轮一致。
 
+**auto-review 审查模型(MOC-173)**:Codex 的 auto-review(逐个工具调用做风险审批的 guardian subagent)默认复用主对话模型、较慢。供应商配置页「模型映射」下方的「auto-review 审查模型」可单独指定它走哪个模型 —— **只能从你已配置的模型槽位里选**(下拉只列映射非空的槽位,避免重复配置 / 降级),transfer 据此给 Codex model catalog 写 `auto_review_model_override`,让审查脱钩主模型、复用所选槽位的现有映射(通常选快 / 便宜模型加速审批);留空 = 跟随主模型。Codex 0.137 抓包实证:设置后审查请求的 `model` 字段即切到所选槽位、与主对话分流(不改主对话模型)。
+
 ## 本地开发(v2 / Rust)
 
 ```bash
@@ -301,7 +303,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 ## 技术栈
 
-- **后端 / 转发**:Rust 1.85+ · axum 0.8 · reqwest 0.12(rustls-tls)· tokio · `wreq` 6.0-rc(浏览器 TLS 指纹伪装,给 Cloudflare 强保的 `openai.com` / `chatgpt.com` 用,详见 `crates/http/`)· `chromiumoxide` 0.9(headless Chromium,抓 ①reqwest / ②wreq 都拿不到的 JS 渲染 SPA —— 探测系统 Chrome,否则按需下载 chrome-headless-shell 到 app data,不打包进安装包;目前为 PoC,接入分层 router 待后续 PR,见 `crates/http/src/headless/`)· `crates/http::web_fetch`(统一抓取层,按设置页档位路由 curl/wreq/headless;配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure`;`webFetchBackend != off` 时自动往 `~/.codex/config.toml` 注册 `[mcp_servers.CAT-WEB-MCP]`(stdio MCP server,transfer 自身 + `--mcp-serve-webfetch`),让 Codex 模型可调 `web_fetch` / `web_search` 工具)
+- **后端 / 转发**:Rust 1.85+ · axum 0.8 · reqwest 0.12(rustls-tls)· tokio · `wreq` 6.0-rc(浏览器 TLS 指纹伪装,给 Cloudflare 强保的 `openai.com` / `chatgpt.com` 用,详见 `crates/http/`)· `chromiumoxide` 0.9(headless Chromium,抓 ①reqwest / ②wreq 都拿不到的 JS 渲染 SPA —— 探测系统 Chrome,否则按需下载 chrome-headless-shell 到 app data,不打包进安装包;目前为 PoC,接入分层 router 待后续 PR,见 `crates/http/src/headless/`)· `crates/http::web_fetch`(统一抓取层,按设置页档位路由 curl/wreq/headless;配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure`;`webFetchBackend != off` 时自动往 `~/.codex/config.toml` 注册 `[mcp_servers.cat-webfetch]`(stdio MCP server,transfer 自身 + `--mcp-serve-webfetch`),让 Codex 模型可调 `web_fetch` / `web_search` 工具)
 - **协议适配**:`crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web 互转(请求 body + 流式响应状态机 + reasoning_content + tool_calls)
 - **前端**:HTML + CSS + 原生 JavaScript + Bootstrap 5.3.3(本地化,无 CDN 依赖)
 - **桌面壳**:Tauri 2 + tray-icon 0.23,通过 `cas://` URI scheme 把 frontend/ 与 axum 同进程串起来,无 TCP loopback

@@ -859,6 +859,7 @@
       </div>
     `;
     refreshSummaryModelDatalist();
+    refreshReviewModelSlotOptions();
   }
 
   // web_fetch 摘要模型 (MOC-152): datalist 候选 = 当前映射里配置的模型值(去重去空)。
@@ -878,6 +879,33 @@
   function setSummaryModelField(value) {
     const el = $("#providerSummaryModel");
     if (el) el.value = value || "";
+  }
+
+  // [MOC-173] auto-review 审查模型下拉:选项 = 当前映射非空的 gpt_5_X 槽(有独立 catalog
+  // entry + openai_id),value = 槽位 key,text = 上游模型名。default 槽不列(列表式 catalog
+  // 无独立 entry,override 会降级);空选项 = 跟随主模型。刷新时保留仍有效的已选值。
+  // 与后端 MODEL_SLOTS(crates/registry/src/model_alias.rs)的非 default 槽 key 一致 —— 后端
+  // catalog 生成按此校验,此处是并行硬编码列表;新增 slot 时记得同步(后端为 source of truth)。
+  const REVIEW_MODEL_SLOT_KEYS = ["gpt_5_5", "gpt_5_4", "gpt_5_4_mini", "gpt_5_3_codex", "gpt_5_2"];
+  function refreshReviewModelSlotOptions() {
+    const sel = $("#providerReviewModelSlot");
+    if (!sel) return;
+    const prev = sel.value;
+    const opts = [`<option value="">${escapeHtml(t("providersAdd.reviewModelFollow"))}</option>`];
+    for (const key of REVIEW_MODEL_SLOT_KEYS) {
+      const model = String((providerFormMappings || {})[key] || "").trim();
+      if (!model) continue;
+      opts.push(`<option value="${escapeHtml(key)}">${escapeHtml(model)}</option>`);
+    }
+    sel.innerHTML = opts.join("");
+    sel.value = Array.from(sel.options).some((o) => o.value === prev) ? prev : "";
+  }
+
+  function setReviewModelSlotField(value) {
+    const sel = $("#providerReviewModelSlot");
+    if (!sel) return;
+    const v = value || "";
+    sel.value = Array.from(sel.options).some((o) => o.value === v) ? v : "";
   }
 
   function setProviderMappings(mappings = {}, options = {}) {
@@ -932,6 +960,10 @@
 
   function updateProviderModelInput(slotKey, value) {
     providerFormMappings[slotKey] = value.trim();
+    // [MOC-173] inline 改 mapping 值后同步审查模型下拉:所选槽位被清空时下拉自动重置为
+    // 「跟随主模型」,否则 <select> 会停在已失效的 slot、save 出与界面不符的 dangling 值
+    // (后端 catalog 仍安全收敛 None,但持久化的 reviewModelSlot 会误导、且重填该槽时静默复活)。
+    refreshReviewModelSlotOptions();
   }
 
   function addProviderMappingRow() {
@@ -947,6 +979,12 @@
     // [MOC-154] 列表式:行0(默认)不可删;删行后把剩余模型值按序重排回 gpt_5_5/...
     if (index <= 0 || index >= providerFormRows.length) return;
     const slotKeys = providerFormDefaultRows.filter((k) => k !== "default");
+    // [MOC-173] repack 会让 slot key 语义移位(后续槽位上移),审查 <select> 若按 slot key
+    // 保留会静默指向另一个 model。先记下审查当前指向的 model 值,repack 后按该值重定位到它
+    // 的新槽位(原 model 行被删 → 找不到 → 清回「跟随主模型」)。
+    const reviewSel = $("#providerReviewModelSlot");
+    const reviewModelVal =
+      reviewSel && reviewSel.value ? providerFormMappings[reviewSel.value] || "" : "";
     const vals = providerFormRows.map((k) => providerFormMappings[k] || "");
     vals.splice(index, 1);
     providerFormMappings = {};
@@ -956,6 +994,12 @@
     });
     openProviderModelMenuKey = null;
     renderProviderMappings();
+    if (reviewModelVal) {
+      const newSlot = providerFormRows.find(
+        (k) => (providerFormMappings[k] || "") === reviewModelVal,
+      );
+      setReviewModelSlotField(newSlot || "");
+    }
   }
 
   function toggleProviderModelMenu(rowKey) {
@@ -1093,6 +1137,8 @@
     // web_fetch 网页摘要模型 (MOC-152):始终带上(含空串)——空串让后端 update 清除旧值、
     // 回退 Default 映射模型;不带则清空操作丢失(见 api.js providerBody 注释)。
     payload.summaryModel = $("#providerSummaryModel")?.value.trim() ?? "";
+    // [MOC-173] auto-review 审查模型槽位:始终带上(含空串)——空串让后端清除、回退复用主模型。
+    payload.reviewModelSlot = $("#providerReviewModelSlot")?.value ?? "";
     return payload;
   }
 
@@ -2214,6 +2260,7 @@
     setWebSearchRow(false, false, null);
     setProviderMappings(emptyMappings());
     setSummaryModelField(""); // 新建/重置 → 清空摘要模型
+    setReviewModelSlotField(""); // 新建/重置 → 审查模型回到「跟随主模型」
   }
 
   function applyPresetToForm(preset, notify = true) {
@@ -2257,6 +2304,7 @@
     providerAvailableModels = [];
     setProviderMappings(preset.models || emptyMappings());
     setSummaryModelField(""); // preset 不带摘要模型 → 清空
+    setReviewModelSlotField(""); // preset 不带审查模型 → 回到「跟随主模型」
     renderPresetOptions(preset, preset.models || emptyMappings());
     updatePresetSelection();
     if (notify) showToast(`${preset.name} ${t("toast.presetFilled")}`);
@@ -2318,6 +2366,7 @@
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
     setSummaryModelField(provider.summaryModel || ""); // 回填已配置的摘要模型
+    setReviewModelSlotField(provider.reviewModelSlot || ""); // 回填已配置的审查模型槽位
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
     updatePresetSelection();
     // [MOC-69] antigravity 自动拉模型列表,让映射选框立即显示 displayName(不必手点「获取模型」);
