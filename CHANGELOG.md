@@ -4,7 +4,7 @@
 
 ## v2.2.x — 进行中
 
-**web_fetch 大页摘要 map-reduce 全覆盖 + 模型批大小白名单 (MOC-157)**:大页摘要新增 **map-reduce 全覆盖路径** —— 当 prompt 为"总结整篇 / 全文概览"类诉求,或调用方未带 prompt 时,全文拆成多批、每批独立摘要、再 reduce 合并为最终摘要,确保不遗漏任何段落(原 top-K 选块模式在"找特定信息"诉求下仍保留)。配套新增**批大小白名单**:单批字符上限按模型名自适应(minimax / kimi 120k、glm / qwen 100k、deepseek 50k、未知 60k),替代原写死 60k —— 大上下文模型不再被压缩到 60k、小上下文模型不会被撑爆。意图路由在 `summarize` 入口统一决策,三档(top-K / stuff / map-reduce)无感切换。Refs MOC-157。
+**web_fetch 大页摘要迭代 (MOC-157)**:在 MOC-156 map-reduce 基础上新增四项改进。① **超时兜底**:map-reduce 某批摘要超时(>90s)→ 丢弃该批、对剩余批继续 reduce、在最终摘要里如实注明"第 X 段超时跳过,可能不完整";全部批均超时才回退原文;非超时硬错误继续整体回退(绝不丢内容)。② **错误文案修正**:区分 reqwest 连接超时("摘要超时")与连接失败(完整 source chain),不再被 reqwest "error sending request" 外层文案误导。③ **关 thinking 提速**:摘要调用复用 registry `compact_disable_thinking_wire` 关掉 reasoning 模型的 CoT(`<think>` 段),大幅提速;支持厂商:MiniMax M3 / Kimi / GLM / MiMo / DeepSeek / Qwen(MiniMax M2.x 不支持,见下)。④ **批大小白名单扩展到 8 厂商**:按 DeepSeek / Kimi / MiMo / GLM / Qwen / MiniMax / Grok / Gemini 系模型名映射真实单批字符上限(替代原四档近似值)。配套:**MiniMax 摘要模型默认推荐 M3**,Settings 页加 warning:若仍用 M2.x,关 thinking 无效、摘要耗时会显著增加。Refs MOC-157。
 
 ## v2.2.1 — 2026-06-04
 

@@ -599,20 +599,94 @@ struct SummarizeOutcome {
     mode: &'static str,
 }
 
-/// 摘要子模型单批喂入字符上限白名单(MOC-157)——按 model 名(slug / 标识)子串匹配该模型上下文窗
-/// 的适宜单批量。**加新模型只改这张表**;未命中回退 [`SUMMARY_INPUT_CHARS`]。值取保守(字符 ≈
-/// token × 1.5~4 因语言而异, 故按字符近似而非精确 token; 留输出 + instruction 余量)。
+/// 摘要子模型单批喂入字符上限白名单(MOC-157)——按 model 名子串匹配该模型上下文窗的适宜单批量。
+/// 窗口值取自**全厂商官方规格调研**(MOC-157: DeepSeek / Kimi / MiMo / GLM / Qwen / MiniMax /
+/// Grok / Gemini + OpenAI / Claude 逐模型);字符 ≈ token × 2~3(中英混), 取窗口保守比例(留输出 +
+/// instruction + 注意力余量, **单批不填满整窗防 lost-in-middle**)。**加新模型只改这张表**;未命中
+/// 回退 [`SUMMARY_INPUT_CHARS`]。`cfg.model` 形如 `<slug>/<model>`, 取末段纯 ID 匹配。
 fn batch_chars_for_model(model: &str) -> usize {
-    let m = model.to_ascii_lowercase();
-    if m.contains("minimax") || m.contains("kimi") || m.contains("moonshot") {
-        120_000 // ~128k-200k token 窗
-    } else if m.contains("glm") || m.contains("qwen") {
-        100_000 // ~128k token 窗
-    } else if m.contains("deepseek") {
-        50_000 // ~64k token 窗, 保守
-    } else {
-        SUMMARY_INPUT_CHARS // 未知保守默认
+    let full = model.to_ascii_lowercase();
+    let m = full.rsplit('/').next().unwrap_or(&full);
+
+    // ── 先判带后缀 / 易混型号(避免被下方宽泛 family 误吞)──
+    // OpenAI gpt-5.4-mini(400k)≠ gpt-5.4(1M); gpt-5.2 / 5.3-codex 同 400k 档
+    if m.contains("gpt-5.4-mini") || m.contains("gpt-5.2") || m.contains("gpt-5.3") {
+        return 130_000;
     }
+    // GLM VLM: 4.5v(64k) / 4.6v(128k) ≠ 同代文本(200k / 128k)
+    if m.contains("glm-4.5v") {
+        return 40_000; // 64k 窗
+    }
+    if m.contains("glm-4.6v") {
+        return 60_000; // 128k 窗
+    }
+    // MiniMax M2-her(64k) ≠ M2.x(204.8k)
+    if m.contains("m2-her") {
+        return 40_000;
+    }
+    // Qwen 裸 qwen-max alias(旧 qwen2.5 快照, 32k)≠ qwen3-max(256k)
+    if m == "qwen-max" || m.starts_with("qwen-max-") {
+        return 20_000; // 32k 窗
+    }
+    // MiMo 语音模型(asr / tts, 8k)不作文本摘要 → 回退默认
+    if m.contains("mimo-v2") && (m.contains("-asr") || m.contains("-tts")) {
+        return SUMMARY_INPUT_CHARS;
+    }
+
+    // ── 1M+ token 窗 → 200k 字符 ──
+    if m.contains("deepseek-v4")
+        || m.contains("deepseek-chat")
+        || m.contains("deepseek-reasoner") // legacy → V4(1M)
+        || m.contains("mimo-v2.5")         // mimo-v2.5 / -pro
+        || m.contains("mimo-v2-pro")       // legacy 1M
+        || m.contains("gemini")            // Gemini 全系(2.5/3/3.1/3.5 + agent/low 变体)1M
+        || m.contains("gpt-5.4")           // gpt-5.4(1.05M); -mini 已上面判
+        || m.contains("gpt-5.5")           // 1.05M
+        || m.contains("claude-opus-4")     // 1M
+        || m.contains("minimax-m3")        // 1M(标准计费档 512k)
+        || m.contains("grok-4.3")
+        || m.contains("grok-4.20")         // 1M
+        || m.contains("glm-4-long")        // 1M
+        || m.contains("qwen3.7")
+        || m.contains("qwen3.6-plus")
+        || m.contains("qwen3.6-flash")
+        || m.contains("qwen3.5")
+        || m.contains("qwen-plus")
+        || m.contains("qwen-flash")
+        || m.contains("qwen3-coder")
+    // Qwen 1M 系
+    {
+        return 200_000;
+    }
+    // ── 256k token 窗 → 100k 字符 ──
+    if m.contains("kimi")                   // Kimi 全系(k2.6/k2.5/thinking/for-coding…)
+        || m.contains("mimo-v2-omni")
+        || m.contains("mimo-v2-flash")
+        || m.contains("qwen3-max")
+        || m.contains("qwen3.6-max")
+        || m.contains("qwen3-next")
+        || m.contains("grok-build")
+    // grok-build-0.1
+    {
+        return 100_000;
+    }
+    // ── 200k token 窗 → 80k 字符 ──
+    if m.contains("minimax-m2")             // M2.x = 204.8k
+        || m.contains("glm-5")              // glm-5 / 5.1 / 5-turbo / 5v-turbo
+        || m.contains("glm-4.7")
+        || m.contains("glm-4.6")
+    // 文本 200k(VLM 4.6v 已上面判)
+    {
+        return 80_000;
+    }
+    // ── 128k token 窗 → 60k 字符 ──
+    if m.contains("glm-4.5")                // glm-4.5 / -air / -x / -airx / -flash
+        || m.contains("glm-4-flash")
+        || m.contains("qwen-turbo")
+    {
+        return 60_000;
+    }
+    SUMMARY_INPUT_CHARS // 未知 / 未查到 / 语音 → 保守默认 60k
 }
 
 /// prompt 是否"全覆盖摘要"诉求(总结整篇)—— 决定走 map-reduce(全覆盖)还是 top-K(找特定信息)。
@@ -664,51 +738,100 @@ fn build_summary_instruction(prompt: &str, capped: &str, trunc_hint: &str) -> St
 
 /// 单次调摘要子模型: 发 `instruction` → 返回 (strip_think 后回复, latency_ms)。map / reduce /
 /// top-K 共用(MOC-157 抽出)。HTTP 错 / 非 JSON / 空回复 → Err(上层回退原文, 绝不丢内容)。
-async fn summarize_call(instruction: &str, cfg: &SummaryConfig) -> Result<(String, u128), String> {
+/// `summarize_call` 的失败原因(MOC-157): 区分**超时**(map-reduce 可丢弃该批、对剩余 reduce)与
+/// 其它硬错误(连接 / HTTP / JSON / 空 —— 整体回退原文)。
+struct CallError {
+    /// reqwest 请求超时(单批 > [`SUMMARY_TIMEOUT`])。reqwest 把超时的 Display 写成
+    /// "error sending request for url" 极易误判成连接失败(本项目踩过), 故显式标记 + 文案点明超时。
+    timeout: bool,
+    msg: String,
+}
+
+async fn summarize_call(
+    instruction: &str,
+    cfg: &SummaryConfig,
+) -> Result<(String, u128), CallError> {
     let client = reqwest::Client::builder()
         .timeout(SUMMARY_TIMEOUT)
         .build()
-        .map_err(|e| format!("建 HTTP client 失败: {e}"))?;
+        .map_err(|e| CallError {
+            timeout: false,
+            msg: format!("建 HTTP client 失败: {e}"),
+        })?;
     let endpoint = format!("http://127.0.0.1:{}/v1/chat/completions", cfg.proxy_port);
-    let body = json!({
+    let mut body = json!({
         "model": cfg.model.clone(),
         "messages": [{ "role": "user", "content": instruction }],
         "stream": false,
     });
+    // 摘要不需要 reasoning CoT —— 复用 registry 白名单按 model 关 thinking(MOC-157: mimo 等
+    // reasoning 模型的 <think> 是摘要延迟大头, 关掉省时间/token)。cfg.model 形如 <slug>/<model>,
+    // 取末段纯 model ID 匹配白名单; M2.x 等不支持 disable 的模型不在表 → 不注入(no-op)。
+    let model_id = cfg.model.rsplit('/').next().unwrap_or(&cfg.model);
+    if let Some(wire) = codex_app_transfer_registry::compact_disable_thinking_wire(model_id) {
+        wire.inject(&mut body);
+    }
     let mut req = client.post(&endpoint).json(&body);
     if let Some(k) = &cfg.gateway_key {
         req = req.bearer_auth(k);
     }
     let t0 = Instant::now();
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("调本地 proxy 摘要失败(proxy 未启动?): {e}"))?;
+    let resp = req.send().await.map_err(|e| {
+        let timeout = e.is_timeout();
+        let msg = if timeout {
+            format!(
+                "摘要超时(单批 > {}s —— 该 model 可能带 thinking 思考太慢, 换支持关 thinking 的 model)",
+                SUMMARY_TIMEOUT.as_secs()
+            )
+        } else {
+            // 打 source chain, 避免外层 Display("error sending request")误导(MOC-157 踩坑)。
+            let mut s = format!("调本地 proxy 摘要失败: {e}");
+            let mut src = std::error::Error::source(&e);
+            while let Some(inner) = src {
+                s.push_str(&format!(" | caused by: {inner}"));
+                src = inner.source();
+            }
+            s
+        };
+        CallError { timeout, msg }
+    })?;
     let status = resp.status();
     // body 读失败给真因, 不吞成空串误报"非 JSON"。
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("读取摘要响应体失败: {e}"))?;
+    let text = resp.text().await.map_err(|e| CallError {
+        timeout: e.is_timeout(),
+        msg: format!("读取摘要响应体失败: {e}"),
+    })?;
     let latency_ms = t0.elapsed().as_millis();
     if !status.is_success() {
-        return Err(format!(
-            "摘要模型 HTTP {status}: {}",
-            text.chars().take(200).collect::<String>()
-        ));
+        return Err(CallError {
+            timeout: false,
+            msg: format!(
+                "摘要模型 HTTP {status}: {}",
+                text.chars().take(200).collect::<String>()
+            ),
+        });
     }
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("摘要响应非 JSON: {e}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| CallError {
+        timeout: false,
+        msg: format!("摘要响应非 JSON: {e}"),
+    })?;
     let raw = v
         .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|t| t.as_str())
-        .ok_or_else(|| "摘要响应缺 choices[0].message.content".to_string())?;
+        .ok_or_else(|| CallError {
+            timeout: false,
+            msg: "摘要响应缺 choices[0].message.content".to_string(),
+        })?;
     // 剥 reasoning 模型内联 <think>…</think>(MOC-152), 否则 CoT 当摘要 = 噪声 + 浪费 token。
     let out = strip_think(raw);
     if out.trim().is_empty() {
-        return Err("摘要模型返回空内容".to_string());
+        return Err(CallError {
+            timeout: false,
+            msg: "摘要模型返回空内容".to_string(),
+        });
     }
     Ok((out.to_string(), latency_ms))
 }
@@ -746,12 +869,27 @@ async fn summarize_map_reduce(
     let batches = chunk_markdown(content, batch); // repack: 段落打包填满批
     let n_batches = batches.len();
     let t0 = Instant::now();
-    // map: 每批摘要。
-    let mut summaries: Vec<String> = Vec::with_capacity(n_batches);
-    for (i, b) in batches.iter().enumerate() {
+    // map: 每批摘要**并行**(A, MOC-157)—— N 批互不依赖, 串行会累加每批 mimo 延迟、整体超
+    // Codex tool_timeout(实测 5 批串行 347s)。并行后整体 ≈ max(单批) + reduce。
+    let map_results = futures::future::join_all(batches.iter().enumerate().map(|(i, b)| {
         let inst = build_map_instruction(prompt, b, i + 1, n_batches);
-        let (resp, _) = summarize_call(&inst, cfg).await?;
-        summaries.push(resp);
+        async move { summarize_call(&inst, cfg).await }
+    }))
+    .await;
+    let mut summaries: Vec<String> = Vec::with_capacity(n_batches);
+    let mut timed_out: Vec<usize> = Vec::new(); // 超时被丢弃的批序号(1-based)
+    for (i, r) in map_results.into_iter().enumerate() {
+        match r {
+            Ok((resp, _)) => summaries.push(resp),
+            // 超时批: 丢弃 + 记录(不整体回退), 对剩余批 reduce、summary 里如实汇报(MOC-157 兜底)。
+            Err(e) if e.timeout => timed_out.push(i + 1),
+            // 非超时硬错误(连接 / HTTP / JSON): 整体回退原文(绝不丢内容)。
+            Err(e) => return Err(e.msg),
+        }
+    }
+    if summaries.is_empty() {
+        // 全部分段都超时 → 无可用内容, 上层回退原文(带 error)。
+        return Err(format!("所有 {n_batches} 个分段摘要均超时, 无法生成摘要"));
     }
     // reduce + collapse: 合并各批摘要; 合并仍超 batch 则分组 reduce(collapse)再循环, 否则单次 reduce。
     let mut last_inst = String::new();
@@ -768,7 +906,7 @@ async fn summarize_map_reduce(
         let combined = summaries.join("\n\n---\n\n");
         if combined.chars().count() <= batch {
             last_inst = build_reduce_instruction(prompt, &combined);
-            let (resp, _) = summarize_call(&last_inst, cfg).await?;
+            let (resp, _) = summarize_call(&last_inst, cfg).await.map_err(|e| e.msg)?;
             break resp;
         }
         // collapse: 当前各摘要按 batch 分组, 每组 reduce 一次 → 更短的摘要列表, 再循环。
@@ -777,7 +915,7 @@ async fn summarize_map_reduce(
         for s in summaries.drain(..) {
             if !group.is_empty() && group.chars().count() + s.chars().count() > batch {
                 let inst = build_reduce_instruction(prompt, &group);
-                let (resp, _) = summarize_call(&inst, cfg).await?;
+                let (resp, _) = summarize_call(&inst, cfg).await.map_err(|e| e.msg)?;
                 collapsed.push(resp);
                 group.clear();
             }
@@ -788,28 +926,54 @@ async fn summarize_map_reduce(
         }
         if !group.is_empty() {
             let inst = build_reduce_instruction(prompt, &group);
-            let (resp, _) = summarize_call(&inst, cfg).await?;
+            let (resp, _) = summarize_call(&inst, cfg).await.map_err(|e| e.msg)?;
             collapsed.push(resp);
         }
         summaries = collapsed;
     };
     let latency_ms = t0.elapsed().as_millis();
+    // 兜底如实汇报(MOC-157): 有批超时被丢弃时, summary 明确告知 Codex 哪几段缺失、可能不完整,
+    // 不静默当全覆盖(否则模型把残缺摘要当完整答案 = 破坏性降级)。
+    let timeout_note = if timed_out.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ⚠️ 其中第 {} 段(共 {n_batches} 段)因单段摘要超时(>{}s)被跳过, 本摘要**不含这些段的内容**、可能不完整。",
+            timed_out.iter().map(usize::to_string).collect::<Vec<_>>().join("/"),
+            SUMMARY_TIMEOUT.as_secs()
+        )
+    };
     let summary = format!(
-        "(注:网页正文过长, 本摘要由全文分 {n_batches} 批分段摘要后合并而成、已全覆盖。)\n\n{final_summary}"
+        "(注:网页正文过长, 本摘要由全文分 {n_batches} 批分段摘要后合并而成。{timeout_note})\n\n{final_summary}"
     );
     Ok(SummarizeOutcome {
         summary,
         model: cfg.model.clone(),
-        prompt_sent: if last_inst.is_empty() {
-            format!("[map-reduce: {n_batches} 批 map(单批即出, 无 reduce)]")
-        } else {
-            format!("[map-reduce: {n_batches} 批 map + reduce]\n\n{last_inst}")
+        prompt_sent: {
+            let to = if timed_out.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} 批超时丢弃(第 {})",
+                    timed_out.len(),
+                    timed_out
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join("/")
+                )
+            };
+            if last_inst.is_empty() {
+                format!("[map-reduce: {n_batches} 批 map{to}, 无 reduce]")
+            } else {
+                format!("[map-reduce: {n_batches} 批 map + reduce{to}]\n\n{last_inst}")
+            }
         },
         response: final_summary,
         latency_ms,
         selected: true,
         total_chunks: n_batches,
-        picked: n_batches, // 全覆盖
+        picked: n_batches - timed_out.len(), // 实际纳入(全覆盖减超时丢弃)
         selected_chars: content.chars().count(),
         mode: "map-reduce",
     })
@@ -846,7 +1010,9 @@ async fn summarize(content: &str, prompt: &str) -> Result<SummarizeOutcome, Stri
         String::new()
     };
     let instruction = build_summary_instruction(prompt, &capped, &trunc_hint);
-    let (out, latency_ms) = summarize_call(&instruction, &cfg).await?;
+    let (out, latency_ms) = summarize_call(&instruction, &cfg)
+        .await
+        .map_err(|e| e.msg)?;
     // 做了相关性选块时也给 Codex 带一句, 避免拿"基于部分正文的摘要"当完整答案。
     let summary = if selected {
         format!(
@@ -1291,16 +1457,50 @@ mod tests {
 
     #[test]
     fn batch_chars_whitelist() {
+        // 1M 窗 → 200k
+        assert_eq!(batch_chars_for_model("d70f3fd0/mimo-v2.5-pro"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/mimo-v2.5"), 200_000); // 标准版也 1M
+        assert_eq!(batch_chars_for_model("slug/deepseek-v4-flash"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/claude-opus-4-7"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/gemini-3.5-flash"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/gemini-2.5-flash"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/gemini-3.1-pro-low"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/gpt-5.5"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/gpt-5.4"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/MiniMax-M3"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/grok-4.20"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/glm-4-long"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/qwen3.6-plus"), 200_000);
+        assert_eq!(batch_chars_for_model("slug/qwen-plus"), 200_000);
+        // 400k 窗 → 130k(gpt-5.4-mini 不被下方 gpt-5.4 的 1M 档误吞)
+        assert_eq!(batch_chars_for_model("slug/gpt-5.2"), 130_000);
+        assert_eq!(batch_chars_for_model("slug/gpt-5.3-codex"), 130_000);
+        assert_eq!(batch_chars_for_model("slug/gpt-5.4-mini"), 130_000);
+        // 256k 窗 → 100k
+        assert_eq!(batch_chars_for_model("slug/kimi-k2.6"), 100_000);
+        assert_eq!(batch_chars_for_model("slug/kimi-for-coding"), 100_000);
+        assert_eq!(batch_chars_for_model("slug/qwen3-next-80b"), 100_000);
+        assert_eq!(batch_chars_for_model("slug/qwen3-max"), 100_000); // ≠ 裸 qwen-max
+        assert_eq!(batch_chars_for_model("slug/mimo-v2-flash"), 100_000);
+        assert_eq!(batch_chars_for_model("slug/grok-build-0.1"), 100_000);
+        // 200k 窗 → 80k
+        assert_eq!(batch_chars_for_model("slug/MiniMax-M2.7-highspeed"), 80_000);
+        assert_eq!(batch_chars_for_model("slug/glm-5.1"), 80_000);
+        assert_eq!(batch_chars_for_model("slug/glm-4.7"), 80_000);
+        assert_eq!(batch_chars_for_model("slug/glm-5v-turbo"), 80_000);
+        // 128k 窗 → 60k
+        assert_eq!(batch_chars_for_model("slug/glm-4.5-air"), 60_000);
+        assert_eq!(batch_chars_for_model("slug/glm-4.6v"), 60_000); // VLM 128k
+        assert_eq!(batch_chars_for_model("slug/qwen-turbo"), 60_000);
+        // 64k 窗 → 40k
+        assert_eq!(batch_chars_for_model("slug/glm-4.5v"), 40_000); // VLM 64k
+                                                                    // 32k 窗 → 20k(裸 qwen-max alias 旧 qwen2.5)
+        assert_eq!(batch_chars_for_model("slug/qwen-max"), 20_000);
+        // 语音 / 未知 → 默认
         assert_eq!(
-            batch_chars_for_model("d70f3fd0/MiniMax-M2.7-highspeed"),
-            120_000
+            batch_chars_for_model("slug/mimo-v2.5-tts"),
+            SUMMARY_INPUT_CHARS
         );
-        assert_eq!(batch_chars_for_model("slug/kimi-k2"), 120_000);
-        assert_eq!(batch_chars_for_model("slug/moonshot-v1"), 120_000);
-        assert_eq!(batch_chars_for_model("slug/glm-4-plus"), 100_000);
-        assert_eq!(batch_chars_for_model("slug/qwen-max"), 100_000);
-        assert_eq!(batch_chars_for_model("slug/deepseek-chat"), 50_000);
-        // 未知模型回退默认
         assert_eq!(
             batch_chars_for_model("slug/unknown-xyz"),
             SUMMARY_INPUT_CHARS
