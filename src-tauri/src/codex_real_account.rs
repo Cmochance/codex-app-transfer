@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -90,6 +90,11 @@ impl RealAccountStatus {
 /// 轮询 `status` 都能读到,不受「事件早于 listener 注册」的启动时序影响。
 static RELOGIN_REQUIRED: AtomicBool = AtomicBool::new(false);
 
+/// [MOC-124 H-2] proxy 401 回灌时记下「被服务端撤销的 token」指纹(FNV-1a,0=无)。detect 的
+/// self-heal 据此判:active token 指纹 == 此值 → 还是那个被撤销的旧 token(exp 没过也别清
+/// relogin);≠ → token 换了(app 外 codex login / 重新导入)→ 可清。
+static REVOKED_TOKEN_FP: AtomicU64 = AtomicU64::new(0);
+
 /// 读「需重新登录」标记。
 pub fn relogin_required() -> bool {
     RELOGIN_REQUIRED.load(Ordering::SeqCst)
@@ -98,6 +103,60 @@ pub fn relogin_required() -> bool {
 /// 设「需重新登录」标记(reconcile/检测判定失效时 true;有新鲜账号时 false)。
 fn set_relogin_required(v: bool) {
     RELOGIN_REQUIRED.store(v, Ordering::SeqCst);
+}
+
+/// [MOC-124 H-2] 清 relogin 标记 + 被撤销 token 指纹记录(拿到新账号 / token 真换了时)。
+/// 比裸 `set_relogin_required(false)` 多清 [`REVOKED_TOKEN_FP`],避免旧的撤销指纹残留误判。
+fn clear_relogin_state() {
+    set_relogin_required(false);
+    REVOKED_TOKEN_FP.store(0, Ordering::SeqCst);
+}
+
+/// [MOC-124 H-2] proxy 透传 chatgpt backend 的鉴权结果回灌。proxy crate 不依赖 src-tauri,经
+/// `ProxyState::with_relogin_notify` 注入的回调调到这里。`token_fp` = 该请求 Authorization
+/// Bearer token 的指纹(跟 [`access_token_fingerprint`] 同算法)。
+///
+/// - `unauthorized=true`(上游 401,服务端 token 失效)→ 记下被撤销 token 指纹 + 标记需重登。
+///   跟本地 JWT `exp` 判定独立 —— 服务端撤销 / refresh_token 失效本地 exp 看不到,上游 401 是
+///   唯一信号。`detect()` self-heal 用指纹区分「还是这个旧 token」(保持)vs「换了新 token」(清)。
+/// - `unauthorized=false`(2xx,token 仍有效)→ 若该 token 正是之前被 401 标记撤销的、清掉
+///   (瞬时 401 恢复自愈)。**真撤销持续 401、永不 2xx → 不会走到这,relogin 保持**;瞬时 401
+///   (token 其实有效、偶发 401)后续 2xx → 自愈,不卡死 over-prompt。
+pub fn report_chatgpt_backend_auth(token_fp: u64, unauthorized: bool) {
+    if unauthorized {
+        REVOKED_TOKEN_FP.store(token_fp, Ordering::SeqCst);
+        set_relogin_required(true);
+    } else if token_fp != 0 && REVOKED_TOKEN_FP.load(Ordering::SeqCst) == token_fp {
+        clear_relogin_state();
+    }
+}
+
+/// [MOC-124 H-2] 算 auth.json 的 `tokens.access_token` 的 FNV-1a 64 指纹,跟 proxy 侧
+/// `authorization_token_fingerprint` **同算法**(对 raw token、同 offset basis + prime),
+/// 用于 detect self-heal 判 active token 是否就是被 proxy 401 标记撤销的那个。空 token → 0。
+fn access_token_fingerprint(auth: &Value) -> u64 {
+    let token = auth
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if token.is_empty() {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in token.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// [MOC-124 H-2] detect self-heal 见有效 Official token 时**是否该清** relogin。
+/// `revoked_fp==0`(无 proxy 401 撤销记录)→ 清(保持原自愈语义);active token 指纹 ≠ 被撤销的
+/// (token 换了:app 外 codex login / 重新导入)→ 清;**指纹相同**(还是那个被服务端撤销、本地
+/// exp 没过的旧 token)→ **不清**,否则会抹掉 proxy 401 探测、H-2 形同无效(本 PR 的 BLOCKER)。
+fn should_clear_relogin(active_token_fp: u64, revoked_fp: u64) -> bool {
+    revoked_fp == 0 || active_token_fp != revoked_fp
 }
 
 /// 活动 `~/.codex/auth.json` 当前是否就是可用的真实 chatgpt(决定「插件解锁是否走原生
@@ -361,8 +420,17 @@ pub fn detect() -> RealAccountStatus {
         Some(found) => {
             // [connector review 自愈] 活动文件就是有效真实 chatgpt = 账号当前确实可用 → 清掉可能
             // stale 的「需重新登录」标记(覆盖 app 外重新 codex login / 直接恢复活动文件场景)。
-            if found.source == AuthSource::Official {
-                set_relogin_required(false);
+            // [MOC-124 H-2] 但**只在 token 真换了**时清:proxy 401 回灌记下了被撤销 token 的指纹,
+            // 若 active 还是那个旧 token(指纹相同、本地 exp 没过)说明服务端撤销仍在,清了等于抹掉
+            // proxy 探测(detect 用 local-exp 判有效、看不到撤销);指纹不同 = app 外 login / 重新
+            // 导入换了新 token → 才清。`REVOKED_TOKEN_FP==0`(无撤销记录)照常清,保持原自愈语义。
+            if found.source == AuthSource::Official
+                && should_clear_relogin(
+                    access_token_fingerprint(&found.value),
+                    REVOKED_TOKEN_FP.load(Ordering::SeqCst),
+                )
+            {
+                clear_relogin_state();
             }
             RealAccountStatus {
                 logged_in: true,
@@ -611,7 +679,7 @@ pub async fn import_auth(source_path: String) -> Result<(), String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     import_locked(&paths, &value, Some(&source_path))?;
-    set_relogin_required(false); // 有效账号导入成功,清失效标记
+    clear_relogin_state(); // [MOC-124 H-2] 有效账号导入成功,清失效标记 + 撤销指纹
     Ok(())
 }
 
@@ -644,11 +712,11 @@ pub async fn forget_imported() -> Result<bool, String> {
     }
     // [connector review] 清除账号后不再有可重登的保留账号 → 清掉「需重新登录」标记,
     // 否则 status 仍带 relogin_required=true,UI 继续提示「账号已失效」要重登。
-    set_relogin_required(false);
-    // [MOC-178] 不在这里删/改活动 auth.json —— 删整个文件会丢 tokens(退出 restore 只恢复
-    // MANAGED 的 auth_mode/OPENAI_API_KEY、tokens 恢复不回 → 残缺)。停用真实账号(让 toggle
-    // 关 + Codex 原生不显示 plugins)改由 forget_handler apply 当前 provider 强制 non-relay
-    // 完成:写 auth_mode=apikey 但**保留 tokens**,退出 restore 才能写回 chatgpt + tokens 完整恢复。
+    clear_relogin_state(); // [MOC-124 H-2] 一并清撤销 token 指纹
+                           // [MOC-178] 不在这里删/改活动 auth.json —— 删整个文件会丢 tokens(退出 restore 只恢复
+                           // MANAGED 的 auth_mode/OPENAI_API_KEY、tokens 恢复不回 → 残缺)。停用真实账号(让 toggle
+                           // 关 + Codex 原生不显示 plugins)改由 forget_handler apply 当前 provider 强制 non-relay
+                           // 完成:写 auth_mode=apikey 但**保留 tokens**,退出 restore 才能写回 chatgpt + tokens 完整恢复。
     Ok(had_mirror)
 }
 
@@ -851,7 +919,7 @@ pub fn start_login() -> Result<(), String> {
         g.pid = None;
         g.last = match result {
             Ok(out) if out.status.success() => {
-                set_relogin_required(false); // 登录成功 = 拿到新鲜账号
+                clear_relogin_state(); // [MOC-124 H-2] 登录成功 = 拿到新鲜账号,清失效标记 + 撤销指纹
                 LoginState::Succeeded
             }
             Ok(out) => {
@@ -913,6 +981,62 @@ pub fn login_status() -> LoginState {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // [MOC-124 H-2 BLOCKER 修复] detect self-heal 的 fp 决策:被撤销的旧 token 保持 relogin,
+    // token 换了 / 无撤销记录才清。修复「detect 用 local-exp 自愈抹掉 proxy 401 探测」的核心。
+    #[test]
+    fn should_clear_relogin_keeps_flag_for_same_revoked_token() {
+        let revoked = access_token_fingerprint(&json!({"tokens": {"access_token": "tok_revoked"}}));
+        let fresh = access_token_fingerprint(&json!({"tokens": {"access_token": "tok_fresh"}}));
+        // 还是被撤销的旧 token(指纹相同)→ 不清(保持 relogin) ← BLOCKER 核心
+        assert!(!should_clear_relogin(revoked, revoked));
+        // token 换了(app 外 login / 重新导入)→ 清
+        assert!(should_clear_relogin(fresh, revoked));
+        // 无撤销记录(revoked==0)→ 清,保持原自愈语义
+        assert!(should_clear_relogin(revoked, 0));
+    }
+
+    // [MOC-124 H-2] auth.json access_token 指纹:稳定、不同 token 不同、缺/空 → 0。
+    // 跟 proxy 侧 authorization_token_fingerprint 同算法 → 同 token 同指纹(跨 crate 比对成立)。
+    #[test]
+    fn access_token_fingerprint_stable_and_distinct() {
+        let a = json!({"tokens": {"access_token": "tok_abc"}});
+        let b = json!({"tokens": {"access_token": "tok_xyz"}});
+        assert_eq!(access_token_fingerprint(&a), access_token_fingerprint(&a));
+        assert_ne!(access_token_fingerprint(&a), access_token_fingerprint(&b));
+        assert_ne!(access_token_fingerprint(&a), 0);
+        assert_eq!(access_token_fingerprint(&json!({})), 0);
+        assert_eq!(
+            access_token_fingerprint(&json!({"tokens": {"access_token": ""}})),
+            0
+        );
+    }
+
+    // [MOC-124 H-2] 200 恢复:401 标记需重登 → 同 token 2xx 自愈;真撤销(别的 token 2xx 不清)保持。
+    // 用全局 RELOGIN_REQUIRED/REVOKED_TOKEN_FP,开头/结尾 clear 复位(本测试是唯一碰这俩的)。
+    #[test]
+    fn report_chatgpt_backend_auth_marks_on_401_self_heals_on_2xx() {
+        let (a, b) = (1111u64, 2222u64);
+        clear_relogin_state();
+        assert!(!relogin_required());
+
+        // 401(token A 撤销)→ 标记需重登
+        report_chatgpt_backend_auth(a, true);
+        assert!(relogin_required());
+        // 同 token A 又 2xx(瞬时 401 恢复)→ 自愈清掉
+        report_chatgpt_backend_auth(a, false);
+        assert!(!relogin_required());
+
+        // 真撤销:A 401 标记后,别的 token B 的 2xx 不清(撤销的是 A、不是 B)
+        report_chatgpt_backend_auth(a, true);
+        report_chatgpt_backend_auth(b, false);
+        assert!(relogin_required(), "别的 token 成功不应清 A 的撤销标记");
+        // A 持续 401(真撤销永不 2xx)→ 保持
+        report_chatgpt_backend_auth(a, true);
+        assert!(relogin_required());
+
+        clear_relogin_state();
+    }
     use std::path::Path;
 
     fn chatgpt_auth() -> Value {
