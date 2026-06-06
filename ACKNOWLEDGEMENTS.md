@@ -424,6 +424,38 @@
 
 ---
 
+## CloakHQ/CloakBrowser
+
+- **Link**: https://github.com/CloakHQ/CloakBrowser
+- **License**: 见上游(stealth Chromium,源码级 C++ 指纹 patch + persistent profile;**概念借鉴,未引入其二进制 / 代码**)
+- **借鉴形式**: 思路借鉴(per-origin 持久 profile 复用 cookie 跳过重复挑战;非代码移植)
+- **首次借鉴 PR / 时间**: #416 / 2026-06-06(MOC-156 ③ headless 持久 profile)
+- **借鉴清单**:
+  - **per-origin persistent profile** —— headless 档按 origin 持久化 `user-data-dir`,Chrome 落盘的 cookie(含 `cf_clearance`)跨调用复用、同 origin 下次跳过重复 CF 挑战 → `crates/http/src/headless/mod.rs::fetch_rendered_html`(顶层)+ `persistent_profile_dir` / `HeadlessBrowser::launch_persistent`
+- **本项目差异 / 扩展**:
+  - 上游是完整 stealth 浏览器(C++ patch ~200MB 独立 license);本项目仅借**持久 profile 复用 `cf_clearance`** 的思路,用 chromiumoxide + 系统 Chrome / chrome-headless-shell 自实现,不引入其二进制。
+  - 约束自实现:per-origin async Mutex 串行(避 Chrome profile lock 冲突)+ TTL 1h(clearance 失效即清,减少 cookie 留存)+ **仅 headless 档**(curl/wreq UA 与 headless 不一致,`cf_clearance` 跨档失效)。
+- **同步策略**: monitor only(概念借鉴,无 API 耦合)。
+- **关联**: MOC-156 / PR #416
+
+---
+
+## Xewdy444/CF-Clearance-Scraper
+
+- **Link**: https://github.com/Xewdy444/CF-Clearance-Scraper
+- **License**: 见上游(`cf_clearance` 抓取工具;**约束认知 + 概念借鉴,未引入代码**)
+- **借鉴形式**: 思路借鉴(CF challenge 等待清除 + `cf_clearance` 复用约束;非代码移植)
+- **首次借鉴 PR / 时间**: #416 / 2026-06-06(MOC-156 ② wait-for-clear + ③ 复用约束)
+- **借鉴清单**:
+  - **wait-for-clear**(②) —— headless 渲染后若仍是 CF 挑战页,原地轮询同页等 stealth 解出(而非立即失败),到 marker 消失或超时 → `crates/http/src/headless/mod.rs::fetch_rendered_html`(`challenge_wait_timeout` 轮询)
+  - **`cf_clearance` 复用约束**(③) —— clearance cookie 绑定 **UA + IP**(上游 README 实证),据此定"仅 headless 同档复用"(curl/wreq UA 不一致跨档失效)→ `headless/mod.rs` 持久 profile 仅 headless 档
+- **本项目差异 / 扩展**:
+  - 上游是 Python 专用 clearance 抓取器;本项目借其 **challenge 等待思路 + clearance UA/IP 绑定约束认知**,用 Rust chromiumoxide 自实现,不抓 / 不导出 cookie(profile 内部复用)。
+- **同步策略**: monitor only(概念借鉴)。
+- **关联**: MOC-156 / PR #416
+
+---
+
 ## liaohch3/claude-tap
 
 - **Link**: https://github.com/liaohch3/claude-tap

@@ -66,7 +66,9 @@ pub async fn web_search(
         "https://html.duckduckgo.com/html/?q={}",
         urlencoding::encode(q)
     );
-    let html = crate::headless::fetch_rendered_html(&url).await?;
+    // no_wait: DDG 的 202 anomaly 是硬拦截、不会自动解出, 不走 wait-for-clear(白等 15s); search
+    // 靠 anomaly marker 自己判 Blocked + 后备 Bing, 要拿到 anomaly 页 html(MOC-156 review)。
+    let html = crate::headless::fetch_rendered_html_no_wait(&url).await?;
     let results = parse_ddg_html(&html, max);
     if !results.is_empty() {
         return Ok(results);
@@ -76,7 +78,7 @@ pub async fn web_search(
     // Bing 拿 10 条干净直链结果。Bing 抓取失败/空则落回按 DDG 信号收尾 (多花一次 headless, 仅在
     // DDG 0 结果这一少数路径)。
     let bing_url = format!("https://www.bing.com/search?q={}", urlencoding::encode(q));
-    match crate::headless::fetch_rendered_html(&bing_url).await {
+    match crate::headless::fetch_rendered_html_no_wait(&bing_url).await {
         Ok(bing_html) => {
             let bing = parse_bing_html(&bing_html, max);
             if !bing.is_empty() {
