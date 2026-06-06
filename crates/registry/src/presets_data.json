@@ -250,6 +250,7 @@
     "models": {
       "default": "MiniMax-M3"
     },
+    "summaryModel": "MiniMax-M3",
     "modelCapabilities": {
       "MiniMax-M3": {
         "context_window": 1000000
@@ -266,6 +267,10 @@
       {
         "type": "info",
         "text": "MiniMax chat completions API 当前不支持原生 web_search 工具(文档实证 2026-05-09)。如需联网搜索,推荐配 mcp_servers 使用 MCP 路径(参考 P5 namespace MCP 修复)。"
+      },
+      {
+        "type": "warning",
+        "text": "网页摘要模型默认用 MiniMax-M3 —— MiniMax 全系**仅 M3 支持关闭思考(thinking)**,M2.x(M2.5 / M2.7 等)关不掉。用 M2.x 作摘要时每段都先生成 <think> 思维链,**显著增加 web_fetch 摘要耗时**(大页分批时单批易超时、回退原文)。强烈建议网页摘要模型保持 M3。"
       }
     ],
     "requestOptions": {},
