@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 use crate::admin::handlers::common::{active_provider_name, read_setting_bool, APP_VERSION};
 use crate::admin::handlers::providers::{
     active_provider, provider_api_key, provider_default_model, provider_display_name,
-    provider_index, provider_model_capabilities, provider_model_mappings, provider_supports_1m,
+    provider_index, provider_model_capabilities, provider_model_mappings,
+    provider_review_model_slot, provider_supports_1m,
 };
 use crate::admin::handlers::proxy::{
     ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed,
@@ -50,6 +51,10 @@ pub struct DesktopConfigTarget {
     /// 让 Codex 自己的 model picker 显示 displayName 而非 raw id。其他 provider 为
     /// `Value::Null`,catalog 回退 raw id(行为不变)。
     pub model_display_names: Value,
+    /// [MOC-173] auto-review 审查模型槽位 key(如 `gpt_5_4`),`None` = auto-review 复用主模型。
+    /// 从 provider `reviewModelSlot` 读;透传给 catalog 生成写每个 entry 的
+    /// `auto_review_model_override`,让审查脱钩主模型走该槽位的现有映射。
+    pub review_model_slot: Option<String>,
 }
 
 /// [MOC-69] 给 antigravity provider 构建 model id → displayName 反查表(JSON object),
@@ -131,6 +136,7 @@ pub fn desktop_config_target_for_provider(
             codex_network_access,
             codex_status_section_default_visible,
             model_display_names: antigravity_display_names(&api_format_lower),
+            review_model_slot: provider_review_model_slot(provider),
         };
     }
 
@@ -159,6 +165,7 @@ pub fn desktop_config_target_for_provider(
         codex_network_access,
         codex_status_section_default_visible,
         model_display_names: antigravity_display_names(&api_format_lower),
+        review_model_slot: provider_review_model_slot(provider),
     }
 }
 
@@ -191,6 +198,7 @@ pub fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> 
         Some(&target.model_mappings),
         Some(&target.model_capabilities),
         Some(&target.model_display_names),
+        target.review_model_slot.as_deref(),
     )
     .into_iter()
     .map(|model| {
@@ -423,6 +431,7 @@ fn apply_desktop_target_impl(
             model_mappings: Some(&target.model_mappings),
             model_capabilities: Some(&target.model_capabilities),
             model_display_names: Some(&target.model_display_names),
+            review_model_slot: target.review_model_slot.as_deref(),
             app_version: APP_VERSION,
             codex_network_access: target.codex_network_access,
             codex_status_section_default_visible: target.codex_status_section_default_visible,
@@ -1389,6 +1398,7 @@ mod tests {
             model_mappings: Value::Null,
             model_capabilities: Value::Null,
             model_display_names: serde_json::Value::Null,
+            review_model_slot: None,
             requires_proxy: false,
             mode: "direct",
             proxy_port: 0,

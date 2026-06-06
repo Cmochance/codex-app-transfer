@@ -181,6 +181,10 @@ pub struct AddProviderInput {
     /// 透传持久化。空字符串 = 清除(回退 `models["default"]`)。
     #[serde(rename = "summaryModel")]
     pub summary_model: Option<String>,
+    /// [MOC-173] auto-review 审查模型槽位 key(如 `gpt_5_4`)。空字符串 = 清除(auto-review
+    /// 回退复用主模型)。经 `Provider.extra` flatten 透传持久化为 `reviewModelSlot`。
+    #[serde(rename = "reviewModelSlot")]
+    pub review_model_slot: Option<String>,
 }
 
 pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
@@ -306,6 +310,15 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
         {
             new_provider.insert("summaryModel".into(), Value::String(sm));
         }
+        // [MOC-173] auto-review 审查模型槽位:trim 后非空才写入(空 → 不写 = 复用主模型)。
+        if let Some(slot) = input
+            .review_model_slot
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            new_provider.insert("reviewModelSlot".into(), Value::String(slot));
+        }
         if let Some(gw) = input.grok_web.clone() {
             if !gw.is_null() {
                 new_provider.insert("grokWeb".into(), gw);
@@ -401,6 +414,15 @@ pub async fn update_provider(
                 updated.remove("summaryModel");
             } else {
                 updated.insert("summaryModel".into(), Value::String(sm.to_string()));
+            }
+        }
+        // [MOC-173] auto-review 审查模型槽位:非空 insert,空字符串 = 用户清除 → remove(复用主模型)。
+        if let Some(slot) = input.review_model_slot.clone() {
+            let slot = slot.trim();
+            if slot.is_empty() {
+                updated.remove("reviewModelSlot");
+            } else {
+                updated.insert("reviewModelSlot".into(), Value::String(slot.to_string()));
             }
         }
         if let Some(gw) = input.grok_web.clone() {

@@ -20,6 +20,12 @@ futures-util = "0.3"
 http = "1"
 # rustls-tls 走纯 Rust TLS 栈,跨平台编译时不需要 system OpenSSL
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "socks", "system-proxy"] }
+# [MOC-125] WS 透传专用 reqwest 0.13(reqwest-websocket 0.6 要 0.13),package rename 与上面
+# state.http 的 reqwest 0.12 共存 —— 只远程控制 WS 这条新路径用,**不动 state.http**,故所有
+# 现有上游转发的 CF/ClientHello 指纹零变化(升级范围 A)。0.13 feature 改名 rustls-tls→rustls,
+# 且 0.13 的 rustls 不再自带根证书、需显式加 webpki-roots。
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2", "socks", "system-proxy"] }
+reqwest-websocket = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

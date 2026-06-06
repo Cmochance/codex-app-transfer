@@ -68,6 +68,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 - 会话历史**两层持久化**:L1 内存 LRU + L2 sqlite(`~/.codex-app-transfer/sessions.db`),`.app` 重启不丢历史。L2 按 sha256 **内容寻址去重**(图片走 blob 外置 + 文字/工具消息整条去重,逐轮快照共享部分只存一份,实测省约 97% 消息体积),体积极小,故**持久化不过期**(旧 30 天 TTL 已移除,老会话永远续得上);存量旧库在首次启动后台静默分批迁移回收(MOC-142 / MOC-168 / MOC-170)
 - **用量统计**(Sidebar → 用量):解析 `~/.codex/sessions/` rollout JSONL,按对话 / 日 / 模型聚合 token 用量(解析层 vendor 自 ryoppippi/ccusage)。「按对话」视图显示每对话**缓存命中率**,点击数字弹出该对话**逐轮命中率直方图**(命中含于总计、双色,hover 看命中 / 总输入 / 输出);proxy 本地记录 `session → 真实上游模型`(本版本之后的新对话),「按对话」模型列因此显示真实上游模型而非 Codex 客户端占位名(`gpt-5.x`)
 - **真实 ChatGPT 账号 Plugins 解锁**(relay 模式,v2.2.0):用真实账号而非 CDP 伪造登录态解锁 Codex Plugins —— 应用内调起官方 `codex login` / 从文件导入账号 / 强制兜底(原 CDP 路径) / 清除账号。relay 保留 `auth_mode=chatgpt` + tokens 让 Codex **原生**显示 Plugins 入口、消除 CDP 伪造的启动高延迟;第三方模型经 `openai_base_url` 走 proxy,账号 / 插件 backend 经 `chatgpt_base_url` 透传真 chatgpt.com。transfer **不刷新** single-use refresh token(与本机 Codex 双刷会 `refresh_token_reused` 烧号),刷新只归源头(本机 Codex 自刷 / 导入源刷 / `codex login` 自取)。配套**系统代理连通检测**:仪表盘「网络代理」状态卡 + 解锁 gate(账号有效 AND 系统代理可达才解锁,缺则引导开代理 / 登录 / 强制),探测只连代理端口、不碰 chatgpt.com(MOC-104 / MOC-114)
+- **Codex 远程控制 WS 透传**(relay 模式,MOC-125):Codex 桌面端「远程控制」(Mobile→Mac)经 `wham/remote/control/server` 发起 **WebSocket** 握手;relay 下此前 transfer 把它当普通 HTTP 透传、不做 WS upgrade → chatgpt.com 返 404 → 远程控制建不起来、Codex `enroll` 死循环重试。现加**真 WS 透传**:接收侧 axum 接 Codex 的 WS upgrade,上游侧用独立 `http1_only` client(WS upgrade 需 HTTP/1.1,而 `state.http` 默认 ALPN 协商 h2)连 `wss://chatgpt.com`、注入 Codex 的 `x-codex-installation-id` / `x-codex-server-id` / `authorization` 等远程控制必需 header,再双向 frame pump。普通转发的 `state.http`(reqwest 0.12)完全不动,WS 单独走 reqwest 0.13 client,现有上游 CF/ClientHello 指纹零变化
 - Codex APP 原配置守护:apply 前自动快照 `~/.codex/{config.toml,auth.json}`,退出 / 下次启动按 key 智能合并还原;**MCP 授权可移植保险箱**(默认开):把 MCP OAuth 凭据改存为可移植文件(`~/.codex/.credentials.json`,0o600),并在 `~/.codex` 之外维护镜像(`~/.codex-app-transfer/mcp-credentials.json`);整个凭据文件被账号切换 / 误删 / 换机清掉时,下次启动弹确认让你从备份恢复(单个 server 的主动登出会被尊重、不复活;注:不解决 OAuth 自然过期)
 - **Codex 文档管理**(Sidebar → Codex):
   - **Agents**:HOME 下非敏感 `AGENTS.md` raw 全文 read/write + 文件系统选择;系统目录 / 凭据目录会被拒绝,按 `.git/` 自动分类 project-root / subdir 显示 chip
@@ -147,6 +148,8 @@ Codex 的 `low/medium/high/xhigh` 在各 chat-completions 上游的处理方式(
 Codex APP 按 OpenAI 模型名提示;第三方 provider 用 `deepseek-v4-pro` / `kimi-k2.6` / `glm-5.1` / `gemini-3-pro` 等真实 ID。
 
 供应商配置页的「在 Codex 中显示的模型」直接列出你想在 Codex 模型选择器看到的真实模型(最多 5 个):**第一个是默认模型、新对话直接用它**,后端自动把它们映射到 Codex 槽位(`gpt-5.5` / `gpt-5.4` / …),无需手动指定槽位。Codex APP 模型选择器里看到的就是你列的真实模型名,数量与你的配置一致(不再有"默认占满"导致的占位重复模型,MOC-154)。上游 `chatcmpl-...` 应答 ID 自动重写为 Codex APP 校验通过的 `resp_<base64>`,保留 deployment affinity 编码,`previous_response_id` 跨轮一致。
+
+**auto-review 审查模型(MOC-173)**:Codex 的 auto-review(逐个工具调用做风险审批的 guardian subagent)默认复用主对话模型、较慢。供应商配置页「模型映射」下方的「auto-review 审查模型」可单独指定它走哪个模型 —— **只能从你已配置的模型槽位里选**(下拉只列映射非空的槽位,避免重复配置 / 降级),transfer 据此给 Codex model catalog 写 `auto_review_model_override`,让审查脱钩主模型、复用所选槽位的现有映射(通常选快 / 便宜模型加速审批);留空 = 跟随主模型。Codex 0.137 抓包实证:设置后审查请求的 `model` 字段即切到所选槽位、与主对话分流(不改主对话模型)。
 
 ## 本地开发(v2 / Rust)
 
@@ -300,7 +303,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 ## 技术栈
 
-- **后端 / 转发**:Rust 1.85+ · axum 0.8 · reqwest 0.12(rustls-tls)· tokio · `wreq` 6.0-rc(浏览器 TLS 指纹伪装,Chrome 120 指纹,curl/wreq/headless 三层声称同一版本避免身份漂移,给 Cloudflare 强保的 `openai.com` / `chatgpt.com` 用,详见 `crates/http/`)· `sys-locale`(读系统语言区域,生成 locale-aware `Accept-Language` 减少 UA 粗筛误拦)· `base64`(Bing `ck/a` 跳转解码)· `chromiumoxide` 0.9(headless Chromium,抓 ①reqwest / ②wreq 都拿不到的 JS 渲染 SPA —— 探测系统 Chrome,否则按需下载 chrome-headless-shell 到 app data,不打包进安装包;目前为 PoC,接入分层 router 待后续 PR,见 `crates/http/src/headless/`)· `crates/http::web_fetch`(统一抓取层,按设置页档位路由 curl/wreq/headless;配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure`;`webFetchBackend != off` 时自动往 `~/.codex/config.toml` 注册 `[mcp_servers.CAT-WEB-MCP]`(stdio MCP server,transfer 自身 + `--mcp-serve-webfetch`),让 Codex 模型可调 `web_fetch` / `web_search` 工具)
+- **后端 / 转发**:Rust 1.85+ · axum 0.8 · reqwest 0.12(rustls-tls)· tokio · `wreq` 6.0-rc(浏览器 TLS 指纹伪装,Chrome 120 指纹,curl/wreq/headless 三层声称同一版本避免身份漂移,给 Cloudflare 强保的 `openai.com` / `chatgpt.com` 用,详见 `crates/http/`)· `sys-locale`(读系统语言区域,生成 locale-aware `Accept-Language` 减少 UA 粗筛误拦)· `base64`(Bing `ck/a` 跳转解码)· `chromiumoxide` 0.9(headless Chromium,抓 ①reqwest / ②wreq 都拿不到的 JS 渲染 SPA —— 探测系统 Chrome,否则按需下载 chrome-headless-shell 到 app data,不打包进安装包;目前为 PoC,接入分层 router 待后续 PR,见 `crates/http/src/headless/`)· `crates/http::web_fetch`(统一抓取层,按设置页档位路由 curl/wreq/headless;配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure`;`webFetchBackend != off` 时自动往 `~/.codex/config.toml` 注册 `[mcp_servers.cat-webfetch]`(stdio MCP server,transfer 自身 + `--mcp-serve-webfetch`),让 Codex 模型可调 `web_fetch` / `web_search` 工具)
 - **协议适配**:`crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web 互转(请求 body + 流式响应状态机 + reasoning_content + tool_calls)
 - **前端**:HTML + CSS + 原生 JavaScript + Bootstrap 5.3.3(本地化,无 CDN 依赖)
 - **桌面壳**:Tauri 2 + tray-icon 0.23,通过 `cas://` URI scheme 把 frontend/ 与 axum 同进程串起来,无 TCP loopback
