@@ -46,6 +46,11 @@ dom_smoothie = "0.17"
 # urlencoding 编码 query + 解码 DDG uddg 重定向参数里的真实 URL。
 dom_query = "0.27"
 urlencoding = "2"
+# Bing 后备引擎 (MOC-186 ⑤): 解 Bing `ck/a` 跳转链接里的 base64url `u` 参数拿真实落地 URL。
+base64 = "0.22"
+# locale-aware Accept-Language (MOC-186 ④): 跨平台读系统 locale (macOS CFLocale / Win / Linux),
+# 比裸读 LANG env 可靠 (GUI app 的 LANG 常为空)。让中文用户抓地区站拿本地化内容。
+sys-locale = "0.3"
 
 [dev-dependencies]
 # 集成测试: 真实打到 chatgpt.com 验证能过 CF (网络可达时)

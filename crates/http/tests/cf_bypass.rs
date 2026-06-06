@@ -1,4 +1,4 @@
-//! 网络集成测试: 真实打到 Cloudflare 强保域, 验证 `wreq` + `Emulation::Chrome120` 真的能过。
+//! 网络集成测试: 真实打到 Cloudflare 强保域, 验证 `wreq` + `Emulation::Chrome147` 真的能过。
 //!
 //! 运行: `cargo test -p codex-app-transfer-http --test cf_bypass -- --include-ignored --nocapture`
 //! 默认 `#[ignore]` 避免 CI 无网络环境挂掉; 本地手动跑拿真实数据。
@@ -9,7 +9,7 @@ use codex_app_transfer_http::{should_impersonate, ImpersonatingClient};
 #[tokio::test]
 #[ignore = "需要网络 + 出向 chatgpt.com"]
 async fn chatgpt_home_returns_non_cf_challenge() {
-    let client = ImpersonatingClient::chrome_120().expect("build chrome_120 client");
+    let client = ImpersonatingClient::chrome().expect("build chrome client");
     let resp = client
         .get("https://chatgpt.com/")
         .send()
@@ -37,7 +37,7 @@ async fn chatgpt_home_returns_non_cf_challenge() {
 #[tokio::test]
 #[ignore = "需要网络 + 出向 help.openai.com"]
 async fn help_openai_codex_collection_returns_200() {
-    let client = ImpersonatingClient::chrome_120().expect("build chrome_120 client");
+    let client = ImpersonatingClient::chrome().expect("build chrome client");
     let resp = client
         .get("https://help.openai.com/en/collections/14937394-codex")
         .send()

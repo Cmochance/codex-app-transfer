@@ -316,7 +316,7 @@ struct RawFetch {
 
 /// 单档 (Curl/Wreq) 抓取: raw 抓 → 非 2xx 即 Err (保持原单档语义, 不自动升级)。
 async fn single_tier(tier: WebFetchBackend, url: &str) -> Result<Fetched, WebFetchError> {
-    let raw = fetch_raw(tier, url).await?;
+    let raw = fetch_raw_retry_429(tier, url).await?;
     if !(200..300).contains(&raw.status) {
         return Err(tier_http_error(tier, raw.status));
     }
@@ -341,6 +341,28 @@ async fn fetch_raw(tier: WebFetchBackend, url: &str) -> Result<RawFetch, WebFetc
     }
 }
 
+/// 429 限流退避重试次数 (⑥ MOC-186): MCP 同步等结果, 退避要短, 不宜多次。
+const MAX_429_RETRIES: u32 = 2;
+/// 429 退避基数 (指数: 0.5s → 1s)。不读 `Retry-After` —— 同步场景下其值常达数十秒, 等不起;
+/// 固定短退避足够吃掉瞬时限流尖峰, 仍 429 则交调用方升档/报错。
+const RETRY_429_BASE: Duration = Duration::from_millis(500);
+
+/// 抓 raw + 对 429 (限流) 短退避重试**当前档** (⑥ MOC-186)。
+///
+/// 429 是 IP/频率限流, 不是"能力不足" —— 换档 (同 IP) 一样被限, 升档无意义; 短退避重试同档才对。
+/// 与 403 (反爬, 该升档过 JA3 指纹) 严格区别。重试 [`MAX_429_RETRIES`] 次指数退避后仍 429,
+/// 返回该 429 raw (交调用方: 单档→Err, Auto→按 needs_upgrade 升档兜底)。
+async fn fetch_raw_retry_429(tier: WebFetchBackend, url: &str) -> Result<RawFetch, WebFetchError> {
+    let mut raw = fetch_raw(tier, url).await?;
+    let mut attempt = 0;
+    while raw.status == 429 && attempt < MAX_429_RETRIES {
+        tokio::time::sleep(RETRY_429_BASE * 2_u32.pow(attempt)).await;
+        attempt += 1;
+        raw = fetch_raw(tier, url).await?;
+    }
+    Ok(raw)
+}
+
 /// tier 对应的 HTTP 错误 (单档非 2xx)。
 fn tier_http_error(tier: WebFetchBackend, status: u16) -> WebFetchError {
     let msg = format!("HTTP {status}");
@@ -350,14 +372,54 @@ fn tier_http_error(tier: WebFetchBackend, status: u16) -> WebFetchError {
     }
 }
 
-/// ① reqwest 静态 GET。返回 RawFetch (不判 status)。
+/// curl 档的浏览器 `Accept` 头 (② MOC-186): Chrome 真实默认值。与 UA 一起过 UA/header 黑名单
+/// 粗筛 —— 很多站第一道按"缺浏览器头"判非浏览器直接拦, 让本可静态抓的页无谓升档。
+const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+
+/// 按系统 locale 生成 `Accept-Language` (④ MOC-186)。中文用户真实浏览器发 `zh-CN`, 固定 en-US
+/// 会拿地区站英文版 + locale/header 不一致。用 `sys-locale` 跨平台读系统 locale (macOS CFLocale /
+/// Win / Linux) —— 比裸读 `LANG` env 可靠 (GUI app 的 `LANG` 常为空), 读不到回退 `en-US,en;q=0.9`
+/// (= wreq emulation 默认)。best-effort, 失败不影响抓取。
+///
+/// **仅用于 curl 档**: wreq 档的 `Accept-Language` 由 emulation 按指纹注入 (请求级覆盖会与 emulation
+/// header 冲突成双值), 且 wreq 只用于 CF 强保域 (内容多为英文), en-US 影响小。
+fn accept_language() -> String {
+    accept_language_from_locale(&sys_locale::get_locale().unwrap_or_default())
+}
+
+/// 把系统 locale (如 `zh_CN.UTF-8` / `en-US` / `C`) 转成 `Accept-Language` 头值 (④ MOC-186)。
+/// 纯函数 (与 `sys-locale` 读取解耦, 便于离线测试)。空 / `C` / `POSIX` → `en-US,en;q=0.9`
+/// (= wreq emulation 默认)。
+fn accept_language_from_locale(raw: &str) -> String {
+    // sys-locale 通常返 BCP47 (`zh-CN`); 防御性把 `_` 归一为 `-`, 取 `.`/`@` 前的 locale 段。
+    let loc = raw.split(['.', '@']).next().unwrap_or("").trim();
+    if loc.is_empty() || loc.eq_ignore_ascii_case("C") || loc.eq_ignore_ascii_case("POSIX") {
+        return "en-US,en;q=0.9".to_string();
+    }
+    let bcp47 = loc.replace('_', "-");
+    let primary = bcp47.split('-').next().unwrap_or(bcp47.as_str());
+    if primary.eq_ignore_ascii_case("en") {
+        format!("{bcp47},en;q=0.9")
+    } else {
+        // 主 locale 优先, 主语言次之, 始终 en 兜底 (地区站无本地化时退英文)。
+        format!("{bcp47},{primary};q=0.9,en;q=0.8")
+    }
+}
+
+/// ① reqwest 静态 GET (+ ② 真实 Chrome UA / ④ locale-aware Accept-Language)。返回 RawFetch (不判 status)。
 async fn fetch_curl_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        // ② curl 档加真实 Chrome UA: 默认 reqwest UA (`reqwest/x`) 一眼非浏览器, 被 UA 黑名单站
+        // 直接拦 → 无谓升档。这里只过 UA 粗筛 (curl 无 TLS 指纹, 遇真 CF 看 JA3 仍会升 wreq)。MOC-186。
+        .user_agent(crate::impersonating::CHROME_UA)
         .build()
         .map_err(|e| WebFetchError::Curl(format!("建 client 失败: {e}")))?;
     let resp = client
         .get(url)
+        // ② 浏览器 Accept + ④ locale-aware Accept-Language (跟 UA 一起减少粗筛误拦)。MOC-186。
+        .header(reqwest::header::ACCEPT, BROWSER_ACCEPT)
+        .header(reqwest::header::ACCEPT_LANGUAGE, accept_language())
         .send()
         .await
         .map_err(|e| WebFetchError::Curl(e.to_string()))?;
@@ -388,10 +450,10 @@ async fn fetch_curl_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     })
 }
 
-/// ② wreq 浏览器 TLS 指纹 (Chrome 120)。返回 RawFetch (不判 status)。
+/// ② wreq 浏览器 TLS 指纹 (Chrome 147)。返回 RawFetch (不判 status)。
 async fn fetch_wreq_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     let client =
-        crate::ImpersonatingClient::chrome_120().map_err(|e| WebFetchError::Wreq(e.to_string()))?;
+        crate::ImpersonatingClient::chrome().map_err(|e| WebFetchError::Wreq(e.to_string()))?;
     let resp = client
         .get(url)
         .send()
@@ -522,7 +584,7 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
                 }
             }
         }
-        match fetch_raw(tier, url).await {
+        match fetch_raw_retry_429(tier, url).await {
             // 不可恢复 (4xx 死链/权限除反爬 + 5xx 无挑战的真服务器故障): 换 client、headless 渲染
             // 错误页都没意义, 直接报 HTTP 错误 (不当成功, 对齐单档 curl/wreq 行为, chatgpt-codex)。
             Ok(raw) if is_unrecoverable(&raw) => return Err(tier_http_error(tier, raw.status)),
@@ -640,17 +702,26 @@ fn is_challenge_body(body: &str) -> bool {
         .take(4096)
         .collect::<String>()
         .to_ascii_lowercase();
-    // CF 专有
+    // CF 专有 (语言无关)
     head.contains("challenge-platform")
         || head.contains("cf-browser-verification")
         || head.contains("_cf_chl_opt")
+        || head.contains("challenges.cloudflare.com") // CF Turnstile widget host
         || head.contains("<title>just a moment")
-        // 通用反爬 / 软拦截
+        // 其他反爬厂商 — 语言无关的 script-host / 资源名 token (③ MOC-186): 治本地化漏判 ——
+        // 中文/日文挑战页不含英文文案, 但这些厂商标识跨语言不变。用 host/path 形式而非裸厂商名,
+        // 特异性高, 避免讨论这些厂商的正文误判 (script src 几乎只出现在真挑战页)。
+        || head.contains("js.hcaptcha.com") // hCaptcha widget
+        || head.contains("www.google.com/recaptcha/") // reCAPTCHA widget
+        || head.contains("_incapsula_resource") // Imperva Incapsula
+        || head.contains("kpsdk.com") // Kasada script host
+        || head.contains("datadome") // DataDome (标准 JS 全局/cookie 名)
+        || head.contains("perimeterx.net") // PerimeterX/HUMAN script host
+        || head.contains("px-captcha") // PerimeterX captcha widget
+        // 通用英文软拦文案 (保留: 覆盖无专有标识的简单拦截页)
         || head.contains("bots use duckduckgo")
         || head.contains("unusual traffic")
         || head.contains("enable javascript and cookies")
-        || head.contains("datadome")
-        || head.contains("px-captcha")
         || head.contains("are you a robot")
 }
 
@@ -1548,6 +1619,50 @@ mod tests {
             "<html><body>just a moment in history was discussed.</body></html>"
         ));
         assert!(!is_challenge_body("<html><body>normal page</body></html>"));
+        // 厂商 token (③ MOC-186): host/script 形式命中真挑战页 (语言无关, 治本地化漏判)。
+        assert!(is_challenge_body(
+            "<script src=\"https://js.hcaptcha.com/1/api.js\"></script>"
+        ));
+        assert!(is_challenge_body(
+            "<script src=\"https://www.google.com/recaptcha/api.js\"></script>"
+        ));
+        assert!(is_challenge_body("<div id=\"_incapsula_resource\"></div>"));
+        assert!(is_challenge_body(
+            "<script src=\"//kpsdk.com/sdk.js\"></script>"
+        ));
+        assert!(is_challenge_body(
+            "<script src=\"//perimeterx.net/px.js\"></script>"
+        ));
+        assert!(is_challenge_body(
+            "<iframe src=\"https://challenges.cloudflare.com/turnstile\"></iframe>"
+        ));
+        // 正文提及厂商名但非挑战页 → 不误判 (host/path 形式特异, 不撞裸厂商名 PerimeterX/hCaptcha)。
+        assert!(!is_challenge_body(
+            "<html><body>本文讨论 PerimeterX 和 Kasada 等反爬产品的原理。</body></html>"
+        ));
+        assert!(!is_challenge_body(
+            "<html><body>A blog post comparing hCaptcha vs reCAPTCHA features.</body></html>"
+        ));
+    }
+
+    #[test]
+    fn accept_language_from_locale_maps_bcp47() {
+        // 中文 locale: 带编码后缀 + 下划线归一, 主语言 zh 次选, en 兜底。
+        assert_eq!(
+            accept_language_from_locale("zh_CN.UTF-8"),
+            "zh-CN,zh;q=0.9,en;q=0.8"
+        );
+        assert_eq!(
+            accept_language_from_locale("zh-CN"),
+            "zh-CN,zh;q=0.9,en;q=0.8"
+        );
+        // 英文 locale: 主语言即 en, 不退化成 `en,en;q=0.9`。
+        assert_eq!(accept_language_from_locale("en_US.UTF-8"), "en-US,en;q=0.9");
+        assert_eq!(accept_language_from_locale("en-GB"), "en-GB,en;q=0.9");
+        // 退化 locale / 空 → en-US 兜底 (= wreq emulation 默认)。
+        assert_eq!(accept_language_from_locale("C"), "en-US,en;q=0.9");
+        assert_eq!(accept_language_from_locale("POSIX"), "en-US,en;q=0.9");
+        assert_eq!(accept_language_from_locale(""), "en-US,en;q=0.9");
     }
 
     #[test]

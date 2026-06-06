@@ -8,7 +8,7 @@
 //!
 //! ## 为什么固定 headless
 //! DDG html 版(`html.duckduckgo.com/html/`)是 SSR + 经典 `.result__a` 结构, 但前置 JS
-//! challenge: 裸 reqwest / wreq Chrome120 指纹(含完整浏览器 header / POST / lite 版)**全部
+//! challenge: 裸 reqwest / wreq Chrome147 指纹(含完整浏览器 header / POST / lite 版)**全部
 //! 被 202 anomaly 拦**(spike 实测 6 变体全灭) —— 必须 headless 真跑 JS 才放行。故 web_search
 //! 内部固定走 [`crate::headless`], **不跟随** web_fetch 的 curl/wreq/headless 档位设置。
 //!
@@ -68,18 +68,32 @@ pub async fn web_search(
     );
     let html = crate::headless::fetch_rendered_html(&url).await?;
     let results = parse_ddg_html(&html, max);
-    if results.is_empty() {
-        // 解析出 0 条结果元素: 区分"反爬拦截"(202 anomaly 页, 该退避重试)与"真无结果 / 结构
-        // 变化"(该换查询)—— 两者 remediation 相反, 必须分开报(避免把 block 误报成 NoResults
-        // 让模型去改查询而非退避; silent-failure-hunter MOC-12 review)。判定基于"无结果元素 +
-        // anomaly 文案", 不再 substring 匹配 result__a(它会被 inline CSS/JS 里的同名 token 干扰)。
-        return Err(if has_anomaly_markers(&html) {
-            WebSearchError::Blocked
-        } else {
-            WebSearchError::NoResults
-        });
+    if !results.is_empty() {
+        return Ok(results);
     }
-    Ok(results)
+    // DDG 0 结果 → 后备引擎 Bing (⑤ MOC-186): DDG 出口 IP 被风控 (anomaly) 时整个 search 单点
+    // 不可用; Bing 覆盖与 DDG 不同, 既治该单点、也补"DDG 索引无但 Bing 有"。spike 实测 headless 抓
+    // Bing 拿 10 条干净直链结果。Bing 抓取失败/空则落回按 DDG 信号收尾 (多花一次 headless, 仅在
+    // DDG 0 结果这一少数路径)。
+    let bing_url = format!("https://www.bing.com/search?q={}", urlencoding::encode(q));
+    match crate::headless::fetch_rendered_html(&bing_url).await {
+        Ok(bing_html) => {
+            let bing = parse_bing_html(&bing_html, max);
+            if !bing.is_empty() {
+                return Ok(bing);
+            }
+        }
+        // Bing 抓取失败(网络/Chrome): 留痕便于区分"Bing 也被拦"vs"Bing 没跑起来", 再落回 DDG 信号。
+        Err(e) => eprintln!("[web_search] Bing 后备抓取失败 (落回 DDG 信号): {e}"),
+    }
+    // 两家都拿不到: 区分"反爬拦截"(DDG anomaly 页, 该退避重试)与"真无结果 / 结构变化"(该换查询)
+    // —— remediation 相反, 必须分开报(避免把 block 误报成 NoResults 让模型改查询而非退避;
+    // silent-failure-hunter MOC-12 review)。判定基于 DDG 页"无结果元素 + anomaly 文案"。
+    Err(if has_anomaly_markers(&html) {
+        WebSearchError::Blocked
+    } else {
+        WebSearchError::NoResults
+    })
 }
 
 /// DDG 反爬挑战页文案标记(仅在解析出 0 条结果时调用, 用于区分"被拦"与"真无结果")。
@@ -132,6 +146,71 @@ fn parse_ddg_html(html: &str, max: usize) -> Vec<SearchResult> {
         }
     }
     out
+}
+
+/// 解析 Bing 搜索结果 (⑤ MOC-186 后备引擎): 遍历 `li.b_algo` organic 容器, 取 `h2 a` 的 title +
+/// href (容器内首个 `a` 常是缩略图, 故锚定 `h2 a`), 经 [`decode_bing_href`] 把 `ck/a` 跳转解成
+/// 真实 URL, `.b_caption` 作摘要。spike 实测 headless 抓 Bing 拿 10 条干净结果 (无反爬拦截), 作
+/// DDG 被拦/无果时的后备 (见 [`web_search`])。
+fn parse_bing_html(html: &str, max: usize) -> Vec<SearchResult> {
+    let doc = Document::from(html);
+    let mut out = Vec::new();
+    for node in doc.select("li.b_algo").iter() {
+        let a = node.select("h2 a");
+        if a.length() == 0 {
+            continue; // 非 organic 块 (图片/视频/问答卡) 无 h2 a, 跳过。
+        }
+        let href = a.attr("href").map(|s| s.to_string()).unwrap_or_default();
+        let url = match decode_bing_href(&href) {
+            Some(u) => u,
+            None => {
+                // 容器有 h2 a、href 非空却解不出 = 疑 Bing ck/a 编码变化, 真实结果被丢 → 留 stderr 痕
+                // (对齐 parse_ddg_html), 便于发现解码器过期; 空 href 不告警(图片/特殊块, 无信息量)。
+                if !href.is_empty() {
+                    eprintln!("[web_search] 跳过无法解码的 Bing href: {href}");
+                }
+                continue;
+            }
+        };
+        let title = collapse_ws(a.text().as_ref());
+        if title.is_empty() {
+            continue;
+        }
+        let snippet = collapse_ws(node.select(".b_caption").text().as_ref());
+        out.push(SearchResult {
+            title,
+            url,
+            snippet,
+        });
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
+/// 解 Bing organic 链接 (⑤ MOC-186)。Bing 的 `h2 a` href 多为
+/// `bing.com/ck/a?...&u=a1<base64url>&ntb=1` 跳转 (非直链) —— 取 `u` 参数、去 `a1` 前缀、base64url
+/// 解码拿真实落地 URL。少数已是直链则原样返回; 非 http / 解码失败 / 解出非 http (图片/视频等特殊块)
+/// → `None` (调用方跳过)。
+fn decode_bing_href(href: &str) -> Option<String> {
+    if !(href.starts_with("http://") || href.starts_with("https://")) {
+        return None;
+    }
+    if !href.contains("/ck/a") {
+        return Some(href.to_string()); // 已是直链。
+    }
+    use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
+    // 按 query 参数边界取 `u`(不能用字面 split("u=") —— 会被早于真 u 参数、含 "u=" 子串的 key
+    // 如 `&menu=1` 错切到错误段)。从 `?` 后按 `&` 拆 kv, 找 key 恰为 `u` 的值。
+    let u = href
+        .split('?')
+        .nth(1)?
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("u="))?;
+    let b64 = u.strip_prefix("a1").unwrap_or(u);
+    let decoded = String::from_utf8(BASE64_URL_SAFE_NO_PAD.decode(b64).ok()?).ok()?;
+    (decoded.starts_with("http://") || decoded.starts_with("https://")).then_some(decoded)
 }
 
 /// DDG 链接解码: href=`//duckduckgo.com/l/?uddg=<enc>&rut=...` → 解码 `uddg` 真实 URL;
@@ -251,6 +330,49 @@ mod tests {
         ));
     }
 
+    // 最小 Bing 结构 (⑤): 1 ck/a 跳转结果 + 1 直链结果 + 1 图片块(无 h2 a, 应跳过)。
+    const BING_FIXTURE: &str = r##"<html><body><ol id="b_results">
+      <li class="b_algo"><h2><a href="https://www.bing.com/ck/a?!&amp;&amp;u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9h&amp;ntb=1">Example Result</a></h2>
+        <div class="b_caption"><p>An example snippet.</p></div></li>
+      <li class="b_algo"><h2><a href="https://direct.example.org/page">Direct Link</a></h2>
+        <div class="b_caption"><p>Direct snippet.</p></div></li>
+      <li class="b_algo"><a class="thumb" href="/images/search?view=x">img</a></li>
+    </ol></body></html>"##;
+
+    #[test]
+    fn parses_bing_and_decodes_ck_redirect() {
+        let r = parse_bing_html(BING_FIXTURE, 10);
+        // ck/a 跳转 + 直链各 1 条; 图片块(无 h2 a)跳过。
+        assert_eq!(r.len(), 2, "got: {r:?}");
+        assert_eq!(r[0].url, "https://example.com/a"); // ck/a base64url 解码
+        assert_eq!(r[0].title, "Example Result");
+        assert_eq!(r[0].snippet, "An example snippet.");
+        assert_eq!(r[1].url, "https://direct.example.org/page"); // 直链原样
+    }
+
+    #[test]
+    fn decode_bing_href_variants() {
+        // ck/a 跳转 → base64url 解码
+        assert_eq!(
+            decode_bing_href("https://www.bing.com/ck/a?!&&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9h&ntb=1"),
+            Some("https://example.com/a".to_string())
+        );
+        // 直链原样
+        assert_eq!(
+            decode_bing_href("https://direct.org/x"),
+            Some("https://direct.org/x".to_string())
+        );
+        // 相对/非 http → None
+        assert_eq!(decode_bing_href("/images/search"), None);
+        // 早于真 u 参数、含 "u=" 子串的 key(menu=1)不被错切 —— 按 query 边界严格匹配 u。
+        assert_eq!(
+            decode_bing_href(
+                "https://www.bing.com/ck/a?menu=1&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9h&ntb=1"
+            ),
+            Some("https://example.com/a".to_string())
+        );
+    }
+
     /// 端到端真机(需网络 + headless Chrome): 手动
     /// `cargo test -p codex-app-transfer-http --ignored live_ddg` 跑。CI 不跑(无 headless)。
     /// spike 已证 fetch_rendered_html 能过 DDG 拿 11 条 .result__a; 本测验证全链路解码 / 过滤。
@@ -271,5 +393,36 @@ mod tests {
         assert!(results
             .iter()
             .all(|r| !r.url.contains("duckduckgo.com/y.js")));
+    }
+
+    /// ⑤ live (MOC-186): 验证后备引擎 Bing 的 [`parse_bing_html`] 真机解析正确。手动:
+    /// `cargo test -p codex-app-transfer-http live_bing_parse -- --ignored --nocapture`。
+    /// spike 三引擎对比结论: Bing `li.b_algo` 拿 10 条干净直链结果 (Brave 结果掺图片块 + networkIdle
+    /// 超时, Startpage selector 0 命中) → 选 Bing 作 DDG 后备。
+    #[tokio::test]
+    #[ignore = "real network + headless Chrome"]
+    async fn live_bing_parse() {
+        let url = format!(
+            "https://www.bing.com/search?q={}",
+            urlencoding::encode("openai chatgpt plus pricing")
+        );
+        let html = crate::headless::fetch_rendered_html(&url)
+            .await
+            .expect("fetch bing");
+        let results = parse_bing_html(&html, 8);
+        eprintln!("bing parsed {} results:", results.len());
+        for r in &results {
+            let snip: String = r.snippet.chars().take(100).collect();
+            eprintln!("  title={}\n    url={}\n    snip={snip}", r.title, r.url);
+        }
+        assert!(!results.is_empty(), "expected bing organic results");
+        assert!(
+            results.iter().all(|r| r.url.starts_with("http")),
+            "all urls must be absolute direct links"
+        );
+        assert!(
+            results.iter().all(|r| !r.url.contains("bing.com/ck/a")),
+            "ck/a redirects must be decoded to real landing URLs"
+        );
     }
 }

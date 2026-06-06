@@ -121,11 +121,6 @@ async fn chrome_binary_works(_bin: &std::path::Path) -> bool {
     true
 }
 
-// stealth UA 兜底: 仅当读真实 navigator.userAgent 失败时用。优先沿用真实 Chrome UA
-// (去掉 HeadlessChrome 标记), 这里只是 best-effort 退路, 选一个近期稳定版 Chrome。
-const STEALTH_UA_FALLBACK: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-
 // 临时 profile 目录序号: 同进程内多个实例不撞目录 (Chrome 同 profile 会 lock 冲突)。
 static PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -245,7 +240,9 @@ impl HeadlessBrowser {
             .ok()
             .and_then(|r| r.into_value::<String>().ok())
             .map(|ua| ua.replace("HeadlessChrome", "Chrome"))
-            .unwrap_or_else(|| STEALTH_UA_FALLBACK.to_string());
+            // fallback: 读不到真实 UA 时用全 crate 统一的 CHROME_UA (147, 见 impersonating 模块
+            // 版本统一约定) —— 与 wreq 指纹层声称同版本, 不留老版本号被被动反爬识破 (MOC-186)。
+            .unwrap_or_else(|| crate::impersonating::CHROME_UA.to_string());
         if let Err(e) = page.enable_stealth_mode_with_agent(&ua).await {
             eprintln!("[headless] 启用 stealth 失败 (继续抓取): {e}");
         }
