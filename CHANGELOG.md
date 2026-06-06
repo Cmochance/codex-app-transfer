@@ -2,6 +2,10 @@
 
 逐版本要点。
 
+## v2.2.x — 进行中
+
+**web_fetch 大页摘要迭代 (MOC-157)**:在 MOC-156 map-reduce 基础上新增四项改进。① **超时兜底**:map-reduce 某批摘要超时(>90s)→ 丢弃该批、对剩余批继续 reduce、在最终摘要里如实注明"第 X 段超时跳过,可能不完整";全部批均超时才回退原文;非超时硬错误继续整体回退(绝不丢内容)。② **错误文案修正**:区分 reqwest 连接超时("摘要超时")与连接失败(完整 source chain),不再被 reqwest "error sending request" 外层文案误导。③ **关 thinking 提速**:摘要调用复用 registry `compact_disable_thinking_wire` 关掉 reasoning 模型的 CoT(`<think>` 段),大幅提速;支持厂商:MiniMax M3 / Kimi / GLM / MiMo / DeepSeek / Qwen(MiniMax M2.x 不支持,见下)。④ **批大小白名单扩展到 8 厂商**:按 DeepSeek / Kimi / MiMo / GLM / Qwen / MiniMax / Grok / Gemini 系模型名映射真实单批字符上限(替代原四档近似值)。配套:**MiniMax 摘要模型默认推荐 M3**,Settings 页加 warning:若仍用 M2.x,关 thinking 无效、摘要耗时会显著增加。Refs MOC-157。
+
 ## v2.2.1 — 2026-06-04
 
 **auto-review 独立审查模型(MOC-173)**:Codex 的 auto-review(guardian subagent 逐工具调用做风险审批)默认复用主对话模型,速度较慢。供应商配置页「模型映射」下方新增「auto-review 审查模型」下拉(选项仅列当前已配置的非空槽位,不引入重复映射),设置后 transfer 在 Codex model catalog 的每个 entry 写入 `auto_review_model_override`,让审查流量复用所选槽位的现有 proxy 映射(通常指向快 / 便宜模型)、与主对话分流;留空 = 跟随主模型。Codex 0.137.0-alpha.4 抓包实证:设置后审查请求 `model` 字段即切换到指定槽位。Refs MOC-173。
