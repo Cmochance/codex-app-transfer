@@ -346,10 +346,19 @@ pub fn convert_responses_tool_to_chat_tool(
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let parameters = obj
+            let mut parameters = obj
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| json!({"type":"object","properties":{},"required":[]}));
+            // tool_search 也合成 strict:false 的 chat function;与 function 分支同样要补
+            // 缺失的 required —— 透传 Codex 给的 parameters 若 all-optional/缺 required,
+            // 同样会被严格中转网关 400 拒(MOC-188 同源,review 反馈)。先确保顶层
+            // type:object,再补 required:[](恒 strict:false,故无条件补)。
+            if let Some(po) = parameters.as_object_mut() {
+                po.entry("type")
+                    .or_insert_with(|| Value::String("object".into()));
+            }
+            crate::core::schema::ensure_object_schema_required(&mut parameters);
             vec![json!({
                 "type": "function",
                 "function": {

@@ -1008,6 +1008,31 @@ fn namespace_inner_function_missing_required_gets_empty_array() {
 }
 
 #[test]
+fn tool_search_missing_required_gets_empty_array() {
+    // tool_search 分支也合成 strict:false 的 chat function;Codex 给的 parameters 若
+    // 缺 required(all-optional)同样要补,否则经严格网关 400(MOC-188 同源,review 反馈)。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "discovery",
+            "parameters": {"type":"object","properties":{"query":{"type":"string"}}}
+        }]
+    });
+    let out = convert(req);
+    let func = &out["tools"][0]["function"];
+    assert_eq!(func["name"], "tool_search");
+    assert_eq!(
+        func["parameters"]["required"],
+        json!([]),
+        "tool_search 缺 required 也必须补"
+    );
+}
+
+#[test]
 fn namespace_alongside_top_level_function_both_kept() {
     // 实测真实场景:tools 数组同时含顶级 function + namespace 包,展平
     // 后总数 = 顶级 function 数 + 所有 namespace 内层 function 数
