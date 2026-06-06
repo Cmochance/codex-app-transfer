@@ -961,13 +961,15 @@ pub(crate) fn build_chatgpt_backend_trace_value(input: &ForwardTraceInput, seq: 
         "seq": seq,
         "inbound": {
             "method": input.method,
-            "client_path": input.client_path,
-            "client_query": input.client_query,
+            // [codex P2] query 里的 credential(?code= / ?access_token= / ?key= / ?sid= 等)脱敏 ——
+            // backend-api(OAuth callback / wham 等)的 query 可能带 token,原样落 jsonl/viewer 会泄漏。
+            "client_path": redact_credential_params(input.client_path).0,
+            "client_query": input.client_query.map(|q| redact_credential_params(q).0),
             "headers": headers_to_json_passthrough(input.inbound_headers),
             "body": redact_body(input.inbound_body, header_content_type(input.inbound_headers)),
         },
         "outbound": {
-            "url": input.upstream_url,
+            "url": redact_credential_params(input.upstream_url).0,
             "headers": headers_to_json_passthrough(input.outbound_headers),
             "body": redact_body(input.outbound_body, header_content_type(input.outbound_headers)),
         },
@@ -1102,6 +1104,43 @@ mod tests {
         assert!(!s.contains("LEAK1"), "x-cookie 真值泄漏: {s}");
         assert!(!s.contains("LEAK2"), "x-api-key 真值泄漏: {s}");
         assert!(s.contains("codex/1.0"), "协议头 user-agent 应保留真值");
+    }
+
+    #[test]
+    fn passthrough_trace_redacts_query_credentials() {
+        // [codex P2] client_path / upstream_url 的 query credential 不得原样落 trace。
+        let h = reqwest::header::HeaderMap::new();
+        let input = ForwardTraceInput {
+            method: "GET",
+            client_path: "/backend-api/cb?code=AUTHLEAK&access_token=ATLEAK&scope=read",
+            client_query: None,
+            inbound_headers: &h,
+            inbound_body: b"",
+            upstream_url: "https://chatgpt.com/backend-api/cb?code=AUTHLEAK&key=GKEYLEAK",
+            outbound_headers: &h,
+            outbound_body: b"",
+            status: 200,
+            response_headers: &h,
+            response_body: b"",
+            response_full_len: 0,
+            provider_id: "chatgpt-backend",
+            provider_name: "x",
+            api_format: "x",
+            auth_scheme: "-",
+            original_model: None,
+            resolved_model: None,
+            upstream_model: None,
+        };
+        let s = serde_json::to_string(&build_chatgpt_backend_trace_value(&input, 1)).unwrap();
+        assert!(
+            !s.contains("AUTHLEAK") && !s.contains("ATLEAK") && !s.contains("GKEYLEAK"),
+            "query credential 泄漏: {s}"
+        );
+        assert!(
+            s.contains("scope=read"),
+            "非 credential query(scope)应保留: {s}"
+        );
+        assert!(s.contains("code=***"), "code 应脱敏: {s}");
     }
 
     #[test]
