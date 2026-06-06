@@ -208,6 +208,17 @@ pub fn convert_responses_tool_to_chat_tool(
                 }
             }
             let strict = obj.get("strict").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Codex 部分内置工具(list_mcp_resources / load_workspace_dependencies /
+            // read_thread_terminal 等,参数全 optional 或无参)的 parameters schema 省略了
+            // `required` 数组。OpenAI / DeepSeek 官方等宽容上游默认当空集放行;但严格 OpenAI
+            // 兼容中转网关(如 AIOHub)的 validator 要求 object schema 显式带 `required`,读到
+            // 缺失字段得 null → 报 `null is not of type "array"` 把整轮请求 400 拒掉
+            // (MOC-188,用户反馈 fb-63e74a8a)。统一补 `required:[]`(语义中性,对宽容上游
+            // no-op)。`strict:true` 工具按 OpenAI 规范须 required 列全 properties,补空反而
+            // 违规 → 仅 non-strict 补,strict 工具原样透传(详见 core::schema 文档)。
+            if !strict {
+                crate::core::schema::ensure_object_schema_required(&mut parameters);
+            }
             vec![json!({
                 "type": "function",
                 "function": {
@@ -335,10 +346,19 @@ pub fn convert_responses_tool_to_chat_tool(
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let parameters = obj
+            let mut parameters = obj
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| json!({"type":"object","properties":{},"required":[]}));
+            // tool_search 也合成 strict:false 的 chat function;与 function 分支同样要补
+            // 缺失的 required —— 透传 Codex 给的 parameters 若 all-optional/缺 required,
+            // 同样会被严格中转网关 400 拒(MOC-188 同源,review 反馈)。先确保顶层
+            // type:object,再补 required:[](恒 strict:false,故无条件补)。
+            if let Some(po) = parameters.as_object_mut() {
+                po.entry("type")
+                    .or_insert_with(|| Value::String("object".into()));
+            }
+            crate::core::schema::ensure_object_schema_required(&mut parameters);
             vec![json!({
                 "type": "function",
                 "function": {

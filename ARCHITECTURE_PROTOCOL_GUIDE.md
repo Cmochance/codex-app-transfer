@@ -11,6 +11,7 @@
   - 路由归一化与本地路径判断（`core/routes.rs`）
   - 输入侧会话恢复与历史拼接（`core/input.rs`）
   - Responses SSE 事件拼装（`core/events.rs`）
+  - JSON Schema 规范化工具（`core/schema.rs`）：`ensure_object_schema_required`，给 `type:object` 节点递归补缺失的 `required:[]`，用于向严格 OpenAI 兼容中转网关发送合规 function tool schema（MOC-188）
 - `mapper`：协议/供应商相关映射逻辑
   - `chat`：Responses <-> Chat 侧映射
   - `gemini_native`：Gemini native 请求/响应映射

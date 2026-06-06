@@ -900,6 +900,138 @@ fn namespace_with_two_inner_functions_flattens_to_two_function_tools() {
     );
 }
 
+// ── MOC-188: function tool parameters 缺 `required` 数组的 strict-aware 补全 ──
+// 严格 OpenAI 兼容中转网关(AIOHub 等)要求 object schema 显式带 required,缺失会被
+// 400 拒(`null is not of type "array"`)。helper 的单元边界见 core/schema.rs;这里
+// 覆盖 function 分支端到端、按 strict 把关的行为。
+
+#[test]
+fn function_tool_missing_required_gets_empty_array_when_not_strict() {
+    // list_mcp_resources 真实形态:strict:false、有 properties、无 required。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"function","name":"list_mcp_resources",
+             "description":"Lists resources provided by MCP servers.",
+             "parameters":{"type":"object","properties":{
+                "cursor":{"type":"string"},"server":{"type":"string"}},
+                "additionalProperties":false},
+             "strict":false}
+        ]
+    });
+    let out = convert(req);
+    let func = &out["tools"][0]["function"];
+    assert_eq!(func["name"], "list_mcp_resources");
+    assert_eq!(
+        func["parameters"]["required"],
+        json!([]),
+        "strict:false 缺 required 的 function tool 必须补 required:[]"
+    );
+    // properties 原样保留,不被改
+    assert!(func["parameters"]["properties"]["cursor"].is_object());
+}
+
+#[test]
+fn function_tool_strict_true_missing_required_left_untouched() {
+    // strict:true 工具按 OpenAI 规范须 required 列全 properties,补空数组反而违规 →
+    // 原样透传,把校验留给上游。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"function","name":"strict_tool",
+             "description":"",
+             "parameters":{"type":"object","properties":{"x":{"type":"string"}}},
+             "strict":true}
+        ]
+    });
+    let out = convert(req);
+    assert!(
+        out["tools"][0]["function"]["parameters"]
+            .get("required")
+            .is_none(),
+        "strict:true 工具缺 required 不应被补"
+    );
+}
+
+#[test]
+fn function_tool_existing_required_preserved() {
+    // 已带 required:helper 是 no-op。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"function","name":"search",
+             "description":"",
+             "parameters":{"type":"object","properties":{
+                "query":{"type":"string"}},"required":["query"]},
+             "strict":false}
+        ]
+    });
+    let out = convert(req);
+    assert_eq!(
+        out["tools"][0]["function"]["parameters"]["required"],
+        json!(["query"]),
+        "已有 required 必须原样保留"
+    );
+}
+
+#[test]
+fn namespace_inner_function_missing_required_gets_empty_array() {
+    // MOC-188 真实受害类:MCP server 工具包在 namespace 里,展平后内层 function 缺
+    // required 同样要被补(端到端锁定 namespace 递归 → function 分支 → helper 这条链路)。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"namespace","name":"mcp__notion__","tools":[
+                {"type":"function","name":"notion_search",
+                 "description":"Search.",
+                 "parameters":{"type":"object","properties":{},"additionalProperties":false},
+                 "strict":false}
+            ]}
+        ]
+    });
+    let out = convert(req);
+    let tool = &out["tools"][0];
+    assert_eq!(tool["function"]["name"], "notion_search");
+    assert_eq!(
+        tool["function"]["parameters"]["required"],
+        json!([]),
+        "namespace 展平后的内层 function 缺 required 也必须补"
+    );
+}
+
+#[test]
+fn tool_search_missing_required_gets_empty_array() {
+    // tool_search 分支也合成 strict:false 的 chat function;Codex 给的 parameters 若
+    // 缺 required(all-optional)同样要补,否则经严格网关 400(MOC-188 同源,review 反馈)。
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [{
+            "type": "tool_search",
+            "execution": "client",
+            "description": "discovery",
+            "parameters": {"type":"object","properties":{"query":{"type":"string"}}}
+        }]
+    });
+    let out = convert(req);
+    let func = &out["tools"][0]["function"];
+    assert_eq!(func["name"], "tool_search");
+    assert_eq!(
+        func["parameters"]["required"],
+        json!([]),
+        "tool_search 缺 required 也必须补"
+    );
+}
+
 #[test]
 fn namespace_alongside_top_level_function_both_kept() {
     // 实测真实场景:tools 数组同时含顶级 function + namespace 包,展平

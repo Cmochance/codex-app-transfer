@@ -261,6 +261,10 @@ v2.1.5 and earlier did not convert `role=system` to `role=user`, causing MiniMax
 
 During automatic context compaction, the proxy used to truncate oversized tool-call arguments by replacing `function.arguments` with a human-readable "shortened" notice, which violates the OpenAI chat protocol (`arguments` must be a valid JSON string), so strict upstreams like MiniMax returned `400 invalid params, invalid function arguments json string ... (2013)`. Fixed in #356: truncated `arguments` stays a valid JSON object, so compaction saves tokens without breaking the protocol.
 
+### Strict OpenAI-compatible relay gateway (AIOHub, etc.) returns 400: `null is not of type "array"`
+
+Some Codex built-in tools (e.g. `list_mcp_resources` / `load_workspace_dependencies` / `read_thread_terminal` — all-optional or no-parameter tools) omit the `required` array from their parameters schema. Lenient upstreams like OpenAI or DeepSeek treat a missing `required` as an empty set and accept the request; but strict OpenAI-compatible relay gateways (e.g. AIOHub) require every `object` schema to carry an explicit `required` array and return `null is not of type "array"` as a 400, rejecting the entire request. **Fixed in v2.2.2+ (MOC-188)**: the conversion path now fills in `required: []` wherever it is missing from an object schema (semantically neutral — a no-op for lenient upstreams). Routing through such strict gateways no longer fails due to missing schema fields.
+
 ### Upstream 404 / can't connect (Base URL includes the full endpoint)
 
 Set the provider Base URL to the root or `/v1` only (e.g. `https://api.example.com/v1`); do **not** paste the full endpoint path. The tool appends `/chat/completions`, `/v1/messages`, or `/responses` per protocol automatically. If the Base URL already ends with one of these (e.g. pasting `https://opencode.ai/zen/go/v1/chat/completions` verbatim), the path doubles into `…/chat/completions/chat/completions` and the upstream returns 404. Trim the extra endpoint suffix and keep it at `/v1`.
