@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 ///
 /// - **只补、不改、不删**：用 entry-or-insert，已有 `required` / `properties`（无论
 ///   空非空）一律不动 → 对本就合规的工具是 no-op。
-/// - **只认 `type=="object"` 的 schema 节点**补 required/properties，不给 string /
+/// - **只认 object schema 节点**（`type=="object"`，或 `type` 数组含 `"object"` 的
+///   nullable 形态如 `["object","null"]`）补 required/properties，不给 string /
 ///   number / array 等节点乱加。
 /// - **白名单递归**：只下钻确定承载子 schema 的字段（`properties.*` / `items` /
 ///   `prefixItems` / `$defs` / `definitions` / `anyOf` / `oneOf` / `allOf` / object
@@ -29,7 +30,7 @@ use serde_json::{json, Value};
 /// - **strict 由调用方把关**：`strict:true` 工具按 OpenAI 规范要求 `required` 列全所有
 ///   properties，补空数组反而违规，故调用方仅在 `strict==false` 时调用本 fn
 ///   （`strict:true` 工具的 schema 本应自带完整 required，原样透传）。
-/// - **顶层 `type`**：本 fn 自身只对 `type=="object"` 节点补 required，对顶层无 type 的
+/// - **顶层 `type`**：本 fn 自身只对 object schema 节点（见上）补 required，对顶层无 type 的
 ///   输入安全降级为不补（只漏补、不错补，helper 正确性不依赖调用方）。集成到 chat 路径时
 ///   调用方（`tools.rs::convert_responses_tool_to_chat_tool`）已先把 object 形态 parameters
 ///   顶层补成 `type:"object"`，故该降级分支在实际调用中不触发，仅作单元级防御。
@@ -47,7 +48,15 @@ fn ensure_object_schema_required_inplace(node: &mut Value, depth: usize) {
         return;
     };
 
-    if obj.get("type").and_then(|v| v.as_str()) == Some("object") {
+    // type 是标量 "object",或 union 数组含 "object"(nullable object,如
+    // `["object","null"]` —— 某些 schema 生成器的 Optional 表达);两者 non-null 实例
+    // 都是 object schema,严格 validator 同样要求 required(MOC-188 review P2)。
+    let is_object_schema = match obj.get("type") {
+        Some(Value::String(s)) => s == "object",
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("object")),
+        _ => false,
+    };
+    if is_object_schema {
         obj.entry("properties").or_insert_with(|| json!({}));
         obj.entry("required").or_insert_with(|| json!([]));
     }
@@ -155,6 +164,19 @@ mod tests {
         let mut array_schema = json!({"type": "array", "items": {"type": "string"}});
         ensure_object_schema_required(&mut array_schema);
         assert!(array_schema.get("required").is_none());
+    }
+
+    #[test]
+    fn union_object_null_type_gets_required() {
+        // nullable object：type 数组含 "object"（如 ["object","null"]，某些 schema
+        // 生成器的 Optional 表达）仍是 object schema，non-null 实例需带 required。
+        let mut s = json!({"type": ["object", "null"], "properties": {"x": {"type": "string"}}});
+        ensure_object_schema_required(&mut s);
+        assert_eq!(s["required"], json!([]));
+        // 纯非 object 的 union（如 ["string","null"]）不补
+        let mut s2 = json!({"type": ["string", "null"]});
+        ensure_object_schema_required(&mut s2);
+        assert!(s2.get("required").is_none());
     }
 
     #[test]
