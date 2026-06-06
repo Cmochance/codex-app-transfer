@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use codex_app_transfer_http::{WebFetchBackend, WebFetchOutcome};
+use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
@@ -53,6 +54,9 @@ const MAX_CONCURRENT_FETCHES: usize = 4;
 const SUMMARY_INPUT_CHARS: usize = 60_000;
 /// 调总结模型的超时。略宽于一般补全(慢 provider / 长正文)。
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(90);
+/// map-reduce 的 map 阶段并发上限(MOC-157 / chatgpt-codex P1): 限同时打到 proxy / 上游的摘要请求
+/// 数, 防超大页(几百批)打爆本地 proxy / 触发上游 rate limit。`buffered` 保序 + 限并发。
+const MAX_MAP_CONCURRENCY: usize = 4;
 
 /// 入口: 读 stdin 逐行 JSON-RPC, 派发到 tokio runtime, 经单写线程串行写 stdout。
 ///
@@ -748,16 +752,10 @@ struct CallError {
 }
 
 async fn summarize_call(
+    client: &reqwest::Client,
     instruction: &str,
     cfg: &SummaryConfig,
 ) -> Result<(String, u128), CallError> {
-    let client = reqwest::Client::builder()
-        .timeout(SUMMARY_TIMEOUT)
-        .build()
-        .map_err(|e| CallError {
-            timeout: false,
-            msg: format!("建 HTTP client 失败: {e}"),
-        })?;
     let endpoint = format!("http://127.0.0.1:{}/v1/chat/completions", cfg.proxy_port);
     let mut body = json!({
         "model": cfg.model.clone(),
@@ -861,6 +859,7 @@ fn build_reduce_instruction(prompt: &str, partials: &str) -> String {
 /// repack(批 = `batch` 填满, 非小固定块)把调用数压到个位数(借鉴 LlamaIndex compact / LangChain
 /// map-reduce, 调研见 Linear MOC-157)。
 async fn summarize_map_reduce(
+    client: &reqwest::Client,
     content: &str,
     prompt: &str,
     cfg: &SummaryConfig,
@@ -869,12 +868,24 @@ async fn summarize_map_reduce(
     let batches = chunk_markdown(content, batch); // repack: 段落打包填满批
     let n_batches = batches.len();
     let t0 = Instant::now();
-    // map: 每批摘要**并行**(A, MOC-157)—— N 批互不依赖, 串行会累加每批 mimo 延迟、整体超
-    // Codex tool_timeout(实测 5 批串行 347s)。并行后整体 ≈ max(单批) + reduce。
-    let map_results = futures::future::join_all(batches.iter().enumerate().map(|(i, b)| {
-        let inst = build_map_instruction(prompt, b, i + 1, n_batches);
-        async move { summarize_call(&inst, cfg).await }
-    }))
+    // map: 每批摘要并行(A, MOC-157)—— N 批互不依赖, 串行会累加延迟、整体超 Codex tool_timeout
+    // (实测 5 批串行 347s)。**限并发到 MAX_MAP_CONCURRENCY**(chatgpt-codex P1): 超大页 + 小批
+    // 模型可切出几百批, 全 join_all 会几百并发撞 proxy / 上游 rate limit。`buffered` 保序(reduce
+    // 按序合并 + timed_out 序号正确)+ 限并发。
+    // 预先算各批 instruction(owned), 再 stream —— async block 借用 batches 元素会引发 HRTB
+    // (FnOnce not general enough), 故先 collect 成 owned String 再 move 进 future。
+    let insts: Vec<String> = batches
+        .iter()
+        .enumerate()
+        .map(|(i, b)| build_map_instruction(prompt, b, i + 1, n_batches))
+        .collect();
+    let map_results: Vec<_> = futures::stream::iter(
+        insts
+            .into_iter()
+            .map(|inst| async move { summarize_call(client, &inst, cfg).await }),
+    )
+    .buffered(MAX_MAP_CONCURRENCY)
+    .collect()
     .await;
     let mut summaries: Vec<String> = Vec::with_capacity(n_batches);
     let mut timed_out: Vec<usize> = Vec::new(); // 超时被丢弃的批序号(1-based)
@@ -906,7 +917,9 @@ async fn summarize_map_reduce(
         let combined = summaries.join("\n\n---\n\n");
         if combined.chars().count() <= batch {
             last_inst = build_reduce_instruction(prompt, &combined);
-            let (resp, _) = summarize_call(&last_inst, cfg).await.map_err(|e| e.msg)?;
+            let (resp, _) = summarize_call(client, &last_inst, cfg)
+                .await
+                .map_err(|e| e.msg)?;
             break resp;
         }
         // collapse: 当前各摘要按 batch 分组, 每组 reduce 一次 → 更短的摘要列表, 再循环。
@@ -915,7 +928,9 @@ async fn summarize_map_reduce(
         for s in summaries.drain(..) {
             if !group.is_empty() && group.chars().count() + s.chars().count() > batch {
                 let inst = build_reduce_instruction(prompt, &group);
-                let (resp, _) = summarize_call(&inst, cfg).await.map_err(|e| e.msg)?;
+                let (resp, _) = summarize_call(client, &inst, cfg)
+                    .await
+                    .map_err(|e| e.msg)?;
                 collapsed.push(resp);
                 group.clear();
             }
@@ -926,7 +941,9 @@ async fn summarize_map_reduce(
         }
         if !group.is_empty() {
             let inst = build_reduce_instruction(prompt, &group);
-            let (resp, _) = summarize_call(&inst, cfg).await.map_err(|e| e.msg)?;
+            let (resp, _) = summarize_call(client, &inst, cfg)
+                .await
+                .map_err(|e| e.msg)?;
             collapsed.push(resp);
         }
         summaries = collapsed;
@@ -992,10 +1009,15 @@ async fn summarize(content: &str, prompt: &str) -> Result<SummarizeOutcome, Stri
             cfg.api_format
         ));
     }
+    // 共享一个 reqwest client(复用连接池, 避免 map-reduce 每批新建 N 个 client —— chatgpt-codex P1)。
+    let client = reqwest::Client::builder()
+        .timeout(SUMMARY_TIMEOUT)
+        .build()
+        .map_err(|e| format!("建 HTTP client 失败: {e}"))?;
     let batch = batch_chars_for_model(&cfg.model);
     // 超批 + 全覆盖诉求 → map-reduce(全覆盖); 普通查询不会进这里(免烧 N 次)。
     if content.chars().count() > batch && is_exhaustive_summary(prompt) {
-        return summarize_map_reduce(content, prompt, &cfg, batch).await;
+        return summarize_map_reduce(&client, content, prompt, &cfg, batch).await;
     }
     // top-K / stuff: 选块(≤batch 原样、>batch 相关性选块)→ 单次摘要。
     let (capped, selected, picked, total_chunks) = select_relevant_content(content, prompt, batch);
@@ -1010,7 +1032,7 @@ async fn summarize(content: &str, prompt: &str) -> Result<SummarizeOutcome, Stri
         String::new()
     };
     let instruction = build_summary_instruction(prompt, &capped, &trunc_hint);
-    let (out, latency_ms) = summarize_call(&instruction, &cfg)
+    let (out, latency_ms) = summarize_call(&client, &instruction, &cfg)
         .await
         .map_err(|e| e.msg)?;
     // 做了相关性选块时也给 Codex 带一句, 避免拿"基于部分正文的摘要"当完整答案。
