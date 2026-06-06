@@ -1002,73 +1002,104 @@ fn location_is_global(lower: &str, loc_start: usize) -> bool {
     }
 }
 
-/// `pos` 是否落在 JS 注释内 —— 行注释 `//`(同行 pos 前出现)或块注释 `/* … */`(最近的 `/*`
-/// 之后到 pos 未闭合)。简化: 不排除字符串字面量里的 `//`(占位页场景足够; 误判方向是"不跟随",
-/// 保守安全, chatgpt review)。入参已小写。
-fn in_js_comment(s: &str, pos: usize) -> bool {
-    let before = &s[..pos];
-    // 行注释: 同行(最后一个换行之后)在 pos 前出现 `//`。
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    if before[line_start..].contains("//") {
-        return true;
+/// 提取所有 `<script>...</script>` 的内容(开标签 `>` 到 `</script>` 之间; 忽略属性)。
+fn script_contents(html: &str) -> Vec<&str> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<script") {
+        let tag = from + rel;
+        let Some(gt) = lower[tag..].find('>') else {
+            break;
+        };
+        let cstart = tag + gt + 1;
+        let Some(close_rel) = lower[cstart..].find("</script>") else {
+            break;
+        };
+        let cend = cstart + close_rel;
+        out.push(&html[cstart..cend]);
+        from = cend + "</script>".len();
     }
-    // 块注释: 最近的 `/*` 之后(到 pos)没有 `*/`。
-    if let Some(open) = before.rfind("/*") {
-        if !before[open..].contains("*/") {
-            return true;
-        }
-    }
-    false
+    out
 }
 
-/// 解析 JS 跳转: `location.replace('T')` / `location.assign('T')` / `location[.href] = 'T'`
-/// (`window.`/`document.` 前缀 + **等号周围空格**容忍, 排除 `==` 比较)。URL 须 `http` / `/` 开头。
-/// 遍历每个 `location` token(经 `location_is_global` 限浏览器全局, 排除对象属性 + 子串误命中)。
-fn parse_js_location(html: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(rel) = lower[from..].find("location") {
-        let start = from + rel;
-        from = start + "location".len();
-        // 边界: 须是浏览器全局 location(可触发导航)—— bare `location` 或 `window.`/`document.`
-        // 等前缀。排除 `allocation`/`geolocation` 子串 + `config.location`/`router.location` 等对象
-        // 属性(chatgpt review)。
-        if !location_is_global(&lower, start) {
-            continue;
+/// 从字符串字面量开引号下标 `i` 跳到结束引号之后(处理 `\` 转义); 返回结束后的下标。
+fn skip_js_string(bytes: &[u8], i: usize) -> usize {
+    let quote = bytes[i];
+    let n = bytes.len();
+    let mut j = i + 1;
+    while j < n {
+        match bytes[j] {
+            b'\\' => j += 2,
+            c if c == quote => return j + 1,
+            _ => j += 1,
         }
-        // 注释里的 location 不是可执行跳转(`// location=...` 行注释 / `/* ... */` 块注释,
-        // chatgpt review)。
-        if in_js_comment(&lower, start) {
-            continue;
-        }
-        let after = &html[from..];
-        let after_lo = &lower[from..];
-        // ① 函数调用: location.replace(...) / location.assign(...)。
-        if after_lo.starts_with(".replace(") || after_lo.starts_with(".assign(") {
-            if let Some(u) = first_quoted_url(after) {
-                return Some(u);
+    }
+    n
+}
+
+/// 在一段 JS 代码内扫浏览器全局 `location` 的赋值/调用目标 URL —— **状态机跳过字符串字面量 +
+/// 行/块注释**, 避免把注释里的 `location`、或 URL 字面量里的 `//` 误判(chatgpt review)。
+fn scan_js_for_location(js: &str) -> Option<String> {
+    let lower = js.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_js_string(bytes, i),
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                i = bytes[i..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(n, |p| i + p);
             }
-            continue;
-        }
-        // ② 赋值: location.href = 'T' 或 location = 'T'(容忍等号空格 + 引号须紧跟, 排除 == 比较)。
-        let rest = if after_lo.starts_with(".href") {
-            &after[".href".len()..]
-        } else {
-            after
-        };
-        if let Some(v) = rest.trim_start().strip_prefix('=') {
-            let v = v.trim_start();
-            if v.starts_with('=') {
-                continue; // `==` 比较, 非赋值
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i = lower[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2);
             }
-            if v.starts_with(['"', '\'']) {
-                if let Some(u) = first_quoted_url(v) {
-                    return Some(u);
+            _ => {
+                if lower[i..].starts_with("location") && location_is_global(&lower, i) {
+                    if let Some(u) = location_target(js, &lower, i + "location".len()) {
+                        return Some(u);
+                    }
                 }
+                i += 1;
             }
         }
     }
     None
+}
+
+/// `location` token 之后(偏移 `after`)解析跳转目标: `.replace('T')` / `.assign('T')` /
+/// `[.href] = 'T'`(容忍等号空格, 排除 `==` 比较)。URL 须 `http` / `/` 开头。
+fn location_target(js: &str, lower: &str, after: usize) -> Option<String> {
+    let tail = &js[after..];
+    let tail_lo = &lower[after..];
+    if tail_lo.starts_with(".replace(") || tail_lo.starts_with(".assign(") {
+        return first_quoted_url(tail);
+    }
+    let rest = if tail_lo.starts_with(".href") {
+        &tail[".href".len()..]
+    } else {
+        tail
+    };
+    let v = rest.trim_start().strip_prefix('=')?.trim_start();
+    if v.starts_with('=') {
+        return None; // `==` 比较, 非赋值
+    }
+    if v.starts_with(['"', '\'']) {
+        return first_quoted_url(v);
+    }
+    None
+}
+
+/// 解析 JS 客户端重定向(meta refresh 之外): **只在 `<script>` 内容内**、用状态机跳过字符串 +
+/// 注释后, 找浏览器全局 `location` 的赋值/调用。取第一个命中(chatgpt review: 限 script tag +
+/// 字符串/注释感知, 避免正文 / 注释 / URL 字面量误判)。
+fn parse_js_location(html: &str) -> Option<String> {
+    script_contents(html)
+        .into_iter()
+        .find_map(scan_js_for_location)
 }
 
 /// 取 `s` 中第一个引号包裹、`http`/`/` 开头的 URL(用于 JS 跳转目标提取)。
@@ -1226,6 +1257,17 @@ mod tests {
             parse_js_location("<script>/* old */ location.replace('https://e.com/h')</script>")
                 .as_deref(),
             Some("https://e.com/h")
+        );
+        // 正文(非 <script>)里的 location 不扫(chatgpt review 第 6 轮)
+        assert_eq!(
+            parse_js_location("<p>set your location = \"/settings\" here</p>"),
+            None
+        );
+        // 同行 URL 字面量(含 //)后的真跳转仍识别 —— 状态机跳字符串、不当注释(chatgpt review 第 6 轮)
+        assert_eq!(
+            parse_js_location("<script>const u=\"https://e.com\"; location=\"/next\"</script>")
+                .as_deref(),
+            Some("/next")
         );
     }
 
