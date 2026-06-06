@@ -694,10 +694,12 @@ fn batch_chars_for_model(model: &str) -> usize {
 }
 
 /// prompt 是否"全覆盖摘要"诉求(总结整篇)—— 决定走 map-reduce(全覆盖)还是 top-K(找特定信息)。
-/// 空 prompt(纯 web_fetch 无具体诉求)也视为全覆盖。MOC-157 意图路由(业界标准: 摘要型走全覆盖、
-/// 查询型走 top-K)。
+/// MOC-157 意图路由(业界标准: 摘要型走全覆盖、查询型走 top-K)。
 fn is_exhaustive_summary(prompt: &str) -> bool {
     let p = prompt.trim().to_lowercase();
+    // 空 prompt 视为全覆盖。**注意**: `handle_web_fetch_call` 拒空 prompt(schema 把 prompt 列
+    // required, MOC-152), 故经 web_fetch 进来的 prompt 恒非空、本分支实际不可达 —— 保留是纯防御
+    // (将来若放开 prompt 可选, 空=全覆盖语义正确); 不对外宣传"无 prompt 走 map-reduce"(chatgpt-codex P2)。
     if p.is_empty() {
         return true;
     }
