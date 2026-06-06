@@ -23,10 +23,11 @@ use serde_json::{json, Value};
 /// - **只认 object schema 节点**（`type=="object"`，或 `type` 数组含 `"object"` 的
 ///   nullable 形态如 `["object","null"]`）补 required/properties，不给 string /
 ///   number / array 等节点乱加。
-/// - **白名单递归**：只下钻确定承载子 schema 的字段（`properties.*` / `items` /
-///   `prefixItems` / `$defs` / `definitions` / `anyOf` / `oneOf` / `allOf` / object
-///   形态的 `additionalProperties`），**不进** `default` / `const` / `examples` /
-///   `enum` 等"数据"字段 —— 避免把恰好长得像 schema 的用户数据误当 schema 补字段。
+/// - **白名单递归**：只下钻确定承载子 schema 的字段（`properties.*` /
+///   `patternProperties.*` / `items` / `prefixItems` / `$defs` / `definitions` /
+///   `anyOf` / `oneOf` / `allOf` / object 形态的 `additionalProperties`），**不进**
+///   `default` / `const` / `examples` / `enum` 等"数据"字段 —— 避免把恰好长得像
+///   schema 的用户数据误当 schema 补字段。
 /// - **strict 由调用方把关**：`strict:true` 工具按 OpenAI 规范要求 `required` 列全所有
 ///   properties，补空数组反而违规，故调用方仅在 `strict==false` 时调用本 fn
 ///   （`strict:true` 工具的 schema 本应自带完整 required，原样透传）。
@@ -64,6 +65,13 @@ fn ensure_object_schema_required_inplace(node: &mut Value, depth: usize) {
     // ── 白名单递归：只下钻确定承载子 schema 的字段，不碰 default/const/examples 等数据 ──
     if let Some(Value::Object(props)) = obj.get_mut("properties") {
         for (_k, v) in props.iter_mut() {
+            ensure_object_schema_required_inplace(v, depth + 1);
+        }
+    }
+    // patternProperties：regex key → 子 schema(dynamic-key map 的另一种表达,与
+    // additionalProperties 并列);遍历 value 子 schema 递归。
+    if let Some(Value::Object(pp)) = obj.get_mut("patternProperties") {
+        for (_k, v) in pp.iter_mut() {
             ensure_object_schema_required_inplace(v, depth + 1);
         }
     }
@@ -221,6 +229,8 @@ mod tests {
             "properties": {
                 // additionalProperties 是子 schema（map 形态参数）→ 递归补
                 "dict": {"type": "object", "additionalProperties": {"type": "object", "properties": {}}},
+                // patternProperties：regex key → 子 schema（与 additionalProperties 并列的 map 表达）
+                "pat": {"type": "object", "patternProperties": {"^x$": {"type": "object", "properties": {}}}},
                 // items 数组形态（draft-07 tuple）：object 元素补、标量元素不补
                 "tup": {"type": "array", "items": [{"type": "object", "properties": {}}, {"type": "string"}]},
                 // prefixItems（2020-12 tuple）
@@ -230,6 +240,10 @@ mod tests {
         ensure_object_schema_required(&mut s);
         assert_eq!(
             s["properties"]["dict"]["additionalProperties"]["required"],
+            json!([])
+        );
+        assert_eq!(
+            s["properties"]["pat"]["patternProperties"]["^x$"]["required"],
             json!([])
         );
         assert_eq!(s["properties"]["tup"]["items"][0]["required"], json!([]));
