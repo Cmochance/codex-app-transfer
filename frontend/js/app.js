@@ -915,14 +915,18 @@
   }
 
   function collectProviderMappingsWithCustom() {
-    // [MOC-154] 列表式:行序 → Codex slot。行0 的模型同时占 gpt_5_5 + default
-    // (Codex 新对话默认 gpt-5.5 直接用它);其余行依次填 gpt_5_4/.../gpt_5_2。
+    // [MOC-154] 行序 → Codex slot:行0 的模型同时占 gpt_5_5 + default(Codex 新对话默认
+    // gpt-5.5 直接用它);其余行依次填 gpt_5_4/.../gpt_5_2。
+    // **输出全部 slot key(空的也给空串)**:删行/清空某行后该 slot="" 才能覆盖后端已存的
+    // 旧值 —— update_provider 对 models 是 per-key merge(crud.rs:413,input 无条件覆盖
+    // existing、含空串),漏给某 key = 旧值残留磁盘 + Codex catalog(chatgpt-codex-connector
+    // 发现)。catalog 生成时空 slot 仍会跳过、不显示。
+    const slotKeys = providerFormDefaultRows.filter((k) => k !== "default"); // gpt_5_5..gpt_5_2
     const result = {};
-    providerFormRows.forEach((rowKey) => {
-      const val = String(providerFormMappings[rowKey] || "").trim();
-      if (val) result[rowKey] = val;
+    slotKeys.forEach((k) => {
+      result[k] = String(providerFormMappings[k] || "").trim();
     });
-    if (result.gpt_5_5) result.default = result.gpt_5_5;
+    result.default = result.gpt_5_5 || "";
     return result;
   }
 
