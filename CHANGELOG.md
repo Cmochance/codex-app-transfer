@@ -2,6 +2,10 @@
 
 逐版本要点。
 
+## v2.2.x — 进行中
+
+**web_fetch 大页摘要 map-reduce 全覆盖 + 模型批大小白名单 (MOC-157)**:大页摘要新增 **map-reduce 全覆盖路径** —— 当 prompt 为"总结整篇 / 全文概览"类诉求,或调用方未带 prompt 时,全文拆成多批、每批独立摘要、再 reduce 合并为最终摘要,确保不遗漏任何段落(原 top-K 选块模式在"找特定信息"诉求下仍保留)。配套新增**批大小白名单**:单批字符上限按模型名自适应(minimax / kimi 120k、glm / qwen 100k、deepseek 50k、未知 60k),替代原写死 60k —— 大上下文模型不再被压缩到 60k、小上下文模型不会被撑爆。意图路由在 `summarize` 入口统一决策,三档(top-K / stuff / map-reduce)无感切换。Refs MOC-157。
+
 ## v2.2.1 — 2026-06-04
 
 **web_fetch 客户端重定向跟随(MOC-139)**:`web_fetch` 现在能跟随 HTML `<meta http-equiv="refresh">` 与 JS `location.replace/assign/href` 跳转页(最多 3 跳,记 trail 防循环):curl/wreq/headless 三档只处理 HTTP 3xx、不识别这类客户端重定向,导致部分"占位跳转页"(如绕 Twitter/Substack 封锁的中间页)正文极少、模型"无法摘要";现跟随到目标 URL 重抓真实内容(真机验证:lcamtuf→substack 占位页 165 字符 → 真文章 10623 字符)。Refs MOC-139。
