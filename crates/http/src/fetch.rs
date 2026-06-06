@@ -508,7 +508,7 @@ fn origin_profiles() -> &'static std::sync::Mutex<std::collections::HashMap<Stri
 }
 
 /// 取 URL 的 origin (`scheme://host`) 作 per-origin cache key。无法解析 → None (不缓存)。
-fn origin_of(url: &str) -> Option<String> {
+pub(crate) fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let host = rest.split(['/', '?', '#']).next()?;
     if scheme.is_empty() || host.is_empty() {
@@ -562,6 +562,9 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
             // headless 是终极兜底 (跑 JS), 无"升级信号"可言 —— 成功即返回, 失败即整体失败。
             match crate::headless::fetch_rendered_html(url).await {
                 Ok(body) => {
+                    // headless 渲染后仍是挑战页的"判失败"已下沉到 headless 层(MOC-156 review P2:
+                    // 覆盖直选 Headless 档 + 所有 public caller, 不只 Auto)。故此处 Ok(body) 必是
+                    // 非挑战的真内容; 挑战页会从下面 Err 分支走 last_usable 非破坏回退。
                     remember_origin(&origin, tier);
                     return Ok(Fetched {
                         body,
@@ -701,7 +704,7 @@ fn needs_upgrade(raw: &RawFetch) -> bool {
 /// chatgpt-codex review): 这些 widget 普遍嵌入正常登录/评论/联系页, 单凭 widget 命中会把带表单
 /// 的正常 200 页误判成挑战页 → 误升档 + `worth_fallback` 拒绝保留已抓内容。挑战判定要 key 在
 /// "整页就是挑战"的结构 (CF cdn-cgi token), 不是"页面嵌了 widget"。
-fn is_challenge_body(body: &str) -> bool {
+pub(crate) fn is_challenge_body(body: &str) -> bool {
     let head: String = body
         .chars()
         .take(4096)
