@@ -694,34 +694,30 @@ fn needs_upgrade(raw: &RawFetch) -> bool {
 
 /// body 是否是反爬挑战 / 软拦截页 (CF + 通用反爬, 只看前 4KB)。命中即 Auto 升级。
 /// CF 的 `just a moment` 锚到 `<title>` (避免讨论 CF 的正文误判, review M2); `challenge-platform`
-/// / `_cf_chl_opt` 是 CF 专有 token; 另加通用反爬 (DDG anomaly / 限流 / "enable javascript" /
-/// DataDome / PerimeterX) marker (review M1: 非 CF 软拦截此前 slip through 当成功)。
+/// / `_cf_chl_opt` 是 CF **整页 challenge** 专有 token, 不出现在正常页 —— 故已覆盖中文/日文等
+/// **本地化** CF 挑战页 (无需穷举译文)。另加通用软拦 (DDG anomaly / 限流 / DataDome / PerimeterX)。
+///
+/// **不**按 hCaptcha/reCAPTCHA/Turnstile 等 CAPTCHA **widget script host** 判挑战 (MOC-186
+/// chatgpt-codex review): 这些 widget 普遍嵌入正常登录/评论/联系页, 单凭 widget 命中会把带表单
+/// 的正常 200 页误判成挑战页 → 误升档 + `worth_fallback` 拒绝保留已抓内容。挑战判定要 key 在
+/// "整页就是挑战"的结构 (CF cdn-cgi token), 不是"页面嵌了 widget"。
 fn is_challenge_body(body: &str) -> bool {
     let head: String = body
         .chars()
         .take(4096)
         .collect::<String>()
         .to_ascii_lowercase();
-    // CF 专有 (语言无关)
+    // CF 专有 (语言无关, 整页 challenge 专属, 不嵌正常页)
     head.contains("challenge-platform")
         || head.contains("cf-browser-verification")
         || head.contains("_cf_chl_opt")
-        || head.contains("challenges.cloudflare.com") // CF Turnstile widget host
         || head.contains("<title>just a moment")
-        // 其他反爬厂商 — 语言无关的 script-host / 资源名 token (③ MOC-186): 治本地化漏判 ——
-        // 中文/日文挑战页不含英文文案, 但这些厂商标识跨语言不变。用 host/path 形式而非裸厂商名,
-        // 特异性高, 避免讨论这些厂商的正文误判 (script src 几乎只出现在真挑战页)。
-        || head.contains("js.hcaptcha.com") // hCaptcha widget
-        || head.contains("www.google.com/recaptcha/") // reCAPTCHA widget
-        || head.contains("_incapsula_resource") // Imperva Incapsula
-        || head.contains("kpsdk.com") // Kasada script host
-        || head.contains("datadome") // DataDome (标准 JS 全局/cookie 名)
-        || head.contains("perimeterx.net") // PerimeterX/HUMAN script host
-        || head.contains("px-captcha") // PerimeterX captcha widget
-        // 通用英文软拦文案 (保留: 覆盖无专有标识的简单拦截页)
+        // 通用反爬 / 软拦截
         || head.contains("bots use duckduckgo")
         || head.contains("unusual traffic")
         || head.contains("enable javascript and cookies")
+        || head.contains("datadome")
+        || head.contains("px-captcha")
         || head.contains("are you a robot")
 }
 
@@ -1619,29 +1615,14 @@ mod tests {
             "<html><body>just a moment in history was discussed.</body></html>"
         ));
         assert!(!is_challenge_body("<html><body>normal page</body></html>"));
-        // 厂商 token (③ MOC-186): host/script 形式命中真挑战页 (语言无关, 治本地化漏判)。
-        assert!(is_challenge_body(
-            "<script src=\"https://js.hcaptcha.com/1/api.js\"></script>"
-        ));
-        assert!(is_challenge_body(
-            "<script src=\"https://www.google.com/recaptcha/api.js\"></script>"
-        ));
-        assert!(is_challenge_body("<div id=\"_incapsula_resource\"></div>"));
-        assert!(is_challenge_body(
-            "<script src=\"//kpsdk.com/sdk.js\"></script>"
-        ));
-        assert!(is_challenge_body(
-            "<script src=\"//perimeterx.net/px.js\"></script>"
-        ));
-        assert!(is_challenge_body(
-            "<iframe src=\"https://challenges.cloudflare.com/turnstile\"></iframe>"
-        ));
-        // 正文提及厂商名但非挑战页 → 不误判 (host/path 形式特异, 不撞裸厂商名 PerimeterX/hCaptcha)。
+        // 嵌入 CAPTCHA widget 的正常页 (登录/评论页常带 reCAPTCHA/hCaptcha) **不**误判为挑战页
+        // (MOC-186 chatgpt-codex review: challenge 判定 key 在整页 CF cdn-cgi 结构, 不在 widget
+        // script host —— 单凭 widget 会把带表单的正常 200 页误升档 + 拒绝保留已抓内容)。
         assert!(!is_challenge_body(
-            "<html><body>本文讨论 PerimeterX 和 Kasada 等反爬产品的原理。</body></html>"
+            "<html><body><form>login</form><script src=\"https://www.google.com/recaptcha/api.js\"></script></body></html>"
         ));
         assert!(!is_challenge_body(
-            "<html><body>A blog post comparing hCaptcha vs reCAPTCHA features.</body></html>"
+            "<html><body><form>contact</form><script src=\"https://js.hcaptcha.com/1/api.js\"></script></body></html>"
         ));
     }
 

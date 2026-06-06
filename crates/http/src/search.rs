@@ -8,7 +8,7 @@
 //!
 //! ## 为什么固定 headless
 //! DDG html 版(`html.duckduckgo.com/html/`)是 SSR + 经典 `.result__a` 结构, 但前置 JS
-//! challenge: 裸 reqwest / wreq Chrome147 指纹(含完整浏览器 header / POST / lite 版)**全部
+//! challenge: 裸 reqwest / wreq Chrome131 指纹(含完整浏览器 header / POST / lite 版)**全部
 //! 被 202 anomaly 拦**(spike 实测 6 变体全灭) —— 必须 headless 真跑 JS 才放行。故 web_search
 //! 内部固定走 [`crate::headless`], **不跟随** web_fetch 的 curl/wreq/headless 档位设置。
 //!

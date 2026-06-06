@@ -5,7 +5,7 @@
 //! 指纹伪装) 作为这些域的 client, 其余域继续走 `reqwest` 不动。
 //!
 //! 用法: `should_impersonate(host)` 决定走哪个 client;
-//! `ImpersonatingClient::chrome()` 拿带 Chrome 147 指纹的 client, 然后 `.get(url).send().await`。
+//! `ImpersonatingClient::chrome()` 拿带 Chrome 131 指纹的 client, 然后 `.get(url).send().await`。
 //!
 //! ③ JS 渲染层 (MOC-143): [`headless`] 模块用 headless Chromium (CDP) 抓 ①reqwest /
 //! ②wreq 都拿不到的 JS 渲染 SPA (取渲染后 DOM)。先探测系统 Chrome, 未命中按需下载
