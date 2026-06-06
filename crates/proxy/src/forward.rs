@@ -32,8 +32,8 @@ use futures_util::TryStreamExt;
 use thiserror::Error;
 
 use crate::diagnostics::{
-    forward_trace_enabled, write_forward_trace_jsonl, write_upstream_error_bundle,
-    ForwardTraceInput, UpstreamErrorBundleInput,
+    forward_trace_enabled, write_chatgpt_backend_trace, write_forward_trace_jsonl,
+    write_upstream_error_bundle, ForwardTraceInput, UpstreamErrorBundleInput,
 };
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
@@ -702,6 +702,8 @@ async fn passthrough_chatgpt_backend(
         "INFO",
         format!("[chatgpt-relay] {method} {client_path} → {upstream}"),
     );
+    // [MOC-125] gate 开时先 clone Codex 原始请求体(下面会 move 进 rb),供 passthrough 诊断 trace。
+    let trace_inbound = forward_trace_enabled().then(|| body.clone());
 
     // [review M-2] method 解析失败**报错、不降级** —— 把 POST(plugins install 等写操作)
     // 悄悄降级成 GET 是破坏性降级(违反"禁止破坏性降级"硬规则);axum Method 已合法,
@@ -743,6 +745,49 @@ async fn passthrough_chatgpt_backend(
             resp_body.len()
         ),
     );
+
+    // [MOC-125] chatgpt-backend passthrough 诊断:gate 开时记一条(inbound Codex 请求 / outbound
+    // 转发 chatgpt.com / response 回包,header 用 cookie 友好脱敏)。定位远程控制 enroll/server
+    // 404 死循环的会话连续性(set-cookie Domain 是否不匹配 relay host → Codex 不回带 cookie)。
+    if let Some(ref tbody) = trace_inbound {
+        let input = ForwardTraceInput {
+            method: method.as_str(),
+            client_path,
+            client_query: None,
+            inbound_headers: headers,
+            inbound_body: tbody.as_ref(),
+            upstream_url: &upstream,
+            // [review comment #1] passthrough 不转换协议,trace 的 outbound 段直接复用 inbound
+            // headers/body 作镜像 —— 真实发 chatgpt.com 的请求会再 strip host/accept-encoding、
+            // reqwest 重填 host/content-length(trace 未反映这层)。诊断重点在 inbound cookie +
+            // response set-cookie 的会话连续性,outbound 仅作对照。
+            outbound_headers: headers,
+            outbound_body: tbody.as_ref(),
+            status,
+            response_headers: &resp_headers,
+            response_body: resp_body.as_ref(),
+            response_full_len: resp_body.len(),
+            provider_id: "chatgpt-backend",
+            provider_name: "ChatGPT Backend (passthrough)",
+            api_format: "chatgpt_passthrough",
+            auth_scheme: "-",
+            original_model: None,
+            resolved_model: None,
+            upstream_model: None,
+        };
+        // [review HIGH] 写盘失败补一次去重 WARN —— 对齐 forward-trace(write_trace_from_ctx),
+        // 否则开了诊断却因权限/满盘写不出时,这条 passthrough trace 一行不落且零提示。
+        if write_chatgpt_backend_trace(&input).is_none()
+            && !TRACE_WRITE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            telemetry.logs.add(
+                "WARN",
+                "forward-trace 已开启(CAS_DIAG_TRACE)但写盘失败(后续不再提示);\
+                 检查 ~/.codex-app-transfer/forward-trace/ 目录权限与磁盘空间"
+                    .to_string(),
+            );
+        }
+    }
 
     let mut builder = Response::builder().status(status);
     if let Some(h) = builder.headers_mut() {
