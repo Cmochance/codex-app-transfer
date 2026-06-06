@@ -979,6 +979,12 @@
     // [MOC-154] 列表式:行0(默认)不可删;删行后把剩余模型值按序重排回 gpt_5_5/...
     if (index <= 0 || index >= providerFormRows.length) return;
     const slotKeys = providerFormDefaultRows.filter((k) => k !== "default");
+    // [MOC-173] repack 会让 slot key 语义移位(后续槽位上移),审查 <select> 若按 slot key
+    // 保留会静默指向另一个 model。先记下审查当前指向的 model 值,repack 后按该值重定位到它
+    // 的新槽位(原 model 行被删 → 找不到 → 清回「跟随主模型」)。
+    const reviewSel = $("#providerReviewModelSlot");
+    const reviewModelVal =
+      reviewSel && reviewSel.value ? providerFormMappings[reviewSel.value] || "" : "";
     const vals = providerFormRows.map((k) => providerFormMappings[k] || "");
     vals.splice(index, 1);
     providerFormMappings = {};
@@ -988,6 +994,12 @@
     });
     openProviderModelMenuKey = null;
     renderProviderMappings();
+    if (reviewModelVal) {
+      const newSlot = providerFormRows.find(
+        (k) => (providerFormMappings[k] || "") === reviewModelVal,
+      );
+      setReviewModelSlotField(newSlot || "");
+    }
   }
 
   function toggleProviderModelMenu(rowKey) {
