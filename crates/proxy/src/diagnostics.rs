@@ -951,6 +951,30 @@ pub fn headers_to_json_passthrough(h: &reqwest::header::HeaderMap) -> Value {
     Value::Object(out)
 }
 
+/// passthrough **请求** body 脱敏:补 [`redact_body`] 对 form-urlencoded body 不脱敏的缺口
+/// (codex P2)。backend-api 的 OAuth/token POST 常是 `application/x-www-form-urlencoded`,body 里
+/// `code=` / `access_token=` / `client_secret=` 走 redact_body 的非 JSON 分支会原样落盘 → 这里
+/// 非 JSON 先过 [`redact_body_string`](form 键值用 redact_credential_params 清洗);JSON / 纯文本
+/// (无 credential → redact_body_string 返 None)/ 非 utf8 仍由 redact_body 处理(JSON scrub + cap)。
+fn redact_passthrough_req_body(bytes: &[u8], content_type: Option<&str>) -> Value {
+    let is_json = content_type
+        .map(|c| c.to_ascii_lowercase().contains("json"))
+        .unwrap_or(false);
+    if !is_json {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            if let Some(scrubbed) = redact_body_string(s) {
+                return json!({
+                    "encoding": "form",
+                    "bytes": bytes.len(),
+                    "truncated_bytes": 0,
+                    "content": scrubbed,
+                });
+            }
+        }
+    }
+    redact_body(bytes, content_type)
+}
+
 /// 一条 chatgpt-backend passthrough trace → 诊断 JSON(MOC-125)。结构同 forward
 /// (inbound/outbound/response),但 header 用 [`headers_to_json_passthrough`](cookie 友好脱敏)。
 pub(crate) fn build_chatgpt_backend_trace_value(input: &ForwardTraceInput, seq: u64) -> Value {
@@ -966,12 +990,12 @@ pub(crate) fn build_chatgpt_backend_trace_value(input: &ForwardTraceInput, seq: 
             "client_path": redact_credential_params(input.client_path).0,
             "client_query": input.client_query.map(|q| redact_credential_params(q).0),
             "headers": headers_to_json_passthrough(input.inbound_headers),
-            "body": redact_body(input.inbound_body, header_content_type(input.inbound_headers)),
+            "body": redact_passthrough_req_body(input.inbound_body, header_content_type(input.inbound_headers)),
         },
         "outbound": {
             "url": redact_credential_params(input.upstream_url).0,
             "headers": headers_to_json_passthrough(input.outbound_headers),
-            "body": redact_body(input.outbound_body, header_content_type(input.outbound_headers)),
+            "body": redact_passthrough_req_body(input.outbound_body, header_content_type(input.outbound_headers)),
         },
         "response": {
             "status": input.status,
@@ -1141,6 +1165,47 @@ mod tests {
             "非 credential query(scope)应保留: {s}"
         );
         assert!(s.contains("code=***"), "code 应脱敏: {s}");
+    }
+
+    #[test]
+    fn passthrough_trace_redacts_form_body() {
+        // [codex P2] form-urlencoded request body 的 credential 不得原样落 trace。
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        let body = b"code=AUTHLEAK&client_secret=SECLEAK&grant_type=authorization_code";
+        let input = ForwardTraceInput {
+            method: "POST",
+            client_path: "/backend-api/token",
+            client_query: None,
+            inbound_headers: &h,
+            inbound_body: body,
+            upstream_url: "https://chatgpt.com/backend-api/token",
+            outbound_headers: &h,
+            outbound_body: body,
+            status: 200,
+            response_headers: &h,
+            response_body: b"",
+            response_full_len: 0,
+            provider_id: "chatgpt-backend",
+            provider_name: "x",
+            api_format: "x",
+            auth_scheme: "-",
+            original_model: None,
+            resolved_model: None,
+            upstream_model: None,
+        };
+        let s = serde_json::to_string(&build_chatgpt_backend_trace_value(&input, 1)).unwrap();
+        assert!(
+            !s.contains("AUTHLEAK") && !s.contains("SECLEAK"),
+            "form body credential 泄漏: {s}"
+        );
+        assert!(
+            s.contains("grant_type=authorization_code"),
+            "非 credential form param 应保留: {s}"
+        );
     }
 
     #[test]
