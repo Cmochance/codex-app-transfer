@@ -316,7 +316,7 @@ struct RawFetch {
 
 /// 单档 (Curl/Wreq) 抓取: raw 抓 → 非 2xx 即 Err (保持原单档语义, 不自动升级)。
 async fn single_tier(tier: WebFetchBackend, url: &str) -> Result<Fetched, WebFetchError> {
-    let raw = fetch_raw(tier, url).await?;
+    let raw = fetch_raw_retry_429(tier, url).await?;
     if !(200..300).contains(&raw.status) {
         return Err(tier_http_error(tier, raw.status));
     }
@@ -341,6 +341,28 @@ async fn fetch_raw(tier: WebFetchBackend, url: &str) -> Result<RawFetch, WebFetc
     }
 }
 
+/// 429 限流退避重试次数 (⑥ MOC-186): MCP 同步等结果, 退避要短, 不宜多次。
+const MAX_429_RETRIES: u32 = 2;
+/// 429 退避基数 (指数: 0.5s → 1s)。不读 `Retry-After` —— 同步场景下其值常达数十秒, 等不起;
+/// 固定短退避足够吃掉瞬时限流尖峰, 仍 429 则交调用方升档/报错。
+const RETRY_429_BASE: Duration = Duration::from_millis(500);
+
+/// 抓 raw + 对 429 (限流) 短退避重试**当前档** (⑥ MOC-186)。
+///
+/// 429 是 IP/频率限流, 不是"能力不足" —— 换档 (同 IP) 一样被限, 升档无意义; 短退避重试同档才对。
+/// 与 403 (反爬, 该升档过 JA3 指纹) 严格区别。重试 [`MAX_429_RETRIES`] 次指数退避后仍 429,
+/// 返回该 429 raw (交调用方: 单档→Err, Auto→按 needs_upgrade 升档兜底)。
+async fn fetch_raw_retry_429(tier: WebFetchBackend, url: &str) -> Result<RawFetch, WebFetchError> {
+    let mut raw = fetch_raw(tier, url).await?;
+    let mut attempt = 0;
+    while raw.status == 429 && attempt < MAX_429_RETRIES {
+        tokio::time::sleep(RETRY_429_BASE * 2_u32.pow(attempt)).await;
+        attempt += 1;
+        raw = fetch_raw(tier, url).await?;
+    }
+    Ok(raw)
+}
+
 /// tier 对应的 HTTP 错误 (单档非 2xx)。
 fn tier_http_error(tier: WebFetchBackend, status: u16) -> WebFetchError {
     let msg = format!("HTTP {status}");
@@ -350,14 +372,54 @@ fn tier_http_error(tier: WebFetchBackend, status: u16) -> WebFetchError {
     }
 }
 
-/// ① reqwest 静态 GET。返回 RawFetch (不判 status)。
+/// curl 档的浏览器 `Accept` 头 (② MOC-186): Chrome 真实默认值。与 UA 一起过 UA/header 黑名单
+/// 粗筛 —— 很多站第一道按"缺浏览器头"判非浏览器直接拦, 让本可静态抓的页无谓升档。
+const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+
+/// 按系统 locale 生成 `Accept-Language` (④ MOC-186)。中文用户真实浏览器发 `zh-CN`, 固定 en-US
+/// 会拿地区站英文版 + locale/header 不一致。用 `sys-locale` 跨平台读系统 locale (macOS CFLocale /
+/// Win / Linux) —— 比裸读 `LANG` env 可靠 (GUI app 的 `LANG` 常为空), 读不到回退 `en-US,en;q=0.9`
+/// (= wreq emulation 默认)。best-effort, 失败不影响抓取。
+///
+/// **仅用于 curl 档**: wreq 档的 `Accept-Language` 由 emulation 按指纹注入 (请求级覆盖会与 emulation
+/// header 冲突成双值), 且 wreq 只用于 CF 强保域 (内容多为英文), en-US 影响小。
+fn accept_language() -> String {
+    accept_language_from_locale(&sys_locale::get_locale().unwrap_or_default())
+}
+
+/// 把系统 locale (如 `zh_CN.UTF-8` / `en-US` / `C`) 转成 `Accept-Language` 头值 (④ MOC-186)。
+/// 纯函数 (与 `sys-locale` 读取解耦, 便于离线测试)。空 / `C` / `POSIX` → `en-US,en;q=0.9`
+/// (= wreq emulation 默认)。
+fn accept_language_from_locale(raw: &str) -> String {
+    // sys-locale 通常返 BCP47 (`zh-CN`); 防御性把 `_` 归一为 `-`, 取 `.`/`@` 前的 locale 段。
+    let loc = raw.split(['.', '@']).next().unwrap_or("").trim();
+    if loc.is_empty() || loc.eq_ignore_ascii_case("C") || loc.eq_ignore_ascii_case("POSIX") {
+        return "en-US,en;q=0.9".to_string();
+    }
+    let bcp47 = loc.replace('_', "-");
+    let primary = bcp47.split('-').next().unwrap_or(bcp47.as_str());
+    if primary.eq_ignore_ascii_case("en") {
+        format!("{bcp47},en;q=0.9")
+    } else {
+        // 主 locale 优先, 主语言次之, 始终 en 兜底 (地区站无本地化时退英文)。
+        format!("{bcp47},{primary};q=0.9,en;q=0.8")
+    }
+}
+
+/// ① reqwest 静态 GET (+ ② 真实 Chrome UA / ④ locale-aware Accept-Language)。返回 RawFetch (不判 status)。
 async fn fetch_curl_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        // ② curl 档加真实 Chrome UA: 默认 reqwest UA (`reqwest/x`) 一眼非浏览器, 被 UA 黑名单站
+        // 直接拦 → 无谓升档。这里只过 UA 粗筛 (curl 无 TLS 指纹, 遇真 CF 看 JA3 仍会升 wreq)。MOC-186。
+        .user_agent(crate::impersonating::CHROME_UA)
         .build()
         .map_err(|e| WebFetchError::Curl(format!("建 client 失败: {e}")))?;
     let resp = client
         .get(url)
+        // ② 浏览器 Accept + ④ locale-aware Accept-Language (跟 UA 一起减少粗筛误拦)。MOC-186。
+        .header(reqwest::header::ACCEPT, BROWSER_ACCEPT)
+        .header(reqwest::header::ACCEPT_LANGUAGE, accept_language())
         .send()
         .await
         .map_err(|e| WebFetchError::Curl(e.to_string()))?;
@@ -391,7 +453,7 @@ async fn fetch_curl_raw(url: &str) -> Result<RawFetch, WebFetchError> {
 /// ② wreq 浏览器 TLS 指纹 (Chrome 120)。返回 RawFetch (不判 status)。
 async fn fetch_wreq_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     let client =
-        crate::ImpersonatingClient::chrome_120().map_err(|e| WebFetchError::Wreq(e.to_string()))?;
+        crate::ImpersonatingClient::chrome().map_err(|e| WebFetchError::Wreq(e.to_string()))?;
     let resp = client
         .get(url)
         .send()
@@ -522,7 +584,7 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
                 }
             }
         }
-        match fetch_raw(tier, url).await {
+        match fetch_raw_retry_429(tier, url).await {
             // 不可恢复 (4xx 死链/权限除反爬 + 5xx 无挑战的真服务器故障): 换 client、headless 渲染
             // 错误页都没意义, 直接报 HTTP 错误 (不当成功, 对齐单档 curl/wreq 行为, chatgpt-codex)。
             Ok(raw) if is_unrecoverable(&raw) => return Err(tier_http_error(tier, raw.status)),
@@ -632,15 +694,20 @@ fn needs_upgrade(raw: &RawFetch) -> bool {
 
 /// body 是否是反爬挑战 / 软拦截页 (CF + 通用反爬, 只看前 4KB)。命中即 Auto 升级。
 /// CF 的 `just a moment` 锚到 `<title>` (避免讨论 CF 的正文误判, review M2); `challenge-platform`
-/// / `_cf_chl_opt` 是 CF 专有 token; 另加通用反爬 (DDG anomaly / 限流 / "enable javascript" /
-/// DataDome / PerimeterX) marker (review M1: 非 CF 软拦截此前 slip through 当成功)。
+/// / `_cf_chl_opt` 是 CF **整页 challenge** 专有 token, 不出现在正常页 —— 故已覆盖中文/日文等
+/// **本地化** CF 挑战页 (无需穷举译文)。另加通用软拦 (DDG anomaly / 限流 / DataDome / PerimeterX)。
+///
+/// **不**按 hCaptcha/reCAPTCHA/Turnstile 等 CAPTCHA **widget script host** 判挑战 (MOC-186
+/// chatgpt-codex review): 这些 widget 普遍嵌入正常登录/评论/联系页, 单凭 widget 命中会把带表单
+/// 的正常 200 页误判成挑战页 → 误升档 + `worth_fallback` 拒绝保留已抓内容。挑战判定要 key 在
+/// "整页就是挑战"的结构 (CF cdn-cgi token), 不是"页面嵌了 widget"。
 fn is_challenge_body(body: &str) -> bool {
     let head: String = body
         .chars()
         .take(4096)
         .collect::<String>()
         .to_ascii_lowercase();
-    // CF 专有
+    // CF 专有 (语言无关, 整页 challenge 专属, 不嵌正常页)
     head.contains("challenge-platform")
         || head.contains("cf-browser-verification")
         || head.contains("_cf_chl_opt")
@@ -1548,6 +1615,35 @@ mod tests {
             "<html><body>just a moment in history was discussed.</body></html>"
         ));
         assert!(!is_challenge_body("<html><body>normal page</body></html>"));
+        // 嵌入 CAPTCHA widget 的正常页 (登录/评论页常带 reCAPTCHA/hCaptcha) **不**误判为挑战页
+        // (MOC-186 chatgpt-codex review: challenge 判定 key 在整页 CF cdn-cgi 结构, 不在 widget
+        // script host —— 单凭 widget 会把带表单的正常 200 页误升档 + 拒绝保留已抓内容)。
+        assert!(!is_challenge_body(
+            "<html><body><form>login</form><script src=\"https://www.google.com/recaptcha/api.js\"></script></body></html>"
+        ));
+        assert!(!is_challenge_body(
+            "<html><body><form>contact</form><script src=\"https://js.hcaptcha.com/1/api.js\"></script></body></html>"
+        ));
+    }
+
+    #[test]
+    fn accept_language_from_locale_maps_bcp47() {
+        // 中文 locale: 带编码后缀 + 下划线归一, 主语言 zh 次选, en 兜底。
+        assert_eq!(
+            accept_language_from_locale("zh_CN.UTF-8"),
+            "zh-CN,zh;q=0.9,en;q=0.8"
+        );
+        assert_eq!(
+            accept_language_from_locale("zh-CN"),
+            "zh-CN,zh;q=0.9,en;q=0.8"
+        );
+        // 英文 locale: 主语言即 en, 不退化成 `en,en;q=0.9`。
+        assert_eq!(accept_language_from_locale("en_US.UTF-8"), "en-US,en;q=0.9");
+        assert_eq!(accept_language_from_locale("en-GB"), "en-GB,en;q=0.9");
+        // 退化 locale / 空 → en-US 兜底 (= wreq emulation 默认)。
+        assert_eq!(accept_language_from_locale("C"), "en-US,en;q=0.9");
+        assert_eq!(accept_language_from_locale("POSIX"), "en-US,en;q=0.9");
+        assert_eq!(accept_language_from_locale(""), "en-US,en;q=0.9");
     }
 
     #[test]

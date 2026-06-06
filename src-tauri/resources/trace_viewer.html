@@ -37,6 +37,7 @@
   .badge.forward { background: #14304d; color: var(--accent); }
   .badge.mcp { background: #3a2a14; color: var(--warn); }
   .badge.cat_webfetch { background: #14402a; color: var(--ok); }
+  .badge.chatgpt_backend { background: #3a2440; color: #c89bf0; }
   .row .summary { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); }
   .row .status { flex: none; font: 11px var(--mono); }
   .st2 { color: var(--ok); } .st4, .st5 { color: var(--err); }
@@ -91,6 +92,7 @@
       <option value="forward">forward</option>
       <option value="mcp">mcp</option>
       <option value="cat_webfetch">cat-webfetch</option>
+      <option value="chatgpt_backend">chatgpt-backend</option>
     </select>
     <select id="group">
       <option value="none">不分组</option>
@@ -121,12 +123,13 @@
     if (!t) return "mcp";
     if (t.trace_kind === "forward_protocol") return "forward";
     if (t.trace_kind === "cat_webfetch") return "cat_webfetch";
+    if (t.trace_kind === "chatgpt_backend") return "chatgpt_backend";
     return "mcp";
   }
 
   function summaryOf(t) {
     const k = kindOf(t);
-    if (k === "forward") {
+    if (k === "forward" || k === "chatgpt_backend") {
       const ib = t.inbound || {};
       return `${esc(ib.method || "")} ${esc(ib.client_path || "")}`;
     }
@@ -439,14 +442,17 @@
     if (!t) { detailEl.innerHTML = "<div class='empty'>选择左侧一条记录查看详情</div>"; return; }
     const k = kindOf(t);
     if (k === "cat_webfetch") { renderCatWebfetch(t); return; }
-    if (k !== "forward") {
+    // chatgpt_backend(passthrough)结构同 forward(inbound/outbound/response),复用同一渲染。
+    if (k !== "forward" && k !== "chatgpt_backend") {
       detailEl.innerHTML = `<div class="tools"><button data-copy="full">复制 JSON</button></div>`
         + `<pre class="payload">${esc(JSON.stringify(t, null, 2))}</pre>`;
       return;
     }
     const p = t.provider || {}, m = t.models || {}, ib = t.inbound || {}, ob = t.outbound || {}, rs = t.response || {};
-    const meta = `provider: ${esc(p.id)} (${esc(p.api_format)} / ${esc(p.auth_scheme)}) · `
-      + `models: ${esc(m.original)} → ${esc(m.resolved)} → ${esc(m.upstream)} · seq ${esc(t.seq)} · ${esc(t.captured_at)}`;
+    const hasModels = m.original || m.resolved || m.upstream;
+    const meta = `provider: ${esc(p.id)} (${esc(p.api_format)} / ${esc(p.auth_scheme)})`
+      + (hasModels ? ` · models: ${esc(m.original)} → ${esc(m.resolved)} → ${esc(m.upstream)}` : "")
+      + ` · seq ${esc(t.seq)} · ${esc(t.captured_at)}`;
     const usage = extractUsage(rs);
     // E 卡片基于 INBOUND(Codex 原始);body 非完整 JSON(截断/省略)时跳过,原始段仍在下方。
     const ibStruct = ib.body && ib.body.encoding === "json" ? ib.body.content : null;

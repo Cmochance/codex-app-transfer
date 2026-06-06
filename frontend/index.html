@@ -268,6 +268,11 @@
                   <p data-i18n="providersAdd.applyHint">一键应用会保存供应商和模型映射，把它设为默认，并让 Codex CLI 连接到本工具。之后你在 Codex CLI 里发消息，本工具会自动转发到你填写的 API 地址。</p>
                 </div>
               </section>
+              <div class="mb-4" id="providerReviewModelSlotRow">
+                <label class="form-label" for="providerReviewModelSlot" data-i18n="providersAdd.reviewModel">auto-review 审查模型</label>
+                <select class="form-select" id="providerReviewModelSlot"></select>
+                <p class="field-hint" data-i18n="providersAdd.reviewModelHint">auto-review 自动审批工具调用时改用的模型,从上方已配置的模型里选(通常选快/便宜模型加速审批)。留空 = 跟随主模型。</p>
+              </div>
               <div class="mb-4" id="providerSummaryModelRow">
                 <label class="form-label" for="providerSummaryModel" data-i18n="providersAdd.summaryModel">网页摘要模型</label>
                 <input class="form-control" type="text" id="providerSummaryModel" list="providerSummaryModelOptions" autocomplete="off" data-i18n-placeholder="providersAdd.summaryModelPlaceholder" placeholder="留空 = 用 Default 映射的模型">

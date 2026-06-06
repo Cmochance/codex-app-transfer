@@ -9,6 +9,13 @@
 //! `~/.codex-app-transfer/config.json` file instead of creating another file
 //! under `~/.codex`. Codex ignores unrelated top-level fields and reads the
 //! `models` array from the configured JSON path.
+//!
+//! **[MOC-173] auto-review model override**: each catalog entry optionally
+//! carries `auto_review_model_override` (the catalog slug of the slot chosen
+//! for guardian / tool-approval reviews). When set, Codex routes auto-review
+//! requests to that slot's existing proxy mapping instead of the main
+//! conversation model. Set via `CatalogModel::auto_review_model_override`;
+//! absent (default) = auto-review reuses the main model.
 
 use codex_app_transfer_registry::{
     documented_context_window, load_raw_config, model_supports_1m, normalize_model_mappings,
@@ -52,6 +59,12 @@ pub struct CatalogModel {
     pub provider_name: String,
     pub context_window: u64,
     pub effective_context_window_percent: u64,
+    /// [MOC-173] auto-review(guardian 工具审批 subagent)专用审查模型的 catalog slug。
+    /// `Some` 时写进该 entry 的 `auto_review_model_override` 字段,让 Codex 在主模型为此
+    /// entry 时改用该 slug 跑工具审查(与主对话脱钩);`None`(默认)= 不写 = auto-review
+    /// 复用主模型(实测默认行为)。值取自该 provider 已配置(映射非空)的槽位,复用其
+    /// 现有 proxy 映射,不引入重复映射 / 降级。
+    pub auto_review_model_override: Option<String>,
 }
 
 pub fn upsert_catalog_models(
@@ -113,6 +126,7 @@ pub fn catalog_models_for_provider(
         model_mappings,
         model_capabilities,
         None,
+        None,
     )
 }
 
@@ -120,6 +134,10 @@ pub fn catalog_models_for_provider(
 /// 人类可读名,如 antigravity `gemini-3.5-flash-low` → "Gemini 3.5 Flash (Medium)")。
 /// catalog 的 `display_name`(Codex Desktop model picker 显示的名字)优先用它,反查
 /// 不到则 fallback raw 模型 id。`slug`(Codex 实际发出去的标识)与路由不受影响。
+///
+/// **[MOC-173]** `review_model_slot`:provider 已配置(映射非空)的槽位 key(如
+/// `gpt_5_4`),用作 auto-review(guardian 工具审批)的专用模型;`None` = 不写
+/// override = auto-review 复用主模型。详见 [`CatalogModel::auto_review_model_override`]。
 pub fn catalog_models_for_provider_with_display_names(
     provider_name: &str,
     default_model: &str,
@@ -127,10 +145,25 @@ pub fn catalog_models_for_provider_with_display_names(
     model_mappings: Option<&Value>,
     model_capabilities: Option<&Value>,
     display_names: Option<&Value>,
+    review_model_slot: Option<&str>,
 ) -> Vec<CatalogModel> {
     let default_model_clean = strip_internal_model_suffix(default_model);
     let default_model = default_model_clean.trim();
     let mappings = normalize_model_mappings(model_mappings);
+    // [MOC-173] 审查模型 override:审查槽位映射非空时取其 catalog slug(= openai_id),给每个
+    // catalog entry 写 auto_review_model_override,让 auto-review(guardian)脱钩主模型走该 slug。
+    // 仅认映射非空的 gpt_5_X 槽(default 无 openai_id、列表式 catalog 无独立 entry → 不支持);
+    // 空槽位 → None(不写),由前端限制选项 + 此处防御共同保证不降级 / 不重复映射。
+    let review_override: Option<String> = review_model_slot.and_then(|slot_key| {
+        let slot = MODEL_SLOTS.iter().find(|s| s.key == slot_key)?;
+        let openai_id = slot.openai_id?;
+        let mapped = mappings.get(slot_key).map(|s| s.trim()).unwrap_or("");
+        if mapped.is_empty() {
+            None
+        } else {
+            Some(openai_id.to_owned())
+        }
+    });
     let mut models = Vec::new();
     for slot in MODEL_SLOTS {
         let Some(openai_id) = slot.openai_id else {
@@ -168,6 +201,7 @@ pub fn catalog_models_for_provider_with_display_names(
             target_clean.trim(),
             context_window,
             display_names,
+            review_override.clone(),
         ));
     }
     // [MOC-154] 去掉旧 fallback entry(slug = default_model 实际模型名)。列表式下
@@ -247,6 +281,7 @@ fn catalog_model(
     default_model: &str,
     context_window: u64,
     display_names: Option<&Value>,
+    auto_review_model_override: Option<String>,
 ) -> CatalogModel {
     let target = if default_model.is_empty() {
         slug
@@ -265,6 +300,7 @@ fn catalog_model(
         provider_name: provider_name.to_owned(),
         context_window,
         effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+        auto_review_model_override,
     }
 }
 
@@ -306,6 +342,11 @@ fn model_to_json(model: &CatalogModel) -> Value {
             .saturating_mul(AUTO_COMPACT_TRIGGER_PERCENT)
             / 100
     );
+    // [MOC-173] 审查模型 override:Some 时写该字段,Codex auto-review(guardian)改用此
+    // catalog slug 跑工具审查(实测脱钩主模型);None 不写 = 复用主模型(默认行为)。
+    if let Some(ref slug) = model.auto_review_model_override {
+        entry["auto_review_model_override"] = Value::String(slug.clone());
+    }
     entry
 }
 
@@ -569,6 +610,7 @@ mod tests {
             provider_name: "P".into(),
             context_window: 258_400,
             effective_context_window_percent: 95,
+            auto_review_model_override: None,
         };
         let entry = model_to_json(&non_builtin);
 
@@ -642,6 +684,7 @@ mod tests {
             Some(&mappings),
             None,
             Some(&display_names),
+            None,
         );
         let dn = |slug: &str| {
             models
@@ -665,6 +708,7 @@ mod tests {
             Some(&mappings),
             None,
             None,
+            None,
         );
         assert_eq!(
             no_names
@@ -674,6 +718,107 @@ mod tests {
                 .display_name,
             "gemini-3.5-flash-low"
         );
+    }
+
+    // ── [MOC-173] auto-review 审查模型 override ──
+
+    #[test]
+    fn auto_review_override_set_when_slot_mapped() {
+        // 审查槽位 gpt_5_4 映射非空 → 每个 catalog entry 写 auto_review_model_override="gpt-5.4"
+        // (审查脱钩主模型,走 gpt_5_4 槽现有映射);model_to_json 如实写出该字段。
+        let mappings = json!({
+            "default": "mimo-v2.5-pro",
+            "gpt_5_5": "mimo-v2.5-pro",
+            "gpt_5_4": "mimo-v2.5",
+        });
+        let models = catalog_models_for_provider_with_display_names(
+            "MiMo",
+            "mimo-v2.5-pro",
+            true,
+            Some(&mappings),
+            None,
+            None,
+            Some("gpt_5_4"),
+        );
+        assert!(!models.is_empty());
+        for m in &models {
+            assert_eq!(
+                m.auto_review_model_override.as_deref(),
+                Some("gpt-5.4"),
+                "entry slug={} 应带审查 override",
+                m.slug
+            );
+        }
+        let gpt55 = models.iter().find(|m| m.slug == "gpt-5.5").unwrap();
+        assert_eq!(
+            model_to_json(gpt55)["auto_review_model_override"],
+            "gpt-5.4"
+        );
+    }
+
+    #[test]
+    fn auto_review_override_absent_when_unset() {
+        // 未设审查槽位(None)→ 不写 override(auto-review 复用主模型,默认行为);
+        // model_to_json 不应出现该字段。
+        let mappings = json!({"default": "mimo-v2.5-pro", "gpt_5_5": "mimo-v2.5-pro"});
+        let models = catalog_models_for_provider_with_display_names(
+            "MiMo",
+            "mimo-v2.5-pro",
+            true,
+            Some(&mappings),
+            None,
+            None,
+            None,
+        );
+        for m in &models {
+            assert!(m.auto_review_model_override.is_none());
+        }
+        assert!(model_to_json(&models[0])
+            .get("auto_review_model_override")
+            .is_none());
+    }
+
+    #[test]
+    fn auto_review_override_ignored_for_empty_slot() {
+        // 防御:审查槽位指向空映射(gpt_5_2 未配)→ 不写 override,避免 proxy 降级 default。
+        // 前端只列非空槽位,这里是后端双保险。
+        let mappings = json!({"default": "mimo-v2.5-pro", "gpt_5_5": "mimo-v2.5-pro"});
+        let models = catalog_models_for_provider_with_display_names(
+            "MiMo",
+            "mimo-v2.5-pro",
+            true,
+            Some(&mappings),
+            None,
+            None,
+            Some("gpt_5_2"),
+        );
+        for m in &models {
+            assert!(
+                m.auto_review_model_override.is_none(),
+                "空槽位不应写 override(防降级)"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_review_override_ignored_for_default_slot() {
+        // default 槽无 openai_id、列表式 catalog 无独立 entry → 不支持作审查槽位,返回 None。
+        let mappings = json!({"default": "mimo-v2.5-pro", "gpt_5_5": "mimo-v2.5-pro"});
+        let models = catalog_models_for_provider_with_display_names(
+            "MiMo",
+            "mimo-v2.5-pro",
+            true,
+            Some(&mappings),
+            None,
+            None,
+            Some("default"),
+        );
+        for m in &models {
+            assert!(
+                m.auto_review_model_override.is_none(),
+                "default 槽不支持作审查槽位"
+            );
+        }
     }
 
     #[test]

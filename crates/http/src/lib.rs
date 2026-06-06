@@ -5,7 +5,7 @@
 //! 指纹伪装) 作为这些域的 client, 其余域继续走 `reqwest` 不动。
 //!
 //! 用法: `should_impersonate(host)` 决定走哪个 client;
-//! `ImpersonatingClient::chrome_120()` 拿带 Chrome 120 指纹的 client, 然后 `.get(url).send().await`。
+//! `ImpersonatingClient::chrome()` 拿带 Chrome 120 指纹的 client, 然后 `.get(url).send().await`。
 //!
 //! ③ JS 渲染层 (MOC-143): [`headless`] 模块用 headless Chromium (CDP) 抓 ①reqwest /
 //! ②wreq 都拿不到的 JS 渲染 SPA (取渲染后 DOM)。先探测系统 Chrome, 未命中按需下载
@@ -15,10 +15,10 @@
 //! 档位路由: `curl`(reqwest 静态) / `wreq`(浏览器 TLS 指纹) / `headless`(Chromium CDP)。
 //! 配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure` 供设置页探测/按需下载 Chrome。
 //! `webFetchBackend != off` 时 transfer 自动往 `~/.codex/config.toml` 注册
-//! `[mcp_servers.CAT-WEB-MCP]`(stdio MCP server),向 Codex 模型暴露 `web_fetch` 工具。
+//! `[mcp_servers.cat-webfetch]`(stdio MCP server),向 Codex 模型暴露 `web_fetch` 工具。
 //!
 //! DuckDuckGo 搜索 (MOC-12): [`search`] 模块的 [`web_search`] 走 DDG HTML SSR 搜索,
-//! 内部固定 headless(DDG 对裸 HTTP 一律 202 反爬拦)。CAT-WEB-MCP 同时暴露
+//! 内部固定 headless(DDG 对裸 HTTP 一律 202 反爬拦)。cat-webfetch 同时暴露
 //! `web_search` 工具,与 `web_fetch` 组成两段式联网。
 //!
 //! 非目标 (后续 PR): 不取代 workspace 其余地方 (`gemini_oauth` / `adapters` /

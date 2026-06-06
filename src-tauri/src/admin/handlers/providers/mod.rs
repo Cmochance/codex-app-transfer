@@ -76,6 +76,17 @@ pub(crate) fn provider_display_name(provider: &Value) -> String {
         .to_owned()
 }
 
+/// [MOC-173] 读 provider 的 `reviewModelSlot` 字段(auto-review 审查模型槽位 key,如
+/// `gpt_5_4`)。trim 后非空才返回 `Some`,空 / 缺 → `None`(auto-review 复用主模型)。
+pub(crate) fn provider_review_model_slot(provider: &Value) -> Option<String> {
+    provider
+        .get("reviewModelSlot")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// 把 `provider.apiFormat` 字段的字面值规范化成后端可持久化的 canonical 值。
 ///
 /// **未知值 / 缺失 fallback 到 `"openai_chat"`**(跟 `Provider::api_format`
