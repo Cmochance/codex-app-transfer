@@ -20,7 +20,21 @@ use crate::resolver::SharedResolver;
 /// 把所有方法 / 所有路径都路由到 `forward_handler`(裸代理 + B1 路由 + B2 鉴权改写)。
 /// Stage 3 起此 router 会再叠 adapter 中间件(provider 协议转换)。
 pub fn build_router(resolver: SharedResolver) -> Router {
-    let state = ProxyState::new(resolver);
+    build_router_with_state(ProxyState::new(resolver))
+}
+
+/// [MOC-124 H-2] 同 [`build_router`],但注入「chatgpt backend 透传遇上游 401 → 回灌账号需重登」
+/// 回调。src-tauri 启动 proxy 时走此入口注入
+/// `codex_real_account::mark_relogin_required_from_proxy`(回调参数 = 被撤销 token 的指纹);
+/// 测试 / proxy 独立运行用无回调的 [`build_router`]。
+pub fn build_router_with_relogin(
+    resolver: SharedResolver,
+    on_chatgpt_unauthorized: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
+) -> Router {
+    build_router_with_state(ProxyState::new(resolver).with_relogin_notify(on_chatgpt_unauthorized))
+}
+
+fn build_router_with_state(state: ProxyState) -> Router {
     Router::new()
         .route(
             "/responses",

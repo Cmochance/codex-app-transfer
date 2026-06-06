@@ -232,10 +232,23 @@ pub async fn enable_handler(
     axum::extract::State(state): axum::extract::State<AdminState>,
 ) -> impl IntoResponse {
     // 账号可用性(新口径认 token,清除切 apikey 后 tokens 还在也算有)。
-    if !codex_real_account::detect().logged_in {
+    let status = codex_real_account::detect();
+    if !status.logged_in {
         return err(
             StatusCode::BAD_REQUEST,
             "无可用真实账号(需先登录 / 导入)".to_owned(),
+        )
+        .into_response();
+    }
+    // [MOC-124 H-2 / codex-connector P2] token 被服务端撤销(relogin_required=true:proxy 探测到
+    // chatgpt backend 401,或本地 JWT 过期)→ **拒绝开启**、要求重登。否则会把同一个被撤销 token
+    // 写回 auth_mode=chatgpt 报 enabled,直到下次请求又 401。detect 仍判 logged_in=true 是因为
+    // 本地 token 未过期、但服务端已失效 —— H-2 的 relogin 信号正是补这个 local-exp 盲点,enable
+    // 必须消费它,否则前端提示重登却又能开被撤销账号(信号形同虚设)。
+    if status.relogin_required {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "账号已失效(服务端撤销 / 过期),请重新登录后再开启真实账号模式".to_owned(),
         )
         .into_response();
     }

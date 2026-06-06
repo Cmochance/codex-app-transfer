@@ -28,6 +28,6 @@ pub use forward::{forward_handler, ProxyState};
 pub use resolver::{
     AuthScheme, ProviderResolver, ResolveError, ResolvedProvider, SharedResolver, StaticResolver,
 };
-pub use server::build_router;
+pub use server::{build_router, build_router_with_relogin};
 pub use telemetry::{proxy_log_dir, proxy_telemetry, ProxyLogEntry, ProxyStatsSnapshot};
 pub use trace_store::{trace_store, TraceEntry, TraceKind, TraceStore};

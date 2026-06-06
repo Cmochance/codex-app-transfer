@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use codex_app_transfer_proxy::{build_router, StaticResolver};
+use codex_app_transfer_proxy::{build_router_with_relogin, StaticResolver};
 use codex_app_transfer_registry::{config_file, Config};
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -103,7 +103,13 @@ impl ProxyManager {
                     let addr = listener
                         .local_addr()
                         .map_err(|e| format!("cannot read listener address: {e}"))?;
-                    let router = build_router(resolver);
+                    // [MOC-124 H-2] 注入「chatgpt backend 透传遇上游 401 → 账号需重登」回调:proxy
+                    // 探测到服务端 token 失效(本地 JWT exp 看不到的撤销)时回灌 relogin,让前端轮询
+                    // status 时及时提示重登。
+                    let router = build_router_with_relogin(
+                        resolver,
+                        Arc::new(crate::codex_real_account::mark_relogin_required_from_proxy),
+                    );
                     // 在 runtime 上 spawn server —— 当 runtime shutdown_background
                     // 时此 task 同步被 abort,listener + 所有 connection sub-task
                     // 一起 drop,fd close。

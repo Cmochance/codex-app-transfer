@@ -43,6 +43,24 @@ pub struct ProxyState {
     pub http: reqwest::Client,
     pub resolver: SharedResolver,
     pub adapters: AdapterRegistry,
+    /// [MOC-124 H-2] chatgpt backend 透传遇上游 401(服务端 token 失效)时回灌 src-tauri 账号
+    /// 状态机的通道。relay 下 transfer 不主动刷新 token,`detect()` 用本地 JWT `exp` 判有效 ——
+    /// 服务端撤销 / refresh_token 失效本地 exp 看不到 → 前端永显账号正常、用户不知要重登。上游
+    /// 401 是唯一能感知 token 被服务端撤销的信号。proxy crate 不依赖 src-tauri,故用依赖倒置:
+    /// 此处只持 `Arc<dyn Fn>`,由 src-tauri 注入 `mark_relogin_required_from_proxy`。`None` =
+    /// 未注入(测试 / proxy 独立运行),回灌静默跳过。
+    ///
+    /// 参数 = 被撤销 token 的指纹(Authorization Bearer token 的 FNV-1a)。src-tauri 据此让
+    /// `detect()` 的 self-heal 只在 active token **变了**(app 外 login / 重新导入 → 指纹不同)
+    /// 时才清 relogin;还是被撤销的那个旧 token(指纹相同、本地 exp 没过)就**保持** —— 不然
+    /// detect 用 local-exp 判有效会立刻抹掉本回灌(H-2 形同无效,本 PR 的 BLOCKER)。
+    ///
+    /// **只对 401 回灌、不做 2xx 自愈**(codex-connector P2):2xx 自愈会被并发请求乱序破坏 ——
+    /// 撤销前发出的旧请求 2xx 若晚于撤销后的 401 完成,会清掉 revocation、漏报真撤销(危险)。
+    /// 而 chatgpt backend 的 401 = OpenAI auth 层真 token 问题(撤销/过期),**不存在「token
+    /// 有效但瞬时 401」**(CF edge 对已认证返 403/503、backend 瞬时故障返 5xx,都不是 401),故
+    /// 无需 2xx 自愈;401 一律标记需重登(误报方向安全,清零由 detect 换 token / 重登入口做)。
+    on_chatgpt_unauthorized: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// 出站 reqwest 默认 User-Agent — 在 provider.extra_headers 没配 UA、客户端
@@ -88,6 +106,7 @@ impl ProxyState {
                 .expect("reqwest client"),
             resolver,
             adapters: AdapterRegistry::with_builtins(),
+            on_chatgpt_unauthorized: None,
         }
     }
 
@@ -96,11 +115,23 @@ impl ProxyState {
             http,
             resolver,
             adapters: AdapterRegistry::with_builtins(),
+            on_chatgpt_unauthorized: None,
         }
     }
 
     pub fn with_adapters(mut self, adapters: AdapterRegistry) -> Self {
         self.adapters = adapters;
+        self
+    }
+
+    /// [MOC-124 H-2] 注入「chatgpt backend 透传遇上游 401 → 回灌账号需重登」回调。src-tauri
+    /// 侧用它注入 `codex_real_account::mark_relogin_required_from_proxy`,把服务端 token 失效
+    /// (本地 JWT exp 看不到的撤销)反映到前端账号状态。回调参数 = 被撤销 token 的指纹。
+    pub fn with_relogin_notify(
+        mut self,
+        notify: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
+    ) -> Self {
+        self.on_chatgpt_unauthorized = Some(notify);
         self
     }
 }
@@ -746,6 +777,27 @@ async fn passthrough_chatgpt_backend(
         ),
     );
 
+    // [MOC-124 H-2] chatgpt backend 透传遇上游 401 = 服务端 token 失效(token_invalidated /
+    // refresh 撤销;本地 JWT exp 可能没到 → `detect()` 仍判账号有效、前端永显正常)→ 回灌账号
+    // 状态机标记需重登。**只对 401**(403 是权限 / plugins gate 非 token 失效;**不做 2xx 自愈**
+    // —— 并发请求乱序下撤销前的旧 2xx 会清掉撤销后的 401 标记、漏报真撤销,见字段 doc)。传被
+    // 撤销 token 的指纹(Codex 透传的 Authorization Bearer token 的 FNV-1a,跟 src-tauri 算
+    // auth.json access_token 同 token 同 FNV → 一致),detect 据此判「换 token 才清」。ERROR
+    // 日志只首次 401 记(去重 —— token 失效后 Codex 密集重试,避免刷屏)。
+    if is_chatgpt_token_invalidated(status) {
+        if let Some(notify) = &state.on_chatgpt_unauthorized {
+            notify(authorization_token_fingerprint(headers));
+        }
+        if !RELOGIN_NOTIFIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            telemetry.logs.add(
+                "ERROR",
+                format!(
+                    "[chatgpt-relay] 上游 401 → chatgpt 账号 token 服务端失效,已回灌 relogin_required(后续 401 静默): {client_path}"
+                ),
+            );
+        }
+    }
+
     // [MOC-125] chatgpt-backend passthrough 诊断:gate 开时记一条(inbound Codex 请求 / outbound
     // 转发 chatgpt.com / response 回包,header 用 cookie 友好脱敏)。定位远程控制 enroll/server
     // 404 死循环的会话连续性(set-cookie Domain 是否不匹配 relay host → Codex 不回带 cookie)。
@@ -947,6 +999,43 @@ impl Drop for TracedStream {
 /// CAS_DIAG_TRACE 却因权限/满盘一行没写时,至少有一句提示而非完全静默。
 static TRACE_WRITE_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// [MOC-124 H-2] chatgpt backend 首次 401 回灌后置真,后续 401 不再重复刷 ERROR 日志
+/// (token 失效后 Codex 密集重试,避免日志爆炸)。回调本身仍每次调(幂等)。进程级、不 reset
+/// —— ERROR 是「token 服务端失效」的一次性信号,记一次足够;状态正确性由幂等回调保证。
+/// 代价:同进程内二次失效(用户重登后新 token 又被撤销)不再记日志 —— 可接受,回调照常 fire、
+/// 状态正确,日志仅诊断用;**不要**为补这条日志而 reset 此 flag,否则 retry storm 又刷屏。
+static RELOGIN_NOTIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [MOC-124 H-2] 上游 status 是否表示「chatgpt 账号 token 被服务端撤销、应回灌 relogin」。
+/// **只 401**(明确鉴权失败);403 是权限语义(plugins gate / 地区限制等)非 token 失效,回灌
+/// 会误报。提独立 fn + 单测边界文档化「只 401 不含 403」;若将来要纳入其他鉴权失败码,改这里
+/// 并同步更新单测。
+fn is_chatgpt_token_invalidated(status: u16) -> bool {
+    status == 401
+}
+
+/// [MOC-124 H-2] 算请求 Authorization Bearer token 的 FNV-1a 64 指纹,作「被撤销 token」的
+/// 标识回传 src-tauri。src-tauri 对 auth.json 的 `access_token` 算**同一指纹**比对,判 active
+/// token 是否已换(换了 → detect 清 relogin;没换 → 保持)。两侧都对 raw token(无 `Bearer `
+/// 前缀)算、用同一 FNV-1a(offset basis `0xcbf29ce484222325` + prime `0x100000001b3`)。
+/// 无 Authorization → 0(src-tauri 把 0 当「无撤销记录」)。
+fn authorization_token_fingerprint(headers: &HeaderMap) -> u64 {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
+        .unwrap_or("");
+    if token.is_empty() {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in token.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 /// 把 owned [`ForwardTraceCtx`] + 响应体借成 [`ForwardTraceInput`] 写一行 jsonl。成功
 /// 路径(`TracedStream::Drop`,body 来自 tee、可能被 cap 截断 → 传 `response_full_len`
@@ -2347,5 +2436,67 @@ mod tests {
             build_upstream_url("https://api.openai.com/v1/", "/responses"),
             "https://api.openai.com/v1/responses"
         );
+    }
+
+    // [MOC-124 H-2] chatgpt backend 透传遇上游 401 → 回灌 relogin 的边界:只 401 不含 403
+    #[test]
+    fn token_invalidated_only_on_401_not_403() {
+        assert!(is_chatgpt_token_invalidated(401));
+        // 403 是权限语义(plugins gate / 地区限制等),非 token 失效 → 不回灌,避免误报
+        assert!(!is_chatgpt_token_invalidated(403));
+        assert!(!is_chatgpt_token_invalidated(200));
+        assert!(!is_chatgpt_token_invalidated(404));
+        assert!(!is_chatgpt_token_invalidated(500));
+    }
+
+    // [MOC-124 H-2] relogin 回调:默认无、注入后在位且可触发,且收到被撤销 token 的指纹
+    #[test]
+    fn with_relogin_notify_injects_callback_and_fires() {
+        use crate::resolver::StaticResolver;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let resolver = Arc::new(StaticResolver::new(None, vec![], None));
+        // 默认未注入回调(测试 / proxy 独立运行)
+        assert!(ProxyState::new(resolver.clone())
+            .on_chatgpt_unauthorized
+            .is_none());
+        // 注入后回调在位且可触发(src-tauri 侧注入 mark_relogin_required_from_proxy 即走这条);
+        // 回调参数 = 被撤销 token 的指纹,验最后一次收到的值。
+        let last_fp = Arc::new(AtomicU64::new(0));
+        let last_fp2 = last_fp.clone();
+        let state = ProxyState::new(resolver).with_relogin_notify(Arc::new(move |fp| {
+            last_fp2.store(fp, Ordering::SeqCst);
+        }));
+        let cb = state
+            .on_chatgpt_unauthorized
+            .as_ref()
+            .expect("回调应已注入");
+        cb(42);
+        cb(99);
+        assert_eq!(
+            last_fp.load(Ordering::SeqCst),
+            99,
+            "回调应收到最后传入的指纹"
+        );
+    }
+
+    // [MOC-124 H-2] token 指纹:strip Bearer、稳定、空头 → 0、不同 token 不同指纹
+    #[test]
+    fn authorization_token_fingerprint_strips_bearer_and_is_stable() {
+        use axum::http::header::{HeaderValue, AUTHORIZATION};
+        let fp = |val: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(AUTHORIZATION, HeaderValue::from_str(val).unwrap());
+            authorization_token_fingerprint(&h)
+        };
+        // 无 Authorization → 0
+        assert_eq!(authorization_token_fingerprint(&HeaderMap::new()), 0);
+        // "Bearer X" 跟裸 "X" 同指纹(strip Bearer)→ proxy 与 src-tauri 算同一 token 一致
+        assert_eq!(fp("Bearer tok_abc"), fp("tok_abc"));
+        // 稳定 + 非 0 + 不同 token 不同指纹
+        assert_eq!(fp("Bearer tok_abc"), fp("Bearer tok_abc"));
+        assert_ne!(fp("Bearer tok_abc"), 0);
+        assert_ne!(fp("Bearer tok_abc"), fp("Bearer tok_xyz"));
     }
 }

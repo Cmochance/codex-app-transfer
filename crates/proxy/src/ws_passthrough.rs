@@ -80,6 +80,10 @@ pub async fn proxy_remote_control(
         }
     }
 
+    // [MOC-124 H-2 note] 这条 WS upgrade 失败(含上游 401 = chatgpt token 服务端失效)**不**单独
+    // 回灌账号 relogin —— H-2 的回灌只挂在 HTTP passthrough(forward.rs `passthrough_chatgpt_backend`)。
+    // 同一个被撤销的 token 必然让 Codex 的 HTTP `getAccount`/`plugins` poll 也 401、被那条捕获回灌,
+    // 故 WS 这条不重复处理(HTTP poll 是可靠兜底,Codex 持续 poll backend)。
     let upstream: UpWebSocket = match req.upgrade().send().await {
         Ok(resp) => match resp.into_websocket().await {
             Ok(ws) => ws,
