@@ -706,13 +706,16 @@ pub async fn forget_imported() -> Result<bool, String> {
         // 源路径重读、把已"忘记"的账号复活)。
         write_imported_source_path(&paths, None);
     }
-    // [connector review] 清除账号后不再有可重登的保留账号 → 清掉「需重新登录」标记,
-    // 否则 status 仍带 relogin_required=true,UI 继续提示「账号已失效」要重登。
-    clear_relogin_state(); // [MOC-124 H-2] 一并清撤销 token 指纹
-                           // [MOC-178] 不在这里删/改活动 auth.json —— 删整个文件会丢 tokens(退出 restore 只恢复
-                           // MANAGED 的 auth_mode/OPENAI_API_KEY、tokens 恢复不回 → 残缺)。停用真实账号(让 toggle
-                           // 关 + Codex 原生不显示 plugins)改由 forget_handler apply 当前 provider 强制 non-relay
-                           // 完成:写 auth_mode=apikey 但**保留 tokens**,退出 restore 才能写回 chatgpt + tokens 完整恢复。
+    // [MOC-124 H-2 / codex-connector P2] **不**在这里清 relogin / 撤销指纹 —— forget_imported
+    // 只删导入镜像、**保留活动 auth.json tokens**(见下 MOC-178)。若活动 token 正是被服务端 401
+    // 撤销的那个,清掉撤销状态会让它在重新启用真账号时被 detect 当 healthy 呈现(漏报撤销)。交给
+    // detect 自然处理:活动 token 有效(指纹不同 / 无撤销记录)→ self-heal 清 relogin;还是被撤销
+    // 的那个(指纹相同)→ 保持提示重登。比硬清更正确(detect 的指纹对比本就区分这两种)。
+    //
+    // [MOC-178] 不在这里删/改活动 auth.json —— 删整个文件会丢 tokens(退出 restore 只恢复
+    // MANAGED 的 auth_mode/OPENAI_API_KEY、tokens 恢复不回 → 残缺)。停用真实账号(让 toggle
+    // 关 + Codex 原生不显示 plugins)改由 forget_handler apply 当前 provider 强制 non-relay
+    // 完成:写 auth_mode=apikey 但**保留 tokens**,退出 restore 才能写回 chatgpt + tokens 完整恢复。
     Ok(had_mirror)
 }
 
