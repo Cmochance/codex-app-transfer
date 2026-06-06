@@ -43,23 +43,24 @@ pub struct ProxyState {
     pub http: reqwest::Client,
     pub resolver: SharedResolver,
     pub adapters: AdapterRegistry,
-    /// [MOC-124 H-2] chatgpt backend 透传的**鉴权结果**回灌 src-tauri 账号状态机的通道。
-    /// relay 下 transfer 不主动刷新 token,`detect()` 用本地 JWT `exp` 判有效 —— 服务端撤销 /
-    /// refresh_token 失效本地 exp 看不到 → 前端永显账号正常、用户不知要重登。上游 401 是唯一
-    /// 能感知 token 被服务端撤销的信号。proxy crate 不依赖 src-tauri,故用依赖倒置:此处只持
-    /// `Arc<dyn Fn>`,由 src-tauri 注入 `report_chatgpt_backend_auth`。`None` = 未注入(测试 /
-    /// proxy 独立运行),回灌静默跳过。
+    /// [MOC-124 H-2] chatgpt backend 透传遇上游 401(服务端 token 失效)时回灌 src-tauri 账号
+    /// 状态机的通道。relay 下 transfer 不主动刷新 token,`detect()` 用本地 JWT `exp` 判有效 ——
+    /// 服务端撤销 / refresh_token 失效本地 exp 看不到 → 前端永显账号正常、用户不知要重登。上游
+    /// 401 是唯一能感知 token 被服务端撤销的信号。proxy crate 不依赖 src-tauri,故用依赖倒置:
+    /// 此处只持 `Arc<dyn Fn>`,由 src-tauri 注入 `mark_relogin_required_from_proxy`。`None` =
+    /// 未注入(测试 / proxy 独立运行),回灌静默跳过。
     ///
-    /// 回调参数 `(token_fp, unauthorized)`:`token_fp` = 该请求 Authorization Bearer token 的
-    /// FNV-1a 指纹;`unauthorized` = 上游是否返 401。src-tauri 据此:
-    /// - **401**(`unauthorized=true`)→ 记下被撤销 token 的指纹 + 标记需重登。`detect()` 的
-    ///   self-heal 只在 active token **变了**(app 外 login / 重新导入 → 指纹不同)时才清,
-    ///   否则(还是这个被撤销、本地 exp 没过的旧 token)**保持** relogin —— 不然 detect 用
-    ///   local-exp 判有效会立刻抹掉本回灌(H-2 形同无效,本 PR 的 BLOCKER)。
-    /// - **2xx**(`unauthorized=false`)→ 若该 token 正是之前被 401 标记撤销的、说明它又有效了
-    ///   (瞬时 401 恢复)→ 清。**真撤销持续 401、永不 2xx → 保持;瞬时 401 后续 2xx → 自愈**,
-    ///   据此精确区分,避免瞬时 401 把 relogin 卡死。
-    on_chatgpt_unauthorized: Option<std::sync::Arc<dyn Fn(u64, bool) + Send + Sync>>,
+    /// 参数 = 被撤销 token 的指纹(Authorization Bearer token 的 FNV-1a)。src-tauri 据此让
+    /// `detect()` 的 self-heal 只在 active token **变了**(app 外 login / 重新导入 → 指纹不同)
+    /// 时才清 relogin;还是被撤销的那个旧 token(指纹相同、本地 exp 没过)就**保持** —— 不然
+    /// detect 用 local-exp 判有效会立刻抹掉本回灌(H-2 形同无效,本 PR 的 BLOCKER)。
+    ///
+    /// **只对 401 回灌、不做 2xx 自愈**(codex-connector P2):2xx 自愈会被并发请求乱序破坏 ——
+    /// 撤销前发出的旧请求 2xx 若晚于撤销后的 401 完成,会清掉 revocation、漏报真撤销(危险)。
+    /// 而 chatgpt backend 的 401 = OpenAI auth 层真 token 问题(撤销/过期),**不存在「token
+    /// 有效但瞬时 401」**(CF edge 对已认证返 403/503、backend 瞬时故障返 5xx,都不是 401),故
+    /// 无需 2xx 自愈;401 一律标记需重登(误报方向安全,清零由 detect 换 token / 重登入口做)。
+    on_chatgpt_unauthorized: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// 出站 reqwest 默认 User-Agent — 在 provider.extra_headers 没配 UA、客户端
@@ -123,12 +124,12 @@ impl ProxyState {
         self
     }
 
-    /// [MOC-124 H-2] 注入「chatgpt backend 透传鉴权结果 → 回灌账号状态」回调。src-tauri 侧用
-    /// 它注入 `codex_real_account::report_chatgpt_backend_auth`,把服务端 token 失效(本地 JWT
-    /// exp 看不到的撤销)/ 恢复反映到前端账号状态。回调参数 `(token_fp, unauthorized)`。
+    /// [MOC-124 H-2] 注入「chatgpt backend 透传遇上游 401 → 回灌账号需重登」回调。src-tauri
+    /// 侧用它注入 `codex_real_account::mark_relogin_required_from_proxy`,把服务端 token 失效
+    /// (本地 JWT exp 看不到的撤销)反映到前端账号状态。回调参数 = 被撤销 token 的指纹。
     pub fn with_relogin_notify(
         mut self,
-        notify: std::sync::Arc<dyn Fn(u64, bool) + Send + Sync>,
+        notify: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
     ) -> Self {
         self.on_chatgpt_unauthorized = Some(notify);
         self
@@ -776,25 +777,18 @@ async fn passthrough_chatgpt_backend(
         ),
     );
 
-    // [MOC-124 H-2] 回灌 chatgpt backend 鉴权结果给 src-tauri 账号状态机。401 = 服务端 token
-    // 失效(token_invalidated / refresh 撤销;本地 JWT exp 可能没到 → `detect()` 仍判账号有效、
-    // 前端永显正常);2xx = token 仍有效(瞬时 401 后又成功 → 自愈)。只这两类是 token 有效性
-    // 信号 —— 403(权限 / plugins gate)、其他 4xx/5xx 不是,跳过。传被撤销 token 的指纹(Codex
-    // 透传的 Authorization Bearer token 的 FNV-1a,跟 src-tauri 算 auth.json access_token 同
-    // token 同 FNV → 一致),src-tauri 据此区分真撤销(持续 401、保持 relogin)vs 瞬时(后续 2xx、
-    // 自愈)。ERROR 日志只首次 401 记(去重 —— token 失效后 Codex 密集重试,避免刷屏)。
-    let auth_signal = if is_chatgpt_token_invalidated(status) {
-        Some(true)
-    } else if (200..300).contains(&status) {
-        Some(false)
-    } else {
-        None
-    };
-    if let Some(unauthorized) = auth_signal {
+    // [MOC-124 H-2] chatgpt backend 透传遇上游 401 = 服务端 token 失效(token_invalidated /
+    // refresh 撤销;本地 JWT exp 可能没到 → `detect()` 仍判账号有效、前端永显正常)→ 回灌账号
+    // 状态机标记需重登。**只对 401**(403 是权限 / plugins gate 非 token 失效;**不做 2xx 自愈**
+    // —— 并发请求乱序下撤销前的旧 2xx 会清掉撤销后的 401 标记、漏报真撤销,见字段 doc)。传被
+    // 撤销 token 的指纹(Codex 透传的 Authorization Bearer token 的 FNV-1a,跟 src-tauri 算
+    // auth.json access_token 同 token 同 FNV → 一致),detect 据此判「换 token 才清」。ERROR
+    // 日志只首次 401 记(去重 —— token 失效后 Codex 密集重试,避免刷屏)。
+    if is_chatgpt_token_invalidated(status) {
         if let Some(notify) = &state.on_chatgpt_unauthorized {
-            notify(authorization_token_fingerprint(headers), unauthorized);
+            notify(authorization_token_fingerprint(headers));
         }
-        if unauthorized && !RELOGIN_NOTIFIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if !RELOGIN_NOTIFIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             telemetry.logs.add(
                 "ERROR",
                 format!(
@@ -2467,29 +2461,23 @@ mod tests {
         assert!(ProxyState::new(resolver.clone())
             .on_chatgpt_unauthorized
             .is_none());
-        // 注入后回调在位且可触发(src-tauri 侧注入 report_chatgpt_backend_auth 即走这条);
-        // 回调参数 (token_fp, unauthorized),验最后一次收到的指纹 + 标志。
+        // 注入后回调在位且可触发(src-tauri 侧注入 mark_relogin_required_from_proxy 即走这条);
+        // 回调参数 = 被撤销 token 的指纹,验最后一次收到的值。
         let last_fp = Arc::new(AtomicU64::new(0));
-        let last_unauth = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (last_fp2, last_unauth2) = (last_fp.clone(), last_unauth.clone());
-        let state = ProxyState::new(resolver).with_relogin_notify(Arc::new(move |fp, unauth| {
+        let last_fp2 = last_fp.clone();
+        let state = ProxyState::new(resolver).with_relogin_notify(Arc::new(move |fp| {
             last_fp2.store(fp, Ordering::SeqCst);
-            last_unauth2.store(unauth, Ordering::SeqCst);
         }));
         let cb = state
             .on_chatgpt_unauthorized
             .as_ref()
             .expect("回调应已注入");
-        cb(42, true);
-        cb(99, false);
+        cb(42);
+        cb(99);
         assert_eq!(
             last_fp.load(Ordering::SeqCst),
             99,
             "回调应收到最后传入的指纹"
-        );
-        assert!(
-            !last_unauth.load(Ordering::SeqCst),
-            "回调应收到最后传入的 unauthorized 标志"
         );
     }
 

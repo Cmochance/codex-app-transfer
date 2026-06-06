@@ -103,12 +103,12 @@ impl ProxyManager {
                     let addr = listener
                         .local_addr()
                         .map_err(|e| format!("cannot read listener address: {e}"))?;
-                    // [MOC-124 H-2] 注入「chatgpt backend 透传鉴权结果 → 账号状态」回调:proxy
-                    // 401 探测到服务端 token 失效(本地 JWT exp 看不到的撤销)→ 回灌 relogin;2xx
-                    // → token 仍有效(瞬时 401 自愈),让前端轮询 status 时及时提示/收回重登。
+                    // [MOC-124 H-2] 注入「chatgpt backend 透传遇上游 401 → 账号需重登」回调:proxy
+                    // 探测到服务端 token 失效(本地 JWT exp 看不到的撤销)时回灌 relogin,让前端轮询
+                    // status 时及时提示重登。
                     let router = build_router_with_relogin(
                         resolver,
-                        Arc::new(crate::codex_real_account::report_chatgpt_backend_auth),
+                        Arc::new(crate::codex_real_account::mark_relogin_required_from_proxy),
                     );
                     // 在 runtime 上 spawn server —— 当 runtime shutdown_background
                     // 时此 task 同步被 abort,listener + 所有 connection sub-task
