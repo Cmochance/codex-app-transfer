@@ -1,4 +1,4 @@
-//! 网络集成测试: 真实打到 Cloudflare 强保域, 验证 `wreq` + `Emulation::Chrome131` 真的能过。
+//! 网络集成测试: 真实打到 Cloudflare 强保域, 验证 `wreq` + `Emulation::Chrome120` 真的能过。
 //!
 //! 运行: `cargo test -p codex-app-transfer-http --test cf_bypass -- --include-ignored --nocapture`
 //! 默认 `#[ignore]` 避免 CI 无网络环境挂掉; 本地手动跑拿真实数据。

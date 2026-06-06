@@ -450,7 +450,7 @@ async fn fetch_curl_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     })
 }
 
-/// ② wreq 浏览器 TLS 指纹 (Chrome 147)。返回 RawFetch (不判 status)。
+/// ② wreq 浏览器 TLS 指纹 (Chrome 120)。返回 RawFetch (不判 status)。
 async fn fetch_wreq_raw(url: &str) -> Result<RawFetch, WebFetchError> {
     let client =
         crate::ImpersonatingClient::chrome().map_err(|e| WebFetchError::Wreq(e.to_string()))?;

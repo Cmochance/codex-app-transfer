@@ -240,7 +240,7 @@ impl HeadlessBrowser {
             .ok()
             .and_then(|r| r.into_value::<String>().ok())
             .map(|ua| ua.replace("HeadlessChrome", "Chrome"))
-            // fallback: 读不到真实 UA 时用全 crate 统一的 CHROME_UA (147, 见 impersonating 模块
+            // fallback: 读不到真实 UA 时用全 crate 统一的 CHROME_UA (120, 见 impersonating 模块
             // 版本统一约定) —— 与 wreq 指纹层声称同版本, 不留老版本号被被动反爬识破 (MOC-186)。
             .unwrap_or_else(|| crate::impersonating::CHROME_UA.to_string());
         if let Err(e) = page.enable_stealth_mode_with_agent(&ua).await {
