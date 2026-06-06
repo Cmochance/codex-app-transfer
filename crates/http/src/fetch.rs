@@ -118,36 +118,70 @@ pub async fn web_fetch(
     backend: WebFetchBackend,
     url: &str,
 ) -> Result<WebFetchOutcome, WebFetchError> {
-    let f = match backend {
-        // Auto: curl→wreq→headless 按失败信号自动升级 + per-origin 复用 (MOC-161)。
-        WebFetchBackend::Auto => web_fetch_auto(url).await?,
-        WebFetchBackend::Curl => single_tier(WebFetchBackend::Curl, url).await?,
-        WebFetchBackend::Wreq => single_tier(WebFetchBackend::Wreq, url).await?,
-        // headless 渲染后的 page.content() 恒为完整 HTML 文档 (无 HTTP status)。
-        WebFetchBackend::Headless => Fetched {
-            body: crate::headless::fetch_rendered_html(url).await?,
-            is_html: true,
-            final_tier: WebFetchBackend::Headless,
-            trail: Vec::new(),
-            status: None,
-        },
+    // 客户端重定向跟随 (MOC-139): curl/reqwest 只跟 HTTP 3xx, **不跟 HTML meta refresh / JS
+    // location** —— 这类页 (如绕 Twitter/Substack title-card feud 的跳转页) curl 拿到的是正文
+    // 极少的占位页。占位页 + 解析出重定向 target → 换 URL 重抓 (防循环 + 记 trail)。
+    let mut current = url.to_string();
+    let mut hops: Vec<String> = Vec::new();
+    // 已访问 URL(精确比较防循环 + 自跳) —— 用纯 URL 列表, 不在格式化 trail 串上 `ends_with`
+    // (否则一个 URL 是另一个后缀时会误判成循环, devin review)。
+    let mut visited: Vec<String> = vec![current.clone()];
+    let f = loop {
+        let f = fetch_by_backend(backend, &current).await?;
+        if f.is_html && hops.len() < MAX_CLIENT_REDIRECTS {
+            let capped = cap_bytes(&f.body, MAX_HTML_INPUT_BYTES);
+            // 仅"正文极少的占位页"才尝试跟随 —— 正常页含 meta refresh/JS 也不动 (避免误跳)。
+            if visible_text_len(&capped) < MIN_EXTRACTED_CHARS {
+                if let Some(target) = detect_client_redirect(&capped, &current) {
+                    // 精确 URL 比较防循环(自跳也涵盖: current 已在 visited)。
+                    if !visited.contains(&target) {
+                        hops.push(format!("client-redirect → {target}"));
+                        visited.push(target.clone());
+                        current = target;
+                        continue;
+                    }
+                }
+            }
+        }
+        break f;
     };
+    // 内容按**重定向后的最终 URL** (current) 抽取 —— base url 决定相对链接解析。
     let content = if f.is_html {
         let capped = cap_bytes(&f.body, MAX_HTML_INPUT_BYTES);
         // 先抽正文 (剥 nav/页眉/页脚/侧栏/广告), 抽取不可靠则回退整页 —— 绝不丢内容。
-        match extract_main_content(&capped, url) {
+        match extract_main_content(&capped, &current) {
             Some(main) => html_to_markdown(&main),
             None => html_to_markdown(&capped),
         }
     } else {
         f.body
     };
+    let mut trail = hops;
+    trail.extend(f.trail);
     Ok(WebFetchOutcome {
         content,
         final_tier: f.final_tier,
-        trail: f.trail,
+        trail,
         status: f.status,
     })
+}
+
+/// 按后端抓一次 (不含客户端重定向跟随) —— 供 [`web_fetch`] 的重定向 loop 每跳调用。
+async fn fetch_by_backend(backend: WebFetchBackend, url: &str) -> Result<Fetched, WebFetchError> {
+    match backend {
+        // Auto: curl→wreq→headless 按失败信号自动升级 + per-origin 复用 (MOC-161)。
+        WebFetchBackend::Auto => web_fetch_auto(url).await,
+        WebFetchBackend::Curl => single_tier(WebFetchBackend::Curl, url).await,
+        WebFetchBackend::Wreq => single_tier(WebFetchBackend::Wreq, url).await,
+        // headless 渲染后的 page.content() 恒为完整 HTML 文档 (无 HTTP status)。
+        WebFetchBackend::Headless => Ok(Fetched {
+            body: crate::headless::fetch_rendered_html(url).await?,
+            is_html: true,
+            final_tier: WebFetchBackend::Headless,
+            trail: Vec::new(),
+            status: None,
+        }),
+    }
 }
 
 /// 下载体积上限 (MOC-152): 防误抓大文件把整个 body 读进内存。**靠服务器声明的 `Content-Length`**
@@ -159,6 +193,9 @@ const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// 抽取出的正文文本下限 (MOC-152): 低于此视为抽取不可靠 (非文章页 / 误剥) → 回退整页。
 const MIN_EXTRACTED_CHARS: usize = 200;
+
+/// 客户端重定向 (meta refresh / JS location) 最大跟随跳数 (MOC-139, 防循环)。
+const MAX_CLIENT_REDIRECTS: usize = 3;
 
 /// 命中二进制 / 非文本资源 → 返回中文类别名 (用于提示); 文本类返回 `None` (按正常抓取)。
 ///
@@ -455,6 +492,9 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
     // 记每档为何升级, 最终失败时拼进错误 —— 否则只看到"headless 失败", 不知 curl/wreq 为何升级
     // (review H1)。
     let mut trail: Vec<String> = Vec::new();
+    // 升级链里最后一个非空 body —— headless 失败时回退它, 避免把 curl/wreq 已拿到的内容变成
+    // Auto error(启发式升级如 is_js_shell 可能误判短静态页, chatgpt-codex review)。
+    let mut last_usable: Option<Fetched> = None;
     for &tier in &AUTO_TIERS[start_idx..] {
         if tier == WebFetchBackend::Headless {
             // headless 是终极兜底 (跑 JS), 无"升级信号"可言 —— 成功即返回, 失败即整体失败。
@@ -470,10 +510,15 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
                     });
                 }
                 Err(e) => {
+                    // headless 失败但升级链中有非空 body → 回退它(非破坏性降级)。不 remember
+                    // headless(它失败了), 也不记那档(它被判过升级信号, 记了下次还从那升)。
+                    if let Some(f) = last_usable.take() {
+                        return Ok(f);
+                    }
                     return Err(WebFetchError::Auto(format!(
                         "升级历程 [{}] 后 headless 仍失败: {e}",
                         trail.join("; ")
-                    )))
+                    )));
                 }
             }
         }
@@ -494,13 +539,24 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
             }
             // 有升级信号 (反爬 / 空 / JS 骨架) → 记原因, 升级到下一档。
             Ok(raw) => {
+                let is_shell = raw.is_html && is_js_shell(&raw.body);
                 trail.push(format!(
-                    "{tier:?}(status={} cf_hdr={} 空={} 骨架={})",
+                    "{tier:?}(status={} cf_hdr={} 空={} 骨架={is_shell})",
                     raw.status,
                     raw.cf_challenge_header,
                     raw.body.trim().is_empty(),
-                    raw.is_html && is_js_shell(&raw.body)
                 ));
+                // 留作 headless 失败时的回退 —— 判据见 worth_fallback(仅非标准 mount 兜底的不确定
+                // 启发式; 确认 app shell / 反爬 / 空 / 非-200 排除)。后到的合格档覆盖前面的。
+                if worth_fallback(&raw) {
+                    last_usable = Some(Fetched {
+                        body: raw.body,
+                        is_html: raw.is_html,
+                        final_tier: tier,
+                        trail: trail.clone(),
+                        status: Some(raw.status),
+                    });
+                }
                 continue;
             }
             // 二进制 / 超大: 升级也没用 (内容本身不抓), 直接返回。
@@ -517,6 +573,24 @@ async fn web_fetch_auto(url: &str) -> Result<Fetched, WebFetchError> {
         "所有后端均失败: {}",
         trail.join("; ")
     )))
+}
+
+/// auto 升级时, 该档 raw 是否值得留作 headless 失败的回退 body。**仅"非标准 mount 兜底"这种不确定
+/// 启发式** —— `has_app_bundle_script`(MOC-183)可能把有内容的短静态页误判成空壳, 误升后若 headless
+/// 起不来, 回退它好过把 curl 已拿到的成功 body 变 Auto error(破坏性降级)。但以下一并排除:
+/// - **标准框架 mount**(`has_spa_skeleton`)是**确认的 app shell**: headless 失败应保留 Auto error 让
+///   调用方知道 headless 依赖坏了; 回退未渲染空壳既无内容、又掩盖故障(chatgpt-codex review 第 2 轮)。
+/// - 反爬挑战页(结构也像 shell)/ 空 body / 非-200 是**确定**失败信号, 回退会把挑战页/空当内容误导模型。
+/// `visible_text < MIN` 复刻 `is_js_shell` 的 gate(只对真"可见文本极少"的页回退)。
+fn worth_fallback(raw: &RawFetch) -> bool {
+    raw.status == 200
+        && raw.is_html
+        && !raw.cf_challenge_header
+        && !raw.body.trim().is_empty()
+        && !is_challenge_body(&raw.body)
+        && visible_text_len(&raw.body) < MIN_EXTRACTED_CHARS
+        && !has_spa_skeleton(&raw.body)
+        && has_app_bundle_script(&raw.body)
 }
 
 /// 这次抓取是否"不可恢复"—— 换 client 或 headless 渲染错误页都救不了, Auto 直接报错(不升级、不当
@@ -589,9 +663,87 @@ fn is_challenge_body(body: &str) -> bool {
 /// (特判反会漏真 CSR 空壳——它同样带 __NEXT_DATA__)。
 fn is_js_shell(html: &str) -> bool {
     // 仅"可见文本少"不够 —— 短静态页(status 页 / 小 snippet)也少, 但 curl 已成功, 升 headless
-    // 是无谓浪费、甚至(headless 不可用时)把成功变失败(chatgpt-codex review)。要求**同时**有 SPA
-    // 骨架信号(已知挂载点 + script)才判 shell; 短静态页(无挂载点)放行为成功。
-    visible_text_len(html) < MIN_EXTRACTED_CHARS && has_spa_skeleton(html)
+    // 是无谓浪费。要求可见文本极少 **且** 有"内容靠 JS 渲染"的信号才判 shell。
+    if visible_text_len(html) >= MIN_EXTRACTED_CHARS {
+        return false;
+    }
+    // ① 标准框架 mount + script(精确覆盖 React/Vue/Next/Nuxt/Angular)。
+    // ② MOC-183 兜底: 非标准 mount 但有 bundle 脚本(ESM `type=module` / 外部 `.js`) —— 实测
+    //    mouseless.click / doscienceto.it 这类被原 mount 白名单漏判, headless 能抓到内容
+    //    (vtext 163→1722 / 21→126)。静态短页(status/snippet)不引 module/bundle.js → 不误升,
+    //    保住"避免误升静态短页"的原 trade-off。
+    has_spa_skeleton(html) || has_app_bundle_script(html)
+}
+
+/// "加载 JS 应用"的 bundle 脚本特征 (MOC-183): ESM `<script type=module>` 或外部 `.js`/`.mjs`
+/// 引用 —— 现代构建工具 (vite/webpack/rollup) 产物。用于 [`is_js_shell`] 的非标准 mount 兜底:
+/// **仅在可见文本已极少时才查** (调用点已 gate), 故"正文里恰好提到 .js"的误判窗口极小。
+fn has_app_bundle_script(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    if !lower.contains("<script") {
+        return false;
+    }
+    // ESM `type=module` 声明(容忍等号空格 + 引号变体) 或外部 .js/.mjs bundle 引用。
+    has_module_type_attr(&lower) || has_js_bundle_url(&lower)
+}
+
+/// `lower`(已小写)是否有 `type` 属性值 = `module` —— ESM script 声明。容忍**等号周围空格**
+/// (`type = "module"`) + 三种引号(双 / 单 / 无), 对齐 [`id_attr_matches`] 的宽容解析(chatgpt-codex
+/// review 第 3 轮:exact substring 漏 spaced 变体)。`type` 前须非 ident 字符(避免 `mimetype` /
+/// `datatype` 误命中), `module` 后须是引号 / 空白 / `>` / `/`(避免 `module-x` 误命中)。
+fn has_module_type_attr(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("type") {
+        let start = from + pos;
+        from = start + 4;
+        if start > 0 {
+            let p = bytes[start - 1];
+            if p.is_ascii_alphanumeric() || p == b'_' || p == b'-' {
+                continue;
+            }
+        }
+        let rest = lower[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
+        if let Some(after) = rest.strip_prefix("module") {
+            if after.is_empty() || after.starts_with(['"', '\'', ' ', '>', '/', '\t', '\n', '\r']) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `lower`(已小写)是否含 `.js`/`.mjs` 后接 URL 结束符的子串 —— 外部 JS bundle 引用。结束符:
+/// 引号 / query `?` / fragment `#` / 空白 / `>` / 串尾。避免 `.json`/`.jsx`(后接字母)误命中,
+/// 容忍 cache-bust query(`app.js?v=123`, chatgpt-codex)。
+fn has_js_bundle_url(lower: &str) -> bool {
+    for pat in [".mjs", ".js"] {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(pat) {
+            let end = from + rel + pat.len();
+            from = end;
+            match lower[end..].chars().next() {
+                None => return true,
+                Some(c)
+                    if c == '"'
+                        || c == '\''
+                        || c == '?'
+                        || c == '#'
+                        || c == '>'
+                        || c.is_ascii_whitespace() =>
+                {
+                    return true
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// SPA 骨架特征: 已知框架挂载点 (root/app/__next/__nuxt/ng-app/reactroot) + 页面挂着 `<script`
@@ -705,6 +857,270 @@ fn looks_like_html(body: &str) -> bool {
         || head.starts_with("<body")
 }
 
+/// HTML 客户端重定向 (meta refresh / JS location) 的目标 URL (MOC-139), resolve 为绝对 URL。
+/// curl/reqwest 只跟 HTTP 3xx, 不跟这两类 → 占位页跟随重抓的判据。调用点已 gate "正文极少"。
+fn detect_client_redirect(html: &str, base_url: &str) -> Option<String> {
+    let target = parse_meta_refresh(html).or_else(|| parse_js_location(html))?;
+    resolve_url(&target, base_url)
+}
+
+/// 解析 `<meta http-equiv="refresh" content="0; url=TARGET">` 的 TARGET (大小写/引号/空格容忍)。
+fn parse_meta_refresh(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<meta") {
+        let start = from + rel;
+        let end = lower[start..]
+            .find('>')
+            .map(|e| start + e + 1)
+            .unwrap_or(html.len());
+        from = end;
+        let tag_lower = &lower[start..end];
+        if !(tag_lower.contains("http-equiv") && tag_lower.contains("refresh")) {
+            continue;
+        }
+        // 严格提取 content 属性的**引号值**, 在值内找 url=(容忍空格), 再 decode HTML 实体:
+        // - 限 content 值内 → 不扫到 content 后的 data-url 等其他属性(chatgpt review)
+        // - `&amp;` 等实体浏览器导航前会 decode, 否则 query 串抓错(chatgpt review)
+        let Some(cval) = tag_attr_value(&html[start..end], tag_lower, "content") else {
+            continue;
+        };
+        let cval_lower = cval.to_ascii_lowercase();
+        if let Some(voff) = find_url_value_offset(&cval_lower) {
+            let raw = cval[voff..]
+                .trim_start_matches(['"', '\'', ' '])
+                .split(['"', '\'', '>', ' '])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !raw.is_empty() {
+                return Some(decode_html_entities(raw));
+            }
+        }
+    }
+    None
+}
+
+/// 在 content 属性值里找 `url`(前须非 ident, 避免 `curl` 等子串)后(**容忍等号空格** `url = X`)的值
+/// 起始字节偏移(相对入参 `s`) —— chatgpt-codex review。
+fn find_url_value_offset(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut p = 0;
+    while let Some(rel) = s[p..].find("url") {
+        let upos = p + rel;
+        p = upos + 3;
+        if upos > 0 && (bytes[upos - 1].is_ascii_alphanumeric() || bytes[upos - 1] == b'_') {
+            continue; // curl / blurl 等子串
+        }
+        let after = s[upos + 3..].trim_start();
+        let Some(rest) = after.strip_prefix('=') else {
+            continue;
+        };
+        let val = rest.trim_start();
+        return Some(s.len() - val.len());
+    }
+    None
+}
+
+/// 提取 tag 内 `attr = "value"` 的引号值(原 html 切片)。`attr` 前须非 ident(避免 `data-content`),
+/// 容忍等号周围空格 + 单/双引号。`html_tag`/`lower_tag` 须同一 tag 切片(等长, ascii lowercase)。
+fn tag_attr_value<'a>(html_tag: &'a str, lower_tag: &str, attr: &str) -> Option<&'a str> {
+    let bytes = lower_tag.as_bytes();
+    let mut p = 0;
+    while let Some(rel) = lower_tag[p..].find(attr) {
+        let a = p + rel;
+        p = a + attr.len();
+        if a > 0 {
+            let pc = bytes[a - 1];
+            if pc.is_ascii_alphanumeric() || pc == b'_' || pc == b'-' {
+                continue; // data-content / xcontent
+            }
+        }
+        let after = lower_tag[a + attr.len()..].trim_start();
+        let Some(after) = after.strip_prefix('=') else {
+            continue;
+        };
+        let after = after.trim_start();
+        let vbase = lower_tag.len() - after.len(); // after 在 tag 的字节偏移
+        match after.as_bytes().first() {
+            // 引号值: 取引号内到配对引号。
+            Some(&q) if q == b'"' || q == b'\'' => {
+                let vstart = vbase + 1;
+                let vend_rel = html_tag.get(vstart..)?.find(q as char)?;
+                return Some(&html_tag[vstart..vstart + vend_rel]);
+            }
+            // 无引号值(HTML 合法 `content=0;url=/x`): 到空白 / `>` / tag 末尾(chatgpt review)。
+            Some(_) => {
+                let rest = html_tag.get(vbase..)?;
+                let vend = rest
+                    .find([' ', '\t', '\n', '\r', '>'])
+                    .unwrap_or(rest.len());
+                return Some(&rest[..vend]);
+            }
+            None => continue,
+        }
+    }
+    None
+}
+
+/// decode meta refresh URL 里常见的 HTML 实体(浏览器导航前会 decode, 否则 `&amp;` 当字面量
+/// 抓错 query —— chatgpt review)。只覆盖 URL 里现实会出现的几个。
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&#x2f;", "/")
+        .replace("&#x2F;", "/")
+        .replace("&#47;", "/")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+/// `loc_start` 处的 `location` 是否为浏览器全局(可触发导航)—— bare `location`(前非 ident 非 `.`)
+/// 或 `window.`/`document.`/`self.`/`top.`/`globalthis.` 前缀。排除 `config.location` 等对象属性
+/// + `allocation`/`geolocation` 子串(chatgpt review)。入参 `lower` 已小写。
+fn location_is_global(lower: &str, loc_start: usize) -> bool {
+    if loc_start == 0 {
+        return true;
+    }
+    let bytes = lower.as_bytes();
+    let prev = bytes[loc_start - 1];
+    if prev == b'.' {
+        // 属性访问: `.` 前的标识符须是浏览器全局对象。
+        let before = &lower[..loc_start - 1];
+        ["window", "document", "self", "top", "globalthis"]
+            .iter()
+            .any(|g| {
+                before.ends_with(g) && {
+                    let gi = before.len() - g.len();
+                    gi == 0 || !(bytes[gi - 1].is_ascii_alphanumeric() || bytes[gi - 1] == b'_')
+                }
+            })
+    } else {
+        // 非属性访问: 须非 ident(bare location: 行首/`;`/空白/`{`/`(`)。排除 allocation/geolocation。
+        !(prev.is_ascii_alphanumeric() || prev == b'_')
+    }
+}
+
+/// 提取所有 `<script>...</script>` 的内容(开标签 `>` 到 `</script>` 之间; 忽略属性)。
+fn script_contents(html: &str) -> Vec<&str> {
+    let lower = html.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<script") {
+        let tag = from + rel;
+        let Some(gt) = lower[tag..].find('>') else {
+            break;
+        };
+        let cstart = tag + gt + 1;
+        let Some(close_rel) = lower[cstart..].find("</script>") else {
+            break;
+        };
+        let cend = cstart + close_rel;
+        out.push(&html[cstart..cend]);
+        from = cend + "</script>".len();
+    }
+    out
+}
+
+/// 从字符串字面量开引号下标 `i` 跳到结束引号之后(处理 `\` 转义); 返回结束后的下标。
+fn skip_js_string(bytes: &[u8], i: usize) -> usize {
+    let quote = bytes[i];
+    let n = bytes.len();
+    let mut j = i + 1;
+    while j < n {
+        match bytes[j] {
+            b'\\' => j += 2,
+            c if c == quote => return j + 1,
+            _ => j += 1,
+        }
+    }
+    n
+}
+
+/// 在一段 JS 代码内扫浏览器全局 `location` 的赋值/调用目标 URL —— **状态机跳过字符串字面量 +
+/// 行/块注释**, 避免把注释里的 `location`、或 URL 字面量里的 `//` 误判(chatgpt review)。
+fn scan_js_for_location(js: &str) -> Option<String> {
+    let lower = js.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => i = skip_js_string(bytes, i),
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                i = bytes[i..]
+                    .iter()
+                    .position(|&c| c == b'\n')
+                    .map_or(n, |p| i + p);
+            }
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i = lower[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2);
+            }
+            _ => {
+                if lower[i..].starts_with("location") && location_is_global(&lower, i) {
+                    if let Some(u) = location_target(js, &lower, i + "location".len()) {
+                        return Some(u);
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// `location` token 之后(偏移 `after`)解析跳转目标: `.replace('T')` / `.assign('T')` /
+/// `[.href] = 'T'`(容忍等号空格, 排除 `==` 比较)。URL 须 `http` / `/` 开头。
+fn location_target(js: &str, lower: &str, after: usize) -> Option<String> {
+    let tail = &js[after..];
+    let tail_lo = &lower[after..];
+    if tail_lo.starts_with(".replace(") || tail_lo.starts_with(".assign(") {
+        return first_quoted_url(tail);
+    }
+    let rest = if tail_lo.starts_with(".href") {
+        &tail[".href".len()..]
+    } else {
+        tail
+    };
+    let v = rest.trim_start().strip_prefix('=')?.trim_start();
+    if v.starts_with('=') {
+        return None; // `==` 比较, 非赋值
+    }
+    if v.starts_with(['"', '\'']) {
+        return first_quoted_url(v);
+    }
+    None
+}
+
+/// 解析 JS 客户端重定向(meta refresh 之外): **只在 `<script>` 内容内**、用状态机跳过字符串 +
+/// 注释后, 找浏览器全局 `location` 的赋值/调用。取第一个命中(chatgpt review: 限 script tag +
+/// 字符串/注释感知, 避免正文 / 注释 / URL 字面量误判)。
+fn parse_js_location(html: &str) -> Option<String> {
+    script_contents(html)
+        .into_iter()
+        .find_map(scan_js_for_location)
+}
+
+/// 取 `s` 中第一个引号包裹、`http`/`/` 开头的 URL(用于 JS 跳转目标提取)。
+fn first_quoted_url(s: &str) -> Option<String> {
+    let q = s.find(['"', '\''])?;
+    let quote = s.as_bytes()[q] as char;
+    let rest = &s[q + 1..];
+    let e = rest.find(quote)?;
+    let url = rest[..e].trim();
+    (url.starts_with("http") || url.starts_with('/')).then(|| url.to_string())
+}
+
+/// 相对 URL → 绝对 (用 `base_url` 解析; 已是绝对则规范化原样返回)。
+fn resolve_url(target: &str, base_url: &str) -> Option<String> {
+    reqwest::Url::parse(base_url)
+        .ok()?
+        .join(target)
+        .ok()
+        .map(|u| u.to_string())
+}
+
 /// HTML→markdown (htmd, Turndown 思路)。剥 script/style/noscript/svg 噪声; 转换失败或
 /// 转出空 (纯 JS 骨架等) → 回退原 HTML, 绝不丢内容。
 fn html_to_markdown(html: &str) -> String {
@@ -726,6 +1142,161 @@ fn html_to_markdown(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_meta_refresh_extracts_url() {
+        // meta refresh(lcamtuf 型)
+        let h = "<html><meta http-equiv='refresh' content='0; url=https://sub.example.com/p/x'><body></body></html>";
+        assert_eq!(
+            parse_meta_refresh(h).as_deref(),
+            Some("https://sub.example.com/p/x")
+        );
+        // 大写 + 双引号 + 相对路径
+        let h2 = "<META HTTP-EQUIV=\"Refresh\" CONTENT=\"5; URL=/relative/path\">";
+        assert_eq!(parse_meta_refresh(h2).as_deref(), Some("/relative/path"));
+        // data-url= 在 content 前不应被误匹配(chatgpt-codex review): 取 content 内的 url
+        assert_eq!(
+            parse_meta_refresh(
+                "<meta http-equiv='refresh' data-url='junk' content='0;url=https://e.com/real'>"
+            )
+            .as_deref(),
+            Some("https://e.com/real")
+        );
+        // url = X 等号空格(chatgpt-codex review 第 2 轮)
+        assert_eq!(
+            parse_meta_refresh("<meta http-equiv='refresh' content='0; url = /spaced'>").as_deref(),
+            Some("/spaced")
+        );
+        // content="0"(值内无 url)+ data-url → 不抓 data-url(chatgpt review 第 3 轮)
+        assert_eq!(
+            parse_meta_refresh("<meta http-equiv='refresh' content='0' data-url='/next'>"),
+            None
+        );
+        // HTML 实体 decode &amp;→&(chatgpt review 第 3 轮)
+        assert_eq!(
+            parse_meta_refresh(
+                "<meta http-equiv='refresh' content='0;url=https://e.com/x?a=1&amp;b=2'>"
+            )
+            .as_deref(),
+            Some("https://e.com/x?a=1&b=2")
+        );
+        // 无引号 content 值(HTML 合法 `content=0;url=/x`)(chatgpt review 第 4 轮)
+        assert_eq!(
+            parse_meta_refresh("<meta http-equiv=refresh content=0;url=/next>").as_deref(),
+            Some("/next")
+        );
+        // 非 refresh meta → None
+        assert_eq!(parse_meta_refresh("<meta charset='utf-8'><p>hi</p>"), None);
+    }
+
+    #[test]
+    fn parse_js_location_extracts_url() {
+        assert_eq!(
+            parse_js_location("<script>window.location.replace('https://e.com/a')</script>")
+                .as_deref(),
+            Some("https://e.com/a")
+        );
+        assert_eq!(
+            parse_js_location("<script>location.href = \"/path\"</script>").as_deref(),
+            Some("/path")
+        );
+        assert_eq!(
+            parse_js_location("<script>document.location='https://e.com/b'</script>").as_deref(),
+            Some("https://e.com/b")
+        );
+        // 读取 location(无引号 URL)→ None, 不误跳
+        assert_eq!(
+            parse_js_location("<script>var x = location.href;</script>"),
+            None
+        );
+        // location.href == 比较(非赋值)不当跳转目标(chatgpt-codex review)
+        assert_eq!(
+            parse_js_location("<script>if(location.href=='https://old.com/x'){}</script>"),
+            None
+        );
+        // window.location = 等号空格赋值(chatgpt-codex review 第 2 轮)
+        assert_eq!(
+            parse_js_location("<script>window.location = \"/next\"</script>").as_deref(),
+            Some("/next")
+        );
+        assert_eq!(
+            parse_js_location("<script>document.location = 'https://e.com/c'</script>").as_deref(),
+            Some("https://e.com/c")
+        );
+        // allocation / geolocation 子串不误命中 location(前是 ident)
+        assert_eq!(
+            parse_js_location("<script>var allocation='https://x.com'</script>"),
+            None
+        );
+        // config.location / router.location 对象属性不当浏览器跳转(chatgpt review 第 3 轮)
+        assert_eq!(
+            parse_js_location("<script>config.location = '/api/state'</script>"),
+            None
+        );
+        assert_eq!(
+            parse_js_location("<script>router.location.replace('/x')</script>"),
+            None
+        );
+        // window.location 浏览器全局仍正常
+        assert_eq!(
+            parse_js_location("<script>window.location.replace('https://e.com/g')</script>")
+                .as_deref(),
+            Some("https://e.com/g")
+        );
+        // 注释里的 location 不当跳转(chatgpt review 第 5 轮)
+        assert_eq!(
+            parse_js_location("<script>// location = '/next'</script>"),
+            None
+        );
+        assert_eq!(
+            parse_js_location("<script>/* location.replace('/x') */</script>"),
+            None
+        );
+        // 块注释**闭合后**的真 location 仍跟随
+        assert_eq!(
+            parse_js_location("<script>/* old */ location.replace('https://e.com/h')</script>")
+                .as_deref(),
+            Some("https://e.com/h")
+        );
+        // 正文(非 <script>)里的 location 不扫(chatgpt review 第 6 轮)
+        assert_eq!(
+            parse_js_location("<p>set your location = \"/settings\" here</p>"),
+            None
+        );
+        // 同行 URL 字面量(含 //)后的真跳转仍识别 —— 状态机跳字符串、不当注释(chatgpt review 第 6 轮)
+        assert_eq!(
+            parse_js_location("<script>const u=\"https://e.com\"; location=\"/next\"</script>")
+                .as_deref(),
+            Some("/next")
+        );
+    }
+
+    #[test]
+    fn detect_client_redirect_resolves() {
+        // 相对 URL → 用 base 解析为绝对
+        assert_eq!(
+            detect_client_redirect(
+                "<meta http-equiv='refresh' content='0;url=/p/x'>",
+                "https://lcamtuf.coredump.cx/blog/conway/"
+            )
+            .as_deref(),
+            Some("https://lcamtuf.coredump.cx/p/x")
+        );
+        // 绝对 URL 原样(规范化)
+        assert_eq!(
+            detect_client_redirect(
+                "<meta http-equiv='refresh' content='0;url=https://sub.example.com/p'>",
+                "https://lcamtuf.coredump.cx/blog/"
+            )
+            .as_deref(),
+            Some("https://sub.example.com/p")
+        );
+        // 正常页(无重定向)→ None
+        assert_eq!(
+            detect_client_redirect("<html><body>正常内容</body></html>", "https://e.com"),
+            None
+        );
+    }
 
     #[test]
     fn html_to_markdown_basic_and_skip() {
@@ -1022,6 +1593,114 @@ mod tests {
             !is_js_shell("<html><body><div id=\"root\"></div></body></html>"),
             "无 script 的挂载点不算 SPA shell"
         );
+
+        // MOC-183: 非标准 mount 但有 bundle 脚本(实测 mouseless.click / doscienceto.it 型,
+        // 原 mount 白名单漏判, headless 实测能抓到内容)。
+        assert!(
+            is_js_shell(
+                "<html><body><div id=\"app-container\"></div>\
+                 <script type=\"module\" src=\"/assets/index-abc.js\"></script></body></html>"
+            ),
+            "非标准 mount + ESM module 脚本应判 shell"
+        );
+        assert!(
+            is_js_shell(
+                "<html><body><main id=\"wrap\"></main>\
+                 <script src=\"/static/bundle.abc.js\"></script></body></html>"
+            ),
+            "非标准 mount + 外部 .js bundle 应判 shell"
+        );
+        // 边界(不误升): 静态短页 + 纯 inline script(无 module / 无 .js bundle)→ 不判 shell。
+        assert!(
+            !is_js_shell("<html><body><p>Status: OK</p><script>track();</script></body></html>"),
+            "静态短页 + inline script(无 bundle)不应误升"
+        );
+        // devin review: inline 单引号 `type='module'`(无 .js/.mjs)也应判 shell。
+        assert!(
+            is_js_shell(
+                "<html><body><div id=\"x\"></div>\
+                 <script type='module'>import {a} from '/a'; a.mount('#x')</script></body></html>"
+            ),
+            "单引号 type='module' 应判 shell"
+        );
+        // chatgpt-codex review: cache-bust 的 `.js?v=123` bundle 也应判 shell(.js 后跟 ?)。
+        assert!(
+            is_js_shell(
+                "<html><body><main id=\"wrap\"></main>\
+                 <script src=\"/assets/app.js?v=123\"></script></body></html>"
+            ),
+            "cache-bust .js?v= bundle 应判 shell"
+        );
+        // 边界: `.json` / `.jsx`(后接字母)不应被当 .js bundle 误命中。
+        assert!(
+            !is_js_shell(
+                "<html><body><p>x</p><script>fetch(\"/data.json\")</script></body></html>"
+            ),
+            ".json 不应误命中 .js bundle"
+        );
+        // chatgpt-codex review 第 3 轮: 等号周围空格 `type = "module"`(对齐 id_attr_matches 容忍)。
+        assert!(
+            is_js_shell(
+                "<html><body><div id=\"q\"></div>\
+                 <script type = \"module\">import {a} from '/a'; a.mount('#q')</script></body></html>"
+            ),
+            "等号空格 type = \"module\" 应判 shell"
+        );
+        // 边界: `mimetype`(type 前是字母)不应误命中 type=module。
+        assert!(
+            !is_js_shell(
+                "<html><body><p>x</p><script>var mimetype=moduleX;</script></body></html>"
+            ),
+            "mimetype 不应误命中 type=module"
+        );
+        // 已知 trade-off(MOC-183): 静态短页若引外部 `.js`(如 analytics)会被判 shell → auto 升
+        // headless。**chatgpt-codex review 后已加兜底**: headless 失败时 web_fetch_auto 回退升级
+        // 链最后一个非空 body(见 last_usable), 不再把 curl 成功变 Auto error。误升仅多花一次
+        // headless(成功时结果不差), 这类页 MOC-152 证明罕见。
+    }
+
+    #[test]
+    fn worth_fallback_only_nonstandard_mount_heuristic() {
+        let mk = |status: u16, cf: bool, body: &str| RawFetch {
+            status,
+            body: body.to_string(),
+            is_html: true,
+            cf_challenge_header: cf,
+        };
+        // 非标准 mount + bundle(不确定启发式, 可能误判有内容短静态页) → 留作回退。
+        let nonstd = "<html><body><main id=\"x\"></main>\
+            <script type=\"module\" src=\"/a.js\"></script></body></html>";
+        assert!(worth_fallback(&mk(200, false, nonstd)));
+        // 标准框架 mount(确认 app shell)→ **不留**: headless 失败应保留 error, 别回退未渲染空壳
+        // 掩盖 headless 依赖故障(chatgpt-codex review 第 2 轮)。
+        assert!(
+            !worth_fallback(&mk(
+                200,
+                false,
+                "<html><body><div id=\"root\"></div>\
+                 <script src=\"/app.js\"></script></body></html>"
+            )),
+            "标准 mount 确认 shell 不应回退(保留 headless error)"
+        );
+        // CF 挑战页(非标准 mount + 结构像 shell, 但 is_challenge_body 命中)→ 不留。
+        assert!(
+            !worth_fallback(&mk(
+                200,
+                false,
+                "<html><head><title>just a moment</title></head><body><div id=\"cf-wrap\"></div>\
+                 <script type=\"module\" src=\"/cf.js\"></script>challenge-platform</body></html>"
+            )),
+            "CF 挑战页不应回退"
+        );
+        assert!(!worth_fallback(&mk(200, true, nonstd)), "cf header 不应留");
+        assert!(!worth_fallback(&mk(200, false, "   ")), "空 body 不应留");
+        assert!(!worth_fallback(&mk(202, false, nonstd)), "非-200 不应留");
+        // 内容页(vtext 够 → 非 shell)即便带 module 也不留。
+        let content = format!(
+            "<html><body><article>{}</article><script type=\"module\"></script></body></html>",
+            "正文内容".repeat(60)
+        );
+        assert!(!worth_fallback(&mk(200, false, &content)), "内容页不应留");
     }
 
     /// 端到端真机 (网络 + headless): Auto 档抓 DDG (curl/wreq 必被 202 反爬, 应自动升到 headless
@@ -1044,5 +1723,29 @@ mod tests {
             !outcome.content.trim().is_empty(),
             "expected non-empty content"
         );
+    }
+
+    /// 端到端真机 (MOC-139): 抓客户端重定向页 (lcamtuf 绕 Substack feud 的 meta refresh + JS
+    /// location 跳转页), 应跟随到 substack 目标拿到真内容。手动 `--ignored live_client_redirect`。
+    #[tokio::test]
+    #[ignore = "real network"]
+    async fn live_client_redirect_follows() {
+        let o = web_fetch(
+            WebFetchBackend::Auto,
+            "https://lcamtuf.coredump.cx/blog/conway/",
+        )
+        .await
+        .expect("应成功");
+        eprintln!("trail={:?}", o.trail);
+        eprintln!(
+            "content len={} 头200={}",
+            o.content.len(),
+            &o.content[..o.content.len().min(200)]
+        );
+        assert!(
+            o.trail.iter().any(|t| t.contains("client-redirect")),
+            "应跟随客户端重定向"
+        );
+        assert!(o.content.len() > 1000, "应拿到 substack 真内容(非占位页)");
     }
 }

@@ -13,7 +13,9 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use codex_app_transfer_codex_integration::CodexPaths;
-use codex_app_transfer_proxy::{proxy_log_dir, recent_feedback_bundles};
+use codex_app_transfer_proxy::{
+    is_credential_key, proxy_log_dir, recent_feedback_bundles, rescrub_persisted_bundle,
+};
 use reqwest::{header::CONTENT_TYPE, multipart};
 use serde_json::{json, Value};
 
@@ -154,14 +156,9 @@ fn redacted_json(value: &Value) -> Value {
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                let key_lower = k.to_ascii_lowercase();
-                let is_sensitive_key = key_lower.contains("apikey")
-                    || key_lower.contains("api_key")
-                    || key_lower.contains("authorization")
-                    || key_lower.contains("token")
-                    || key_lower.contains("secret")
-                    || key_lower.contains("password");
-                if is_sensitive_key {
+                // MOC-110:复用 proxy `is_credential_key`(归一化 + privateKey/jwt/cf_clearance/
+                // credentials 等),与 forward-trace/mcp 脱敏同一份判定,避免两套黑名单再分叉。
+                if is_credential_key(k) {
                     out.insert(k.clone(), Value::String("<REDACTED>".to_owned()));
                 } else {
                     out.insert(k.clone(), redacted_json(v));
@@ -194,22 +191,16 @@ fn sanitize_codex_toml(raw: &str) -> String {
             out.push(line.to_owned());
             continue;
         }
+        // 去掉 TOML 引号 key 的包裹引号(`"api_key" = …` / `'authorization' = …`),否则
+        // is_credential_key 的 `ends_with` 会因尾部引号失配而漏脱敏(codex P2)。
         let key = trimmed
             .split('=')
             .next()
             .unwrap_or("")
             .trim()
-            .to_ascii_lowercase();
-        let normalized = key.replace(['-', '_'], "");
-        let sensitive = key.contains("api_key")
-            || key.contains("api-key")
-            || key.contains("apikey")
-            || normalized.contains("apikey")
-            || key.contains("token")
-            || key.contains("secret")
-            || key.contains("password")
-            || key.contains("authorization");
-        if sensitive {
+            .trim_matches(|c| c == '"' || c == '\'');
+        // MOC-110:复用 proxy `is_credential_key`(内部归一化大小写/`_`/`-`),与 redacted_json 同判定。
+        if is_credential_key(key) {
             let prefix_len = line.find('=').unwrap_or(line.len());
             let prefix = &line[..prefix_len + 1];
             out.push(format!("{prefix} \"<REDACTED>\""));
@@ -259,6 +250,9 @@ fn diagnostic_attachments(include_diag: bool) -> Vec<FeedbackAttachment> {
         let Ok(raw) = fs::read(&bundle_path) else {
             continue;
         };
+        // MOC-110:上传前再脱敏一遍 —— 旧 build 写的历史 bundle 的 body 仍是原始未脱敏,
+        // 写路径修复不保护它们(codex P1)。对新 bundle 幂等。
+        let raw = rescrub_persisted_bundle(&raw);
         let name = bundle_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -782,5 +776,39 @@ mod tests {
             let data: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(data["message"], json!("worker failed"));
         });
+    }
+
+    #[test]
+    fn redacted_json_covers_moc110_keys_via_shared_predicate() {
+        // MOC-110:收敛到 proxy is_credential_key 后,privateKey/cf_clearance/credentials
+        // 等以前漏的 key 也脱敏;诊断字段(max_tokens)不误伤
+        let v = json!({
+            "api_key": "sk-LEAK",
+            "privateKey": "PK-LEAK",
+            "cf_clearance": "CF-LEAK",
+            "credentials": "CRED-LEAK",
+            "nested": {"accessToken": "AT-LEAK"},
+            "max_tokens": 4096,
+            "base_url": "https://api.example.com"
+        });
+        let red = redacted_json(&v);
+        let s = serde_json::to_string(&red).unwrap();
+        for leak in ["sk-LEAK", "PK-LEAK", "CF-LEAK", "CRED-LEAK", "AT-LEAK"] {
+            assert!(!s.contains(leak), "{leak} 泄漏: {s}");
+        }
+        assert_eq!(red["max_tokens"], 4096, "诊断字段不应误伤");
+        assert_eq!(red["base_url"], "https://api.example.com");
+    }
+
+    #[test]
+    fn sanitize_codex_toml_covers_moc110_keys() {
+        // 含裸 key + 引号 key("..." / '...')(codex P2:引号 key 不能漏脱敏)
+        let toml = "model = \"gpt-5\"\nprivate_key = \"PK-LEAK\"\ncf_clearance = \"CF-LEAK\"\napi_key = \"sk-LEAK\"\n\"api_key\" = \"QK-LEAK\"\n'authorization' = \"QA-LEAK\"\nmax_output_tokens = 8192\n";
+        let out = sanitize_codex_toml(toml);
+        for leak in ["PK-LEAK", "CF-LEAK", "sk-LEAK", "QK-LEAK", "QA-LEAK"] {
+            assert!(!out.contains(leak), "{leak} 泄漏: {out}");
+        }
+        assert!(out.contains("model = \"gpt-5\""), "非凭据行保留");
+        assert!(out.contains("max_output_tokens = 8192"), "用量字段不误伤");
     }
 }

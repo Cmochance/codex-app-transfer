@@ -531,8 +531,12 @@ pub fn delete_server(name: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
-/// MOC-144 web_fetch MCP server 的固定 name(`[mcp_servers.cat-webfetch]`)。
-pub const WEB_FETCH_SERVER_NAME: &str = "cat-webfetch";
+/// MOC-144 web_fetch MCP server 的固定 name(`[mcp_servers.CAT-WEB-MCP]`, MOC-139 改名)。
+pub const WEB_FETCH_SERVER_NAME: &str = "CAT-WEB-MCP";
+
+/// 改名前的旧 server name(MOC-139 前 = `cat-webfetch`)。`sync_web_fetch_server` 每次清理残留,
+/// 避免老用户 config 留两个 server(旧 cat-webfetch + 新 CAT-WEB-MCP)。
+const LEGACY_WEB_FETCH_SERVER_NAME: &str = "cat-webfetch";
 
 /// 按 `webFetchBackend` 档位注册/移除 transfer 自己的 web_fetch MCP server。
 ///
@@ -551,7 +555,15 @@ pub fn sync_web_fetch_server(backend: &str) -> Result<(), String> {
     // MOC-115)。startup re-sync 每次启动都调, 必须幂等。
     // list_servers() 的读错误要传播, 不能 .ok() 吞掉 —— 否则 off 分支会因"读不到"
     // 当成"不存在"跳过 delete, 残留 server 还谎报成功(关不掉)。
-    let existing = list_servers()?
+    let servers = list_servers()?;
+    // 迁移(MOC-139): 改名前注册过旧 cat-webfetch 的用户, 清理旧 key 避免 config 残留两个 server。
+    if servers
+        .iter()
+        .any(|s| s.name == LEGACY_WEB_FETCH_SERVER_NAME)
+    {
+        delete_server(LEGACY_WEB_FETCH_SERVER_NAME)?;
+    }
+    let existing = servers
         .into_iter()
         .find(|s| s.name == WEB_FETCH_SERVER_NAME);
     if !active {

@@ -35,7 +35,7 @@ use codex_app_transfer_http::{WebFetchBackend, WebFetchOutcome};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
-const SERVER_NAME: &str = "cat-webfetch";
+const SERVER_NAME: &str = "CAT-WEB-MCP";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// client 未给 protocolVersion 时的兜底(回显 client 的值更优, 见 spec)。
 const FALLBACK_PROTOCOL: &str = "2025-11-25";
