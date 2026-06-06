@@ -340,7 +340,7 @@ fn compute_fields_to_strip(matched: &[MatchedSignature]) -> Vec<String> {
 /// string 在我们用到的转义子集 — `\\` `\"` `\n` `\r` `\t` — 上完全一致,跟
 /// 写入端 `toml_string_literal` 对称),自动处理转义。闭合 `"` 用手工状态机
 /// 找(裸 `.find('"')` 会被字符串内的 `\"` 误终结)。
-fn parse_root_string_value(stripped: &str, key: &str) -> Option<String> {
+pub(crate) fn parse_root_string_value(stripped: &str, key: &str) -> Option<String> {
     let rest = stripped.strip_prefix(key)?;
     let next = rest.chars().next()?;
     if next != '=' && !next.is_ascii_whitespace() {

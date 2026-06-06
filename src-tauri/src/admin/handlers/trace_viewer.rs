@@ -1,8 +1,9 @@
 //! `/api/trace-viewer/*` —— 诊断流量查看器(MOC-169)生命周期 + 浏览器打开。
 //!
 //! 前端「诊断模式」开关 on → `start`(置位运行时采集 gate + 起独立端口 SSE 服务);off →
-//! `stop`(清 gate + 关服务)。开关本身的持久化走 `save_settings`(`traceViewerEnabled`),
-//! 启动自启在 `main.rs` setup 里按持久化值处理。
+//! `stop`(清 gate + 关服务)。**MOC-185 起 session 级一次性**:开关**不持久化**、退出
+//! transfer 即关、`main.rs` 启动**不自启**(仅 env `CAS_DIAG_TRACE` 例外);前端
+//! `renderSettings` 据 `/status` 的运行态(非持久化 config)设开关,避免 desync。
 
 use axum::{extract::State, response::IntoResponse, Json};
 use serde_json::json;

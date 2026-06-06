@@ -495,6 +495,11 @@
       return api('POST', '/api/trace-viewer/stop');
     },
 
+    // [MOC-185] 查诊断查看器运行态(session 级:renderSettings 据此设开关,避免与持久化 desync)
+    async traceViewerStatus() {
+      return api('GET', '/api/trace-viewer/status');
+    },
+
     async openTraceViewer() {
       return api('POST', '/api/trace-viewer/open');
     },
