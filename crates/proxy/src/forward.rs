@@ -734,7 +734,16 @@ async fn passthrough_chatgpt_backend(
         format!("[chatgpt-relay] {method} {client_path} → {upstream}"),
     );
     // [MOC-125] gate 开时先 clone Codex 原始请求体(下面会 move 进 rb),供 passthrough 诊断 trace。
+    // [MOC-153] 此处记**注入前**原始体:既反映 Codex 真实发出的顶层 instructions 空(正是
+    // MOC-153 根因坐实点),又能跟下面 outbound(注入后)对照看出 transfer 干预了哪层。
     let trace_inbound = forward_trace_enabled().then(|| body.clone());
+
+    // [MOC-153] 切 GPT relay 修复:Codex 把第三方会话切到 gpt-5.x 时顶层 instructions 为空 →
+    // OpenAI Responses 后端 400 `Instructions are required`、对话卡死。转发前对切 GPT 的对话
+    // 请求(`/backend-api/.../responses` + 带 input)检测顶层空 → 注入中性占位过校验。其余
+    // backend 请求(getAccount/plugins 等)及已带非空 instructions 的请求字节级原样透传。
+    let body = inject_chatgpt_responses_instructions(client_path, body);
+    let trace_outbound = forward_trace_enabled().then(|| body.clone());
 
     // [review M-2] method 解析失败**报错、不降级** —— 把 POST(plugins install 等写操作)
     // 悄悄降级成 GET 是破坏性降级(违反"禁止破坏性降级"硬规则);axum Method 已合法,
@@ -745,8 +754,14 @@ async fn passthrough_chatgpt_backend(
     let mut rb = state.http.request(rmethod, &upstream);
     for (k, v) in headers.iter() {
         let name = k.as_str();
-        // host 让 reqwest 按 upstream 重填;accept-encoding 去掉避免压缩 body 干扰 log
-        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("accept-encoding") {
+        // host 让 reqwest 按 upstream 重填;accept-encoding 去掉避免压缩 body 干扰 log。
+        // [MOC-153] content-length 也跳过:instructions 注入会改写 body 长度,复制 Codex
+        // 原始 content-length 会与注入后 body 不一致 → 让 reqwest 按实际 body 重算。未注入
+        // 时 reqwest 重算结果 == 原值,对 getAccount/plugins 等其他 backend 请求零影响。
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("accept-encoding")
+            || name.eq_ignore_ascii_case("content-length")
+        {
             continue;
         }
         rb = rb.header(name, v.as_bytes());
@@ -809,12 +824,14 @@ async fn passthrough_chatgpt_backend(
             inbound_headers: headers,
             inbound_body: tbody.as_ref(),
             upstream_url: &upstream,
-            // [review comment #1] passthrough 不转换协议,trace 的 outbound 段直接复用 inbound
-            // headers/body 作镜像 —— 真实发 chatgpt.com 的请求会再 strip host/accept-encoding、
-            // reqwest 重填 host/content-length(trace 未反映这层)。诊断重点在 inbound cookie +
-            // response set-cookie 的会话连续性,outbound 仅作对照。
+            // [review comment #1] passthrough 基本不转换协议,outbound headers 复用 inbound 作
+            // 镜像 —— 真实发 chatgpt.com 会再 strip host/accept-encoding、reqwest 重填 host/
+            // content-length(trace 未反映这层)。诊断重点在 inbound cookie + response set-cookie
+            // 的会话连续性,outbound 仅作对照。
+            // [MOC-153] body 例外:切 GPT 时顶层 instructions 注入会改 body,故 outbound_body 用
+            // 注入后的 trace_outbound,让诊断看得见这层干预(未注入时 == inbound、零差异)。
             outbound_headers: headers,
-            outbound_body: tbody.as_ref(),
+            outbound_body: trace_outbound.as_deref().unwrap_or_else(|| tbody.as_ref()),
             status,
             response_headers: &resp_headers,
             response_body: resp_body.as_ref(),
@@ -998,6 +1015,12 @@ impl Drop for TracedStream {
 /// forward-trace 写盘失败只在**首次**记一条 WARN(去重防每请求刷屏)。用户显式开了
 /// CAS_DIAG_TRACE 却因权限/满盘一行没写时,至少有一句提示而非完全静默。
 static TRACE_WRITE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [MOC-153] instructions 注入回写序列化失败只在**首次**记一条 WARN(去重)。`to_vec` 对刚
+/// `from_slice` 成功的 Value 几乎不可能失败,但万一发生,请求会带空 instructions 发出 →
+/// chatgpt.com 400;这条 WARN 让排查者能区分「注入失败」与「修复没触发」,而非静默。
+static INSTRUCTIONS_REWRITE_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// [MOC-124 H-2] chatgpt backend 首次 401 回灌后置真,后续 401 不再重复刷 ERROR 日志
@@ -1646,6 +1669,199 @@ fn body_model(body: &[u8]) -> Option<String> {
     v.get("model")
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
+}
+
+/// [MOC-153] 切 GPT relay 顶层 `instructions` 注入的中性占位串。
+///
+/// 真实 GPT 人格由 input 里的 `<model_switch>` developer 消息(实测 ~22K 字符
+/// "You are Codex, a coding agent based on GPT-5…")提供;顶层 instructions 只需
+/// **非空**以过 OpenAI Responses 后端校验。占位方向与 developer 消息一致(同声明
+/// Codex coding agent 身份),不引入矛盾人格、不改变模型行为 —— 刻意**不**用泛化的
+/// "You are a helpful assistant."(会与 input 里的 GPT-5 人格矛盾,致切换后行为漂移)。
+const CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER: &str = "You are Codex, a coding agent.";
+
+/// [MOC-153] relay 模式下 Codex 把第三方模型会话切到 ChatGPT 后端模型(gpt-5.x)时,
+/// 顶层 `instructions` 字段为空(Codex 身份提示走 input 的 developer 消息、切模型不
+/// 回填顶层),OpenAI Responses 后端硬校验顶层非空 → 返回 400 `Instructions are
+/// required`,composer 内联报错、对话卡死。
+///
+/// 修复:在 chatgpt-backend passthrough **转发前**,对切 GPT 的对话请求检测顶层
+/// instructions 空 → 注入中性占位([`CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER`])。后端
+/// 收到非空即放行;模型真实指令仍来自 input developer 消息,行为不变。
+///
+/// 收窄触发,避免误伤非对话 backend 请求(`getAccount`/`plugins`/`wham` 等):
+/// 1. path 含 `/responses`(Codex 对话端点)
+/// 2. body 是带 `input` 字段的 JSON object(Responses 对话请求特征)
+/// 3. 顶层 `instructions` 缺失 / `null` / 空白字符串
+///
+/// 任一不满足或 body 非 JSON object → 字节级原样返回,零干预(passthrough 语义)。
+///
+/// 同样覆盖 relay 模式下切 GPT 的 `/backend-api/.../responses/compact`(上下文压缩请求):
+/// 它也是带 `input` 的 Responses 体、`/responses` 子串命中,顶层 instructions 若空,
+/// ChatGPT 后端会用同一条 400 拦下 → 注入占位一并修掉(desired)。
+///
+/// 注:仅 relay 模式(`chatgpt_base_url` 指向本 proxy)下 GPT 请求才经此函数;GPT 直连
+/// chatgpt.com 时 transfer 够不着,无解(见 MOC-153 Linear)。
+fn inject_chatgpt_responses_instructions(client_path: &str, body: Bytes) -> Bytes {
+    let path_only = client_path.split('?').next().unwrap_or(client_path);
+    if !path_only.contains("/responses") || body.is_empty() {
+        return body;
+    }
+    let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let Some(obj) = parsed.as_object_mut() else {
+        return body;
+    };
+    // Responses 对话请求必带 `input`;GET `/responses/{id}`、`/responses/{id}/cancel`
+    // 等无 input → 不是对话请求,不注入。
+    if !obj.contains_key("input") {
+        return body;
+    }
+    let needs_injection = match obj.get("instructions") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+        _ => false,
+    };
+    if !needs_injection {
+        return body;
+    }
+    obj.insert(
+        "instructions".to_owned(),
+        serde_json::Value::String(CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER.to_owned()),
+    );
+    match serde_json::to_vec(&parsed) {
+        Ok(bytes) => {
+            // [MOC-153] 注入成功记一条 INFO(同 passthrough 的 `[chatgpt-relay]` 日志栈,默认
+            // 落盘 + 应用内诊断查看器可见)。只记 path、**不记 body**(backend body 含 account
+            // id/email,见上方 N-3 规矩)。真机 relay 验证靠这条**直接**确认注入触发,不必靠
+            // "chatgpt.com 不再 400" 间接反证;仅真注入时记 → 前置 passthrough 分支零噪音。
+            proxy_telemetry().logs.add(
+                "INFO",
+                format!(
+                    "[chatgpt-relay] 切 GPT relay:顶层 instructions 空 → 注入 Codex 身份占位: {path_only}"
+                ),
+            );
+            Bytes::from(bytes)
+        }
+        // 回写序列化失败(刚 from_slice 成功,几乎不可能)→ 原样转发不阻断请求,但补一条去重
+        // WARN(对齐 forward.rs 既有 M-1/HIGH:降级可接受、但必须可见)。否则请求带空
+        // instructions 发出 → chatgpt.com 400,排查者会误判"修复根本没触发"。
+        Err(_) => {
+            if !INSTRUCTIONS_REWRITE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                proxy_telemetry().logs.add(
+                    "WARN",
+                    format!(
+                        "[chatgpt-relay] instructions 注入回写序列化失败,原样转发(请求可能 400 Instructions are required;后续静默): {path_only}"
+                    ),
+                );
+            }
+            body
+        }
+    }
+}
+
+#[cfg(test)]
+mod moc153_instructions_tests {
+    //! [MOC-153] `inject_chatgpt_responses_instructions` 触发条件 + 占位内容单测。
+    //! 注:这是 helper 纯函数单测;"注入实际让 chatgpt.com 不再 400" 需 relay 真机验证。
+    use super::*;
+
+    fn instructions_of(body: &Bytes) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(body).unwrap()["instructions"].clone()
+    }
+
+    #[test]
+    fn injects_when_instructions_missing() {
+        let out = inject_chatgpt_responses_instructions(
+            "/backend-api/codex/responses",
+            Bytes::from(r#"{"input":[],"model":"gpt-5.5"}"#),
+        );
+        assert_eq!(
+            instructions_of(&out),
+            CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn injects_when_instructions_null_or_blank() {
+        for raw in [
+            r#"{"input":[],"instructions":null}"#,
+            r#"{"input":[],"instructions":""}"#,
+            "{\"input\":[],\"instructions\":\"   \"}",
+        ] {
+            let out = inject_chatgpt_responses_instructions(
+                "/backend-api/codex/responses",
+                Bytes::from(raw),
+            );
+            assert_eq!(
+                instructions_of(&out),
+                CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER,
+                "空/null/空白 instructions 应注入: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_existing_non_empty_instructions() {
+        let body = Bytes::from(r#"{"input":[],"instructions":"real GPT persona"}"#);
+        let out =
+            inject_chatgpt_responses_instructions("/backend-api/codex/responses", body.clone());
+        assert_eq!(out, body, "已有非空 instructions 必须原样保留");
+    }
+
+    #[test]
+    fn skips_non_responses_path() {
+        // getAccount/me 等非 /responses 路径不碰,即便碰巧 body 带 input 且 instructions 空。
+        let body = Bytes::from(r#"{"input":[]}"#);
+        let out = inject_chatgpt_responses_instructions("/backend-api/me", body.clone());
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn skips_responses_subpath_without_input() {
+        // /responses 子路径但无 input(如 GET /responses/{id})→ 非对话请求,不注入。
+        let body = Bytes::from(r#"{"foo":"bar"}"#);
+        let out = inject_chatgpt_responses_instructions(
+            "/backend-api/codex/responses/resp_123",
+            body.clone(),
+        );
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn skips_invalid_json_non_object_and_empty() {
+        for raw in ["not json", "[]", ""] {
+            let body = Bytes::from(raw);
+            let out =
+                inject_chatgpt_responses_instructions("/backend-api/codex/responses", body.clone());
+            assert_eq!(out, body, "非 object/空 body 原样透传: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn matches_path_with_query_string() {
+        let out = inject_chatgpt_responses_instructions(
+            "/backend-api/codex/responses?stream=true",
+            Bytes::from(r#"{"input":[]}"#),
+        );
+        assert_eq!(
+            instructions_of(&out),
+            CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn placeholder_is_codex_identity_not_generic_assistant() {
+        // 回归锁定接手发现:占位必须是 Codex 身份(与 developer 消息一致),绝不是泛化
+        // "helpful assistant"(会与 input 里 GPT-5 人格矛盾,Alpaca 原实现的语义污染点)。
+        assert!(CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER.contains("Codex"));
+        assert!(!CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER
+            .to_lowercase()
+            .contains("helpful assistant"));
+        assert!(!CHATGPT_RELAY_INSTRUCTIONS_PLACEHOLDER.trim().is_empty());
+    }
 }
 
 /// 把 [`codex_app_transfer_gemini_oauth::ServiceError`] 分类成 [`ForwardError::
