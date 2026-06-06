@@ -65,10 +65,11 @@ pub struct Settings {
     /// 写入 `~/.codex/config.toml` 的 `sandbox_workspace_write.network_access`,
     /// 控制 `sandbox_mode = workspace-write`(Codex 默认)下 shell 能否联网。
     ///
-    /// **默认 `true`**(#212):解决小白配置完后撞"Codex 看似挂了"的 pain point
-    /// (Codex CLI 默认 `false`,模型用 `curl` 被 sandbox 拦截)。专业用户可在
-    /// UI 上自行关闭。关闭**不影响** Codex 内置 `web_search` 工具(走 OpenAI
-    /// 缓存,不需要 `network_access`)。
+    /// **默认 `false`**(MOC-185):full access(danger-full-access + approval=never)
+    /// 等于完全信任模型、有风险,缺省关;需要联网 / 无审批的用户在 UI 自行开启。
+    /// 关闭**不影响** Codex 内置 `web_search` 工具(走 OpenAI 缓存,不需要
+    /// `network_access`)。已显式设过此 bool 的老 config 照旧解析、不被覆盖
+    /// (serde 反序列化仅在字段缺失时套默认)。
     #[serde(default = "default_codex_network_access")]
     pub codex_network_access: bool,
 
@@ -79,16 +80,18 @@ pub struct Settings {
     #[serde(default = "default_web_fetch_backend")]
     pub web_fetch_backend: String,
 
-    /// 「诊断模式」开关(MOC-169):开启后启动独立端口诊断流量查看器(默认 `127.0.0.1:18090`)
-    /// 并采集 forward-trace / MCP 流量。**默认 `false`** —— 纯开发者诊断,普通用户零影响、
-    /// 仅本地 loopback;正文按结构化 credential 脱敏但 prompt/代码/回复完整落盘,故默认关。
-    /// 与 env `CAS_DIAG_TRACE` 并联(任一开即采集);持久化为真时 app 启动自启查看器。
+    /// 「诊断模式」开关(MOC-169/MOC-185):开启后启动独立端口诊断流量查看器
+    /// (默认 `127.0.0.1:18090`)并采集 forward-trace / MCP 流量。**默认 `false`** —— 纯
+    /// 开发者诊断,普通用户零影响、仅本地 loopback;正文按结构化 credential 脱敏但
+    /// prompt/代码/回复完整落盘,故默认关。**MOC-185 起改为 session 级一次性**:UI 开关
+    /// 纯运行时起/停、退出 transfer 即关,**不再持久化也不随启动自启**,故本字段已不被
+    /// 写入 / 读取(保留仅为兼容解析遗留 config);开发者长期采集走 env `CAS_DIAG_TRACE`。
     #[serde(default)]
     pub trace_viewer_enabled: bool,
 }
 
 fn default_codex_network_access() -> bool {
-    true
+    false
 }
 
 fn default_web_fetch_backend() -> String {
@@ -107,7 +110,7 @@ impl Default for Settings {
             expose_all_provider_models: false,
             restore_codex_on_exit: true,
             update_url: DEFAULT_UPDATE_URL.to_owned(),
-            codex_network_access: true,
+            codex_network_access: false,
             web_fetch_backend: default_web_fetch_backend(),
             trace_viewer_enabled: false,
         }

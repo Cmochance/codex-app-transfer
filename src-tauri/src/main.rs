@@ -83,21 +83,17 @@ fn main() {
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
             // startup 后第一个 user 请求的 prompt 注入就是正确语言。后续 user
             // 切语言由 `save_settings` 内的 hot reload(同模块 fn)处理。
-            let mut trace_viewer_persisted = false;
             if let Ok(cfg) = handlers::settings::load_registry_for_startup_language_sync() {
                 let settings = cfg.get("settings").cloned().unwrap_or_else(|| serde_json::json!({}));
                 handlers::settings::sync_user_language_from_settings(&settings);
-                trace_viewer_persisted = settings
-                    .get("traceViewerEnabled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
             }
 
-            // [MOC-169] 诊断流量查看器:env `CAS_DIAG_TRACE` 或持久化「诊断模式」开关任一开
-            // 时随 app 自启。默认关 → 不启、零开销。运行时采集 gate 由 `vm.start`/`stop_silent`
-            // 在 start_lock 内与 viewer 生命周期原子绑定(成功才开 gate、失败不开 → 无残留),
-            // 这里不再单独动 gate。env `CAS_DIAG_TRACE` 项在 forward_trace_enabled() 里恒真、独立。
-            if codex_app_transfer_proxy::diagnostics::forward_trace_enabled() || trace_viewer_persisted
+            // [MOC-185] 诊断流量查看器:仅 env `CAS_DIAG_TRACE` 显式开发者入口随 app 自启。
+            // 「诊断模式」UI 开关已改为 **session 级一次性**(退出 transfer 即关、不持久化、不
+            // 随启动自启 —— 见 app.js toggle / renderSettings),故启动**不再读** traceViewerEnabled。
+            // 运行时采集 gate 由 `vm.start`/`stop_silent` 在 start_lock 内与 viewer 生命周期原子
+            // 绑定(成功才开 gate、失败不开 → 无残留),这里不单独动 gate。
+            if codex_app_transfer_proxy::diagnostics::forward_trace_enabled()
             {
                 let vm = app
                     .state::<Arc<trace_viewer::TraceViewerManager>>()

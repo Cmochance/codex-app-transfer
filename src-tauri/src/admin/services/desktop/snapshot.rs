@@ -998,6 +998,8 @@ mod tests {
                 let mut cfg = config_with_secret();
                 cfg["gatewayApiKey"] = Value::Null;
                 cfg["settings"]["proxyPort"] = json!(0);
+                // [MOC-154] codexNetworkAccess 新默认 false;此测试验证 full-access apply 场景,显式开
+                cfg["settings"]["codexNetworkAccess"] = json!(true);
                 save_registry(&cfg).unwrap();
 
                 let codex_dir = home.join(".codex");
@@ -1147,11 +1149,23 @@ mod tests {
             .collect();
         assert!(names.contains(&"gpt-5.5"));
         assert!(names.contains(&"gpt-5.4"));
-        assert!(names.contains(&"gpt-5.4-mini"));
-        assert!(names.contains(&"deepseek-v4-pro"));
-        assert!(models
-            .iter()
-            .any(|item| item.get("supports1m").and_then(|v| v.as_bool()) == Some(true)));
+        // [MOC-154] gpt_5_4_mini 槽未配置 → 跳过;fallback entry(slug=实际模型名)已删
+        assert!(
+            !names.contains(&"gpt-5.4-mini"),
+            "empty slot should be skipped"
+        );
+        assert!(
+            !names.contains(&"deepseek-v4-pro"),
+            "fallback entry removed in MOC-154"
+        );
+        // [MOC-154] kimi-k2(258_400) / glm-4.6(200_000) 均非 1M;旧逻辑 fallback entry
+        // deepseek-v4-pro[1m] 已删,无 supports1m=true 的 entry
+        assert!(
+            models
+                .iter()
+                .all(|item| item.get("supports1m").and_then(|v| v.as_bool()) != Some(true)),
+            "kimi-k2 / glm-4.6 均非 1M,不应有 supports1m=true"
+        );
     }
 
     #[test]
@@ -1193,10 +1207,18 @@ mod tests {
                 let models_raw = payload["keys"]["inferenceModels"].as_str().unwrap();
                 assert!(!models_raw.contains("sonnet"));
                 assert!(models_raw.contains("gpt-5.5"));
-                assert!(models_raw.contains("deepseek-v4-pro"));
+                // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 名作 display_name 出现
+                assert!(
+                    models_raw.contains("kimi-k2"),
+                    "default_model 作为 gpt-5.5 的 display_name 出现"
+                );
+                // [MOC-154] only gpt-5.5 slug exists in catalog; deepseek-v4-pro fallback entry was removed
                 assert_eq!(payload["configured"], json!(false));
                 assert_eq!(payload["health"]["needsApply"], json!(true));
-                assert_eq!(payload["health"]["oneMillionReady"], json!(false));
+                // [MOC-154] kimi-k2(gpt_5_5 slot) context_window=258_400 <1M;
+                // one_million_names 为空 → one_million_catalog_ready 直接 true(无需检查 catalog);
+                // 旧 fallback entry deepseek-v4-pro(1M) 已删
+                assert_eq!(payload["health"]["oneMillionReady"], json!(true));
 
                 let codes: Vec<&str> = payload["health"]["issues"]
                     .as_array()
@@ -1205,7 +1227,11 @@ mod tests {
                     .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
                     .collect();
                 assert!(codes.contains(&"not_managed_by_cas"));
-                assert!(codes.contains(&"one_million_not_written"));
+                // [MOC-154] oneMillionReady=true → one_million_not_written issue 不再出现
+                assert!(
+                    !codes.contains(&"one_million_not_written"),
+                    "no 1M model => no one_million_not_written"
+                );
             });
         });
     }
