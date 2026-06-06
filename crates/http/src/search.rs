@@ -1,4 +1,4 @@
-//! web_search (MOC-12 P0): DuckDuckGo HTML SSR 搜索, 给 CAT-WEB-MCP 提供 `web_search` 工具。
+//! web_search (MOC-12 P0): DuckDuckGo HTML SSR 搜索, 给 cat-webfetch 提供 `web_search` 工具。
 //!
 //! ## 为什么需要
 //! Codex.app 每轮发 OpenAI server-side `web_search`, 但 chat-completions provider

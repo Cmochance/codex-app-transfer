@@ -545,14 +545,14 @@ fn main() {
             }
             let _ = handlers::desktop::restore_codex_if_enabled("exit");
             // MOC-144:transfer 注入的 web_fetch MCP server 在退出时从 Codex config.toml 移除
-            // —— 它是 transfer 管理的工具, transfer 不在时不该残留 [mcp_servers.CAT-WEB-MCP]
+            // —— 它是 transfer 管理的工具, transfer 不在时不该残留 [mcp_servers.cat-webfetch]
             // (注入/移除对称;下次 transfer 启动 re-sync 会按 webFetchBackend 重新注册)。
-            // 顺带清掉历史误用的 cas-webfetch 名(未发布)+ MOC-139 改名前的旧 cat-webfetch。
+            // 顺带清掉历史误用的 cas-webfetch 名(未发布)+ MOC-139 误改的大写 CAT-WEB-MCP。
             let _ = crate::admin::services::mcp_servers::delete_server(
                 crate::admin::services::mcp_servers::WEB_FETCH_SERVER_NAME,
             );
             let _ = crate::admin::services::mcp_servers::delete_server("cas-webfetch");
-            let _ = crate::admin::services::mcp_servers::delete_server("cat-webfetch");
+            let _ = crate::admin::services::mcp_servers::delete_server("CAT-WEB-MCP");
         }
     });
 }
