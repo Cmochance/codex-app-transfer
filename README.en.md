@@ -149,6 +149,8 @@ Codex App prompts by OpenAI model names; third-party providers use real IDs like
 
 This tool maps via `provider.models[slot]` (`gpt-5.5` → `deepseek-v4-pro` etc.); Codex App's model picker shows `<provider> / <real-model>` real names. Upstream `chatcmpl-...` response IDs are auto-rewritten to Codex App-validatable `resp_<base64>`, preserving deployment-affinity encoding so `previous_response_id` is consistent across turns.
 
+**Auto-review model (MOC-173)**: Codex's auto-review (the guardian subagent that risk-approves each tool call) reuses the main conversation model by default, which is slow. The "Auto-review Model" dropdown below "Model Mapping" on the provider config page lets you point it at a separate model — **you can only pick from slots you've already configured** (the dropdown lists only non-empty slots, avoiding duplicate mappings / downgrades). Transfer writes `auto_review_model_override` into the Codex model catalog accordingly, so the review subagent decouples from the main model and reuses the chosen slot's existing mapping (typically a fast / cheap model to speed up approvals); empty = follow the main model. Verified by packet capture on Codex 0.137: once set, the `model` field of review requests switches to the chosen slot, splitting from the main conversation (without changing the main model).
+
 ## Development (v2 / Rust)
 
 ```bash

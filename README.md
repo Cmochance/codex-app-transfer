@@ -148,6 +148,8 @@ Codex APP 按 OpenAI 模型名提示;第三方 provider 用 `deepseek-v4-pro` / 
 
 供应商配置页的「在 Codex 中显示的模型」直接列出你想在 Codex 模型选择器看到的真实模型(最多 5 个):**第一个是默认模型、新对话直接用它**,后端自动把它们映射到 Codex 槽位(`gpt-5.5` / `gpt-5.4` / …),无需手动指定槽位。Codex APP 模型选择器里看到的就是你列的真实模型名,数量与你的配置一致(不再有"默认占满"导致的占位重复模型,MOC-154)。上游 `chatcmpl-...` 应答 ID 自动重写为 Codex APP 校验通过的 `resp_<base64>`,保留 deployment affinity 编码,`previous_response_id` 跨轮一致。
 
+**auto-review 审查模型(MOC-173)**:Codex 的 auto-review(逐个工具调用做风险审批的 guardian subagent)默认复用主对话模型、较慢。供应商配置页「模型映射」下方的「auto-review 审查模型」可单独指定它走哪个模型 —— **只能从你已配置的模型槽位里选**(下拉只列映射非空的槽位,避免重复配置 / 降级),transfer 据此给 Codex model catalog 写 `auto_review_model_override`,让审查脱钩主模型、复用所选槽位的现有映射(通常选快 / 便宜模型加速审批);留空 = 跟随主模型。Codex 0.137 抓包实证:设置后审查请求的 `model` 字段即切到所选槽位、与主对话分流(不改主对话模型)。
+
 ## 本地开发(v2 / Rust)
 
 ```bash

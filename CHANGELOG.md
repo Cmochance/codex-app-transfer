@@ -4,6 +4,8 @@
 
 ## v2.2.1 — 2026-06-04
 
+**auto-review 独立审查模型(MOC-173)**:Codex 的 auto-review(guardian subagent 逐工具调用做风险审批)默认复用主对话模型,速度较慢。供应商配置页「模型映射」下方新增「auto-review 审查模型」下拉(选项仅列当前已配置的非空槽位,不引入重复映射),设置后 transfer 在 Codex model catalog 的每个 entry 写入 `auto_review_model_override`,让审查流量复用所选槽位的现有 proxy 映射(通常指向快 / 便宜模型)、与主对话分流;留空 = 跟随主模型。Codex 0.137.0-alpha.4 抓包实证:设置后审查请求 `model` 字段即切换到指定槽位。Refs MOC-173。
+
 **web_fetch 客户端重定向跟随(MOC-139)**:`web_fetch` 现在能跟随 HTML `<meta http-equiv="refresh">` 与 JS `location.replace/assign/href` 跳转页(最多 3 跳,记 trail 防循环):curl/wreq/headless 三档只处理 HTTP 3xx、不识别这类客户端重定向,导致部分"占位跳转页"(如绕 Twitter/Substack 封锁的中间页)正文极少、模型"无法摘要";现跟随到目标 URL 重抓真实内容(真机验证:lcamtuf→substack 占位页 165 字符 → 真文章 10623 字符)。Refs MOC-139。
 
 **内置 MCP server 命名规范化(MOC-139 搭车)**:内置联网工具 MCP server 注册名 `cat-webfetch` → `CAT-WEB-MCP`;工具名 `web_fetch` / `web_search` 保留不变(模型识别最稳);诊断 viewer `kind=cat_webfetch` 标识符保持不变(内部诊断分类)。老用户 config 残留的 `cat-webfetch` server 条目在下次启动时自动迁移清理。Refs MOC-139。
