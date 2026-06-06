@@ -12,7 +12,7 @@
 //!
 //! ## 路由一览
 //! - `GET  /`                  — viewer 单页 HTML(inline CSS/JS,无外部依赖)
-//! - `GET  /api/traces?kind=`  — 历史快照(`kind=forward/mcp/cat_webfetch/all`,缺省全部)
+//! - `GET  /api/traces?kind=`  — 历史快照(`kind=forward/mcp/cat_webfetch/chatgpt_backend/all`,缺省全部)
 //! - `GET  /api/stream`        — SSE 实时流(所有类别)
 //! - `POST /api/clear`         — 清空 ring
 //! - `POST /api/ingest`        — **MOC-181**:cat-webfetch 子进程反向上报内部链路;只接受
@@ -26,6 +26,10 @@
 //!   请求参数 / 抓取后端 + 升级链 + HTTP status / 大页选块统计 /
 //!   摘要 prompt + 模型响应 + 延迟 / 返回字符数。供 `GET /api/traces?kind=cat_webfetch`
 //!   机读(AI 调试分析)或页面实时查看。
+//! - **chatgpt-backend** — relay 模式 Codex 账号/插件/wham/远程控制请求经 proxy 透传
+//!   chatgpt.com 的 inbound/outbound/response(MOC-125):header 用 cookie 友好脱敏(保留
+//!   cookie name + set-cookie 属性、打码 value),定位远程控制 WS enroll/server 死循环等
+//!   会话连续性问题。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -219,6 +223,7 @@ fn kind_str(k: TraceKind) -> &'static str {
         TraceKind::Forward => "forward",
         TraceKind::Mcp => "mcp",
         TraceKind::CatWebfetch => "cat_webfetch",
+        TraceKind::ChatgptBackend => "chatgpt_backend",
     }
 }
 

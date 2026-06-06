@@ -828,6 +828,179 @@ pub fn write_forward_trace_jsonl(input: &ForwardTraceInput) -> Option<PathBuf> {
     crate::trace_store::trace_store().push(crate::trace_store::TraceKind::Forward, seq, value)
 }
 
+// ============ MOC-125 chatgpt-backend passthrough 抓包诊断 ============
+// relay 模式下 Codex 的账号/插件/wham/远程控制请求经 proxy 透传 chatgpt.com,走独立诊断 kind
+// (`chatgpt_backend`)。重点**保留 cookie 结构**:set-cookie 的 Domain/Path/SameSite 等属性 +
+// cookie name 全留、只打码 value(指纹用于跨轮比对) —— 诊断 enroll 200 下发的 session 是否因
+// Domain 不匹配 relay host(127.0.0.1)→ Codex 不回带 → GET server 404 → 重新 enroll 死循环。
+
+/// 对敏感值取稳定非可逆短指纹(8 hex),用于**跨请求比对是否同值**(两轮 authorization 是否同
+/// token、set-cookie 下发值与下轮 cookie 回带值是否一致),不泄漏原值。FNV-1a 64-bit,跨进程
+/// 稳定(不像 `DefaultHasher` 带随机种子)。
+fn value_fingerprint(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", (h >> 32) as u32)
+}
+
+/// 打码单个 `name=value`(cookie pair / set-cookie 主对):保留 name、value → `***(fp=…)`。
+fn mask_name_value(pair: &str) -> String {
+    match pair.split_once('=') {
+        Some((name, val)) => format!(
+            "{}=***(fp={})",
+            name.trim(),
+            value_fingerprint(val.trim().as_bytes())
+        ),
+        None => pair.trim().to_string(),
+    }
+}
+
+/// `Cookie:` 请求头脱敏:`a=v1; b=v2` → `a=***(fp=…); b=***(fp=…)`(保留每个 cookie name)。
+fn redact_cookie_value(v: &str) -> String {
+    v.split(';')
+        .map(mask_name_value)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `Set-Cookie:` 响应头脱敏:主对 name 留、value 打码,**所有属性原样保留**
+/// (Domain/Path/Expires/Max-Age/SameSite/Secure/HttpOnly)—— 诊断 cookie 是否因 Domain/Path/
+/// SameSite 不匹配 relay host 而不被 Codex 回带(MOC-125 enroll/server 404 死循环嫌疑)。
+fn redact_set_cookie_value(v: &str) -> String {
+    let mut it = v.splitn(2, ';');
+    let masked = mask_name_value(it.next().unwrap_or(""));
+    match it.next() {
+        Some(attrs) => format!("{masked};{attrs}"),
+        None => masked,
+    }
+}
+
+/// `Authorization:` 脱敏:保留 scheme(Bearer/…)+ 长度 + 指纹,打码 token 本体。
+fn redact_authorization_value(v: &str) -> String {
+    match v.split_once(' ') {
+        Some((scheme, tok)) => {
+            format!(
+                "{scheme} ***(len={}, fp={})",
+                tok.len(),
+                value_fingerprint(tok.as_bytes())
+            )
+        }
+        None => format!(
+            "***(len={}, fp={})",
+            v.len(),
+            value_fingerprint(v.as_bytes())
+        ),
+    }
+}
+
+/// passthrough 专用 header → JSON:`cookie`/`set-cookie`/`authorization` **保留结构**(name +
+/// set-cookie 属性 + 指纹、打码 value);其余 credential(api-key 等)同 [`headers_to_json_redacted`]
+/// 打成 `***(len=N)`;协议字段留真值。仅用于 chatgpt-backend 诊断 kind(MOC-125)。
+pub fn headers_to_json_passthrough(h: &reqwest::header::HeaderMap) -> Value {
+    let mut out = serde_json::Map::new();
+    for (name, value) in h.iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        let s = value.to_str().ok();
+        let v = match (lower.as_str(), s) {
+            ("cookie", Some(s)) => redact_cookie_value(s),
+            ("set-cookie", Some(s)) => redact_set_cookie_value(s),
+            ("authorization", Some(s)) => redact_authorization_value(s),
+            _ => {
+                let sensitive = matches!(
+                    lower.as_str(),
+                    "proxy-authorization"
+                        | "api-key"
+                        | "x-api-key"
+                        | "openai-api-key"
+                        | "anthropic-api-key"
+                        | "x-goog-api-key"
+                ) || lower.starts_with("x-auth-")
+                    || lower.starts_with("x-csrf-")
+                    || lower.starts_with("x-session-")
+                    // [review I-1] 对齐基线 headers_to_json_redacted:非标准 cookie 头
+                    // (cookie-* / x-cookie / 废弃 set-cookie2 等)也脱敏,不原样落盘。
+                    || lower.contains("cookie")
+                    || lower.contains("secret")
+                    || lower.contains("token")
+                    || lower.contains("credential")
+                    || lower.contains("password");
+                if sensitive {
+                    format!("***(len={})", value.as_bytes().len())
+                } else {
+                    match s {
+                        Some(s) => s.to_string(),
+                        None => format!("<non-utf8 len={}>", value.as_bytes().len()),
+                    }
+                }
+            }
+        };
+        out.entry(name.as_str().to_string())
+            .and_modify(|prev| {
+                if let Value::Array(arr) = prev {
+                    arr.push(Value::String(v.clone()));
+                } else {
+                    let p = prev.clone();
+                    *prev = Value::Array(vec![p, Value::String(v.clone())]);
+                }
+            })
+            .or_insert(Value::String(v));
+    }
+    Value::Object(out)
+}
+
+/// 一条 chatgpt-backend passthrough trace → 诊断 JSON(MOC-125)。结构同 forward
+/// (inbound/outbound/response),但 header 用 [`headers_to_json_passthrough`](cookie 友好脱敏)。
+pub(crate) fn build_chatgpt_backend_trace_value(input: &ForwardTraceInput, seq: u64) -> Value {
+    json!({
+        "trace_kind": "chatgpt_backend",
+        "captured_at": Local::now().to_rfc3339(),
+        "proxy_version": env!("CARGO_PKG_VERSION"),
+        "seq": seq,
+        "inbound": {
+            "method": input.method,
+            "client_path": input.client_path,
+            "client_query": input.client_query,
+            "headers": headers_to_json_passthrough(input.inbound_headers),
+            "body": redact_body(input.inbound_body, header_content_type(input.inbound_headers)),
+        },
+        "outbound": {
+            "url": input.upstream_url,
+            "headers": headers_to_json_passthrough(input.outbound_headers),
+            "body": redact_body(input.outbound_body, header_content_type(input.outbound_headers)),
+        },
+        "response": {
+            "status": input.status,
+            "headers": headers_to_json_passthrough(input.response_headers),
+            "body": redact_body_with_len(
+                input.response_body,
+                input.response_full_len,
+                header_content_type(input.response_headers),
+            ),
+        },
+        "provider": {
+            "id": input.provider_id,
+            "name": input.provider_name,
+            "api_format": input.api_format,
+            "auth_scheme": input.auth_scheme,
+        },
+    })
+}
+
+/// 抓一条 chatgpt-backend passthrough trace → 统一 trace_store(独立 kind `ChatgptBackend`)。
+/// 调用方须先用 [`forward_trace_enabled`] gate。返回 jsonl 路径(写盘失败 / 无 home 返 `None`)。
+pub fn write_chatgpt_backend_trace(input: &ForwardTraceInput) -> Option<PathBuf> {
+    let seq = crate::trace_store::next_seq();
+    let value = build_chatgpt_backend_trace_value(input, seq);
+    crate::trace_store::trace_store().push(
+        crate::trace_store::TraceKind::ChatgptBackend,
+        seq,
+        value,
+    )
+}
+
 fn trim_old_bundles(dir: &Path, keep: usize) {
     trim_old_files(dir, keep, "json");
 }
@@ -864,6 +1037,72 @@ pub(crate) fn trim_old_files(dir: &Path, keep: usize, ext: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── [MOC-125 / review] passthrough cookie 友好脱敏:真值绝不落盘 + 结构保留 ──
+    #[test]
+    fn passthrough_fingerprint_stable_and_distinct() {
+        assert_eq!(value_fingerprint(b"abc"), value_fingerprint(b"abc"));
+        assert_ne!(value_fingerprint(b"abc"), value_fingerprint(b"abd"));
+        assert_eq!(value_fingerprint(b"abc").len(), 8);
+        assert!(value_fingerprint(b"abc")
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn passthrough_cookie_keeps_name_masks_value() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("cookie", "session=SECRET123; csrf=TOK456".parse().unwrap());
+        let s = serde_json::to_string(&headers_to_json_passthrough(&h)).unwrap();
+        assert!(
+            !s.contains("SECRET123") && !s.contains("TOK456"),
+            "cookie 真值泄漏: {s}"
+        );
+        assert!(
+            s.contains("session=***") && s.contains("csrf=***"),
+            "cookie name 应保留: {s}"
+        );
+    }
+
+    #[test]
+    fn passthrough_set_cookie_keeps_attrs_masks_value() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            "set-cookie",
+            "__Secure-sess=SECRETVAL; Domain=.chatgpt.com; Path=/; HttpOnly; SameSite=Lax"
+                .parse()
+                .unwrap(),
+        );
+        let s = serde_json::to_string(&headers_to_json_passthrough(&h)).unwrap();
+        assert!(!s.contains("SECRETVAL"), "set-cookie value 泄漏: {s}");
+        assert!(s.contains("__Secure-sess=***"), "name 应保留: {s}");
+        assert!(
+            s.contains("Domain=.chatgpt.com") && s.contains("Path=/") && s.contains("SameSite=Lax"),
+            "属性应保留(诊断 Domain 等关键): {s}"
+        );
+    }
+
+    #[test]
+    fn passthrough_authorization_keeps_scheme_masks_token() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("authorization", "Bearer eyJTOKEN_SECRET".parse().unwrap());
+        let s = serde_json::to_string(&headers_to_json_passthrough(&h)).unwrap();
+        assert!(!s.contains("eyJTOKEN_SECRET"), "token 泄漏: {s}");
+        assert!(s.contains("Bearer ***"), "scheme 应保留: {s}");
+    }
+
+    #[test]
+    fn passthrough_non_standard_cookie_and_credential_still_redacted() {
+        // [review I-1] 非标准 cookie 头 + 其它 credential 不得原样落盘;协议头保留真值。
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("x-cookie", "LEAK1".parse().unwrap());
+        h.insert("x-api-key", "LEAK2".parse().unwrap());
+        h.insert("user-agent", "codex/1.0".parse().unwrap());
+        let s = serde_json::to_string(&headers_to_json_passthrough(&h)).unwrap();
+        assert!(!s.contains("LEAK1"), "x-cookie 真值泄漏: {s}");
+        assert!(!s.contains("LEAK2"), "x-api-key 真值泄漏: {s}");
+        assert!(s.contains("codex/1.0"), "协议头 user-agent 应保留真值");
+    }
 
     #[test]
     fn redact_mcp_value_cleanses_headers_and_oauth_body() {

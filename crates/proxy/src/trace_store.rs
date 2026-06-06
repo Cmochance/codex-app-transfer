@@ -42,6 +42,10 @@ pub enum TraceKind {
     /// cat-webfetch MCP 子进程内部链路 (MOC-181): 请求 / 抓取后端 + 升级链 / 选块 / 摘要
     /// prompt + 响应 / 返回 Codex 结果。子进程经 viewer `POST /api/ingest` 反向上报。
     CatWebfetch,
+    /// chatgpt backend passthrough (MOC-125): relay 模式下 Codex 的账号/插件/wham/远程控制
+    /// 请求经 proxy 透传 chatgpt.com,记 inbound/outbound/response(header 用 cookie 友好脱敏、
+    /// 保留 set-cookie 的 Domain/Path 等属性)定位 enroll/server 404 死循环等会话连续性问题。
+    ChatgptBackend,
 }
 
 /// store 里的一条记录。`value` 是**已脱敏**的完整 JSON 对象(forward-trace 即
