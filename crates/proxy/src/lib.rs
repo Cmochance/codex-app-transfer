@@ -19,6 +19,7 @@ pub mod server;
 pub mod telemetry;
 pub mod trace_store;
 pub mod validation;
+pub mod ws_passthrough;
 
 pub use diagnostics::{
     feedback_bundle_dir, is_credential_key, recent_feedback_bundles, rescrub_persisted_bundle,

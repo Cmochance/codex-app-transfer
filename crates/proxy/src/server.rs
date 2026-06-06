@@ -6,7 +6,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::{HeaderMap, Method, Request},
+    http::{HeaderMap, Method, Request, Uri},
     response::IntoResponse,
     routing::{any, get},
     Router,
@@ -40,8 +40,30 @@ pub fn build_router(resolver: SharedResolver) -> Router {
                 .post(forward_handler)
                 .options(forward_handler),
         )
+        // [MOC-125] Codex 远程控制 WS 端点:真 WS 透传(区别于 /responses 的 ws→http 转换)。
+        // relay 模式 chatgpt_base_url 指向本 proxy,这条 GET 是 WebSocket 握手 → 透传到
+        // wss://chatgpt.com;显式路由优先于 fallback,其余 /backend-api/* 仍走 passthrough。
+        // enroll(POST .../server/enroll)路径不同,走 fallback passthrough。
+        .route(
+            crate::ws_passthrough::REMOTE_CONTROL_WS_PATH,
+            get(remote_control_ws_handler),
+        )
         .fallback(any(forward_handler))
         .with_state(state)
+}
+
+/// [MOC-125] Codex 远程控制 WS 接收侧:axum 接 upgrade,把 Codex 原始 header + path(含
+/// query)交给 [`crate::ws_passthrough::proxy_remote_control`] 透传到 chatgpt.com。
+async fn remote_control_ws_handler(
+    headers: HeaderMap,
+    uri: Uri,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let path = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    ws.on_upgrade(move |socket| crate::ws_passthrough::proxy_remote_control(socket, headers, path))
 }
 
 async fn responses_websocket_handler(
