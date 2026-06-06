@@ -90,10 +90,16 @@ impl RealAccountStatus {
 /// 轮询 `status` 都能读到,不受「事件早于 listener 注册」的启动时序影响。
 static RELOGIN_REQUIRED: AtomicBool = AtomicBool::new(false);
 
-/// [MOC-124 H-2] proxy 401 回灌时记下「被服务端撤销的 token」指纹(FNV-1a,0=无)。detect 的
-/// self-heal 据此判:active token 指纹 == 此值 → 还是那个被撤销的旧 token(exp 没过也别清
+/// [MOC-124 H-2] proxy 401 回灌时记下「被服务端撤销的 token」指纹(FNV-1a,0=指纹未知)。detect
+/// 的 self-heal 据此判:active token 指纹 == 此值 → 还是那个被撤销的旧 token(exp 没过也别清
 /// relogin);≠ → token 换了(app 外 codex login / 重新导入)→ 可清。
 static REVOKED_TOKEN_FP: AtomicU64 = AtomicU64::new(0);
+
+/// [MOC-124 H-2 / codex-connector P2] 是否有 proxy 401 撤销记录(**独立于指纹**)。区分两种
+/// `REVOKED_TOKEN_FP==0`:① 从没 proxy 401(无撤销)→ detect 照常自愈清 stale relogin;②
+/// no-bearer 401(请求无 Authorization → 指纹算成 0,有撤销但指纹未知)→ 保守保持 relogin、
+/// **不**被当成「无记录」而自清。少了这个 flag,no-bearer 401 会让 detect 漏报真撤销。
+static HAS_REVOCATION: AtomicBool = AtomicBool::new(false);
 
 /// 读「需重新登录」标记。
 pub fn relogin_required() -> bool {
@@ -110,6 +116,7 @@ fn set_relogin_required(v: bool) {
 fn clear_relogin_state() {
     set_relogin_required(false);
     REVOKED_TOKEN_FP.store(0, Ordering::SeqCst);
+    HAS_REVOCATION.store(false, Ordering::SeqCst);
 }
 
 /// [MOC-124 H-2] proxy 透传探测到 chatgpt backend 上游 401(服务端 token 失效)时回灌。proxy
@@ -122,8 +129,15 @@ fn clear_relogin_state() {
 /// **只标记、不做 2xx 自愈**(codex-connector P2):并发请求乱序下撤销前的旧 2xx 会清掉撤销后的
 /// 401 标记、漏报真撤销(危险)。而 chatgpt backend 的 401 = 真 token 问题、不存在「token 有效
 /// 但瞬时 401」,故无需自愈;401 一律标记(误报方向安全,detect 换 token 自然清)。
+///
+/// **no-bearer 401**(codex-connector P2):请求无 Authorization 时 `token_fp==0`。置
+/// [`HAS_REVOCATION`] 但**不**用 0 覆盖已记录的撤销指纹 —— 否则会擦掉之前真撤销 token 的指纹、
+/// 让 detect 误判「无记录」自清。`HAS_REVOCATION` 让 detect 把这种「有撤销但指纹未知」保守保持。
 pub fn mark_relogin_required_from_proxy(token_fp: u64) {
-    REVOKED_TOKEN_FP.store(token_fp, Ordering::SeqCst);
+    HAS_REVOCATION.store(true, Ordering::SeqCst);
+    if token_fp != 0 {
+        REVOKED_TOKEN_FP.store(token_fp, Ordering::SeqCst);
+    }
     set_relogin_required(true);
 }
 
@@ -148,11 +162,17 @@ fn access_token_fingerprint(auth: &Value) -> u64 {
 }
 
 /// [MOC-124 H-2] detect self-heal 见有效 Official token 时**是否该清** relogin。
-/// `revoked_fp==0`(无 proxy 401 撤销记录)→ 清(保持原自愈语义);active token 指纹 ≠ 被撤销的
-/// (token 换了:app 外 codex login / 重新导入)→ 清;**指纹相同**(还是那个被服务端撤销、本地
-/// exp 没过的旧 token)→ **不清**,否则会抹掉 proxy 401 探测、H-2 形同无效(本 PR 的 BLOCKER)。
-fn should_clear_relogin(active_token_fp: u64, revoked_fp: u64) -> bool {
-    revoked_fp == 0 || active_token_fp != revoked_fp
+/// - `!has_revocation`(从没 proxy 401)→ 清(detect 照常自愈 detect-None 设的 stale relogin)。
+/// - 有撤销 + 指纹未知(`revoked_fp==0`,no-bearer 401,codex P2)→ **不清**(保守保持,避免被当
+///   成「无记录」漏报真撤销)。
+/// - 有撤销 + active 指纹 ≠ 被撤销的(token 换了:app 外 login / 重新导入)→ 清。
+/// - 有撤销 + 指纹相同(还是那个被服务端撤销、本地 exp 没过的旧 token)→ **不清**,否则会抹掉
+///   proxy 401 探测、H-2 形同无效(本 PR 的 BLOCKER)。
+fn should_clear_relogin(active_token_fp: u64, revoked_fp: u64, has_revocation: bool) -> bool {
+    if !has_revocation {
+        return true;
+    }
+    revoked_fp != 0 && active_token_fp != revoked_fp
 }
 
 /// 活动 `~/.codex/auth.json` 当前是否就是可用的真实 chatgpt(决定「插件解锁是否走原生
@@ -424,6 +444,7 @@ pub fn detect() -> RealAccountStatus {
                 && should_clear_relogin(
                     access_token_fingerprint(&found.value),
                     REVOKED_TOKEN_FP.load(Ordering::SeqCst),
+                    HAS_REVOCATION.load(Ordering::SeqCst),
                 )
             {
                 clear_relogin_state();
@@ -981,18 +1002,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // [MOC-124 H-2 BLOCKER 修复] detect self-heal 的 fp 决策:被撤销的旧 token 保持 relogin,
-    // token 换了 / 无撤销记录才清。修复「detect 用 local-exp 自愈抹掉 proxy 401 探测」的核心。
+    // [MOC-124 H-2 BLOCKER + codex P2] detect self-heal 决策矩阵:被撤销旧 token 保持、token
+    // 换了才清、无撤销照常清、no-bearer 401(指纹未知)保守保持。
     #[test]
-    fn should_clear_relogin_keeps_flag_for_same_revoked_token() {
+    fn should_clear_relogin_decision_matrix() {
         let revoked = access_token_fingerprint(&json!({"tokens": {"access_token": "tok_revoked"}}));
         let fresh = access_token_fingerprint(&json!({"tokens": {"access_token": "tok_fresh"}}));
-        // 还是被撤销的旧 token(指纹相同)→ 不清(保持 relogin) ← BLOCKER 核心
-        assert!(!should_clear_relogin(revoked, revoked));
-        // token 换了(app 外 login / 重新导入)→ 清
-        assert!(should_clear_relogin(fresh, revoked));
-        // 无撤销记录(revoked==0)→ 清,保持原自愈语义
-        assert!(should_clear_relogin(revoked, 0));
+        // 无撤销记录(has_revocation=false)→ 清(detect 照常自愈 detect-None 设的 stale relogin)
+        assert!(should_clear_relogin(revoked, 0, false));
+        assert!(should_clear_relogin(revoked, revoked, false));
+        // 有撤销 + 还是被撤销的旧 token(指纹相同)→ 不清(保持) ← BLOCKER 核心
+        assert!(!should_clear_relogin(revoked, revoked, true));
+        // 有撤销 + token 换了(app 外 login / 重新导入)→ 清
+        assert!(should_clear_relogin(fresh, revoked, true));
+        // 有撤销 + 指纹未知(no-bearer 401,revoked_fp==0)→ 不清(保守保持) ← codex P2
+        assert!(!should_clear_relogin(revoked, 0, true));
+        assert!(!should_clear_relogin(fresh, 0, true));
     }
 
     // [MOC-124 H-2] auth.json access_token 指纹:稳定、不同 token 不同、缺/空 → 0。
@@ -1020,16 +1045,24 @@ mod tests {
         clear_relogin_state();
         assert!(!relogin_required());
 
-        // 401(token A 撤销)→ 标记需重登 + 记指纹 A
+        // 401(token A 撤销)→ 标记需重登 + 记指纹 A + has_revocation
         mark_relogin_required_from_proxy(a);
         assert!(relogin_required());
-        // detect self-heal:active 还是 A(指纹相同)→ 不清(保持);换了 token → 清
-        assert!(!should_clear_relogin(a, a));
-        assert!(should_clear_relogin(2222, a));
-        // 显式清(等价 login/import/forget 拿到新账号)
+        assert_eq!(REVOKED_TOKEN_FP.load(Ordering::SeqCst), a);
+        assert!(HAS_REVOCATION.load(Ordering::SeqCst));
+        // [codex P2] 随后 no-bearer 401(fp=0)置 has_revocation 但**不覆盖**已记录的指纹 A
+        mark_relogin_required_from_proxy(0);
+        assert_eq!(
+            REVOKED_TOKEN_FP.load(Ordering::SeqCst),
+            a,
+            "no-bearer 401 不该擦掉指纹 A"
+        );
+        assert!(HAS_REVOCATION.load(Ordering::SeqCst));
+        // 显式清(等价 login/import/forget 拿到新账号)→ 全清
         clear_relogin_state();
         assert!(!relogin_required());
-        assert!(should_clear_relogin(a, 0)); // 清后无撤销记录 → detect 照常清
+        assert_eq!(REVOKED_TOKEN_FP.load(Ordering::SeqCst), 0);
+        assert!(!HAS_REVOCATION.load(Ordering::SeqCst));
     }
     use std::path::Path;
 
