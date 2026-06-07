@@ -2094,6 +2094,60 @@ fn empty_instructions_is_skipped() {
 }
 
 #[test]
+fn cas_sentinel_instructions_stripped_for_third_party() {
+    // [MOC-153] transfer 注入给 catalog 的 base_instructions sentinel 不能转发给第三方
+    // chat provider:命中即剥离,第三方请求与历史"顶层 instructions 为空"时字节级一致
+    // (只剩 user 输入,无 system 头)。sentinel 只为"切真 GPT 续话"过后端校验而存在。
+    let out = convert(json!({
+        "model": "x",
+        "instructions": codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS,
+        "input": "hi"
+    }));
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "sentinel 应被剥离,不产生 system 头");
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["content"], "hi");
+}
+
+#[test]
+fn cas_sentinel_instructions_as_object_text_stripped() {
+    // 兼容 instructions 以 { "text": ... } 对象形态出现时也精确剥离。
+    let out = convert(json!({
+        "instructions": { "text": codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS },
+        "input": "hi"
+    }));
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["role"], "user");
+}
+
+#[test]
+fn cas_sentinel_instructions_as_object_content_stripped() {
+    // helper doc 声称同时认 { "text" | "content": ... };锁住 content 键分支(与
+    // build_instructions_message 的取值口径对称)。
+    let out = convert(json!({
+        "instructions": { "content": codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS },
+        "input": "hi"
+    }));
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["role"], "user");
+}
+
+#[test]
+fn non_sentinel_instructions_not_stripped() {
+    // 只精确剥离 sentinel;其它任何非空 instructions(真实用户/Codex 指令)照常作 system 头。
+    let out = convert(json!({
+        "instructions": "You are Codex, a coding agent.",
+        "input": "hi"
+    }));
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(msgs[0]["content"], "You are Codex, a coding agent.");
+}
+
+#[test]
 fn array_input_message_item_passthrough() {
     let out = convert(json!({
         "input": [

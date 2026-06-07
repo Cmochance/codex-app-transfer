@@ -270,6 +270,10 @@ v2.1.5 及之前的版本未把 `role=system` 转 `role=user`,导致 MiniMax `/v
 
 Codex 部分内置工具(如 `list_mcp_resources` / `load_workspace_dependencies` / `read_thread_terminal`,参数全 optional 或无参)的 parameters schema 省略了 `required` 数组。OpenAI / DeepSeek 官方等宽容上游默认把缺失当空集放行;但严格 OpenAI 兼容中转网关(如 AIOHub)的 JSON Schema validator 要求 object schema 显式带 `required`,读到缺失得 `null` → 报 `null is not of type "array"` 整请求 400。**v2.2.2+ 已修(MOC-188)**:转换路径统一给缺失 `required` 的 object schema 补 `required:[]`(语义中性),经此类网关接入不再因工具 schema 缺字段 400。
 
+### 第三方模型会话切到 GPT 报 `Instructions are required`
+
+在第三方模型(如 MiniMax / MiMo)起步的对话里**切换到真 GPT**(`gpt-5.5` 等)后发消息,Codex composer 内联报 `Instructions are required`、对话卡死。根因:Codex 把会话所用模型的 model catalog `base_instructions` 字段**在会话创建时冻结**(定死、跨续话不重算),transfer 历史上给 catalog 写的是空串 → 第三方起步的会话顶层 `instructions` 一直空;之后切真 GPT 直连 chatgpt.com(不经 proxy),OpenAI Responses 后端硬校验顶层 instructions 非空 → 400。**已修(MOC-153)**:transfer 给 catalog 写非空 `base_instructions`,会话出生即带、切 GPT 不再 400;该值对第三方请求由 proxy adapter 精确剥离,第三方对话行为字节级不变。
+
 ### 上游 404 / 连不上(Base URL 填了完整 endpoint)
 
 provider 的 Base URL 只填到根或 `/v1`(例 `https://api.example.com/v1`),**不要**把完整 endpoint 路径整段粘进去。本工具会按协议自动补 `/chat/completions`、`/v1/messages`、`/responses` 等;若 Base URL 已含这些后缀(如把 `https://opencode.ai/zen/go/v1/chat/completions` 整段填入),会拼成 `…/chat/completions/chat/completions` 导致上游 404。删掉多余的 endpoint 后缀、只留到 `/v1` 即可。

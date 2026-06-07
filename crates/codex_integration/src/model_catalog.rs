@@ -19,7 +19,7 @@
 
 use codex_app_transfer_registry::{
     documented_context_window, load_raw_config, model_supports_1m, normalize_model_mappings,
-    save_raw_config, strip_internal_model_suffix, MODEL_SLOTS,
+    save_raw_config, strip_internal_model_suffix, CAS_BASE_INSTRUCTIONS, MODEL_SLOTS,
 };
 use serde_json::{json, Value};
 
@@ -467,7 +467,11 @@ fn codex_model_template(
         "additional_speed_tiers": additional_speed_tiers,
         "availability_nux": availability_nux,
         "upgrade": upgrade,
-        "base_instructions": "",
+        // [MOC-153] 非空 sentinel(替代旧 ""):Codex 把它冻结进会话级
+        // session_meta.base_instructions,让"第三方会话停 transfer 后切真 GPT 续话"
+        // 时顶层 instructions 非空、不再被真 ChatGPT 后端 400。第三方请求经 adapter
+        // 剥离本 sentinel(request.rs),字节级不变。见 registry::CAS_BASE_INSTRUCTIONS。
+        "base_instructions": CAS_BASE_INSTRUCTIONS,
         "supports_reasoning_summaries": true,
         "default_reasoning_summary": default_reasoning_summary,
         "support_verbosity": true,
@@ -509,7 +513,9 @@ fn generic_model_template() -> Value {
         "additional_speed_tiers": [],
         "availability_nux": null,
         "upgrade": null,
-        "base_instructions": "",
+        // [MOC-153] 见 codex_model_template 同处注释:非空 sentinel 修真 GPT 切换 400,
+        // 第三方经 adapter 剥离。见 registry::CAS_BASE_INSTRUCTIONS。
+        "base_instructions": CAS_BASE_INSTRUCTIONS,
         "supports_reasoning_summaries": false,
         "default_reasoning_summary": "auto",
         "support_verbosity": false,
@@ -595,6 +601,37 @@ mod tests {
         assert_eq!(entry["supports_search_tool"], true);
         assert_eq!(entry["supports_reasoning_summaries"], true);
         assert_eq!(entry["web_search_tool_type"], "text_and_image");
+    }
+
+    #[test]
+    fn catalog_entries_carry_nonempty_base_instructions() {
+        // [MOC-153] 每个 catalog 条目的 base_instructions 必须是非空 sentinel(替代旧 ""):
+        // Codex 把它冻结进会话级 session_meta.base_instructions,第三方会话停 transfer 后切
+        // 真 GPT 续话才不会因顶层 instructions 空被后端 400。builtin slug(gpt-5.5)与
+        // generic 模板(非内置 slug)两条路径都要带。第三方请求侧由 adapter 剥离,无污染。
+        let builtin = catalog_models_for_provider("DeepSeek", "deepseek-v4-pro", true, None, None);
+        let gpt55 = builtin.iter().find(|m| m.slug == "gpt-5.5").unwrap();
+        assert_eq!(
+            model_to_json(gpt55)["base_instructions"],
+            CAS_BASE_INSTRUCTIONS
+        );
+
+        let non_builtin = CatalogModel {
+            slug: "custom-non-builtin".into(),
+            display_name: "custom-non-builtin".into(),
+            provider_name: "P".into(),
+            context_window: 258_400,
+            effective_context_window_percent: 95,
+            auto_review_model_override: None,
+        };
+        assert_eq!(
+            model_to_json(&non_builtin)["base_instructions"],
+            CAS_BASE_INSTRUCTIONS
+        );
+
+        // 防回归:绝不退回空串(空串正是 MOC-153 的根因)。
+        assert_ne!(model_to_json(gpt55)["base_instructions"], "");
+        assert_ne!(model_to_json(&non_builtin)["base_instructions"], "");
     }
 
     #[test]

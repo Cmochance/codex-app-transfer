@@ -303,11 +303,21 @@ fn build_messages_from_input(
     session_cache: Option<&ResponseSessionCache>,
 ) -> Result<MergeResult, AdapterError> {
     let mut messages: Vec<Value> = Vec::new();
-    if let Some(msg) = body
-        .get("instructions")
-        .and_then(build_instructions_message)
-    {
-        messages.push(msg);
+    // [MOC-153] 剥掉 transfer 注入的 catalog base_instructions sentinel。
+    // transfer 给 catalog 条目写非空 `CAS_BASE_INSTRUCTIONS`(修"第三方会话切真 GPT
+    // 续话报 400"),Codex 会把它作为顶层 instructions 发给**每个** turn —— 包括转发给
+    // 第三方 chat provider 的请求。该 sentinel 对第三方纯属噪音(历史上第三方顶层
+    // instructions 本就为空;仅在注册 apply_patch 的 first turn 才有下方注入的 chat-path
+    // 指引),命中即跳过、保持第三方请求与历史行为一致、零污染。非 sentinel 的真实
+    // instructions 照常转为 system 头。
+    let instructions = body.get("instructions");
+    let skip_cas_sentinel = instructions
+        .map(is_cas_injected_base_instructions)
+        .unwrap_or(false);
+    if !skip_cas_sentinel {
+        if let Some(msg) = instructions.and_then(build_instructions_message) {
+            messages.push(msg);
+        }
     }
 
     // 紧跟 Codex CLI 自带 instructions 之后注入 apply_patch chat-path 指引
@@ -385,6 +395,24 @@ fn build_instructions_message(instructions: &Value) -> Option<Value> {
             }
         }
     }
+}
+
+/// [MOC-153] 顶层 instructions 是否就是 transfer 注入给 catalog 的 sentinel
+/// ([`codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS`])。命中即在转发给第三方
+/// chat provider 时剥离,详见 [`build_messages_from_input`] 与 registry 模块文档。
+///
+/// 兼容 wire 上 instructions 既可能是裸 string、也可能是 `{ "text" | "content": ... }`
+/// 对象;精确匹配常量值(不 trim,catalog→session_meta→wire 全程原样传递)。
+fn is_cas_injected_base_instructions(instructions: &Value) -> bool {
+    let text = match instructions {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(obj) => obj
+            .get("text")
+            .or_else(|| obj.get("content"))
+            .and_then(|v| v.as_str()),
+        _ => None,
+    };
+    text == Some(codex_app_transfer_registry::CAS_BASE_INSTRUCTIONS)
 }
 
 /// 把 `body.input` 字段(可能是 string 也可能是 array)展开成 messages 列表.
