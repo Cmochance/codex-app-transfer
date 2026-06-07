@@ -173,6 +173,11 @@ pub(super) fn allowed_install_extensions(platform: &str) -> &'static [&'static s
 }
 
 pub(super) fn pick_windows_installer(assets: &[Value]) -> Result<Value, String> {
+    // release.yml 把 NSIS 产物 cp 成 `Codex-App-Transfer-v{V}-Windows-x64-Setup.exe`
+    // (含架构段 `-x64-`)。早先匹配 `windows-setup.exe` 漏了架构段 → 真实 release 永远
+    // 挑不到 Windows 安装包,in-app 更新报 "no Windows installer asset"(MOC-111)。改匹
+    // 配 `-setup.exe` 后缀:稳健命中当前及未来架构变体(arm64),且不误中 `.exe.sig` /
+    // `.exe.sha256` / `.msi`(只有 NSIS setup 主包以 `-setup.exe` 结尾)。
     assets
         .iter()
         .find(|asset| {
@@ -181,7 +186,7 @@ pub(super) fn pick_windows_installer(assets: &[Value]) -> Result<Value, String> 
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_ascii_lowercase()
-                .ends_with("windows-setup.exe")
+                .ends_with("-setup.exe")
         })
         .cloned()
         .ok_or_else(|| "current release has no Windows installer asset".to_owned())
@@ -967,13 +972,19 @@ mod tests {
         assert!(is_newer_version("2.1", "2.0.99"));
         assert!(!is_newer_version("2.0", "2.0.0"));
 
+        // 用真实 release 资产命名(release.yml: `...-Windows-x64-Setup.exe`,含架构段
+        // `-x64-`)。MOC-111:旧 fixture `Windows-Setup.exe` 漏了 `-x64-`,让 bug 在测试
+        // 侧不可见。setup 主包放最后 + 前置 `.exe.sig`/`.exe.sha256`/`.msi` 干扰项,强制
+        // find 跳过非主包资产才能挑中。
         let windows_assets = vec![
-            json!({"name": "Codex-App-Transfer-Windows-Portable.exe"}),
-            json!({"name": "Codex-App-Transfer-Windows-Setup.exe"}),
+            json!({"name": "Codex-App-Transfer-v2.2.1-Windows-x64-Setup.exe.sig"}),
+            json!({"name": "Codex-App-Transfer-v2.2.1-Windows-x64-Setup.exe.sha256"}),
+            json!({"name": "Codex-App-Transfer-v2.2.1-Windows-x64.msi"}),
+            json!({"name": "Codex-App-Transfer-v2.2.1-Windows-x64-Setup.exe"}),
         ];
         assert_eq!(
             pick_windows_installer(&windows_assets).unwrap()["name"],
-            json!("Codex-App-Transfer-Windows-Setup.exe")
+            json!("Codex-App-Transfer-v2.2.1-Windows-x64-Setup.exe")
         );
 
         let macos_assets = vec![
