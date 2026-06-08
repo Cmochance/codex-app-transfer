@@ -190,7 +190,14 @@ fn dispatch_line(
                 "result": {
                     "protocolVersion": proto,
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+                    "serverInfo": {
+                        "name": SERVER_NAME,
+                        "version": SERVER_VERSION,
+                        // MCP 2025-11-25 SEP-973 icons: 用本应用图标(Codex 折叠的「工具活动」汇总会
+                        // 渲染这个小叠层图标)。注: 展开的单条工具调用 header 那个图标由 Codex 的
+                        // connector catalog 控制、不读 MCP icons, 故只影响折叠汇总(调研 MOC-190 followup)。
+                        "icons": [{ "src": app_icon_data_uri(), "mimeType": "image/png", "sizes": ["128x128"] }]
+                    },
                     "instructions": SERVER_INSTRUCTIONS
                 }
             }));
@@ -1602,6 +1609,18 @@ fn current_backend() -> Result<Option<WebFetchBackend>, String> {
     Ok(WebFetchBackend::parse(s))
 }
 
+/// 本应用图标(128x128 PNG)的 data URI —— 给 MCP `serverInfo.icons`。一次编码后缓存(initialize 不
+/// 频繁, OnceLock 足够)。图标取自 `src-tauri/icons/128x128.png`(Tauri app icon)。
+fn app_icon_data_uri() -> &'static str {
+    use base64::Engine as _;
+    static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URI.get_or_init(|| {
+        let png = include_bytes!("../icons/128x128.png");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        format!("data:image/png;base64,{b64}")
+    })
+}
+
 fn web_fetch_tool_def() -> Value {
     json!({
         "name": "web_fetch",
@@ -1855,6 +1874,24 @@ mod tests {
             cache_put_in(&mut m, format!("k{i}"), format!("c{i}"));
         }
         assert!(m.len() <= FETCH_CACHE_CAP, "容量应 ≤ CAP, 实际 {}", m.len());
+    }
+
+    #[test]
+    fn server_info_icon_is_valid_png_data_uri() {
+        // MOC-190 followup: serverInfo.icons 用本应用图标(Codex 折叠工具汇总渲染的小叠层图标)。
+        let uri = app_icon_data_uri();
+        assert!(
+            uri.starts_with("data:image/png;base64,"),
+            "应是 PNG data URI, 实际开头: {}",
+            &uri[..40.min(uri.len())]
+        );
+        use base64::Engine as _;
+        let b64 = uri.strip_prefix("data:image/png;base64,").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("base64 段应可解码");
+        // PNG magic number: 89 50 4E 47。
+        assert_eq!(&decoded[..4], &[0x89, 0x50, 0x4e, 0x47], "应是合法 PNG");
     }
 
     #[test]
