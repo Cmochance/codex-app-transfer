@@ -96,31 +96,21 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // **cache miss + input 空** → build_messages_from_input 返回
     // PreviousResponseNotFound,proxy 层 IntoResponse 会转成标准 OpenAI 400
     // (`code: "previous_response_not_found"`)让 Codex CLI fail-fast。
-    let merge_result = build_messages_from_input(input, session_cache)?;
+    let (merge_result, current_tool_count) = build_messages_from_input(input, session_cache)?;
     let history_lost = merge_result.history_lost;
     let mut messages = merge_result.messages;
     // MOC-190: merge(cached history + 当前)后统一重新压缩 tool 输出。当前轮(本次 input)新产生的**所有**
     // function_call_output 都保留全文(模型一轮可能调多个工具, 每条都该全文进 LLM); cached 历史轮的旧
     // tool 输出压缩。**按位置**区分而非 call_id: merge 把 cached 拼在前、当前轮在后, 故当前轮的 tool
-    // message 必是末尾 N 个(N = 本次 input 的 function_call_output 数)。位置法兼容 ID-less / 别名的
-    // function_call_output —— 它们的 tool_call_id 由后续 repair_tool_call_ids 补、recompress 此刻还
-    // 没有(chatgpt-codex P2)。compact / 本轮无新 tool → N=0 → 全压缩(P1 防累积 + P2 防无新 tool 漏压)。
-    let current_tool_count: usize = if COMPACT_NO_KEEP_RECENT.with(|c| c.get()) {
+    // message 是末尾 N 个(N = current_tool_count, 由 build_messages_from_input 在已转换的 current_messages
+    // 上数好带出 —— 不重复转换 / 不重复触发 artifact 存储, chatgpt-codex P2)。位置法不依赖 ID, 兼容
+    // ID-less / 别名 / 多 tool / tool_search_output 等。compact(压缩历史)强制 0 → 全压缩(P1 防累积 + P2)。
+    let keep_count = if COMPACT_NO_KEEP_RECENT.with(|c| c.get()) {
         0
     } else {
-        // 数当前轮(本次 input)转换后**实际产出多少 role:tool message** —— 不只 function_call_output,
-        // 还含 tool_search_output 等其它转成 tool 的 item。必须与 recompress 的 tool_positions(数所有
-        // tool message)同口径, 否则末尾 N 个会取错、把真正的 function_call_output 漏在外面被压缩
-        // (chatgpt-codex P2)。复用 input_field_to_messages 的转换结果计数(current input 通常很小)。
-        input
-            .get("input")
-            .map(input_field_to_messages)
-            .unwrap_or_default()
-            .iter()
-            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
-            .count()
+        current_tool_count
     };
-    recompress_stale_full_tool_outputs(&mut messages, current_tool_count);
+    recompress_stale_full_tool_outputs(&mut messages, keep_count);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -337,7 +327,7 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
 fn build_messages_from_input(
     body: &Value,
     session_cache: Option<&ResponseSessionCache>,
-) -> Result<MergeResult, AdapterError> {
+) -> Result<(MergeResult, usize), AdapterError> {
     let mut messages: Vec<Value> = Vec::new();
     // [MOC-153] 剥掉 transfer 注入的 catalog base_instructions sentinel。
     // transfer 给 catalog 条目写非空 `CAS_BASE_INSTRUCTIONS`(修"第三方会话切真 GPT
@@ -394,8 +384,15 @@ fn build_messages_from_input(
         .get("input")
         .map(input_field_to_messages)
         .unwrap_or_default();
+    // 当前轮转换后产出的 role:tool message 数 —— 随返回带出, 供 recompress 定位末尾 N 个。在这里数(而非
+    // 上层再转换一次)避免重复触发 keep_recent_tool_output_full 的 artifact 存储副作用(chatgpt-codex P2)。
+    let current_tool_count = current_messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .count();
     messages.extend(current_messages);
-    merge_messages_with_previous_response(messages, body, session_cache)
+    let merge_result = merge_messages_with_previous_response(messages, body, session_cache)?;
+    Ok((merge_result, current_tool_count))
 }
 
 fn build_instructions_message(instructions: &Value) -> Option<Value> {
