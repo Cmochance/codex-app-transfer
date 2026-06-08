@@ -203,7 +203,10 @@ fn dispatch_line(
             // (与 web_fetch 改 on/off 需重启一致);运行期切档的 stale 缓存由 handle_web_search_call
             // 的 backend gate 兜底(failing 双保险)。
             let mut tools = vec![web_fetch_tool_def()];
-            if matches!(current_backend(), Ok(Some(b)) if b.may_use_headless()) {
+            // web_search 暴露条件(MOC-190): backend 非 off + Chrome 就绪(系统装了或已下载),
+            // 与 web_fetch 档位选择解耦 —— 系统有 Chrome 的用户在 curl/wreq 档也能用 search 且不
+            // 触发下载;两者皆无则不暴露(避免在没走过 consent 的档静默拉 ~86MB)。
+            if matches!(current_backend(), Ok(Some(_))) && chrome_ready() {
                 tools.push(web_search_tool_def());
             }
             let _ = out_tx.send(json!({
@@ -594,11 +597,19 @@ fn bounded_page(
     format!("[web_fetch {url} | 字符 {offset}-{end} / 共 {total}{more}]\n\n{page}")
 }
 
+/// Chrome 是否就绪可跑 headless: 系统装了 Chrome / Edge / Chromium, 或已下载内置 chrome-headless-shell
+/// (**不触发下载**)。web_search 的暴露 gate(tools/list)与调用 gate 共用(MOC-190)—— 把 web_search
+/// 可见性从 web_fetch 档位解耦为「Chrome 就绪」, 同时守住「不静默下载 86MB」。
+fn chrome_ready() -> bool {
+    codex_app_transfer_http::headless::detect_system_chrome().is_some()
+        || codex_app_transfer_http::headless::chrome_headless_shell_path().is_some()
+}
+
 /// 处理 `web_search` tools/call: 走 DDG(headless)搜索, 返回结构化结果列表给模型。
-/// **要求 webFetchBackend == headless 档**(chatgpt-codex review #386): web_search 必须 headless
-/// (DDG 纯 HTTP 被 202 反爬拦, spike 实测 wreq 6 变体全灭, MOC-12), 故 ① 尊重 off(用户运行期
-/// 关联网即拒, 与 web_fetch 每次 re-read backend 的 runtime guard 对齐)② 不在 curl/wreq 档静默
-/// 后台下载 ~86MB chrome-headless-shell(那两档没走过 headless 的 UI consent 下载流程)。
+/// **要求 Chrome 就绪**(MOC-190: 暴露/调用 gate 从 web_fetch 档位解耦为「Chrome 就绪」):
+/// web_search 内部固定 headless(DDG 纯 HTTP 被 202 反爬拦, MOC-12), 故 ① 尊重 off(用户运行期
+/// 关联网即拒)② 非 off 但 Chrome 未就绪拒 + 引导(不在没走过 consent 的档静默下载 ~86MB);系统
+/// 装了 Chrome / 已下载内置 Chrome 即放行 —— curl/wreq 档只要 Chrome 在也能用(不再强制 headless 档)。
 async fn handle_web_search_call(
     id: Value,
     query: Option<String>,
@@ -608,19 +619,18 @@ async fn handle_web_search_call(
         Some(q) if !q.is_empty() => q,
         _ => return tool_error(id, "缺少必填参数 query(搜索关键词 / 问题)"),
     };
-    // web_search 必须用真浏览器(DDG 反爬)→ 要求 headless **或 auto** 档(Auto 允许升 headless、
-    // 抓 DDG 会走到 headless, MOC-161): off 拒(尊重关闭), curl/wreq 拒 + 引导切档(避免静默下载
-    // Chrome), headless/auto 放行(其 Chrome 已走过 UI consent 下载)。
+    // web_search 必须用真浏览器(DDG 反爬)→ 要求 Chrome 就绪(MOC-190: 从 web_fetch 档位解耦为
+    // 「Chrome 就绪」)。off 拒(尊重关闭);非 off 但 Chrome 未就绪拒 + 引导(避免静默下载 86MB);
+    // Chrome 就绪(系统装了或已下载)则任意非 off 档放行 —— web_search 内部固定 headless、不跟随
+    // web_fetch 档位, 故 curl/wreq 档只要 Chrome 在就能用。
     match current_backend() {
-        Ok(Some(b)) if b.may_use_headless() => {}
-        Ok(Some(other)) => {
+        Ok(Some(_)) if chrome_ready() => {}
+        Ok(Some(_)) => {
             return tool_error(
                 id,
-                &format!(
-                    "web_search 需要 auto 或 headless 档(DDG 反爬只有真浏览器能过)。当前是 {} 档 —— 请在 \
-                     codex-app-transfer 设置 → 内置联网抓取工具 选 auto 或 headless(首次会确认下载 Chrome)再用。",
-                    other.as_str()
-                ),
+                "web_search 需要本机有 Chrome / Edge / Chromium, 或已下载内置 Chrome(DDG 反爬只有真\
+                 浏览器能过)。请在 codex-app-transfer 设置 → 内置联网抓取工具 选 headless 档完成首次\
+                 chrome-headless-shell(~86MB)下载后再用。",
             )
         }
         Ok(None) => {

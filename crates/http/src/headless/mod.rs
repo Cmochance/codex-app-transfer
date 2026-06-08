@@ -35,7 +35,9 @@ mod detect;
 mod download;
 
 pub use detect::detect_system_chrome;
-pub use download::{ensure_chrome_headless_shell, platform_slug, PINNED_VERSION};
+pub use download::{
+    chrome_headless_shell_path, ensure_chrome_headless_shell, platform_slug, PINNED_VERSION,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
