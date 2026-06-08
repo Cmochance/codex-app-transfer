@@ -348,7 +348,10 @@ async fn handle_web_fetch_call(
 
     // 1) 取正文: 进程内缓存命中则复用(offset 翻页 / 重读同 URL 不重抓), miss 才真抓。
     //    Ok(正文) 进入分流; Err(已构造的早退 resp) 用于空 body / 抓取失败。
-    let content = match cache_get(&url) {
+    // 缓存 key 含 backend(MOC-190 chatgpt-codex P2): 否则 curl/wreq 抓的 body 缓存后, 切 headless
+    // 重试同 URL 在 TTL 内命中 stale 非渲染 body, 回归 per-call backend reread。
+    let cache_key = format!("{}|{}", backend.as_str(), url);
+    let content = match cache_get(&cache_key) {
         Some(c) => {
             if diag {
                 fetch_v = json!({ "cache_hit": true, "body_chars": c.chars().count() });
@@ -368,7 +371,7 @@ async fn handle_web_fetch_call(
                 if diag {
                     fetch_v = fetch_value(backend, &outcome);
                 }
-                cache_put(url.clone(), outcome.content.clone());
+                cache_put(cache_key.clone(), outcome.content.clone());
                 Ok(outcome.content)
             }
             Err(e) => {
@@ -438,7 +441,13 @@ async fn handle_web_fetch_call(
         }
         Ok(content) => {
             let page = truncate(
-                &bounded_page(&url, &content, query.as_deref(), offset, WEBFETCH_PAGE_CHARS),
+                &bounded_page(
+                    &url,
+                    &content,
+                    query.as_deref(),
+                    offset,
+                    WEBFETCH_PAGE_CHARS,
+                ),
                 MAX_CONTENT_CHARS,
             );
             if diag {
@@ -624,15 +633,7 @@ async fn handle_web_search_call(
     // Chrome 就绪(系统装了或已下载)则任意非 off 档放行 —— web_search 内部固定 headless、不跟随
     // web_fetch 档位, 故 curl/wreq 档只要 Chrome 在就能用。
     match current_backend() {
-        Ok(Some(_)) if chrome_ready() => {}
-        Ok(Some(_)) => {
-            return tool_error(
-                id,
-                "web_search 需要本机有 Chrome / Edge / Chromium, 或已下载内置 Chrome(DDG 反爬只有真\
-                 浏览器能过)。请在 codex-app-transfer 设置 → 内置联网抓取工具 选 headless 档完成首次\
-                 chrome-headless-shell(~86MB)下载后再用。",
-            )
-        }
+        Ok(Some(_)) => {}
         Ok(None) => {
             return tool_error(
                 id,
@@ -645,6 +646,17 @@ async fn handle_web_search_call(
                 &format!("读取联网设置失败: {e}(请检查 ~/.codex-app-transfer/config.json)"),
             )
         }
+    }
+    // Chrome 就绪判定用「不会触发下载」语义(已下载 shell, 或系统 Chrome 自检通过)—— 与 launch 的
+    // resolve_chrome_binary 一致, 避免 stale/损坏系统 Chrome 路径 gate 放行后 launch 自检失败
+    // fallback 下载 86MB(chatgpt-codex P2)。off 已在上面 match 早退, 此处只对非 off 档判 Chrome。
+    if !codex_app_transfer_http::headless::chrome_ready_without_download().await {
+        return tool_error(
+            id,
+            "web_search 需要本机有可用的 Chrome / Edge / Chromium, 或已下载内置 Chrome(DDG 反爬只有\
+             真浏览器能过)。请在 codex-app-transfer 设置 → 内置联网抓取工具 选 headless 档完成首次\
+             chrome-headless-shell(~86MB)下载后再用。",
+        );
     }
     let max = max_results.unwrap_or(codex_app_transfer_http::search::DEFAULT_MAX_RESULTS);
     let diag_port = diag_target();
@@ -1797,7 +1809,10 @@ mod tests {
         // 新增可选参数 query / offset / summarize。
         assert_eq!(d["inputSchema"]["properties"]["query"]["type"], "string");
         assert_eq!(d["inputSchema"]["properties"]["offset"]["type"], "integer");
-        assert_eq!(d["inputSchema"]["properties"]["summarize"]["type"], "boolean");
+        assert_eq!(
+            d["inputSchema"]["properties"]["summarize"]["type"],
+            "boolean"
+        );
         // 旧 prompt 字段不再声明(改由 dispatch 兼容映射到 query)。
         assert!(d["inputSchema"]["properties"]["prompt"].is_null());
         // MOC-172: readOnlyHint=true / destructiveHint=false 让 guardian 跳过 auto-review 审批。
@@ -1831,7 +1846,10 @@ mod tests {
     fn bounded_page_offset_overflow() {
         let content = "x".repeat(100);
         let p = bounded_page("https://e.com", &content, None, 500, 400);
-        assert!(p.contains("已超全文长度 100"), "越界 offset 应明确提示: {p}");
+        assert!(
+            p.contains("已超全文长度 100"),
+            "越界 offset 应明确提示: {p}"
+        );
     }
 
     #[test]
@@ -1842,7 +1860,13 @@ mod tests {
             .collect();
         paras.push("## 关键\nbreaking change 是 XYZ 配置项。".to_string());
         let content = paras.join("\n\n");
-        let p = bounded_page("https://e.com", &content, Some("breaking change XYZ"), 0, 2000);
+        let p = bounded_page(
+            "https://e.com",
+            &content,
+            Some("breaking change XYZ"),
+            0,
+            2000,
+        );
         assert!(
             p.contains("XYZ"),
             "query 应选出相关段原文: {}",
@@ -1857,7 +1881,13 @@ mod tests {
     #[test]
     fn bounded_page_query_small_content_passthrough() {
         // query 但全文未超单页 → did_select=false, 标注"已全返回"且含原文。
-        let p = bounded_page("https://e.com", "短内容 breaking", Some("breaking"), 0, 4000);
+        let p = bounded_page(
+            "https://e.com",
+            "短内容 breaking",
+            Some("breaking"),
+            0,
+            4000,
+        );
         assert!(p.contains("未超单页, 已全返回"), "小内容应全返回: {p}");
         assert!(p.contains("短内容 breaking"));
     }
@@ -1887,8 +1917,7 @@ mod tests {
 
     #[test]
     fn cache_in_roundtrip_update_and_cap() {
-        let mut m: std::collections::HashMap<String, CachedDoc> =
-            std::collections::HashMap::new();
+        let mut m: std::collections::HashMap<String, CachedDoc> = std::collections::HashMap::new();
         assert!(cache_get_in(&mut m, "u1").is_none(), "初始未命中");
         cache_put_in(&mut m, "u1".into(), "正文".into());
         assert_eq!(cache_get_in(&mut m, "u1").as_deref(), Some("正文"));

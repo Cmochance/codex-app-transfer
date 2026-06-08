@@ -133,6 +133,20 @@ async fn chrome_binary_works(_bin: &std::path::Path) -> bool {
     true
 }
 
+/// web_search gate 用(MOC-190): Chrome 是否就绪**且 launch 不会触发下载**。已下载内置 shell → ready;
+/// 否则系统 Chrome 须**自检通过**(`--version`, 与 [`resolve_chrome_binary`] 同语义)才算 —— 避免
+/// detect 命中 stale/损坏路径、gate 放行后 launch 自检失败 fallback `ensure_chrome_headless_shell`
+/// 静默下载 86MB(chatgpt-codex P2)。
+pub async fn chrome_ready_without_download() -> bool {
+    if download::chrome_headless_shell_path().is_some() {
+        return true;
+    }
+    match detect::detect_system_chrome() {
+        Some(p) => chrome_binary_works(&p).await,
+        None => false,
+    }
+}
+
 // 临时 profile 目录序号: 同进程内多个实例不撞目录 (Chrome 同 profile 会 lock 冲突)。
 static PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
