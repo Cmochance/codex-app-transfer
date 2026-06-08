@@ -42,6 +42,20 @@ const TOOL_OUTPUT_INLINE_MAX_CHARS: usize = 4_000;
 const TOOL_OUTPUT_HEAD_CHARS: usize = 1_200;
 const TOOL_OUTPUT_TAIL_CHARS: usize = 1_200;
 const TOOL_OUTPUT_VISIBLE_MAX_CHARS: usize = 5_000;
+/// 最新 1 条 tool 输出"保留全文"的上限(MOC-190): 当前轮刚产生的 tool 输出全文进上下文, 但 ≤ 此
+/// 上限 —— 超过(如巨型 shell grep 924k)仍走 bounding, 防单条撑爆。100k ≈ web_fetch 全文上限。
+const TOOL_OUTPUT_KEEP_FULL_MAX_CHARS: usize = 100_000;
+
+thread_local! {
+    /// MOC-190: compact 转换期间置 true —— compact 是压缩历史, 不保留最新 tool 全文(与 normal turn
+    /// 区分;两者共用 `input_field_to_messages` 转换路径)。`compact.rs` 在转换前后 set/reset。
+    static COMPACT_NO_KEEP_RECENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 设置 compact 转换标志(见 [`COMPACT_NO_KEEP_RECENT`])。compact 调转换前 `true`、之后 `false`。
+pub(crate) fn set_compact_no_keep_recent(v: bool) {
+    COMPACT_NO_KEEP_RECENT.with(|c| c.set(v));
+}
 
 /// 把 Responses API 请求体转换成 OpenAI Chat Completions 请求体.
 pub fn responses_body_to_chat_body(input: &Value) -> Result<Value, AdapterError> {
@@ -82,9 +96,21 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // **cache miss + input 空** → build_messages_from_input 返回
     // PreviousResponseNotFound,proxy 层 IntoResponse 会转成标准 OpenAI 400
     // (`code: "previous_response_not_found"`)让 Codex CLI fail-fast。
-    let merge_result = build_messages_from_input(input, session_cache)?;
+    let (merge_result, current_tool_count) = build_messages_from_input(input, session_cache)?;
     let history_lost = merge_result.history_lost;
     let mut messages = merge_result.messages;
+    // MOC-190: merge(cached history + 当前)后统一重新压缩 tool 输出。当前轮(本次 input)新产生的**所有**
+    // function_call_output 都保留全文(模型一轮可能调多个工具, 每条都该全文进 LLM); cached 历史轮的旧
+    // tool 输出压缩。**按位置**区分而非 call_id: merge 把 cached 拼在前、当前轮在后, 故当前轮的 tool
+    // message 是末尾 N 个(N = current_tool_count, 由 build_messages_from_input 在已转换的 current_messages
+    // 上数好带出 —— 不重复转换 / 不重复触发 artifact 存储, chatgpt-codex P2)。位置法不依赖 ID, 兼容
+    // ID-less / 别名 / 多 tool / tool_search_output 等。compact(压缩历史)强制 0 → 全压缩(P1 防累积 + P2)。
+    let keep_count = if COMPACT_NO_KEEP_RECENT.with(|c| c.get()) {
+        0
+    } else {
+        current_tool_count
+    };
+    recompress_stale_full_tool_outputs(&mut messages, keep_count);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -301,7 +327,7 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
 fn build_messages_from_input(
     body: &Value,
     session_cache: Option<&ResponseSessionCache>,
-) -> Result<MergeResult, AdapterError> {
+) -> Result<(MergeResult, usize), AdapterError> {
     let mut messages: Vec<Value> = Vec::new();
     // [MOC-153] 剥掉 transfer 注入的 catalog base_instructions sentinel。
     // transfer 给 catalog 条目写非空 `CAS_BASE_INSTRUCTIONS`(修"第三方会话切真 GPT
@@ -358,8 +384,20 @@ fn build_messages_from_input(
         .get("input")
         .map(input_field_to_messages)
         .unwrap_or_default();
+    // 当前轮转换后产出的 role:tool message 数 —— 随返回带出, 供 recompress 定位末尾 N 个。在这里数(而非
+    // 上层再转换一次)避免重复触发 keep_recent_tool_output_full 的 artifact 存储副作用(chatgpt-codex P2)。
+    // 当前轮的 tool 是 current_messages **末尾连续**的那一组(被任意非 tool message 隔断之前的更早
+    // tool 属历史)。stateless client 无 previous_response_id、把完整 transcript 直接塞进 input 时,
+    // 只有最新一组该保留全文, 不是数组里所有 function_call_output —— 否则历史 web_fetch 各留 100k 累积
+    // 撑爆, 绕过 P1(chatgpt-codex P2)。
+    let current_tool_count = current_messages
+        .iter()
+        .rev()
+        .take_while(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .count();
     messages.extend(current_messages);
-    merge_messages_with_previous_response(messages, body, session_cache)
+    let merge_result = merge_messages_with_previous_response(messages, body, session_cache)?;
+    Ok((merge_result, current_tool_count))
 }
 
 fn build_instructions_message(instructions: &Value) -> Option<Value> {
@@ -418,10 +456,14 @@ fn is_cas_injected_base_instructions(instructions: &Value) -> bool {
 /// 把 `body.input` 字段(可能是 string 也可能是 array)展开成 messages 列表.
 fn input_field_to_messages(input: &Value) -> Vec<Value> {
     let items = extract_input_items(input);
+    // MOC-190: input 是「当前轮」新产生的 —— 其**所有** function_call_output 都保留全文(模型一轮可能
+    // 调多个工具, 每条都该全文进 LLM)。compact(压缩历史)不保留。cached history 里之前轮当「当前」存入
+    // 的旧全文, 由 merge 后的 recompress 按 call_id 压缩 —— 那才是历史轮。
+    let keep_current_tools = !COMPACT_NO_KEEP_RECENT.with(|c| c.get());
     let mut out = Vec::new();
     let mut pending_reasoning: Option<String> = None;
 
-    for item in items {
+    for item in items.iter() {
         let Some(obj) = item.as_object() else {
             continue;
         };
@@ -429,7 +471,8 @@ fn input_field_to_messages(input: &Value) -> Vec<Value> {
             pending_reasoning = Some(extract_reasoning_text(obj));
             continue;
         }
-        let mut item_messages = input_item_to_messages(obj);
+        let is_fco = obj.get("type").and_then(|v| v.as_str()) == Some("function_call_output");
+        let mut item_messages = input_item_to_messages(obj, keep_current_tools && is_fco);
         for msg in &mut item_messages {
             if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
                 if let Some(reasoning) = pending_reasoning.take() {
@@ -543,7 +586,7 @@ fn strip_codex_reasoning_prefix(text: &str) -> &str {
 }
 
 /// 单个 Responses input item → 一条或多条 Chat message.
-fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
+fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool) -> Vec<Value> {
     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match item_type {
@@ -586,8 +629,12 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>) -> Vec<Value> {
                 .get("output")
                 .cloned()
                 .unwrap_or(Value::String(String::new()));
-            let output_str =
-                normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
+            // MOC-190: 最新 1 条 tool 输出保留全文(当前轮全文进 LLM); 历史轮照常压缩。
+            let output_str = if keep_full {
+                keep_recent_tool_output_full(Some(call_id.as_str()), output_value)
+            } else {
+                normalize_tool_output_for_context(Some(call_id.as_str()), output_value)
+            };
             vec![json!({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -931,6 +978,70 @@ fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) 
         );
     }
     names
+}
+
+/// MOC-190 P1: merge(拼接 cached history + 当前)后统一收口 —— 只保留全局最新 1 条 tool message
+/// 全文, 更早的若超 inline 阈值且尚未压缩(不含外置标记)则重新 bound。覆盖 session cache 里之前
+/// 作为 latest 存入的全文(它们在当轮已非最新, 不该再占满上下文);已 bound 的跳过防嵌套。
+fn recompress_stale_full_tool_outputs(messages: &mut [Value], keep_recent_count: usize) {
+    // keep_recent_count = 当前轮(本次 input)新产生的 function_call_output 数。merge 把 cached 拼在前、
+    // 当前轮在后, 故当前轮的 tool message 是**末尾 keep_recent_count 个** —— 这些保留全文(模型一轮调多
+    // 工具时每条都该全文); 更靠前的(cached 历史)若超阈值且未压缩则重新 bound。按位置而非 call_id, 兼容
+    // ID-less / 别名(recompress 在 repair_tool_call_ids 前跑, 此刻 tool_call_id 可能还没补)。N=0 → 全压缩。
+    let tool_positions: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .map(|(i, _)| i)
+        .collect();
+    let keep: std::collections::HashSet<usize> = tool_positions
+        .iter()
+        .rev()
+        .take(keep_recent_count)
+        .copied()
+        .collect();
+    for (i, m) in messages.iter_mut().enumerate() {
+        if keep.contains(&i) {
+            continue; // 当前轮的(末尾 N 个), 保留全文
+        }
+        if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let Some(content) = m.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // 只压缩"看起来是全文"的(超 inline 阈值);已是 bounded evidence(含外置标记)的跳过防嵌套。
+        if content.chars().count() <= TOOL_OUTPUT_INLINE_MAX_CHARS
+            || content.contains("[Tool output stored outside model context]")
+        {
+            continue;
+        }
+        let call_id = m
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let bounded = normalize_tool_output_for_context(
+            call_id.as_deref(),
+            Value::String(content.to_owned()),
+        );
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("content".into(), Value::String(bounded));
+        }
+    }
+}
+
+/// 最新 1 条 tool 输出保留全文(MOC-190): ≤ 上限直接全文(当前轮全文进 LLM), 超过仍 bound 防撑爆。
+/// 与 [`normalize_tool_output_for_context`] 互补 —— 后者无条件压缩, 本函数给"当前轮那条"开全文绿灯。
+pub(crate) fn keep_recent_tool_output_full(call_id: Option<&str>, output_value: Value) -> String {
+    let raw = match output_value {
+        Value::String(s) => s,
+        other => serde_json::to_string(&other).unwrap_or_default(),
+    };
+    if raw.chars().count() <= TOOL_OUTPUT_KEEP_FULL_MAX_CHARS {
+        raw
+    } else {
+        normalize_tool_output_for_context(call_id, Value::String(raw))
+    }
 }
 
 pub(crate) fn normalize_tool_output_for_context(
@@ -2716,10 +2827,10 @@ fn apply_patch_chat_path_guidance_for_current_language() -> &'static str {
 /// 内置联网工具引导(中文)。真机实测:模型对"找数据/查定价"类任务 shell-first —— 单次会话
 /// 18 次 shell curl vs 1 次 web_search(即便 web_search/web_fetch 已暴露),curl 抓外网被防火墙/
 /// 反爬拦截后白费多轮、退化到可能过时的训练数据。引导模型优先用工具(MOC-12 followup)。
-const WEB_TOOLS_SYSTEM_GUIDANCE_ZH: &str = "联网获取信息时(实时事实 / 价格 / 文档 / 新闻 / 版本号 / 任何你不确定或可能已过时的内容),**优先用 `web_search` 和 `web_fetch` 工具,不要用 shell 的 curl / wget / python 去抓 URL 或搜索引擎**。本机对外网访问受限,shell 直连通常被防火墙 / 反爬拦截(返回空或 403),会白费多轮尝试、最后只能靠可能过时的记忆作答;而这两个工具经 codex-app-transfer 代理(浏览器 TLS 指纹 + headless 渲染)能真正抓到。用法:先 `web_search(query)` 找信息源,再对结果里的 URL 用 `web_fetch(url, 你的问题)` 读正文。";
+const WEB_TOOLS_SYSTEM_GUIDANCE_ZH: &str = "联网获取信息时(实时事实 / 价格 / 文档 / 新闻 / 版本号 / 任何你不确定或可能已过时的内容),**优先用 `web_search` 和 `web_fetch` 工具,不要用 shell 的 curl / wget / python 去抓 URL 或搜索引擎**。本机对外网访问受限,shell 直连通常被防火墙 / 反爬拦截(返回空或 403),会白费多轮尝试、最后只能靠可能过时的记忆作答;而这两个工具经 codex-app-transfer 代理(浏览器 TLS 指纹 + headless 渲染)能真正抓到。用法:先 `web_search(query)` 找信息源,再用 `web_fetch(url)` 读该页**完整正文**(默认返回全文、自己读;只在想要压缩摘要时才加 `summarize=true`)。之前抓过的某 URL 若在对话历史里被折叠 / 压缩、需要回看完整原文, 用 `read_url_local(url)` 从本地缓存取回, 不必重新联网。";
 
 /// 内置联网工具引导(English)。见 [`WEB_TOOLS_SYSTEM_GUIDANCE_ZH`]。
-const WEB_TOOLS_SYSTEM_GUIDANCE_EN: &str = "When you need information from the web (current facts, prices, docs, news, version numbers — anything you're unsure of or that may be outdated), PREFER the `web_search` and `web_fetch` tools. Do NOT use shell curl / wget / python to fetch URLs or scrape search engines: outbound network here is restricted and direct HTTP is usually blocked by firewalls / anti-bot (empty body or 403), wasting many turns before you fall back to possibly-stale memory. These two tools route through codex-app-transfer's proxy (browser TLS fingerprint + headless rendering) and actually work. Usage: `web_search(query)` to find sources, then `web_fetch(url, your-question)` to read each result's page.";
+const WEB_TOOLS_SYSTEM_GUIDANCE_EN: &str = "When you need information from the web (current facts, prices, docs, news, version numbers — anything you're unsure of or that may be outdated), PREFER the `web_search` and `web_fetch` tools. Do NOT use shell curl / wget / python to fetch URLs or scrape search engines: outbound network here is restricted and direct HTTP is usually blocked by firewalls / anti-bot (empty body or 403), wasting many turns before you fall back to possibly-stale memory. These two tools route through codex-app-transfer's proxy (browser TLS fingerprint + headless rendering) and actually work. Usage: `web_search(query)` to find sources, then `web_fetch(url)` to read the page's FULL text (full content by default — read it yourself; only add `summarize=true` for a compressed summary). If a URL you fetched earlier got folded/compressed in the conversation history and you need the full original again, use `read_url_local(url)` to pull it from the local cache instead of re-fetching.";
 
 /// 按当前 user 语言偏好选内置联网工具引导。
 fn web_tools_guidance_for_current_language() -> &'static str {

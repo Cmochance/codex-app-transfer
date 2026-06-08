@@ -45,14 +45,15 @@ pub enum WebSearchError {
     NoResults,
 }
 
-/// 默认返回结果上限。
-pub const DEFAULT_MAX_RESULTS: usize = 8;
-/// 结果上限硬顶(防模型传超大值撑爆 context)。
-const MAX_RESULTS_CAP: usize = 20;
+/// 默认返回结果上限(MOC-190: 8→15, 8 条太少、模型常因信息不足反复换词搜;每条只是标题+URL+短摘要、
+/// 15 条不占多少 context)。
+pub const DEFAULT_MAX_RESULTS: usize = 15;
+/// 结果上限硬顶(防模型传超大值撑爆 context;MOC-190: 20→30)。
+const MAX_RESULTS_CAP: usize = 30;
 
 /// 搜索 `query`, 返回结构化结果列表。固定走 DDG html 版 + headless(见模块注释)。
 ///
-/// `max_results` 截到 `[1, 20]`(`0` 视作 1, `>20` 截到 20)—— 防模型传超大值撑爆 context。
+/// `max_results` 截到 `[1, 30]`(`0` 视作 1, `>30` 截到 30)—— 防模型传超大值撑爆 context。
 pub async fn web_search(
     query: &str,
     max_results: usize,

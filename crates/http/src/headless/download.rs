@@ -138,6 +138,18 @@ pub async fn ensure_chrome_headless_shell() -> Result<PathBuf, HeadlessError> {
     Ok(bin)
 }
 
+/// 只查 chrome-headless-shell 是否**已下载就绪**(marker 版本匹配 + 二进制在), **不触发下载**。
+/// 给 web_search 暴露 gate 用(MOC-190): 判断 Chrome 是否就绪而不静默拉 86MB。对称于
+/// [`super::detect::detect_system_chrome`](查系统 Chrome)—— 二者任一命中即「Chrome 就绪」。
+pub fn chrome_headless_shell_path() -> Option<PathBuf> {
+    let slug = platform_slug()?;
+    let root = browsers_root().ok()?;
+    let version_dir = root.join(PINNED_VERSION);
+    let bin = version_dir.join(binary_rel_path(slug));
+    let marker = version_dir.join(".complete");
+    (marker_matches(&marker, PINNED_VERSION) && bin.is_file()).then_some(bin)
+}
+
 /// 下载 zip → 解压到 `staging` → set exec + 清 quarantine → spawn `--version` 自检。
 /// 返回 staging 下的二进制路径 (自检已过)。任一步失败上抛 (调用方清 staging)。
 async fn download_extract_verify(
@@ -330,5 +342,13 @@ mod tests {
         );
         assert!(!marker_matches(&m, "150.0.0.0"), "版本不符应为 false");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chrome_headless_shell_path_safe() {
+        // MOC-190: 不 panic; 命中时返回真实存在的二进制(CI / 未下载环境 → None)。
+        if let Some(p) = chrome_headless_shell_path() {
+            assert!(p.is_file(), "命中却不是文件: {}", p.display());
+        }
     }
 }

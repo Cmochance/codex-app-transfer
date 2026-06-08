@@ -2172,8 +2172,9 @@ mod tests {
     }
 
     #[test]
-    fn large_function_call_output_is_bounded_in_gemini_normalized_chat() {
-        let huge_line = "const minified='x';".repeat(3_000);
+    fn large_function_call_output_over_limit_is_bounded_in_gemini_normalized_chat() {
+        // MOC-190: 当前轮 tool 输出默认全文; 但超 100k 上限的单条仍 bound 防撑爆。
+        let huge_line = "const minified='x';".repeat(6_000); // > 100k 字符
         let raw_output = format!(
             "Chunk ID: 44d863\n\
              Wall time: 0.1540 seconds\n\
@@ -2191,7 +2192,10 @@ mod tests {
         });
         let chat = responses_body_to_normalized_chat(&body).unwrap();
         let msgs = chat["messages"].as_array().unwrap();
-        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        let tool = msgs
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "tool_large")
+            .unwrap();
         let content = tool["content"].as_str().unwrap();
 
         assert_eq!(tool["tool_call_id"], "tool_large");

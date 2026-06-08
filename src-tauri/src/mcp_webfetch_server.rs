@@ -45,6 +45,13 @@ use tokio::sync::Semaphore;
 
 const SERVER_NAME: &str = "cat-webfetch";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// MCP `initialize` 回给模型的整体工具使用规则(MOC-190): 把「回看已抓 URL 优先用 read_url_local」抬到
+/// server 级指引(比单个 tool description 优先级高), 提高 read_url_local 调用率、避免重复 web_fetch 同一页。
+const SERVER_INSTRUCTIONS: &str = "联网工具使用规则:\n\
+1. 需要网上信息时先 web_search(query) 找来源, 再 web_fetch(url) 读该页完整正文。\n\
+2. **凡是本次对话里你已经用 web_fetch 抓过的 URL —— 当你要再次引用 / 摘录 / 附上它的原文 / 回看更多细节时, 必须先用 read_url_local(url) 从本地缓存取回, 不要重复 web_fetch 同一个 URL**。read_url_local 不联网、瞬时返回, 且能拿回已被对话历史折叠/压缩、你当前看不到的完整原文。\n\
+3. 抓「新」URL 才用 web_fetch; 回看「旧」(本会话已抓过的)URL 一律 read_url_local。\n\
+4. web_fetch 默认返回完整正文供当前轮直接阅读; 仅当你只要压缩摘要时才加 summarize=true。";
 /// client 未给 protocolVersion 时的兜底(回显 client 的值更优, 见 spec)。
 const FALLBACK_PROTOCOL: &str = "2025-11-25";
 /// 返回正文截断上限(字符)。防把 MB 级页面灌给模型(类 Claude WebFetch 的 100KB 截断)。
@@ -183,7 +190,8 @@ fn dispatch_line(
                 "result": {
                     "protocolVersion": proto,
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+                    "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+                    "instructions": SERVER_INSTRUCTIONS
                 }
             }));
         }
@@ -198,8 +206,11 @@ fn dispatch_line(
             // handle 拒, 徒增无效调用(用户 #386 验收反馈)。改档需重启 Codex 重新 tools/list 才反映
             // (与 web_fetch 改 on/off 需重启一致);运行期切档的 stale 缓存由 handle_web_search_call
             // 的 backend gate 兜底(failing 双保险)。
-            let mut tools = vec![web_fetch_tool_def()];
-            if matches!(current_backend(), Ok(Some(b)) if b.may_use_headless()) {
+            let mut tools = vec![web_fetch_tool_def(), read_url_local_tool_def()];
+            // web_search 暴露条件(MOC-190): backend 非 off + Chrome 就绪(系统装了或已下载),
+            // 与 web_fetch 档位选择解耦 —— 系统有 Chrome 的用户在 curl/wreq 档也能用 search 且不
+            // 触发下载;两者皆无则不暴露(避免在没走过 consent 的档静默拉 ~86MB)。
+            if matches!(current_backend(), Ok(Some(_))) && chrome_ready() {
                 tools.push(web_search_tool_def());
             }
             let _ = out_tx.send(json!({
@@ -265,11 +276,26 @@ async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
                 .get("url")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string());
-            let prompt = args
-                .get("prompt")
+            // query: summarize=true 时作摘要重点。兼容旧 `prompt` 字段(MOC-152 时必填)。
+            let query = args
+                .get("query")
+                .or_else(|| args.get("prompt"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            // summarize: 显式 opt-in 走总结子模型; 默认 false = 返回全文(MOC-190)。
+            let summarize = args
+                .get("summarize")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            handle_web_fetch_call(id, url, query, summarize).await
+        }
+        "read_url_local" => {
+            let url = args
+                .get("url")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string());
-            handle_web_fetch_call(id, url, prompt).await
+            handle_read_url_local_call(id, url).await
         }
         "web_search" => {
             let query = args
@@ -286,20 +312,18 @@ async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
     }
 }
 
-async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<String>) -> Value {
+/// MOC-190: 默认返回**抓取的全文**(当前轮全文进 LLM; adapter 层保留最新 1 条全文、历史轮才压缩);
+/// `summarize=true` 才走总结子模型(opt-in, `query` 作摘要重点)。正文经进程内缓存复用、同 URL 不重抓
+/// (给 `read_url_local` 取回工具用)。`url` 必填, 其余可选。
+async fn handle_web_fetch_call(
+    id: Value,
+    url: Option<String>,
+    query: Option<String>,
+    summarize_flag: bool,
+) -> Value {
     let url = match url {
         Some(u) if !u.is_empty() => u,
         _ => return tool_error(id, "缺少必填参数 url(需绝对 http(s) URL)"),
-    };
-    // prompt 必填 (MOC-152): web_fetch 不返整页, 而是用『总结模型』针对 prompt 摘要/作答。
-    let prompt = match prompt {
-        Some(p) if !p.is_empty() => p,
-        _ => {
-            return tool_error(
-                id,
-                "缺少必填参数 prompt(描述你想从该网页了解 / 提取什么 —— 据此生成针对性摘要)",
-            )
-        }
     };
     let backend = match current_backend() {
         Ok(Some(b)) => b,
@@ -321,30 +345,57 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
     let diag_port = diag_target();
     let diag = diag_port.is_some();
     let captured_at = now_iso();
-    let fetched = codex_app_transfer_http::web_fetch(backend, &url).await;
-
-    // 诊断三段 (diag 关时保持 Null、不构造)。
     let mut fetch_v = Value::Null;
     let mut summarize_v = Value::Null;
     let mut result_v = Value::Null;
 
-    let resp = match fetched {
-        // 2xx 但空 body: 不静默当成功(模型会以为抓到了空页), 给明确可操作提示。MOC-145:
-        // web_fetch 对合法空响应(如 204)返 Ok(""), 区分"空"与"抓取失败"的语义落在这里。
-        Ok(outcome) if outcome.content.trim().is_empty() => {
+    // 1) 取正文: 进程内缓存命中则复用(offset 翻页 / 重读同 URL 不重抓), miss 才真抓。
+    //    Ok(正文) 进入分流; Err(已构造的早退 resp) 用于空 body / 抓取失败。
+    // 缓存 key 含 backend(MOC-190 chatgpt-codex P2): 否则 curl/wreq 抓的 body 缓存后, 切 headless
+    // 重试同 URL 在 TTL 内命中 stale 非渲染 body, 回归 per-call backend reread。
+    let cache_key = format!("{}|{}", backend.as_str(), url);
+    let content = match cache_get(&cache_key) {
+        Some(c) => {
             if diag {
-                fetch_v = fetch_value(backend, &outcome);
-                result_v = json!({ "returned_chars": 0, "is_error": false, "empty": true });
+                fetch_v = json!({ "cache_hit": true, "body_chars": c.chars().count() });
             }
-            tool_ok(id, &empty_body_msg(backend))
+            Ok(c)
         }
-        // 抓到正文 → 用总结模型针对 prompt 摘要; 摘要失败(未配/proxy 未起/模型报错/格式不支持)
-        // → 回退返回抓取的原文(绝不丢内容), 并注明摘要未生成。
-        Ok(outcome) => {
-            if diag {
-                fetch_v = fetch_value(backend, &outcome);
+        None => match codex_app_transfer_http::web_fetch(backend, &url).await {
+            // 2xx 但空 body(204 / 反爬丢内容): 不静默当成功, 给可操作提示。不缓存空。MOC-145。
+            Ok(outcome) if outcome.content.trim().is_empty() => {
+                if diag {
+                    fetch_v = fetch_value(backend, &outcome);
+                    result_v = json!({ "returned_chars": 0, "is_error": false, "empty": true });
+                }
+                Err(tool_ok(id.clone(), &empty_body_msg(backend)))
             }
-            match summarize(&outcome.content, &prompt).await {
+            Ok(outcome) => {
+                if diag {
+                    fetch_v = fetch_value(backend, &outcome);
+                }
+                cache_put(cache_key.clone(), outcome.content.clone());
+                Ok(outcome.content)
+            }
+            Err(e) => {
+                if diag {
+                    fetch_v = json!({ "backend": backend.as_str(), "error": e.to_string() });
+                    result_v = json!({ "is_error": true });
+                }
+                Err(tool_error(
+                    id.clone(),
+                    &format!("抓取失败(后端 {}): {e}", backend.as_str()),
+                ))
+            }
+        },
+    };
+
+    // 2) 分流: summarize=true 走总结子模型(opt-in); 否则返回**全文**(默认, 当前轮全文进 LLM,
+    //    adapter 层保留最新 1 条全文)。摘要失败回退全文(绝不丢内容)。
+    let resp = match content {
+        Err(early) => early,
+        Ok(content) if summarize_flag => {
+            match summarize(&content, query.as_deref().unwrap_or("")).await {
                 Ok(so) => {
                     let returned = truncate(&so.summary, MAX_CONTENT_CHARS);
                     if diag {
@@ -354,37 +405,43 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
                             "is_error": false,
                         });
                     }
-                    tool_ok(id, &returned)
+                    tool_ok(id.clone(), &returned)
                 }
                 Err(e) => {
-                    eprintln!("[cat-webfetch] 网页摘要未生成, 回退原文: {e}");
-                    // 醒目 + 注明"非摘要" + actionable:回退原文(isError=false)只靠这段前缀区分,
-                    // 否则模型可能把整页原文当成摘要直接采纳(silent-failure-hunter F3)。
+                    eprintln!("[cat-webfetch] 网页摘要未生成, 回退全文: {e}");
+                    // summarize=true 时模型明确要摘要 —— 回退全文须注明摘要失败, 否则模型可能把
+                    // 全文当摘要采纳(silent failure)。默认路径(summarize=false)本就是全文、不经
+                    // 这里, 无此问题。
                     let note = format!(
-                        "⚠️ 网页摘要未生成({e})—— 以下是抓取到的**网页正文原文(非摘要, 请勿直接当作答案)**。\
+                        "⚠️ 摘要未生成({e})—— 以下是网页正文全文(**非摘要, 请勿直接当作答案**)。\
                          若反复如此, 请检查该 provider 的「网页摘要模型」/ apiFormat(仅 openai_chat 支持)/ \
                          本地代理是否在线。\n\n"
                     );
-                    let returned =
-                        truncate(&format!("{note}{}", outcome.content), MAX_CONTENT_CHARS);
+                    let full = truncate(&format!("{note}{content}"), MAX_CONTENT_CHARS);
                     if diag {
                         summarize_v = json!({ "fallback_raw": true, "error": e });
                         result_v = json!({
-                            "returned_chars": returned.chars().count(),
+                            "returned_chars": full.chars().count(),
                             "is_error": false,
                             "fallback_raw": true,
                         });
                     }
-                    tool_ok(id, &returned)
+                    tool_ok(id.clone(), &full)
                 }
             }
         }
-        Err(e) => {
+        Ok(content) => {
+            // 默认: 返回全文(截到 MAX_CONTENT_CHARS 防对抗巨页)。当前轮全文进 LLM, adapter 层保留
+            // 最新 1 条全文、历史轮压缩成 evidence + artifact, 回看用 read_url_local 工具。
+            let full = truncate(&content, MAX_CONTENT_CHARS);
             if diag {
-                fetch_v = json!({ "backend": backend.as_str(), "error": e.to_string() });
-                result_v = json!({ "is_error": true });
+                result_v = json!({
+                    "returned_chars": full.chars().count(),
+                    "is_error": false,
+                    "mode": "full",
+                });
             }
-            tool_error(id, &format!("抓取失败(后端 {}): {e}", backend.as_str()))
+            tool_ok(id.clone(), &full)
         }
     };
 
@@ -395,7 +452,7 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
                 "trace_kind": "cat_webfetch",
                 "captured_at": captured_at,
                 "tool": "web_fetch",
-                "request": { "url": url, "prompt": prompt },
+                "request": { "url": url, "query": query, "summarize": summarize_flag },
                 "fetch": fetch_v,
                 "summarize": summarize_v,
                 "result": result_v,
@@ -406,11 +463,172 @@ async fn handle_web_fetch_call(id: Value, url: Option<String>, prompt: Option<St
     resp
 }
 
+/// 从本地缓存取之前 web_fetch 抓过的某 URL 的完整正文(历史轮被压缩后回看用,MOC-190)。
+/// 不联网、不重抓;缓存未命中(>15min 或本会话未抓过)时返回可操作错误提示用户改用 web_fetch。
+async fn handle_read_url_local_call(id: Value, url: Option<String>) -> Value {
+    let url = match url {
+        Some(u) if !u.is_empty() => u,
+        _ => return tool_error(id, "缺少必填参数 url(需绝对 http(s) URL)"),
+    };
+    // 仅校验联网工具是否开着(off → 提示); 缓存内容跨所有档找(见下)。
+    match current_backend() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return tool_error(
+                id,
+                "联网抓取工具已关闭。请在 codex-app-transfer 设置 → 内置联网抓取工具 选 auto(推荐) / curl / wreq / headless。",
+            )
+        }
+        Err(e) => {
+            return tool_error(
+                id,
+                &format!("读取联网设置失败: {e}(请检查 ~/.codex-app-transfer/config.json)"),
+            )
+        }
+    }
+    // P2(chatgpt-codex): 缓存 key 含 backend, 用户抓完切档会让 read_url_local 用新档 key miss 掉旧档
+    // 存的内容 → 跨所有档找; 且同 URL 多档都缓存时按 cached_at 取最新(避免返回旧的弱档骨架)。
+    let hit = cache_get_newest_for_url(&url);
+    let (resp, returned_chars, is_error) = match hit {
+        Some(content) => {
+            let out = truncate(&content, MAX_CONTENT_CHARS);
+            let n = out.chars().count();
+            (tool_ok(id.clone(), &out), n, false)
+        }
+        None => (
+            tool_error(
+                id.clone(),
+                &format!(
+                    "该 URL 未在本地缓存(可能已过期 >15min, 或本会话未用 web_fetch 抓过): {url}。请改用 web_fetch 重新抓取。"
+                ),
+            ),
+            0usize,
+            true,
+        ),
+    };
+    // MOC-190: 补诊断埋点 —— 此前 read_url_local 不记 trace, 诊断里看不到回看是否触发/是否命中缓存。
+    if let Some(port) = diag_target() {
+        post_diag_entry(
+            port,
+            json!({
+                "trace_kind": "cat_webfetch",
+                "captured_at": now_iso(),
+                "tool": "read_url_local",
+                "request": { "url": url },
+                "result": { "returned_chars": returned_chars, "is_error": is_error, "cache_hit": !is_error },
+            }),
+        )
+        .await;
+    }
+    resp
+}
+
+/// 网页正文进程内缓存(MOC-190): URL → readability+markdown 后的完整正文。给 `read_url_local` 取回 /
+/// 同 URL 重读复用, 避免重抓(也省一次 headless 冷启动)。TTL 短(15min, 对齐 Anthropic/OpenAI
+/// fetch 缓存), 容量上限驱逐最旧。cat-webfetch 是长驻进程, 故进程内缓存跨多次 tools/call 有效;
+/// 进程重启缓存丢失时 `read_url_local` 走 miss 分支提示重抓 —— 缓存仅加速、非正确性依赖。
+const FETCH_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const FETCH_CACHE_CAP: usize = 32;
+
+struct CachedDoc {
+    content: String,
+    cached_at: Instant,
+}
+
+fn fetch_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedDoc>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CachedDoc>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 命中且未过期 → 返回正文克隆。全局 wrapper, 真逻辑在 [`cache_get_in`](便于用本地 map 单测、
+/// 不碰全局共享态、不受并行测试串扰)。
+fn cache_get(url: &str) -> Option<String> {
+    let mut guard = match fetch_cache().lock() {
+        Ok(g) => g,
+        // poison 仅持锁线程 panic 才发生(这里持锁只做纯 map 操作, 实际近乎不可能);真发生时
+        // 降级无缓存(重抓)是安全的, 但留 stderr 痕避免静默缓存失效(silent-failure-hunter)。
+        Err(_) => {
+            eprintln!("[cat-webfetch] fetch 缓存锁 poisoned, 本次降级无缓存(重抓)");
+            return None;
+        }
+    };
+    cache_get_in(&mut guard, url)
+}
+
+/// 跨所有 backend 档找同 URL 缓存, 返回 `cached_at` 最新的正文(read_url_local 用)。同 URL 先弱档(curl
+/// 骨架)后 headless(渲染正文)抓时两档都缓存, 固定顺序会先返回旧的 curl 骨架 → 按 cached_at 取最新, 拿
+/// 到更完整的渲染版(chatgpt-codex P2)。
+fn cache_get_newest_for_url(url: &str) -> Option<String> {
+    let mut guard = match fetch_cache().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            eprintln!("[cat-webfetch] fetch 缓存锁 poisoned, read_url_local 降级 miss");
+            return None;
+        }
+    };
+    guard.retain(|_, d| d.cached_at.elapsed() < FETCH_CACHE_TTL);
+    ["auto", "curl", "wreq", "headless"]
+        .iter()
+        .filter_map(|b| guard.get(&format!("{b}|{url}")))
+        .max_by_key(|d| d.cached_at)
+        .map(|d| d.content.clone())
+}
+
+/// 写缓存。全局 wrapper, 真逻辑在 [`cache_put_in`]。
+fn cache_put(url: String, content: String) {
+    match fetch_cache().lock() {
+        Ok(mut m) => cache_put_in(&mut m, url, content),
+        Err(_) => eprintln!("[cat-webfetch] fetch 缓存锁 poisoned, 本次跳过写缓存"),
+    }
+}
+
+/// [`cache_get`] 纯逻辑(操作传入 map): retain 清过期(惰性 GC)+ 命中返回克隆。
+fn cache_get_in(
+    map: &mut std::collections::HashMap<String, CachedDoc>,
+    url: &str,
+) -> Option<String> {
+    map.retain(|_, d| d.cached_at.elapsed() < FETCH_CACHE_TTL);
+    map.get(url).map(|d| d.content.clone())
+}
+
+/// [`cache_put`] 纯逻辑(操作传入 map): 容量满且是新 key 时驱逐最旧一条(按 cached_at)。
+fn cache_put_in(
+    map: &mut std::collections::HashMap<String, CachedDoc>,
+    url: String,
+    content: String,
+) {
+    if map.len() >= FETCH_CACHE_CAP && !map.contains_key(&url) {
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, d)| d.cached_at)
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(
+        url,
+        CachedDoc {
+            content,
+            cached_at: Instant::now(),
+        },
+    );
+}
+
+/// Chrome 是否就绪可跑 headless: 系统装了 Chrome / Edge / Chromium, 或已下载内置 chrome-headless-shell
+/// (**不触发下载**)。web_search 的暴露 gate(tools/list)与调用 gate 共用(MOC-190)—— 把 web_search
+/// 可见性从 web_fetch 档位解耦为「Chrome 就绪」, 同时守住「不静默下载 86MB」。
+fn chrome_ready() -> bool {
+    codex_app_transfer_http::headless::detect_system_chrome().is_some()
+        || codex_app_transfer_http::headless::chrome_headless_shell_path().is_some()
+}
+
 /// 处理 `web_search` tools/call: 走 DDG(headless)搜索, 返回结构化结果列表给模型。
-/// **要求 webFetchBackend == headless 档**(chatgpt-codex review #386): web_search 必须 headless
-/// (DDG 纯 HTTP 被 202 反爬拦, spike 实测 wreq 6 变体全灭, MOC-12), 故 ① 尊重 off(用户运行期
-/// 关联网即拒, 与 web_fetch 每次 re-read backend 的 runtime guard 对齐)② 不在 curl/wreq 档静默
-/// 后台下载 ~86MB chrome-headless-shell(那两档没走过 headless 的 UI consent 下载流程)。
+/// **要求 Chrome 就绪**(MOC-190: 暴露/调用 gate 从 web_fetch 档位解耦为「Chrome 就绪」):
+/// web_search 内部固定 headless(DDG 纯 HTTP 被 202 反爬拦, MOC-12), 故 ① 尊重 off(用户运行期
+/// 关联网即拒)② 非 off 但 Chrome 未就绪拒 + 引导(不在没走过 consent 的档静默下载 ~86MB);系统
+/// 装了 Chrome / 已下载内置 Chrome 即放行 —— curl/wreq 档只要 Chrome 在也能用(不再强制 headless 档)。
 async fn handle_web_search_call(
     id: Value,
     query: Option<String>,
@@ -420,21 +638,12 @@ async fn handle_web_search_call(
         Some(q) if !q.is_empty() => q,
         _ => return tool_error(id, "缺少必填参数 query(搜索关键词 / 问题)"),
     };
-    // web_search 必须用真浏览器(DDG 反爬)→ 要求 headless **或 auto** 档(Auto 允许升 headless、
-    // 抓 DDG 会走到 headless, MOC-161): off 拒(尊重关闭), curl/wreq 拒 + 引导切档(避免静默下载
-    // Chrome), headless/auto 放行(其 Chrome 已走过 UI consent 下载)。
+    // web_search 必须用真浏览器(DDG 反爬)→ 要求 Chrome 就绪(MOC-190: 从 web_fetch 档位解耦为
+    // 「Chrome 就绪」)。off 拒(尊重关闭);非 off 但 Chrome 未就绪拒 + 引导(避免静默下载 86MB);
+    // Chrome 就绪(系统装了或已下载)则任意非 off 档放行 —— web_search 内部固定 headless、不跟随
+    // web_fetch 档位, 故 curl/wreq 档只要 Chrome 在就能用。
     match current_backend() {
-        Ok(Some(b)) if b.may_use_headless() => {}
-        Ok(Some(other)) => {
-            return tool_error(
-                id,
-                &format!(
-                    "web_search 需要 auto 或 headless 档(DDG 反爬只有真浏览器能过)。当前是 {} 档 —— 请在 \
-                     codex-app-transfer 设置 → 内置联网抓取工具 选 auto 或 headless(首次会确认下载 Chrome)再用。",
-                    other.as_str()
-                ),
-            )
-        }
+        Ok(Some(_)) => {}
         Ok(None) => {
             return tool_error(
                 id,
@@ -447,6 +656,17 @@ async fn handle_web_search_call(
                 &format!("读取联网设置失败: {e}(请检查 ~/.codex-app-transfer/config.json)"),
             )
         }
+    }
+    // Chrome 就绪判定用「不会触发下载」语义(已下载 shell, 或系统 Chrome 自检通过)—— 与 launch 的
+    // resolve_chrome_binary 一致, 避免 stale/损坏系统 Chrome 路径 gate 放行后 launch 自检失败
+    // fallback 下载 86MB(chatgpt-codex P2)。off 已在上面 match 早退, 此处只对非 off 档判 Chrome。
+    if !codex_app_transfer_http::headless::chrome_ready_without_download().await {
+        return tool_error(
+            id,
+            "web_search 需要本机有可用的 Chrome / Edge / Chromium, 或已下载内置 Chrome(DDG 反爬只有\
+             真浏览器能过)。请在 codex-app-transfer 设置 → 内置联网抓取工具 选 headless 档完成首次\
+             chrome-headless-shell(~86MB)下载后再用。",
+        );
     }
     let max = max_results.unwrap_or(codex_app_transfer_http::search::DEFAULT_MAX_RESULTS);
     let diag_port = diag_target();
@@ -704,9 +924,9 @@ fn batch_chars_for_model(model: &str) -> usize {
 /// MOC-157 意图路由(业界标准: 摘要型走全覆盖、查询型走 top-K)。
 fn is_exhaustive_summary(prompt: &str) -> bool {
     let p = prompt.trim().to_lowercase();
-    // 空 prompt 视为全覆盖。**注意**: `handle_web_fetch_call` 拒空 prompt(schema 把 prompt 列
-    // required, MOC-152), 故经 web_fetch 进来的 prompt 恒非空、本分支实际不可达 —— 保留是纯防御
-    // (将来若放开 prompt 可选, 空=全覆盖语义正确); 不对外宣传"无 prompt 走 map-reduce"(chatgpt-codex P2)。
+    // 空查询视为全覆盖摘要诉求。MOC-190 后 web_fetch 的 query 可空: `summarize=true` 但不带 query
+    // 时 summarize() 给这里传空串 → 判全覆盖走 map-reduce(语义正确: 无具体查询 = 总结整篇)。
+    // 注: 默认路径(summarize=false)根本不调摘要、不到这里; 本函数只在 summarize=true 时参与路由。
     if p.is_empty() {
         return true;
     }
@@ -1386,27 +1606,43 @@ fn web_fetch_tool_def() -> Value {
     json!({
         "name": "web_fetch",
         "title": "Web Fetch",
-        "description": "抓取一个 http(s) URL 的网页, 用配置的『总结模型』针对你的 prompt 生成\
-    摘要 / 回答后返回(类 Claude WebFetch, 省 context)。由 codex-app-transfer 代抓(curl / wreq / \
-    headless 三档, 绕 Cloudflare + 跑 JS)并抽取正文。**必须提供 prompt** 说明你想从该页了解 / \
-    提取什么。若未配置总结模型 / proxy 未起 / 摘要失败, 自动回退返回网页正文原文(不丢内容)。",
+        "description": "抓取一个 http(s) URL 的网页正文,**默认直接返回抓取到的完整正文**供你阅读(不再分页)。`summarize=true` 时改为调用配置的总结模型生成针对 `query` 的摘要(opt-in)。想回看之前抓过的某 URL 全文用 `read_url_local`。由 codex-app-transfer 代抓(curl/wreq/headless 自动升级,绕 Cloudflare)。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "url": { "type": "string", "description": "要抓取的绝对 http(s) URL。" },
-                "prompt": {
+                "query": {
                     "type": "string",
-                    "description": "你想从该网页了解 / 提取什么(如『v0.136 的 breaking changes』\
-                    『把安装步骤原样列出』)。据此用总结模型生成针对性摘要 / 回答。"
+                    "description": "可选。**仅在 `summarize=true` 时**作为摘要重点(让摘要聚焦你关心的方面);默认返回全文时 query 不影响返回内容(全文照原样返回)。"
+                },
+                "summarize": {
+                    "type": "boolean",
+                    "description": "可选, 默认 false。true = 调用配置的总结模型把正文压成针对 query 的精炼摘要(较慢、仅 openai_chat provider 支持);默认 false = 直接返回正文原文。"
                 }
             },
-            "required": ["url", "prompt"]
+            "required": ["url"]
         },
         // MOC-172: readOnlyHint=true → Codex guardian 的 requires_mcp_tool_approval
         // (core/src/mcp_tool_call.rs)命中 read_only_hint 直接返回「不需审批」,只读抓取工具
         // 跳过 auto-review 审批往返、消除联网延迟;destructiveHint=false 确保不被强制审批
         // (destructive=true 优先级最高会触发审批)。openWorldHint=true 如实声明访问开放网络。
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": true }
+    })
+}
+
+fn read_url_local_tool_def() -> Value {
+    json!({
+        "name": "read_url_local",
+        "title": "Read URL (local cache)",
+        "description": "取之前用 web_fetch 抓过的某 URL 的**完整正文**(从本地缓存)。当较早抓取的内容在对话历史里被折叠 / 压缩、你需要回看完整原文时用它,避免重新联网抓取。仅 url 一个参数。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "要读取的绝对 http(s) URL(需与之前 web_fetch 时一致)。" }
+            },
+            "required": ["url"]
+        },
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false }
     })
 }
 
@@ -1427,9 +1663,9 @@ fn web_search_tool_def() -> Value {
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "返回结果数上限(默认 8, 最多 20)。",
+                    "description": "返回结果数上限(默认 15, 最多 30)。",
                     "minimum": 1,
-                    "maximum": 20
+                    "maximum": 30
                 }
             },
             "required": ["query"]
@@ -1446,14 +1682,23 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let mut cut: String = s.chars().take(max).collect();
+    // 给截断提示留出空间, 保证「正文 + 提示」总长 ≤ max —— 否则正好卡满上限的页会因这点溢出, 被上层
+    // adapter 的 keep-full 上限(TOOL_OUTPUT_KEEP_FULL_MAX_CHARS, 同为 100k)判超限、把整条当前轮全文
+    // bound 掉(chatgpt-codex P2)。max 极小时(单测)放不下提示, 退化为不预留。
+    const NOTICE_RESERVE: usize = 160;
+    let body_budget = if max > NOTICE_RESERVE * 2 {
+        max - NOTICE_RESERVE
+    } else {
+        max
+    };
+    let mut cut: String = s.chars().take(body_budget).collect();
     // 退到最后一个换行边界(就近, 浪费不超过 1/4 预算时才退)。
     if let Some(i) = cut.rfind('\n') {
         if i >= cut.len() * 3 / 4 {
             cut.truncate(i);
         }
     }
-    format!("{cut}\n\n[... 内容超过 {max} 字符已截断;需要后续内容请抓取更具体的子页 URL ...]")
+    format!("{cut}\n\n[... 内容超过 {max} 字符上限已截断, 后续内容未包含; 若该页有分章/分节, 可 web_fetch 更具体的子页 URL ...]")
 }
 
 fn tool_ok(id: Value, text: &str) -> Value {
@@ -1578,14 +1823,38 @@ mod tests {
     fn tool_def_shape() {
         let d = web_fetch_tool_def();
         assert_eq!(d["name"], "web_fetch");
+        // MOC-190: 仅 url 必填(默认返原文); prompt 必填已移除。
         assert_eq!(d["inputSchema"]["required"][0], "url");
-        // MOC-152: prompt 设为必填(摘要驱动)。
-        assert_eq!(d["inputSchema"]["required"][1], "prompt");
+        assert_eq!(d["inputSchema"]["required"].as_array().unwrap().len(), 1);
         assert_eq!(d["inputSchema"]["properties"]["url"]["type"], "string");
-        assert_eq!(d["inputSchema"]["properties"]["prompt"]["type"], "string");
+        // 新增可选参数 query / summarize。
+        assert_eq!(d["inputSchema"]["properties"]["query"]["type"], "string");
+        assert_eq!(
+            d["inputSchema"]["properties"]["summarize"]["type"],
+            "boolean"
+        );
+        // 旧 prompt 字段不再声明(改由 dispatch 兼容映射到 query)。
+        assert!(d["inputSchema"]["properties"]["prompt"].is_null());
         // MOC-172: readOnlyHint=true / destructiveHint=false 让 guardian 跳过 auto-review 审批。
         assert_eq!(d["annotations"]["readOnlyHint"], true);
         assert_eq!(d["annotations"]["destructiveHint"], false);
+    }
+
+    #[test]
+    fn cache_in_roundtrip_update_and_cap() {
+        let mut m: std::collections::HashMap<String, CachedDoc> = std::collections::HashMap::new();
+        assert!(cache_get_in(&mut m, "u1").is_none(), "初始未命中");
+        cache_put_in(&mut m, "u1".into(), "正文".into());
+        assert_eq!(cache_get_in(&mut m, "u1").as_deref(), Some("正文"));
+        // 同 key 重复 put = 更新, 不增容量。
+        cache_put_in(&mut m, "u1".into(), "正文2".into());
+        assert_eq!(cache_get_in(&mut m, "u1").as_deref(), Some("正文2"));
+        assert_eq!(m.len(), 1);
+        // 写满 CAP+ 后容量不超 CAP(最旧被驱逐)。
+        for i in 0..(FETCH_CACHE_CAP + 5) {
+            cache_put_in(&mut m, format!("k{i}"), format!("c{i}"));
+        }
+        assert!(m.len() <= FETCH_CACHE_CAP, "容量应 ≤ CAP, 实际 {}", m.len());
     }
 
     #[test]
@@ -1689,7 +1958,10 @@ mod tests {
         let s = format!("{}\n{}", "a".repeat(16), "b".repeat(10));
         let t = truncate(&s, 20); // 前 20 字符 = 16a + \n + 3b; \n@16 >= 15 → 退到 16
         assert!(t.starts_with(&"a".repeat(16)), "应保留整段 a: {t}");
-        assert!(!t.contains('b'), "应退到换行边界、不含半行 b: {t}");
+        // 只看正文部分(截断标记前): 退到换行边界、不含半行 b。标记文案本身可能含 b(如 web_fetch),
+        // 不纳入判定。
+        let body = t.split("\n\n[").next().unwrap_or(&t);
+        assert!(!body.contains('b'), "正文应退到换行边界、不含半行 b: {t}");
         assert!(t.contains("已截断"));
         // 换行太靠前(末 1/4 外)→ 不退, 硬切以免浪费预算
         let s2 = format!("{}\n{}", "c".repeat(4), "d".repeat(40));

@@ -2754,8 +2754,9 @@ fn function_call_output_non_string_is_json_serialized() {
 }
 
 #[test]
-fn large_function_call_output_is_bounded_before_chat_history() {
-    let huge_line = "function veryLongMinifiedBundle(){return 'x';}".repeat(2_000);
+fn large_function_call_output_over_limit_is_bounded() {
+    // MOC-190: 当前轮 tool 输出默认全文; 但**超 100k 上限**的单条仍 bound 防撑爆。
+    let huge_line = "function veryLongMinifiedBundle(){return 'x';}".repeat(3_000); // > 100k 字符
     let raw_output = format!(
         "Chunk ID: 44d863\n\
          Wall time: 0.1540 seconds\n\
@@ -2767,18 +2768,20 @@ fn large_function_call_output_is_bounded_before_chat_history() {
     );
 
     let out = convert(json!({
-        "input": [{
-            "type": "function_call_output",
-            "call_id": "tool_large",
-            "output": raw_output
-        }]
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "tool_large",
+                "output": raw_output
+            }
+        ]
     }));
     let tool_msg = out["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["role"] == "tool")
-        .expect("应当有 tool 消息");
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "tool_large")
+        .expect("应当有 tool_large 消息");
 
     assert_eq!(tool_msg["tool_call_id"], "tool_large");
     let content = tool_msg["content"].as_str().unwrap();
@@ -2798,6 +2801,230 @@ fn large_function_call_output_is_bounded_before_chat_history() {
         content.len() < 20_000,
         "模型可见 tool.content 应有界,实际长度 {}",
         content.len()
+    );
+}
+
+#[test]
+fn keep_current_round_all_tool_outputs_full() {
+    // MOC-190(修「一轮多 tool 只留 1 条」缺陷): current input 的多个 function_call_output(模型一轮
+    // 调多工具)**都**保留全文, 不是只留最新 1 条。两条都 <100k → 都全文。
+    let big_old = "OLDDATA ".repeat(1000); // ~8000 字符 > inline 阈值
+    let big_new = "NEWDATA ".repeat(1000); // ~8000 字符
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call_output", "call_id": "c_old", "output": big_old.clone() },
+            { "type": "function_call_output", "call_id": "c_new", "output": big_new.clone() },
+        ]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let content_of = |cid: &str| {
+        messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == cid)
+            .unwrap_or_else(|| panic!("缺 {cid} tool 消息"))["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let old_c = content_of("c_old");
+    let new_c = content_of("c_new");
+    let mark = "[Tool output stored outside model context]";
+    // 同一轮的两条都保留全文(不压缩) —— 这正是修复点。
+    assert!(!old_c.contains(mark), "当前轮 c_old 应保留全文");
+    assert!(!new_c.contains(mark), "当前轮 c_new 应保留全文");
+    assert!(
+        old_c.contains("OLDDATA") && new_c.contains("NEWDATA"),
+        "两条都应是原始全文"
+    );
+}
+
+#[test]
+fn recompress_keeps_current_round_compresses_cached() {
+    // MOC-190: cached history 里之前轮存入的全文(c_old)+ 当前轮新产生的(c_new)。current 集合只含
+    // c_new → c_old 压缩、c_new 保留全文; 且对已压缩的幂等。
+    let big = "DATA ".repeat(2000); // ~10k > inline 阈值
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_old", "content": big.clone() }),
+        json!({ "role": "assistant", "content": "..." }),
+        json!({ "role": "tool", "tool_call_id": "c_new", "content": big.clone() }),
+    ];
+    // 当前轮只有 c_new(messages 末尾的 tool message)→ keep_recent_count=1。
+    recompress_stale_full_tool_outputs(&mut messages, 1);
+    let c_old = messages[0]["content"].as_str().unwrap();
+    let c_new = messages[2]["content"].as_str().unwrap();
+    assert!(
+        c_old.contains("[Tool output stored outside model context]"),
+        "cached 历史全文应被重新压缩"
+    );
+    assert!(
+        !c_new.contains("[Tool output stored outside model context]"),
+        "当前轮 tool 应保留全文"
+    );
+    // 幂等: 再跑一次不变(已压缩的含外置标记会被跳过)。
+    let snapshot = messages.clone();
+    recompress_stale_full_tool_outputs(&mut messages, 1);
+    assert_eq!(messages, snapshot, "幂等: 已压缩的不应再变");
+}
+
+#[test]
+fn keep_current_round_id_less_output_preserved() {
+    // chatgpt-codex P2: 当前轮 function_call_output 没有自己的 call_id, 靠前一个 function_call 配对
+    // (repair_tool_call_ids 后补 tool_call_id)。recompress 在 repair 之前跑、按位置(末尾 N 个)保留,
+    // 不依赖此刻还没有的 ID —— 否则 ID-less 的当前轮 tool 会被误当历史压缩。
+    let big = "DATA ".repeat(2000);
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call", "call_id": "fc1", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "output": big.clone() }
+        ]
+    }));
+    let tool = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("应有 tool 消息");
+    assert!(
+        !tool["content"]
+            .as_str()
+            .unwrap()
+            .contains("[Tool output stored outside model context]"),
+        "ID-less 的当前轮 tool 输出应保留全文(按位置识别, 不依赖未补的 ID)"
+    );
+}
+
+#[test]
+fn stateless_full_transcript_only_keeps_latest_tool_group_full() {
+    // chatgpt-codex P2: stateless client(无 previous_response_id)把完整 transcript 塞进 input。只有
+    // 末尾连续的最新一组 tool 该保留全文, 更早的(被非 tool message 隔断)历史 tool 应压缩 —— 否则历史
+    // web_fetch 各留 100k 累积撑爆、绕过 P1。
+    let big_old = "OLDDATA ".repeat(1000); // ~8k > inline
+    let big_new = "NEWDATA ".repeat(1000);
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call", "call_id": "fc_old", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "call_id": "fc_old", "output": big_old.clone() },
+            { "type": "message", "role": "assistant", "content": "中间回复, 隔断两组 tool" },
+            { "type": "function_call", "call_id": "fc_new", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "call_id": "fc_new", "output": big_new.clone() }
+        ]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let content_of = |cid: &str| {
+        messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == cid)
+            .unwrap_or_else(|| panic!("缺 {cid} tool 消息"))["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mark = "[Tool output stored outside model context]";
+    assert!(
+        content_of("fc_old").contains(mark),
+        "stateless 历史一组 tool(被 assistant 隔断)应压缩"
+    );
+    assert!(
+        !content_of("fc_new").contains(mark),
+        "stateless 末尾最新一组 tool 应保留全文"
+    );
+}
+
+#[test]
+fn recompress_keeps_all_current_round_tools_full() {
+    // MOC-190: 模型一轮调多个工具 —— 当前轮 c_a + c_b(messages 末尾 2 个 tool), 它们**都**该保留全文
+    // (不是只留 1 条); cached 的 c_old 压缩。专防「一轮多 tool 只留最新 1 条」缺陷(read_url_local + web_fetch 同轮)。
+    let big = "DATA ".repeat(2000);
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_old", "content": big.clone() }),
+        json!({ "role": "tool", "tool_call_id": "c_a", "content": big.clone() }),
+        json!({ "role": "tool", "tool_call_id": "c_b", "content": big.clone() }),
+    ];
+    // 当前轮 2 个 tool(末尾 2 个)→ keep_recent_count=2, 都保留全文。
+    recompress_stale_full_tool_outputs(&mut messages, 2);
+    let mark = "[Tool output stored outside model context]";
+    assert!(
+        messages[0]["content"].as_str().unwrap().contains(mark),
+        "cached c_old 应压缩"
+    );
+    assert!(
+        !messages[1]["content"].as_str().unwrap().contains(mark),
+        "当前轮 c_a 应保留全文"
+    );
+    assert!(
+        !messages[2]["content"].as_str().unwrap().contains(mark),
+        "当前轮 c_b 应保留全文"
+    );
+}
+
+#[test]
+fn recompress_no_new_tool_compresses_even_latest_cached() {
+    // MOC-190 P2: 本轮没新 function_call_output(keep_recent_count=0), 即便最后一条 tool 整条来自
+    // cached history, 也要压缩 —— 否则同一历史页每个 follow-up 都全尺寸重发。
+    let big = "DATA ".repeat(2000); // ~10k > inline 阈值
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_cached", "content": big.clone() }),
+        json!({ "role": "user", "content": "普通问题, 本轮没抓新页" }),
+    ];
+    // 本轮没新 tool → keep_recent_count=0 → 全压缩。
+    recompress_stale_full_tool_outputs(&mut messages, 0);
+    let c = messages[0]["content"].as_str().unwrap();
+    assert!(
+        c.contains("[Tool output stored outside model context]"),
+        "本轮没新 tool 时, cached 的最后一条 tool 也应被压缩"
+    );
+}
+
+#[test]
+fn keep_latest_full_recognizes_single_object_input() {
+    // chatgpt-codex P2: input 可为单个 object(非 array)。keep_latest_full 必须也识别它含
+    // function_call_output, 否则当前轮 tool 输出会被 recompress 误压(extract_input_items 已接受单 object)。
+    let big = "DATA ".repeat(2000); // ~10k > inline
+    let out = convert(json!({
+        "input": { "type": "function_call_output", "call_id": "c_single", "output": big.clone() }
+    }));
+    let content = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c_single")
+        .unwrap_or_else(|| panic!("缺 c_single tool 消息"))["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !content.contains("[Tool output stored outside model context]"),
+        "单 object input 的当前轮 tool 应保留全文(不被 recompress 误压)"
+    );
+    assert!(content.contains("DATA"), "应是原始全文");
+}
+
+#[test]
+fn keep_recent_full_tool_output_over_limit_falls_back_to_bounded() {
+    // MOC-190: 最新那条 >100k 字符时仍走 bounding 防撑爆(不无界保全文 —— 防巨型 shell grep 924k)。
+    let huge = "X".repeat(120_000); // > TOOL_OUTPUT_KEEP_FULL_MAX_CHARS(100k)
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call_output", "call_id": "c_huge", "output": huge }
+        ]
+    }));
+    let content = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c_huge")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // 即便是最新那条, >100k 也被 bound(防撑爆)。
+    assert!(
+        content.contains("[Tool output stored outside model context]"),
+        "最新但 >100k 的 tool 输出应被 bound"
+    );
+    assert!(
+        content.chars().count() < 20_000,
+        "bound 后应有界, 实际 {}",
+        content.chars().count()
     );
 }
 

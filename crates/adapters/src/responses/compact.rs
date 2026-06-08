@@ -236,8 +236,12 @@ pub(crate) fn build_compact_chat_request(
         synthetic_responses_body["tools"] = tools.clone();
     }
 
-    let chat_body =
-        responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))?;
+    // MOC-190: compact 转换不保留最新 tool 全文(压缩历史)。set→convert→reset(即使 Err 也 reset)。
+    super::request::set_compact_no_keep_recent(true);
+    let conversion =
+        responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider));
+    super::request::set_compact_no_keep_recent(false);
+    let chat_body = conversion?;
     let chat_body = enforce_compact_chat_message_budget(chat_body);
     let chat_body = inject_compact_disable_thinking_if_supported(chat_body);
     serde_json::to_vec(&chat_body)

@@ -10,7 +10,10 @@ repository.workspace = true
 
 [dependencies]
 # 默认走标准 reqwest (跟 workspace 现状一致: rustls-tls + system-proxy + socks + http2 + stream)
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "socks", "system-proxy"] }
+# gzip/brotli/deflate/zstd: 解压 feature (MOC-190)。curl 档带 Chrome UA, 服务器对其返回压缩正文;
+# 不开解压则 reqwest 原样吐 gzip 字节 → 乱码 (antigravity.google 实测 final_tier=Curl ratio=0.43)。
+# feature 启用后 reqwest 默认自动加 Accept-Encoding + 解压。
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "socks", "system-proxy", "gzip", "brotli", "deflate", "zstd"] }
 # 为 OpenAI/ChatGPT 等 Cloudflare 强保域提供浏览器指纹伪装。
 # **必须 pin 死 rc 版本**:wreq/wreq-util 是 pre-release,caret 范围会解析到最新 rc,
 # 而 wreq-util 3.0.0-rc.11 是写给 wreq 6.0.0-rc.23 的(rc.29 重命名了 emulation
@@ -18,7 +21,10 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 # cargo build 验证可一起编译的组合。default-features=false 关掉了 wreq 的
 # default。注: rc.23 的 runtime (TcpConnector/GaiResolver) 非 feature-gated,
 # rc.23 features 列表里没有 tokio-rt 这一项 (#358 实证),无需也无法显式开启。
-wreq = { version = "=6.0.0-rc.23", default-features = false, features = ["stream", "webpki-roots", "socks", "system-proxy"] }
+# gzip/brotli/deflate/zstd: 解压 feature (MOC-190)。wreq 的 Emulation::Chrome120 必带 Accept-Encoding
+# 指纹, 服务器据此返回压缩正文; 不开解压则 client 原样吐压缩字节 → 乱码 (antigravity.google 实测)。
+# 解压在 response 层 (tower-http), 不动 ClientHello / Accept-Encoding 指纹 —— 但改 wreq 仍跑 cf-canary 复核。
+wreq = { version = "=6.0.0-rc.23", default-features = false, features = ["stream", "webpki-roots", "socks", "system-proxy", "gzip", "brotli", "deflate", "zstd"] }
 wreq-util = "=3.0.0-rc.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "process"] }
 # 错误类型
