@@ -104,14 +104,18 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // tool / compact)连最新那条也压缩 —— 它整条来自 cached history、不该每个 follow-up 都全尺寸重发
     // (chatgpt-codex P1 防累积 + P2 防本轮无新 tool 时漏压)。
     let keep_latest_full = !COMPACT_NO_KEEP_RECENT.with(|c| c.get())
-        && input
-            .get("input")
-            .and_then(|v| v.as_array())
-            .is_some_and(|items| {
-                items.iter().any(|it| {
-                    it.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
-                })
-            });
+        && input.get("input").is_some_and(|inp| {
+            let is_fco = |it: &Value| {
+                it.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
+            };
+            // 与 extract_input_items 一致: input 可为单 object(非 array) —— 单 object 直接判它本身,
+            // 数组逐项判(chatgpt-codex P2: 只认 array 会漏掉单 object input 的 keep_full)。
+            match inp {
+                Value::Array(items) => items.iter().any(is_fco),
+                Value::Object(_) => is_fco(inp),
+                _ => false,
+            }
+        });
     recompress_stale_full_tool_outputs(&mut messages, keep_latest_full);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);

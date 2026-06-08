@@ -2898,6 +2898,29 @@ fn recompress_no_new_tool_compresses_even_latest_cached() {
 }
 
 #[test]
+fn keep_latest_full_recognizes_single_object_input() {
+    // chatgpt-codex P2: input 可为单个 object(非 array)。keep_latest_full 必须也识别它含
+    // function_call_output, 否则当前轮 tool 输出会被 recompress 误压(extract_input_items 已接受单 object)。
+    let big = "DATA ".repeat(2000); // ~10k > inline
+    let out = convert(json!({
+        "input": { "type": "function_call_output", "call_id": "c_single", "output": big.clone() }
+    }));
+    let content = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c_single")
+        .unwrap_or_else(|| panic!("缺 c_single tool 消息"))["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !content.contains("[Tool output stored outside model context]"),
+        "单 object input 的当前轮 tool 应保留全文(不被 recompress 误压)"
+    );
+    assert!(content.contains("DATA"), "应是原始全文");
+}
+
+#[test]
 fn keep_recent_full_tool_output_over_limit_falls_back_to_bounded() {
     // MOC-190: 最新那条 >100k 字符时仍走 bounding 防撑爆(不无界保全文 —— 防巨型 shell grep 924k)。
     let huge = "X".repeat(120_000); // > TOOL_OUTPUT_KEEP_FULL_MAX_CHARS(100k)

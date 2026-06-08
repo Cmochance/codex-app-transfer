@@ -470,8 +470,9 @@ async fn handle_read_url_local_call(id: Value, url: Option<String>) -> Value {
         Some(u) if !u.is_empty() => u,
         _ => return tool_error(id, "缺少必填参数 url(需绝对 http(s) URL)"),
     };
-    let backend = match current_backend() {
-        Ok(Some(b)) => b,
+    // 仅校验联网工具是否开着(off → 提示); 缓存内容跨所有档找(见下)。
+    match current_backend() {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return tool_error(
                 id,
@@ -484,9 +485,18 @@ async fn handle_read_url_local_call(id: Value, url: Option<String>) -> Value {
                 &format!("读取联网设置失败: {e}(请检查 ~/.codex-app-transfer/config.json)"),
             )
         }
-    };
-    let cache_key = format!("{}|{}", backend.as_str(), url);
-    match cache_get(&cache_key) {
+    }
+    // P2(chatgpt-codex): 缓存 key 含 backend, 用户抓完切档会让 read_url_local 用新档 key miss 掉旧档
+    // 存的内容。改为跨所有档找 —— 任一档命中即返回(回看不该受切档影响)。
+    let hit = [
+        WebFetchBackend::Auto,
+        WebFetchBackend::Curl,
+        WebFetchBackend::Wreq,
+        WebFetchBackend::Headless,
+    ]
+    .iter()
+    .find_map(|b| cache_get(&format!("{}|{}", b.as_str(), url)));
+    match hit {
         Some(content) => tool_ok(id, &truncate(&content, MAX_CONTENT_CHARS)),
         None => tool_error(
             id,
@@ -1644,7 +1654,7 @@ fn truncate(s: &str, max: usize) -> String {
             cut.truncate(i);
         }
     }
-    format!("{cut}\n\n[... 内容超过 {max} 字符已截断;需要后续内容请抓取更具体的子页 URL ...]")
+    format!("{cut}\n\n[... 内容超过 {max} 字符上限已截断, 后续内容未包含; 若该页有分章/分节, 可 web_fetch 更具体的子页 URL ...]")
 }
 
 fn tool_ok(id: Value, text: &str) -> Value {
@@ -1904,7 +1914,10 @@ mod tests {
         let s = format!("{}\n{}", "a".repeat(16), "b".repeat(10));
         let t = truncate(&s, 20); // 前 20 字符 = 16a + \n + 3b; \n@16 >= 15 → 退到 16
         assert!(t.starts_with(&"a".repeat(16)), "应保留整段 a: {t}");
-        assert!(!t.contains('b'), "应退到换行边界、不含半行 b: {t}");
+        // 只看正文部分(截断标记前): 退到换行边界、不含半行 b。标记文案本身可能含 b(如 web_fetch),
+        // 不纳入判定。
+        let body = t.split("\n\n[").next().unwrap_or(&t);
+        assert!(!body.contains('b'), "正文应退到换行边界、不含半行 b: {t}");
         assert!(t.contains("已截断"));
         // 换行太靠前(末 1/4 外)→ 不退, 硬切以免浪费预算
         let s2 = format!("{}\n{}", "c".repeat(4), "d".repeat(40));
