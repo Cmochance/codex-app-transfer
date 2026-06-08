@@ -2,6 +2,13 @@
 //! 启动时进入此模式, 给 Codex CLI 暴露一个 `web_fetch` 工具。Codex 把本二进制作为
 //! stdio mcp_server spawn, 走 newline-delimited JSON-RPC over stdin/stdout。
 //!
+//! ## 数据路径(勿误读成"本地总结"或"浏览器直发")
+//! headless/curl/wreq 在**本地**抓取目标 URL 正文 → 把正文发给**「总结模型」**(一次真实的
+//! LLM 调用, 经本地 proxy → 上游 provider, 见 [`summarize`])按 prompt 摘要 → 摘要结果经
+//! **MCP stdio** 回 Codex core → core 作为 tool 结果发给**主 LLM**;摘要失败则回退原文。
+//! 抓取内容**不**由浏览器直接发给模型(headless 只 GET 外部站点、经 CDP 把 DOM 回本地进程),
+//! 摘要也**不是**本地纯文本处理 —— 是一次走 proxy/上游的模型调用。
+//!
 //! 协议 (官方 MCP spec + openai/codex rmcp 1.7.0 实证):
 //! - **stdout 只能写 JSON-RPC 消息**(日志一律走 stderr);逐行 `\n` 分隔的紧凑 JSON。
 //! - `initialize` → 回 `capabilities.tools` + 回显 client 的 protocolVersion;
