@@ -2767,18 +2767,27 @@ fn large_function_call_output_is_bounded_before_chat_history() {
     );
 
     let out = convert(json!({
-        "input": [{
-            "type": "function_call_output",
-            "call_id": "tool_large",
-            "output": raw_output
-        }]
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "tool_large",
+                "output": raw_output
+            },
+            // MOC-190: 再加一条更新的(最新)tool 输出, 让 tool_large 不是最新那条 —— 验证较早的
+            // 大 tool 输出仍被 bound(只有最新那条才保留全文)。
+            {
+                "type": "function_call_output",
+                "call_id": "tool_newer",
+                "output": "small recent tool output"
+            }
+        ]
     }));
     let tool_msg = out["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["role"] == "tool")
-        .expect("应当有 tool 消息");
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "tool_large")
+        .expect("应当有 tool_large 消息");
 
     assert_eq!(tool_msg["tool_call_id"], "tool_large");
     let content = tool_msg["content"].as_str().unwrap();
@@ -2798,6 +2807,79 @@ fn large_function_call_output_is_bounded_before_chat_history() {
         content.len() < 20_000,
         "模型可见 tool.content 应有界,实际长度 {}",
         content.len()
+    );
+}
+
+#[test]
+fn keep_recent_full_tool_output_keeps_newest_full_bounds_older() {
+    // MOC-190: 两条大 function_call_output(都 >4000 字符)。最新那条保留全文(当前轮全文进 LLM),
+    // 较早那条照常压缩成 bounded evidence。
+    let big_old = "OLDDATA ".repeat(1000); // ~8000 字符 > inline 阈值
+    let big_new = "NEWDATA ".repeat(1000); // ~8000 字符
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call_output", "call_id": "c_old", "output": big_old },
+            { "type": "function_call_output", "call_id": "c_new", "output": big_new.clone() },
+        ]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let content_of = |cid: &str| {
+        messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == cid)
+            .unwrap_or_else(|| panic!("缺 {cid} tool 消息"))["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let old_c = content_of("c_old");
+    let new_c = content_of("c_new");
+    // 较早那条: 压缩成 bounded evidence(含外置存储标记)。
+    assert!(
+        old_c.contains("[Tool output stored outside model context]"),
+        "较早 tool 输出应被压缩"
+    );
+    // 最新那条: 全文(不含压缩标记, 且是原始完整内容)。
+    assert!(
+        !new_c.contains("[Tool output stored outside model context]"),
+        "最新 tool 输出应保留全文(未压缩)"
+    );
+    assert!(new_c.contains("NEWDATA"), "最新应是原始全文");
+    assert!(
+        new_c.chars().count() >= big_new.chars().count(),
+        "最新应是完整全文(未截断), 实际 {} 期望 ≥ {}",
+        new_c.chars().count(),
+        big_new.chars().count()
+    );
+}
+
+#[test]
+fn keep_recent_full_tool_output_over_limit_falls_back_to_bounded() {
+    // MOC-190: 最新那条 >100k 字符时仍走 bounding 防撑爆(不无界保全文 —— 防巨型 shell grep 924k)。
+    let huge = "X".repeat(120_000); // > TOOL_OUTPUT_KEEP_FULL_MAX_CHARS(100k)
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call_output", "call_id": "c_huge", "output": huge }
+        ]
+    }));
+    let content = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c_huge")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // 即便是最新那条, >100k 也被 bound(防撑爆)。
+    assert!(
+        content.contains("[Tool output stored outside model context]"),
+        "最新但 >100k 的 tool 输出应被 bound"
+    );
+    assert!(
+        content.chars().count() < 20_000,
+        "bound 后应有界, 实际 {}",
+        content.chars().count()
     );
 }
 

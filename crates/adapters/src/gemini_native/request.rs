@@ -2186,12 +2186,19 @@ mod tests {
         let body = serde_json::json!({
             "input": [
                 {"type":"function_call","call_id":"tool_large","name":"exec_command","arguments":"{}"},
-                {"type":"function_call_output","call_id":"tool_large","output": raw_output}
+                {"type":"function_call_output","call_id":"tool_large","output": raw_output},
+                // MOC-190: 再加一对更新的(最新)调用, 让 tool_large 不是最新那条 —— 验证较早的大
+                // tool 输出仍被 bound(只有最新那条才保留全文)。
+                {"type":"function_call","call_id":"tool_newer","name":"exec_command","arguments":"{}"},
+                {"type":"function_call_output","call_id":"tool_newer","output": "small recent output"}
             ]
         });
         let chat = responses_body_to_normalized_chat(&body).unwrap();
         let msgs = chat["messages"].as_array().unwrap();
-        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        let tool = msgs
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "tool_large")
+            .unwrap();
         let content = tool["content"].as_str().unwrap();
 
         assert_eq!(tool["tool_call_id"], "tool_large");
