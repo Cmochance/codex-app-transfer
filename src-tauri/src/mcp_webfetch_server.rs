@@ -487,15 +487,8 @@ async fn handle_read_url_local_call(id: Value, url: Option<String>) -> Value {
         }
     }
     // P2(chatgpt-codex): 缓存 key 含 backend, 用户抓完切档会让 read_url_local 用新档 key miss 掉旧档
-    // 存的内容。改为跨所有档找 —— 任一档命中即返回(回看不该受切档影响)。
-    let hit = [
-        WebFetchBackend::Auto,
-        WebFetchBackend::Curl,
-        WebFetchBackend::Wreq,
-        WebFetchBackend::Headless,
-    ]
-    .iter()
-    .find_map(|b| cache_get(&format!("{}|{}", b.as_str(), url)));
+    // 存的内容 → 跨所有档找; 且同 URL 多档都缓存时按 cached_at 取最新(避免返回旧的弱档骨架)。
+    let hit = cache_get_newest_for_url(&url);
     let (resp, returned_chars, is_error) = match hit {
         Some(content) => {
             let out = truncate(&content, MAX_CONTENT_CHARS);
@@ -561,6 +554,25 @@ fn cache_get(url: &str) -> Option<String> {
         }
     };
     cache_get_in(&mut guard, url)
+}
+
+/// 跨所有 backend 档找同 URL 缓存, 返回 `cached_at` 最新的正文(read_url_local 用)。同 URL 先弱档(curl
+/// 骨架)后 headless(渲染正文)抓时两档都缓存, 固定顺序会先返回旧的 curl 骨架 → 按 cached_at 取最新, 拿
+/// 到更完整的渲染版(chatgpt-codex P2)。
+fn cache_get_newest_for_url(url: &str) -> Option<String> {
+    let mut guard = match fetch_cache().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            eprintln!("[cat-webfetch] fetch 缓存锁 poisoned, read_url_local 降级 miss");
+            return None;
+        }
+    };
+    guard.retain(|_, d| d.cached_at.elapsed() < FETCH_CACHE_TTL);
+    ["auto", "curl", "wreq", "headless"]
+        .iter()
+        .filter_map(|b| guard.get(&format!("{b}|{url}")))
+        .max_by_key(|d| d.cached_at)
+        .map(|d| d.content.clone())
 }
 
 /// 写缓存。全局 wrapper, 真逻辑在 [`cache_put_in`]。

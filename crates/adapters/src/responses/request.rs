@@ -114,7 +114,15 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
             .unwrap_or_default()
             .iter()
             .filter(|it| it.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
-            .filter_map(|it| it.get("call_id").and_then(|v| v.as_str()).map(String::from))
+            // 与 input_item_to_messages 取 call_id 一致: 可用 tool_call_id / id 别名(chatgpt-codex P2);
+            // 只认 call_id 会让用别名的当前轮 tool 被误当历史压缩。
+            .filter_map(|it| {
+                it.get("call_id")
+                    .or_else(|| it.get("tool_call_id"))
+                    .or_else(|| it.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .collect()
     };
     recompress_stale_full_tool_outputs(&mut messages, &current_tool_ids);
