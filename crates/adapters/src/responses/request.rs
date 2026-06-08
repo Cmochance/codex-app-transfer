@@ -99,10 +99,20 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     let merge_result = build_messages_from_input(input, session_cache)?;
     let history_lost = merge_result.history_lost;
     let mut messages = merge_result.messages;
-    // MOC-190 P1: cached history 里可能含之前作为 latest 存入的全文 tool output, merge 后统一重新
-    // 压缩 —— 只保留全局最新 1 条 tool message 全文, 更早的(含 cached 全文、未压缩的)重新 bound,
-    // 防多轮会话 session cache 累积全文撑爆(chatgpt-codex P1)。
-    recompress_stale_full_tool_outputs(&mut messages);
+    // MOC-190 P1+P2: merge(cached history + 当前)后统一重新压缩 tool 输出。仅当「当前轮真的产生了新
+    // function_call_output」(且非 compact)时保留全局最新 1 条全文(当前轮全文进 LLM); 否则(本轮没新
+    // tool / compact)连最新那条也压缩 —— 它整条来自 cached history、不该每个 follow-up 都全尺寸重发
+    // (chatgpt-codex P1 防累积 + P2 防本轮无新 tool 时漏压)。
+    let keep_latest_full = !COMPACT_NO_KEEP_RECENT.with(|c| c.get())
+        && input
+            .get("input")
+            .and_then(|v| v.as_array())
+            .is_some_and(|items| {
+                items.iter().any(|it| {
+                    it.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
+                })
+            });
+    recompress_stale_full_tool_outputs(&mut messages, keep_latest_full);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -972,16 +982,20 @@ fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) 
 /// MOC-190 P1: merge(拼接 cached history + 当前)后统一收口 —— 只保留全局最新 1 条 tool message
 /// 全文, 更早的若超 inline 阈值且尚未压缩(不含外置标记)则重新 bound。覆盖 session cache 里之前
 /// 作为 latest 存入的全文(它们在当轮已非最新, 不该再占满上下文);已 bound 的跳过防嵌套。
-fn recompress_stale_full_tool_outputs(messages: &mut [Value]) {
-    let Some(last_tool) = messages
-        .iter()
-        .rposition(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
-    else {
-        return;
+fn recompress_stale_full_tool_outputs(messages: &mut [Value], keep_latest: bool) {
+    // keep_latest=false(本轮没新 tool / compact): 不保留任何 latest, 全部历史 tool 压缩 —— 否则
+    // 来自 cached history 的最后一条会被误当"当前轮"留全文、每个 follow-up 全尺寸重发(P2)。
+    // keep_latest=true: 全局最新 1 条(=当前轮新产生的)保留全文, 其余压缩。
+    let last_tool = if keep_latest {
+        messages
+            .iter()
+            .rposition(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+    } else {
+        None
     };
     for (i, m) in messages.iter_mut().enumerate() {
-        if i == last_tool {
-            continue; // 全局最新那条保留全文(当前轮)
+        if Some(i) == last_tool {
+            continue; // 全局最新那条保留全文(当前轮新产生的)
         }
         if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
             continue;

@@ -2863,7 +2863,7 @@ fn recompress_stale_full_keeps_newest_compresses_cached() {
         json!({ "role": "assistant", "content": "..." }),
         json!({ "role": "tool", "tool_call_id": "c_new", "content": big.clone() }),
     ];
-    recompress_stale_full_tool_outputs(&mut messages);
+    recompress_stale_full_tool_outputs(&mut messages, true);
     let c_old = messages[0]["content"].as_str().unwrap();
     let c_new = messages[2]["content"].as_str().unwrap();
     assert!(
@@ -2876,8 +2876,25 @@ fn recompress_stale_full_keeps_newest_compresses_cached() {
     );
     // 幂等: 再跑一次不变(已压缩的含外置标记会被跳过)。
     let snapshot = messages.clone();
-    recompress_stale_full_tool_outputs(&mut messages);
+    recompress_stale_full_tool_outputs(&mut messages, true);
     assert_eq!(messages, snapshot, "幂等: 已压缩的不应再变");
+}
+
+#[test]
+fn recompress_no_new_tool_compresses_even_latest_cached() {
+    // MOC-190 P2: 本轮没新 function_call_output(keep_latest=false), 即便最后一条 tool 整条来自
+    // cached history, 也要压缩 —— 否则同一历史页每个 follow-up 都全尺寸重发。
+    let big = "DATA ".repeat(2000); // ~10k > inline 阈值
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_cached", "content": big.clone() }),
+        json!({ "role": "user", "content": "普通问题, 本轮没抓新页" }),
+    ];
+    recompress_stale_full_tool_outputs(&mut messages, false);
+    let c = messages[0]["content"].as_str().unwrap();
+    assert!(
+        c.contains("[Tool output stored outside model context]"),
+        "本轮没新 tool 时, cached 的最后一条 tool 也应被压缩"
+    );
 }
 
 #[test]
