@@ -50,9 +50,13 @@ const FALLBACK_PROTOCOL: &str = "2025-11-25";
 /// 返回正文截断上限(字符)。防把 MB 级页面灌给模型(类 Claude WebFetch 的 100KB 截断)。
 const MAX_CONTENT_CHARS: usize = 100_000;
 /// 单页 bounded 原文默认预算(字符, MOC-190)。默认 = adapter 对 tool 输出的 inline 阈值
-/// (`responses/request.rs` TOOL_OUTPUT_INLINE_MAX_CHARS=4000), 让 preview 原样 inline、不被
-/// adapter 二次 head/tail 盲切; 需更多正文用 `offset` 翻页(缓存复用不重抓)或 `summarize=true`。
+/// (`responses/request.rs` TOOL_OUTPUT_INLINE_MAX_CHARS=4000), 让「元信息头 + 正文」总长原样
+/// inline、不被 adapter 二次 head/tail 盲切; 需更多正文用 `offset` 翻页(缓存复用不重抓)或
+/// `summarize=true`。
 const WEBFETCH_PAGE_CHARS: usize = 4_000;
+/// bounded_page 元信息头预留(从单页预算扣除, 保证「头 + 正文」总长 ≤ page_chars、不超 adapter
+/// inline 阈值被二次截断, devin review)。覆盖典型 URL + 范围数字 + 提示文案 + query 词。
+const WEBFETCH_PAGE_HEADER_RESERVE: usize = 320;
 /// stdin EOF 后等在途抓取写完响应的上限(略大于单次工具超时 120s)。匹配旧同步实现
 /// "先跑完在途 fetch 再退"的行为, 不丢已在算的响应; 仍卡住的任务到点由 drop(rt) 中止。
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(125);
@@ -567,10 +571,13 @@ fn bounded_page(
     page_chars: usize,
 ) -> String {
     let total = content.chars().count();
+    // 正文预算从 page_chars 扣除元信息头开销(devin review): 保证「头 + 正文」总长 ≤ page_chars
+    // (= adapter inline 阈值), 不被 adapter 二次 head/tail 截断。
+    let body_budget = page_chars.saturating_sub(WEBFETCH_PAGE_HEADER_RESERVE);
     // query 选块模式: 找特定信息, 返回最相关的若干段原文。
     if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
         let (selected, did_select, picked, total_chunks) =
-            select_relevant_content(content, q, page_chars);
+            select_relevant_content(content, q, body_budget);
         // query(相关性选块)与 offset(顺序翻页)互斥; 传了 offset 时显式告知它被忽略, 防模型
         // 以为翻页生效却拿到同样结果(code-reviewer + silent-failure-hunter 双提)。
         let offset_note = if offset > 0 {
@@ -596,8 +603,8 @@ fn bounded_page(
     if offset >= total {
         return format!("[web_fetch {url} | offset {offset} 已超全文长度 {total},无更多内容]");
     }
-    let page: String = content.chars().skip(offset).take(page_chars).collect();
-    let end = (offset + page_chars).min(total);
+    let page: String = content.chars().skip(offset).take(body_budget).collect();
+    let end = (offset + body_budget).min(total);
     let more = if end < total {
         format!(" | 读更多: web_fetch(url, offset={end})")
     } else {
@@ -1824,22 +1831,58 @@ mod tests {
 
     #[test]
     fn bounded_page_sequential_paging() {
-        let content = "abcdefghij".repeat(100); // 1000 字符
-        let p0 = bounded_page("https://e.com", &content, None, 0, 400);
+        let content = "abcdefghij".repeat(500); // 5000 字符
+        let page_chars = 2000;
+        let budget = page_chars - WEBFETCH_PAGE_HEADER_RESERVE; // 正文预算(扣 header 预留)
+        let p0 = bounded_page("https://e.com", &content, None, 0, page_chars);
         assert!(
-            p0.contains("字符 0-400 / 共 1000"),
+            p0.contains(&format!("字符 0-{budget} / 共 5000")),
             "应标注范围+总长: {}",
             p0.chars().take(60).collect::<String>()
         );
-        assert!(p0.contains("offset=400"), "应提示下一页 offset");
+        assert!(
+            p0.contains(&format!("offset={budget}")),
+            "应提示下一页 offset"
+        );
         // 元信息行**置于最前**(adapter head 截断也能保住)。
         assert!(p0.starts_with("[web_fetch https://e.com"), "元信息应在最前");
+        // devin: 头 + 正文总长 ≤ page_chars(不超 adapter inline 被二次截断)。
+        assert!(
+            p0.chars().count() <= page_chars,
+            "总输出 {} 应 ≤ page_chars {page_chars}",
+            p0.chars().count()
+        );
         // 第 2 页接续。
-        let p1 = bounded_page("https://e.com", &content, None, 400, 400);
-        assert!(p1.contains("字符 400-800 / 共 1000"));
+        let p1 = bounded_page("https://e.com", &content, None, budget, page_chars);
+        assert!(p1.contains(&format!("字符 {budget}-{} / 共 5000", budget * 2)));
         // 末页提示已到结尾。
-        let p2 = bounded_page("https://e.com", &content, None, 800, 400);
-        assert!(p2.contains("已到结尾"), "末页应标已到结尾: {p2}");
+        let p2 = bounded_page("https://e.com", &content, None, 4000, page_chars);
+        assert!(
+            p2.contains("已到结尾"),
+            "末页应标已到结尾: {}",
+            p2.chars().take(60).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn bounded_page_output_within_budget() {
+        // devin: 无论顺序 / query 模式, 「头 + 正文」总长都 ≤ page_chars(= adapter inline 阈值),
+        // 避免被 adapter 二次 head/tail 截断。用较长 URL 给 header 加压。
+        let content = "x".repeat(10_000);
+        let url = "https://example.com/a/fairly/long/path/segment/that/adds/header/overhead";
+        let page_chars = WEBFETCH_PAGE_CHARS;
+        let seq = bounded_page(url, &content, None, 0, page_chars);
+        assert!(
+            seq.chars().count() <= page_chars,
+            "顺序模式总输出 {} 应 ≤ {page_chars}",
+            seq.chars().count()
+        );
+        let q = bounded_page(url, &content, Some("some query terms"), 0, page_chars);
+        assert!(
+            q.chars().count() <= page_chars,
+            "query 模式总输出 {} 应 ≤ {page_chars}",
+            q.chars().count()
+        );
     }
 
     #[test]
