@@ -45,6 +45,13 @@ use tokio::sync::Semaphore;
 
 const SERVER_NAME: &str = "cat-webfetch";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// MCP `initialize` 回给模型的整体工具使用规则(MOC-190): 把「回看已抓 URL 优先用 read_url_local」抬到
+/// server 级指引(比单个 tool description 优先级高), 提高 read_url_local 调用率、避免重复 web_fetch 同一页。
+const SERVER_INSTRUCTIONS: &str = "联网工具使用规则:\n\
+1. 需要网上信息时先 web_search(query) 找来源, 再 web_fetch(url) 读该页完整正文。\n\
+2. **凡是本次对话里你已经用 web_fetch 抓过的 URL —— 当你要再次引用 / 摘录 / 附上它的原文 / 回看更多细节时, 必须先用 read_url_local(url) 从本地缓存取回, 不要重复 web_fetch 同一个 URL**。read_url_local 不联网、瞬时返回, 且能拿回已被对话历史折叠/压缩、你当前看不到的完整原文。\n\
+3. 抓「新」URL 才用 web_fetch; 回看「旧」(本会话已抓过的)URL 一律 read_url_local。\n\
+4. web_fetch 默认返回完整正文供当前轮直接阅读; 仅当你只要压缩摘要时才加 summarize=true。";
 /// client 未给 protocolVersion 时的兜底(回显 client 的值更优, 见 spec)。
 const FALLBACK_PROTOCOL: &str = "2025-11-25";
 /// 返回正文截断上限(字符)。防把 MB 级页面灌给模型(类 Claude WebFetch 的 100KB 截断)。
@@ -183,7 +190,8 @@ fn dispatch_line(
                 "result": {
                     "protocolVersion": proto,
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+                    "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+                    "instructions": SERVER_INSTRUCTIONS
                 }
             }));
         }
@@ -1610,7 +1618,7 @@ fn web_search_tool_def() -> Value {
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "返回结果数上限(默认 12, 最多 30)。",
+                    "description": "返回结果数上限(默认 15, 最多 30)。",
                     "minimum": 1,
                     "maximum": 30
                 }

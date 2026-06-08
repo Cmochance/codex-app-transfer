@@ -45,8 +45,9 @@ pub enum WebSearchError {
     NoResults,
 }
 
-/// 默认返回结果上限(MOC-190: 8→12, 8 条太少、模型常因信息不足反复换词搜)。
-pub const DEFAULT_MAX_RESULTS: usize = 12;
+/// 默认返回结果上限(MOC-190: 8→15, 8 条太少、模型常因信息不足反复换词搜;每条只是标题+URL+短摘要、
+/// 15 条不占多少 context)。
+pub const DEFAULT_MAX_RESULTS: usize = 15;
 /// 结果上限硬顶(防模型传超大值撑爆 context;MOC-190: 20→30)。
 const MAX_RESULTS_CAP: usize = 30;
 
