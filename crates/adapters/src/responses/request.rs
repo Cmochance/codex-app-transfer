@@ -99,24 +99,25 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     let merge_result = build_messages_from_input(input, session_cache)?;
     let history_lost = merge_result.history_lost;
     let mut messages = merge_result.messages;
-    // MOC-190 P1+P2: merge(cached history + 当前)后统一重新压缩 tool 输出。仅当「当前轮真的产生了新
-    // function_call_output」(且非 compact)时保留全局最新 1 条全文(当前轮全文进 LLM); 否则(本轮没新
-    // tool / compact)连最新那条也压缩 —— 它整条来自 cached history、不该每个 follow-up 都全尺寸重发
-    // (chatgpt-codex P1 防累积 + P2 防本轮无新 tool 时漏压)。
-    let keep_latest_full = !COMPACT_NO_KEEP_RECENT.with(|c| c.get())
-        && input.get("input").is_some_and(|inp| {
-            let is_fco = |it: &Value| {
-                it.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
-            };
-            // 与 extract_input_items 一致: input 可为单 object(非 array) —— 单 object 直接判它本身,
-            // 数组逐项判(chatgpt-codex P2: 只认 array 会漏掉单 object input 的 keep_full)。
-            match inp {
-                Value::Array(items) => items.iter().any(is_fco),
-                Value::Object(_) => is_fco(inp),
-                _ => false,
-            }
-        });
-    recompress_stale_full_tool_outputs(&mut messages, keep_latest_full);
+    // MOC-190: merge(cached history + 当前)后统一重新压缩 tool 输出。当前轮(本次 input)新产生的**所有**
+    // function_call_output 保留全文(模型一轮可能调多个工具, 每条都该全文进 LLM); cached 历史轮的旧 tool
+    // 输出(call_id 不在当前集合)压缩。compact / 本轮无新 tool → 集合为空 → 全压缩(P1 防累积 + P2 防无新
+    // tool 时漏压)。用 extract_input_items 取 call_id, 同时兼容单 object input(P2-3)。
+    let current_tool_ids: std::collections::HashSet<String> = if COMPACT_NO_KEEP_RECENT
+        .with(|c| c.get())
+    {
+        std::collections::HashSet::new()
+    } else {
+        input
+            .get("input")
+            .map(extract_input_items)
+            .unwrap_or_default()
+            .iter()
+            .filter(|it| it.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+            .filter_map(|it| it.get("call_id").and_then(|v| v.as_str()).map(String::from))
+            .collect()
+    };
+    recompress_stale_full_tool_outputs(&mut messages, &current_tool_ids);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -450,24 +451,14 @@ fn is_cas_injected_base_instructions(instructions: &Value) -> bool {
 /// 把 `body.input` 字段(可能是 string 也可能是 array)展开成 messages 列表.
 fn input_field_to_messages(input: &Value) -> Vec<Value> {
     let items = extract_input_items(input);
-    // MOC-190: 找最新 1 条 function_call_output 的下标 —— 它保留全文(当前轮全文进 LLM), 其余 tool
-    // 输出照常 bound。compact 也走这里, 但其 P2 预算层会在转换后兜底裁剪超大块, 故无需在此区分。
-    // MOC-190: normal turn 保留最新 1 条 function_call_output 全文; compact(压缩历史)不保留。
-    let keep_full_idx = if COMPACT_NO_KEEP_RECENT.with(|c| c.get()) {
-        None
-    } else {
-        items.iter().enumerate().rev().find_map(|(i, it)| {
-            (it.as_object()
-                .and_then(|o| o.get("type"))
-                .and_then(|v| v.as_str())
-                == Some("function_call_output"))
-            .then_some(i)
-        })
-    };
+    // MOC-190: input 是「当前轮」新产生的 —— 其**所有** function_call_output 都保留全文(模型一轮可能
+    // 调多个工具, 每条都该全文进 LLM)。compact(压缩历史)不保留。cached history 里之前轮当「当前」存入
+    // 的旧全文, 由 merge 后的 recompress 按 call_id 压缩 —— 那才是历史轮。
+    let keep_current_tools = !COMPACT_NO_KEEP_RECENT.with(|c| c.get());
     let mut out = Vec::new();
     let mut pending_reasoning: Option<String> = None;
 
-    for (idx, item) in items.iter().enumerate() {
+    for item in items.iter() {
         let Some(obj) = item.as_object() else {
             continue;
         };
@@ -475,7 +466,8 @@ fn input_field_to_messages(input: &Value) -> Vec<Value> {
             pending_reasoning = Some(extract_reasoning_text(obj));
             continue;
         }
-        let mut item_messages = input_item_to_messages(obj, Some(idx) == keep_full_idx);
+        let is_fco = obj.get("type").and_then(|v| v.as_str()) == Some("function_call_output");
+        let mut item_messages = input_item_to_messages(obj, keep_current_tools && is_fco);
         for msg in &mut item_messages {
             if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
                 if let Some(reasoning) = pending_reasoning.take() {
@@ -986,23 +978,23 @@ fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) 
 /// MOC-190 P1: merge(拼接 cached history + 当前)后统一收口 —— 只保留全局最新 1 条 tool message
 /// 全文, 更早的若超 inline 阈值且尚未压缩(不含外置标记)则重新 bound。覆盖 session cache 里之前
 /// 作为 latest 存入的全文(它们在当轮已非最新, 不该再占满上下文);已 bound 的跳过防嵌套。
-fn recompress_stale_full_tool_outputs(messages: &mut [Value], keep_latest: bool) {
-    // keep_latest=false(本轮没新 tool / compact): 不保留任何 latest, 全部历史 tool 压缩 —— 否则
-    // 来自 cached history 的最后一条会被误当"当前轮"留全文、每个 follow-up 全尺寸重发(P2)。
-    // keep_latest=true: 全局最新 1 条(=当前轮新产生的)保留全文, 其余压缩。
-    let last_tool = if keep_latest {
-        messages
-            .iter()
-            .rposition(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
-    } else {
-        None
-    };
-    for (i, m) in messages.iter_mut().enumerate() {
-        if Some(i) == last_tool {
-            continue; // 全局最新那条保留全文(当前轮新产生的)
-        }
+fn recompress_stale_full_tool_outputs(
+    messages: &mut [Value],
+    current_tool_ids: &std::collections::HashSet<String>,
+) {
+    // current_tool_ids = 当前轮(本次 input)新产生的 function_call_output 的 call_id 集合。在集合里的
+    // 保留全文(模型一轮调多个工具时每条都该全文); 不在集合里的(= cached 历史轮的旧 tool 输出)若超阈值
+    // 且未压缩则重新 bound。空集(compact / 本轮无新 tool)→ 全部历史 tool 压缩。
+    for m in messages.iter_mut() {
         if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
             continue;
+        }
+        let in_current = m
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|cid| current_tool_ids.contains(cid));
+        if in_current {
+            continue; // 当前轮新产生的, 保留全文
         }
         let Some(content) = m.get("content").and_then(|v| v.as_str()) else {
             continue;

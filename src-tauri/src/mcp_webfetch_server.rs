@@ -496,15 +496,38 @@ async fn handle_read_url_local_call(id: Value, url: Option<String>) -> Value {
     ]
     .iter()
     .find_map(|b| cache_get(&format!("{}|{}", b.as_str(), url)));
-    match hit {
-        Some(content) => tool_ok(id, &truncate(&content, MAX_CONTENT_CHARS)),
-        None => tool_error(
-            id,
-            &format!(
-                "该 URL 未在本地缓存(可能已过期 >15min, 或本会话未用 web_fetch 抓过): {url}。请改用 web_fetch 重新抓取。"
+    let (resp, returned_chars, is_error) = match hit {
+        Some(content) => {
+            let out = truncate(&content, MAX_CONTENT_CHARS);
+            let n = out.chars().count();
+            (tool_ok(id.clone(), &out), n, false)
+        }
+        None => (
+            tool_error(
+                id.clone(),
+                &format!(
+                    "该 URL 未在本地缓存(可能已过期 >15min, 或本会话未用 web_fetch 抓过): {url}。请改用 web_fetch 重新抓取。"
+                ),
             ),
+            0usize,
+            true,
         ),
+    };
+    // MOC-190: 补诊断埋点 —— 此前 read_url_local 不记 trace, 诊断里看不到回看是否触发/是否命中缓存。
+    if let Some(port) = diag_target() {
+        post_diag_entry(
+            port,
+            json!({
+                "trace_kind": "cat_webfetch",
+                "captured_at": now_iso(),
+                "tool": "read_url_local",
+                "request": { "url": url },
+                "result": { "returned_chars": returned_chars, "is_error": is_error, "cache_hit": !is_error },
+            }),
+        )
+        .await;
     }
+    resp
 }
 
 /// 网页正文进程内缓存(MOC-190): URL → readability+markdown 后的完整正文。给 `read_url_local` 取回 /

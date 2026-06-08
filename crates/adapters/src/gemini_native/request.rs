@@ -2172,8 +2172,9 @@ mod tests {
     }
 
     #[test]
-    fn large_function_call_output_is_bounded_in_gemini_normalized_chat() {
-        let huge_line = "const minified='x';".repeat(3_000);
+    fn large_function_call_output_over_limit_is_bounded_in_gemini_normalized_chat() {
+        // MOC-190: 当前轮 tool 输出默认全文; 但超 100k 上限的单条仍 bound 防撑爆。
+        let huge_line = "const minified='x';".repeat(6_000); // > 100k 字符
         let raw_output = format!(
             "Chunk ID: 44d863\n\
              Wall time: 0.1540 seconds\n\
@@ -2186,11 +2187,7 @@ mod tests {
         let body = serde_json::json!({
             "input": [
                 {"type":"function_call","call_id":"tool_large","name":"exec_command","arguments":"{}"},
-                {"type":"function_call_output","call_id":"tool_large","output": raw_output},
-                // MOC-190: 再加一对更新的(最新)调用, 让 tool_large 不是最新那条 —— 验证较早的大
-                // tool 输出仍被 bound(只有最新那条才保留全文)。
-                {"type":"function_call","call_id":"tool_newer","name":"exec_command","arguments":"{}"},
-                {"type":"function_call_output","call_id":"tool_newer","output": "small recent output"}
+                {"type":"function_call_output","call_id":"tool_large","output": raw_output}
             ]
         });
         let chat = responses_body_to_normalized_chat(&body).unwrap();

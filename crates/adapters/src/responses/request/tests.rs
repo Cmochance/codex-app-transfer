@@ -2754,8 +2754,9 @@ fn function_call_output_non_string_is_json_serialized() {
 }
 
 #[test]
-fn large_function_call_output_is_bounded_before_chat_history() {
-    let huge_line = "function veryLongMinifiedBundle(){return 'x';}".repeat(2_000);
+fn large_function_call_output_over_limit_is_bounded() {
+    // MOC-190: 当前轮 tool 输出默认全文; 但**超 100k 上限**的单条仍 bound 防撑爆。
+    let huge_line = "function veryLongMinifiedBundle(){return 'x';}".repeat(3_000); // > 100k 字符
     let raw_output = format!(
         "Chunk ID: 44d863\n\
          Wall time: 0.1540 seconds\n\
@@ -2772,13 +2773,6 @@ fn large_function_call_output_is_bounded_before_chat_history() {
                 "type": "function_call_output",
                 "call_id": "tool_large",
                 "output": raw_output
-            },
-            // MOC-190: 再加一条更新的(最新)tool 输出, 让 tool_large 不是最新那条 —— 验证较早的
-            // 大 tool 输出仍被 bound(只有最新那条才保留全文)。
-            {
-                "type": "function_call_output",
-                "call_id": "tool_newer",
-                "output": "small recent tool output"
             }
         ]
     }));
@@ -2811,14 +2805,14 @@ fn large_function_call_output_is_bounded_before_chat_history() {
 }
 
 #[test]
-fn keep_recent_full_tool_output_keeps_newest_full_bounds_older() {
-    // MOC-190: 两条大 function_call_output(都 >4000 字符)。最新那条保留全文(当前轮全文进 LLM),
-    // 较早那条照常压缩成 bounded evidence。
+fn keep_current_round_all_tool_outputs_full() {
+    // MOC-190(修「一轮多 tool 只留 1 条」缺陷): current input 的多个 function_call_output(模型一轮
+    // 调多工具)**都**保留全文, 不是只留最新 1 条。两条都 <100k → 都全文。
     let big_old = "OLDDATA ".repeat(1000); // ~8000 字符 > inline 阈值
     let big_new = "NEWDATA ".repeat(1000); // ~8000 字符
     let out = convert(json!({
         "input": [
-            { "type": "function_call_output", "call_id": "c_old", "output": big_old },
+            { "type": "function_call_output", "call_id": "c_old", "output": big_old.clone() },
             { "type": "function_call_output", "call_id": "c_new", "output": big_new.clone() },
         ]
     }));
@@ -2834,36 +2828,28 @@ fn keep_recent_full_tool_output_keeps_newest_full_bounds_older() {
     };
     let old_c = content_of("c_old");
     let new_c = content_of("c_new");
-    // 较早那条: 压缩成 bounded evidence(含外置存储标记)。
+    let mark = "[Tool output stored outside model context]";
+    // 同一轮的两条都保留全文(不压缩) —— 这正是修复点。
+    assert!(!old_c.contains(mark), "当前轮 c_old 应保留全文");
+    assert!(!new_c.contains(mark), "当前轮 c_new 应保留全文");
     assert!(
-        old_c.contains("[Tool output stored outside model context]"),
-        "较早 tool 输出应被压缩"
-    );
-    // 最新那条: 全文(不含压缩标记, 且是原始完整内容)。
-    assert!(
-        !new_c.contains("[Tool output stored outside model context]"),
-        "最新 tool 输出应保留全文(未压缩)"
-    );
-    assert!(new_c.contains("NEWDATA"), "最新应是原始全文");
-    assert!(
-        new_c.chars().count() >= big_new.chars().count(),
-        "最新应是完整全文(未截断), 实际 {} 期望 ≥ {}",
-        new_c.chars().count(),
-        big_new.chars().count()
+        old_c.contains("OLDDATA") && new_c.contains("NEWDATA"),
+        "两条都应是原始全文"
     );
 }
 
 #[test]
-fn recompress_stale_full_keeps_newest_compresses_cached() {
-    // MOC-190 P1: 模拟 merge 后 —— cached history 里有之前作为 latest 存入的全文(c_old)+ 当前轮
-    // 最新全文(c_new)。recompress 应把 c_old 重新压缩、只留 c_new 全文, 且对已压缩的幂等。
+fn recompress_keeps_current_round_compresses_cached() {
+    // MOC-190: cached history 里之前轮存入的全文(c_old)+ 当前轮新产生的(c_new)。current 集合只含
+    // c_new → c_old 压缩、c_new 保留全文; 且对已压缩的幂等。
     let big = "DATA ".repeat(2000); // ~10k > inline 阈值
     let mut messages = vec![
         json!({ "role": "tool", "tool_call_id": "c_old", "content": big.clone() }),
         json!({ "role": "assistant", "content": "..." }),
         json!({ "role": "tool", "tool_call_id": "c_new", "content": big.clone() }),
     ];
-    recompress_stale_full_tool_outputs(&mut messages, true);
+    let current: std::collections::HashSet<String> = ["c_new".to_string()].into_iter().collect();
+    recompress_stale_full_tool_outputs(&mut messages, &current);
     let c_old = messages[0]["content"].as_str().unwrap();
     let c_new = messages[2]["content"].as_str().unwrap();
     assert!(
@@ -2872,24 +2858,53 @@ fn recompress_stale_full_keeps_newest_compresses_cached() {
     );
     assert!(
         !c_new.contains("[Tool output stored outside model context]"),
-        "全局最新 tool 应保留全文"
+        "当前轮 tool 应保留全文"
     );
     // 幂等: 再跑一次不变(已压缩的含外置标记会被跳过)。
     let snapshot = messages.clone();
-    recompress_stale_full_tool_outputs(&mut messages, true);
+    recompress_stale_full_tool_outputs(&mut messages, &current);
     assert_eq!(messages, snapshot, "幂等: 已压缩的不应再变");
 }
 
 #[test]
+fn recompress_keeps_all_current_round_tools_full() {
+    // MOC-190: 模型一轮调多个工具 —— current 集合含 c_a + c_b, 它们**都**该保留全文(不是只留 1 条);
+    // cached 的 c_old 压缩。专防「一轮多 tool 只留最新 1 条」缺陷(read_url_local + web_fetch 同轮)。
+    let big = "DATA ".repeat(2000);
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_old", "content": big.clone() }),
+        json!({ "role": "tool", "tool_call_id": "c_a", "content": big.clone() }),
+        json!({ "role": "tool", "tool_call_id": "c_b", "content": big.clone() }),
+    ];
+    let current: std::collections::HashSet<String> =
+        ["c_a".to_string(), "c_b".to_string()].into_iter().collect();
+    recompress_stale_full_tool_outputs(&mut messages, &current);
+    let mark = "[Tool output stored outside model context]";
+    assert!(
+        messages[0]["content"].as_str().unwrap().contains(mark),
+        "cached c_old 应压缩"
+    );
+    assert!(
+        !messages[1]["content"].as_str().unwrap().contains(mark),
+        "当前轮 c_a 应保留全文"
+    );
+    assert!(
+        !messages[2]["content"].as_str().unwrap().contains(mark),
+        "当前轮 c_b 应保留全文"
+    );
+}
+
+#[test]
 fn recompress_no_new_tool_compresses_even_latest_cached() {
-    // MOC-190 P2: 本轮没新 function_call_output(keep_latest=false), 即便最后一条 tool 整条来自
+    // MOC-190 P2: 本轮没新 function_call_output(current 集合为空), 即便最后一条 tool 整条来自
     // cached history, 也要压缩 —— 否则同一历史页每个 follow-up 都全尺寸重发。
     let big = "DATA ".repeat(2000); // ~10k > inline 阈值
     let mut messages = vec![
         json!({ "role": "tool", "tool_call_id": "c_cached", "content": big.clone() }),
         json!({ "role": "user", "content": "普通问题, 本轮没抓新页" }),
     ];
-    recompress_stale_full_tool_outputs(&mut messages, false);
+    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    recompress_stale_full_tool_outputs(&mut messages, &empty);
     let c = messages[0]["content"].as_str().unwrap();
     assert!(
         c.contains("[Tool output stored outside model context]"),
