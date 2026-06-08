@@ -2854,6 +2854,33 @@ fn keep_recent_full_tool_output_keeps_newest_full_bounds_older() {
 }
 
 #[test]
+fn recompress_stale_full_keeps_newest_compresses_cached() {
+    // MOC-190 P1: 模拟 merge 后 —— cached history 里有之前作为 latest 存入的全文(c_old)+ 当前轮
+    // 最新全文(c_new)。recompress 应把 c_old 重新压缩、只留 c_new 全文, 且对已压缩的幂等。
+    let big = "DATA ".repeat(2000); // ~10k > inline 阈值
+    let mut messages = vec![
+        json!({ "role": "tool", "tool_call_id": "c_old", "content": big.clone() }),
+        json!({ "role": "assistant", "content": "..." }),
+        json!({ "role": "tool", "tool_call_id": "c_new", "content": big.clone() }),
+    ];
+    recompress_stale_full_tool_outputs(&mut messages);
+    let c_old = messages[0]["content"].as_str().unwrap();
+    let c_new = messages[2]["content"].as_str().unwrap();
+    assert!(
+        c_old.contains("[Tool output stored outside model context]"),
+        "cached 历史全文应被重新压缩"
+    );
+    assert!(
+        !c_new.contains("[Tool output stored outside model context]"),
+        "全局最新 tool 应保留全文"
+    );
+    // 幂等: 再跑一次不变(已压缩的含外置标记会被跳过)。
+    let snapshot = messages.clone();
+    recompress_stale_full_tool_outputs(&mut messages);
+    assert_eq!(messages, snapshot, "幂等: 已压缩的不应再变");
+}
+
+#[test]
 fn keep_recent_full_tool_output_over_limit_falls_back_to_bounded() {
     // MOC-190: 最新那条 >100k 字符时仍走 bounding 防撑爆(不无界保全文 —— 防巨型 shell grep 924k)。
     let huge = "X".repeat(120_000); // > TOOL_OUTPUT_KEEP_FULL_MAX_CHARS(100k)

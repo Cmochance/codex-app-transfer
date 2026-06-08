@@ -99,6 +99,10 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     let merge_result = build_messages_from_input(input, session_cache)?;
     let history_lost = merge_result.history_lost;
     let mut messages = merge_result.messages;
+    // MOC-190 P1: cached history 里可能含之前作为 latest 存入的全文 tool output, merge 后统一重新
+    // 压缩 —— 只保留全局最新 1 条 tool message 全文, 更早的(含 cached 全文、未压缩的)重新 bound,
+    // 防多轮会话 session cache 累积全文撑爆(chatgpt-codex P1)。
+    recompress_stale_full_tool_outputs(&mut messages);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -963,6 +967,46 @@ fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) 
         );
     }
     names
+}
+
+/// MOC-190 P1: merge(拼接 cached history + 当前)后统一收口 —— 只保留全局最新 1 条 tool message
+/// 全文, 更早的若超 inline 阈值且尚未压缩(不含外置标记)则重新 bound。覆盖 session cache 里之前
+/// 作为 latest 存入的全文(它们在当轮已非最新, 不该再占满上下文);已 bound 的跳过防嵌套。
+fn recompress_stale_full_tool_outputs(messages: &mut [Value]) {
+    let Some(last_tool) = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+    else {
+        return;
+    };
+    for (i, m) in messages.iter_mut().enumerate() {
+        if i == last_tool {
+            continue; // 全局最新那条保留全文(当前轮)
+        }
+        if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let Some(content) = m.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // 只压缩"看起来是全文"的(超 inline 阈值);已是 bounded evidence(含外置标记)的跳过防嵌套。
+        if content.chars().count() <= TOOL_OUTPUT_INLINE_MAX_CHARS
+            || content.contains("[Tool output stored outside model context]")
+        {
+            continue;
+        }
+        let call_id = m
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let bounded = normalize_tool_output_for_context(
+            call_id.as_deref(),
+            Value::String(content.to_owned()),
+        );
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("content".into(), Value::String(bounded));
+        }
+    }
 }
 
 /// 最新 1 条 tool 输出保留全文(MOC-190): ≤ 上限直接全文(当前轮全文进 LLM), 超过仍 bound 防撑爆。
