@@ -243,6 +243,10 @@ Old versions only exposed `/v1/responses`; Codex CLI 0.126+ falls back to `/resp
 
 Usually means `response.id` / `response.model` weren't returned in the shape Codex App expects. This tool rewrites upstream `chatcmpl-...` to `resp_<base64>` while preserving the requested model name — confirm forwarding logs show `resp_...` instead of `chatcmpl-...`.
 
+### Third-party chat reports `idle timeout waiting for websocket` / keeps reconnecting in relay mode
+
+In relay mode (keep the ChatGPT login + route the model to a third party), v2.2.0–v2.2.1 required the model request's ChatGPT JWT to **byte-match** the local `~/.codex/auth.json` before forwarding. Any mismatch (token rotation / a different `CODEX_HOME` / not actually logged into ChatGPT) made the model request return 401 `missing or invalid gateway api key` → Codex's WS hung until the idle timeout → the chat froze (MOC-189 / #427). **Fixed**: the gateway now relies only on localhost binding + the `cas_` fallback, so third-party chat no longer depends on ChatGPT token state. A broken GPT JWT now only affects `/backend-api/*` (plugins/account), not the third-party conversation.
+
 ### Upstream 400: `thinking is enabled but reasoning_content is missing`
 
 Kimi / DeepSeek with thinking enabled require historical assistant messages with `tool_call` to carry `reasoning_content`. This tool **auto-fills a default empty string since v1.0.1** and maps reasoning items from Responses input to the corresponding assistant message.

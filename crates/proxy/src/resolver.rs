@@ -198,15 +198,19 @@ impl StaticResolver {
         if token == expected {
             return Ok(());
         }
-        // [MOC-104 relay / connector P1 review] relay 模式活动 `~/.codex/auth.json` 是真实
-        // chatgpt,Codex 模型请求发的是 chatgpt access_token(JWT,**不是** cas_ gateway key);
-        // 放行让 `decide_provider` 按 active_provider 转发(不依赖 gateway key)。但**只验 JWT
-        // claim 不够** —— 攻击者可自造未签名、payload 含 chatgpt_account_id 的三段 JWT 绕过
-        // gateway key 花用户 provider 凭据(proxy 无 OpenAI 公钥、无法验签名)。故放行条件收紧
-        // 为:形状是 chatgpt JWT **且逐字 == 本地活动 auth.json 里 Codex 真在用的 access_token**
-        // —— 自造 token 不匹配本地真 token 即拒。实时读盘(relay 下 transfer 不刷新、Codex 自刷
-        // auth.json,构造时传会 stale)。安全锚:放行的凭据来自本地 auth 文件、而非未签名 claim。
-        if is_chatgpt_access_token(token) && token_matches_active_chatgpt(token) {
+        // [MOC-189] relay 模式活动 `~/.codex/auth.json` 是真实 chatgpt,Codex 的**模型请求**
+        // 发的是 chatgpt access_token(JWT,**不是** cas_ gateway key);放行让 `decide_provider`
+        // 按 active_provider 转发到第三方 provider(用 provider 自己的 key,GPT JWT 不出本机、
+        // 被 `forward::is_strip_on_forward` 剥掉)。
+        //
+        // 这里**只验形状**(chatgpt JWT),**不再**要求逐字匹配本地 auth.json(放宽 MOC-124 SEC-1):
+        // - 鉴权的真实边界是 proxy 只绑 `127.0.0.1`(`proxy_runner.rs`)+ apikey 模式的 cas_ 兜底。
+        //   能连 loopback 又能伪造 chatgpt 形状 JWT 的本机进程,本就能直接读 auth.json 拿真 token,
+        //   逐字匹配挡不住该威胁、属冗余门槛。
+        // - 旧的逐字匹配把「第三方对话可用性」错误绑死在 ChatGPT token 匹配状态上:token 轮换竞态 /
+        //   `CODEX_HOME` 读串 / 未真正登 ChatGPT 都会让模型请求 401 → Codex WS idle timeout → 对话
+        //   卡死。而 GPT JWT 功能上只服务 `/backend-api/*` 透传,坏了应只影响 plugins/账号,不该拖垮对话。
+        if is_chatgpt_access_token(token) {
             return Ok(());
         }
         Err(ResolveError::Unauthorized)
@@ -350,33 +354,6 @@ fn is_chatgpt_access_token(token: &str) -> bool {
         .and_then(|a| a.get("chatgpt_account_id"))
         .and_then(serde_json::Value::as_str)
         .is_some_and(|s| !s.trim().is_empty())
-}
-
-/// [connector P1 review] relay 放行的安全锚:incoming token 必须**逐字 == 本地活动
-/// `auth.json` 里 Codex 真在用的 `tokens.access_token`。仅验 JWT claim
-/// ([`is_chatgpt_access_token`])挡不住自造的未签名 chatgpt 形状 JWT —— proxy 无 OpenAI
-/// 公钥、无法验签名,故改以「本地真 token 比对」作为身份证明:能发出 == 本地 access_token
-/// 的请求,等于已持有 auth.json,同样能拿 config 里的 cas_ gateway key,门槛相同;自造 token
-/// 不匹配即拒。**实时读盘**:relay 下 transfer 不刷新、Codex 自刷 auth.json,缓存/构造时传
-/// 会 stale 拒掉刚刷新的真 token。proxy 不依赖 codex_integration,按 `CODEX_HOME`(优先)/
-/// `~/.codex` 自拼路径读;读失败 / 非 chatgpt / 不匹配 → false(回退到只认 cas_)。
-fn token_matches_active_chatgpt(token: &str) -> bool {
-    let base = std::env::var_os("CODEX_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")));
-    let Some(path) = base.map(|b| b.join("auth.json")) else {
-        return false;
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return false;
-    };
-    v.get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|active| !active.is_empty() && active == token)
 }
 
 /// 让裸 Resolver 可装进 `Arc<dyn ProviderResolver>`(给 ProxyState 共享用).
@@ -536,31 +513,21 @@ mod tests {
         format!("eyJhbGciOiJub25lIn0.{p}.sig")
     }
 
-    /// [MOC-104 relay / connector P1] relay 放行的 chatgpt token 必须**逐字 == 本地活动
-    /// auth.json 的 access_token**,而非任意带 chatgpt_account_id claim 的 JWT。设临时
-    /// CODEX_HOME + 写活动 auth.json,覆盖:① 本地真 token 放行 ② cas_ 仍放行 ③ 自造
-    /// chatgpt JWT(claim 合法但 ≠ 本地 token)拒 ④ 随机乱串拒。
+    /// [MOC-189] relay 放行**任意 chatgpt 形状的 JWT**,不再要求逐字匹配本地 auth.json。
+    /// 鉴权边界 = localhost 绑定 + cas_ 兜底;放宽逐字匹配是为了让「第三方对话可用性」不再被
+    /// ChatGPT token 轮换 / `CODEX_HOME` 读串 / 未登 ChatGPT 拖死(模型请求 401 → WS idle
+    /// timeout)。覆盖:① chatgpt 形状 JWT 放行 ② cas_ 仍放行 ③ 另一 account_id 的 chatgpt JWT
+    /// 同样放行(不再匹配本地)④ 非 JWT 乱串拒。
     #[test]
-    fn relay_accepts_only_local_active_chatgpt_token() {
+    fn relay_accepts_any_chatgpt_shaped_jwt() {
         use base64::Engine;
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let active = chatgpt_jwt(); // 本地活动 auth.json 里 Codex 真在用的 token
-        let mut f = std::fs::File::create(dir.path().join("auth.json")).unwrap();
-        write!(
-            f,
-            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{active}","refresh_token":"rt"}}}}"#
-        )
-        .unwrap();
-        std::env::set_var("CODEX_HOME", dir.path());
-
         let r = StaticResolver::new(
             Some("cas-secret".into()),
             vec![provider("openai", "https://up", "sk-1")],
             Some("openai".into()),
         );
-        // ① 本地活动 chatgpt token → 放行,decide_provider 走 active_provider
-        let auth = format!("Bearer {active}");
+        // ① chatgpt 形状 JWT → 放行,decide_provider 走 active_provider
+        let auth = format!("Bearer {}", chatgpt_jwt());
         let p = parts_with(&[("authorization", auth.as_str())]);
         let res = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();
         assert_eq!(res.provider_id, "openai");
@@ -568,30 +535,38 @@ mod tests {
         // ② cas_ gateway key 仍放行(exact match 分支不变)
         let p_cas = parts_with(&[("authorization", "Bearer cas-secret")]);
         assert!(r.resolve(&p_cas, b"{}").is_ok());
-        // ③ 自造 chatgpt JWT(claim 合法但 ≠ 本地 access_token)→ 拒(connector P1:挡未签名伪造)
-        let forged_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        // ③ 另一个 account_id 的 chatgpt JWT → 同样放行(MOC-189:不再要求匹配本地 auth.json)
+        let other_payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(
-                &serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"acc_evil"}}),
+                &serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"acc_other"}}),
             )
             .unwrap(),
         );
-        let forged = format!("Bearer eyJhbGciOiJub25lIn0.{forged_payload}.sig");
-        let pf = parts_with(&[("authorization", forged.as_str())]);
+        let other = format!("Bearer eyJhbGciOiJub25lIn0.{other_payload}.sig");
+        let po = parts_with(&[("authorization", other.as_str())]);
         assert!(
-            matches!(
-                r.resolve(&pf, b"{}").unwrap_err(),
-                ResolveError::Unauthorized
-            ),
-            "自造 chatgpt JWT ≠ 本地活动 token 应拒"
+            r.resolve(&po, b"{}").is_ok(),
+            "任意 chatgpt 形状 JWT 都应放行(localhost + cas_ 已是鉴权边界)"
         );
-        // ④ 随机乱串 → 拒
+        // ④ 非 JWT 乱串 → 拒
         let pr = parts_with(&[("authorization", "Bearer random-junk")]);
         assert!(matches!(
             r.resolve(&pr, b"{}").unwrap_err(),
             ResolveError::Unauthorized
         ));
-
-        std::env::remove_var("CODEX_HOME");
+        // ⑤ 3 段 JWT 但 payload 无 chatgpt_account_id claim → 拒(pin 住 is_chatgpt_access_token
+        //    的 claim 校验:gate 放宽后这是唯一剩下的判别逻辑,防未来回归成"任意 3 段 token 放行")
+        let no_claim_payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"sub\":\"x\"}");
+        let no_claim = format!("Bearer eyJhbGciOiJub25lIn0.{no_claim_payload}.sig");
+        let pnc = parts_with(&[("authorization", no_claim.as_str())]);
+        assert!(
+            matches!(
+                r.resolve(&pnc, b"{}").unwrap_err(),
+                ResolveError::Unauthorized
+            ),
+            "缺 chatgpt_account_id 的 3 段 JWT 不算 chatgpt token,应拒"
+        );
     }
 
     #[test]
