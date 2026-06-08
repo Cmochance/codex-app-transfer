@@ -386,9 +386,14 @@ fn build_messages_from_input(
         .unwrap_or_default();
     // 当前轮转换后产出的 role:tool message 数 —— 随返回带出, 供 recompress 定位末尾 N 个。在这里数(而非
     // 上层再转换一次)避免重复触发 keep_recent_tool_output_full 的 artifact 存储副作用(chatgpt-codex P2)。
+    // 当前轮的 tool 是 current_messages **末尾连续**的那一组(被任意非 tool message 隔断之前的更早
+    // tool 属历史)。stateless client 无 previous_response_id、把完整 transcript 直接塞进 input 时,
+    // 只有最新一组该保留全文, 不是数组里所有 function_call_output —— 否则历史 web_fetch 各留 100k 累积
+    // 撑爆, 绕过 P1(chatgpt-codex P2)。
     let current_tool_count = current_messages
         .iter()
-        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .rev()
+        .take_while(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
         .count();
     messages.extend(current_messages);
     let merge_result = merge_messages_with_previous_response(messages, body, session_cache)?;

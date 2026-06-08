@@ -2894,6 +2894,43 @@ fn keep_current_round_id_less_output_preserved() {
 }
 
 #[test]
+fn stateless_full_transcript_only_keeps_latest_tool_group_full() {
+    // chatgpt-codex P2: stateless client(无 previous_response_id)把完整 transcript 塞进 input。只有
+    // 末尾连续的最新一组 tool 该保留全文, 更早的(被非 tool message 隔断)历史 tool 应压缩 —— 否则历史
+    // web_fetch 各留 100k 累积撑爆、绕过 P1。
+    let big_old = "OLDDATA ".repeat(1000); // ~8k > inline
+    let big_new = "NEWDATA ".repeat(1000);
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call", "call_id": "fc_old", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "call_id": "fc_old", "output": big_old.clone() },
+            { "type": "message", "role": "assistant", "content": "中间回复, 隔断两组 tool" },
+            { "type": "function_call", "call_id": "fc_new", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "call_id": "fc_new", "output": big_new.clone() }
+        ]
+    }));
+    let messages = out["messages"].as_array().unwrap();
+    let content_of = |cid: &str| {
+        messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == cid)
+            .unwrap_or_else(|| panic!("缺 {cid} tool 消息"))["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mark = "[Tool output stored outside model context]";
+    assert!(
+        content_of("fc_old").contains(mark),
+        "stateless 历史一组 tool(被 assistant 隔断)应压缩"
+    );
+    assert!(
+        !content_of("fc_new").contains(mark),
+        "stateless 末尾最新一组 tool 应保留全文"
+    );
+}
+
+#[test]
 fn recompress_keeps_all_current_round_tools_full() {
     // MOC-190: 模型一轮调多个工具 —— 当前轮 c_a + c_b(messages 末尾 2 个 tool), 它们**都**该保留全文
     // (不是只留 1 条); cached 的 c_old 压缩。专防「一轮多 tool 只留最新 1 条」缺陷(read_url_local + web_fetch 同轮)。
