@@ -1632,12 +1632,20 @@ fn bytes_preview(body: &Bytes, max: usize) -> String {
     }
 }
 
+/// [MOC-189] `/responses` 的 OPTIONS 预检响应。
+///
+/// **不广播任何 `Access-Control-Allow-*`** —— `/responses` 没有任何合法的跨源浏览器调用方:
+/// Codex 模型请求走原生 core 进程(不发 CORS 预检),web_fetch 的 headless Chrome 只 GET
+/// 外部站点、内容经 CDP/stdio 回本地,都**不**向 loopback 的 `/responses` 发浏览器跨源请求。
+///
+/// 旧实现返 `allow-origin:*` + `allow-headers:*`,等于对任意网站开放跨源 POST。配合 gate 放宽
+/// (只验 chatgpt JWT 形状,见 [`crate::resolver`]),会让安全寄生在"现代浏览器恰好不让 `*`
+/// 覆盖 `Authorization` 头"这个实现细节上 —— 太脆。改为返回不含任何 CORS 授权头的 204:浏览器
+/// 拿不到跨源授权 → 恶意网页无法借用户浏览器把带伪造 JWT 的跨源 POST 打到本机 proxy。原生
+/// 客户端(Codex core / web_fetch 摘要请求)发的是 POST、不走预检,零影响。
 fn cors_preflight_response() -> Result<Response, axum::http::Error> {
     Response::builder()
-        .status(StatusCode::OK)
-        .header("access-control-allow-origin", "*")
-        .header("access-control-allow-methods", "POST, OPTIONS")
-        .header("access-control-allow-headers", "*")
+        .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
 }
 
