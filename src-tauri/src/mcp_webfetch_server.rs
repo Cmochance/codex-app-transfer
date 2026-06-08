@@ -1682,7 +1682,16 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let mut cut: String = s.chars().take(max).collect();
+    // 给截断提示留出空间, 保证「正文 + 提示」总长 ≤ max —— 否则正好卡满上限的页会因这点溢出, 被上层
+    // adapter 的 keep-full 上限(TOOL_OUTPUT_KEEP_FULL_MAX_CHARS, 同为 100k)判超限、把整条当前轮全文
+    // bound 掉(chatgpt-codex P2)。max 极小时(单测)放不下提示, 退化为不预留。
+    const NOTICE_RESERVE: usize = 160;
+    let body_budget = if max > NOTICE_RESERVE * 2 {
+        max - NOTICE_RESERVE
+    } else {
+        max
+    };
+    let mut cut: String = s.chars().take(body_budget).collect();
     // 退到最后一个换行边界(就近, 浪费不超过 1/4 预算时才退)。
     if let Some(i) = cut.rfind('\n') {
         if i >= cut.len() * 3 / 4 {
