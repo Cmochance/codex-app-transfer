@@ -100,13 +100,13 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     let history_lost = merge_result.history_lost;
     let mut messages = merge_result.messages;
     // MOC-190: merge(cached history + 当前)后统一重新压缩 tool 输出。当前轮(本次 input)新产生的**所有**
-    // function_call_output 保留全文(模型一轮可能调多个工具, 每条都该全文进 LLM); cached 历史轮的旧 tool
-    // 输出(call_id 不在当前集合)压缩。compact / 本轮无新 tool → 集合为空 → 全压缩(P1 防累积 + P2 防无新
-    // tool 时漏压)。用 extract_input_items 取 call_id, 同时兼容单 object input(P2-3)。
-    let current_tool_ids: std::collections::HashSet<String> = if COMPACT_NO_KEEP_RECENT
-        .with(|c| c.get())
-    {
-        std::collections::HashSet::new()
+    // function_call_output 都保留全文(模型一轮可能调多个工具, 每条都该全文进 LLM); cached 历史轮的旧
+    // tool 输出压缩。**按位置**区分而非 call_id: merge 把 cached 拼在前、当前轮在后, 故当前轮的 tool
+    // message 必是末尾 N 个(N = 本次 input 的 function_call_output 数)。位置法兼容 ID-less / 别名的
+    // function_call_output —— 它们的 tool_call_id 由后续 repair_tool_call_ids 补、recompress 此刻还
+    // 没有(chatgpt-codex P2)。compact / 本轮无新 tool → N=0 → 全压缩(P1 防累积 + P2 防无新 tool 漏压)。
+    let current_tool_count: usize = if COMPACT_NO_KEEP_RECENT.with(|c| c.get()) {
+        0
     } else {
         input
             .get("input")
@@ -114,18 +114,9 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
             .unwrap_or_default()
             .iter()
             .filter(|it| it.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
-            // 与 input_item_to_messages 取 call_id 一致: 可用 tool_call_id / id 别名(chatgpt-codex P2);
-            // 只认 call_id 会让用别名的当前轮 tool 被误当历史压缩。
-            .filter_map(|it| {
-                it.get("call_id")
-                    .or_else(|| it.get("tool_call_id"))
-                    .or_else(|| it.get("id"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-            .collect()
+            .count()
     };
-    recompress_stale_full_tool_outputs(&mut messages, &current_tool_ids);
+    recompress_stale_full_tool_outputs(&mut messages, current_tool_count);
     messages = merge_consecutive_user_messages(messages);
     messages = merge_consecutive_assistant_messages(messages);
     repair_tool_call_ids(
@@ -986,23 +977,29 @@ fn extract_tool_search_output_tool_names(item: &serde_json::Map<String, Value>) 
 /// MOC-190 P1: merge(拼接 cached history + 当前)后统一收口 —— 只保留全局最新 1 条 tool message
 /// 全文, 更早的若超 inline 阈值且尚未压缩(不含外置标记)则重新 bound。覆盖 session cache 里之前
 /// 作为 latest 存入的全文(它们在当轮已非最新, 不该再占满上下文);已 bound 的跳过防嵌套。
-fn recompress_stale_full_tool_outputs(
-    messages: &mut [Value],
-    current_tool_ids: &std::collections::HashSet<String>,
-) {
-    // current_tool_ids = 当前轮(本次 input)新产生的 function_call_output 的 call_id 集合。在集合里的
-    // 保留全文(模型一轮调多个工具时每条都该全文); 不在集合里的(= cached 历史轮的旧 tool 输出)若超阈值
-    // 且未压缩则重新 bound。空集(compact / 本轮无新 tool)→ 全部历史 tool 压缩。
-    for m in messages.iter_mut() {
+fn recompress_stale_full_tool_outputs(messages: &mut [Value], keep_recent_count: usize) {
+    // keep_recent_count = 当前轮(本次 input)新产生的 function_call_output 数。merge 把 cached 拼在前、
+    // 当前轮在后, 故当前轮的 tool message 是**末尾 keep_recent_count 个** —— 这些保留全文(模型一轮调多
+    // 工具时每条都该全文); 更靠前的(cached 历史)若超阈值且未压缩则重新 bound。按位置而非 call_id, 兼容
+    // ID-less / 别名(recompress 在 repair_tool_call_ids 前跑, 此刻 tool_call_id 可能还没补)。N=0 → 全压缩。
+    let tool_positions: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .map(|(i, _)| i)
+        .collect();
+    let keep: std::collections::HashSet<usize> = tool_positions
+        .iter()
+        .rev()
+        .take(keep_recent_count)
+        .copied()
+        .collect();
+    for (i, m) in messages.iter_mut().enumerate() {
+        if keep.contains(&i) {
+            continue; // 当前轮的(末尾 N 个), 保留全文
+        }
         if m.get("role").and_then(|v| v.as_str()) != Some("tool") {
             continue;
-        }
-        let in_current = m
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .is_some_and(|cid| current_tool_ids.contains(cid));
-        if in_current {
-            continue; // 当前轮新产生的, 保留全文
         }
         let Some(content) = m.get("content").and_then(|v| v.as_str()) else {
             continue;

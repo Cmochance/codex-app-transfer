@@ -2848,8 +2848,8 @@ fn recompress_keeps_current_round_compresses_cached() {
         json!({ "role": "assistant", "content": "..." }),
         json!({ "role": "tool", "tool_call_id": "c_new", "content": big.clone() }),
     ];
-    let current: std::collections::HashSet<String> = ["c_new".to_string()].into_iter().collect();
-    recompress_stale_full_tool_outputs(&mut messages, &current);
+    // 当前轮只有 c_new(messages 末尾的 tool message)→ keep_recent_count=1。
+    recompress_stale_full_tool_outputs(&mut messages, 1);
     let c_old = messages[0]["content"].as_str().unwrap();
     let c_new = messages[2]["content"].as_str().unwrap();
     assert!(
@@ -2862,23 +2862,49 @@ fn recompress_keeps_current_round_compresses_cached() {
     );
     // 幂等: 再跑一次不变(已压缩的含外置标记会被跳过)。
     let snapshot = messages.clone();
-    recompress_stale_full_tool_outputs(&mut messages, &current);
+    recompress_stale_full_tool_outputs(&mut messages, 1);
     assert_eq!(messages, snapshot, "幂等: 已压缩的不应再变");
 }
 
 #[test]
+fn keep_current_round_id_less_output_preserved() {
+    // chatgpt-codex P2: 当前轮 function_call_output 没有自己的 call_id, 靠前一个 function_call 配对
+    // (repair_tool_call_ids 后补 tool_call_id)。recompress 在 repair 之前跑、按位置(末尾 N 个)保留,
+    // 不依赖此刻还没有的 ID —— 否则 ID-less 的当前轮 tool 会被误当历史压缩。
+    let big = "DATA ".repeat(2000);
+    let out = convert(json!({
+        "input": [
+            { "type": "function_call", "call_id": "fc1", "name": "exec", "arguments": "{}" },
+            { "type": "function_call_output", "output": big.clone() }
+        ]
+    }));
+    let tool = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("应有 tool 消息");
+    assert!(
+        !tool["content"]
+            .as_str()
+            .unwrap()
+            .contains("[Tool output stored outside model context]"),
+        "ID-less 的当前轮 tool 输出应保留全文(按位置识别, 不依赖未补的 ID)"
+    );
+}
+
+#[test]
 fn recompress_keeps_all_current_round_tools_full() {
-    // MOC-190: 模型一轮调多个工具 —— current 集合含 c_a + c_b, 它们**都**该保留全文(不是只留 1 条);
-    // cached 的 c_old 压缩。专防「一轮多 tool 只留最新 1 条」缺陷(read_url_local + web_fetch 同轮)。
+    // MOC-190: 模型一轮调多个工具 —— 当前轮 c_a + c_b(messages 末尾 2 个 tool), 它们**都**该保留全文
+    // (不是只留 1 条); cached 的 c_old 压缩。专防「一轮多 tool 只留最新 1 条」缺陷(read_url_local + web_fetch 同轮)。
     let big = "DATA ".repeat(2000);
     let mut messages = vec![
         json!({ "role": "tool", "tool_call_id": "c_old", "content": big.clone() }),
         json!({ "role": "tool", "tool_call_id": "c_a", "content": big.clone() }),
         json!({ "role": "tool", "tool_call_id": "c_b", "content": big.clone() }),
     ];
-    let current: std::collections::HashSet<String> =
-        ["c_a".to_string(), "c_b".to_string()].into_iter().collect();
-    recompress_stale_full_tool_outputs(&mut messages, &current);
+    // 当前轮 2 个 tool(末尾 2 个)→ keep_recent_count=2, 都保留全文。
+    recompress_stale_full_tool_outputs(&mut messages, 2);
     let mark = "[Tool output stored outside model context]";
     assert!(
         messages[0]["content"].as_str().unwrap().contains(mark),
@@ -2896,15 +2922,15 @@ fn recompress_keeps_all_current_round_tools_full() {
 
 #[test]
 fn recompress_no_new_tool_compresses_even_latest_cached() {
-    // MOC-190 P2: 本轮没新 function_call_output(current 集合为空), 即便最后一条 tool 整条来自
+    // MOC-190 P2: 本轮没新 function_call_output(keep_recent_count=0), 即便最后一条 tool 整条来自
     // cached history, 也要压缩 —— 否则同一历史页每个 follow-up 都全尺寸重发。
     let big = "DATA ".repeat(2000); // ~10k > inline 阈值
     let mut messages = vec![
         json!({ "role": "tool", "tool_call_id": "c_cached", "content": big.clone() }),
         json!({ "role": "user", "content": "普通问题, 本轮没抓新页" }),
     ];
-    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
-    recompress_stale_full_tool_outputs(&mut messages, &empty);
+    // 本轮没新 tool → keep_recent_count=0 → 全压缩。
+    recompress_stale_full_tool_outputs(&mut messages, 0);
     let c = messages[0]["content"].as_str().unwrap();
     assert!(
         c.contains("[Tool output stored outside model context]"),
