@@ -30,8 +30,8 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, TRUE, WPARAM};
+use windows::core::{BOOL, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
 };
@@ -196,7 +196,7 @@ struct CloseCtx<'a> {
     posted: usize,
 }
 
-/// EnumWindows 回调:窗口属于 Codex 进程则投 WM_CLOSE。返回 TRUE 继续遍历。
+/// EnumWindows 回调:窗口属于 Codex 进程则投 WM_CLOSE。返回 BOOL(1)(真)继续遍历。
 unsafe extern "system" fn enum_close_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let ctx = &mut *(lparam.0 as *mut CloseCtx);
     let mut pid: u32 = 0;
@@ -207,7 +207,7 @@ unsafe extern "system" fn enum_close_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     {
         ctx.posted += 1;
     }
-    TRUE
+    BOOL(1)
 }
 
 /// Codex Desktop 的 Windows 进程名(与 `process.rs::WINDOWS_PROCESS_NAME` 一致)。
