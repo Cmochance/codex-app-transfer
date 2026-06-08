@@ -108,12 +108,16 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     let current_tool_count: usize = if COMPACT_NO_KEEP_RECENT.with(|c| c.get()) {
         0
     } else {
+        // 数当前轮(本次 input)转换后**实际产出多少 role:tool message** —— 不只 function_call_output,
+        // 还含 tool_search_output 等其它转成 tool 的 item。必须与 recompress 的 tool_positions(数所有
+        // tool message)同口径, 否则末尾 N 个会取错、把真正的 function_call_output 漏在外面被压缩
+        // (chatgpt-codex P2)。复用 input_field_to_messages 的转换结果计数(current input 通常很小)。
         input
             .get("input")
-            .map(extract_input_items)
+            .map(input_field_to_messages)
             .unwrap_or_default()
             .iter()
-            .filter(|it| it.get("type").and_then(|v| v.as_str()) == Some("function_call_output"))
+            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
             .count()
     };
     recompress_stale_full_tool_outputs(&mut messages, current_tool_count);
