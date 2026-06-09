@@ -2668,7 +2668,7 @@
       statusEl.textContent = tFmt("settings.residualScanStatusError", {
         error: error?.message || String(error),
       });
-      return;
+      return null;
     }
     const count = (report?.polluted || []).length;
     if (count === 0) {
@@ -2676,11 +2676,12 @@
       statusEl.textContent = report?.transferCurrentlyApplied
         ? t("settings.residualScanStatusCleanWhileApplied")
         : t("settings.residualScanStatusClean");
-      return;
+      return report;
     }
     statusEl.classList.add("residual-dirty");
     statusEl.textContent = tFmt("settings.residualScanStatusDirty", { count });
     if (repairBtn) repairBtn.hidden = false;
+    return report;
   }
 
   function formatResidualPreview(polluted) {
@@ -2739,6 +2740,26 @@
       }));
     } finally {
       await refreshResidualScanStatus();
+    }
+  }
+
+  // 只读查看:复用 scan(dry,GET)结果把每个污染文件的残留字段列进 previewEl,
+  // 不弹 confirm、不写盘(对比 handleRepairResidual 会清除)。
+  async function handleShowResidualFields() {
+    const previewEl = $("#residualScanPreview");
+    const report = await refreshResidualScanStatus();
+    if (!report) return; // scan 出错 / 无 statusEl,状态文本已反映
+    if (!report.polluted?.length) {
+      if (previewEl) {
+        previewEl.textContent = t("settings.residualScanShowFieldsClean");
+        previewEl.hidden = false;
+      }
+      return;
+    }
+    const preview = formatResidualPreview(report.polluted);
+    if (previewEl) {
+      previewEl.textContent = `${t("settings.residualScanPreviewTitle")}\n\n${preview}`;
+      previewEl.hidden = false;
     }
   }
 
@@ -3710,6 +3731,11 @@
 
       if (action === "rescan-residual") {
         await refreshResidualScanStatus();
+        return;
+      }
+
+      if (action === "show-residual-fields") {
+        await handleShowResidualFields();
         return;
       }
 
