@@ -326,7 +326,7 @@ fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
 
 /// **规则:`Update File` 目标是空文件 → `Delete File + Add File`**(prompt gotcha #3,无损)。
 /// `*** Update File:` 无法作用于空文件(Codex 报 `cannot operate on a completely empty file`)。
-/// 当目标文件存在且**为空**(全空白)、且 Update body 是**纯 `+` 行**(纯写内容,无 `-`/context 可
+/// 当目标文件存在且**为空**(真正 0 字节,非纯空白)、且 Update body 是**纯 `+` 行**(纯写内容,无 `-`/context 可
 /// 匹配)时,转成 `*** Delete File: X` + `*** Add File: X` + 原 `+` body(空文件无内容可丢 → 无损)。
 /// body 含 `-`/context(模型在空文件上写了匹配行,本就矛盾)/ 含 Move(交给 empty-move 规则)→ 不动。需 `cwd`。
 fn recover_update_empty_file(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
@@ -343,8 +343,11 @@ fn recover_update_empty_file(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repai
     while i < lines.len() {
         if let Some(path) = lines[i].strip_prefix("*** Update File: ") {
             let p = path.trim();
+            // 只认**真正 0 字节**(Codex 仅对 `completely empty file` 报错;纯空白文件仍是可读内容、
+            // 能正常 Update)。用 `c.trim().is_empty()` 会把纯空白文件也转 Delete+Add → 丢掉那些
+            // 空白字节(破坏性,codex-connector #435 P2)。
             let is_empty = std::fs::read_to_string(resolve_path(p, cwd))
-                .map(|c| c.trim().is_empty())
+                .map(|c| c.is_empty())
                 .unwrap_or(false);
             if is_empty {
                 let body_start = i + 1;
@@ -1163,6 +1166,17 @@ mod tests {
         assert!(out.contains("+line1") && out.contains("+line2"));
         assert!(!out.contains("*** Update File:"), "Update 已转换");
         assert_eq!(reps[0].kind, "repaired");
+    }
+
+    #[test]
+    fn update_whitespace_only_file_not_converted() {
+        // codex-connector #435 P2:纯空白文件(非 0 字节)不算空 → 不转 Delete+Add(否则丢空白字节)。
+        let (dir, name) = tmp_file("ws.txt", "  \n\t\n");
+        let cwd = dir.path().to_str().unwrap();
+        let v4a = format!("*** Begin Patch\n*** Update File: {name}\n+line1\n*** End Patch\n");
+        let (out, reps) = recover_update_empty_file(&v4a, Some(cwd));
+        assert_eq!(out, v4a, "纯空白文件 Update 不应转 Delete+Add:\n{out}");
+        assert!(reps.is_empty());
     }
 
     #[test]
