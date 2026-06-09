@@ -410,11 +410,22 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
         if let Some(old) = lines[i].strip_prefix("*** Update File: ") {
             if i + 1 < lines.len() {
                 if let Some(new) = lines[i + 1].strip_prefix("*** Move to: ") {
-                    // 看 Move 之后、下一个控制行(`*** `)之前有没有 hunk 内容行。
+                    // 看 Move 之后、下一个**文件操作**控制行之前有没有 hunk 内容行。
+                    // 注:`*** End of File` 是文档化的 **hunk 内标记**(prompt RENAME/MOVE 段),不是
+                    // section 边界 —— 不能停在它(否则 rename+EOF 追加会被误判成空 rename、转成丢内容的
+                    // Delete+Add,codex-connector #435 P1)。它本身即表示「有 hunk」,继续往后扫。
                     let mut j = i + 2;
                     let mut has_hunk = false;
-                    while j < lines.len() && !lines[j].starts_with("*** ") {
+                    while j < lines.len() {
                         let t = lines[j];
+                        if t.trim_end() == "*** End of File" {
+                            has_hunk = true;
+                            j += 1;
+                            continue;
+                        }
+                        if t.starts_with("*** ") {
+                            break; // 真正的下一个文件操作 / End Patch 边界
+                        }
                         if t.starts_with('+')
                             || t.starts_with('-')
                             || t.starts_with(' ')
@@ -1101,6 +1112,20 @@ mod tests {
         let (out, reps) = recover_empty_move(&v4a, Some(cwd));
         assert_eq!(out, v4a, "有 hunk 的 Move 不动");
         assert!(reps.is_empty());
+    }
+
+    #[test]
+    fn rename_with_eof_marker_hunk_not_treated_as_empty() {
+        // codex-connector #435 P1:rename + `*** End of File` 追加 hunk 不能被当空 rename(否则转成
+        // 丢内容的 Delete+Add)→ 识别为有 hunk → 透过不转。
+        let (dir, name) = tmp_file("eof_old.md", "a\n");
+        let cwd = dir.path().to_str().unwrap();
+        let v4a = format!(
+            "*** Begin Patch\n*** Update File: {name}\n*** Move to: eof_new.md\n*** End of File\n+tail\n*** End Patch\n"
+        );
+        let (out, reps) = recover_empty_move(&v4a, Some(cwd));
+        assert_eq!(out, v4a, "含 EOF hunk 的 rename 应透过不转:\n{out}");
+        assert!(reps.is_empty(), "{:?}", reps);
     }
 
     #[test]
