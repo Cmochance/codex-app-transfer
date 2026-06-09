@@ -46,6 +46,17 @@ pub enum TraceKind {
     /// 请求经 proxy 透传 chatgpt.com,记 inbound/outbound/response(header 用 cookie 友好脱敏、
     /// 保留 set-cookie 的 Domain/Path 等属性)定位 enroll/server 404 死循环等会话连续性问题。
     ChatgptBackend,
+    /// apply_patch 转换决策埋点:adapter(chat / gemini_native)把上游回的 apply_patch 工具调用
+    /// 重打包成 Codex `custom_tool_call` wire 时,逐 call 记录「原始 args → 提取出的 V4A →
+    /// 截断/语法校验 verdict → completed/incomplete 决策」。forward-trace 只见 raw 协议体,
+    /// 看不到这些**中间决策**,故单列一类供 apply_patch 模块精修(extract/repair/validate 迭代)。
+    /// adapter 不能反向依赖 proxy(循环依赖),故经 [`crate::diagnostics`] 注册的 sink 回推本 store。
+    ApplyPatch,
+    /// proxy → Codex 的**转换后响应 SSE**(MOC-194):forward-trace 的 `response` 是上游 raw,
+    /// 这里是 adapter `transform_response_stream` 转换后、真正发给 Codex 的字节。用于逐字节核对
+    /// 转换输出是否完整(如每个 apply_patch 的 `output_item.added/done` 是否都发到了 Codex)。
+    /// 由 forward.rs 的 tee 流 Drop 时落库,gate 同 forward-trace(默认关)。
+    CodexResponse,
 }
 
 /// store 里的一条记录。`value` 是**已脱敏**的完整 JSON 对象(forward-trace 即

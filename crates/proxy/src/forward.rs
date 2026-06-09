@@ -32,8 +32,9 @@ use futures_util::TryStreamExt;
 use thiserror::Error;
 
 use crate::diagnostics::{
-    forward_trace_enabled, write_chatgpt_backend_trace, write_forward_trace_jsonl,
-    write_upstream_error_bundle, ForwardTraceInput, UpstreamErrorBundleInput,
+    forward_trace_enabled, write_chatgpt_backend_trace, write_codex_response_trace,
+    write_forward_trace_jsonl, write_upstream_error_bundle, ForwardTraceInput,
+    UpstreamErrorBundleInput,
 };
 use crate::resolver::{AuthScheme, ResolveError, ResolvedProvider, SharedResolver};
 use crate::telemetry::proxy_telemetry;
@@ -164,14 +165,36 @@ pub enum ForwardError {
     },
 }
 
+/// [MOC-194] 把 error 的 `source()` 链拼成 `top → cause1 → cause2 …`,跳过已出现在 `top` 里的
+/// 段(thiserror `{0}` 已把直接 source 的 Display 嵌进 top → 避免重复)。用于诊断上游传输层错误
+/// 的**真因**(reqwest Display 泛化、真因藏在 source)。
+fn build_error_cause_chain(err: &dyn std::error::Error, top: &str) -> String {
+    let mut out = top.to_string();
+    let mut src = err.source();
+    while let Some(e) = src {
+        let es = e.to_string();
+        if !out.contains(&es) {
+            out.push_str(" → ");
+            out.push_str(&es);
+        }
+        src = e.source();
+    }
+    out
+}
+
 impl axum::response::IntoResponse for ForwardError {
     fn into_response(self) -> Response {
         let message = self.to_string();
         let telemetry = proxy_telemetry();
         telemetry.stats.record(false);
+        // [MOC-194] 追加底层 cause 链:reqwest 的 Display(如 `error sending request for url`)**不含**
+        // source,真因(`connect timed out` / `connection reset` / `dns error` / TLS 等)在 source 链里。
+        // 走 std::error::Error::source 逐层拼,跳过已含在 message 里的(避免重复 reqwest Display),
+        // 让上游连不上/超时这类错误一眼看清具体原因(此前只显示泛化的 "error sending request")。
+        let log_message = build_error_cause_chain(&self, &message);
         telemetry
             .logs
-            .add("ERROR", format!("proxy request failed: {message}"));
+            .add("ERROR", format!("proxy request failed: {log_message}"));
 
         // OauthUnavailable 单独走 401 + structured JSON,提示用户重新登录(2026-05-11
         // silent-failure 修)。原版走 502 + plain text "proxy error: invalid header: ..."
@@ -699,11 +722,32 @@ pub async fn forward_handler(
 
     // 8. 把 ResponsePlan 还原成 axum Response
     let mut builder = Response::builder().status(response_plan.status);
+    // [MOC-194] proxy→Codex SSE 抓取:gate 开时 tee 转换后响应(content-type 须在 headers 被 move
+    // 前取)。tee 只 passthrough + 累积,不破流;Drop 时落 `codex_response` trace。
+    let codex_status = response_plan.status.as_u16();
+    let codex_method = parts.method.as_str().to_string();
+    let codex_path = client_path.clone();
+    let codex_ct = response_plan
+        .headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let headers_out = builder
         .headers_mut()
         .ok_or_else(|| ForwardError::Header("response builder lacks headers".into()))?;
     *headers_out = response_plan.headers;
-    Ok(builder.body(Body::from_stream(response_plan.stream))?)
+    let codex_stream: codex_app_transfer_adapters::ByteStream = if forward_trace_enabled() {
+        Box::pin(CodexRespStream::new(
+            response_plan.stream,
+            codex_method,
+            codex_path,
+            codex_status,
+            codex_ct,
+        ))
+    } else {
+        response_plan.stream
+    };
+    Ok(builder.body(Body::from_stream(codex_stream))?)
 }
 
 /// [MOC-104 relay] relay 模式 `chatgpt_base_url=<proxy>/backend-api` 后,Codex 的
@@ -878,6 +922,10 @@ async fn passthrough_chatgpt_backend(
 /// forward-trace(MOC-89)成功路径上限:tee 的响应体最多缓冲这么多字节(与 diagnostics
 /// 的 body cap 一致;`redact_body` 还会再 cap 一次)。仅 gate 开时分配。
 const MAX_TRACE_BODY_BYTES: usize = 256 * 1024;
+/// [MOC-194] codex_response tee 缓冲上限:比 forward 大,以完整逐字节验证大输出的 transfer 转换
+/// (转换后 SSE 常 >256KB)。与 `diagnostics::MAX_CODEX_RESP_BODY_BYTES` 对齐。仅 gate 开 + 仅
+/// codex_response 流分配,普通转发不受影响。
+const MAX_CODEX_RESP_TEE_BYTES: usize = 2 * 1024 * 1024;
 
 /// forward-trace 成功路径在 [`TracedStream`] 里随流携带的 owned 上下文。流走完(Drop)时
 /// 借这些字段 + tee 到的响应体构造 [`ForwardTraceInput`] 写一行 jsonl。仅 gate 开时为
@@ -991,6 +1039,75 @@ impl Drop for TracedStream {
                 // resp_buf 可能被 cap 截断;total_bytes 是 tee 累计真实全长 → 传它修正 truncated_bytes
                 write_trace_from_ctx(&ctx, &self.resp_buf, self.total_bytes);
             }
+        }
+    }
+}
+
+/// [MOC-194] tee **proxy→Codex 转换后响应**:passthrough + 累积(cap [`MAX_TRACE_BODY_BYTES`]),
+/// 流走完(Drop)写一条 `codex_response` trace。仅 gate 开时 wrap(关时不构造、零开销);Drop 再
+/// 查 gate(中途关诊断即停,不留 in-flight 残尾,与 forward-trace 一致)。passthrough 不 await /
+/// 不重排 → 不破流。
+struct CodexRespStream {
+    inner: codex_app_transfer_adapters::ByteStream,
+    method: String,
+    client_path: String,
+    status: u16,
+    content_type: Option<String>,
+    buf: Vec<u8>,
+    total: usize,
+}
+
+impl CodexRespStream {
+    fn new(
+        inner: codex_app_transfer_adapters::ByteStream,
+        method: String,
+        client_path: String,
+        status: u16,
+        content_type: Option<String>,
+    ) -> Self {
+        Self {
+            inner,
+            method,
+            client_path,
+            status,
+            content_type,
+            buf: Vec::new(),
+            total: 0,
+        }
+    }
+}
+
+impl Stream for CodexRespStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.total += chunk.len();
+                if this.buf.len() < MAX_CODEX_RESP_TEE_BYTES {
+                    let room = MAX_CODEX_RESP_TEE_BYTES - this.buf.len();
+                    let take = room.min(chunk.len());
+                    this.buf.extend_from_slice(&chunk[..take]);
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for CodexRespStream {
+    fn drop(&mut self) {
+        // Drop 时重查 gate(中途关诊断即停)。
+        if forward_trace_enabled() {
+            write_codex_response_trace(
+                &self.method,
+                &self.client_path,
+                self.status,
+                self.content_type.as_deref(),
+                &self.buf,
+                self.total,
+            );
         }
     }
 }

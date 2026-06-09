@@ -3741,10 +3741,11 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
         outer.contains("*** Add File: hello.py"),
         "必须包含一个 Add File example:{outer}"
     );
-    // (5) Delete + Add File fallback 兜底(Update 反复失败时)
+    // (5) P3(MOC-194):Update 失败 → 修锚点重试针对性 Update,**不再**诱导整写 fallback(bypass 已删)
     assert!(
-        outer.contains("Delete File + Add File"),
-        "必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{outer}"
+        outer.contains("retry the SAME surgical Update")
+            && !outer.contains("fall back to a Delete File + Add File"),
+        "Update 失败应诱导修锚点重试针对性 Update、不诱导整写 fallback:{outer}"
     );
     // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
     assert!(
@@ -3765,13 +3766,17 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
         outer.contains("ALWAYS use this tool") && outer.contains("NEVER use shell"),
         "outer description 必须强 normative 禁 shell redirect:{outer}"
     );
+    // P3(MOC-194):优先针对性 Update,整文件替换仅限真正需要时(删掉「整写是正确 idiom」的 bypass 诱导)
     assert!(
-        outer.contains("full-file rewrites") && outer.contains("`*** Delete File:"),
-        "outer description 必须明示 large rewrite 走 Delete + Add File:{outer}"
+        outer.contains("PREFER SURGICAL TARGETED EDITS")
+            && outer.contains("Reserve full-file replacement")
+            && outer.contains("`*** Delete File:"),
+        "outer description 必须优先针对性编辑、整写仅限 genuine cases:{outer}"
     );
+    // 空/新文件走 Add File,不再诱导 shell seed
     assert!(
-        outer.contains("narrow exception is seeding a totally empty file"),
-        "outer description 必须 carve-out 空文件 seed 用法:{outer}"
+        outer.contains("brand-new or empty file") && outer.contains("`*** Add File:"),
+        "outer description 必须指引新/空文件用 Add File(非 shell):{outer}"
     );
 
     // 参数描述紧凑版必须含同样核心规则(round 4 修复后)

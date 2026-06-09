@@ -8,6 +8,7 @@
 //! - **响应侧**:Chat SSE → Responses SSE 状态机(text-only)。tool / reasoning /
 //!   function call 留 Stage 3.3。
 
+pub mod apply_patch_preflight;
 pub mod artifact_store;
 // MOC-142: sessions.db 大 data: blob 内容寻址外置(去重),仅 responses 内部用。
 mod blob_store;

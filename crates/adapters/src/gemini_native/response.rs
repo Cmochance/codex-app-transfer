@@ -251,6 +251,11 @@ impl GeminiToResponsesConverter {
         // **build namespace map 必须先于 move**(struct field 顺序里
         // original_request 在前会先 move 走,后面 tool_namespace_map 拿不到 ref)
         let tool_namespace_map = build_tool_namespace_map(original_request.as_ref());
+        // [MOC-194] 每请求记忆 cwd(同 chat 的 with_original_request):带 cwd 的 turn-start 请求
+        // 不产生 apply_patch,只在此记忆才能供后续不带 cwd 的 apply_patch 请求回退。
+        crate::responses::apply_patch_preflight::remember_cwd_from_request(
+            original_request.as_ref(),
+        );
         Self {
             buffer: Vec::new(),
             accumulated_json: String::new(),
@@ -1368,6 +1373,19 @@ impl GeminiToResponsesConverter {
         // close_tool_call;Gemini 不增量,无 interrupted 半截风险,故不走 incomplete)。
         if name == APPLY_PATCH_TOOL_NAME {
             let input = crate::responses::extract_apply_patch_input(&args_json_str);
+            // [apply_patch 中间层] 同 chat 路径:白名单逐条恢复已知格式错误(双边 @@ / 上下文失配 /
+            // 空 Update+Move / 缺信封)。gemini args 一次性完整,无流式截断顾虑 → json_complete=true。
+            let preflight_cwd = crate::responses::apply_patch_preflight::extract_cwd(
+                self.original_request.as_ref(),
+            );
+            let (input, preflight_repairs) =
+                crate::responses::apply_patch_preflight::optimize_patch(
+                    &input,
+                    preflight_cwd.as_deref(),
+                    /* json_complete = */ true,
+                );
+            let preflight_repairs_val =
+                crate::responses::apply_patch_preflight::repairs_to_value(&preflight_repairs);
             let has_begin = input.contains("*** Begin Patch");
             // [MOC-75 review] 两类畸形/截断都 emit `status="incomplete"` 阻止 Codex 执行
             // partial/invalid apply_patch(destructive,partial 执行可能写错目标 —— 对齐
@@ -1449,6 +1467,32 @@ impl GeminiToResponsesConverter {
             } else {
                 "completed"
             };
+            // [apply-patch 诊断页] 记录本次 apply_patch 决策(原始 args → 提取 V4A → 校验/响应级
+            // 截断 verdict → completed/incomplete),供诊断查看器「apply-patch」页精修。gemini args
+            // 一次性结构、无流式 JSON 截断,故 json_truncation 恒 None;finishReason 非 STOP 的响应级
+            // 截断折叠进 v4a_truncation(detail 带 finishReason)。默认关、关时零开销。
+            let gemini_response_trunc = response_truncated.then(|| {
+                format!(
+                    "response-level truncation: finishReason={}",
+                    self.final_finish_reason.as_deref().unwrap_or("(none)")
+                )
+            });
+            crate::core::apply_patch_trace::emit(
+                &crate::core::apply_patch_trace::ApplyPatchTrace {
+                    source: "gemini_native",
+                    model: &self.model,
+                    call_id: &call_id,
+                    fc_id: &item_id,
+                    args_raw: &args_json_str,
+                    input: &input,
+                    interrupted: false,
+                    json_truncation: None,
+                    v4a_truncation: gemini_response_trunc.as_deref(),
+                    v4a_validation: v4a_err.as_ref().map(|e| (e.line, e.message.as_str())),
+                    decision: status,
+                    repairs: (!preflight_repairs.is_empty()).then_some(&preflight_repairs_val),
+                },
+            );
             emit_event(
                 out,
                 &mut self.sequence_number,

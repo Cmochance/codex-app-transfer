@@ -12,7 +12,7 @@
 //!
 //! ## 路由一览
 //! - `GET  /`                  — viewer 单页 HTML(inline CSS/JS,无外部依赖)
-//! - `GET  /api/traces?kind=`  — 历史快照(`kind=forward/mcp/cat_webfetch/chatgpt_backend/all`,缺省全部)
+//! - `GET  /api/traces?kind=`  — 历史快照(`kind=forward/mcp/cat_webfetch/chatgpt_backend/apply_patch/codex_response/all`,缺省全部)
 //! - `GET  /api/stream`        — SSE 实时流(所有类别)
 //! - `POST /api/clear`         — 清空 ring
 //! - `POST /api/ingest`        — **MOC-181**:cat-webfetch 子进程反向上报内部链路;只接受
@@ -30,6 +30,11 @@
 //!   chatgpt.com 的 inbound/outbound/response(MOC-125):header 用 cookie 友好脱敏(保留
 //!   cookie name + set-cookie 属性、打码 value),定位远程控制 WS enroll/server 死循环等
 //!   会话连续性问题。
+//! - **apply-patch** — adapter(chat / gemini_native)把上游 apply_patch 工具调用重打包成
+//!   Codex `custom_tool_call` wire 的**逐 call 决策链**:原始 function args → 提取出的 V4A →
+//!   信封修复 / JSON·V4A 截断检测 / V4A 后验语法校验 verdict → completed/incomplete 决策。
+//!   forward-trace 只见 raw 协议体看不到这些中间决策;adapter 不能依赖本 crate(循环依赖),
+//!   故经 `proxy::server` 注册的 sink 回推 store(`TraceKind::ApplyPatch`)。供精修 apply_patch 模块。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -224,6 +229,8 @@ fn kind_str(k: TraceKind) -> &'static str {
         TraceKind::Mcp => "mcp",
         TraceKind::CatWebfetch => "cat_webfetch",
         TraceKind::ChatgptBackend => "chatgpt_backend",
+        TraceKind::ApplyPatch => "apply_patch",
+        TraceKind::CodexResponse => "codex_response",
     }
 }
 

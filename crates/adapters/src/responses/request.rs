@@ -629,6 +629,11 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
                 .get("output")
                 .cloned()
                 .unwrap_or(Value::String(String::new()));
+            // [apply-patch 诊断页] apply_patch 是 freeform custom 工具,但 Codex 回灌结果**可能**
+            // 用 `function_call_output`(实测 chat 路径)或 `custom_tool_call_output`(下方 arm)。
+            // 两处都挂,内部按 pending call_id 精确配对 —— 只有我们发过的 completed apply_patch call
+            // 才发射,shell 等其它工具的 function_call_output 不会命中。必须在 output_value 被移走前调。
+            crate::core::apply_patch_trace::emit_result(&call_id, &output_value);
             // MOC-190: 最新 1 条 tool 输出保留全文(当前轮全文进 LLM); 历史轮照常压缩。
             let output_str = if keep_full {
                 keep_recent_tool_output_full(Some(call_id.as_str()), output_value)
@@ -787,6 +792,11 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
                 .get("output")
                 .cloned()
                 .unwrap_or(Value::String(String::new()));
+            // [apply-patch 诊断页] 抓 apply_patch 的**结果回灌**(Codex apply 后塞回模型的输出)。
+            // 只在 call_id 命中我们发过的 completed apply_patch call(pending)时发射,故历史重放
+            // 的重复结果 / 非 apply_patch 的 custom 工具结果都不会进 —— 必须在 output_value 被
+            // normalize 移走**之前**调。默认关、关时零开销。
+            crate::core::apply_patch_trace::emit_result(&call_id, &output_value);
             let output_str =
                 normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
             vec![json!({
