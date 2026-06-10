@@ -30,7 +30,8 @@ pub mod snapshot;
 pub mod toml_sync;
 
 pub use apply::{
-    apply_provider, restore_codex_snapshot, restore_codex_state, ApplyConfig, ApplyResult,
+    apply_provider, restore_codex_snapshot, restore_codex_state, restore_stale_codex_sessions,
+    ApplyConfig, ApplyResult,
 };
 pub use auth::{read_auth, write_auth};
 pub use mcp_credentials::{
@@ -48,8 +49,9 @@ pub use residual::{
     RepairedFile, ResidualScanReport,
 };
 pub use snapshot::{
-    gc_trash_older_than, get_snapshot_status, has_snapshot, list_snapshots, snapshot_codex_state,
-    SnapshotInfo, SnapshotManifest, SnapshotStatus, TRASH_RETENTION_DAYS,
+    gc_trash_older_than, get_snapshot_status, has_snapshot, has_stale_active_snapshot,
+    list_snapshots, snapshot_codex_state, SnapshotInfo, SnapshotManifest, SnapshotStatus,
+    TRASH_RETENTION_DAYS,
 };
 pub use toml_sync::sync_root_value;
 

@@ -21,6 +21,10 @@
 //! - **快照 != live**:active snapshot 存在时 live 的 transfer 字段属于当前
 //!   apply 生效状态,不算污染;但任何 snapshot 自己带 transfer 字段都算
 //!   污染 — 因为 snapshot 的语义是"apply 之前的用户原始配置"。
+//! - **双端调用**:`signature_fields_to_strip` 在读取端(`apply.rs`
+//!   `restore_from_snapshot_values`,#270)和**写入端**(`snapshot.rs`
+//!   `snapshot_codex_state`,MOC-197)均被调用 — 写入端在拍快照时对副本
+//!   strip,防止强杀残留的脏 live config 被固化成还原基线。
 
 use crate::paths::CodexPaths;
 use crate::snapshot::has_snapshot;

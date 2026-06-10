@@ -10,6 +10,16 @@
 //!    最早的用户配置。
 //! 4. restore 时基于快照精确还原我们改过的几个 key,**不动**用户在我们运行
 //!    期间手加的内容。
+//! 5. **写入端反投毒**([MOC-197]):拍快照时对 `config.toml` 副本 strip
+//!    transfer 签名字段(#270 `signature_fields_to_strip`)。上一 session 被
+//!    强杀、退出 restore 没跑时 live config 仍带 `openai_base_url`/`sandbox_mode`
+//!    等残留;若原样拍照会把污染固化成"用户原始配置"——写入端 strip 在拍照
+//!    时同步清除(live config 本身不动,apply 接下来就会重写它)。
+//! 6. **stale 快照自愈**([MOC-197]):被 SIGKILL/崩溃强杀的 session 遗留的
+//!    active 快照,新进程通过 [`has_stale_active_snapshot`] /
+//!    [`stale_active_snapshot_dirs`] 感知;退出 restore 与 `desktop_clear`
+//!    守门均已补 `|| has_stale_active_snapshot` 盲区,确保强杀后重启能补跑
+//!    欠下的 restore。
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -285,7 +295,22 @@ pub fn snapshot_codex_state(
     let auth_existed = paths.auth_json.exists();
 
     if config_existed {
-        std::fs::copy(&paths.config_toml, config_path(&current_dir))?;
+        let snapshot_copy = config_path(&current_dir);
+        std::fs::copy(&paths.config_toml, &snapshot_copy)?;
+        // [MOC-197] 写入端反投毒:live config 含 transfer signature 字段(上一个 session
+        // 被强杀、退出 restore 没跑的残留)时,原样拍照会把污染固化成"用户原始配置"
+        // (active 快照的语义),restore 基线从此带毒。#270 只防"从脏快照读回",这里补
+        // 写入端对称防护:对快照**副本** strip 命中字段(高精度签名 100% transfer 写的,
+        // 不会误删用户手写值;live config 本身不动,apply 接下来就会重写它)。端口列表与
+        // #270 restore 端同为 [18080],自定义 proxyPort 的识别缺口由 MOC-162 统一解决。
+        let content = std::fs::read_to_string(&snapshot_copy)?;
+        for key in crate::residual::signature_fields_to_strip(
+            &content,
+            &paths.model_catalog_json,
+            &[18080],
+        ) {
+            crate::toml_sync::sync_root_value(&snapshot_copy, &key, None)?;
+        }
     }
     if auth_existed {
         let snapshot_auth = auth_path(&current_dir);
@@ -501,7 +526,7 @@ pub fn gc_trash_older_than(paths: &CodexPaths, retention_days: u64) -> (usize, u
     (removed, failed)
 }
 
-fn read_manifest_from_dir(dir: &Path) -> Result<SnapshotManifest, CodexError> {
+pub(crate) fn read_manifest_from_dir(dir: &Path) -> Result<SnapshotManifest, CodexError> {
     let s = std::fs::read_to_string(manifest_path(dir))?;
     Ok(serde_json::from_str(&s)?)
 }
@@ -522,7 +547,7 @@ pub(crate) fn read_snapshot_config_by_id(paths: &CodexPaths, snapshot_id: &str) 
     snapshot_dir_by_id(paths, snapshot_id).and_then(|dir| read_snapshot_config_from_dir(&dir))
 }
 
-fn read_snapshot_config_from_dir(dir: &Path) -> Option<String> {
+pub(crate) fn read_snapshot_config_from_dir(dir: &Path) -> Option<String> {
     std::fs::read_to_string(config_path(dir)).ok()
 }
 
@@ -539,12 +564,39 @@ pub(crate) fn read_snapshot_auth_by_id(paths: &CodexPaths, snapshot_id: &str) ->
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()))
 }
 
-fn read_snapshot_auth_from_dir(dir: &Path) -> serde_json::Value {
+pub(crate) fn read_snapshot_auth_from_dir(dir: &Path) -> serde_json::Value {
     let txt = std::fs::read_to_string(auth_path(dir)).ok();
     match txt {
         Some(s) if !s.trim().is_empty() => serde_json::from_str(&s)
             .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
         _ => serde_json::Value::Object(Default::default()),
+    }
+}
+
+/// [MOC-197] 区分"文件不存在"(`Ok(None)`)与"存在但读失败"(`Err`)的快照
+/// config 读取。stale heal 用:读失败时**不能**折叠成空内容去还原(那会把
+/// managed key 全删 = 破坏性 clear),必须冒泡让 caller 保守中止、保留快照目录
+/// (silent-failure review HIGH#1;`read_snapshot_config_from_dir` 的 `.ok()`
+/// 折叠语义保留给"按 manifest existed 标记判定"的既有路径)。
+pub(crate) fn read_snapshot_config_classified(dir: &Path) -> Result<Option<String>, CodexError> {
+    match std::fs::read_to_string(config_path(dir)) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// [MOC-197] 同 [`read_snapshot_config_classified`],auth 版。损坏 JSON 也算
+/// 读失败(`Err`)而非空对象 —— 否则 heal 会把 live 的 managed auth key 删掉
+/// 而不是按快照还原。空文件沿用既有语义(空对象)。
+pub(crate) fn read_snapshot_auth_classified(
+    dir: &Path,
+) -> Result<Option<serde_json::Value>, CodexError> {
+    match std::fs::read_to_string(auth_path(dir)) {
+        Ok(s) if s.trim().is_empty() => Ok(Some(serde_json::Value::Object(Default::default()))),
+        Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -637,18 +689,34 @@ fn snapshot_dir_matches_id(dir: &Path, snapshot_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn move_stale_active_snapshots_to_recovery(paths: &CodexPaths) -> Result<(), CodexError> {
-    let current = current_session_id().to_owned();
-    // 按目录名(固定宽度时间戳前缀 → 字典序即时间序)升序 = **旧→新**处理。
+/// [MOC-197] 列出**非当前 session** 的 active 快照目录(被 SIGKILL/崩溃强杀的
+/// session 遗留),按目录名升序(固定宽度时间戳前缀 → 字典序即时间序,旧→新)。
+/// 只认带 manifest 的目录(口径同 [`snapshot_dirs_under`])。
+pub(crate) fn stale_active_snapshot_dirs(paths: &CodexPaths) -> Vec<PathBuf> {
+    let current = current_session_id();
+    let mut dirs: Vec<PathBuf> = snapshot_dirs_under(&paths.active_snapshots_dir)
+        .into_iter()
+        .filter(|dir| dir_name(dir).as_deref() != Some(current))
+        .collect();
+    dirs.sort_by(|a, b| dir_name(a).cmp(&dir_name(b)));
+    dirs
+}
+
+/// [MOC-197] 是否存在 stale session 的 active 快照。[`has_snapshot`] 是
+/// session(进程)维度、看不见它们;caller(`desktop_clear` 守门 / 退出 restore
+/// gate)用本函数补盲区,避免"快照明明在却报 no snapshot"。
+pub fn has_stale_active_snapshot(paths: &CodexPaths) -> bool {
+    !stale_active_snapshot_dirs(paths).is_empty()
+}
+
+pub(crate) fn move_stale_active_snapshots_to_recovery(
+    paths: &CodexPaths,
+) -> Result<(), CodexError> {
+    // 按目录名升序 = **旧→新**处理(见 stale_active_snapshot_dirs)。
     // 替换式去重(见 move_snapshot_dir_to_recovery)下,同内容多份 stale 时让最新那份**最后**
     // 处理、替换掉更旧的,使留存的 recovery 副本始终是最新那份(MOC-148 review P2:否则若
     // newer 先处理、older 后处理,older 会覆盖 newer,at-cap 时该内容可能被 prune 误删)。
-    let mut stale_dirs = snapshot_dirs_under(&paths.active_snapshots_dir);
-    stale_dirs.sort_by(|a, b| dir_name(a).cmp(&dir_name(b)));
-    for dir in stale_dirs {
-        if dir_name(&dir).as_deref() == Some(current.as_str()) {
-            continue;
-        }
+    for dir in stale_active_snapshot_dirs(paths) {
         // 去重为**替换式**(见 move_snapshot_dir_to_recovery):命中旧重复时把更新的 stale
         // 作为最新一份移入,内容以最新时间戳存活 → 末尾 prune 不论 cap 状态都不会误删它。
         // 故无需"去重前先 prune"(MOC-148 review P2:那只防已超额、防不住本轮移入后才超额)。
