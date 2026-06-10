@@ -5,6 +5,7 @@
 
 mod admin;
 mod codex_plugin_unlocker;
+mod codex_quota_injector;
 mod codex_real_account;
 mod codex_theme_injector;
 mod mcp_webfetch_server;
@@ -123,6 +124,11 @@ fn main() {
                         .add("WARN", format!("[trace-viewer] 启动失败: {e}")),
                 }
             }
+
+            // [MOC-204] 额度条目注入 daemon:每 tick 读 settings.codexQuotaEnabled
+            // + proxy rate limit 快照,经 CDP 推进 Codex Environment 卡片。
+            // 开关关 / CDP 不可达时 tick 内静默跳过,常驻无负担。
+            tauri::async_runtime::spawn(codex_quota_injector::run_quota_daemon());
 
             // Deep link scheme handler:codex-app-transfer://v1/import?...
             // 转发 URL 给前端 codexMcpHandleDeeplink() 弹 confirmation modal。

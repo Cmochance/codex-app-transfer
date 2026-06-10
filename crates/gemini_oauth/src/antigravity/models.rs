@@ -75,6 +75,9 @@ const SKIP_MODEL_IDS: &[&str] = &[
     // [MOC-69] claude 两款不提供给用户
     "claude-opus-4-6-thinking",
     "claude-sonnet-4-6",
+    // [MOC-204] gpt-oss 非 Gemini 系:本项目 antigravity 仅适配 Gemini 模型(额度也是
+    // Gemini 共用池),暴露非 Gemini 模型会让 Usage 面板对它显示错池额度,直接过滤不提供
+    "gpt-oss-120b-medium",
     // [MOC-69] 用户真机实测不可用(对话起不来),根因待 MOC-79 查
     "gemini-3.1-pro-high",
 ];
@@ -264,7 +267,7 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// 上游响应 happy path:返 2 条模型,过滤掉 skip list 一条
+    /// 上游响应 happy path:返 3 条模型,过滤掉 skip list 两条(gemini-2.5-pro + gpt-oss)
     #[tokio::test]
     async fn fetches_models_skipping_blacklist() {
         let server = MockServer::start().await;
@@ -302,7 +305,10 @@ mod tests {
                 count += 1;
             }
         }
-        assert_eq!(count, 2, "skip list 应过滤掉 gemini-2.5-pro");
+        assert_eq!(
+            count, 1,
+            "skip list 应过滤掉 gemini-2.5-pro + gpt-oss-120b-medium,仅留 gemini-3-pro-low"
+        );
 
         // wiremock instance 防 unused
         let _ = server;
@@ -321,7 +327,7 @@ mod tests {
     }
 
     /// SKIP_MODEL_IDS 锚定 — 防修代码时不小心动了清单(含 [MOC-69] claude 两款 +
-    /// 用户真机实测不可用的 gemini-3.1-pro-high)
+    /// 用户真机实测不可用的 gemini-3.1-pro-high + [MOC-204] gpt-oss 非 Gemini 系)
     #[test]
     fn skip_list_matches_expected() {
         let expected = [
@@ -335,6 +341,7 @@ mod tests {
             "gemini-2.5-flash-lite",
             "claude-opus-4-6-thinking",
             "claude-sonnet-4-6",
+            "gpt-oss-120b-medium",
             "gemini-3.1-pro-high",
         ];
         assert_eq!(SKIP_MODEL_IDS, expected);

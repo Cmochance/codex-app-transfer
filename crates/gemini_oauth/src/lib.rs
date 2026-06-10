@@ -55,6 +55,7 @@ pub use token::{OauthToken, TokenError, TokenStore};
 // Antigravity provider re-exports(parallel module,跟 gemini-cli 共用 token / FlowError 等)
 pub use antigravity::{
     antigravity_bootstrap_project, antigravity_static_models, fetch_antigravity_available_models,
-    refresh_antigravity_access_token, run_antigravity_oauth_flow_with_cancel,
-    AntigravityClientMetadata, AntigravityModelEntry,
+    fetch_gemini_quota_summary, refresh_antigravity_access_token,
+    run_antigravity_oauth_flow_with_cancel, AntigravityClientMetadata, AntigravityModelEntry,
+    GeminiQuota, QuotaError, QuotaWindow,
 };

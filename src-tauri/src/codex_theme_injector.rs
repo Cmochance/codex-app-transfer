@@ -860,7 +860,9 @@ async fn run_clear() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// 拿 Codex Desktop 主窗口的 CDP webSocketDebuggerUrl。
 /// 复用 plugin_unlocker 的 page-filter 思路:type=page + URL 含 `index.html` +
 /// 不含 `avatar-overlay`(过滤宠物悬浮窗)。
-async fn locate_main_window_ws() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+/// pub(crate):MOC-204 quota injector 复用同一套 CDP 定位/收发工具。
+pub(crate) async fn locate_main_window_ws(
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // **CDP_PORT=0 sentinel 检查**:Codex 启动后 0–15s 内,或 DevToolsActivePort
     // 永远没出现的极端 case,`current_cdp_url()` 会返 `http://127.0.0.1:0/...`,
     // 直接走 reqwest 会冒出"tcp connect error: Cannot assign requested address"
@@ -892,7 +894,7 @@ async fn locate_main_window_ws() -> Result<String, Box<dyn std::error::Error + S
         .ok_or_else(|| "webSocketDebuggerUrl missing".into())
 }
 
-fn make_msg(id: u64, method: &str, params: Value) -> (String, u64) {
+pub(crate) fn make_msg(id: u64, method: &str, params: Value) -> (String, u64) {
     let body = json!({ "id": id, "method": method, "params": params }).to_string();
     (body, id)
 }
@@ -901,7 +903,7 @@ fn make_msg(id: u64, method: &str, params: Value) -> (String, u64) {
 /// CDP 可能先发 event(无 `id` 字段)再发 response,所以必须 loop 跳过 event。
 /// 检查 response 的 `error` 字段,有错就返 Err。
 /// overall_timeout = 8s,每条 read 最多等 500ms。
-async fn drain_until_response(
+pub(crate) async fn drain_until_response(
     read: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
     expected_id: u64,
 ) -> Result<(), String> {

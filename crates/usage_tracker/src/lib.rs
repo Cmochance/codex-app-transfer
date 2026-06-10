@@ -88,6 +88,85 @@ pub fn load_codex_events() -> Result<Vec<CodexTokenUsageEvent>> {
     Ok(events)
 }
 
+/// [MOC-204 Phase 2] 当前会话(= 最新 rollout 文件)的累计用量。供 quota injector 即时
+/// 显示「累计 token / 缓存命中率」—— 直接读 Codex rollout(ground truth、含**全部历史
+/// 轮次**,compact 也已正确计入),不需发新对话。只解析最新一个文件(非全量扫),按
+/// (path, mtime) 缓存避免每 tick 重解析。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionTotals {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+}
+
+impl SessionTotals {
+    /// 平均缓存命中率 % = `cached_input / input`(对齐前端 `cacheHitPct` / #304);input=0→None。
+    pub fn cache_hit_percent(&self) -> Option<f64> {
+        if self.input_tokens == 0 {
+            None
+        } else {
+            Some(self.cached_input_tokens as f64 / self.input_tokens as f64 * 100.0)
+        }
+    }
+}
+
+static NEWEST_TOTALS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(PathBuf, std::time::SystemTime, SessionTotals)>>,
+> = std::sync::OnceLock::new();
+
+/// 找最新 rollout 文件(按 mtime)解析得当前会话累计。无 rollout → None。
+///
+/// **已知限制(review P2)**:按 newest-mtime 选文件,假设「最近写入的 rollout = 当前活动
+/// 会话」——常态成立(用户正在用的会话其 rollout 持续被追加,mtime 最新)。但用户切回**旧**
+/// 对话且未发新轮就开面板时,旧对话 mtime 可能比另一近期对话旧 → 选错文件,面板累计 / 缓存
+/// 短暂显示另一会话的值(在该旧对话发一轮即自愈)。彻底修需把活动会话 id 从 Codex fiber 打通
+/// 到本 daemon(当前 daemon→JS 单向推送、无此通道),属设计取舍,留作 followup。
+pub fn newest_session_totals() -> Option<SessionTotals> {
+    let dirs = codex_usage_paths().ok()?;
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    for dir in &dirs {
+        let mut files = Vec::new();
+        walk(dir, &mut files);
+        for f in files {
+            if let Ok(mt) = std::fs::metadata(&f).and_then(|m| m.modified()) {
+                if newest.as_ref().is_none_or(|(_, best)| mt > *best) {
+                    newest = Some((f, mt));
+                }
+            }
+        }
+    }
+    let (path, mtime) = newest?;
+    // cache key 用完整 SystemTime(保留亚秒精度):同一文件系统秒内 Codex 又追加 usage
+    // event 时 mtime 仍变(纳秒级),避免截断到秒后命中旧 cache、漏掉本秒最新一轮累计/
+    // 缓存率直到下一秒才有写入(review P2)。
+    let cache = NEWEST_TOTALS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Some((p, mt, totals)) = cache.lock().unwrap().as_ref() {
+        if p == &path && *mt == mtime {
+            return Some(*totals); // 文件没变,复用解析结果
+        }
+    }
+    // 收集 → dedupe → sum:Codex 会 retry / 重复写同一 token-count event(同 session+ts+
+    // tokens),直接累加会双计 total/input/cache → 缓存命中率算错。复用 load_codex_events
+    // 同款 dedupe_events(event_key 去重)保持一致(review P2)。
+    let mut events: Vec<CodexTokenUsageEvent> = Vec::new();
+    let sessions_dir = path.parent().unwrap_or(path.as_path());
+    let _ = visit_codex_session_file(sessions_dir, &path, |event| {
+        events.push(event);
+        Ok(())
+    });
+    dedupe_events(&mut events);
+    let mut totals = SessionTotals::default();
+    for event in &events {
+        totals.total_tokens = totals.total_tokens.saturating_add(event.total_tokens);
+        totals.input_tokens = totals.input_tokens.saturating_add(event.input_tokens);
+        totals.cached_input_tokens = totals
+            .cached_input_tokens
+            .saturating_add(event.cached_input_tokens);
+    }
+    *cache.lock().unwrap() = Some((path, mtime, totals));
+    Some(totals)
+}
+
 fn load_dir(sessions_dir: &std::path::Path, events: &mut Vec<CodexTokenUsageEvent>) -> Result<()> {
     let files = list_jsonl_files(sessions_dir);
     for file in files {
@@ -593,6 +672,26 @@ mod usage_phase2_tests {
     fn format_last_activity_tz_invalid_returns_none() {
         let tz = jiff::tz::TimeZone::get("Asia/Shanghai").unwrap();
         assert_eq!(format_last_activity_tz("not-a-timestamp", Some(&tz)), None);
+    }
+}
+
+#[cfg(test)]
+mod session_totals_tests {
+    use super::*;
+
+    #[test]
+    fn cache_hit_percent_matches_cached_over_input() {
+        let t = SessionTotals {
+            total_tokens: 3000,
+            input_tokens: 2500,
+            cached_input_tokens: 1500,
+        };
+        assert_eq!(t.cache_hit_percent(), Some(60.0)); // 1500/2500
+    }
+
+    #[test]
+    fn cache_hit_percent_none_when_no_input() {
+        assert_eq!(SessionTotals::default().cache_hit_percent(), None);
     }
 }
 
