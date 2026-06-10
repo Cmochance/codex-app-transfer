@@ -29,8 +29,9 @@
 //! 旧版本(插件)与本实现的锁命名空间不同(`/tmp/<id>_si.sock` vs
 //! `<app_home>/instance.lock`),互相不可见会双实例并存 → 抢 proxy 端口 +
 //! 任一退出时 restore 把 config.toml 还原,另一实例静默脱代理。兜底:
-//! - 启动先探测 legacy socket,有旧版监听 → alert 提示退出旧版后 exit(0)
-//!   (探测的 connect+EOF 会顺带触发旧版唤窗,用户能直接看到它);
+//! - **拿到 flock 后**探测 legacy socket(锁被占 = 新版主实例在跑,legacy 是
+//!   它的兼容监听,不得误判;拿到锁才可能存在旧版),有旧版监听 → alert 提示
+//!   退出旧版后 exit(0)(探测的 connect+EOF 会顺带触发旧版唤窗);
 //! - 成为主实例后兼容 bind legacy socket:旧版本二次启动 connect 成功
 //!   notify 后自行退出,本实例按旧 wire 格式(`cwd\0\0args`)解析唤窗。
 //!
@@ -140,18 +141,6 @@ pub fn mark_ready(app: AppHandle) {
 ///
 /// 第二实例路径(锁被健康主实例持有)在内部 `exit(0)`,不返回。
 pub fn acquire_or_exit() -> Option<InstanceLock> {
-    // 跨版本兜底:旧版本(插件)实例在监听 legacy socket → 提示用户退出旧版,
-    // 不静默共存(双实例会抢 proxy 端口 + 退出 restore 互踩 config.toml)。
-    // connect 本身会让旧版 listener 读到 EOF 触发唤窗,用户能直接看到它;
-    // 旧版若是僵尸(#436 形态)也会 connect 成功 → 同一 alert,指引明确,
-    // 严格优于旧版方案的静默 exit(0)。
-    if UnixStream::connect(legacy_sock_path()).is_ok() {
-        alert(
-            "检测到旧版本 Codex App Transfer 正在运行。请先退出它(若找不到窗口,可在「活动监视器」中结束 codex-app-transfer 进程)再打开新版本。",
-        );
-        std::process::exit(0);
-    }
-
     let lock_path = lock_path();
     if let Some(parent) = lock_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -174,7 +163,24 @@ pub fn acquire_or_exit() -> Option<InstanceLock> {
     };
 
     match file.try_lock_exclusive() {
-        Ok(()) => Some(become_primary(file)),
+        Ok(()) => {
+            // 跨版本兜底:拿到 flock = 没有任何新版本实例(新版主实例必持锁),
+            // 此时 legacy socket 若有监听者只可能是**旧版本**(插件方案,不持本
+            // 锁)→ 提示用户退出旧版,不静默共存(双实例抢 proxy 端口 + 退出
+            // restore 互踩 config.toml)。探测必须放在锁判定**之后** —— 新版主
+            // 实例自己也兼容 bind 了 legacy socket,放在锁前会让新版二次启动
+            // 误报「旧版本在运行」且 deeplink argv 全丢(chatgpt-codex P2)。
+            // connect+EOF 顺带触发旧版唤窗,用户能直接看到它;旧版若是僵尸
+            // (#436 形态)也 connect 成功 → 同一 alert,指引明确,严格优于
+            // 旧插件的静默 exit(0)。exit 自动释放刚拿的 flock。
+            if UnixStream::connect(legacy_sock_path()).is_ok() {
+                alert(
+                    "检测到旧版本 Codex App Transfer 正在运行。请先退出它(若找不到窗口,可在「活动监视器」中结束 codex-app-transfer 进程)再打开新版本。",
+                );
+                std::process::exit(0);
+            }
+            Some(become_primary(file))
+        }
         // 只有「锁被占」(EWOULDBLOCK)才意味着有另一实例;ENOTSUP/EIO 等是
         // flock 在该文件系统不可用(典型:网络盘 home)。混为一谈会让 flock
         // 不可用的机器每次启动都走 takeover→alert+exit,复刻「永远打不开」
