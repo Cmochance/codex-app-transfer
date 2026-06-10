@@ -47,6 +47,7 @@ impl Adapter for OpenAiChatAdapter {
             response_session: None,
             adapter_metadata: None,
             is_compact: false,
+            compact_v2: false,
             // openai_chat 路径直接 passthrough,入站本来就是 chat 格式,
             // 无 namespace 包装也无 Responses API envelope 字段需求,留 None。
             original_responses_request: None,

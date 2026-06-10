@@ -52,10 +52,17 @@ pub struct RequestPlan {
     /// This stays internal to the adapter/proxy boundary and must not be exposed
     /// as part of the user-facing protocol.
     pub adapter_metadata: Option<Value>,
-    /// 是否是 `/responses/compact` 请求(由 Responses adapter 转换成 chat
-    /// completions 模拟 compact 端点)。`transform_response_stream` 据此选择
-    /// 直接 SSE 转换还是包装成 `{"output":[{"type":"compaction",...}]}` 响应。
+    /// 是否是 compact 请求(V1 `/responses/compact` 端点 或 V2 普通 `/responses`
+    /// 含 `compaction_trigger` item,均由 adapter 转换成 chat completions 本地
+    /// 实现)。`transform_response_stream` 据此选择直接 SSE 转换还是包装成
+    /// compact 响应(V1:非流式 JSON;V2:SSE 流,由 `compact_v2` 字段区分)。
     pub is_compact: bool,
+    /// [MOC-198] `is_compact=true` 时区分协议代:`false`=V1 旧端点
+    /// `/responses/compact`(非流式 JSON `{"output":[{"type":"compaction"}]}`);
+    /// `true`=remote compaction v2(普通流式 `/responses` + `compaction_trigger`
+    /// input item,响应须为 SSE:output_item.done(compaction)+ completed)。
+    /// `is_compact=false` 时无意义。
+    pub compact_v2: bool,
     /// 原入站 Responses API request 的**完整 body**(未经任何展平 / 协议转换)。
     /// chat→responses SSE 状态机用它构造合规 envelope:`response.created` /
     /// `response.in_progress` / `response.completed` 三个生命周期事件的

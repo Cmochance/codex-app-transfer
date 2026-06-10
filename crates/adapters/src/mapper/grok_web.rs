@@ -65,6 +65,9 @@ impl ResponseMapper for GrokWebMapper {
 ///
 /// `/responses/compact` 端点 grok.com 后端不暴露(R3 PoC 注释),目前 mapper
 /// 也是 fallback 当普通 chat 请求处理,后续可加 compact 短路。
+/// [MOC-198] remote compaction v2(`compaction_trigger`)同样未接 —— 与 V1
+/// 不支持平价(grok 上 V2 失败形态 = Codex 报 expected exactly one compaction
+/// output item,V1 = JSON parse 错,均 fatal 无回归);接入时两轨一起做。
 pub(crate) fn prepare_grok_web_request(
     body: Bytes,
     provider: &Provider,
@@ -84,6 +87,7 @@ pub(crate) fn prepare_grok_web_request(
         response_session: Some(conversion.response_session),
         adapter_metadata: None,
         is_compact: false,
+        compact_v2: false,
         original_responses_request: Some(parsed),
     })
 }

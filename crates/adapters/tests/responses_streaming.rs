@@ -98,10 +98,12 @@ const KIMI_REASONING_LIFECYCLE: &[&str] = &[
     "response.output_item.added", // reasoning lazy open
     "response.reasoning_summary_part.added",
     "response.reasoning_summary_text.delta", // open_reasoning 注入的 `**Thinking**\n\n` prefix
-    "response.reasoning_summary_text.delta", // 上游真实 reasoning_content delta
+    "response.reasoning_summary_text.delta", // 上游真实 reasoning_content delta(summary 通道)
+    "response.reasoning_text.delta",         // 同 delta 双发 content 通道(v26.608+ 渲染,无 header)
     "response.reasoning_summary_text.done",
     "response.reasoning_summary_part.done",
-    "response.output_item.done", // reasoning close
+    "response.reasoning_text.done", // content 通道收尾
+    "response.output_item.done",    // reasoning close
     "response.completed",
 ];
 
@@ -124,6 +126,14 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
         .unwrap();
     assert_eq!(summary_done.1["text"], "**Thinking**\n\nThe");
 
+    // content 通道收尾文本 = 纯思考(无注入 prefix)
+    let text_done = events
+        .iter()
+        .find(|(n, _)| n == "response.reasoning_text.done")
+        .unwrap();
+    assert_eq!(text_done.1["text"], "The");
+    assert_eq!(text_done.1["content_index"], 0);
+
     // completed: incomplete + max_output_tokens(finish_reason=length),
     // output 里只有 reasoning item,没有 message item
     let completed = &events.last().unwrap().1["response"];
@@ -137,7 +147,9 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
     let output = completed["output"].as_array().unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"], "reasoning");
-    assert_eq!(output[0]["content"], Value::Null);
+    // content 通道(v26.608+ 渲染):纯思考文本,剥 `**Thinking**` header
+    assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
+    assert_eq!(output[0]["content"][0]["text"], "The");
     assert_eq!(output[0]["encrypted_content"], Value::Null);
     assert_eq!(output[0]["summary"][0]["type"], "summary_text");
     assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nThe");

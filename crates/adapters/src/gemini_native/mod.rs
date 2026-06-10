@@ -212,6 +212,39 @@ mod adapter_tests {
         );
     }
 
+    #[test]
+    fn compact_v2_trigger_routes_to_non_stream_and_marks_compact_v2() {
+        // [MOC-198] 普通流式 /responses + compaction_trigger item = V2:
+        // 同样转非流 generateContent,且 compact_v2=true(响应侧走 SSE 包装)
+        let body = serde_json::json!({
+            "model": "gemini-3.1-pro-high",
+            "stream": true,
+            "input": [
+                {"type":"message","role":"user","content":"history x"},
+                {"type":"compaction_trigger"},
+            ],
+        });
+        let plan = GeminiNativeAdapter
+            .prepare_request(
+                "/v1/responses",
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                &dummy_provider(),
+            )
+            .expect("compact v2 prepare_request should succeed");
+        assert!(plan.is_compact && plan.compact_v2, "V2 必须双标记");
+        assert!(
+            plan.upstream_path.ends_with(":generateContent"),
+            "V2 上游仍走非流 generateContent, got {}",
+            plan.upstream_path
+        );
+        let parsed: Value = serde_json::from_slice(&plan.body).expect("gemini request json");
+        let contents = serde_json::to_string(&parsed["contents"]).unwrap();
+        assert!(
+            !contents.contains("compaction_trigger"),
+            "trigger 标记不得流入 Gemini wire: {contents}"
+        );
+    }
+
     #[tokio::test]
     async fn two_turn_responses_roundtrip_restores_history_via_previous_response_id() {
         let adapter = GeminiNativeAdapter;

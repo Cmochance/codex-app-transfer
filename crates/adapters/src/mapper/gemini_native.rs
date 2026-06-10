@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use crate::mapper::{RequestMapper, ResponseMapper};
 use crate::responses::compact::{
-    build_compact_chat_request, build_compact_response_plan, is_compact_path,
+    build_compact_chat_request, build_compact_response_plan, build_compact_v2_response_plan,
+    detect_compact, strip_compaction_trigger, CompactKind,
 };
 use crate::responses::global_response_session_cache;
 use crate::types::{AdapterError, ByteStream, RequestPlan, ResponsePlan};
@@ -14,15 +15,22 @@ use crate::types::{AdapterError, ByteStream, RequestPlan, ResponsePlan};
 pub(crate) struct GeminiNativeMapper;
 
 /// gemini_native 请求侧转换：
-/// - `/responses/compact`：走 compact 请求包装并转 Gemini 非流式 wire
+/// - `/responses/compact`(V1)+ 普通 `/responses` 含 `compaction_trigger` item(V2)→
+///   compact 请求包装(剥 trigger / 注入摘要 prompt)并转 Gemini 非流式 wire
 /// - 普通 `/responses`：走 responses->gemini 转换，并挂接 response_session
 pub(crate) fn prepare_gemini_native_request(
     client_path: &str,
     body: Bytes,
     provider: &Provider,
 ) -> Result<RequestPlan, AdapterError> {
-    if is_compact_path(client_path) {
-        let compact_chat_body = build_compact_chat_request(&body, provider)?;
+    if let Some(kind) = detect_compact(client_path, &body) {
+        // [MOC-198] V2 先剥 compaction_trigger,其余与 V1 同路;响应侧按
+        // compact_v2 选 JSON/SSE 包装。
+        let body_eff = match kind {
+            CompactKind::V1 => body.to_vec(),
+            CompactKind::V2 => strip_compaction_trigger(&body)?,
+        };
+        let compact_chat_body = build_compact_chat_request(&body_eff, provider)?;
         let compact_chat_json: Value = serde_json::from_slice(&compact_chat_body)
             .map_err(|e| AdapterError::Internal(format!("compact chat body decode: {e}")))?;
         let model = compact_chat_json
@@ -47,6 +55,7 @@ pub(crate) fn prepare_gemini_native_request(
             response_session: None,
             adapter_metadata: None,
             is_compact: true,
+            compact_v2: kind == CompactKind::V2,
             original_responses_request: None,
         });
     }
@@ -82,6 +91,7 @@ pub(crate) fn prepare_gemini_native_request(
         response_session: Some(conversion.response_session),
         adapter_metadata: None,
         is_compact: false,
+        compact_v2: false,
         original_responses_request: Some(parsed),
     })
 }
@@ -98,6 +108,13 @@ pub(crate) fn transform_gemini_native_response_stream(
     request_plan: &RequestPlan,
 ) -> Result<ResponsePlan, AdapterError> {
     if request_plan.is_compact {
+        if request_plan.compact_v2 {
+            return build_compact_v2_response_plan(
+                upstream_status,
+                upstream_headers,
+                upstream_stream,
+            );
+        }
         return build_compact_response_plan(upstream_status, upstream_headers, upstream_stream);
     }
 

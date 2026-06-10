@@ -354,6 +354,42 @@ mod adapter_tests {
     }
 
     #[test]
+    fn compact_v2_trigger_routes_to_generate_content_and_marks_compact_v2() {
+        // [MOC-198] V2(普通流式 /responses + compaction_trigger)走同款本地
+        // compact:cloud-code envelope + 非流 generateContent + compact_v2=true
+        let body = serde_json::json!({
+            "model": "gemini-2.5-pro",
+            "stream": true,
+            "input": [
+                {"type":"message","role":"user","content":"some long history to compact"},
+                {"type":"compaction_trigger"},
+            ],
+        });
+        let plan = GeminiCliAdapter
+            .prepare_request(
+                "/v1/responses",
+                Bytes::from(serde_json::to_vec(&body).unwrap()),
+                &dummy_provider_with_project(),
+            )
+            .expect("compact v2 prepare_request should succeed");
+        assert!(plan.is_compact && plan.compact_v2, "V2 必须双标记");
+        assert_eq!(
+            plan.upstream_path, "/v1internal:generateContent",
+            "V2 走非流 generateContent"
+        );
+        let parsed: Value = serde_json::from_slice(&plan.body).unwrap();
+        assert!(
+            parsed["request"]["contents"].is_array(),
+            "cloud-code envelope 完整"
+        );
+        let wire = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            !wire.contains("compaction_trigger"),
+            "trigger 标记不得流入 wire: {wire}"
+        );
+    }
+
+    #[test]
     fn missing_project_id_returns_bad_request_with_hint() {
         // 隔离 HOME 让 token store fallback 走 None 而不是命中真实磁盘
         // ~/.codex-app-transfer/gemini-oauth.json — 否则 dev 机跑 test 会因为

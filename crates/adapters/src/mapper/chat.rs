@@ -28,15 +28,21 @@ pub(crate) fn provider_needs_think_tag_split(provider: &Provider) -> bool {
 }
 
 /// responses adapter 请求侧编排：
-/// - `/responses/compact` 走 compact 本地包装
+/// - `/responses/compact`(V1)+ 普通 `/responses` 含 `compaction_trigger` item(V2)→ compact 本地包装
 /// - 其他 `/responses*` 走 responses->chat 主管道转换
 pub(crate) fn prepare_responses_request(
     client_path: &str,
     body: Bytes,
     provider: &Provider,
 ) -> Result<RequestPlan, AdapterError> {
-    if compact::is_compact_path(client_path) {
-        let new_body = compact::build_compact_chat_request(&body, provider)?;
+    if let Some(kind) = compact::detect_compact(client_path, &body) {
+        // [MOC-198] V2 先剥 compaction_trigger 标记 item,其余与 V1 完全同路
+        // (摘要 prompt 注入 + 历史展开);响应侧按 compact_v2 选 JSON/SSE 包装。
+        let body_eff = match kind {
+            compact::CompactKind::V1 => body.to_vec(),
+            compact::CompactKind::V2 => compact::strip_compaction_trigger(&body)?,
+        };
+        let new_body = compact::build_compact_chat_request(&body_eff, provider)?;
         return Ok(RequestPlan {
             upstream_path: "/chat/completions".to_owned(),
             body: Bytes::from(new_body),
@@ -44,6 +50,7 @@ pub(crate) fn prepare_responses_request(
             response_session: None,
             adapter_metadata: None,
             is_compact: true,
+            compact_v2: kind == compact::CompactKind::V2,
             original_responses_request: None,
         });
     }
@@ -73,12 +80,14 @@ pub(crate) fn prepare_responses_request(
         response_session: Some(conversion.response_session),
         adapter_metadata,
         is_compact: false,
+        compact_v2: false,
         original_responses_request,
     })
 }
 
 /// responses adapter 响应侧编排：
-/// - compact 走 compact response 包装
+/// - compact V1(/responses/compact)→ 非流式 JSON 包装
+/// - compact V2(compaction_trigger)→ SSE 包装(单 compaction item)
 /// - 其余路径走 chat SSE -> responses SSE 转换
 pub(crate) fn transform_responses_response_stream(
     upstream_status: StatusCode,
@@ -88,6 +97,13 @@ pub(crate) fn transform_responses_response_stream(
     request_plan: &RequestPlan,
 ) -> Result<ResponsePlan, AdapterError> {
     if request_plan.is_compact {
+        if request_plan.compact_v2 {
+            return compact::build_compact_v2_response_plan(
+                upstream_status,
+                upstream_headers,
+                upstream_stream,
+            );
+        }
         return compact::build_compact_response_plan(
             upstream_status,
             upstream_headers,
@@ -543,6 +559,7 @@ mod upstream_error_tests {
             response_session: None,
             adapter_metadata: None,
             is_compact: false,
+            compact_v2: false,
             original_responses_request: Some(json!({"model": "kimi-for-coding"})),
         }
     }
