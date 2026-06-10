@@ -385,11 +385,18 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
 /// 还原成功后清掉快照。
 pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
     if !has_snapshot(paths) {
+        // [MOC-197] 先兜底 stale session 快照(被 SIGKILL/崩溃强杀的 session 遗留,
+        // has_snapshot 是 session 维度看不见)。命中 = 补跑被强杀 session 欠下的那次
+        // 退出 restore,不走下面的 clear fallback(clear 只删 key,丢用户原始值)。
+        if restore_stale_codex_sessions(paths)? {
+            return Ok(true);
+        }
         // 没快照时退化为旧版"删除我们的 key"逻辑,与 Python 行为对齐。
         //
         // ⚠️ **layered defense 注意(防回归)**:`desktop_clear` handler
-        // (src-tauri desktop.rs:910) 已在 has_snapshot=false 时**先 noop
-        // 返回**不调本函数,守门 follow-up #28(用户从未 apply 但手写过
+        // (src-tauri handlers/desktop.rs) 已在 `!has_snapshot &&
+        // !has_stale_active_snapshot` 时**先 noop 返回**不调本函数,
+        // 守门 follow-up #28(用户从未 apply 但手写过
         // ~/.codex/config.toml managed key 时不应被清)。**不要**因为
         // "外层已 guard 这里 fallback 是 dead code"就 DRY 删掉本分支 ——
         // 其他 caller (测试 / 其它 endpoint / 未来新 handler) 仍可能直
@@ -418,6 +425,86 @@ pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
         );
     }
 
+    Ok(true)
+}
+
+/// [MOC-197] 还原**stale session** 遗留的 active 快照(启动/退出自愈)。
+///
+/// `has_snapshot` 是 session(进程)维度 —— 上一个 session 被 SIGKILL/崩溃强杀时
+/// 退出 restore 没跑,其 active 快照(用户真原始配置)仍留在 `active/` 下,但新
+/// 进程看不见 → 自愈短路、live 残留 apply 字段;Codex(GPT 账号)读到
+/// `sandbox_mode=danger-full-access` + 指向已死 proxy 的 base_url 后报「无法设置
+/// 管理员沙盒」且无法对话(2026-06-10 真机 kill -9 复现)。更糟的是下一次 apply 会把
+/// 干净 stale 快照降级进 recovery、再在脏 live 上拍新基线(投毒;写入端兜底见
+/// [`crate::snapshot::snapshot_codex_state`] 的 signature strip)。
+///
+/// 行为:取**最新**一份 stale 快照(保留用户最近 session 的合法 managed 值;若它
+/// 本身被投毒,`restore_from_snapshot_values` 的 #270 strip 兜底不回写污染),按
+/// [`RestoreMode::Auto`] 还原(保留用户 CLI 选过的 model,语义 = 补跑欠下的自动
+/// restore),成功后删除该快照目录。剩余更老的 stale 份**当场归档**进 recovery/
+/// (不能等下次 apply 顺手归档 —— `autoApplyOnStart=false` / 无 active provider 时
+/// apply 不跑,老 stale 跨重启滞留,下次启动 heal 会用**更老**快照的 managed 值
+/// 倒灌覆盖本次已还原的干净配置;code-review IMPORTANT#2)。
+///
+/// 返回 `Ok(true)` = 找到并还原了一份;`Ok(false)` = 无 stale 快照。
+pub fn restore_stale_codex_sessions(paths: &CodexPaths) -> Result<bool, CodexError> {
+    let Some(dir) = crate::snapshot::stale_active_snapshot_dirs(paths).pop() else {
+        return Ok(false);
+    };
+    // manifest 先读:atom pre-value(删目录后读不到)+ `config_existed`/`auth_existed`
+    // 消歧"文件本来就没有"vs"存在但读失败"(silent-failure review HIGH#1)。
+    let manifest = crate::snapshot::read_manifest_from_dir(&dir).ok();
+
+    // 读失败(EACCES/EIO/损坏 JSON)≠ 文件不存在:前者 propagate、**不还原不删目录**
+    // —— 否则等于拿空内容跑 clear(managed key 全删、丢用户原始值),且随后的
+    // remove_dir_all 把"没读出来"的唯一原始副本永久销毁。保留目录留待下次启动重试 /
+    // 下次 apply 的 move_stale 归档。文件不存在再按 manifest 判定:原本就没有
+    // (existed=false)→ 合法空内容(还原到"不存在");manifest 说有却缺文件
+    // (部分写入)→ 同样保守拒绝。
+    let snapshot_config = match crate::snapshot::read_snapshot_config_classified(&dir)? {
+        Some(s) => s,
+        None if manifest.as_ref().is_some_and(|m| !m.config_existed) => String::new(),
+        None => {
+            return Err(CodexError::Io(std::io::Error::other(format!(
+                "stale snapshot {} 缺 config.toml 但 manifest 标记 config_existed,拒绝破坏性 heal",
+                dir.display()
+            ))))
+        }
+    };
+    let snapshot_auth = match crate::snapshot::read_snapshot_auth_classified(&dir)? {
+        Some(v) => v,
+        None if manifest.as_ref().is_some_and(|m| !m.auth_existed) => {
+            serde_json::Value::Object(Default::default())
+        }
+        None => {
+            return Err(CodexError::Io(std::io::Error::other(format!(
+                "stale snapshot {} 缺 auth.json 但 manifest 标记 auth_existed,拒绝破坏性 heal",
+                dir.display()
+            ))))
+        }
+    };
+    restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth, RestoreMode::Auto)?;
+
+    std::fs::remove_dir_all(&dir)?;
+    // 剩余更老的 stale 份当场归档进 recovery/(见 fn doc;归档失败不 block heal —
+    // 配置已还原成功,归档只是清理,下次 apply 还有机会补跑)。
+    if let Err(e) = crate::snapshot::move_stale_active_snapshots_to_recovery(paths) {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            error = %e,
+            "best-effort archive of remaining stale snapshots after heal failed; \
+             config/auth already restored — heal reported overall",
+        );
+    }
+    clear_catalog_models(&paths.model_catalog_json)?;
+    if let Err(e) = restore_status_section_from_manifest(paths, manifest) {
+        tracing::warn!(
+            target: "codex_integration::apply",
+            error = %e,
+            "best-effort status-section atom restore (stale session heal) failed; \
+             config/auth already restored, stale snapshot dropped — heal reported overall",
+        );
+    }
     Ok(true)
 }
 
@@ -2475,5 +2562,324 @@ model = \"gpt-5.5\"
         assert!(toml.contains("[profiles]"), "用户 [profiles] 应保留");
         let auth = read_auth_value(&paths);
         assert_eq!(auth["OPENAI_API_KEY"], "sk-original");
+    }
+
+    // ── [MOC-197] stale session 快照自愈 + 写入端反投毒 ───────────────
+
+    /// helper:在 active/ 下伪造一份"被强杀 session 遗留"的 stale 快照。
+    fn write_stale_snapshot(paths: &CodexPaths, dir_name: &str, config: &str, auth: &str) {
+        let dir = paths.active_snapshots_dir.join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), config).unwrap();
+        std::fs::write(dir.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            json!({
+                "schema_version": 4,
+                "snapshot_id": dir_name,
+                "session_id": dir_name,
+                "snapshot_at": "2020-01-01T00:00:00",
+                "config_existed": true,
+                "auth_existed": true,
+                "app_version": "v-test",
+                "electron_status_section_pre_value": null,
+                "electron_status_section_capture_failed": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// kill -9 全链路防回归(2026-06-10 真机复现):被强杀 session 的快照(用户真
+    /// 原始配置)留在 active/,live 残留 apply 字段。restore_codex_state 必须发现
+    /// stale 快照并还原(补跑欠下的退出 restore),而非走 clear fallback 丢原始值。
+    #[test]
+    fn restore_heals_stale_session_snapshot_after_force_kill() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        write_stale_snapshot(
+            &paths,
+            "20200101T000000000-p1",
+            "model = \"gpt-5.4\"\npersonality = \"pragmatic\"\n",
+            "{\"auth_mode\":\"chatgpt\"}\n",
+        );
+
+        // live = 强杀后残留 apply 字段的状态(+ 用户强杀后自己加的 key)
+        std::fs::write(
+            &paths.config_toml,
+            "openai_base_url = \"http://127.0.0.1:18080\"\nsandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\nmodel = \"gpt-5.5\"\nuser_key = 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &paths.auth_json,
+            "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"cas_x\",\"keep\":1}\n",
+        )
+        .unwrap();
+
+        let restored = restore_codex_state(&paths).unwrap();
+        assert!(
+            restored,
+            "stale 快照必须被还原(而非 clear fallback 返 false)"
+        );
+
+        let toml = read_toml(&paths);
+        for k in ["openai_base_url", "sandbox_mode", "approval_policy"] {
+            assert!(
+                !toml.contains(&format!("{k} =")),
+                "残留 {k} 必须被清掉: {toml}"
+            );
+        }
+        assert!(
+            toml.contains("model = \"gpt-5.4\""),
+            "managed key 按 stale 快照原值还原: {toml}"
+        );
+        assert!(toml.contains("user_key = 1"), "用户后加 key 不动: {toml}");
+        let auth = read_auth_value(&paths);
+        assert_eq!(auth["auth_mode"], "chatgpt", "auth managed key 按快照还原");
+        assert!(auth.get("OPENAI_API_KEY").is_none());
+        assert_eq!(auth["keep"], 1, "auth 非 managed key 不动");
+        assert!(
+            !paths
+                .active_snapshots_dir
+                .join("20200101T000000000-p1")
+                .exists(),
+            "还原后 stale 快照目录应被删除"
+        );
+    }
+
+    /// Auto 语义:stale 快照里没有 `model` 时保留 live 的 CLI 活跃选择
+    /// (语义 = 补跑被强杀 session 欠下的那次**自动** restore,非 Manual)。
+    #[test]
+    fn stale_heal_keeps_cli_model_when_snapshot_lacks_model() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        write_stale_snapshot(
+            &paths,
+            "20200101T000000000-p1",
+            "personality = \"x\"\n",
+            "{}",
+        );
+        std::fs::write(
+            &paths.config_toml,
+            "openai_base_url = \"http://127.0.0.1:18080\"\nmodel = \"user-picked\"\n",
+        )
+        .unwrap();
+        std::fs::write(&paths.auth_json, "{}").unwrap();
+
+        assert!(restore_codex_state(&paths).unwrap());
+        let toml = read_toml(&paths);
+        assert!(!toml.contains("openai_base_url"), "残留必须清掉: {toml}");
+        assert!(
+            toml.contains("model = \"user-picked\""),
+            "快照无 model 时保留用户 CLI 活跃选择(Auto 语义): {toml}"
+        );
+    }
+
+    /// 多份 stale:还原**最新**一份(保留用户最近 session 的合法 managed 值),
+    /// 更老的**当场归档**进 recovery/ —— 不留 active/,防 autoApplyOnStart=false
+    /// 时老份跨重启滞留、下次启动 heal 用更老快照倒灌覆盖本次还原结果。
+    #[test]
+    fn stale_heal_picks_newest_and_archives_older_to_recovery() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        write_stale_snapshot(
+            &paths,
+            "20200101T000000000-p1",
+            "model = \"gpt-5.3\"\n",
+            "{}",
+        );
+        write_stale_snapshot(
+            &paths,
+            "20210101T000000000-p2",
+            "model = \"gpt-5.4\"\n",
+            "{}",
+        );
+        std::fs::write(&paths.config_toml, "model = \"leftover\"\n").unwrap();
+        std::fs::write(&paths.auth_json, "{}").unwrap();
+
+        assert!(restore_codex_state(&paths).unwrap());
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains("model = \"gpt-5.4\""),
+            "应按最新 stale 快照还原: {toml}"
+        );
+        assert!(
+            !paths
+                .active_snapshots_dir
+                .join("20210101T000000000-p2")
+                .exists(),
+            "最新份还原后删除"
+        );
+        assert!(
+            !paths
+                .active_snapshots_dir
+                .join("20200101T000000000-p1")
+                .exists(),
+            "更老的 stale 份不应滞留 active/(否则 autoApplyOnStart=false 时下次启动会倒灌)"
+        );
+        assert!(
+            paths
+                .recovery_snapshots_dir
+                .join("20200101T000000000-p1")
+                .exists(),
+            "更老的 stale 份当场归档进 recovery/"
+        );
+        // 再跑一次:active/ 已空 → clear fallback(false),老快照值不得倒灌
+        assert!(
+            !restore_codex_state(&paths).unwrap(),
+            "归档后再启动不应再有 stale 可还原"
+        );
+        let toml2 = read_toml(&paths);
+        assert!(
+            !toml2.contains("model = \"gpt-5.3\""),
+            "老快照值不得倒灌: {toml2}"
+        );
+    }
+
+    /// [MOC-197 silent-failure HIGH#1] manifest 标记 config_existed 但快照目录缺
+    /// config.toml(部分写入/损坏)→ 拒绝破坏性 heal:不还原、不删目录、冒泡错误。
+    /// 否则空内容还原 = managed key 全删 + remove_dir_all 销毁唯一原始副本。
+    #[test]
+    fn stale_heal_refuses_when_snapshot_config_missing_but_manifest_says_existed() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        write_stale_snapshot(&paths, "20200101T000000000-p1", "ignored", "{}");
+        let stale = paths.active_snapshots_dir.join("20200101T000000000-p1");
+        std::fs::remove_file(stale.join("config.toml")).unwrap();
+
+        let live = "openai_base_url = \"http://127.0.0.1:18080\"\nmodel = \"gpt-5.5\"\n";
+        std::fs::write(&paths.config_toml, live).unwrap();
+        std::fs::write(&paths.auth_json, "{}").unwrap();
+
+        let result = restore_codex_state(&paths);
+        assert!(result.is_err(), "缺 config 但 manifest 说有 → 必须拒绝");
+        assert!(stale.exists(), "快照目录必须保留(留待重试/人工恢复)");
+        assert_eq!(read_toml(&paths), live, "live config 不得被动过");
+    }
+
+    /// [MOC-197 silent-failure HIGH#1] 快照 auth.json 损坏(非法 JSON)→ 同样拒绝,
+    /// 不能折叠成空对象把 live 的 managed auth key 删掉。
+    #[test]
+    fn stale_heal_refuses_on_corrupt_snapshot_auth() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        write_stale_snapshot(
+            &paths,
+            "20200101T000000000-p1",
+            "model = \"gpt-5.4\"\n",
+            "{not-json",
+        );
+        std::fs::write(&paths.config_toml, "model = \"gpt-5.5\"\n").unwrap();
+        std::fs::write(&paths.auth_json, "{\"auth_mode\":\"chatgpt\",\"keep\":1}").unwrap();
+
+        let result = restore_codex_state(&paths);
+        assert!(result.is_err(), "损坏 auth 必须拒绝而非清 key");
+        assert!(
+            paths
+                .active_snapshots_dir
+                .join("20200101T000000000-p1")
+                .exists(),
+            "快照目录必须保留"
+        );
+        let auth = read_auth_value(&paths);
+        assert_eq!(auth["auth_mode"], "chatgpt", "live auth 不得被动过");
+    }
+
+    /// stale 快照自身被投毒(本修复落地前的版本拍的)→ #270 strip 兜底,
+    /// 还原时不回写污染字段。
+    #[test]
+    fn stale_heal_does_not_write_back_poisoned_stale_snapshot() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        let poisoned = format!(
+            "openai_base_url = \"http://127.0.0.1:18080\"\nchatgpt_base_url = \"http://127.0.0.1:18080/backend-api\"\nsandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\nmodel_catalog_json = \"{}\"\nmodel_context_window = 1000000\nmodel = \"gpt-5.5\"\n",
+            paths.model_catalog_json.display()
+        );
+        write_stale_snapshot(&paths, "20200101T000000000-p1", &poisoned, "{}");
+        std::fs::write(&paths.config_toml, &poisoned).unwrap();
+        std::fs::write(&paths.auth_json, "{}").unwrap();
+
+        assert!(restore_codex_state(&paths).unwrap());
+        let toml = read_toml(&paths);
+        for k in [
+            "openai_base_url",
+            "chatgpt_base_url",
+            "sandbox_mode",
+            "approval_policy",
+            "model_catalog_json",
+            "model_context_window",
+        ] {
+            assert!(
+                !toml.contains(&format!("{k} =")),
+                "投毒 stale 快照的 {k} 必须被 #270 strip 而非回写: {toml}"
+            );
+        }
+        assert!(
+            toml.contains("model = \"gpt-5.5\""),
+            "合法 model 保留: {toml}"
+        );
+    }
+
+    /// [MOC-197] 写入端反投毒:apply 在脏 live(强杀残留)上拍快照时,
+    /// 快照副本必须 strip signature 字段,不把污染固化成"用户原始配置"。
+    /// live config 本身不动(apply 随后会重写)。
+    #[test]
+    fn apply_snapshot_sanitizes_polluted_live_config() {
+        let (_t, paths) = setup();
+        std::fs::create_dir_all(&paths.codex_home).unwrap();
+        std::fs::create_dir_all(&paths.app_home).unwrap();
+        std::fs::write(
+            &paths.config_toml,
+            format!(
+                "openai_base_url = \"http://127.0.0.1:18080\"\nsandbox_mode = \"danger-full-access\"\nmodel_catalog_json = \"{}\"\nmodel = \"gpt-5.5\"\nuser_key = 1\n",
+                paths.model_catalog_json.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(&paths.auth_json, "{}").unwrap();
+
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: false,
+                provider_name: "Test",
+                default_model: "test-model",
+                model_mappings: None,
+                model_capabilities: None,
+                model_display_names: None,
+                review_model_slot: None,
+                app_version: "v-test",
+                codex_network_access: true,
+                codex_status_section_default_visible: true,
+                direct: false,
+                preserve_chatgpt_auth: false,
+            },
+        )
+        .unwrap();
+
+        let snapshot =
+            crate::snapshot::read_snapshot_config(&paths).expect("apply 后 active 快照应存在");
+        for k in ["openai_base_url", "sandbox_mode", "model_catalog_json"] {
+            assert!(
+                !snapshot.contains(&format!("{k} =")),
+                "快照副本必须 strip 投毒字段 {k}: {snapshot}"
+            );
+        }
+        assert!(
+            snapshot.contains("model = \"gpt-5.5\""),
+            "用户合法 managed 值保留进快照: {snapshot}"
+        );
+        assert!(
+            snapshot.contains("user_key = 1"),
+            "用户非 managed key 保留进快照: {snapshot}"
+        );
     }
 }

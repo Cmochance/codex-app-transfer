@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use codex_app_transfer_codex_integration::{
     apply_provider, catalog_models_for_provider_with_display_names, ensure_file_store_mode,
-    get_snapshot_status, has_snapshot, list_snapshots, read_auth, restore_available_count,
-    restore_codex_snapshot, restore_codex_state, sync_mcp_credentials, ApplyConfig, CodexPaths,
+    get_snapshot_status, has_snapshot, has_stale_active_snapshot, list_snapshots, read_auth,
+    restore_available_count, restore_codex_snapshot, restore_codex_state, sync_mcp_credentials,
+    ApplyConfig, CodexPaths,
 };
 use codex_app_transfer_gemini_oauth::antigravity_static_models;
 use codex_app_transfer_proxy::proxy_telemetry;
@@ -575,14 +576,23 @@ pub fn restore_codex_if_enabled(reason: &str) -> Value {
             return json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e.to_string()})
         }
     };
-    if !has_snapshot(&paths) {
+    // [MOC-197] stale session 快照(被强杀 session 遗留)也算"有快照"——
+    // restore_codex_state 内部会兜底还原它(startup 自愈核心路径);只有
+    // active/ 真空才 skip。
+    if !has_snapshot(&paths) && !has_stale_active_snapshot(&paths) {
         return json!({"attempted": false, "restored": false, "success": true, "reason": reason, "message": "no snapshot; skip"});
     }
     match restore_codex_state(&paths) {
         Ok(restored) => {
+            // [MOC-197 silent-failure HIGH#2] startup/exit 自愈是核心交付,caller
+            // (main.rs)`let _ =` 丢弃返回值 → 这里必须自己留 audit trail,否则
+            // 自愈失败的症状(残留 sandbox_mode → Codex 报"无法设置管理员沙盒")
+            // 与未触发无法区分。
+            tracing::info!("codex restore ({reason}): restored={restored}");
             json!({"attempted": true, "restored": restored, "success": true, "reason": reason})
         }
         Err(e) => {
+            tracing::error!("codex restore ({reason}) failed: {e}");
             json!({"attempted": true, "restored": false, "success": false, "reason": reason, "message": e.to_string()})
         }
     }

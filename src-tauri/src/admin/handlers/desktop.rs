@@ -7,8 +7,8 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::{
-    discard_mcp_mirror, get_snapshot_status, has_snapshot, list_snapshots,
-    repair_residual_pollution, restore_codex_snapshot, restore_codex_state,
+    discard_mcp_mirror, get_snapshot_status, has_snapshot, has_stale_active_snapshot,
+    list_snapshots, repair_residual_pollution, restore_codex_snapshot, restore_codex_state,
     restore_mcp_credentials_from_mirror, scan_residual_pollution, CodexPaths,
 };
 use serde::Deserialize;
@@ -141,7 +141,9 @@ pub async fn desktop_clear() -> impl IntoResponse {
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     // follow-up #28 P0 守门:无快照时**直接 noop 不动文件**。
-    if !has_snapshot(&paths) {
+    // [MOC-197] stale session 快照(被强杀 session 遗留)也算"有快照"——
+    // restore_codex_state 内部会兜底还原它;只有 active/ 真空(从未 apply)才 noop。
+    if !has_snapshot(&paths) && !has_stale_active_snapshot(&paths) {
         return Json(json!({
             "success": true,
             "restored": false,
