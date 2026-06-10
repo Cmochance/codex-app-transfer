@@ -865,16 +865,25 @@ pub(crate) fn build_compact_v2_response_plan(
     // 输出会逼近 Codex 默认 ~300s idle timeout;V1 端点靠 Codex 的 compact 专属
     // 4x timeout 宽限,V2 走普通 /responses 没有这个优待。
     let id = compact_v2_response_id();
-    let created = sse_event(
+    // sequence_number(chatgpt-codex P1 / devin):全仓 SSE 不变量(converter.rs
+    // `every_sse_event_has_monotonically_increasing_sequence_number`)要求每个
+    // event 带单调递增 sequence_number,strict client 据此排序。两段流约定:head
+    // 固定发 created(seq 0),tail 从 seq 1 续(success:1,2 / failed:1)。复用
+    // core::events::emit_sse_event 统一注入,不另造轮子。
+    let mut head_buf = Vec::new();
+    let mut seq = 0u64;
+    crate::core::events::emit_sse_event(
+        &mut head_buf,
+        &mut seq,
         "response.created",
-        &json!({
+        json!({
             "type": "response.created",
             "response": {"id": id, "object": "response", "status": "in_progress", "output": []},
         }),
     );
     let head =
         futures_util::stream::once(
-            async move { Ok::<Bytes, std::io::Error>(Bytes::from(created)) },
+            async move { Ok::<Bytes, std::io::Error>(Bytes::from(head_buf)) },
         );
     let tail = futures_util::stream::once(async move {
         let sse = match collect_compact_summary_for_v2(upstream_status, upstream_stream).await {
@@ -1026,10 +1035,6 @@ fn extract_compact_usage(parsed: &Value) -> Value {
     })
 }
 
-fn sse_event(event: &str, data: &Value) -> String {
-    format!("event: {event}\ndata: {data}\n\n")
-}
-
 fn compact_v2_response_id() -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1043,27 +1048,34 @@ fn compact_v2_response_id() -> String {
 /// completed.output 仅取 usage —— 上游 collect_compaction_output 坐实,不双计)。
 fn compact_v2_success_tail(id: &str, encrypted_content: &str, usage: Value) -> Vec<u8> {
     let item = json!({"type": "compaction", "encrypted_content": encrypted_content});
-    let item_done = json!({
-        "type": "response.output_item.done",
-        "output_index": 0,
-        "item": item,
-    });
-    let completed = json!({
-        "type": "response.completed",
-        "response": {
-            "id": id,
-            "object": "response",
-            "status": "completed",
-            "output": [item],
-            "usage": usage,
-        },
-    });
-    format!(
-        "{}{}",
-        sse_event("response.output_item.done", &item_done),
-        sse_event("response.completed", &completed),
-    )
-    .into_bytes()
+    let mut out = Vec::new();
+    let mut seq = 1u64; // head 已用 seq 0(created)
+    crate::core::events::emit_sse_event(
+        &mut out,
+        &mut seq,
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": item,
+        }),
+    );
+    crate::core::events::emit_sse_event(
+        &mut out,
+        &mut seq,
+        "response.completed",
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": id,
+                "object": "response",
+                "status": "completed",
+                "output": [item],
+                "usage": usage,
+            },
+        }),
+    );
+    out
 }
 
 /// 失败流尾段:failed 事件。`code` 已按白名单语义预映射(见
@@ -1071,16 +1083,23 @@ fn compact_v2_success_tail(id: &str, encrypted_content: &str, usage: Value) -> V
 /// quality 类 kind);`upstream_error_kind` 保留原始分类供诊断(对齐
 /// chat/grok/gemini 失败流惯例)。
 fn compact_v2_failed_tail(id: &str, code: &str, kind: &str, message: &str) -> Vec<u8> {
-    let failed = json!({
-        "type": "response.failed",
-        "response": {
-            "id": id,
-            "object": "response",
-            "status": "failed",
-            "error": {"code": code, "message": message, "upstream_error_kind": kind},
-        },
-    });
-    sse_event("response.failed", &failed).into_bytes()
+    let mut out = Vec::new();
+    let mut seq = 1u64; // head 已用 seq 0(created)
+    crate::core::events::emit_sse_event(
+        &mut out,
+        &mut seq,
+        "response.failed",
+        json!({
+            "type": "response.failed",
+            "response": {
+                "id": id,
+                "object": "response",
+                "status": "failed",
+                "error": {"code": code, "message": message, "upstream_error_kind": kind},
+            },
+        }),
+    );
+    out
 }
 
 /// 校验 compact summary 的输出质量。
@@ -2204,6 +2223,19 @@ mod tests {
             !out.contains("\"type\":\"message\""),
             "不得混入普通 item: {out}"
         );
+        // sequence_number 单调递增 0,1,2(全仓 SSE 不变量,chatgpt-codex P1/devin)
+        assert!(
+            out.contains("\"sequence_number\":0"),
+            "created seq=0: {out}"
+        );
+        assert!(
+            out.contains("\"sequence_number\":1"),
+            "output_item.done seq=1: {out}"
+        );
+        assert!(
+            out.contains("\"sequence_number\":2"),
+            "completed seq=2: {out}"
+        );
     }
 
     #[tokio::test]
@@ -2225,6 +2257,12 @@ mod tests {
         assert!(out.contains("event: response.failed"), "{out}");
         assert!(out.contains("\"code\":\"invalid_prompt\""), "{out}");
         assert!(!out.contains("response.completed"), "{out}");
+        // 失败流 seq:created=0, failed=1
+        assert!(
+            out.contains("\"sequence_number\":0"),
+            "created seq=0: {out}"
+        );
+        assert!(out.contains("\"sequence_number\":1"), "failed seq=1: {out}");
     }
 
     #[tokio::test]
