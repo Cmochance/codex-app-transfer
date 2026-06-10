@@ -34,7 +34,36 @@ pub fn build_router_with_relogin(
     build_router_with_state(ProxyState::new(resolver).with_relogin_notify(on_chatgpt_unauthorized))
 }
 
+/// 注册 apply_patch 埋点 sink(进程级一次)。adapter(`codex_app_transfer_adapters`)不能反向
+/// 依赖本 crate(循环依赖),故由这里把「补 `seq`/`captured_at`/`proxy_version` 再 push 进
+/// [`crate::trace_store`]」的闭包注册给 adapter,gate 复用诊断总开关
+/// [`crate::diagnostics::forward_trace_enabled`](env / app 内「诊断模式」,默认关)。
+/// `OnceLock`(adapter 内)保证二次调用静默忽略 —— `build_router*` 多次调用 / 测试都安全。
+fn register_apply_patch_trace_sink() {
+    use codex_app_transfer_adapters::core::apply_patch_trace;
+    apply_patch_trace::install(
+        crate::diagnostics::forward_trace_enabled,
+        Box::new(|mut value| {
+            let seq = crate::trace_store::next_seq();
+            if let serde_json::Value::Object(map) = &mut value {
+                map.insert("seq".to_owned(), seq.into());
+                map.insert(
+                    "captured_at".to_owned(),
+                    chrono::Local::now().to_rfc3339().into(),
+                );
+                map.insert("proxy_version".to_owned(), env!("CARGO_PKG_VERSION").into());
+            }
+            crate::trace_store::trace_store().push(
+                crate::trace_store::TraceKind::ApplyPatch,
+                seq,
+                value,
+            );
+        }),
+    );
+}
+
 fn build_router_with_state(state: ProxyState) -> Router {
+    register_apply_patch_trace_sink();
     Router::new()
         .route(
             "/responses",

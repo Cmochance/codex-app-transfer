@@ -327,6 +327,10 @@ impl ChatToResponsesConverter {
     /// namespace 必填字段)。
     pub fn with_original_request(mut self, request: Option<Value>) -> Self {
         self.tool_namespace_map = build_tool_namespace_map(request.as_ref());
+        // [MOC-194] 每个请求都记忆其 cwd:带 `<cwd>` 的是 turn-start 请求,apply_patch 出现在不带
+        // cwd 的后续请求里,故 cwd 记忆必须在此(每请求都过)做 —— 只在 optimize_patch(apply_patch
+        // 专属)记永远学不到 cwd,Tier B 读盘规则会全程 no-op。
+        crate::responses::apply_patch_preflight::remember_cwd_from_request(request.as_ref());
         self.original_request = request;
         self
     }
@@ -871,15 +875,29 @@ impl ChatToResponsesConverter {
                 );
             }
             let input = extract_apply_patch_input(&args_acc);
-            // 缓存 input 到 pending,供 `tool_call_item_completed`(envelope
-            // output[] 终态)读,避免重复 parse 与潜在 drift。
+            // [MOC-57] JSON 结构截断(看 raw args,独立于 input)。先算:中间层「缺信封补全」须
+            // gate 在 JSON 完整上 —— 避免把**流式截断**的半截 patch 误补成"完整"(破坏性半应用)。
+            let json_truncation = detect_json_truncation(&args_acc);
+            // [apply_patch 中间层] 按白名单逐条恢复模型不遵循 prompt 产出的已知格式错误
+            // (双边 @@ / 上下文 byte-exact 失配 / 空 Update+Move / 缺信封)。只动确定的已知坑、
+            // 未知一律原样放行(不猜不丢)。cwd 取自 Codex 注入请求的 `<cwd>`(self.original_request)。
+            let preflight_cwd = crate::responses::apply_patch_preflight::extract_cwd(
+                self.original_request.as_ref(),
+            );
+            let (input, preflight_repairs) =
+                crate::responses::apply_patch_preflight::optimize_patch(
+                    &input,
+                    preflight_cwd.as_deref(),
+                    json_truncation.is_none(),
+                );
+            let preflight_repairs_val =
+                crate::responses::apply_patch_preflight::repairs_to_value(&preflight_repairs);
+            // 缓存**最终** input(对齐 + 补全后)到 pending,供 `tool_call_item_completed`
+            // (envelope output[] 终态)读,避免重复 parse 与潜在 drift。
             if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
                 pending.apply_patch_input = Some(input.clone());
             }
-            // [MOC-57] 截断检测(JSON 结构 + V4A 信封双层级)。#303 只靠
-            // `interrupted` 模糊信号判断 patch 是否完整;这里主动检测 args 是否
-            // 被流式切断,即使上游没断流也能发现。
-            let json_truncation = detect_json_truncation(&args_acc);
+            // V4A 信封截断检测(对补全后的 input);#303 的 `interrupted` 之外主动发现切断。
             let v4a_truncation = detect_v4a_truncation(&input);
             let is_truncated = json_truncation.is_some() || v4a_truncation.is_some();
             // [MOC-57] V4A 后验语法校验(仅非截断时做,截断本身已是 invalid)。
@@ -901,6 +919,31 @@ impl ChatToResponsesConverter {
             // 让 Codex CLI 看到 apply_patch handler 不应执行 partial/invalid patch
             // (apply_patch destructive,partial 执行可能在意外目标写入意外内容)。
             let should_incomplete = interrupted || is_truncated || v4a_validation.is_some();
+            // [apply-patch 诊断页] 逐 call 记录完整决策链(原始 args → 提取 V4A → 截断/校验
+            // verdict → completed/incomplete),供诊断查看器「apply-patch」页精修本模块。默认关、
+            // 关时零开销(emit 内部先 gate 再构造)。
+            crate::core::apply_patch_trace::emit(
+                &crate::core::apply_patch_trace::ApplyPatchTrace {
+                    source: "chat",
+                    model: &self.model,
+                    call_id: &call_id,
+                    fc_id: &fc_id,
+                    args_raw: &args_acc,
+                    input: &input,
+                    interrupted,
+                    json_truncation: json_truncation.as_deref(),
+                    v4a_truncation: v4a_truncation.as_deref(),
+                    v4a_validation: v4a_validation
+                        .as_ref()
+                        .map(|e| (e.line, e.message.as_str())),
+                    decision: if should_incomplete {
+                        "incomplete"
+                    } else {
+                        "completed"
+                    },
+                    repairs: (!preflight_repairs.is_empty()).then_some(&preflight_repairs_val),
+                },
+            );
             if should_incomplete {
                 tracing::warn!(
                     target: "adapters::apply_patch",
