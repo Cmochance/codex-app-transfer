@@ -594,7 +594,7 @@
       "settings.residualScanStatusError": "扫描失败：{error}",
       "settings.residualScanRefresh": "重新扫描",
       "settings.residualScanRepair": "针对性清除",
-      "settings.residualScanShowFields": "显示重复字段",
+      "settings.residualScanShowFields": "显示残留字段",
       "settings.residualScanShowFieldsClean": "✅ 无残留字段，无需清除。",
       "settings.residualScanPreviewTitle": "即将 strip 的字段：",
       "settings.residualScanConfirm": "本工具会从下列文件中删除标注的 transfer 字段（其它内容包括 model / personality / [projects.*] / mcp_servers 等全部保留）：\n\n{preview}\n\n确认继续？",
