@@ -36,6 +36,8 @@ pub struct AnthropicMessagesPreparedRequest {
     pub headers: HeaderMap,
     pub response_session: Option<ResponseSessionPlan>,
     pub is_compact: bool,
+    /// [MOC-198] remote compaction v2(见 `types.rs::RequestPlan::compact_v2`)。
+    pub compact_v2: bool,
     pub original_responses_request: Option<Value>,
     pub tool_name_maps: AnthropicToolNameMaps,
 }
@@ -79,8 +81,14 @@ pub fn prepare_anthropic_messages_request(
     body: Bytes,
     provider: &Provider,
 ) -> Result<AnthropicMessagesPreparedRequest, AdapterError> {
-    if compact::is_compact_path(client_path) {
-        let compact_chat_body = compact::build_compact_chat_request(&body, provider)?;
+    if let Some(kind) = compact::detect_compact(client_path, &body) {
+        // [MOC-198] V2 先剥 compaction_trigger,其余与 V1 同路;响应侧按
+        // compact_v2 选 JSON/SSE 包装。
+        let body_eff = match kind {
+            compact::CompactKind::V1 => body.to_vec(),
+            compact::CompactKind::V2 => compact::strip_compaction_trigger(&body)?,
+        };
+        let compact_chat_body = compact::build_compact_chat_request(&body_eff, provider)?;
         let compact_chat_json: Value = serde_json::from_slice(&compact_chat_body)
             .map_err(|e| AdapterError::Internal(format!("compact chat body decode: {e}")))?;
         let wire = chat_body_to_anthropic_messages_request(&compact_chat_json, false)?;
@@ -91,6 +99,7 @@ pub fn prepare_anthropic_messages_request(
             headers: anthropic_messages_default_headers(),
             response_session: None,
             is_compact: true,
+            compact_v2: kind == compact::CompactKind::V2,
             original_responses_request: None,
             tool_name_maps: wire.tool_name_maps,
         });
@@ -109,6 +118,7 @@ pub fn prepare_anthropic_messages_request(
         headers: anthropic_messages_default_headers(),
         response_session: Some(conversion.response_session),
         is_compact: false,
+        compact_v2: false,
         original_responses_request: Some(parsed),
         tool_name_maps: conversion.tool_name_maps,
     })
@@ -123,6 +133,7 @@ pub fn into_request_plan(prepared: AnthropicMessagesPreparedRequest) -> RequestP
         response_session: prepared.response_session,
         adapter_metadata,
         is_compact: prepared.is_compact,
+        compact_v2: prepared.compact_v2,
         original_responses_request: prepared.original_responses_request,
     }
 }

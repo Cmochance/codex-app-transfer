@@ -1,19 +1,31 @@
-//! 本地实现 OpenAI Responses 私有 `/responses/compact` 端点。
+//! 本地实现 Codex autocompact 两套协议(V1 / V2 双轨)。
 //!
-//! Codex CLI 在累计 token 超过 `model_auto_compact_token_limit` 时会调
+//! ## V1:私有 `/responses/compact` 端点
+//!
+//! 旧版 Codex CLI 在累计 token 超过 `model_auto_compact_token_limit` 时会调
 //! `POST /responses/compact`,期望后端做"上下文压缩"——把整段对话历史摘要成
 //! 一段简短的纯文本 summary,用 `{"output":[{"type":"compaction",
 //! "encrypted_content":"<SUMMARY_PREFIX>\n<text>"}]}` 形态回写。
+//!
+//! ## V2:[MOC-198] remote compaction v2
+//!
+//! 新版 Codex(启用 `remote_compaction_v2`)不再调私有端点,改发**普通流式
+//! `/responses`** 请求并在 `input` 末尾追加 `{"type":"compaction_trigger"}`
+//! 标记 item,期待响应流中**恰好一个** `type=compaction` output item(否则
+//! 报 `remote compaction v2 expected exactly one compaction output item`)。
+//! 响应必须是 SSE 流:`response.created` → `response.output_item.done`
+//! (单 `type=compaction` item)→ `response.completed`。
+//!
+//! ## 公共实现说明
 //!
 //! 这是 OpenAI 官方 Responses API 的私有扩展,**所有第三方 OpenAI-compatible
 //! provider(MiMo / Kimi / DeepSeek / MiniMax / 智谱 / 百炼)都不支持**——
 //! 透传必 404,litellm 也只对 openai provider 实现透传。
 //!
-//! 本模块在我们代理层本地实现:把 `CompactionInput` 重组成普通
-//! `/chat/completions` 请求(注入抄自 codex 自家的 SUMMARIZATION_PROMPT 作
-//! 为 system message),拿到上游 chat completion 响应后,提取
-//! `choices[0].message.content` 作为 summary,包装成 Codex CLI 期待的
-//! compact 响应。
+//! 本模块在代理层本地实现两套路径:把 `CompactionInput`(V1 body /
+//! V2 剥掉 `compaction_trigger` 后的 body)重组成普通 `/chat/completions`
+//! 请求(注入 SUMMARIZATION_PROMPT),拿到上游 chat completion 响应后提取
+//! summary 文本,V1 包装成非流式 JSON compact 响应;V2 包装成 SSE 流。
 //!
 //! ## 协议来源
 //!
@@ -144,6 +156,93 @@ const MAX_UPSTREAM_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 /// 判断入站 path 是否是 `/responses/compact`(含可选 `/v1/`、`/openai/v1/` 前缀)。
 pub(crate) fn is_compact_path(path: &str) -> bool {
     routes::is_exact_responses_compact_path(path)
+}
+
+/// compact 请求类别。
+///
+/// [MOC-198] Codex 启用 `remote_compaction_v2` 后,autocompact 不再调 V1 私有
+/// 端点,改发**普通流式 `/responses`** 请求并在 input 末尾追加
+/// `{"type":"compaction_trigger"}` 标记(上游 `codex-rs/core/src/compact_remote_v2.rs`
+/// `input.push(ResponseItem::CompactionTrigger)`),期待响应流中**恰好一个**
+/// `type=compaction` output item,否则报
+/// `remote compaction v2 expected exactly one compaction output item`。
+/// 两版并存:旧版 Codex 仍走 V1,检测必须双轨。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactKind {
+    /// 旧私有端点 `POST /responses/compact`(非流式 JSON 响应)。
+    V1,
+    /// remote compaction v2:`POST /responses`(stream)+ `compaction_trigger`
+    /// input item(SSE 响应,单 compaction output item)。
+    V2,
+}
+
+/// 统一检测入口:V1 按 path,V2 按「普通 /responses + body 含 compaction_trigger」。
+///
+/// V2 检测做两段:先廉价字节子串扫(`"compaction_trigger"` 不在 body 里直接
+/// 返 None,避免为每个普通请求多做一次完整 JSON parse —— compact 触发点在
+/// 80% 上下文,body 可达 MB 级);命中再 parse 确认它真是 input 数组里的 item
+/// type(防历史消息文本里恰好出现这个词的误判)。
+pub(crate) fn detect_compact(client_path: &str, body: &[u8]) -> Option<CompactKind> {
+    if is_compact_path(client_path) {
+        return Some(CompactKind::V1);
+    }
+    if !routes::is_local_responses_route(client_path) {
+        return None;
+    }
+    const NEEDLE: &[u8] = b"\"compaction_trigger\"";
+    if !body.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return None;
+    }
+    let Some(parsed) = serde_json::from_slice::<Value>(body).ok() else {
+        // 不可达级防御(proxy 已整段缓冲,Codex serde 不会发非法 JSON):留痕
+        // 防未来 wire 形态变化让 V2 静默退化成普通对话(silent-failure review)。
+        tracing::debug!(
+            "[compact-v2] body 含 compaction_trigger 字节但 JSON parse 失败,按普通请求处理"
+        );
+        return None;
+    };
+    let has_trigger = parsed
+        .get("input")
+        .and_then(|i| i.as_array())
+        .map(|arr| {
+            arr.iter()
+                .any(|it| it.get("type").and_then(|t| t.as_str()) == Some("compaction_trigger"))
+        })
+        .unwrap_or(false);
+    if !has_trigger {
+        // 字节命中但确认失败:多半是历史文本里出现该词(正常),也可能是上游
+        // 协议改了 trigger 位置/形态(异常)。debug 留痕供后者排查。
+        tracing::debug!(
+            "[compact-v2] body 含 compaction_trigger 字节但非 input item type,按普通请求处理"
+        );
+        return None;
+    }
+    Some(CompactKind::V2)
+}
+
+/// [MOC-198] 从 V2 请求 body 的 input 数组里剥掉 `compaction_trigger` 标记 item。
+/// 它是纯标记(空 item),进历史展开会被当未知 type 产生占位噪音;剥掉后剩余
+/// body 即与 V1 的 `CompactionInput` 同形(model + input 历史),可直接复用
+/// [`build_compact_chat_request`]。
+pub(crate) fn strip_compaction_trigger(body: &[u8]) -> Result<Vec<u8>, AdapterError> {
+    let mut parsed: Value = serde_json::from_slice(body)
+        .map_err(|e| AdapterError::BadRequest(format!("compact v2 body 不是合法 JSON: {e}")))?;
+    let mut stripped = 0usize;
+    if let Some(arr) = parsed.get_mut("input").and_then(|i| i.as_array_mut()) {
+        let before = arr.len();
+        arr.retain(|it| it.get("type").and_then(|t| t.as_str()) != Some("compaction_trigger"));
+        stripped = before - arr.len();
+    }
+    // 不变量:caller 只在 detect_compact 判 V2 后调用(同一字节 parse 两次结果
+    // 一致),必剥掉 ≥1 个。violated = 有人绕过 detect 直接调,trigger 会静默
+    // 流入历史展开(silent-failure review 防御项)。
+    if stripped == 0 {
+        return Err(AdapterError::Internal(
+            "compact v2 strip 不变量违反:body 中无 compaction_trigger item(caller 未经 detect_compact?)".into(),
+        ));
+    }
+    serde_json::to_vec(&parsed)
+        .map_err(|e| AdapterError::Internal(format!("compact v2 body re-serialize: {e}")))
 }
 
 /// 把 Codex CLI 的 `CompactionInput` JSON 改写成上游 `/chat/completions` 请求体。
@@ -686,10 +785,23 @@ fn extract_compact_summary_text(parsed: &Value) -> Option<String> {
             return Some(text);
         }
     }
+    // anthropic messages 非流式:content[].{type:"text",text}(V2 路径 anthropic
+    // 复用共享包装;V1 anthropic 有自己的 collect_and_wrap,不经此函数)
+    if let Some(parts) = root.get("content").and_then(|v| v.as_array()) {
+        let text: String = parts
+            .iter()
+            .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
     None
 }
 
-pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u8>, AdapterError> {
+/// 共享(V1/V2):raw 模型输出 → 质量校验 → `encrypted_content` 文本。
+fn compact_encrypted_content_from_raw(raw: &str) -> Result<String, AdapterError> {
     // B1:抽 `<summary>...</summary>` tag 内容。新短 prompt 不要求此格式,
     // raw fallback(无 tag 时返回原文)是常规路径;tag 解析保留作向后容错。
     let summary = extract_summary_section(raw).trim().to_owned();
@@ -708,7 +820,11 @@ pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u
         )));
     }
 
-    let encrypted_content = format!("{COMPACT_SUMMARY_PREFIX}\n{summary}");
+    Ok(format!("{COMPACT_SUMMARY_PREFIX}\n{summary}"))
+}
+
+pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u8>, AdapterError> {
+    let encrypted_content = compact_encrypted_content_from_raw(raw)?;
     let compact_response = json!({
         "output": [{
             "type": "compaction",
@@ -717,6 +833,254 @@ pub(crate) fn compact_response_body_from_summary_text(raw: &str) -> Result<Vec<u
     });
     serde_json::to_vec(&compact_response)
         .map_err(|e| AdapterError::Internal(format!("serialize compact response: {e}")))
+}
+
+// ─── [MOC-198] remote compaction v2:流式 SSE 包装 ───────────────────────
+
+/// V2:把上游非流式摘要响应包装成 Codex remote compaction v2 期待的 Responses
+/// SSE 流:`response.created` → `response.output_item.done`(单 `type=compaction`
+/// item)→ `response.completed`。摘要重组/提取/质量校验与 V1 完全共享。
+///
+/// 失败路径(上游非 2xx / 摘要质量不过)emit `response.failed`(HTTP 仍 200,
+/// 对齐 MOC-103:Codex 对裸 HTTP 错误 + JSON body 会卡 Thinking),错误 code 经
+/// [`crate::codex_retry_code`] 白名单语义:质量失败 → `invalid_prompt`(永久,
+/// Codex 感知后回退本地 inline compact);上游瞬时错误保留可重试语义。
+/// 绝不把普通对话响应(reasoning+message)发回去 —— 那正是修复前
+/// 「expected exactly one compaction output item, got 0 from 2」的来源。
+pub(crate) fn build_compact_v2_response_plan(
+    upstream_status: StatusCode,
+    mut upstream_headers: HeaderMap,
+    upstream_stream: ByteStream,
+) -> Result<ResponsePlan, AdapterError> {
+    upstream_headers.remove(http::header::CONTENT_LENGTH);
+    upstream_headers.remove(http::header::CONTENT_ENCODING);
+    upstream_headers.remove(http::header::TRANSFER_ENCODING);
+    upstream_headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+
+    // 两段流(edge-case review):先立即 emit `response.created`,再 await 上游
+    // 摘要 —— 摘要可能跑数十秒(慢第三方 + 大上下文),单段流在此期间 0 字节
+    // 输出会逼近 Codex 默认 ~300s idle timeout;V1 端点靠 Codex 的 compact 专属
+    // 4x timeout 宽限,V2 走普通 /responses 没有这个优待。
+    let id = compact_v2_response_id();
+    let created = sse_event(
+        "response.created",
+        &json!({
+            "type": "response.created",
+            "response": {"id": id, "object": "response", "status": "in_progress", "output": []},
+        }),
+    );
+    let head =
+        futures_util::stream::once(
+            async move { Ok::<Bytes, std::io::Error>(Bytes::from(created)) },
+        );
+    let tail = futures_util::stream::once(async move {
+        let sse = match collect_compact_summary_for_v2(upstream_status, upstream_stream).await {
+            Ok((encrypted_content, usage)) => {
+                compact_v2_success_tail(&id, &encrypted_content, usage)
+            }
+            Err((code, kind, msg)) => {
+                // [silent-failure review] 失败必留主进程日志:Retryable code 会让
+                // Codex 静默重发(上限 2 次),重试窗口内仅靠 SSE 错误用户不可见。
+                tracing::warn!(
+                    code,
+                    upstream_error_kind = kind,
+                    "[compact-v2] 失败,emit response.failed: {msg}"
+                );
+                compact_v2_failed_tail(&id, code, kind, &msg)
+            }
+        };
+        Ok::<Bytes, std::io::Error>(Bytes::from(sse))
+    });
+    let stream_with_logic = Box::pin(head.chain(tail));
+
+    Ok(ResponsePlan {
+        status: StatusCode::OK,
+        headers: upstream_headers,
+        stream: stream_with_logic,
+    })
+}
+
+/// 收上游响应 → (encrypted_content, usage)。
+/// Err 携带 (最终 error code, 原始分类 kind, message):code 已按 MOC-79/103
+/// 白名单语义预映射(quality 失败必须 `invalid_prompt`,不能走 `codex_retry_code`
+/// 的 kind 映射 —— 它不认识 quality 类 kind 会落 Retryable);kind 进
+/// `error.upstream_error_kind` 供诊断(对齐 chat/grok/gemini 失败流惯例)。
+async fn collect_compact_summary_for_v2(
+    upstream_status: StatusCode,
+    mut upstream_stream: ByteStream,
+) -> Result<(String, Value), (&'static str, &'static str, String)> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = upstream_stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                return Err((
+                    "server_error",
+                    "upstream_io",
+                    format!("compact v2 upstream io: {e}"),
+                ))
+            }
+        };
+        if buf.len() + bytes.len() > MAX_UPSTREAM_RESPONSE_BYTES {
+            return Err((
+                "server_error",
+                "oversize",
+                format!("compact v2 upstream response > {MAX_UPSTREAM_RESPONSE_BYTES} bytes"),
+            ));
+        }
+        buf.extend_from_slice(&bytes);
+    }
+
+    if !upstream_status.is_success() {
+        let preview: String = String::from_utf8_lossy(&buf).chars().take(300).collect();
+        // 上游 HTTP 错误按瞬时/永久映射:401/403/400 永久 surface,余者保留可重试。
+        // 429 用 `rate_limit_exceeded` 而非仓库他处的 `rate_limited`:上游 codex
+        // 对该字面 code 有 retry-after 解析优待(api_bridge 的 else 分支
+        // try_parse_retry_after),`rate_limited` 则只是普通 Retryable。
+        let (code, kind): (&'static str, &'static str) = match upstream_status.as_u16() {
+            400 => ("invalid_prompt", "http_400"),
+            401 => ("invalid_prompt", "http_401"),
+            403 => ("invalid_prompt", "http_403"),
+            429 => ("rate_limit_exceeded", "http_429"),
+            _ => ("server_error", "http_5xx_or_other"),
+        };
+        return Err((
+            code,
+            kind,
+            format!("compact v2 upstream {upstream_status}: {preview}"),
+        ));
+    }
+
+    let parsed: Value = serde_json::from_slice(&buf).map_err(|e| {
+        let preview: String = String::from_utf8_lossy(&buf).chars().take(300).collect();
+        (
+            "server_error",
+            "non_json",
+            format!("compact v2 upstream non-JSON: {e}; first 300 chars: {preview}"),
+        )
+    })?;
+    let raw = extract_compact_summary_text(&parsed).ok_or_else(|| {
+        let preview: String = serde_json::to_string(&parsed)
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect();
+        (
+            "server_error",
+            "missing_summary",
+            format!("compact v2 upstream missing summary text; first 300 chars: {preview}"),
+        )
+    })?;
+    let encrypted_content = compact_encrypted_content_from_raw(&raw)
+        // 质量校验失败 = 重试同请求大概率同败 → 永久语义(invalid_prompt →
+        // Codex InvalidRequest 非重试,error.rs::is_retryable=false,随后回退
+        // 本地 inline compact —— 上游源码坐实,非推测)
+        .map_err(|e| ("invalid_prompt", "quality_check_failed", e.to_string()))?;
+    Ok((encrypted_content, extract_compact_usage(&parsed)))
+}
+
+/// wire 无关地从上游响应抽 token usage,映射成 Responses usage 形态。
+/// 抽不到一律 0(Codex 只做记账,不影响 compact 语义)。
+fn extract_compact_usage(parsed: &Value) -> Value {
+    let root = parsed.get("response").unwrap_or(parsed);
+    // chat: usage.prompt_tokens/completion_tokens;anthropic: usage.input_tokens/output_tokens
+    let usage = root.get("usage");
+    let mut input = usage
+        .and_then(|u| u.get("prompt_tokens").or_else(|| u.get("input_tokens")))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mut output = usage
+        .and_then(|u| {
+            u.get("completion_tokens")
+                .or_else(|| u.get("output_tokens"))
+        })
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    // gemini / cloud_code(剥 response 后): usageMetadata.promptTokenCount/candidatesTokenCount
+    if input == 0 && output == 0 {
+        if let Some(meta) = root.get("usageMetadata") {
+            input = meta
+                .get("promptTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            output = meta
+                .get("candidatesTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+        }
+    }
+    if input == 0 && output == 0 {
+        // 全 0 兜底安全(Codex 只记账,下一真实 turn 即矫正),但留痕防未来
+        // provider 换 usage 字段名后永远默默报 0(silent-failure review)。
+        tracing::debug!("[compact-v2] 上游响应未抽到 usage,记账按 0 上报");
+    }
+    json!({
+        "input_tokens": input,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": output,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": input + output,
+    })
+}
+
+fn sse_event(event: &str, data: &Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
+fn compact_v2_response_id() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("resp_compact_v2_{millis}")
+}
+
+/// 成功流尾段(created 已由两段流头部先发):output_item.done(compaction)→
+/// completed(output 含同一 item;Codex 只对 OutputItemDone 计数 compaction、
+/// completed.output 仅取 usage —— 上游 collect_compaction_output 坐实,不双计)。
+fn compact_v2_success_tail(id: &str, encrypted_content: &str, usage: Value) -> Vec<u8> {
+    let item = json!({"type": "compaction", "encrypted_content": encrypted_content});
+    let item_done = json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": item,
+    });
+    let completed = json!({
+        "type": "response.completed",
+        "response": {
+            "id": id,
+            "object": "response",
+            "status": "completed",
+            "output": [item],
+            "usage": usage,
+        },
+    });
+    format!(
+        "{}{}",
+        sse_event("response.output_item.done", &item_done),
+        sse_event("response.completed", &completed),
+    )
+    .into_bytes()
+}
+
+/// 失败流尾段:failed 事件。`code` 已按白名单语义预映射(见
+/// [`collect_compact_summary_for_v2`] doc,不经 `codex_retry_code` —— 它不认识
+/// quality 类 kind);`upstream_error_kind` 保留原始分类供诊断(对齐
+/// chat/grok/gemini 失败流惯例)。
+fn compact_v2_failed_tail(id: &str, code: &str, kind: &str, message: &str) -> Vec<u8> {
+    let failed = json!({
+        "type": "response.failed",
+        "response": {
+            "id": id,
+            "object": "response",
+            "status": "failed",
+            "error": {"code": code, "message": message, "upstream_error_kind": kind},
+        },
+    });
+    sse_event("response.failed", &failed).into_bytes()
 }
 
 /// 校验 compact summary 的输出质量。
@@ -1282,6 +1646,14 @@ mod tests {
         }))
     }
 
+    async fn collect_stream_bytes(mut s: ByteStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = s.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        buf
+    }
+
     /// 测试用 helper:把 caller 给的 marker 文本包成至少 850 字符 + 带 markdown
     /// header,以同时满足 `validate_compact_summary_quality` 的 C1(≥800 chars)
     /// 和 C4(至少 1 个 markdown header)门槛。
@@ -1729,5 +2101,173 @@ mod tests {
         with_user_language("en", || {
             assert!(COMPACT_SUMMARY_PREFIX.starts_with("Another language model"));
         });
+    }
+
+    // ─── [MOC-198] remote compaction v2 ───────────────────────────────
+
+    #[test]
+    fn detect_compact_v1_by_path() {
+        assert_eq!(
+            detect_compact("/responses/compact", b"{}"),
+            Some(CompactKind::V1)
+        );
+        assert_eq!(
+            detect_compact("/v1/responses/compact", b"{}"),
+            Some(CompactKind::V1)
+        );
+    }
+
+    #[test]
+    fn detect_compact_v2_by_trigger_item() {
+        let body = br#"{"model":"gpt-5.5","stream":true,"input":[
+            {"type":"message","role":"user","content":"hi"},
+            {"type":"compaction_trigger"}
+        ]}"#;
+        assert_eq!(detect_compact("/responses", body), Some(CompactKind::V2));
+        assert_eq!(detect_compact("/v1/responses", body), Some(CompactKind::V2));
+    }
+
+    #[test]
+    fn detect_compact_ignores_trigger_word_inside_message_content() {
+        // 历史消息文本里恰好出现 "compaction_trigger" 字样 → 字节快筛命中但
+        // parse 确认它不是 input item type → 不得误判 V2
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":"what is \"compaction_trigger\"?"}
+        ]}"#;
+        assert_eq!(detect_compact("/responses", body), None);
+    }
+
+    #[test]
+    fn detect_compact_none_for_plain_responses() {
+        let body = br#"{"model":"m","input":[{"type":"message","role":"user","content":"hi"}]}"#;
+        assert_eq!(detect_compact("/responses", body), None);
+        // 非 responses 路由不参与 v2 检测
+        assert_eq!(
+            detect_compact(
+                "/chat/completions",
+                br#"{"input":[{"type":"compaction_trigger"}]}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn strip_compaction_trigger_keeps_other_items() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":"hi"},
+            {"type":"compaction_trigger"},
+            {"type":"function_call_output","call_id":"c1","output":"ok"}
+        ]}"#;
+        let stripped = strip_compaction_trigger(body).unwrap();
+        let v: Value = serde_json::from_slice(&stripped).unwrap();
+        let arr = v["input"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "只剥 trigger: {v}");
+        assert_eq!(arr[0]["type"], "message");
+        assert_eq!(arr[1]["type"], "function_call_output");
+    }
+
+    #[tokio::test]
+    async fn compact_v2_plan_wraps_chat_upstream_into_sse_with_single_compaction_item() {
+        let long_summary = format!(
+            "## Summary\n{}",
+            "context detail line with substance. ".repeat(60)
+        );
+        let upstream = serde_json::to_vec(&json!({
+            "choices": [{"message": {"role": "assistant", "content": long_summary}}],
+            "usage": {"prompt_tokens": 1200, "completion_tokens": 340}
+        }))
+        .unwrap();
+        let plan = build_compact_v2_response_plan(
+            StatusCode::OK,
+            HeaderMap::new(),
+            one_chunk_stream(upstream),
+        )
+        .unwrap();
+        assert_eq!(plan.status, StatusCode::OK);
+        assert_eq!(
+            plan.headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let body = collect_stream_bytes(plan.stream).await;
+        let out = String::from_utf8(body).unwrap();
+        assert!(out.contains("event: response.created"), "{out}");
+        assert!(out.contains("event: response.output_item.done"), "{out}");
+        assert!(out.contains("event: response.completed"), "{out}");
+        assert_eq!(
+            out.matches("\"type\":\"compaction\"").count(),
+            2,
+            "item.done + completed.output 各一份 compaction item: {out}"
+        );
+        assert!(out.contains("\"input_tokens\":1200"), "{out}");
+        assert!(out.contains("\"output_tokens\":340"), "{out}");
+        assert!(
+            !out.contains("\"type\":\"message\""),
+            "不得混入普通 item: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_v2_plan_emits_failed_event_on_quality_failure() {
+        // 过短 summary → 质量校验失败 → response.failed(invalid_prompt,永久,
+        // Codex 回退 inline compact),HTTP 仍 200
+        let upstream = serde_json::to_vec(&json!({
+            "choices": [{"message": {"role": "assistant", "content": "too short"}}]
+        }))
+        .unwrap();
+        let plan = build_compact_v2_response_plan(
+            StatusCode::OK,
+            HeaderMap::new(),
+            one_chunk_stream(upstream),
+        )
+        .unwrap();
+        assert_eq!(plan.status, StatusCode::OK);
+        let out = String::from_utf8(collect_stream_bytes(plan.stream).await).unwrap();
+        assert!(out.contains("event: response.failed"), "{out}");
+        assert!(out.contains("\"code\":\"invalid_prompt\""), "{out}");
+        assert!(!out.contains("response.completed"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn compact_v2_plan_maps_upstream_429_to_retryable_failed() {
+        let plan = build_compact_v2_response_plan(
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            one_chunk_stream(b"{\"error\":\"slow down\"}".to_vec()),
+        )
+        .unwrap();
+        assert_eq!(plan.status, StatusCode::OK, "对齐 MOC-103:错误也走 200+SSE");
+        let out = String::from_utf8(collect_stream_bytes(plan.stream).await).unwrap();
+        assert!(out.contains("event: response.failed"), "{out}");
+        assert!(
+            out.contains("\"code\":\"rate_limit_exceeded\""),
+            "瞬时错误保留可重试语义: {out}"
+        );
+    }
+
+    #[test]
+    fn extract_summary_handles_anthropic_content_shape() {
+        let parsed = json!({
+            "content": [
+                {"type": "text", "text": "part one. "},
+                {"type": "text", "text": "part two."}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        assert_eq!(
+            extract_compact_summary_text(&parsed).as_deref(),
+            Some("part one. part two.")
+        );
+    }
+
+    #[test]
+    fn extract_usage_covers_three_wires() {
+        let chat = json!({"usage": {"prompt_tokens": 7, "completion_tokens": 3}});
+        assert_eq!(extract_compact_usage(&chat)["total_tokens"], 10);
+        let gemini = json!({"usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 5}});
+        assert_eq!(extract_compact_usage(&gemini)["input_tokens"], 20);
+        let cloud_code = json!({"response": {"usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 2}}});
+        assert_eq!(extract_compact_usage(&cloud_code)["total_tokens"], 10);
+        let anthropic = json!({"usage": {"input_tokens": 4, "output_tokens": 6}});
+        assert_eq!(extract_compact_usage(&anthropic)["output_tokens"], 6);
     }
 }

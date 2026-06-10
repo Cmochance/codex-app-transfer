@@ -39,6 +39,7 @@ pub(crate) fn transform_anthropic_messages_response_stream(
         request_plan.original_responses_request.clone(),
         tool_name_maps,
         request_plan.is_compact,
+        request_plan.compact_v2,
     )
 }
 

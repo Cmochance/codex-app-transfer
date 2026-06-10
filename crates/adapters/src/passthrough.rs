@@ -64,6 +64,7 @@ impl Adapter for ResponsesPassthroughAdapter {
             response_session: None,
             adapter_metadata: None,
             is_compact: false,
+            compact_v2: false,
             original_responses_request: None,
         })
     }

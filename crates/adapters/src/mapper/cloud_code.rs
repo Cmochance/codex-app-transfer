@@ -1,6 +1,7 @@
 use crate::mapper::{RequestMapper, ResponseMapper};
 use crate::responses::compact::{
-    build_compact_chat_request, build_compact_response_plan, is_compact_path,
+    build_compact_chat_request, build_compact_response_plan, build_compact_v2_response_plan,
+    detect_compact, strip_compaction_trigger, CompactKind,
 };
 use crate::types::AdapterError;
 use crate::types::{ByteStream, RequestPlan, ResponsePlan};
@@ -331,13 +332,20 @@ pub(crate) fn prepare_cloud_code_request(
 ) -> Result<RequestPlan, AdapterError> {
     // MOC-92:compact 路径 —— 必须跟普通请求一样转 Gemini wire + 裹 cloud-code envelope,
     // 但用 build_compact_chat_request(摘要 prompt + 历史预算)、走非流 generateContent、
-    // 并标 is_compact=true 让响应侧 route 到 build_compact_response_plan。否则 antigravity
-    // 的 /responses/compact 被当普通请求 → 响应是 SSE 而非 Codex compact client 要的
-    // JSON {"output":[...]} → `expected value at line 1 column 1`(对齐 gemini_native:24-52)。
-    if is_compact_path(client_path) {
+    // 并标 is_compact=true 让响应侧按双轨 route:V1(/responses/compact)→
+    // build_compact_response_plan(非流式 JSON {"output":[...]});V2(compaction_trigger)→
+    // build_compact_v2_response_plan(SSE 流,单 compaction item)。否则 antigravity
+    // 的 compact 请求被当普通请求 → 响应格式不匹配 → Codex 报错(MOC-92/MOC-198)。
+    if let Some(kind) = detect_compact(client_path, &body) {
+        // [MOC-198] V2(普通流式 /responses + compaction_trigger)先剥标记 item,
+        // 其余与 V1 同路;响应侧按 compact_v2 选 JSON/SSE 包装。
+        let body_eff = match kind {
+            CompactKind::V1 => body.to_vec(),
+            CompactKind::V2 => strip_compaction_trigger(&body)?,
+        };
         let flavor = CloudCodeApiFlavor::from_api_format(&provider.api_format);
         let project_id = resolve_cloud_code_project_id(provider)?;
-        let compact_chat_body = build_compact_chat_request(&body, provider)?;
+        let compact_chat_body = build_compact_chat_request(&body_eff, provider)?;
         let compact_chat_json: Value = serde_json::from_slice(&compact_chat_body)
             .map_err(|e| AdapterError::Internal(format!("compact chat body decode: {e}")))?;
         let model = compact_chat_json
@@ -372,6 +380,7 @@ pub(crate) fn prepare_cloud_code_request(
             response_session: None,
             adapter_metadata: None,
             is_compact: true,
+            compact_v2: kind == CompactKind::V2,
             original_responses_request: None,
         });
     }
@@ -434,6 +443,7 @@ pub(crate) fn prepare_cloud_code_request(
         response_session: Some(conversion.response_session),
         adapter_metadata: None,
         is_compact: false,
+        compact_v2: false,
         original_responses_request: Some(parsed),
     })
 }
@@ -447,10 +457,19 @@ pub(crate) fn transform_cloud_code_response_stream(
     upstream_stream: ByteStream,
     request_plan: &RequestPlan,
 ) -> Result<ResponsePlan, AdapterError> {
-    // MOC-92:compact 响应走本地 compact 包装(非 SSE)。build_compact_response_plan
-    // 收原始 generateContent body(cloud-code 裹在 `{"response":{...}}` 里),
+    // MOC-92/MOC-198:compact 响应走本地 compact 包装,按 compact_v2 双轨:
+    // V1(/responses/compact) → build_compact_response_plan(非流式 JSON)。
+    // V2(compaction_trigger) → build_compact_v2_response_plan(SSE 流)。
+    // 两路均收原始 generateContent body(cloud-code 裹在 `{"response":{...}}` 里),
     // extract_compact_summary_text 会剥 `response` + 抽 gemini candidates 文本。
     if request_plan.is_compact {
+        if request_plan.compact_v2 {
+            return build_compact_v2_response_plan(
+                upstream_status,
+                upstream_headers,
+                upstream_stream,
+            );
+        }
         return build_compact_response_plan(upstream_status, upstream_headers, upstream_stream);
     }
     upstream_headers.remove(http::header::CONTENT_LENGTH);
