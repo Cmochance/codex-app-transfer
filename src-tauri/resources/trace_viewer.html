@@ -38,9 +38,13 @@
   .badge.mcp { background: #3a2a14; color: var(--warn); }
   .badge.cat_webfetch { background: #14402a; color: var(--ok); }
   .badge.chatgpt_backend { background: #3a2440; color: #c89bf0; }
+  .badge.apply_patch { background: #3d2a14; color: #f0a868; }
+  .badge.codex_response { background: #142d3d; color: #68c0f0; }
   .row .summary { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); }
   .row .status { flex: none; font: 11px var(--mono); }
   .st2 { color: var(--ok); } .st4, .st5 { color: var(--err); }
+  .stc { color: var(--ok); } .sti { color: var(--err); }  /* apply-patch call: completed / incomplete */
+  .sto { color: var(--ok); } .ste { color: var(--err); }  /* apply-patch result: ok / error */
   #detail { flex: 1; overflow-y: auto; padding: 14px; }
   #detail .empty { color: var(--muted); margin-top: 40px; text-align: center; }
   .meta { color: var(--muted); font: 11px var(--mono); margin-bottom: 12px; word-break: break-all; }
@@ -69,6 +73,11 @@
     border: 1px solid var(--border); color: var(--muted); }
   .uchip b { color: var(--fg); font-weight: 600; }
   .uchip.cache b { color: var(--ok); } .uchip.reason b { color: var(--warn); }
+  /* apply-patch 页:决策 / 校验 verdict 胶囊 */
+  .vchip { font: 11px var(--mono); padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); }
+  .vchip.ok { background: #14402a; color: var(--ok); border-color: #1f6b40; }
+  .vchip.warn { background: #3d2a14; color: var(--warn); border-color: #6b4a1f; }
+  .vchip.err { background: #3a1414; color: var(--err); border-color: #6b1f1f; }
   .group-hd { position: sticky; top: 0; padding: 4px 12px; background: var(--panel2); color: var(--accent);
     font: 600 11px var(--mono); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; }
   .group-hd .cnt { color: var(--muted); }
@@ -93,6 +102,8 @@
       <option value="mcp">mcp</option>
       <option value="cat_webfetch">cat-webfetch</option>
       <option value="chatgpt_backend">chatgpt-backend</option>
+      <option value="apply_patch">apply-patch</option>
+      <option value="codex_response">codex-response</option>
     </select>
     <select id="group">
       <option value="none">不分组</option>
@@ -124,6 +135,8 @@
     if (t.trace_kind === "forward_protocol") return "forward";
     if (t.trace_kind === "cat_webfetch") return "cat_webfetch";
     if (t.trace_kind === "chatgpt_backend") return "chatgpt_backend";
+    if (t.trace_kind === "apply_patch") return "apply_patch";
+    if (t.trace_kind === "codex_response") return "codex_response";
     return "mcp";
   }
 
@@ -137,10 +150,29 @@
       const r = t.request || {};
       return `${esc(t.tool || "")} ${esc(r.url || r.query || "")}`;
     }
+    if (k === "apply_patch") {
+      if ((t.phase || "call") === "result") {
+        const o = t.output || {};
+        return `↩ result ${esc((t.call_id || "").slice(-8))} ${t.is_error ? "ERROR" : "ok"} ${o.len || 0}B`;
+      }
+      // <model> · <source> · <extraction>;incomplete 时附原因,一眼定位 misbehave 模型/形态
+      const reasons = (t.incomplete_reasons || []).join(",");
+      return `${esc(t.model || "?")} · ${esc(t.source || "")} · ${esc(t.extraction || "")}`
+        + (reasons ? ` · ${esc(reasons)}` : "");
+    }
+    if (k === "codex_response") {
+      return `${esc(t.method || "")} ${esc(t.client_path || "")} → Codex`;
+    }
     return `${esc((t.event || "mcp"))} ${esc(t.url || "")}`;
   }
   function statusOf(t) {
-    if (kindOf(t) === "cat_webfetch") {
+    const k = kindOf(t);
+    if (k === "codex_response") return t.status || "";
+    if (k === "apply_patch") {
+      if ((t.phase || "call") === "result") return t.is_error ? "error" : "ok";
+      return t.decision || "";
+    }
+    if (k === "cat_webfetch") {
       const f = t.fetch || {}, r = t.result || {};
       if (f.status != null) return f.status;
       return r.is_error ? "err" : "ok";
@@ -442,6 +474,8 @@
     if (!t) { detailEl.innerHTML = "<div class='empty'>选择左侧一条记录查看详情</div>"; return; }
     const k = kindOf(t);
     if (k === "cat_webfetch") { renderCatWebfetch(t); return; }
+    if (k === "apply_patch") { renderApplyPatch(t); return; }
+    if (k === "codex_response") { renderCodexResponse(t); return; }
     // chatgpt_backend(passthrough)结构同 forward(inbound/outbound/response),复用同一渲染。
     if (k !== "forward" && k !== "chatgpt_backend") {
       detailEl.innerHTML = `<div class="tools"><button data-copy="full">复制 JSON</button></div>`
@@ -508,6 +542,133 @@
     detailEl.innerHTML = html;
   }
 
+  // apply-patch 决策链详情:原始 args → 提取+修复 V4A(含 diff)→ 截断/语法 verdict → completed/incomplete。
+  // 精修本模块时一眼看清「上游回了啥 / extract_apply_patch_input + repair_v4a_envelope 改了啥 /
+  // 为什么判 incomplete」。
+  // 按 call_id + phase 找配对的 apply_patch 记录(call ↔ result 互链)。
+  function apTraceByPhase(callId, phase) {
+    return traces.find((x) => kindOf(x) === "apply_patch" && (x.phase || "call") === phase && x.call_id === callId);
+  }
+
+  function renderApplyPatch(t) {
+    const phase = t.phase || "call";
+
+    // ── phase = result:Codex apply 后回灌给模型的结果(成功/错误);失败正是触发模型重试的原因 ──
+    if (phase === "result") {
+      const o = t.output || {};
+      const oTrunc = o.truncated_bytes > 0 ? `<div class="trunc">⚠ 截断:原 ${o.len} 字节,丢 ${o.truncated_bytes}</div>` : "";
+      const call = apTraceByPhase(t.call_id, "call");
+      let callInner;
+      if (call) {
+        const ci = call.input || {};
+        callInner = `<table class="hdr">`
+          + `<tr><td class="k">model</td><td class="v">${esc(call.model || "?")} / ${esc(call.source || "")}</td></tr>`
+          + `<tr><td class="k">decision</td><td class="v">${esc(call.decision || "?")}</td></tr>`
+          + `<tr><td class="k">input</td><td class="v">${ci.len || 0} 字节</td></tr></table>`
+          + `<pre class="payload mini">${esc((ci.v4a || "").slice(0, 4000))}</pre>`
+          + `<div class="meta">→ 列表选 seq ${esc(call.seq)} 看该 patch 完整记录(args / diff / verdict)</div>`;
+      } else {
+        callInner = `<div class="meta">未找到对应 patch call(可能已被 ring 淘汰,或诊断在该 call 之后才开启)</div>`;
+      }
+      detailEl.innerHTML = `<div class="meta">phase: result · call_id ${esc(t.call_id || "")} · seq ${esc(t.seq)} · ${esc(t.captured_at || "")}</div>`
+        + `<div class="usage"><span class="vchip ${t.is_error ? "err" : "ok"}">apply 结果: ${t.is_error ? "ERROR(触发重试)" : "ok"}</span></div>`
+        + `<div class="tools"><button data-copy="ap_output">复制结果</button><button data-copy="full">复制 JSON</button></div>`
+        + seg("apply 结果 · Codex 回灌给模型的 output", `${o.len || 0} 字节`,
+            `<pre class="payload">${esc(o.text || "")}</pre>${oTrunc}`)
+        + seg("对应的 patch call", esc((t.call_id || "").slice(-12)), callInner, false);
+      return;
+    }
+
+    // ── phase = call:模型发出的 patch + 我们这层的提取/校验/决策 ──
+    const a = t.args || {}, inp = t.input || {}, c = t.checks || {};
+    const reasons = t.incomplete_reasons || [];
+    const completed = t.decision === "completed";
+    const meta = `model: ${esc(t.model || "?")} · source: ${esc(t.source || "")} · call_id ${esc(t.call_id || "")}`
+      + ` · seq ${esc(t.seq)} · ${esc(t.captured_at || "")}`;
+    const chips = [
+      `<span class="vchip ${completed ? "ok" : "err"}">decision: ${esc(t.decision || "?")}</span>`,
+      `<span class="vchip ${(t.extraction === "raw_fallback" || t.extraction === "empty") ? "warn" : "ok"}">extraction: ${esc(t.extraction || "?")}</span>`,
+      `<span class="vchip ${c.interrupted ? "warn" : "ok"}">interrupted: ${c.interrupted ? "yes" : "no"}</span>`,
+      `<span class="vchip ${c.json_truncation ? "err" : "ok"}">json: ${c.json_truncation ? "truncated" : "ok"}</span>`,
+      `<span class="vchip ${c.v4a_truncation ? "err" : "ok"}">v4a-trunc: ${c.v4a_truncation ? "yes" : "no"}</span>`,
+      `<span class="vchip ${c.v4a_validation ? "err" : "ok"}">v4a-syntax: ${c.v4a_validation ? "invalid" : "ok"}</span>`,
+    ];
+    if (reasons.length) chips.push(`<span class="vchip warn">reasons: ${esc(reasons.join(","))}</span>`);
+
+    let checkRows = "";
+    if (c.json_truncation) checkRows += `<tr><td class="k">json_truncation</td><td class="v">${esc(c.json_truncation)}</td></tr>`;
+    if (c.v4a_truncation) checkRows += `<tr><td class="k">v4a_truncation</td><td class="v">${esc(c.v4a_truncation)}</td></tr>`;
+    if (c.v4a_validation) checkRows += `<tr><td class="k">v4a_validation</td><td class="v">line ${esc(c.v4a_validation.line)}: ${esc(c.v4a_validation.message)}</td></tr>`;
+    const checksSeg = checkRows
+      ? seg("校验 verdict · checks", "有失败 → incomplete", `<table class="hdr">${checkRows}</table>`)
+      : seg("校验 verdict · checks", "全过(completed)", `<div class="meta">无截断 / 语法问题</div>`);
+
+    const argTrunc = a.truncated_bytes > 0 ? `<div class="trunc">⚠ 截断:原 ${a.len} 字节,丢 ${a.truncated_bytes}</div>` : "";
+    const inpTrunc = inp.truncated_bytes > 0 ? `<div class="trunc">⚠ 截断:原 ${inp.len} 字节,丢 ${inp.truncated_bytes}</div>` : "";
+
+    // pre-flight 自动修复(读盘对齐安全的上下文失配)。每个 Update File 一条记录。
+    const repairs = Array.isArray(t.repairs) ? t.repairs : [];
+    const nRepaired = repairs.filter((r) => r.kind === "repaired").length;
+    const nSkipped = repairs.filter((r) => (r.kind || "").startsWith("skipped")).length;
+    const repairChip = (k) => k === "repaired" ? "warn" : ((k || "").startsWith("skipped") ? "err" : "ok");
+    const repairsSeg = repairs.length
+      ? seg(`pre-flight 自动修复 · 修复 ${nRepaired} / 放行 ${nSkipped} / 共 ${repairs.length} 文件`,
+          nRepaired ? "已对齐上下文锚点(免 Failed to find)" : (nSkipped ? "有放行未修" : "本就匹配"),
+          `<table class="hdr">` + repairs.map((r) =>
+            `<tr><td class="k">${esc(r.file)}</td><td class="v"><span class="vchip ${repairChip(r.kind)}">${esc(r.kind)}</span> ${esc(r.detail)}</td></tr>`
+          ).join("") + `</table>`, nRepaired > 0 || nSkipped > 0 ? true : false)
+      : "";
+
+    // apply 结果回灌(下一轮请求才会带回);completed 的 call 才追踪结果。
+    const result = apTraceByPhase(t.call_id, "result");
+    const resultSeg = result
+      ? seg("apply 结果 · Codex 回灌", result.is_error ? "ERROR(触发重试)" : "ok",
+          `<div class="usage"><span class="vchip ${result.is_error ? "err" : "ok"}">${result.is_error ? "ERROR" : "ok"}</span></div>`
+          + `<pre class="payload">${esc((result.output || {}).text || "")}</pre>`)
+      : seg("apply 结果 · Codex 回灌", completed ? "尚未捕获" : "incomplete · 不会执行",
+          `<div class="meta">${completed ? "还没看到这条 patch 的结果回灌(下一轮请求才带回)" : "incomplete 的 patch Codex 不执行,无结果"}</div>`, false);
+
+    detailEl.innerHTML = `<div class="meta">${meta}</div>`
+      + `<div class="usage">${chips.join("")}</div>`
+      + `<div class="tools">`
+      +   `<button data-copy="ap_args">复制原始 args</button>`
+      +   `<button data-copy="ap_input">复制提取 V4A</button>`
+      +   `<button data-copy="full">复制 JSON</button>`
+      + `</div>`
+      + repairsSeg
+      + resultSeg
+      + checksSeg
+      + seg("① 原始 args · 上游回的 function arguments", `${a.len || 0} 字节`,
+          `<pre class="payload">${esc(a.raw || "")}</pre>${argTrunc}`)
+      + seg("② 提取 + 修复后 V4A · 发给 Codex 的 input", `${inp.len || 0} 字节`,
+          `<pre class="payload">${esc(inp.v4a || "")}</pre>${inpTrunc}`)
+      + seg("DIFF · 原始 args → 提取 V4A(extract/repair 改了啥)", "红=移除 绿=新增",
+          diffLines(a.raw || "", inp.v4a || ""), false);
+  }
+
+  // proxy→Codex 转换后响应(MOC-194):看真正发给 Codex 的 SSE。附 apply_patch wire 统计,
+  // 直接核对「每个 apply_patch 的 output_item.added/done 是否都发到了」(Q1)。
+  function renderCodexResponse(t) {
+    const b = t.body || {};
+    const txt = typeof b.content === "string" ? b.content : (b.content == null ? "" : JSON.stringify(b.content));
+    const count = (re) => (txt.match(re) || []).length;
+    const added = count(/response\.output_item\.added/g);
+    const done = count(/response\.output_item\.done/g);
+    const apCall = count(/"type":"custom_tool_call"/g);
+    const apInputDone = count(/response\.custom_tool_call_input\.done/g);
+    const meta = `${esc(t.method || "")} ${esc(t.client_path || "")} → Codex · status ${esc(t.status)} · seq ${esc(t.seq)} · ${esc(t.captured_at || "")}`;
+    const chips = `<div class="usage">`
+      + `<span class="uchip">output_item.added <b>${added}</b></span>`
+      + `<span class="uchip">output_item.done <b>${done}</b></span>`
+      + `<span class="uchip">custom_tool_call <b>${apCall}</b></span>`
+      + `<span class="uchip">apply_patch input.done <b>${apInputDone}</b></span>`
+      + `</div>`;
+    detailEl.innerHTML = `<div class="meta">${meta}</div>`
+      + chips
+      + `<div class="tools"><button data-copy="cr_body">复制 SSE</button><button data-copy="full">复制 JSON</button></div>`
+      + seg("proxy→Codex 转换后 SSE", `${b.bytes || 0} 字节`, bodyBlock(b));
+  }
+
   function add(t, prepend) {
     if (prepend) traces.unshift(t); else traces.push(t);
     if (traces.length > 1000) traces.length = 1000;
@@ -531,6 +692,10 @@
     if (what === "curl") s = buildCurl(t.outbound, (t.inbound || {}).method);
     else if (what === "ob") s = bodyText((t.outbound || {}).body) || JSON.stringify(t.outbound || {}, null, 2);
     else if (what === "ib") s = bodyText((t.inbound || {}).body) || JSON.stringify(t.inbound || {}, null, 2);
+    else if (what === "ap_args") s = (t.args || {}).raw || "";
+    else if (what === "ap_input") s = (t.input || {}).v4a || "";
+    else if (what === "ap_output") s = (t.output || {}).text || "";
+    else if (what === "cr_body") s = bodyText(t.body) || "";
     else s = JSON.stringify(t, null, 2);
     copyText(s, btn);
   });

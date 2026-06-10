@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 
 const MAX_STORED_BUNDLES: usize = 50;
 const MAX_STORED_BODY_BYTES: usize = 256 * 1024;
+/// codex_response(MOC-194)body 上限:比默认大,以**完整逐字节验证大输出的 transfer 转换**
+/// (转换后 SSE 常 >256KB;观测过 ~1MB)。仅 codex_response 用,不影响其它 trace 的存储体积。
+const MAX_CODEX_RESP_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// forward-trace jsonl 按天分文件,保留最近 N 天(防无界增长)。
 pub(crate) const FORWARD_TRACE_KEEP_DAYS: usize = 7;
 
@@ -472,6 +475,18 @@ fn redact_body(bytes: &[u8], content_type: Option<&str>) -> Value {
 /// 因截断而残缺的有限完整性,codex-connector P2 二轮)。非 JSON / SSE 不受影响,照走
 /// `bytes_payload_with_len`(正文是模型回复等,无结构化 credential)。
 fn redact_body_with_len(bytes: &[u8], true_len: usize, content_type: Option<&str>) -> Value {
+    redact_body_with_cap(bytes, true_len, content_type, MAX_STORED_BODY_BYTES)
+}
+
+/// 同 [`redact_body_with_len`],但 body 上限可指定(`cap`)。codex_response(MOC-194)用更大的
+/// [`MAX_CODEX_RESP_BODY_BYTES`] 以完整逐字节验证大输出的 transfer 转换;forward/chatgpt-backend
+/// 仍走默认 [`MAX_STORED_BODY_BYTES`]。
+fn redact_body_with_cap(
+    bytes: &[u8],
+    true_len: usize,
+    content_type: Option<&str>,
+    cap: usize,
+) -> Value {
     let is_json = content_type
         .map(|c| c.to_ascii_lowercase().contains("json"))
         .unwrap_or(false);
@@ -481,7 +496,7 @@ fn redact_body_with_len(bytes: &[u8], true_len: usize, content_type: Option<&str
             // 脱敏后再量大小:未超 cap → 原样发完整脱敏对象;超 cap → 退回**已脱敏**的
             // JSON 文本截断(credential 已 scrub,如实记 truncated_bytes)。
             let serialized = serde_json::to_vec(&v).unwrap_or_default();
-            if serialized.len() <= MAX_STORED_BODY_BYTES {
+            if serialized.len() <= cap {
                 return json!({
                     "encoding": "json",
                     "bytes": true_len,
@@ -489,7 +504,7 @@ fn redact_body_with_len(bytes: &[u8], true_len: usize, content_type: Option<&str
                     "content": v,
                 });
             }
-            return bytes_payload_with_len(&serialized, serialized.len(), MAX_STORED_BODY_BYTES);
+            return bytes_payload_with_len(&serialized, serialized.len(), cap);
         }
     }
     if is_json && true_len != bytes.len() {
@@ -502,7 +517,7 @@ fn redact_body_with_len(bytes: &[u8], true_len: usize, content_type: Option<&str
             "note": "large JSON body truncated upstream of redaction; omitted to avoid leaking unredactable credentials",
         });
     }
-    bytes_payload_with_len(bytes, true_len, MAX_STORED_BODY_BYTES)
+    bytes_payload_with_len(bytes, true_len, cap)
 }
 
 /// 递归把 JSON 里的 credential 字段值替换成 `***`。键判定见 [`is_credential_key`];另对
@@ -826,6 +841,34 @@ pub fn write_forward_trace_jsonl(input: &ForwardTraceInput) -> Option<PathBuf> {
     let seq = crate::trace_store::next_seq();
     let value = build_forward_trace_value(input, seq);
     crate::trace_store::trace_store().push(crate::trace_store::TraceKind::Forward, seq, value)
+}
+
+/// 抓一条 **proxy → Codex 转换后响应**(MOC-194)→ 统一 trace_store(`CodexResponse` kind)。
+/// `body` 是 adapter `transform_response_stream` 转换后**真正发给 Codex 的字节**(SSE / JSON),
+/// 可能被 tee cap 截断(`full_len` 为真实全长)。调用方须先用 [`forward_trace_enabled`] gate。
+/// body 走 [`redact_body_with_len`](SSE/非 JSON 退 `bytes_payload`,正文照留 —— 同 forward-trace
+/// 取舍:本地诊断、默认关、勿外传)。用于核对转换输出完整性(如每个 apply_patch 的
+/// `output_item.added/done` 是否都发到了 Codex)。
+pub fn write_codex_response_trace(
+    method: &str,
+    client_path: &str,
+    status: u16,
+    content_type: Option<&str>,
+    body: &[u8],
+    full_len: usize,
+) -> Option<PathBuf> {
+    let seq = crate::trace_store::next_seq();
+    let value = json!({
+        "trace_kind": "codex_response",
+        "captured_at": Local::now().to_rfc3339(),
+        "proxy_version": env!("CARGO_PKG_VERSION"),
+        "seq": seq,
+        "method": method,
+        "client_path": client_path,
+        "status": status,
+        "body": redact_body_with_cap(body, full_len, content_type, MAX_CODEX_RESP_BODY_BYTES),
+    });
+    crate::trace_store::trace_store().push(crate::trace_store::TraceKind::CodexResponse, seq, value)
 }
 
 // ============ MOC-125 chatgpt-backend passthrough 抓包诊断 ============

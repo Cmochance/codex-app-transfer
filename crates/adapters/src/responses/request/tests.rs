@@ -2444,9 +2444,11 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
         // (5) 空文件 + lone `+` APPEND + Delete+Add fallback 兜底
         assert!(guidance.contains("empty file") || guidance.contains("totally empty"));
         assert!(guidance.contains("APPEND") || guidance.contains("append"));
+        // P3(MOC-194):Update 失败 → 修锚点重试针对性 Update,**不再** fallback 整写(bypass 已删)
         assert!(
-            guidance.contains("Delete File + Add File"),
-            "guidance 必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{guidance}"
+            guidance.contains("retry the SAME surgical Update")
+                && !guidance.contains("fall back to a Delete File + Add File"),
+            "guidance 应诱导修锚点重试针对性 Update、不诱导整写 fallback:{guidance}"
         );
         // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
         assert!(
@@ -2469,18 +2471,18 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
                 && guidance.contains("NEVER use shell"),
             "guidance 必须强 normative 禁 shell redirect:{guidance}"
         );
+        // P3:优先针对性编辑,整文件替换仅限 genuine cases(删「整写是 idiom」诱导)
         assert!(
-            guidance.contains("full-file rewrites")
+            guidance.contains("PREFER surgical targeted edits")
+                && guidance.contains("Reserve full-file replacement")
                 && guidance.contains("`*** Delete File:")
                 && guidance.contains("`*** Add File:"),
-            "guidance 必须明示 large rewrite 走 Delete File + Add File:{guidance}"
+            "guidance 应优先针对性、整写仅限 genuine cases:{guidance}"
         );
-        // 必须含 rule 5 `printf '\n' > <path>` carve-out 明示
-        // (防 Devin pre-merge review 报跟 rule 5 冲突,2026-05-22)
+        // P3:新/空文件走 Add File,不再 shell-seed(删 printf carve-out)
         assert!(
-            guidance.contains("narrow exception in rule 5")
-                && guidance.contains("preparation step, not a content bypass"),
-            "guidance 必须 carve-out rule 5 的 `printf '\\n' > <path>` setup 用法:{guidance}"
+            guidance.contains("brand-new or empty file") && guidance.contains("`*** Add File:"),
+            "guidance 应指引新/空文件用 Add File(非 shell):{guidance}"
         );
     });
 }
@@ -3741,10 +3743,11 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
         outer.contains("*** Add File: hello.py"),
         "必须包含一个 Add File example:{outer}"
     );
-    // (5) Delete + Add File fallback 兜底(Update 反复失败时)
+    // (5) P3(MOC-194):Update 失败 → 修锚点重试针对性 Update,**不再**诱导整写 fallback(bypass 已删)
     assert!(
-        outer.contains("Delete File + Add File"),
-        "必须含 Update 反复失败时 fallback 到 Delete+Add 兜底:{outer}"
+        outer.contains("retry the SAME surgical Update")
+            && !outer.contains("fall back to a Delete File + Add File"),
+        "Update 失败应诱导修锚点重试针对性 Update、不诱导整写 fallback:{outer}"
     );
     // Round 7 实证修复(t0002 漏写 Begin Patch + t0020 Move 空 hunk):
     assert!(
@@ -3765,13 +3768,17 @@ fn tools_custom_apply_patch_injects_v4a_format_hint() {
         outer.contains("ALWAYS use this tool") && outer.contains("NEVER use shell"),
         "outer description 必须强 normative 禁 shell redirect:{outer}"
     );
+    // P3(MOC-194):优先针对性 Update,整文件替换仅限真正需要时(删掉「整写是正确 idiom」的 bypass 诱导)
     assert!(
-        outer.contains("full-file rewrites") && outer.contains("`*** Delete File:"),
-        "outer description 必须明示 large rewrite 走 Delete + Add File:{outer}"
+        outer.contains("PREFER SURGICAL TARGETED EDITS")
+            && outer.contains("Reserve full-file replacement")
+            && outer.contains("`*** Delete File:"),
+        "outer description 必须优先针对性编辑、整写仅限 genuine cases:{outer}"
     );
+    // 空/新文件走 Add File,不再诱导 shell seed
     assert!(
-        outer.contains("narrow exception is seeding a totally empty file"),
-        "outer description 必须 carve-out 空文件 seed 用法:{outer}"
+        outer.contains("brand-new or empty file") && outer.contains("`*** Add File:"),
+        "outer description 必须指引新/空文件用 Add File(非 shell):{outer}"
     );
 
     // 参数描述紧凑版必须含同样核心规则(round 4 修复后)

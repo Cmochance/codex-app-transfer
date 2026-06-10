@@ -32,8 +32,8 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "Edit files using the apply_patch tool. ",
     "**ALWAYS use this tool to write file content** — new files, single-line edits, and full-file rewrites alike. ",
     "**NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. ",
-    "(The narrow exception is seeding a totally empty file with `printf '\\n' > <path>` before calling `*** Update File:` — see gotcha 3; that's a setup step, not a content bypass.) ",
-    "For full-file rewrites or large changes where almost every line differs, use `*** Delete File: <path>` followed by `*** Add File: <path>` (with `+` prefix on every line of the new content) inside a single patch — this is more concise than a long `-`/`+` diff and is the correct apply_patch idiom for large rewrites. ",
+    "(To create brand-new or empty files, use `*** Add File: <path>` — not a shell redirect.) ",
+    "**PREFER SURGICAL TARGETED EDITS.** To change or replace existing content, emit ONLY the specific `-` (old) and `+` (new) lines for what actually changes, with minimal context. Do NOT regenerate the whole file/section and append it; do NOT rewrite an entire file just because part of it changed. Reserve full-file replacement (`*** Delete File: <path>` then `*** Add File: <path>` with every line `+`-prefixed, in one patch) for genuine cases ONLY: creating brand-new content, or when almost every line truly differs. ",
     "Call this function with a single `input` string containing a V4A patch. ",
     "**The patch MUST start with `*** Begin Patch` as the literal first line** (no leading whitespace, no other content before it), and end with `*** End Patch`. ",
     "Each file operation header is one of `*** Add File: <path>`, ",
@@ -134,10 +134,10 @@ pub(crate) const APPLY_PATCH_TOOL_DESCRIPTION_FOR_CHAT: &str = concat!(
     "is NOT V4A — the trailing `@@` becomes literal text and breaks context matching.\n",
     "2. Do NOT combine `*** Add File: foo` and `*** Update File: foo` in the SAME patch — Update reads the file before Add lands on disk. ",
     "Either make Add File write the final content in one shot, or split into two separate patches.\n",
-    "3. `*** Update File:` cannot operate on a completely empty file. Use shell to write at least one line first, then apply_patch.\n",
+    "3. To populate a brand-new or empty file, use `*** Add File: <path>` with every line `+`-prefixed (not `*** Update File:`).\n",
     "4. In a multi-line file, lone `+` lines without a corresponding `-` APPEND below the previous context — they do NOT replace any existing line. ",
     "To change a line, use `-` to remove the old line AND `+` to add the new one; do not omit the `-`.\n",
-    "5. If multiple Update attempts on the same file fail with `Failed to find context` errors, fall back to a Delete File + Add File pair within the same patch (semantically equivalent to a full rewrite) — this avoids anchor-matching fragility.\n",
+    "5. If an Update fails with `Failed to find context`, the `-`/context lines did not match the file byte-for-byte. Re-read the file (`cat <path>` / `sed -n`) and fix those lines to match exactly, then retry the SAME surgical Update. Do NOT escalate to rewriting or re-appending the whole file/section — keep the edit targeted to the lines that change.\n",
     "6. `*** Begin Patch` MUST be the literal first line of `input` — no preamble, no whitespace, no `*** Add File:` directly. Forgetting it causes `invalid patch: The first line of the patch must be '*** Begin Patch'`.\n",
     "7. `*** Update File: <old>` + `*** Move to: <new>` requires at least one hunk (rename-only is NOT supported via Move). For pure rename without content change, use `*** Delete File: <old>` + `*** Add File: <new>` (copy original content with `+` prefix). Empty Update+Move fails with `Update file hunk for path '<old>' is empty`."
 );
@@ -162,9 +162,9 @@ pub(crate) const APPLY_PATCH_INPUT_DESCRIPTION_FOR_CHAT: &str = concat!(
     "(blank lines as bare `+`). Relative paths only. ",
     "`-` lines and space-prefixed context MUST be byte-exact to the file's current content ",
     "(read via `cat <path>` first if unsure) — guessing produces `Failed to find context` errors. ",
-    "Chat-path gotchas: do not Add+Update the same path in one patch; Update cannot ",
-    "operate on a totally empty file; lone `+` without `-` appends instead of replacing. ",
-    "If Update fails repeatedly, fall back to Delete File + Add File in one patch. ",
+    "**PREFER surgical targeted Update** (`-` old line + `+` new line for ONLY the changed lines, minimal context) — do NOT regenerate or append the whole file/section. ",
+    "Chat-path gotchas: do not Add+Update the same path in one patch; for brand-new/empty files use `*** Add File:` (not Update); lone `+` without `-` APPENDS rather than replaces — to replace a line, pair `-` (old) with `+` (new). ",
+    "If Update fails with `Failed to find context`, re-read the file (`cat`) and fix the `-`/context lines to be byte-exact, then retry the SAME targeted Update — do NOT escalate to rewriting the whole file. ",
     "**`*** Begin Patch` MUST be the literal first line of `input`** (no preamble). ",
     "**`*** Update File: <old>` + `*** Move to: <new>` requires ≥1 hunk** — for pure rename use `*** Delete File:` + `*** Add File:` instead."
 );

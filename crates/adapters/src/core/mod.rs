@@ -1,3 +1,4 @@
+pub mod apply_patch_trace;
 pub(crate) mod events;
 pub(crate) mod input;
 pub mod language;
