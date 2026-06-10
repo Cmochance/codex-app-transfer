@@ -109,15 +109,6 @@ pub const ANTIGRAVITY_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/experimentsandconfigs",
 ];
 
-/// Antigravity 出站 X-Goog-Api-Client header 值(历史:CLIProxyAPI `antigravity_version.go:23`)。
-///
-/// **2026-05-29 实证抓包(本机 mitmproxy local 模式,Antigravity IDE 2.0.10):
-/// Antigravity 对 cloudcode-pa 的请求(chat 和控制面 loadCodeAssist/fetchAvailableModels)
-/// 都不发 `X-Goog-Api-Client`**。此常量仅保留以填充 `OauthProviderConfig.x_goog_api_client`
-/// 结构字段;antigravity 路径实际不注入该 header(见 antigravity/cloud_code.rs 与
-/// proxy/forward.rs)。见 memory `reference_antigravity_wire_fingerprint`。
-pub const ANTIGRAVITY_X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
-
 /// Antigravity 版本号。**2026-05-29 实证抓包**:真实 UA 里的版本就是 Antigravity IDE
 /// 版本 `2.0.10`(推翻了之前 CLIProxyAPI 推测的 `1.23.2`)。
 ///
@@ -173,7 +164,6 @@ pub struct OauthProviderConfig {
     /// Token 持久化文件名(`~/.codex-app-transfer/<token_filename>`),不同
     /// provider 必须不同 token 文件,防覆盖。
     pub token_filename: &'static str,
-    pub x_goog_api_client: &'static str,
 }
 
 /// gemini-cli provider 配置(等价于现有 hardcoded 常量,用于新代码统一接口)。
@@ -185,7 +175,6 @@ pub const GEMINI_CLI_PROVIDER: OauthProviderConfig = OauthProviderConfig {
     callback_port: None,
     prompt_consent: false,
     token_filename: "gemini-oauth.json",
-    x_goog_api_client: X_GOOG_API_CLIENT,
 };
 
 /// Antigravity provider 配置。
@@ -197,7 +186,6 @@ pub const ANTIGRAVITY_PROVIDER: OauthProviderConfig = OauthProviderConfig {
     callback_port: Some(ANTIGRAVITY_CALLBACK_PORT),
     prompt_consent: true,
     token_filename: "antigravity-oauth.json",
-    x_goog_api_client: ANTIGRAVITY_X_GOOG_API_CLIENT,
 };
 
 #[cfg(test)]
