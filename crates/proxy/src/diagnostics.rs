@@ -14,6 +14,11 @@ const MAX_STORED_BODY_BYTES: usize = 256 * 1024;
 /// codex_response(MOC-194)body 上限:比默认大,以**完整逐字节验证大输出的 transfer 转换**
 /// (转换后 SSE 常 >256KB;观测过 ~1MB)。仅 codex_response 用,不影响其它 trace 的存储体积。
 const MAX_CODEX_RESP_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// forward-trace **请求体**(inbound = Codex 来的、outbound = 转换后发上游的)上限:与
+/// codex_response 一样提到 2MB。antigravity / 大上下文请求常 >256KB(观测 715KB),默认 256KB
+/// 会把请求尾部关键字段(labels/toolConfig/sessionId/userAgent 等)截掉、丢诊断精度(MOC-67)。
+/// 响应体仍用默认 [`MAX_STORED_BODY_BYTES`](上游回包可能极大;转换后的已由 codex_response 2MB 留存)。
+const MAX_FORWARD_REQ_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// forward-trace jsonl 按天分文件,保留最近 N 天(防无界增长)。
 pub(crate) const FORWARD_TRACE_KEEP_DAYS: usize = 7;
 
@@ -801,13 +806,23 @@ pub(crate) fn build_forward_trace_value(input: &ForwardTraceInput, seq: u64) -> 
             "client_path": input.client_path,
             "client_query": input.client_query,
             "headers": headers_to_json_redacted(input.inbound_headers),
-            "body": redact_body(input.inbound_body, header_content_type(input.inbound_headers)),
+            "body": redact_body_with_cap(
+                input.inbound_body,
+                input.inbound_body.len(),
+                header_content_type(input.inbound_headers),
+                MAX_FORWARD_REQ_BODY_BYTES,
+            ),
         },
         // ── adapter 转换后发上游的 ──
         "outbound": {
             "url": input.upstream_url,
             "headers": headers_to_json_redacted(input.outbound_headers),
-            "body": redact_body(input.outbound_body, header_content_type(input.outbound_headers)),
+            "body": redact_body_with_cap(
+                input.outbound_body,
+                input.outbound_body.len(),
+                header_content_type(input.outbound_headers),
+                MAX_FORWARD_REQ_BODY_BYTES,
+            ),
         },
         // ── 上游回包(raw) ──
         "response": {

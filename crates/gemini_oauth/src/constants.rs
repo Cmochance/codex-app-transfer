@@ -109,20 +109,22 @@ pub const ANTIGRAVITY_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/experimentsandconfigs",
 ];
 
-/// Antigravity 版本号。**2026-05-29 实证抓包**:真实 UA 里的版本就是 Antigravity IDE
-/// 版本 `2.0.10`(推翻了之前 CLIProxyAPI 推测的 `1.23.2`)。
+/// Antigravity 版本号 = 安装的 Antigravity IDE 版本(出现在出站 UA `antigravity/hub/<ver>`)。
+/// `2.0.11`(2026-06-10 对齐本机 `/Applications/Antigravity.app` Info.plist
+/// CFBundleShortVersionString;2026-05-29 首次抓包时为 2.0.10)。
 ///
-/// followup(MOC-59):实现 6h-cached HTTP poll updater 动态拿最新版,替代 hardcode
-/// (`https://antigravity-auto-updater-974169037036.us-central1.run.app/releases`)。
-pub const ANTIGRAVITY_VERSION: &str = "2.0.10";
+/// MOC-67:CI 定期校验此值未落后真实版本(防被 Google 按 min-version 拒,史上 1.21.9 被拒过)。
+/// 权威源 = hub auto-updater manifest(`antigravity-hub-auto-updater-…/manifest/`,见 app 内
+/// `app-update.yml`,electron-updater generic);`ide`/`releases` 等端点版本滞后、非权威。
+pub const ANTIGRAVITY_VERSION: &str = "2.0.11";
 
 /// Antigravity subclient 标识。实证 UA 形如 `antigravity/<subclient>/<ver> <plat>/<arch>`,
 /// 中间这段是 subclient —— Agent Manager / Hub 客户端发 `hub`。
 pub const ANTIGRAVITY_SUBCLIENT: &str = "hub";
 
 /// Antigravity 出站 User-Agent。**chat 和控制面(loadCodeAssist / onboardUser /
-/// fetchAvailableModels)统一用这个** —— 2026-05-29 实证抓包都是
-/// `antigravity/hub/2.0.10 darwin/arm64`,**不带** `google-api-nodejs-client` 后缀
+/// fetchAvailableModels)统一用这个** —— 2026-05-29 实证抓包形如
+/// `antigravity/hub/<ver> darwin/arm64`(当时 ver=2.0.10),**不带** `google-api-nodejs-client` 后缀
 /// (推翻了之前 CLIProxyAPI 的"控制面长形式 UA"假设)。平台/架构运行时检测,跟
 /// gemini-cli 共享 [`node_platform_arch`]。
 pub fn antigravity_user_agent() -> String {
@@ -219,8 +221,9 @@ mod tests {
         // 实证(2026-05-29 抓包):chat + 控制面统一 `antigravity/hub/<ver> <plat>/<arch>`,
         // 无 google-api-nodejs-client 后缀。
         let ua = antigravity_user_agent();
+        // 版本号不 pin 死(随真实 IDE 版本 bump,CI 另行校验未滞后);只验格式 + 用了 const。
         assert!(
-            ua.starts_with("antigravity/hub/2.0.10 "),
+            ua.starts_with(&format!("antigravity/hub/{ANTIGRAVITY_VERSION} ")),
             "格式应为 antigravity/hub/<ver> <plat>/<arch>,实际:{ua}"
         );
         assert!(
