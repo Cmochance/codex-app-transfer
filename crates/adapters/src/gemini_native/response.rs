@@ -24,9 +24,11 @@
 //!     response.content_part.done
 //!   [if reasoning:]
 //!     response.reasoning_summary_part.added  ← summary_index=0
-//!     response.reasoning_summary_text.delta  ← 增量
+//!     response.reasoning_summary_text.delta  ← 增量(summary 通道,旧版兼容)
+//!     response.reasoning_text.delta          ← 增量(content 通道,v26.608+ 渲染)
 //!     response.reasoning_summary_text.done
 //!     response.reasoning_summary_part.done
+//!     response.reasoning_text.done           ← content 通道完毕
 //!   [if function_call:]
 //!     response.function_call_arguments.delta  ← 一次性 emit 完整 args(Gemini 不增量)
 //!     response.function_call_arguments.done
@@ -37,7 +39,8 @@
 //!
 //! Gemini → Responses 字段映射:
 //! - `candidates[].content.parts[].text` (thought≠true) → output_text.delta
-//! - `candidates[].content.parts[].text` (thought=true) → reasoning_summary_text.delta
+//! - `candidates[].content.parts[].text` (thought=true) → reasoning_summary_text.delta(summary 通道)
+//!   + reasoning_text.delta(content 通道,v26.608+ 渲染);双发兼容新旧版 Codex
 //! - `candidates[].content.parts[].functionCall {name, args}` → function_call output_item
 //!   (args 序列化成 JSON string 灌进 function_call_arguments.delta)
 //! - `candidates[].groundingMetadata` → output_text.annotation.added(在 message 内)
@@ -709,7 +712,12 @@ impl GeminiToResponsesConverter {
                 for part in &content.parts {
                     // text part
                     if let Some(text) = &part.text {
-                        if part.thought == Some(true) {
+                        if text.is_empty() {
+                            // [Phase0 gemini-tool-fold] Gemini 在 functionCall 之后
+                            // 常发 {"text":""} 空 part:不开 message/reasoning item ——
+                            // 空 item 既渲染空白行,又打断 Codex 按「连续 tool item」
+                            // 分组的工具折叠(对齐 chat 路径 emit_text_delta 空守卫)。
+                        } else if part.thought == Some(true) {
                             // reasoning text:必要时关 message + 开 reasoning
                             if self.open_message.is_some() {
                                 self.close_message(out);
@@ -1231,7 +1239,7 @@ impl GeminiToResponsesConverter {
                     "status": "in_progress",
                     "id": item_id,
                     "summary": [],
-                    "content": null,
+                    "content": [],
                     "encrypted_content": null,
                 },
             }),
@@ -1256,19 +1264,39 @@ impl GeminiToResponsesConverter {
     }
 
     fn emit_reasoning_delta(&mut self, out: &mut Vec<u8>, delta: &str) {
-        let Some(rs) = self.open_reasoning.as_mut() else {
-            return;
+        let (item_id, output_index) = match self.open_reasoning.as_mut() {
+            Some(rs) => {
+                rs.text_acc.push_str(delta);
+                (rs.item_id.clone(), rs.output_index)
+            }
+            None => return,
         };
-        rs.text_acc.push_str(delta);
+        // summary 通道(保留,兼容旧版渲染)
         emit_event(
             out,
             &mut self.sequence_number,
             "response.reasoning_summary_text.delta",
             json!({
                 "type": "response.reasoning_summary_text.delta",
-                "item_id": rs.item_id,
-                "output_index": rs.output_index,
+                "item_id": item_id,
+                "output_index": output_index,
                 "summary_index": 0,
+                "delta": delta,
+            }),
+        );
+        // [verify content 通道] 新版 Codex(v26.608+)渲染思考块认 reasoning_text
+        // (content_index),GPT 直连走此通道(本地 session 实证:GPT reasoning
+        // summary:[] 却正常显示);transfer 此前只发 summary→被新版废弃不渲染。
+        // 双发 content 对齐 GPT,summary 留作旧版兼容。
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.reasoning_text.delta",
+            json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
                 "delta": delta,
             }),
         );
@@ -1305,12 +1333,25 @@ impl GeminiToResponsesConverter {
                 },
             }),
         );
+        // [verify content 通道] 对齐 GPT:补发 reasoning_text.done(content_index)
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.reasoning_text.done",
+            json!({
+                "type": "response.reasoning_text.done",
+                "item_id": rs.item_id,
+                "output_index": rs.output_index,
+                "content_index": 0,
+                "text": rs.text_acc,
+            }),
+        );
         let item = json!({
             "type": "reasoning",
             "status": "completed",
             "id": rs.item_id,
             "summary": [{ "type": "summary_text", "text": rs.text_acc }],
-            "content": null,
+            "content": [{ "type": "reasoning_text", "text": rs.text_acc }],
             "encrypted_content": null,
         });
         emit_event(
@@ -2423,6 +2464,56 @@ mod tests {
         // reasoning summary text 应该是 "thinking step"
         let r = output.iter().find(|i| i["type"] == "reasoning").unwrap();
         assert_eq!(r["summary"][0]["text"], "thinking step");
+
+        // [MOC-203] content 通道双发(v26.608+ 渲染):delta/done + envelope content
+        assert!(names.contains(&"response.reasoning_text.delta".into()));
+        assert!(names.contains(&"response.reasoning_text.done".into()));
+        let text_done = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, _)| n == "response.reasoning_text.done")
+            .unwrap();
+        assert_eq!(text_done.1["content_index"], 0);
+        // gemini 不注入 **Thinking** header,content 通道 = 原始思考文本
+        assert_eq!(text_done.1["text"], "thinking step");
+        assert_eq!(r["content"][0]["type"], "reasoning_text");
+        assert_eq!(r["content"][0]["text"], "thinking step");
+        // output_item.added 即声明 content: [](激活 content 通道,锁 null→[] 改动)
+        let item_added = events
+            .iter()
+            .map(|s| parse_event(s.as_str()))
+            .find(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "reasoning")
+            .unwrap();
+        assert_eq!(item_added.1["item"]["content"], json!([]));
+    }
+
+    /// MOC-203 折叠修复锁定:gemini functionCall 后常发 `{"text":""}` 空 part,
+    /// 不得为它开空 message item(空白行 + 打断 Codex 同轮工具折叠分组);
+    /// 空 thought part 同理不开 reasoning item。
+    #[test]
+    fn empty_text_part_after_function_call_does_not_open_message_item() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{}}},{"text":""},{"text":"","thought":true}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let parsed: Vec<(String, Value)> = events.iter().map(|s| parse_event(s.as_str())).collect();
+        // 不产生任何 message / reasoning item,也无空 text delta
+        assert!(parsed
+            .iter()
+            .all(|(n, _)| n != "response.output_text.delta"));
+        assert!(parsed
+            .iter()
+            .filter(|(n, _)| n == "response.output_item.added")
+            .all(|(_, d)| d["item"]["type"] == "function_call"));
+        // envelope 只有 function_call 一个 item
+        let completed = parsed
+            .iter()
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "function_call");
     }
 
     #[test]
