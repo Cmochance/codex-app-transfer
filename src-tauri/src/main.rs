@@ -9,6 +9,8 @@ mod codex_real_account;
 mod codex_theme_injector;
 mod mcp_webfetch_server;
 mod proxy_runner;
+#[cfg(target_os = "macos")]
+mod single_instance;
 mod system_proxy;
 mod telemetry_bridge;
 mod trace_viewer;
@@ -42,6 +44,13 @@ fn main() {
     // (registry healing / desktop apply / proxy 拉起)的 tracing event 会被 drop。
     telemetry_bridge::init_global_subscriber();
 
+    // [MOC-196] macOS 自管单实例:flock 持锁 + 就绪态握手 + 超时接管,根治
+    // 「僵尸主实例 → 后续启动被插件无条件 exit(0) 静默杀」(#436)。guard 持有
+    // flock 至进程结束;第二实例路径在内部 exit、不返回。Windows/Linux 仍走
+    // tauri_plugin_single_instance(下方 cfg 分支)。
+    #[cfg(target_os = "macos")]
+    let _instance_lock = single_instance::acquire_or_exit();
+
     let proxy_manager = Arc::new(ProxyManager::new());
     // [MOC-169] 诊断流量查看器:独立端口 SSE 服务,默认关,gate 开时随 app 自启(见 setup)。
     let trace_viewer_manager = Arc::new(trace_viewer::TraceViewerManager::new());
@@ -52,21 +61,26 @@ fn main() {
     let app_router = Arc::new(build_app_router(admin_state));
     let app_router_for_protocol = app_router.clone();
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            show_main_window(app);
-            // single-instance 启动时如果带 deeplink URL,argv 里会有,转发给前端
-            for arg in _argv.iter().skip(1) {
-                if arg.starts_with("codex-app-transfer:") {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.emit("codex-deeplink", arg.clone());
-                    }
+        .plugin(tauri_plugin_deep_link::init());
+    // [MOC-196] macOS 用上面的自管单实例(插件的 socket 方案会被僵尸主实例
+    // 骗过且第二实例无条件 exit(0) 静默死,见 single_instance.rs 模块注释);
+    // Windows(CreateMutex)/Linux(DBus)实现不同、无此故障实证,保留插件。
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        show_main_window(app);
+        // single-instance 启动时如果带 deeplink URL,argv 里会有,转发给前端
+        for arg in _argv.iter().skip(1) {
+            if arg.starts_with("codex-app-transfer:") {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.emit("codex-deeplink", arg.clone());
                 }
             }
-        }))
+        }
+    }));
+    let app = builder
         .manage(proxy_manager)
         .manage(trace_viewer_manager)
         .register_asynchronous_uri_scheme_protocol("cas", move |_app, request, responder| {
@@ -491,6 +505,12 @@ fn main() {
         .expect("error while building Codex App Transfer");
 
     app.run(|app_handle, event| {
+        // [MOC-196] 窗口创建成功(Ready)→ 单实例握手开始回 OK(此前回 STARTING)。
+        // 僵尸(setup hang)到不了这里,第二实例据此识别并接管。
+        #[cfg(target_os = "macos")]
+        if matches!(event, RunEvent::Ready) {
+            single_instance::mark_ready(app_handle.clone());
+        }
         if matches!(event, RunEvent::Exit) {
             let manager = app_handle.state::<Arc<ProxyManager>>();
             manager.stop_silent();
