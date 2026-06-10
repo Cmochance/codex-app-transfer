@@ -64,6 +64,12 @@ static READY: AtomicBool = AtomicBool::new(false);
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 /// 本进程启动时刻(unix 秒),STARTING 回应携带,第二实例据此算宽限期。
 static STARTED_AT_UNIX: OnceLock<u64> = OnceLock::new();
+/// STARTING 期间收到的唤起请求暂存队列,`mark_ready` 时统一补放 —— 否则
+/// 启动期到达的 deeplink(`codex-app-transfer://...`)会被永久丢弃
+/// (chatgpt-codex P2)。READY 的判定与入队/排空必须在同一把锁内完成,
+/// 防「listener 读到 READY=false → mark_ready 排空 → listener 才入队」的
+/// 竞态丢失;见 [`queue_or_dispatch`] / [`mark_ready`]。
+static PENDING_ACTIVATIONS: std::sync::Mutex<Vec<Vec<String>>> = std::sync::Mutex::new(Vec::new());
 
 /// 握手等待主实例回应的超时。健康主实例的 listener 是常驻线程,回应在毫秒级;
 /// 超时即视为对端无应答(僵尸/假 socket)。listener 侧 per-connection 读超时
@@ -127,11 +133,41 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// 窗口创建成功(RunEvent::Ready)时由 main.rs 调用:置 ready + 存 AppHandle。
+/// 窗口创建成功(RunEvent::Ready)时由 main.rs 调用:置 ready + 存 AppHandle,
+/// 并补放 STARTING 期间暂存的唤起请求(deeplink 不丢)。
 /// set 在 store 之前:listener 读到 READY=true(SeqCst)必能取到已 set 的 handle。
+/// READY 置位与队列排空在同一把锁内:之后任何 listener 入队尝试都会在锁内
+/// 看到 READY=true 而改走直接 dispatch,不存在「排空后才入队」的丢失窗口。
 pub fn mark_ready(app: AppHandle) {
     let _ = APP_HANDLE.set(app);
-    READY.store(true, Ordering::SeqCst);
+    let drained: Vec<Vec<String>> = {
+        let mut pending = PENDING_ACTIVATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        READY.store(true, Ordering::SeqCst);
+        pending.drain(..).collect()
+    };
+    for args in drained {
+        dispatch_show_and_deeplink(args);
+    }
+}
+
+/// listener 收到 ACTIVATE 时的统一入口:ready → 立即唤起;未 ready → 入队
+/// 暂存(回应仍是 STARTING,第二实例提示后退出,请求由主实例 ready 时补放)。
+/// 返回是否已 ready(决定回 OK 还是 STARTING)。
+fn queue_or_dispatch(args: Vec<String>) -> bool {
+    let pending = PENDING_ACTIVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if READY.load(Ordering::SeqCst) {
+        drop(pending);
+        dispatch_show_and_deeplink(args);
+        true
+    } else {
+        let mut pending = pending;
+        pending.push(args);
+        false
+    }
 }
 
 /// main() 在 Builder 之前调用。返回:
@@ -281,8 +317,10 @@ fn listener_loop(listener: UnixListener) {
         let mut req = String::new();
         let reply = match stream.read_to_string(&mut req) {
             Ok(_) if req.starts_with("ACTIVATE") => {
-                if READY.load(Ordering::SeqCst) {
-                    dispatch_activate(&req);
+                // skip(1) 丢掉 "ACTIVATE" token,余下为完整 argv;argv0(路径)由
+                // dispatch_show_and_deeplink 的 deeplink 前缀过滤天然排除。
+                let args: Vec<String> = req.split('\x1f').skip(1).map(str::to_owned).collect();
+                if queue_or_dispatch(args) {
                     "OK\n".to_string()
                 } else {
                     format!("STARTING {}\n", STARTED_AT_UNIX.get().copied().unwrap_or(0))
@@ -313,7 +351,8 @@ fn legacy_listener_loop(listener: UnixListener) {
             continue;
         }
         let args = parse_legacy_notify(&req);
-        dispatch_show_and_deeplink(args);
+        // 同样走暂存队列:STARTING 期间旧版 notify 的 deeplink 不丢
+        let _ = queue_or_dispatch(args);
     }
 }
 
@@ -323,14 +362,7 @@ fn parse_legacy_notify(req: &str) -> Vec<String> {
     args.split('\0').skip(1).map(str::to_owned).collect()
 }
 
-/// ready 态收到 ACTIVATE:唤起主窗口 + 转发 deeplink(与旧插件回调语义一致)。
-fn dispatch_activate(req: &str) {
-    // skip(1) 丢掉 "ACTIVATE" token,余下为完整 argv;再 skip(1) 丢 argv0 由
-    // dispatch_show_and_deeplink 的 deeplink 前缀过滤天然完成(argv0 是路径)。
-    let args: Vec<String> = req.split('\x1f').skip(1).map(str::to_owned).collect();
-    dispatch_show_and_deeplink(args);
-}
-
+/// 唤起主窗口 + 转发 deeplink(与旧插件回调语义一致)。
 fn dispatch_show_and_deeplink(args: Vec<String>) {
     let Some(app) = APP_HANDLE.get() else {
         // mark_ready 的 set→store 顺序保证 READY=true 时必有 handle,此分支
@@ -385,7 +417,7 @@ fn secondary_flow(lock_path: &PathBuf) -> Option<InstanceLock> {
         Ok(Reply::Starting(started_at)) => {
             let elapsed = now_unix().saturating_sub(started_at);
             if Duration::from_secs(elapsed) < STARTUP_GRACE {
-                alert("Codex App Transfer 正在启动中,请稍候几秒再试。");
+                alert("Codex App Transfer 正在启动中,请稍候几秒。本次打开请求(含链接)会在启动完成后自动处理。");
                 std::process::exit(0);
             }
             // 启动超过宽限期仍未 ready = setup hang 僵尸 → 接管
