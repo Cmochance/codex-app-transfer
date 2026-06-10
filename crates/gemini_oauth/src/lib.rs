@@ -41,7 +41,7 @@ pub use cloud_code::{bootstrap_project, ClientMetadata, CloudCodeError};
 pub use constants::{
     antigravity_user_agent_chat, antigravity_user_agent_loadcodeassist, detect_user_agent,
     OauthProviderConfig, ANTIGRAVITY_PROVIDER, ANTIGRAVITY_USERINFO_ENDPOINT, ANTIGRAVITY_VERSION,
-    ANTIGRAVITY_X_GOOG_API_CLIENT, GEMINI_CLI_PROVIDER, X_GOOG_API_CLIENT,
+    GEMINI_CLI_PROVIDER, X_GOOG_API_CLIENT,
 };
 pub use flow::{
     build_auth_url, refresh_access_token, run_oauth_flow, run_oauth_flow_with_cancel, FlowError,
