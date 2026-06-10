@@ -770,7 +770,7 @@ async fn run_reload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _) = connect_async(&ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
     let (msg, _) = make_msg(1, "Page.reload", json!({ "ignoreCache": true }));
-    write.send(WsMessage::Text(msg)).await?;
+    write.send(WsMessage::Text(msg.into())).await?;
     drain_until_response(&mut read, 1).await?;
     let _ = write.close().await;
     Ok(())
@@ -812,7 +812,7 @@ async fn run_apply(
 
     // 1. enable Page domain(addScriptToEvaluateOnNewDocument 需要)
     let (msg, _) = make_msg(1, "Page.enable", json!({}));
-    write.send(WsMessage::Text(msg)).await?;
+    write.send(WsMessage::Text(msg.into())).await?;
     drain_until_response(&mut read, 1).await?;
 
     // 2. addScriptToEvaluateOnNewDocument — 每次 page navigate / reload 自动跑
@@ -822,7 +822,7 @@ async fn run_apply(
         "Page.addScriptToEvaluateOnNewDocument",
         json!({ "source": script }),
     );
-    write.send(WsMessage::Text(msg)).await?;
+    write.send(WsMessage::Text(msg.into())).await?;
     drain_until_response(&mut read, 2).await?;
 
     // 3. Runtime.evaluate — 立即在当前 page 跑一次(addScriptToEvaluateOnNewDocument
@@ -832,7 +832,7 @@ async fn run_apply(
         "Runtime.evaluate",
         json!({ "expression": script, "returnByValue": true }),
     );
-    write.send(WsMessage::Text(msg)).await?;
+    write.send(WsMessage::Text(msg.into())).await?;
     drain_until_response(&mut read, 3).await?;
 
     let _ = write.close().await;
@@ -850,7 +850,7 @@ async fn run_clear() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Runtime.evaluate",
         json!({ "expression": script, "returnByValue": true }),
     );
-    write.send(WsMessage::Text(msg)).await?;
+    write.send(WsMessage::Text(msg.into())).await?;
     drain_until_response(&mut read, 1).await?;
 
     let _ = write.close().await;
