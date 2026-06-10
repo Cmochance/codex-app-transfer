@@ -481,12 +481,12 @@ async fn connect_and_monitor(
     // 1. 启用 Runtime domain
     let (runtime_enable, runtime_enable_id) =
         make_cdp_msg(msg_id_counter, "Runtime.enable", json!({}));
-    write.send(WsMessage::Text(runtime_enable)).await?;
+    write.send(WsMessage::Text(runtime_enable.into())).await?;
     let _ = await_cdp_response(&mut read, runtime_enable_id, Duration::from_secs(5)).await;
 
     // 2. 启用 Page domain（监听刷新事件）
     let (page_enable, page_enable_id) = make_cdp_msg(msg_id_counter, "Page.enable", json!({}));
-    write.send(WsMessage::Text(page_enable)).await?;
+    write.send(WsMessage::Text(page_enable.into())).await?;
     let _ = await_cdp_response(&mut read, page_enable_id, Duration::from_secs(5)).await;
 
     // [MOC-100 线1 回退] Network.enable + 重型逐事件落盘已撤(观察者效应:每事件同步 flush
@@ -684,7 +684,7 @@ async fn connect_and_monitor(
                         "returnByValue": true
                     }),
                 );
-                if let Err(e) = write.send(WsMessage::Text(ping)).await {
+                if let Err(e) = write.send(WsMessage::Text(ping.into())).await {
                     tracing::warn!("[PluginUnlock] heartbeat send failed, connection dead: {}", e);
                     break;
                 }
@@ -718,7 +718,7 @@ async fn connect_and_monitor(
                             "Runtime.evaluate",
                             json!({ "expression": MCP_RECORDER_JS, "returnByValue": true }),
                         );
-                        if let Err(e) = write.send(WsMessage::Text(rec_msg)).await {
+                        if let Err(e) = write.send(WsMessage::Text(rec_msg.into())).await {
                             tracing::warn!("[McpTrace] recorder install send failed: {}", e);
                             break;
                         }
@@ -734,7 +734,7 @@ async fn connect_and_monitor(
                                 "returnByValue": true
                             }),
                         );
-                        if let Err(e) = write.send(WsMessage::Text(drain_msg)).await {
+                        if let Err(e) = write.send(WsMessage::Text(drain_msg.into())).await {
                             tracing::warn!("[McpTrace] drain send failed: {}", e);
                             break;
                         }
@@ -1017,7 +1017,7 @@ async fn inject_unlock_script(
         }),
     );
 
-    write.send(WsMessage::Text(evaluate)).await?;
+    write.send(WsMessage::Text(evaluate.into())).await?;
 
     // 必须按 CDP message id 匹配响应,而不是简单读"下一帧"。
     // 注入脚本内 `console.log` 会触发 `Runtime.consoleAPICalled` 事件帧,
@@ -1197,7 +1197,7 @@ async fn inject_uninstall_script(
         "Runtime.evaluate",
         json!({ "expression": uninstall_script, "returnByValue": true }),
     );
-    if write.send(WsMessage::Text(evaluate)).await.is_err() {
+    if write.send(WsMessage::Text(evaluate.into())).await.is_err() {
         tracing::warn!("[PluginUnlock] uninstall script send failed (WS dead); skipping");
         return;
     }
@@ -1458,7 +1458,7 @@ async fn wait_for_page_ready(
             "Runtime.evaluate",
             json!({ "expression": "document.readyState", "returnByValue": true }),
         );
-        if write.send(WsMessage::Text(msg)).await.is_err() {
+        if write.send(WsMessage::Text(msg.into())).await.is_err() {
             return false;
         }
         if let Ok(resp) = await_cdp_response(read, id, Duration::from_secs(2)).await {
@@ -1542,7 +1542,7 @@ async fn disable_mcp_recorder_if_active(
             "returnByValue": true
         }),
     );
-    let _ = write.send(WsMessage::Text(off_msg)).await;
+    let _ = write.send(WsMessage::Text(off_msg.into())).await;
 }
 
 fn make_cdp_msg(counter: &AtomicU64, method: &str, params: serde_json::Value) -> (String, u64) {
