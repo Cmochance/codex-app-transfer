@@ -132,27 +132,36 @@ pub(crate) fn apply_antigravity_transform(
     // (实证 `agent/a65d590f-…/1780060921687/17e30eb2-…/85`)。我们没有真实的
     // trajectory/step 连续性,用随机 uuid + 当前 ms + seq(以 contents 条数近似 step
     // index,随多轮递增)。见 memory `reference_antigravity_wire_fingerprint`。
+    // [MOC-67] execution_uuid / trajectory_uuid / seq **抽成变量**:requestId 与 labels
+    // 必须内部一致(labels.last_execution_id=execution_uuid、trajectory_id=trajectory_uuid、
+    // last_step_index=seq-1)。
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    let seq = envelope_obj
+        .get("request")
+        .and_then(|v| v.as_object())
+        .and_then(|r| r.get("contents"))
+        .and_then(|c| c.as_array())
+        .map(|a| a.len())
+        .unwrap_or(1);
+    let execution_uuid = uuid_v4()?;
+    let trajectory_uuid = uuid_v4()?;
     let request_id = if is_image {
-        format!("image_gen/{}/{}/12", now_ms, uuid_v4()?)
+        format!("image_gen/{}/{}/12", now_ms, execution_uuid)
     } else {
-        let seq = envelope_obj
-            .get("request")
-            .and_then(|v| v.as_object())
-            .and_then(|r| r.get("contents"))
-            .and_then(|c| c.as_array())
-            .map(|a| a.len())
-            .unwrap_or(1);
-        format!("agent/{}/{}/{}/{}", uuid_v4()?, now_ms, uuid_v4()?, seq)
+        format!("agent/{execution_uuid}/{now_ms}/{trajectory_uuid}/{seq}")
     };
     envelope_obj.insert("requestId".into(), Value::String(request_id));
     // 官方 antigravity envelope **不含** `user_prompt_id`(2026-05-29 实证);它是
     // gemini-cli 路径才有的字段,而 `wrap_cloud_code_envelope` 给两边都加了 ——
     // 在 antigravity 路径移除,避免 wire 上出现 gemini-cli 特有字段被上游识别。
     envelope_obj.remove("user_prompt_id");
+
+    // 顶层 toolConfig(tool_choice 派生的 AUTO/NONE/ANY)在 antigravity 不发 —— 官方固定发
+    // VALIDATED(下面在 request 内按 tools 设),先移除顶层避免泄漏 gemini-cli 形态。
+    envelope_obj.remove("toolConfig");
 
     if let Some(request_obj) = envelope_obj
         .get_mut("request")
@@ -163,24 +172,47 @@ pub(crate) fn apply_antigravity_transform(
         if !is_image {
             let session_id = stable_session_id_from_request(request_obj);
             request_obj.insert("sessionId".into(), Value::String(session_id));
-        }
-    }
 
-    let top_tool_config = envelope_obj.get("toolConfig").cloned();
-    if let Some(tc) = top_tool_config {
-        let req_has_tc = envelope_obj
-            .get("request")
-            .and_then(|v| v.as_object())
-            .map(|r| r.contains_key("toolConfig"))
-            .unwrap_or(false);
-        if !req_has_tc {
-            if let Some(request_obj) = envelope_obj
-                .get_mut("request")
-                .and_then(|v| v.as_object_mut())
-            {
-                request_obj.insert("toolConfig".into(), tc);
+            // [MOC-67 item1] labels:与 requestId 内部一致 + 固定占位(2026-05-29 抓包实证)。
+            // GCP labels 惯例是 string→string,故 last_step_index 也用字符串。
+            request_obj.insert(
+                "labels".into(),
+                json!({
+                    "last_execution_id": execution_uuid,
+                    "last_step_index": seq.saturating_sub(1).to_string(),
+                    "model_enum": "MODEL_PLACEHOLDER_M132",
+                    "trajectory_id": trajectory_uuid,
+                    "used_claude": "false",
+                    "used_claude_conservative": "false",
+                }),
+            );
+
+            // [MOC-67 item2] toolConfig:官方固定 `{"functionCallingConfig":{"mode":"VALIDATED"}}`
+            // (2026-05-29 抓包)。**仅当带 functionDeclarations 时设** —— Gemini 拒绝
+            // functionCallingConfig 单独出现而无 functionDeclarations(400),built-in 工具
+            // (googleSearch/web_search)不算(对齐 gemini_native/request.rs 同款门槛,
+            // codex-connector #439 P2)。VALIDATED 按 schema 约束工具调用入参,已真机验证
+            // 不破坏 Codex shell/apply_patch(那些是 functionDeclarations,17 次 15 ok/0 错)。
+            let has_function_decls = request_obj
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(|arr| {
+                    arr.iter().any(|tool| {
+                        tool.get("functionDeclarations")
+                            .and_then(|f| f.as_array())
+                            .map(|f| !f.is_empty())
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if has_function_decls {
+                request_obj.insert(
+                    "toolConfig".into(),
+                    json!({"functionCallingConfig": {"mode": "VALIDATED"}}),
+                );
+            } else {
+                request_obj.remove("toolConfig");
             }
-            envelope_obj.remove("toolConfig");
         }
     }
 
@@ -773,7 +805,8 @@ mod tests {
             "user_prompt_id": "u",
             "request": {
                 "contents": [{"role":"user","parts":[{"text":"hello world"}]}],
-                "safetySettings": [{"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"}]
+                "safetySettings": [{"category":"HARM_CATEGORY_HATE_SPEECH","threshold":"BLOCK_NONE"}],
+                "tools": [{"functionDeclarations":[{"name":"shell","parameters":{"type":"object"}}]}]
             },
             "toolConfig": {"functionCallingConfig":{"mode":"AUTO"}}
         });
@@ -789,17 +822,14 @@ mod tests {
         );
 
         let rid = out.get("requestId").and_then(|v| v.as_str()).unwrap();
-        // 实证格式 agent/<uuid>/<ms>/<uuid>/<seq>(2026-05-29 抓包)
-        assert!(
-            rid.starts_with("agent/"),
-            "requestId 应为 agent/<uuid>/<ms>/<uuid>/<seq>,实际:{rid}"
-        );
+        // 实证格式 agent/<execution_uuid>/<ms>/<trajectory_uuid>/<seq>(2026-05-29 抓包)
+        let segs: Vec<&str> = rid.split('/').collect();
         assert_eq!(
-            rid.matches('/').count(),
-            4,
-            "agent/uuid/ms/uuid/seq 应有 4 个斜杠,实际:{rid}"
+            segs.len(),
+            5,
+            "requestId 应 agent/uuid/ms/uuid/seq,实际:{rid}"
         );
-        // antigravity envelope 不含 user_prompt_id(实证),transform 应删除
+        assert_eq!(segs[0], "agent");
         assert!(
             out.get("user_prompt_id").is_none(),
             "antigravity 路径应移除 user_prompt_id"
@@ -808,7 +838,49 @@ mod tests {
         let req = out.get("request").and_then(|v| v.as_object()).unwrap();
         assert!(!req.contains_key("safetySettings"));
         assert!(req.contains_key("sessionId"));
-        assert!(req.contains_key("toolConfig"));
+
+        // [MOC-67 item1] labels 与 requestId 内部一致(last_execution_id=第1段 uuid /
+        // trajectory_id=第3段 uuid / last_step_index=seq-1)+ 固定占位值
+        let labels = req
+            .get("labels")
+            .and_then(|v| v.as_object())
+            .expect("labels 应存在");
+        assert_eq!(
+            labels.get("last_execution_id").and_then(|v| v.as_str()),
+            Some(segs[1]),
+            "last_execution_id 应=requestId 第1段 uuid"
+        );
+        assert_eq!(
+            labels.get("trajectory_id").and_then(|v| v.as_str()),
+            Some(segs[3]),
+            "trajectory_id 应=requestId 第3段 uuid"
+        );
+        // seq=contents.len()=1 → last_step_index=seq-1="0";requestId 末段=seq="1"
+        assert_eq!(
+            labels.get("last_step_index").and_then(|v| v.as_str()),
+            Some("0")
+        );
+        assert_eq!(segs[4], "1");
+        assert_eq!(
+            labels.get("model_enum").and_then(|v| v.as_str()),
+            Some("MODEL_PLACEHOLDER_M132")
+        );
+        assert_eq!(
+            labels.get("used_claude").and_then(|v| v.as_str()),
+            Some("false")
+        );
+        assert_eq!(
+            labels
+                .get("used_claude_conservative")
+                .and_then(|v| v.as_str()),
+            Some("false")
+        );
+
+        // [MOC-67 item2] toolConfig 固定 VALIDATED(覆盖 tool_choice 的 AUTO);顶层移除
+        assert_eq!(
+            req.get("toolConfig").cloned(),
+            Some(json!({"functionCallingConfig":{"mode":"VALIDATED"}}))
+        );
         assert!(out.get("toolConfig").is_none());
     }
 
@@ -833,10 +905,13 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_transform_does_not_overwrite_existing_request_tool_config() {
+    fn antigravity_transform_forces_validated_overriding_input_toolconfig() {
+        // [MOC-67] antigravity 固定 VALIDATED:覆盖 request 已有的 tool_choice 模式(ANY)
+        // + 丢弃顶层(AUTO)。官方抓包恒发 VALIDATED,不发 tool_choice 派生形态。
         let envelope = json!({
             "request": {
                 "contents": [{"role":"user","parts":[{"text":"hi"}]}],
+                "tools": [{"functionDeclarations":[{"name":"f","parameters":{"type":"object"}}]}],
                 "toolConfig": {"functionCallingConfig":{"mode":"ANY"}}
             },
             "toolConfig": {"functionCallingConfig":{"mode":"AUTO"}}
@@ -847,10 +922,44 @@ mod tests {
             .and_then(|v| v.get("toolConfig"))
             .cloned()
             .unwrap();
-        assert_eq!(req_tc, json!({"functionCallingConfig":{"mode":"ANY"}}));
+        assert_eq!(
+            req_tc,
+            json!({"functionCallingConfig":{"mode":"VALIDATED"}})
+        );
+        assert!(out.get("toolConfig").is_none(), "顶层 toolConfig 应移除");
+    }
+
+    #[test]
+    fn antigravity_transform_no_tools_drops_toolconfig() {
+        // 无 tools → 不发 toolConfig(functionCallingConfig 仅在有函数声明时有意义)
+        let envelope = json!({
+            "request": {"contents": [{"role":"user","parts":[{"text":"hi"}]}]},
+            "toolConfig": {"functionCallingConfig":{"mode":"AUTO"}}
+        });
+        let out = apply_antigravity_transform(envelope, "gemini-3-pro-low").unwrap();
+        let req = out.get("request").and_then(|v| v.as_object()).unwrap();
         assert!(
-            out.get("toolConfig").is_some(),
-            "top-level remains when request already has one"
+            !req.contains_key("toolConfig"),
+            "无 tools 不应发 toolConfig"
+        );
+        assert!(out.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn antigravity_transform_builtin_only_tools_no_validated() {
+        // codex-connector #439 P2:只有 built-in 工具(googleSearch,无 functionDeclarations)
+        // → 不设 VALIDATED(Gemini 拒 functionCallingConfig 无 functionDeclarations,400)。
+        let envelope = json!({
+            "request": {
+                "contents": [{"role":"user","parts":[{"text":"hi"}]}],
+                "tools": [{"googleSearch": {}}]
+            }
+        });
+        let out = apply_antigravity_transform(envelope, "gemini-3-pro-low").unwrap();
+        let req = out.get("request").and_then(|v| v.as_object()).unwrap();
+        assert!(
+            !req.contains_key("toolConfig"),
+            "built-in 工具无 functionDeclarations 不应设 VALIDATED"
         );
     }
 }
