@@ -2,6 +2,22 @@
 
 逐版本要点。
 
+## v2.3.1
+
+**新版 Codex Desktop(v26.608+)思考过程不显示修复 (MOC-203)**:新版 Codex 渲染读 reasoning 的 **content 通道**(`reasoning_text` + `content_index`),不再读旧 summary 通道(`reasoning_summary_text` + `summary_index`),导致升级后第三方模型的思考块整段不显示。修复:`gemini_native` / chat 路径**双发两通道**(保留旧 summary 兼容老版 + 新增 content 通道,item content 同步置 `[{reasoning_text}]`),content 通道剥掉 CLI 的 `**Thinking**` 头;chat 路径开 tool_call 前先 `close_reasoning`,修 reasoning 与 function_call 事件交错导致新版渲染整段丢思考;交错思考(close 后又来 reasoning,如 GLM/Kimi 工具间思考)重开新 reasoning item(新 id/output_index)、envelope 多段输出、历史回灌多段拼接;gemini `functionCall` 后空 text part 不再开空 message item,修同轮工具折叠 + 空白行。Refs MOC-203。
+
+**remote compaction v2 支持 (MOC-198)**:新版 Codex(启用 `remote_compaction_v2`)autocompact 不再调私有 `/responses/compact` 端点,改发普通流式 `/responses` 请求并在 `input` 末尾追加 `{"type":"compaction_trigger"}` 标记;此前代理未识别该形态、把它当普通对话,响应不含 compaction item,Codex 报 `expected exactly one compaction output item` 后挂住。修复:新增双轨检测(V1 按 path;V2 按「普通 /responses + body 含 compaction_trigger」),V2 剥标记后复用摘要逻辑、按 Codex v2 协议包装单 compaction item 的 SSE 流;四大 mapper(chat / gemini_native / cloud_code / anthropic)均已适配。Refs MOC-198。
+
+**apply_patch 中间层 — 畸形 V4A 格式恢复 (MOC-194)**:第三方 chat 模型无 GPT 的 lark 语法约束,常产出畸形 V4A patch(双边 `@@`、Add File 漏 `+`、上下文 byte 失配、缺 `*** Begin/End Patch` 信封、漏空行、漏前缀)。新增中间层按白名单逐条恢复成合法格式再发 Codex —— 读盘把锚点/上下文对齐文件真实字节、补回漏写空行、空文件/空 rename 转 `Delete+Add`;**非破坏性**(不丢内容/不覆盖)、未知一律原样透过(交 Codex 报错让模型自纠,不猜)。状态改写仅用当前请求 fresh cwd 防跨项目 stale cwd 删错文件。另加诊断 apply-patch / codex-response 页。Refs MOC-194。
+
+**强杀后重启自愈 + 拍快照反投毒 (MOC-197)**:transfer 被 `kill -9` / 崩溃强杀时退出 restore 没跑,live config 残留 apply 字段(`sandbox_mode` / 死 proxy base_url),GPT 账号 Codex 报「无法设置管理员沙盒」且无法对话。两层修复:restore 在无当前 session 快照时发现并还原最新 stale 快照(Auto 语义);拍快照写入端过滤残留特征字段,防把脏 live 拍成新快照污染还原基线。Refs MOC-197。
+
+**antigravity 传输指纹剩余项 (MOC-67)**:对齐抓包 ground truth 补齐 antigravity 传输层指纹 —— `streamGenerateContent` request.labels(`last_execution_id` / `trajectory_id` / `model_enum` / `used_claude` 等,与 requestId 内部一致)、`toolConfig` mode 置 `VALIDATED`、删除冗余 `x_goog` dead code。内容层(prompt + tools)保持 Codex 不动。Refs MOC-67。
+
+**残留扫描面板「显示重复字段」只读按钮 + macOS Gatekeeper 文档修正**:Codex 原配置完整性检查面板新增「显示重复字段」按钮(只读 GET,列出每个污染文件 + 待 strip 残留字段、不弹确认不写盘);README 修正 macOS 15 Sequoia+ / Tahoe 26 的 Gatekeeper 放行步骤(Apple 已移除「右键→打开」,改为系统设置→隐私与安全性→「仍要打开」)。
+
+**依赖升级**:`windows` 0.61.3→0.62.2、`tokio-tungstenite` 0.24→0.29(workspace 统一 0.29,适配 `Message::Text` 载荷 `String`→`Utf8Bytes`)、`dom_query` 0.27→0.28、`dom_smoothie` 0.17→0.18。
+
 ## v2.3.0
 
 **web_fetch 默认返回完整正文 + 新增 `read_url_local` 工具 (MOC-190)**:`web_fetch` 默认行为重做——**直接返回抓取到的完整正文**(不再分页、不再按 `offset` 翻页、不再按 `query` 相关性选块)。adapter 层保留当前轮(本次新产生的那一组,模型一轮可调多工具)所有 tool 输出全文进 LLM 上下文(≤100k,超则仍 bound 防撑爆),更早历史轮 tool 输出照常压缩成 bounded evidence + artifact。`summarize=true` 仍走总结子模型(opt-in 不变,`query` 仅作摘要重点)。新增 **`read_url_local(url)`** 工具:取之前 `web_fetch` 抓过的某 URL 完整正文(进程内缓存,TTL 15 min),当较早抓取的内容在对话历史里被折叠/压缩时用它回看完整原文,无需重新联网。`web_search` `max_results` 默认 8→15、上限 20→30(8 条太少,模型常因信息不足反复换词重搜;每条只是标题+URL+短摘要、不占多少 context)。compact 转换(历史压缩)不保留 tool 全文(与正常轮区分)。另修 **curl/wreq 抓取未解压压缩响应导致乱码**:两档都带 Chrome 指纹、服务器据此返回 gzip/br 压缩正文,但 client 没启用解压 → 原样吐压缩字节变乱码(antigravity.google 等实测);为 reqwest/wreq 补 `gzip/brotli/deflate/zstd` 解压 feature(解压连带修好 auto 升级误判——乱码曾让 JS 骨架检测失效、不升级 headless)。mcp `initialize` 加 server 级 `instructions` 把「回看已抓过的 URL 优先用 read_url_local、不重复 web_fetch」抬成强规则,提高其调用率。经 chatgpt-codex 11 轮 review 收敛——current/cached 区分从「call_id 集合」改为「merge 后末尾连续 tool 组」的结构定义,兼容 ID-less / 别名 / 一轮多工具 / tool_search_output / stateless 完整 transcript 所有形态。
