@@ -105,7 +105,7 @@ Codex-App-Transfer-v<版本>-Linux-x86_64.AppImage       通用 Linux x86_64,`ch
 每个二进制都附带 `.sha256` 与 `.sig`(RSA-3072 PKCS#1 v1.5 + SHA-256 签名);公钥 `Codex-App-Transfer-release-public.pem` 跟随每个 Release 一起发布,直接从 [Releases](https://github.com/Cmochance/codex-app-transfer/releases) 下载即可验签。
 
 Windows 暂未做 Authenticode 代码签名,系统可能提示未知发布者,可用 `.sha256` / `.sig` 校验下载完整性。
-macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarization)**,首次打开会被 Gatekeeper 拦截,提示「无法打开,因为它来自身份不明的开发者」。绕过方式:`右键 → 打开` 一次性放行;或用 `.sha256` / `.sig` 校验下载完整性后,在 `系统设置 → 隐私与安全性` 点「仍要打开」。
+macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarization)**(发行包为 ad-hoc 签名),首次打开会被 Gatekeeper 拦截。放行方式(macOS 15 Sequoia / 26 Tahoe 起 Apple 已移除「右键 → 打开」放行入口,请按下面步骤):先把 .app 从 dmg 拖入「应用程序」,双击一次让系统弹出拦截提示并关闭,再到 `系统设置 → 隐私与安全性` 底部点「仍要打开」;或用 `.sha256` / `.sig` 校验下载完整性后,终端执行 `xattr -dr com.apple.quarantine "/Applications/Codex App Transfer.app"` 清除隔离属性。macOS 14 及更早版本仍可 `右键 → 打开` 一次性放行。
 
 ## 快速开始
 

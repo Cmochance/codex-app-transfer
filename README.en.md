@@ -106,7 +106,7 @@ Each binary ships with `.sha256` and `.sig` (RSA-3072 PKCS#1 v1.5 + SHA-256); th
 
 Windows builds are not Authenticode-signed yet, so Windows may show an "unknown publisher" warning — use the `.sha256` / `.sig` to verify download integrity.
 
-macOS builds are **not yet signed with an Apple Developer ID** and **not yet Notarized**, so Gatekeeper blocks first launch with "cannot be opened because it is from an unidentified developer". Workarounds: `right-click → Open` to allow once; or verify download integrity with `.sha256` / `.sig`, then click "Open Anyway" under `System Settings → Privacy & Security`.
+macOS builds are **not yet signed with an Apple Developer ID** and **not yet Notarized** (release bundles are ad-hoc signed), so Gatekeeper blocks first launch. How to allow (since macOS 15 Sequoia / 26 Tahoe, Apple removed the `right-click → Open` bypass — use the steps below): drag the .app from the dmg into `Applications`, double-click once so the blocking dialog appears and dismiss it, then click "Open Anyway" at the bottom of `System Settings → Privacy & Security`; or verify download integrity with `.sha256` / `.sig` and run `xattr -dr com.apple.quarantine "/Applications/Codex App Transfer.app"` in Terminal to clear the quarantine attribute. On macOS 14 and earlier, `right-click → Open` still works as a one-time allow.
 
 ## Quick Start
 
