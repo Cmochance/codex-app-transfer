@@ -63,10 +63,25 @@ fn remember_or_recall_cwd(cwd: Option<&str>) -> Option<String> {
 
 /// 从 Codex Responses 请求里抽 `<cwd>...</cwd>`(Codex 注入的 environment_context 块,
 /// 形如 `<environment_context>\n  <cwd>/abs/path</cwd>\n  <shell>zsh</shell>...`)。
-/// 直接在序列化后的请求 JSON 文本里找(不依赖它落在 instructions 还是某条 input message)。
+///
+/// **遍历 Value 树**找含 `<cwd>` 的字符串节点(其值已是 serde 反转义后的原文)再抽取 —— **不能**
+/// 先 `serde_json::to_string(整个请求)` 再搜:那会把字符串值**重新 JSON 转义**,Windows 路径
+/// `C:\Users\...` 的反斜杠被翻倍成 `C:\\Users\\...`,resolve_path 拿到错路径(codex-connector #435 P2)。
+/// 不依赖 `<cwd>` 落在 instructions 还是某条 input message(任意层级的 string 节点都扫)。
 pub fn extract_cwd(request: Option<&Value>) -> Option<String> {
-    let req = request?;
-    let s = serde_json::to_string(req).ok()?;
+    fn find_in_value(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => extract_cwd_from_str(s),
+            Value::Array(a) => a.iter().find_map(find_in_value),
+            Value::Object(o) => o.values().find_map(find_in_value),
+            _ => None,
+        }
+    }
+    find_in_value(request?)
+}
+
+/// 从单个(已反转义的)字符串里抽 `<cwd>...</cwd>`。
+fn extract_cwd_from_str(s: &str) -> Option<String> {
     let start = s.find("<cwd>")? + "<cwd>".len();
     let rest = &s[start..];
     let end = rest.find("</cwd>")?;
@@ -962,6 +977,16 @@ mod tests {
         assert_eq!(extract_cwd(Some(&req)).as_deref(), Some("/Users/x/proj"));
         assert_eq!(extract_cwd(None), None);
         assert_eq!(extract_cwd(Some(&json!({"input":[]}))), None);
+
+        // codex-connector #435 P2:Windows 路径反斜杠不能被翻倍(遍历 Value 取反转义原文,
+        // 不能先序列化整个请求)。json! 里 "C:\\Users\\me\\repo" = 实际单反斜杠路径。
+        let win = json!({
+            "input": [{"type":"message","role":"user","content":"<environment_context>\n  <cwd>C:\\Users\\me\\repo</cwd>\n</environment_context>"}]
+        });
+        assert_eq!(
+            extract_cwd(Some(&win)).as_deref(),
+            Some(r"C:\Users\me\repo")
+        );
     }
 
     #[test]
