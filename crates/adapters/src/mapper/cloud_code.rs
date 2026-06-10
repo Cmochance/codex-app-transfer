@@ -187,14 +187,24 @@ pub(crate) fn apply_antigravity_transform(
             );
 
             // [MOC-67 item2] toolConfig:官方固定 `{"functionCallingConfig":{"mode":"VALIDATED"}}`
-            // (2026-05-29 抓包),仅当 request 带 tools 时设。⚠️ VALIDATED 会按 schema 校验工具
-            // 调用入参 —— **须真机验证不破坏 Codex shell/apply_patch 工具调用**(MOC-67 item2)。
-            let has_tools = request_obj
+            // (2026-05-29 抓包)。**仅当带 functionDeclarations 时设** —— Gemini 拒绝
+            // functionCallingConfig 单独出现而无 functionDeclarations(400),built-in 工具
+            // (googleSearch/web_search)不算(对齐 gemini_native/request.rs 同款门槛,
+            // codex-connector #439 P2)。VALIDATED 按 schema 约束工具调用入参,已真机验证
+            // 不破坏 Codex shell/apply_patch(那些是 functionDeclarations,17 次 15 ok/0 错)。
+            let has_function_decls = request_obj
                 .get("tools")
                 .and_then(|t| t.as_array())
-                .map(|a| !a.is_empty())
+                .map(|arr| {
+                    arr.iter().any(|tool| {
+                        tool.get("functionDeclarations")
+                            .and_then(|f| f.as_array())
+                            .map(|f| !f.is_empty())
+                            .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false);
-            if has_tools {
+            if has_function_decls {
                 request_obj.insert(
                     "toolConfig".into(),
                     json!({"functionCallingConfig": {"mode": "VALIDATED"}}),
@@ -914,5 +924,23 @@ mod tests {
             "无 tools 不应发 toolConfig"
         );
         assert!(out.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn antigravity_transform_builtin_only_tools_no_validated() {
+        // codex-connector #439 P2:只有 built-in 工具(googleSearch,无 functionDeclarations)
+        // → 不设 VALIDATED(Gemini 拒 functionCallingConfig 无 functionDeclarations,400)。
+        let envelope = json!({
+            "request": {
+                "contents": [{"role":"user","parts":[{"text":"hi"}]}],
+                "tools": [{"googleSearch": {}}]
+            }
+        });
+        let out = apply_antigravity_transform(envelope, "gemini-3-pro-low").unwrap();
+        let req = out.get("request").and_then(|v| v.as_object()).unwrap();
+        assert!(
+            !req.contains_key("toolConfig"),
+            "built-in 工具无 functionDeclarations 不应设 VALIDATED"
+        );
     }
 }
