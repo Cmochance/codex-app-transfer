@@ -69,9 +69,10 @@ toml_edit = "0.22"
 # tar / gzip — MCP plugin marketplace 安装走 tar.gz download → 解压到 ~/.codex/plugins/cache/
 tar = "0.4"
 flate2 = "1.0"
-# cross-process file locking — config.json RMW 跨实例(双开 .app)防 lost-update。
-# 进程内 std::sync::Mutex 不管多 OS 进程,fs2::FileExt::lock_exclusive 走 fcntl
-# (POSIX) / LockFileEx (Windows),OS 级独占。
+# cross-process file locking — config.json RMW 跨实例(双开 .app)防 lost-update;
+# [MOC-196] 也是 macOS 单实例锁本体(single_instance.rs,进程死亡内核自动释放)。
+# 进程内 std::sync::Mutex 不管多 OS 进程,fs2 在 unix 走 flock(非 fcntl,
+# fs2-0.4.3/src/unix.rs)/ Windows 走 LockFileEx,OS 级独占。
 fs2 = "0.4"
 # CDP WebSocket 连接（Codex Plugins 解锁器）
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
