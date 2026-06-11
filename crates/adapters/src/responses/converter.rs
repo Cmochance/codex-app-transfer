@@ -1157,6 +1157,7 @@ impl ChatToResponsesConverter {
             ToolCallEntry {
                 name: name.clone(),
                 arguments: args_acc.clone(),
+                thought_signature: None,
             },
         );
         if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
@@ -1435,8 +1436,6 @@ impl ChatToResponsesConverter {
                     "status": "in_progress",
                     "id": self.reasoning_id,
                     "summary": [],
-                    "content": [],
-                    "encrypted_content": null,
                 },
             }),
         );
@@ -1554,11 +1553,12 @@ impl ChatToResponsesConverter {
     }
 
     fn reasoning_item_completed(&self) -> Value {
-        // content 通道纯思考(剥 summary 侧的 **Thinking** CLI header)
-        let content_text = self
-            .reasoning_acc
-            .strip_prefix(crate::responses::request::CODEX_REASONING_PREFIX)
-            .unwrap_or(&self.reasoning_acc);
+        // [MOC-218 第三关] item 不带 `content` / `encrypted_content`:OpenAI
+        // Responses 后端对 input 里 reasoning item 硬校验 content 数组长度必须
+        // 0(`array_above_max_length`),`encrypted_content` 假值有 MOC-13 前科;
+        // item 持久化进会话历史、切真 GPT 时原样上发,必须出生即合规。当轮
+        // 渲染靠 SSE `reasoning_text.delta` content 通道事件(保留双发,
+        // MOC-203),不靠 item 字段(GPT 直连 summary:[] 仍显示的实证)。
         json!({
             "type": "reasoning",
             "status": "completed",
@@ -1567,11 +1567,6 @@ impl ChatToResponsesConverter {
                 "type": "summary_text",
                 "text": self.reasoning_acc,
             }],
-            "content": [{
-                "type": "reasoning_text",
-                "text": content_text,
-            }],
-            "encrypted_content": null,
         })
     }
 
@@ -2295,6 +2290,7 @@ fn emit_apply_patch_output(
         ToolCallEntry {
             name: name.to_owned(),
             arguments: args_acc.to_owned(),
+            thought_signature: None,
         },
     );
 }
@@ -3157,10 +3153,10 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         let output = completed["output"].as_array().unwrap();
         assert_eq!(output.len(), 1, "output contains only the reasoning item");
         assert_eq!(output[0]["type"], "reasoning");
-        // content 通道(新版 Codex 渲染):纯思考,剥 **Thinking** header
-        assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
-        assert_eq!(output[0]["content"][0]["text"], "The");
-        assert_eq!(output[0]["encrypted_content"], Value::Null);
+        // [MOC-218 第三关] item 不带 content / encrypted_content(OpenAI 后端
+        // 校验 input reasoning content 长度 0;content 通道只走 SSE 事件)
+        assert!(output[0].get("content").is_none());
+        assert!(output[0].get("encrypted_content").is_none());
         // summary[0].text 是注入 prefix + 上游 reasoning 累积的全文(旧版兼容)
         assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nThe");
         assert_eq!(output[0]["summary"][0]["type"], "summary_text");
@@ -3193,8 +3189,9 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         assert_eq!(ev1[2].1["item"]["type"], "reasoning");
         assert_eq!(ev1[2].1["output_index"], 0);
         assert_eq!(ev1[2].1["item"]["summary"], json!([]));
-        assert_eq!(ev1[2].1["item"]["content"], json!([]));
-        assert_eq!(ev1[2].1["item"]["encrypted_content"], Value::Null);
+        // [MOC-218 第三关] added item 同样不带 content / encrypted_content
+        assert!(ev1[2].1["item"].get("content").is_none());
+        assert!(ev1[2].1["item"].get("encrypted_content").is_none());
         assert_eq!(ev1[4].1["delta"], "**Thinking**\n\n");
         assert_eq!(ev1[5].1["delta"], "think");
         assert_eq!(ev1[6].1["delta"], "think"); // content 通道纯思考(无 header)
@@ -3220,8 +3217,10 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         );
         // reasoning 关闭事件的 output_index = 0
         assert_eq!(ev2[3].1["output_index"], 0);
-        assert_eq!(ev2[3].1["item"]["content"][0]["text"], "think");
-        assert_eq!(ev2[3].1["item"]["encrypted_content"], Value::Null);
+        // [MOC-218 第三关] done item 不带 content / encrypted_content;思考
+        // 文本由上面的 reasoning_text.done 事件承载
+        assert!(ev2[3].1["item"].get("content").is_none());
+        assert!(ev2[3].1["item"].get("encrypted_content").is_none());
         assert_eq!(ev2[3].1["item"]["summary"][0]["type"], "summary_text");
         // message 打开事件的 output_index = 1
         assert_eq!(ev2[4].1["output_index"], 1);
@@ -3242,8 +3241,9 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         let output = ev3[3].1["response"]["output"].as_array().unwrap();
         assert_eq!(output.len(), 2);
         assert_eq!(output[0]["type"], "reasoning");
-        assert_eq!(output[0]["content"][0]["text"], "think");
-        assert_eq!(output[0]["encrypted_content"], Value::Null);
+        // [MOC-218 第三关] envelope reasoning item 同样不带 content / encrypted_content
+        assert!(output[0].get("content").is_none());
+        assert!(output[0].get("encrypted_content").is_none());
         assert_eq!(output[0]["summary"][0]["type"], "summary_text");
         assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink");
         assert_eq!(output[1]["type"], "message");
@@ -3272,8 +3272,9 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             completed["output"][0]["summary"][0]["text"],
             "**Thinking**\n\npart1 part2"
         );
-        // content 通道(多 delta 拼接后)剥 header = 纯思考
-        assert_eq!(completed["output"][0]["content"][0]["text"], "part1 part2");
+        // [MOC-218 第三关] item 不带 content(content 通道只走 SSE 事件;多
+        // delta 拼接的纯思考文本由 reasoning_text.done 事件承载)
+        assert!(completed["output"][0].get("content").is_none());
     }
 
     /// MOC-203 交错修复锁定:reasoning 开着时来 tool_call,必须先完整闭合
@@ -3365,9 +3366,12 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","fu
         assert_eq!(output[2]["type"], "reasoning");
         // 两段 item id 不同(避免与已 done 的 item 撞 id)
         assert_ne!(output[0]["id"], output[2]["id"]);
-        // 各段 content 通道独立纯思考
-        assert_eq!(output[0]["content"][0]["text"], "think1");
-        assert_eq!(output[2]["content"][0]["text"], "think2");
+        // [MOC-218 第三关] item 不带 content;各段独立思考文本经 SSE
+        // reasoning_text 事件与 summary 承载
+        assert!(output[0].get("content").is_none());
+        assert!(output[2].get("content").is_none());
+        assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink1");
+        assert_eq!(output[2]["summary"][0]["text"], "**Thinking**\n\nthink2");
         // assistant_message 历史回灌:两段拼接、均剥 header
         let msg = c.assistant_message().unwrap();
         assert_eq!(msg["reasoning_content"], "think1\n\nthink2");

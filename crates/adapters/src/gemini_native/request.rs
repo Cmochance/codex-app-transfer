@@ -1192,8 +1192,9 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
                 for tc in tool_calls {
                     if let Some((id, name, args, sig)) = extract_tool_call(tc) {
                         tool_call_id_to_name.insert(id, name.clone());
-                        // P1-B:thoughtSignature 从 call_id 解出后写回 functionCall part,
-                        // Gemini 3 多轮 thinking 上下文不断
+                        // P1-B → MOC-218:thoughtSignature 由 decode_tool_call_id_signature
+                        // 三级回退(旧内联格式 → 本地 cache 反查 → miss 裸发)写回
+                        // functionCall part,Gemini 3 多轮 thinking 上下文不断
                         assistant_parts.push(Part {
                             function_call: Some(FunctionCall { name, args }),
                             thought_signature: sig,
@@ -1247,18 +1248,20 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
             // function_call + function_call_output 不会触发这条 path;若 Codex.app
             // 启用 session resume 而 SessionStore 还没实现,这条会触发 — 当前
             // 安全 BadRequest 让用户看到 "缺 SessionStore" 而不是 silent Gemini 400。
-            // **encoded vs clean call_id 兼容**(2026-05-11 修):
-            // tool message 的 tool_call_id 是 emit_function_call 的 encoded form
-            // ("call_X~~sig~~Y"),但 tool_call_id_to_name 是 extract_tool_call
-            // 解码后的 clean form 作 key("call_X")。 lookup 两次试:先 encoded
-            // 后 clean 才不漏 — 不然即使 prior function_call 在同 input,
-            // tool_call_id_to_name lookup MISS,误判没 prior → BadRequest
+            // **encoded vs clean call_id 兼容**(2026-05-11;MOC-218 后仍保留):
+            // MOC-218 前 emit_function_call 产生 encoded call_id("call_X~~sig~~Y"),
+            // 修复后 emit 侧恒短,但旧会话历史里仍有 encoded form。
+            // tool_call_id_to_name 以 extract_tool_call 解码后的 clean form("call_X")
+            // 为 key。lookup 两次试:先 encoded 后 clean 才不漏 — 否则旧会话
+            // 的 encoded tool_call_id 查不到 → 误判无 prior → BadRequest
             let name = tool_call_id_to_name
                 .get(tool_call_id)
                 .cloned()
                 .or_else(|| {
-                    let (clean, _sig) = decode_tool_call_id_signature(tool_call_id);
-                    tool_call_id_to_name.get(&clean).cloned()
+                    // 只需 clean id 做 map lookup,不需要签名 → 走纯 strip 版,
+                    // 避免对短 id 白查一次 global cache(锁 + entry clone)
+                    let clean = strip_tool_call_id_signature(tool_call_id);
+                    tool_call_id_to_name.get(clean).cloned()
                 })
                 .or_else(|| msg.get("name").and_then(|v| v.as_str()).map(String::from))
                 .ok_or_else(|| {
@@ -1353,16 +1356,38 @@ fn role_of(msg: &Value) -> &str {
     msg.get("role").and_then(|v| v.as_str()).unwrap_or("")
 }
 
-/// 拆 call_id 里的 thoughtSignature(P1-B 修复 — Gemini 3 多轮 thinking roundtrip)。
-/// emit_function_call 用 `~~sig~~` 分隔符编码,这里反向拆。
-/// 返 (clean_call_id_without_signature, Option<signature>)。
+/// 取 call_id 对应的 thoughtSignature(P1-B — Gemini 3 多轮 thinking roundtrip;
+/// MOC-218 改为本地 cache 反查)。返 (clean_call_id, Option<signature>),三级回退:
+///
+/// 1. **旧内联格式兼容**:修复前的会话历史里 call_id 仍是
+///    `call_X~~sig~~Y`(emit 侧已不再产生),按分隔符拆出签名 —— 旧会话
+///    在 gemini 内续聊签名链不断;
+/// 2. **本地 cache(新格式)**:emit_function_call 把签名存进
+///    [`crate::responses::global_tool_call_cache`],按短 call_id 反查;
+/// 3. **裸发**:cache miss(TTL 1h 过期 / LRU 顶出 / 写盘失败后重启 /
+///    多实例 last-writer-wins 覆盖 / 跨机)→ `None`,functionCall 历史不带
+///    thoughtSignature 上发 —— Gemini 上游实测完全容忍(flash + pro 两档
+///    200,MOC-218 容忍度测试),代价仅推理连续性;丢失事件在 cache 的
+///    过期 / 顶出点有 debug 日志锚点。
 pub fn decode_tool_call_id_signature(id: &str) -> (String, Option<String>) {
     if let Some((before, after)) = id.split_once("~~sig~~") {
         if !after.is_empty() {
             return (before.to_owned(), Some(after.to_owned()));
         }
     }
-    (id.to_owned(), None)
+    let cached = crate::responses::global_tool_call_cache()
+        .get(id)
+        .and_then(|entry| entry.thought_signature);
+    (id.to_owned(), cached)
+}
+
+/// 仅剥旧内联格式的签名段取 clean id,**不查 cache**(给只做 map lookup、
+/// 不需要签名的调用点用,省一次全局锁 + entry clone)。
+fn strip_tool_call_id_signature(id: &str) -> &str {
+    match id.split_once("~~sig~~") {
+        Some((before, _)) => before,
+        None => id,
+    }
 }
 
 fn extract_tool_call(tc: &Value) -> Option<(String, String, Value, Option<String>)> {
@@ -2305,11 +2330,40 @@ mod tests {
         );
     }
 
+    /// [MOC-218] 新格式:签名存本地 cache,decode 按短 call_id 反查注入。
+    #[test]
+    fn decode_signature_falls_back_to_local_cache_for_short_call_id() {
+        use crate::responses::{global_tool_call_cache, ToolCallEntry};
+        let short_id = "call_moc218_cache_hit_001";
+        global_tool_call_cache().save(
+            short_id,
+            ToolCallEntry {
+                name: "search".into(),
+                arguments: "{}".into(),
+                thought_signature: Some("CACHED_SIG".into()),
+            },
+        );
+        let (clean, sig) = decode_tool_call_id_signature(short_id);
+        assert_eq!(clean, short_id);
+        assert_eq!(sig.as_deref(), Some("CACHED_SIG"));
+    }
+
+    /// [MOC-218] cache miss → 裸发(`None`),不报错——上游对缺失
+    /// thoughtSignature 的历史完全容忍(flash + pro 实测,见 Linear)。
+    #[test]
+    fn decode_signature_cache_miss_returns_none_for_short_call_id() {
+        let (clean, sig) = decode_tool_call_id_signature("call_moc218_nonexistent_999");
+        assert_eq!(clean, "call_moc218_nonexistent_999");
+        assert!(sig.is_none());
+    }
+
     /// **Bug 真因回归测试** (2026-05-11):encoded call_id (含 `~~sig~~<sig>`
     /// thoughtSignature roundtrip) 跨 function_call → function_call_output 链路
     /// 时,即使两者在**同一 input 数组里**(不需 session resume),也要能找到
     /// name。原 bug:`extract_tool_call` 解码后 `tool_call_id_to_name` 用 clean_id
-    /// 作 key,tool message 仍用 encoded id lookup → miss → BadRequest
+    /// 作 key,tool message 仍用 encoded id lookup → miss → BadRequest。
+    /// MOC-218 后 emit 已不产生该格式,本测试守的是**旧会话历史兼容**路径
+    /// (decode 第 1 级:内联格式优先拆)。
     #[test]
     fn function_call_output_with_encoded_call_id_resolves_via_pending_chain() {
         // Codex.app 实测会发**encoded call_id**(含 `~~sig~~`)在 function_call
@@ -2370,6 +2424,7 @@ mod tests {
             ToolCallEntry {
                 name: "weather_lookup".into(),
                 arguments: r#"{"city":"上海"}"#.into(),
+                thought_signature: None,
             },
         );
 

@@ -781,11 +781,11 @@ impl GeminiToResponsesConverter {
                         if self.open_reasoning.is_some() {
                             self.close_reasoning(out);
                         }
-                        // P1-B:thoughtSignature 在 functionCall part 上时编码进 call_id,
-                        // client roundtrip 时由请求侧 decode_tool_call_id_signature 拆出
-                        // signature 写回 outgoing functionCall part(LiteLLM
-                        // _encode_tool_call_id_with_signature 模式)。Gemini 3 多轮
-                        // thinking 链才不会断。
+                        // P1-B → MOC-218:thoughtSignature 不编码进 call_id(旧
+                        // `call_X~~sig~~Y` 内联格式)——改写进 global ToolCallCache,
+                        // 请求侧 decode_tool_call_id_signature 反查注入 functionCall
+                        // part 的 thought_signature(旧格式兼容保留在 decode 侧)。
+                        // Gemini 3 多轮 thinking 链不断、call_id 恒短(≤64)。
                         self.emit_function_call(
                             out,
                             &fc.name,
@@ -1288,8 +1288,6 @@ impl GeminiToResponsesConverter {
                     "status": "in_progress",
                     "id": item_id,
                     "summary": [],
-                    "content": [],
-                    "encrypted_content": null,
                 },
             }),
         );
@@ -1395,13 +1393,20 @@ impl GeminiToResponsesConverter {
                 "text": rs.text_acc,
             }),
         );
+        // [MOC-218 第三关] reasoning **item** 不带 `content` / `encrypted_content`:
+        // OpenAI Responses 后端对 input 里 reasoning item 硬校验 `content` 数组
+        // 长度必须 0(`array_above_max_length`,真 GPT 自家 rollout item 形态即
+        // `{type, summary, encrypted_content}` 无 content)、`encrypted_content`
+        // 假值有 MOC-13 invalid_encrypted_content 前科(null 行为未定义,缺失
+        // 最安全)。item 会被 Codex 持久化进会话历史,切真 GPT 时原样上发 ——
+        // 必须出生即合规。当轮渲染不受影响:新版(v26.608+)读 SSE
+        // `reasoning_text.delta` content 通道事件(上方保留双发,MOC-203),
+        // 实证 GPT 直连 summary:[] 仍正常显示 = 渲染靠事件流不靠 item 字段。
         let item = json!({
             "type": "reasoning",
             "status": "completed",
             "id": rs.item_id,
             "summary": [{ "type": "summary_text", "text": rs.text_acc }],
-            "content": [{ "type": "reasoning_text", "text": rs.text_acc }],
-            "encrypted_content": null,
         });
         emit_event(
             out,
@@ -1426,16 +1431,17 @@ impl GeminiToResponsesConverter {
         thought_signature: Option<&str>,
     ) {
         let item_id = format!("fc_{}", synthesize_id());
-        // P1-B:thoughtSignature 编码进 call_id 让客户端 roundtrip 不丢
-        // (LiteLLM _encode_tool_call_id_with_signature 模式)。
-        // 用 `~~sig~~` 分隔符(JSON-safe + 跟 hex/base64 互补不冲突),
-        // 请求侧 decode_tool_call_id_signature 反向拆。
-        let call_id = match thought_signature {
-            Some(sig) if !sig.is_empty() => {
-                format!("call_{}~~sig~~{sig}", synthesize_id())
-            }
-            _ => format!("call_{}", synthesize_id()),
-        };
+        // P1-B → MOC-218:thoughtSignature 的 roundtrip 不再走 call_id 内联编码
+        // (旧 `call_X~~sig~~Y` 格式把 call_id 撑到数 KB,持久化进 Codex rollout
+        // 后,会话切真 GPT 时被 OpenAI Responses 后端的 call_id ≤64 校验 400 拒,
+        // string_above_max_length)。签名改写进 global_tool_call_cache(见下方
+        // save),请求侧 decode_tool_call_id_signature 反查注入;cache miss 裸发,
+        // 上游实测容忍(MOC-218)。旧分隔符 `~~sig~~` 仅在 decode 侧保留兼容
+        // (修复前的会话历史里 call_id 仍是内联格式)。
+        let call_id = format!("call_{}", synthesize_id());
+        let cached_signature = thought_signature
+            .filter(|sig| !sig.is_empty())
+            .map(str::to_owned);
         let output_index = self.next_output_index;
         self.next_output_index += 1;
         // OpenAI function_call.arguments 是 JSON 字符串,Gemini 是结构化对象 → 序列化
@@ -1646,13 +1652,15 @@ impl GeminiToResponsesConverter {
                 }),
             );
             // incomplete 不写 cache —— 下一轮引用此 call_id 会拿到 incomplete 上下文反而
-            // 误导;让 orphan repair 路径补占位(对齐 chat 路径)。
+            // 误导;让 orphan repair 路径补占位(对齐 chat 路径)。incomplete 时
+            // thoughtSignature 同样不存(签名属于完整调用,上游容忍缺失)。
             if !incomplete {
                 crate::responses::global_tool_call_cache().save(
                     &call_id,
                     crate::responses::ToolCallEntry {
                         name: name.to_owned(),
                         arguments: args_json_str.clone(),
+                        thought_signature: cached_signature.clone(),
                     },
                 );
             }
@@ -1732,11 +1740,24 @@ impl GeminiToResponsesConverter {
                     },
                 }),
             );
-            // 不写 global_tool_call_cache:tool_search 的多轮历史(tool_search_call /
-            // tool_search_output)由共享 chat 转换器重建(`responses/request.rs:652/695`),
-            // **不**经 gemini 的 function_call_output cache 反查路径(`request.rs` 仅
-            // function_call_output 查 cache)→ 此处写入无 consumer。对齐 chat 路径
-            // (`converter.rs` tool_search 同样不写 cache),省一次冗余 disk write。
+            // name 反查不需要 cache(tool_search_call 历史由共享 chat 转换器重建,
+            // `responses/request.rs:652/695`,name 不走 gemini 的 cache 反查路径,
+            // 对齐 chat 路径省冗余 disk write)。但 **thoughtSignature 需要**
+            // (MOC-218 review 修):重建出的 assistant.tool_calls 带原 call_id,
+            // 经 `extract_tool_call` → `decode_tool_call_id_signature` 反查注入
+            // ——修复前签名内联在 call_id 里天然 roundtrip,本分支不写 cache 会
+            // 让 tool_search 的签名链必断(行为回归)。仅有签名时写,保留
+            // 无签名场景的省写意图。
+            if let Some(sig) = cached_signature.as_ref() {
+                crate::responses::global_tool_call_cache().save(
+                    &call_id,
+                    crate::responses::ToolCallEntry {
+                        name: name.to_owned(),
+                        arguments: args_json_str.clone(),
+                        thought_signature: Some(sig.clone()),
+                    },
+                );
+            }
             self.closed_function_calls.push(ClosedFunctionCall {
                 item_id,
                 output_index,
@@ -1818,12 +1839,14 @@ impl GeminiToResponsesConverter {
         // P0-G:写 global ToolCallCache (call_id → name + arguments) 让下轮
         // function_call_output 即便 Codex.app 不重发 prior function_call 也能 lookup
         // (Codex.app 是 stateful client,默认依赖 server 维护 mapping)。复用项目
-        // 已有 ResponsesAdapter converter.rs:665 同款模式。
+        // 已有 ResponsesAdapter converter.rs:665 同款模式。thoughtSignature 一并
+        // 入 cache(MOC-218,decode 侧反查注入)。
         crate::responses::global_tool_call_cache().save(
             &call_id,
             crate::responses::ToolCallEntry {
                 name: name.to_owned(),
                 arguments: args_json_str.clone(),
+                thought_signature: cached_signature.clone(),
             },
         );
         self.closed_function_calls.push(ClosedFunctionCall {
@@ -2363,6 +2386,75 @@ mod tests {
         assert!(fc["call_id"].as_str().unwrap().starts_with("call_"));
     }
 
+    /// [MOC-218] thoughtSignature 不再编码进 call_id(旧 `call_X~~sig~~Y` 内联
+    /// 格式把 call_id 撑到数 KB,持久化进 rollout 后会话切真 GPT 被 OpenAI
+    /// Responses 后端的 call_id ≤64 校验 400 拒)。断言:① call_id 短格式
+    /// (无 `~~sig~~` 且 ≤64);② 签名进 global ToolCallCache 供 decode 反查。
+    #[test]
+    fn function_call_thought_signature_kept_out_of_call_id_and_cached() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{"q":"weather"}},"thoughtSignature":"MOC218_TEST_SIG_BLOB"}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .unwrap();
+        let output = &completed.1["response"]["output"];
+        let fc = output
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .unwrap();
+        let call_id = fc["call_id"].as_str().unwrap();
+        assert!(call_id.starts_with("call_"));
+        assert!(
+            !call_id.contains("~~sig~~"),
+            "签名不得内联进 call_id,got {call_id}"
+        );
+        assert!(
+            call_id.len() <= 64,
+            "call_id 必须 ≤64(OpenAI Responses 后端上限),got len={}",
+            call_id.len()
+        );
+        let cached = crate::responses::global_tool_call_cache()
+            .get(call_id)
+            .expect("function_call entry 应已写入 global cache");
+        assert_eq!(
+            cached.thought_signature.as_deref(),
+            Some("MOC218_TEST_SIG_BLOB"),
+            "thoughtSignature 应入 cache 供请求侧反查"
+        );
+    }
+
+    /// [MOC-218 review 修] tool_search 分支的 thoughtSignature 同样必须入 cache:
+    /// tool_search_call 历史经共享转换器重建后带原 call_id 回到 gemini decode
+    /// 路径,不写 cache = 签名链必断(修复前内联编码天然 roundtrip)。
+    #[test]
+    fn tool_search_thought_signature_cached_for_roundtrip() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{"query":"web fetch"}},"thoughtSignature":"MOC218_TS_SIG"}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, p)| {
+                n == "response.output_item.added" && p["item"]["type"] == "tool_search_call"
+            })
+            .expect("应 emit tool_search_call item");
+        let call_id = added.1["item"]["call_id"].as_str().unwrap().to_owned();
+        assert!(!call_id.contains("~~sig~~"));
+        let cached = crate::responses::global_tool_call_cache()
+            .get(&call_id)
+            .expect("tool_search 带签名时 entry 应入 cache");
+        assert_eq!(cached.thought_signature.as_deref(), Some("MOC218_TS_SIG"));
+    }
+
     // [MOC-217] tool_search 必须重打包成 tool_search_call wire(arguments=object、
     // execution=client),否则 Codex router 收 function_call(name=tool_search)不识别为
     // builtin → 无法本地 BM25 dispatch 发现 cat-webfetch 等 defer 的 MCP 工具。
@@ -2671,15 +2763,21 @@ mod tests {
         assert_eq!(text_done.1["content_index"], 0);
         // gemini 不注入 **Thinking** header,content 通道 = 原始思考文本
         assert_eq!(text_done.1["text"], "thinking step");
-        assert_eq!(r["content"][0]["type"], "reasoning_text");
-        assert_eq!(r["content"][0]["text"], "thinking step");
-        // output_item.added 即声明 content: [](激活 content 通道,锁 null→[] 改动)
+        // [MOC-218 第三关] item 不带 content / encrypted_content:OpenAI 后端
+        // 对 input reasoning item 硬校验 content 数组长度 0,假 encrypted 有
+        // MOC-13 前科;content 通道只走 SSE 事件(上方断言),item 持久化形态
+        // 必须出生即合规(切真 GPT 历史原样上发)。
+        assert!(r.get("content").is_none(), "reasoning item 不得带 content");
+        assert!(
+            r.get("encrypted_content").is_none(),
+            "reasoning item 不得带 encrypted_content"
+        );
         let item_added = events
             .iter()
             .map(|s| parse_event(s.as_str()))
             .find(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "reasoning")
             .unwrap();
-        assert_eq!(item_added.1["item"]["content"], json!([]));
+        assert!(item_added.1["item"].get("content").is_none());
     }
 
     /// MOC-203 折叠修复锁定:gemini functionCall 后常发 `{"text":""}` 空 part,

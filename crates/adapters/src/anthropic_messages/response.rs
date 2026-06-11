@@ -665,8 +665,6 @@ impl AnthropicMessagesToResponsesConverter {
                     "status": "in_progress",
                     "id": item_id,
                     "summary": [],
-                    "content": null,
-                    "encrypted_content": null,
                 },
             }),
         );
@@ -722,6 +720,9 @@ impl AnthropicMessagesToResponsesConverter {
                 },
             }),
         );
+        // [MOC-218 第三关] item 不带 content / encrypted_content(对齐 gemini /
+        // chat 路径):OpenAI 后端对 input reasoning item 硬校验 content,null
+        // 假值同样有被拒风险;item 持久化进历史、切真 GPT 原样上发须出生合规。
         let item = json!({
             "type": "reasoning",
             "id": reasoning.item_id,
@@ -730,8 +731,6 @@ impl AnthropicMessagesToResponsesConverter {
                 "type": "summary_text",
                 "text": reasoning.text_acc,
             }],
-            "content": null,
-            "encrypted_content": null,
         });
         emit_event(
             out,
@@ -848,6 +847,7 @@ impl AnthropicMessagesToResponsesConverter {
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_owned(),
+                    thought_signature: None,
                 },
             );
         }
