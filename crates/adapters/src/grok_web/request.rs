@@ -113,7 +113,17 @@ pub fn responses_body_to_grok_request_with_session(
         Some(session_cache),
     )?;
     let merged_messages = conversion.response_session.messages;
-    let message = flatten_messages_to_grok_single_string(&merged_messages);
+    // [MOC-193] wire 源用 conversion.body(去重版)而非 merged_messages(session
+    // 全量版):两者在 dedupe_repeated_instruction_messages 处分叉(此前 identical,
+    // 用哪个无差),grok 拍平单字符串发上游同样不该带 N 份重复指令块;session save
+    // 仍用全量,与 gemini_native / anthropic_messages 的消费模式对齐。
+    let wire_messages = conversion
+        .body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_else(|| merged_messages.clone());
+    let message = flatten_messages_to_grok_single_string(&wire_messages);
 
     let parent_response_id = resolve_parent_response_id(body, Some(global_tracker()));
     let is_reasoning = parse_reasoning_flag(body);
@@ -1119,6 +1129,51 @@ mod tests {
             "无历史 + 单 user message 时 plan 应只含本轮 1 条消息,got: {:?}",
             conv.response_session.messages
         );
+    }
+
+    #[test]
+    fn moc193_grok_wire_deduped_but_session_plan_keeps_full_history() {
+        // [MOC-193] grok wire 源必须用 conversion.body(去重版):cache 历史已
+        // 累积 2 份 identical system 指令块 + 本轮 Codex 又重发 1 份 → 拍平后的
+        // grok message 只含 1 份;session plan(回写 cache)仍 3 份全量。
+        let env_content = "<permissions instructions>BIG block</permissions instructions>";
+        let cache = ResponseSessionCache::new(8, std::time::Duration::from_secs(60));
+        cache.save(
+            "resp_prev",
+            vec![
+                json!({"role": "system", "content": env_content}),
+                json!({"role": "user", "content": "u1"}),
+                json!({"role": "assistant", "content": "a1"}),
+                json!({"role": "system", "content": env_content}),
+                json!({"role": "user", "content": "u2"}),
+                json!({"role": "assistant", "content": "a2"}),
+            ],
+        );
+        let body = json!({
+            "model": "gpt_5_codex",
+            "previous_response_id": "resp_prev",
+            "input": [
+                // developer role:不命中 core merge 仅删 current[0] system 头的
+                // 既有去重(MOC-193 的洞正在于此),merge 后 session 累积 3 份
+                {"type": "message", "role": "developer", "content": env_content},
+                {"type": "message", "role": "user", "content": "u3"}
+            ]
+        });
+        let p = make_provider();
+        let conv = responses_body_to_grok_request_with_session(&body, &p, &cache).unwrap();
+        assert_eq!(
+            conv.request.message.matches(env_content).count(),
+            1,
+            "grok 拍平 wire 只留第一份,got: {}",
+            conv.request.message
+        );
+        let session_env = conv
+            .response_session
+            .messages
+            .iter()
+            .filter(|m| m["content"].as_str() == Some(env_content))
+            .count();
+        assert_eq!(session_env, 3, "session plan 保全量,不碰重建敏感区");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 ## Unreleased
 
-**多轮重复 system 块 wire 级去重 (MOC-193)**:Codex 每轮请求随历史重建附带完整 env block(~37 KB),长对话实测出现 3 份相同的 system/developer 指令块并发上游;chat 路径在 `session_messages` clone 之后、发上游之前增加 `dedupe_repeated_instruction_messages` pass,对整条 JSON 内容相同的 system/developer 消息去重(保留首次出现以稳定 prompt-cache prefix),实测可省数十 KB/轮;session cache 保持全量原貌。Anthropic / Gemini / Grok 路径本轮不覆盖。Refs MOC-193。
+**多轮重复 system 块 wire 级去重 (MOC-193)**:Codex 每轮请求随历史重建附带完整 env block(~37 KB),长对话实测出现 3 份相同的 system/developer 指令块并发上游;在共享转换管道的 `session_messages` clone 之后、发上游之前增加 `dedupe_repeated_instruction_messages` pass,对整条 JSON 内容相同的 system/developer 消息去重(保留首次出现以稳定 prompt-cache prefix),实测可省数十 KB/轮;session cache 保持全量原貌。**四路径全覆盖**:chat / gemini_native / anthropic_messages 经共享管道的 wire 源(`conversion.body`)自动继承,grok_web 的 wire 源同步从 session 全量版切到去重版。Refs MOC-193。
 
 ## v2.3.1
 
