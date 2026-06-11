@@ -29,6 +29,11 @@ pub(crate) struct MergeResult {
 /// - cache miss 且当前为空: `PreviousResponseNotFound`
 /// - cache miss 且当前非空: 降级为仅当前（`history_lost = true`）
 /// - 若历史里已有 system/developer 且当前首条是 system,去重当前首 system
+///
+/// 注: 多轮累积的**重复** system/developer 块(Codex 每轮重发 ~37 KB env block)
+/// 在 wire 级别由 `responses/request.rs::dedupe_repeated_instruction_messages`
+/// 去重(MOC-193),发生在本函数返回的 merge 结果 clone 之后 —— session cache
+/// 保持全量原貌,只有最终发上游的 messages 瘦身。
 pub(crate) fn merge_messages_with_previous_response(
     mut current_messages: Vec<Value>,
     original_body: &Value,

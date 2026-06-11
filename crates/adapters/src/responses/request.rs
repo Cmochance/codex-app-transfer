@@ -158,6 +158,9 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // (`code: "previous_response_not_found"`),与 OpenAI 服务端真实行为对齐。
     // 此处不再有"messages 为空"分支:进到这里 messages 必非空。
     let session_messages = messages.clone();
+    // [MOC-193] wire-level 去重必须在 session_messages clone **之后**:cache 保持
+    // 全量原貌(session 重建敏感区不动,MOC-142/168/190),只有发上游的 body 瘦身。
+    dedupe_repeated_instruction_messages(&mut messages);
     result.insert("messages".into(), Value::Array(messages));
 
     // tools(function / custom 直接处理,namespace 递归展平,web_search /
@@ -1305,6 +1308,56 @@ fn image_url_for_chat(value: Value, detail: &str) -> Value {
         Value::Object(_) => value,
         Value::String(url) => json!({ "url": url, "detail": detail }),
         other => json!({ "url": value_to_chat_string(&other), "detail": detail }),
+    }
+}
+
+/// [MOC-193] wire-level 去重 merged 历史里逐轮累积的重复指令块。
+///
+/// Codex 每轮(或每个新任务)在 input 里重发 developer 指令(`<user_instructions>` +
+/// `<environment_context>`,实测 ~37KB 一份),`merge_messages_with_previous_response`
+/// 的去重只覆盖 `current[0]` 的 system 头,中段 developer 块逐轮滚雪球(实测一次请求
+/// 3 份 identical,纯冗余 ~74KB)。本函数对 role ∈ {system, developer} 且**整条消息
+/// 序列化完全一致**的,只保留**第一份**;user/assistant/tool 一律不碰。
+///
+/// - 保第一份而非最新:历史保持 append-only,上游 prompt cache 前缀逐轮稳定;留最新
+///   会让块位置逐轮后移,前缀 diverge 全量 cache miss,省 token 反拖慢 TTFB。
+///   注意这与 OpenAI 官方 /responses 服务端重放语义相反端(官方会保留全部 N 份、
+///   最新一份天然靠近对话尾部)——内容 exact-identical 信息无损,只损 recency
+///   锚定,权衡取 prompt cache 前缀稳定;若未来长对话质量回退疑似与此相关,
+///   用下方 `MOC193_INSTRUCTION_DEDUPED` 日志归因。
+/// - exact-identical 是 fail-safe 方向:内容有任何差异(如含时间戳)即不删,最坏
+///   情况是优化不生效,不会误删。
+/// - 调用点在 `session_messages` clone 之后:cache 保全量,仅 wire 瘦身,可秒回滚。
+fn dedupe_repeated_instruction_messages(messages: &mut Vec<Value>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dropped_count = 0usize;
+    let mut dropped_bytes = 0usize;
+    messages.retain(|msg| {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "system" && role != "developer" {
+            return true;
+        }
+        // 整条消息(role + content + 其余字段)做 key:任何字段差异都视为不同,不删
+        let key = msg.to_string();
+        let key_bytes = key.len();
+        if seen.insert(key) {
+            true
+        } else {
+            dropped_count += 1;
+            dropped_bytes += key_bytes;
+            false
+        }
+    });
+    // 命中才 emit(MOC-48 observability 模式):forward-trace 里 outbound 消息数
+    // 少于 session cache 全量时,operator 据此归因是 dedupe 而非 history 丢失;
+    // 同时验证省流是否真实兑现(Codex 若给 env block 加时间戳,本优化会静默失效)。
+    if dropped_count > 0 {
+        tracing::debug!(
+            error_id = "MOC193_INSTRUCTION_DEDUPED",
+            dropped_count,
+            dropped_bytes,
+            "wire-level 去重重复 system/developer 指令块(session cache 保全量,仅上游 body 瘦身)"
+        );
     }
 }
 

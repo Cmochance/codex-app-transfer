@@ -4318,3 +4318,140 @@ fn apply_patch_guidance_zh_covers_all_nine_rules() {
         assert!(guidance.contains("绝不"), "missing **NEVER** equivalent");
     });
 }
+
+// ===== [MOC-193] wire-level 重复指令块去重 =====
+
+#[test]
+fn moc193_dedupe_keeps_first_identical_block_preserving_order() {
+    let env = json!({"role": "system", "content": "<environment_context>BIG ~37KB</environment_context>"});
+    let mut msgs = vec![
+        json!({"role": "system", "content": "instructions"}),
+        env.clone(),
+        json!({"role": "user", "content": "u1"}),
+        json!({"role": "assistant", "content": "a1"}),
+        env.clone(),
+        json!({"role": "user", "content": "u2"}),
+        env.clone(),
+        json!({"role": "user", "content": "u3"}),
+    ];
+    dedupe_repeated_instruction_messages(&mut msgs);
+    // 保**第一份**位置(历史 append-only,上游 prompt cache 前缀稳定),
+    // 后两份删除,其余消息相对顺序不变
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            "instructions",
+            "<environment_context>BIG ~37KB</environment_context>",
+            "u1",
+            "a1",
+            "u2",
+            "u3"
+        ],
+        "应只删第 2/3 份 identical 块,实际 {msgs:#?}"
+    );
+}
+
+#[test]
+fn moc193_dedupe_is_failsafe_on_any_content_difference() {
+    let mut msgs = vec![
+        json!({"role": "system", "content": "env snapshot at 10:00"}),
+        json!({"role": "user", "content": "u1"}),
+        json!({"role": "system", "content": "env snapshot at 10:05"}),
+    ];
+    dedupe_repeated_instruction_messages(&mut msgs);
+    assert_eq!(
+        msgs.len(),
+        3,
+        "内容有任何差异(如时间戳)都不删 — fail-safe 方向"
+    );
+}
+
+#[test]
+fn moc193_dedupe_never_touches_user_assistant_tool_roles() {
+    let mut msgs = vec![
+        json!({"role": "user", "content": "same"}),
+        json!({"role": "user", "content": "same"}),
+        json!({"role": "assistant", "content": "same"}),
+        json!({"role": "assistant", "content": "same"}),
+        json!({"role": "tool", "tool_call_id": "t1", "content": "same"}),
+        json!({"role": "tool", "tool_call_id": "t1", "content": "same"}),
+    ];
+    dedupe_repeated_instruction_messages(&mut msgs);
+    assert_eq!(
+        msgs.len(),
+        6,
+        "user/assistant/tool 即使 identical 也一律不碰"
+    );
+}
+
+#[test]
+fn moc193_dedupe_handles_developer_role_kept_for_openai_official() {
+    // OpenAI official provider 走 keep_developer 分支,块的 role 保持 developer
+    let dev = json!({"role": "developer", "content": "<user_instructions>X</user_instructions>"});
+    let mut msgs = vec![
+        dev.clone(),
+        json!({"role": "user", "content": "u1"}),
+        dev.clone(),
+    ];
+    dedupe_repeated_instruction_messages(&mut msgs);
+    assert_eq!(msgs.len(), 2, "developer role 同样去重");
+    assert_eq!(msgs[0]["role"], "developer");
+    assert_eq!(msgs[1]["role"], "user");
+}
+
+/// 端到端锁定核心不变量:wire body 去重,session plan(回写 cache 的)保全量。
+/// 复现 MOC-193 实测场景:cache 历史已累积 2 份 identical developer 环境块,
+/// 本轮 Codex 又重发 1 份 → merge 后 3 份 → wire 1 份 / session 3 份。
+#[test]
+fn moc193_wire_deduped_but_session_plan_keeps_full_history() {
+    let env_content = "<environment_context>BIG ~37KB block</environment_context>";
+    let cache = ResponseSessionCache::new(1000, std::time::Duration::from_secs(3600));
+    cache.save(
+        "resp_prev",
+        vec![
+            json!({"role": "system", "content": "instructions"}),
+            json!({"role": "developer", "content": env_content}),
+            json!({"role": "user", "content": "u1"}),
+            json!({"role": "assistant", "content": "a1"}),
+            json!({"role": "developer", "content": env_content}),
+            json!({"role": "user", "content": "u2"}),
+            json!({"role": "assistant", "content": "a2"}),
+        ],
+    );
+
+    let conversion = responses_body_to_chat_body_for_provider_with_session(
+        &json!({
+            "previous_response_id": "resp_prev",
+            "input": [
+                {"type": "message", "role": "developer", "content": env_content},
+                {"type": "message", "role": "user", "content": "u3"}
+            ]
+        }),
+        None,
+        Some(&cache),
+    )
+    .unwrap();
+
+    let count_env = |msgs: &[Value]| {
+        msgs.iter()
+            .filter(|m| m["content"].as_str() == Some(env_content))
+            .count()
+    };
+
+    let wire = conversion.body["messages"].as_array().unwrap();
+    assert_eq!(count_env(wire), 1, "wire 上只留第一份,实际 {wire:#?}");
+    // 非 OpenAI official(provider=None)→ developer 已转 system
+    assert_eq!(wire[1]["role"], "system");
+    assert_eq!(wire[1]["content"], env_content, "保留的是第一份的位置");
+
+    let session = &conversion.response_session.messages;
+    assert_eq!(
+        count_env(session),
+        3,
+        "session plan(回写 cache)必须保全量 — wire-level only,不碰 session 重建敏感区"
+    );
+}

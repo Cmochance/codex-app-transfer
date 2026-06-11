@@ -2,6 +2,10 @@
 
 逐版本要点。
 
+## Unreleased
+
+**多轮重复 system 块 wire 级去重 (MOC-193)**:Codex 每轮请求随历史重建附带完整 env block(~37 KB),长对话实测出现 3 份相同的 system/developer 指令块并发上游;chat 路径在 `session_messages` clone 之后、发上游之前增加 `dedupe_repeated_instruction_messages` pass,对整条 JSON 内容相同的 system/developer 消息去重(保留首次出现以稳定 prompt-cache prefix),实测可省数十 KB/轮;session cache 保持全量原貌。Anthropic / Gemini / Grok 路径本轮不覆盖。Refs MOC-193。
+
 ## v2.3.1
 
 **新版 Codex Desktop(v26.608+)思考过程不显示修复 (MOC-203)**:新版 Codex 渲染读 reasoning 的 **content 通道**(`reasoning_text` + `content_index`),不再读旧 summary 通道(`reasoning_summary_text` + `summary_index`),导致升级后第三方模型的思考块整段不显示。修复:`gemini_native` / chat 路径**双发两通道**(保留旧 summary 兼容老版 + 新增 content 通道,item content 同步置 `[{reasoning_text}]`),content 通道剥掉 CLI 的 `**Thinking**` 头;chat 路径开 tool_call 前先 `close_reasoning`,修 reasoning 与 function_call 事件交错导致新版渲染整段丢思考;交错思考(close 后又来 reasoning,如 GLM/Kimi 工具间思考)重开新 reasoning item(新 id/output_index)、envelope 多段输出、历史回灌多段拼接;gemini `functionCall` 后空 text part 不再开空 message item,修同轮工具折叠 + 空白行。Refs MOC-203。

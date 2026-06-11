@@ -20,7 +20,9 @@
   - `anthropic_messages`：Responses <-> Anthropic Messages 请求/响应映射
   - `mapper/mod.rs`：`RequestMapper` / `ResponseMapper` trait + 契约测试
 - `adapter`（薄编排）：
-  - `responses/mod.rs`
+  - `responses/mod.rs`（含 `responses/request.rs`：Responses → Chat body 转换主逻辑，以及
+    wire-level 去重 pass `dedupe_repeated_instruction_messages`——在 session_messages clone 后
+    剥除多轮累积的重复 system/developer 块，MOC-193）
   - `gemini_native/mod.rs`
   - `gemini_cli/mod.rs`
   - `grok_web/mod.rs`
