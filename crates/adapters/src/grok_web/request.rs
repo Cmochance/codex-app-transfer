@@ -35,8 +35,8 @@
 //! - ⚠️ tools / web_search / MCP namespace 字段:**忽略**(server-side state 自动注入)
 //!
 //! 主入口:[`responses_body_to_grok_request_with_session`](生产路径,mapper 用)。
-//! 兼容入口:[`responses_body_to_grok_request`] / [`responses_body_to_grok_request_with_tracker`]
-//! (test fixture,**无 session cache → 不走 core → 丢历史**,prod 别用)。
+//! 测试 fixture:`responses_body_to_grok_request_with_tracker`(`#[cfg(test)]`,
+//! **无 session cache → 不走 core → 丢历史**,prod 别用)。
 //!
 //! 协议事实详见本 module 各 type 的 doc comment(`super::types`、`super::parent_response`),
 //! 以及 `crates/adapters/src/grok_web/mod.rs` 顶层文档。
@@ -75,8 +75,8 @@ pub struct GrokRequestConversion {
 /// state。本 fn 虽 `pub`,但当前唯一 caller 是同 crate 的
 /// [`crate::mapper::grok_web::prepare_grok_web_request`](已同步改);外部 crate
 /// 无引用,签名 break 实际影响为零。Test fixture 路径走
-/// [`responses_body_to_grok_request`] / [`responses_body_to_grok_request_with_tracker`]
-/// (`pub(crate)` 物理隔离,跨 crate 不可见)。
+/// `responses_body_to_grok_request_with_tracker`(`#[cfg(test)]` 物理隔离,
+/// prod build 不存在)。
 ///
 /// 双保险(grok.com 后端契约层面):
 /// 1. **client 端历史拼接**(本 fn 主路径):把 merged messages flatten 成 grok
@@ -144,24 +144,19 @@ pub fn responses_body_to_grok_request_with_session(
     })
 }
 
-/// **测试 fixture / 兼容入口**(`pub(crate)` 物理隔离 prod 误用):Codex Responses
+/// **测试 fixture**(`#[cfg(test)]` 物理隔离 prod 误用):Codex Responses
 /// body → grok payload,**不走 core**,会丢历史 message + compaction +
 /// function_call_output + reasoning 等非 `type=message` 输入项。
 ///
-/// 此路径**只在 unit test 用**作为 cache-free 简化 harness;prod 必须走
-/// [`responses_body_to_grok_request_with_session`]。
+/// 此路径**只在 unit test 用**作为 cache-free 简化 harness(允许注入
+/// tracker);prod 必须走 [`responses_body_to_grok_request_with_session`]。
+/// 原无-tracker 兼容入口 `responses_body_to_grok_request` 已无调用方,
+/// MOC-118 随 dead-code 清理删除。
 ///
 /// `instructions` 字段:本 fn 单独抽出来塞进 `custom_instructions` 字段(走
 /// grok wire `customInstructions`)— core 路径在 messages[0]=system 里处理,
 /// 本 fn 不走 core,messages 不含 system,故必须独立 surface。
-pub(crate) fn responses_body_to_grok_request(
-    body: &Value,
-    provider: &Provider,
-) -> Result<GrokChatRequest, AdapterError> {
-    responses_body_to_grok_request_with_tracker(body, provider, Some(global_tracker()))
-}
-
-/// **测试 fixture**(允许注入 tracker)。`pub(crate)` 物理隔离 prod 误用。
+#[cfg(test)]
 pub(crate) fn responses_body_to_grok_request_with_tracker(
     body: &Value,
     provider: &Provider,
@@ -499,7 +494,9 @@ fn extract_message_content_text(content: Option<&Value>) -> String {
 }
 
 /// 无 session_cache 的 fallback:从 body.input 数组按 Codex Responses spec 抽 messages,
-/// **不**走 core(测试 fixture 路径)。生产路径用 with_session 入口。
+/// **不**走 core(测试 fixture 路径,仅 [`responses_body_to_grok_request_with_tracker`]
+/// 调用)。生产路径用 with_session 入口。
+#[cfg(test)]
 fn extract_messages_from_input_only(body: &Value) -> Result<Vec<Value>, AdapterError> {
     let mut out: Vec<Value> = Vec::new();
     // 字符串形态:整段当 user

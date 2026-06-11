@@ -226,16 +226,14 @@ pub fn convert_grok_sse_to_responses_sse(
     s
 }
 
-/// Cap 上游错误 body 防 DoS(同 `gemini_native` `MAX_UPSTREAM_ERROR_BODY_BYTES`)。
-const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 65_536;
-
-/// 把上游 grok.com 4xx/5xx 错误流翻译成合规 Codex Responses 失败 SSE 流。
+/// 把上游 grok.com 4xx/5xx 错误流翻译成合规 Codex Responses 失败 SSE 流
+/// (骨架收编进 [`crate::core::failure_stream`],MOC-118)。
 ///
 /// 流形态固定两个事件:
 /// 1. `response.created`(status=in_progress,让 Codex APP 进入流接收状态)
 /// 2. `response.failed`(status=failed,带 classify 后的 error.code + grok message)
 ///
-/// **classify 规则**:
+/// **classify 规则**(见 [`classify_grok_error_status`]):
 /// - `401` → `auth_error` → `invalid_prompt`(永久,Codex surface + 停)
 /// - `403` → `permission_denied` → `invalid_prompt`(永久,Codex surface + 停)
 /// - `408` / `504` → `timeout`
@@ -246,93 +244,19 @@ const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 65_536;
 /// 语义分类经 [`crate::codex_retry_code`] 映射:永久性(401/403) → Codex 非重试
 /// `invalid_prompt`,瞬时态(timeout/rate_limited/server_error/upstream_error)
 /// 保留原 code → Codex Retryable。原始语义分类保留在 `error.upstream_error_kind`。
-///
-/// **防御**:
-/// - body cap [`MAX_UPSTREAM_ERROR_BODY_BYTES`] 字节防 DoS
-/// - 非 UTF-8 用 `from_utf8_lossy`,后缀标 `(non-UTF-8 body)`
-/// - mid-read transport `Err` → `upstream_transport_error` code,带 err 文本
-/// - empty body / 解析失败 → 不打断,仍 emit `response.failed` 带通用 message
+/// body cap / lossy / truncate / transport-err 防御见 core 模块 doc。
 pub fn convert_grok_error_to_responses_failure_stream(
     upstream_status: http::StatusCode,
     upstream_stream: ByteStream,
     response_id: String,
 ) -> ByteStream {
-    let status_u16 = upstream_status.as_u16();
-    let code = classify_grok_error_status(status_u16);
-
-    let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
-        stream::unfold((upstream_stream, false), move |(mut input, finished)| {
-            let response_id = response_id.clone();
-            let code = code.to_owned();
-            async move {
-                if finished {
-                    return None;
-                }
-                let mut body = Vec::with_capacity(1024);
-                let mut transport_err: Option<String> = None;
-                let mut truncated = false;
-                while let Some(chunk) = input.next().await {
-                    match chunk {
-                        Ok(b) => {
-                            let remaining =
-                                MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
-                            if remaining == 0 {
-                                truncated = true;
-                                break;
-                            }
-                            let take = b.len().min(remaining);
-                            body.extend_from_slice(&b[..take]);
-                            if take < b.len() {
-                                truncated = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            transport_err = Some(e.to_string());
-                            break;
-                        }
-                    }
-                }
-                let was_lossy = std::str::from_utf8(&body).is_err();
-                let mut body_text = String::from_utf8_lossy(&body).into_owned();
-                if truncated {
-                    body_text.push_str(" …(truncated)");
-                }
-                if was_lossy {
-                    body_text.push_str(" (non-UTF-8 body)");
-                }
-                let (final_code, message) = if let Some(transport) = transport_err {
-                    (
-                            "upstream_transport_error".to_owned(),
-                            format!(
-                                "grok.com HTTP {status_u16} but transport err during body read: {transport}",
-                            ),
-                        )
-                } else {
-                    let msg = if body_text.is_empty() {
-                        format!("grok.com HTTP {status_u16} (empty body)")
-                    } else {
-                        format!("grok.com HTTP {status_u16}: {body_text}")
-                    };
-                    (code, msg)
-                };
-
-                // 两个事件拼一起 yield(避免 mock stream 单 chunk 截断 SSE 帧)
-                // 短路 4xx 路径无 ConvState,自己起 local seq 计数器(从 0 起)
-                let mut local_seq: u64 = 0;
-                let mut buf = Vec::with_capacity(512);
-                buf.extend_from_slice(&emit_response_created(&mut local_seq, &response_id));
-                buf.extend_from_slice(&emit_response_failed(
-                    &mut local_seq,
-                    &response_id,
-                    &final_code,
-                    &message,
-                ));
-                Some((Ok(Bytes::from(buf)), (input, true)))
-            }
-        }),
-    );
-    s
+    crate::core::failure_stream::convert_upstream_error_stream(
+        upstream_status,
+        upstream_stream,
+        response_id,
+        classify_grok_error_status(upstream_status.as_u16()),
+        "grok.com",
+    )
 }
 
 fn classify_grok_error_status(status_u16: u16) -> &'static str {
@@ -1269,19 +1193,12 @@ fn format_generic_search_results_for_reasoning(
 // Event 构造 helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// 薄转发:帧结构单源在 [`crate::core::failure_stream::emit_response_created_frame`],
+/// 本地仅做 `Bytes` 形态适配(grok 主流程按 `Bytes` 帧 push 进 pending 队列)。
 fn emit_response_created(seq: &mut u64, response_id: &str) -> Bytes {
-    emit_event(
-        seq,
-        "response.created",
-        serde_json::json!({
-            "type": "response.created",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "status": "in_progress",
-            }
-        }),
-    )
+    let mut out = Vec::with_capacity(128);
+    crate::core::failure_stream::emit_response_created_frame(&mut out, seq, response_id);
+    Bytes::from(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1407,17 +1324,6 @@ fn close_reasoning_if_open(state: &mut ConvState) {
             },
         }),
     ));
-}
-
-fn emit_output_text_delta(seq: &mut u64, delta: &str) -> Bytes {
-    emit_event(
-        seq,
-        "response.output_text.delta",
-        serde_json::json!({
-            "type": "response.output_text.delta",
-            "delta": delta,
-        }),
-    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1561,14 +1467,11 @@ fn close_message_if_open(state: &mut ConvState) {
 /// - error envelope `{"error":{...}}` 帧 → `process_buffered_lines` 内部调
 /// - 流末无 `final` token / `isSoftStop` → `unfold` 流末防御调
 ///
-/// 字段对齐 [OpenAI Responses API spec](https://platform.openai.com/docs/api-reference/responses):
-/// 构造 `response.failed` SSE 事件。
-///
 /// `upstream_kind` 是内部语义分类(`auth_error` / `server_error` / …),
 /// 经 [`crate::codex_retry_code`] 映射成 Codex 客户端认识的 retry-control
-/// `error.code`(永久性 → `invalid_prompt`,瞬时态保留原值)。
-/// 原始语义分类保留在 `error.upstream_error_kind` 诊断字段
-/// (Codex `Error` struct 无 `deny_unknown_fields`,该字段被安全忽略)。
+/// `error.code`(永久性 → `invalid_prompt`,瞬时态保留原值)。帧结构单源在
+/// [`crate::core::failure_stream::emit_response_failed_frame`],本地仅做
+/// kind→code 映射 + `Bytes` 形态适配。
 pub(crate) fn emit_response_failed(
     seq: &mut u64,
     response_id: &str,
@@ -1576,23 +1479,16 @@ pub(crate) fn emit_response_failed(
     message: &str,
 ) -> Bytes {
     let codex_code = crate::codex_retry_code(upstream_kind);
-    emit_event(
+    let mut out = Vec::with_capacity(256);
+    crate::core::failure_stream::emit_response_failed_frame(
+        &mut out,
         seq,
-        "response.failed",
-        serde_json::json!({
-            "type": "response.failed",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "status": "failed",
-                "error": {
-                    "code": codex_code,
-                    "message": message,
-                    "upstream_error_kind": upstream_kind,
-                }
-            }
-        }),
-    )
+        response_id,
+        codex_code,
+        upstream_kind,
+        message,
+    );
+    Bytes::from(out)
 }
 
 fn emit_response_completed(seq: &mut u64, response_id: &str) -> Bytes {

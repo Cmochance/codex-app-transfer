@@ -1080,24 +1080,14 @@ fn compact_v2_success_tail(id: &str, encrypted_content: &str, usage: Value) -> V
 
 /// 失败流尾段:failed 事件。`code` 已按白名单语义预映射(见
 /// [`collect_compact_summary_for_v2`] doc,不经 `codex_retry_code` —— 它不认识
-/// quality 类 kind);`upstream_error_kind` 保留原始分类供诊断(对齐
-/// chat/grok/gemini 失败流惯例)。
+/// quality 类 kind);`upstream_error_kind` 保留原始分类供诊断。帧结构单源在
+/// [`crate::core::failure_stream::emit_response_failed_frame`](MOC-118,
+/// 对齐 chat/grok/gemini 失败流惯例)。
 fn compact_v2_failed_tail(id: &str, code: &str, kind: &str, message: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let mut seq = 1u64; // head 已用 seq 0(created)
-    crate::core::events::emit_sse_event(
-        &mut out,
-        &mut seq,
-        "response.failed",
-        json!({
-            "type": "response.failed",
-            "response": {
-                "id": id,
-                "object": "response",
-                "status": "failed",
-                "error": {"code": code, "message": message, "upstream_error_kind": kind},
-            },
-        }),
+    crate::core::failure_stream::emit_response_failed_frame(
+        &mut out, &mut seq, id, code, kind, message,
     );
     out
 }
