@@ -14,7 +14,7 @@
     "restoreCodexOnExit": true,
     "updateUrl": "https://github.com/Cmochance/codex-app-transfer/releases/latest/download/latest.json",
     "codexNetworkAccess": false,
-    "webFetchBackend": "off",
+    "webFetchBackend": "auto",
     "traceViewerEnabled": false
   }
 }
