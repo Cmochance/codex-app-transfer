@@ -95,13 +95,19 @@ fn default_codex_network_access() -> bool {
     false
 }
 
+/// 内置联网抓取后端的默认档(MOC-215: off→auto,开箱即用)。**单一真源** —— typed serde 默认
+/// (本文件)与**所有读 raw JSON config 的 fallback**(src-tauri:current_backend / 启动 sync /
+/// save·import 比较)都引这个常量,防 drift。`auto` 安全:web_fetch 用 curl/wreq 不需 Chrome;
+/// web_search 仍受 mcp_webfetch_server 的 chrome_ready gate 保护,Chrome 未就绪时不暴露、不静默
+/// 下载 ~86MB。用户可在设置里改回 off。
+///
+/// **Why 提常量**(devin/codex bot review #445):此前只改了 typed serde 默认,raw 读取点仍 hardcode
+/// `"off"` → 老用户(config 缺该字段)UI 经 serde 显示 auto、但启动 sync 读 raw 退 off、不注册 MCP,
+/// 工具不激活,违背开箱即用。统一引常量根治。
+pub const DEFAULT_WEB_FETCH_BACKEND: &str = "auto";
+
 fn default_web_fetch_backend() -> String {
-    // MOC-215: 默认从 `off` 改 `auto` —— 让内置联网抓取/搜索工具(cat-webfetch:web_fetch +
-    // web_search)开箱可用,否则新用户默认无 web_search(Codex 内置 web_search 被 adapter drop
-    // 又无 cat-webfetch 兜底 = 彻底没搜索)。`auto` 安全:web_fetch 用 curl/wreq 不需 Chrome;
-    // web_search 仍受 mcp_webfetch_server 的 chrome_ready gate 保护,Chrome 未就绪时不暴露、
-    // **不会静默下载 ~86MB**。用户可在设置里改回 off。
-    "auto".to_owned()
+    DEFAULT_WEB_FETCH_BACKEND.to_owned()
 }
 
 impl Default for Settings {

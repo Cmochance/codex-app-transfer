@@ -268,7 +268,10 @@ fn main() {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string())
                         })
-                        .unwrap_or_else(|| "off".to_string());
+                        // MOC-215: raw fallback 对齐 schema 默认(off→auto),否则老用户启动 sync 不注册 MCP
+                        .unwrap_or_else(|| {
+                            codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND.to_string()
+                        });
                     if let Err(e) =
                         crate::admin::services::mcp_servers::sync_web_fetch_server(&backend)
                     {

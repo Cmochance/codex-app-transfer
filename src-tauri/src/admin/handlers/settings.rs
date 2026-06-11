@@ -398,7 +398,7 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .get("settings")
             .and_then(|s| s.get("webFetchBackend"))
             .and_then(Value::as_str)
-            .unwrap_or("off")
+            .unwrap_or(codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND)
             .to_string();
         let s = ensure_settings_object(cfg);
         if let Some(obj) = input.as_object() {
@@ -420,7 +420,7 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
         let new_web_fetch = settings
             .get("webFetchBackend")
             .and_then(Value::as_str)
-            .unwrap_or("off")
+            .unwrap_or(codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND)
             .to_string();
         let web_fetch_changed = (new_web_fetch != old_web_fetch).then_some(new_web_fetch);
         Ok(ConfigMutation::Modified((
@@ -659,7 +659,7 @@ pub async fn import_config(Json(data): Json<Value>) -> impl IntoResponse {
         let backend = settings
             .get("webFetchBackend")
             .and_then(|v| v.as_str())
-            .unwrap_or("off");
+            .unwrap_or(codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND);
         if let Err(e) = crate::admin::services::mcp_servers::sync_web_fetch_server(backend) {
             tracing::error!("import 后 sync web_fetch mcp_server 失败(下次启动重试): {e}");
         }

@@ -1638,12 +1638,13 @@ fn current_backend() -> Result<Option<WebFetchBackend>, String> {
         .ok_or_else(|| "无法定位 ~/.codex-app-transfer/config.json(HOME 未设置?)".to_string())?;
     let cfg = codex_app_transfer_registry::load_raw_config(&path)
         .map_err(|e| format!("读取 config.json 失败: {e}"))?;
-    // 字段缺失视作 off(Ok(None));只有 IO/解析失败才 Err。
+    // 字段缺失视作默认档(MOC-215: auto,对齐 schema 默认,否则缺字段时 web_search 不暴露);
+    // 只有 IO/解析失败才 Err。
     let s = cfg
         .get("settings")
         .and_then(|s| s.get("webFetchBackend"))
         .and_then(|v| v.as_str())
-        .unwrap_or("off");
+        .unwrap_or(codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND);
     Ok(WebFetchBackend::parse(s))
 }
 
