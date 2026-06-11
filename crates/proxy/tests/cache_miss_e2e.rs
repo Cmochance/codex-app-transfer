@@ -14,6 +14,10 @@ use codex_app_transfer_registry::Provider;
 use indexmap::IndexMap;
 use tokio::net::TcpListener;
 
+// [MOC-195] main 前隔离 home:本测试查 global session cache 的 previous_response_id,
+// 不隔离会读真机 sessions.db(数据巧合可命中 → 假失败;启动 GC 还会拖时)
+mod common;
+
 async fn spawn_proxy_no_upstream() -> std::net::SocketAddr {
     // provider.base_url 写一个 RFC5737 测试网段 + 不可达端口,确保哪怕 router 真的
     // 试图打上游也会立即失败,反向证明 cache miss 是在 forward → adapter 转换阶段

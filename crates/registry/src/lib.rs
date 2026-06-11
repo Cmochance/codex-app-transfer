@@ -39,6 +39,7 @@ pub use model_context_policy::{
 };
 pub use paths::{
     config_dir, config_file, library_dir, resolve_home, sessions_db_file, tool_artifacts_db_file,
+    HOME_OVERRIDE_ENV,
 };
 pub use presets::builtin_presets;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};

@@ -306,9 +306,10 @@ impl ToolCallCache {
 }
 
 /// 默认持久化路径:`<home>/.codex-app-transfer/tool_call_cache.json`。
-/// home 解析走 `codex_app_transfer_registry::resolve_home()`:`HOME` →
-/// `USERPROFILE` fallback,Windows GUI 进程(无 HOME)也能拿到正确路径
-/// (fix #222,跟 session.rs / CodexPaths 一致)。
+/// home 解析走 `codex_app_transfer_registry::resolve_home()`:
+/// `CODEX_APP_TRANSFER_HOME`(显式覆盖,集成测试隔离用,MOC-195)→
+/// `HOME` → `USERPROFILE` fallback,Windows GUI 进程(无 HOME)也能拿到
+/// 正确路径(fix #222,跟 session.rs / CodexPaths 一致)。
 /// 解析失败(eg sandboxed test runner)→ 回退纯内存。
 pub fn global_tool_call_cache() -> &'static ToolCallCache {
     static CACHE: OnceLock<ToolCallCache> = OnceLock::new();

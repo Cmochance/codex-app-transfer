@@ -98,9 +98,10 @@ pub struct TokenStore {
 
 impl TokenStore {
     /// 用 `<home>/.codex-app-transfer/gemini-oauth.json` 默认路径(gemini-cli)。
-    /// `<home>` 解析优先级:`HOME` → `USERPROFILE`(Windows GUI 进程默认只设
-    /// `USERPROFILE`,无 `HOME`,所以必须 fallback)。**新代码**(支持多 OAuth
-    /// provider)请用 [`Self::for_token_filename`] 显式指定文件名;本 fn 等价
+    /// `<home>` 解析优先级:`CODEX_APP_TRANSFER_HOME`(显式覆盖)→ `HOME` →
+    /// `USERPROFILE`(Windows GUI 进程默认只设 `USERPROFILE`,无 `HOME`,
+    /// 所以必须 fallback)。**新代码**(支持多 OAuth provider)请用
+    /// [`Self::for_token_filename`] 显式指定文件名;本 fn 等价
     /// `for_token_filename("gemini-oauth.json")`。
     pub fn from_home_env() -> Result<Self, TokenError> {
         Self::for_token_filename("gemini-oauth.json")
@@ -110,8 +111,9 @@ impl TokenStore {
     /// 共存(eg `gemini-oauth.json` vs `antigravity-oauth.json`)。filename
     /// 来自 `OauthProviderConfig::token_filename`。`<home>` 解析委派给
     /// `codex_app_transfer_registry::paths::resolve_home`,workspace 内唯一
-    /// 入口,统一 `HOME` → `USERPROFILE` 回退 + 空字符串当未设,**Windows GUI
-    /// 进程一律走 `USERPROFILE`**,与 `CodexPaths` 等其它路径解析一致。
+    /// 入口,统一 `CODEX_APP_TRANSFER_HOME`(显式覆盖,MOC-195)→ `HOME` →
+    /// `USERPROFILE` 回退 + 空字符串当未设,**Windows GUI 进程一律走
+    /// `USERPROFILE`**,与 `CodexPaths` 等其它路径解析一致。
     pub fn for_token_filename(filename: &str) -> Result<Self, TokenError> {
         let home =
             codex_app_transfer_registry::paths::resolve_home().ok_or(TokenError::HomeNotSet)?;
