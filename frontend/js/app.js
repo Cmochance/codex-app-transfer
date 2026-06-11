@@ -2625,7 +2625,7 @@
       if ($("#openTraceViewerBtn")) $("#openTraceViewerBtn").hidden = !_tv;
     }
     if ($("#webFetchBackend")) {
-      const _wfb = settings.webFetchBackend || "off";
+      const _wfb = settings.webFetchBackend || "auto"; // MOC-215: 默认 auto(与后端 schema 默认一致)
       // segmented 按钮组: 高亮当前档 + 记下"已保存值"供切换失败/取消时回退。
       $("#webFetchBackend").dataset.saved = _wfb;
       $all("#webFetchBackend .btn").forEach((b) =>
@@ -3196,7 +3196,7 @@
       mcpCredentialsPortableStore: $("#mcpCredentialsPortableStore")?.checked !== false,
       codexNetworkAccess: $("#codexNetworkAccess")?.checked === true,
       // [MOC-185] traceViewerEnabled 不再持久化(诊断改 session 级,见 toggle handler)。
-      webFetchBackend: $("#webFetchBackend")?.querySelector(".btn.active")?.dataset.webfetch || "off",
+      webFetchBackend: $("#webFetchBackend")?.querySelector(".btn.active")?.dataset.webfetch || "auto",
       codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
