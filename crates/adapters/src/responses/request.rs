@@ -1351,8 +1351,11 @@ fn dedupe_repeated_instruction_messages(messages: &mut Vec<Value>) {
     // 命中才 emit(MOC-48 observability 模式):forward-trace 里 outbound 消息数
     // 少于 session cache 全量时,operator 据此归因是 dedupe 而非 history 丢失;
     // 同时验证省流是否真实兑现(Codex 若给 env block 加时间戳,本优化会静默失效)。
+    // info 级而非 debug:telemetry bridge(src-tauri/telemetry_bridge.rs)按
+    // LevelFilter::INFO 兜底,debug 进不了 logs viewer / proxy-*.log;每请求
+    // 最多一条,与 MINIMAX_SYS_CONVERT_SPLIT 同级不刷屏。
     if dropped_count > 0 {
-        tracing::debug!(
+        tracing::info!(
             error_id = "MOC193_INSTRUCTION_DEDUPED",
             dropped_count,
             dropped_bytes,
