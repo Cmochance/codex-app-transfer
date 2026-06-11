@@ -40,3 +40,5 @@ hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 indexmap = "2"
 tempfile = "3"
+# [MOC-195] 集成测试 main 前隔离 home(tests/common/mod.rs),版本跟 lock 内既有传递依赖一致
+ctor = "0.8"

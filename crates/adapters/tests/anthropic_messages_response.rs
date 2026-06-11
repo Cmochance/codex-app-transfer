@@ -15,6 +15,10 @@ use futures_util::stream::{self, StreamExt};
 use http::{HeaderMap, StatusCode};
 use serde_json::{json, Value};
 
+// [MOC-195] main 前隔离 home:本文件直接调 global_response_session_cache(),
+// 不隔离会全表扫 + write-through 写真机 sessions.db(详见 common/mod.rs)
+mod common;
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
