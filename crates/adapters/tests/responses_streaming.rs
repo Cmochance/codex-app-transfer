@@ -23,6 +23,9 @@ use futures_core::Stream;
 use futures_util::stream::{self, StreamExt};
 use serde_json::Value;
 
+// [MOC-195] main 前隔离 home,防未来用例触碰真机数据(详见 common/mod.rs)
+mod common;
+
 fn fixture_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // -> crates/

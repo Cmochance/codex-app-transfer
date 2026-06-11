@@ -9,6 +9,10 @@
 //! `set_var(HOME)` 是进程级,拆成两个 `#[test]` 会并发改 HOME 互相打架;单测试顺序跑、
 //! 共享同一临时 HOME 与同一 jsonl(seq 区分)即可。开头 `set_var`(HOME + CAS_DIAG_TRACE)
 //! 安全:此刻无并发线程读这两个 env;gate 的 OnceLock 在首次转发时才读取并缓存。
+//!
+//! 注:本文件**刻意不用** `mod common;`(`#[ctor]` 设 `CODEX_APP_TRANSFER_HOME`)——
+//! forward-trace 测的是 HOME 真实落盘路径(`CAS_DIAG_TRACE` gate),需在测试体内
+//! 精确控制 HOME + jsonl 文件路径,隔离粒度细于 common 提供的进程级 tempdir。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,6 +105,9 @@ async fn post_chat(proxy: std::net::SocketAddr) -> reqwest::Response {
 #[tokio::test]
 async fn forward_trace_writes_redacted_and_truncation_honest_jsonl() {
     let tmp = tempfile::tempdir().unwrap();
+    // [MOC-195] 开发者 shell 若残留 override env,优先级高于下面的 HOME,会把
+    // registry 派生路径(含 trace 落盘)指到别处,断言报错却看不出真因 —— 先清掉
+    std::env::remove_var(codex_app_transfer_registry::HOME_OVERRIDE_ENV);
     std::env::set_var("HOME", tmp.path());
     std::env::set_var("USERPROFILE", tmp.path()); // Windows 解析回退也指向临时目录
     std::env::set_var("CAS_DIAG_TRACE", "1");

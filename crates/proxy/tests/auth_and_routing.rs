@@ -30,6 +30,9 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message as WsMessage},
 };
 
+// [MOC-195] main 前隔离 home,防集成测试读写真机 sessions.db(详见 common/mod.rs)
+mod common;
+
 /// echo-back 上游:把收到的请求镜像成 JSON 返回。`marker` 用来在响应头里
 /// 标记是哪个 mock,以便测试断言代理选对了上游。
 ///

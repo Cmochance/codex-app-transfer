@@ -23,6 +23,9 @@ use codex_app_transfer_registry::Provider;
 use indexmap::IndexMap;
 use tokio::net::TcpListener;
 
+// [MOC-195] main 前隔离 home,防集成测试触碰真机数据(详见 common/mod.rs)
+mod common;
+
 fn fixture_path(rel: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // -> crates/

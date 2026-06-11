@@ -4,9 +4,17 @@
 //! `codex_integration::CodexPaths::from_home_env` 与
 //! `gemini_oauth::TokenStore::for_token_filename` 共用,保证 Windows GUI
 //! 进程(无 `HOME`、只有 `USERPROFILE`)行为一致(参见 PR #115)。
+//! 解析优先级:`$CODEX_APP_TRANSFER_HOME`(显式覆盖,供集成测试隔离真机数据,
+//! MOC-195)→ `$HOME` → `$USERPROFILE`;日常运行不设
+//! `CODEX_APP_TRANSFER_HOME`,行为与之前完全一致。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+
+/// [MOC-195] home 解析显式覆盖 env key —— 集成测试用它把 registry 派生路径
+/// 重定向到 tempdir。测试侧(各 crate `tests/common/mod.rs` 的 ctor)必须引用
+/// 本常量而非自写字面量,防两侧改名漂移让隔离静默失效。
+pub const HOME_OVERRIDE_ENV: &str = "CODEX_APP_TRANSFER_HOME";
 
 const CONFIG_DIR_NAME: &str = ".codex-app-transfer";
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -15,9 +23,17 @@ const BACKUPS_DIR_NAME: &str = "backups";
 const SESSIONS_DB_NAME: &str = "sessions.db";
 const TOOL_ARTIFACTS_DB_NAME: &str = "tool_artifacts.db";
 
-/// 解析当前用户的 home 目录:`$HOME` 优先,`$USERPROFILE`(Windows GUI 进程
-/// 默认值)回退;空字符串视作未设。返 `None` 时调用方应映射为各自的
-/// "无可定位主目录"错误(如 `CodexError::NoHome` / `TokenError::HomeNotSet`)。
+/// 解析当前用户的 home 目录:`$CODEX_APP_TRANSFER_HOME`(显式覆盖)→ `$HOME`
+/// → `$USERPROFILE`(Windows GUI 进程默认值)依次回退;空字符串视作未设。
+/// 返 `None` 时调用方应映射为各自的"无可定位主目录"错误(如
+/// `CodexError::NoHome` / `TokenError::HomeNotSet`)。
+///
+/// `CODEX_APP_TRANSFER_HOME` 覆盖所有**经本函数派生**的路径
+/// (`.codex-app-transfer/`、`CodexPaths` 的 `.codex/`、gemini token 等);
+/// src-tauri 内若干本地 home 解析副本不走本函数、**不受影响**,所以它不是
+/// 整个 app 的沙箱开关。供集成测试隔离真机数据用(MOC-195:proxy 集成测试
+/// 曾直接读写用户真实 `sessions.db`,几百 MB 数据让启动 GC 扫描拖超 client
+/// timeout);日常运行不设置,行为与之前完全一致。
 ///
 /// 用 `std::env::var_os` 而非 `var`,保证 non-UTF-8 path(理论存在,实测罕见)
 /// 也能解析,避免 `var` 返 `Err(NotUnicode)` 导致 home unavailable 假阴性。
@@ -33,7 +49,7 @@ pub(crate) fn resolve_home_from<F>(get_env: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    for key in ["HOME", "USERPROFILE"] {
+    for key in [HOME_OVERRIDE_ENV, "HOME", "USERPROFILE"] {
         if let Some(raw) = get_env(key) {
             if !raw.is_empty() {
                 return Some(PathBuf::from(raw));
@@ -74,6 +90,34 @@ pub fn tool_artifacts_db_file() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_home_prefers_explicit_override_over_home() {
+        let env = |k: &str| match k {
+            HOME_OVERRIDE_ENV => Some(OsString::from("/tmp/cas-test-home")),
+            "HOME" => Some(OsString::from("/Users/me")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_home_from(env),
+            Some(PathBuf::from("/tmp/cas-test-home")),
+            "显式覆盖必须压过 HOME,否则集成测试隔离不生效(MOC-195)"
+        );
+    }
+
+    #[test]
+    fn resolve_home_treats_empty_override_as_missing() {
+        let env = |k: &str| match k {
+            HOME_OVERRIDE_ENV => Some(OsString::new()),
+            "HOME" => Some(OsString::from("/Users/me")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_home_from(env),
+            Some(PathBuf::from("/Users/me")),
+            "空字符串覆盖应视作未设,继续走 HOME"
+        );
+    }
 
     #[test]
     fn resolve_home_prefers_home_over_userprofile() {
