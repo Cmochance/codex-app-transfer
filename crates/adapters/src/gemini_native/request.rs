@@ -720,6 +720,18 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                             .or_insert_with(|| Value::String("object".into()));
                     }
                     crate::core::schema::ensure_object_schema_required(&mut parameters);
+                    // [chatgpt-codex-connector review] `ensure_object_schema_required` 只在 required
+                    // 缺失时补**空** `[]`,不把 query 加进 required。若 Codex 的 schema 有 query
+                    // property 但 required 不含它(或 =[]),Gemini 仍认为 query optional → 可合法返
+                    // `{}` → 空 BM25 → 暴露不了 defer 工具。tool_search 没 query 无意义,强制 query 必填。
+                    if let Some(required) = parameters
+                        .get_mut("required")
+                        .and_then(|r| r.as_array_mut())
+                    {
+                        if !required.iter().any(|r| r == "query") {
+                            required.push(Value::String("query".into()));
+                        }
+                    }
                 } else {
                     parameters = json!({
                         "type": "object",
@@ -3272,6 +3284,38 @@ mod tests {
         assert!(
             required.iter().any(|r| r == "query"),
             "query 必须 required;实际:{ts_params}"
+        );
+    }
+
+    #[test]
+    fn tool_search_with_query_prop_but_no_required_forces_query_required() {
+        // [MOC-217 / chatgpt-codex-connector review] Codex 给的 schema 有 query property 但
+        // required 缺 query(或 =[])→ Gemini 认为 query optional → 可合法返 {} → 空 BM25 →
+        // 暴露不了 defer 工具。透传分支必须强制 query 进 required。
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[{"type":"message","role":"user","content":"x"}],
+            "tools":[{"type":"tool_search","execution":"client","description":"d",
+                "parameters":{"type":"object","properties":{"query":{"type":"string"}}}}]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let ts_params = req
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.function_declarations.as_ref())
+            .flatten()
+            .find(|d| d.name == "tool_search")
+            .and_then(|d| d.parameters.as_ref())
+            .expect("tool_search parameters");
+        let required = ts_params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("tool_search parameters 必须有 required");
+        assert!(
+            required.iter().any(|r| r == "query"),
+            "透传含 query 的 schema 时必须强制 query 进 required;实际:{ts_params}"
         );
     }
 
