@@ -1592,6 +1592,8 @@ fn function_object_to_declaration(func: Option<&Value>) -> Option<FunctionDeclar
 /// - anyOf 单一 null branch → 当作 nullable + 提取另一 branch(LiteLLM
 ///   `convert_anyof_null_to_nullable:745`)
 /// - object 类型未指定 properties 时补 `properties:{}`(Gemini 强制要求)
+/// - oneOf / allOf:**刻意不处理、原样透传**(实测当前 Gemini 已识别这两个组合子,
+///   见下方 `sanitize_schema_inplace` 注释 + MOC-205;**勿**加降级)
 pub fn sanitize_schema(mut schema: Value) -> Value {
     // 先抽 $defs 出来作为 lookup table,然后递归展开所有 $ref
     // (P1-C 修复:不再 silent remove $ref → 引用断)
@@ -1761,6 +1763,17 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                 // 其他形态(多 non-null / pure null)— anyOf 字段**保留**不剥,
                 // Gemini 自己 validate(它文档支持 anyOf union type)
             }
+            // oneOf / allOf:**刻意不处理、原样透传**(MOC-205 / codex 0.139 #24118+#27084)。
+            // ai.google.dev 的 Schema 字段表只列 anyOf、未列 oneOf/allOf,LiteLLM
+            // `_build_vertex_schema` 也按 allowlist 把它们剥掉 —— 但二者均已**过时**。
+            // 2026-06-11 真机实测:Google AI Studio(gemini-2.5-flash / 3-flash-preview /
+            // 3.5-flash)+ Antigravity cloudcode-pa(gemini-3-flash-agent / gemini-pro-agent /
+            // gemini-3.1-pro-low)对带 oneOf/allOf 的 tool schema 全部接受(200 /
+            // response.completed),而真正的未知字段(对照组 `zzz_unknown_field`)被 400
+            // `Cannot find field` —— 证明 oneOf/allOf 是当前 Gemini Schema proto **已识别的
+            // 合法字段**,不是被宽容静默吞。故不剥不转:转 anyOf / 展开 allOf 会丢
+            // union/intersection 语义 = 不必要的破坏性降级。branch 内部子 schema 仍由下面的
+            // 递归 `sanitize_schema_inplace` 覆盖(additionalProperties / $ref / 嵌套 type 等照常处理)。
             // object 类型 properties 默认补空对象
             if obj.get("type").and_then(|v| v.as_str()) == Some("object")
                 && !obj.contains_key("properties")

@@ -307,6 +307,18 @@ fn is_hop_header(name: &str) -> bool {
 ///   统一剔除零业务损失,且能防御未来 Codex CLI 加新 identity 头。
 ///   provider.extra_headers 已能注入正确身份(如 `User-Agent: KimiCLI/...`)
 ///   填补必要 client 标记。
+///
+/// **Body 侧同款身份(`client_metadata`)不在本函数管辖,刻意不动**(MOC-205 /
+/// codex 0.139 #26923):新版 Codex 还把身份/会话信息塞进 `/responses` 请求体的
+/// `client_metadata` 字段(`x-codex-window-id` / `x-codex-installation-id` /
+/// `x-codex-turn-metadata` —— 后者展开含 session_id + 本地 workspace 绝对路径 +
+/// git origin URL + commit hash)。本函数只 strip **header**;body 的
+/// `client_metadata` 不剥:转换路径(chat / gemini / anthropic)重建 body 时它不被
+/// 映射 → 自然丢弃;`responses` 字节透传路径(`adapters::passthrough`)原样转发
+/// (faithful relay,不做多余操作)。这**不影响上下文** —— 上下文拼接的 key 是
+/// `previous_response_id`(转换路径走 `core::input::build_messages_from_input` +
+/// `ResponseSessionCache` 本地重建全量历史;透传路径 `store=false` 由上游服务器
+/// 自管 session),**与 `client_metadata` 无关**。详见 MOC-205。
 fn is_strip_on_forward(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if lower == "authorization" {
