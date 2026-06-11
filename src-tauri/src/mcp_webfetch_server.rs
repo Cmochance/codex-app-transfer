@@ -313,7 +313,11 @@ async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
                 .get("max_results")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
-            handle_web_search_call(id, query, max).await
+            let page = args
+                .get("page")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            handle_web_search_call(id, query, max, page).await
         }
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
@@ -640,6 +644,7 @@ async fn handle_web_search_call(
     id: Value,
     query: Option<String>,
     max_results: Option<usize>,
+    page: Option<usize>,
 ) -> Value {
     let query = match query {
         Some(q) if !q.is_empty() => q,
@@ -676,11 +681,12 @@ async fn handle_web_search_call(
         );
     }
     let max = max_results.unwrap_or(codex_app_transfer_http::search::DEFAULT_MAX_RESULTS);
+    let page = page.unwrap_or(1); // MOC-215 step2: 1-indexed, 默认第 1 页
     let diag_port = diag_target();
     let diag = diag_port.is_some();
     let captured_at = now_iso();
     let mut result_v = Value::Null;
-    let resp = match codex_app_transfer_http::web_search(&query, max).await {
+    let resp = match codex_app_transfer_http::web_search(&query, max, page).await {
         Ok(results) => {
             let formatted = truncate(&format_search_results(&query, &results), MAX_CONTENT_CHARS);
             if diag {
@@ -1669,9 +1675,9 @@ fn web_search_tool_def() -> Value {
     json!({
         "name": "web_search",
         "title": "Web Search",
-        "description": "用 DuckDuckGo 搜索一个查询, 返回结构化结果列表(标题 + URL + 摘要)。\
+        "description": "用 DuckDuckGo + Bing 双引擎合并搜索一个查询, 返回结构化结果列表(标题 + URL + 摘要, 已跨引擎去重)。\
     拿到结果后用 web_fetch 抓你需要的 URL 取正文 —— 两段式: 先 search 找信息源, 再 fetch 读内容。\
-    **不知道确切 URL 时用它, 别瞎猜 URL**(尤其官方文档 / 帮助中心 / 论坛帖)。由 codex-app-transfer \
+    **不知道确切 URL 时用它, 别瞎猜 URL**(尤其官方文档 / 帮助中心 / 论坛帖)。结果不够全 / 想要更多时传 `page=2`、`3` 翻页取新结果(非重复)。由 codex-app-transfer \
     经 headless 浏览器代搜(免 key, 不依赖当前 provider 是否支持原生 web_search)。",
         "inputSchema": {
             "type": "object",
@@ -1685,6 +1691,11 @@ fn web_search_tool_def() -> Value {
                     "description": "返回结果数上限(默认 15, 最多 30)。",
                     "minimum": 1,
                     "maximum": 30
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "结果页码(默认 1)。同一 query 想要**更多/不同**结果时传 page=2、3… 取下一批(非重复前页)。",
+                    "minimum": 1
                 }
             },
             "required": ["query"]
