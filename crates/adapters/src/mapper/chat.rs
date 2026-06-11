@@ -1,9 +1,6 @@
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
-use futures_util::stream::{self, Stream, StreamExt};
 use http::{header::HeaderValue, HeaderMap, StatusCode};
-use serde_json::json;
-use std::pin::Pin;
 
 use crate::core::routes;
 use crate::mapper::{RequestMapper, ResponseMapper};
@@ -174,9 +171,6 @@ pub(crate) fn transform_responses_response_stream(
     })
 }
 
-/// Cap 上游错误 body 防 DoS(对齐 grok_web / gemini_native 的同名常量)。
-const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 65_536;
-
 /// chat 路径上游 HTTP status → 内部语义 kind(再经 [`crate::codex_retry_code`]
 /// 映射成 Codex 客户端认识的 retry-control code)。
 ///
@@ -198,161 +192,26 @@ fn classify_chat_error_status(status_u16: u16) -> &'static str {
     }
 }
 
-/// chat 路径上游非 2xx → 合规 Responses 失败流(MOC-103,对齐 grok_web 的
-/// `convert_grok_error_to_responses_failure_stream`)。
+/// chat 路径上游非 2xx → 合规 Responses 失败流(MOC-103;骨架收编进
+/// [`crate::core::failure_stream`],MOC-118)。
 ///
 /// 输出永远是 `response.created` + `response.failed` 两个 SSE 事件(HTTP status
 /// 由调用方写成 200)。语义分类 [`classify_chat_error_status`] 经
 /// [`crate::codex_retry_code`] 映射:永久错误(400/401/403)→ `invalid_prompt`
 /// (surface + 停),瞬时态(timeout/rate_limited/server_error/404 等)保留原 code
 /// → Codex Retryable。原始分类存 `error.upstream_error_kind` 诊断字段。
-///
-/// **防御**(对齐 grok):
-/// - body cap [`MAX_UPSTREAM_ERROR_BODY_BYTES`] 字节防 DoS
-/// - 非 UTF-8 用 `from_utf8_lossy`,后缀标 `(non-UTF-8 body)`
-/// - mid-read transport `Err` → `upstream_transport_error` code(保留 Retryable)
-/// - 空 body / 截断仍 emit `response.failed`,带通用 message
+/// body cap / lossy / truncate / transport-err 防御见 core 模块 doc。
 fn convert_chat_error_to_responses_failure_stream(
     upstream_status: StatusCode,
     upstream_stream: ByteStream,
     response_id: String,
 ) -> ByteStream {
-    let status_u16 = upstream_status.as_u16();
-    let kind = classify_chat_error_status(status_u16);
-
-    let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
-        stream::unfold((upstream_stream, false), move |(mut input, finished)| {
-            let response_id = response_id.clone();
-            let kind = kind.to_owned();
-            async move {
-                if finished {
-                    return None;
-                }
-                let mut body = Vec::with_capacity(1024);
-                let mut transport_err: Option<String> = None;
-                let mut truncated = false;
-                while let Some(chunk) = input.next().await {
-                    match chunk {
-                        Ok(b) => {
-                            let remaining =
-                                MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
-                            if remaining == 0 {
-                                truncated = true;
-                                break;
-                            }
-                            let take = b.len().min(remaining);
-                            body.extend_from_slice(&b[..take]);
-                            if take < b.len() {
-                                truncated = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            transport_err = Some(e.to_string());
-                            break;
-                        }
-                    }
-                }
-                let was_lossy = std::str::from_utf8(&body).is_err();
-                let mut body_text = String::from_utf8_lossy(&body).into_owned();
-                if truncated {
-                    body_text.push_str(" …(truncated)");
-                }
-                if was_lossy {
-                    body_text.push_str(" (non-UTF-8 body)");
-                }
-                let (final_kind, message) = if let Some(transport) = transport_err {
-                    (
-                        "upstream_transport_error".to_owned(),
-                        format!(
-                            "upstream HTTP {status_u16} but transport err during body read: {transport}"
-                        ),
-                    )
-                } else if body_text.is_empty() {
-                    (kind, format!("upstream HTTP {status_u16} (empty body)"))
-                } else {
-                    (kind, format!("upstream HTTP {status_u16}: {body_text}"))
-                };
-
-                // 两个事件拼一起 yield(避免 mock stream 单 chunk 截断 SSE 帧)。
-                // 短路错误路径无 ConvState,起 local seq 计数器(从 0)。
-                let mut seq: u64 = 0;
-                let mut buf = Vec::with_capacity(512);
-                buf.extend_from_slice(&emit_chat_response_created(&mut seq, &response_id));
-                buf.extend_from_slice(&emit_chat_response_failed(
-                    &mut seq,
-                    &response_id,
-                    &final_kind,
-                    &message,
-                ));
-                Some((Ok(Bytes::from(buf)), (input, true)))
-            }
-        }),
-    );
-    s
-}
-
-/// 构造一个带 `sequence_number` 的 Responses SSE 事件帧(`event:` + `data:`)。
-fn emit_chat_sse_event(seq: &mut u64, event: &str, mut data: serde_json::Value) -> Bytes {
-    if let Some(obj) = data.as_object_mut() {
-        obj.insert(
-            "sequence_number".into(),
-            serde_json::Value::Number((*seq).into()),
-        );
-    }
-    *seq += 1;
-    let mut out = String::with_capacity(128);
-    out.push_str("event: ");
-    out.push_str(event);
-    out.push('\n');
-    out.push_str("data: ");
-    out.push_str(&data.to_string());
-    out.push_str("\n\n");
-    Bytes::from(out)
-}
-
-fn emit_chat_response_created(seq: &mut u64, response_id: &str) -> Bytes {
-    emit_chat_sse_event(
-        seq,
-        "response.created",
-        json!({
-            "type": "response.created",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "status": "in_progress",
-            }
-        }),
-    )
-}
-
-/// `upstream_kind` 是内部语义分类,经 [`crate::codex_retry_code`] 映射成 Codex
-/// 客户端认识的 retry-control `error.code`(永久 → `invalid_prompt`,瞬时态保留
-/// 原值)。原始分类保留在 `error.upstream_error_kind` 诊断字段(Codex `Error`
-/// struct 无 `deny_unknown_fields`,该字段被安全忽略)。
-fn emit_chat_response_failed(
-    seq: &mut u64,
-    response_id: &str,
-    upstream_kind: &str,
-    message: &str,
-) -> Bytes {
-    let codex_code = crate::codex_retry_code(upstream_kind);
-    emit_chat_sse_event(
-        seq,
-        "response.failed",
-        json!({
-            "type": "response.failed",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "status": "failed",
-                "error": {
-                    "code": codex_code,
-                    "message": message,
-                    "upstream_error_kind": upstream_kind,
-                }
-            }
-        }),
+    crate::core::failure_stream::convert_upstream_error_stream(
+        upstream_status,
+        upstream_stream,
+        response_id,
+        classify_chat_error_status(upstream_status.as_u16()),
+        "upstream",
     )
 }
 
@@ -389,7 +248,10 @@ impl ResponseMapper for ChatResponsesMapper {
 #[cfg(test)]
 mod upstream_error_tests {
     use super::*;
+    use crate::core::failure_stream::MAX_UPSTREAM_ERROR_BODY_BYTES;
+    use futures_util::stream::{self, StreamExt};
     use indexmap::IndexMap;
+    use serde_json::json;
 
     /// drive 失败流到底,拼成字符串(convert 输出的 chunk 永远是 Ok 的 SSE bytes)。
     async fn collect(stream: ByteStream) -> String {
