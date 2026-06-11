@@ -150,10 +150,10 @@ async fn kimi_fixture_emits_reasoning_lifecycle_single_chunk() {
     let output = completed["output"].as_array().unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"], "reasoning");
-    // content 通道(v26.608+ 渲染):纯思考文本,剥 `**Thinking**` header
-    assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
-    assert_eq!(output[0]["content"][0]["text"], "The");
-    assert_eq!(output[0]["encrypted_content"], Value::Null);
+    // [MOC-218 第三关] reasoning item 不带 content / encrypted_content(OpenAI
+    // 后端校验 input reasoning content 长度 0;content 通道只走 SSE 事件)
+    assert!(output[0].get("content").is_none());
+    assert!(output[0].get("encrypted_content").is_none());
     assert_eq!(output[0]["summary"][0]["type"], "summary_text");
     assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nThe");
 }

@@ -1288,8 +1288,6 @@ impl GeminiToResponsesConverter {
                     "status": "in_progress",
                     "id": item_id,
                     "summary": [],
-                    "content": [],
-                    "encrypted_content": null,
                 },
             }),
         );
@@ -1395,13 +1393,20 @@ impl GeminiToResponsesConverter {
                 "text": rs.text_acc,
             }),
         );
+        // [MOC-218 第三关] reasoning **item** 不带 `content` / `encrypted_content`:
+        // OpenAI Responses 后端对 input 里 reasoning item 硬校验 `content` 数组
+        // 长度必须 0(`array_above_max_length`,真 GPT 自家 rollout item 形态即
+        // `{type, summary, encrypted_content}` 无 content)、`encrypted_content`
+        // 假值有 MOC-13 invalid_encrypted_content 前科(null 行为未定义,缺失
+        // 最安全)。item 会被 Codex 持久化进会话历史,切真 GPT 时原样上发 ——
+        // 必须出生即合规。当轮渲染不受影响:新版(v26.608+)读 SSE
+        // `reasoning_text.delta` content 通道事件(上方保留双发,MOC-203),
+        // 实证 GPT 直连 summary:[] 仍正常显示 = 渲染靠事件流不靠 item 字段。
         let item = json!({
             "type": "reasoning",
             "status": "completed",
             "id": rs.item_id,
             "summary": [{ "type": "summary_text", "text": rs.text_acc }],
-            "content": [{ "type": "reasoning_text", "text": rs.text_acc }],
-            "encrypted_content": null,
         });
         emit_event(
             out,
@@ -2758,15 +2763,21 @@ mod tests {
         assert_eq!(text_done.1["content_index"], 0);
         // gemini 不注入 **Thinking** header,content 通道 = 原始思考文本
         assert_eq!(text_done.1["text"], "thinking step");
-        assert_eq!(r["content"][0]["type"], "reasoning_text");
-        assert_eq!(r["content"][0]["text"], "thinking step");
-        // output_item.added 即声明 content: [](激活 content 通道,锁 null→[] 改动)
+        // [MOC-218 第三关] item 不带 content / encrypted_content:OpenAI 后端
+        // 对 input reasoning item 硬校验 content 数组长度 0,假 encrypted 有
+        // MOC-13 前科;content 通道只走 SSE 事件(上方断言),item 持久化形态
+        // 必须出生即合规(切真 GPT 历史原样上发)。
+        assert!(r.get("content").is_none(), "reasoning item 不得带 content");
+        assert!(
+            r.get("encrypted_content").is_none(),
+            "reasoning item 不得带 encrypted_content"
+        );
         let item_added = events
             .iter()
             .map(|s| parse_event(s.as_str()))
             .find(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "reasoning")
             .unwrap();
-        assert_eq!(item_added.1["item"]["content"], json!([]));
+        assert!(item_added.1["item"].get("content").is_none());
     }
 
     /// MOC-203 折叠修复锁定:gemini functionCall 后常发 `{"text":""}` 空 part,
