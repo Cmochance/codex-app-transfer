@@ -31,22 +31,32 @@ pub struct UsageSummaryQuery {
 pub async fn usage_summary(Query(query): Query<UsageSummaryQuery>) -> impl IntoResponse {
     let tz_owned = query.tz;
     let tz_key = tz_owned.clone().unwrap_or_default();
+    let bypass_cache = matches!(query.nocache.as_deref(), Some("1") | Some("true"));
+    // 进锁前记请求到达时刻 —— nocache 路径据此判断 cache 是否"在本请求之后"才填充。
+    let req_start = Instant::now();
     // [MOC-19 ③] 60s TTL cache + single-flight。load_usage_report 全扫 ~1.2GB rollout
     // (release ~1-2s);前端有 in-memory cache 兜常规切 view,但多 tab 实例首次加载会各自
-    // 冷扫,本 cache 拦掉这类冗余。用户主动 Refresh 走 `nocache=1` 绕过(见 UsageSummaryQuery),
-    // 保留"强制最新"语义。cache 按 tz 区分(不同 tz 聚合结果不同);**持锁跨扫描 = single-flight**
-    // — 并发请求串行等锁,第二个进来直接命中,不会双扫(代价:第二个等第一个扫完,可接受)。
+    // 冷扫,本 cache 拦掉这类冗余。用户主动 Refresh 走 `nocache=1` 绕过旧 cache(见
+    // UsageSummaryQuery),保留"强制最新"语义。cache 按 tz 区分(不同 tz 聚合结果不同)。
+    // **持锁跨扫描 = single-flight** —— 并发请求串行等锁;命中判定:
+    //   · 常规(非 nocache):同 tz 且 60s 内 → 命中;
+    //   · nocache:只接受 `fetched_at >= req_start`(= 本请求开始之后才填的 cache,即并发
+    //     refresh 批次里另一个请求刚扫出的 fresh 结果)→ 命中。否则(只有旧 cache)放行去冷扫。
+    // 这样并发 double-click / 多 tab 同时 refresh 也只扫一次(第二个用第一个刚扫的结果),
+    // single-flight 对 nocache 同样生效(chatgpt-codex-connector review)。
     static USAGE_CACHE: OnceLock<Mutex<Option<(String, Instant, usage::UsageReport)>>> =
         OnceLock::new();
     let cache = USAGE_CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock().await;
-    // nocache=1(用户主动 Refresh)跳过命中检查、强制冷扫;否则同 tz + 60s 内命中。
-    let bypass_cache = matches!(query.nocache.as_deref(), Some("1") | Some("true"));
-    if !bypass_cache {
-        if let Some((cached_tz, fetched_at, report)) = guard.as_ref() {
-            if *cached_tz == tz_key && fetched_at.elapsed() < Duration::from_secs(60) {
-                return Json(report.clone()).into_response();
-            }
+    if let Some((cached_tz, fetched_at, report)) = guard.as_ref() {
+        let hit = *cached_tz == tz_key
+            && if bypass_cache {
+                *fetched_at >= req_start
+            } else {
+                fetched_at.elapsed() < Duration::from_secs(60)
+            };
+        if hit {
+            return Json(report.clone()).into_response();
         }
     }
     // load_usage_report 内部扫 ~/.codex/sessions/ 全部 rollout 串行解析,
