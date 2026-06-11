@@ -391,7 +391,9 @@ mod tests {
         assert_eq!(m.len(), 3, "got {urls:?}");
         // a.com 去重后只一条
         assert_eq!(
-            m.iter().filter(|r| norm_url(&r.url) == "https://a.com").count(),
+            m.iter()
+                .filter(|r| norm_url(&r.url) == "https://a.com")
+                .count(),
             1
         );
         assert!(urls.contains(&"https://b.com"));
@@ -433,7 +435,10 @@ mod tests {
         // DDG 空(抓取失败)→ 退化为纯 Bing
         let bing = vec![sr("https://b1"), sr("https://b2")];
         let m = merge_dedup(vec![], bing, 10);
-        assert_eq!(m.iter().map(|r| r.url.as_str()).collect::<Vec<_>>(), ["https://b1", "https://b2"]);
+        assert_eq!(
+            m.iter().map(|r| r.url.as_str()).collect::<Vec<_>>(),
+            ["https://b1", "https://b2"]
+        );
         // DDG 先耗尽, Bing 还有尾巴 → 继续 drain Bing(不提前停)
         let ddg = vec![sr("https://a1")];
         let bing = vec![sr("https://b1"), sr("https://b2"), sr("https://b3")];

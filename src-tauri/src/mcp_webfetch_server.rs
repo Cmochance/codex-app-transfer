@@ -705,8 +705,10 @@ async fn handle_web_search_call(
     let mut result_v = Value::Null;
     let resp = match codex_app_transfer_http::web_search(&query, max, page).await {
         Ok(results) => {
-            let formatted =
-                truncate(&format_search_results(&query, &results, page), MAX_CONTENT_CHARS);
+            let formatted = truncate(
+                &format_search_results(&query, &results, page),
+                MAX_CONTENT_CHARS,
+            );
             if diag {
                 result_v = json!({
                     "result_count": results.len(),
