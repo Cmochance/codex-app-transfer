@@ -734,10 +734,22 @@ mod tests {
     use crate::admin::registry_io::with_config_write;
     use serde_json::json;
 
+    // [MOC-19 搭车修] cancel/epoch 测试共享进程级全局 `cancel_slot()` SLOT + `next_epoch()`
+    // 原子;cargo test 多线程并行执行时这些测试互相交错改 SLOT → 偶发 fail(单线程全 pass、
+    // 多线程并行稳定触发,pre-existing flaky,非 MOC-19 引入)。用进程级串行锁让所有碰 SLOT 的
+    // 测试串行。async 测试在 `#[tokio::test]` 默认 current_thread runtime 单线程跑,guard 跨
+    // await 不切线程、不死锁;poison 直接 into_inner(某测试 panic 不该让后续全卡)。
+    static SLOT_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial_slot_guard() -> std::sync::MutexGuard<'static, ()> {
+        SLOT_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// **C1 修核心 contract**:LoginDoneGuard::Drop 必须把 epoch 写进
     /// login_done_channel,让 wait_for_login_epoch_complete 立即返。
     #[tokio::test]
     async fn login_done_guard_writes_epoch_to_channel() {
+        let _serial = serial_slot_guard();
         // 拿 unique 大 epoch 防跟其他 test 串(channel 是进程级 sticky)
         let target = next_epoch() + 100_000;
         let waiter = tokio::spawn(async move {
@@ -764,6 +776,7 @@ mod tests {
     /// 值返,**不**等 timeout。原 Notify::notify_waiters 设计这种场景信号丢失。
     #[tokio::test]
     async fn wait_returns_immediately_when_drop_happens_before_await() {
+        let _serial = serial_slot_guard();
         let target = next_epoch() + 200_000;
         // 先 drop guard(模拟 cancel signal 在 Exit 钩子 await 之前到达)
         {
@@ -790,6 +803,7 @@ mod tests {
     /// 只有 epoch >= target 时才返。
     #[tokio::test]
     async fn wait_for_specific_epoch_not_satisfied_by_lower_epoch() {
+        let _serial = serial_slot_guard();
         let target_high = next_epoch() + 300_000;
         let lower = target_high - 1;
         // 先 drop 一个 lower epoch guard — 不应满足 wait(target_high)
@@ -826,6 +840,7 @@ mod tests {
     /// 验 slot 里仍是 B 的 sender(没被 A 误清)。
     #[test]
     fn cancel_slot_epoch_prevents_a_from_clearing_b_sender() {
+        let _serial = serial_slot_guard();
         // 隔离前:清空残留(如果别的 test 留下来的)— take 不带 send 不影响
         {
             let _ = lock_cancel_slot().take();
@@ -900,6 +915,7 @@ mod tests {
     /// await 起来,B 抢占 send(true) 后 A 的 receiver 必须立即看到 true。
     #[tokio::test]
     async fn preemption_actually_delivers_cancel_signal_to_receiver() {
+        let _serial = serial_slot_guard();
         // 清空残留
         {
             let _ = lock_cancel_slot().take();
@@ -962,6 +978,7 @@ mod tests {
     /// no-in-flight / poison-recovery 三种状态,response 携带 slotRecovered flag。
     #[test]
     fn cancel_no_in_flight_returns_distinguishable_outcome() {
+        let _serial = serial_slot_guard();
         // 清空 slot 模拟 "无 in-flight"
         {
             let _ = lock_cancel_slot().take();
@@ -976,6 +993,7 @@ mod tests {
 
     #[test]
     fn cancel_with_in_flight_returns_cancelled_true() {
+        let _serial = serial_slot_guard();
         {
             let _ = lock_cancel_slot().take();
         }
