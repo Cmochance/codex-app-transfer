@@ -731,7 +731,7 @@ async fn handle_web_search_call(
                 "trace_kind": "cat_webfetch",
                 "captured_at": captured_at,
                 "tool": "web_search",
-                "request": { "query": query, "max_results": max },
+                "request": { "query": query, "max_results": max, "page": page },
                 "result": result_v,
             }),
         )

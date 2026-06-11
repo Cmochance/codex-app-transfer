@@ -54,6 +54,12 @@ const MAX_RESULTS_CAP: usize = 30;
 /// 每页结果基准条数(Bing first= 翻页步长 + DDG 单页约值)。
 const PAGE_SIZE: usize = 10;
 
+/// 页码(1-indexed)→ Bing `first=` 偏移:page 1→1, page 2→11, page 3→21(`first` 是 1-indexed 结果序号)。
+/// `page < 1` 视作 1。MOC-215: 抽成纯函数便于单测 —— 这是翻页的核心行为(此前仅 live test 覆盖)。
+fn bing_first_offset(page: usize) -> usize {
+    (page.max(1) - 1) * PAGE_SIZE + 1
+}
+
 /// 搜索 `query` 第 `page` 页, 返回结构化结果列表。固定走 headless(见模块注释)。
 ///
 /// - `max_results` 截到 `[1, 30]`(`0` 视作 1, `>30` 截到 30)—— 防模型传超大值撑爆 context。
@@ -80,7 +86,7 @@ pub async fn web_search(
         "https://html.duckduckgo.com/html/?q={}",
         urlencoding::encode(q)
     );
-    let bing_first = (page - 1) * PAGE_SIZE + 1;
+    let bing_first = bing_first_offset(page);
     let bing_url = format!(
         "https://www.bing.com/search?q={}&first={}",
         urlencoding::encode(q),
@@ -121,18 +127,17 @@ pub async fn web_search(
     if !merged.is_empty() {
         return Ok(merged);
     }
-    // 无合并结果: DDG anomaly → Blocked(退避重试);抓取层失败(headless 故障)→ 透传 Fetch 错
-    // (? 语义);否则 NoResults(该换查询)。block/NoResults remediation 相反, 必须分开报
-    // (silent-failure-hunter MOC-12 review)。
+    // 无合并结果, 区分三类(remediation 相反、必须分开报;silent-failure-hunter MOC-12 review):
+    // ① DDG anomaly 反爬页 → Blocked(该退避重试);
+    // ② Bing 抓取层失败(headless 崩溃/超时)→ 透传 Fetch 错 —— **不能把后端崩溃伪报成 NoResults**
+    //    让模型改 query 而非退避:DDG 即便成功返空, 我们也没拿到 Bing 的答案, 无权宣称"无结果"
+    //    (此前用 `!matches!(ddg_fetch, Some(Ok))` 守卫会在 DDG 成功-返空时吞掉 Bing 崩溃, 已修);
+    // ③ Bing 成功返空(无论 DDG 成功返空 or 抓取失败-已 stderr 记)→ NoResults(该换查询)。
     if ddg_anomaly {
         return Err(WebSearchError::Blocked);
     }
-    // page>1 时 ddg_fetch=None(没抓 DDG), 只看 Bing;page 1 时 DDG 也没成功(None 不会出现,
-    // 但 Some(Err))→ Bing 也失败才透传(DDG Ok-but-empty + Bing Ok-empty 落 NoResults)。
-    if !matches!(&ddg_fetch, Some(Ok(_))) {
-        if let Err(e) = bing_fetch {
-            return Err(e.into());
-        }
+    if let Err(e) = bing_fetch {
+        return Err(WebSearchError::from(e));
     }
     Err(WebSearchError::NoResults)
 }
@@ -409,6 +414,32 @@ mod tests {
         assert_eq!(norm_url("https://x.com"), "https://x.com");
         // query 保留(不同 query 不能并)
         assert_eq!(norm_url("https://x.com/?q=1"), "https://x.com/?q=1");
+        // 前后空白先 trim(一家带空白的 URL 应与另一家干净的去重为一条)
+        assert_eq!(norm_url("  https://x.com/  "), "https://x.com");
+    }
+
+    #[test]
+    fn bing_first_offset_maps_page_to_offset() {
+        // 1-indexed page → Bing first= 偏移(PR 核心翻页行为)
+        assert_eq!(bing_first_offset(1), 1);
+        assert_eq!(bing_first_offset(2), 11);
+        assert_eq!(bing_first_offset(3), 21);
+        // page<1 视作 1(防 0/下溢)
+        assert_eq!(bing_first_offset(0), 1);
+    }
+
+    #[test]
+    fn merge_dedup_degrades_to_single_engine_and_drains_tail() {
+        // DDG 空(抓取失败)→ 退化为纯 Bing
+        let bing = vec![sr("https://b1"), sr("https://b2")];
+        let m = merge_dedup(vec![], bing, 10);
+        assert_eq!(m.iter().map(|r| r.url.as_str()).collect::<Vec<_>>(), ["https://b1", "https://b2"]);
+        // DDG 先耗尽, Bing 还有尾巴 → 继续 drain Bing(不提前停)
+        let ddg = vec![sr("https://a1")];
+        let bing = vec![sr("https://b1"), sr("https://b2"), sr("https://b3")];
+        let m = merge_dedup(ddg, bing, 10);
+        assert_eq!(m.len(), 4); // a1 + b1 + b2 + b3, 无丢失
+        assert!(m.iter().any(|r| r.url == "https://b3"));
     }
 
     #[test]
