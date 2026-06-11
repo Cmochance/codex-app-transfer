@@ -2877,7 +2877,9 @@
 
   function fmtLastActivity(s) {
     if (!s) return "—";
-    // ccusage 写 RFC3339;表格列宽紧张,只显示 YYYY-MM-DD HH:MM(秒/ms/Z/offset 全省)
+    // [MOC-19 ④] 后端已把 last_activity 按用户 tz format 成 `YYYY-MM-DD HH:MM`(不再是
+    // raw UTC RFC3339,见 usage_tracker::format_last_activity_tz)。这里只做防御性裁切:
+    // 命中正则取前 16 字符(兼容后端 format 串 + 万一旧 cache 的 RFC3339,T/空格都认)。
     const m = s.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/);
     return m ? `${m[1]} ${m[2]}` : s;
   }
@@ -3076,10 +3078,14 @@
     }).join("");
   }
 
-  async function fetchUsageReport() {
+  async function fetchUsageReport(forceRefresh = false) {
     // 浏览器 tz:Intl.DateTimeFormat().resolvedOptions().timeZone
     const tz = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || "");
-    const res = await fetch(`/api/usage/summary?tz=${tz}`);
+    // [MOC-19 ③] 后端有 60s TTL cache;用户主动点 Refresh(forceRefresh)时带 nocache=1
+    // 绕过缓存、强制冷扫拿最新数据(refresh 的语义就是要最新)。常规切 view / 多 tab 自动
+    // 加载不带 → 命中后端 cache,避免冗余全扫 1.2GB。
+    const nocache = forceRefresh ? "&nocache=1" : "";
+    const res = await fetch(`/api/usage/summary?tz=${tz}${nocache}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   }
@@ -3112,7 +3118,7 @@
     if (!usageCache || forceRefresh) {
       if (loading) loading.hidden = false;
       try {
-        usageCache = await fetchUsageReport();
+        usageCache = await fetchUsageReport(forceRefresh);
       } catch (e) {
         console.warn("cas: load usage failed", e);
         if (loading) loading.hidden = true;

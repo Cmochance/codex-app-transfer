@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+**用量统计打磨 — 时区 / 精度 / 性能 (MOC-19)**:承接 token 用量统计的 4 项 followup。①「最后活动」时间改为后端按用户时区显示(此前是 UTC,跟「按日」视图的本地日期不一致,体感时间对不上);② 取每对话「最后活动」从字符串比较改为按真实时刻(epoch 毫秒)比较,避免混合时区偏移(`+08:00` vs `Z`)的 RFC3339 字符串序 ≠ 时间序导致选错最晚活动;③ `/api/usage/summary`(全扫 ~1.2GB rollout、release 约 1-2s)加 60 秒 TTL 缓存 + single-flight,多标签页 / 重复打开 Usage 页不再各自冷扫,**用户主动点「刷新」仍强制拿最新**(走 nocache 绕过缓存);④ rollout 文件打开失败从静默跳过改为 tracing 告警(用户报「数据少了几天」时可在日志定位)。Refs MOC-19。
+
 **gemini/antigravity 恢复 MCP 工具暴露 (MOC-217)**:Codex 0.130+ 把所有 MCP 工具(含内置 `cat-webfetch` 的 web_fetch / web_search)defer 到 `tool_search` builtin,模型需先调 `tool_search` 做 BM25 发现工具、再调用具体工具。chat 路径早已适配,但 gemini / antigravity 路径漏接 —— `tool_search` 落 `other => warn_once_drop_tool` 被静默 drop,导致这些 provider 下**所有** MCP 工具(用户配的 server + 内置 cat-webfetch)对模型不可见、联网搜索不可用。补齐 gemini 路径全链路(对齐 chat 路径 + 已有 apply_patch 重打包模式):请求侧把 `tool_search` 降级成 functionDeclaration、并把 `tool_search_output` 里发现的工具(namespace 包)展平注入 functionDeclarations(否则模型发现工具后下一轮仍无法调用 → 死循环);响应侧把模型回的 functionCall(name=tool_search)重打包成 Responses `tool_search_call` wire(arguments=object、execution=client)+ session 历史重建,保证多轮闭环。Refs MOC-217。
 
 **多轮重复 system 块 wire 级去重 (MOC-193)**:Codex 每轮请求随历史重建附带完整 env block(~37 KB),长对话实测出现 3 份相同的 system/developer 指令块并发上游;在共享转换管道的 `session_messages` clone 之后、发上游之前增加 `dedupe_repeated_instruction_messages` pass,对整条 JSON 内容相同的 system/developer 消息去重(保留首次出现以稳定 prompt-cache prefix),实测可省数十 KB/轮;session cache 保持全量原貌。**四路径全覆盖**:chat / gemini_native / anthropic_messages 经共享管道的 wire 源(`conversion.body`)自动继承,grok_web 的 wire 源同步从 session 全量版切到去重版。Refs MOC-193。

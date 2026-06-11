@@ -91,6 +91,19 @@ pub fn load_codex_events() -> Result<Vec<CodexTokenUsageEvent>> {
 fn load_dir(sessions_dir: &std::path::Path, events: &mut Vec<CodexTokenUsageEvent>) -> Result<()> {
     let files = list_jsonl_files(sessions_dir);
     for file in files {
+        // [MOC-19 ⑤] vendored `parser.rs` 对文件级 open/read 失败吞成 `Ok(())`(保持
+        // ccusage 1:1、不改 vendor),caller 因此拿不到 → 用户报「数据少了几天」时无从定位。
+        // 在 caller 层先探测 open:失败走 `tracing::warn!` 记 (file, error) 再 skip,跟目录级
+        // `walk()` 的 read_dir warn 对称。探测成功后 visit 内仍会再 open 一次(open 成本可
+        // 忽略;TOCTOU 窗口极小且 visit 内 `Ok(())` 兜底,非致命)。
+        if let Err(err) = std::fs::File::open(&file) {
+            tracing::warn!(
+                file = %file.display(),
+                error = %err,
+                "usage_tracker: 打开 rollout 文件失败,跳过该文件(用户报「数据少了」时查此日志)"
+            );
+            continue;
+        }
         visit_codex_session_file(sessions_dir, &file, |event| {
             events.push(event);
             Ok(())
@@ -184,14 +197,44 @@ impl UsageRow {
                 self.models.push(model.to_string());
             }
         }
+        // [MOC-19 ②] last_activity 取最晚 event:按解析后的 epoch ms 比较,不用 raw 字符串
+        // lex compare。Codex CLI 自身输出全 UTC `Z` 实际不踩,但 RFC3339 mixed offset
+        // (如 `+08:00` vs `Z`)的字符串序 != 时间序时会选错最晚活动。parse 失败 → 0(不更新)。
         match (&self.last_activity, &event.timestamp) {
             (None, ts) => self.last_activity = Some(ts.clone()),
-            (Some(prev), ts) if ts.as_str() > prev.as_str() => {
-                self.last_activity = Some(ts.clone())
+            (Some(prev), ts) => {
+                let prev_ms = parse_ts_timestamp(prev)
+                    .map(TimestampMs::as_millis)
+                    .unwrap_or(0);
+                let ts_ms = parse_ts_timestamp(ts)
+                    .map(TimestampMs::as_millis)
+                    .unwrap_or(0);
+                if ts_ms > prev_ms {
+                    self.last_activity = Some(ts.clone());
+                }
             }
-            _ => {}
         }
     }
+}
+
+/// [MOC-19 ④] `last_activity` raw RFC3339(Codex 写 UTC `Z`)→ 用户 tz 的
+/// `YYYY-MM-DD HH:MM` 显示串。此前 `last_activity` 全程是 raw UTC 字符串、前端只截取前
+/// 16 字符 → 表格显示的是 **UTC** 时间而非用户本地时间(跟 daily date 已按 tz format 不
+/// 一致)。统一在后端按用户 tz format(复用 daily date 同款 jiff `to_zoned` 路径),前端直接
+/// 显示。parse 失败 → None(调用方保留 raw,不致丢信息)。
+fn format_last_activity_tz(raw: &str, tz: Option<&jiff::tz::TimeZone>) -> Option<String> {
+    let ms = parse_ts_timestamp(raw)?.as_millis();
+    let ts = jiff::Timestamp::from_millisecond(ms).ok()?;
+    let tz = tz.cloned().unwrap_or_else(jiff::tz::TimeZone::system);
+    let zoned = ts.to_zoned(tz);
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        i32::from(zoned.year()),
+        u32::from(zoned.month() as u8),
+        u32::from(zoned.day() as u8),
+        u32::from(zoned.hour() as u8),
+        u32::from(zoned.minute() as u8),
+    ))
 }
 
 /// Daily 视图:date(localized) → UsageRow。timezone 同 ccusage `aggregate.rs:97`
@@ -309,6 +352,21 @@ pub fn load_usage_report(timezone: Option<&str>) -> Result<UsageReport> {
         report.total_turns += 1;
     }
     report.total_conversations = report.by_conversation.len() as u64;
+    // [MOC-19 ④] 三视图的 last_activity raw UTC → 用户 tz 显示串(统一一处 format,避免
+    // 前端按 UTC 显示)。daily 视图的 date 已按 tz,这里把 last_activity 列也对齐 tz。
+    let tz = parse_tz(timezone);
+    for row in report
+        .daily
+        .iter_mut()
+        .chain(report.by_model.iter_mut())
+        .chain(report.by_conversation.iter_mut())
+    {
+        if let Some(raw) = row.last_activity.as_deref() {
+            if let Some(formatted) = format_last_activity_tz(raw, tz.as_ref()) {
+                row.last_activity = Some(formatted);
+            }
+        }
+    }
     Ok(report)
 }
 
@@ -467,6 +525,75 @@ pub fn cache_series_for_conversation(session_id: &str) -> Result<Vec<CacheBucket
         })
         .collect();
     Ok(bucket_series(&points, 10))
+}
+
+#[cfg(test)]
+mod usage_phase2_tests {
+    use super::*;
+    use vendored_ccusage::types::CodexTokenUsageEvent;
+
+    fn ev(ts: &str) -> CodexTokenUsageEvent {
+        CodexTokenUsageEvent {
+            session_id: "s".into(),
+            timestamp: ts.into(),
+            model: None,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            is_fallback_model: false,
+        }
+    }
+
+    #[test]
+    fn last_activity_picks_latest_by_epoch_not_lex() {
+        // [MOC-19 ②] mixed offset:`10:00:00+08:00`(=02:00 UTC)vs `05:00:00Z`(=05:00 UTC)。
+        // 字符串 lex compare 会误判前者晚("T10:…" > "T05:…");按 epoch 后者才是最晚活动。
+        let mut row = UsageRow::default();
+        row.add_event(&ev("2026-06-12T10:00:00+08:00"));
+        row.add_event(&ev("2026-06-12T05:00:00Z"));
+        assert_eq!(
+            row.last_activity.as_deref(),
+            Some("2026-06-12T05:00:00Z"),
+            "应按 epoch 选最晚(05:00Z > 10:00+08=02:00Z),非字符串 lex"
+        );
+    }
+
+    #[test]
+    fn last_activity_order_independent() {
+        // 反向加入顺序也对:先加晚的(Z),再加早的(+08)不该覆盖。
+        let mut row = UsageRow::default();
+        row.add_event(&ev("2026-06-12T05:00:00Z"));
+        row.add_event(&ev("2026-06-12T10:00:00+08:00"));
+        assert_eq!(row.last_activity.as_deref(), Some("2026-06-12T05:00:00Z"));
+    }
+
+    #[test]
+    fn format_last_activity_tz_converts_utc_to_user_tz() {
+        // [MOC-19 ④] 00:30 UTC → 08:30 Shanghai(+08)
+        let tz = jiff::tz::TimeZone::get("Asia/Shanghai").unwrap();
+        assert_eq!(
+            format_last_activity_tz("2026-06-12T00:30:00Z", Some(&tz)).as_deref(),
+            Some("2026-06-12 08:30")
+        );
+    }
+
+    #[test]
+    fn format_last_activity_tz_crosses_date_boundary() {
+        // 23:30 UTC → 次日 07:30 Shanghai(跨日,验证不是只截 HH:MM 而是真转 tz)
+        let tz = jiff::tz::TimeZone::get("Asia/Shanghai").unwrap();
+        assert_eq!(
+            format_last_activity_tz("2026-06-12T23:30:00Z", Some(&tz)).as_deref(),
+            Some("2026-06-13 07:30")
+        );
+    }
+
+    #[test]
+    fn format_last_activity_tz_invalid_returns_none() {
+        let tz = jiff::tz::TimeZone::get("Asia/Shanghai").unwrap();
+        assert_eq!(format_last_activity_tz("not-a-timestamp", Some(&tz)), None);
+    }
 }
 
 #[cfg(test)]
