@@ -48,7 +48,7 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// MCP `initialize` 回给模型的整体工具使用规则(MOC-190): 把「回看已抓 URL 优先用 read_url_local」抬到
 /// server 级指引(比单个 tool description 优先级高), 提高 read_url_local 调用率、避免重复 web_fetch 同一页。
 const SERVER_INSTRUCTIONS: &str = "联网工具使用规则:\n\
-1. 需要网上信息时先 web_search(query) 找来源, 再 web_fetch(url) 读该页完整正文。\n\
+1. 需要网上信息时先 web_search(query) 找来源, 再 web_fetch(url) 读该页完整正文。web_search 只返第 1 页(约一二十条);第 1 页没覆盖到你要的信息时, 用 web_search_more(传同一 query + page=2、3…)取下一批**不重复**的新结果, **别用同样 query 重复调 web_search**(会返回同一批)。\n\
 2. **凡是本次对话里你已经用 web_fetch 抓过的 URL —— 当你要再次引用 / 摘录 / 附上它的原文 / 回看更多细节时, 必须先用 read_url_local(url) 从本地缓存取回, 不要重复 web_fetch 同一个 URL**。read_url_local 不联网、瞬时返回, 且能拿回已被对话历史折叠/压缩、你当前看不到的完整原文。\n\
 3. 抓「新」URL 才用 web_fetch; 回看「旧」(本会话已抓过的)URL 一律 read_url_local。\n\
 4. web_fetch 默认返回完整正文供当前轮直接阅读; 仅当你只要压缩摘要时才加 summarize=true。";
@@ -219,6 +219,7 @@ fn dispatch_line(
             // 触发下载;两者皆无则不暴露(避免在没走过 consent 的档静默拉 ~86MB)。
             if matches!(current_backend(), Ok(Some(_))) && chrome_ready() {
                 tools.push(web_search_tool_def());
+                tools.push(web_search_more_tool_def()); // MOC-215: 独立翻页工具
             }
             let _ = out_tx.send(json!({
                 "jsonrpc": "2.0",
@@ -313,6 +314,19 @@ async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
                 .get("max_results")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
+            // web_search 固定第 1 页;翻页走独立 web_search_more 工具(MOC-215)。
+            handle_web_search_call(id, query, max, Some(1)).await
+        }
+        "web_search_more" => {
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let max = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            // page 必填(tool def required, ≥2);缺失/非法时 handle 内 unwrap_or(1) 兜底。
             let page = args
                 .get("page")
                 .and_then(|v| v.as_u64())
@@ -688,7 +702,8 @@ async fn handle_web_search_call(
     let mut result_v = Value::Null;
     let resp = match codex_app_transfer_http::web_search(&query, max, page).await {
         Ok(results) => {
-            let formatted = truncate(&format_search_results(&query, &results), MAX_CONTENT_CHARS);
+            let formatted =
+                truncate(&format_search_results(&query, &results, page), MAX_CONTENT_CHARS);
             if diag {
                 result_v = json!({
                     "result_count": results.len(),
@@ -723,9 +738,13 @@ async fn handle_web_search_call(
 }
 
 /// 把结果列表格式化成给模型的 markdown(序号 + 标题 + URL + 摘要 + 两段式用法提示)。
-fn format_search_results(query: &str, results: &[codex_app_transfer_http::SearchResult]) -> String {
+fn format_search_results(
+    query: &str,
+    results: &[codex_app_transfer_http::SearchResult],
+    page: usize,
+) -> String {
     let mut s = format!(
-        "web_search「{query}」共 {} 条结果。挑你需要的用 web_fetch 抓 URL 取正文:\n\n",
+        "web_search「{query}」第 {page} 页共 {} 条结果。挑你需要的用 web_fetch 抓 URL 取正文:\n\n",
         results.len()
     );
     for (i, r) in results.iter().enumerate() {
@@ -735,6 +754,14 @@ fn format_search_results(query: &str, results: &[codex_app_transfer_http::Search
         }
         s.push('\n');
     }
+    // 尾部诱导(MOC-215): 单页只 ~10-15 条, 引导模型用 web_search_more 翻页拿**新结果**, 而非用
+    // 同 query 重复 web_search(会返回同一批)。这是让翻页功能真被用上的关键(模型默认不会主动翻页)。
+    s.push_str(&format!(
+        "—— 以上为第 {page} 页。没找到需要的信息?**别用同样 query 再调 web_search**(会返回同一批结果);\
+         改用 `web_search_more`(传完全相同的 query「{query}」+ page={})取**下一批不重复**的结果, \
+         或换一个更具体的 query 重搜。",
+        page + 1
+    ));
     s
 }
 
@@ -1675,9 +1702,9 @@ fn web_search_tool_def() -> Value {
     json!({
         "name": "web_search",
         "title": "Web Search",
-        "description": "用 DuckDuckGo + Bing 双引擎合并搜索一个查询, 返回结构化结果列表(标题 + URL + 摘要, 已跨引擎去重)。\
+        "description": "用 DuckDuckGo + Bing 双引擎合并搜索一个查询, 返回**第 1 页**结构化结果(标题 + URL + 摘要, 已跨引擎去重)。\
     拿到结果后用 web_fetch 抓你需要的 URL 取正文 —— 两段式: 先 search 找信息源, 再 fetch 读内容。\
-    **不知道确切 URL 时用它, 别瞎猜 URL**(尤其官方文档 / 帮助中心 / 论坛帖)。结果不够全 / 想要更多时传 `page=2`、`3` 翻页取新结果(非重复)。由 codex-app-transfer \
+    **不知道确切 URL 时用它, 别瞎猜 URL**(尤其官方文档 / 帮助中心 / 论坛帖)。第 1 页(约一二十条)没覆盖到要的信息时, 用 `web_search_more`(传同一 query + page=2)取下一批新结果, 别用同样 query 重复本工具。由 codex-app-transfer \
     经 headless 浏览器代搜(免 key, 不依赖当前 provider 是否支持原生 web_search)。",
         "inputSchema": {
             "type": "object",
@@ -1691,16 +1718,50 @@ fn web_search_tool_def() -> Value {
                     "description": "返回结果数上限(默认 15, 最多 30)。",
                     "minimum": 1,
                     "maximum": 30
-                },
-                "page": {
-                    "type": "integer",
-                    "description": "结果页码(默认 1)。同一 query 想要**更多/不同**结果时传 page=2、3… 取下一批(非重复前页)。",
-                    "minimum": 1
                 }
             },
             "required": ["query"]
         },
         // MOC-172: 同 web_fetch —— 只读搜索工具,readOnlyHint 让 guardian 跳过审批。
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": true }
+    })
+}
+
+/// MOC-215: web_search 的**独立翻页工具**。单独成 tool(而非 web_search 的 page 参数)是因为模型
+/// 几乎不会主动用搜索工具的分页参数 —— 一个名字明确、描述完整的独立工具发现性更高, 配合 web_search
+/// 结果尾部的诱导提示, 模型在第 1 页不够时才会真去翻页。单页只抓一页(~10-15 条, 不一次扩抓多页避免
+/// headless 延迟过高), 深页按需取。
+fn web_search_more_tool_def() -> Value {
+    json!({
+        "name": "web_search_more",
+        "title": "Web Search — 下一页",
+        "description": "取 **web_search 同一个 query 的下一页**结果(更多、不重复第 1 页的来源)。\
+    用法: 先用 `web_search` 搜得到第 1 页;若第 1 页没覆盖到你要的信息、需要更多来源, **不要用同样的 \
+    query 再调 web_search(会返回同一批结果)**, 改用本工具 —— 传**与刚才完全相同的 query** + 目标页码 \
+    `page`(从 2 开始, 2=第 2 页、3=第 3 页…)。每页约 10-15 条新结果。拿到结果后照样用 web_fetch 抓 URL \
+    取正文。由 codex-app-transfer 经 headless 浏览器代搜(免 key, 不依赖当前 provider 是否支持原生 web_search)。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "与之前 web_search 用的**完全相同**的查询词(必须一致, 翻的是这个 query 的后续页)。"
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "要取的页码, 从 2 开始(2=第 2 页, 3=第 3 页…)。第 1 页用 web_search。",
+                    "minimum": 2
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "本页返回结果数上限(默认 15, 最多 30)。",
+                    "minimum": 1,
+                    "maximum": 30
+                }
+            },
+            "required": ["query", "page"]
+        },
+        // 只读搜索工具(同 web_search): readOnlyHint 让 guardian 跳过审批。
         "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": true }
     })
 }
@@ -1921,15 +1982,28 @@ mod tests {
     }
 
     #[test]
+    fn web_search_more_tool_def_shape() {
+        let d = web_search_more_tool_def();
+        assert_eq!(d["name"], "web_search_more");
+        let req = d["inputSchema"]["required"].as_array().unwrap();
+        assert!(req.iter().any(|v| v == "query"));
+        assert!(req.iter().any(|v| v == "page"));
+        // page 从 2 起(第 1 页走 web_search)
+        assert_eq!(d["inputSchema"]["properties"]["page"]["minimum"], 2);
+        assert_eq!(d["annotations"]["readOnlyHint"], true);
+    }
+
+    #[test]
     fn format_search_results_shape() {
         let results = vec![codex_app_transfer_http::SearchResult {
             title: "T".into(),
             url: "https://e.com".into(),
             snippet: "S".into(),
         }];
-        let out = format_search_results("q", &results);
+        let out = format_search_results("q", &results, 1);
         assert!(out.contains("https://e.com"));
         assert!(out.contains("web_fetch")); // 带两段式用法提示
+        assert!(out.contains("web_search_more")); // 尾部翻页诱导(MOC-215)
     }
 
     #[test]
