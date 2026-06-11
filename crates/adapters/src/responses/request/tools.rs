@@ -9,6 +9,13 @@ use super::provider_looks_like;
 /// wire re-shape — they must trigger on the exact same tool name.
 pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 
+/// Codex 0.130+ `tool_search` builtin name. Request side lowers `type:"tool_search"`
+/// into a chat/function tool with this name; response side (`converter.rs` chat path,
+/// `gemini_native/response.rs` Gemini path) re-shapes the model's function call back
+/// into a `tool_search_call` wire — both must key off this exact name. See MOC-32
+/// (chat path) and MOC-217 (gemini/antigravity path).
+pub(crate) const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
+
 /// Chat-path replacement for Codex CLI's freeform `apply_patch` description.
 /// Original upstream text says "do not wrap the patch in JSON" because the
 /// Responses API freeform/lark grammar accepts raw text — but on the

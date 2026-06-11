@@ -209,15 +209,28 @@ pub fn responses_body_to_normalized_chat(body: &Value) -> Result<Value, AdapterE
         })?;
 
     // tools[] 转 chat shape(保留 web_search,unwrap function/custom 等)
-    if let Some(tools) = body_obj.get("tools").and_then(|v| v.as_array()) {
-        let chat_tools = responses_tools_to_chat_tools(tools);
-        if !chat_tools.is_empty() {
-            chat_body.insert("tools".into(), Value::Array(chat_tools));
-        } else {
-            chat_body.remove("tools");
-        }
-    } else {
+    let mut chat_tools = body_obj
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| responses_tools_to_chat_tools(tools))
+        .unwrap_or_default();
+    // [MOC-217] 注入 tool_search 发现的具体工具。它们只在 input[] 的
+    // `tool_search_output.tools`(namespace 包),**不在** body.tools[](真机 trace
+    // 实证:body.tools 恒为固定 18 个,发现的 cat-webfetch/web_fetch 等只在 output)。
+    // 不注入则模型调 tool_search 发现工具后,下一轮 tools 里仍没有它 → 无法调用 → 死循环
+    // 调 tool_search。对齐 chat 路径 `responses/request.rs:205`,复用同一 discovered
+    // helper;discovered 是 namespace 包,经 responses_tools_to_chat_tools 展平(并注入
+    // server prefix 给 Gemini 工具选择提供 context)。
+    for discovered in crate::responses::request::discovered_tools_from_tool_search_output(body) {
+        chat_tools.extend(responses_tools_to_chat_tools(std::slice::from_ref(
+            &discovered,
+        )));
+    }
+    crate::responses::request::dedup_chat_tools_by_name(&mut chat_tools);
+    if chat_tools.is_empty() {
         chat_body.remove("tools");
+    } else {
+        chat_body.insert("tools".into(), Value::Array(chat_tools));
     }
     // tool_choice 直接透传(Responses 跟 chat 形态一致)
     if let Some(tc) = body_obj.get("tool_choice") {
@@ -669,6 +682,42 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                 let mut m = Map::new();
                 m.insert("type".into(), Value::String("web_search".into()));
                 out.push(Value::Object(m));
+            }
+            "tool_search" => {
+                // [MOC-217] Codex 0.130+ `Feature::ToolSearchAlwaysDeferMcpTools`:所有
+                // MCP server 工具(含内置 cat-webfetch)都 defer 到 `tool_search` builtin,
+                // 模型先 BM25 query 发现具体工具再调用。Gemini 不认 `type=tool_search`,
+                // 降级成普通 function(name=tool_search,description+parameters 透传)→
+                // 下游 chat→Gemini 转 functionDeclaration。模型调用后 `response.rs::
+                // emit_function_call` 把 functionCall 重打包成 Responses `tool_search_call`
+                // wire(同 apply_patch→custom_tool_call)。
+                //
+                // 对齐 chat 路径 `responses/request/tools.rs:344`(MOC-32);gemini 路径此前
+                // 缺此分支 → tool_search 落下面 `other => warn_once_drop_tool` 被静默 drop,
+                // 致 antigravity/gemini 下所有 defer 的 MCP 工具(cat-webfetch 等)不可见。
+                let description = obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mut parameters = obj
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type":"object","properties":{},"required":[]}));
+                // tool_search 也合成 chat function;parameters 若 all-optional/缺 required,
+                // 严格中转网关会 400(对齐 chat 路径同款补全)。先确保顶层 type:object 再补 required。
+                if let Some(po) = parameters.as_object_mut() {
+                    po.entry("type")
+                        .or_insert_with(|| Value::String("object".into()));
+                }
+                crate::core::schema::ensure_object_schema_required(&mut parameters);
+                let mut func = Map::new();
+                func.insert("name".into(), Value::String("tool_search".into()));
+                func.insert("description".into(), Value::String(description.to_owned()));
+                func.insert("parameters".into(), parameters);
+                let mut wrapper = Map::new();
+                wrapper.insert("type".into(), Value::String("function".into()));
+                wrapper.insert("function".into(), Value::Object(func));
+                out.push(Value::Object(wrapper));
             }
             "custom" => {
                 // Codex.app custom freeform tool(Responses API freeform,无 JSON
@@ -3135,5 +3184,82 @@ mod tests {
             .find_map(|t| t.function_declarations.clone())
             .unwrap();
         assert_eq!(decls[0].name, "calc");
+    }
+
+    // ───── MOC-217: tool_search builtin (gemini/antigravity) ─────
+
+    fn gemini_function_decl_names(req: &RequestBody) -> Vec<String> {
+        req.tools
+            .iter()
+            .flatten()
+            .filter_map(|t| t.function_declarations.clone())
+            .flatten()
+            .map(|d| d.name)
+            .collect()
+    }
+
+    #[test]
+    fn tool_search_lowered_to_function_declaration() {
+        // [MOC-217] Codex 0.130+ `tool_search` builtin 必须降级成 functionDeclaration
+        // (name=tool_search),否则 gemini/antigravity 下所有 defer 的 MCP 工具(含内置
+        // cat-webfetch)对模型不可见 —— 此前 tool_search 落 `other => warn_once_drop_tool`
+        // 被静默 drop。
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[{"type":"message","role":"user","content":"search the web"}],
+            "tools":[
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}},
+                {"type":"tool_search","execution":"client","description":"# Tool discovery\nBM25 over deferred tools"}
+            ]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let names = gemini_function_decl_names(&req);
+        assert!(
+            names.contains(&"tool_search".to_owned()),
+            "tool_search 必须降级成 functionDeclaration;实际:{names:?}"
+        );
+        assert!(
+            names.contains(&"exec_command".to_owned()),
+            "普通 function 也保留;实际:{names:?}"
+        );
+    }
+
+    #[test]
+    fn tool_search_output_discovered_tools_injected_as_function_declarations() {
+        // [MOC-217] tool_search 发现的具体工具只在 input[] 的 `tool_search_output.tools`
+        // (namespace 包),**不在** body.tools[]。必须注入 functionDeclarations,否则模型调
+        // tool_search 发现 cat-webfetch 后下一轮 tools 里仍没有 web_fetch → 无法调用 → 死循环。
+        let body = serde_json::json!({
+            "model":"gemini-3.1-pro-preview",
+            "input":[
+                {"type":"message","role":"user","content":"fetch a url"},
+                {"type":"function_call","call_id":"c1","name":"tool_search","arguments":"{\"query\":\"web fetch\"}"},
+                {"type":"tool_search_output","call_id":"c1","status":"completed","execution":"client",
+                 "tools":[{"type":"namespace","name":"mcp__cat_webfetch","tools":[
+                     {"type":"function","name":"web_fetch","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
+                     {"type":"function","name":"read_url_local","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}},
+                     {"type":"function","name":"web_search","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}
+                 ]}]}
+            ],
+            "tools":[{"type":"tool_search","execution":"client","description":"discovery"}]
+        });
+        let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
+        let names = gemini_function_decl_names(&req);
+        assert!(
+            names.contains(&"web_fetch".to_owned()),
+            "tool_search_output 发现的 web_fetch 必须注入 functionDeclarations;实际:{names:?}"
+        );
+        assert!(
+            names.contains(&"web_search".to_owned()),
+            "发现的 web_search 必须注入;实际:{names:?}"
+        );
+        assert!(
+            names.contains(&"read_url_local".to_owned()),
+            "发现的 read_url_local 必须注入;实际:{names:?}"
+        );
+        assert!(
+            names.contains(&"tool_search".to_owned()),
+            "tool_search 本身仍保留(模型可继续 query 更多);实际:{names:?}"
+        );
     }
 }

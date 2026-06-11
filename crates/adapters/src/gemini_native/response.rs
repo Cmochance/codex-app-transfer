@@ -56,7 +56,7 @@ use serde_json::{json, Value};
 
 use crate::core::events::{build_tool_namespace_map, emit_sse_event as emit_event};
 use crate::responses::global_response_session_cache;
-use crate::responses::request::tools::APPLY_PATCH_TOOL_NAME;
+use crate::responses::request::tools::{APPLY_PATCH_TOOL_NAME, TOOL_SEARCH_TOOL_NAME};
 use crate::types::{ByteStream, ResponseSessionPlan};
 
 use super::grounding::convert_grounding_metadata_to_annotations;
@@ -154,6 +154,12 @@ struct ClosedFunctionCall {
     /// emit `status="incomplete"`,让严格读 envelope 终态的客户端不把畸形 patch 当完整
     /// 执行(破坏性半应用防护,对齐 #322)。仅 apply_patch 分支可能置 true。
     apply_patch_incomplete: bool,
+    /// [MOC-217] `Some(args)` 当 name==tool_search:envelope output[] + 流式 wire 都
+    /// emit 成 `tool_search_call`(`arguments` 是 JSON object、`execution:"client"`),而非
+    /// function_call —— Codex router 对 tool_search 期待 `ToolPayload::ToolSearch`,收
+    /// Function payload 不识别为 builtin(同 apply_patch 收 Function 会 abort 的机制)。
+    /// 值是 functionCall.args(确保 object;非 object 包成 `{"raw":...}`)。
+    tool_search_arguments: Option<Value>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -553,6 +559,35 @@ impl GeminiToResponsesConverter {
                         "type": "function",
                         "function": {
                             "name": name,
+                            "arguments": arguments,
+                        }
+                    }));
+                }
+                // [MOC-217] tool_search_call 的 envelope item(`arguments`=object、
+                // execution=client)。session 历史用 chat-format,必须重建成 function-type
+                // tool_call(name=tool_search,arguments=stringify(object)) —— 跟请求侧
+                // `responses/request.rs:652` 的 tool_search_call 回放形态一致。否则下一轮
+                // previous_response_id 续话时 assistant 历史缺这条 tool_search call,新进来的
+                // tool_search_output(role:tool)无匹配 functionCall → Gemini BadRequest / 断多轮。
+                Some("tool_search_call") => {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    // envelope arguments 是 JSON object;chat function.arguments 要 string。
+                    let arguments = match item.get("arguments") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(other) => {
+                            serde_json::to_string(other).unwrap_or_else(|_| "{}".to_owned())
+                        }
+                        None => "{}".to_owned(),
+                    };
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
                             "arguments": arguments,
                         }
                     }));
@@ -982,24 +1017,38 @@ impl GeminiToResponsesConverter {
             // [MOC-75] apply_patch 的 envelope item 也必须是 custom_tool_call(input=
             // patch),跟流式 wire 一致 —— 否则严格客户端读 envelope 终态会当成
             // function_call → Codex router abort。其余工具仍走 function_call。
-            let mut item = match &fc.apply_patch_input {
-                Some(input) => json!({
-                    "type": "custom_tool_call",
+            // [MOC-217] tool_search 的 envelope 终态也必须是 tool_search_call(跟流式 wire
+            // 一致),否则严格读 envelope output[] 的客户端把它当 function_call → Codex router
+            // 不识别为 builtin。优先于 apply_patch / function 判定。
+            let mut item = if let Some(args) = &fc.tool_search_arguments {
+                json!({
+                    "type": "tool_search_call",
                     "id": fc.item_id.clone(),
                     "call_id": fc.call_id.clone(),
-                    "name": fc.name.clone(),
-                    "input": input,
-                    // [MOC-75] 畸形 patch envelope 终态也 incomplete(对齐流式 + 破坏性防护)
-                    "status": if fc.apply_patch_incomplete { "incomplete" } else { "completed" },
-                }),
-                None => json!({
-                    "type": "function_call",
-                    "id": fc.item_id.clone(),
-                    "call_id": fc.call_id.clone(),
-                    "name": fc.name.clone(),
-                    "arguments": fc.arguments_json_str.clone(),
+                    "execution": "client",
+                    "arguments": args,
                     "status": "completed",
-                }),
+                })
+            } else {
+                match &fc.apply_patch_input {
+                    Some(input) => json!({
+                        "type": "custom_tool_call",
+                        "id": fc.item_id.clone(),
+                        "call_id": fc.call_id.clone(),
+                        "name": fc.name.clone(),
+                        "input": input,
+                        // [MOC-75] 畸形 patch envelope 终态也 incomplete(对齐流式 + 破坏性防护)
+                        "status": if fc.apply_patch_incomplete { "incomplete" } else { "completed" },
+                    }),
+                    None => json!({
+                        "type": "function_call",
+                        "id": fc.item_id.clone(),
+                        "call_id": fc.call_id.clone(),
+                        "name": fc.name.clone(),
+                        "arguments": fc.arguments_json_str.clone(),
+                        "status": "completed",
+                    }),
+                }
             };
             // namespace 字段(Codex.app dispatch MCP server 必填;apply_patch 无 namespace)
             if let Some(ns) = fc.namespace.as_ref() {
@@ -1616,6 +1665,88 @@ impl GeminiToResponsesConverter {
                 namespace: None,
                 apply_patch_input: Some(input),
                 apply_patch_incomplete: incomplete,
+                tool_search_arguments: None,
+            });
+            return;
+        }
+
+        // [MOC-217] tool_search:Codex 0.130+ builtin,把所有 MCP 工具(含 cat-webfetch)
+        // defer。请求侧已把 `type:"tool_search"` 降级成 function(responses_tools_to_chat_tools
+        // 的 tool_search 分支),Gemini 回来的 functionCall.name=="tool_search"。这里重打包成
+        // Responses `tool_search_call` wire(`arguments` 是 JSON **object** 不是 string;
+        // `execution:"client"`),否则 Codex router 收 function_call(name=tool_search)不识别为
+        // builtin → 无法本地 BM25 dispatch 发现工具。对齐 chat 路径 `responses/converter.rs`
+        // is_tool_search 分支 + 本文件 apply_patch 同款重打包(wire schema 实证:
+        // `protocol/src/models.rs:2674-2715`)。Gemini 一次性给完整 args,无流式截断,故不走
+        // apply_patch 那套 incomplete 防护。
+        if name == TOOL_SEARCH_TOOL_NAME {
+            // Gemini functionCall.args 已是结构化 Value;Codex `ToolSearchCall.arguments` 要
+            // object(`router.rs` 用 serde_json::from_value::<SearchToolCallParams>)。非 object
+            // (模型 misbehave)包成 {"raw":<stringified>} 让 Codex 端可 surface 而非静默丢 query。
+            let arguments_value = if args.is_object() {
+                args.clone()
+            } else {
+                // 模型 misbehave(args 非 object):包 {raw} 兜底,query 不丢(Codex 端会 reject
+                // 但能 surface)。带 warn 对齐 chat 路径 `converter.rs` 同款兜底 + 本仓"fallback
+                // 必带 warn"约定,避免这层静默(否则只能从 Codex 端 reject 反推,定位成本高)。
+                tracing::warn!(
+                    target: "adapters::tool_search",
+                    call_id = %call_id,
+                    "gemini tool_search args 非 object;emit {{raw:...}} fallback(Codex 会 reject,但日志保留模型意图)",
+                );
+                json!({ "raw": args_json_str })
+            };
+            // open:in_progress + 空 arguments;close:completed + 完整 arguments。BM25 query 短,
+            // 不流式增量(对齐 chat 路径 converter.rs tool_search 分支)。
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "tool_search_call",
+                        "id": item_id.clone(),
+                        "call_id": call_id.clone(),
+                        "execution": "client",
+                        "arguments": {},
+                        "status": "in_progress",
+                    },
+                }),
+            );
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "tool_search_call",
+                        "id": item_id.clone(),
+                        "call_id": call_id.clone(),
+                        "execution": "client",
+                        "arguments": arguments_value.clone(),
+                        "status": "completed",
+                    },
+                }),
+            );
+            // 不写 global_tool_call_cache:tool_search 的多轮历史(tool_search_call /
+            // tool_search_output)由共享 chat 转换器重建(`responses/request.rs:652/695`),
+            // **不**经 gemini 的 function_call_output cache 反查路径(`request.rs` 仅
+            // function_call_output 查 cache)→ 此处写入无 consumer。对齐 chat 路径
+            // (`converter.rs` tool_search 同样不写 cache),省一次冗余 disk write。
+            self.closed_function_calls.push(ClosedFunctionCall {
+                item_id,
+                output_index,
+                call_id,
+                name: name.to_owned(),
+                arguments_json_str: args_json_str,
+                namespace: None,
+                apply_patch_input: None,
+                apply_patch_incomplete: false,
+                tool_search_arguments: Some(arguments_value),
             });
             return;
         }
@@ -1704,6 +1835,7 @@ impl GeminiToResponsesConverter {
             namespace: namespace_for,
             apply_patch_input: None,
             apply_patch_incomplete: false,
+            tool_search_arguments: None,
         });
     }
 
@@ -2257,6 +2389,97 @@ mod tests {
         let args: Value = serde_json::from_str(args_str).unwrap();
         assert_eq!(args["q"], "weather");
         assert!(fc["call_id"].as_str().unwrap().starts_with("call_"));
+    }
+
+    // [MOC-217] tool_search 必须重打包成 tool_search_call wire(arguments=object、
+    // execution=client),否则 Codex router 收 function_call(name=tool_search)不识别为
+    // builtin → 无法本地 BM25 dispatch 发现 cat-webfetch 等 defer 的 MCP 工具。
+    #[test]
+    fn tool_search_function_call_rewritten_to_tool_search_call_wire() {
+        let chunk = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{"query":"web fetch"}}}]},"finishReason":"STOP"}]}
+
+"#;
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let events = drive_to_events(&mut conv, &[chunk]);
+        // 流式 output_item.added / done 必须是 tool_search_call type(不是 function_call)
+        let added = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, p)| {
+                n == "response.output_item.added" && p["item"]["type"] == "tool_search_call"
+            })
+            .expect("output_item.added 必须含 tool_search_call");
+        assert_eq!(added.1["item"]["execution"], "client");
+        let done = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, p)| {
+                n == "response.output_item.done" && p["item"]["type"] == "tool_search_call"
+            })
+            .expect("output_item.done 必须含 tool_search_call");
+        assert_eq!(
+            done.1["item"]["arguments"]["query"], "web fetch",
+            "arguments 必须是 JSON object 且含 query(不是 stringify)"
+        );
+        assert_eq!(done.1["item"]["status"], "completed");
+        // 普通 function 的 arguments delta/done 不应出现(走 tool_search 专用序列)
+        let names: Vec<String> = events.iter().map(|e| parse_event(e).0).collect();
+        assert!(
+            !names.contains(&"response.function_call_arguments.delta".into()),
+            "tool_search 不走 function_call_arguments 流式"
+        );
+        // envelope output[] 终态也必须是 tool_search_call
+        let completed = events
+            .iter()
+            .map(|e| parse_event(e))
+            .find(|(n, _)| n == "response.completed")
+            .expect("response.completed 应存在");
+        let out = &completed.1["response"]["output"];
+        let ts = out
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "tool_search_call")
+            .expect("envelope output 必须含 tool_search_call(不是 function_call)");
+        assert_eq!(ts["arguments"]["query"], "web fetch");
+        assert_eq!(ts["execution"], "client");
+    }
+
+    // [MOC-217] session 历史(下一轮 previous_response_id 续话)必须把 tool_search_call
+    // envelope item 重建成 chat-format function tool_call(name=tool_search),否则历史缺这条
+    // call,新进来的 tool_search_output(role:tool)无匹配 → Gemini BadRequest / 断多轮。
+    #[tokio::test]
+    async fn tool_search_call_rebuilt_into_session_assistant_message() {
+        let response_id = format!("resp_gn_ts_{}", synthesize_id());
+        let session = ResponseSessionPlan {
+            response_id: response_id.clone(),
+            messages: vec![json!({"role":"user","content":"fetch a url"})],
+        };
+        let raw = br#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{"query":"web fetch"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}
+
+"#;
+        let mut converted =
+            convert_gemini_to_responses_stream(input_stream(raw), None, Some(session));
+        while let Some(chunk) = converted.next().await {
+            let _ = chunk.expect("stream chunk should be valid");
+        }
+        let saved = global_response_session_cache()
+            .get(&response_id)
+            .expect("session 必须保存");
+        let assistant = saved
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "assistant")
+            .expect("应有 assistant message");
+        let tc = &assistant["tool_calls"][0];
+        assert_eq!(
+            tc["function"]["name"], "tool_search",
+            "tool_search_call 必须重建成 name=tool_search 的 function tool_call"
+        );
+        // arguments 是 stringify 的 object(chat function.arguments 要 string)
+        let args_str = tc["function"]["arguments"].as_str().unwrap();
+        let args: Value = serde_json::from_str(args_str).unwrap();
+        assert_eq!(args["query"], "web fetch");
     }
 
     // [MOC-75] apply_patch 必须重打包成 custom_tool_call wire(Codex CLI router

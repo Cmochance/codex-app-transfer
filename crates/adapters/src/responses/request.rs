@@ -912,7 +912,10 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
 /// 收集 Codex 发现的工具(namespace/function 结构)。Codex 0.130+ 把 MCP 工具
 /// defer 到 tool_search,发现的工具只出现在 tool_search_output.tools,**不在**
 /// body.tools[];不注入 chat tools[] 则 LLM 永远看不到 → 无法调用。
-fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
+///
+/// `pub(crate)`:gemini_native 请求侧复用同一发现逻辑(MOC-217),避免 gemini
+/// 重写一套 namespace 提取后漂移。参数是整个 body(内部取 `.input`)。
+pub(crate) fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
     let Some(items) = input.get("input").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -943,7 +946,9 @@ fn discovered_tools_from_tool_search_output(input: &Value) -> Vec<Value> {
 
 /// 按 `function.name` 去重 chat tools(保留首次出现 — body.tools[] builtin 在
 /// 发现工具之前 extend,故 builtin 优先)。空 name 不参与去重(全保留)。
-fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
+///
+/// `pub(crate)`:gemini_native 请求侧注入 discovered tools 后同样需去重(MOC-217)。
+pub(crate) fn dedup_chat_tools_by_name(tools: &mut Vec<Value>) {
     let mut seen = std::collections::HashSet::new();
     tools.retain(|t| {
         let name = t
