@@ -891,7 +891,7 @@ impl GeminiToResponsesConverter {
     /// 客户端能正确识别 + 显示。`type` 字段额外塞 upstream HTTP status 方便诊断。
     ///
     /// **`codex_code` 必须是 Codex 客户端 `response.failed` handler 认识的 retry-control
-    /// code**(见 [`codex_retry_code`] 的文档):Codex 只按 `error.code` 字符串决定是否
+    /// code**(见 [`crate::codex_retry_code`] 的文档):Codex 只按 `error.code` 字符串决定是否
     /// 重试,不认识的 code 一律落 `Retryable` → `CodexErr::Stream`(`is_retryable()=true`)
     /// → 卡死重发到 max_retries(MOC-79 实证)。`upstream_kind` 是我们内部的语义分类
     /// (`bad_request` / `auth_error` / …),作为 `error.upstream_error_kind` 诊断字段保留
@@ -1792,20 +1792,9 @@ impl GeminiToResponsesConverter {
 // ByteStream wrapper
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 上游错误 body 最大读取字节数。Gemini error 通常 <1KB;CDN HTML 错误页 / proxy
-/// 异常体可能数 MB。无 cap → 失败请求并发时内存放大攻击面。截断后剩余 bytes 直接 drop
-/// (上游已经表态错误,我们不需要 forward 完整 body,只需要 error message 给用户)。
-const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
-
 /// 用户可见 error message 截断阈值。Responses error envelope 无文档化硬上限,选 2000
 /// 给操作者足够诊断信息(stack trace / quota detail)又不至于撑爆 SSE event。
 const MAX_USER_ERROR_MESSAGE_CHARS: usize = 2000;
-
-/// 薄封装:`crate::codex_retry_code`(共享于 adapters crate lib.rs)。
-/// 完整文档 + 维护见 [`crate::codex_retry_code`]。
-fn codex_retry_code(upstream_kind: &str) -> &str {
-    crate::codex_retry_code(upstream_kind)
-}
 
 /// 上游 4xx/5xx 错误 → Responses SSE failure 流。
 ///
@@ -1815,12 +1804,12 @@ fn codex_retry_code(upstream_kind: &str) -> &str {
 /// 含 error code + message。客户端能识别 + 显示用户级错误。
 ///
 /// 错误分类(status code + Gemini `error.status` + message 关键词)→ 语义 kind,
-/// 再经 [`codex_retry_code`] 映射成 Codex 认识的 `error.code`(控制是否重试):
+/// 再经 [`crate::codex_retry_code`] 映射成 Codex 认识的 `error.code`(控制是否重试):
 /// - 401 / UNAUTHENTICATED → `auth_error` → `invalid_prompt`(永久,surface)
 /// - 403 / PERMISSION_DENIED → `permission_denied` → `invalid_prompt`(永久,surface)
 /// - 408 / 504 → `timeout` → 保留(瞬时,Codex 重试)
 /// - 429 + RESOURCE_EXHAUSTED → `quota_exceeded` → 保留(瞬时:Gemini 429 混 per-minute
-///   限流与日级配额,无法可靠区分 → 走 Codex 重试,见 [`codex_retry_code`])
+///   限流与日级配额,无法可靠区分 → 走 Codex 重试,见 [`crate::codex_retry_code`])
 /// - 429 其他 → `rate_limited` → 保留(瞬时,指数退避 retry)
 /// - 400 + SAFETY/blockReason → `content_filter` → `invalid_prompt`(永久,surface)
 /// - 400 其他 → `bad_request` → `invalid_prompt`(永久,surface;**MOC-79 卡死点**)
@@ -1828,18 +1817,18 @@ fn codex_retry_code(upstream_kind: &str) -> &str {
 /// - 502 / 5xx 其他 → `server_error` → 保留(瞬时,Codex 重试)
 /// - 其他 → `upstream_error` → 保留(瞬时)
 ///
-/// 防御性失败处理(本身**不能**埋新 silent failure):
+/// 防御性失败处理(本身**不能**埋新 silent failure;body 收集骨架复用
+/// [`crate::core::failure_stream::collect_upstream_error_body`],MOC-118):
 /// - upstream ByteStream Err mid-read → 把 transport error 拼进用户 message,降级
 ///   `code = "upstream_transport_error"`(operator log 也会记)
-/// - body 超过 [`MAX_UPSTREAM_ERROR_BODY_BYTES`] → 截断,在 message 后缀标 `…(truncated)`
-/// - body 非 UTF-8 → `from_utf8_lossy` 替换,在 message 后缀标 `(non-UTF-8 body)`
+/// - body 超 cap → 截断,在 message 后缀标 `[body truncated]`
+/// - body 非 UTF-8 → `from_utf8_lossy` 替换,在 message 后缀标 `[non-UTF-8 body]`
 /// - 任何分支都**保证** emit `response.failed`,客户端永远不会卡住
 pub fn convert_gemini_error_to_responses_failure_stream(
     upstream_status: http::StatusCode,
     upstream_stream: ByteStream,
     original_request: Option<Value>,
 ) -> ByteStream {
-    use futures_util::stream::StreamExt;
     let status_u16 = upstream_status.as_u16();
     let s: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = Box::pin(
         stream::unfold(
@@ -1849,33 +1838,16 @@ pub fn convert_gemini_error_to_responses_failure_stream(
                     return None;
                 }
                 // 收上游 error body, cap 防 DoS, 记录 transport err 防 silent swallow
-                let mut body = Vec::with_capacity(1024);
-                let mut transport_err: Option<String> = None;
-                let mut truncated = false;
-                while let Some(chunk) = input.next().await {
-                    match chunk {
-                        Ok(b) => {
-                            let remaining =
-                                MAX_UPSTREAM_ERROR_BODY_BYTES.saturating_sub(body.len());
-                            if remaining == 0 {
-                                truncated = true;
-                                break;
-                            }
-                            let take = b.len().min(remaining);
-                            body.extend_from_slice(&b[..take]);
-                            if take < b.len() {
-                                truncated = true;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            transport_err = Some(e.to_string());
-                            break;
-                        }
-                    }
-                }
-                let was_lossy = std::str::from_utf8(&body).is_err();
-                let raw_text = String::from_utf8_lossy(&body).into_owned();
+                // (骨架共享见 core;truncated/lossy 后缀按 gemini 自己的格式拼)
+                let collected = crate::core::failure_stream::collect_upstream_error_body(
+                    &mut input,
+                    crate::core::failure_stream::MAX_UPSTREAM_ERROR_BODY_BYTES,
+                )
+                .await;
+                let transport_err = collected.transport_err;
+                let truncated = collected.truncated;
+                let was_lossy = collected.lossy;
+                let raw_text = collected.text;
                 let parsed: Option<Value> = serde_json::from_str(&raw_text).ok();
 
                 // 提 Gemini error.message,支持 object {"error":{...}} 与 array [{"error":{...}}] 两种 shape
@@ -2034,7 +2006,7 @@ pub fn convert_gemini_error_to_responses_failure_stream(
 
                 let mut conv = GeminiToResponsesConverter::new(orig, None);
                 // `code` 是内部语义分类;真正写进 envelope.error.code 的是 Codex 认识的
-                // retry-control code(见 codex_retry_code)。语义 kind 保留在 upstream_error_kind。
+                // retry-control code(见 crate::codex_retry_code)。语义 kind 保留在 upstream_error_kind。
                 let out = conv.emit_failure(
                     crate::codex_retry_code(code),
                     code,
@@ -2907,24 +2879,27 @@ mod tests {
     #[test]
     fn codex_retry_code_maps_permanent_to_whitelist_keeps_transient() {
         // 永久错误 → Codex 白名单(非重试):用户看到错误能换模型
-        assert_eq!(codex_retry_code("bad_request"), "invalid_prompt");
-        assert_eq!(codex_retry_code("content_filter"), "invalid_prompt");
-        assert_eq!(codex_retry_code("auth_error"), "invalid_prompt");
-        assert_eq!(codex_retry_code("permission_denied"), "invalid_prompt");
+        assert_eq!(crate::codex_retry_code("bad_request"), "invalid_prompt");
+        assert_eq!(crate::codex_retry_code("content_filter"), "invalid_prompt");
+        assert_eq!(crate::codex_retry_code("auth_error"), "invalid_prompt");
+        assert_eq!(
+            crate::codex_retry_code("permission_denied"),
+            "invalid_prompt"
+        );
         // 其余一律保留原 code → Codex Retryable(该重试 / 拿不准别误杀,别动)
         // quota_exceeded:Gemini 429 混 per-minute 限流,不映射非重试 insufficient_quota
-        assert_eq!(codex_retry_code("quota_exceeded"), "quota_exceeded");
+        assert_eq!(crate::codex_retry_code("quota_exceeded"), "quota_exceeded");
         // service_unavailable:瞬时过载,不映射非重试 server_is_overloaded
         assert_eq!(
-            codex_retry_code("service_unavailable"),
+            crate::codex_retry_code("service_unavailable"),
             "service_unavailable"
         );
-        assert_eq!(codex_retry_code("timeout"), "timeout");
-        assert_eq!(codex_retry_code("rate_limited"), "rate_limited");
-        assert_eq!(codex_retry_code("server_error"), "server_error");
-        assert_eq!(codex_retry_code("upstream_error"), "upstream_error");
+        assert_eq!(crate::codex_retry_code("timeout"), "timeout");
+        assert_eq!(crate::codex_retry_code("rate_limited"), "rate_limited");
+        assert_eq!(crate::codex_retry_code("server_error"), "server_error");
+        assert_eq!(crate::codex_retry_code("upstream_error"), "upstream_error");
         assert_eq!(
-            codex_retry_code("upstream_transport_error"),
+            crate::codex_retry_code("upstream_transport_error"),
             "upstream_transport_error"
         );
     }
@@ -2942,7 +2917,7 @@ mod tests {
     fn failure_stream_503_service_unavailable_distinct_from_500() {
         let s = drive_failure_stream(503, r#"{"error":{"message":"overloaded"}}"#);
         // 503 是瞬时 → 保留 service_unavailable(落 Codex Retryable,该重试);
-        // **不**映射 server_is_overloaded(那会变 is_retryable=false 立即断,见 codex_retry_code)
+        // **不**映射 server_is_overloaded(那会变 is_retryable=false 立即断,见 crate::codex_retry_code)
         assert!(s.contains("\"code\":\"service_unavailable\""));
         assert!(!s.contains("\"code\":\"server_is_overloaded\""));
         assert!(s.contains("\"upstream_error_kind\":\"service_unavailable\""));
