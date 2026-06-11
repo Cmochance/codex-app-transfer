@@ -699,17 +699,39 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let mut parameters = obj
-                    .get("parameters")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type":"object","properties":{},"required":[]}));
-                // tool_search 也合成 chat function;parameters 若 all-optional/缺 required,
-                // 严格中转网关会 400(对齐 chat 路径同款补全)。先确保顶层 type:object 再补 required。
-                if let Some(po) = parameters.as_object_mut() {
-                    po.entry("type")
-                        .or_insert_with(|| Value::String("object".into()));
+                // **Gemini-specific(与 chat 路径有意分歧)**:Codex 真机的 `tool_search` 工具
+                // **省略 `parameters`**(trace 实证:只有 type/execution/description)。chat 路径
+                // fallback 空 object schema 仍 work —— chat 模型能从 description 推断要传 BM25
+                // `query`;但 **Gemini 严格按 schema**,空 properties = "无可调用参数" → 模型返
+                // `{}` 而非 query → 响应侧转成空 `tool_search_call` → Codex BM25 拿空 query →
+                // 发现不了任何 defer 的 MCP 工具(cat-webfetch 等)→ 死循环,正是本 PR 要修的
+                // 问题(chatgpt-codex-connector review 实证)。故当 Codex 未给含 `query` 的
+                // schema 时,**合成显式 `{query:string, required:[query]}`**(Codex tool_search
+                // 期望 `SearchToolCallParams{query}`,见 converter.rs::normalize_tool_search_arguments)。
+                let mut parameters = obj.get("parameters").cloned().unwrap_or(Value::Null);
+                let has_query_prop = parameters
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .is_some_and(|p| p.contains_key("query"));
+                if has_query_prop {
+                    // Codex 显式给了含 query 的 schema → 透传 + 补 required(对齐 chat 路径)。
+                    if let Some(po) = parameters.as_object_mut() {
+                        po.entry("type")
+                            .or_insert_with(|| Value::String("object".into()));
+                    }
+                    crate::core::schema::ensure_object_schema_required(&mut parameters);
+                } else {
+                    parameters = json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query used to discover relevant tools via BM25 over deferred MCP tool metadata."
+                            }
+                        },
+                        "required": ["query"]
+                    });
                 }
-                crate::core::schema::ensure_object_schema_required(&mut parameters);
                 let mut func = Map::new();
                 func.insert("name".into(), Value::String("tool_search".into()));
                 func.insert("description".into(), Value::String(description.to_owned()));
@@ -3221,6 +3243,35 @@ mod tests {
         assert!(
             names.contains(&"exec_command".to_owned()),
             "普通 function 也保留;实际:{names:?}"
+        );
+        // [MOC-217] Codex 真机省略 tool_search.parameters(本 case 也是)。Gemini 严格按 schema,
+        // 空 properties 会让模型返 {} 而非 BM25 query → 发现不了工具 → 死循环。必须合成显式
+        // `query` schema(chatgpt-codex-connector review 实证)。
+        let ts_params = req
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.function_declarations.as_ref())
+            .flatten()
+            .find(|d| d.name == "tool_search")
+            .and_then(|d| d.parameters.as_ref())
+            .expect("tool_search functionDeclaration 必须有 parameters");
+        let props = ts_params
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("tool_search parameters 必须有 properties");
+        assert!(
+            props.contains_key("query"),
+            "缺 parameters 时必须合成 query property(否则 Gemini 返空 query → 死循环);实际:{ts_params}"
+        );
+        let required = ts_params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("tool_search parameters 必须有 required");
+        assert!(
+            required.iter().any(|r| r == "query"),
+            "query 必须 required;实际:{ts_params}"
         );
     }
 
