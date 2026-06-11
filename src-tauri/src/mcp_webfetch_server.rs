@@ -277,6 +277,17 @@ fn dispatch_line(
 
 /// 处理 `tools/call`。owned 参数, 避免跨 await 借用 req。
 /// 按 tool name 分派 `tools/call`(owned 参数避免跨 await 借用 req)。新增工具在此加分支。
+/// 宽容解析数值工具参数:接受 JSON number、浮点(2.0→2)、数字字符串("2")。模型(尤其 MiMo)
+/// 常把整数序列化进 tool_call arguments 时用字符串("2"),只认 `as_u64()` 会漏 → 静默退默认值。
+/// MOC-215 实证:web_search_more 的 `page="2"` 字符串被漏解析, page 退 1 → 翻页永远返第 1 页。
+fn arg_usize(args: &Value, key: &str) -> Option<usize> {
+    let v = args.get(key)?;
+    v.as_u64()
+        .map(|n| n as usize)
+        .or_else(|| v.as_f64().map(|f| f as usize))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<usize>().ok()))
+}
+
 async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
     match name {
         "web_fetch" => {
@@ -310,10 +321,7 @@ async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
                 .get("query")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string());
-            let max = args
-                .get("max_results")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
+            let max = arg_usize(&args, "max_results");
             // web_search 固定第 1 页;翻页走独立 web_search_more 工具(MOC-215)。
             handle_web_search_call(id, query, max, Some(1)).await
         }
@@ -322,15 +330,10 @@ async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
                 .get("query")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string());
-            let max = args
-                .get("max_results")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            // page 必填(tool def required, ≥2);缺失/非法时 handle 内 unwrap_or(1) 兜底。
-            let page = args
-                .get("page")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
+            let max = arg_usize(&args, "max_results");
+            // page 必填(tool def required, ≥2);缺失/非法时 handle 内 unwrap_or(1) 兜底。arg_usize
+            // 宽容解析:模型常把 page 传成字符串 "2"(MiMo 实测), 只认 as_u64 会漏 → 退第 1 页(MOC-215)。
+            let page = arg_usize(&args, "page");
             handle_web_search_call(id, query, max, page).await
         }
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
@@ -2004,6 +2007,17 @@ mod tests {
         assert!(out.contains("https://e.com"));
         assert!(out.contains("web_fetch")); // 带两段式用法提示
         assert!(out.contains("web_search_more")); // 尾部翻页诱导(MOC-215)
+    }
+
+    #[test]
+    fn arg_usize_lenient_parses_string_and_number() {
+        let args = json!({"a": 2, "b": "3", "c": 2.0, "d": " 5 ", "e": "x"});
+        assert_eq!(arg_usize(&args, "a"), Some(2)); // JSON number
+        assert_eq!(arg_usize(&args, "b"), Some(3)); // 数字字符串(MiMo 实测 page="2")
+        assert_eq!(arg_usize(&args, "c"), Some(2)); // 浮点 2.0
+        assert_eq!(arg_usize(&args, "d"), Some(5)); // 带空格字符串
+        assert_eq!(arg_usize(&args, "e"), None); // 非数字字符串
+        assert_eq!(arg_usize(&args, "missing"), None);
     }
 
     #[test]
