@@ -28,9 +28,11 @@
 //!   conversation 的 call_id 仍能反查到 name,会话不丢失(user 反馈核心需求)
 //!
 //! 同步写策略:每次 `save()` 后**同步原子写**(temp + rename)。Cache size
-//! 上限 1000 entries,每条 ~200 bytes,JSON 总 ~200KB,sync write 延迟 ms 级
-//! 可接受(tool call 频率本来就不高)。Best-effort:写盘失败只 warn,
-//! in-memory cache 不受影响。
+//! 上限 1000 entries;无签名 entry ~200 bytes,gemini 带 `thought_signature`
+//! 的 entry 可达数 KB(签名是 protobuf base64,MOC-218 起入 cache),极限
+//! JSON 总量数 MB 量级,sync write 延迟仍 ms 级可接受(tool call 频率本来
+//! 就不高,SSD 顺序写)。Best-effort:写盘失败只 warn,in-memory cache
+//! 不受影响。
 //!
 //! ## ⚠️ Single-writer semantics
 //!
@@ -53,6 +55,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct ToolCallEntry {
     pub name: String,
     pub arguments: String,
+    /// Gemini 3 `thoughtSignature`(MOC-218):签名**不再编码进 call_id**
+    /// (旧 `call_X~~sig~~Y` 内联格式会把 call_id 撑到数 KB,会话切真 GPT 时
+    /// 被 OpenAI Responses 后端的 64 字符上限 400 拒),改存本地、由
+    /// `gemini_native::request::decode_tool_call_id_signature` 反查注入。
+    /// cache miss(TTL 1h 过期 / LRU 顶出 / 换机)→ 裸发不回传签名,上游
+    /// 实测完全容忍(flash + pro 两档 200,见 MOC-218 容忍度测试)。
+    /// 仅 gemini 系写非 None;chat / anthropic 路径无此概念,恒 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +197,10 @@ impl ToolCallCache {
             .unwrap_or(false);
         if expired {
             inner.entries.remove(call_id);
+            // 丢失事件锚点(MOC-218 review):entry 带 thoughtSignature 时,过期
+            // 意味着该调用后续轮签名只能裸发(上游容忍,仅损推理连续性)。
+            // debug 级一次性记录,排查「thinking 质量变差」类反馈用。
+            tracing::debug!(call_id, "tool call cache: entry TTL 过期移除");
             return None;
         }
         let entry = inner.entries.get_mut(call_id)?;
@@ -223,6 +238,9 @@ impl ToolCallCache {
             return;
         };
         inner.entries.remove(&oldest_key);
+        // 丢失事件锚点(MOC-218 review,同 get 过期分支):LRU 顶出后该 call_id
+        // 的 name/签名反查均 miss,走 orphan repair / 裸发降级。
+        tracing::debug!(call_id = %oldest_key, "tool call cache: 容量满,LRU 顶出最旧 entry");
     }
 
     fn load_from_disk(
@@ -348,6 +366,7 @@ mod tests {
             ToolCallEntry {
                 name: "search".into(),
                 arguments: r#"{"q":"foo"}"#.into(),
+                thought_signature: None,
             },
         );
         let entry = cache.get("call_a").expect("cache should hit");
@@ -363,6 +382,7 @@ mod tests {
             ToolCallEntry {
                 name: "noop".into(),
                 arguments: String::new(),
+                thought_signature: None,
             },
         );
         assert!(cache.get("").is_none());
@@ -376,6 +396,7 @@ mod tests {
             ToolCallEntry {
                 name: "a".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
         );
         cache.save(
@@ -383,6 +404,7 @@ mod tests {
             ToolCallEntry {
                 name: "b".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
         );
         // 给 call_2 提访问计数
@@ -393,6 +415,7 @@ mod tests {
             ToolCallEntry {
                 name: "c".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
         );
         assert!(cache.get("call_1").is_none());
@@ -408,6 +431,7 @@ mod tests {
             ToolCallEntry {
                 name: "search".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -426,6 +450,7 @@ mod tests {
             ToolCallEntry {
                 name: "notion_search".into(),
                 arguments: r#"{"q":"开发"}"#.into(),
+                thought_signature: None,
             },
         );
         // 此时 disk 应该有文件
@@ -453,6 +478,7 @@ mod tests {
                 tool_call: ToolCallEntry {
                     name: "x".into(),
                     arguments: "{}".into(),
+                    thought_signature: None,
                 },
                 inserted_at_ms: 0,
                 access_count: 0,
@@ -482,6 +508,7 @@ mod tests {
             ToolCallEntry {
                 name: "n".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
         );
         assert!(cache.get("ok").is_some());
@@ -507,6 +534,26 @@ mod tests {
         );
     }
 
+    /// [MOC-218] 旧格式 v1 文件(entry 无 `thought_signature` 字段)必须能
+    /// 正常加载(`serde(default)` → `None`),不得被当 corrupt 清掉。
+    #[test]
+    fn legacy_v1_entry_without_signature_field_loads_as_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.json");
+        let now = now_unix_ms();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version": 1, "entries": {{"call_legacy": {{"tool_call": {{"name": "n", "arguments": "{{}}"}}, "inserted_at_ms": {now}, "access_count": 0}}}}}}"#,
+            ),
+        )
+        .unwrap();
+        let cache = ToolCallCache::with_persistence(8, Duration::from_secs(60), path);
+        let entry = cache.get("call_legacy").expect("旧格式 entry 应正常加载");
+        assert_eq!(entry.name, "n");
+        assert!(entry.thought_signature.is_none());
+    }
+
     /// `clear()` 同步删 disk 文件(idempotent — 文件不存在不报错)
     #[test]
     fn clear_removes_disk_file() {
@@ -518,6 +565,7 @@ mod tests {
             ToolCallEntry {
                 name: "n".into(),
                 arguments: "{}".into(),
+                thought_signature: None,
             },
         );
         assert!(path.exists());

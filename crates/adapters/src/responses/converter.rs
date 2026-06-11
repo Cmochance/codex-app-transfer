@@ -1157,6 +1157,7 @@ impl ChatToResponsesConverter {
             ToolCallEntry {
                 name: name.clone(),
                 arguments: args_acc.clone(),
+                thought_signature: None,
             },
         );
         if let Some(pending) = self.tool_calls.get_mut(&openai_index) {
@@ -2295,6 +2296,7 @@ fn emit_apply_patch_output(
         ToolCallEntry {
             name: name.to_owned(),
             arguments: args_acc.to_owned(),
+            thought_signature: None,
         },
     );
 }

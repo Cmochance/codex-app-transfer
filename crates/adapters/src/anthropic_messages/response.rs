@@ -848,6 +848,7 @@ impl AnthropicMessagesToResponsesConverter {
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_owned(),
+                    thought_signature: None,
                 },
             );
         }

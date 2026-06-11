@@ -3090,6 +3090,7 @@ fn orphan_tool_with_call_id_rebuilds_from_tool_call_cache() {
         super::super::tool_call_cache::ToolCallEntry {
             name: "shell".to_owned(),
             arguments: r#"{"cmd":"ls"}"#.to_owned(),
+            thought_signature: None,
         },
     );
     let mut messages = vec![json!({
@@ -3120,6 +3121,7 @@ fn orphan_tool_with_call_id_inserts_tool_call_into_existing_assistant() {
         super::super::tool_call_cache::ToolCallEntry {
             name: "search".to_owned(),
             arguments: "{}".to_owned(),
+            thought_signature: None,
         },
     );
     let mut messages = vec![
@@ -3276,6 +3278,7 @@ fn flush_uses_tool_name_from_cache_when_available() {
         super::super::tool_call_cache::ToolCallEntry {
             name: "web_search".to_owned(),
             arguments: "{}".to_owned(),
+            thought_signature: None,
         },
     );
     let mut messages = vec![
@@ -3342,6 +3345,7 @@ fn forward_and_reverse_orphans_both_get_repaired() {
         super::super::tool_call_cache::ToolCallEntry {
             name: "shell".to_owned(),
             arguments: "{}".to_owned(),
+            thought_signature: None,
         },
     );
     let mut messages = vec![

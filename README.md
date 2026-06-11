@@ -281,6 +281,10 @@ Codex 部分内置工具(如 `list_mcp_resources` / `load_workspace_dependencies
 
 在第三方模型(如 MiniMax / MiMo)起步的对话里**切换到真 GPT**(`gpt-5.5` 等)后发消息,Codex composer 内联报 `Instructions are required`、对话卡死。根因:Codex 把会话所用模型的 model catalog `base_instructions` 字段**在会话创建时冻结**(定死、跨续话不重算),transfer 历史上给 catalog 写的是空串 → 第三方起步的会话顶层 `instructions` 一直空;之后切真 GPT 直连 chatgpt.com(不经 proxy),OpenAI Responses 后端硬校验顶层 instructions 非空 → 400。**已修(MOC-153)**:transfer 给 catalog 写非空 `base_instructions`,会话出生即带、切 GPT 不再 400;该值对第三方请求由 proxy adapter 精确剥离,第三方对话行为字节级不变。
 
+### gemini/antigravity 会话切到 GPT 报 `call_id: string too long`
+
+gemini 系 provider(Gemini API key / gemini-cli OAuth / Antigravity)的对话里用过工具后**切换到真 GPT** 发消息,composer 内联报 `Invalid 'input[N].call_id': string too long ... maximum length 64`。根因:Gemini 3 的函数调用带 `thoughtSignature`(后续轮需回传),transfer 历史上把签名编码进 call_id(`call_X~~sig~~<签名>`,可达数 KB)持久化进会话历史;切真 GPT 直连 chatgpt.com(不经 proxy)时历史原样上发,OpenAI Responses 后端硬校验 `call_id` ≤ 64 字符 → 400。**已修(MOC-218)**:签名改存 transfer 本地缓存、call_id 保持短格式,新会话切 GPT 不再触发;修复前产生的旧会话历史无法清洗(同 MOC-153 的冻结语义),仍报此错的旧会话请开新会话。
+
 ### 上游 404 / 连不上(Base URL 填了完整 endpoint)
 
 provider 的 Base URL 只填到根或 `/v1`(例 `https://api.example.com/v1`),**不要**把完整 endpoint 路径整段粘进去。本工具会按协议自动补 `/chat/completions`、`/v1/messages`、`/responses` 等;若 Base URL 已含这些后缀(如把 `https://opencode.ai/zen/go/v1/chat/completions` 整段填入),会拼成 `…/chat/completions/chat/completions` 导致上游 404。删掉多余的 endpoint 后缀、只留到 `/v1` 即可。
