@@ -1,24 +1,30 @@
-//! MOC-219: preamble fallback 注入的纯函数 + 跨轮工具记忆。
+//! MOC-219: preamble fallback 注入的纯函数 + 跨轮静默轮数记忆。
 //!
 //! Codex Desktop 26.609 把完成态 reasoning 从对话流渲染中产品级移除(解包实证:
 //! exploration 组内 `Lv` 对非 exec item 返 null + 独立 entry `B=null` 双路拦截,
 //! 不分 provider、无设置可恢复),工具轮之间唯一持久可见的文本通道是 assistant
-//! message。第三方模型连续工具轮常不吐 message(MiMo 真机 trace:10 轮连续
-//! `reasoning + function_call` 零 message)→ UI 全折叠成一条 toolActivitySummary。
+//! message。第三方 chat 模型连续工具轮常不吐 message → UI 全折叠无文本。
 //!
-//! 本模块为 chat 路径 converter 提供三个纯构件:
-//! 1. [`tool_family`] — 工具名 → 折叠族。同族连续工具轮折叠(不注入、丢弃模型
-//!    偶发的碎 message),异族边界注入 reasoning 转述,UI 形态对齐 gemini 系
-//!    模型「每个工具组之间一句 preamble」的自然行为。
-//! 2. [`PreambleToolMemory`] — `response_id → 本轮工具族` 跨轮记忆。Codex 是
-//!    stateful 增量请求模式(工具轮 input 只有 `*_output`,历史靠
-//!    `previous_response_id` 链),「上一轮调了什么工具」只能靠跨轮内存,从
-//!    input 读不到(MOC-219 真机 trace 实证,PR #452 第一版因此每轮误注入)。
-//! 3. [`select_preamble_text`] — 注入文本截取:短全取,长按段落累积,上限内
-//!    char 边界截断。
+//! ## 注入节奏:轮数节流(而非工具族切换)
 //!
-//! 纯内存、不持久化:记忆丢失(重启/容量逐出)的最坏后果 = 异族判定多注入一条
-//! 思考转述,无害降级,不值得动 sessions.db schema。
+//! 第一版按「工具族切换」判定注入点,真机证伪:Codex chat 路径 wire 工具粒度是
+//! **exec_command 包打一切**(读文件 cat/sed、搜索 rg、跑命令全是同一个 name,
+//! renderer 靠解析命令内容才分出 Read/Searched/Ran),真实编码会话几乎全程同族
+//! → 永不注入;而「同族丢弃」还把模型自己稀缺的 preamble message 吃掉(真机日志
+//! dropped_chars 34-126 连续出现)。族切换信号在 Codex 场景不可用;改文件↔跑
+//! 测试交替形态下它又退化成每两轮一句(旧 PR #452-455 每轮注入被废弃的同款问题)。
+//!
+//! 改为**纯轮数节流**:跨轮记忆「自上次可见文本以来的连续静默工具轮数」,
+//! 静默满 [`INJECT_EVERY_N_ROUNDS`] 轮才注入一句 reasoning 转述;模型自己吐的
+//! message 永远原样下发(proxy 不替模型删话,工具折叠是 Codex renderer 自己的
+//! 职责)。任何会话形态下 UI 严格保持「最多每 N 个静默工具轮一句话」。
+//!
+//! Codex 是 stateful 增量请求模式(工具轮 input 只有 `*_output`,历史靠
+//! `previous_response_id` 链),静默轮数只能靠跨轮内存;stateless 客户端(完整
+//! transcript 进 input)用 [`silent_rounds_from_input_tail`] 从 input 尾部近似。
+//!
+//! 纯内存、不持久化:记忆丢失(重启/容量逐出)的最坏后果 = 当作新 task 多注入
+//! 一条思考转述,无害降级,不值得动 sessions.db schema。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -28,94 +34,34 @@ use serde_json::Value;
 /// 注入文本上限(chars)。用户拍板:短全取;长按段落累积 ≤300;单段超限截断加 `…`。
 const PREAMBLE_MAX_CHARS: usize = 300;
 
+/// 连续静默(无可见 message)工具轮满该数注入一句。3 = 在「每轮都注入太吵」
+/// (旧 PR 废弃原因)与「全程空白」之间的平衡起步值,真机体感不合适可调。
+pub const INJECT_EVERY_N_ROUNDS: u32 = 3;
+
 /// 跨轮记忆容量(响应条数)。FIFO 逐出;512 轮远超单会话工具轮跨度,
 /// 逐出只可能发生在多会话长时间并行后,且后果仅为多注入一条(无害)。
 const MEMORY_CAPACITY: usize = 512;
 
-/// 工具名 → 折叠族。同族 = 连续调用视为同一段工作、折叠不注入。
-///
-/// 归族宽松(用户拍板:`run`/`exec_command`/`shell` 一族、search 一族),但只收
-/// Codex 生态已知 name —— MCP/namespace 工具名形态自由,误归族会把异类工具错误
-/// 折叠(丢可见文本),按 name 原样自成一族最保守。
-pub fn tool_family(name: &str) -> &str {
-    match name {
-        // 首帧无 name(罕见 provider chunking):空族永不匹配 → 保守走注入分支
-        "" => "",
-        "exec_command" | "shell" | "shell_command" | "run" | "run_command" | "bash"
-        | "execute_command" => "exec",
-        "tool_search" => "tool_search",
-        // redirect 前的 legacy MCP discovery 名与 tool_search 同族(converter 在
-        // open 时已把它们 redirect 成 tool_search,这里冗余覆盖防调用方传 raw name;
-        // 共享 converter 的 const,避免两处字面量漂移)
-        n if super::converter::REDIRECT_TO_TOOL_SEARCH_NAMES.contains(&n) => "tool_search",
-        // web_search 与 web_fetch 同族:同属网络调研,Codex 自身的
-        // toolActivitySummary 折叠条也把两者混合统计
-        "web_search" | "web_fetch" => "web",
-        "apply_patch" => "apply_patch",
-        other => other,
-    }
-}
-
-/// stateless 客户端 fallback(MOC-219 review I1):无 `previous_response_id`(或
-/// recall miss)时,从请求 `input` 尾部往前扫「最近一段连续工具 item」推上一轮
-/// 工具族。stateless 形态完整 transcript 在 input 里,信息可得;stateful 增量轮
-/// input 只有 `*_output`(无 name)→ 扫不出 → None,回到「无记录 → 异族」分支,
-/// 与跨轮记忆 miss 的行为一致。任何 message(user 边界 / assistant 可见文本)
-/// 截断 —— 工具段定义是「自上次可见文本以来」。
-pub fn families_from_input_tail(input: &Value) -> Option<Vec<String>> {
-    let items = input.as_array()?;
-    let mut families: Vec<String> = Vec::new();
-    for item in items.iter().rev() {
-        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-        match item_type {
-            "function_call" | "custom_tool_call" => {
-                if let Some(name) = item.get("name").and_then(Value::as_str) {
-                    let family = tool_family(name);
-                    if !family.is_empty() && !families.iter().any(|f| f == family) {
-                        families.push(family.to_owned());
-                    }
-                }
-            }
-            // tool_search_call 结构性无 name(arguments object 形态)
-            "tool_search_call" => {
-                if !families.iter().any(|f| f == "tool_search") {
-                    families.push("tool_search".to_owned());
-                }
-            }
-            // 工具输出 / reasoning 不断段,继续往前扫
-            "function_call_output"
-            | "custom_tool_call_output"
-            | "tool_search_output"
-            | "reasoning" => {}
-            _ => break,
-        }
-    }
-    if families.is_empty() {
-        None
-    } else {
-        Some(families)
-    }
-}
-
 #[derive(Debug, Default)]
 struct MemoryInner {
-    map: HashMap<String, Vec<String>>,
+    /// response_id → 该响应结束时「自上次可见文本以来的连续静默轮数」
+    /// (0 = 该轮自身有可见 message:模型原文 flush 或注入)。
+    map: HashMap<String, u32>,
     /// FIFO 逐出顺序(插入序)。recall 不 bump —— 容量上限只为防无界增长,
     /// 不需要真 LRU 精度。
     order: VecDeque<String>,
 }
 
-/// `response_id → 本轮调用过的工具族(去重)` 的进程内记忆。
+/// `response_id → 静默轮数` 的进程内记忆。
 #[derive(Debug, Default)]
 pub struct PreambleToolMemory {
     inner: Mutex<MemoryInner>,
 }
 
 impl PreambleToolMemory {
-    /// 流结束时记忆本轮工具族。`families` 空时不记(recall None 与 Some(空) 在
-    /// 判定上等价,都走「异族」分支)。
-    pub fn remember(&self, response_id: &str, families: Vec<String>) {
-        if response_id.trim().is_empty() || families.is_empty() {
+    /// 流结束时记忆本轮结束后的静默轮数(本轮有可见 message 记 0,否则上轮 +1)。
+    pub fn remember(&self, response_id: &str, silent_rounds: u32) {
+        if response_id.trim().is_empty() {
             return;
         }
         // poisoned 不 panic 放大:记忆是无害降级数据,接着用比拒绝服务好
@@ -128,11 +74,11 @@ impl PreambleToolMemory {
                 }
             }
         }
-        inner.map.insert(response_id.to_owned(), families);
+        inner.map.insert(response_id.to_owned(), silent_rounds);
     }
 
-    /// 下一轮流内用请求的 `previous_response_id` 取回上一轮工具族。
-    pub fn recall(&self, response_id: &str) -> Option<Vec<String>> {
+    /// 下一轮流内用请求的 `previous_response_id` 取回上一轮静默轮数。
+    pub fn recall(&self, response_id: &str) -> Option<u32> {
         if response_id.trim().is_empty() {
             return None;
         }
@@ -141,13 +87,44 @@ impl PreambleToolMemory {
             .unwrap_or_else(|e| e.into_inner())
             .map
             .get(response_id)
-            .cloned()
+            .copied()
     }
 }
 
 pub fn global_preamble_tool_memory() -> &'static PreambleToolMemory {
     static MEMORY: OnceLock<PreambleToolMemory> = OnceLock::new();
     MEMORY.get_or_init(PreambleToolMemory::default)
+}
+
+/// stateless 客户端 fallback:无 `previous_response_id`(或 recall miss)时,从
+/// 请求 `input` 尾部往前数「最近一段连续工具 item」里的工具调用数,近似静默轮数
+/// (一轮多 fc 会高估 → 提前注入,无害方向)。任何 message(user 边界 /
+/// assistant 可见文本)截断 —— 静默段定义是「自上次可见文本以来」。
+///
+/// stateful 增量轮 input 只有 `*_output`(不计数)→ 返 None,回到「无记录」
+/// 分支,与跨轮记忆 miss 的行为一致。
+pub fn silent_rounds_from_input_tail(input: &Value) -> Option<u32> {
+    let items = input.as_array()?;
+    let mut rounds = 0u32;
+    for item in items.iter().rev() {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match item_type {
+            "function_call" | "custom_tool_call" | "tool_search_call" => {
+                rounds = rounds.saturating_add(1);
+            }
+            // 工具输出 / reasoning 不断段,继续往前扫
+            "function_call_output"
+            | "custom_tool_call_output"
+            | "tool_search_output"
+            | "reasoning" => {}
+            _ => break,
+        }
+    }
+    if rounds == 0 {
+        None
+    } else {
+        Some(rounds)
+    }
 }
 
 /// 从 reasoning 文本截取注入用 preamble:整体 ≤ [`PREAMBLE_MAX_CHARS`] 全取;
@@ -193,45 +170,20 @@ pub fn select_preamble_text(reasoning: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tool_family_groups_exec_aliases() {
-        assert_eq!(tool_family("exec_command"), "exec");
-        assert_eq!(tool_family("shell"), "exec");
-        assert_eq!(tool_family("run_command"), "exec");
-    }
-
-    #[test]
-    fn tool_family_groups_web_search_and_fetch() {
-        assert_eq!(tool_family("web_search"), "web");
-        assert_eq!(tool_family("web_fetch"), "web");
-    }
-
-    #[test]
-    fn tool_family_unknown_name_is_its_own_family() {
-        assert_eq!(tool_family("my_mcp_tool"), "my_mcp_tool");
-    }
-
-    #[test]
-    fn tool_family_empty_name_never_matches() {
-        assert_eq!(tool_family(""), "");
-        // 空族与任何记忆值都不相等(记忆侧 families 非空才记)
-    }
+    use serde_json::json;
 
     #[test]
     fn memory_remember_recall_roundtrip() {
         let m = PreambleToolMemory::default();
-        m.remember("resp_a", vec!["exec".into()]);
-        assert_eq!(m.recall("resp_a"), Some(vec!["exec".to_owned()]));
+        m.remember("resp_a", 2);
+        assert_eq!(m.recall("resp_a"), Some(2));
         assert_eq!(m.recall("resp_b"), None);
     }
 
     #[test]
-    fn memory_skips_empty_families_and_blank_id() {
+    fn memory_skips_blank_id() {
         let m = PreambleToolMemory::default();
-        m.remember("resp_a", vec![]);
-        m.remember("  ", vec!["exec".into()]);
-        assert_eq!(m.recall("resp_a"), None);
+        m.remember("  ", 1);
         assert_eq!(m.recall("  "), None);
     }
 
@@ -239,10 +191,42 @@ mod tests {
     fn memory_evicts_oldest_beyond_capacity() {
         let m = PreambleToolMemory::default();
         for i in 0..(MEMORY_CAPACITY + 10) {
-            m.remember(&format!("resp_{i}"), vec!["exec".into()]);
+            m.remember(&format!("resp_{i}"), 1);
         }
         assert_eq!(m.recall("resp_0"), None);
         assert!(m.recall(&format!("resp_{}", MEMORY_CAPACITY + 9)).is_some());
+    }
+
+    #[test]
+    fn silent_rounds_counts_tail_tool_calls() {
+        let input = json!([
+            {"type": "message", "role": "assistant", "content": "visible"},
+            {"type": "function_call", "name": "exec_command"},
+            {"type": "function_call_output"},
+            {"type": "reasoning", "summary": []},
+            {"type": "function_call", "name": "exec_command"},
+            {"type": "function_call_output"},
+        ]);
+        assert_eq!(silent_rounds_from_input_tail(&input), Some(2));
+    }
+
+    #[test]
+    fn silent_rounds_none_when_tail_is_message() {
+        let input = json!([
+            {"type": "function_call", "name": "exec_command"},
+            {"type": "function_call_output"},
+            {"type": "message", "role": "user", "content": "next task"},
+        ]);
+        assert_eq!(silent_rounds_from_input_tail(&input), None);
+    }
+
+    #[test]
+    fn silent_rounds_none_for_stateful_incremental_input() {
+        // stateful 增量轮:input 只有 *_output(无 name 可数)
+        let input = json!([
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        ]);
+        assert_eq!(silent_rounds_from_input_tail(&input), None);
     }
 
     #[test]
