@@ -285,6 +285,10 @@ Codex 部分内置工具(如 `list_mcp_resources` / `load_workspace_dependencies
 
 第三方会话**切换到真 GPT** 发消息,composer 内联报 `Invalid 'input[N].call_id': string too long ... maximum length 64`(gemini 系用过工具后)或 `Invalid 'input[N].content': array too long ... maximum length 0`(任何第三方有思考输出后)。根因同源:OpenAI Responses 后端对上发历史逐项校验,而切真 GPT 直连 chatgpt.com(不经 proxy)历史原样上发——transfer 历史上把 Gemini 3 `thoughtSignature` 编码进 call_id(可达数 KB,超 64 上限),且 reasoning item 带明文 `content` 数组(后端要求必须为空)。**已修(MOC-218)**:签名改存 transfer 本地缓存、call_id 保持短格式;reasoning item 不再携带 `content` / `encrypted_content` 字段(思考显示走 SSE 事件通道,不受影响)。修复前产生的旧会话历史无法清洗(同 MOC-153 的冻结语义),仍报此类错的旧会话请开新会话。
 
+### Codex 更新后第三方连续工具调用「全折叠成一团、轮间无思考文本」
+
+Codex Desktop v26.609 起不再渲染工具轮之间的 reasoning 思考块;第三方模型(MiMo 等)在连续工具循环中常省略说明文字(preamble message),于是 UI 把所有工具调用折叠成一组、中间完全没有文本。**已适配(MOC-219)**:chat 路径在「同类工具首次出现且该轮模型没说话」时,把该轮思考文本(≤300 字符)复制为一条正文消息注入,工具组之间恢复可见说明;同类工具连续调用不注入、仍自动折叠。注:这些注入文本会进入会话上下文(对模型可见),属预期行为。
+
 ### 上游 404 / 连不上(Base URL 填了完整 endpoint)
 
 provider 的 Base URL 只填到根或 `/v1`(例 `https://api.example.com/v1`),**不要**把完整 endpoint 路径整段粘进去。本工具会按协议自动补 `/chat/completions`、`/v1/messages`、`/responses` 等;若 Base URL 已含这些后缀(如把 `https://opencode.ai/zen/go/v1/chat/completions` 整段填入),会拼成 `…/chat/completions/chat/completions` 导致上游 404。删掉多余的 endpoint 后缀、只留到 `/v1` 即可。
