@@ -131,6 +131,14 @@ jobs:
         shell: bash
         run: python3 scripts/check_release_version.py "${{ steps.ver.outputs.version }}"
 
+      # MOC-66 发版门禁: release-notes/v<version>.md 必须已 commit 进仓库,
+      # 防止 notes 只注入 GitHub release body 而仓库缺文件 (MOC-65 回填 16 个
+      # + v2.2.0-v2.3.1 复发 4 个的根因)。push tag 触发时 checkout 的是 tag
+      # commit,等于强制 notes 在打 tag 前就进仓库。
+      - name: Verify release notes present
+        shell: bash
+        run: python3 scripts/check_release_notes_present.py "${{ steps.ver.outputs.version }}"
+
       - name: Import macOS signing cert
         if: startsWith(matrix.os, 'macos-') && env.CERT != ''
         uses: apple-actions/import-codesign-certs@v3
@@ -369,6 +377,14 @@ jobs:
       - name: Verify release version sources
         shell: bash
         run: python3 scripts/check_release_version.py "${{ steps.ver.outputs.version }}"
+
+      # MOC-66 发版门禁: release-notes/v<version>.md 必须已 commit 进仓库,
+      # 防止 notes 只注入 GitHub release body 而仓库缺文件 (MOC-65 回填 16 个
+      # + v2.2.0-v2.3.1 复发 4 个的根因)。push tag 触发时 checkout 的是 tag
+      # commit,等于强制 notes 在打 tag 前就进仓库。
+      - name: Verify release notes present
+        shell: bash
+        run: python3 scripts/check_release_notes_present.py "${{ steps.ver.outputs.version }}"
 
       - name: Write release signing key
         env:
