@@ -2,7 +2,7 @@
 
 逐版本要点。
 
-## Unreleased
+## v2.3.2
 
 **新增内置 preset「智谱 GLM Coding」— GLM Coding Plan 订阅套餐适配**:智谱 GLM 有两套接入方式:开放平台按量计费(现有「智谱 GLM」preset,端点 `/api/paas/v4`)和 GLM Coding Plan 订阅套餐(专属端点 `/api/coding/paas/v4`)。Coding Plan 用户此前无法使用内置 preset 接入 Codex(开放平台账户余额不足时报「余额不足」)。本次新增 preset「智谱 GLM Coding」(id `zhipu-coding`),指向 Coding Plan 专属端点;**extraHeaders 注入 `User-Agent: claude-cli/2.1.175 (external, cli)`,将 transfer 伪装成 Claude Code 以适配 Coding Plan 工具识别策略**(Coding Plan 条款授权编程工具接入,对齐 Kimi Code 使用 `KimiCLI/1.40.0` UA 的做法)。模型映射:gpt_5_5/gpt_5_4 → glm-4.7,mini/codex → glm-4.6,default → glm-4.7。原「智谱 GLM」开放平台 preset 保留不动,两者并存。/ **New built-in preset "Zhipu GLM Coding" — GLM Coding Plan subscription endpoint support**: Zhipu GLM offers two access paths: the open platform (pay-per-token, existing "Zhipu GLM" preset, endpoint `/api/paas/v4`) and the GLM Coding Plan subscription (dedicated endpoint `/api/coding/paas/v4`). Coding Plan subscribers previously had no built-in preset and could not connect Codex (open-platform accounts reported "insufficient balance"). This adds a new preset "Zhipu GLM Coding" (id `zhipu-coding`) targeting the Coding Plan endpoint; **extraHeaders inject `User-Agent: claude-cli/2.1.175 (external, cli)`, spoofing transfer as Claude Code to satisfy the Coding Plan tool-recognition policy** (Coding Plan terms authorize coding tool access; mirrors Kimi Code's use of the `KimiCLI/1.40.0` UA). Model mapping: gpt_5_5/gpt_5_4 → glm-4.7, mini/codex → glm-4.6, default → glm-4.7. The existing "Zhipu GLM" open-platform preset is unchanged; both presets coexist.
 
@@ -21,6 +21,12 @@
 **gemini/antigravity 恢复 MCP 工具暴露 (MOC-217)**:Codex 0.130+ 把所有 MCP 工具(含内置 `cat-webfetch` 的 web_fetch / web_search)defer 到 `tool_search` builtin,模型需先调 `tool_search` 做 BM25 发现工具、再调用具体工具。chat 路径早已适配,但 gemini / antigravity 路径漏接 —— `tool_search` 落 `other => warn_once_drop_tool` 被静默 drop,导致这些 provider 下**所有** MCP 工具(用户配的 server + 内置 cat-webfetch)对模型不可见、联网搜索不可用。补齐 gemini 路径全链路(对齐 chat 路径 + 已有 apply_patch 重打包模式):请求侧把 `tool_search` 降级成 functionDeclaration、并把 `tool_search_output` 里发现的工具(namespace 包)展平注入 functionDeclarations(否则模型发现工具后下一轮仍无法调用 → 死循环);响应侧把模型回的 functionCall(name=tool_search)重打包成 Responses `tool_search_call` wire(arguments=object、execution=client)+ session 历史重建,保证多轮闭环。Refs MOC-217。
 
 **多轮重复 system 块 wire 级去重 (MOC-193)**:Codex 每轮请求随历史重建附带完整 env block(~37 KB),长对话实测出现 3 份相同的 system/developer 指令块并发上游;在共享转换管道的 `session_messages` clone 之后、发上游之前增加 `dedupe_repeated_instruction_messages` pass,对整条 JSON 内容相同的 system/developer 消息去重(保留首次出现以稳定 prompt-cache prefix),实测可省数十 KB/轮;session cache 保持全量原貌。**四路径全覆盖**:chat / gemini_native / anthropic_messages 经共享管道的 wire 源(`conversion.body`)自动继承,grok_web 的 wire 源同步从 session 全量版切到去重版。Refs MOC-193。
+
+**web_search 开箱可用 + 双引擎合并 + 翻页 (MOC-215)**:`web_fetch_backend` 默认从 off 改为 auto,新用户内置联网工具(web_fetch / web_search)开箱可用(web_fetch 走 curl/wreq 不需 Chrome;web_search 仍受 chrome_ready gate 保护不静默下载)。web_search 从「DDG 失败才 Bing 兜底」改为 DDG+Bing 并行抓取 → URL 归一化去重 + 交错合并(覆盖面翻倍,耗时≈单家);新增独立 `web_search_more` 翻页工具(同 query 取下一批结果,结果尾部诱导 prompt 引导模型翻页而非重复同 query)。Refs MOC-215。
+
+**移除 web_fetch 摘要兜底 + summaryModel 配置整链 (MOC-227)**:web_fetch 自 MOC-190 起默认返回全文,`summarize=true` opt-in 摘要兜底实际几乎不会触达且依赖摘要模型配置,整链移除 —— MCP server 摘要管线(选块 / strip_think / 摘要请求)、provider `summaryModel` 配置字段与前端设置行、内置 preset 残留字段、trace viewer 摘要段渲染。旧会话模型仍传 `summarize` / `query` / `prompt` 参数时静默忽略、走默认全文路径(非破坏性);用户 config 中残留的 `summaryModel` 字段经 extra 透传,无主但无害。Refs MOC-227。
+
+**工程杂项**:release 发版门禁 —— release.yml 双 job 校验 `release-notes/vX.Y.Z.md` 必须随 tag 进仓库,缺失即 4 平台 fail(MOC-66,并回填 v2.2.0–v2.3.1 四版 notes 文件);codex 0.139 适配小修(MOC-205);集成测试 home 隔离,不再读写真机 sessions.db(MOC-195);chat/grok/gemini/compact 失败流骨架提取 core + grok dead-code 清理(MOC-118)。
 
 ## v2.3.1
 
