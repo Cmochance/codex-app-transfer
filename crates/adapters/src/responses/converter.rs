@@ -22,12 +22,23 @@
 //!         首次 reasoning_content delta:
 //!           reasoning open → reasoning.summary_text.delta*(summary 通道,旧版兼容)
 //!                          + reasoning_text.delta*(content 通道,v26.608+ 渲染)
-//!         首次 content delta:
-//!           if reasoning 还开着 → reasoning close
-//!           message open → output_text.delta*
+//!         content delta:
+//!           [preamble 缓冲窗口] 判定前(preamble_decided=false):累积到 text_acc,
+//!           不出 wire —— 等首个 tool_call 首帧或流尾决定 flush/注入。
+//!           判定后:if reasoning 还开着 → reasoning close;message open → output_text.delta*
+//!         首个 tool_call 首帧(preamble_decided=false → true):
+//!           resolve_preamble_at_first_tool:模型 message 原样 flush /
+//!           模型静默且连续静默满 N 轮(轮数节流)时注入 reasoning 转述
 //!                    │
 //!         close 阶段:open 着的 item 依次 close → response.completed
 //! ```
+//!
+//! **MOC-219 preamble fallback**:Codex 26.609 把完成态 reasoning 从渲染层移除,
+//! 工具轮间唯一可见文本通道是 assistant message。`preamble_decided` flag 控制
+//! message 缓冲窗口;`super::preamble` 模块提供跨轮静默轮数记忆 / 文本截取
+//! 纯构件(注入按轮数节流,详见该模块注释)。message 段机制(`message_segment`
+//! / `closed_message_items`)允许同轮多 message 段(注入 preamble 后上游再发
+//! content 重开新段),对齐 reasoning 的多段 item 设计(MOC-203 引入)。
 //!
 //! 设计取舍:
 //! - 状态机用同步 `feed(&[u8]) -> Vec<u8>` + `finish() -> Vec<u8>` 暴露,
@@ -202,9 +213,29 @@ pub struct ChatToResponsesConverter {
     // ── message(文本流)──
     message_id: String,
     message_open: bool,
-    message_closed: bool,
     message_index: u32,
     text_acc: String,
+    // [MOC-219] message 段机制(对齐 reasoning 段):close_message 收尾当前段
+    // 并重置状态,后续文本重开**新** item。preamble flush/注入会在 function_call
+    // 之前提前闭合 message(保 item 串行闭合,26.608 交错丢弃教训),其后上游
+    // 再发的 content(GLM/Kimi interleaved 形态)必须进新 item 而不是灌死 item。
+    message_id_base: String,
+    message_segment: u32,
+    closed_message_items: Vec<(u32, Value)>,
+    /// 已闭合各段文本拼接,供 assistant_message 历史回灌(含注入的合成 preamble
+    /// —— 与 Codex 端 rollout 一致,切真 GPT / compact 重建不丢)。
+    message_history: String,
+
+    // ── preamble fallback(MOC-219)──
+    // Codex 26.609 渲染只认 assistant message(完成态 reasoning 被产品级移除),
+    // 工具轮间无 message 则全部折叠成一条 toolActivitySummary。SSE 流序是
+    // [reasoning, message, function_call],message 先于 fc 到达,判定必须前移:
+    // message 缓冲不出 wire,首个 fc 首帧判定 —— 模型自己的 message 永远原样
+    // flush;模型静默时按轮数节流注入 reasoning 转述(连续静默满 N 轮 / 新 task
+    // 首轮才注入,跨轮静默计数按 previous_response_id recall,详见 preamble.rs
+    // 模块注释);整轮无 fc 流尾 flush。
+    /// 本响应已做过缓冲判定(首个 fc 首帧或流尾,置位后 message 路径回到直通)。
+    preamble_decided: bool,
     /// 是否在 `delta.content` 上启用 `<think>...</think>` 兜底拆分。
     /// 仅对 MiniMax 一类把 thinking 塞进 content 标签的 provider 开启;
     /// 其他 provider 默认透传,避免代码块/字面 `<think>` 被误吃。
@@ -289,10 +320,14 @@ impl ChatToResponsesConverter {
             reasoning_segment: 0,
             closed_reasoning_items: Vec::new(),
             reasoning_history: String::new(),
+            message_id_base: message_id.clone(),
             message_id,
             message_open: false,
-            message_closed: false,
             message_index: 0,
+            message_segment: 0,
+            closed_message_items: Vec::new(),
+            message_history: String::new(),
+            preamble_decided: false,
             text_acc: String::new(),
             enable_think_tag_split: false,
             think_tag_open: false,
@@ -392,7 +427,13 @@ impl ChatToResponsesConverter {
     }
 
     pub fn assistant_message(&self) -> Option<Value> {
+        // [MOC-219] `text_acc` 必须独立判:缓冲窗口内(判定前)文本只进 text_acc、
+        // message 未 open。stream.rs 的上游 Err 中断路径不走 finish() 直接保存
+        // session(#210),漏判 text_acc 会让缓冲中的纯文本轮整条 session 不存
+        // → 下一轮 previous_response_not_found 对话断裂。
         if !self.message_open
+            && self.text_acc.is_empty()
+            && self.message_history.is_empty()
             && self.tool_calls.is_empty()
             && self.reasoning_acc.is_empty()
             && self.reasoning_history.is_empty()
@@ -400,9 +441,16 @@ impl ChatToResponsesConverter {
             return None;
         }
 
+        // [MOC-219] message 段机制:历史回灌 = 已闭合段(message_history)+ 当前
+        // 未闭合段(text_acc)。含注入的合成 preamble(与 Codex rollout 一致)。
+        let full_text = match (self.message_history.is_empty(), self.text_acc.is_empty()) {
+            (true, _) => self.text_acc.clone(),
+            (false, true) => self.message_history.clone(),
+            (false, false) => format!("{}\n\n{}", self.message_history, self.text_acc),
+        };
         let mut message = json!({
             "role": "assistant",
-            "content": self.text_acc,
+            "content": full_text,
         });
         // ToolCallCache 重建走这条路把 reasoning 写回上游 messages —
         // 上游不需要见到 v2.0.8+ open_reasoning 注入的 `**Thinking**\n\n`
@@ -639,8 +687,6 @@ impl ChatToResponsesConverter {
             if self.reasoning_open {
                 self.close_reasoning(out);
             }
-            let output_index = self.next_output_index;
-            self.next_output_index += 1;
             let fc_id = format!("fc_{}_{}", self.fc_id_seed, openai_index);
             let call_id = tc
                 .id
@@ -661,6 +707,20 @@ impl ChatToResponsesConverter {
             } else {
                 raw_name.clone()
             };
+            // [MOC-219] 首个 fc 首帧:缓冲判定(flush / 节流注入)。必须在
+            // 本 fc 的 output_index 分配**之前**,flush/注入的 message 才能占住更
+            // 小的 index,保 [reasoning, message, function_call] item 序。
+            if !self.preamble_decided {
+                self.preamble_decided = true;
+                self.resolve_preamble_at_first_tool(&name, out);
+            } else if self.message_open {
+                // 判定后 interleaved 文本段(GLM/Kimi:fc 之间上游再发 content)
+                // 在下一个 fc open 前闭合 —— 保 item 串行闭合不变量(26.608
+                // 渲染丢交错 item 的教训),段机制让后续文本自动进新 item。
+                self.close_message(out);
+            }
+            let output_index = self.next_output_index;
+            self.next_output_index += 1;
             // **取舍**:wire 形态(function_call vs custom_tool_call)在 open
             // 时一次性根据**首帧 name** 决定,后续帧补全 name 不改 wire。
             // 实测 DeepSeek / Kimi / MiMo 都在首帧带 name。极端情况下首帧
@@ -1206,6 +1266,13 @@ impl ChatToResponsesConverter {
         if self.reasoning_open {
             self.close_reasoning(out);
         }
+        // [MOC-219] 缓冲窗口:判定(首个 tool_call 首帧 / 流尾)前 message 只累积
+        // 不出 wire —— SSE 流序 message 先于 fc 到达,emit 出去就收不回,注入
+        // 节流的判定必须前移到能改写输出的时点。判定后回到直通流式。
+        if !self.preamble_decided {
+            self.text_acc.push_str(text);
+            return;
+        }
         if !self.message_open {
             self.open_message(out);
         }
@@ -1253,6 +1320,15 @@ impl ChatToResponsesConverter {
         // annotations 必须挂在 message 上;reasoning open 时先 close,然后 open message
         if self.reasoning_open {
             self.close_reasoning(out);
+        }
+        // [MOC-219] 缓冲窗口:annotation 同 message 文本一起缓冲(只累积进
+        // active_annotations,flush 时随 open→delta→close 序列逐条补发)。
+        if !self.preamble_decided {
+            for annotation in annotations {
+                self.active_annotations
+                    .push(translate_annotation(annotation));
+            }
+            return;
         }
         if !self.message_open {
             self.open_message(out);
@@ -1650,7 +1726,20 @@ impl ChatToResponsesConverter {
                 "item": message_item,
             }),
         );
-        self.message_closed = true;
+        // [MOC-219] 段收尾(对齐 close_reasoning):completed item 入列(envelope
+        // 用),状态归零让后续 content(preamble flush 之后 / fc 之后的 interleaved
+        // 文本)重开**新** item 而不是灌进已 done 的死 item。
+        self.closed_message_items
+            .push((message_index, message_item));
+        if !self.message_history.is_empty() {
+            self.message_history.push_str("\n\n");
+        }
+        self.message_history.push_str(&self.text_acc);
+        self.message_open = false;
+        self.text_acc.clear();
+        self.active_annotations.clear();
+        self.message_segment += 1;
+        self.message_id = format!("{}-{}", self.message_id_base, self.message_segment);
     }
 
     fn message_item_completed(&self) -> Value {
@@ -1670,6 +1759,129 @@ impl ChatToResponsesConverter {
         })
     }
 
+    /// [MOC-219] 上一轮结束时的静默轮数:跨轮记忆(`previous_response_id`
+    /// recall)优先,miss 时 stateless fallback 数 input 尾部工具段。None =
+    /// 无任何记录(新 task / 重启 / stateful 增量轮且记忆丢失)。
+    fn prev_silent_rounds(&self) -> Option<u32> {
+        self.original_request
+            .as_ref()
+            .and_then(|r| r.get("previous_response_id"))
+            .and_then(Value::as_str)
+            .and_then(|prev| super::preamble::global_preamble_tool_memory().recall(prev))
+            .or_else(|| {
+                self.original_request
+                    .as_ref()
+                    .and_then(|r| r.get("input"))
+                    .and_then(super::preamble::silent_rounds_from_input_tail)
+            })
+    }
+
+    /// [MOC-219] 首个 tool_call 首帧的缓冲判定。调用点在 close_reasoning 之后、
+    /// fc 的 output_index 分配之前 —— flush/注入的 message 要占住更小的
+    /// output_index,保 `[reasoning, message, function_call]` item 序。
+    ///
+    /// 判定(轮数节流,详见 preamble.rs 模块注释):
+    /// - 模型自己吐了 message → **永远原样 flush**(proxy 不替模型删话;工具
+    ///   折叠是 Codex renderer 的职责,第一版「同族丢弃」真机证伪已废);
+    /// - 模型静默:连续静默轮数满 [`super::preamble::INJECT_EVERY_N_ROUNDS`]
+    ///   (或无任何记录 = 新会话首轮 / 记忆丢失)→ 注入 reasoning 转述为合成 message
+    ///   (26.609 渲染只认 assistant message,这是工具组间唯一可见文本通道);
+    ///   否则静默通过(UI 自然折叠)。
+    fn resolve_preamble_at_first_tool(&mut self, first_tool_name: &str, out: &mut Vec<u8>) {
+        if !self.text_acc.is_empty() || !self.active_annotations.is_empty() {
+            self.flush_buffered_message(out);
+            return;
+        }
+        let prev_rounds = self.prev_silent_rounds();
+        let throttled = prev_rounds
+            .is_some_and(|r| r.saturating_add(1) < super::preamble::INJECT_EVERY_N_ROUNDS);
+        if throttled {
+            tracing::debug!(
+                target: "adapters::preamble",
+                silent_rounds = prev_rounds.unwrap_or(0) + 1,
+                tool = first_tool_name,
+                "silent tool round below injection threshold; passing through",
+            );
+            return;
+        }
+        let source = self.reasoning_history.trim();
+        if source.is_empty() {
+            return;
+        }
+        let text = super::preamble::select_preamble_text(source);
+        if text.is_empty() {
+            return;
+        }
+        tracing::info!(
+            target: "adapters::preamble",
+            chars = text.chars().count(),
+            silent_rounds = prev_rounds.map(|r| r + 1).unwrap_or(1),
+            tool = first_tool_name,
+            "injecting synthetic preamble message from reasoning (Codex 26.609 renders only assistant messages between tool groups)",
+        );
+        self.text_acc.push_str(&text);
+        self.flush_buffered_message(out);
+    }
+
+    /// [MOC-219] 流错误前的紧急 flush:缓冲窗口内已累积但未出 wire 的 message
+    /// 一次性下发(完整生命周期),调用方随后再传播错误。基线(无缓冲)时代
+    /// 部分文本已实时流出,错误不应让缓冲版把已生成文本全吞(PR #458 bot
+    /// review P2)。无缓冲内容(或流已 Done)返回空。不 emit
+    /// `response.completed` —— 保持「突然断流」的错误语义,Codex 端的重试
+    /// 行为与基线一致。
+    pub fn flush_pending_buffer(&mut self) -> Vec<u8> {
+        if matches!(self.state, State::Done) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !self.preamble_decided {
+            self.preamble_decided = true;
+            if !self.text_acc.is_empty() || !self.active_annotations.is_empty() {
+                self.flush_buffered_message(&mut out);
+            }
+        }
+        out
+    }
+
+    /// [MOC-219] 缓冲一次性下发:open → 全量 delta → annotations 补发 → close。
+    /// 一气呵成闭合,不与后续 function_call item 交错(26.608 渲染丢交错 item
+    /// 的教训);close 走段机制,其后上游再发的 content 自动进新 item。
+    fn flush_buffered_message(&mut self, out: &mut Vec<u8>) {
+        self.open_message(out);
+        if !self.text_acc.is_empty() {
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": self.message_id,
+                    "output_index": self.message_index,
+                    "content_index": 0,
+                    "delta": self.text_acc,
+                }),
+            );
+        }
+        for (annotation_index, annotation) in
+            self.active_annotations.clone().into_iter().enumerate()
+        {
+            emit_event(
+                out,
+                &mut self.sequence_number,
+                "response.output_text.annotation.added",
+                json!({
+                    "type": "response.output_text.annotation.added",
+                    "item_id": self.message_id,
+                    "output_index": self.message_index,
+                    "content_index": 0,
+                    "annotation_index": annotation_index,
+                    "annotation": annotation,
+                }),
+            );
+        }
+        self.close_message(out);
+    }
+
     fn emit_close(&mut self, out: &mut Vec<u8>, from_done: bool) {
         // 如果到 [DONE] 还没 emit 过 created(纯 [DONE] 输入 / 全是坏 JSON),
         // 仍要补 emit 一次,保证客户端拿到完整生命周期(response.created +
@@ -1682,7 +1894,16 @@ impl ChatToResponsesConverter {
         if self.reasoning_open {
             self.close_reasoning(out);
         }
-        if self.message_open && !self.message_closed {
+        // [MOC-219] 整轮无 tool_call(最终回答轮 / 标题生成等辅助请求):流尾
+        // flush 缓冲的 message。代价是纯文本轮不再流式(全文一次性出现),用户
+        // 已拍板接受 —— 换工具轮间的节流注入能力。
+        if !self.preamble_decided {
+            self.preamble_decided = true;
+            if !self.text_acc.is_empty() || !self.active_annotations.is_empty() {
+                self.flush_buffered_message(out);
+            }
+        }
+        if self.message_open {
             self.close_message(out);
         }
         // tool_calls 按 OpenAI index 顺序闭合(BTreeMap 自然有序)。
@@ -1720,6 +1941,9 @@ impl ChatToResponsesConverter {
         if self.reasoning_open {
             all_items.push((self.reasoning_index, self.reasoning_item_completed()));
         }
+        // [MOC-219] 已闭合的 message 段(close_message 时快照;preamble flush /
+        // interleaved 文本可能多段)+ 当前未闭合段。
+        all_items.extend(self.closed_message_items.iter().cloned());
         if self.message_open {
             all_items.push((self.message_index, self.message_item_completed()));
         }
@@ -1728,6 +1952,22 @@ impl ChatToResponsesConverter {
         }
         all_items.sort_by_key(|(idx, _)| *idx);
         let output_items: Vec<Value> = all_items.into_iter().map(|(_, v)| v).collect();
+
+        // [MOC-219] 记忆本轮结束后的静默轮数(response_id → silent_rounds),
+        // 下一轮按 previous_response_id recall 做注入节流判定。本轮有可见
+        // message(模型原文 flush / 注入 / 直通)→ 0 重置;静默工具轮 → 上轮 +1。
+        // 纯文本轮也记(rounds=0),保 recall 链不断 —— 否则「工具轮 → 纯文本轮
+        // → 工具轮」第三轮 recall miss 会被误判新 task 提前注入。
+        let visible_message = !self.message_history.is_empty() || self.message_open;
+        let silent_rounds = if visible_message {
+            0
+        } else if self.tool_calls.is_empty() {
+            // 纯 reasoning 辅助轮(标题生成等):不在主链上,沿用上轮计数不递增
+            self.prev_silent_rounds().unwrap_or(0)
+        } else {
+            self.prev_silent_rounds().unwrap_or(0).saturating_add(1)
+        };
+        super::preamble::global_preamble_tool_memory().remember(&self.response_id, silent_rounds);
 
         let mut envelope = self.build_envelope(status);
         envelope["output"] = Value::Array(output_items);
@@ -3070,8 +3310,10 @@ mod tests {
         );
     }
 
+    /// [MOC-219] message 缓冲:content delta 在判定(首个 tool_call / 流尾)前
+    /// 不出 wire,只发 lifecycle open。流尾 flush 出完整 message 生命周期。
     #[test]
-    fn first_content_delta_lazily_opens_message() {
+    fn first_content_delta_is_buffered_until_stream_end() {
         let mut c = fixed();
         let out = c.feed(
             br#"data: {"model":"m","choices":[{"index":0,"delta":{"content":"Hi"}}]}
@@ -3081,17 +3323,26 @@ mod tests {
         let events = parse_emitted(&out);
         assert_eq!(
             names(&events),
+            vec!["response.created", "response.in_progress"],
+            "content 进缓冲,判定前不应出现任何 message 事件"
+        );
+        let out2 = c.feed(b"data: [DONE]\n\n");
+        let ev2 = parse_emitted(&out2);
+        assert_eq!(
+            names(&ev2),
             vec![
-                "response.created",
-                "response.in_progress",
                 "response.output_item.added",
                 "response.content_part.added",
                 "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
             ],
-            "首个非空 content 应同时懒开 message item"
+            "流尾 flush 完整 message 生命周期"
         );
-        assert_eq!(events[4].1["delta"], "Hi");
-        assert_eq!(events[2].1["output_index"], 0);
+        assert_eq!(ev2[2].1["delta"], "Hi");
+        assert_eq!(ev2[0].1["output_index"], 0);
     }
 
     #[test]
@@ -3106,16 +3357,20 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         );
         let out = c.feed(b"data: [DONE]\n\n");
         let events = parse_emitted(&out);
+        // [MOC-219] message 缓冲:整条生命周期(open→delta→close)在流尾一次性 flush
         assert_eq!(
             names(&events),
             vec![
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
                 "response.output_text.done",
                 "response.content_part.done",
                 "response.output_item.done",
                 "response.completed",
             ]
         );
-        let completed = &events[3].1["response"];
+        let completed = &events[6].1["response"];
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["output"][0]["type"], "message");
         assert_eq!(completed["output"][0]["content"][0]["text"], "Hello");
@@ -3196,7 +3451,7 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         assert_eq!(ev1[5].1["delta"], "think");
         assert_eq!(ev1[6].1["delta"], "think"); // content 通道纯思考(无 header)
 
-        // 第 2 chunk:content 出现,先关 reasoning 再开 message
+        // 第 2 chunk:content 出现,先关 reasoning;message 进缓冲([MOC-219])
         let out2 = c.feed(
             br#"data: {"choices":[{"index":0,"delta":{"content":"answer"}}]}
 
@@ -3210,10 +3465,8 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
                 "response.reasoning_summary_part.done",
                 "response.reasoning_text.done", // content 通道
                 "response.output_item.done",    // reasoning close
-                "response.output_item.added",   // message open
-                "response.content_part.added",
-                "response.output_text.delta",
-            ]
+            ],
+            "message 缓冲:判定前不出 wire"
         );
         // reasoning 关闭事件的 output_index = 0
         assert_eq!(ev2[3].1["output_index"], 0);
@@ -3222,23 +3475,27 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         assert!(ev2[3].1["item"].get("content").is_none());
         assert!(ev2[3].1["item"].get("encrypted_content").is_none());
         assert_eq!(ev2[3].1["item"]["summary"][0]["type"], "summary_text");
-        // message 打开事件的 output_index = 1
-        assert_eq!(ev2[4].1["output_index"], 1);
 
-        // 第 3 chunk:finish + [DONE]
+        // 第 3 chunk:finish + [DONE] → 流尾 flush 完整 message 生命周期
         let _ = c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
         let out3 = c.feed(b"data: [DONE]\n\n");
         let ev3 = parse_emitted(&out3);
         assert_eq!(
             names(&ev3),
             vec![
+                "response.output_item.added", // message open(flush)
+                "response.content_part.added",
+                "response.output_text.delta",
                 "response.output_text.done",
                 "response.content_part.done",
                 "response.output_item.done", // message close
                 "response.completed",
             ]
         );
-        let output = ev3[3].1["response"]["output"].as_array().unwrap();
+        // message 打开事件的 output_index = 1(reasoning 之后)
+        assert_eq!(ev3[0].1["output_index"], 1);
+        assert_eq!(ev3[2].1["delta"], "answer");
+        let output = ev3[6].1["response"]["output"].as_array().unwrap();
         assert_eq!(output.len(), 2);
         assert_eq!(output[0]["type"], "reasoning");
         // [MOC-218 第三关] envelope reasoning item 同样不带 content / encrypted_content
@@ -3295,6 +3552,8 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
 "#,
         );
         let ev2 = parse_emitted(&out2);
+        // [MOC-219] 模型无 message + 无上一轮工具记忆 → 首个 fc 首帧注入
+        // reasoning 转述为合成 message,序 [reasoning, message, function_call]
         assert_eq!(
             names(&ev2),
             vec![
@@ -3302,15 +3561,24 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
                 "response.reasoning_summary_part.done",
                 "response.reasoning_text.done", // content 通道
                 "response.output_item.done",    // reasoning 闭合在先
-                "response.output_item.added",   // function_call 打开在后
+                "response.output_item.added",   // 注入的合成 message open
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done", // 合成 message close(闭合后才开 fc)
+                "response.output_item.added", // function_call 打开在后
                 "response.function_call_arguments.delta",
             ]
         );
         assert_eq!(ev2[3].1["item"]["type"], "reasoning");
-        assert_eq!(ev2[4].1["item"]["type"], "function_call");
-        // reasoning 占 output_index 0,tool_call 严格在其后
+        assert_eq!(ev2[4].1["item"]["type"], "message");
+        assert_eq!(ev2[6].1["delta"], "think", "注入文本 = 剥 header 的纯思考");
+        assert_eq!(ev2[10].1["item"]["type"], "function_call");
+        // reasoning 占 output_index 0,合成 message 1,tool_call 严格在其后 2
         assert_eq!(ev2[3].1["output_index"], 0);
         assert_eq!(ev2[4].1["output_index"], 1);
+        assert_eq!(ev2[10].1["output_index"], 2);
 
         let _ =
             c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
@@ -3318,9 +3586,11 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         let ev3 = parse_emitted(&out3);
         let completed = &ev3.last().unwrap().1["response"];
         let output = completed["output"].as_array().unwrap();
-        assert_eq!(output.len(), 2);
+        assert_eq!(output.len(), 3);
         assert_eq!(output[0]["type"], "reasoning");
-        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "think");
+        assert_eq!(output[2]["type"], "function_call");
     }
 
     /// MOC-203 interleaved thinking 锁定:tool_call 强制闭合 reasoning 后,
@@ -3350,8 +3620,9 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","fu
             .collect();
         assert_eq!(added.len(), 1, "第二段 reasoning 应重开新 item");
         assert_eq!(added[0].1["item"]["type"], "reasoning");
-        // 新段领新 output_index(0=seg1 reasoning,1=tool_call,2=seg2 reasoning)
-        assert_eq!(added[0].1["output_index"], 2);
+        // 新段领新 output_index(0=seg1 reasoning,1=注入的合成 message
+        // [MOC-219],2=tool_call,3=seg2 reasoning)
+        assert_eq!(added[0].1["output_index"], 3);
 
         let _ =
             c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
@@ -3359,22 +3630,25 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","fu
         let ev4 = parse_emitted(&out4);
         let completed = &ev4.last().unwrap().1["response"];
         let output = completed["output"].as_array().unwrap();
-        // 两段 reasoning + 一个 function_call,按 output_index 排序
-        assert_eq!(output.len(), 3);
+        // 两段 reasoning + 注入 message + 一个 function_call,按 output_index 排序
+        assert_eq!(output.len(), 4);
         assert_eq!(output[0]["type"], "reasoning");
-        assert_eq!(output[1]["type"], "function_call");
-        assert_eq!(output[2]["type"], "reasoning");
+        assert_eq!(output[1]["type"], "message"); // [MOC-219] 注入的合成 preamble
+        assert_eq!(output[1]["content"][0]["text"], "think1");
+        assert_eq!(output[2]["type"], "function_call");
+        assert_eq!(output[3]["type"], "reasoning");
         // 两段 item id 不同(避免与已 done 的 item 撞 id)
-        assert_ne!(output[0]["id"], output[2]["id"]);
+        assert_ne!(output[0]["id"], output[3]["id"]);
         // [MOC-218 第三关] item 不带 content;各段独立思考文本经 SSE
         // reasoning_text 事件与 summary 承载
         assert!(output[0].get("content").is_none());
-        assert!(output[2].get("content").is_none());
+        assert!(output[3].get("content").is_none());
         assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink1");
-        assert_eq!(output[2]["summary"][0]["text"], "**Thinking**\n\nthink2");
-        // assistant_message 历史回灌:两段拼接、均剥 header
+        assert_eq!(output[3]["summary"][0]["text"], "**Thinking**\n\nthink2");
+        // assistant_message 历史回灌:两段拼接、均剥 header;content 含注入文本
         let msg = c.assistant_message().unwrap();
         assert_eq!(msg["reasoning_content"], "think1\n\nthink2");
+        assert_eq!(msg["content"], "think1");
     }
 
     #[test]
@@ -3452,17 +3726,19 @@ data: {"choices":[{"index":0,"delta":{"content":" more</think>final"},"finish_re
         assert!(out1.is_empty(), "半帧不应 emit");
         let out2 = c.feed(b"t1\"}}]}\n\n");
         let events = parse_emitted(&out2);
+        // [MOC-219] message 缓冲:半帧拼合后 content 进缓冲,只出 lifecycle
         assert_eq!(
             names(&events),
-            vec![
-                "response.created",
-                "response.in_progress",
-                "response.output_item.added",
-                "response.content_part.added",
-                "response.output_text.delta",
-            ]
+            vec!["response.created", "response.in_progress"]
         );
-        assert_eq!(events[4].1["delta"], "part1");
+        // 流尾 flush 验证拼合后的完整文本
+        let out3 = c.feed(b"data: [DONE]\n\n");
+        let ev3 = parse_emitted(&out3);
+        let delta = ev3
+            .iter()
+            .find(|(n, _)| n == "response.output_text.delta")
+            .expect("flush 时出 delta");
+        assert_eq!(delta.1["delta"], "part1");
     }
 
     #[test]
@@ -3471,18 +3747,23 @@ data: {"choices":[{"index":0,"delta":{"content":" more</think>final"},"finish_re
         let _ = c.feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abc\"}}]}\n\n");
         let out = c.finish();
         let events = parse_emitted(&out);
+        // [MOC-219] message 缓冲:EOF 截断同样在 emit_close 里 flush 完整生命周期
         assert_eq!(
             names(&events),
             vec![
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
                 "response.output_text.done",
                 "response.content_part.done",
                 "response.output_item.done",
                 "response.completed",
             ]
         );
-        assert_eq!(events[3].1["response"]["status"], "incomplete");
+        assert_eq!(events[2].1["delta"], "abc");
+        assert_eq!(events[6].1["response"]["status"], "incomplete");
         assert_eq!(
-            events[3].1["response"]["incomplete_details"]["reason"],
+            events[6].1["response"]["incomplete_details"]["reason"],
             "interrupted"
         );
     }
@@ -4334,14 +4615,16 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
         let _ = c.feed(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":null,\"tool_calls\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
         );
-        let out = c.feed(
+        let _ = c.feed(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\",\"reasoning_content\":null,\"tool_calls\":null,\"role\":null},\"finish_reason\":null}]}\n\n".as_bytes(),
         );
+        // [MOC-219] message 缓冲:content 不丢,流尾 flush 出 delta
+        let out = c.feed(b"data: [DONE]\n\n");
         let events = parse_emitted(&out);
         let kinds = names(&events);
         assert!(
             kinds.contains(&"response.output_text.delta"),
-            "delta.content 必须 emit;实际事件: {kinds:?}"
+            "delta.content 必须 emit(流尾 flush);实际事件: {kinds:?}"
         );
         let delta_event = events
             .iter()
@@ -4403,5 +4686,479 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
         assert_eq!(usage["input_tokens"], 4);
         assert_eq!(usage["output_tokens"], 6);
         assert_eq!(usage["total_tokens"], 10);
+    }
+
+    // ── [MOC-219] preamble fallback:模型 message 永远 flush + 轮数节流注入 ──
+    //
+    // Codex 是 stateful 增量请求模式:工具轮 input 只有 `*_output`,「静默了几
+    // 轮」只能靠跨轮记忆(response_id → silent_rounds,按 previous_response_id
+    // recall)。以下用例多个 converter 实例模拟相邻轮链。全局 memory 共享,
+    // response_id 必须每用例唯一,防测试间污染。
+
+    /// 喂一轮:reasoning + 可选 message + 指定工具的 fc,直至 [DONE]。
+    fn run_tool_round(
+        response_id: &str,
+        previous_response_id: Option<&str>,
+        with_message: bool,
+        tool_name: &str,
+    ) -> Vec<(String, Value)> {
+        let mut c = ChatToResponsesConverter::new_with_response_id(response_id.to_owned())
+            .with_original_request(
+                previous_response_id.map(|p| json!({ "previous_response_id": p })),
+            );
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"plan next step\"}}]}\n\n",
+        ));
+        if with_message {
+            all.extend(c.feed(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will check the files.\"}}]}\n\n",
+            ));
+        }
+        let fc = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"function\":{{\"name\":\"{tool_name}\",\"arguments\":\"{{}}\"}}}}]}}}}]}}\n\n",
+        );
+        all.extend(c.feed(fc.as_bytes()));
+        all.extend(
+            c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"),
+        );
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        parse_emitted(&all)
+    }
+
+    fn message_texts(events: &[(String, Value)]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|(n, e)| n == "response.output_item.done" && e["item"]["type"] == "message")
+            .map(|(_, e)| {
+                e["item"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// 模型自己的 message **永远原样 flush**,不论静默链状态 —— proxy 不替模型
+    /// 删话(第一版「同族丢弃」把模型稀缺 preamble 吃掉,真机证伪已废)。
+    #[test]
+    fn model_message_always_flushed_in_silent_chain() {
+        let ev1 = run_tool_round("resp_m219_keep_1", None, false, "exec_command");
+        // 轮 1 prev=None → 注入,链上 rounds=0
+        assert_eq!(message_texts(&ev1), vec!["plan next step".to_owned()]);
+        // 轮 2 模型自带 message:即使节流窗口内也原样 flush
+        let ev2 = run_tool_round("resp_m219_keep_2", Some("resp_m219_keep_1"), true, "shell");
+        assert_eq!(
+            message_texts(&ev2),
+            vec!["I will check the files.".to_owned()],
+            "模型 message 永远 flush,不丢弃"
+        );
+        // envelope 含 message item(进历史,与 rollout 一致)
+        let completed = &ev2.last().unwrap().1["response"];
+        let types: Vec<&str> = completed["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["reasoning", "message", "function_call"]);
+    }
+
+    /// 轮数节流链:新 task 首轮注入 → 静默 2 轮不注入 → 第 3 个静默轮再注入。
+    #[test]
+    fn throttle_injects_after_n_silent_rounds() {
+        let ev1 = run_tool_round("resp_m219_thr_1", None, false, "exec_command");
+        assert_eq!(
+            message_texts(&ev1),
+            vec!["plan next step".to_owned()],
+            "无记录(新 task 首轮)→ 注入"
+        );
+        let ev2 = run_tool_round("resp_m219_thr_2", Some("resp_m219_thr_1"), false, "shell");
+        assert_eq!(
+            message_texts(&ev2),
+            Vec::<String>::new(),
+            "静默第 1 轮:节流不注入"
+        );
+        let ev3 = run_tool_round("resp_m219_thr_3", Some("resp_m219_thr_2"), false, "shell");
+        assert_eq!(
+            message_texts(&ev3),
+            Vec::<String>::new(),
+            "静默第 2 轮:节流不注入"
+        );
+        let ev4 = run_tool_round("resp_m219_thr_4", Some("resp_m219_thr_3"), false, "shell");
+        assert_eq!(
+            message_texts(&ev4),
+            vec!["plan next step".to_owned()],
+            "静默满 INJECT_EVERY_N_ROUNDS(3)轮 → 注入"
+        );
+        // 注入轮重置计数:下一轮回到节流窗口
+        let ev5 = run_tool_round("resp_m219_thr_5", Some("resp_m219_thr_4"), false, "shell");
+        assert_eq!(message_texts(&ev5), Vec::<String>::new());
+    }
+
+    /// 模型自吐 message 的轮重置静默计数。
+    #[test]
+    fn model_message_resets_silent_counter() {
+        let _ = run_tool_round("resp_m219_rst_1", None, false, "exec_command"); // 注入,0
+        let _ = run_tool_round("resp_m219_rst_2", Some("resp_m219_rst_1"), false, "shell"); // 静默 1
+                                                                                            // 模型 message → flush → 计数归 0
+        let ev3 = run_tool_round("resp_m219_rst_3", Some("resp_m219_rst_2"), true, "shell");
+        assert_eq!(
+            message_texts(&ev3),
+            vec!["I will check the files.".to_owned()]
+        );
+        // 重新累计:再静默 2 轮仍不注入
+        let ev4 = run_tool_round("resp_m219_rst_4", Some("resp_m219_rst_3"), false, "shell");
+        assert_eq!(message_texts(&ev4), Vec::<String>::new());
+        let ev5 = run_tool_round("resp_m219_rst_5", Some("resp_m219_rst_4"), false, "shell");
+        assert_eq!(message_texts(&ev5), Vec::<String>::new());
+        // 第 3 个静默轮注入
+        let ev6 = run_tool_round("resp_m219_rst_6", Some("resp_m219_rst_5"), false, "shell");
+        assert_eq!(message_texts(&ev6), vec!["plan next step".to_owned()]);
+    }
+
+    /// 一轮多 fc 只算 1 个静默轮。
+    #[test]
+    fn multi_fc_round_counts_as_one_silent_round() {
+        let mut c1 = ChatToResponsesConverter::new_with_response_id("resp_m219_multi_1".into());
+        let _ = c1.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        );
+        let _ =
+            c1.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+        let _ = c1.feed(b"data: [DONE]\n\n");
+        // 无 reasoning 无 message 的静默轮(prev=None):rounds = 0+1 = 1
+        assert_eq!(
+            super::super::preamble::global_preamble_tool_memory().recall("resp_m219_multi_1"),
+            Some(1),
+            "一轮 2 个 fc 记 1 个静默轮"
+        );
+    }
+
+    /// 判定(注入)之后上游再发 content(GLM/Kimi interleaved 形态):
+    /// 段机制重开**新** message item,不灌已 done 的死 item。
+    #[test]
+    fn content_after_injection_reopens_new_message_item() {
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_seg".into());
+        let _ = c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+        );
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        );
+        // fc 之后上游再发 content → 新 message 段,直通流式
+        let out3 = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final words\"}}]}\n\n",
+        );
+        let ev3 = parse_emitted(&out3);
+        let added: Vec<_> = ev3
+            .iter()
+            .filter(|(n, e)| n == "response.output_item.added" && e["item"]["type"] == "message")
+            .collect();
+        assert_eq!(added.len(), 1, "interleaved 文本应重开新 message item");
+        let _ = c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        let out4 = c.feed(b"data: [DONE]\n\n");
+        let ev4 = parse_emitted(&out4);
+        let completed = &ev4.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        // [reasoning, 注入 message, function_call, 第二段 message]
+        assert_eq!(output.len(), 4);
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "think");
+        assert_eq!(output[3]["type"], "message");
+        assert_eq!(output[3]["content"][0]["text"], "final words");
+        // 两段 message item id 不同
+        assert_ne!(output[1]["id"], output[3]["id"]);
+        // 历史回灌:两段拼接
+        let msg = c.assistant_message().unwrap();
+        assert_eq!(msg["content"], "think\n\nfinal words");
+    }
+
+    /// 整轮无 fc 且模型无文本(辅助请求边缘):流尾不注入、不产生空 message。
+    #[test]
+    fn reasoning_only_round_does_not_inject_at_stream_end() {
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_aux".into());
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"idle think\"}}]}\n\n",
+        ));
+        all.extend(c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"));
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        assert_eq!(
+            message_texts(&events),
+            Vec::<String>::new(),
+            "无 fc 的纯 reasoning 轮不注入(注入只发生在工具边界)"
+        );
+    }
+
+    /// 纯文本轮(最终回答)重置静默计数:工具轮 → 纯文本轮 → 工具轮,第三轮
+    /// recall 到 0 而不是 miss,不会被误判新会话提前注入。
+    #[test]
+    fn plain_text_round_resets_silent_counter_in_chain() {
+        let _ = run_tool_round("resp_m219_ptx_1", None, false, "exec_command"); // 注入,0
+        let _ = run_tool_round("resp_m219_ptx_2", Some("resp_m219_ptx_1"), false, "shell"); // 静默 1
+                                                                                            // 纯文本轮(无 fc):flush 于流尾,visible → 记 0
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_ptx_3".into())
+            .with_original_request(Some(json!({
+                "previous_response_id": "resp_m219_ptx_2"
+            })));
+        let _ = c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final answer\"}}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        let _ = c.feed(b"data: [DONE]\n\n");
+        assert_eq!(
+            super::super::preamble::global_preamble_tool_memory().recall("resp_m219_ptx_3"),
+            Some(0),
+            "纯文本轮可见 → 计数归 0"
+        );
+        // 后续工具轮:recall 0 → 静默第 1 轮,节流不注入
+        let ev4 = run_tool_round("resp_m219_ptx_4", Some("resp_m219_ptx_3"), false, "shell");
+        assert_eq!(message_texts(&ev4), Vec::<String>::new());
+    }
+
+    /// 纯 reasoning 辅助轮(无 fc 无文本)沿用计数不递增:静默 1 →(辅助轮)→
+    /// 工具轮 recall 到 1(而非 2 或 0)。
+    #[test]
+    fn reasoning_only_round_carries_silent_counter() {
+        let _ = run_tool_round("resp_m219_carry_1", None, false, "exec_command"); // 注入,0
+        let _ = run_tool_round(
+            "resp_m219_carry_2",
+            Some("resp_m219_carry_1"),
+            false,
+            "shell",
+        ); // 静默 1
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_carry_3".into())
+            .with_original_request(Some(json!({
+                "previous_response_id": "resp_m219_carry_2"
+            })));
+        let _ = c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"aux\"}}]}\n\n",
+        );
+        let _ = c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        let _ = c.feed(b"data: [DONE]\n\n");
+        assert_eq!(
+            super::super::preamble::global_preamble_tool_memory().recall("resp_m219_carry_3"),
+            Some(1),
+            "纯 reasoning 辅助轮沿用上轮计数不递增"
+        );
+    }
+
+    /// 注入失败轮(静默满阈值但 reasoning 为空)计数继续累计,reasoning 恢复的
+    /// 下一轮立即注入并归零。
+    #[test]
+    fn failed_injection_round_keeps_counting_until_reasoning_returns() {
+        let _ = run_tool_round("resp_m219_fail_1", None, false, "exec_command"); // 注入,0
+        let _ = run_tool_round("resp_m219_fail_2", Some("resp_m219_fail_1"), false, "shell"); // 1
+        let _ = run_tool_round("resp_m219_fail_3", Some("resp_m219_fail_2"), false, "shell"); // 2
+                                                                                              // 第 3 个静默轮满阈值,但本轮无 reasoning → 注入失败,计数继续 +1
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_fail_4".into())
+            .with_original_request(Some(json!({
+                "previous_response_id": "resp_m219_fail_3"
+            })));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        ));
+        all.extend(
+            c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"),
+        );
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        assert_eq!(message_texts(&parse_emitted(&all)), Vec::<String>::new());
+        assert_eq!(
+            super::super::preamble::global_preamble_tool_memory().recall("resp_m219_fail_4"),
+            Some(3),
+            "注入失败轮继续累计"
+        );
+        // reasoning 恢复 → 满阈值立即注入并归零
+        let ev5 = run_tool_round("resp_m219_fail_5", Some("resp_m219_fail_4"), false, "shell");
+        assert_eq!(message_texts(&ev5), vec!["plan next step".to_owned()]);
+        assert_eq!(
+            super::super::preamble::global_preamble_tool_memory().recall("resp_m219_fail_5"),
+            Some(0),
+            "注入成功归零"
+        );
+    }
+
+    /// [bot P2] 流错误前 flush_pending_buffer:缓冲文本以完整 message 生命周期
+    /// 下发;重复调用 / 无缓冲时返回空。
+    #[test]
+    fn flush_pending_buffer_emits_buffered_text_once() {
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_errflush".into());
+        let _ = c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        );
+        let out = c.flush_pending_buffer();
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ],
+            "缓冲文本完整生命周期下发,不带 completed"
+        );
+        assert_eq!(events[2].1["delta"], "partial");
+        assert!(c.flush_pending_buffer().is_empty(), "重复调用返回空");
+
+        let mut empty = ChatToResponsesConverter::new_with_response_id("resp_m219_errempty".into());
+        assert!(empty.flush_pending_buffer().is_empty(), "无缓冲返回空");
+    }
+
+    /// [#210 回归] 缓冲窗口内流中断(上游 Err,不走 finish):assistant_message
+    /// 仍须带出缓冲文本,session 保存不能因 message 未 open 而整条丢失。
+    #[test]
+    fn buffered_text_survives_assistant_message_without_finish() {
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_err".into());
+        let _ = c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+        );
+        // 不调 finish() —— 模拟 stream.rs 上游 Err 路径直接保存 session
+        let msg = c
+            .assistant_message()
+            .expect("缓冲中的纯文本轮中断时 session 仍须保存");
+        assert_eq!(msg["content"], "partial answer");
+    }
+
+    /// stateless 客户端 fallback:无 previous_response_id,但完整 transcript 在
+    /// input 里 —— 从 input 尾部工具段数静默轮数,节流照常生效。
+    #[test]
+    fn stateless_input_tail_fallback_throttles_injection() {
+        // 尾部 1 个工具调用 = 静默 1 轮 → 本轮是第 2 个静默轮 <3 → 不注入
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_stateless".into())
+            .with_original_request(Some(json!({
+                "input": [
+                    {"type": "message", "role": "user", "content": "do the task"},
+                    {"type": "reasoning", "summary": []},
+                    {"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+                ]
+            })));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\n",
+        ));
+        all.extend(c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        ));
+        all.extend(
+            c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"),
+        );
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        assert_eq!(
+            message_texts(&parse_emitted(&all)),
+            Vec::<String>::new(),
+            "stateless 静默 1 轮后的工具轮:节流不注入"
+        );
+
+        // 尾部 2 个工具调用 = 静默 2 轮 → 本轮是第 3 个静默轮 ≥3 → 注入
+        let mut c2 = ChatToResponsesConverter::new_with_response_id(
+            "resp_m219_stateless_inj".into(),
+        )
+        .with_original_request(Some(json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "do the task"},
+                {"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+                {"type": "function_call", "name": "exec_command", "call_id": "c2", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c2", "output": "ok"}
+            ]
+        })));
+        let mut all2 = Vec::new();
+        all2.extend(c2.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\n",
+        ));
+        all2.extend(c2.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        ));
+        all2.extend(
+            c2.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"),
+        );
+        all2.extend(c2.feed(b"data: [DONE]\n\n"));
+        assert_eq!(
+            message_texts(&parse_emitted(&all2)),
+            vec!["plan".to_owned()],
+            "stateless 静默 2 轮后的工具轮:满阈值注入"
+        );
+    }
+
+    /// stateless fallback:input 尾部是 user message(新指令轮)→ 无工具段 →
+    /// 无记录(prev=None)→ 注入。
+    #[test]
+    fn stateless_input_tail_user_boundary_allows_injection() {
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_stateless2".into())
+            .with_original_request(Some(json!({
+                "input": [
+                    {"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+                    {"type": "message", "role": "user", "content": "next task"}
+                ]
+            })));
+        let mut all = Vec::new();
+        all.extend(c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\n",
+        ));
+        all.extend(c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        ));
+        all.extend(
+            c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"),
+        );
+        all.extend(c.feed(b"data: [DONE]\n\n"));
+        let events = parse_emitted(&all);
+        assert_eq!(
+            message_texts(&events),
+            vec!["plan".to_owned()],
+            "user 边界后的工具首现:注入"
+        );
+    }
+
+    /// 判定后 fc 之间的 interleaved 文本段:下一个 fc open 前闭合(item 串行
+    /// 闭合不变量),不与 fc item 交错。
+    #[test]
+    fn interleaved_message_between_fcs_closes_before_next_fc() {
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_betweenfc".into());
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        );
+        // fc1 之后 interleaved 文本(新段,直通 open)
+        let _ = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"between tools\"}}]}\n\n",
+        );
+        // fc2 首帧:open 前必须先闭合 interleaved message 段
+        let out3 = c.feed(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        );
+        let ev3 = parse_emitted(&out3);
+        let kinds = names(&ev3);
+        let msg_done_pos = kinds
+            .iter()
+            .position(|n| *n == "response.output_item.done")
+            .expect("message 段在 fc2 前闭合");
+        let fc2_added_pos = kinds
+            .iter()
+            .position(|n| *n == "response.output_item.added")
+            .expect("fc2 open");
+        assert!(
+            msg_done_pos < fc2_added_pos,
+            "message close 必须先于 fc2 open;实际事件: {kinds:?}"
+        );
+        let _ =
+            c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+        let out4 = c.feed(b"data: [DONE]\n\n");
+        let ev4 = parse_emitted(&out4);
+        let completed = &ev4.last().unwrap().1["response"];
+        let output = completed["output"].as_array().unwrap();
+        // [fc1, message("between tools"), fc2] 按 output_index 排序
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "between tools");
+        assert_eq!(output[2]["type"], "function_call");
     }
 }
