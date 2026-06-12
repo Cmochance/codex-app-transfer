@@ -34,15 +34,48 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 13 条 builtin presets:
+        // 当前 14 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
-        // / zhipu / bailian / bailian-token-plan / minimax / grok-web / google-ai-studio
-        // / gemini-cli-oauth / antigravity-oauth
+        // / zhipu / zhipu-coding / bailian / bailian-token-plan / minimax / grok-web
+        // / google-ai-studio / gemini-cli-oauth / antigravity-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
         // (2026-05-11 加 Gemini CLI OAuth login preset)
         // (2026-05-11 加 Antigravity OAuth preset)
         // (2026-05-12 加 Grok Web 反代 preset,见 R1 Plan A)
-        assert_eq!(builtin_presets().len(), 13);
+        // (2026-06-13 加智谱 GLM Coding preset:Coding Plan 端点 + Claude Code UA 伪装)
+        assert_eq!(builtin_presets().len(), 14);
+    }
+
+    #[test]
+    fn zhipu_coding_preset_uses_coding_endpoint_and_claude_code_ua() {
+        // GLM Coding Plan(订阅套餐)走专属 coding 端点,非开放平台按量端点;
+        // 智谱条款禁止「非官方工具」接入,UA 伪装成 Claude Code(官方授权的
+        // 编程工具,对齐 Kimi Code 用 KimiCLI UA 的做法)。
+        let p = builtin_presets()
+            .iter()
+            .find(|p| p["id"] == "zhipu-coding")
+            .expect("zhipu-coding preset must exist");
+        assert_eq!(
+            p["baseUrl"], "https://open.bigmodel.cn/api/coding/paas/v4",
+            "必须是 Coding Plan 专属端点(/api/coding/paas/v4),非开放平台 /api/paas/v4"
+        );
+        assert_eq!(p["apiFormat"], "openai_chat");
+        assert_eq!(
+            p["extraHeaders"]["User-Agent"], "claude-cli/2.1.175 (external, cli)",
+            "UA 伪装成 Claude Code 真实 UA(本机 bundle 实证 getUserAgent 形态)"
+        );
+        // default model 必须在 modelCapabilities 配 context_window(issue #356)
+        let default_model = p["models"]["default"].as_str().unwrap_or("");
+        assert_eq!(default_model, "glm-4.7");
+        assert!(
+            p["modelCapabilities"][default_model]["context_window"].is_number(),
+            "default model {default_model} 必须配 context_window"
+        );
+        // 与开放平台 zhipu preset 并存(对称 Kimi / Kimi Code 双 preset)
+        assert!(
+            builtin_presets().iter().any(|p| p["id"] == "zhipu"),
+            "开放平台 zhipu preset 必须保留(按量计费用户)"
+        );
     }
 
     #[test]

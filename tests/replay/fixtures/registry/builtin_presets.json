@@ -187,6 +187,33 @@
     "isBuiltin": true
   },
   {
+    "id": "zhipu-coding",
+    "name": "智谱 GLM Coding",
+    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+    "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
+    "authScheme": "bearer",
+    "apiFormat": "openai_chat",
+    "extraHeaders": {
+      "User-Agent": "claude-cli/2.1.175 (external, cli)"
+    },
+    "models": {
+      "gpt_5_5": "glm-4.7",
+      "gpt_5_4": "glm-4.7",
+      "gpt_5_4_mini": "glm-4.6",
+      "gpt_5_3_codex": "glm-4.6",
+      "default": "glm-4.7"
+    },
+    "modelCapabilities": {
+      "glm-4.7": {
+        "context_window": 200000
+      },
+      "glm-4.6": {
+        "context_window": 200000
+      }
+    },
+    "isBuiltin": true
+  },
+  {
     "id": "bailian",
     "name": "阿里云百炼",
     "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
