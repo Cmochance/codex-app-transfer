@@ -7,6 +7,11 @@
 //!   但**单元 / 集成测试可以独立 driving 响应侧**)。
 //! - **响应侧**:Chat SSE → Responses SSE 状态机(text-only)。tool / reasoning /
 //!   function call 留 Stage 3.3。
+//!
+//! **MOC-219 preamble fallback**:Codex 26.609 把完成态 reasoning 从渲染层移除,
+//! chat 路径新增 `preamble` 子模块(工具族映射 / 跨轮记忆 / reasoning 截取)
+//! + `converter` 内 message 缓冲与判定逻辑 —— 同族连续工具轮折叠,异族边界
+//! 注入 preamble 或 reasoning 转述为合成 assistant message。
 
 pub mod apply_patch_preflight;
 pub mod artifact_store;
@@ -16,6 +21,8 @@ pub mod compact;
 pub mod converter;
 // MOC-168: sessions.db 每条消息内容寻址外置(收文字/tool 侧逐轮快照重复)。
 mod message_store;
+// MOC-219: preamble fallback 注入(族映射 / 跨轮工具记忆 / 文本截取)。
+pub mod preamble;
 pub mod request;
 pub mod session;
 pub mod stream;
