@@ -27,10 +27,14 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
         // MiniMax
         "minimax-m2.7" => Some(204_800),
         "minimax-m3" => Some(ONE_M_CONTEXT_WINDOW),
-        // Google Gemini (当前 preset 默认模型)
-        "gemini-3.1-flash-lite" | "gemini-2.5-flash" | "gemini-3-flash" => {
-            Some(ONE_M_CONTEXT_WINDOW)
-        }
+        // Google Gemini:antigravity 上游对全系 gemini 文本模型(flash / pro / agent
+        // 各档)都声明 context_length = 1_048_576(`antigravity_models.json`),Google
+        // 官方 Gemini 1.5 / 2.x / 3.x 文本上下文也都 ≥ 1M。真机 antigravity 实际映射
+        // 的是带后缀的 id(`gemini-3-flash-agent` / `gemini-3.1-pro-low` /
+        // `gemini-pro-agent` 等),逐 id 精确枚举追不上上游上新,故按前缀统一判 1M。
+        // 没有其它 provider 的模型 id 以 `gemini` 开头,零误伤。`gemini-*-image` 是
+        // 图像模型(`context_length` 为 null,见 MOC-222),不参与文本上下文,排除。
+        m if m.starts_with("gemini") && !m.contains("image") => Some(ONE_M_CONTEXT_WINDOW),
         _ => None,
     }
 }
@@ -137,6 +141,46 @@ mod tests {
         assert_eq!(documented_context_window("MiniMax-M2.7"), Some(204_800));
         assert_eq!(documented_context_window("MiniMax-M3"), Some(1_000_000));
         assert_eq!(documented_context_window("unknown-model"), None);
+    }
+
+    #[test]
+    fn documented_context_window_matches_all_gemini_text_models_as_1m() {
+        // 真机 antigravity 实际映射到 Codex 槽位的带后缀 id —— 之前逐 id 精确匹配
+        // 全部漏掉,落 258_400 兜底;前缀匹配后统一 1M。
+        for id in [
+            "gemini-3-flash-agent",
+            "gemini-3.5-flash-low",
+            "gemini-3.5-flash-extra-low",
+            "gemini-3.1-pro-low",
+            "gemini-3.1-pro-high",
+            "gemini-pro-agent", // 注意:以 `gemini-pro` 开头,非 `gemini-3`
+            // 仍保留原精确匹配的三个
+            "gemini-3-flash",
+            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-pro",
+        ] {
+            assert_eq!(
+                documented_context_window(id),
+                Some(ONE_M_CONTEXT_WINDOW),
+                "{id} 应判 1M",
+            );
+        }
+        // 大小写/空白归一
+        assert_eq!(
+            documented_context_window("  Gemini-3-Flash-Agent  "),
+            Some(ONE_M_CONTEXT_WINDOW),
+        );
+    }
+
+    #[test]
+    fn documented_context_window_excludes_gemini_image_models() {
+        // 图像模型 context_length 为 null(MOC-222 单独接入),不走文本上下文兜底。
+        assert_eq!(documented_context_window("gemini-3.1-flash-image"), None);
+        assert_eq!(
+            documented_context_window("gemini-3-pro-image-preview"),
+            None
+        );
     }
 
     #[test]

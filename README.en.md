@@ -130,7 +130,7 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Google Gemini CLI OAuth | ✅ | ✅ | ✅ | Browser login once; no API key needed |
 | Anthropic Messages (custom Claude-compatible) | ✅ (PR #153) | ✅ (PR #153) | ✅ (PR #153) | `apiFormat=anthropic_messages`; Claude preset pending real validation |
 | Grok Web (SuperGrok / X Premium+) | ✅ | ✅ | ✅ (v2.1.6 adds tool_calls flatten) | Experimental, TOS gray area, personal use only |
-| Google Antigravity OAuth | ✅ | ✅ | ✅ | Backend ready, UI pending |
+| Google Antigravity OAuth | ✅ | ✅ | ✅ | Backend ready, UI pending; gemini family context 1M (suffixed ids previously fell back to 258k, MOC-221) |
 | Zhipu GLM (5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
 | Alibaba Cloud Bailian (Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
 | Responses passthrough (custom) | — | — | — | Direct upstream connection, bypasses proxy (suitable for OpenAI official / native Responses reverse proxy); ⚠️ Plugins/MCP `namespace` tool bundle is NOT flattened — some upstreams silently drop tools |
