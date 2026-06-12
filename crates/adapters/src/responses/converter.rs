@@ -1823,6 +1823,26 @@ impl ChatToResponsesConverter {
         self.flush_buffered_message(out);
     }
 
+    /// [MOC-219] 流错误前的紧急 flush:缓冲窗口内已累积但未出 wire 的 message
+    /// 一次性下发(完整生命周期),调用方随后再传播错误。基线(无缓冲)时代
+    /// 部分文本已实时流出,错误不应让缓冲版把已生成文本全吞(PR #458 bot
+    /// review P2)。无缓冲内容(或流已 Done)返回空。不 emit
+    /// `response.completed` —— 保持「突然断流」的错误语义,Codex 端的重试
+    /// 行为与基线一致。
+    pub fn flush_pending_buffer(&mut self) -> Vec<u8> {
+        if matches!(self.state, State::Done) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !self.preamble_decided {
+            self.preamble_decided = true;
+            if !self.text_acc.is_empty() || !self.active_annotations.is_empty() {
+                self.flush_buffered_message(&mut out);
+            }
+        }
+        out
+    }
+
     /// [MOC-219] 缓冲一次性下发:open → 全量 delta → annotations 补发 → close。
     /// 一气呵成闭合,不与后续 function_call item 交错(26.608 渲染丢交错 item
     /// 的教训);close 走段机制,其后上游再发的 content 自动进新 item。
@@ -4959,6 +4979,35 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delt
             Some(0),
             "注入成功归零"
         );
+    }
+
+    /// [bot P2] 流错误前 flush_pending_buffer:缓冲文本以完整 message 生命周期
+    /// 下发;重复调用 / 无缓冲时返回空。
+    #[test]
+    fn flush_pending_buffer_emits_buffered_text_once() {
+        let mut c = ChatToResponsesConverter::new_with_response_id("resp_m219_errflush".into());
+        let _ = c.feed(
+            b"data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        );
+        let out = c.flush_pending_buffer();
+        let events = parse_emitted(&out);
+        assert_eq!(
+            names(&events),
+            vec![
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ],
+            "缓冲文本完整生命周期下发,不带 completed"
+        );
+        assert_eq!(events[2].1["delta"], "partial");
+        assert!(c.flush_pending_buffer().is_empty(), "重复调用返回空");
+
+        let mut empty = ChatToResponsesConverter::new_with_response_id("resp_m219_errempty".into());
+        assert!(empty.flush_pending_buffer().is_empty(), "无缓冲返回空");
     }
 
     /// [#210 回归] 缓冲窗口内流中断(上游 Err,不走 finish):assistant_message
