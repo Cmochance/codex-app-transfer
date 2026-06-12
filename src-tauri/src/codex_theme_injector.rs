@@ -298,9 +298,9 @@ pub fn all_themes() -> Vec<ThemeMeta> {
                 blur: "6px",
                 hover: "rgba(206,224,244,0.10)",
                 selection: "rgba(206,224,244,0.16)",
-                scrim_top: "rgba(12,18,28,0.26)",
-                scrim_mid: "rgba(12,18,28,0.34)",
-                scrim_bot: "rgba(12,18,28,0.60)",
+                scrim_top: "rgba(12,18,28,0.50)",
+                scrim_mid: "rgba(12,18,28,0.56)",
+                scrim_bot: "rgba(12,18,28,0.64)",
                 base_color: "#0c121c",
             },
         },
@@ -329,9 +329,9 @@ pub fn all_themes() -> Vec<ThemeMeta> {
                 blur: "6px",
                 hover: "rgba(247,233,218,0.10)",
                 selection: "rgba(247,233,218,0.16)",
-                scrim_top: "rgba(10,6,4,0.26)",
-                scrim_mid: "rgba(10,6,4,0.34)",
-                scrim_bot: "rgba(10,6,4,0.60)",
+                scrim_top: "rgba(10,6,4,0.41)",
+                scrim_mid: "rgba(10,6,4,0.47)",
+                scrim_bot: "rgba(10,6,4,0.55)",
                 base_color: "#0a0604",
             },
         },
@@ -360,9 +360,9 @@ pub fn all_themes() -> Vec<ThemeMeta> {
                 blur: "6px",
                 hover: "rgba(241,238,242,0.10)",
                 selection: "rgba(241,238,242,0.16)",
-                scrim_top: "rgba(16,12,18,0.26)",
-                scrim_mid: "rgba(16,12,18,0.34)",
-                scrim_bot: "rgba(16,12,18,0.60)",
+                scrim_top: "rgba(16,12,18,0.44)",
+                scrim_mid: "rgba(16,12,18,0.50)",
+                scrim_bot: "rgba(16,12,18,0.58)",
                 base_color: "#100c12",
             },
         },
@@ -391,9 +391,9 @@ pub fn all_themes() -> Vec<ThemeMeta> {
                 blur: "6px",
                 hover: "rgba(206,214,235,0.10)",
                 selection: "rgba(206,214,235,0.16)",
-                scrim_top: "rgba(14,16,24,0.26)",
-                scrim_mid: "rgba(14,16,24,0.34)",
-                scrim_bot: "rgba(14,16,24,0.60)",
+                scrim_top: "rgba(14,16,24,0.43)",
+                scrim_mid: "rgba(14,16,24,0.49)",
+                scrim_bot: "rgba(14,16,24,0.57)",
                 base_color: "#0e1018",
             },
         },
@@ -422,9 +422,9 @@ pub fn all_themes() -> Vec<ThemeMeta> {
                 blur: "6px",
                 hover: "rgba(205,221,228,0.10)",
                 selection: "rgba(124,197,214,0.16)",
-                scrim_top: "rgba(13,17,21,0.26)",
-                scrim_mid: "rgba(13,17,21,0.34)",
-                scrim_bot: "rgba(13,17,21,0.60)",
+                scrim_top: "rgba(13,17,21,0.41)",
+                scrim_mid: "rgba(13,17,21,0.47)",
+                scrim_bot: "rgba(13,17,21,0.55)",
                 base_color: "#0d1115",
             },
         },
@@ -453,9 +453,9 @@ pub fn all_themes() -> Vec<ThemeMeta> {
                 blur: "6px",
                 hover: "rgba(238,241,247,0.10)",
                 selection: "rgba(238,241,247,0.16)",
-                scrim_top: "rgba(10,13,22,0.26)",
-                scrim_mid: "rgba(10,13,22,0.34)",
-                scrim_bot: "rgba(10,13,22,0.60)",
+                scrim_top: "rgba(10,13,22,0.40)",
+                scrim_mid: "rgba(10,13,22,0.46)",
+                scrim_bot: "rgba(10,13,22,0.54)",
                 base_color: "#0a0d16",
             },
         },
@@ -484,9 +484,9 @@ pub fn all_themes() -> Vec<ThemeMeta> {
                 blur: "6px",
                 hover: "rgba(248,224,224,0.10)",
                 selection: "rgba(248,224,224,0.16)",
-                scrim_top: "rgba(18,11,14,0.26)",
-                scrim_mid: "rgba(18,11,14,0.34)",
-                scrim_bot: "rgba(18,11,14,0.60)",
+                scrim_top: "rgba(18,11,14,0.36)",
+                scrim_mid: "rgba(18,11,14,0.42)",
+                scrim_bot: "rgba(18,11,14,0.50)",
                 base_color: "#120b0e",
             },
         },
@@ -515,9 +515,9 @@ pub fn all_themes() -> Vec<ThemeMeta> {
                 blur: "6px",
                 hover: "rgba(216,224,242,0.10)",
                 selection: "rgba(216,224,242,0.16)",
-                scrim_top: "rgba(15,18,30,0.26)",
-                scrim_mid: "rgba(15,18,30,0.34)",
-                scrim_bot: "rgba(15,18,30,0.60)",
+                scrim_top: "rgba(15,18,30,0.37)",
+                scrim_mid: "rgba(15,18,30,0.43)",
+                scrim_bot: "rgba(15,18,30,0.51)",
                 base_color: "#0f121e",
             },
         },
@@ -1046,8 +1046,17 @@ background:__BASECOLOR__ url('__HERO__') __POS__ / __FIT__ no-repeat fixed !impo
 body{background:transparent !important;}
 #root > *,.app-shell,.app-shell-main,main.main-surface,.app-shell-main-content-viewport,.app-shell-main-content-frame,[class~="electron:bg-token-main-surface-primary"]{background-color:transparent !important;}
 html main.main-surface{border-radius:0 !important;}
+/* 可读性 scrim 折进 #root(normal-flow;再叠 position:fixed 层会让 backdrop-filter
+   采样时 Page.captureScreenshot 死锁)。从 agent-theme 同步 3 层复合方案 —— 旧单层
+   linear(mid 仅 ~0.34)对亮壁纸太弱、文字被壁纸透射压住:(1)顶部 ~42% 阻尼带平衡
+   亮发/脸高光;(2)居中对话列焦点处(~50%/47%)径向加强,让正文落在更暗的值上;
+   (3)基线 linear,mid 上提到 44% + 底部用 color-mix 在最深 --cl-scrim-bot 上加深。
+   同 --cl-scrim-* 旋钮,只叠得更强;各主题 alpha 按壁纸亮度在 palette 里逐套校准。 */
 #root{
-background:linear-gradient(180deg,var(--cl-scrim-top) 0%,var(--cl-scrim-mid) 55%,var(--cl-scrim-bot) 100%) !important;
+background:
+ linear-gradient(180deg,color-mix(in srgb,var(--cl-scrim-bot) 58%,transparent) 0%,transparent 42%),
+ radial-gradient(135% 92% at 50% 47%,color-mix(in srgb,var(--cl-scrim-bot) 54%,transparent) 0%,transparent 70%),
+ linear-gradient(180deg,var(--cl-scrim-top) 0%,var(--cl-scrim-mid) 44%,color-mix(in srgb,var(--cl-scrim-bot) 86%,transparent) 100%) !important;
 }
 html .app-shell-left-panel{
 background:var(--cl-glass) !important;border-right:none !important;
