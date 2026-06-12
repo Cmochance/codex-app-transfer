@@ -1850,6 +1850,26 @@ fn vision_blacklist_blocks_mimo_v2_pro_and_v2_5_pro() {
 }
 
 #[test]
+fn vision_blacklist_blocks_glm_text_models() {
+    // GLM 文本旗舰(glm-5.1 / glm-4.7 + Coding Plan 套餐档 glm-4.6)官方明确
+    // 为纯文本模型,视觉走独立 GLM-5V;带图请求必须 strip 降级,不能透传给
+    // 纯文本上游(否则 400)。glm-4.6 是 zhipu-coding preset 的 mini/codex 槽。
+    for model in ["glm-5.1", "glm-4.7", "glm-4.6"] {
+        let req = vision_request_for(model);
+        let mut p = provider(
+            "zhipu-coding",
+            "智谱 GLM Coding",
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+        );
+        p.models.insert("default".into(), model.into());
+        assert!(
+            !image_url_kept(&req, &p),
+            "{model} 官方纯文本,带图必须 strip"
+        );
+    }
+}
+
+#[test]
 fn vision_check_uses_body_model_not_provider_default() {
     // 关键:provider.default = "kimi-k2.6"(支持视觉),但 body 实际请求
     // moonshot-v1-8k(纯文本)→ 必须按 body model 判定,strip 图。

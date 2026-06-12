@@ -2274,6 +2274,8 @@ fn provider_supports_vision(provider: Option<&Provider>, model: Option<&str>) ->
             // 智谱 GLM 文本旗舰模型（官方明确为文本模型，视觉走 GLM-5V 等独立模型）
             "glm-5.1",
             "glm-4.7",
+            // GLM Coding Plan 套餐档（zhipu-coding preset 的 mini/codex 槽,同纯文本）
+            "glm-4.6",
             // 阿里云百炼 Qwen 标准版（视觉能力走 Qwen-VL 系列）
             "qwen3.6-plus",
             "qwen3.6-flash",
