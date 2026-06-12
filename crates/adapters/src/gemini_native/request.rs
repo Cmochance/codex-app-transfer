@@ -81,6 +81,19 @@ pub fn responses_body_to_gemini_request_with_session(
     // Step 1: Codex.app /responses → 归一化 chat-shape 中间表示
     let mut chat_body = responses_body_to_normalized_chat(body)?;
 
+    // [MOC-210] image_gen 出图工具只对 **antigravity** 暴露 —— 履约链路(proxy 响应流
+    // 截获 functionCall(image_gen) → 出图子请求)只对 antigravity flavor 生效。gemini-cli /
+    // gemini 直连虽共用本归一化路径(`responses_tools_to_chat_tools` 会无差别降级出
+    // image_gen),但它们没有履约端 → 模型若调用会变成 proxy 不拦截的 dangling function_call
+    // 让 Codex 卡等 function_call_output(code-review I-1)。故非 antigravity 在此剥掉。
+    if !crate::is_antigravity_api_format(&provider.api_format) {
+        if let Some(tools) = chat_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+            tools.retain(|t| {
+                t.pointer("/function/name").and_then(|n| n.as_str()) != Some("image_gen")
+            });
+        }
+    }
+
     // Step 1.5: 复用 responses 输入主管道统一处理 previous_response_id +
     // tool_call_cache 修复接线，避免 gemini_native 维护并漂移一套历史恢复逻辑。
     let responses_conversion =
@@ -865,7 +878,50 @@ fn responses_tools_to_chat_tools(tools: &[Value]) -> Vec<Value> {
                     out.push(tool);
                 }
             }
-            // computer_use_preview / file_search / image_generation 等 Gemini 不直接对应。
+            // [MOC-210] Codex 内置 image_generation 工具:此前落 `other` 被 drop →
+            // gemini 模型收不到 → 出图请求(imagegen 技能)报"工具不可用"退 CLI fallback。
+            // 改成降级为 functionDeclaration(name=image_gen),模型即可调用。
+            // 履约**不在 adapter 响应侧**(emit_function_call 没有也不该有 image_gen 特判),
+            // 而在 proxy:`forward.rs::intercept_image_gen_stream` 截获 functionCall(image_gen)
+            // → 发出图子请求(gemini-*-image)→ 注入图片 inlineData → 转 image_generation_call。
+            // 本分支对所有 gemini-family 无差别降级出 image_gen,非 antigravity 的会在
+            // `responses_body_to_gemini_request_with_session` 入口被剥掉(只 antigravity 有履约)。
+            "image_generation" => {
+                let description = obj
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(
+                        "Generate an image from a text description. Call this when the user asks \
+                         to create, draw, render, or generate a picture/photo/illustration/logo. \
+                         Provide a detailed visual `prompt`; the generated image is returned and \
+                         shown to the user.",
+                    )
+                    .to_owned();
+                // [MOC-210] 名字 `image_gen`(Codex 内部工具名 + 技能预期),不是
+                // `image_generation`(否则模型认不出 → 判不可用退 CLI)。
+                let mut func = Map::new();
+                func.insert("name".into(), Value::String("image_gen".into()));
+                func.insert("description".into(), Value::String(description));
+                func.insert(
+                    "parameters".into(),
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": "Detailed description of the image to generate."
+                            }
+                        },
+                        "required": ["prompt"],
+                    }),
+                );
+                let mut wrapper = Map::new();
+                wrapper.insert("type".into(), Value::String("function".into()));
+                wrapper.insert("function".into(), Value::Object(func));
+                out.push(Value::Object(wrapper));
+            }
+            // computer_use_preview / file_search 等 Gemini 不直接对应。
             // warn_once 让以后用户配新 tool 类型时能在 telemetry 立刻看到 silent drop。
             other => {
                 crate::warn_once_drop_tool(&format!("gemini_native:responses_tool:{other}"));
@@ -2168,6 +2224,40 @@ mod tests {
             sort_index: 0,
             extra: IndexMap::new(),
         }
+    }
+
+    // [MOC-210 / code-review I-1] image_gen 出图工具只对 antigravity 暴露;gemini-cli /
+    // gemini 直连(无 proxy 履约端)必须剥掉,否则模型调用 → dangling function_call 卡 Codex。
+    #[test]
+    fn image_gen_tool_exposed_only_for_antigravity() {
+        let body = json!({
+            "model": "gemini-3-flash-agent",
+            "input": [{
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "draw a cat"}]
+            }],
+            "tools": [{"type": "image_generation"}],
+            "stream": true,
+        });
+
+        // 非 antigravity(gemini_native 直连)→ 剥掉
+        let non_ag = dummy_provider();
+        let req = responses_body_to_gemini_request_with_session(&body, &non_ag, None).unwrap();
+        let wire = serde_json::to_string(&req.request).unwrap();
+        assert!(
+            !wire.contains("image_gen"),
+            "非 antigravity 必须剥掉 image_gen(无履约端会 dangling),实际 wire 含: {wire}"
+        );
+
+        // antigravity → 保留
+        let mut ag = dummy_provider();
+        ag.api_format = "antigravity_oauth".into();
+        let req = responses_body_to_gemini_request_with_session(&body, &ag, None).unwrap();
+        let wire = serde_json::to_string(&req.request).unwrap();
+        assert!(
+            wire.contains("image_gen"),
+            "antigravity 必须暴露 image_gen 供模型调用 + proxy 履约,实际 wire: {wire}"
+        );
     }
 
     // ───── upstream URL ─────

@@ -38,6 +38,13 @@ impl CloudCodeApiFlavor {
     }
 }
 
+/// provider 的 `api_format` 是否是 antigravity 系(三个别名)。单一判定源,供 proxy
+/// (是否对响应流做 image_gen 履约拦截)与 gemini 请求侧(是否给模型暴露 image_gen 工具)
+/// 共用,避免两处各抄一份匹配列表日后漂移(MOC-210 code-review N-2)。
+pub fn is_antigravity_api_format(api_format: &str) -> bool {
+    CloudCodeApiFlavor::from_api_format(api_format).is_antigravity()
+}
+
 /// 按 provider `api_format` 选择 token 文件名。
 pub(crate) fn token_filename_for_api_format(api_format: &str) -> &'static str {
     if CloudCodeApiFlavor::from_api_format(api_format).is_antigravity() {
@@ -417,19 +424,6 @@ pub(crate) fn prepare_cloud_code_request(
         });
     }
 
-    // [MOC-210] OpenAI Images API(`POST /v1/images/generations`):Codex 内置
-    // image_generation 工具出图时发的独立子请求(`{model:gpt-image-1, prompt, n,
-    // size, quality}`),与 /responses 形态完全不同(无 input/tools,响应也是
-    // Images API JSON 而非 SSE)。仅 antigravity flavor 支持 —— 路由到 gemini 图像
-    // 模型(model id 含 "image" → 自动走 is_image 指纹路径)。非 antigravity 的
-    // cloud_code(gemini_cli)暂不接,落下面普通路径(上游无此端点会失败,但不
-    // 静默——留可见错误,待 followup)。
-    if is_images_generation_path(client_path)
-        && CloudCodeApiFlavor::from_api_format(&provider.api_format).is_antigravity()
-    {
-        return prepare_antigravity_image_request(&body, provider);
-    }
-
     let parsed: Value = serde_json::from_slice(&body)?;
     let stream = parsed
         .get("stream")
@@ -493,21 +487,14 @@ pub(crate) fn prepare_cloud_code_request(
     })
 }
 
-// ─────────────────────── [MOC-210] OpenAI Images API 出图 ───────────────────────
-
-/// 出图响应 buffer 上限(图片 base64 较大,1024×1024 PNG 约 1-3 MB;留富余防 OOM)。
-const MAX_IMAGE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+// ─────────────────── [MOC-210] antigravity 出图(image_gen 履约)───────────────────
 
 /// antigravity 默认图像后端模型。model id 含 "image" → `apply_antigravity_transform`
 /// 的 `is_image` 路径自动激活(requestType=image_gen)。可经 provider.models 的
 /// `gpt-image-1` / `gpt_image_1` / `image` 槽位覆盖。
+/// 真机实测 cloudcode-pa /v1internal 认 `gemini-3.1-flash-image`;language_server 里的
+/// `-preview` 后缀是 Vertex AI aiplatform 端点用的,cloudcode-pa 不认(404),故用无后缀版。
 const DEFAULT_ANTIGRAVITY_IMAGE_MODEL: &str = "gemini-3.1-flash-image";
-
-/// 识别 OpenAI Images API 出图端点(`POST /v1/images/generations` 及各前缀变体)。
-pub(crate) fn is_images_generation_path(client_path: &str) -> bool {
-    let path = client_path.split('?').next().unwrap_or(client_path);
-    path.trim_end_matches('/').ends_with("/images/generations")
-}
 
 fn resolve_antigravity_image_model(provider: &Provider) -> String {
     for key in ["gpt-image-1", "gpt_image_1", "image"] {
@@ -521,11 +508,12 @@ fn resolve_antigravity_image_model(provider: &Provider) -> String {
     DEFAULT_ANTIGRAVITY_IMAGE_MODEL.to_owned()
 }
 
-/// 把 OpenAI Images API 请求转成 antigravity(cloud_code)出图请求。
-/// 入站 `{model:gpt-image-1, prompt, n, size, quality}` → gemini `generateContent`
+/// 构造 antigravity(cloud_code)出图请求体:`{prompt, n}` → gemini `generateContent`
 /// (prompt 进 user parts + `generationConfig.responseModalities:["IMAGE"]`),裹
-/// cloud_code envelope 并走 is_image 指纹路径(requestType=image_gen);非流式。
-/// 入站 model 被 resolver 重写为文本默认槽位,这里**忽略**它、改用图像模型。
+/// cloud_code envelope 并走 is_image 指纹路径(requestType=image_gen)。
+/// 被 `build_antigravity_image_gen_request`(proxy image_gen 履约子请求)复用 —— 后者把
+/// `upstream_path` 覆盖为流式 streamGenerateContent。入站 model 被 resolver 重写为文本
+/// 默认槽位,这里**忽略**它、改用图像模型。
 fn prepare_antigravity_image_request(
     body: &[u8],
     provider: &Provider,
@@ -566,146 +554,79 @@ fn prepare_antigravity_image_request(
     let outer_body = serde_json::to_vec(&outer).map_err(AdapterError::BodyDecode)?;
 
     Ok(RequestPlan {
-        upstream_path: cloud_code_upstream_path(false), // 非流式 generateContent
+        upstream_path: cloud_code_upstream_path(false), // build_antigravity_image_gen_request 会覆盖为流式
         body: bytes::Bytes::from(outer_body),
         upstream_headers: http::HeaderMap::new(),
         response_session: None,
-        adapter_metadata: Some(json!({ "images_mode": true })),
+        adapter_metadata: None,
         is_compact: false,
         compact_v2: false,
         original_responses_request: None,
     })
 }
 
-/// `request_plan` 是否标记了 Images API 出图模式。
-fn is_images_mode(request_plan: &RequestPlan) -> bool {
-    request_plan
-        .adapter_metadata
-        .as_ref()
-        .and_then(|m| m.get("images_mode"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
-/// 把 antigravity 出图响应转成 OpenAI Images API 响应(`{created, data:[{b64_json}]}`)。
-/// 非流式:buffer 上游 generateContent JSON,抽 inlineData base64 直接进 b64_json。
-fn build_image_generation_response_plan(
-    upstream_status: StatusCode,
-    mut upstream_headers: HeaderMap,
-    upstream_stream: ByteStream,
-) -> Result<ResponsePlan, AdapterError> {
-    upstream_headers.insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    upstream_headers.remove(http::header::CONTENT_LENGTH);
-    upstream_headers.remove(http::header::CONTENT_ENCODING);
-    upstream_headers.remove(http::header::TRANSFER_ENCODING);
-
-    let status_out = if upstream_status.is_success() {
-        StatusCode::OK
-    } else {
-        upstream_status
-    };
-    let stream = Box::pin(futures_util::stream::once(async move {
-        let body = collect_image_response_body(upstream_status, upstream_stream).await;
-        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(body))
-    }));
-    Ok(ResponsePlan {
-        status: status_out,
-        headers: upstream_headers,
-        stream,
-    })
-}
-
-async fn collect_image_response_body(
-    upstream_status: StatusCode,
-    mut upstream_stream: ByteStream,
-) -> Vec<u8> {
-    use futures_util::stream::StreamExt;
-    let mut buf = Vec::new();
-    while let Some(chunk) = upstream_stream.next().await {
-        match chunk {
-            Ok(bytes) => {
-                if buf.len() + bytes.len() > MAX_IMAGE_RESPONSE_BYTES {
-                    return image_error_body("image upstream response too large");
-                }
-                buf.extend_from_slice(&bytes);
-            }
-            Err(e) => return image_error_body(&format!("upstream io: {e}")),
+/// [MOC-210] 从 buffered cloud_code gemini SSE 响应里抽 `image_gen` functionCall 的
+/// prompt。模型调 image_gen 出图时 proxy 据此触发履约子请求。仅认 name=="image_gen"。
+pub fn extract_image_gen_prompt(buffered: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(buffered).ok()?;
+    for line in text.lines() {
+        let payload = line
+            .strip_prefix("data:")
+            .map(str::trim)
+            .unwrap_or_else(|| line.trim());
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
         }
-    }
-    if !upstream_status.is_success() {
-        // 上游错误原样透传(Codex 收非 2xx 显示原始 body),不二次包装掩盖根因。
-        return buf;
-    }
-    let parsed: Value = match serde_json::from_slice(&buf) {
-        Ok(v) => v,
-        Err(e) => {
-            let preview: String = String::from_utf8_lossy(&buf).chars().take(300).collect();
-            return image_error_body(&format!(
-                "non-JSON image response: {e}; first 300: {preview}"
-            ));
-        }
-    };
-    let images = extract_inline_images(&parsed);
-    if images.is_empty() {
-        let preview: String = serde_json::to_string(&parsed)
-            .unwrap_or_default()
-            .chars()
-            .take(300)
-            .collect();
-        return image_error_body(&format!(
-            "no inlineData image in upstream response; first 300: {preview}"
-        ));
-    }
-    let data: Vec<Value> = images
-        .into_iter()
-        .map(|b64| json!({ "b64_json": b64 }))
-        .collect();
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    serde_json::to_vec(&json!({ "created": created, "data": data }))
-        .unwrap_or_else(|e| image_error_body(&e.to_string()))
-}
-
-fn image_error_body(msg: &str) -> Vec<u8> {
-    let body = json!({
-        "error": {
-            "message": msg,
-            "type": "image_generation_error",
-            "code": "image_generation_failed",
-        }
-    });
-    serde_json::to_vec(&body).unwrap_or_else(|_| msg.as_bytes().to_vec())
-}
-
-/// 抽 gemini 响应里的图片 base64(cloud_code 非流式响应可能外裹 `{"response":{...}}`)。
-/// 兼容 `inlineData`/`inline_data` 两种命名。
-fn extract_inline_images(parsed: &Value) -> Vec<String> {
-    let root = parsed.get("response").unwrap_or(parsed);
-    let mut out = Vec::new();
-    let Some(cands) = root.get("candidates").and_then(|v| v.as_array()) else {
-        return out;
-    };
-    for cand in cands {
-        let Some(parts) = cand.pointer("/content/parts").and_then(|v| v.as_array()) else {
+        let Ok(v) = serde_json::from_str::<Value>(payload) else {
             continue;
         };
-        for part in parts {
-            let inline = part.get("inlineData").or_else(|| part.get("inline_data"));
-            if let Some(data) = inline
-                .and_then(|i| i.get("data"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                out.push(data.to_owned());
+        let root = v.get("response").unwrap_or(&v);
+        let Some(cands) = root.get("candidates").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for cand in cands {
+            let Some(parts) = cand.pointer("/content/parts").and_then(|p| p.as_array()) else {
+                continue;
+            };
+            for part in parts {
+                let Some(fc) = part
+                    .get("functionCall")
+                    .or_else(|| part.get("function_call"))
+                else {
+                    continue;
+                };
+                if fc.get("name").and_then(|n| n.as_str()) != Some("image_gen") {
+                    continue;
+                }
+                if let Some(prompt) = fc
+                    .pointer("/args/prompt")
+                    .and_then(|p| p.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    return Some(prompt.to_owned());
+                }
             }
         }
     }
-    out
+    None
+}
+
+/// [MOC-210] 用 prompt 构造 antigravity 出图子请求(履约用)。复用 image gen envelope
+/// builder(非流式 generateContent → gemini 回 inlineData)。
+pub fn build_antigravity_image_gen_request(
+    prompt: &str,
+    provider: &Provider,
+) -> Result<RequestPlan, AdapterError> {
+    let body = serde_json::to_vec(&json!({ "model": "gpt-image-1", "prompt": prompt, "n": 1 }))
+        .map_err(AdapterError::BodyDecode)?;
+    let mut plan = prepare_antigravity_image_request(&body, provider)?;
+    // 履约子请求走**流式** streamGenerateContent → 响应是 SSE,交回主请求的 cloud_code
+    // 正常 SSE 转换器(unwrap envelope + gemini→responses + emit_inline_data),inlineData
+    // 转成 image_generation_call。`adapter_metadata.images_mode` 不带(那是 /v1/images
+    // 端点的非流 JSON 响应路径,履约不走它)。
+    plan.upstream_path = cloud_code_upstream_path(true);
+    plan.adapter_metadata = None;
+    Ok(plan)
 }
 
 /// cloud-code 响应流转换：
@@ -731,14 +652,6 @@ pub(crate) fn transform_cloud_code_response_stream(
             );
         }
         return build_compact_response_plan(upstream_status, upstream_headers, upstream_stream);
-    }
-    // [MOC-210] Images API 出图:上游 generateContent JSON → OpenAI Images API 响应。
-    if is_images_mode(request_plan) {
-        return build_image_generation_response_plan(
-            upstream_status,
-            upstream_headers,
-            upstream_stream,
-        );
     }
     upstream_headers.remove(http::header::CONTENT_LENGTH);
     upstream_headers.remove(http::header::CONTENT_ENCODING);
@@ -1199,7 +1112,7 @@ mod tests {
         );
     }
 
-    // ───────────────── [MOC-210] Images API 出图 ─────────────────
+    // ───────────────── [MOC-210] antigravity 出图(image_gen 履约)─────────────────
 
     fn antigravity_image_provider(models: Value) -> Provider {
         serde_json::from_value(json!({
@@ -1211,16 +1124,6 @@ mod tests {
             "models": models,
         }))
         .unwrap()
-    }
-
-    #[test]
-    fn is_images_generation_path_matches_openai_images_endpoint() {
-        assert!(is_images_generation_path("/v1/images/generations"));
-        assert!(is_images_generation_path("/openai/v1/images/generations"));
-        assert!(is_images_generation_path("/v1/images/generations?x=1"));
-        assert!(is_images_generation_path("/v1/images/generations/"));
-        assert!(!is_images_generation_path("/responses"));
-        assert!(!is_images_generation_path("/v1/images/edits"));
     }
 
     #[test]
@@ -1250,9 +1153,10 @@ mod tests {
 
         let plan = prepare_antigravity_image_request(&body, &provider).unwrap();
 
-        // 非流式 generateContent + images_mode 标记
+        // 非流式 generateContent(履约入口 build_antigravity_image_gen_request 会覆盖为流式);
+        // 不带 adapter_metadata(端点专用的 images_mode 标记已随未启用端点删除)。
         assert_eq!(plan.upstream_path, cloud_code_upstream_path(false));
-        assert!(is_images_mode(&plan));
+        assert!(plan.adapter_metadata.is_none());
         assert!(!plan.is_compact);
 
         let envelope: Value = serde_json::from_slice(&plan.body).unwrap();
@@ -1290,37 +1194,5 @@ mod tests {
         let provider = antigravity_image_provider(json!({ "default": "gemini-3-flash-agent" }));
         let body = serde_json::to_vec(&json!({ "model": "gpt-image-1", "n": 1 })).unwrap();
         assert!(prepare_antigravity_image_request(&body, &provider).is_err());
-    }
-
-    #[test]
-    fn extract_inline_images_handles_response_wrap_and_naming() {
-        // cloud_code 外裹 {"response": {...}} + camelCase inlineData
-        let wrapped = json!({
-            "response": {
-                "candidates": [{
-                    "content": { "parts": [
-                        { "text": "here" },
-                        { "inlineData": { "mimeType": "image/png", "data": "AAAA" } }
-                    ]}
-                }]
-            }
-        });
-        assert_eq!(extract_inline_images(&wrapped), vec!["AAAA".to_string()]);
-
-        // 无外裹 + snake_case inline_data + 多图
-        let direct = json!({
-            "candidates": [
-                { "content": { "parts": [{ "inline_data": { "data": "B1" } }] } },
-                { "content": { "parts": [{ "inline_data": { "data": "B2" } }] } }
-            ]
-        });
-        assert_eq!(
-            extract_inline_images(&direct),
-            vec!["B1".to_string(), "B2".to_string()]
-        );
-
-        // 无图 → 空
-        let none = json!({ "candidates": [{ "content": { "parts": [{ "text": "x" }] } }] });
-        assert!(extract_inline_images(&none).is_empty());
     }
 }

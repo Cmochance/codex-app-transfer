@@ -28,7 +28,7 @@ use codex_app_transfer_adapters::{
 };
 use codex_app_transfer_registry::strip_internal_model_suffix;
 use futures_core::Stream;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use thiserror::Error;
 
 use crate::diagnostics::{
@@ -573,6 +573,15 @@ pub async fn forward_handler(
         }
     }
 
+    // [MOC-210] antigravity 原生出图履约:本次成功响应是否需做 image_gen 流式拦截。
+    // 真正的拦截在下方成功流构造处用 `intercept_image_gen_stream` 包裹 —— raw gemini SSE
+    // 逐事件透传(文本 / 思考实时流式),仅在检出 functionCall(name=image_gen) 时抑制该事件
+    // 及其后续,流末用 prompt 发出图子请求并把图片 inlineData 事件注入流尾,交下游 adapter
+    // 正常转成 image_generation_call。普通轮零拦截、零 buffer(修复早期"buffer 全部
+    // antigravity 成功响应"导致正常对话轮也被整段缓冲、体感"一加载出图工具就停了"的回归)。
+    let is_antigravity =
+        codex_app_transfer_adapters::is_antigravity_api_format(&resolved.provider.api_format);
+
     // 4xx / 5xx 诊断:整段缓冲 upstream body,把请求体 + 响应体片段写日志,
     // 然后用同一份字节再造一个 stream 走 adapter / 客户端。错误 body 一般
     // 很小(JSON error),全缓冲不影响延迟;成功路径仍走零拷贝 stream。
@@ -656,10 +665,31 @@ pub async fn forward_handler(
             // 响应体由 TracedStream tee(不破流式),Drop 时连同 ctx 写一行 jsonl。
             let trace_ctx = forward_trace_enabled()
                 .then(|| make_trace_ctx(st.as_u16(), resp.headers().clone()));
-            let raw = Box::pin(
+            // [MOC-210] antigravity 的 event-stream 成功响应套一层 image_gen 流式拦截器:
+            // 普通轮零开销逐事件透传,出图轮抑制 functionCall(image_gen) + 流末注入图片
+            // inlineData。仅认 content-type=event-stream(chat /responses 的
+            // streamGenerateContent),/v1/images/generations 的 JSON 响应不会命中、原样透传。
+            let is_sse = hs
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.contains("event-stream"))
+                .unwrap_or(false);
+            let raw: codex_app_transfer_adapters::ByteStream = Box::pin(
                 resp.bytes_stream()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
             );
+            let raw = if is_antigravity && is_sse {
+                intercept_image_gen_stream(
+                    raw,
+                    state.clone(),
+                    parts.method.clone(),
+                    parts.headers.clone(),
+                    resolved.clone(),
+                    resolved.upstream_base.clone(),
+                )
+            } else {
+                raw
+            };
             Box::pin(TracedStream::new(
                 raw,
                 t_send,
@@ -1386,6 +1416,284 @@ fn is_metadata_v4(v4: std::net::Ipv4Addr) -> bool {
         || v4.octets() == [100, 100, 100, 200]
 }
 
+// ───────────────────── [MOC-210] antigravity 原生出图履约 ─────────────────────
+
+/// 出图子请求响应体上限(base64 后约 2-3 MB/图,留富余)。履约路径不走 adapters 的
+/// `/v1/images` JSON cap,这里独立兜底防超大响应 OOM(code-review HIGH-1)。
+const MAX_IMAGE_FULFILL_BYTES: usize = 32 * 1024 * 1024;
+
+/// SSE 事件边界:返回 `buf` 中首个完整事件的结束偏移(含分隔符,可直接 `drain(..end)`)。
+/// 认 `\n\n`(2 字节)与 `\r\n\r\n`(4 字节)两种分隔;无完整事件返回 `None`。
+fn next_sse_event_end(buf: &[u8]) -> Option<usize> {
+    let n = buf.len();
+    let mut i = 0;
+    while i < n {
+        if i + 4 <= n && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
+        }
+        if i + 2 <= n && &buf[i..i + 2] == b"\n\n" {
+            return Some(i + 2);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 单个 cloud_code SSE 事件里若含 `functionCall(name=image_gen)` 则返回其 `prompt` 参数。
+/// 先做廉价子串预筛,避免对每个文本/思考事件都 JSON parse。
+fn detect_image_gen_event(event: &[u8]) -> Option<String> {
+    if !event.windows(b"image_gen".len()).any(|w| w == b"image_gen") {
+        return None;
+    }
+    codex_app_transfer_adapters::extract_image_gen_prompt(event)
+}
+
+/// 合成一段最小 gemini cloud_code SSE 事件(model role 文本 + `finishReason:STOP`),
+/// 出图子请求失败时用它让下游 adapter 正常吐一条文本消息并收尾,不挂起客户端。
+fn synth_gemini_text_event(text: &str) -> Bytes {
+    let v = serde_json::json!({
+        "response": {
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": text }] },
+                "finishReason": "STOP"
+            }]
+        }
+    });
+    Bytes::from(format!("data: {v}\n\n"))
+}
+
+/// [MOC-210] 合成一个只携带 `_casRevisedPrompt` 的 cloud_code SSE 事件,注入到图片 SSE
+/// 之前 → 下游转换器暂存 prompt、填进 `image_generation_call.revised_prompt`(供 session
+/// 历史区分多图)。`_casRevisedPrompt` 是 proxy 内部旁路字段,真实上游 wire 不会出现。
+fn synth_image_prompt_event(prompt: &str) -> Bytes {
+    let v = serde_json::json!({
+        "response": {
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "_casRevisedPrompt": prompt }] }
+            }]
+        }
+    });
+    Bytes::from(format!("data: {v}\n\n"))
+}
+
+/// 用 image_gen 的 `prompt` 发 antigravity 出图子请求,返回图片 SSE 字节(gemini
+/// cloud_code streamGenerateContent 响应,含 `inlineData`)。子请求任何环节失败都返回
+/// 一段合成文本事件(见 `synth_gemini_text_event`),保证下游 adapter 能正常收尾。
+/// 成功时在图片 SSE 前注入一个携带原始 prompt 的旁路事件(`synth_image_prompt_event`),
+/// 让 image_generation_call 带上 revised_prompt。
+async fn fulfill_image_gen(
+    prompt: &str,
+    state: &ProxyState,
+    method: &http::Method,
+    inbound_headers: &HeaderMap,
+    resolved: &ResolvedProvider,
+    upstream_base: &str,
+) -> Bytes {
+    let telemetry = proxy_telemetry();
+    let plan = match codex_app_transfer_adapters::build_antigravity_image_gen_request(
+        prompt,
+        &resolved.provider,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // 构造失败属代码/配置 bug(非瞬时),ERROR 级别便于聚合监控
+            telemetry
+                .logs
+                .add("ERROR", format!("[MOC-210] image_gen 请求构造失败: {e}"));
+            return synth_gemini_text_event(
+                "⚠️ 图像生成失败:出图请求构造错误(内部问题,可重试;若持续请反馈)",
+            );
+        }
+    };
+    let url = build_upstream_url(upstream_base, &plan.upstream_path);
+    match build_and_send_upstream(
+        state,
+        method,
+        inbound_headers,
+        resolved,
+        &plan.body,
+        &plan.upstream_headers,
+        &url,
+    )
+    .await
+    {
+        Ok((resp, _)) => {
+            let st = resp.status();
+            // HIGH-1 / P2:**边读边累加**并在超过 MAX_IMAGE_FULFILL_BYTES 时立即中断 ——
+            // 不能先 resp.bytes() 整段分配再检查长度(那样 cap 形同虚设,超大响应仍会先把
+            // 内存吃满,多并发出图轮叠加更危险)。HIGH-2:读取错误显式处理,不静默退化成空
+            // body 伪装成 "200 (0 bytes)" 误导排查。
+            let mut body_buf: Vec<u8> = Vec::new();
+            let mut byte_stream = resp.bytes_stream();
+            loop {
+                match byte_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        if body_buf.len() + chunk.len() > MAX_IMAGE_FULFILL_BYTES {
+                            telemetry.logs.add(
+                                "ERROR",
+                                format!(
+                                    "[MOC-210] 出图响应超过上限 {MAX_IMAGE_FULFILL_BYTES} bytes,中断"
+                                ),
+                            );
+                            return synth_gemini_text_event("⚠️ 图像生成失败:出图响应过大(可重试)");
+                        }
+                        body_buf.extend_from_slice(&chunk);
+                    }
+                    Some(Err(e)) => {
+                        telemetry
+                            .logs
+                            .add("ERROR", format!("[MOC-210] 出图响应读取失败: {e}"));
+                        return synth_gemini_text_event("⚠️ 图像生成失败:读取出图响应中断(可重试)");
+                    }
+                    None => break,
+                }
+            }
+            if st.is_success() {
+                telemetry.logs.add(
+                    "INFO",
+                    format!(
+                        "[MOC-210] 出图子请求返回 {} ({} bytes)",
+                        st.as_u16(),
+                        body_buf.len()
+                    ),
+                );
+                // 图片 SSE 前注入 prompt 旁路事件 → image_generation_call.revised_prompt
+                let mut out = synth_image_prompt_event(prompt).to_vec();
+                out.extend_from_slice(&body_buf);
+                Bytes::from(out)
+            } else {
+                let body = Bytes::from(body_buf);
+                // 上游 4xx/5xx(配额/限流/模型 id 等)属真实功能失败,ERROR 级别
+                telemetry.logs.add(
+                    "ERROR",
+                    format!(
+                        "[MOC-210] 出图子请求 {} 失败: {}",
+                        st.as_u16(),
+                        String::from_utf8_lossy(&body)
+                            .chars()
+                            .take(120)
+                            .collect::<String>()
+                    ),
+                );
+                synth_gemini_text_event(
+                    "⚠️ 图像生成失败:上游出图接口返回错误(请检查 antigravity 配额/网络后重试)",
+                )
+            }
+        }
+        Err(e) => {
+            telemetry
+                .logs
+                .add("ERROR", format!("[MOC-210] 出图子请求发送失败: {e}"));
+            synth_gemini_text_event("⚠️ 图像生成失败:无法连接出图接口(请检查网络后重试)")
+        }
+    }
+}
+
+/// antigravity 原生出图履约流转换器。raw gemini SSE 逐事件透传(文本 / 思考实时流式),
+/// 检出 `functionCall(name=image_gen)` 时抑制该事件及其后续(含原 `finishReason`),
+/// 流末用捕获的 prompt 发出图子请求、把图片 `inlineData` 事件注入流尾,交下游 cloud_code
+/// adapter 正常把 `inlineData` 转成 `image_generation_call`。普通轮检不到 image_gen →
+/// 全程零拦截透传 + 末尾 flush 残留尾事件(对正常对话轮零行为变化、保持流式)。
+fn intercept_image_gen_stream(
+    mut upstream: codex_app_transfer_adapters::ByteStream,
+    state: ProxyState,
+    method: http::Method,
+    inbound_headers: HeaderMap,
+    resolved: ResolvedProvider,
+    upstream_base: String,
+) -> codex_app_transfer_adapters::ByteStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut captured_prompt: Option<String> = None;
+        // 检出 image_gen 后被抑制的尾随事件数。实测 image_gen 是该轮末个有效 part
+        // (后面只剩 finishReason,见 forward-trace seq=171),正常应为 0~1;若非 0 说明
+        // 模型在 image_gen 后还吐了内容被丢,流末记一条 telemetry 让其可观测(code-review M-2)。
+        let mut suppressed_after: usize = 0;
+        loop {
+            // 先把 buffer 里所有完整事件取出处理
+            while let Some(end) = next_sse_event_end(&buf) {
+                let event: Vec<u8> = buf.drain(..end).collect();
+                if captured_prompt.is_some() {
+                    suppressed_after += 1;
+                    continue; // 已检出 image_gen → 抑制其后所有事件
+                }
+                if let Some(prompt) = detect_image_gen_event(&event) {
+                    proxy_telemetry().logs.add(
+                        "INFO",
+                        format!(
+                            "[MOC-210] 截获 image_gen 调用,流末将发出图子请求(prompt 前40: {})",
+                            prompt.chars().take(40).collect::<String>()
+                        ),
+                    );
+                    captured_prompt = Some(prompt);
+                    continue; // 抑制 functionCall 事件本身
+                }
+                if tx.send(Ok(Bytes::from(event))).await.is_err() {
+                    return; // 下游已断流
+                }
+            }
+            match upstream.next().await {
+                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                Some(Err(e)) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+                None => break,
+            }
+        }
+        // upstream 结束。末尾尾事件可能没有 \n\n 收尾(没被循环里的 next_sse_event_end
+        // 取出)→ 对残留 buf 补一次检测,防 image_gen 是无分隔末事件时漏检、被当普通
+        // 内容透传成 dangling function_call(Codex 会卡等 function_call_output)。
+        if captured_prompt.is_none() && !buf.is_empty() {
+            if let Some(prompt) = detect_image_gen_event(&buf) {
+                proxy_telemetry().logs.add(
+                    "INFO",
+                    format!(
+                        "[MOC-210] 截获 image_gen 调用(末事件),发出图子请求(prompt 前40: {})",
+                        prompt.chars().take(40).collect::<String>()
+                    ),
+                );
+                captured_prompt = Some(prompt);
+                buf.clear();
+            }
+        }
+        match captured_prompt {
+            None => {
+                // 普通轮:flush 残留(末尾尾事件可能没有 \n\n 分隔)
+                if !buf.is_empty() {
+                    let _ = tx.send(Ok(Bytes::from(buf))).await;
+                }
+            }
+            Some(prompt) => {
+                // 抑制了 >1 个尾随事件(超出预期的单个 finishReason)→ 模型在 image_gen
+                // 之后可能还有别的输出被丢,记一条让其可观测(不影响出图)。
+                if suppressed_after > 1 {
+                    proxy_telemetry().logs.add(
+                        "WARN",
+                        format!(
+                            "[MOC-210] image_gen 后抑制了 {suppressed_after} 个尾随事件(预期 ≤1);如出图轮内容缺失可据此排查"
+                        ),
+                    );
+                }
+                let img = fulfill_image_gen(
+                    &prompt,
+                    &state,
+                    &method,
+                    &inbound_headers,
+                    &resolved,
+                    &upstream_base,
+                )
+                .await;
+                let _ = tx.send(Ok(img)).await;
+            }
+        }
+    });
+    Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
 /// 构造 reqwest 上游请求 + 发送,返回 `(Response, 出站 headers 快照)`。
 /// **extras / adapter 同名 header 走 override 语义**:reqwest `RequestBuilder::header()`
 /// 是 append,不是 replace。如果客户端(例如 Codex CLI 自己加的
@@ -1919,6 +2227,45 @@ fn filter_hop_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [MOC-210] SSE 事件边界:认 \n\n 与 \r\n\r\n,返回首个完整事件结束偏移。
+    #[test]
+    fn sse_event_boundary_handles_lf_and_crlf() {
+        assert_eq!(next_sse_event_end(b"data: a\n\ndata: b"), Some(9));
+        assert_eq!(next_sse_event_end(b"data: a\r\n\r\nrest"), Some(11));
+        assert_eq!(next_sse_event_end(b"data: incomplete"), None);
+        // \r\n\r\n 优先于其内部可能的 \n\n 误判,边界落在 4 字节分隔之后
+        assert_eq!(&b"data: a\r\n\r\nrest"[..11], b"data: a\r\n\r\n");
+    }
+
+    // [MOC-210] 只有 functionCall(name=image_gen) 才算出图调用;普通文本/其它工具不误判。
+    #[test]
+    fn detect_image_gen_only_matches_image_gen_function_call() {
+        let img = br#"data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"image_gen","args":{"prompt":"a cat on a sofa"}}}]}}]}}"#;
+        assert_eq!(
+            detect_image_gen_event(img),
+            Some("a cat on a sofa".to_owned())
+        );
+        // 文本里出现 "image_gen" 子串但无 functionCall → 不误判(子串预筛后 parse 兜底)
+        let text = br#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"I will call image_gen now"}]}}]}}"#;
+        assert_eq!(detect_image_gen_event(text), None);
+        // 别的工具调用 → 不命中
+        let other = br#"data: {"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"cmd":"ls"}}}]}}]}}"#;
+        assert_eq!(detect_image_gen_event(other), None);
+    }
+
+    #[test]
+    fn synth_gemini_text_event_is_parseable_cloud_code_sse() {
+        let bytes = synth_gemini_text_event("boom");
+        let s = std::str::from_utf8(&bytes).unwrap();
+        let payload = s.strip_prefix("data: ").unwrap().trim_end();
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            v["response"]["candidates"][0]["content"]["parts"][0]["text"],
+            "boom"
+        );
+        assert_eq!(v["response"]["candidates"][0]["finishReason"], "STOP");
+    }
 
     #[test]
     fn ssrf_blocks_cloud_metadata_ips() {

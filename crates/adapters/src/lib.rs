@@ -38,6 +38,13 @@ pub use responses::{
     responses_body_to_chat_body_for_provider, ChatToResponsesConverter, ResponsesAdapter,
 };
 pub use types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
+// [MOC-210] antigravity 原生出图履约:proxy(forward.rs)截获模型 image_gen 调用后,
+// 用这两个函数抽 prompt + 构造出图子请求(envelope),子请求响应的 inlineData 再经
+// adapter 转 image_generation_call。`is_antigravity_api_format` 是 antigravity 系判定的
+// 单一来源(proxy 决定是否拦截 + gemini 请求侧决定是否暴露 image_gen 工具,共用)。
+pub use mapper::cloud_code::{
+    build_antigravity_image_gen_request, extract_image_gen_prompt, is_antigravity_api_format,
+};
 
 /// 同 tool_type 前 [`DROP_TOOL_WARN_LIMIT`] 次 warn,之后静默(但 counter 仍累加)。
 ///

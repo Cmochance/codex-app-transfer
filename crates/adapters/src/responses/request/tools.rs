@@ -376,8 +376,15 @@ pub fn convert_responses_tool_to_chat_tool(
                 },
             })]
         }
+        // [MOC-210] 注意:Codex 内置 `image_generation` 工具在这条 chat-format 通用通道里
+        // **仍然 drop**(落下面 `other`)。出图履约只在 antigravity(走 gemini 请求侧的
+        // `responses_tools_to_chat_tools`,且只对 antigravity flavor 暴露 image_gen)+ proxy
+        // 响应流拦截实现 —— 没有任何 openai_chat-format provider 能履约 image_gen。若在此
+        // 无条件降级成 function tool 暴露,普通 chat provider 的模型可能真去调它 → proxy 不
+        // 拦截 → Codex 收到无 executor 的 function_call 卡等 function_call_output(code-review
+        // I-1)。故这里不特判,保持 drop。
         // Responses 专属类型(local_shell / file_search / computer_use* /
-        // code_interpreter / image_generation / mcp 等)Chat 端点不认,丢弃。
+        // code_interpreter / mcp 等)Chat 端点不认,丢弃。
         // warn_once 防多轮重发刷屏(借鉴 mimo2codex `reqToChat.ts:158-172` warnOnce)。
         other => {
             crate::warn_once_drop_tool(other);

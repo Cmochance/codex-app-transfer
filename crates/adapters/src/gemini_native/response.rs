@@ -204,6 +204,9 @@ pub struct GeminiToResponsesConverter {
     /// P0-E:已 close 的非 message/reasoning/function_call 类 items
     /// (image_generation_call / 等扩展 type),emit_completed 也按 output_index 排序
     closed_other_items: Vec<(u32, Value)>,
+    /// [MOC-210] proxy 出图履约从合成 `_casRevisedPrompt` part 暂存的 prompt,
+    /// 紧随其后的 inlineData → emit_inline_data 取用填 revised_prompt 后清空。
+    pending_image_prompt: Option<String>,
 
     // ─ 终态 ─
     has_seen_tool_calls: bool,
@@ -283,6 +286,7 @@ impl GeminiToResponsesConverter {
             closed_messages: Vec::new(),
             closed_reasonings: Vec::new(),
             closed_other_items: Vec::new(),
+            pending_image_prompt: None,
             has_seen_tool_calls: false,
             final_finish_reason: None,
             final_usage: None,
@@ -592,6 +596,20 @@ impl GeminiToResponsesConverter {
                         }
                     }));
                 }
+                // [MOC-210] 出图轮:session 历史是 chat-format,承载不了 image bytes
+                // (~1.5MB base64 逐轮回放也不经济)。记一条文本标记,让下一轮模型从历史
+                // 知道"上一轮已成功生成图片",避免它误以为没出图而用同 prompt 反复重调
+                // image_gen(MOC-210 实测重试根因之一)。revised_prompt 若有则带上,帮模型
+                // 区分自己之前画了什么。
+                Some("image_generation_call") => {
+                    let note = match item.get("revised_prompt").and_then(|v| v.as_str()) {
+                        Some(p) if !p.trim().is_empty() => {
+                            format!("[已生成图片] (prompt: {p})")
+                        }
+                        _ => "[已生成图片]".to_owned(),
+                    };
+                    text_parts.push(note);
+                }
                 _ => {}
             }
         }
@@ -745,6 +763,14 @@ impl GeminiToResponsesConverter {
             }
             if let Some(content) = &candidate.content {
                 for part in &content.parts {
+                    // [MOC-210] proxy 出图履约的旁路 part:只携带 prompt(无 text/inlineData),
+                    // 暂存给紧随其后的 inlineData → image_generation_call.revised_prompt。
+                    if let Some(rp) = &part.revised_prompt {
+                        if !rp.trim().is_empty() {
+                            self.pending_image_prompt = Some(rp.clone());
+                        }
+                        continue;
+                    }
                     // text part
                     if let Some(text) = &part.text {
                         if text.is_empty() {
@@ -1867,20 +1893,28 @@ impl GeminiToResponsesConverter {
     /// 模型在 response 里直接生成 inline_data (image/audio/video base64),
     /// 转 Responses output_item type="image_generation_call" + result 含
     /// mime_type + data。Codex.app 旧版可能不识别此 item 但 wire 上不丢。
-    fn emit_inline_data(&mut self, out: &mut Vec<u8>, mime: &str, data: &str) {
-        let item_id = format!("img_{}", synthesize_id());
+    fn emit_inline_data(&mut self, out: &mut Vec<u8>, _mime: &str, data: &str) {
+        // [MOC-210] 对齐 codex-rs `ResponseItem::ImageGenerationCall`
+        // (protocol/src/models.rs):`{ id: String, status: String, revised_prompt:
+        // Option<String>, result: String }`。`result` 必须是**裸 base64 字符串**(Codex
+        // 据此 base64-decode 存到 generated_images/<thread>/<id>.png)。早期实现把 result
+        // 写成对象 `{type,mime_type,data}` → Codex 反序列化 `result: String` 失败、报
+        // "invalid image generation payload" 丢弃整个 item → 图不渲染、模型误以为没出图
+        // 而用同一 prompt 反复重试(MOC-210 实测)。id 前缀对齐真机的 `ig_`。
+        let item_id = format!("ig_{}", synthesize_id());
         let output_index = self.next_output_index;
         self.next_output_index += 1;
-        let item = json!({
+        let mut item = json!({
             "type": "image_generation_call",
             "id": item_id,
             "status": "completed",
-            "result": {
-                "type": "inline_data",
-                "mime_type": mime,
-                "data": data,
-            },
+            "result": data,
         });
+        // [MOC-210] 出图履约带来的原始 prompt → revised_prompt(供 session 历史区分多图,
+        // 见 build_assistant_message_for_session)。仅 take 一次,避免错配后续图片。
+        if let Some(prompt) = self.pending_image_prompt.take() {
+            item["revised_prompt"] = Value::String(prompt);
+        }
         emit_event(
             out,
             &mut self.sequence_number,
@@ -3508,5 +3542,103 @@ mod tests {
             args["input"], "*** Begin Patch\n*** End Patch",
             "arguments 必须是 {{\"input\":<patch>}},与请求侧回放形态一致"
         );
+    }
+
+    // [MOC-210] 模型 inlineData 输出必须转成 codex-rs 认的 image_generation_call:
+    // `result` 是**裸 base64 字符串**(非对象)、id 前缀 `ig_`、status=completed。
+    // result 写成对象会让 Codex 报 "invalid image generation payload" 丢弃 → 图不渲染。
+    #[test]
+    fn inline_data_emits_image_generation_call_with_base64_string_result() {
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let raw = br#"data: {"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"QUJDRA=="}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events = drive_to_events(&mut conv, &[raw]);
+        let item = events
+            .iter()
+            .map(|e| parse_event(e).1)
+            .find(|v| {
+                v.get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("image_generation_call")
+            })
+            .map(|v| v["item"].clone())
+            .expect("必须 emit image_generation_call output item");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(
+            item["result"],
+            Value::String("QUJDRA==".to_owned()),
+            "result 必须是裸 base64 字符串,不能是 {{type,mime_type,data}} 对象"
+        );
+        assert!(
+            item["result"].is_string(),
+            "result 必须是 String(codex-rs ImageGenerationCall.result: String)"
+        );
+        assert!(
+            item["id"].as_str().unwrap().starts_with("ig_"),
+            "id 前缀对齐真机 ig_"
+        );
+    }
+
+    // [MOC-210] 出图轮必须在 session 历史留痕(文本标记),否则下一轮模型看不到"已出图"
+    // 会用同 prompt 反复重调 image_gen。
+    #[test]
+    fn image_generation_call_recorded_in_session_as_marker() {
+        let output_items = vec![json!({
+            "type": "image_generation_call",
+            "id": "ig_abc",
+            "status": "completed",
+            "result": "QUJDRA==",
+            "revised_prompt": "a fluffy cat"
+        })];
+        let msg = GeminiToResponsesConverter::build_assistant_message_for_session(&output_items)
+            .expect("出图轮必须产生 assistant session 消息(不能被 _=>{{}} 丢弃)");
+        let content = msg["content"].as_str().unwrap_or("");
+        assert!(
+            content.contains("已生成图片"),
+            "session content 必须含出图标记,实际: {content}"
+        );
+        assert!(
+            content.contains("a fluffy cat"),
+            "revised_prompt 应带进标记帮模型区分,实际: {content}"
+        );
+    }
+
+    // [MOC-210] 端到端验证 revised_prompt 真的从合成 `_casRevisedPrompt` part 流到
+    // image_generation_call(此前 emit_inline_data 从不设 revised_prompt、标记恒为通用,
+    // devin-review 指出测试只手造 item 没走真实路径)。这里喂「prompt 旁路 part + inlineData」
+    // 两个事件,断言产出的 item 带 revised_prompt、且 session 标记含该 prompt。
+    #[test]
+    fn revised_prompt_flows_from_synthetic_part_to_image_call_and_session() {
+        let mut conv = GeminiToResponsesConverter::new(None, None);
+        let prompt_event =
+            br#"data: {"candidates":[{"content":{"parts":[{"_casRevisedPrompt":"a fluffy cat on a sofa"}]}}]}
+
+"#;
+        let image_event = br#"data: {"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"QUJDRA=="}}]},"finishReason":"STOP"}]}
+
+"#;
+        let events = drive_to_events(&mut conv, &[prompt_event, image_event]);
+        let item = events
+            .iter()
+            .map(|e| parse_event(e).1)
+            .find(|v| {
+                v.get("item")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("image_generation_call")
+            })
+            .map(|v| v["item"].clone())
+            .expect("必须 emit image_generation_call");
+        assert_eq!(
+            item["revised_prompt"], "a fluffy cat on a sofa",
+            "revised_prompt 必须从旁路 part 流到 item,实际: {item}"
+        );
+        // 旁路 part 自身不得产出任何 output_text(否则 prompt 会泄漏到对话可见区)
+        let leaked = events
+            .iter()
+            .any(|e| e.contains("a fluffy cat on a sofa") && e.contains("output_text"));
+        assert!(!leaked, "prompt 旁路 part 不能泄漏成 output_text");
     }
 }

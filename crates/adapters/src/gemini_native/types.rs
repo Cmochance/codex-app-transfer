@@ -34,6 +34,12 @@ pub struct Part {
     /// state 透传给后续 turn,跟 LiteLLM `transformation.py:469` 一致)。
     #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// [MOC-210] proxy 出图履约专用旁路字段:`intercept_image_gen_stream` 截获模型
+    /// image_gen 调用后,把原始 prompt 经一个合成 part 带给响应转换器,emit_inline_data
+    /// 据此填 `image_generation_call.revised_prompt`(供 session 历史区分多张图,避免模型
+    /// 重复出图)。真实 Gemini wire 永不出现此字段;`skip_serializing` 保证不外泄上游。
+    #[serde(rename = "_casRevisedPrompt", skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
