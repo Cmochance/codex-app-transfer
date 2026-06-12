@@ -858,27 +858,7 @@
         ` : ""}
       </div>
     `;
-    refreshSummaryModelDatalist();
     refreshReviewModelSlotOptions();
-  }
-
-  // web_fetch 摘要模型 (MOC-152): datalist 候选 = 当前映射里配置的模型值(去重去空)。
-  function refreshSummaryModelDatalist() {
-    const dl = $("#providerSummaryModelOptions");
-    if (!dl) return;
-    const vals = Array.from(
-      new Set(
-        Object.values(providerFormMappings || {})
-          .map((v) => String(v || "").trim())
-          .filter(Boolean),
-      ),
-    );
-    dl.innerHTML = vals.map((v) => `<option value="${escapeHtml(v)}"></option>`).join("");
-  }
-
-  function setSummaryModelField(value) {
-    const el = $("#providerSummaryModel");
-    if (el) el.value = value || "";
   }
 
   // [MOC-173] auto-review 审查模型下拉:选项 = 当前映射非空的 gpt_5_X 槽(有独立 catalog
@@ -1134,9 +1114,6 @@
     if (grokWebPayload) {
       payload.grokWeb = grokWebPayload;
     }
-    // web_fetch 网页摘要模型 (MOC-152):始终带上(含空串)——空串让后端 update 清除旧值、
-    // 回退 Default 映射模型;不带则清空操作丢失(见 api.js providerBody 注释)。
-    payload.summaryModel = $("#providerSummaryModel")?.value.trim() ?? "";
     // [MOC-173] auto-review 审查模型槽位:始终带上(含空串)——空串让后端清除、回退复用主模型。
     payload.reviewModelSlot = $("#providerReviewModelSlot")?.value ?? "";
     return payload;
@@ -2259,7 +2236,6 @@
     fillGrokWebFormFromProvider(null);
     setWebSearchRow(false, false, null);
     setProviderMappings(emptyMappings());
-    setSummaryModelField(""); // 新建/重置 → 清空摘要模型
     setReviewModelSlotField(""); // 新建/重置 → 审查模型回到「跟随主模型」
   }
 
@@ -2303,7 +2279,6 @@
     );
     providerAvailableModels = [];
     setProviderMappings(preset.models || emptyMappings());
-    setSummaryModelField(""); // preset 不带摘要模型 → 清空
     setReviewModelSlotField(""); // preset 不带审查模型 → 回到「跟随主模型」
     renderPresetOptions(preset, preset.models || emptyMappings());
     updatePresetSelection();
@@ -2365,7 +2340,6 @@
     );
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
-    setSummaryModelField(provider.summaryModel || ""); // 回填已配置的摘要模型
     setReviewModelSlotField(provider.reviewModelSlot || ""); // 回填已配置的审查模型槽位
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
     updatePresetSelection();

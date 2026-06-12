@@ -140,8 +140,6 @@
       requestOptions: provider.requestOptions || {},
       default: provider.id === activeId,
       isBuiltin: !!provider.isBuiltin,
-      // web_fetch 网页摘要模型 (MOC-152);显式挑字段, 不加这行前端拿不到后端返的值。
-      summaryModel: provider.summaryModel || '',
       // [MOC-173] auto-review 审查模型槽位 key(gpt_5_X);显式挑字段,不加这行前端拿不到后端返的值。
       reviewModelSlot: provider.reviewModelSlot || '',
       mappings: {
@@ -200,11 +198,6 @@
     }
     if (includeModels) {
       body.models = payload.models || {};
-    }
-    // web_fetch 网页摘要模型 (MOC-152): 只要 payload 带了该键就下发(含空串 ''),否则用户
-    // 清空时前端不发 → 后端 update_provider 的 remove 分支永不触发、旧值残留(显式挑字段丢值)。
-    if (payload.summaryModel !== undefined && payload.summaryModel !== null) {
-      body.summaryModel = payload.summaryModel; // '' → 后端 remove(清除,回退 models.default)
     }
     // [MOC-173] auto-review 审查模型槽位:带键就下发(含空串 '' → 后端 remove 清除,回退复用主模型)。
     if (payload.reviewModelSlot !== undefined && payload.reviewModelSlot !== null) {

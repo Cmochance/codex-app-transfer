@@ -157,8 +157,8 @@ pub struct Provider {
     #[serde(default)]
     pub sort_index: i64,
     /// 透传任何此结构未显式枚举的字段(notices / baseUrlOptions /
-    /// requestOptionPresets / baseUrlHint / docsUrl / `summaryModel`(MOC-152
-    /// web_fetch 网页摘要模型, 空→`models["default"]`)/ ...).
+    /// requestOptionPresets / baseUrlHint / docsUrl / ...)。历史字段(如 MOC-227
+    /// 移除的 `summaryModel`)若残留在用户 config 也经此透传, 无主但无害。
     #[serde(flatten)]
     pub extra: IndexMap<String, Value>,
 }

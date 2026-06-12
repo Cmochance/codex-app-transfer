@@ -177,10 +177,6 @@ pub struct AddProviderInput {
     pub request_options: Option<Value>,
     #[serde(rename = "grokWeb")]
     pub grok_web: Option<Value>,
-    /// web_fetch 网页摘要模型 (MOC-152): 写进 provider JSON, 经 `Provider.extra` flatten
-    /// 透传持久化。空字符串 = 清除(回退 `models["default"]`)。
-    #[serde(rename = "summaryModel")]
-    pub summary_model: Option<String>,
     /// [MOC-173] auto-review 审查模型槽位 key(如 `gpt_5_4`)。空字符串 = 清除(auto-review
     /// 回退复用主模型)。经 `Provider.extra` flatten 透传持久化为 `reviewModelSlot`。
     #[serde(rename = "reviewModelSlot")]
@@ -300,16 +296,6 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
             "requestOptions".into(),
             input.request_options.clone().unwrap_or_else(|| json!({})),
         );
-        // web_fetch 摘要模型 (MOC-152): trim 后非空才写入(空 → 不写, 后端回退 models.default)。
-        // trim 与 update_provider 对齐, 避免直连 API 存进带首尾空格的值(devin review)。
-        if let Some(sm) = input
-            .summary_model
-            .clone()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            new_provider.insert("summaryModel".into(), Value::String(sm));
-        }
         // [MOC-173] auto-review 审查模型槽位:trim 后非空才写入(空 → 不写 = 复用主模型)。
         if let Some(slot) = input
             .review_model_slot
@@ -406,15 +392,6 @@ pub async fn update_provider(
         }
         if let Some(opts) = input.request_options.clone() {
             updated.insert("requestOptions".into(), opts);
-        }
-        // web_fetch 摘要模型 (MOC-152): 非空 insert, 空字符串 = 用户清除 → remove(回退 default)。
-        if let Some(sm) = input.summary_model.clone() {
-            let sm = sm.trim();
-            if sm.is_empty() {
-                updated.remove("summaryModel");
-            } else {
-                updated.insert("summaryModel".into(), Value::String(sm.to_string()));
-            }
         }
         // [MOC-173] auto-review 审查模型槽位:非空 insert,空字符串 = 用户清除 → remove(复用主模型)。
         if let Some(slot) = input.review_model_slot.clone() {

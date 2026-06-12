@@ -509,9 +509,10 @@
           diffLines(bodyText(ib.body), bodyText(ob.body)), false);
   }
 
-  // MOC-181: cat-webfetch 链路详情(请求 / 抓取+升级链 / 摘要 prompt+响应 / 结果)。
+  // MOC-181: cat-webfetch 链路详情(请求 / 抓取+升级链 / 结果)。
+  // MOC-227: summarize 段渲染已随摘要兜底移除(历史 trace 里的 summarize 字段不再展示)。
   function renderCatWebfetch(t) {
-    const r = t.request || {}, f = t.fetch || {}, s = t.summarize || {}, res = t.result || {};
+    const r = t.request || {}, f = t.fetch || {}, res = t.result || {};
     let html = `<div class="meta">tool: ${esc(t.tool)} · seq ${esc(t.seq)} · ${esc(t.captured_at)}</div>`;
     html += `<div class="tools"><button data-copy="full">复制 JSON</button></div>`;
     html += seg("请求 · request", esc(t.tool || ""), hdrTable(r));
@@ -523,20 +524,6 @@
           + `<pre class="payload">${esc(f.escalation_trail.join("\n"))}</pre>`;
       }
       html += seg("抓取 · fetch", esc(f.final_tier || f.backend || ""), inner);
-    }
-    if (s && Object.keys(s).length) {
-      if (s.fallback_raw) {
-        html += seg("摘要 · fallback(回退原文)", "未生成",
-          `<pre class="payload">摘要未生成: ${esc(s.error || "")}</pre>`);
-      } else {
-        const scopy = Object.assign({}, s); delete scopy.prompt_sent; delete scopy.response;
-        const inner = hdrTable(scopy)
-          + `<div class="meta">prompt_sent(完整喂给摘要模型):</div>`
-          + `<pre class="payload">${esc(s.prompt_sent || "")}</pre>`
-          + `<div class="meta">response(摘要模型原始回复):</div>`
-          + `<pre class="payload">${esc(s.response || "")}</pre>`;
-        html += seg("摘要 · summarize", esc(s.model || ""), inner);
-      }
     }
     html += seg("结果 · result", res.is_error ? "ERROR" : "ok", hdrTable(res));
     detailEl.innerHTML = html;
