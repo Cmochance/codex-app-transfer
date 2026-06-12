@@ -12,6 +12,9 @@
 //!
 //! reasoning / message / tool_calls 三类 item 在同一响应里独立维持,按
 //! "实际出现顺序"决定它们在最终 `response.completed.output[]` 里的排列。
+//! [MOC-219] 额外增加一类合成 preamble message item:连续工具循环中模型省略
+//! preamble 且该轮为同类工具首现时,从 reasoning 文本截取 ≤300 字符注入为
+//! 普通 assistant message(output_index 排在对应 function_call 之前)。
 //!
 //! 状态机生命周期(单次响应):
 //! ```text
@@ -25,6 +28,9 @@
 //!         首次 content delta:
 //!           if reasoning 还开着 → reasoning close
 //!           message open → output_text.delta*
+//!         首次 function_call delta(同类工具首现且本轮无模型 message):
+//!           [MOC-219] maybe_inject_preamble_message → 合成 assistant message
+//!           (完整 6 事件生命周期,output_index < function_call)
 //!                    │
 //!         close 阶段:open 着的 item 依次 close → response.completed
 //! ```
@@ -255,6 +261,23 @@ pub struct ChatToResponsesConverter {
     /// `streamToSse.ts:48` `state.activeAnnotations` + `streamToSse.ts:338-352`
     /// 累计逻辑。
     active_annotations: Vec<Value>,
+
+    // ── preamble fallback(MOC-219)──
+    /// 本响应是否已注入过合成 preamble message(每响应最多一次)。
+    /// 背景:连续工具流中模型常省略 preamble message,Codex v26.609 起不再
+    /// 渲染工具轮间的 reasoning → UI 把所有 tool 折叠成一团。fallback:
+    /// 「同类工具首现」且本轮无模型 message 时,把 reasoning 文本复制一份
+    /// 作为合成 message 注入(`[reasoning, message, function_call]` 标准
+    /// wire 序),走渲染最稳定的 assistant message 通道;同类工具连续调用
+    /// 不注入 → 自动折叠成组。
+    preamble_injected: bool,
+    /// 已注入的合成 message items,envelope 组装时按 output_index 并入
+    /// (与 `closed_reasoning_items` 同模式)。
+    injected_preamble_items: Vec<(u32, Value)>,
+    /// 「自上次可见 assistant 文本以来」历史里出现过的工具名集合,从
+    /// `original_request.input` 尾部连续工具段 lazy 提取一次(无新增全局
+    /// 状态,跨轮「同类工具首现」判定靠它)。
+    history_recent_tools: Option<std::collections::HashSet<String>>,
 }
 
 impl ChatToResponsesConverter {
@@ -310,6 +333,9 @@ impl ChatToResponsesConverter {
                 .unwrap_or(0),
             tool_namespace_map: std::collections::HashMap::new(),
             active_annotations: Vec::new(),
+            preamble_injected: false,
+            injected_preamble_items: Vec::new(),
+            history_recent_tools: None,
         }
     }
 
@@ -639,9 +665,6 @@ impl ChatToResponsesConverter {
             if self.reasoning_open {
                 self.close_reasoning(out);
             }
-            let output_index = self.next_output_index;
-            self.next_output_index += 1;
-            let fc_id = format!("fc_{}_{}", self.fc_id_seed, openai_index);
             let call_id = tc
                 .id
                 .clone()
@@ -661,6 +684,14 @@ impl ChatToResponsesConverter {
             } else {
                 raw_name.clone()
             };
+            // [MOC-219] preamble fallback:本轮无模型 message 且该工具是
+            // 「自上次可见文本以来」首现 → 把 reasoning 文本复制为合成
+            // message 注入(必须在 fc 的 output_index 分配前,保证
+            // [reasoning, message, function_call] 的 item 顺序)。
+            self.maybe_inject_preamble_message(&name, out);
+            let output_index = self.next_output_index;
+            self.next_output_index += 1;
+            let fc_id = format!("fc_{}_{}", self.fc_id_seed, openai_index);
             // **取舍**:wire 形态(function_call vs custom_tool_call)在 open
             // 时一次性根据**首帧 name** 决定,后续帧补全 name 不改 wire。
             // 实测 DeepSeek / Kimi / MiMo 都在首帧带 name。极端情况下首帧
@@ -1570,6 +1601,156 @@ impl ChatToResponsesConverter {
         })
     }
 
+    /// [MOC-219] preamble fallback 注入:把本响应的 reasoning 文本复制为一条
+    /// 合成 assistant message item(完整生命周期 6 事件 + envelope item),
+    /// 让 Codex UI 在工具组之间有可渲染文本(v26.609 起不再渲染工具轮间的
+    /// reasoning)。注入条件(全部满足):
+    /// 1. 本响应尚未注入过(每响应最多一次);
+    /// 2. 本响应模型自己没吐过可见文本(message 未开过、text 未累积);
+    /// 3. 本响应有已闭合的 reasoning 文本;
+    /// 4. 即将调用的工具是「自上次可见 assistant 文本以来」的首现工具种类
+    ///    (历史尾部连续工具段 ∪ 本响应已 open 工具均未出现)——同类工具
+    ///    连续调用不注入,UI 自动折叠成组。
+    ///
+    /// 合成 message 走标准 wire,会进 Codex rollout / 后续轮历史 / compact /
+    /// 切真 GPT 上发(assistant message 无后端校验风险,用户已接受进上下文,
+    /// 2026-06-12 拍板)。独立 item id(`msg_<seed>_pre<N>`),不动模型自身
+    /// message 的 `message_*` 状态。
+    fn maybe_inject_preamble_message(&mut self, tool_name: &str, out: &mut Vec<u8>) {
+        if self.preamble_injected {
+            return;
+        }
+        if self.message_open || self.message_closed || !self.text_acc.is_empty() {
+            return;
+        }
+        if self.reasoning_history.trim().is_empty() {
+            return;
+        }
+        if self.history_recent_tools.is_none() {
+            let seen = self
+                .original_request
+                .as_ref()
+                .and_then(|r| r.get("input"))
+                .map(recent_tool_names_from_history)
+                .unwrap_or_default();
+            self.history_recent_tools = Some(seen);
+        }
+        let seen_in_history = self
+            .history_recent_tools
+            .as_ref()
+            .is_some_and(|s| s.contains(tool_name));
+        let seen_in_response = self.tool_calls.values().any(|t| t.name == tool_name);
+        if seen_in_history || seen_in_response {
+            // 「该注入没注入」方向的排查锚点(debug 级,同类连续轮高频)
+            tracing::debug!(
+                target: "adapters::preamble",
+                tool = tool_name,
+                source = if seen_in_history { "history" } else { "response" },
+                "[MOC-219] 同类工具非首现,跳过 preamble 注入(折叠成组)"
+            );
+            return;
+        }
+        let text = select_preamble_text(&self.reasoning_history);
+        if text.is_empty() {
+            return;
+        }
+        let item_id = format!("msg_{}_pre{}", self.fc_id_seed, self.next_output_index);
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "id": item_id,
+                    "content": [],
+                },
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": "", "annotations": [] },
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_text.delta",
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "delta": text,
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_text.done",
+            json!({
+                "type": "response.output_text.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "text": text,
+            }),
+        );
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.content_part.done",
+            json!({
+                "type": "response.content_part.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": text, "annotations": [] },
+            }),
+        );
+        let item = json!({
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "id": item_id,
+            "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+        });
+        emit_event(
+            out,
+            &mut self.sequence_number,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item.clone(),
+            }),
+        );
+        self.injected_preamble_items.push((output_index, item));
+        self.preamble_injected = true;
+        // info + target 对齐 apply_patch / tool_search shim 的既有约定:注入
+        // 改变用户可见输出且写进会话历史,失控场景(每轮注入)需要默认级别
+        // 可见的排查锚点;频率天然 ≤1/响应,无刷屏风险。
+        tracing::info!(
+            target: "adapters::preamble",
+            tool = tool_name,
+            len = text.chars().count(),
+            "[MOC-219] 注入 preamble fallback message(同类工具首现且本轮无模型 message)"
+        );
+    }
+
     fn open_message(&mut self, out: &mut Vec<u8>) {
         self.message_open = true;
         self.message_index = self.next_output_index;
@@ -1717,6 +1898,8 @@ impl ChatToResponsesConverter {
         let mut all_items: Vec<(u32, Value)> = Vec::new();
         // 已闭合的 reasoning 段(close_reasoning 时快照;interleaved thinking 可能多段)
         all_items.extend(self.closed_reasoning_items.iter().cloned());
+        // [MOC-219] 合成 preamble message(注入时快照)
+        all_items.extend(self.injected_preamble_items.iter().cloned());
         if self.reasoning_open {
             all_items.push((self.reasoning_index, self.reasoning_item_completed()));
         }
@@ -1757,6 +1940,89 @@ impl Default for ChatToResponsesConverter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// [MOC-219] 从 reasoning 文本截取 preamble:短的全取,长的按段落累积、
+/// 总长 ≤ `PREAMBLE_MAX_CHARS`;至少取一段,单段超限按 char 边界截断加 `…`。
+/// 用户拍板的截取策略(2026-06-12)。
+fn select_preamble_text(reasoning: &str) -> String {
+    const PREAMBLE_MAX_CHARS: usize = 300;
+    let trimmed = reasoning.trim();
+    if trimmed.chars().count() <= PREAMBLE_MAX_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut acc = String::new();
+    for para in trimmed.split("\n\n") {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        let sep = if acc.is_empty() { 0 } else { 2 };
+        if acc.chars().count() + sep + para.chars().count() <= PREAMBLE_MAX_CHARS {
+            if sep > 0 {
+                acc.push_str("\n\n");
+            }
+            acc.push_str(para);
+        } else {
+            if acc.is_empty() {
+                // 首段自身超限:char 边界截断 + 省略号
+                acc = para.chars().take(PREAMBLE_MAX_CHARS).collect();
+                acc.push('…');
+            }
+            break;
+        }
+    }
+    acc
+}
+
+/// [MOC-219]「自上次可见 assistant 文本以来」历史尾部连续工具段的工具名集合。
+/// 从 `original_request.input` 尾部往前扫:工具调用 item 收集 name;遇到带
+/// 非空文本的 assistant message(上一段可见 preamble)或 user message(新
+/// task 边界)即停;`function_call_output` / `reasoning` 等不打断。注入判定
+/// 用:本轮工具 name 不在集合中 = 同类工具首现 → 注入合成 preamble。
+fn recent_tool_names_from_history(input: &Value) -> std::collections::HashSet<String> {
+    let mut seen = std::collections::HashSet::new();
+    let Some(items) = input.as_array() else {
+        return seen;
+    };
+    for item in items.iter().rev() {
+        let ty = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match ty {
+            "function_call" | "custom_tool_call" => {
+                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    seen.insert(name.to_owned());
+                }
+            }
+            // tool_search_call 的 wire **结构性无 name 字段**(`ResponseItem::
+            // ToolSearchCall { call_id, execution, arguments }`,同
+            // `responses/request.rs` 回放时硬编码 `"name": "tool_search"` 的
+            // 同一事实)——用固定标识对齐响应侧 redirect 后的统一 name,否则
+            // 跨轮 tool_search 去重静默失效 → 每轮注入且注入的 message 又成为
+            // 下轮扫描边界,失控自我延续(review 抓的 HIGH)。
+            "tool_search_call" => {
+                seen.insert("tool_search".to_owned());
+            }
+            "message" => {
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+                let has_text = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts.iter().any(|p| {
+                            p.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| !t.trim().is_empty())
+                        })
+                    })
+                    .unwrap_or(false);
+                if role == "user" || (role == "assistant" && has_text) {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    seen
 }
 
 /// 把 Chat Completions 风格的 `usage`(prompt_tokens / completion_tokens /
@@ -3302,15 +3568,27 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
                 "response.reasoning_summary_part.done",
                 "response.reasoning_text.done", // content 通道
                 "response.output_item.done",    // reasoning 闭合在先
-                "response.output_item.added",   // function_call 打开在后
+                // [MOC-219] 本轮无模型 message + 工具首现 → 注入合成 preamble
+                // message 完整生命周期(reasoning 与 function_call 之间)
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.output_item.added", // function_call 打开在后
                 "response.function_call_arguments.delta",
             ]
         );
         assert_eq!(ev2[3].1["item"]["type"], "reasoning");
-        assert_eq!(ev2[4].1["item"]["type"], "function_call");
-        // reasoning 占 output_index 0,tool_call 严格在其后
+        assert_eq!(ev2[4].1["item"]["type"], "message");
+        assert_eq!(ev2[10].1["item"]["type"], "function_call");
+        // item 顺序:reasoning(0)→ 合成 message(1)→ tool_call(2)
         assert_eq!(ev2[3].1["output_index"], 0);
         assert_eq!(ev2[4].1["output_index"], 1);
+        assert_eq!(ev2[10].1["output_index"], 2);
+        // 合成 message 文本 = reasoning 纯思考(剥 **Thinking** header)
+        assert_eq!(ev2[6].1["delta"], "think");
 
         let _ =
             c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
@@ -3318,9 +3596,11 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         let ev3 = parse_emitted(&out3);
         let completed = &ev3.last().unwrap().1["response"];
         let output = completed["output"].as_array().unwrap();
-        assert_eq!(output.len(), 2);
+        assert_eq!(output.len(), 3);
         assert_eq!(output[0]["type"], "reasoning");
-        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "think");
+        assert_eq!(output[2]["type"], "function_call");
     }
 
     /// MOC-203 interleaved thinking 锁定:tool_call 强制闭合 reasoning 后,
@@ -3350,8 +3630,9 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","fu
             .collect();
         assert_eq!(added.len(), 1, "第二段 reasoning 应重开新 item");
         assert_eq!(added[0].1["item"]["type"], "reasoning");
-        // 新段领新 output_index(0=seg1 reasoning,1=tool_call,2=seg2 reasoning)
-        assert_eq!(added[0].1["output_index"], 2);
+        // 新段领新 output_index(0=seg1 reasoning,1=[MOC-219] 合成 preamble
+        // message,2=tool_call,3=seg2 reasoning)
+        assert_eq!(added[0].1["output_index"], 3);
 
         let _ =
             c.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
@@ -3359,22 +3640,205 @@ data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","fu
         let ev4 = parse_emitted(&out4);
         let completed = &ev4.last().unwrap().1["response"];
         let output = completed["output"].as_array().unwrap();
-        // 两段 reasoning + 一个 function_call,按 output_index 排序
-        assert_eq!(output.len(), 3);
+        // 两段 reasoning + 合成 preamble message + function_call,按 output_index 排序
+        assert_eq!(output.len(), 4);
         assert_eq!(output[0]["type"], "reasoning");
-        assert_eq!(output[1]["type"], "function_call");
-        assert_eq!(output[2]["type"], "reasoning");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[2]["type"], "function_call");
+        assert_eq!(output[3]["type"], "reasoning");
         // 两段 item id 不同(避免与已 done 的 item 撞 id)
-        assert_ne!(output[0]["id"], output[2]["id"]);
+        assert_ne!(output[0]["id"], output[3]["id"]);
         // [MOC-218 第三关] item 不带 content;各段独立思考文本经 SSE
         // reasoning_text 事件与 summary 承载
         assert!(output[0].get("content").is_none());
-        assert!(output[2].get("content").is_none());
+        assert!(output[3].get("content").is_none());
         assert_eq!(output[0]["summary"][0]["text"], "**Thinking**\n\nthink1");
-        assert_eq!(output[2]["summary"][0]["text"], "**Thinking**\n\nthink2");
+        assert_eq!(output[3]["summary"][0]["text"], "**Thinking**\n\nthink2");
         // assistant_message 历史回灌:两段拼接、均剥 header
         let msg = c.assistant_message().unwrap();
         assert_eq!(msg["reasoning_content"], "think1\n\nthink2");
+    }
+
+    // ── [MOC-219] preamble fallback 注入矩阵 ──
+
+    /// 同类工具在「历史尾部连续工具段」已出现 → 不注入(UI 自动折叠同类)。
+    #[test]
+    fn preamble_not_injected_when_same_tool_in_recent_history() {
+        let original = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "do it"}]},
+                {"type": "function_call", "call_id": "c1", "name": "search", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            ]
+        });
+        let mut c = fixed().with_original_request(Some(original));
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}
+
+"#,
+        );
+        let out = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","function":{"name":"search","arguments":"{}"}}]}}]}
+
+"#,
+        );
+        let ev = parse_emitted(&out);
+        assert!(
+            !ev.iter()
+                .any(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "message"),
+            "同类工具(search)在历史尾部工具段已出现,不得注入合成 message"
+        );
+    }
+
+    /// 同名工具出现在「上一段可见 assistant 文本之前」→ 不算已见(扫描在可见
+    /// 文本处截断)→ 注入。
+    #[test]
+    fn preamble_injected_when_tool_only_seen_before_visible_message() {
+        let original = serde_json::json!({
+            "input": [
+                {"type": "function_call", "call_id": "c0", "name": "search", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c0", "output": "ok"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "上一段 preamble"}]},
+                {"type": "function_call", "call_id": "c1", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            ]
+        });
+        let mut c = fixed().with_original_request(Some(original));
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}
+
+"#,
+        );
+        let out = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","function":{"name":"search","arguments":"{}"}}]}}]}
+
+"#,
+        );
+        let ev = parse_emitted(&out);
+        assert!(
+            ev.iter()
+                .any(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "message"),
+            "search 上次出现在可见 assistant 文本之前,应视为首现并注入"
+        );
+    }
+
+    /// 本轮模型自己吐过可见文本 → 不注入(模型已有 preamble)。
+    #[test]
+    fn preamble_not_injected_when_model_already_messaged() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"I will search now."}}]}
+
+"#,
+        );
+        let out = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"search","arguments":"{}"}}]}}]}
+
+"#,
+        );
+        let ev = parse_emitted(&out);
+        // tool_call 阶段不得再出现新 message item(模型 message 已在流中)
+        assert!(
+            !ev.iter()
+                .any(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "message"),
+            "模型已吐 message,不得注入合成 preamble"
+        );
+    }
+
+    /// 一轮多个新工具:每响应最多注入一次。
+    #[test]
+    fn preamble_injected_at_most_once_per_response() {
+        let mut c = fixed();
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}
+
+"#,
+        );
+        let out = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"alpha","arguments":"{}"}},{"index":1,"id":"c2","function":{"name":"beta","arguments":"{}"}}]}}]}
+
+"#,
+        );
+        let ev = parse_emitted(&out);
+        let injected = ev
+            .iter()
+            .filter(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "message")
+            .count();
+        assert_eq!(injected, 1, "一轮两个新工具也只注入一条合成 message");
+    }
+
+    /// [MOC-219] 截取策略:短全取 / 段落累积 ≤300 / 首段超限截断加省略号。
+    #[test]
+    fn select_preamble_text_strategy() {
+        assert_eq!(select_preamble_text("short thought"), "short thought");
+        // 段落累积:首段 + 次段 ≤300 → 两段都要;第三段加入会超 → 停
+        let p1 = "a".repeat(120);
+        let p2 = "b".repeat(120);
+        let p3 = "c".repeat(120);
+        let text = format!("{p1}\n\n{p2}\n\n{p3}");
+        let got = select_preamble_text(&text);
+        assert_eq!(got, format!("{p1}\n\n{p2}"));
+        // 首段自身超 300 → 截 300 字符 + …(char 边界,中文安全)
+        let long = "思".repeat(400);
+        let got = select_preamble_text(&long);
+        assert_eq!(got.chars().count(), 301);
+        assert!(got.ends_with('…'));
+    }
+
+    /// [MOC-219 review HIGH 回归锁定] tool_search_call 的真实 wire 形态
+    /// **无 name 字段**(`ResponseItem::ToolSearchCall {call_id, execution,
+    /// arguments}`),历史扫描必须用固定标识收集,否则跨轮 tool_search 去重
+    /// 静默失效 → 每轮注入且自我延续。
+    #[test]
+    fn preamble_not_injected_when_tool_search_call_in_history_without_name() {
+        let original = serde_json::json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "tool_search_call", "call_id": "ts1", "execution": "client", "arguments": {"query": "web"}},
+                {"type": "tool_search_output", "call_id": "ts1", "output": "[]"},
+            ]
+        });
+        let mut c = fixed().with_original_request(Some(original));
+        let _ = c.feed(
+            br#"data: {"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"think"}}]}
+
+"#,
+        );
+        let out = c.feed(
+            br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"name":"tool_search","arguments":"{}"}}]}}]}
+
+"#,
+        );
+        let ev = parse_emitted(&out);
+        assert!(
+            !ev.iter()
+                .any(|(n, d)| n == "response.output_item.added" && d["item"]["type"] == "message"),
+            "历史已有 tool_search_call(无 name 形态),本轮再调 tool_search 不得注入"
+        );
+    }
+
+    /// [MOC-219] 历史尾部工具段提取:user 边界截断;reasoning /
+    /// function_call_output / 空文本 assistant message 不打断。
+    #[test]
+    fn recent_tool_names_from_history_scan_rules() {
+        let input = serde_json::json!([
+            {"type": "function_call", "name": "old_tool", "arguments": "{}"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            {"type": "function_call", "name": "tool_a", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "x", "output": "ok"},
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "role": "assistant", "content": []},
+            {"type": "custom_tool_call", "name": "tool_b", "input": ""},
+        ]);
+        let seen = recent_tool_names_from_history(&input);
+        assert!(seen.contains("tool_a"), "工具段内的 function_call 应收集");
+        assert!(seen.contains("tool_b"), "custom_tool_call 应收集");
+        assert!(
+            !seen.contains("old_tool"),
+            "user message 之前的工具不属于当前连续段"
+        );
     }
 
     #[test]
