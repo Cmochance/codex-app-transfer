@@ -27,14 +27,24 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
         // MiniMax
         "minimax-m2.7" => Some(204_800),
         "minimax-m3" => Some(ONE_M_CONTEXT_WINDOW),
-        // Google Gemini:antigravity 上游对全系 gemini 文本模型(flash / pro / agent
-        // 各档)都声明 context_length = 1_048_576(`antigravity_models.json`),Google
-        // 官方 Gemini 1.5 / 2.x / 3.x 文本上下文也都 ≥ 1M。真机 antigravity 实际映射
-        // 的是带后缀的 id(`gemini-3-flash-agent` / `gemini-3.1-pro-low` /
-        // `gemini-pro-agent` 等),逐 id 精确枚举追不上上游上新,故按前缀统一判 1M。
-        // 没有其它 provider 的模型 id 以 `gemini` 开头,零误伤。`gemini-*-image` 是
-        // 图像模型(`context_length` 为 null,见 MOC-222),不参与文本上下文,排除。
-        m if m.starts_with("gemini") && !m.contains("image") => Some(ONE_M_CONTEXT_WINDOW),
+        // Google Gemini:仅限**确有 ≥1M 上下文**的世代 —— Gemini 1.5 / 2.x / 3.x
+        // (antigravity 全系落在 2.x / 3.x,且上游 `antigravity_models.json` 对它们都
+        // 声明 context_length = 1_048_576)。真机 antigravity 实际映射的是带后缀的 id
+        // (`gemini-3-flash-agent` / `gemini-3.1-pro-low` 等,已被版本前缀覆盖),唯
+        // `gemini-pro-agent`(antigravity 的 Gemini 3.1 Pro 别名)无版本号前缀,单列。
+        // 逐 id 精确枚举追不上上游上新,故按世代前缀统一判 1M。
+        // **不**放宽到裸 `gemini-pro` / `gemini-1.0-*` 等老世代(真实上限 ~32k):给它们
+        // 误报 1M 会让 autocompact 等到 800k 才触发、反而撑爆上游(#453 P2);老 id 维持
+        // None → 落 258_400 兜底(与改动前一致,无回归)。`gemini-*-image` 是图像模型
+        // (`context_length` 为 null,见 MOC-222),不参与文本上下文,排除。
+        m if !m.contains("image")
+            && (m.starts_with("gemini-1.5")
+                || m.starts_with("gemini-2")
+                || m.starts_with("gemini-3")
+                || m.starts_with("gemini-pro-agent")) =>
+        {
+            Some(ONE_M_CONTEXT_WINDOW)
+        }
         _ => None,
     }
 }
@@ -180,6 +190,24 @@ mod tests {
         assert_eq!(
             documented_context_window("gemini-3-pro-image-preview"),
             None
+        );
+    }
+
+    #[test]
+    fn documented_context_window_excludes_legacy_gemini_without_1m() {
+        // 老世代 gemini(真实上限 ~32k)不能误报 1M —— 否则手动映射这些 id 时
+        // autocompact 等到 800k 才触发、反而撑爆上游(#453 P2)。维持 None → 兜底。
+        for id in [
+            "gemini-pro",     // 裸名 = Gemini 1.0 Pro
+            "gemini-1.0-pro", // 1.0 世代
+            "gemini-1.0-pro-vision",
+        ] {
+            assert_eq!(documented_context_window(id), None, "{id} 不应判 1M");
+        }
+        // 但 Gemini 1.5+ 世代仍判 1M
+        assert_eq!(
+            documented_context_window("gemini-1.5-pro"),
+            Some(ONE_M_CONTEXT_WINDOW),
         );
     }
 
