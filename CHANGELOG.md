@@ -26,7 +26,7 @@
 
 **移除 web_fetch 摘要兜底 + summaryModel 配置整链 (MOC-227)**:web_fetch 自 MOC-190 起默认返回全文,`summarize=true` opt-in 摘要兜底实际几乎不会触达且依赖摘要模型配置,整链移除 —— MCP server 摘要管线(选块 / strip_think / 摘要请求)、provider `summaryModel` 配置字段与前端设置行、内置 preset 残留字段、trace viewer 摘要段渲染。旧会话模型仍传 `summarize` / `query` / `prompt` 参数时静默忽略、走默认全文路径(非破坏性);用户 config 中残留的 `summaryModel` 字段经 extra 透传,无主但无害。Refs MOC-227。
 
-**apply_patch 中间层新增两条 glm-5.1 格式修复规则 (MOC-228)**:glm 系编码模型(尤其 glm-5.1)在 V4A patch 生成上有两类固定格式错误。① `@@ X` 紧跟内容逐字相同的 `-X`(同一行既当 `@@` 定位锚点又当 `-` 删除行)→ 中间层删冗余 `@@` 行、保留 `-` 行(精确匹配,不误判缩进不同的合法行);② Add File body 末尾误入 `+*** End Patch`(把信封结尾标记加了 `+` 前缀当文件内容)→ 仅当 patch 缺真信封结尾时剥离(已含真裸 `*** End Patch` 时保守不剥,避免误删合法文件内容),剥后由 `ensure_v4a_envelope` 补回真信封。两条规则均为纯字符串、不读盘,防御性收紧:未命中一律透传。含 10 个新单元测试(正例 + 反例 + 端到端,覆盖不误触发合法 patch)。Refs MOC-228。
+**apply_patch 中间层新增两条 glm-5.1 格式修复规则 (MOC-228)**:glm 系编码模型(尤其 glm-5.1)在 V4A patch 生成上有两类固定格式错误。① `@@ X` 紧跟内容逐字相同的 `-X`(同一行既当 `@@` 定位锚点又当 `-` 删除行)→ 中间层删冗余 `@@` 行、保留 `-` 行(精确匹配,不误判缩进不同的合法行;**仅 `*** Update File:` section 内生效**,Add File body 里的 `@@`/`-` 是文件内容、不去重);② Add File body 末尾误入 `+*** End Patch`(把信封结尾标记加了 `+` 前缀当文件内容)→ 仅当 patch 缺真信封结尾时剥离(已含真裸 `*** End Patch` 时保守不剥,避免误删合法文件内容),剥后由 `ensure_v4a_envelope` 补回真信封。两条规则均为纯字符串、不读盘,防御性收紧:未命中一律透传。含 10 个新单元测试(正例 + 反例 + 端到端,覆盖不误触发合法 patch)。Refs MOC-228。
 
 **工程杂项**:release 发版门禁 —— release.yml 双 job 校验 `release-notes/vX.Y.Z.md` 必须随 tag 进仓库,缺失即 4 平台 fail(MOC-66,并回填 v2.2.0–v2.3.1 四版 notes 文件);codex 0.139 适配小修(MOC-205);集成测试 home 隔离,不再读写真机 sessions.db(MOC-195);chat/grok/gemini/compact 失败流骨架提取 core + grok dead-code 清理(MOC-118)。
 

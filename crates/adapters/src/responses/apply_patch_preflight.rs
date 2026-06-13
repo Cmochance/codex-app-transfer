@@ -246,22 +246,39 @@ fn strip_trailing_at(v4a: &str) -> (String, Vec<Repair>) {
 /// V4A 语义:`@@` 是不消费的 context 锚点,`-` 是删除行;两者指向文件同一行(只有一份)→ `@@` 定位 +
 /// `-` 又删 → 消费冲突 → `Failed to find` / `skipped:no_unique_match`。修复:删 `@@` 行(冗余锚点)、
 /// 保留 `-` 行(真删除意图)。**只在 `@@ <h>` 紧跟 `-<h>` 且去前缀后逐字相同时触发**(精确匹配,不 trim,
-/// 避免误判缩进不同的合法行);`@@ X` 紧跟 `-Y`(不同) / `+X` / context 一律不动。纯字符串、不读盘。
+/// 避免误判缩进不同的合法行);`@@ X` 紧跟 `-Y`(不同) / `+X` / context 一律不动。
+/// **仅在 `*** Update File:` section 内生效**(MOC-228 bot P2):`@@`/`-` 只在 Update hunk 里才是
+/// 锚点 / 删除语义;**Add File body 里的 `@@ foo` / `-foo` 是文件内容**(diff fixture / 文档,且可能
+/// 缺 `+` 前缀待 `ensure_add_file_plus` 补),绝不去重 —— 否则会在补 `+` 前误删合法内容(silent data
+/// loss)。Delete File 无 body。纯字符串、不读盘。
 fn dedup_at_minus(v4a: &str) -> (String, Vec<Repair>) {
     let lines: Vec<&str> = v4a.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = 0usize;
+    // 仅 Update File section 内 `@@`/`-` 是 hunk 语法;Add/Delete File body 不碰(见 docstring)。
+    let mut in_update = false;
     let mut i = 0;
     while i < lines.len() {
         let l = lines[i];
-        // `@@ <h>`(非裸 `@@`)紧跟 `-<h>`(去 `-` 前缀后与 h 逐字相同)→ 删 `@@` 行
-        if let Some(h) = l.strip_prefix("@@ ") {
-            if !h.trim().is_empty() && i + 1 < lines.len() {
-                if let Some(m) = lines[i + 1].strip_prefix('-') {
-                    if m == h {
-                        changed += 1;
-                        i += 1; // 跳过 `@@` 行,下轮从 `-` 行继续(保留之)
-                        continue;
+        if l.starts_with("*** Update File:") {
+            in_update = true;
+        } else if l.starts_with("*** Add File:")
+            || l.starts_with("*** Delete File:")
+            || l.starts_with("*** Begin Patch")
+            || l.starts_with("*** End Patch")
+        {
+            in_update = false;
+        }
+        // 仅 Update section 内:`@@ <h>`(非裸 `@@`)紧跟 `-<h>`(去前缀逐字相同)→ 删冗余 `@@` 行
+        if in_update {
+            if let Some(h) = l.strip_prefix("@@ ") {
+                if !h.trim().is_empty() && i + 1 < lines.len() {
+                    if let Some(m) = lines[i + 1].strip_prefix('-') {
+                        if m == h {
+                            changed += 1;
+                            i += 1; // 跳过 `@@` 行,下轮从 `-` 行继续(保留之)
+                            continue;
+                        }
                     }
                 }
             }
@@ -1132,6 +1149,17 @@ mod tests {
         // 裸 @@(section 分隔)不动
         let v4a = "@@\n-x\n";
         assert_eq!(dedup_at_minus(v4a).0, v4a);
+    }
+
+    #[test]
+    fn dedup_at_minus_ignores_add_file_content() {
+        // [bot P2 反例] Add File body 含 @@ foo + -foo(diff fixture / 文档内容,@@/- 是文件字面内容)
+        // → 绝不去重(否则会误删合法 Add 内容,silent data loss)。只在 Update section 才去重。
+        let v4a =
+            "*** Begin Patch\n*** Add File: example.diff\n@@ foo\n-foo\n+bar\n*** End Patch\n";
+        let (out, reps) = dedup_at_minus(v4a);
+        assert_eq!(out, v4a, "Add File body 的 @@/- 是内容,整体不动");
+        assert!(reps.is_empty());
     }
 
     #[test]
