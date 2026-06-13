@@ -900,13 +900,16 @@ pub(crate) fn make_msg(id: u64, method: &str, params: Value) -> (String, u64) {
 }
 
 /// drain CDP messages until we receive the response with the matching `expected_id`.
-/// CDP 可能先发 event(无 `id` 字段)再发 response,所以必须 loop 跳过 event。
-/// 检查 response 的 `error` 字段,有错就返 Err。
+/// 等到 id==expected_id 的 CDP 响应(CDP 可能先发 event(无 `id` 字段)再发 response,
+/// 所以必须 loop 跳过 event)。检查 response 的 `error` 字段,有错就返 Err。
 /// overall_timeout = 8s,每条 read 最多等 500ms。
+///
+/// 返回 `Runtime.evaluate` 结果值(`result.result.value`,returnByValue 下是真实 JS 返回值;
+/// 无则 None)—— caller 可 `?` 忽略,也可读回(MOC-230:回读活动 conversationId)。
 pub(crate) async fn drain_until_response(
     read: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
     expected_id: u64,
-) -> Result<(), String> {
+) -> Result<Option<serde_json::Value>, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -934,7 +937,12 @@ pub(crate) async fn drain_until_response(
                         expected_id, exception
                     ));
                 }
-                return Ok(());
+                // Runtime.evaluate 结果:result.result.value(returnByValue 下为真实 JS 值)
+                return Ok(val
+                    .get("result")
+                    .and_then(|r| r.get("result"))
+                    .and_then(|r| r.get("value"))
+                    .cloned());
             }
             Ok(Some(Ok(WsMessage::Binary(b)))) => {
                 let _ = b;

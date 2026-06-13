@@ -52,7 +52,17 @@ use crate::codex_theme_injector::{drain_until_response, locate_main_window_ws, m
 /// `textContent` sink、宽度数值 clamp 0-100,不可信串经 serde_json 转义无 XSS。
 const INSTALL_SCRIPT: &str = r##"
 (function() {
-  if (window.__catQuotaInstalled) return;
+  // [MOC-230] 版本化幂等 guard:同版本跳过(常态);版本变(应用升级后 INSTALL_SCRIPT 改了)
+  // → 先拆旧 observer + DOM 节点再重装,使新逻辑无需重启 Codex 即覆盖旧注入。旧版只有
+  // __catQuotaInstalled、无 __catQuotaVersion(undefined ≠ 当前版本)→ 同样触发重装。
+  var VERSION = 2;
+  if (window.__catQuotaInstalled) {
+    if (window.__catQuotaVersion === VERSION) return;
+    try { if (window.__catQuotaObserver) window.__catQuotaObserver.disconnect(); } catch (e) {}
+    var __stale = document.getElementById('cat-quota-entry');
+    if (__stale) __stale.remove();
+  }
+  window.__catQuotaVersion = VERSION;
   window.__catQuotaLast = null;
   window.__catQuotaSig = null;
 
@@ -189,6 +199,50 @@ const INSTALL_SCRIPT: &str = r##"
     } catch (e) {}
     return null;
   }
+  // MOC-230 对话隔离:从 React fiber 读当前活动会话 conversationId(== rollout 文件名 uuid,
+  // == session_meta payload.id,2026-06-14 解包+真机实证)。多锚点(上下文环 / pinned summary
+  // scroller / 面板所在 section)向上爬 props/state 找 conversationId(uuid 形态)。读不到 →
+  // null:daemon 据此 fail-closed 不显累计/缓存,绝不串到别的对话。
+  var __CONVID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  function convIdFromFiber(start) {
+    if (!start) return null;
+    var fkey = null;
+    for (var k in start) { if (k.indexOf('__reactFiber$') === 0) { fkey = k; break; } }
+    if (!fkey) return null;
+    var f = start[fkey], n = 0;
+    while (f && n < 40) {
+      var bags = [f.memoizedProps, f.memoizedState];
+      for (var b = 0; b < bags.length; b++) {
+        var bag = bags[b];
+        if (bag && typeof bag === 'object') {
+          for (var key in bag) {
+            if (key === 'conversationId' || /[Cc]onversationId$/.test(key)) {
+              var v = bag[key];
+              if (typeof v === 'string' && __CONVID_RE.test(v)) return v;
+            }
+          }
+        }
+      }
+      f = f.return; n++;
+    }
+    return null;
+  }
+  function readConvId() {
+    try {
+      var ctxSection = document.querySelector('#cat-quota-entry');
+      var anchors = [
+        document.querySelector('[aria-label^="Context usage:"]'),
+        findScroller(),
+        ctxSection ? ctxSection.previousElementSibling : null,
+      ];
+      for (var i = 0; i < anchors.length; i++) {
+        var id = convIdFromFiber(anchors[i]);
+        if (id) return id;
+      }
+    } catch (e) {}
+    return null;
+  }
+  window.__catActiveConvId = readConvId;
   // 刷新上下文行(每次 ensureNode,含 observer 触发 → live):优先 fiber 精确值(立即、
   // 不需对话);读不到退回 Codex aria 的 %(只有 %)。
   function refreshContext(node) {
@@ -223,6 +277,7 @@ const INSTALL_SCRIPT: &str = r##"
   // ≈1/4);2s 滑窗算速率;流停(最近样本 >1.5s)冻结在最后值(用户:保留);没数据 0。
   var __tpsBuf = [];
   var __tpsLast = 0;
+  var __tpsConvId = null; // 当前速率归属的会话(MOC-230:切对话即清零重算)
   function inPanel(node) {
     var n = node && node.nodeType === 3 ? node.parentNode : node;
     return !!(n && n.closest && n.closest('#cat-quota-entry'));
@@ -271,13 +326,44 @@ const INSTALL_SCRIPT: &str = r##"
     __tpsLast = Math.round(sum / span);
     return __tpsLast;
   }
-  function refreshTps(node) {
+  function refreshTps(node, cid) {
+    // 对话隔离(MOC-230):活动 conversationId 变了(切对话)→ 清空速率 buffer,新对话
+    // 从零重估,不把上个对话的速率带过来。仅在 cid **非空且变化**时重置:readConvId 偶发
+    // 读不到(返 null)时不误清正在累积的速率(读不到 ≠ 切对话)。
+    if (cid && cid !== __tpsConvId) {
+      __tpsBuf.length = 0;
+      __tpsLast = 0;
+      __tpsConvId = cid;
+    }
     var s = node && node.querySelector('.cqrate');
     if (!s) return;
     // 同 refreshContext:仅变化时写,避免自触发 observer 的 ~60fps 空转(流式时值在变 →
     // 正常实时刷;空闲时 currentTps 返回冻结值不变 → 不写 → observer 不被自身唤醒)。
-    var t = currentTps() + ' token/s';
+    // cid 读不到(null)→ 无法确认速率归属哪个对话 → 显 0(fail-closed,绝不显上个对话的
+    // 冻结速率;与 cum/cache 的 null→「—」一致,review P2)。不清 buffer:transient null
+    // 不丢已累积样本,cid 恢复(仍同对话)即继续显实时速率。
+    var t = (cid ? currentTps() : 0) + ' token/s';
     if (s.textContent !== t) s.textContent = t;
+  }
+  // 刷新累计/缓存命中(MOC-230 对话隔离):payload 标注的 convId 与当前活动 conversationId
+  // 一致才显 daemon 算的值;不一致(切对话、daemon 还没追上)→ 显「—」,绝不显别的对话数据。
+  function refreshDuo(node, cid) {
+    var data = window.__catQuotaLast;
+    if (!data) return;
+    var duo = null, rows = data.rows || [];
+    for (var i = 0; i < rows.length; i++) { if (rows[i] && rows[i].kind === 'duo') { duo = rows[i]; break; } }
+    if (!duo) return;
+    var match = data.convId != null && data.convId === cid;
+    var cumEl = node.querySelector('.cqcum');
+    var cacheEl = node.querySelector('.cqcache');
+    if (cumEl) {
+      var cumV = match ? (duo.cum || '累计 —') : '累计 —';
+      if (cumEl.textContent !== cumV) cumEl.textContent = cumV;
+    }
+    if (cacheEl) {
+      var cacheV = match ? (duo.right || '缓存命中 —') : '缓存命中 —';
+      if (cacheEl.textContent !== cacheV) cacheEl.textContent = cacheV;
+    }
   }
 
   function buildRow(r) {
@@ -287,9 +373,9 @@ const INSTALL_SCRIPT: &str = r##"
       var lw = el('span', 'l');
       lw.appendChild(el('span', 'cqrate', '0 token/s'));
       lw.appendChild(document.createTextNode(' · '));
-      lw.appendChild(el('span', null, r.cum || '累计 —'));
+      lw.appendChild(el('span', 'cqcum', r.cum || '累计 —'));
       d.appendChild(lw);
-      d.appendChild(el('span', 'r', r.right || ''));
+      d.appendChild(el('span', 'r cqcache', r.right || ''));
       return d;
     }
     if (r && r.kind === 'ctx') {
@@ -366,9 +452,12 @@ const INSTALL_SCRIPT: &str = r##"
       window.__catQuotaSig = sig;
     }
     if (data.title) node.title = data.title;
-    // 上下文 + 实时速率每次都刷(payload sig 不变也刷,observer 触发即更新 → 实时)
+    // 上下文 + 实时速率 + 累计/缓存(对话隔离)每次都刷(observer 触发即更新 → 实时)。
+    // cid 一次算、refreshTps/refreshDuo 复用(避免每个各爬一次 fiber)。
+    var cid = readConvId();
     refreshContext(node);
-    refreshTps(node);
+    refreshTps(node, cid);
+    refreshDuo(node, cid);
   }
 
   window.__catQuotaUpdate = function(data) {
@@ -405,8 +494,10 @@ const REMOVE_SCRIPT: &str = r#"
   if (window.__catQuotaObserver) { window.__catQuotaObserver.disconnect(); }
   delete window.__catQuotaObserver;
   delete window.__catQuotaUpdate;
+  delete window.__catActiveConvId;
   delete window.__catQuotaLast;
   delete window.__catQuotaSig;
+  delete window.__catQuotaVersion;
   delete window.__catQuotaInstalled;
   var n = document.getElementById('cat-quota-entry');
   if (n) n.remove();
@@ -436,11 +527,14 @@ impl std::fmt::Display for PushError {
 /// 一次 CDP 推送:install(幂等)+ `__catQuotaUpdate(payload)`。
 /// payload=None 表示"当前无可显示数据"(条目隐藏但保持已安装)。
 /// payload 为结构化对象(见 [`INSTALL_SCRIPT`] schema):`{header,title,rows[]}`。
-async fn push_via_cdp(payload: Option<serde_json::Value>) -> Result<(), PushError> {
+/// 推一次 payload,并**回读当前活动会话 conversationId**(脚本末尾返回
+/// `__catActiveConvId()`,MOC-230 对话隔离用)。返回 `Ok(Some(convId))` / `Ok(None)`(读不到)。
+async fn push_via_cdp(payload: Option<serde_json::Value>) -> Result<Option<String>, PushError> {
     let update_arg = payload.unwrap_or(serde_json::Value::Null);
-    // update 调用拼在 install 后:首次/页面重载后 install 真正执行,平时跳过
+    // update 调用拼在 install 后:首次/页面重载后 install 真正执行,平时跳过。末尾表达式
+    // 返回活动 conversationId → evaluate 回读(daemon 下 tick 据此按 uuid 取该对话累计)。
     let script = format!(
-        "{INSTALL_SCRIPT}\nwindow.__catQuotaUpdate && window.__catQuotaUpdate({update_arg});"
+        "{INSTALL_SCRIPT}\nwindow.__catQuotaUpdate && window.__catQuotaUpdate({update_arg});\n(window.__catActiveConvId ? window.__catActiveConvId() : null);"
     );
     evaluate_once(&script).await
 }
@@ -503,16 +597,17 @@ fn quota_rows(
 ///   触发。Codex 常驻 DOM 只暴露 %(绝对 62k/190k 仅 hover tooltip,读不到),故只显 %。
 /// - **Tokens 速率·累计 / 缓存命中率**:累计量,Codex 没有、只能 proxy 捕获 → 需对话
 ///   触发;还没有任何一轮(刚开会话)→ placeholder("—")。
-fn local_usage_rows() -> Vec<serde_json::Value> {
+fn local_usage_rows(session_id: Option<&str>) -> Vec<serde_json::Value> {
     // 上下文:整行由注入脚本直接从 Codex React fiber 读 usedTokens + contextWindow(已有
     // 对话即有值、不需发新对话;满窗口 = contextWindow ÷ 0.95 把 5% reserve 加回来)。
     // 故 payload 只给占位,不带数据。
     let ctx = json!({"kind": "ctx", "label": "上下文"});
-    // 累计 token + 缓存命中率:读 Codex rollout 当前会话(ground truth、含全部历史轮次、
-    // compact 已正确计入,**不需发新对话**)。速率(token/s):注入脚本实时从 Codex 流式
-    // 文本增长估算(见 INSTALL_SCRIPT 的 tps —— SSE 无逐 delta token,实时只能估),
-    // payload 不带 rate。
-    let totals = codex_app_transfer_usage_tracker::newest_session_totals();
+    // 累计 token + 缓存命中率:按**活动会话 uuid** 取该对话自己的 rollout(MOC-230 对话隔离,
+    // 非 newest-mtime)。session_id = daemon 上一 tick 从 Codex fiber 回读的 conversationId
+    // (== rollout 文件名 uuid);None / 该 uuid 无 rollout 文件(全新对话还没写盘 / 读不到 id)
+    // → fail-closed 显「—」,绝不退 newest-mtime 串到别的对话。rollout 含全部历史轮次、compact
+    // 已正确计入,不需发新对话。速率(token/s)由注入脚本实时从流式文本估算,payload 不带 rate。
+    let totals = session_id.and_then(codex_app_transfer_usage_tracker::session_totals_for_id);
     let cum_part = match totals {
         Some(t) if t.total_tokens > 0 => format!("累计 {}", fmt_tokens(t.total_tokens)),
         _ => "累计 —".to_string(),
@@ -529,12 +624,16 @@ fn local_usage_rows() -> Vec<serde_json::Value> {
 /// (上下文/Tokens/缓存)。`quota` 由 daemon 在活动 provider 为白名单时传入。
 fn build_payload(
     quota: Option<&codex_app_transfer_gemini_oauth::GeminiQuota>,
+    session_id: Option<&str>,
 ) -> serde_json::Value {
     let mut rows = quota_rows(quota);
-    rows.extend(local_usage_rows());
+    rows.extend(local_usage_rows(session_id));
     json!({
         "header": "Usage",
         "title": "MOC-204 · 额度(白名单 provider)+ 上下文/Tokens/缓存(本地实时)",
+        // MOC-230 对话隔离:标注本累计/缓存是为哪个 conversationId 算的;JS 渲染前比对当前
+        // fiber conversationId,不匹配则隐藏累计/缓存(切对话瞬间不串)。
+        "convId": session_id,
         "rows": rows,
     })
 }
@@ -554,10 +653,11 @@ fn build_mock_payload() -> serde_json::Value {
 
 /// 推一次卸载脚本(开关关闭 / 启动清残留时调用)。
 async fn push_remove() -> Result<(), PushError> {
-    evaluate_once(REMOVE_SCRIPT).await
+    evaluate_once(REMOVE_SCRIPT).await.map(|_| ())
 }
 
-async fn evaluate_once(script: &str) -> Result<(), PushError> {
+/// evaluate 一段脚本,返回其末尾表达式的 JS 字符串结果(非字符串 / null / 无 → None)。
+async fn evaluate_once(script: &str) -> Result<Option<String>, PushError> {
     let ws_url = locate_main_window_ws()
         .await
         .map_err(|e| PushError::Connect(e.to_string()))?;
@@ -574,11 +674,11 @@ async fn evaluate_once(script: &str) -> Result<(), PushError> {
         .send(WsMessage::Text(msg.into()))
         .await
         .map_err(|e| PushError::Evaluate(e.to_string()))?;
-    drain_until_response(&mut read, 1)
+    let value = drain_until_response(&mut read, 1)
         .await
         .map_err(PushError::Evaluate)?;
     let _ = write.close().await;
-    Ok(())
+    Ok(value.and_then(|v| v.as_str().map(str::to_string)))
 }
 
 /// 读 settings 的 `codexQuotaEnabled`(默认 false)。
@@ -726,6 +826,10 @@ pub async fn run_quota_daemon() {
         codex_app_transfer_gemini_oauth::GeminiQuota,
         std::time::Instant,
     )> = None;
+    // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
+    // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
+    // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
+    let mut last_conv_id: Option<String> = None;
     loop {
         tokio::time::sleep(TICK).await;
         let enabled = quota_enabled();
@@ -742,9 +846,15 @@ pub async fn run_quota_daemon() {
         // 额度:仅白名单 provider(antigravity gemini)取真实双窗口,否则 None(不显额度行);
         // 上下文/Tokens/缓存命中率为本地实时(注入脚本侧)。
         let quota = fetch_antigravity_quota(&quota_http, &mut quota_cache).await;
-        let payload = Some(build_payload(quota.as_ref()));
+        // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
+        let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
         match push_via_cdp(payload).await {
-            Ok(()) => evaluate_warned = false,
+            // push 同时回读**当前**活动 conversationId,供下 tick 按 uuid 取累计。
+            // Ok(None)=evaluate 成功但无可识别活动会话 → 下 tick fail-closed 显「—」。
+            Ok(conv) => {
+                evaluate_warned = false;
+                last_conv_id = conv;
+            }
             Err(e) => log_push_error(&e, "quota push", &mut evaluate_warned),
         }
     }
@@ -757,7 +867,10 @@ mod tests {
     #[test]
     fn install_script_is_idempotent_and_remove_cleans() {
         // 结构性断言:防手滑改掉幂等 guard / 清理目标
-        assert!(INSTALL_SCRIPT.contains("if (window.__catQuotaInstalled) return;"));
+        // [MOC-230] 版本化幂等 guard:同版本跳过、版本变重装(覆盖旧注入,无需重启 Codex)
+        assert!(INSTALL_SCRIPT.contains("window.__catQuotaInstalled"));
+        assert!(INSTALL_SCRIPT.contains("__catQuotaVersion === VERSION"));
+        assert!(REMOVE_SCRIPT.contains("__catQuotaVersion"));
         assert!(INSTALL_SCRIPT.contains("cat-quota-entry"));
         assert!(REMOVE_SCRIPT.contains("cat-quota-entry"));
         assert!(REMOVE_SCRIPT.contains("disconnect"));
@@ -826,6 +939,28 @@ mod tests {
     }
 
     #[test]
+    fn install_script_has_conversation_isolation_guards() {
+        // [MOC-230] 对话隔离:fiber 读 conversationId + 暴露给 daemon 回读;tps 按会话重置;
+        // 累计/缓存渲染前 uuid-match 守卫(切对话不串)。
+        assert!(INSTALL_SCRIPT.contains("function readConvId"));
+        assert!(INSTALL_SCRIPT.contains("window.__catActiveConvId")); // daemon 经 evaluate 回读
+        assert!(INSTALL_SCRIPT.contains("__tpsConvId")); // tps 按会话隔离(切对话清零)
+        assert!(INSTALL_SCRIPT.contains("function refreshDuo")); // 累计/缓存 uuid-match 守卫
+        assert!(INSTALL_SCRIPT.contains("cqcum") && INSTALL_SCRIPT.contains("cqcache"));
+        assert!(REMOVE_SCRIPT.contains("__catActiveConvId")); // 卸载清理
+    }
+
+    #[test]
+    fn build_payload_tags_conversation_id() {
+        // [MOC-230] payload 标注 convId(JS 渲染前比对当前 fiber conversationId);
+        // 无活动会话 → null,JS fail-closed 显「—」不串别的对话。
+        let p = build_payload(None, Some("019ec12f-eef0-7971-9bc8-ee9f0c21b5df"));
+        assert_eq!(p["convId"], "019ec12f-eef0-7971-9bc8-ee9f0c21b5df");
+        let p2 = build_payload(None, None);
+        assert!(p2["convId"].is_null());
+    }
+
+    #[test]
     fn fmt_tokens_compact() {
         assert_eq!(fmt_tokens(0), "0");
         assert_eq!(fmt_tokens(850), "850");
@@ -836,7 +971,7 @@ mod tests {
     #[test]
     fn build_payload_no_quota_hides_quota_rows() {
         // [MOC-204 Phase 3] 非白名单 / 无额度(quota=None)→ 不显额度行,只剩本地 2 行。
-        let p = build_payload(None);
+        let p = build_payload(None, None);
         let rows = p["rows"].as_array().expect("rows");
         assert_eq!(rows.len(), 2, "无额度 → 只有 上下文 + Tokens/缓存");
         assert_eq!(rows[0]["kind"], "ctx");
@@ -857,7 +992,7 @@ mod tests {
                 reset_rfc3339: Some("2026-06-20T12:56:06Z".into()),
             }),
         };
-        let p = build_payload(Some(&q));
+        let p = build_payload(Some(&q), None);
         let rows = p["rows"].as_array().expect("rows");
         assert_eq!(rows.len(), 4, "2 额度 + 上下文 + Tokens/缓存");
         assert_eq!(rows[0]["cls"], "quota");

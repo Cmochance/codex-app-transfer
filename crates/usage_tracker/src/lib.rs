@@ -17,6 +17,8 @@
 //! - [`load_codex_events`] — 扫所有 `~/.codex/sessions/` 的 rollout 文件,产 events
 //! - [`UsageReport`] — daily / by-model / by-conversation 三种聚合视图
 //! - [`load_usage_report`] — 一站调用,推荐入口
+//! - [`session_totals_for_id`] — 按会话 uuid 取该对话累计(MOC-230 对话隔离,供 quota injector)
+//! - [`SessionTotals`] — 单对话累计(total/input/cached_input tokens + [`SessionTotals::cache_hit_percent`])
 
 #![forbid(unsafe_code)]
 
@@ -88,10 +90,10 @@ pub fn load_codex_events() -> Result<Vec<CodexTokenUsageEvent>> {
     Ok(events)
 }
 
-/// [MOC-204 Phase 2] 当前会话(= 最新 rollout 文件)的累计用量。供 quota injector 即时
-/// 显示「累计 token / 缓存命中率」—— 直接读 Codex rollout(ground truth、含**全部历史
-/// 轮次**,compact 也已正确计入),不需发新对话。只解析最新一个文件(非全量扫),按
-/// (path, mtime) 缓存避免每 tick 重解析。
+/// 单个对话的累计用量(MOC-204/MOC-230)。供 quota injector 即时显示「累计 token /
+/// 缓存命中率」—— 直接读 Codex rollout(ground truth、含**全部历史轮次**,compact 已正确
+/// 计入),不需发新对话。由 [`session_totals_for_id`] 按会话 uuid 取指定对话 rollout,
+/// 每会话独立缓存键 `(uuid → path, mtime, totals)`,多对话互不干扰。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionTotals {
     pub total_tokens: u64,
@@ -110,47 +112,13 @@ impl SessionTotals {
     }
 }
 
-static NEWEST_TOTALS_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<Option<(PathBuf, std::time::SystemTime, SessionTotals)>>,
-> = std::sync::OnceLock::new();
-
-/// 找最新 rollout 文件(按 mtime)解析得当前会话累计。无 rollout → None。
-///
-/// **已知限制(review P2)**:按 newest-mtime 选文件,假设「最近写入的 rollout = 当前活动
-/// 会话」——常态成立(用户正在用的会话其 rollout 持续被追加,mtime 最新)。但用户切回**旧**
-/// 对话且未发新轮就开面板时,旧对话 mtime 可能比另一近期对话旧 → 选错文件,面板累计 / 缓存
-/// 短暂显示另一会话的值(在该旧对话发一轮即自愈)。彻底修需把活动会话 id 从 Codex fiber 打通
-/// 到本 daemon(当前 daemon→JS 单向推送、无此通道),属设计取舍,留作 followup。
-pub fn newest_session_totals() -> Option<SessionTotals> {
-    let dirs = codex_usage_paths().ok()?;
-    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
-    for dir in &dirs {
-        let mut files = Vec::new();
-        walk(dir, &mut files);
-        for f in files {
-            if let Ok(mt) = std::fs::metadata(&f).and_then(|m| m.modified()) {
-                if newest.as_ref().is_none_or(|(_, best)| mt > *best) {
-                    newest = Some((f, mt));
-                }
-            }
-        }
-    }
-    let (path, mtime) = newest?;
-    // cache key 用完整 SystemTime(保留亚秒精度):同一文件系统秒内 Codex 又追加 usage
-    // event 时 mtime 仍变(纳秒级),避免截断到秒后命中旧 cache、漏掉本秒最新一轮累计/
-    // 缓存率直到下一秒才有写入(review P2)。
-    let cache = NEWEST_TOTALS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
-    if let Some((p, mt, totals)) = cache.lock().unwrap().as_ref() {
-        if p == &path && *mt == mtime {
-            return Some(*totals); // 文件没变,复用解析结果
-        }
-    }
-    // 收集 → dedupe → sum:Codex 会 retry / 重复写同一 token-count event(同 session+ts+
-    // tokens),直接累加会双计 total/input/cache → 缓存命中率算错。复用 load_codex_events
-    // 同款 dedupe_events(event_key 去重)保持一致(review P2)。
+/// 单个 rollout 文件 → SessionTotals(collect → dedupe → sum)。Codex 会 retry / 重复写同一
+/// token-count event(同 session+ts+tokens),直接累加会双计 total/input/cache → 缓存命中率
+/// 算错。复用 load_codex_events 同款 dedupe_events(event_key 去重)保持一致。
+fn totals_from_file(path: &std::path::Path) -> SessionTotals {
     let mut events: Vec<CodexTokenUsageEvent> = Vec::new();
-    let sessions_dir = path.parent().unwrap_or(path.as_path());
-    let _ = visit_codex_session_file(sessions_dir, &path, |event| {
+    let sessions_dir = path.parent().unwrap_or(path);
+    let _ = visit_codex_session_file(sessions_dir, path, |event| {
         events.push(event);
         Ok(())
     });
@@ -163,7 +131,65 @@ pub fn newest_session_totals() -> Option<SessionTotals> {
             .cached_input_tokens
             .saturating_add(event.cached_input_tokens);
     }
-    *cache.lock().unwrap() = Some((path, mtime, totals));
+    totals
+}
+
+static SESSION_TOTALS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, (PathBuf, std::time::SystemTime, SessionTotals)>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// 按**会话 uuid** 取该对话累计(MOC-230 对话隔离)。在 `~/.codex/sessions/` 下找文件名以
+/// `-<session_id>.jsonl` 结尾的 rollout(rollout 文件名末尾就是会话 uuid,== session_meta
+/// `payload.id` == renderer `conversationId`,2026-06-14 解包 + 真机实证),解析得 SessionTotals
+/// (累计 + 缓存命中率同源)。每会话独立缓存键 `(uuid → path,mtime,totals)`,多对话互不干扰。
+///
+/// **fail-closed(对话隔离硬保证)**:uuid 无对应 rollout 文件(全新对话还没写盘 / id 不匹配)
+/// → `None`。caller 据此显「—」,**绝不**退回 newest-mtime —— 那会串到别的对话。文件名命中
+/// 本身即自验证 `session_id == 该文件 uuid`(命不中宁可不显也不猜)。
+pub fn session_totals_for_id(session_id: &str) -> Option<SessionTotals> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let dirs = codex_usage_paths().ok()?;
+    let needle = format!("-{session_id}.jsonl");
+    let mut found: Option<(PathBuf, std::time::SystemTime)> = None;
+    'outer: for dir in &dirs {
+        let mut files = Vec::new();
+        walk(dir, &mut files);
+        for f in files {
+            let is_match = f
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&needle));
+            if is_match {
+                if let Ok(mt) = std::fs::metadata(&f).and_then(|m| m.modified()) {
+                    found = Some((f, mt));
+                    break 'outer; // 会话 uuid 唯一,命中即取
+                }
+            }
+        }
+    }
+    let (path, mtime) = found?; // 无文件 → fail-closed None(不退 newest-mtime)
+    let cache = SESSION_TOTALS_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some((p, mt, totals)) = cache.lock().unwrap().get(session_id) {
+        if p == &path && *mt == mtime {
+            return Some(*totals); // 文件没变,复用解析结果
+        }
+    }
+    let totals = totals_from_file(&path);
+    {
+        let mut guard = cache.lock().unwrap();
+        // 每查过的 conversation uuid 各占一条;daemon 每 tick 只查活动会话,累积量 = 本进程
+        // 切过的对话数。超 64 条整体清空(活动会话下 tick 即重填),防长寿 daemon 无界增长
+        // (code-review NIT)。
+        if guard.len() >= 64 {
+            guard.clear();
+        }
+        guard.insert(session_id.to_string(), (path, mtime, totals));
+    }
     Some(totals)
 }
 
