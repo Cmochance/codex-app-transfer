@@ -7,8 +7,9 @@
 //! 带 displayName 的 user-facing 模型;旧版 CLIProxyAPI 静态切片命名已过期,跟实时
 //! 上游对不上,故改抓实时)。编译期 `include_str!` 进二进制。每条带 `display_name` /
 //! `recommended` / `tag_title`(供前端 + Codex model catalog 显示)+ maxTokens /
-//! maxOutputTokens(context window)。`is_skipped_model_id` 在 load 时过滤掉 7 条
-//! (claude 两款 / gemini-2.5-* 旧版 / gemini-3.1-pro-high 实测不可用)→ 暴露 9 条。
+//! maxOutputTokens(context window)。`is_skipped_model_id` 在 load 时过滤掉 8 条
+//! (claude 两款 / gemini-2.5-* 四款旧版 / gemini-3.1-pro-high 实测不可用 /
+//! [MOC-204] gpt-oss 非 Gemini 系)→ 暴露 8 条。
 //!
 //! ⚠️ 上游可能新增 / 改动模型 — 这份种子定期(eg release 前)从 antigravity
 //! `:fetchAvailableModels` 重抓刷新(上游响应是 model-id → {displayName, recommended,
@@ -45,12 +46,12 @@ pub fn antigravity_static_models() -> Vec<AntigravityModelEntry> {
 mod tests {
     use super::*;
 
-    /// 锚定 seed 数量 = 9([MOC-69] 2026-05-30 实时上游 16 条 user-facing 模型
-    /// - is_skipped_model_id 过滤 7 条:claude 两款 / gemini-2.5-* 四款旧版 /
-    /// gemini-3.1-pro-high 实测不可用)
+    /// 锚定 seed 数量 = 8([MOC-69] 2026-05-30 实时上游 16 条 user-facing 模型
+    /// - is_skipped_model_id 过滤 8 条:claude 两款 / gemini-2.5-* 四款旧版 /
+    /// gemini-3.1-pro-high 实测不可用 / [MOC-204] gpt-oss-120b-medium 非 Gemini)
     #[test]
     fn seed_count_after_skip_filter() {
-        assert_eq!(antigravity_static_models().len(), 9);
+        assert_eq!(antigravity_static_models().len(), 8);
     }
 
     /// 锚定关键 model id 存在(防 seed 被意外清空 / 改名)。用 2026-05-30 实时上游
@@ -69,10 +70,6 @@ mod tests {
         );
         assert!(ids.contains(&"gemini-3.1-pro-low"), "缺 gemini-3.1-pro-low");
         assert!(ids.contains(&"gemini-pro-agent"), "缺 gemini-pro-agent");
-        assert!(
-            ids.contains(&"gpt-oss-120b-medium"),
-            "缺 gpt-oss-120b-medium"
-        );
     }
 
     /// [MOC-69] seed 必须带 display_name + recommended(给前端 + Codex catalog 显示用)。
@@ -95,9 +92,10 @@ mod tests {
         assert!(!lite.recommended, "gemini-3.1-flash-lite 不应 recommended");
     }
 
-    /// [MOC-69] seed fallback 也过 SKIP — claude 两款不出现在静态种子列表里
+    /// [MOC-69] claude 两款 + [MOC-204] gpt-oss 非 Gemini 系 — seed 走 SKIP 过滤,
+    /// 不出现在静态种子列表里(本项目 antigravity 仅适配 Gemini)
     #[test]
-    fn seed_excludes_claude_models() {
+    fn seed_excludes_non_gemini_models() {
         let ids: Vec<String> = antigravity_static_models()
             .iter()
             .map(|m| m.id.clone())
@@ -105,6 +103,10 @@ mod tests {
         assert!(
             !ids.iter().any(|id| id.starts_with("claude")),
             "claude 款不该出现在 seed 列表(SKIP 过滤),实际: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.contains("gpt-oss")),
+            "gpt-oss 不该出现在 seed 列表(MOC-204 SKIP 过滤),实际: {ids:?}"
         );
     }
 

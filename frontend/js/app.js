@@ -2579,6 +2579,7 @@
    forceUnlockPersisted = settings.autoUnlockCodexPlugins === true;
    $("#autoUnlockCodexPlugins").checked = forceUnlockPersisted;
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
+    $("#codexQuotaEnabled").checked = settings.codexQuotaEnabled === true;
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     showGrayPresets = settings.showGrayProviders === true;
     $("#showGrayProviders").checked = showGrayPresets;
@@ -3169,6 +3170,7 @@
       autoApplyOnStart: $("#autoApplyOnStart")?.checked !== false,
      autoUnlockCodexPlugins: forceUnlockPersisted,
       autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
+      codexQuotaEnabled: $("#codexQuotaEnabled")?.checked === true,
      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       showGrayProviders: $("#showGrayProviders")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
@@ -8481,6 +8483,10 @@
     });
     $("#restoreCodexOnExit")?.addEventListener("change", saveSettingsFromForm);
     $("#codexNetworkAccess")?.addEventListener("change", saveSettingsFromForm);
+    // [MOC-204] 额度注入开关:持久化即可,注入 daemon 每 tick 自取。注意:
+    // daemon 走 CDP,Codex 启动时才决定是否带调试端口(should_attach_debug_port);
+    // Codex 已无端口运行时开开关不会即时生效,需重启 Codex(hint 已注明)。
+    $("#codexQuotaEnabled")?.addEventListener("change", saveSettingsFromForm);
     // [MOC-185] 诊断模式开关 = session 级一次性:**纯运行时**起/停查看器服务 + 切按钮可见性,
     // **不再 saveSettingsFromForm 持久化开关态**(退出 transfer 即关、启动不自启)。
     // 注意:api() 对后端返回的 `success:false`(含 bind 失败)会 **throw**(api.js:28),

@@ -419,7 +419,14 @@ fn should_attach_debug_port() -> Vec<String> {
         .and_then(|s| s.get("codexUiThemeEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !plugin_unlock_needs_port && !theme_enabled {
+    // [MOC-204] 额度注入 daemon 也走 CDP,只开 quota 不开 theme/unlock 时同样要端口。
+    let quota_enabled = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("codexQuotaEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !plugin_unlock_needs_port && !theme_enabled && !quota_enabled {
         return vec![];
     }
 
