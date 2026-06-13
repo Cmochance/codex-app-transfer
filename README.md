@@ -56,6 +56,12 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
 
 第 6 套 Carton 自带右下角漂浮立绘(随鼠标动)。**自定义背景**:Theme 页 → "+ 添加自定义" → 选 JPG/PNG → 1:1 crop 弹窗自由选截取区域(拖拽 + 滚轮缩放)→ 应用。Codex 启动时如已开启 toggle 会自动注入已选主题,不需手动操作。
 
+### Codex 内用量显示(可选)
+
+在 Codex Desktop 顶栏「Toggle pinned summary」弹窗底部注入独立「Usage」分区:5 小时 / 每周额度(白名单 provider)、上下文用量、实时 Tokens 速率与累计、缓存命中率。其中**上下文**行可展开 Claude 风格的 by-source 明细下拉(按发往上游的内容分类:工具调用与输出 / 推理 / 开发者指令 / 对话消息 / 工具定义 / 系统提示),数据按对话持久化、启动即用。详见下方「能做什么」。
+
+![Codex 内用量显示](img/codex-usage-breakdown.jpg)
+
 ## 能做什么
 
 - 管理多套供应商,按 OpenAI 模型名(`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`)映射到供应商真实模型 ID

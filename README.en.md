@@ -56,6 +56,12 @@ Inject background image + frosted-glass panel CSS into Codex Desktop (the Electr
 
 A sixth theme (Carton) carries a floating mascot in the bottom-right that reacts to the cursor. **Custom backgrounds**: Theme page → "+ Add custom" → pick a JPG/PNG → 1:1 crop modal (drag + scroll to zoom) → apply. If the toggle is on at Codex launch, the selected theme auto-injects — no manual step needed.
 
+### Usage panel inside Codex (optional)
+
+Injects a standalone "Usage" section at the bottom of Codex Desktop's "Toggle pinned summary" popup: 5-hour / weekly quota (whitelisted providers), context usage, real-time token rate + cumulative total, and cache hit rate. The **Context** row expands into a Claude-style by-source breakdown dropdown (classified by what is sent upstream: tool calls & output / reasoning / developer instructions / conversation messages / tool definitions / system prompt), persisted per conversation for instant load. See "What it does" below.
+
+![Usage panel inside Codex](img/codex-usage-breakdown.jpg)
+
 ## What it does
 
 - Manage multiple providers; map OpenAI model names (`gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` / `gpt-5.2`) to the provider's real model IDs
