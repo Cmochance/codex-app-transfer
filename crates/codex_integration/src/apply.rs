@@ -86,20 +86,11 @@ pub struct ApplyConfig<'a> {
     /// network_access` section field)。控制小白用户能否用 `curl` 等命令联网。
     /// Caller 从 `Settings.codex_network_access`(默认 `true`)读取(#212)。
     pub codex_network_access: bool,
-    /// Codex Desktop composer footer 的 context 圆环 + tokens/s 显示开关(#258 / MOC-123)。
-    /// 写到 `~/.codex/.codex-global-state.json` 的
-    /// `electron-persisted-atom-state.show-context-window-usage`(见
-    /// [`crate::electron_state::CONTEXT_USAGE_ATOM_KEY`])。
-    /// `true` → ensure 开启,`false` → ensure 关闭。
-    /// Caller 从 `Settings.codex_status_section_default_visible`(默认 `true`,对应前端
-    /// settings key `codexStatusSectionDefaultVisible`,名字保留作 user-config 兼容)读取。
-    pub codex_status_section_default_visible: bool,
     /// **direct 直连模式**(`bypass_proxy`,snapshot.rs:87-89)。为 `true` 时
     /// apply 只写上游配置(`openai_base_url` + auth key),并 **strip** 所有
     /// transfer 私货字段(`model_catalog_json` / catalog models /
     /// `model_context_window` / `sandbox_mode` / `approval_policy`)—— 这一步
-    /// 同时是「从 local_proxy 切到 direct 时清掉残留私货」的清理机制;
-    /// status-section atom 既不写也不清(留用户原值)。详见 issue #317。
+    /// 同时是「从 local_proxy 切到 direct 时清掉残留私货」的清理机制。详见 issue #317。
     #[serde(default)]
     pub direct: bool,
     /// **[MOC-104] relay 模式**:`true` 时 apply **保留**活动 `auth.json` 的真实
@@ -129,8 +120,7 @@ pub struct ApplyResult {
 pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResult, CodexError> {
     // 1. snapshot(幂等;已有快照不会覆盖)
     let snapshot_taken_now = !has_snapshot(paths);
-    // manage_atom = !cfg.direct:direct 直连模式不写也不 restore context-usage atom(#317)。
-    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name, !cfg.direct)?;
+    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name)?;
 
     // 2. config.toml: openai_base_url
     if cfg.base_url.is_empty() {
@@ -339,39 +329,6 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     }
     write_auth(&paths.auth_json, &auth)?;
 
-    // 5. Codex Desktop UI 偏好:ensure `show-context-window-usage`
-    // 跟 user 设置一致(默认 true,圆环可见)。详见 #258 真因:0.132+ 版本该
-    // atom 默认 false,新装/升级 user 看不到 context 圆环,我们通过这个写
-    // restore-friendly 的 single-atom-key 操作把 UI 偏好同步成 user 期望值。
-    //
-    // **Race 提醒**:Codex Desktop 跑着的时候 in-memory atom 会在它下次 persist
-    // 时把我们的写入**覆盖**回去。所以这步**只在 Codex Desktop 启动前**有效,
-    // 跟 transfer "先 apply 再启动 desktop" 的时序天然配合;如果 user 在 Codex
-    // 跑着的时候切 provider,新值要重启 Codex 才生效。
-    //
-    // **best-effort**(silent-failure-hunter HIGH #3):atom write 在 step 1-4
-    // (snapshot + config.toml + auth.json)都成功后才跑。如果失败 → propagate
-    // 会让 apply 整体报 Err,但 config.toml / auth.json 已写,partial-apply 错误
-    // 框架。改成 warn + 继续,跟 restore-side 对称(UI preference 失败不该 block
-    // 主路径)。失败的 user 可在 Codex Settings 里手动开启,或重启 Codex 重试。
-    // direct 模式不碰 context-usage atom(UI 偏好;issue #317:既不写也不强清,
-    // 留用户原值)。
-    if !cfg.direct {
-        if let Err(e) = crate::electron_state::write_atom(
-            &paths.electron_global_state,
-            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-            serde_json::Value::Bool(cfg.codex_status_section_default_visible),
-        ) {
-            tracing::warn!(
-                target: "codex_integration::apply",
-                path = %paths.electron_global_state.display(),
-                error = %e,
-                "best-effort context-usage atom write failed; provider apply continues. \
-                 User can enable it in Codex Desktop Settings (context usage ring) or restart Codex.",
-            );
-        }
-    }
-
     Ok(ApplyResult {
         config_toml_path: paths.config_toml.display().to_string(),
         auth_json_path: paths.auth_json.display().to_string(),
@@ -409,21 +366,8 @@ pub fn restore_codex_state(paths: &CodexPaths) -> Result<bool, CodexError> {
     let snapshot_auth = read_snapshot_auth(paths);
     restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth, RestoreMode::Auto)?;
 
-    // 先读 manifest 拿到 atom pre-value(下面 drop_snapshot 后就读不到了),
-    // **best-effort** atom restore — UI preference 失败不 block 主路径。
-    let manifest = crate::snapshot::read_current_manifest(paths);
-
     drop_snapshot(paths)?;
     clear_catalog_models(&paths.model_catalog_json)?;
-
-    if let Err(e) = restore_status_section_from_manifest(paths, manifest) {
-        tracing::warn!(
-            target: "codex_integration::apply",
-            error = %e,
-            "best-effort status-section atom restore failed; config/auth already restored, \
-             snapshot dropped — restore success reported overall",
-        );
-    }
 
     Ok(true)
 }
@@ -451,8 +395,8 @@ pub fn restore_stale_codex_sessions(paths: &CodexPaths) -> Result<bool, CodexErr
     let Some(dir) = crate::snapshot::stale_active_snapshot_dirs(paths).pop() else {
         return Ok(false);
     };
-    // manifest 先读:atom pre-value(删目录后读不到)+ `config_existed`/`auth_existed`
-    // 消歧"文件本来就没有"vs"存在但读失败"(silent-failure review HIGH#1)。
+    // manifest 先读:`config_existed`/`auth_existed` 消歧"文件本来就没有"vs
+    // "存在但读失败"(silent-failure review HIGH#1)。
     let manifest = crate::snapshot::read_manifest_from_dir(&dir).ok();
 
     // 读失败(EACCES/EIO/损坏 JSON)≠ 文件不存在:前者 propagate、**不还原不删目录**
@@ -497,14 +441,6 @@ pub fn restore_stale_codex_sessions(paths: &CodexPaths) -> Result<bool, CodexErr
         );
     }
     clear_catalog_models(&paths.model_catalog_json)?;
-    if let Err(e) = restore_status_section_from_manifest(paths, manifest) {
-        tracing::warn!(
-            target: "codex_integration::apply",
-            error = %e,
-            "best-effort status-section atom restore (stale session heal) failed; \
-             config/auth already restored, stale snapshot dropped — heal reported overall",
-        );
-    }
     Ok(true)
 }
 
@@ -539,10 +475,6 @@ pub fn restore_codex_snapshot(
     let snapshot_auth = read_snapshot_auth_by_id(paths, snapshot_id);
     restore_from_snapshot_values(paths, &snapshot_config, &snapshot_auth, RestoreMode::Manual)?;
 
-    // 先读 manifest 拿 atom pre-value(drop 后读不到),best-effort 适用同
-    // restore_codex_state。
-    let manifest = crate::snapshot::read_manifest_by_id(paths, snapshot_id);
-
     if drop_remaining_snapshots {
         drop_all_snapshots(paths)?;
     } else {
@@ -550,72 +482,7 @@ pub fn restore_codex_snapshot(
     }
     clear_catalog_models(&paths.model_catalog_json)?;
 
-    if let Err(e) = restore_status_section_from_manifest(paths, manifest) {
-        tracing::warn!(
-            target: "codex_integration::apply",
-            error = %e,
-            "best-effort status-section atom restore (manual snapshot pick) failed; \
-             config/auth already restored, snapshots dropped — restore success reported overall",
-        );
-    }
-
     Ok(true)
-}
-
-/// 把 `~/.codex/.codex-global-state.json` 里
-/// `electron-persisted-atom-state.show-context-window-usage`
-/// 退回到 snapshot 拍摄时的原值。
-///
-/// **三态语义**(配合 `SnapshotManifest.electron_status_section_capture_failed`):
-/// - `capture_failed=true` → snapshot 时读 atom 失败 → **不动**(避免 silently 抹
-///   user 真实原值;tracing::warn! 记一条 audit trail)
-/// - `capture_failed=false` + `pre_value=Some(b)` → 原值就是 b,write_atom 复原
-/// - `capture_failed=false` + `pre_value=None` → atom 原本不存在,remove_atom 物理删除
-/// - `manifest=None`(没快照 / 损坏 manifest)→ capture_failed=true 行为(不动)
-fn restore_status_section_from_manifest(
-    paths: &CodexPaths,
-    manifest: Option<crate::snapshot::SnapshotManifest>,
-) -> Result<(), CodexError> {
-    let Some(m) = manifest else {
-        tracing::warn!(
-            target: "codex_integration::apply",
-            "no manifest for status-section atom restore; skipping to avoid silent loss",
-        );
-        return Ok(());
-    };
-    if m.electron_status_section_capture_failed {
-        tracing::warn!(
-            target: "codex_integration::apply",
-            "snapshot manifest marked status-section atom capture as failed; \
-             skipping restore to avoid silent loss of user's real original value",
-        );
-        return Ok(());
-    }
-    // BUG-002 fix + [MOC-123] v4 bump:`schema_version < 4` 的 manifest 要么没追踪 atom
-    // (pre-v3,serde default pre_value=None + capture_failed=false),要么追踪的是**已废
-    // 旧 key** `local-conversation-status-section-visible`(v3),都不能拿来 restore 现役
-    // `show-context-window-usage` —— pre_value=None 时会误删 user 自己设的 footer 偏好
-    // (transfer 从没 capture 过)。一律跳过,留 user 原值。
-    if m.schema_version < 4 {
-        tracing::warn!(
-            target: "codex_integration::apply",
-            schema_version = m.schema_version,
-            "manifest predates the show-context-window-usage atom (schema_version < 4); \
-             skipping atom restore to avoid silently removing user's current value",
-        );
-        return Ok(());
-    }
-    match m.electron_status_section_pre_value {
-        Some(value) => crate::electron_state::write_atom(
-            &paths.electron_global_state,
-            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-            serde_json::Value::Bool(value),
-        ),
-        None => crate::electron_state::remove_atom(
-            &paths.electron_global_state,
-            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-        ),
-    }
 }
 
 fn clear_managed_codex_state(paths: &CodexPaths) -> Result<(), CodexError> {
@@ -634,30 +501,6 @@ fn clear_managed_codex_state(paths: &CodexPaths) -> Result<(), CodexError> {
             }
         }
         write_auth(&paths.auth_json, &auth)?;
-    }
-    // 没快照 fallback 路径:**不动** electron_global_state 的 atom 字段。
-    //
-    // Why: 用户全局规则"不主动进行任何破坏性降级"(feedback_no_silent_destructive_fallback)。
-    // 走到这里说明 transfer 从未 apply 过(没 snapshot),user 的 atom 值就是
-    // user 自己 manually 设的(包括在 Codex Settings 手动开关,或者新装从未碰过)。
-    // strip 掉等于擅自抹掉 user 配置,违反规则。
-    //
-    // Trade-off: 如果上版本 transfer 写过 atom 但未生成新 schema 的 snapshot,
-    // 这里清不掉残留 — 接受这个边缘 case 换"绝不擅动 user 偏好"的稳态。
-    //
-    // **silent-failure-hunter HIGH #5**:explicit log 让 upgrade-stale 场景留 audit
-    // trail。检测当前 atom 是否存在,有则告诉 user 怎么手动重置。
-    let current = crate::electron_state::read_atom(
-        &paths.electron_global_state,
-        crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-    );
-    if let Ok(Some(_)) = current {
-        tracing::warn!(
-            target: "codex_integration::apply",
-            "no snapshot but managed atom key still present in .codex-global-state.json \
-             (likely from older transfer version) — leaving in place per no-destructive-fallback rule. \
-             User can change it in Codex Desktop Settings (context usage ring).",
-        );
     }
     Ok(())
 }
@@ -779,7 +622,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v2.0.0-stage2.5",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -837,7 +679,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v2.0.0-stage2.5",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: true,
             },
@@ -886,7 +727,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: false,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -934,7 +774,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1004,7 +843,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1073,7 +911,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1139,7 +976,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1181,7 +1017,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1231,7 +1066,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1273,7 +1107,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1295,7 +1128,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1348,7 +1180,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1395,7 +1226,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1461,7 +1291,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1646,7 +1475,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v-active",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1716,7 +1544,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1738,7 +1565,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1774,7 +1600,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1802,7 +1627,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1837,7 +1661,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1878,7 +1701,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1931,7 +1753,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -1987,7 +1808,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -2043,7 +1863,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -2057,327 +1876,6 @@ model = \"gpt-5.5\"
         assert!(
             toml.contains("model = \"kimi-k2.6\""),
             "快照里没有 model 时,restore 应保留 CLI 写入的活跃选择,实际 toml:\n{toml}"
-        );
-    }
-
-    /// #258:apply 把 `show-context-window-usage` ensure 成 user 设置值,
-    /// restore 严格退回到 snapshot 拍摄时的原值(包括"原本不存在" → strip 退路)。
-    #[test]
-    fn apply_writes_status_section_atom_and_restore_reverts_to_snapshot_original() {
-        let (_t, paths) = setup();
-        let global_state = &paths.electron_global_state;
-
-        // 模拟 user 原本完全没设过该 atom(文件压根不存在)
-        assert!(!global_state.exists());
-
-        // apply with default_visible=true (transfer 默认行为)
-        apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "http://127.0.0.1:18080",
-                gateway_api_key: "cas_test",
-                supports_1m: false,
-                provider_name: "Mock",
-                default_model: "mock-model",
-                model_mappings: None,
-                model_capabilities: None,
-                model_display_names: None,
-                review_model_slot: None,
-                app_version: "v",
-                codex_network_access: true,
-                codex_status_section_default_visible: true,
-                direct: false,
-                preserve_chatgpt_auth: false,
-            },
-        )
-        .unwrap();
-        // atom 被写入 true
-        assert_eq!(
-            crate::electron_state::read_atom(
-                global_state,
-                crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-            )
-            .unwrap(),
-            Some(json!(true))
-        );
-
-        // restore:user 原本无此 atom → restore 应 strip,文件里该 key 应消失
-        restore_codex_state(&paths).unwrap();
-        assert_eq!(
-            crate::electron_state::read_atom(
-                global_state,
-                crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-            )
-            .unwrap(),
-            None,
-            "restore 必须 strip 我们写入的 atom(因为 snapshot 拍到 user 原本没此字段)"
-        );
-    }
-
-    /// Devin Review BUG-002 防回归:pre-v3 manifest(schema_version=2)由旧 transfer
-    /// 写,根本没追踪 atom。restore 必须**不动** atom 避免误删 user 升级后的手动设置。
-    #[test]
-    fn restore_does_not_touch_atom_for_pre_v3_manifest() {
-        let (_t, paths) = setup();
-        let global_state = &paths.electron_global_state;
-
-        // 模拟 user 升级前在 Codex Settings 开过 footer → atom=true
-        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
-        std::fs::write(
-            global_state,
-            r#"{"electron-persisted-atom-state":{"show-context-window-usage":true}}"#,
-        )
-        .unwrap();
-
-        // 模拟旧 transfer (schema v2) 的 manifest:没 atom 字段
-        let pre_v3_manifest = crate::snapshot::SnapshotManifest {
-            schema_version: 2,
-            snapshot_id: "legacy".into(),
-            session_id: "legacy".into(),
-            snapshot_at: "2026-05-01T00:00:00".into(),
-            config_existed: false,
-            auth_existed: false,
-            app_version: "v-old".into(),
-            provider_name: None,
-            // serde default 模拟:旧 manifest 没这俩字段
-            electron_status_section_pre_value: None,
-            electron_status_section_capture_failed: false,
-        };
-
-        restore_status_section_from_manifest(&paths, Some(pre_v3_manifest)).unwrap();
-
-        // user 的 atom=true 必须**不被删** —— 旧 transfer 没管它,新版 restore 也不该删
-        let after: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
-        assert_eq!(
-            after.pointer("/electron-persisted-atom-state/show-context-window-usage"),
-            Some(&json!(true)),
-            "pre-v3 manifest restore 必须不动 atom(旧 transfer 没追踪此字段,user 手动设置不该被删)"
-        );
-    }
-
-    /// [MOC-123] v4 bump 防回归:v3 manifest 由**上一版 transfer** 写,追踪的是已废旧 key
-    /// `local-conversation-status-section-visible`,其 pre_value 不代表现役
-    /// `show-context-window-usage`。restore 必须**跳过**(guard `schema_version < 4`),不能
-    /// 拿 v3 的 `None` 去 remove 新 key 误删 user 自己在 Codex Settings 开的 footer 偏好。
-    #[test]
-    fn restore_skips_v3_manifest_tracking_old_key() {
-        let (_t, paths) = setup();
-        let global_state = &paths.electron_global_state;
-
-        // user 自己在 Codex Settings 开了 footer → show-context-window-usage=true
-        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
-        std::fs::write(
-            global_state,
-            r#"{"electron-persisted-atom-state":{"show-context-window-usage":true}}"#,
-        )
-        .unwrap();
-
-        // 上一版 transfer 的 v3 manifest:追踪旧 key,新 key 视角下 pre_value=None
-        let v3_manifest = crate::snapshot::SnapshotManifest {
-            schema_version: 3,
-            snapshot_id: "v3-old-key".into(),
-            session_id: "v3-old-key".into(),
-            snapshot_at: "2026-06-01T00:00:00".into(),
-            config_existed: false,
-            auth_existed: false,
-            app_version: "v-old".into(),
-            provider_name: None,
-            electron_status_section_pre_value: None,
-            electron_status_section_capture_failed: false,
-        };
-
-        restore_status_section_from_manifest(&paths, Some(v3_manifest)).unwrap();
-
-        let after: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
-        assert_eq!(
-            after.pointer("/electron-persisted-atom-state/show-context-window-usage"),
-            Some(&json!(true)),
-            "v3 manifest(追踪旧 key)restore 必须跳过,不能拿 None 误删 user 现役 footer 偏好"
-        );
-    }
-
-    /// Devin Review BUG-003 防回归:snapshot 时 atom 是 non-boolean 值(手改 / 未来
-    /// Codex Desktop 改格式)→ snapshot 必须记 capture_failed=true,restore 必须不动。
-    #[test]
-    fn snapshot_marks_capture_failed_when_atom_is_not_boolean() {
-        let (_t, paths) = setup();
-        let global_state = &paths.electron_global_state;
-
-        // 模拟 user atom 是非 boolean (手改或未来 schema 变化)
-        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
-        std::fs::write(
-            global_state,
-            r#"{"electron-persisted-atom-state":{"show-context-window-usage":"yes"}}"#,
-        )
-        .unwrap();
-
-        apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "http://127.0.0.1:18080",
-                gateway_api_key: "cas_test",
-                supports_1m: false,
-                provider_name: "Mock",
-                default_model: "mock-model",
-                model_mappings: None,
-                model_capabilities: None,
-                model_display_names: None,
-                review_model_slot: None,
-                app_version: "v",
-                codex_network_access: true,
-                codex_status_section_default_visible: true,
-                direct: false,
-                preserve_chatgpt_auth: false,
-            },
-        )
-        .unwrap();
-
-        let manifest =
-            crate::snapshot::read_current_manifest(&paths).expect("snapshot 应已写 manifest");
-        assert!(
-            manifest.electron_status_section_capture_failed,
-            "non-boolean atom 必须 mark capture_failed=true(否则 restore 会误删)"
-        );
-
-        // restore 必须**不动** atom — apply 写入的 true 留在那(没原值可退回)
-        restore_codex_state(&paths).unwrap();
-        let after: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
-        // 关键:atom 字段没被 remove(restore short-circuit 跳过 atom touching)
-        assert!(
-            after
-                .pointer("/electron-persisted-atom-state/show-context-window-usage")
-                .is_some(),
-            "capture_failed=true 时 restore 必须不调 remove_atom,atom 字段必须保留"
-        );
-    }
-
-    /// silent-failure-hunter CRITICAL #1 防回归:snapshot 时 `.codex-global-state.json`
-    /// 损坏 → snapshot 应记 capture_failed=true,restore **不动** atom 防 silent 抹原值。
-    #[test]
-    fn restore_does_not_touch_atom_when_snapshot_capture_failed() {
-        let (_t, paths) = setup();
-        let global_state = &paths.electron_global_state;
-
-        // 模拟 user 真实场景:.codex-global-state.json 内容损坏(可能 mid-write 崩),
-        // 但里面 ATOM_STATE 段实际上仍有 atom=true(我们看不到,因为整体非法 JSON)。
-        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
-        std::fs::write(global_state, "{ corrupt json garbage").unwrap();
-
-        // apply 应**不 panic**(best-effort + tracing warn 即可)
-        apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "http://127.0.0.1:18080",
-                gateway_api_key: "cas_test",
-                supports_1m: false,
-                provider_name: "Mock",
-                default_model: "mock-model",
-                model_mappings: None,
-                model_capabilities: None,
-                model_display_names: None,
-                review_model_slot: None,
-                app_version: "v",
-                codex_network_access: true,
-                codex_status_section_default_visible: true,
-                direct: false,
-                preserve_chatgpt_auth: false,
-            },
-        )
-        .expect("apply must not fail when atom file is corrupt — UI preference best-effort");
-
-        // 验证 manifest 标了 capture_failed
-        let manifest =
-            crate::snapshot::read_current_manifest(&paths).expect("snapshot 应已写 manifest");
-        assert!(
-            manifest.electron_status_section_capture_failed,
-            "snapshot 必须把 capture 失败信号写进 manifest"
-        );
-        assert_eq!(
-            manifest.electron_status_section_pre_value, None,
-            "capture failed 时 pre_value 必须留 None"
-        );
-
-        // restore 应不动文件(保持 corrupt 原样,让 user 自己处理),并且不 panic
-        restore_codex_state(&paths).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(global_state).unwrap(),
-            "{ corrupt json garbage",
-            "restore 必须不动损坏文件(防 silently 抹 user 真实原 atom 值)"
-        );
-    }
-
-    /// #258:user **原本**已经手动 toggle 过 `/status` 为 false,apply 又把它改为 true,
-    /// restore 必须退回 false(尊重 user 原选择,不留 transfer 写入的 true)。
-    #[test]
-    fn restore_preserves_user_original_status_section_value() {
-        let (_t, paths) = setup();
-        let global_state = &paths.electron_global_state;
-
-        // user 已有的 global-state 文件,手动 toggle 过 /status off,且有其它字段
-        std::fs::create_dir_all(global_state.parent().unwrap()).unwrap();
-        std::fs::write(
-            global_state,
-            r#"{"electron-saved-workspace-roots":["/tmp/proj"],"electron-persisted-atom-state":{"show-context-window-usage":false,"composer-auto-context-enabled":true}}"#,
-        )
-        .unwrap();
-
-        apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "http://127.0.0.1:18080",
-                gateway_api_key: "cas_test",
-                supports_1m: false,
-                provider_name: "Mock",
-                default_model: "mock-model",
-                model_mappings: None,
-                model_capabilities: None,
-                model_display_names: None,
-                review_model_slot: None,
-                app_version: "v",
-                codex_network_access: true,
-                codex_status_section_default_visible: true,
-                direct: false,
-                preserve_chatgpt_auth: false,
-            },
-        )
-        .unwrap();
-        // apply 覆盖成 true,其它字段保留
-        let after_apply: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
-        assert_eq!(
-            after_apply.pointer("/electron-persisted-atom-state/show-context-window-usage"),
-            Some(&json!(true))
-        );
-        assert_eq!(
-            after_apply.pointer("/electron-persisted-atom-state/composer-auto-context-enabled"),
-            Some(&json!(true))
-        );
-        assert_eq!(
-            after_apply.get("electron-saved-workspace-roots"),
-            Some(&json!(["/tmp/proj"]))
-        );
-
-        // restore:atom 退回 user 原值 false,其它字段仍保留
-        restore_codex_state(&paths).unwrap();
-        let after_restore: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(global_state).unwrap()).unwrap();
-        assert_eq!(
-            after_restore.pointer("/electron-persisted-atom-state/show-context-window-usage"),
-            Some(&json!(false)),
-            "restore 必须用 snapshot 记录的 user 原值 false 复原,不留 transfer 写入的 true"
-        );
-        assert_eq!(
-            after_restore.pointer("/electron-persisted-atom-state/composer-auto-context-enabled"),
-            Some(&json!(true)),
-            "我们 only-touch 单 atom,user 同段其它 atom 必须原样保留"
-        );
-        assert_eq!(
-            after_restore.get("electron-saved-workspace-roots"),
-            Some(&json!(["/tmp/proj"])),
-            "user 顶层字段必须原样保留"
         );
     }
 
@@ -2401,7 +1899,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true, // 即便 on,direct 也不写 sandbox
-                codex_status_section_default_visible: true,
                 direct: true,
                 preserve_chatgpt_auth: false,
             },
@@ -2456,7 +1953,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },
@@ -2482,7 +1978,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: true,
                 preserve_chatgpt_auth: false,
             },
@@ -2545,7 +2040,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: true,
                 preserve_chatgpt_auth: false,
             },
@@ -2581,9 +2075,7 @@ model = \"gpt-5.5\"
                 "snapshot_at": "2020-01-01T00:00:00",
                 "config_existed": true,
                 "auth_existed": true,
-                "app_version": "v-test",
-                "electron_status_section_pre_value": null,
-                "electron_status_section_capture_failed": true
+                "app_version": "v-test"
             })
             .to_string(),
         )
@@ -2858,7 +2350,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v-test",
                 codex_network_access: true,
-                codex_status_section_default_visible: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
             },

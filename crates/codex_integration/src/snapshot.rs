@@ -30,12 +30,10 @@ use crate::paths::CodexPaths;
 use crate::toml_sync::write_atomic;
 use crate::CodexError;
 
-/// v3:开始追踪 context-usage atom 的 pre-value(`electron_status_section_*` 字段)。
-/// v4 [MOC-123]:追踪的 atom key 从已废 `local-conversation-status-section-visible` 换成
-/// 现役 `show-context-window-usage`(见 [`crate::electron_state::CONTEXT_USAGE_ATOM_KEY`])。
-/// v3 manifest 存的是**旧 key** 的 pre-value,**不能**拿去 restore 新 key —— 否则
-/// `None` 会误删 user 自己设的 footer 偏好(transfer 从没 capture 过)。restore + 迁移
-/// 路径据此 `< 4` 跳过 / 标 capture_failed(见 PR #360 chatgpt-codex-connector P2)。
+/// Snapshot manifest 的 schema 版本号。历史上 v3/v4 用于追踪 Codex Desktop
+/// context-usage atom 的 pre-value;该 feature 已移除(MOC-229),atom 字段不再写入,
+/// 但版本号保持 4 不回退 —— 旧 manifest 多出的 atom 字段由 serde 忽略
+/// (`SnapshotManifest` 无 `deny_unknown_fields`),无需迁移。
 const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 
 /// `gc_trash_older_than` 的默认保留天数 — daemon startup 调一次时用。
@@ -65,25 +63,6 @@ pub struct SnapshotManifest {
     pub app_version: String,
     #[serde(default)]
     pub provider_name: Option<String>,
-    /// `~/.codex/.codex-global-state.json` 里
-    /// `electron-persisted-atom-state.show-context-window-usage`
-    /// (见 [`crate::electron_state::CONTEXT_USAGE_ATOM_KEY`])在 snapshot 拍摄时的原值。
-    /// (字段名保留 `status_section` 作 manifest serde 向后兼容,语义现为 context-usage atom。)
-    ///
-    /// **三态语义**(配合 `electron_status_section_capture_failed`):
-    /// - `capture_failed=false` + `Some(v)` → snapshot 时已读到该值,restore 走 write_atom 复原
-    /// - `capture_failed=false` + `None` → snapshot 时确认 atom 不存在,restore 走 remove_atom
-    /// - `capture_failed=true` + `None` → snapshot 时读 atom 失败(IO/parse 错误),
-    ///   restore **不动** atom(避免 silently 抹掉 user 真实原值)
-    ///
-    /// `#[serde(default)]` 保证旧 manifest(schema_version < 3 没有此字段)
-    /// deserialize 到 `None` + `capture_failed=false`,等同"原本无该字段" → restore 走 remove。
-    #[serde(default)]
-    pub electron_status_section_pre_value: Option<bool>,
-    /// `electron_status_section_pre_value` capture 失败 sentinel。详见上面三态。
-    /// 旧 manifest 默认 false(snapshot 老路径全是成功 capture,行为不变)。
-    #[serde(default)]
-    pub electron_status_section_capture_failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -108,21 +87,6 @@ pub struct SnapshotInfo {
     pub app_version: String,
     pub provider_name: Option<String>,
     pub current_session: bool,
-}
-
-/// 是否有未还原的快照。
-/// 读当前快照的 manifest(走 active / 兼容 legacy)。
-/// 没快照或读失败返 `None`,caller(`apply::restore_*`)按"原本就没记录"语义走。
-pub fn read_current_manifest(paths: &CodexPaths) -> Option<SnapshotManifest> {
-    if let Some(dir) = current_snapshot_dir(paths) {
-        return read_manifest_from_dir(&dir).ok();
-    }
-    None
-}
-
-/// 读指定 snapshot_id 的 manifest。
-pub fn read_manifest_by_id(paths: &CodexPaths, snapshot_id: &str) -> Option<SnapshotManifest> {
-    snapshot_dir_by_id(paths, snapshot_id).and_then(|dir| read_manifest_from_dir(&dir).ok())
 }
 
 pub fn has_snapshot(paths: &CodexPaths) -> bool {
@@ -199,95 +163,20 @@ pub fn get_snapshot_status(paths: &CodexPaths) -> SnapshotStatus {
     }
 }
 
-/// 读当前 `~/.codex/.codex-global-state.json` 里 context-usage atom 的原值,返回
-/// `(pre_value, capture_failed)`(三态语义见 [`SnapshotManifest`])。snapshot 在
-/// apply 写 atom **之前**调,所以这里读到的是 user 写入前的原值。
-///
-/// BUG-003:atom 被手改 / 未来 Codex 改成非 boolean → `as_bool()` 返 None,不能误当
-/// "原本无字段"(restore 会 remove 误删),显式 mark capture_failed 防 silent loss。
-fn capture_context_usage_pre_value(paths: &CodexPaths) -> (Option<bool>, bool) {
-    match crate::electron_state::read_atom(
-        &paths.electron_global_state,
-        crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-    ) {
-        Ok(Some(v)) => match v.as_bool() {
-            Some(b) => (Some(b), false),
-            None => {
-                tracing::warn!(
-                    target: "codex_integration::snapshot",
-                    path = %paths.electron_global_state.display(),
-                    value = %v,
-                    "context-usage atom is not a boolean; marking capture as failed \
-                     to avoid silent loss on restore",
-                );
-                (None, true)
-            }
-        },
-        Ok(None) => (None, false),
-        Err(e) => {
-            tracing::warn!(
-                target: "codex_integration::snapshot",
-                path = %paths.electron_global_state.display(),
-                error = %e,
-                "snapshot pre-value capture failed for context-usage atom; \
-                 restore will skip atom touching to avoid silent loss",
-            );
-            (None, true)
-        }
-    }
-}
-
-/// 复用已存在的 active / legacy snapshot manifest。若它是 `< SNAPSHOT_SCHEMA_VERSION`
-/// 的旧版本(没追踪 context-usage atom,或追踪的是已废旧 key),则**重新捕获**当前
-/// (apply 写 atom 之前)的 atom 原值、升到当前 schema 后回写。
-///
-/// [MOC-123 / PR #360 P2] 为什么必须升级而不是原样复用:apply 之后会无条件写
-/// `show-context-window-usage` atom,而 restore 现在跳过所有 `< 4` manifest —— 若复用的
-/// 旧 manifest 不升级,写进去的 atom 就**没有可 restore 的 pre-value**,transfer 退出
-/// 时清不掉、永久留在 user global-state(破坏"退出恢复 Codex 默认")。升级前的旧
-/// transfer 只写过旧 key,所以此刻读到的新 key 值就是 user 的真实原值,捕获正确。
-///
-/// `manage_atom=false`(direct 直连模式):transfer 不写也不该 restore 这个 atom
-/// (#317 留用户原值),升级时标 capture_failed=true 让 restore 跳过。
-fn reuse_manifest_upgrading_atom(
-    paths: &CodexPaths,
-    dir: &Path,
-    manage_atom: bool,
-) -> Result<SnapshotManifest, CodexError> {
-    let mut manifest = read_manifest_from_dir(dir)?;
-    if manifest.schema_version < SNAPSHOT_SCHEMA_VERSION {
-        let (pre_value, capture_failed) = if manage_atom {
-            capture_context_usage_pre_value(paths)
-        } else {
-            (None, true)
-        };
-        manifest.electron_status_section_pre_value = pre_value;
-        manifest.electron_status_section_capture_failed = capture_failed;
-        manifest.schema_version = SNAPSHOT_SCHEMA_VERSION;
-        write_manifest_to_dir(dir, &manifest)?;
-    }
-    Ok(manifest)
-}
-
-/// `manage_atom`:transfer 这次 apply 是否会**写** context-usage atom(= `!cfg.direct`)。
-/// direct 直连模式不写也**不 restore** 该 atom(#317:既不写也不强清,留用户原值)——
-/// 否则 direct 会话期间 user 在 Codex Settings 手动改的圆环会被退出 restore 覆盖
-/// (PR #360 chatgpt-codex-connector P2)。direct 时 snapshot 把 atom 标 capture_failed
-/// 让 restore 跳过。
+/// 在 apply 写入前对当前 Codex 配置拍快照(幂等:已有 active 快照则复用)。
 pub fn snapshot_codex_state(
     paths: &CodexPaths,
     app_version: &str,
     provider_name: &str,
-    manage_atom: bool,
 ) -> Result<SnapshotManifest, CodexError> {
     move_stale_active_snapshots_to_recovery(paths)?;
 
     let current_dir = current_active_snapshot_dir(paths);
     if manifest_path(&current_dir).exists() {
-        return reuse_manifest_upgrading_atom(paths, &current_dir, manage_atom);
+        return read_manifest_from_dir(&current_dir);
     }
     if paths.snapshot_manifest.exists() {
-        return reuse_manifest_upgrading_atom(paths, &paths.snapshot_dir, manage_atom);
+        return read_manifest_from_dir(&paths.snapshot_dir);
     }
     std::fs::create_dir_all(&current_dir)?;
 
@@ -323,24 +212,6 @@ pub fn snapshot_codex_state(
         }
     }
 
-    // 读 `~/.codex/.codex-global-state.json` 里 status section atom 的原值。
-    // None = 文件不存在 / 段不存在 / atom 缺失,restore 时走 remove。
-    //
-    // **错误处理 silent-failure-hunter CRITICAL fix**:read_atom 现在区分
-    // ENOENT (Ok(None)) vs 其它 IO / parse 错误 (Err)。读错时**不能**默认 None ——
-    // 否则后续 restore 用 None 当"原本无此字段" → remove_atom → silent 丢
-    // user 真实原值。改成读错时:warn 一行 + manifest pre_value 保留 None,
-    // 但 restore 路径会 short-circuit"不动 atom"(见 apply.rs restore 改动)。
-    // 这里用 capture-failed sentinel 区分清楚两种 None。
-    let (electron_status_section_pre_value, electron_status_section_capture_failed) = if manage_atom
-    {
-        capture_context_usage_pre_value(paths)
-    } else {
-        // direct 模式:transfer 不写 atom,也不该退出时 restore-revert(#317 留用户原值)。
-        // 标 capture_failed → restore 跳过 → direct 会话期间 user 手动改的圆环不被覆盖。
-        (None, true)
-    };
-
     let session_id = current_session_id().to_owned();
     let manifest = SnapshotManifest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -355,8 +226,6 @@ pub fn snapshot_codex_state(
         } else {
             Some(provider_name.to_owned())
         },
-        electron_status_section_pre_value,
-        electron_status_section_capture_failed,
     };
     write_manifest_to_dir(&current_dir, &manifest)?;
 
@@ -744,28 +613,12 @@ fn read_dedup_field(path: &Path) -> Option<Option<String>> {
     }
 }
 
-/// 快照的 atom restore 等价类(去重指纹的一部分)。restore 行为只由 manifest 的
-/// `(capture_failed, pre_value)` 三态 + `schema_version` 决定:
-/// - `capture_failed=true`(或 `schema_version < 4` 兜底、manifest **不存在**)→ restore
-///   **不动** atom → 归一为 [`AtomRestoreKey::Untouched`];
-/// - 否则按 `pre_value` 复原(`Some(v)` 写入 / `None` 移除)→ [`AtomRestoreKey::Restore`]。
-///
-/// config/auth 相同但本键不同的两份 restore 结果不同、**不可互换**,不能去重(MOC-148
-/// review P2:否则删"重复"时会丢失只存在于 manifest 的 atom 恢复值)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AtomRestoreKey {
-    /// restore 不动 atom。
-    Untouched,
-    /// restore 按该 `pre_value` 复原(`Some(v)` 写入 / `None` 移除)。
-    Restore(Option<bool>),
-}
-
 /// manifest.json 的读取分类:区分"合法空态(不存在)"与"损坏(存在但读/解析失败)"。
 enum ManifestRead {
     /// 文件不存在(合法:无 manifest 的空原始态)。
     Absent,
     /// 读取 + 解析成功。
-    Parsed(SnapshotManifest),
+    Parsed,
     /// 文件存在但读失败 / 解析失败(损坏,内容不可判定)。
     Corrupt,
 }
@@ -775,47 +628,27 @@ fn read_manifest_classified(dir: &Path) -> ManifestRead {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ManifestRead::Absent,
         Err(_) => ManifestRead::Corrupt,
         Ok(s) => match serde_json::from_str::<SnapshotManifest>(&s) {
-            Ok(m) => ManifestRead::Parsed(m),
+            Ok(_) => ManifestRead::Parsed,
             Err(_) => ManifestRead::Corrupt,
         },
     }
 }
 
-/// 读 `dir` 的 manifest 归一成 [`AtomRestoreKey`]。口径与 [`move_snapshot_dir_to_recovery`]
-/// 写 recovery manifest 一致(`schema_version < 4` 视作 capture_failed)。
-/// - manifest **不存在** → restore 兜底"不动 atom" → `Some(Untouched)`(合法空态,参与比较);
-/// - 解析成功 → `Some(Restore(..)/Untouched)`;
-/// - manifest **存在但损坏**(读/解析失败)→ `None`:内容不可判定,调用方据此保守**不去重**
-///   —— 不拿"损坏、`list_snapshots` 看不到、无法手动恢复"的份当去重目标而误删好快照
-///   (MOC-148 review P2)。
-fn snapshot_atom_restore_key(dir: &Path) -> Option<AtomRestoreKey> {
-    match read_manifest_classified(dir) {
-        ManifestRead::Absent => Some(AtomRestoreKey::Untouched),
-        ManifestRead::Parsed(m)
-            if !m.electron_status_section_capture_failed && m.schema_version >= 4 =>
-        {
-            Some(AtomRestoreKey::Restore(m.electron_status_section_pre_value))
-        }
-        ManifestRead::Parsed(_) => Some(AtomRestoreKey::Untouched),
-        ManifestRead::Corrupt => None,
-    }
-}
-
-/// 读快照 dir 的去重指纹:config.toml + auth.json 内容 + atom restore 等价键。
-/// **不含 manifest 的 timestamp/session_id/snapshot_id**(每份都不同),但**含**影响
-/// restore 的 atom 三态(见 [`AtomRestoreKey`])。
+/// 读快照 dir 的去重指纹:config.toml + auth.json 内容。
+/// **不含 manifest 的 timestamp/session_id/snapshot_id**(每份都不同)。
 /// config/auth 任一"存在但读失败",或 manifest **存在但损坏** → 返回 `None`
-/// (内容不可判定,调用方据此保守不去重)。
-fn snapshot_content_for_dedup(
-    dir: &Path,
-) -> Option<(Option<String>, Option<String>, AtomRestoreKey)> {
+/// (内容不可判定,调用方据此保守不去重;manifest 损坏沿用 MOC-148 review P2 语义,
+/// 不拿"损坏、`list_snapshots` 看不到、无法手动恢复"的份当去重目标而误删好快照)。
+fn snapshot_content_for_dedup(dir: &Path) -> Option<(Option<String>, Option<String>)> {
     let config = read_dedup_field(&config_path(dir))?;
     let auth = read_dedup_field(&auth_path(dir))?;
-    let atom = snapshot_atom_restore_key(dir)?;
-    Some((config, auth, atom))
+    if matches!(read_manifest_classified(dir), ManifestRead::Corrupt) {
+        return None;
+    }
+    Some((config, auth))
 }
 
-/// recovery/ 中与 `dir` 内容(config + auth + atom restore 等价键)完全相同的备份目录列表。
+/// recovery/ 中与 `dir` 内容(config + auth)完全相同的备份目录列表。
 ///
 /// 保守语义:`dir` 自身 config/auth 读不出、或 manifest **存在但损坏** → 视为内容不可判定,
 /// 返回空(当作非重复、保留),绝不因"读不出/损坏"去删唯一副本;某份 recovery config/auth
@@ -870,7 +703,7 @@ fn prune_recovery_snapshots(paths: &CodexPaths) {
 }
 
 fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), CodexError> {
-    // 备份去重(**替换式**,MOC-148 review P2):recovery/ 已有内容(config+auth+atom 键)
+    // 备份去重(**替换式**,MOC-148 review P2):recovery/ 已有内容(config+auth)
     // 相同的旧份时,**删掉旧份、把这份更新的 stale 作为最新一份移入**(下方 rename),
     // 而非"删 stale 保留旧份"。后者在 recovery 接近/达到上限时有内容丢失风险:旧份可能
     // 随后被 `prune_recovery_snapshots` 清掉(本轮还有别的 stale 移入顶过上限时),导致该
@@ -902,26 +735,13 @@ fn move_snapshot_dir_to_recovery(paths: &CodexPaths, dir: &Path) -> Result<(), C
             auth_existed: auth_path(dir).exists(),
             app_version: String::new(),
             provider_name: None,
-            // 损坏快照的兜底 manifest 没原值信息。capture_failed=true 让 restore
-            // 安全 short-circuit"不动 atom"(防 silent 抹 user 原值)。
-            electron_status_section_pre_value: None,
-            electron_status_section_capture_failed: true,
         });
     std::fs::create_dir_all(&paths.recovery_snapshots_dir)?;
     let target = unique_recovery_dir(paths, &manifest.snapshot_id);
     std::fs::rename(dir, &target)?;
-    // BUG-004 fix + [MOC-123] v4 bump:升级 schema_version 到当前版本前先存原版本。
-    // 原版本 `< 4` 的 manifest 要么没追踪 atom(pre-v3),要么追踪的是已废旧 key
-    // `local-conversation-status-section-visible`(v3)—— 升 schema 后必须**同时**设
-    // capture_failed=true,否则 manual restore 把(旧 key 的 / 缺失的)pre_value 当成
-    // 现役 `show-context-window-usage` 的权威值 → None 时 remove_atom 误删 user 自己设的
-    // footer 偏好(见 apply.rs restore guard 设计)。
-    let original_schema = manifest.schema_version;
+    // 归档进 recovery 时把 schema_version 升到当前版本(纯 metadata,无字段迁移)。
     let mut recovery_manifest = manifest;
     recovery_manifest.schema_version = SNAPSHOT_SCHEMA_VERSION;
-    if original_schema < 4 {
-        recovery_manifest.electron_status_section_capture_failed = true;
-    }
     if let Some(target_id) = dir_name(&target) {
         recovery_manifest.snapshot_id = target_id;
     }
@@ -1124,7 +944,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"x\"\n").unwrap();
         std::fs::write(&paths.auth_json, "{\"OPENAI_API_KEY\":\"sk-real\"}\n").unwrap();
-        snapshot_codex_state(&paths, "v-test", "Mock", true).unwrap();
+        snapshot_codex_state(&paths, "v-test", "Mock").unwrap();
         assert!(has_snapshot(&paths));
 
         drop_all_snapshots(&paths).unwrap();
@@ -1182,7 +1002,7 @@ mod tests {
     #[test]
     fn snapshot_when_neither_file_exists() {
         let (_t, paths) = paths_with_tmp();
-        let m = snapshot_codex_state(&paths, "v2.0.0-stage2.5", "Mock", true).unwrap();
+        let m = snapshot_codex_state(&paths, "v2.0.0-stage2.5", "Mock").unwrap();
         assert!(!m.config_existed);
         assert!(!m.auth_existed);
         assert!(has_snapshot(&paths));
@@ -1199,7 +1019,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"existing\"\n").unwrap();
         std::fs::write(&paths.auth_json, "{\"OPENAI_API_KEY\":\"existing\"}\n").unwrap();
-        let m = snapshot_codex_state(&paths, "v", "Mock", true).unwrap();
+        let m = snapshot_codex_state(&paths, "v", "Mock").unwrap();
         assert!(m.config_existed);
         assert!(m.auth_existed);
         assert_eq!(
@@ -1213,10 +1033,10 @@ mod tests {
         let (_t, paths) = paths_with_tmp();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "old\n").unwrap();
-        snapshot_codex_state(&paths, "v", "Mock", true).unwrap();
+        snapshot_codex_state(&paths, "v", "Mock").unwrap();
         // 改了 config.toml,再 snapshot 一次 —— 不应覆盖原始备份
         std::fs::write(&paths.config_toml, "new\n").unwrap();
-        snapshot_codex_state(&paths, "v", "Mock", true).unwrap();
+        snapshot_codex_state(&paths, "v", "Mock").unwrap();
         assert_eq!(
             read_snapshot_config(&paths).unwrap(),
             "old\n",
@@ -1227,7 +1047,7 @@ mod tests {
     #[test]
     fn drop_snapshot_clears_dir() {
         let (_t, paths) = paths_with_tmp();
-        snapshot_codex_state(&paths, "v", "Mock", true).unwrap();
+        snapshot_codex_state(&paths, "v", "Mock").unwrap();
         assert!(has_snapshot(&paths));
         drop_snapshot(&paths).unwrap();
         assert!(!has_snapshot(&paths));
@@ -1250,8 +1070,6 @@ mod tests {
                 auth_existed: false,
                 app_version: "v-old".to_owned(),
                 provider_name: Some("Old".to_owned()),
-                electron_status_section_pre_value: None,
-                electron_status_section_capture_failed: false,
             })
             .unwrap(),
         )
@@ -1259,7 +1077,7 @@ mod tests {
 
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
-        snapshot_codex_state(&paths, "v-new", "New", true).unwrap();
+        snapshot_codex_state(&paths, "v-new", "New").unwrap();
 
         assert!(!stale_dir.exists());
         let snapshots = list_snapshots(&paths);
@@ -1283,8 +1101,6 @@ mod tests {
             auth_existed: false,
             app_version: "v".to_owned(),
             provider_name: None,
-            electron_status_section_pre_value: None,
-            electron_status_section_capture_failed: false,
         }
     }
 
@@ -1347,86 +1163,21 @@ mod tests {
         assert_eq!(recs.len(), 2, "不同内容应新增 recovery: {recs:?}");
     }
 
-    /// MOC-148 review P2:config/auth **完全相同**但 manifest 的 atom `pre_value` 不同 →
-    /// restore 结果不同、不可互换 → **不去重**,保留两份(否则删"重复"会丢只存在于
-    /// manifest 的 atom 恢复值)。
+    /// 回归:config/auth 完全相同 → 真重复 → 去重(只保留一份)。
     #[test]
-    fn move_to_recovery_keeps_when_atom_pre_value_differs() {
+    fn move_to_recovery_dedups_when_content_matches() {
         let (_t, paths) = paths_with_tmp();
         let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
         std::fs::create_dir_all(&existing).unwrap();
         std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
         std::fs::write(auth_path(&existing), "{\"k\":\"A\"}").unwrap();
-        let mut m_existing = mk_manifest("existing");
-        m_existing.electron_status_section_pre_value = Some(false);
-        write_manifest_to_dir(&existing, &m_existing).unwrap();
+        write_manifest_to_dir(&existing, &mk_manifest("existing")).unwrap();
 
-        // config/auth 一字不差,仅 atom pre_value 不同(Some(true) vs Some(false))。
-        let stale = paths.active_snapshots_dir.join("atom-diff");
+        let stale = paths.active_snapshots_dir.join("same-content");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
         std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
-        let mut m_stale = mk_manifest("atom-diff");
-        m_stale.electron_status_section_pre_value = Some(true);
-        write_manifest_to_dir(&stale, &m_stale).unwrap();
-
-        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
-
-        assert!(!stale.exists(), "stale 仍应移入 recovery(rename)");
-        assert_eq!(
-            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
-            2,
-            "atom restore 值不同 → 不可互换 → 不去重,应保留两份"
-        );
-    }
-
-    /// `capture_failed` 差异同样使两份不可互换(一个 restore 不动 atom、一个会复原)→ 保留。
-    #[test]
-    fn move_to_recovery_keeps_when_capture_failed_differs() {
-        let (_t, paths) = paths_with_tmp();
-        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
-        std::fs::create_dir_all(&existing).unwrap();
-        std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
-        let mut m_existing = mk_manifest("existing");
-        m_existing.electron_status_section_pre_value = Some(true); // Restore(Some(true))
-        write_manifest_to_dir(&existing, &m_existing).unwrap();
-
-        let stale = paths.active_snapshots_dir.join("cap-failed");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
-        let mut m_stale = mk_manifest("cap-failed");
-        m_stale.electron_status_section_capture_failed = true; // Untouched
-        write_manifest_to_dir(&stale, &m_stale).unwrap();
-
-        move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
-
-        assert!(!stale.exists());
-        assert_eq!(
-            snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
-            2,
-            "capture_failed 不同(不动 atom vs 复原)→ 不可互换 → 保留两份"
-        );
-    }
-
-    /// 回归:config/auth 相同且 atom 三态也相同 → 仍是真重复 → 照旧去重(本修复不误伤)。
-    #[test]
-    fn move_to_recovery_still_dedups_when_atom_state_matches() {
-        let (_t, paths) = paths_with_tmp();
-        let existing = paths.recovery_snapshots_dir.join("20260601T000000000-p1");
-        std::fs::create_dir_all(&existing).unwrap();
-        std::fs::write(config_path(&existing), "openai_base_url = \"X\"\n").unwrap();
-        std::fs::write(auth_path(&existing), "{\"k\":\"A\"}").unwrap();
-        let mut m_existing = mk_manifest("existing");
-        m_existing.electron_status_section_pre_value = Some(true);
-        write_manifest_to_dir(&existing, &m_existing).unwrap();
-
-        let stale = paths.active_snapshots_dir.join("same-atom");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(config_path(&stale), "openai_base_url = \"X\"\n").unwrap();
-        std::fs::write(auth_path(&stale), "{\"k\":\"A\"}").unwrap();
-        let mut m_stale = mk_manifest("same-atom");
-        m_stale.electron_status_section_pre_value = Some(true);
-        write_manifest_to_dir(&stale, &m_stale).unwrap();
+        write_manifest_to_dir(&stale, &mk_manifest("same-content")).unwrap();
 
         move_snapshot_dir_to_recovery(&paths, &stale).unwrap();
 
@@ -1434,7 +1185,7 @@ mod tests {
         assert_eq!(
             snapshot_dirs_under(&paths.recovery_snapshots_dir).len(),
             1,
-            "config/auth + atom 三态全同 → 真重复 → 去重(不新增)"
+            "config/auth 完全相同 → 真重复 → 去重(不新增)"
         );
     }
 
@@ -1722,124 +1473,12 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
 
-        snapshot_codex_state(&paths, "v-new", "New", true).unwrap();
+        snapshot_codex_state(&paths, "v-new", "New").unwrap();
 
         assert!(
             snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,
             "apply 时应把积压 recovery 收敛到上限内"
         );
-    }
-
-    /// Devin Review BUG-004 防回归:pre-v3 (schema_version=2) 的 stale active
-    /// 被升级到 recovery 时,必须**同时**标 capture_failed=true,否则后续 manual
-    /// restore 时(schema 已升 v3 + 三态默认 None/false)会误判"snapshot 时 atom
-    /// 不存在" → remove_atom → silently 抹掉 user 手动设的 context-usage 偏好(Codex Settings)。
-    #[test]
-    fn pre_v3_stale_recovery_upgrade_marks_capture_failed() {
-        let (_t, paths) = paths_with_tmp();
-
-        // 模拟旧 transfer 写的 schema_version=2 manifest(没追踪 atom 字段,但
-        // 序列化时 serde 给 default 值 — pre_value=None + capture_failed=false)
-        let stale_dir = paths.active_snapshots_dir.join("v2-session");
-        std::fs::create_dir_all(&stale_dir).unwrap();
-        std::fs::write(config_path(&stale_dir), "openai_base_url = \"old\"\n").unwrap();
-        let v2_manifest_json = serde_json::json!({
-            "schema_version": 2,
-            "snapshot_id": "v2-session",
-            "session_id": "v2-session",
-            "snapshot_at": "2026-05-01T01:00:00",
-            "config_existed": true,
-            "auth_existed": false,
-            "app_version": "v-old",
-            "provider_name": "Old"
-            // 故意 omit electron_status_section_* — 模拟真实 v2 manifest 没这俩字段
-        });
-        std::fs::write(manifest_path(&stale_dir), v2_manifest_json.to_string()).unwrap();
-
-        std::fs::create_dir_all(&paths.codex_home).unwrap();
-        std::fs::write(&paths.config_toml, "openai_base_url = \"new\"\n").unwrap();
-
-        // trigger move_stale_active_snapshots_to_recovery via snapshot_codex_state
-        snapshot_codex_state(&paths, "v-new", "New", true).unwrap();
-
-        // 找新生成的 recovery manifest,核对 schema 升 v3 + capture_failed=true
-        let recovery_dirs: Vec<_> = std::fs::read_dir(&paths.recovery_snapshots_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect();
-        assert!(!recovery_dirs.is_empty(), "应有 recovery 目录");
-        let recovery_manifest =
-            read_manifest_from_dir(&recovery_dirs[0]).expect("应读到 recovery manifest");
-        assert_eq!(
-            recovery_manifest.schema_version, SNAPSHOT_SCHEMA_VERSION,
-            "schema_version 应升到 v3"
-        );
-        assert!(
-            recovery_manifest.electron_status_section_capture_failed,
-            "pre-v3 manifest 升 v3 时必须 mark capture_failed=true(防 manual restore 误删 user atom)"
-        );
-    }
-
-    /// [MOC-123 / PR #360 P2] reuse 一个 legacy v3 manifest 时必须升到 v4 并重新捕获
-    /// 当前 atom 原值。否则 apply 随后无条件写的 `show-context-window-usage` 没有可
-    /// restore 的 pre-value(restore 跳过 `< 4` manifest)→ transfer 退出时清不掉。
-    /// 这里验证 user 原本无 atom 的常见场景:升级后 pre_value=None + schema v4 + 落盘,
-    /// 后续 restore 据此 remove 干净(恢复 Codex 默认)。
-    #[test]
-    fn reuse_upgrades_legacy_v3_manifest_and_recaptures_atom() {
-        let (_t, paths) = paths_with_tmp();
-        std::fs::create_dir_all(&paths.snapshot_dir).unwrap();
-        let v3 = serde_json::json!({
-            "schema_version": 3,
-            "snapshot_id": "legacy-v3",
-            "session_id": "legacy-v3",
-            "snapshot_at": "2026-06-01T00:00:00",
-            "config_existed": false,
-            "auth_existed": false,
-            "app_version": "v-old",
-            "provider_name": "Old",
-            // v3 追踪的是旧 key,新 key 视角下没捕获;且 user 原本无新 key atom
-            "electron_status_section_pre_value": null,
-            "electron_status_section_capture_failed": false
-        });
-        std::fs::write(manifest_path(&paths.snapshot_dir), v3.to_string()).unwrap();
-
-        let upgraded = reuse_manifest_upgrading_atom(&paths, &paths.snapshot_dir, true).unwrap();
-        assert_eq!(
-            upgraded.schema_version, SNAPSHOT_SCHEMA_VERSION,
-            "legacy v3 manifest 复用时必须升到当前 schema(v4),否则写入的 atom 退出清不掉"
-        );
-        assert_eq!(
-            upgraded.electron_status_section_pre_value, None,
-            "user 原本无 atom → 重新捕获到 None(restore 会 remove,退出恢复 Codex 默认)"
-        );
-        assert!(!upgraded.electron_status_section_capture_failed);
-        // 落盘也已升级到 v4
-        let persisted = read_manifest_from_dir(&paths.snapshot_dir).unwrap();
-        assert_eq!(persisted.schema_version, SNAPSHOT_SCHEMA_VERSION);
-    }
-
-    /// [MOC-123 / PR #360 P2] direct 直连模式(manage_atom=false):snapshot 不把 atom
-    /// 当 transfer 管理字段 —— 标 capture_failed=true 让 restore 跳过,这样 direct 会话
-    /// 期间 user 在 Codex Settings 手动改的圆环不会被退出 restore 覆盖(#317 留用户原值)。
-    #[test]
-    fn direct_snapshot_marks_atom_unmanaged_so_restore_skips() {
-        let (_t, paths) = paths_with_tmp();
-        // user 自己开了圆环
-        crate::electron_state::write_atom(
-            &paths.electron_global_state,
-            crate::electron_state::CONTEXT_USAGE_ATOM_KEY,
-            serde_json::json!(true),
-        )
-        .unwrap();
-        // direct apply 的 snapshot:manage_atom=false
-        let m = snapshot_codex_state(&paths, "v", "Direct", false).unwrap();
-        assert!(
-            m.electron_status_section_capture_failed,
-            "direct 模式 snapshot 必须标 capture_failed=true,让 restore 跳过 atom(留用户原值)"
-        );
-        assert_eq!(m.electron_status_section_pre_value, None);
     }
 
     #[test]
@@ -1865,8 +1504,6 @@ mod tests {
                     auth_existed: false,
                     app_version: "v-old".to_owned(),
                     provider_name: Some("Old".to_owned()),
-                    electron_status_section_pre_value: None,
-                    electron_status_section_capture_failed: false,
                 })
                 .unwrap(),
             )

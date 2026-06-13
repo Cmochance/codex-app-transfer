@@ -11,17 +11,6 @@ pub struct CodexPaths {
     pub config_toml: PathBuf,
     pub auth_json: PathBuf,
     pub model_catalog_json: PathBuf,
-    /// Electron 主进程的持久化 atom state JSON(`~/.codex/.codex-global-state.json`)。
-    ///
-    /// Codex Desktop GUI 用 jotai `atomWithStorage` + electron-store 把若干 user-UI 偏好
-    /// 持久化到这里,字段路径 `electron-persisted-atom-state.<atom-key>`。比如
-    /// `show-context-window-usage` 控制 composer footer 底部 context 圆环 +
-    /// tokens/s 的显示(Codex 0.135+ 收敛进 footer 的设置,见 #258 / MOC-123)。
-    ///
-    /// transfer 通过该路径在 Codex Desktop **启动前** ensure 某些 UI 偏好默认开启
-    /// (e.g. 圆环默认显示),避免新 user / 升级 reset 后看不到关键 UI。运行时改
-    /// 会被 Codex 内存 atom 覆盖,所以必须先于 Codex 启动。
-    pub electron_global_state: PathBuf,
     /// Codex MCP OAuth 凭据的 file-store 落点(`~/.codex/.credentials.json`)。
     ///
     /// 当 `mcp_oauth_credentials_store = "file"` 时,Codex 把每个 MCP server 的
@@ -86,7 +75,6 @@ impl CodexPaths {
             config_toml: codex_home.join("config.toml"),
             auth_json: codex_home.join("auth.json"),
             model_catalog_json: app_home.join("config.json"),
-            electron_global_state: codex_home.join(".codex-global-state.json"),
             mcp_credentials: codex_home.join(".credentials.json"),
             mcp_credentials_mirror: app_home.join("mcp-credentials.json"),
             snapshot_config: snapshot_dir.join("config.toml"),
@@ -143,10 +131,6 @@ mod tests {
         assert_eq!(
             p.model_catalog_json,
             PathBuf::from("/x/.codex-app-transfer/config.json")
-        );
-        assert_eq!(
-            p.electron_global_state,
-            PathBuf::from("/x/.codex/.codex-global-state.json")
         );
         assert_eq!(
             p.mcp_credentials,
