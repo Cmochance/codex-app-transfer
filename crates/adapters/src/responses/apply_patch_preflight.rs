@@ -149,9 +149,20 @@ pub fn optimize_patch(v4a: &str, cwd: Option<&str>, json_complete: bool) -> (Str
     s = s1;
     repairs.extend(r1);
 
+    // [MOC-228] @@ 与紧邻同内容 - 行去重(删冗余 @@ 锚点)
+    let (s_d, r_d) = dedup_at_minus(&s);
+    s = s_d;
+    repairs.extend(r_d);
+
     let (s_g, r_g) = ensure_add_file_plus(&s);
     s = s_g;
     repairs.extend(r_g);
+
+    // [MOC-228] 剥离 Add File body 末尾误入的信封标记(+*** End Patch);模型把 *** End Patch 当文件
+    // 内容并加了 + 前缀。放 ensure_add_file_plus 之后无副作用(该函数不产生 +*** End Patch)。
+    let (s_e, r_e) = strip_body_envelope_leak(&s);
+    s = s_e;
+    repairs.extend(r_e);
 
     // ── Tier B 语义恢复 ──
     // 注:`Add File 已存在 → Delete+Add 覆盖` 规则**已撤销**(2026-06-09)。它会覆盖已有文件、
@@ -230,6 +241,50 @@ fn strip_trailing_at(v4a: &str) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
+/// **规则:`@@ X` 与紧邻 `-X`(内容逐字相同)去重 → 删冗余 `@@` 锚点**([[MOC-228]] glm-5.1 实测)。
+/// 模型把同一行**既当 `@@` 定位锚点、又当 `-` 删除行**(`@@ async def f():` 紧跟 `-async def f():`)。
+/// V4A 语义:`@@` 是不消费的 context 锚点,`-` 是删除行;两者指向文件同一行(只有一份)→ `@@` 定位 +
+/// `-` 又删 → 消费冲突 → `Failed to find` / `skipped:no_unique_match`。修复:删 `@@` 行(冗余锚点)、
+/// 保留 `-` 行(真删除意图)。**只在 `@@ <h>` 紧跟 `-<h>` 且去前缀后逐字相同时触发**(精确匹配,不 trim,
+/// 避免误判缩进不同的合法行);`@@ X` 紧跟 `-Y`(不同) / `+X` / context 一律不动。纯字符串、不读盘。
+fn dedup_at_minus(v4a: &str) -> (String, Vec<Repair>) {
+    let lines: Vec<&str> = v4a.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = 0usize;
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        // `@@ <h>`(非裸 `@@`)紧跟 `-<h>`(去 `-` 前缀后与 h 逐字相同)→ 删 `@@` 行
+        if let Some(h) = l.strip_prefix("@@ ") {
+            if !h.trim().is_empty() && i + 1 < lines.len() {
+                if let Some(m) = lines[i + 1].strip_prefix('-') {
+                    if m == h {
+                        changed += 1;
+                        i += 1; // 跳过 `@@` 行,下轮从 `-` 行继续(保留之)
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(l.to_owned());
+        i += 1;
+    }
+    let mut joined = out.join("\n");
+    if v4a.ends_with('\n') {
+        joined.push('\n');
+    }
+    let repairs = if changed > 0 {
+        vec![Repair {
+            file: "(@@ header)".to_owned(),
+            kind: "repaired".to_owned(),
+            detail: format!("@@ 与紧邻 - 行内容重复 → 删冗余 @@ 锚点: {changed} 行(MOC-228)"),
+        }]
+    } else {
+        Vec::new()
+    };
+    (joined, repairs)
+}
+
 /// **规则 G:Add File 内容行漏 `+` 前缀 → 补全**(grammar `add_hunk: … add_line+`、
 /// `add_line: "+" /(.*)/`)。Add File 语义 = 后续每行都是新文件的**字面内容**、必须 `+` 前缀;
 /// 模型偶尔漏写 `+` → Codex 不认作内容。Add File section 内**无歧义**(全是新增),给非 `+` 行
@@ -262,6 +317,78 @@ fn ensure_add_file_plus(v4a: &str) -> (String, Vec<Repair>) {
                     file: path.trim().to_owned(),
                     kind: "repaired".to_owned(),
                     detail: format!("Add File {fixed} 行漏 `+` 前缀 → 补全(lark add_line)"),
+                });
+            }
+        } else {
+            out.push(lines[i].to_owned());
+            i += 1;
+        }
+    }
+    let mut joined = out.join("\n");
+    if v4a.ends_with('\n') {
+        joined.push('\n');
+    }
+    (joined, repairs)
+}
+
+/// **规则:Add File body 末尾误入信封标记 `+*** End Patch` → 剥离**([[MOC-228]] glm-5.1 实测)。
+/// 模型把信封结尾 `*** End Patch` 当文件最后一行内容、**并加了 `+` 前缀**(`+*** End Patch`)→ apply 会把
+/// `*** End Patch` 写进新文件末尾(rate_limit.py 实证:16:09:12 写入 → 16:13:29 模型不得不再发 patch 删它)。
+/// (注:裸 `*** End Patch` 是 `*** ` 控制行,会被当真信封结尾正常解析、不进 body;只有带 `+` 前缀的才被
+/// 当内容 → 本规则只处理 `+*** End Patch`,`ensure_add_file_plus` 不参与。)**只剥 Add File body 紧贴下个
+/// `*** ` 控制行 / EOF 的末尾连续行**,去 `+` 前缀 trim 后正好是孤立信封标记(`*** End Patch` /
+/// `*** Begin Patch`)。**关键防误剥(收紧,见函数体守卫)**:仅在 patch **缺真信封结尾**时才剥 ——
+/// 若 patch 已含真裸 `*** End Patch`,则 body 内的 `+*** End Patch` 与「合法文件恰好以该标记结尾」
+/// (如 documenting V4A 格式本身的文档 / fixture)**位置无法区分**,保守不剥(避免 silent data loss)。
+/// body **中间**真含该字样的内容(文档 / 示例)亦不碰(只扫末尾)。剥后缺失的真信封由
+/// [`ensure_v4a_envelope`] 在链尾补回。纯字符串、不读盘。
+fn strip_body_envelope_leak(v4a: &str) -> (String, Vec<Repair>) {
+    if !v4a.contains("*** Add File:") {
+        return (v4a.to_owned(), Vec::new());
+    }
+    // [MOC-228 收紧] **仅当 patch 缺真信封结尾(无裸 `*** End Patch`)时**,body 末尾的 `+*** End Patch`
+    // 才确定是「泄漏」(模型把信封当内容加了 `+` 前缀、且漏写真信封 —— rate_limit.py 16:09:12 实证:
+    // `+*** End Patch` 在 EOF、无真信封)→ 剥离,由 [`ensure_v4a_envelope`] 在链尾补真信封。
+    // 若**已有**真裸 `*** End Patch`,body 内的 `+*** End Patch` 与「合法文件恰好以该标记结尾」结构
+    // **位置无法区分** → 保守不剥(宁漏不误删,避免 silent data loss;模型会自纠,如 16:13:29 再发 patch 删)。
+    if v4a.lines().any(|l| l.trim_end() == "*** End Patch") {
+        return (v4a.to_owned(), Vec::new());
+    }
+    let lines: Vec<&str> = v4a.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut repairs = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].starts_with("*** Add File: ") {
+            out.push(lines[i].to_owned()); // header
+            i += 1;
+            let body_start = out.len();
+            // Add File body 到下个 `*** ` 控制行 / EOF
+            while i < lines.len() && !lines[i].starts_with("*** ") {
+                out.push(lines[i].to_owned());
+                i += 1;
+            }
+            // 剥末尾连续的孤立信封标记行(只扫末尾,中间合法内容不碰)
+            let mut stripped = 0usize;
+            while out.len() > body_start {
+                let core = out
+                    .last()
+                    .unwrap()
+                    .strip_prefix('+')
+                    .unwrap_or(out.last().unwrap())
+                    .trim();
+                if core == "*** End Patch" || core == "*** Begin Patch" {
+                    out.pop();
+                    stripped += 1;
+                } else {
+                    break;
+                }
+            }
+            if stripped > 0 {
+                repairs.push(Repair {
+                    file: "(Add File body)".to_owned(),
+                    kind: "repaired".to_owned(),
+                    detail: format!("Add File body 末尾误入信封标记 → 剥离 {stripped} 行(MOC-228)"),
                 });
             }
         } else {
@@ -967,6 +1094,121 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         (dir, name.to_owned())
+    }
+
+    // ── [MOC-228] @@/- 去重 + Add File body 内信封剥离 ──────────────────
+
+    #[test]
+    fn dedup_at_minus_removes_duplicate_anchor() {
+        // glm-5.1 实测:@@ X 紧跟 -X(逐字相同)→ 删 @@ 锚点,保留 - 删除行
+        let v4a = "*** Begin Patch\n*** Update File: a.py\n@@ async def f(x):\n-async def f(x):\n+async def f(x, y):\n*** End Patch\n";
+        let (out, reps) = dedup_at_minus(v4a);
+        assert!(!out.contains("@@ async def f(x):"), "应删除冗余 @@ 锚点");
+        assert!(out.contains("-async def f(x):"), "应保留 - 删除行");
+        assert_eq!(reps.len(), 1);
+        assert!(reps[0].detail.contains("MOC-228"));
+    }
+
+    #[test]
+    fn dedup_at_minus_keeps_different_minus() {
+        // @@ X + -Y(内容不同)→ 合法锚点 + 删除,不动
+        let v4a = "@@ def f():\n-x = 1\n+x = 2\n";
+        let (out, reps) = dedup_at_minus(v4a);
+        assert_eq!(out, v4a);
+        assert!(reps.is_empty());
+    }
+
+    #[test]
+    fn dedup_at_minus_ignores_plus_and_context() {
+        // @@ X 紧跟 +X(加行)/ context(空格前缀)→ 不动(只对内容相同的 - 行去重)
+        let p = "@@ def f():\n+def f():\n";
+        assert_eq!(dedup_at_minus(p).0, p);
+        let c = "@@ def f():\n def f():\n";
+        assert_eq!(dedup_at_minus(c).0, c);
+    }
+
+    #[test]
+    fn dedup_at_minus_ignores_bare_at() {
+        // 裸 @@(section 分隔)不动
+        let v4a = "@@\n-x\n";
+        assert_eq!(dedup_at_minus(v4a).0, v4a);
+    }
+
+    #[test]
+    fn strip_body_envelope_leak_removes_trailing() {
+        // 真实泄漏形态:Add File body 末尾 +*** End Patch 在 EOF、**无真信封**(rate_limit.py 16:09:12)→ 剥离
+        let v4a = "*** Begin Patch\n*** Add File: a.py\n+x = 1\n+*** End Patch\n";
+        let (out, reps) = strip_body_envelope_leak(v4a);
+        assert!(
+            !out.lines().any(|l| l == "+*** End Patch"),
+            "应剥离泄漏的 +*** End Patch"
+        );
+        assert!(out.contains("+x = 1"), "正常内容保留");
+        assert_eq!(reps.len(), 1);
+    }
+
+    #[test]
+    fn strip_body_envelope_leak_keeps_legit_trailing_marker() {
+        // [收紧反例] 合法文档真的以 *** End Patch 结尾 + 有真信封 → 与泄漏位置无法区分,保守不剥(防 silent data loss)
+        let v4a = "*** Begin Patch\n*** Add File: doc.md\n+# V4A 格式\n+补丁以下面这行结束:\n+*** End Patch\n*** End Patch\n";
+        let (out, reps) = strip_body_envelope_leak(v4a);
+        assert_eq!(
+            out, v4a,
+            "有真信封时 body 末尾 +*** End Patch 视为合法内容,不剥"
+        );
+        assert!(reps.is_empty());
+    }
+
+    #[test]
+    fn strip_body_envelope_leak_keeps_midbody() {
+        // body 中间含 +*** End Patch(文档示例),末尾是正常内容 → 不碰(只扫末尾)
+        let v4a = "*** Add File: doc.md\n+# 示例\n+*** End Patch\n+正文继续\n";
+        let (out, reps) = strip_body_envelope_leak(v4a);
+        assert_eq!(out, v4a, "中间信封字样(非末尾)不碰");
+        assert!(reps.is_empty());
+    }
+
+    #[test]
+    fn strip_body_envelope_leak_ignores_update_minus() {
+        // Update File 的 -*** End Patch(删文件里误入的)→ 不碰(只处理 Add File body)
+        let v4a = "*** Update File: a.py\n context\n-*** End Patch\n";
+        let (out, reps) = strip_body_envelope_leak(v4a);
+        assert_eq!(out, v4a);
+        assert!(reps.is_empty());
+    }
+
+    #[test]
+    fn moc228_at_dedup_endtoend() {
+        // 端到端(auth.py 类):optimize_patch 后冗余 @@ 锚点被删,- 删除行保留
+        let v4a = "*** Begin Patch\n*** Update File: a.py\n context\n@@ async def register(r):\n-async def register(r):\n+async def register(r, h):\n*** End Patch\n";
+        let (out, reps) = optimize_patch(v4a, None, true);
+        assert!(
+            !out.contains("@@ async def register(r):"),
+            "@@ 冗余锚点应删"
+        );
+        assert!(out.contains("-async def register(r):"), "- 删除行保留");
+        assert!(reps
+            .iter()
+            .any(|r| r.detail.contains("MOC-228") && r.detail.contains("@@")));
+    }
+
+    #[test]
+    fn moc228_envelope_leak_endtoend() {
+        // 端到端(rate_limit.py 真实形态):Add body 末尾 +*** End Patch 在 EOF 无真信封 → 剥 + ensure 补真信封
+        let v4a = "*** Begin Patch\n*** Add File: rate_limit.py\n+import time\n+*** End Patch\n";
+        let (out, reps) = optimize_patch(v4a, None, true);
+        assert!(
+            !out.lines().any(|l| l == "+*** End Patch"),
+            "body 内泄漏 +*** End Patch 应剥"
+        );
+        assert!(out.contains("+import time"), "正常内容保留");
+        assert!(
+            out.trim_end().ends_with("*** End Patch"),
+            "ensure_v4a_envelope 补回真信封"
+        );
+        assert!(reps
+            .iter()
+            .any(|r| r.detail.contains("MOC-228") && r.detail.contains("信封")));
     }
 
     #[test]
