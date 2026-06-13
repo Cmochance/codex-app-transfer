@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
@@ -55,6 +55,38 @@ pub(crate) fn build_tool_namespace_map(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     acc.extend(local);
     acc.clone()
+}
+
+/// 扫 `original_request.tools[]`,收集所有 `type:"custom"` 工具(Codex freeform
+/// 工具,如 apply_patch)的顶层 `name`,返回名字集合。
+///
+/// **用途**(MOC-88):GeminiNative 响应侧判定「Gemini 回来的这个 functionCall 当初
+/// 是不是注册为 custom freeform 工具」。Gemini 只认 structured function,请求侧把所有
+/// `type:"custom"` 工具降级成单 `input` 的 function(见 `gemini_native/request.rs`
+/// `"custom"` arm);响应侧据此集合把对应 functionCall 重打包回 `custom_tool_call`
+/// wire。比硬比 name 字符串 == `apply_patch`(name-only)更准:既不会把**碰巧**同名的
+/// 普通 function / MCP 工具误打成 custom(丢 args / namespace),也不漏判 apply_patch
+/// 之外的 custom 工具(回成 function_call → Codex router 形态不符)。
+///
+/// 跟 [`build_tool_namespace_map`] 的差异:**不**累积进程级缓存 —— custom 工具集合是
+/// 单请求语义(本轮注册了哪些 custom 工具),无 tool_search 那种跨请求渐进发现问题,
+/// 每次按当前 `original_request` 重建即可。custom 工具的 `name` 在 tool 对象顶层
+/// (`{"type":"custom","name":...}`),非嵌套 function。
+pub(crate) fn build_custom_tool_name_set(original_request: Option<&Value>) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Some(tools) = original_request
+        .and_then(|r| r.get("tools"))
+        .and_then(|v| v.as_array())
+    {
+        for tool in tools {
+            if tool.get("type").and_then(|v| v.as_str()) == Some("custom") {
+                if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+                    set.insert(name.to_owned());
+                }
+            }
+        }
+    }
+    set
 }
 
 /// 进程级 `function.name -> namespace.name` 累积缓存。见

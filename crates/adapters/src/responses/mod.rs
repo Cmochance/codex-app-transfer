@@ -32,7 +32,8 @@ pub mod tool_call_cache;
 pub use artifact_store::{global_tool_artifact_store, ToolArtifactStore};
 pub use converter::ChatToResponsesConverter;
 // [MOC-75] gemini_native 复用 chat 的 apply_patch input 解析(alt-key 容错一致)
-pub(crate) use converter::extract_apply_patch_input;
+// [MOC-88] extract_custom_tool_input:非 apply_patch 的 custom freeform 工具浅提取
+pub(crate) use converter::{extract_apply_patch_input, extract_custom_tool_input};
 // [MOC-75] gemini_native 复用 chat 的 V4A 后验语法校验(完整但畸形的 patch → emit
 // status=incomplete,对齐 #322 MOC-57 破坏性半应用防护)。V4aError 不具名导出 —— 调用方
 // 经 `validate_v4a_syntax(..).err()` 类型推断读 line/message(pub(crate) 字段),无需 re-export。
