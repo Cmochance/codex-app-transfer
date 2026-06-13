@@ -13,6 +13,8 @@ pub mod artifact_store;
 // MOC-142: sessions.db 大 data: blob 内容寻址外置(去重),仅 responses 内部用。
 mod blob_store;
 pub mod compact;
+// [MOC-231] 上下文 by-source 明细(供 Codex Desktop context 下拉面板)。
+pub mod context_breakdown;
 pub mod converter;
 // MOC-168: sessions.db 每条消息内容寻址外置(收文字/tool 侧逐轮快照重复)。
 mod message_store;
@@ -22,6 +24,10 @@ pub mod stream;
 pub mod tool_call_cache;
 
 pub use artifact_store::{global_tool_artifact_store, ToolArtifactStore};
+// [MOC-231] 上下文明细类型 + 计算入口(request.rs 算、mapper 经 adapter_metadata 带出)。
+pub use context_breakdown::{
+    compute_context_breakdown, set_breakdown_enabled, BreakdownCategory, ContextBreakdown,
+};
 pub use converter::ChatToResponsesConverter;
 // [MOC-75] gemini_native 复用 chat 的 apply_patch input 解析(alt-key 容错一致)
 // [MOC-88] extract_custom_tool_input:非 apply_patch 的 custom freeform 工具浅提取

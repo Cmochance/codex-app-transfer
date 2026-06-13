@@ -55,7 +55,7 @@ const INSTALL_SCRIPT: &str = r##"
   // [MOC-230] 版本化幂等 guard:同版本跳过(常态);版本变(应用升级后 INSTALL_SCRIPT 改了)
   // → 先拆旧 observer + DOM 节点再重装,使新逻辑无需重启 Codex 即覆盖旧注入。旧版只有
   // __catQuotaInstalled、无 __catQuotaVersion(undefined ≠ 当前版本)→ 同样触发重装。
-  var VERSION = 2;
+  var VERSION = 3; // [MOC-231] 加 breakdown caret/下拉 + convId 守卫 → bump,升级后免重启 Codex 即覆盖旧注入
   if (window.__catQuotaInstalled) {
     if (window.__catQuotaVersion === VERSION) return;
     try { if (window.__catQuotaObserver) window.__catQuotaObserver.disconnect(); } catch (e) {}
@@ -105,7 +105,22 @@ const INSTALL_SCRIPT: &str = r##"
       '#cat-quota-entry .cqduo{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 16px;font-variant-numeric:tabular-nums}' +
       '#cat-quota-entry .cqduo .l{font-size:13px;color:var(--color-token-text-primary,#ededed)}' +
       '#cat-quota-entry .cqduo .r{font-size:13px;color:var(--color-token-text-secondary,#8c8782);white-space:nowrap}' +
-      '#cat-quota-entry .cqs{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 16px}';
+      '#cat-quota-entry .cqs{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 16px}' +
+      // [MOC-231] 上下文明细:detail + caret 右对齐成组(间距 5px),点开内联展开 by-source 下拉
+      '#cat-quota-entry .cqctxr{display:flex;align-items:center;gap:5px}' +
+      '#cat-quota-entry .cqbdcaret{display:inline-flex;align-items:center;cursor:pointer;opacity:.5;transition:transform .15s ease}' +
+      '#cat-quota-entry .cqbdcaret:hover{opacity:.9}' +
+      '#cat-quota-entry .cqb.cqbdopen .cqbdcaret{transform:rotate(180deg)}' +
+      '#cat-quota-entry .cqbd{display:none;flex-direction:column;gap:4px;margin-top:7px}' +
+      '#cat-quota-entry .cqb.cqbdopen .cqbd{display:flex}' +
+      '#cat-quota-entry .cqbdrow{display:flex;align-items:center;gap:8px;font-size:12px}' +
+      '#cat-quota-entry .cqbdsw{width:9px;height:9px;border-radius:2px;flex:0 0 auto}' +
+      '#cat-quota-entry .cqbdlb{flex:1 1 auto;color:var(--color-token-text-primary,#ededed);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '#cat-quota-entry .cqbdtk{color:var(--color-token-text-secondary,#8c8782);font-variant-numeric:tabular-nums}' +
+      '#cat-quota-entry .cqbdpc{color:var(--color-token-text-tertiary,rgba(238,241,247,.5));width:48px;text-align:right;font-variant-numeric:tabular-nums}' +
+      // [MOC-231] payload 非当前活动会话时,隐藏 breakdown caret + 下拉(对齐 refreshDuo 的 uuid 守卫,防切对话 1 tick stale 串显)
+      '#cat-quota-entry .cqb.cqbdmismatch .cqbdcaret{display:none}' +
+      '#cat-quota-entry .cqb.cqbdmismatch .cqbd{display:none}';
     (document.head || document.documentElement).appendChild(st);
   }
 
@@ -162,6 +177,10 @@ const INSTALL_SCRIPT: &str = r##"
   // token 数格式化:≥1M(含会被 round 到 1000k 的)显 M(整数不带小数,如 1M / 1.5M),
   // 否则整数 k(对齐 Codex 文案,如 62k / 200k)。修「1M 模型显 1000k」。
   function fmtTok(n) {
+    if (n >= 9.995e8) { // ≥~1000M → B(十亿),防「1000M」过长
+      var b = n / 1e9;
+      return (Math.abs(b - Math.round(b)) < 0.05 ? Math.round(b) : b.toFixed(1)) + 'B';
+    }
     if (n >= 999500) {
       var m = n / 1e6;
       return (Math.abs(m - Math.round(m)) < 0.05 ? Math.round(m) : m.toFixed(1)) + 'M';
@@ -243,9 +262,27 @@ const INSTALL_SCRIPT: &str = r##"
     return null;
   }
   window.__catActiveConvId = readConvId;
+  // [MOC-231] per-conv 用量缓存(localStorage,Codex 侧 → Codex/transfer 重启都活、按 cid 不串):
+  // 上下文绝对值(fiber)/ 累计 / 缓存命中 就绪时缓存;(re)load 后这些 live 源没就绪前先显本
+  // 对话缓存的上次值,做到「启动即显」。% 仍优先 aria 实时(它本来就即时)。
+  function usageCacheGet(cid) {
+    if (!cid) return null;
+    try {
+      var s = localStorage.getItem('catUsageCache:' + cid);
+      return s ? JSON.parse(s) : null;
+    } catch (e) { return null; }
+  }
+  function usageCacheMerge(cid, patch) {
+    if (!cid) return;
+    try {
+      var cur = usageCacheGet(cid) || {};
+      for (var k in patch) cur[k] = patch[k];
+      localStorage.setItem('catUsageCache:' + cid, JSON.stringify(cur));
+    } catch (e) {}
+  }
   // 刷新上下文行(每次 ensureNode,含 observer 触发 → live):优先 fiber 精确值(立即、
   // 不需对话);读不到退回 Codex aria 的 %(只有 %)。
-  function refreshContext(node) {
+  function refreshContext(node, cid) {
     var w = node && node.querySelector('[data-ctx]');
     if (!w) return;
     var d = w.querySelector('.cqctxd');
@@ -258,10 +295,20 @@ const INSTALL_SCRIPT: &str = r##"
       var fullWin = Math.round(u.effWin / 0.95);
       pct = Math.max(0, Math.min(100, (u.used / fullWin) * 100));
       detail = fmtTok(u.used) + ' / ' + fmtTok(fullWin) + ' · ' + Math.round(pct) + '%';
+      // [MOC-231] 缓存绝对值:下次 (re)load fiber 没就绪前用它即显「X / Y」,不再只剩 %。
+      usageCacheMerge(cid, { ctxUsed: u.used, ctxWin: fullWin });
     } else {
+      // fiber 没就绪(刚 (re)load):优先本对话缓存的绝对值即显(% 用 aria 实时,无则按缓存算);
+      // 无缓存才退回 aria 的「只有 %」。
       var aria = readCtxPct();
-      pct = aria == null ? 0 : aria;
-      detail = aria == null ? '—' : Math.round(aria) + '%';
+      var c = usageCacheGet(cid);
+      if (c && typeof c.ctxUsed === 'number' && c.ctxWin) {
+        pct = aria != null ? aria : Math.max(0, Math.min(100, (c.ctxUsed / c.ctxWin) * 100));
+        detail = fmtTok(c.ctxUsed) + ' / ' + fmtTok(c.ctxWin) + ' · ' + Math.round(pct) + '%';
+      } else {
+        pct = aria == null ? 0 : aria;
+        detail = aria == null ? '—' : Math.round(aria) + '%';
+      }
     }
     // 值相等才不写:textContent/style 赋值会产生 DOM 变更 → 触发本 observer → 若每次都
     // 写就自循环 ~60fps(空闲也跑,code-review IMPORTANT-1)。仅变化时写,稳定即静默。
@@ -270,6 +317,14 @@ const INSTALL_SCRIPT: &str = r##"
     if (fill && fill.style.width !== wpx) fill.style.width = wpx;
     var hot = pct >= 90;
     if (w.classList.contains('hot') !== hot) w.classList.toggle('hot', hot);
+    // [MOC-231] convId 守卫(对齐 refreshDuo):payload 的 breakdown 属于 data.convId 这条对话,
+    // 与当前活动 cid 不符时(切对话后 daemon 1 tick 延迟)隐藏 caret + 下拉,绝不把上一对话
+    // 的明细串显在新对话下。仅变化时 toggle,稳定不写,避免自触发 observer churn。
+    var data = window.__catQuotaLast;
+    var bdMismatch = !(data && data.convId != null && data.convId === cid);
+    if (w.classList.contains('cqbdmismatch') !== bdMismatch) {
+      w.classList.toggle('cqbdmismatch', bdMismatch);
+    }
   }
 
   // ── 实时 tokens/s(MOC-204 §3,参考 Codex 老版 + OpenCode 插件)──
@@ -348,22 +403,89 @@ const INSTALL_SCRIPT: &str = r##"
   // 刷新累计/缓存命中(MOC-230 对话隔离):payload 标注的 convId 与当前活动 conversationId
   // 一致才显 daemon 算的值;不一致(切对话、daemon 还没追上)→ 显「—」,绝不显别的对话数据。
   function refreshDuo(node, cid) {
-    var data = window.__catQuotaLast;
-    if (!data) return;
-    var duo = null, rows = data.rows || [];
-    for (var i = 0; i < rows.length; i++) { if (rows[i] && rows[i].kind === 'duo') { duo = rows[i]; break; } }
-    if (!duo) return;
-    var match = data.convId != null && data.convId === cid;
     var cumEl = node.querySelector('.cqcum');
     var cacheEl = node.querySelector('.cqcache');
-    if (cumEl) {
-      var cumV = match ? (duo.cum || '累计 —') : '累计 —';
-      if (cumEl.textContent !== cumV) cumEl.textContent = cumV;
+    if (!cumEl && !cacheEl) return;
+    var data = window.__catQuotaLast;
+    var duo = null;
+    if (data) {
+      var rows = data.rows || [];
+      for (var i = 0; i < rows.length; i++) { if (rows[i] && rows[i].kind === 'duo') { duo = rows[i]; break; } }
     }
-    if (cacheEl) {
-      var cacheV = match ? (duo.right || '缓存命中 —') : '缓存命中 —';
-      if (cacheEl.textContent !== cacheV) cacheEl.textContent = cacheV;
+    var match = !!(data && duo && data.convId != null && data.convId === cid);
+    var cumV, cacheV;
+    if (match) {
+      // payload 就是本对话:用 live 值,并缓存供下次 (re)load 即显(占位「—」不缓存)。
+      cumV = duo.cum || '累计 —';
+      cacheV = duo.right || '缓存命中 —';
+      var patch = {};
+      if (cumV.indexOf('—') < 0) patch.cum = cumV;
+      if (cacheV.indexOf('—') < 0) patch.cacheRight = cacheV;
+      usageCacheMerge(cid, patch);
+    } else {
+      // [MOC-231] payload 还不是本对话(daemon 1-tick / 冷启动还没 push 到本对话):
+      // 显本对话缓存的上次值(按 cid 取,绝不串别的对话);无缓存才「—」。
+      var c = usageCacheGet(cid);
+      cumV = (c && c.cum) || '累计 —';
+      cacheV = (c && c.cacheRight) || '缓存命中 —';
     }
+    if (cumEl && cumEl.textContent !== cumV) cumEl.textContent = cumV;
+    if (cacheEl && cacheEl.textContent !== cacheV) cacheEl.textContent = cacheV;
+  }
+
+  // [MOC-231] by-source 明细:分类 key → 中文 label(与后端 ContextBreakdown.categories[].key 对齐)
+  var BD_LABELS = {
+    tool_calls: '工具调用与输出', messages: '对话消息', reasoning: '推理',
+    developer: '开发者指令', tools: '工具定义', system_prompt: '系统提示'
+  };
+  var BDCHEV = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+  function ctxBdOpen() { try { return localStorage.getItem('catCtxBdOpen') === '1'; } catch (e) { return false; } }
+  function setCtxBdOpen(v) { try { localStorage.setItem('catCtxBdOpen', v ? '1' : '0'); } catch (e) {} }
+  function fmtTokFine(n) {
+    n = n || 0;
+    if (n >= 1e9) return (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    return String(Math.round(n));
+  }
+  // 小方块统一用注入主题的 accent 色系(--cl-accent),从上往下(占比降序)随占比减小逐渐变浅
+  // —— 同色系不同深度,用降不透明度实现(top 最深、bottom 最浅)。
+  function swatchOpacity(i, n) { return n > 1 ? (1 - i * (0.62 / (n - 1))) : 1; }
+  // 百分比按占「总上下文窗口」(非占已用):优先读 Codex fiber 满窗口(effWin/0.95,与 ctx bar
+  // 同口径),读不到退回 breakdown 自身总数。<10% 显 1 位小数,>=10% 显整数。
+  function ctxPctStr(tokens, denom) {
+    var p = 100 * (tokens || 0) / (denom || 1);
+    return (p < 10 ? p.toFixed(1) : String(Math.round(p))) + '%';
+  }
+  // 构造 by-source 明细块(每类一行:色块 + label + tokens + 占总窗口 %)。仿 Claude 上下文下拉。
+  function buildBreakdown(bd) {
+    var box = el('div', 'cqbd');
+    var cats = (bd && bd.categories) || [];
+    var n = cats.length;
+    var bdTotal = (bd && bd.total_tokens) || cats.reduce(function(s, c) { return s + (c.tokens || 0); }, 0) || 1;
+    var u = readCtxUsage();
+    // [MOC-231] o200k 口径校准:breakdown 用 o200k(GPT tokenizer)逐 item 算,但活动 provider
+    // 的 tokenizer 可能不同(如 gemini/antigravity 对中文 + 跨模型累积历史计数差很多)→ 直接显
+    // o200k 总数会和上下文 bar(Codex 权威 used,按真实模型口径)对不上。用 used / o200k总 缩放:
+    // 只保留 o200k 的「各类占比」,绝对值 + % 对齐 bar(每次 payload 刷新时对齐,与底层 tokenizer 无关)。
+    // fiber 没就绪 / used 读不到或为 0(刚 (re)load 或新对话中途态)→ 退回 o200k 原值(降级,
+    // 不缩放),避免 scale=0 把所有分类清零成「全 0」。
+    var hasWin = u && u.effWin > 0;
+    var fullWin = hasWin ? Math.round(u.effWin / 0.95) : bdTotal;
+    var scale = hasWin && u.used > 0 && bdTotal > 0 ? (u.used / bdTotal) : 1;
+    cats.forEach(function(c, i) {
+      var tok = (c.tokens || 0) * scale; // 缩放到 Codex 权威 used 口径
+      var row = el('div', 'cqbdrow');
+      var sw = el('span', 'cqbdsw');
+      sw.style.background = 'var(--cl-accent,#6c83c4)';
+      sw.style.opacity = swatchOpacity(i, n).toFixed(3);
+      row.appendChild(sw);
+      row.appendChild(el('span', 'cqbdlb', BD_LABELS[c.key] || c.key));
+      row.appendChild(el('span', 'cqbdtk', fmtTokFine(tok)));
+      row.appendChild(el('span', 'cqbdpc', ctxPctStr(tok, fullWin)));
+      box.appendChild(row);
+    });
+    return box;
   }
 
   function buildRow(r) {
@@ -384,13 +506,33 @@ const INSTALL_SCRIPT: &str = r##"
       cw.setAttribute('data-ctx', '1'); // 值由 refreshContext 从 Codex fiber 实时填
       var ctop = el('div', 'cqt');
       ctop.appendChild(el('span', 'cql', r.label || '上下文'));
-      ctop.appendChild(el('span', 'cqd cqctxd', '—'));
+      // [MOC-231] detail(28k/1M·3%)+ caret 右对齐成组,紧贴(间距 5px),不再被 space-between 居中。
+      // caret 仿 Claude `⌄`,点开内联展开 breakdown;开合态 localStorage 记忆,renderInto 重建复原。
+      var cright = el('span', 'cqctxr');
+      cright.appendChild(el('span', 'cqd cqctxd', '—'));
+      var bd = r.breakdown;
+      var hasBd = !!(bd && bd.categories && bd.categories.length);
+      if (hasBd) {
+        if (ctxBdOpen()) cw.classList.add('cqbdopen');
+        var caret = el('span', 'cqbdcaret');
+        caret.innerHTML = BDCHEV;
+        caret.title = '上下文明细';
+        caret.addEventListener('click', function(ev) {
+          ev.stopPropagation();
+          var open = !cw.classList.contains('cqbdopen');
+          cw.classList.toggle('cqbdopen', open);
+          setCtxBdOpen(open);
+        });
+        cright.appendChild(caret);
+      }
+      ctop.appendChild(cright);
       cw.appendChild(ctop);
       var ctrack = el('div', 'cqk');
       var cfill = el('i');
       cfill.className = 'cqctxfill';
       ctrack.appendChild(cfill);
       cw.appendChild(ctrack);
+      if (hasBd) cw.appendChild(buildBreakdown(bd));
       return cw;
     }
     if (r && r.kind === 'bar') {
@@ -455,7 +597,7 @@ const INSTALL_SCRIPT: &str = r##"
     // 上下文 + 实时速率 + 累计/缓存(对话隔离)每次都刷(observer 触发即更新 → 实时)。
     // cid 一次算、refreshTps/refreshDuo 复用(避免每个各爬一次 fiber)。
     var cid = readConvId();
-    refreshContext(node);
+    refreshContext(node, cid);
     refreshTps(node, cid);
     refreshDuo(node, cid);
   }
@@ -541,7 +683,10 @@ async fn push_via_cdp(payload: Option<serde_json::Value>) -> Result<Option<Strin
 
 /// token 数紧凑格式:850 → `850`、42100 → `42.1k`、1_250_000 → `1.25M`。
 fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
+    // 累计 token 无上限,≥1000M 用 B(十亿)避免「1000.00M」挤爆行。k→M→B。
+    if n >= 1_000_000_000 {
+        format!("{:.2}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
         format!("{:.2}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
         format!("{:.1}k", n as f64 / 1_000.0)
@@ -598,10 +743,18 @@ fn quota_rows(
 /// - **Tokens 速率·累计 / 缓存命中率**:累计量,Codex 没有、只能 proxy 捕获 → 需对话
 ///   触发;还没有任何一轮(刚开会话)→ placeholder("—")。
 fn local_usage_rows(session_id: Option<&str>) -> Vec<serde_json::Value> {
-    // 上下文:整行由注入脚本直接从 Codex React fiber 读 usedTokens + contextWindow(已有
-    // 对话即有值、不需发新对话;满窗口 = contextWindow ÷ 0.95 把 5% reserve 加回来)。
-    // 故 payload 只给占位,不带数据。
-    let ctx = json!({"kind": "ctx", "label": "上下文"});
+    // 上下文:bar 的 % / 绝对值由注入脚本直接从 Codex React fiber 读 usedTokens + contextWindow
+    // (已有对话即有值、不需发新对话;满窗口 = contextWindow ÷ 0.95 把 5% reserve 加回来)。
+    // [MOC-231] 附带 by-source 明细:按**活动会话 uuid** 读 proxy 持久化的明细(磁盘,
+    // proxy 转发时按 prompt_cache_key==conv uuid 写盘;adapters context_breakdown 用 o200k
+    // 逐 item 精确分类)。对话隔离 + 持久(transfer 重启即用、不需新对话)+ 读取快(小 JSON),
+    // 与累计/缓存同口径(session_id == rollout/fiber uuid)。有则塞进 ctx 行,注入脚本在文字行
+    // 最右加 caret 展开 Claude 风格下拉;该对话还没发过(无文件)/ passthrough → None,不显 caret。
+    let ctx = match session_id.and_then(codex_app_transfer_proxy::telemetry::load_context_breakdown)
+    {
+        Some(breakdown) => json!({"kind": "ctx", "label": "上下文", "breakdown": breakdown}),
+        None => json!({"kind": "ctx", "label": "上下文"}),
+    };
     // 累计 token + 缓存命中率:按**活动会话 uuid** 取该对话自己的 rollout(MOC-230 对话隔离,
     // 非 newest-mtime)。session_id = daemon 上一 tick 从 Codex fiber 回读的 conversationId
     // (== rollout 文件名 uuid);None / 该 uuid 无 rollout 文件(全新对话还没写盘 / 读不到 id)
@@ -646,7 +799,19 @@ fn build_mock_payload() -> serde_json::Value {
         json!({"kind":"bar","cls":"quota","label":"5 小时额度","pct":94,"detail":"94% · 06-13 17:56 刷新","hot":false}),
         json!({"kind":"bar","cls":"quota","label":"每周额度","pct":100,"detail":"100% · 06-20 12:56 刷新","hot":false}),
     ];
-    rows.push(json!({"kind":"ctx","label":"上下文"}));
+    // [MOC-231] ctx 行带 by-source 明细(代表性满数据:tool 调用大头,对齐真机实测占比),
+    // 锁 payload↔JS 契约不随运行期漂移。
+    rows.push(json!({"kind":"ctx","label":"上下文","breakdown":{
+        "total_tokens": 267000,
+        "categories": [
+            {"key":"tool_calls","tokens":168000,"items":606},
+            {"key":"messages","tokens":62000,"items":223},
+            {"key":"reasoning","tokens":20000,"items":157},
+            {"key":"developer","tokens":10000,"items":3},
+            {"key":"tools","tokens":6700,"items":18},
+            {"key":"system_prompt","tokens":86,"items":1}
+        ]
+    }}));
     rows.push(json!({"kind":"duo","cum":"累计 128.5k","right":"缓存命中 67%"}));
     json!({ "header": "Usage", "title": "fixture", "rows": rows })
 }
@@ -833,6 +998,9 @@ pub async fn run_quota_daemon() {
     loop {
         tokio::time::sleep(TICK).await;
         let enabled = quota_enabled();
+        // [MOC-231 perf] 跟随面板开关同步 adapter 侧门禁:关闭时 proxy 转发跳过 o200k 逐 item
+        // tokenize,不在热路径白算 breakdown(默认关 → 绝大多数请求免算)。
+        codex_app_transfer_adapters::responses::set_breakdown_enabled(enabled);
         if !enabled {
             if needs_remove {
                 match push_remove().await {
@@ -961,11 +1129,63 @@ mod tests {
     }
 
     #[test]
+    fn ctx_breakdown_contract() {
+        // [MOC-231] 锁 ctx 行 by-source 明细 payload↔JS 契约。
+        let p = build_mock_payload();
+        let rows = p["rows"].as_array().expect("rows");
+        let ctx = &rows[2];
+        assert_eq!(ctx["kind"], "ctx");
+        let cats = ctx["breakdown"]["categories"]
+            .as_array()
+            .expect("ctx.breakdown.categories array");
+        assert!(!cats.is_empty());
+        assert!(ctx["breakdown"]["total_tokens"].is_number());
+        // 每类有 key/tokens(JS 按 key 取 label、按 tokens 算 %)
+        for c in cats {
+            assert!(c["key"].is_string() && c["tokens"].is_number());
+        }
+        // JS 端明细渲染分支 + caret + 开合记忆必须在场(改任一侧不同步即挂)
+        assert!(INSTALL_SCRIPT.contains("r.breakdown"));
+        assert!(INSTALL_SCRIPT.contains("buildBreakdown"));
+        assert!(INSTALL_SCRIPT.contains("cqbdcaret"));
+        assert!(INSTALL_SCRIPT.contains(".cqb.cqbdopen .cqbd{display:flex}"));
+        assert!(INSTALL_SCRIPT.contains("catCtxBdOpen")); // 开合态 localStorage 记忆
+                                                          // key→label 映射覆盖后端所有分类 key(对齐 adapters context_breakdown::keys)
+        for key in [
+            "tool_calls",
+            "messages",
+            "reasoning",
+            "developer",
+            "tools",
+            "system_prompt",
+        ] {
+            assert!(
+                INSTALL_SCRIPT.contains(&format!("{key}:")),
+                "BD_LABELS 缺 key: {key}"
+            );
+        }
+        // [MOC-231] per-conv 用量缓存(localStorage):上下文绝对值 + 累计/缓存「重启即显」。
+        // refreshContext 缓存 fiber 绝对值、refreshDuo 缓存累计/缓存命中,(re)load 即显缓存值。
+        assert!(INSTALL_SCRIPT.contains("catUsageCache")); // 按 cid 的 localStorage key
+        assert!(
+            INSTALL_SCRIPT.contains("usageCacheMerge") && INSTALL_SCRIPT.contains("usageCacheGet")
+        );
+        assert!(INSTALL_SCRIPT.contains("ctxUsed")); // 缓存上下文绝对值(used/window)
+                                                     // [MOC-231] breakdown 的 convId 守卫(切对话不串)+ 版本化 guard 已 bump(升级免重启覆盖)
+        assert!(INSTALL_SCRIPT.contains("cqbdmismatch"));
+        assert!(INSTALL_SCRIPT.contains("var VERSION = 3"));
+    }
+
+    #[test]
     fn fmt_tokens_compact() {
         assert_eq!(fmt_tokens(0), "0");
         assert_eq!(fmt_tokens(850), "850");
         assert_eq!(fmt_tokens(42_100), "42.1k");
         assert_eq!(fmt_tokens(1_250_000), "1.25M");
+        // ≥1000M 进 B(十亿),不再「1000.00M」挤爆行
+        assert_eq!(fmt_tokens(999_000_000), "999.00M");
+        assert_eq!(fmt_tokens(1_000_000_000), "1.00B");
+        assert_eq!(fmt_tokens(2_890_000_000), "2.89B");
     }
 
     #[test]

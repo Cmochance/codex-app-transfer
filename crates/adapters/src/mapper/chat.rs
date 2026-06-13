@@ -63,12 +63,22 @@ pub(crate) fn prepare_responses_request(
     )?;
     let new_body = serde_json::to_vec(&conversion.body)
         .map_err(|e| AdapterError::Internal(format!("re-serialize: {e}")))?;
-    // fix(#210 P1-1): 传递 history_lost 标志到 adapter_metadata,
-    // transform_response_stream 据此注入 X-Session-History-Lost header
-    let adapter_metadata = if conversion.history_lost {
-        Some(serde_json::json!({"history_lost": true}))
-    } else {
+    // adapter_metadata 是 adapter→proxy 内部通道(不进 user-facing 协议):
+    // - fix(#210 P1-1): history_lost → transform_response_stream 注入 X-Session-History-Lost header
+    // - [MOC-231]: context_breakdown → proxy 写 telemetry → CDP 注入 Codex 上下文明细面板
+    let mut metadata = serde_json::Map::new();
+    if conversion.history_lost {
+        metadata.insert("history_lost".into(), serde_json::json!(true));
+    }
+    if let Some(breakdown) = &conversion.context_breakdown {
+        if let Ok(v) = serde_json::to_value(breakdown) {
+            metadata.insert("context_breakdown".into(), v);
+        }
+    }
+    let adapter_metadata = if metadata.is_empty() {
         None
+    } else {
+        Some(serde_json::Value::Object(metadata))
     };
     Ok(RequestPlan {
         upstream_path,

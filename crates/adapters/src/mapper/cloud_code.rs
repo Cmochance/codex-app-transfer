@@ -480,7 +480,13 @@ pub(crate) fn prepare_cloud_code_request(
         body: bytes::Bytes::from(outer_body),
         upstream_headers: http::HeaderMap::new(),
         response_session: Some(conversion.response_session),
-        adapter_metadata: None,
+        // [MOC-231] 透传上下文 by-source 明细给 proxy(forward 写 telemetry → quota injector
+        // 注入面板的「上下文」bar 文字行最右 caret + Claude 风格下拉)。antigravity 走本路径。
+        adapter_metadata: conversion
+            .context_breakdown
+            .as_ref()
+            .and_then(|bd| serde_json::to_value(bd).ok())
+            .map(|v| serde_json::json!({ "context_breakdown": v })),
         is_compact: false,
         compact_v2: false,
         original_responses_request: Some(parsed),

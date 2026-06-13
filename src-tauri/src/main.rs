@@ -130,6 +130,14 @@ fn main() {
             // 开关关 / CDP 不可达时 tick 内静默跳过,常驻无负担。
             tauri::async_runtime::spawn(codex_quota_injector::run_quota_daemon());
 
+            // [MOC-231] GC 旧的上下文明细缓存(context-breakdown/<uuid>.json,每对话一个;
+            // >14 天的陈旧对话删除,下次有请求会重建)。fire-and-forget,不阻塞 startup。
+            tauri::async_runtime::spawn(async {
+                codex_app_transfer_proxy::telemetry::gc_context_breakdown(
+                    std::time::Duration::from_secs(14 * 24 * 60 * 60),
+                );
+            });
+
             // Deep link scheme handler:codex-app-transfer://v1/import?...
             // 转发 URL 给前端 codexMcpHandleDeeplink() 弹 confirmation modal。
             let app_handle_for_deeplink = app.handle().clone();

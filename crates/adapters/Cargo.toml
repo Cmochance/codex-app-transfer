@@ -35,6 +35,7 @@ base64 = "0.22"
 # (借鉴 Codex generated_images / Claude paste-cache),消除逐轮快照重复存储。
 sha2 = "0.10"
 hex = "0.4"
+tiktoken-rs = "0.12.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
