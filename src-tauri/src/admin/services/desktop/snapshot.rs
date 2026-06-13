@@ -42,11 +42,6 @@ pub struct DesktopConfigTarget {
     /// #212:是否允许 Codex shell 工具网络访问(从 `Settings.codexNetworkAccess`
     /// 读取,默认 `true`)。写入 `sandbox_workspace_write.network_access`。
     pub codex_network_access: bool,
-    /// #258:Codex Desktop 对话页底部 context 圆环 + tokens/s 默认显示开关
-    /// (从 `Settings.codexStatusSectionDefaultVisible` 读取,默认 `true`)。
-    /// 写入 `~/.codex/.codex-global-state.json` 的
-    /// `electron-persisted-atom-state.show-context-window-usage`。
-    pub codex_status_section_default_visible: bool,
     /// [MOC-69] model id → 人类可读 displayName(JSON object)。仅 antigravity 非空
     /// (从 static seed 构建);Codex Desktop model catalog 的 `display_name` 优先用它,
     /// 让 Codex 自己的 model picker 显示 displayName 而非 raw id。其他 provider 为
@@ -119,8 +114,6 @@ pub fn desktop_config_target_for_provider(
         && !direct_api_key.is_empty();
 
     let codex_network_access = crate::admin::handlers::proxy::read_codex_network_access(cfg);
-    let codex_status_section_default_visible =
-        crate::admin::handlers::proxy::read_codex_status_section_default_visible(cfg);
 
     if bypass_proxy {
         return DesktopConfigTarget {
@@ -135,7 +128,6 @@ pub fn desktop_config_target_for_provider(
             mode: "direct",
             proxy_port,
             codex_network_access,
-            codex_status_section_default_visible,
             model_display_names: antigravity_display_names(&api_format_lower),
             review_model_slot: provider_review_model_slot(provider),
         };
@@ -164,7 +156,6 @@ pub fn desktop_config_target_for_provider(
         mode: "local_proxy",
         proxy_port,
         codex_network_access,
-        codex_status_section_default_visible,
         model_display_names: antigravity_display_names(&api_format_lower),
         review_model_slot: provider_review_model_slot(provider),
     }
@@ -435,7 +426,6 @@ fn apply_desktop_target_impl(
             review_model_slot: target.review_model_slot.as_deref(),
             app_version: APP_VERSION,
             codex_network_access: target.codex_network_access,
-            codex_status_section_default_visible: target.codex_status_section_default_visible,
             // issue #317:direct 直连只写上游配置,strip 全部 transfer 私货。
             direct: target.mode == "direct",
             preserve_chatgpt_auth,
@@ -1413,7 +1403,6 @@ mod tests {
             mode: "direct",
             proxy_port: 0,
             codex_network_access: true,
-            codex_status_section_default_visible: true,
         };
         assert!(
             one_million_catalog_ready(&paths, &direct_target),

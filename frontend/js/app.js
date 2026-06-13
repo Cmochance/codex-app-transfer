@@ -2609,7 +2609,6 @@
       const _wfBadge = $("#webFetchNewBadge");
       if (_wfBadge) _wfBadge.hidden = webFetchHintSeen();
     }
-    $("#codexStatusSectionDefaultVisible").checked = settings.codexStatusSectionDefaultVisible !== false;
     $("#settingsUpdateUrl").value = settings.updateUrl || "";
     renderModelMenuModeState(settings);
     // 设置页的 Plugins 解锁运行时状态 + 真实账号区(MOC-104)随设置页一起刷新,
@@ -3177,7 +3176,6 @@
       codexNetworkAccess: $("#codexNetworkAccess")?.checked === true,
       // [MOC-185] traceViewerEnabled 不再持久化(诊断改 session 级,见 toggle handler)。
       webFetchBackend: $("#webFetchBackend")?.querySelector(".btn.active")?.dataset.webfetch || "auto",
-      codexStatusSectionDefaultVisible: $("#codexStatusSectionDefaultVisible")?.checked !== false,
       updateUrl: $("#settingsUpdateUrl").value.trim(),
     };
     const resp = await CCApi.saveSettings(settings);
@@ -8617,7 +8615,6 @@
         _webFetchSwitching = false;
       })
     );
-    $("#codexStatusSectionDefaultVisible")?.addEventListener("change", saveSettingsFromForm);
     $("#configImportFile")?.addEventListener("change", (event) => {
       importConfigFile(event.target.files?.[0]);
     });
