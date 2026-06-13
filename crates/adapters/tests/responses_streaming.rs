@@ -182,8 +182,7 @@ async fn synthetic_two_text_deltas_then_done() {
             (n == "response.output_text.delta").then(|| v["delta"].as_str().unwrap())
         })
         .collect();
-    // [MOC-219] message 缓冲:两条上游 delta 累积,流尾 flush 合并为一条
-    assert_eq!(deltas, vec!["Hello"]);
+    assert_eq!(deltas, vec!["He", "llo"]);
 
     let completed = events
         .iter()
