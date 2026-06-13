@@ -353,8 +353,9 @@ fn ensure_add_file_plus(v4a: &str) -> (String, Vec<Repair>) {
 /// `*** End Patch` 写进新文件末尾(rate_limit.py 实证:16:09:12 写入 → 16:13:29 模型不得不再发 patch 删它)。
 /// (注:裸 `*** End Patch` 是 `*** ` 控制行,会被当真信封结尾正常解析、不进 body;只有带 `+` 前缀的才被
 /// 当内容 → 本规则只处理 `+*** End Patch`,`ensure_add_file_plus` 不参与。)**只剥 Add File body 紧贴下个
-/// `*** ` 控制行 / EOF 的末尾连续行**,去 `+` 前缀 trim 后正好是孤立信封标记(`*** End Patch` /
-/// `*** Begin Patch`)。**关键防误剥(收紧,见函数体守卫)**:仅在 patch **缺真信封结尾**时才剥 ——
+/// `*** ` 控制行 / EOF 的末尾连续行**,去 `+` 前缀 trim 后正好是 `*** End Patch`(MOC-228 bot P2:
+/// **只剥 End Patch,不剥 `*** Begin Patch`** —— Begin 是开头标记非结尾泄漏、无实证,文件可能合法以它结尾)。
+/// **关键防误剥(收紧,见函数体守卫)**:仅在 patch **缺真信封结尾**时才剥 ——
 /// 若 patch 已含真裸 `*** End Patch`,则 body 内的 `+*** End Patch` 与「合法文件恰好以该标记结尾」
 /// (如 documenting V4A 格式本身的文档 / fixture)**位置无法区分**,保守不剥(避免 silent data loss)。
 /// body **中间**真含该字样的内容(文档 / 示例)亦不碰(只扫末尾)。剥后缺失的真信封由
@@ -394,7 +395,9 @@ fn strip_body_envelope_leak(v4a: &str) -> (String, Vec<Repair>) {
                     .strip_prefix('+')
                     .unwrap_or(out.last().unwrap())
                     .trim();
-                if core == "*** End Patch" || core == "*** Begin Patch" {
+                // [MOC-228 bot P2] 只剥 `*** End Patch`(实证泄漏 + closing-envelope 语义);
+                // `*** Begin Patch` 是开头标记、非结尾泄漏,无实证且文件可能合法以它结尾 → 不剥(防误删)。
+                if core == "*** End Patch" {
                     out.pop();
                     stripped += 1;
                 } else {
@@ -1183,6 +1186,18 @@ mod tests {
         assert_eq!(
             out, v4a,
             "有真信封时 body 末尾 +*** End Patch 视为合法内容,不剥"
+        );
+        assert!(reps.is_empty());
+    }
+
+    #[test]
+    fn strip_body_envelope_leak_keeps_begin_patch() {
+        // [bot P2] Add File 合法以 +*** Begin Patch 结尾(无真信封)→ 不剥 —— Begin 是开头标记非结尾泄漏
+        let v4a = "*** Begin Patch\n*** Add File: doc.md\n+示例补丁开头:\n+*** Begin Patch\n";
+        let (out, reps) = strip_body_envelope_leak(v4a);
+        assert!(
+            out.contains("+*** Begin Patch"),
+            "Begin Patch 不是结尾泄漏,不剥"
         );
         assert!(reps.is_empty());
     }
