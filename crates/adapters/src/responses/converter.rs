@@ -2201,6 +2201,47 @@ pub(crate) fn extract_apply_patch_input(args_acc: &str) -> String {
     }
 }
 
+/// 提取**非 apply_patch** 的 custom freeform 工具的裸 `input` 文本。请求侧把所有
+/// `type:"custom"` 工具(含 apply_patch 之外的)统一降级成单 `input` 的 function
+/// (见 `gemini_native/request.rs` `"custom"` arm / `request/tools.rs`),Gemini /
+/// chat 回来的 args 形如 `{"input":"<text>"}`。这里取 `input` 字段;非 JSON 或缺
+/// `input` 则整段原样透传(交客户端,绝不静默吞 / 截断)。
+///
+/// 跟 [`extract_apply_patch_input`] 的区别:**不**做 V4A 信封修复 / 别名 key 回收
+/// —— 那些是 apply_patch 的 V4A patch 特有语义;其他 custom 工具的 `input` 是任意
+/// 文本,按原样取出即可。
+pub(crate) fn extract_custom_tool_input(args_acc: &str) -> String {
+    let trimmed = args_acc.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(parsed) => match parsed.get("input").and_then(Value::as_str) {
+            Some(s) => s.to_owned(),
+            None => {
+                // 缺 `input` string(或 input 非 string,如 {"input":42})。整段原样透传
+                // 给客户端(非破坏性兜底,不吞不截);debug 级留痕便于反查模型 misbehave,
+                // 对齐 apply_patch / tool_search 兜底带日志的约定(用 debug 不用 warn —— custom
+                // 工具缺 input 未必是错,避免噪音)。
+                tracing::debug!(
+                    target: "adapters::custom_tool",
+                    args_preview = %args_acc.chars().take(120).collect::<String>(),
+                    "custom 工具 args 缺 `input` string 字段;整段原样透传",
+                );
+                args_acc.to_owned()
+            }
+        },
+        Err(_) => {
+            tracing::debug!(
+                target: "adapters::custom_tool",
+                args_preview = %args_acc.chars().take(120).collect::<String>(),
+                "custom 工具 args 非 JSON;整段原样透传",
+            );
+            args_acc.to_owned()
+        }
+    }
+}
+
 /// `input` 缺失时尝试的常见别名 key(模型 schema drift)。仅当值是含
 /// `*** Begin Patch` 的字符串才回收,避免误取无关字段。
 const APPLY_PATCH_ALT_KEYS: &[&str] = &["patch", "diff", "apply_patch", "input_text", "content"];
@@ -4148,6 +4189,34 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
         );
         // 空字符串:返回空
         assert_eq!(extract_apply_patch_input(""), "");
+    }
+
+    // [MOC-88] 非 apply_patch custom 工具的浅提取:取 input string,否则整段透传(不做
+    // apply_patch 的 V4A 信封修复 / 别名 key 回收)。
+    #[test]
+    fn extract_custom_tool_input_extracts_or_falls_back() {
+        // happy:取 input string
+        assert_eq!(
+            extract_custom_tool_input(r#"{"input":"hello world"}"#),
+            "hello world"
+        );
+        // 缺 input 字段:整段透传(交客户端,不吞)
+        assert_eq!(
+            extract_custom_tool_input(r#"{"other":"x"}"#),
+            r#"{"other":"x"}"#
+        );
+        // input 非 string(模型 misbehave):整段透传
+        assert_eq!(
+            extract_custom_tool_input(r#"{"input":42}"#),
+            r#"{"input":42}"#
+        );
+        // 非 JSON:整段原样透传
+        assert_eq!(
+            extract_custom_tool_input("raw text payload"),
+            "raw text payload"
+        );
+        // 空字符串:返回空
+        assert_eq!(extract_custom_tool_input(""), "");
     }
 
     #[test]
