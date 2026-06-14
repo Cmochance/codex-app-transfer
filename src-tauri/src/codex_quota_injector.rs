@@ -33,6 +33,7 @@ use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use crate::codex_theme_injector::{drain_until_response, locate_main_window_ws, make_msg};
+use crate::provider_quota::{ProviderQuota, QuotaWindow};
 
 /// 幂等安装脚本:注入 scoped `<style>` + 定义 `window.__catQuotaUpdate` +
 /// MutationObserver 守护。已安装(`__catQuotaInstalled`)时直接跳过,daemon
@@ -709,7 +710,7 @@ fn fmt_reset_local(rfc3339: Option<&str>) -> Option<String> {
 
 /// 单条额度 bar(5h / weekly):显**剩余**百分比(满额=100,条满)+ 绝对重置时间点;
 /// 剩余 ≤10% 标红预警(`hot`,由 JS 上色——额度类红色判定与 used 类相反,故显式传)。
-fn quota_bar(label: &str, w: &codex_app_transfer_gemini_oauth::QuotaWindow) -> serde_json::Value {
+fn quota_bar(label: &str, w: &QuotaWindow) -> serde_json::Value {
     let pct = w.remaining_percent.round() as i64;
     let detail = match fmt_reset_local(w.reset_rfc3339.as_deref()) {
         Some(t) => format!("{pct}% · {t} 刷新"),
@@ -718,11 +719,10 @@ fn quota_bar(label: &str, w: &codex_app_transfer_gemini_oauth::QuotaWindow) -> s
     json!({"kind":"bar","cls":"quota","label":label,"pct":pct,"detail":detail,"hot":pct <= 10})
 }
 
-/// [MOC-204 Phase 3] 额度两行:仅白名单 provider(当前 antigravity gemini 系)有真实额度
-/// → 5h + weekly 两 bar;非白名单 / 拿不到 → 空(不显额度行)。
-fn quota_rows(
-    quota: Option<&codex_app_transfer_gemini_oauth::GeminiQuota>,
-) -> Vec<serde_json::Value> {
+/// [MOC-204 Phase 3 / MOC-211] 额度两行:白名单 provider(antigravity gemini 系 / GLM Coding)
+/// 有真实双窗口额度 → 5h + weekly 两 bar;非白名单 / 拿不到 → 空(不显额度行)。各 provider
+/// 的额度已在 fetcher 里归一成 [`ProviderQuota`]。
+fn quota_rows(quota: Option<&ProviderQuota>) -> Vec<serde_json::Value> {
     let Some(q) = quota else {
         return vec![];
     };
@@ -776,10 +776,7 @@ fn local_usage_rows(session_id: Option<&str>) -> Vec<serde_json::Value> {
 
 /// 组装完整 Usage 面板 payload:额度(白名单 provider 真实,否则不显)+ 本地实时
 /// (上下文/Tokens/缓存)。`quota` 由 daemon 在活动 provider 为白名单时传入。
-fn build_payload(
-    quota: Option<&codex_app_transfer_gemini_oauth::GeminiQuota>,
-    session_id: Option<&str>,
-) -> serde_json::Value {
+fn build_payload(quota: Option<&ProviderQuota>, session_id: Option<&str>) -> serde_json::Value {
     let mut rows = quota_rows(quota);
     rows.extend(local_usage_rows(session_id));
     json!({
@@ -874,14 +871,51 @@ fn active_authscheme() -> Option<String> {
         .map(str::to_owned)
 }
 
-/// 额度白名单 = 能读真实额度的 provider。当前仅 antigravity(gemini 系,经
-/// `retrieveUserQuotaSummary`);其余 provider 不显额度行(见 MOC-204 §quota 调研:
-/// glm-coding 等无额度 API/头)。
+/// antigravity 额度白名单(**按 authScheme 判定**):gemini 系经 `retrieveUserQuotaSummary`。
+/// 注:GLM Coding 不走这里——它是通用 `bearer` authScheme(无法靠 authScheme 区分),改按
+/// baseUrl host 判定,见 [`active_glm_provider`](MOC-211)。
 fn is_quota_whitelisted(authscheme: &str) -> bool {
     matches!(
         authscheme,
         "google_oauth_antigravity" | "antigravity_oauth" | "antigravity"
     )
+}
+
+/// 从 URL 轻量提取 host(剥 scheme / 端口 / userinfo,不引 url crate)。
+fn host_of(url: &str) -> Option<String> {
+    let after = url.split("://").nth(1).unwrap_or(url);
+    let authority = after.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// 活动 provider 若是 GLM Coding(baseUrl host 含 `bigmodel.cn` / `z.ai` 且为 coding 套餐)→
+/// 返回 `(monitor host, apiKey)`,否则 None。**白名单按 baseUrl host 判定而非 authScheme**:
+/// GLM 是通用 `bearer`、authScheme 无法区分,且本仓存储的 provider id 是运行时 UUID(非 preset
+/// id `zhipu-coding`)。按量计费的 `zhipu`(`/api/paas/v4`,无 coding)不匹配——它无订阅额度窗口。
+fn active_glm_provider() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    let is_glm_host = host.ends_with("bigmodel.cn") || host.ends_with("z.ai");
+    let is_coding = base_url.contains("coding");
+    if !(is_glm_host && is_coding) {
+        return None;
+    }
+    let api_key = p
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some((host, api_key.to_string()))
 }
 
 /// 取 antigravity gemini 双窗口额度(白名单 gate + token 校验 + 45s 缓存)。非白名单 /
@@ -953,6 +987,49 @@ async fn fetch_antigravity_quota(
     }
 }
 
+/// [MOC-211] 取 GLM Coding 双窗口额度(baseUrl host gate + 45s 缓存)。非 GLM coding provider /
+/// key 失效 → 清缓存 + None(不显额度行)。用推理同一把 apiKey 查 monitor 端口(不带 Bearer),
+/// 失败按 [`crate::glm_quota::QuotaError`] 分类(Auth=清缓存 / Transient=留旧缓存重试),
+/// 与 antigravity 同一套缓存语义。
+async fn fetch_glm_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::glm_quota::{fetch_glm_quota_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    // 活动 provider 不是 GLM coding(或已切走)→ 清缓存,不残留上个 provider 的额度。
+    let Some((host, api_key)) = active_glm_provider() else {
+        *cache = None;
+        return None;
+    };
+    if let Some((q, at)) = cache.as_ref() {
+        if at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_glm_quota_summary(http, &host, &api_key).await {
+        Ok(q) => {
+            *cache = Some((q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        // 401/403:key 服务端失效 / 非 coding-plan key → 清缓存,不残留。
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] GLM quota 鉴权失败(key 失效/非 coding key)→ 清额度缓存");
+            *cache = None;
+            None
+        }
+        // 网络 / 5xx / 429 / 解析瞬时失败:留旧缓存 + 刷新时间戳(下个 TTL 周期再试)。
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] GLM quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            if let Some((_, at)) = cache.as_mut() {
+                *at = std::time::Instant::now();
+            }
+            cache.as_ref().map(|(q, _)| q.clone())
+        }
+    }
+}
+
 /// 按阶段分级记录推送失败:connect 失败 = Codex 没跑(常态,debug);
 /// evaluate 失败 = Codex 在跑但注入坏了(真异常,warn 一次后去重降 debug,
 /// 防 5s tick 刷屏;成功后复位再坏会再 warn)。
@@ -992,6 +1069,8 @@ pub async fn run_quota_daemon() {
         codex_app_transfer_gemini_oauth::GeminiQuota,
         std::time::Instant,
     )> = None;
+    // [MOC-211] GLM Coding 额度缓存(独立于 antigravity;两源按活动 provider 互斥,各自 self-gate)。
+    let mut glm_cache: Option<(ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -1012,9 +1091,15 @@ pub async fn run_quota_daemon() {
             continue;
         }
         needs_remove = true;
-        // 额度:仅白名单 provider(antigravity gemini)取真实双窗口,否则 None(不显额度行);
-        // 上下文/Tokens/缓存命中率为本地实时(注入脚本侧)。
-        let quota = fetch_antigravity_quota(&quota_http, &mut quota_cache).await;
+        // 额度:白名单 provider 取真实双窗口(各自归一成 ProviderQuota),否则 None(不显额度行);
+        // 上下文/Tokens/缓存命中率为本地实时(注入脚本侧)。两个 fetcher 各按活动 provider self-gate,
+        // antigravity(authScheme)与 GLM(baseUrl host)互斥 → 最多一个返 Some,or() 取活动那个;
+        // 非活动源每 tick 自清缓存(防上个 provider 额度滞留)。
+        let antigravity = fetch_antigravity_quota(&quota_http, &mut quota_cache)
+            .await
+            .map(ProviderQuota::from);
+        let glm = fetch_glm_quota(&quota_http, &mut glm_cache).await;
+        let quota = antigravity.or(glm);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
         match push_via_cdp(payload).await {
@@ -1201,9 +1286,9 @@ mod tests {
 
     #[test]
     fn build_payload_with_quota_shows_two_quota_bars() {
-        // [MOC-204 Phase 3] 白名单 provider:5h + weekly 两 bar 在前,显**剩余**百分比。
-        use codex_app_transfer_gemini_oauth::{GeminiQuota, QuotaWindow};
-        let q = GeminiQuota {
+        // [MOC-204 Phase 3 / MOC-211] 白名单 provider:5h + weekly 两 bar 在前,显**剩余**百分比。
+        // 用中性 ProviderQuota(antigravity 与 GLM 都归一到它)。
+        let q = ProviderQuota {
             five_hour: Some(QuotaWindow {
                 remaining_percent: 94.0, // 剩 94%
                 reset_rfc3339: Some("2026-06-13T17:56:06Z".into()),
@@ -1240,5 +1325,23 @@ mod tests {
     #[test]
     fn quota_rows_empty_when_none() {
         assert!(quota_rows(None).is_empty());
+    }
+
+    #[test]
+    fn host_of_extracts_host() {
+        // [MOC-211] GLM 白名单 gate 靠它从 baseUrl 取 host。
+        assert_eq!(
+            host_of("https://open.bigmodel.cn/api/coding/paas/v4").as_deref(),
+            Some("open.bigmodel.cn")
+        );
+        assert_eq!(
+            host_of("https://api.z.ai/api/coding/paas/v4").as_deref(),
+            Some("api.z.ai")
+        );
+        // 带端口 / userinfo / 无 scheme 也能剥到纯 host
+        assert_eq!(host_of("http://h:8080/x").as_deref(), Some("h"));
+        assert_eq!(host_of("https://u@host.tld/x").as_deref(), Some("host.tld"));
+        assert_eq!(host_of("open.bigmodel.cn/api").as_deref(), Some("open.bigmodel.cn"));
+        assert_eq!(host_of(""), None);
     }
 }

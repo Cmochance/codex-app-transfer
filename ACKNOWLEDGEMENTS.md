@@ -475,6 +475,28 @@
 
 ---
 
+## guyinwonder168/opencode-glm-quota
+
+- **Link**: https://github.com/guyinwonder168/opencode-glm-quota
+- **License**: MIT
+- **借鉴形式**: 反向工程产物借鉴 + 算法借鉴
+- **首次借鉴 PR / 时间**: MOC-211 / 2026-06
+- **借鉴清单**:
+  - **GLM Coding 用量 monitor 端口路径**(上游对 `bigmodel.cn` / `z.ai` 两域名的 `GET /api/monitor/usage/quota/limit` 反向工程结论)→ `src-tauri/src/glm_quota.rs:95` `fetch_glm_quota_summary`
+  - **Authorization 不带 Bearer 前缀的鉴权约定**(上游实测发现 GLM coding-plan API key 直接置 Authorization header,无 Bearer)→ `src-tauri/src/glm_quota.rs:95` 请求构造处
+  - **响应字段语义**:`data.limits[]` 中 `TOKENS_LIMIT` 类型的 `unit/number` 映射(unit=3,number=5 → 5 小时;unit=6,number=1 → 每周)+ `percentage` 为**已用**%(对比 antigravity remainingFraction 的剩余口径)+ `nextResetTime` 重置时刻(unix 毫秒)→ `src-tauri/src/glm_quota.rs:58` `parse_glm_quota`
+- **本项目差异 / 扩展**:
+  - 未复制上游代码,按上游对该闭源 monitor API 的反向工程结论自行实现 Rust parser / fetcher(`glm_quota.rs`)
+  - 额外加 host gate:baseUrl 含 `bigmodel.cn`/`z.ai` 且含 `coding` 才匹配(`src-tauri/src/codex_quota_injector.rs` `active_glm_provider`),按量计费的 `zhipu`(`/api/paas/v4`)不匹配
+  - 缓存 / 失效语义与 antigravity 完全对称(45s 缓存、401/403 清缓存、瞬时错留旧值)`src-tauri/src/codex_quota_injector.rs` `fetch_glm_quota`
+  - 中性类型 `ProviderQuota`(`src-tauri/src/provider_quota.rs`)统一 antigravity 与 GLM 两路数据
+  - 真机实测取证 2026-06-14(bigmodel.cn 域名 + 真实 coding key → HTTP 200)
+- **同步策略**: monitor only — GLM 若更改 monitor 端口路径 / 字段语义时,按 file:line 定位 `parse_glm_quota` / `fetch_glm_quota_summary` 同步
+- **TOS / 法律注意**: 使用的是 GLM Coding Plan 订阅用户自己的 API key 调官方 monitor 端点,属合规访问自有账号数据,无灰色风险
+- **关联 PR / followup / issue**: MOC-211
+
+---
+
 ## 维护规则
 
 - **新增借鉴**:1 个 PR 内 ① README 致谢段加一行概览 ② 本文档加完整 entry(必填字段全),缺一不可
