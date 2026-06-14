@@ -289,9 +289,12 @@ pub async fn add_provider(
                 json!({"default":"","gpt_5_5":"","gpt_5_4":"","gpt_5_4_mini":"","gpt_5_3_codex":"","gpt_5_2":""})
             }),
         );
-        // 池化:加 provider 时若带了已抓取/手加的模型列表,持久化为 pooledModels(按 provider 隔离)。
+        // 池化:加 provider 时带了已抓取/手加的模型列表 → chat-only 过滤后持久化为 pooledModels。
         if let Some(pooled) = input.pooled_models.clone() {
-            new_provider.insert("pooledModels".into(), pooled);
+            new_provider.insert(
+                "pooledModels".into(),
+                super::models::chat_filter_pooled_value(&pooled),
+            );
         }
         new_provider.insert(
             "extraHeaders".into(),
@@ -437,9 +440,12 @@ pub async fn update_provider(
                 updated.insert("models".into(), Value::Object(merged));
             }
         }
-        // 池化:带 pooledModels 就更新(前端把 fetched + 手加合并后整列表下发;不带 = 不动)。
+        // 池化:带 pooledModels 就更新(chat-only 过滤;前端把 fetched + mappings 合并下发;不带=不动)。
         if let Some(pooled) = input.pooled_models.clone() {
-            updated.insert("pooledModels".into(), pooled);
+            updated.insert(
+                "pooledModels".into(),
+                super::models::chat_filter_pooled_value(&pooled),
+            );
         }
         updated.insert("id".into(), Value::String(id.clone()));
         updated.insert("isBuiltin".into(), Value::Bool(is_builtin));

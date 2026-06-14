@@ -1136,14 +1136,17 @@
     }
     if (includeModels) {
       payload.models = mappings;
-      // 池化:把当前下拉里的模型列表(进编辑页 seed 自持久化 pooledModels、点「获取模型」后
-      // 刷新/合并过)一并作为 pooledModels 持久化 —— 否则 fetch-form-models + 保存后池子拿不到
-      // 完整列表、回退槽位(bot review P2;也满足「添加 provider 时记录已获取模型」)。
-      // 空(从未获取且无持久化)→ 不下发,后端保留现值。
+      // 池化列表 = 当前下拉(进编辑页 seed 自持久化 pooledModels、点「获取模型」后刷新/合并过)
+      // ∪ 当前 mappings 值(含用户**手输**的新模型 id)。必须并入 mappings:否则手输的新模型
+      // 不进池,且旧 seed 出来的 pooledModels 反而盖掉它(registry 优先 pooledModels)→ 新模型
+      // 永不出现(bot review P2)。chat-only 过滤在后端 chat_filter_pooled_value 统一做。
+      // 空(从未获取 + 无持久化 + 无映射)→ 不下发,后端保留现值。
       const pooled = [
         ...new Set(
-          providerAvailableModels
-            .map(modelEntryId)
+          [
+            ...providerAvailableModels.map(modelEntryId),
+            ...Object.values(mappings || {}),
+          ]
             .map((s) => String(s || "").trim())
             .filter(Boolean)
         ),

@@ -225,7 +225,7 @@ const NON_CHAT_MODEL_KEYWORDS: &[&str] = &[
 /// 只保留可用于 chat 的模型 id(过滤 embedding/rerank/语音/图像);**全被过滤则返回空**
 /// (不 fallback 原列表)。池化 pooledModels 用它 —— 否则只含 embedding 的 provider 会把
 /// 这些模型写进池、出现在 Codex chat picker 并把 chat 请求路由到不支持的端点(bot review P2)。
-fn chat_usable_model_ids(model_ids: &[String]) -> Vec<String> {
+pub(crate) fn chat_usable_model_ids(model_ids: &[String]) -> Vec<String> {
     model_ids
         .iter()
         .filter(|model_id| {
@@ -236,6 +236,27 @@ fn chat_usable_model_ids(model_ids: &[String]) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+/// 对外来的 `pooledModels`(JSON 字符串数组)做 chat-only 过滤,返回过滤后的 `Value::Array`。
+/// add/update provider 持久化 pooledModels 前用它统一兜底 —— 保证无论前端 / API 哪条路径
+/// 写入,非 chat 模型(embedding/rerank/语音)都不会进池(单一过滤真源,bot review P2)。
+pub(crate) fn chat_filter_pooled_value(pooled: &Value) -> Value {
+    let ids: Vec<String> = pooled
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_owned()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(
+        chat_usable_model_ids(&ids)
+            .into_iter()
+            .map(Value::String)
+            .collect(),
+    )
 }
 
 fn usable_model_ids(model_ids: &[String]) -> Vec<String> {
