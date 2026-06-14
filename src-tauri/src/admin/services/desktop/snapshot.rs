@@ -610,8 +610,8 @@ pub async fn switch_provider_and_sync(
         trace_viewer_manager: Arc::new(crate::trace_viewer::TraceViewerManager::new()),
     };
     let desktop_sync = sync_desktop_for_active_provider(&state).await;
-    // MOC-62:切换后做一次 MCP 凭据并集同步(capture 新授权 + 必要时 restore;
-    // 只动两个凭据文件,不碰 config.toml)。
+    // MOC-62:切换后做一次 MCP 凭据镜像同步(镜像跟随 live 捕获新授权 + 传播登出删除,
+    // 绝不写 live;只动两个凭据文件,不碰 config.toml)。
     mcp_credentials_capture_after_switch();
     json!({
         "success": true,
@@ -704,9 +704,10 @@ fn apply_mcp_portable_store(enabled: bool, reason: &str) -> usize {
     }
 }
 
-/// MOC-62:provider 交互式切换后做一次 MCP 凭据并集同步(仅开关开时)。本质是完整的
-/// `sync_mcp_credentials`(capture 新授权进镜像 + 必要时从镜像 restore 回 live),只动
-/// 两个凭据文件、**不碰 config.toml**。缩短"新授权还没进镜像就被外部擦掉"的窗口。
+/// MOC-62:provider 交互式切换后做一次 MCP 凭据镜像同步(仅开关开时)。调
+/// `sync_mcp_credentials` 让镜像跟随 live(捕获新授权 + 传播登出删除),**绝不写 live**
+/// (live 缺失时只报告可恢复条数、由用户确认式 restore 处理),只动两个凭据文件、
+/// **不碰 config.toml**。缩短"新授权还没进镜像就被外部擦掉"的窗口。
 fn mcp_credentials_capture_after_switch() {
     let cfg = match load_registry() {
         Ok(c) => c,
