@@ -48,6 +48,7 @@ use futures_core::Stream;
 use http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::Value;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::mapper::{RequestMapper, ResponseMapper};
 use crate::registry::{is_responses_compact_subpath, rewrite_local_path_for_upstream};
@@ -125,10 +126,10 @@ impl ResponseMapper for ResponsesPassthroughMapper {
             });
         }
 
-        // 成功路径:**始终**套一层**纯透传** tee 解析 SSE 的 `response.completed` —— tee 不 await /
-        // 不重排 / 不改字节(chunk 原样返回,绝不破流;非 SSE / 失败自然不记录)。tee 内:
-        // ① **始终**把上游产生的 tool-call 记进降级缓存(供 orphan-400 修复,不依赖面板);
-        // ② 仅当带观测上下文(breakdown 开)时额外把整轮记进观测镜像供拼全历史算明细。
+        // 成功路径:套一层**对流式零影响**的纯透传 tee。tee 的 `poll_next` 只把 chunk(Arc clone)
+        // 非阻塞入队后原样立即返回,**不改字节、不 await、不解析**;SSE 抽行找 `response.completed`、
+        // 把本轮(input+output)记进 always-on 会话观测镜像(供 breakdown 拼全历史 + orphan-400 降级
+        // 重建上下文),全在独立 spawned task 异步完成(见 `ObserveTeeStream` doc)。
         let stream = Box::pin(ObserveTeeStream::new(
             upstream_stream,
             observe_ctx_from_plan(request_plan),
@@ -249,117 +250,36 @@ fn observe_ctx_from_plan(plan: &RequestPlan) -> Option<(Option<String>, Vec<Valu
 /// 不影响转发),防病态超长行 OOM。
 const MAX_OBSERVE_PENDING_LINE: usize = 8 * 1024 * 1024;
 
-/// [MOC-234] 只读观测 tee:**纯透传** + 旁路增量解析 SSE 找 `response.completed`,拿 response_id
-/// + output items 后把本轮(input+output)记进会话观测镜像。chunk 原样返回(不 await / 不重排 /
-/// 不改字节),解析失败 / 非 SSE / 超长行 → 静默不记录(降级,绝不影响转发)。仅记录一次。
+/// [MOC-234] 只读观测 tee:**对流式输出零影响的纯透传**。`poll_next` 拿到 chunk 后只做两件
+/// O(1) 的事 —— 把 chunk(`Bytes` 是 Arc,clone 仅 +1 引用计数、不拷数据)经 unbounded channel
+/// 非阻塞 `send` 给观测 task,然后**原样立即返回**。流式热路径上**无解析、无扫描、无锁、无 await**。
+///
+/// SSE 增量抽行、找 `response.completed`、把本轮(input+output)记进会话观测镜像,全部在一个
+/// **独立 spawned task**([`observe_response_stream`])里异步消费 channel 完成 —— 解析再重也只
+/// 占用后台 task,绝不挤占 chunk 投递(根治「中间流程卡输出 / 整段文字闪烁」)。
+///
+/// 无观测上下文(compact / parse 失败)或不在 tokio runtime(单测/非 async)→ 不起 task、
+/// `observe_tx = None`,退化为彻底零开销的纯透传。流结束时本 struct 被 drop → `observe_tx`
+/// drop → task 的 `rx` 收到 channel 关闭 → 自然收尾。
 struct ObserveTeeStream {
     inner: ByteStream,
-    line_buf: Vec<u8>,
-    /// 已扫过、确认其中无 `\n` 的前缀长度。下个 chunk 只从这里起扫新增字节,避免
-    /// 每 chunk 全量重扫 —— 否则巨型单行 `response.completed`(数 MB)跨大量小 chunk
-    /// 到达时会退化成 O(n²)(code review 指出)。
-    scan_pos: usize,
-    /// 观测上下文(本轮 prev_id + input items),仅 `breakdown_enabled` 时 `Some`。
-    /// `Some` 才把整轮记进观测镜像供 breakdown 拼全历史;function_call 缓存(降级修复用)
-    /// **无论 observe 是否 Some 都记**(始终运行,见 `process_line`)。
-    observe: Option<(Option<String>, Vec<Value>)>,
-    recorded: bool,
-    gave_up: bool,
+    /// 把 chunk 旁路给异步观测 task 的发送端。`None` = 不观测 → 纯透传。
+    observe_tx: Option<UnboundedSender<Bytes>>,
 }
 
 impl ObserveTeeStream {
     fn new(inner: ByteStream, observe: Option<(Option<String>, Vec<Value>)>) -> Self {
-        Self {
-            inner,
-            line_buf: Vec::new(),
-            scan_pos: 0,
-            observe,
-            recorded: false,
-            gave_up: false,
-        }
-    }
-
-    /// 把一个 chunk 喂进行缓冲,抽出完整行逐行处理(找 `response.completed`)。
-    /// 用 `scan_pos` 只扫新增字节找 `\n`(线性);找到则 drain 该行、游标归零续扫剩余。
-    fn feed(&mut self, chunk: &[u8]) {
-        if self.recorded || self.gave_up {
-            return;
-        }
-        self.line_buf.extend_from_slice(chunk);
-        loop {
-            match self.line_buf[self.scan_pos..]
-                .iter()
-                .position(|&b| b == b'\n')
-            {
-                Some(rel) => {
-                    let nl = self.scan_pos + rel;
-                    let line: Vec<u8> = self.line_buf.drain(..=nl).collect();
-                    self.process_line(&line[..line.len().saturating_sub(1)]);
-                    self.scan_pos = 0; // 头部已 drain,剩余从头继续扫
-                    if self.recorded {
-                        return;
-                    }
-                }
-                None => {
-                    self.scan_pos = self.line_buf.len(); // 全扫过、暂无 `\n`,下个 chunk 接着扫
-                    break;
-                }
+        // 仅当 ① 有观测上下文 ② 处于 tokio runtime 内,才起异步观测 task;否则纯透传。
+        // 解析/记录全在该 task 里跑,流式热路径只剩 O(1) 入队(见 struct doc)。
+        let observe_tx = match (observe, tokio::runtime::Handle::try_current()) {
+            (Some(observe), Ok(handle)) => {
+                let (tx, rx) = unbounded_channel::<Bytes>();
+                handle.spawn(observe_response_stream(rx, observe));
+                Some(tx)
             }
-        }
-        // 无换行的超长 pending 行(病态)→ 放弃,防无界增长。
-        if self.line_buf.len() > MAX_OBSERVE_PENDING_LINE {
-            self.gave_up = true;
-            self.line_buf = Vec::new();
-            self.scan_pos = 0;
-        }
-    }
-
-    /// 处理一行(已去 `\n`):仅认 `data: {...response.completed...}`,拿 id + output 记录本轮。
-    fn process_line(&mut self, line: &[u8]) {
-        let line = if line.last() == Some(&b'\r') {
-            &line[..line.len() - 1]
-        } else {
-            line
+            _ => None,
         };
-        let Ok(s) = std::str::from_utf8(line) else {
-            return; // 跨 chunk 切断多字节字符的残行,下一行再来(罕见,降级)
-        };
-        let Some(data) = s.trim_start().strip_prefix("data:") else {
-            return;
-        };
-        let data = data.trim();
-        if data.is_empty() || data == "[DONE]" {
-            return;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return;
-        };
-        if v.get("type").and_then(Value::as_str) != Some("response.completed") {
-            return;
-        }
-        let resp = v.get("response");
-        let id = resp
-            .and_then(|r| r.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if id.is_empty() {
-            return;
-        }
-        let output = resp
-            .and_then(|r| r.get("output"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        // **始终**(不依赖 breakdown 面板)把本轮(input + output)记进会话观测镜像,链头 =
-        // 本轮 response_id。镜像同时支撑:① breakdown 拼全历史算明细(面板开时);② orphan-400
-        // 降级时沿链重建完整上下文。observe 是 always-on(`build_observe_metadata` 始终返回 ctx),
-        // 故续轮 input 总被记下;output 里的 function_call 也随之入链,供降级拼回。
-        if let Some((prev_id, input_items)) = self.observe.take() {
-            let mut items = input_items;
-            items.extend(output);
-            global_passthrough_observe_store().record_turn(id, prev_id, items);
-        }
-        self.recorded = true;
+        Self { inner, observe_tx }
     }
 }
 
@@ -369,12 +289,111 @@ impl Stream for ObserveTeeStream {
         let this = self.as_mut().get_mut();
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
-                this.feed(&chunk);
+                // 唯一旁路开销:Arc 计数 clone + 非阻塞 unbounded send,均 O(1)。
+                // 不解析、不扫描、不等待 → 对流式输出零影响。send 失败(task 已收尾)忽略。
+                if let Some(tx) = &this.observe_tx {
+                    let _ = tx.send(chunk.clone());
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             other => other,
         }
     }
+}
+
+/// [MOC-234] 异步观测 task(在流式热路径**之外**运行):消费 chunk channel,增量抽行找
+/// `response.completed`,拿 `response_id` + output 后把本轮(input + output)记进会话观测镜像
+/// (链头 = 本轮 `response_id`)。镜像 always-on,支撑 ① breakdown 拼全历史算明细;② orphan-400
+/// 降级沿链重建完整上下文。记录一次即返回(后续 chunk 随 channel 关闭被丢弃)。
+///
+/// `scan_pos` 只扫新增字节找 `\n`(线性),防巨型单行 `response.completed`(长会话可数 MB)跨
+/// 大量小 chunk 到达时退化 O(n²);超 `MAX_OBSERVE_PENDING_LINE` 视为病态、放弃观测(降级)。
+async fn observe_response_stream(
+    mut rx: UnboundedReceiver<Bytes>,
+    observe: (Option<String>, Vec<Value>),
+) {
+    let (prev_id, input_items) = observe;
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut scan_pos = 0usize;
+    // 沿 chunk 流找到 `response.completed` 就 break 出 (id, output);channel 关闭/超长行 → None。
+    // 两条 None 路径都是**观测降级**(转发不受影响),debug 落一条线索便于现场排查「某轮为何没
+    // 进观测镜像 / orphan 自愈或 breakdown 失灵」(否则完全静默)。
+    let completed = loop {
+        let Some(chunk) = rx.recv().await else {
+            // channel 关闭(上游 EOF / 客户端断开)仍未见 response.completed:截断 / 中止 /
+            // 非 SSE 响应 → 本轮不记录。
+            tracing::debug!(
+                "responses observe: stream ended before response.completed; turn not recorded"
+            );
+            break None;
+        };
+        line_buf.extend_from_slice(&chunk);
+        let mut hit = None;
+        loop {
+            match line_buf[scan_pos..].iter().position(|&b| b == b'\n') {
+                Some(rel) => {
+                    let nl = scan_pos + rel;
+                    let line: Vec<u8> = line_buf.drain(..=nl).collect();
+                    scan_pos = 0; // 头部已 drain,剩余从头续扫
+                    if let Some(found) = parse_completed_event(&line) {
+                        hit = Some(found);
+                        break;
+                    }
+                }
+                None => {
+                    scan_pos = line_buf.len(); // 全扫过暂无 `\n`,下个 chunk 接着扫
+                    break;
+                }
+            }
+        }
+        if hit.is_some() {
+            break hit;
+        }
+        if line_buf.len() > MAX_OBSERVE_PENDING_LINE {
+            tracing::debug!(
+                pending_bytes = line_buf.len(),
+                cap = MAX_OBSERVE_PENDING_LINE,
+                "responses observe: pending SSE line exceeded cap; abandoning observation for this turn"
+            );
+            break None;
+        }
+    };
+    if let Some((id, output)) = completed {
+        let mut items = input_items;
+        items.extend(output);
+        global_passthrough_observe_store().record_turn(&id, prev_id, items);
+    }
+}
+
+/// 解析一行(可含末尾 `\r\n`):是 `data: {...response.completed...}` event 则返回
+/// `(response_id, output items)`,否则 `None`。子串预筛跳过对每个 delta 事件的 JSON parse
+/// (此处虽在异步 task、即便全 parse 也不影响流式,仍省掉无谓开销)。
+fn parse_completed_event(line: &[u8]) -> Option<(String, Vec<Value>)> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let data = std::str::from_utf8(line)
+        .ok()?
+        .trim_start()
+        .strip_prefix("data:")?
+        .trim();
+    if data.is_empty() || data == "[DONE]" || !data.contains("response.completed") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("response.completed") {
+        return None;
+    }
+    let resp = v.get("response")?;
+    let id = resp.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return None;
+    }
+    let output = resp
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Some((id.to_owned(), output))
 }
 
 #[cfg(test)]
@@ -569,10 +588,20 @@ mod tests {
             got.extend(chunk.unwrap());
         }
         assert_eq!(got, expected, "tee 必须 1:1 透传上游字节");
+        drop(tee); // 关闭 channel,让观测 task 收尾(它在 completed 事件即记录)。
 
-        // 观测镜像应记下本轮(input 1 + output 1 = 2 items),链头 = response_id。
-        let hist = global_passthrough_observe_store().assemble_chain(rid);
-        assert_eq!(hist.len(), 2, "本轮 input+output 应记进观测镜像");
+        // 记录已搬进独立异步 task(对流式零影响),yield 让其推进后再断言:观测镜像应记下
+        // 本轮(input 1 + output 1 = 2 items),链头 = response_id。
+        let store = global_passthrough_observe_store();
+        let mut hist = store.assemble_chain(rid);
+        for _ in 0..1000 {
+            if !hist.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            hist = store.assemble_chain(rid);
+        }
+        assert_eq!(hist.len(), 2, "本轮 input+output 应异步记进观测镜像");
     }
 
     #[test]

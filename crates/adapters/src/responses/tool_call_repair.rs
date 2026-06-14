@@ -57,8 +57,13 @@ pub fn rebuild_orphan_context_bytes(body: &[u8]) -> Option<Bytes> {
 
     let history = global_passthrough_observe_store().assemble_chain(&prev_id);
     if history.is_empty() {
-        // 观测 store 没记到该链(proxy 重启 / 首轮 / 跨 provider 边界)→ 拼不了完整上下文,
-        // 只补 function_call 也无意义(上游仍无会话上下文),不重试。
+        // 观测 store 没记到该链 → 拼不了完整上下文,只补 function_call 也无意义(上游仍无
+        // 会话上下文),不重试。**优雅降级**:原 orphan-400 照常 surface,无损坏。可能原因:
+        // proxy 重启 / 首轮 / 跨 provider 边界;或上一轮记录的**异步竞态**——观测记录已移出流式
+        // 热路径(防卡顿/闪烁)到独立 task,理论上本轮(N+1)orphan 重写可能早于上一轮(N)的
+        // task 落库。但 orphan-400 只在上游**拒绝 N+1**(一整个网络往返 + 上游处理后)才触发,
+        // 而 task 喂的是 client 已消费的同批 chunk、微秒级即落库,远早于该 400 回来 → 竞态仅在
+        // runtime 饿死整个 N+1 往返时才命中,且命中也仅本次不自愈(下一轮链已补齐)。
         return None;
     }
 
