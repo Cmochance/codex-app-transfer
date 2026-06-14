@@ -31,6 +31,13 @@ use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket};
 use axum::http::HeaderMap;
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::{CloseCode, Message as UpMessage, Upgrade, WebSocket as UpWebSocket};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as TungCloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame as TungCloseFrame;
+use tokio_tungstenite::tungstenite::Message as TungMessage;
+use tokio_tungstenite::WebSocketStream;
 
 use crate::resolver::{AuthScheme, ResolvedProvider};
 use crate::telemetry::proxy_telemetry;
@@ -40,67 +47,27 @@ use crate::telemetry::proxy_telemetry;
 /// 前置)路径更长、不等于此常量,落 fallback 的普通 passthrough。
 pub const REMOTE_CONTROL_WS_PATH: &str = "/backend-api/wham/remote/control/server";
 
-/// WS 透传专用上游 client:`http1_only`(WS upgrade 需 HTTP/1.1)+ rustls,进程级 `OnceLock`
-/// 复用连接池。**独立于 state.http**(reqwest 0.12),用 reqwest 0.13(package `reqwest13`)配
-/// reqwest-websocket 0.6。
-///
-/// **代理路由(MOC-234 实证关键)**:VPN fake-ip(TUN)模式会**破坏 WS upgrade**(实测对上游
-/// 直发握手返 426,WS 根本到不了真实端点);必须走 VPN 的**显式 HTTP/SOCKS 代理**做原始 TCP
-/// 隧道,WS 握手才直达上游(实测经代理 426→401,即真正到达)。Codex 自己靠 `~/.codex/.env` 的
-/// `HTTP(S)_PROXY` 走代理;本 proxy 进程不继承该 env,故这里显式探测代理(见 [`upstream_ws_proxy`])
-/// 并 `.proxy()`。探测不到(无 VPN)→ 不设代理,退回直连(非 VPN 用户行为不变)。
+/// 远程控制 WS 专用上游 client:`http1_only`(WS upgrade 需 HTTP/1.1)+ rustls + system-proxy,
+/// 进程级 `OnceLock` 复用连接池。**独立于 state.http**(reqwest 0.12),用 reqwest 0.13(package
+/// `reqwest13`)配 reqwest-websocket 0.6。**仅 [`proxy_remote_control`] 用** —— responses 上游 WS
+/// 改用 tokio-tungstenite(见 [`proxy_responses_upstream_ws`]),不经此 client。
 fn ws_upstream_client() -> &'static reqwest13::Client {
     static CLIENT: OnceLock<reqwest13::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        let mut builder = reqwest13::Client::builder()
+        reqwest13::Client::builder()
             .http1_only()
             .use_rustls_tls()
-            .connect_timeout(Duration::from_secs(20));
-        if let Some(proxy_url) = upstream_ws_proxy() {
-            match reqwest13::Proxy::all(&proxy_url) {
-                Ok(p) => {
-                    builder = builder.proxy(p);
-                    proxy_telemetry()
-                        .logs
-                        .add("INFO", format!("[ws-upstream] 上游 WS 走代理: {proxy_url}"));
-                }
-                Err(e) => proxy_telemetry().logs.add(
-                    "WARN",
-                    format!("[ws-upstream] 代理 URL {proxy_url} 无效,退回直连: {e}"),
-                ),
-            }
-        }
-        builder.build().expect("build WS upstream client")
+            .connect_timeout(Duration::from_secs(20))
+            .build()
+            .expect("build WS upstream client")
     })
 }
 
-/// 上游 WS 用的代理 URL(已归一成 `socks5h://`)。WS upgrade 经 **HTTP-CONNECT 代理会被
-/// fake-ip 截断**(实测 reqwest/curl 走 `http://` 代理返 426、到不了真实端点);改用 **SOCKS5h**
-/// (代理端解析域名拿真实 IP + 原始 TCP 隧道)WS 才直达上游(实测 websocat 走 socks5 返 401 =
-/// 已到达鉴权阶段)。假设代理端口兼 SOCKS(Clash/Mihomo mixed-port,用户场景)。
-fn upstream_ws_proxy() -> Option<String> {
-    Some(to_socks5h(&upstream_ws_proxy_raw()?))
-}
-
-/// 把任意代理 URL 归一成 `socks5h://<authority>`(保留 `[userinfo@]host:port`,强制代理端 DNS,
-/// 绕开客户端 fake-ip 解析)。已是 `socks5h://` 的原样返回。
-fn to_socks5h(proxy: &str) -> String {
-    if proxy.starts_with("socks5h://") {
-        return proxy.to_string();
-    }
-    let authority = proxy
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(proxy)
-        .split('/')
-        .next()
-        .unwrap_or(proxy);
-    format!("socks5h://{authority}")
-}
-
-/// 原始代理来源:优先进程 env(`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`,大小写都认),否则读
-/// `~/.codex/.env`(用户给 Codex 配的「全通信走 VPN」代理)。返回首个非空代理 URL。
-fn upstream_ws_proxy_raw() -> Option<String> {
+/// VPN 的 HTTP 代理 URL —— responses 上游 WS 的手动 HTTP-CONNECT 用(见
+/// [`proxy_responses_upstream_ws`])。优先进程 env(`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`,
+/// 大小写都认),否则读 `~/.codex/.env`(用户给 Codex 配的「全通信走 VPN」代理)。返回首个非空
+/// 代理 URL;无(非 VPN 用户)→ `None` = 直连(行为不变)。
+fn vpn_http_proxy() -> Option<String> {
     for k in [
         "HTTPS_PROXY",
         "https_proxy",
@@ -233,75 +200,100 @@ pub async fn proxy_responses_upstream_ws(
         ),
     );
 
-    let mut req = ws_upstream_client().get(&upstream_url);
-    // 透传 Codex 握手头(OpenAI-Beta: responses_websockets / x-codex-* 等);跳过 gateway
-    // authorization(下面单独处理)+ WS 协议握手头(reqwest-websocket 重新生成上游段)。
-    // 收集转发的头**名字**(不含值,避免泄露 auth/attestation)便于诊断上游 4xx 时缺哪个头。
-    let mut forwarded_names: Vec<&str> = Vec::new();
-    for (k, v) in handshake_headers.iter() {
-        if should_forward_responses_ws_header(k.as_str()) {
-            req = req.header(k.as_str(), v.as_bytes());
-            forwarded_names.push(k.as_str());
-        }
-    }
-    telemetry.logs.add(
-        "INFO",
-        format!(
-            "[responses-ws] 转发 Codex 握手头: [{}]",
-            forwarded_names.join(", ")
-        ),
-    );
-    // 鉴权:第三方 provider(api_key 非空)注入 provider 凭据;chatgpt.com relay(api_key 空、
-    // 用 Codex 账号 token)透传 Codex 自带的 authorization。
-    if resolved.api_key.is_empty() {
-        if let Some(auth) = handshake_headers.get(axum::http::header::AUTHORIZATION) {
-            req = req.header("authorization", auth.as_bytes());
-        }
-    } else {
-        req = apply_responses_upstream_auth(req, &resolved);
-    }
-    // provider.extra_headers(已做 {apiKey} 模板替换)叠加。
-    for (k, v) in resolved.extra_headers.iter() {
-        req = req.header(k.as_str(), v.as_bytes());
-    }
+    let Some((host, port)) = parse_ws_target(&upstream_url) else {
+        telemetry.logs.add(
+            "WARN",
+            format!("[responses-ws] 无法解析 WS host:port: {upstream_url}"),
+        );
+        close_client(client_socket, "bad upstream ws url").await;
+        return;
+    };
 
-    let mut upstream: UpWebSocket = match req.upgrade().send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            match resp.into_websocket().await {
-                Ok(ws) => ws,
-                Err(e) => {
-                    telemetry.logs.add(
-                        "WARN",
-                        format!("[responses-ws] 上游 upgrade 失败(status {status}): {e}"),
-                    );
-                    close_client(client_socket, "upstream ws upgrade failed").await;
-                    return;
-                }
-            }
-        }
+    // 构造 WS 握手请求:`into_client_request` 生成 Sec-WebSocket-* / Upgrade / Connection / Host,
+    // 再叠加要透传的 Codex 头 + 鉴权。tungstenite 与 axum 同用 http 1.x,HeaderName/Value 直接复用。
+    let mut request = match upstream_url.as_str().into_client_request() {
+        Ok(r) => r,
         Err(e) => {
             telemetry
                 .logs
-                .add("WARN", format!("[responses-ws] 上游连接失败: {e}"));
-            close_client(client_socket, "upstream ws connect failed").await;
+                .add("WARN", format!("[responses-ws] 构造握手请求失败: {e}"));
+            close_client(client_socket, "bad ws request").await;
+            return;
+        }
+    };
+    {
+        let h = request.headers_mut();
+        // 透传 Codex 握手头(OpenAI-Beta: responses_websockets / x-codex-* 等);跳过 gateway
+        // authorization(下面单独处理)+ WS 协议握手头(tungstenite 自己生成)。收集名字(不含值)
+        // 便于诊断上游 4xx 时缺哪个头。
+        let mut forwarded_names: Vec<&str> = Vec::new();
+        for (k, v) in handshake_headers.iter() {
+            if should_forward_responses_ws_header(k.as_str()) {
+                h.insert(k.clone(), v.clone());
+                forwarded_names.push(k.as_str());
+            }
+        }
+        // 鉴权:第三方 provider(api_key 非空)注入 provider 凭据;chatgpt.com relay(api_key 空、
+        // 用 Codex 账号 token)透传 Codex 自带的 authorization。
+        if resolved.api_key.is_empty() {
+            if let Some(auth) = handshake_headers.get(axum::http::header::AUTHORIZATION) {
+                h.insert(axum::http::header::AUTHORIZATION, auth.clone());
+            }
+        } else {
+            insert_responses_upstream_auth(h, &resolved);
+        }
+        // provider.extra_headers(已做 {apiKey} 模板替换)叠加。
+        for (k, v) in resolved.extra_headers.iter() {
+            h.insert(k.clone(), v.clone());
+        }
+        telemetry.logs.add(
+            "INFO",
+            format!(
+                "[responses-ws] 转发 Codex 握手头: [{}]",
+                forwarded_names.join(", ")
+            ),
+        );
+    }
+
+    // 建 TCP:直连 or 经 VPN HTTP-CONNECT 代理(CONNECT 时发**域名**让代理端解析,绕开客户端
+    // fake-ip → 这是 reqwest-websocket 走代理 426、tokio-tungstenite 能通的关键差异)。
+    let tcp = match establish_upstream_tcp(&host, port).await {
+        Ok(s) => s,
+        Err(e) => {
+            telemetry
+                .logs
+                .add("WARN", format!("[responses-ws] 上游 TCP/CONNECT 失败: {e}"));
+            close_client(client_socket, "upstream connect failed").await;
+            return;
+        }
+    };
+
+    // TLS(rustls + webpki-roots)+ WS 握手 over 隧道流,tokio-tungstenite(Codex 同款栈)。
+    let mut upstream = match tokio_tungstenite::client_async_tls(request, tcp).await {
+        Ok((ws, _resp)) => ws,
+        Err(e) => {
+            // tungstenite Error::Http 的 Display 含状态码(如 401/426),便于定位鉴权 vs 路由。
+            telemetry
+                .logs
+                .add("WARN", format!("[responses-ws] 上游 WS 握手失败: {e}"));
+            close_client(client_socket, "upstream ws handshake failed").await;
             return;
         }
     };
     telemetry.logs.add(
         "INFO",
-        "[responses-ws] 上游 WS 建立(101),首帧发送 + 双向 relay 开始".to_string(),
+        "[responses-ws] 上游 WS 建立,首帧发送 + 双向 relay 开始".to_string(),
     );
 
     // 已从 Codex 读到的首帧(response.create)原样发上游,再进双向 pump(后续帧 1:1 relay)。
-    if upstream.send(ax_to_up(first_frame)).await.is_err() {
+    if upstream.send(ax_to_tung(first_frame)).await.is_err() {
         telemetry
             .logs
             .add("WARN", "[responses-ws] 首帧写上游失败,收束".to_string());
         close_client(client_socket, "upstream write failed").await;
         return;
     }
-    pump(client_socket, upstream).await;
+    tung_pump(client_socket, upstream).await;
     telemetry
         .logs
         .add("INFO", "[responses-ws] relay 结束,通道关闭".to_string());
@@ -325,15 +317,119 @@ fn responses_ws_url(upstream_base: &str) -> Option<String> {
 }
 
 /// responses 上游 WS 握手鉴权注入(仅 api_key 非空时调):`x_api_key` scheme → `x-api-key`,
-/// 其余(Bearer 及第三方默认)→ `Authorization: Bearer <key>`。OAuth/Google 类 scheme 不会
-/// 进 responses 分支(那是 gemini/antigravity,api_format 非 responses)。
-fn apply_responses_upstream_auth(
-    req: reqwest13::RequestBuilder,
-    resolved: &ResolvedProvider,
-) -> reqwest13::RequestBuilder {
+/// 其余(Bearer 及第三方默认)→ `Authorization: Bearer <key>`。OAuth/Google 类 scheme 不会进
+/// responses 分支(那是 gemini/antigravity,api_format 非 responses)。值非法(含换行等)则跳过。
+fn insert_responses_upstream_auth(h: &mut axum::http::HeaderMap, resolved: &ResolvedProvider) {
     match resolved.auth_scheme {
-        AuthScheme::XApiKey => req.header("x-api-key", resolved.api_key.as_str()),
-        _ => req.header("authorization", format!("Bearer {}", resolved.api_key)),
+        AuthScheme::XApiKey => {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&resolved.api_key) {
+                h.insert(axum::http::HeaderName::from_static("x-api-key"), v);
+            }
+        }
+        _ => {
+            if let Ok(v) =
+                axum::http::HeaderValue::from_str(&format!("Bearer {}", resolved.api_key))
+            {
+                h.insert(axum::http::header::AUTHORIZATION, v);
+            }
+        }
+    }
+}
+
+/// 建到上游 `host:port` 的 TCP:有 VPN 代理(见 [`vpn_http_proxy`])则走 **HTTP-CONNECT**
+/// 隧道(`CONNECT host:port`,发**域名**让代理端解析真实 IP,绕开客户端 fake-ip);无则直连。
+/// 返回可直接交给 `client_async_tls` 做 TLS+WS 握手的明文流。
+async fn establish_upstream_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let Some(proxy) = vpn_http_proxy() else {
+        return TcpStream::connect((host, port)).await;
+    };
+    let Some((ph, pp)) = parse_authority(&proxy) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("bad proxy url: {proxy}"),
+        ));
+    };
+    proxy_telemetry().logs.add(
+        "INFO",
+        format!("[responses-ws] 经 HTTP-CONNECT 代理 {ph}:{pp} → {host}:{port}"),
+    );
+    let mut s = TcpStream::connect((ph.as_str(), pp)).await?;
+    let connect = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+    s.write_all(connect.as_bytes()).await?;
+    let status = read_connect_status(&mut s).await?;
+    if !(200..300).contains(&status) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("proxy CONNECT 返回 {status}"),
+        ));
+    }
+    Ok(s)
+}
+
+/// 读 HTTP-CONNECT 响应,解析首行状态码(读到 `\r\n\r\n` 头结束为止;逐字节、响应很小)。
+async fn read_connect_status(s: &mut TcpStream) -> std::io::Result<u16> {
+    let mut buf: Vec<u8> = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        if s.read(&mut byte).await? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "proxy 在 CONNECT 期间关闭",
+            ));
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CONNECT 响应头过大",
+            ));
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let first = head.lines().next().unwrap_or("");
+    first
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("无法解析 CONNECT 状态行: {first}"),
+            )
+        })
+}
+
+/// 从代理 URL 取 `host`/`port`(剥 scheme + userinfo + path)。无显式端口 → None(.env 的代理
+/// 恒带端口,如 `http://127.0.0.1:7897`)。
+fn parse_authority(url: &str) -> Option<(String, u16)> {
+    let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after.split(['/', '?']).next().unwrap_or(after);
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    let (h, p) = hostport.rsplit_once(':')?;
+    Some((h.to_string(), p.parse().ok()?))
+}
+
+/// 从 `ws(s)://host[:port]/path` 取 `host`/`port`(无端口按 scheme 取默认 443/80)。
+fn parse_ws_target(ws_url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = ws_url.split_once("://")?;
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    let default = if scheme == "wss" { 443 } else { 80 };
+    match hostport.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(port) => Some((h.to_string(), port)),
+            Err(_) => Some((hostport.to_string(), default)),
+        },
+        None => Some((hostport.to_string(), default)),
     }
 }
 
@@ -457,6 +553,91 @@ fn up_to_ax(m: UpMessage) -> AxMessage {
             code: u16::from(code),
             reason: reason.into(),
         })),
+    }
+}
+
+/// 双向 frame pump(responses 上游 WS):Codex(axum)↔ 上游(tokio-tungstenite)。同 [`pump`]
+/// 但对接 tungstenite 的 `Message` 类型。任一端 `Close` / 读到 `None` / 写失败即收束。
+async fn tung_pump<S>(client: WebSocket, upstream: WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let telemetry = proxy_telemetry();
+    let (mut client_tx, mut client_rx) = client.split();
+    let (mut up_tx, mut up_rx) = upstream.split();
+
+    loop {
+        tokio::select! {
+            msg = client_rx.next() => match msg {
+                Some(Ok(m)) => {
+                    let is_close = matches!(m, AxMessage::Close(_));
+                    if up_tx.send(ax_to_tung(m)).await.is_err() {
+                        break;
+                    }
+                    if is_close {
+                        break;
+                    }
+                }
+                Some(Err(e)) => {
+                    telemetry
+                        .logs
+                        .add("WARN", format!("[responses-ws] Codex 侧读错误: {e}"));
+                    break;
+                }
+                None => break,
+            },
+            msg = up_rx.next() => match msg {
+                Some(Ok(m)) => {
+                    let is_close = matches!(m, TungMessage::Close(_));
+                    if client_tx.send(tung_to_ax(m)).await.is_err() {
+                        break;
+                    }
+                    if is_close {
+                        break;
+                    }
+                }
+                Some(Err(e)) => {
+                    telemetry
+                        .logs
+                        .add("WARN", format!("[responses-ws] 上游侧读错误: {e}"));
+                    break;
+                }
+                None => break,
+            },
+        }
+    }
+
+    let _ = up_tx.close().await;
+    let _ = client_tx.close().await;
+}
+
+/// axum WS 帧 → tokio-tungstenite 帧(Codex → 上游方向)。
+fn ax_to_tung(m: AxMessage) -> TungMessage {
+    match m {
+        AxMessage::Text(t) => TungMessage::Text(t.to_string().into()),
+        AxMessage::Binary(b) => TungMessage::Binary(b),
+        AxMessage::Ping(b) => TungMessage::Ping(b),
+        AxMessage::Pong(b) => TungMessage::Pong(b),
+        AxMessage::Close(frame) => TungMessage::Close(frame.map(|f| TungCloseFrame {
+            code: TungCloseCode::from(f.code),
+            reason: f.reason.to_string().into(),
+        })),
+    }
+}
+
+/// tokio-tungstenite 帧 → axum WS 帧(上游 → Codex 方向)。`Frame`(原始帧)在读路径不应出现,
+/// 兜底成空 Binary(无害)。
+fn tung_to_ax(m: TungMessage) -> AxMessage {
+    match m {
+        TungMessage::Text(t) => AxMessage::Text(t.as_str().to_owned().into()),
+        TungMessage::Binary(b) => AxMessage::Binary(b),
+        TungMessage::Ping(b) => AxMessage::Ping(b),
+        TungMessage::Pong(b) => AxMessage::Pong(b),
+        TungMessage::Close(frame) => AxMessage::Close(frame.map(|f| CloseFrame {
+            code: u16::from(f.code),
+            reason: f.reason.to_string().into(),
+        })),
+        TungMessage::Frame(_) => AxMessage::Binary(bytes::Bytes::new()),
     }
 }
 
@@ -595,31 +776,32 @@ mod tests {
     }
 
     #[test]
-    fn to_socks5h_normalizes_to_socks5h_keeping_authority() {
-        // http/https/socks5 → socks5h(强制代理端 DNS,绕开 fake-ip)
+    fn parse_authority_extracts_host_port_strips_scheme_userinfo_path() {
         assert_eq!(
-            to_socks5h("http://127.0.0.1:7897"),
-            "socks5h://127.0.0.1:7897"
+            parse_authority("http://127.0.0.1:7897"),
+            Some(("127.0.0.1".to_string(), 7897))
         );
         assert_eq!(
-            to_socks5h("https://127.0.0.1:7897"),
-            "socks5h://127.0.0.1:7897"
+            parse_authority("http://user:pass@host:1080/x"),
+            Some(("host".to_string(), 1080))
+        );
+        // 无显式端口 → None(.env 代理恒带端口)
+        assert_eq!(parse_authority("http://127.0.0.1"), None);
+    }
+
+    #[test]
+    fn parse_ws_target_extracts_host_port_with_scheme_default() {
+        assert_eq!(
+            parse_ws_target("wss://api.freemodel.dev/responses"),
+            Some(("api.freemodel.dev".to_string(), 443))
         );
         assert_eq!(
-            to_socks5h("socks5://127.0.0.1:7897"),
-            "socks5h://127.0.0.1:7897"
+            parse_ws_target("ws://127.0.0.1:18080/responses"),
+            Some(("127.0.0.1".to_string(), 18080))
         );
-        // 已是 socks5h 原样
         assert_eq!(
-            to_socks5h("socks5h://127.0.0.1:7897"),
-            "socks5h://127.0.0.1:7897"
+            parse_ws_target("wss://host:8443/responses?x=1"),
+            Some(("host".to_string(), 8443))
         );
-        // 保留 userinfo,丢弃 path
-        assert_eq!(
-            to_socks5h("http://user:pass@host:1080/x"),
-            "socks5h://user:pass@host:1080"
-        );
-        // 无 scheme
-        assert_eq!(to_socks5h("127.0.0.1:7897"), "socks5h://127.0.0.1:7897");
     }
 }
