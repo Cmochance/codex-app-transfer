@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod admin;
+mod anyrouter_quota;
 mod codex_plugin_unlocker;
 mod codex_quota_injector;
 mod codex_real_account;

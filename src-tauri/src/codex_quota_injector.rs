@@ -1002,6 +1002,31 @@ fn active_deepseek_provider() -> Option<(String, String)> {
     Some((host, api_key.to_string()))
 }
 
+/// [MOC-211] 活动 provider 若是 anyrouter(baseUrl host 含 `anyrouter.top`)且有 apiKey →
+/// 返回 `(host, apiKey)`,否则 None。anyrouter 已用额度走 OpenAI 兼容 billing 端点(推理同
+/// 一把 key、Bearer);账户剩余余额被阿里反爬挡、不取(见 anyrouter_quota)。
+fn active_anyrouter_provider() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    if !host.ends_with("anyrouter.top") {
+        return None;
+    }
+    let api_key = p
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some((host, api_key.to_string()))
+}
+
 /// 取 antigravity gemini 双窗口额度(白名单 gate + token 校验 + 45s 缓存)。非白名单 /
 /// token 失效 → 清缓存 + None(不显额度行)。token 复用文件 refresh_token 刷新(同 app)。
 async fn fetch_antigravity_quota(
@@ -1192,6 +1217,45 @@ async fn fetch_deepseek_quota(
     }
 }
 
+/// [MOC-211] 取 anyrouter 已用额度(host gate + 45s 缓存)。非 anyrouter / key 失效 → 清缓存 +
+/// None。用推理同一把 apiKey 查 OpenAI 兼容 `/v1/dashboard/billing/usage`(end_date=本地当天)。
+async fn fetch_anyrouter_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::anyrouter_quota::{fetch_anyrouter_usage, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((host, api_key)) = active_anyrouter_provider() else {
+        *cache = None;
+        return None;
+    };
+    if let Some((q, at)) = cache.as_ref() {
+        if at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    match fetch_anyrouter_usage(http, &host, &api_key, &today).await {
+        Ok(q) => {
+            *cache = Some((q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] anyrouter usage 鉴权失败(key 失效)→ 清缓存");
+            *cache = None;
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] anyrouter usage 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            if let Some((_, at)) = cache.as_mut() {
+                *at = std::time::Instant::now();
+            }
+            cache.as_ref().map(|(q, _)| q.clone())
+        }
+    }
+}
+
 /// 按阶段分级记录推送失败:connect 失败 = Codex 没跑(常态,debug);
 /// evaluate 失败 = Codex 在跑但注入坏了(真异常,warn 一次后去重降 debug,
 /// 防 5s tick 刷屏;成功后复位再坏会再 warn)。
@@ -1236,6 +1300,7 @@ pub async fn run_quota_daemon() {
     let mut glm_cache: Option<(ProviderQuota, std::time::Instant)> = None;
     let mut mimo_cache: Option<(ProviderQuota, std::time::Instant)> = None;
     let mut deepseek_cache: Option<(ProviderQuota, std::time::Instant)> = None;
+    let mut anyrouter_cache: Option<(ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -1266,7 +1331,8 @@ pub async fn run_quota_daemon() {
         let glm = fetch_glm_quota(&quota_http, &mut glm_cache).await;
         let mimo = fetch_mimo_quota(&quota_http, &mut mimo_cache).await;
         let deepseek = fetch_deepseek_quota(&quota_http, &mut deepseek_cache).await;
-        let quota = antigravity.or(glm).or(mimo).or(deepseek);
+        let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
+        let quota = antigravity.or(glm).or(mimo).or(deepseek).or(anyrouter);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
         match push_via_cdp(payload).await {
