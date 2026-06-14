@@ -484,7 +484,11 @@ mod tests {
 
         let entries = unique_pool_slugs(&[included, excluded, no_flag]);
         let slugs: Vec<&str> = entries.iter().map(|e| e.slug.as_str()).collect();
-        assert_eq!(slugs, vec!["a/a-model"], "只有 pooledEnabled=true 的 a 进池");
+        assert_eq!(
+            slugs,
+            vec!["a/a-model"],
+            "只有 pooledEnabled=true 的 a 进池"
+        );
         // provider_idx 仍是原始下标(a 在 0)
         assert_eq!(entries[0].provider_idx, 0);
     }
