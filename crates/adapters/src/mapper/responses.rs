@@ -50,7 +50,10 @@ use serde_json::Value;
 use crate::mapper::{RequestMapper, ResponseMapper};
 use crate::registry::{is_responses_compact_subpath, rewrite_local_path_for_upstream};
 use crate::responses::context_breakdown::breakdown_enabled;
-use crate::responses::{global_passthrough_observe_store, spawn_compute_and_persist_responses};
+use crate::responses::{
+    global_passthrough_observe_store, global_tool_call_repair_cache,
+    spawn_compute_and_persist_responses,
+};
 use crate::types::{AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -123,16 +126,14 @@ impl ResponseMapper for ResponsesPassthroughMapper {
             });
         }
 
-        // 成功路径:只读观测 tee(仅 request 侧带了观测上下文 = breakdown_enabled 且非
-        // compact 时)套一层**纯透传** tee 解析 SSE 的 `response.completed` 拿 response_id
-        // + output items,写会话观测镜像供下一轮拼全历史。tee 不 await / 不重排 / 不改字节
-        // —— chunk 原样返回,绝不破流;非 SSE / 失败自然不记录(降级,不影响转发)。
-        let stream = match observe_ctx_from_plan(request_plan) {
-            Some((prev_id, input_items)) => {
-                Box::pin(ObserveTeeStream::new(upstream_stream, prev_id, input_items)) as ByteStream
-            }
-            None => upstream_stream,
-        };
+        // 成功路径:**始终**套一层**纯透传** tee 解析 SSE 的 `response.completed` —— tee 不 await /
+        // 不重排 / 不改字节(chunk 原样返回,绝不破流;非 SSE / 失败自然不记录)。tee 内:
+        // ① **始终**把上游产生的 tool-call 记进降级缓存(供 orphan-400 修复,不依赖面板);
+        // ② 仅当带观测上下文(breakdown 开)时额外把整轮记进观测镜像供拼全历史算明细。
+        let stream = Box::pin(ObserveTeeStream::new(
+            upstream_stream,
+            observe_ctx_from_plan(request_plan),
+        )) as ByteStream;
         // 1:1 直透:status / headers 原样回灌。**不强制** content-type —— 与 chat 等转换
         // mapper 不同,透传上游可能返回非 SSE 的合法响应(`stream:false` 的 JSON、
         // `/responses/compact` v1 非流式、`/responses/{id}/cancel` 等),强制
@@ -254,20 +255,21 @@ struct ObserveTeeStream {
     /// 每 chunk 全量重扫 —— 否则巨型单行 `response.completed`(数 MB)跨大量小 chunk
     /// 到达时会退化成 O(n²)(code review 指出)。
     scan_pos: usize,
-    prev_id: Option<String>,
-    input_items: Vec<Value>,
+    /// 观测上下文(本轮 prev_id + input items),仅 `breakdown_enabled` 时 `Some`。
+    /// `Some` 才把整轮记进观测镜像供 breakdown 拼全历史;function_call 缓存(降级修复用)
+    /// **无论 observe 是否 Some 都记**(始终运行,见 `process_line`)。
+    observe: Option<(Option<String>, Vec<Value>)>,
     recorded: bool,
     gave_up: bool,
 }
 
 impl ObserveTeeStream {
-    fn new(inner: ByteStream, prev_id: Option<String>, input_items: Vec<Value>) -> Self {
+    fn new(inner: ByteStream, observe: Option<(Option<String>, Vec<Value>)>) -> Self {
         Self {
             inner,
             line_buf: Vec::new(),
             scan_pos: 0,
-            prev_id,
-            input_items,
+            observe,
             recorded: false,
             gave_up: false,
         }
@@ -344,10 +346,16 @@ impl ObserveTeeStream {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        // 本轮 items = 本轮 input(请求侧带来)+ 上游 output。记进镜像,链头 = 本轮 response_id。
-        let mut items = std::mem::take(&mut self.input_items);
-        items.extend(output);
-        global_passthrough_observe_store().record_turn(id, self.prev_id.take(), items);
+        // **始终**(不依赖 breakdown 面板)把上游产生的 tool-call 按 call_id 记进降级缓存,
+        // 供 orphan-function_call 400 时拼回 input(store:false 上游不留自己的 function_call)。
+        global_tool_call_repair_cache().record_output(&output);
+        // 仅 observe 上下文存在(breakdown 开)时,把整轮(input + output)记进观测镜像
+        // 供下一轮拼全历史算 by-source 明细。
+        if let Some((prev_id, input_items)) = self.observe.take() {
+            let mut items = input_items;
+            items.extend(output);
+            global_passthrough_observe_store().record_turn(id, prev_id, items);
+        }
         self.recorded = true;
     }
 }
@@ -547,7 +555,7 @@ mod tests {
             .collect();
 
         let inner: ByteStream = Box::pin(futures_util::stream::iter(chunks));
-        let mut tee = ObserveTeeStream::new(inner, Some("prev_x".into()), vec![input_item]);
+        let mut tee = ObserveTeeStream::new(inner, Some((Some("prev_x".into()), vec![input_item])));
 
         // 透传字节必须与上游完全一致(tee 不改流)。
         let mut got: Vec<u8> = Vec::new();

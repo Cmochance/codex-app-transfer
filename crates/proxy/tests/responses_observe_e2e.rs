@@ -275,3 +275,152 @@ async fn responses_passthrough_e2e_communication_and_breakdown() {
 
     set_breakdown_enabled(false); // 复位,避免影响同 binary 其它用例
 }
+
+/// orphan-修复 mock 上游:校验每个 function_call_output 是否有同 call_id 的 function_call
+/// 在 input 内(模拟 new-api 类 store:false 反代的窄校验)。
+/// - input 无 function_call_output(纯对话轮)→ 200,output 带一个 function_call(call_FIX)
+///   让 proxy 的 tool-call 缓存记下;
+/// - input 有 function_call_output 但缺配对 function_call → 400 orphan(referencing 该 call_id);
+/// - input 有配对(proxy 拼接后)→ 200。
+async fn mock_orphan_upstream(
+    State(state): State<Arc<MockState>>,
+    body: Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    state.received.lock().unwrap().push(body.to_vec());
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let input = v
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let present: std::collections::HashSet<String> = input
+        .iter()
+        .filter(|it| it.get("type").and_then(Value::as_str) == Some("function_call"))
+        .filter_map(|it| it.get("call_id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let orphan = input
+        .iter()
+        .filter(|it| it.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .filter_map(|it| it.get("call_id").and_then(Value::as_str))
+        .find(|cid| !present.contains(*cid));
+    if let Some(cid) = orphan {
+        // 窄校验失败 → 400 orphan(裸 JSON,标 event-stream,复刻真机)
+        let err = format!(
+            "{{\"error\":{{\"message\":\"No tool call found for function call output with call_id {cid}.\",\"type\":\"invalid_request_error\",\"param\":\"input\"}}}}"
+        );
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(CONTENT_TYPE, "text/event-stream")],
+            err,
+        )
+            .into_response();
+    }
+    // 200:纯对话轮回一个 function_call 供缓存记录;否则回普通 message。
+    let has_output = input
+        .iter()
+        .any(|it| it.get("type").and_then(Value::as_str) == Some("function_call_output"));
+    let out_item = if has_output {
+        json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]})
+    } else {
+        json!({"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls\"}","call_id":"call_FIX"})
+    };
+    let completed = json!({
+        "type":"response.completed",
+        "response":{"id":"r_orphan","object":"response","status":"completed","output":[out_item]}
+    });
+    let sse = format!("event: response.completed\ndata: {completed}\n\ndata: [DONE]\n\n");
+    ([(CONTENT_TYPE, "text/event-stream")], sse).into_response()
+}
+
+#[tokio::test]
+async fn orphan_function_call_400_is_repaired_and_retried_to_success() {
+    // [MOC-234] 真机复现的降级:store:false 反代续轮发 function_call_output 找不到自己产生的
+    // function_call → 400。proxy 应:① 从缓存(上一轮响应记录的 function_call)拼回 input
+    // + 去 previous_response_id;② 透明重发;③ 客户端拿到 200(而非 400)。
+    let mock = Arc::new(MockState::default());
+    let upstream_addr = spawn(
+        Router::new()
+            .route("/responses", post(mock_orphan_upstream))
+            .with_state(mock.clone()),
+    )
+    .await;
+    let resolver = Arc::new(StaticResolver::new(
+        None,
+        vec![responses_provider(&format!("http://{upstream_addr}"))],
+        Some("test-upstream".into()),
+    ));
+    let proxy_addr = spawn(build_router(resolver)).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // Turn 1:纯对话轮 → 上游回 function_call(call_FIX),proxy tee 记进降级缓存。
+    let t1 = json!({
+        "model":"gpt-5.5","stream":true,"store":false,
+        "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"run ls"}]}]
+    });
+    let r1 = client
+        .post(format!("http://{proxy_addr}/responses"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&t1).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert!(r1.status().is_success());
+    let r1_text = r1.text().await.unwrap();
+    assert!(
+        r1_text.contains("call_FIX"),
+        "turn1 应回灌 function_call 供缓存记录"
+    );
+
+    // Turn 2:orphan —— 只发 call_FIX 的 output + previous_response_id,不带 function_call。
+    let t2 = json!({
+        "model":"gpt-5.5","stream":true,"store":false,
+        "previous_response_id":"r_orphan",
+        "input":[{"type":"function_call_output","call_id":"call_FIX","output":"file1\nfile2"}]
+    });
+    let r2 = client
+        .post(format!("http://{proxy_addr}/responses"))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&t2).unwrap())
+        .send()
+        .await
+        .unwrap();
+    // 关键:客户端应拿到 200(proxy 拼接 function_call 重发成功),而非 400/ response.failed。
+    assert!(
+        r2.status().is_success(),
+        "orphan 续轮应被 proxy 修复重试成功,status={}",
+        r2.status()
+    );
+    let r2_text = r2.text().await.unwrap();
+    assert!(
+        r2_text.contains("response.completed"),
+        "重试成功应回灌 response.completed,而非 response.failed: {r2_text}"
+    );
+    assert!(
+        !r2_text.contains("response.failed"),
+        "修复成功不应出现 response.failed: {r2_text}"
+    );
+
+    // 上游应收到 turn2 两次:第一次 orphan(400)+ 修复后重发(200)。
+    let recv = mock.received.lock().unwrap();
+    // recv[0]=turn1, recv[1]=turn2 orphan, recv[2]=turn2 repaired
+    assert!(
+        recv.len() >= 3,
+        "应有 turn1 + turn2-orphan + turn2-repaired 三次上游请求,实际 {}",
+        recv.len()
+    );
+    let repaired: Value = serde_json::from_slice(recv.last().unwrap()).unwrap();
+    let rin = repaired["input"].as_array().unwrap();
+    assert!(
+        rin.iter()
+            .any(|it| it["type"] == "function_call" && it["call_id"] == "call_FIX"),
+        "重发请求 input 必须含拼回的 function_call: {repaired}"
+    );
+    assert!(
+        repaired.get("previous_response_id").is_none(),
+        "修复重发应去掉 previous_response_id"
+    );
+}

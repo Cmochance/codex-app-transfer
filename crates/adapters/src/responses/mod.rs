@@ -24,6 +24,8 @@ pub mod request;
 pub mod session;
 pub mod stream;
 pub mod tool_call_cache;
+// [MOC-234] responses passthrough orphan function_call 降级修复(store:false 上游)。
+pub mod tool_call_repair;
 
 pub use artifact_store::{global_tool_artifact_store, read_tool_artifact_raw, ToolArtifactStore};
 // [MOC-231/232] 上下文明细:类型 + 计算入口 + 异步落盘/读取。request.rs 在转换末尾起
@@ -52,6 +54,9 @@ pub use stream::{
     convert_chat_to_responses_stream_with_session,
 };
 pub use tool_call_cache::{global_tool_call_cache, ToolCallCache, ToolCallEntry};
+pub use tool_call_repair::{
+    global_tool_call_repair_cache, repair_orphan_tool_calls, ToolCallRepairCache,
+};
 
 use codex_app_transfer_registry::Provider;
 use http::{HeaderMap, StatusCode};

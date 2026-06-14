@@ -570,8 +570,49 @@ pub async fn forward_handler(
             );
             live_resp = Some(pair.0);
             outbound_headers_snapshot = pair.1;
+        } else if codex_app_transfer_adapters::is_orphan_function_call_error(&body_bytes) {
+            // [MOC-234] orphan function_call 400 降级:store:false 反代(new-api 类)续轮找不到
+            // 自己上一轮产生的 function_call。用本地 tool-call 缓存把缺失的 function_call 拼回
+            // input + 去掉 previous_response_id,透明重发一次,让续轮能继续(否则只能显示报错)。
+            // 缓存补不齐(命中不全 / 非该 body 形态)→ repair 返 None,退回保存原 4xx 显示错误。
+            match codex_app_transfer_adapters::repair_orphan_tool_calls_bytes(&plan.body) {
+                Some(repaired) => {
+                    telemetry.logs.add(
+                        "WARN",
+                        format!(
+                            "orphan function_call 400 for provider {} — spliced cached function_call(s) + dropped previous_response_id, retrying...",
+                            resolved.provider.id
+                        ),
+                    );
+                    plan.body = repaired; // 反映实际重发的 body 到 trace/diag
+                    let pair = build_and_send_upstream(
+                        &state,
+                        &parts.method,
+                        &parts.headers,
+                        &resolved,
+                        &plan.body,
+                        &plan.upstream_headers,
+                        &upstream_url,
+                    )
+                    .await?;
+                    telemetry.logs.add(
+                        "INFO",
+                        format!(
+                            "orphan function_call retry status {} for provider {}",
+                            pair.0.status().as_u16(),
+                            resolved.provider.id
+                        ),
+                    );
+                    live_resp = Some(pair.0);
+                    outbound_headers_snapshot = pair.1;
+                }
+                None => {
+                    // 缓存补不齐(如 proxy 重启丢了上一轮、或非 responses body)→ 不重试。
+                    captured_4xx = Some((st, hs, body_bytes));
+                }
+            }
         } else {
-            // 非 web_search 4xx,resp 已被 bytes() 消费,把三元组保存
+            // 非 web_search / 非可修复 orphan 的 4xx,resp 已被 bytes() 消费,把三元组保存
             captured_4xx = Some((st, hs, body_bytes));
         }
     }
