@@ -84,7 +84,7 @@ Codex App Transfer 是一个面向 **OpenAI Codex APP** 的轻量桌面配置 + 
   - **Agents**:HOME 下非敏感 `AGENTS.md` raw 全文 read/write + 文件系统选择;系统目录 / 凭据目录会被拒绝,按 `.git/` 自动分类 project-root / subdir 显示 chip
   - **Memories**:固定管理 `~/.codex/memories/MEMORY.md`(主索引)+ `memory_summary.md`(摘要),也可添加 HOME 下非敏感项目 `MEMORY.md`;系统目录 / 凭据目录会被拒绝
   - **Skills**:扫描 `~/.codex/skills/<name>/SKILL.md` 全列表 raw 编辑,并强制限制在 skills 根目录内;"打开文件夹"按钮调系统 `open` 让用户在 Finder/资源管理器 改 SKILL.md 之外的子文件(scripts / examples / templates 等)
-  - **MCP**:结构化 JSON 编辑 `~/.codex/config.toml` 的 `[mcp_servers.*]` 节(`toml_edit` round-trip 保留注释 + 其他配置节)+ Plugins 子页扫 `~/.codex/plugins/cache/` 列已安装 plugin(enable toggle / uninstall);所有改动 atomic write + 独立 history 互不交叉(SHA-256 hash 路径)
+  - **MCP**:结构化 JSON 编辑 `~/.codex/config.toml` 的 `[mcp_servers.*]` 节(`toml_edit` round-trip 保留注释 + 其他配置节)+ Plugins 子页扫 `~/.codex/plugins/cache/` 列已安装 plugin(enable toggle / uninstall);所有改动 atomic write + 独立 history 互不交叉(SHA-256 hash 路径);**新增 / 编辑 / 一键添加 server 及 raw TOML 覆盖写盘前一律弹二次确认**(stdio 展示将以你账户权限在本机执行的命令、http 展示连接地址),防误改、无免确认白名单(MOC-106)
 - 实时日志面板,2 秒自动刷新;统一 `tracing::warn!(error_id, detail)` + 稳定 token,operator 可 grep / 聚合
 - 反馈弹窗附带诊断材料(环境信息、脱敏配置、最近错误快照及完整请求 / 响应),减少手工补材料
 - 中文 / 英文界面,浅色 / 深色 / 绿色 / 橙色 / 灰色 / 白色多种主题

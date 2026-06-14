@@ -5547,6 +5547,20 @@
     if (el) el.hidden = true;
   }
 
+  // 写 MCP server 进 ~/.codex/config.toml 前的二次确认文案(MOC-106)。
+  // 所有新增 / 编辑一律确认,没有免确认白名单 —— stdio 强调"会以你的权限在本机执行"
+  // (config 即可 spawn 任意命令,黑名单只是 guardrail),http 列出连接地址防误填。
+  function codexMcpBuildSaveConfirm(spec) {
+    const name = spec.name || "";
+    if (spec.transport === "stdio") {
+      const cmdline = [spec.command || "", ...(Array.isArray(spec.args) ? spec.args : [])]
+        .join(" ")
+        .trim();
+      return tFmt("codex.mcp.saveConfirmStdio", { name, cmdline });
+    }
+    return tFmt("codex.mcp.saveConfirmHttp", { name, url: spec.url || "" });
+  }
+
   async function codexMcpJsonSave() {
     const ta = $("#codexMcpJsonTextarea");
     if (!ta) return;
@@ -5600,6 +5614,7 @@
       enabledTools: Array.isArray(parsed.enabledTools ?? parsed.enabled_tools) ? (parsed.enabledTools ?? parsed.enabled_tools) : null,
       disabledTools: Array.isArray(parsed.disabledTools ?? parsed.disabled_tools) ? (parsed.disabledTools ?? parsed.disabled_tools) : null,
     };
+    if (!window.confirm(codexMcpBuildSaveConfirm(spec))) return;
     try {
       const r = await fetch("/api/codex/mcp/servers", {
         method: "POST",
@@ -5732,6 +5747,8 @@
   async function codexMcpRawApply() {
     const ta = $("#codexMcpRawTextarea");
     if (!ta) return;
+    // raw 模式整体覆盖 ~/.codex/config.toml(含 [mcp_servers.*] command),同样需二次确认(MOC-106)。
+    if (!window.confirm(t("codex.mcp.rawApplyConfirm"))) return;
     try {
       const r = await fetch("/api/codex/mcp/config/raw", {
         method: "POST",
@@ -6010,6 +6027,7 @@
       spec.url = item.url || "";
       spec.bearerTokenEnvVar = item.bearerTokenEnvVar || null;
     }
+    if (!window.confirm(codexMcpBuildSaveConfirm(spec))) return;
     try {
       const r = await fetch("/api/codex/mcp/servers", {
         method: "POST",
