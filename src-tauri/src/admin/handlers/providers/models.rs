@@ -210,26 +210,38 @@ fn extract_model_ids(payload: &Value) -> Vec<String> {
     ids
 }
 
-fn usable_model_ids(model_ids: &[String]) -> Vec<String> {
-    const EXCLUDE: &[&str] = &[
-        "embedding",
-        "rerank",
-        "moderation",
-        "whisper",
-        "tts",
-        "image",
-        "vision",
-        "audio",
-    ];
-    let usable: Vec<String> = model_ids
+/// 非 chat 模型关键词(embedding / rerank / 语音 / 图像 等)—— 这些不能服务 chat 请求。
+const NON_CHAT_MODEL_KEYWORDS: &[&str] = &[
+    "embedding",
+    "rerank",
+    "moderation",
+    "whisper",
+    "tts",
+    "image",
+    "vision",
+    "audio",
+];
+
+/// 只保留可用于 chat 的模型 id(过滤 embedding/rerank/语音/图像);**全被过滤则返回空**
+/// (不 fallback 原列表)。池化 pooledModels 用它 —— 否则只含 embedding 的 provider 会把
+/// 这些模型写进池、出现在 Codex chat picker 并把 chat 请求路由到不支持的端点(bot review P2)。
+fn chat_usable_model_ids(model_ids: &[String]) -> Vec<String> {
+    model_ids
         .iter()
         .filter(|model_id| {
             let lower = model_id.to_ascii_lowercase();
-            !EXCLUDE.iter().any(|keyword| lower.contains(keyword))
+            !NON_CHAT_MODEL_KEYWORDS
+                .iter()
+                .any(|keyword| lower.contains(keyword))
         })
         .cloned()
-        .collect();
+        .collect()
+}
+
+fn usable_model_ids(model_ids: &[String]) -> Vec<String> {
+    let usable = chat_usable_model_ids(model_ids);
     if usable.is_empty() {
+        // suggest_model_mappings 等场景:全被过滤时退回原列表,保证映射下拉不空。
         model_ids.to_vec()
     } else {
         usable
@@ -613,7 +625,9 @@ pub async fn autofill_provider_models(
         .and_then(|v| v.as_array())
         .map(|arr| {
             let ids: Vec<String> = arr.iter().filter_map(model_id_from_item).collect();
-            usable_model_ids(&ids)
+            // 池化用 no-fallback 过滤:全是 embedding/rerank 等时返回空,不把非 chat 模型写进池
+            // (否则出现在 Codex chat picker 并把 chat 路由到不支持的端点,bot review P2)。
+            chat_usable_model_ids(&ids)
         })
         .unwrap_or_default();
 

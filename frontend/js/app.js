@@ -1136,6 +1136,21 @@
     }
     if (includeModels) {
       payload.models = mappings;
+      // 池化:把当前下拉里的模型列表(进编辑页 seed 自持久化 pooledModels、点「获取模型」后
+      // 刷新/合并过)一并作为 pooledModels 持久化 —— 否则 fetch-form-models + 保存后池子拿不到
+      // 完整列表、回退槽位(bot review P2;也满足「添加 provider 时记录已获取模型」)。
+      // 空(从未获取且无持久化)→ 不下发,后端保留现值。
+      const pooled = [
+        ...new Set(
+          providerAvailableModels
+            .map(modelEntryId)
+            .map((s) => String(s || "").trim())
+            .filter(Boolean)
+        ),
+      ];
+      if (pooled.length) {
+        payload.pooledModels = pooled;
+      }
     }
     // R1 PR-7:apiFormat=grok_web 时打包 extra.grokWeb(cookies + statsigId)。
     // Provider 后端 schema 用 `#[serde(flatten)] extra`,任何不在已知字段的 key
