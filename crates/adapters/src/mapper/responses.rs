@@ -167,28 +167,32 @@ fn build_observe_metadata(client_path: &str, body: &Bytes) -> Option<Value> {
         spawn_compute_and_persist_responses(instructions, assembled, tools, conv_id.to_owned());
     }
 
-    Some(serde_json::json!({
-        "passthrough_observe": {
-            "prev_id": prev_id,
-            "input_items": input_items,
-        }
-    }))
+    // typed → Value(见 ObserveCtx doc),response 侧 from_value 还原。
+    let ctx = ObserveCtx {
+        prev_id,
+        input_items,
+    };
+    Some(serde_json::json!({ "passthrough_observe": serde_json::to_value(&ctx).ok()? }))
 }
 
-/// 从 `RequestPlan.adapter_metadata` 取出 response 侧记录所需的 (prev_id, 本轮 input items)。
+/// request→response 侧内部通道载荷(经 `RequestPlan.adapter_metadata` 的
+/// `passthrough_observe` 字段透传)。用 typed struct 而非手搓 JSON:producer
+/// (`build_observe_metadata`)与 consumer(`observe_ctx_from_plan`)共用同一定义,
+/// 字段漂移即编译错(对齐 `mapper::anthropic_messages` 的 `AnthropicToolNameMaps` 模式)。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ObserveCtx {
+    /// 本轮请求的 `previous_response_id`(无则 None)。
+    prev_id: Option<String>,
+    /// 本轮 input items(供 response 侧拿到 response_id 后连同 output 一起记进镜像)。
+    input_items: Vec<Value>,
+}
+
+/// 从 `RequestPlan.adapter_metadata` 取出 response 侧记录所需的观测上下文。
 /// 无观测上下文(面板关 / compact / parse 失败)→ None,response 侧不套 tee。
 fn observe_ctx_from_plan(plan: &RequestPlan) -> Option<(Option<String>, Vec<Value>)> {
     let obs = plan.adapter_metadata.as_ref()?.get("passthrough_observe")?;
-    let prev_id = obs
-        .get("prev_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let input_items = obs
-        .get("input_items")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Some((prev_id, input_items))
+    let ctx: ObserveCtx = serde_json::from_value(obs.clone()).ok()?;
+    Some((ctx.prev_id, ctx.input_items))
 }
 
 /// 单条 SSE `data:` 行(`response.completed` event)在被解析前允许在行缓冲里累积的上限。
@@ -202,6 +206,10 @@ const MAX_OBSERVE_PENDING_LINE: usize = 8 * 1024 * 1024;
 struct ObserveTeeStream {
     inner: ByteStream,
     line_buf: Vec<u8>,
+    /// 已扫过、确认其中无 `\n` 的前缀长度。下个 chunk 只从这里起扫新增字节,避免
+    /// 每 chunk 全量重扫 —— 否则巨型单行 `response.completed`(数 MB)跨大量小 chunk
+    /// 到达时会退化成 O(n²)(code review 指出)。
+    scan_pos: usize,
     prev_id: Option<String>,
     input_items: Vec<Value>,
     recorded: bool,
@@ -213,6 +221,7 @@ impl ObserveTeeStream {
         Self {
             inner,
             line_buf: Vec::new(),
+            scan_pos: 0,
             prev_id,
             input_items,
             recorded: false,
@@ -221,22 +230,37 @@ impl ObserveTeeStream {
     }
 
     /// 把一个 chunk 喂进行缓冲,抽出完整行逐行处理(找 `response.completed`)。
+    /// 用 `scan_pos` 只扫新增字节找 `\n`(线性);找到则 drain 该行、游标归零续扫剩余。
     fn feed(&mut self, chunk: &[u8]) {
         if self.recorded || self.gave_up {
             return;
         }
         self.line_buf.extend_from_slice(chunk);
-        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
-            self.process_line(&line[..line.len().saturating_sub(1)]);
-            if self.recorded {
-                return;
+        loop {
+            match self.line_buf[self.scan_pos..]
+                .iter()
+                .position(|&b| b == b'\n')
+            {
+                Some(rel) => {
+                    let nl = self.scan_pos + rel;
+                    let line: Vec<u8> = self.line_buf.drain(..=nl).collect();
+                    self.process_line(&line[..line.len().saturating_sub(1)]);
+                    self.scan_pos = 0; // 头部已 drain,剩余从头继续扫
+                    if self.recorded {
+                        return;
+                    }
+                }
+                None => {
+                    self.scan_pos = self.line_buf.len(); // 全扫过、暂无 `\n`,下个 chunk 接着扫
+                    break;
+                }
             }
         }
         // 无换行的超长 pending 行(病态)→ 放弃,防无界增长。
         if self.line_buf.len() > MAX_OBSERVE_PENDING_LINE {
             self.gave_up = true;
             self.line_buf = Vec::new();
+            self.scan_pos = 0;
         }
     }
 

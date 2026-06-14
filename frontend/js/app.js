@@ -3320,9 +3320,10 @@
 
   async function saveProviderFromForm() {
     const payload = providerPayloadFromForm(true);
-    // Responses 透传协议(direct mode)必须填齐 baseUrl + apiKey,否则 backend
-    // 会 silent fallback 到 local_proxy → Codex.app 经代理 → 行为偏离用户预期。
-    // 前端拦下让用户立即看到错误,而不是后端 fallback 后用户毫无察觉。
+    // Responses 透传协议必须填齐 baseUrl + apiKey:[MOC-234] responses 现统一经
+    // 本地代理做 1:1 字节透传(不再 direct 直连),baseUrl = 代理转发的上游地址、
+    // apiKey = 代理按 provider 注入的上游凭据,缺任一上游都无法转发。前端拦下让
+    // 用户立即看到错误,而不是保存一个转发必失败的 provider。
     if (payload.apiFormat === "responses" || payload.apiFormat === "openai_responses") {
       if (!payload.baseUrl) {
         throw new Error(t("toast.directModeBaseUrlRequired"));

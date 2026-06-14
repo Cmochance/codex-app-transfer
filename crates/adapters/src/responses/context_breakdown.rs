@@ -12,8 +12,13 @@
 //! 圆环是模型侧 usage、本模块是 proxy 侧发送内容的逐段归因,测量点不同 —— 面板用本模块
 //! 自洽的总数。
 //!
-//! **边界**:仅 adapter 转换路径(openai_chat/gemini/anthropic 等第三方)proxy 持有
-//! 完整拼接上下文、可精确分类;官方 ChatGPT 走 passthrough 不解析 body,算不了。
+//! **边界**:
+//! - chat 转换路径(openai_chat/gemini/anthropic 等)proxy 持有完整拼接 chat 上下文,
+//!   用本模块 [`compute_context_breakdown`](chat 形)分类。
+//! - [MOC-234] responses 1:1 passthrough 路径用 [`compute_context_breakdown_responses`]
+//!   (responses 原生形,不经 chat 转换),全历史由独立的只读会话观测镜像
+//!   ([`crate::responses::passthrough_observe`])沿 `previous_response_id` 链重建。
+//! - 官方 ChatGPT relay backend 透传不解析 body,仍算不了。
 
 use std::fs;
 use std::path::PathBuf;
@@ -257,6 +262,11 @@ pub fn compute_context_breakdown_responses(
 ) -> ContextBreakdown {
     let mut acc = Acc::default();
 
+    // 顶层 instructions 按 XML 标签启发式分 system_prompt / developer。**parity 假设**:
+    // 与 chat 路径(`is_developer_block(message_text(msg))`)同一启发式 —— Codex 通常把
+    // base 指令放顶层 instructions(无标签 → system_prompt)、把权限/env/AGENTS 块放独立
+    // developer message(带标签 → developer)。若未来 Codex 把这些标签内联进 instructions,
+    // 两路会对语义等价内容给出不同归类(仅面板分桶差异,不影响转发 / 总数)。
     if let Some(text) = instructions.filter(|s| !s.is_empty()) {
         let slot = if is_developer_block(text) {
             &mut acc.developer
@@ -639,6 +649,23 @@ mod tests {
         // 不 spawn、不落盘、不 panic。
         spawn_compute_and_persist(
             sample_messages(),
+            sample_tools(),
+            "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+        );
+    }
+
+    #[test]
+    fn spawn_compute_and_persist_responses_noop_guards() {
+        // responses 变体共用同一 is_safe / no-runtime guard:非法 uuid + 无 runtime 均 no-op、不 panic。
+        spawn_compute_and_persist_responses(
+            Some("You are Codex.".to_owned()),
+            sample_responses_items(),
+            sample_tools(),
+            "not-a-uuid".to_owned(),
+        );
+        spawn_compute_and_persist_responses(
+            None,
+            sample_responses_items(),
             sample_tools(),
             "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
         );

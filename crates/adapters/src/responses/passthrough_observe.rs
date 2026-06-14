@@ -199,12 +199,26 @@ mod tests {
     }
 
     #[test]
-    fn cap_evicts_oldest() {
+    fn records_independent_turns_without_collision() {
         let s = PassthroughObserveStore::new();
-        // 不超过 MAX_TURNS 时全留(此处只验证 len 累加 + 不串)
         for i in 0..10 {
             s.record_turn(&format!("r{i}"), None, vec![item("x")]);
         }
         assert_eq!(s.len(), 10);
+    }
+
+    #[test]
+    fn cap_evicts_when_over_max_turns() {
+        // 真正灌过 MAX_TURNS,验证 evict_oldest 把总量封顶(reviewer:原测试只插 10 条、
+        // 没触达 cap,名不副实)。
+        let s = PassthroughObserveStore::new();
+        for i in 0..(super::MAX_TURNS + 5) {
+            s.record_turn(&format!("r{i}"), None, vec![item("x")]);
+        }
+        assert_eq!(
+            s.len(),
+            super::MAX_TURNS,
+            "超过 MAX_TURNS 必须顶出最旧、总量封顶"
+        );
     }
 }
