@@ -62,9 +62,6 @@ pub fn responses_body_to_gemini_request(
 pub struct GeminiResponsesRequestConversion {
     pub request: RequestBody,
     pub response_session: ResponseSessionPlan,
-    /// [MOC-231] 上下文 by-source 明细(由内部 chat 转换算出,见 responses::context_breakdown)。
-    /// cloud_code/antigravity mapper 经 RequestPlan.adapter_metadata 带给 proxy 写 telemetry。
-    pub context_breakdown: Option<crate::responses::ContextBreakdown>,
 }
 
 /// Codex.app /responses body → Gemini RequestBody + ResponseSessionPlan。
@@ -105,7 +102,8 @@ pub fn responses_body_to_gemini_request_with_session(
             None,
             session_cache,
         )?;
-    let context_breakdown = responses_conversion.context_breakdown;
+    // [MOC-232] context_breakdown 已在 with_session 内部起 spawn_blocking 后台算 + 落盘,
+    // 此处不再读取/透传(搬离转发关键路径)。
     let merged_messages = responses_conversion.response_session.messages;
     let normalized_messages = responses_conversion
         .body
@@ -123,7 +121,6 @@ pub fn responses_body_to_gemini_request_with_session(
             response_id: response_id_for_session(),
             messages: merged_messages,
         },
-        context_breakdown,
     })
 }
 

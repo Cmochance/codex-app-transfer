@@ -221,84 +221,9 @@ impl Default for ProxyTelemetry {
     }
 }
 
-/// [MOC-231] 上下文 by-source 明细的**按对话持久 store**(磁盘):
-/// `~/.codex-app-transfer/context-breakdown/<conversation_id>.json`。
-///
-/// `conversation_id` = Codex 请求的 `prompt_cache_key`(== rollout 文件名 uuid ==
-/// renderer fiber 的 conversationId,2026-06-14 实证三者一致)。proxy 在 forward 完成时
-/// 按该 uuid 写盘(producer),quota injector daemon 按**活动会话 uuid**(fiber 回读)读盘
-/// (consumer)。磁盘持久 → transfer 重启即用、不需新对话;小 JSON → 读取快;按 uuid 隔离
-/// → 切对话不串(对齐 MOC-230 累计/缓存的对话隔离)。
-fn context_breakdown_dir() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("context-breakdown"))
-}
-
-/// 校验 conversation_id 是规范 uuid(防路径穿越:只允许 hex + 连字符、长度 36)。
-fn is_safe_conversation_id(id: &str) -> bool {
-    id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
-}
-
-/// 按对话 uuid 持久化明细(best-effort:失败不影响主转发路径)。
-pub fn persist_context_breakdown(conversation_id: &str, breakdown: &serde_json::Value) {
-    if !is_safe_conversation_id(conversation_id) {
-        return;
-    }
-    let Some(dir) = context_breakdown_dir() else {
-        return;
-    };
-    // best-effort:失败不影响转发主路径,但记 debug 便于区分「该对话还没经过 proxy」(正常,
-    // 不显面板)与「写盘一直失败」(权限/磁盘满 → 面板永不显 → 否则无从诊断)。
-    if let Err(e) = fs::create_dir_all(&dir) {
-        tracing::debug!(error = %e, "context_breakdown 持久化建目录失败");
-        return;
-    }
-    let path = dir.join(format!("{conversation_id}.json"));
-    match serde_json::to_vec(breakdown) {
-        Ok(bytes) => {
-            if let Err(e) = fs::write(&path, bytes) {
-                tracing::debug!(error = %e, path = %path.display(), "context_breakdown 持久化写盘失败");
-            }
-        }
-        Err(e) => tracing::debug!(error = %e, "context_breakdown 序列化失败"),
-    }
-}
-
-/// 按对话 uuid 读最近持久化的明细(quota injector daemon 每 tick 按活动会话读)。
-pub fn load_context_breakdown(conversation_id: &str) -> Option<serde_json::Value> {
-    if !is_safe_conversation_id(conversation_id) {
-        return None;
-    }
-    let path = context_breakdown_dir()?.join(format!("{conversation_id}.json"));
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
-}
-
-/// [MOC-231] GC `context-breakdown/` 下 mtime 超 `max_age` 的明细文件。每对话一个小 JSON、
-/// 无上限会随历史对话数长期累积;陈旧对话的明细本就过时,删了下次有请求会重建。best-effort,
-/// 启动时跑一次(对齐 sessions/trash 的 retention 思路)。
-pub fn gc_context_breakdown(max_age: std::time::Duration) {
-    let Some(dir) = context_breakdown_dir() else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return; // 目录还不存在 = 没持久化过,正常
-    };
-    let now = std::time::SystemTime::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let too_old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|mt| now.duration_since(mt).ok())
-            .is_some_and(|age| age > max_age);
-        if too_old {
-            let _ = fs::remove_file(&path);
-        }
-    }
-}
+// [MOC-232] 上下文 by-source 明细的持久 store(dir / is_safe_conversation_id / persist /
+// load / gc)已迁到 `adapters::responses::context_breakdown` —— 计算改 adapter 内
+// spawn_blocking 后台跑,compute 与 persist 同处 adapters、数据流最短(proxy 不再触碰)。
 
 static TELEMETRY: OnceLock<ProxyTelemetry> = OnceLock::new();
 
@@ -314,27 +239,8 @@ pub fn proxy_log_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn breakdown_conversation_id_rejects_path_traversal() {
-        // [MOC-231] 持久化文件名直接来自 conversation_id(prompt_cache_key),必须严格校验
-        // 是规范 uuid,否则恶意/畸形 id 能写到任意路径。合法 uuid 通过:
-        assert!(is_safe_conversation_id(
-            "019ec12f-eef0-7971-9bc8-ee9f0c21b5df"
-        ));
-        // 路径穿越 / 斜杠 / 非 hex / 错长度 / 带后缀 一律拒绝:
-        assert!(!is_safe_conversation_id("../../etc/passwd"));
-        assert!(!is_safe_conversation_id(
-            "019ec12f/eef0-7971-9bc8-ee9f0c21b5df"
-        ));
-        assert!(!is_safe_conversation_id(".."));
-        assert!(!is_safe_conversation_id(""));
-        assert!(!is_safe_conversation_id(
-            "019ec12f-eef0-7971-9bc8-ee9f0c21b5df.json"
-        ));
-        assert!(!is_safe_conversation_id(
-            "z19ec12f-eef0-7971-9bc8-ee9f0c21b5dz"
-        ));
-    }
+    // [MOC-232] uuid 校验测试随 store 一起迁到
+    // `adapters::responses::context_breakdown`(is_safe_conversation_id_rejects_path_traversal_and_bad_shape)。
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

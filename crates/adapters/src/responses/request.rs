@@ -23,7 +23,7 @@
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Map, Value};
 
-use super::context_breakdown::{breakdown_enabled, compute_context_breakdown, ContextBreakdown};
+use super::context_breakdown::{breakdown_enabled, spawn_compute_and_persist};
 use super::session::ResponseSessionCache;
 use crate::core::input::{
     merge_messages_with_previous_response, response_id_for_session, MergeResult,
@@ -37,9 +37,6 @@ pub struct ResponsesBodyConversion {
     /// `true` 表示 `previous_response_id` cache miss 后降级为仅本轮 messages，
     /// 历史已丢失。调用方可据此在响应 header 中注入信号。
     pub history_lost: bool,
-    /// [MOC-231] 本次发往上游的 chat 上下文 by-source 明细(已拼接历史 + dedupe 后)。
-    /// 由 mapper 经 `RequestPlan.adapter_metadata` 带给 proxy → 写 telemetry → CDP 注入面板。
-    pub context_breakdown: Option<ContextBreakdown>,
 }
 
 const TOOL_OUTPUT_INLINE_MAX_CHARS: usize = 4_000;
@@ -322,25 +319,30 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     sanitize_chat_body_for_provider(&mut result, provider);
 
     // [MOC-231] 在最终 chat body 定型(merge 历史 + dedupe 瘦身 + sanitize)后,对即将
-    // 发往上游的 messages + tools 算 by-source 明细。空 messages 不该走到这里(见上方
-    // PreviousResponseNotFound 注释),保险起见 messages 缺失则不产出明细。
-    // [MOC-231 perf] 面板关闭(默认)时跳过 o200k 逐 item tokenize —— 不在每个转发请求热
-    // 路径上白付计算(breakdown 是展示特性,由 quota daemon 按 codexQuotaEnabled 开门禁)。
-    let context_breakdown = if breakdown_enabled() {
-        result
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(|messages| {
-                let tools = result
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                compute_context_breakdown(messages, tools)
-            })
-    } else {
-        None
-    };
+    // 发往上游的 messages + tools 算 by-source 明细(供 Codex Desktop 上下文面板)。
+    // [MOC-231 perf] 面板关闭(默认)时整段跳过,零开销。
+    // [MOC-232] 开启时也**不在转发关键路径上同步算** —— 起 spawn_blocking 后台算 o200k
+    // 逐 item tokenize + 按对话 uuid 落盘(实测同步算 404k 上下文 ~1s 卡 TTFB)。
+    // conv_id = 入站 `prompt_cache_key`(== rollout 文件名 == renderer fiber 的 conversationId)。
+    //
+    // **仅在 `session_cache.is_some()`(主转发产出、已恢复全历史的那次)才算**:gemini_native
+    // 会用 `session_cache=None` 再调本 fn 做 chat-shape 归一化子路径(只含当前轮、无历史),
+    // 非 session wrapper 同理。若那些也 spawn,无历史的那次会与带全历史的主产出竞争原子落盘
+    // (rename 顺序不定可能让无历史者胜出),导致 gemini/cloud_code 多轮对话面板只显当前轮
+    // (code review 实证)。
+    if breakdown_enabled() && session_cache.is_some() {
+        if let (Some(messages), Some(conv_id)) = (
+            result.get("messages").and_then(Value::as_array).cloned(),
+            input.get("prompt_cache_key").and_then(Value::as_str),
+        ) {
+            let tools = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            spawn_compute_and_persist(messages, tools, conv_id.to_owned());
+        }
+    }
 
     Ok(ResponsesBodyConversion {
         body: Value::Object(result),
@@ -349,7 +351,6 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
             messages: session_messages,
         },
         history_lost,
-        context_breakdown,
     })
 }
 

@@ -15,9 +15,13 @@
 //! **边界**:仅 adapter 转换路径(openai_chat/gemini/anthropic 等第三方)proxy 持有
 //! 完整拼接上下文、可精确分类;官方 ChatGPT 走 passthrough 不解析 body,算不了。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::time::Duration;
 
+use codex_app_transfer_registry::config_dir;
 use serde::Serialize;
 use serde_json::Value;
 use tiktoken_rs::CoreBPE;
@@ -226,6 +230,132 @@ pub fn compute_context_breakdown(messages: &[Value], tools: &[Value]) -> Context
     }
 }
 
+// ───────────────── [MOC-231/232] 按对话持久 store + 异步搬离关键路径 ─────────────────
+//
+// [MOC-231] 明细按**对话 uuid** 落盘 `~/.codex-app-transfer/context-breakdown/<uuid>.json`:
+// `uuid` = Codex 请求的 `prompt_cache_key`(== rollout 文件名 == renderer fiber 的
+// conversationId)。producer 是本模块(adapter prepare_request 路径),consumer 是 quota
+// injector daemon 按**活动会话 uuid** 读盘。磁盘持久 → 重启即用;小 JSON → 读取快;按
+// uuid 隔离 → 切对话不串。
+//
+// [MOC-232] store 从 `proxy::telemetry` 迁来 + 计算改 `spawn_blocking` 后台跑:原先在
+// `prepare_request` 同步算(面板开时 404k 上下文 ~1s 卡 TTFB),现搬离转发关键路径;
+// compute 与 persist 同处 adapters,数据流最短(不再经 adapter_metadata 透传 ~1.5MB)。
+// persist 用原子 rename,同对话并发后台任务最新者胜出(面板不卡旧轮)。
+
+/// 明细持久目录:`<config_dir>/context-breakdown/`。
+fn context_breakdown_dir() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("context-breakdown"))
+}
+
+/// 校验 conversation_id 是规范 uuid(防路径穿越:只允许 hex + 连字符、长度 36)。
+fn is_safe_conversation_id(id: &str) -> bool {
+    id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// temp 文件名后缀计数器(同进程内唯一,避免并发后台任务的 temp 互撞)。
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 按对话 uuid 持久化明细(best-effort:失败不影响计算/转发)。
+///
+/// [MOC-232] **原子写**:先写唯一 temp 再 `rename` 覆盖目标(同目录 rename 原子)。同一对话
+/// 的并发后台任务(web_search retry / 大上下文后跟快速 auto-turn)各写各的 temp、各自 rename,
+/// 最后 rename 的胜出(面板取最新);避免非原子 `fs::write` 被 consumer 读到半截 JSON,也无需
+/// 丢弃新快照的 in-flight 去重(那会让面板卡在上一轮,code review P2)。
+fn persist_context_breakdown(conversation_id: &str, breakdown: &Value) {
+    if !is_safe_conversation_id(conversation_id) {
+        return;
+    }
+    let Some(dir) = context_breakdown_dir() else {
+        return;
+    };
+    if let Err(e) = fs::create_dir_all(&dir) {
+        tracing::debug!(error = %e, "context_breakdown 持久化建目录失败");
+        return;
+    }
+    let bytes = match serde_json::to_vec(breakdown) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, "context_breakdown 序列化失败");
+            return;
+        }
+    };
+    let path = dir.join(format!("{conversation_id}.json"));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        "{conversation_id}.{}.{seq}.tmp",
+        std::process::id()
+    ));
+    if let Err(e) = fs::write(&tmp, &bytes) {
+        tracing::debug!(error = %e, "context_breakdown 写 temp 失败");
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        tracing::debug!(error = %e, path = %path.display(), "context_breakdown rename 失败");
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// 按对话 uuid 读最近持久化的明细(quota injector daemon 每 tick 按活动会话读)。
+pub fn load_context_breakdown(conversation_id: &str) -> Option<Value> {
+    if !is_safe_conversation_id(conversation_id) {
+        return None;
+    }
+    let path = context_breakdown_dir()?.join(format!("{conversation_id}.json"));
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// [MOC-231] GC `context-breakdown/` 下 mtime 超 `max_age` 的明细文件。best-effort,
+/// 启动时跑一次(陈旧对话的明细本就过时,删了下次有请求会重建)。
+pub fn gc_context_breakdown(max_age: Duration) {
+    let Some(dir) = context_breakdown_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return; // 目录还不存在 = 没持久化过,正常
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let too_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mt| now.duration_since(mt).ok())
+            .is_some_and(|age| age > max_age);
+        if too_old {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// [MOC-232] 把 o200k 逐 item tokenize + 持久化搬到 `spawn_blocking` 后台跑,
+/// **不阻塞转发关键路径**(实测面板开时 404k 上下文同步算 ~1s)。
+///
+/// - conv_id 非规范 uuid → 直接返回(省掉无谓 tokenize,反正 persist 也会拦)。
+/// - 无 tokio runtime(单测 / 非 async 调用)→ 直接返回,不计算、不 panic。
+/// - fire-and-forget:丢弃 JoinHandle,算完原子落盘,面板下一 tick 读到(consumer 是磁盘
+///   轮询、与本计算无同步握手,"晚到一拍"无副作用)。同对话多个后台任务(retry / 快速
+///   auto-turn)不做丢弃新快照的去重 —— 各自算各自原子 rename,最新者胜出,面板始终是最新轮
+///   (见 [`persist_context_breakdown`] 的原子写;code review P2)。
+pub fn spawn_compute_and_persist(messages: Vec<Value>, tools: Vec<Value>, conv_id: String) {
+    if !is_safe_conversation_id(&conv_id) {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn_blocking(move || {
+        let breakdown = compute_context_breakdown(&messages, &tools);
+        if let Ok(v) = serde_json::to_value(&breakdown) {
+            persist_context_breakdown(&conv_id, &v);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +437,42 @@ mod tests {
         assert!(by_key.contains_key(keys::TOOL_CALLS));
         // tool_calls 主体不含 reasoning_content 文本(已 remove)
         assert!(!by_key.contains_key(keys::MESSAGES));
+    }
+
+    #[test]
+    fn is_safe_conversation_id_rejects_path_traversal_and_bad_shape() {
+        // 规范 uuid(36 = 32 hex + 4 连字符)放行
+        assert!(is_safe_conversation_id(
+            "01234567-89ab-cdef-0123-456789abcdef"
+        ));
+        // 路径穿越 / 含分隔符 / 非 hex / 长度不符一律拒(防写到 context-breakdown/ 外)
+        assert!(!is_safe_conversation_id("../../etc/passwd"));
+        assert!(!is_safe_conversation_id(
+            "01234567/89ab/cdef/0123/456789abcdef"
+        )); // 36 但含 /
+        assert!(!is_safe_conversation_id(
+            "01234567-89ab-cdef-0123-456789abcde"
+        )); // 35
+        assert!(!is_safe_conversation_id(
+            "zzzzzzzz-89ab-cdef-0123-456789abcdef"
+        )); // 非 hex
+        assert!(!is_safe_conversation_id(""));
+    }
+
+    #[test]
+    fn spawn_compute_and_persist_invalid_uuid_is_noop() {
+        // 非法 conv_id → is_safe 提前拦截,不 insert IN_FLIGHT、不 spawn、不落盘、不 panic。
+        spawn_compute_and_persist(sample_messages(), sample_tools(), "not-a-uuid".to_owned());
+    }
+
+    #[test]
+    fn spawn_compute_and_persist_no_runtime_is_noop_not_panic() {
+        // 合法 uuid 但无 tokio runtime(普通 #[test])→ Handle::try_current 失败 → 直接返回,
+        // 不 spawn、不落盘、不 panic。
+        spawn_compute_and_persist(
+            sample_messages(),
+            sample_tools(),
+            "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+        );
     }
 }

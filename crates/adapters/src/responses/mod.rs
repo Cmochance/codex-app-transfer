@@ -24,9 +24,11 @@ pub mod stream;
 pub mod tool_call_cache;
 
 pub use artifact_store::{global_tool_artifact_store, ToolArtifactStore};
-// [MOC-231] 上下文明细类型 + 计算入口(request.rs 算、mapper 经 adapter_metadata 带出)。
+// [MOC-231/232] 上下文明细:类型 + 计算入口 + 异步落盘/读取。request.rs 在转换末尾起
+// spawn_blocking 后台算并 persist(MOC-232 搬离转发关键路径),quota injector 读盘渲染。
 pub use context_breakdown::{
-    compute_context_breakdown, set_breakdown_enabled, BreakdownCategory, ContextBreakdown,
+    compute_context_breakdown, gc_context_breakdown, load_context_breakdown, set_breakdown_enabled,
+    spawn_compute_and_persist, BreakdownCategory, ContextBreakdown,
 };
 pub use converter::ChatToResponsesConverter;
 // [MOC-75] gemini_native 复用 chat 的 apply_patch input 解析(alt-key 容错一致)

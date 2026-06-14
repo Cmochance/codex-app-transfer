@@ -65,15 +65,11 @@ pub(crate) fn prepare_responses_request(
         .map_err(|e| AdapterError::Internal(format!("re-serialize: {e}")))?;
     // adapter_metadata 是 adapter→proxy 内部通道(不进 user-facing 协议):
     // - fix(#210 P1-1): history_lost → transform_response_stream 注入 X-Session-History-Lost header
-    // - [MOC-231]: context_breakdown → proxy 写 telemetry → CDP 注入 Codex 上下文明细面板
+    // [MOC-232] context_breakdown 不再经此透传 —— 改由 responses::request 内
+    // spawn_blocking 后台算并直接按对话 uuid 落盘(搬离转发关键路径,见 context_breakdown.rs)。
     let mut metadata = serde_json::Map::new();
     if conversion.history_lost {
         metadata.insert("history_lost".into(), serde_json::json!(true));
-    }
-    if let Some(breakdown) = &conversion.context_breakdown {
-        if let Ok(v) = serde_json::to_value(breakdown) {
-            metadata.insert("context_breakdown".into(), v);
-        }
     }
     let adapter_metadata = if metadata.is_empty() {
         None
