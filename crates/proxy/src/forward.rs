@@ -572,15 +572,16 @@ pub async fn forward_handler(
             outbound_headers_snapshot = pair.1;
         } else if codex_app_transfer_adapters::is_orphan_function_call_error(&body_bytes) {
             // [MOC-234] orphan function_call 400 降级:store:false 反代(new-api 类)续轮找不到
-            // 自己上一轮产生的 function_call。用本地 tool-call 缓存把缺失的 function_call 拼回
-            // input + 去掉 previous_response_id,透明重发一次,让续轮能继续(否则只能显示报错)。
-            // 缓存补不齐(命中不全 / 非该 body 形态)→ repair 返 None,退回保存原 4xx 显示错误。
-            match codex_app_transfer_adapters::repair_orphan_tool_calls_bytes(&plan.body) {
+            // 自己上一轮产生的 function_call,且整段会话上下文上游也没有(远端拼接失效)。用
+            // always-on 会话观测镜像沿 previous_response_id 链**重建完整上下文** inline + 去掉
+            // previous_response_id,透明重发一次,让续轮带着完整历史继续。镜像没记到该链(proxy
+            // 重启 / 跨 provider 边界)→ rebuild 返 None,退回保存原 4xx 显示错误。
+            match codex_app_transfer_adapters::rebuild_orphan_context_bytes(&plan.body) {
                 Some(repaired) => {
                     telemetry.logs.add(
                         "WARN",
                         format!(
-                            "orphan function_call 400 for provider {} — spliced cached function_call(s) + dropped previous_response_id, retrying...",
+                            "orphan function_call 400 for provider {} — rebuilt full context from session mirror + dropped previous_response_id, retrying...",
                             resolved.provider.id
                         ),
                     );
@@ -607,7 +608,8 @@ pub async fn forward_handler(
                     outbound_headers_snapshot = pair.1;
                 }
                 None => {
-                    // 缓存补不齐(如 proxy 重启丢了上一轮、或非 responses body)→ 不重试。
+                    // 镜像没记到该链(proxy 重启 / 首轮 / 跨 provider 边界 / 非 responses body)
+                    // → 拼不出完整上下文,不重试(退回 response.failed 显示错误)。
                     captured_4xx = Some((st, hs, body_bytes));
                 }
             }

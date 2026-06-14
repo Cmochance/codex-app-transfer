@@ -34,8 +34,10 @@
 //! ## Session
 //! `response_session = None` —— 透传场景上游自管 `previous_response_id`,代理不写
 //! 也不读本项目的 chat 形 `ResponseSessionCache`(形状不同,混写会被 chat 路径读坏)。
-//! 后续若要为 Usage / 上下文面板做 by-source 明细,走**独立的只读观测镜像**,
-//! 绝不把重建历史回注请求(见 MOC-234 Step 3)。
+//! 改用**独立的 responses 形会话观测镜像**(`passthrough_observe`,always-on):正常转发
+//! 时只读(算 by-source 明细),**仅在上游报 orphan-400 时**沿链重建完整上下文回注重发
+//! (`forward.rs` + `tool_call_repair::rebuild_orphan_context_bytes`,store:false 反代续轮兜底,
+//! 用户授权的 error-path 降级)。
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -50,10 +52,7 @@ use serde_json::Value;
 use crate::mapper::{RequestMapper, ResponseMapper};
 use crate::registry::{is_responses_compact_subpath, rewrite_local_path_for_upstream};
 use crate::responses::context_breakdown::breakdown_enabled;
-use crate::responses::{
-    global_passthrough_observe_store, global_tool_call_repair_cache,
-    spawn_compute_and_persist_responses,
-};
+use crate::responses::{global_passthrough_observe_store, spawn_compute_and_persist_responses};
 use crate::types::{AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -164,13 +163,16 @@ fn classify_passthrough_error_status(status_u16: u16) -> &'static str {
     }
 }
 
-/// [MOC-234] request 侧只读观测:gate=`breakdown_enabled` 且非 compact 子路径时,旁路 parse
-/// 一份 body 副本,按 `previous_response_id` 链拼全历史 → 起后台 responses 原生 breakdown 并
-/// 按 `prompt_cache_key` 落盘。返回的 metadata 仅携带本轮 input items + prev_id,供 response 侧
-/// tee 在拿到上游分配的 `response_id` 后把本轮(input+output)记进观测镜像。**绝不改转发 body。**
+/// [MOC-234] request 侧旁路观测(非 compact 子路径时):parse 一份 body 副本,拿本轮 input
+/// items + prev_id,经 metadata 透传给 response 侧 tee → tee 拿到上游 `response_id` 后把本轮
+/// (input+output)记进**会话观测镜像**。**绝不改转发 body。**
+///
+/// 观测镜像的**写入是 always-on**(不依赖面板)—— 它同时支撑 orphan-400 降级重建上下文
+/// (需要历史始终被记下)。**仅 breakdown 面板开时**才额外起后台 o200k by-source 计算 + 落盘
+/// (那是热路径上较重的一步,保持 gated)。
 fn build_observe_metadata(client_path: &str, body: &Bytes) -> Option<Value> {
-    // 默认(面板关)零开销:不 parse、不 spawn。compact 是生命周期端点、非对话轮,跳过观测。
-    if !breakdown_enabled() || is_responses_compact_subpath(client_path) {
+    // compact 是生命周期端点、非对话轮,跳过观测(也无需降级重建)。
+    if is_responses_compact_subpath(client_path) {
         return None;
     }
     let parsed: Value = serde_json::from_slice(body).ok()?;
@@ -187,31 +189,33 @@ fn build_observe_metadata(client_path: &str, body: &Bytes) -> Option<Value> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
 
-    // 全历史 = 沿 prev_id 链回溯的镜像 + 本轮 input。
-    let mut assembled = match prev_id.as_deref() {
-        Some(prev) => global_passthrough_observe_store().assemble_history(prev),
-        None => Vec::new(),
-    };
-    assembled.extend(input_items.iter().cloned());
-
-    // 起后台 breakdown(o200k tokenize + 原子落盘,搬离热路径)。conv_id = prompt_cache_key。
-    if let Some(conv_id) = parsed
-        .get("prompt_cache_key")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        let instructions = parsed
-            .get("instructions")
+    // [仅面板开] 起后台 responses 原生 breakdown(o200k tokenize + 原子落盘,搬离热路径)。
+    // conv_id = prompt_cache_key。全历史 = 沿 prev_id 链回溯的镜像 + 本轮 input。
+    if breakdown_enabled() {
+        if let Some(conv_id) = parsed
+            .get("prompt_cache_key")
             .and_then(Value::as_str)
-            .map(str::to_owned);
-        let tools = parsed
-            .get("tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        spawn_compute_and_persist_responses(instructions, assembled, tools, conv_id.to_owned());
+            .filter(|s| !s.is_empty())
+        {
+            let mut assembled = match prev_id.as_deref() {
+                Some(prev) => global_passthrough_observe_store().assemble_chain(prev),
+                None => Vec::new(),
+            };
+            assembled.extend(input_items.iter().cloned());
+            let instructions = parsed
+                .get("instructions")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let tools = parsed
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            spawn_compute_and_persist_responses(instructions, assembled, tools, conv_id.to_owned());
+        }
     }
 
+    // **始终**返回观测上下文 → response tee always-on 把本轮记进镜像(供 orphan 降级重建)。
     // typed → Value(见 ObserveCtx doc),response 侧 from_value 还原。
     let ctx = ObserveCtx {
         prev_id,
@@ -346,11 +350,10 @@ impl ObserveTeeStream {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        // **始终**(不依赖 breakdown 面板)把上游产生的 tool-call 按 call_id 记进降级缓存,
-        // 供 orphan-function_call 400 时拼回 input(store:false 上游不留自己的 function_call)。
-        global_tool_call_repair_cache().record_output(&output);
-        // 仅 observe 上下文存在(breakdown 开)时,把整轮(input + output)记进观测镜像
-        // 供下一轮拼全历史算 by-source 明细。
+        // **始终**(不依赖 breakdown 面板)把本轮(input + output)记进会话观测镜像,链头 =
+        // 本轮 response_id。镜像同时支撑:① breakdown 拼全历史算明细(面板开时);② orphan-400
+        // 降级时沿链重建完整上下文。observe 是 always-on(`build_observe_metadata` 始终返回 ctx),
+        // 故续轮 input 总被记下;output 里的 function_call 也随之入链,供降级拼回。
         if let Some((prev_id, input_items)) = self.observe.take() {
             let mut items = input_items;
             items.extend(output);
@@ -475,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn request_no_session_no_metadata() {
+    fn request_no_session_no_envelope_replay() {
         let plan = ResponsesPassthroughMapper
             .map_request(
                 "/v1/responses",
@@ -483,9 +486,12 @@ mod tests {
                 &dummy_provider(),
             )
             .unwrap();
+        // 透传不写 chat 形 session、无 envelope replay。
         assert!(plan.response_session.is_none());
-        assert!(plan.adapter_metadata.is_none());
         assert!(plan.original_responses_request.is_none());
+        // adapter_metadata 现在恒带观测上下文(always-on,供 breakdown + orphan 降级);
+        // 它是 adapter↔proxy 内部通道,不进 user-facing 协议、不改转发 body。
+        assert!(plan.adapter_metadata.is_some());
     }
 
     #[tokio::test]
@@ -565,7 +571,7 @@ mod tests {
         assert_eq!(got, expected, "tee 必须 1:1 透传上游字节");
 
         // 观测镜像应记下本轮(input 1 + output 1 = 2 items),链头 = response_id。
-        let hist = global_passthrough_observe_store().assemble_history(rid);
+        let hist = global_passthrough_observe_store().assemble_chain(rid);
         assert_eq!(hist.len(), 2, "本轮 input+output 应记进观测镜像");
     }
 
@@ -589,22 +595,30 @@ mod tests {
         assert_eq!(prev.as_deref(), Some("resp_prev"));
         assert_eq!(items.len(), 1);
 
-        // 无 metadata → None(面板关 / compact / parse 失败时 response 侧不套 tee)。
-        let bare = ResponsesPassthroughMapper
+        // 无 metadata(如 compact 路径)→ observe_ctx None,response 侧不套 tee。
+        let mut bare = ResponsesPassthroughMapper
             .map_request(
                 "/v1/responses",
                 Bytes::from_static(b"{}"),
                 &dummy_provider(),
             )
             .unwrap();
+        bare.adapter_metadata = None;
         assert!(observe_ctx_from_plan(&bare).is_none());
     }
 
     #[test]
-    fn build_observe_metadata_none_when_breakdown_disabled() {
-        // 默认面板关 → 不 parse、不 spawn、metadata=None(热路径零开销)。
-        // (不切换全局 gate,避免污染并发测试。)
-        assert!(build_observe_metadata("/v1/responses", &Bytes::from_static(b"{}")).is_none());
+    fn build_observe_metadata_always_on_except_compact() {
+        // 观测镜像写入 always-on(不依赖 breakdown 面板)→ 普通 /responses 恒返回 ctx,
+        // 供 orphan 降级重建历史。compact 子路径跳过(生命周期端点、非对话轮)。
+        assert!(
+            build_observe_metadata("/v1/responses", &Bytes::from_static(b"{}")).is_some(),
+            "普通 responses 应恒返回观测上下文(always-on)"
+        );
+        assert!(
+            build_observe_metadata("/v1/responses/compact", &Bytes::from_static(b"{}")).is_none(),
+            "compact 跳过观测"
+        );
     }
 
     #[tokio::test]

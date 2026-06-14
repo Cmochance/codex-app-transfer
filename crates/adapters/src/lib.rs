@@ -40,7 +40,7 @@ pub use responses::{
 // [MOC-234] responses passthrough orphan function_call 降级修复:forward 层据此检测上游
 // orphan-400 + 拼回缺失 function_call 透明重试(store:false 反代续轮兜底)。
 pub use responses::tool_call_repair::{
-    is_orphan_function_call_error, repair_orphan_tool_calls_bytes,
+    is_orphan_function_call_error, rebuild_orphan_context_bytes,
 };
 pub use types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 // [MOC-210] antigravity 原生出图履约:proxy(forward.rs)截获模型 image_gen 调用后,

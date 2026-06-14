@@ -54,9 +54,7 @@ pub use stream::{
     convert_chat_to_responses_stream_with_session,
 };
 pub use tool_call_cache::{global_tool_call_cache, ToolCallCache, ToolCallEntry};
-pub use tool_call_repair::{
-    global_tool_call_repair_cache, repair_orphan_tool_calls, ToolCallRepairCache,
-};
+pub use tool_call_repair::{is_orphan_function_call_error, rebuild_orphan_context_bytes};
 
 use codex_app_transfer_registry::Provider;
 use http::{HeaderMap, StatusCode};

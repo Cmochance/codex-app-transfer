@@ -5,16 +5,20 @@
 //! 本 store 按 turn 记录每轮的 Responses item(本轮 input + 本轮 output),用 `response_id`
 //! → `prev_id` 链可重建任意 tip 之前的全历史。
 //!
-//! ## 严格只读 / 不接管(MOC-234 约束)
-//! - **绝不回注请求**:仅供 [`crate::responses::compute_context_breakdown_responses`] 旁路
-//!   计算 + session 观测读;转发字节一字不改。
+//! ## 写入与读取(MOC-234)
+//! - **写入 always-on**:由响应侧 tee 每轮记 input+output(不依赖 breakdown 面板)——
+//!   既支撑 breakdown 拼全历史,也支撑 orphan-400 降级重建上下文(需要历史始终被记下)。
+//!   仅 breakdown 的 o200k 逐 item 计算保持 gated(那是较重的一步)。
+//! - **两类读取**:① [`crate::responses::compute_context_breakdown_responses`] 旁路只读
+//!   计 token(不改转发);② [`crate::responses::rebuild_orphan_context_bytes`] 在上游报
+//!   orphan-400 时**沿链重建完整上下文回注重发**——这是用户授权的 error-path 降级(偏离
+//!   纯 1:1),仅该错误触发,成功路径与正常转发一律不改字节。
 //! - **独立于 chat 形 `ResponseSessionCache`**:那个存 chat messages、写入侧耦合
 //!   tool_call_cache / artifact_store;本 store 存**原始 Responses item**,形状不同,
 //!   混用会被 chat 路径 `build_messages_with_history` 读坏。
-//! - 仅在 `breakdown_enabled()`(面板开)时由 mapper 写入,默认关零开销。
 //!
-//! 纯内存(无持久化):breakdown 结果本身已按 conv_id 落盘(复用 MOC-232),重启后新轮
-//! 重建即可;会话镜像无需跨重启。TTL + 总上限防无界增长。
+//! 纯内存(无持久化):会话镜像无需跨重启(重启后新轮重建链头;断链的旧历史拼不回属预期
+//! 降级)。TTL + 总上限防无界增长。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -26,7 +30,7 @@ use serde_json::Value;
 const MAX_TURNS: usize = 4096;
 /// turn 记录 TTL:2h 没被触达即视为过期(陈旧会话,删了不影响——续轮会重建链头)。
 const TTL: Duration = Duration::from_secs(2 * 3600);
-/// 单次 `assemble_history` 沿 `prev_id` 链最多回溯的 turn 数(防异常超长链 / 环导致卡顿)。
+/// 单次 `assemble_chain` 沿 `prev_id` 链最多回溯的 turn 数(防异常超长链 / 环导致卡顿)。
 const MAX_CHAIN_DEPTH: usize = 2048;
 
 /// 一轮的观测记录:本轮拼进上下文的 Responses item(input + output)+ 上一轮 id。
@@ -83,21 +87,22 @@ impl PassthroughObserveStore {
         );
     }
 
-    /// 沿 `tip_id` 的 `prev_id` 链回溯,收集**全历史** Responses item。
+    /// 沿 `tip_id` 的 `prev_id` 链回溯,拼出**时序完整历史**(最旧轮在前,轮内 item 顺序不变)。
     ///
-    /// 返回顺序为「最新轮 → 最旧轮」(breakdown 按类计 token,与顺序无关,故不额外反转)。
-    /// 用 visited 集合防环;`MAX_CHAIN_DEPTH` 防异常超长链。链中缺环(如 proxy 重启后
-    /// 半途接手的会话)即止,返回已收集部分(降级但不出错)。命中的 turn 会刷新其
-    /// inserted 时间(LRU 保活:活跃会话的历史不被 TTL 误删)。
-    pub fn assemble_history(&self, tip_id: &str) -> Vec<Value> {
-        let mut out = Vec::new();
+    /// 既供 orphan 降级重建上下文(**顺序必须时序正确**),也供 breakdown 计 token(顺序无关)。
+    /// 用 visited 集合防环;`MAX_CHAIN_DEPTH` 防异常超长链。链中缺环(如 proxy 重启后半途接手
+    /// 的会话、或跨 provider 切换的边界)即止,返回已收集部分(降级但不出错)。命中的 turn 会
+    /// 刷新 inserted(LRU 保活:活跃会话历史不被 TTL 误删)。
+    pub fn assemble_chain(&self, tip_id: &str) -> Vec<Value> {
         let Ok(mut inner) = self.inner.lock() else {
-            return out;
+            return Vec::new();
         };
         let now = Instant::now();
         let mut visited: HashSet<String> = HashSet::new();
         let mut cursor = Some(tip_id.to_owned());
         let mut depth = 0;
+        // 先按「最新轮 → 最旧轮」收集每轮 items,再整轮反转成时序。
+        let mut turns_newest_first: Vec<Vec<Value>> = Vec::new();
         while let Some(id) = cursor {
             if depth >= MAX_CHAIN_DEPTH || !visited.insert(id.clone()) {
                 break;
@@ -107,8 +112,12 @@ impl PassthroughObserveStore {
                 break;
             };
             rec.inserted = now; // 保活:活跃会话沿链命中的每轮都续期
-            out.extend(rec.items.iter().cloned());
+            turns_newest_first.push(rec.items.clone());
             cursor = rec.prev_id.clone();
+        }
+        let mut out = Vec::new();
+        for turn_items in turns_newest_first.into_iter().rev() {
+            out.extend(turn_items);
         }
         out
     }
@@ -162,7 +171,7 @@ mod tests {
         s.record_turn("r2", Some("r1".into()), vec![item("t2in"), item("t2out")]);
         s.record_turn("r3", Some("r2".into()), vec![item("t3in")]);
 
-        let hist = s.assemble_history("r3");
+        let hist = s.assemble_chain("r3");
         // 3 轮共 2+2+1 = 5 个 item
         assert_eq!(hist.len(), 5, "应沿链拼出全历史 5 个 item");
     }
@@ -170,7 +179,7 @@ mod tests {
     #[test]
     fn assemble_missing_tip_returns_empty() {
         let s = PassthroughObserveStore::new();
-        assert!(s.assemble_history("nope").is_empty());
+        assert!(s.assemble_chain("nope").is_empty());
     }
 
     #[test]
@@ -178,7 +187,7 @@ mod tests {
         // r2 → r1,但 r1 不在 store(重启后半途接手)→ 只收到 r2 自己的 item
         let s = PassthroughObserveStore::new();
         s.record_turn("r2", Some("r1".into()), vec![item("t2in"), item("t2out")]);
-        assert_eq!(s.assemble_history("r2").len(), 2);
+        assert_eq!(s.assemble_chain("r2").len(), 2);
     }
 
     #[test]
@@ -187,7 +196,7 @@ mod tests {
         let s = PassthroughObserveStore::new();
         s.record_turn("r1", Some("r2".into()), vec![item("a")]);
         s.record_turn("r2", Some("r1".into()), vec![item("b")]);
-        let hist = s.assemble_history("r1");
+        let hist = s.assemble_chain("r1");
         assert_eq!(hist.len(), 2, "环也只各收一次");
     }
 

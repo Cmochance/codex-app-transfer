@@ -414,13 +414,26 @@ async fn orphan_function_call_400_is_repaired_and_retried_to_success() {
     );
     let repaired: Value = serde_json::from_slice(recv.last().unwrap()).unwrap();
     let rin = repaired["input"].as_array().unwrap();
+    // 重发请求必须含**完整上下文**(不只拼 function_call):turn1 的 user 消息 + function_call
+    // call_FIX + turn2 的 function_call_output。证明是「重建完整历史」而非「只补一个 call」。
+    assert!(
+        rin.iter().any(|it| it["type"] == "message"
+            && it["content"]
+                .as_array()
+                .and_then(|c| c.first())
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.contains("run ls"))
+                .unwrap_or(false)),
+        "重发请求 input 必须含 turn1 的 user 消息(完整上下文): {repaired}"
+    );
     assert!(
         rin.iter()
             .any(|it| it["type"] == "function_call" && it["call_id"] == "call_FIX"),
-        "重发请求 input 必须含拼回的 function_call: {repaired}"
+        "重发请求 input 必须含重建回的 function_call: {repaired}"
     );
     assert!(
         repaired.get("previous_response_id").is_none(),
-        "修复重发应去掉 previous_response_id"
+        "修复重发应去掉 previous_response_id(已 inline 完整上下文)"
     );
 }
