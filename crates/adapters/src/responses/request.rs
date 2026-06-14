@@ -1133,6 +1133,21 @@ fn build_bounded_tool_output_summary(
         if let Some(call_id) = artifact.call_id.as_deref() {
             out.push_str(&format!("Tool call ID: {call_id}\n"));
         }
+        // MOC-235: 仅当 artifact **持久化到共享 DB** 时才告知可回取 —— read_tool_artifact 跑在
+        // 独立 `--mcp-serve-webfetch` 进程、只读 DB,读不到仅落 proxy 进程内存的降级 fallback。
+        // 否则会给模型一个 reader 看不到的 id、把回取变成 miss/重跑(MOC-235 review #4)。
+        if artifact.persisted {
+            out.push_str(&format!(
+                "To read the FULL untruncated output on demand, call the read_tool_artifact tool with artifact_id \"{}\" (only when the head/tail excerpt below is not enough).\n",
+                artifact.artifact_id
+            ));
+        } else {
+            // 非持久化(DB 不可用/写失败 → 仅落 proxy 内存): 显式标本 id 不可回取, 抵消 MCP server 级
+            // 「见 Artifact ID 就调 read_tool_artifact」的通用指引, 防模型拿死 id 空调(MOC-235 review #5)。
+            out.push_str(
+                "(This artifact is stored in-process only and is NOT retrievable via read_tool_artifact — do not call read_tool_artifact for this ID.)\n",
+            );
+        }
     } else {
         out.push_str("Artifact ID: unavailable; raw payload could not be stored.\n");
     }
