@@ -21,8 +21,9 @@ pub struct CodexPaths {
     /// transfer 为 MCP 凭据维护的镜像(`~/.codex-app-transfer/mcp-credentials.json`)。
     ///
     /// 在 `~/.codex` 之外,所以 `codex switch` 的 `rsync --delete` / 误删 / 换机
-    /// 都碰不到它。启动 + apply 后与 [`Self::mcp_credentials`] 并集合并(缺失则
-    /// 恢复、存在则捕获),使 MCP 授权可恢复、可迁移。MOC-62。
+    /// 都碰不到它。启动 + apply 后镜像跟随 [`Self::mcp_credentials`](捕获新授权 +
+    /// 传播登出删除,绝不写 live);live 整文件缺失时由用户确认后才从镜像恢复,
+    /// 使 MCP 授权可恢复、可迁移。MOC-62。
     pub mcp_credentials_mirror: PathBuf,
     /// Legacy single-snapshot path kept for upgrade compatibility.
     pub snapshot_dir: PathBuf,
