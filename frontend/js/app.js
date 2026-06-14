@@ -4004,16 +4004,28 @@
           // 加入整合后自动获取该 provider 的模型(用户要求)。**用非破坏性的 available 拉取**
           // (GET /models/available)而非 autofill —— autofill 会顺带覆盖 provider.models 槽位
           // 映射(用户在编辑页手调的、池外仍用的),整合页不该有此副作用(#477 bot review P2)。
-          // 拿到后连同 enabled 一次写入(setProviderPool 后端 chat 过滤 + 只动 pooledModels)。
-          let models = null;
+          let fetched = [];
           try {
             const result = await CCApi.fetchProviderModels(pid);
-            models = (result.models || []).map(modelEntryId).filter(Boolean);
+            fetched = (result.models || []).map(modelEntryId).filter(Boolean);
           } catch (fetchErr) {
             console.warn(`[integration] 自动获取模型失败 ${pid}:`, fetchErr);
             showToast(formatModelFetchError(fetchErr));
           }
-          await CCApi.setProviderPool(pid, models ? { enabled: true, models } : { enabled: true });
+          // 合并「该 provider 现有生效模型(还没 curation → 映射回退)」+ 本次抓取,去重。
+          // 不能只发抓取结果:用户手填、但 /models 不返回(或被后端过滤)的映射模型,会被当成
+          // 权威 pooledModels 的抓取列表挤掉、从池里消失(#477 bot review P2)。
+          const providers = await CCApi.getProviders();
+          const provider = providers.find((p) => p.id === pid);
+          const merged = effectivePoolModels(provider).slice();
+          const seen = new Set(merged);
+          for (const m of fetched) {
+            if (!seen.has(m)) {
+              seen.add(m);
+              merged.push(m);
+            }
+          }
+          await CCApi.setProviderPool(pid, merged.length ? { enabled: true, models: merged } : { enabled: true });
           showToast(t("toast.integrationProviderAdded"));
           await renderProviders();
         } catch (error) {
