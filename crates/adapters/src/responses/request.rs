@@ -1133,6 +1133,12 @@ fn build_bounded_tool_output_summary(
         if let Some(call_id) = artifact.call_id.as_deref() {
             out.push_str(&format!("Tool call ID: {call_id}\n"));
         }
+        // MOC-235: 明确告知模型可按需取回全文 —— 由 `--mcp-serve-webfetch` 的 read_tool_artifact
+        // 工具读共享 tool_artifacts.db 返回不截断全文(取回当轮全文, 下一轮再被本压缩逻辑收回, 不长期占上下文)。
+        out.push_str(&format!(
+            "To read the FULL untruncated output on demand, call the read_tool_artifact tool with artifact_id \"{}\" (only when the head/tail excerpt below is not enough).\n",
+            artifact.artifact_id
+        ));
     } else {
         out.push_str("Artifact ID: unavailable; raw payload could not be stored.\n");
     }

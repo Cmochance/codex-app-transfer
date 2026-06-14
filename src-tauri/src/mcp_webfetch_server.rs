@@ -36,6 +36,7 @@ use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use codex_app_transfer_adapters::responses::read_tool_artifact_raw;
 use codex_app_transfer_http::{WebFetchBackend, WebFetchOutcome};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -48,7 +49,8 @@ const SERVER_INSTRUCTIONS: &str = "联网工具使用规则:\n\
 1. 需要网上信息时先 web_search(query) 找来源, 再 web_fetch(url) 读该页完整正文。web_search 只返第 1 页(约一二十条);第 1 页没覆盖到你要的信息时, 用 web_search_more(传同一 query + page=2、3…)取下一批**不重复**的新结果, **别用同样 query 重复调 web_search**(会返回同一批)。\n\
 2. **凡是本次对话里你已经用 web_fetch 抓过的 URL —— 当你要再次引用 / 摘录 / 附上它的原文 / 回看更多细节时, 必须先用 read_url_local(url) 从本地缓存取回, 不要重复 web_fetch 同一个 URL**。read_url_local 不联网、瞬时返回, 且能拿回已被对话历史折叠/压缩、你当前看不到的完整原文。\n\
 3. 抓「新」URL 才用 web_fetch; 回看「旧」(本会话已抓过的)URL 一律 read_url_local。\n\
-4. web_fetch 默认返回完整正文供当前轮直接阅读。";
+4. web_fetch 默认返回完整正文供当前轮直接阅读。\n\
+5. **任何工具(shell / 飞书 MCP / 其它)的输出在对话历史里被折叠成 `[Tool output stored outside model context]` 摘要时, 摘要里给了 `Artifact ID`。需要那条输出的完整原文时, 调 read_tool_artifact(artifact_id) 取回不截断全文 —— 不要为了拿回历史输出去重跑工具**。read_tool_artifact 瞬时返回, 取回内容仅供当前轮阅读, 之后会再被自动折叠(不长期占上下文)。";
 /// client 未给 protocolVersion 时的兜底(回显 client 的值更优, 见 spec)。
 const FALLBACK_PROTOCOL: &str = "2025-11-25";
 /// 返回正文截断上限(字符)。防把 MB 级页面灌给模型(类 Claude WebFetch 的 100KB 截断)。
@@ -202,7 +204,11 @@ fn dispatch_line(
             // handle 拒, 徒增无效调用(用户 #386 验收反馈)。改档需重启 Codex 重新 tools/list 才反映
             // (与 web_fetch 改 on/off 需重启一致);运行期切档的 stale 缓存由 handle_web_search_call
             // 的 backend gate 兜底(failing 双保险)。
-            let mut tools = vec![web_fetch_tool_def(), read_url_local_tool_def()];
+            let mut tools = vec![
+                web_fetch_tool_def(),
+                read_url_local_tool_def(),
+                read_tool_artifact_tool_def(),
+            ];
             // web_search 暴露条件(MOC-190): backend 非 off + Chrome 就绪(系统装了或已下载),
             // 与 web_fetch 档位选择解耦 —— 系统有 Chrome 的用户在 curl/wreq 档也能用 search 且不
             // 触发下载;两者皆无则不暴露(避免在没走过 consent 的档静默拉 ~86MB)。
@@ -294,6 +300,13 @@ async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string());
             handle_read_url_local_call(id, url).await
+        }
+        "read_tool_artifact" => {
+            let artifact_id = args
+                .get("artifact_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            handle_read_tool_artifact_call(id, artifact_id).await
         }
         "web_search" => {
             let query = args
@@ -479,6 +492,67 @@ async fn handle_read_url_local_call(id: Value, url: Option<String>) -> Value {
                 "tool": "read_url_local",
                 "request": { "url": url },
                 "result": { "returned_chars": returned_chars, "is_error": is_error, "cache_hit": !is_error },
+            }),
+        )
+        .await;
+    }
+    resp
+}
+
+/// 通用工具输出回取(MOC-235): 按 `artifact_id` 从共享 `tool_artifacts.db`(proxy 压缩历史工具
+/// 输出时落盘, SQLite WAL 跨进程)取回**不截断全文**。与 read_url_local 互补 —— 后者按 URL 取
+/// web_fetch 缓存, 本工具按 artifact_id 取**任意**被折叠的工具输出(shell / 飞书 MCP / 其它)。
+/// 不联网、不受 webfetch 档位影响(artifact 跟 webfetch 开关无关)。取回内容当前轮全文进上下文,
+/// 下一轮被 proxy 的 MOC-190 滚动压缩再次收回, 不长期占上下文。
+async fn handle_read_tool_artifact_call(id: Value, artifact_id: Option<String>) -> Value {
+    let artifact_id = match artifact_id {
+        Some(a) if !a.is_empty() => a,
+        _ => {
+            return tool_error(
+                id,
+                "缺少必填参数 artifact_id(取历史里 `[Tool output stored outside model context]` 摘要给出的 Artifact ID)",
+            )
+        }
+    };
+    // 用户要求「不截断」: 返回 raw_content 全长。超大 artifact 的边界由 proxy 侧
+    // keep_recent_tool_output_full(当前轮 100k 字符上限)再收口, 本工具不主动截。
+    // 三态(MOC-235 review): Ok(Some)=命中 / Ok(None)=真不存在或过期 / Err=瞬时读失败。
+    // 瞬时失败若也提示「重跑原工具」会误导模型白跑(本功能正是要省这成本)→ 提示重试同一调用。
+    let (resp, returned_chars, is_error) = match read_tool_artifact_raw(&artifact_id) {
+        Ok(Some(content)) => {
+            let n = content.chars().count();
+            (tool_ok(id.clone(), &content), n, false)
+        }
+        Ok(None) => (
+            tool_error(
+                id.clone(),
+                &format!(
+                    "未找到该 artifact(可能已过期 >30 天, 或 ID 有误): {artifact_id}。如仍需该数据请用对应工具重新获取。"
+                ),
+            ),
+            0usize,
+            true,
+        ),
+        Err(e) => (
+            tool_error(
+                id.clone(),
+                &format!(
+                    "读取 artifact 暂时失败(存储可能正被占用或损坏): {e}。这是临时性读取错误, 请稍后**用同一 artifact_id 重试 read_tool_artifact**, 不要为此重跑原工具。"
+                ),
+            ),
+            0usize,
+            true,
+        ),
+    };
+    if let Some(port) = diag_target() {
+        post_diag_entry(
+            port,
+            json!({
+                "trace_kind": "cat_webfetch",
+                "captured_at": now_iso(),
+                "tool": "read_tool_artifact",
+                "request": { "artifact_id": artifact_id },
+                "result": { "returned_chars": returned_chars, "is_error": is_error, "hit": !is_error },
             }),
         )
         .await;
@@ -846,6 +920,22 @@ fn read_url_local_tool_def() -> Value {
     })
 }
 
+fn read_tool_artifact_tool_def() -> Value {
+    json!({
+        "name": "read_tool_artifact",
+        "title": "Read tool artifact (full output)",
+        "description": "取回**任意**被折叠工具输出的**完整、未截断原文**(从本地存储)。当某条历史工具输出(shell / 飞书等 MCP / 其它)在对话里被压成 `[Tool output stored outside model context]` 摘要、你需要其完整内容时,用摘要里给出的 `Artifact ID` 调用本工具,不要为此重跑原工具。不联网、瞬时返回;取回内容仅供当前轮阅读,之后会再被自动折叠。仅 artifact_id 一个参数。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": { "type": "string", "description": "要取回的 Artifact ID(取自历史里 `[Tool output stored outside model context]` 摘要的 `Artifact ID:` 行)。" }
+            },
+            "required": ["artifact_id"]
+        },
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false }
+    })
+}
+
 fn web_search_tool_def() -> Value {
     json!({
         "name": "web_search",
@@ -989,6 +1079,21 @@ mod tests {
         assert!(d["inputSchema"]["properties"]["summarize"].is_null());
         assert!(d["inputSchema"]["properties"]["prompt"].is_null());
         // MOC-172: readOnlyHint=true / destructiveHint=false 让 guardian 跳过 auto-review 审批。
+        assert_eq!(d["annotations"]["readOnlyHint"], true);
+        assert_eq!(d["annotations"]["destructiveHint"], false);
+    }
+
+    #[test]
+    fn read_tool_artifact_tool_def_shape() {
+        // MOC-235: 通用回取工具 —— 仅 artifact_id 必填, readOnlyHint=true 跳过审批。
+        let d = read_tool_artifact_tool_def();
+        assert_eq!(d["name"], "read_tool_artifact");
+        assert_eq!(d["inputSchema"]["required"][0], "artifact_id");
+        assert_eq!(d["inputSchema"]["required"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            d["inputSchema"]["properties"]["artifact_id"]["type"],
+            "string"
+        );
         assert_eq!(d["annotations"]["readOnlyHint"], true);
         assert_eq!(d["annotations"]["destructiveHint"], false);
     }

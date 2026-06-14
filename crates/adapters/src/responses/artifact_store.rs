@@ -134,8 +134,25 @@ impl ToolArtifactStore {
     }
 
     pub fn get(&self, artifact_id: &str) -> Option<ToolArtifactRecord> {
+        match self.get_result(artifact_id) {
+            Ok(record) => record,
+            Err(e) => {
+                log_artifact_warning(
+                    "TOOL_ARTIFACT_DB_LOAD_FAILED",
+                    format!("load artifact_id={artifact_id} failed: {e}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// 同 [`get`] 但**保留 DB 读错误**(不吞成 `None`)。跨进程回取(MOC-235)用它区分
+    /// 「真不存在 / 已过期」(`Ok(None)`)与「瞬时读失败:锁超时 / 损坏 / 权限」(`Err`)——
+    /// 让 read_tool_artifact 对后者提示「稍后用同一 id 重试」, 而非误导模型「重跑原工具」
+    /// (重跑正是本功能要消除的成本)。`get` 仍吞错返 `None`(保留旧调用方语义)。
+    pub fn get_result(&self, artifact_id: &str) -> Result<Option<ToolArtifactRecord>, String> {
         if artifact_id.trim().is_empty() {
-            return None;
+            return Ok(None);
         }
         {
             let mut inner = self.inner.lock().expect("artifact store mutex poisoned");
@@ -150,20 +167,11 @@ impl ToolArtifactStore {
                 entry.access_count += 1;
                 entry.record.access_count += 1;
                 entry.record.last_access_unix = unix_now();
-                return Some(entry.record.clone());
+                return Ok(Some(entry.record.clone()));
             }
         }
 
-        match self.persist_load(artifact_id) {
-            Ok(record) => record,
-            Err(e) => {
-                log_artifact_warning(
-                    "TOOL_ARTIFACT_DB_LOAD_FAILED",
-                    format!("load artifact_id={artifact_id} failed: {e}"),
-                );
-                None
-            }
-        }
+        self.persist_load(artifact_id).map_err(|e| e.to_string())
     }
 
     pub fn clear(&self) {
@@ -336,6 +344,16 @@ fn init_db(db_path: &Path) -> rusqlite::Result<Connection> {
             format!("pragma synchronous=NORMAL failed: {e}"),
         );
     }
+    // 跨进程并发(MOC-235): proxy 进程写(INSERT/touch)+ `--mcp-serve-webfetch` 进程读
+    // (read_tool_artifact 回取)同时访问本 db。WAL 允许多读单写, 但两进程并发写(proxy
+    // persist_save 与 MCP get() 的 last_access touch)会撞 SQLITE_BUSY。设 busy_timeout 让其
+    // 短暂自旋重试而非立即失败(touch 失败本就 graceful, 但 INSERT 重试能少丢 artifact)。
+    if let Err(e) = conn.busy_timeout(Duration::from_secs(5)) {
+        log_artifact_warning(
+            "TOOL_ARTIFACT_DB_BUSY_TIMEOUT_FAILED",
+            format!("busy_timeout failed: {e}"),
+        );
+    }
     create_schema(&conn)?;
     Ok(conn)
 }
@@ -424,6 +442,17 @@ pub fn global_tool_artifact_store() -> &'static ToolArtifactStore {
     })
 }
 
+/// 按 `artifact_id` 取回被压缩外置的工具输出**全文**(不截断)。供 `--mcp-serve-webfetch`
+/// 进程的 `read_tool_artifact` 工具跨进程读 —— 全文存在共享 `tool_artifacts.db`(WAL),
+/// 由 proxy 侧 [`build_bounded_tool_output_summary`](request.rs)压缩时 `save` 落盘。
+/// 返回:`Ok(Some(全文))` 命中 / `Ok(None)` 真不存在或已过期 / `Err` 瞬时读失败(锁超时
+/// / 损坏)—— 调用方据此对「真没有」与「临时错误」给不同提示(后者建议重试同一调用)。MOC-235。
+pub fn read_tool_artifact_raw(artifact_id: &str) -> Result<Option<String>, String> {
+    global_tool_artifact_store()
+        .get_result(artifact_id)
+        .map(|opt| opt.map(|record| record.raw_content))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +468,29 @@ mod tests {
         assert_eq!(record.call_id.as_deref(), Some("call_a"));
         assert_eq!(record.kind, "command_output");
         assert_eq!(record.raw_content, "raw output");
+    }
+
+    #[test]
+    fn read_tool_artifact_raw_round_trips_via_global() {
+        // MOC-235: 通用回取走 global store(test 下为内存档),save 后按 artifact_id 取回不截断全文。
+        let stored = global_tool_artifact_store().save(
+            Some("call_moc235"),
+            "command_output",
+            "FULL UNTRUNCATED PAYLOAD moc235",
+        );
+        assert_eq!(
+            read_tool_artifact_raw(&stored.artifact_id)
+                .expect("read should not error")
+                .as_deref(),
+            Some("FULL UNTRUNCATED PAYLOAD moc235")
+        );
+        // 真不存在 / 空 id → Ok(None)(非 Err);Err 仅留给瞬时 DB 读失败。
+        assert!(read_tool_artifact_raw("nonexistent_moc235")
+            .expect("miss is not an error")
+            .is_none());
+        assert!(read_tool_artifact_raw("   ")
+            .expect("blank id is not an error")
+            .is_none());
     }
 
     #[test]
