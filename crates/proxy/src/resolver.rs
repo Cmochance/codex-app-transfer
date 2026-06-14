@@ -128,6 +128,12 @@ pub struct StaticResolver {
     /// `settings.exposeAllProviderModels` gate 后用 `registry::unique_pool_slugs`
     /// 构建(与 catalog 生成端**同一 helper**,保证 slug 逐字一致、不错路由)。
     pub catalog_slug_map: HashMap<String, (usize, String)>,
+    /// 是否处于池化(整合)模式。`true` = catalog 由 `catalog_slug_map` 这个**子集**定义,
+    /// `decide_provider` 在反查表 miss 时**不再**走 `<slug>/<model>` legacy 拆分(否则会把
+    /// 旧会话 / 手输的 `excluded-provider/model` 路由到用户已移出整合的 provider,违反子集
+    /// 语义,#477 P2 round-6)→ 直接退默认 provider。`false` = 单 provider / 池空回退,保留
+    /// legacy 拆分(向后兼容)。由 `with_catalog_slug_map` 按「反查表非空」自动置位。
+    pub pool_enabled: bool,
 }
 
 impl StaticResolver {
@@ -141,11 +147,15 @@ impl StaticResolver {
             providers,
             default_provider_id,
             catalog_slug_map: HashMap::new(),
+            pool_enabled: false,
         }
     }
 
     /// 装配池化反查表(builder 形式,保持 `new` 三参签名不变 → 既有调用 / 测试不破)。
+    /// 反查表非空 ⟺ 池化模式(proxy_runner 仅在 expose 开 + 池非空时灌非空表)→ 同步置
+    /// `pool_enabled`,作为 legacy slug-split 是否禁用的**显式**状态。
     pub fn with_catalog_slug_map(mut self, map: HashMap<String, (usize, String)>) -> Self {
+        self.pool_enabled = !map.is_empty();
         self.catalog_slug_map = map;
         self
     }
@@ -349,9 +359,13 @@ fn decide_provider<'a>(
             );
         }
         // 1. "<slug>/<model>" 约定:按 provider slug 路由(手动调用 / 池化前兼容)。
-        if let Some((slug, real)) = model.split_once('/') {
-            if let Some(p) = res.find_by_slug(slug) {
-                return Some((p, Some(strip_internal_model_suffix(real))));
+        //    **仅非池化模式**才走:池化模式下反查表 = 整合子集的全集,miss 必须退默认 provider,
+        //    不能用 legacy 拆分把 `excluded-provider/model`(用户移出整合的)路由回去(#477 P2 round-6)。
+        if !res.pool_enabled {
+            if let Some((slug, real)) = model.split_once('/') {
+                if let Some(p) = res.find_by_slug(slug) {
+                    return Some((p, Some(strip_internal_model_suffix(real))));
+                }
             }
         }
     }
@@ -874,5 +888,28 @@ mod tests {
             .unwrap();
         assert_eq!(res.provider_id, "deepseek");
         assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn pool_mode_does_not_legacy_route_excluded_provider_slug() {
+        // #477 P2 round-6:池化模式(反查表非空)下,请求一个**不在整合子集**的 provider slug
+        // (用户已移出整合 / 旧会话遗留)→ 反查表 miss → **不**走 legacy split 路由回该 provider,
+        // 退默认 provider。子集语义:移出整合的 provider 不该再被路由到。
+        let providers = vec![
+            provider("openai", "https://up-1", "sk-1"), // default + 在整合子集
+            provider("deepseek", "https://up-2", "sk-2"), // 已移出整合(不在反查表)
+        ];
+        let mut map = HashMap::new();
+        map.insert("openai/o-pro".to_owned(), (0usize, "o-pro".to_owned()));
+        let r =
+            StaticResolver::new(None, providers, Some("openai".into())).with_catalog_slug_map(map);
+        let p = parts_with(&[]);
+        let res = r
+            .resolve(&p, br#"{"model":"deepseek/deepseek-v4-pro"}"#)
+            .unwrap();
+        assert_eq!(
+            res.provider_id, "openai",
+            "池化下 excluded provider 的 slug 应退默认 provider,绝不 legacy 路由回 deepseek"
+        );
     }
 }
