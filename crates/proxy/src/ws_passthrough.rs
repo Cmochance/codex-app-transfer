@@ -40,19 +40,74 @@ use crate::telemetry::proxy_telemetry;
 /// 前置)路径更长、不等于此常量,落 fallback 的普通 passthrough。
 pub const REMOTE_CONTROL_WS_PATH: &str = "/backend-api/wham/remote/control/server";
 
-/// WS 透传专用上游 client:`http1_only`(WS upgrade 需 HTTP/1.1)+ rustls + system-proxy,
-/// 进程级 `OnceLock` 复用连接池。**独立于 state.http**(reqwest 0.12),用 reqwest 0.13
-/// (package `reqwest13`)配 reqwest-websocket 0.6。
+/// WS 透传专用上游 client:`http1_only`(WS upgrade 需 HTTP/1.1)+ rustls,进程级 `OnceLock`
+/// 复用连接池。**独立于 state.http**(reqwest 0.12),用 reqwest 0.13(package `reqwest13`)配
+/// reqwest-websocket 0.6。
+///
+/// **代理路由(MOC-234 实证关键)**:VPN fake-ip(TUN)模式会**破坏 WS upgrade**(实测对上游
+/// 直发握手返 426,WS 根本到不了真实端点);必须走 VPN 的**显式 HTTP/SOCKS 代理**做原始 TCP
+/// 隧道,WS 握手才直达上游(实测经代理 426→401,即真正到达)。Codex 自己靠 `~/.codex/.env` 的
+/// `HTTP(S)_PROXY` 走代理;本 proxy 进程不继承该 env,故这里显式探测代理(见 [`upstream_ws_proxy`])
+/// 并 `.proxy()`。探测不到(无 VPN)→ 不设代理,退回直连(非 VPN 用户行为不变)。
 fn ws_upstream_client() -> &'static reqwest13::Client {
     static CLIENT: OnceLock<reqwest13::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest13::Client::builder()
+        let mut builder = reqwest13::Client::builder()
             .http1_only()
             .use_rustls_tls()
-            .connect_timeout(Duration::from_secs(20))
-            .build()
-            .expect("build WS upstream client")
+            .connect_timeout(Duration::from_secs(20));
+        if let Some(proxy_url) = upstream_ws_proxy() {
+            match reqwest13::Proxy::all(&proxy_url) {
+                Ok(p) => {
+                    builder = builder.proxy(p);
+                    proxy_telemetry()
+                        .logs
+                        .add("INFO", format!("[ws-upstream] 上游 WS 走代理: {proxy_url}"));
+                }
+                Err(e) => proxy_telemetry().logs.add(
+                    "WARN",
+                    format!("[ws-upstream] 代理 URL {proxy_url} 无效,退回直连: {e}"),
+                ),
+            }
+        }
+        builder.build().expect("build WS upstream client")
     })
+}
+
+/// 上游 WS 的代理来源:优先进程 env(`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`,大小写都认),
+/// 否则读 `~/.codex/.env`(用户给 Codex 配的「全通信走 VPN」代理)。返回首个非空代理 URL。
+/// 仅供 [`ws_upstream_client`] 用 —— 只为修 WS-over-TUN 被截断,不动 HTTP 转发(state.http)。
+fn upstream_ws_proxy() -> Option<String> {
+    for k in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(v) = std::env::var(k) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let content =
+        std::fs::read_to_string(std::path::Path::new(&home).join(".codex").join(".env")).ok()?;
+    for raw in content.lines() {
+        let line = raw.trim().strip_prefix("export ").unwrap_or(raw.trim());
+        for k in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+            if let Some(rest) = line.strip_prefix(&format!("{k}=")) {
+                let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 远程控制 WS 透传主流程:连 `wss://chatgpt.com{client_path}` 上游 → 双向 frame pump。
@@ -178,17 +233,20 @@ pub async fn proxy_responses_upstream_ws(
     }
 
     let mut upstream: UpWebSocket = match req.upgrade().send().await {
-        Ok(resp) => match resp.into_websocket().await {
-            Ok(ws) => ws,
-            Err(e) => {
-                telemetry.logs.add(
-                    "WARN",
-                    format!("[responses-ws] 上游 upgrade 失败(非 101): {e}"),
-                );
-                close_client(client_socket, "upstream ws upgrade failed").await;
-                return;
+        Ok(resp) => {
+            let status = resp.status();
+            match resp.into_websocket().await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    telemetry.logs.add(
+                        "WARN",
+                        format!("[responses-ws] 上游 upgrade 失败(status {status}): {e}"),
+                    );
+                    close_client(client_socket, "upstream ws upgrade failed").await;
+                    return;
+                }
             }
-        },
+        }
         Err(e) => {
             telemetry
                 .logs
@@ -495,7 +553,9 @@ mod tests {
         assert!(!should_forward_responses_ws_header("Authorization"));
         // OpenAI-Beta / x-codex-* 必须透传(上游 Responses WS v2 握手需要)
         assert!(should_forward_responses_ws_header("openai-beta"));
-        assert!(should_forward_responses_ws_header("x-codex-installation-id"));
+        assert!(should_forward_responses_ws_header(
+            "x-codex-installation-id"
+        ));
         // WS 握手头 / host 仍跳过(reqwest-websocket 重新生成)
         assert!(!should_forward_responses_ws_header("sec-websocket-key"));
         assert!(!should_forward_responses_ws_header("host"));
