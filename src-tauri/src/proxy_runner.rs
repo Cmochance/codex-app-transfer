@@ -11,12 +11,13 @@
 //! application-level gate middleware 等"兜底逻辑"—— `Runtime::shutdown_background`
 //! 是 tokio 提供的 OS-level "杀光所有 task" 原语,不需要 user-space cancel chain。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use codex_app_transfer_proxy::{build_router_with_relogin, StaticResolver};
-use codex_app_transfer_registry::{config_file, Config};
+use codex_app_transfer_registry::{build_catalog_slug_map, config_file, unique_pool_slugs, Config};
 use serde::Serialize;
 use tokio::sync::oneshot;
 
@@ -258,10 +259,21 @@ fn load_resolver_snapshot() -> Result<ResolverSnapshot, String> {
         .gateway_api_key
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "gateway api key was not generated".to_owned())?;
+
+    // 池化反查表:仅 `exposeAllProviderModels` 开时构建(与 catalog 生成端共用
+    // `unique_pool_slugs`,保证 slug 逐字一致)。关 → 空表 → `decide_provider` 退回
+    // slug-split / 默认 provider,行为与池化前完全一致。
+    let pool_map = if cfg.settings.expose_all_provider_models {
+        build_catalog_slug_map(&unique_pool_slugs(&cfg.providers))
+    } else {
+        HashMap::new()
+    };
+
     Ok(ResolverSnapshot {
         provider_count: cfg.providers.len(),
         active_provider: cfg.active_provider.clone(),
-        resolver: StaticResolver::new(Some(gateway_key), cfg.providers, cfg.active_provider),
+        resolver: StaticResolver::new(Some(gateway_key), cfg.providers, cfg.active_provider)
+            .with_catalog_slug_map(pool_map),
         gateway_auth: true,
     })
 }

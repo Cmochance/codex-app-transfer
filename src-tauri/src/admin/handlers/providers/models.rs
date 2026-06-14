@@ -3,7 +3,12 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use codex_app_transfer_registry::MODEL_ORDER;
 use serde_json::{json, Value};
 
@@ -571,7 +576,10 @@ pub async fn fetch_provider_models_payload(Json(payload): Json<Value>) -> impl I
     (status, Json(result)).into_response()
 }
 
-pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoResponse {
+pub async fn autofill_provider_models(
+    State(state): State<crate::admin::state::AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     // **不能在 with_config_write 闭包内 await**(closure 是 sync)。先 load 一份
     // provider snapshot 给 fetch 用,await long async 在锁外,然后真 mutate +
     // save 走 atomic RMW。
@@ -616,6 +624,8 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
     if let Err(e) = write_result {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    // 池模式:autofill 改了该 provider 的模型映射 → 全局池 catalog + 反查表重建(非 active 也是)。
+    super::resync_pool_if_enabled(&state).await;
     Json(json!({
         "success": true,
         "models": result.get("models").cloned().unwrap_or_else(|| json!([])),

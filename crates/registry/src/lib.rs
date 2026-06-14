@@ -31,8 +31,10 @@ pub use healing::heal_builtin_extra_headers;
 pub use healing::heal_builtin_provider_fields;
 pub use healing::heal_legacy_update_url;
 pub use model_alias::{
-    empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
-    provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,
+    build_catalog_slug_map, empty_model_mappings, has_internal_one_m_suffix,
+    normalize_model_mappings, openai_model_slot, pooled_model_ids, pooled_models_with_one_m,
+    provider_slug, strip_internal_model_suffix, unique_pool_slugs, PoolEntry, MODEL_ORDER,
+    MODEL_SLOTS, POOL_SLUG_SEPARATOR,
 };
 pub use model_context_policy::{
     documented_context_window, model_supports_1m, ONE_M_CONTEXT_WINDOW,

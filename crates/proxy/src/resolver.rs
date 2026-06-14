@@ -8,6 +8,7 @@
 //! `registry::Config` 的内存实现;Stage 4 接入 UI / 文件监听后,可换成
 //! `ConfigWatcher` 持有实时 config 的版本.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -120,6 +121,13 @@ pub struct StaticResolver {
     /// 当 incoming 请求里没法决定 provider 时,fallback 用的 id.
     /// 一般等于 `Config::active_provider`.
     pub default_provider_id: Option<String>,
+    /// 池化模式反查表:Codex catalog slug → (`providers` 下标, 上游真实 model)。
+    ///
+    /// 空 = 未开池化(或无可池模型)→ `decide_provider` 退回 slug-split / 默认
+    /// provider,行为与池化前**完全一致**。非空时由 `proxy_runner` 在启动时按
+    /// `settings.exposeAllProviderModels` gate 后用 `registry::unique_pool_slugs`
+    /// 构建(与 catalog 生成端**同一 helper**,保证 slug 逐字一致、不错路由)。
+    pub catalog_slug_map: HashMap<String, (usize, String)>,
 }
 
 impl StaticResolver {
@@ -132,7 +140,14 @@ impl StaticResolver {
             gateway_key,
             providers,
             default_provider_id,
+            catalog_slug_map: HashMap::new(),
         }
+    }
+
+    /// 装配池化反查表(builder 形式,保持 `new` 三参签名不变 → 既有调用 / 测试不破)。
+    pub fn with_catalog_slug_map(mut self, map: HashMap<String, (usize, String)>) -> Self {
+        self.catalog_slug_map = map;
+        self
     }
 
     fn find_by_id(&self, id: &str) -> Option<&Provider> {
@@ -309,25 +324,46 @@ fn decide_provider<'a>(
     res: &'a StaticResolver,
     body: &[u8],
 ) -> Option<(&'a Provider, Option<String>)> {
-    // 试着从 body JSON 里抠 "model".
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-        if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
-            if let Some((slug, real)) = model.split_once('/') {
-                if let Some(p) = res.find_by_slug(slug) {
-                    return Some((p, Some(strip_internal_model_suffix(real))));
-                }
+    // body JSON 里的 "model"(可能没有);只解析一次。
+    let model = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_owned));
+
+    if let Some(model) = model.as_deref() {
+        // 0. 池化反查表:catalog slug 精确命中 → 路由到该 provider + 改写成真实 model。
+        //    放最前:池化 slug 形如 "<base>/<real>",base 可能带碰撞后缀(-2),靠精确表
+        //    命中而非 find_by_slug 的裸 slug,避免碰撞误路由(把 prompt 发错上游)。
+        if let Some((idx, real)) = res.catalog_slug_map.get(model) {
+            if let Some(p) = res.providers.get(*idx) {
+                return Some((p, Some(real.clone())));
+            }
+            // 反查表命中但 idx 越界 = catalog↔map 单一真源约定被破坏(正常不可能:两端都用
+            // unique_pool_slugs 对同一 config 构建)。loud log 而非静默 fall through —— 否则会
+            // 落到默认 provider + 默认 model,把 prompt 发错上游。
+            crate::telemetry::proxy_telemetry().logs.add(
+                "ERROR",
+                format!(
+                    "POOL_SLUG_MAP_IDX_OUT_OF_RANGE: slug {model:?} → idx {idx} 越界(providers={}),fall through",
+                    res.providers.len()
+                ),
+            );
+        }
+        // 1. "<slug>/<model>" 约定:按 provider slug 路由(手动调用 / 池化前兼容)。
+        if let Some((slug, real)) = model.split_once('/') {
+            if let Some(p) = res.find_by_slug(slug) {
+                return Some((p, Some(strip_internal_model_suffix(real))));
             }
         }
     }
+
+    // 2. 默认 provider + 槽位映射改写。
     let provider = res.default_provider()?;
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-        if let Some(model) = v.get("model").and_then(|m| m.as_str()) {
-            if let Some(mapped) = res.map_model_for_provider(provider, model) {
-                return Some((provider, Some(mapped)));
-            }
+    if let Some(model) = model.as_deref() {
+        if let Some(mapped) = res.map_model_for_provider(provider, model) {
+            return Some((provider, Some(mapped)));
         }
     }
-    // 没 / 或没可映射 model → 走默认 provider.
+    // 没 / 或没可映射 model → 走默认 provider 不改写。
     Some((provider, None))
 }
 
@@ -778,5 +814,65 @@ mod tests {
         let res = r.resolve(&parts, b"{}").unwrap();
         assert_eq!(res.extra_headers.get("x-api-key").unwrap(), "sk-real-key");
         assert_eq!(res.extra_headers.get("x-plain").unwrap(), "no-template");
+    }
+
+    // ── 池化反查表路由(catalog_slug_map)──
+
+    #[test]
+    fn catalog_slug_map_routes_pool_slug_and_rewrites_model() {
+        let providers = vec![
+            provider("openai", "https://up-1", "sk-1"),
+            provider("deepseek", "https://up-2", "sk-2"),
+        ];
+        let mut map = HashMap::new();
+        map.insert(
+            "deepseek/deepseek-v4-pro".to_owned(),
+            (1usize, "deepseek-v4-pro".to_owned()),
+        );
+        let r =
+            StaticResolver::new(None, providers, Some("openai".into())).with_catalog_slug_map(map);
+        let p = parts_with(&[]);
+        let res = r
+            .resolve(&p, br#"{"model":"deepseek/deepseek-v4-pro"}"#)
+            .unwrap();
+        assert_eq!(res.provider_id, "deepseek");
+        assert_eq!(res.api_key, "sk-2");
+        assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+    }
+
+    #[test]
+    fn catalog_slug_map_resolves_collision_suffix_slug_that_find_by_slug_cannot() {
+        // 碰撞后缀 slug "x-2/m":没有任何 provider 的 provider_slug == "x-2",
+        // find_by_slug 永远命中不了 → 必须靠精确反查表路由到正确 provider。
+        let providers = vec![
+            provider("a", "https://up-a", "sk-a"),
+            provider("b", "https://up-b", "sk-b"),
+        ];
+        let mut map = HashMap::new();
+        map.insert("x-2/m".to_owned(), (1usize, "m".to_owned()));
+        let r = StaticResolver::new(None, providers, Some("a".into())).with_catalog_slug_map(map);
+        let p = parts_with(&[]);
+        let res = r.resolve(&p, br#"{"model":"x-2/m"}"#).unwrap();
+        assert_eq!(res.provider_id, "b");
+        assert_eq!(res.rewritten_model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn empty_catalog_slug_map_preserves_legacy_slug_split_routing() {
+        // 空表(未开池化)→ decide_provider 退回 "<slug>/<model>" split,行为不变。
+        let r = StaticResolver::new(
+            None,
+            vec![
+                provider("openai", "https://up-1", "sk-1"),
+                provider("deepseek", "https://up-2", "sk-2"),
+            ],
+            Some("openai".into()),
+        );
+        let p = parts_with(&[]);
+        let res = r
+            .resolve(&p, br#"{"model":"deepseek/deepseek-v4-pro"}"#)
+            .unwrap();
+        assert_eq!(res.provider_id, "deepseek");
+        assert_eq!(res.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
     }
 }

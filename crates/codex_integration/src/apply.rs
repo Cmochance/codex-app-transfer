@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{read_auth, write_auth};
 use crate::model_catalog::{
     catalog_models_for_provider_with_display_names, clear_catalog_models, upsert_catalog_models,
-    CODEX_MODEL_CATALOG_KEY,
+    CatalogModel, CODEX_MODEL_CATALOG_KEY,
 };
 use crate::paths::CodexPaths;
 use crate::snapshot::{
@@ -104,6 +104,16 @@ pub struct ApplyConfig<'a> {
     /// 改走现有 `openai_base_url` 根键路径。
     #[serde(default)]
     pub preserve_chatgpt_auth: bool,
+    /// **池化模式**:全 provider 的 catalog 模型列表(由 src-tauri 用
+    /// `unique_pool_slugs` + `catalog_models_for_pool` 构建)。`Some` → catalog 写池
+    /// (Codex picker 显示所有 provider 的所有模型);`None` → 走单 active provider 路径
+    /// (与池化前**字节一致**)。仅 local_proxy 模式可能为 `Some`(direct 不写 catalog)。
+    #[serde(skip)]
+    pub pool: Option<&'a [CatalogModel]>,
+    /// 池模式下 root `model` 锚定目标 slug(一般是 active provider 的池默认 slug)。
+    /// 仅当当前 config.toml 的 `model` 不在新 catalog 时用它重置(单模式锚 `gpt-5.5`)。
+    #[serde(skip)]
+    pub pool_default_slug: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -243,15 +253,21 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
             CODEX_MODEL_CATALOG_KEY,
             Some(&catalog_literal),
         )?;
-        let models = catalog_models_for_provider_with_display_names(
-            cfg.provider_name,
-            cfg.default_model,
-            cfg.supports_1m,
-            cfg.model_mappings,
-            cfg.model_capabilities,
-            cfg.model_display_names,
-            cfg.review_model_slot,
-        );
+        // 池化模式:catalog = 全 provider 的池条目(src-tauri 已构建好);否则单 active
+        // provider 路径(与池化前字节一致)。
+        let models = if let Some(pool) = cfg.pool {
+            pool.to_vec()
+        } else {
+            catalog_models_for_provider_with_display_names(
+                cfg.provider_name,
+                cfg.default_model,
+                cfg.supports_1m,
+                cfg.model_mappings,
+                cfg.model_capabilities,
+                cfg.model_display_names,
+                cfg.review_model_slot,
+            )
+        };
         upsert_catalog_models(&paths.model_catalog_json, &models)?;
         // [MOC-154] 列表式:Codex `model` 字段统一锚到 catalog 内的有效 slug。去掉旧
         // fallback entry 后,遗留的 `model = 实际模型名`(用户在旧版映射 UI 下选过)会不在
@@ -279,11 +295,35 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        let model_needs_reset = current_model
-            .as_deref()
-            .is_some_and(|m| !m.is_empty() && !models.iter().any(|cm| cm.slug == m));
-        if model_needs_reset && models.iter().any(|cm| cm.slug == "gpt-5.5") {
-            sync_root_value(&paths.config_toml, "model", Some("\"gpt-5.5\""))?;
+        let model_needs_reset = match current_model.as_deref() {
+            Some(m) => !m.is_empty() && !models.iter().any(|cm| cm.slug == m),
+            // 池模式下 config 无 root `model` key:Codex 隐式默认 gpt-5.5,但池 catalog 不含
+            // 该 slug(全是 `<provider>/<model>`)→ 必须主动锚到池默认 slug,否则新会话起在
+            // 一个不在 catalog 的隐式模型上(bot review P2)。单模式 catalog 含 gpt-5.5,隐式
+            // 默认即可、不强写(保持原行为)。
+            None => cfg.pool.is_some(),
+        };
+        if model_needs_reset {
+            // 锚定目标:池模式 → active provider 的池默认 slug(回退到首条池条目);
+            // 单模式 → gpt-5.5。只在目标确实在刚写入的 catalog 里时才重置(守
+            // no-silent-destructive:绝不把 model 设成 catalog 没有的 slug)。
+            let anchor: Option<&str> = if cfg.pool.is_some() {
+                match cfg.pool_default_slug {
+                    Some(s) if !s.is_empty() && models.iter().any(|cm| cm.slug == s) => Some(s),
+                    _ => models.first().map(|m| m.slug.as_str()),
+                }
+            } else if models.iter().any(|cm| cm.slug == "gpt-5.5") {
+                Some("gpt-5.5")
+            } else {
+                None
+            };
+            if let Some(anchor) = anchor {
+                sync_root_value(
+                    &paths.config_toml,
+                    "model",
+                    Some(&toml_string_literal(anchor)),
+                )?;
+            }
         }
         if cfg.supports_1m {
             sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
@@ -624,6 +664,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -681,6 +723,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: true,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -729,6 +773,8 @@ mod tests {
                 codex_network_access: false,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -776,6 +822,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -845,6 +893,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -913,6 +963,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -978,6 +1030,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1019,6 +1073,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1037,6 +1093,68 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m["slug"] == "gpt-5.5"));
+    }
+
+    #[test]
+    fn apply_pool_anchors_model_when_config_has_no_model_key() {
+        // bot review P2:全新 config(无 root `model`)+ 池模式 → 必须锚到 pool_default_slug,
+        // 否则 Codex 隐式默认 gpt-5.5,而池 catalog 全是 `<provider>/<model>` slug、不含它。
+        let (_t, paths) = setup();
+        let pool = vec![
+            CatalogModel {
+                slug: "deepseek/deepseek-v4-pro".into(),
+                display_name: "DeepSeek / deepseek-v4-pro".into(),
+                provider_name: "DeepSeek".into(),
+                context_window: 1_000_000,
+                effective_context_window_percent: 95,
+                auto_review_model_override: None,
+            },
+            CatalogModel {
+                slug: "kimi/kimi-k2.6".into(),
+                display_name: "Kimi / kimi-k2.6".into(),
+                provider_name: "Kimi".into(),
+                context_window: 262_144,
+                effective_context_window_percent: 95,
+                auto_review_model_override: None,
+            },
+        ];
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "k",
+                supports_1m: false,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro",
+                model_mappings: None,
+                model_capabilities: None,
+                model_display_names: None,
+                review_model_slot: None,
+                app_version: "v",
+                codex_network_access: true,
+                direct: false,
+                preserve_chatgpt_auth: false,
+                pool: Some(&pool),
+                pool_default_slug: Some("deepseek/deepseek-v4-pro"),
+            },
+        )
+        .unwrap();
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains(r#"model = "deepseek/deepseek-v4-pro""#),
+            "全新 pool config 应锚到 pool_default_slug:\n{toml}"
+        );
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.model_catalog_json).unwrap()).unwrap();
+        let slugs: Vec<&str> = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["slug"].as_str())
+            .collect();
+        assert!(slugs.contains(&"deepseek/deepseek-v4-pro"));
+        assert!(slugs.contains(&"kimi/kimi-k2.6"));
+        assert!(!slugs.contains(&"gpt-5.5"), "池 catalog 不应含 gpt-5.5");
     }
 
     #[test]
@@ -1068,6 +1186,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1109,6 +1229,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1130,6 +1252,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1182,6 +1306,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1228,6 +1354,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1293,6 +1421,8 @@ mod tests {
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1477,6 +1607,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1546,6 +1678,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1567,6 +1701,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1602,6 +1738,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1629,6 +1767,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1663,6 +1803,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1703,6 +1845,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1755,6 +1899,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1810,6 +1956,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1865,6 +2013,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1901,6 +2051,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true, // 即便 on,direct 也不写 sandbox
                 direct: true,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1955,6 +2107,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -1980,6 +2134,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: true,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -2042,6 +2198,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: true,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
@@ -2352,6 +2510,8 @@ model = \"gpt-5.5\"
                 codex_network_access: true,
                 direct: false,
                 preserve_chatgpt_auth: false,
+                pool: None,
+                pool_default_slug: None,
             },
         )
         .unwrap();
