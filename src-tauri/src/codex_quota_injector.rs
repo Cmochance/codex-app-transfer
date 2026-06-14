@@ -1096,13 +1096,25 @@ async fn fetch_antigravity_quota(
     }
 }
 
-/// [MOC-211] 取 GLM Coding 双窗口额度(baseUrl host gate + 45s 缓存)。非 GLM coding provider /
-/// key 失效 → 清缓存 + None(不显额度行)。用推理同一把 apiKey 查 monitor 端口(不带 Bearer),
-/// 失败按 [`crate::glm_quota::QuotaError`] 分类(Auth=清缓存 / Transient=留旧缓存重试),
-/// 与 antigravity 同一套缓存语义。
+/// [MOC-211] 额度缓存指纹:把账号身份(host+key / id+cookie)散列,缓存命中前比对——切账号
+/// (同 provider 类型换 key / 账号)即视为缓存失效,避免 45s TTL 内串显上个账号的额度/余额。
+fn quota_fingerprint(parts: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+        0xffu8.hash(&mut h); // 段分隔,防 ("ab","c") 与 ("a","bc") 碰撞
+    }
+    h.finish()
+}
+
+/// [MOC-211] 取 GLM Coding 双窗口额度(baseUrl host gate + 账号指纹 + 45s 缓存)。非 GLM coding
+/// provider / key 失效 → 清缓存 + None(不显额度行)。用推理同一把 apiKey 查 monitor 端口(不带
+/// Bearer),失败按 [`crate::glm_quota::QuotaError`] 分类(Auth=清缓存 / Transient=同账号留旧缓存
+/// 重试),与 antigravity 同一套缓存语义。
 async fn fetch_glm_quota(
     http: &Option<reqwest::Client>,
-    cache: &mut Option<(ProviderQuota, std::time::Instant)>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
 ) -> Option<ProviderQuota> {
     use crate::glm_quota::{fetch_glm_quota_summary, QuotaError};
     const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
@@ -1111,15 +1123,17 @@ async fn fetch_glm_quota(
         *cache = None;
         return None;
     };
-    if let Some((q, at)) = cache.as_ref() {
-        if at.elapsed() < QUOTA_TTL {
+    let fp = quota_fingerprint(&[&host, &api_key]);
+    // 命中缓存需同账号(指纹一致)且未过期;切账号即失效重取。
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
             return Some(q.clone());
         }
     }
     let http = http.as_ref()?;
     match fetch_glm_quota_summary(http, &host, &api_key).await {
         Ok(q) => {
-            *cache = Some((q.clone(), std::time::Instant::now()));
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
             Some(q)
         }
         // 401/403:key 服务端失效 / 非 coding-plan key → 清缓存,不残留。
@@ -1128,13 +1142,19 @@ async fn fetch_glm_quota(
             *cache = None;
             None
         }
-        // 网络 / 5xx / 429 / 解析瞬时失败:留旧缓存 + 刷新时间戳(下个 TTL 周期再试)。
+        // 网络 / 5xx / 429 / 解析瞬时失败:仅同账号(指纹一致)留旧缓存 + 刷新时间戳;切了账号不回旧值。
         Err(QuotaError::Transient(e)) => {
             tracing::debug!(error = %e, "[Quota] GLM quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
-            if let Some((_, at)) = cache.as_mut() {
-                *at = std::time::Instant::now();
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
             }
-            cache.as_ref().map(|(q, _)| q.clone())
         }
     }
 }
@@ -1144,7 +1164,7 @@ async fn fetch_glm_quota(
 /// 提示重登;MiMo session 无 refresh,只能重新登录)。
 async fn fetch_mimo_quota(
     http: &Option<reqwest::Client>,
-    cache: &mut Option<(ProviderQuota, std::time::Instant)>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
 ) -> Option<ProviderQuota> {
     use crate::mimo_quota::{fetch_mimo_quota_summary, QuotaError};
     const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
@@ -1152,15 +1172,17 @@ async fn fetch_mimo_quota(
         *cache = None;
         return None;
     };
-    if let Some((q, at)) = cache.as_ref() {
-        if at.elapsed() < QUOTA_TTL {
+    // 指纹按 (provider id, cookie):换账号重登(cookie 变)即缓存失效。
+    let fp = quota_fingerprint(&[&id, &cookie]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
             return Some(q.clone());
         }
     }
     let http = http.as_ref()?;
     match fetch_mimo_quota_summary(http, &cookie).await {
         Ok(q) => {
-            *cache = Some((q.clone(), std::time::Instant::now()));
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
             Some(q)
         }
         Err(QuotaError::Auth) => {
@@ -1171,10 +1193,16 @@ async fn fetch_mimo_quota(
         }
         Err(QuotaError::Transient(e)) => {
             tracing::debug!(error = %e, "[Quota] MiMo quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
-            if let Some((_, at)) = cache.as_mut() {
-                *at = std::time::Instant::now();
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
             }
-            cache.as_ref().map(|(q, _)| q.clone())
         }
     }
 }
@@ -1183,7 +1211,7 @@ async fn fetch_mimo_quota(
 /// None。用推理同一把 apiKey 查官方 `/user/balance`。
 async fn fetch_deepseek_quota(
     http: &Option<reqwest::Client>,
-    cache: &mut Option<(ProviderQuota, std::time::Instant)>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
 ) -> Option<ProviderQuota> {
     use crate::deepseek_quota::{fetch_deepseek_balance, QuotaError};
     const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
@@ -1191,15 +1219,16 @@ async fn fetch_deepseek_quota(
         *cache = None;
         return None;
     };
-    if let Some((q, at)) = cache.as_ref() {
-        if at.elapsed() < QUOTA_TTL {
+    let fp = quota_fingerprint(&[&host, &api_key]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
             return Some(q.clone());
         }
     }
     let http = http.as_ref()?;
     match fetch_deepseek_balance(http, &host, &api_key).await {
         Ok(q) => {
-            *cache = Some((q.clone(), std::time::Instant::now()));
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
             Some(q)
         }
         Err(QuotaError::Auth(s)) => {
@@ -1209,10 +1238,16 @@ async fn fetch_deepseek_quota(
         }
         Err(QuotaError::Transient(e)) => {
             tracing::debug!(error = %e, "[Quota] DeepSeek balance 瞬时失败,留旧缓存(下个 TTL 周期重试)");
-            if let Some((_, at)) = cache.as_mut() {
-                *at = std::time::Instant::now();
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
             }
-            cache.as_ref().map(|(q, _)| q.clone())
         }
     }
 }
@@ -1221,7 +1256,7 @@ async fn fetch_deepseek_quota(
 /// None。用推理同一把 apiKey 查 OpenAI 兼容 `/v1/dashboard/billing/usage`(end_date=本地当天)。
 async fn fetch_anyrouter_quota(
     http: &Option<reqwest::Client>,
-    cache: &mut Option<(ProviderQuota, std::time::Instant)>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
 ) -> Option<ProviderQuota> {
     use crate::anyrouter_quota::{fetch_anyrouter_usage, QuotaError};
     const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
@@ -1229,8 +1264,9 @@ async fn fetch_anyrouter_quota(
         *cache = None;
         return None;
     };
-    if let Some((q, at)) = cache.as_ref() {
-        if at.elapsed() < QUOTA_TTL {
+    let fp = quota_fingerprint(&[&host, &api_key]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
             return Some(q.clone());
         }
     }
@@ -1238,7 +1274,7 @@ async fn fetch_anyrouter_quota(
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     match fetch_anyrouter_usage(http, &host, &api_key, &today).await {
         Ok(q) => {
-            *cache = Some((q.clone(), std::time::Instant::now()));
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
             Some(q)
         }
         Err(QuotaError::Auth(s)) => {
@@ -1248,10 +1284,16 @@ async fn fetch_anyrouter_quota(
         }
         Err(QuotaError::Transient(e)) => {
             tracing::debug!(error = %e, "[Quota] anyrouter usage 瞬时失败,留旧缓存(下个 TTL 周期重试)");
-            if let Some((_, at)) = cache.as_mut() {
-                *at = std::time::Instant::now();
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
             }
-            cache.as_ref().map(|(q, _)| q.clone())
         }
     }
 }
@@ -1297,10 +1339,11 @@ pub async fn run_quota_daemon() {
     )> = None;
     // [MOC-211] GLM Coding / MiMo Token Plan / DeepSeek 额度缓存(各自独立;各源按活动 provider
     // 互斥、self-gate,最多一个返 Some)。
-    let mut glm_cache: Option<(ProviderQuota, std::time::Instant)> = None;
-    let mut mimo_cache: Option<(ProviderQuota, std::time::Instant)> = None;
-    let mut deepseek_cache: Option<(ProviderQuota, std::time::Instant)> = None;
-    let mut anyrouter_cache: Option<(ProviderQuota, std::time::Instant)> = None;
+    // 缓存带账号指纹(u64):切同类型 provider 的不同账号时即失效,不串旧账号额度。
+    let mut glm_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut mimo_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut deepseek_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut anyrouter_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。

@@ -135,6 +135,9 @@
       apiFormat: ['openai', 'openai_chat'].includes(provider.apiFormat) ? 'openai_chat' : (provider.apiFormat || 'openai_chat'),
       authScheme: provider.authScheme || 'bearer',
       hasApiKey: !!provider.hasApiKey,
+      // [MOC-211] 后端 public_provider mask 出 mimoCookie、只暴露 hasMimoCookie;显式挑字段
+      // 必须带上,否则编辑页登录后仍显「未登录」(mapper 不列即丢,见 api.js mapper 契约)。
+      hasMimoCookie: !!provider.hasMimoCookie,
       extraHeaders: provider.extraHeaders || {},
       modelCapabilities: provider.modelCapabilities || {},
       requestOptions: provider.requestOptions || {},
