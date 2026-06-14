@@ -10,6 +10,8 @@ mod codex_real_account;
 mod codex_theme_injector;
 mod glm_quota;
 mod mcp_webfetch_server;
+mod mimo_quota;
+mod mimo_session;
 mod provider_quota;
 mod proxy_runner;
 #[cfg(target_os = "macos")]
@@ -95,6 +97,9 @@ fn main() {
         })
         .setup(|app| {
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
+            // [MOC-211] 存全局 AppHandle 供 MiMo 小米账号内嵌 webview 登录开窗用
+            // (AdminState 在建 router 时尚无 AppHandle,故走全局 OnceLock)。
+            mimo_session::init(app.handle().clone());
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
 
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
@@ -501,6 +506,11 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
+                // [MOC-211] 只有主窗口走「关闭=隐藏到托盘」;其它窗口(如 MiMo 小米账号登录
+                // webview)应正常关闭销毁,否则红叉会连主 app 一起隐藏、窗口也不被销毁。
+                if window.label() != "main" {
+                    return;
+                }
                 api.prevent_close();
                 // macOS:用 NSApp.hide:(`app.hide()`)而不是 NSWindow.orderOut:
                 // (`window.hide()`)。NSApp.hide/unhide 是 Apple 提供的 app 级

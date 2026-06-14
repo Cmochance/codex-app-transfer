@@ -710,30 +710,23 @@ fn fmt_reset_local(rfc3339: Option<&str>) -> Option<String> {
 
 /// 单条额度 bar(5h / weekly):显**剩余**百分比(满额=100,条满)+ 绝对重置时间点;
 /// 剩余 ≤10% 标红预警(`hot`,由 JS 上色——额度类红色判定与 used 类相反,故显式传)。
-fn quota_bar(label: &str, w: &QuotaWindow) -> serde_json::Value {
+fn quota_bar(w: &QuotaWindow) -> serde_json::Value {
     let pct = w.remaining_percent.round() as i64;
     let detail = match fmt_reset_local(w.reset_rfc3339.as_deref()) {
         Some(t) => format!("{pct}% · {t} 刷新"),
         None => format!("{pct}%"),
     };
-    json!({"kind":"bar","cls":"quota","label":label,"pct":pct,"detail":detail,"hot":pct <= 10})
+    json!({"kind":"bar","cls":"quota","label":w.label,"pct":pct,"detail":detail,"hot":pct <= 10})
 }
 
-/// [MOC-204 Phase 3 / MOC-211] 额度两行:白名单 provider(antigravity gemini 系 / GLM Coding)
-/// 有真实双窗口额度 → 5h + weekly 两 bar;非白名单 / 拿不到 → 空(不显额度行)。各 provider
-/// 的额度已在 fetcher 里归一成 [`ProviderQuota`]。
+/// [MOC-204 / MOC-211] 额度行:白名单 provider 的每个窗口渲染一条 bar(antigravity/GLM =
+/// 5h + 每周;MiMo = 套餐用量月窗口)。label 随窗口走,故 5h/周 与 月度套餐各显各、互不混。
+/// 非白名单 / 拿不到 → 空(不显额度行)。
 fn quota_rows(quota: Option<&ProviderQuota>) -> Vec<serde_json::Value> {
-    let Some(q) = quota else {
-        return vec![];
-    };
-    let mut rows = Vec::new();
-    if let Some(w) = &q.five_hour {
-        rows.push(quota_bar("5 小时额度", w));
+    match quota {
+        Some(q) => q.windows.iter().map(quota_bar).collect(),
+        None => vec![],
     }
-    if let Some(w) = &q.weekly {
-        rows.push(quota_bar("每周额度", w));
-    }
-    rows
 }
 
 /// [MOC-204 Phase 2] 本地用量两行:
@@ -918,6 +911,64 @@ fn active_glm_provider() -> Option<(String, String)> {
     Some((host, api_key.to_string()))
 }
 
+/// [MOC-211] 活动 provider 若是 MiMo Token Plan(baseUrl host 含 `xiaomimimo.com` 且路径含
+/// `token-plan`)且已存网页 session → 返回 `(provider id, mimoCookie)`,否则 None。按量计费的
+/// MiMo(`api.xiaomimimo.com`,无 token-plan)不匹配——它无订阅套餐额度。额度查询走小米账号
+/// session(见 mimo_quota / mimo_session),非 apiKey。
+fn active_mimo_session() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    if !(host.ends_with("xiaomimimo.com") && base_url.contains("token-plan")) {
+        return None;
+    }
+    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
+    let cookie = p
+        .get("mimoCookie")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((id, cookie))
+}
+
+/// session 失效(Auth)时清掉该 provider 存的 `mimoCookie`,让前端 `hasMimoCookie` 转 false
+/// 显「未登录」、提示重新登录(MiMo session 无 refresh,只能重登)。
+fn clear_mimo_cookie(provider_id: &str) {
+    let _ = crate::admin::registry_io::with_config_write(|cfg| {
+        let Some(providers) = cfg
+            .as_object_mut()
+            .and_then(|o| o.get_mut("providers"))
+            .and_then(|v| v.as_array_mut())
+        else {
+            return Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()));
+        };
+        let mut changed = false;
+        for p in providers.iter_mut() {
+            if p.get("id").and_then(|v| v.as_str()) == Some(provider_id) {
+                if let Some(obj) = p.as_object_mut() {
+                    if obj.remove("mimoCookie").is_some() {
+                        changed = true;
+                    }
+                }
+                break;
+            }
+        }
+        if changed {
+            Ok(crate::admin::registry_io::ConfigMutation::Modified(()))
+        } else {
+            Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()))
+        }
+    });
+}
+
 /// 取 antigravity gemini 双窗口额度(白名单 gate + token 校验 + 45s 缓存)。非白名单 /
 /// token 失效 → 清缓存 + None(不显额度行)。token 复用文件 refresh_token 刷新(同 app)。
 async fn fetch_antigravity_quota(
@@ -1030,6 +1081,46 @@ async fn fetch_glm_quota(
     }
 }
 
+/// [MOC-211] 取 MiMo 套餐用量(host gate + 网页 session cookie + 45s 缓存)。非 MiMo token-plan /
+/// 无 cookie → 清缓存 + None。session 失效(Auth)→ 清缓存 + 清存储 cookie(前端转「未登录」
+/// 提示重登;MiMo session 无 refresh,只能重新登录)。
+async fn fetch_mimo_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::mimo_quota::{fetch_mimo_quota_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((id, cookie)) = active_mimo_session() else {
+        *cache = None;
+        return None;
+    };
+    if let Some((q, at)) = cache.as_ref() {
+        if at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_mimo_quota_summary(http, &cookie).await {
+        Ok(q) => {
+            *cache = Some((q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth) => {
+            tracing::debug!("[Quota] MiMo session 失效 → 清缓存 + 清存储 cookie(需重新登录)");
+            *cache = None;
+            clear_mimo_cookie(&id);
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] MiMo quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            if let Some((_, at)) = cache.as_mut() {
+                *at = std::time::Instant::now();
+            }
+            cache.as_ref().map(|(q, _)| q.clone())
+        }
+    }
+}
+
 /// 按阶段分级记录推送失败:connect 失败 = Codex 没跑(常态,debug);
 /// evaluate 失败 = Codex 在跑但注入坏了(真异常,warn 一次后去重降 debug,
 /// 防 5s tick 刷屏;成功后复位再坏会再 warn)。
@@ -1069,8 +1160,10 @@ pub async fn run_quota_daemon() {
         codex_app_transfer_gemini_oauth::GeminiQuota,
         std::time::Instant,
     )> = None;
-    // [MOC-211] GLM Coding 额度缓存(独立于 antigravity;两源按活动 provider 互斥,各自 self-gate)。
+    // [MOC-211] GLM Coding / MiMo Token Plan 额度缓存(各自独立;三源按活动 provider 互斥、
+    // 各自 self-gate,最多一个返 Some)。
     let mut glm_cache: Option<(ProviderQuota, std::time::Instant)> = None;
+    let mut mimo_cache: Option<(ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -1099,7 +1192,8 @@ pub async fn run_quota_daemon() {
             .await
             .map(ProviderQuota::from);
         let glm = fetch_glm_quota(&quota_http, &mut glm_cache).await;
-        let quota = antigravity.or(glm);
+        let mimo = fetch_mimo_quota(&quota_http, &mut mimo_cache).await;
+        let quota = antigravity.or(glm).or(mimo);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
         match push_via_cdp(payload).await {
@@ -1286,17 +1380,21 @@ mod tests {
 
     #[test]
     fn build_payload_with_quota_shows_two_quota_bars() {
-        // [MOC-204 Phase 3 / MOC-211] 白名单 provider:5h + weekly 两 bar 在前,显**剩余**百分比。
-        // 用中性 ProviderQuota(antigravity 与 GLM 都归一到它)。
+        // [MOC-204 / MOC-211] 白名单 provider:5h + weekly 两 bar 在前,显**剩余**百分比。
+        // 用中性 ProviderQuota 多窗口(antigravity / GLM 都归一到它)。
         let q = ProviderQuota {
-            five_hour: Some(QuotaWindow {
-                remaining_percent: 94.0, // 剩 94%
-                reset_rfc3339: Some("2026-06-13T17:56:06Z".into()),
-            }),
-            weekly: Some(QuotaWindow {
-                remaining_percent: 8.0, // 剩 8% → 应标红 hot
-                reset_rfc3339: Some("2026-06-20T12:56:06Z".into()),
-            }),
+            windows: vec![
+                QuotaWindow {
+                    label: "5 小时额度".into(),
+                    remaining_percent: 94.0, // 剩 94%
+                    reset_rfc3339: Some("2026-06-13T17:56:06Z".into()),
+                },
+                QuotaWindow {
+                    label: "每周额度".into(),
+                    remaining_percent: 8.0, // 剩 8% → 应标红 hot
+                    reset_rfc3339: Some("2026-06-20T12:56:06Z".into()),
+                },
+            ],
         };
         let p = build_payload(Some(&q), None);
         let rows = p["rows"].as_array().expect("rows");

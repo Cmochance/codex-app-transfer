@@ -43,17 +43,20 @@ fn reset_ms_to_rfc3339(ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
 }
 
-/// 从 `monitor/usage/quota/limit` 响应提取 5h + weekly 双窗口。纯函数,可测。
-/// 只取 `TOKENS_LIMIT`(按 unit/number 归位);`TIME_LIMIT`(MCP 工具额度)忽略。
+/// 从 `monitor/usage/quota/limit` 响应提取 5h + weekly 双窗口,产出带 label 的窗口列表
+/// (5 小时额度 / 每周额度,固定顺序)。纯函数,可测。只取 `TOKENS_LIMIT`(按 unit/number
+/// 归位);`TIME_LIMIT`(MCP 工具额度)忽略。
 pub fn parse_glm_quota(json: &serde_json::Value) -> ProviderQuota {
-    let mut out = ProviderQuota::default();
     let Some(limits) = json
         .get("data")
         .and_then(|d| d.get("limits"))
         .and_then(|v| v.as_array())
     else {
-        return out;
+        return ProviderQuota::default();
     };
+    // 先归位到 5h / weekly(再按固定顺序 push,避免上游 limits 顺序影响展示顺序)。
+    let mut five_hour: Option<(f64, Option<String>)> = None;
+    let mut weekly: Option<(f64, Option<String>)> = None;
     for lim in limits {
         if lim.get("type").and_then(|v| v.as_str()) != Some("TOKENS_LIMIT") {
             continue;
@@ -62,22 +65,36 @@ pub fn parse_glm_quota(json: &serde_json::Value) -> ProviderQuota {
             .get("percentage")
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0);
-        let win = QuotaWindow {
-            remaining_percent: (100.0 - used).clamp(0.0, 100.0),
-            reset_rfc3339: lim
-                .get("nextResetTime")
-                .and_then(serde_json::Value::as_i64)
-                .and_then(reset_ms_to_rfc3339),
-        };
-        let unit = lim.get("unit").and_then(serde_json::Value::as_i64);
-        let number = lim.get("number").and_then(serde_json::Value::as_i64);
-        match (unit, number) {
-            (Some(3), Some(5)) => out.five_hour = Some(win),
-            (Some(6), Some(1)) => out.weekly = Some(win),
+        let remaining = (100.0 - used).clamp(0.0, 100.0);
+        let reset = lim
+            .get("nextResetTime")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(reset_ms_to_rfc3339);
+        match (
+            lim.get("unit").and_then(serde_json::Value::as_i64),
+            lim.get("number").and_then(serde_json::Value::as_i64),
+        ) {
+            (Some(3), Some(5)) => five_hour = Some((remaining, reset)),
+            (Some(6), Some(1)) => weekly = Some((remaining, reset)),
             _ => {}
         }
     }
-    out
+    let mut windows = Vec::new();
+    if let Some((remaining, reset)) = five_hour {
+        windows.push(QuotaWindow {
+            label: "5 小时额度".into(),
+            remaining_percent: remaining,
+            reset_rfc3339: reset,
+        });
+    }
+    if let Some((remaining, reset)) = weekly {
+        windows.push(QuotaWindow {
+            label: "每周额度".into(),
+            remaining_percent: remaining,
+            reset_rfc3339: reset,
+        });
+    }
+    ProviderQuota { windows }
 }
 
 /// 调 monitor 端口取 GLM coding 双窗口额度。`base_host` = provider.baseUrl 的 host
@@ -133,14 +150,22 @@ mod tests {
         })
     }
 
+    fn win<'a>(q: &'a ProviderQuota, label: &str) -> Option<&'a QuotaWindow> {
+        q.windows.iter().find(|w| w.label == label)
+    }
+
     #[test]
     fn parses_both_token_windows_as_remaining() {
         let q = parse_glm_quota(&real_response());
+        assert_eq!(q.windows.len(), 2);
+        // 顺序:5 小时额度 在前、每周额度 在后
+        assert_eq!(q.windows[0].label, "5 小时额度");
+        assert_eq!(q.windows[1].label, "每周额度");
         // percentage=已用 → 剩余 = 100 - 已用
-        let h = q.five_hour.expect("5h");
+        let h = win(&q, "5 小时额度").expect("5h");
         assert!((h.remaining_percent - 78.0).abs() < 1e-6, "5h 已用 22 → 剩 78");
         assert!(h.reset_rfc3339.is_some(), "5h 重置时刻应解析自 nextResetTime");
-        let w = q.weekly.expect("weekly");
+        let w = win(&q, "每周额度").expect("weekly");
         assert!((w.remaining_percent - 75.0).abs() < 1e-6, "weekly 已用 25 → 剩 75");
     }
 
@@ -148,7 +173,7 @@ mod tests {
     fn ignores_time_limit_mcp_bucket() {
         // TIME_LIMIT(MCP 工具)不应被当成 token 窗口;只保留两个 TOKENS_LIMIT。
         let q = parse_glm_quota(&real_response());
-        assert!(q.five_hour.is_some() && q.weekly.is_some());
+        assert_eq!(q.windows.len(), 2);
     }
 
     #[test]
@@ -159,13 +184,14 @@ mod tests {
 
     #[test]
     fn clamps_overflow_and_handles_partial() {
-        // percentage>100(异常)→ 剩余 clamp 到 0;缺一个窗口 → 该窗口 None。
+        // percentage>100(异常)→ 剩余 clamp 到 0;缺 weekly → 只剩 5h 单窗口。
         let j = json!({"data":{"limits":[
             {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":140}
         ]}});
         let q = parse_glm_quota(&j);
-        assert_eq!(q.five_hour.unwrap().remaining_percent, 0.0, "已用>100 → 剩 0");
-        assert!(q.weekly.is_none(), "缺 weekly → None");
+        assert_eq!(q.windows.len(), 1);
+        assert_eq!(win(&q, "5 小时额度").unwrap().remaining_percent, 0.0, "已用>100 → 剩 0");
+        assert!(win(&q, "每周额度").is_none(), "缺 weekly → 无该窗口");
     }
 
     #[test]

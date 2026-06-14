@@ -319,6 +319,12 @@
       return api('POST', `/api/providers/${encodeURIComponent(id)}/activate`);
     },
 
+    // [MOC-211] 触发小米账号内嵌 webview 登录,抓取 session cookie 存到该 provider
+    // (用于 MiMo Token Plan 套餐用量查询)。后端阻塞到登录成功 / 超时 / 关窗。
+    async mimoLogin(id) {
+      return api('POST', `/api/providers/${encodeURIComponent(id)}/mimo-login`);
+    },
+
     async reorderProviders(providerIds) {
       return api('PUT', '/api/providers/reorder', { providerIds });
     },
