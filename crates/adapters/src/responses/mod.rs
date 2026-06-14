@@ -23,7 +23,7 @@ pub mod session;
 pub mod stream;
 pub mod tool_call_cache;
 
-pub use artifact_store::{global_tool_artifact_store, ToolArtifactStore};
+pub use artifact_store::{global_tool_artifact_store, read_tool_artifact_raw, ToolArtifactStore};
 // [MOC-231/232] 上下文明细:类型 + 计算入口 + 异步落盘/读取。request.rs 在转换末尾起
 // spawn_blocking 后台算并 persist(MOC-232 搬离转发关键路径),quota injector 读盘渲染。
 pub use context_breakdown::{

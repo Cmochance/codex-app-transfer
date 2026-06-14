@@ -36,6 +36,7 @@ use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use codex_app_transfer_adapters::responses::read_tool_artifact_raw;
 use codex_app_transfer_http::{WebFetchBackend, WebFetchOutcome};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
@@ -48,7 +49,8 @@ const SERVER_INSTRUCTIONS: &str = "联网工具使用规则:\n\
 1. 需要网上信息时先 web_search(query) 找来源, 再 web_fetch(url) 读该页完整正文。web_search 只返第 1 页(约一二十条);第 1 页没覆盖到你要的信息时, 用 web_search_more(传同一 query + page=2、3…)取下一批**不重复**的新结果, **别用同样 query 重复调 web_search**(会返回同一批)。\n\
 2. **凡是本次对话里你已经用 web_fetch 抓过的 URL —— 当你要再次引用 / 摘录 / 附上它的原文 / 回看更多细节时, 必须先用 read_url_local(url) 从本地缓存取回, 不要重复 web_fetch 同一个 URL**。read_url_local 不联网、瞬时返回, 且能拿回已被对话历史折叠/压缩、你当前看不到的完整原文。\n\
 3. 抓「新」URL 才用 web_fetch; 回看「旧」(本会话已抓过的)URL 一律 read_url_local。\n\
-4. web_fetch 默认返回完整正文供当前轮直接阅读。";
+4. web_fetch 默认返回完整正文供当前轮直接阅读。\n\
+5. **任何工具(shell / 飞书 MCP / 其它)的输出在对话历史里被折叠成 `[Tool output stored outside model context]` 摘要时, 摘要里给了 `Artifact ID`。需要那条输出的完整原文时, 调 read_tool_artifact(artifact_id) 取回不截断全文 —— 不要为了拿回历史输出去重跑工具**。read_tool_artifact 瞬时返回, 取回内容仅供当前轮阅读, 之后会再被自动折叠(不长期占上下文)。**例外**: 若摘要把该 artifact 标注为「stored in-process only / NOT retrievable」, 则该 id 取不出来, 别对它调 read_tool_artifact。";
 /// client 未给 protocolVersion 时的兜底(回显 client 的值更优, 见 spec)。
 const FALLBACK_PROTOCOL: &str = "2025-11-25";
 /// 返回正文截断上限(字符)。防把 MB 级页面灌给模型(类 Claude WebFetch 的 100KB 截断)。
@@ -202,7 +204,15 @@ fn dispatch_line(
             // handle 拒, 徒增无效调用(用户 #386 验收反馈)。改档需重启 Codex 重新 tools/list 才反映
             // (与 web_fetch 改 on/off 需重启一致);运行期切档的 stale 缓存由 handle_web_search_call
             // 的 backend gate 兜底(failing 双保险)。
-            let mut tools = vec![web_fetch_tool_def(), read_url_local_tool_def()];
+            // MOC-235: read_tool_artifact 不联网、始终可用(本 server 始终注册, 见
+            // sync_web_fetch_server)。web_fetch / read_url_local 是联网工具, 仅 backend 非 off
+            // 时暴露 —— off 档 server 仍在(为 read_tool_artifact), 但不列联网工具(列了也只会被
+            // handle 拒, 徒增无效调用)。
+            let mut tools = vec![read_tool_artifact_tool_def()];
+            if matches!(current_backend(), Ok(Some(_))) {
+                tools.push(web_fetch_tool_def());
+                tools.push(read_url_local_tool_def());
+            }
             // web_search 暴露条件(MOC-190): backend 非 off + Chrome 就绪(系统装了或已下载),
             // 与 web_fetch 档位选择解耦 —— 系统有 Chrome 的用户在 curl/wreq 档也能用 search 且不
             // 触发下载;两者皆无则不暴露(避免在没走过 consent 的档静默拉 ~86MB)。
@@ -294,6 +304,15 @@ async fn dispatch_tool_call(id: Value, name: &str, args: Value) -> Value {
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string());
             handle_read_url_local_call(id, url).await
+        }
+        "read_tool_artifact" => {
+            let artifact_id = args
+                .get("artifact_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            // offset 宽容解析(模型常把整数传成字符串 "90000", 见 arg_usize 注释);缺省从头读。
+            let offset = arg_usize(&args, "offset").unwrap_or(0);
+            handle_read_tool_artifact_call(id, artifact_id, offset).await
         }
         "web_search" => {
             let query = args
@@ -479,6 +498,101 @@ async fn handle_read_url_local_call(id: Value, url: Option<String>) -> Value {
                 "tool": "read_url_local",
                 "request": { "url": url },
                 "result": { "returned_chars": returned_chars, "is_error": is_error, "cache_hit": !is_error },
+            }),
+        )
+        .await;
+    }
+    resp
+}
+
+/// 单次回取返回的字符上限。必须**低于** proxy 的 `TOOL_OUTPUT_KEEP_FULL_MAX_CHARS`(100k,
+/// `crates/adapters/src/responses/request.rs`)—— 否则回取结果回传后会被 `keep_recent_tool_output_full`
+/// 当成超限当前轮输出再压成摘要, 大 artifact 永远取不全(MOC-235 review #3)。留 10k headroom 给
+/// 续读提示 + 安全余量。超过此长度的 artifact 分页返回, 模型用 `offset` 逐块读完任意大小。
+const ARTIFACT_CHUNK_CHARS: usize = 90_000;
+
+/// 把 artifact 全文按 `offset` 切一块(≤ [`ARTIFACT_CHUNK_CHARS`]),`end < total` 时末尾附续读提示。
+/// 返回 `(body, 本块字符数)`;`offset` 越界返回 `Err`(说明)。按 char 切分避免劈裂 UTF-8。纯函数便于测。
+fn artifact_chunk_body(content: &str, offset: usize) -> Result<(String, usize), String> {
+    let total = content.chars().count();
+    if offset > 0 && offset >= total {
+        return Err(format!(
+            "offset {offset} 超出 artifact 长度({total} 字符);从头读用 offset=0。"
+        ));
+    }
+    let chunk: String = content
+        .chars()
+        .skip(offset)
+        .take(ARTIFACT_CHUNK_CHARS)
+        .collect();
+    let n = chunk.chars().count();
+    let end = offset + n;
+    let body = if end < total {
+        format!(
+            "{chunk}\n\n[本次返回 artifact 第 {offset}–{end} / 共 {total} 字符。读取剩余部分: 用同一 artifact_id + offset={end} 再次调用 read_tool_artifact。]"
+        )
+    } else {
+        chunk
+    };
+    Ok((body, n))
+}
+
+/// 通用工具输出回取(MOC-235): 按 `artifact_id` 从共享 `tool_artifacts.db`(proxy 压缩历史工具
+/// 输出时落盘, SQLite WAL 跨进程)取回原文。与 read_url_local 互补 —— 后者按 URL 取 web_fetch
+/// 缓存, 本工具按 artifact_id 取**任意**被折叠的工具输出(shell / 飞书 MCP / 其它)。不联网、不受
+/// webfetch 档位影响。取回内容当前轮进上下文, 下一轮被 proxy 的 MOC-190 滚动压缩收回, 不长期占用。
+/// ≤[`ARTIFACT_CHUNK_CHARS`] 一次返全文;更大则从 `offset` 起返回一块 + 续读提示(逐块可取完整)。
+async fn handle_read_tool_artifact_call(
+    id: Value,
+    artifact_id: Option<String>,
+    offset: usize,
+) -> Value {
+    let artifact_id = match artifact_id {
+        Some(a) if !a.is_empty() => a,
+        _ => {
+            return tool_error(
+                id,
+                "缺少必填参数 artifact_id(取历史里 `[Tool output stored outside model context]` 摘要给出的 Artifact ID)",
+            )
+        }
+    };
+    // 三态(MOC-235 review): Ok(Some)=命中 / Ok(None)=真不存在或过期 / Err=瞬时读失败。
+    // 瞬时失败若也提示「重跑原工具」会误导模型白跑(本功能正是要省这成本)→ 提示重试同一调用。
+    let (resp, returned_chars, is_error) = match read_tool_artifact_raw(&artifact_id) {
+        Ok(Some(content)) => match artifact_chunk_body(&content, offset) {
+            Ok((body, n)) => (tool_ok(id.clone(), &body), n, false),
+            Err(msg) => (tool_error(id.clone(), &msg), 0usize, true),
+        },
+        Ok(None) => (
+            tool_error(
+                id.clone(),
+                &format!(
+                    "未找到该 artifact(可能已过期 >30 天, 或 ID 有误): {artifact_id}。如仍需该数据请用对应工具重新获取。"
+                ),
+            ),
+            0usize,
+            true,
+        ),
+        Err(e) => (
+            tool_error(
+                id.clone(),
+                &format!(
+                    "读取 artifact 暂时失败(存储可能正被占用或损坏): {e}。这是临时性读取错误, 请稍后**用同一 artifact_id 重试 read_tool_artifact**, 不要为此重跑原工具。"
+                ),
+            ),
+            0usize,
+            true,
+        ),
+    };
+    if let Some(port) = diag_target() {
+        post_diag_entry(
+            port,
+            json!({
+                "trace_kind": "cat_webfetch",
+                "captured_at": now_iso(),
+                "tool": "read_tool_artifact",
+                "request": { "artifact_id": artifact_id, "offset": offset },
+                "result": { "returned_chars": returned_chars, "is_error": is_error, "hit": !is_error },
             }),
         )
         .await;
@@ -846,6 +960,23 @@ fn read_url_local_tool_def() -> Value {
     })
 }
 
+fn read_tool_artifact_tool_def() -> Value {
+    json!({
+        "name": "read_tool_artifact",
+        "title": "Read tool artifact (full output)",
+        "description": "取回**任意**被折叠工具输出的完整原文(从本地存储)。当某条历史工具输出(shell / 飞书等 MCP / 其它)在对话里被压成 `[Tool output stored outside model context]` 摘要、你需要其完整内容时,用摘要里给出的 `Artifact ID` 调用本工具,不要为此重跑原工具。不联网、瞬时返回;取回内容仅供当前轮阅读,之后会再被自动折叠。超大输出会分页返回(每次约 90k 字符),返回末尾会提示用 `offset` 续读下一块,逐块可取完整。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": { "type": "string", "description": "要取回的 Artifact ID(取自历史里 `[Tool output stored outside model context]` 摘要的 `Artifact ID:` 行)。" },
+                "offset": { "type": "integer", "description": "起始字符偏移(默认 0 从头读)。仅当上次返回末尾提示「用 offset=N 续读」时,传该 N 取下一块。" }
+            },
+            "required": ["artifact_id"]
+        },
+        "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false }
+    })
+}
+
 fn web_search_tool_def() -> Value {
     json!({
         "name": "web_search",
@@ -991,6 +1122,50 @@ mod tests {
         // MOC-172: readOnlyHint=true / destructiveHint=false 让 guardian 跳过 auto-review 审批。
         assert_eq!(d["annotations"]["readOnlyHint"], true);
         assert_eq!(d["annotations"]["destructiveHint"], false);
+    }
+
+    #[test]
+    fn read_tool_artifact_tool_def_shape() {
+        // MOC-235: 通用回取工具 —— 仅 artifact_id 必填(offset 可选), readOnlyHint=true 跳过审批。
+        let d = read_tool_artifact_tool_def();
+        assert_eq!(d["name"], "read_tool_artifact");
+        assert_eq!(d["inputSchema"]["required"][0], "artifact_id");
+        assert_eq!(d["inputSchema"]["required"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            d["inputSchema"]["properties"]["artifact_id"]["type"],
+            "string"
+        );
+        // offset 可选(分页续读), 不在 required 里。
+        assert_eq!(d["inputSchema"]["properties"]["offset"]["type"], "integer");
+        assert_eq!(d["annotations"]["readOnlyHint"], true);
+        assert_eq!(d["annotations"]["destructiveHint"], false);
+    }
+
+    #[test]
+    fn artifact_chunk_body_paginates_under_keep_full_cap() {
+        // 小 artifact: 一次全文, 无续读提示。
+        let (body, n) = artifact_chunk_body("short content", 0).unwrap();
+        assert_eq!(body, "short content");
+        assert_eq!(n, "short content".chars().count());
+
+        // 超 ARTIFACT_CHUNK_CHARS: 首块 = cap 大小, 带续读提示, 且整体 < proxy keep-full 100k
+        // (否则回传会被 keep_recent_tool_output_full 再压 → 大 artifact 取不全, MOC-235 review #3)。
+        let big = "x".repeat(ARTIFACT_CHUNK_CHARS + 5_000);
+        let (body0, n0) = artifact_chunk_body(&big, 0).unwrap();
+        assert_eq!(n0, ARTIFACT_CHUNK_CHARS);
+        assert!(body0.contains(&format!("offset={ARTIFACT_CHUNK_CHARS}")));
+        assert!(
+            body0.chars().count() < 100_000,
+            "首块含提示也必须 < keep-full 100k, 否则回传被再压"
+        );
+
+        // 续读: offset=cap 取剩余, 无续读提示(已到尾)。
+        let (body1, n1) = artifact_chunk_body(&big, ARTIFACT_CHUNK_CHARS).unwrap();
+        assert_eq!(n1, 5_000);
+        assert!(!body1.contains("再次调用"));
+
+        // offset 越界 → Err。
+        assert!(artifact_chunk_body("abc", 99).is_err());
     }
 
     #[test]
