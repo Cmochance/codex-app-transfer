@@ -247,7 +247,10 @@ pub fn catalog_models_for_pool(
             let meta = providers_meta.get(entry.provider_idx)?;
             let caps = Some(&meta.model_capabilities);
             let real = entry.real_model.as_str();
-            let supports_1m = model_supports_1m(real, caps);
+            // 1M 信号:显式 modelCapabilities/documented(model_supports_1m)**或** 被 strip 的
+            // 内部 `[1m]` 标记(entry.supports_one_m)。后者保证无显式声明的自定义模型在池模式
+            // 也拿 1M 窗口,与单 provider 模式一致(bot review P2)。
+            let supports_1m = entry.supports_one_m || model_supports_1m(real, caps);
             let context_window = context_window_for_model(real, real, real, supports_1m, caps);
             let label = resolve_display_label(real, Some(&meta.display_names));
             let display_name = if meta.provider_name.trim().is_empty() {
@@ -1231,11 +1234,13 @@ mod tests {
                 provider_idx: 0,
                 slug: "deepseek/deepseek-v4-pro".into(),
                 real_model: "deepseek-v4-pro".into(),
+                supports_one_m: false,
             },
             PoolEntry {
                 provider_idx: 1,
                 slug: "ag/gemini-3.5-flash-low".into(),
                 real_model: "gemini-3.5-flash-low".into(),
+                supports_one_m: false,
             },
         ];
         let meta = vec![
@@ -1282,6 +1287,7 @@ mod tests {
             provider_idx: 5,
             slug: "x/y".into(),
             real_model: "y".into(),
+            supports_one_m: false,
         }];
         let meta = vec![PoolProviderMeta {
             provider_name: "P".into(),
@@ -1289,5 +1295,28 @@ mod tests {
             display_names: Value::Null,
         }];
         assert!(catalog_models_for_pool(&entries, &meta).is_empty());
+    }
+
+    #[test]
+    fn catalog_models_for_pool_honors_supports_one_m_marker_without_caps() {
+        // bot review P2:仅靠 `[1m]` 标 1M 的自定义模型(无 modelCapabilities / 非 documented),
+        // 池模式也要拿 1M 窗口(与单 provider 模式一致),靠 PoolEntry.supports_one_m 传递。
+        use codex_app_transfer_registry::PoolEntry;
+        let entries = vec![PoolEntry {
+            provider_idx: 0,
+            slug: "x/custom-undocumented".into(),
+            real_model: "custom-undocumented".into(),
+            supports_one_m: true,
+        }];
+        let meta = vec![PoolProviderMeta {
+            provider_name: "X".into(),
+            model_capabilities: json!({}), // 无显式声明
+            display_names: Value::Null,
+        }];
+        let models = catalog_models_for_pool(&entries, &meta);
+        assert_eq!(
+            models[0].context_window, 1_000_000,
+            "supports_one_m → 1M 窗口"
+        );
     }
 }

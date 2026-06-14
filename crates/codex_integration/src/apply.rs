@@ -295,9 +295,14 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        let model_needs_reset = current_model
-            .as_deref()
-            .is_some_and(|m| !m.is_empty() && !models.iter().any(|cm| cm.slug == m));
+        let model_needs_reset = match current_model.as_deref() {
+            Some(m) => !m.is_empty() && !models.iter().any(|cm| cm.slug == m),
+            // 池模式下 config 无 root `model` key:Codex 隐式默认 gpt-5.5,但池 catalog 不含
+            // 该 slug(全是 `<provider>/<model>`)→ 必须主动锚到池默认 slug,否则新会话起在
+            // 一个不在 catalog 的隐式模型上(bot review P2)。单模式 catalog 含 gpt-5.5,隐式
+            // 默认即可、不强写(保持原行为)。
+            None => cfg.pool.is_some(),
+        };
         if model_needs_reset {
             // 锚定目标:池模式 → active provider 的池默认 slug(回退到首条池条目);
             // 单模式 → gpt-5.5。只在目标确实在刚写入的 catalog 里时才重置(守
@@ -1088,6 +1093,68 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m["slug"] == "gpt-5.5"));
+    }
+
+    #[test]
+    fn apply_pool_anchors_model_when_config_has_no_model_key() {
+        // bot review P2:全新 config(无 root `model`)+ 池模式 → 必须锚到 pool_default_slug,
+        // 否则 Codex 隐式默认 gpt-5.5,而池 catalog 全是 `<provider>/<model>` slug、不含它。
+        let (_t, paths) = setup();
+        let pool = vec![
+            CatalogModel {
+                slug: "deepseek/deepseek-v4-pro".into(),
+                display_name: "DeepSeek / deepseek-v4-pro".into(),
+                provider_name: "DeepSeek".into(),
+                context_window: 1_000_000,
+                effective_context_window_percent: 95,
+                auto_review_model_override: None,
+            },
+            CatalogModel {
+                slug: "kimi/kimi-k2.6".into(),
+                display_name: "Kimi / kimi-k2.6".into(),
+                provider_name: "Kimi".into(),
+                context_window: 262_144,
+                effective_context_window_percent: 95,
+                auto_review_model_override: None,
+            },
+        ];
+        apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "k",
+                supports_1m: false,
+                provider_name: "DeepSeek",
+                default_model: "deepseek-v4-pro",
+                model_mappings: None,
+                model_capabilities: None,
+                model_display_names: None,
+                review_model_slot: None,
+                app_version: "v",
+                codex_network_access: true,
+                direct: false,
+                preserve_chatgpt_auth: false,
+                pool: Some(&pool),
+                pool_default_slug: Some("deepseek/deepseek-v4-pro"),
+            },
+        )
+        .unwrap();
+        let toml = read_toml(&paths);
+        assert!(
+            toml.contains(r#"model = "deepseek/deepseek-v4-pro""#),
+            "全新 pool config 应锚到 pool_default_slug:\n{toml}"
+        );
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.model_catalog_json).unwrap()).unwrap();
+        let slugs: Vec<&str> = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["slug"].as_str())
+            .collect();
+        assert!(slugs.contains(&"deepseek/deepseek-v4-pro"));
+        assert!(slugs.contains(&"kimi/kimi-k2.6"));
+        assert!(!slugs.contains(&"gpt-5.5"), "池 catalog 不应含 gpt-5.5");
     }
 
     #[test]

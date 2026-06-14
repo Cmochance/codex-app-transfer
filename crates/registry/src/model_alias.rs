@@ -189,30 +189,53 @@ pub struct PoolEntry {
     pub slug: String,
     /// 上游真实模型 id(已 strip 内部 `[1m]` 后缀)。
     pub real_model: String,
+    /// 该模型是否声明 1M 上下文 —— 源自被 strip 掉的内部 `[1m]` 标记。slug / real_model
+    /// 都已去后缀(slug 干净、上游不收 `[1m]`),但 catalog 端需要这个信号:无显式
+    /// `modelCapabilities` / documented window 的自定义模型,仅靠 `[1m]` 标 1M 时,池模式
+    /// 也要给 1M 窗口(否则比单 provider 模式早压缩,bot review P2)。
+    pub supports_one_m: bool,
 }
 
-fn push_unique_model(raw: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+fn push_pooled_with_one_m(
+    raw: &str,
+    out: &mut Vec<(String, bool)>,
+    index: &mut HashMap<String, usize>,
+) {
+    let one_m = has_internal_one_m_suffix(raw);
     let cleaned = strip_internal_model_suffix(raw);
     let trimmed = cleaned.trim();
-    if !trimmed.is_empty() && seen.insert(trimmed.to_owned()) {
-        out.push(trimmed.to_owned());
+    if trimmed.is_empty() {
+        return;
+    }
+    match index.get(trimmed) {
+        // 同一 clean id 的多个变体:只要有一个带 `[1m]` 即视为支持 1M。
+        Some(&i) => {
+            if one_m {
+                out[i].1 = true;
+            }
+        }
+        None => {
+            index.insert(trimmed.to_owned(), out.len());
+            out.push((trimmed.to_owned(), one_m));
+        }
     }
 }
 
-/// 某 provider 在池里的"可选模型 id 列表"。
-///
-/// 优先用持久化的 `pooledModels`(用户获取 / 手加的完整列表);为空则回退到已配置的
-/// 槽位映射(`default` 优先,再按 `MODEL_SLOTS` 顺序取非空值)。回退保证老 provider
-/// 无需重新获取也能进池、池永不为空。返回值已 strip 内部 `[1m]` 后缀、去重、稳定顺序。
-pub fn pooled_model_ids(pooled_models: Option<&Value>, models: Option<&Value>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+/// 某 provider 在池里的"可选模型列表",每条附带"是否声明 1M"(由被 strip 的 `[1m]`
+/// 标记得出)。优先用持久化 `pooledModels`,为空则回退槽位映射(`default` 优先,再按
+/// `MODEL_SLOTS` 顺序)。clean id 去重、稳定顺序;同 clean id 多变体只要一个带 `[1m]` 即 true。
+pub fn pooled_models_with_one_m(
+    pooled_models: Option<&Value>,
+    models: Option<&Value>,
+) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
 
     // 1. 持久化 pooledModels(字符串数组)
     if let Some(Value::Array(arr)) = pooled_models {
         for item in arr {
             if let Some(s) = item.as_str() {
-                push_unique_model(s, &mut out, &mut seen);
+                push_pooled_with_one_m(s, &mut out, &mut index);
             }
         }
     }
@@ -223,17 +246,25 @@ pub fn pooled_model_ids(pooled_models: Option<&Value>, models: Option<&Value>) -
     // 2. 回退:槽位映射的非空值(default 优先,再按槽位顺序)
     let mappings = normalize_model_mappings(models);
     if let Some(d) = mappings.get(DEFAULT_MODEL_KEY) {
-        push_unique_model(d, &mut out, &mut seen);
+        push_pooled_with_one_m(d, &mut out, &mut index);
     }
     for slot in MODEL_SLOTS {
         if slot.key == DEFAULT_MODEL_KEY {
             continue;
         }
         if let Some(v) = mappings.get(slot.key) {
-            push_unique_model(v, &mut out, &mut seen);
+            push_pooled_with_one_m(v, &mut out, &mut index);
         }
     }
     out
+}
+
+/// 同 [`pooled_models_with_one_m`] 但只返 clean id 列表(已 strip `[1m]`、去重、稳定顺序)。
+pub fn pooled_model_ids(pooled_models: Option<&Value>, models: Option<&Value>) -> Vec<String> {
+    pooled_models_with_one_m(pooled_models, models)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// 给一组 provider 产出全部池条目(catalog slug ↔ provider/real_model)。
@@ -274,14 +305,16 @@ pub fn unique_pool_slugs(providers: &[crate::Provider]) -> Vec<PoolEntry> {
         let base = &base_for_idx[idx];
         let provider = &providers[idx];
         let models_value = serde_json::to_value(&provider.models).ok();
-        let ids = pooled_model_ids(provider.extra.get("pooledModels"), models_value.as_ref());
-        for real in ids {
+        let pairs =
+            pooled_models_with_one_m(provider.extra.get("pooledModels"), models_value.as_ref());
+        for (real, supports_one_m) in pairs {
             let slug = format!("{base}{POOL_SLUG_SEPARATOR}{real}");
             if used_slug.insert(slug.clone()) {
                 entries.push(PoolEntry {
                     provider_idx: idx,
                     slug,
                     real_model: real,
+                    supports_one_m,
                 });
             }
         }
@@ -495,5 +528,49 @@ mod tests {
         // 反查表:两条 slug 解析到不同 provider_idx + 各自 real model
         let map = build_catalog_slug_map(&entries);
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn pooled_models_with_one_m_preserves_1m_marker() {
+        // `[1m]` 标记被 strip 进 clean id,但 1M 信号保留在 bool 上(供 catalog 给 1M 窗口)。
+        let pooled = json!(["custom-1m[1m]", "plain-model"]);
+        let pairs = pooled_models_with_one_m(Some(&pooled), None);
+        assert_eq!(
+            pairs,
+            vec![
+                ("custom-1m".to_owned(), true),
+                ("plain-model".to_owned(), false)
+            ]
+        );
+        // pooled_model_ids 契约不变(只 clean id)
+        assert_eq!(
+            pooled_model_ids(Some(&pooled), None),
+            vec!["custom-1m", "plain-model"]
+        );
+    }
+
+    #[test]
+    fn pooled_models_with_one_m_ors_1m_across_duplicate_variants() {
+        // 同 clean id 多变体:无后缀在前、带 [1m] 在后 → 仍标 1M(OR 合并)。
+        let pooled = json!(["m", "m[1m]"]);
+        let pairs = pooled_models_with_one_m(Some(&pooled), None);
+        assert_eq!(pairs, vec![("m".to_owned(), true)]);
+    }
+
+    #[test]
+    fn unique_pool_slugs_carries_supports_one_m_from_marker() {
+        let mut p = mk_provider("deepseek", "DeepSeek");
+        p.models
+            .insert("default".into(), "deepseek-v4-pro[1m]".into());
+        let entries = unique_pool_slugs(&[p]);
+        let e = entries
+            .iter()
+            .find(|e| e.slug == "deepseek/deepseek-v4-pro")
+            .expect("slug 应 strip [1m]");
+        assert!(e.supports_one_m, "entry 应携带 1M 标记");
+        assert_eq!(
+            e.real_model, "deepseek-v4-pro",
+            "real_model 不带 [1m](上游不收)"
+        );
     }
 }
