@@ -24,6 +24,11 @@ pub struct StoredToolArtifact {
     pub kind: String,
     pub original_chars: usize,
     pub original_lines: usize,
+    /// 是否已**持久化到共享 `tool_artifacts.db`**(而非仅落 proxy 进程内存的降级 fallback)。
+    /// 跨进程的 `read_tool_artifact`(`--mcp-serve-webfetch` 进程)只能读 DB,读不到内存档 ——
+    /// 故仅当 `persisted=true` 时压缩摘要才告知模型「可调 read_tool_artifact 取回」,否则会给一个
+    /// reader 看不到的 id、把回取变成 miss/重跑(MOC-235 review #4)。
+    pub persisted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,25 +122,53 @@ impl ToolArtifactStore {
             last_access_unix: now,
             access_count: 0,
         };
-        let stored = record.to_stored();
+        let mut stored = record.to_stored();
 
-        if let Err(e) = self.persist_save(&record) {
-            log_artifact_warning(
-                "TOOL_ARTIFACT_DB_SAVE_FAILED",
-                format!(
-                    "save artifact_id={} failed: {e}; falling back to in-memory store",
-                    record.artifact_id
-                ),
-            );
-            self.save_in_memory(record);
-        }
+        // persisted = 真的写进了共享 DB。false(无 DB / INSERT 失败)→ 落 proxy 进程内存兜底,
+        // 但跨进程 read_tool_artifact 读不到 → 摘要据此不告知可回取(MOC-235 review #4)。
+        stored.persisted = match self.persist_save(&record) {
+            Ok(persisted) => {
+                if !persisted {
+                    self.save_in_memory(record);
+                }
+                persisted
+            }
+            Err(e) => {
+                log_artifact_warning(
+                    "TOOL_ARTIFACT_DB_SAVE_FAILED",
+                    format!(
+                        "save artifact_id={} failed: {e}; falling back to in-memory store",
+                        record.artifact_id
+                    ),
+                );
+                self.save_in_memory(record);
+                false
+            }
+        };
 
         stored
     }
 
     pub fn get(&self, artifact_id: &str) -> Option<ToolArtifactRecord> {
+        match self.get_result(artifact_id) {
+            Ok(record) => record,
+            Err(e) => {
+                log_artifact_warning(
+                    "TOOL_ARTIFACT_DB_LOAD_FAILED",
+                    format!("load artifact_id={artifact_id} failed: {e}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// 同 [`get`] 但**保留 DB 读错误**(不吞成 `None`)。跨进程回取(MOC-235)用它区分
+    /// 「真不存在 / 已过期」(`Ok(None)`)与「瞬时读失败:锁超时 / 损坏 / 权限」(`Err`)——
+    /// 让 read_tool_artifact 对后者提示「稍后用同一 id 重试」, 而非误导模型「重跑原工具」
+    /// (重跑正是本功能要消除的成本)。`get` 仍吞错返 `None`(保留旧调用方语义)。
+    pub fn get_result(&self, artifact_id: &str) -> Result<Option<ToolArtifactRecord>, String> {
         if artifact_id.trim().is_empty() {
-            return None;
+            return Ok(None);
         }
         {
             let mut inner = self.inner.lock().expect("artifact store mutex poisoned");
@@ -150,20 +183,11 @@ impl ToolArtifactStore {
                 entry.access_count += 1;
                 entry.record.access_count += 1;
                 entry.record.last_access_unix = unix_now();
-                return Some(entry.record.clone());
+                return Ok(Some(entry.record.clone()));
             }
         }
 
-        match self.persist_load(artifact_id) {
-            Ok(record) => record,
-            Err(e) => {
-                log_artifact_warning(
-                    "TOOL_ARTIFACT_DB_LOAD_FAILED",
-                    format!("load artifact_id={artifact_id} failed: {e}"),
-                );
-                None
-            }
-        }
+        self.persist_load(artifact_id).map_err(|e| e.to_string())
     }
 
     pub fn clear(&self) {
@@ -214,12 +238,12 @@ impl ToolArtifactStore {
         );
     }
 
-    fn persist_save(&self, record: &ToolArtifactRecord) -> rusqlite::Result<()> {
+    /// 把 record 写进共享 DB。`Ok(true)` = 已持久化;`Ok(false)` = 无 DB(未持久化, 由 caller
+    /// 落内存兜底);`Err` = INSERT 失败(同样由 caller 落内存)。返回值供 [`save`] 标 `persisted`。
+    fn persist_save(&self, record: &ToolArtifactRecord) -> rusqlite::Result<bool> {
         let mut guard = self.db.lock().expect("artifact store db mutex poisoned");
         let Some(conn) = guard.as_mut() else {
-            drop(guard);
-            self.save_in_memory(record.clone());
-            return Ok(());
+            return Ok(false);
         };
         conn.execute(
             "INSERT INTO tool_artifacts \
@@ -237,7 +261,7 @@ impl ToolArtifactStore {
                 record.last_access_unix
             ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     fn persist_load(&self, artifact_id: &str) -> rusqlite::Result<Option<ToolArtifactRecord>> {
@@ -310,6 +334,7 @@ impl ToolArtifactRecord {
             kind: self.kind.clone(),
             original_chars: self.original_chars,
             original_lines: self.original_lines,
+            persisted: false, // 由 save() 按 persist_save 结果覆盖
         }
     }
 }
@@ -334,6 +359,16 @@ fn init_db(db_path: &Path) -> rusqlite::Result<Connection> {
         log_artifact_warning(
             "TOOL_ARTIFACT_DB_PRAGMA_FAILED",
             format!("pragma synchronous=NORMAL failed: {e}"),
+        );
+    }
+    // 跨进程并发(MOC-235): proxy 进程写(INSERT/touch)+ `--mcp-serve-webfetch` 进程读
+    // (read_tool_artifact 回取)同时访问本 db。WAL 允许多读单写, 但两进程并发写(proxy
+    // persist_save 与 MCP get() 的 last_access touch)会撞 SQLITE_BUSY。设 busy_timeout 让其
+    // 短暂自旋重试而非立即失败(touch 失败本就 graceful, 但 INSERT 重试能少丢 artifact)。
+    if let Err(e) = conn.busy_timeout(Duration::from_secs(5)) {
+        log_artifact_warning(
+            "TOOL_ARTIFACT_DB_BUSY_TIMEOUT_FAILED",
+            format!("busy_timeout failed: {e}"),
         );
     }
     create_schema(&conn)?;
@@ -424,6 +459,17 @@ pub fn global_tool_artifact_store() -> &'static ToolArtifactStore {
     })
 }
 
+/// 按 `artifact_id` 取回被压缩外置的工具输出**全文**(不截断)。供 `--mcp-serve-webfetch`
+/// 进程的 `read_tool_artifact` 工具跨进程读 —— 全文存在共享 `tool_artifacts.db`(WAL),
+/// 由 proxy 侧 [`build_bounded_tool_output_summary`](request.rs)压缩时 `save` 落盘。
+/// 返回:`Ok(Some(全文))` 命中 / `Ok(None)` 真不存在或已过期 / `Err` 瞬时读失败(锁超时
+/// / 损坏)—— 调用方据此对「真没有」与「临时错误」给不同提示(后者建议重试同一调用)。MOC-235。
+pub fn read_tool_artifact_raw(artifact_id: &str) -> Result<Option<String>, String> {
+    global_tool_artifact_store()
+        .get_result(artifact_id)
+        .map(|opt| opt.map(|record| record.raw_content))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +485,52 @@ mod tests {
         assert_eq!(record.call_id.as_deref(), Some("call_a"));
         assert_eq!(record.kind, "command_output");
         assert_eq!(record.raw_content, "raw output");
+    }
+
+    #[test]
+    fn read_tool_artifact_raw_round_trips_via_global() {
+        // MOC-235: 通用回取走 global store(test 下为内存档),save 后按 artifact_id 取回不截断全文。
+        let stored = global_tool_artifact_store().save(
+            Some("call_moc235"),
+            "command_output",
+            "FULL UNTRUNCATED PAYLOAD moc235",
+        );
+        assert_eq!(
+            read_tool_artifact_raw(&stored.artifact_id)
+                .expect("read should not error")
+                .as_deref(),
+            Some("FULL UNTRUNCATED PAYLOAD moc235")
+        );
+        // 真不存在 / 空 id → Ok(None)(非 Err);Err 仅留给瞬时 DB 读失败。
+        assert!(read_tool_artifact_raw("nonexistent_moc235")
+            .expect("miss is not an error")
+            .is_none());
+        assert!(read_tool_artifact_raw("   ")
+            .expect("blank id is not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn save_marks_persisted_only_when_db_backed() {
+        // MOC-235 review #4: persisted 必须如实反映「是否进了共享 DB」—— 跨进程 reader 只能读 DB,
+        // 摘要据此决定要不要告知模型可回取(内存档不告知, 否则给一个 reader 看不到的 id)。
+        let mem = ToolArtifactStore::new(8, Duration::from_secs(60));
+        assert!(
+            !mem.save(Some("c"), "command_output", "raw").persisted,
+            "无 DB 的内存档不应标 persisted"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _warn) = ToolArtifactStore::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &dir.path().join("a.db"),
+        );
+        assert!(
+            db.save(Some("c"), "command_output", "raw").persisted,
+            "写入共享 DB 成功应标 persisted"
+        );
     }
 
     #[test]
