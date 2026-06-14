@@ -219,10 +219,8 @@
     if (payload.grokWeb) {
       body.grokWeb = payload.grokWeb;
     }
-    // 池化:带 pooledModels 才下发(数组),让后端 add/update 持久化;不带 = 后端保留现值。
-    if (Array.isArray(payload.pooledModels)) {
-      body.pooledModels = payload.pooledModels;
-    }
+    // 模型池(pooledModels)不经 provider 表单下发 —— 由「整合提供商」页 setProviderPool
+    // 独家管理(/api/providers/{id}/pool)。表单写池会与整合页 curation 冲突(#477 bot review P2)。
     return body;
   }
 

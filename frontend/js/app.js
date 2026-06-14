@@ -1136,24 +1136,9 @@
     }
     if (includeModels) {
       payload.models = mappings;
-      // 池化列表 = 当前下拉(进编辑页 seed 自持久化 pooledModels、点「获取模型」后刷新/合并过)
-      // ∪ 当前 mappings 值(含用户**手输**的新模型 id)。必须并入 mappings:否则手输的新模型
-      // 不进池,且旧 seed 出来的 pooledModels 反而盖掉它(registry 优先 pooledModels)→ 新模型
-      // 永不出现(bot review P2)。chat-only 过滤在后端 chat_filter_pooled_value 统一做。
-      // 空(从未获取 + 无持久化 + 无映射)→ 不下发,后端保留现值。
-      const pooled = [
-        ...new Set(
-          [
-            ...providerAvailableModels.map(modelEntryId),
-            ...Object.values(mappings || {}),
-          ]
-            .map((s) => String(s || "").trim())
-            .filter(Boolean)
-        ),
-      ];
-      if (pooled.length) {
-        payload.pooledModels = pooled;
-      }
+      // 注意:provider 表单**不再**下发 pooledModels —— 模型池(整合)由「整合提供商」页
+      // (setProviderPool)独家管理。表单只管 provider 配置 + 槽位映射;表单 / autofill 写池会
+      // 把整合页 curation 删掉的模型在保存其它字段时悄悄加回(#477 bot review P2)。
     }
     // R1 PR-7:apiFormat=grok_web 时打包 extra.grokWeb(cookies + statsigId)。
     // Provider 后端 schema 用 `#[serde(flatten)] extra`,任何不在已知字段的 key

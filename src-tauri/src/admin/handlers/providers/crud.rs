@@ -181,11 +181,6 @@ pub struct AddProviderInput {
     /// 回退复用主模型)。经 `Provider.extra` flatten 透传持久化为 `reviewModelSlot`。
     #[serde(rename = "reviewModelSlot")]
     pub review_model_slot: Option<String>,
-    /// 池化模式的可选模型列表(用户「获取模型」拉取 + 手加),按 provider 隔离持久化为
-    /// `pooledModels`(经 `Provider.extra` flatten)。catalog 池化(`unique_pool_slugs` /
-    /// `pooled_model_ids`)优先用它,为空才回退槽位映射。`None` = 本次不改动该字段。
-    #[serde(rename = "pooledModels")]
-    pub pooled_models: Option<Value>,
 }
 
 pub async fn add_provider(
@@ -289,13 +284,8 @@ pub async fn add_provider(
                 json!({"default":"","gpt_5_5":"","gpt_5_4":"","gpt_5_4_mini":"","gpt_5_3_codex":"","gpt_5_2":""})
             }),
         );
-        // 池化:加 provider 时带了已抓取/手加的模型列表 → chat-only 过滤后持久化为 pooledModels。
-        if let Some(pooled) = input.pooled_models.clone() {
-            new_provider.insert(
-                "pooledModels".into(),
-                super::models::chat_filter_pooled_value(&pooled),
-            );
-        }
+        // 模型池(pooledModels)不在 add provider 时写入 —— 新 provider 默认未加入整合
+        // (pooledEnabled 缺省 false),其池由「整合提供商」页 setProviderPool 独家管理。
         new_provider.insert(
             "extraHeaders".into(),
             input.extra_headers.clone().unwrap_or_else(|| json!({})),
@@ -440,45 +430,10 @@ pub async fn update_provider(
                 updated.insert("models".into(), Value::Object(merged));
             }
         }
-        // 池化 pooledModels 维护:
-        // - **upstream 身份变了**(baseUrl / apiFormat 与原值不同)→ 旧池属旧端点,清空
-        //   pooledModels(回退新映射,等用户对新 upstream「获取模型」重建池)。incoming 此时
-        //   多半还是旧缓存,一并丢弃(bot review P2)。
-        // - 同一 upstream + 带 pooledModels → **合并**进现有(chat 过滤、去重、**永不收缩**):
-        //   表单 incoming 源自易失下拉缓存,fetch 失败/部分态只剩 1-5 个映射值,替换会把已持久化
-        //   的完整池删剩映射;合并既保留手加/已抓取又纳入本次映射新模型(bot review P2)。
-        // - 同一 upstream + 不带该字段 → 完全不动。
-        // 身份 = baseUrl / apiFormat / apiKey。apiKey 变更也算(bot review P2):换 key 常意味换
-        // 账号,旧账号可见的模型未必新 key 可用,stale slug 会拿新 key 路由 → invalid-model/权限
-        // 错。比对 existing vs updated 的 apiKey:用户没重填 key → 前端不下发 → updated 沿用旧值
-        // → 相等不触发,正常编辑不误清;真改了 key 才清。
-        let identity_changed = existing.get("baseUrl") != updated.get("baseUrl")
-            || existing.get("apiFormat") != updated.get("apiFormat")
-            || existing.get("apiKey") != updated.get("apiKey");
-        if identity_changed {
-            updated.remove("pooledModels");
-        } else if let Some(pooled) = input.pooled_models.clone() {
-            let incoming = super::models::chat_filter_pooled_value(&pooled);
-            let mut merged: Vec<Value> = existing
-                .get("pooledModels")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let mut seen: std::collections::HashSet<String> = merged
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-            if let Some(arr) = incoming.as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        if seen.insert(s.to_owned()) {
-                            merged.push(v.clone());
-                        }
-                    }
-                }
-            }
-            updated.insert("pooledModels".into(), Value::Array(merged));
-        }
+        // 模型池(pooledModels)**不由 provider 表单维护** —— 由「整合提供商」页 setProviderPool
+        // 独家管理。`updated` 克隆自 existing,这里不动 pooledModels = 表单编辑任何字段都原样保留
+        // 用户在整合页 curation 的池(含显式空 [])。表单写池会把删掉的模型悄悄加回(#477 P2)。
+        // 上游(baseUrl/apiKey)改了导致池陈旧,由用户在整合页「重新获取」处理,不在表单静默清空。
         updated.insert("id".into(), Value::String(id.clone()));
         updated.insert("isBuiltin".into(), Value::Bool(is_builtin));
 
@@ -756,36 +711,8 @@ pub async fn update_models(
             .unwrap();
         if let Some(o) = providers[idx].as_object_mut() {
             o.insert("models".into(), input.models.clone());
-            // 池化:若该 provider 已在用池(pooledModels 非空),把映射页编辑的模型值并进池
-            // (chat 过滤、去重、永不收缩)。否则池模式偏好非空 pooledModels、映射页改/手输的
-            // 新模型永不出现(bot review P2)。空池时无需(走 mappings fallback)。
-            let mut pooled: Vec<Value> = o
-                .get("pooledModels")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if !pooled.is_empty() {
-                let mapping_ids: Vec<String> = input
-                    .models
-                    .as_object()
-                    .map(|m| {
-                        m.values()
-                            .filter_map(|v| v.as_str().map(|s| s.trim().to_owned()))
-                            .filter(|s| !s.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let mut seen: std::collections::HashSet<String> = pooled
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect();
-                for id in super::models::chat_usable_model_ids(&mapping_ids) {
-                    if seen.insert(id.clone()) {
-                        pooled.push(Value::String(id));
-                    }
-                }
-                o.insert("pooledModels".into(), Value::Array(pooled));
-            }
+            // 模型池(pooledModels)不由映射页保存维护 —— 由「整合提供商」页 setProviderPool
+            // 独家管理。映射页写池会把整合页 curation 删掉的模型悄悄加回(#477 bot review P2)。
         }
         Ok(ConfigMutation::Modified(was_active))
     });

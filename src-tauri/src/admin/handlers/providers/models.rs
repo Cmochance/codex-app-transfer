@@ -633,20 +633,9 @@ pub async fn autofill_provider_models(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // 池化:把抓取到的可用模型 id 写入 pooledModels(去 embedding/rerank 等);**合并**而非
-    // 覆盖 —— 保留用户手加的、追加新上游的(「重新获取只负责更新列表」,守 no-silent-destructive)。
-    let fetched_pool_ids: Vec<String> = result
-        .get("models")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            let ids: Vec<String> = arr.iter().filter_map(model_id_from_item).collect();
-            // 池化用 no-fallback 过滤:全是 embedding/rerank 等时返回空,不把非 chat 模型写进池
-            // (否则出现在 Codex chat picker 并把 chat 路由到不支持的端点,bot review P2)。
-            chat_usable_model_ids(&ids)
-        })
-        .unwrap_or_default();
-
-    // 真 mutate + save 走 atomic RMW
+    // autofill 只更新该 provider 的槽位 `models` 映射 —— **不写 pooledModels**(模型池由
+    // 「整合提供商」页 setProviderPool 独家管理;autofill 写池会把整合页 curation 删掉的模型
+    // 悄悄加回,#477 bot review P2)。
     let suggested_for_closure = suggested.clone();
     let write_result = with_config_write(|cfg| {
         let Some(idx) = provider_index(cfg, &id) else {
@@ -656,22 +645,6 @@ pub async fn autofill_provider_models(
         if let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) {
             if let Some(provider) = providers.get_mut(idx).and_then(|v| v.as_object_mut()) {
                 provider.insert("models".into(), suggested_for_closure.clone());
-                // pooledModels 合并:现有(含手加)在前,新抓取去重追加。
-                let mut pooled: Vec<Value> = provider
-                    .get("pooledModels")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let mut seen: HashSet<String> = pooled
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect();
-                for id in &fetched_pool_ids {
-                    if seen.insert(id.clone()) {
-                        pooled.push(Value::String(id.clone()));
-                    }
-                }
-                provider.insert("pooledModels".into(), Value::Array(pooled));
                 return Ok(ConfigMutation::Modified(()));
             }
         }
@@ -680,7 +653,7 @@ pub async fn autofill_provider_models(
     if let Err(e) = write_result {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
-    // 池模式:autofill 改了该 provider 的模型映射 → 全局池 catalog + 反查表重建(非 active 也是)。
+    // 整合下若该 provider 仍靠映射回退(pooledModels 缺省),映射变了 → 池 catalog 跟着变 → 重建。
     super::resync_pool_if_enabled(&state).await;
     Json(json!({
         "success": true,
