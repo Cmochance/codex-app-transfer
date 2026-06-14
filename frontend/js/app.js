@@ -5573,7 +5573,20 @@
       const extra = extras.length ? "\n\n" + extras.join("\n") : "";
       return tFmt("codex.mcp.saveConfirmStdio", { name, cmdline, extra });
     }
-    return tFmt("codex.mcp.saveConfirmHttp", { name, url: spec.url || "" });
+    // http 也展示发往远端的凭据 / header —— 恶意 spec 可把 Authorization / $GITHUB_TOKEN
+    // 等通过 bearerTokenEnvVar / httpHeaders / envHttpHeaders 发到错误或恶意 URL。
+    const httpExtras = [];
+    if (spec.bearerTokenEnvVar) httpExtras.push(`bearer token env var: ${spec.bearerTokenEnvVar}`);
+    if (spec.httpHeaders && typeof spec.httpHeaders === "object") {
+      const lines = Object.keys(spec.httpHeaders).map((k) => `  ${k}: ${spec.httpHeaders[k]}`);
+      if (lines.length) httpExtras.push("http headers:\n" + lines.join("\n"));
+    }
+    if (spec.envHttpHeaders && typeof spec.envHttpHeaders === "object") {
+      const lines = Object.keys(spec.envHttpHeaders).map((k) => `  ${k} ← $${spec.envHttpHeaders[k]}`);
+      if (lines.length) httpExtras.push("env http headers:\n" + lines.join("\n"));
+    }
+    const httpExtra = httpExtras.length ? "\n\n" + httpExtras.join("\n") : "";
+    return tFmt("codex.mcp.saveConfirmHttp", { name, url: spec.url || "", extra: httpExtra });
   }
 
   async function codexMcpJsonSave() {
