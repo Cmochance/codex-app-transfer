@@ -440,11 +440,19 @@ pub async fn update_provider(
                 updated.insert("models".into(), Value::Object(merged));
             }
         }
-        // 池化:带 pooledModels 就**合并**进现有(chat-only 过滤;现有 ∪ 新增,去重,**永不收缩**)。
-        // 合并而非替换是关键(bot review P2):表单保存的 incoming 源自易失的下拉缓存,fetch 失败 /
-        // 部分态会让它只剩 1-5 个映射值;若替换就会把已持久化的完整池删剩映射。合并兜底:既保留
-        // 用户手加 / 已抓取的,又纳入本次映射里的新模型。不带该字段 = 完全不动。
-        if let Some(pooled) = input.pooled_models.clone() {
+        // 池化 pooledModels 维护:
+        // - **upstream 身份变了**(baseUrl / apiFormat 与原值不同)→ 旧池属旧端点,清空
+        //   pooledModels(回退新映射,等用户对新 upstream「获取模型」重建池)。incoming 此时
+        //   多半还是旧缓存,一并丢弃(bot review P2)。
+        // - 同一 upstream + 带 pooledModels → **合并**进现有(chat 过滤、去重、**永不收缩**):
+        //   表单 incoming 源自易失下拉缓存,fetch 失败/部分态只剩 1-5 个映射值,替换会把已持久化
+        //   的完整池删剩映射;合并既保留手加/已抓取又纳入本次映射新模型(bot review P2)。
+        // - 同一 upstream + 不带该字段 → 完全不动。
+        let identity_changed = existing.get("baseUrl") != updated.get("baseUrl")
+            || existing.get("apiFormat") != updated.get("apiFormat");
+        if identity_changed {
+            updated.remove("pooledModels");
+        } else if let Some(pooled) = input.pooled_models.clone() {
             let incoming = super::models::chat_filter_pooled_value(&pooled);
             let mut merged: Vec<Value> = existing
                 .get("pooledModels")
