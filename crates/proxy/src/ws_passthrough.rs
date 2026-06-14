@@ -62,6 +62,18 @@ fn ws_upstream_client() -> &'static reqwest13::Client {
     })
 }
 
+/// 进程级一次性安装 rustls 0.23 默认 CryptoProvider。依赖树里 aws-lc-rs(reqwest)+ ring
+/// (tokio-tungstenite)同在 → rustls 无法自动选 provider,`client_async_tls` 做 TLS 时会
+/// **panic**(WS task 直接死、既不建立也不报错 → Codex 卡住重连)。这里显式装 aws-lc-rs(与
+/// reqwest 上游转发一致)。`Once` 保证只装一次;已装(reqwest 等先装过)则 `install_default`
+/// 返 Err、忽略。
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 /// VPN 的 HTTP 代理 URL —— responses 上游 WS 的手动 HTTP-CONNECT 用(见
 /// [`proxy_responses_upstream_ws`])。优先进程 env(`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`,
 /// 大小写都认),否则读 `~/.codex/.env`(用户给 Codex 配的「全通信走 VPN」代理)。返回首个非空
@@ -179,6 +191,7 @@ pub async fn proxy_responses_upstream_ws(
     handshake_headers: HeaderMap,
     first_frame: AxMessage,
 ) {
+    ensure_crypto_provider();
     let telemetry = proxy_telemetry();
     let Some(upstream_url) = responses_ws_url(&resolved.upstream_base) else {
         telemetry.logs.add(
