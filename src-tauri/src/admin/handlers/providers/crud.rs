@@ -183,7 +183,10 @@ pub struct AddProviderInput {
     pub review_model_slot: Option<String>,
 }
 
-pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
+pub async fn add_provider(
+    State(state): State<AdminState>,
+    Json(input): Json<AddProviderInput>,
+) -> impl IntoResponse {
     // 校验 extraHeaders 在保存前合法,避免运行时静默丢 header(实测痛点:Kimi
     // KimiCLI UA 字符串带换行 → resolver 运行时 HeaderValue::from_str 失败 →
     // WARN 后跳过 → Kimi 上游 403 但用户看不到原因)
@@ -328,10 +331,13 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // 池模式:新 provider 的模型要进全局池 catalog + resolver 反查表 → 立即重建。
+    super::resync_pool_if_enabled(&state).await;
     Json(json!({"success": true, "provider": public_provider(&new_provider_value)})).into_response()
 }
 
 pub async fn update_provider(
+    State(state): State<AdminState>,
     Path(id): Path<String>,
     Json(input): Json<AddProviderInput>,
 ) -> impl IntoResponse {
@@ -437,10 +443,15 @@ pub async fn update_provider(
         }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // 池模式:该 provider(即便非 active)的模型在全局池里 → 改动后重建 catalog + 反查表。
+    super::resync_pool_if_enabled(&state).await;
     Json(json!({"success": true, "provider": public_provider(&updated_value)})).into_response()
 }
 
-pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
+pub async fn delete_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     let result = with_config_write(|cfg| {
         let providers = cfg
             .get("providers")
@@ -486,7 +497,12 @@ pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
         Ok(ConfigMutation::Modified(()))
     });
     match result {
-        Ok(()) => Json(json!({"success": true})).into_response(),
+        Ok(()) => {
+            // 池模式:删 provider 后必须从池 catalog + resolver 反查表移除其 slug,
+            // 否则 picker 仍显示、且旧反查表仍用陈旧凭据路由到已删 provider(bot review P2)。
+            super::resync_pool_if_enabled(&state).await;
+            Json(json!({"success": true})).into_response()
+        }
         Err(e) if e == "provider not found" => err(StatusCode::NOT_FOUND, e).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -530,7 +546,10 @@ pub struct ReorderInput {
     pub provider_ids: Vec<String>,
 }
 
-pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResponse {
+pub async fn reorder_providers(
+    State(state): State<AdminState>,
+    Json(input): Json<ReorderInput>,
+) -> impl IntoResponse {
     let result = with_config_write(|cfg| {
         let providers = cfg
             .get("providers")
@@ -583,6 +602,8 @@ pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResp
     });
     match result {
         Ok(public_ordered) => {
+            // 池模式:reorder 改 sortIndex → 改 unique_pool_slugs 的碰撞后缀分配 → 重建。
+            super::resync_pool_if_enabled(&state).await;
             Json(json!({"success": true, "providers": public_ordered})).into_response()
         }
         Err(e) if e == "reorder count mismatch" => err(StatusCode::BAD_REQUEST, e).into_response(),
@@ -592,10 +613,11 @@ pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResp
 
 // /api/providers/{id}/draft —— v1 当 update 用,我们直接复用
 pub async fn save_draft(
+    State(state): State<AdminState>,
     Path(id): Path<String>,
     Json(input): Json<AddProviderInput>,
 ) -> impl IntoResponse {
-    update_provider(Path(id), Json(input)).await
+    update_provider(State(state), Path(id), Json(input)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -624,7 +646,19 @@ pub async fn update_models(
     });
     match result {
         Ok(was_active) => {
-            let desktop_sync = if was_active {
+            // 单模式:仅 active provider 的映射影响 catalog/路由 → 只它变了才 sync。
+            // 池模式:任何 provider 的模型都在全局池里 → 非 active 也要重建(bot review P2)。
+            let pool_on = crate::admin::registry_io::load()
+                .ok()
+                .map(|cfg| {
+                    crate::admin::handlers::common::read_setting_bool(
+                        &cfg,
+                        "exposeAllProviderModels",
+                        false,
+                    )
+                })
+                .unwrap_or(false);
+            let desktop_sync = if was_active || pool_on {
                 let sync =
                     crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(
                         &state,

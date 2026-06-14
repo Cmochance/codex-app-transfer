@@ -23,7 +23,32 @@ use codex_app_transfer_registry::{
 };
 use serde_json::{json, Value};
 
+use crate::admin::state::AdminState;
+
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// 池化模式下,任一 provider 变更(增删改 / reorder / autofill)后重建**全 provider**
+/// catalog + 重启 proxy 刷新反查表 —— 因为池模式 catalog/路由依赖所有 provider,而非
+/// 只 active。单模式无需(catalog/路由只看 active provider,非 active 改动到下次切换才生效)。
+///
+/// 失败只在 sync 内部记录、不阻塞调用方的 CRUD 成功响应(下次 re-apply / 重启幂等补偿);
+/// 关池模式时整体 no-op(连 config 都不读 settings 之外)。
+pub(crate) async fn resync_pool_if_enabled(state: &AdminState) {
+    let pool_on = crate::admin::registry_io::load()
+        .ok()
+        .map(|cfg| {
+            crate::admin::handlers::common::read_setting_bool(
+                &cfg,
+                "exposeAllProviderModels",
+                false,
+            )
+        })
+        .unwrap_or(false);
+    if pool_on {
+        let _ = crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(state)
+            .await;
+    }
+}
 
 pub(crate) fn fresh_provider_id(existing: &[String]) -> String {
     loop {
