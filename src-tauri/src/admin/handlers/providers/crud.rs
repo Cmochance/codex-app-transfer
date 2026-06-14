@@ -430,10 +430,21 @@ pub async fn update_provider(
                 updated.insert("models".into(), Value::Object(merged));
             }
         }
-        // 模型池(pooledModels)**不由 provider 表单维护** —— 由「整合提供商」页 setProviderPool
-        // 独家管理。`updated` 克隆自 existing,这里不动 pooledModels = 表单编辑任何字段都原样保留
-        // 用户在整合页 curation 的池(含显式空 [])。表单写池会把删掉的模型悄悄加回(#477 P2)。
-        // 上游(baseUrl/apiKey)改了导致池陈旧,由用户在整合页「重新获取」处理,不在表单静默清空。
+        // 模型池(pooledModels)**不由 provider 表单填充** —— 由「整合提供商」页 setProviderPool
+        // 独家管理。`updated` 克隆自 existing,正常编辑不动 pooledModels = 原样保留整合页 curation
+        // 的池(含显式空 []),表单写池会把删掉的模型悄悄加回(#477 P2 round-3)。
+        //
+        // **例外:upstream 身份变了**(baseUrl / apiFormat / apiKey 与原值不同)→ 旧池属于旧端点/
+        // 旧账号,留着会让 catalog / resolver 继续广播旧 slug、把请求路由到新上游的不存在模型
+        // (错路由,plan 头号风险)→ **清空** pooledModels(remove → 缺省 → 回退新映射,等用户在
+        // 整合页「重新获取」对新上游重建池)。注意:表单这里只**作废**池、绝不**填充**池(非 resurrection)。
+        // (#477 P2 round-5)
+        let identity_changed = existing.get("baseUrl") != updated.get("baseUrl")
+            || existing.get("apiFormat") != updated.get("apiFormat")
+            || existing.get("apiKey") != updated.get("apiKey");
+        if identity_changed {
+            updated.remove("pooledModels");
+        }
         updated.insert("id".into(), Value::String(id.clone()));
         updated.insert("isBuiltin".into(), Value::Bool(is_builtin));
 

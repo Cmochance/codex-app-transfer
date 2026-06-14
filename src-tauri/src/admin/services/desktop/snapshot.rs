@@ -11,7 +11,7 @@ use codex_app_transfer_codex_integration::{
 };
 use codex_app_transfer_gemini_oauth::antigravity_static_models;
 use codex_app_transfer_proxy::proxy_telemetry;
-use codex_app_transfer_registry::{provider_pooled_enabled, unique_pool_slugs, RawConfig};
+use codex_app_transfer_registry::{unique_pool_slugs, RawConfig};
 use serde_json::{json, Value};
 
 use crate::admin::handlers::common::{active_provider_name, read_setting_bool, APP_VERSION};
@@ -115,14 +115,11 @@ fn build_pool_catalog(
     }
     let entries = unique_pool_slugs(&typed);
     if entries.is_empty() {
-        // 区分两种「空」:
-        // - **无 provider 加入整合**(pooledEnabled 全 false)= 池还没配置 → `None`,caller 退回
-        //   单 active provider catalog(整合刚开、还没添加,Codex 不至于空)。
-        // - **有 provider 加入整合、但池被 curation 全清空**(全 `[]`)= 显式空池 → `Some(空)`,
-        //   尊重用户清空、**不**退回单 provider(否则被删的 active 模型在 Codex 复活,#477 P2)。
-        if typed.iter().any(provider_pooled_enabled) {
-            return Some((Vec::new(), None));
-        }
+        // 池里**一个 slug 都没有**(没 provider 加入整合,或加入的都被 curation 清空)→ 返回
+        // `None`,caller 退回单 active provider catalog。**catalog 与 resolver 一致地回退**是关键:
+        // 此前曾对「加入但全清空」返 `Some(空)`,但 resolver 对空 catalog_slug_map 仍按 legacy 模式
+        // (slug 拆分 / 默认 provider)路由 → catalog 空、resolver 仍回退 = 不一致(#477 P2 round-5)。
+        // 故统一「池空即整体回退」(graceful、Codex 不至于空),回退本身有 loud log 兜底可排查。
         return None;
     }
     // meta 直接从 typed 构建(与 entries 同源 → `entry.provider_idx` 对齐是**结构保证**,
@@ -242,14 +239,13 @@ pub fn desktop_config_target_for_provider(
         match build_pool_catalog(cfg, provider.get("id").and_then(|v| v.as_str())) {
             Some((catalog, slug)) => (Some(catalog), slug),
             None => {
-                // 整合开关已开却**无任何 provider 加入整合**(刚翻开关、还没添加)→ 池尚未配置,
-                // 退回单 active provider catalog(Codex 不至于空)。必须 loud log,否则用户看
+                // 整合开关已开但池为空(没 provider 加入整合 / 加入的都被 curation 清空)→ 退回单
+                // active provider catalog(graceful、Codex 不至于空)。必须 loud log,否则用户看
                 // 「整合已开 + 应用锁定」却只看到单 provider 模型、无从排查(守 no-silent-degradation)。
-                // 前端整合页下池另有「还没加入提供商」引导。
-                // 注:已加入 provider 但 curation 清空(显式空池)走 Some(空) 分支、不到这里(#477 P2)。
+                // 前端整合页下池另有「还没加入提供商 / 各 provider 无可选模型」引导。
                 tracing::warn!(
                     error_id = "POOL_EMPTY_FELL_BACK_TO_SINGLE",
-                    "整合开关已开但还没有 provider 加入整合,退回单 active provider catalog"
+                    "整合开关已开但模型池为空(无 provider 加入整合或加入的都已清空),退回单 active provider catalog"
                 );
                 (None, None)
             }
@@ -1018,39 +1014,13 @@ mod tests {
     }
 
     #[test]
-    fn pool_mode_integrated_but_all_emptied_respects_explicit_empty() {
-        // #477 bot review P2:provider 加入整合但 curation 把模型全删空(pooledModels: [])→
-        // build_pool_catalog 返 Some(空),**不**退回单 provider(否则被删的 active 模型在 Codex 复活)。
-        let cfg = json!({
-            "version": APP_VERSION,
-            "activeProvider": "deepseek",
-            "gatewayApiKey": "cas_test",
-            "providers": [
-                {
-                    "id": "deepseek", "name": "DeepSeek",
-                    "baseUrl": "https://a.example/v1", "apiFormat": "openai_chat",
-                    "apiKey": "k1", "models": {"default": "deepseek-v4-pro"},
-                    "pooledModels": [], "pooledEnabled": true, "sortIndex": 0
-                }
-            ]
-        });
-        let (catalog, slug) = build_pool_catalog(&cfg, Some("deepseek"))
-            .expect("有 provider 加入整合 → Some(即便空),不退回单 provider");
-        assert!(
-            catalog.is_empty(),
-            "显式空池 → catalog 空, got {:?}",
-            catalog.iter().map(|m| &m.slug).collect::<Vec<_>>()
-        );
-        assert!(slug.is_none(), "空池无默认 slug");
-    }
-
-    #[test]
-    fn pool_mode_nothing_integrated_returns_none_for_fallback() {
-        // 对照:开关开但没有 provider 加入整合(pooledEnabled 全缺省)→ None → caller 退回单 provider。
-        let cfg = json!({
-            "version": APP_VERSION,
-            "activeProvider": "deepseek",
-            "gatewayApiKey": "cas_test",
+    fn pool_mode_empty_pool_returns_none_for_consistent_fallback() {
+        // #477 bot review P2 round-5:池里没有任何 slug 时(无论是「没 provider 加入整合」还是
+        // 「加入的都被 curation 清空」)统一返回 None → caller 退回单 active provider catalog。
+        // 关键是 **catalog 与 resolver 一致回退** —— 曾试过对「加入但清空」返 Some(空),但 resolver
+        // 对空 map 仍按 legacy 路由 → 不一致。两种空因都走同一 None 分支验证。
+        let nothing_integrated = json!({
+            "version": APP_VERSION, "activeProvider": "deepseek", "gatewayApiKey": "cas_test",
             "providers": [
                 {
                     "id": "deepseek", "name": "DeepSeek",
@@ -1060,8 +1030,24 @@ mod tests {
             ]
         });
         assert!(
-            build_pool_catalog(&cfg, Some("deepseek")).is_none(),
-            "没有 provider 加入整合 → None(退回单 provider)"
+            build_pool_catalog(&nothing_integrated, Some("deepseek")).is_none(),
+            "没有 provider 加入整合 → None"
+        );
+
+        let all_emptied = json!({
+            "version": APP_VERSION, "activeProvider": "deepseek", "gatewayApiKey": "cas_test",
+            "providers": [
+                {
+                    "id": "deepseek", "name": "DeepSeek",
+                    "baseUrl": "https://a.example/v1", "apiFormat": "openai_chat",
+                    "apiKey": "k1", "models": {"default": "deepseek-v4-pro"},
+                    "pooledModels": [], "pooledEnabled": true, "sortIndex": 0
+                }
+            ]
+        });
+        assert!(
+            build_pool_catalog(&all_emptied, Some("deepseek")).is_none(),
+            "加入整合但 curation 清空 → 同样 None(catalog 与 resolver 一致回退)"
         );
     }
 
