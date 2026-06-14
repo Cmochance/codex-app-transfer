@@ -949,7 +949,7 @@ fn active_mimo_session() -> Option<(String, String)> {
 
 /// session 失效(Auth)时清掉该 provider 存的 `mimoCookie`,让前端 `hasMimoCookie` 转 false
 /// 显「未登录」、提示重新登录(MiMo session 无 refresh,只能重登)。
-fn clear_mimo_cookie(provider_id: &str) {
+fn clear_mimo_cookie(provider_id: &str, used_cookie: &str) {
     let _ = crate::admin::registry_io::with_config_write(|cfg| {
         let Some(providers) = cfg
             .as_object_mut()
@@ -962,7 +962,11 @@ fn clear_mimo_cookie(provider_id: &str) {
         for p in providers.iter_mut() {
             if p.get("id").and_then(|v| v.as_str()) == Some(provider_id) {
                 if let Some(obj) = p.as_object_mut() {
-                    if obj.remove("mimoCookie").is_some() {
+                    // 仅当当前存的 cookie 仍是本次失败用的那把才清:避免请求在途时用户已重新
+                    // 登录(存了新 session),这条迟到的 Auth 把刚捕获的新 cookie 误删。
+                    let still_same =
+                        obj.get("mimoCookie").and_then(|v| v.as_str()) == Some(used_cookie);
+                    if still_same && obj.remove("mimoCookie").is_some() {
                         changed = true;
                     }
                 }
@@ -1188,7 +1192,7 @@ async fn fetch_mimo_quota(
         Err(QuotaError::Auth) => {
             tracing::debug!("[Quota] MiMo session 失效 → 清缓存 + 清存储 cookie(需重新登录)");
             *cache = None;
-            clear_mimo_cookie(&id);
+            clear_mimo_cookie(&id, &cookie);
             None
         }
         Err(QuotaError::Transient(e)) => {
