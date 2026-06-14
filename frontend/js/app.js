@@ -5556,13 +5556,22 @@
   // 写 MCP server 进 ~/.codex/config.toml 前的二次确认文案(MOC-106)。
   // 所有新增 / 编辑一律确认,没有免确认白名单 —— stdio 强调"会以你的权限在本机执行"
   // (config 即可 spawn 任意命令,黑名单只是 guardrail),http 列出连接地址防误填。
+  // stdio 一并展示 cwd / env —— 它们同样 execution-affecting(env 可塞 NODE_OPTIONS /
+  // LD_PRELOAD / PATH 劫持注入代码、cwd 改工作目录),否则恶意 payload 藏 env 里会绕过确认。
   function codexMcpBuildSaveConfirm(spec) {
     const name = spec.name || "";
     if (spec.transport === "stdio") {
       const cmdline = [spec.command || "", ...(Array.isArray(spec.args) ? spec.args : [])]
         .join(" ")
         .trim();
-      return tFmt("codex.mcp.saveConfirmStdio", { name, cmdline });
+      const extras = [];
+      if (spec.cwd) extras.push(`cwd: ${spec.cwd}`);
+      if (spec.env && typeof spec.env === "object") {
+        const envLines = Object.keys(spec.env).map((k) => `  ${k}=${spec.env[k]}`);
+        if (envLines.length) extras.push("env:\n" + envLines.join("\n"));
+      }
+      const extra = extras.length ? "\n\n" + extras.join("\n") : "";
+      return tFmt("codex.mcp.saveConfirmStdio", { name, cmdline, extra });
     }
     return tFmt("codex.mcp.saveConfirmHttp", { name, url: spec.url || "" });
   }
