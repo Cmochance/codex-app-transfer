@@ -222,8 +222,9 @@ fn push_pooled_with_one_m(
 }
 
 /// 某 provider 在池里的"可选模型列表",每条附带"是否声明 1M"(由被 strip 的 `[1m]`
-/// 标记得出)。优先用持久化 `pooledModels`,为空则回退槽位映射(`default` 优先,再按
-/// `MODEL_SLOTS` 顺序)。clean id 去重、稳定顺序;同 clean id 多变体只要一个带 `[1m]` 即 true。
+/// 标记得出)。`pooledModels` **数组存在即权威(含空数组)**;仅当其整个缺省(key 不存在 /
+/// 非数组)才回退槽位映射(`default` 优先,再按 `MODEL_SLOTS` 顺序)。clean id 去重、稳定
+/// 顺序;同 clean id 多变体只要一个带 `[1m]` 即 true。
 pub fn pooled_models_with_one_m(
     pooled_models: Option<&Value>,
     models: Option<&Value>,
@@ -231,15 +232,17 @@ pub fn pooled_models_with_one_m(
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
 
-    // 1. 持久化 pooledModels(字符串数组)
+    // 1. 持久化 pooledModels(字符串数组)。**数组存在即权威(含空数组)**:整合页 curation
+    //    把某 provider 的模型删光会写入 `pooledModels: []`,必须当「显式空池」返回空,**不能**
+    //    回退槽位映射 —— 否则 UI 删光了、Codex catalog / resolver 仍带该 provider 的映射模型
+    //    = 静默不一致(#477 bot review P2)。仅当 pooledModels 整个缺省(key 不存在 / 非数组,
+    //    含老 config 与从未 curation 的 provider)才走步骤 2 回退。
     if let Some(Value::Array(arr)) = pooled_models {
         for item in arr {
             if let Some(s) = item.as_str() {
                 push_pooled_with_one_m(s, &mut out, &mut index);
             }
         }
-    }
-    if !out.is_empty() {
         return out;
     }
 
@@ -494,6 +497,21 @@ mod tests {
     }
 
     #[test]
+    fn unique_pool_slugs_integrated_provider_with_explicit_empty_pool_contributes_nothing() {
+        // #477 bot review P2:整合页把某 provider 的模型 curation 删光(pooledModels: [])后,
+        // 即便它有 models 槽位映射,也**不能**回退映射进池 —— 否则 UI 删光了 Codex 仍能选。
+        let mut emptied = mk_provider("a", "A");
+        emptied.models.insert("default".into(), "a-model".into()); // 有映射但被显式清空
+        emptied.extra.insert("pooledModels".into(), json!([]));
+        let mut kept = mk_provider("b", "B");
+        kept.extra.insert("pooledModels".into(), json!(["b-x"]));
+
+        let entries = unique_pool_slugs(&[emptied, kept]);
+        let slugs: Vec<&str> = entries.iter().map(|e| e.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["b/b-x"], "显式空池的 a 不进池,只有 b/b-x");
+    }
+
+    #[test]
     fn pooled_model_ids_prefers_pooled_models_list() {
         // pooledModels 非空 → 用它;strip [1m];去重;忽略槽位映射
         let pooled = json!(["deepseek-v4-pro[1m]", "deepseek-chat", "deepseek-v4-pro"]);
@@ -519,10 +537,26 @@ mod tests {
     }
 
     #[test]
-    fn pooled_model_ids_empty_array_falls_back_to_mappings() {
+    fn pooled_model_ids_explicit_empty_array_is_empty_not_fallback() {
+        // 整合页 curation 删光 = 显式空池(pooledModels: [])→ 返回空,**不**回退槽位映射。
+        // (区分「显式空」与「整个缺省」:后者才回退,见下一个 test。)#477 bot review P2。
         let pooled = json!([]);
         let models = json!({"default": "m1"});
-        assert_eq!(pooled_model_ids(Some(&pooled), Some(&models)), vec!["m1"]);
+        let empty: Vec<String> = vec![];
+        assert_eq!(pooled_model_ids(Some(&pooled), Some(&models)), empty);
+    }
+
+    #[test]
+    fn pooled_model_ids_absent_falls_back_to_mappings() {
+        // pooledModels 整个缺省(None / 非数组)= 从未 curation(老 config)→ 回退槽位映射,
+        // 保证未整理过的 provider 不会因「没设 pooledModels」就空池。
+        let models = json!({"default": "m1"});
+        assert_eq!(pooled_model_ids(None, Some(&models)), vec!["m1"]);
+        let not_array = json!("oops");
+        assert_eq!(
+            pooled_model_ids(Some(&not_array), Some(&models)),
+            vec!["m1"]
+        );
     }
 
     #[test]
