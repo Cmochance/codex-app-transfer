@@ -716,6 +716,29 @@
     return providerAvailableModels.find((e) => modelEntryId(e).trim().toLowerCase() === target) || null;
   }
 
+  // 池化:进编辑页时,模型下拉「立即」用 provider 已持久化的 pooledModels 渲染(无需先
+  // 网络拉取)。pooledModels 是 raw id string 数组 —— modelEntryId/DisplayLabel 已兼容
+  // string entry(value=显示文本=id),直接当 providerAvailableModels 用即可。
+  // 同时把当前 mappings 里已选、但还不在 pooledModels 的值并进来,保证「选框选中项必出现在
+  // 下拉里」(沿用改前:无论 available 列表内容,已选值始终可见)。dedup 用 lowercase id。
+  function pooledModelOptionsFromProvider(pooledModels = [], mappings = {}) {
+    const out = [];
+    const seen = new Set();
+    const push = (id) => {
+      const raw = String(id || "").trim();
+      if (!raw) return;
+      const key = raw.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(raw);
+    };
+    (Array.isArray(pooledModels) ? pooledModels : []).forEach(push);
+    // mappings 里的现值(default + 各槽)兜底并入,确保已配置但未出现在 pooledModels 的
+    // 模型在下拉里仍可见 / 可重选。
+    Object.values(mappings || {}).forEach(push);
+    return out;
+  }
+
   function providerModelOptionsMarkup(currentValue = "") {
     // recommended:true 置顶,其余保持原相对顺序(稳定排序);非推荐仍全量保留可见。
     // 其他 provider(全 string entry)recommended 恒 false,排序 no-op,行为同改前。
@@ -913,7 +936,14 @@
       const result = await CCApi.fetchProviderModelsPayload(payload);
       const models = Array.isArray(result.models) ? result.models.slice() : [];
       if (models.length) {
-        setProviderMappings(providerFormMappings, { availableModels: models });
+        // 富 entry(带 display_name)优先,再并入已 seed 的 pooledModels 里上游没返回的
+        // raw id —— 避免上游 list 缺某个池化模型时把它从下拉里挤掉(非破坏性合并)。
+        const covered = new Set(models.map((e) => modelEntryId(e).trim().toLowerCase()).filter(Boolean));
+        const extras = providerAvailableModels.filter((e) => {
+          const id = modelEntryId(e).trim().toLowerCase();
+          return id && !covered.has(id);
+        });
+        setProviderMappings(providerFormMappings, { availableModels: [...models, ...extras] });
       }
     } catch (e) {
       // 非破坏性 fallback:保持选框 raw id 显示,不弹 toast 不打扰用户;但留 devtools
@@ -1136,7 +1166,7 @@
     return null;
   }
 
-  function providerCardMarkup(provider) {
+  function providerCardMarkup(provider, poolMode = false) {
     const mapping = [
       provider.mappings.default,
       provider.mappings.gpt_5_5,
@@ -1156,6 +1186,11 @@
     const baseUrlMarkup = docsUrl
       ? `<a class="truncate baseurl-docs-link" href="#" data-action="open-docs" data-docs-url="${escapeHtml(docsUrl)}" data-provider-name="${providerName}" title="${t("providers.openDocsHint")}">${providerUrl}<i class="bi bi-box-arrow-up-right baseurl-docs-icon"></i></a>`
       : `<span class="truncate">${providerUrl}</span>`;
+    // 池化模式下「设为默认」语义从「全部路由到这里」变成「新对话 / 不带前缀请求的默认 provider」,
+    // active badge / 启用按钮文案随之切换(关闭时维持原文案)。
+    const activeBadgeText = poolMode ? t("providers.poolDefaultBadge") : t("status.active");
+    const enableBtnText = poolMode ? t("providers.setPoolDefault") : t("providers.enable");
+    const enableBtnTitle = poolMode ? t("providers.setPoolDefaultHint") : "";
     return `
       <article class="provider-switch-card ${provider.default ? "active" : ""}" draggable="true" data-provider-id="${providerId}">
         <span class="drag-handle"><i class="bi bi-grip-vertical"></i></span>
@@ -1166,9 +1201,9 @@
         </span>
         <span class="provider-meta truncate">${mappingText}</span>
         <span class="provider-actions">
-          ${provider.default ? `<span class="active-indicator" role="status" aria-label="${escapeHtml(t("status.active"))}"><i class="bi bi-broadcast" aria-hidden="true"></i><span>${escapeHtml(t("status.active"))}</span></span>` : ""}
-          <button class="btn btn-primary compact-enable" type="button" data-action="set-default" data-id="${providerId}">
-            <i class="bi bi-play-fill"></i><span>${t("providers.enable")}</span>
+          ${provider.default ? `<span class="active-indicator" role="status" aria-label="${escapeHtml(activeBadgeText)}"><i class="bi bi-broadcast" aria-hidden="true"></i><span>${escapeHtml(activeBadgeText)}</span></span>` : ""}
+          <button class="btn btn-primary compact-enable" type="button" data-action="set-default" data-id="${providerId}"${enableBtnTitle ? ` title="${escapeHtml(enableBtnTitle)}"` : ""}>
+            <i class="bi bi-play-fill"></i><span>${enableBtnText}</span>
           </button>
           <button class="icon-action" type="button" data-action="test-provider" data-id="${providerId}" title="${t("providers.testSpeed")}" aria-label="${t("providers.testSpeed")}"><i class="bi bi-lightning-charge"></i></button>
           <button class="icon-action" type="button" data-action="query-usage" data-id="${providerId}" title="${t("providers.usage")}" aria-label="${t("providers.usage")}"><i class="bi bi-wallet2"></i></button>
@@ -1282,8 +1317,16 @@
     if (!target) return;
     const providers = await CCApi.getProviders();
     if (!presetCache.length) presetCache = await CCApi.getPresets();
+    // 池化模式开关:决定 set-default 按钮 / active badge 文案语义(读 status 比 getSettings
+    // 轻;失败时退到 false = 原文案,非破坏性)。
+    let poolMode = false;
+    try {
+      poolMode = !!(await CCApi.getStatus()).exposeAllProviderModels;
+    } catch (e) {
+      console.warn("[renderProviderCards] 读取 exposeAllProviderModels 失败,按关闭处理:", e);
+    }
     const providerList = providers.length
-      ? `<div class="provider-configured-list" data-provider-list>${providers.map(providerCardMarkup).join("")}</div>`
+      ? `<div class="provider-configured-list" data-provider-list>${providers.map((p) => providerCardMarkup(p, poolMode)).join("")}</div>`
       : "";
     if (!providers.length) {
       target.innerHTML = `<div class="provider-preset-grid">${visiblePresets().map((preset) => providerPresetCardMarkup(preset)).join("")}</div>`;
@@ -2338,13 +2381,17 @@
       !!formRequestOptions.web_search_enabled,
       matchedPreset?.id || null
     );
-    providerAvailableModels = [];
-    setProviderMappings(provider.mappings || emptyMappings());
+    // 池化:进编辑页「立即」用持久化的 pooledModels 渲染下拉(解耦强制网络拉取);
+    // pooledModels 空时回退空列表,行为同改前(下拉禁用直到点「获取模型」)。
+    // setProviderMappings 内部会把 availableModels 写进 providerAvailableModels(单一赋值源)。
+    const pooledOptions = pooledModelOptionsFromProvider(provider.pooledModels, provider.mappings);
+    setProviderMappings(provider.mappings || emptyMappings(), { availableModels: pooledOptions });
     setReviewModelSlotField(provider.reviewModelSlot || ""); // 回填已配置的审查模型槽位
     renderPresetOptions(selectedPreset, provider.mappings || emptyMappings());
     updatePresetSelection();
     // [MOC-69] antigravity 自动拉模型列表,让映射选框立即显示 displayName(不必手点「获取模型」);
-    // 失败/离线静默保持 raw id 显示。只对 antigravity(唯一带 displayName 的 provider)生效。
+    // 失败/离线静默保持上面 pooledModels 的 raw id 显示。只对 antigravity(唯一带
+    // displayName 的 provider)生效;这是「锦上添花」式异步增强,不再是下拉的唯一数据源。
     if ((effectiveFormat || provider.apiFormat) === "antigravity_oauth") {
       await autoFetchModelsForDisplay();
     }

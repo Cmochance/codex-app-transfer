@@ -179,7 +179,9 @@ pub async fn status(State(state): State<AdminState>) -> impl IntoResponse {
         "activeProviderId": active_id,
         "providerCount": providers_count,
         "desktopHealth": desktop_health,
-        "exposeAllProviderModels": false,
+        // 池化开关真实值(此前硬编 false 的 stub):前端据此把 set-default 文案切到
+        // 「新对话默认 provider」语义 + 决定模型菜单提示。
+        "exposeAllProviderModels": read_setting_bool(&cfg, "exposeAllProviderModels", false),
     }))
     .into_response()
 }
