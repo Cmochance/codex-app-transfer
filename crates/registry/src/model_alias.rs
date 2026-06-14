@@ -267,7 +267,19 @@ pub fn pooled_model_ids(pooled_models: Option<&Value>, models: Option<&Value>) -
         .collect()
 }
 
+/// provider 是否已加入「整合」(`extra["pooledEnabled"] == true`)。整合页里用户「添加」进去
+/// 的子集才置 true;未加入的不进池(catalog 不显示、resolver 不路由其 slug)。
+pub fn provider_pooled_enabled(provider: &crate::Provider) -> bool {
+    provider
+        .extra
+        .get("pooledEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// 给一组 provider 产出全部池条目(catalog slug ↔ provider/real_model)。
+///
+/// **只纳入已加入整合的 provider**(`pooledEnabled==true`)—— 整合页用户「添加」的子集。
 ///
 /// **确定性**是核心契约:catalog 生成端与 resolver 路由端各自调用本函数(对同一份
 /// `providers`),必须得到逐字一致的 slug。为此:
@@ -276,7 +288,10 @@ pub fn pooled_model_ids(pooled_models: Option<&Value>, models: Option<&Value>) -
 /// - `provider_idx` 始终是**原始切片**下标,方便两端各自索引自己的数据;
 /// - 全局 slug 去重(同 provider 内重复模型 / 跨 provider 撞全名都只保留首次)。
 pub fn unique_pool_slugs(providers: &[crate::Provider]) -> Vec<PoolEntry> {
-    let mut order: Vec<usize> = (0..providers.len()).collect();
+    // 只处理已加入整合的 provider;provider_idx 仍取**原始切片**下标(两端一致)。
+    let mut order: Vec<usize> = (0..providers.len())
+        .filter(|&i| provider_pooled_enabled(&providers[i]))
+        .collect();
     order.sort_by(|&a, &b| {
         providers[a]
             .sort_index
@@ -434,6 +449,10 @@ mod tests {
     // ── 池化路由 helper ──
 
     fn mk_provider(id: &str, name: &str) -> crate::Provider {
+        // 默认已加入整合(pooledEnabled=true),让 unique_pool_slugs 测试纳入它;
+        // 「未加入则排除」由专门的 excludes 测试覆盖。
+        let mut extra = IndexMap::new();
+        extra.insert("pooledEnabled".to_owned(), serde_json::json!(true));
         crate::Provider {
             id: id.into(),
             name: name.into(),
@@ -447,8 +466,27 @@ mod tests {
             request_options: IndexMap::new(),
             is_builtin: false,
             sort_index: 0,
-            extra: IndexMap::new(),
+            extra,
         }
+    }
+
+    #[test]
+    fn unique_pool_slugs_excludes_providers_not_in_integration() {
+        // pooledEnabled 缺失 / false → 不进池(整合子集语义)。
+        let mut included = mk_provider("a", "A");
+        included.models.insert("default".into(), "a-model".into());
+        let mut excluded = mk_provider("b", "B");
+        excluded.models.insert("default".into(), "b-model".into());
+        excluded.extra.insert("pooledEnabled".into(), json!(false));
+        let mut no_flag = mk_provider("c", "C");
+        no_flag.models.insert("default".into(), "c-model".into());
+        no_flag.extra.shift_remove("pooledEnabled");
+
+        let entries = unique_pool_slugs(&[included, excluded, no_flag]);
+        let slugs: Vec<&str> = entries.iter().map(|e| e.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["a/a-model"], "只有 pooledEnabled=true 的 a 进池");
+        // provider_idx 仍是原始下标(a 在 0)
+        assert_eq!(entries[0].provider_idx, 0);
     }
 
     #[test]

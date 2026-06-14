@@ -56,6 +56,10 @@ pub fn build_app_router(state: AdminState) -> Router {
             put(handlers::providers::crud::set_default_provider),
         )
         .route(
+            "/api/providers/{id}/pool",
+            put(handlers::providers::crud::set_provider_pool),
+        )
+        .route(
             "/api/providers/{id}/activate",
             post(handlers::providers::crud::activate_provider),
         )

@@ -559,6 +559,70 @@ pub async fn delete_provider(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetPoolInput {
+    /// 整合开关:把该 provider 加入(true)/移出(false)整合页子集。缺省 = 不动。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 可选模型列表(整合页下方卡池增删的**权威结果**)。缺省 = 不动;
+    /// `Some` 时**整列表替换**(curation 既要增也要删,非合并),经 chat 过滤去重。
+    #[serde(default)]
+    pub models: Option<Value>,
+}
+
+/// `PUT /api/providers/{id}/pool` —— 整合页对单个 provider 的池操作。
+///
+/// 两件事各自独立、缺省即不动:
+/// - `enabled`:写 `pooledEnabled`(决定该 provider 是否进入 `unique_pool_slugs` 子集)。
+/// - `models`:**权威替换** `pooledModels`(curation 的增删都靠它,不能 merge,
+///   否则用户删不掉模型 —— 与 CRUD 的 never-shrink 合并语义相反,这里就是要精确集合)。
+pub async fn set_provider_pool(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(input): Json<SetPoolInput>,
+) -> impl IntoResponse {
+    // `models` 是权威替换:若客户端传了非数组,coerce 成 [] 会**静默清空** pooledModels
+    // (守 no-silent-destructive)→ 提前拒为 400,不进写盘闭包。缺省(None)= 不动该项。
+    if let Some(models) = input.models.as_ref() {
+        if !models.is_array() {
+            return err(StatusCode::BAD_REQUEST, "models must be an array").into_response();
+        }
+    }
+    let result = with_config_write(|cfg| {
+        let Some(idx) = provider_index(cfg, &id) else {
+            return Err("provider not found".into());
+        };
+        let providers = cfg
+            .get_mut("providers")
+            .and_then(|v| v.as_array_mut())
+            .unwrap();
+        // provider_index 已证 idx 在数组内;但元素非 object = config 损坏,
+        // 不能静默 no-op 还回 success(否则客户端以为写成功了)。
+        let Some(o) = providers[idx].as_object_mut() else {
+            return Err("provider entry is not an object (corrupt config)".into());
+        };
+        if let Some(enabled) = input.enabled {
+            o.insert("pooledEnabled".into(), Value::Bool(enabled));
+        }
+        if let Some(models) = input.models.as_ref() {
+            o.insert(
+                "pooledModels".into(),
+                super::models::chat_filter_pooled_value(models),
+            );
+        }
+        Ok(ConfigMutation::Modified(()))
+    });
+    match result {
+        Ok(()) => {
+            // 整合子集 / 池模型列表变化 → 重建池 catalog + resolver 反查表。
+            super::resync_pool_if_enabled(&state).await;
+            Json(json!({"success": true})).into_response()
+        }
+        Err(e) if e == "provider not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 pub async fn set_default_provider(
     State(state): State<AdminState>,
     Path(id): Path<String>,

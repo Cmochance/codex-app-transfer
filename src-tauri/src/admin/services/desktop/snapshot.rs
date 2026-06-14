@@ -233,7 +233,17 @@ pub fn desktop_config_target_for_provider(
     let (pool, pool_default_slug) = if read_setting_bool(cfg, "exposeAllProviderModels", false) {
         match build_pool_catalog(cfg, provider.get("id").and_then(|v| v.as_str())) {
             Some((catalog, slug)) => (Some(catalog), slug),
-            None => (None, None),
+            None => {
+                // 整合开关已开却无可池条目(最常见:刚翻开关、还没把任何 provider「加入整合」,
+                // 或加入的 provider 没有可池模型)。此时静默退回单 active provider catalog ——
+                // 必须 loud log,否则用户看「整合已开 + 应用锁定」却只看到单 provider 模型,无从排查
+                // (守 no-silent-degradation)。前端整合页下池另有「还没加入提供商」引导。
+                tracing::warn!(
+                    error_id = "POOL_EMPTY_FELL_BACK_TO_SINGLE",
+                    "整合开关已开但池为空(无 provider 加入整合 / 加入的无可池模型),退回单 active provider catalog"
+                );
+                (None, None)
+            }
         }
     } else {
         (None, None)
@@ -891,13 +901,15 @@ mod tests {
                 {
                     "id": "deepseek", "name": "DeepSeek",
                     "baseUrl": "https://a.example/v1", "apiFormat": "openai_chat",
-                    "apiKey": "k1", "models": {"default": "deepseek-v4-pro"}, "sortIndex": 0
+                    "apiKey": "k1", "models": {"default": "deepseek-v4-pro"},
+                    "pooledEnabled": true, "sortIndex": 0
                 },
                 {
                     "id": "kimi", "name": "Kimi",
                     "baseUrl": "https://b.example/v1", "apiFormat": "openai_chat",
                     "apiKey": "k2", "models": {"default": "kimi-k2.6"},
-                    "pooledModels": ["kimi-k2.6", "kimi-for-coding"], "sortIndex": 1
+                    "pooledModels": ["kimi-k2.6", "kimi-for-coding"],
+                    "pooledEnabled": true, "sortIndex": 1
                 }
             ],
             "settings": {
@@ -945,6 +957,58 @@ mod tests {
     }
 
     #[test]
+    fn pool_mode_excludes_active_provider_not_in_integration() {
+        // 子集语义新引入的运行态:整合开 + active provider(deepseek)未「加入整合」
+        // (无 pooledEnabled),仅 kimi 加入 → 池非空(只含 kimi),但 active 不在池里
+        // → pool_default_slug=None。这是本次改动新可达的状态(以前全 provider 都入池,
+        // active 必有条目、default_slug 必 Some);apply 层据此退回 catalog 首条锚定,picker 不空。
+        let mut cfg = json!({
+            "version": APP_VERSION,
+            "activeProvider": "deepseek",
+            "gatewayApiKey": "cas_test",
+            "providers": [
+                {
+                    "id": "deepseek", "name": "DeepSeek",
+                    "baseUrl": "https://a.example/v1", "apiFormat": "openai_chat",
+                    "apiKey": "k1", "models": {"default": "deepseek-v4-pro"},
+                    "sortIndex": 0
+                },
+                {
+                    "id": "kimi", "name": "Kimi",
+                    "baseUrl": "https://b.example/v1", "apiFormat": "openai_chat",
+                    "apiKey": "k2", "models": {"default": "kimi-k2.6"},
+                    "pooledModels": ["kimi-k2.6", "kimi-for-coding"],
+                    "pooledEnabled": true, "sortIndex": 1
+                }
+            ],
+            "settings": {
+                "theme": "default", "language": "zh",
+                "proxyPort": 18080, "adminPort": 18081,
+                "autoStart": false, "autoApplyOnStart": true,
+                "exposeAllProviderModels": true, "restoreCodexOnExit": true,
+                "updateUrl": DEFAULT_UPDATE_URL
+            }
+        });
+
+        let active = cfg["providers"][0].clone();
+        let target = desktop_config_target_for_provider(&mut cfg, &active, None);
+        let pool = target.pool.clone().expect("kimi 加入整合 → pool 应为 Some");
+        let slugs: Vec<&str> = pool.iter().map(|m| m.slug.as_str()).collect();
+        assert!(slugs.contains(&"kimi/kimi-k2.6"), "{slugs:?}");
+        assert!(slugs.contains(&"kimi/kimi-for-coding"), "{slugs:?}");
+        assert!(
+            !slugs.iter().any(|s| s.starts_with("deepseek/")),
+            "active 但未加入整合的 deepseek 不应在池: {slugs:?}"
+        );
+        assert!(!pool.is_empty(), "池非空 → picker 不空");
+        assert!(
+            target.pool_default_slug.is_none(),
+            "active 不在整合子集 → pool_default_slug=None, got {:?}",
+            target.pool_default_slug
+        );
+    }
+
+    #[test]
     fn pool_catalog_slugs_match_resolver_map_keys_byte_for_byte() {
         // **最高severity invariant 守门**:catalog 生成端(snapshot::build_pool_catalog)与
         // resolver 路由端(proxy_runner:Config deser → unique_pool_slugs → build_catalog_slug_map)
@@ -959,12 +1023,12 @@ mod tests {
             "gatewayApiKey": "cas_test",
             "providers": [
                 {"id":"acme","name":"Acme One","baseUrl":"https://a/v1","apiFormat":"openai_chat",
-                 "apiKey":"k","models":{"default":"qna-v1"},"sortIndex":0},
+                 "apiKey":"k","models":{"default":"qna-v1"},"pooledEnabled":true,"sortIndex":0},
                 {"id":"ACME","name":"Acme Two","baseUrl":"https://b/v1","apiFormat":"openai_chat",
-                 "apiKey":"k","models":{"default":"qna-v2"},"sortIndex":1},
+                 "apiKey":"k","models":{"default":"qna-v2"},"pooledEnabled":true,"sortIndex":1},
                 {"id":"kimi","name":"Kimi","baseUrl":"https://c/v1","apiFormat":"openai_chat",
                  "apiKey":"k","models":{"default":"kimi-k2.6"},
-                 "pooledModels":["kimi-k2.6","kimi-for-coding"],"sortIndex":2}
+                 "pooledModels":["kimi-k2.6","kimi-for-coding"],"pooledEnabled":true,"sortIndex":2}
             ],
             "settings": {"theme":"default","language":"zh","proxyPort":18080,"adminPort":18081,
                 "autoStart":false,"autoApplyOnStart":true,"exposeAllProviderModels":true,
