@@ -542,7 +542,11 @@ fn artifact_chunk_body(content: &str, offset: usize) -> Result<(String, usize), 
 /// 缓存, 本工具按 artifact_id 取**任意**被折叠的工具输出(shell / 飞书 MCP / 其它)。不联网、不受
 /// webfetch 档位影响。取回内容当前轮进上下文, 下一轮被 proxy 的 MOC-190 滚动压缩收回, 不长期占用。
 /// ≤[`ARTIFACT_CHUNK_CHARS`] 一次返全文;更大则从 `offset` 起返回一块 + 续读提示(逐块可取完整)。
-async fn handle_read_tool_artifact_call(id: Value, artifact_id: Option<String>, offset: usize) -> Value {
+async fn handle_read_tool_artifact_call(
+    id: Value,
+    artifact_id: Option<String>,
+    offset: usize,
+) -> Value {
     let artifact_id = match artifact_id {
         Some(a) if !a.is_empty() => a,
         _ => {
