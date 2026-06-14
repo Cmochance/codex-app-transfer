@@ -208,12 +208,6 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // 选择器里 fallback 到内置 GPT 系列名("GPT-5.5"等),用户看不到真实
     // provider/model。现在每条 provider 都通过 catalog 把 display_name 设成
     // "<provider> / <real-model>",`model_context_window` 仍只在 1M 时设。
-    let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
-    sync_root_value(
-        &paths.config_toml,
-        CODEX_MODEL_CATALOG_KEY,
-        Some(&catalog_literal),
-    )?;
     let models = catalog_models_for_provider_with_display_names(
         cfg.provider_name,
         cfg.default_model,
@@ -223,43 +217,61 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         cfg.model_display_names,
         cfg.review_model_slot,
     );
-    upsert_catalog_models(&paths.model_catalog_json, &models)?;
-    // [MOC-154] 列表式:Codex `model` 字段统一锚到 catalog 内的有效 slug。去掉旧
-    // fallback entry 后,遗留的 `model = 实际模型名`(用户在旧版映射 UI 下选过)会不在
-    // 新 catalog → Codex 选不到。仅当当前 model 非空且不在新 catalog slug 集合时,重置
-    // 为 `gpt-5.5`(= 默认模型槽,保证新对话直接用默认);已是有效 slug(用户手选的
-    // gpt-5.x)→ 保留不覆盖(守 no-silent-destructive)。snapshot 已在首次 apply 前
-    // 捕获原 model,restore 仍按快照还原用户接管前的值。
-    let current_model = match std::fs::read_to_string(&paths.config_toml) {
-        // 与同 crate `read_or_empty` 约定一致:NotFound(首次 apply、config.toml 还
-        // 不存在 → 无遗留 model)当良性、不迁移;其余 IO 错误(权限/损坏/部分读)
-        // fail-loud 向上传播,不静默吞错漏迁移。
-        Ok(content) => content
-            // root `model` key 只在第一个 `[section]` 之前出现;take_while 到首个
-            // 表头止,避免把 `[some_table]` 里的 `model = ...` 误读成根 model。
-            .lines()
-            .take_while(|line| !line.trim_start().starts_with('['))
-            .find_map(|line| {
-                let t = line.trim_start();
-                if t.starts_with('#') {
-                    None
-                } else {
-                    crate::residual::parse_root_string_value(t, "model")
-                }
-            }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
-    let model_needs_reset = current_model
-        .as_deref()
-        .is_some_and(|m| !m.is_empty() && !models.iter().any(|cm| cm.slug == m));
-    if model_needs_reset && models.iter().any(|cm| cm.slug == "gpt-5.5") {
-        sync_root_value(&paths.config_toml, "model", Some("\"gpt-5.5\""))?;
-    }
-    if cfg.supports_1m {
-        sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
-    } else {
+    if models.is_empty() {
+        // [MOC-234] responses passthrough provider 允许**留空默认模型**(UI 如此 ——
+        // model 原样透传给原生上游),此时 catalog models 为空。**绝不写 `models:[]`
+        // 覆盖 Codex 内置目录** —— 否则用户按 passthrough 流程配置后,Codex 模型选择器
+        // 被清空、丢失所有可选模型(chatgpt-codex-connector P2)。改为 strip catalog key
+        // + 清空文件 + 不写 window,让 Codex 回落到自带内置目录(等价旧 direct 的 catalog
+        // strip,只是触发条件从「direct」改为「models 为空」)。
+        sync_root_value(&paths.config_toml, CODEX_MODEL_CATALOG_KEY, None)?;
+        clear_catalog_models(&paths.model_catalog_json)?;
         sync_root_value(&paths.config_toml, "model_context_window", None)?;
+    } else {
+        let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
+        sync_root_value(
+            &paths.config_toml,
+            CODEX_MODEL_CATALOG_KEY,
+            Some(&catalog_literal),
+        )?;
+        upsert_catalog_models(&paths.model_catalog_json, &models)?;
+        // [MOC-154] 列表式:Codex `model` 字段统一锚到 catalog 内的有效 slug。去掉旧
+        // fallback entry 后,遗留的 `model = 实际模型名`(用户在旧版映射 UI 下选过)会不在
+        // 新 catalog → Codex 选不到。仅当当前 model 非空且不在新 catalog slug 集合时,重置
+        // 为 `gpt-5.5`(= 默认模型槽,保证新对话直接用默认);已是有效 slug(用户手选的
+        // gpt-5.x)→ 保留不覆盖(守 no-silent-destructive)。snapshot 已在首次 apply 前
+        // 捕获原 model,restore 仍按快照还原用户接管前的值。
+        let current_model = match std::fs::read_to_string(&paths.config_toml) {
+            // 与同 crate `read_or_empty` 约定一致:NotFound(首次 apply、config.toml 还
+            // 不存在 → 无遗留 model)当良性、不迁移;其余 IO 错误(权限/损坏/部分读)
+            // fail-loud 向上传播,不静默吞错漏迁移。
+            Ok(content) => content
+                // root `model` key 只在第一个 `[section]` 之前出现;take_while 到首个
+                // 表头止,避免把 `[some_table]` 里的 `model = ...` 误读成根 model。
+                .lines()
+                .take_while(|line| !line.trim_start().starts_with('['))
+                .find_map(|line| {
+                    let t = line.trim_start();
+                    if t.starts_with('#') {
+                        None
+                    } else {
+                        crate::residual::parse_root_string_value(t, "model")
+                    }
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let model_needs_reset = current_model
+            .as_deref()
+            .is_some_and(|m| !m.is_empty() && !models.iter().any(|cm| cm.slug == m));
+        if model_needs_reset && models.iter().any(|cm| cm.slug == "gpt-5.5") {
+            sync_root_value(&paths.config_toml, "model", Some("\"gpt-5.5\""))?;
+        }
+        if cfg.supports_1m {
+            sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
+        } else {
+            sync_root_value(&paths.config_toml, "model_context_window", None)?;
+        }
     }
 
     // 4. auth.json: auth_mode + OPENAI_API_KEY
@@ -303,8 +315,8 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         config_toml_path: paths.config_toml.display().to_string(),
         auth_json_path: paths.auth_json.display().to_string(),
         snapshot_taken: snapshot_taken_now,
-        model_context_window_set: cfg.supports_1m,
-        model_catalog_json_set: true,
+        model_context_window_set: cfg.supports_1m && !models.is_empty(),
+        model_catalog_json_set: !models.is_empty(),
     })
 }
 
@@ -573,6 +585,62 @@ mod tests {
 
     fn read_app_config(paths: &CodexPaths) -> serde_json::Value {
         codex_app_transfer_registry::load_raw_config(&paths.model_catalog_json).unwrap()
+    }
+
+    /// [MOC-234] chatgpt-codex-connector P2 回归:responses passthrough provider 留空默认
+    /// 模型(UI 允许,model 原样透传上游)→ catalog models 为空时**绝不写 `models:[]`
+    /// 覆盖 Codex 内置目录**(否则模型选择器被清空)。应 strip catalog key + 不写 window,
+    /// 让 Codex 回落内置目录。
+    #[test]
+    fn responses_blank_default_model_does_not_clobber_codex_catalog() {
+        let (_t, paths) = setup();
+        let result = apply_provider(
+            &paths,
+            &ApplyConfig {
+                base_url: "http://127.0.0.1:18080",
+                gateway_api_key: "cas_test",
+                supports_1m: true, // 即便 1M,空 models 也不写 window
+                provider_name: "Custom Responses",
+                default_model: "",    // 留空(UI 对 responses 放开)
+                model_mappings: None, // 无映射 → catalog models 为空
+                model_capabilities: None,
+                model_display_names: None,
+                review_model_slot: None,
+                app_version: "v",
+                codex_network_access: true,
+                preserve_chatgpt_auth: false,
+            },
+        )
+        .unwrap();
+        assert!(!result.model_catalog_json_set, "空 models 不应写 catalog");
+        assert!(!result.model_context_window_set, "空 models 不应写 window");
+        let toml = read_toml(&paths);
+        assert!(
+            !toml.contains("model_catalog_json"),
+            "config.toml 不应指向 catalog: {toml}"
+        );
+        assert!(
+            !toml.contains("model_context_window"),
+            "不应写 window: {toml}"
+        );
+        // catalog 文件:不存在 或 无非空 models 都可(关键是 config.toml 没指向它 →
+        // Codex 用内置目录)。绝不能出现写入的非空 `models` 把内置目录顶掉。
+        if paths.model_catalog_json.exists() {
+            let raw = std::fs::read_to_string(&paths.model_catalog_json).unwrap_or_default();
+            let v: serde_json::Value =
+                serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+            let has_nonempty_models = v
+                .get("models")
+                .and_then(|m| m.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            assert!(
+                !has_nonempty_models,
+                "绝不写非空 models 覆盖 Codex 内置目录"
+            );
+        }
+        // 上游 base_url 仍正常写(local_proxy)。
+        assert!(toml.contains("openai_base_url = \"http://127.0.0.1:18080\""));
     }
 
     #[test]
