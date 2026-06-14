@@ -94,7 +94,10 @@ pub fn parse_glm_quota(json: &serde_json::Value) -> ProviderQuota {
             reset_rfc3339: reset,
         });
     }
-    ProviderQuota { windows }
+    ProviderQuota {
+        windows,
+        ..Default::default()
+    }
 }
 
 /// 调 monitor 端口取 GLM coding 双窗口额度。`base_host` = provider.baseUrl 的 host

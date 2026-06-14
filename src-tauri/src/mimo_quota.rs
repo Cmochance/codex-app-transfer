@@ -103,6 +103,7 @@ pub async fn fetch_mimo_quota_summary(
             remaining_percent: remaining,
             reset_rfc3339: reset,
         }],
+        ..Default::default()
     })
 }
 

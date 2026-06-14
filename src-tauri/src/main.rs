@@ -8,6 +8,7 @@ mod codex_plugin_unlocker;
 mod codex_quota_injector;
 mod codex_real_account;
 mod codex_theme_injector;
+mod deepseek_quota;
 mod glm_quota;
 mod mcp_webfetch_server;
 mod mimo_quota;
