@@ -436,14 +436,16 @@ pub async fn update_provider(
         //
         // **例外:upstream 身份变了**(baseUrl / apiFormat / apiKey 与原值不同)→ 旧池属于旧端点/
         // 旧账号,留着会让 catalog / resolver 继续广播旧 slug、把请求路由到新上游的不存在模型
-        // (错路由,plan 头号风险)→ **清空** pooledModels(remove → 缺省 → 回退新映射,等用户在
-        // 整合页「重新获取」对新上游重建池)。注意:表单这里只**作废**池、绝不**填充**池(非 resurrection)。
-        // (#477 P2 round-5)
+        // (错路由,plan 头号风险)→ 置 pooledModels 为**显式空 `[]`**(等用户在整合页「重新获取」
+        // 对新上游重建)。**不能** remove:缺省会让 `unique_pool_slugs` 回退到该 provider 的(同样
+        // 陈旧的)`models` 槽位映射,旧 slug 立刻又被广播进池(#477 P2 round-7);显式 `[]` 经
+        // round-3 registry 语义 = 该 provider 不贡献任何 slug、也不回退。表单只**作废**池、绝不
+        // **填充**(非 resurrection)。(#477 P2 round-5/7)
         let identity_changed = existing.get("baseUrl") != updated.get("baseUrl")
             || existing.get("apiFormat") != updated.get("apiFormat")
             || existing.get("apiKey") != updated.get("apiKey");
         if identity_changed {
-            updated.remove("pooledModels");
+            updated.insert("pooledModels".into(), Value::Array(Vec::new()));
         }
         updated.insert("id".into(), Value::String(id.clone()));
         updated.insert("isBuiltin".into(), Value::Bool(is_builtin));
