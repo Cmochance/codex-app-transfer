@@ -673,6 +673,21 @@
   max-width: 280px;
 }
 
+.pool-fallback-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.pool-fallback-hint > i {
+  margin-top: 2px;
+  color: var(--primary);
+}
+
 /* 整合模式锁定提示(dashboard + 编辑页) */
 .integration-lock-notice {
   display: flex;

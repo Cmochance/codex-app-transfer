@@ -143,7 +143,10 @@
       // [MOC-173] auto-review 审查模型槽位 key(gpt_5_X);显式挑字段,不加这行前端拿不到后端返的值。
       reviewModelSlot: provider.reviewModelSlot || '',
       // 池化:按 provider 持久化的可选模型列表(显式挑字段,否则被这层 mapper 静默丢)。
-      pooledModels: Array.isArray(provider.pooledModels) ? provider.pooledModels : [],
+      // **保留「缺省」与「显式空」之分**:数组(含 [])原样透出;字段缺省 → null(= 从未
+      // curation,后端回退槽位映射)。collapse 成 [] 会让「未整理」provider 在 UI 显示为空、
+      // 与后端实际仍用映射的 catalog 不一致(#477 bot review P2)。
+      pooledModels: Array.isArray(provider.pooledModels) ? provider.pooledModels : null,
       // 整合页子集开关:该 provider 是否参与模型池。默认 false —— 子集语义,
       // 只有用户在整合页显式「添加」的 provider 才进池(与后端 provider_pooled_enabled 默认一致)。
       pooledEnabled: provider.pooledEnabled === true,

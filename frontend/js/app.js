@@ -2486,11 +2486,35 @@
     grid.innerHTML = providers.map((p) => poolProviderCardMarkup(p)).join("");
   }
 
+  // 整合下池「实际生效的模型列表」。pooledModels 是数组(含空 [])即权威;缺省(null,
+  // 从未 curation)时**镜像后端 `pooled_models_with_one_m` 的回退** —— default 优先 + 各槽位
+  // 非空去重。保证 UI 显示与后端 catalog 一致(#477 bot review P2:别把「回退中」当空)。
+  function effectivePoolModels(provider) {
+    if (Array.isArray(provider?.pooledModels)) return provider.pooledModels;
+    const m = provider?.mappings || {};
+    const order = [m.default, m.gpt_5_5, m.gpt_5_4, m.gpt_5_4_mini, m.gpt_5_3_codex, m.gpt_5_2];
+    const seen = new Set();
+    const out = [];
+    for (const v of order) {
+      const s = String(v || "").trim();
+      if (s && !seen.has(s)) {
+        seen.add(s);
+        out.push(s);
+      }
+    }
+    return out;
+  }
+
+  // pooledModels 缺省 = 还没 curation,下池显示的是回退映射(非用户整理的固定列表)。
+  function poolModelsAreFallback(provider) {
+    return !Array.isArray(provider?.pooledModels);
+  }
+
   function poolProviderCardMarkup(provider) {
     const id = escapeHtml(provider.id);
     const name = escapeHtml(provider.name);
     const added = provider.pooledEnabled === true;
-    const count = Array.isArray(provider.pooledModels) ? provider.pooledModels.length : 0;
+    const count = effectivePoolModels(provider).length;
     const actionBtn = added
       ? `<button class="btn btn-outline-danger btn-sm" type="button" data-action="pool-remove-provider" data-id="${id}"><i class="bi bi-dash-lg"></i><span>${escapeHtml(t("providers.integrationRemoveProvider"))}</span></button>`
       : `<button class="btn btn-primary btn-sm" type="button" data-action="pool-add-provider" data-id="${id}"><i class="bi bi-plus-lg"></i><span>${escapeHtml(t("providers.integrationAddProvider"))}</span></button>`;
@@ -2522,10 +2546,14 @@
   function poolModelGroupMarkup(provider) {
     const id = escapeHtml(provider.id);
     const name = escapeHtml(provider.name);
-    const models = Array.isArray(provider.pooledModels) ? provider.pooledModels : [];
+    const models = effectivePoolModels(provider);
     const chips = models.length
       ? models.map((m) => poolModelChipMarkup(provider.id, m)).join("")
       : `<p class="pool-empty">${escapeHtml(t("providers.integrationNoModels"))}</p>`;
+    // 回退态(未 curation):提示这些是默认映射、获取/增删后才固化(与后端回退保持一致)。
+    const fallbackHint = poolModelsAreFallback(provider) && models.length
+      ? `<p class="pool-fallback-hint"><i class="bi bi-info-circle"></i>${escapeHtml(t("providers.integrationFallbackHint"))}</p>`
+      : "";
     return `
       <section class="pool-model-group" data-provider-id="${id}">
         <div class="pool-model-group-header">
@@ -2535,6 +2563,7 @@
             <i class="bi bi-cloud-arrow-down"></i><span>${escapeHtml(t("providers.integrationFetchModels"))}</span>
           </button>
         </div>
+        ${fallbackHint}
         <div class="pool-model-chips">${chips}</div>
         <div class="pool-model-add">
           <input type="text" class="form-control form-control-sm" data-pool-add-input="${id}" placeholder="${escapeHtml(t("providers.integrationAddModelPlaceholder"))}">
@@ -2553,17 +2582,6 @@
         <button class="pool-model-remove" type="button" data-action="pool-remove-model" data-id="${pid}" data-model="${m}" title="${escapeHtml(t("providers.integrationRemoveModel"))}" aria-label="${escapeHtml(t("providers.integrationRemoveModel"))}"><i class="bi bi-x"></i></button>
       </span>
     `;
-  }
-
-  // 加入整合后自动获取该 provider 的模型(依次);失败不回滚「加入」状态 ——
-  // provider 已入池,模型可稍后「重新获取」或手动添加(守 no-silent-destructive)。
-  async function autofillPoolProviderModels(providerId) {
-    try {
-      await CCApi.autofillProviderModels(providerId);
-    } catch (e) {
-      console.warn(`[integration] 自动获取模型失败 ${providerId}:`, e);
-      showToast(formatModelFetchError(e));
-    }
   }
 
   // 整合开关同步:settings 页 checkbox + 整合页右上角 toggle 共用 exposeAllProviderModels,
@@ -3998,10 +4016,20 @@
         const pid = actionEl.dataset.id;
         actionEl.disabled = true;
         try {
-          await CCApi.setProviderPool(pid, { enabled: true });
+          // 加入整合后自动获取该 provider 的模型(用户要求)。**用非破坏性的 available 拉取**
+          // (GET /models/available)而非 autofill —— autofill 会顺带覆盖 provider.models 槽位
+          // 映射(用户在编辑页手调的、池外仍用的),整合页不该有此副作用(#477 bot review P2)。
+          // 拿到后连同 enabled 一次写入(setProviderPool 后端 chat 过滤 + 只动 pooledModels)。
+          let models = null;
+          try {
+            const result = await CCApi.fetchProviderModels(pid);
+            models = (result.models || []).map(modelEntryId).filter(Boolean);
+          } catch (fetchErr) {
+            console.warn(`[integration] 自动获取模型失败 ${pid}:`, fetchErr);
+            showToast(formatModelFetchError(fetchErr));
+          }
+          await CCApi.setProviderPool(pid, models ? { enabled: true, models } : { enabled: true });
           showToast(t("toast.integrationProviderAdded"));
-          // 加入整合后自动获取该 provider 的模型(用户要求)。
-          await autofillPoolProviderModels(pid);
           await renderProviders();
         } catch (error) {
           actionEl.disabled = false;
@@ -4029,7 +4057,21 @@
         const orig = span ? span.textContent : "";
         if (span) span.textContent = t("providers.integrationFetchingModels");
         try {
-          await CCApi.autofillProviderModels(pid);
+          // 非破坏性拉取 + 合并(「重新获取只负责更新列表」):available 拉取不动 provider.models,
+          // 与现有 pooledModels 去重合并后经 setProviderPool 权威写回(后端 chat 过滤)。
+          const result = await CCApi.fetchProviderModels(pid);
+          const fetched = (result.models || []).map(modelEntryId).filter(Boolean);
+          const providers = await CCApi.getProviders();
+          const provider = providers.find((p) => p.id === pid);
+          const merged = effectivePoolModels(provider).slice();
+          const seen = new Set(merged);
+          for (const m of fetched) {
+            if (!seen.has(m)) {
+              seen.add(m);
+              merged.push(m);
+            }
+          }
+          await CCApi.setProviderPool(pid, { models: merged });
           showToast(t("toast.integrationModelsUpdated"));
           await renderProviders();
         } catch (error) {
@@ -4048,7 +4090,9 @@
         try {
           const providers = await CCApi.getProviders();
           const provider = providers.find((p) => p.id === pid);
-          const models = Array.isArray(provider?.pooledModels) ? provider.pooledModels.slice() : [];
+          // 以「实际生效列表」为基底:若该 provider 还没 curation(回退映射中),增删要把回退
+          // 映射先固化进 pooledModels,否则只存这一条编辑会丢掉回退里的其它模型(#477 P2)。
+          const models = effectivePoolModels(provider).slice();
           if (!models.includes(value)) models.push(value);
           await CCApi.setProviderPool(pid, { models });
           showToast(t("toast.integrationModelsUpdated"));
@@ -4066,7 +4110,8 @@
         try {
           const providers = await CCApi.getProviders();
           const provider = providers.find((p) => p.id === pid);
-          const models = (Array.isArray(provider?.pooledModels) ? provider.pooledModels : []).filter((m) => m !== model);
+          // 同 add:基底取实际生效列表(回退态先固化),再剔除目标 model。
+          const models = effectivePoolModels(provider).filter((m) => m !== model);
           await CCApi.setProviderPool(pid, { models });
           showToast(t("toast.integrationModelsUpdated"));
           await renderProviders();
