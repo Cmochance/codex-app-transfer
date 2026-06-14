@@ -210,7 +210,13 @@ fn extract_model_ids(payload: &Value) -> Vec<String> {
     ids
 }
 
-/// 非 chat 模型关键词(embedding / rerank / 语音 / 图像 等)—— 这些不能服务 chat 请求。
+/// 非 chat 模型关键词(embedding / rerank / 审核 / 语音转写 / 语音合成 / 图像生成)——
+/// 这些**真正**不能服务 chat 请求。
+///
+/// **不含** `vision` / `audio`:多模态 chat 模型常带这些词(`moonshot-v1-8k-vision-preview`、
+/// `gpt-4o-audio-preview` 等仍是 chat 模型,只是支持图/音输入),按子串剔除会把合法 chat 模型
+/// 静默踢出池、在 Codex picker 里消失(#477 bot review P2 round-9)。`image` 保留:`gpt-image-1`
+/// 等是图像**生成**端点、非 chat,且无以 `image` 命名的常见 chat 变体。
 const NON_CHAT_MODEL_KEYWORDS: &[&str] = &[
     "embedding",
     "rerank",
@@ -218,8 +224,6 @@ const NON_CHAT_MODEL_KEYWORDS: &[&str] = &[
     "whisper",
     "tts",
     "image",
-    "vision",
-    "audio",
 ];
 
 /// 只保留可用于 chat 的模型 id(过滤 embedding/rerank/语音/图像);**全被过滤则返回空**
@@ -668,6 +672,48 @@ pub async fn autofill_provider_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_usable_keeps_vision_audio_drops_true_non_chat() {
+        // #477 P2 round-9:vision / audio 多模态 chat 模型必须保留;只剔真正非 chat 的。
+        let ids: Vec<String> = [
+            "moonshot-v1-8k-vision-preview",
+            "gpt-4o-audio-preview",
+            "deepseek-chat",
+            "text-embedding-3-large",
+            "bge-reranker-v2",
+            "whisper-1",
+            "tts-1",
+            "gpt-image-1",
+            "omni-moderation-latest",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let kept = chat_usable_model_ids(&ids);
+        assert!(
+            kept.contains(&"moonshot-v1-8k-vision-preview".to_string()),
+            "vision 是 chat"
+        );
+        assert!(
+            kept.contains(&"gpt-4o-audio-preview".to_string()),
+            "audio 是 chat"
+        );
+        assert!(kept.contains(&"deepseek-chat".to_string()));
+        for dropped in [
+            "text-embedding-3-large",
+            "bge-reranker-v2",
+            "whisper-1",
+            "tts-1",
+            "gpt-image-1",
+            "omni-moderation-latest",
+        ] {
+            assert!(
+                !kept.iter().any(|m| m == dropped),
+                "{dropped} 应被过滤(真非 chat)"
+            );
+        }
+    }
 
     #[test]
     fn provider_is_bailian_token_plan_matches_only_token_plan_host() {
