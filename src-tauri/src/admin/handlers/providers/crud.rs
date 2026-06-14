@@ -448,8 +448,13 @@ pub async fn update_provider(
         //   表单 incoming 源自易失下拉缓存,fetch 失败/部分态只剩 1-5 个映射值,替换会把已持久化
         //   的完整池删剩映射;合并既保留手加/已抓取又纳入本次映射新模型(bot review P2)。
         // - 同一 upstream + 不带该字段 → 完全不动。
+        // 身份 = baseUrl / apiFormat / apiKey。apiKey 变更也算(bot review P2):换 key 常意味换
+        // 账号,旧账号可见的模型未必新 key 可用,stale slug 会拿新 key 路由 → invalid-model/权限
+        // 错。比对 existing vs updated 的 apiKey:用户没重填 key → 前端不下发 → updated 沿用旧值
+        // → 相等不触发,正常编辑不误清;真改了 key 才清。
         let identity_changed = existing.get("baseUrl") != updated.get("baseUrl")
-            || existing.get("apiFormat") != updated.get("apiFormat");
+            || existing.get("apiFormat") != updated.get("apiFormat")
+            || existing.get("apiKey") != updated.get("apiKey");
         if identity_changed {
             updated.remove("pooledModels");
         } else if let Some(pooled) = input.pooled_models.clone() {
