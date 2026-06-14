@@ -37,12 +37,19 @@
 //! 后续若要为 Usage / 上下文面板做 by-source 明细,走**独立的只读观测镜像**,
 //! 绝不把重建历史回注请求(见 MOC-234 Step 3)。
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
+use futures_core::Stream;
 use http::{HeaderMap, StatusCode};
+use serde_json::Value;
 
 use crate::mapper::{RequestMapper, ResponseMapper};
-use crate::registry::rewrite_local_path_for_upstream;
+use crate::registry::{is_responses_compact_subpath, rewrite_local_path_for_upstream};
+use crate::responses::context_breakdown::breakdown_enabled;
+use crate::responses::{global_passthrough_observe_store, spawn_compute_and_persist_responses};
 use crate::types::{AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -55,6 +62,11 @@ impl RequestMapper for ResponsesPassthroughMapper {
         body: Bytes,
         _provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
+        // [MOC-234] 只读观测整合(gate=breakdown_enabled,默认关零开销):旁路 parse 一份
+        // 副本算 responses 原生 context_breakdown + 喂会话观测镜像,**绝不改 body**。返回的
+        // adapter_metadata 仅携带本轮 input items + prev_id 供 response 侧 tee 记录链头。
+        let adapter_metadata = build_observe_metadata(client_path, &body);
+
         // 路径 normalize:剥 `/openai` legacy prefix + `/claude/v1/messages` alias +
         // 前导 `/v1`(provider.base_url 已带 `/v1`)+ 保 query。**不能**只剥 `/v1`,
         // 否则 `/openai/v1/responses` 透传成 `…/v1/openai/v1/responses` → 上游 404。
@@ -66,7 +78,7 @@ impl RequestMapper for ResponsesPassthroughMapper {
             upstream_headers: HeaderMap::new(),
             // 上游自管 session,不写本项目 chat 形 cache(见模块 doc)。
             response_session: None,
-            adapter_metadata: None,
+            adapter_metadata,
             // 恒 false:compact 原样直透原生上游,绝不走本地 compact.rs 包装(MOC-234)。
             is_compact: false,
             compact_v2: false,
@@ -83,18 +95,206 @@ impl ResponseMapper for ResponsesPassthroughMapper {
         upstream_headers: HeaderMap,
         upstream_stream: ByteStream,
         _provider: &Provider,
-        _request_plan: &RequestPlan,
+        request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
-        // 1:1 直透:status / headers / 流原样回灌。**不强制** content-type ——
-        // 与 chat 等转换 mapper 不同,透传上游可能返回非 SSE 的合法响应(`stream:false`
-        // 的 JSON、`/responses/compact` v1 非流式、`/responses/{id}/cancel` 等),
-        // 强制 `text/event-stream` 会破坏这些响应。上游已按 Responses 协议给正确
-        // content-type,忠实保留。
+        // [MOC-234] 只读观测 tee:仅成功流 + request 侧带了观测上下文(= breakdown_enabled
+        // 且非 compact)时,套一层**纯透传** tee 解析 SSE 的 `response.completed` 拿 response_id
+        // + output items,写会话观测镜像供下一轮拼全历史。tee 不 await / 不重排 / 不改字节 ——
+        // chunk 原样返回,绝不破流;失败/非 SSE 自然不记录(降级,不影响转发)。
+        let stream = match observe_ctx_from_plan(request_plan) {
+            Some((prev_id, input_items)) if upstream_status.is_success() => {
+                Box::pin(ObserveTeeStream::new(upstream_stream, prev_id, input_items)) as ByteStream
+            }
+            _ => upstream_stream,
+        };
+        // 1:1 直透:status / headers 原样回灌。**不强制** content-type —— 与 chat 等转换
+        // mapper 不同,透传上游可能返回非 SSE 的合法响应(`stream:false` 的 JSON、
+        // `/responses/compact` v1 非流式、`/responses/{id}/cancel` 等),强制
+        // `text/event-stream` 会破坏这些响应。上游已按 Responses 协议给正确 content-type,忠实保留。
         Ok(ResponsePlan {
             status: upstream_status,
             headers: upstream_headers,
-            stream: upstream_stream,
+            stream,
         })
+    }
+}
+
+/// [MOC-234] request 侧只读观测:gate=`breakdown_enabled` 且非 compact 子路径时,旁路 parse
+/// 一份 body 副本,按 `previous_response_id` 链拼全历史 → 起后台 responses 原生 breakdown 并
+/// 按 `prompt_cache_key` 落盘。返回的 metadata 仅携带本轮 input items + prev_id,供 response 侧
+/// tee 在拿到上游分配的 `response_id` 后把本轮(input+output)记进观测镜像。**绝不改转发 body。**
+fn build_observe_metadata(client_path: &str, body: &Bytes) -> Option<Value> {
+    // 默认(面板关)零开销:不 parse、不 spawn。compact 是生命周期端点、非对话轮,跳过观测。
+    if !breakdown_enabled() || is_responses_compact_subpath(client_path) {
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(body).ok()?;
+
+    let input_items: Vec<Value> = parsed
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let prev_id = parsed
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    // 全历史 = 沿 prev_id 链回溯的镜像 + 本轮 input。
+    let mut assembled = match prev_id.as_deref() {
+        Some(prev) => global_passthrough_observe_store().assemble_history(prev),
+        None => Vec::new(),
+    };
+    assembled.extend(input_items.iter().cloned());
+
+    // 起后台 breakdown(o200k tokenize + 原子落盘,搬离热路径)。conv_id = prompt_cache_key。
+    if let Some(conv_id) = parsed
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        let instructions = parsed
+            .get("instructions")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let tools = parsed
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        spawn_compute_and_persist_responses(instructions, assembled, tools, conv_id.to_owned());
+    }
+
+    Some(serde_json::json!({
+        "passthrough_observe": {
+            "prev_id": prev_id,
+            "input_items": input_items,
+        }
+    }))
+}
+
+/// 从 `RequestPlan.adapter_metadata` 取出 response 侧记录所需的 (prev_id, 本轮 input items)。
+/// 无观测上下文(面板关 / compact / parse 失败)→ None,response 侧不套 tee。
+fn observe_ctx_from_plan(plan: &RequestPlan) -> Option<(Option<String>, Vec<Value>)> {
+    let obs = plan.adapter_metadata.as_ref()?.get("passthrough_observe")?;
+    let prev_id = obs
+        .get("prev_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let input_items = obs
+        .get("input_items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Some((prev_id, input_items))
+}
+
+/// 单条 SSE `data:` 行(`response.completed` event)在被解析前允许在行缓冲里累积的上限。
+/// `response.completed` 携带完整 output,长会话可能数 MB;超此上限放弃解析该流(观测降级、
+/// 不影响转发),防病态超长行 OOM。
+const MAX_OBSERVE_PENDING_LINE: usize = 8 * 1024 * 1024;
+
+/// [MOC-234] 只读观测 tee:**纯透传** + 旁路增量解析 SSE 找 `response.completed`,拿 response_id
+/// + output items 后把本轮(input+output)记进会话观测镜像。chunk 原样返回(不 await / 不重排 /
+/// 不改字节),解析失败 / 非 SSE / 超长行 → 静默不记录(降级,绝不影响转发)。仅记录一次。
+struct ObserveTeeStream {
+    inner: ByteStream,
+    line_buf: Vec<u8>,
+    prev_id: Option<String>,
+    input_items: Vec<Value>,
+    recorded: bool,
+    gave_up: bool,
+}
+
+impl ObserveTeeStream {
+    fn new(inner: ByteStream, prev_id: Option<String>, input_items: Vec<Value>) -> Self {
+        Self {
+            inner,
+            line_buf: Vec::new(),
+            prev_id,
+            input_items,
+            recorded: false,
+            gave_up: false,
+        }
+    }
+
+    /// 把一个 chunk 喂进行缓冲,抽出完整行逐行处理(找 `response.completed`)。
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.recorded || self.gave_up {
+            return;
+        }
+        self.line_buf.extend_from_slice(chunk);
+        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            self.process_line(&line[..line.len().saturating_sub(1)]);
+            if self.recorded {
+                return;
+            }
+        }
+        // 无换行的超长 pending 行(病态)→ 放弃,防无界增长。
+        if self.line_buf.len() > MAX_OBSERVE_PENDING_LINE {
+            self.gave_up = true;
+            self.line_buf = Vec::new();
+        }
+    }
+
+    /// 处理一行(已去 `\n`):仅认 `data: {...response.completed...}`,拿 id + output 记录本轮。
+    fn process_line(&mut self, line: &[u8]) {
+        let line = if line.last() == Some(&b'\r') {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        let Ok(s) = std::str::from_utf8(line) else {
+            return; // 跨 chunk 切断多字节字符的残行,下一行再来(罕见,降级)
+        };
+        let Some(data) = s.trim_start().strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("response.completed") {
+            return;
+        }
+        let resp = v.get("response");
+        let id = resp
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if id.is_empty() {
+            return;
+        }
+        let output = resp
+            .and_then(|r| r.get("output"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // 本轮 items = 本轮 input(请求侧带来)+ 上游 output。记进镜像,链头 = 本轮 response_id。
+        let mut items = std::mem::take(&mut self.input_items);
+        items.extend(output);
+        global_passthrough_observe_store().record_turn(id, self.prev_id.take(), items);
+        self.recorded = true;
+    }
+}
+
+impl Stream for ObserveTeeStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.feed(&chunk);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
     }
 }
 
@@ -241,5 +441,93 @@ mod tests {
             Some("application/json"),
             "透传必须 1:1 保留上游 content-type,不强制 event-stream"
         );
+    }
+
+    #[tokio::test]
+    async fn observe_tee_records_turn_and_passes_bytes_through() {
+        use crate::responses::global_passthrough_observe_store;
+        use futures_util::StreamExt;
+        use serde_json::json;
+
+        // 唯一 response_id 避免与并发测试在全局 store 串(store 按 id 隔离)。
+        let rid = "obs_test_tee_r1";
+        let input_item =
+            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]});
+        // SSE:故意把 response.completed 事件**跨 chunk 切断**,验证行缓冲重组。
+        let completed = format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "id": rid,
+                    "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]
+                }
+            })
+        );
+        let (a, b) = completed.split_at(completed.len() / 2);
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+            )),
+            Ok(Bytes::from(a.to_owned())),
+            Ok(Bytes::from(b.to_owned())),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let expected: Vec<u8> = chunks
+            .iter()
+            .flat_map(|c| c.as_ref().unwrap().to_vec())
+            .collect();
+
+        let inner: ByteStream = Box::pin(futures_util::stream::iter(chunks));
+        let mut tee = ObserveTeeStream::new(inner, Some("prev_x".into()), vec![input_item]);
+
+        // 透传字节必须与上游完全一致(tee 不改流)。
+        let mut got: Vec<u8> = Vec::new();
+        while let Some(chunk) = tee.next().await {
+            got.extend(chunk.unwrap());
+        }
+        assert_eq!(got, expected, "tee 必须 1:1 透传上游字节");
+
+        // 观测镜像应记下本轮(input 1 + output 1 = 2 items),链头 = response_id。
+        let hist = global_passthrough_observe_store().assemble_history(rid);
+        assert_eq!(hist.len(), 2, "本轮 input+output 应记进观测镜像");
+    }
+
+    #[test]
+    fn observe_ctx_from_plan_reads_metadata() {
+        use serde_json::json;
+        let mut plan = ResponsesPassthroughMapper
+            .map_request(
+                "/v1/responses",
+                Bytes::from_static(b"{}"),
+                &dummy_provider(),
+            )
+            .unwrap();
+        plan.adapter_metadata = Some(json!({
+            "passthrough_observe": {
+                "prev_id": "resp_prev",
+                "input_items": [{"type":"message","role":"user","content":"x"}]
+            }
+        }));
+        let (prev, items) = observe_ctx_from_plan(&plan).expect("应解析出观测上下文");
+        assert_eq!(prev.as_deref(), Some("resp_prev"));
+        assert_eq!(items.len(), 1);
+
+        // 无 metadata → None(面板关 / compact / parse 失败时 response 侧不套 tee)。
+        let bare = ResponsesPassthroughMapper
+            .map_request(
+                "/v1/responses",
+                Bytes::from_static(b"{}"),
+                &dummy_provider(),
+            )
+            .unwrap();
+        assert!(observe_ctx_from_plan(&bare).is_none());
+    }
+
+    #[test]
+    fn build_observe_metadata_none_when_breakdown_disabled() {
+        // 默认面板关 → 不 parse、不 spawn、metadata=None(热路径零开销)。
+        // (不切换全局 gate,避免污染并发测试。)
+        assert!(build_observe_metadata("/v1/responses", &Bytes::from_static(b"{}")).is_none());
     }
 }
