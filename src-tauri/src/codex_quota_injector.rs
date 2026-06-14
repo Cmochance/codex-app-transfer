@@ -745,16 +745,17 @@ fn quota_rows(
 fn local_usage_rows(session_id: Option<&str>) -> Vec<serde_json::Value> {
     // 上下文:bar 的 % / 绝对值由注入脚本直接从 Codex React fiber 读 usedTokens + contextWindow
     // (已有对话即有值、不需发新对话;满窗口 = contextWindow ÷ 0.95 把 5% reserve 加回来)。
-    // [MOC-231] 附带 by-source 明细:按**活动会话 uuid** 读 proxy 持久化的明细(磁盘,
-    // proxy 转发时按 prompt_cache_key==conv uuid 写盘;adapters context_breakdown 用 o200k
-    // 逐 item 精确分类)。对话隔离 + 持久(transfer 重启即用、不需新对话)+ 读取快(小 JSON),
+    // [MOC-231/232] 附带 by-source 明细:按**活动会话 uuid** 读磁盘持久化的明细。
+    // producer 是 adapters::responses::request — 在转换末尾起 spawn_blocking 后台算 o200k
+    // 逐 item tokenize + 按 conv uuid 落盘(MOC-232 已搬离转发关键路径,不再经 proxy 写盘)。
+    // 对话隔离 + 持久(transfer 重启即用、不需新对话)+ 读取快(小 JSON),
     // 与累计/缓存同口径(session_id == rollout/fiber uuid)。有则塞进 ctx 行,注入脚本在文字行
     // 最右加 caret 展开 Claude 风格下拉;该对话还没发过(无文件)/ passthrough → None,不显 caret。
-    let ctx = match session_id.and_then(codex_app_transfer_proxy::telemetry::load_context_breakdown)
-    {
-        Some(breakdown) => json!({"kind": "ctx", "label": "上下文", "breakdown": breakdown}),
-        None => json!({"kind": "ctx", "label": "上下文"}),
-    };
+    let ctx =
+        match session_id.and_then(codex_app_transfer_adapters::responses::load_context_breakdown) {
+            Some(breakdown) => json!({"kind": "ctx", "label": "上下文", "breakdown": breakdown}),
+            None => json!({"kind": "ctx", "label": "上下文"}),
+        };
     // 累计 token + 缓存命中率:按**活动会话 uuid** 取该对话自己的 rollout(MOC-230 对话隔离,
     // 非 newest-mtime)。session_id = daemon 上一 tick 从 Codex fiber 回读的 conversationId
     // (== rollout 文件名 uuid);None / 该 uuid 无 rollout 文件(全新对话还没写盘 / 读不到 id)

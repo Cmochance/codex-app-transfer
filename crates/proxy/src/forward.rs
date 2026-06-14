@@ -455,19 +455,9 @@ pub async fn forward_handler(
     let upstream_url = build_upstream_url(&resolved.upstream_base, &plan.upstream_path);
     check_ssrf_safe(&upstream_url).await?;
     let telemetry = proxy_telemetry();
-    // [MOC-231] 本次请求带上下文 by-source 明细时(adapter 转换路径会算),按**对话 uuid**
-    // (Codex 请求的 `prompt_cache_key` == rollout/fiber 的 conversationId)持久化到磁盘,供
-    // quota injector daemon 按活动会话读盘渲染 —— transfer 重启即用、按对话隔离不串、读取快。
-    // 无明细的请求(passthrough / MCP / webfetch 等内部调用)不写,不影响已有对话的明细文件。
-    if let Some(breakdown) = plan
-        .adapter_metadata
-        .as_ref()
-        .and_then(|m| m.get("context_breakdown"))
-    {
-        if let Some(conv_id) = body_prompt_cache_key(&original_body_bytes_for_retry) {
-            crate::telemetry::persist_context_breakdown(&conv_id, breakdown);
-        }
-    }
+    // [MOC-232] 上下文 by-source 明细不再在转发关键路径上算/写 —— 改由 adapters 的
+    // responses::request 在转换末尾起 spawn_blocking 后台算 + 按对话 uuid 落盘
+    // (见 context_breakdown.rs),proxy 此处不再触碰。
     telemetry
         .logs
         .add("INFO", format!("request: {} {client_path}", parts.method));
@@ -2102,16 +2092,6 @@ fn cors_preflight_response() -> Result<Response, axum::http::Error> {
 fn body_model(body: &[u8]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     v.get("model")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
-}
-
-/// [MOC-231] 入站 Responses body 的 `prompt_cache_key` —— Codex 据此填**对话 uuid**
-/// (实证 == rollout 文件名 uuid == renderer fiber conversationId),用作上下文明细的
-/// 按对话持久化 key。缺失 / 非字符串 → None(不持久化)。
-fn body_prompt_cache_key(body: &[u8]) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    v.get("prompt_cache_key")
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
 }

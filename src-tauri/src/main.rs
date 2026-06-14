@@ -133,7 +133,7 @@ fn main() {
             // [MOC-231] GC 旧的上下文明细缓存(context-breakdown/<uuid>.json,每对话一个;
             // >14 天的陈旧对话删除,下次有请求会重建)。fire-and-forget,不阻塞 startup。
             tauri::async_runtime::spawn(async {
-                codex_app_transfer_proxy::telemetry::gc_context_breakdown(
+                codex_app_transfer_adapters::responses::gc_context_breakdown(
                     std::time::Duration::from_secs(14 * 24 * 60 * 60),
                 );
             });
