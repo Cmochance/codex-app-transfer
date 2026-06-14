@@ -118,11 +118,19 @@ async fn responses_websocket_handler(
 }
 
 async fn responses_websocket_loop(mut socket: WebSocket, state: ProxyState, headers: HeaderMap) {
+    // [MOC-234] 首个 `response.create` 帧到达时解析 provider 决定传输,本连接固定:
+    // - **native responses provider**(api_format = responses / openai_responses,含
+    //   chatgpt.com)→ 全程 WS relay(Codex-WS ↔ 上游-WS,见
+    //   [`crate::ws_passthrough::proxy_responses_upstream_ws`])。保 `previous_response_id`、保
+    //   原生流式(不 re-framing),与 direct 直连一致;不再 ws→http 把 WS 降级成 HTTP。
+    // - **chat 类 provider**(无 WS / 无 responses API,如 mimo/glm)→ 维持 ws→http 转换
+    //   ([`forward_chat_frame`]):responses-WS 帧转 chat-HTTP POST 经 forward_handler。
+    let mut chat_decided = false;
     while let Some(message) = socket.next().await {
         let Ok(message) = message else {
             break;
         };
-        let text = match message {
+        let text = match &message {
             Message::Text(text) => text.to_string(),
             Message::Binary(bytes) => match String::from_utf8(bytes.to_vec()) {
                 Ok(text) => text,
@@ -141,57 +149,93 @@ async fn responses_websocket_loop(mut socket: WebSocket, state: ProxyState, head
         if message_json.get("type").and_then(|v| v.as_str()) != Some("response.create") {
             continue;
         }
-        let mut body = extract_response_create_body(&message_json);
-        // Codex CLI ws warmup(`prewarm_websocket`,`generate: false`)与"新
-        // session 首帧 input 为空 + 无 previous_response_id"这两类 frame
-        // 上游(任何 chat-completions 兼容 provider)必然 400 — 因为转换后
-        // messages 是空数组。**不要**转 HTTP 浪费一次 RTT,直接给 ws 客户端
-        // 送 stream error 让 Codex 立即按 ws stream error 处理(进 stream retry
-        // 并在 retry 耗尽后 fallback 到 HTTP `stream_responses_api`,后者发
-        // 完整 history 必然成功)。
-        //
-        // 注意保留:`input: [] + previous_response_id != ""` 仍走转发路径,
-        // 这是 ws incremental delta=0 续轮 — 走 ResponseSessionCache 查历史
-        // (PR #65 sqlite 持久化覆盖)。
-        if should_skip_upstream_warmup(&body) {
-            // **关键**:OpenAI Responses ws 协议里 `{"type":"error",...}` 是
-            // "流内错误事件"(stream-level)语义 —— Codex CLI ws 客户端收到
-            // 后**不会**立即放弃 ws session,可能等 ws idle timeout(实测 ~5
-            // 分钟,见反馈 fb-8f5b51fb / fb-0c121681)才 fallback HTTP。
-            //
-            // 应当**直接关闭 ws 连接**(发 Close frame),让 Codex CLI 立即
-            // 看到"ws 通道不可用"→ 进入 try_switch_fallback_transport →
-            // HTTP 路径,total wait 从 ~5 分钟降到秒级。
-            //
-            // 之前 v2.0.11 PR #67 用 send_ws_error 是错的协议语义,本次
-            // 修正为 close。
-            let _ = socket
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: axum::extract::ws::close_code::UNSUPPORTED,
-                    reason: "warmup / empty-input frame not supported; fall back to HTTP".into(),
-                })))
-                .await;
-            break;
-        }
-        if body.get("stream").is_none() {
-            body["stream"] = serde_json::Value::Bool(true);
-        }
-        let body_bytes = match serde_json::to_vec(&body) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                send_ws_error(&mut socket, &format!("Invalid response body: {error}")).await;
-                continue;
+
+        // 首个 response.create:解析 provider。native responses → 交给全程 WS relay(原始首帧
+        // 一并交出,relay 内原样发上游),relay 接管 socket,本 loop 退出。解析失败 / 非 responses
+        // → 固定走 chat 的 ws→http 转换。warmup/空帧的判定留在 chat 路径(WS relay 透传一切)。
+        if !chat_decided {
+            let body = extract_response_create_body(&message_json);
+            if let Some(resolved) = resolve_provider_for_ws(&state, &headers, &body) {
+                if is_native_responses_provider(&resolved) {
+                    crate::ws_passthrough::proxy_responses_upstream_ws(
+                        socket, resolved, headers, message,
+                    )
+                    .await;
+                    return;
+                }
             }
-        };
-        let req = websocket_forward_request(&headers, body_bytes);
-        let response = match forward_handler(State(state.clone()), req).await {
-            Ok(response) => response,
-            Err(error) => error.into_response(),
-        };
-        if !stream_forward_response_to_websocket(response, &mut socket).await {
+            chat_decided = true;
+        }
+
+        if !forward_chat_frame(&mut socket, &state, &headers, message_json).await {
             break;
         }
     }
+}
+
+/// chat 类 provider 的单帧 ws→http 转换(原 loop body)。warmup / 空帧直接 Close 让 Codex
+/// 立即 fallback HTTP;否则 body 转 HTTP POST `/responses` 经 [`forward_handler`],SSE 响应
+/// 再逐行回灌 WS。返回 `false` = 应收束连接。
+async fn forward_chat_frame(
+    socket: &mut WebSocket,
+    state: &ProxyState,
+    headers: &HeaderMap,
+    message_json: serde_json::Value,
+) -> bool {
+    let mut body = extract_response_create_body(&message_json);
+    // Codex CLI ws warmup(`generate: false`)与"新 session 首帧 input 为空 + 无
+    // previous_response_id"这两类 frame 转到任何 chat-completions 兼容 provider 必然 400
+    // (转换后 messages 空)。直接 Close 让 Codex 立即 try_switch_fallback_transport → HTTP
+    // (`input: [] + previous_response_id != ""` 是 ws incremental delta=0 续轮,不命中、走转发)。
+    if should_skip_upstream_warmup(&body) {
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::UNSUPPORTED,
+                reason: "warmup / empty-input frame not supported; fall back to HTTP".into(),
+            })))
+            .await;
+        return false;
+    }
+    if body.get("stream").is_none() {
+        body["stream"] = serde_json::Value::Bool(true);
+    }
+    let body_bytes = match serde_json::to_vec(&body) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            send_ws_error(socket, &format!("Invalid response body: {error}")).await;
+            return true;
+        }
+    };
+    let req = websocket_forward_request(headers, body_bytes);
+    let response = match forward_handler(State(state.clone()), req).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    stream_forward_response_to_websocket(response, socket).await
+}
+
+/// 在 WS 握手上下文里解析 provider:用 Codex 的握手 header + 首帧(response.create)body 合成
+/// 一个 `POST /responses` 请求喂给 resolver(复用 HTTP 路径同一套 slot/model 路由)。失败 → None。
+fn resolve_provider_for_ws(
+    state: &ProxyState,
+    headers: &HeaderMap,
+    body: &serde_json::Value,
+) -> Option<crate::resolver::ResolvedProvider> {
+    let mut builder = Request::builder().method(Method::POST).uri("/responses");
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    let (parts, _) = builder.body(()).ok()?.into_parts();
+    let body_bytes = serde_json::to_vec(body).unwrap_or_default();
+    state.resolver.resolve(&parts, &body_bytes).ok()
+}
+
+/// provider 是否原生 Responses 协议(走全程 WS relay)。chat 类(openai_chat 等)走 ws→http 转换。
+fn is_native_responses_provider(resolved: &crate::resolver::ResolvedProvider) -> bool {
+    matches!(
+        resolved.provider.api_format.as_str(),
+        "responses" | "openai_responses"
+    )
 }
 
 fn extract_response_create_body(message: &serde_json::Value) -> serde_json::Value {

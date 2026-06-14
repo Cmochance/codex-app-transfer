@@ -32,6 +32,7 @@ use axum::http::HeaderMap;
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::{CloseCode, Message as UpMessage, Upgrade, WebSocket as UpWebSocket};
 
+use crate::resolver::{AuthScheme, ResolvedProvider};
 use crate::telemetry::proxy_telemetry;
 
 /// 远程控制 WS 端点路径。**单一来源** —— [`crate::server`] 的 axum 显式路由直接用此常量
@@ -113,6 +114,144 @@ pub async fn proxy_remote_control(
     telemetry
         .logs
         .add("INFO", "[remote-control-ws] pump 结束,通道关闭".to_string());
+}
+
+/// [MOC-234] native responses provider 的**全程 WS 透传**:Codex-WS ↔ proxy ↔ 上游-WS。
+///
+/// 背景:Codex `/responses` 默认走 Responses WebSocket v2(`provider.supports_websockets`,
+/// 内置 openai provider 恒 true、即便 `openai_base_url` 被指到本 proxy 也保持)。此前本 proxy
+/// 把 Codex 的 WS 帧**转成 HTTP** 发上游(ws→http),导致:① 只在 WS v2 支持 `previous_response_id`
+/// 的上游(如 freemodel.dev)对每个续轮 400;② 上游 SSE 经 re-framing 回灌引起整段文字闪烁。
+/// 本函数对 native responses provider **不再转 HTTP**,而是把 Codex 帧原样 relay 到上游的
+/// Responses WS v2(保 `previous_response_id`、保原生流式),与 direct 直连时一致。
+///
+/// `resolved` 给出上游 base / 鉴权;`handshake_headers` 是 Codex 的 WS 握手头(透传
+/// `OpenAI-Beta: responses_websockets` / `x-codex-*`,剥 gateway authorization);`first_frame`
+/// 是已从 Codex 读到的首个 `response.create` 帧(解析过 model 用于路由,这里**原样**发上游)。
+/// 上游握手失败 → 给 Codex 发 Close(error)让其按 WS 不可用处理,**不**回退到已失败的 ws→http。
+pub async fn proxy_responses_upstream_ws(
+    client_socket: WebSocket,
+    resolved: ResolvedProvider,
+    handshake_headers: HeaderMap,
+    first_frame: AxMessage,
+) {
+    let telemetry = proxy_telemetry();
+    let Some(upstream_url) = responses_ws_url(&resolved.upstream_base) else {
+        telemetry.logs.add(
+            "WARN",
+            format!(
+                "[responses-ws] 无法从 upstream_base 构造 WS URL: {}",
+                resolved.upstream_base
+            ),
+        );
+        close_client(client_socket, "bad upstream base url").await;
+        return;
+    };
+    telemetry.logs.add(
+        "INFO",
+        format!(
+            "[responses-ws] upgrade → {upstream_url}(provider {})",
+            resolved.provider_id
+        ),
+    );
+
+    let mut req = ws_upstream_client().get(&upstream_url);
+    // 透传 Codex 握手头(OpenAI-Beta: responses_websockets / x-codex-* 等);跳过 gateway
+    // authorization(下面单独处理)+ WS 协议握手头(reqwest-websocket 重新生成上游段)。
+    for (k, v) in handshake_headers.iter() {
+        if should_forward_responses_ws_header(k.as_str()) {
+            req = req.header(k.as_str(), v.as_bytes());
+        }
+    }
+    // 鉴权:第三方 provider(api_key 非空)注入 provider 凭据;chatgpt.com relay(api_key 空、
+    // 用 Codex 账号 token)透传 Codex 自带的 authorization。
+    if resolved.api_key.is_empty() {
+        if let Some(auth) = handshake_headers.get(axum::http::header::AUTHORIZATION) {
+            req = req.header("authorization", auth.as_bytes());
+        }
+    } else {
+        req = apply_responses_upstream_auth(req, &resolved);
+    }
+    // provider.extra_headers(已做 {apiKey} 模板替换)叠加。
+    for (k, v) in resolved.extra_headers.iter() {
+        req = req.header(k.as_str(), v.as_bytes());
+    }
+
+    let mut upstream: UpWebSocket = match req.upgrade().send().await {
+        Ok(resp) => match resp.into_websocket().await {
+            Ok(ws) => ws,
+            Err(e) => {
+                telemetry.logs.add(
+                    "WARN",
+                    format!("[responses-ws] 上游 upgrade 失败(非 101): {e}"),
+                );
+                close_client(client_socket, "upstream ws upgrade failed").await;
+                return;
+            }
+        },
+        Err(e) => {
+            telemetry
+                .logs
+                .add("WARN", format!("[responses-ws] 上游连接失败: {e}"));
+            close_client(client_socket, "upstream ws connect failed").await;
+            return;
+        }
+    };
+    telemetry.logs.add(
+        "INFO",
+        "[responses-ws] 上游 WS 建立(101),首帧发送 + 双向 relay 开始".to_string(),
+    );
+
+    // 已从 Codex 读到的首帧(response.create)原样发上游,再进双向 pump(后续帧 1:1 relay)。
+    if upstream.send(ax_to_up(first_frame)).await.is_err() {
+        telemetry
+            .logs
+            .add("WARN", "[responses-ws] 首帧写上游失败,收束".to_string());
+        close_client(client_socket, "upstream write failed").await;
+        return;
+    }
+    pump(client_socket, upstream).await;
+    telemetry
+        .logs
+        .add("INFO", "[responses-ws] relay 结束,通道关闭".to_string());
+}
+
+/// 由 provider 的 `upstream_base`(http/https)构造上游 Responses WS URL:scheme 换
+/// `ws`/`wss`,path 追加 `/responses`(与 HTTP 转发的 `build_upstream_url(base, "/responses")`
+/// 同口径)。非 http(s)/ws(s) → None。
+fn responses_ws_url(upstream_base: &str) -> Option<String> {
+    let base = upstream_base.trim_end_matches('/');
+    let swapped = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if base.starts_with("wss://") || base.starts_with("ws://") {
+        base.to_string()
+    } else {
+        return None;
+    };
+    Some(format!("{swapped}/responses"))
+}
+
+/// responses 上游 WS 握手鉴权注入(仅 api_key 非空时调):`x_api_key` scheme → `x-api-key`,
+/// 其余(Bearer 及第三方默认)→ `Authorization: Bearer <key>`。OAuth/Google 类 scheme 不会
+/// 进 responses 分支(那是 gemini/antigravity,api_format 非 responses)。
+fn apply_responses_upstream_auth(
+    req: reqwest13::RequestBuilder,
+    resolved: &ResolvedProvider,
+) -> reqwest13::RequestBuilder {
+    match resolved.auth_scheme {
+        AuthScheme::XApiKey => req.header("x-api-key", resolved.api_key.as_str()),
+        _ => req.header("authorization", format!("Bearer {}", resolved.api_key)),
+    }
+}
+
+/// responses WS relay 透传哪些 Codex 握手头给上游。同 [`should_forward_ws_header`],但**额外
+/// 跳过 `authorization`** —— responses relay 的鉴权由 [`proxy_responses_upstream_ws`] 决定
+/// (第三方注入 provider 凭据 / chatgpt.com 透传 Codex token),不在通用透传里处理。
+fn should_forward_responses_ws_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower != "authorization" && should_forward_ws_header(name)
 }
 
 /// 哪些 Codex 原始 header 透传给上游 WS。透传 `authorization` + `x-codex-*`(远程控制
@@ -323,5 +462,42 @@ mod tests {
             UpMessage::Binary(b) => assert_eq!(b, payload),
             _ => panic!("expected Binary"),
         }
+    }
+
+    #[test]
+    fn responses_ws_url_swaps_scheme_and_appends_responses_path() {
+        // https→wss / http→ws,尾随 `/` 归一,path 追加 /responses(同 HTTP build_upstream_url)。
+        assert_eq!(
+            responses_ws_url("https://api.freemodel.dev").as_deref(),
+            Some("wss://api.freemodel.dev/responses")
+        );
+        assert_eq!(
+            responses_ws_url("http://127.0.0.1:18080").as_deref(),
+            Some("ws://127.0.0.1:18080/responses")
+        );
+        assert_eq!(
+            responses_ws_url("https://host/v1/").as_deref(),
+            Some("wss://host/v1/responses")
+        );
+        // 已是 ws/wss 原样保留
+        assert_eq!(
+            responses_ws_url("wss://host").as_deref(),
+            Some("wss://host/responses")
+        );
+        // 非 http(s)/ws(s) → None
+        assert_eq!(responses_ws_url("ftp://nope"), None);
+    }
+
+    #[test]
+    fn responses_ws_header_filter_skips_authorization_keeps_beta() {
+        // 鉴权由 proxy_responses_upstream_ws 单独处理(注入 provider / 透传 Codex),不走通用透传
+        assert!(!should_forward_responses_ws_header("authorization"));
+        assert!(!should_forward_responses_ws_header("Authorization"));
+        // OpenAI-Beta / x-codex-* 必须透传(上游 Responses WS v2 握手需要)
+        assert!(should_forward_responses_ws_header("openai-beta"));
+        assert!(should_forward_responses_ws_header("x-codex-installation-id"));
+        // WS 握手头 / host 仍跳过(reqwest-websocket 重新生成)
+        assert!(!should_forward_responses_ws_header("sec-websocket-key"));
+        assert!(!should_forward_responses_ws_header("host"));
     }
 }
