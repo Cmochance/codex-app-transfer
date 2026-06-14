@@ -1141,6 +1141,12 @@ fn build_bounded_tool_output_summary(
                 "To read the FULL untruncated output on demand, call the read_tool_artifact tool with artifact_id \"{}\" (only when the head/tail excerpt below is not enough).\n",
                 artifact.artifact_id
             ));
+        } else {
+            // 非持久化(DB 不可用/写失败 → 仅落 proxy 内存): 显式标本 id 不可回取, 抵消 MCP server 级
+            // 「见 Artifact ID 就调 read_tool_artifact」的通用指引, 防模型拿死 id 空调(MOC-235 review #5)。
+            out.push_str(
+                "(This artifact is stored in-process only and is NOT retrievable via read_tool_artifact — do not call read_tool_artifact for this ID.)\n",
+            );
         }
     } else {
         out.push_str("Artifact ID: unavailable; raw payload could not be stored.\n");

@@ -50,7 +50,7 @@ const SERVER_INSTRUCTIONS: &str = "联网工具使用规则:\n\
 2. **凡是本次对话里你已经用 web_fetch 抓过的 URL —— 当你要再次引用 / 摘录 / 附上它的原文 / 回看更多细节时, 必须先用 read_url_local(url) 从本地缓存取回, 不要重复 web_fetch 同一个 URL**。read_url_local 不联网、瞬时返回, 且能拿回已被对话历史折叠/压缩、你当前看不到的完整原文。\n\
 3. 抓「新」URL 才用 web_fetch; 回看「旧」(本会话已抓过的)URL 一律 read_url_local。\n\
 4. web_fetch 默认返回完整正文供当前轮直接阅读。\n\
-5. **任何工具(shell / 飞书 MCP / 其它)的输出在对话历史里被折叠成 `[Tool output stored outside model context]` 摘要时, 摘要里给了 `Artifact ID`。需要那条输出的完整原文时, 调 read_tool_artifact(artifact_id) 取回不截断全文 —— 不要为了拿回历史输出去重跑工具**。read_tool_artifact 瞬时返回, 取回内容仅供当前轮阅读, 之后会再被自动折叠(不长期占上下文)。";
+5. **任何工具(shell / 飞书 MCP / 其它)的输出在对话历史里被折叠成 `[Tool output stored outside model context]` 摘要时, 摘要里给了 `Artifact ID`。需要那条输出的完整原文时, 调 read_tool_artifact(artifact_id) 取回不截断全文 —— 不要为了拿回历史输出去重跑工具**。read_tool_artifact 瞬时返回, 取回内容仅供当前轮阅读, 之后会再被自动折叠(不长期占上下文)。**例外**: 若摘要把该 artifact 标注为「stored in-process only / NOT retrievable」, 则该 id 取不出来, 别对它调 read_tool_artifact。";
 /// client 未给 protocolVersion 时的兜底(回显 client 的值更优, 见 spec)。
 const FALLBACK_PROTOCOL: &str = "2025-11-25";
 /// 返回正文截断上限(字符)。防把 MB 级页面灌给模型(类 Claude WebFetch 的 100KB 截断)。
