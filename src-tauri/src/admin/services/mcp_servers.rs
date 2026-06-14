@@ -255,7 +255,9 @@ fn is_shell_interpreter(basename: &str) -> bool {
 /// 由 Codex CLI 直接 spawn `command + args`,"配置即可执行任意命令"本质成立 —— `node -e`
 /// / `python -c` 这类无法靠黑名单拦(拦了会误伤正常 MCP server,绝大多数 server 就是
 /// node/python/npx/uvx)。本检查只拦最直白的 `bash -c` 形态 + `env bash` 包装,降低被
-/// 诱导粘贴恶意 spec 的概率;真正的边界是"写配置需用户在 UI 显式确认"(见 Linear followup)。
+/// 诱导粘贴恶意 spec 的概率;真正的边界是"写配置需用户在 UI 显式确认" —— 前端新增 /
+/// 编辑 / 一键添加 server 保存前一律弹二次确认(stdio 展示将以用户权限执行的命令、http 展示
+/// 连接地址),无免确认白名单(MOC-106,`frontend/js/app.js` `codexMcpBuildSaveConfirm`)。
 fn command_is_shell(command: &str, args: &[String]) -> bool {
     let base = command_basename(command);
     if is_shell_interpreter(&base) {

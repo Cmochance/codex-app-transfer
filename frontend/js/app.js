@@ -4480,6 +4480,8 @@
     if (!currentAgentsHash) return;
     const ta = $("#codexAgentsEdit");
     const content = ta?.value ?? "";
+    // 写盘前二次确认,防误改影响 AI 行为的文档(MOC-106)。
+    if (!window.confirm(tFmt("codex.docApplyConfirm", { doc: "AGENTS.md" }))) return;
     try {
       const r = await fetch(`/api/codex/agents-md/raw?hash=${encodeURIComponent(currentAgentsHash)}`, {
         method: "POST",
@@ -4955,6 +4957,8 @@
     if (!currentMemoriesHash) return;
     const ta = $("#codexMemoriesEdit");
     const content = ta?.value ?? "";
+    // 写盘前二次确认,防误改影响 AI 行为的文档(MOC-106)。
+    if (!window.confirm(tFmt("codex.docApplyConfirm", { doc: "MEMORY.md" }))) return;
     try {
       const r = await fetch(`/api/codex/memories-md/raw?hash=${encodeURIComponent(currentMemoriesHash)}`, {
         method: "POST",
@@ -5163,6 +5167,8 @@
     if (!currentSkillsHash) return;
     const ta = $("#codexSkillsEdit");
     const content = ta?.value ?? "";
+    // 写盘前二次确认,防误改影响 AI 行为的文档(MOC-106)。
+    if (!window.confirm(tFmt("codex.docApplyConfirm", { doc: "SKILL.md" }))) return;
     try {
       const r = await fetch(`/api/codex/skills-md/raw?hash=${encodeURIComponent(currentSkillsHash)}`, {
         method: "POST",
@@ -5547,6 +5553,42 @@
     if (el) el.hidden = true;
   }
 
+  // 写 MCP server 进 ~/.codex/config.toml 前的二次确认文案(MOC-106)。
+  // 所有新增 / 编辑一律确认,没有免确认白名单 —— stdio 强调"会以你的权限在本机执行"
+  // (config 即可 spawn 任意命令,黑名单只是 guardrail),http 列出连接地址防误填。
+  // stdio 一并展示 cwd / env —— 它们同样 execution-affecting(env 可塞 NODE_OPTIONS /
+  // LD_PRELOAD / PATH 劫持注入代码、cwd 改工作目录),否则恶意 payload 藏 env 里会绕过确认。
+  function codexMcpBuildSaveConfirm(spec) {
+    const name = spec.name || "";
+    if (spec.transport === "stdio") {
+      const cmdline = [spec.command || "", ...(Array.isArray(spec.args) ? spec.args : [])]
+        .join(" ")
+        .trim();
+      const extras = [];
+      if (spec.cwd) extras.push(`cwd: ${spec.cwd}`);
+      if (spec.env && typeof spec.env === "object") {
+        const envLines = Object.keys(spec.env).map((k) => `  ${k}=${spec.env[k]}`);
+        if (envLines.length) extras.push("env:\n" + envLines.join("\n"));
+      }
+      const extra = extras.length ? "\n\n" + extras.join("\n") : "";
+      return tFmt("codex.mcp.saveConfirmStdio", { name, cmdline, extra });
+    }
+    // http 也展示发往远端的凭据 / header —— 恶意 spec 可把 Authorization / $GITHUB_TOKEN
+    // 等通过 bearerTokenEnvVar / httpHeaders / envHttpHeaders 发到错误或恶意 URL。
+    const httpExtras = [];
+    if (spec.bearerTokenEnvVar) httpExtras.push(`bearer token env var: ${spec.bearerTokenEnvVar}`);
+    if (spec.httpHeaders && typeof spec.httpHeaders === "object") {
+      const lines = Object.keys(spec.httpHeaders).map((k) => `  ${k}: ${spec.httpHeaders[k]}`);
+      if (lines.length) httpExtras.push("http headers:\n" + lines.join("\n"));
+    }
+    if (spec.envHttpHeaders && typeof spec.envHttpHeaders === "object") {
+      const lines = Object.keys(spec.envHttpHeaders).map((k) => `  ${k} ← $${spec.envHttpHeaders[k]}`);
+      if (lines.length) httpExtras.push("env http headers:\n" + lines.join("\n"));
+    }
+    const httpExtra = httpExtras.length ? "\n\n" + httpExtras.join("\n") : "";
+    return tFmt("codex.mcp.saveConfirmHttp", { name, url: spec.url || "", extra: httpExtra });
+  }
+
   async function codexMcpJsonSave() {
     const ta = $("#codexMcpJsonTextarea");
     if (!ta) return;
@@ -5600,6 +5642,7 @@
       enabledTools: Array.isArray(parsed.enabledTools ?? parsed.enabled_tools) ? (parsed.enabledTools ?? parsed.enabled_tools) : null,
       disabledTools: Array.isArray(parsed.disabledTools ?? parsed.disabled_tools) ? (parsed.disabledTools ?? parsed.disabled_tools) : null,
     };
+    if (!window.confirm(codexMcpBuildSaveConfirm(spec))) return;
     try {
       const r = await fetch("/api/codex/mcp/servers", {
         method: "POST",
@@ -5732,6 +5775,8 @@
   async function codexMcpRawApply() {
     const ta = $("#codexMcpRawTextarea");
     if (!ta) return;
+    // raw 模式整体覆盖 ~/.codex/config.toml(含 [mcp_servers.*] command),同样需二次确认(MOC-106)。
+    if (!window.confirm(t("codex.mcp.rawApplyConfirm"))) return;
     try {
       const r = await fetch("/api/codex/mcp/config/raw", {
         method: "POST",
@@ -6010,6 +6055,7 @@
       spec.url = item.url || "";
       spec.bearerTokenEnvVar = item.bearerTokenEnvVar || null;
     }
+    if (!window.confirm(codexMcpBuildSaveConfirm(spec))) return;
     try {
       const r = await fetch("/api/codex/mcp/servers", {
         method: "POST",
