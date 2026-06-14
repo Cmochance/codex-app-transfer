@@ -475,25 +475,237 @@
   border-top: 1px solid var(--line);
 }
 
-.model-menu-mode-panel {
-  display: flex;
+/* ── 整合提供商页(模型池):页头开关 + off 提示 + 上下两卡池 ───────────── */
+.integration-title-row .integration-toggle {
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  margin-bottom: 12px;
-  padding: 14px 18px;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
-.model-menu-mode-panel h2 {
+.integration-toggle-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.integration-off-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px;
+}
+
+.integration-off-hint > i {
+  font-size: 20px;
+  color: var(--primary);
+  margin-top: 2px;
+}
+
+.integration-off-hint h2 {
   margin: 0 0 4px;
   font-size: 16px;
 }
 
-.model-menu-mode-panel p {
+.integration-off-hint p {
   margin: 0;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.integration-pools {
+  display: grid;
+  gap: 16px;
+}
+
+.pool-panel-header {
+  margin-bottom: 14px;
+}
+
+.pool-panel-header h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+
+.pool-panel-header p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.pool-empty {
+  margin: 0;
+  padding: 18px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* 上池:provider 候选卡片(加入 / 移出整合子集) */
+.pool-provider-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.pool-provider-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md, 12px);
+  background: var(--surface);
+}
+
+.pool-provider-card.added {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.pool-provider-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.pool-provider-main strong {
+  font-size: 14px;
+}
+
+.pool-provider-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.pool-provider-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+/* 下池:按 provider 分组的可选模型 chip(增删) */
+.pool-model-groups {
+  display: grid;
+  gap: 16px;
+}
+
+.pool-model-group {
+  display: grid;
+  gap: 10px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.pool-model-group:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.pool-model-group-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pool-model-group-header strong {
+  font-size: 14px;
+  flex: 1;
+  min-width: 0;
+}
+
+.pool-model-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pool-model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--soft-surface);
+  font-size: 13px;
+  max-width: 100%;
+}
+
+.pool-model-name {
+  max-width: 240px;
+}
+
+.pool-model-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.pool-model-remove:hover {
+  background: var(--danger-soft, rgba(220, 53, 69, 0.12));
+  color: var(--danger, #dc3545);
+}
+
+.pool-model-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.pool-model-add input {
+  max-width: 280px;
+}
+
+/* 整合模式锁定提示(dashboard + 编辑页) */
+.integration-lock-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-md, 12px);
+  background: var(--primary-soft);
+}
+
+.integration-lock-notice > i {
+  font-size: 18px;
+  color: var(--primary);
+  margin-top: 2px;
+}
+
+.integration-lock-notice strong {
+  display: block;
+  font-size: 14px;
+  margin-bottom: 2px;
+}
+
+.integration-lock-notice p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.compact-enable.locked {
+  cursor: not-allowed;
 }
 
 .api-format-display {

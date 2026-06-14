@@ -1204,11 +1204,14 @@
     const baseUrlMarkup = docsUrl
       ? `<a class="truncate baseurl-docs-link" href="#" data-action="open-docs" data-docs-url="${escapeHtml(docsUrl)}" data-provider-name="${providerName}" title="${t("providers.openDocsHint")}">${providerUrl}<i class="bi bi-box-arrow-up-right baseurl-docs-icon"></i></a>`
       : `<span class="truncate">${providerUrl}</span>`;
-    // 池化模式下「设为默认」语义从「全部路由到这里」变成「新对话 / 不带前缀请求的默认 provider」,
-    // active badge / 启用按钮文案随之切换(关闭时维持原文案)。
+    // 整合(池化)模式下:统一由模型池管理,单 provider 的「启用 / 应用」锁定避免冲突
+    // (用户指示)—— set-default 按钮换成 disabled 锁定态;active badge 仍标「默认」。
     const activeBadgeText = poolMode ? t("providers.poolDefaultBadge") : t("status.active");
-    const enableBtnText = poolMode ? t("providers.setPoolDefault") : t("providers.enable");
-    const enableBtnTitle = poolMode ? t("providers.setPoolDefaultHint") : "";
+    const enableBtn = poolMode
+      ? `<button class="btn btn-outline-secondary compact-enable locked" type="button" disabled title="${escapeHtml(t("providers.integrationApplyLockedHint"))}"><i class="bi bi-lock"></i><span>${escapeHtml(t("providers.integrationApplyLockedTitle"))}</span></button>`
+      : `<button class="btn btn-primary compact-enable" type="button" data-action="set-default" data-id="${providerId}">
+            <i class="bi bi-play-fill"></i><span>${escapeHtml(t("providers.enable"))}</span>
+          </button>`;
     return `
       <article class="provider-switch-card ${provider.default ? "active" : ""}" draggable="true" data-provider-id="${providerId}">
         <span class="drag-handle"><i class="bi bi-grip-vertical"></i></span>
@@ -1220,9 +1223,7 @@
         <span class="provider-meta truncate">${mappingText}</span>
         <span class="provider-actions">
           ${provider.default ? `<span class="active-indicator" role="status" aria-label="${escapeHtml(activeBadgeText)}"><i class="bi bi-broadcast" aria-hidden="true"></i><span>${escapeHtml(activeBadgeText)}</span></span>` : ""}
-          <button class="btn btn-primary compact-enable" type="button" data-action="set-default" data-id="${providerId}"${enableBtnTitle ? ` title="${escapeHtml(enableBtnTitle)}"` : ""}>
-            <i class="bi bi-play-fill"></i><span>${enableBtnText}</span>
-          </button>
+          ${enableBtn}
           <button class="icon-action" type="button" data-action="test-provider" data-id="${providerId}" title="${t("providers.testSpeed")}" aria-label="${t("providers.testSpeed")}"><i class="bi bi-lightning-charge"></i></button>
           <button class="icon-action" type="button" data-action="query-usage" data-id="${providerId}" title="${t("providers.usage")}" aria-label="${t("providers.usage")}"><i class="bi bi-wallet2"></i></button>
           <button class="icon-action" type="button" data-action="edit-provider" data-id="${providerId}" title="${t("common.edit")}" aria-label="${t("common.edit")}"><i class="bi bi-pencil-square"></i></button>
@@ -1704,6 +1705,9 @@
     }
     const health = status.desktopHealth || {};
     const desktopReady = status.desktopConfigured && !health.needsApply;
+    // 整合模式开 → dashboard 顶部显示锁定提示(provider 卡片的「启用」按钮也会锁定)。
+    const lockBanner = $("#dashboardIntegrationLock");
+    if (lockBanner) lockBanner.hidden = !status.exposeAllProviderModels;
     try {
       await renderProviderCards("#dashboardProviderCards", { includePresets: true });
     } catch (err) {
@@ -2417,6 +2421,7 @@
 
   async function renderProviderForm() {
     await renderPresets();
+    await applyIntegrationLockToForm();
     if (editingProviderId) {
       await fillProviderForEdit(editingProviderId);
       return;
@@ -2429,32 +2434,146 @@
     resetProviderForm();
   }
 
-  async function renderProviders() {
-    await renderModelMenuModePanel();
-    await renderProviderCards("#providerRows");
+  // 整合模式开 → 编辑页「启用 / 应用」按钮锁定 + 顶部提示(用户指示,避免与模型池冲突);
+  // 「仅保存」不锁(改 provider 配置 / 映射仍允许,只是不再单独 apply 到 Codex)。
+  async function applyIntegrationLockToForm() {
+    let enabled = false;
+    try {
+      enabled = !!(await CCApi.getStatus()).exposeAllProviderModels;
+    } catch (e) {
+      console.warn("[renderProviderForm] 读取整合开关失败,按关闭处理:", e);
+    }
+    const notice = $("#providerFormIntegrationLock");
+    if (notice) notice.hidden = !enabled;
+    const applyBtn = $("#providerApplyBtn");
+    if (applyBtn) {
+      applyBtn.disabled = enabled;
+      applyBtn.classList.toggle("locked", enabled);
+      applyBtn.title = enabled ? t("providers.integrationApplyLockedHint") : "";
+    }
   }
 
+  // ── 整合提供商页(模型池)──────────────────────────────────────────────────
+  // #providers 路由。整合开关(= exposeAllProviderModels)关 → 只显示 off 提示;
+  // 开 → 两个卡池:上池选「整合的提供商」(子集),下池按 provider 分组做「可选模型」增删。
+  async function renderProviders() {
+    const offHint = $("#integrationOffHint");
+    const pools = $("#integrationPools");
+    const toggle = $("#integrationToggle");
+    let enabled = false;
+    try {
+      enabled = !!(await CCApi.getSettings()).exposeAllProviderModels;
+    } catch (e) {
+      console.warn("[renderProviders] 读取整合开关失败,按关闭处理:", e);
+    }
+    if (toggle) toggle.checked = enabled;
+    if (offHint) offHint.hidden = enabled;
+    if (pools) pools.hidden = !enabled;
+    if (!enabled) return;
+    const providers = await CCApi.getProviders();
+    renderPoolProviderGrid(providers);
+    renderPoolModelGroups(providers);
+  }
+
+  // 上池:把已配置的 provider 当候选,加入(pooledEnabled)/移出整合子集。
+  function renderPoolProviderGrid(providers) {
+    const grid = $("#poolProviderGrid");
+    if (!grid) return;
+    if (!providers.length) {
+      grid.innerHTML = `<p class="pool-empty">${escapeHtml(t("providers.integrationNoProviders"))}</p>`;
+      return;
+    }
+    grid.innerHTML = providers.map((p) => poolProviderCardMarkup(p)).join("");
+  }
+
+  function poolProviderCardMarkup(provider) {
+    const id = escapeHtml(provider.id);
+    const name = escapeHtml(provider.name);
+    const added = provider.pooledEnabled === true;
+    const count = Array.isArray(provider.pooledModels) ? provider.pooledModels.length : 0;
+    const actionBtn = added
+      ? `<button class="btn btn-outline-danger btn-sm" type="button" data-action="pool-remove-provider" data-id="${id}"><i class="bi bi-dash-lg"></i><span>${escapeHtml(t("providers.integrationRemoveProvider"))}</span></button>`
+      : `<button class="btn btn-primary btn-sm" type="button" data-action="pool-add-provider" data-id="${id}"><i class="bi bi-plus-lg"></i><span>${escapeHtml(t("providers.integrationAddProvider"))}</span></button>`;
+    return `
+      <article class="pool-provider-card ${added ? "added" : ""}" data-provider-id="${id}">
+        <span class="provider-logo">${iconMarkup(provider)}</span>
+        <span class="pool-provider-main">
+          <strong>${name}</strong>
+          <span class="pool-provider-sub truncate">${escapeHtml(provider.baseUrl)}</span>
+        </span>
+        ${added ? `<span class="pool-provider-count" title="${escapeHtml(t("providers.integrationModelsPoolTitle"))}"><i class="bi bi-list-ul"></i>${count}</span>` : ""}
+        ${actionBtn}
+      </article>
+    `;
+  }
+
+  // 下池:按 integrated provider 分组,逐 model 展示 chip(可删)+ 手动加 + 重新获取。
+  function renderPoolModelGroups(providers) {
+    const wrap = $("#poolModelGroups");
+    if (!wrap) return;
+    const integrated = providers.filter((p) => p.pooledEnabled === true);
+    if (!integrated.length) {
+      wrap.innerHTML = `<p class="pool-empty">${escapeHtml(t("providers.integrationNoIntegrated"))}</p>`;
+      return;
+    }
+    wrap.innerHTML = integrated.map((p) => poolModelGroupMarkup(p)).join("");
+  }
+
+  function poolModelGroupMarkup(provider) {
+    const id = escapeHtml(provider.id);
+    const name = escapeHtml(provider.name);
+    const models = Array.isArray(provider.pooledModels) ? provider.pooledModels : [];
+    const chips = models.length
+      ? models.map((m) => poolModelChipMarkup(provider.id, m)).join("")
+      : `<p class="pool-empty">${escapeHtml(t("providers.integrationNoModels"))}</p>`;
+    return `
+      <section class="pool-model-group" data-provider-id="${id}">
+        <div class="pool-model-group-header">
+          <span class="provider-logo">${iconMarkup(provider)}</span>
+          <strong>${name}</strong>
+          <button class="btn btn-outline-primary btn-sm" type="button" data-action="pool-fetch-models" data-id="${id}">
+            <i class="bi bi-cloud-arrow-down"></i><span>${escapeHtml(t("providers.integrationFetchModels"))}</span>
+          </button>
+        </div>
+        <div class="pool-model-chips">${chips}</div>
+        <div class="pool-model-add">
+          <input type="text" class="form-control form-control-sm" data-pool-add-input="${id}" placeholder="${escapeHtml(t("providers.integrationAddModelPlaceholder"))}">
+          <button class="btn btn-outline-primary btn-sm" type="button" data-action="pool-add-model" data-id="${id}"><i class="bi bi-plus-lg"></i><span>${escapeHtml(t("providers.integrationAddModel"))}</span></button>
+        </div>
+      </section>
+    `;
+  }
+
+  function poolModelChipMarkup(providerId, model) {
+    const m = escapeHtml(model);
+    const pid = escapeHtml(providerId);
+    return `
+      <span class="pool-model-chip">
+        <span class="pool-model-name truncate">${m}</span>
+        <button class="pool-model-remove" type="button" data-action="pool-remove-model" data-id="${pid}" data-model="${m}" title="${escapeHtml(t("providers.integrationRemoveModel"))}" aria-label="${escapeHtml(t("providers.integrationRemoveModel"))}"><i class="bi bi-x"></i></button>
+      </span>
+    `;
+  }
+
+  // 加入整合后自动获取该 provider 的模型(依次);失败不回滚「加入」状态 ——
+  // provider 已入池,模型可稍后「重新获取」或手动添加(守 no-silent-destructive)。
+  async function autofillPoolProviderModels(providerId) {
+    try {
+      await CCApi.autofillProviderModels(providerId);
+    } catch (e) {
+      console.warn(`[integration] 自动获取模型失败 ${providerId}:`, e);
+      showToast(formatModelFetchError(e));
+    }
+  }
+
+  // 整合开关同步:settings 页 checkbox + 整合页右上角 toggle 共用 exposeAllProviderModels,
+  // 任一处渲染 settings 时两个都对齐(旧 providers 页的「显示全部模型」按钮已移除,留兜底 guard)。
   function renderModelMenuModeState(settings = {}) {
     const enabled = !!settings.exposeAllProviderModels;
-    const button = $("#modelMenuModeToggle");
-    const hint = $("#modelMenuModeHint");
-    if (button) {
-      button.classList.toggle("btn-primary", enabled);
-      button.classList.toggle("btn-outline-primary", !enabled);
-      const span = $("span", button);
-      if (span) span.textContent = enabled ? t("providers.showSingleModel") : t("providers.showAllModels");
-      button.setAttribute("aria-pressed", enabled ? "true" : "false");
-    }
-    if (hint) {
-      hint.textContent = enabled ? t("providers.modelMenuAllHint") : t("providers.modelMenuSingleHint");
-    }
     const settingToggle = $("#exposeAllProviderModels");
     if (settingToggle) settingToggle.checked = enabled;
-  }
-
-  async function renderModelMenuModePanel() {
-    const settings = await CCApi.getSettings();
-    renderModelMenuModeState(settings);
+    const integrationToggle = $("#integrationToggle");
+    if (integrationToggle) integrationToggle.checked = enabled;
   }
 
   async function renderModelSelectors() {
@@ -3874,12 +3993,87 @@
         openFeedbackModal();
       }
 
-      if (action === "toggle-model-menu-mode") {
-        const settings = await CCApi.getSettings();
-        const next = !settings.exposeAllProviderModels;
-        const saved = await CCApi.saveSettings({ exposeAllProviderModels: next });
-        renderModelMenuModeState(saved);
-        showToast(next ? t("toast.allModelsEnabled") : t("toast.singleModelEnabled"));
+      // ── 整合页模型池操作 ────────────────────────────────────────────────
+      if (action === "pool-add-provider") {
+        const pid = actionEl.dataset.id;
+        actionEl.disabled = true;
+        try {
+          await CCApi.setProviderPool(pid, { enabled: true });
+          showToast(t("toast.integrationProviderAdded"));
+          // 加入整合后自动获取该 provider 的模型(用户要求)。
+          await autofillPoolProviderModels(pid);
+          await renderProviders();
+        } catch (error) {
+          actionEl.disabled = false;
+          showToast(error.message || t("toast.requestFailed"));
+        }
+      }
+
+      if (action === "pool-remove-provider") {
+        const pid = actionEl.dataset.id;
+        actionEl.disabled = true;
+        try {
+          await CCApi.setProviderPool(pid, { enabled: false });
+          showToast(t("toast.integrationProviderRemoved"));
+          await renderProviders();
+        } catch (error) {
+          actionEl.disabled = false;
+          showToast(error.message || t("toast.requestFailed"));
+        }
+      }
+
+      if (action === "pool-fetch-models") {
+        const pid = actionEl.dataset.id;
+        actionEl.disabled = true;
+        const span = $("span", actionEl);
+        const orig = span ? span.textContent : "";
+        if (span) span.textContent = t("providers.integrationFetchingModels");
+        try {
+          await CCApi.autofillProviderModels(pid);
+          showToast(t("toast.integrationModelsUpdated"));
+          await renderProviders();
+        } catch (error) {
+          if (span) span.textContent = orig;
+          actionEl.disabled = false;
+          showToast(formatModelFetchError(error));
+        }
+      }
+
+      if (action === "pool-add-model") {
+        const pid = actionEl.dataset.id;
+        const input = $all("[data-pool-add-input]").find((el) => el.dataset.poolAddInput === pid);
+        const value = (input?.value || "").trim();
+        if (!value) return;
+        actionEl.disabled = true;
+        try {
+          const providers = await CCApi.getProviders();
+          const provider = providers.find((p) => p.id === pid);
+          const models = Array.isArray(provider?.pooledModels) ? provider.pooledModels.slice() : [];
+          if (!models.includes(value)) models.push(value);
+          await CCApi.setProviderPool(pid, { models });
+          showToast(t("toast.integrationModelsUpdated"));
+          await renderProviders();
+        } catch (error) {
+          actionEl.disabled = false;
+          showToast(error.message || t("toast.requestFailed"));
+        }
+      }
+
+      if (action === "pool-remove-model") {
+        const pid = actionEl.dataset.id;
+        const model = actionEl.dataset.model;
+        actionEl.disabled = true;
+        try {
+          const providers = await CCApi.getProviders();
+          const provider = providers.find((p) => p.id === pid);
+          const models = (Array.isArray(provider?.pooledModels) ? provider.pooledModels : []).filter((m) => m !== model);
+          await CCApi.setProviderPool(pid, { models });
+          showToast(t("toast.integrationModelsUpdated"));
+          await renderProviders();
+        } catch (error) {
+          actionEl.disabled = false;
+          showToast(error.message || t("toast.requestFailed"));
+        }
       }
 
       if (action === "check-provider-compatibility") {
@@ -8586,6 +8780,24 @@
       $("[data-action=real-account-login]")?.click(); // 复用「登录真实账号」逻辑
     });
     $("#exposeAllProviderModels").addEventListener("change", saveSettingsFromForm);
+    // 整合页右上角开关:与 settings 页 exposeAllProviderModels 同一设置。
+    $("#integrationToggle")?.addEventListener("change", async (e) => {
+      const next = e.target.checked;
+      let saved;
+      try {
+        saved = await CCApi.saveSettings({ exposeAllProviderModels: next });
+      } catch (err) {
+        e.target.checked = !next; // 仅「保存失败」回滚 UI(非破坏性);渲染失败不回滚已存设置
+        showToast(err.message || t("toast.requestFailed"));
+        return;
+      }
+      renderModelMenuModeState(saved);
+      showToast(next ? t("toast.integrationEnabled") : t("toast.integrationDisabled"));
+      // 设置已落盘;重渲染整合页 + dashboard(「启用 / 应用」按钮随开关锁定 / 解锁)。
+      // 渲染异常不回滚开关——下次进入页面会自我纠正。
+      await renderProviders();
+      await renderDashboard();
+    });
     $("#showGrayProviders")?.addEventListener("change", async () => {
       // MOC-91:更新展示过滤缓存 + 持久化。设置页当前不展示 preset,无需即时重渲染;
       // 下次进「添加 provider」/ dashboard 时 visiblePresets() 即按新值过滤。

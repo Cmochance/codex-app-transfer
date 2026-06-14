@@ -144,6 +144,9 @@
       reviewModelSlot: provider.reviewModelSlot || '',
       // 池化:按 provider 持久化的可选模型列表(显式挑字段,否则被这层 mapper 静默丢)。
       pooledModels: Array.isArray(provider.pooledModels) ? provider.pooledModels : [],
+      // 整合页子集开关:该 provider 是否参与模型池。默认 false —— 子集语义,
+      // 只有用户在整合页显式「添加」的 provider 才进池(与后端 provider_pooled_enabled 默认一致)。
+      pooledEnabled: provider.pooledEnabled === true,
       mappings: {
         default: models.default || '',
         gpt_5_5: models.gpt_5_5 || '',
@@ -315,6 +318,15 @@
 
     async setDefaultProvider(id) {
       return api('PUT', `/api/providers/${encodeURIComponent(id)}/default`);
+    },
+
+    // 整合页:把 provider 加入/移出模型池(enabled)+ 权威设置其可选模型列表(models,增删)。
+    // 任一字段缺省即后端不动该项。
+    async setProviderPool(id, { enabled, models } = {}) {
+      const body = {};
+      if (typeof enabled === 'boolean') body.enabled = enabled;
+      if (Array.isArray(models)) body.models = models;
+      return api('PUT', `/api/providers/${encodeURIComponent(id)}/pool`, body);
     },
 
     async saveDraft(id, payload) {
