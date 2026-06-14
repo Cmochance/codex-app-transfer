@@ -492,46 +492,34 @@ pub async fn save_settings(
                 }
             }
             // 池化开关翻转 → re-apply 当前 active provider:开 = catalog 写全 provider 池,
-            // 关 = 退回单 provider catalog;同时重启 proxy 刷新 resolver 反查表。
-            // - 仅在 re-apply **成功**(success==true)才提示 needsCodexRestart —— 失败时
-            //   catalog 没真正改,提示重启无意义。
-            // - re-apply 失败(attempted 但 !success)必须 surface(exposeAllProviderModelsWarning)
-            //   + error log,绝不静默吞:开关已写盘但 catalog/proxy 没跟上 = 状态不一致,用户无
-            //   信号会以为"开关没生效"(守 no-silent-failure,对齐 webFetchSyncWarning)。
-            // - 无 active provider 时 sync attempted=false → 既不提示重启也不算失败。
-            let mut needs_codex_restart = false;
-            let mut expose_all_warning: Option<String> = None;
+            // 关 = 退回单 provider catalog;同时重启 proxy 刷新 resolver 反查表。re-apply 失败
+            // 必须 **loud log**(不静默吞:开关已写盘但 catalog/proxy 没跟上 = 状态不一致)。
+            //
+            // 用户面提示(失败 toast / "需重启 Codex" 引导)属池化前端 UX —— 本 PR 后端 only,
+            // 故此处只到后端日志层;翻开关的 toast / 重启提示随前端 follow-up 落地(MOC-236)。
+            // 无 active provider 时 sync attempted=false(无可 apply),非失败。
             if expose_all_changed {
                 let sync =
                     crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(
                         &state,
                     )
                     .await;
-                let attempted = sync.get("attempted").and_then(Value::as_bool) == Some(true);
-                let succeeded = sync.get("success").and_then(Value::as_bool) == Some(true);
-                needs_codex_restart = succeeded;
-                if attempted && !succeeded {
+                if sync.get("attempted").and_then(Value::as_bool) == Some(true)
+                    && sync.get("success").and_then(Value::as_bool) != Some(true)
+                {
                     let msg = sync
                         .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned();
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     tracing::error!(
                         error_id = "POOL_TOGGLE_REAPPLY_FAILED",
                         "exposeAllProviderModels 翻转后 re-apply 失败: {msg}"
                     );
-                    expose_all_warning = Some(msg);
                 }
             }
             let mut body = json!({"success": true, "settings": settings});
             if let Some(w) = web_fetch_warning {
                 body["webFetchSyncWarning"] = json!(w);
-            }
-            if let Some(w) = expose_all_warning {
-                body["exposeAllProviderModelsWarning"] = json!(w);
-            }
-            if needs_codex_restart {
-                body["needsCodexRestart"] = json!(true);
             }
             Json(body).into_response()
         }
