@@ -43,7 +43,8 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
 use futures_core::Stream;
-use http::{HeaderMap, StatusCode};
+use http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::Value;
 
 use crate::mapper::{RequestMapper, ResponseMapper};
@@ -97,15 +98,40 @@ impl ResponseMapper for ResponsesPassthroughMapper {
         _provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
-        // [MOC-234] 只读观测 tee:仅成功流 + request 侧带了观测上下文(= breakdown_enabled
-        // 且非 compact)时,套一层**纯透传** tee 解析 SSE 的 `response.completed` 拿 response_id
-        // + output items,写会话观测镜像供下一轮拼全历史。tee 不 await / 不重排 / 不改字节 ——
-        // chunk 原样返回,绝不破流;失败/非 SSE 自然不记录(降级,不影响转发)。
+        // [MOC-234] **上游非 2xx → 合规 `response.failed` SSE**,绝不裸传错误体。
+        // 实测原生 Responses 上游(及第三方反代)报错常返 HTTP 4xx/5xx + JSON error body
+        // (甚至 `content-type: text/event-stream` 但 body 不是 SSE 帧)。流式 `/responses`
+        // 请求下,Codex 客户端等不到 SSE 终止事件 → 卡 Thinking、错误不显示。这里复用
+        // 与 chat/grok/gemini 同一套 `core::failure_stream`,把上游错误转成
+        // `response.created` + `response.failed`(HTTP 写 200,Codex 据 response.failed
+        // 渲染错误并按 code fail-fast / retry),与转换路径的报错对接一致。**仅错误路径,
+        // 成功流仍 1:1 字节直透。**
+        if !upstream_status.is_success() {
+            let mut headers = HeaderMap::with_capacity(2);
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            return Ok(ResponsePlan {
+                status: StatusCode::OK,
+                headers,
+                stream: crate::core::failure_stream::convert_upstream_error_stream(
+                    upstream_status,
+                    upstream_stream,
+                    "resp_passthrough_error".to_owned(),
+                    classify_passthrough_error_status(upstream_status.as_u16()),
+                    "upstream",
+                ),
+            });
+        }
+
+        // 成功路径:只读观测 tee(仅 request 侧带了观测上下文 = breakdown_enabled 且非
+        // compact 时)套一层**纯透传** tee 解析 SSE 的 `response.completed` 拿 response_id
+        // + output items,写会话观测镜像供下一轮拼全历史。tee 不 await / 不重排 / 不改字节
+        // —— chunk 原样返回,绝不破流;非 SSE / 失败自然不记录(降级,不影响转发)。
         let stream = match observe_ctx_from_plan(request_plan) {
-            Some((prev_id, input_items)) if upstream_status.is_success() => {
+            Some((prev_id, input_items)) => {
                 Box::pin(ObserveTeeStream::new(upstream_stream, prev_id, input_items)) as ByteStream
             }
-            _ => upstream_stream,
+            None => upstream_stream,
         };
         // 1:1 直透:status / headers 原样回灌。**不强制** content-type —— 与 chat 等转换
         // mapper 不同,透传上游可能返回非 SSE 的合法响应(`stream:false` 的 JSON、
@@ -116,6 +142,24 @@ impl ResponseMapper for ResponsesPassthroughMapper {
             headers: upstream_headers,
             stream,
         })
+    }
+}
+
+/// 上游(原生 Responses 反代)HTTP status → 内部语义 kind(再经 [`crate::codex_retry_code`]
+/// 映射成 Codex 的 retry-control code)。与 `mapper::chat::classify_chat_error_status` 同口径:
+/// 400/401/403 等永久错误 → `invalid_prompt`(surface + fail-fast),timeout / rate_limited /
+/// 5xx / 404 等瞬时或不确定态保留原 code → Codex Retryable(「Retryable 比误杀安全」)。
+/// 透传场景 400 多为请求格式 / 上游会话状态错误(如 `previous_response_id` + `store:false`
+/// 下 function_call 续轮),重试同一请求必复现,故归永久错误 fail-fast。
+fn classify_passthrough_error_status(status_u16: u16) -> &'static str {
+    match status_u16 {
+        400 => "bad_request",
+        401 => "auth_error",
+        403 => "permission_denied",
+        408 | 504 => "timeout",
+        429 => "rate_limited",
+        500..=599 => "server_error",
+        _ => "upstream_error",
     }
 }
 
@@ -553,5 +597,59 @@ mod tests {
         // 默认面板关 → 不 parse、不 spawn、metadata=None(热路径零开销)。
         // (不切换全局 gate,避免污染并发测试。)
         assert!(build_observe_metadata("/v1/responses", &Bytes::from_static(b"{}")).is_none());
+    }
+
+    #[tokio::test]
+    async fn response_upstream_400_becomes_response_failed_sse_not_raw_passthrough() {
+        // [MOC-234] 真机复现:上游(jp.yemoren / new-api)对工具续轮返 HTTP 400 + 裸 JSON
+        // error 体(甚至标 content-type=event-stream 但非 SSE 帧)→ 若 1:1 直透,Codex 流式
+        // 客户端等不到 SSE 终止事件 → 卡 Thinking、错误不显示。本路径必须转成 response.failed SSE。
+        use futures_util::StreamExt;
+        let err_body = br#"{"error":{"message":"No tool call found for function call output with call_id call_X.","type":"invalid_request_error","param":"input"}}"#;
+        let upstream: ByteStream = Box::pin(futures_util::stream::once(async move {
+            Ok::<_, std::io::Error>(Bytes::from_static(err_body))
+        }));
+        let mut up_headers = HeaderMap::new();
+        up_headers.insert(CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        let plan = ResponsesPassthroughMapper
+            .map_request(
+                "/v1/responses",
+                Bytes::from_static(b"{}"),
+                &dummy_provider(),
+            )
+            .unwrap();
+        let resp = ResponsesPassthroughMapper
+            .map_response(
+                StatusCode::BAD_REQUEST,
+                up_headers,
+                upstream,
+                &dummy_provider(),
+                &plan,
+            )
+            .unwrap();
+        // HTTP 写 200 + SSE,Codex 才会读流拿到 response.failed(裸 400 会卡 Thinking)。
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(
+            resp.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let mut body = Vec::new();
+        let mut s = resp.stream;
+        while let Some(c) = s.next().await {
+            body.extend(c.unwrap());
+        }
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("event: response.failed"),
+            "上游错误必须转成 response.failed SSE: {text}"
+        );
+        assert!(
+            text.contains("invalid_prompt"),
+            "400 → invalid_prompt(fail-fast,不卡 retry): {text}"
+        );
+        assert!(
+            text.contains("No tool call found"),
+            "应带上上游错误 message 供用户/模型看到: {text}"
+        );
     }
 }
