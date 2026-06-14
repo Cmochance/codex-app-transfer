@@ -541,23 +541,26 @@ pub const WEB_FETCH_SERVER_NAME: &str = "cat-webfetch";
 /// 残留,避免老用户 config 留两个 server(旧大写 CAT-WEB-MCP + 新小写 cat-webfetch)。
 const LEGACY_WEB_FETCH_SERVER_NAME: &str = "CAT-WEB-MCP";
 
-/// 按 `webFetchBackend` 档位注册/移除 transfer 自己的 web_fetch MCP server。
+/// 注册 transfer 自己的 web_fetch MCP server(`command` = 本二进制绝对路径 + `--mcp-serve-webfetch`)。
 ///
-/// - `off` / 未知 → 移除 `[mcp_servers.cat-webfetch]`
-/// - `curl` / `wreq` / `headless` → 注册(`command` = 本二进制绝对路径 + `--mcp-serve-webfetch`)
+/// MOC-235 起**始终注册**(不再随 `webFetchBackend=off` 移除):本 server 同时托管
+/// `read_tool_artifact`(工具输出回取,不联网、始终有用)。哪些**联网**工具(web_fetch /
+/// web_search / read_url_local)对模型可见,由 server 在 `tools/list` 按当前档位决定 ——
+/// `off` 档只暴露 `read_tool_artifact`。
 ///
-/// 注:Codex 在启动时加载 `mcp_servers`,改档后需**重启 Codex Desktop** 才会重新加载 /
-/// 卸载本 server;但后端档位(curl/wreq/headless)是 server 每次 `tools/call` 时读
-/// config.json 当前值, 在 server 已加载的前提下切档无需重启。
+/// 注:Codex 在启动时加载 `mcp_servers`,改档后需**重启 Codex Desktop** 才会让 `tools/list`
+/// 的变化(联网工具出现/消失)生效;但后端档位(curl/wreq/headless)是 server 每次
+/// `tools/call` 时读 config.json 当前值, 已加载前提下切档无需重启。
 pub fn sync_web_fetch_server(backend: &str) -> Result<(), String> {
-    let active = matches!(
-        backend.trim().to_ascii_lowercase().as_str(),
-        "auto" | "curl" | "wreq" | "headless"
-    );
+    // MOC-235: 本 server 现同时托管 read_tool_artifact(工具输出回取, 与 webfetch 档位无关、
+    // 始终有用 —— 历史工具输出被 MOC-190 压缩外置后靠它取回全文)→ **始终注册**, 不再随
+    // webFetchBackend=off 移除。web_fetch / web_search / read_url_local 等**联网**工具是否
+    // 暴露, 由 server 自身在 `tools/list` 按当前 backend 档位决定(off 档只暴露 read_tool_artifact,
+    // 不加任何网络能力)。`backend` 参数保留(向后兼容调用方 + 文档语义), 不再决定是否注册。
+    let _ = backend;
     // 幂等: 先看现状, 已是目标态就不写(避免无谓重写 config.toml 触发 Codex "modified",
     // MOC-115)。startup re-sync 每次启动都调, 必须幂等。
-    // list_servers() 的读错误要传播, 不能 .ok() 吞掉 —— 否则 off 分支会因"读不到"
-    // 当成"不存在"跳过 delete, 残留 server 还谎报成功(关不掉)。
+    // list_servers() 的读错误要传播, 不能 .ok() 吞掉。
     let servers = list_servers()?;
     // 迁移(回退 MOC-139): 注册过大写 CAT-WEB-MCP 的用户, 清理旧 key 避免 config 残留两个 server。
     if servers
@@ -569,12 +572,6 @@ pub fn sync_web_fetch_server(backend: &str) -> Result<(), String> {
     let existing = servers
         .into_iter()
         .find(|s| s.name == WEB_FETCH_SERVER_NAME);
-    if !active {
-        if existing.is_some() {
-            delete_server(WEB_FETCH_SERVER_NAME)?;
-        }
-        return Ok(());
-    }
     let exe = std::env::current_exe()
         .map_err(|e| format!("拿不到自身可执行路径: {e}"))?
         .to_string_lossy()

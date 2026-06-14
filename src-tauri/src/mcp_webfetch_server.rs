@@ -204,11 +204,15 @@ fn dispatch_line(
             // handle 拒, 徒增无效调用(用户 #386 验收反馈)。改档需重启 Codex 重新 tools/list 才反映
             // (与 web_fetch 改 on/off 需重启一致);运行期切档的 stale 缓存由 handle_web_search_call
             // 的 backend gate 兜底(failing 双保险)。
-            let mut tools = vec![
-                web_fetch_tool_def(),
-                read_url_local_tool_def(),
-                read_tool_artifact_tool_def(),
-            ];
+            // MOC-235: read_tool_artifact 不联网、始终可用(本 server 始终注册, 见
+            // sync_web_fetch_server)。web_fetch / read_url_local 是联网工具, 仅 backend 非 off
+            // 时暴露 —— off 档 server 仍在(为 read_tool_artifact), 但不列联网工具(列了也只会被
+            // handle 拒, 徒增无效调用)。
+            let mut tools = vec![read_tool_artifact_tool_def()];
+            if matches!(current_backend(), Ok(Some(_))) {
+                tools.push(web_fetch_tool_def());
+                tools.push(read_url_local_tool_def());
+            }
             // web_search 暴露条件(MOC-190): backend 非 off + Chrome 就绪(系统装了或已下载),
             // 与 web_fetch 档位选择解耦 —— 系统有 Chrome 的用户在 curl/wreq 档也能用 search 且不
             // 触发下载;两者皆无则不暴露(避免在没走过 consent 的档静默拉 ~86MB)。
