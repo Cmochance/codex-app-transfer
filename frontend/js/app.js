@@ -4480,6 +4480,8 @@
     if (!currentAgentsHash) return;
     const ta = $("#codexAgentsEdit");
     const content = ta?.value ?? "";
+    // 写盘前二次确认,防误改影响 AI 行为的文档(MOC-106)。
+    if (!window.confirm(tFmt("codex.docApplyConfirm", { doc: "AGENTS.md" }))) return;
     try {
       const r = await fetch(`/api/codex/agents-md/raw?hash=${encodeURIComponent(currentAgentsHash)}`, {
         method: "POST",
@@ -4955,6 +4957,8 @@
     if (!currentMemoriesHash) return;
     const ta = $("#codexMemoriesEdit");
     const content = ta?.value ?? "";
+    // 写盘前二次确认,防误改影响 AI 行为的文档(MOC-106)。
+    if (!window.confirm(tFmt("codex.docApplyConfirm", { doc: "MEMORY.md" }))) return;
     try {
       const r = await fetch(`/api/codex/memories-md/raw?hash=${encodeURIComponent(currentMemoriesHash)}`, {
         method: "POST",
@@ -5163,6 +5167,8 @@
     if (!currentSkillsHash) return;
     const ta = $("#codexSkillsEdit");
     const content = ta?.value ?? "";
+    // 写盘前二次确认,防误改影响 AI 行为的文档(MOC-106)。
+    if (!window.confirm(tFmt("codex.docApplyConfirm", { doc: "SKILL.md" }))) return;
     try {
       const r = await fetch(`/api/codex/skills-md/raw?hash=${encodeURIComponent(currentSkillsHash)}`, {
         method: "POST",
