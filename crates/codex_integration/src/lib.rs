@@ -14,8 +14,9 @@
 //! - [`ensure_file_store_mode`]:向 `~/.codex/config.toml` 写 / 删
 //!   `mcp_oauth_credentials_store = "file"`,切换 Codex MCP OAuth 凭据存储模式
 //!   (MOC-62 可移植保险箱开关)
-//! - [`sync_mcp_credentials`]:把 `~/.codex/.credentials.json` 与
-//!   `~/.codex-app-transfer/mcp-credentials.json` 镜像做并集合并(MOC-62)
+//! - [`sync_mcp_credentials`]:让 `~/.codex-app-transfer/mcp-credentials.json` 镜像
+//!   跟随 `~/.codex/.credentials.json`(捕获新授权 + 传播登出删除),**绝不写 live**;
+//!   live 整文件缺失时只报告可恢复条数,由用户确认式 restore 处理(MOC-62)
 //!
 //! 路径解析全部走 [`CodexPaths`],测试可注入临时目录。
 
