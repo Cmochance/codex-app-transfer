@@ -86,13 +86,6 @@ pub struct ApplyConfig<'a> {
     /// network_access` section field)。控制小白用户能否用 `curl` 等命令联网。
     /// Caller 从 `Settings.codex_network_access`(默认 `true`)读取(#212)。
     pub codex_network_access: bool,
-    /// **direct 直连模式**(`bypass_proxy`,snapshot.rs:87-89)。为 `true` 时
-    /// apply 只写上游配置(`openai_base_url` + auth key),并 **strip** 所有
-    /// transfer 私货字段(`model_catalog_json` / catalog models /
-    /// `model_context_window` / `sandbox_mode` / `approval_policy`)—— 这一步
-    /// 同时是「从 local_proxy 切到 direct 时清掉残留私货」的清理机制。详见 issue #317。
-    #[serde(default)]
-    pub direct: bool,
     /// **[MOC-104] relay 模式**:`true` 时 apply **保留**活动 `auth.json` 的真实
     /// chatgpt 登录态(`auth_mode=chatgpt` + tokens),**不**写 `apikey` /
     /// `OPENAI_API_KEY`。Codex 据 `auth_mode==chatgpt` 原生显示 Plugins 入口
@@ -140,7 +133,7 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // `/backend-api`,与默认结构对齐:proxy 收到 `/backend-api/*` 透传真
     // chatgpt.com 同 path),proxy 即可逐条 log 该链路的请求/响应,把黑盒打开。
     //
-    // 仅 relay 写;direct / apikey 态 strip(None)。snapshot 已存原值,restore 退回。
+    // 仅 relay 写;非 relay(apikey / local_proxy)态 strip(None)。snapshot 已存原值,restore 退回。
     if cfg.preserve_chatgpt_auth && !cfg.base_url.is_empty() {
         let chatgpt_base = format!("{}/backend-api", cfg.base_url.trim_end_matches('/'));
         let literal = toml_string_literal(&chatgpt_base);
@@ -184,20 +177,7 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // (Codex docs: "Full access means `danger-full-access` together with
     // `never`")。toggle 默认 on 接受 prompt-injection 风险换"小白开箱用",
     // 专业用户 toggle off 自己回 Codex default 沙箱。
-    if cfg.direct {
-        // === direct 直连(issue #317):strip sandbox/approval 私货。direct 唯一
-        // 职责是写上游配置,不注入 transfer 的「全访问无审批」默认,也清掉从
-        // local_proxy 切来时可能残留的这两条。Codex 回默认沙箱(read-only +
-        // on-request)。
-        sync_root_value(&paths.config_toml, "sandbox_mode", None)?;
-        sync_root_value(&paths.config_toml, "approval_policy", None)?;
-        sync_table_field(
-            &paths.config_toml,
-            "sandbox_workspace_write",
-            "network_access",
-            None,
-        )?;
-    } else if cfg.codex_network_access {
+    if cfg.codex_network_access {
         sync_root_value(
             &paths.config_toml,
             "sandbox_mode",
@@ -228,68 +208,58 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
     // 选择器里 fallback 到内置 GPT 系列名("GPT-5.5"等),用户看不到真实
     // provider/model。现在每条 provider 都通过 catalog 把 display_name 设成
     // "<provider> / <real-model>",`model_context_window` 仍只在 1M 时设。
-    if cfg.direct {
-        // === direct 直连(issue #317):strip model_catalog_json + 顶层 catalog
-        // models + model_context_window。responses 直连用 Codex 默认 OpenAI
-        // catalog(模型名同属 OpenAI 命名空间,无需 transfer 注入),这里同时
-        // 清掉从 local_proxy 切来时残留的 catalog/window。
-        sync_root_value(&paths.config_toml, CODEX_MODEL_CATALOG_KEY, None)?;
-        clear_catalog_models(&paths.model_catalog_json)?;
-        sync_root_value(&paths.config_toml, "model_context_window", None)?;
+    let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
+    sync_root_value(
+        &paths.config_toml,
+        CODEX_MODEL_CATALOG_KEY,
+        Some(&catalog_literal),
+    )?;
+    let models = catalog_models_for_provider_with_display_names(
+        cfg.provider_name,
+        cfg.default_model,
+        cfg.supports_1m,
+        cfg.model_mappings,
+        cfg.model_capabilities,
+        cfg.model_display_names,
+        cfg.review_model_slot,
+    );
+    upsert_catalog_models(&paths.model_catalog_json, &models)?;
+    // [MOC-154] 列表式:Codex `model` 字段统一锚到 catalog 内的有效 slug。去掉旧
+    // fallback entry 后,遗留的 `model = 实际模型名`(用户在旧版映射 UI 下选过)会不在
+    // 新 catalog → Codex 选不到。仅当当前 model 非空且不在新 catalog slug 集合时,重置
+    // 为 `gpt-5.5`(= 默认模型槽,保证新对话直接用默认);已是有效 slug(用户手选的
+    // gpt-5.x)→ 保留不覆盖(守 no-silent-destructive)。snapshot 已在首次 apply 前
+    // 捕获原 model,restore 仍按快照还原用户接管前的值。
+    let current_model = match std::fs::read_to_string(&paths.config_toml) {
+        // 与同 crate `read_or_empty` 约定一致:NotFound(首次 apply、config.toml 还
+        // 不存在 → 无遗留 model)当良性、不迁移;其余 IO 错误(权限/损坏/部分读)
+        // fail-loud 向上传播,不静默吞错漏迁移。
+        Ok(content) => content
+            // root `model` key 只在第一个 `[section]` 之前出现;take_while 到首个
+            // 表头止,避免把 `[some_table]` 里的 `model = ...` 误读成根 model。
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .find_map(|line| {
+                let t = line.trim_start();
+                if t.starts_with('#') {
+                    None
+                } else {
+                    crate::residual::parse_root_string_value(t, "model")
+                }
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let model_needs_reset = current_model
+        .as_deref()
+        .is_some_and(|m| !m.is_empty() && !models.iter().any(|cm| cm.slug == m));
+    if model_needs_reset && models.iter().any(|cm| cm.slug == "gpt-5.5") {
+        sync_root_value(&paths.config_toml, "model", Some("\"gpt-5.5\""))?;
+    }
+    if cfg.supports_1m {
+        sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
     } else {
-        let catalog_literal = toml_string_literal(&paths.model_catalog_json.display().to_string());
-        sync_root_value(
-            &paths.config_toml,
-            CODEX_MODEL_CATALOG_KEY,
-            Some(&catalog_literal),
-        )?;
-        let models = catalog_models_for_provider_with_display_names(
-            cfg.provider_name,
-            cfg.default_model,
-            cfg.supports_1m,
-            cfg.model_mappings,
-            cfg.model_capabilities,
-            cfg.model_display_names,
-            cfg.review_model_slot,
-        );
-        upsert_catalog_models(&paths.model_catalog_json, &models)?;
-        // [MOC-154] 列表式:Codex `model` 字段统一锚到 catalog 内的有效 slug。去掉旧
-        // fallback entry 后,遗留的 `model = 实际模型名`(用户在旧版映射 UI 下选过)会不在
-        // 新 catalog → Codex 选不到。仅当当前 model 非空且不在新 catalog slug 集合时,重置
-        // 为 `gpt-5.5`(= 默认模型槽,保证新对话直接用默认);已是有效 slug(用户手选的
-        // gpt-5.x)→ 保留不覆盖(守 no-silent-destructive)。snapshot 已在首次 apply 前
-        // 捕获原 model,restore 仍按快照还原用户接管前的值。
-        let current_model = match std::fs::read_to_string(&paths.config_toml) {
-            // 与同 crate `read_or_empty` 约定一致:NotFound(首次 apply、config.toml 还
-            // 不存在 → 无遗留 model)当良性、不迁移;其余 IO 错误(权限/损坏/部分读)
-            // fail-loud 向上传播,不静默吞错漏迁移。
-            Ok(content) => content
-                // root `model` key 只在第一个 `[section]` 之前出现;take_while 到首个
-                // 表头止,避免把 `[some_table]` 里的 `model = ...` 误读成根 model。
-                .lines()
-                .take_while(|line| !line.trim_start().starts_with('['))
-                .find_map(|line| {
-                    let t = line.trim_start();
-                    if t.starts_with('#') {
-                        None
-                    } else {
-                        crate::residual::parse_root_string_value(t, "model")
-                    }
-                }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        let model_needs_reset = current_model
-            .as_deref()
-            .is_some_and(|m| !m.is_empty() && !models.iter().any(|cm| cm.slug == m));
-        if model_needs_reset && models.iter().any(|cm| cm.slug == "gpt-5.5") {
-            sync_root_value(&paths.config_toml, "model", Some("\"gpt-5.5\""))?;
-        }
-        if cfg.supports_1m {
-            sync_root_value(&paths.config_toml, "model_context_window", Some("1000000"))?;
-        } else {
-            sync_root_value(&paths.config_toml, "model_context_window", None)?;
-        }
+        sync_root_value(&paths.config_toml, "model_context_window", None)?;
     }
 
     // 4. auth.json: auth_mode + OPENAI_API_KEY
@@ -333,8 +303,8 @@ pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResu
         config_toml_path: paths.config_toml.display().to_string(),
         auth_json_path: paths.auth_json.display().to_string(),
         snapshot_taken: snapshot_taken_now,
-        model_context_window_set: cfg.supports_1m && !cfg.direct,
-        model_catalog_json_set: !cfg.direct,
+        model_context_window_set: cfg.supports_1m,
+        model_catalog_json_set: true,
     })
 }
 
@@ -622,7 +592,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v2.0.0-stage2.5",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -679,7 +648,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v2.0.0-stage2.5",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: true,
             },
         )
@@ -727,7 +695,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: false,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -774,7 +741,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -843,7 +809,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -911,7 +876,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -976,7 +940,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1017,7 +980,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1066,7 +1028,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1107,7 +1068,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1128,7 +1088,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1180,7 +1139,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1226,7 +1184,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1291,7 +1248,6 @@ mod tests {
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1475,7 +1431,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v-active",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1544,7 +1499,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1565,7 +1519,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1600,7 +1553,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1627,7 +1579,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1661,7 +1612,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1701,7 +1651,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1753,7 +1702,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1808,7 +1756,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1863,7 +1810,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )
@@ -1877,185 +1823,6 @@ model = \"gpt-5.5\"
             toml.contains("model = \"kimi-k2.6\""),
             "快照里没有 model 时,restore 应保留 CLI 写入的活跃选择,实际 toml:\n{toml}"
         );
-    }
-
-    /// issue #317:direct 直连只写上游配置(openai_base_url + auth key),
-    /// **strip** 全部 transfer 私货 —— 即便 supports_1m + network_access 都为
-    /// true,也不写 catalog / model_context_window / sandbox_mode / approval_policy。
-    #[test]
-    fn apply_direct_only_writes_upstream_and_strips_private() {
-        let (_t, paths) = setup();
-        let result = apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "https://up.example.com/v1",
-                gateway_api_key: "sk-upstream",
-                supports_1m: true, // 即便 1M,direct 也不写 window
-                provider_name: "Custom",
-                default_model: "gpt-5.5",
-                model_mappings: None,
-                model_capabilities: None,
-                model_display_names: None,
-                review_model_slot: None,
-                app_version: "v",
-                codex_network_access: true, // 即便 on,direct 也不写 sandbox
-                direct: true,
-                preserve_chatgpt_auth: false,
-            },
-        )
-        .unwrap();
-        assert!(!result.model_context_window_set, "direct 不应设 window");
-        assert!(!result.model_catalog_json_set, "direct 不应设 catalog");
-
-        let toml = read_toml(&paths);
-        assert!(
-            toml.contains("openai_base_url = \"https://up.example.com/v1\""),
-            "direct 必须写上游 base_url: {toml}"
-        );
-        assert!(
-            !toml.contains("model_catalog_json"),
-            "direct 不应写 catalog: {toml}"
-        );
-        assert!(
-            !toml.contains("model_context_window"),
-            "direct 不应写 window: {toml}"
-        );
-        assert!(
-            !toml.contains("sandbox_mode"),
-            "direct 不应写 sandbox: {toml}"
-        );
-        assert!(
-            !toml.contains("approval_policy"),
-            "direct 不应写 approval: {toml}"
-        );
-
-        let auth = read_auth_value(&paths);
-        assert_eq!(auth["OPENAI_API_KEY"], "sk-upstream");
-        assert_eq!(auth["auth_mode"], "apikey");
-    }
-
-    /// issue #317:从 local_proxy 切到 direct —— direct apply 的 strip 同时承担
-    /// 「清掉 local_proxy 残留私货」的清理机制,切换后 config 必须干净。
-    #[test]
-    fn switch_local_proxy_to_direct_strips_residual_private_fields() {
-        let (_t, paths) = setup();
-        apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "http://127.0.0.1:18080",
-                gateway_api_key: "cas_proxy",
-                supports_1m: true,
-                provider_name: "DeepSeek",
-                default_model: "deepseek-v4-pro",
-                model_mappings: None,
-                model_capabilities: None,
-                model_display_names: None,
-                review_model_slot: None,
-                app_version: "v",
-                codex_network_access: true,
-                direct: false,
-                preserve_chatgpt_auth: false,
-            },
-        )
-        .unwrap();
-        let after_proxy = read_toml(&paths);
-        assert!(after_proxy.contains("model_catalog_json"));
-        assert!(after_proxy.contains("model_context_window = 1000000"));
-        assert!(after_proxy.contains("sandbox_mode"));
-        assert!(read_app_config(&paths).get("models").is_some());
-
-        apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "https://up.example.com/v1",
-                gateway_api_key: "sk-upstream",
-                supports_1m: true,
-                provider_name: "Custom",
-                default_model: "gpt-5.5",
-                model_mappings: None,
-                model_capabilities: None,
-                model_display_names: None,
-                review_model_slot: None,
-                app_version: "v",
-                codex_network_access: true,
-                direct: true,
-                preserve_chatgpt_auth: false,
-            },
-        )
-        .unwrap();
-        let after_direct = read_toml(&paths);
-        assert!(
-            after_direct.contains("openai_base_url = \"https://up.example.com/v1\""),
-            "切 direct 后 base_url 必须是上游: {after_direct}"
-        );
-        assert!(
-            !after_direct.contains("model_catalog_json"),
-            "切 direct 应清 catalog: {after_direct}"
-        );
-        assert!(
-            !after_direct.contains("model_context_window"),
-            "切 direct 应清 window: {after_direct}"
-        );
-        assert!(
-            !after_direct.contains("sandbox_mode"),
-            "切 direct 应清 sandbox: {after_direct}"
-        );
-        assert!(
-            !after_direct.contains("approval_policy"),
-            "切 direct 应清 approval: {after_direct}"
-        );
-        assert!(
-            read_app_config(&paths).get("models").is_none(),
-            "切 direct 应清掉顶层 catalog models"
-        );
-    }
-
-    /// issue #317:direct apply 后 restore 仍能恢复用户原始配置(复用 snapshot +
-    /// MANAGED_TOML_KEYS,direct 没写的字段 strip=noop,安全)。
-    #[test]
-    fn direct_apply_then_restore_brings_back_user_values() {
-        let (_t, paths) = setup();
-        std::fs::create_dir_all(&paths.codex_home).unwrap();
-        std::fs::write(
-            &paths.config_toml,
-            "openai_base_url = \"https://api.openai.com/v1\"\nmodel = \"gpt-5.5\"\n[profiles]\nfoo = 1\n",
-        )
-        .unwrap();
-        std::fs::write(
-            &paths.auth_json,
-            "{\"OPENAI_API_KEY\":\"sk-original\",\"tokens\":{\"a\":1}}\n",
-        )
-        .unwrap();
-        apply_provider(
-            &paths,
-            &ApplyConfig {
-                base_url: "https://up.example.com/v1",
-                gateway_api_key: "sk-upstream",
-                supports_1m: false,
-                provider_name: "Custom",
-                default_model: "gpt-5.5",
-                model_mappings: None,
-                model_capabilities: None,
-                model_display_names: None,
-                review_model_slot: None,
-                app_version: "v",
-                codex_network_access: true,
-                direct: true,
-                preserve_chatgpt_auth: false,
-            },
-        )
-        .unwrap();
-        assert!(read_toml(&paths).contains("openai_base_url = \"https://up.example.com/v1\""));
-
-        restore_codex_state(&paths).unwrap();
-        let toml = read_toml(&paths);
-        assert!(
-            toml.contains("openai_base_url = \"https://api.openai.com/v1\""),
-            "restore 应回用户原 base_url: {toml}"
-        );
-        assert!(toml.contains("[profiles]"), "用户 [profiles] 应保留");
-        let auth = read_auth_value(&paths);
-        assert_eq!(auth["OPENAI_API_KEY"], "sk-original");
     }
 
     // ── [MOC-197] stale session 快照自愈 + 写入端反投毒 ───────────────
@@ -2350,7 +2117,6 @@ model = \"gpt-5.5\"
                 review_model_slot: None,
                 app_version: "v-test",
                 codex_network_access: true,
-                direct: false,
                 preserve_chatgpt_auth: false,
             },
         )

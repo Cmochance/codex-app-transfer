@@ -175,7 +175,11 @@ mod tests {
     #[test]
     fn request_no_session_no_metadata() {
         let plan = ResponsesPassthroughMapper
-            .map_request("/v1/responses", Bytes::from_static(b"{}"), &dummy_provider())
+            .map_request(
+                "/v1/responses",
+                Bytes::from_static(b"{}"),
+                &dummy_provider(),
+            )
             .unwrap();
         assert!(plan.response_session.is_none());
         assert!(plan.adapter_metadata.is_none());
@@ -190,7 +194,11 @@ mod tests {
         headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         headers.insert(TRANSFER_ENCODING, "chunked".parse().unwrap());
         let plan = ResponsesPassthroughMapper
-            .map_request("/v1/responses", Bytes::from_static(b"{}"), &dummy_provider())
+            .map_request(
+                "/v1/responses",
+                Bytes::from_static(b"{}"),
+                &dummy_provider(),
+            )
             .unwrap();
         let resp = ResponsesPassthroughMapper
             .map_response(
