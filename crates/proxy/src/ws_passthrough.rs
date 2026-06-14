@@ -74,10 +74,33 @@ fn ws_upstream_client() -> &'static reqwest13::Client {
     })
 }
 
-/// 上游 WS 的代理来源:优先进程 env(`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`,大小写都认),
-/// 否则读 `~/.codex/.env`(用户给 Codex 配的「全通信走 VPN」代理)。返回首个非空代理 URL。
-/// 仅供 [`ws_upstream_client`] 用 —— 只为修 WS-over-TUN 被截断,不动 HTTP 转发(state.http)。
+/// 上游 WS 用的代理 URL(已归一成 `socks5h://`)。WS upgrade 经 **HTTP-CONNECT 代理会被
+/// fake-ip 截断**(实测 reqwest/curl 走 `http://` 代理返 426、到不了真实端点);改用 **SOCKS5h**
+/// (代理端解析域名拿真实 IP + 原始 TCP 隧道)WS 才直达上游(实测 websocat 走 socks5 返 401 =
+/// 已到达鉴权阶段)。假设代理端口兼 SOCKS(Clash/Mihomo mixed-port,用户场景)。
 fn upstream_ws_proxy() -> Option<String> {
+    Some(to_socks5h(&upstream_ws_proxy_raw()?))
+}
+
+/// 把任意代理 URL 归一成 `socks5h://<authority>`(保留 `[userinfo@]host:port`,强制代理端 DNS,
+/// 绕开客户端 fake-ip 解析)。已是 `socks5h://` 的原样返回。
+fn to_socks5h(proxy: &str) -> String {
+    if proxy.starts_with("socks5h://") {
+        return proxy.to_string();
+    }
+    let authority = proxy
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(proxy)
+        .split('/')
+        .next()
+        .unwrap_or(proxy);
+    format!("socks5h://{authority}")
+}
+
+/// 原始代理来源:优先进程 env(`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`,大小写都认),否则读
+/// `~/.codex/.env`(用户给 Codex 配的「全通信走 VPN」代理)。返回首个非空代理 URL。
+fn upstream_ws_proxy_raw() -> Option<String> {
     for k in [
         "HTTPS_PROXY",
         "https_proxy",
@@ -213,11 +236,21 @@ pub async fn proxy_responses_upstream_ws(
     let mut req = ws_upstream_client().get(&upstream_url);
     // 透传 Codex 握手头(OpenAI-Beta: responses_websockets / x-codex-* 等);跳过 gateway
     // authorization(下面单独处理)+ WS 协议握手头(reqwest-websocket 重新生成上游段)。
+    // 收集转发的头**名字**(不含值,避免泄露 auth/attestation)便于诊断上游 4xx 时缺哪个头。
+    let mut forwarded_names: Vec<&str> = Vec::new();
     for (k, v) in handshake_headers.iter() {
         if should_forward_responses_ws_header(k.as_str()) {
             req = req.header(k.as_str(), v.as_bytes());
+            forwarded_names.push(k.as_str());
         }
     }
+    telemetry.logs.add(
+        "INFO",
+        format!(
+            "[responses-ws] 转发 Codex 握手头: [{}]",
+            forwarded_names.join(", ")
+        ),
+    );
     // 鉴权:第三方 provider(api_key 非空)注入 provider 凭据;chatgpt.com relay(api_key 空、
     // 用 Codex 账号 token)透传 Codex 自带的 authorization。
     if resolved.api_key.is_empty() {
@@ -559,5 +592,34 @@ mod tests {
         // WS 握手头 / host 仍跳过(reqwest-websocket 重新生成)
         assert!(!should_forward_responses_ws_header("sec-websocket-key"));
         assert!(!should_forward_responses_ws_header("host"));
+    }
+
+    #[test]
+    fn to_socks5h_normalizes_to_socks5h_keeping_authority() {
+        // http/https/socks5 → socks5h(强制代理端 DNS,绕开 fake-ip)
+        assert_eq!(
+            to_socks5h("http://127.0.0.1:7897"),
+            "socks5h://127.0.0.1:7897"
+        );
+        assert_eq!(
+            to_socks5h("https://127.0.0.1:7897"),
+            "socks5h://127.0.0.1:7897"
+        );
+        assert_eq!(
+            to_socks5h("socks5://127.0.0.1:7897"),
+            "socks5h://127.0.0.1:7897"
+        );
+        // 已是 socks5h 原样
+        assert_eq!(
+            to_socks5h("socks5h://127.0.0.1:7897"),
+            "socks5h://127.0.0.1:7897"
+        );
+        // 保留 userinfo,丢弃 path
+        assert_eq!(
+            to_socks5h("http://user:pass@host:1080/x"),
+            "socks5h://user:pass@host:1080"
+        );
+        // 无 scheme
+        assert_eq!(to_socks5h("127.0.0.1:7897"), "socks5h://127.0.0.1:7897");
     }
 }
