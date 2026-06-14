@@ -679,6 +679,36 @@ pub async fn update_models(
             .unwrap();
         if let Some(o) = providers[idx].as_object_mut() {
             o.insert("models".into(), input.models.clone());
+            // 池化:若该 provider 已在用池(pooledModels 非空),把映射页编辑的模型值并进池
+            // (chat 过滤、去重、永不收缩)。否则池模式偏好非空 pooledModels、映射页改/手输的
+            // 新模型永不出现(bot review P2)。空池时无需(走 mappings fallback)。
+            let mut pooled: Vec<Value> = o
+                .get("pooledModels")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if !pooled.is_empty() {
+                let mapping_ids: Vec<String> = input
+                    .models
+                    .as_object()
+                    .map(|m| {
+                        m.values()
+                            .filter_map(|v| v.as_str().map(|s| s.trim().to_owned()))
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut seen: std::collections::HashSet<String> = pooled
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+                for id in super::models::chat_usable_model_ids(&mapping_ids) {
+                    if seen.insert(id.clone()) {
+                        pooled.push(Value::String(id));
+                    }
+                }
+                o.insert("pooledModels".into(), Value::Array(pooled));
+            }
         }
         Ok(ConfigMutation::Modified(was_active))
     });
