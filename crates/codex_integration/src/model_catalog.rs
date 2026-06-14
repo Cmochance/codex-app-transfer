@@ -19,7 +19,7 @@
 
 use codex_app_transfer_registry::{
     documented_context_window, load_raw_config, model_supports_1m, normalize_model_mappings,
-    save_raw_config, strip_internal_model_suffix, CAS_BASE_INSTRUCTIONS, MODEL_SLOTS,
+    save_raw_config, strip_internal_model_suffix, PoolEntry, CAS_BASE_INSTRUCTIONS, MODEL_SLOTS,
 };
 use serde_json::{json, Value};
 
@@ -211,11 +211,67 @@ pub fn catalog_models_for_provider_with_display_names(
     models
 }
 
+/// 池化模式下单个 provider 的元数据,按 [`PoolEntry::provider_idx`] 索引。
+///
+/// 拥有自己的数据(非借用)以避开 caller 端 `Value` 生命周期纠缠。空 object `{}` /
+/// `Null` 表示"无该信息"(context_window / display 反查都会安全回退)。
+#[derive(Debug, Clone)]
+pub struct PoolProviderMeta {
+    pub provider_name: String,
+    /// `modelCapabilities`(model id → {context_window, supports1m, ...});`{}` = 无。
+    pub model_capabilities: Value,
+    /// model id → 人类可读 displayName(仅 antigravity 非空);`Null` = 回退 raw id。
+    pub display_names: Value,
+}
+
+/// 池化 catalog:对 [`unique_pool_slugs`](codex_app_transfer_registry::unique_pool_slugs)
+/// 产出的每条 [`PoolEntry`] 生成一条 [`CatalogModel`]。
+///
+/// - `slug` 直接用 entry 的 `<provider_slug>/<model>`(已去碰撞);
+/// - `display_name` 池模式下 **provider-qualified**(`"<provider> / <model>"`)以消歧
+///   多 provider 同名模型 —— Codex 原生 picker 是扁平列表,只能靠这个区分(单 provider
+///   模式去前缀的旧决策不适用池模式);
+/// - `context_window` 复用 [`context_window_for_model`] 的优先级链(显式 caps → documented
+///   → 1M/258K 二档),按**每个模型**独立计算;
+/// - `auto_review_model_override = None`(slot 机制对斜杠 slug 无意义)。
+///
+/// `providers_meta` 必须与传给 `unique_pool_slugs` 的 provider 切片**同序**(entry 的
+/// `provider_idx` 即下标)。下标越界的 entry 被跳过(防御,正常不发生)。
+pub fn catalog_models_for_pool(
+    entries: &[PoolEntry],
+    providers_meta: &[PoolProviderMeta],
+) -> Vec<CatalogModel> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let meta = providers_meta.get(entry.provider_idx)?;
+            let caps = Some(&meta.model_capabilities);
+            let real = entry.real_model.as_str();
+            let supports_1m = model_supports_1m(real, caps);
+            let context_window = context_window_for_model(real, real, real, supports_1m, caps);
+            let label = resolve_display_label(real, Some(&meta.display_names));
+            let display_name = if meta.provider_name.trim().is_empty() {
+                label
+            } else {
+                format!("{} / {}", meta.provider_name.trim(), label)
+            };
+            Some(CatalogModel {
+                slug: entry.slug.clone(),
+                display_name,
+                provider_name: meta.provider_name.clone(),
+                context_window,
+                effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+                auto_review_model_override: None,
+            })
+        })
+        .collect()
+}
+
 pub fn strip_model_suffix(model: &str) -> String {
     strip_internal_model_suffix(model)
 }
 
-fn context_window_for_model(
+pub(crate) fn context_window_for_model(
     original_model: &str,
     clean_model: &str,
     default_model: &str,
@@ -1163,5 +1219,75 @@ mod tests {
             .any(|m| m["slug"] == "gpt-5.5"));
         let _typed: codex_app_transfer_registry::Config =
             serde_json::from_value(v).expect("top-level models must not break registry config");
+    }
+
+    // ── 池化 catalog(catalog_models_for_pool）──
+
+    #[test]
+    fn catalog_models_for_pool_builds_provider_qualified_entries() {
+        use codex_app_transfer_registry::PoolEntry;
+        let entries = vec![
+            PoolEntry {
+                provider_idx: 0,
+                slug: "deepseek/deepseek-v4-pro".into(),
+                real_model: "deepseek-v4-pro".into(),
+            },
+            PoolEntry {
+                provider_idx: 1,
+                slug: "ag/gemini-3.5-flash-low".into(),
+                real_model: "gemini-3.5-flash-low".into(),
+            },
+        ];
+        let meta = vec![
+            PoolProviderMeta {
+                provider_name: "DeepSeek".into(),
+                model_capabilities: json!({"deepseek-v4-pro": {"context_window": 512000}}),
+                display_names: Value::Null,
+            },
+            PoolProviderMeta {
+                provider_name: "Antigravity".into(),
+                model_capabilities: json!({}),
+                display_names: json!({"gemini-3.5-flash-low": "Gemini 3.5 Flash (Medium)"}),
+            },
+        ];
+        let models = catalog_models_for_pool(&entries, &meta);
+        assert_eq!(models.len(), 2);
+
+        // provider-qualified display + slug 透传 + 显式 caps 窗口胜出
+        assert_eq!(models[0].slug, "deepseek/deepseek-v4-pro");
+        assert_eq!(models[0].display_name, "DeepSeek / deepseek-v4-pro");
+        assert_eq!(models[0].context_window, 512_000);
+        assert!(models[0].auto_review_model_override.is_none());
+
+        // display_names 反查命中 → 人类名,仍 provider-qualified
+        assert_eq!(models[1].slug, "ag/gemini-3.5-flash-low");
+        assert_eq!(
+            models[1].display_name,
+            "Antigravity / Gemini 3.5 Flash (Medium)"
+        );
+
+        // model_to_json:斜杠 slug 原样保留 + visibility=list + supported_in_api(会进 picker)
+        let json0 = model_to_json(&models[0]);
+        assert_eq!(json0["slug"], "deepseek/deepseek-v4-pro");
+        assert_eq!(json0["visibility"], "list");
+        assert_eq!(json0["supported_in_api"], true);
+        assert_eq!(json0["context_window"], 512_000);
+        assert_eq!(json0["apply_patch_tool_type"], "freeform");
+    }
+
+    #[test]
+    fn catalog_models_for_pool_skips_out_of_range_provider_idx() {
+        use codex_app_transfer_registry::PoolEntry;
+        let entries = vec![PoolEntry {
+            provider_idx: 5,
+            slug: "x/y".into(),
+            real_model: "y".into(),
+        }];
+        let meta = vec![PoolProviderMeta {
+            provider_name: "P".into(),
+            model_capabilities: json!({}),
+            display_names: Value::Null,
+        }];
+        assert!(catalog_models_for_pool(&entries, &meta).is_empty());
     }
 }
