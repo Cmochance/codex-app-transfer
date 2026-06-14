@@ -92,7 +92,10 @@ mod tests {
         assert!(p.stats.is_empty());
         assert_eq!(p.windows[0].label, "5 小时额度");
         assert_eq!(p.windows[0].remaining_percent, 98.0);
-        assert_eq!(p.windows[0].reset_rfc3339.as_deref(), Some("2026-06-13T17:56:06Z"));
+        assert_eq!(
+            p.windows[0].reset_rfc3339.as_deref(),
+            Some("2026-06-13T17:56:06Z")
+        );
         assert_eq!(p.windows[1].label, "每周额度");
     }
 

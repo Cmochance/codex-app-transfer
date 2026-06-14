@@ -1603,7 +1603,10 @@ mod tests {
         // 带端口 / userinfo / 无 scheme 也能剥到纯 host
         assert_eq!(host_of("http://h:8080/x").as_deref(), Some("h"));
         assert_eq!(host_of("https://u@host.tld/x").as_deref(), Some("host.tld"));
-        assert_eq!(host_of("open.bigmodel.cn/api").as_deref(), Some("open.bigmodel.cn"));
+        assert_eq!(
+            host_of("open.bigmodel.cn/api").as_deref(),
+            Some("open.bigmodel.cn")
+        );
         assert_eq!(host_of(""), None);
     }
 }

@@ -95,7 +95,9 @@ mod tests {
     #[test]
     fn zero_usage() {
         assert_eq!(
-            parse_anyrouter_usage(&json!({"total_usage":0})).unwrap().value,
+            parse_anyrouter_usage(&json!({"total_usage":0}))
+                .unwrap()
+                .value,
             "$0.00"
         );
     }

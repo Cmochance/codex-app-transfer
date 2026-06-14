@@ -54,7 +54,9 @@ pub async fn login_and_capture() -> Result<Option<String>, String> {
     let app_build = app.clone();
     app.run_on_main_thread(move || {
         let res = (|| -> Result<(), String> {
-            let url: tauri::Url = LOGIN_URL.parse().map_err(|e| format!("URL 解析失败: {e}"))?;
+            let url: tauri::Url = LOGIN_URL
+                .parse()
+                .map_err(|e| format!("URL 解析失败: {e}"))?;
             WebviewWindowBuilder::new(&app_build, WIN_LABEL, WebviewUrl::External(url))
                 .title("登录小米账号 · 获取 MiMo 套餐用量")
                 .inner_size(480.0, 760.0)

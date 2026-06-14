@@ -166,10 +166,19 @@ mod tests {
         assert_eq!(q.windows[1].label, "每周额度");
         // percentage=已用 → 剩余 = 100 - 已用
         let h = win(&q, "5 小时额度").expect("5h");
-        assert!((h.remaining_percent - 78.0).abs() < 1e-6, "5h 已用 22 → 剩 78");
-        assert!(h.reset_rfc3339.is_some(), "5h 重置时刻应解析自 nextResetTime");
+        assert!(
+            (h.remaining_percent - 78.0).abs() < 1e-6,
+            "5h 已用 22 → 剩 78"
+        );
+        assert!(
+            h.reset_rfc3339.is_some(),
+            "5h 重置时刻应解析自 nextResetTime"
+        );
         let w = win(&q, "每周额度").expect("weekly");
-        assert!((w.remaining_percent - 75.0).abs() < 1e-6, "weekly 已用 25 → 剩 75");
+        assert!(
+            (w.remaining_percent - 75.0).abs() < 1e-6,
+            "weekly 已用 25 → 剩 75"
+        );
     }
 
     #[test]
@@ -193,7 +202,11 @@ mod tests {
         ]}});
         let q = parse_glm_quota(&j);
         assert_eq!(q.windows.len(), 1);
-        assert_eq!(win(&q, "5 小时额度").unwrap().remaining_percent, 0.0, "已用>100 → 剩 0");
+        assert_eq!(
+            win(&q, "5 小时额度").unwrap().remaining_percent,
+            0.0,
+            "已用>100 → 剩 0"
+        );
         assert!(win(&q, "每周额度").is_none(), "缺 weekly → 无该窗口");
     }
 

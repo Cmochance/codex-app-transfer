@@ -175,7 +175,8 @@ mod tests {
     fn missing_plan_item_yields_none() {
         assert!(parse_plan_remaining(&json!({})).is_none());
         // 只有补偿积分、无套餐本体 → None(不显)
-        let j = json!({"data":{"usage":{"items":[{"name":"compensation_total_token","percent":1.0}]}}});
+        let j =
+            json!({"data":{"usage":{"items":[{"name":"compensation_total_token","percent":1.0}]}}});
         assert!(parse_plan_remaining(&j).is_none());
     }
 
@@ -183,6 +184,9 @@ mod tests {
     fn period_end_parses_to_rfc3339() {
         let s = period_end_to_rfc3339("2026-06-27 23:59:59").expect("rfc3339");
         assert!(chrono::DateTime::parse_from_rfc3339(&s).is_ok());
-        assert!(s.starts_with("2026-06-27T23:59:59"), "应按 UTC 解析,实得 {s}");
+        assert!(
+            s.starts_with("2026-06-27T23:59:59"),
+            "应按 UTC 解析,实得 {s}"
+        );
     }
 }

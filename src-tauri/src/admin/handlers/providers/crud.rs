@@ -514,9 +514,7 @@ pub async fn mimo_login(Path(id): Path<String>) -> impl IntoResponse {
     let cookie = match crate::mimo_session::login_and_capture().await {
         Ok(Some(c)) => c,
         // 用户关窗 / 超时未完成 → 非错误,前端显「未登录」不弹错。
-        Ok(None) => {
-            return Json(json!({"success": true, "captured": false})).into_response()
-        }
+        Ok(None) => return Json(json!({"success": true, "captured": false})).into_response(),
         Err(e) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
     };
     // 落库到该 provider 的 mimoCookie。
