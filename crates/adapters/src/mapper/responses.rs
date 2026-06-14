@@ -23,6 +23,14 @@
 //! - 不展平 namespace,不改 tool 定义。
 //! 接进这些本项目资产会让原生上游的体验降级,故一律不碰。
 //!
+//! **本项目的 helper prompt 注入对 responses 不存在(= 已剥除)**:apply_patch /
+//! web_search 的协助优化 guidance(`responses/request.rs::apply_patch_chat_guidance_message`
+//! / `web_tools_guidance_message`)**只在 chat 转换路径注入** —— 那是给缺乏原生
+//! lark grammar / 联网工具语义的 chat function-call provider 补的。本 1:1 passthrough
+//! 不调 `responses_body_to_chat_body_*`,原生 Responses 上游自带这些能力,故这些注入
+//! prompt **结构上不会出现在 responses 请求里**(既不需要、也不应注入)。
+//! `request_passthrough_never_injects_helper_guidance` 回归测试锁死此不变量。
+//!
 //! ## Session
 //! `response_session = None` —— 透传场景上游自管 `previous_response_id`,代理不写
 //! 也不读本项目的 chat 形 `ResponseSessionCache`(形状不同,混写会被 chat 路径读坏)。
@@ -144,6 +152,24 @@ mod tests {
             );
             assert!(!plan.compact_v2);
         }
+    }
+
+    #[test]
+    fn request_passthrough_never_injects_helper_guidance() {
+        // [MOC-234] 用户约束:web_search / apply_patch 的本项目 helper prompt 注入
+        // (chat 转换路径专属)绝不能出现在 responses 请求。1:1 passthrough 不调 chat
+        // 转换,故首轮(无 previous_response_id)+ 注册 apply_patch + web_search 工具时,
+        // 出站 body 必须与入站字节完全相同(零 guidance 注入)。此测试锁死该不变量:
+        // 未来若误把 responses 路由进 chat 转换 / 加共享注入点,这里会立刻失败。
+        let inbound = br#"{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":"patch this file and search the web"}],"tools":[{"type":"custom","name":"apply_patch"},{"type":"web_search"}],"stream":true}"#;
+        let body = Bytes::from_static(inbound);
+        let plan = ResponsesPassthroughMapper
+            .map_request("/v1/responses", body.clone(), &dummy_provider())
+            .unwrap();
+        assert_eq!(
+            plan.body, body,
+            "passthrough 首轮注册 apply_patch/web_search 也必须字节级 1:1,绝不注入 helper guidance"
+        );
     }
 
     #[test]
