@@ -90,7 +90,19 @@ fn main() {
     let app = builder
         .manage(proxy_manager)
         .manage(trace_viewer_manager)
-        .register_asynchronous_uri_scheme_protocol("cas", move |_app, request, responder| {
+        .register_asynchronous_uri_scheme_protocol("cas", move |ctx, request, responder| {
+            // [MOC-211 安全] cas:// 同进程 admin API 只允许**主窗口**访问。MiMo 小米账号登录等
+            // 加载**外部页面**的 webview(label != "main")若能发 cas://localhost/api/... 即可篡改
+            // 本地 provider/settings(外部页面/被篡改脚本/重定向/MITM 拿到本地 admin API,P1);
+            // 故非主窗口一律 403、绝不转进 admin router。
+            if ctx.webview_label() != "main" {
+                let resp = tauri::http::Response::builder()
+                    .status(403)
+                    .body(b"forbidden: cas scheme is restricted to the main webview".to_vec())
+                    .unwrap();
+                responder.respond(resp);
+                return;
+            }
             let router = app_router_for_protocol.clone();
             tauri::async_runtime::spawn(async move {
                 let response = handle_cas_request(router, request).await;
