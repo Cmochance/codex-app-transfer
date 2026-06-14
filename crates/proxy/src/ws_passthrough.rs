@@ -31,7 +31,6 @@ use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket};
 use axum::http::HeaderMap;
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::{CloseCode, Message as UpMessage, Upgrade, WebSocket as UpWebSocket};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as TungCloseCode;
@@ -255,21 +254,60 @@ pub async fn proxy_responses_upstream_ws(
         );
     }
 
-    // 建 TCP:直连 or 经 VPN HTTP-CONNECT 代理(CONNECT 时发**域名**让代理端解析,绕开客户端
-    // fake-ip → 这是 reqwest-websocket 走代理 426、tokio-tungstenite 能通的关键差异)。
-    let tcp = match establish_upstream_tcp(&host, port).await {
-        Ok(s) => s,
-        Err(e) => {
-            telemetry
-                .logs
-                .add("WARN", format!("[responses-ws] 上游 TCP/CONNECT 失败: {e}"));
-            close_client(client_socket, "upstream connect failed").await;
-            return;
+    // 建到上游的隧道:有 VPN 代理(见 [`vpn_http_proxy`])走 **SOCKS5**(proxy 端解析域名拿真实
+    // IP,绕开客户端 fake-ip —— 实测 HTTP-CONNECT 隧道对部分上游卡住/426,SOCKS 能到达真实
+    // 端点);无代理直连。隧道流交给 [`relay_upstream`] 做 TLS+WS 握手 + 双向 relay。
+    match vpn_http_proxy() {
+        Some(proxy) => {
+            let Some((ph, pp)) = parse_authority(&proxy) else {
+                telemetry.logs.add(
+                    "WARN",
+                    format!("[responses-ws] 代理 URL 无 host:port: {proxy}"),
+                );
+                close_client(client_socket, "bad proxy url").await;
+                return;
+            };
+            telemetry.logs.add(
+                "INFO",
+                format!("[responses-ws] 经 SOCKS5 代理 {ph}:{pp} → {host}:{port}"),
+            );
+            // target 用域名(非预解析 IP)→ SOCKS5h 语义,proxy 端解析。
+            match tokio_socks::tcp::Socks5Stream::connect((ph.as_str(), pp), (host.as_str(), port))
+                .await
+            {
+                Ok(s) => relay_upstream(client_socket, request, s, first_frame).await,
+                Err(e) => {
+                    telemetry
+                        .logs
+                        .add("WARN", format!("[responses-ws] SOCKS5 连接失败: {e}"));
+                    close_client(client_socket, "socks5 connect failed").await;
+                }
+            }
         }
-    };
+        None => match TcpStream::connect((host.as_str(), port)).await {
+            Ok(s) => relay_upstream(client_socket, request, s, first_frame).await,
+            Err(e) => {
+                telemetry
+                    .logs
+                    .add("WARN", format!("[responses-ws] 上游直连失败: {e}"));
+                close_client(client_socket, "upstream connect failed").await;
+            }
+        },
+    }
+}
 
-    // TLS(rustls + webpki-roots)+ WS 握手 over 隧道流,tokio-tungstenite(Codex 同款栈)。
-    let mut upstream = match tokio_tungstenite::client_async_tls(request, tcp).await {
+/// 在已建立的明文隧道流(SOCKS5 / 直连)上做 TLS+WS 握手(`client_async_tls`,rustls+webpki-roots),
+/// 发首帧,再 [`tung_pump`] 双向 relay。握手 / 写首帧失败 → 给 Codex 发 Close。泛型适配两种流类型。
+async fn relay_upstream<S>(
+    client_socket: WebSocket,
+    request: axum::http::Request<()>,
+    stream: S,
+    first_frame: AxMessage,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let telemetry = proxy_telemetry();
+    let mut upstream = match tokio_tungstenite::client_async_tls(request, stream).await {
         Ok((ws, _resp)) => ws,
         Err(e) => {
             // tungstenite Error::Http 的 Display 含状态码(如 401/426),便于定位鉴权 vs 路由。
@@ -284,8 +322,6 @@ pub async fn proxy_responses_upstream_ws(
         "INFO",
         "[responses-ws] 上游 WS 建立,首帧发送 + 双向 relay 开始".to_string(),
     );
-
-    // 已从 Codex 读到的首帧(response.create)原样发上游,再进双向 pump(后续帧 1:1 relay)。
     if upstream.send(ax_to_tung(first_frame)).await.is_err() {
         telemetry
             .logs
@@ -334,72 +370,6 @@ fn insert_responses_upstream_auth(h: &mut axum::http::HeaderMap, resolved: &Reso
             }
         }
     }
-}
-
-/// 建到上游 `host:port` 的 TCP:有 VPN 代理(见 [`vpn_http_proxy`])则走 **HTTP-CONNECT**
-/// 隧道(`CONNECT host:port`,发**域名**让代理端解析真实 IP,绕开客户端 fake-ip);无则直连。
-/// 返回可直接交给 `client_async_tls` 做 TLS+WS 握手的明文流。
-async fn establish_upstream_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    let Some(proxy) = vpn_http_proxy() else {
-        return TcpStream::connect((host, port)).await;
-    };
-    let Some((ph, pp)) = parse_authority(&proxy) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("bad proxy url: {proxy}"),
-        ));
-    };
-    proxy_telemetry().logs.add(
-        "INFO",
-        format!("[responses-ws] 经 HTTP-CONNECT 代理 {ph}:{pp} → {host}:{port}"),
-    );
-    let mut s = TcpStream::connect((ph.as_str(), pp)).await?;
-    let connect = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
-    s.write_all(connect.as_bytes()).await?;
-    let status = read_connect_status(&mut s).await?;
-    if !(200..300).contains(&status) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("proxy CONNECT 返回 {status}"),
-        ));
-    }
-    Ok(s)
-}
-
-/// 读 HTTP-CONNECT 响应,解析首行状态码(读到 `\r\n\r\n` 头结束为止;逐字节、响应很小)。
-async fn read_connect_status(s: &mut TcpStream) -> std::io::Result<u16> {
-    let mut buf: Vec<u8> = Vec::with_capacity(128);
-    let mut byte = [0u8; 1];
-    loop {
-        if s.read(&mut byte).await? == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "proxy 在 CONNECT 期间关闭",
-            ));
-        }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
-        }
-        if buf.len() > 8192 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "CONNECT 响应头过大",
-            ));
-        }
-    }
-    let head = String::from_utf8_lossy(&buf);
-    let first = head.lines().next().unwrap_or("");
-    first
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse::<u16>().ok())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("无法解析 CONNECT 状态行: {first}"),
-            )
-        })
 }
 
 /// 从代理 URL 取 `host`/`port`(剥 scheme + userinfo + path)。无显式端口 → None(.env 的代理

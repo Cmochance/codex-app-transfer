@@ -31,6 +31,9 @@ reqwest-websocket = "0.6"
 # tokio-tungstenite 自管连接(手动 HTTP-CONNECT 时发域名让代理端解析)。`client_async_tls`
 # 用 rustls + webpki-roots 在隧道流上做 TLS+WS 握手。remote-control 仍用 reqwest-websocket。
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+# [MOC-234] 经 VPN 代理建上游 WS 隧道走 SOCKS5(proxy 端解析域名,绕开客户端 fake-ip)——
+# 实测 HTTP-CONNECT 隧道对部分上游会卡住/426,SOCKS 能到达真实端点(websocat 验证)。
+tokio-socks = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
