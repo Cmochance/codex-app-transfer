@@ -252,6 +252,15 @@
                 </div>
                 <p class="field-hint" id="providerWebSearchHint" data-i18n="providersAdd.webSearchEnabledHint.default">启用后代理在出站请求注入 web_search 工具,让模型联网搜索。计费 / 限制取决于 provider。</p>
               </div>
+              <!-- [MOC-211] MiMo Token Plan 套餐用量:登录小米账号抓 session(httpOnly,API key 查不到额度) -->
+              <div class="mb-4" id="providerMimoLoginRow" hidden>
+                <label class="form-label" data-i18n="providersAdd.mimoLogin.label">套餐用量额度</label>
+                <div class="d-flex align-items-center gap-2">
+                  <button type="button" class="btn btn-outline-secondary btn-sm" id="providerMimoLoginBtn" data-i18n="providersAdd.mimoLogin.button">登录小米账号</button>
+                  <span class="field-hint mb-0" id="providerMimoLoginStatus"></span>
+                </div>
+                <p class="field-hint" id="providerMimoLoginHint" data-i18n="providersAdd.mimoLogin.hint">MiMo 套餐用量需登录小米账号(用量接口不认 API Key)。点击在内嵌窗口登录,完成后用于在 Codex 用量面板显示套餐余量。</p>
+              </div>
               <section class="provider-mapping-section">
                 <div class="section-title-row">
                   <div>
