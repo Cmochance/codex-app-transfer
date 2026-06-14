@@ -18,6 +18,8 @@ pub mod context_breakdown;
 pub mod converter;
 // MOC-168: sessions.db 每条消息内容寻址外置(收文字/tool 侧逐轮快照重复)。
 mod message_store;
+// [MOC-234] responses 1:1 passthrough 的只读会话观测镜像(供 responses 原生 breakdown 拼全历史)。
+pub mod passthrough_observe;
 pub mod request;
 pub mod session;
 pub mod stream;
@@ -39,6 +41,7 @@ pub(crate) use converter::{extract_apply_patch_input, extract_custom_tool_input}
 // status=incomplete,对齐 #322 MOC-57 破坏性半应用防护)。V4aError 不具名导出 —— 调用方
 // 经 `validate_v4a_syntax(..).err()` 类型推断读 line/message(pub(crate) 字段),无需 re-export。
 pub(crate) use converter::validate_v4a_syntax;
+pub use passthrough_observe::{global_passthrough_observe_store, PassthroughObserveStore};
 pub use request::{
     responses_body_to_chat_body, responses_body_to_chat_body_for_provider,
     responses_body_to_chat_body_for_provider_with_session,
