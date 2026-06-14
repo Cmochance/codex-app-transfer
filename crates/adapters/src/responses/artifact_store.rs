@@ -24,6 +24,11 @@ pub struct StoredToolArtifact {
     pub kind: String,
     pub original_chars: usize,
     pub original_lines: usize,
+    /// 是否已**持久化到共享 `tool_artifacts.db`**(而非仅落 proxy 进程内存的降级 fallback)。
+    /// 跨进程的 `read_tool_artifact`(`--mcp-serve-webfetch` 进程)只能读 DB,读不到内存档 ——
+    /// 故仅当 `persisted=true` 时压缩摘要才告知模型「可调 read_tool_artifact 取回」,否则会给一个
+    /// reader 看不到的 id、把回取变成 miss/重跑(MOC-235 review #4)。
+    pub persisted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,18 +122,29 @@ impl ToolArtifactStore {
             last_access_unix: now,
             access_count: 0,
         };
-        let stored = record.to_stored();
+        let mut stored = record.to_stored();
 
-        if let Err(e) = self.persist_save(&record) {
-            log_artifact_warning(
-                "TOOL_ARTIFACT_DB_SAVE_FAILED",
-                format!(
-                    "save artifact_id={} failed: {e}; falling back to in-memory store",
-                    record.artifact_id
-                ),
-            );
-            self.save_in_memory(record);
-        }
+        // persisted = 真的写进了共享 DB。false(无 DB / INSERT 失败)→ 落 proxy 进程内存兜底,
+        // 但跨进程 read_tool_artifact 读不到 → 摘要据此不告知可回取(MOC-235 review #4)。
+        stored.persisted = match self.persist_save(&record) {
+            Ok(persisted) => {
+                if !persisted {
+                    self.save_in_memory(record);
+                }
+                persisted
+            }
+            Err(e) => {
+                log_artifact_warning(
+                    "TOOL_ARTIFACT_DB_SAVE_FAILED",
+                    format!(
+                        "save artifact_id={} failed: {e}; falling back to in-memory store",
+                        record.artifact_id
+                    ),
+                );
+                self.save_in_memory(record);
+                false
+            }
+        };
 
         stored
     }
@@ -222,12 +238,12 @@ impl ToolArtifactStore {
         );
     }
 
-    fn persist_save(&self, record: &ToolArtifactRecord) -> rusqlite::Result<()> {
+    /// 把 record 写进共享 DB。`Ok(true)` = 已持久化;`Ok(false)` = 无 DB(未持久化, 由 caller
+    /// 落内存兜底);`Err` = INSERT 失败(同样由 caller 落内存)。返回值供 [`save`] 标 `persisted`。
+    fn persist_save(&self, record: &ToolArtifactRecord) -> rusqlite::Result<bool> {
         let mut guard = self.db.lock().expect("artifact store db mutex poisoned");
         let Some(conn) = guard.as_mut() else {
-            drop(guard);
-            self.save_in_memory(record.clone());
-            return Ok(());
+            return Ok(false);
         };
         conn.execute(
             "INSERT INTO tool_artifacts \
@@ -245,7 +261,7 @@ impl ToolArtifactStore {
                 record.last_access_unix
             ],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     fn persist_load(&self, artifact_id: &str) -> rusqlite::Result<Option<ToolArtifactRecord>> {
@@ -318,6 +334,7 @@ impl ToolArtifactRecord {
             kind: self.kind.clone(),
             original_chars: self.original_chars,
             original_lines: self.original_lines,
+            persisted: false, // 由 save() 按 persist_save 结果覆盖
         }
     }
 }
@@ -491,6 +508,29 @@ mod tests {
         assert!(read_tool_artifact_raw("   ")
             .expect("blank id is not an error")
             .is_none());
+    }
+
+    #[test]
+    fn save_marks_persisted_only_when_db_backed() {
+        // MOC-235 review #4: persisted 必须如实反映「是否进了共享 DB」—— 跨进程 reader 只能读 DB,
+        // 摘要据此决定要不要告知模型可回取(内存档不告知, 否则给一个 reader 看不到的 id)。
+        let mem = ToolArtifactStore::new(8, Duration::from_secs(60));
+        assert!(
+            !mem.save(Some("c"), "command_output", "raw").persisted,
+            "无 DB 的内存档不应标 persisted"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _warn) = ToolArtifactStore::with_db_path(
+            8,
+            Duration::from_secs(60),
+            DEFAULT_PERSISTED_TTL,
+            &dir.path().join("a.db"),
+        );
+        assert!(
+            db.save(Some("c"), "command_output", "raw").persisted,
+            "写入共享 DB 成功应标 persisted"
+        );
     }
 
     #[test]
