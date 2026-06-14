@@ -2,7 +2,7 @@
    pages/providers.css — 提供商 page 大段
    layer1: 642-720 (.preset-list / .preset-item / .provider-logo / .preset-logo) + 721-805 (.table-panel / .provider-table-header / .provider-row / .drag-handle / .provider-name / .truncate / .row-actions)
           + 809-865 (.mapping-stack / .mapping-card / .mapping-icon / .alias-pill / .source-model)
-   layer2: 2018-2020 (#page-providers .page-title hide) + 2212-2398 (provider-switch-card 大段 + preset-card + provider-actions + active-indicator)
+   layer2: 2212-2398 (provider-switch-card 大段 + preset-card + provider-actions + active-indicator)
           + 2398-2440 (.speed-result / .provider-feedback / .usage-result)
           + 2442-2734 (.provider-mapping-section / .api-format-* / .form-mapping-* / .mapping-slot-* / .preset-options / .preset-option-item / .preset-notice / .apply-explain)
           + 2736-2818 (.preset-notice 续 / .apply-explain / .desktop-explain 部分 — desktop-explain 已归 dashboard, 2819-2821 单独放过去)
@@ -234,10 +234,6 @@
 }
 
 /* === Layer 2: compact desktop === */
-
-#page-providers .page-title {
-  display: none;
-}
 
 .provider-switch-card {
   display: grid;
