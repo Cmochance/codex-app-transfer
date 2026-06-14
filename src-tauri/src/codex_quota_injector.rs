@@ -1332,7 +1332,13 @@ pub async fn run_quota_daemon() {
         let mimo = fetch_mimo_quota(&quota_http, &mut mimo_cache).await;
         let deepseek = fetch_deepseek_quota(&quota_http, &mut deepseek_cache).await;
         let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
-        let quota = antigravity.or(glm).or(mimo).or(deepseek).or(anyrouter);
+        // 取活动那个源(互斥,最多一个 Some);空额度(无窗口无条目)→ 视作无,不显额度行。
+        let quota = antigravity
+            .or(glm)
+            .or(mimo)
+            .or(deepseek)
+            .or(anyrouter)
+            .filter(ProviderQuota::has_any);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
         match push_via_cdp(payload).await {
