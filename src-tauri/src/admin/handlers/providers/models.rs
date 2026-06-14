@@ -259,16 +259,6 @@ pub(crate) fn chat_filter_pooled_value(pooled: &Value) -> Value {
     )
 }
 
-fn usable_model_ids(model_ids: &[String]) -> Vec<String> {
-    let usable = chat_usable_model_ids(model_ids);
-    if usable.is_empty() {
-        // suggest_model_mappings 等场景:全被过滤时退回原列表,保证映射下拉不空。
-        model_ids.to_vec()
-    } else {
-        usable
-    }
-}
-
 fn pick_model(model_ids: &[String], keywords: &[&str], fallback_index: usize) -> String {
     for keyword in keywords {
         for model_id in model_ids {
@@ -293,7 +283,11 @@ fn empty_model_mappings_value() -> Value {
 }
 
 fn suggest_model_mappings(model_ids: &[String]) -> Value {
-    let usable = usable_model_ids(model_ids);
+    // 用 no-fallback 的 chat 过滤:**只含 embedding/rerank 的 provider 不应自动推荐**一个非 chat
+    // 模型当 default —— 否则池化的「pooledModels 空 → 回退槽位映射」会把该 embedding 漏进
+    // Codex chat picker(bot review P2)。正常 provider(有 chat 模型)行为不变(此时与
+    // usable_model_ids 结果一致)。
+    let usable = chat_usable_model_ids(model_ids);
     let mut result = empty_model_mappings_value();
     if usable.is_empty() {
         return result;

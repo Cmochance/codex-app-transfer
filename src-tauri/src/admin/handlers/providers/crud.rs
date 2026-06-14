@@ -440,12 +440,31 @@ pub async fn update_provider(
                 updated.insert("models".into(), Value::Object(merged));
             }
         }
-        // 池化:带 pooledModels 就更新(chat-only 过滤;前端把 fetched + mappings 合并下发;不带=不动)。
+        // 池化:带 pooledModels 就**合并**进现有(chat-only 过滤;现有 ∪ 新增,去重,**永不收缩**)。
+        // 合并而非替换是关键(bot review P2):表单保存的 incoming 源自易失的下拉缓存,fetch 失败 /
+        // 部分态会让它只剩 1-5 个映射值;若替换就会把已持久化的完整池删剩映射。合并兜底:既保留
+        // 用户手加 / 已抓取的,又纳入本次映射里的新模型。不带该字段 = 完全不动。
         if let Some(pooled) = input.pooled_models.clone() {
-            updated.insert(
-                "pooledModels".into(),
-                super::models::chat_filter_pooled_value(&pooled),
-            );
+            let incoming = super::models::chat_filter_pooled_value(&pooled);
+            let mut merged: Vec<Value> = existing
+                .get("pooledModels")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut seen: std::collections::HashSet<String> = merged
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            if let Some(arr) = incoming.as_array() {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        if seen.insert(s.to_owned()) {
+                            merged.push(v.clone());
+                        }
+                    }
+                }
+            }
+            updated.insert("pooledModels".into(), Value::Array(merged));
         }
         updated.insert("id".into(), Value::String(id.clone()));
         updated.insert("isBuiltin".into(), Value::Bool(is_builtin));
