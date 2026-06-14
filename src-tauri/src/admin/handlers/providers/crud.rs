@@ -181,6 +181,11 @@ pub struct AddProviderInput {
     /// 回退复用主模型)。经 `Provider.extra` flatten 透传持久化为 `reviewModelSlot`。
     #[serde(rename = "reviewModelSlot")]
     pub review_model_slot: Option<String>,
+    /// 池化模式的可选模型列表(用户「获取模型」拉取 + 手加),按 provider 隔离持久化为
+    /// `pooledModels`(经 `Provider.extra` flatten)。catalog 池化(`unique_pool_slugs` /
+    /// `pooled_model_ids`)优先用它,为空才回退槽位映射。`None` = 本次不改动该字段。
+    #[serde(rename = "pooledModels")]
+    pub pooled_models: Option<Value>,
 }
 
 pub async fn add_provider(
@@ -284,6 +289,10 @@ pub async fn add_provider(
                 json!({"default":"","gpt_5_5":"","gpt_5_4":"","gpt_5_4_mini":"","gpt_5_3_codex":"","gpt_5_2":""})
             }),
         );
+        // 池化:加 provider 时若带了已抓取/手加的模型列表,持久化为 pooledModels(按 provider 隔离)。
+        if let Some(pooled) = input.pooled_models.clone() {
+            new_provider.insert("pooledModels".into(), pooled);
+        }
         new_provider.insert(
             "extraHeaders".into(),
             input.extra_headers.clone().unwrap_or_else(|| json!({})),
@@ -427,6 +436,10 @@ pub async fn update_provider(
                 }
                 updated.insert("models".into(), Value::Object(merged));
             }
+        }
+        // 池化:带 pooledModels 就更新(前端把 fetched + 手加合并后整列表下发;不带 = 不动)。
+        if let Some(pooled) = input.pooled_models.clone() {
+            updated.insert("pooledModels".into(), pooled);
         }
         updated.insert("id".into(), Value::String(id.clone()));
         updated.insert("isBuiltin".into(), Value::Bool(is_builtin));

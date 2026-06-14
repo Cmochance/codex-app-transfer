@@ -606,6 +606,17 @@ pub async fn autofill_provider_models(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    // 池化:把抓取到的可用模型 id 写入 pooledModels(去 embedding/rerank 等);**合并**而非
+    // 覆盖 —— 保留用户手加的、追加新上游的(「重新获取只负责更新列表」,守 no-silent-destructive)。
+    let fetched_pool_ids: Vec<String> = result
+        .get("models")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            let ids: Vec<String> = arr.iter().filter_map(model_id_from_item).collect();
+            usable_model_ids(&ids)
+        })
+        .unwrap_or_default();
+
     // 真 mutate + save 走 atomic RMW
     let suggested_for_closure = suggested.clone();
     let write_result = with_config_write(|cfg| {
@@ -616,6 +627,22 @@ pub async fn autofill_provider_models(
         if let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) {
             if let Some(provider) = providers.get_mut(idx).and_then(|v| v.as_object_mut()) {
                 provider.insert("models".into(), suggested_for_closure.clone());
+                // pooledModels 合并:现有(含手加)在前,新抓取去重追加。
+                let mut pooled: Vec<Value> = provider
+                    .get("pooledModels")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut seen: HashSet<String> = pooled
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+                for id in &fetched_pool_ids {
+                    if seen.insert(id.clone()) {
+                        pooled.push(Value::String(id.clone()));
+                    }
+                }
+                provider.insert("pooledModels".into(), Value::Array(pooled));
                 return Ok(ConfigMutation::Modified(()));
             }
         }

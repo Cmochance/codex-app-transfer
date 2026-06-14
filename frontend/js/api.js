@@ -142,6 +142,8 @@
       isBuiltin: !!provider.isBuiltin,
       // [MOC-173] auto-review 审查模型槽位 key(gpt_5_X);显式挑字段,不加这行前端拿不到后端返的值。
       reviewModelSlot: provider.reviewModelSlot || '',
+      // 池化:按 provider 持久化的可选模型列表(显式挑字段,否则被这层 mapper 静默丢)。
+      pooledModels: Array.isArray(provider.pooledModels) ? provider.pooledModels : [],
       mappings: {
         default: models.default || '',
         gpt_5_5: models.gpt_5_5 || '',
@@ -210,6 +212,10 @@
     // check 命中报错。passthrough 后 backend 正常持久化到 provider.grokWeb
     if (payload.grokWeb) {
       body.grokWeb = payload.grokWeb;
+    }
+    // 池化:带 pooledModels 才下发(数组),让后端 add/update 持久化;不带 = 后端保留现值。
+    if (Array.isArray(payload.pooledModels)) {
+      body.pooledModels = payload.pooledModels;
     }
     return body;
   }
