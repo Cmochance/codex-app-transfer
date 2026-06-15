@@ -179,9 +179,13 @@ pub fn desktop_config_target_for_provider(
         .trim()
         .to_owned();
     let direct_api_key = provider_api_key(provider);
+    // 整合模式必须走本地代理(池按 catalog slug 分流到各上游)→ 即便 active provider 是
+    // responses 直连,也不能 bypass,否则 Codex 直连该 provider、绕过整合池(#477 用户反馈:
+    // 整合开了但 Codex 用的还是开整合前的 provider 配置)。
     let bypass_proxy = matches!(api_format_lower.as_str(), "responses" | "openai_responses")
         && !provider_base_url.is_empty()
-        && !direct_api_key.is_empty();
+        && !direct_api_key.is_empty()
+        && !read_setting_bool(cfg, "exposeAllProviderModels", false);
 
     let codex_network_access = crate::admin::handlers::proxy::read_codex_network_access(cfg);
 

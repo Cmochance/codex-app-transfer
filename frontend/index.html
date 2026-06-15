@@ -333,9 +333,14 @@
           </article>
 
           <article class="panel pool-panel">
-            <div class="pool-panel-header">
-              <h2 data-i18n="providers.integrationMappingTitle">模型映射(进 Codex)</h2>
-              <p data-i18n="providers.integrationMappingHint">把 Codex 标准档映射到池中某「提供商 / 模型」。Codex 模型列表里只显示**映射了的**标准档,选某档即走你映射的上游;未映射的档不显示。</p>
+            <div class="pool-panel-header with-apply">
+              <div>
+                <h2 data-i18n="providers.integrationMappingTitle">模型映射(进 Codex)</h2>
+                <p data-i18n="providers.integrationMappingHint">把 Codex 标准档映射到池中某「提供商 / 模型」。Codex 模型列表里只显示映射了的标准档,选某档即走你映射的上游;未映射的档不显示。</p>
+              </div>
+              <button class="btn btn-primary btn-lg integration-apply-btn" id="integrationApplyBtn" type="button" data-action="apply-integration">
+                <i class="bi bi-download"></i><span data-i18n="providers.integrationApply">应用整合并重启 Codex</span>
+              </button>
             </div>
             <div class="pool-slot-mappings" id="poolSlotMappings"></div>
           </article>

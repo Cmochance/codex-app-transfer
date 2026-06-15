@@ -4143,6 +4143,31 @@
       }
 
       // ── 整合页模型池操作 ────────────────────────────────────────────────
+      // 应用整合配置到 Codex(整合模式专用「启用」入口 —— 单 provider「应用/启用」已锁定):
+      // 写 config.toml(整合池 catalog + 代理 base_url)→ 确保代理在跑 → 重启 Codex 生效。
+      if (action === "apply-integration") {
+        actionEl.disabled = true;
+        try {
+          const result = await CCApi.configureDesktop();
+          if (result && result.requiresProxy) {
+            await CCApi.startProxy();
+          }
+          showToast(t("toast.integrationApplied"));
+          await renderDashboard();
+          // 重启 Codex 让新 config.toml(整合 catalog)生效;restartCodexAppNow 自带非 app
+          // 启动场景的兜底(失败只提示,不抛)。
+          await restartCodexAppNow({
+            buttonId: "integrationApplyBtn",
+            fallbackLabelKey: "providers.integrationApply",
+            hideModal: false,
+          });
+        } catch (e) {
+          showToast(e.message || t("toast.requestFailed"));
+        } finally {
+          actionEl.disabled = false;
+        }
+      }
+
       if (action === "pool-add-provider") {
         const pid = actionEl.dataset.id;
         actionEl.disabled = true;

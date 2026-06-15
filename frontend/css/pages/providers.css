@@ -519,6 +519,19 @@
   margin-bottom: 14px;
 }
 
+/* 「模型映射」区头部:标题块左、应用按钮右(整合模式的「启用」入口) */
+.pool-panel-header.with-apply {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.integration-apply-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .pool-panel-header h2 {
   margin: 0 0 4px;
   font-size: 16px;
