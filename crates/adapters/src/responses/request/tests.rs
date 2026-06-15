@@ -1,9 +1,8 @@
-use super::tools::*;
 use super::*;
 use crate::types::AdapterError;
 use codex_app_transfer_registry::Provider;
 use indexmap::IndexMap;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 fn convert(body: Value) -> Value {
     responses_body_to_chat_body(&body).unwrap()
@@ -1256,15 +1255,30 @@ fn web_search_dropped_for_all_providers_even_with_flag_enabled() {
     // drop,该 flag 不再有任何效果。逐 provider 验证:web_search 被丢、同 turn 的
     // 普通 function 工具保留、不再注入 Kimi thinking disabled。
     for (id, name, base, model) in [
-        ("xiaomimimo", "MiMo", "https://api.xiaomimimo.com/v1", "mimo-v2.5"),
+        (
+            "xiaomimimo",
+            "MiMo",
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5",
+        ),
         (
             "kimi-for-coding",
             "Kimi",
             "https://api.kimi.com/coding/v1",
             "kimi-for-coding",
         ),
-        ("moonshot", "Moonshot", "https://api.moonshot.cn/v1", "kimi-k2.6"),
-        ("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-v4-pro"),
+        (
+            "moonshot",
+            "Moonshot",
+            "https://api.moonshot.cn/v1",
+            "kimi-k2.6",
+        ),
+        (
+            "deepseek",
+            "DeepSeek",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-pro",
+        ),
     ] {
         let mut p = ws_chat_provider(id, name, base, model);
         // 即便用户显式开 web_search_enabled=true 也不再生效
