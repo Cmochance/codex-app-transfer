@@ -244,14 +244,6 @@
                 </details>
                 <p class="field-hint text-warning" data-i18n="grokWeb.tosWarning">⚠️ 反代 grok.com Web 端,grok TOS 灰色,仅限个人使用本机 SuperGrok 账号,不应作为对外服务发布。</p>
               </div>
-              <div class="mb-4" id="providerWebSearchRow" hidden>
-                <label class="form-label" data-i18n="providersAdd.webSearchEnabled">联网搜索</label>
-                <div class="form-check form-switch">
-                  <input class="form-check-input" type="checkbox" id="providerWebSearchEnabled">
-                  <label class="form-check-label" for="providerWebSearchEnabled" data-i18n="providersAdd.webSearchEnabledToggle">启用 web_search 工具</label>
-                </div>
-                <p class="field-hint" id="providerWebSearchHint" data-i18n="providersAdd.webSearchEnabledHint.default">启用后代理在出站请求注入 web_search 工具,让模型联网搜索。计费 / 限制取决于 provider。</p>
-              </div>
               <!-- [MOC-211] MiMo Token Plan 套餐用量:登录小米账号抓 session(httpOnly,API key 查不到额度) -->
               <div class="mb-4" id="providerMimoLoginRow" hidden>
                 <label class="form-label" data-i18n="providersAdd.mimoLogin.label">套餐用量额度</label>
@@ -599,7 +591,7 @@
             <strong data-i18n="settings.codexNetworkAccess">允许 Codex 联网工具（全权限模式）</strong>
             <div>
               <label class="switch-label only-switch"><input type="checkbox" id="codexNetworkAccess"><span class="switch-ui"></span></label>
-              <p class="settings-note" data-i18n="settings.codexNetworkAccessHint">⚠️ 默认关闭（全权限有风险）。开启后让 Codex 走 danger-full-access 沙箱 + approval_policy=never（Codex 官方推荐的 "Full access" 配对）：模型可以读写任何文件、用 curl / wget 等联网命令获取实时网页，且所有命令无审批弹窗。**等于完全信任模型**。默认（关闭）时 Codex 走 read-only 沙箱 + on-request 审批：无网络，仅能用所选模型自带的 web_search 能力；若模型不支持 web_search，则完全无法联网搜索。</p>
+              <p class="settings-note" data-i18n="settings.codexNetworkAccessHint">⚠️ 默认关闭（全权限有风险）。开启后让 Codex 走 danger-full-access 沙箱 + approval_policy=never（Codex 官方推荐的 "Full access" 配对）：模型可以读写任何文件、用 curl / wget 等联网命令获取实时网页，且所有命令无审批弹窗。**等于完全信任模型**。默认（关闭）时 Codex 走 read-only 沙箱 + on-request 审批：无网络；第三方 provider 原生 web_search 已在协议层 drop（MOC-208），联网搜索改走自研 web_search / web_fetch 工具（需开启「内置联网抓取工具」）。</p>
             </div>
           </div>
           <div class="settings-row settings-row-stack">

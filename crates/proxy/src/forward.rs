@@ -445,10 +445,6 @@ pub async fn forward_handler(
     let adapter = state
         .adapters
         .lookup_for_request(&resolved.provider.api_format, &client_path);
-    // 保留一份原始 body_bytes(model 已 rewrite + strip 过),供 web_search
-    // transparent retry 路径重新调用 prepare_request 用 —— retry 时 cache 已
-    // disable web_search,prepare_request 会输出不带 web_search 工具的 body。
-    let original_body_bytes_for_retry = body_bytes.clone();
     let mut plan = adapter.prepare_request(&client_path, body_bytes, &resolved.provider)?;
 
     // 5. 拼上游 URL —— base 末尾去 `/`,plan.upstream_path 必含 `/`
@@ -497,20 +493,15 @@ pub async fn forward_handler(
     )
     .await?;
 
-    // ── A+B web_search transparent retry ──
-    // 上游 web search 拒绝时(MiMo Token Plan 套餐没开 Web Search Plugin):
-    //   { "code": "400", "param": "web search tool found in the request body,
-    //     but webSearchEnabled is false" }
-    // **不能透传 4xx 给 Codex.app** —— 实测它收到 JSON error body 后期待
+    // ── 4xx transparent retry(orphan function_call 上下文重建)──
+    // 上游 400 不能直接透传给 Codex.app —— 实测它收到 JSON error body 后期待
     // SSE 流而卡 Thinking,不会让用户看到错误,也不会自动重试触发下一 turn。
-    // 必须 transparent retry:① disable cache → ② 重新 prepare_request(B 层
-    // cache 命中 web_search 被 drop)→ ③ 重发上游 + 用新响应替代 4xx →
-    // 客户端只感知到正常 SSE 流。用户视角:无感降级,session 内后续 turn 都
-    // 不再发 web_search,直到用户在 UI 重新打开开关 / 应用重启。
+    // 唯一可透明修复的 400 是 orphan function_call(见下),其余 4xx 原样保存
+    // 交下游 adapter 包成 response.failed。
     //
     // 用 Option<Response> + Option<(status, headers, body)> 二选一表示状态:
     //   live_resp = Some + captured_4xx = None → resp 活着(成功 / 5xx / retry 后)
-    //   live_resp = None + captured_4xx = Some  → 非 web_search 4xx,resp 已消费
+    //   live_resp = None + captured_4xx = Some  → 不可修复的 4xx,resp 已消费
     let mut live_resp: Option<reqwest::Response> = Some(initial_resp);
     let mut captured_4xx: Option<(http::StatusCode, reqwest::header::HeaderMap, Bytes)> = None;
     let need_retry_check = live_resp
@@ -525,61 +516,16 @@ pub async fn forward_handler(
             Ok(b) => b,
             Err(e) => {
                 // H2 修复:静默吞错改为 telemetry log。上游 4xx body read 失败时,
-                // web_search retry 检测会失效(is_web_search_upstream_reject 拿空 body
+                // orphan 重建检测会失效(is_orphan_function_call_error 拿空 body
                 // → false → 不进 retry 路径),用户看不到 root cause。
                 telemetry.logs.add(
                     "WARN",
-                    format!("upstream {st} body read failed during web_search retry check: {e}",),
+                    format!("upstream {st} body read failed during 4xx retry check: {e}",),
                 );
                 Bytes::new()
             }
         };
-        // [reviewer] responses passthrough(api_format=responses/openai_responses)的 map_request
-        // 1:1 返回原 body(不经 B 层 cache drop web_search),故 disable_web_search_for + 重跑
-        // prepare_request 仍发同样带 web_search 的 body → 重复 POST 必被同样 400 拒,只多打一次上游、
-        // 延后客户端看到错误,违背 1:1 透传。透传场景跳过该 transparent retry,直接把 4xx 交给下游
-        // (responses mapper 包成 response.failed)。
-        let is_responses_passthrough = matches!(
-            resolved.provider.api_format.as_str(),
-            "responses" | "openai_responses"
-        );
-        if is_web_search_upstream_reject(&body_bytes) && !is_responses_passthrough {
-            codex_app_transfer_adapters::disable_web_search_for(&resolved.provider.id);
-            telemetry.logs.add(
-                "WARN",
-                format!(
-                    "auto-disabled web_search for provider {} (upstream rejected: webSearchEnabled=false), retrying without web_search...",
-                    resolved.provider.id
-                ),
-            );
-            // 重新调 prepare_request,B 层 cache 命中 → web_search 被 drop
-            plan = adapter.prepare_request(
-                &client_path,
-                original_body_bytes_for_retry,
-                &resolved.provider,
-            )?;
-            // upstream_url 不变(同一 provider,plan.upstream_path 跟 web_search 无关)
-            let pair = build_and_send_upstream(
-                &state,
-                &parts.method,
-                &parts.headers,
-                &resolved,
-                &plan.body,
-                &plan.upstream_headers,
-                &upstream_url,
-            )
-            .await?;
-            telemetry.logs.add(
-                "INFO",
-                format!(
-                    "web_search retry status {} for provider {}",
-                    pair.0.status().as_u16(),
-                    resolved.provider.id
-                ),
-            );
-            live_resp = Some(pair.0);
-            outbound_headers_snapshot = pair.1;
-        } else if codex_app_transfer_adapters::is_orphan_function_call_error(&body_bytes) {
+        if codex_app_transfer_adapters::is_orphan_function_call_error(&body_bytes) {
             // [MOC-234] orphan function_call 400 降级:store:false 反代(new-api 类)续轮找不到
             // 自己上一轮产生的 function_call,且整段会话上下文上游也没有(远端拼接失效)。用
             // always-on 会话观测镜像沿 previous_response_id 链**重建完整上下文** inline + 去掉
@@ -623,7 +569,7 @@ pub async fn forward_handler(
                 }
             }
         } else {
-            // 非 web_search / 非可修复 orphan 的 4xx,resp 已被 bytes() 消费,把三元组保存
+            // 非可修复 orphan 的 4xx,resp 已被 bytes() 消费,把三元组保存
             captured_4xx = Some((st, hs, body_bytes));
         }
     }
@@ -677,7 +623,7 @@ pub async fn forward_handler(
         HeaderMap,
         codex_app_transfer_adapters::ByteStream,
     ) = if let Some((st, hs, body)) = captured_4xx {
-        // 非 web_search 4xx,resp 已消费,用 captured 三元组
+        // 不可修复的 4xx,resp 已消费,用 captured 三元组
         log_upstream_error_diag(
             &telemetry,
             st,
@@ -1759,8 +1705,8 @@ fn intercept_image_gen_stream(
 /// 写入的名字,保证最终只有一份明确值出去。provider.extraHeaders 优先级高于
 /// adapter defaults。
 ///
-/// 抽成 helper 是为了 web_search transparent retry 路径复用同一份 header /
-/// auth 构造逻辑(forward 主路径调一次,4xx web_search 拒绝时再调一次)。
+/// 抽成 helper 是为了 4xx transparent retry 路径复用同一份 header / auth 构造
+/// 逻辑(forward 主路径调一次,orphan function_call 重建时再调一次)。
 async fn build_and_send_upstream(
     state: &ProxyState,
     method: &http::Method,
@@ -1932,40 +1878,6 @@ async fn build_and_send_upstream(
     let outbound_headers_snapshot = req.headers().clone();
     let resp = state.http.execute(req).await?;
     Ok((resp, outbound_headers_snapshot))
-}
-
-/// 检测上游 4xx 响应 body 是否是"web search plugin / Web Search 能力未开"
-/// 这一类错误。命中时 `forward.rs` 主路径会调用
-/// `adapters::disable_web_search_for(provider_id)` 把当前 provider 加入本进程
-/// 内存 disable cache,避免后续 turn 重复触发同样错误。
-///
-/// **匹配关键字**(实测覆盖):
-/// - MiMo Token Plan / 其他套餐没开 Web Search Plugin:`"webSearchEnabled is false"`
-///   / `"web search tool found"`(实测 2026-05-09 dump)
-/// - 通用兜底:`"web_search"` + `"not enabled" / "not supported" / "not activated"`
-///   未来其他 provider 可能用类似措辞,留个宽松兜底
-///
-/// 误判风险:**故意宽松**(关键字 OR 命中即触发 disable),最坏情况是用户
-/// 没开 web_search_enabled 也"被 disable"(本来就是 disabled,无副作用)。
-fn is_web_search_upstream_reject(body_bytes: &[u8]) -> bool {
-    let body = match std::str::from_utf8(body_bytes) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let lower = body.to_ascii_lowercase();
-    // 实测精确字面量(MiMo)
-    if lower.contains("websearchenabled is false")
-        || lower.contains("web search tool found in the request body")
-    {
-        return true;
-    }
-    // 通用兜底
-    let mentions_web_search = lower.contains("web_search") || lower.contains("web search");
-    let mentions_not_available = lower.contains("not enabled")
-        || lower.contains("not supported")
-        || lower.contains("not activated")
-        || lower.contains("disabled");
-    mentions_web_search && mentions_not_available
 }
 
 /// [#304] 本地记录 `session_id → 真实上游模型` 到 `~/.codex-app-transfer/session-models.jsonl`。
@@ -2861,52 +2773,6 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["model"], "deepseek-v4-pro[beta]");
         assert_eq!(v["stream"], true);
-    }
-
-    // ── is_web_search_upstream_reject 关键字识别(B 层 fallback 触发条件)──
-
-    #[test]
-    fn web_search_reject_matches_mimo_exact_literal() {
-        // MiMo Token Plan 套餐没开 Web Search Plugin 时实测错误体
-        // (2026-05-09 dump 抓到的精确字面量)
-        let body = br#"{"error":{"code":"400","message":"Param Incorrect","param":"web search tool found in the request body, but webSearchEnabled is false","type":""}}"#;
-        assert!(is_web_search_upstream_reject(body));
-    }
-
-    #[test]
-    fn web_search_reject_matches_camelcase_variant() {
-        let body = br#"{"error":"webSearchEnabled is false"}"#;
-        assert!(is_web_search_upstream_reject(body));
-    }
-
-    #[test]
-    fn web_search_reject_matches_generic_not_enabled_phrasing() {
-        // 兜底:其他 provider 可能用类似措辞
-        let body = br#"{"error":"web_search is not enabled for this account"}"#;
-        assert!(is_web_search_upstream_reject(body));
-        let body2 = br#"{"error":"web search not activated"}"#;
-        assert!(is_web_search_upstream_reject(body2));
-    }
-
-    #[test]
-    fn web_search_reject_does_not_match_unrelated_400() {
-        // 普通 400 错误不该误触发 fallback(只 disable web_search)
-        assert!(!is_web_search_upstream_reject(
-            b"{\"error\":\"Invalid model name\"}"
-        ));
-        assert!(!is_web_search_upstream_reject(
-            b"{\"error\":\"token limit exceeded\"}"
-        ));
-        assert!(!is_web_search_upstream_reject(
-            b"{\"error\":\"rate limit reached\"}"
-        ));
-    }
-
-    #[test]
-    fn web_search_reject_handles_non_utf8_safely() {
-        // 上游返回非 UTF-8 时不 panic,认为不匹配
-        let body: &[u8] = &[0xff, 0xfe, 0xfd, 0x00];
-        assert!(!is_web_search_upstream_reject(body));
     }
 
     #[test]

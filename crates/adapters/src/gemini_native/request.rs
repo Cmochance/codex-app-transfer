@@ -1030,16 +1030,17 @@ pub fn chat_normalized_to_gemini_request(
     // 返 "Built-in tools ({google_search}) and Function Calling cannot be combined
     // in the same request."
     //
-    // 处理(2026-05-11 对齐 cliproxy):**所有 Gemini 版本统一 drop `googleSearch`**,
-    // 不再注入 systemInstruction 软约束。Gemini 3+ 之前用
-    // `toolConfig.includeServerSideToolInvocations=true` 让两者共存,但用户实测发现
-    // 该参数 + 自动联网会让模型语义偏移,且 cliproxy 不实现 web_search → 维持同一行为
-    // 更可预测。模型若需要联网信息,可用 function-calling 工具(如 `exec_command + curl`)
-    // 自适应替代。
+    // 处理([MOC-208] 2026-06-15 起**无条件**;2026-05-11 起对齐 cliproxy):**所有
+    // Gemini 版本一律 drop `googleSearch`**,不再注入 systemInstruction 软约束。
+    // 原本仅在与 functionDeclarations 共存时 drop(Gemini 拒共存、返 400),但本项目
+    // 已决定关闭所有 provider 的原生 web search(改走自研 web_fetch/web_search,MOC-190),
+    // 故即便单独出现 googleSearch(无 function 工具的边界请求)也一并丢弃,不再依赖
+    // 共存条件。Gemini 3+ 之前 `toolConfig.includeServerSideToolInvocations=true` 共存
+    // 路径已弃(用户实测会让模型语义偏移)。模型需联网走自研 web_search/web_fetch。
     let has_google_search = tools
         .as_ref()
         .is_some_and(|t| t.iter().any(|tool| tool.google_search.is_some()));
-    if has_function_decls && has_google_search {
+    if has_google_search {
         if let Some(tools_vec) = tools.as_mut() {
             tools_vec.retain(|tool| tool.google_search.is_none());
             if tools_vec.is_empty() {
@@ -1047,7 +1048,7 @@ pub fn chat_normalized_to_gemini_request(
             }
         }
         tracing::info!(
-            "gemini_native: dropped wire googleSearch tool because functionDeclarations cannot coexist on Gemini (cliproxy-aligned; no soft-constraint injection)."
+            "gemini_native: dropped wire googleSearch tool (MOC-208: provider-native web search disabled, use self-built web_search/web_fetch)."
         );
     }
 
@@ -3046,20 +3047,24 @@ mod tests {
     }
 
     #[test]
-    fn responses_to_gemini_with_web_search_emits_google_search_tool() {
-        // 关键端到端回归:Codex.app /responses + tools=[web_search] →
-        // Gemini RequestBody 必须含 tools=[{googleSearch:{}}]
+    fn responses_to_gemini_with_web_search_drops_google_search_unconditionally() {
+        // [MOC-208] 关闭所有 provider 原生 web search:即便 tools 只含 web_search
+        // (无 function 工具的边界请求),也**无条件** drop googleSearch,不发上游。
+        // 模型改走自研 web_search/web_fetch。
         let body = serde_json::json!({
             "model":"gemini-3.1-pro-preview",
             "input":[{"type":"message","role":"user","content":"今天纽约天气?"}],
             "tools":[{"type":"web_search","external_web_access":true}]
         });
         let req = responses_body_to_gemini_request(&body, &dummy_provider()).unwrap();
-        let tools = req.tools.expect("tools 应存在");
+        let has_google_search = req
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|t| t.google_search.is_some()));
         assert!(
-            tools.iter().any(|t| t.google_search.is_some()),
-            "必须含 googleSearch tool;实际:{}",
-            serde_json::to_string(&tools).unwrap()
+            !has_google_search,
+            "googleSearch 必须被无条件 drop;实际 tools:{}",
+            serde_json::to_string(&req.tools).unwrap()
         );
     }
 
