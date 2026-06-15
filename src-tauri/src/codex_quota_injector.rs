@@ -1335,6 +1335,8 @@ pub async fn run_quota_daemon() {
     // 额度查询用的 http client(建一次复用)+ 45s 缓存(避免每 5s tick 打 cloudcode-pa)。
     let quota_http = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
+        // [MOC-96] connect 阶段封顶,坏系统代理下连接不再阻塞到 overall timeout。
+        .connect_timeout(Duration::from_secs(8))
         .build()
         .ok();
     let mut quota_cache: Option<(

@@ -210,8 +210,11 @@ pub fn cancel_in_flight_login() -> CancelOutcome {
 /// crash。OnceLock 存 Result 让首次失败被记忆,后续调用也直接返 Err 不重试
 /// (避免每次 login 都打一遍 panic-prone path)。
 ///
-/// **Pool 配置**:`pool_idle_timeout(30s)` 跟原 login_handler 一致,避免 long-
-/// idle 后端 keep-alive 超时被中断。
+/// **超时配置**:`pool_idle_timeout(30s)` 跟原 login_handler 一致,避免 long-
+/// idle 后端 keep-alive 超时被中断;`connect_timeout(10s)` + `timeout(30s)`
+/// 为 [MOC-96] 补 —— 原先既无 connect 也无 overall 上限,坏系统代理(Windows
+/// 注册表代理不可达)下 token exchange/refresh/userinfo 会无限挂。这些都是短
+/// 请求(非流式,真模型推理走 proxy state.http),30s 远高于真实延迟、不误切。
 ///
 /// **Why 不复用 ProxyState.http**:ProxyState 是 chat 路径专用,有自己 timeout
 /// + redirect policy。OAuth flow 想要 stricter behavior,独立 pool 边界清晰。
@@ -220,6 +223,9 @@ pub fn shared_oauth_http_client() -> Result<&'static reqwest::Client, &'static s
     let cell = CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .pool_idle_timeout(std::time::Duration::from_secs(30))
+            // [MOC-96] connect + overall 上限,见上方 doc 注释。
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| {
                 tracing::error!(

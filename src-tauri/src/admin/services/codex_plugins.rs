@@ -351,6 +351,8 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
     const MAX_TARBALL_BYTES: usize = 50 * 1024 * 1024;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
+        // [MOC-96] connect 阶段封顶,坏系统代理下连接不再阻塞到 overall timeout。
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest build: {e}"))?;
     let resp = client
