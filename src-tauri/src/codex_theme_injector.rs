@@ -1054,8 +1054,12 @@ html.electron-light,html.electron-dark,html{
 background:__BASECOLOR__ url('__HERO__') __POS__ / __FIT__ no-repeat fixed !important;
 }
 body{background:transparent !important;}
-#root > *,.app-shell,.app-shell-main,main.main-surface,.app-shell-main-content-viewport,.app-shell-main-content-frame,[class~="electron:bg-token-main-surface-primary"]{background-color:transparent !important;}
-html main.main-surface{border-radius:0 !important;}
+/* .main-surface 用类选择器、不加 main 元素限定:Codex settings/archive 页该容器是
+   div.main-surface(整页无 main 元素),元素限定会漏匹配 → 主面板留半透明+圆角 →
+   hover 局部重绘撕裂(MOC-247)。聊天页同名容器一并透明化是预期。
+   注:本模板整体嵌进 JS 模板字符串(style.textContent = ...),禁止出现反引号。 */
+#root > *,.app-shell,.app-shell-main,.main-surface,.app-shell-main-content-viewport,.app-shell-main-content-frame,[class~="electron:bg-token-main-surface-primary"]{background-color:transparent !important;}
+html .main-surface{border-radius:0 !important;}
 /* 可读性 scrim 折进 #root(normal-flow;再叠 position:fixed 层会让 backdrop-filter
    采样时 Page.captureScreenshot 死锁)。从 agent-theme 同步 3 层复合方案 —— 旧单层
    linear(mid 仅 ~0.34)对亮壁纸太弱、文字被壁纸透射压住:(1)顶部 ~42% 阻尼带平衡
@@ -1369,10 +1373,21 @@ mod tests {
                 "{id} missing top-fade rule"
             );
             assert!(
-                script.contains("main.main-surface") && script.contains("cat-theme-style"),
+                script.contains(".main-surface") && script.contains("cat-theme-style"),
                 "{id} missing transparent main / style id"
             );
         }
+        // 1.5) CSS 整体嵌进 build_inject_script 的 JS 模板字符串(`style.textContent = `...``),
+        //      模板里任何反引号都会截断字符串 → 整个注入脚本 SyntaxError、主题 CSS 全不生效
+        //      (MOC-247 review 实证)。守住 CSS 源里不得出现反引号。
+        assert!(
+            !CODEX_CSS_TEMPLATE.contains('`'),
+            "CODEX_CSS_TEMPLATE must not contain backticks (embedded in a JS template literal)"
+        );
+        assert!(
+            !CODEX_ACCENT_BLOCK.contains('`'),
+            "CODEX_ACCENT_BLOCK must not contain backticks (embedded in a JS template literal)"
+        );
         // 2) 代表性 spot-check:每套 thread 自己**独立**的 accent(证 per-theme palette
         //    接线正确,不是共享 accent)。
         for (id, accent) in [
