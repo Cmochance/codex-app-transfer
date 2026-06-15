@@ -304,6 +304,24 @@ pub(crate) fn build_compact_chat_request(
             })]
         }
     };
+    // MOC-11: compact 摘要任务只要历史的「结论」不要「过程」,剥掉历史
+    // `type=reasoning` items 省 input budget(仿 Claude Code 主动管理 stale
+    // thinking)。剥离后:
+    // - 真实 reasoning 不会被 `build_messages_from_input` 烤进 assistant 消息的
+    //   `reasoning_content`(那条回灌发生在 `request.rs` 的
+    //   `extract_input_items` 消费处:reasoning item → 下一条 assistant 的
+    //   reasoning_content),input 字节随之下降;
+    // - 协议兼容性不受影响:下方仍透传 `reasoning` 字段,
+    //   `ensure_thinking_tool_call_reasoning` 会给带 tool_calls 的 assistant
+    //   消息补 `" "` 占位,Kimi / DeepSeek 等强制 reasoning_content 的上游不 400。
+    // 必须在 pre-conversion(filter input items)而非 post-conversion 做:转换后
+    // `ensure_thinking_tool_call_reasoning` 已把占位塞进 tool_call 消息,届时再
+    // strip `reasoning_content` 要么连占位一起删(重新 400)、要么对 agentic 会话
+    // 最常见的 tool_call 消息无效。pre-conversion 让 ensure 自然补占位,最干净。
+    // 多段 interleaved thinking(MOC-203,envelope 可能含多个 reasoning item)
+    // 一并覆盖:retain 删全部 type=reasoning,不依赖数量。V2 compact
+    // (MOC-198,strip_compaction_trigger 后复用本函数)亦自动覆盖。
+    input_array.retain(|item| item.get("type").and_then(|t| t.as_str()) != Some("reasoning"));
     input_array.push(json!({
         "type": "message",
         "role": "user",
@@ -1306,6 +1324,57 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .is_some(),
             "thinking 启用时 assistant tool_call 必须带 reasoning_content 字段(可以是单空格占位)"
+        );
+    }
+
+    #[test]
+    fn build_compact_chat_request_strips_history_reasoning_items() {
+        // MOC-11: compact 摘要只要历史结论不要过程,历史 `type=reasoning` items
+        // 的真实文本不应进入上游 chat body(省 input budget)。但带 tool_calls
+        // 的 assistant 消息仍须由 ensure_thinking_tool_call_reasoning 补 " " 占位,
+        // 保 Kimi/DeepSeek 等强制 reasoning_content 的上游协议兼容。
+        let p = make_provider();
+        let secret = "SECRET_HISTORY_REASONING_TEXT_should_be_stripped";
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": secret}]},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "next"}
+                ]}
+            ],
+            "reasoning": {"effort": "high"},
+            "tools": [{"type": "function", "name": "shell"}]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        // 真实历史 reasoning 文本必须从整个上游 body 里彻底消失
+        let raw = String::from_utf8(chat.clone()).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "历史 reasoning 文本不应出现在 compact chat body 里(应被剥离)"
+        );
+        // 带 tool_calls 的 assistant 消息仍带 reasoning_content,但只是占位(空白)
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let assistant_with_tool_calls = messages
+            .iter()
+            .find(|m| {
+                m["role"] == "assistant" && m.get("tool_calls").and_then(|v| v.as_array()).is_some()
+            })
+            .expect("应有一条 assistant + tool_calls(从 function_call 转换而来)");
+        let reasoning_content = assistant_with_tool_calls
+            .get("reasoning_content")
+            .and_then(|v| v.as_str());
+        assert!(
+            reasoning_content.is_some(),
+            "thinking 启用时 assistant tool_call 仍须带 reasoning_content 字段"
+        );
+        assert!(
+            reasoning_content.unwrap().trim().is_empty(),
+            "剥离后 reasoning_content 应为占位(空白),而非真实历史 reasoning 文本"
         );
     }
 
