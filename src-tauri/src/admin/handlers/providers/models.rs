@@ -312,6 +312,9 @@ async fn fetch_antigravity_models_impl() -> Value {
     // pool)。这里用临时 client builder 简化(get_or_init 失败也不阻塞 user)
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        // [MOC-96] 给 connect 阶段单独封顶:Windows 系统代理(注册表)已配置但
+        // 不可达时,connect 不再阻塞到 overall timeout 才失败。对齐同文件 :446。
+        .connect_timeout(Duration::from_secs(6))
         .build()
     {
         Ok(c) => c,

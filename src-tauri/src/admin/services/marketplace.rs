@@ -250,6 +250,8 @@ async fn fetch_one(source: &MarketplaceSource, force_refresh: bool) -> Result<Re
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        // [MOC-96] connect 阶段封顶,坏系统代理下连接不再阻塞到 overall timeout。
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest build: {e}"))?;
     let resp = client
