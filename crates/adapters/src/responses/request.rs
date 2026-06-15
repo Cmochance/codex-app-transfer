@@ -1811,7 +1811,18 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
                 | "stream_options"
                 | "mask_sensitive_info"
         ) || (key == "response_format" && response_format_allowed)
-            || (is_m3_plus && matches!(key.as_str(), "parallel_tool_calls" | "reasoning_effort"))
+            // [MOC-241] M3 的 OpenAI-compat `/v1/chat/completions` 原生接受 top-level
+            // `thinking:{type:disabled|adaptive}`(platform.minimax.io 实证,经 extra_body
+            // 透传;`reasoning_effort`/`enable_thinking` 均**不**控制 M3 思考)。reasoning
+            // 档位选 `none` 时 `apply_reasoning_effort` 在本 sanitize 之前(request.rs:243 <
+            // 313)写入 `thinking:{type:disabled}`,若不放行会被本 retain 剥掉 → 上游 M3 收不到
+            // 关思考、picker 显 none 却仍思考。M2.x 不放行(其端点字段集更窄、且 M2.x 走
+            // FORCED_HIDDEN 无 none 档,本就不会带 thinking)。
+            || (is_m3_plus
+                && matches!(
+                    key.as_str(),
+                    "parallel_tool_calls" | "reasoning_effort" | "thinking"
+                ))
     });
 
     // MiniMax 官方建议 OpenAI-compatible M2.7 工具调用启用

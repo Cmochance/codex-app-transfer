@@ -427,6 +427,40 @@ fn minimax_m3_keeps_system_and_standard_fields() {
 }
 
 #[test]
+fn minimax_m3_keeps_thinking_disable_wire_but_m2_drops() {
+    // [MOC-241] reasoning 档位选 `none` 时,apply_reasoning_effort 给 M3 写 top-level
+    // `thinking:{type:disabled}`(M3 ∈ BINARY_THINKING_TYPE),且该调用在 sanitize 之前
+    // (request.rs:243 < 313)。M3 的 OpenAI-compat 端点原生接受该字段,sanitize 必须放行,
+    // 否则上游收不到关思考、picker 显 none 却仍思考。M2.x(FORCED_HIDDEN,无 none 档)
+    // 即便误带也应剥掉。
+    let mk = |model: &str| {
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disabled"}
+        })
+        .as_object()
+        .expect("json object")
+        .clone()
+    };
+    let mut m3 = mk("MiniMax-M3");
+    sanitize_minimax_chat_body(&mut m3);
+    assert_eq!(
+        m3.get("thinking")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("disabled"),
+        "M3 必须保留 thinking:{{type:disabled}}(none 档关思考 wire,上游接受)"
+    );
+    let mut m2 = mk("MiniMax-M2.7");
+    sanitize_minimax_chat_body(&mut m2);
+    assert!(
+        !m2.contains_key("thinking"),
+        "M2.x 应剥 thinking(端点字段集更窄,且 M2.x 无 none 档不应带此 wire)"
+    );
+}
+
+#[test]
 fn minimax_m2_still_converts_system_and_drops_unsupported_fields() {
     // 回归保护:M2.x 必须保持 #139 的 system→user + 字段剥离(M3 的宽松路径
     // 不能误伤 M2.x)。
