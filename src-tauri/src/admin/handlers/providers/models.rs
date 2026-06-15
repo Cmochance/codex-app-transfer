@@ -3,7 +3,12 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use codex_app_transfer_registry::MODEL_ORDER;
 use serde_json::{json, Value};
 
@@ -205,30 +210,57 @@ fn extract_model_ids(payload: &Value) -> Vec<String> {
     ids
 }
 
-fn usable_model_ids(model_ids: &[String]) -> Vec<String> {
-    const EXCLUDE: &[&str] = &[
-        "embedding",
-        "rerank",
-        "moderation",
-        "whisper",
-        "tts",
-        "image",
-        "vision",
-        "audio",
-    ];
-    let usable: Vec<String> = model_ids
+/// 非 chat 模型关键词(embedding / rerank / 审核 / 语音转写 / 语音合成 / 图像生成)——
+/// 这些**真正**不能服务 chat 请求。
+///
+/// **不含** `vision` / `audio`:多模态 chat 模型常带这些词(`moonshot-v1-8k-vision-preview`、
+/// `gpt-4o-audio-preview` 等仍是 chat 模型,只是支持图/音输入),按子串剔除会把合法 chat 模型
+/// 静默踢出池、在 Codex picker 里消失(#477 bot review P2 round-9)。`image` 保留:`gpt-image-1`
+/// 等是图像**生成**端点、非 chat,且无以 `image` 命名的常见 chat 变体。
+const NON_CHAT_MODEL_KEYWORDS: &[&str] = &[
+    "embedding",
+    "rerank",
+    "moderation",
+    "whisper",
+    "tts",
+    "image",
+];
+
+/// 只保留可用于 chat 的模型 id(过滤 embedding/rerank/语音/图像);**全被过滤则返回空**
+/// (不 fallback 原列表)。池化 pooledModels 用它 —— 否则只含 embedding 的 provider 会把
+/// 这些模型写进池、出现在 Codex chat picker 并把 chat 请求路由到不支持的端点(bot review P2)。
+pub(crate) fn chat_usable_model_ids(model_ids: &[String]) -> Vec<String> {
+    model_ids
         .iter()
         .filter(|model_id| {
             let lower = model_id.to_ascii_lowercase();
-            !EXCLUDE.iter().any(|keyword| lower.contains(keyword))
+            !NON_CHAT_MODEL_KEYWORDS
+                .iter()
+                .any(|keyword| lower.contains(keyword))
         })
         .cloned()
-        .collect();
-    if usable.is_empty() {
-        model_ids.to_vec()
-    } else {
-        usable
-    }
+        .collect()
+}
+
+/// 对外来的 `pooledModels`(JSON 字符串数组)做 chat-only 过滤,返回过滤后的 `Value::Array`。
+/// add/update provider 持久化 pooledModels 前用它统一兜底 —— 保证无论前端 / API 哪条路径
+/// 写入,非 chat 模型(embedding/rerank/语音)都不会进池(单一过滤真源,bot review P2)。
+pub(crate) fn chat_filter_pooled_value(pooled: &Value) -> Value {
+    let ids: Vec<String> = pooled
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_owned()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(
+        chat_usable_model_ids(&ids)
+            .into_iter()
+            .map(Value::String)
+            .collect(),
+    )
 }
 
 fn pick_model(model_ids: &[String], keywords: &[&str], fallback_index: usize) -> String {
@@ -255,7 +287,11 @@ fn empty_model_mappings_value() -> Value {
 }
 
 fn suggest_model_mappings(model_ids: &[String]) -> Value {
-    let usable = usable_model_ids(model_ids);
+    // 用 no-fallback 的 chat 过滤:**只含 embedding/rerank 的 provider 不应自动推荐**一个非 chat
+    // 模型当 default —— 否则池化的「pooledModels 空 → 回退槽位映射」会把该 embedding 漏进
+    // Codex chat picker(bot review P2)。正常 provider(有 chat 模型)行为不变(此时与
+    // usable_model_ids 结果一致)。
+    let usable = chat_usable_model_ids(model_ids);
     let mut result = empty_model_mappings_value();
     if usable.is_empty() {
         return result;
@@ -571,7 +607,10 @@ pub async fn fetch_provider_models_payload(Json(payload): Json<Value>) -> impl I
     (status, Json(result)).into_response()
 }
 
-pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoResponse {
+pub async fn autofill_provider_models(
+    State(state): State<crate::admin::state::AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     // **不能在 with_config_write 闭包内 await**(closure 是 sync)。先 load 一份
     // provider snapshot 给 fetch 用,await long async 在锁外,然后真 mutate +
     // save 走 atomic RMW。
@@ -598,7 +637,9 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // 真 mutate + save 走 atomic RMW
+    // autofill 只更新该 provider 的槽位 `models` 映射 —— **不写 pooledModels**(模型池由
+    // 「整合提供商」页 setProviderPool 独家管理;autofill 写池会把整合页 curation 删掉的模型
+    // 悄悄加回,#477 bot review P2)。
     let suggested_for_closure = suggested.clone();
     let write_result = with_config_write(|cfg| {
         let Some(idx) = provider_index(cfg, &id) else {
@@ -616,6 +657,8 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
     if let Err(e) = write_result {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    // 整合下若该 provider 仍靠映射回退(pooledModels 缺省),映射变了 → 池 catalog 跟着变 → 重建。
+    super::resync_pool_if_enabled(&state).await;
     Json(json!({
         "success": true,
         "models": result.get("models").cloned().unwrap_or_else(|| json!([])),
@@ -629,6 +672,48 @@ pub async fn autofill_provider_models(Path(id): Path<String>) -> impl IntoRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_usable_keeps_vision_audio_drops_true_non_chat() {
+        // #477 P2 round-9:vision / audio 多模态 chat 模型必须保留;只剔真正非 chat 的。
+        let ids: Vec<String> = [
+            "moonshot-v1-8k-vision-preview",
+            "gpt-4o-audio-preview",
+            "deepseek-chat",
+            "text-embedding-3-large",
+            "bge-reranker-v2",
+            "whisper-1",
+            "tts-1",
+            "gpt-image-1",
+            "omni-moderation-latest",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let kept = chat_usable_model_ids(&ids);
+        assert!(
+            kept.contains(&"moonshot-v1-8k-vision-preview".to_string()),
+            "vision 是 chat"
+        );
+        assert!(
+            kept.contains(&"gpt-4o-audio-preview".to_string()),
+            "audio 是 chat"
+        );
+        assert!(kept.contains(&"deepseek-chat".to_string()));
+        for dropped in [
+            "text-embedding-3-large",
+            "bge-reranker-v2",
+            "whisper-1",
+            "tts-1",
+            "gpt-image-1",
+            "omni-moderation-latest",
+        ] {
+            assert!(
+                !kept.iter().any(|m| m == dropped),
+                "{dropped} 应被过滤(真非 chat)"
+            );
+        }
+    }
 
     #[test]
     fn provider_is_bailian_token_plan_matches_only_token_plan_host() {

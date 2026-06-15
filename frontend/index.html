@@ -64,6 +64,13 @@
 
     <main class="app-main">
       <section class="page active" id="page-dashboard" data-page="dashboard">
+        <div class="integration-lock-notice" id="dashboardIntegrationLock" hidden>
+          <i class="bi bi-lock"></i>
+          <div>
+            <strong data-i18n="providers.integrationApplyLockedTitle">整合模式已开启</strong>
+            <p data-i18n="providers.integrationApplyLockedHint">整合模式下由统一模型池管理,单提供商「应用 / 启用」已锁定。</p>
+          </div>
+        </div>
         <div class="switch-board">
           <div class="provider-card-list" id="dashboardProviderCards"></div>
         </div>
@@ -282,8 +289,15 @@
                 <select class="form-select" id="providerReviewModelSlot"></select>
                 <p class="field-hint" data-i18n="providersAdd.reviewModelHint">auto-review 自动审批工具调用时改用的模型,从上方已配置的模型里选(通常选快/便宜模型加速审批)。留空 = 跟随主模型。</p>
               </div>
+              <div class="integration-lock-notice" id="providerFormIntegrationLock" hidden>
+                <i class="bi bi-lock"></i>
+                <div>
+                  <strong data-i18n="providers.integrationApplyLockedTitle">整合模式已开启</strong>
+                  <p data-i18n="providers.integrationApplyLockedHint">整合模式下由统一模型池管理,单提供商「应用 / 启用」已锁定。</p>
+                </div>
+              </div>
               <div class="button-row provider-form-actions">
-                <button class="btn btn-primary btn-lg" type="button" data-action="apply-provider-desktop"><i class="bi bi-play-fill"></i><span data-i18n="providers.enable">启用</span></button>
+                <button class="btn btn-primary btn-lg" id="providerApplyBtn" type="button" data-action="apply-provider-desktop"><i class="bi bi-play-fill"></i><span data-i18n="providers.enable">启用</span></button>
                 <button class="btn btn-outline-primary btn-lg" id="providerSaveOnly" type="submit" data-i18n="common.saveOnly">仅保存</button>
                 <a class="btn btn-outline-primary btn-lg" href="#providers" data-i18n="common.cancel">取消</a>
               </div>
@@ -299,35 +313,55 @@
       </section>
 
       <section class="page" id="page-providers" data-page="providers">
-        <div class="page-title with-action">
+        <div class="page-title with-action integration-title-row">
           <div>
-            <h1 data-i18n="providers.title">提供商</h1>
-            <p data-i18n="providers.subtitle">管理已配置的 API 提供商</p>
+            <h1 data-i18n="providers.integrationTitle">整合提供商</h1>
+            <p data-i18n="providers.integrationSubtitle">把多个提供商的模型整合进统一模型池;在 Codex 里直接选任意模型,转发器按模型自动分流。</p>
           </div>
-          <a href="#providers/add" class="btn btn-primary btn-lg"><i class="bi bi-plus-lg"></i><span data-i18n="providers.add">添加提供商</span></a>
+          <label class="integration-toggle">
+            <span class="integration-toggle-label" data-i18n="providers.integrationToggleLabel">开启提供商整合</span>
+            <span class="switch-label only-switch"><input type="checkbox" id="integrationToggle"><span class="switch-ui"></span></span>
+          </label>
         </div>
 
-        <article class="panel model-menu-mode-panel" hidden aria-hidden="true">
+        <article class="panel integration-off-hint" id="integrationOffHint" hidden>
+          <i class="bi bi-info-circle"></i>
           <div>
-            <h2 data-i18n="providers.modelMenuTitle">Claude 模型菜单</h2>
-            <p id="modelMenuModeHint" data-i18n="providers.modelMenuSingleHint">当前只把默认提供商的模型显示到 Codex CLI。</p>
+            <h2 data-i18n="providers.integrationOffTitle">整合未开启</h2>
+            <p data-i18n="providers.integrationOffHint">当前为单提供商模式:仅默认提供商的模型显示到 Codex。开启右上角开关后,可把多个提供商整合进统一模型池。</p>
           </div>
-          <button class="btn btn-outline-primary btn-sm" id="modelMenuModeToggle" type="button" data-action="toggle-model-menu-mode">
-            <i class="bi bi-list-stars"></i><span data-i18n="providers.showAllModels">显示全部模型</span>
-          </button>
         </article>
 
-        <article class="panel table-panel">
-          <div class="provider-table-header">
-            <span></span>
-            <span data-i18n="providers.name">提供商名称</span>
-            <span data-i18n="providers.baseUrl">API Base URL</span>
-            <span data-i18n="providers.mapping">模型映射</span>
-            <span data-i18n="providers.status">状态</span>
-            <span data-i18n="providers.actions">操作</span>
-          </div>
-          <div id="providerRows"></div>
-        </article>
+        <div class="integration-pools" id="integrationPools" hidden>
+          <article class="panel pool-panel">
+            <div class="pool-panel-header">
+              <h2 data-i18n="providers.integrationProvidersPoolTitle">整合的提供商</h2>
+              <p data-i18n="providers.integrationProvidersPoolHint">选择要加入模型池的提供商。加入后会自动获取其模型并列入下方可选模型。</p>
+            </div>
+            <div class="pool-provider-grid" id="poolProviderGrid"></div>
+          </article>
+
+          <article class="panel pool-panel">
+            <div class="pool-panel-header with-apply">
+              <div>
+                <h2 data-i18n="providers.integrationMappingTitle">模型映射(进 Codex)</h2>
+                <p data-i18n="providers.integrationMappingHint">把 Codex 标准档映射到池中某「提供商 / 模型」。Codex 模型列表里只显示映射了的标准档,选某档即走你映射的上游;未映射的档不显示。</p>
+              </div>
+              <button class="btn btn-primary btn-lg integration-apply-btn" id="integrationApplyBtn" type="button" data-action="apply-integration">
+                <i class="bi bi-download"></i><span data-i18n="providers.integrationApply">应用整合并重启 Codex</span>
+              </button>
+            </div>
+            <div class="pool-slot-mappings" id="poolSlotMappings"></div>
+          </article>
+
+          <article class="panel pool-panel">
+            <div class="pool-panel-header">
+              <h2 data-i18n="providers.integrationModelsPoolTitle">可选模型(映射来源)</h2>
+              <p data-i18n="providers.integrationModelsPoolHint">每个整合提供商的可选模型清单,作为上方映射的候选来源。这些模型本身不直接进 Codex,可增删。</p>
+            </div>
+            <div class="pool-model-groups" id="poolModelGroups"></div>
+          </article>
+        </div>
       </section>
 
       <section class="page" id="page-desktop" data-page="desktop">

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_registry::{
     config_dir, normalize_model_mappings, RawConfig, DEFAULT_UPDATE_URL,
 };
@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use super::super::registry_io::save_for_test as save_registry;
 use super::super::registry_io::{load as load_registry, with_config_write, ConfigMutation};
 use super::common::{err, random_hex, APP_VERSION};
+use crate::admin::state::AdminState;
 
 pub(super) fn ensure_settings_object(cfg: &mut RawConfig) -> &mut serde_json::Map<String, Value> {
     let obj = cfg.as_object_mut().expect("registry root is object");
@@ -141,6 +142,9 @@ pub(super) fn normalize_imported_config(data: &Value) -> Result<Value, String> {
             "gatewayApiKey",
             "providers",
             "settings",
+            // 整合模式全局标准档映射:导入备份时一并保留,否则整合开着却丢了所有映射、
+            // 退回单 provider 直到用户手动重建(#477 bot review P2)。
+            "poolSlotMappings",
         ] {
             if let Some(value) = source_obj.get(key) {
                 obj.insert(key.to_owned(), value.clone());
@@ -377,7 +381,10 @@ pub async fn get_settings() -> impl IntoResponse {
     Json(settings).into_response()
 }
 
-pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
+pub async fn save_settings(
+    State(state): State<AdminState>,
+    Json(input): Json<Value>,
+) -> impl IntoResponse {
     let result = with_config_write(|cfg| {
         // #MOC-62:记下旧值,只在 mcpCredentialsPortableStore 真变了才触发即时生效
         // (避免改主题等无关 settings 也去写 config.toml)。
@@ -400,6 +407,12 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .and_then(Value::as_str)
             .unwrap_or(codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND)
             .to_string();
+        // 池化开关旧值:真翻转才在写后 re-apply(重建 catalog + 重启 proxy)。
+        let old_expose_all = cfg
+            .get("settings")
+            .and_then(|s| s.get("exposeAllProviderModels"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let s = ensure_settings_object(cfg);
         if let Some(obj) = input.as_object() {
             for (k, v) in obj {
@@ -423,15 +436,27 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             .unwrap_or(codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND)
             .to_string();
         let web_fetch_changed = (new_web_fetch != old_web_fetch).then_some(new_web_fetch);
+        let new_expose_all = settings
+            .get("exposeAllProviderModels")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let expose_all_changed = new_expose_all != old_expose_all;
         Ok(ConfigMutation::Modified((
             settings,
             portable_changed,
             auto_unlock_changed,
             web_fetch_changed,
+            expose_all_changed,
         )))
     });
     match result {
-        Ok((settings, portable_changed, auto_unlock_changed, web_fetch_changed)) => {
+        Ok((
+            settings,
+            portable_changed,
+            auto_unlock_changed,
+            web_fetch_changed,
+            expose_all_changed,
+        )) => {
             // #262:settings.language 改动后 hot reload 到 adapters 全局,
             // 让接下来的 prompt 注入跟新语言一致(用户切语言无需重启 transfer)。
             sync_user_language_from_settings(&settings);
@@ -467,6 +492,32 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
                     // 不一致;startup re-sync 会在下次 transfer 启动时幂等重试补偿。
                     tracing::error!("sync web_fetch mcp_server 失败(下次启动重试): {e}");
                     web_fetch_warning = Some(e);
+                }
+            }
+            // 池化开关翻转 → re-apply 当前 active provider:开 = catalog 写全 provider 池,
+            // 关 = 退回单 provider catalog;同时重启 proxy 刷新 resolver 反查表。re-apply 失败
+            // 必须 **loud log**(不静默吞:开关已写盘但 catalog/proxy 没跟上 = 状态不一致)。
+            //
+            // 用户面提示(失败 toast / "需重启 Codex" 引导)属池化前端 UX —— 本 PR 后端 only,
+            // 故此处只到后端日志层;翻开关的 toast / 重启提示随前端 follow-up 落地(MOC-236)。
+            // 无 active provider 时 sync attempted=false(无可 apply),非失败。
+            if expose_all_changed {
+                let sync =
+                    crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(
+                        &state,
+                    )
+                    .await;
+                if sync.get("attempted").and_then(Value::as_bool) == Some(true)
+                    && sync.get("success").and_then(Value::as_bool) != Some(true)
+                {
+                    let msg = sync
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    tracing::error!(
+                        error_id = "POOL_TOGGLE_REAPPLY_FAILED",
+                        "exposeAllProviderModels 翻转后 re-apply 失败: {msg}"
+                    );
                 }
             }
             let mut body = json!({"success": true, "settings": settings});

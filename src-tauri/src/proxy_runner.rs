@@ -11,12 +11,13 @@
 //! application-level gate middleware 等"兜底逻辑"—— `Runtime::shutdown_background`
 //! 是 tokio 提供的 OS-level "杀光所有 task" 原语,不需要 user-space cancel chain。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use codex_app_transfer_proxy::{build_router_with_relogin, StaticResolver};
-use codex_app_transfer_registry::{config_file, Config};
+use codex_app_transfer_registry::{build_catalog_slug_map, config_file, pool_slot_entries, Config};
 use serde::Serialize;
 use tokio::sync::oneshot;
 
@@ -258,12 +259,63 @@ fn load_resolver_snapshot() -> Result<ResolverSnapshot, String> {
         .gateway_api_key
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "gateway api key was not generated".to_owned())?;
+
+    // 整合反查表:仅 `exposeAllProviderModels` 开时构建(与 catalog 生成端共用
+    // `pool_slot_entries`,key = 标准档 slug `gpt-5.x`,保证逐字一致)。关 → 空 entries → 空表
+    // → `decide_provider` 退默认 provider,行为与整合前一致。
+    let pool_entries = if cfg.settings.expose_all_provider_models {
+        pool_slot_entries(&cfg.providers, Some(&cfg.pool_slot_mappings))
+    } else {
+        Vec::new()
+    };
+    let pool_map = build_catalog_slug_map(&pool_entries);
+    // 默认 provider(resolver fallback):非池化 → active。池化 → active 若在整合子集内则 active,
+    // 否则用池首条所属 provider —— **绝不**退回被排除的 active(否则 pool-miss 把流量打到用户
+    // 移出整合的 provider,#477 P2 round-8;且与 apply root-model 锚到「池首条」保持一致)。
+    let default_provider_id = if pool_entries.is_empty() {
+        cfg.active_provider.clone()
+    } else {
+        pool_default_provider_id(
+            &cfg.providers,
+            cfg.active_provider.as_deref(),
+            &pool_entries,
+        )
+    };
+    // 池模式「默认档」路由:首条标准档映射的 (provider_idx, real_model)。catalog miss 时
+    // decide_provider 路由到这里(不走 map_model_for_provider,#477 P2)。
+    let pool_default = pool_entries
+        .first()
+        .map(|e| (e.provider_idx, e.real_model.clone()));
+
     Ok(ResolverSnapshot {
         provider_count: cfg.providers.len(),
         active_provider: cfg.active_provider.clone(),
-        resolver: StaticResolver::new(Some(gateway_key), cfg.providers, cfg.active_provider),
+        resolver: StaticResolver::new(Some(gateway_key), cfg.providers, default_provider_id)
+            .with_catalog_slug_map(pool_map)
+            .with_pool_default(pool_default),
         gateway_auth: true,
     })
+}
+
+/// 池化模式下 resolver 的默认 provider id。active 在整合子集(`pool_entries`)内 → 用 active;
+/// 否则退回池首条 entry 所属 provider(与 `apply` 把 root `model` 锚到池首条 slug 一致),
+/// **绝不**返回被排除的 active —— 否则 pool-miss 的请求会路由到用户移出整合的 provider
+/// (子集语义违例,#477 P2 round-8)。
+fn pool_default_provider_id(
+    providers: &[codex_app_transfer_registry::Provider],
+    active: Option<&str>,
+    pool_entries: &[codex_app_transfer_registry::PoolEntry],
+) -> Option<String> {
+    let active_idx = active.and_then(|aid| providers.iter().position(|p| p.id == aid));
+    let active_in_pool =
+        active_idx.is_some_and(|ai| pool_entries.iter().any(|e| e.provider_idx == ai));
+    if active_in_pool {
+        return active.map(str::to_owned);
+    }
+    pool_entries
+        .first()
+        .and_then(|e| providers.get(e.provider_idx))
+        .map(|p| p.id.clone())
 }
 
 #[cfg(test)]
@@ -276,6 +328,42 @@ mod tests {
 
     use crate::admin::handlers::common::test_support::with_isolated_home;
     use crate::admin::registry_io::{load as load_registry, save_for_test as save_registry};
+
+    #[test]
+    fn pool_default_provider_id_skips_excluded_active() {
+        use codex_app_transfer_registry::{PoolEntry, Provider};
+        let providers: Vec<Provider> = serde_json::from_value(json!([
+            {"id":"a","name":"A","baseUrl":"https://a","apiFormat":"openai_chat","apiKey":"k","models":{"default":"ma"}},
+            {"id":"b","name":"B","baseUrl":"https://b","apiFormat":"openai_chat","apiKey":"k","models":{"default":"mb"}},
+            {"id":"c","name":"C","baseUrl":"https://c","apiFormat":"openai_chat","apiKey":"k","models":{"default":"mc"}}
+        ]))
+        .unwrap();
+        // 整合子集 = b, c(idx 1,2);a 被排除(未加入整合)。
+        let entries = vec![
+            PoolEntry {
+                provider_idx: 1,
+                slug: "b/mb".into(),
+                real_model: "mb".into(),
+                supports_one_m: false,
+            },
+            PoolEntry {
+                provider_idx: 2,
+                slug: "c/mc".into(),
+                real_model: "mc".into(),
+                supports_one_m: false,
+            },
+        ];
+        // active=a 被排除 → 默认改用池首条所属 provider(b),绝不退回排除的 a。
+        assert_eq!(
+            pool_default_provider_id(&providers, Some("a"), &entries).as_deref(),
+            Some("b")
+        );
+        // active=b 在子集内 → 默认仍 b。
+        assert_eq!(
+            pool_default_provider_id(&providers, Some("b"), &entries).as_deref(),
+            Some("b")
+        );
+    }
 
     fn config_with_gateway(base_url: String, gateway: Value) -> Value {
         json!({

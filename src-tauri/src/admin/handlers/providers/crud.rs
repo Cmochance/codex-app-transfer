@@ -183,7 +183,10 @@ pub struct AddProviderInput {
     pub review_model_slot: Option<String>,
 }
 
-pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoResponse {
+pub async fn add_provider(
+    State(state): State<AdminState>,
+    Json(input): Json<AddProviderInput>,
+) -> impl IntoResponse {
     // 校验 extraHeaders 在保存前合法,避免运行时静默丢 header(实测痛点:Kimi
     // KimiCLI UA 字符串带换行 → resolver 运行时 HeaderValue::from_str 失败 →
     // WARN 后跳过 → Kimi 上游 403 但用户看不到原因)
@@ -281,6 +284,8 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
                 json!({"default":"","gpt_5_5":"","gpt_5_4":"","gpt_5_4_mini":"","gpt_5_3_codex":"","gpt_5_2":""})
             }),
         );
+        // 模型池(pooledModels)不在 add provider 时写入 —— 新 provider 默认未加入整合
+        // (pooledEnabled 缺省 false),其池由「整合提供商」页 setProviderPool 独家管理。
         new_provider.insert(
             "extraHeaders".into(),
             input.extra_headers.clone().unwrap_or_else(|| json!({})),
@@ -328,10 +333,13 @@ pub async fn add_provider(Json(input): Json<AddProviderInput>) -> impl IntoRespo
         Ok(v) => v,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // 池模式:新 provider 的模型要进全局池 catalog + resolver 反查表 → 立即重建。
+    super::resync_pool_if_enabled(&state).await;
     Json(json!({"success": true, "provider": public_provider(&new_provider_value)})).into_response()
 }
 
 pub async fn update_provider(
+    State(state): State<AdminState>,
     Path(id): Path<String>,
     Json(input): Json<AddProviderInput>,
 ) -> impl IntoResponse {
@@ -422,6 +430,23 @@ pub async fn update_provider(
                 updated.insert("models".into(), Value::Object(merged));
             }
         }
+        // 模型池(pooledModels)**不由 provider 表单填充** —— 由「整合提供商」页 setProviderPool
+        // 独家管理。`updated` 克隆自 existing,正常编辑不动 pooledModels = 原样保留整合页 curation
+        // 的池(含显式空 []),表单写池会把删掉的模型悄悄加回(#477 P2 round-3)。
+        //
+        // **例外:upstream 身份变了**(baseUrl / apiFormat / apiKey 与原值不同)→ 旧池属于旧端点/
+        // 旧账号,留着会让 catalog / resolver 继续广播旧 slug、把请求路由到新上游的不存在模型
+        // (错路由,plan 头号风险)→ 置 pooledModels 为**显式空 `[]`**(等用户在整合页「重新获取」
+        // 对新上游重建)。**不能** remove:缺省会让 `unique_pool_slugs` 回退到该 provider 的(同样
+        // 陈旧的)`models` 槽位映射,旧 slug 立刻又被广播进池(#477 P2 round-7);显式 `[]` 经
+        // round-3 registry 语义 = 该 provider 不贡献任何 slug、也不回退。表单只**作废**池、绝不
+        // **填充**(非 resurrection)。(#477 P2 round-5/7)
+        let identity_changed = existing.get("baseUrl") != updated.get("baseUrl")
+            || existing.get("apiFormat") != updated.get("apiFormat")
+            || existing.get("apiKey") != updated.get("apiKey");
+        if identity_changed {
+            updated.insert("pooledModels".into(), Value::Array(Vec::new()));
+        }
         updated.insert("id".into(), Value::String(id.clone()));
         updated.insert("isBuiltin".into(), Value::Bool(is_builtin));
 
@@ -437,10 +462,15 @@ pub async fn update_provider(
         }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // 池模式:该 provider(即便非 active)的模型在全局池里 → 改动后重建 catalog + 反查表。
+    super::resync_pool_if_enabled(&state).await;
     Json(json!({"success": true, "provider": public_provider(&updated_value)})).into_response()
 }
 
-pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
+pub async fn delete_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     let result = with_config_write(|cfg| {
         let providers = cfg
             .get("providers")
@@ -486,8 +516,111 @@ pub async fn delete_provider(Path(id): Path<String>) -> impl IntoResponse {
         Ok(ConfigMutation::Modified(()))
     });
     match result {
-        Ok(()) => Json(json!({"success": true})).into_response(),
+        Ok(()) => {
+            // 池模式:删 provider 后必须从池 catalog + resolver 反查表移除其 slug,
+            // 否则 picker 仍显示、且旧反查表仍用陈旧凭据路由到已删 provider(bot review P2)。
+            super::resync_pool_if_enabled(&state).await;
+            Json(json!({"success": true})).into_response()
+        }
         Err(e) if e == "provider not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetPoolInput {
+    /// 整合开关:把该 provider 加入(true)/移出(false)整合页子集。缺省 = 不动。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 可选模型列表(整合页下方卡池增删的**权威结果**)。缺省 = 不动;
+    /// `Some` 时**整列表替换**(curation 既要增也要删,非合并),经 chat 过滤去重。
+    #[serde(default)]
+    pub models: Option<Value>,
+}
+
+/// `PUT /api/providers/{id}/pool` —— 整合页对单个 provider 的池操作。
+///
+/// 两件事各自独立、缺省即不动:
+/// - `enabled`:写 `pooledEnabled`(决定该 provider 是否进入 `unique_pool_slugs` 子集)。
+/// - `models`:**权威替换** `pooledModels`(curation 的增删都靠它,不能 merge,
+///   否则用户删不掉模型 —— 与 CRUD 的 never-shrink 合并语义相反,这里就是要精确集合)。
+pub async fn set_provider_pool(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(input): Json<SetPoolInput>,
+) -> impl IntoResponse {
+    // `models` 是权威替换:若客户端传了非数组,coerce 成 [] 会**静默清空** pooledModels
+    // (守 no-silent-destructive)→ 提前拒为 400,不进写盘闭包。缺省(None)= 不动该项。
+    if let Some(models) = input.models.as_ref() {
+        if !models.is_array() {
+            return err(StatusCode::BAD_REQUEST, "models must be an array").into_response();
+        }
+    }
+    let result = with_config_write(|cfg| {
+        let Some(idx) = provider_index(cfg, &id) else {
+            return Err("provider not found".into());
+        };
+        let providers = cfg
+            .get_mut("providers")
+            .and_then(|v| v.as_array_mut())
+            .unwrap();
+        // provider_index 已证 idx 在数组内;但元素非 object = config 损坏,
+        // 不能静默 no-op 还回 success(否则客户端以为写成功了)。
+        let Some(o) = providers[idx].as_object_mut() else {
+            return Err("provider entry is not an object (corrupt config)".into());
+        };
+        if let Some(enabled) = input.enabled {
+            o.insert("pooledEnabled".into(), Value::Bool(enabled));
+        }
+        if let Some(models) = input.models.as_ref() {
+            o.insert(
+                "pooledModels".into(),
+                super::models::chat_filter_pooled_value(models),
+            );
+        }
+        Ok(ConfigMutation::Modified(()))
+    });
+    match result {
+        Ok(()) => {
+            // 整合子集 / 池模型列表变化 → 重建池 catalog + resolver 反查表。
+            super::resync_pool_if_enabled(&state).await;
+            Json(json!({"success": true})).into_response()
+        }
+        Err(e) if e == "provider not found" => err(StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetSlotMappingsInput {
+    /// 全局标准档映射:`{ "gpt_5_5": {"provider":"<id>","model":"<m>"}, ... }`(object;
+    /// `null` / `{}` = 清空)。**权威替换**(整合页中间映射区一次提交完整映射)。
+    pub mappings: Value,
+}
+
+/// `PUT /api/pool/slot-mappings` —— 整合页「模型映射」区:全局 gpt-5.x → (provider, model)。
+/// 权威替换顶层 `poolSlotMappings`(`pool_slot_entries` 在读取时会过滤 target 不在整合子集 /
+/// model 空的条目,故这里只校验整体是 object/null,细粒度留给 catalog/resolver 构建端)。
+pub async fn set_pool_slot_mappings(
+    State(state): State<AdminState>,
+    Json(input): Json<SetSlotMappingsInput>,
+) -> impl IntoResponse {
+    if !input.mappings.is_object() && !input.mappings.is_null() {
+        return err(StatusCode::BAD_REQUEST, "mappings must be an object").into_response();
+    }
+    let result = with_config_write(|cfg| {
+        let Some(obj) = cfg.as_object_mut() else {
+            return Err("config root is not an object".into());
+        };
+        obj.insert("poolSlotMappings".into(), input.mappings.clone());
+        Ok(ConfigMutation::Modified(()))
+    });
+    match result {
+        Ok(()) => {
+            // 全局映射变化 → 重建池 catalog(标准档)+ resolver 反查表。
+            super::resync_pool_if_enabled(&state).await;
+            Json(json!({"success": true})).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -578,7 +711,10 @@ pub struct ReorderInput {
     pub provider_ids: Vec<String>,
 }
 
-pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResponse {
+pub async fn reorder_providers(
+    State(state): State<AdminState>,
+    Json(input): Json<ReorderInput>,
+) -> impl IntoResponse {
     let result = with_config_write(|cfg| {
         let providers = cfg
             .get("providers")
@@ -631,6 +767,8 @@ pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResp
     });
     match result {
         Ok(public_ordered) => {
+            // 池模式:reorder 改 sortIndex → 改 unique_pool_slugs 的碰撞后缀分配 → 重建。
+            super::resync_pool_if_enabled(&state).await;
             Json(json!({"success": true, "providers": public_ordered})).into_response()
         }
         Err(e) if e == "reorder count mismatch" => err(StatusCode::BAD_REQUEST, e).into_response(),
@@ -640,10 +778,11 @@ pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResp
 
 // /api/providers/{id}/draft —— v1 当 update 用,我们直接复用
 pub async fn save_draft(
+    State(state): State<AdminState>,
     Path(id): Path<String>,
     Json(input): Json<AddProviderInput>,
 ) -> impl IntoResponse {
-    update_provider(Path(id), Json(input)).await
+    update_provider(State(state), Path(id), Json(input)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,12 +806,26 @@ pub async fn update_models(
             .unwrap();
         if let Some(o) = providers[idx].as_object_mut() {
             o.insert("models".into(), input.models.clone());
+            // 模型池(pooledModels)不由映射页保存维护 —— 由「整合提供商」页 setProviderPool
+            // 独家管理。映射页写池会把整合页 curation 删掉的模型悄悄加回(#477 bot review P2)。
         }
         Ok(ConfigMutation::Modified(was_active))
     });
     match result {
         Ok(was_active) => {
-            let desktop_sync = if was_active {
+            // 单模式:仅 active provider 的映射影响 catalog/路由 → 只它变了才 sync。
+            // 池模式:任何 provider 的模型都在全局池里 → 非 active 也要重建(bot review P2)。
+            let pool_on = crate::admin::registry_io::load()
+                .ok()
+                .map(|cfg| {
+                    crate::admin::handlers::common::read_setting_bool(
+                        &cfg,
+                        "exposeAllProviderModels",
+                        false,
+                    )
+                })
+                .unwrap_or(false);
+            let desktop_sync = if was_active || pool_on {
                 let sync =
                     crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(
                         &state,

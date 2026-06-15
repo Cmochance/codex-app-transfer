@@ -146,8 +146,7 @@
   font-size: 13px;
 }
 
-.provider-card-list,
-#providerRows {
+.provider-card-list {
   display: grid;
   gap: 12px;
 }

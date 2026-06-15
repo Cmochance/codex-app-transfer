@@ -23,7 +23,46 @@ use codex_app_transfer_registry::{
 };
 use serde_json::{json, Value};
 
+use crate::admin::state::AdminState;
+
 static ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// 池化模式下,任一 provider 变更(增删改 / reorder / autofill)后重建**全 provider**
+/// catalog + 重启 proxy 刷新反查表 —— 因为池模式 catalog/路由依赖所有 provider,而非
+/// 只 active。单模式无需(catalog/路由只看 active provider,非 active 改动到下次切换才生效)。
+///
+/// re-apply 失败(proxy 重启绑定失败 / apply 出错)必须 **loud log**(`POOL_CRUD_RESYNC_FAILED`),
+/// 不静默吞 —— 否则 CRUD 报成功但 Codex 被留在「停掉 / 陈旧的 proxy + catalog」(bot review P2)。
+/// **不阻塞** CRUD 成功响应(config 已落盘,下次 re-apply / 重启幂等补偿);用户面提示归前端 UX。
+pub(crate) async fn resync_pool_if_enabled(state: &AdminState) {
+    let pool_on = crate::admin::registry_io::load()
+        .ok()
+        .map(|cfg| {
+            crate::admin::handlers::common::read_setting_bool(
+                &cfg,
+                "exposeAllProviderModels",
+                false,
+            )
+        })
+        .unwrap_or(false);
+    if !pool_on {
+        return;
+    }
+    let sync =
+        crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(state).await;
+    if sync.get("attempted").and_then(Value::as_bool) == Some(true)
+        && sync.get("success").and_then(Value::as_bool) != Some(true)
+    {
+        let msg = sync
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        tracing::error!(
+            error_id = "POOL_CRUD_RESYNC_FAILED",
+            "池模式 provider 变更后 re-apply 失败(proxy/catalog 可能陈旧或已停): {msg}"
+        );
+    }
+}
 
 pub(crate) fn fresh_provider_id(existing: &[String]) -> String {
     loop {
