@@ -268,6 +268,17 @@ pub(crate) fn build_compact_chat_request(
         .map_err(|e| AdapterError::BadRequest(format!("compact body 不是合法 JSON: {e}")))?;
     let model = parsed.get("model").cloned().unwrap_or(Value::Null);
     let raw_input = parsed.get("input").cloned();
+    // [MOC-243] V2 compact 历史重建准备:Codex 发 compaction_trigger +
+    // previous_response_id 而**不带** inline 历史时(strip_compaction_trigger 后
+    // input 为空),指望 proxy 用 prev_id 从 session cache 重建对话历史。否则模型
+    // 「无米下炊」→ 空 content 摘要(实证 22:24:05:input 仅 trigger → 模型
+    // "fresh start / blank slate" → content 空 → compact 失败 / 漂移)。
+    let prev_id = parsed
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_owned();
 
     // A2:把 SUMMARIZATION_PROMPT 作为最后一条 user message append 到 input。
     // 必须**先 normalize input 为 array**才能可靠 append —— `extract_input_items`
@@ -322,6 +333,12 @@ pub(crate) fn build_compact_chat_request(
     // 一并覆盖:retain 删全部 type=reasoning,不依赖数量。V2 compact
     // (MOC-198,strip_compaction_trigger 后复用本函数)亦自动覆盖。
     input_array.retain(|item| item.get("type").and_then(|t| t.as_str()) != Some("reasoning"));
+    // [MOC-243] 仅在「prev_id 非空 且 input(剥 trigger/reasoning 后、加 summary
+    // prompt 前)为空」时从 session cache 重建历史。V1 / V2-inline(input 已含完整
+    // 历史)**不**重建 —— merge_messages_with_previous_response 命中 cache 即无条件
+    // 把 cache 历史拼到 current 前(core/input.rs:93),若 current 已含 inline 历史
+    // 会叠成双份。空 input 才是「Codex 指望 proxy 重建」的 V2 prev_id-依赖型。
+    let reconstruct_history = !prev_id.is_empty() && input_array.is_empty();
     input_array.push(json!({
         "type": "message",
         "role": "user",
@@ -353,10 +370,30 @@ pub(crate) fn build_compact_chat_request(
         synthetic_responses_body["tools"] = tools.clone();
     }
 
+    // [MOC-243] 重建场景:透传 previous_response_id,让下方 with_session 转换经
+    // merge_messages_with_previous_response 用它从 session cache 取回历史。
+    if reconstruct_history {
+        synthetic_responses_body["previous_response_id"] = Value::String(prev_id.clone());
+    }
+
     // MOC-190: compact 转换不保留最新 tool 全文(压缩历史)。set→convert→reset(即使 Err 也 reset)。
     super::request::set_compact_no_keep_recent(true);
-    let conversion =
-        responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider));
+    // [MOC-243] reconstruct_history 时走 with_session 变体 + global session cache,
+    // 让 V2 compact(仅 trigger + prev_id)能取回完整历史再摘要;否则(V1 / inline)
+    // 沿用无 session 变体。cache miss + 非空 input(已 append summary prompt)→
+    // history_lost 降级为仅 summary prompt(空摘要→server_error 可重试→Codex 改发
+    // inline 自愈),**不会** PreviousResponseNotFound(那只在 input 空时触发)。
+    // synthetic body 无 prompt_cache_key → 不触发 context breakdown 落盘(无污染)。
+    let conversion = if reconstruct_history {
+        super::request::responses_body_to_chat_body_for_provider_with_session(
+            &synthetic_responses_body,
+            Some(provider),
+            Some(super::global_response_session_cache()),
+        )
+        .map(|c| c.body)
+    } else {
+        responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))
+    };
     super::request::set_compact_no_keep_recent(false);
     let chat_body = conversion?;
     let chat_body = enforce_compact_chat_message_budget(chat_body);
@@ -789,45 +826,18 @@ fn extract_compact_summary_text(parsed: &Value) -> Option<String> {
         .pointer("/candidates/0/content/parts")
         .and_then(|v| v.as_array())
     {
-        // 正常情况:摘要在 content 通道(非 thought),优先取它 —— 维持原意
-        // (排除 thought 避免思维链污染摘要;gemini_native/response.rs 也把
-        // part.thought 路由 reasoning 而非 content)。content 非空就用它,**不论
-        // thought 多长**:模型思考再多,结论通道才是摘要,不能因 thought 更长就反取。
-        let join_parts = |want_thought: bool| -> String {
-            parts
-                .iter()
-                .filter(|p| {
-                    (p.get("thought").and_then(|t| t.as_bool()) == Some(true)) == want_thought
-                })
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect()
-        };
-        let content_text = join_parts(false);
-        if !content_text.trim().is_empty() {
-            return Some(content_text);
-        }
-        // 失败模式(MOC-243):部分 Antigravity 模型思考档焊死在 model id(如
-        // gemini-3-flash-agent = "Gemini 3.5 Flash (High)",必然 High thinking、
-        // 无法运行时关闭),会把整段摘要写进 thought 通道、content 通道**空** →
-        // 只取非-thought 会让 compact 拿不到摘要(missing summary text),逼 Codex
-        // 回退本地 inline compact。content 空时退回 thought:compact 的"思考"本身
-        // 就是对历史的浓缩,远优于整个失败。下游 quality 校验(min 800)仍把关。
-        //
-        // 但**仅当生成正常收尾**(finishReason == STOP)才退回 thought:若因
-        // MAX_TOKENS / SAFETY 等被截断(chatgpt-codex-connector P2),thought 是
-        // 不完整推理残片而非摘要,接受它会把对话历史替换成残片 —— 比 compact 失败
-        // 更糟。非 STOP → 不 fallback,返回 None 让 compact 优雅失败(Codex 保留
-        // 历史 / 回退本地)。与 gemini_native/response.rs 的「非 STOP = incomplete」
-        // 判定一致。
-        let finished_ok = root
-            .pointer("/candidates/0/finishReason")
-            .and_then(|v| v.as_str())
-            == Some("STOP");
-        if finished_ok {
-            let thought_text = join_parts(true);
-            if !thought_text.trim().is_empty() {
-                return Some(thought_text);
-            }
+        // **排除 thought 部分**:compact 请求带 reasoning_effort → 转 Gemini 时产
+        // `thinkingConfig.include_thoughts=true` → 响应可能含 `{"thought":true,"text":...}`
+        // 思维链。summary 只要结论不要过程,且全代码别处(gemini_native/response.rs 把
+        // part.thought 路由 reasoning 而非 content)一致把 thought 当非 content。不排除
+        // 会让思维链污染压缩后的上下文(code-reviewer IMPORTANT)。
+        let text: String = parts
+            .iter()
+            .filter(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true))
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !text.is_empty() {
+            return Some(text);
         }
     }
     // anthropic messages 非流式:content[].{type:"text",text}(V2 路径 anthropic
@@ -1692,6 +1702,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_compact_chat_request_v2_reconstructs_history_from_session_cache() {
+        // MOC-243: V2 compact(strip_compaction_trigger 后 input 空 + previous_response_id)
+        // 应从 session cache 用 prev_id 重建历史,而不是把空历史发给上游(实证:模型
+        // 收到零历史 → "fresh start / blank slate" → 空 content 摘要)。
+        let p = make_provider();
+        let cache = crate::responses::global_response_session_cache();
+        let prev_id = "moc243_recon_test_prev_id";
+        cache.save(
+            prev_id,
+            vec![
+                json!({"role": "user", "content": "MOC243_HISTORY_USER_审查项目"}),
+                json!({"role": "assistant", "content": "MOC243_HISTORY_ASSISTANT_已完成审查"}),
+            ],
+        );
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [],
+            "previous_response_id": prev_id,
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let joined = serde_json::to_string(messages).unwrap();
+        assert!(
+            joined.contains("MOC243_HISTORY_USER_审查项目"),
+            "V2 compact 应从 session cache 重建出历史 user 消息,实际 messages={messages:?}"
+        );
+        assert!(
+            joined.contains("MOC243_HISTORY_ASSISTANT_已完成审查"),
+            "V2 compact 应从 session cache 重建出历史 assistant 消息"
+        );
+        // summary prompt 作为最后一条 user(历史在它之前)
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(last["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CONTEXT CHECKPOINT"));
+    }
+
+    #[test]
+    fn build_compact_chat_request_does_not_reconstruct_when_input_has_inline_history() {
+        // MOC-243 防双份:input 已含 inline 历史(V1 / V2-inline)时,即便带 prev_id
+        // 也**不**从 cache 重建 —— merge_messages_with_previous_response 命中 cache
+        // 会无条件把 cache 历史拼到 current 前,与 inline 叠成双份。
+        let p = make_provider();
+        let cache = crate::responses::global_response_session_cache();
+        let prev_id = "moc243_inline_test_prev_id";
+        cache.save(
+            prev_id,
+            vec![json!({"role": "user", "content": "MOC243_CACHED_SHOULD_NOT_APPEAR"})],
+        );
+        let body = json!({
+            "model": "kimi-for-coding",
+            "previous_response_id": prev_id,
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "MOC243_INLINE_HISTORY"}]}],
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let joined =
+            serde_json::to_string(&serde_json::from_slice::<Value>(&chat).unwrap()["messages"])
+                .unwrap();
+        assert!(
+            joined.contains("MOC243_INLINE_HISTORY"),
+            "应保留 inline 历史"
+        );
+        assert!(
+            !joined.contains("MOC243_CACHED_SHOULD_NOT_APPEAR"),
+            "input 非空时不应从 cache 重建(防双份历史)"
+        );
+    }
+
     // ── extract_summary_section ──────────────────────────────────────
 
     #[test]
@@ -1940,80 +2025,6 @@ mod tests {
         assert_eq!(extract_compact_summary_text(&json!({"foo": "bar"})), None);
         assert_eq!(
             extract_compact_summary_text(&json!({"candidates": [{"content": {"parts": []}}]})),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_compact_summary_text_falls_back_to_thought_when_content_empty() {
-        // MOC-243:gemini-3-flash-agent(思考档焊死在 id,必然 thinking)可能把整段
-        // 摘要写进 thought 通道、content 通道空 → 旧逻辑只取非-thought 会返回 None
-        // (missing summary text),compact 失败。content 空 + 正常收尾(STOP)时应
-        // 退回 thought 文本。
-        let all_thought = json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [
-            {"text": "整段摘要其实在这里...", "thought": true},
-            {"text": "more summary in thought", "thought": true}
-        ]}}]});
-        assert_eq!(
-            extract_compact_summary_text(&all_thought).as_deref(),
-            Some("整段摘要其实在这里...more summary in thought"),
-            "content 通道空 + STOP 时应退回 thought 文本,而非返回 None 让 compact 失败"
-        );
-        // cloud_code / antigravity 外裹 {"response": {...}} 变体同样生效
-        let all_thought_wrapped = json!({"response": {"candidates": [{"finishReason": "STOP", "content": {"parts": [
-            {"text": "wrapped thought summary", "thought": true}
-        ]}}]}});
-        assert_eq!(
-            extract_compact_summary_text(&all_thought_wrapped).as_deref(),
-            Some("wrapped thought summary")
-        );
-        // 回归守卫:content 非空时**仍优先 content**,即便 thought 更长也不反取
-        // (content 路径不看 finishReason —— 维持既有行为,本次只 gate thought fallback)
-        let content_shorter_than_thought = json!({"candidates": [{"content": {"parts": [
-            {"text": "a very long chain of thought that is much longer than the summary", "thought": true},
-            {"text": "short summary"}
-        ]}}]});
-        assert_eq!(
-            extract_compact_summary_text(&content_shorter_than_thought).as_deref(),
-            Some("short summary"),
-            "content 非空就用 content,不能因 thought 更长就反取(避免思维链污染)"
-        );
-        // content 纯空白(非空但 trim 后为空)+ 有真实 thought + STOP → 退回 thought
-        // (锁住 .trim().is_empty() guard:空白不该当作有效摘要返回)
-        let blank_content = json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [
-            {"text": "   "},
-            {"text": "real summary lives in thought", "thought": true}
-        ]}}]});
-        assert_eq!(
-            extract_compact_summary_text(&blank_content).as_deref(),
-            Some("real summary lives in thought"),
-            "content 纯空白 + STOP 时应退回 thought,而非返回空白摘要"
-        );
-        // [chatgpt-codex-connector P2] content 空但**生成被截断**(非 STOP,如
-        // MAX_TOKENS / SAFETY)→ thought 是不完整残片,**不**退回,返回 None 让
-        // compact 优雅失败,绝不把历史替换成截断的推理残片。
-        for fr in ["MAX_TOKENS", "SAFETY", "RECITATION"] {
-            let truncated = json!({"candidates": [{"finishReason": fr, "content": {"parts": [
-                {"text": "incomplete reasoning trace cut off mid-thought...", "thought": true}
-            ]}}]});
-            assert_eq!(
-                extract_compact_summary_text(&truncated),
-                None,
-                "finishReason={fr}(非 STOP)时 thought 是截断残片,不应作摘要返回"
-            );
-        }
-        // finishReason 缺失(异常)同样不 fallback —— 要求显式 STOP
-        let no_finish = json!({"candidates": [{"content": {"parts": [
-            {"text": "thought without finish reason", "thought": true}
-        ]}}]});
-        assert_eq!(extract_compact_summary_text(&no_finish), None);
-        // content 与 thought 都空 → None
-        assert_eq!(
-            extract_compact_summary_text(
-                &json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [
-                    {"text": "", "thought": true}
-                ]}}]})
-            ),
             None
         );
     }
