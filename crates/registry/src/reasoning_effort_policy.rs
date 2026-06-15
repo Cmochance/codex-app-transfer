@@ -28,9 +28,11 @@
 //! 两表入表证据格式完全对齐,review 友好。一般情况下两者写**不同 key**(本 policy 写
 //! `reasoning_effort` / `compact_thinking_policy` 写 `thinking` 或 `enable_thinking`),
 //! `Drop` 集合本身就不写 `reasoning_effort`,wire 更干净。**例外([MOC-241] GLM `none`)**:
-//! 本 policy 的 [`apply_glm_thinking`] 也写顶级 `thinking:{type:disabled}` + 嵌套
-//! `chat_template_kwargs.enable_thinking:false` —— 与 `compact_thinking_policy` 对 GLM 的强制
-//! disable **同向(都是「关」)**且全用 `or_insert` 幂等,即便 compact + `none` 同时命中也不互踩。
+//! 命中 [`crate::reasoning_tiers`] 表的模型(如 GLM)选「不思考」时,[`apply_reasoning_effort`]
+//! 用该模型的 `disable_wire`(GLM = [`crate::compact_thinking_policy::DisableThinkingWire::GlmDual`])
+//! 写顶级 `thinking:{type:disabled}` + 嵌套 `chat_template_kwargs.enable_thinking:false` —— 与
+//! `compact_thinking_policy` 的强制 disable **同向(都是「关」)**、全 `or_insert` 幂等,即便
+//! compact + `none` 同时命中也不互踩。
 //!
 //! ## 入表证据(每条 entry 必须同时满足)
 //!
@@ -47,6 +49,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::reasoning_tiers::reasoning_tiers_for_model;
 use crate::schema::Provider;
 
 /// Codex `reasoning.effort` 转换成上游接受的字段形态.
@@ -310,20 +313,19 @@ pub fn apply_reasoning_effort(
     if codex_effort.is_empty() {
         return;
     }
-    // [MOC-241] 智谱 GLM:不收顶级 `reasoning_effort`(wire=Drop),其原生「不思考」走 OpenAI
-    // 兼容端的 `chat_template_kwargs`(见 [`apply_glm_thinking`],disable wire 取自 GLM 官方
-    // 客户端 ZCode、非猜测)。**按请求 model 判定 GLM**([`is_glm_model`];`body["model"]` 已被
-    // forward.rs 重写成上游 id),与 catalog 层(`codex_integration` 的 `is_binary_thinking_model`
-    // 同样按 model id 标 GLM 两档)用同一判定 —— GLM 模型即便挂在非 zhipu 命名的代理(如自建
-    // LiteLLM 网关)后面,picker 的 `none`/`max` 与 wire 也一致生效。provider needle 作兜底
-    // (覆盖 model 字段缺失等场景)。
-    let model_is_glm = body
+    // [MOC-241] 可选思考档位表([`crate::reasoning_tiers`]):按请求 model 判定(`body["model"]`
+    // 已被 forward.rs 重写成上游 id),与 catalog 层**同一张表**,故 GLM 即便挂在非 zhipu 命名代理
+    // (如自建 LiteLLM 网关)后面也一致生效。命中(目前 = thinking-capable GLM)时:用户选「不思考」
+    // (`none`/`off`/`disabled`)→ 用该模型 `disable_wire` 关思考;选其它档(如 `max`)→ 留模型默认
+    // (no-op,GLM 默认思考开)。命中即 return,绝不落到下方 wire 给 GLM 写顶级 `reasoning_effort`。
+    if let Some(spec) = body
         .get("model")
         .and_then(|v| v.as_str())
-        .is_some_and(is_glm_model);
-    if model_is_glm || provider_matches(provider, "zhipu") || provider_matches(provider, "bigmodel")
+        .and_then(reasoning_tiers_for_model)
     {
-        apply_glm_thinking(body, codex_effort);
+        if matches!(codex_effort, "none" | "off" | "disabled") {
+            spec.disable_wire.apply_to_map(body);
+        }
         return;
     }
     let mut wire = reasoning_effort_wire(provider);
@@ -341,67 +343,6 @@ pub fn apply_reasoning_effort(
         wire = ReasoningEffortWire::OpenAIEnum;
     }
     wire.apply(body, codex_effort, &provider.id);
-}
-
-/// [MOC-241] 该 model id 是否属智谱 GLM 系(`glm-5.1` / `glm-4.7` / `glm-5-turbo` … 统一 `glm-`
-/// 前缀,外加裸 `glm`;入参已可含大小写/空白,本函数 trim + lowercase)。
-///
-/// **registry 单一判定源**:catalog 层(`codex_integration::model_catalog::is_binary_thinking_model`
-/// —— 决定 Codex picker 是否显 GLM 两档)与本模块 wire 层([`apply_reasoning_effort`] 的 GLM 分支
-/// / [`apply_glm_thinking`] —— 决定 `none` 是否真关思考)共用此函数,杜绝两层判定漂移。
-pub fn is_glm_model(model: &str) -> bool {
-    let m = model.trim().to_ascii_lowercase();
-    m == "glm" || m.starts_with("glm-")
-}
-
-/// [MOC-241] 把 Codex reasoning.effort 翻成智谱 GLM 的原生「不思考」控制(OpenAI 兼容端)。
-///
-/// **disable wire 取自 GLM 官方客户端(智谱 ZCode v3.0.1 的 glm agent `zcode.cjs`,
-/// `createGlm52ReasoningProviderOptions`)的 OpenAI-compat 形态,非自行猜测**:
-/// `none`/`off`/`disabled`(不思考)→ `chat_template_kwargs.enable_thinking = false`。
-///
-/// **只写「关」、不写「开」**:GLM 默认思考开,故 `max`(最高)= 默认行为、无需写线。ZCode 对
-/// `max` 还会发 `chat_template_kwargs.reasoning_effort:"max"`,但本仓**故意不发** —— 那是
-/// thinking-ON 信号,而 compact 请求走同一转换路径(`adapters` 的
-/// `apply_codex_reasoning_effort_for_provider`,request.rs:243)且默认 effort 多为 `max`。
-/// 关键:compact 的强制 disable([`crate::compact_thinking_policy`] / issue #248)只剥**顶级**
-/// `reasoning_effort`、对**嵌套** `chat_template_kwargs.reasoning_effort` 无感 —— 若写出来会漏到
-/// wire 把思考又打开。只写「关」就永不撤销 compact 的 disable,端到端两档语义仍成立
-///(`none`=关 / `max`=GLM 默认开)。
-///
-/// **`none` 同时发两个 disable wire**(覆盖不同 GLM 部署,二者都表达「关」、不矛盾):
-/// 1. 顶级 `thinking:{type:disabled}` —— **hosted Z.AI / BigModel**(内置 preset 指向
-///    `open.bigmodel.cn`)的 OpenAI 兼容 API 用这个关思考(docs.bigmodel.cn;= 本仓
-///    [`crate::compact_thinking_policy`] GLM 已用形态,issue #248 真机实测有效);
-/// 2. `chat_template_kwargs.enable_thinking:false` —— **自建 vLLM/SGLang** GLM 用这个
-///    (GLM 官方客户端智谱 ZCode 的 openaiCompatible wire,`createGlm52ReasoningProviderOptions`)。
-///
-/// 两者皆 `or_insert` **不覆盖**用户/上游已设同名键(最小干预);都只表达「关」,与 compact 的
-/// 强制 disable 同向、`or_insert` 幂等,无互踩。GLM 不收顶级 `reasoning_effort`,本函数也不写
-///(保留 Drop 语义)。
-fn apply_glm_thinking(body: &mut Map<String, Value>, effort: &str) {
-    // 只有「不思考」档需要显式 wire;max / 其它档留 GLM 默认(思考开)。
-    if !matches!(effort, "none" | "off" | "disabled") {
-        return;
-    }
-    // ① hosted Z.AI / BigModel:顶级 `thinking:{type:disabled}`
-    if let Some(obj) = body
-        .entry("thinking")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-    {
-        obj.entry("type".to_owned())
-            .or_insert_with(|| Value::String("disabled".into()));
-    }
-    // ② 自建 vLLM / SGLang:`chat_template_kwargs.enable_thinking:false`
-    if let Some(obj) = body
-        .entry("chat_template_kwargs")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-    {
-        obj.entry("enable_thinking".to_owned())
-            .or_insert(Value::Bool(false));
-    }
 }
 
 #[cfg(test)]
@@ -494,47 +435,66 @@ mod tests {
         assert!(apply("kimi-code", "xhigh").as_object().unwrap().is_empty());
     }
 
-    // ── [MOC-241] GLM 原生两档思考:chat_template_kwargs(ZCode 权威 wire)──
+    // ── [MOC-241] GLM 思考档位 wire(reasoning_tiers 表驱动,按 body["model"] 判定)──
 
-    #[test]
-    fn glm_max_is_noop_relies_on_default() {
-        // GLM 默认思考开 → max/xhigh 不写线(故意不发 ZCode 的 reasoning_effort:max,防 compact 互踩);
-        // 也绝不写顶级 reasoning_effort(GLM 不收)。
-        assert!(apply("zhipu", "max").as_object().unwrap().is_empty());
-        assert!(apply("zhipu", "xhigh").as_object().unwrap().is_empty());
+    /// 构造带 `model` 的 body 跑 `apply_reasoning_effort`。GLM 检测按 `body["model"]`(查
+    /// reasoning_tiers 表),与 provider 名字无关 —— 故意用非 zhipu 的 provider 名,证明 model-based。
+    fn apply_model(model: &str, effort: &str) -> Value {
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String(model.into()));
+        apply_reasoning_effort(&mut body, &provider("custom-proxy"), effort);
+        Value::Object(body)
+    }
+
+    /// body 里除 `model` 外没写任何思考/effort 字段(GLM no-op 档的判据)。
+    fn only_model_left(body: &Value) -> bool {
+        body.get("thinking").is_none()
+            && body.get("chat_template_kwargs").is_none()
+            && body.get("reasoning_effort").is_none()
     }
 
     #[test]
-    fn glm_none_disables_thinking() {
-        let body = apply("zhipu", "none");
-        // hosted Z.AI/BigModel 形态
+    fn glm_max_is_noop_relies_on_default() {
+        // GLM 默认思考开 → max/xhigh 不写线(故意不发 thinking-ON 信号,防 compact 互踩);
+        // 也绝不写顶级 reasoning_effort(GLM 不收)。
+        for e in ["max", "xhigh"] {
+            assert!(
+                only_model_left(&apply_model("glm-5.1", e)),
+                "GLM effort={e} 应 no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn glm_none_disables_thinking_both_wires() {
+        let body = apply_model("glm-5.1", "none");
+        // ① hosted Z.AI/BigModel 形态
         assert_eq!(body["thinking"]["type"], "disabled");
-        // 自建 vLLM/SGLang 形态
+        // ② 自建 vLLM/SGLang 形态
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         // GLM 不收顶级 reasoning_effort
         assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
-    fn glm_matched_by_bigmodel_baseurl_none_disables() {
-        // healed config:UUID id + name "GLM" + baseUrl bigmodel → 靠 bigmodel needle 命中
-        let p = provider_full("xyz789", "GLM", "https://open.bigmodel.cn/api/paas/v4");
+    fn glm_keyed_by_model_not_provider() {
+        // PR #490 bot review:表驱动 model-based,GLM 模型挂在任意命名代理(如自建 LiteLLM 网关)
+        // 后面都生效 —— 与 catalog 层同一张表。
+        let p = provider_full("litellm-uuid", "my-litellm-proxy", "https://gw.internal/v1");
         let mut body = Map::new();
+        body.insert("model".into(), Value::String("glm-5.1".into()));
         apply_reasoning_effort(&mut body, &p, "none");
-        // bigmodel = hosted,顶级 thinking:{type:disabled} 是其生效形态(#248 实测)
-        assert_eq!(
-            body["thinking"]["type"], "disabled",
-            "hosted GLM(bigmodel)顶级 thinking 必须关思考"
-        );
+        assert_eq!(body["thinking"]["type"], "disabled");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
     fn glm_other_efforts_noop() {
-        // GLM catalog 只暴露 none/max;其它档若出现 → 不写,留 GLM 默认(思考开)
+        // GLM picker 只暴露 none/max;其它档若出现 → 不写,留 GLM 默认(思考开)
         for e in ["low", "medium", "high", "minimal", "auto"] {
             assert!(
-                apply("zhipu", e).as_object().unwrap().is_empty(),
+                only_model_left(&apply_model("glm-5.1", e)),
                 "GLM effort={e} 应 no-op"
             );
         }
@@ -543,13 +503,13 @@ mod tests {
     #[test]
     fn glm_preserves_user_set_chat_template_kwargs() {
         // or_insert 最小干预:用户已显式设的同名键不被覆盖
-        let p = provider("zhipu");
         let mut body = Map::new();
+        body.insert("model".into(), Value::String("glm-5.1".into()));
         body.insert(
             "chat_template_kwargs".into(),
             json!({"enable_thinking": true, "foo": 1}),
         );
-        apply_reasoning_effort(&mut body, &p, "none");
+        apply_reasoning_effort(&mut body, &provider("custom-proxy"), "none");
         // 用户已设 enable_thinking:true → or_insert 不覆盖
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(body["chat_template_kwargs"]["foo"], 1);
@@ -558,31 +518,18 @@ mod tests {
     }
 
     #[test]
-    fn glm_model_behind_non_zhipu_provider_still_disables() {
-        // PR #490 bot review:GLM 模型挂在非 zhipu 命名的代理(如自建 LiteLLM 网关)后面 ——
-        // 仅靠 provider needle 会漏(picker 显 none 但关不掉)。按 body["model"](forward.rs 已
-        // 重写成上游 id)判定即可命中,与 catalog 层同款 model-driven 判定。
-        let p = provider_full("litellm-uuid", "my-litellm-proxy", "https://gw.internal/v1");
+    fn legacy_glm4_not_in_table_no_disable() {
+        // legacy GLM-4(不在 reasoning_tiers 表,不支持 thinking 控制)→ none 不触发 disable wire,
+        // 不给不支持的模型发假控制(PR #490 bot review P2)。走 reasoning_effort_wire:zhipu → Drop。
         let mut body = Map::new();
-        body.insert("model".into(), Value::String("glm-5.1".into()));
-        apply_reasoning_effort(&mut body, &p, "none");
-        assert_eq!(
-            body["chat_template_kwargs"]["enable_thinking"], false,
-            "非 zhipu 命名代理后的 GLM 模型,none 也必须关思考(按 model 判定)"
+        body.insert("model".into(), Value::String("glm-4-plus".into()));
+        apply_reasoning_effort(&mut body, &provider("zhipu"), "none");
+        assert!(
+            body.get("thinking").is_none(),
+            "legacy glm-4 不应写 thinking"
         );
-        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("chat_template_kwargs").is_none());
         assert!(body.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn is_glm_model_classifies_glm_family() {
-        for m in ["glm-5.1", "GLM-4.7", "glm-5-turbo", "glm", " glm-5 "] {
-            assert!(is_glm_model(m), "{m} 应判为 GLM");
-        }
-        // 边界:chatglm3 不是 `glm-` 前缀(不收),空串不收
-        for m in ["gpt-5.5", "deepseek-v4-pro", "chatglm3", ""] {
-            assert!(!is_glm_model(m), "{m} 不应判为 GLM");
-        }
     }
 
     #[test]

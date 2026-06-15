@@ -22,6 +22,7 @@ pub mod paths;
 pub mod presets;
 pub mod raw_io;
 pub mod reasoning_effort_policy;
+pub mod reasoning_tiers;
 pub mod schema;
 
 pub use base_instructions::CAS_BASE_INSTRUCTIONS;
@@ -44,6 +45,7 @@ pub use paths::{
 pub use presets::builtin_presets;
 pub use raw_io::{load_raw_config, save_raw_config, IoError, RawConfig};
 pub use reasoning_effort_policy::{
-    apply_reasoning_effort, is_glm_model, reasoning_effort_wire, ReasoningEffortWire,
+    apply_reasoning_effort, reasoning_effort_wire, ReasoningEffortWire,
 };
+pub use reasoning_tiers::{reasoning_tiers_for_model, ReasoningTier, ReasoningTierSpec};
 pub use schema::{Config, ModelSlotKey, Provider, Settings, APP_VERSION, DEFAULT_UPDATE_URL};

@@ -53,7 +53,9 @@
 //!   thinking 后,**当前调用**的模型不思考、不产 reasoning_content;但**历史**
 //!   仍可能含上一轮的 reasoning_content placeholder,不影响。
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+use crate::reasoning_tiers::reasoning_tiers_for_model;
 
 /// compact 路径 disable-thinking 的 wire 形态。
 ///
@@ -83,6 +85,12 @@ pub enum DisableThinkingWire {
     /// - 小米 MiMo v2.x 全系(`help.aliyun.com/zh/model-studio/mimo` 跟 Qwen 同款
     ///   `enable_thinking` wire)
     EnableThinkingFalse,
+
+    /// **[MOC-241] GLM 双发** —— 同时写顶级 `thinking:{"type":"disabled"}`(hosted Z.AI /
+    /// BigModel,docs.bigmodel.cn / 本仓 #248 实测)+ 嵌套 `chat_template_kwargs.enable_thinking:false`
+    /// (自建 vLLM/SGLang,GLM 官方客户端智谱 ZCode `createGlm52ReasoningProviderOptions` 的
+    /// openaiCompatible wire)。二者皆「关」、不矛盾,覆盖 hosted 与自建两种部署。
+    GlmDual,
 }
 
 impl DisableThinkingWire {
@@ -102,22 +110,26 @@ impl DisableThinkingWire {
     /// 已有的 `thinking`/`enable_thinking`,若 body 已显式 **enable** thinking,则不关
     /// 思考、也保留用户/provider 的 `reasoning_effort`(不能无脑删,否则丢配置)。
     pub fn inject(self, chat_body: &mut Value) {
-        let Some(obj) = chat_body.as_object_mut() else {
-            return;
-        };
+        if let Some(obj) = chat_body.as_object_mut() {
+            self.apply_to_map(obj);
+        }
+    }
+
+    /// 同 [`Self::inject`],但直接作用在 chat body 的 `Map` 上。
+    ///
+    /// disable 逻辑的**单一来源**:compact 路径走 [`Self::inject`](`Value`),
+    /// reasoning_effort_policy 的 GLM `none` 路径走本方法(`Map`),共用同一实现。
+    pub fn apply_to_map(self, obj: &mut Map<String, Value>) {
         // 先 insert disable wire(不覆盖已有值),并判定 thinking 最终是否真被关。
         let disabled = match self {
-            Self::ThinkingTypeDisabled => {
-                let entry = obj
-                    .entry("thinking".to_owned())
-                    .or_insert_with(|| serde_json::json!({"type": "disabled"}));
-                entry.get("type").and_then(|t| t.as_str()) == Some("disabled")
-            }
-            Self::EnableThinkingFalse => {
-                let entry = obj
-                    .entry("enable_thinking".to_owned())
-                    .or_insert_with(|| serde_json::json!(false));
-                entry.as_bool() == Some(false)
+            Self::ThinkingTypeDisabled => set_thinking_type_disabled(obj),
+            Self::EnableThinkingFalse => set_enable_thinking_false(obj),
+            // [MOC-241] GLM 双发:hosted 顶级 thinking + 自建 chat_template_kwargs 都写;
+            // 任一生效即视为已关(覆盖 hosted / 自建两种部署)。
+            Self::GlmDual => {
+                let a = set_thinking_type_disabled(obj);
+                let b = set_chat_template_enable_thinking_false(obj);
+                a || b
             }
         };
         // 仅当 thinking 确实被关掉才删 reasoning_effort(见上方 P2 说明)。
@@ -125,6 +137,36 @@ impl DisableThinkingWire {
             obj.remove("reasoning_effort");
         }
     }
+}
+
+/// 顶级 `thinking:{"type":"disabled"}`(`or_insert` 不覆盖已有);返回 thinking 是否最终为 disabled。
+fn set_thinking_type_disabled(obj: &mut Map<String, Value>) -> bool {
+    let entry = obj
+        .entry("thinking".to_owned())
+        .or_insert_with(|| serde_json::json!({"type": "disabled"}));
+    entry.get("type").and_then(|t| t.as_str()) == Some("disabled")
+}
+
+/// 顶级 `enable_thinking:false`(`or_insert` 不覆盖已有);返回是否最终为 false。
+fn set_enable_thinking_false(obj: &mut Map<String, Value>) -> bool {
+    let entry = obj
+        .entry("enable_thinking".to_owned())
+        .or_insert_with(|| serde_json::json!(false));
+    entry.as_bool() == Some(false)
+}
+
+/// 嵌套 `chat_template_kwargs.enable_thinking:false`(`or_insert` 不覆盖已有);返回是否最终为 false。
+fn set_chat_template_enable_thinking_false(obj: &mut Map<String, Value>) -> bool {
+    let kwargs = obj
+        .entry("chat_template_kwargs".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(k) = kwargs.as_object_mut() else {
+        return false;
+    };
+    let entry = k
+        .entry("enable_thinking".to_owned())
+        .or_insert_with(|| serde_json::json!(false));
+    entry.as_bool() == Some(false)
 }
 
 /// 按发到上游的 model ID 查 compact-disable 策略。
@@ -138,29 +180,16 @@ impl DisableThinkingWire {
 /// doc-only 模块里保留专属注释段,**完整呈现** chat 协议全模型决策图。
 pub fn compact_disable_thinking_wire(model: &str) -> Option<DisableThinkingWire> {
     let m = model.trim().to_ascii_lowercase();
+    // [MOC-241] 智谱 GLM 全系的「思考档位 + disable wire」统一收口到 [`crate::reasoning_tiers`]
+    // 表(单一真相,与 Codex picker 两档共用),不再在此硬列 GLM 名单。GLM 命中 → 返回其
+    // `disable_wire`(`GlmDual`:hosted 顶级 thinking + 自建 chat_template_kwargs 双发,
+    // 覆盖 Z.AI ChatThinking schema 列出的 4.5+/5.x 思考档,排除 legacy glm-4-*)。
+    if let Some(spec) = reasoning_tiers_for_model(&m) {
+        return Some(spec.disable_wire);
+    }
     match m.as_str() {
         // ─── 派 A:顶级 thinking.type=disabled ──────────────────────────
         //
-        // 智谱 GLM 全系。Z.AI `ChatThinking` schema 原文:
-        // "When enabled, GLM-5.1 GLM-5 GLM-5-Turbo GLM-5V-Turbo GLM-4.7 GLM-4.5V
-        // will think compulsorily, while GLM-4.6, GLM-4.6V, GLM-4.5 and others
-        // will automatically determine whether to think, default: enabled"
-        //
-        // - **compulsorily 名单**(强制思考,issue #248 GLM-5.1 真机失败实证):
-        //   `glm-5.1` / `glm-5` / `glm-5-turbo` / `glm-5v-turbo` / `glm-4.7` / `glm-4.5v`
-        // - **自适应名单**(默认开但 compact 任务自适应可能少思考):
-        //   `glm-4.6` / `glm-4.6v` / `glm-4.5`
-        //   即便自适应,文档明确支持 `thinking.type=disabled` + 默认开 → 入表是稳赚不亏
-        // 文档:https://docs.z.ai/api-reference/llm/chat-completion
-        "glm-5.1"
-        | "glm-5"
-        | "glm-5-turbo"
-        | "glm-5v-turbo"
-        | "glm-4.7"
-        | "glm-4.5v"
-        | "glm-4.6"
-        | "glm-4.6v"
-        | "glm-4.5"
         // Kimi K2 系列(月之暗面平台 + Kimi Code 平台)
         // thinking 默认开 + 自适应 + 共享 max_tokens 池 + 支持
         // `thinking.type=disabled` 顶级字段。
@@ -168,7 +197,7 @@ pub fn compact_disable_thinking_wire(model: &str) -> Option<DisableThinkingWire>
         // 的旁证 —— **不是不加的依据**。compact 任务下 reasoning 仍是浪费 budget。
         // `kimi-for-coding` 是 Kimi Code 平台稳定 alias,后端映射最新 K2.6+。
         // 文档:https://platform.kimi.com/docs/guide/use-kimi-k2-thinking-model
-        | "kimi-k2.5"
+        "kimi-k2.5"
         | "kimi-k2.6"
         | "kimi-for-coding"
         // DeepSeek V4 实名 model(项目 preset `presets_data.json:13-21` 收录的两个)。
@@ -295,8 +324,9 @@ mod tests {
     // ── lookup 行为 ─────────────────────────────────────────────────
 
     #[test]
-    fn glm_compulsorily_models_resolve_to_thinking_type_disabled() {
-        // Z.AI compulsorily 名单 6 个,全部派 A
+    fn glm_compulsorily_models_resolve_to_glm_dual() {
+        // [MOC-241] GLM 现统一从 reasoning_tiers 表取 disable_wire = GlmDual(hosted 顶级 thinking
+        // + 自建 chat_template_kwargs 双发)。Z.AI compulsorily 名单 6 个。
         for m in [
             "glm-5.1",
             "glm-5",
@@ -307,21 +337,32 @@ mod tests {
         ] {
             assert_eq!(
                 compact_disable_thinking_wire(m),
-                Some(DisableThinkingWire::ThinkingTypeDisabled),
-                "GLM compulsorily model {m} 必须走 ThinkingTypeDisabled wire"
+                Some(DisableThinkingWire::GlmDual),
+                "GLM compulsorily model {m} 应走 GlmDual wire(经 reasoning_tiers 表)"
             );
         }
     }
 
     #[test]
-    fn glm_adaptive_models_also_resolve_to_thinking_type_disabled() {
-        // 自适应名单(Z.AI 文档说会"automatically determine whether to think")
-        // 仍入表 —— compact 任务"永远不需要 thinking"对自适应模型也成立
+    fn glm_adaptive_models_also_resolve_to_glm_dual() {
+        // 自适应名单(Z.AI 文档说会"automatically determine whether to think")同样入表 → GlmDual。
         for m in ["glm-4.6", "glm-4.6v", "glm-4.5"] {
             assert_eq!(
                 compact_disable_thinking_wire(m),
-                Some(DisableThinkingWire::ThinkingTypeDisabled),
-                "GLM 自适应 model {m} 也应走 ThinkingTypeDisabled wire"
+                Some(DisableThinkingWire::GlmDual),
+                "GLM 自适应 model {m} 也应走 GlmDual wire"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_glm4_not_in_table_returns_none() {
+        // [MOC-241/PR#490 P2] legacy GLM-4(不支持 thinking 控制)不在表 → compact 也不注入 disable。
+        for m in ["glm-4-plus", "glm-4-flash", "glm-4-32b-0414-128k", "glm-4"] {
+            assert_eq!(
+                compact_disable_thinking_wire(m),
+                None,
+                "legacy {m} 不应注入 disable"
             );
         }
     }
@@ -448,8 +489,9 @@ mod tests {
     #[test]
     fn lookup_is_case_insensitive_and_trims_whitespace() {
         assert_eq!(
+            // [MOC-241] GLM 经 reasoning_tiers 表 → GlmDual(表也 trim+lowercase)
             compact_disable_thinking_wire("  GLM-5.1  "),
-            Some(DisableThinkingWire::ThinkingTypeDisabled)
+            Some(DisableThinkingWire::GlmDual)
         );
         assert_eq!(
             compact_disable_thinking_wire("Kimi-K2.6"),
