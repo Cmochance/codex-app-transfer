@@ -244,7 +244,7 @@ To add a new component: create `components/<name>.css` + add a line `@import url
 
 `curl` requires elevated permissions. Third-party models currently cannot trigger the macOS escalation prompt, so this app writes `sandbox_mode = "danger-full-access"` + `approval_policy = "never"` into `~/.codex/config.toml` by default on apply. On Windows, or if you have other reasons, you can turn this off in Settings → "Allow Codex network tools (full-access mode)" (#215).
 
-> **⚠️ Security trade-off**: full-access mode lets the model read/write any file and run every command without approval = **fully trust the model** (equivalent to Codex's official "Full access" tier). With the toggle off, Codex falls back to the read-only sandbox + on-request approval. macOS still cannot trigger the elevation prompt, so there is no network access — only the selected model's built-in `web_search` capability is usable. If the model doesn't support `web_search`, all search calls return empty results.
+> **⚠️ Security trade-off**: full-access mode lets the model read/write any file and run every command without approval = **fully trust the model** (equivalent to Codex's official "Full access" tier). With the toggle off, Codex falls back to the read-only sandbox + on-request approval. macOS still cannot trigger the elevation prompt, so there is no network access. Provider-native `web_search` is now dropped at the protocol layer (MOC-208); search requests go through the self-built `web_search` / `web_fetch` tools instead (enable the built-in web tools).
 
 ### Codex App reports `404 Not Found url: http://127.0.0.1:18080/responses`
 
