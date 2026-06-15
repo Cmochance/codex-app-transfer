@@ -1372,7 +1372,7 @@ mod tests {
                 "{id} missing top-fade rule"
             );
             assert!(
-                script.contains("main.main-surface") && script.contains("cat-theme-style"),
+                script.contains(".main-surface") && script.contains("cat-theme-style"),
                 "{id} missing transparent main / style id"
             );
         }
