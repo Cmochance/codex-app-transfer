@@ -30,6 +30,10 @@ fn provider_kind(provider: &Value) -> &'static str {
         "novita"
     } else if probe.contains("stepfun") || probe.contains("step") {
         "stepfun"
+    } else if probe.contains("moonshot") {
+        // Kimi (月之暗面) PAYG:baseUrl 含 `api.moonshot.cn`/`.ai`。**只认 `moonshot` 不认 `kimi`**:
+        // 订阅制 `kimi-code`(`api.kimi.com/coding`)不含 `moonshot`、是另一个 provider,不在此列。
+        "moonshot"
     } else {
         "unknown"
     }
@@ -57,6 +61,14 @@ fn balance_endpoint(provider: &Value) -> Option<(&'static str, String)> {
         "openrouter" => Some((kind, "https://openrouter.ai/api/v1/credits".to_owned())),
         "novita" => Some((kind, "https://api.novita.ai/v3/user/balance".to_owned())),
         "stepfun" => Some((kind, "https://api.stepfun.com/v1/accounts".to_owned())),
+        "moonshot" => {
+            let host = if base.contains("moonshot.ai") {
+                "https://api.moonshot.ai"
+            } else {
+                "https://api.moonshot.cn"
+            };
+            Some((kind, format!("{host}/v1/users/me/balance")))
+        }
         _ => None,
     }
 }
@@ -122,6 +134,27 @@ fn normalize_balance_payload(kind: &str, payload: &Value) -> Vec<Value> {
             _ => None,
         };
         return vec![money_item("credits", remaining, total, used, "USD")];
+    }
+
+    if kind == "moonshot" {
+        // 响应:{"code":0,"data":{"available_balance":..,"voucher_balance":..,"cash_balance":..}}.
+        // available = 可用余额(= cash + voucher)。响应无币种字段 → 这里默认按 .cn 记 CNY(国际站
+        // .ai 罕用);Codex UI 实时显示那条会按 host 推币种符号(见 moonshot_quota)。
+        let data = payload.get("data").unwrap_or(payload);
+        let Some(obj) = data.as_object() else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        if let Some(avail) = float_or_none(obj.get("available_balance")) {
+            items.push(money_item("balance", Some(avail), None, None, "CNY"));
+        }
+        if let Some(cash) = float_or_none(obj.get("cash_balance")) {
+            items.push(money_item("cash", Some(cash), None, None, "CNY"));
+        }
+        if let Some(voucher) = float_or_none(obj.get("voucher_balance")) {
+            items.push(money_item("voucher", Some(voucher), None, None, "CNY"));
+        }
+        return items;
     }
 
     let data = payload.get("data").unwrap_or(payload);
@@ -333,5 +366,49 @@ mod tests {
         assert_eq!(generic[0]["total"], json!(4.0));
         assert_eq!(generic[0]["used"], json!(0.75));
         assert_eq!(generic[0]["unit"], json!("CNY"));
+    }
+
+    /// 关键隔离:`kimi (月之暗面)` PAYG(moonshot host)→ balance 支持;订阅制 `kimi-code`
+    /// (`api.kimi.com/coding`)→ 不被识别成 moonshot、无 balance 端点。两者绝不混淆。
+    #[test]
+    fn moonshot_kind_separates_kimi_paygo_from_kimi_code() {
+        let kimi_paygo =
+            json!({"name": "Kimi (月之暗面)", "baseUrl": "https://api.moonshot.cn/v1"});
+        assert_eq!(provider_kind(&kimi_paygo), "moonshot");
+        let (kind, endpoint) = balance_endpoint(&kimi_paygo).expect("moonshot endpoint");
+        assert_eq!(kind, "moonshot");
+        assert_eq!(endpoint, "https://api.moonshot.cn/v1/users/me/balance");
+
+        // 订阅制 kimi-code:host 是 api.kimi.com,**不含 moonshot** → unknown、无 balance 端点。
+        let kimi_code = json!({"name": "Kimi Code", "baseUrl": "https://api.kimi.com/coding/v1"});
+        assert_eq!(provider_kind(&kimi_code), "unknown");
+        assert!(balance_endpoint(&kimi_code).is_none());
+
+        // 国际站 .ai → 切到 api.moonshot.ai 端点。
+        let kimi_intl = json!({"name": "Moonshot", "baseUrl": "https://api.moonshot.ai/v1"});
+        let (_, endpoint) = balance_endpoint(&kimi_intl).expect("moonshot.ai endpoint");
+        assert_eq!(endpoint, "https://api.moonshot.ai/v1/users/me/balance");
+    }
+
+    #[test]
+    fn moonshot_balance_normalizes_available_and_breakdown() {
+        let items = normalize_balance_payload(
+            "moonshot",
+            &json!({
+                "code": 0,
+                "data": {"available_balance": 49.58, "voucher_balance": 46.58, "cash_balance": 3.0},
+                "status": true
+            }),
+        );
+        assert_eq!(items[0]["label"], json!("balance"));
+        assert_eq!(items[0]["remaining"], json!(49.58));
+        assert_eq!(items[0]["unit"], json!("CNY"));
+        assert_eq!(items[1]["label"], json!("cash"));
+        assert_eq!(items[1]["remaining"], json!(3.0));
+        assert_eq!(items[2]["label"], json!("voucher"));
+        assert_eq!(items[2]["remaining"], json!(46.58));
+
+        // 缺 available_balance → 空(ok=false,前端显「暂未识别到余额」)。
+        assert!(normalize_balance_payload("moonshot", &json!({"data": {}})).is_empty());
     }
 }

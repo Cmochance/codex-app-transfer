@@ -1031,6 +1031,34 @@ fn active_anyrouter_provider() -> Option<(String, String)> {
     Some((host, api_key.to_string()))
 }
 
+/// 活动 provider 若是 Kimi (月之暗面 / Moonshot) PAYG(baseUrl host = `moonshot.cn` /
+/// `moonshot.ai`)且有 apiKey → 返回 `(host, apiKey)`,否则 None。余额走推理同一把 key
+/// (Bearer),官方 `/v1/users/me/balance`(见 [`crate::moonshot_quota`])。
+///
+/// **订阅制 `kimi-code`(host `api.kimi.com`,coding plan 5h 窗口)不匹配** —— 它无余额接口,
+/// 与本 PAYG provider 是两个不同 provider。gate 只认 `moonshot.{cn,ai}` host,绝不波及 kimi-code。
+fn active_moonshot_provider() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    if !(host.ends_with("moonshot.cn") || host.ends_with("moonshot.ai")) {
+        return None;
+    }
+    let api_key = p
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some((host, api_key.to_string()))
+}
+
 /// 取 antigravity gemini 双窗口额度(白名单 gate + token 校验 + 45s 缓存)。非白名单 /
 /// token 失效 → 清缓存 + None(不显额度行)。token 复用文件 refresh_token 刷新(同 app)。
 async fn fetch_antigravity_quota(
@@ -1302,6 +1330,51 @@ async fn fetch_anyrouter_quota(
     }
 }
 
+/// 取 Kimi (月之暗面 / Moonshot) PAYG 余额(host gate + 45s 缓存)。非 moonshot / key 失效 →
+/// 清缓存 + None。用推理同一把 apiKey 查官方 `/v1/users/me/balance`。`kimi-code` host gate 不命中。
+async fn fetch_moonshot_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::moonshot_quota::{fetch_moonshot_balance, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((host, api_key)) = active_moonshot_provider() else {
+        *cache = None;
+        return None;
+    };
+    let fp = quota_fingerprint(&[&host, &api_key]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_moonshot_balance(http, &host, &api_key).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] Moonshot balance 鉴权失败(key 失效)→ 清缓存");
+            *cache = None;
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] Moonshot balance 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// 按阶段分级记录推送失败:connect 失败 = Codex 没跑(常态,debug);
 /// evaluate 失败 = Codex 在跑但注入坏了(真异常,warn 一次后去重降 debug,
 /// 防 5s tick 刷屏;成功后复位再坏会再 warn)。
@@ -1350,6 +1423,7 @@ pub async fn run_quota_daemon() {
     let mut mimo_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut deepseek_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     let mut anyrouter_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut moonshot_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -1381,12 +1455,14 @@ pub async fn run_quota_daemon() {
         let mimo = fetch_mimo_quota(&quota_http, &mut mimo_cache).await;
         let deepseek = fetch_deepseek_quota(&quota_http, &mut deepseek_cache).await;
         let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
+        let moonshot = fetch_moonshot_quota(&quota_http, &mut moonshot_cache).await;
         // 取活动那个源(互斥,最多一个 Some);空额度(无窗口无条目)→ 视作无,不显额度行。
         let quota = antigravity
             .or(glm)
             .or(mimo)
             .or(deepseek)
             .or(anyrouter)
+            .or(moonshot)
             .filter(ProviderQuota::has_any);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
