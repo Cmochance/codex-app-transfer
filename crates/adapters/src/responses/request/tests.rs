@@ -1,9 +1,8 @@
-use super::tools::*;
 use super::*;
 use crate::types::AdapterError;
 use codex_app_transfer_registry::Provider;
 use indexmap::IndexMap;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 fn convert(body: Value) -> Value {
     responses_body_to_chat_body(&body).unwrap()
@@ -237,6 +236,8 @@ fn minimax_tool_choice_required_is_downgraded_to_auto() {
         "model": "MiniMax-M2.7",
         "stream": true,
         "input": "hi",
+        // tool_choice 仅在有 tools 时转发(MOC-208),带一个 function 工具以走 M2.x required→auto 降级
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}],
         "tool_choice": {"type": "required"}
     });
     let p = minimax_provider();
@@ -1236,131 +1237,98 @@ fn unknown_tool_type_dropped_via_warn_once_path_does_not_panic() {
     assert_eq!(tools[0]["function"]["name"], "keep_me");
 }
 
-// ── web_search 工具 per-provider 适配 — MiMo 阶段 ─────────────────
-// Codex.app 入站默认每轮发 `{type:"web_search", external_web_access:true,
-// search_content_types:["text","image"]}`(实测 dump),代理把这个统一
-// 形态转成各上游 chat API 真实支持的形态。本批仅 MiMo 实施(1:1 复刻
-// mimo2codex `reqToChat.ts:196-209`),Kimi/DeepSeek/MiniMax 等留 follow-up
-// (逐家文档实证后跟进,见 `docs/web-search-implementation-tracker.md`)。
+// ── web_search 一律 drop(MOC-208)─────────────────────────────────
+// 本项目自研 web_fetch/web_search(MOC-190,Chrome-based)已统一覆盖联网,不再
+// 借任何第三方 provider 的原生 web search。`convert_web_search_tool` 无条件 drop;
+// 历史的 xiaomi/kimi 原生注入 + A/B 层 web_search_enabled 开关 + Kimi
+// thinking-disabled 后处理均已移除。
 
-/// MiMo provider 用于 web_search 测试 — 显式 enable Web Search Plugin。
-/// A 层默认 false,测试需要显式开才会触发转换。
-fn mimo_provider_with_web_search() -> Provider {
-    let mut p = mimo_provider();
-    p.models.insert("default".into(), "mimo-v2.5".into());
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
+/// chat 形 provider 简易构造(显式 openai_chat + default model)。
+fn ws_chat_provider(id: &str, name: &str, base: &str, model: &str) -> Provider {
+    let mut p = provider(id, name, base);
+    p.models.insert("default".into(), model.into());
+    p.api_format = "openai_chat".into();
     p
 }
 
 #[test]
-fn mimo_web_search_converted_to_native_schema_with_user_location() {
-    let p = mimo_provider_with_web_search();
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"搜索 X 最新进展"}],
-        "tools": [
-            {
-                "type": "web_search",
-                "external_web_access": true,
-                "search_content_types": ["text", "image"],
-                "user_location": {
-                    "type": "approximate",
-                    "country": "CN",
-                    "city": "Shanghai"
-                },
-                "max_keyword": 5,
-                "force_search": true,
-                "limit": 10
-            }
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 1);
-    let tool = &tools[0];
-    assert_eq!(
-        tool["type"], "web_search",
-        "MiMo chat 端原生 type:web_search"
-    );
-    assert_eq!(tool["user_location"]["country"], "CN");
-    assert_eq!(tool["user_location"]["city"], "Shanghai");
-    assert_eq!(tool["max_keyword"], 5);
-    assert_eq!(tool["force_search"], true);
-    assert_eq!(tool["limit"], 10);
-    // OpenAI 的 external_web_access / search_content_types 在 MiMo 无等价,silent drop
-    assert!(
-        tool.get("external_web_access").is_none(),
-        "external_web_access 在 MiMo 无等价,必须 silent drop"
-    );
-    assert!(
-        tool.get("search_content_types").is_none(),
-        "search_content_types 在 MiMo 无等价,必须 silent drop"
-    );
+fn web_search_dropped_for_all_providers_even_with_flag_enabled() {
+    // 历史上 xiaomi/kimi 在 web_search_enabled=true 时注入原生 search;现在无条件
+    // drop,该 flag 不再有任何效果。逐 provider 验证:web_search 被丢、同 turn 的
+    // 普通 function 工具保留、不再注入 Kimi thinking disabled。
+    for (id, name, base, model) in [
+        (
+            "xiaomimimo",
+            "MiMo",
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2.5",
+        ),
+        (
+            "kimi-for-coding",
+            "Kimi",
+            "https://api.kimi.com/coding/v1",
+            "kimi-for-coding",
+        ),
+        (
+            "moonshot",
+            "Moonshot",
+            "https://api.moonshot.cn/v1",
+            "kimi-k2.6",
+        ),
+        (
+            "deepseek",
+            "DeepSeek",
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-pro",
+        ),
+    ] {
+        let mut p = ws_chat_provider(id, name, base, model);
+        // 即便用户显式开 web_search_enabled=true 也不再生效
+        p.request_options
+            .insert("web_search_enabled".into(), json!(true));
+        let req = json!({
+            "model": model,
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"hi"}],
+            "tools": [
+                {"type":"web_search","external_web_access":true,"search_content_types":["text"]},
+                {"type":"function","name":"keep_me","parameters":{"type":"object","properties":{}}}
+            ]
+        });
+        let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "{id}: web_search 必须被 drop,只剩 keep_me");
+        assert_eq!(tools[0]["function"]["name"], "keep_me");
+        assert!(
+            out.get("thinking").is_none(),
+            "{id}: 不该再注入 Kimi thinking disabled"
+        );
+    }
 }
 
 #[test]
-fn mimo_web_search_with_minimal_fields_outputs_minimal_tool() {
-    // 用户没传 user_location / max_keyword 等字段时,只输出 type:"web_search"
-    let p = mimo_provider_with_web_search();
+fn web_search_preview_alias_also_dropped() {
+    let p = ws_chat_provider(
+        "kimi-for-coding",
+        "Kimi",
+        "https://api.kimi.com/coding/v1",
+        "kimi-for-coding",
+    );
     let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search", "external_web_access": true, "search_content_types": ["text"]}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1);
-    let keys: Vec<&String> = tools[0].as_object().unwrap().keys().collect();
-    assert_eq!(keys, vec![&"type".to_string()], "无可选字段时只剩 type");
-    assert_eq!(tools[0]["type"], "web_search");
-}
-
-#[test]
-fn mimo_web_search_preview_alias_handled_same_as_web_search() {
-    // Codex.app 历史上有过 web_search_preview / web_search 两种 type,
-    // mimo2codex `reqToChat.ts:196` 同样处理,我们也照抄。
-    let p = mimo_provider_with_web_search();
-    let req = json!({
-        "model": "mimo-v2.5",
+        "model": "kimi-for-coding",
         "stream": true,
         "input": [{"type":"message","role":"user","content":"hi"}],
         "tools": [{"type":"web_search_preview"}]
     });
     let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    assert_eq!(out["tools"][0]["type"], "web_search");
+    assert!(
+        out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty(),
+        "web_search_preview 同样 drop,无其它工具时 tools 不写入"
+    );
 }
 
 #[test]
-fn non_mimo_provider_web_search_dropped_via_warn_once() {
-    // Kimi / DeepSeek / MiniMax 等 provider 暂未文档实证,走 drop + warn_once。
-    // 用户实际会看到模型走 P5 修通的 namespace MCP 工具(如 Node Repl)绕路
-    // 联网搜索;后续逐家文档实证后再加映射。
-    let mut kimi = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
-    kimi.models.insert("default".into(), "kimi-k2.6".into());
-    let req = json!({
-        "model": "kimi-k2.6",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search", "external_web_access": true, "search_content_types": ["text"]},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&kimi)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 1, "Kimi 暂未实施,web_search drop 只剩 keep_me");
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-}
-
-#[test]
-fn web_search_with_no_provider_context_dropped() {
-    // 极端情况:没有 provider 上下文(应该不发生,resolver 必填),
-    // 安全 drop 不 panic
+fn web_search_dropped_with_no_provider_context() {
     let req = json!({
         "model": "any",
         "stream": true,
@@ -1368,326 +1336,64 @@ fn web_search_with_no_provider_context_dropped() {
         "tools": [{"type":"web_search"}]
     });
     let out = convert(req);
-    // 没 provider 时整个 web_search drop,tools 字段不存在(empty 数组不写入)
     assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
 }
 
-// ── A 层(provider 配置开关)──
-// `request_options.web_search_enabled` 默认 false,用户必须显式标 true。
-// 默认关闭原因:很多 provider(如 MiMo Token Plan)没开 plugin 时发
-// web_search 工具会触发上游 400。
-
 #[test]
-fn mimo_provider_without_web_search_enabled_drops_web_search_by_default() {
-    // 默认状态:mimo_provider() 没设 web_search_enabled → 视为 false → drop
-    let mut p = mimo_provider();
-    p.models.insert("default".into(), "mimo-v2.5".into());
-    // 故意不设 web_search_enabled
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search", "external_web_access": true},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(
-        tools.len(),
-        1,
-        "默认 web_search_enabled=false → web_search 被 A 层 drop"
-    );
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-}
-
-#[test]
-fn mimo_provider_with_explicit_web_search_enabled_false_drops_web_search() {
-    // 显式标 false 跟没设效果一致 — 都触发 A 层 drop
-    let mut p = mimo_provider();
-    p.models.insert("default".into(), "mimo-v2.5".into());
-    p.request_options
-        .insert("web_search_enabled".into(), json!(false));
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
-}
-
-// ── B 层(运行时自动 disable cache)──
-// `crate::disable_web_search_for(provider_id)` 后,即使配置 web_search_enabled=true,
-// 同 provider id 后续转换也立即 drop。模拟 forward.rs 4xx fallback 后的行为。
-
-#[test]
-fn b_layer_runtime_disable_blocks_subsequent_web_search_conversion() {
-    let mut p = mimo_provider_with_web_search();
-    p.id = "mimo-runtime-disable-test".into();
-    // 模拟 forward.rs 4xx fallback 调用
-    crate::disable_web_search_for(&p.id);
-
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search"},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(
-        tools.len(),
-        1,
-        "运行时 disable cache 命中 → web_search 被 B 层 drop,只剩 keep_me"
-    );
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-    assert!(crate::is_web_search_disabled_for(&p.id));
-}
-
-#[test]
-fn b_layer_runtime_disable_only_affects_targeted_provider_id() {
-    // disable provider A 不影响 provider B(各自 cache 隔离)
-    let mut a = mimo_provider_with_web_search();
-    a.id = "mimo-disable-a".into();
-    let mut b = mimo_provider_with_web_search();
-    b.id = "mimo-untouched-b".into();
-    crate::disable_web_search_for(&a.id);
-
-    let req = json!({
-        "model": "mimo-v2.5",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out_b = responses_body_to_chat_body_for_provider(&req, Some(&b)).unwrap();
-    // b 的 web_search_enabled=true 且没被 disable,正常转换
-    assert_eq!(out_b["tools"][0]["type"], "web_search");
-}
-
-// ── Kimi (Moonshot) web_search builtin_function 映射 ──
-// 来源:WebFetch `platform.kimi.ai/docs/guide/use-web-search` 真原文实证。
-// 1:1 复刻官方文档:tools 形态固定 `{type:"builtin_function", function:{name:"$web_search"}}`,
-// 强制配套 `thinking:{type:"disabled"}` 顶级字段(Kimi 文档明确强制)。
-
-fn kimi_provider_with_web_search() -> Provider {
-    let mut p = provider(
+fn forced_tool_choice_dropped_when_web_search_was_only_tool() {
+    // [MOC-208] 某轮只带 web_search + tool_choice=required:web_search 被 drop 后
+    // tools 整体变空,此时绝不能仍透传 tool_choice=required(上游会因「强制用工具但
+    // 无工具」返 400)。tools 缺席时 tool_choice 也必须不发。
+    let p = ws_chat_provider(
         "kimi-for-coding",
-        "Kimi For Coding",
+        "Kimi",
         "https://api.kimi.com/coding/v1",
-    );
-    p.models.insert("default".into(), "kimi-for-coding".into());
-    p.api_format = "openai_chat".into();
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
-    p
-}
-
-fn moonshot_provider_with_web_search() -> Provider {
-    let mut p = provider("moonshot", "Moonshot", "https://api.moonshot.cn/v1");
-    p.models.insert("default".into(), "kimi-k2.6".into());
-    p.api_format = "openai_chat".into();
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
-    p
-}
-
-#[test]
-fn kimi_web_search_outputs_builtin_function_with_dollar_prefix_name() {
-    let p = kimi_provider_with_web_search();
-    let req = json!({
-        "model": "kimi-for-coding",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"搜索 X"}],
-        "tools": [
-            {
-                "type": "web_search",
-                "external_web_access": true,
-                "search_content_types": ["text", "image"],
-                "user_location": {"country": "CN"},
-                "max_keyword": 5
-            }
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 1);
-    // Kimi 形态:固定 builtin_function + $web_search,**不透传任何子字段**
-    assert_eq!(tools[0]["type"], "builtin_function");
-    assert_eq!(tools[0]["function"]["name"], "$web_search");
-    // OpenAI 字段全部 silent drop(Kimi 文档明确只要 type + function.name)
-    assert!(tools[0].get("user_location").is_none());
-    assert!(tools[0].get("max_keyword").is_none());
-    assert!(tools[0].get("external_web_access").is_none());
-    assert!(tools[0].get("search_content_types").is_none());
-}
-
-#[test]
-fn kimi_web_search_force_injects_thinking_disabled_top_level_field() {
-    let p = kimi_provider_with_web_search();
-    let req = json!({
-        "model": "kimi-for-coding",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    // Kimi 文档强制:`thinking:{type:"disabled"}` 顶级字段必填
-    assert_eq!(
-        out["thinking"],
-        json!({"type": "disabled"}),
-        "Kimi $web_search 必须配套 thinking disabled(官方文档强制)"
-    );
-}
-
-#[test]
-fn moonshot_provider_uses_same_kimi_web_search_form() {
-    // moonshot.cn / kimi.ai 同公司,provider_looks_like("moonshot") 同样命中
-    let p = moonshot_provider_with_web_search();
-    let req = json!({
-        "model": "kimi-k2.6",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    assert_eq!(out["tools"][0]["type"], "builtin_function");
-    assert_eq!(out["tools"][0]["function"]["name"], "$web_search");
-    assert_eq!(out["thinking"], json!({"type": "disabled"}));
-}
-
-#[test]
-fn kimi_without_web_search_enabled_does_not_inject_thinking() {
-    // 未启用 web_search 时不该强制 disable thinking(用户原 thinking 配置不变)
-    let mut p = provider(
         "kimi-for-coding",
-        "Kimi For Coding",
-        "https://api.kimi.com/coding/v1",
     );
-    p.models.insert("default".into(), "kimi-for-coding".into());
-    // 故意不设 web_search_enabled
     let req = json!({
         "model": "kimi-for-coding",
         "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search"},
-            {"type":"function", "name":"shell", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    // web_search 被 A 层 drop(默认关),不该注入 thinking disabled
-    assert!(
-        out.get("thinking").is_none(),
-        "未启用 web_search 时不该注入 thinking disabled,实际: {:?}",
-        out.get("thinking")
-    );
-    // shell function 仍然保留
-    assert_eq!(out["tools"][0]["function"]["name"], "shell");
-}
-
-#[test]
-fn kimi_web_search_b_layer_runtime_disable_skips_thinking_injection() {
-    // B 层 cache 命中(运行时已 disable)→ web_search drop → 不该注入 thinking
-    let mut p = kimi_provider_with_web_search();
-    p.id = "kimi-runtime-disabled".into();
-    crate::disable_web_search_for(&p.id);
-    let req = json!({
-        "model": "kimi-for-coding",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    assert!(
-        out.get("thinking").is_none(),
-        "B 层 cache disable 后 web_search drop,thinking 不该注入"
-    );
-}
-
-// ── DeepSeek web_search drop(文档实证不支持)──
-// 来源:WebFetch `api-docs.deepseek.com/api/create-chat-completion` 真原文
-// (2026-05-09):"Currently, only `function` is supported." DeepSeek chat
-// completions tools 数组只接受 type:"function",无任何 server-side web 搜索。
-
-#[test]
-fn deepseek_web_search_dropped_with_explicit_warn_key() {
-    // DeepSeek 即使 web_search_enabled=true 也 drop(API 不支持)
-    let mut p = deepseek_provider();
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
-    let req = json!({
-        "model": "deepseek-v4-pro",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search"},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(
-        tools.len(),
-        1,
-        "DeepSeek API 不支持 web_search,只剩 keep_me function"
-    );
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-    // DeepSeek 不应触发 Kimi thinking 注入(它跟 thinking-disabled 路径无关)
-    assert!(out.get("thinking").is_none());
-}
-
-// ── MiniMax web_search drop(文档实证不支持)──
-// 来源:WebFetch `platform.minimaxi.com/docs/api-reference/` + liteLLM
-// MiniMax provider 文档(2026-05-09):MiniMax chat completions tools 只接受
-// type:"function",无内置 web_search;web_search 仅作 Token Plan MCP 工具存在。
-
-#[test]
-fn minimax_web_search_dropped_with_explicit_warn_key() {
-    let mut p = minimax_provider();
-    p.request_options
-        .insert("web_search_enabled".into(), json!(true));
-    let req = json!({
-        "model": "MiniMax-M2.7",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [
-            {"type":"web_search"},
-            {"type":"function", "name":"keep_me", "parameters":{"type":"object","properties":{}}}
-        ]
-    });
-    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
-    let tools = out["tools"].as_array().unwrap();
-    assert_eq!(
-        tools.len(),
-        1,
-        "MiniMax chat API 不支持 web_search,只剩 keep_me function"
-    );
-    assert_eq!(tools[0]["function"]["name"], "keep_me");
-    // MiniMax 不应触发 Kimi thinking 注入(它跟 thinking-disabled 路径无关)
-    assert!(out.get("thinking").is_none());
-}
-
-#[test]
-fn deepseek_web_search_drop_independent_of_web_search_enabled_flag() {
-    // 即使用户显式标 web_search_enabled=false / 不标,DeepSeek 都 drop
-    // (其实只是 DeepSeek 不支持的硬实事,跟 A 层无关)
-    let p = deepseek_provider(); // 默认未标 web_search_enabled
-    let req = json!({
-        "model": "deepseek-v4-pro",
-        "stream": true,
-        "input": [{"type":"message","role":"user","content":"hi"}],
-        "tools": [{"type":"web_search"}]
+        "input": [{"type":"message","role":"user","content":"搜一下"}],
+        "tools": [{"type":"web_search"}],
+        "tool_choice": "required"
     });
     let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
     assert!(
         out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty(),
-        "DeepSeek 默认未启用 web_search 时,A 层先 drop(走 disabled-by-config 路径)"
+        "web_search 应被 drop,tools 为空"
+    );
+    assert!(
+        out.get("tool_choice").is_none(),
+        "tools 为空时不应转发 tool_choice(避免畸形 required+无工具);实际:{:?}",
+        out.get("tool_choice")
+    );
+}
+
+#[test]
+fn tool_choice_still_forwarded_when_real_tools_remain() {
+    // 回归保护:web_search 被 drop 但仍有普通 function 工具时,tool_choice 正常转发。
+    let p = ws_chat_provider(
+        "kimi-for-coding",
+        "Kimi",
+        "https://api.kimi.com/coding/v1",
+        "kimi-for-coding",
+    );
+    let req = json!({
+        "model": "kimi-for-coding",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"web_search"},
+            {"type":"function","name":"shell","parameters":{"type":"object","properties":{}}}
+        ],
+        "tool_choice": "auto"
+    });
+    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+    assert_eq!(out["tools"].as_array().unwrap().len(), 1, "只剩 shell");
+    assert_eq!(
+        out["tool_choice"],
+        json!("auto"),
+        "有 tools 时 tool_choice 正常转发"
     );
 }
 
@@ -3904,6 +3610,8 @@ fn text_format_reasoning_and_special_fields_follow_legacy_conversion() {
         "service_tier": "priority",
         "modalities": ["text", "audio", "bad"],
         "audio": {"voice": "alloy", "format": "mp3"},
+        // tool_choice 仅在有 tools 时转发(MOC-208),故带一个 function 工具以覆盖 any→required 归一
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}],
         "tool_choice": {"type": "any"}
     }));
     assert_eq!(out["response_format"]["type"], "json_schema");
