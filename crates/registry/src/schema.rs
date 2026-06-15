@@ -34,6 +34,12 @@ pub struct Config {
     #[serde(default)]
     pub providers: Vec<Provider>,
     pub settings: Settings,
+    /// 整合(池化)模式的**全局**槽位映射:`{ "gpt_5_5": {"provider":"<id>","model":"<m>"}, ... }`。
+    /// 把 Codex 标准档(gpt-5.x)映射到池中某 (provider, model);catalog + resolver 经
+    /// `pool_slot_entries` 消费(真机确认 provider/model slug 进不了 Codex picker,故整合模式只
+    /// 暴露标准档)。缺省 `Null`(且 `skip_serializing_if` → 不写盘,旧 config round-trip 不变)。
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub pool_slot_mappings: Value,
 }
 
 impl Default for Config {
@@ -44,6 +50,7 @@ impl Default for Config {
             gateway_api_key: None,
             providers: Vec::new(),
             settings: Settings::default(),
+            pool_slot_mappings: Value::Null,
         }
     }
 }

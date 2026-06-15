@@ -340,6 +340,62 @@ pub fn unique_pool_slugs(providers: &[crate::Provider]) -> Vec<PoolEntry> {
     entries
 }
 
+/// 全局槽位映射的池条目:把 OpenAI 标准档(`gpt-5.5` 等)映射到池中某 (provider, model)。
+///
+/// 与 [`unique_pool_slugs`] 不同 —— 真机确认 `provider/model` 这种 slug **进不了 Codex model
+/// picker**,故整合模式 catalog 改走「标准档 slug(`gpt-5.5` 等)+ 全局映射」:Codex 只显示标准
+/// 档,选某档由 resolver 按本表路由到映射的 (provider, model)。catalog 生成端(snapshot)与
+/// resolver 路由端(proxy_runner)共用本函数 → slug 逐字一致(byte-identity)。
+///
+/// `slot_mappings` 形如 `{ "gpt_5_5": {"provider":"<id>","model":"<m>"}, ... }`(全局一份)。
+/// 只产**有效**条目:target provider 必须在整合子集内(`pooledEnabled`)且 model 非空 ——
+/// 否则会路由到用户移出整合 / 不存在的目标。slug = 槽位 OpenAI id(`gpt-5.5`),
+/// real_model = 映射模型(已 strip 内部 `[1m]`,1M 信号转入 `supports_one_m`)。
+pub fn pool_slot_entries(
+    providers: &[crate::Provider],
+    slot_mappings: Option<&Value>,
+) -> Vec<PoolEntry> {
+    let mut entries = Vec::new();
+    let Some(obj) = slot_mappings.and_then(Value::as_object) else {
+        return entries;
+    };
+    for slot in MODEL_SLOTS {
+        let Some(openai_id) = slot.openai_id else {
+            continue; // 只映射有 OpenAI id 的标准档(跳过 default)
+        };
+        let Some(target) = obj.get(slot.key).and_then(Value::as_object) else {
+            continue;
+        };
+        let provider_id = target
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let model = target
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if provider_id.is_empty() || model.is_empty() {
+            continue;
+        }
+        // target provider 必须在整合子集内,否则路由到被排除 / 已删的 provider。
+        let Some(idx) = providers
+            .iter()
+            .position(|p| p.id == provider_id && provider_pooled_enabled(p))
+        else {
+            continue;
+        };
+        entries.push(PoolEntry {
+            provider_idx: idx,
+            slug: openai_id.to_owned(),
+            real_model: strip_internal_model_suffix(model),
+            supports_one_m: has_internal_one_m_suffix(model),
+        });
+    }
+    entries
+}
+
 /// 由池条目构建 resolver 用的反查表:`catalog slug → (provider_idx, real_model)`。
 pub fn build_catalog_slug_map(entries: &[PoolEntry]) -> HashMap<String, (usize, String)> {
     entries
@@ -471,6 +527,43 @@ mod tests {
             sort_index: 0,
             extra,
         }
+    }
+
+    #[test]
+    fn pool_slot_entries_maps_standard_slots_to_valid_pool_targets() {
+        let a = mk_provider("deepseek", "DeepSeek"); // pooledEnabled=true
+        let b = mk_provider("kimi", "Kimi");
+        let mut excluded = mk_provider("x", "X");
+        excluded.extra.insert("pooledEnabled".into(), json!(false));
+        let providers = vec![a, b, excluded];
+        let mappings = json!({
+            "gpt_5_5": {"provider": "deepseek", "model": "deepseek-v4-pro"},
+            "gpt_5_4": {"provider": "kimi", "model": "kimi-k2.6[1m]"},
+            "gpt_5_4_mini": {"provider": "x", "model": "whatever"}, // x 未加入整合 → 跳过
+            "gpt_5_2": {"provider": "deepseek", "model": ""}        // model 空 → 跳过
+        });
+        let entries = pool_slot_entries(&providers, Some(&mappings));
+        let by_slug: HashMap<&str, (usize, &str, bool)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.slug.as_str(),
+                    (e.provider_idx, e.real_model.as_str(), e.supports_one_m),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_slug.get("gpt-5.5"),
+            Some(&(0usize, "deepseek-v4-pro", false))
+        );
+        // [1m] 被 strip,1M 信号转入 supports_one_m
+        assert_eq!(by_slug.get("gpt-5.4"), Some(&(1usize, "kimi-k2.6", true)));
+        assert!(
+            !by_slug.contains_key("gpt-5.4-mini"),
+            "excluded provider 不产条目"
+        );
+        assert!(!by_slug.contains_key("gpt-5.2"), "空 model 不产条目");
+        assert!(!by_slug.contains_key("default"), "default 非标准档不产条目");
     }
 
     #[test]

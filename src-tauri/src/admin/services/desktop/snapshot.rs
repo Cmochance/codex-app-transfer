@@ -3,15 +3,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_app_transfer_codex_integration::{
-    apply_provider, catalog_models_for_pool, catalog_models_for_provider_with_display_names,
-    ensure_file_store_mode, get_snapshot_status, has_snapshot, has_stale_active_snapshot,
-    list_snapshots, read_auth, restore_available_count, restore_codex_snapshot,
-    restore_codex_state, sync_mcp_credentials, ApplyConfig, CatalogModel, CodexPaths,
-    PoolProviderMeta,
+    apply_provider, catalog_models_for_provider_with_display_names,
+    catalog_models_for_slot_mappings, ensure_file_store_mode, get_snapshot_status, has_snapshot,
+    has_stale_active_snapshot, list_snapshots, read_auth, restore_available_count,
+    restore_codex_snapshot, restore_codex_state, sync_mcp_credentials, ApplyConfig, CatalogModel,
+    CodexPaths, PoolProviderMeta,
 };
 use codex_app_transfer_gemini_oauth::antigravity_static_models;
 use codex_app_transfer_proxy::proxy_telemetry;
-use codex_app_transfer_registry::{unique_pool_slugs, RawConfig};
+use codex_app_transfer_registry::{pool_slot_entries, RawConfig};
 use serde_json::{json, Value};
 
 use crate::admin::handlers::common::{active_provider_name, read_setting_bool, APP_VERSION};
@@ -78,16 +78,17 @@ fn antigravity_display_names(api_format_lower: &str) -> Value {
     Value::Object(map)
 }
 
-/// 池化 catalog 构建:对 config 里**全部** provider 用 `unique_pool_slugs`(与 proxy
-/// resolver 反查表**同一 helper** → slug 逐字一致、不错路由)产池条目,再
-/// `catalog_models_for_pool` 生成 Codex catalog。返回 `(catalog, pool_default_slug)`,
-/// 后者 = active provider 的首条池条目 slug(给 apply 锚定 root `model`)。
+/// 整合(池化)catalog 构建:把**全局槽位映射** `poolSlotMappings`(`gpt-5.x → {provider,model}`)
+/// 经 `pool_slot_entries`(与 proxy resolver 反查表**同一 helper** → slug 逐字一致)产标准档条目,
+/// 再 `catalog_models_for_slot_mappings` 生成 Codex catalog。返回 `(catalog, pool_default_slug)`,
+/// 后者 = 首条标准档 slug(MODEL_SLOTS 顺序,即 gpt-5.5 优先;给 apply 锚定 root `model`)。
 ///
-/// `None` = 无法池化(无 provider / 解析异常 / 无可池模型)→ caller 退回单 provider
-/// catalog,**绝不返回空 catalog**(空会让 Codex picker 空)。
+/// **真机确认 `provider/model` slug 进不了 Codex picker**,故整合模式只把标准档(gpt-5.x)暴露
+/// 给 Codex,下池 provider/model 仅作映射来源。`None` = 无有效映射(没配 / target 都被移出整合 /
+/// model 空 / 解析异常)→ caller 退回单 provider catalog,**绝不返回空 catalog**(空会让 picker 空)。
 fn build_pool_catalog(
     cfg: &RawConfig,
-    active_id: Option<&str>,
+    _active_id: Option<&str>,
 ) -> Option<(Vec<CatalogModel>, Option<String>)> {
     let providers_raw = cfg.get("providers").and_then(|v| v.as_array())?;
     if providers_raw.is_empty() {
@@ -113,18 +114,15 @@ fn build_pool_catalog(
             }
         }
     }
-    let entries = unique_pool_slugs(&typed);
+    // 全局槽位映射 → 标准档条目(pool_slot_entries 已校验 target provider 在整合子集内 + model 非空)。
+    let entries = pool_slot_entries(&typed, cfg.get("poolSlotMappings"));
     if entries.is_empty() {
-        // 池里**一个 slug 都没有**(没 provider 加入整合,或加入的都被 curation 清空)→ 返回
-        // `None`,caller 退回单 active provider catalog。**catalog 与 resolver 一致地回退**是关键:
-        // 此前曾对「加入但全清空」返 `Some(空)`,但 resolver 对空 catalog_slug_map 仍按 legacy 模式
-        // (slug 拆分 / 默认 provider)路由 → catalog 空、resolver 仍回退 = 不一致(#477 P2 round-5)。
-        // 故统一「池空即整体回退」(graceful、Codex 不至于空),回退本身有 loud log 兜底可排查。
+        // 没有任何有效的标准档映射(没配 / target 都被移出整合 / model 空)→ 返回 `None`,
+        // caller 退回单 active provider catalog。**catalog 与 resolver 一致地回退**(resolver 端
+        // 反查表也为空 → 退默认 provider),graceful、Codex 不至于空,回退有 loud log 兜底可排查。
         return None;
     }
-    // meta 直接从 typed 构建(与 entries 同源 → `entry.provider_idx` 对齐是**结构保证**,
-    // 不再靠"两次遍历同序"约定)。typed 反序列化要求 `name` 存在,故此处 name 必有(可能为
-    // 空串,catalog_models_for_pool 视空串为不加 provider 前缀,与 raw accessor 行为一致)。
+    // meta 按 provider_idx 索引取窗口 / display(标准档 catalog 的 context_window 取映射模型的)。
     let meta: Vec<PoolProviderMeta> = typed
         .iter()
         .map(|p| PoolProviderMeta {
@@ -134,26 +132,12 @@ fn build_pool_catalog(
             display_names: antigravity_display_names(&p.api_format.trim().to_ascii_lowercase()),
         })
         .collect();
-    let catalog = catalog_models_for_pool(&entries, &meta);
+    let catalog = catalog_models_for_slot_mappings(&entries, &meta);
     if catalog.is_empty() {
         return None;
     }
-    // 诊断:哪些 provider 没贡献任何池条目(空映射 + 无 pooledModels)→ 在 picker 里缺席。
-    // debug 级,便于排查"某 provider 模型没出现在池里"。
-    let covered: std::collections::HashSet<usize> =
-        entries.iter().map(|e| e.provider_idx).collect();
-    for (idx, p) in typed.iter().enumerate() {
-        if !covered.contains(&idx) {
-            tracing::debug!("池化:provider {:?} 无可池模型,不进池", p.id);
-        }
-    }
-    let default_slug = active_id.and_then(|id| {
-        let idx = typed.iter().position(|p| p.id == id)?;
-        entries
-            .iter()
-            .find(|e| e.provider_idx == idx)
-            .map(|e| e.slug.clone())
-    });
+    // root `model` 锚到首条标准档(pool_slot_entries 按 MODEL_SLOTS 顺序 → gpt-5.5 优先)。
+    let default_slug = entries.first().map(|e| e.slug.clone());
     Some((catalog, default_slug))
 }
 
@@ -894,10 +878,11 @@ mod tests {
     }
 
     #[test]
-    fn pool_mode_target_builds_all_provider_catalog() {
-        // exposeAllProviderModels=true + 2 provider(local_proxy)→ target.pool 含每个
-        // provider 的 <slug>/<model>;pool_default_slug = active provider 首条;
-        // expected_model_items 反映池。toggle 关时退回单 provider(pool=None)。
+    fn pool_mode_target_builds_slot_catalog() {
+        // exposeAllProviderModels=true + poolSlotMappings(标准档→池中 (provider,model))→
+        // target.pool 含**标准档** slug(gpt-5.x;真机确认 provider/model slug 进不了 Codex picker,
+        // 故整合模式只暴露标准档)。pool_default_slug = 首条标准档(MODEL_SLOTS 顺序 → gpt-5.5)。
+        // toggle 关时退回单 provider(pool=None)。
         let mut cfg = json!({
             "version": APP_VERSION,
             "activeProvider": "deepseek",
@@ -907,16 +892,19 @@ mod tests {
                     "id": "deepseek", "name": "DeepSeek",
                     "baseUrl": "https://a.example/v1", "apiFormat": "openai_chat",
                     "apiKey": "k1", "models": {"default": "deepseek-v4-pro"},
-                    "pooledEnabled": true, "sortIndex": 0
+                    "pooledModels": ["deepseek-v4-pro"], "pooledEnabled": true, "sortIndex": 0
                 },
                 {
                     "id": "kimi", "name": "Kimi",
                     "baseUrl": "https://b.example/v1", "apiFormat": "openai_chat",
                     "apiKey": "k2", "models": {"default": "kimi-k2.6"},
-                    "pooledModels": ["kimi-k2.6", "kimi-for-coding"],
-                    "pooledEnabled": true, "sortIndex": 1
+                    "pooledModels": ["kimi-k2.6"], "pooledEnabled": true, "sortIndex": 1
                 }
             ],
+            "poolSlotMappings": {
+                "gpt_5_5": {"provider": "deepseek", "model": "deepseek-v4-pro"},
+                "gpt_5_4": {"provider": "kimi", "model": "kimi-k2.6"}
+            },
             "settings": {
                 "theme": "default", "language": "zh",
                 "proxyPort": 18080, "adminPort": 18081,
@@ -928,64 +916,54 @@ mod tests {
 
         let active = cfg["providers"][0].clone();
         let target = desktop_config_target_for_provider(&mut cfg, &active, None);
-        let pool = target.pool.clone().expect("toggle 开 → pool 应为 Some");
+        let pool = target
+            .pool
+            .clone()
+            .expect("toggle 开 + 有映射 → pool 应为 Some");
         let slugs: Vec<&str> = pool.iter().map(|m| m.slug.as_str()).collect();
-        assert!(slugs.contains(&"deepseek/deepseek-v4-pro"), "{slugs:?}");
-        assert!(slugs.contains(&"kimi/kimi-k2.6"), "{slugs:?}");
-        assert!(slugs.contains(&"kimi/kimi-for-coding"), "{slugs:?}");
-        // pooledModels 优先:kimi 的 default(kimi-k2.6)+ 手加(kimi-for-coding)都在池
+        assert!(slugs.contains(&"gpt-5.5"), "{slugs:?}");
+        assert!(slugs.contains(&"gpt-5.4"), "{slugs:?}");
+        assert!(
+            !slugs.iter().any(|s| s.contains('/')),
+            "整合模式只暴露标准档,不含 provider/model slug: {slugs:?}"
+        );
         assert_eq!(
             target.pool_default_slug.as_deref(),
-            Some("deepseek/deepseek-v4-pro"),
-            "锚定到 active provider 首条池条目"
-        );
-        // display_name provider-qualified(消歧)
-        let kimi_coding = pool
-            .iter()
-            .find(|m| m.slug == "kimi/kimi-for-coding")
-            .unwrap();
-        assert_eq!(kimi_coding.display_name, "Kimi / kimi-for-coding");
-        // expected_model_items(dashboard / needsApply 判定)反映池
-        let names: Vec<String> = desktop_expected_model_items(&target)
-            .iter()
-            .filter_map(|i| i["name"].as_str().map(str::to_owned))
-            .collect();
-        assert!(
-            names.iter().any(|n| n == "kimi/kimi-for-coding"),
-            "{names:?}"
+            Some("gpt-5.5"),
+            "root model 锚到首条标准档(MODEL_SLOTS 顺序)"
         );
 
-        // toggle 关 → 退回单 active provider(pool=None,catalog 走 gpt-5.x 槽)
+        // toggle 关 → 退回单 active provider(pool=None)
         cfg["settings"]["exposeAllProviderModels"] = json!(false);
         let target_off = desktop_config_target_for_provider(&mut cfg, &active, None);
         assert!(target_off.pool.is_none(), "toggle 关 → pool=None");
     }
 
     #[test]
-    fn pool_mode_excludes_active_provider_not_in_integration() {
-        // 子集语义新引入的运行态:整合开 + active provider(deepseek)未「加入整合」
-        // (无 pooledEnabled),仅 kimi 加入 → 池非空(只含 kimi),但 active 不在池里
-        // → pool_default_slug=None。这是本次改动新可达的状态(以前全 provider 都入池,
-        // active 必有条目、default_slug 必 Some);apply 层据此退回 catalog 首条锚定,picker 不空。
-        let mut cfg = json!({
+    fn pool_slot_mapping_to_excluded_provider_is_dropped() {
+        // 映射 target 指向未加入整合的 provider → 该标准档不进 catalog(pool_slot_entries 过滤),
+        // 避免把请求路由到用户移出整合的 provider(子集语义)。
+        let cfg = json!({
             "version": APP_VERSION,
-            "activeProvider": "deepseek",
+            "activeProvider": "kimi",
             "gatewayApiKey": "cas_test",
             "providers": [
                 {
                     "id": "deepseek", "name": "DeepSeek",
                     "baseUrl": "https://a.example/v1", "apiFormat": "openai_chat",
-                    "apiKey": "k1", "models": {"default": "deepseek-v4-pro"},
-                    "sortIndex": 0
+                    "apiKey": "k1", "models": {"default": "deepseek-v4-pro"}, "sortIndex": 0
                 },
                 {
                     "id": "kimi", "name": "Kimi",
                     "baseUrl": "https://b.example/v1", "apiFormat": "openai_chat",
                     "apiKey": "k2", "models": {"default": "kimi-k2.6"},
-                    "pooledModels": ["kimi-k2.6", "kimi-for-coding"],
-                    "pooledEnabled": true, "sortIndex": 1
+                    "pooledModels": ["kimi-k2.6"], "pooledEnabled": true, "sortIndex": 1
                 }
             ],
+            "poolSlotMappings": {
+                "gpt_5_5": {"provider": "deepseek", "model": "deepseek-v4-pro"},
+                "gpt_5_4": {"provider": "kimi", "model": "kimi-k2.6"}
+            },
             "settings": {
                 "theme": "default", "language": "zh",
                 "proxyPort": 18080, "adminPort": 18081,
@@ -995,21 +973,15 @@ mod tests {
             }
         });
 
-        let active = cfg["providers"][0].clone();
-        let target = desktop_config_target_for_provider(&mut cfg, &active, None);
-        let pool = target.pool.clone().expect("kimi 加入整合 → pool 应为 Some");
-        let slugs: Vec<&str> = pool.iter().map(|m| m.slug.as_str()).collect();
-        assert!(slugs.contains(&"kimi/kimi-k2.6"), "{slugs:?}");
-        assert!(slugs.contains(&"kimi/kimi-for-coding"), "{slugs:?}");
+        let (catalog, _) = build_pool_catalog(&cfg, Some("kimi")).expect("kimi 有映射 → Some");
+        let slugs: Vec<&str> = catalog.iter().map(|m| m.slug.as_str()).collect();
         assert!(
-            !slugs.iter().any(|s| s.starts_with("deepseek/")),
-            "active 但未加入整合的 deepseek 不应在池: {slugs:?}"
+            slugs.contains(&"gpt-5.4"),
+            "kimi(已加入)的档在 catalog: {slugs:?}"
         );
-        assert!(!pool.is_empty(), "池非空 → picker 不空");
         assert!(
-            target.pool_default_slug.is_none(),
-            "active 不在整合子集 → pool_default_slug=None, got {:?}",
-            target.pool_default_slug
+            !slugs.contains(&"gpt-5.5"),
+            "映射到被排除 provider(deepseek)的档不进 catalog: {slugs:?}"
         );
     }
 
@@ -1054,54 +1026,51 @@ mod tests {
     #[test]
     fn pool_catalog_slugs_match_resolver_map_keys_byte_for_byte() {
         // **最高severity invariant 守门**:catalog 生成端(snapshot::build_pool_catalog)与
-        // resolver 路由端(proxy_runner:Config deser → unique_pool_slugs → build_catalog_slug_map)
-        // 对同一 config 必须产出**逐字一致**的 slug 集合;否则 Codex picker 选的模型会路由到
-        // 错误上游(把 prompt 发错 provider = 数据泄露级)。含 slug 碰撞 + pooledModels 两种用例。
-        use codex_app_transfer_registry::{build_catalog_slug_map, unique_pool_slugs, Config};
-        // id `acme` 与 `ACME` slug 化后都成 `acme`(provider_slug 优先用 id 并 lowercase)→
-        // 制造真实碰撞,验证 catalog 与 resolver 两端用同一 -N 后缀消歧。p3 走 pooledModels。
+        // resolver 路由端(proxy_runner:Config deser → pool_slot_entries → build_catalog_slug_map)
+        // 对同一 config 必须产出**逐字一致**的 slug 集合(整合模式 = 标准档 slug);否则 Codex
+        // picker 选的档会路由到错误上游(把 prompt 发错 provider = 数据泄露级)。
+        use codex_app_transfer_registry::{build_catalog_slug_map, pool_slot_entries, Config};
         let cfg = json!({
             "version": APP_VERSION,
-            "activeProvider": "acme",
+            "activeProvider": "deepseek",
             "gatewayApiKey": "cas_test",
             "providers": [
-                {"id":"acme","name":"Acme One","baseUrl":"https://a/v1","apiFormat":"openai_chat",
-                 "apiKey":"k","models":{"default":"qna-v1"},"pooledEnabled":true,"sortIndex":0},
-                {"id":"ACME","name":"Acme Two","baseUrl":"https://b/v1","apiFormat":"openai_chat",
-                 "apiKey":"k","models":{"default":"qna-v2"},"pooledEnabled":true,"sortIndex":1},
+                {"id":"deepseek","name":"DeepSeek","baseUrl":"https://a/v1","apiFormat":"openai_chat",
+                 "apiKey":"k","models":{"default":"deepseek-v4-pro"},
+                 "pooledModels":["deepseek-v4-pro"],"pooledEnabled":true,"sortIndex":0},
                 {"id":"kimi","name":"Kimi","baseUrl":"https://c/v1","apiFormat":"openai_chat",
                  "apiKey":"k","models":{"default":"kimi-k2.6"},
-                 "pooledModels":["kimi-k2.6","kimi-for-coding"],"pooledEnabled":true,"sortIndex":2}
+                 "pooledModels":["kimi-k2.6"],"pooledEnabled":true,"sortIndex":1}
             ],
+            "poolSlotMappings": {
+                "gpt_5_5": {"provider":"deepseek","model":"deepseek-v4-pro"},
+                "gpt_5_4": {"provider":"kimi","model":"kimi-k2.6"}
+            },
             "settings": {"theme":"default","language":"zh","proxyPort":18080,"adminPort":18081,
                 "autoStart":false,"autoApplyOnStart":true,"exposeAllProviderModels":true,
                 "restoreCodexOnExit":true,"updateUrl":DEFAULT_UPDATE_URL}
         });
 
         // catalog 端
-        let (catalog, _) = build_pool_catalog(&cfg, Some("acme")).expect("pool should build");
+        let (catalog, _) = build_pool_catalog(&cfg, Some("deepseek")).expect("pool should build");
         let catalog_slugs: std::collections::BTreeSet<String> =
             catalog.iter().map(|m| m.slug.clone()).collect();
 
         // resolver 端(完全复刻 proxy_runner::load_resolver_snapshot 的构建路径)
         let config: Config = serde_json::from_value(cfg.clone()).expect("config deser");
-        let map = build_catalog_slug_map(&unique_pool_slugs(&config.providers));
+        let map = build_catalog_slug_map(&pool_slot_entries(
+            &config.providers,
+            Some(&config.pool_slot_mappings),
+        ));
         let map_keys: std::collections::BTreeSet<String> = map.keys().cloned().collect();
 
         assert_eq!(
             catalog_slugs, map_keys,
             "catalog slug 集合必须 == resolver 反查表键集合(否则路由错上游)"
         );
-        // sanity:碰撞消歧(acme/ 与 acme-2/)+ pooledModels 生效
-        assert!(
-            map_keys.iter().any(|s| s.starts_with("acme/")),
-            "{map_keys:?}"
-        );
-        assert!(
-            map_keys.iter().any(|s| s.starts_with("acme-2/")),
-            "{map_keys:?}"
-        );
-        assert!(map_keys.contains("kimi/kimi-for-coding"), "{map_keys:?}");
+        // sanity:标准档 slug 生效
+        assert!(map_keys.contains("gpt-5.5"), "{map_keys:?}");
+        assert!(map_keys.contains("gpt-5.4"), "{map_keys:?}");
     }
 
     fn agent_debug_log(hypothesis_id: &str, location: &str, message: &str, data: Value) {

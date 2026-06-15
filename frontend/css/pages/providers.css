@@ -684,6 +684,40 @@
   color: var(--primary);
 }
 
+/* 中间「模型映射」区:左标准档标签 + 两级 select(provider → model) */
+.pool-slot-mappings {
+  display: grid;
+  gap: 10px;
+}
+
+.pool-slot-row {
+  display: grid;
+  grid-template-columns: 116px auto minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.pool-slot-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pool-slot-arrow {
+  color: var(--muted);
+}
+
+@media (max-width: 680px) {
+  .pool-slot-row {
+    grid-template-columns: 1fr 1fr;
+  }
+  .pool-slot-label {
+    grid-column: 1 / -1;
+  }
+  .pool-slot-arrow {
+    display: none;
+  }
+}
+
 /* 整合模式锁定提示(dashboard + 编辑页) */
 .integration-lock-notice {
   display: flex;

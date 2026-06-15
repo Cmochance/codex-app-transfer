@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use codex_app_transfer_proxy::{build_router_with_relogin, StaticResolver};
-use codex_app_transfer_registry::{build_catalog_slug_map, config_file, unique_pool_slugs, Config};
+use codex_app_transfer_registry::{build_catalog_slug_map, config_file, pool_slot_entries, Config};
 use serde::Serialize;
 use tokio::sync::oneshot;
 
@@ -260,11 +260,11 @@ fn load_resolver_snapshot() -> Result<ResolverSnapshot, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "gateway api key was not generated".to_owned())?;
 
-    // 池化反查表:仅 `exposeAllProviderModels` 开时构建(与 catalog 生成端共用
-    // `unique_pool_slugs`,保证 slug 逐字一致)。关 → 空 entries → 空表 → `decide_provider`
-    // 退回 slug-split / 默认 provider,行为与池化前完全一致。
+    // 整合反查表:仅 `exposeAllProviderModels` 开时构建(与 catalog 生成端共用
+    // `pool_slot_entries`,key = 标准档 slug `gpt-5.x`,保证逐字一致)。关 → 空 entries → 空表
+    // → `decide_provider` 退默认 provider,行为与整合前一致。
     let pool_entries = if cfg.settings.expose_all_provider_models {
-        unique_pool_slugs(&cfg.providers)
+        pool_slot_entries(&cfg.providers, Some(&cfg.pool_slot_mappings))
     } else {
         Vec::new()
     };

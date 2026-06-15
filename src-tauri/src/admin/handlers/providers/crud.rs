@@ -591,6 +591,40 @@ pub async fn set_provider_pool(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetSlotMappingsInput {
+    /// 全局标准档映射:`{ "gpt_5_5": {"provider":"<id>","model":"<m>"}, ... }`(object;
+    /// `null` / `{}` = 清空)。**权威替换**(整合页中间映射区一次提交完整映射)。
+    pub mappings: Value,
+}
+
+/// `PUT /api/pool/slot-mappings` —— 整合页「模型映射」区:全局 gpt-5.x → (provider, model)。
+/// 权威替换顶层 `poolSlotMappings`(`pool_slot_entries` 在读取时会过滤 target 不在整合子集 /
+/// model 空的条目,故这里只校验整体是 object/null,细粒度留给 catalog/resolver 构建端)。
+pub async fn set_pool_slot_mappings(
+    State(state): State<AdminState>,
+    Json(input): Json<SetSlotMappingsInput>,
+) -> impl IntoResponse {
+    if !input.mappings.is_object() && !input.mappings.is_null() {
+        return err(StatusCode::BAD_REQUEST, "mappings must be an object").into_response();
+    }
+    let result = with_config_write(|cfg| {
+        let Some(obj) = cfg.as_object_mut() else {
+            return Err("config root is not an object".into());
+        };
+        obj.insert("poolSlotMappings".into(), input.mappings.clone());
+        Ok(ConfigMutation::Modified(()))
+    });
+    match result {
+        Ok(()) => {
+            // 全局映射变化 → 重建池 catalog(标准档)+ resolver 反查表。
+            super::resync_pool_if_enabled(&state).await;
+            Json(json!({"success": true})).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 pub async fn set_default_provider(
     State(state): State<AdminState>,
     Path(id): Path<String>,

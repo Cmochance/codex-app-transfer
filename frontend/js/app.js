@@ -2446,10 +2446,14 @@
     const pools = $("#integrationPools");
     const toggle = $("#integrationToggle");
     let enabled = false;
+    let slotMappings = {};
     try {
-      enabled = !!(await CCApi.getSettings()).exposeAllProviderModels;
+      // getStatus 一次拿到整合开关 + 全局槽位映射(中间映射区渲染用)。
+      const status = await CCApi.getStatus();
+      enabled = !!status.exposeAllProviderModels;
+      slotMappings = status.poolSlotMappings || {};
     } catch (e) {
-      console.warn("[renderProviders] 读取整合开关失败,按关闭处理:", e);
+      console.warn("[renderProviders] 读取整合状态失败,按关闭处理:", e);
     }
     if (toggle) toggle.checked = enabled;
     if (offHint) offHint.hidden = enabled;
@@ -2457,7 +2461,129 @@
     if (!enabled) return;
     const providers = await CCApi.getProviders();
     renderPoolProviderGrid(providers);
+    renderPoolSlotMappings(providers, slotMappings);
     renderPoolModelGroups(providers);
+    // antigravity 等 displayName 异步预取(锦上添花);完成后只重渲染映射 + 下池(不重置整页)。
+    ensurePoolDisplayNames(providers).then((changed) => {
+      if (changed && routeFromHash() === "providers") {
+        renderPoolSlotMappings(providers, slotMappings);
+        renderPoolModelGroups(providers);
+      }
+    });
+  }
+
+  // 整合页模型 displayName 缓存:providerId → { 小写 rawId: displayName }。仅 antigravity
+  // (raw id 不可读)异步拉富模型列表反查;其他 provider raw id 即 display(不拉、不打扰)。
+  let poolDisplayCache = {};
+  function poolModelLabel(providerId, modelId) {
+    const map = poolDisplayCache[providerId];
+    const hit = map && map[String(modelId || "").trim().toLowerCase()];
+    return hit || modelId;
+  }
+  async function ensurePoolDisplayNames(providers) {
+    let changed = false;
+    for (const p of providers) {
+      if (p.pooledEnabled !== true) continue;
+      if (p.apiFormat !== "antigravity_oauth") continue; // 只 antigravity 需反查 displayName
+      if (poolDisplayCache[p.id]) continue; // 已缓存 / 已尝试
+      try {
+        const result = await CCApi.fetchProviderModels(p.id);
+        const map = {};
+        for (const e of result.models || []) {
+          const id = modelEntryId(e);
+          const label = modelEntryDisplayLabel(e);
+          if (id && label) map[id.trim().toLowerCase()] = label;
+        }
+        poolDisplayCache[p.id] = map;
+        if (Object.keys(map).length) changed = true;
+      } catch (e) {
+        poolDisplayCache[p.id] = {}; // 标记已尝试,避免重复拉
+        console.warn(`[integration] displayName 预取失败 ${p.id}:`, e);
+      }
+    }
+    return changed;
+  }
+
+  // 中间「模型映射」区(进 Codex):复用编辑页槽位映射的左右布局,右侧两级 select
+  // (先选 provider 再选该 provider 池中 model)。全局映射 poolSlotMappings 一份。
+  function renderPoolSlotMappings(providers, slotMappings) {
+    const wrap = $("#poolSlotMappings");
+    if (!wrap) return;
+    const integrated = providers.filter((p) => p.pooledEnabled === true);
+    if (!integrated.length) {
+      wrap.innerHTML = `<p class="pool-empty">${escapeHtml(t("providers.integrationNoIntegrated"))}</p>`;
+      return;
+    }
+    // 5 个标准档(排除 default —— 非 OpenAI 档、不进 Codex picker)。
+    const slots = providerFormModelSlots.filter((s) => s.key !== "default");
+    wrap.innerHTML = slots
+      .map((slot) => poolSlotMappingRowMarkup(slot, integrated, slotMappings || {}))
+      .join("");
+  }
+
+  function poolSlotMappingRowMarkup(slot, integrated, slotMappings) {
+    const m = slotMappings[slot.key] || {};
+    const selProvider = m.provider || "";
+    const selModel = m.model || "";
+    const providerOpts = [
+      `<option value="">${escapeHtml(t("providers.integrationSlotUnset"))}</option>`,
+    ]
+      .concat(
+        integrated.map(
+          (p) =>
+            `<option value="${escapeHtml(p.id)}"${p.id === selProvider ? " selected" : ""}>${escapeHtml(p.name)}</option>`
+        )
+      )
+      .join("");
+    const selProviderObj = integrated.find((p) => p.id === selProvider);
+    let modelOpts;
+    if (selProviderObj) {
+      const models = effectivePoolModels(selProviderObj);
+      modelOpts = [
+        `<option value="">${escapeHtml(t("providers.integrationSlotPickModel"))}</option>`,
+      ]
+        .concat(
+          models.map(
+            (mid) =>
+              `<option value="${escapeHtml(mid)}"${mid === selModel ? " selected" : ""}>${escapeHtml(poolModelLabel(selProvider, mid))}</option>`
+          )
+        )
+        .join("");
+    } else {
+      modelOpts = `<option value="">${escapeHtml(t("providers.integrationSlotPickProviderFirst"))}</option>`;
+    }
+    return `
+      <div class="pool-slot-row" data-slot="${escapeHtml(slot.key)}">
+        <span class="pool-slot-label">${escapeHtml(slot.label)}</span>
+        <i class="bi bi-arrow-right pool-slot-arrow"></i>
+        <select class="form-select form-select-sm pool-slot-provider" data-slot="${escapeHtml(slot.key)}">${providerOpts}</select>
+        <select class="form-select form-select-sm pool-slot-model" data-slot="${escapeHtml(slot.key)}"${selProviderObj ? "" : " disabled"}>${modelOpts}</select>
+      </div>
+    `;
+  }
+
+  // 从 DOM 读全部映射行 → 重建 poolSlotMappings 对象。`resetModelForSlot` 给「换了 provider」
+  // 的行用:旧 model 不属于新 provider,清空(等用户再选 model)。
+  function collectPoolSlotMappings(resetModelForSlot) {
+    const out = {};
+    $all(".pool-slot-row").forEach((row) => {
+      const slotKey = row.dataset.slot;
+      const provider = $(".pool-slot-provider", row)?.value || "";
+      let model = $(".pool-slot-model", row)?.value || "";
+      if (slotKey === resetModelForSlot) model = "";
+      if (provider) out[slotKey] = { provider, model };
+    });
+    return out;
+  }
+
+  async function savePoolSlotMappings(mappings) {
+    try {
+      await CCApi.setPoolSlotMappings(mappings);
+      showToast(t("toast.integrationMappingUpdated"));
+    } catch (e) {
+      showToast(e.message || t("toast.requestFailed"));
+    }
+    await renderProviders(); // 重渲染(成功固化 / 失败复原到后端真实状态 + 重填 model select)
   }
 
   // 上池:把已配置的 provider 当候选,加入(pooledEnabled)/移出整合子集。
@@ -2561,9 +2687,11 @@
   function poolModelChipMarkup(providerId, model) {
     const m = escapeHtml(model);
     const pid = escapeHtml(providerId);
+    // 显示 displayName(antigravity 等 raw id 看不懂);value / data-model 仍是 raw id。
+    const label = escapeHtml(poolModelLabel(providerId, model));
     return `
-      <span class="pool-model-chip">
-        <span class="pool-model-name truncate">${m}</span>
+      <span class="pool-model-chip" title="${m}">
+        <span class="pool-model-name truncate">${label}</span>
         <button class="pool-model-remove" type="button" data-action="pool-remove-model" data-id="${pid}" data-model="${m}" title="${escapeHtml(t("providers.integrationRemoveModel"))}" aria-label="${escapeHtml(t("providers.integrationRemoveModel"))}"><i class="bi bi-x"></i></button>
       </span>
     `;
@@ -8839,6 +8967,17 @@
       // 渲染异常不回滚开关——下次进入页面会自我纠正。
       await renderProviders();
       await renderDashboard();
+    });
+    // 整合页中间「模型映射」区的两级 select(provider / model)变更 → 重建并保存全局映射。
+    document.addEventListener("change", async (e) => {
+      const el = e.target;
+      if (!el || !el.classList) return;
+      if (el.classList.contains("pool-slot-provider")) {
+        // 换了 provider → 旧 model 不属于新 provider,清空该档 model(等用户再选)。
+        await savePoolSlotMappings(collectPoolSlotMappings(el.dataset.slot));
+      } else if (el.classList.contains("pool-slot-model")) {
+        await savePoolSlotMappings(collectPoolSlotMappings());
+      }
     });
     $("#showGrayProviders")?.addEventListener("change", async () => {
       // MOC-91:更新展示过滤缓存 + 持久化。设置页当前不展示 preset,无需即时重渲染;

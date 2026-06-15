@@ -245,6 +245,11 @@
         activeProviderId: data.activeProviderId,
         desktopHealth: data.desktopHealth || { needsApply: false, issues: [] },
         exposeAllProviderModels: !!data.exposeAllProviderModels,
+        // 整合页中间「模型映射」区渲染用:全局 gpt-5.x → {provider, model}。
+        poolSlotMappings:
+          data.poolSlotMappings && typeof data.poolSlotMappings === 'object'
+            ? data.poolSlotMappings
+            : {},
       };
     },
 
@@ -328,6 +333,11 @@
       if (typeof enabled === 'boolean') body.enabled = enabled;
       if (Array.isArray(models)) body.models = models;
       return api('PUT', `/api/providers/${encodeURIComponent(id)}/pool`, body);
+    },
+
+    // 整合页中间「模型映射」区:全局 gpt-5.x → {provider, model}(权威替换整份映射)。
+    async setPoolSlotMappings(mappings) {
+      return api('PUT', '/api/pool/slot-mappings', { mappings: mappings || {} });
     },
 
     async saveDraft(id, payload) {

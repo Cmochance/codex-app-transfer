@@ -40,8 +40,8 @@ pub use mcp_credentials::{
 };
 pub use model_catalog::{
     catalog_models_for_pool, catalog_models_for_provider,
-    catalog_models_for_provider_with_display_names, strip_model_suffix, upsert_catalog_models,
-    CatalogModel, PoolProviderMeta,
+    catalog_models_for_provider_with_display_names, catalog_models_for_slot_mappings,
+    strip_model_suffix, upsert_catalog_models, CatalogModel, PoolProviderMeta,
 };
 pub use paths::CodexPaths;
 pub use residual::{

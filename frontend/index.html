@@ -334,8 +334,16 @@
 
           <article class="panel pool-panel">
             <div class="pool-panel-header">
-              <h2 data-i18n="providers.integrationModelsPoolTitle">可选模型</h2>
-              <p data-i18n="providers.integrationModelsPoolHint">这些模型会出现在 Codex 模型列表里(按提供商分组,同名模型互不混淆)。可增删。</p>
+              <h2 data-i18n="providers.integrationMappingTitle">模型映射(进 Codex)</h2>
+              <p data-i18n="providers.integrationMappingHint">把 Codex 标准档映射到池中某「提供商 / 模型」。Codex 模型列表里只显示**映射了的**标准档,选某档即走你映射的上游;未映射的档不显示。</p>
+            </div>
+            <div class="pool-slot-mappings" id="poolSlotMappings"></div>
+          </article>
+
+          <article class="panel pool-panel">
+            <div class="pool-panel-header">
+              <h2 data-i18n="providers.integrationModelsPoolTitle">可选模型(映射来源)</h2>
+              <p data-i18n="providers.integrationModelsPoolHint">每个整合提供商的可选模型清单,作为上方映射的候选来源。这些模型本身不直接进 Codex,可增删。</p>
             </div>
             <div class="pool-model-groups" id="poolModelGroups"></div>
           </article>

@@ -270,6 +270,36 @@ pub fn catalog_models_for_pool(
         .collect()
 }
 
+/// 整合(池化)模式 catalog:把全局槽位映射(`registry::pool_slot_entries` 产的标准档条目)
+/// 转成 CatalogModel。与 [`catalog_models_for_pool`] 不同:slug **是标准档名**(`gpt-5.5` 等)、
+/// display_name 也用标准档名 —— 真机确认 `provider/model` slug 进不了 Codex picker,故整合模式
+/// 只把标准档暴露给 Codex,选某档由 resolver 按映射路由到真实 (provider, model)。
+/// context_window 取**映射模型**的(target provider 的 caps),保证与真实上游窗口一致;
+/// `model_to_json` 对 `gpt-5.x` slug 会自动套 Codex 原生 builtin 模板(完整档位字段)。
+pub fn catalog_models_for_slot_mappings(
+    entries: &[PoolEntry],
+    providers_meta: &[PoolProviderMeta],
+) -> Vec<CatalogModel> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let meta = providers_meta.get(entry.provider_idx)?;
+            let caps = Some(&meta.model_capabilities);
+            let real = entry.real_model.as_str();
+            let supports_1m = entry.supports_one_m || model_supports_1m(real, caps);
+            let context_window = context_window_for_model(real, real, real, supports_1m, caps);
+            Some(CatalogModel {
+                slug: entry.slug.clone(),         // 标准档名,如 "gpt-5.5"
+                display_name: entry.slug.clone(), // Codex picker 显示熟悉的标准档名
+                provider_name: meta.provider_name.clone(),
+                context_window,
+                effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+                auto_review_model_override: None,
+            })
+        })
+        .collect()
+}
+
 pub fn strip_model_suffix(model: &str) -> String {
     strip_internal_model_suffix(model)
 }
