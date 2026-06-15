@@ -308,6 +308,14 @@ pub fn apply_reasoning_effort(
     if codex_effort.is_empty() {
         return;
     }
+    // [MOC-241] 智谱 GLM:不收顶级 `reasoning_effort`(wire=Drop),其原生「不思考」走 OpenAI
+    // 兼容端的 `chat_template_kwargs`(见 [`apply_glm_thinking`],disable wire 取自 GLM 官方
+    // 客户端 ZCode、非猜测)。让 Codex reasoning 选择器对 GLM 的 `none`/`max` 两档生效
+    //(catalog 见 codex_integration::model_catalog 的 GLM 两档)。
+    if provider_matches(provider, "zhipu") || provider_matches(provider, "bigmodel") {
+        apply_glm_thinking(body, codex_effort);
+        return;
+    }
     let mut wire = reasoning_effort_wire(provider);
     // MiniMax-M3 起原生接受 `reasoning_effort`(2026-06-03 真机实测 api.minimaxi.com
     // 直连:200;M2.x 同字段 400)。即便实测当前档位不改变 M3 思考深度,也按 OpenAI
@@ -323,6 +331,38 @@ pub fn apply_reasoning_effort(
         wire = ReasoningEffortWire::OpenAIEnum;
     }
     wire.apply(body, codex_effort, &provider.id);
+}
+
+/// [MOC-241] 把 Codex reasoning.effort 翻成智谱 GLM 的原生「不思考」控制(OpenAI 兼容端)。
+///
+/// **disable wire 取自 GLM 官方客户端(智谱 ZCode v3.0.1 的 glm agent `zcode.cjs`,
+/// `createGlm52ReasoningProviderOptions`)的 OpenAI-compat 形态,非自行猜测**:
+/// `none`/`off`/`disabled`(不思考)→ `chat_template_kwargs.enable_thinking = false`。
+///
+/// **只写「关」、不写「开」**:GLM 默认思考开,故 `max`(最高)= 默认行为、无需写线。ZCode 对
+/// `max` 还会发 `chat_template_kwargs.reasoning_effort:"max"`,但本仓**故意不发** —— 那是
+/// thinking-ON 信号,而 compact 请求走同一转换路径(`adapters` 的
+/// `apply_codex_reasoning_effort_for_provider`,request.rs:243)且默认 effort 多为 `max`。
+/// 关键:compact 的强制 disable([`crate::compact_thinking_policy`] / issue #248)只剥**顶级**
+/// `reasoning_effort`、对**嵌套** `chat_template_kwargs.reasoning_effort` 无感 —— 若写出来会漏到
+/// wire 把思考又打开。只写「关」就永不撤销 compact 的 disable,端到端两档语义仍成立
+///(`none`=关 / `max`=GLM 默认开)。
+///
+/// 合并进已有 `chat_template_kwargs`、`or_insert` **不覆盖**用户/上游已设同名键(最小干预)。
+/// GLM 不收顶级 `reasoning_effort`,本函数也不写(保留 Drop 语义)。注:ZCode 的 Anthropic
+/// 格式才用顶级 `thinking:{type:disabled}`(= compact_thinking_policy 现用),OpenAI-compat 端不同。
+fn apply_glm_thinking(body: &mut Map<String, Value>, effort: &str) {
+    // 只有「不思考」档需要显式 wire;max / 其它档留 GLM 默认(思考开)。
+    if !matches!(effort, "none" | "off" | "disabled") {
+        return;
+    }
+    let kwargs = body
+        .entry("chat_template_kwargs")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(obj) = kwargs.as_object_mut() {
+        obj.entry("enable_thinking".to_owned())
+            .or_insert(Value::Bool(false));
+    }
 }
 
 #[cfg(test)]
@@ -415,9 +455,58 @@ mod tests {
         assert!(apply("kimi-code", "xhigh").as_object().unwrap().is_empty());
     }
 
+    // ── [MOC-241] GLM 原生两档思考:chat_template_kwargs(ZCode 权威 wire)──
+
     #[test]
-    fn zhipu_drops() {
+    fn glm_max_is_noop_relies_on_default() {
+        // GLM 默认思考开 → max/xhigh 不写线(故意不发 ZCode 的 reasoning_effort:max,防 compact 互踩);
+        // 也绝不写顶级 reasoning_effort(GLM 不收)。
         assert!(apply("zhipu", "max").as_object().unwrap().is_empty());
+        assert!(apply("zhipu", "xhigh").as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn glm_none_disables_thinking() {
+        let body = apply("zhipu", "none");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn glm_matched_by_bigmodel_baseurl_none_disables() {
+        // healed config:UUID id + name "GLM" + baseUrl bigmodel → 靠 bigmodel needle 命中
+        let p = provider_full("xyz789", "GLM", "https://open.bigmodel.cn/api/paas/v4");
+        let mut body = Map::new();
+        apply_reasoning_effort(&mut body, &p, "none");
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"], false,
+            "healed GLM(bigmodel baseUrl)的 none 必须关思考"
+        );
+    }
+
+    #[test]
+    fn glm_other_efforts_noop() {
+        // GLM catalog 只暴露 none/max;其它档若出现 → 不写,留 GLM 默认(思考开)
+        for e in ["low", "medium", "high", "minimal", "auto"] {
+            assert!(
+                apply("zhipu", e).as_object().unwrap().is_empty(),
+                "GLM effort={e} 应 no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn glm_preserves_user_set_chat_template_kwargs() {
+        // or_insert 最小干预:用户已显式设的同名键不被覆盖
+        let p = provider("zhipu");
+        let mut body = Map::new();
+        body.insert(
+            "chat_template_kwargs".into(),
+            json!({"enable_thinking": true, "foo": 1}),
+        );
+        apply_reasoning_effort(&mut body, &p, "none");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["foo"], 1);
     }
 
     #[test]

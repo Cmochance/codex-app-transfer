@@ -155,7 +155,7 @@ How Codex's `low/medium/high/xhigh` is dispatched per chat-completions upstream 
 | **Kimi / Kimi Code / GLM / Bailian Qwen / Xiaomi MiMo / MiniMax** | field dropped | field dropped | Upstreams don't accept `reasoning_effort`; default thinking applies. Set provider-native fields in `requestOptions` to control explicitly |
 | **Custom chat-compat** | clamp to `"high"` | passthrough | OpenAI standard enum conservative fallback |
 
-**GLM picker shows two native tiers (MOC-241)**: GLM-family models (`glm-*`) present Codex's native `none` (no thinking) + `max` reasoning options in the model picker — matching GLM's binary thinking switch (no `low/medium/high` depth tiers) — instead of the generic four. This is the picker *display* (written into the model catalog); the wire-level `reasoning_effort` handling is unchanged (GLM still drops the field, per the row above). Tier labels use Codex's own localized strings (no custom injection).
+**GLM native two reasoning tiers (MOC-241)**: GLM-family models (`glm-*`) present Codex's native `none` (no thinking) + `max` reasoning options in the model picker — matching GLM's binary thinking switch (no `low/medium/high` depth tiers) — instead of the generic four. Selecting `none` disables GLM thinking on the wire via `chat_template_kwargs.enable_thinking:false` (the OpenAI-compatible wire used by GLM's official client, Zhipu ZCode); `max` uses GLM's default (thinking on). The top-level `reasoning_effort` field is still dropped (per the row above — GLM doesn't accept it). Tier labels use Codex's own localized strings (no custom injection).
 
 ## Model mapping
 
