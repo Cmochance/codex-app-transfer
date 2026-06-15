@@ -25,10 +25,12 @@
 //! - `compact_thinking_policy` 管 **compact 任务强制 disable thinking**(已开 → 关掉)
 //! - `reasoning_effort_policy` 管 **正常请求按档位映射 thinking**(关 → 按 effort 决定开多深)
 //!
-//! 两表入表证据格式完全对齐,review 友好。compact 路径下两者写**不同 key**
-//! (本 policy 写 `reasoning_effort` / `compact_thinking_policy` 写 `thinking` 或
-//! `enable_thinking`),无论谁先跑都不互踩;`Drop` 集合本身就不写 `reasoning_effort`,
-//! wire 更干净。
+//! 两表入表证据格式完全对齐,review 友好。一般情况下两者写**不同 key**(本 policy 写
+//! `reasoning_effort` / `compact_thinking_policy` 写 `thinking` 或 `enable_thinking`),
+//! `Drop` 集合本身就不写 `reasoning_effort`,wire 更干净。**例外([MOC-241] GLM `none`)**:
+//! 本 policy 的 [`apply_glm_thinking`] 也写顶级 `thinking:{type:disabled}` + 嵌套
+//! `chat_template_kwargs.enable_thinking:false` —— 与 `compact_thinking_policy` 对 GLM 的强制
+//! disable **同向(都是「关」)**且全用 `or_insert` 幂等,即便 compact + `none` 同时命中也不互踩。
 //!
 //! ## 入表证据(每条 entry 必须同时满足)
 //!
@@ -367,18 +369,36 @@ pub fn is_glm_model(model: &str) -> bool {
 /// wire 把思考又打开。只写「关」就永不撤销 compact 的 disable,端到端两档语义仍成立
 ///(`none`=关 / `max`=GLM 默认开)。
 ///
-/// 合并进已有 `chat_template_kwargs`、`or_insert` **不覆盖**用户/上游已设同名键(最小干预)。
-/// GLM 不收顶级 `reasoning_effort`,本函数也不写(保留 Drop 语义)。注:ZCode 的 Anthropic
-/// 格式才用顶级 `thinking:{type:disabled}`(= compact_thinking_policy 现用),OpenAI-compat 端不同。
+/// **`none` 同时发两个 disable wire**(覆盖不同 GLM 部署,二者都表达「关」、不矛盾):
+/// 1. 顶级 `thinking:{type:disabled}` —— **hosted Z.AI / BigModel**(内置 preset 指向
+///    `open.bigmodel.cn`)的 OpenAI 兼容 API 用这个关思考(docs.bigmodel.cn;= 本仓
+///    [`crate::compact_thinking_policy`] GLM 已用形态,issue #248 真机实测有效);
+/// 2. `chat_template_kwargs.enable_thinking:false` —— **自建 vLLM/SGLang** GLM 用这个
+///    (GLM 官方客户端智谱 ZCode 的 openaiCompatible wire,`createGlm52ReasoningProviderOptions`)。
+///
+/// 两者皆 `or_insert` **不覆盖**用户/上游已设同名键(最小干预);都只表达「关」,与 compact 的
+/// 强制 disable 同向、`or_insert` 幂等,无互踩。GLM 不收顶级 `reasoning_effort`,本函数也不写
+///(保留 Drop 语义)。
 fn apply_glm_thinking(body: &mut Map<String, Value>, effort: &str) {
     // 只有「不思考」档需要显式 wire;max / 其它档留 GLM 默认(思考开)。
     if !matches!(effort, "none" | "off" | "disabled") {
         return;
     }
-    let kwargs = body
+    // ① hosted Z.AI / BigModel:顶级 `thinking:{type:disabled}`
+    if let Some(obj) = body
+        .entry("thinking")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+    {
+        obj.entry("type".to_owned())
+            .or_insert_with(|| Value::String("disabled".into()));
+    }
+    // ② 自建 vLLM / SGLang:`chat_template_kwargs.enable_thinking:false`
+    if let Some(obj) = body
         .entry("chat_template_kwargs")
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let Some(obj) = kwargs.as_object_mut() {
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+    {
         obj.entry("enable_thinking".to_owned())
             .or_insert(Value::Bool(false));
     }
@@ -487,7 +507,11 @@ mod tests {
     #[test]
     fn glm_none_disables_thinking() {
         let body = apply("zhipu", "none");
+        // hosted Z.AI/BigModel 形态
+        assert_eq!(body["thinking"]["type"], "disabled");
+        // 自建 vLLM/SGLang 形态
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        // GLM 不收顶级 reasoning_effort
         assert!(body.get("reasoning_effort").is_none());
     }
 
@@ -497,10 +521,12 @@ mod tests {
         let p = provider_full("xyz789", "GLM", "https://open.bigmodel.cn/api/paas/v4");
         let mut body = Map::new();
         apply_reasoning_effort(&mut body, &p, "none");
+        // bigmodel = hosted,顶级 thinking:{type:disabled} 是其生效形态(#248 实测)
         assert_eq!(
-            body["chat_template_kwargs"]["enable_thinking"], false,
-            "healed GLM(bigmodel baseUrl)的 none 必须关思考"
+            body["thinking"]["type"], "disabled",
+            "hosted GLM(bigmodel)顶级 thinking 必须关思考"
         );
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
     }
 
     #[test]
@@ -524,8 +550,11 @@ mod tests {
             json!({"enable_thinking": true, "foo": 1}),
         );
         apply_reasoning_effort(&mut body, &p, "none");
+        // 用户已设 enable_thinking:true → or_insert 不覆盖
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(body["chat_template_kwargs"]["foo"], 1);
+        // 顶级 thinking 仍补上(另一 key,不冲突)
+        assert_eq!(body["thinking"]["type"], "disabled");
     }
 
     #[test]
@@ -541,6 +570,7 @@ mod tests {
             body["chat_template_kwargs"]["enable_thinking"], false,
             "非 zhipu 命名代理后的 GLM 模型,none 也必须关思考(按 model 判定)"
         );
+        assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning_effort").is_none());
     }
 
