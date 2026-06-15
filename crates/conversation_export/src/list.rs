@@ -73,12 +73,39 @@ fn collect_rollouts_recursively(
             continue;
         }
         if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            // [MOC-214] Codex 0.137+(#25089)把冷归档 rollout 压成 `rollout-*.jsonl.zst`
+            // (zstd)。当前 list/parse 只读纯 .jsonl,压缩归档会话会被**静默漏读**(对话
+            // 列表 / 导出少会话)。完整 zstd 解压等真机真出现 .zst 再做(上游 feature flag
+            // 仍 under-development、真机零 .zst);这里只放一次性检测哨,上线即可从日志看到。
+            if is_compressed_rollout(&path) {
+                warn_compressed_rollout_once(&path);
+            }
             continue;
         }
         if let Some(meta) = read_meta_from_rollout(&path, kind, titles) {
             out.push(meta);
         }
     }
+}
+
+/// `rollout-*.jsonl.zst`(Codex 0.137+ 冷压缩归档 rollout)判定:完整文件名以
+/// `.jsonl.zst` 结尾(extension 仅是 `zst`,用全名后缀防误判其它 .zst 文件)。
+fn is_compressed_rollout(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".jsonl.zst"))
+}
+
+/// [MOC-214] 检测到压缩 rollout 时**一次性** warn(进程生命周期内只一次,避免每次
+/// 列表刷新重复刷屏)。
+fn warn_compressed_rollout_once(path: &Path) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            example = %path.display(),
+            "conversation_export: 检测到压缩 rollout(.jsonl.zst),当前版本会静默漏读这些归档会话(MOC-214,待加 zstd 解压)"
+        );
+    });
 }
 
 /// 流式读 rollout 头部 + 扫 user_message 计数 turn_count。**不读全文**,只读直到
@@ -160,6 +187,18 @@ struct SessionMetaPayload {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn is_compressed_rollout_detects_zst() {
+        // [MOC-214] 检测哨判定:只认完整 `.jsonl.zst` 后缀,纯 .jsonl / 其它 .zst 不误判。
+        assert!(is_compressed_rollout(Path::new(
+            "rollout-2026-06-15T00-00-00-abc.jsonl.zst"
+        )));
+        assert!(!is_compressed_rollout(Path::new(
+            "rollout-2026-06-15T00-00-00-abc.jsonl"
+        )));
+        assert!(!is_compressed_rollout(Path::new("notes.zst")));
+    }
 
     fn write_jsonl(path: &Path, lines: &[&str]) {
         if let Some(parent) = path.parent() {

@@ -33,6 +33,7 @@ use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use crate::codex_theme_injector::{drain_until_response, locate_main_window_ws, make_msg};
+use crate::provider_quota::{ProviderQuota, QuotaWindow};
 
 /// 幂等安装脚本:注入 scoped `<style>` + 定义 `window.__catQuotaUpdate` +
 /// MutationObserver 守护。已安装(`__catQuotaInstalled`)时直接跳过,daemon
@@ -709,30 +710,30 @@ fn fmt_reset_local(rfc3339: Option<&str>) -> Option<String> {
 
 /// 单条额度 bar(5h / weekly):显**剩余**百分比(满额=100,条满)+ 绝对重置时间点;
 /// 剩余 ≤10% 标红预警(`hot`,由 JS 上色——额度类红色判定与 used 类相反,故显式传)。
-fn quota_bar(label: &str, w: &codex_app_transfer_gemini_oauth::QuotaWindow) -> serde_json::Value {
+fn quota_bar(w: &QuotaWindow) -> serde_json::Value {
     let pct = w.remaining_percent.round() as i64;
     let detail = match fmt_reset_local(w.reset_rfc3339.as_deref()) {
         Some(t) => format!("{pct}% · {t} 刷新"),
         None => format!("{pct}%"),
     };
-    json!({"kind":"bar","cls":"quota","label":label,"pct":pct,"detail":detail,"hot":pct <= 10})
+    json!({"kind":"bar","cls":"quota","label":w.label,"pct":pct,"detail":detail,"hot":pct <= 10})
 }
 
-/// [MOC-204 Phase 3] 额度两行:仅白名单 provider(当前 antigravity gemini 系)有真实额度
-/// → 5h + weekly 两 bar;非白名单 / 拿不到 → 空(不显额度行)。
-fn quota_rows(
-    quota: Option<&codex_app_transfer_gemini_oauth::GeminiQuota>,
-) -> Vec<serde_json::Value> {
+/// [MOC-204 / MOC-211] 额度行:白名单 provider 的每个窗口渲染一条 bar(antigravity/GLM =
+/// 5h + 每周;MiMo = 套餐用量月窗口)。label 随窗口走,故 5h/周 与 月度套餐各显各、互不混。
+/// 非白名单 / 拿不到 → 空(不显额度行)。
+fn quota_rows(quota: Option<&ProviderQuota>) -> Vec<serde_json::Value> {
     let Some(q) = quota else {
         return vec![];
     };
-    let mut rows = Vec::new();
-    if let Some(w) = &q.five_hour {
-        rows.push(quota_bar("5 小时额度", w));
-    }
-    if let Some(w) = &q.weekly {
-        rows.push(quota_bar("每周额度", w));
-    }
+    // 先窗口 bar(5h/周/套餐用量),再数值条目(DeepSeek 余额等)。stat 行无进度条:
+    // 注入脚本 buildRow 对非 bar/duo/ctx 的 kind 落 `cqs`(label + detail)分支渲染。
+    let mut rows: Vec<serde_json::Value> = q.windows.iter().map(quota_bar).collect();
+    rows.extend(
+        q.stats
+            .iter()
+            .map(|s| json!({"kind":"stat","label":s.label,"detail":s.value})),
+    );
     rows
 }
 
@@ -776,10 +777,7 @@ fn local_usage_rows(session_id: Option<&str>) -> Vec<serde_json::Value> {
 
 /// 组装完整 Usage 面板 payload:额度(白名单 provider 真实,否则不显)+ 本地实时
 /// (上下文/Tokens/缓存)。`quota` 由 daemon 在活动 provider 为白名单时传入。
-fn build_payload(
-    quota: Option<&codex_app_transfer_gemini_oauth::GeminiQuota>,
-    session_id: Option<&str>,
-) -> serde_json::Value {
+fn build_payload(quota: Option<&ProviderQuota>, session_id: Option<&str>) -> serde_json::Value {
     let mut rows = quota_rows(quota);
     rows.extend(local_usage_rows(session_id));
     json!({
@@ -874,14 +872,163 @@ fn active_authscheme() -> Option<String> {
         .map(str::to_owned)
 }
 
-/// 额度白名单 = 能读真实额度的 provider。当前仅 antigravity(gemini 系,经
-/// `retrieveUserQuotaSummary`);其余 provider 不显额度行(见 MOC-204 §quota 调研:
-/// glm-coding 等无额度 API/头)。
+/// antigravity 额度白名单(**按 authScheme 判定**):gemini 系经 `retrieveUserQuotaSummary`。
+/// 注:GLM Coding 不走这里——它是通用 `bearer` authScheme(无法靠 authScheme 区分),改按
+/// baseUrl host 判定,见 [`active_glm_provider`](MOC-211)。
 fn is_quota_whitelisted(authscheme: &str) -> bool {
     matches!(
         authscheme,
         "google_oauth_antigravity" | "antigravity_oauth" | "antigravity"
     )
+}
+
+/// 从 URL 轻量提取 host(剥 scheme / 端口 / userinfo,不引 url crate)。
+fn host_of(url: &str) -> Option<String> {
+    let after = url.split("://").nth(1).unwrap_or(url);
+    let authority = after.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// 活动 provider 若是 GLM Coding(baseUrl host 含 `bigmodel.cn` / `z.ai` 且为 coding 套餐)→
+/// 返回 `(monitor host, apiKey)`,否则 None。**白名单按 baseUrl host 判定而非 authScheme**:
+/// GLM 是通用 `bearer`、authScheme 无法区分,且本仓存储的 provider id 是运行时 UUID(非 preset
+/// id `zhipu-coding`)。按量计费的 `zhipu`(`/api/paas/v4`,无 coding)不匹配——它无订阅额度窗口。
+fn active_glm_provider() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    let is_glm_host = host.ends_with("bigmodel.cn") || host.ends_with("z.ai");
+    let is_coding = base_url.contains("coding");
+    if !(is_glm_host && is_coding) {
+        return None;
+    }
+    let api_key = p
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some((host, api_key.to_string()))
+}
+
+/// [MOC-211] 活动 provider 若是 MiMo Token Plan(baseUrl host 含 `xiaomimimo.com` 且路径含
+/// `token-plan`)且已存网页 session → 返回 `(provider id, mimoCookie)`,否则 None。按量计费的
+/// MiMo(`api.xiaomimimo.com`,无 token-plan)不匹配——它无订阅套餐额度。额度查询走小米账号
+/// session(见 mimo_quota / mimo_session),非 apiKey。
+fn active_mimo_session() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    if !(host.ends_with("xiaomimimo.com") && base_url.contains("token-plan")) {
+        return None;
+    }
+    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
+    let cookie = p
+        .get("mimoCookie")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((id, cookie))
+}
+
+/// session 失效(Auth)时清掉该 provider 存的 `mimoCookie`,让前端 `hasMimoCookie` 转 false
+/// 显「未登录」、提示重新登录(MiMo session 无 refresh,只能重登)。
+fn clear_mimo_cookie(provider_id: &str, used_cookie: &str) {
+    let _ = crate::admin::registry_io::with_config_write(|cfg| {
+        let Some(providers) = cfg
+            .as_object_mut()
+            .and_then(|o| o.get_mut("providers"))
+            .and_then(|v| v.as_array_mut())
+        else {
+            return Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()));
+        };
+        let mut changed = false;
+        for p in providers.iter_mut() {
+            if p.get("id").and_then(|v| v.as_str()) == Some(provider_id) {
+                if let Some(obj) = p.as_object_mut() {
+                    // 仅当当前存的 cookie 仍是本次失败用的那把才清:避免请求在途时用户已重新
+                    // 登录(存了新 session),这条迟到的 Auth 把刚捕获的新 cookie 误删。
+                    let still_same =
+                        obj.get("mimoCookie").and_then(|v| v.as_str()) == Some(used_cookie);
+                    if still_same && obj.remove("mimoCookie").is_some() {
+                        changed = true;
+                    }
+                }
+                break;
+            }
+        }
+        if changed {
+            Ok(crate::admin::registry_io::ConfigMutation::Modified(()))
+        } else {
+            Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()))
+        }
+    });
+}
+
+/// [MOC-211] 活动 provider 若是 DeepSeek(baseUrl host 含 `deepseek.com`)且有 apiKey →
+/// 返回 `(host, apiKey)`,否则 None。DeepSeek 余额走推理同一把 key(Bearer),官方
+/// `/user/balance` 接口。
+fn active_deepseek_provider() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    if !host.ends_with("deepseek.com") {
+        return None;
+    }
+    let api_key = p
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some((host, api_key.to_string()))
+}
+
+/// [MOC-211] 活动 provider 若是 anyrouter(baseUrl host 含 `anyrouter.top`)且有 apiKey →
+/// 返回 `(host, apiKey)`,否则 None。anyrouter 已用额度走 OpenAI 兼容 billing 端点(推理同
+/// 一把 key、Bearer);账户剩余余额被阿里反爬挡、不取(见 anyrouter_quota)。
+fn active_anyrouter_provider() -> Option<(String, String)> {
+    let cfg = crate::admin::registry_io::load().ok()?;
+    let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
+    let providers = cfg.get("providers")?.as_array()?;
+    let p = match active_id {
+        Some(id) => providers
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => providers.first()?,
+    };
+    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
+    let host = host_of(base_url)?;
+    if !host.ends_with("anyrouter.top") {
+        return None;
+    }
+    let api_key = p
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some((host, api_key.to_string()))
 }
 
 /// 取 antigravity gemini 双窗口额度(白名单 gate + token 校验 + 45s 缓存)。非白名单 /
@@ -953,6 +1100,208 @@ async fn fetch_antigravity_quota(
     }
 }
 
+/// [MOC-211] 额度缓存指纹:把账号身份(host+key / id+cookie)散列,缓存命中前比对——切账号
+/// (同 provider 类型换 key / 账号)即视为缓存失效,避免 45s TTL 内串显上个账号的额度/余额。
+fn quota_fingerprint(parts: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+        0xffu8.hash(&mut h); // 段分隔,防 ("ab","c") 与 ("a","bc") 碰撞
+    }
+    h.finish()
+}
+
+/// [MOC-211] 取 GLM Coding 双窗口额度(baseUrl host gate + 账号指纹 + 45s 缓存)。非 GLM coding
+/// provider / key 失效 → 清缓存 + None(不显额度行)。用推理同一把 apiKey 查 monitor 端口(不带
+/// Bearer),失败按 [`crate::glm_quota::QuotaError`] 分类(Auth=清缓存 / Transient=同账号留旧缓存
+/// 重试),与 antigravity 同一套缓存语义。
+async fn fetch_glm_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::glm_quota::{fetch_glm_quota_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    // 活动 provider 不是 GLM coding(或已切走)→ 清缓存,不残留上个 provider 的额度。
+    let Some((host, api_key)) = active_glm_provider() else {
+        *cache = None;
+        return None;
+    };
+    let fp = quota_fingerprint(&[&host, &api_key]);
+    // 命中缓存需同账号(指纹一致)且未过期;切账号即失效重取。
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_glm_quota_summary(http, &host, &api_key).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        // 401/403:key 服务端失效 / 非 coding-plan key → 清缓存,不残留。
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] GLM quota 鉴权失败(key 失效/非 coding key)→ 清额度缓存");
+            *cache = None;
+            None
+        }
+        // 网络 / 5xx / 429 / 解析瞬时失败:仅同账号(指纹一致)留旧缓存 + 刷新时间戳;切了账号不回旧值。
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] GLM quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// [MOC-211] 取 MiMo 套餐用量(host gate + 网页 session cookie + 45s 缓存)。非 MiMo token-plan /
+/// 无 cookie → 清缓存 + None。session 失效(Auth)→ 清缓存 + 清存储 cookie(前端转「未登录」
+/// 提示重登;MiMo session 无 refresh,只能重新登录)。
+async fn fetch_mimo_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::mimo_quota::{fetch_mimo_quota_summary, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((id, cookie)) = active_mimo_session() else {
+        *cache = None;
+        return None;
+    };
+    // 指纹按 (provider id, cookie):换账号重登(cookie 变)即缓存失效。
+    let fp = quota_fingerprint(&[&id, &cookie]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_mimo_quota_summary(http, &cookie).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth) => {
+            tracing::debug!("[Quota] MiMo session 失效 → 清缓存 + 清存储 cookie(需重新登录)");
+            *cache = None;
+            clear_mimo_cookie(&id, &cookie);
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] MiMo quota 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// [MOC-211] 取 DeepSeek 账户余额(host gate + 45s 缓存)。非 DeepSeek / key 失效 → 清缓存 +
+/// None。用推理同一把 apiKey 查官方 `/user/balance`。
+async fn fetch_deepseek_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::deepseek_quota::{fetch_deepseek_balance, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((host, api_key)) = active_deepseek_provider() else {
+        *cache = None;
+        return None;
+    };
+    let fp = quota_fingerprint(&[&host, &api_key]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    match fetch_deepseek_balance(http, &host, &api_key).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] DeepSeek balance 鉴权失败(key 失效)→ 清缓存");
+            *cache = None;
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] DeepSeek balance 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// [MOC-211] 取 anyrouter 已用额度(host gate + 45s 缓存)。非 anyrouter / key 失效 → 清缓存 +
+/// None。用推理同一把 apiKey 查 OpenAI 兼容 `/v1/dashboard/billing/usage`(end_date=本地当天)。
+async fn fetch_anyrouter_quota(
+    http: &Option<reqwest::Client>,
+    cache: &mut Option<(u64, ProviderQuota, std::time::Instant)>,
+) -> Option<ProviderQuota> {
+    use crate::anyrouter_quota::{fetch_anyrouter_usage, QuotaError};
+    const QUOTA_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+    let Some((host, api_key)) = active_anyrouter_provider() else {
+        *cache = None;
+        return None;
+    };
+    let fp = quota_fingerprint(&[&host, &api_key]);
+    if let Some((cfp, q, at)) = cache.as_ref() {
+        if *cfp == fp && at.elapsed() < QUOTA_TTL {
+            return Some(q.clone());
+        }
+    }
+    let http = http.as_ref()?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    match fetch_anyrouter_usage(http, &host, &api_key, &today).await {
+        Ok(q) => {
+            *cache = Some((fp, q.clone(), std::time::Instant::now()));
+            Some(q)
+        }
+        Err(QuotaError::Auth(s)) => {
+            tracing::debug!(status = %s, "[Quota] anyrouter usage 鉴权失败(key 失效)→ 清缓存");
+            *cache = None;
+            None
+        }
+        Err(QuotaError::Transient(e)) => {
+            tracing::debug!(error = %e, "[Quota] anyrouter usage 瞬时失败,留旧缓存(下个 TTL 周期重试)");
+            match cache.as_mut() {
+                Some((cfp, q, at)) if *cfp == fp => {
+                    *at = std::time::Instant::now();
+                    Some(q.clone())
+                }
+                _ => {
+                    *cache = None;
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// 按阶段分级记录推送失败:connect 失败 = Codex 没跑(常态,debug);
 /// evaluate 失败 = Codex 在跑但注入坏了(真异常,warn 一次后去重降 debug,
 /// 防 5s tick 刷屏;成功后复位再坏会再 warn)。
@@ -992,6 +1341,13 @@ pub async fn run_quota_daemon() {
         codex_app_transfer_gemini_oauth::GeminiQuota,
         std::time::Instant,
     )> = None;
+    // [MOC-211] GLM Coding / MiMo Token Plan / DeepSeek 额度缓存(各自独立;各源按活动 provider
+    // 互斥、self-gate,最多一个返 Some)。
+    // 缓存带账号指纹(u64):切同类型 provider 的不同账号时即失效,不串旧账号额度。
+    let mut glm_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut mimo_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut deepseek_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
+    let mut anyrouter_cache: Option<(u64, ProviderQuota, std::time::Instant)> = None;
     // MOC-230 对话隔离:上一 tick 从 fiber 回读的活动 conversationId。本 tick 据此按 uuid 取
     // 该对话累计/缓存(非 newest-mtime)。1-tick 延迟由 JS 侧 uuid-guard 兜底(渲染前比对当前
     // fiber id,不匹配则隐藏 → 切对话瞬间不串)。None = 无可识别活动会话 → fail-closed 显「—」。
@@ -1012,9 +1368,24 @@ pub async fn run_quota_daemon() {
             continue;
         }
         needs_remove = true;
-        // 额度:仅白名单 provider(antigravity gemini)取真实双窗口,否则 None(不显额度行);
-        // 上下文/Tokens/缓存命中率为本地实时(注入脚本侧)。
-        let quota = fetch_antigravity_quota(&quota_http, &mut quota_cache).await;
+        // 额度:白名单 provider 取真实双窗口(各自归一成 ProviderQuota),否则 None(不显额度行);
+        // 上下文/Tokens/缓存命中率为本地实时(注入脚本侧)。两个 fetcher 各按活动 provider self-gate,
+        // antigravity(authScheme)与 GLM(baseUrl host)互斥 → 最多一个返 Some,or() 取活动那个;
+        // 非活动源每 tick 自清缓存(防上个 provider 额度滞留)。
+        let antigravity = fetch_antigravity_quota(&quota_http, &mut quota_cache)
+            .await
+            .map(ProviderQuota::from);
+        let glm = fetch_glm_quota(&quota_http, &mut glm_cache).await;
+        let mimo = fetch_mimo_quota(&quota_http, &mut mimo_cache).await;
+        let deepseek = fetch_deepseek_quota(&quota_http, &mut deepseek_cache).await;
+        let anyrouter = fetch_anyrouter_quota(&quota_http, &mut anyrouter_cache).await;
+        // 取活动那个源(互斥,最多一个 Some);空额度(无窗口无条目)→ 视作无,不显额度行。
+        let quota = antigravity
+            .or(glm)
+            .or(mimo)
+            .or(deepseek)
+            .or(anyrouter)
+            .filter(ProviderQuota::has_any);
         // 累计/缓存按上 tick 回读的活动 conversationId 取(MOC-230);payload 标注该 id。
         let payload = Some(build_payload(quota.as_ref(), last_conv_id.as_deref()));
         match push_via_cdp(payload).await {
@@ -1201,17 +1572,22 @@ mod tests {
 
     #[test]
     fn build_payload_with_quota_shows_two_quota_bars() {
-        // [MOC-204 Phase 3] 白名单 provider:5h + weekly 两 bar 在前,显**剩余**百分比。
-        use codex_app_transfer_gemini_oauth::{GeminiQuota, QuotaWindow};
-        let q = GeminiQuota {
-            five_hour: Some(QuotaWindow {
-                remaining_percent: 94.0, // 剩 94%
-                reset_rfc3339: Some("2026-06-13T17:56:06Z".into()),
-            }),
-            weekly: Some(QuotaWindow {
-                remaining_percent: 8.0, // 剩 8% → 应标红 hot
-                reset_rfc3339: Some("2026-06-20T12:56:06Z".into()),
-            }),
+        // [MOC-204 / MOC-211] 白名单 provider:5h + weekly 两 bar 在前,显**剩余**百分比。
+        // 用中性 ProviderQuota 多窗口(antigravity / GLM 都归一到它)。
+        let q = ProviderQuota {
+            windows: vec![
+                QuotaWindow {
+                    label: "5 小时额度".into(),
+                    remaining_percent: 94.0, // 剩 94%
+                    reset_rfc3339: Some("2026-06-13T17:56:06Z".into()),
+                },
+                QuotaWindow {
+                    label: "每周额度".into(),
+                    remaining_percent: 8.0, // 剩 8% → 应标红 hot
+                    reset_rfc3339: Some("2026-06-20T12:56:06Z".into()),
+                },
+            ],
+            ..Default::default()
         };
         let p = build_payload(Some(&q), None);
         let rows = p["rows"].as_array().expect("rows");
@@ -1240,5 +1616,44 @@ mod tests {
     #[test]
     fn quota_rows_empty_when_none() {
         assert!(quota_rows(None).is_empty());
+    }
+
+    #[test]
+    fn quota_rows_renders_stat_for_balance() {
+        // [MOC-211] DeepSeek 余额 = stat 条目(无进度条),JS buildRow 落 cqs(label+detail)。
+        use crate::provider_quota::QuotaStat;
+        let q = ProviderQuota {
+            stats: vec![QuotaStat {
+                label: "余额".into(),
+                value: "¥5.37".into(),
+            }],
+            ..Default::default()
+        };
+        let rows = quota_rows(Some(&q));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "stat");
+        assert_eq!(rows[0]["label"], "余额");
+        assert_eq!(rows[0]["detail"], "¥5.37");
+    }
+
+    #[test]
+    fn host_of_extracts_host() {
+        // [MOC-211] GLM 白名单 gate 靠它从 baseUrl 取 host。
+        assert_eq!(
+            host_of("https://open.bigmodel.cn/api/coding/paas/v4").as_deref(),
+            Some("open.bigmodel.cn")
+        );
+        assert_eq!(
+            host_of("https://api.z.ai/api/coding/paas/v4").as_deref(),
+            Some("api.z.ai")
+        );
+        // 带端口 / userinfo / 无 scheme 也能剥到纯 host
+        assert_eq!(host_of("http://h:8080/x").as_deref(), Some("h"));
+        assert_eq!(host_of("https://u@host.tld/x").as_deref(), Some("host.tld"));
+        assert_eq!(
+            host_of("open.bigmodel.cn/api").as_deref(),
+            Some("open.bigmodel.cn")
+        );
+        assert_eq!(host_of(""), None);
     }
 }

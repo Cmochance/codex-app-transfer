@@ -527,5 +527,14 @@ pub fn public_provider(p: &Value) -> Value {
         .unwrap_or(false);
     out.remove("grokWeb");
     out.insert("hasGrokWeb".into(), Value::Bool(has_grok_web));
+    // [MOC-211] mimoCookie 是小米账号网页 session(httpOnly serviceToken 等),敏感凭证,
+    // 跟 apiKey 一样 mask 出去,只暴露 `hasMimoCookie` 给前端显示「已登录/需登录」状态。
+    let has_mimo_cookie = out
+        .get("mimoCookie")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    out.remove("mimoCookie");
+    out.insert("hasMimoCookie".into(), Value::Bool(has_mimo_cookie));
     Value::Object(out)
 }

@@ -328,6 +328,53 @@
     }
   }
 
+  /// [MOC-211] 该 provider 是否 MiMo Token Plan(套餐用量需小米账号 session)。
+  /// 按 baseUrl 判:host 含 xiaomimimo.com 且路径含 token-plan(对齐 token-plan-{cn,sgp,ams})。
+  function isMimoTokenPlan(baseUrl) {
+    const u = baseUrl || "";
+    return /xiaomimimo\.com/i.test(u) && /token-plan/i.test(u);
+  }
+
+  /// [MOC-211] MiMo Token Plan「登录小米账号」row:仅编辑已保存的 MiMo token-plan provider
+  /// 时显示(登录需 provider.id 落 cookie)。点击开内嵌 webview 登录,抓 session 存后端。
+  function setMimoLoginRow(show, hasCookie, providerId) {
+    const row = $("#providerMimoLoginRow");
+    const btn = $("#providerMimoLoginBtn");
+    const status = $("#providerMimoLoginStatus");
+    if (row) row.hidden = !show;
+    if (!show) return;
+    if (status) {
+      status.textContent = hasCookie
+        ? t("providersAdd.mimoLogin.statusLoggedIn")
+        : t("providersAdd.mimoLogin.statusNotLoggedIn");
+    }
+    if (btn) {
+      btn.disabled = false;
+      // onclick 赋值(非 addEventListener)避免重复绑定叠加
+      btn.onclick = async () => {
+        if (!providerId) return;
+        btn.disabled = true;
+        if (status) status.textContent = t("providersAdd.mimoLogin.statusLoggingIn");
+        try {
+          const res = await CCApi.mimoLogin(providerId);
+          if (res && res.captured === false) {
+            // 用户关窗 / 未完成登录 → 中性提示,不当错误
+            if (status) status.textContent = t("providersAdd.mimoLogin.statusNotLoggedIn");
+            showToast(t("providersAdd.mimoLogin.cancelled"));
+          } else {
+            if (status) status.textContent = t("providersAdd.mimoLogin.statusLoggedIn");
+            showToast(t("providersAdd.mimoLogin.success"));
+          }
+        } catch (error) {
+          if (status) status.textContent = t("providersAdd.mimoLogin.statusNotLoggedIn");
+          showToast(error.message || t("toast.requestFailed"));
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    }
+  }
+
   function setApiFormatMode(allowSelect, currentValue) {
     const displayEl = $("#providerApiFormatDisplay");
     const selectableEl = $("#providerApiFormatSelectable");
@@ -2235,6 +2282,7 @@
     setGrokWebRowState("openai_chat"); // R1 PR-7 reset grok_web row 隐藏
     fillGrokWebFormFromProvider(null);
     setWebSearchRow(false, false, null);
+    setMimoLoginRow(false, false, null); // 新建态无 provider.id,隐藏登录 row
     setProviderMappings(emptyMappings());
     setReviewModelSlotField(""); // 新建/重置 → 审查模型回到「跟随主模型」
   }
@@ -2277,6 +2325,7 @@
       !!formRequestOptions.web_search_enabled,
       preset.id
     );
+    setMimoLoginRow(false, false, null); // 选 preset(新建态)无 provider.id,隐藏登录 row
     providerAvailableModels = [];
     setProviderMappings(preset.models || emptyMappings());
     setReviewModelSlotField(""); // preset 不带审查模型 → 回到「跟随主模型」
@@ -2338,6 +2387,8 @@
       !!formRequestOptions.web_search_enabled,
       matchedPreset?.id || null
     );
+    // [MOC-211] 编辑已保存的 MiMo Token Plan provider → 显示「登录小米账号」row(有 provider.id 可落 cookie)
+    setMimoLoginRow(isMimoTokenPlan(provider.baseUrl), !!provider.hasMimoCookie, provider.id);
     providerAvailableModels = [];
     setProviderMappings(provider.mappings || emptyMappings());
     setReviewModelSlotField(provider.reviewModelSlot || ""); // 回填已配置的审查模型槽位
