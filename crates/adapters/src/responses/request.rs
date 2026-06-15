@@ -1817,7 +1817,7 @@ fn sanitize_minimax_chat_body(body: &mut Map<String, Value>) {
             // 档位选 `none` 时 `apply_reasoning_effort` 在本 sanitize 之前(request.rs:243 <
             // 313)写入 `thinking:{type:disabled}`,若不放行会被本 retain 剥掉 → 上游 M3 收不到
             // 关思考、picker 显 none 却仍思考。M2.x 不放行(其端点字段集更窄、且 M2.x 走
-            // FORCED_HIDDEN 无 none 档,本就不会带 thinking)。
+            // SINGLE_MAX 单档 max、无 none 档,本就不会带 thinking)。
             || (is_m3_plus
                 && matches!(
                     key.as_str(),

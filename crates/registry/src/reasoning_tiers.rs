@@ -21,8 +21,8 @@
 //! 返回 `None` = 无特殊档位,catalog 用 Codex 默认 4 档、wire 不动。
 //!
 //! **范围(MOC-241)**:chat-completions 思考系(GLM / DeepSeek / Kimi / 阿里云百炼 Qwen /
-//! 小米 MiMo / MiniMax)+ **Gemini 全系**(AI Studio / CLI / Antigravity:思考档不可经 Codex
-//! picker 可靠控制 → 空档位隐藏 picker)。Grok、moonshot-v1-* 仍留默认。
+//! 小米 MiMo / MiniMax)+ **Gemini 全系**(AI Studio / CLI / Antigravity,gemini_native:`none`/`max`
+//! 两档,wire 经 gemini_native 映射 none→thinkingLevel:off / max→high)。Grok、moonshot-v1-* 仍留默认。
 
 use crate::compact_thinking_policy::DisableThinkingWire;
 use crate::reasoning_effort_policy::ReasoningEffortWire;
@@ -106,12 +106,18 @@ static BINARY_ENABLE_THINKING: ReasoningTierSpec = ReasoningTierSpec {
     on_tier_wire: None,
 };
 
-/// **空档位 → 隐藏 picker**:思考档不可(经 Codex picker)控制的模型 —— MiniMax-M2.x(强制思考、
-/// 上游不支持 disable)与 Gemini 全系(Antigravity 把档位焊在 model id 里、gemini_native 的 `xhigh`
-/// 映射不到任何 thinkingLevel)。无 disable wire(不主动注入 disable)。
-static FORCED_HIDDEN: ReasoningTierSpec = ReasoningTierSpec {
-    levels: &[],
-    default_level: None,
+/// **思考必开 → 单档 `max`**:思考不可关、固定开的模型(MiniMax-M2.x;Gemini 全系按产品决策也归此 ——
+/// 不暴露可切的思考档)。**单档**(非空档位/非 none+max):picker 只显「Max」一个固定项,无可切选项
+/// (符合「思考不可修改」);且因有真实档 + 默认 max,Codex composer 的 `xp()` 返回 `max`(非回落全局
+/// 默认),**不残留「Reasoning / Medium」标签**(空档位会被 Codex 兜底成 medium 残留、去不掉除非 CDP,
+/// MOC-241 CDP 实证;单档 max 干净绕开)。
+///
+/// **wire**:M2.x(chat)思考强制开、`disable_wire`/`on_tier_wire` 皆 `None`(不发 reasoning_effort,
+/// minimax sanitize 也会剥);Gemini 走 gemini_native,`max`→`thinkingLevel:high`(Gemini 3 最高;2.x 走
+/// thinkingBudget)由 `adapters::gemini_native::request` 映射,不经本表 chat wire。本 spec 只驱动 picker。
+static SINGLE_MAX: ReasoningTierSpec = ReasoningTierSpec {
+    levels: &[TIER_MAX],
+    default_level: Some("max"),
     disable_wire: None,
     on_tier_wire: None,
 };
@@ -124,16 +130,15 @@ pub fn reasoning_tiers_for_model(model: &str) -> Option<&'static ReasoningTierSp
     if is_glm_thinking_model(&m) {
         return Some(&GLM_TWO_TIER);
     }
-    // MiniMax M2.x:thinking 强制开、上游不支持 disable(platform.minimaxi.com)→ 隐藏档位
+    // MiniMax M2.x:thinking 强制开、上游不支持 disable(platform.minimaxi.com)→ 单档 max(固定开,不可切)
     if m.starts_with("minimax-m2") {
-        return Some(&FORCED_HIDDEN);
+        return Some(&SINGLE_MAX);
     }
-    // Gemini 全系(AI Studio / CLI / Antigravity):思考档不可经 Codex picker 可靠控制 —— Antigravity
-    // 把档位焊在 model id 里(换档=换模型条目、且实测拒 thinkingLevel),gemini_native 的 `xhigh`
-    // 映射不到任何 thinkingLevel(Gemini 3 仅 off/low/medium/high)。用户指示:Gemini 思考不可改 →
-    // 空档位隐藏整个 picker。
+    // Gemini 全系(AI Studio / CLI / Antigravity,gemini_native):按产品决策不暴露可切思考档 → 单档 max
+    //(固定最高思考)。不用空档位隐藏(会被 Codex 兜底成残留 medium、去不掉除非 CDP);单档 max 干净。
+    // wire 经 gemini_native 映射 max→thinkingLevel:high(非本表 chat wire)。
     if m.starts_with("gemini") {
-        return Some(&FORCED_HIDDEN);
+        return Some(&SINGLE_MAX);
     }
 
     match m.as_str() {
@@ -268,11 +273,12 @@ mod tests {
     }
 
     #[test]
-    fn minimax_m2_forced_hidden() {
+    fn minimax_m2_single_max() {
+        // M2.x 思考强制开、不可关 → 单档 max(固定开,picker 无可切项);无 disable wire。
         for m in ["minimax-m2.7", "minimax-m2", "MiniMax-M2.7"] {
-            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中隐藏档"));
-            assert!(s.levels.is_empty(), "{m} 应空档位(隐藏 picker)");
-            assert_eq!(s.default_level, None);
+            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中单档 max"));
+            assert_eq!(efforts(s), vec!["max"], "{m} 应单档 max");
+            assert_eq!(s.default_level, Some("max"));
             assert_eq!(s.disable_wire, None, "{m} 强制思考、不可关");
         }
     }
@@ -295,8 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn gemini_all_forced_hidden() {
-        // Gemini 全系思考档不可经 picker 控制 → 空档位隐藏 picker(AI Studio + Antigravity 变体)。
+    fn gemini_all_single_max() {
+        // Gemini 全系(AI Studio + Antigravity 变体)→ 单档 max(固定最高思考,不暴露可切档);
+        // wire 经 gemini_native(max→thinkingLevel:high),非本表 chat wire,故 disable/on_tier 均 None。
         for m in [
             "gemini-3-pro",
             "gemini-3-flash",
@@ -309,11 +316,11 @@ mod tests {
             "gemini-3.1-pro-high",
             "  Gemini-3-Pro  ",
         ] {
-            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中隐藏档"));
-            assert!(s.levels.is_empty(), "{m} 应空档位(隐藏 picker)");
-            assert_eq!(s.default_level, None);
-            assert_eq!(s.disable_wire, None);
-            assert_eq!(s.on_tier_wire, None);
+            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中单档 max"));
+            assert_eq!(efforts(s), vec!["max"], "{m}");
+            assert_eq!(s.default_level, Some("max"), "{m} 默认 max");
+            assert_eq!(s.disable_wire, None, "{m} wire 经 gemini_native 不在本表");
+            assert_eq!(s.on_tier_wire, None, "{m}");
         }
     }
 

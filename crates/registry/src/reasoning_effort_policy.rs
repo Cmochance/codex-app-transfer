@@ -336,7 +336,7 @@ pub fn apply_reasoning_effort(
         return;
     }
     // [MOC-241] MiniMax-M3 / M2.x 已收口到 reasoning_tiers 表(M3 = 二元 none/max:none→thinking.type=
-    // disabled、max→no-op 默认思考;M2.x = FORCED_HIDDEN),命中即在上方 return,不再走旧的
+    // disabled、max→no-op 默认思考;M2.x = SINGLE_MAX 单档 max,disable/on_tier 均 None → 不写),命中即在上方 return,不再走旧的
     // 「Drop→OpenAIEnum 透传 reasoning_effort」M3 特例。此处仅处理**未入表**的 provider/model。
     reasoning_effort_wire(provider).apply(body, codex_effort, &provider.id);
 }
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn minimax_m2_forced_thinking_no_disable_wire() {
-        // M2.x 强制思考、不可关(reasoning_tiers=FORCED_HIDDEN,disable_wire=None;picker 已隐藏):
+        // M2.x 强制思考、不可关(reasoning_tiers=SINGLE_MAX,单档 max,disable_wire=None):
         // 选 none 也不写任何 disable 字段,绝不发假控制。
         let b = apply_model("minimax", "minimax-m2.7", "none");
         assert!(b.get("thinking").is_none(), "M2.x 不可关,不写 thinking");
@@ -652,7 +652,7 @@ mod tests {
     fn minimax_m3_and_m2_via_table() {
         // [MOC-241] M3/M2.x 收口到 reasoning_tiers 表(真机 healed 形态:name MiniMax + minimaxi baseUrl)。
         // M3 = 二元(none→thinking.type=disabled;high/max→no-op,M3 默认思考,不再透传 reasoning_effort);
-        // M2.x = FORCED_HIDDEN(强制思考不可关,不写任何 disable/effort)。
+        // M2.x = SINGLE_MAX(单档 max,强制思考不可关,不写任何 disable/effort)。
         let p = provider_full("minimax", "MiniMax", "https://api.minimaxi.com/v1");
 
         // M3 思考开档(high)→ no-op

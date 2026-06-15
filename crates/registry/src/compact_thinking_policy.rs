@@ -184,8 +184,8 @@ pub fn compact_disable_thinking_wire(model: &str) -> Option<DisableThinkingWire>
     // - GLM 4.5+/5.x → `GlmDual`(hosted 顶级 thinking + 自建 chat_template_kwargs 双发)
     // - Kimi K2 / DeepSeek V4 / MiniMax-M3 → `ThinkingTypeDisabled`(顶级 thinking.type)
     // - 阿里云百炼 Qwen 3.x / 小米 MiMo v2.x → `EnableThinkingFalse`(顶级 enable_thinking)
-    // - `None` = 表里没有(未知 / 非 thinking 模型)或**强制思考不可关**(MiniMax-M2.x → 表里是
-    //   `FORCED_HIDDEN`,`disable_wire=None`)→ 不注入 disable(保持 current behavior)。
+    // - `None` = 表里没有(未知 / 非 thinking 模型)或**强制思考不可关**(MiniMax-M2.x / Gemini → 表里是
+    //   `SINGLE_MAX` 单档 max,`disable_wire=None`)→ 不注入 disable(保持 current behavior)。
     // 各模型的官方文档出处见 reasoning_tiers 表注释;下方 `__unsupported_model_anchors` 段保留
     // 「无解类 / 无 thinking 类」完整决策图。新增模型只改表一处。
     reasoning_tiers_for_model(model).and_then(|spec| spec.disable_wire)

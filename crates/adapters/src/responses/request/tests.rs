@@ -431,7 +431,7 @@ fn minimax_m3_keeps_thinking_disable_wire_but_m2_drops() {
     // [MOC-241] reasoning 档位选 `none` 时,apply_reasoning_effort 给 M3 写 top-level
     // `thinking:{type:disabled}`(M3 ∈ BINARY_THINKING_TYPE),且该调用在 sanitize 之前
     // (request.rs:243 < 313)。M3 的 OpenAI-compat 端点原生接受该字段,sanitize 必须放行,
-    // 否则上游收不到关思考、picker 显 none 却仍思考。M2.x(FORCED_HIDDEN,无 none 档)
+    // 否则上游收不到关思考、picker 显 none 却仍思考。M2.x(SINGLE_MAX 单档 max,无 none 档)
     // 即便误带也应剥掉。
     let mk = |model: &str| {
         json!({
