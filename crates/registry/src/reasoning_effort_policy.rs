@@ -310,9 +310,17 @@ pub fn apply_reasoning_effort(
     }
     // [MOC-241] 智谱 GLM:不收顶级 `reasoning_effort`(wire=Drop),其原生「不思考」走 OpenAI
     // 兼容端的 `chat_template_kwargs`(见 [`apply_glm_thinking`],disable wire 取自 GLM 官方
-    // 客户端 ZCode、非猜测)。让 Codex reasoning 选择器对 GLM 的 `none`/`max` 两档生效
-    //(catalog 见 codex_integration::model_catalog 的 GLM 两档)。
-    if provider_matches(provider, "zhipu") || provider_matches(provider, "bigmodel") {
+    // 客户端 ZCode、非猜测)。**按请求 model 判定 GLM**([`is_glm_model`];`body["model"]` 已被
+    // forward.rs 重写成上游 id),与 catalog 层(`codex_integration` 的 `is_binary_thinking_model`
+    // 同样按 model id 标 GLM 两档)用同一判定 —— GLM 模型即便挂在非 zhipu 命名的代理(如自建
+    // LiteLLM 网关)后面,picker 的 `none`/`max` 与 wire 也一致生效。provider needle 作兜底
+    // (覆盖 model 字段缺失等场景)。
+    let model_is_glm = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .is_some_and(is_glm_model);
+    if model_is_glm || provider_matches(provider, "zhipu") || provider_matches(provider, "bigmodel")
+    {
         apply_glm_thinking(body, codex_effort);
         return;
     }
@@ -331,6 +339,17 @@ pub fn apply_reasoning_effort(
         wire = ReasoningEffortWire::OpenAIEnum;
     }
     wire.apply(body, codex_effort, &provider.id);
+}
+
+/// [MOC-241] 该 model id 是否属智谱 GLM 系(`glm-5.1` / `glm-4.7` / `glm-5-turbo` … 统一 `glm-`
+/// 前缀,外加裸 `glm`;入参已可含大小写/空白,本函数 trim + lowercase)。
+///
+/// **registry 单一判定源**:catalog 层(`codex_integration::model_catalog::is_binary_thinking_model`
+/// —— 决定 Codex picker 是否显 GLM 两档)与本模块 wire 层([`apply_reasoning_effort`] 的 GLM 分支
+/// / [`apply_glm_thinking`] —— 决定 `none` 是否真关思考)共用此函数,杜绝两层判定漂移。
+pub fn is_glm_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m == "glm" || m.starts_with("glm-")
 }
 
 /// [MOC-241] 把 Codex reasoning.effort 翻成智谱 GLM 的原生「不思考」控制(OpenAI 兼容端)。
@@ -507,6 +526,33 @@ mod tests {
         apply_reasoning_effort(&mut body, &p, "none");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(body["chat_template_kwargs"]["foo"], 1);
+    }
+
+    #[test]
+    fn glm_model_behind_non_zhipu_provider_still_disables() {
+        // PR #490 bot review:GLM 模型挂在非 zhipu 命名的代理(如自建 LiteLLM 网关)后面 ——
+        // 仅靠 provider needle 会漏(picker 显 none 但关不掉)。按 body["model"](forward.rs 已
+        // 重写成上游 id)判定即可命中,与 catalog 层同款 model-driven 判定。
+        let p = provider_full("litellm-uuid", "my-litellm-proxy", "https://gw.internal/v1");
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String("glm-5.1".into()));
+        apply_reasoning_effort(&mut body, &p, "none");
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"], false,
+            "非 zhipu 命名代理后的 GLM 模型,none 也必须关思考(按 model 判定)"
+        );
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn is_glm_model_classifies_glm_family() {
+        for m in ["glm-5.1", "GLM-4.7", "glm-5-turbo", "glm", " glm-5 "] {
+            assert!(is_glm_model(m), "{m} 应判为 GLM");
+        }
+        // 边界:chatglm3 不是 `glm-` 前缀(不收),空串不收
+        for m in ["gpt-5.5", "deepseek-v4-pro", "chatglm3", ""] {
+            assert!(!is_glm_model(m), "{m} 不应判为 GLM");
+        }
     }
 
     #[test]

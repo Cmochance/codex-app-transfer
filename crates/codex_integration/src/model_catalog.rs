@@ -18,8 +18,9 @@
 //! absent (default) = auto-review reuses the main model.
 
 use codex_app_transfer_registry::{
-    documented_context_window, load_raw_config, model_supports_1m, normalize_model_mappings,
-    save_raw_config, strip_internal_model_suffix, CAS_BASE_INSTRUCTIONS, MODEL_SLOTS,
+    documented_context_window, is_glm_model, load_raw_config, model_supports_1m,
+    normalize_model_mappings, save_raw_config, strip_internal_model_suffix, CAS_BASE_INSTRUCTIONS,
+    MODEL_SLOTS,
 };
 use serde_json::{json, Value};
 
@@ -578,13 +579,12 @@ fn gpt52_reasoning_levels() -> Value {
 /// 与自适应档(glm-4.6/4.5)。两类都接受 `thinking.type=disabled` 且默认开,故 `none`+`max`
 /// 对二者都是忠实的二元表面,不是漏判。
 ///
-/// **按 model id 判定**(与 [`documented_context_window`] 同款 model-driven 口径,逐 slot
-/// 精确;比 provider 级更准 —— 同一 provider 不同 slot 可映射不同模型族)。GLM 模型 id 形如
-/// `glm-5.1` / `glm-4.7` / `glm-5-turbo`,统一 `glm-` 前缀(外加裸 `glm`)。
-/// 已对 trim + lowercase。
+/// **按 model id 判定**(model-driven,逐 slot 精确;同一 provider 不同 slot 可映射不同模型族),
+/// 且**与 wire 层共用同一判定 [`is_glm_model`]**(`registry::reasoning_effort_policy` 的 GLM 分支据此
+/// 决定 `none` 是否真关思考)—— 保证「picker 显两档」与「`none` 生效」对同一模型一致触发、不漂移
+/// (MOC-241 PR review:否则 GLM 模型挂在非 zhipu 命名代理后会 picker 显 `none` 但关不掉思考)。
 fn is_binary_thinking_model(model: &str) -> bool {
-    let m = model.trim().to_ascii_lowercase();
-    m == "glm" || m.starts_with("glm-")
+    is_glm_model(model)
 }
 
 /// [MOC-241] 二元思考模型的 reasoning 档位:Codex 原生 `none`(不思考)+ `max`(最高)。
