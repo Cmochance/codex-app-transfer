@@ -154,7 +154,7 @@ Codex 的 `low/medium/high/xhigh` 在各 chat-completions 上游的处理方式(
 | **Kimi / Kimi Code / GLM / 阿里云百炼 / Xiaomi MiMo / MiniMax** | 不传字段 | 不传字段 | 上游不认 `reasoning_effort`,用自家默认 thinking;如需控制在 `requestOptions` 写 provider-native 字段 |
 | **自定义 chat-compat** | clamp 到 `"high"` | 同名透传 | OpenAI 标准 enum 保守 fallback |
 
-**GLM 原生两档思考(MOC-241)**:GLM 思考模型(Z.AI 标支持 `thinking` 的 GLM-4.5+/5.x 系;legacy `glm-4-*` 不支持、维持默认 4 档)在 Codex 模型选择器显示 Codex 原生 `none`(不思考)+ `max`(最高)两档 —— 对齐 GLM 的二元思考开关(无 `low/medium/high` 深度档)—— 替代默认 4 档。选 `none` 会发 GLM 原生 disable wire 关闭思考——hosted Z.AI/BigModel 用顶级 `thinking:{type:disabled}`(docs.bigmodel.cn)、自建 vLLM/SGLang 用 `chat_template_kwargs.enable_thinking:false`(取自 GLM 官方客户端智谱 ZCode),两者皆「关」、不矛盾、覆盖各部署;`max` 走 GLM 默认(思考开)。顶级 `reasoning_effort` 仍丢弃(见上表,GLM 不收)。档位标签沿用 Codex 自身本地化文案,不做注入。
+**各 provider 原生思考档位(MOC-241)**:GLM 思考模型(Z.AI 标支持 `thinking` 的 GLM-4.5+/5.x 系;legacy `glm-4-*` 不支持、维持默认 4 档)在 Codex 模型选择器显示 Codex 原生 `none`(不思考)+ `max`(最高)两档 —— 对齐 GLM 的二元思考开关(无 `low/medium/high` 深度档)—— 替代默认 4 档。选 `none` 会发 GLM 原生 disable wire 关闭思考——hosted Z.AI/BigModel 用顶级 `thinking:{type:disabled}`(docs.bigmodel.cn)、自建 vLLM/SGLang 用 `chat_template_kwargs.enable_thinking:false`(取自 GLM 官方客户端智谱 ZCode),两者皆「关」、不矛盾、覆盖各部署;`max` 走 GLM 默认(思考开)。顶级 `reasoning_effort` 仍丢弃(见上表,GLM 不收)。档位标签沿用 Codex 自身本地化文案,不做注入。**同一张 `reasoning_tiers` 表还覆盖**:DeepSeek V4(`none/high/max`,none 关思考、high/max 走 `reasoning_effort`)、Kimi K2 / 阿里云百炼 Qwen 3.x / 小米 MiMo v2.x / MiniMax-M3(均 `none/max`)、MiniMax-M2.x(强制思考不可关 → 空档位隐藏 picker);Gemini(gemini_native 协议)/ Grok / moonshot-v1-* 暂留默认。
 
 ## 模型映射
 

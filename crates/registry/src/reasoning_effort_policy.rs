@@ -314,19 +314,25 @@ pub fn apply_reasoning_effort(
         return;
     }
     // [MOC-241] 可选思考档位表([`crate::reasoning_tiers`]):按请求 model 判定(`body["model"]`
-    // 已被 forward.rs 重写成上游 id),与 catalog 层**同一张表**,故 GLM 即便挂在非 zhipu 命名代理
-    // (如自建 LiteLLM 网关)后面也一致生效。命中(目前 = thinking-capable GLM)时:用户选「不思考」
-    // (`none`/`off`/`disabled`)→ 用该模型 `disable_wire` 关思考;选其它档(如 `max`)→ 留模型默认
-    // (no-op,GLM 默认思考开)。命中即 return,绝不落到下方 wire 给 GLM 写顶级 `reasoning_effort`。
+    // 已被 forward.rs 重写成上游 id),与 catalog 层**同一张表**,故模型即便挂在任意命名代理后面也
+    // 一致生效。命中时:
+    // - 选「不思考」(`none`/`off`/`disabled`)→ 用该模型 `disable_wire` 关思考(`None` = 该模型不可关,
+    //   no-op);GLM 等不收顶级 `reasoning_effort`,故关思考分支直接 return、不落下方 wire。
+    // - 选「思考开」的深度档(如 DeepSeek `high`/`max`)→ **fall through** 到下方
+    //   `reasoning_effort_wire` 写 `reasoning_effort`(DeepSeek=HighMax;GLM/Kimi/Qwen/MiMo=Drop 即
+    //   no-op = 模型默认思考开)。
     if let Some(spec) = body
         .get("model")
         .and_then(|v| v.as_str())
         .and_then(reasoning_tiers_for_model)
     {
         if matches!(codex_effort, "none" | "off" | "disabled") {
-            spec.disable_wire.apply_to_map(body);
+            if let Some(wire) = spec.disable_wire {
+                wire.apply_to_map(body);
+            }
+            return;
         }
-        return;
+        // 「思考开」深度档:不 return,落下方 reasoning_effort_wire(DeepSeek 写 high/max;其余 Drop)。
     }
     let mut wire = reasoning_effort_wire(provider);
     // MiniMax-M3 起原生接受 `reasoning_effort`(2026-06-03 真机实测 api.minimaxi.com
@@ -437,12 +443,13 @@ mod tests {
 
     // ── [MOC-241] GLM 思考档位 wire(reasoning_tiers 表驱动,按 body["model"] 判定)──
 
-    /// 构造带 `model` 的 body 跑 `apply_reasoning_effort`。GLM 检测按 `body["model"]`(查
-    /// reasoning_tiers 表),与 provider 名字无关 —— 故意用非 zhipu 的 provider 名,证明 model-based。
-    fn apply_model(model: &str, effort: &str) -> Value {
+    /// 构造带 `model` 的 body 跑 `apply_reasoning_effort`(model-based 查 reasoning_tiers 表)。
+    /// `provider_id` 决定「思考开」深度档 fall-through 到的 `reasoning_effort_wire`:GLM 模型挂
+    /// zhipu provider → Drop = no-op;DeepSeek 模型挂 deepseek provider → HighMax 写 reasoning_effort。
+    fn apply_model(provider_id: &str, model: &str, effort: &str) -> Value {
         let mut body = Map::new();
         body.insert("model".into(), Value::String(model.into()));
-        apply_reasoning_effort(&mut body, &provider("custom-proxy"), effort);
+        apply_reasoning_effort(&mut body, &provider(provider_id), effort);
         Value::Object(body)
     }
 
@@ -459,7 +466,7 @@ mod tests {
         // 也绝不写顶级 reasoning_effort(GLM 不收)。
         for e in ["max", "xhigh"] {
             assert!(
-                only_model_left(&apply_model("glm-5.1", e)),
+                only_model_left(&apply_model("zhipu", "glm-5.1", e)),
                 "GLM effort={e} 应 no-op"
             );
         }
@@ -467,7 +474,7 @@ mod tests {
 
     #[test]
     fn glm_none_disables_thinking_both_wires() {
-        let body = apply_model("glm-5.1", "none");
+        let body = apply_model("zhipu", "glm-5.1", "none");
         // ① hosted Z.AI/BigModel 形态
         assert_eq!(body["thinking"]["type"], "disabled");
         // ② 自建 vLLM/SGLang 形态
@@ -494,7 +501,7 @@ mod tests {
         // GLM picker 只暴露 none/max;其它档若出现 → 不写,留 GLM 默认(思考开)
         for e in ["low", "medium", "high", "minimal", "auto"] {
             assert!(
-                only_model_left(&apply_model("glm-5.1", e)),
+                only_model_left(&apply_model("zhipu", "glm-5.1", e)),
                 "GLM effort={e} 应 no-op"
             );
         }
@@ -530,6 +537,72 @@ mod tests {
         );
         assert!(body.get("chat_template_kwargs").is_none());
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    // ── [MOC-241] 其它 chat 思考 provider(reasoning_tiers 表驱动)──
+
+    #[test]
+    fn deepseek_none_disables_then_high_max_via_reasoning_effort() {
+        // none → 顶级 thinking:{type:disabled}(派 A),不写 reasoning_effort
+        let b = apply_model("deepseek", "deepseek-v4-pro", "none");
+        assert_eq!(b["thinking"]["type"], "disabled");
+        assert!(b.get("reasoning_effort").is_none());
+        // high/max(思考开深度档)→ fall through 到 HighMax wire → reasoning_effort
+        assert_eq!(
+            apply_model("deepseek", "deepseek-v4-pro", "high")["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            apply_model("deepseek", "deepseek-v4-flash", "max")["reasoning_effort"],
+            "max"
+        );
+    }
+
+    #[test]
+    fn kimi_none_disables_thinking_type_max_noop() {
+        let b = apply_model("kimi", "kimi-k2.6", "none");
+        assert_eq!(b["thinking"]["type"], "disabled");
+        assert!(
+            b.get("chat_template_kwargs").is_none(),
+            "Kimi 走顶级 thinking,不发 chat_template_kwargs"
+        );
+        // max(思考开)→ Drop fall-through → no-op(Kimi 默认思考)
+        assert!(only_model_left(&apply_model("kimi", "kimi-k2.6", "max")));
+    }
+
+    #[test]
+    fn qwen_and_mimo_none_disables_enable_thinking() {
+        let q = apply_model("bailian", "qwen3.6-plus", "none");
+        assert_eq!(q["enable_thinking"], false);
+        assert!(
+            q.get("thinking").is_none(),
+            "Qwen 走顶级 enable_thinking,不发 thinking.type"
+        );
+        let m = apply_model("xiaomi-mimo-payg", "mimo-v2.5-pro", "none");
+        assert_eq!(m["enable_thinking"], false);
+        // max → no-op(默认思考开)
+        assert!(only_model_left(&apply_model(
+            "bailian",
+            "qwen3.6-plus",
+            "max"
+        )));
+    }
+
+    #[test]
+    fn minimax_m3_none_disables_thinking_type() {
+        let b = apply_model("minimax", "minimax-m3", "none");
+        assert_eq!(b["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn minimax_m2_forced_thinking_no_disable_wire() {
+        // M2.x 强制思考、不可关(reasoning_tiers=FORCED_HIDDEN,disable_wire=None;picker 已隐藏):
+        // 选 none 也不写任何 disable 字段,绝不发假控制。
+        let b = apply_model("minimax", "minimax-m2.7", "none");
+        assert!(b.get("thinking").is_none(), "M2.x 不可关,不写 thinking");
+        assert!(b.get("enable_thinking").is_none());
+        assert!(b.get("chat_template_kwargs").is_none());
+        assert!(b.get("reasoning_effort").is_none());
     }
 
     #[test]

@@ -179,87 +179,16 @@ fn set_chat_template_enable_thinking_false(obj: &mut Map<String, Value>) -> bool
 /// 两类已知"故意不进表"的模型在本文件末尾的 [`__unsupported_model_anchors`]
 /// doc-only 模块里保留专属注释段,**完整呈现** chat 协议全模型决策图。
 pub fn compact_disable_thinking_wire(model: &str) -> Option<DisableThinkingWire> {
-    let m = model.trim().to_ascii_lowercase();
-    // [MOC-241] 智谱 GLM 全系的「思考档位 + disable wire」统一收口到 [`crate::reasoning_tiers`]
-    // 表(单一真相,与 Codex picker 两档共用),不再在此硬列 GLM 名单。GLM 命中 → 返回其
-    // `disable_wire`(`GlmDual`:hosted 顶级 thinking + 自建 chat_template_kwargs 双发,
-    // 覆盖 Z.AI ChatThinking schema 列出的 4.5+/5.x 思考档,排除 legacy glm-4-*)。
-    if let Some(spec) = reasoning_tiers_for_model(&m) {
-        return Some(spec.disable_wire);
-    }
-    match m.as_str() {
-        // ─── 派 A:顶级 thinking.type=disabled ──────────────────────────
-        //
-        // Kimi K2 系列(月之暗面平台 + Kimi Code 平台)
-        // thinking 默认开 + 自适应 + 共享 max_tokens 池 + 支持
-        // `thinking.type=disabled` 顶级字段。
-        // 用户实测 compact ✅(2026-05-24,kimi-k2.6 直连)是"加 disable 不变坏"
-        // 的旁证 —— **不是不加的依据**。compact 任务下 reasoning 仍是浪费 budget。
-        // `kimi-for-coding` 是 Kimi Code 平台稳定 alias,后端映射最新 K2.6+。
-        // 文档:https://platform.kimi.com/docs/guide/use-kimi-k2-thinking-model
-        "kimi-k2.5"
-        | "kimi-k2.6"
-        | "kimi-for-coding"
-        // DeepSeek V4 实名 model(项目 preset `presets_data.json:13-21` 收录的两个)。
-        // thinking 默认开 + 自适应 + 支持 `thinking.type=disabled`(OpenAI SDK
-        // 走 extra_body,wire 上是顶级字段)。
-        // PR #224 prompt 简化已让 compact 实测稳,加 disable 是进一步优化:
-        // 1. 节省 output token(reasoning 不占 budget)
-        // 2. 节省 wall time(实测 #224 数据:短 prompt 44s / 长 prompt 94s,
-        //    主要差异在模型思考时长)
-        // 3. 节省钱(reasoning 按 output token 计费)
-        //
-        // **故意不收 `deepseek-chat` / `deepseek-reasoner` alias**:
-        // - `deepseek-reasoner` 历史上是 R1/V3-class thinking-only 模型 wrapper,
-        //   thinking 是模型设计的 integral 行为而非 toggleable;disable 可能
-        //   silently ignored 或上游 400 unknown field。
-        // - `deepseek-chat` 历史上指 non-thinking 模式,inject disable 是 no-op
-        //   占代码无意义。
-        // - 两个 alias 在 2026-04 后传言"统一指向 deepseek-v4-flash",但没找到
-        //   具体 doc URL 实证 + 没真机验证 disable 接受性 → 保守不收,等真实
-        //   issue 报告 + 真机验证再加。
-        // 文档:https://api-docs.deepseek.com/guides/thinking_mode
-        | "deepseek-v4-pro"
-        | "deepseek-v4-flash"
-        // MiniMax-M3:thinking 默认开(输出 <think>)。真机实测(2026-06-03,
-        // api.minimaxi.com 直连 MiniMax-M3 + 真实 key):**只有**顶级
-        // `thinking.type=disabled` 能关掉思考(content 直出 "Four." 无 <think>);
-        // `enable_thinking=false` / `reasoning_effort=none` /
-        // `chat_template_kwargs.enable_thinking=false` 全部被上游忽略(仍 <think>)。
-        // 故入派 A。注意:M2.x 系列(见下方无解类)直连不支持 disable,M3 与之不同。
-        | "minimax-m3" => Some(DisableThinkingWire::ThinkingTypeDisabled),
-
-        // ─── 派 B:顶级 enable_thinking=false ───────────────────────────
-        //
-        // 阿里云百炼 Qwen 3.x 混合思考模式。
-        // 官方原话:"qwen3.6-plus 和 qwen3.6-flash 默认开启思考模式 ...
-        // 由于 enable_thinking 非 OpenAI 标准参数,需要通过 extra_body 传入"。
-        // wire 上 SDK 的 `extra_body={"enable_thinking": False}` 透传后等价于
-        // chat body 顶级 `"enable_thinking": false`。
-        // 混合思考是自适应,但 compact 任务下"不思考"永远是对的 → 入表。
-        // 文档:https://help.aliyun.com/zh/model-studio/deep-thinking
-        "qwen3.6-plus"
-        | "qwen3.6-flash"
-        | "qwen3-plus"
-        | "qwen3-flash"
-        // 小米 MiMo v2 全系。跟 Qwen 同款 `enable_thinking` wire(都走百炼
-        // OpenAI 兼容路径,共用同一参数命名约定)。
-        // `mimo-v2.5-pro` / `mimo-v2.5` / `mimo-v2-pro` 通过 xiaomimimo.com 直连
-        // 或百炼第三方上架,wire 一致。`mimo-v2-flash` / `mimo-v2-omni` 同源 family。
-        // 文档:https://help.aliyun.com/zh/model-studio/mimo
-        //       https://www.mimo-v2.com/zh/docs/quick-start/first-api-call
-        | "mimo-v2.5-pro"
-        | "mimo-v2.5"
-        | "mimo-v2-pro"
-        | "mimo-v2-flash"
-        | "mimo-v2-omni" => Some(DisableThinkingWire::EnableThinkingFalse),
-
-        // ─── 未知 model:不注入(保守) ──────────────────────────────────
-        // 用户自定义 provider 上配置的 model ID 不在表中 → 不注入,保持
-        // current behavior。下方 `__unsupported_model_anchors` 注释段记录
-        // **已知** 但故意不入表的模型,见那里。
-        _ => None,
-    }
+    // [MOC-241] 整个 compact-disable 名单已收口到 [`crate::reasoning_tiers`] 表(单一真相,与
+    // Codex picker 档位 + reasoning wire 共用)。命中模型返回其 `disable_wire`:
+    // - GLM 4.5+/5.x → `GlmDual`(hosted 顶级 thinking + 自建 chat_template_kwargs 双发)
+    // - Kimi K2 / DeepSeek V4 / MiniMax-M3 → `ThinkingTypeDisabled`(顶级 thinking.type)
+    // - 阿里云百炼 Qwen 3.x / 小米 MiMo v2.x → `EnableThinkingFalse`(顶级 enable_thinking)
+    // - `None` = 表里没有(未知 / 非 thinking 模型)或**强制思考不可关**(MiniMax-M2.x → 表里是
+    //   `FORCED_HIDDEN`,`disable_wire=None`)→ 不注入 disable(保持 current behavior)。
+    // 各模型的官方文档出处见 reasoning_tiers 表注释;下方 `__unsupported_model_anchors` 段保留
+    // 「无解类 / 无 thinking 类」完整决策图。新增模型只改表一处。
+    reasoning_tiers_for_model(model).and_then(|spec| spec.disable_wire)
 }
 
 // ─────────────────────────────────────────────────────────────────────

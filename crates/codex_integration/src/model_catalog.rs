@@ -357,17 +357,22 @@ fn model_to_json(model: &CatalogModel) -> Value {
     if let Some(ref slug) = model.auto_review_model_override {
         entry["auto_review_model_override"] = Value::String(slug.clone());
     }
-    // [MOC-241] 该模型在 reasoning_tiers 表里有自定义档位(如 GLM → none/max 两档)→ 用表里的
-    // levels + default 覆盖模板默认档。主标签由 Codex 自身按 effort 本地化(中文 UI ≈「无思考 /
-    // 最大思考」),不另做 CDP/asar 注入;effort 取自 Codex 闭合枚举 {none..max},合法。
+    // [MOC-241] 该模型在 reasoning_tiers 表里有自定义档位 → 用表里的 levels(+ default)覆盖模板默认档。
+    // - 非空 levels(如 GLM none/max、DeepSeek none/high/max):picker 显这些档,主标签由 Codex 自身
+    //   按 effort 本地化(中文 UI ≈「无思考 / 最大思考」),不另做 CDP/asar 注入;effort 取自 Codex
+    //   闭合枚举 {none..max},合法。
+    // - **空 levels(强制思考不可关,如 MiniMax-M2.x):写 `supported_reasoning_levels: []` 让 Codex
+    //   隐藏 reasoning picker**(空档位不渲染可选项);此时无 default(留模板默认,反正 picker 隐藏)。
     if let Some(spec) = model.reasoning_spec {
-        entry["default_reasoning_level"] = Value::String(spec.default_level.to_owned());
         entry["supported_reasoning_levels"] = Value::Array(
             spec.levels
                 .iter()
                 .map(|l| json!({"effort": l.effort, "description": l.description}))
                 .collect(),
         );
+        if let Some(default_level) = spec.default_level {
+            entry["default_reasoning_level"] = Value::String(default_level.to_owned());
+        }
     }
     entry
 }
@@ -1234,17 +1239,55 @@ mod tests {
         assert_ne!(non_glm["default_reasoning_level"], "max");
     }
 
-    #[test]
-    fn non_glm_model_keeps_codex_multitier_reasoning() {
-        // 非二元思考模型(DeepSeek)保留 Codex 4 档,不被覆盖。
-        let models = catalog_models_for_provider("DeepSeek", "deepseek-v4-pro", true, None, None);
+    /// catalog 里 gpt-5.5 槽(= default_model)entry 的 supported_reasoning_levels effort 列表。
+    fn catalog_tiers(default_model: &str) -> Vec<String> {
+        let models = catalog_models_for_provider("P", default_model, false, None, None);
         let entry = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
-        let efforts: Vec<&str> = entry["supported_reasoning_levels"]
+        entry["supported_reasoning_levels"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|l| l["effort"].as_str().unwrap())
-            .collect();
-        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh"]);
+            .map(|l| l["effort"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn model_not_in_table_keeps_codex_multitier_reasoning() {
+        // 不在 reasoning_tiers 表的模型 → Codex 默认 4 档(模板自带)
+        assert_eq!(
+            catalog_tiers("some-custom-llm-x"),
+            ["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn deepseek_catalog_three_tier_default_high() {
+        assert_eq!(catalog_tiers("deepseek-v4-pro"), ["none", "high", "max"]);
+        let models = catalog_models_for_provider("DeepSeek", "deepseek-v4-pro", false, None, None);
+        let entry = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        assert_eq!(entry["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn binary_thinking_providers_catalog_two_tier() {
+        // GLM / Kimi / Qwen / MiMo / MiniMax-M3 → none + max
+        for m in [
+            "glm-5.1",
+            "kimi-k2.6",
+            "qwen3.6-plus",
+            "mimo-v2.5-pro",
+            "minimax-m3",
+        ] {
+            assert_eq!(catalog_tiers(m), ["none", "max"], "{m}");
+        }
+    }
+
+    #[test]
+    fn forced_thinking_catalog_hides_picker() {
+        // MiniMax-M2.x 强制思考不可关 → 空 supported_reasoning_levels(Codex 隐藏 picker)
+        assert!(
+            catalog_tiers("minimax-m2.7").is_empty(),
+            "M2.x 应空档位(隐藏 picker)"
+        );
     }
 }
