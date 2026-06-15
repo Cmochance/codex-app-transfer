@@ -408,9 +408,14 @@ pub(crate) fn build_compact_chat_request(
     super::request::set_compact_no_keep_recent(true);
     // [MOC-243] reconstruct_history 时走 with_session 变体 + global session cache,
     // 让 V2 compact(仅 trigger + prev_id)能取回完整历史再摘要;否则(V1 / inline)
-    // 沿用无 session 变体。cache miss + 非空 input(已 append summary prompt)→
-    // history_lost 降级为仅 summary prompt(空摘要→server_error 可重试→Codex 改发
-    // inline 自愈),**不会** PreviousResponseNotFound(那只在 input 空时触发)。
+    // 沿用无 session 变体。
+    //
+    // cache miss(重启 / TTL / eviction)→ `history_lost=true`:此时 input 只剩 summary
+    // prompt、无任何对话历史。**不能**就这么发出去 —— 模型可能从 prompt 凭空幻觉出"看似
+    // 合理实则无用"的摘要,骗过 `validate_compact_summary_quality`,Codex 据此用空洞摘要
+    // 替换掉真实 transcript(#494 bot review P2)。故 `history_lost` 时 **fail-fast** 返回
+    // Internal 错误(对齐质量校验失败路径)→ Codex 回退改发 inline 历史重试自愈,而不是发
+    // 一个没有历史的摘要请求。
     // synthetic body 无 prompt_cache_key → 不触发 context breakdown 落盘(无污染)。
     let conversion = if reconstruct_history {
         super::request::responses_body_to_chat_body_for_provider_with_session(
@@ -418,7 +423,17 @@ pub(crate) fn build_compact_chat_request(
             Some(provider),
             Some(super::global_response_session_cache()),
         )
-        .map(|c| c.body)
+        .and_then(|c| {
+            if c.history_lost {
+                Err(AdapterError::Internal(
+                    "compact V2 history reconstruction failed (session cache miss); \
+                     returning error so Codex retries with inline history"
+                        .into(),
+                ))
+            } else {
+                Ok(c.body)
+            }
+        })
     } else {
         responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))
     };
@@ -1770,6 +1785,29 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("CONTEXT CHECKPOINT"));
+    }
+
+    #[test]
+    fn build_compact_chat_request_v2_errors_on_session_cache_miss() {
+        // MOC-243 / #494 bot review P2: V2 compact 重建历史时若 session cache miss
+        // (重启 / TTL / eviction)→ history_lost,input 只剩 summary prompt、无历史。
+        // 必须 fail-fast 报错(让 Codex 回退改发 inline 历史重试),不能发空历史请求 ——
+        // 否则模型可能从 prompt 凭空幻觉出"看似合理"的摘要骗过质量校验、替换掉真实 transcript。
+        let p = make_provider();
+        // 故意用一个从未 cache.save 过的 prev_id → 重建时必 cache miss
+        let prev_id = "moc243_cache_miss_never_saved_prev_id";
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [],
+            "previous_response_id": prev_id,
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let err = build_compact_chat_request(&bytes, &p).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("history reconstruction failed") || msg.contains("cache miss"),
+            "V2 compact cache miss 应 fail-fast 报错,实际: {msg}"
+        );
     }
 
     #[test]
