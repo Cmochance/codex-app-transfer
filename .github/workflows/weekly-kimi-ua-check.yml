@@ -1,0 +1,77 @@
+# 周 cron kimi-cli UA 跟踪 —— 每周查 PyPI 上 `kimi-cli` 最新版本,跟我们
+# kimi-code preset 的 `User-Agent: KimiCLI/<ver>` 比对。kimi 的 /coding 网关会
+# 按 UA 白名单过滤(非白名单 UA 丢进降级池、返回 429 engine_overloaded 文案),
+# UA 落后于官方 CLI 有被风控的风险;但 kimi 发版是不可预测的被动事件,这层把
+# 「等用户报 429」换成「每周主动比对 + fail 告警」(对齐 weekly-cf-check 的思路)。
+#
+# UA 版本号 == pip 包 `kimi-cli` 版本 —— 实证 kimi_cli/constant.py:
+#   get_user_agent() -> f"KimiCLI/{metadata.version('kimi-cli')}"
+# 所以拿 PyPI 最新版即可还原官方 UA。检测到落后只 fail 告警(独立 workflow,
+# 不是 PR required check、不阻塞合并);更新办法写在报错信息里。
+#
+# 注意: GitHub Actions cron 只认 UTC(无 timezone 字段);scheduled run 高峰会
+# 延迟甚至丢弃、只从默认分支(main)触发 —— 是提醒不是保证。整点(HH:00)最拥挤,
+# 故用错峰分钟,且避开 weekly-cf-check 的 01:37。
+name: weekly-kimi-ua-check
+
+on:
+  schedule:
+    # 错峰: 周一 02:43 UTC = 10:43 Asia/Shanghai(避开 weekly-cf-check 的 01:37、避开整点)。
+    - cron: '43 2 * * 1'
+  # 手动触发(cron 不准时的兜底 + 验收用)
+  workflow_dispatch: {}
+
+concurrency:
+  group: weekly-kimi-ua-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check-ua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: 比对 kimi-code preset UA 与 PyPI kimi-cli 最新版
+        run: |
+          set -euo pipefail
+          PRESET=crates/registry/src/presets_data.json
+
+          # preset 里 kimi-code 当前 UA 版本(KimiCLI/<ver> 取 <ver>)
+          CURRENT=$(jq -r '.[] | select(.id=="kimi-code") | .extraHeaders["User-Agent"] | split("/")[1]' "$PRESET")
+          if [ -z "$CURRENT" ] || [ "$CURRENT" = "null" ]; then
+            echo "::error::无法从 $PRESET 解析 kimi-code 的 User-Agent 版本(preset 结构可能变了)"
+            exit 1
+          fi
+
+          # PyPI 最新版(拿不到只 warn 不 fail,避免 PyPI 抖动误报)
+          LATEST=$(curl -fsSL --max-time 30 https://pypi.org/pypi/kimi-cli/json | jq -r '.info.version' || true)
+
+          {
+            echo "### kimi-cli UA 检测"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| preset 当前 UA | \`KimiCLI/$CURRENT\` |"
+            echo "| PyPI 最新版本 | \`${LATEST:-（获取失败）}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "::warning::PyPI 获取 kimi-cli 最新版本失败,跳过比对(本次不判定)"
+            exit 0
+          fi
+
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "::error::kimi-cli 已更新到 $LATEST,preset UA 仍是 KimiCLI/$CURRENT。更新办法:全仓 sed 替换 'KimiCLI/$CURRENT' → 'KimiCLI/$LATEST',再 'cargo run -p xtask -- gen-fixtures' 同步 fixture,提 PR。"
+            {
+              echo ""
+              echo "⚠️ **UA 落后**:把 \`KimiCLI/$CURRENT\` 全仓替换为 \`KimiCLI/$LATEST\` 后 regen fixture 再提 PR。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo ""
+            echo "✅ UA 已是最新(\`KimiCLI/$CURRENT\`)。"
+          } >> "$GITHUB_STEP_SUMMARY"

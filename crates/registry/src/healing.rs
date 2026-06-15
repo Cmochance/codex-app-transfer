@@ -543,7 +543,7 @@ mod tests {
         assert!(changed, "应当报告有改动");
         let extras = &cfg["providers"][0]["extraHeaders"];
         assert_eq!(
-            extras["User-Agent"], "KimiCLI/1.40.0",
+            extras["User-Agent"], "KimiCLI/1.47.0",
             "Kimi Code 的 KimiCLI UA 应被强制写入"
         );
     }
@@ -575,7 +575,7 @@ mod tests {
             "命中 preset → isBuiltin 应被设为 true"
         );
         assert_eq!(p["id"], "b405e7b0", "id 不动(避免破坏 activeProvider 引用)");
-        assert_eq!(p["extraHeaders"]["User-Agent"], "KimiCLI/1.40.0");
+        assert_eq!(p["extraHeaders"]["User-Agent"], "KimiCLI/1.47.0");
     }
 
     #[test]
@@ -711,7 +711,7 @@ mod tests {
                     "isBuiltin": true,
                     "apiFormat": "openai_chat",
                     "authScheme": "bearer",
-                    "extraHeaders": {"User-Agent": "KimiCLI/1.40.0"}
+                    "extraHeaders": {"User-Agent": "KimiCLI/1.47.0"}
                 }
             ]
         });
@@ -775,7 +775,7 @@ mod tests {
         assert_eq!(cfg["providers"][0]["isBuiltin"], json!(true));
         assert_eq!(
             cfg["providers"][0]["extraHeaders"]["User-Agent"],
-            "KimiCLI/1.40.0"
+            "KimiCLI/1.47.0"
         );
         // h2 DeepSeek 命中 preset(/v1 后缀已 normalize)→ isBuiltin 设为 true,
         // apiFormat 写入 preset 字面值 openai_chat

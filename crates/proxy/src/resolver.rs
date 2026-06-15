@@ -755,13 +755,13 @@ mod tests {
     fn extra_headers_pulled_from_provider() {
         let mut p = provider("kimi-code", "https://up", "k");
         p.extra_headers
-            .insert("User-Agent".into(), "KimiCLI/1.40.0".into());
+            .insert("User-Agent".into(), "KimiCLI/1.47.0".into());
         let r = StaticResolver::new(None, vec![p], Some("kimi-code".into()));
         let parts = parts_with(&[]);
         let res = r.resolve(&parts, b"{}").unwrap();
         assert_eq!(
             res.extra_headers.get("user-agent").unwrap(),
-            "KimiCLI/1.40.0"
+            "KimiCLI/1.47.0"
         );
     }
 

@@ -329,7 +329,7 @@ fn is_strip_on_forward(name: &str) -> bool {
     // 元凶)。把它进 strip 列表后,后续逻辑会保证有正确的 UA 出站:
     //
     //   (1) 若 `provider.extra_headers` 含 User-Agent(如 Kimi Code preset 的
-    //       `KimiCLI/1.40.0`)→ extras 注入路径会上 UA(forward 复制循环跳过
+    //       `KimiCLI/1.47.0`)→ extras 注入路径会上 UA(forward 复制循环跳过
     //       客户端 UA + extras 注入循环上 extras 的 UA = 干净一份)。
     //   (2) 若 extras **没有** User-Agent(如非 Kimi 系 provider 没配)→
     //       `ProxyState::new` 给 reqwest `Client` 设了中性 default
@@ -1753,7 +1753,7 @@ fn intercept_image_gen_stream(
 /// **extras / adapter 同名 header 走 override 语义**:reqwest `RequestBuilder::header()`
 /// 是 append,不是 replace。如果客户端(例如 Codex CLI 自己加的
 /// `User-Agent: codex-cli/...`)和 `provider.extraHeaders`(例如 kimi-code
-/// 的 `User-Agent: KimiCLI/1.40.0`)同名,或客户端 header 跟协议 adapter 的
+/// 的 `User-Agent: KimiCLI/1.47.0`)同名,或客户端 header 跟协议 adapter 的
 /// 默认头(如 `anthropic-version`)同名,两条值都会上线,部分上游严格按首条值
 /// 判定接入身份。这里在复制客户端 header 时先过滤掉将由 extras / adapter
 /// 写入的名字,保证最终只有一份明确值出去。provider.extraHeaders 优先级高于
@@ -2780,7 +2780,7 @@ mod tests {
         );
         h.insert(
             HeaderName::from_static("user-agent"),
-            HeaderValue::from_static("KimiCLI/1.40.0"),
+            HeaderValue::from_static("KimiCLI/1.47.0"),
         );
         h.insert(
             HeaderName::from_static("accept"),
@@ -2826,7 +2826,7 @@ mod tests {
         }
         // 普通 header 必须保留原值
         assert!(dump.contains("content-type=application/json"));
-        assert!(dump.contains("user-agent=KimiCLI/1.40.0"));
+        assert!(dump.contains("user-agent=KimiCLI/1.47.0"));
         assert!(dump.contains("accept=text/event-stream"));
     }
 

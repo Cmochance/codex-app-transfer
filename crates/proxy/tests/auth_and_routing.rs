@@ -486,7 +486,7 @@ async fn slug_routes_to_provider_b_with_x_api_key_and_extras() {
 /// 同名 header 必须**只**带 `provider.extraHeaders` 的值上线,**不能**和
 /// 客户端原始 header 一起以多值形式打到上游。reqwest `RequestBuilder::header`
 /// 是 append 语义,如果不在复制客户端 header 时过滤掉 extras 已覆盖的名字,
-/// kimi-code 这类靠 `User-Agent: KimiCLI/1.40.0` 伪装身份的 provider 会被
+/// kimi-code 这类靠 `User-Agent: KimiCLI/1.47.0` 伪装身份的 provider 会被
 /// 上游"首条 UA"一票否决(2026-05-07 Windows v2.0.8 Kimi 403 现场)。
 #[tokio::test]
 async fn extras_header_overrides_client_value_no_duplicate() {
@@ -695,7 +695,7 @@ async fn openai_chat_provider_handles_responses_route_like_legacy_proxy() {
         &format!("http://{upstream}/v1"),
         "sk-kimi",
         "bearer",
-        &[("User-Agent", "KimiCLI/1.40.0")],
+        &[("User-Agent", "KimiCLI/1.47.0")],
     );
     active
         .models
@@ -747,7 +747,7 @@ async fn websocket_responses_route_uses_legacy_responses_conversion() {
         &format!("http://{upstream}/v1"),
         "sk-kimi",
         "bearer",
-        &[("User-Agent", "KimiCLI/1.40.0")],
+        &[("User-Agent", "KimiCLI/1.47.0")],
     );
     active
         .models

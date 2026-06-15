@@ -140,7 +140,7 @@ pub(super) fn provider_test_headers(provider: &Value, include_content_type: bool
     if provider_id == "kimi-code" || base_url.contains("api.kimi.com/coding") {
         headers.insert(
             HeaderName::from_static("user-agent"),
-            HeaderValue::from_static("KimiCLI/1.40.0"),
+            HeaderValue::from_static("KimiCLI/1.47.0"),
         );
     }
 

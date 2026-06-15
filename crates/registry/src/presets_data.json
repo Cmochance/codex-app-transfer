@@ -78,7 +78,7 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "extraHeaders": {
-      "User-Agent": "KimiCLI/1.40.0"
+      "User-Agent": "KimiCLI/1.47.0"
     },
     "models": {
       "default": "kimi-for-coding"

@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn accepts_common_kimi_headers() {
         let m = map_from(&[
-            ("User-Agent", "KimiCLI/1.40.0"),
+            ("User-Agent", "KimiCLI/1.47.0"),
             ("X-Foo", "bar"),
             ("Authorization", "Bearer sk-test"),
         ]);
