@@ -232,7 +232,8 @@ pub async fn proxy_responses_upstream_ws(
 
     // 收集非-WS 头(Codex 真实头值 + 鉴权)。手搓握手里(见 [`relay_manual`])排布逐字节复刻
     // Codex 真实握手(tcpdump 实证):WS 握手头(Host/Connection/Upgrade/Sec-WebSocket-*)在**前**,
-    // 这些自定义头在中间,`sec-websocket-extensions: permessage-deflate` 在**最后**。
+    // 这些自定义头在后。(Codex 真实握手末尾还带 `permessage-deflate` extension,但本 relay 无压缩
+    // 处理故**不 offer**,见 [`relay_manual`]。)
     let mut headers: Vec<(String, String)> = Vec::new();
     // 鉴权放自定义头块最前(整块仍在 WS 握手头之后,见上):第三方注入 provider 凭据;
     // chatgpt.com(key 空)透传 Codex token。
@@ -316,10 +317,10 @@ pub async fn proxy_responses_upstream_ws(
     }
 }
 
-/// TLS(tokio-rustls + webpki-roots)+ **手搓 WS 握手**(WS 头在前、自定义头居中、permessage-deflate
-/// extensions 在后,逐字节复刻 Codex 真实握手;`http` HeaderMap 控制不了顺序,故手写字节)+
+/// TLS(tokio-rustls + webpki-roots)+ **手搓 WS 握手**(WS 头在前、自定义头在后,逐字节复刻 Codex
+/// 真实握手;`http` HeaderMap 控制不了顺序,故手写字节;**不 offer permessage-deflate**,见函数体)+
 /// `from_raw_socket` 收发帧。握手非 101 → 给 Codex 发 Close + 日志状态码。`headers` 为自定义头
-/// (含鉴权,**不含** WS 握手头与 extensions)。
+/// (含鉴权,**不含** WS 握手头)。
 async fn relay_manual<S>(
     client_socket: WebSocket,
     host: String,
@@ -343,9 +344,11 @@ async fn relay_manual<S>(
     };
     let wskey = random_ws_key();
     // 逐字节复刻 Codex 真实握手排布(tcpdump 实证):WS 握手头在**前**,然后自定义头(鉴权 +
-    // Codex 真实头值),`sec-websocket-extensions` 放**最后**。freemodel 网关校验「带 x-codex-* 的
-    // Codex 客户端必须也带 permessage-deflate offer」—— 漏了当假 Codex 拒 426。这里只 offer,
-    // 是否真压缩看上游 101 响应是否回 `Sec-WebSocket-Extensions`(见下方响应头日志)。
+    // Codex 真实头值)。**不 offer `permessage-deflate`**:Codex 真实握手带该 extension,但本 relay
+    // 用 `from_raw_socket(.., None)` 无压缩处理,若上游接受 offer 并发压缩帧,tokio-tungstenite 见
+    // 非零 RSV bit 即关流、relay 断(reviewer)。故不 offer(上游不会压缩,裸帧 relay 安全)。
+    // [followup MOC-239] 若某 WS 端点要求 permessage-deflate,再启 tokio-tungstenite deflate feature
+    // 做真压缩协商,而非裸 offer。
     let mut req = format!("GET {path} HTTP/1.1\r\n");
     req.push_str(&format!(
         "Host: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {wskey}\r\n"
@@ -356,7 +359,7 @@ async fn relay_manual<S>(
         req.push_str(v);
         req.push_str("\r\n");
     }
-    req.push_str("sec-websocket-extensions: permessage-deflate; client_max_window_bits\r\n\r\n");
+    req.push_str("\r\n");
     if tls.write_all(req.as_bytes()).await.is_err() {
         telemetry
             .logs
