@@ -2576,14 +2576,32 @@
     return out;
   }
 
+  // 串行化保存:连点多个映射 select 时,每次都发整份权威快照。并发 PUT 可能乱序完成 →
+  // 较慢的旧请求落在新请求后、覆盖用户更新的选择(#477 bot review P2)。改为「单飞 + 最新覆盖」:
+  // 同一时刻只有一个 PUT 在跑,期间新变更只更新 pending(last-write-wins),队列排空后统一重渲染。
+  let poolSlotSaving = false;
+  let poolSlotPending = null;
   async function savePoolSlotMappings(mappings) {
+    poolSlotPending = mappings; // 最新一次覆盖
+    if (poolSlotSaving) return; // 已有保存循环在跑,会消费最新 pending
+    poolSlotSaving = true;
+    let ok = true;
     try {
-      await CCApi.setPoolSlotMappings(mappings);
-      showToast(t("toast.integrationMappingUpdated"));
-    } catch (e) {
-      showToast(e.message || t("toast.requestFailed"));
+      while (poolSlotPending !== null) {
+        const next = poolSlotPending;
+        poolSlotPending = null;
+        try {
+          await CCApi.setPoolSlotMappings(next); // 串行 PUT,杜绝并发乱序覆盖
+        } catch (e) {
+          ok = false;
+          showToast(e.message || t("toast.requestFailed"));
+        }
+      }
+    } finally {
+      poolSlotSaving = false;
     }
-    await renderProviders(); // 重渲染(成功固化 / 失败复原到后端真实状态 + 重填 model select)
+    if (ok) showToast(t("toast.integrationMappingUpdated"));
+    await renderProviders(); // 队列排空后统一重渲染(后端最终状态 + 重填 model select)
   }
 
   // 上池:把已配置的 provider 当候选,加入(pooledEnabled)/移出整合子集。
