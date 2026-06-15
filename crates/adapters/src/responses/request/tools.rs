@@ -1,8 +1,6 @@
 use codex_app_transfer_registry::Provider;
 use serde_json::{json, Value};
 
-use super::provider_looks_like;
-
 /// Codex freeform tool name we special-case. See the `"custom" =>` arm in
 /// `convert_responses_tool_to_chat_tool` below for the request-side rewrite
 /// rationale, and `converter.rs::close_tool_call` for the response-side
@@ -329,10 +327,9 @@ pub fn convert_responses_tool_to_chat_tool(
         // Codex.app 默认每轮都给 tools 数组传 `{type:"web_search",
         // external_web_access:true, search_content_types:["text","image"]}`
         // (实测 dump 确认),作为 Responses API 标准 server-side built-in。
-        // 各家上游 chat completions API 用各自字段表达 web search 能力,
-        // 代理层负责 per-provider 适配。本提交先实施 MiMo,Kimi /
-        // DeepSeek / MiniMax / Qwen / GLM 留 TODO,逐家文档实证后跟进。
-        // 实施跟踪见 `docs/web-search-implementation-tracker.md`。
+        // 协议层一律 drop,不映射到任何第三方 provider 的原生 web search。
+        // 模型统一走自研 web_search / web_fetch(MOC-190)+ MCP 路径联网。
+        // [MOC-208]
         "web_search" | "web_search_preview" => convert_web_search_tool(obj, provider),
         // Codex 0.130+ 引入的 `tool_search` builtin — `Feature::ToolSearchAlwaysDeferMcpTools`
         // 启用后所有 MCP server tools 都 defer 到 `tool_search`,LLM 通过它 BM25 query
@@ -393,143 +390,22 @@ pub fn convert_responses_tool_to_chat_tool(
     }
 }
 
-/// Per-provider `web_search` / `web_search_preview` 适配。Codex.app 入站默认
-/// 每轮发 OpenAI Responses API 标准的 `{type:"web_search", external_web_access:true,
-/// search_content_types:["text","image"]}`,本函数转成各上游 chat API 真实
-/// 支持的形态。
+/// Codex 入站的 `web_search` / `web_search_preview` 工具**一律 drop**,不再映射
+/// 到任何第三方 provider 的原生 web search。[MOC-208]
 ///
-/// **逐家文档实证后才能加映射**(`docs/web-search-implementation-tracker.md`)。
-/// 暂未实证 of provider 走 `_ => warn_once + drop`,模型退化到用 MCP 工具(如
-/// 用户配的 Node Repl + JS fetch DDG 这种自带能力)联网,**功能仍可用,只是
-/// 不走最高效路径**。
-///
-/// ## 已实证 provider
-///
-/// ### Xiaomi MiMo(`platform.xiaomimimo.com`)
-///
-/// 1:1 复刻 `7as0nch/mimo2codex@fe79178` `src/translate/reqToChat.ts:196-209`。
-/// MiMo chat 端原生支持 `type:"web_search"`(MiMo 私有扩展,**需要在 MiMo
-/// 控制台开 Web Search Plugin** —— https://platform.xiaomimimo.com/#/console/plugin)。
-///
-/// 字段透传:`user_location` / `max_keyword` / `force_search` / `limit`(全可选)。
-/// OpenAI 的 `external_web_access` / `search_content_types` / `search_context_size`
-/// 在 MiMo 无等价,silent drop(对齐 mimo2codex)。
+/// **理由**:本项目自研 `web_search` / `web_fetch`(MOC-190,Chrome-based —— 浏览器
+/// TLS 指纹 + headless 渲染 + 全文返回 + `read_url_local` 本地缓存)已统一覆盖所有
+/// provider 的联网能力,够用且可控。继续借第三方原生 web search 弊大于利:计费不
+/// 可控(如 Kimi `$web_search` 每次 $0.005)、各家形态/参数不一难维护、built-in
+/// search 与 Codex 每轮必发的 function tools 共存常触发上游 400(Gemini
+/// `google_search` + functionDeclarations 即此症)。模型改走自研 web_search +
+/// web_fetch + MCP 路径联网,行为统一。
 fn convert_web_search_tool(
-    obj: &serde_json::Map<String, Value>,
-    provider: Option<&Provider>,
+    _obj: &serde_json::Map<String, Value>,
+    _provider: Option<&Provider>,
 ) -> Vec<Value> {
-    let Some(provider) = provider else {
-        crate::warn_once_drop_tool("web_search:no-provider");
-        return vec![];
-    };
-
-    // A 层:配置开关。`request_options.web_search_enabled` 默认 false。
-    // 用户必须主动在 codex-app-transfer config 里标 true 才会启用;UI 提示
-    // 文案:"web_search 需要先在 Xiaomi MiMo 控制台付费启用后才能正常使用"。
-    if !provider_web_search_enabled(provider) {
-        crate::warn_once_drop_tool("web_search:disabled-by-config");
-        return vec![];
-    }
-
-    // B 层:运行时自动 disable cache。上游 4xx 失败一次后(forward.rs 调
-    // `disable_web_search_for`),本进程后续 turn 立即 drop,避免每个 turn
-    // 都触发同样错误。本次启动有效;用户去 UI 关 `web_search_enabled = false`
-    // 才是持久关闭。
-    if crate::is_web_search_disabled_for(&provider.id) {
-        crate::warn_once_drop_tool("web_search:auto-disabled-after-failure");
-        return vec![];
-    }
-
-    if provider_looks_like(provider, "xiaomimimo") || provider_looks_like(provider, "mimo") {
-        // MiMo 私有 chat 端 web_search 形态(reqToChat.ts:196-209)
-        let mut out = serde_json::Map::new();
-        out.insert("type".into(), Value::String("web_search".into()));
-        for field in ["user_location", "max_keyword", "force_search", "limit"] {
-            if let Some(v) = obj.get(field) {
-                out.insert(field.to_string(), v.clone());
-            }
-        }
-        return vec![Value::Object(out)];
-    }
-
-    if provider_looks_like(provider, "kimi") || provider_looks_like(provider, "moonshot") {
-        // Kimi 内置 `$web_search` builtin_function(WebFetch
-        // `platform.kimi.ai/docs/guide/use-web-search` 真原文实证):
-        //   {"type":"builtin_function", "function":{"name":"$web_search"}}
-        // **不透传任何子字段**(Kimi 文档明确只要 type + function.name)。
-        // 配套强制 `thinking:{type:"disabled"}` 顶级字段在
-        // `responses_body_to_chat_body_for_provider_with_session` body 后处理
-        // 注入(`contains_kimi_web_search_tool` 检测命中即写)。
-        // 计费:每次搜索调用 $0.005(独立于 token),搜索结果计入 prompt_tokens。
-        return vec![serde_json::json!({
-            "type": "builtin_function",
-            "function": {
-                "name": "$web_search",
-            },
-        })];
-    }
-
-    // ── 文档实证不支持 web_search 的 provider ──
-    // 这些 provider 的 chat completions API 明确只接受 `type:"function"`,
-    // 没有 builtin web_search / native search / extra_body 顶级开关等任何
-    // 形式的 server-side web 搜索能力。用户启用 web_search_enabled=true 也
-    // 不会 work,只能走 P5 修通的 namespace MCP 工具(如 Node Repl + JS
-    // fetch)绕路联网。warn_once 写明具体 provider 帮用户理解。
-
-    // DeepSeek(WebFetch `api-docs.deepseek.com/api/create-chat-completion`
-    // 真原文实证 2026-05-09):"Currently, only `function` is supported."
-    // tools 数组只接受 type:"function",最多 128 个,无 builtin / web_search
-    // / 任何 server-side 搜索能力。
-    if provider_looks_like(provider, "deepseek") {
-        crate::warn_once_drop_tool("web_search:not-supported-by-deepseek-api");
-        return vec![];
-    }
-
-    // MiniMax(三方实证 2026-05-09:WebFetch `platform.minimaxi.com/docs/api-reference/`
-    // + `platform.minimax.io/docs/api-reference/text-openai-api` + liteLLM
-    // MiniMax provider 文档):MiniMax chat completions API(`api.minimaxi.com/v1`)
-    // tools 仅 `type:"function"`,**无任何 builtin web_search / native search /
-    // 顶级 enable_search 字段**。MiniMax 自家的 web_search 能力**仅作 Token Plan
-    // MCP 工具存在**,不在 chat completions API 内。用户需联网搜索 → 走 P5
-    // 修通的 namespace MCP 路径(`~/.codex/config.toml` 加 mcp_servers 条目)。
-    if provider_looks_like(provider, "minimax") || provider_looks_like(provider, "minimaxi") {
-        crate::warn_once_drop_tool("web_search:not-supported-by-minimax-api");
-        return vec![];
-    }
-
-    // 其他 provider 尚未文档实证,走 drop + warn_once。
-    // 用户实地反馈"模型不能直接用 web_search,绕路 MCP 工具/Node Repl 写
-    // JS fetch HTML"是预期当前行为(P5 namespace MCP 修复后这条路是通的);
-    // 后续逐家移植后会让模型直接走 chat 原生 web search,效率更高。
-    crate::warn_once_drop_tool("web_search:provider-not-implemented");
+    crate::warn_once_drop_tool("web_search:provider-native-disabled");
     vec![]
-}
-
-/// 扫 outbound tools 数组,看是否含 Kimi 内置 `$web_search`
-/// (`type:"builtin_function"` + `function.name == "$web_search"`)。
-/// 命中时调用方需要在 body 顶级注入 `thinking:{type:"disabled"}` —— Kimi
-/// 文档强制要求(see `docs/web-search-implementation-tracker.md` §2.1.2)。
-pub fn contains_kimi_web_search_tool(tools: &[Value]) -> bool {
-    tools.iter().any(|t| {
-        t.get("type").and_then(|v| v.as_str()) == Some("builtin_function")
-            && t.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())
-                == Some("$web_search")
-    })
-}
-
-/// 读 `provider.request_options.web_search_enabled`(boolean,默认 false)。
-/// 用户必须显式在 codex-app-transfer 配置里标 true 才启用;**默认关闭**
-/// 是因为很多 provider(如 MiMo Token Plan 套餐)没开 Web Search Plugin
-/// 时,发 web_search 工具会被 400 拒绝。配套 4xx fallback 自动降级
-/// (`crate::disable_web_search_for`)防止重复失败。
-pub fn provider_web_search_enabled(provider: &Provider) -> bool {
-    provider
-        .request_options
-        .get("web_search_enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
 }
 
 pub fn normalize_tool_choice(tool_choice: &Value) -> Value {

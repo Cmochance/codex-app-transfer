@@ -245,7 +245,7 @@ start frontend/gallery.html       # Windows
 
 curl 等联网命令需要高级权限(目前第三方模型在 macOS 端无法触发提权选择)。**自 MOC-185 起该开关默认关闭**:apply 时写 `read-only` 沙箱 + `on-request` 审批,模型默认不能用 curl / wget 等联网 shell 命令、所有命令走审批。需要让模型联网 / 免审批时,在 设置 → "允许 Codex 联网工具(全权限模式)" 开关里**手动开启**(开启后 apply 才写 `sandbox_mode = "danger-full-access"` + `approval_policy = "never"`)。改默认只影响新装 / 未设置过的用户;**已显式开启的老用户配置不受默认值变更影响**(#215 / MOC-185)。
 
-> **⚠️ 安全权衡**:full-access 模式(手动开启后)模型可读写任何文件 + 所有命令无审批 = **完全信任模型**(等同 Codex 官方文档的 "Full access" 档位)。**默认(关闭)** Codex 走 read-only 沙箱 + on-request 审批,无网络,仅能用所选模型自带的 `web_search` 能力;若模型不支持 web_search 则所有搜索操作只会返回空内容。macOS 目前无法触发提权选择,故全权限需你手动权衡后开启。
+> **⚠️ 安全权衡**:full-access 模式(手动开启后)模型可读写任何文件 + 所有命令无审批 = **完全信任模型**(等同 Codex 官方文档的 "Full access" 档位)。**默认(关闭)** Codex 走 read-only 沙箱 + on-request 审批,无网络;第三方 provider 的原生 `web_search` 已不再使用(协议层 drop:chat 路径无条件丢弃、Gemini 路径在 functionDeclarations 共存时丢弃 googleSearch;MOC-208),搜索请求均走自研 `web_search` / `web_fetch` 工具(需开启内置联网抓取工具)。macOS 目前无法触发提权选择,故全权限需你手动权衡后开启。
 
 ### 上游 OpenAI / ChatGPT 返 403(Cloudflare JS 挑战)
 

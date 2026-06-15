@@ -165,7 +165,7 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     result.insert("messages".into(), Value::Array(messages));
 
     // tools(function / custom 直接处理,namespace 递归展平,web_search /
-    // web_search_preview per-provider 适配上游真支持的形态,其余 Responses
+    // web_search_preview 协议层无条件 drop [MOC-208],其余 Responses
     // 专属类型 drop + warn_once)
     if let Some(Value::Array(tools)) = body.get("tools") {
         // Stage 2: Filter out computer_use_preview for non-vision models early
@@ -208,17 +208,6 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         }
         dedup_chat_tools_by_name(&mut chat_tools);
         if !chat_tools.is_empty() {
-            // **Kimi `$web_search` 强制 thinking disabled**:Kimi 官方文档
-            // (`platform.kimi.ai/docs/guide/use-web-search`)明确写
-            // "When using `$web_search` function, you must disable the thinking
-            // ability of the model"。OpenAI SDK 的 `extra_body.thinking.type=
-            // "disabled"` 在 wire 上等价于 request body 顶级 `thinking:
-            // {type:"disabled"}` 字段。如果 outbound tools 含 Kimi 内置
-            // `$web_search`,代理在这里强制注入(用户启用 web_search 时模型
-            // thinking 能力被禁用是 Kimi API 限制,UI 后续会加提示)。
-            if contains_kimi_web_search_tool(&chat_tools) {
-                result.insert("thinking".into(), serde_json::json!({"type": "disabled"}));
-            }
             result.insert("tools".into(), Value::Array(chat_tools));
         }
     }
@@ -2812,10 +2801,7 @@ pub mod tools;
 #[cfg(test)]
 mod tests;
 
-use tools::{
-    contains_kimi_web_search_tool, convert_responses_tool_to_chat_tool, normalize_tool_choice,
-    APPLY_PATCH_TOOL_NAME,
-};
+use tools::{convert_responses_tool_to_chat_tool, normalize_tool_choice, APPLY_PATCH_TOOL_NAME};
 
 /// chat-path 实战指引(英文版),作为独立 `role:"system"` 注入,仅在该 turn 的
 /// tools 数组里注册了 `apply_patch` 时启用。理由参见 issue #235 真机稳定性测试。
