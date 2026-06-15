@@ -226,7 +226,11 @@ mod tests {
         // 断链:r9 的 prev=r8 不在 store(缺环)→ assemble_chain 仍返回尾段,但
         // assemble_chain_complete 必须 None(不能把不完整尾段当完整去 inline 重发)
         s.record_turn("r9", Some("r8".into()), vec![item("t9")]);
-        assert_eq!(s.assemble_chain("r9").len(), 1, "断链 assemble_chain 返回尾段");
+        assert_eq!(
+            s.assemble_chain("r9").len(),
+            1,
+            "断链 assemble_chain 返回尾段"
+        );
         assert!(
             s.assemble_chain_complete("r9").is_none(),
             "断链 → assemble_chain_complete None"

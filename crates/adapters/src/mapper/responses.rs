@@ -737,7 +737,8 @@ mod tests {
         // [reviewer] 非流式(`stream:false`)/ 子路径(cancel 等)请求的上游错误**原样回灌**
         // (status + JSON body),不包成 SSE 200 —— 否则期望 JSON 错误的 SDK/API 客户端会误判成功。
         use futures_util::StreamExt;
-        let err_body = br#"{"error":{"message":"bad cancel request","type":"invalid_request_error"}}"#;
+        let err_body =
+            br#"{"error":{"message":"bad cancel request","type":"invalid_request_error"}}"#;
         let upstream: ByteStream = Box::pin(futures_util::stream::once(async move {
             Ok::<_, std::io::Error>(Bytes::from_static(err_body))
         }));
