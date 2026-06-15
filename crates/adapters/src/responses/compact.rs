@@ -789,18 +789,32 @@ fn extract_compact_summary_text(parsed: &Value) -> Option<String> {
         .pointer("/candidates/0/content/parts")
         .and_then(|v| v.as_array())
     {
-        // **排除 thought 部分**:compact 请求带 reasoning_effort → 转 Gemini 时产
-        // `thinkingConfig.include_thoughts=true` → 响应可能含 `{"thought":true,"text":...}`
-        // 思维链。summary 只要结论不要过程,且全代码别处(gemini_native/response.rs 把
-        // part.thought 路由 reasoning 而非 content)一致把 thought 当非 content。不排除
-        // 会让思维链污染压缩后的上下文(code-reviewer IMPORTANT)。
-        let text: String = parts
-            .iter()
-            .filter(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true))
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect();
-        if !text.is_empty() {
-            return Some(text);
+        // 正常情况:摘要在 content 通道(非 thought),优先取它 —— 维持原意
+        // (排除 thought 避免思维链污染摘要;gemini_native/response.rs 也把
+        // part.thought 路由 reasoning 而非 content)。content 非空就用它,**不论
+        // thought 多长**:模型思考再多,结论通道才是摘要,不能因 thought 更长就反取。
+        let join_parts = |want_thought: bool| -> String {
+            parts
+                .iter()
+                .filter(|p| {
+                    (p.get("thought").and_then(|t| t.as_bool()) == Some(true)) == want_thought
+                })
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect()
+        };
+        let content_text = join_parts(false);
+        if !content_text.trim().is_empty() {
+            return Some(content_text);
+        }
+        // 失败模式(MOC-243):部分 Antigravity 模型思考档焊死在 model id(如
+        // gemini-3-flash-agent = "Gemini 3.5 Flash (High)",必然 High thinking、
+        // 无法运行时关闭),会把整段摘要写进 thought 通道、content 通道**空** →
+        // 只取非-thought 会让 compact 拿不到摘要(missing summary text),逼 Codex
+        // 回退本地 inline compact。content 空时退回 thought:compact 的"思考"本身
+        // 就是对历史的浓缩,远优于整个失败。下游 quality 校验(min 800)仍把关。
+        let thought_text = join_parts(true);
+        if !thought_text.trim().is_empty() {
+            return Some(thought_text);
         }
     }
     // anthropic messages 非流式:content[].{type:"text",text}(V2 路径 anthropic
@@ -1913,6 +1927,58 @@ mod tests {
         assert_eq!(extract_compact_summary_text(&json!({"foo": "bar"})), None);
         assert_eq!(
             extract_compact_summary_text(&json!({"candidates": [{"content": {"parts": []}}]})),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_compact_summary_text_falls_back_to_thought_when_content_empty() {
+        // MOC-243:gemini-3-flash-agent(思考档焊死在 id,必然 thinking)可能把整段
+        // 摘要写进 thought 通道、content 通道空 → 旧逻辑只取非-thought 会返回 None
+        // (missing summary text),compact 失败。content 空时应退回 thought 文本。
+        let all_thought = json!({"candidates": [{"content": {"parts": [
+            {"text": "整段摘要其实在这里...", "thought": true},
+            {"text": "more summary in thought", "thought": true}
+        ]}}]});
+        assert_eq!(
+            extract_compact_summary_text(&all_thought).as_deref(),
+            Some("整段摘要其实在这里...more summary in thought"),
+            "content 通道空时应退回 thought 文本,而非返回 None 让 compact 失败"
+        );
+        // cloud_code / antigravity 外裹 {"response": {...}} 变体同样生效
+        let all_thought_wrapped = json!({"response": {"candidates": [{"content": {"parts": [
+            {"text": "wrapped thought summary", "thought": true}
+        ]}}]}});
+        assert_eq!(
+            extract_compact_summary_text(&all_thought_wrapped).as_deref(),
+            Some("wrapped thought summary")
+        );
+        // 回归守卫:content 非空时**仍优先 content**,即便 thought 更长也不反取
+        let content_shorter_than_thought = json!({"candidates": [{"content": {"parts": [
+            {"text": "a very long chain of thought that is much longer than the summary", "thought": true},
+            {"text": "short summary"}
+        ]}}]});
+        assert_eq!(
+            extract_compact_summary_text(&content_shorter_than_thought).as_deref(),
+            Some("short summary"),
+            "content 非空就用 content,不能因 thought 更长就反取(避免思维链污染)"
+        );
+        // content 纯空白(非空但 trim 后为空)+ 有真实 thought → 退回 thought
+        // (锁住 .trim().is_empty() guard:空白不该当作有效摘要返回)
+        let blank_content = json!({"candidates": [{"content": {"parts": [
+            {"text": "   "},
+            {"text": "real summary lives in thought", "thought": true}
+        ]}}]});
+        assert_eq!(
+            extract_compact_summary_text(&blank_content).as_deref(),
+            Some("real summary lives in thought"),
+            "content 纯空白时应退回 thought,而非返回空白摘要"
+        );
+        // content 与 thought 都空 → None
+        assert_eq!(
+            extract_compact_summary_text(&json!({"candidates": [{"content": {"parts": [
+                {"text": "", "thought": true}
+            ]}}]})),
             None
         );
     }
