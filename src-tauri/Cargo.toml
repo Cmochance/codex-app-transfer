@@ -65,7 +65,7 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 # toml_edit 保留注释 / 字段顺序 / 空行,用于 #24 MCP tab 的 config.toml 受管块
 # (TomlManagedBlock variant 解析 [mcp_servers.<name>] table 时不能丢用户注释)。
 # 普通 `toml` crate from_str + to_string 会丢注释 → marker 注释失效, 不可用。
-toml_edit = "0.22"
+toml_edit = "0.25"
 # tar / gzip — MCP plugin marketplace 安装走 tar.gz download → 解压到 ~/.codex/plugins/cache/
 tar = "0.4"
 flate2 = "1.0"
