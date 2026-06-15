@@ -1049,7 +1049,13 @@ fn active_moonshot_provider() -> Option<(String, String)> {
     };
     let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
     let host = host_of(base_url)?;
-    if !(host.ends_with("moonshot.cn") || host.ends_with("moonshot.ai")) {
+    // 精确 host 判定(`moonshot.cn`/`.ai` 本身或其子域),不用裸 ends_with —— 防 `notmoonshot.cn` /
+    // `api.moonshot.cn.evil` 误中。与 balance.rs `is_moonshot_payg_host` 对齐。
+    let is_moonshot = host == "moonshot.cn"
+        || host.ends_with(".moonshot.cn")
+        || host == "moonshot.ai"
+        || host.ends_with(".moonshot.ai");
+    if !is_moonshot {
         return None;
     }
     let api_key = p

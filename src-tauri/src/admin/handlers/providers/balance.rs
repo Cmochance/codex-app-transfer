@@ -10,6 +10,24 @@ use super::super::common::err;
 use super::test::{provider_test_error_label, provider_test_headers};
 use super::{clean_base_url, provider_api_key};
 
+/// 是否 Kimi (月之暗面 / Moonshot) PAYG 的官方 host。**解析 `baseUrl` 取真实 host 再精确判定**
+/// (不用 raw-URL `contains`,否则 `api.moonshot.cn.proxy.local` / `notmoonshot.cn` 会误中、把 key
+/// 发到官方端点)。允许 `moonshot.cn` 本身及其子域(`api.moonshot.cn` 等),`.ai` 同理。订阅制
+/// `kimi-code`(host `api.kimi.com`)不命中。与 injector 侧 `active_moonshot_provider` 的 host gate 对齐。
+fn is_moonshot_payg_host(base_url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    host == "moonshot.cn"
+        || host.ends_with(".moonshot.cn")
+        || host == "moonshot.ai"
+        || host.ends_with(".moonshot.ai")
+}
+
 fn provider_kind(provider: &Value) -> &'static str {
     let probe = format!(
         "{} {}",
@@ -33,16 +51,11 @@ fn provider_kind(provider: &Value) -> &'static str {
     } else if provider
         .get("baseUrl")
         .and_then(|v| v.as_str())
-        .map(|u| {
-            let u = u.to_ascii_lowercase();
-            u.contains("moonshot.cn") || u.contains("moonshot.ai")
-        })
+        .map(is_moonshot_payg_host)
         .unwrap_or(false)
     {
-        // Kimi (月之暗面) PAYG:**按 baseUrl host 判定**(`api.moonshot.cn`/`.ai`),不认 name 子串
-        // —— 防一个名字含 "moonshot" 但 baseUrl 是自定义代理的 provider 被误判、把 key 发到官方端点
-        // (与 injector 侧 `active_moonshot_provider` 的 host gate 对齐)。订阅制 `kimi-code`
-        // (`api.kimi.com/coding`)host 非 moonshot,不匹配。
+        // Kimi (月之暗面) PAYG:按解析后的 baseUrl **host** 精确判定(见 `is_moonshot_payg_host`),
+        // 不认 name 子串、不在 raw URL 上 `contains`。订阅制 `kimi-code`(`api.kimi.com/coding`)不命中。
         "moonshot"
     } else {
         "unknown"
@@ -407,6 +420,26 @@ mod tests {
         let renamed = json!({"name": "my moonshot proxy", "baseUrl": "https://api.example.com/v1"});
         assert_eq!(provider_kind(&renamed), "unknown");
         assert!(balance_endpoint(&renamed).is_none());
+
+        // 伪 host 必须被拒(解析 host 而非 raw `contains`):后缀混淆 + 子域伪装。
+        for spoof in [
+            "https://notmoonshot.cn/v1",
+            "https://api.moonshot.cn.proxy.local/v1",
+            "https://moonshot.cn.evil.com/v1",
+        ] {
+            let p = json!({ "name": "x", "baseUrl": spoof });
+            assert_eq!(
+                provider_kind(&p),
+                "unknown",
+                "spoof host must not match: {spoof}"
+            );
+            assert!(balance_endpoint(&p).is_none());
+        }
+        // 合法子域接受。
+        assert_eq!(
+            provider_kind(&json!({"name": "x", "baseUrl": "https://api.moonshot.cn/v1"})),
+            "moonshot"
+        );
 
         // 国际站 .ai → 切到 api.moonshot.ai 端点。
         let kimi_intl = json!({"name": "Moonshot", "baseUrl": "https://api.moonshot.ai/v1"});
