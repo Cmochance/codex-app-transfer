@@ -134,6 +134,11 @@ pub struct StaticResolver {
     /// 语义,#477 P2 round-6)→ 直接退默认 provider。`false` = 单 provider / 池空回退,保留
     /// legacy 拆分(向后兼容)。由 `with_catalog_slug_map` 按「反查表非空」自动置位。
     pub pool_enabled: bool,
+    /// 池化模式「默认档」路由:`(providers 下标, 上游真实 model)`,= 首条标准档映射
+    /// (MODEL_SLOTS 顺序 → gpt-5.5 优先)。池模式下 catalog miss(旧会话 / 未映射档 / 未知
+    /// model)路由到这里,**不**走 `map_model_for_provider`(那会用 default provider 自己的槽位
+    /// 映射、绕过整合 catalog,把流量发给整合页未暴露的模型,#477 P2)。`None` = 非池模式。
+    pub pool_default: Option<(usize, String)>,
 }
 
 impl StaticResolver {
@@ -148,6 +153,7 @@ impl StaticResolver {
             default_provider_id,
             catalog_slug_map: HashMap::new(),
             pool_enabled: false,
+            pool_default: None,
         }
     }
 
@@ -157,6 +163,13 @@ impl StaticResolver {
     pub fn with_catalog_slug_map(mut self, map: HashMap<String, (usize, String)>) -> Self {
         self.pool_enabled = !map.is_empty();
         self.catalog_slug_map = map;
+        self
+    }
+
+    /// 装配池化「默认档」路由(catalog miss 时用)。proxy_runner 传首条标准档映射的
+    /// `(provider_idx, real_model)`。
+    pub fn with_pool_default(mut self, default: Option<(usize, String)>) -> Self {
+        self.pool_default = default;
         self
     }
 
@@ -370,7 +383,23 @@ fn decide_provider<'a>(
         }
     }
 
-    // 2. 默认 provider + 槽位映射改写。
+    // 2a. 池模式 catalog miss(旧会话残留 / 未映射档 / 未知 model)→ 路由到「池默认档」的
+    //     精确 (provider, real_model),**不**走 map_model_for_provider —— 后者会用 default
+    //     provider 自己的槽位映射改写,绕过整合 catalog、把流量发给整合页未暴露的模型
+    //     (#477 bot review P2)。把池模式所有流量都留在用户 curate 的映射内。
+    if res.pool_enabled {
+        if let Some((idx, real)) = res.pool_default.as_ref() {
+            if let Some(p) = res.providers.get(*idx) {
+                return Some((p, Some(real.clone())));
+            }
+        }
+        // 防御:pool_enabled 但无池默认(理论上不可能,map 非空必有首条)→ 退默认 provider
+        // 原样(strip 后),仍不套单 provider 槽位映射。
+        let provider = res.default_provider()?;
+        return Some((provider, model.as_deref().map(strip_internal_model_suffix)));
+    }
+
+    // 2b. 非池模式:默认 provider + 槽位映射改写(原行为)。
     let provider = res.default_provider()?;
     if let Some(model) = model.as_deref() {
         if let Some(mapped) = res.map_model_for_provider(provider, model) {
@@ -910,6 +939,37 @@ mod tests {
         assert_eq!(
             res.provider_id, "openai",
             "池化下 excluded provider 的 slug 应退默认 provider,绝不 legacy 路由回 deepseek"
+        );
+    }
+
+    #[test]
+    fn pool_mode_routes_standard_slot_and_miss_to_pool_default() {
+        // 新设计:catalog_slug_map key = 标准档(gpt-5.x)→ 映射的 (provider, real_model)。
+        let providers = vec![
+            provider("openai", "https://up-1", "sk-1"),
+            provider("deepseek", "https://up-2", "sk-2"),
+        ];
+        let mut map = HashMap::new();
+        map.insert("gpt-5.5".to_owned(), (1usize, "deepseek-v4-pro".to_owned()));
+        let r = StaticResolver::new(None, providers, Some("openai".into()))
+            .with_catalog_slug_map(map)
+            .with_pool_default(Some((1usize, "deepseek-v4-pro".to_owned())));
+        let p = parts_with(&[]);
+        // 映射命中:gpt-5.5 → deepseek/deepseek-v4-pro
+        let hit = r.resolve(&p, br#"{"model":"gpt-5.5"}"#).unwrap();
+        assert_eq!(hit.provider_id, "deepseek");
+        assert_eq!(hit.rewritten_model.as_deref(), Some("deepseek-v4-pro"));
+        // #477 P2:catalog miss(未映射的 gpt-5.2 / 旧会话)→ 路由到池默认档,**不**用 default
+        // provider(openai)自己的槽位映射改写。
+        let miss = r.resolve(&p, br#"{"model":"gpt-5.2"}"#).unwrap();
+        assert_eq!(
+            miss.provider_id, "deepseek",
+            "miss 路由到池默认档 provider,非 default openai"
+        );
+        assert_eq!(
+            miss.rewritten_model.as_deref(),
+            Some("deepseek-v4-pro"),
+            "miss 改写成池默认档 real model"
         );
     }
 }

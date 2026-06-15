@@ -281,12 +281,18 @@ fn load_resolver_snapshot() -> Result<ResolverSnapshot, String> {
             &pool_entries,
         )
     };
+    // 池模式「默认档」路由:首条标准档映射的 (provider_idx, real_model)。catalog miss 时
+    // decide_provider 路由到这里(不走 map_model_for_provider,#477 P2)。
+    let pool_default = pool_entries
+        .first()
+        .map(|e| (e.provider_idx, e.real_model.clone()));
 
     Ok(ResolverSnapshot {
         provider_count: cfg.providers.len(),
         active_provider: cfg.active_provider.clone(),
         resolver: StaticResolver::new(Some(gateway_key), cfg.providers, default_provider_id)
-            .with_catalog_slug_map(pool_map),
+            .with_catalog_slug_map(pool_map)
+            .with_pool_default(pool_default),
         gateway_auth: true,
     })
 }
