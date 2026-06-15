@@ -812,9 +812,22 @@ fn extract_compact_summary_text(parsed: &Value) -> Option<String> {
         // 只取非-thought 会让 compact 拿不到摘要(missing summary text),逼 Codex
         // 回退本地 inline compact。content 空时退回 thought:compact 的"思考"本身
         // 就是对历史的浓缩,远优于整个失败。下游 quality 校验(min 800)仍把关。
-        let thought_text = join_parts(true);
-        if !thought_text.trim().is_empty() {
-            return Some(thought_text);
+        //
+        // 但**仅当生成正常收尾**(finishReason == STOP)才退回 thought:若因
+        // MAX_TOKENS / SAFETY 等被截断(chatgpt-codex-connector P2),thought 是
+        // 不完整推理残片而非摘要,接受它会把对话历史替换成残片 —— 比 compact 失败
+        // 更糟。非 STOP → 不 fallback,返回 None 让 compact 优雅失败(Codex 保留
+        // 历史 / 回退本地)。与 gemini_native/response.rs 的「非 STOP = incomplete」
+        // 判定一致。
+        let finished_ok = root
+            .pointer("/candidates/0/finishReason")
+            .and_then(|v| v.as_str())
+            == Some("STOP");
+        if finished_ok {
+            let thought_text = join_parts(true);
+            if !thought_text.trim().is_empty() {
+                return Some(thought_text);
+            }
         }
     }
     // anthropic messages 非流式:content[].{type:"text",text}(V2 路径 anthropic
@@ -1935,18 +1948,19 @@ mod tests {
     fn extract_compact_summary_text_falls_back_to_thought_when_content_empty() {
         // MOC-243:gemini-3-flash-agent(思考档焊死在 id,必然 thinking)可能把整段
         // 摘要写进 thought 通道、content 通道空 → 旧逻辑只取非-thought 会返回 None
-        // (missing summary text),compact 失败。content 空时应退回 thought 文本。
-        let all_thought = json!({"candidates": [{"content": {"parts": [
+        // (missing summary text),compact 失败。content 空 + 正常收尾(STOP)时应
+        // 退回 thought 文本。
+        let all_thought = json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [
             {"text": "整段摘要其实在这里...", "thought": true},
             {"text": "more summary in thought", "thought": true}
         ]}}]});
         assert_eq!(
             extract_compact_summary_text(&all_thought).as_deref(),
             Some("整段摘要其实在这里...more summary in thought"),
-            "content 通道空时应退回 thought 文本,而非返回 None 让 compact 失败"
+            "content 通道空 + STOP 时应退回 thought 文本,而非返回 None 让 compact 失败"
         );
         // cloud_code / antigravity 外裹 {"response": {...}} 变体同样生效
-        let all_thought_wrapped = json!({"response": {"candidates": [{"content": {"parts": [
+        let all_thought_wrapped = json!({"response": {"candidates": [{"finishReason": "STOP", "content": {"parts": [
             {"text": "wrapped thought summary", "thought": true}
         ]}}]}});
         assert_eq!(
@@ -1954,6 +1968,7 @@ mod tests {
             Some("wrapped thought summary")
         );
         // 回归守卫:content 非空时**仍优先 content**,即便 thought 更长也不反取
+        // (content 路径不看 finishReason —— 维持既有行为,本次只 gate thought fallback)
         let content_shorter_than_thought = json!({"candidates": [{"content": {"parts": [
             {"text": "a very long chain of thought that is much longer than the summary", "thought": true},
             {"text": "short summary"}
@@ -1963,22 +1978,42 @@ mod tests {
             Some("short summary"),
             "content 非空就用 content,不能因 thought 更长就反取(避免思维链污染)"
         );
-        // content 纯空白(非空但 trim 后为空)+ 有真实 thought → 退回 thought
+        // content 纯空白(非空但 trim 后为空)+ 有真实 thought + STOP → 退回 thought
         // (锁住 .trim().is_empty() guard:空白不该当作有效摘要返回)
-        let blank_content = json!({"candidates": [{"content": {"parts": [
+        let blank_content = json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [
             {"text": "   "},
             {"text": "real summary lives in thought", "thought": true}
         ]}}]});
         assert_eq!(
             extract_compact_summary_text(&blank_content).as_deref(),
             Some("real summary lives in thought"),
-            "content 纯空白时应退回 thought,而非返回空白摘要"
+            "content 纯空白 + STOP 时应退回 thought,而非返回空白摘要"
         );
+        // [chatgpt-codex-connector P2] content 空但**生成被截断**(非 STOP,如
+        // MAX_TOKENS / SAFETY)→ thought 是不完整残片,**不**退回,返回 None 让
+        // compact 优雅失败,绝不把历史替换成截断的推理残片。
+        for fr in ["MAX_TOKENS", "SAFETY", "RECITATION"] {
+            let truncated = json!({"candidates": [{"finishReason": fr, "content": {"parts": [
+                {"text": "incomplete reasoning trace cut off mid-thought...", "thought": true}
+            ]}}]});
+            assert_eq!(
+                extract_compact_summary_text(&truncated),
+                None,
+                "finishReason={fr}(非 STOP)时 thought 是截断残片,不应作摘要返回"
+            );
+        }
+        // finishReason 缺失(异常)同样不 fallback —— 要求显式 STOP
+        let no_finish = json!({"candidates": [{"content": {"parts": [
+            {"text": "thought without finish reason", "thought": true}
+        ]}}]});
+        assert_eq!(extract_compact_summary_text(&no_finish), None);
         // content 与 thought 都空 → None
         assert_eq!(
-            extract_compact_summary_text(&json!({"candidates": [{"content": {"parts": [
-                {"text": "", "thought": true}
-            ]}}]})),
+            extract_compact_summary_text(
+                &json!({"candidates": [{"finishReason": "STOP", "content": {"parts": [
+                    {"text": "", "thought": true}
+                ]}}]})
+            ),
             None
         );
     }
