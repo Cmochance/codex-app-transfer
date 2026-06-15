@@ -1716,10 +1716,6 @@ fn cache_miss_with_empty_input_returns_previous_response_not_found() {
 
 #[test]
 fn cache_miss_with_nonempty_input_falls_back_to_current_only() {
-    // [#262 followup] 锁 en:本测试断言 wire messages 结构,语言指令注入
-    // (session_cache=Some 时按 current_language 注入)会改其结构 → 与并行 zh 测试 race。
-    let _lang = LANG_TEST_LOCK.lock().unwrap();
-    crate::core::language::set_user_language("en");
     // cache miss 但 input 非空 → 保留旧降级:丢 previous_response_id,只用
     // 当前 input。这条路径不报错(模型可能丢上下文,但至少能继续对话),
     // 跟 PreviousResponseNotFound 路径区分清楚。
@@ -3700,9 +3696,6 @@ fn previous_response_id_without_session_cache_keeps_current_input_only() {
 
 #[test]
 fn previous_response_id_restores_history_before_current_input() {
-    // [#262 followup] 锁 en:断言 wire messages 数量/顺序,语言指令注入会改结构 → 防 race。
-    let _lang = LANG_TEST_LOCK.lock().unwrap();
-    crate::core::language::set_user_language("en");
     let cache = ResponseSessionCache::new(1000, std::time::Duration::from_secs(3600));
     cache.save(
         "resp_prev",
@@ -3970,73 +3963,6 @@ fn first_turn_request_with_apply_patch() -> Value {
     })
 }
 
-// [#262 followup] 语言指令注入 —— 仅主转发(session_cache=Some)+ 非英文用户注入。
-#[test]
-fn language_directive_injected_in_chinese_for_real_forward() {
-    with_user_language("zh-CN", || {
-        let cache = crate::responses::global_response_session_cache();
-        let body = json!({
-            "model": "kimi-for-coding",
-            "input": [{"type": "message", "role": "user",
-                       "content": [{"type": "input_text", "text": "你好"}]}],
-        });
-        let out =
-            super::responses_body_to_chat_body_for_provider_with_session(&body, None, Some(cache))
-                .unwrap();
-        let messages = out.body["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["role"], "system");
-        assert!(
-            messages[0]["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("请始终使用简体中文回复"),
-            "zh + Some(cache) 主转发应在最前注入中文语言指令,实际 messages={messages:?}"
-        );
-    });
-}
-
-#[test]
-fn language_directive_not_injected_in_english() {
-    with_user_language("en", || {
-        let cache = crate::responses::global_response_session_cache();
-        let body = json!({
-            "model": "kimi-for-coding",
-            "input": [{"type": "message", "role": "user",
-                       "content": [{"type": "input_text", "text": "hi"}]}],
-        });
-        let out =
-            super::responses_body_to_chat_body_for_provider_with_session(&body, None, Some(cache))
-                .unwrap();
-        let joined = serde_json::to_string(out.body["messages"].as_array().unwrap()).unwrap();
-        assert!(
-            !joined.contains("请始终使用简体中文回复"),
-            "英文用户不应注入中文指令"
-        );
-        assert!(
-            !joined.contains("respond to the user in English"),
-            "英文是默认输出语言,不注入冗余指令"
-        );
-    });
-}
-
-#[test]
-fn language_directive_skipped_without_session_cache() {
-    with_user_language("zh-CN", || {
-        let body = json!({
-            "model": "kimi-for-coding",
-            "input": [{"type": "message", "role": "user",
-                       "content": [{"type": "input_text", "text": "你好"}]}],
-        });
-        // None cache(纯转换 / gemini chat-shape 归一化子路径)→ 不注入,避免污染纯转换
-        let out = super::responses_body_to_chat_body_for_provider(&body, None).unwrap();
-        let joined = serde_json::to_string(out["messages"].as_array().unwrap()).unwrap();
-        assert!(
-            !joined.contains("请始终使用简体中文回复"),
-            "None cache 不应注入"
-        );
-    });
-}
-
 #[test]
 fn apply_patch_guidance_injected_in_english_by_default() {
     with_user_language("en", || {
@@ -4214,9 +4140,6 @@ fn moc193_dedupe_handles_developer_role_kept_for_openai_official() {
 /// 本轮 Codex 又重发 1 份 → merge 后 3 份 → wire 1 份 / session 3 份。
 #[test]
 fn moc193_wire_deduped_but_session_plan_keeps_full_history() {
-    // [#262 followup] 锁 en:断言 wire messages 数量,语言指令注入会改结构 → 防 race。
-    let _lang = LANG_TEST_LOCK.lock().unwrap();
-    crate::core::language::set_user_language("en");
     let env_content = "<environment_context>BIG ~37KB block</environment_context>";
     let cache = ResponseSessionCache::new(1000, std::time::Duration::from_secs(3600));
     cache.save(

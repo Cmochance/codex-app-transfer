@@ -162,19 +162,6 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // [MOC-193] wire-level 去重必须在 session_messages clone **之后**:cache 保持
     // 全量原貌(session 重建敏感区不动,MOC-142/168/190),只有发上游的 body 瘦身。
     dedupe_repeated_instruction_messages(&mut messages);
-    // [#262 followup] 注入显式语言指令(按 transfer 客户端语言)。**wire-only**(在
-    // session_messages clone 之后):不进 session cache → 不随轮次累积,且每轮(含
-    // compact 替换历史后)都重注 —— 根治长对话 / compact 后第三方模型(尤其
-    // Antigravity gemini-*-agent:~40KB 英文 Codex system prompt + 无语言指示 → 默认
-    // 英文)的语言漂移。仅「按用户语言写 guidance」(#262)不够强,需显式指令压制。
-    // 放最前(system 役,与 apply_patch guidance 同位)兼容所有 chat provider;
-    // gemini_native 把 system 消息归一进 systemInstruction(位置无关)。
-    // **仅 `session_cache.is_some()`(主转发产出)才注入** —— 与上面 breakdown 同
-    // 理:chat / gemini 真转发都传 Some(mapper 透传);gemini chat-shape 归一化子
-    // 路径与无 session 单测走 None,不注入(避免污染纯转换断言 + 重复注入)。
-    if session_cache.is_some() {
-        inject_language_directive_message(&mut messages);
-    }
     result.insert("messages".into(), Value::Array(messages));
 
     // tools(function / custom 直接处理,namespace 递归展平,web_search /
@@ -3020,37 +3007,4 @@ fn web_tools_guidance_message() -> Value {
         "role": "system",
         "content": web_tools_guidance_for_current_language(),
     })
-}
-
-/// [#262 followup] 在 wire messages 最前注入一句显式语言指令,语言由
-/// [`current_language`](crate::core::language::current_language)(transfer 客户端
-/// 语言选择)决定。
-///
-/// **为何需要显式指令**:#262 已让注入的 guidance 文本随用户语言切换,但第三方
-/// agent 模型(实证 Antigravity `gemini-3-flash-agent`:systemInstruction 里 ~40KB
-/// 英文 Codex system prompt、无任何「用用户语言回复」指示)仍默认英文回复,中文
-/// 用户长对话 / compact 后明显漂移成英文。一句显式 system 指令足以压制。
-///
-/// **为何 caller 在 session_messages clone 之后调(wire-only)**:不进 session
-/// cache → 不随轮次累积(否则 N 轮 N 份),且每轮(含 compact 用 summary 替换历史
-/// 之后)都重新注入 → 不会因历史被压缩而丢失。放最前 system 役兼容所有 chat
-/// provider;gemini_native 把 system 消息归一进 systemInstruction(与位置无关)。
-fn inject_language_directive_message(messages: &mut Vec<Value>) {
-    use crate::core::language::{current_language, Language};
-    // 仅对**非英文**(当前仅中文)用户注入显式指令。英文是模型 / 英文 Codex system
-    // prompt 的默认输出语言 —— 给英文用户注入「respond in English」是冗余 no-op,
-    // 且会改变所有英文默认路径的 wire(打挂大量转换断言)。漂移问题只发生在中文等
-    // 非英文用户身上,故只在那时注入即可根治,同时保持英文用户行为零变化。
-    match current_language() {
-        Language::Chinese => {
-            messages.insert(
-                0,
-                json!({
-                    "role": "system",
-                    "content": "请始终使用简体中文回复用户。",
-                }),
-            );
-        }
-        Language::English => {}
-    }
 }
