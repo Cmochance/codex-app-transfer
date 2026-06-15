@@ -911,6 +911,10 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
                 .unwrap_or("")
                 .trim()
                 .to_owned();
+            // [#262 followup] 中文用户下把英文 summary 前缀换成中文,消除 compact 后
+            // 上游 user message 里的英文 framing(语言漂移真因);响应侧仍英文(Codex
+            // startswith 识别)。其它语言 / 无前缀 → 原样。
+            let summary = crate::responses::compact::localize_compaction_summary_prefix(&summary);
             if summary.is_empty() {
                 Vec::new()
             } else {
@@ -2972,10 +2976,29 @@ fn tools_register_apply_patch(body: &Value) -> bool {
     })
 }
 
+/// 中文用户语言引导(MOC-243 followup #262):第三方模型(gemini-3-flash-agent 等)在大段英文
+/// Codex system 模板下倾向英文回复,即便 input 全中文(实测 mochan-translator 续轮多轮全英文)。
+/// 在 system instruction 顶部(apply_patch 指引之前)放一条显式中文指令,引导模型用中文回复用户。
+const CHINESE_LANGUAGE_DIRECTIVE: &str =
+    "**请始终使用简体中文回复用户**(代码、命令、标识符、文件路径等技术内容保持原文,不要翻译)。";
+
+/// apply_patch chat-path 指引 system message。**中文用户**额外在指引最前面 prepend
+/// [`CHINESE_LANGUAGE_DIRECTIVE`] —— 该 message 已位于 system instruction 顶部(Codex 原生
+/// instructions 多为空 sentinel),故 directive 成为模型最先读到的指令,纠正英文漂移。
+/// 拼进**同一条** message(而非独立 message)是为了不改变后续 message 下标,避免破坏读
+/// `messages[1]` 的既有断言;且仅当本 turn 注册 apply_patch 时注入(Codex Desktop 必注册),
+/// 与指引同生命周期,后续 turn 经 session_cache merge 已含。
 fn apply_patch_chat_guidance_message() -> Value {
+    use crate::core::language::{current_language, Language};
+    let guidance = apply_patch_chat_path_guidance_for_current_language();
+    let content = if current_language() == Language::Chinese {
+        format!("{CHINESE_LANGUAGE_DIRECTIVE}\n\n{guidance}")
+    } else {
+        guidance.to_owned()
+    };
     json!({
         "role": "system",
-        "content": apply_patch_chat_path_guidance_for_current_language(),
+        "content": content,
     })
 }
 

@@ -136,6 +136,34 @@ fn compact_summarization_prompt_for_current_language() -> &'static str {
 /// 识别这段文本是 compaction summary 并接管历史回放。**前缀必须保持字面一致**。
 pub(crate) const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
 
+/// [#262 followup] `COMPACT_SUMMARY_PREFIX` 的中文等价。**仅用于请求侧**:续轮把
+/// Codex 回发的 compaction item 渲染成**上游 user message** 时(request.rs /
+/// gemini_native),中文用户下用它替换英文前缀。
+///
+/// **为什么**:compact 后续轮 input 里这段实质性英文前缀(+ ~40KB 英文 Codex
+/// system prompt)会把第三方 agent 模型(实证 Antigravity gemini-*-agent)带成
+/// 英文回复(真机 forward-trace 实证的语言漂移真因)。换成中文前缀消除该英文
+/// framing,且保留「这是上一模型的总结、基于它继续」的语义。
+///
+/// **响应侧不动**:发给 Codex 的 compact 响应仍用英文 [`COMPACT_SUMMARY_PREFIX`]
+/// —— Codex CLI `is_summary_message`(`startswith(PREFIX)`)靠它识别压缩摘要;
+/// 替换发生在 Codex 识别 + 存档**之后**的请求侧渲染,Codex 看不到、不受影响。
+pub(crate) const COMPACT_SUMMARY_PREFIX_ZH: &str = "另一个语言模型已开始解决此问题,并产出了其思考过程的总结。你还可以访问该模型所用工具的状态。请利用这些信息在已完成的工作上继续推进,避免重复劳动。以下是该模型产出的总结,请用其中的信息辅助你自己的分析:";
+
+/// 渲染续轮 compaction item 的 `encrypted_content`(明文 = `COMPACT_SUMMARY_PREFIX`
+/// + 摘要正文)成上游 user message 时调用:中文用户下,若文本以英文
+/// [`COMPACT_SUMMARY_PREFIX`] 开头,把前缀替换成 [`COMPACT_SUMMARY_PREFIX_ZH`]
+/// (保留正文),消除 compact 后语言漂移;其它语言 / 不含该前缀 → 原样返回。
+pub(crate) fn localize_compaction_summary_prefix(text: &str) -> String {
+    use crate::core::language::{current_language, Language};
+    if current_language() == Language::Chinese {
+        if let Some(body) = text.strip_prefix(COMPACT_SUMMARY_PREFIX) {
+            return format!("{COMPACT_SUMMARY_PREFIX_ZH}{body}");
+        }
+    }
+    text.to_owned()
+}
+
 /// `COMPACT_USER_MESSAGE_MAX_TOKENS` from `codex-rs/core/src/compact.rs:48`.
 const COMPACT_MAX_OUTPUT_TOKENS: u32 = 20_000;
 
@@ -268,6 +296,17 @@ pub(crate) fn build_compact_chat_request(
         .map_err(|e| AdapterError::BadRequest(format!("compact body 不是合法 JSON: {e}")))?;
     let model = parsed.get("model").cloned().unwrap_or(Value::Null);
     let raw_input = parsed.get("input").cloned();
+    // [MOC-243] V2 compact 历史重建准备:Codex 发 compaction_trigger +
+    // previous_response_id 而**不带** inline 历史时(strip_compaction_trigger 后
+    // input 为空),指望 proxy 用 prev_id 从 session cache 重建对话历史。否则模型
+    // 「无米下炊」→ 空 content 摘要(实证 22:24:05:input 仅 trigger → 模型
+    // "fresh start / blank slate" → content 空 → compact 失败 / 漂移)。
+    let prev_id = parsed
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_owned();
 
     // A2:把 SUMMARIZATION_PROMPT 作为最后一条 user message append 到 input。
     // 必须**先 normalize input 为 array**才能可靠 append —— `extract_input_items`
@@ -322,6 +361,12 @@ pub(crate) fn build_compact_chat_request(
     // 一并覆盖:retain 删全部 type=reasoning,不依赖数量。V2 compact
     // (MOC-198,strip_compaction_trigger 后复用本函数)亦自动覆盖。
     input_array.retain(|item| item.get("type").and_then(|t| t.as_str()) != Some("reasoning"));
+    // [MOC-243] 仅在「prev_id 非空 且 input(剥 trigger/reasoning 后、加 summary
+    // prompt 前)为空」时从 session cache 重建历史。V1 / V2-inline(input 已含完整
+    // 历史)**不**重建 —— merge_messages_with_previous_response 命中 cache 即无条件
+    // 把 cache 历史拼到 current 前(core/input.rs:93),若 current 已含 inline 历史
+    // 会叠成双份。空 input 才是「Codex 指望 proxy 重建」的 V2 prev_id-依赖型。
+    let reconstruct_history = !prev_id.is_empty() && input_array.is_empty();
     input_array.push(json!({
         "type": "message",
         "role": "user",
@@ -353,10 +398,45 @@ pub(crate) fn build_compact_chat_request(
         synthetic_responses_body["tools"] = tools.clone();
     }
 
+    // [MOC-243] 重建场景:透传 previous_response_id,让下方 with_session 转换经
+    // merge_messages_with_previous_response 用它从 session cache 取回历史。
+    if reconstruct_history {
+        synthetic_responses_body["previous_response_id"] = Value::String(prev_id.clone());
+    }
+
     // MOC-190: compact 转换不保留最新 tool 全文(压缩历史)。set→convert→reset(即使 Err 也 reset)。
     super::request::set_compact_no_keep_recent(true);
-    let conversion =
-        responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider));
+    // [MOC-243] reconstruct_history 时走 with_session 变体 + global session cache,
+    // 让 V2 compact(仅 trigger + prev_id)能取回完整历史再摘要;否则(V1 / inline)
+    // 沿用无 session 变体。
+    //
+    // cache miss(重启 / TTL / eviction)→ `history_lost=true`:此时 input 只剩 summary
+    // prompt、无任何对话历史。**不能**就这么发出去 —— 模型可能从 prompt 凭空幻觉出"看似
+    // 合理实则无用"的摘要,骗过 `validate_compact_summary_quality`,Codex 据此用空洞摘要
+    // 替换掉真实 transcript(#494 bot review P2)。故 `history_lost` 时 **fail-fast** 返回
+    // Internal 错误(对齐质量校验失败路径)→ Codex 回退改发 inline 历史重试自愈,而不是发
+    // 一个没有历史的摘要请求。
+    // synthetic body 无 prompt_cache_key → 不触发 context breakdown 落盘(无污染)。
+    let conversion = if reconstruct_history {
+        super::request::responses_body_to_chat_body_for_provider_with_session(
+            &synthetic_responses_body,
+            Some(provider),
+            Some(super::global_response_session_cache()),
+        )
+        .and_then(|c| {
+            if c.history_lost {
+                Err(AdapterError::Internal(
+                    "compact V2 history reconstruction failed (session cache miss); \
+                     returning error so Codex retries with inline history"
+                        .into(),
+                ))
+            } else {
+                Ok(c.body)
+            }
+        })
+    } else {
+        responses_body_to_chat_body_for_provider(&synthetic_responses_body, Some(provider))
+    };
     super::request::set_compact_no_keep_recent(false);
     let chat_body = conversion?;
     let chat_body = enforce_compact_chat_message_budget(chat_body);
@@ -1663,6 +1743,104 @@ mod tests {
                 "null/empty input 时 prompt 也必须注入,实际 body={body:?},last={last:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_compact_chat_request_v2_reconstructs_history_from_session_cache() {
+        // MOC-243: V2 compact(strip_compaction_trigger 后 input 空 + previous_response_id)
+        // 应从 session cache 用 prev_id 重建历史,而不是把空历史发给上游(实证:模型
+        // 收到零历史 → "fresh start / blank slate" → 空 content 摘要)。
+        let p = make_provider();
+        let cache = crate::responses::global_response_session_cache();
+        let prev_id = "moc243_recon_test_prev_id";
+        cache.save(
+            prev_id,
+            vec![
+                json!({"role": "user", "content": "MOC243_HISTORY_USER_审查项目"}),
+                json!({"role": "assistant", "content": "MOC243_HISTORY_ASSISTANT_已完成审查"}),
+            ],
+        );
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [],
+            "previous_response_id": prev_id,
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let parsed: Value = serde_json::from_slice(&chat).unwrap();
+        let messages = parsed["messages"].as_array().unwrap();
+        let joined = serde_json::to_string(messages).unwrap();
+        assert!(
+            joined.contains("MOC243_HISTORY_USER_审查项目"),
+            "V2 compact 应从 session cache 重建出历史 user 消息,实际 messages={messages:?}"
+        );
+        assert!(
+            joined.contains("MOC243_HISTORY_ASSISTANT_已完成审查"),
+            "V2 compact 应从 session cache 重建出历史 assistant 消息"
+        );
+        // summary prompt 作为最后一条 user(历史在它之前)
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert!(last["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CONTEXT CHECKPOINT"));
+    }
+
+    #[test]
+    fn build_compact_chat_request_v2_errors_on_session_cache_miss() {
+        // MOC-243 / #494 bot review P2: V2 compact 重建历史时若 session cache miss
+        // (重启 / TTL / eviction)→ history_lost,input 只剩 summary prompt、无历史。
+        // 必须 fail-fast 报错(让 Codex 回退改发 inline 历史重试),不能发空历史请求 ——
+        // 否则模型可能从 prompt 凭空幻觉出"看似合理"的摘要骗过质量校验、替换掉真实 transcript。
+        let p = make_provider();
+        // 故意用一个从未 cache.save 过的 prev_id → 重建时必 cache miss
+        let prev_id = "moc243_cache_miss_never_saved_prev_id";
+        let body = json!({
+            "model": "kimi-for-coding",
+            "input": [],
+            "previous_response_id": prev_id,
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let err = build_compact_chat_request(&bytes, &p).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("history reconstruction failed") || msg.contains("cache miss"),
+            "V2 compact cache miss 应 fail-fast 报错,实际: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_compact_chat_request_does_not_reconstruct_when_input_has_inline_history() {
+        // MOC-243 防双份:input 已含 inline 历史(V1 / V2-inline)时,即便带 prev_id
+        // 也**不**从 cache 重建 —— merge_messages_with_previous_response 命中 cache
+        // 会无条件把 cache 历史拼到 current 前,与 inline 叠成双份。
+        let p = make_provider();
+        let cache = crate::responses::global_response_session_cache();
+        let prev_id = "moc243_inline_test_prev_id";
+        cache.save(
+            prev_id,
+            vec![json!({"role": "user", "content": "MOC243_CACHED_SHOULD_NOT_APPEAR"})],
+        );
+        let body = json!({
+            "model": "kimi-for-coding",
+            "previous_response_id": prev_id,
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": "MOC243_INLINE_HISTORY"}]}],
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let chat = build_compact_chat_request(&bytes, &p).unwrap();
+        let joined =
+            serde_json::to_string(&serde_json::from_slice::<Value>(&chat).unwrap()["messages"])
+                .unwrap();
+        assert!(
+            joined.contains("MOC243_INLINE_HISTORY"),
+            "应保留 inline 历史"
+        );
+        assert!(
+            !joined.contains("MOC243_CACHED_SHOULD_NOT_APPEAR"),
+            "input 非空时不应从 cache 重建(防双份历史)"
+        );
     }
 
     // ── extract_summary_section ──────────────────────────────────────

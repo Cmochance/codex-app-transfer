@@ -547,6 +547,10 @@ fn responses_input_to_chat_messages(
                     .unwrap_or("")
                     .trim()
                     .to_owned();
+                // [#262 followup] 中文用户下把英文 summary 前缀换成中文,消除 compact
+                // 后上游(gemini contents)里的英文 framing(语言漂移真因)。
+                let summary =
+                    crate::responses::compact::localize_compaction_summary_prefix(&summary);
                 if !summary.is_empty() {
                     // flush pending assistant 再灌 user summary,保证顺序
                     flush_assistant(
