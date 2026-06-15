@@ -20,9 +20,9 @@
 //! `{none, minimal, low, medium, high, xhigh, max}` 内(实测 Codex.app v0.140 UI 校验器只认这些)。
 //! 返回 `None` = 无特殊档位,catalog 用 Codex 默认 4 档、wire 不动。
 //!
-//! **范围(MOC-241 本轮)**:chat-completions 思考系(GLM / DeepSeek / Kimi / 阿里云百炼 Qwen /
-//! 小米 MiMo / MiniMax)。Gemini(AI Studio / CLI / Antigravity,gemini_native 协议、thinkingLevel/
-//! Budget)与 Grok、moonshot-v1-* 留默认,另行处理。
+//! **范围(MOC-241)**:chat-completions 思考系(GLM / DeepSeek / Kimi / 阿里云百炼 Qwen /
+//! 小米 MiMo / MiniMax)+ **Gemini 全系**(AI Studio / CLI / Antigravity:思考档不可经 Codex
+//! picker 可靠控制 → 空档位隐藏 picker)。Grok、moonshot-v1-* 仍留默认。
 
 use crate::compact_thinking_policy::DisableThinkingWire;
 use crate::reasoning_effort_policy::ReasoningEffortWire;
@@ -106,7 +106,9 @@ static BINARY_ENABLE_THINKING: ReasoningTierSpec = ReasoningTierSpec {
     on_tier_wire: None,
 };
 
-/// **强制思考、不可关**(如 MiniMax-M2.x):空档位 → 隐藏 picker;无 disable wire。
+/// **空档位 → 隐藏 picker**:思考档不可(经 Codex picker)控制的模型 —— MiniMax-M2.x(强制思考、
+/// 上游不支持 disable)与 Gemini 全系(Antigravity 把档位焊在 model id 里、gemini_native 的 `xhigh`
+/// 映射不到任何 thinkingLevel)。无 disable wire(不主动注入 disable)。
 static FORCED_HIDDEN: ReasoningTierSpec = ReasoningTierSpec {
     levels: &[],
     default_level: None,
@@ -124,6 +126,13 @@ pub fn reasoning_tiers_for_model(model: &str) -> Option<&'static ReasoningTierSp
     }
     // MiniMax M2.x:thinking 强制开、上游不支持 disable(platform.minimaxi.com)→ 隐藏档位
     if m.starts_with("minimax-m2") {
+        return Some(&FORCED_HIDDEN);
+    }
+    // Gemini 全系(AI Studio / CLI / Antigravity):思考档不可经 Codex picker 可靠控制 —— Antigravity
+    // 把档位焊在 model id 里(换档=换模型条目、且实测拒 thinkingLevel),gemini_native 的 `xhigh`
+    // 映射不到任何 thinkingLevel(Gemini 3 仅 off/low/medium/high)。用户指示:Gemini 思考不可改 →
+    // 空档位隐藏整个 picker。
+    if m.starts_with("gemini") {
         return Some(&FORCED_HIDDEN);
     }
 
@@ -278,11 +287,33 @@ mod tests {
             "glm-4.1v-thinking-flashx",
             "gpt-5.5",
             "moonshot-v1-32k",
-            "gemini-3-flash-agent",
             "grok-420-computer-use-sa",
             "",
         ] {
             assert!(reasoning_tiers_for_model(m).is_none(), "{m} 不应有 spec");
+        }
+    }
+
+    #[test]
+    fn gemini_all_forced_hidden() {
+        // Gemini 全系思考档不可经 picker 控制 → 空档位隐藏 picker(AI Studio + Antigravity 变体)。
+        for m in [
+            "gemini-3-pro",
+            "gemini-3-flash",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-1.5-pro",
+            "gemini-3.5-flash-low",
+            "gemini-3-flash-agent",
+            "gemini-pro-agent",
+            "gemini-3.1-pro-high",
+            "  Gemini-3-Pro  ",
+        ] {
+            let s = reasoning_tiers_for_model(m).unwrap_or_else(|| panic!("{m} 应命中隐藏档"));
+            assert!(s.levels.is_empty(), "{m} 应空档位(隐藏 picker)");
+            assert_eq!(s.default_level, None);
+            assert_eq!(s.disable_wire, None);
+            assert_eq!(s.on_tier_wire, None);
         }
     }
 
