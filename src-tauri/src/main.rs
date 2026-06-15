@@ -14,6 +14,7 @@ mod glm_quota;
 mod mcp_webfetch_server;
 mod mimo_quota;
 mod mimo_session;
+mod moonshot_quota;
 mod provider_quota;
 mod proxy_runner;
 #[cfg(target_os = "macos")]
