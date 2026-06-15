@@ -305,29 +305,6 @@
     setOauthRowState(canonical);
   }
 
-  // 控制 web_search 配置开关 row 的显示 + 初始 checkbox state + provider-specific
-  // hint 文案。preset.supportsWebSearch === true 才显示(Kimi / Kimi Code / MiMo
-  // PAYG / MiMo Token Plan 四家;Gemini OpenAI compat chat 不支持 grounding,
-  // 已实测 5 种 variant 全 400,故不开)。
-  // hint 文案按 presetId 选 i18n key,fallback 到 .default;切换 preset 时
-  // 同步更新 dataset.i18n + textContent,语言切换 + preset 切换都不会留旧文案。
-  function setWebSearchRow(supports, enabled, presetId) {
-    const row = $("#providerWebSearchRow");
-    const cb = $("#providerWebSearchEnabled");
-    const hint = $("#providerWebSearchHint");
-    if (row) row.hidden = !supports;
-    if (cb) cb.checked = !!enabled;
-    if (hint) {
-      const specificKey = presetId
-        ? `providersAdd.webSearchEnabledHint.${presetId}`
-        : null;
-      const fallbackKey = "providersAdd.webSearchEnabledHint.default";
-      const useKey = specificKey && t(specificKey) !== specificKey ? specificKey : fallbackKey;
-      hint.dataset.i18n = useKey;
-      hint.textContent = t(useKey);
-    }
-  }
-
   /// [MOC-211] 该 provider 是否 MiMo Token Plan(套餐用量需小米账号 session)。
   /// 按 baseUrl 判:host 含 xiaomimimo.com 且路径含 token-plan(对齐 token-plan-{cn,sgp,ams})。
   function isMimoTokenPlan(baseUrl) {
@@ -535,14 +512,6 @@
     if (Object.keys(responsesBlock).length) result.responses = responsesBlock;
     const chatBlock = normalizeChatBlock(options.chat);
     if (Object.keys(chatBlock).length) result.chat = chatBlock;
-    // **顶级 boolean / 标量字段**:web_search_enabled 由 backend
-    // `convert_web_search_tool` 读 `provider.request_options.web_search_enabled`
-    // 决定是否启用 web 搜索(MiMo / Kimi / Gemini 等支持 web_search 的 provider)。
-    // 之前版本 normalize 不保留此字段 → frontend 编辑保存即剥光,用户必须
-    // 手改 config.json,UX 痛点。本字段必须保留(boolean),否则功能失效。
-    if (typeof options.web_search_enabled === "boolean") {
-      result.web_search_enabled = options.web_search_enabled;
-    }
     return result;
   }
 
@@ -1128,17 +1097,6 @@
   function providerPayloadFromForm(includeModels = true) {
     const apiKey = $("#providerApiKey").value.trim();
     const mappings = includeModels ? collectProviderMappings() : null;
-    // Web Search 开关:仅当 row 显示(preset.supportsWebSearch === true)时,从
-    // checkbox 收集 web_search_enabled 写入 formRequestOptions;否则保留 form
-    // 状态(preset 不支持时 normalize 阶段会自动剥)。
-    const webSearchRow = $("#providerWebSearchRow");
-    const webSearchToggle = $("#providerWebSearchEnabled");
-    if (webSearchRow && webSearchToggle && !webSearchRow.hidden) {
-      formRequestOptions = {
-        ...formRequestOptions,
-        web_search_enabled: webSearchToggle.checked,
-      };
-    }
     const payload = {
       name: $("#providerName").value.trim(),
       baseUrl: $("#providerBaseUrl").value.trim(),
@@ -2281,7 +2239,6 @@
     setOauthRowState("openai_chat"); // P2.2 reset OAuth row 隐藏
     setGrokWebRowState("openai_chat"); // R1 PR-7 reset grok_web row 隐藏
     fillGrokWebFormFromProvider(null);
-    setWebSearchRow(false, false, null);
     setMimoLoginRow(false, false, null); // 新建态无 provider.id,隐藏登录 row
     setProviderMappings(emptyMappings());
     setReviewModelSlotField(""); // 新建/重置 → 审查模型回到「跟随主模型」
@@ -2316,15 +2273,6 @@
     setGrokWebRowState(preset.apiFormat); // R1 PR-7 grok_web UI 切换
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
-    // Web Search 配置开关:preset 标支持 + preset.requestOptions.web_search_enabled
-    // 决定初始 checkbox state(kimi / kimi-code 默认 true,xiaomi-mimo-* 默认 false,
-    // 跟 backend `provider_web_search_enabled` 读取契约一致);hint 文案按
-    // preset.id 选 provider-specific 段落
-    setWebSearchRow(
-      !!preset.supportsWebSearch,
-      !!formRequestOptions.web_search_enabled,
-      preset.id
-    );
     setMimoLoginRow(false, false, null); // 选 preset(新建态)无 provider.id,隐藏登录 row
     providerAvailableModels = [];
     setProviderMappings(preset.models || emptyMappings());
@@ -2378,15 +2326,6 @@
     setOauthRowState(effectiveFormat); // OAuth UI 切换(P2.2)
     setGrokWebRowState(effectiveFormat); // R1 PR-7 grok_web UI 切换
     fillGrokWebFormFromProvider(provider);
-    // 编辑场景:支持判定走 matchedPreset.supportsWebSearch(自定义 provider 不命中
-    // builtin → matchedPreset undefined → 不显示开关);初始 checkbox state 读
-    // provider 实际保存的 requestOptions.web_search_enabled;hint 文案按
-    // matchedPreset.id(自定义 provider 时 fallback 到 .default 通用文案)
-    setWebSearchRow(
-      !!(matchedPreset && matchedPreset.supportsWebSearch),
-      !!formRequestOptions.web_search_enabled,
-      matchedPreset?.id || null
-    );
     // [MOC-211] 编辑已保存的 MiMo Token Plan provider → 显示「登录小米账号」row(有 provider.id 可落 cookie)
     setMimoLoginRow(isMimoTokenPlan(provider.baseUrl), !!provider.hasMimoCookie, provider.id);
     providerAvailableModels = [];

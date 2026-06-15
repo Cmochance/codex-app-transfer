@@ -133,14 +133,18 @@ mod adapter_tests {
             plan.upstream_path,
             "/v1alpha/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse"
         );
-        // body 必须是 Gemini wire(`contents` / `systemInstruction` / `tools[].googleSearch`)
+        // body 必须是 Gemini wire(`contents` / `systemInstruction`)
         let parsed: Value = serde_json::from_slice(&plan.body).unwrap();
         assert!(parsed.get("contents").is_some());
         assert!(parsed.get("systemInstruction").is_some());
-        let tools = parsed["tools"].as_array().unwrap();
+        // [MOC-208] web_search → googleSearch 无条件 drop:出站 body 不应含 googleSearch
+        let has_google_search = parsed["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|t| t.get("googleSearch").is_some()));
         assert!(
-            tools.iter().any(|t| t.get("googleSearch").is_some()),
-            "出站 body 必须含 googleSearch tool;实际:{tools:?}"
+            !has_google_search,
+            "googleSearch 必须被 drop;实际:{:?}",
+            parsed.get("tools")
         );
         // original_responses_request 保留供下轮 SSE 状态机用
         assert!(plan.original_responses_request.is_some());

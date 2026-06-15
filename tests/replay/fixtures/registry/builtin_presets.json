@@ -353,7 +353,7 @@
       },
       {
         "type": "info",
-        "text": "**Google Search grounding 已 work**:打开 web_search 工具后(Codex.app 默认开),代理把入站 OpenAI 标准 `web_search` 工具转 Gemini `tools=[{googleSearch:{}}]`。响应侧 grounding citations(`groundingMetadata.groundingChunks/groundingSupports`)直接 emit 成 Responses `response.output_text.annotation.added` 事件,Codex.app UI 显示来源链接。"
+        "text": "**联网搜索走自研工具,不再用 Gemini 原生 Google Search**(MOC-208):代理统一 drop 入站 `web_search`(不再转 `googleSearch` grounding —— built-in 与 functionDeclarations 共存会触发 Gemini 400,且原生 grounding 各家形态不一)。开启「内置联网抓取工具」后,模型用自研 `web_search` / `web_fetch`(Chrome-based,全文返回)联网,行为与其它 provider 一致。"
       },
       {
         "type": "warning",
