@@ -263,6 +263,15 @@
                 </div>
                 <div class="form-mapping-grid" id="providerMappingStack"></div>
                 <div class="preset-options" id="providerPresetOptions" hidden></div>
+                <div class="preset-options" id="providerGemini1mRow" hidden>
+                  <label class="preset-option-item">
+                    <input class="form-check-input" type="checkbox" id="providerGemini1m">
+                    <span>
+                      <strong data-i18n="providersAdd.gemini1mLabel">启用 Gemini 1M 上下文</strong>
+                      <small data-i18n="providersAdd.gemini1mHint">关闭时 Gemini 上下文限制在约 600K（更早触发自动压缩），提升长上下文下的指令遵循;开启使用完整 1M。默认关闭。</small>
+                    </span>
+                  </label>
+                </div>
                 <p class="inline-status" id="providerModelFetchResult"></p>
                 <div class="apply-explain">
                   <i class="bi bi-info-circle"></i>
