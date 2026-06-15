@@ -65,6 +65,12 @@ pub struct CatalogModel {
     /// 复用主模型(实测默认行为)。值取自该 provider 已配置(映射非空)的槽位,复用其
     /// 现有 proxy 映射,不引入重复映射 / 降级。
     pub auto_review_model_override: Option<String>,
+    /// [MOC-241] 该 entry 映射的上游模型是否为「二元思考」模型(只有思考开/关、无
+    /// low/medium/high 深度档,如 GLM 全系)。`true` 时 [`model_to_json`] 把 reasoning
+    /// 档位收敛成 Codex 原生 `none`(不思考)+ `max`(最高),替代默认 4 档,对齐这类
+    /// 上游官方应用的两档 UX;`false`(默认)= 用 Codex 模板自带档位。详见
+    /// [`is_binary_thinking_model`]。
+    pub binary_thinking: bool,
 }
 
 pub fn upsert_catalog_models(
@@ -301,6 +307,9 @@ fn catalog_model(
         context_window,
         effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         auto_review_model_override,
+        // [MOC-241] 按上游真实 model id(target,= 该 slot 映射的模型)判定二元思考,
+        // 与 documented_context_window 同款 model-driven 口径,逐 slot 精确。
+        binary_thinking: is_binary_thinking_model(target),
     }
 }
 
@@ -346,6 +355,14 @@ fn model_to_json(model: &CatalogModel) -> Value {
     // catalog slug 跑工具审查(实测脱钩主模型);None 不写 = 复用主模型(默认行为)。
     if let Some(ref slug) = model.auto_review_model_override {
         entry["auto_review_model_override"] = Value::String(slug.clone());
+    }
+    // [MOC-241] 二元思考模型(GLM 全系):覆盖模板默认的多档 reasoning,收敛成 Codex
+    // 原生 `none`(不思考)+ `max`(最高)两档,对齐这类上游官方应用的两档 UX。
+    // 主标签由 Codex 自身按 effort 本地化渲染(中文 UI ≈「无思考 / 最大思考」),不另做
+    // CDP/asar 注入;effort 取自 Codex 闭合枚举 {none..max},合法。详见 [`is_binary_thinking_model`]。
+    if model.binary_thinking {
+        entry["default_reasoning_level"] = Value::String("max".into());
+        entry["supported_reasoning_levels"] = glm_two_tier_reasoning_levels();
     }
     entry
 }
@@ -552,6 +569,37 @@ fn gpt52_reasoning_levels() -> Value {
     ])
 }
 
+/// [MOC-241] 该上游模型是否为「二元思考」模型 —— 思考只有开/关、没有 low/medium/high
+/// 深度档。目前覆盖智谱 GLM 全系:GLM 思考靠顶级 `thinking:{type:enabled|disabled}`
+/// 二元开关(见 `registry::compact_thinking_policy`),官方应用也只给「无思考 / 最大思考」
+/// 两档。命中则 catalog 把 reasoning 收敛成 `none`+`max`(见 [`glm_two_tier_reasoning_levels`])。
+///
+/// 故意覆盖 GLM 的**两类思考**(`compact_thinking_policy` 区分):强制思考档(glm-5.1/5/4.7…)
+/// 与自适应档(glm-4.6/4.5)。两类都接受 `thinking.type=disabled` 且默认开,故 `none`+`max`
+/// 对二者都是忠实的二元表面,不是漏判。
+///
+/// **按 model id 判定**(与 [`documented_context_window`] 同款 model-driven 口径,逐 slot
+/// 精确;比 provider 级更准 —— 同一 provider 不同 slot 可映射不同模型族)。GLM 模型 id 形如
+/// `glm-5.1` / `glm-4.7` / `glm-5-turbo`,统一 `glm-` 前缀(外加裸 `glm`)。
+/// 已对 trim + lowercase。
+fn is_binary_thinking_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m == "glm" || m.starts_with("glm-")
+}
+
+/// [MOC-241] 二元思考模型的 reasoning 档位:Codex 原生 `none`(不思考)+ `max`(最高)。
+///
+/// `effort` 取值必须落在 Codex 闭合枚举 `{none, minimal, low, medium, high, xhigh, max}`
+/// 内(实测 Codex.app UI 校验器只认这些,未知值不渲染);`none`/`max` 正好对应两档语义。
+/// 主标签由 Codex 按 effort 自身本地化渲染(中文 UI ≈「无思考 / 最大思考」),故意**不**
+/// 注入自定义标签;`description` 仅作副标题说明。
+fn glm_two_tier_reasoning_levels() -> Value {
+    json!([
+        {"effort": "none", "description": "No thinking"},
+        {"effort": "max", "description": "Maximum thinking effort"}
+    ])
+}
+
 fn gpt54_upgrade() -> Value {
     json!({
         "model": "gpt-5.4",
@@ -623,6 +671,7 @@ mod tests {
             context_window: 258_400,
             effective_context_window_percent: 95,
             auto_review_model_override: None,
+            binary_thinking: false,
         };
         assert_eq!(
             model_to_json(&non_builtin)["base_instructions"],
@@ -648,6 +697,7 @@ mod tests {
             context_window: 258_400,
             effective_context_window_percent: 95,
             auto_review_model_override: None,
+            binary_thinking: false,
         };
         let entry = model_to_json(&non_builtin);
 
@@ -1163,5 +1213,81 @@ mod tests {
             .any(|m| m["slug"] == "gpt-5.5"));
         let _typed: codex_app_transfer_registry::Config =
             serde_json::from_value(v).expect("top-level models must not break registry config");
+    }
+
+    // ── [MOC-241] GLM 等二元思考模型:reasoning 档位收敛为 none + max ──
+
+    #[test]
+    fn glm_model_catalog_uses_none_max_two_tier() {
+        // GLM provider:catalog entry 的 reasoning 收敛成 Codex 原生 none + max,
+        // default = max(GLM 默认思考开)。标签交给 Codex 本地化,这里只验 wire 值。
+        let models = catalog_models_for_provider("智谱 GLM", "glm-5.1", false, None, None);
+        let entry = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        assert_eq!(entry["default_reasoning_level"], "max");
+        let efforts: Vec<&str> = entry["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(efforts, vec!["none", "max"], "GLM 应只显示 none + max 两档");
+    }
+
+    #[test]
+    fn glm_reasoning_is_per_slot_by_model_id() {
+        // 按 model id 逐 slot 判定:同 provider 内 GLM slot 收敛两档,非 GLM slot 保留多档。
+        let mappings = json!({
+            "default": "glm-5.1",
+            "gpt_5_5": "glm-4.7",
+            "gpt_5_4": "deepseek-v4-pro"
+        });
+        let models = catalog_models_for_provider("Mixed", "glm-5.1", false, Some(&mappings), None);
+        let glm = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        let non_glm = model_to_json(models.iter().find(|m| m.slug == "gpt-5.4").unwrap());
+        assert_eq!(glm["default_reasoning_level"], "max");
+        assert_eq!(
+            glm["supported_reasoning_levels"].as_array().unwrap().len(),
+            2
+        );
+        // deepseek slot 保留 Codex 模板多档(>2),且 default 不被改成 max
+        assert!(
+            non_glm["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len()
+                > 2
+        );
+        assert_ne!(non_glm["default_reasoning_level"], "max");
+    }
+
+    #[test]
+    fn non_glm_model_keeps_codex_multitier_reasoning() {
+        // 非二元思考模型(DeepSeek)保留 Codex 4 档,不被覆盖。
+        let models = catalog_models_for_provider("DeepSeek", "deepseek-v4-pro", true, None, None);
+        let entry = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        let efforts: Vec<&str> = entry["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh"]);
+    }
+
+    #[test]
+    fn is_binary_thinking_model_classifies_glm_family() {
+        for m in ["glm-5.1", "GLM-4.7", "glm-5-turbo", "glm", " glm-5 "] {
+            assert!(is_binary_thinking_model(m), "{m} 应判为二元思考");
+        }
+        for m in [
+            "gpt-5.5",
+            "deepseek-v4-pro",
+            "kimi-k2.6",
+            "mimo-v2.5",
+            "qwen3.6-plus",
+            "",
+        ] {
+            assert!(!is_binary_thinking_model(m), "{m} 不应判为二元思考");
+        }
     }
 }
