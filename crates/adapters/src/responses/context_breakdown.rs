@@ -12,8 +12,13 @@
 //! 圆环是模型侧 usage、本模块是 proxy 侧发送内容的逐段归因,测量点不同 —— 面板用本模块
 //! 自洽的总数。
 //!
-//! **边界**:仅 adapter 转换路径(openai_chat/gemini/anthropic 等第三方)proxy 持有
-//! 完整拼接上下文、可精确分类;官方 ChatGPT 走 passthrough 不解析 body,算不了。
+//! **边界**:
+//! - chat 转换路径(openai_chat/gemini/anthropic 等)proxy 持有完整拼接 chat 上下文,
+//!   用本模块 [`compute_context_breakdown`](chat 形)分类。
+//! - [MOC-234] responses 1:1 passthrough 路径用 [`compute_context_breakdown_responses`]
+//!   (responses 原生形,不经 chat 转换),全历史由独立的只读会话观测镜像
+//!   ([`crate::responses::passthrough_observe`])沿 `previous_response_id` 链重建。
+//! - 官方 ChatGPT relay backend 透传不解析 body,仍算不了。
 
 use std::fs;
 use std::path::PathBuf;
@@ -203,6 +208,12 @@ pub fn compute_context_breakdown(messages: &[Value], tools: &[Value]) -> Context
         acc.tools.add(count_value(tool));
     }
 
+    finalize_acc(acc)
+}
+
+/// 把累加器收成最终明细(各分类降序、过滤空类、汇总总数)。chat 与 responses 两条
+/// 计算路径共用,保证两者口径(分类 key / 排序 / 空类过滤)完全一致。
+fn finalize_acc(acc: Acc) -> ContextBreakdown {
     // 注:seed 数组顺序是 tokens 相等时排序的 tiebreak,保持稳定。
     let mut categories: Vec<BreakdownCategory> = [
         (keys::SYSTEM_PROMPT, acc.system_prompt),
@@ -228,6 +239,84 @@ pub fn compute_context_breakdown(messages: &[Value], tools: &[Value]) -> Context
         total_tokens,
         categories,
     }
+}
+
+/// [MOC-234] **responses 原生**上下文明细计算(1:1 passthrough 路径专用)。
+///
+/// 与 [`compute_context_breakdown`](chat 形)同口径(同 o200k tokenizer、同分类 key、同
+/// finalize),但直接吃 **Responses 形 item**,**不经 `responses_body_to_chat_body_*` 转换**
+/// —— 那条路径会引入 namespace 展平 / tool_call_cache / artifact_store / helper-prompt 注入等
+/// 本项目资产,违反 MOC-234「responses 路径不接管」约束。本函数纯只读测量,绝不改动任何转发字节。
+///
+/// 入参:
+/// - `instructions`:Responses 请求顶层 `instructions`(Codex 的 base/system 指令),
+///   按内容标签归 `system_prompt` / `developer`。
+/// - `items`:已由观测累积器拼好的「全历史 + 本轮」Responses input/output item 列表
+///   (`message` / `function_call*` / `custom_tool_call*` / `local_shell_call*` / `reasoning` …)。
+/// - `tools`:Responses 请求顶层 `tools`(含 namespace 包装、apply_patch 的 lark grammar 等,
+///   原样计入 `tools` 分类)。
+pub fn compute_context_breakdown_responses(
+    instructions: Option<&str>,
+    items: &[Value],
+    tools: &[Value],
+) -> ContextBreakdown {
+    let mut acc = Acc::default();
+
+    // 顶层 instructions 按 XML 标签启发式分 system_prompt / developer。**parity 假设**:
+    // 与 chat 路径(`is_developer_block(message_text(msg))`)同一启发式 —— Codex 通常把
+    // base 指令放顶层 instructions(无标签 → system_prompt)、把权限/env/AGENTS 块放独立
+    // developer message(带标签 → developer)。若未来 Codex 把这些标签内联进 instructions,
+    // 两路会对语义等价内容给出不同归类(仅面板分桶差异,不影响转发 / 总数)。
+    if let Some(text) = instructions.filter(|s| !s.is_empty()) {
+        let slot = if is_developer_block(text) {
+            &mut acc.developer
+        } else {
+            &mut acc.system_prompt
+        };
+        slot.add(count_tokens(text));
+    }
+
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        // tool 往返:function_call / function_call_output / custom_tool_call(_output) /
+        // local_shell_call(_output) 等,统一归 tool_calls(与 chat 口径一致)。
+        if item_type.starts_with("function_call")
+            || item_type.starts_with("custom_tool_call")
+            || item_type.starts_with("local_shell_call")
+            || item_type == "tool_call"
+            || item_type == "tool_result"
+        {
+            acc.tool_calls.add(count_value(item));
+            continue;
+        }
+        match item_type {
+            "reasoning" => acc.reasoning.add(count_value(item)),
+            "message" => {
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+                match role {
+                    "system" | "developer" => {
+                        let slot = if is_developer_block(&message_text(item)) {
+                            &mut acc.developer
+                        } else {
+                            &mut acc.system_prompt
+                        };
+                        slot.add(count_value(item));
+                    }
+                    // user / assistant 文本消息 → messages(assistant 工具调用是独立的
+                    // function_call item,已在上面归 tool_calls,不在此处)。
+                    _ => acc.messages.add(count_value(item)),
+                }
+            }
+            // 未知 / 其它 item(item_reference 等)兜底进 messages,不丢(与 chat 口径一致)。
+            _ => acc.messages.add(count_value(item)),
+        }
+    }
+
+    for tool in tools {
+        acc.tools.add(count_value(tool));
+    }
+
+    finalize_acc(acc)
 }
 
 // ───────────────── [MOC-231/232] 按对话持久 store + 异步搬离关键路径 ─────────────────
@@ -356,6 +445,30 @@ pub fn spawn_compute_and_persist(messages: Vec<Value>, tools: Vec<Value>, conv_i
     });
 }
 
+/// [MOC-234] responses 1:1 passthrough 路径的后台 breakdown 计算 + 落盘。同
+/// [`spawn_compute_and_persist`] 的异步/原子语义,但走 [`compute_context_breakdown_responses`]
+/// (responses 形 item,不经 chat 转换)。`items` 由观测累积器拼好(全历史 + 本轮)。
+pub fn spawn_compute_and_persist_responses(
+    instructions: Option<String>,
+    items: Vec<Value>,
+    tools: Vec<Value>,
+    conv_id: String,
+) {
+    if !is_safe_conversation_id(&conv_id) {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn_blocking(move || {
+        let breakdown =
+            compute_context_breakdown_responses(instructions.as_deref(), &items, &tools);
+        if let Ok(v) = serde_json::to_value(&breakdown) {
+            persist_context_breakdown(&conv_id, &v);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +512,71 @@ mod tests {
         assert_eq!(by_key.get(keys::REASONING).unwrap().items, 1);
         // tools:2 个工具定义
         assert_eq!(by_key.get(keys::TOOLS).unwrap().items, 2);
+    }
+
+    /// 合成 Responses 形 item(覆盖各 source),对称于 [`sample_messages`] 的 chat 形。
+    fn sample_responses_items() -> Vec<Value> {
+        vec![
+            json!({ "type": "message", "role": "developer", "content": [{"type":"input_text","text":"<permissions instructions> sandbox=workspace-write"}] }), // → developer
+            json!({ "type": "message", "role": "user", "content": [{"type":"input_text","text":"帮我改个 bug"}] }), // → messages
+            json!({ "type": "reasoning", "summary": [{"type":"summary_text","text":"先看代码再改"}] }), // → reasoning
+            json!({ "type": "function_call", "name": "shell", "arguments": "{\"cmd\":\"ls\"}", "call_id": "c1" }), // → tool_calls
+            json!({ "type": "function_call_output", "call_id": "c1", "output": "file1.rs\nfile2.rs" }), // → tool_calls
+            json!({ "type": "message", "role": "assistant", "content": [{"type":"output_text","text":"改好了"}] }), // → messages
+        ]
+    }
+
+    #[test]
+    fn responses_native_classifies_each_source_into_expected_bucket() {
+        // [MOC-234] responses 原生计算口径必须与 chat 版一致(同分类 key)。
+        let bd = compute_context_breakdown_responses(
+            Some("You are Codex."), // 顶层 instructions → system_prompt
+            &sample_responses_items(),
+            &sample_tools(),
+        );
+        let by_key: std::collections::HashMap<_, _> =
+            bd.categories.iter().map(|c| (c.key, c)).collect();
+        assert_eq!(
+            by_key.get(keys::SYSTEM_PROMPT).unwrap().items,
+            1,
+            "instructions"
+        );
+        assert_eq!(
+            by_key.get(keys::DEVELOPER).unwrap().items,
+            1,
+            "developer message"
+        );
+        assert_eq!(
+            by_key.get(keys::MESSAGES).unwrap().items,
+            2,
+            "user + assistant"
+        );
+        assert_eq!(
+            by_key.get(keys::TOOL_CALLS).unwrap().items,
+            2,
+            "function_call + function_call_output"
+        );
+        assert_eq!(
+            by_key.get(keys::REASONING).unwrap().items,
+            1,
+            "reasoning item"
+        );
+        assert_eq!(by_key.get(keys::TOOLS).unwrap().items, 2, "tool defs");
+        // 总数 = 各类之和,且降序
+        assert_eq!(
+            bd.total_tokens,
+            bd.categories.iter().map(|c| c.tokens).sum::<u64>()
+        );
+        for w in bd.categories.windows(2) {
+            assert!(w[0].tokens >= w[1].tokens);
+        }
+    }
+
+    #[test]
+    fn responses_native_empty_yields_empty() {
+        let bd = compute_context_breakdown_responses(None, &[], &[]);
+        assert_eq!(bd.total_tokens, 0);
+        assert!(bd.categories.is_empty());
     }
 
     #[test]
@@ -471,6 +649,23 @@ mod tests {
         // 不 spawn、不落盘、不 panic。
         spawn_compute_and_persist(
             sample_messages(),
+            sample_tools(),
+            "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+        );
+    }
+
+    #[test]
+    fn spawn_compute_and_persist_responses_noop_guards() {
+        // responses 变体共用同一 is_safe / no-runtime guard:非法 uuid + 无 runtime 均 no-op、不 panic。
+        spawn_compute_and_persist_responses(
+            Some("You are Codex.".to_owned()),
+            sample_responses_items(),
+            sample_tools(),
+            "not-a-uuid".to_owned(),
+        );
+        spawn_compute_and_persist_responses(
+            None,
+            sample_responses_items(),
             sample_tools(),
             "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
         );

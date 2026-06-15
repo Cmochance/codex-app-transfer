@@ -68,6 +68,10 @@ pub fn build_app_router(state: AdminState) -> Router {
             post(handlers::providers::crud::activate_provider),
         )
         .route(
+            "/api/providers/{id}/mimo-login",
+            post(handlers::providers::crud::mimo_login),
+        )
+        .route(
             "/api/providers/{id}/secret",
             get(handlers::providers::crud::get_secret),
         )

@@ -299,7 +299,7 @@
       detailEl.textContent = t(detailKey);
     }
     // 协议切换 → 重渲 mappings UI 让 default required 状态跟当前协议同步
-    // (direct 模式 default 解锁为可空,其他场景仍 required)
+    // (responses 1:1 透传协议 default 解锁为可空,其他场景仍 required)
     setProviderMappings(providerFormMappings);
     // OAuth 模式切换:apiFormat=gemini_cli_oauth 时隐藏 apiKey input,显示 OAuth UI
     setOauthRowState(canonical);
@@ -325,6 +325,53 @@
       const useKey = specificKey && t(specificKey) !== specificKey ? specificKey : fallbackKey;
       hint.dataset.i18n = useKey;
       hint.textContent = t(useKey);
+    }
+  }
+
+  /// [MOC-211] 该 provider 是否 MiMo Token Plan(套餐用量需小米账号 session)。
+  /// 按 baseUrl 判:host 含 xiaomimimo.com 且路径含 token-plan(对齐 token-plan-{cn,sgp,ams})。
+  function isMimoTokenPlan(baseUrl) {
+    const u = baseUrl || "";
+    return /xiaomimimo\.com/i.test(u) && /token-plan/i.test(u);
+  }
+
+  /// [MOC-211] MiMo Token Plan「登录小米账号」row:仅编辑已保存的 MiMo token-plan provider
+  /// 时显示(登录需 provider.id 落 cookie)。点击开内嵌 webview 登录,抓 session 存后端。
+  function setMimoLoginRow(show, hasCookie, providerId) {
+    const row = $("#providerMimoLoginRow");
+    const btn = $("#providerMimoLoginBtn");
+    const status = $("#providerMimoLoginStatus");
+    if (row) row.hidden = !show;
+    if (!show) return;
+    if (status) {
+      status.textContent = hasCookie
+        ? t("providersAdd.mimoLogin.statusLoggedIn")
+        : t("providersAdd.mimoLogin.statusNotLoggedIn");
+    }
+    if (btn) {
+      btn.disabled = false;
+      // onclick 赋值(非 addEventListener)避免重复绑定叠加
+      btn.onclick = async () => {
+        if (!providerId) return;
+        btn.disabled = true;
+        if (status) status.textContent = t("providersAdd.mimoLogin.statusLoggingIn");
+        try {
+          const res = await CCApi.mimoLogin(providerId);
+          if (res && res.captured === false) {
+            // 用户关窗 / 未完成登录 → 中性提示,不当错误
+            if (status) status.textContent = t("providersAdd.mimoLogin.statusNotLoggedIn");
+            showToast(t("providersAdd.mimoLogin.cancelled"));
+          } else {
+            if (status) status.textContent = t("providersAdd.mimoLogin.statusLoggedIn");
+            showToast(t("providersAdd.mimoLogin.success"));
+          }
+        } catch (error) {
+          if (status) status.textContent = t("providersAdd.mimoLogin.statusNotLoggedIn");
+          showToast(error.message || t("toast.requestFailed"));
+        } finally {
+          btn.disabled = false;
+        }
+      };
     }
   }
 
@@ -803,8 +850,8 @@
   }
 
   function isDirectResponsesMode() {
-    // 自定义第三方 + apiFormat=responses → Codex.app 直连上游(direct 模式),
-    // 模型透传给上游,代理不做 alias 翻译 → default mapping 可空。
+    // 自定义第三方 + apiFormat=responses → 代理内 1:1 字节透传给原生 Responses 上游
+    // (MOC-234:不再 direct 直连,但仍 1:1 不做 alias 翻译)→ default mapping 可空。
     return (
       formApiFormatValue === "responses" && !!selectedPreset?.allowApiFormatSelection
     );
@@ -815,7 +862,7 @@
       // [MOC-154] 列表式:行序自动对应 Codex slot(行0=默认→gpt_5_5+default,行1→gpt_5_4
       // ...),用户只填"要在 Codex 显示的模型",不再手动选槽位、不再有 custom 行。
       const isDefault = index === 0;
-      // direct 模式不需要 model alias 映射,默认行也可空;其他场景默认行仍 required
+      // responses 1:1 透传不需要 model alias 映射,默认行也可空;其他场景默认行仍 required
       const isRequired = isDefault && !isDirectResponsesMode();
       const currentProviderModel = providerFormMappings[rowKey] || "";
       return `
@@ -2285,6 +2332,7 @@
     setGrokWebRowState("openai_chat"); // R1 PR-7 reset grok_web row 隐藏
     fillGrokWebFormFromProvider(null);
     setWebSearchRow(false, false, null);
+    setMimoLoginRow(false, false, null); // 新建态无 provider.id,隐藏登录 row
     setProviderMappings(emptyMappings());
     setReviewModelSlotField(""); // 新建/重置 → 审查模型回到「跟随主模型」
   }
@@ -2327,6 +2375,7 @@
       !!formRequestOptions.web_search_enabled,
       preset.id
     );
+    setMimoLoginRow(false, false, null); // 选 preset(新建态)无 provider.id,隐藏登录 row
     providerAvailableModels = [];
     setProviderMappings(preset.models || emptyMappings());
     setReviewModelSlotField(""); // preset 不带审查模型 → 回到「跟随主模型」
@@ -2388,6 +2437,8 @@
       !!formRequestOptions.web_search_enabled,
       matchedPreset?.id || null
     );
+    // [MOC-211] 编辑已保存的 MiMo Token Plan provider → 显示「登录小米账号」row(有 provider.id 可落 cookie)
+    setMimoLoginRow(isMimoTokenPlan(provider.baseUrl), !!provider.hasMimoCookie, provider.id);
     // 池化:进编辑页「立即」用持久化的 pooledModels 渲染下拉(解耦强制网络拉取);
     // pooledModels 空时回退空列表,行为同改前(下拉禁用直到点「获取模型」)。
     // setProviderMappings 内部会把 availableModels 写进 providerAvailableModels(单一赋值源)。
@@ -3653,9 +3704,10 @@
 
   async function saveProviderFromForm() {
     const payload = providerPayloadFromForm(true);
-    // Responses 透传协议(direct mode)必须填齐 baseUrl + apiKey,否则 backend
-    // 会 silent fallback 到 local_proxy → Codex.app 经代理 → 行为偏离用户预期。
-    // 前端拦下让用户立即看到错误,而不是后端 fallback 后用户毫无察觉。
+    // Responses 透传协议必须填齐 baseUrl + apiKey:[MOC-234] responses 现统一经
+    // 本地代理做 1:1 字节透传(不再 direct 直连),baseUrl = 代理转发的上游地址、
+    // apiKey = 代理按 provider 注入的上游凭据,缺任一上游都无法转发。前端拦下让
+    // 用户立即看到错误,而不是保存一个转发必失败的 provider。
     if (payload.apiFormat === "responses" || payload.apiFormat === "openai_responses") {
       if (!payload.baseUrl) {
         throw new Error(t("toast.directModeBaseUrlRequired"));

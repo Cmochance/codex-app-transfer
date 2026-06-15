@@ -4,11 +4,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod admin;
+mod anyrouter_quota;
 mod codex_plugin_unlocker;
 mod codex_quota_injector;
 mod codex_real_account;
 mod codex_theme_injector;
+mod deepseek_quota;
+mod glm_quota;
 mod mcp_webfetch_server;
+mod mimo_quota;
+mod mimo_session;
+mod provider_quota;
 mod proxy_runner;
 #[cfg(target_os = "macos")]
 mod single_instance;
@@ -84,7 +90,19 @@ fn main() {
     let app = builder
         .manage(proxy_manager)
         .manage(trace_viewer_manager)
-        .register_asynchronous_uri_scheme_protocol("cas", move |_app, request, responder| {
+        .register_asynchronous_uri_scheme_protocol("cas", move |ctx, request, responder| {
+            // [MOC-211 安全] cas:// 同进程 admin API 只允许**主窗口**访问。MiMo 小米账号登录等
+            // 加载**外部页面**的 webview(label != "main")若能发 cas://localhost/api/... 即可篡改
+            // 本地 provider/settings(外部页面/被篡改脚本/重定向/MITM 拿到本地 admin API,P1);
+            // 故非主窗口一律 403、绝不转进 admin router。
+            if ctx.webview_label() != "main" {
+                let resp = tauri::http::Response::builder()
+                    .status(403)
+                    .body(b"forbidden: cas scheme is restricted to the main webview".to_vec())
+                    .unwrap();
+                responder.respond(resp);
+                return;
+            }
             let router = app_router_for_protocol.clone();
             tauri::async_runtime::spawn(async move {
                 let response = handle_cas_request(router, request).await;
@@ -93,6 +111,9 @@ fn main() {
         })
         .setup(|app| {
             let startup_proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
+            // [MOC-211] 存全局 AppHandle 供 MiMo 小米账号内嵌 webview 登录开窗用
+            // (AdminState 在建 router 时尚无 AppHandle,故走全局 OnceLock)。
+            mimo_session::init(app.handle().clone());
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
 
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
@@ -499,6 +520,11 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
+                // [MOC-211] 只有主窗口走「关闭=隐藏到托盘」;其它窗口(如 MiMo 小米账号登录
+                // webview)应正常关闭销毁,否则红叉会连主 app 一起隐藏、窗口也不被销毁。
+                if window.label() != "main" {
+                    return;
+                }
                 api.prevent_close();
                 // macOS:用 NSApp.hide:(`app.hide()`)而不是 NSWindow.orderOut:
                 // (`window.hide()`)。NSApp.hide/unhide 是 Apple 提供的 app 级

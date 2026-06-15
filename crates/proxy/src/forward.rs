@@ -534,7 +534,16 @@ pub async fn forward_handler(
                 Bytes::new()
             }
         };
-        if is_web_search_upstream_reject(&body_bytes) {
+        // [reviewer] responses passthrough(api_format=responses/openai_responses)的 map_request
+        // 1:1 返回原 body(不经 B 层 cache drop web_search),故 disable_web_search_for + 重跑
+        // prepare_request 仍发同样带 web_search 的 body → 重复 POST 必被同样 400 拒,只多打一次上游、
+        // 延后客户端看到错误,违背 1:1 透传。透传场景跳过该 transparent retry,直接把 4xx 交给下游
+        // (responses mapper 包成 response.failed)。
+        let is_responses_passthrough = matches!(
+            resolved.provider.api_format.as_str(),
+            "responses" | "openai_responses"
+        );
+        if is_web_search_upstream_reject(&body_bytes) && !is_responses_passthrough {
             codex_app_transfer_adapters::disable_web_search_for(&resolved.provider.id);
             telemetry.logs.add(
                 "WARN",
@@ -570,8 +579,51 @@ pub async fn forward_handler(
             );
             live_resp = Some(pair.0);
             outbound_headers_snapshot = pair.1;
+        } else if codex_app_transfer_adapters::is_orphan_function_call_error(&body_bytes) {
+            // [MOC-234] orphan function_call 400 降级:store:false 反代(new-api 类)续轮找不到
+            // 自己上一轮产生的 function_call,且整段会话上下文上游也没有(远端拼接失效)。用
+            // always-on 会话观测镜像沿 previous_response_id 链**重建完整上下文** inline + 去掉
+            // previous_response_id,透明重发一次,让续轮带着完整历史继续。镜像没记到该链(proxy
+            // 重启 / 跨 provider 边界)→ rebuild 返 None,退回保存原 4xx 显示错误。
+            match codex_app_transfer_adapters::rebuild_orphan_context_bytes(&plan.body) {
+                Some(repaired) => {
+                    telemetry.logs.add(
+                        "WARN",
+                        format!(
+                            "orphan function_call 400 for provider {} — rebuilt full context from session mirror + dropped previous_response_id, retrying...",
+                            resolved.provider.id
+                        ),
+                    );
+                    plan.body = repaired; // 反映实际重发的 body 到 trace/diag
+                    let pair = build_and_send_upstream(
+                        &state,
+                        &parts.method,
+                        &parts.headers,
+                        &resolved,
+                        &plan.body,
+                        &plan.upstream_headers,
+                        &upstream_url,
+                    )
+                    .await?;
+                    telemetry.logs.add(
+                        "INFO",
+                        format!(
+                            "orphan function_call retry status {} for provider {}",
+                            pair.0.status().as_u16(),
+                            resolved.provider.id
+                        ),
+                    );
+                    live_resp = Some(pair.0);
+                    outbound_headers_snapshot = pair.1;
+                }
+                None => {
+                    // 镜像没记到该链(proxy 重启 / 首轮 / 跨 provider 边界 / 非 responses body)
+                    // → 拼不出完整上下文,不重试(退回 response.failed 显示错误)。
+                    captured_4xx = Some((st, hs, body_bytes));
+                }
+            }
         } else {
-            // 非 web_search 4xx,resp 已被 bytes() 消费,把三元组保存
+            // 非 web_search / 非可修复 orphan 的 4xx,resp 已被 bytes() 消费,把三元组保存
             captured_4xx = Some((st, hs, body_bytes));
         }
     }

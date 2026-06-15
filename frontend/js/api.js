@@ -135,6 +135,9 @@
       apiFormat: ['openai', 'openai_chat'].includes(provider.apiFormat) ? 'openai_chat' : (provider.apiFormat || 'openai_chat'),
       authScheme: provider.authScheme || 'bearer',
       hasApiKey: !!provider.hasApiKey,
+      // [MOC-211] 后端 public_provider mask 出 mimoCookie、只暴露 hasMimoCookie;显式挑字段
+      // 必须带上,否则编辑页登录后仍显「未登录」(mapper 不列即丢,见 api.js mapper 契约)。
+      hasMimoCookie: !!provider.hasMimoCookie,
       extraHeaders: provider.extraHeaders || {},
       modelCapabilities: provider.modelCapabilities || {},
       requestOptions: provider.requestOptions || {},
@@ -346,6 +349,12 @@
 
     async activateProvider(id) {
       return api('POST', `/api/providers/${encodeURIComponent(id)}/activate`);
+    },
+
+    // [MOC-211] 触发小米账号内嵌 webview 登录,抓取 session cookie 存到该 provider
+    // (用于 MiMo Token Plan 套餐用量查询)。后端阻塞到登录成功 / 超时 / 关窗。
+    async mimoLogin(id) {
+      return api('POST', `/api/providers/${encodeURIComponent(id)}/mimo-login`);
     },
 
     async reorderProviders(providerIds) {

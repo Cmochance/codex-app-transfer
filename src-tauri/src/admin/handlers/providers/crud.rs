@@ -625,6 +625,54 @@ pub async fn set_pool_slot_mappings(
     }
 }
 
+/// [MOC-211] 触发小米账号内嵌 webview 登录,抓取网页 session cookie 存到该 provider 的
+/// `mimoCookie`(masked,见 public_provider),daemon 之后带它查 MiMo 套餐用量。仅对 MiMo
+/// token-plan provider 有意义(前端只在该类 provider 上显示登录按钮)。阻塞到登录成功 /
+/// 超时 / 用户关窗。
+pub async fn mimo_login(Path(id): Path<String>) -> impl IntoResponse {
+    // 先确认 provider 存在(避免登录成功后才发现 id 无效)。
+    let exists = load_registry()
+        .ok()
+        .and_then(|cfg| {
+            cfg.get("providers").and_then(|v| v.as_array()).map(|ps| {
+                ps.iter()
+                    .any(|p| p.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            })
+        })
+        .unwrap_or(false);
+    if !exists {
+        return err(StatusCode::NOT_FOUND, "provider not found").into_response();
+    }
+    // 开内嵌 webview 登录,抓 session cookie(httpOnly serviceToken 等)。
+    let cookie = match crate::mimo_session::login_and_capture().await {
+        Ok(Some(c)) => c,
+        // 用户关窗 / 超时未完成 → 非错误,前端显「未登录」不弹错。
+        Ok(None) => return Json(json!({"success": true, "captured": false})).into_response(),
+        Err(e) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+    };
+    // 落库到该 provider 的 mimoCookie。
+    let result = with_config_write(|cfg| {
+        let providers = cfg
+            .as_object_mut()
+            .and_then(|o| o.get_mut("providers"))
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| "providers missing".to_string())?;
+        let p = providers
+            .iter_mut()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .ok_or_else(|| "provider not found".to_string())?;
+        let obj = p
+            .as_object_mut()
+            .ok_or_else(|| "provider not object".to_string())?;
+        obj.insert("mimoCookie".into(), Value::String(cookie));
+        Ok(ConfigMutation::Modified(()))
+    });
+    match result {
+        Ok(()) => Json(json!({"success": true, "captured": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 pub async fn set_default_provider(
     State(state): State<AdminState>,
     Path(id): Path<String>,

@@ -95,7 +95,7 @@
 当前 registry 中应保持下列 canonical protocol 字面值稳定：
 
 - `openai_chat`：OpenAI Chat-compatible 上游，默认 fallback。
-- `responses`：OpenAI Responses 语义；custom direct mode 只允许 `responses` / `openai_responses` 旁路本地代理。
+- `responses`：OpenAI Responses 语义；`responses` / `openai_responses` 格式通过 `ResponsesPassthroughMapper` 纳入统一 mapper 框架，经本地代理 1:1 字节透传至原生上游（MOC-234，direct 旁路已彻底移除）。
 - `gemini_native`：Google AI Studio `generateContent` / `streamGenerateContent`。
 - `gemini_cli_oauth`：Google Cloud Code Assist OAuth wire。
 - `antigravity_oauth`：Antigravity OAuth flavor，复用 Cloud Code Assist wire。
@@ -116,7 +116,7 @@
   - provider `apiFormat` 归一化；
   - provider connection test URL/body/header；
   - model list endpoint 推导；
-  - direct-mode bypass guard；
+  - responses 协议的 passthrough mapper 注册（`responses` / `openai_responses` → `ResponsesPassthroughMapper`，不再需要 direct-mode bypass guard，MOC-234 已移除该机制）；
   - 前端保存 canonical 值和旧配置别名显示。
 
 ## 5. 例外处理机制

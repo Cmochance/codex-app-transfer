@@ -9,6 +9,8 @@ pub(crate) mod chat;
 pub(crate) mod cloud_code;
 pub(crate) mod gemini_native;
 pub(crate) mod grok_web;
+// [MOC-234] responses ↔ responses 1:1 直透 mapper(原生 Responses 上游纳入统一框架)。
+pub(crate) mod responses;
 
 /// Request 侧协议映射器统一接口。
 pub(crate) trait RequestMapper {

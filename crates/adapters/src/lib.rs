@@ -37,6 +37,11 @@ pub use responses::{
     convert_chat_to_responses_stream, responses_body_to_chat_body,
     responses_body_to_chat_body_for_provider, ChatToResponsesConverter, ResponsesAdapter,
 };
+// [MOC-234] responses passthrough orphan function_call 降级修复:forward 层据此检测上游
+// orphan-400 + 拼回缺失 function_call 透明重试(store:false 反代续轮兜底)。
+pub use responses::tool_call_repair::{
+    is_orphan_function_call_error, rebuild_orphan_context_bytes,
+};
 pub use types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 // [MOC-210] antigravity 原生出图履约:proxy(forward.rs)截获模型 image_gen 调用后,
 // 用这两个函数抽 prompt + 构造出图子请求(envelope),子请求响应的 inlineData 再经

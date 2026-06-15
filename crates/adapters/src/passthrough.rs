@@ -29,9 +29,11 @@
 
 use bytes::Bytes;
 use codex_app_transfer_registry::Provider;
+use http::{HeaderMap, StatusCode};
 
-use crate::registry::rewrite_local_path_for_upstream;
-use crate::types::{Adapter, AdapterError, RequestPlan};
+use crate::mapper::responses::ResponsesPassthroughMapper;
+use crate::mapper::{RequestMapper, ResponseMapper};
+use crate::types::{Adapter, AdapterError, ByteStream, RequestPlan, ResponsePlan};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ResponsesPassthroughAdapter;
@@ -42,6 +44,10 @@ impl ResponsesPassthroughAdapter {
     }
 }
 
+// [MOC-234] 薄 adapter:请求 / 响应两侧都委托给统一框架内的
+// `ResponsesPassthroughMapper`(1:1 直透),与 `ResponsesAdapter`→`ChatResponsesMapper`、
+// `AnthropicMessagesAdapter`→`AnthropicMessagesMapper` 的两行委托写法一致。adapter name
+// 保持 `responses_passthrough` 不变,registry 路由与既有测试零改动。
 impl Adapter for ResponsesPassthroughAdapter {
     fn name(&self) -> &'static str {
         "responses_passthrough"
@@ -51,22 +57,26 @@ impl Adapter for ResponsesPassthroughAdapter {
         &self,
         client_path: &str,
         body: Bytes,
-        _provider: &Provider,
+        provider: &Provider,
     ) -> Result<RequestPlan, AdapterError> {
-        // 用 registry::rewrite_local_path_for_upstream 完整 normalize:
-        // 剥 `/openai` legacy prefix + `/claude/v1/messages` alias + `/v1` 前缀 + 保 query。
-        // 不能用 `normalize_v1_prefix`(只剥 `/v1`),否则 `/openai/v1/responses` 会
-        // 被透传成 `/openai/v1/responses` 拼到 baseUrl → 上游 404。
-        Ok(RequestPlan {
-            upstream_path: rewrite_local_path_for_upstream(client_path),
-            body,
-            upstream_headers: http::HeaderMap::new(),
-            response_session: None,
-            adapter_metadata: None,
-            is_compact: false,
-            compact_v2: false,
-            original_responses_request: None,
-        })
+        ResponsesPassthroughMapper.map_request(client_path, body, provider)
+    }
+
+    fn transform_response_stream(
+        &self,
+        upstream_status: StatusCode,
+        upstream_headers: HeaderMap,
+        upstream_stream: ByteStream,
+        provider: &Provider,
+        request_plan: &RequestPlan,
+    ) -> Result<ResponsePlan, AdapterError> {
+        ResponsesPassthroughMapper.map_response(
+            upstream_status,
+            upstream_headers,
+            upstream_stream,
+            provider,
+            request_plan,
+        )
     }
 }
 

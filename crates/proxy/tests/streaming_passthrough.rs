@@ -178,14 +178,64 @@ async fn responses_passthrough_byte_identical() {
     .await;
 }
 
-/// H2 (silent-failure-hunter review):passthrough 上游 4xx 错误体字节级透传。
-/// 防回归:`forward.rs::unwrap_or_default` 静默吞 body read 错误改成 telemetry warn,
-/// 上游 400 + JSON error body 完整原样透回客户端,不丢失 error.code / error.message。
+/// [MOC-234] passthrough 上游 4xx → 转 `response.failed` SSE(**不再字节级透传**)。
+///
+/// 旧行为(H2)是把上游 400 + JSON error body 原样透回客户端。但实测 Codex 流式
+/// `/responses` 客户端收到非 SSE 的 JSON 错误体会**卡 Thinking、不显示错误**。本 PR 改为
+/// 与 chat/grok/gemini 同源,把上游错误转成 `response.created` + `response.failed`
+/// (HTTP 200 + event-stream),Codex 据此渲染错误并按 code fail-fast。H2 的「不丢错误
+/// 信息」目标仍满足 —— 上游 `error.message` 保留在 `response.failed` 事件里。
 #[tokio::test]
-async fn responses_passthrough_upstream_error_body_passthrough() {
-    run_passthrough_against_with_format(
+async fn responses_passthrough_upstream_error_becomes_response_failed() {
+    let fixture = Fixture::load(fixture_path(
         "tests/replay/fixtures/_example_responses_passthrough_error.json",
-        "responses",
-    )
-    .await;
+    ))
+    .unwrap();
+    let upstream_addr = spawn(build_upstream_mock(&fixture)).await;
+    let resolver = Arc::new(StaticResolver::new(
+        None,
+        vec![provider_for(
+            &format!("http://{upstream_addr}"),
+            "responses",
+        )],
+        Some("test-upstream".into()),
+    ));
+    let proxy_addr = spawn(build_router(resolver)).await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-5","stream":true,"input":[]}"#)
+        .send()
+        .await
+        .expect("proxy send");
+    // 上游 4xx 转成 200 + SSE,Codex 才会读流拿到 response.failed(裸 400 会卡 Thinking)。
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "上游 4xx 应转成 200 + response.failed SSE"
+    );
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    assert!(ct.contains("text/event-stream"), "应为 event-stream: {ct}");
+    let body = resp.text().await.expect("read body");
+    assert!(
+        body.contains("response.failed"),
+        "应 emit response.failed: {body}"
+    );
+    assert!(
+        body.contains("Invalid API key for upstream"),
+        "上游 error.message 必须保留(H2 目标不丢错误信息): {body}"
+    );
+    assert!(
+        body.contains("invalid_prompt"),
+        "400 → invalid_prompt(fail-fast): {body}"
+    );
 }

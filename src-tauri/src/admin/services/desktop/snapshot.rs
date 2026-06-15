@@ -16,9 +16,9 @@ use serde_json::{json, Value};
 
 use crate::admin::handlers::common::{active_provider_name, read_setting_bool, APP_VERSION};
 use crate::admin::handlers::providers::{
-    active_provider, provider_api_key, provider_default_model, provider_display_name,
-    provider_index, provider_model_capabilities, provider_model_mappings,
-    provider_review_model_slot, provider_supports_1m,
+    active_provider, provider_default_model, provider_display_name, provider_index,
+    provider_model_capabilities, provider_model_mappings, provider_review_model_slot,
+    provider_supports_1m,
 };
 use crate::admin::handlers::proxy::{
     ensure_gateway_key, read_gateway_key, read_proxy_port, start_proxy_if_needed,
@@ -148,71 +148,25 @@ pub fn desktop_config_target_for_provider(
 ) -> DesktopConfigTarget {
     let proxy_port = proxy_port_override.unwrap_or_else(|| read_proxy_port(cfg));
 
-    // **bypass_proxy 模式**(2026-05-10):用户在「自定义第三方」preset 显式选
-    // `apiFormat=responses` 协议,且填了 baseUrl + apiKey → Codex.app 直连上游,
-    // 代理不参与转发(借鉴 codex-account-switch 的纯配置写入模式)。
+    // [MOC-234] **所有 provider 统一走 local_proxy**(含 `apiFormat=responses` /
+    // `openai_responses`)。此前 responses 协议在填了 baseUrl + apiKey 时会 bypass
+    // 代理、让 Codex.app 直连上游(direct 模式),导致这条流量不进转发层 —— 无法做
+    // 协议层处理 / 埋点 / 上下文与用量归因。MOC-234 永久去掉 direct:responses↔responses
+    // 改由代理内 `ResponsesPassthroughAdapter` 做 1:1 字节直透(compact / web_search /
+    // namespace 等 Codex 自有 / 上游原生能力照样原样转发、本项目不接管,体验不降级),
+    // 既把原生 Responses 上游纳入统一管线,又能在一处做只读整合。
     //
-    // 适用范围:OpenAI 官方 / 任何原生实现 OpenAI Responses API 的反代或自建服务。
-    // 触发条件:
-    //   - apiFormat 严格等于 `responses` / `openai_responses`(anthropic /
-    //     anthropic_messages / claude / messages 是 Anthropic Messages 路径
-    //     → 继续走代理做本地协议转换)
-    //   - baseUrl 与 apiKey 都非空(空了 direct 没法 work,fallback 到 local_proxy)
-    //   - healing 命中 builtin preset 时强制覆盖 apiFormat=openai_chat,**builtin
-    //     用户行为不变**(MiMo / Kimi / DeepSeek / MiniMax / 智谱 / 百炼 / Kimi Code 等)
-    //
-    // 历史教训(2026-05-08 MiMo Token Plan 404):v1.x 用 apiFormat=responses 当
-    // "上游原生透传"隐式信号 → 用户配 MiMo 也被路由到 direct_provider → MiMo 上游
-    // 没有 /responses端点 → 必 404。此次设计的关键差异:**healing 已经把所有
-    // builtin preset 强制覆盖回 openai_chat**,bypass只可能命中显式自定义的
-    // 第三方 provider —— 用户对此场景做出 informed choice。
+    // local_proxy 模式:Codex.app → 127.0.0.1:18080 → 本地代理(协议转换 / 1:1 透传 +
+    // extras 注入 + model 改写 + vision 剥离 + namespace MCP 展平等)→ 上游。
     let api_format_lower = provider
         .get("apiFormat")
         .and_then(|v| v.as_str())
         .unwrap_or("openai_chat")
         .trim()
         .to_ascii_lowercase();
-    let provider_base_url = provider
-        .get("baseUrl")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    let direct_api_key = provider_api_key(provider);
-    // 整合模式必须走本地代理(池按 catalog slug 分流到各上游)→ 即便 active provider 是
-    // responses 直连,也不能 bypass,否则 Codex 直连该 provider、绕过整合池(#477 用户反馈:
-    // 整合开了但 Codex 用的还是开整合前的 provider 配置)。
-    let bypass_proxy = matches!(api_format_lower.as_str(), "responses" | "openai_responses")
-        && !provider_base_url.is_empty()
-        && !direct_api_key.is_empty()
-        && !read_setting_bool(cfg, "exposeAllProviderModels", false);
 
     let codex_network_access = crate::admin::handlers::proxy::read_codex_network_access(cfg);
 
-    if bypass_proxy {
-        return DesktopConfigTarget {
-            base_url: provider_base_url,
-            api_key: direct_api_key,
-            supports_1m: provider_supports_1m(provider),
-            provider_name: provider_display_name(provider),
-            default_model: provider_default_model(provider),
-            model_mappings: provider_model_mappings(provider),
-            model_capabilities: provider_model_capabilities(provider),
-            requires_proxy: false,
-            mode: "direct",
-            proxy_port,
-            codex_network_access,
-            model_display_names: antigravity_display_names(&api_format_lower),
-            review_model_slot: provider_review_model_slot(provider),
-            // direct 直连不写 catalog(apply.rs 会 strip),故池化对其无意义。
-            pool: None,
-            pool_default_slug: None,
-        };
-    }
-
-    // 默认 local_proxy 模式:Codex.app → 127.0.0.1:18080 → 本地代理(协议转换 +
-    // extras 注入 + model 改写 + vision 剥离 + namespace MCP 展平等)→ 上游。
-    // 本项目核心价值在协议转换层,默认所有 provider 走代理,需要透传必须显式选。
     let base_url = format!("http://127.0.0.1:{proxy_port}");
     // 熵源失败(getrandom)时 ensure_gateway_key 返 Err。desktop 配置生成属次要
     // 路径 —— proxy 端鉴权强制由 proxy_runner 启动路径的硬失败保证,这里降级为
@@ -271,9 +225,10 @@ pub fn desktop_target_for_active_provider(cfg: &RawConfig) -> Option<DesktopConf
 }
 
 /// [MOC-178 codex P2] 当前 active provider 是否支持真实账号 relay = 有 active provider 且走 proxy
-/// (local_proxy 类,requires_proxy=true)。direct(bypass_proxy 直连)**或无 provider**(默认
-/// activeProvider null、无 target)→ false:不代理 / 没法 apply relay,保不住 chatgpt 态,不该开真实
-/// 账号模式 flag(startup 收敛关 / pin 只 save 镜像)。只读,不写盘。
+/// (requires_proxy=true)。**无 provider**(默认 activeProvider null、无 target)→ false:没法
+/// apply relay,保不住 chatgpt 态,不该开真实账号模式 flag(startup 收敛关 / pin 只 save 镜像)。
+/// [MOC-234] direct 直连已移除,所有 provider 恒 requires_proxy=true,故等价于「有无 active provider」。
+/// 只读,不写盘。
 pub fn active_provider_supports_relay() -> bool {
     crate::admin::registry_io::load()
         .ok()
@@ -356,10 +311,11 @@ pub fn codex_openai_api_key_present(paths: &CodexPaths) -> bool {
 }
 
 pub fn one_million_catalog_ready(paths: &CodexPaths, target: &DesktopConfigTarget) -> bool {
-    // issue #317:direct 直连模式不写 model_catalog_json(用 Codex 默认 catalog),
-    // 「1M catalog 是否写入」对 direct 无意义 —— 视为就绪。否则 desktop_health 会
-    // 因 config.toml 没有 model_catalog_json 而永远返回 false → needsApply 死循环
-    // (direct + default model 带 [1m] 后缀的 provider)。
+    // 防御性 guard:不经代理的 target(`requires_proxy=false`)不写 model_catalog_json,
+    // 「1M catalog 是否写入」对它无意义 → 视为就绪,否则 desktop_health 会因 config.toml
+    // 没有 model_catalog_json 而永远返回 false → needsApply 死循环。
+    // [MOC-234] direct 直连已移除后,desktop target 恒 `requires_proxy=true`,此分支当前
+    // 不会被命中,仅作防御保留(未来若再出现不经代理的 target 仍正确)。
     if !target.requires_proxy {
         return true;
     }
@@ -510,14 +466,12 @@ fn apply_desktop_target_impl(
     force_apikey: bool,
 ) -> Result<Value, String> {
     let paths = CodexPaths::from_home_env().map_err(|e| e.to_string())?;
-    // [MOC-104] relay 模式 gate:仅 proxy 模式(非 direct)+ 活动已是可用真实
-    // chatgpt 时,apply 保留 chatgpt 登录态(让 Codex 原生显示 Plugins 入口、
-    // 不再依赖 CDP daemon 注入,消除 MOC-100 高延迟)。direct 直连 bypass proxy、
-    // 凭据直接用 auth.json 发上游,保留 chatgpt token 直连第三方会 401 → 不 relay。
-    // [MOC-178] force_apikey(清除真实账号)强制不 relay,即便活动仍是 chatgpt。
-    let preserve_chatgpt_auth = !force_apikey
-        && target.mode != "direct"
-        && crate::codex_real_account::active_is_real_chatgpt_now();
+    // [MOC-104] relay 模式 gate:活动已是可用真实 chatgpt 时,apply 保留 chatgpt
+    // 登录态(让 Codex 原生显示 Plugins 入口、不再依赖 CDP daemon 注入,消除 MOC-100
+    // 高延迟)。[MOC-178] force_apikey(清除真实账号)强制不 relay,即便活动仍是 chatgpt。
+    // [MOC-234] direct 直连已永久移除,所有 provider 走 local_proxy,故不再有「direct 不 relay」分支。
+    let preserve_chatgpt_auth =
+        !force_apikey && crate::codex_real_account::active_is_real_chatgpt_now();
     let result = apply_provider(
         &paths,
         &ApplyConfig {
@@ -532,8 +486,6 @@ fn apply_desktop_target_impl(
             review_model_slot: target.review_model_slot.as_deref(),
             app_version: APP_VERSION,
             codex_network_access: target.codex_network_access,
-            // issue #317:direct 直连只写上游配置,strip 全部 transfer 私货。
-            direct: target.mode == "direct",
             preserve_chatgpt_auth,
             // 池化:Some 时 apply 把 catalog 写成全 provider 池(否则单 provider)。
             pool: target.pool.as_deref(),
@@ -541,13 +493,6 @@ fn apply_desktop_target_impl(
         },
     )
     .map_err(|e| format!("apply 失败: {e}"))?;
-    // [MOC-178 codex P2] apply direct target 时持久关真实账号模式 flag —— direct(bypass_proxy 直连)
-    // 不代理、不支持 chatgpt relay,apply 已把活动 rewrite 回 apikey。一处覆盖所有 apply direct 路径
-    // (startup auto_apply / runtime 切 provider / enable 误开),避免「flag 还 true 但 plugins locked」
-    // 状态不一致(否则 UI 据 flag 说 mode on,要等下次 startup reconcile 的 direct 收敛才纠)。
-    if target.mode == "direct" {
-        let _ = crate::admin::handlers::settings::set_real_account_mode_enabled(false);
-    }
     serde_json::to_value(result).map_err(|e| format!("apply 结果序列化失败: {e}"))
 }
 
@@ -1118,36 +1063,32 @@ mod tests {
             proxy_target.api_key
         );
 
-        let mut direct_cfg = config_with_secret();
-        direct_cfg["gatewayApiKey"] = Value::Null;
-        let direct_provider = json!({
+        // [MOC-234] apiFormat=responses 的自定义第三方 provider 不再 direct 直连,
+        // 跟其它 provider 一样走 local_proxy(代理内 1:1 字节透传),便于统一处理与埋点。
+        let mut resp_cfg = config_with_secret();
+        let resp_provider = json!({
             "id": "custom-third-party-instance",
-            "name": "Custom Third-Party (Direct)",
+            "name": "Custom Third-Party (Responses)",
             "baseUrl": "https://direct.example.com/v1/",
             "authScheme": "bearer",
             "apiFormat": "responses",
             "apiKey": "sk-direct",
             "models": {"default": "direct-model"},
         });
-        let target =
-            desktop_config_target_for_provider(&mut direct_cfg, &direct_provider, Some(19090));
+        let target = desktop_config_target_for_provider(&mut resp_cfg, &resp_provider, Some(19090));
         assert_eq!(
-            target.mode, "direct",
-            "apiFormat=responses + 自定义第三方 + 填齐 baseUrl/apiKey → direct 透传"
+            target.mode, "local_proxy",
+            "apiFormat=responses 也走 local_proxy(MOC-234 已去除 direct 直连)"
         );
-        assert!(!target.requires_proxy, "direct 模式不启动本地代理");
+        assert!(target.requires_proxy, "responses 现在也需要本地代理");
         assert_eq!(
-            target.base_url, "https://direct.example.com/v1/",
-            "config.toml 直接指向用户填的上游 baseUrl"
+            target.base_url, "http://127.0.0.1:19090",
+            "config.toml 指向本地代理而非上游 baseUrl"
         );
-        assert_eq!(
-            target.api_key, "sk-direct",
-            "auth.json 直接写用户填的 apiKey"
+        assert!(
+            target.api_key.starts_with("cas_"),
+            "auth.json 写 gateway key,上游 apiKey 由代理按 provider 注入"
         );
-        assert!(direct_cfg
-            .get("gatewayApiKey")
-            .map(|v| v.is_null())
-            .unwrap_or(false));
     }
 
     #[test]
@@ -1213,11 +1154,13 @@ mod tests {
     }
 
     #[test]
-    fn openai_responses_alias_triggers_direct_mode() {
+    fn openai_responses_alias_uses_local_proxy_no_direct_bypass() {
+        // [MOC-234] openai_responses 别名跟 responses 一样走 local_proxy(代理内 1:1
+        // 透传),不再 direct 直连上游 —— 流量进转发层才能做统一处理与埋点。
         let mut cfg = config_with_secret();
         let provider = json!({
-            "id": "alias-direct",
-            "name": "Alias Direct",
+            "id": "alias-responses",
+            "name": "Alias Responses",
             "baseUrl": "https://api.openai.com/v1/",
             "authScheme": "bearer",
             "apiFormat": "openai_responses",
@@ -1226,16 +1169,18 @@ mod tests {
         });
         let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
         assert_eq!(
-            target.mode, "direct",
-            "openai_responses 别名必须跟 responses 同样进 bypass"
+            target.mode, "local_proxy",
+            "openai_responses 别名走 local_proxy(MOC-234 已去除 direct bypass)"
         );
-        assert!(!target.requires_proxy);
-        assert_eq!(target.base_url, "https://api.openai.com/v1/");
-        assert_eq!(target.api_key, "sk-direct");
+        assert!(target.requires_proxy);
+        assert_eq!(target.base_url, "http://127.0.0.1:19090");
     }
 
     #[test]
-    fn switch_back_to_builtin_restarts_proxy_and_repoints_config() {
+    fn switch_between_providers_keeps_proxy_and_repoints_config() {
+        // [MOC-234] responses provider 现在也走 local_proxy(不再 direct 直连),
+        // 故在 responses ↔ builtin 之间切换:代理始终运行,config.toml 始终指向
+        // 127.0.0.1,且绝不把上游 apiKey(sk-direct)写进 auth.json(由代理注入)。
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1249,7 +1194,7 @@ mod tests {
                     cfg["providers"][0].clone(),
                     {
                         "id": "p2",
-                        "name": "Custom Direct",
+                        "name": "Custom Responses",
                         "baseUrl": "https://direct.example.com/v1/",
                         "authScheme": "bearer",
                         "apiFormat": "responses",
@@ -1264,23 +1209,33 @@ mod tests {
                 let manager = Arc::new(ProxyManager::new());
 
                 let r1 = switch_provider_and_sync(Arc::clone(&manager), "p2".to_owned()).await;
-                assert_eq!(r1["desktopSync"]["mode"], json!("direct"));
-                assert!(!manager.status().running, "direct 模式不启动代理");
+                assert_eq!(r1["desktopSync"]["mode"], json!("local_proxy"));
+                assert!(
+                    manager.status().running,
+                    "responses 也走代理,proxy 必须运行"
+                );
                 let toml1 = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
-                assert!(toml1.contains("direct.example.com"));
+                assert!(
+                    toml1.contains("openai_base_url = \"http://127.0.0.1:"),
+                    "responses 经代理,config.toml 指向 127.0.0.1 而非上游:\n{toml1}"
+                );
+                assert!(
+                    !toml1.contains("direct.example.com"),
+                    "禁止把上游 URL 写进 config.toml:\n{toml1}"
+                );
 
                 let p1_id = cfg["providers"][0]["id"].as_str().unwrap().to_owned();
                 let r2 = switch_provider_and_sync(Arc::clone(&manager), p1_id).await;
                 assert_eq!(r2["desktopSync"]["mode"], json!("local_proxy"));
-                assert!(manager.status().running, "切回 builtin 必须重启代理");
+                assert!(manager.status().running, "切回 builtin 代理仍运行");
                 let toml2 = fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
                 assert!(
                     toml2.contains("openai_base_url = \"http://127.0.0.1:"),
-                    "config.toml 必须重新指向 127.0.0.1,实际:\n{toml2}"
+                    "config.toml 必须指向 127.0.0.1,实际:\n{toml2}"
                 );
                 assert!(
                     !toml2.contains("direct.example.com"),
-                    "禁止残留 direct 上游 URL:\n{toml2}"
+                    "禁止残留上游 URL:\n{toml2}"
                 );
                 let auth_json: Value = serde_json::from_str(
                     &fs::read_to_string(home.join(".codex").join("auth.json")).unwrap(),
@@ -1289,7 +1244,7 @@ mod tests {
                 let api_key = auth_json["OPENAI_API_KEY"].as_str().unwrap_or_default();
                 assert_ne!(
                     api_key, "sk-direct",
-                    "auth.json 不能残留 direct 时的 provider apiKey"
+                    "auth.json 不能残留上游 provider apiKey(由代理注入)"
                 );
                 assert!(
                     !api_key.is_empty(),
@@ -1378,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_switch_syncs_desktop_via_direct_when_apiformat_is_responses() {
+    fn provider_switch_syncs_responses_via_local_proxy() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1392,7 +1347,7 @@ mod tests {
                     cfg["providers"][0].clone(),
                     {
                         "id": "p2",
-                        "name": "Custom Third-Party (Direct)",
+                        "name": "Custom Responses",
                         "baseUrl": "https://direct.example.com/v1/",
                         "authScheme": "bearer",
                         "apiFormat": "responses",
@@ -1407,13 +1362,15 @@ mod tests {
                 let manager = Arc::new(ProxyManager::new());
                 let result = switch_provider_and_sync(Arc::clone(&manager), "p2".to_owned()).await;
 
+                // [MOC-234] responses 走 local_proxy:代理启动、config.toml 指向 127.0.0.1、
+                // 上游 apiKey 不写进 auth.json(由代理按 provider 注入)。
                 assert_eq!(result["success"], json!(true));
                 assert_eq!(result["desktopSync"]["success"], json!(true));
-                assert_eq!(result["desktopSync"]["mode"], json!("direct"));
-                assert_eq!(result["desktopSync"]["requiresProxy"], json!(false));
+                assert_eq!(result["desktopSync"]["mode"], json!("local_proxy"));
+                assert_eq!(result["desktopSync"]["requiresProxy"], json!(true));
                 assert!(
-                    !manager.status().running,
-                    "direct 模式必须不启动代理(stop_silent)"
+                    manager.status().running,
+                    "responses 走 local_proxy,代理必须启动"
                 );
 
                 let saved = load_registry().unwrap();
@@ -1421,22 +1378,25 @@ mod tests {
                 let config_toml =
                     fs::read_to_string(home.join(".codex").join("config.toml")).unwrap();
                 assert!(
-                    config_toml.contains("openai_base_url = \"https://direct.example.com/v1/\""),
-                    "config.toml 必须指向用户填的上游 baseUrl,实际:\n{config_toml}"
+                    config_toml.contains("openai_base_url = \"http://127.0.0.1:"),
+                    "config.toml 必须指向本地代理 127.0.0.1,实际:\n{config_toml}"
                 );
                 assert!(
-                    !config_toml.contains("127.0.0.1"),
-                    "direct 模式禁止指向 127.0.0.1:\n{config_toml}"
+                    !config_toml.contains("direct.example.com"),
+                    "禁止把上游 URL 写进 config.toml:\n{config_toml}"
                 );
                 let auth_json: Value = serde_json::from_str(
                     &fs::read_to_string(home.join(".codex").join("auth.json")).unwrap(),
                 )
                 .unwrap();
                 let api_key = auth_json["OPENAI_API_KEY"].as_str().unwrap_or_default();
-                assert_eq!(
+                assert_ne!(
                     api_key, "sk-direct",
-                    "auth.json 必须写用户填的 provider apiKey"
+                    "auth.json 不写上游 provider apiKey(由代理注入)"
                 );
+                assert!(!api_key.is_empty(), "auth.json 必须有 gateway key");
+
+                manager.stop_silent();
             });
         });
     }
@@ -1688,14 +1648,15 @@ mod tests {
         });
     }
 
-    /// issue #317 回归保护:direct(`requires_proxy=false`)不写 model_catalog_json,
-    /// `one_million_catalog_ready` 必须直接判就绪(short-circuit),不读 catalog
-    /// 文件。否则 direct + default model 带 [1m] 的 provider 会让 desktop_health
-    /// 永远 needsApply=true。短路在读文件之前,即便 paths 指向不存在目录也成立。
+    /// 防御性 guard 回归保护:不经代理的 target(`requires_proxy=false`)不写
+    /// model_catalog_json,`one_million_catalog_ready` 必须直接判就绪(short-circuit),
+    /// 不读 catalog 文件。否则带 [1m] 的 provider 会让 desktop_health 永远 needsApply=true。
+    /// 短路在读文件之前,即便 paths 指向不存在目录也成立。[MOC-234] direct 移除后此态为
+    /// 合成态(prod 恒 requires_proxy=true),仍单测 guard 本身正确。
     #[test]
-    fn one_million_catalog_ready_short_circuits_true_for_direct() {
+    fn one_million_catalog_ready_short_circuits_when_proxy_not_required() {
         let paths = CodexPaths::from_home_dir(std::path::Path::new("/nonexistent-cas-317"));
-        let direct_target = DesktopConfigTarget {
+        let no_proxy_target = DesktopConfigTarget {
             base_url: "https://up.example.com/v1".into(),
             api_key: "sk".into(),
             supports_1m: true,
@@ -1706,15 +1667,15 @@ mod tests {
             model_display_names: serde_json::Value::Null,
             review_model_slot: None,
             requires_proxy: false,
-            mode: "direct",
+            mode: "local_proxy",
             proxy_port: 0,
             codex_network_access: true,
             pool: None,
             pool_default_slug: None,
         };
         assert!(
-            one_million_catalog_ready(&paths, &direct_target),
-            "direct(requires_proxy=false)应直接判 1M 就绪,不依赖 catalog 文件"
+            one_million_catalog_ready(&paths, &no_proxy_target),
+            "requires_proxy=false 应直接判 1M 就绪,不依赖 catalog 文件"
         );
     }
 }
