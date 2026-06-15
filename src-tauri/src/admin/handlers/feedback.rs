@@ -472,6 +472,8 @@ pub(super) async fn submit_feedback_with_body(
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        // [MOC-96] connect 阶段封顶,避免坏系统代理下连接挂到 overall timeout。
+        .connect_timeout(Duration::from_secs(8))
         .build()
     {
         Ok(client) => client,

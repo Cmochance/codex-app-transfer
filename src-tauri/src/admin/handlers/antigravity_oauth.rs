@@ -130,6 +130,11 @@ pub fn shared_antigravity_http_client() -> Result<&'static reqwest::Client, &'st
     let cell = CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .pool_idle_timeout(std::time::Duration::from_secs(30))
+            // [MOC-96] 原先仅 pool_idle、无 connect/overall 上限,坏系统代理
+            // (Windows)下 token refresh/userinfo 会无限挂。补 connect+overall
+            // 上限;均为短请求(非流式),30s 远高于真实延迟、不误切。
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| {
                 tracing::error!(
