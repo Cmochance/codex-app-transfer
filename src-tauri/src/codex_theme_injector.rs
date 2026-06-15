@@ -1054,8 +1054,11 @@ html.electron-light,html.electron-dark,html{
 background:__BASECOLOR__ url('__HERO__') __POS__ / __FIT__ no-repeat fixed !important;
 }
 body{background:transparent !important;}
-#root > *,.app-shell,.app-shell-main,main.main-surface,.app-shell-main-content-viewport,.app-shell-main-content-frame,[class~="electron:bg-token-main-surface-primary"]{background-color:transparent !important;}
-html main.main-surface{border-radius:0 !important;}
+/* `.main-surface` 用类选择器、不加 `main` 元素限定:Codex settings/archive 页该容器是
+   `<div class="main-surface">`(整页无 `<main>`),元素限定会漏匹配 → 主面板留半透明+圆角 →
+   hover 局部重绘撕裂(MOC-247)。聊天页同名容器一并透明化是预期。 */
+#root > *,.app-shell,.app-shell-main,.main-surface,.app-shell-main-content-viewport,.app-shell-main-content-frame,[class~="electron:bg-token-main-surface-primary"]{background-color:transparent !important;}
+html .main-surface{border-radius:0 !important;}
 /* 可读性 scrim 折进 #root(normal-flow;再叠 position:fixed 层会让 backdrop-filter
    采样时 Page.captureScreenshot 死锁)。从 agent-theme 同步 3 层复合方案 —— 旧单层
    linear(mid 仅 ~0.34)对亮壁纸太弱、文字被壁纸透射压住:(1)顶部 ~42% 阻尼带平衡
