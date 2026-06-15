@@ -212,9 +212,14 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         }
     }
 
-    // tool_choice 规范化
-    if let Some(tc) = body.get("tool_choice") {
-        result.insert("tool_choice".into(), normalize_tool_choice(tc));
+    // tool_choice 规范化 —— **仅当出站确有 tools 时才转发**。[MOC-208] web_search 等
+    // 被 drop 后 tools 可能整体变空(如某轮只带 web_search),此时若仍透传
+    // `tool_choice:"required"/"tool"` 会让上游收到「强制用工具但无工具」的畸形请求
+    // (400)。无 tools 时 tool_choice 无意义,直接不发(等价于上游默认 auto)。
+    if result.contains_key("tools") {
+        if let Some(tc) = body.get("tool_choice") {
+            result.insert("tool_choice".into(), normalize_tool_choice(tc));
+        }
     }
 
     // text.format → response_format

@@ -236,6 +236,8 @@ fn minimax_tool_choice_required_is_downgraded_to_auto() {
         "model": "MiniMax-M2.7",
         "stream": true,
         "input": "hi",
+        // tool_choice 仅在有 tools 时转发(MOC-208),带一个 function 工具以走 M2.x required→auto 降级
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}],
         "tool_choice": {"type": "required"}
     });
     let p = minimax_provider();
@@ -1335,6 +1337,64 @@ fn web_search_dropped_with_no_provider_context() {
     });
     let out = convert(req);
     assert!(out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn forced_tool_choice_dropped_when_web_search_was_only_tool() {
+    // [MOC-208] 某轮只带 web_search + tool_choice=required:web_search 被 drop 后
+    // tools 整体变空,此时绝不能仍透传 tool_choice=required(上游会因「强制用工具但
+    // 无工具」返 400)。tools 缺席时 tool_choice 也必须不发。
+    let p = ws_chat_provider(
+        "kimi-for-coding",
+        "Kimi",
+        "https://api.kimi.com/coding/v1",
+        "kimi-for-coding",
+    );
+    let req = json!({
+        "model": "kimi-for-coding",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"搜一下"}],
+        "tools": [{"type":"web_search"}],
+        "tool_choice": "required"
+    });
+    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+    assert!(
+        out.get("tools").is_none() || out["tools"].as_array().unwrap().is_empty(),
+        "web_search 应被 drop,tools 为空"
+    );
+    assert!(
+        out.get("tool_choice").is_none(),
+        "tools 为空时不应转发 tool_choice(避免畸形 required+无工具);实际:{:?}",
+        out.get("tool_choice")
+    );
+}
+
+#[test]
+fn tool_choice_still_forwarded_when_real_tools_remain() {
+    // 回归保护:web_search 被 drop 但仍有普通 function 工具时,tool_choice 正常转发。
+    let p = ws_chat_provider(
+        "kimi-for-coding",
+        "Kimi",
+        "https://api.kimi.com/coding/v1",
+        "kimi-for-coding",
+    );
+    let req = json!({
+        "model": "kimi-for-coding",
+        "stream": true,
+        "input": [{"type":"message","role":"user","content":"hi"}],
+        "tools": [
+            {"type":"web_search"},
+            {"type":"function","name":"shell","parameters":{"type":"object","properties":{}}}
+        ],
+        "tool_choice": "auto"
+    });
+    let out = responses_body_to_chat_body_for_provider(&req, Some(&p)).unwrap();
+    assert_eq!(out["tools"].as_array().unwrap().len(), 1, "只剩 shell");
+    assert_eq!(
+        out["tool_choice"],
+        json!("auto"),
+        "有 tools 时 tool_choice 正常转发"
+    );
 }
 
 #[test]
@@ -3550,6 +3610,8 @@ fn text_format_reasoning_and_special_fields_follow_legacy_conversion() {
         "service_tier": "priority",
         "modalities": ["text", "audio", "bad"],
         "audio": {"voice": "alloy", "format": "mp3"},
+        // tool_choice 仅在有 tools 时转发(MOC-208),故带一个 function 工具以覆盖 any→required 归一
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}],
         "tool_choice": {"type": "any"}
     }));
     assert_eq!(out["response_format"]["type"], "json_schema");
