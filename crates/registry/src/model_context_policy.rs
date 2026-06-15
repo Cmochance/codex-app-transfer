@@ -49,11 +49,12 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
     }
 }
 
-/// 统一的 1M 判定策略:
+/// 统一的 1M 判定策略(优先级从高到低):
 /// 1. `[1m]` 内部后缀
-/// 2. 文档化 context_window >= 1M
-/// 3. `modelCapabilities[model].supports1m = true/false`
-/// 4. `modelCapabilities[model].context_window >= 1_000_000`
+/// 2. 显式 `modelCapabilities[model].context_window` 数值(权威:>= 1M → true,< 1M → false;
+///    不再 fall through 到 documented,与 `model_catalog::explicit_context_window` 同优先级)
+/// 3. 文档化 context_window >= 1M
+/// 4. `modelCapabilities[model].supports1m = true/false`
 pub fn model_supports_1m(original_model: &str, model_capabilities: Option<&Value>) -> bool {
     if has_internal_one_m_suffix(original_model) {
         return true;
@@ -64,26 +65,30 @@ pub fn model_supports_1m(original_model: &str, model_capabilities: Option<&Value
         return false;
     }
 
-    if documented_context_window(clean_model).is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW) {
-        return true;
-    }
-
-    if let Some(b) = capability_bool(
-        model_capabilities,
-        original_model,
-        clean_model,
-        "supports1m",
-    ) {
-        return b;
-    }
-
-    capability_u64(
+    // [MOC-241] 显式 context_window 数值是最高优先级权威:用户/前端显式声明窗口时直接按它
+    // 判 1M,**不再** fall through 到 documented。否则 documented 对 Gemini 1.5/2/3 先判 1M,
+    // Gemini 1M 开关「关」写的 600000 cap 形同虚设 → apply.rs 的 legacy `model_context_window`
+    // root key 仍写 1M、与 catalog 的 600K 打架(#490 bot review)。与 explicit_context_window 对齐。
+    if let Some(n) = capability_u64(
         model_capabilities,
         original_model,
         clean_model,
         "context_window",
+    ) {
+        return n >= ONE_M_CONTEXT_WINDOW;
+    }
+
+    if documented_context_window(clean_model).is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW) {
+        return true;
+    }
+
+    capability_bool(
+        model_capabilities,
+        original_model,
+        clean_model,
+        "supports1m",
     )
-    .is_some_and(|n| n >= ONE_M_CONTEXT_WINDOW)
+    .unwrap_or(false)
 }
 
 fn capability_bool(
@@ -226,6 +231,20 @@ mod tests {
         assert!(model_supports_1m("custom", Some(&caps)));
         assert!(!model_supports_1m("small", Some(&caps)));
         assert!(model_supports_1m("big", Some(&caps)));
+    }
+
+    #[test]
+    fn explicit_context_window_cap_overrides_documented_1m() {
+        // [MOC-241] Gemini 1M 开关「关」写 context_window=600000:即便 documented 判
+        // gemini-3-pro 为 1M,显式 cap 也让 supports_1m=false —— 使 apply.rs 的 legacy
+        // model_context_window root key 与 catalog 的 600K 一致(#490 bot review)。
+        let capped = json!({"gemini-3-pro": {"context_window": 600000}});
+        assert!(!model_supports_1m("gemini-3-pro", Some(&capped)));
+        // 「开」写 1000000(+supports1m)→ true
+        let full = json!({"gemini-3-pro": {"context_window": 1000000, "supports1m": true}});
+        assert!(model_supports_1m("gemini-3-pro", Some(&full)));
+        // 无显式 cap → 仍按 documented 判 1M(回归保护:不影响未配 cap 的现有 provider)
+        assert!(model_supports_1m("gemini-3-pro", None));
     }
 
     #[test]

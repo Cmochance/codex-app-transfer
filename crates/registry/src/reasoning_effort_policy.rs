@@ -25,10 +25,14 @@
 //! - `compact_thinking_policy` 管 **compact 任务强制 disable thinking**(已开 → 关掉)
 //! - `reasoning_effort_policy` 管 **正常请求按档位映射 thinking**(关 → 按 effort 决定开多深)
 //!
-//! 两表入表证据格式完全对齐,review 友好。compact 路径下两者写**不同 key**
-//! (本 policy 写 `reasoning_effort` / `compact_thinking_policy` 写 `thinking` 或
-//! `enable_thinking`),无论谁先跑都不互踩;`Drop` 集合本身就不写 `reasoning_effort`,
-//! wire 更干净。
+//! 两表入表证据格式完全对齐,review 友好。一般情况下两者写**不同 key**(本 policy 写
+//! `reasoning_effort` / `compact_thinking_policy` 写 `thinking` 或 `enable_thinking`),
+//! `Drop` 集合本身就不写 `reasoning_effort`,wire 更干净。**例外([MOC-241] GLM `none`)**:
+//! 命中 [`crate::reasoning_tiers`] 表的模型(如 GLM)选「不思考」时,[`apply_reasoning_effort`]
+//! 用该模型的 `disable_wire`(GLM = [`crate::compact_thinking_policy::DisableThinkingWire::GlmDual`])
+//! 写顶级 `thinking:{type:disabled}` + 嵌套 `chat_template_kwargs.enable_thinking:false` —— 与
+//! `compact_thinking_policy` 的强制 disable **同向(都是「关」)**、全 `or_insert` 幂等,即便
+//! compact + `none` 同时命中也不互踩。
 //!
 //! ## 入表证据(每条 entry 必须同时满足)
 //!
@@ -45,6 +49,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::reasoning_tiers::reasoning_tiers_for_model;
 use crate::schema::Provider;
 
 /// Codex `reasoning.effort` 转换成上游接受的字段形态.
@@ -308,21 +313,32 @@ pub fn apply_reasoning_effort(
     if codex_effort.is_empty() {
         return;
     }
-    let mut wire = reasoning_effort_wire(provider);
-    // MiniMax-M3 起原生接受 `reasoning_effort`(2026-06-03 真机实测 api.minimaxi.com
-    // 直连:200;M2.x 同字段 400)。即便实测当前档位不改变 M3 思考深度,也按 OpenAI
-    // 规范把客户端意图透传给上游(交由上游决定),不主动剥除。M2.x 仍 Drop(白名单外
-    // 字段会 400)。model 取实际请求体(可能非 provider.default)。
-    if matches!(wire, ReasoningEffortWire::Drop)
-        && provider_matches(provider, "minimax")
-        && body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .is_some_and(|m| m.to_ascii_lowercase().starts_with("minimax-m3"))
+    // [MOC-241] 可选思考档位表([`crate::reasoning_tiers`]):按请求 model 判定(`body["model"]`
+    // 已被 forward.rs 重写成上游 id),与 catalog 层**同一张表**。**命中即由表完全决定 wire、一律
+    // return**,绝不 fall through 到下方 provider-名 keyed 的 `reasoning_effort_wire`(PR #490 bot
+    // review P2:否则 GLM/Qwen 模型挂自定义命名代理会被误写 `reasoning_effort`、DeepSeek 的 `max`
+    // 被 clamp 成 `high`)。命中时:
+    // - 选「不思考」(`none`/`off`/`disabled`)→ 用 `disable_wire` 关思考(`None` = 不可关,no-op);
+    // - 选「思考开」深度档 → 用 `on_tier_wire`(DeepSeek = `HighMax` 写 `reasoning_effort`;
+    //   `None` = 二元 provider GLM/Kimi/Qwen/MiMo/M3 不收 `reasoning_effort`,no-op = 模型默认思考)。
+    if let Some(spec) = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .and_then(reasoning_tiers_for_model)
     {
-        wire = ReasoningEffortWire::OpenAIEnum;
+        if matches!(codex_effort, "none" | "off" | "disabled") {
+            if let Some(wire) = spec.disable_wire {
+                wire.apply_to_map(body);
+            }
+        } else if let Some(wire) = spec.on_tier_wire {
+            wire.apply(body, codex_effort, &provider.id);
+        }
+        return;
     }
-    wire.apply(body, codex_effort, &provider.id);
+    // [MOC-241] MiniMax-M3 / M2.x 已收口到 reasoning_tiers 表(M3 = 二元 none/max:none→thinking.type=
+    // disabled、max→no-op 默认思考;M2.x = SINGLE_MAX 单档 max,disable/on_tier 均 None → 不写),命中即在上方 return,不再走旧的
+    // 「Drop→OpenAIEnum 透传 reasoning_effort」M3 特例。此处仅处理**未入表**的 provider/model。
+    reasoning_effort_wire(provider).apply(body, codex_effort, &provider.id);
 }
 
 #[cfg(test)]
@@ -415,9 +431,187 @@ mod tests {
         assert!(apply("kimi-code", "xhigh").as_object().unwrap().is_empty());
     }
 
+    // ── [MOC-241] GLM 思考档位 wire(reasoning_tiers 表驱动,按 body["model"] 判定)──
+
+    /// 构造带 `model` 的 body 跑 `apply_reasoning_effort`(model-based 查 reasoning_tiers 表)。
+    /// `provider_id` 决定「思考开」深度档 fall-through 到的 `reasoning_effort_wire`:GLM 模型挂
+    /// zhipu provider → Drop = no-op;DeepSeek 模型挂 deepseek provider → HighMax 写 reasoning_effort。
+    fn apply_model(provider_id: &str, model: &str, effort: &str) -> Value {
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String(model.into()));
+        apply_reasoning_effort(&mut body, &provider(provider_id), effort);
+        Value::Object(body)
+    }
+
+    /// body 里除 `model` 外没写任何思考/effort 字段(GLM no-op 档的判据)。
+    fn only_model_left(body: &Value) -> bool {
+        body.get("thinking").is_none()
+            && body.get("chat_template_kwargs").is_none()
+            && body.get("reasoning_effort").is_none()
+    }
+
     #[test]
-    fn zhipu_drops() {
-        assert!(apply("zhipu", "max").as_object().unwrap().is_empty());
+    fn glm_max_is_noop_relies_on_default() {
+        // GLM 默认思考开 → max/xhigh 不写线(故意不发 thinking-ON 信号,防 compact 互踩);
+        // 也绝不写顶级 reasoning_effort(GLM 不收)。
+        for e in ["max", "xhigh"] {
+            assert!(
+                only_model_left(&apply_model("zhipu", "glm-5.1", e)),
+                "GLM effort={e} 应 no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn glm_none_disables_thinking_both_wires() {
+        let body = apply_model("zhipu", "glm-5.1", "none");
+        // ① hosted Z.AI/BigModel 形态
+        assert_eq!(body["thinking"]["type"], "disabled");
+        // ② 自建 vLLM/SGLang 形态
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        // GLM 不收顶级 reasoning_effort
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn glm_keyed_by_model_not_provider() {
+        // PR #490 bot review:表驱动 model-based,GLM 模型挂在任意命名代理(如自建 LiteLLM 网关)
+        // 后面都生效 —— 与 catalog 层同一张表。
+        let p = provider_full("litellm-uuid", "my-litellm-proxy", "https://gw.internal/v1");
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String("glm-5.1".into()));
+        apply_reasoning_effort(&mut body, &p, "none");
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn glm_other_efforts_noop() {
+        // GLM picker 只暴露 none/max;其它档若出现 → 不写,留 GLM 默认(思考开)
+        for e in ["low", "medium", "high", "minimal", "auto"] {
+            assert!(
+                only_model_left(&apply_model("zhipu", "glm-5.1", e)),
+                "GLM effort={e} 应 no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn glm_preserves_user_set_chat_template_kwargs() {
+        // or_insert 最小干预:用户已显式设的同名键不被覆盖
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String("glm-5.1".into()));
+        body.insert(
+            "chat_template_kwargs".into(),
+            json!({"enable_thinking": true, "foo": 1}),
+        );
+        apply_reasoning_effort(&mut body, &provider("custom-proxy"), "none");
+        // 用户已设 enable_thinking:true → or_insert 不覆盖
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["foo"], 1);
+        // 顶级 thinking 仍补上(另一 key,不冲突)
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn legacy_glm4_not_in_table_no_disable() {
+        // legacy GLM-4(不在 reasoning_tiers 表,不支持 thinking 控制)→ none 不触发 disable wire,
+        // 不给不支持的模型发假控制(PR #490 bot review P2)。走 reasoning_effort_wire:zhipu → Drop。
+        let mut body = Map::new();
+        body.insert("model".into(), Value::String("glm-4-plus".into()));
+        apply_reasoning_effort(&mut body, &provider("zhipu"), "none");
+        assert!(
+            body.get("thinking").is_none(),
+            "legacy glm-4 不应写 thinking"
+        );
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    // ── [MOC-241] 其它 chat 思考 provider(reasoning_tiers 表驱动)──
+
+    #[test]
+    fn deepseek_none_disables_then_high_max_via_reasoning_effort() {
+        // none → 顶级 thinking:{type:disabled}(派 A),不写 reasoning_effort
+        let b = apply_model("deepseek", "deepseek-v4-pro", "none");
+        assert_eq!(b["thinking"]["type"], "disabled");
+        assert!(b.get("reasoning_effort").is_none());
+        // high/max(思考开深度档)→ fall through 到 HighMax wire → reasoning_effort
+        assert_eq!(
+            apply_model("deepseek", "deepseek-v4-pro", "high")["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            apply_model("deepseek", "deepseek-v4-flash", "max")["reasoning_effort"],
+            "max"
+        );
+    }
+
+    #[test]
+    fn table_on_tier_keyed_by_model_not_provider_name() {
+        // PR #490 bot review P2:table-hit 模型的 on-tier 由表的 on_tier_wire 决定、绝不 fall through 到
+        // provider-名 keyed wire。即便挂在任意命名代理(非 zhipu/deepseek)后也正确。
+        // GLM 挂自定义代理 + max → no-op(不误写 reasoning_effort,GLM 不收)
+        assert!(
+            apply_model("my-litellm-proxy", "glm-5.1", "max")
+                .get("reasoning_effort")
+                .is_none(),
+            "GLM 挂自定义代理 max 不应写 reasoning_effort"
+        );
+        // DeepSeek 挂自定义代理 + max → reasoning_effort:max(不被 clamp 成 high,#254)
+        assert_eq!(
+            apply_model("my-litellm-proxy", "deepseek-v4-pro", "max")["reasoning_effort"],
+            "max",
+            "DeepSeek 挂自定义代理 max 必须可达 max"
+        );
+    }
+
+    #[test]
+    fn kimi_none_disables_thinking_type_max_noop() {
+        let b = apply_model("kimi", "kimi-k2.6", "none");
+        assert_eq!(b["thinking"]["type"], "disabled");
+        assert!(
+            b.get("chat_template_kwargs").is_none(),
+            "Kimi 走顶级 thinking,不发 chat_template_kwargs"
+        );
+        // max(思考开)→ Drop fall-through → no-op(Kimi 默认思考)
+        assert!(only_model_left(&apply_model("kimi", "kimi-k2.6", "max")));
+    }
+
+    #[test]
+    fn qwen_and_mimo_none_disables_enable_thinking() {
+        let q = apply_model("bailian", "qwen3.6-plus", "none");
+        assert_eq!(q["enable_thinking"], false);
+        assert!(
+            q.get("thinking").is_none(),
+            "Qwen 走顶级 enable_thinking,不发 thinking.type"
+        );
+        let m = apply_model("xiaomi-mimo-payg", "mimo-v2.5-pro", "none");
+        assert_eq!(m["enable_thinking"], false);
+        // max → no-op(默认思考开)
+        assert!(only_model_left(&apply_model(
+            "bailian",
+            "qwen3.6-plus",
+            "max"
+        )));
+    }
+
+    #[test]
+    fn minimax_m3_none_disables_thinking_type() {
+        let b = apply_model("minimax", "minimax-m3", "none");
+        assert_eq!(b["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn minimax_m2_forced_thinking_no_disable_wire() {
+        // M2.x 强制思考、不可关(reasoning_tiers=SINGLE_MAX,单档 max,disable_wire=None):
+        // 选 none 也不写任何 disable 字段,绝不发假控制。
+        let b = apply_model("minimax", "minimax-m2.7", "none");
+        assert!(b.get("thinking").is_none(), "M2.x 不可关,不写 thinking");
+        assert!(b.get("enable_thinking").is_none());
+        assert!(b.get("chat_template_kwargs").is_none());
+        assert!(b.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -455,28 +649,32 @@ mod tests {
     }
 
     #[test]
-    fn minimax_m3_passes_through_reasoning_effort_but_m2_drops() {
-        // 真机实测(2026-06-03,api.minimaxi.com 直连):MiniMax-M3 接受
-        // reasoning_effort(200),M2.x 同字段 400。M3 按 OpenAI 规范透传给上游
-        // (不主动剥),M2.x 仍 Drop。model 取请求体实际值(可能非 provider.default)。
+    fn minimax_m3_and_m2_via_table() {
+        // [MOC-241] M3/M2.x 收口到 reasoning_tiers 表(真机 healed 形态:name MiniMax + minimaxi baseUrl)。
+        // M3 = 二元(none→thinking.type=disabled;high/max→no-op,M3 默认思考,不再透传 reasoning_effort);
+        // M2.x = SINGLE_MAX(单档 max,强制思考不可关,不写任何 disable/effort)。
         let p = provider_full("minimax", "MiniMax", "https://api.minimaxi.com/v1");
 
+        // M3 思考开档(high)→ no-op
         let mut m3 = Map::new();
         m3.insert("model".into(), Value::String("MiniMax-M3".into()));
         apply_reasoning_effort(&mut m3, &p, "high");
-        assert_eq!(
-            m3.get("reasoning_effort").and_then(|v| v.as_str()),
-            Some("high"),
-            "M3 应透传 reasoning_effort=high"
+        assert!(
+            !m3.contains_key("reasoning_effort"),
+            "M3 思考开档 no-op,不透传 reasoning_effort"
         );
+        // M3 none → thinking.type=disabled
+        let mut m3n = Map::new();
+        m3n.insert("model".into(), Value::String("MiniMax-M3".into()));
+        apply_reasoning_effort(&mut m3n, &p, "none");
+        assert_eq!(m3n["thinking"]["type"], "disabled");
 
+        // M2.x 强制思考 → 不写任何 disable/effort
         let mut m2 = Map::new();
         m2.insert("model".into(), Value::String("MiniMax-M2.7".into()));
-        apply_reasoning_effort(&mut m2, &p, "high");
-        assert!(
-            !m2.contains_key("reasoning_effort"),
-            "M2.x 必须 Drop reasoning_effort(白名单外字段会 400)"
-        );
+        apply_reasoning_effort(&mut m2, &p, "none");
+        assert!(!m2.contains_key("reasoning_effort"));
+        assert!(!m2.contains_key("thinking"));
     }
 
     // ─── Fallback (自定义 provider): OpenAI 标准 enum ────────────────────

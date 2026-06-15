@@ -466,11 +466,36 @@
     return normalized;
   }
 
+  // [MOC-241] 保留 supports1m **与** context_window(数值 ≥ 1024)。Gemini 1M 开关把
+  // 600000(默认关)/ 1000000(开)写进 modelCapabilities[model].context_window,后端
+  // explicit_context_window 直接消费;旧逻辑只留 supports1m,会把写入的窗口值在保存/回填
+  // 时静默剥掉(同 api.js mapper「不列即丢」契约)。
   function normalizeCapabilities(capabilities = {}) {
     if (!capabilities || typeof capabilities !== "object") return {};
-    return Object.fromEntries(Object.entries(capabilities).filter(([, value]) => (
-      value && typeof value === "object" && value.supports1m === true
-    )));
+    const out = {};
+    for (const [modelId, value] of Object.entries(capabilities)) {
+      if (!value || typeof value !== "object") continue;
+      const entry = {};
+      if (value.supports1m === true) entry.supports1m = true;
+      const cw = Number(value.context_window);
+      if (Number.isFinite(cw) && cw >= 1024) entry.context_window = Math.trunc(cw);
+      if (Object.keys(entry).length > 0) out[modelId] = entry;
+    }
+    return out;
+  }
+
+  // [MOC-241] Gemini 1M 上下文开关。开=完整 1M,关(默认)=封顶 600K → 后端 auto_compact
+  // 在 480K 触发,稳在用户实测的 ~500K 指令遵循悬崖以下。仅作用于 Gemini,不碰其它 provider。
+  const GEMINI_1M_CONTEXT = 1000000;
+  const GEMINI_CAPPED_CONTEXT = 600000;
+
+  // 只匹配后端 documented_context_window 判 1M 的 Gemini 文本世代(gemini-1.5 / 2.x / 3.x /
+  // pro-agent,排除 image),避免给老世代 / 图像模型误写窗口(explicit 优先级最高,会反向抬高)。
+  function isGemini1mModelId(modelId) {
+    const m = String(modelId || "").trim().toLowerCase();
+    if (!m || m.includes("image")) return false;
+    return m.startsWith("gemini-1.5") || m.startsWith("gemini-2")
+      || m.startsWith("gemini-3") || m.startsWith("gemini-pro-agent");
   }
 
   const EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"];
@@ -662,6 +687,56 @@
     return Object.fromEntries(Object.entries(normalizeCapabilities(formModelCapabilities)).filter(([modelId]) => (
       usedModelIds.has(modelId)
     )));
+  }
+
+  // [MOC-241] 当前映射里命中的 1M-世代 Gemini 模型(开关只对它们写窗口)。
+  function mappedGemini1mModels(mappings = collectProviderMappings()) {
+    return [...new Set(Object.values(mappings || {}).filter(Boolean))].filter(isGemini1mModelId);
+  }
+
+  // [MOC-241] Gemini 1M 开关的 provider-wide 意图(不随换 model 丢失)。表单打开时重置(新建 false)/
+  // 回填(编辑按已存 cap 推断);change listener 更新。**不**用 per-model 派生勾选态 —— 否则开启后换
+  // Gemini 模型,新 id 在 formModelCapabilities 无 cap 会被误取消、保存写回 600K,丢失用户选择(#490 bot review)。
+  let gemini1mOptIn = false;
+
+  // provider 含 1M-世代 Gemini 模型时才显示开关。勾选态取自 gemini1mOptIn(provider-wide 意图),并把意图
+  // 同步写进当前映射的 gemini 模型(remap 后新模型也拿到正确 cap)。在 renderPresetOptions(映射变化 /
+  // 编辑回填 / 新增重置都会调)里调用。
+  function updateGemini1mRow(mappings = collectProviderMappings()) {
+    const row = $("#providerGemini1mRow");
+    if (!row) return;
+    const geminiModels = mappedGemini1mModels(mappings);
+    row.hidden = geminiModels.length === 0;
+    const checkbox = $("#providerGemini1m");
+    if (!checkbox || row.hidden) return;
+    checkbox.checked = gemini1mOptIn;
+    applyGemini1mCapabilities(formModelCapabilities, mappings);
+  }
+
+  // 按已存 capabilities 推断 1M 意图(编辑回填用):任一 gemini 模型 context_window ≥ 1M → 开。
+  function deriveGemini1mOptIn(caps, mappings) {
+    const c = normalizeCapabilities(caps || {});
+    return mappedGemini1mModels(mappings).some(
+      (id) => Number(c[id]?.context_window) >= GEMINI_1M_CONTEXT,
+    );
+  }
+
+  // 保存时把开关状态写进待存 capabilities:开 → 1M + supports1m;关 → 600K(并清掉 supports1m
+  // 保持 legacy model_context_window 与 catalog 一致)。仅 Gemini provider(开关可见)生效。
+  function applyGemini1mCapabilities(caps, mappings) {
+    const row = $("#providerGemini1mRow");
+    if (!row || row.hidden || !mappings) return;
+    const on = !!$("#providerGemini1m")?.checked;
+    for (const modelId of mappedGemini1mModels(mappings)) {
+      const entry = { ...(caps[modelId] || {}) };
+      entry.context_window = on ? GEMINI_1M_CONTEXT : GEMINI_CAPPED_CONTEXT;
+      if (on) {
+        entry.supports1m = true;
+      } else {
+        delete entry.supports1m;
+      }
+      caps[modelId] = entry;
+    }
   }
 
   function formMappingRowsFromMappings(mappings = {}) {
@@ -1016,6 +1091,8 @@
   }
 
   function renderPresetOptions(preset = null, mappings = null) {
+    // [MOC-241] Gemini 1M 开关跟映射联动:每次重渲染都按当前映射刷新可见性 + 勾选态。
+    updateGemini1mRow(normalizeMappings(mappings || collectProviderMappings()));
     const container = $("#providerPresetOptions");
     if (!container) return;
     const modelOptions = preset?.modelOptions && typeof preset.modelOptions === "object"
@@ -1097,13 +1174,18 @@
   function providerPayloadFromForm(includeModels = true) {
     const apiKey = $("#providerApiKey").value.trim();
     const mappings = includeModels ? collectProviderMappings() : null;
+    const modelCapabilities = mappings
+      ? capabilitiesForCurrentMappings(mappings)
+      : normalizeCapabilities(formModelCapabilities);
+    // [MOC-241] Gemini 1M 开关:把 context_window(开 1M / 关 600K)写进待存 capabilities。
+    applyGemini1mCapabilities(modelCapabilities, mappings);
     const payload = {
       name: $("#providerName").value.trim(),
       baseUrl: $("#providerBaseUrl").value.trim(),
       authScheme: $("#providerAuth").value,
       apiFormat: formApiFormatValue,
       extraHeaders: selectedPreset?.extraHeaders || {},
-      modelCapabilities: mappings ? capabilitiesForCurrentMappings(mappings) : normalizeCapabilities(formModelCapabilities),
+      modelCapabilities,
       requestOptions: normalizeRequestOptions(formRequestOptions),
     };
     if (apiKey) {
@@ -2219,6 +2301,7 @@
     selectedPreset = null;
     providerAvailableModels = [];
     baseUrlMenuOpen = false;
+    gemini1mOptIn = false; // [MOC-241] 新建态:Gemini 1M 开关意图复位为关
     renderPresetOptions(null);
     updatePresetSelection();
     formModelCapabilities = {};
@@ -2272,6 +2355,17 @@
     setOauthRowState(preset.apiFormat); // P2.2 OAuth UI 切换
     setGrokWebRowState(preset.apiFormat); // R1 PR-7 grok_web UI 切换
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
+    // [MOC-241] 预设自带的 Gemini context_window(=1M)不当作用户选择 —— 否则选 Google AI Studio /
+    // Gemini CLI / Antigravity 预设直接保存就持久化 1M、违反「Gemini 1M 开关默认关」(#490 bot review)。
+    // 清掉 → 开关默认关(updateGemini1mRow 读不到 ≥1M);用户显式开启经 change listener 写回 1M。
+    for (const id of Object.keys(formModelCapabilities)) {
+      const cap = formModelCapabilities[id];
+      if (isGemini1mModelId(id) && cap && typeof cap === "object") {
+        delete cap.context_window;
+        if (Object.keys(cap).length === 0) delete formModelCapabilities[id];
+      }
+    }
+    gemini1mOptIn = false; // [MOC-241] 新建/预设:Gemini 1M 开关默认关
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     setMimoLoginRow(false, false, null); // 选 preset(新建态)无 provider.id,隐藏登录 row
     providerAvailableModels = [];
@@ -2297,6 +2391,8 @@
         requestOptions: provider.requestOptions || {},
       };
     formModelCapabilities = normalizeCapabilities(provider.modelCapabilities || selectedPreset.modelCapabilities || {});
+    // [MOC-241] 编辑已存 provider:按已保存的 gemini context_window 推断 1M 开关意图(≥1M → 开)。
+    gemini1mOptIn = deriveGemini1mOptIn(formModelCapabilities, provider.mappings || {});
     formRequestOptions = normalizeRequestOptions(provider.requestOptions || selectedPreset.requestOptions || {});
     setProviderFormMode("providersAdd.editTitle");
     $("#providerName").value = provider.name;
@@ -8316,6 +8412,12 @@
         // R1 PR-7:切换 apiFormat 时同步 OAuth / grok_web row 显隐
         setOauthRowState(event.target.value);
         setGrokWebRowState(event.target.value);
+      }
+      // [MOC-241] Gemini 1M 开关:更新 provider-wide 意图 + 写进 formModelCapabilities(当前映射的
+      // gemini 模型)。意图变量保证后续换 model / 重渲染不丢失用户选择。
+      if (event.target.id === "providerGemini1m") {
+        gemini1mOptIn = !!event.target.checked;
+        applyGemini1mCapabilities(formModelCapabilities, collectProviderMappings());
       }
     });
 

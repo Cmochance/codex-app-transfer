@@ -19,7 +19,8 @@
 
 use codex_app_transfer_registry::{
     documented_context_window, load_raw_config, model_supports_1m, normalize_model_mappings,
-    save_raw_config, strip_internal_model_suffix, CAS_BASE_INSTRUCTIONS, MODEL_SLOTS,
+    reasoning_tiers_for_model, save_raw_config, strip_internal_model_suffix, ReasoningTierSpec,
+    CAS_BASE_INSTRUCTIONS, MODEL_SLOTS,
 };
 use serde_json::{json, Value};
 
@@ -65,6 +66,12 @@ pub struct CatalogModel {
     /// 复用主模型(实测默认行为)。值取自该 provider 已配置(映射非空)的槽位,复用其
     /// 现有 proxy 映射,不引入重复映射 / 降级。
     pub auto_review_model_override: Option<String>,
+    /// [MOC-241] 该 entry 映射的上游模型在 [`reasoning_tiers_for_model`] 表里的「可选思考档位」
+    /// 规格:`Some` = 该模型有自定义档位(如 GLM → `none`/`max` 两档),`None` = 用 Codex 模板
+    /// 自带默认档位。`Some` 时 [`model_to_json`] 用它覆盖 entry 的 `supported_reasoning_levels` +
+    /// `default_reasoning_level`。catalog 与 wire 层(`registry::reasoning_effort_policy`)共用同一
+    /// 张表,保证 picker 显档与 `none` 关思考一致(不漂移)。
+    pub reasoning_spec: Option<&'static ReasoningTierSpec>,
 }
 
 pub fn upsert_catalog_models(
@@ -301,6 +308,9 @@ fn catalog_model(
         context_window,
         effective_context_window_percent: DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         auto_review_model_override,
+        // [MOC-241] 按上游真实 model id(target,= 该 slot 映射的模型)查可选思考档位表
+        //(与 wire 层 registry::reasoning_effort_policy 同一张表,逐 slot 精确)。
+        reasoning_spec: reasoning_tiers_for_model(target),
     }
 }
 
@@ -346,6 +356,22 @@ fn model_to_json(model: &CatalogModel) -> Value {
     // catalog slug 跑工具审查(实测脱钩主模型);None 不写 = 复用主模型(默认行为)。
     if let Some(ref slug) = model.auto_review_model_override {
         entry["auto_review_model_override"] = Value::String(slug.clone());
+    }
+    // [MOC-241] 该模型在 reasoning_tiers 表里有自定义档位 → 用表里的 levels + default 覆盖模板默认档
+    //(GLM/Kimi/Qwen/MiMo none/max、DeepSeek none/high/max、Gemini/MiniMax-M2.x 单档 max)。主标签由
+    // Codex 按 effort 本地化(中文 UI ≈「无思考 / 最大思考」),不另做 CDP/asar 注入;effort 取自 Codex
+    // 闭合枚举 {none..max},合法。**思考固定模型用单档 `max`(非空档位)**:空档位会被 Codex composer
+    // 的 `xp()` 兜底成残留「Medium」标签(去不掉除非 CDP,MOC-241 实证),单档 max 有真实档+默认反而干净。
+    if let Some(spec) = model.reasoning_spec {
+        entry["supported_reasoning_levels"] = Value::Array(
+            spec.levels
+                .iter()
+                .map(|l| json!({"effort": l.effort, "description": l.description}))
+                .collect(),
+        );
+        if let Some(default_level) = spec.default_level {
+            entry["default_reasoning_level"] = Value::String(default_level.to_owned());
+        }
     }
     entry
 }
@@ -623,6 +649,7 @@ mod tests {
             context_window: 258_400,
             effective_context_window_percent: 95,
             auto_review_model_override: None,
+            reasoning_spec: None,
         };
         assert_eq!(
             model_to_json(&non_builtin)["base_instructions"],
@@ -648,6 +675,7 @@ mod tests {
             context_window: 258_400,
             effective_context_window_percent: 95,
             auto_review_model_override: None,
+            reasoning_spec: None,
         };
         let entry = model_to_json(&non_builtin);
 
@@ -1163,5 +1191,112 @@ mod tests {
             .any(|m| m["slug"] == "gpt-5.5"));
         let _typed: codex_app_transfer_registry::Config =
             serde_json::from_value(v).expect("top-level models must not break registry config");
+    }
+
+    // ── [MOC-241] GLM 等二元思考模型:reasoning 档位收敛为 none + max ──
+
+    #[test]
+    fn glm_model_catalog_uses_none_max_two_tier() {
+        // GLM provider:catalog entry 的 reasoning 收敛成 Codex 原生 none + max,
+        // default = max(GLM 默认思考开)。标签交给 Codex 本地化,这里只验 wire 值。
+        let models = catalog_models_for_provider("智谱 GLM", "glm-5.1", false, None, None);
+        let entry = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        assert_eq!(entry["default_reasoning_level"], "max");
+        let efforts: Vec<&str> = entry["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(efforts, vec!["none", "max"], "GLM 应只显示 none + max 两档");
+    }
+
+    #[test]
+    fn glm_reasoning_is_per_slot_by_model_id() {
+        // 按 model id 逐 slot 判定:同 provider 内 GLM slot 收敛两档,非 GLM slot 保留多档。
+        let mappings = json!({
+            "default": "glm-5.1",
+            "gpt_5_5": "glm-4.7",
+            "gpt_5_4": "deepseek-v4-pro"
+        });
+        let models = catalog_models_for_provider("Mixed", "glm-5.1", false, Some(&mappings), None);
+        let glm = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        let non_glm = model_to_json(models.iter().find(|m| m.slug == "gpt-5.4").unwrap());
+        assert_eq!(glm["default_reasoning_level"], "max");
+        assert_eq!(
+            glm["supported_reasoning_levels"].as_array().unwrap().len(),
+            2
+        );
+        // deepseek slot 保留 Codex 模板多档(>2),且 default 不被改成 max
+        assert!(
+            non_glm["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len()
+                > 2
+        );
+        assert_ne!(non_glm["default_reasoning_level"], "max");
+    }
+
+    /// catalog 里 gpt-5.5 槽(= default_model)entry 的 supported_reasoning_levels effort 列表。
+    fn catalog_tiers(default_model: &str) -> Vec<String> {
+        let models = catalog_models_for_provider("P", default_model, false, None, None);
+        let entry = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        entry["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["effort"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn model_not_in_table_keeps_codex_multitier_reasoning() {
+        // 不在 reasoning_tiers 表的模型 → Codex 默认 4 档(模板自带)
+        assert_eq!(
+            catalog_tiers("some-custom-llm-x"),
+            ["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn deepseek_catalog_three_tier_default_high() {
+        assert_eq!(catalog_tiers("deepseek-v4-pro"), ["none", "high", "max"]);
+        let models = catalog_models_for_provider("DeepSeek", "deepseek-v4-pro", false, None, None);
+        let entry = model_to_json(models.iter().find(|m| m.slug == "gpt-5.5").unwrap());
+        assert_eq!(entry["default_reasoning_level"], "high");
+    }
+
+    #[test]
+    fn binary_thinking_providers_catalog_two_tier() {
+        // GLM / Kimi / Qwen / MiMo / MiniMax-M3 → none + max
+        for m in [
+            "glm-5.1",
+            "kimi-k2.6",
+            "qwen3.6-plus",
+            "mimo-v2.5-pro",
+            "minimax-m3",
+        ] {
+            assert_eq!(catalog_tiers(m), ["none", "max"], "{m}");
+        }
+    }
+
+    #[test]
+    fn single_max_catalog_one_tier_default_max() {
+        // 思考必开、不暴露可切档的模型(MiniMax-M2.x + Gemini 全系)→ 单档 max:catalog 写
+        // supported_reasoning_levels=[max] + default_reasoning_level=max。单档(非空)有真实档 + 默认 →
+        // Codex composer 的 xp() 返 max、**不残留「Reasoning / Medium」标签**(空档位会被 Codex 兜底成
+        // 残留 medium、去不掉除非 CDP,见 reasoning_tiers::SINGLE_MAX doc + MOC-241 CDP 实证)。
+        for m in [
+            "minimax-m2.7",
+            "gemini-3-pro",
+            "gemini-3.5-flash-low",
+            "gemini-pro-agent",
+        ] {
+            assert_eq!(catalog_tiers(m), ["max"], "{m} 应单档 max");
+            let models = catalog_models_for_provider("P", m, false, None, None);
+            let entry = model_to_json(models.iter().find(|x| x.slug == "gpt-5.5").unwrap());
+            assert_eq!(entry["default_reasoning_level"], "max", "{m}");
+        }
     }
 }
