@@ -30,9 +30,19 @@ fn provider_kind(provider: &Value) -> &'static str {
         "novita"
     } else if probe.contains("stepfun") || probe.contains("step") {
         "stepfun"
-    } else if probe.contains("moonshot") {
-        // Kimi (月之暗面) PAYG:baseUrl 含 `api.moonshot.cn`/`.ai`。**只认 `moonshot` 不认 `kimi`**:
-        // 订阅制 `kimi-code`(`api.kimi.com/coding`)不含 `moonshot`、是另一个 provider,不在此列。
+    } else if provider
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .map(|u| {
+            let u = u.to_ascii_lowercase();
+            u.contains("moonshot.cn") || u.contains("moonshot.ai")
+        })
+        .unwrap_or(false)
+    {
+        // Kimi (月之暗面) PAYG:**按 baseUrl host 判定**(`api.moonshot.cn`/`.ai`),不认 name 子串
+        // —— 防一个名字含 "moonshot" 但 baseUrl 是自定义代理的 provider 被误判、把 key 发到官方端点
+        // (与 injector 侧 `active_moonshot_provider` 的 host gate 对齐)。订阅制 `kimi-code`
+        // (`api.kimi.com/coding`)host 非 moonshot,不匹配。
         "moonshot"
     } else {
         "unknown"
@@ -97,7 +107,7 @@ fn money_item(
     })
 }
 
-fn normalize_balance_payload(kind: &str, payload: &Value) -> Vec<Value> {
+fn normalize_balance_payload(kind: &str, payload: &Value, endpoint: &str) -> Vec<Value> {
     if kind == "deepseek" {
         let mut items = Vec::new();
         for item in payload
@@ -138,21 +148,26 @@ fn normalize_balance_payload(kind: &str, payload: &Value) -> Vec<Value> {
 
     if kind == "moonshot" {
         // 响应:{"code":0,"data":{"available_balance":..,"voucher_balance":..,"cash_balance":..}}.
-        // available = 可用余额(= cash + voucher)。响应无币种字段 → 这里默认按 .cn 记 CNY(国际站
-        // .ai 罕用);Codex UI 实时显示那条会按 host 推币种符号(见 moonshot_quota)。
+        // available = 可用余额(= cash + voucher)。响应无币种字段 → 按 endpoint host 推币种
+        // (`.ai`→USD,其余 `.cn`→CNY),与 injector 侧 moonshot_quota 的符号推断保持一致。
+        let unit = if endpoint.contains("moonshot.ai") {
+            "USD"
+        } else {
+            "CNY"
+        };
         let data = payload.get("data").unwrap_or(payload);
         let Some(obj) = data.as_object() else {
             return Vec::new();
         };
         let mut items = Vec::new();
         if let Some(avail) = float_or_none(obj.get("available_balance")) {
-            items.push(money_item("balance", Some(avail), None, None, "CNY"));
+            items.push(money_item("balance", Some(avail), None, None, unit));
         }
         if let Some(cash) = float_or_none(obj.get("cash_balance")) {
-            items.push(money_item("cash", Some(cash), None, None, "CNY"));
+            items.push(money_item("cash", Some(cash), None, None, unit));
         }
         if let Some(voucher) = float_or_none(obj.get("voucher_balance")) {
-            items.push(money_item("voucher", Some(voucher), None, None, "CNY"));
+            items.push(money_item("voucher", Some(voucher), None, None, unit));
         }
         return items;
     }
@@ -259,7 +274,7 @@ async fn query_provider_usage_impl(provider: &Value) -> Value {
             });
         }
     };
-    let items = normalize_balance_payload(kind, &payload);
+    let items = normalize_balance_payload(kind, &payload, &endpoint);
     let ok = !items.is_empty();
     let message = if ok {
         "query complete"
@@ -344,6 +359,7 @@ mod tests {
                     "topped_up_balance": "1.5"
                 }]
             }),
+            "",
         );
         assert_eq!(deepseek[0]["label"], json!("CNY"));
         assert_eq!(deepseek[0]["remaining"], json!(8.5));
@@ -353,6 +369,7 @@ mod tests {
         let openrouter = normalize_balance_payload(
             "openrouter",
             &json!({"data": {"total_credits": 12.0, "total_usage": 5.25}}),
+            "",
         );
         assert_eq!(openrouter[0]["label"], json!("credits"));
         assert_eq!(openrouter[0]["remaining"], json!(6.75));
@@ -361,6 +378,7 @@ mod tests {
         let generic = normalize_balance_payload(
             "siliconflow",
             &json!({"data": {"availableBalance": "3.25", "totalBalance": "4", "usedBalance": "0.75", "currency": "CNY"}}),
+            "",
         );
         assert_eq!(generic[0]["remaining"], json!(3.25));
         assert_eq!(generic[0]["total"], json!(4.0));
@@ -384,6 +402,12 @@ mod tests {
         assert_eq!(provider_kind(&kimi_code), "unknown");
         assert!(balance_endpoint(&kimi_code).is_none());
 
+        // 名字含 "moonshot" 但 baseUrl 是自定义代理(非官方 host)→ 仍 unknown、不发 key 到官方端点
+        // (host gate,非 name 子串;对应 bot P2 thread 1)。
+        let renamed = json!({"name": "my moonshot proxy", "baseUrl": "https://api.example.com/v1"});
+        assert_eq!(provider_kind(&renamed), "unknown");
+        assert!(balance_endpoint(&renamed).is_none());
+
         // 国际站 .ai → 切到 api.moonshot.ai 端点。
         let kimi_intl = json!({"name": "Moonshot", "baseUrl": "https://api.moonshot.ai/v1"});
         let (_, endpoint) = balance_endpoint(&kimi_intl).expect("moonshot.ai endpoint");
@@ -392,13 +416,15 @@ mod tests {
 
     #[test]
     fn moonshot_balance_normalizes_available_and_breakdown() {
+        let payload = json!({
+            "code": 0,
+            "data": {"available_balance": 49.58, "voucher_balance": 46.58, "cash_balance": 3.0},
+            "status": true
+        });
         let items = normalize_balance_payload(
             "moonshot",
-            &json!({
-                "code": 0,
-                "data": {"available_balance": 49.58, "voucher_balance": 46.58, "cash_balance": 3.0},
-                "status": true
-            }),
+            &payload,
+            "https://api.moonshot.cn/v1/users/me/balance",
         );
         assert_eq!(items[0]["label"], json!("balance"));
         assert_eq!(items[0]["remaining"], json!(49.58));
@@ -408,7 +434,15 @@ mod tests {
         assert_eq!(items[2]["label"], json!("voucher"));
         assert_eq!(items[2]["remaining"], json!(46.58));
 
+        // .ai endpoint → 币种标 USD(对应 bot P2 thread 2:不再硬编码 CNY)。
+        let intl = normalize_balance_payload(
+            "moonshot",
+            &payload,
+            "https://api.moonshot.ai/v1/users/me/balance",
+        );
+        assert_eq!(intl[0]["unit"], json!("USD"));
+
         // 缺 available_balance → 空(ok=false,前端显「暂未识别到余额」)。
-        assert!(normalize_balance_payload("moonshot", &json!({"data": {}})).is_empty());
+        assert!(normalize_balance_payload("moonshot", &json!({"data": {}}), "").is_empty());
     }
 }
