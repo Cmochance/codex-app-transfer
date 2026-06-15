@@ -361,8 +361,12 @@ fn model_to_json(model: &CatalogModel) -> Value {
     // - 非空 levels(如 GLM none/max、DeepSeek none/high/max):picker 显这些档,主标签由 Codex 自身
     //   按 effort 本地化(中文 UI ≈「无思考 / 最大思考」),不另做 CDP/asar 注入;effort 取自 Codex
     //   闭合枚举 {none..max},合法。
-    // - **空 levels(强制思考不可关,如 MiniMax-M2.x):写 `supported_reasoning_levels: []` 让 Codex
-    //   隐藏 reasoning picker**(空档位不渲染可选项);此时无 default(留模板默认,反正 picker 隐藏)。
+    // - **空 levels(隐藏 reasoning,如 MiniMax-M2.x / Gemini):写 `supported_reasoning_levels: []`
+    //   去掉可选项,**并清掉模板带的 `default_reasoning_level` + 关 `supports_reasoning_summaries`**。
+    //   仅置空 levels 不够 —— Codex composer 的 effort 解析 `xp()`(app.asar models-and-reasoning-
+    //   efforts)是 `supportedReasoningEfforts.has(cur) ? cur : (defaultReasoningEffort ?? levels[0] ??
+    //   null)`:levels 空但 default 在 → 仍回落 default(实测显示残留「Reasoning / Medium」标签)。
+    //   只有 **levels 空 且 default 缺失** 才返回 null = 彻底不渲染 reasoning UI(MOC-241 CDP 实证)。
     if let Some(spec) = model.reasoning_spec {
         entry["supported_reasoning_levels"] = Value::Array(
             spec.levels
@@ -370,7 +374,12 @@ fn model_to_json(model: &CatalogModel) -> Value {
                 .map(|l| json!({"effort": l.effort, "description": l.description}))
                 .collect(),
         );
-        if let Some(default_level) = spec.default_level {
+        if spec.levels.is_empty() {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.remove("default_reasoning_level");
+            }
+            entry["supports_reasoning_summaries"] = json!(false);
+        } else if let Some(default_level) = spec.default_level {
             entry["default_reasoning_level"] = Value::String(default_level.to_owned());
         }
     }
@@ -1284,10 +1293,29 @@ mod tests {
 
     #[test]
     fn forced_thinking_catalog_hides_picker() {
-        // MiniMax-M2.x 强制思考不可关 → 空 supported_reasoning_levels(Codex 隐藏 picker)
-        assert!(
-            catalog_tiers("minimax-m2.7").is_empty(),
-            "M2.x 应空档位(隐藏 picker)"
-        );
+        // MiniMax-M2.x / Gemini 隐藏 reasoning → 空 supported_reasoning_levels **且** 清掉
+        // 模板带的 default_reasoning_level + 关 supports_reasoning_summaries。仅空档位不够:
+        // Codex composer 的 xp() 在 supported 空但 default 在时仍回落 default → 残留「Medium」标签;
+        // 只有 default 也缺失 xp() 才返 null = 彻底不渲染 reasoning UI(MOC-241 CDP 实证)。
+        for m in ["minimax-m2.7", "gemini-3-pro", "gemini-3.5-flash-low"] {
+            let models = catalog_models_for_provider("P", m, false, None, None);
+            let entry = model_to_json(models.iter().find(|x| x.slug == "gpt-5.5").unwrap());
+            assert!(
+                entry["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "{m} 应空档位(隐藏 picker)"
+            );
+            assert!(
+                entry.get("default_reasoning_level").is_none(),
+                "{m} 应清掉 default_reasoning_level(让 xp() 返 null、不渲染 effort 标签)"
+            );
+            assert_eq!(
+                entry["supports_reasoning_summaries"],
+                json!(false),
+                "{m} 应关 reasoning summaries"
+            );
+        }
     }
 }

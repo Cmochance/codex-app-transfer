@@ -2340,6 +2340,16 @@
     setOauthRowState(preset.apiFormat); // P2.2 OAuth UI 切换
     setGrokWebRowState(preset.apiFormat); // R1 PR-7 grok_web UI 切换
     formModelCapabilities = normalizeCapabilities(preset.modelCapabilities || {});
+    // [MOC-241] 预设自带的 Gemini context_window(=1M)不当作用户选择 —— 否则选 Google AI Studio /
+    // Gemini CLI / Antigravity 预设直接保存就持久化 1M、违反「Gemini 1M 开关默认关」(#490 bot review)。
+    // 清掉 → 开关默认关(updateGemini1mRow 读不到 ≥1M);用户显式开启经 change listener 写回 1M。
+    for (const id of Object.keys(formModelCapabilities)) {
+      const cap = formModelCapabilities[id];
+      if (isGemini1mModelId(id) && cap && typeof cap === "object") {
+        delete cap.context_window;
+        if (Object.keys(cap).length === 0) delete formModelCapabilities[id];
+      }
+    }
     formRequestOptions = normalizeRequestOptions(preset.requestOptions || {});
     setMimoLoginRow(false, false, null); // 选 preset(新建态)无 provider.id,隐藏登录 row
     providerAvailableModels = [];
