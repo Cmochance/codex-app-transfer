@@ -142,6 +142,9 @@ pub(super) fn normalize_imported_config(data: &Value) -> Result<Value, String> {
             "gatewayApiKey",
             "providers",
             "settings",
+            // 整合模式全局标准档映射:导入备份时一并保留,否则整合开着却丢了所有映射、
+            // 退回单 provider 直到用户手动重建(#477 bot review P2)。
+            "poolSlotMappings",
         ] {
             if let Some(value) = source_obj.get(key) {
                 obj.insert(key.to_owned(), value.clone());

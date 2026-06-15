@@ -386,10 +386,23 @@ pub fn pool_slot_entries(
         else {
             continue;
         };
+        let real = strip_internal_model_suffix(model);
+        // target model 还必须在该 provider **当前可选池**里(下池 curation 删模型 / 换上游
+        // 把 pooledModels 置空后,旧映射会变陈旧)→ 否则跳过,避免 catalog/resolver 继续把标准档
+        // 暴露 / 路由到已被删除的模型(#477 bot review P2)。pooled_model_ids 已含「缺省回退槽位
+        // 映射」语义,与前端 effectivePoolModels 的候选来源一致。
+        let provider = &providers[idx];
+        let pool_ids = pooled_model_ids(
+            provider.extra.get("pooledModels"),
+            serde_json::to_value(&provider.models).ok().as_ref(),
+        );
+        if !pool_ids.iter().any(|m| m == &real) {
+            continue;
+        }
         entries.push(PoolEntry {
             provider_idx: idx,
             slug: openai_id.to_owned(),
-            real_model: strip_internal_model_suffix(model),
+            real_model: real,
             supports_one_m: has_internal_one_m_suffix(model),
         });
     }
@@ -531,8 +544,11 @@ mod tests {
 
     #[test]
     fn pool_slot_entries_maps_standard_slots_to_valid_pool_targets() {
-        let a = mk_provider("deepseek", "DeepSeek"); // pooledEnabled=true
-        let b = mk_provider("kimi", "Kimi");
+        let mut a = mk_provider("deepseek", "DeepSeek"); // pooledEnabled=true
+        a.extra
+            .insert("pooledModels".into(), json!(["deepseek-v4-pro"]));
+        let mut b = mk_provider("kimi", "Kimi");
+        b.extra.insert("pooledModels".into(), json!(["kimi-k2.6"]));
         let mut excluded = mk_provider("x", "X");
         excluded.extra.insert("pooledEnabled".into(), json!(false));
         let providers = vec![a, b, excluded];
@@ -540,6 +556,7 @@ mod tests {
             "gpt_5_5": {"provider": "deepseek", "model": "deepseek-v4-pro"},
             "gpt_5_4": {"provider": "kimi", "model": "kimi-k2.6[1m]"},
             "gpt_5_4_mini": {"provider": "x", "model": "whatever"}, // x 未加入整合 → 跳过
+            "gpt_5_3_codex": {"provider": "deepseek", "model": "not-in-pool"}, // 不在池 → 跳过
             "gpt_5_2": {"provider": "deepseek", "model": ""}        // model 空 → 跳过
         });
         let entries = pool_slot_entries(&providers, Some(&mappings));
@@ -561,6 +578,10 @@ mod tests {
         assert!(
             !by_slug.contains_key("gpt-5.4-mini"),
             "excluded provider 不产条目"
+        );
+        assert!(
+            !by_slug.contains_key("gpt-5.3-codex"),
+            "model 不在该 provider 当前池 → 不产条目(stale 映射)"
         );
         assert!(!by_slug.contains_key("gpt-5.2"), "空 model 不产条目");
         assert!(!by_slug.contains_key("default"), "default 非标准档不产条目");
