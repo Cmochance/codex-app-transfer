@@ -113,8 +113,40 @@ async fn responses_websocket_handler(
     State(state): State<ProxyState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // [followup MOC-239] **native responses provider** + ws→ws 透传关(默认)→ 对 WS upgrade 回
+    // **426 Upgrade Required**。Codex(codex-rs `core/src/client.rs::stream_responses_websocket`,
+    // 实证 @ codex-rs main 2026-06 / Codex Desktop 0.140;**未版本锁定**,Codex 改 fallback 策略则此
+    // 假设失效)对 WS 握手的 426 **立即**返回 `WebsocketStreamOutcome::FallbackToHttp`(无重试,置
+    // `disable_websockets` 整 session 黏住),转走 HTTP `/responses` transport —— Codex 原生把
+    // `previous_response_id` inline 成自包含请求(prev_id=null + 完整上下文),免 proxy 端上下文重建、
+    // 免 5/5 reconnect。这就是「让 Codex 自己降级 HTTP」的正解。
+    //
+    // **chat 类 provider**(openai_chat 等)仍接受 WS 走 ws→http 逐帧转换([`forward_chat_frame`]:
+    // responses-WS 帧转 chat-HTTP,`core::input` 从本地 ResponseSessionCache inline 历史)—— 它们没有
+    // passthrough prev_id 问题,保持现状。ws→ws ON 时所有 provider 都升级走 [`responses_websocket_loop`]
+    // (native → 全程 relay,供 followup 对支持 WS 的端点验证)。解析不出 provider → 不拦,照常 upgrade。
+    if !responses_ws_passthrough_enabled() {
+        if let Some(resolved) = resolve_provider_for_ws(&state, &headers, &serde_json::json!({})) {
+            if is_native_responses_provider(&resolved) {
+                // 留痕:否则「Codex 为何降级 HTTP」在诊断日志里无迹可循(决策点静默)。
+                crate::telemetry::proxy_telemetry().logs.add(
+                    "INFO",
+                    format!(
+                        "[responses-ws] native provider {} → WS upgrade 回 426,Codex 降级 HTTP transport(CAS_RESPONSES_WS_PASSTHROUGH 未开)",
+                        resolved.provider.id
+                    ),
+                );
+                return (
+                    axum::http::StatusCode::UPGRADE_REQUIRED,
+                    "native responses websocket passthrough disabled; fall back to HTTP",
+                )
+                    .into_response();
+            }
+        }
+    }
     ws.on_upgrade(move |socket| responses_websocket_loop(socket, state, headers))
+        .into_response()
 }
 
 async fn responses_websocket_loop(mut socket: WebSocket, state: ProxyState, headers: HeaderMap) {
@@ -150,18 +182,25 @@ async fn responses_websocket_loop(mut socket: WebSocket, state: ProxyState, head
             continue;
         }
 
-        // 首个 response.create:解析 provider。native responses → 交给全程 WS relay(原始首帧
-        // 一并交出,relay 内原样发上游),relay 接管 socket,本 loop 退出。解析失败 / 非 responses
-        // → 固定走 chat 的 ws→http 转换。warmup/空帧的判定留在 chat 路径(WS relay 透传一切)。
+        // 首个 response.create:解析 provider。native responses **且** ws→ws 透传开关开启(默认关,
+        // 见 [`responses_ws_passthrough_enabled`])→ 交给全程 WS relay(原始首帧一并交出,relay 接管
+        // socket,本 loop 退出)。否则(默认 / 非 responses / 解析失败)走 ws→http 转换
+        // ([`forward_chat_frame`]):responses-WS 帧转 HTTP POST `/responses`,SSE 回灌 WS。
+        //
+        // [followup MOC-239] freemodel 等 **AWS ALB 后端**对 HTTP/1.1 WS Upgrade 一律 426、对 h2
+        // extended CONNECT(RFC 8441)400,原生 ws→ws relay 实证不可达 → 默认走 ws→http;ws→ws 待对
+        // 支持的端点(chatgpt.com)实现 + 验证后再 flip 默认 / 按 provider 决策。
         if !chat_decided {
-            let body = extract_response_create_body(&message_json);
-            if let Some(resolved) = resolve_provider_for_ws(&state, &headers, &body) {
-                if is_native_responses_provider(&resolved) {
-                    crate::ws_passthrough::proxy_responses_upstream_ws(
-                        socket, resolved, headers, message,
-                    )
-                    .await;
-                    return;
+            if responses_ws_passthrough_enabled() {
+                let body = extract_response_create_body(&message_json);
+                if let Some(resolved) = resolve_provider_for_ws(&state, &headers, &body) {
+                    if is_native_responses_provider(&resolved) {
+                        crate::ws_passthrough::proxy_responses_upstream_ws(
+                            socket, resolved, headers, message,
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
             chat_decided = true;
@@ -235,6 +274,17 @@ fn is_native_responses_provider(resolved: &crate::resolver::ResolvedProvider) ->
     matches!(
         resolved.provider.api_format.as_str(),
         "responses" | "openai_responses"
+    )
+}
+
+/// native responses 是否走 **ws→ws 全程透传**(env `CAS_RESPONSES_WS_PASSTHROUGH=1`/`true`)。
+/// **默认关** = 走 ws→http 转换。[followup MOC-239] 上游(freemodel 等 ALB 后端)的 WS 端点实证
+/// 不可达(HTTP/1.1 Upgrade → 426、h2 extended CONNECT → 400),原生 relay 暂禁用;待对支持 WS 的
+/// 端点实现 + 验证后再 flip 默认。开关保留以便 followup 用 chatgpt.com 等真 WS 端点测透传链路。
+fn responses_ws_passthrough_enabled() -> bool {
+    matches!(
+        std::env::var("CAS_RESPONSES_WS_PASSTHROUGH").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
     )
 }
 

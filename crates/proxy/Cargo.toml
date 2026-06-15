@@ -26,18 +26,19 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 # 且 0.13 的 rustls 不再自带根证书、需显式加 webpki-roots。
 reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2", "socks", "system-proxy"] }
 reqwest-websocket = "0.6"
-# [MOC-234] responses provider 上游 WS 透传用 tokio-tungstenite(Codex 同款 WS 栈)——
-# reqwest-websocket 借 reqwest 连接机制、经代理握手会把域名预解析成 fake-ip 致 426;
-# tokio-tungstenite 自管连接(手动 HTTP-CONNECT 时发域名让代理端解析)。`client_async_tls`
-# 用 rustls + webpki-roots 在隧道流上做 TLS+WS 握手。remote-control 仍用 reqwest-websocket。
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
-# [MOC-234] 经 VPN 代理建上游 WS 隧道走 SOCKS5(proxy 端解析域名,绕开客户端 fake-ip)——
-# 实测 HTTP-CONNECT 隧道对部分上游会卡住/426,SOCKS 能到达真实端点(websocat 验证)。
+# [MOC-234] responses provider 上游 WS relay 用 tokio-tungstenite(Codex 同款 WS 栈):用其 WS 帧
+# 编解码运行时(`WebSocketStream::from_raw_socket` 在已建立的 TLS 流上收发帧)+ 消息类型,连接 /
+# TLS / 握手全自管(TLS 走 tokio-rustls,见 ws_passthrough.rs),不用 tokio-tungstenite 自带 TLS,
+# 故无需 TLS feature。remote-control 仍用 reqwest-websocket。[followup MOC-239] 该 relay 默认禁用
+# (上游 ALB WS 实证不可达),保留待验证。
+tokio-tungstenite = "0.29"
+# [MOC-234] 经 VPN 代理建上游 WS 隧道走 SOCKS5(proxy 端解析域名,绕开客户端 fake-ip)。
 tokio-socks = "0.5"
-# [MOC-234] rustls 0.23 进程级 CryptoProvider:依赖树里 aws-lc-rs(reqwest)+ ring
-# (tokio-tungstenite)同在 → 无法自动选,client_async_tls 做 TLS 会 panic。启动时显式装
-# aws-lc-rs(与 reqwest 上游转发一致)。default-features=false + aws_lc_rs 仅取该 provider。
+# [MOC-234] rustls 0.23 进程级 CryptoProvider:依赖树有多个 backend 候选时无法自动选,做 TLS
+# (tokio-rustls)前必须显式装 aws-lc-rs(与 reqwest 上游转发一致),否则 panic。
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+webpki-roots = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

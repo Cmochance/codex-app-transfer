@@ -23,18 +23,27 @@
 //!
 //! PoC 已验证传输层完全打通:reqwest 0.13 + http1_only 连 wss://chatgpt.com 过 CF
 //! (cf-ray 放行无 challenge)、过系统代理、http1.1 WS upgrade 到达 OpenAI 应用层。
+//!
+//! ## [MOC-234 / followup MOC-239] responses provider 上游 WS relay(**默认禁用**)
+//! 本模块还含一条 native responses provider 的全程 WS relay([`proxy_responses_upstream_ws`] /
+//! [`relay_manual`]):Codex-WS ↔ 上游-WS,经 SOCKS5(VPN 代理)+ 手搓 TLS([`tls_connect`],
+//! tokio-rustls)+ 手搓 WS 握手([`from_raw_socket`](WebSocketStream::from_raw_socket) 收发帧)。
+//! **实证**:freemodel 等 AWS ALB 后端对 HTTP/1.1 WS Upgrade 一律 426、对 h2 extended CONNECT 400,
+//! proxy 重发的握手不可达 → 该 relay **默认关**,native responses 改由 [`crate::server`] 对 WS
+//! upgrade 回 426 让 Codex 自降级 HTTP。relay 仅在 `CAS_RESPONSES_WS_PASSTHROUGH=1` 时启用,留待
+//! MOC-239 对支持 WS 的端点验证。remote-control 那半(上方)走 reqwest-websocket,与此互不影响。
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message as AxMessage, WebSocket};
 use axum::http::HeaderMap;
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::{CloseCode, Message as UpMessage, Upgrade, WebSocket as UpWebSocket};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as TungCloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame as TungCloseFrame;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame as TungCloseFrame, Role};
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tokio_tungstenite::WebSocketStream;
 
@@ -204,14 +213,6 @@ pub async fn proxy_responses_upstream_ws(
         close_client(client_socket, "bad upstream base url").await;
         return;
     };
-    telemetry.logs.add(
-        "INFO",
-        format!(
-            "[responses-ws] upgrade → {upstream_url}(provider {})",
-            resolved.provider_id
-        ),
-    );
-
     let Some((host, port)) = parse_ws_target(&upstream_url) else {
         telemetry.logs.add(
             "WARN",
@@ -220,56 +221,63 @@ pub async fn proxy_responses_upstream_ws(
         close_client(client_socket, "bad upstream ws url").await;
         return;
     };
+    let path = ws_path(&upstream_url);
+    telemetry.logs.add(
+        "INFO",
+        format!(
+            "[responses-ws] upgrade → {upstream_url}(provider {})",
+            resolved.provider_id
+        ),
+    );
 
-    // 构造 WS 握手请求:`into_client_request` 生成 Sec-WebSocket-* / Upgrade / Connection / Host,
-    // 再叠加要透传的 Codex 头 + 鉴权。tungstenite 与 axum 同用 http 1.x,HeaderName/Value 直接复用。
-    let mut request = match upstream_url.as_str().into_client_request() {
-        Ok(r) => r,
-        Err(e) => {
-            telemetry
-                .logs
-                .add("WARN", format!("[responses-ws] 构造握手请求失败: {e}"));
-            close_client(client_socket, "bad ws request").await;
-            return;
-        }
-    };
-    {
-        let h = request.headers_mut();
-        // 透传 Codex 握手头(OpenAI-Beta: responses_websockets / x-codex-* 等);跳过 gateway
-        // authorization(下面单独处理)+ WS 协议握手头(tungstenite 自己生成)。收集名字(不含值)
-        // 便于诊断上游 4xx 时缺哪个头。
-        let mut forwarded_names: Vec<&str> = Vec::new();
-        for (k, v) in handshake_headers.iter() {
-            if should_forward_responses_ws_header(k.as_str()) {
-                h.insert(k.clone(), v.clone());
-                forwarded_names.push(k.as_str());
+    // 收集非-WS 头(Codex 真实头值 + 鉴权)。手搓握手里(见 [`relay_manual`])排布逐字节复刻
+    // Codex 真实握手(tcpdump 实证):WS 握手头(Host/Connection/Upgrade/Sec-WebSocket-*)在**前**,
+    // 这些自定义头在中间,`sec-websocket-extensions: permessage-deflate` 在**最后**。
+    let mut headers: Vec<(String, String)> = Vec::new();
+    // 鉴权放自定义头块最前(整块仍在 WS 握手头之后,见上):第三方注入 provider 凭据;
+    // chatgpt.com(key 空)透传 Codex token。
+    if resolved.api_key.is_empty() {
+        if let Some(auth) = handshake_headers.get(axum::http::header::AUTHORIZATION) {
+            if let Ok(v) = auth.to_str() {
+                headers.push(("authorization".to_string(), v.to_string()));
             }
         }
-        // 鉴权:第三方 provider(api_key 非空)注入 provider 凭据;chatgpt.com relay(api_key 空、
-        // 用 Codex 账号 token)透传 Codex 自带的 authorization。
-        if resolved.api_key.is_empty() {
-            if let Some(auth) = handshake_headers.get(axum::http::header::AUTHORIZATION) {
-                h.insert(axum::http::header::AUTHORIZATION, auth.clone());
+    } else {
+        match resolved.auth_scheme {
+            AuthScheme::XApiKey => {
+                headers.push(("x-api-key".to_string(), resolved.api_key.clone()))
             }
-        } else {
-            insert_responses_upstream_auth(h, &resolved);
+            _ => headers.push((
+                "authorization".to_string(),
+                format!("Bearer {}", resolved.api_key),
+            )),
         }
-        // provider.extra_headers(已做 {apiKey} 模板替换)叠加。
-        for (k, v) in resolved.extra_headers.iter() {
-            h.insert(k.clone(), v.clone());
-        }
-        telemetry.logs.add(
-            "INFO",
-            format!(
-                "[responses-ws] 转发 Codex 握手头: [{}]",
-                forwarded_names.join(", ")
-            ),
-        );
     }
+    // Codex 真实握手头(跳过 authorization + WS 握手头);记名字便于诊断。
+    let mut forwarded_names: Vec<String> = Vec::new();
+    for (k, v) in handshake_headers.iter() {
+        if should_forward_responses_ws_header(k.as_str()) {
+            if let Ok(val) = v.to_str() {
+                headers.push((k.as_str().to_string(), val.to_string()));
+                forwarded_names.push(k.as_str().to_string());
+            }
+        }
+    }
+    for (k, v) in resolved.extra_headers.iter() {
+        if let Ok(val) = v.to_str() {
+            headers.push((k.as_str().to_string(), val.to_string()));
+        }
+    }
+    telemetry.logs.add(
+        "INFO",
+        format!(
+            "[responses-ws] 转发 Codex 握手头: [{}]",
+            forwarded_names.join(", ")
+        ),
+    );
 
-    // 建到上游的隧道:有 VPN 代理(见 [`vpn_http_proxy`])走 **SOCKS5**(proxy 端解析域名拿真实
-    // IP,绕开客户端 fake-ip —— 实测 HTTP-CONNECT 隧道对部分上游卡住/426,SOCKS 能到达真实
-    // 端点);无代理直连。隧道流交给 [`relay_upstream`] 做 TLS+WS 握手 + 双向 relay。
+    // 建到上游的隧道:有 VPN 代理(见 [`vpn_http_proxy`])走 SOCKS5(proxy 端解析域名拿真实 IP,
+    // 绕开客户端 fake-ip);无代理直连。隧道流交给 [`relay_manual`] 做 TLS + 手搓握手 + 双向 relay。
     match vpn_http_proxy() {
         Some(proxy) => {
             let Some((ph, pp)) = parse_authority(&proxy) else {
@@ -284,11 +292,10 @@ pub async fn proxy_responses_upstream_ws(
                 "INFO",
                 format!("[responses-ws] 经 SOCKS5 代理 {ph}:{pp} → {host}:{port}"),
             );
-            // target 用域名(非预解析 IP)→ SOCKS5h 语义,proxy 端解析。
             match tokio_socks::tcp::Socks5Stream::connect((ph.as_str(), pp), (host.as_str(), port))
                 .await
             {
-                Ok(s) => relay_upstream(client_socket, request, s, first_frame).await,
+                Ok(s) => relay_manual(client_socket, host, path, headers, s, first_frame).await,
                 Err(e) => {
                     telemetry
                         .logs
@@ -298,7 +305,7 @@ pub async fn proxy_responses_upstream_ws(
             }
         }
         None => match TcpStream::connect((host.as_str(), port)).await {
-            Ok(s) => relay_upstream(client_socket, request, s, first_frame).await,
+            Ok(s) => relay_manual(client_socket, host, path, headers, s, first_frame).await,
             Err(e) => {
                 telemetry
                     .logs
@@ -309,36 +316,98 @@ pub async fn proxy_responses_upstream_ws(
     }
 }
 
-/// 在已建立的明文隧道流(SOCKS5 / 直连)上做 TLS+WS 握手(`client_async_tls`,rustls+webpki-roots),
-/// 发首帧,再 [`tung_pump`] 双向 relay。握手 / 写首帧失败 → 给 Codex 发 Close。泛型适配两种流类型。
-async fn relay_upstream<S>(
+/// TLS(tokio-rustls + webpki-roots)+ **手搓 WS 握手**(WS 头在前、自定义头居中、permessage-deflate
+/// extensions 在后,逐字节复刻 Codex 真实握手;`http` HeaderMap 控制不了顺序,故手写字节)+
+/// `from_raw_socket` 收发帧。握手非 101 → 给 Codex 发 Close + 日志状态码。`headers` 为自定义头
+/// (含鉴权,**不含** WS 握手头与 extensions)。
+async fn relay_manual<S>(
     client_socket: WebSocket,
-    request: axum::http::Request<()>,
+    host: String,
+    path: String,
+    headers: Vec<(String, String)>,
     stream: S,
     first_frame: AxMessage,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let telemetry = proxy_telemetry();
-    let mut upstream = match tokio_tungstenite::client_async_tls(request, stream).await {
-        Ok((ws, _resp)) => ws,
+    let mut tls = match tls_connect(&host, stream).await {
+        Ok(t) => t,
         Err(e) => {
-            // tungstenite Error::Http 的 Display 含状态码(如 401/426),便于定位鉴权 vs 路由。
             telemetry
                 .logs
-                .add("WARN", format!("[responses-ws] 上游 WS 握手失败: {e}"));
-            close_client(client_socket, "upstream ws handshake failed").await;
+                .add("WARN", format!("[responses-ws] 上游 TLS 失败: {e}"));
+            close_client(client_socket, "upstream tls failed").await;
             return;
         }
     };
+    let wskey = random_ws_key();
+    // 逐字节复刻 Codex 真实握手排布(tcpdump 实证):WS 握手头在**前**,然后自定义头(鉴权 +
+    // Codex 真实头值),`sec-websocket-extensions` 放**最后**。freemodel 网关校验「带 x-codex-* 的
+    // Codex 客户端必须也带 permessage-deflate offer」—— 漏了当假 Codex 拒 426。这里只 offer,
+    // 是否真压缩看上游 101 响应是否回 `Sec-WebSocket-Extensions`(见下方响应头日志)。
+    let mut req = format!("GET {path} HTTP/1.1\r\n");
+    req.push_str(&format!(
+        "Host: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {wskey}\r\n"
+    ));
+    for (k, v) in &headers {
+        req.push_str(k);
+        req.push_str(": ");
+        req.push_str(v);
+        req.push_str("\r\n");
+    }
+    req.push_str("sec-websocket-extensions: permessage-deflate; client_max_window_bits\r\n\r\n");
+    if tls.write_all(req.as_bytes()).await.is_err() {
+        telemetry
+            .logs
+            .add("WARN", "[responses-ws] 写握手失败".to_string());
+        close_client(client_socket, "upstream write failed").await;
+        return;
+    }
+    let (status, head) = match read_http_status(&mut tls).await {
+        Ok(s) => s,
+        Err(e) => {
+            telemetry
+                .logs
+                .add("WARN", format!("[responses-ws] 读握手响应失败: {e}"));
+            close_client(client_socket, "upstream handshake read failed").await;
+            return;
+        }
+    };
+    // 诊断:记上游握手响应的状态行 + **白名单头**(看 101 + 是否回 Sec-WebSocket-Extensions=接受压缩)。
+    // 只记状态行 / sec-websocket-* / cf-ray / content-type —— 避免把 Set-Cookie(CF/ALB 会话 cookie)、
+    // 鉴权头等凭据级敏感值写进诊断日志。
+    let safe_head = head
+        .lines()
+        .filter(|line| {
+            let low = line.to_ascii_lowercase();
+            low.starts_with("http/")
+                || low.starts_with("sec-websocket-")
+                || low.starts_with("cf-ray")
+                || low.starts_with("content-type")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    telemetry
+        .logs
+        .add("INFO", format!("[responses-ws] 上游握手响应: {safe_head}"));
+    if status != 101 {
+        telemetry.logs.add(
+            "WARN",
+            format!("[responses-ws] 上游 WS 握手失败 status {status}"),
+        );
+        close_client(client_socket, "upstream ws handshake non-101").await;
+        return;
+    }
     telemetry.logs.add(
         "INFO",
-        "[responses-ws] 上游 WS 建立,首帧发送 + 双向 relay 开始".to_string(),
+        "[responses-ws] 上游 WS 建立(101),首帧 + 双向 relay 开始".to_string(),
     );
+    let mut upstream = WebSocketStream::from_raw_socket(tls, Role::Client, None).await;
     if upstream.send(ax_to_tung(first_frame)).await.is_err() {
         telemetry
             .logs
-            .add("WARN", "[responses-ws] 首帧写上游失败,收束".to_string());
+            .add("WARN", "[responses-ws] 首帧写上游失败".to_string());
         close_client(client_socket, "upstream write failed").await;
         return;
     }
@@ -346,6 +415,87 @@ async fn relay_upstream<S>(
     telemetry
         .logs
         .add("INFO", "[responses-ws] relay 结束,通道关闭".to_string());
+}
+
+/// tokio-rustls TLS connect(webpki-roots 根证书,SNI=host)。进程级 OnceLock 复用 ClientConfig。
+async fn tls_connect<S>(
+    host: &str,
+    stream: S,
+) -> std::io::Result<tokio_rustls::client::TlsStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    });
+    let connector = tokio_rustls::TlsConnector::from(config.clone());
+    let sni = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad sni: {e}"))
+    })?;
+    connector.connect(sni, stream).await
+}
+
+/// 读 HTTP 响应头(到 `\r\n\r\n`),返回 (状态码, 完整响应头原文)。流随后停在帧数据起点
+/// (供 `from_raw_socket`)。响应头原文供诊断(看 `Sec-WebSocket-Extensions` 上游是否接受压缩)。
+async fn read_http_status<S>(stream: &mut S) -> std::io::Result<(u16, String)>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    loop {
+        if stream.read(&mut byte).await? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "上游在握手期间关闭",
+            ));
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 16384 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "握手响应头过大",
+            ));
+        }
+    }
+    let head = String::from_utf8_lossy(&buf).into_owned();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "无法解析状态行"))?;
+    Ok((status, head))
+}
+
+/// 随机 16 字节 base64 Sec-WebSocket-Key(避免 RFC 示例值被 WAF 当扫描器拉黑)。
+fn random_ws_key() -> String {
+    use base64::Engine;
+    let mut kb = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut kb);
+    }
+    base64::engine::general_purpose::STANDARD.encode(kb)
+}
+
+/// 从 `ws(s)://authority/path...` 取 path(含 query);无 path → `/`。
+fn ws_path(ws_url: &str) -> String {
+    let after = ws_url.split_once("://").map(|(_, r)| r).unwrap_or(ws_url);
+    match after.find('/') {
+        Some(i) => after[i..].to_string(),
+        None => "/".to_string(),
+    }
 }
 
 /// 由 provider 的 `upstream_base`(http/https)构造上游 Responses WS URL:scheme 换
@@ -363,26 +513,6 @@ fn responses_ws_url(upstream_base: &str) -> Option<String> {
         return None;
     };
     Some(format!("{swapped}/responses"))
-}
-
-/// responses 上游 WS 握手鉴权注入(仅 api_key 非空时调):`x_api_key` scheme → `x-api-key`,
-/// 其余(Bearer 及第三方默认)→ `Authorization: Bearer <key>`。OAuth/Google 类 scheme 不会进
-/// responses 分支(那是 gemini/antigravity,api_format 非 responses)。值非法(含换行等)则跳过。
-fn insert_responses_upstream_auth(h: &mut axum::http::HeaderMap, resolved: &ResolvedProvider) {
-    match resolved.auth_scheme {
-        AuthScheme::XApiKey => {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&resolved.api_key) {
-                h.insert(axum::http::HeaderName::from_static("x-api-key"), v);
-            }
-        }
-        _ => {
-            if let Ok(v) =
-                axum::http::HeaderValue::from_str(&format!("Bearer {}", resolved.api_key))
-            {
-                h.insert(axum::http::header::AUTHORIZATION, v);
-            }
-        }
-    }
 }
 
 /// 从代理 URL 取 `host`/`port`(剥 scheme + userinfo + path)。无显式端口 → None(.env 的代理

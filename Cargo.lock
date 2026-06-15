@@ -1039,9 +1039,11 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-socks",
  "tokio-tungstenite",
  "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
