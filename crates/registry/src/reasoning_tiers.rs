@@ -25,6 +25,7 @@
 //! Budget)与 Grok、moonshot-v1-* 留默认,另行处理。
 
 use crate::compact_thinking_policy::DisableThinkingWire;
+use crate::reasoning_effort_policy::ReasoningEffortWire;
 
 /// picker 里的一个可选思考档位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +46,13 @@ pub struct ReasoningTierSpec {
     /// 选「不思考」(`none`/`off`/`disabled`)档时往上游发的关思考 wire;`None` = 该模型**不可关**
     /// 思考(强制),compact 也不注入 disable。
     pub disable_wire: Option<DisableThinkingWire>,
+    /// 选「思考开」的深度档(非 disable 档,如 DeepSeek `high`/`max`)时怎么写 `reasoning_effort`:
+    /// `Some(wire)` = 用该 wire 写(DeepSeek = `HighMax`;**按 model 定,不看 provider 名**);
+    /// `None` = no-op(二元思考 provider:GLM/Kimi/Qwen/MiMo/M3 不收 `reasoning_effort`,「开」即模型默认)。
+    /// **table 命中即由本字段决定 on-tier wire,绝不 fall through 到 provider-名 keyed 的
+    /// `reasoning_effort_wire`**(PR #490 bot review P2:否则 GLM/Qwen 挂自定义代理会被误写
+    /// `reasoning_effort`、DeepSeek 的 `max` 被 clamp 成 `high`)。
+    pub on_tier_wire: Option<ReasoningEffortWire>,
 }
 
 const TIER_NONE: ReasoningTier = ReasoningTier {
@@ -66,6 +74,7 @@ static GLM_TWO_TIER: ReasoningTierSpec = ReasoningTierSpec {
     levels: &[TIER_NONE, TIER_MAX],
     default_level: Some("max"),
     disable_wire: Some(DisableThinkingWire::GlmDual),
+    on_tier_wire: None,
 };
 
 /// DeepSeek V4(pro/flash):`none` + `high` + `max`(官方 reasoning_effort 有 high/max 两档,
@@ -75,6 +84,8 @@ static DEEPSEEK_TIERS: ReasoningTierSpec = ReasoningTierSpec {
     levels: &[TIER_NONE, TIER_HIGH, TIER_MAX],
     default_level: Some("high"),
     disable_wire: Some(DisableThinkingWire::ThinkingTypeDisabled),
+    // 深度档 high/max → reasoning_effort:high/max(HighMax 按 model 定,不看 provider 名)
+    on_tier_wire: Some(ReasoningEffortWire::HighMax),
 };
 
 /// 二元 + 顶级 `thinking:{type:disabled}` 关思考:Kimi K2 全系 + MiniMax-M3。
@@ -83,6 +94,7 @@ static BINARY_THINKING_TYPE: ReasoningTierSpec = ReasoningTierSpec {
     levels: &[TIER_NONE, TIER_MAX],
     default_level: Some("max"),
     disable_wire: Some(DisableThinkingWire::ThinkingTypeDisabled),
+    on_tier_wire: None,
 };
 
 /// 二元 + 顶级 `enable_thinking:false` 关思考:阿里云百炼 Qwen 3.x + 小米 MiMo v2.x。
@@ -91,6 +103,7 @@ static BINARY_ENABLE_THINKING: ReasoningTierSpec = ReasoningTierSpec {
     levels: &[TIER_NONE, TIER_MAX],
     default_level: Some("max"),
     disable_wire: Some(DisableThinkingWire::EnableThinkingFalse),
+    on_tier_wire: None,
 };
 
 /// **强制思考、不可关**(如 MiniMax-M2.x):空档位 → 隐藏 picker;无 disable wire。
@@ -98,6 +111,7 @@ static FORCED_HIDDEN: ReasoningTierSpec = ReasoningTierSpec {
     levels: &[],
     default_level: None,
     disable_wire: None,
+    on_tier_wire: None,
 };
 
 /// model id(自动 trim + lowercase)→ 可选思考档位规格;`None` = 无特殊档位(用 Codex 默认 4 档)。
