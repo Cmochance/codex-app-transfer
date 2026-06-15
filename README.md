@@ -154,6 +154,8 @@ Codex 的 `low/medium/high/xhigh` 在各 chat-completions 上游的处理方式(
 | **Kimi / Kimi Code / GLM / 阿里云百炼 / Xiaomi MiMo / MiniMax** | 不传字段 | 不传字段 | 上游不认 `reasoning_effort`,用自家默认 thinking;如需控制在 `requestOptions` 写 provider-native 字段 |
 | **自定义 chat-compat** | clamp 到 `"high"` | 同名透传 | OpenAI 标准 enum 保守 fallback |
 
+**GLM 选择器显示原生两档(MOC-241)**:GLM 系列(`glm-*`)在 Codex 模型选择器显示 Codex 原生 `none`(不思考)+ `max`(最高)两档 —— 对齐 GLM 的二元思考开关(无 `low/medium/high` 深度档)—— 替代默认 4 档。这是选择器**显示层**(写进 model catalog);wire 上的 `reasoning_effort` 处理不变(GLM 仍丢弃该字段,见上表)。档位标签沿用 Codex 自身本地化文案,不做注入。
+
 ## 模型映射
 
 Codex APP 按 OpenAI 模型名提示;第三方 provider 用 `deepseek-v4-pro` / `kimi-k2.6` / `glm-5.1` / `gemini-3-pro` 等真实 ID。
