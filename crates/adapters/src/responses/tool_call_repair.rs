@@ -55,17 +55,15 @@ pub fn rebuild_orphan_context_bytes(body: &[u8]) -> Option<Bytes> {
         .filter(|s| !s.is_empty())?
         .to_owned();
 
-    let history = global_passthrough_observe_store().assemble_chain(&prev_id);
-    if history.is_empty() {
-        // 观测 store 没记到该链 → 拼不了完整上下文,只补 function_call 也无意义(上游仍无
-        // 会话上下文),不重试。**优雅降级**:原 orphan-400 照常 surface,无损坏。可能原因:
-        // proxy 重启 / 首轮 / 跨 provider 边界;或上一轮记录的**异步竞态**——观测记录已移出流式
-        // 热路径(防卡顿/闪烁)到独立 task,理论上本轮(N+1)orphan 重写可能早于上一轮(N)的
-        // task 落库。但 orphan-400 只在上游**拒绝 N+1**(一整个网络往返 + 上游处理后)才触发,
-        // 而 task 喂的是 client 已消费的同批 chunk、微秒级即落库,远早于该 400 回来 → 竞态仅在
-        // runtime 饿死整个 N+1 往返时才命中,且命中也仅本次不自愈(下一轮链已补齐)。
-        return None;
-    }
+    // 只取**完整链**(回溯到真正链根 prev_id=None、中途无缺环)才能安全 inline + 去 prev_id 重发;
+    // 拿不到完整链 → None,不重试,**优雅降级**:原 orphan-400 照常 surface,无损坏。可能原因:
+    // 观测 store 没记到该链 / **断链**(proxy 重启 / 首轮 / 跨 provider 边界 / TTL·MAX_TURNS 顶出早期
+    // 轮)/ 非 responses body。reviewer:断链尾段**不能**当完整去 inline,否则带缺失早期上下文重试会
+    // 让上游从错误任务续写。或上一轮记录的**异步竞态**——观测记录已移出流式热路径到独立 task,理论上
+    // 本轮(N+1)orphan 重写可能早于上一轮(N)的 task 落库;但 orphan-400 只在上游**拒绝 N+1**(整个
+    // 网络往返 + 上游处理后)才触发,task 喂的是 client 已消费的同批 chunk、微秒级落库,远早于该 400
+    // 回来 → 竞态仅在 runtime 饿死整个 N+1 往返时命中,且命中也仅本次不自愈(下一轮链已补齐)。
+    let history = global_passthrough_observe_store().assemble_chain_complete(&prev_id)?;
 
     let current_input = v
         .get("input")

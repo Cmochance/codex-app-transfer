@@ -101,28 +101,38 @@ impl ResponseMapper for ResponsesPassthroughMapper {
         _provider: &Provider,
         request_plan: &RequestPlan,
     ) -> Result<ResponsePlan, AdapterError> {
-        // [MOC-234] **上游非 2xx → 合规 `response.failed` SSE**,绝不裸传错误体。
-        // 实测原生 Responses 上游(及第三方反代)报错常返 HTTP 4xx/5xx + JSON error body
-        // (甚至 `content-type: text/event-stream` 但 body 不是 SSE 帧)。流式 `/responses`
-        // 请求下,Codex 客户端等不到 SSE 终止事件 → 卡 Thinking、错误不显示。这里复用
-        // 与 chat/grok/gemini 同一套 `core::failure_stream`,把上游错误转成
-        // `response.created` + `response.failed`(HTTP 写 200,Codex 据 response.failed
-        // 渲染错误并按 code fail-fast / retry),与转换路径的报错对接一致。**仅错误路径,
-        // 成功流仍 1:1 字节直透。**
+        // [MOC-234] **上游非 2xx → 合规 `response.failed` SSE**,绝不裸传错误体 —— **仅限流式
+        // `/responses` create 请求**(body `stream:true`)。实测原生 Responses 上游(及第三方反代)
+        // 报错常返 HTTP 4xx/5xx + JSON error body(甚至 `content-type: text/event-stream` 但 body
+        // 不是 SSE 帧)。流式下 Codex 客户端等不到 SSE 终止事件 → 卡 Thinking、错误不显示。这里复用
+        // 与 chat/grok/gemini 同一套 `core::failure_stream`,把上游错误转成 `response.created` +
+        // `response.failed`(HTTP 写 200,Codex 据 response.failed 渲染并按 code fail-fast / retry)。
+        //
+        // reviewer:**非流式**(`stream:false` 的 JSON)/ **子路径**(`/responses/{id}/cancel` 等)
+        // 请求,客户端期望的是 JSON 错误体,包成 SSE 200 反让其误判成功 → 这类**原样回灌**上游错误
+        // (status + headers + body 1:1)。**成功流亦 1:1 字节直透。**
         if !upstream_status.is_success() {
-            let mut headers = HeaderMap::with_capacity(2);
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            if request_is_streaming(request_plan) {
+                let mut headers = HeaderMap::with_capacity(2);
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                return Ok(ResponsePlan {
+                    status: StatusCode::OK,
+                    headers,
+                    stream: crate::core::failure_stream::convert_upstream_error_stream(
+                        upstream_status,
+                        upstream_stream,
+                        "resp_passthrough_error".to_owned(),
+                        classify_passthrough_error_status(upstream_status.as_u16()),
+                        "upstream",
+                    ),
+                });
+            }
+            // 非流式 / 子路径:原样回灌上游错误,不包 SSE(否则破坏 JSON 错误语义)。
             return Ok(ResponsePlan {
-                status: StatusCode::OK,
-                headers,
-                stream: crate::core::failure_stream::convert_upstream_error_stream(
-                    upstream_status,
-                    upstream_stream,
-                    "resp_passthrough_error".to_owned(),
-                    classify_passthrough_error_status(upstream_status.as_u16()),
-                    "upstream",
-                ),
+                status: upstream_status,
+                headers: upstream_headers,
+                stream: upstream_stream,
             });
         }
 
@@ -178,11 +188,18 @@ fn build_observe_metadata(client_path: &str, body: &Bytes) -> Option<Value> {
     }
     let parsed: Value = serde_json::from_slice(body).ok()?;
 
-    let input_items: Vec<Value> = parsed
-        .get("input")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    // `input` 可为 array(item 列表)或 plain string(等价单条 user 文本)。reviewer:string 形态
+    // 旧版当无 input items → 镜像只记 output,后续 orphan 重建 / breakdown 丢掉本轮用户 prompt。
+    // 统一把 string 规整成一条 user message item 记入镜像(与 array 形态等价)。
+    let input_items: Vec<Value> = match parsed.get("input") {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::String(text)) => vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }]
+        })],
+        _ => Vec::new(),
+    };
     let prev_id = parsed
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -235,6 +252,16 @@ struct ObserveCtx {
     prev_id: Option<String>,
     /// 本轮 input items(供 response 侧拿到 response_id 后连同 output 一起记进镜像)。
     input_items: Vec<Value>,
+}
+
+/// 本轮请求是否为**流式**(body `"stream": true`)。仅流式 `/responses` create 的上游错误才包成
+/// `response.failed` SSE;非流式(JSON)/ 子路径(cancel 等)的错误原样回灌(见 `map_response`)。
+/// 透传 body 1:1,故 stream 字段忠实反映客户端意图;缺省 / 非 true → 非流式。
+fn request_is_streaming(plan: &RequestPlan) -> bool {
+    serde_json::from_slice::<Value>(&plan.body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// 从 `RequestPlan.adapter_metadata` 取出 response 侧记录所需的观测上下文。
@@ -662,10 +689,11 @@ mod tests {
         }));
         let mut up_headers = HeaderMap::new();
         up_headers.insert(CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        // 流式 create 请求(`stream:true`)—— Codex 主路径,错误必须包成 response.failed SSE。
         let plan = ResponsesPassthroughMapper
             .map_request(
                 "/v1/responses",
-                Bytes::from_static(b"{}"),
+                Bytes::from_static(br#"{"stream":true}"#),
                 &dummy_provider(),
             )
             .unwrap();
@@ -701,6 +729,55 @@ mod tests {
         assert!(
             text.contains("No tool call found"),
             "应带上上游错误 message 供用户/模型看到: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_upstream_400_non_streaming_preserved_raw_not_sse() {
+        // [reviewer] 非流式(`stream:false`)/ 子路径(cancel 等)请求的上游错误**原样回灌**
+        // (status + JSON body),不包成 SSE 200 —— 否则期望 JSON 错误的 SDK/API 客户端会误判成功。
+        use futures_util::StreamExt;
+        let err_body = br#"{"error":{"message":"bad cancel request","type":"invalid_request_error"}}"#;
+        let upstream: ByteStream = Box::pin(futures_util::stream::once(async move {
+            Ok::<_, std::io::Error>(Bytes::from_static(err_body))
+        }));
+        let mut up_headers = HeaderMap::new();
+        up_headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let plan = ResponsesPassthroughMapper
+            .map_request(
+                "/v1/responses",
+                Bytes::from_static(br#"{"stream":false}"#),
+                &dummy_provider(),
+            )
+            .unwrap();
+        let resp = ResponsesPassthroughMapper
+            .map_response(
+                StatusCode::BAD_REQUEST,
+                up_headers,
+                upstream,
+                &dummy_provider(),
+                &plan,
+            )
+            .unwrap();
+        // 原样:status 仍 400、content-type 仍 application/json、body 是原 JSON 错误(非 SSE)。
+        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let mut body = Vec::new();
+        let mut s = resp.stream;
+        while let Some(c) = s.next().await {
+            body.extend(c.unwrap());
+        }
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("response.failed"),
+            "非流式错误不应被包成 SSE: {text}"
+        );
+        assert!(
+            text.contains("bad cancel request"),
+            "应原样保留上游 JSON 错误体: {text}"
         );
     }
 }

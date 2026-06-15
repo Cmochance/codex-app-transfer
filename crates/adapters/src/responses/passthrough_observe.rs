@@ -88,19 +88,38 @@ impl PassthroughObserveStore {
     }
 
     /// 沿 `tip_id` 的 `prev_id` 链回溯,拼出**时序完整历史**(最旧轮在前,轮内 item 顺序不变)。
-    ///
-    /// 既供 orphan 降级重建上下文(**顺序必须时序正确**),也供 breakdown 计 token(顺序无关)。
-    /// 用 visited 集合防环;`MAX_CHAIN_DEPTH` 防异常超长链。链中缺环(如 proxy 重启后半途接手
-    /// 的会话、或跨 provider 切换的边界)即止,返回已收集部分(降级但不出错)。命中的 turn 会
-    /// 刷新 inserted(LRU 保活:活跃会话历史不被 TTL 误删)。
+    /// 供 breakdown 计 token(顺序无关、部分历史也可用)。**断链容忍**:链中缺环 / 环 / 超深即止,
+    /// 返回已收集部分(降级但不出错)。需要「链是否完整」语义的 orphan 降级请用
+    /// [`assemble_chain_complete`]。命中的 turn 刷新 inserted(LRU 保活)。
     pub fn assemble_chain(&self, tip_id: &str) -> Vec<Value> {
+        self.walk_chain(tip_id).0
+    }
+
+    /// 沿链回溯并**要求链完整**:仅当回溯到真正链根(某轮 `prev_id=None`)且中途无缺环 / 无环 /
+    /// 未超深时返回 `Some(时序完整历史)`,否则(tip 缺失 / 中途缺环 / 环 / 超深 → 拿到的只是
+    /// 尾段不完整上下文)返回 `None`。供 orphan-400 降级:只有完整链才能安全 inline + 去
+    /// `previous_response_id` 重发,否则带**缺失早期上下文**重试会让上游从错误任务续写(reviewer:
+    /// 旧版只判 `is_empty`、把断链尾段当完整);拼不全则退回原 400 显示错误。
+    pub fn assemble_chain_complete(&self, tip_id: &str) -> Option<Vec<Value>> {
+        let (history, complete) = self.walk_chain(tip_id);
+        if complete && !history.is_empty() {
+            Some(history)
+        } else {
+            None
+        }
+    }
+
+    /// 沿 `prev_id` 链回溯的公共实现,返回 `(时序完整历史, 是否回溯到真正链根)`。`complete=false`
+    /// 表示中途 break(缺环 / 环 / 超深),拿到的是不完整尾段。命中的 turn 刷新 inserted(LRU 保活)。
+    fn walk_chain(&self, tip_id: &str) -> (Vec<Value>, bool) {
         let Ok(mut inner) = self.inner.lock() else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
         let now = Instant::now();
         let mut visited: HashSet<String> = HashSet::new();
         let mut cursor = Some(tip_id.to_owned());
         let mut depth = 0;
+        let mut complete = false;
         // 先按「最新轮 → 最旧轮」收集每轮 items,再整轮反转成时序。
         let mut turns_newest_first: Vec<Vec<Value>> = Vec::new();
         while let Some(id) = cursor {
@@ -114,12 +133,16 @@ impl PassthroughObserveStore {
             rec.inserted = now; // 保活:活跃会话沿链命中的每轮都续期
             turns_newest_first.push(rec.items.clone());
             cursor = rec.prev_id.clone();
+            // prev_id=None → 这轮是真正链根,链回溯完整(while 随之正常退出)。
+            if cursor.is_none() {
+                complete = true;
+            }
         }
         let mut out = Vec::new();
         for turn_items in turns_newest_first.into_iter().rev() {
             out.extend(turn_items);
         }
-        out
+        (out, complete)
     }
 
     #[cfg(test)]
@@ -188,6 +211,28 @@ mod tests {
         let s = PassthroughObserveStore::new();
         s.record_turn("r2", Some("r1".into()), vec![item("t2in"), item("t2out")]);
         assert_eq!(s.assemble_chain("r2").len(), 2);
+    }
+
+    #[test]
+    fn assemble_chain_complete_requires_full_chain_to_root() {
+        let s = PassthroughObserveStore::new();
+        // 完整链:r1(prev=None 真链根)← r2 → assemble_chain_complete 返 Some
+        s.record_turn("r1", None, vec![item("t1")]);
+        s.record_turn("r2", Some("r1".into()), vec![item("t2")]);
+        assert!(
+            s.assemble_chain_complete("r2").is_some(),
+            "回溯到链根 → 完整"
+        );
+        // 断链:r9 的 prev=r8 不在 store(缺环)→ assemble_chain 仍返回尾段,但
+        // assemble_chain_complete 必须 None(不能把不完整尾段当完整去 inline 重发)
+        s.record_turn("r9", Some("r8".into()), vec![item("t9")]);
+        assert_eq!(s.assemble_chain("r9").len(), 1, "断链 assemble_chain 返回尾段");
+        assert!(
+            s.assemble_chain_complete("r9").is_none(),
+            "断链 → assemble_chain_complete None"
+        );
+        // tip 本身缺失 → None
+        assert!(s.assemble_chain_complete("nope").is_none());
     }
 
     #[test]

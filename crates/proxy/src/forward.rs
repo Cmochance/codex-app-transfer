@@ -534,7 +534,16 @@ pub async fn forward_handler(
                 Bytes::new()
             }
         };
-        if is_web_search_upstream_reject(&body_bytes) {
+        // [reviewer] responses passthrough(api_format=responses/openai_responses)的 map_request
+        // 1:1 返回原 body(不经 B 层 cache drop web_search),故 disable_web_search_for + 重跑
+        // prepare_request 仍发同样带 web_search 的 body → 重复 POST 必被同样 400 拒,只多打一次上游、
+        // 延后客户端看到错误,违背 1:1 透传。透传场景跳过该 transparent retry,直接把 4xx 交给下游
+        // (responses mapper 包成 response.failed)。
+        let is_responses_passthrough = matches!(
+            resolved.provider.api_format.as_str(),
+            "responses" | "openai_responses"
+        );
+        if is_web_search_upstream_reject(&body_bytes) && !is_responses_passthrough {
             codex_app_transfer_adapters::disable_web_search_for(&resolved.provider.id);
             telemetry.logs.add(
                 "WARN",
