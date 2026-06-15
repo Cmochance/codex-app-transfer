@@ -2002,6 +2002,44 @@ fn context_compaction_alias_renders_same_as_compaction() {
 }
 
 #[test]
+fn compaction_summary_prefix_localized_to_chinese_for_zh_user() {
+    // [#262 followup] 续轮 compaction item 渲染成上游 user message 时,中文用户下
+    // 把英文 COMPACT_SUMMARY_PREFIX 换成中文等价(保留正文),消除 compact 后语言
+    // 漂移;英文用户保留英文前缀(Codex 原生)。
+    use crate::responses::compact::{COMPACT_SUMMARY_PREFIX, COMPACT_SUMMARY_PREFIX_ZH};
+    let body = json!({
+        "input": [{
+            "type": "compaction",
+            "encrypted_content": format!("{COMPACT_SUMMARY_PREFIX}\n### 进度\n用户要做X,已完成Y。")
+        }]
+    });
+    with_user_language("zh-CN", || {
+        let out = convert(body.clone());
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with(COMPACT_SUMMARY_PREFIX_ZH),
+            "zh:英文前缀应换成中文前缀"
+        );
+        assert!(
+            content.contains("### 进度\n用户要做X,已完成Y。"),
+            "摘要正文必须保留"
+        );
+        assert!(
+            !content.contains("Another language model started"),
+            "zh:不应残留英文前缀"
+        );
+    });
+    with_user_language("en", || {
+        let out = convert(body.clone());
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with(COMPACT_SUMMARY_PREFIX),
+            "en:保留英文前缀(Codex 原生行为)"
+        );
+    });
+}
+
+#[test]
 fn compaction_item_with_empty_encrypted_content_is_dropped() {
     // 防御:空 summary 不应往上游塞空 user message(会触发某些 provider
     // "user message must not be empty" 400)

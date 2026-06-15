@@ -911,6 +911,10 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
                 .unwrap_or("")
                 .trim()
                 .to_owned();
+            // [#262 followup] 中文用户下把英文 summary 前缀换成中文,消除 compact 后
+            // 上游 user message 里的英文 framing(语言漂移真因);响应侧仍英文(Codex
+            // startswith 识别)。其它语言 / 无前缀 → 原样。
+            let summary = crate::responses::compact::localize_compaction_summary_prefix(&summary);
             if summary.is_empty() {
                 Vec::new()
             } else {

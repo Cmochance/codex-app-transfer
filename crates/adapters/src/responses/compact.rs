@@ -136,6 +136,34 @@ fn compact_summarization_prompt_for_current_language() -> &'static str {
 /// 识别这段文本是 compaction summary 并接管历史回放。**前缀必须保持字面一致**。
 pub(crate) const COMPACT_SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
 
+/// [#262 followup] `COMPACT_SUMMARY_PREFIX` 的中文等价。**仅用于请求侧**:续轮把
+/// Codex 回发的 compaction item 渲染成**上游 user message** 时(request.rs /
+/// gemini_native),中文用户下用它替换英文前缀。
+///
+/// **为什么**:compact 后续轮 input 里这段实质性英文前缀(+ ~40KB 英文 Codex
+/// system prompt)会把第三方 agent 模型(实证 Antigravity gemini-*-agent)带成
+/// 英文回复(真机 forward-trace 实证的语言漂移真因)。换成中文前缀消除该英文
+/// framing,且保留「这是上一模型的总结、基于它继续」的语义。
+///
+/// **响应侧不动**:发给 Codex 的 compact 响应仍用英文 [`COMPACT_SUMMARY_PREFIX`]
+/// —— Codex CLI `is_summary_message`(`startswith(PREFIX)`)靠它识别压缩摘要;
+/// 替换发生在 Codex 识别 + 存档**之后**的请求侧渲染,Codex 看不到、不受影响。
+pub(crate) const COMPACT_SUMMARY_PREFIX_ZH: &str = "另一个语言模型已开始解决此问题,并产出了其思考过程的总结。你还可以访问该模型所用工具的状态。请利用这些信息在已完成的工作上继续推进,避免重复劳动。以下是该模型产出的总结,请用其中的信息辅助你自己的分析:";
+
+/// 渲染续轮 compaction item 的 `encrypted_content`(明文 = `COMPACT_SUMMARY_PREFIX`
+/// + 摘要正文)成上游 user message 时调用:中文用户下,若文本以英文
+/// [`COMPACT_SUMMARY_PREFIX`] 开头,把前缀替换成 [`COMPACT_SUMMARY_PREFIX_ZH`]
+/// (保留正文),消除 compact 后语言漂移;其它语言 / 不含该前缀 → 原样返回。
+pub(crate) fn localize_compaction_summary_prefix(text: &str) -> String {
+    use crate::core::language::{current_language, Language};
+    if current_language() == Language::Chinese {
+        if let Some(body) = text.strip_prefix(COMPACT_SUMMARY_PREFIX) {
+            return format!("{COMPACT_SUMMARY_PREFIX_ZH}{body}");
+        }
+    }
+    text.to_owned()
+}
+
 /// `COMPACT_USER_MESSAGE_MAX_TOKENS` from `codex-rs/core/src/compact.rs:48`.
 const COMPACT_MAX_OUTPUT_TOKENS: u32 = 20_000;
 
