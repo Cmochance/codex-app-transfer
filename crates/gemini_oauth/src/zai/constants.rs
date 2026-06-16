@@ -14,7 +14,8 @@
 //! | authorize 参数样式 | `redirect_uri`+`response_type=code`+`client_id`+`state` | `redirect`+`appId`+`state` | 两个 adapter 的 `buildAuthorizeUrl` |
 //! | appId | `client_P8X5CMWmlaRO9gyO-KSqtg` | `zcode` | `_m`/`Vc.appId` |
 //! | token URL | `zcode.z.ai/api/v1/oauth/token`(共用) | 同 | `_m`/`Vc.tokenUrl` |
-//! | biz base(换组织 key) | `https://api.z.ai`(`Ch`) | `https://zcode.z.ai`(`wh`) | `resolveZaiApiKey`/`resolveBizApiKey` |
+//! | biz base(换组织 key) | `https://api.z.ai`(`Ch`) | `https://bigmodel.cn`(`resolveBigModelApiOrigin`) | `resolveZaiApiKey`/`resolveBizApiKey` |
+//! | biz `Authorization` 前缀 | `Bearer <token>` | 裸 `<token>`(无 Bearer) | `resolveZaiApiKey` vs bigmodel 透传 |
 //! | 模型 base(Anthropic wire) | `api.z.ai/api/anthropic` | `open.bigmodel.cn/api/anthropic`(`$m`) | catalog |
 //! | 业务 token 中转 | 需要(`km` ZaiBusinessTokenResolver) | 不需要 | `businessLoginUrl` |
 //! | 换 key requireSecretKey | `true` | `false` | `resolveZaiApiKey`/`resolveBizApiKey` |
@@ -30,7 +31,7 @@ pub enum ZaiProvider {
     /// Z.ai 国际版(`chat.z.ai` 登录 + `api.z.ai` 业务面)。
     #[serde(rename = "zai")]
     Zai,
-    /// 智谱 BigModel 国内版(`bigmodel.cn` 网页登录 + `zcode.z.ai` 业务面)。
+    /// 智谱 BigModel 国内版(`bigmodel.cn` 网页登录 + `bigmodel.cn` 业务面)。
     #[serde(rename = "bigmodel")]
     BigModel,
 }
@@ -82,6 +83,12 @@ pub struct ZaiProviderConfig {
     pub business_login_url: Option<&'static str>,
     /// 换 key 时是否必须拿到 `secretKey`(z.ai=true;bigmodel 可只用 apiKey)。
     pub require_secret_key: bool,
+    /// biz 面(getCustomerInfo / api_keys / copy)`Authorization` 是否带 `Bearer ` 前缀。
+    /// **z.ai=true**(ZCode `resolveZaiApiKey` 显式 `` `Bearer ${t}` ``);
+    /// **bigmodel=false**(ZCode 直接透传原始 token,无 Bearer —— 与 GLM coding-plan
+    /// 「Authorization 不带 Bearer」约定一致,真机 e2e 实证 zcode.z.ai 是错 host、
+    /// bigmodel.cn + 裸 token 才对)。
+    pub biz_auth_bearer: bool,
 }
 
 /// z.ai 国际版配置(ZCode `_m`)。
@@ -94,19 +101,22 @@ pub const ZAI_CONFIG: ZaiProviderConfig = ZaiProviderConfig {
     model_base: "https://api.z.ai/api/anthropic",
     business_login_url: Some("https://api.z.ai/api/auth/z/login"),
     require_secret_key: true,
+    biz_auth_bearer: true,
 };
 
-/// 智谱 BigModel 国内版配置(ZCode `Vc`)。**biz base 走 ZCode 后端
-/// `zcode.z.ai`**(不是模型面 `open.bigmodel.cn`)—— ZCode 后端代为经手组织 key。
+/// 智谱 BigModel 国内版配置(ZCode `Vc`)。**biz base = `https://bigmodel.cn`**
+/// (ZCode `resolveBigModelApiOrigin` production 值 `Ak`;真机 e2e 实证:此前误用
+/// `zcode.z.ai` → getCustomerInfo 404)。biz 面 `Authorization` **不带 Bearer**。
 pub const BIGMODEL_CONFIG: ZaiProviderConfig = ZaiProviderConfig {
     provider: ZaiProvider::BigModel,
     authorize_url: "https://bigmodel.cn/login",
     token_url: "https://zcode.z.ai/api/v1/oauth/token",
     app_id: "zcode",
-    biz_base: "https://zcode.z.ai",
+    biz_base: "https://bigmodel.cn",
     model_base: "https://open.bigmodel.cn/api/anthropic",
     business_login_url: None,
     require_secret_key: false,
+    biz_auth_bearer: false,
 };
 
 /// 换组织 key 时,api_keys 列表里查找 / 新建的 key name(ZCode `RI`)。
@@ -223,16 +233,25 @@ mod tests {
     }
 
     #[test]
-    fn bigmodel_config_uses_zcode_backend_biz_base() {
+    fn bigmodel_config_biz_base_and_auth() {
         let c = ZaiProvider::BigModel.config();
-        // biz base 是 ZCode 后端,**不是**模型面 open.bigmodel.cn
-        assert_eq!(c.biz_base, "https://zcode.z.ai");
+        // biz base = bigmodel.cn(真机 e2e 实证;zcode.z.ai 会 404),**不是**模型面 open.bigmodel.cn
+        assert_eq!(c.biz_base, "https://bigmodel.cn");
         assert!(
             c.business_login_url.is_none(),
-            "bigmodel 直接用 oauth token 当 biz Bearer"
+            "bigmodel 不走业务 token 中转"
         );
         assert!(!c.require_secret_key);
+        assert!(!c.biz_auth_bearer, "bigmodel biz Authorization 不带 Bearer");
         assert_eq!(c.model_base, "https://open.bigmodel.cn/api/anthropic");
+    }
+
+    #[test]
+    fn zai_config_uses_bearer_for_biz() {
+        assert!(
+            ZaiProvider::Zai.config().biz_auth_bearer,
+            "z.ai biz 用 Bearer"
+        );
     }
 
     #[test]

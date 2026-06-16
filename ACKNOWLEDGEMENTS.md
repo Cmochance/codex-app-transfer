@@ -504,7 +504,7 @@
 - **借鉴清单**(均为对 ZCode 3.1.0 解包 `out/host/index.js` 的反向工程结论,Rust 自行实现):
   - **z.ai / bigmodel 两套账号登录 provider 配置**(authorize / token / biz / business-login endpoint + appId + authorize 参数样式)→ `crates/gemini_oauth/src/zai/constants.rs`
   - **JSON 信封 token 交换**(`POST zcode.z.ai/api/v1/oauth/token` body `{provider,code,redirect_uri,state}`,响应 `{code,msg,data}` 业务信封,`code != 0` 即业务错)→ `crates/gemini_oauth/src/zai/flow.rs`
-  - **Coding Plan 换组织 API key 链路**(`getCustomerInfo → pickOrgAndProject → api_keys find/create → copy → <apiKey>.<secretKey>`)+ z.ai 业务 token 中转(`api/auth/z/login`)→ `crates/gemini_oauth/src/zai/coding_plan.rs`
+  - **Coding Plan 换组织 API key 链路**(`getCustomerInfo → pickOrgAndProject → api_keys find/create → copy → <apiKey>.<secretKey>`,biz base:z.ai=`api.z.ai`+`Bearer`、bigmodel=`bigmodel.cn`+裸 token)+ z.ai 业务 token 中转(`api/auth/z/login`)→ `crates/gemini_oauth/src/zai/coding_plan.rs`
   - **ZCode 指纹头**(`User-Agent: ZCode/<ver>`、`X-Platform`、`HTTP-Referer`、`X-Title`、`X-ZCode-Agent: glm`、`anthropic-version`)→ `crates/gemini_oauth/src/zai/constants.rs`
 - **本项目差异 / 扩展**:
   - **未复制 ZCode 代码**,按解包分析结论自行 Rust 重写

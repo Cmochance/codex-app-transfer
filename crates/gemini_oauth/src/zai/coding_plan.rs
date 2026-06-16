@@ -62,27 +62,34 @@ pub async fn fetch_business_token(
         .ok_or(ZaiError::MissingField("business token access_token"))
 }
 
-/// 换出组织 API key(`<apiKey>.<secretKey>`)。`bearer_token` 是裸 token(内部
-/// 包成 `Authorization: Bearer <token>`)。
+/// 换出组织 API key(`<apiKey>.<secretKey>`)。`bearer_token` 是裸 token,内部按
+/// `config.biz_auth_bearer` 决定 `Authorization` 是否加 `Bearer ` 前缀(z.ai 加、
+/// bigmodel 不加)。
 pub async fn resolve_org_api_key(
     http: &reqwest::Client,
     config: &ZaiProviderConfig,
     bearer_token: &str,
 ) -> Result<String, ZaiError> {
     let biz = config.biz_base;
+    // biz 面 Authorization 值:z.ai 带 `Bearer `,bigmodel 用裸 token(真机 e2e 实证)
+    let authorization = if config.biz_auth_bearer {
+        format!("Bearer {bearer_token}")
+    } else {
+        bearer_token.to_string()
+    };
 
     // 1. customer info → org / project
     let customer = biz_get(
         http,
         &format!("{biz}/api/biz/customer/getCustomerInfo"),
-        bearer_token,
+        &authorization,
     )
     .await?;
     let (org, proj) = pick_org_and_project(&customer)?;
 
     // 2. api_keys 找 zcode-api-key,没有就建
     let keys_url = format!("{biz}/api/biz/v1/organization/{org}/projects/{proj}/api_keys");
-    let list = biz_get(http, &keys_url, bearer_token).await?;
+    let list = biz_get(http, &keys_url, &authorization).await?;
     let entry = match find_api_key_entry(&list, ZCODE_API_KEY_NAME) {
         Some(e) => e,
         None => {
@@ -90,7 +97,7 @@ pub async fn resolve_org_api_key(
             biz_post(
                 http,
                 &keys_url,
-                bearer_token,
+                &authorization,
                 &serde_json::json!({ "name": ZCODE_API_KEY_NAME }),
             )
             .await?
@@ -105,7 +112,7 @@ pub async fn resolve_org_api_key(
         "{keys_url}/copy/{}",
         url::form_urlencoded::byte_serialize(api_key.as_bytes()).collect::<String>()
     );
-    let copied = biz_get(http, &copy_url, bearer_token).await?;
+    let copied = biz_get(http, &copy_url, &authorization).await?;
     let secret_key = extract_str(&copied, "secretKey").filter(|s| !s.is_empty());
 
     // 4. 拼 key:有 secretKey 用 `<apiKey>.<secretKey>`(read_json 已查业务码,
@@ -133,11 +140,15 @@ pub async fn resolve_org_api_key(
     Ok(org_key)
 }
 
-/// GET 一个 biz 端点,返回解析后的 JSON。
-async fn biz_get(http: &reqwest::Client, url: &str, bearer: &str) -> Result<Value, ZaiError> {
+/// GET 一个 biz 端点(`authorization` 是完整 header 值,按 provider 已含/不含 Bearer)。
+async fn biz_get(
+    http: &reqwest::Client,
+    url: &str,
+    authorization: &str,
+) -> Result<Value, ZaiError> {
     let mut req = http
         .get(url)
-        .bearer_auth(bearer)
+        .header("Authorization", authorization)
         .header("Content-Type", "application/json");
     for (k, v) in zcode_source_headers() {
         req = req.header(k, v);
@@ -145,16 +156,16 @@ async fn biz_get(http: &reqwest::Client, url: &str, bearer: &str) -> Result<Valu
     read_json(req).await
 }
 
-/// POST 一个 biz 端点(JSON body),返回解析后的 JSON。
+/// POST 一个 biz 端点(JSON body;`authorization` 是完整 header 值)。
 async fn biz_post(
     http: &reqwest::Client,
     url: &str,
-    bearer: &str,
+    authorization: &str,
     body: &Value,
 ) -> Result<Value, ZaiError> {
     let mut req = http
         .post(url)
-        .bearer_auth(bearer)
+        .header("Authorization", authorization)
         .header("Content-Type", "application/json")
         .json(body);
     for (k, v) in zcode_source_headers() {
