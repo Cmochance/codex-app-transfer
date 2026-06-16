@@ -5,8 +5,11 @@
 //! - authorize 两套样式(z.ai `redirect_uri`+`response_type`+`client_id`;
 //!   bigmodel `redirect`+`appId`)—— [`build_zai_authorize_url`]
 //! - **动态 loopback 端口**(`127.0.0.1:0`):ZCode 注册的是 `zcode://` deeplink,
-//!   我们实测 localhost 任意端口都被 authorize 回跳 + token 交换接受(RFC 8252
-//!   loopback),用动态端口最稳、不跟 antigravity 固定 51121 撞
+//!   我们实测 loopback 任意端口都被 authorize 回跳 + token 交换接受(RFC 8252
+//!   loopback),用动态端口最稳、不跟 antigravity 固定 51121 撞。redirect_uri
+//!   **用 `127.0.0.1` 而非 `localhost`**(跟 listener 同栈 + 对齐 gemini parent
+//!   flow + RFC 8252 推荐):`localhost` 在部分系统先解析成 IPv6 `::1`,而 listener
+//!   只绑 IPv4 → 回调 connection refused 卡到超时
 //! - token 交换是 **JSON body**(非 form),`{provider, code, redirect_uri, state}`,
 //!   **无** `grant_type`/`client_secret`/PKCE;响应是 `{code,msg,data}` 业务信封
 //!   (`code != 0` 即业务错)
@@ -126,7 +129,7 @@ pub async fn run_zai_oauth_flow_with_cancel(
         .await
         .map_err(FlowError::Bind)?;
     let port = listener.local_addr().map_err(FlowError::Bind)?.port();
-    let redirect_uri = format!("http://localhost:{port}/oauth-callback");
+    let redirect_uri = loopback_redirect_uri(port);
     tracing::info!(
         provider = config.provider.wire_id(),
         port,
@@ -344,6 +347,13 @@ pub(crate) fn parse_token_envelope(
     })
 }
 
+/// loopback 回调 redirect_uri。**用 `127.0.0.1` 而非 `localhost`**:跟 IPv4
+/// listener 同栈,避开 `localhost` 在部分系统先解析成 IPv6 `::1` 导致回调
+/// connection refused 卡超时(对齐 gemini parent flow + RFC 8252;bot P2)。
+fn loopback_redirect_uri(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/oauth-callback")
+}
+
 fn random_state_token() -> Result<String, FlowError> {
     let mut buf = [0u8; 32];
     getrandom::getrandom(&mut buf).map_err(|e| FlowError::Rng(e.to_string()))?;
@@ -457,6 +467,15 @@ mod tests {
             matches!(err, ZaiError::MissingField("data.token")),
             "实际 {err:?}"
         );
+    }
+
+    #[test]
+    fn loopback_redirect_uri_uses_ipv4_not_localhost() {
+        // bot P2:redirect_uri 必须用 127.0.0.1(跟 IPv4 listener 同栈),
+        // 不能用 localhost(部分系统先解析 IPv6 ::1 → 回调打不到 listener)
+        let uri = loopback_redirect_uri(51234);
+        assert_eq!(uri, "http://127.0.0.1:51234/oauth-callback");
+        assert!(!uri.contains("localhost"), "不能用 localhost: {uri}");
     }
 
     #[test]
