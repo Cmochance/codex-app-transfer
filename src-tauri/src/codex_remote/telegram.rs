@@ -40,8 +40,6 @@ pub struct Chat {
 #[derive(Debug, Clone, Deserialize)]
 pub struct User {
     pub id: i64,
-    #[serde(default)]
-    pub username: Option<String>,
 }
 
 #[derive(Deserialize)]

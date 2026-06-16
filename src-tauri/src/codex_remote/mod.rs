@@ -56,7 +56,8 @@ fn bot_token() -> Option<String> {
         .map(str::to_owned)
 }
 
-/// 授权用户白名单(numeric id 或 `@username`,大小写不敏感)。
+/// 授权用户白名单(**仅数字 user id 生效**,bot-review P1)。仍兼容旧配置里残留的
+/// `@username` 项(剥 `@` 后保留),但它们匹配不到任何数字 id、不再授权。
 fn allowed_users() -> Vec<String> {
     settings()
         .as_ref()
@@ -72,18 +73,15 @@ fn allowed_users() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 仅按**稳定的数字 user id** 鉴权(bot-review P1):Telegram username 可改 / 被重分配,
+/// 用 username 鉴权会让放弃或夺取该 handle 的新持有者获得本机远程控制权。白名单里的
+/// 非数字项(@username)不再生效(`allowed_users` 已剥 `@`,非数字串匹配不到任何 id)。
 fn is_authorized(msg: &Message, allow: &[String]) -> bool {
     let Some(from) = &msg.from else {
         return false;
     };
     let id = from.id.to_string();
-    allow.iter().any(|a| {
-        a == &id
-            || from
-                .username
-                .as_deref()
-                .is_some_and(|u| u.eq_ignore_ascii_case(a))
-    })
+    allow.iter().any(|a| a == &id)
 }
 
 /// Telegram bot daemon 主循环。开关关 / 无 token 时空转;开启后长轮询并分发。
@@ -204,28 +202,25 @@ async fn handle_message(client: &TelegramClient, msg: Message) {
     if !is_drivable_chat(&msg) {
         return;
     }
+    let sender_id = msg.from.as_ref().map(|f| f.id);
     if !is_authorized(&msg, &allowed_users()) {
-        let (id, uname) = msg
-            .from
-            .as_ref()
-            .map(|f| {
-                (
-                    f.id.to_string(),
-                    f.username.clone().unwrap_or_else(|| "（无）".into()),
-                )
-            })
-            .unwrap_or_else(|| ("?".into(), "?".into()));
+        let id = sender_id
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "?".into());
         notify(
             client,
             chat_id,
             &format!(
-                "⛔ 未授权。请在 transfer 设置的「远程控制白名单」加入以下任一,再重试:\n\
-                 • user id = {id}\n• username = @{uname}"
+                "⛔ 未授权。请在 transfer 设置的「远程控制白名单」加入你的**数字 user id**,再重试:\n\
+                 • user id = {id}\n(出于安全,只按数字 id 授权,不支持 @username)"
             ),
         )
         .await;
         return;
     }
+    let Some(sender_id) = sender_id else {
+        return;
+    };
 
     let text = msg.text.unwrap_or_default();
     let text = text.trim();
@@ -235,7 +230,7 @@ async fn handle_message(client: &TelegramClient, msg: Message) {
     if let Some(cmd) = text.strip_prefix('/') {
         handle_command(client, chat_id, cmd).await;
     } else {
-        run_turn(client, chat_id, text).await;
+        run_turn(client, chat_id, sender_id, text).await;
     }
 }
 
@@ -299,12 +294,19 @@ const HELP_TEXT: &str = "🤖 Codex 远程控制\n\
     注:M1 为对话问答式;若 Codex 需要批准命令/工具,请到桌面端确认(批准转发到手机为 M2)。";
 
 /// 驱动 Codex 跑一轮并流式回发。取 [`TURN_LOCK`] 串行化(一台 Codex 一次一轮)。
-async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
+/// `sender_id` = 发起者数字 user id,用于取锁后重新鉴权(排队期间可能被移出白名单)。
+async fn run_turn(client: &TelegramClient, chat_id: i64, sender_id: i64, prompt: &str) {
     let _guard = TURN_LOCK.lock().await;
-    // 排队等锁期间(前一轮可能跑了几分钟)用户可能已关远程控制 → 取到锁后重查,
-    // 已关则不驱动 Codex(bot-review P2)。
-    if !enabled() {
-        notify(client, chat_id, "ℹ️ 远程控制已关闭,本次指令已取消。").await;
+    // 排队等锁期间(前一轮可能跑数分钟)配置 / 白名单可能变 → 取到锁后**重查**:
+    // 关开关 / 发起者已被移出白名单,则取消本次,不驱动 Codex(bot-review P2)。
+    let still_authorized = allowed_users().iter().any(|a| a == &sender_id.to_string());
+    if !enabled() || !still_authorized {
+        notify(
+            client,
+            chat_id,
+            "ℹ️ 远程控制已关闭或你已不在白名单,本次指令已取消。",
+        )
+        .await;
         return;
     }
 
@@ -455,16 +457,19 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
             };
             let _ = client.send_message(chat_id, msg).await;
         }
-        // 完成判定(bot-review P2):必须有**真实 idle 证据**,不靠纯 stable-text 的 drift。
-        // ① done_idle:submitting 明确读到 false(显式空闲)+ 内容稳定;
-        // ② done_final:Codex 给最终 assistant 答案打了 final-assistant 标记(streaming /
-        //    Thinking / 跑工具 / 等批准期间**不在**)+ 内容稳定 —— 比 isSubmitting 可靠,
-        //    且覆盖 fiber 漂移读不到 submitting 的 Codex 版本(codex-e2e-test skill 实证)。
-        // 两者都拿不到(submitting 漂移 + 无 final 标记,如纯工具轮)→ 不提前完成,持锁
-        // 等到 MAX_POLLS,由循环后的「超时仍在跑则 stop」兜底,绝不在仍在跑时放锁。
-        let done_idle = snap.submitting == Some(false) && stable >= 2;
+        // 完成判定(bot-review P2):必须有**结束证据**,不在仍可能运行时放锁。
+        // ① done_final:Codex 给最终 assistant 答案打了 final-assistant 标记(streaming /
+        //    Thinking / 跑工具 / 等批准期间**不在**)+ 内容稳定 —— 最可靠的结束信号
+        //    (codex-e2e-test skill 实证),作主判据。
+        // ② done_idle_corroborated:submitting==false **本身在 streaming 阶段也会误读 false**
+        //    (见 driver Snapshot 文档),故不能 2 轮即收;要求长稳(8 轮 ≈10s 无变化)+ 非空
+        //    文本作佐证,才把它当结束 —— 覆盖「无 final 标记但确已结束」的兜底。
+        // 两者都拿不到(submitting 漂移 + 无 final 标记 + 无文本,如纯工具轮)→ 不提前完成,
+        // 持锁等到 MAX_POLLS,由循环后的「超时仍在跑则 stop」兜底,绝不在仍在跑时放锁。
         let done_final = snap.final_ready && stable >= 2;
-        if done_idle || done_final {
+        let done_idle_corroborated =
+            snap.submitting == Some(false) && stable >= 8 && !last_seen.is_empty();
+        if done_final || done_idle_corroborated {
             completed = true;
             break;
         }
@@ -512,52 +517,49 @@ mod tests {
     use super::*;
     use telegram::{Chat, User};
 
-    fn msg_from(id: i64, username: Option<&str>) -> Message {
-        msg_in_chat(id, username, Some("private"))
+    fn msg_from(id: i64) -> Message {
+        msg_in_chat(id, Some("private"))
     }
 
-    fn msg_in_chat(id: i64, username: Option<&str>, chat_kind: Option<&str>) -> Message {
+    fn msg_in_chat(id: i64, chat_kind: Option<&str>) -> Message {
         Message {
             chat: Chat {
                 id: 100,
                 kind: chat_kind.map(str::to_owned),
             },
-            from: Some(User {
-                id,
-                username: username.map(str::to_owned),
-            }),
+            from: Some(User { id }),
             text: Some("hi".into()),
         }
     }
 
     #[test]
     fn only_private_chats_drivable() {
-        assert!(is_drivable_chat(&msg_in_chat(1, None, Some("private"))));
-        assert!(is_drivable_chat(&msg_in_chat(1, None, None))); // kind 缺失放行
-        assert!(!is_drivable_chat(&msg_in_chat(1, None, Some("group"))));
-        assert!(!is_drivable_chat(&msg_in_chat(1, None, Some("supergroup"))));
-        assert!(!is_drivable_chat(&msg_in_chat(1, None, Some("channel"))));
+        assert!(is_drivable_chat(&msg_in_chat(1, Some("private"))));
+        assert!(is_drivable_chat(&msg_in_chat(1, None))); // kind 缺失放行
+        assert!(!is_drivable_chat(&msg_in_chat(1, Some("group"))));
+        assert!(!is_drivable_chat(&msg_in_chat(1, Some("supergroup"))));
+        assert!(!is_drivable_chat(&msg_in_chat(1, Some("channel"))));
     }
 
     #[test]
     fn authorized_by_numeric_id() {
         let allow = vec!["12345".to_string()];
-        assert!(is_authorized(&msg_from(12345, None), &allow));
-        assert!(!is_authorized(&msg_from(99999, None), &allow));
+        assert!(is_authorized(&msg_from(12345), &allow));
+        assert!(!is_authorized(&msg_from(99999), &allow));
     }
 
     #[test]
-    fn authorized_by_username_case_insensitive() {
-        let allow = vec!["Alice".to_string()];
-        assert!(is_authorized(&msg_from(1, Some("alice")), &allow));
-        assert!(is_authorized(&msg_from(1, Some("ALICE")), &allow));
-        assert!(!is_authorized(&msg_from(1, Some("bob")), &allow));
+    fn username_entries_never_authorize() {
+        // bot-review P1:白名单里的 @username(非数字)项绝不授权,只认稳定数字 id。
+        let allow = vec!["alice".to_string(), "@bob".to_string()];
+        assert!(!is_authorized(&msg_from(1), &allow));
+        assert!(!is_authorized(&msg_from(42), &allow));
     }
 
     #[test]
     fn unauthorized_when_no_from() {
         let allow = vec!["1".to_string()];
-        let mut m = msg_from(1, None);
+        let mut m = msg_from(1);
         m.from = None;
         assert!(!is_authorized(&m, &allow));
     }

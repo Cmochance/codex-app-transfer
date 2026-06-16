@@ -529,8 +529,8 @@
               </div>
               <div style="margin-top:10px;">
                 <label data-i18n="settings.codexRemoteControlAllowedUsers" style="display:block;font-size:13px;margin-bottom:4px;">授权用户白名单</label>
-                <input type="text" id="codexRemoteControlAllowedUsers" autocomplete="off" placeholder="123456789, @yourname">
-                <p class="settings-note" data-i18n="settings.codexRemoteControlAllowedUsersHint">允许控制的 Telegram 数字 user id 或 @username,逗号分隔。未授权用户给 bot 发消息时会收到自己的 id,方便你加进来。</p>
+                <input type="text" id="codexRemoteControlAllowedUsers" autocomplete="off" placeholder="123456789, 987654321">
+                <p class="settings-note" data-i18n="settings.codexRemoteControlAllowedUsersHint">允许控制的 Telegram 数字 user id,逗号分隔。出于安全只认数字 id(username 可被改/夺取,不支持)。未授权用户给 bot 发消息时会收到自己的数字 id,方便你加进来。</p>
               </div>
             </div>
           </div>
