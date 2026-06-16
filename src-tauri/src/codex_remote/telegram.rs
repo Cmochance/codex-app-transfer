@@ -82,17 +82,20 @@ impl TelegramClient {
         method: &str,
         body: serde_json::Value,
     ) -> Result<T, String> {
+        // `without_url()`:reqwest::Error 的 Display 含完整请求 URL,而 URL 里嵌着
+        // `/bot<token>/`(授予远程控制权的凭据)。错误串会进日志 / 回给用户,必须先剥 URL
+        // 防 token 泄露(bot-review P1)。
         let resp = self
             .http
             .post(self.url(method))
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("{method} 网络错误: {e}"))?;
+            .map_err(|e| format!("{method} 网络错误: {}", e.without_url()))?;
         let env: ApiEnvelope<T> = resp
             .json()
             .await
-            .map_err(|e| format!("{method} 解析失败: {e}"))?;
+            .map_err(|e| format!("{method} 解析失败: {}", e.without_url()))?;
         if !env.ok {
             return Err(format!(
                 "{method} API 错误: {}",

@@ -210,10 +210,15 @@ async fn handle_command(client: &TelegramClient, chat_id: i64, cmd: &str) {
             ),
             Err(e) => format!("⚠️ 读取状态失败:{e}\n(确认 Codex.app 正在运行)"),
         },
-        "new" | "新建" => match driver::new_chat().await {
-            Ok(true) => "🆕 已新建对话".to_string(),
-            Ok(false) => "未找到新建按钮(当前视图可能不支持)".to_string(),
-            Err(e) => format!("⚠️ 新建失败:{e}"),
+        // /new 取 TURN_LOCK(try_lock):有轮次进行中则拒绝,避免并发点新建把活动对话
+        // 从正在跑的 run_turn 下面换掉(bot-review P2)。/status /stop 仍 bypass(正确)。
+        "new" | "新建" => match TURN_LOCK.try_lock() {
+            Ok(_guard) => match driver::new_chat().await {
+                Ok(true) => "🆕 已新建对话".to_string(),
+                Ok(false) => "未找到新建按钮(当前视图可能不支持)".to_string(),
+                Err(e) => format!("⚠️ 新建失败:{e}"),
+            },
+            Err(_) => "⏳ 有一轮对话正在进行,请先 /stop 或等它结束再 /new。".to_string(),
         },
         "stop" | "停止" => match driver::stop().await {
             Ok(via) => format!("🛑 已发停止({via})"),
