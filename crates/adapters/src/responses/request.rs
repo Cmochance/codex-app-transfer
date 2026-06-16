@@ -163,10 +163,10 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // session cache 只保存折叠后的 tool 文本(无全分辨率 base64、无提升出的 user 图片消息),
     // 这样多轮 computer-use 会话里历史截图不会跨轮累积进 cache → 撑爆上下文 / 成本。
     let session_messages = strip_tool_image_side_fields(messages.clone());
-    // [MOC-250] 仅对发往上游的 wire 副本提升当前轮截图为 user image message(position-aware:
-    // 末尾 keep_count 个 tool 属当前轮 → 提升真图;更早历史轮 → 丢弃图片只留文本)。放在
-    // cache clone 之后 → 提升出的图片永不进 cache;并清除所有 tool message 的侧信道字段。
-    lift_tool_screenshot_images(&mut messages, keep_count);
+    // [MOC-250] 仅对发往上游的 wire 副本提升当前 input 截图为 user image message(按侧信道字段
+    // 存在判定当前轮,见 lift_tool_screenshot_images doc)。放在 cache clone 之后 → 提升出的图片
+    // 永不进 cache;并清除所有 tool message 的侧信道字段。
+    lift_tool_screenshot_images(&mut messages);
     // 新提升出的 user image message 需与原有图片一样过视觉处理:不支持视觉的上游降级占位、
     // 支持的补 text part(与上方 L139 同逻辑;那次跑在提升之前,覆盖不到这些新消息)。
     if !provider_supports_vision(provider, body_model.as_deref()) {
@@ -1183,22 +1183,20 @@ fn strip_tool_image_side_fields(mut messages: Vec<Value>) -> Vec<Value> {
     messages
 }
 
-/// [MOC-250] position-aware 截图提升:把**当前轮**(末尾 `keep_recent_count` 个 tool message)
-/// 的 [`TOOL_IMAGE_SIDE_FIELD`] 图片提升为紧随其后的 user image message;更早历史轮的图片丢弃
-/// (chat tool role 不能携图;OpenAI / Gemini 都要求图片落在 user turn)。无论提升与否,
-/// **所有** tool message 的侧信道字段都在此清除 —— 它绝不出现在发上游的 wire 上。
+/// [MOC-250] 截图提升:把**当前 input** 里每条带 [`TOOL_IMAGE_SIDE_FIELD`] 的 tool message
+/// 的图片提升为紧随其后的 user image message(chat tool role 不能携图;OpenAI / Gemini 都要求
+/// 图片落在 user turn)。无论是否提升,**所有** tool message 的侧信道字段都在此清除 —— 它绝不
+/// 出现在发上游的 wire 上。
 ///
-/// trailing 判定与 [`recompress_stale_full_tool_outputs`] 一致(按 role:tool 位置取末尾 N 个),
-/// 这样「保全文的当前轮 tool」与「提升真图的当前轮 tool」是同一组,语义一致。
-///
-/// **历史轮丢图不留占位标记**(刻意,非疏漏):侧信道字段只挂在**本轮 input** 转出的 tool
-/// message 上;cache 副本已剥字段(见 [`strip_tool_image_side_fields`]),故 previous_response_id
-/// 续轮里历史截图根本不带字段、不进本函数的 drop 分支 —— 每张截图在它**作为当前轮那一次**
-/// 已作为真图发过上游一次(computer-use 的标准上下文管理:模型按需重新截图,无需逐轮回灌旧图)。
-/// 真正进 drop 分支的只有 stateless 客户端把完整 transcript 塞进 input、回放多张历史截图的少见
-/// 情形;此时丢非末尾的旧图只为防上下文/成本膨胀,tool 文本仍保留、结果不空,不加逐轮标记
-/// (会在长 computer-use 会话里累积成噪音,得不偿失)。
-fn lift_tool_screenshot_images(messages: &mut Vec<Value>, keep_recent_count: usize) {
+/// **以「侧信道字段是否存在」判定当前轮,而非 trailing-tool 位置**(chatgpt-codex P2 修):
+/// 侧信道字段只在 [`input_item_to_messages`] 给**本轮 input** 的 function_call_output 挂,cache
+/// 副本已剥字段(见 [`strip_tool_image_side_fields`]),故合并历史后带字段的恒为当前 input 的
+/// tool message。早先版本按「末尾 keep_count 个 tool」判定,在 Codex 完整循环的
+/// `[function_call_output(截图), 新 user 输入]` 形态下 `current_tool_count==0` → 当前截图被静默
+/// 丢弃(正是需要像素的那一轮)。改为按字段存在判定后,只要是本轮 input 的截图就提升,不依赖
+/// 是否有 trailing user;跨轮累积仍由 cache 剥字段独立防住(历史截图早已在它**作为当前轮那次**
+/// 发过上游一次,续轮 cache 里不带字段、不重发,符合 computer-use「按需重新截图」的上下文管理)。
+fn lift_tool_screenshot_images(messages: &mut Vec<Value>) {
     // 绝大多数请求没有任何带图侧信道字段 → 快速返回,零额外分配。
     if !messages
         .iter()
@@ -1206,23 +1204,13 @@ fn lift_tool_screenshot_images(messages: &mut Vec<Value>, keep_recent_count: usi
     {
         return;
     }
-    let keep: std::collections::HashSet<usize> = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
-        .map(|(i, _)| i)
-        .collect::<Vec<usize>>()
-        .into_iter()
-        .rev()
-        .take(keep_recent_count)
-        .collect();
     let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 1);
-    for (i, mut msg) in std::mem::take(messages).into_iter().enumerate() {
+    for mut msg in std::mem::take(messages) {
         let images = msg
             .as_object_mut()
             .and_then(|o| o.remove(TOOL_IMAGE_SIDE_FIELD));
         let lifted = match images {
-            Some(Value::Array(arr)) if !arr.is_empty() && keep.contains(&i) => Some(arr),
+            Some(Value::Array(arr)) if !arr.is_empty() => Some(arr),
             _ => None,
         };
         out.push(msg);

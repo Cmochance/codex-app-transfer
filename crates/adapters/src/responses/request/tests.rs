@@ -4300,36 +4300,71 @@ fn split_tool_output_text_and_images_passthrough_when_no_image() {
 }
 
 #[test]
-fn lift_tool_screenshot_images_lifts_current_drops_history() {
-    // 两条 tool message 都带侧信道图片;keep_recent_count=1 → 只末尾那条提升,历史丢弃。
+fn lift_tool_screenshot_images_lifts_all_sidefield_and_clears_field() {
+    // [chatgpt-codex P2 修] 按侧信道字段存在判定当前轮(非 trailing-tool 位置):凡带字段的
+    // tool message 都提升,字段一律清除。带字段的恒是当前 input 的 tool(cache 已剥字段),
+    // 跨轮累积由 cache 剥字段独立防住,不在本函数 drop。
     let mut messages = vec![
-        json!({"role":"tool","tool_call_id":"old","content":"old text",
-               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,OLD"}}]}),
+        json!({"role":"tool","tool_call_id":"a","content":"text a",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}),
         json!({"role":"assistant","content":"between"}),
-        json!({"role":"tool","tool_call_id":"new","content":"new text",
-               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,NEW"}}]}),
+        json!({"role":"tool","tool_call_id":"b","content":"text b",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,BBB"}}]}),
     ];
-    lift_tool_screenshot_images(&mut messages, 1);
+    lift_tool_screenshot_images(&mut messages);
     let all = serde_json::to_string(&messages).unwrap();
-    // 侧信道字段一律清除
     assert!(
         !all.contains("__cas_tool_images"),
         "侧信道字段必须被清除: {all}"
     );
-    // 当前轮(NEW)提升为 user image message
-    assert!(all.contains("NEW"), "当前轮截图应提升保留");
-    let new_idx = messages
-        .iter()
-        .position(|m| m["tool_call_id"] == "new")
-        .unwrap();
-    assert_eq!(
-        messages[new_idx + 1]["role"],
-        "user",
-        "NEW tool 后应紧跟 user image message"
+    // 两条 tool 各自后面都跟一条 user image message
+    for (tid, data) in [("a", "AAA"), ("b", "BBB")] {
+        let idx = messages
+            .iter()
+            .position(|m| m["tool_call_id"] == tid)
+            .unwrap();
+        assert_eq!(
+            messages[idx + 1]["role"],
+            "user",
+            "{tid} tool 后应紧跟 user image message"
+        );
+        assert!(
+            serde_json::to_string(&messages[idx + 1])
+                .unwrap()
+                .contains(data),
+            "{tid} 图片应保留"
+        );
+    }
+}
+
+#[test]
+fn screenshot_lifted_even_when_user_message_follows_tool_output() {
+    // [chatgpt-codex P2 回归] Codex 完整循环形态:function_call_output(截图) 后紧跟新 user 输入。
+    // 此时 current_tool_count(trailing tool)==0,旧 keep_count 逻辑会丢图。现在必须仍提升。
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_s","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_s","output":[
+                {"type":"input_text","text":"state"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/TRAILINGUSER"}
+            ]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"now click the button"}]}
+        ]
+    });
+    let out =
+        responses_body_to_chat_body_for_provider(&req, Some(&vision_chat_provider())).unwrap();
+    let all = serde_json::to_string(&out["messages"]).unwrap();
+    assert!(
+        all.contains("/9j/TRAILINGUSER"),
+        "尾随 user 消息时当前轮截图仍须提升(不丢): {all}"
     );
-    // 历史轮(OLD)图片丢弃,但 tool 文本仍在
-    assert!(!all.contains("OLD"), "历史轮截图应丢弃,不跨轮累积");
-    assert!(all.contains("old text"), "历史轮 tool 文本应保留");
+    assert!(
+        all.contains("now click the button"),
+        "尾随 user 消息也应保留"
+    );
+    assert!(!all.contains("__cas_tool_images"));
 }
 
 #[test]
