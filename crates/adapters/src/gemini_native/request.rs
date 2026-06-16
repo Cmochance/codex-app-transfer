@@ -18,8 +18,8 @@
 //! - ✅ Gemini 3+ 用 v1alpha endpoint(LiteLLM `common_utils.py:412`)
 //! - ✅ Gemini 3+ 默认 temperature=1.0(LiteLLM 实证 < 1 触发 infinite loop)
 //! - ✅ thinkingConfig:Gemini 3+ 用 thinkingLevel,Gemini 2.x 用 thinkingBudget
-//! - ✅ schema sanitize 增强(enum 空字符串 → null / anyOf null → nullable /
-//!   object type 默认 / additionalProperties+strict+$schema+$id 剥)
+//! - ✅ schema sanitize 增强(enum 空字符串 → null / 非 string 类型 enum 删除 /
+//!   anyOf null → nullable / object type 默认 / additionalProperties+strict+$schema+$id 剥)
 //!
 //! Should 范围(Codex.app 当前不发,**留 TODO follow-up**):
 //! - 🔵 audio/speechConfig / computer_use / google_maps / url_context /
@@ -1760,6 +1760,8 @@ fn function_object_to_declaration(func: Option<&Value>) -> Option<FunctionDeclar
 ///   思路 — 旧实现直接 remove $ref/$defs 导致引用断 + schema 不完整)
 /// - 剥 OpenAPI 高级 keyword(`additionalProperties` / `strict` / `$schema` / `$id`)
 /// - enum 内空字符串 → null(LiteLLM `_fix_enum_empty_strings:466`)
+/// - 非 string 类型字段的 enum **删除**(MOC-251;LiteLLM `_fix_enum_types` —— Gemini/Vertex
+///   只允许 string 字段带 enum,整数 enum 原样发出会 400 `enum[0] (TYPE_STRING)`)
 /// - anyOf 单一 null branch → 当作 nullable + 提取另一 branch(LiteLLM
 ///   `convert_anyof_null_to_nullable:745`)
 /// - object 类型未指定 properties 时补 `properties:{}`(Gemini 强制要求)
@@ -1897,6 +1899,26 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                             obj.insert("nullable".into(), Value::Bool(true));
                         }
                     }
+                }
+            }
+            // [MOC-251] Gemini/Vertex 只允许 **string 类型**字段带 enum(对齐 LiteLLM
+            // `_fix_enum_types`)。非 string-typed 的 enum(如 integer 枚举)原样发出 → 上游
+            // 400(`enum[0] (TYPE_STRING), <int>`,computer-use 工具实测)。**删 enum 保 type**
+            // (不主动破坏性降级:只去 Gemini 表达不了的枚举约束,类型/参数语义不动)。type
+            // 数组已在上面归一为单 string;空串已在上面转 null。保留判定:
+            //   - type 显式 == "string" → 保留
+            //   - typeless 但 enum 值全是 string/null(纯字符串枚举,空串已转 null)→ 保留
+            //   - 其余(type 显式非 string,或 typeless 含整数等非字符串值)→ 删 enum
+            if obj.contains_key("enum") {
+                let keep_enum = match obj.get("type").and_then(|t| t.as_str()) {
+                    Some(t) => t.eq_ignore_ascii_case("string"),
+                    None => obj
+                        .get("enum")
+                        .and_then(|e| e.as_array())
+                        .is_some_and(|arr| arr.iter().all(|v| v.is_string() || v.is_null())),
+                };
+                if !keep_enum {
+                    obj.remove("enum");
                 }
             }
             // P2-A 修复(用户硬性规则:不主动破坏性降级):
@@ -3154,6 +3176,50 @@ mod tests {
         assert_eq!(arr[0], "a");
         assert!(arr[1].is_null(), "空字符串必须转 null");
         assert_eq!(arr[2], "b");
+    }
+
+    #[test]
+    fn schema_sanitize_drops_enum_on_non_string_type() {
+        // [MOC-251] Gemini/Vertex 只允许 string 字段带 enum;整数 enum 原样发出 → 上游 400
+        // (`enum[0] (TYPE_STRING), <int>`,computer-use 工具实测)。type 非 string → 删 enum
+        // 保 type;string-typed enum 保留。
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "button": {"type": "integer", "enum": [1, 2, 3]},
+                "mode": {"type": "string", "enum": ["fast", "slow"]},
+                "ratio": {"type": "number", "enum": [0.5, 1.0]},
+            }
+        });
+        let cleaned = sanitize_schema(schema);
+        let btn = &cleaned["properties"]["button"];
+        assert!(
+            btn.get("enum").is_none(),
+            "integer-typed enum 必须删掉(Gemini 拒非 string enum)"
+        );
+        assert_eq!(btn["type"], "integer", "type 必须保留不动");
+        assert_eq!(
+            cleaned["properties"]["mode"]["enum"],
+            serde_json::json!(["fast", "slow"]),
+            "string-typed enum 必须保留"
+        );
+        assert!(
+            cleaned["properties"]["ratio"].get("enum").is_none(),
+            "number-typed enum 同样删掉"
+        );
+    }
+
+    #[test]
+    fn schema_sanitize_keeps_typeless_string_enum_drops_typeless_int_enum() {
+        // typeless 纯字符串 enum 保留(不回归 enum_empty_string_to_null 既有行为);
+        // typeless 含整数等非字符串值的 enum 删掉(Gemini enum ⟹ string)。
+        let cleaned_str = sanitize_schema(serde_json::json!({"enum": ["a", "b"]}));
+        assert_eq!(cleaned_str["enum"], serde_json::json!(["a", "b"]));
+        let cleaned_int = sanitize_schema(serde_json::json!({"enum": [1, 2]}));
+        assert!(
+            cleaned_int.get("enum").is_none(),
+            "typeless 整数 enum 必须删"
+        );
     }
 
     #[test]
