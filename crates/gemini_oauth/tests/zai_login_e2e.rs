@@ -52,20 +52,35 @@ async fn drive_login(provider: ZaiProvider) {
         })),
     };
 
-    eprintln!("\n=== z.ai e2e: {} 登录开始,浏览器即将弹出 ===", provider.wire_id());
+    eprintln!(
+        "\n=== z.ai e2e: {} 登录开始,浏览器即将弹出 ===",
+        provider.wire_id()
+    );
     let result = run_zai_login(&http, provider, &flow_config, None).await;
 
     match result {
         Ok(cred) => {
             eprintln!("\n✅ {} 登录成功", provider.wire_id());
-            eprintln!("  email           = {}", cred.email.as_deref().unwrap_or("<none>"));
+            eprintln!(
+                "  email           = {}",
+                cred.email.as_deref().unwrap_or("<none>")
+            );
             eprintln!("  org_api_key     = {}", mask(&cred.org_api_key));
             eprintln!("  zcode_jwt       = {}", mask(&cred.zcode_jwt));
-            eprintln!("  落盘路径(临时)  = {}", tmp.path().join(".codex-app-transfer").join(provider.token_filename()).display());
+            eprintln!(
+                "  落盘路径(临时)  = {}",
+                tmp.path()
+                    .join(".codex-app-transfer")
+                    .join(provider.token_filename())
+                    .display()
+            );
             assert!(!cred.org_api_key.is_empty(), "组织 key 不能为空");
             // 组织 key 形如 <apiKey>.<secretKey>(z.ai 必有点号;bigmodel 可只 apiKey)
             if provider == ZaiProvider::Zai {
-                assert!(cred.org_api_key.contains('.'), "z.ai 组织 key 应为 <apiKey>.<secretKey>");
+                assert!(
+                    cred.org_api_key.contains('.'),
+                    "z.ai 组织 key 应为 <apiKey>.<secretKey>"
+                );
             }
         }
         Err(e) => panic!("❌ {} 登录失败: {e}", provider.wire_id()),

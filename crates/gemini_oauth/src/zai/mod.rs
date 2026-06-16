@@ -63,8 +63,7 @@ pub async fn run_zai_login(
     let config = provider.config();
 
     // 1. OAuth → zcode_jwt + provider access_token
-    let exchange =
-        flow::run_zai_oauth_flow_with_cancel(http, &config, flow_config, cancel).await?;
+    let exchange = flow::run_zai_oauth_flow_with_cancel(http, &config, flow_config, cancel).await?;
 
     // 2. 决定换 key 用的 biz Bearer
     let provider_at = exchange

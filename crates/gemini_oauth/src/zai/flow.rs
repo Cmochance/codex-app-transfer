@@ -127,7 +127,11 @@ pub async fn run_zai_oauth_flow_with_cancel(
         .map_err(FlowError::Bind)?;
     let port = listener.local_addr().map_err(FlowError::Bind)?.port();
     let redirect_uri = format!("http://localhost:{port}/oauth-callback");
-    tracing::info!(provider = config.provider.wire_id(), port, "z.ai OAuth loopback server bound");
+    tracing::info!(
+        provider = config.provider.wire_id(),
+        port,
+        "z.ai OAuth loopback server bound"
+    );
 
     // 2. CSRF state + authorize URL(按 provider 选样式)
     let state = random_state_token()?;
@@ -378,7 +382,11 @@ mod tests {
 
     #[test]
     fn zai_authorize_url_uses_oauth_style_params() {
-        let url = build_zai_authorize_url(&super::super::constants::ZAI_CONFIG, "http://localhost:5/oauth-callback", "st8");
+        let url = build_zai_authorize_url(
+            &super::super::constants::ZAI_CONFIG,
+            "http://localhost:5/oauth-callback",
+            "st8",
+        );
         assert!(url.starts_with("https://chat.z.ai/api/oauth/authorize?"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=client_P8X5CMWmlaRO9gyO-KSqtg"));
@@ -390,7 +398,11 @@ mod tests {
 
     #[test]
     fn bigmodel_authorize_url_uses_login_page_style_params() {
-        let url = build_zai_authorize_url(&super::super::constants::BIGMODEL_CONFIG, "http://localhost:7/oauth-callback", "st9");
+        let url = build_zai_authorize_url(
+            &super::super::constants::BIGMODEL_CONFIG,
+            "http://localhost:7/oauth-callback",
+            "st9",
+        );
         assert!(url.starts_with("https://bigmodel.cn/login?"));
         assert!(url.contains("appId=zcode"));
         assert!(url.contains("redirect=http"));
@@ -441,7 +453,10 @@ mod tests {
     fn parse_envelope_missing_token_errors() {
         let body = r#"{"code":0,"data":{"zai":{"access_token":"x"}}}"#;
         let err = parse_token_envelope(ZaiProvider::Zai, body).unwrap_err();
-        assert!(matches!(err, ZaiError::MissingField("data.token")), "实际 {err:?}");
+        assert!(
+            matches!(err, ZaiError::MissingField("data.token")),
+            "实际 {err:?}"
+        );
     }
 
     #[test]

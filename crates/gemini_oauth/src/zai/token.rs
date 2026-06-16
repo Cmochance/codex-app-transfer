@@ -219,10 +219,19 @@ mod tests {
     fn debug_redacts_long_lived_secrets() {
         let cred = sample(ZaiProvider::Zai);
         let dbg = format!("{cred:?}");
-        assert!(!dbg.contains("ak-abc123"), "org_api_key 不该出现在 Debug: {dbg}");
-        assert!(!dbg.contains("sk-secret789"), "secretKey 部分不该出现: {dbg}");
+        assert!(
+            !dbg.contains("ak-abc123"),
+            "org_api_key 不该出现在 Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("sk-secret789"),
+            "secretKey 部分不该出现: {dbg}"
+        );
         assert!(!dbg.contains("ey.zcode.jwt"), "zcode_jwt 不该出现: {dbg}");
-        assert!(!dbg.contains("provider-at-xyz"), "provider_access_token 不该出现: {dbg}");
+        assert!(
+            !dbg.contains("provider-at-xyz"),
+            "provider_access_token 不该出现: {dbg}"
+        );
         assert!(dbg.contains("<redacted>"), "应有脱敏标记: {dbg}");
         // email 非 secret,保留可见(production 日志本就打)
         assert!(dbg.contains("user@example.com"), "email 应可见: {dbg}");
@@ -246,7 +255,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ZaiCredentialStore::at_path(dir.path().join("zai-oauth.json"));
         store.save(&sample(ZaiProvider::Zai)).unwrap();
-        let mode = std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "凭证文件必须 0600,实际 {mode:o}");
     }
 }

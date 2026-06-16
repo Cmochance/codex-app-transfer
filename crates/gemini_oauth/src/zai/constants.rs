@@ -184,7 +184,10 @@ mod tests {
     #[test]
     fn provider_token_filenames_are_distinct_per_provider() {
         assert_eq!(ZaiProvider::Zai.token_filename(), "zai-oauth.json");
-        assert_eq!(ZaiProvider::BigModel.token_filename(), "bigmodel-oauth.json");
+        assert_eq!(
+            ZaiProvider::BigModel.token_filename(),
+            "bigmodel-oauth.json"
+        );
         assert_ne!(
             ZaiProvider::Zai.token_filename(),
             ZaiProvider::BigModel.token_filename()
@@ -224,7 +227,10 @@ mod tests {
         let c = ZaiProvider::BigModel.config();
         // biz base 是 ZCode 后端,**不是**模型面 open.bigmodel.cn
         assert_eq!(c.biz_base, "https://zcode.z.ai");
-        assert!(c.business_login_url.is_none(), "bigmodel 直接用 oauth token 当 biz Bearer");
+        assert!(
+            c.business_login_url.is_none(),
+            "bigmodel 直接用 oauth token 当 biz Bearer"
+        );
         assert!(!c.require_secret_key);
         assert_eq!(c.model_base, "https://open.bigmodel.cn/api/anthropic");
     }
@@ -238,6 +244,10 @@ mod tests {
         assert!(headers.iter().any(|(k, _)| *k == "X-Title"));
         // X-Platform 形如 <os>-<arch>,含连字符
         let plat = headers.iter().find(|(k, _)| *k == "X-Platform").unwrap();
-        assert!(plat.1.contains('-'), "X-Platform 应为 <os>-<arch>: {}", plat.1);
+        assert!(
+            plat.1.contains('-'),
+            "X-Platform 应为 <os>-<arch>: {}",
+            plat.1
+        );
     }
 }

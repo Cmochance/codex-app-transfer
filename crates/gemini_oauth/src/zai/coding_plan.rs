@@ -72,8 +72,12 @@ pub async fn resolve_org_api_key(
     let biz = config.biz_base;
 
     // 1. customer info → org / project
-    let customer = biz_get(http, &format!("{biz}/api/biz/customer/getCustomerInfo"), bearer_token)
-        .await?;
+    let customer = biz_get(
+        http,
+        &format!("{biz}/api/biz/customer/getCustomerInfo"),
+        bearer_token,
+    )
+    .await?;
     let (org, proj) = pick_org_and_project(&customer)?;
 
     // 2. api_keys 找 zcode-api-key,没有就建
@@ -345,16 +349,24 @@ mod tests {
     fn pick_org_project_distinguishes_empty_from_malformed() {
         // 空 organizations → KeyResolution(账号真无 org,可引导用户)
         let empty = pick_org_and_project(&json!({"organizations": []})).unwrap_err();
-        assert!(matches!(empty, ZaiError::KeyResolution(_)), "实际 {empty:?}");
+        assert!(
+            matches!(empty, ZaiError::KeyResolution(_)),
+            "实际 {empty:?}"
+        );
         // organizations 字段缺失 → MissingField(结构漂移,跟「真无 org」区分)
         let missing = pick_org_and_project(&json!({"foo": 1})).unwrap_err();
-        assert!(matches!(missing, ZaiError::MissingField(_)), "实际 {missing:?}");
+        assert!(
+            matches!(missing, ZaiError::MissingField(_)),
+            "实际 {missing:?}"
+        );
         // 有 org 但 projects 为空 → KeyResolution
-        let no_proj = pick_org_and_project(
-            &json!({"organizations":[{"organizationId":"o","projects":[]}]}),
-        )
-        .unwrap_err();
-        assert!(matches!(no_proj, ZaiError::KeyResolution(_)), "实际 {no_proj:?}");
+        let no_proj =
+            pick_org_and_project(&json!({"organizations":[{"organizationId":"o","projects":[]}]}))
+                .unwrap_err();
+        assert!(
+            matches!(no_proj, ZaiError::KeyResolution(_)),
+            "实际 {no_proj:?}"
+        );
     }
 
     #[test]
@@ -372,8 +384,14 @@ mod tests {
 
     #[test]
     fn extract_str_trims_and_unwraps_data() {
-        assert_eq!(extract_str(&json!({"secretKey":" sk-9 "}), "secretKey").as_deref(), Some("sk-9"));
-        assert_eq!(extract_str(&json!({"data":{"access_token":"at-1"}}), "access_token").as_deref(), Some("at-1"));
+        assert_eq!(
+            extract_str(&json!({"secretKey":" sk-9 "}), "secretKey").as_deref(),
+            Some("sk-9")
+        );
+        assert_eq!(
+            extract_str(&json!({"data":{"access_token":"at-1"}}), "access_token").as_deref(),
+            Some("at-1")
+        );
         assert_eq!(extract_str(&json!({}), "missing"), None);
     }
 
