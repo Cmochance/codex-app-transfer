@@ -113,14 +113,36 @@ pub async fn run_remote_control_daemon() {
         // Telegram 会留存这些消息(最长 24h);offset=0 起会把「关闭期间 / 发信人尚未进
         // 白名单时」发的指令当 live 命令立即执行(重放)。会话启动先用 offset=-1(取队尾
         // 最后一条、遗忘之前所有)把 offset 推到最新之后,只接受**启用之后**到达的消息。
-        match client.get_updates(-1, 0).await {
-            Ok(updates) => {
-                if let Some(max_id) = updates.iter().map(|u| u.update_id).max() {
-                    offset = max_id + 1;
-                    tracing::info!("[RemoteControl] 丢弃启用前积压,offset 起于 {offset}");
+        // drain **必须成功**才进 live loop —— 失败(如 Telegram 短暂不可达)就退避重试,
+        // 绝不以 offset=0 进 live loop,否则下一次成功 poll 会重放积压(bot-review P2)。
+        let mut drained = false;
+        for attempt in 0..6 {
+            if !enabled() || bot_token().as_deref() != Some(token.as_str()) {
+                break;
+            }
+            match client.get_updates(-1, 0).await {
+                Ok(updates) => {
+                    if let Some(max_id) = updates.iter().map(|u| u.update_id).max() {
+                        offset = max_id + 1;
+                        tracing::info!("[RemoteControl] 丢弃启用前积压,offset 起于 {offset}");
+                    }
+                    drained = true;
+                    break;
+                }
+                Err(e) => {
+                    let wait = (3u64 << attempt.min(4)).min(60);
+                    tracing::warn!(
+                        "[RemoteControl] 初始 drain 失败(第 {} 次,{wait}s 后重试): {e}",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
             }
-            Err(e) => tracing::warn!("[RemoteControl] 初始 drain 失败(以 offset=0 起): {e}"),
+        }
+        if !drained {
+            // drain 始终失败:不进 live loop(避免 offset=0 重放积压),回外层整体重建。
+            tracing::warn!("[RemoteControl] 初始 drain 持续失败,本次不进 live loop,稍后重建会话");
+            continue;
         }
         tracing::info!(
             "[RemoteControl] Telegram bot daemon 已启动 (driver schema v{})",
@@ -345,6 +367,7 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
     let mut give_up_edit = false; // 编辑连续失败 → 停止编辑但继续持锁轮询
     let mut saw_running = false; // submitting 出现过 Some(true)(模型确实起跑)
     let mut warned_no_text = false; // 「无文本」提示只发一次
+    let mut completed = false; // 是否经「真实 idle 证据」正常完成(区别于超时/CDP 断)
     for i in 0..MAX_POLLS {
         tokio::time::sleep(STREAM_POLL).await;
         let snap = match driver::snapshot().await {
@@ -410,16 +433,34 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
             };
             let _ = client.send_message(chat_id, msg).await;
         }
-        // 完成判定:
-        // ① done_idle:Codex 明确空闲(当前 submitting==false)+ 内容稳定;
-        // ② done_drift:当前仍读不到 submitting(fiber 漂移)+ **已有非空内容**长稳。
-        //    drift 必须要求非空内容(bot-review P2)—— 否则在 isSubmitting fiber 完全漂移
-        //    的 Codex 版本上,刚提交、还在 thinking/等批准的轮次会因「空内容稳定 6 轮 ≈7s」
-        //    误判完成提前放锁。空内容 + 全程读不到 submitting 的极端情形只等到 MAX_POLLS。
+        // 完成判定(bot-review P2):必须有**真实 idle 证据**,不靠纯 stable-text 的 drift。
+        // ① done_idle:submitting 明确读到 false(显式空闲)+ 内容稳定;
+        // ② done_final:Codex 给最终 assistant 答案打了 final-assistant 标记(streaming /
+        //    Thinking / 跑工具 / 等批准期间**不在**)+ 内容稳定 —— 比 isSubmitting 可靠,
+        //    且覆盖 fiber 漂移读不到 submitting 的 Codex 版本(codex-e2e-test skill 实证)。
+        // 两者都拿不到(submitting 漂移 + 无 final 标记,如纯工具轮)→ 不提前完成,持锁
+        // 等到 MAX_POLLS,由循环后的「超时仍在跑则 stop」兜底,绝不在仍在跑时放锁。
         let done_idle = snap.submitting == Some(false) && stable >= 2;
-        let done_drift = snap.submitting.is_none() && stable >= 6 && !last_seen.is_empty();
-        if done_idle || done_drift {
+        let done_final = snap.final_ready && stable >= 2;
+        if done_idle || done_final {
+            completed = true;
             break;
+        }
+    }
+    // 循环退出三种:completed(正常完成)/ read_err_streak(Codex 不可达,释放安全)/
+    // MAX_POLLS 耗尽(可能仍在跑)。后两者取末张快照确认:仍 submitting==true → stop 中止
+    // 再释放锁(bot-review P2:超时仍在跑就放锁会让下条 prompt 驱动同一页面)。
+    if !completed {
+        if let Ok(s) = driver::snapshot().await {
+            if s.submitting == Some(true) {
+                let _ = driver::stop().await;
+                let _ = client
+                    .send_message(
+                        chat_id,
+                        "⏱ 轮次超过时长上限仍在运行,已发送停止以释放远程控制(可重发指令)。",
+                    )
+                    .await;
+            }
         }
     }
     if last_sent.is_empty() {

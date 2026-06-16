@@ -5,8 +5,10 @@
 //! - composer = 底部唯一可见 `div.ProseMirror[contenteditable]`(ProseMirror 编辑器)
 //! - 灌字 = `focus()` + `document.execCommand('insertText')`(回退 `beforeinput/input`)
 //! - 提交 = 点 `button[class*="size-token-button-compose"]`(回退爬 fiber 调 `handleSubmit()`)
-//! - 读输出 = 末个用户气泡(`bg-token-foreground/5 ... rounded-2*`)之后的 transcript 文本
-//! - 完成判定 = composer fiber `isSubmitting===false`
+//! - 读输出 = `[data-local-conversation-final-assistant]`(剥用户气泡+时间戳),兜底用
+//!   `[data-user-message-bubble]` + 排除 composer 的滚动容器(codex-e2e-test skill 实证)
+//! - 完成判定 = `[data-local-conversation-final-assistant]` 就绪(final_ready)优先,
+//!   `isSubmitting===false` 兜底 —— isSubmitting 在 streaming/Thinking 阶段会提前读 false
 //!
 //! **边界**(spike 实证):页面 CSP `connect-src` 只放 chatgpt/openai/mapbox,注入 JS
 //! 开不了外部 WS → 对外 bot 长连接必须 Rust 侧(见 [`super::telegram`]);renderer 纯
@@ -44,6 +46,11 @@ pub struct Snapshot {
     pub submitting: Option<bool>,
     /// 末个用户气泡之后的 transcript 文本(= 最近一轮 assistant 输出,已轻清洗)。
     pub reply: Option<String>,
+    /// `[data-local-conversation-final-assistant]` 在场且有非空文本 —— Codex 在**最终**
+    /// assistant 答案渲染好后才打这个标记(Thinking/streaming 阶段不在)。比 `isSubmitting`
+    /// 更可靠的「本轮已结束」信号(isSubmitting 在 streaming 阶段会提前读 false);用于
+    /// fiber 漂移、读不到 submitting 时的完成判定(codex-e2e-test skill 实证)。
+    pub final_ready: bool,
 }
 
 /// 一次 CDP `Runtime.evaluate`(连接→发→drain→关),返回 JS 的 `returnByValue` 结果。
@@ -78,25 +85,38 @@ function __crSubmitting(){
 }
 "#;
 
-/// 读快照:composer 在否 + isSubmitting + 末个用户气泡之后的 transcript 文本。
+/// 读快照:composer 在否 + isSubmitting + finalReady + 最近一轮 assistant 文本。
+/// 提取与完成信号(codex-e2e-test skill 实证):
+/// - finalReady = `[data-local-conversation-final-assistant]` 在场且有非空文本(最终答案
+///   渲染好才出),作完成信号优于 isSubmitting(后者 streaming 阶段提前读 false)。
+/// - reply 优先取 final-assistant(剥用户气泡 + 时间戳叶子);兜底用 `data-user-message-bubble`
+///   + **排除 composer** 的滚动容器(避免圈进 Approve/模型选择/Thinking 噪声)。
 const JS_SNAPSHOT: &str = r#"
 (function(){
   var pm=__crComposer();
-  var out={ present: !!pm, submitting: __crSubmitting(), reply: null };
-  var bubbles=document.querySelectorAll('[class*="bg-token-foreground/5"][class*="rounded-2"]');
-  if(bubbles.length){
-    var lastUser=bubbles[bubbles.length-1];
-    // 找 transcript 容器:末个用户气泡向上第一个可滚动大容器
-    var cont=lastUser;
-    for(var i=0;i<14 && cont.parentElement;i++){
-      var c=cont.parentElement; var r=c.getBoundingClientRect();
-      if(r.width>380 && c.scrollHeight>c.clientHeight+30){ cont=c; break; }
+  var out={ present: !!pm, submitting: __crSubmitting(), reply: null, finalReady: false };
+  var fa=document.querySelectorAll('[data-local-conversation-final-assistant]');
+  if(fa.length){
+    var clone=fa[fa.length-1].cloneNode(true);
+    clone.querySelectorAll('[data-user-message-bubble]').forEach(function(n){ n.remove(); });
+    clone.querySelectorAll('*').forEach(function(n){ if(!n.children.length && /^\s*\d{1,2}:\d{2}\s?(AM|PM)\s*$/i.test(n.textContent||'')) n.remove(); });
+    var t=(clone.innerText||'').trim();
+    if(t){ out.reply=t; out.finalReady=true; }
+  }
+  var ub=document.querySelectorAll('[data-user-message-bubble]');
+  if(ub.length){
+    var lastUser=ub[ub.length-1];
+    var cont=lastUser, picked=null;
+    for(var i=0;i<16 && cont.parentElement;i++){
+      var c=cont.parentElement;
+      if(c.querySelector('.ProseMirror')) break;
       cont=c;
+      var r=c.getBoundingClientRect();
+      if(r.width>380 && c.scrollHeight>c.clientHeight+20) picked=c;
     }
-    var full=cont.innerText||'';
-    var key=(lastUser.innerText||'').slice(0,60);
-    var idx=key?full.lastIndexOf(key):-1;
-    out.reply = idx>=0 ? full.slice(idx + (lastUser.innerText||'').length) : null;
+    var box=picked||cont;
+    var full=box.innerText||''; var key=(lastUser.innerText||'').slice(0,60); var idx=key?full.lastIndexOf(key):-1;
+    if(out.reply==null) out.reply = idx>=0 ? full.slice(idx + (lastUser.innerText||'').length) : null;
   }
   return out;
 })()
@@ -153,6 +173,10 @@ pub async fn snapshot() -> Result<Snapshot, String> {
             .and_then(Value::as_str)
             .map(clean_reply)
             .filter(|s| !s.is_empty()),
+        final_ready: v
+            .get("finalReady")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -246,8 +270,8 @@ fn clean_reply(raw: &str) -> String {
         if is_ts {
             continue;
         }
-        // "Worked for 0s" / "Worked for 1m 3s" 等状态行
-        if t.starts_with("Worked for ") {
+        // "Worked for 0s" / "Worked for 1m 3s" 等状态行;流式思考/批准占位
+        if t.starts_with("Worked for ") || t == "Thinking" || t == "Approve for me" {
             continue;
         }
         lines.push(t);
