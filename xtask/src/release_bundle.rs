@@ -21,9 +21,11 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Utc;
 use clap::Args as ClapArgs;
 use indexmap::IndexMap;
-use rand::rngs::OsRng;
+// rsa crate 自带 rand_core 0.6 re-export(与 rsa 0.9 的 CryptoRngCore trait 兼容)。
+// 不直接依赖 rand crate,避免 rand 0.9 升级后 rand_core 0.6/0.9 版本冲突。
 use regex::Regex;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
+use rsa::rand_core::OsRng;
 use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use serde::Serialize;
 use serde_json::{json, Value};
