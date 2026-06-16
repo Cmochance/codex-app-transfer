@@ -1901,26 +1901,6 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                     }
                 }
             }
-            // [MOC-251] Gemini/Vertex 只允许 **string 类型**字段带 enum(对齐 LiteLLM
-            // `_fix_enum_types`)。非 string-typed 的 enum(如 integer 枚举)原样发出 → 上游
-            // 400(`enum[0] (TYPE_STRING), <int>`,computer-use 工具实测)。**删 enum 保 type**
-            // (不主动破坏性降级:只去 Gemini 表达不了的枚举约束,类型/参数语义不动)。type
-            // 数组已在上面归一为单 string;空串已在上面转 null。保留判定:
-            //   - type 显式 == "string" → 保留
-            //   - typeless 但 enum 值全是 string/null(纯字符串枚举,空串已转 null)→ 保留
-            //   - 其余(type 显式非 string,或 typeless 含整数等非字符串值)→ 删 enum
-            if obj.contains_key("enum") {
-                let keep_enum = match obj.get("type").and_then(|t| t.as_str()) {
-                    Some(t) => t.eq_ignore_ascii_case("string"),
-                    None => obj
-                        .get("enum")
-                        .and_then(|e| e.as_array())
-                        .is_some_and(|arr| arr.iter().all(|v| v.is_string() || v.is_null())),
-                };
-                if !keep_enum {
-                    obj.remove("enum");
-                }
-            }
             // P2-A 修复(用户硬性规则:不主动破坏性降级):
             // Gemini Schema 文档(`vertex-ai/docs/reference/rest/v1beta1/Schema`)
             // **明确支持 anyOf**。旧实现把多 non-null branch silent 砍到 first,
@@ -1955,6 +1935,29 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
                 }
                 // 其他形态(多 non-null / pure null)— anyOf 字段**保留**不剥,
                 // Gemini 自己 validate(它文档支持 anyOf union type)
+            }
+            // [MOC-251] Gemini/Vertex 只允许 **string 类型**字段带 enum(对齐 LiteLLM
+            // `_fix_enum_types`)。非 string-typed 的 enum(如 integer 枚举)原样发出 → 上游
+            // 400(`enum[0] (TYPE_STRING), <int>`,computer-use 工具实测)。**删 enum 保 type**
+            // (不主动破坏性降级:只去 Gemini 表达不了的枚举约束,类型/参数语义不动)。
+            // **必须放在上面 anyOf nullable 折叠之后**:折叠会把单 non-null branch 的 type+enum
+            // 拷到 parent 再删 anyOf,而递归只 visit 子值、不重查 parent —— 剪枝若在折叠前跑,
+            // anyOf 包裹的整数 enum(`{anyOf:[{type:integer,enum:[1,2]},{type:null}]}`)会漏过去、
+            // 同样 400(#497 bot review P2)。type 数组已归一为单 string;空串已转 null。保留判定:
+            //   - type 显式 == "string" → 保留
+            //   - typeless 但 enum 值全是 string/null(纯字符串枚举,空串已转 null)→ 保留
+            //   - 其余(type 显式非 string,或 typeless 含整数等非字符串值)→ 删 enum
+            if obj.contains_key("enum") {
+                let keep_enum = match obj.get("type").and_then(|t| t.as_str()) {
+                    Some(t) => t.eq_ignore_ascii_case("string"),
+                    None => obj
+                        .get("enum")
+                        .and_then(|e| e.as_array())
+                        .is_some_and(|arr| arr.iter().all(|v| v.is_string() || v.is_null())),
+                };
+                if !keep_enum {
+                    obj.remove("enum");
+                }
             }
             // oneOf / allOf:**刻意不处理、原样透传**(MOC-205 / codex 0.139 #24118+#27084)。
             // ai.google.dev 的 Schema 字段表只列 anyOf、未列 oneOf/allOf,LiteLLM
@@ -3219,6 +3222,31 @@ mod tests {
         assert!(
             cleaned_int.get("enum").is_none(),
             "typeless 整数 enum 必须删"
+        );
+    }
+
+    #[test]
+    fn schema_sanitize_drops_enum_from_nullable_anyof_integer() {
+        // [#497 bot review P2] nullable 整数 enum 用 anyOf 表达:
+        // `{anyOf:[{type:integer,enum:[1,2]},{type:null}]}` → anyOf nullable 折叠把
+        // 非 null branch 的 type+enum 拷到 parent;enum 剪枝必须在折叠**后**跑,否则
+        // 整数 enum 漏给 Gemini → 同样 400。
+        let schema = serde_json::json!({
+            "anyOf": [
+                {"type": "integer", "enum": [1, 2]},
+                {"type": "null"}
+            ]
+        });
+        let cleaned = sanitize_schema(schema);
+        assert_eq!(
+            cleaned["type"], "integer",
+            "非 null branch 的 type 应折叠到 parent"
+        );
+        assert_eq!(cleaned["nullable"], true, "null branch → nullable");
+        assert!(cleaned.get("anyOf").is_none(), "anyOf 已折叠");
+        assert!(
+            cleaned.get("enum").is_none(),
+            "anyOf 折叠上来的整数 enum 必须被剪掉(否则 Gemini 400)"
         );
     }
 
