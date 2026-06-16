@@ -1947,7 +1947,10 @@ fn sanitize_schema_inplace(v: &mut Value, depth: usize) {
             //   - type 显式 == "string" → 保留
             //   - typeless 但 enum 值全是 string/null(纯字符串枚举,空串已转 null)→ 保留
             //   - 其余(type 显式非 string,或 typeless 含整数等非字符串值)→ 删 enum
-            if obj.contains_key("enum") {
+            // **gate 在 `enum` 值确实是数组**:enum 关键字值永远是数组;若工具参数名恰好叫
+            // `enum`(在 `properties` map 里它是 schema 对象、非枚举数组),不能当 enum 关键字删
+            // (否则参数丢失 + `required:["enum"]` 悬空,#497 bot review P2 round-2)。
+            if obj.get("enum").is_some_and(|e| e.is_array()) {
                 let keep_enum = match obj.get("type").and_then(|t| t.as_str()) {
                     Some(t) => t.eq_ignore_ascii_case("string"),
                     None => obj
@@ -3248,6 +3251,26 @@ mod tests {
             cleaned.get("enum").is_none(),
             "anyOf 折叠上来的整数 enum 必须被剪掉(否则 Gemini 400)"
         );
+    }
+
+    #[test]
+    fn schema_sanitize_keeps_property_named_enum() {
+        // [#497 bot review P2 round-2] 工具参数名恰好叫 "enum"(值是 schema 对象、非枚举数组)
+        // 不能被当成 enum 关键字删掉(否则参数丢失 + required:["enum"] 悬空)。
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "enum": {"type": "string", "description": "a param literally named enum"}
+            },
+            "required": ["enum"]
+        });
+        let cleaned = sanitize_schema(schema);
+        assert!(
+            cleaned["properties"]["enum"].is_object(),
+            "名为 enum 的参数必须保留"
+        );
+        assert_eq!(cleaned["properties"]["enum"]["type"], "string");
+        assert_eq!(cleaned["required"], serde_json::json!(["enum"]));
     }
 
     #[test]
