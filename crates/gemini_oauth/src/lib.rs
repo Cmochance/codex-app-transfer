@@ -36,6 +36,7 @@ pub mod constants;
 pub mod flow;
 pub mod service;
 pub mod token;
+pub mod zai;
 
 pub use cloud_code::{bootstrap_project, ClientMetadata, CloudCodeError};
 pub use constants::{
@@ -58,4 +59,10 @@ pub use antigravity::{
     fetch_gemini_quota_summary, refresh_antigravity_access_token,
     run_antigravity_oauth_flow_with_cancel, AntigravityClientMetadata, AntigravityModelEntry,
     GeminiQuota, QuotaError, QuotaWindow,
+};
+
+// z.ai / bigmodel(GLM Coding Plan 账号登录)provider re-exports(parallel module,
+// 独立 vendor wire,复用 gemini OauthFlowConfig / FlowError loopback 骨架)
+pub use zai::{
+    run_zai_login, ZaiCredential, ZaiCredentialStore, ZaiError, ZaiProvider, ZaiProviderConfig,
 };
