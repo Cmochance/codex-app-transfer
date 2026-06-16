@@ -64,5 +64,6 @@ pub use antigravity::{
 // z.ai / bigmodel(GLM Coding Plan 账号登录)provider re-exports(parallel module,
 // 独立 vendor wire,复用 gemini OauthFlowConfig / FlowError loopback 骨架)
 pub use zai::{
-    run_zai_login, ZaiCredential, ZaiCredentialStore, ZaiError, ZaiProvider, ZaiProviderConfig,
+    resume_zai_login, run_zai_login, ZaiCredential, ZaiCredentialStore, ZaiError, ZaiPendingStore,
+    ZaiPendingTokens, ZaiProvider, ZaiProviderConfig,
 };

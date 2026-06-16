@@ -96,58 +96,146 @@ impl ZaiCredentialStore {
     /// 加载凭证。文件不存在返 `Ok(None)`(未登录正常路径);JSON 损坏返
     /// `Serde` 错(不静默当未登录,跟 gemini TokenStore 一致)。
     pub fn load(&self) -> Result<Option<ZaiCredential>, TokenError> {
-        match std::fs::read(&self.path) {
-            Ok(bytes) => {
-                let cred: ZaiCredential = serde_json::from_slice(&bytes)?;
-                Ok(Some(cred))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(TokenError::Io(e)),
-        }
+        read_json_opt(&self.path)
     }
 
     /// 写凭证 —— temp + rename 保证 atomic;Unix 上**创建时即 0600**(避免先
     /// 0644 再 chmod 的世界可读窗口,跟 gemini TokenStore H3 修一致)。
     pub fn save(&self, cred: &ZaiCredential) -> Result<(), TokenError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(cred)?;
-
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            // 清残留 tmp:只吞 NotFound,别的 IO 错必须 propagate
-            match std::fs::remove_file(&tmp) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(TokenError::Io(e)),
-            }
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp, &json)?;
-        }
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        write_json_atomic(&self.path, cred)
     }
 
     /// 删除凭证(logout / 401 重登)。文件不存在算成功(idempotent)。
     pub fn delete(&self) -> Result<(), TokenError> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(TokenError::Io(e)),
+        delete_file_idempotent(&self.path)
+    }
+}
+
+/// OAuth 授权成功、但**还没换出组织 key** 时落盘的中间 token(安全网)。
+///
+/// 浏览器 OAuth 授权是"消耗登录"的部分;授权一旦成功就立即把这份 token 落盘,
+/// 之后换组织 key 的后端调用即便失败,也能用 [`resume_zai_login`](super::resume_zai_login)
+/// 从这里**不重新走浏览器**地重试(限 `provider_access_token` 有效期内)。成功换出
+/// key 后这份 pending 会被删除。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZaiPendingTokens {
+    pub provider: ZaiProvider,
+    /// ZCode 业务 JWT(`data.token`)。
+    pub zcode_jwt: String,
+    /// provider 侧 access_token —— resume 换 key 的入口(z.ai 还要再换业务 token)。
+    pub provider_access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// OAuth 完成时刻(UNIX ms-epoch)—— resume 前可据此判断 token 是否可能已过期。
+    pub obtained_at_ms: i64,
+}
+
+/// 手写 `Debug` 脱敏 secret(`zcode_jwt`/`provider_access_token`)。
+impl std::fmt::Debug for ZaiPendingTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZaiPendingTokens")
+            .field("provider", &self.provider)
+            .field("zcode_jwt", &"<redacted>")
+            .field("provider_access_token", &"<redacted>")
+            .field("email", &self.email)
+            .field("obtained_at_ms", &self.obtained_at_ms)
+            .finish()
+    }
+}
+
+/// `~/.codex-app-transfer/<provider>-oauth-pending.json` 持久化句柄(安全网中间态)。
+/// 复用跟 [`ZaiCredentialStore`] 同一套 atomic write + 0600。
+pub struct ZaiPendingStore {
+    path: PathBuf,
+}
+
+impl ZaiPendingStore {
+    pub fn for_provider(provider: ZaiProvider) -> Result<Self, TokenError> {
+        let home =
+            codex_app_transfer_registry::paths::resolve_home().ok_or(TokenError::HomeNotSet)?;
+        let path = home
+            .join(".codex-app-transfer")
+            .join(pending_filename(provider));
+        Ok(Self { path })
+    }
+
+    pub fn at_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<Option<ZaiPendingTokens>, TokenError> {
+        read_json_opt(&self.path)
+    }
+
+    pub fn save(&self, tokens: &ZaiPendingTokens) -> Result<(), TokenError> {
+        write_json_atomic(&self.path, tokens)
+    }
+
+    pub fn delete(&self) -> Result<(), TokenError> {
+        delete_file_idempotent(&self.path)
+    }
+}
+
+/// pending 文件名 `<provider>-oauth-pending.json`(跟 `<provider>-oauth.json` 区分)。
+fn pending_filename(provider: ZaiProvider) -> String {
+    let base = provider.token_filename(); // "<p>-oauth.json"
+    base.replace("-oauth.json", "-oauth-pending.json")
+}
+
+/// 把 `value` atomic 写到 `path`(temp + rename,Unix 创建时即 0600)。
+/// `ZaiCredentialStore`/`ZaiPendingStore` 共用,序列化任意 `Serialize`。
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), TokenError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_vec_pretty(value)?;
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // 清残留 tmp:只吞 NotFound,别的 IO 错必须 propagate
+        match std::fs::remove_file(&tmp) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(TokenError::Io(e)),
         }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, &json)?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// 读 + 反序列化;文件不存在返 `Ok(None)`,JSON 损坏返 `Serde` 错(不静默)。
+fn read_json_opt<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, TokenError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(TokenError::Io(e)),
+    }
+}
+
+/// 删文件,不存在算成功(idempotent)。
+fn delete_file_idempotent(path: &Path) -> Result<(), TokenError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(TokenError::Io(e)),
     }
 }
 
@@ -246,6 +334,65 @@ mod tests {
         assert!(!json.contains("provider_access_token"), "json: {json}");
         assert!(!json.contains("email"), "json: {json}");
         assert!(json.contains("org_api_key"));
+    }
+
+    fn sample_pending(provider: ZaiProvider) -> ZaiPendingTokens {
+        ZaiPendingTokens {
+            provider,
+            zcode_jwt: "ey.zcode.jwt".into(),
+            provider_access_token: "provider-at-xyz".into(),
+            email: Some("user@example.com".into()),
+            obtained_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn pending_store_roundtrip_and_distinct_filename() {
+        let dir = TempDir::new().unwrap();
+        let store = ZaiPendingStore::at_path(dir.path().join("zai-oauth-pending.json"));
+        let p = sample_pending(ZaiProvider::Zai);
+        assert_eq!(store.load().unwrap(), None);
+        store.save(&p).unwrap();
+        assert_eq!(store.load().unwrap().unwrap(), p);
+        store.delete().unwrap();
+        assert_eq!(store.load().unwrap(), None);
+    }
+
+    #[test]
+    fn pending_filename_distinct_from_credential_file() {
+        assert_eq!(pending_filename(ZaiProvider::Zai), "zai-oauth-pending.json");
+        assert_eq!(
+            pending_filename(ZaiProvider::BigModel),
+            "bigmodel-oauth-pending.json"
+        );
+        // pending 文件名必须跟正式凭证文件名不同,否则会互相覆盖
+        assert_ne!(
+            pending_filename(ZaiProvider::Zai),
+            ZaiProvider::Zai.token_filename()
+        );
+    }
+
+    #[test]
+    fn pending_debug_redacts_secrets() {
+        let dbg = format!("{:?}", sample_pending(ZaiProvider::Zai));
+        assert!(!dbg.contains("ey.zcode.jwt"), "zcode_jwt 不该出现: {dbg}");
+        assert!(!dbg.contains("provider-at-xyz"), "token 不该出现: {dbg}");
+        assert!(dbg.contains("<redacted>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_save_sets_unix_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let store = ZaiPendingStore::at_path(dir.path().join("zai-oauth-pending.json"));
+        store.save(&sample_pending(ZaiProvider::Zai)).unwrap();
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "pending 文件必须 0600,实际 {mode:o}");
     }
 
     #[cfg(unix)]
