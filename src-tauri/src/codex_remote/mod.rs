@@ -109,6 +109,19 @@ pub async fn run_remote_control_daemon() {
         // 复用旧 offset 会让 getUpdates 跳过新 bot 的(可能更小的)update_id → 新 token
         // 看着像死的(bot-review P2)。Telegram 不会重投已确认 update,重置到 0 安全。
         let mut offset: i64 = 0;
+        // **丢弃积压**(bot-review P2):功能关闭/无 token 期间 daemon 不 getUpdates,
+        // Telegram 会留存这些消息(最长 24h);offset=0 起会把「关闭期间 / 发信人尚未进
+        // 白名单时」发的指令当 live 命令立即执行(重放)。会话启动先用 offset=-1(取队尾
+        // 最后一条、遗忘之前所有)把 offset 推到最新之后,只接受**启用之后**到达的消息。
+        match client.get_updates(-1, 0).await {
+            Ok(updates) => {
+                if let Some(max_id) = updates.iter().map(|u| u.update_id).max() {
+                    offset = max_id + 1;
+                    tracing::info!("[RemoteControl] 丢弃启用前积压,offset 起于 {offset}");
+                }
+            }
+            Err(e) => tracing::warn!("[RemoteControl] 初始 drain 失败(以 offset=0 起): {e}"),
+        }
         tracing::info!(
             "[RemoteControl] Telegram bot daemon 已启动 (driver schema v{})",
             driver::DRIVER_SCHEMA_VERSION
@@ -254,6 +267,17 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
     // 1) 确保 composer 在场(不在则新建对话)。new_chat 失败/没找到按钮必须显式
     //    告知并 return —— 否则下游 set_input 退化成误导性的「输入失败」。
     match driver::snapshot().await {
+        // 初始已在跑(桌面端有一轮进行中)→ 拒绝注入(bot-review P2):此时发送钮是停止钮,
+        // set_input/submit 会覆盖草稿并停掉桌面轮次。此处未驱动任何东西,释放锁安全。
+        Ok(s) if s.submitting == Some(true) => {
+            notify(
+                client,
+                chat_id,
+                "⏳ Codex 桌面端有一轮正在进行,请等它结束、或在桌面停止后再发。",
+            )
+            .await;
+            return;
+        }
         Ok(s) if !s.composer_present => match driver::new_chat().await {
             Ok(true) => tokio::time::sleep(Duration::from_millis(1500)).await,
             Ok(false) => {
@@ -299,12 +323,14 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
         return;
     }
 
-    // 3) 占位消息 + 流式编辑
-    let msg_id = match client.send_message(chat_id, "▍ 正在处理…").await {
-        Ok(id) => id,
+    // 3) 占位消息 + 流式编辑。占位发送失败**不 return**(submit 已让 Codex 起跑,return
+    //    会放锁让下条 prompt 驱动同页,bot-review P2):msg_id 置 None,无流式但仍持锁轮询
+    //    到 Codex 空闲。
+    let msg_id: Option<i64> = match client.send_message(chat_id, "▍ 正在处理…").await {
+        Ok(id) => Some(id),
         Err(e) => {
-            tracing::warn!("[RemoteControl] 占位消息发送失败: {e}");
-            return;
+            tracing::warn!("[RemoteControl] 占位消息发送失败,改为静默持锁轮询到 Codex 空闲: {e}");
+            None
         }
     };
     // 不变量(bot-review P2):TURN_LOCK 必须持到 Codex 真正空闲(submitting==false)/
@@ -345,29 +371,31 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
             stable = 0;
             last_seen = trimmed.clone();
         }
-        // 流式编辑(未放弃时):C1 —— 仅成功才推进 last_sent;连续失败熔断但**不 return**,
-        // 改为停止编辑、继续持锁轮询到 Codex 空闲。
-        if !give_up_edit && !trimmed.is_empty() && trimmed != last_sent {
-            match client.edit_message_text(chat_id, msg_id, &trimmed).await {
-                Ok(()) => {
-                    last_sent = trimmed;
-                    edit_err_streak = 0;
-                }
-                Err(e) => {
-                    edit_err_streak += 1;
-                    tracing::warn!(
-                        chat_id,
-                        fail = edit_err_streak,
-                        "[RemoteControl] editMessageText 失败: {e}"
-                    );
-                    if edit_err_streak >= 3 {
-                        give_up_edit = true;
-                        let _ = client
-                            .send_message(
-                                chat_id,
-                                "⚠️ 流式更新中断(bot 可能被限流/踢出/token 失效)。Codex 仍在本地继续,完成前不接受新指令;可发 /stop 中止。",
-                            )
-                            .await;
+        // 流式编辑(占位消息存在且未放弃时):C1 —— 仅成功才推进 last_sent;连续失败熔断
+        // 但**不 return**,改为停止编辑、继续持锁轮询到 Codex 空闲。
+        if let Some(mid) = msg_id {
+            if !give_up_edit && !trimmed.is_empty() && trimmed != last_sent {
+                match client.edit_message_text(chat_id, mid, &trimmed).await {
+                    Ok(()) => {
+                        last_sent = trimmed;
+                        edit_err_streak = 0;
+                    }
+                    Err(e) => {
+                        edit_err_streak += 1;
+                        tracing::warn!(
+                            chat_id,
+                            fail = edit_err_streak,
+                            "[RemoteControl] editMessageText 失败: {e}"
+                        );
+                        if edit_err_streak >= 3 {
+                            give_up_edit = true;
+                            let _ = client
+                                .send_message(
+                                    chat_id,
+                                    "⚠️ 流式更新中断(bot 可能被限流/踢出/token 失效)。Codex 仍在本地继续,完成前不接受新指令;可发 /stop 中止。",
+                                )
+                                .await;
+                        }
                     }
                 }
             }
@@ -382,22 +410,26 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
             };
             let _ = client.send_message(chat_id, msg).await;
         }
-        // 完成:Codex 明确空闲 + 内容稳定;或 **当前** snapshot 仍读不到 submitting
-        // (fiber 漂移)且内容长稳兜底。drift 用**当前** snap.submitting.is_none() 而非
-        // sticky flag —— 否则早期读到一次 None 后即便后续 Some(true) 仍在跑也会误判完成
-        // 提前放锁(bot-review P2)。不要求 last_sent 非空 —— 纯工具轮无文本也算结束。
+        // 完成判定:
+        // ① done_idle:Codex 明确空闲(当前 submitting==false)+ 内容稳定;
+        // ② done_drift:当前仍读不到 submitting(fiber 漂移)+ **已有非空内容**长稳。
+        //    drift 必须要求非空内容(bot-review P2)—— 否则在 isSubmitting fiber 完全漂移
+        //    的 Codex 版本上,刚提交、还在 thinking/等批准的轮次会因「空内容稳定 6 轮 ≈7s」
+        //    误判完成提前放锁。空内容 + 全程读不到 submitting 的极端情形只等到 MAX_POLLS。
         let done_idle = snap.submitting == Some(false) && stable >= 2;
-        let done_drift = snap.submitting.is_none() && stable >= 6;
+        let done_drift = snap.submitting.is_none() && stable >= 6 && !last_seen.is_empty();
         if done_idle || done_drift {
             break;
         }
     }
     if last_sent.is_empty() {
-        if let Err(e) = client
-            .edit_message_text(chat_id, msg_id, "（本轮无文本输出或超时,可发 /status 查看)")
-            .await
-        {
-            tracing::warn!(chat_id, "[RemoteControl] 收尾编辑失败: {e}");
+        if let Some(mid) = msg_id {
+            if let Err(e) = client
+                .edit_message_text(chat_id, mid, "（本轮无文本输出或超时,可发 /status 查看)")
+                .await
+            {
+                tracing::warn!(chat_id, "[RemoteControl] 收尾编辑失败: {e}");
+            }
         }
     }
 }
