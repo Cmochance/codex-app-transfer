@@ -4368,6 +4368,42 @@ fn screenshot_lifted_even_when_user_message_follows_tool_output() {
 }
 
 #[test]
+fn lift_keeps_parallel_tool_results_contiguous() {
+    // [chatgpt-codex P2 回归] 并行 tool call:assistant.tool_calls=[a,b,c],tool(b) 返图。
+    // 图片必须落在整段 tool-result 块**之后**,不能插在 tool(b) 与 tool(c) 之间
+    //(否则 tool(c) 与 assistant.tool_calls 失配 → strict OpenAI 校验 400)。
+    let mut messages = vec![
+        json!({"role":"assistant","content":"","tool_calls":[
+            {"id":"a","type":"function","function":{"name":"f","arguments":"{}"}},
+            {"id":"b","type":"function","function":{"name":"g","arguments":"{}"}},
+            {"id":"c","type":"function","function":{"name":"h","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"a","content":"ra"}),
+        json!({"role":"tool","tool_call_id":"b","content":"rb",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,SHOT"}}]}),
+        json!({"role":"tool","tool_call_id":"c","content":"rc"}),
+    ];
+    lift_tool_screenshot_images(&mut messages);
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["assistant", "tool", "tool", "tool", "user"],
+        "tool-result 块须保持连续,图片落在块尾之后: {roles:?}"
+    );
+    assert!(
+        serde_json::to_string(messages.last().unwrap())
+            .unwrap()
+            .contains("SHOT"),
+        "图片须在末尾 user message 里保留"
+    );
+    assert!(!serde_json::to_string(&messages)
+        .unwrap()
+        .contains("__cas_tool_images"));
+}
+
+#[test]
 fn computer_use_screenshot_lifts_to_user_image_for_vision_provider() {
     let req = json!({
         "model": "kimi-k2.6",

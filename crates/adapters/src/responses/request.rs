@@ -1196,6 +1196,13 @@ fn strip_tool_image_side_fields(mut messages: Vec<Value>) -> Vec<Value> {
 /// 丢弃(正是需要像素的那一轮)。改为按字段存在判定后,只要是本轮 input 的截图就提升,不依赖
 /// 是否有 trailing user;跨轮累积仍由 cache 剥字段独立防住(历史截图早已在它**作为当前轮那次**
 /// 发过上游一次,续轮 cache 里不带字段、不重发,符合 computer-use「按需重新截图」的上下文管理)。
+///
+/// **图片在整段 tool-result 连续块之后才落 user message,不插在块中间**(chatgpt-codex P2 修):
+/// 并行 tool call(assistant.tool_calls=[a,b,c])要求其全部 tool result 在下一条非 tool 消息前
+/// **连续排列**(`repair_tool_call_ids` / issue #180:strict OpenAI 校验器靠这个把每个
+/// tool_call id 配上 result)。若某个 tool(b) 返图就紧跟着插一条 user image,会把后续 tool(c)
+/// 挤到 user 消息之后 → tool(c) 变孤儿 → 400。故累积本连续块内所有图片,遇到**下一条非 tool
+/// 消息(或结尾)再一次性 flush** 成一条 user image message,保持 tool-result 块完整。
 fn lift_tool_screenshot_images(messages: &mut Vec<Value>) {
     // 绝大多数请求没有任何带图侧信道字段 → 快速返回,零额外分配。
     if !messages
@@ -1204,19 +1211,28 @@ fn lift_tool_screenshot_images(messages: &mut Vec<Value>) {
     {
         return;
     }
+    let is_tool = |m: &Value| m.get("role").and_then(|v| v.as_str()) == Some("tool");
     let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    // 当前 tool-result 连续块内累积的待提升图片;遇非 tool 消息或结尾时 flush。
+    let mut pending: Vec<Value> = Vec::new();
     for mut msg in std::mem::take(messages) {
-        let images = msg
-            .as_object_mut()
-            .and_then(|o| o.remove(TOOL_IMAGE_SIDE_FIELD));
-        let lifted = match images {
-            Some(Value::Array(arr)) if !arr.is_empty() => Some(arr),
-            _ => None,
-        };
-        out.push(msg);
-        if let Some(arr) = lifted {
-            out.push(json!({ "role": "user", "content": Value::Array(arr) }));
+        // 非 tool 消息前先把上一段 tool 块累积的图片 flush 掉,保证图片落在 tool 块之后、
+        // 不打断 tool-result 连续性。
+        if !is_tool(&msg) && !pending.is_empty() {
+            out.push(
+                json!({ "role": "user", "content": Value::Array(std::mem::take(&mut pending)) }),
+            );
         }
+        if let Some(Value::Array(arr)) = msg
+            .as_object_mut()
+            .and_then(|o| o.remove(TOOL_IMAGE_SIDE_FIELD))
+        {
+            pending.extend(arr);
+        }
+        out.push(msg);
+    }
+    if !pending.is_empty() {
+        out.push(json!({ "role": "user", "content": Value::Array(pending) }));
     }
     *messages = out;
 }
