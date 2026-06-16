@@ -369,6 +369,7 @@ Some experimental providers (Grok Web / Gemini CLI OAuth / Antigravity OAuth) in
 - [`borawong/AiMaMi`](https://github.com/borawong/AiMaMi) — managed-block six-op design
 - [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage) — rollout JSONL token-usage parser
 - [`guyinwonder168/opencode-glm-quota`](https://github.com/guyinwonder168/opencode-glm-quota) — GLM Coding quota monitor port / auth ref
+- [`ZCode (z.ai)`](https://zcode.z.ai) — GLM account login wire reverse-eng
 - [`Cmochance/Codex_Account_Switch`](https://github.com/Cmochance/Codex_Account_Switch) — codex login spawn + token refresh
 - [`deedy5/duckduckgo_search`](https://github.com/deedy5/duckduckgo_search) — DDG result parsing reference
 - [`CloakHQ/CloakBrowser`](https://github.com/CloakHQ/CloakBrowser) — persistent profile reuse idea

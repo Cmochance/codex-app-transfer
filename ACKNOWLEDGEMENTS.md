@@ -495,6 +495,26 @@
 - **TOS / 法律注意**: 使用的是 GLM Coding Plan 订阅用户自己的 API key 调官方 monitor 端点,属合规访问自有账号数据,无灰色风险
 - **关联 PR / followup / issue**: MOC-211
 
+## ZCode(智谱 z.ai 多 CLI agent 桌面客户端)
+
+- **Link**: https://zcode.z.ai (闭源桌面 app,无公开源码仓库)
+- **License**: 闭源商业产品(无开源 license);本项目**不复制其代码**,仅复用对其登录 wire 的反向工程结论
+- **借鉴形式**: 反向工程产物借鉴 + Wire-level 对齐
+- **首次借鉴 PR / 时间**: MOC-252 Stage 1 / 2026-06(#499)
+- **借鉴清单**(均为对 ZCode 3.1.0 解包 `out/host/index.js` 的反向工程结论,Rust 自行实现):
+  - **z.ai / bigmodel 两套账号登录 provider 配置**(authorize / token / biz / business-login endpoint + appId + authorize 参数样式)→ `crates/gemini_oauth/src/zai/constants.rs`
+  - **JSON 信封 token 交换**(`POST zcode.z.ai/api/v1/oauth/token` body `{provider,code,redirect_uri,state}`,响应 `{code,msg,data}` 业务信封,`code != 0` 即业务错)→ `crates/gemini_oauth/src/zai/flow.rs`
+  - **Coding Plan 换组织 API key 链路**(`getCustomerInfo → pickOrgAndProject → api_keys find/create → copy → <apiKey>.<secretKey>`)+ z.ai 业务 token 中转(`api/auth/z/login`)→ `crates/gemini_oauth/src/zai/coding_plan.rs`
+  - **ZCode 指纹头**(`User-Agent: ZCode/<ver>`、`X-Platform`、`HTTP-Referer`、`X-Title`、`X-ZCode-Agent: glm`、`anthropic-version`)→ `crates/gemini_oauth/src/zai/constants.rs`
+- **本项目差异 / 扩展**:
+  - **未复制 ZCode 代码**,按解包分析结论自行 Rust 重写
+  - **回调机制改 loopback**:ZCode 用 `zcode://` deeplink,本项目改 `http://127.0.0.1:<port>/oauth-callback`(RFC 8252 loopback,实测两套账号 authorize 回跳 + token 交换都接受)
+  - **凭证存储改明文 0600 文件**:ZCode 存 `~/.zcode/v2/credentials.json`(AES-256-GCM),本项目改 `~/.codex-app-transfer/{provider}-oauth.json`(仿 antigravity 的 atomic + 0600,与项目其它 OAuth 凭证一致)
+  - 加「OAuth 授权成功即预存 token + resume 续传」安全网(ZCode 无),保护浏览器授权不因换 key 失败而白费
+- **同步策略**: monitor only — ZCode 若更改登录 wire(endpoint / 信封 / 换 key 链路),按 file:line 定位 `zai/{constants,flow,coding_plan}.rs` 同步
+- **TOS / 法律注意**: ⚠️ 对闭源桌面客户端反向工程其登录 wire。用途是让用户用**自己的 GLM Coding Plan 订阅账号**经本项目登录(等价于 ZCode 自身的登录),访问的是用户自有账号资源;不复制 ZCode 专有代码、不重新分发其二进制。仅供个人使用自有账号,不应作为对外服务发布。
+- **关联 PR / followup / issue**: MOC-252(#499 Stage 1)
+
 ---
 
 ## 维护规则
