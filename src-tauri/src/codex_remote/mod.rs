@@ -306,12 +306,19 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
             return;
         }
     };
-    let mut last_sent = String::new();
+    // 不变量(bot-review P2):TURN_LOCK 必须持到 Codex 真正空闲(submitting==false)/
+    // CDP 不可达 / MAX_POLLS 才释放 —— 绝不在本地轮次仍在跑时 return/break 放锁,否则
+    // 下一条 prompt 会驱动同一页面、破坏 one-turn-at-a-time。故所有「无文本/编辑失败」
+    // 情形只发一次提示,继续持锁轮询,不提前 return。
+    let mut last_sent = String::new(); // 已成功编辑进 Telegram 的内容
+    let mut last_seen = String::new(); // Codex 上一轮观察到的内容(稳定性判定,与编辑解耦)
     let mut stable: u32 = 0;
     let mut read_err_streak: u32 = 0;
     let mut edit_err_streak: u32 = 0;
-    let mut saw_running = false; // submitting 是否出现过 Some(true)(模型确实起跑)
+    let mut give_up_edit = false; // 编辑连续失败 → 停止编辑但继续持锁轮询
+    let mut saw_running = false; // submitting 出现过 Some(true)(模型确实起跑)
     let mut submitting_unknown = false; // submitting 读到过 None(fiber 漂移)
+    let mut warned_no_text = false; // 「无文本」提示只发一次
     for i in 0..MAX_POLLS {
         tokio::time::sleep(STREAM_POLL).await;
         let snap = match driver::snapshot().await {
@@ -322,7 +329,7 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
             Err(_) => {
                 read_err_streak += 1;
                 if read_err_streak >= 5 {
-                    break; // 连续读不到(Codex 退出/CDP 断)→ 收尾
+                    break; // Codex 退出/CDP 断 → 已不可驱动,释放锁安全
                 }
                 continue;
             }
@@ -332,15 +339,20 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
             None => submitting_unknown = true,
             Some(false) => {}
         }
-        let reply = snap.reply.unwrap_or_default();
-        let trimmed = truncate_tg(&reply);
-        if !trimmed.is_empty() && trimmed != last_sent {
-            // C1:仅编辑成功才推进 last_sent;失败保留旧值下轮重试 + 连击熔断,
-            //     不再「失败却推进 → 永远停在旧内容且兜底不触发」。
+        let trimmed = truncate_tg(&snap.reply.unwrap_or_default());
+        // 稳定性按「Codex 观察到的内容是否变化」算,与能否成功编辑解耦
+        if trimmed == last_seen {
+            stable += 1;
+        } else {
+            stable = 0;
+            last_seen = trimmed.clone();
+        }
+        // 流式编辑(未放弃时):C1 —— 仅成功才推进 last_sent;连续失败熔断但**不 return**,
+        // 改为停止编辑、继续持锁轮询到 Codex 空闲。
+        if !give_up_edit && !trimmed.is_empty() && trimmed != last_sent {
             match client.edit_message_text(chat_id, msg_id, &trimmed).await {
                 Ok(()) => {
                     last_sent = trimmed;
-                    stable = 0;
                     edit_err_streak = 0;
                 }
                 Err(e) => {
@@ -351,51 +363,38 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
                         "[RemoteControl] editMessageText 失败: {e}"
                     );
                     if edit_err_streak >= 3 {
-                        notify(
-                            client,
-                            chat_id,
-                            "⚠️ 流式更新中断(bot 可能被限流/踢出/token 失效)。Codex 仍在本地继续跑,稍后发 /status 查看。",
-                        )
-                        .await;
-                        return;
+                        give_up_edit = true;
+                        let _ = client
+                            .send_message(
+                                chat_id,
+                                "⚠️ 流式更新中断(bot 可能被限流/踢出/token 失效)。Codex 仍在本地继续,完成前不接受新指令;可发 /stop 中止。",
+                            )
+                            .await;
                     }
                 }
             }
-        } else {
-            stable += 1;
         }
-        // H1:无任何输出的早退,避免空等满 MAX_POLLS(≈3.6min):
-        // ① 跑了 ~18s 仍无输出且从未起跑 → 多半卡桌面批准 UI / 未起跑
-        if last_sent.is_empty() && i >= 15 && !saw_running {
-            notify(
-                client,
-                chat_id,
-                "⏳ Codex 还没开始响应。常见原因:它在桌面端等你批准命令/工具(M1 不支持远程批准),请到桌面确认;或发 /stop 后重试。",
-            )
-            .await;
-            return;
+        // H1:长时间无文本时给一次提示(不再 return —— 必须持锁到 Codex 空闲)
+        if last_sent.is_empty() && !warned_no_text && ((i >= 15 && !saw_running) || i >= 40) {
+            warned_no_text = true;
+            let msg = if !saw_running {
+                "⏳ Codex 还没开始响应,可能在桌面端等你批准命令/工具(M1 不支持远程批准)。完成前不接受新指令;到桌面确认,或发 /stop 中止。"
+            } else {
+                "⏳ Codex 已开始但暂无文本输出(可能在跑工具或等批准)。完成前不接受新指令;发 /status 查看或 /stop 中止。"
+            };
+            let _ = client.send_message(chat_id, msg).await;
         }
-        // ② 起跑了但 ~48s 仍无可显示文本(跑工具 / 长时间无文本输出)
-        if last_sent.is_empty() && i >= 40 {
-            notify(
-                client,
-                chat_id,
-                "⏳ Codex 已开始但还没有可显示的文本输出(可能在跑工具或等批准)。Codex 仍在本地继续;发 /status 查看或 /stop 中止。",
-            )
-            .await;
-            return;
-        }
-        // 完成判定:① 模型明确空闲 + 文本连续 2 轮稳定;② submitting 读不到(fiber
-        // 漂移,M3)时,文本长时间稳定(6 轮)也收尾,避免恒空转到超时。
+        // 完成:Codex 明确空闲 + 内容稳定;或 fiber 漂移(submitting 恒 None)时长稳兜底。
+        // 不再要求 last_sent 非空 —— 纯工具轮可能无文本输出但确已结束(此时也该释放锁)。
         let done_idle = snap.submitting == Some(false) && stable >= 2;
         let done_drift = submitting_unknown && stable >= 6;
-        if (done_idle || done_drift) && !last_sent.is_empty() {
+        if done_idle || done_drift {
             break;
         }
     }
     if last_sent.is_empty() {
         if let Err(e) = client
-            .edit_message_text(chat_id, msg_id, "（无输出或超时,可发 /status 查看)")
+            .edit_message_text(chat_id, msg_id, "（本轮无文本输出或超时,可发 /status 查看)")
             .await
         {
             tracing::warn!(chat_id, "[RemoteControl] 收尾编辑失败: {e}");
