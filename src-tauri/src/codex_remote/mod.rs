@@ -221,7 +221,8 @@ async fn handle_command(client: &TelegramClient, chat_id: i64, cmd: &str) {
             Err(_) => "⏳ 有一轮对话正在进行,请先 /stop 或等它结束再 /new。".to_string(),
         },
         "stop" | "停止" => match driver::stop().await {
-            Ok(via) => format!("🛑 已发停止({via})"),
+            Ok(via) if via == "none" => "ℹ️ 当前没有正在进行的轮次,无需停止。".to_string(),
+            Ok(via) => format!("🛑 已发送停止({via})"),
             Err(e) => format!("⚠️ 停止失败:{e}"),
         },
         other => format!("未知命令 /{other}。发送 /help 看可用命令。"),
@@ -317,7 +318,6 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
     let mut edit_err_streak: u32 = 0;
     let mut give_up_edit = false; // 编辑连续失败 → 停止编辑但继续持锁轮询
     let mut saw_running = false; // submitting 出现过 Some(true)(模型确实起跑)
-    let mut submitting_unknown = false; // submitting 读到过 None(fiber 漂移)
     let mut warned_no_text = false; // 「无文本」提示只发一次
     for i in 0..MAX_POLLS {
         tokio::time::sleep(STREAM_POLL).await;
@@ -334,10 +334,8 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
                 continue;
             }
         };
-        match snap.submitting {
-            Some(true) => saw_running = true,
-            None => submitting_unknown = true,
-            Some(false) => {}
+        if snap.submitting == Some(true) {
+            saw_running = true;
         }
         let trimmed = truncate_tg(&snap.reply.unwrap_or_default());
         // 稳定性按「Codex 观察到的内容是否变化」算,与能否成功编辑解耦
@@ -384,10 +382,12 @@ async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
             };
             let _ = client.send_message(chat_id, msg).await;
         }
-        // 完成:Codex 明确空闲 + 内容稳定;或 fiber 漂移(submitting 恒 None)时长稳兜底。
-        // 不再要求 last_sent 非空 —— 纯工具轮可能无文本输出但确已结束(此时也该释放锁)。
+        // 完成:Codex 明确空闲 + 内容稳定;或 **当前** snapshot 仍读不到 submitting
+        // (fiber 漂移)且内容长稳兜底。drift 用**当前** snap.submitting.is_none() 而非
+        // sticky flag —— 否则早期读到一次 None 后即便后续 Some(true) 仍在跑也会误判完成
+        // 提前放锁(bot-review P2)。不要求 last_sent 非空 —— 纯工具轮无文本也算结束。
         let done_idle = snap.submitting == Some(false) && stable >= 2;
-        let done_drift = submitting_unknown && stable >= 6;
+        let done_drift = snap.submitting.is_none() && stable >= 6;
         if done_idle || done_drift {
             break;
         }

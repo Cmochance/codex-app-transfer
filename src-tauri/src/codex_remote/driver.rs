@@ -125,14 +125,18 @@ const JS_SUBMIT: &str = r#"
 })()
 "#;
 
-/// 停止当前轮:fiber `onStop()` 或点停止钮(发送钮在跑动时切成停止态,同一 selector)。
+/// 停止当前轮:优先 fiber `onStop()`。按钮回退**仅在确实正在跑(isSubmitting）时**
+/// 才点 —— 该 selector 与发送钮同一个,空闲时它是「发送」,点了会把 composer 草稿当
+/// 新一轮提交(bot-review P2)。空闲且无 onStop → 返 `none`(无可停)。
 const JS_STOP: &str = r#"
 (function(){
   var pm=__crComposer(); var el=pm, f=null;
   while(el && !(f=__crFiberOf(el))) el=el.parentElement;
   var d=0; while(f && d<24){ var p=f.memoizedProps; if(p && typeof p.onStop==='function'){ try{ p.onStop(); return {via:'onStop'}; }catch(e){} } f=f.return; d++; }
-  var sb=document.querySelector('button[class*="size-token-button-compose"]');
-  if(sb){ sb.click(); return {via:'button'}; }
+  if(__crSubmitting()===true){
+    var sb=document.querySelector('button[class*="size-token-button-compose"]');
+    if(sb){ sb.click(); return {via:'button'}; }
+  }
   return {via:'none'};
 })()
 "#;
