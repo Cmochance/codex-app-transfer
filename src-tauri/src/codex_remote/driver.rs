@@ -95,17 +95,23 @@ const JS_SNAPSHOT: &str = r#"
 (function(){
   var pm=__crComposer();
   var out={ present: !!pm, submitting: __crSubmitting(), reply: null, finalReady: false };
+  var ub=document.querySelectorAll('[data-user-message-bubble]');
+  var lastUser=ub.length?ub[ub.length-1]:null;
   var fa=document.querySelectorAll('[data-local-conversation-final-assistant]');
   if(fa.length){
-    var clone=fa[fa.length-1].cloneNode(true);
-    clone.querySelectorAll('[data-user-message-bubble]').forEach(function(n){ n.remove(); });
-    clone.querySelectorAll('*').forEach(function(n){ if(!n.children.length && /^\s*\d{1,2}:\d{2}\s?(AM|PM)\s*$/i.test(n.textContent||'')) n.remove(); });
-    var t=(clone.innerText||'').trim();
-    if(t){ out.reply=t; out.finalReady=true; }
+    var faNode=fa[fa.length-1];
+    // final-assistant 必须**在最新用户消息之后**才算本轮结果(bot-review P2):否则 Codex
+    // 残留的上一轮最终答案会让「新 prompt 仍在 thinking」时 finalReady 误判 true、秒完成。
+    var isAfter = !lastUser || (lastUser.compareDocumentPosition(faNode) & 4); // FOLLOWING
+    if(isAfter){
+      var clone=faNode.cloneNode(true);
+      clone.querySelectorAll('[data-user-message-bubble]').forEach(function(n){ n.remove(); });
+      clone.querySelectorAll('*').forEach(function(n){ if(!n.children.length && /^\s*\d{1,2}:\d{2}\s?(AM|PM)\s*$/i.test(n.textContent||'')) n.remove(); });
+      var t=(clone.innerText||'').trim();
+      if(t){ out.reply=t; out.finalReady=true; }
+    }
   }
-  var ub=document.querySelectorAll('[data-user-message-bubble]');
-  if(ub.length){
-    var lastUser=ub[ub.length-1];
+  if(lastUser){
     var cont=lastUser, picked=null;
     for(var i=0;i<16 && cont.parentElement;i++){
       var c=cont.parentElement;

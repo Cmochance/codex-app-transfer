@@ -160,6 +160,12 @@ pub async fn run_remote_control_daemon() {
             match client.get_updates(offset, LONG_POLL_SECS).await {
                 Ok(updates) => {
                     err_backoff = 0;
+                    // long-poll 期间(最长 25s)用户可能关开关 / 换 token:这批 update 属于
+                    // 旧会话,丢弃并回外层重建,避免「发给已停用/旧 bot 的指令仍驱动 Codex」
+                    // (bot-review P2)。回内层 loop 顶,顶部 stale 检查会 break。
+                    if !enabled() || bot_token().as_deref() != Some(token.as_str()) {
+                        continue;
+                    }
                     for u in updates {
                         offset = offset.max(u.update_id + 1);
                         if let Some(msg) = u.message {
