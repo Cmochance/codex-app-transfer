@@ -192,8 +192,18 @@ pub async fn run_remote_control_daemon() {
     }
 }
 
+/// 仅私聊可驱动:非 private(群/超级群/频道)拒绝;kind 缺失(老 API)按私聊放行。
+fn is_drivable_chat(msg: &Message) -> bool {
+    msg.chat.kind.as_deref().map_or(true, |k| k == "private")
+}
+
 async fn handle_message(client: &TelegramClient, msg: Message) {
     let chat_id = msg.chat.id;
+    // 仅私聊驱动(bot-review P2):bot 被拉进群/超级群/频道时,群内消息不应驱动 Codex。
+    // 非 private 静默忽略(不在群里刷屏)。
+    if !is_drivable_chat(&msg) {
+        return;
+    }
     if !is_authorized(&msg, &allowed_users()) {
         let (id, uname) = msg
             .from
@@ -291,6 +301,12 @@ const HELP_TEXT: &str = "🤖 Codex 远程控制\n\
 /// 驱动 Codex 跑一轮并流式回发。取 [`TURN_LOCK`] 串行化(一台 Codex 一次一轮)。
 async fn run_turn(client: &TelegramClient, chat_id: i64, prompt: &str) {
     let _guard = TURN_LOCK.lock().await;
+    // 排队等锁期间(前一轮可能跑了几分钟)用户可能已关远程控制 → 取到锁后重查,
+    // 已关则不驱动 Codex(bot-review P2)。
+    if !enabled() {
+        notify(client, chat_id, "ℹ️ 远程控制已关闭,本次指令已取消。").await;
+        return;
+    }
 
     // 1) 确保 composer 在场(不在则新建对话)。new_chat 失败/没找到按钮必须显式
     //    告知并 return —— 否则下游 set_input 退化成误导性的「输入失败」。
@@ -497,14 +513,30 @@ mod tests {
     use telegram::{Chat, User};
 
     fn msg_from(id: i64, username: Option<&str>) -> Message {
+        msg_in_chat(id, username, Some("private"))
+    }
+
+    fn msg_in_chat(id: i64, username: Option<&str>, chat_kind: Option<&str>) -> Message {
         Message {
-            chat: Chat { id: 100 },
+            chat: Chat {
+                id: 100,
+                kind: chat_kind.map(str::to_owned),
+            },
             from: Some(User {
                 id,
                 username: username.map(str::to_owned),
             }),
             text: Some("hi".into()),
         }
+    }
+
+    #[test]
+    fn only_private_chats_drivable() {
+        assert!(is_drivable_chat(&msg_in_chat(1, None, Some("private"))));
+        assert!(is_drivable_chat(&msg_in_chat(1, None, None))); // kind 缺失放行
+        assert!(!is_drivable_chat(&msg_in_chat(1, None, Some("group"))));
+        assert!(!is_drivable_chat(&msg_in_chat(1, None, Some("supergroup"))));
+        assert!(!is_drivable_chat(&msg_in_chat(1, None, Some("channel"))));
     }
 
     #[test]

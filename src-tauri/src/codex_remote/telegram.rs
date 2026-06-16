@@ -31,6 +31,10 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Chat {
     pub id: i64,
+    /// Telegram chat 类型:`private` / `group` / `supergroup` / `channel`。
+    /// 远程控制只接受 `private`(防 bot 被拉进群后群内消息驱动 Codex)。
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
