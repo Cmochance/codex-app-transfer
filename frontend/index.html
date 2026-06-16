@@ -517,6 +517,23 @@
               <p class="settings-note" data-i18n="settings.codexQuotaEnabledHint">在 Codex 的固定摘要(pinned summary)弹窗底部显示用量面板:上下文占用、Tokens 速率与累计(所有 provider),以及 5 小时 / 每周额度(仅支持的 provider)。需 Codex 通过本应用启动;若 Codex 已在运行,改动开关后需重启 Codex 生效。</p>
             </div>
           </div>
+          <div class="settings-row settings-row-stack">
+            <strong data-i18n="settings.codexRemoteControlEnabled">移动端远程控制(Telegram)</strong>
+            <div>
+              <label class="switch-label only-switch"><input type="checkbox" id="codexRemoteControlEnabled"><span class="switch-ui"></span></label>
+              <p class="settings-note" data-i18n="settings.codexRemoteControlEnabledHint">开启后 transfer 跑一个 Telegram bot:授权用户在手机上给 bot 发消息,即可远程驱动本应用启动的 Codex 跑一轮对话并流式收到回复。需 Codex 通过本应用启动;改动开关后需重启 Codex 生效。⚠️ 远程控制等同远程操作本机,务必只授权本人账号、妥善保管 Bot Token。</p>
+              <div style="margin-top:10px;">
+                <label data-i18n="settings.codexRemoteControlBotToken" style="display:block;font-size:13px;margin-bottom:4px;">Bot Token</label>
+                <input type="password" id="codexRemoteControlBotToken" autocomplete="off" placeholder="123456:ABC-DEF...">
+                <p class="settings-note" data-i18n="settings.codexRemoteControlBotTokenHint">从 Telegram @BotFather 创建 bot 后拿到的 HTTP API token。</p>
+              </div>
+              <div style="margin-top:10px;">
+                <label data-i18n="settings.codexRemoteControlAllowedUsers" style="display:block;font-size:13px;margin-bottom:4px;">授权用户白名单</label>
+                <input type="text" id="codexRemoteControlAllowedUsers" autocomplete="off" placeholder="123456789, @yourname">
+                <p class="settings-note" data-i18n="settings.codexRemoteControlAllowedUsersHint">允许控制的 Telegram 数字 user id 或 @username,逗号分隔。未授权用户给 bot 发消息时会收到自己的 id,方便你加进来。</p>
+              </div>
+            </div>
+          </div>
           <!-- MOC-104 强制开启二次确认弹窗(高延迟警告)。Tauri webview 的 window.confirm
                不稳定,用 app 自己的 codex-modal 保证可见 -->
           <div class="codex-modal-backdrop" id="realAccountForceEnableModal" hidden>
