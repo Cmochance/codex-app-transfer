@@ -88,7 +88,6 @@ fn is_authorized(msg: &Message, allow: &[String]) -> bool {
 
 /// Telegram bot daemon 主循环。开关关 / 无 token 时空转;开启后长轮询并分发。
 pub async fn run_remote_control_daemon() {
-    let mut offset: i64 = 0;
     loop {
         if !enabled() {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -106,6 +105,10 @@ pub async fn run_remote_control_daemon() {
                 continue;
             }
         };
+        // offset 每个 bot 会话独立重置:Telegram update_id 是 per-bot 的,换 token 后
+        // 复用旧 offset 会让 getUpdates 跳过新 bot 的(可能更小的)update_id → 新 token
+        // 看着像死的(bot-review P2)。Telegram 不会重投已确认 update,重置到 0 安全。
+        let mut offset: i64 = 0;
         tracing::info!(
             "[RemoteControl] Telegram bot daemon 已启动 (driver schema v{})",
             driver::DRIVER_SCHEMA_VERSION

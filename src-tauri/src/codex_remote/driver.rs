@@ -158,33 +158,46 @@ pub async fn new_chat() -> Result<bool, String> {
     Ok(v.get("clicked").and_then(Value::as_bool).unwrap_or(false))
 }
 
-/// 把 `text` 灌进 composer(`execCommand('insertText')`,回退 `beforeinput/input`)。
-/// 返回 composer 当前文本(用于校验入框成功)。
+/// 把 `text` 灌进 composer。**先全选替换**(`selectNodeContents` 不 collapse →
+/// `execCommand('insertText')` 替换掉任何残留草稿),避免「残留草稿 + 远程指令」一起
+/// 被提交、执行非预期文本。灌完**校验** composer 文本与目标一致(空白不敏感,容忍
+/// ProseMirror 对多行的换行规整),不一致返 Err 让上层中止、不提交。
 pub async fn set_input(text: &str) -> Result<String, String> {
     let lit = serde_json::to_string(text).map_err(|e| e.to_string())?;
     let script = format!(
         r#"{JS_HELPERS}
 (function(){{
   var pm=__crComposer(); if(!pm) return {{ok:false, err:'no composer'}};
-  pm.focus();
-  try{{ var sel=window.getSelection(); sel.removeAllRanges(); var r=document.createRange(); r.selectNodeContents(pm); r.collapse(false); sel.addRange(r); }}catch(e){{}}
   var TEXT={lit};
-  var ok=false; try{{ ok=document.execCommand('insertText', false, TEXT); }}catch(e){{}}
-  if(!pm.textContent){{ try{{
-    pm.dispatchEvent(new InputEvent('beforeinput',{{inputType:'insertText',data:TEXT,bubbles:true,cancelable:true}}));
-    pm.dispatchEvent(new InputEvent('input',{{inputType:'insertText',data:TEXT,bubbles:true}}));
-  }}catch(e){{}} }}
-  return {{ok:ok, text:pm.textContent}};
+  function norm(s){{ return (s||'').replace(/\s+/g,''); }}
+  pm.focus();
+  // 全选现有内容(含旧草稿)→ insertText 直接替换(不 collapse)
+  try{{ var sel=window.getSelection(); sel.removeAllRanges(); var r=document.createRange(); r.selectNodeContents(pm); sel.addRange(r); }}catch(e){{}}
+  try{{ document.execCommand('insertText', false, TEXT); }}catch(e){{}}
+  // 若不匹配(execCommand 失败 / 未替换干净):显式清空 + beforeinput/input 回退
+  if(norm(pm.textContent) !== norm(TEXT)){{
+    try{{ var s2=window.getSelection(); s2.removeAllRanges(); var r2=document.createRange(); r2.selectNodeContents(pm); s2.addRange(r2); document.execCommand('delete'); }}catch(e){{}}
+    try{{
+      pm.dispatchEvent(new InputEvent('beforeinput',{{inputType:'insertText',data:TEXT,bubbles:true,cancelable:true}}));
+      pm.dispatchEvent(new InputEvent('input',{{inputType:'insertText',data:TEXT,bubbles:true}}));
+    }}catch(e){{}}
+  }}
+  return {{ok: norm(pm.textContent) === norm(TEXT), text: pm.textContent}};
 }})()"#
     );
     let v = cdp_eval(&script).await?.unwrap_or(Value::Null);
     if let Some(err) = v.get("err").and_then(Value::as_str) {
         return Err(format!("set_input: {err}"));
     }
-    Ok(v.get("text")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string())
+    let text_in = v.get("text").and_then(Value::as_str).unwrap_or("");
+    // 校验入框内容(空白不敏感)== 目标,防残留草稿混入被提交
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "composer 内容与目标不一致(可能有残留草稿),已中止以防提交非预期文本;当前: {:?}",
+            text_in.chars().take(60).collect::<String>()
+        ));
+    }
+    Ok(text_in.to_string())
 }
 
 /// 提交当前 composer。返回提交途径(`button` / `handleSubmit`)。
