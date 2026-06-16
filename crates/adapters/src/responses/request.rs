@@ -138,9 +138,10 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
         .map(codex_app_transfer_registry::strip_internal_model_suffix);
     if !provider_supports_vision(provider, body_model.as_deref()) {
         strip_image_blocks_in_place(&mut messages);
-        // Stage 3 note: Additional input_image stripping from raw Responses input
-        // (for Computer Use base64) can be added here once we have &mut access to body.
-        // Current defense relies on strip_image_blocks_in_place after input→message conversion.
+        // [MOC-250] computer-use 截图已在 input→message 转换时拆出并挂到侧信道字段,
+        // `lift_tool_screenshot_images` 之后的第二次 strip(下方 L172)负责清掉提升出
+        // 的 user image message。此处 strip 覆盖其余 input_image 块(非 computer-use
+        // 路径),两次 strip 合作确保非视觉上游零 base64 泄漏。
     } else {
         // 含 image_url 但无 text part 时补一个空格 text part — MiMo 多模态
         // 接口强制要求(否则 400 "Param Incorrect: text is not set"),
@@ -158,7 +159,21 @@ pub fn responses_body_to_chat_body_for_provider_with_session(
     // 返回 `PreviousResponseNotFound`,proxy IntoResponse 转标准 OpenAI 400
     // (`code: "previous_response_not_found"`),与 OpenAI 服务端真实行为对齐。
     // 此处不再有"messages 为空"分支:进到这里 messages 必非空。
-    let session_messages = messages.clone();
+    // [MOC-250] cache 副本在「截图提升」之前生成,并剥掉 tool message 的图片侧信道字段:
+    // session cache 只保存折叠后的 tool 文本(无全分辨率 base64、无提升出的 user 图片消息),
+    // 这样多轮 computer-use 会话里历史截图不会跨轮累积进 cache → 撑爆上下文 / 成本。
+    let session_messages = strip_tool_image_side_fields(messages.clone());
+    // [MOC-250] 仅对发往上游的 wire 副本提升当前 input 截图为 user image message(按侧信道字段
+    // 存在判定当前轮,见 lift_tool_screenshot_images doc)。放在 cache clone 之后 → 提升出的图片
+    // 永不进 cache;并清除所有 tool message 的侧信道字段。
+    lift_tool_screenshot_images(&mut messages);
+    // 新提升出的 user image message 需与原有图片一样过视觉处理:不支持视觉的上游降级占位、
+    // 支持的补 text part(与上方 L139 同逻辑;那次跑在提升之前,覆盖不到这些新消息)。
+    if !provider_supports_vision(provider, body_model.as_deref()) {
+        strip_image_blocks_in_place(&mut messages);
+    } else {
+        ensure_text_part_when_image_present(&mut messages);
+    }
     // [MOC-193] wire-level 去重必须在 session_messages clone **之后**:cache 保持
     // 全量原貌(session 重建敏感区不动,MOC-142/168/190),只有发上游的 body 瘦身。
     dedupe_repeated_instruction_messages(&mut messages);
@@ -658,17 +673,33 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
             // 两处都挂,内部按 pending call_id 精确配对 —— 只有我们发过的 completed apply_patch call
             // 才发射,shell 等其它工具的 function_call_output 不会命中。必须在 output_value 被移走前调。
             crate::core::apply_patch_trace::emit_result(&call_id, &output_value);
+            // [MOC-250] computer-use 等工具的 output 可能是含 `input_image` 的多模态数组
+            // (浏览器截图 `data:image/...;base64`)。若直接折叠,整张图 base64 会被
+            // `serde_json::to_string` 当文本塞进 tool message content → 上游收到一坨文本、
+            // 模型看不到任何像素(真机 trace 实证截图被 bound 成 artifact 文本摘要)。
+            // 这里先把图片块从 output 拆出来:只折叠文本部分;图片以 chat `image_url` block
+            // 形态挂到 tool message 的侧信道字段 `__cas_tool_images`,交给 position-aware 的
+            // `lift_tool_screenshot_images` 决定 —— 当前轮提升为紧随其后的 user image
+            // message(上游真当图收),历史轮丢弃(防多轮 computer-use 跨轮累积全图)。
+            // 非图片 output(绝大多数工具)走 else 分支,折叠行为与改前完全一致。
+            let (text_value, tool_images) = split_tool_output_text_and_images(output_value);
             // MOC-190: 最新 1 条 tool 输出保留全文(当前轮全文进 LLM); 历史轮照常压缩。
             let output_str = if keep_full {
-                keep_recent_tool_output_full(Some(call_id.as_str()), output_value)
+                keep_recent_tool_output_full(Some(call_id.as_str()), text_value)
             } else {
-                normalize_tool_output_for_context(Some(call_id.as_str()), output_value)
+                normalize_tool_output_for_context(Some(call_id.as_str()), text_value)
             };
-            vec![json!({
+            let mut tool_msg = json!({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": output_str,
-            })]
+            });
+            if !tool_images.is_empty() {
+                if let Some(obj) = tool_msg.as_object_mut() {
+                    obj.insert(TOOL_IMAGE_SIDE_FIELD.into(), Value::Array(tool_images));
+                }
+            }
+            vec![tool_msg]
         }
         "tool_search_call" => {
             // 实验 exp/resources-to-tool-search:input history 里 Codex 回放的
@@ -821,13 +852,23 @@ fn input_item_to_messages(item: &serde_json::Map<String, Value>, keep_full: bool
             // 的重复结果 / 非 apply_patch 的 custom 工具结果都不会进 —— 必须在 output_value 被
             // normalize 移走**之前**调。默认关、关时零开销。
             crate::core::apply_patch_trace::emit_result(&call_id, &output_value);
-            let output_str =
-                normalize_tool_output_for_context(Some(call_id.as_str()), output_value);
-            vec![json!({
+            // [MOC-250] custom_tool_call_output 与 function_call_output 共用 output 编码
+            // (string 或 content_items 数组),同样可能含 input_image。走相同的拆图逻辑,
+            // 图片不被当文本折叠;无图时是无副作用 passthrough(与改前一致)。两 arm 行为对齐,
+            // 避免「同 payload 形态、不同 arm 处理不一致」的隐藏漏洞。
+            let (text_value, tool_images) = split_tool_output_text_and_images(output_value);
+            let output_str = normalize_tool_output_for_context(Some(call_id.as_str()), text_value);
+            let mut tool_msg = json!({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": output_str,
-            })]
+            });
+            if !tool_images.is_empty() {
+                if let Some(obj) = tool_msg.as_object_mut() {
+                    obj.insert(TOOL_IMAGE_SIDE_FIELD.into(), Value::Array(tool_images));
+                }
+            }
+            vec![tool_msg]
         }
         "input_image" => {
             let image_url = item
@@ -1071,6 +1112,129 @@ fn recompress_stale_full_tool_outputs(messages: &mut [Value], keep_recent_count:
             obj.insert("content".into(), Value::String(bounded));
         }
     }
+}
+
+/// [MOC-250] tool message 上携带「待提升的截图」的侧信道字段名。`input_item_to_messages`
+/// 在折叠 computer-use 等多模态 output 时把图片块塞这里,`lift_tool_screenshot_images`
+/// 消费后清除 —— 该字段**永不**出现在发往上游的 wire body 或 session cache 里。
+const TOOL_IMAGE_SIDE_FIELD: &str = "__cas_tool_images";
+
+/// [MOC-250] Responses content block 是否图片块(`input_image` / 已转好的 `image_url`)。
+fn is_responses_image_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(|v| v.as_str()),
+        Some("input_image") | Some("image_url")
+    )
+}
+
+/// [MOC-250] 拆分 `function_call_output.output`:
+/// - 若是**含图片块**的多模态数组 → 返回(拼接后的文本 `Value::String`, 图片 chat block 列表)。
+///   图片块用 [`responses_block_to_chat_block`] 转成 `{type:"image_url", image_url:{url,detail}}`,
+///   与普通 message 里图片的归一化形态一致(chat 路径直接可用、gemini 路径 `image_url_block_to_part`
+///   也认),避免另造一套图片表示。
+/// - 否则(非数组 / 数组无图)→ 原样返回 output + 空图片列表,**折叠行为与改前完全一致**。
+fn split_tool_output_text_and_images(output_value: Value) -> (Value, Vec<Value>) {
+    let Value::Array(blocks) = &output_value else {
+        return (output_value, Vec::new());
+    };
+    if !blocks.iter().any(is_responses_image_block) {
+        return (output_value, Vec::new());
+    }
+    let mut text = String::new();
+    let mut images: Vec<Value> = Vec::new();
+    for block in blocks {
+        if is_responses_image_block(block) {
+            if let Some(chat_block) = responses_block_to_chat_block(block) {
+                images.push(chat_block);
+            }
+            continue;
+        }
+        // 文本块(input_text / output_text / text)取 `text` 拼进折叠文本。
+        // **非文本非图片的罕见块**(input_file / input_audio / refusal / 未知未来类型)
+        // 不静默丢:保留其 JSON 形态拼进文本 —— 对齐改前「整数组 serde_json::to_string」
+        // 的非破坏语义,也守用户「不主动破坏性降级」硬规则。computer-use output 实测只
+        // 含 text + image,这条仅是 future-proof 兜底,正常路径不触发。
+        let chunk = match block.get("type").and_then(|v| v.as_str()) {
+            Some("input_text" | "output_text" | "text") => block
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| serde_json::to_string(block).unwrap_or_default()),
+            _ => serde_json::to_string(block).unwrap_or_default(),
+        };
+        if !chunk.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&chunk);
+        }
+    }
+    (Value::String(text), images)
+}
+
+/// [MOC-250] 剥掉所有 tool message 上的 [`TOOL_IMAGE_SIDE_FIELD`] 侧信道字段。给 cache 副本用:
+/// 不缓存全分辨率截图、也不缓存提升出的 user image message,避免跨轮累积。
+fn strip_tool_image_side_fields(mut messages: Vec<Value>) -> Vec<Value> {
+    for m in &mut messages {
+        if let Some(obj) = m.as_object_mut() {
+            obj.remove(TOOL_IMAGE_SIDE_FIELD);
+        }
+    }
+    messages
+}
+
+/// [MOC-250] 截图提升:把**当前 input** 里每条带 [`TOOL_IMAGE_SIDE_FIELD`] 的 tool message
+/// 的图片提升为紧随其后的 user image message(chat tool role 不能携图;OpenAI / Gemini 都要求
+/// 图片落在 user turn)。无论是否提升,**所有** tool message 的侧信道字段都在此清除 —— 它绝不
+/// 出现在发上游的 wire 上。
+///
+/// **以「侧信道字段是否存在」判定当前轮,而非 trailing-tool 位置**(chatgpt-codex P2 修):
+/// 侧信道字段只在 [`input_item_to_messages`] 给**本轮 input** 的 function_call_output 挂,cache
+/// 副本已剥字段(见 [`strip_tool_image_side_fields`]),故合并历史后带字段的恒为当前 input 的
+/// tool message。早先版本按「末尾 keep_count 个 tool」判定,在 Codex 完整循环的
+/// `[function_call_output(截图), 新 user 输入]` 形态下 `current_tool_count==0` → 当前截图被静默
+/// 丢弃(正是需要像素的那一轮)。改为按字段存在判定后,只要是本轮 input 的截图就提升,不依赖
+/// 是否有 trailing user;跨轮累积仍由 cache 剥字段独立防住(历史截图早已在它**作为当前轮那次**
+/// 发过上游一次,续轮 cache 里不带字段、不重发,符合 computer-use「按需重新截图」的上下文管理)。
+///
+/// **图片在整段 tool-result 连续块之后才落 user message,不插在块中间**(chatgpt-codex P2 修):
+/// 并行 tool call(assistant.tool_calls=[a,b,c])要求其全部 tool result 在下一条非 tool 消息前
+/// **连续排列**(`repair_tool_call_ids` / issue #180:strict OpenAI 校验器靠这个把每个
+/// tool_call id 配上 result)。若某个 tool(b) 返图就紧跟着插一条 user image,会把后续 tool(c)
+/// 挤到 user 消息之后 → tool(c) 变孤儿 → 400。故累积本连续块内所有图片,遇到**下一条非 tool
+/// 消息(或结尾)再一次性 flush** 成一条 user image message,保持 tool-result 块完整。
+fn lift_tool_screenshot_images(messages: &mut Vec<Value>) {
+    // 绝大多数请求没有任何带图侧信道字段 → 快速返回,零额外分配。
+    if !messages
+        .iter()
+        .any(|m| m.get(TOOL_IMAGE_SIDE_FIELD).is_some())
+    {
+        return;
+    }
+    let is_tool = |m: &Value| m.get("role").and_then(|v| v.as_str()) == Some("tool");
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    // 当前 tool-result 连续块内累积的待提升图片;遇非 tool 消息或结尾时 flush。
+    let mut pending: Vec<Value> = Vec::new();
+    for mut msg in std::mem::take(messages) {
+        // 非 tool 消息前先把上一段 tool 块累积的图片 flush 掉,保证图片落在 tool 块之后、
+        // 不打断 tool-result 连续性。
+        if !is_tool(&msg) && !pending.is_empty() {
+            out.push(
+                json!({ "role": "user", "content": Value::Array(std::mem::take(&mut pending)) }),
+            );
+        }
+        if let Some(Value::Array(arr)) = msg
+            .as_object_mut()
+            .and_then(|o| o.remove(TOOL_IMAGE_SIDE_FIELD))
+        {
+            pending.extend(arr);
+        }
+        out.push(msg);
+    }
+    if !pending.is_empty() {
+        out.push(json!({ "role": "user", "content": Value::Array(pending) }));
+    }
+    *messages = out;
 }
 
 /// 最新 1 条 tool 输出保留全文(MOC-190): ≤ 上限直接全文(当前轮全文进 LLM), 超过仍 bound 防撑爆。

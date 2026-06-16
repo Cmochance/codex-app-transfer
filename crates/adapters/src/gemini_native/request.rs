@@ -1386,6 +1386,15 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
         });
     }
 
+    // [MOC-250] 合并相邻同 role 的 Content。computer-use 截图在 responses→chat 折叠时被
+    // 提升为 tool 结果之后的独立 user message,转 Gemini 后会产出
+    // `[user(functionResponse), user(inlineData)]` 两个**连续 user content**;而 Gemini wire
+    // 要求 user/model 严格交替(见下方注释),连续 user 会 400。合并成单个 user turn
+    // (functionResponse + 截图 inlineData 同 turn)正是 Gemini computer-use 的标准形态,
+    // 也对齐 LiteLLM 对相邻同 role 的 parts 合并。非破坏:仅把相邻同 role 的 parts 顺序拼接,
+    // 不跨非同 role 边界,等价于「同一 turn 多个 part」。
+    let mut contents = merge_adjacent_same_role_contents(contents);
+
     // **Gemini wire 严格要求**(2026-05-10 实测 400):"function call turn comes
     // immediately after a user turn or after a function response turn" — contents
     // 必须以 user role 开头(且 user/model 严格交替)。Codex.app 多轮 session resume
@@ -1417,6 +1426,20 @@ fn convert_messages_to_contents(messages: &[Value]) -> Result<Vec<Content>, Adap
 
 fn role_of(msg: &Value) -> &str {
     msg.get("role").and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// [MOC-250] 合并相邻同 role 的 [`Content`](parts 顺序拼接)。用于消除 computer-use 截图
+/// 提升产生的连续 user content(Gemini 要求 user/model 交替)。只在相邻 role 相同时合并,
+/// 不跨非同 role 边界,语义等价于「同一 turn 里多个 part」。
+fn merge_adjacent_same_role_contents(contents: Vec<Content>) -> Vec<Content> {
+    let mut merged: Vec<Content> = Vec::with_capacity(contents.len());
+    for c in contents {
+        match merged.last_mut() {
+            Some(last) if last.role == c.role => last.parts.extend(c.parts),
+            _ => merged.push(c),
+        }
+    }
+    merged
 }
 
 /// 取 call_id 对应的 thoughtSignature(P1-B — Gemini 3 多轮 thinking roundtrip;
@@ -3628,6 +3651,92 @@ mod tests {
         assert!(
             names.contains(&"tool_search".to_owned()),
             "tool_search 本身仍保留(模型可继续 query 更多);实际:{names:?}"
+        );
+    }
+
+    // ───────── [MOC-250] computer-use 截图提升 → Gemini inlineData ─────────
+
+    #[test]
+    fn merge_adjacent_same_role_contents_coalesces_consecutive_user() {
+        let part = |t: &str| Part {
+            text: Some(t.to_owned()),
+            ..Default::default()
+        };
+        let contents = vec![
+            Content {
+                role: "user".into(),
+                parts: vec![part("a")],
+            },
+            Content {
+                role: "user".into(),
+                parts: vec![part("b")],
+            },
+            Content {
+                role: "model".into(),
+                parts: vec![part("c")],
+            },
+            Content {
+                role: "user".into(),
+                parts: vec![part("d")],
+            },
+        ];
+        let merged = merge_adjacent_same_role_contents(contents);
+        assert_eq!(merged.len(), 3, "相邻两个 user 应合并");
+        assert_eq!(merged[0].role, "user");
+        assert_eq!(merged[0].parts.len(), 2, "合并后 parts 顺序拼接");
+        assert_eq!(merged[1].role, "model");
+        assert_eq!(merged[2].role, "user");
+    }
+
+    #[test]
+    fn computer_use_screenshot_becomes_inline_data_in_function_response_turn() {
+        // 整链路:Codex /responses(function_call + 含图 function_call_output)→ Gemini wire。
+        // 截图必须作为 inlineData(真图)落在 functionResponse 同一个 user turn,
+        // 不得变成 base64 文本、也不得产生连续 user content(Gemini 会 400)。
+        let body = json!({
+            "model": "gemini-3-flash-agent",
+            "stream": true,
+            "input": [
+                {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":[
+                    {"type":"input_text","text":"Wall time: 0.2s"},
+                    {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/SHOT","detail":"high"}
+                ]}
+            ]
+        });
+        let p = dummy_provider();
+        let req = responses_body_to_gemini_request_with_session(&body, &p, None).unwrap();
+        let wire = serde_json::to_value(&req.request).unwrap();
+        let contents = wire["contents"].as_array().expect("contents 数组");
+        let wire_s = serde_json::to_string(&req.request).unwrap();
+
+        // 1. 截图作为 inlineData(真图),不是 base64 文本里的 functionResponse
+        assert!(
+            wire_s.contains("inlineData"),
+            "截图应作为 inlineData: {wire_s}"
+        );
+
+        // 2. 无连续 user content(合并已生效)
+        let mut prev = "";
+        for c in contents {
+            let role = c["role"].as_str().unwrap_or("");
+            assert!(
+                !(role == "user" && prev == "user"),
+                "不应出现连续 user content(Gemini 会 400): {wire_s}"
+            );
+            prev = role;
+        }
+
+        // 3. functionResponse 与截图 inlineData 合并进同一个 user turn
+        let has_merged_turn = contents.iter().any(|c| {
+            let parts = c["parts"].as_array().cloned().unwrap_or_default();
+            let has_inline = parts.iter().any(|p| p.get("inlineData").is_some());
+            let has_fr = parts.iter().any(|p| p.get("functionResponse").is_some());
+            has_inline && has_fr
+        });
+        assert!(
+            has_merged_turn,
+            "functionResponse 与截图 inlineData 应在同一 user turn: {wire_s}"
         );
     }
 }

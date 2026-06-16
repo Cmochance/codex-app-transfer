@@ -4259,3 +4259,312 @@ fn moc193_wire_deduped_but_session_plan_keeps_full_history() {
         "session plan(回写 cache)必须保全量 — wire-level only,不碰 session 重建敏感区"
     );
 }
+
+// ───────── [MOC-250] computer-use 截图(function_call_output 多模态 output)─────────
+
+fn vision_chat_provider() -> Provider {
+    // 非 TEXT_ONLY_MODELS、非 None → provider_supports_vision == true(默认支持)
+    let mut p = provider("kimi", "Kimi", "https://api.moonshot.cn/v1");
+    p.models.insert("default".into(), "kimi-k2.6".into());
+    p.api_format = "openai_chat".into();
+    p
+}
+
+#[test]
+fn split_tool_output_text_and_images_splits_multimodal_array() {
+    let output = json!([
+        {"type":"input_text","text":"Wall time: 0.2s"},
+        {"type":"input_text","text":"app_state..."},
+        {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/AAAA","detail":"high"}
+    ]);
+    let (text, images) = split_tool_output_text_and_images(output);
+    assert_eq!(text, Value::String("Wall time: 0.2s\napp_state...".into()));
+    assert_eq!(images.len(), 1);
+    let s = serde_json::to_string(&images[0]).unwrap();
+    assert!(s.contains("image_url"), "图片块应转成 chat image_url: {s}");
+    assert!(s.contains("/9j/AAAA"), "图片数据应保留: {s}");
+}
+
+#[test]
+fn split_tool_output_text_and_images_passthrough_when_no_image() {
+    // 纯文本数组 → 原样返回 + 空图片列表(折叠行为不变)
+    let arr = json!([{"type":"input_text","text":"hello"}]);
+    let (v, imgs) = split_tool_output_text_and_images(arr.clone());
+    assert_eq!(v, arr);
+    assert!(imgs.is_empty());
+    // 字符串 → 原样
+    let s = json!("plain string output");
+    let (v2, imgs2) = split_tool_output_text_and_images(s.clone());
+    assert_eq!(v2, s);
+    assert!(imgs2.is_empty());
+}
+
+#[test]
+fn lift_tool_screenshot_images_lifts_all_sidefield_and_clears_field() {
+    // [chatgpt-codex P2 修] 按侧信道字段存在判定当前轮(非 trailing-tool 位置):凡带字段的
+    // tool message 都提升,字段一律清除。带字段的恒是当前 input 的 tool(cache 已剥字段),
+    // 跨轮累积由 cache 剥字段独立防住,不在本函数 drop。
+    let mut messages = vec![
+        json!({"role":"tool","tool_call_id":"a","content":"text a",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}),
+        json!({"role":"assistant","content":"between"}),
+        json!({"role":"tool","tool_call_id":"b","content":"text b",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,BBB"}}]}),
+    ];
+    lift_tool_screenshot_images(&mut messages);
+    let all = serde_json::to_string(&messages).unwrap();
+    assert!(
+        !all.contains("__cas_tool_images"),
+        "侧信道字段必须被清除: {all}"
+    );
+    // 两条 tool 各自后面都跟一条 user image message
+    for (tid, data) in [("a", "AAA"), ("b", "BBB")] {
+        let idx = messages
+            .iter()
+            .position(|m| m["tool_call_id"] == tid)
+            .unwrap();
+        assert_eq!(
+            messages[idx + 1]["role"],
+            "user",
+            "{tid} tool 后应紧跟 user image message"
+        );
+        assert!(
+            serde_json::to_string(&messages[idx + 1])
+                .unwrap()
+                .contains(data),
+            "{tid} 图片应保留"
+        );
+    }
+}
+
+#[test]
+fn screenshot_lifted_even_when_user_message_follows_tool_output() {
+    // [chatgpt-codex P2 回归] Codex 完整循环形态:function_call_output(截图) 后紧跟新 user 输入。
+    // 此时 current_tool_count(trailing tool)==0,旧 keep_count 逻辑会丢图。现在必须仍提升。
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_s","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_s","output":[
+                {"type":"input_text","text":"state"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/TRAILINGUSER"}
+            ]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"now click the button"}]}
+        ]
+    });
+    let out =
+        responses_body_to_chat_body_for_provider(&req, Some(&vision_chat_provider())).unwrap();
+    let all = serde_json::to_string(&out["messages"]).unwrap();
+    assert!(
+        all.contains("/9j/TRAILINGUSER"),
+        "尾随 user 消息时当前轮截图仍须提升(不丢): {all}"
+    );
+    assert!(
+        all.contains("now click the button"),
+        "尾随 user 消息也应保留"
+    );
+    assert!(!all.contains("__cas_tool_images"));
+}
+
+#[test]
+fn lift_keeps_parallel_tool_results_contiguous() {
+    // [chatgpt-codex P2 回归] 并行 tool call:assistant.tool_calls=[a,b,c],tool(b) 返图。
+    // 图片必须落在整段 tool-result 块**之后**,不能插在 tool(b) 与 tool(c) 之间
+    //(否则 tool(c) 与 assistant.tool_calls 失配 → strict OpenAI 校验 400)。
+    let mut messages = vec![
+        json!({"role":"assistant","content":"","tool_calls":[
+            {"id":"a","type":"function","function":{"name":"f","arguments":"{}"}},
+            {"id":"b","type":"function","function":{"name":"g","arguments":"{}"}},
+            {"id":"c","type":"function","function":{"name":"h","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"a","content":"ra"}),
+        json!({"role":"tool","tool_call_id":"b","content":"rb",
+               "__cas_tool_images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,SHOT"}}]}),
+        json!({"role":"tool","tool_call_id":"c","content":"rc"}),
+    ];
+    lift_tool_screenshot_images(&mut messages);
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["assistant", "tool", "tool", "tool", "user"],
+        "tool-result 块须保持连续,图片落在块尾之后: {roles:?}"
+    );
+    assert!(
+        serde_json::to_string(messages.last().unwrap())
+            .unwrap()
+            .contains("SHOT"),
+        "图片须在末尾 user message 里保留"
+    );
+    assert!(!serde_json::to_string(&messages)
+        .unwrap()
+        .contains("__cas_tool_images"));
+}
+
+#[test]
+fn computer_use_screenshot_lifts_to_user_image_for_vision_provider() {
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"Wall time: 0.2s"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/SCREENSHOT","detail":"high"}
+            ]}
+        ]
+    });
+    let out =
+        responses_body_to_chat_body_for_provider(&req, Some(&vision_chat_provider())).unwrap();
+    let messages = out["messages"].as_array().unwrap();
+    // tool message: 含文本, 不含图片 base64
+    let tool_idx = messages.iter().position(|m| m["role"] == "tool").unwrap();
+    let tool_content = messages[tool_idx]["content"].as_str().unwrap();
+    assert!(
+        tool_content.contains("Wall time"),
+        "tool 文本应保留: {tool_content}"
+    );
+    assert!(
+        !tool_content.contains("/9j/SCREENSHOT"),
+        "tool 文本不得含图片 base64: {tool_content}"
+    );
+    // 紧随其后一条 user image message,图片作为真图(image_url)保留
+    let next = &messages[tool_idx + 1];
+    assert_eq!(next["role"], "user");
+    let next_s = serde_json::to_string(next).unwrap();
+    assert!(
+        next_s.contains("image_url"),
+        "提升的 user message 应含 image_url: {next_s}"
+    );
+    assert!(
+        next_s.contains("/9j/SCREENSHOT"),
+        "图片应作为真图保留: {next_s}"
+    );
+    // 侧信道字段不得出现在 wire
+    let all = serde_json::to_string(messages).unwrap();
+    assert!(!all.contains("__cas_tool_images"), "wire 不得含侧信道字段");
+}
+
+#[test]
+fn computer_use_screenshot_stripped_for_non_vision_provider() {
+    let req = json!({
+        "model": "deepseek-v4-pro",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"Wall time: 0.2s"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/SCREENSHOT","detail":"high"}
+            ]}
+        ]
+    });
+    let out = responses_body_to_chat_body_for_provider(&req, Some(&deepseek_provider())).unwrap();
+    let all = serde_json::to_string(&out["messages"]).unwrap();
+    // 非视觉上游:图片 base64 既不能进 tool 文本,也不能作为 image_url 透传
+    assert!(
+        !all.contains("/9j/SCREENSHOT"),
+        "非视觉上游不得透传图片数据: {all}"
+    );
+    assert!(
+        !all.contains("\"image_url\""),
+        "非视觉上游不得含 image_url variant: {all}"
+    );
+    assert!(all.contains("omitted"), "应降级为占位文本: {all}");
+    assert!(!all.contains("__cas_tool_images"));
+}
+
+#[test]
+fn computer_use_screenshot_not_persisted_in_session_cache() {
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_1","name":"screenshot","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"Wall time: 0.2s"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/SCREENSHOT","detail":"high"}
+            ]}
+        ]
+    });
+    let conv = responses_body_to_chat_body_for_provider_with_session(
+        &req,
+        Some(&vision_chat_provider()),
+        None,
+    )
+    .unwrap();
+    // wire body 含真图
+    let wire = serde_json::to_string(&conv.body["messages"]).unwrap();
+    assert!(wire.contains("/9j/SCREENSHOT"), "wire 应含真图");
+    // session cache(回写历史)不得含全分辨率截图,也不得含侧信道字段或提升出的 user 图片消息
+    let cached = serde_json::to_string(&conv.response_session.messages).unwrap();
+    assert!(
+        !cached.contains("/9j/SCREENSHOT"),
+        "cache 不得缓存全分辨率截图: {cached}"
+    );
+    assert!(
+        !cached.contains("__cas_tool_images"),
+        "cache 不得含侧信道字段"
+    );
+    // cache 仍保留 tool 文本(供后续轮历史)
+    assert!(cached.contains("Wall time"), "cache 应保留 tool 文本");
+}
+
+#[test]
+fn split_tool_output_preserves_unknown_blocks_when_image_present() {
+    // [silent-failure I1] 含图的多模态数组里,非文本非图片块(input_file 等)不得静默丢:
+    // 保留其 JSON 进文本(对齐改前整数组 to_string 的非破坏语义)。
+    let output = json!([
+        {"type":"input_text","text":"head"},
+        {"type":"input_file","filename":"a.pdf","file_id":"f_1"},
+        {"type":"input_image","image_url":"data:image/png;base64,IMG"}
+    ]);
+    let (text, images) = split_tool_output_text_and_images(output);
+    let text_s = text.as_str().unwrap();
+    assert!(text_s.contains("head"), "文本块保留: {text_s}");
+    assert!(
+        text_s.contains("input_file"),
+        "未知块 JSON 必须保留不丢: {text_s}"
+    );
+    assert!(text_s.contains("a.pdf"), "未知块内容必须保留: {text_s}");
+    assert_eq!(images.len(), 1, "图片块照常提取");
+}
+
+#[test]
+fn custom_tool_call_output_with_image_lifts_to_user_message() {
+    // [silent-failure B1] custom_tool_call_output 与 function_call_output 同 payload 编码,
+    // 含图时也走拆图提升,而不是把 base64 当文本折叠。
+    let req = json!({
+        "model": "kimi-k2.6",
+        "stream": true,
+        "input": [
+            {"type":"function_call","call_id":"call_c","name":"custom_tool","arguments":"{}"},
+            {"type":"custom_tool_call_output","call_id":"call_c","output":[
+                {"type":"input_text","text":"done"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/CUSTOMSHOT"}
+            ]}
+        ]
+    });
+    let out =
+        responses_body_to_chat_body_for_provider(&req, Some(&vision_chat_provider())).unwrap();
+    let messages = out["messages"].as_array().unwrap();
+    let tool_idx = messages.iter().position(|m| m["role"] == "tool").unwrap();
+    let tool_content = messages[tool_idx]["content"].as_str().unwrap();
+    assert!(
+        !tool_content.contains("/9j/CUSTOMSHOT"),
+        "custom tool 文本不得含图片 base64: {tool_content}"
+    );
+    let next = &messages[tool_idx + 1];
+    assert_eq!(
+        next["role"], "user",
+        "custom tool 截图应提升为 user image message"
+    );
+    let next_s = serde_json::to_string(next).unwrap();
+    assert!(
+        next_s.contains("/9j/CUSTOMSHOT"),
+        "图片应作为真图保留: {next_s}"
+    );
+    let all = serde_json::to_string(messages).unwrap();
+    assert!(!all.contains("__cas_tool_images"), "wire 不得含侧信道字段");
+}
