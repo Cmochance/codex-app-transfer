@@ -1799,6 +1799,11 @@ async fn build_and_send_upstream(
         .request(method.clone(), upstream_url)
         .body(plan_body.clone());
     let strip_for_grok = matches!(resolved.auth_scheme, AuthScheme::GrokCookie);
+    // GLM Coding Plan API key 端点(`zhipu-coding`):Bearer 鉴权但需注入完整
+    // ZCode 指纹头(含运行时 X-Platform)。跳过入站 X-Platform,防止 Codex 客户端
+    // 值泄漏到 BigModel 或与代码注入值重复。
+    let is_glm_coding_bearer = matches!(resolved.auth_scheme, AuthScheme::Bearer)
+        && resolved.provider.base_url.contains("coding/paas/v4");
     for (name, value) in inbound_headers.iter() {
         if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
             continue;
@@ -1807,6 +1812,9 @@ async fn build_and_send_upstream(
             continue;
         }
         if adapter_headers.contains_key(name) {
+            continue;
+        }
+        if is_glm_coding_bearer && name.as_str().eq_ignore_ascii_case("x-platform") {
             continue;
         }
         // dup-header 防御(review-feedback A4):GrokCookie scheme 下,grok.com
@@ -1865,6 +1873,20 @@ async fn build_and_send_upstream(
             // X-ZCode-App-Version)—— 强制 override inbound/extra 同名值,对齐 ZCode 客户端
             // 身份。`anthropic-version` + `Content-Type` 由 anthropic_messages adapter 注;
             // `Authorization: Bearer <org_key>` 由 inject_auth 注。
+            for (name, value) in
+                codex_app_transfer_gemini_oauth::zai::constants::zcode_source_headers()
+            {
+                up = up.header(name, value);
+            }
+        }
+        crate::resolver::AuthScheme::Bearer
+            if resolved.provider.base_url.contains("coding/paas/v4") =>
+        {
+            // GLM Coding Plan API key 端点(`zhipu-coding` provider)——Bearer 鉴权
+            // 但需要与 OAuth 路径完全对齐的 ZCode 指纹头(含运行时动态 X-Platform
+            // `darwin-arm64` / `win32-x64`),否则 Codex 客户端真实 X-Platform 或缺失
+            // X-Platform 会让 BigModel 后端判定为非 ZCode 客户端,拿不到 150% 加成。
+            // preset extra_headers 不再配这些头,统一由此注入(与 ZaiOauth 分支对齐)。
             for (name, value) in
                 codex_app_transfer_gemini_oauth::zai::constants::zcode_source_headers()
             {

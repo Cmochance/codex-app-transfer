@@ -49,10 +49,12 @@ mod tests {
     }
 
     #[test]
-    fn zhipu_coding_preset_uses_coding_endpoint_and_claude_code_ua() {
-        // GLM Coding Plan(订阅套餐)走专属 coding 端点,非开放平台按量端点;
-        // 智谱条款禁止「非官方工具」接入,UA 伪装成 Claude Code(官方授权的
-        // 编程工具,对齐 Kimi Code 用 KimiCLI UA 的做法)。
+    fn zhipu_coding_preset_uses_coding_endpoint_no_preset_headers() {
+        // GLM Coding Plan(订阅套餐)走专属 coding 端点,非开放平台按量端点。
+        // ZCode 指纹头(User-Agent/HTTP-Referer/X-Title/X-ZCode-App-Version/
+        // X-Platform)不在 preset extraHeaders 里配置,而是在 forward.rs 代码层
+        // 按 base_url 含 coding/paas/v4 判定后注入完整的 zcode_source_headers()
+        // (含运行时动态 X-Platform),与 OAuth 路径完全对齐。
         let p = builtin_presets()
             .iter()
             .find(|p| p["id"] == "zhipu-coding")
@@ -63,8 +65,9 @@ mod tests {
         );
         assert_eq!(p["apiFormat"], "openai_chat");
         assert_eq!(
-            p["extraHeaders"]["User-Agent"], "claude-cli/2.1.175 (external, cli)",
-            "UA 伪装成 Claude Code 真实 UA(本机 bundle 实证 getUserAgent 形态)"
+            p.get("extraHeaders"),
+            None,
+            "ZCode 指纹头由 forward.rs 代码层注入(含运行时 X-Platform),preset 不配 extraHeaders"
         );
         // default model 必须在 modelCapabilities 配 context_window(issue #356)
         let default_model = p["models"]["default"].as_str().unwrap_or("");

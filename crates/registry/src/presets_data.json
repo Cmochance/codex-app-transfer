@@ -193,9 +193,6 @@
     "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
-    "extraHeaders": {
-      "User-Agent": "claude-cli/2.1.175 (external, cli)"
-    },
     "models": {
       "gpt_5_5": "glm-4.7",
       "gpt_5_4": "glm-4.7",
