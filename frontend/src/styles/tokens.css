@@ -1,0 +1,125 @@
+/* ============================================================
+   Design tokens — 三套主题: 白(light) / 黑(dark) / 国风(inkwash 宣纸水墨)
+   切换: html[data-theme="light|dark|inkwash"] (useAppearance 写入, 持久化 /api/settings)
+   ============================================================ */
+
+:root {
+  /* 与主题无关的尺度 token */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-full: 9999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-8: 48px;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Menlo", "Cascadia Code", "JetBrains Mono", monospace;
+  --font-serif: "Songti SC", "STSong", "SimSun", serif;
+
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+
+  --transition: 0.18s ease;
+  --transition-slow: 0.28s ease;
+  --sidebar-w: 220px;
+}
+
+/* ---------- 白 · light (macOS 浅色) ---------- */
+:root,
+html[data-theme="light"] {
+  --bg: #f5f5f7;
+  --surface: #ffffff;
+  --surface-2: #f0f0f3;
+  --surface-hover: #f5f5f7;
+  --border: #e3e3e8;
+  --border-strong: #d2d2d7;
+  --text: #1d1d1f;
+  --text-secondary: #424245;
+  --text-muted: #6e6e73;
+  --accent: #0a84ff;
+  --accent-hover: #0070e0;
+  --accent-soft: #e8f1ff;
+  --accent-text: #ffffff;
+  --success: #1d9d4f;
+  --success-soft: #e6f6ec;
+  --danger: #ff3b30;
+  --danger-soft: #ffeceb;
+  --warning: #c77f0a;
+  --warning-soft: #fff3e0;
+  --seal: #0a84ff; /* light 无朱砂, 退回 accent */
+  --sidebar-bg: rgba(246, 246, 248, 0.72);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.16);
+  color-scheme: light;
+}
+
+/* ---------- 黑 · dark (macOS 深色) ---------- */
+html[data-theme="dark"] {
+  --bg: #1c1c1e;
+  --surface: #2c2c2e;
+  --surface-2: #3a3a3c;
+  --surface-hover: #3a3a3c;
+  --border: #38383a;
+  --border-strong: #48484a;
+  --text: #f5f5f7;
+  --text-secondary: #d1d1d6;
+  --text-muted: #98989d;
+  --accent: #0a84ff;
+  --accent-hover: #409cff;
+  --accent-soft: rgba(10, 132, 255, 0.18);
+  --accent-text: #ffffff;
+  --success: #30d158;
+  --success-soft: rgba(48, 209, 88, 0.16);
+  --danger: #ff453a;
+  --danger-soft: rgba(255, 69, 58, 0.16);
+  --warning: #ff9f0a;
+  --warning-soft: rgba(255, 159, 10, 0.16);
+  --seal: #0a84ff;
+  --sidebar-bg: rgba(30, 30, 32, 0.72);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 6px 24px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.55);
+  color-scheme: dark;
+}
+
+/* ---------- 国风 · inkwash (宣纸 + 水墨 + 朱砂印) ---------- */
+html[data-theme="inkwash"] {
+  --bg: #f3ede1; /* 宣纸米黄 */
+  --surface: #faf6ec; /* 宣纸本色 */
+  --surface-2: #efe7d6;
+  --surface-hover: #f0e9da;
+  --border: #d8ccb4; /* 淡赭线 */
+  --border-strong: #c4b596;
+  --text: #2b2620; /* 松烟墨(带暖) */
+  --text-secondary: #4a4035;
+  --text-muted: #6b5d49; /* 淡墨 */
+  --accent: #8a5a44; /* 赭石 */
+  --accent-hover: #744a37;
+  --accent-soft: #ece0cf;
+  --accent-text: #faf6ec;
+  --success: #5b7a52; /* 苔绿 */
+  --success-soft: #e7ecdf;
+  --danger: #b23b32; /* 朱砂 */
+  --danger-soft: #f3ddd6;
+  --warning: #c89b3c; /* 赭黄 */
+  --warning-soft: #f6eed8;
+  --seal: #b23b32; /* 朱砂印红, 点缀/激活态 */
+  --sidebar-bg: rgba(243, 237, 225, 0.8);
+  --shadow-sm: 0 1px 3px rgba(60, 50, 35, 0.1);
+  --shadow-md: 0 6px 20px rgba(80, 65, 45, 0.16);
+  --shadow-lg: 0 14px 40px rgba(80, 65, 45, 0.22);
+  color-scheme: light;
+}
