@@ -115,6 +115,18 @@ fn main() {
             // [MOC-211] 存全局 AppHandle 供 MiMo 小米账号内嵌 webview 登录开窗用
             // (AdminState 在建 router 时尚无 AppHandle,故走全局 OnceLock)。
             mimo_session::init(app.handle().clone());
+
+            // [dev] tauri.conf.json 的 window url 是 cas://localhost/(prod 同进程 axum 派发)。
+            // cas:// 是自定义协议,Tauri 不会用 build.devUrl 替换它(devUrl 只对 app-relative
+            // URL 生效),故 dev 模式手动把主窗口导航到 vite dev server,享受 HMR;前端 /api
+            // 请求经 vite proxy → 127.0.0.1:18900 的 debug TCP listener(见下方 app.run 前)。
+            // release 不编译此段,窗口仍走 cas://localhost/。
+            #[cfg(debug_assertions)]
+            if let Some(w) = app.get_webview_window("main") {
+                if let Ok(url) = "http://localhost:1420".parse::<tauri::Url>() {
+                    let _ = w.navigate(url);
+                }
+            }
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
 
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
