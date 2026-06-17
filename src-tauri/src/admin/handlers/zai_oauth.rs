@@ -220,7 +220,9 @@ async fn status_handler(Query(q): Query<ProviderQuery>) -> impl IntoResponse {
         }
     };
     match store.load() {
-        Ok(None) => Json(json!({ "loggedIn": false, "provider": provider.wire_id() })).into_response(),
+        Ok(None) => {
+            Json(json!({ "loggedIn": false, "provider": provider.wire_id() })).into_response()
+        }
         Ok(Some(cred)) => Json(json!({
             "loggedIn": true,
             "provider": provider.wire_id(),
@@ -254,7 +256,10 @@ async fn login_handler(Query(q): Query<ProviderQuery>) -> impl IntoResponse {
 
     let mut config = OauthFlowConfig::default();
     config.on_auth_url = Some(Arc::new(|url: &str| {
-        tracing::info!(auth_url = url, "zai OAuth auth URL 已生成 — 自动打开浏览器中");
+        tracing::info!(
+            auth_url = url,
+            "zai OAuth auth URL 已生成 — 自动打开浏览器中"
+        );
     }));
 
     // 注册 cancel sender + 抢占语义(新登录抢占任何 in-flight)
@@ -280,7 +285,10 @@ async fn login_handler(Query(q): Query<ProviderQuery>) -> impl IntoResponse {
         }))
         .into_response(),
         Err(ZaiError::Flow(codex_app_transfer_gemini_oauth::FlowError::Cancelled)) => {
-            tracing::info!(provider = provider.wire_id(), "zai OAuth login cancelled — 不落盘");
+            tracing::info!(
+                provider = provider.wire_id(),
+                "zai OAuth login cancelled — 不落盘"
+            );
             Json(json!({"loggedIn": false, "cancelled": true, "provider": provider.wire_id()}))
                 .into_response()
         }
@@ -339,15 +347,29 @@ mod tests {
     #[test]
     fn parse_provider_accepts_both_and_rejects_garbage() {
         assert_eq!(
-            parse_provider(&ProviderQuery { provider: "zai".into() }),
+            parse_provider(&ProviderQuery {
+                provider: "zai".into()
+            }),
             Some(ZaiProvider::Zai)
         );
         assert_eq!(
-            parse_provider(&ProviderQuery { provider: "BigModel".into() }),
+            parse_provider(&ProviderQuery {
+                provider: "BigModel".into()
+            }),
             Some(ZaiProvider::BigModel)
         );
-        assert_eq!(parse_provider(&ProviderQuery { provider: "".into() }), None);
-        assert_eq!(parse_provider(&ProviderQuery { provider: "openai".into() }), None);
+        assert_eq!(
+            parse_provider(&ProviderQuery {
+                provider: "".into()
+            }),
+            None
+        );
+        assert_eq!(
+            parse_provider(&ProviderQuery {
+                provider: "openai".into()
+            }),
+            None
+        );
     }
 
     #[test]
