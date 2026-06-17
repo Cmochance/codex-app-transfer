@@ -2748,6 +2748,9 @@
    $("#autoUnlockCodexPlugins").checked = forceUnlockPersisted;
     $("#autoWakeCodexPet").checked = settings.autoWakeCodexPet !== false;
     $("#codexQuotaEnabled").checked = settings.codexQuotaEnabled === true;
+    if ($("#codexRemoteControlEnabled")) $("#codexRemoteControlEnabled").checked = settings.codexRemoteControlEnabled === true;
+    if ($("#codexRemoteControlBotToken")) $("#codexRemoteControlBotToken").value = settings.codexRemoteControlBotToken || "";
+    if ($("#codexRemoteControlAllowedUsers")) $("#codexRemoteControlAllowedUsers").value = Array.isArray(settings.codexRemoteControlAllowedUsers) ? settings.codexRemoteControlAllowedUsers.join(", ") : "";
    $("#exposeAllProviderModels").checked = !!settings.exposeAllProviderModels;
     showGrayPresets = settings.showGrayProviders === true;
     $("#showGrayProviders").checked = showGrayPresets;
@@ -3339,6 +3342,12 @@
      autoUnlockCodexPlugins: forceUnlockPersisted,
       autoWakeCodexPet: $("#autoWakeCodexPet")?.checked !== false,
       codexQuotaEnabled: $("#codexQuotaEnabled")?.checked === true,
+      codexRemoteControlEnabled: $("#codexRemoteControlEnabled")?.checked === true,
+      codexRemoteControlBotToken: ($("#codexRemoteControlBotToken")?.value || "").trim(),
+      codexRemoteControlAllowedUsers: ($("#codexRemoteControlAllowedUsers")?.value || "")
+        .split(/[\s,]+/)
+        .map((s) => s.trim())
+        .filter(Boolean),
      exposeAllProviderModels: $("#exposeAllProviderModels")?.checked || false,
       showGrayProviders: $("#showGrayProviders")?.checked || false,
       restoreCodexOnExit: $("#restoreCodexOnExit")?.checked !== false,
@@ -8714,6 +8723,11 @@
     // daemon 走 CDP,Codex 启动时才决定是否带调试端口(should_attach_debug_port);
     // Codex 已无端口运行时开开关不会即时生效,需重启 Codex(hint 已注明)。
     $("#codexQuotaEnabled")?.addEventListener("change", saveSettingsFromForm);
+    // [MOC-249] 远程控制开关/凭据:持久化即可,daemon 每 tick 自取;开关同样影响
+    // should_attach_debug_port(开后需重启 Codex 才带调试端口,hint 已注明)。
+    $("#codexRemoteControlEnabled")?.addEventListener("change", saveSettingsFromForm);
+    $("#codexRemoteControlBotToken")?.addEventListener("change", saveSettingsFromForm);
+    $("#codexRemoteControlAllowedUsers")?.addEventListener("change", saveSettingsFromForm);
     // [MOC-185] 诊断模式开关 = session 级一次性:**纯运行时**起/停查看器服务 + 切按钮可见性,
     // **不再 saveSettingsFromForm 持久化开关态**(退出 transfer 即关、启动不自启)。
     // 注意:api() 对后端返回的 `success:false`(含 bind 失败)会 **throw**(api.js:28),

@@ -426,7 +426,14 @@ fn should_attach_debug_port() -> Vec<String> {
         .and_then(|s| s.get("codexQuotaEnabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if !plugin_unlock_needs_port && !theme_enabled && !quota_enabled {
+    // [MOC-249] 移动端远程控制 daemon 经 CDP 驱动 Codex 发对话/读输出,开启时同样要端口。
+    let remote_control_enabled = cfg
+        .as_ref()
+        .and_then(|c| c.get("settings"))
+        .and_then(|s| s.get("codexRemoteControlEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !plugin_unlock_needs_port && !theme_enabled && !quota_enabled && !remote_control_enabled {
         return vec![];
     }
 

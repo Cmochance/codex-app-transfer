@@ -8,6 +8,7 @@ mod anyrouter_quota;
 mod codex_plugin_unlocker;
 mod codex_quota_injector;
 mod codex_real_account;
+mod codex_remote;
 mod codex_theme_injector;
 mod deepseek_quota;
 mod glm_quota;
@@ -151,6 +152,10 @@ fn main() {
             // + proxy rate limit 快照,经 CDP 推进 Codex Environment 卡片。
             // 开关关 / CDP 不可达时 tick 内静默跳过,常驻无负担。
             tauri::async_runtime::spawn(codex_quota_injector::run_quota_daemon());
+
+            // [MOC-249] 移动端远程控制 daemon:开关开 + 配了 Telegram bot token 时,
+            // 长轮询收手机指令,经 CDP 驱动 Codex 跑一轮并流式回发。关 / 无 token 时空转。
+            tauri::async_runtime::spawn(codex_remote::run_remote_control_daemon());
 
             // [MOC-231] GC 旧的上下文明细缓存(context-breakdown/<uuid>.json,每对话一个;
             // >14 天的陈旧对话删除,下次有请求会重建)。fire-and-forget,不阻塞 startup。
