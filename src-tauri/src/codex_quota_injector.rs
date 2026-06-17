@@ -933,7 +933,11 @@ fn active_glm_provider() -> Option<(String, String)> {
         if cred.org_api_key.is_empty() {
             return None;
         }
-        return Some((host, cred.org_api_key));
+        // **host 钉死从 zp.config().model_base 取**(api.z.ai/open.bigmodel.cn),不信任用户
+        // baseUrl —— `is_glm_host` 的 ends_with 后缀检查可被 `evilbigmodel.cn` 绕过,组织 key
+        // 不能发去任意 host(跟 forward/模型获取钉死一致;bot P2 安全修)。
+        let pinned_host = host_of(zp.config().model_base)?;
+        return Some((pinned_host, cred.org_api_key));
     }
 
     // 按量计费 apikey GLM Coding(原逻辑):baseUrl 含 `coding` + provider.apiKey。
@@ -1748,6 +1752,25 @@ mod tests {
         assert_eq!(rows[0]["kind"], "stat");
         assert_eq!(rows[0]["label"], "余额");
         assert_eq!(rows[0]["detail"], "¥5.37");
+    }
+
+    #[test]
+    fn zai_oauth_quota_host_pinned_from_provider_config() {
+        // bot P2 安全:zai/bigmodel 账号登录的额度 monitor host 必须从 zp.config().model_base
+        // 钉死(api.z.ai/open.bigmodel.cn),不信任用户 baseUrl —— 否则 `evilbigmodel.cn` 也过
+        // ends_with 后缀检查、组织 key 被发去任意 host。
+        use codex_app_transfer_gemini_oauth::ZaiProvider;
+        assert_eq!(
+            host_of(ZaiProvider::Zai.config().model_base).as_deref(),
+            Some("api.z.ai")
+        );
+        assert_eq!(
+            host_of(ZaiProvider::BigModel.config().model_base).as_deref(),
+            Some("open.bigmodel.cn")
+        );
+        // 后缀检查可绕过的反例:`evilbigmodel.cn` 也 ends_with("bigmodel.cn") —— 正因如此
+        // 不能用 baseUrl 的 host,必须用 config 钉死的。
+        assert!("evilbigmodel.cn".ends_with("bigmodel.cn"));
     }
 
     #[test]
