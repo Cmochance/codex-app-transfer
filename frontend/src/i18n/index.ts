@@ -14,6 +14,11 @@ export function t(key: string): string {
   return dicts[i18nState.locale][key] ?? dicts.zh[key] ?? key
 }
 
+// 带 {placeholder} 插值(移植 i18n.js tFmt):t(key).replace({doc}/{count} 等)
+export function tFmt(key: string, vars: Record<string, string | number>): string {
+  return t(key).replace(/\{(\w+)\}/g, (_, k) => (k in vars ? String(vars[k]) : `{${k}}`))
+}
+
 export function setLocale(l: Locale) {
   i18nState.locale = dicts[l] ? l : 'zh'
   document.documentElement.lang = i18nState.locale === 'zh' ? 'zh-CN' : 'en'

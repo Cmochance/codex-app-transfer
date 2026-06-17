@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import TopTabBar from './TopTabBar.vue'
+import ToastHost from '@/components/ui/ToastHost.vue'
 </script>
 
 <template>
@@ -10,6 +11,7 @@ import TopTabBar from './TopTabBar.vue'
         <RouterView />
       </div>
     </main>
+    <ToastHost />
   </div>
 </template>
 
