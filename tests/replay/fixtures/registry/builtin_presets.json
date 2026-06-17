@@ -215,7 +215,7 @@
   },
   {
     "id": "zai-login",
-    "name": "Z.ai(GLM 账号登录)",
+    "name": "GLM（Z.ai）",
     "baseUrl": "https://api.z.ai/api/anthropic",
     "docsUrl": "https://docs.z.ai/",
     "authScheme": "zai_oauth",
@@ -245,7 +245,7 @@
   },
   {
     "id": "bigmodel-login",
-    "name": "BigModel(智谱账号登录)",
+    "name": "GLM（BigModel）",
     "baseUrl": "https://open.bigmodel.cn/api/anthropic",
     "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
     "authScheme": "bigmodel_oauth",
