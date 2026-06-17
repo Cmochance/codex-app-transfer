@@ -678,7 +678,7 @@ fn encode_data_uri(mime: &str, bytes: &[u8]) -> String {
 
 /// 主题注入状态(给前端展示)。
 ///
-/// 序列化保留 PascalCase(serde 默认):前端 `frontend/js/app.js` 状态
+/// 序列化保留 PascalCase(serde 默认):前端 `frontend/src/pages/CodexSkinPage.vue` 状态
 /// badge 用 `sObj.Applied` / `sObj.Failed` / `sObj === "Disabled"` 检
 /// 查,跟枚举 variant 名严格对齐。修过一次 `rename_all = "snake_case"`
 /// 让 badge 永远 falsy,见 PR #265 review。

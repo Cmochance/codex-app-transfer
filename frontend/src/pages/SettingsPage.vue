@@ -9,6 +9,10 @@ import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
+import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
+import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
+import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
+import IconChevronRight from '~icons/lucide/chevron-right'
 
 const store = useSettingsStore()
 const { current: appearance, set: setAppearance } = useAppearance()
@@ -130,6 +134,23 @@ function onUpdateUrl(e: Event) {
       </SettingsRow>
     </SettingsGroup>
 
+    <SettingsGroup :title="t('settings.codexDesktopGroup')">
+      <RouterLink to="/codex-skin" class="nav-row">
+        <div class="nav-row__text">
+          <div class="nav-row__title">{{ t('theme.title') }}</div>
+          <div class="nav-row__desc">{{ t('settings.codexThemeRowDesc') }}</div>
+        </div>
+        <IconChevronRight class="nav-row__chevron" />
+      </RouterLink>
+      <RouterLink to="/desktop" class="nav-row">
+        <div class="nav-row__text">
+          <div class="nav-row__title">{{ t('desktop.title') }}</div>
+          <div class="nav-row__desc">{{ t('desktop.subtitle') }}</div>
+        </div>
+        <IconChevronRight class="nav-row__chevron" />
+      </RouterLink>
+    </SettingsGroup>
+
     <SettingsGroup title="提供商">
       <SettingsRow :title="t('settings.exposeAllModels')" description="OpenAI 模型菜单展示全部模型">
         <AppSwitch v-model="exposeAllProviderModels" />
@@ -177,6 +198,10 @@ function onUpdateUrl(e: Event) {
         />
       </SettingsRow>
     </SettingsGroup>
+
+    <ResidualScanPanel />
+    <SnapshotPanel />
+    <DiagnosticPanel />
   </div>
 </template>
 
@@ -209,5 +234,39 @@ function onUpdateUrl(e: Event) {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* Codex 桌面导航行(整行可点 → 子页) */
+.nav-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  text-decoration: none;
+  color: inherit;
+  transition: background var(--transition);
+}
+.nav-row:hover {
+  background: var(--surface-hover);
+}
+.nav-row + .nav-row {
+  border-top: 1px solid var(--border);
+}
+.nav-row__title {
+  font-size: var(--fs-md);
+  font-weight: 550;
+  color: var(--text);
+}
+.nav-row__desc {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+.nav-row__chevron {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--text-muted);
 }
 </style>
