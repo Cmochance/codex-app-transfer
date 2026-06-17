@@ -14,7 +14,10 @@
   // authScheme=google_api_key 经 setAuthSchemeValue 校验失败 → fallback 'bearer'
   // → backend 用 Authorization: Bearer 调 Gemini /v1beta/models → 401(Google 不接 Bearer)
   // → 测速看似绿(401 走 auth_not_verified 路径)但实际从未真正鉴权过 + 列模型失败。
-  const providerAuthSchemes = ["bearer", "x-api-key", "google_api_key", "grok_cookie", "none"];
+  // [MOC-252] 加 zai_oauth / bigmodel_oauth(GLM 账号登录,免 API key)。两者 apiFormat 都是
+  // anthropic_messages(跟非 OAuth 的 Claude 共用),OAuth 性靠 authScheme 判 —— 不加进白名单
+  // 的话 setAuthSchemeValue 会把 authScheme 静默落 'bearer',preset 存盘后丢掉 OAuth 标记。
+  const providerAuthSchemes = ["bearer", "x-api-key", "google_api_key", "grok_cookie", "zai_oauth", "bigmodel_oauth", "none"];
   const providerFormDefaultRows = ["default", "gpt_5_5", "gpt_5_4", "gpt_5_4_mini", "gpt_5_3_codex", "gpt_5_2"];
   let pendingDeleteId = null;
   let selectedPreset = null;
@@ -237,13 +240,25 @@
     return { key: "openaiChat", canonical: "openai_chat" };
   }
 
-  /// Cloud Code Assist OAuth provider 的 per-canonical 配置:i18n key 前缀(决定
-  /// 整套 UI 文案 namespace)+ CCApi 方法名(login/status/logout)。新增 OAuth
-  /// provider 时往这里加一条即可,setOauthRowState/refreshOauthStatusUi/
-  /// handleOauthLogin/handleOauthLogout 都 share 这个 dispatch 表
+  /// OAuth 登录类 provider 的 per-config 配置。新增 OAuth provider 时往这里加一条即可,
+  /// setOauthRowState/refreshOauthStatusUi/handleOauthLogin/handleOauthLogout 都 share
+  /// 这个 dispatch 表。字段:
+  ///   - i18nPrefix:整套 UI 文案 namespace
+  ///   - api:CCApi 方法三件套(getStatus/login/logout),login 闭包带各 provider 参数
+  ///   - baseUrl:OAuth 模式下锁定的 baseUrl(setOauthRowState 写死,user 不看 / 不改)
+  ///   - requiresProject:上游是否有 Google Cloud Code project 概念(gemini/antigravity=true:
+  ///     登录成功还需 provision project,status.projectId 缺失 = partial;zai/bigmodel=false:
+  ///     纯账号登录无 project,projectId/expiresAt 不参与成功判定)
+  ///
+  /// **key 选择**:gemini/antigravity 用 apiFormat canonical 做 key(它们 apiFormat 唯一);
+  /// zai/bigmodel 的 apiFormat 是 anthropic_messages(非 OAuth,跟 Claude 共用),无法靠
+  /// apiFormat 区分,改用 authScheme 值(zai_oauth / bigmodel_oauth)做 key。resolveOauthConfig
+  /// 先按 apiFormat canonical 查 → miss 再按 authScheme 查,两类 provider 都能命中。
   const OAUTH_PROVIDER_CONFIGS = {
     gemini_cli_oauth: {
       i18nPrefix: "geminiOauth",
+      baseUrl: "https://cloudcode-pa.googleapis.com",
+      requiresProject: true,
       api: {
         getStatus: () => CCApi.getGeminiOauthStatus(),
         login: () => CCApi.loginGeminiOauth(),
@@ -251,25 +266,65 @@
       },
     },
     antigravity_oauth: {
+      // **行为保持**:旧 setOauthRowState 对 gemini / antigravity 都无条件锁
+      // baseUrl=cloudcode-pa.googleapis.com(即便 antigravity-oauth preset 自带
+      // daily-cloudcode-pa)。这里继续锁 cloudcode-pa 不改既有 OAuth 流程。
       i18nPrefix: "antigravityOauth",
+      baseUrl: "https://cloudcode-pa.googleapis.com",
+      requiresProject: true,
       api: {
         getStatus: () => CCApi.getAntigravityOauthStatus(),
         login: () => CCApi.loginAntigravityOauth(),
         logout: () => CCApi.logoutAntigravityOauth(),
       },
     },
+    // [MOC-252] z.ai / bigmodel(GLM Coding Plan 账号登录)。key = authScheme 值
+    // (apiFormat=anthropic_messages 跟 Claude 共用,无法靠 apiFormat 路由)。
+    zai_oauth: {
+      i18nPrefix: "zaiOauth",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      requiresProject: false,
+      api: {
+        getStatus: () => CCApi.getZaiOauthStatus("zai"),
+        login: () => CCApi.loginZaiOauth("zai"),
+        logout: () => CCApi.logoutZaiOauth("zai"),
+      },
+    },
+    bigmodel_oauth: {
+      i18nPrefix: "bigmodelOauth",
+      baseUrl: "https://open.bigmodel.cn/api/anthropic",
+      requiresProject: false,
+      api: {
+        getStatus: () => CCApi.getZaiOauthStatus("bigmodel"),
+        login: () => CCApi.loginZaiOauth("bigmodel"),
+        logout: () => CCApi.logoutZaiOauth("bigmodel"),
+      },
+    },
   };
+
+  /// [MOC-252] 解析当前表单对应的 OAuth provider config(无 → null)。
+  /// **两段查找**:先按 apiFormat canonical 查(gemini_cli_oauth / antigravity_oauth 命中,
+  /// 它们 apiFormat 唯一)→ miss 再按 authScheme 查(zai_oauth / bigmodel_oauth 命中,它们
+  /// apiFormat=anthropic_messages 跟 Claude 共用、只能靠 authScheme 区分)。authScheme 缺省
+  /// 从 #providerAuth input 现值读(applyPresetToForm 里 setAuthSchemeValue 在 setOauthRowState
+  /// 之前调,所以读得到 preset.authScheme)。
+  function resolveOauthConfig(apiFormat, authScheme) {
+    const { canonical } = normalizeApiFormat(apiFormat);
+    const byFormat = OAUTH_PROVIDER_CONFIGS[canonical];
+    if (byFormat) return byFormat;
+    const scheme = authScheme !== undefined ? authScheme : ($("#providerAuth")?.value || "");
+    return OAUTH_PROVIDER_CONFIGS[scheme] || null;
+  }
 
   /// 当前 form 已选 apiFormat 对应的 OAuth provider config(none → null)。
   /// setOauthRowState 时缓存,refresh / login / logout 复用避免每次重 lookup
   let activeOauthConfig = null;
 
-  /// Cloud Code Assist OAuth 路径不需要 apiKey input,改 OAuth login UI block。
-  /// 返 true 表示当前协议是 OAuth 模式(gemini_cli_oauth 或 antigravity_oauth),
-  /// 调用方据此切换 form 显示
-  function isOauthApiFormat(apiFormat) {
-    const { canonical } = normalizeApiFormat(apiFormat);
-    return Object.prototype.hasOwnProperty.call(OAUTH_PROVIDER_CONFIGS, canonical);
+  /// OAuth 登录路径不需要 apiKey input,改 OAuth login UI block。返 true 表示当前
+  /// 表单是 OAuth 模式(gemini_cli_oauth / antigravity_oauth 按 apiFormat,zai_oauth /
+  /// bigmodel_oauth 按 authScheme),调用方据此切换 form 显示。
+  function isOauthApiFormat(apiFormat, authScheme) {
+    return resolveOauthConfig(apiFormat, authScheme) !== null;
   }
 
   function renderApiFormatDisplay(apiFormat) {
@@ -2051,19 +2106,20 @@
     }
   }
 
-  function setOauthRowState(apiFormat) {
+  /// apiFormat = 当前 form 选的协议;authScheme(可选)= 当前 form 的 authScheme,
+  /// 不传则 resolveOauthConfig 从 #providerAuth 现值读(zai/bigmodel 靠它命中)。
+  function setOauthRowState(apiFormat, authScheme) {
     const oauthRow = $("#providerOauthRow");
     const apiKeyRow = $("#providerApiKeyRow");
     const apiKeyInput = $("#providerApiKey");
     const baseUrlRow = $("#providerBaseUrlRow");
     const baseUrlInput = $("#providerBaseUrl");
-    const { canonical } = normalizeApiFormat(apiFormat);
-    const config = OAUTH_PROVIDER_CONFIGS[canonical] || null;
+    const config = resolveOauthConfig(apiFormat, authScheme);
     activeOauthConfig = config;
     const isOauth = !!config;
     if (oauthRow) oauthRow.hidden = !isOauth;
     if (apiKeyRow) apiKeyRow.hidden = isOauth;
-    // OAuth 模式 baseUrl 由 preset 写死(cloudcode-pa.googleapis.com),
+    // OAuth 模式 baseUrl 由 preset 写死(per-config baseUrl),
     // user 不需要看 / 改;切回非 OAuth 显示
     if (baseUrlRow) baseUrlRow.hidden = isOauth;
     // **silent-failure-hunter H3 修**:原 `required = !isOauth && req` 单调毁掉
@@ -2086,11 +2142,11 @@
       }
       baseUrlInput.required = isOauth ? false : baseUrlInput.dataset.origRequired === "1";
       // **silent-failure-hunter H2 修**:hide 行不等于清 value。OAuth 模式下
-      // baseUrl 由 preset 写死(cloudcode-pa.googleapis.com),user 切换 preset
-      // 时残留的旧 value 可能跟着 form submit 上去让 backend 用错 endpoint。
-      // 强制锁定 value 防止 hidden field 数据漂移
-      if (isOauth) {
-        baseUrlInput.value = "https://cloudcode-pa.googleapis.com";
+      // baseUrl 由 per-config 写死(gemini/antigravity=cloudcode-pa,zai=api.z.ai,
+      // bigmodel=open.bigmodel),user 切换 preset 时残留的旧 value 可能跟着 form
+      // submit 上去让 backend 用错 endpoint。强制锁定 value 防止 hidden field 数据漂移。
+      if (isOauth && config.baseUrl) {
+        baseUrlInput.value = config.baseUrl;
       }
     }
     if (isOauth && config) {
@@ -2161,6 +2217,22 @@
           loginBtn.dataset.i18n = k("loginBtn");
           loginBtn.textContent = tFmt(k("loginBtn"));
         }
+      } else if (!config.requiresProject) {
+        // [MOC-252] 无 project 概念的 OAuth(zai / bigmodel):纯账号登录,status 只有
+        // email(+ obtainedAt),projectId/expiresAt 不参与判定。logged in = 成功态,
+        // 不显 partial / 不加 warning。
+        statusEl.dataset.i18n = k("statusLoggedIn");
+        statusEl.textContent = tFmt(k("statusLoggedIn"), {
+          email: status.email || "?",
+        });
+        statusEl.classList.remove("text-warning");
+        if (logoutBtn) logoutBtn.hidden = false;
+        if (loginBtn) {
+          loginBtn.hidden = false;
+          // 已登录时改 button 文案为"切换账号"
+          loginBtn.dataset.i18n = k("switchAccountBtn");
+          loginBtn.textContent = tFmt(k("switchAccountBtn"));
+        }
       } else {
         const expiresStr = status.expiresAt
           ? new Date(status.expiresAt).toLocaleString()
@@ -2227,7 +2299,17 @@
     if (logoutBtn) logoutBtn.disabled = true;
     try {
       const result = await config.api.login();
-      if (result.loggedIn && result.projectId) {
+      if (result.cancelled) {
+        // 用户在浏览器授权窗口取消 / 关窗(后端返 {loggedIn:false, cancelled:true})。
+        // 中性提示,不当错误。zai/bigmodel 后端显式带 cancelled 字段。
+        showToast(tFmt(k("loginCancelled")));
+      } else if (!config.requiresProject && result.loggedIn) {
+        // [MOC-252] 无 project 概念的 OAuth(zai / bigmodel):loggedIn 即成功,
+        // 不看 projectId。
+        showToast(tFmt(k("loginSuccess"), {
+          email: result.email || "?",
+        }));
+      } else if (result.loggedIn && result.projectId) {
         showToast(tFmt(k("loginSuccess"), {
           email: result.email || "?",
           projectId: result.projectId,
@@ -3424,12 +3506,18 @@
     // 先登录,不是 save 后才发现 silently broken provider。两个 OAuth provider
     // 各自独立检查,错的 provider 不能 save
     {
-      const config = OAUTH_PROVIDER_CONFIGS[payload.apiFormat];
+      // [MOC-252] 按 apiFormat + authScheme 解析(zai/bigmodel 的 apiFormat=anthropic_messages
+      // 跟 Claude 共用,只能靠 authScheme 命中)。无 project 的 OAuth(requiresProject=false)
+      // 只校验 loggedIn,不要求 projectId。
+      const config = resolveOauthConfig(payload.apiFormat, payload.authScheme);
       if (config) {
         const loginRequiredMsg = t(`${config.i18nPrefix}.loginRequired`);
         try {
           const status = await config.api.getStatus();
-          if (!status.loggedIn || !status.projectId) {
+          const notReady = config.requiresProject
+            ? (!status.loggedIn || !status.projectId)
+            : !status.loggedIn;
+          if (notReady) {
             throw new Error(loginRequiredMsg);
           }
         } catch (e) {

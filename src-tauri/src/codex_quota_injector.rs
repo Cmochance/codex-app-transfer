@@ -891,10 +891,12 @@ fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// 活动 provider 若是 GLM Coding(baseUrl host 含 `bigmodel.cn` / `z.ai` 且为 coding 套餐)→
-/// 返回 `(monitor host, apiKey)`,否则 None。**白名单按 baseUrl host 判定而非 authScheme**:
-/// GLM 是通用 `bearer`、authScheme 无法区分,且本仓存储的 provider id 是运行时 UUID(非 preset
-/// id `zhipu-coding`)。按量计费的 `zhipu`(`/api/paas/v4`,无 coding)不匹配——它无订阅额度窗口。
+/// 活动 provider 若是 GLM Coding(订阅额度)→ 返回 `(monitor host, key)`,否则 None。
+/// 两条路径:
+/// - **apikey coding plan**(`zhipu-coding`):baseUrl host 含 `bigmodel.cn`/`z.ai` 且含
+///   `coding` + key 在 `provider.apiKey`。按量计费的 `zhipu`(`/api/paas/v4`,无 coding)不匹配。
+/// - **账号登录 OAuth**(MOC-252,`zai_oauth`/`bigmodel_oauth`):baseUrl `/api/anthropic`(无
+///   `coding`)+ 组织 key 在 `ZaiCredentialStore`(不在 provider.apiKey)。同一 monitor 端点。
 fn active_glm_provider() -> Option<(String, String)> {
     let cfg = crate::admin::registry_io::load().ok()?;
     let active_id = cfg.get("activeProvider").and_then(|v| v.as_str());
@@ -908,8 +910,40 @@ fn active_glm_provider() -> Option<(String, String)> {
     let base_url = p.get("baseUrl").and_then(|v| v.as_str())?;
     let host = host_of(base_url)?;
     let is_glm_host = host.ends_with("bigmodel.cn") || host.ends_with("z.ai");
+    if !is_glm_host {
+        return None;
+    }
+
+    // 账号登录(MOC-252):authScheme=zai_oauth/bigmodel_oauth → 组织 key 在 oauth 文件
+    // (不在 provider.apiKey)。baseUrl 是 `/api/anthropic`(无 `coding`),但 monitor 端点
+    // 跟 apikey coding plan 同(`<host>/api/monitor/usage/quota/limit`,Authorization 无 Bearer),
+    // 组织 key 本身就是 coding-plan key,可直接打。
+    let auth_scheme = p.get("authScheme").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(zp) = match auth_scheme {
+        "zai_oauth" | "zai" => Some(codex_app_transfer_gemini_oauth::ZaiProvider::Zai),
+        "bigmodel_oauth" | "bigmodel" => {
+            Some(codex_app_transfer_gemini_oauth::ZaiProvider::BigModel)
+        }
+        _ => None,
+    } {
+        let cred = codex_app_transfer_gemini_oauth::ZaiCredentialStore::for_provider(zp)
+            .ok()?
+            .load()
+            .ok()??;
+        if cred.org_api_key.is_empty() {
+            return None;
+        }
+        // **host 钉死从 zp.config().model_base 取**(api.z.ai/open.bigmodel.cn),不信任用户
+        // baseUrl —— `is_glm_host` 的 ends_with 后缀检查可被 `evilbigmodel.cn` 绕过,组织 key
+        // 不能发去任意 host(跟 forward/模型获取钉死一致;bot P2 安全修)。
+        let pinned_host = host_of(zp.config().model_base)?;
+        return Some((pinned_host, cred.org_api_key));
+    }
+
+    // 按量计费 apikey GLM Coding(原逻辑):baseUrl 含 `coding` + provider.apiKey。
+    // 按量计费的 `zhipu`(`/api/paas/v4`,无 coding)不匹配——它无订阅额度窗口。
     let is_coding = base_url.contains("coding");
-    if !(is_glm_host && is_coding) {
+    if !is_coding {
         return None;
     }
     let api_key = p
@@ -1718,6 +1752,25 @@ mod tests {
         assert_eq!(rows[0]["kind"], "stat");
         assert_eq!(rows[0]["label"], "余额");
         assert_eq!(rows[0]["detail"], "¥5.37");
+    }
+
+    #[test]
+    fn zai_oauth_quota_host_pinned_from_provider_config() {
+        // bot P2 安全:zai/bigmodel 账号登录的额度 monitor host 必须从 zp.config().model_base
+        // 钉死(api.z.ai/open.bigmodel.cn),不信任用户 baseUrl —— 否则 `evilbigmodel.cn` 也过
+        // ends_with 后缀检查、组织 key 被发去任意 host。
+        use codex_app_transfer_gemini_oauth::ZaiProvider;
+        assert_eq!(
+            host_of(ZaiProvider::Zai.config().model_base).as_deref(),
+            Some("api.z.ai")
+        );
+        assert_eq!(
+            host_of(ZaiProvider::BigModel.config().model_base).as_deref(),
+            Some("open.bigmodel.cn")
+        );
+        // 后缀检查可绕过的反例:`evilbigmodel.cn` 也 ends_with("bigmodel.cn") —— 正因如此
+        // 不能用 baseUrl 的 host,必须用 config 钉死的。
+        assert!("evilbigmodel.cn".ends_with("bigmodel.cn"));
     }
 
     #[test]

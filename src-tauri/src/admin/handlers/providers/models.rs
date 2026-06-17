@@ -359,6 +359,90 @@ async fn fetch_antigravity_models_impl() -> Value {
     }
 }
 
+/// 主力 GLM 模型静态 catalog(拉真实列表失败 / 未登录时兜底)。比写死 2 条全,
+/// 取自实测真实列表 + ZCode catalog 的主力款。
+fn zai_static_glm_models() -> Vec<String> {
+    ["glm-4.7", "glm-4.6", "glm-4.5", "glm-5", "glm-5.1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// z.ai / bigmodel GLM 账号登录的模型列表 — 用 `ZaiCredentialStore` 的组织 key 打
+/// GLM 真实模型列表端点 `<host>/api/paas/v4/models`(`Authorization: Bearer <org_key>`)。
+/// **host 钉死取自 `zp.config().model_base`**(`api.z.ai` / `open.bigmodel.cn`),**不信任
+/// provider.baseUrl** —— 防被篡改 / 畸形的 saved provider 或直接 payload 调用把组织 key
+/// 发去任意 host(跟 resolver 钉死 model traffic 一致;bot P2 安全修)。拉失败 / 未登录 →
+/// 退静态 catalog(主力 GLM 模型,好过完全拿不到)。
+async fn fetch_zai_glm_models_impl(zp: codex_app_transfer_gemini_oauth::ZaiProvider) -> Value {
+    let static_fallback = || {
+        let ids = zai_static_glm_models();
+        json!({
+            "success": true,
+            "endpoint": "(static: GLM models fallback)",
+            "models": ids.clone(),
+            "suggested": suggest_model_mappings(&ids),
+        })
+    };
+
+    let Some(cred) = codex_app_transfer_gemini_oauth::ZaiCredentialStore::for_provider(zp)
+        .ok()
+        .and_then(|s| s.load().ok().flatten())
+        .filter(|c| !c.org_api_key.is_empty())
+    else {
+        // 未登录 → 静态兜底(让 UI 仍能给 model 选项,跟 antigravity 未登录退种子一致)
+        return static_fallback();
+    };
+
+    // host **钉死**从 zp 的 model_base 取(`api.z.ai` / `open.bigmodel.cn`),不信任用户
+    // baseUrl;模型列表在 OpenAI 兼容路径 `/api/paas/v4/models`(跟模型调用 `/api/anthropic`
+    // 不同路径、同 host)。
+    let Some(host) = reqwest::Url::parse(zp.config().model_base)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+    else {
+        return static_fallback();
+    };
+    let url = format!("https://{host}/api/paas/v4/models");
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .connect_timeout(Duration::from_secs(6))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return static_fallback(),
+    };
+    let resp = match client.get(&url).bearer_auth(&cred.org_api_key).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error_id = "ZAI_MODELS_FETCH_HTTP", error = %e, "GLM 模型列表请求失败,退静态");
+            return static_fallback();
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(
+            error_id = "ZAI_MODELS_FETCH_STATUS",
+            status = %resp.status(),
+            "GLM 模型列表非 2xx,退静态"
+        );
+        return static_fallback();
+    }
+    let Ok(payload) = resp.json::<Value>().await else {
+        return static_fallback();
+    };
+    let ids = extract_model_ids(&payload);
+    if ids.is_empty() {
+        return static_fallback();
+    }
+    json!({
+        "success": true,
+        "endpoint": url,
+        "models": ids.clone(),
+        "suggested": suggest_model_mappings(&ids),
+    })
+}
+
 async fn fetch_provider_models_impl(provider: &Value) -> Value {
     // Cloud Code Assist (gemini_cli_oauth) 上游没有 listModels endpoint —
     // gemini-cli upstream 自己用 hardcoded enum (`packages/core/src/config/models.ts`)。
@@ -405,6 +489,21 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
     // 跟 gemini_cli_oauth 不同(那个上游真没 list endpoint)
     if provider.get("apiFormat").and_then(|v| v.as_str()) == Some("antigravity_oauth") {
         return fetch_antigravity_models_impl().await;
+    }
+
+    // **z.ai / bigmodel GLM 账号登录**(authScheme=zai_oauth/bigmodel_oauth,MOC-252):
+    // 按 authScheme 判(apiFormat 是 anthropic_messages、跟普通 Claude 共用,不能按它分流)。
+    // 组织 key 在 `{zai,bigmodel}-oauth.json`(不在 provider.apiKey),用它打 GLM 真实
+    // 模型列表端点 `<host>/api/paas/v4/models`(`Authorization: Bearer <org_key>`,实测 200
+    // 返 glm-4.5/4.6/4.7/5/5.1/5.2 全列表)—— **不写死**;拉失败才退静态 catalog。
+    if let Some(zp) = match provider.get("authScheme").and_then(|v| v.as_str()) {
+        Some("zai_oauth") | Some("zai") => Some(codex_app_transfer_gemini_oauth::ZaiProvider::Zai),
+        Some("bigmodel_oauth") | Some("bigmodel") => {
+            Some(codex_app_transfer_gemini_oauth::ZaiProvider::BigModel)
+        }
+        _ => None,
+    } {
+        return fetch_zai_glm_models_impl(zp).await;
     }
 
     // **百炼 Token Plan 套餐** (`token-plan.cn-beijing.maas.aliyuncs.com`) 不暴露
@@ -678,6 +777,31 @@ mod tests {
         );
         // endpoint 标识必须明示是 static,不能让用户误以为真打了 HTTP
         assert!(result["endpoint"].as_str().unwrap_or("").contains("static"));
+    }
+
+    #[test]
+    fn zai_static_glm_models_is_richer_than_hardcoded_pair() {
+        // MOC-252 复测反馈:不能只写死 glm-4.7/glm-4.6。静态兜底是主力 GLM 列表(>2 条)。
+        let m = zai_static_glm_models();
+        assert!(m.len() > 2, "静态兜底应 >2 条主力模型,实际 {m:?}");
+        assert!(m.contains(&"glm-4.7".to_string()));
+        assert!(m.contains(&"glm-5.1".to_string()));
+    }
+
+    #[test]
+    fn zai_models_host_pinned_from_provider_config_not_user_baseurl() {
+        // bot P2 安全:模型获取 host 必须来自 zp.config().model_base(钉死),不信任用户
+        // baseUrl —— 否则组织 key 可能被发去任意 host。
+        use codex_app_transfer_gemini_oauth::ZaiProvider;
+        let host = |zp: ZaiProvider| {
+            reqwest::Url::parse(zp.config().model_base)
+                .unwrap()
+                .host_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(host(ZaiProvider::Zai), "api.z.ai");
+        assert_eq!(host(ZaiProvider::BigModel), "open.bigmodel.cn");
     }
 
     #[test]

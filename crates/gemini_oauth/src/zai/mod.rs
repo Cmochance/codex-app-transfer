@@ -172,6 +172,14 @@ async fn finalize_from_pending(
             provider = provider.wire_id(),
             "换 key 后落盘前检测到取消,中止(不覆盖凭证)"
         );
+        // **取消 = 用户主动放弃**:清掉 OAuth 后写的 pending token,不留可复用的 ghost
+        // token 在盘上(bot P2)。注意这跟「换 key **失败**保留 pending 供 resume」不同
+        // —— 失败走上面的 `?` 提前返回、根本不进这个取消分支,pending 仍保留。
+        if let Ok(ps) = ZaiPendingStore::for_provider(provider) {
+            if let Err(e) = ps.delete() {
+                tracing::warn!(error = %e, "取消后删 pending token 失败");
+            }
+        }
         return Err(FlowError::Cancelled.into());
     }
 

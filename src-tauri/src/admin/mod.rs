@@ -252,6 +252,8 @@ pub fn build_app_router(state: AdminState) -> Router {
         .merge(handlers::theme::routes())
         // Antigravity OAuth (login / status / logout / cancel)
         .merge(handlers::antigravity_oauth::routes())
+        // z.ai / bigmodel GLM 账号登录 OAuth (login / status / logout / cancel,MOC-252 Stage 3)
+        .merge(handlers::zai_oauth::routes())
         // Codex AGENTS.md 受管块管理(#24 / #25 Agents tab MVP, 借鉴 borawong/AiMaMi)
         .route(
             "/api/codex/agents-md/status",

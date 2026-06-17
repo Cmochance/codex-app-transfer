@@ -601,6 +601,20 @@ fn main() {
                 });
                 tracing::info!(target_epoch, "app exit: epoch={target_epoch} 已退出或 timeout");
             }
+            // 同理取消 in-flight zai/bigmodel OAuth login(MOC-252 Stage 3):防退出期间
+            // 后台 OAuth task 残留 + 落盘 ghost 凭证
+            let zai_outcome = handlers::zai_oauth::cancel_in_flight_login();
+            if let (true, Some(target_epoch)) = (zai_outcome.cancelled, zai_outcome.cancelled_epoch)
+            {
+                tracing::info!(target_epoch, "app exit: cancelled in-flight zai OAuth login");
+                let _ = tauri::async_runtime::block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handlers::zai_oauth::wait_for_login_epoch_complete(target_epoch),
+                    )
+                    .await
+                });
+            }
             // [devin review] 同理取消 in-flight `codex login`(真实账号登录):否则 user 在
             // OAuth 等待期间退出 app,孤儿 codex login 进程可能在下面 restore_codex_if_enabled
             // 恢复原配置**之后**才写 ~/.codex/auth.json,把刚恢复的状态又改脏(数据完整性)。

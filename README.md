@@ -139,8 +139,8 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | 后端就绪,UI 待 PR;gemini 全系上下文 1M(带后缀 id 此前误落 258k 兜底,MOC-221);**支持 Codex 内置 image_gen 工具原生出图**(MOC-210,gemini-3.1-flash-image;可 provider 覆盖) |
 | 智谱 GLM(5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
 | 智谱 GLM Coding(4.7 / 4.6) | ✅ | ✅ | ✅ | GLM Coding Plan 订阅套餐专属端点(`/api/coding/paas/v4`);UA 伪装成 Claude Code 以适配 Coding Plan 工具识别(对齐 Kimi Code 做法) |
-| GLM（Z.ai）(`zai-login`) | ✅ | ✅ | ✅ | **OAuth 免 API key**,走你的 GLM Coding Plan 订阅额度;`api.z.ai/api/anthropic` Anthropic Messages wire + ZCode 指纹头;proxy 已就绪,登录 UI 待 Stage 3 |
-| GLM（BigModel）(`bigmodel-login`) | ✅ | ✅ | ✅ | **OAuth 免 API key**,走你的 GLM Coding Plan 订阅额度;`open.bigmodel.cn/api/anthropic` Anthropic Messages wire + ZCode 指纹头;proxy 已就绪,登录 UI 待 Stage 3 |
+| GLM（Z.ai）(`zai-login`) | ✅ | ✅ | ✅ | **OAuth 免 API key**,走你的 GLM Coding Plan 订阅额度;`api.z.ai/api/anthropic` Anthropic Messages wire + ZCode 指纹头;provider 配置内 OAuth 登录(免 key)+ GLM Coding Plan 额度显示 |
+| GLM（BigModel）(`bigmodel-login`) | ✅ | ✅ | ✅ | **OAuth 免 API key**,走你的 GLM Coding Plan 订阅额度;`open.bigmodel.cn/api/anthropic` Anthropic Messages wire + ZCode 指纹头;provider 配置内 OAuth 登录(免 key)+ GLM Coding Plan 额度显示 |
 | 阿里云百炼(Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
 | Responses 协议透传(custom) | — | — | — | 经本地代理 **1:1 字节透传**至上游(不再 direct 直连,MOC-234);适合 OpenAI 官方 / 原生 Responses 反代;⚠️ Plugins/MCP `namespace` 工具包不展平,部分上游会静默丢工具 |
 

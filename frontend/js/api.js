@@ -52,6 +52,12 @@
     zhipu: { logo: 'assets/providers/zhipu.png' },
     bigmodel: { logo: 'assets/providers/zhipu.png' },
     glm: { logo: 'assets/providers/zhipu.png' },
+    // [MOC-252] GLM 账号登录(OAuth)preset:zai-login / bigmodel-login。bigmodel-login
+    // 已被上面 'bigmodel' 子串命中;zai-login 的 id/baseUrl(z.ai)不含 zhipu/bigmodel/glm
+    // (仅 name "GLM（Z.ai）" 偶然含 glm,脆弱),显式加 'zai-login' + 'z-ai'(baseUrl
+    // api.z.ai 经 `_`/空格→`-` normalize 后是 api-z.ai,'.' 不变,所以匹配 'z-ai' 不命中;
+    // 用 'zai-login' id 子串稳)兜底,统一复用智谱 logo。
+    'zai-login': { logo: 'assets/providers/zhipu.png' },
     siliconflow: { icon: 'bi-diagram-3-fill' },
     bailian: { logo: 'assets/providers/aliyun.ico' },
     dashscope: { logo: 'assets/providers/aliyun.ico' },
@@ -632,6 +638,23 @@
     /// 是 hardcoded list;antigravity 真有 endpoint(CLIProxyAPI 实证)
     async getAntigravityOauthModels() {
       return api('GET', '/api/antigravity-oauth/models');
+    },
+
+    // ── z.ai / bigmodel OAuth(GLM Coding Plan 账号登录,免 API key)──────────
+    // 后端 admin handler 在 src-tauri/src/admin/handlers/zai_oauth.rs。两个 provider
+    // (z.ai / bigmodel)共用一套路由,用 `?provider=zai|bigmodel` query 区分,各自独立
+    // token 文件。endpoint shape 同 antigravity(login long-poll + status/logout 即时)。
+    async getZaiOauthStatus(provider) {
+      return api('GET', `/api/zai-oauth/status?provider=${encodeURIComponent(provider)}`);
+    },
+
+    async loginZaiOauth(provider) {
+      // **long polling** — fetch 会阻塞最长 5min 等待 OAuth callback
+      return api('POST', `/api/zai-oauth/login?provider=${encodeURIComponent(provider)}`, {});
+    },
+
+    async logoutZaiOauth(provider) {
+      return api('DELETE', `/api/zai-oauth/logout?provider=${encodeURIComponent(provider)}`);
     },
   };
 
