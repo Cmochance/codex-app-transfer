@@ -407,6 +407,24 @@ async fn fetch_provider_models_impl(provider: &Value) -> Value {
         return fetch_antigravity_models_impl().await;
     }
 
+    // **z.ai / bigmodel GLM 账号登录**(authScheme=zai_oauth/bigmodel_oauth,MOC-252):
+    // 按 authScheme 判(apiFormat 是 anthropic_messages、跟普通 Claude 共用,不能按它分流)。
+    // 组织 key 在 `{zai,bigmodel}-oauth.json`(不在 provider.apiKey,通用 probe 会拿空 key
+    // 打 GLM `/v1/models` → 401/404 失败);且 GLM Coding Plan 模型已知。对齐
+    // gemini_cli_oauth / bailian token-plan 的静态列表做法,返固定 GLM 模型,不打上游。
+    if matches!(
+        provider.get("authScheme").and_then(|v| v.as_str()),
+        Some("zai_oauth") | Some("bigmodel_oauth")
+    ) {
+        let model_ids = vec!["glm-4.7".to_owned(), "glm-4.6".to_owned()];
+        return json!({
+            "success": true,
+            "endpoint": "(static: GLM Coding Plan models)",
+            "models": model_ids.clone(),
+            "suggested": suggest_model_mappings(&model_ids),
+        });
+    }
+
     // **百炼 Token Plan 套餐** (`token-plan.cn-beijing.maas.aliyuncs.com`) 不暴露
     // `compatible-mode/v1/models` endpoint(网关在所有 unknown path 都返 401,
     // routing 在 auth 之后)。阿里官方 Qwen CLI 自身就走静态硬编码,见
@@ -678,6 +696,33 @@ mod tests {
         );
         // endpoint 标识必须明示是 static,不能让用户误以为真打了 HTTP
         assert!(result["endpoint"].as_str().unwrap_or("").contains("static"));
+    }
+
+    #[test]
+    fn fetch_provider_models_zai_oauth_returns_static_glm_list_no_http() {
+        // MOC-252:zai/bigmodel 账号登录(authScheme=zai_oauth/bigmodel_oauth)按 authScheme
+        // 走静态 GLM 列表,不打上游(apiFormat=anthropic_messages 跟普通 Claude 共用,
+        // 通用 probe 会拿空 apiKey 失败)。
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for scheme in ["zai_oauth", "bigmodel_oauth"] {
+            let result = runtime.block_on(fetch_provider_models_impl(&json!({
+                "baseUrl": "https://api.z.ai/api/anthropic",
+                "apiFormat": "anthropic_messages",
+                "authScheme": scheme,
+            })));
+            assert_eq!(result["success"], json!(true), "scheme={scheme}");
+            let models: Vec<String> = result["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(models, vec!["glm-4.7", "glm-4.6"], "scheme={scheme}");
+            assert!(result["endpoint"].as_str().unwrap_or("").contains("static"));
+        }
     }
 
     #[test]
