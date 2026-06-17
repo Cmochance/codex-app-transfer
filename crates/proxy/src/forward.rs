@@ -391,6 +391,35 @@ fn is_grok_owned_header(name: &str) -> bool {
     )
 }
 
+/// GLM Coding Plan 的三条路径都要注入完整 ZCode 指纹头(UA `ZCode/<ver>` /
+/// X-Platform / HTTP-Referer / X-Title / X-ZCode-App-Version)并在注入路径上
+/// **独占**这些头:`zhipu-coding`(Bearer 鉴权 + coding 端点)走 API key,
+/// `zai-login`/`bigmodel-login`(ZaiOauth)走 OAuth。
+///
+/// 抽成纯函数,让"入站同名头去重(见 [`is_zcode_owned_header`])"与"match 注入
+/// 分支的 guard"共用同一判定 —— 杜绝单条路径漏 strip 入站指纹头的不对称(否则
+/// reqwest `header()` 的 append 语义会让出站出现 Codex 真实值 + 注入值的双值,
+/// 被 BigModel 判定为非 ZCode 客户端)。
+fn injects_zcode_source_headers(auth_scheme: &AuthScheme, base_url: &str) -> bool {
+    matches!(auth_scheme, AuthScheme::ZaiOauth(_))
+        || (matches!(auth_scheme, AuthScheme::Bearer) && base_url.contains("coding/paas/v4"))
+}
+
+/// `zcode_source_headers()` 注入、需在注入路径上**独占**的 ZCode 指纹头名集合。
+/// 入站客户端的同名头会被 strip,避免 reqwest `header()` 的 append 语义产生双值
+/// (对齐 [`is_grok_owned_header`] 的"独占注入头全 strip 入站"模式)。
+///
+/// **`User-Agent` 不在此列**:它已由 [`is_strip_on_forward`] 全局 strip(Codex
+/// 客户端 UA 是反爬指纹,所有上游都剔)。仅在 [`injects_zcode_source_headers`]
+/// 为真时对入站应用此判定。
+fn is_zcode_owned_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "x-platform" | "http-referer" | "x-title" | "x-zcode-app-version"
+    )
+}
+
 pub async fn forward_handler(
     State(state): State<ProxyState>,
     req: Request,
@@ -1799,11 +1828,13 @@ async fn build_and_send_upstream(
         .request(method.clone(), upstream_url)
         .body(plan_body.clone());
     let strip_for_grok = matches!(resolved.auth_scheme, AuthScheme::GrokCookie);
-    // GLM Coding Plan API key 端点(`zhipu-coding`):Bearer 鉴权但需注入完整
-    // ZCode 指纹头(含运行时 X-Platform)。跳过入站 X-Platform,防止 Codex 客户端
-    // 值泄漏到 BigModel 或与代码注入值重复。
-    let is_glm_coding_bearer = matches!(resolved.auth_scheme, AuthScheme::Bearer)
-        && resolved.provider.base_url.contains("coding/paas/v4");
+    // GLM Coding Plan 的三条路径都在下方 match 里独占注入完整 ZCode 指纹头(含
+    // 运行时 X-Platform):`zhipu-coding`(Bearer + coding 端点)走 API key,
+    // `zai-login`/`bigmodel-login` 走 ZaiOauth。判定收口到 `injects_zcode_source_headers`,
+    // 既用于入站 x-platform 去重,又用于 Bearer 注入分支的 guard —— 保证"谁注入
+    // ZCode 头、谁就 strip 入站 x-platform"两处一致,不再出现单条路径漏 strip 的不对称。
+    let injects_zcode_headers =
+        injects_zcode_source_headers(&resolved.auth_scheme, &resolved.provider.base_url);
     for (name, value) in inbound_headers.iter() {
         if is_hop_header(name.as_str()) || is_strip_on_forward(name.as_str()) {
             continue;
@@ -1814,7 +1845,12 @@ async fn build_and_send_upstream(
         if adapter_headers.contains_key(name) {
             continue;
         }
-        if is_glm_coding_bearer && name.as_str().eq_ignore_ascii_case("x-platform") {
+        // ZCode 指纹头(X-Platform / HTTP-Referer / X-Title / X-ZCode-App-Version)
+        // 由下方 match 分支独占注入;入站客户端若带同名头,reqwest `header()` 的
+        // append 语义会让出站出现双值(Codex 真实值 + 注入值),BigModel 据此判定
+        // 为非 ZCode 客户端。strip 入站同名让注入分支独占,ZaiOauth 与 Bearer-coding
+        // 两条路径一致处理(`User-Agent` 已由 is_strip_on_forward 全局 strip)。
+        if injects_zcode_headers && is_zcode_owned_header(name.as_str()) {
             continue;
         }
         // dup-header 防御(review-feedback A4):GrokCookie scheme 下,grok.com
@@ -1871,22 +1907,23 @@ async fn build_and_send_upstream(
         crate::resolver::AuthScheme::ZaiOauth(_) => {
             // ZCode 来源指纹头(UA `ZCode/<ver>` / X-Platform / HTTP-Referer / X-Title /
             // X-ZCode-App-Version)—— 强制 override inbound/extra 同名值,对齐 ZCode 客户端
-            // 身份。`anthropic-version` + `Content-Type` 由 anthropic_messages adapter 注;
-            // `Authorization: Bearer <org_key>` 由 inject_auth 注。
+            // 身份。入站 x-platform 已在上方按 `injects_zcode_headers` 统一 strip,避免与
+            // 此处注入的 X-Platform append 成双值。`anthropic-version` + `Content-Type` 由
+            // anthropic_messages adapter 注;`Authorization: Bearer <org_key>` 由 inject_auth 注。
             for (name, value) in
                 codex_app_transfer_gemini_oauth::zai::constants::zcode_source_headers()
             {
                 up = up.header(name, value);
             }
         }
-        crate::resolver::AuthScheme::Bearer
-            if resolved.provider.base_url.contains("coding/paas/v4") =>
-        {
+        crate::resolver::AuthScheme::Bearer if injects_zcode_headers => {
             // GLM Coding Plan API key 端点(`zhipu-coding` provider)——Bearer 鉴权
-            // 但需要与 OAuth 路径完全对齐的 ZCode 指纹头(含运行时动态 X-Platform
-            // `darwin-arm64` / `win32-x64`),否则 Codex 客户端真实 X-Platform 或缺失
-            // X-Platform 会让 BigModel 后端判定为非 ZCode 客户端,拿不到 150% 加成。
-            // preset extra_headers 不再配这些头,统一由此注入(与 ZaiOauth 分支对齐)。
+            // 但需要与 OAuth(ZaiOauth)路径完全对齐的 ZCode 指纹头(含运行时动态
+            // X-Platform `darwin-arm64` / `win32-x64`),否则缺失 / 错误的 X-Platform
+            // 会让 BigModel 后端判定为非 ZCode 客户端,拿不到 150% 加成。入站 x-platform
+            // 已在上方按 `injects_zcode_headers` 统一 strip,这里独占注入。preset
+            // extra_headers 现为空对象({})、healing 清掉存量用户残留的 claude-cli UA,
+            // ZCode 指纹头统一由此代码层注入(与 ZaiOauth 分支对齐)。
             for (name, value) in
                 codex_app_transfer_gemini_oauth::zai::constants::zcode_source_headers()
             {
@@ -2263,6 +2300,61 @@ fn filter_hop_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ZCode 指纹头注入判定:三条 GLM Coding Plan 路径(zhipu-coding 的 Bearer +
+    // coding 端点,zai-login/bigmodel-login 的 ZaiOauth)命中,其它一律不命中。
+    // 此判定同时驱动入站 x-platform 去重与 match 注入分支 guard,两处必须一致。
+    #[test]
+    fn injects_zcode_source_headers_covers_all_glm_coding_paths() {
+        use codex_app_transfer_gemini_oauth::ZaiProvider;
+        let coding = "https://open.bigmodel.cn/api/coding/paas/v4";
+        // zhipu-coding:Bearer + coding 端点 → 注入
+        assert!(injects_zcode_source_headers(&AuthScheme::Bearer, coding));
+        // zai-login / bigmodel-login:ZaiOauth → 注入(base_url 无所谓)
+        assert!(injects_zcode_source_headers(
+            &AuthScheme::ZaiOauth(ZaiProvider::Zai),
+            "https://api.z.ai/api/anthropic"
+        ));
+        assert!(injects_zcode_source_headers(
+            &AuthScheme::ZaiOauth(ZaiProvider::BigModel),
+            "https://open.bigmodel.cn/api/anthropic"
+        ));
+        // 普通 Bearer(非 coding 端点,如开放平台 zhipu / openrouter)→ 不注入
+        assert!(!injects_zcode_source_headers(
+            &AuthScheme::Bearer,
+            "https://open.bigmodel.cn/api/paas/v4"
+        ));
+        // 其它 scheme 即便打 coding 端点也不注入(理论不会发生,防御)
+        assert!(!injects_zcode_source_headers(&AuthScheme::XApiKey, coding));
+        assert!(!injects_zcode_source_headers(
+            &AuthScheme::GrokCookie,
+            coding
+        ));
+        assert!(!injects_zcode_source_headers(&AuthScheme::None, ""));
+    }
+
+    // 入站需独占 strip 的 ZCode 指纹头(除 User-Agent —— 它由 is_strip_on_forward
+    // 全局 strip),大小写不敏感;非指纹头不误伤。
+    #[test]
+    fn is_zcode_owned_header_covers_injected_fingerprint_headers() {
+        for h in [
+            "X-Platform",
+            "x-platform",
+            "HTTP-Referer",
+            "http-referer",
+            "X-Title",
+            "X-ZCode-App-Version",
+            "x-zcode-app-version",
+        ] {
+            assert!(is_zcode_owned_header(h), "{h} 应被 strip");
+        }
+        // User-Agent 由 is_strip_on_forward 处理,不进 zcode-owned 集合
+        assert!(!is_zcode_owned_header("User-Agent"));
+        // 普通头不误伤
+        assert!(!is_zcode_owned_header("content-type"));
+        assert!(!is_zcode_owned_header("authorization"));
+        assert!(!is_zcode_owned_header("x-session-id"));
+    }
 
     // [MOC-210] SSE 事件边界:认 \n\n 与 \r\n\r\n,返回首个完整事件结束偏移。
     #[test]
