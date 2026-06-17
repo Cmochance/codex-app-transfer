@@ -34,16 +34,18 @@ mod tests {
 
     #[test]
     fn presets_count_matches_python() {
-        // 当前 14 条 builtin presets:
+        // 当前 16 条 builtin presets:
         // deepseek / kimi / kimi-code / xiaomi-mimo-payg / xiaomi-mimo-token-plan
-        // / zhipu / zhipu-coding / bailian / bailian-token-plan / minimax / grok-web
-        // / google-ai-studio / gemini-cli-oauth / antigravity-oauth
+        // / zhipu / zhipu-coding / zai-login / bigmodel-login / bailian /
+        // bailian-token-plan / minimax / grok-web / google-ai-studio /
+        // gemini-cli-oauth / antigravity-oauth
         // (2026-05-10 加 Google AI Studio Gemini preset)
         // (2026-05-11 加 Gemini CLI OAuth login preset)
         // (2026-05-11 加 Antigravity OAuth preset)
         // (2026-05-12 加 Grok Web 反代 preset,见 R1 Plan A)
         // (2026-06-13 加智谱 GLM Coding preset:Coding Plan 端点 + Claude Code UA 伪装)
-        assert_eq!(builtin_presets().len(), 14);
+        // (2026-06-16 加 zai-login / bigmodel-login OAuth preset:GLM Coding Plan 账号登录,MOC-252)
+        assert_eq!(builtin_presets().len(), 16);
     }
 
     #[test]

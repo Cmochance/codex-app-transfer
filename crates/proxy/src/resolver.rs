@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use codex_app_transfer_gemini_oauth::ZaiProvider;
 use codex_app_transfer_registry::model_alias::{
     normalize_model_mappings, openai_model_slot, provider_slug, strip_internal_model_suffix,
 };
@@ -56,6 +57,13 @@ pub enum AuthScheme {
     ///
     /// Cookie 不在 provider.api_key,而在 `provider.extra["grokWeb"]["cookies"]` JSON object。
     GrokCookie,
+    /// z.ai / bigmodel(GLM **Coding Plan** 账号登录)。换出的**组织 API key** 不在
+    /// `provider.api_key`,由 `gemini_oauth::zai::ZaiCredentialStore` 持久化
+    /// (`~/.codex-app-transfer/{zai,bigmodel}-oauth.json`)+ 请求时 load(**无 refresh**,
+    /// 过期/未登录 → needs_login)。打 [`ZaiProvider::config().model_base`] 的 Anthropic
+    /// Messages wire,forward.rs 注 `Authorization: Bearer <org_key>` + ZCode 指纹头。
+    /// 内含 [`ZaiProvider`] 区分 z.ai vs bigmodel(两者 model_base / token 文件不同)。
+    ZaiOauth(ZaiProvider),
     /// 不写鉴权头(上游免认证 / 走 cookie 等少见情况).
     None,
 }
@@ -75,6 +83,8 @@ impl AuthScheme {
                 AuthScheme::GoogleOauthAntigravity
             }
             "grok_cookie" | "grok" | "grok_web" => AuthScheme::GrokCookie,
+            "zai_oauth" | "zai" => AuthScheme::ZaiOauth(ZaiProvider::Zai),
+            "bigmodel_oauth" | "bigmodel" => AuthScheme::ZaiOauth(ZaiProvider::BigModel),
             "" | "none" | "no" => AuthScheme::None,
             // bearer 与未知 scheme 都按 Bearer 处理(与 Python 默认一致)
             _ => AuthScheme::Bearer,
@@ -290,6 +300,9 @@ impl ProviderResolver for StaticResolver {
             AuthScheme::GoogleOauthAntigravity => {
                 "https://daily-cloudcode-pa.googleapis.com".to_string()
             }
+            // z.ai/bigmodel:上游 base 按 provider 钉死(`api.z.ai/api/anthropic` /
+            // `open.bigmodel.cn/api/anthropic`),不允许用户 baseUrl 漂移
+            AuthScheme::ZaiOauth(zai_provider) => zai_provider.config().model_base.to_string(),
             _ => provider.base_url.clone(),
         };
 
@@ -461,6 +474,30 @@ mod tests {
         assert_eq!(
             AuthScheme::parse("Google-OAuth-Antigravity"),
             AuthScheme::GoogleOauthAntigravity
+        );
+
+        // z.ai / bigmodel(MOC-252):别名误归 Bearer 会让 forward.rs 跳过组织 key load
+        // + 不注 ZCode 指纹 → 上游 401 / 非 GLM 客户端。两套 provider 必须解到对的
+        // ZaiProvider(决定 model_base + token 文件)。
+        assert_eq!(
+            AuthScheme::parse("zai_oauth"),
+            AuthScheme::ZaiOauth(ZaiProvider::Zai)
+        );
+        assert_eq!(
+            AuthScheme::parse("zai"),
+            AuthScheme::ZaiOauth(ZaiProvider::Zai)
+        );
+        assert_eq!(
+            AuthScheme::parse("bigmodel_oauth"),
+            AuthScheme::ZaiOauth(ZaiProvider::BigModel)
+        );
+        assert_eq!(
+            AuthScheme::parse("bigmodel"),
+            AuthScheme::ZaiOauth(ZaiProvider::BigModel)
+        );
+        assert_eq!(
+            AuthScheme::parse("BigModel-OAuth"),
+            AuthScheme::ZaiOauth(ZaiProvider::BigModel)
         );
     }
 

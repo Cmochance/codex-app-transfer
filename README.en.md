@@ -5,7 +5,7 @@
 >
 > This project has currently completed **end-to-end real-world testing only for Kimi For Coding and Xiaomi MiMo (Token Plan)**.
 >
-> Other built-in chat-completions-compatible providers (including **DeepSeek, Kimi (Moonshot Platform), Xiaomi MiMo (Pay for Token), Zhipu GLM, Zhipu GLM Coding, Aliyun Bailian (API Key / Token Plan), MiniMax**) **have not undergone long-term real-world regression** — they sit at unit-test + occasional user-report level only.
+> Other built-in chat-completions-compatible providers (including **DeepSeek, Kimi (Moonshot Platform), Xiaomi MiMo (Pay for Token), Zhipu GLM, Zhipu GLM Coding, Z.ai GLM account login (zai-login), BigModel Zhipu account login (bigmodel-login), Aliyun Bailian (API Key / Token Plan), MiniMax**) **have not undergone long-term real-world regression** — they sit at unit-test + occasional user-report level only.
 >
 > If you'd be willing to **provide an API key from another provider for testing**, it would be deeply appreciated! Reach out via **QQ: `3216202644`** or email — the author guarantees the **API key will only be used for actual testing of this project**.
 
@@ -140,6 +140,8 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | Backend ready, UI pending; gemini family context 1M (suffixed ids previously fell back to 258k, MOC-221); **native image_gen support** (MOC-210; gemini-3.1-flash-image by default, overridable via the `gpt-image-1` model slot) |
 | Zhipu GLM (5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
 | Zhipu GLM Coding (4.7 / 4.6) | ✅ | ✅ | ✅ | GLM Coding Plan subscription endpoint (`/api/coding/paas/v4`); User-Agent spoofed as Claude Code to match the Coding Plan tool-recognition policy (mirrors Kimi Code's approach) |
+| Z.ai GLM account login (`zai-login`) | ✅ | ✅ | ✅ | **OAuth — no API key required**; uses your GLM Coding Plan subscription quota; `api.z.ai/api/anthropic` Anthropic Messages wire + ZCode fingerprint headers; proxy ready, login UI pending Stage 3 |
+| BigModel Zhipu account login (`bigmodel-login`) | ✅ | ✅ | ✅ | **OAuth — no API key required**; uses your GLM Coding Plan subscription quota; `open.bigmodel.cn/api/anthropic` Anthropic Messages wire + ZCode fingerprint headers; proxy ready, login UI pending Stage 3 |
 | Alibaba Cloud Bailian (Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
 | Responses passthrough (custom) | — | — | — | Routes through the local proxy as a **1:1 byte passthrough** (no more direct connection, MOC-234); suitable for OpenAI official / native Responses reverse proxy; ⚠️ Plugins/MCP `namespace` tool bundle is NOT flattened — some upstreams silently drop tools |
 

@@ -204,20 +204,23 @@ impl axum::response::IntoResponse for ForwardError {
             needs_login,
         } = &self
         {
+            // vendor-neutral 文案:本错误现服务 gemini-cli / antigravity / zai(z.ai/bigmodel)
+            // 多个 OAuth provider;具体是哪个由 `reason` 携带(如 "not logged in to zai")。
+            // 不再硬编码 "Gemini" —— 否则 z.ai/bigmodel 用户未登录会被误导去重登 Gemini;
+            // 且 zai 无 refresh,旧 "token refresh failed" 文案对它自相矛盾。
             let (code, message) = if *needs_login {
                 (
                     "oauth_login_required",
                     format!(
-                        "Gemini OAuth credentials missing or revoked — please re-run login from \
+                        "OAuth credentials missing or revoked — please re-run login from \
                          settings. Detail: {reason}"
                     ),
                 )
             } else {
                 (
-                    "oauth_token_refresh_failed",
+                    "oauth_token_unavailable",
                     format!(
-                        "Gemini OAuth token refresh transiently failed; please retry. Detail: \
-                         {reason}"
+                        "OAuth credentials temporarily unavailable; please retry. Detail: {reason}"
                     ),
                 )
             };
@@ -1758,6 +1761,36 @@ async fn build_and_send_upstream(
             .map_err(classify_oauth_service_error)?;
             Some(token)
         }
+        crate::resolver::AuthScheme::ZaiOauth(zai_provider) => {
+            // z.ai/bigmodel:换出的组织 key 在 {zai,bigmodel}-oauth.json,**同步 load
+            // 无 refresh**(组织 key 长期有效);文件不存在 = 未登录 → needs_login。
+            let store =
+                codex_app_transfer_gemini_oauth::ZaiCredentialStore::for_provider(zai_provider)
+                    .map_err(|e| ForwardError::OauthUnavailable {
+                        reason: format!(
+                            "home directory unavailable; cannot locate zai token store: {e}"
+                        ),
+                        needs_login: false,
+                    })?;
+            let cred = store
+                .load()
+                .map_err(|e| {
+                    // 损坏文件(Serde)重试无用,重登会重写文件 → needs_login:true(对齐
+                    // antigravity classify_oauth_service_error 对 Token 错的处置);home/IO
+                    // 是环境/瞬时问题 → false
+                    let needs_login =
+                        matches!(e, codex_app_transfer_gemini_oauth::TokenError::Serde(_));
+                    ForwardError::OauthUnavailable {
+                        reason: format!("zai credential load failed: {e}"),
+                        needs_login,
+                    }
+                })?
+                .ok_or_else(|| ForwardError::OauthUnavailable {
+                    reason: format!("not logged in to {}", zai_provider.wire_id()),
+                    needs_login: true,
+                })?;
+            Some(cred.org_api_key)
+        }
         _ => None,
     };
 
@@ -1826,6 +1859,17 @@ async fn build_and_send_upstream(
                 "User-Agent",
                 codex_app_transfer_gemini_oauth::antigravity_user_agent_chat(),
             );
+        }
+        crate::resolver::AuthScheme::ZaiOauth(_) => {
+            // ZCode 来源指纹头(UA `ZCode/<ver>` / X-Platform / HTTP-Referer / X-Title /
+            // X-ZCode-App-Version)—— 强制 override inbound/extra 同名值,对齐 ZCode 客户端
+            // 身份。`anthropic-version` + `Content-Type` 由 anthropic_messages adapter 注;
+            // `Authorization: Bearer <org_key>` 由 inject_auth 注。
+            for (name, value) in
+                codex_app_transfer_gemini_oauth::zai::constants::zcode_source_headers()
+            {
+                up = up.header(name, value);
+            }
         }
         crate::resolver::AuthScheme::GrokCookie => {
             // grok.com Web 后端鉴权头(cookie + statsig + xai-request-id + traceparent +
@@ -2111,11 +2155,14 @@ fn inject_auth(
         AuthScheme::GoogleApiKey => {
             req = req.header("x-goog-api-key", resolved.api_key.clone());
         }
-        AuthScheme::GoogleOauthCloudCode | AuthScheme::GoogleOauthAntigravity => {
+        AuthScheme::GoogleOauthCloudCode
+        | AuthScheme::GoogleOauthAntigravity
+        | AuthScheme::ZaiOauth(_) => {
             // 调用方在 build_and_send_upstream 入口处已 await 过 OAuth token,
-            // 这里单纯 Bearer 注入。两个 OAuth scheme 共用 cloudcode-pa 上游 →
-            // Bearer header 一样,只是 token 来源(gemini-cli vs antigravity 文件)
-            // 不同。**None 是 build_and_send_upstream 的 bug** — 大声 log error_id
+            // 这里单纯 Bearer 注入。Google 两个 scheme 共用 cloudcode-pa,zai 用换出的
+            // 组织 key(ZCode model 调用对 plan provider 也是 `Authorization: Bearer`)→
+            // Bearer header 形式一样,只是 token 来源不同(gemini/antigravity/zai 文件)。
+            // **None 是 build_and_send_upstream 的 bug** — 大声 log error_id
             // 让 Sentry/grep 锚定;请求会因缺 Authorization header 上游 401,
             // 用户看到 401 时再交叉看日志(2026-05-11 silent-failure-hunter C1)
             match oauth_bearer {
@@ -2400,7 +2447,8 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_unavailable_renders_401_with_refresh_failed_code_when_transient() {
-        // 临时网络错误 → needs_login=false → code "oauth_token_refresh_failed",
+        // 临时错误 → needs_login=false → code "oauth_token_unavailable"(vendor-neutral,
+        // MOC-252:原 "oauth_token_refresh_failed" 对无 refresh 的 zai 语义矛盾)。
         // 文案不让用户重登(避免误导用户重做 OAuth 当成永久错误)
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
@@ -2412,7 +2460,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let body_bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body["error"]["code"], "oauth_token_refresh_failed");
+        assert_eq!(body["error"]["code"], "oauth_token_unavailable");
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
             message.contains("retry"),
