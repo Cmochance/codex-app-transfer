@@ -306,6 +306,17 @@ impl ProviderResolver for StaticResolver {
             _ => provider.base_url.clone(),
         };
 
+        // ZaiOauth:把 forced base 也写回转发用的 provider.base_url。anthropic_messages
+        // adapter 的 path 由 `build_anthropic_messages_upstream_path(&provider.base_url)`
+        // 推导(末尾是否 `/v1` 决定 `/messages` vs `/v1/messages`);若仍用用户漂移的
+        // base_url(如手填成 `…/api/anthropic/v1`)会得到 `/messages`,跟 forced base
+        // `…/api/anthropic` 拼成缺 `/v1` 的错误 URL。让 path 与 forced base 同源根治
+        // (bot P2)。cloudcode/antigravity 走 gemini_cli adapter、path 逻辑不同,不动。
+        let mut forwarded_provider = provider.clone();
+        if matches!(auth_scheme, AuthScheme::ZaiOauth(_)) {
+            forwarded_provider.base_url = upstream_base.clone();
+        }
+
         Ok(ResolvedProvider {
             provider_id: provider.id.clone(),
             upstream_base,
@@ -313,7 +324,7 @@ impl ProviderResolver for StaticResolver {
             auth_scheme,
             extra_headers: extras,
             rewritten_model,
-            provider: Arc::new(provider.clone()),
+            provider: Arc::new(forwarded_provider),
         })
     }
 }
@@ -690,6 +701,35 @@ mod tests {
         assert_eq!(res.provider_id, "");
         assert_eq!(res.upstream_base, "https://up-1");
         assert_eq!(res.rewritten_model.as_deref(), Some("qna-v1"));
+    }
+
+    #[test]
+    fn zai_oauth_forces_base_and_path_source_even_when_baseurl_drifts() {
+        // bot P2:用户 baseUrl 漂移带 /v1 时,forced upstream_base **和**转发用的
+        // provider.base_url 都应钉成 model_base —— 这样 anthropic adapter 的 path 推导
+        // (`build_anthropic_messages_upstream_path` 看 base 末尾是否 `/v1`)与 base 同源,
+        // 不会拼出缺 `/v1` 的错误 URL。
+        let mut p = provider("bm", "https://open.bigmodel.cn/api/anthropic/v1", "");
+        p.auth_scheme = "bigmodel_oauth".into();
+        p.api_format = "anthropic_messages".into();
+        let r = StaticResolver::new(None, vec![p], Some("bm".into()));
+        let parts = parts_with(&[]);
+        let res = r.resolve(&parts, br#"{"model":"glm-4.7"}"#).unwrap();
+        let forced = "https://open.bigmodel.cn/api/anthropic";
+        assert_eq!(res.upstream_base, forced, "upstream_base 应钉成 model_base");
+        assert_eq!(
+            res.provider.base_url, forced,
+            "转发 provider.base_url 也应钉成 forced base(否则 adapter path 推导用漂移值)"
+        );
+        // z.ai 同理
+        let mut pz = provider("z", "https://api.z.ai/api/anthropic/v1/", "");
+        pz.auth_scheme = "zai_oauth".into();
+        pz.api_format = "anthropic_messages".into();
+        let rz = StaticResolver::new(None, vec![pz], Some("z".into()));
+        let resz = rz
+            .resolve(&parts_with(&[]), br#"{"model":"glm-4.7"}"#)
+            .unwrap();
+        assert_eq!(resz.provider.base_url, "https://api.z.ai/api/anthropic");
     }
 
     #[test]
