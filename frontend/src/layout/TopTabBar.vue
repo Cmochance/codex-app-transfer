@@ -25,7 +25,6 @@ const tabs: Tab[] = [
 
 <template>
   <header class="topbar">
-    <div class="topbar__title">Codex App Transfer</div>
     <nav class="tabbar">
       <RouterLink
         v-for="tab in tabs"
@@ -44,18 +43,11 @@ const tabs: Tab[] = [
 <style scoped>
 .topbar {
   flex-shrink: 0;
-  padding: var(--space-3) 0 var(--space-2);
+  padding: var(--space-2) 0;
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--bg) 88%, transparent);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
-}
-.topbar__title {
-  text-align: center;
-  font-size: var(--fs-md);
-  font-weight: 600;
-  margin-bottom: var(--space-3);
-  letter-spacing: -0.01em;
 }
 .tabbar {
   display: flex;

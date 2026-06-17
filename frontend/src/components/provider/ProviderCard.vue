@@ -6,7 +6,6 @@ import IconGrip from '~icons/lucide/grip-vertical'
 import IconPlay from '~icons/lucide/play'
 import IconPencil from '~icons/lucide/square-pen'
 import IconTrash from '~icons/lucide/trash-2'
-import IconRadio from '~icons/lucide/radio'
 import IconPlug from '~icons/lucide/plug'
 
 defineProps<{ provider: Provider }>()
@@ -20,10 +19,12 @@ defineEmits<{ enable: []; edit: []; remove: [] }>()
     <img v-if="provider.logo" :src="`/${provider.logo}`" class="pcard__logo" alt="" />
     <span v-else class="pcard__logo pcard__logo--fallback"><IconPlug /></span>
     <div class="pcard__main">
-      <strong class="pcard__name">{{ provider.name }}</strong>
+      <div class="pcard__name-row">
+        <strong class="pcard__name">{{ provider.name }}</strong>
+        <span v-if="provider.default" class="pcard__enabled">{{ t('providers.enabled') }}</span>
+      </div>
       <span class="pcard__url">{{ provider.baseUrl }}</span>
     </div>
-    <span v-if="provider.default" class="pcard__badge"><IconRadio />{{ t('status.active') }}</span>
     <!-- 诉求1: 只保留 启用/编辑/删除 三个, 统一图标+文字 -->
     <div class="pcard__actions">
       <AppButton
@@ -87,7 +88,17 @@ defineEmits<{ enable: []; edit: []; remove: [] }>()
   min-width: 0;
   flex: 1;
 }
+.pcard__name-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
 .pcard__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: var(--fs-md);
   font-weight: 600;
 }
@@ -98,17 +109,11 @@ defineEmits<{ enable: []; edit: []; remove: [] }>()
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.pcard__badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: var(--fs-sm);
-  color: var(--success);
+.pcard__enabled {
   flex-shrink: 0;
-}
-.pcard__badge :deep(svg) {
-  width: 13px;
-  height: 13px;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--success);
 }
 .pcard__actions {
   display: flex;

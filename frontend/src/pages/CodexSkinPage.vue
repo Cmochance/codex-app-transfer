@@ -397,8 +397,8 @@ async function onRestartChoice(choice: 'now' | 'later') {
 
 <style scoped>
 .skin-page {
-  max-width: 760px;
-  margin: 0 auto;
+  /* 填满容器(左右 20px 边由 AppLayout 统一控制) */
+  max-width: 100%;
 }
 .page-head {
   margin-bottom: var(--space-5);

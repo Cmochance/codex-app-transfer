@@ -7,9 +7,10 @@ import { useToast } from '@/composables/useToast'
 import { renderMiniMd, truncateString } from '@/lib/miniMd'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppInput from '@/components/ui/AppInput.vue'
-import AppModal from '@/components/ui/AppModal.vue'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
+import AppSelect from '@/components/ui/AppSelect.vue'
+import AppDropdown from '@/components/ui/AppDropdown.vue'
 import IconRefresh from '~icons/lucide/refresh-cw'
 import IconDownload from '~icons/lucide/download'
 import IconTrash from '~icons/lucide/trash-2'
@@ -36,7 +37,6 @@ const exportOptions = reactive<ExportOptions>({
   includeSystemPrompts: false,
   redactSecrets: true,
 })
-const optionsModal = ref(false)
 
 // ── 默认导出目录(localStorage 持久化)──────────────────────────────────
 const DEFAULT_DIR_KEY = 'cas.conv.defaultExportDir'
@@ -116,6 +116,21 @@ const cwdOptions = computed(() => {
   const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
   return sorted.map(([cwd, count]) => ({ value: cwd, label: `${cwd.split('/').pop() || cwd} (${count})` }))
 })
+// 自定义下拉选项(替代原生 <select>)
+const kindOptions = computed(() => [
+  { value: 'all', label: t('codex.conv.kindAll') },
+  { value: 'active', label: t('codex.conv.kindActive') },
+  { value: 'archived', label: t('codex.conv.kindArchived') },
+])
+const cwdSelectOptions = computed(() => [
+  { value: 'all', label: t('codex.conv.cwdAll') },
+  ...cwdOptions.value,
+])
+const formatOptions = computed(() => [
+  { value: 'markdown', label: 'Markdown (.md)' },
+  { value: 'json', label: 'JSON (.json)' },
+  { value: 'jsonl', label: `${t('codex.conv.formatJsonl')} (.jsonl)` },
+])
 
 const filtered = computed(() => {
   const q = search.value.toLowerCase().trim()
@@ -302,20 +317,11 @@ onMounted(() => {
 
 <template>
   <div class="conv">
-    <p class="conv__warn">{{ t('codex.conv.warnRedact') }}</p>
-
     <!-- 工具栏 -->
     <div class="conv__toolbar">
       <AppInput v-model="search" :placeholder="t('codex.conv.searchPlaceholder')" class="conv__search" />
-      <select v-model="kindFilter" class="conv__select">
-        <option value="all">{{ t('codex.conv.kindAll') }}</option>
-        <option value="active">{{ t('codex.conv.kindActive') }}</option>
-        <option value="archived">{{ t('codex.conv.kindArchived') }}</option>
-      </select>
-      <select v-model="cwdFilter" class="conv__select">
-        <option value="all">{{ t('codex.conv.cwdAll') }}</option>
-        <option v-for="o in cwdOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
-      </select>
+      <AppSelect v-model="kindFilter" :options="kindOptions" class="conv__sel conv__sel--kind" />
+      <AppSelect v-model="cwdFilter" :options="cwdSelectOptions" align="right" class="conv__sel conv__sel--cwd" />
       <AppButton size="sm" :icon="IconRefresh" :label="t('codex.conv.refresh')" @click="load" />
     </div>
 
@@ -325,14 +331,32 @@ onMounted(() => {
         <span>{{ t('codex.conv.selectAll') }}</span>
       </label>
       <span class="conv__spacer" />
-      <select v-model="format" class="conv__select">
-        <option value="markdown">Markdown (.md)</option>
-        <option value="json">JSON (.json)</option>
-        <option value="jsonl">{{ t('codex.conv.formatJsonl') }} (.jsonl)</option>
-      </select>
-      <AppButton size="sm" :icon="IconSettings" :label="t('codex.conv.options')" @click="optionsModal = true" />
-      <AppButton size="sm" :icon="IconDownload" :label="exportLabel" :disabled="!selected.size" @click="exportSelected" />
-      <AppButton size="sm" variant="danger" :icon="IconTrash" :label="deleteLabel" :disabled="!selected.size" @click="deleteSelected" />
+      <AppSelect v-model="format" :options="formatOptions" align="right" class="conv__sel conv__sel--fmt" />
+      <!-- 「选项」内联下拉(替代弹窗;开关直接绑 exportOptions,改即生效)-->
+      <AppDropdown align="right" panel-width="320px" class="conv__opts">
+        <template #trigger>
+          <AppButton size="sm" :icon="IconSettings" :label="t('codex.conv.options')" />
+        </template>
+        <div class="conv__opts-panel">
+          <SettingsRow :title="t('codex.conv.optIncludeReasoning')">
+            <AppSwitch v-model="exportOptions.includeReasoning" />
+          </SettingsRow>
+          <SettingsRow :title="t('codex.conv.optIncludeToolCalls')">
+            <AppSwitch v-model="exportOptions.includeToolCalls" />
+          </SettingsRow>
+          <SettingsRow :title="t('codex.conv.optIncludeSystem')">
+            <AppSwitch v-model="exportOptions.includeSystemPrompts" />
+          </SettingsRow>
+          <SettingsRow :title="t('codex.conv.optRedact')">
+            <AppSwitch v-model="exportOptions.redactSecrets" />
+          </SettingsRow>
+          <SettingsRow :title="t('codex.conv.optToolMax')">
+            <input v-model.number="exportOptions.toolOutputMaxChars" type="number" min="100" max="200000" step="256" class="conv__num" />
+          </SettingsRow>
+        </div>
+      </AppDropdown>
+      <AppButton class="conv__act-btn" size="sm" :icon="IconDownload" :label="exportLabel" :disabled="!selected.size" @click="exportSelected" />
+      <AppButton class="conv__act-btn" size="sm" variant="danger" :icon="IconTrash" :label="deleteLabel" :disabled="!selected.size" @click="deleteSelected" />
     </div>
 
     <p v-if="!loading" class="conv__summary">{{ tFmt('codex.conv.summary', { count: sessions.length }) }}</p>
@@ -414,27 +438,6 @@ onMounted(() => {
       </SettingsRow>
     </div>
 
-    <!-- 导出选项 modal -->
-    <AppModal v-if="optionsModal" :title="t('codex.conv.optionsTitle')" @close="optionsModal = false">
-      <SettingsRow :title="t('codex.conv.optIncludeReasoning')">
-        <AppSwitch v-model="exportOptions.includeReasoning" />
-      </SettingsRow>
-      <SettingsRow :title="t('codex.conv.optIncludeToolCalls')">
-        <AppSwitch v-model="exportOptions.includeToolCalls" />
-      </SettingsRow>
-      <SettingsRow :title="t('codex.conv.optIncludeSystem')">
-        <AppSwitch v-model="exportOptions.includeSystemPrompts" />
-      </SettingsRow>
-      <SettingsRow :title="t('codex.conv.optRedact')">
-        <AppSwitch v-model="exportOptions.redactSecrets" />
-      </SettingsRow>
-      <SettingsRow :title="t('codex.conv.optToolMax')">
-        <input v-model.number="exportOptions.toolOutputMaxChars" type="number" min="100" max="200000" step="256" class="conv__num" />
-      </SettingsRow>
-      <div class="conv__modal-actions">
-        <AppButton variant="primary" :label="t('common.save')" @click="optionsModal = false; toast(t('codex.conv.optionsSaved'))" />
-      </div>
-    </AppModal>
   </div>
 </template>
 
@@ -443,6 +446,8 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+  flex: 1;
+  min-height: 0;
 }
 .conv__warn {
   margin: 0;
@@ -467,15 +472,27 @@ onMounted(() => {
 .conv__search :deep(.app-input) {
   width: 100%;
 }
-.conv__select {
-  height: 30px;
-  padding: 0 var(--space-2);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--text);
-  font-size: var(--fs-sm);
-  font-family: inherit;
+.conv__sel--kind {
+  width: 104px;
+}
+.conv__sel--cwd {
+  width: 168px;
+}
+.conv__sel--fmt {
+  width: 152px;
+}
+/* 导出/删除按钮固定宽度:label 带选中数变化时不再改变宽度(修原重叠 bug) */
+.conv__act-btn {
+  min-width: 122px;
+  flex-shrink: 0;
+  justify-content: center;
+}
+/* 「选项」内联面板的开关行 */
+.conv__opts-panel :deep(.settings-row) {
+  padding: var(--space-3);
+}
+.conv__opts-panel :deep(.settings-row + .settings-row) {
+  border-top: 1px solid var(--border);
 }
 .conv__selectall {
   display: flex;
@@ -494,13 +511,15 @@ onMounted(() => {
 }
 
 /* list */
+/* 列表填满剩余空间 + 框内滚;「默认导出文件夹」常驻底部,底部间隙恒定 = 内边距 */
 .conv__list {
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  max-height: 320px;
+  flex: 1;
+  min-height: 160px;
   overflow-y: auto;
 }
 .conv__state {
@@ -573,6 +592,9 @@ onMounted(() => {
 
 /* detail */
 .conv__detail {
+  flex-shrink: 0;
+  max-height: 42vh;
+  overflow-y: auto;
   padding: var(--space-4);
   background: var(--surface);
   border: 1px solid var(--border);
@@ -660,11 +682,6 @@ onMounted(() => {
   background: var(--surface);
   color: var(--text);
   font-size: var(--fs-sm);
-}
-.conv__modal-actions {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: var(--space-4);
 }
 
 /* 渲染 markdown(v-html)*/

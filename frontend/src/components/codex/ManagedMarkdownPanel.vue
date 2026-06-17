@@ -530,7 +530,7 @@ watch(
 }
 .mmp__preview {
   min-height: 240px;
-  max-height: 52vh;
+  max-height: calc(100vh - 300px);
   overflow-y: auto;
   padding: var(--space-4);
   background: var(--surface);
@@ -546,7 +546,7 @@ watch(
 .mmp__edit {
   width: 100%;
   min-height: 240px;
-  height: 52vh;
+  height: calc(100vh - 300px);
   padding: var(--space-4);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);

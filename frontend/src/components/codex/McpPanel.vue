@@ -486,10 +486,10 @@ watch(subpane, (sub) => loadSubpane(sub))
 
     <!-- ════ Servers ════ -->
     <div v-if="subpane === 'servers'" class="mcp__servers">
-      <p class="mcp__warn">{{ t('codex.mcp.serversWarn') }}</p>
       <div class="mcp__split">
         <!-- list -->
         <div class="mcp__list">
+          <div class="mcp__list-scroll">
           <div v-if="!servers.length" class="mcp__empty">{{ t('codex.mcp.serversEmpty') }}</div>
           <button
             v-for="s in servers"
@@ -505,6 +505,7 @@ watch(subpane, (sub) => loadSubpane(sub))
             <span class="mcp__list-name">{{ s.name }}</span>
             <span v-if="s.enabled === false" class="mcp__off">off</span>
           </button>
+          </div>
           <AppButton class="mcp__new" size="sm" :icon="IconPlus" :label="t('codex.mcp.serverNew')" @click="openNewServer" />
         </div>
 
@@ -561,7 +562,6 @@ watch(subpane, (sub) => loadSubpane(sub))
 
     <!-- ════ Plugins ════ -->
     <div v-else-if="subpane === 'plugins'" class="mcp__plugins">
-      <p class="mcp__warn">{{ t('codex.mcp.pluginsWarn') }}</p>
       <div v-if="!plugins.length" class="mcp__empty">{{ t('codex.mcp.pluginsEmpty') }}</div>
       <div v-for="p in plugins" :key="p.key" class="mcp__plugin">
         <div class="mcp__plugin-body">
@@ -569,9 +569,12 @@ watch(subpane, (sub) => loadSubpane(sub))
           <span class="mcp__plugin-ver">@{{ p.marketplace }} · v{{ p.version }}</span>
         </div>
         <div class="mcp__plugin-actions">
+          <span class="mcp__plugin-state" :class="p.enabled ? 'on' : 'off'">
+            {{ p.enabled ? t('codex.mcp.pluginOn') : t('codex.mcp.pluginOff') }}
+          </span>
           <AppButton
             size="sm"
-            :label="p.enabled ? t('codex.mcp.pluginEnabled') : t('codex.mcp.pluginDisabled')"
+            :label="p.enabled ? t('codex.mcp.pluginDisable') : t('codex.mcp.pluginEnable')"
             @click="togglePlugin(p)"
           />
           <AppButton size="sm" variant="danger" :icon="IconTrash" @click="uninstallPlugin(p)" />
@@ -709,11 +712,23 @@ watch(subpane, (sub) => loadSubpane(sub))
   display: grid;
   grid-template-columns: 200px 1fr;
   gap: var(--space-3);
+  height: calc(100vh - 280px);
+  min-height: 320px;
 }
 .mcp__list {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+  min-height: 0;
+}
+/* 列表填满左列、框内滚;「新增」按钮常驻底部,避免下方留空白 */
+.mcp__list-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 .mcp__list-item {
   display: flex;
@@ -770,6 +785,7 @@ watch(subpane, (sub) => loadSubpane(sub))
 /* form */
 .mcp__form {
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
@@ -802,10 +818,12 @@ watch(subpane, (sub) => loadSubpane(sub))
   width: 15px;
   height: 15px;
 }
+/* 配置框固定高度(填满表单中段)+ 框内滚:不同 server 配置长短不再改变布局/撑页 */
 .mcp__json-pre,
 .mcp__json-edit {
   margin: 0;
-  min-height: 220px;
+  flex: 1;
+  min-height: 0;
   padding: var(--space-3);
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -813,16 +831,16 @@ watch(subpane, (sub) => loadSubpane(sub))
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   line-height: 1.6;
+  overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
 }
 .mcp__json-edit {
   width: 100%;
-  height: 280px;
   background: var(--surface);
   border-color: var(--border-strong);
   color: var(--text);
-  resize: vertical;
+  resize: none;
 }
 .mcp__json-edit:focus {
   outline: none;
@@ -879,8 +897,19 @@ watch(subpane, (sub) => loadSubpane(sub))
 }
 .mcp__plugin-actions {
   display: flex;
+  align-items: center;
   gap: var(--space-2);
   flex-shrink: 0;
+}
+.mcp__plugin-state {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+.mcp__plugin-state.on {
+  color: var(--success);
+}
+.mcp__plugin-state.off {
+  color: var(--text-muted);
 }
 
 /* marketplace */

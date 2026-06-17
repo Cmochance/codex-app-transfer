@@ -34,10 +34,7 @@ const tab = computed<Tab>({
 </script>
 
 <template>
-  <div>
-    <h1 class="page-title">{{ t('codex.title') }}</h1>
-    <p class="page-sub">{{ t('codex.subtitle') }}</p>
-
+  <div class="codex-page">
     <div class="codex-subnav">
       <SegmentedControl v-model="tab" :options="tabOptions" />
     </div>
@@ -54,15 +51,12 @@ const tab = computed<Tab>({
 </template>
 
 <style scoped>
-.page-title {
-  font-size: var(--fs-xl);
-  font-weight: 600;
-  margin: 0 0 4px;
-}
-.page-sub {
-  font-size: var(--fs-sm);
-  color: var(--text-muted);
-  margin: 0 0 var(--space-4);
+/* flex 列:让 Sessions(ConversationsPanel)能 flex:1 撑满到底部内边距 */
+.codex-page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .codex-subnav {
   display: flex;

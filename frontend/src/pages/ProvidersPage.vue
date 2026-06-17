@@ -1,20 +1,37 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useProvidersStore } from '@/stores/providers'
 import { t } from '@/i18n'
+import { restartCodexApp } from '@/api/desktop'
+import { useToast } from '@/composables/useToast'
 import ProviderCard from '@/components/provider/ProviderCard.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import IconPlus from '~icons/lucide/plus'
+import IconRefreshCw from '~icons/lucide/refresh-cw'
 
 const store = useProvidersStore()
 const router = useRouter()
+const { show: toast } = useToast()
 onMounted(() => store.load())
+
+// 已启用(default)的提供商置顶,其余保持后端顺序
+const displayList = computed(() => {
+  const def = store.list.filter((p) => p.default)
+  const rest = store.list.filter((p) => !p.default)
+  return [...def, ...rest]
+})
 
 // 诉求2: HTML5 拖拽排序(复刻旧 enableProviderReorder 语义), drop 后乐观更新 + 持久化
 const draggingId = ref<string | null>(null)
-function onDragStart(id: string) {
+function onDragStart(id: string, e: DragEvent) {
   draggingId.value = id
+  // ⚠️ WKWebView(macOS)必须在 dragstart 写 dataTransfer, 否则 drop 事件根本不触发,
+  // 表现为「拖得动但松手位置不变」(本次 bug 根因)。setData + effectAllowed 缺一不可。
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', id)
+  }
 }
 function onDragEnd() {
   draggingId.value = null
@@ -23,14 +40,32 @@ function onDrop(targetId: string) {
   const from = draggingId.value
   draggingId.value = null
   if (!from || from === targetId) return
-  const ids = store.list.map((p) => p.id)
+  const ids = displayList.value.map((p) => p.id)
   const fi = ids.indexOf(from)
   const ti = ids.indexOf(targetId)
   if (fi < 0 || ti < 0) return
-  ids.splice(ti, 0, ids.splice(fi, 1)[0])
+  ids.splice(fi, 1) // 先移除被拖项
+  const tAfter = ids.indexOf(targetId) // 移除后目标的新索引
+  ids.splice(fi < ti ? tAfter + 1 : tAfter, 0, from) // 下拖落目标之后 / 上拖落之前
   store.reorder(ids)
 }
 
+async function onRestartCodexApp() {
+  try {
+    await restartCodexApp()
+    toast(t('toast.codexAppRestartRequested'))
+  } catch (e) {
+    toast((e as Error).message || t('toast.codexAppRestartFailed'), 'error')
+  }
+}
+
+async function onEnable(id: string) {
+  try {
+    await store.setDefault(id)
+  } catch (e) {
+    toast((e as Error).message || '启用失败', 'error')
+  }
+}
 function onEdit(id: string) {
   router.push({ path: '/providers/add', query: { id } })
 }
@@ -42,7 +77,13 @@ function onRemove(id: string) {
 <template>
   <div class="providers">
     <div class="providers__header">
-      <h1 class="providers__title">{{ t('nav.providers') }}</h1>
+      <AppButton
+        variant="secondary"
+        size="sm"
+        :icon="IconRefreshCw"
+        :label="t('providers.restartCodexApp')"
+        @click="onRestartCodexApp"
+      />
       <AppButton
         variant="primary"
         size="sm"
@@ -58,19 +99,19 @@ function onRemove(id: string) {
 
     <div v-else class="providers__list">
       <div
-        v-for="p in store.list"
+        v-for="p in displayList"
         :key="p.id"
         class="providers__item"
         :class="{ 'is-dragging': draggingId === p.id }"
         draggable="true"
-        @dragstart="onDragStart(p.id)"
+        @dragstart="onDragStart(p.id, $event)"
         @dragend="onDragEnd"
         @dragover.prevent
-        @drop="onDrop(p.id)"
+        @drop.prevent="onDrop(p.id)"
       >
         <ProviderCard
           :provider="p"
-          @enable="store.setDefault(p.id)"
+          @enable="onEnable(p.id)"
           @edit="onEdit(p.id)"
           @remove="onRemove(p.id)"
         />
@@ -83,12 +124,9 @@ function onRemove(id: string) {
 .providers__header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
+  gap: var(--space-2);
   margin-bottom: var(--space-4);
-}
-.providers__title {
-  font-size: var(--fs-xl);
-  font-weight: 600;
 }
 .providers__list {
   display: flex;

@@ -26,6 +26,21 @@ function fmtNum(n: number | undefined | null): string {
   if (n === null || n === undefined) return '—'
   return Number(n).toLocaleString()
 }
+// 大数缩写:4 位有效数字 + 单位(k/M/B/T…),<1000 原样。仅用于 KPI 卡。
+function fmtAbbr(n: number | undefined | null): string {
+  if (n === null || n === undefined) return '—'
+  const num = Number(n)
+  if (!Number.isFinite(num)) return '—'
+  const abs = Math.abs(num)
+  if (abs < 1000) return String(num)
+  const units = ['', 'k', 'M', 'B', 'T', 'P']
+  const tier = Math.min(units.length - 1, Math.floor(Math.log10(abs) / 3))
+  const scaled = num / 1000 ** tier
+  const intDigits = Math.floor(Math.log10(Math.abs(scaled))) + 1
+  const decimals = Math.max(0, 4 - intDigits)
+  const s = scaled.toFixed(decimals).replace(/\.?0+$/, '')
+  return `${s}${units[tier]}`
+}
 // 后端已按用户 tz format 成 `YYYY-MM-DD HH:MM`;这里防御性裁切前 16 字符。
 function fmtLastActivity(s?: string): string {
   if (!s) return '—'
@@ -43,10 +58,10 @@ function cacheHitPct(row: UsageRow): number | null {
 const kpis = computed(() => {
   const r = store.report
   return [
-    { label: t('usage.kpi.totalInput'), value: fmtNum(r?.totalInputTokens), icon: IconArrowDown },
-    { label: t('usage.kpi.totalOutput'), value: fmtNum(r?.totalOutputTokens), icon: IconArrowUp },
-    { label: t('usage.kpi.totalTokens'), value: fmtNum(r?.totalTokens), icon: IconLayers },
-    { label: t('usage.kpi.conversations'), value: fmtNum(r?.totalConversations), icon: IconChat },
+    { label: t('usage.kpi.totalInput'), value: fmtAbbr(r?.totalInputTokens), icon: IconArrowDown },
+    { label: t('usage.kpi.totalOutput'), value: fmtAbbr(r?.totalOutputTokens), icon: IconArrowUp },
+    { label: t('usage.kpi.totalTokens'), value: fmtAbbr(r?.totalTokens), icon: IconLayers },
+    { label: t('usage.kpi.conversations'), value: fmtAbbr(r?.totalConversations), icon: IconChat },
   ]
 })
 
@@ -84,7 +99,7 @@ function firstCol(row: UsageRow): { label: string; title: string } {
   if (store.activeView !== 'conversation') return { label: row.group || '—', title: '' }
   const name = (row.displayName || '').trim()
   let label: string
-  if (name) label = name.length > 5 ? `${name.slice(0, 5)}…` : name
+  if (name) label = name // 全名;显示长度由列宽 + CSS 省略号控制(不再 JS 截断 5 字)
   else {
     const m = (row.group || '').match(/^\d{4}\/(\d{2})\/(\d{2})\//)
     label = m ? `${m[1]}/${m[2]}` : '—'
@@ -163,22 +178,7 @@ const cacheBars = computed(() => {
 </script>
 
 <template>
-  <div>
-    <div class="page-head">
-      <div>
-        <h1 class="page-title">{{ t('usage.title') }}</h1>
-        <p class="page-sub">{{ t('usage.subtitle') }}</p>
-      </div>
-      <AppButton
-        variant="ghost"
-        size="sm"
-        :icon="IconRefresh"
-        :label="t('usage.refresh')"
-        :disabled="store.loading"
-        @click="refresh"
-      />
-    </div>
-
+  <div class="usage-page">
     <!-- 错误条:fetch 失败不写空 report 误显 "0 用量",显带 retry 的错误 -->
     <div v-if="store.error" class="usage-error">
       <span>{{ t('usage.loadError') }}: {{ store.error }}</span>
@@ -189,14 +189,20 @@ const cacheBars = computed(() => {
       <div class="kpis">
         <article v-for="(kpi, i) in kpis" :key="i" class="kpi">
           <component :is="kpi.icon" class="kpi__icon" />
-          <div class="kpi__body">
-            <span class="kpi__label">{{ kpi.label }}</span>
-            <strong class="kpi__value">{{ kpi.value }}</strong>
-          </div>
+          <strong class="kpi__value">{{ kpi.value }}</strong>
+          <span class="kpi__label">{{ kpi.label }}</span>
         </article>
       </div>
 
       <div class="usage-toolbar">
+        <AppButton
+          variant="ghost"
+          size="sm"
+          :icon="IconRefresh"
+          :label="t('usage.refresh')"
+          :disabled="store.loading"
+          @click="refresh"
+        />
         <SegmentedControl
           :model-value="store.activeView"
           :options="viewOptions"
@@ -211,7 +217,7 @@ const cacheBars = computed(() => {
           <table class="usage-table">
             <thead>
               <tr>
-                <th>{{ firstColLabel }}</th>
+                <th class="first-col">{{ firstColLabel }}</th>
                 <th v-if="showModelsCol">{{ t('usage.col.model') }}</th>
                 <th class="num">{{ t('usage.col.cacheHit') }}</th>
                 <th class="num">{{ t('usage.col.input') }}</th>
@@ -224,7 +230,7 @@ const cacheBars = computed(() => {
             </thead>
             <tbody>
               <tr v-for="(row, i) in rows" :key="i">
-                <td :title="firstCol(row).title">{{ firstCol(row).label }}</td>
+                <td class="first-col" :title="firstCol(row).title">{{ firstCol(row).label }}</td>
                 <td v-if="showModelsCol" class="model">{{ modelText(row) }}</td>
                 <td class="num">
                   <button
@@ -238,10 +244,10 @@ const cacheBars = computed(() => {
                   </button>
                   <span v-else>{{ cacheHitPct(row) == null ? '—' : `${cacheHitPct(row)}%` }}</span>
                 </td>
-                <td class="num">{{ fmtNum(row.inputTokens) }}</td>
-                <td class="num">{{ fmtNum(row.outputTokens) }}</td>
-                <td class="num">{{ fmtNum(row.reasoningOutputTokens) }}</td>
-                <td class="num"><strong>{{ fmtNum(row.totalTokens) }}</strong></td>
+                <td class="num">{{ fmtAbbr(row.inputTokens) }}</td>
+                <td class="num">{{ fmtAbbr(row.outputTokens) }}</td>
+                <td class="num">{{ fmtAbbr(row.reasoningOutputTokens) }}</td>
+                <td class="num"><strong>{{ fmtAbbr(row.totalTokens) }}</strong></td>
                 <td class="num">{{ fmtNum(row.turnCount) }}</td>
                 <td class="last">{{ fmtLastActivity(row.lastActivity) }}</td>
               </tr>
@@ -279,26 +285,13 @@ const cacheBars = computed(() => {
 </template>
 
 <style scoped>
-.page-head {
+.usage-page {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-4);
-  margin-bottom: var(--space-5);
+  flex-direction: column;
 }
-.page-title {
-  font-size: var(--fs-xl);
-  font-weight: 600;
-  margin: 0 0 4px;
-}
-.page-sub {
-  font-size: var(--fs-sm);
-  color: var(--text-muted);
-  margin: 0;
-  max-width: 520px;
-}
-
-/* KPI 卡片 */
+/* KPI 卡片(单行:图标-数值-文字) */
 .kpis {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -308,7 +301,7 @@ const cacheBars = computed(() => {
 .kpi {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-2);
   padding: var(--space-4);
   background: var(--surface);
   border: 1px solid var(--border);
@@ -316,35 +309,35 @@ const cacheBars = computed(() => {
 }
 .kpi__icon {
   flex-shrink: 0;
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   color: var(--accent);
-}
-.kpi__body {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-.kpi__label {
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-  white-space: nowrap;
 }
 .kpi__value {
   font-size: var(--fs-lg);
-  font-weight: 600;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
+}
+.kpi__label {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .usage-toolbar {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: var(--space-3);
   margin-bottom: var(--space-3);
 }
 
 /* 表格卡片 */
 .usage-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -356,8 +349,11 @@ const cacheBars = computed(() => {
   color: var(--text-muted);
   font-size: var(--fs-sm);
 }
+/* 填满卡片 + 框内滚动(底部间隙恒定 = 内边距);表头吸顶 */
 .usage-table-wrap {
-  overflow-x: auto;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
 }
 .usage-table {
   width: 100%;
@@ -376,6 +372,9 @@ const cacheBars = computed(() => {
   color: var(--text-muted);
   border-bottom: 1px solid var(--border);
   background: var(--surface-2);
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 .usage-table tbody tr + tr td {
   border-top: 1px solid var(--border);
@@ -389,6 +388,13 @@ const cacheBars = computed(() => {
 .usage-table .last {
   color: var(--text-secondary);
   max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 第一列加宽(数值缩写腾出空间), 超长省略号 */
+.usage-table .first-col {
+  min-width: 150px;
+  max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;
 }

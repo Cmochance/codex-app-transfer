@@ -109,11 +109,13 @@ export function providerBody(payload: ProviderPayload, includeModels = true): Re
 
 // ── 端点(路径/请求 shape 保持与后端契约一致) ──
 export async function getProviders(): Promise<Provider[]> {
-  const data = await api<{ providers?: Record<string, any>[]; activeProviderId?: string | null }>(
+  // 后端 list_providers 返回的 key 是 `activeId`(非 activeProviderId);读错即导致
+  // 没有 provider 被标记 default → 「已启用」徽章/置顶不生效。
+  const data = await api<{ providers?: Record<string, any>[]; activeId?: string | null }>(
     'GET',
     '/api/providers',
   )
-  const activeId = data.activeProviderId ?? null
+  const activeId = data.activeId ?? null
   return (data.providers || []).map((p) => mapProvider(p, activeId))
 }
 
