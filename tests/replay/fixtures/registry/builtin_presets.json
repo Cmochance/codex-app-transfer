@@ -214,6 +214,66 @@
     "isBuiltin": true
   },
   {
+    "id": "zai-login",
+    "name": "Z.ai(GLM 账号登录)",
+    "baseUrl": "https://api.z.ai/api/anthropic",
+    "docsUrl": "https://docs.z.ai/",
+    "authScheme": "zai_oauth",
+    "apiFormat": "anthropic_messages",
+    "models": {
+      "gpt_5_5": "glm-4.7",
+      "gpt_5_4": "glm-4.7",
+      "gpt_5_4_mini": "glm-4.6",
+      "gpt_5_3_codex": "glm-4.6",
+      "default": "glm-4.7"
+    },
+    "modelCapabilities": {
+      "glm-4.7": {
+        "context_window": 200000
+      },
+      "glm-4.6": {
+        "context_window": 200000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录(OAuth)免 API key —— 在 provider 配置点登录、用 z.ai 账号授权一次,走你的 GLM Coding Plan 订阅额度。"
+      }
+    ],
+    "isBuiltin": true
+  },
+  {
+    "id": "bigmodel-login",
+    "name": "BigModel(智谱账号登录)",
+    "baseUrl": "https://open.bigmodel.cn/api/anthropic",
+    "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
+    "authScheme": "bigmodel_oauth",
+    "apiFormat": "anthropic_messages",
+    "models": {
+      "gpt_5_5": "glm-4.7",
+      "gpt_5_4": "glm-4.7",
+      "gpt_5_4_mini": "glm-4.6",
+      "gpt_5_3_codex": "glm-4.6",
+      "default": "glm-4.7"
+    },
+    "modelCapabilities": {
+      "glm-4.7": {
+        "context_window": 200000
+      },
+      "glm-4.6": {
+        "context_window": 200000
+      }
+    },
+    "notices": [
+      {
+        "type": "info",
+        "text": "账号登录(OAuth)免 API key —— 在 provider 配置点登录、用智谱 bigmodel 账号授权一次,走你的 GLM Coding Plan 订阅额度。"
+      }
+    ],
+    "isBuiltin": true
+  },
+  {
     "id": "bailian",
     "name": "阿里云百炼",
     "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
