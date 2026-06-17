@@ -49,10 +49,19 @@ mod tests {
     }
 
     #[test]
-    fn zhipu_coding_preset_uses_coding_endpoint_and_claude_code_ua() {
-        // GLM Coding Plan(订阅套餐)走专属 coding 端点,非开放平台按量端点;
-        // 智谱条款禁止「非官方工具」接入,UA 伪装成 Claude Code(官方授权的
-        // 编程工具,对齐 Kimi Code 用 KimiCLI UA 的做法)。
+    fn zhipu_coding_preset_uses_coding_endpoint_with_empty_headers() {
+        // GLM Coding Plan(订阅套餐)走专属 coding 端点,非开放平台按量端点。
+        // ZCode 指纹头(User-Agent/HTTP-Referer/X-Title/X-ZCode-App-Version/
+        // X-Platform)不在 preset extraHeaders 里配置,而是在 forward.rs 代码层
+        // 按 base_url 含 coding/paas/v4 判定后注入完整的 zcode_source_headers()
+        // (含运行时动态 X-Platform),与 OAuth 路径完全对齐。
+        //
+        // **extraHeaders 必须是空对象 `{}` 而不是缺失字段**:旧版 preset 曾带
+        // `User-Agent: claude-cli/...`,存量用户 config.json 里已快照了这条。
+        // healing(ENFORCED_BUILTIN_FIELDS 含 extraHeaders)只在 preset **声明**了
+        // 该字段(preset_specifies==true)时才覆盖用户值;若字段缺失则跳过、残留
+        // 不清。空对象 `{}` 让 healing 把存量残留的 claude-cli UA 覆盖成 `{}`,
+        // 避免它与代码层注入的 ZCode UA 在出站时 append 成双 User-Agent。
         let p = builtin_presets()
             .iter()
             .find(|p| p["id"] == "zhipu-coding")
@@ -63,8 +72,9 @@ mod tests {
         );
         assert_eq!(p["apiFormat"], "openai_chat");
         assert_eq!(
-            p["extraHeaders"]["User-Agent"], "claude-cli/2.1.175 (external, cli)",
-            "UA 伪装成 Claude Code 真实 UA(本机 bundle 实证 getUserAgent 形态)"
+            p["extraHeaders"],
+            serde_json::json!({}),
+            "extraHeaders 必须是空对象(非缺失),否则 healing 清不掉存量用户残留的 claude-cli UA,会与代码层注入的 ZCode UA 重复"
         );
         // default model 必须在 modelCapabilities 配 context_window(issue #356)
         let default_model = p["models"]["default"].as_str().unwrap_or("");

@@ -139,7 +139,7 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Grok Web (SuperGrok / X Premium+) | ✅ | ✅ | ✅ (v2.1.6 adds tool_calls flatten) | Experimental, TOS gray area, personal use only |
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | Backend ready, UI pending; gemini family context 1M (suffixed ids previously fell back to 258k, MOC-221); **native image_gen support** (MOC-210; gemini-3.1-flash-image by default, overridable via the `gpt-image-1` model slot) |
 | Zhipu GLM (5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
-| Zhipu GLM Coding (4.7 / 4.6) | ✅ | ✅ | ✅ | GLM Coding Plan subscription endpoint (`/api/coding/paas/v4`); User-Agent spoofed as Claude Code to match the Coding Plan tool-recognition policy (mirrors Kimi Code's approach) |
+| Zhipu GLM Coding (4.7 / 4.6) | ✅ | ✅ | ✅ | GLM Coding Plan subscription endpoint (`/api/coding/paas/v4`); full ZCode fingerprint headers (incl. runtime `X-Platform`) injected at the proxy code layer, fully aligned with the OAuth login path for the Coding Plan 150% quota bonus |
 | GLM (Z.ai) (`zai-login`) | ✅ | ✅ | ✅ | **OAuth — no API key required**; uses your GLM Coding Plan subscription quota; `api.z.ai/api/anthropic` Anthropic Messages wire + ZCode fingerprint headers; in-app OAuth login (no key) + GLM Coding Plan quota display |
 | GLM (BigModel) (`bigmodel-login`) | ✅ | ✅ | ✅ | **OAuth — no API key required**; uses your GLM Coding Plan subscription quota; `open.bigmodel.cn/api/anthropic` Anthropic Messages wire + ZCode fingerprint headers; in-app OAuth login (no key) + GLM Coding Plan quota display |
 | Alibaba Cloud Bailian (Qwen 3.6 Plus / Flash) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
