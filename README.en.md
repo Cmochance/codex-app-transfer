@@ -221,7 +221,7 @@ The viewer now has six tabs (switch via the "Kind" dropdown): **forward** (proto
 
 ### Tweaking the UI
 
-The frontend is **Vue 3 + Vite + TypeScript** (`frontend/`, mid-migration from the old vanilla-JS stack). Source lives in `frontend/src/` (SFC single-file components + Pinia + vue-router).
+The frontend is **Vue 3 + Vite + TypeScript** (`frontend/`, fully refactored from the old vanilla-JS + Bootstrap stack). Source lives in `frontend/src/` (SFC single-file components + Pinia + vue-router).
 
 Dev (hot reload):
 
@@ -324,7 +324,7 @@ Design intent: the client trusts only the build-time embedded public key and nev
 
 - **Backend / forwarding**: Rust 1.85+ · axum 0.8 · reqwest 0.12 (rustls-tls) · tokio · `wreq` 6.0-rc (browser TLS fingerprint impersonation, Chrome 120 fingerprint; curl / wreq / headless all claim the same version to avoid cross-layer identity drift; for Cloudflare-strict `openai.com` / `chatgpt.com`; see `crates/http/`) · `sys-locale` (reads system locale to emit a locale-aware `Accept-Language`, reducing UA-blocklist false positives) · `base64` (Bing `ck/a` redirect decoding) · `chromiumoxide` 0.9 (headless Chromium to fetch JS-rendered SPAs that ①reqwest / ②wreq can't reach — detects system Chrome, else downloads chrome-headless-shell on demand to app data, not bundled; PoC for now, router integration in a later PR; see `crates/http/src/headless/`) · `crates/http::web_fetch` (unified fetch layer routing curl/wreq/headless by the settings tier; paired with `GET /api/chrome/detect` + `POST /api/chrome/ensure`; when `webFetchBackend != off`, automatically registers `[mcp_servers.cat-webfetch]` in `~/.codex/config.toml` — a stdio MCP server (transfer binary + `--mcp-serve-webfetch`) — exposing the `web_fetch` and `web_search` tools to the Codex model)
 - **Protocol adapters**: `crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web (request body + streaming response state machine + reasoning_content + tool_calls)
-- **Frontend**: HTML + CSS + vanilla JavaScript + Bootstrap 5.3.3 (localized, no CDN dependency)
+- **Frontend**: Vue 3 + Vite + TypeScript (SFC + Pinia + vue-router; source `frontend/src/`, `frontend/dist` embedded into the binary via `include_dir!`, prod served over `cas://localhost/` under strict CSP `script-src 'self'`; MacBook-style design + three themes: light / dark / inkwash)
 - **Desktop shell**: Tauri 2 + tray-icon 0.23; the `cas://` URI scheme glues frontend/ and axum in-process, no TCP loopback
 - **Storage**: `~/.codex-app-transfer/config.json` (config, compatible with v1.x), `~/.codex-app-transfer/sessions.db` (L2 sqlite session persistence), `~/.codex-app-transfer/blobs/` (large in-conversation images, sha256-deduplicated out of the db; not auto-removed when you delete the db — delete it too or use `POST /api/sessions/clear`), `~/.codex/{config.toml,auth.json,.credentials.json}` (Codex App integration), `~/.codex-app-transfer/mcp-credentials.json` (MCP credential mirror, outside `~/.codex`)
 - **Packaging**: `cargo tauri build` single command produces dmg/AppImage/deb/exe/msi; `xtask release-bundle` finalizes sha256 + RSA-3072 sig + latest.json + draft GitHub release
