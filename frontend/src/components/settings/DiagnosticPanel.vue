@@ -38,8 +38,8 @@ onMounted(async () => {
 })
 
 // 纯运行时起/停查看器服务(不持久化)。快速 on→off 竞争:await 后若 enabledModel 已被
-// 后续操作改写则放弃本次 toast(stale handler);被放弃的 start 可能留 viewer 仍运行,
-// 由后续 toggle / 退出 transfer 自愈。启动失败回滚开关。
+// 后续操作改写则放弃本次 toast(stale handler);被放弃的 start 若已成功则补发 stop,
+// 确保 viewer 不在用户关闭后残留捕获。启动失败回滚开关。
 watch(enabledModel, async (on) => {
   if (internalSet) {
     internalSet = false
@@ -50,7 +50,17 @@ watch(enabledModel, async (on) => {
   try {
     if (on) {
       const r = await traceViewerStart()
-      if (enabledModel.value !== requested) return
+      if (enabledModel.value !== requested) {
+        // on→off 竞态:start 在途时用户已切回 off。若后端这次 start 成功了, 必须补发
+        // stop —— 否则(尤其 stop 先于 start 完成的排序)viewer 残留运行, 诊断会在用户
+        // 关闭后继续捕获敏感流量。best-effort 补停, 确保运行态收敛到「关」。
+        try {
+          await traceViewerStop()
+        } catch {
+          /* 已停 / 未真正起来: 忽略 */
+        }
+        return
+      }
       toast(r?.url ? tFmt('settings.traceViewerStartedAt', { url: r.url }) : t('settings.traceViewerStarted'))
     } else {
       await traceViewerStop()
