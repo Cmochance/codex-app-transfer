@@ -144,6 +144,35 @@ pub(super) fn provider_test_headers(provider: &Value, include_content_type: bool
         );
     }
 
+    // GLM Coding Plan 路径的「测试 provider」探测也要带完整 ZCode 指纹头,与
+    // forward.rs 的 `injects_zcode_source_headers` 注入路径对齐:`zhipu-coding`
+    // (Bearer + coding/paas/v4 端点)走 API key,`zai-login`/`bigmodel-login`
+    // (zai/bigmodel OAuth)走组织 key。否则测试请求是普通 API-key 调用、无 ZCode
+    // 指纹,BigModel 可能误报 key/端点无效或划错配额桶,与正常 chat 行为不一致。
+    // `insert` 覆盖语义保证不与上方 extraHeaders 复制出的同名头重复。
+    let zcode_auth_scheme = provider
+        .get("authScheme")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let injects_zcode = matches!(
+        zcode_auth_scheme.as_str(),
+        "zai_oauth" | "zai" | "bigmodel_oauth" | "bigmodel"
+    ) || base_url.contains("coding/paas/v4");
+    if injects_zcode {
+        for (name, value) in codex_app_transfer_gemini_oauth::zai::constants::zcode_source_headers()
+        {
+            if let (Ok(n), Ok(v)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(&value),
+            ) {
+                headers.insert(n, v);
+            }
+        }
+    }
+
     headers
 }
 
@@ -576,6 +605,60 @@ mod tests {
         assert!(
             headers.get(reqwest::header::AUTHORIZATION).is_none(),
             "Gemini 不能用 Authorization: Bearer(那是 OpenAI 兼容路径,native 走 x-goog-api-key)"
+        );
+    }
+
+    #[test]
+    fn provider_test_headers_glm_coding_injects_zcode_fingerprint() {
+        // zhipu-coding(Bearer + coding/paas/v4):测试探测必须带 ZCode 指纹头,
+        // 与 forward.rs chat 路径一致(否则 Test provider 看到普通 API-key 调用)。
+        let provider = json!({
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "apiKey": "glm-test-key",
+            "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+            "extraHeaders": {},
+        });
+        let headers = provider_test_headers(&provider, true);
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("ZCode/3.1.0"),
+            "GLM Coding 测试探测 UA 必须是 ZCode,不是 reqwest 默认 UA"
+        );
+        assert!(
+            headers.get("x-platform").is_some(),
+            "ZCode 指纹必含运行时 X-Platform"
+        );
+        assert_eq!(
+            headers.get("http-referer").and_then(|v| v.to_str().ok()),
+            Some("https://zcode.z.ai")
+        );
+        assert!(headers.get("x-zcode-app-version").is_some());
+        assert_eq!(
+            headers.get("x-title").and_then(|v| v.to_str().ok()),
+            Some("Z Code@electron")
+        );
+    }
+
+    #[test]
+    fn provider_test_headers_plain_bearer_no_zcode_fingerprint() {
+        // 普通 Bearer provider(非 coding 端点,如开放平台 zhipu /api/paas/v4)
+        // 不应注入 ZCode 指纹头 —— 避免误命中。
+        let provider = json!({
+            "apiFormat": "openai_chat",
+            "authScheme": "bearer",
+            "apiKey": "plain-key",
+            "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+            "extraHeaders": {},
+        });
+        let headers = provider_test_headers(&provider, true);
+        assert!(
+            headers.get("x-platform").is_none(),
+            "非 GLM Coding 路径不该带 ZCode X-Platform"
+        );
+        assert!(
+            headers.get("http-referer").is_none(),
+            "非 GLM Coding 路径不该带 ZCode HTTP-Referer"
         );
     }
 
