@@ -41,19 +41,26 @@ import ToastHost from '@/components/ui/ToastHost.vue'
   letter-spacing: -0.01em;
   pointer-events: none;
 }
+/* content 不滚、固定高(flex:1 of 100vh shell)+ flex 列,把固定高传给 inner */
 .app-shell__content {
   flex: 1;
-  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
-/* 内容填满窗口宽度, 卡片左右仅留 20px 边(窗口宽度由 tauri.conf 控成较窄)。
-   min-height:100% + flex 列:让「单主框」页面(用量表/会话列表/文档预览)能 flex:1
-   撑满到底部内边距,底部间隙恒定 = padding-bottom,不再靠估算 calc。 */
+/* inner 拿到固定高(flex:1 of content)→「单主框」页面(用量表/会话列表/文档预览)
+   能 flex:1 框内滚、底部间隙恒定 = padding-bottom;长页(设置/提供商)则由 inner 自身
+   overflow-y:auto 整页滚。关键:必须是 flex:1 固定高,不能用 min-height:100%(那只是下限,
+   内容一多就跟着长高、约束失效 → 表格/列表撑出窗口)。 */
 .app-shell__inner {
   max-width: 1400px;
   margin: 0 auto;
-  min-height: 100%;
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow-y: auto;
   padding: var(--space-5) 20px var(--space-8);
 }
 </style>
