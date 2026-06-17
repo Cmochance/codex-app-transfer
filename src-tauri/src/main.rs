@@ -548,6 +548,31 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building Codex App Transfer");
 
+    // [dev] vite dev server 在 http://localhost:1420 提供前端(HMR),其 /api 请求经
+    // vite proxy(vite.config.ts server.proxy)转发到这里的 TCP 监听 —— 因为 dev 下
+    // webview 在 devUrl 而非 cas://,相对路径 /api 打不到同进程 cas scheme 派发。
+    // prod 走 cas:// 同进程 axum,不绑任何 TCP 端口;故此监听仅 debug 编译。
+    #[cfg(debug_assertions)]
+    {
+        let dev_router = app_router.clone();
+        tauri::async_runtime::spawn(async move {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 18900));
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tracing::info!(
+                        "[dev] admin API listening on http://{addr} (vite proxy /api → here)"
+                    );
+                    if let Err(e) =
+                        axum::serve(listener, (*dev_router).clone().into_make_service()).await
+                    {
+                        tracing::warn!("[dev] admin API listener exited: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("[dev] failed to bind {addr} for admin API: {e}"),
+            }
+        });
+    }
+
     app.run(|app_handle, event| {
         // [MOC-196] 窗口创建成功(Ready)→ 单实例握手开始回 OK(此前回 STARTING)。
         // 僵尸(setup hang)到不了这里,第二实例据此识别并接管。

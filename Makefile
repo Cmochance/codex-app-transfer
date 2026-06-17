@@ -17,6 +17,8 @@ help:
 	@echo "         tag 触发: git tag v<x.y.z> && git push --tags"
 
 mac-app:
+	npm --prefix frontend ci
+	npm --prefix frontend run build
 	CARGO_TARGET_DIR=target cargo tauri build --bundles app
 	mkdir -p dist/mac
 	rm -rf "dist/mac/Codex App Transfer.app"
