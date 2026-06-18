@@ -177,6 +177,7 @@ const webFetchOptions: { value: string; label: string }[] = [
 // 存档某档:乐观更新 wfbDisplay + store.save。webFetchSyncWarning(注册到 Codex 失败)
 // 不回退、仅警告并返 false 跳成功 toast;真保存失败回退到上次值 + 报「设置保存失败」(区分「下载失败」)。
 async function commitWebFetch(v: string): Promise<boolean> {
+  const prev = store.str('webFetchBackend', 'auto') // 失败回退目标,不依赖 store.save 内部回滚时序
   wfbDisplay.value = v
   try {
     const warn = await store.save({ webFetchBackend: v })
@@ -186,7 +187,7 @@ async function commitWebFetch(v: string): Promise<boolean> {
     }
     return true
   } catch (e) {
-    wfbDisplay.value = store.str('webFetchBackend', 'auto')
+    wfbDisplay.value = prev
     const msg = (e as Error).message
     toast(t('settings.webFetchSaveFailed') + (msg ? `: ${msg}` : ''), 'error')
     return false
@@ -208,7 +209,9 @@ async function onWebFetchChange(v: string | undefined) {
     let sp: SystemProxyStatus | null = null
     try {
       sp = (await getSystemProxyStatus()).systemProxy ?? null
-    } catch {
+    } catch (e) {
+      // fail-open(查询失败放行),但留痕便于真机 DevTools 定位后端回归
+      console.warn('[webFetch gate] system-proxy status probe failed, fail-open:', e)
       sp = null
     }
     const gateOk = !sp || sp.kind === 'pac' || !sp.configured || sp.connected === true
