@@ -308,18 +308,46 @@ fn main() {
                 // (config 已是某后端但还没注册过 → 补注册;off → 移除)。幂等:已一致则
                 // 不写 config.toml。Codex 需重启才会加载/卸载该 server。
                 {
-                    let backend = codex_app_transfer_registry::config_file()
+                    let raw_backend = codex_app_transfer_registry::config_file()
                         .and_then(|p| codex_app_transfer_registry::load_raw_config(&p).ok())
                         .and_then(|c| {
                             c.get("settings")
                                 .and_then(|s| s.get("webFetchBackend"))
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string())
-                        })
-                        // MOC-215: raw fallback 对齐 schema 默认(off→auto),否则老用户启动 sync 不注册 MCP
-                        .unwrap_or_else(|| {
-                            codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND.to_string()
                         });
+                    let backend = match raw_backend {
+                        Some(b) => b,
+                        // MOC-256:webFetchBackend 从未设置过。无 Chrome 就绪时默认 `off` ——
+                        // 否则 MOC-215 的开箱即用 `auto` 会在运行时 web_fetch 升 headless 时
+                        // 静默下载 ~86MB chrome-headless-shell(用户没机会同意)。持久化 `off`
+                        // 让前端 + 后续读取一致;用户之后手动选 auto/headless 会经设置门控确认
+                        // 下载。已有系统 Chrome / 已下载内置 shell 才沿用开箱即用 `auto`。
+                        None => {
+                            if codex_app_transfer_http::headless::chrome_ready_without_download()
+                                .await
+                            {
+                                codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND
+                                    .to_string()
+                            } else {
+                                let _ = crate::admin::registry_io::with_config_write(|cfg| {
+                                    if let Some(obj) = cfg.as_object_mut() {
+                                        let settings = obj
+                                            .entry("settings")
+                                            .or_insert_with(|| serde_json::json!({}));
+                                        if let Some(so) = settings.as_object_mut() {
+                                            so.insert(
+                                                "webFetchBackend".to_string(),
+                                                serde_json::Value::String("off".to_string()),
+                                            );
+                                        }
+                                    }
+                                    Ok(crate::admin::registry_io::ConfigMutation::Modified(()))
+                                });
+                                "off".to_string()
+                            }
+                        }
+                    };
                     if let Err(e) =
                         crate::admin::services::mcp_servers::sync_web_fetch_server(&backend)
                     {
