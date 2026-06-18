@@ -5,22 +5,28 @@ export default {
   "pluginUnlock.connected": "已连接,等待注入",
   "pluginUnlock.injected": "已解锁",
   "pluginUnlock.nativeRelay": "已解锁(真实账号)",
-  "realAccount.sectionHint": "真实账号模式:用真实 ChatGPT 账号取代 CDP 伪造登录,避开 Codex 启动的额外延迟。登录或导入后会长期保留,活动 auth.json 被改也会在启动时自动恢复。",
+  "realAccount.sectionHint":
+    "真实账号模式:用真实 ChatGPT 账号取代 CDP 伪造登录,避开 Codex 启动的额外延迟。登录或导入后会长期保留,活动 auth.json 被改也会在启动时自动恢复。",
   "realAccount.login": "登录真实账号",
   "realAccount.forceEnable": "强制开启(高延迟)",
   "realAccount.loginStarted": "已启动登录,请在浏览器完成授权",
   "realAccount.forceEnabled": "已强制开启(高延迟)",
   "realAccount.forceEnableTitle": "强制开启(高延迟)",
   "realAccount.forceEnableConfirm": "确定强制开启",
-  "realAccount.forceEnableWarn": "强制开启会用 CDP 注入伪造登录态,Codex 每次启动会多一段明显的加载延迟(Windows 上可能长达数十秒)。建议改用「登录真实账号」避免该延迟。确定要强制开启吗?",
-  "realAccount.reloginRequired": "真实 ChatGPT 账号已失效,已自动关闭自动解锁,请重新登录",
+  "realAccount.forceEnableWarn":
+    "强制开启会用 CDP 注入伪造登录态,Codex 每次启动会多一段明显的加载延迟(Windows 上可能长达数十秒)。建议改用「登录真实账号」避免该延迟。确定要强制开启吗?",
+  "realAccount.reloginRequired":
+    "真实 ChatGPT 账号已失效,已自动关闭自动解锁,请重新登录",
   "realAccount.statusUnavailable": "暂时无法获取账号状态,请稍后重试",
   "realAccount.noAccountTitle": "未检测到有效账号",
-  "realAccount.noAccountDesc": "未检测到有效的真实 ChatGPT 账号。请登录一个有效账号(推荐:Codex 原生显示 Plugins、无额外启动延迟),或强制开启(CDP 注入伪造登录,每次启动有明显延迟)。",
+  "realAccount.noAccountDesc":
+    "未检测到有效的真实 ChatGPT 账号。请登录一个有效账号(推荐:Codex 原生显示 Plugins、无额外启动延迟),或强制开启(CDP 注入伪造登录,每次启动有明显延迟)。",
   "realAccount.gateProxyTitle": "网络代理未连接",
-  "realAccount.gateProxyDesc": "检测到账号可用,但系统代理(梯子)未连接。Plugins 与第三方模型都需经代理访问,请先开启代理服务后重试;或强制开启(CDP 注入伪造登录,每次启动有明显延迟,且代理不通时插件仍可能无法加载)。",
+  "realAccount.gateProxyDesc":
+    "检测到账号可用,但系统代理(梯子)未连接。Plugins 与第三方模型都需经代理访问,请先开启代理服务后重试;或强制开启(CDP 注入伪造登录,每次启动有明显延迟,且代理不通时插件仍可能无法加载)。",
   "realAccount.gateBothTitle": "未连接代理且未登录账号",
-  "realAccount.gateBothDesc": "请开启代理服务(梯子)并登录 GPT 账号后重试;或强制开启(CDP 注入伪造登录,每次启动有明显延迟)。",
+  "realAccount.gateBothDesc":
+    "请开启代理服务(梯子)并登录 GPT 账号后重试;或强制开启(CDP 注入伪造登录,每次启动有明显延迟)。",
   "dashboard.systemProxyStatus": "网络代理",
   "systemProxy.connected": "已连接",
   "systemProxy.disconnected": "未连接",
@@ -39,14 +45,17 @@ export default {
   "realAccount.acctFetching": "获取中…",
   "realAccount.import": "导入文件",
   "realAccount.imported": "已导入并持久保留真实账号",
-  "realAccount.importExpired": "已导入,但该账号登录态已失效,请重新导出最新文件或改用「登录真实账号」",
+  "realAccount.importExpired":
+    "已导入,但该账号登录态已失效,请重新导出最新文件或改用「登录真实账号」",
   "realAccount.importBadJson": "文件不是合法 JSON",
   "realAccount.importPickTitle": "选择 chatgpt 模式 auth.json(导入真实账号)",
   "realAccount.forget": "清除真实账号",
-  "realAccount.forgetConfirm": "清除真实账号?将切回 apikey 模式(Codex 不再显示 Plugins);你的登录态会保留,退出 transfer 时自动恢复。",
+  "realAccount.forgetConfirm":
+    "清除真实账号?将切回 apikey 模式(Codex 不再显示 Plugins);你的登录态会保留,退出 transfer 时自动恢复。",
   "realAccount.modeEnabled": "已开启真实账号模式",
   "realAccount.modeDisabled": "已关闭真实账号模式(切 apikey,登录态保留)",
-  "realAccount.forgetApplyFailed": "已清除镜像,但切 apikey 失败 —— Plugins 可能未关,请重试或重启 Codex",
+  "realAccount.forgetApplyFailed":
+    "已清除镜像,但切 apikey 失败 —— Plugins 可能未关,请重试或重启 Codex",
   "realAccount.forgotten": "已清除真实账号",
   "realAccount.kept": "已长期保留",
   "nav.dashboard": "仪表盘",
@@ -57,7 +66,8 @@ export default {
   "nav.usage": "用量",
   "nav.settings": "设置",
   "usage.title": "Token 用量统计",
-  "usage.subtitle": "基于 ~/.codex/sessions/ 的 rollout JSONL,解析层 vendor 自 ryoppippi/ccusage",
+  "usage.subtitle":
+    "基于 ~/.codex/sessions/ 的 rollout JSONL,解析层 vendor 自 ryoppippi/ccusage",
   "usage.refresh": "刷新",
   "usage.viewDaily": "按日",
   "usage.viewModel": "按模型",
@@ -93,9 +103,11 @@ export default {
   "nav.theme": "主题",
   "nav.guide": "引导",
   "theme.title": "Codex Desktop 主题",
-  "theme.subtitle": "向运行中的 Codex Desktop 通过 CDP 注入 CSS / DOM,覆盖原生外观。默认关闭;启用后选一个内置主题。改动后 Codex Desktop 整页 reload 会自动重应用;从本工具重启 Codex.app 也会自动应用已选主题。",
+  "theme.subtitle":
+    "向运行中的 Codex Desktop 通过 CDP 注入 CSS / DOM,覆盖原生外观。默认关闭;启用后选一个内置主题。改动后 Codex Desktop 整页 reload 会自动重应用;从本工具重启 Codex.app 也会自动应用已选主题。",
   "theme.toggleLabel": "启用 Codex Desktop 主题",
-  "theme.toggleHint": "开关为持久化偏好:开启后保存并即时应用(若 Codex 未经本工具启动则提示重启生效);关闭只清除偏好,已注入主题保留至 Codex 下次重启。状态独立于 Plugin Unlock,互不影响。",
+  "theme.toggleHint":
+    "开关为持久化偏好:开启后保存并即时应用(若 Codex 未经本工具启动则提示重启生效);关闭只清除偏好,已注入主题保留至 Codex 下次重启。状态独立于 Plugin Unlock,互不影响。",
   "theme.applyBtn": "应用",
   "theme.clearBtn": "清除",
   "theme.restartCodexBtn": "重启 Codex",
@@ -112,7 +124,8 @@ export default {
   "theme.loadFailed": "主题列表加载失败",
   "theme.disabledPendingRestart": "已关闭,主题将在 Codex 重启后移除",
   "theme.savedTitle": "主题偏好已保存",
-  "theme.savedPendingRestart": "当前 Codex 未通过本工具启动或调试端口不可用,主题将在 Codex 重启后生效。",
+  "theme.savedPendingRestart":
+    "当前 Codex 未通过本工具启动或调试端口不可用,主题将在 Codex 重启后生效。",
   "theme.savedPendingRestartToast": "主题已保存,Codex 重启后生效",
   "theme.restartNow": "立即重启",
   "theme.restartLater": "稍后重启",
@@ -141,7 +154,8 @@ export default {
   "codex.conv.options": "选项",
   "codex.conv.exportSelected": "导出选中",
   "codex.conv.exportSelectedN": "导出选中 ({count})",
-  "codex.conv.warnRedact": "默认已 redact 密钥(sk- / cas_ / JWT / Bearer)。Reasoning 默认隐藏,Tool calls 默认含,output > 2KB 截断。点「选项」调整。",
+  "codex.conv.warnRedact":
+    "默认已 redact 密钥(sk- / cas_ / JWT / Bearer)。Reasoning 默认隐藏,Tool calls 默认含,output > 2KB 截断。点「选项」调整。",
   "codex.conv.summary": "共 {count} 个 session",
   "codex.conv.loading": "加载中…",
   "codex.conv.noResults": "无匹配 session",
@@ -158,7 +172,8 @@ export default {
   "codex.conv.saveDialogMulti": "保存对话 zip",
   "codex.conv.deleteSelected": "删除选中",
   "codex.conv.deleteSelectedN": "删除选中 ({count})",
-  "codex.conv.confirmDelete": "确认把 {count} 个 session 移到系统回收站?此操作可在 Finder Trash 中恢复。",
+  "codex.conv.confirmDelete":
+    "确认把 {count} 个 session 移到系统回收站?此操作可在 Finder Trash 中恢复。",
   "codex.conv.toastDeleted": "已移到回收站 {count} 个 session",
   "codex.conv.toastDeletedPartial": "移到回收站 {moved} 个,失败 {failed} 个",
   "codex.conv.deleteFailed": "删除失败",
@@ -178,29 +193,35 @@ export default {
   "codex.agentsPath.global": "全局",
   "codex.agentsPath.projectRoot": "项目根目录",
   "codex.agentsPath.subdir": "子目录",
-  "codex.agentsPathEmpty": "未检测到 AGENTS.md,请通过右侧\"添加\"按钮指定",
+  "codex.agentsPathEmpty": '未检测到 AGENTS.md,请通过右侧"添加"按钮指定',
   "codex.agentsPathAdd": "添加",
   "codex.agentsPathAddTitle": "添加自定义 AGENTS.md 路径",
-  "codex.agentsPathAddPrompt": "点击\"浏览\"打开系统文件选择,或直接粘贴 HOME 下非敏感 AGENTS.md 的绝对路径;系统目录和凭据目录会被拒绝",
+  "codex.agentsPathAddPrompt":
+    '点击"浏览"打开系统文件选择,或直接粘贴 HOME 下非敏感 AGENTS.md 的绝对路径;系统目录和凭据目录会被拒绝',
   "codex.agentsPathBrowse": "浏览",
   "codex.agentsPathAddOk": "已添加自定义 AGENTS.md 路径",
   "codex.agentsPathAddOkBtn": "添加",
   "codex.agentsPathAddEmpty": "请粘贴路径",
-  "codex.agentsPathRemoveConfirm": "确认从下拉列表删除当前路径?(只移除引用,不删文件)",
+  "codex.agentsPathRemoveConfirm":
+    "确认从下拉列表删除当前路径?(只移除引用,不删文件)",
   "codex.agentsPathRemoveOk": "已删除路径引用",
   "codex.agentsWarn": "AGENTS.md 会严重影响 AI 的行为,请谨慎修改",
-  "codex.memoriesPathEmpty": "未添加项目 MEMORY.md,请通过右侧\"添加\"按钮指定",
+  "codex.memoriesPathEmpty": '未添加项目 MEMORY.md,请通过右侧"添加"按钮指定',
   "codex.memoriesPathAddTitle": "添加 MEMORY.md 路径",
-  "codex.memoriesPathAddPrompt": "选择 HOME 下非敏感项目目录或 MEMORY.md;系统目录和凭据目录会被拒绝",
-  "codex.memoriesWarn": "MEMORY.md 跟 memory_summary.md 是 AI 长期记忆 user-editable 索引,请谨慎修改",
+  "codex.memoriesPathAddPrompt":
+    "选择 HOME 下非敏感项目目录或 MEMORY.md;系统目录和凭据目录会被拒绝",
+  "codex.memoriesWarn":
+    "MEMORY.md 跟 memory_summary.md 是 AI 长期记忆 user-editable 索引,请谨慎修改",
   "codex.memoriesLoading": "加载 codex 全局 memories…",
   "codex.memoriesPath.index": "主索引",
   "codex.memoriesPath.summary": "摘要",
   "codex.mcp.servers": "Servers",
   "codex.mcp.plugins": "Plugins",
   "codex.mcp.marketplace": "Marketplace",
-  "codex.mcp.serversWarn": "修改 MCP servers 会改 ~/.codex/config.toml 全局生效",
-  "codex.mcp.pluginsWarn": "Plugin 来自 marketplace 安装到 ~/.codex/plugins/cache/,卸载将删除整个 cache 目录",
+  "codex.mcp.serversWarn":
+    "修改 MCP servers 会改 ~/.codex/config.toml 全局生效",
+  "codex.mcp.pluginsWarn":
+    "Plugin 来自 marketplace 安装到 ~/.codex/plugins/cache/,卸载将删除整个 cache 目录",
   "codex.mcp.serversEmpty": "尚未配置 MCP server,点底部新增",
   "codex.mcp.pluginsEmpty": "尚未安装 plugin,去 Marketplace 安装",
   "codex.mcp.marketEmpty": "无匹配条目,试着切源 / 搜索 / 刷新",
@@ -208,11 +229,15 @@ export default {
   "codex.mcp.formName": "Server ID(TOML key,如 vercel)",
   "codex.mcp.serverNew": "新增 server",
   "codex.mcp.rawToml": "Edit raw TOML",
-  "codex.mcp.rawWarn": "Raw 模式直改 ~/.codex/config.toml,parse 失败拒绝;通过校验后 atomic 写盘,pre-backup",
+  "codex.mcp.rawWarn":
+    "Raw 模式直改 ~/.codex/config.toml,parse 失败拒绝;通过校验后 atomic 写盘,pre-backup",
   "codex.mcp.saveOk": "已保存",
-  "codex.mcp.saveConfirmStdio": "确认保存 MCP server \"{name}\"?\n\n保存后会写入 ~/.codex/config.toml,对所有 Codex 会话全局生效。\n\n⚠️ 该 server 会以你的账户权限在本机执行下面的命令:\n\n  {cmdline}{extra}\n\n请确认命令、工作目录与环境变量无误再继续。",
-  "codex.mcp.saveConfirmHttp": "确认保存 MCP server \"{name}\"?\n\n保存后会写入 ~/.codex/config.toml,对所有 Codex 会话全局生效。\n\n传输:streamable_http\n连接到:{url}{extra}\n\n请确认地址与发往远端的凭据 / header 无误再继续。",
-  "codex.mcp.rawApplyConfirm": "确认用编辑后的原始 TOML 覆盖 ~/.codex/config.toml?\n\n这会整体覆盖该文件并对所有 Codex 会话全局生效;其中 [mcp_servers.*] 的 command 会以你账户权限在本机执行。\n\n请确认内容无误再继续。",
+  "codex.mcp.saveConfirmStdio":
+    '确认保存 MCP server "{name}"?\n\n保存后会写入 ~/.codex/config.toml,对所有 Codex 会话全局生效。\n\n⚠️ 该 server 会以你的账户权限在本机执行下面的命令:\n\n  {cmdline}{extra}\n\n请确认命令、工作目录与环境变量无误再继续。',
+  "codex.mcp.saveConfirmHttp":
+    '确认保存 MCP server "{name}"?\n\n保存后会写入 ~/.codex/config.toml,对所有 Codex 会话全局生效。\n\n传输:streamable_http\n连接到:{url}{extra}\n\n请确认地址与发往远端的凭据 / header 无误再继续。',
+  "codex.mcp.rawApplyConfirm":
+    "确认用编辑后的原始 TOML 覆盖 ~/.codex/config.toml?\n\n这会整体覆盖该文件并对所有 Codex 会话全局生效;其中 [mcp_servers.*] 的 command 会以你账户权限在本机执行。\n\n请确认内容无误再继续。",
   "codex.mcp.installServerOk": "已添加到 Servers",
   "codex.mcp.installPluginOk": "Plugin 安装成功",
   "codex.mcp.uninstallOk": "Plugin 已卸载",
@@ -225,7 +250,8 @@ export default {
   "codex.mcp.refresh": "刷新",
   "codex.mcp.sourceAdd": "添加源",
   "codex.mcp.sourceAddTitle": "添加 marketplace 源",
-  "codex.mcp.sourceAddPrompt": "输入 https registry.json 的完整 URL,跟一个友好名字",
+  "codex.mcp.sourceAddPrompt":
+    "输入 https registry.json 的完整 URL,跟一个友好名字",
   "codex.mcp.sourceAddConfirm": "添加",
   "codex.mcp.serverPresets": "Server 预设(一键加进 Servers tab)",
   "codex.mcp.pluginBundles": "Plugin 安装包(一键安装)",
@@ -241,10 +267,12 @@ export default {
   "codex.agentsEdit": "Edit",
   "codex.agentsBackup": "Backup",
   "codex.agentsCancel": "Cancel",
-  "codex.docApplyConfirm": "确认应用对 {doc} 的修改?\n\n保存后会覆盖磁盘上的 {doc}(旧版本自动进 History),并会影响 AI 的后续行为。\n\n请确认内容无误再继续。",
+  "codex.docApplyConfirm":
+    "确认应用对 {doc} 的修改?\n\n保存后会覆盖磁盘上的 {doc}(旧版本自动进 History),并会影响 AI 的后续行为。\n\n请确认内容无误再继续。",
   "codex.agentsApplyOk": "已保存 AGENTS.md(旧版本已备份到 History)",
   "codex.agentsBackupOk": "已备份当前 AGENTS.md 到 History",
-  "codex.agentsRestoreConfirm": "确认还原此版本?当前 AGENTS.md 会先备份到 History",
+  "codex.agentsRestoreConfirm":
+    "确认还原此版本?当前 AGENTS.md 会先备份到 History",
   "codex.agentsRestoreOk": "已还原 AGENTS.md",
   "codex.historyEmpty": "暂无 history snapshot",
   "codex.historyApply": "应用",
@@ -264,9 +292,11 @@ export default {
   "codex.statusTargetFile": "目标文件",
   "codex.statusNone": "无",
   "codex.statusBytesSuffix": "bytes",
-  "codex.confirmClear": "确认 Clear 受管块?会删除 marker + 内容(进 history 可 rollback)",
+  "codex.confirmClear":
+    "确认 Clear 受管块?会删除 marker + 内容(进 history 可 rollback)",
   "codex.confirmRollback": "确认 Rollback {type} 到 history[{idx}]?",
-  "codex.confirmSkillsRestore": "确认从 {filename} 还原 skills/?会覆盖当前 ~/.codex/skills 内容!",
+  "codex.confirmSkillsRestore":
+    "确认从 {filename} 还原 skills/?会覆盖当前 ~/.codex/skills 内容!",
   "codex.toastApplied": "{type} 受管块已 apply",
   "codex.toastCleared": "{type} 受管块已 clear(进 history)",
   "codex.toastRollbacked": "已 rollback {type} 到 history[{idx}]",
@@ -286,7 +316,8 @@ export default {
   "codex.skillsBackupsCountSuffix": "份",
   "codex.statusLoading": "状态加载中…",
   "codex.managedContent": "受管块内容(start/end marker 之间的内容)",
-  "codex.placeholder": "贴入 app 受管 AGENTS.md 段(留空 = Apply 创建空块或 Preview 看 marker 注入位置)",
+  "codex.placeholder":
+    "贴入 app 受管 AGENTS.md 段(留空 = Apply 创建空块或 Preview 看 marker 注入位置)",
   "codex.preview": "Preview",
   "codex.apply": "Apply",
   "codex.history": "History",
@@ -301,7 +332,8 @@ export default {
   "dashboard.switchProvider": "切换提供商",
   "dashboard.droppedToolsTitle": "transfer 静默丢弃了 Responses API 工具",
   "dashboard.droppedToolsExpand": "查看每个类型计数",
-  "dashboard.droppedToolsHint": "这是 transfer adapter 不识别的 Responses API 工具类型(可能 Codex 升级引入了新 type,或第三方客户端发了非 Codex 用的 type)。本进程累计计数,重启归零。如果某 type 计数持续上升,需要在 transfer 加 explicit 适配。",
+  "dashboard.droppedToolsHint":
+    "这是 transfer adapter 不识别的 Responses API 工具类型(可能 Codex 升级引入了新 type,或第三方客户端发了非 Codex 用的 type)。本进程累计计数,重启归零。如果某 type 计数持续上升,需要在 transfer 加 explicit 适配。",
   "dashboard.droppedToolsCalls": "次",
   "dashboard.droppedToolsTypes": "种",
   "dashboard.restartCodex": "重启 Codex",
@@ -309,20 +341,25 @@ export default {
   "dashboard.feedback": "反馈",
   "settings.feedback": "反馈与建议",
   "settings.feedbackOpen": "打开反馈窗口",
-  "settings.feedbackHint": "遇到问题或想提建议?支持文本 + 截图 + 日志,匿名提交,无需登录。诊断信息默认自动附上:应用版本、环境信息、脱敏配置、最近错误快照(完整请求/响应)。不含 API Key 等敏感数据。",
+  "settings.feedbackHint":
+    "遇到问题或想提建议?支持文本 + 截图 + 日志,匿名提交,无需登录。诊断信息默认自动附上:应用版本、环境信息、脱敏配置、最近错误快照(完整请求/响应)。不含 API Key 等敏感数据。",
   "feedback.title": "反馈与建议",
-  "feedback.intro": "欢迎反馈使用问题或改进建议。提交内容会发送到开发者维护的私有存储,不会公开。",
+  "feedback.intro":
+    "欢迎反馈使用问题或改进建议。提交内容会发送到开发者维护的私有存储,不会公开。",
   "feedback.titleLabel": "标题(选填)",
   "feedback.titlePlaceholder": "一句话概括问题",
   "feedback.contactEmailLabel": "联系邮箱(选填)",
   "feedback.contactEmailPlaceholder": "name@example.com",
-  "feedback.contactEmailHint": "选填。填写后作者可通过该邮箱联系你反馈处理进展。",
+  "feedback.contactEmailHint":
+    "选填。填写后作者可通过该邮箱联系你反馈处理进展。",
   "feedback.bodyLabel": "详细描述 *",
-  "feedback.bodyPlaceholder": "请尽量描述清楚:发生了什么,你期望的是什么,如何复现",
+  "feedback.bodyPlaceholder":
+    "请尽量描述清楚:发生了什么,你期望的是什么,如何复现",
   "feedback.attachmentsLabel": "附件(选填,可多个,单文件最大 5MB)",
   "feedback.attachmentsHint": "点击选择文件 / 直接拖拽到此处 / Cmd+V 粘贴截图",
   "feedback.includeDiagnostics": "附加诊断信息(默认开启,推荐)",
-  "feedback.includeDiagnosticsHint": "自动附加应用版本、环境信息、脱敏配置和最近错误快照(含完整请求/响应)。不含 API Key 等敏感数据。",
+  "feedback.includeDiagnosticsHint":
+    "自动附加应用版本、环境信息、脱敏配置和最近错误快照(含完整请求/响应)。不含 API Key 等敏感数据。",
   "feedback.privacyWarning": "⚠ 截图请检查是否含 API Key、个人信息等敏感内容。",
   "feedback.submit": "提交反馈",
   "feedback.submitting": "提交中...",
@@ -333,7 +370,8 @@ export default {
   "dashboard.recentActivity": "最近操作",
   "dashboard.updateAvailable": "有新版本",
   "dashboard.availablePresets": "继续添加提供商",
-  "dashboard.availablePresetsHint": "这里会一直保留还没添加的厂商，点一个就能带着预设进入添加页。",
+  "dashboard.availablePresetsHint":
+    "这里会一直保留还没添加的厂商，点一个就能带着预设进入添加页。",
   "status.configured": "已配置",
   "status.notConfigured": "未配置",
   "status.needsApply": "需重新应用",
@@ -355,26 +393,32 @@ export default {
   "providersAdd.editTitle": "编辑提供商",
   "providersAdd.subtitle": "添加新的 API 提供商或选择预设",
   "providersAdd.presets": "快捷预设",
-  "providersAdd.presetsHint": "选择后会自动填入 API 地址和推荐模型，API Key 仍由你自己填写。",
+  "providersAdd.presetsHint":
+    "选择后会自动填入 API 地址和推荐模型，API Key 仍由你自己填写。",
   "providersAdd.mappingTitle": "在 Codex 中显示的模型",
-  "providersAdd.mappingSubtitle": "直接列出你想在 Codex 模型选择器里看到的模型（最多 5 个）。第一个是默认模型，新对话直接用它；后端自动完成到 Codex 槽位的映射，无需手动指定。",
+  "providersAdd.mappingSubtitle":
+    "直接列出你想在 Codex 模型选择器里看到的模型（最多 5 个）。第一个是默认模型，新对话直接用它；后端自动完成到 Codex 槽位的映射，无需手动指定。",
   "providersAdd.defaultModelBadge": "默认",
   "providersAdd.addModel": "添加模型",
   "providersAdd.reviewModel": "auto-review 审查模型",
   "providersAdd.reviewModelFollow": "跟随主模型(默认)",
-  "providersAdd.reviewModelHint": "auto-review 自动审批工具调用时改用的模型，从上方已配置的模型里选(通常选快 / 便宜模型加速审批）。留空 = 跟随主模型。",
+  "providersAdd.reviewModelHint":
+    "auto-review 自动审批工具调用时改用的模型，从上方已配置的模型里选(通常选快 / 便宜模型加速审批）。留空 = 跟随主模型。",
   "providersAdd.providerModel": "用户 API 所含模型",
   "providersAdd.providerModelPlaceholder": "输入或选择模型",
   "providersAdd.removeMapping": "移除",
   "providersAdd.optionApplied": "已切换模型配置",
   "providersAdd.applyToDesktop": "一键生成 Codex CLI 配置",
-  "providersAdd.applyHint": "一键应用会保存供应商和模型列表，把它设为默认，并让 Codex CLI 连接到本工具。之后你在 Codex CLI 里发消息，本工具会自动转发到你填写的 API 地址。",
+  "providersAdd.applyHint":
+    "一键应用会保存供应商和模型列表，把它设为默认，并让 Codex CLI 连接到本工具。之后你在 Codex CLI 里发消息，本工具会自动转发到你填写的 API 地址。",
   "providersAdd.gemini1mLabel": "启用 Gemini 1M 上下文",
-  "providersAdd.gemini1mHint": "关闭时 Gemini 上下文限制在约 600K（更早触发自动压缩），提升长上下文下的指令遵循;开启使用完整 1M。默认关闭。",
+  "providersAdd.gemini1mHint":
+    "关闭时 Gemini 上下文限制在约 600K（更早触发自动压缩），提升长上下文下的指令遵循;开启使用完整 1M。默认关闭。",
   "providersAdd.apiFormatLabel": "协议类型",
   "providersAdd.mimoLogin.label": "套餐用量额度",
   "providersAdd.mimoLogin.button": "登录小米账号",
-  "providersAdd.mimoLogin.hint": "MiMo 套餐用量需登录小米账号(用量接口不认 API Key)。点击在内嵌窗口登录,完成后用于在 Codex 用量面板显示套餐余量。",
+  "providersAdd.mimoLogin.hint":
+    "MiMo 套餐用量需登录小米账号(用量接口不认 API Key)。点击在内嵌窗口登录,完成后用于在 Codex 用量面板显示套餐余量。",
   "providersAdd.mimoLogin.statusLoggedIn": "已登录",
   "providersAdd.mimoLogin.statusNotLoggedIn": "未登录",
   "providersAdd.mimoLogin.statusLoggingIn": "登录中…",
@@ -389,98 +433,133 @@ export default {
   "apiFormatDisplay.responses.name": "Responses",
   "apiFormatDisplay.responses.detail": "原生透传上游",
   "apiFormatDisplay.anthropic.name": "Anthropic Messages",
-  "apiFormatDisplay.anthropic.detail": "Responses ↔ Anthropic Messages 本地协议转换",
+  "apiFormatDisplay.anthropic.detail":
+    "Responses ↔ Anthropic Messages 本地协议转换",
   "apiFormatDisplay.geminiNative.name": "Gemini Native",
-  "apiFormatDisplay.geminiNative.detail": "Responses ↔ Gemini generateContent 直转",
+  "apiFormatDisplay.geminiNative.detail":
+    "Responses ↔ Gemini generateContent 直转",
   "apiFormatDisplay.geminiCliOauth.name": "Gemini CLI(OAuth)",
-  "apiFormatDisplay.geminiCliOauth.detail": "浏览器登录 Google → Cloud Code Assist 直转",
+  "apiFormatDisplay.geminiCliOauth.detail":
+    "浏览器登录 Google → Cloud Code Assist 直转",
   "geminiOauth.title": "Google OAuth 登录",
   "geminiOauth.statusLoading": "加载中...",
-  "geminiOauth.statusNotLoggedIn": "未登录 — 请点下方按钮通过浏览器登录 Google 账号",
-  "geminiOauth.statusLoggedIn": "已登录:{email} — 项目 {projectId}(过期:{expiresAt})",
-  "geminiOauth.statusLoggedInNoProject": "已登录但 project 未 provision:{email}(请重新登录修复)",
+  "geminiOauth.statusNotLoggedIn":
+    "未登录 — 请点下方按钮通过浏览器登录 Google 账号",
+  "geminiOauth.statusLoggedIn":
+    "已登录:{email} — 项目 {projectId}(过期:{expiresAt})",
+  "geminiOauth.statusLoggedInNoProject":
+    "已登录但 project 未 provision:{email}(请重新登录修复)",
   "geminiOauth.loginBtn": "浏览器登录 Google 账号",
   "geminiOauth.loginBtnInProgress": "等待浏览器授权(最多 5 分钟)...",
   "geminiOauth.logoutBtn": "注销并删除本地凭证",
-  "geminiOauth.hint": "登录后浏览器窗口可关闭。Token 持久化到 ~/.codex-app-transfer/gemini-oauth.json,过期前自动刷新。",
-  "geminiOauth.tosWarning": "⚠️ 通过 impersonate gemini-cli 接 Google Cloud Code 内部端点,TOS 灰色,Google 可随时改协议。降级路径:用 Google AI Studio(API key)provider。",
+  "geminiOauth.hint":
+    "登录后浏览器窗口可关闭。Token 持久化到 ~/.codex-app-transfer/gemini-oauth.json,过期前自动刷新。",
+  "geminiOauth.tosWarning":
+    "⚠️ 通过 impersonate gemini-cli 接 Google Cloud Code 内部端点,TOS 灰色,Google 可随时改协议。降级路径:用 Google AI Studio(API key)provider。",
   "geminiOauth.loginSuccess": "登录成功!email: {email}, project: {projectId}",
   "geminiOauth.loginCancelled": "已取消登录",
   "geminiOauth.loginFailed": "登录失败:{error}",
-  "geminiOauth.loginPartial": "OAuth 通过但 Cloud Code project 未 provision(token 未持久化,请重新登录)",
-  "geminiOauth.loginRequired": "切到 Gemini CLI(OAuth)需先登录 Google 账号 — 点表单上的「浏览器登录」按钮",
+  "geminiOauth.loginPartial":
+    "OAuth 通过但 Cloud Code project 未 provision(token 未持久化,请重新登录)",
+  "geminiOauth.loginRequired":
+    "切到 Gemini CLI(OAuth)需先登录 Google 账号 — 点表单上的「浏览器登录」按钮",
   "geminiOauth.logoutConfirmed": "已注销,本地凭证已删除",
-  "geminiOauth.logoutFailedManual": "注销失败:{error}。Token 文件可能仍在 ~/.codex-app-transfer/gemini-oauth.json,需手动删除才能彻底登出",
+  "geminiOauth.logoutFailedManual":
+    "注销失败:{error}。Token 文件可能仍在 ~/.codex-app-transfer/gemini-oauth.json,需手动删除才能彻底登出",
   "geminiOauth.statusFetchFailed": "状态加载失败:{error}",
   "geminiOauth.switchAccountBtn": "切换账号(重新登录)",
   "apiFormatDisplay.antigravityOauth.name": "Antigravity(OAuth)",
-  "apiFormatDisplay.antigravityOauth.detail": "浏览器登录 Google → Antigravity IDE 凭证 → Cloud Code Assist",
+  "apiFormatDisplay.antigravityOauth.detail":
+    "浏览器登录 Google → Antigravity IDE 凭证 → Cloud Code Assist",
   "antigravityOauth.title": "Google OAuth 登录",
   "antigravityOauth.statusLoading": "加载中...",
-  "antigravityOauth.statusNotLoggedIn": "未登录 — 请点下方按钮通过浏览器登录 Google 账号",
-  "antigravityOauth.statusLoggedIn": "已登录:{email} — 项目 {projectId}(过期:{expiresAt})",
-  "antigravityOauth.statusLoggedInNoProject": "已登录但 project 未 provision:{email}(请重新登录修复)",
+  "antigravityOauth.statusNotLoggedIn":
+    "未登录 — 请点下方按钮通过浏览器登录 Google 账号",
+  "antigravityOauth.statusLoggedIn":
+    "已登录:{email} — 项目 {projectId}(过期:{expiresAt})",
+  "antigravityOauth.statusLoggedInNoProject":
+    "已登录但 project 未 provision:{email}(请重新登录修复)",
   "antigravityOauth.loginBtn": "浏览器登录 Google 账号",
   "antigravityOauth.loginBtnInProgress": "等待浏览器授权(最多 5 分钟)...",
   "antigravityOauth.logoutBtn": "注销并删除本地凭证",
-  "antigravityOauth.hint": "登录后浏览器窗口可关闭。Token 持久化到 ~/.codex-app-transfer/antigravity-oauth.json,过期前自动刷新。可与 Gemini CLI(OAuth)同时登录互不影响。",
-  "antigravityOauth.tosWarning": "⚠️ 通过 impersonate Antigravity IDE 客户端接 Google Cloud Code 内部端点,TOS 灰色,Google 可随时改协议。降级路径:用 Google AI Studio(API key)或 Gemini CLI(OAuth)。",
-  "antigravityOauth.loginSuccess": "登录成功!email: {email}, project: {projectId}",
+  "antigravityOauth.hint":
+    "登录后浏览器窗口可关闭。Token 持久化到 ~/.codex-app-transfer/antigravity-oauth.json,过期前自动刷新。可与 Gemini CLI(OAuth)同时登录互不影响。",
+  "antigravityOauth.tosWarning":
+    "⚠️ 通过 impersonate Antigravity IDE 客户端接 Google Cloud Code 内部端点,TOS 灰色,Google 可随时改协议。降级路径:用 Google AI Studio(API key)或 Gemini CLI(OAuth)。",
+  "antigravityOauth.loginSuccess":
+    "登录成功!email: {email}, project: {projectId}",
   "antigravityOauth.loginCancelled": "已取消登录",
   "antigravityOauth.loginFailed": "登录失败:{error}",
-  "antigravityOauth.loginPartial": "OAuth 通过但 Cloud Code project 未 provision(token 未持久化,请重新登录)",
-  "antigravityOauth.loginRequired": "切到 Antigravity(OAuth)需先登录 Google 账号 — 点表单上的「浏览器登录」按钮",
+  "antigravityOauth.loginPartial":
+    "OAuth 通过但 Cloud Code project 未 provision(token 未持久化,请重新登录)",
+  "antigravityOauth.loginRequired":
+    "切到 Antigravity(OAuth)需先登录 Google 账号 — 点表单上的「浏览器登录」按钮",
   "antigravityOauth.logoutConfirmed": "已注销,本地凭证已删除",
-  "antigravityOauth.logoutFailedManual": "注销失败:{error}。Token 文件可能仍在 ~/.codex-app-transfer/antigravity-oauth.json,需手动删除才能彻底登出",
+  "antigravityOauth.logoutFailedManual":
+    "注销失败:{error}。Token 文件可能仍在 ~/.codex-app-transfer/antigravity-oauth.json,需手动删除才能彻底登出",
   "antigravityOauth.statusFetchFailed": "状态加载失败:{error}",
   "antigravityOauth.switchAccountBtn": "切换账号(重新登录)",
   "zaiOauth.title": "GLM 账号登录(Z.ai)",
   "zaiOauth.statusLoading": "加载中...",
-  "zaiOauth.statusNotLoggedIn": "未登录 — 请点下方按钮用 z.ai 账号登录(免 API key)",
+  "zaiOauth.statusNotLoggedIn":
+    "未登录 — 请点下方按钮用 z.ai 账号登录(免 API key)",
   "zaiOauth.statusLoggedIn": "已登录:{email}",
   "zaiOauth.loginBtn": "用 z.ai 账号登录",
   "zaiOauth.loginBtnInProgress": "等待浏览器授权(最多 5 分钟)...",
   "zaiOauth.logoutBtn": "注销并删除本地凭证",
-  "zaiOauth.hint": "登录后浏览器窗口可关闭。免 API key,走你的 GLM Coding Plan 订阅额度。Token 持久化到 ~/.codex-app-transfer/zai-oauth.json,过期前自动刷新。",
+  "zaiOauth.hint":
+    "登录后浏览器窗口可关闭。免 API key,走你的 GLM Coding Plan 订阅额度。Token 持久化到 ~/.codex-app-transfer/zai-oauth.json,过期前自动刷新。",
   "zaiOauth.loginSuccess": "登录成功!email: {email}",
   "zaiOauth.loginCancelled": "已取消登录",
   "zaiOauth.loginFailed": "登录失败:{error}",
-  "zaiOauth.loginRequired": "切到 GLM(Z.ai)需先登录 z.ai 账号 — 点表单上的「用 z.ai 账号登录」按钮",
+  "zaiOauth.loginRequired":
+    "切到 GLM(Z.ai)需先登录 z.ai 账号 — 点表单上的「用 z.ai 账号登录」按钮",
   "zaiOauth.logoutConfirmed": "已注销,本地凭证已删除",
-  "zaiOauth.logoutFailedManual": "注销失败:{error}。Token 文件可能仍在 ~/.codex-app-transfer/zai-oauth.json,需手动删除才能彻底登出",
+  "zaiOauth.logoutFailedManual":
+    "注销失败:{error}。Token 文件可能仍在 ~/.codex-app-transfer/zai-oauth.json,需手动删除才能彻底登出",
   "zaiOauth.statusFetchFailed": "状态加载失败:{error}",
   "zaiOauth.switchAccountBtn": "切换账号(重新登录)",
   "bigmodelOauth.title": "GLM 账号登录(BigModel)",
   "bigmodelOauth.statusLoading": "加载中...",
-  "bigmodelOauth.statusNotLoggedIn": "未登录 — 请点下方按钮用智谱 bigmodel 账号登录(免 API key)",
+  "bigmodelOauth.statusNotLoggedIn":
+    "未登录 — 请点下方按钮用智谱 bigmodel 账号登录(免 API key)",
   "bigmodelOauth.statusLoggedIn": "已登录:{email}",
   "bigmodelOauth.loginBtn": "用 bigmodel 账号登录",
   "bigmodelOauth.loginBtnInProgress": "等待浏览器授权(最多 5 分钟)...",
   "bigmodelOauth.logoutBtn": "注销并删除本地凭证",
-  "bigmodelOauth.hint": "登录后浏览器窗口可关闭。免 API key,走你的 GLM Coding Plan 订阅额度。Token 持久化到 ~/.codex-app-transfer/bigmodel-oauth.json,过期前自动刷新。",
+  "bigmodelOauth.hint":
+    "登录后浏览器窗口可关闭。免 API key,走你的 GLM Coding Plan 订阅额度。Token 持久化到 ~/.codex-app-transfer/bigmodel-oauth.json,过期前自动刷新。",
   "bigmodelOauth.loginSuccess": "登录成功!email: {email}",
   "bigmodelOauth.loginCancelled": "已取消登录",
   "bigmodelOauth.loginFailed": "登录失败:{error}",
-  "bigmodelOauth.loginRequired": "切到 GLM(BigModel)需先登录 bigmodel 账号 — 点表单上的「用 bigmodel 账号登录」按钮",
+  "bigmodelOauth.loginRequired":
+    "切到 GLM(BigModel)需先登录 bigmodel 账号 — 点表单上的「用 bigmodel 账号登录」按钮",
   "bigmodelOauth.logoutConfirmed": "已注销,本地凭证已删除",
-  "bigmodelOauth.logoutFailedManual": "注销失败:{error}。Token 文件可能仍在 ~/.codex-app-transfer/bigmodel-oauth.json,需手动删除才能彻底登出",
+  "bigmodelOauth.logoutFailedManual":
+    "注销失败:{error}。Token 文件可能仍在 ~/.codex-app-transfer/bigmodel-oauth.json,需手动删除才能彻底登出",
   "bigmodelOauth.statusFetchFailed": "状态加载失败:{error}",
   "bigmodelOauth.switchAccountBtn": "切换账号(重新登录)",
   "apiFormatDisplay.grokWeb.name": "Grok Web(实验性)",
-  "apiFormatDisplay.grokWeb.detail": "反代 grok.com Web 后端,SuperGrok / X Premium+ cookie 鉴权",
+  "apiFormatDisplay.grokWeb.detail":
+    "反代 grok.com Web 后端,SuperGrok / X Premium+ cookie 鉴权",
   "grokWeb.title": "Grok Web Cookie 鉴权",
-  "grokWeb.hint": "浏览器登录 grok.com → F12 → Application → Cookies → 复制 sso 一个值即可,其他自动处理(x-statsig-id 每次动态生成、sso-rw 复用 sso、UA 默认)。",
+  "grokWeb.hint":
+    "浏览器登录 grok.com → F12 → Application → Cookies → 复制 sso 一个值即可,其他自动处理(x-statsig-id 每次动态生成、sso-rw 复用 sso、UA 默认)。",
   "grokWeb.ssoLabel": "sso(JWT,必填)",
   "grokWeb.ssoRwLabel": "sso-rw(可选,默认复用 sso)",
   "grokWeb.cookieStringLabel": "完整 Cookie 字符串(CF challenge 时必填)",
-  "grokWeb.cookieStringHint": "浏览器 DevTools → Network → grok.com 任一请求 → Request Headers → 整行 Cookie value 复制粘贴(可带 \"Cookie: \" 前缀,自动 strip)。grok.com Cloudflare 401 \"No credentials presented\" 即缺这一段。对齐 chenyme/grok2api `proxy.clearance.cf_cookies` 设计。",
+  "grokWeb.cookieStringHint":
+    '浏览器 DevTools → Network → grok.com 任一请求 → Request Headers → 整行 Cookie value 复制粘贴(可带 "Cookie: " 前缀,自动 strip)。grok.com Cloudflare 401 "No credentials presented" 即缺这一段。对齐 chenyme/grok2api `proxy.clearance.cf_cookies` 设计。',
   "grokWeb.cfClearanceLabel": "cf_clearance(可选,单 token)",
-  "grokWeb.cfClearanceHint": "如已 paste 完整 Cookie 字符串无需填。单独填只发 `cf_clearance=` segment(可能不够);整段 paste 更稳。",
+  "grokWeb.cfClearanceHint":
+    "如已 paste 完整 Cookie 字符串无需填。单独填只发 `cf_clearance=` segment(可能不够);整段 paste 更稳。",
   "grokWeb.advancedSummary": "高级选项(401 / CF challenge 时展开补充)",
   "grokWeb.statsigIdLabel": "x-statsig-id(可选 override,默认动态生成)",
-  "grokWeb.statsigIdHint": "默认每次请求后端动态生成伪 Statsig blob(参考 chenyme/grok2api),无需手动维护;仅高级用户精确控制 statsig 内容时填写。",
+  "grokWeb.statsigIdHint":
+    "默认每次请求后端动态生成伪 Statsig blob(参考 chenyme/grok2api),无需手动维护;仅高级用户精确控制 statsig 内容时填写。",
   "grokWeb.userAgentLabel": "User-Agent override(可选)",
-  "grokWeb.tosWarning": "⚠️ 反代 grok.com Web 端,grok TOS 灰色,仅限个人使用本机 SuperGrok 账号,不应作为对外服务发布。",
+  "grokWeb.tosWarning":
+    "⚠️ 反代 grok.com Web 端,grok TOS 灰色,仅限个人使用本机 SuperGrok 账号,不应作为对外服务发布。",
   "grokWeb.savedPlaceholder": "已保存,留空则保持不变",
   "providers.title": "提供商",
   "providers.subtitle": "管理已配置的 API 提供商",
@@ -509,8 +588,10 @@ export default {
   "providers.keyPlaceholder": "sk-...",
   "providers.keySavedPlaceholder": "已填入，可点眼睛查看",
   "providers.modelMenuTitle": "OpenAI 模型菜单",
-  "providers.modelMenuSingleHint": "当前只把默认提供商的模型显示到 Codex CLI。新增或改名模型后，需要重新一键应用并重启终端。",
-  "providers.modelMenuAllHint": "已开启全部模型。下次一键应用后，Codex CLI 会显示所有已配置提供商的模型；同步过的模型之间切换不用再回本工具切换。",
+  "providers.modelMenuSingleHint":
+    "当前只把默认提供商的模型显示到 Codex CLI。新增或改名模型后，需要重新一键应用并重启终端。",
+  "providers.modelMenuAllHint":
+    "已开启全部模型。下次一键应用后，Codex CLI 会显示所有已配置提供商的模型；同步过的模型之间切换不用再回本工具切换。",
   "providers.showAllModels": "显示全部模型",
   "providers.showSingleModel": "只显示当前模型",
   "models.title": "模型映射",
@@ -523,19 +604,27 @@ export default {
   "models.fetchSuccess": "模型获取成功",
   "models.fetchFailedManual": "模型获取失败，请手动输入可用模型",
   "models.fetchFailed": "无法自动获取模型列表",
-  "models.upstreamError.api_key_invalid": "API key 无效,请检查 key 格式或重新生成",
-  "models.upstreamError.invalid_argument": "请求参数错误 (HTTP 400),请检查 baseUrl 是否对应 Codex 兼容端点",
+  "models.upstreamError.api_key_invalid":
+    "API key 无效,请检查 key 格式或重新生成",
+  "models.upstreamError.invalid_argument":
+    "请求参数错误 (HTTP 400),请检查 baseUrl 是否对应 Codex 兼容端点",
   "models.upstreamError.bad_request": "请求格式错误 (HTTP 400)",
-  "models.upstreamError.unauthenticated_oauth": "API key 缺失或无效,请填写正确的 API key 后重试",
+  "models.upstreamError.unauthenticated_oauth":
+    "API key 缺失或无效,请填写正确的 API key 后重试",
   "models.upstreamError.unauthenticated_expired": "API key 已过期,请重新生成",
   "models.upstreamError.unauthenticated": "鉴权失败 (HTTP 401),请检查 API key",
-  "models.upstreamError.permission_denied": "API key 无权访问此功能 (HTTP 403),请确认账号已开通对应 API",
-  "models.upstreamError.billing_required": "未启用计费,请到上游控制台启用 billing (HTTP 403)",
+  "models.upstreamError.permission_denied":
+    "API key 无权访问此功能 (HTTP 403),请确认账号已开通对应 API",
+  "models.upstreamError.billing_required":
+    "未启用计费,请到上游控制台启用 billing (HTTP 403)",
   "models.upstreamError.forbidden": "上游拒绝访问 (HTTP 403)",
-  "models.upstreamError.not_found": "端点不存在 (HTTP 404),请检查 baseUrl 是否填写正确",
-  "models.upstreamError.method_not_allowed": "端点不支持此方法 (HTTP 405),baseUrl 可能填错",
+  "models.upstreamError.not_found":
+    "端点不存在 (HTTP 404),请检查 baseUrl 是否填写正确",
+  "models.upstreamError.method_not_allowed":
+    "端点不支持此方法 (HTTP 405),baseUrl 可能填错",
   "models.upstreamError.timeout": "上游响应超时,稍后重试",
-  "models.upstreamError.quota_exceeded": "上游配额已用完 (HTTP 429),请检查计费 / 等待配额刷新",
+  "models.upstreamError.quota_exceeded":
+    "上游配额已用完 (HTTP 429),请检查计费 / 等待配额刷新",
   "models.upstreamError.rate_limited": "请求过于频繁 (HTTP 429),稍后重试",
   "models.upstreamError.server_error": "上游服务异常 (HTTP {status}),稍后重试",
   "models.upstreamError.unknown": "上游返回错误 (HTTP {status})",
@@ -550,7 +639,8 @@ export default {
   "models.upstreamError.models_not_found": "响应中未找到模型列表",
   "models.upstreamError.client_init_failure": "无法创建 HTTP 客户端",
   "models.upstreamError.invalid_base_url": "API 地址无效",
-  "models.hint": "Codex CLI 发送 OpenAI 模型名，本工具会映射到你选择的提供商模型。",
+  "models.hint":
+    "Codex CLI 发送 OpenAI 模型名，本工具会映射到你选择的提供商模型。",
   "desktop.title": "Codex CLI",
   "desktop.subtitle": "一键让 Codex CLI 使用当前供应商",
   "desktop.configTitle": "Codex CLI 配置",
@@ -558,7 +648,8 @@ export default {
   "desktop.details": "配置详情",
   "desktop.clear": "还原 Codex 原配置",
   "desktop.quickGuide": "快速引导",
-  "desktop.explainText": "原理很简单：Codex CLI 先连接到本工具；本工具再把模型名翻译成你选择的供应商模型，并转发到对应 API。你的上游 API Key 只保存在本机配置里，不直接写进 Codex CLI。",
+  "desktop.explainText":
+    "原理很简单：Codex CLI 先连接到本工具；本工具再把模型名翻译成你选择的供应商模型，并转发到对应 API。你的上游 API Key 只保存在本机配置里，不直接写进 Codex CLI。",
   "desktop.step1Title": "复制命令",
   "desktop.step1Text": "把 Codex CLI 连接到本工具",
   "desktop.step2Title": "设置环境变量",
@@ -586,66 +677,90 @@ export default {
   "settings.adminPort": "管理端口",
   "settings.autoStart": "开机自启",
   "settings.autoApplyOnStart": "启动时自动应用配置",
-  "settings.autoApplyOnStartHint": "启动时自动应用当前提供商的 Codex 配置；如该提供商需要转发服务，会同时启动转发。关闭则需要手动点「应用配置」。",
+  "settings.autoApplyOnStartHint":
+    "启动时自动将当前提供商的配置替换 codex 原配置；如该提供商需要转发服务，会同时启动转发。",
   "settings.showGrayProviders": "显示灰色提供商",
-  "settings.showGrayProvidersWarn": "⚠️ 存在封号风险，开启并使用这些提供商的后果由你自行承担。",
-  "settings.showGrayProvidersHint": "默认隐藏 Grok(Web)、Gemini CLI、Antigravity 等 TOS 灰色 / 实验性提供商。开启后它们才会出现在「添加提供商」的列表中。",
-  "settings.autoUnlockCodexPlugins": "自动解锁 Codex Plugins",
-  "settings.autoUnlockCodexPluginsHint": "此功能需要通过本应用内启动 Codex 才能正常使用。点击右侧「重启 Codex」可直接重启 Codex 并触发自动注入。注意:Plugins / MCP 工具仅在协议转发路径(`apiFormat=openai_chat / anthropic_messages / gemini_native` 等)生效;Responses 直连 provider(`apiFormat=responses`,如 OpenAI 官方)走字节级 passthrough,MCP `namespace` 工具包不展平,部分上游会忽略导致工具列表静默丢失。",
+  "settings.showGrayProvidersWarn":
+    "⚠️ 存在封号风险，开启并使用这些提供商的后果由你自行承担。",
+  "settings.showGrayProvidersHint":
+    "默认隐藏Gemini CLI、Antigravity 等实验性提供商。",
+  "settings.autoUnlockCodexPlugins": "自动解锁 Codex 插件",
+  "settings.autoUnlockCodexPluginsHint":
+    "此功能需要通过本应用内启动 Codex 才能正常使用。启动后，解锁 codex 插件的使用。",
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
-  "settings.codexQuotaEnabledHint": "在 Codex 的固定摘要(pinned summary)弹窗底部显示用量面板:上下文占用、Tokens 速率与累计(所有 provider),以及 5 小时 / 每周额度(仅支持的 provider)。需 Codex 通过本应用启动;若 Codex 已在运行,改动开关后需重启 Codex 生效。",
+  "settings.codexQuotaEnabledHint":
+    "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",
   "settings.autoUnlockRestartCodex": "重启 Codex",
   "settings.pluginUnlockRuntimeStatus": "运行时状态：未检测",
   "settings.pluginUnlockRuntimeStatusPrefix": "运行时状态：",
   "settings.autoWakeCodexPet": "自动唤醒 Codex 桌面宠物",
-  "settings.autoWakeCodexPetHint": "启动 Codex Desktop 时会自动同步 ~/.codex/.codex-global-state.json 中的 electron-avatar-overlay-open：开启写 true 让宠物随 Codex 唤醒，关闭写 false 覆盖之前残留的 true 让宠物不再自动出现。",
+  "settings.autoWakeCodexPetHint": "启动后，宠物会在 codex 启动时自动唤醒。",
   "settings.exposeAllModels": "OpenAI 模型菜单",
   "settings.restoreCodexOnExit": "退出时还原 Codex 原配置",
-  "settings.restoreCodexOnExitHint": "开启后，应用退出或下次启动时会自动把 ~/.codex/config.toml 与 auth.json 还原至 apply 之前的状态；保证不开应用时 Codex CLI 仍是你本人的原配置。",
+  "settings.restoreCodexOnExitHint":
+    "启动后，应用会在退出时自动将配置文件还原为 codex 原配置。",
   "settings.mcpCredentialsPortableStore": "MCP 授权可移植保险箱",
-  "settings.mcpCredentialsPortableStoreHint": "开启后把 Codex 的 MCP 授权改存为可移植文件（~/.codex/.credentials.json），并由本应用在 ~/.codex 之外维护一份镜像；若整个授权文件被切账号 / 误删 / 换机清掉，下次启动会弹确认让你从备份恢复（单个 server 的主动登出会被尊重、不复活）。注意：授权 token 将明文存盘（权限 0o600，与其它 CLI agent 一致）；此功能不解决授权自然过期（过期仍需重新授权）。",
+  "settings.mcpCredentialsPortableStoreHint":
+    "备份 MCP 授权信息，避免切换提供商时授权失效。",
   "mcp.restorePromptTitle": "恢复 MCP 授权？",
-  "mcp.restorePromptBody": "检测到 ~/.codex/.credentials.json 不见了，但本应用备份里有 {count} 条 MCP 授权。是否从备份恢复？（若你刚主动登出了全部 MCP，请选「否」——会清掉备份不再提示。）",
+  "mcp.restorePromptBody":
+    "检测到 ~/.codex/.credentials.json 不见了，但本应用备份里有 {count} 条 MCP 授权。是否从备份恢复？（若你刚主动登出了全部 MCP，请选「否」——会清掉备份不再提示。）",
   "mcp.restoreDone": "已从备份恢复 {count} 条 MCP 授权",
   "mcp.restoreDismissed": "已忽略并清除 MCP 授权备份",
-  "settings.webFetchBackend": "内置联网抓取工具（transfer 代抓网页）",
+  "settings.webFetchBackend": "WebFetch MCP",
   "settings.newBadge": "新功能",
-  "settings.webFetchBackendHint": "transfer 自己抓取网页内容返给模型（独立于下面的 Codex 沙箱联网开关）。auto=按页面难度自动 curl→wreq→headless 升级，并记住每站最佳档；curl=reqwest 静态抓取；wreq=浏览器 TLS 指纹绕 Cloudflare；headless=无头 Chrome 跑 JS 抓 JS 渲染 SPA。auto / headless 需系统代理（梯子）连通才能抓墙外站，否则自动降级 wreq；首次选 auto / headless 会检测系统 Chrome，未安装则提示下载 chrome-headless-shell（~86MB，仅一次，复用，不打包进安装包）。",
+  "settings.webFetchBackendHint": "联网工具扩展：WebSearch, WebFetch",
   "settings.webFetchBackend.off": "关闭",
   "settings.webFetchBackend.auto": "auto",
-  "settings.webFetchAutoNeedsProxy": "auto / headless 档需系统代理（梯子）连通才能抓墙外站，当前系统代理未连通，已自动降级为 wreq 档。请先开启系统代理再选 auto。",
+  "settings.webFetchAutoNeedsProxy":
+    "auto / headless 档需系统代理（梯子）连通才能抓墙外站，当前系统代理未连通，已自动降级为 wreq 档。请先开启系统代理再选 auto。",
   "settings.headlessChromeTitle": "未检测到 Chrome",
-  "settings.headlessChromeDesc": "启用 headless 抓取需要一个 Chromium 浏览器，但未在系统中检测到 Chrome / Edge / Chromium。是否下载 chrome-headless-shell（约 86MB，仅下载一次并复用，不打包进安装包）？取消则回退到上一个选项。",
+  "settings.headlessChromeDesc":
+    "启用 headless 抓取需要一个 Chromium 浏览器，但未在系统中检测到 Chrome / Edge / Chromium。是否下载 chrome-headless-shell（约 86MB，仅下载一次并复用，不打包进安装包）？取消则回退到上一个选项。",
   "settings.headlessChromeConfirm": "下载并启用",
-  "settings.headlessChromeSystemFound": "已检测到系统 Chrome，已启用 headless 抓取",
-  "settings.headlessChromeDownloading": "正在下载 chrome-headless-shell（~86MB）…",
+  "settings.headlessChromeSystemFound":
+    "已检测到系统 Chrome，已启用 headless 抓取",
+  "settings.headlessChromeDownloading":
+    "正在下载 chrome-headless-shell（~86MB）…",
   "settings.headlessChromeDownloaded": "已下载并启用 headless 抓取",
   "settings.headlessChromeFailed": "下载失败，已回退到上一个选项",
   "settings.webFetchSaveFailed": "设置保存失败，已回退到上次保存的选项",
-  "settings.webFetchSyncWarning": "设置已保存，但向 Codex 注册抓取工具失败（下次启动 transfer 会自动重试）。如持续失败请检查 ~/.codex/config.toml 写入权限。",
-  "settings.codexNetworkAccess": "允许 Codex 联网工具（全权限模式）",
-  "settings.codexNetworkAccessHint": "⚠️ 默认关闭（全权限有风险）。开启后让 Codex 走 danger-full-access 沙箱 + approval_policy=never（Codex 官方推荐的 \"Full access\" 配对）：模型可以读写任何文件、用 curl / wget 等联网命令获取实时网页，且所有命令无审批弹窗。**等于完全信任模型**。默认（关闭）时 Codex 走 read-only 沙箱 + on-request 审批：无网络；第三方 provider 原生 web_search 已在协议层 drop（MOC-208），联网搜索改走自研 web_search / web_fetch 工具（需开启「内置联网抓取工具」）。",
+  "settings.webFetchSyncWarning":
+    "设置已保存，但向 Codex 注册抓取工具失败（下次启动 transfer 会自动重试）。如持续失败请检查 ~/.codex/config.toml 写入权限。",
+  "settings.codexNetworkAccess": "默认使用全权限模式",
+  "settings.codexNetworkAccessHint":
+    "⚠️ 第三方模型的提权能力有限，普通模式下部分指令会静默失败。",
   "settings.traceViewerEnabled": "诊断模式 · 协议流量查看器（开发者）",
   "settings.openTraceViewer": "打开查看器",
-  "settings.traceViewerEnabledHint": "⚠️ 开发者诊断，默认关。开启后在本机独立端口（http://127.0.0.1:18090）实时查看 Codex↔上游 协议转发全流量（原始请求 / 转换后 / 上游回包），用于排查 adapter / 协议映射问题；也可设环境变量 CAS_DIAG_TRACE=1 启动。仅本地 loopback；credential（authorization / api_key 等）落盘前脱敏，但 prompt / 代码 / 模型回复正文会完整记录，故仅供本地排查、勿外传。关闭即停止采集与查看器。注:MCP / OAuth 流量采集额外依赖插件解锁器 daemon 运行（即「自动解锁 Codex Plugins」开、Codex 经本工具带调试端口启动）;未运行时仅有 forward-trace。",
+  "settings.traceViewerEnabledHint":
+    "⚠️ 开发者诊断，开启后在 http://127.0.0.1:18090 实时查看 Codex↔上游全流量，落盘前脱敏。",
   "settings.residualScanTitle": "Codex 原配置完整性检查",
-  "settings.residualScanHint": "扫描 ~/.codex/config.toml 与本应用历史快照里是否残留 transfer apply 写过的字段（model_catalog_json / openai_base_url 等）。启动时会自动扫一次，发现污染会顶部弹提示。",
+  "settings.residualScanHint": "扫描 Codex 原配置是否含有 Transfer 残留字段。",
   "settings.residualScanStatusUnknown": "正在扫描…",
-  "settings.residualScanStatusClean": "✅ 干净：~/.codex/config.toml 与所有快照均未含 transfer apply 残留字段。",
-  "settings.residualScanStatusCleanWhileApplied": "✅ 当前 transfer apply 生效中，所有快照均未含残留字段（live config 含 transfer 字段属正常）。",
-  "settings.residualScanStatusDirty": "⚠️ 发现 {count} 个文件含 transfer 字段。点「针对性清除」预览要 strip 的字段并清理。",
+  "settings.residualScanStatusClean":
+    "✅ 干净：所有快照均未含 transfer 残留字段。",
+  "settings.residualScanStatusCleanWhileApplied":
+    "✅ 当前 transfer 生效中，所有快照均未含残留字段。",
+  "settings.residualScanStatusDirty":
+    "⚠️ 发现 {count} 个文件含 transfer 字段残留，点「针对性清除」进行清理。",
   "settings.residualScanStatusError": "扫描失败：{error}",
   "settings.residualScanRefresh": "重新扫描",
   "settings.residualScanRepair": "针对性清除",
   "settings.residualScanShowFields": "显示残留字段",
   "settings.residualScanShowFieldsClean": "✅ 无残留字段，无需清除。",
   "settings.residualScanPreviewTitle": "即将 strip 的字段：",
-  "settings.residualScanConfirm": "本工具会从下列文件中删除标注的 transfer 字段（其它内容包括 model / personality / [projects.*] / mcp_servers 等全部保留）：\n\n{preview}\n\n确认继续？",
-  "settings.residualScanToastCleaned": "已清除 {count} 个文件的 transfer 残留字段。",
-  "settings.residualScanStartupToast": "启动扫描：发现 {count} 个文件含 transfer 字段，请到设置页查看 / 清除。",
-  "settings.codexSnapshotStatusActive": "已保存 apply 之前的原配置快照（{time}）；退出或点「还原 Codex 原配置」会自动回滚。",
-  "settings.codexSnapshotStatusRecovery": "存在 {count} 个可人工恢复的 Codex 配置备份。点「还原 Codex 原配置」可选择其中一个恢复。",
-  "settings.codexSnapshotStatusEmpty": "暂未生成 Codex 配置快照。第一次点「应用配置」时会自动备份 ~/.codex/config.toml 与 auth.json。",
+  "settings.residualScanConfirm":
+    "本工具会从下列文件中删除标注的 transfer 字段（其它内容包括 model / personality / [projects.*] / mcp_servers 等全部保留）：\n\n{preview}\n\n确认继续？",
+  "settings.residualScanToastCleaned":
+    "已清除 {count} 个文件的 transfer 残留字段。",
+  "settings.residualScanStartupToast":
+    "启动扫描：发现 {count} 个文件含 transfer 字段，请到设置页查看 / 清除。",
+  "settings.codexSnapshotStatusActive":
+    "已保存应用之前的原配置快照（{time}）。",
+  "settings.codexSnapshotStatusRecovery":
+    "存在 {count} 个可人工恢复的 Codex 配置备份。点「还原 Codex 原配置」可选择其中一个恢复。",
+  "settings.codexSnapshotStatusEmpty":
+    "暂未生成 Codex 配置快照。第一次点「应用配置」时会自动备份 ~/.codex/config.toml 与 auth.json。",
   "settings.codexSnapshotKind.active": "当前会话",
   "settings.codexSnapshotKind.recovery": "恢复备份",
   "settings.codexSnapshotKind.legacy": "旧版备份",
@@ -661,10 +776,12 @@ export default {
   "settings.importConfig": "导入配置",
   "settings.noBackups": "暂无备份",
   "settings.backupLoadFailed": "备份列表读取失败",
-  "settings.configBackupHint": "导出的配置会包含 API Key，请只保存在可信设备上。",
+  "settings.configBackupHint":
+    "导出的配置会包含 API Key，请只保存在可信设备上。",
   "settings.thirdPartyCompat": "第三方兼容",
   "settings.checkCompatibility": "检查兼容性",
-  "settings.thirdPartyCompatHint": "一键检查所有 provider 实际可用性。自定义 provider 可选择 OpenAI Chat 本地转换、原生 Responses 透传、Anthropic Messages 本地转换等协议路由。",
+  "settings.thirdPartyCompatHint":
+    "一键检查所有 provider 实际可用性。自定义 provider 可选择 OpenAI Chat 本地转换、原生 Responses 透传、Anthropic Messages 本地转换等协议路由。",
   "settings.compatibilityEmpty": "还没有已保存的提供商。",
   "settings.checkUpdate": "检查更新",
   "settings.installUpdate": "下载并安装",
@@ -680,49 +797,66 @@ export default {
   "theme.dark": "暗色",
   "theme.white": "白色",
   "guide.title": "使用引导",
-  "guide.subtitle": "让 OpenAI Codex CLI 接入 Kimi、DeepSeek、智谱 GLM、阿里云百炼、Xiaomi MiMo 等供应商,无需改动 CLI 本身。",
+  "guide.subtitle":
+    "让 OpenAI Codex CLI 接入 Kimi、DeepSeek、智谱 GLM、阿里云百炼、Xiaomi MiMo 等供应商,无需改动 CLI 本身。",
   "guide.prereqTitle": "开始之前",
-  "guide.prereqBody": "需要已安装 <strong>OpenAI Codex CLI 0.126+</strong>。终端跑 <code>codex --version</code> 看版本号;没装的话先去 <a href=\"https://github.com/openai/codex\" target=\"_blank\" rel=\"noreferrer\">github.com/openai/codex</a>。",
+  "guide.prereqBody":
+    '需要已安装 <strong>OpenAI Codex CLI 0.126+</strong>。终端跑 <code>codex --version</code> 看版本号;没装的话先去 <a href="https://github.com/openai/codex" target="_blank" rel="noreferrer">github.com/openai/codex</a>。',
   "guide.quickStartTitle": "快速开始",
   "guide.step1": "添加提供商",
-  "guide.step1Text": "在「提供商」页右上角「+」选预设(Kimi / Kimi Code / DeepSeek / 智谱 GLM / 阿里云百炼 / Xiaomi MiMo),粘贴 API Key。模型映射按官方文档已预填。",
+  "guide.step1Text":
+    "在「提供商」页右上角「+」选预设(Kimi / Kimi Code / DeepSeek / 智谱 GLM / 阿里云百炼 / Xiaomi MiMo),粘贴 API Key。模型映射按官方文档已预填。",
   "guide.step1Link": "去添加 →",
   "guide.step2": "设为默认",
-  "guide.step2Text": "「提供商」列表点你要用的那个,确认带上「默认」标记。可以同时保存多个,以后随时切。",
+  "guide.step2Text":
+    "「提供商」列表点你要用的那个,确认带上「默认」标记。可以同时保存多个,以后随时切。",
   "guide.step2Link": "去管理 →",
   "guide.step3": "应用配置(自动)",
-  "guide.step3Text": "应用启动时自动写入 <code>~/.codex/config.toml</code> 与 <code>auth.json</code>,按需启动本地转发服务。<strong>第一次会先快照备份你原来的 ~/.codex 配置</strong>,退出时按 key 智能合并还原。",
+  "guide.step3Text":
+    "应用启动时自动写入 <code>~/.codex/config.toml</code> 与 <code>auth.json</code>,按需启动本地转发服务。<strong>第一次会先快照备份你原来的 ~/.codex 配置</strong>,退出时按 key 智能合并还原。",
   "guide.step4": "在终端跑 codex",
-  "guide.step4Text": "<strong>打开新终端</strong>,直接跑 <code>codex</code>。模型选单会显示当前 provider 的映射(Sonnet / Haiku / Opus 对应真实模型)。",
+  "guide.step4Text":
+    "<strong>打开新终端</strong>,直接跑 <code>codex</code>。模型选单会显示当前 provider 的映射(Sonnet / Haiku / Opus 对应真实模型)。",
   "guide.step5": "切换 / 退出",
-  "guide.step5Text": "右键系统托盘图标可以一键切换 provider。退出应用时,<code>~/.codex/</code> 自动回到你原来的配置 —— 不开应用 = 用你自己的原配置。",
+  "guide.step5Text":
+    "右键系统托盘图标可以一键切换 provider。退出应用时,<code>~/.codex/</code> 自动回到你原来的配置 —— 不开应用 = 用你自己的原配置。",
   "guide.advancedTitle": "进阶用法",
   "guide.advThinkingTitle": "DeepSeek 思维模式",
-  "guide.advThinkingText": "编辑 DeepSeek provider 时打开「Max 思维」开关,自动按官方 chat/completions 思维协议发送 reasoning_effort + thinking 字段。",
+  "guide.advThinkingText":
+    "编辑 DeepSeek provider 时打开「Max 思维」开关,自动按官方 chat/completions 思维协议发送 reasoning_effort + thinking 字段。",
   "guide.advCompatTitle": "兼容性测试",
-  "guide.advCompatText": "Settings 页「检查兼容性」按钮一键测试所有 provider 的实际响应,标记哪些直连、哪些需要转发、哪些有问题。",
+  "guide.advCompatText":
+    "Settings 页「检查兼容性」按钮一键测试所有 provider 的实际响应,标记哪些直连、哪些需要转发、哪些有问题。",
   "guide.advBackupTitle": "配置备份",
-  "guide.advBackupText": "Settings 页可立即备份当前配置,或导出/导入完整 JSON。备份包含 API Key,只在可信设备上保存。",
+  "guide.advBackupText":
+    "Settings 页可立即备份当前配置,或导出/导入完整 JSON。备份包含 API Key,只在可信设备上保存。",
   "guide.advRestoreTitle": "还原 Codex 原配置",
-  "guide.advRestoreText": "Dashboard 顶栏红色按钮按 key 智能合并 —— 仅回滚我们写过的 auth_mode / OPENAI_API_KEY / openai_base_url,你的 model_reasoning_effort 等其他配置原样保留。",
+  "guide.advRestoreText":
+    "Dashboard 顶栏红色按钮按 key 智能合并 —— 仅回滚我们写过的 auth_mode / OPENAI_API_KEY / openai_base_url,你的 model_reasoning_effort 等其他配置原样保留。",
   "guide.troubleshootTitle": "遇到问题",
   "guide.tsFeedbackTitle": "提交反馈",
-  "guide.tsFeedbackText": "Dashboard 顶栏「反馈」按钮匿名提交问题描述 + 截图 + 日志,默认附诊断信息(应用版本 / OS / 当前 provider 名,<strong>不含 API Key</strong>)。无需登录。",
+  "guide.tsFeedbackText":
+    "Dashboard 顶栏「反馈」按钮匿名提交问题描述 + 截图 + 日志,默认附诊断信息(应用版本 / OS / 当前 provider 名,<strong>不含 API Key</strong>)。无需登录。",
   "guide.tsLogsTitle": "查看日志",
-  "guide.tsLogsText": "Settings 页底部「查看日志」按钮直接打开 <code>~/.codex-app-transfer/logs/</code>。或在「转发」页内置实时日志面板,2 秒自动刷新。",
+  "guide.tsLogsText":
+    "Settings 页底部「查看日志」按钮直接打开 <code>~/.codex-app-transfer/logs/</code>。或在「转发」页内置实时日志面板,2 秒自动刷新。",
   "guide.tsRestartTitle": "模型菜单不刷新?",
-  "guide.tsRestartText": "Codex CLI 只在启动时读 <code>~/.codex/</code> 配置。切换 provider 后必须 <strong>关闭并重新打开终端</strong>,新终端才会用新映射。",
+  "guide.tsRestartText":
+    "Codex CLI 只在启动时读 <code>~/.codex/</code> 配置。切换 provider 后必须 <strong>关闭并重新打开终端</strong>,新终端才会用新映射。",
   "guide.tsSpeedTitle": "测速 / 兼容性失败?",
-  "guide.tsSpeedText": "如果测速失败,先确认 baseUrl 与 API Key 对得上。v2.x 起所有 provider 的协议类型由系统统一管理:内置预设按 baseUrl 自动命中,自定义 provider 默认 <strong>chat/completions</strong>;仅当上游明确实现 OpenAI Responses API 时才选 Responses,Claude / Anthropic 上游请选择 Anthropic Messages 本地转换。",
+  "guide.tsSpeedText":
+    "如果测速失败,先确认 baseUrl 与 API Key 对得上。v2.x 起所有 provider 的协议类型由系统统一管理:内置预设按 baseUrl 自动命中,自定义 provider 默认 <strong>chat/completions</strong>;仅当上游明确实现 OpenAI Responses API 时才选 Responses,Claude / Anthropic 上游请选择 Anthropic Messages 本地转换。",
   "guide.start": "添加你的第一个提供商",
   "restartReminder.title": "是否立即重启 Codex App？",
-  "restartReminder.body": "已切换供应商并同步模型列表，需要重启 Codex App 才能生效。",
+  "restartReminder.body":
+    "已切换供应商并同步模型列表，需要重启 Codex App 才能生效。",
   "restartReminder.later": "取消，稍后重启",
   "restartReminder.now": "立即重启",
   "restartReminder.restarting": "正在重启…",
   "toast.defaultUpdated": "默认提供商已更新",
   "toast.defaultUpdatedDesktop": "已启用并同步到 Codex CLI，请重启 Codex App",
-  "toast.defaultUpdatedDesktopFailed": "已启用，但桌面版同步失败，请重新一键应用",
+  "toast.defaultUpdatedDesktopFailed":
+    "已启用，但桌面版同步失败，请重新一键应用",
   "toast.codexAppRestartRequested": "已请求重启 Codex App",
   "toast.codexAppRestartFailed": "无法重启 Codex App",
   "toast.modelsSaved": "模型映射已保存",
@@ -730,7 +864,8 @@ export default {
   "toast.modelsAutofilled": "模型获取成功",
   "toast.desktopApplied": "环境变量命令已复制到剪贴板",
   "toast.desktopCleared": "已还原 ~/.codex/ 至 apply 之前的状态",
-  "toast.desktopClearedLegacy": "未发现快照，已按旧逻辑清除我们写入的字段（升级前的原 base_url / API Key 无法恢复）",
+  "toast.desktopClearedLegacy":
+    "未发现快照，已按旧逻辑清除我们写入的字段（升级前的原 base_url / API Key 无法恢复）",
   "toast.desktopSnapshotInvalid": "未选择有效的 Codex 配置备份",
   "toast.proxyStarted": "转发服务已启动",
   "toast.proxyStopped": "转发服务已停止",
@@ -756,15 +891,24 @@ export default {
   "toast.singleModelEnabled": "已切回只显示当前模型，请重新一键应用并重启终端",
   "toast.compatibilityChecked": "兼容性检查完成",
   "toast.requestFailed": "操作失败，请查看后端日志",
-  "confirm.desktopApply": "即将生成 Codex CLI 环境变量配置命令并复制到剪贴板。确认继续？",
-  "confirm.desktopClear": "这会把 ~/.codex/config.toml 与 auth.json 还原至 apply 之前的状态（智能合并，仅回滚我们写过的字段）。本工具内保存的提供商与 API Key 不受影响。确认继续？",
-  "confirm.desktopClearFallback": "未发现可用快照。继续后会清除本工具写入 Codex 的接管字段，包括代理地址、模型目录和模型选择残留；会保留 Codex 账号 token。确认继续？",
-  "confirm.desktopSnapshotRestoreSingle": "将恢复以下 Codex 配置备份，并保留 Codex 账号 token：\n\n{summary}\n\n恢复成功后会清理剩余备份。确认继续？",
-  "confirm.desktopSnapshotSelect": "检测到多个 Codex 配置备份。请输入要恢复的序号：\n\n{list}",
-  "confirm.desktopSnapshotRestoreSelected": "将恢复以下 Codex 配置备份，并在成功后清理所有剩余备份：\n\n{summary}\n\n确认继续？",
-  "confirm.configImport": "导入配置会覆盖当前提供商和设置，系统会先自动备份现有配置。确认继续？",
-  "confirm.providerApplyDesktop": "即将保存当前供应商和模型映射，并生成 Codex CLI 环境变量配置，同时启动转发服务。确认继续？",
-  "confirm.installUpdate": "将自动下载安装包。下载完成后，当前应用会自动退出并启动安装器。确认继续？",
+  "confirm.desktopApply":
+    "即将生成 Codex CLI 环境变量配置命令并复制到剪贴板。确认继续？",
+  "confirm.desktopClear":
+    "这会把 ~/.codex/config.toml 与 auth.json 还原至 apply 之前的状态（智能合并，仅回滚我们写过的字段）。本工具内保存的提供商与 API Key 不受影响。确认继续？",
+  "confirm.desktopClearFallback":
+    "未发现可用快照。继续后会清除本工具写入 Codex 的接管字段，包括代理地址、模型目录和模型选择残留；会保留 Codex 账号 token。确认继续？",
+  "confirm.desktopSnapshotRestoreSingle":
+    "将恢复以下 Codex 配置备份，并保留 Codex 账号 token：\n\n{summary}\n\n恢复成功后会清理剩余备份。确认继续？",
+  "confirm.desktopSnapshotSelect":
+    "检测到多个 Codex 配置备份。请输入要恢复的序号：\n\n{list}",
+  "confirm.desktopSnapshotRestoreSelected":
+    "将恢复以下 Codex 配置备份，并在成功后清理所有剩余备份：\n\n{summary}\n\n确认继续？",
+  "confirm.configImport":
+    "导入配置会覆盖当前提供商和设置，系统会先自动备份现有配置。确认继续？",
+  "confirm.providerApplyDesktop":
+    "即将保存当前供应商和模型映射，并生成 Codex CLI 环境变量配置，同时启动转发服务。确认继续？",
+  "confirm.installUpdate":
+    "将自动下载安装包。下载完成后，当前应用会自动退出并启动安装器。确认继续？",
   "confirm.openDocs": "即将在浏览器打开 {provider} 的官方文档页面。继续？",
   "theme.cropTitle": "1:1 截取（拖动调整位置，滚轮缩放）",
   "theme.cropConfirm": "使用此截取",
@@ -785,7 +929,60 @@ export default {
   "settings.traceViewerStopFailed": "诊断查看器关闭失败",
   "settings.traceViewerOpenFailed": "打开诊断查看器失败",
   "settings.codexDesktopGroup": "Codex 桌面",
-  "settings.codexThemeRowDesc": "注入皮肤覆盖 Codex Desktop 原生外观",
+  "settings.codexThemeRowDesc": "修改 Codex Desktop 外观",
   "settings.codexSnapshotTitle": "Codex 配置快照",
-  "common.back": "返回"
-} as Record<string, string>
+  "common.back": "返回",
+  "settings.groupAppearance": "外观与语言",
+  "settings.groupStartup": "启动与配置",
+  "settings.groupCodexIntegration": "Codex 集成",
+  "settings.groupCodexConfig": "Codex 配置",
+  "settings.groupAdvanced": "高级",
+  "settings.themeDesc": "应用主题:白 / 黑 / 米",
+  "settings.themeLight": "白",
+  "settings.themeDark": "黑",
+  "settings.themeInkwash": "米",
+  "settings.langDesc": "界面显示语言",
+  "settings.fontBody": "正文字体",
+  "settings.fontBodyDesc": "界面正文字体(默认米:系统)",
+  "settings.fontHeading": "标题字体",
+  "settings.fontHeadingDesc": "标题 / 分组名字体(默认米:宋体)",
+  "settings.fontMono": "等宽字体",
+  "settings.fontMonoDesc": "代码 / JSON 等宽显示字体",
+  "settings.fontSize": "字号",
+  "settings.fontSizeDesc": "界面整体字号缩放",
+  "settings.fontSystem": "系统",
+  "settings.fontSongti": "宋体",
+  "settings.fontKaiti": "楷体",
+  "settings.fontRounded": "圆体",
+  "settings.fontMonoLabel": "等宽",
+  "settings.fontSizeSmall": "小",
+  "settings.fontSizeNormal": "标准",
+  "settings.fontSizeLarge": "大",
+  "settings.exposeAllModelsDesc": "OpenAI 模型菜单展示全部模型",
+  "settings.proxyPortDesc": "本地转发代理监听端口(改后需重启生效)",
+  "settings.adminPortDesc": "管理 API 端口(改后需重启生效)",
+  "settings.updateUrlDesc": "更新检查地址",
+  "providerForm.titleEdit": "编辑提供商",
+  "providerForm.titleAdd": "添加提供商",
+  "providerForm.name": "名称",
+  "providerForm.apiKeyEditHint": "留空保持原 key 不变",
+  "providerForm.apiFormat": "协议格式",
+  "providerForm.authScheme": "鉴权方式",
+  "providerForm.modelMapSection": "模型映射 · Codex 槽位 → 上游模型 id",
+  "providerForm.slotFallbackPlaceholder": "留空回落默认模型",
+  "providerForm.reviewModelSlot": "Review 模型槽",
+  "providerForm.reviewModelSlotDesc": "/review 使用的槽位(留空 = default)",
+  "providerForm.advancedToggle": "高级 · 额外请求头 / 模型能力 / 请求选项(JSON)",
+  "providerForm.extraHeaders": "额外请求头",
+  "providerForm.modelCapabilities": "模型能力",
+  "providerForm.requestOptions": "请求选项",
+  "providerForm.saving": "保存中…",
+  "providerForm.errNotFound": "未找到该提供商",
+  "providerForm.errRequired": "名称和 Base URL 必填",
+  "providerForm.errSaveFailed": "保存失败",
+  "providerForm.errJsonInvalid": "{label} 不是合法 JSON",
+  "providerForm.errJsonNotObject": "{label} 必须是 JSON 对象",
+  "providers.saved": "提供商已保存",
+  "providers.loading": "加载中…",
+  "providers.enableFailed": "启用失败",
+} as Record<string, string>;

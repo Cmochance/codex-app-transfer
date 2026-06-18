@@ -69,7 +69,7 @@ async function onEnable(id: string) {
   try {
     await store.setDefault(id)
   } catch (e) {
-    toast((e as Error).message || '启用失败', 'error')
+    toast((e as Error).message || t('providers.enableFailed'), 'error')
   }
 }
 function onEdit(id: string) {
@@ -77,7 +77,7 @@ function onEdit(id: string) {
   formOpen.value = true
 }
 function onRemove(id: string) {
-  if (window.confirm('确认删除该提供商？')) store.remove(id)
+  if (window.confirm(t('providers.deleteMessage'))) store.remove(id)
 }
 </script>
 
@@ -100,9 +100,9 @@ function onRemove(id: string) {
       />
     </div>
 
-    <div v-if="store.loading" class="providers__hint">加载中…</div>
+    <div v-if="store.loading" class="providers__hint">{{ t('providers.loading') }}</div>
     <div v-else-if="store.error" class="providers__hint providers__hint--err">{{ store.error }}</div>
-    <div v-else-if="!store.list.length" class="providers__hint">暂无提供商，点击右上角添加</div>
+    <div v-else-if="!store.list.length" class="providers__hint">{{ t('providers.empty') }}</div>
 
     <div v-else class="providers__list">
       <div
@@ -129,7 +129,7 @@ function onRemove(id: string) {
       v-if="formOpen"
       :edit-id="formEditId"
       @close="formOpen = false"
-      @saved="toast('提供商已保存')"
+      @saved="toast(t('providers.saved'))"
     />
   </div>
 </template>

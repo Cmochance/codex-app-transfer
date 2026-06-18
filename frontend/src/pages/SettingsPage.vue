@@ -30,7 +30,7 @@ async function persist(partial: Settings) {
     const warn = await store.save(partial)
     if (warn) toast(warn, 'error')
   } catch (e) {
-    toast((e as Error).message || '保存失败', 'error')
+    toast((e as Error).message || t('theme.saveFailed'), 'error')
   }
 }
 
@@ -67,16 +67,16 @@ const language = computed<'zh' | 'en'>({
   },
 })
 const themeOptions: { value: Appearance; label: string }[] = [
-  { value: 'light', label: '白' },
-  { value: 'dark', label: '黑' },
-  { value: 'inkwash', label: '国风' },
+  { value: 'light', label: t('settings.themeLight') },
+  { value: 'dark', label: t('settings.themeDark') },
+  { value: 'inkwash', label: t('settings.themeInkwash') },
 ]
 const langOptions: { value: 'zh' | 'en'; label: string }[] = [
   { value: 'zh', label: '中文' },
   { value: 'en', label: 'EN' },
 ]
 
-// 字体:按角色(正文/标题/等宽)+ 字号,纯 localStorage(useFont)。默认值 = 国风原字体。
+// 字体:按角色(正文/标题/等宽)+ 字号,纯 localStorage(useFont)。默认值 = 米原字体。
 const font = useFont()
 const bodyFont = computed<FontChoice>({ get: () => font.body.value, set: (v) => font.setRole('body', v) })
 const headingFont = computed<FontChoice>({
@@ -86,25 +86,25 @@ const headingFont = computed<FontChoice>({
 const monoFont = computed<FontChoice>({ get: () => font.mono.value, set: (v) => font.setRole('mono', v) })
 const fontSize = computed<FontSize>({ get: () => font.size.value, set: (v) => font.setSize(v) })
 const bodyFontOptions: { value: FontChoice; label: string }[] = [
-  { value: 'system', label: '系统' },
-  { value: 'songti', label: '宋体' },
-  { value: 'kaiti', label: '楷体' },
-  { value: 'rounded', label: '圆体' },
+  { value: 'system', label: t('settings.fontSystem') },
+  { value: 'songti', label: t('settings.fontSongti') },
+  { value: 'kaiti', label: t('settings.fontKaiti') },
+  { value: 'rounded', label: t('settings.fontRounded') },
 ]
 const headingFontOptions: { value: FontChoice; label: string }[] = [
-  { value: 'songti', label: '宋体' },
-  { value: 'kaiti', label: '楷体' },
-  { value: 'system', label: '系统' },
+  { value: 'songti', label: t('settings.fontSongti') },
+  { value: 'kaiti', label: t('settings.fontKaiti') },
+  { value: 'system', label: t('settings.fontSystem') },
 ]
 const monoFontOptions: { value: FontChoice; label: string }[] = [
-  { value: 'mono', label: '等宽' },
-  { value: 'songti', label: '宋体' },
-  { value: 'system', label: '系统' },
+  { value: 'mono', label: t('settings.fontMonoLabel') },
+  { value: 'songti', label: t('settings.fontSongti') },
+  { value: 'system', label: t('settings.fontSystem') },
 ]
 const fontSizeOptions: { value: FontSize; label: string }[] = [
-  { value: 'small', label: '小' },
-  { value: 'normal', label: '标准' },
-  { value: 'large', label: '大' },
+  { value: 'small', label: t('settings.fontSizeSmall') },
+  { value: 'normal', label: t('settings.fontSizeNormal') },
+  { value: 'large', label: t('settings.fontSizeLarge') },
 ]
 
 // webFetchBackend(off/auto/curl/wreq/headless;仅 off/auto 有 i18n,余技术名)
@@ -131,28 +131,28 @@ function onUpdateUrl(e: Event) {
 
 <template>
   <div>
-    <SettingsGroup title="外观与语言">
-      <SettingsRow :title="t('settings.theme')" description="应用主题:白 / 黑 / 国风">
+    <SettingsGroup :title="t('settings.groupAppearance')">
+      <SettingsRow :title="t('settings.theme')" :description="t('settings.themeDesc')">
         <SegmentedControl v-model="theme" :options="themeOptions" />
       </SettingsRow>
-      <SettingsRow :title="t('settings.language')" description="界面显示语言">
+      <SettingsRow :title="t('settings.language')" :description="t('settings.langDesc')">
         <SegmentedControl v-model="language" :options="langOptions" />
       </SettingsRow>
-      <SettingsRow title="正文字体" description="界面正文字体(默认国风:系统)">
+      <SettingsRow :title="t('settings.fontBody')" :description="t('settings.fontBodyDesc')">
         <AppSelect v-model="bodyFont" :options="bodyFontOptions" class="font-select" />
       </SettingsRow>
-      <SettingsRow title="标题字体" description="标题 / 分组名字体(默认国风:宋体)">
+      <SettingsRow :title="t('settings.fontHeading')" :description="t('settings.fontHeadingDesc')">
         <AppSelect v-model="headingFont" :options="headingFontOptions" class="font-select" />
       </SettingsRow>
-      <SettingsRow title="等宽字体" description="代码 / JSON 等宽显示字体">
+      <SettingsRow :title="t('settings.fontMono')" :description="t('settings.fontMonoDesc')">
         <AppSelect v-model="monoFont" :options="monoFontOptions" class="font-select" />
       </SettingsRow>
-      <SettingsRow title="字号" description="界面整体字号缩放">
+      <SettingsRow :title="t('settings.fontSize')" :description="t('settings.fontSizeDesc')">
         <SegmentedControl v-model="fontSize" :options="fontSizeOptions" />
       </SettingsRow>
     </SettingsGroup>
 
-    <SettingsGroup title="启动与配置">
+    <SettingsGroup :title="t('settings.groupStartup')">
       <SettingsRow :title="t('settings.autoApplyOnStart')" :description="t('settings.autoApplyOnStartHint')">
         <AppSwitch v-model="autoApplyOnStart" />
       </SettingsRow>
@@ -170,7 +170,7 @@ function onUpdateUrl(e: Event) {
       </SettingsRow>
     </SettingsGroup>
 
-    <SettingsGroup title="Codex 集成">
+    <SettingsGroup :title="t('settings.groupCodexIntegration')">
       <SettingsRow :title="t('settings.codexQuotaEnabled')" :description="t('settings.codexQuotaEnabledHint')">
         <AppSwitch v-model="codexQuotaEnabled" />
       </SettingsRow>
@@ -186,7 +186,7 @@ function onUpdateUrl(e: Event) {
       </SettingsRow>
     </SettingsGroup>
 
-    <SettingsGroup title="Codex 配置">
+    <SettingsGroup :title="t('settings.groupCodexConfig')">
       <RouterLink to="/desktop" class="nav-row">
         <div class="nav-row__text">
           <div class="nav-row__title">{{ t('desktop.title') }}</div>
@@ -198,8 +198,8 @@ function onUpdateUrl(e: Event) {
       <SnapshotPanel />
     </SettingsGroup>
 
-    <SettingsGroup title="高级">
-      <SettingsRow :title="t('settings.exposeAllModels')" description="OpenAI 模型菜单展示全部模型">
+    <SettingsGroup :title="t('settings.groupAdvanced')">
+      <SettingsRow :title="t('settings.exposeAllModels')" :description="t('settings.exposeAllModelsDesc')">
         <AppSwitch v-model="exposeAllProviderModels" />
       </SettingsRow>
       <SettingsRow :title="t('settings.showGrayProviders')" :description="t('settings.showGrayProvidersHint')">
@@ -211,7 +211,7 @@ function onUpdateUrl(e: Event) {
       >
         <AppSwitch v-model="mcpCredentialsPortableStore" />
       </SettingsRow>
-      <SettingsRow :title="t('settings.proxyPort')" description="本地转发代理监听端口(改后需重启生效)">
+      <SettingsRow :title="t('settings.proxyPort')" :description="t('settings.proxyPortDesc')">
         <input
           type="number"
           class="settings-num"
@@ -221,7 +221,7 @@ function onUpdateUrl(e: Event) {
           @change="onPort('proxyPort', $event)"
         />
       </SettingsRow>
-      <SettingsRow :title="t('settings.adminPort')" description="管理 API 端口(改后需重启生效)">
+      <SettingsRow :title="t('settings.adminPort')" :description="t('settings.adminPortDesc')">
         <input
           type="number"
           class="settings-num"
@@ -231,7 +231,7 @@ function onUpdateUrl(e: Event) {
           @change="onPort('adminPort', $event)"
         />
       </SettingsRow>
-      <SettingsRow :title="t('settings.updateUrl')" description="自定义更新检查地址(留空用默认)">
+      <SettingsRow :title="t('settings.updateUrl')" :description="t('settings.updateUrlDesc')">
         <input
           type="text"
           class="settings-input"

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { t, tFmt } from '@/i18n'
 import { useProvidersStore } from '@/stores/providers'
 import * as providersApi from '@/api/providers'
 import type { ProviderPayload } from '@/api/types'
@@ -16,7 +17,7 @@ const store = useProvidersStore()
 
 // Codex 槽位 → 上游模型 id 映射(对齐后端 models 字段 + 旧 providerFormDefaultRows)
 const MODEL_SLOTS = [
-  { key: 'default', label: '默认模型' },
+  { key: 'default', label: t('models.defaultModel') },
   { key: 'gpt_5_5', label: 'gpt-5.5' },
   { key: 'gpt_5_4', label: 'gpt-5.4' },
   { key: 'gpt_5_4_mini', label: 'gpt-5.4-mini' },
@@ -56,17 +57,17 @@ const formatOptions = [
 const authOptions = [
   { value: 'bearer', label: 'Bearer' },
   { value: 'x-api-key', label: 'x-api-key' },
-  { value: 'none', label: '无' },
+  { value: 'none', label: t('codex.statusNone') },
 ]
 const isEdit = computed(() => !!props.editId)
-const title = computed(() => (isEdit.value ? '编辑提供商' : '添加提供商'))
+const title = computed(() => (isEdit.value ? t('providerForm.titleEdit') : t('providerForm.titleAdd')))
 
 onMounted(async () => {
   if (!props.editId) return
   if (!store.list.length) await store.load().catch(() => {})
   const p = store.list.find((x) => x.id === props.editId)
   if (!p) {
-    error.value = '未找到该提供商'
+    error.value = t('providerForm.errNotFound')
     return
   }
   form.name = p.name
@@ -93,24 +94,25 @@ function parseJsonObj(label: string, raw: string): Record<string, unknown> | und
   try {
     v = JSON.parse(trimmed)
   } catch {
-    throw new Error(`${label} 不是合法 JSON`)
+    throw new Error(tFmt('providerForm.errJsonInvalid', { label }))
   }
-  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`${label} 必须是 JSON 对象`)
+  if (!v || typeof v !== 'object' || Array.isArray(v))
+    throw new Error(tFmt('providerForm.errJsonNotObject', { label }))
   return v as Record<string, unknown>
 }
 
 async function save() {
   if (!form.name.trim() || !form.baseUrl.trim()) {
-    error.value = '名称和 Base URL 必填'
+    error.value = t('providerForm.errRequired')
     return
   }
   let extraHeaders: Record<string, unknown> | undefined
   let modelCapabilities: Record<string, unknown> | undefined
   let requestOptions: Record<string, unknown> | undefined
   try {
-    extraHeaders = parseJsonObj('额外请求头', form.extraHeaders)
-    modelCapabilities = parseJsonObj('模型能力', form.modelCapabilities)
-    requestOptions = parseJsonObj('请求选项', form.requestOptions)
+    extraHeaders = parseJsonObj(t('providerForm.extraHeaders'), form.extraHeaders)
+    modelCapabilities = parseJsonObj(t('providerForm.modelCapabilities'), form.modelCapabilities)
+    requestOptions = parseJsonObj(t('providerForm.requestOptions'), form.requestOptions)
   } catch (e) {
     error.value = (e as Error).message
     return
@@ -139,7 +141,7 @@ async function save() {
     emit('saved')
     emit('close')
   } catch (e) {
-    error.value = (e as Error).message || '保存失败'
+    error.value = (e as Error).message || t('providerForm.errSaveFailed')
   } finally {
     saving.value = false
   }
@@ -149,39 +151,39 @@ async function save() {
 <template>
   <AppModal :title="title" @close="emit('close')">
     <div class="pf">
-      <SettingsRow title="名称">
+      <SettingsRow :title="t('providerForm.name')">
         <AppInput v-model="form.name" placeholder="My Provider" />
       </SettingsRow>
       <SettingsRow title="Base URL">
         <AppInput v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
-      <SettingsRow title="API Key" :description="isEdit ? '留空保持原 key 不变' : ''">
+      <SettingsRow title="API Key" :description="isEdit ? t('providerForm.apiKeyEditHint') : ''">
         <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
       </SettingsRow>
-      <SettingsRow title="协议格式">
+      <SettingsRow :title="t('providerForm.apiFormat')">
         <SegmentedControl v-model="form.apiFormat" :options="formatOptions" />
       </SettingsRow>
-      <SettingsRow title="鉴权方式">
+      <SettingsRow :title="t('providerForm.authScheme')">
         <SegmentedControl v-model="form.authScheme" :options="authOptions" />
       </SettingsRow>
 
-      <div class="pf__section">模型映射 · Codex 槽位 → 上游模型 id</div>
+      <div class="pf__section">{{ t('providerForm.modelMapSection') }}</div>
       <SettingsRow v-for="s in MODEL_SLOTS" :key="s.key" :title="s.label">
         <AppInput
           v-model="form.models[s.key]"
-          :placeholder="s.key === 'default' ? 'gpt-4o' : '留空回落默认模型'"
+          :placeholder="s.key === 'default' ? 'gpt-4o' : t('providerForm.slotFallbackPlaceholder')"
         />
       </SettingsRow>
-      <SettingsRow title="Review 模型槽" description="/review 使用的槽位(留空 = default)">
+      <SettingsRow :title="t('providerForm.reviewModelSlot')" :description="t('providerForm.reviewModelSlotDesc')">
         <AppInput v-model="form.reviewModelSlot" placeholder="default" />
       </SettingsRow>
 
       <button type="button" class="pf__adv" @click="showAdvanced = !showAdvanced">
-        {{ showAdvanced ? '▾' : '▸' }} 高级 · 额外请求头 / 模型能力 / 请求选项(JSON)
+        {{ showAdvanced ? '▾' : '▸' }} {{ t('providerForm.advancedToggle') }}
       </button>
       <template v-if="showAdvanced">
         <div class="pf__field">
-          <label>额外请求头 extraHeaders</label>
+          <label>{{ t('providerForm.extraHeaders') }} extraHeaders</label>
           <textarea
             v-model="form.extraHeaders"
             class="pf__json"
@@ -190,7 +192,7 @@ async function save() {
           ></textarea>
         </div>
         <div class="pf__field">
-          <label>模型能力 modelCapabilities</label>
+          <label>{{ t('providerForm.modelCapabilities') }} modelCapabilities</label>
           <textarea
             v-model="form.modelCapabilities"
             class="pf__json"
@@ -199,15 +201,20 @@ async function save() {
           ></textarea>
         </div>
         <div class="pf__field">
-          <label>请求选项 requestOptions</label>
+          <label>{{ t('providerForm.requestOptions') }} requestOptions</label>
           <textarea v-model="form.requestOptions" class="pf__json" spellcheck="false"></textarea>
         </div>
       </template>
 
       <div v-if="error" class="pf__error">{{ error }}</div>
       <div class="pf__actions">
-        <AppButton variant="ghost" label="取消" @click="emit('close')" />
-        <AppButton variant="primary" :label="saving ? '保存中…' : '保存'" :disabled="saving" @click="save" />
+        <AppButton variant="ghost" :label="t('common.cancel')" @click="emit('close')" />
+        <AppButton
+          variant="primary"
+          :label="saving ? t('providerForm.saving') : t('common.save')"
+          :disabled="saving"
+          @click="save"
+        />
       </div>
     </div>
   </AppModal>

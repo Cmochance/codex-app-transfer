@@ -15,7 +15,7 @@ interface ThemeOption {
 const themes: ThemeOption[] = [
   { key: 'light', icon: IconSun, label: '白' },
   { key: 'dark', icon: IconMoon, label: '黑' },
-  { key: 'inkwash', icon: IconBrush, label: '国风' },
+  { key: 'inkwash', icon: IconBrush, label: '米' },
 ]
 </script>
 

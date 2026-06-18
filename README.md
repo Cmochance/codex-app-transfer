@@ -230,7 +230,7 @@ forward 分页详情为调 adapter 准备了几件利器(借鉴 [`liaohch3/claud
 cargo tauri dev    # 经 beforeDevCommand 拉起 vite (localhost:1420) + HMR,改 .vue/.ts 自动刷新
 ```
 
-打包:`npm --prefix frontend run build` 出 `frontend/dist/`,被 `src-tauri` 的 `include_dir!` 编进二进制(prod 走 `cas://localhost/` 加载,严格 CSP `script-src 'self'`)。MacBook 风设计系统与三套主题(白 / 黑 / 国风)随重构阶段落地。
+打包:`npm --prefix frontend run build` 出 `frontend/dist/`,被 `src-tauri` 的 `include_dir!` 编进二进制(prod 走 `cas://localhost/` 加载,严格 CSP `script-src 'self'`)。MacBook 风设计系统与三套主题(白 / 黑 / 米)随重构阶段落地。
 
 ## 常见问题
 
@@ -325,7 +325,7 @@ v2.1.12+ 的客户端 **强制** RSA-3072 PKCS#1-v1.5-SHA256 验签 `latest.json
 
 - **后端 / 转发**:Rust 1.85+ · axum 0.8 · reqwest 0.12(rustls-tls)· tokio · `wreq` 6.0-rc(浏览器 TLS 指纹伪装,Chrome 120 指纹,curl/wreq/headless 三层声称同一版本避免身份漂移,给 Cloudflare 强保的 `openai.com` / `chatgpt.com` 用,详见 `crates/http/`)· `sys-locale`(读系统语言区域,生成 locale-aware `Accept-Language` 减少 UA 粗筛误拦)· `base64`(Bing `ck/a` 跳转解码)· `chromiumoxide` 0.9(headless Chromium,抓 ①reqwest / ②wreq 都拿不到的 JS 渲染 SPA —— 探测系统 Chrome,否则按需下载 chrome-headless-shell 到 app data,不打包进安装包;目前为 PoC,接入分层 router 待后续 PR,见 `crates/http/src/headless/`)· `crates/http::web_fetch`(统一抓取层,按设置页档位路由 curl/wreq/headless;配套 `GET /api/chrome/detect` + `POST /api/chrome/ensure`;`webFetchBackend != off` 时自动往 `~/.codex/config.toml` 注册 `[mcp_servers.cat-webfetch]`(stdio MCP server,transfer 自身 + `--mcp-serve-webfetch`),让 Codex 模型可调 `web_fetch` / `web_search` 工具)
 - **协议适配**:`crates/adapters/` — Responses ↔ Chat / Gemini Native / Gemini CLI OAuth / Anthropic Messages / Grok Web 互转(请求 body + 流式响应状态机 + reasoning_content + tool_calls)
-- **前端**:Vue 3 + Vite + TypeScript(SFC + Pinia + vue-router;源码 `frontend/src/`,`frontend/dist` 经 `include_dir!` 编入二进制,prod 走 `cas://localhost/` + 严格 CSP `script-src 'self'`;MacBook 风设计 + 三套主题 白/黑/国风)
+- **前端**:Vue 3 + Vite + TypeScript(SFC + Pinia + vue-router;源码 `frontend/src/`,`frontend/dist` 经 `include_dir!` 编入二进制,prod 走 `cas://localhost/` + 严格 CSP `script-src 'self'`;MacBook 风设计 + 三套主题 白/黑/米)
 - **桌面壳**:Tauri 2 + tray-icon 0.23,通过 `cas://` URI scheme 把 frontend/ 与 axum 同进程串起来,无 TCP loopback
 - **存储**:`~/.codex-app-transfer/config.json`(配置,与 v1.x 互通)、`~/.codex-app-transfer/sessions.db`(L2 sqlite 会话持久化)、`~/.codex-app-transfer/blobs/`(会话内大图按 sha256 去重外置,删 db 不会自动清,需一并删或走 `POST /api/sessions/clear`)、`~/.codex/{config.toml,auth.json,.credentials.json}`(Codex APP 集成)、`~/.codex-app-transfer/mcp-credentials.json`(MCP 凭据镜像,在 `~/.codex` 之外)
 - **打包**:`cargo tauri build` 单命令出 dmg/AppImage/deb/exe/msi;`xtask release-bundle` 收口出 sha256 + RSA-3072 sig + latest.json + draft GitHub release
