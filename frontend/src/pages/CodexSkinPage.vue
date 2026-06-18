@@ -15,8 +15,6 @@ import {
   restartCodexApp,
   type ThemeEntry,
 } from '@/api/desktop'
-import SettingsGroup from '@/components/ui/SettingsGroup.vue'
-import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
@@ -52,7 +50,7 @@ const hiddenCount = computed(() => hiddenIds.value.length)
 const hasCustomVisible = computed(() => visibleThemes.value.some((th) => th.id === 'custom'))
 
 // 分页(8/页;最后一页带「添加自定义」卡)
-const PAGE_SIZE = 8
+const PAGE_SIZE = 12
 const page = ref(1)
 const totalPages = computed(() => Math.max(1, Math.ceil(visibleThemes.value.length / PAGE_SIZE)))
 const pagedThemes = computed(() =>
@@ -340,23 +338,18 @@ async function onRestartChoice(choice: 'now' | 'later') {
         <IconChevronLeft class="back-icon" />
         {{ t('common.back') }}
       </RouterLink>
-      <AppButton
-        variant="secondary"
-        size="sm"
-        :icon="IconRefreshCw"
-        :label="t('theme.restartCodexBtn')"
-        @click="restartCodex"
-      />
+      <div class="head-actions">
+        <span v-if="badge" class="status-badge">{{ badge }}</span>
+        <AppSwitch v-model="enabledModel" />
+        <AppButton
+          variant="secondary"
+          size="sm"
+          :icon="IconRefreshCw"
+          :label="t('theme.restartCodexBtn')"
+          @click="restartCodex"
+        />
+      </div>
     </header>
-
-    <SettingsGroup>
-      <SettingsRow :title="t('theme.toggleLabel')">
-        <div class="toggle-wrap">
-          <span v-if="badge" class="status-badge">{{ badge }}</span>
-          <AppSwitch v-model="enabledModel" />
-        </div>
-      </SettingsRow>
-    </SettingsGroup>
 
     <section class="theme-section">
       <div v-if="hiddenCount > 0" class="theme-bar">
@@ -477,7 +470,7 @@ async function onRestartChoice(choice: 'now' | 'later') {
   line-height: 1.5;
   margin: 0;
 }
-.toggle-wrap {
+.head-actions {
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -488,7 +481,7 @@ async function onRestartChoice(choice: 'now' | 'later') {
   white-space: nowrap;
 }
 .theme-section {
-  margin-top: var(--space-5);
+  margin-top: 0;
 }
 .theme-bar {
   display: flex;
