@@ -12,6 +12,8 @@ import AppCombobox from '@/components/ui/AppCombobox.vue'
 import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
+import OAuthLoginSection from '@/components/provider/OAuthLoginSection.vue'
+import type { OAuthKind } from '@/api/oauth'
 import { useToast } from '@/composables/useToast'
 
 // editId 为空 = 添加;非空 = 编辑(从 store 取数据 + 拉 secret 回填)
@@ -77,6 +79,7 @@ const form = reactive({
   extraHeaders: '',
   modelCapabilities: '',
   requestOptions: '',
+  grokSso: '',
 })
 const saving = ref(false)
 const error = ref('')
@@ -108,6 +111,22 @@ const baseUrlOptions = computed(() =>
 // 鉴权方式由 preset 决定且被后端 healing(ENFORCED_BUILTIN_FIELDS)强制覆盖,
 // 用户在此设置无效 → 内置 / 命中 preset 时隐藏, 仅自定义 provider 可选。
 const showAuthScheme = computed(() => !isBuiltin.value && !matchedPreset.value)
+
+// OAuth 账号登录类 provider(按 authScheme 判定, 添加经 preset 预填 / 编辑从后端回填均适用):
+// 这些用浏览器授权登录, 用登录区取代 API Key 输入。
+const OAUTH_KIND_BY_AUTH: Record<string, OAuthKind> = {
+  zai_oauth: 'zai',
+  bigmodel_oauth: 'bigmodel',
+  google_oauth_cloud_code: 'gemini',
+  gemini_cli_oauth: 'gemini',
+  google_oauth_antigravity: 'antigravity',
+  antigravity_oauth: 'antigravity',
+}
+const oauthKind = computed<OAuthKind | null>(() => OAUTH_KIND_BY_AUTH[form.authScheme] ?? null)
+// grok-web 不是 OAuth, 走粘贴 grok.com SSO cookie。
+const isGrokWeb = computed(
+  () => form.authScheme === 'grok_cookie' || form.apiFormat === 'grok_web',
+)
 
 // ── 名称下拉:可选内置预设(选中预填全部默认)或「自定义」(全手填) ──
 const CUSTOM_LABEL = t('providerForm.customOption')
@@ -283,6 +302,10 @@ async function save() {
     modelCapabilities,
     requestOptions,
   }
+  // grok-web:粘贴的 SSO cookie 封进 grokWeb.cookies.sso(留空=编辑时保持原值)
+  if (isGrokWeb.value && form.grokSso.trim()) {
+    payload.grokWeb = { cookies: { sso: form.grokSso.trim() } }
+  }
   saving.value = true
   error.value = ''
   try {
@@ -318,7 +341,13 @@ async function save() {
         />
         <AppInput v-else v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
-      <SettingsRow title="API Key">
+      <SettingsRow v-if="oauthKind" :title="t('providerForm.account')">
+        <OAuthLoginSection :key="oauthKind" :kind="oauthKind!" />
+      </SettingsRow>
+      <SettingsRow v-else-if="isGrokWeb" :title="t('providerForm.grokCookie')">
+        <AppInput v-model="form.grokSso" :placeholder="t('providerForm.grokCookiePlaceholder')" />
+      </SettingsRow>
+      <SettingsRow v-else title="API Key">
         <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
       </SettingsRow>
       <SettingsRow :title="t('providerForm.apiFormat')">
