@@ -40,9 +40,9 @@ export function themeDeleteCustom() {
 export function restartCodexApp() {
   return api('POST', '/api/desktop/restart-codex-app')
 }
-// 在系统文件管理器打开本应用数据目录(~/.codex-app-transfer/,含原配置快照/备份)
-export function openCodexConfigDir() {
-  return api('POST', '/api/desktop/open-config-dir')
+// 在系统文件管理器打开 Codex 原配置快照目录(~/.codex-app-transfer/codex-snapshots/active/)
+export function openSnapshotDir() {
+  return api('POST', '/api/desktop/open-snapshot-dir')
 }
 
 // ───────────────────────────────────────────────────────────────────────────

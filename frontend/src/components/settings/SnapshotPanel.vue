@@ -5,7 +5,7 @@ import { computed, onMounted, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import { useCodexRestore } from '@/composables/useCodexRestore'
-import { getDesktopSnapshotStatus, openCodexConfigDir } from '@/api/desktop'
+import { getDesktopSnapshotStatus, openSnapshotDir } from '@/api/desktop'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 
@@ -47,7 +47,7 @@ async function onRestore() {
 
 async function onOpenFolder() {
   try {
-    await openCodexConfigDir()
+    await openSnapshotDir()
   } catch (e) {
     toast(errMsg(e), 'error')
   }
@@ -60,7 +60,7 @@ async function onOpenFolder() {
       <span class="snap-title">{{ t('settings.codexSnapshotTitle') }}</span>
     </template>
     <div class="snap-actions">
-      <AppButton size="sm" variant="ghost" :label="t('settings.openConfigFolder')" @click="onOpenFolder" />
+      <AppButton size="sm" variant="secondary" :label="t('settings.openConfigFolder')" @click="onOpenFolder" />
       <AppButton size="sm" variant="secondary" :label="t('desktop.clear')" @click="onRestore" />
     </div>
   </SettingsRow>

@@ -305,16 +305,20 @@ pub async fn restart_codex_app(State(state): State<crate::admin::AdminState>) ->
     }
 }
 
-/// POST /api/desktop/open-config-dir — 在系统文件管理器打开本应用数据目录
-/// (`~/.codex-app-transfer/`,内含 Codex 原配置快照 / 备份),方便用户查找。
-pub async fn open_config_dir() -> impl IntoResponse {
-    let Some(dir) = codex_app_transfer_registry::paths::config_dir() else {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位数据目录").into_response();
+/// POST /api/desktop/open-snapshot-dir — 在系统文件管理器打开 Codex 原配置快照目录
+/// (`~/.codex-app-transfer/codex-snapshots/active/`,内含各次 pre-apply 快照的
+/// config.toml / auth.json / manifest.json),方便用户查找备份的原始配置。
+pub async fn open_snapshot_dir() -> impl IntoResponse {
+    let dir = match CodexPaths::from_home_env() {
+        Ok(p) => p.active_snapshots_dir,
+        Err(_) => {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位快照目录").into_response()
+        }
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("创建数据目录失败: {e}"),
+            format!("创建快照目录失败: {e}"),
         )
         .into_response();
     }

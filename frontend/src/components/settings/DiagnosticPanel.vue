@@ -94,7 +94,7 @@ async function onOpen() {
         <AppButton
           v-if="showOpenBtn"
           size="sm"
-          variant="ghost"
+          variant="secondary"
           :label="t('settings.openTraceViewer')"
           @click="onOpen"
         />
