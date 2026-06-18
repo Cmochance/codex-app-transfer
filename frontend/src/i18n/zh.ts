@@ -965,7 +965,6 @@ export default {
   "providerForm.titleEdit": "编辑提供商",
   "providerForm.titleAdd": "添加提供商",
   "providerForm.name": "名称",
-  "providerForm.nameHint": "选预设自动预填，或手输自定义名称",
   "providerForm.customOption": "自定义",
   "providerForm.apiKeyEditHint": "留空保持原 key 不变",
   "providerForm.apiFormat": "协议格式",

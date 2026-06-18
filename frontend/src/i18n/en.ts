@@ -821,7 +821,6 @@ export default {
   "providerForm.titleEdit": "Edit Provider",
   "providerForm.titleAdd": "Add Provider",
   "providerForm.name": "Name",
-  "providerForm.nameHint": "Pick a preset to prefill, or type a custom name",
   "providerForm.customOption": "Custom",
   "providerForm.apiKeyEditHint": "Leave blank to keep the existing key",
   "providerForm.apiFormat": "Protocol Format",

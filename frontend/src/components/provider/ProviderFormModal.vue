@@ -9,6 +9,7 @@ import AppModal from '@/components/ui/AppModal.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppInput from '@/components/ui/AppInput.vue'
 import AppCombobox from '@/components/ui/AppCombobox.vue'
+import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import { useToast } from '@/composables/useToast'
@@ -83,8 +84,27 @@ const showAdvanced = ref(false)
 const isBuiltin = ref(false)
 const fetching = ref(false)
 const availableModels = ref<string[]>([])
-// 预设(内置)provider 不支持自定义鉴权 → 隐藏;第三方可自选(authScheme 已接后端 providerBody)
-const showAuthScheme = computed(() => !isBuiltin.value)
+
+// baseUrl 归一(去 scheme / 末尾斜杠 / 大小写)后反查命中的内置 preset。
+// 对齐后端 healing 的 baseUrl→preset 匹配:命中即视作内置 provider。
+const normUrl = (u: string) =>
+  u.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '')
+const matchedPreset = computed(() => {
+  const cur = normUrl(form.baseUrl)
+  if (!cur) return null
+  return (
+    presets.value.find(
+      (p) =>
+        normUrl(p.baseUrl) === cur ||
+        (p.baseUrlOptions || []).some((o) => normUrl(o.value) === cur),
+    ) || null
+  )
+})
+// 命中 preset 且其带多个备选 baseUrl(如小米 MiMo Token Plan 三集群)→ baseUrl 用下拉
+const baseUrlOptions = computed(() => matchedPreset.value?.baseUrlOptions ?? [])
+// 鉴权方式由 preset 决定且被后端 healing(ENFORCED_BUILTIN_FIELDS)强制覆盖,
+// 用户在此设置无效 → 内置 / 命中 preset 时隐藏, 仅自定义 provider 可选。
+const showAuthScheme = computed(() => !isBuiltin.value && !matchedPreset.value)
 
 // ── 名称下拉:可选内置预设(选中预填全部默认)或「自定义」(全手填) ──
 const CUSTOM_LABEL = t('providerForm.customOption')
@@ -279,7 +299,7 @@ async function save() {
 <template>
   <AppModal :title="title" wide @close="emit('close')">
     <div class="pf">
-      <SettingsRow :title="t('providerForm.name')" :description="t('providerForm.nameHint')">
+      <SettingsRow :title="t('providerForm.name')">
         <AppCombobox
           v-model="form.name"
           :options="nameOptions"
@@ -287,8 +307,13 @@ async function save() {
           @select="onPickName"
         />
       </SettingsRow>
-      <SettingsRow title="Base URL">
-        <AppInput v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
+      <SettingsRow title="Base URL" :description="matchedPreset?.baseUrlHint || ''">
+        <AppSelect
+          v-if="baseUrlOptions.length >= 2"
+          v-model="form.baseUrl"
+          :options="baseUrlOptions"
+        />
+        <AppInput v-else v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
       <SettingsRow title="API Key" :description="isEdit ? t('providerForm.apiKeyEditHint') : ''">
         <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />

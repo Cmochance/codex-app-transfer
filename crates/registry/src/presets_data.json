@@ -168,7 +168,7 @@
   },
   {
     "id": "zhipu",
-    "name": "智谱 GLM",
+    "name": "GLM",
     "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
     "docsUrl": "https://docs.bigmodel.cn/cn/guide/develop/openai/introduction",
     "authScheme": "bearer",
@@ -273,7 +273,7 @@
   },
   {
     "id": "bailian",
-    "name": "阿里云百炼",
+    "name": "Aliyuncs",
     "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "docsUrl": "https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope",
     "authScheme": "bearer",

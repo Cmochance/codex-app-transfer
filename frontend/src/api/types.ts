@@ -34,7 +34,7 @@ export interface Preset {
   baseUrl: string
   apiFormat: string
   authScheme?: string
-  baseUrlOptions?: string[]
+  baseUrlOptions?: { label: string; value: string }[]
   baseUrlHint?: string
   allowApiFormatSelection?: boolean
   // 后端 /api/presets 透传的默认内容(选预设时整套预填), TS 之前未声明
