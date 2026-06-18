@@ -2,11 +2,13 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useProvidersStore } from '@/stores/providers'
+import { useSettingsStore } from '@/stores/settings'
 import * as providersApi from '@/api/providers'
-import type { ProviderPayload } from '@/api/types'
+import type { ProviderPayload, Preset } from '@/api/types'
 import AppModal from '@/components/ui/AppModal.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppInput from '@/components/ui/AppInput.vue'
+import AppCombobox from '@/components/ui/AppCombobox.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import { useToast } from '@/composables/useToast'
@@ -15,7 +17,36 @@ import { useToast } from '@/composables/useToast'
 const props = defineProps<{ editId?: string | null }>()
 const emit = defineEmits<{ close: []; saved: [] }>()
 const store = useProvidersStore()
+const settingsStore = useSettingsStore()
 const { show: toast } = useToast()
+
+// JSON 对象 → 缩进字符串(空对象/缺失返空), 供回填高级字段(编辑 / 选预设共用)
+function stringifyIfAny(o: Record<string, unknown> | undefined): string {
+  return o && Object.keys(o).length ? JSON.stringify(o, null, 2) : ''
+}
+
+// ── 获取到的模型清单本地持久化(按 baseUrl), 下次打开同上游 provider 无需重新「获取模型」──
+const MODEL_CACHE_PREFIX = 'cas:models:'
+const modelCacheKey = (baseUrl: string) => MODEL_CACHE_PREFIX + baseUrl.trim().replace(/\/+$/, '')
+function saveCachedModels(baseUrl: string, models: string[]) {
+  if (!baseUrl.trim() || !models.length) return
+  try {
+    localStorage.setItem(modelCacheKey(baseUrl), JSON.stringify(models))
+  } catch {
+    /* localStorage 不可用时静默跳过, 不影响主流程 */
+  }
+}
+function loadCachedModels(baseUrl: string) {
+  if (!baseUrl.trim()) return
+  try {
+    const raw = localStorage.getItem(modelCacheKey(baseUrl))
+    if (!raw) return
+    const arr = JSON.parse(raw)
+    if (Array.isArray(arr)) availableModels.value = arr.filter((x): x is string => typeof x === 'string')
+  } catch {
+    /* 解析失败忽略 */
+  }
+}
 
 // Codex 槽位 → 上游模型 id 映射(对齐后端 models 字段 + 旧 providerFormDefaultRows)
 const MODEL_SLOTS = [
@@ -55,6 +86,54 @@ const availableModels = ref<string[]>([])
 // 预设(内置)provider 不支持自定义鉴权 → 隐藏;第三方可自选(authScheme 已接后端 providerBody)
 const showAuthScheme = computed(() => !isBuiltin.value)
 
+// ── 名称下拉:可选内置预设(选中预填全部默认)或「自定义」(全手填) ──
+const CUSTOM_LABEL = t('providerForm.customOption')
+const presets = ref<Preset[]>([])
+// 名称下拉选项 = [自定义, ...预设名](灰色预设按「显示灰色提供商」开关过滤)
+const nameOptions = computed(() => [CUSTOM_LABEL, ...presets.value.map((p) => p.name)])
+
+// 选「自定义」→ 清空所有字段, 名称留空显示占位, 由用户全部手填
+function resetToCustom() {
+  form.name = ''
+  form.baseUrl = ''
+  form.apiKey = ''
+  form.apiFormat = 'openai_chat'
+  form.authScheme = 'bearer'
+  form.reviewModelSlot = ''
+  for (const s of MODEL_SLOTS) form.models[s.key] = ''
+  form.extraHeaders = ''
+  form.modelCapabilities = ''
+  form.requestOptions = ''
+  availableModels.value = []
+}
+
+// 选预设 → 预填该预设携带的全部默认内容(baseUrl / 协议 / 鉴权 / 模型映射 / 高级字段)
+function applyPreset(p: Preset) {
+  form.name = p.name
+  form.baseUrl = p.baseUrl || ''
+  form.apiKey = ''
+  form.apiFormat = p.apiFormat || 'openai_chat'
+  form.authScheme = p.authScheme || 'bearer'
+  form.reviewModelSlot = ''
+  for (const s of MODEL_SLOTS) form.models[s.key] = p.models?.[s.key] || ''
+  form.extraHeaders = stringifyIfAny(p.extraHeaders)
+  form.modelCapabilities = stringifyIfAny(p.modelCapabilities)
+  form.requestOptions = stringifyIfAny(p.requestOptions as Record<string, unknown> | undefined)
+  // 该上游若之前抓过模型, 带出缓存清单, 否则清空待用户「获取模型」
+  availableModels.value = []
+  loadCachedModels(form.baseUrl)
+}
+
+// 名称下拉显式点选(自由键入自定义名称不触发, 走 v-model 直更 form.name)
+function onPickName(picked: string) {
+  if (picked === CUSTOM_LABEL) {
+    resetToCustom()
+    return
+  }
+  const p = presets.value.find((x) => x.name === picked)
+  if (p) applyPreset(p)
+}
+
 // 获取上游可用模型(草稿走 form 当前值 → 用已输入/已回填的 key)
 async function fetchModels() {
   if (!form.baseUrl.trim()) {
@@ -79,15 +158,13 @@ async function fetchModels() {
           : (m as { id?: string; name?: string })?.id || (m as { name?: string })?.name || '',
       )
       .filter(Boolean)
+    saveCachedModels(form.baseUrl, availableModels.value)
     toast(tFmt('providerForm.modelsFetched', { count: availableModels.value.length }))
   } catch (e) {
     error.value = (e as Error).message || t('providerForm.modelsFetchFailed')
   } finally {
     fetching.value = false
   }
-}
-function pickModel(m: string) {
-  form.models.default = m
 }
 
 const formatOptions = [
@@ -105,6 +182,14 @@ const isEdit = computed(() => !!props.editId)
 const title = computed(() => (isEdit.value ? t('providerForm.titleEdit') : t('providerForm.titleAdd')))
 
 onMounted(async () => {
+  // 名称下拉的预设列表(添加 / 编辑都需要): 灰色预设按「显示灰色提供商」开关过滤
+  if (!settingsStore.loaded) await settingsStore.load().catch(() => {})
+  const showGray = settingsStore.bool('showGrayProviders', false)
+  await providersApi
+    .getPresets()
+    .then((list) => (presets.value = list.filter((p) => showGray || !p.gray)))
+    .catch(() => {})
+
   if (!props.editId) return
   if (!store.list.length) await store.load().catch(() => {})
   const p = store.list.find((x) => x.id === props.editId)
@@ -121,11 +206,11 @@ onMounted(async () => {
   for (const s of MODEL_SLOTS) {
     form.models[s.key] = (p.mappings as Record<string, string>)[s.key] || ''
   }
-  const stringifyIfAny = (o: Record<string, unknown> | undefined) =>
-    o && Object.keys(o).length ? JSON.stringify(o, null, 2) : ''
   form.extraHeaders = stringifyIfAny(p.extraHeaders)
   form.modelCapabilities = stringifyIfAny(p.modelCapabilities)
   form.requestOptions = stringifyIfAny(p.requestOptions)
+  // 该上游之前抓过模型 → 带出本地缓存清单, 无需重新「获取模型」即可切换映射
+  loadCachedModels(form.baseUrl)
   const secret = await providersApi.getProviderSecret(props.editId).catch(() => ({ apiKey: '' }))
   form.apiKey = secret.apiKey || ''
 })
@@ -194,8 +279,13 @@ async function save() {
 <template>
   <AppModal :title="title" wide @close="emit('close')">
     <div class="pf">
-      <SettingsRow :title="t('providerForm.name')">
-        <AppInput v-model="form.name" placeholder="My Provider" />
+      <SettingsRow :title="t('providerForm.name')" :description="t('providerForm.nameHint')">
+        <AppCombobox
+          v-model="form.name"
+          :options="nameOptions"
+          placeholder="My Provider"
+          @select="onPickName"
+        />
       </SettingsRow>
       <SettingsRow title="Base URL">
         <AppInput v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
@@ -220,25 +310,14 @@ async function save() {
           @click="fetchModels"
         />
       </div>
-      <div v-if="availableModels.length" class="pf__models">
-        <span class="pf__models-hint">{{ t('providerForm.modelsPick') }}</span>
-        <button
-          v-for="m in availableModels"
-          :key="m"
-          type="button"
-          class="pf__model-chip"
-          @click="pickModel(m)"
-        >
-          {{ m }}
-        </button>
-      </div>
       <SettingsRow v-for="s in MODEL_SLOTS" :key="s.key" :title="s.label">
-        <AppInput
+        <AppCombobox
           v-model="form.models[s.key]"
+          :options="availableModels"
           :placeholder="s.key === 'default' ? 'gpt-4o' : t('providerForm.slotFallbackPlaceholder')"
         />
       </SettingsRow>
-      <SettingsRow :title="t('providerForm.reviewModelSlot')" :description="t('providerForm.reviewModelSlotDesc')">
+      <SettingsRow :title="t('providerForm.reviewModelSlot')">
         <AppInput v-model="form.reviewModelSlot" placeholder="default" />
       </SettingsRow>
 
@@ -307,31 +386,6 @@ async function save() {
 }
 .pf__section-row .pf__section {
   margin: var(--space-3) 0 var(--space-1);
-}
-.pf__models {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 0 var(--space-1) var(--space-2);
-}
-.pf__models-hint {
-  width: 100%;
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-}
-.pf__model-chip {
-  padding: 2px var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  cursor: pointer;
-}
-.pf__model-chip:hover {
-  border-color: var(--accent);
 }
 .pf__adv {
   align-self: flex-start;
