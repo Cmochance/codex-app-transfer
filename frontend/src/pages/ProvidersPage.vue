@@ -1,19 +1,25 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { useProvidersStore } from '@/stores/providers'
 import { t } from '@/i18n'
 import { restartCodexApp } from '@/api/desktop'
 import { useToast } from '@/composables/useToast'
 import ProviderCard from '@/components/provider/ProviderCard.vue'
+import ProviderFormModal from '@/components/provider/ProviderFormModal.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import IconPlus from '~icons/lucide/plus'
 import IconRefreshCw from '~icons/lucide/refresh-cw'
 
 const store = useProvidersStore()
-const router = useRouter()
 const { show: toast } = useToast()
+const formOpen = ref(false)
+const formEditId = ref<string | null>(null)
 onMounted(() => store.load())
+
+function openAdd() {
+  formEditId.value = null
+  formOpen.value = true
+}
 
 // 已启用(default)的提供商置顶,其余保持后端顺序
 const displayList = computed(() => {
@@ -67,7 +73,8 @@ async function onEnable(id: string) {
   }
 }
 function onEdit(id: string) {
-  router.push({ path: '/providers/add', query: { id } })
+  formEditId.value = id
+  formOpen.value = true
 }
 function onRemove(id: string) {
   if (window.confirm('确认删除该提供商？')) store.remove(id)
@@ -89,7 +96,7 @@ function onRemove(id: string) {
         size="sm"
         :icon="IconPlus"
         :label="t('providers.add')"
-        @click="router.push('/providers/add')"
+        @click="openAdd"
       />
     </div>
 
@@ -117,6 +124,13 @@ function onRemove(id: string) {
         />
       </div>
     </div>
+
+    <ProviderFormModal
+      v-if="formOpen"
+      :edit-id="formEditId"
+      @close="formOpen = false"
+      @saved="toast('提供商已保存')"
+    />
   </div>
 </template>
 

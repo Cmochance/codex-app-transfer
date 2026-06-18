@@ -6,7 +6,6 @@ import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-rou
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/providers' },
   { path: '/providers', name: 'providers', component: () => import('@/pages/ProvidersPage.vue'), meta: { navKey: 'nav.providers', icon: 'plug' } },
-  { path: '/providers/add', name: 'provider-form', component: () => import('@/pages/ProviderFormPage.vue') },
   { path: '/proxy', name: 'proxy', component: () => import('@/pages/ProxyPage.vue'), meta: { navKey: 'nav.proxy', icon: 'radio' } },
   { path: '/usage', name: 'usage', component: () => import('@/pages/UsagePage.vue'), meta: { navKey: 'nav.usage', icon: 'chart' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/SettingsPage.vue'), meta: { navKey: 'nav.settings', icon: 'settings' } },
