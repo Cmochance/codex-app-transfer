@@ -99,7 +99,7 @@ export default {
   "usage.cacheModal.hitInput": "命中输入",
   "usage.cacheModal.totalInput": "总计输入",
   "usage.cacheModal.output": "输出",
-  "nav.codex": "Codex 文档",
+  "nav.codex": "文档",
   "nav.theme": "主题",
   "nav.guide": "引导",
   "theme.title": "Codex Desktop 主题",

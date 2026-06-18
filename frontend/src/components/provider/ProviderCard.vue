@@ -4,6 +4,7 @@ import { t } from '@/i18n'
 import AppButton from '@/components/ui/AppButton.vue'
 import IconGrip from '~icons/lucide/grip-vertical'
 import IconPlay from '~icons/lucide/play'
+import IconCheck from '~icons/lucide/check'
 import IconPencil from '~icons/lucide/square-pen'
 import IconTrash from '~icons/lucide/trash-2'
 import IconPlug from '~icons/lucide/plug'
@@ -21,7 +22,6 @@ defineEmits<{ enable: []; edit: []; remove: [] }>()
     <div class="pcard__main">
       <div class="pcard__name-row">
         <strong class="pcard__name">{{ provider.name }}</strong>
-        <span v-if="provider.default" class="pcard__enabled">{{ t('providers.enabled') }}</span>
       </div>
       <span class="pcard__url">{{ provider.baseUrl }}</span>
     </div>
@@ -30,8 +30,9 @@ defineEmits<{ enable: []; edit: []; remove: [] }>()
       <AppButton
         :variant="provider.default ? 'secondary' : 'primary'"
         size="sm"
-        :icon="IconPlay"
-        :label="t('providers.enable')"
+        :icon="provider.default ? IconCheck : IconPlay"
+        :label="provider.default ? t('providers.enabled') : t('providers.enable')"
+        :disabled="provider.default"
         @click="$emit('enable')"
       />
       <AppButton variant="ghost" size="sm" :icon="IconPencil" :label="t('common.edit')" @click="$emit('edit')" />
