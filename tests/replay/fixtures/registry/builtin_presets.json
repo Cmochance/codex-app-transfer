@@ -31,7 +31,7 @@
   },
   {
     "id": "kimi",
-    "name": "Kimi (月之暗面)",
+    "name": "Kimi (MoonShot)",
     "baseUrl": "https://api.moonshot.cn/v1",
     "docsUrl": "https://platform.moonshot.cn/docs",
     "authScheme": "bearer",
@@ -188,7 +188,7 @@
   },
   {
     "id": "zhipu-coding",
-    "name": "智谱 GLM Coding",
+    "name": "GLM Coding",
     "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
     "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/overview",
     "authScheme": "bearer",
@@ -300,7 +300,7 @@
   },
   {
     "id": "bailian-token-plan",
-    "name": "阿里云百炼 (Token Plan)",
+    "name": "Aliyuncs (Token Plan)",
     "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
     "docsUrl": "https://help.aliyun.com/zh/model-studio/token-plan-quickstart",
     "authScheme": "bearer",
