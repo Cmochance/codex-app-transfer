@@ -220,12 +220,32 @@ export const getConversations = () =>
 // 后端 detail 返回**裸** NormalizedSession({meta,turns,warnings} 顶层,无 session 包裹)
 export const getConversation = (id: string) =>
   api<ConversationDetail>('GET', `/api/conversations/${encodeURIComponent(id)}`)
-export const deleteConversations = (sessionIds: string[]) =>
-  api<{ deleted?: string[]; failed?: { sessionId: string; reason: string }[] }>(
-    'POST',
-    '/api/conversations/delete',
-    { sessionIds },
-  )
+// 后端「全部失败」时返 HTTP 200 + {success:false, deleted:[], failed:[...]}(conversations.rs)。
+// 不能走 api():其遇 success===false 即抛,会吞掉 failed 明细,UI 退回泛化报错而非逐条提示。
+// 用 raw fetch 读完整 payload,只在真正的传输/网关错误(非 2xx / 非 JSON)时抛。
+export async function deleteConversations(
+  sessionIds: string[],
+): Promise<{ deleted?: string[]; failed?: { sessionId: string; reason: string }[] }> {
+  const resp = await fetch('/api/conversations/delete', {
+    method: 'POST',
+    headers: { 'X-CAS-Request': '1', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionIds }),
+  })
+  let data: {
+    deleted?: string[]
+    failed?: { sessionId: string; reason: string }[]
+    message?: string
+  }
+  try {
+    data = await resp.json()
+  } catch {
+    throw new Error(
+      `Request failed: POST /api/conversations/delete — HTTP ${resp.status} ${resp.statusText || ''}`,
+    )
+  }
+  if (!resp.ok) throw new Error(data.message || `Request failed: HTTP ${resp.status}`)
+  return data
+}
 
 // 导出双响应:targetPath 已落盘 → JSON {success}; 无 targetPath → 二进制流(浏览器下载)。
 // 用 raw fetch(非 api())以便按 Content-Type 分流读 blob。

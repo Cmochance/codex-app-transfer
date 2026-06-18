@@ -77,19 +77,35 @@ const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
 const mcpCredentialsPortableStore = toggle('mcpCredentialsPortableStore', true)
 
-// theme / language 双向(同步本地状态 + 持久化服务端)
+// theme / language 双向(同步本地状态 + 持久化服务端)。
+// setAppearance/setLocale 立刻改 DOM/localStorage(无闪烁),但服务端保存失败时
+// store.save 只回滚 Pinia settings、不动这二者 → UI 会停在未保存值。故失败时显式回滚。
 const theme = computed<Appearance>({
   get: () => appearance.value,
   set: (v) => {
+    const prev = appearance.value
     setAppearance(v)
-    void persist({ theme: v })
+    store
+      .save({ theme: v })
+      .then((warn) => warn && toast(warn, 'error'))
+      .catch((e) => {
+        setAppearance(prev)
+        toast((e as Error).message || t('theme.saveFailed'), 'error')
+      })
   },
 })
 const language = computed<'zh' | 'en'>({
   get: () => i18nState.locale,
   set: (v) => {
+    const prev = i18nState.locale
     setLocale(v)
-    void persist({ language: v })
+    store
+      .save({ language: v })
+      .then((warn) => warn && toast(warn, 'error'))
+      .catch((e) => {
+        setLocale(prev)
+        toast((e as Error).message || t('theme.saveFailed'), 'error')
+      })
   },
 })
 const themeOptions: { value: Appearance; label: string }[] = [
