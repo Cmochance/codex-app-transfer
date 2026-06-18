@@ -135,3 +135,9 @@ export const setDefaultProvider = (id: string) => api('PUT', `/api/providers/${i
 export const activateProvider = (id: string) => api('POST', `/api/providers/${id}/activate`)
 export const getProviderSecret = (id: string) =>
   api<{ apiKey?: string }>('GET', `/api/providers/${id}/secret`)
+
+// 获取上游可用模型:已存在 provider 走 id(用落盘 key);草稿(新增/编辑未存)走 payload。
+export const fetchProviderModels = (id: string) =>
+  api<{ models?: unknown[] }>('GET', `/api/providers/${id}/models/available`)
+export const fetchProviderModelsDraft = (payload: ProviderPayload) =>
+  api<{ models?: unknown[] }>('POST', '/api/providers/models/available', providerBody(payload, false))

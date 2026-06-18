@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Codex 配置快照状态 + 还原 — 移植旧 refreshCodexSnapshotStatus;还原动作复用
 // useCodexRestore(与 Desktop 页 clear-desktop 同一入口 chooseCodexRestoreTarget)。
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import { useCodexRestore } from '@/composables/useCodexRestore'
@@ -11,26 +11,29 @@ import AppButton from '@/components/ui/AppButton.vue'
 
 const { show: toast } = useToast()
 const { restoreCodexConfig } = useCodexRestore()
-const statusText = ref('')
+// 存原始数据,statusText 用 computed 派生 → 随 locale 切换实时更新(修「中文界面残留旧 locale 英文」)
+const snap = ref<Awaited<ReturnType<typeof getDesktopSnapshotStatus>> | null>(null)
+const failed = ref(false)
+
+const statusText = computed(() => {
+  const s = snap.value
+  if (failed.value || !s) return t('settings.codexSnapshotStatusEmpty')
+  if (s.hasSnapshot) return tFmt('settings.codexSnapshotStatusActive', { time: s.snapshotAt || '' })
+  if (s.restorableCount > 0) return tFmt('settings.codexSnapshotStatusRecovery', { count: s.restorableCount })
+  return t('settings.codexSnapshotStatusEmpty')
+})
 
 function errMsg(e: unknown): string {
   return (e as Error)?.message || String(e)
 }
 
 onMounted(refreshStatus)
-
 async function refreshStatus() {
   try {
-    const s = await getDesktopSnapshotStatus()
-    if (s?.hasSnapshot) {
-      statusText.value = tFmt('settings.codexSnapshotStatusActive', { time: s.snapshotAt || '' })
-    } else if (s && s.restorableCount > 0) {
-      statusText.value = tFmt('settings.codexSnapshotStatusRecovery', { count: s.restorableCount })
-    } else {
-      statusText.value = t('settings.codexSnapshotStatusEmpty')
-    }
+    snap.value = await getDesktopSnapshotStatus()
+    failed.value = false
   } catch {
-    statusText.value = t('settings.codexSnapshotStatusEmpty')
+    failed.value = true
   }
 }
 

@@ -968,7 +968,7 @@ export default {
   "providerForm.apiKeyEditHint": "留空保持原 key 不变",
   "providerForm.apiFormat": "协议格式",
   "providerForm.authScheme": "鉴权方式",
-  "providerForm.modelMapSection": "模型映射 · Codex 槽位 → 上游模型 id",
+  "providerForm.modelMapSection": "模型映射",
   "providerForm.slotFallbackPlaceholder": "留空回落默认模型",
   "providerForm.reviewModelSlot": "Review 模型槽",
   "providerForm.reviewModelSlotDesc": "/review 使用的槽位(留空 = default)",
@@ -997,4 +997,9 @@ export default {
   "settings.codexCliRowDesc": "当前配置详情",
   "settings.residualClean": "无残留",
   "settings.residualDirty": "有残留",
+  "providerForm.fetchModels": "获取模型",
+  "providerForm.fetching": "获取中…",
+  "providerForm.modelsFetched": "找到 {count} 个模型",
+  "providerForm.modelsFetchFailed": "获取模型失败",
+  "providerForm.modelsPick": "点击填入默认模型槽",
 } as Record<string, string>;

@@ -9,11 +9,13 @@ import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppInput from '@/components/ui/AppInput.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
+import { useToast } from '@/composables/useToast'
 
 // editId 为空 = 添加;非空 = 编辑(从 store 取数据 + 拉 secret 回填)
 const props = defineProps<{ editId?: string | null }>()
 const emit = defineEmits<{ close: []; saved: [] }>()
 const store = useProvidersStore()
+const { show: toast } = useToast()
 
 // Codex 槽位 → 上游模型 id 映射(对齐后端 models 字段 + 旧 providerFormDefaultRows)
 const MODEL_SLOTS = [
@@ -47,6 +49,46 @@ const form = reactive({
 const saving = ref(false)
 const error = ref('')
 const showAdvanced = ref(false)
+const isBuiltin = ref(false)
+const fetching = ref(false)
+const availableModels = ref<string[]>([])
+// 预设(内置)provider 不支持自定义鉴权 → 隐藏;第三方可自选(authScheme 已接后端 providerBody)
+const showAuthScheme = computed(() => !isBuiltin.value)
+
+// 获取上游可用模型(草稿走 form 当前值 → 用已输入/已回填的 key)
+async function fetchModels() {
+  if (!form.baseUrl.trim()) {
+    error.value = t('providerForm.errRequired')
+    return
+  }
+  fetching.value = true
+  error.value = ''
+  try {
+    const draft: ProviderPayload = {
+      name: form.name.trim() || 'draft',
+      baseUrl: form.baseUrl.trim(),
+      apiKey: form.apiKey || undefined,
+      apiFormat: form.apiFormat,
+      authScheme: form.authScheme,
+    }
+    const res = await providersApi.fetchProviderModelsDraft(draft)
+    availableModels.value = (res.models || [])
+      .map((m) =>
+        typeof m === 'string'
+          ? m
+          : (m as { id?: string; name?: string })?.id || (m as { name?: string })?.name || '',
+      )
+      .filter(Boolean)
+    toast(tFmt('providerForm.modelsFetched', { count: availableModels.value.length }))
+  } catch (e) {
+    error.value = (e as Error).message || t('providerForm.modelsFetchFailed')
+  } finally {
+    fetching.value = false
+  }
+}
+function pickModel(m: string) {
+  form.models.default = m
+}
 
 const formatOptions = [
   { value: 'openai_chat', label: 'OpenAI' },
@@ -74,6 +116,7 @@ onMounted(async () => {
   form.baseUrl = p.baseUrl
   form.apiFormat = p.apiFormat
   form.authScheme = p.authScheme || 'bearer'
+  isBuiltin.value = !!p.isBuiltin
   form.reviewModelSlot = p.reviewModelSlot || ''
   for (const s of MODEL_SLOTS) {
     form.models[s.key] = (p.mappings as Record<string, string>)[s.key] || ''
@@ -149,7 +192,7 @@ async function save() {
 </script>
 
 <template>
-  <AppModal :title="title" @close="emit('close')">
+  <AppModal :title="title" wide @close="emit('close')">
     <div class="pf">
       <SettingsRow :title="t('providerForm.name')">
         <AppInput v-model="form.name" placeholder="My Provider" />
@@ -163,11 +206,32 @@ async function save() {
       <SettingsRow :title="t('providerForm.apiFormat')">
         <SegmentedControl v-model="form.apiFormat" :options="formatOptions" />
       </SettingsRow>
-      <SettingsRow :title="t('providerForm.authScheme')">
+      <SettingsRow v-if="showAuthScheme" :title="t('providerForm.authScheme')">
         <SegmentedControl v-model="form.authScheme" :options="authOptions" />
       </SettingsRow>
 
-      <div class="pf__section">{{ t('providerForm.modelMapSection') }}</div>
+      <div class="pf__section-row">
+        <span class="pf__section">{{ t('providerForm.modelMapSection') }}</span>
+        <AppButton
+          size="sm"
+          variant="ghost"
+          :label="fetching ? t('providerForm.fetching') : t('providerForm.fetchModels')"
+          :disabled="fetching"
+          @click="fetchModels"
+        />
+      </div>
+      <div v-if="availableModels.length" class="pf__models">
+        <span class="pf__models-hint">{{ t('providerForm.modelsPick') }}</span>
+        <button
+          v-for="m in availableModels"
+          :key="m"
+          type="button"
+          class="pf__model-chip"
+          @click="pickModel(m)"
+        >
+          {{ m }}
+        </button>
+      </div>
       <SettingsRow v-for="s in MODEL_SLOTS" :key="s.key" :title="s.label">
         <AppInput
           v-model="form.models[s.key]"
@@ -235,6 +299,39 @@ async function save() {
   color: var(--text-secondary);
   margin: var(--space-3) 0 var(--space-1);
   padding-left: var(--space-1);
+}
+.pf__section-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.pf__section-row .pf__section {
+  margin: var(--space-3) 0 var(--space-1);
+}
+.pf__models {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-1) var(--space-2);
+}
+.pf__models-hint {
+  width: 100%;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+.pf__model-chip {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.pf__model-chip:hover {
+  border-color: var(--accent);
 }
 .pf__adv {
   align-self: flex-start;
