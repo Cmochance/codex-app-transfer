@@ -553,7 +553,7 @@ export default {
   "models.hint": "Desktop sends OpenAI model names. This app maps them to provider models.",
   "desktop.title": "Codex CLI",
   "desktop.subtitle": "Make Codex CLI use the active provider",
-  "desktop.configTitle": "Codex CLI Configuration",
+  "desktop.configTitle": "Current Config",
   "desktop.apply": "Copy env commands",
   "desktop.details": "Configuration Details",
   "desktop.clear": "Restore original Codex config",
@@ -845,5 +845,12 @@ export default {
   "codex.conv.defaultDir": "Default Export Folder",
   "codex.mcp.deleteSource": "Delete this source",
   "codex.mcp.confirmCreate": "Create",
-  "codex.mcp.installAction": "Install"
+  "codex.mcp.installAction": "Install",
+  "common.prevPage": "Prev",
+  "common.nextPage": "Next",
+  "common.pageIndicator": "Page {cur} / {total}",
+  "settings.codexCliRow": "Current Config",
+  "settings.codexCliRowDesc": "Current config details",
+  "settings.residualClean": "No residue",
+  "settings.residualDirty": "Residue found"
 } as Record<string, string>

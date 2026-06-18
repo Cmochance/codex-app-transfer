@@ -51,6 +51,24 @@ const visibleThemes = computed(() => themes.value.filter((th) => !hiddenIds.valu
 const hiddenCount = computed(() => hiddenIds.value.length)
 const hasCustomVisible = computed(() => visibleThemes.value.some((th) => th.id === 'custom'))
 
+// 分页(8/页;最后一页带「添加自定义」卡)
+const PAGE_SIZE = 8
+const page = ref(1)
+const totalPages = computed(() => Math.max(1, Math.ceil(visibleThemes.value.length / PAGE_SIZE)))
+const pagedThemes = computed(() =>
+  visibleThemes.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE),
+)
+const isLastPage = computed(() => page.value >= totalPages.value)
+watch(totalPages, (tp) => {
+  if (page.value > tp) page.value = tp
+})
+function prevPage() {
+  if (page.value > 1) page.value -= 1
+}
+function nextPage() {
+  if (page.value < totalPages.value) page.value += 1
+}
+
 function displayName(th: ThemeEntry): string {
   return i18nState.locale === 'en' ? th.displayNameEn : th.displayNameZh
 }
@@ -322,12 +340,17 @@ async function onRestartChoice(choice: 'now' | 'later') {
         <IconChevronLeft class="back-icon" />
         {{ t('common.back') }}
       </RouterLink>
-      <h1 class="page-title">{{ t('theme.title') }}</h1>
-      <p class="page-sub">{{ t('theme.subtitle') }}</p>
+      <AppButton
+        variant="secondary"
+        size="sm"
+        :icon="IconRefreshCw"
+        :label="t('theme.restartCodexBtn')"
+        @click="restartCodex"
+      />
     </header>
 
     <SettingsGroup>
-      <SettingsRow :title="t('theme.toggleLabel')" :description="t('theme.toggleHint')">
+      <SettingsRow :title="t('theme.toggleLabel')">
         <div class="toggle-wrap">
           <span v-if="badge" class="status-badge">{{ badge }}</span>
           <AppSwitch v-model="enabledModel" />
@@ -336,15 +359,8 @@ async function onRestartChoice(choice: 'now' | 'later') {
     </SettingsGroup>
 
     <section class="theme-section">
-      <div class="theme-bar">
-        <AppButton
-          variant="secondary"
-          size="sm"
-          :icon="IconRefreshCw"
-          :label="t('theme.restartCodexBtn')"
-          @click="restartCodex"
-        />
-        <div v-if="hiddenCount > 0" class="hidden-restore">
+      <div v-if="hiddenCount > 0" class="theme-bar">
+        <div class="hidden-restore">
           <span class="hidden-badge">{{ tFmt('theme.hiddenCount', { count: hiddenCount }) }}</span>
           <AppButton variant="ghost" size="sm" :label="t('theme.restoreHidden')" @click="onRestoreHidden" />
         </div>
@@ -352,7 +368,7 @@ async function onRestartChoice(choice: 'now' | 'later') {
 
       <div class="theme-grid">
         <div
-          v-for="th in visibleThemes"
+          v-for="th in pagedThemes"
           :key="th.id"
           class="theme-card"
           :class="{ 'theme-card--sel': th.id === selectedId }"
@@ -376,10 +392,28 @@ async function onRestartChoice(choice: 'now' | 'later') {
           <div class="card-name">{{ displayName(th) }}</div>
         </div>
 
-        <div v-if="!hasCustomVisible" class="theme-card theme-card--add" @click="openUpload">
+        <div v-if="!hasCustomVisible && isLastPage" class="theme-card theme-card--add" @click="openUpload">
           <div class="add-icon"><IconPlus /></div>
           <div class="card-name card-name--muted">{{ t('theme.addCustom') }}</div>
         </div>
+      </div>
+
+      <div v-if="totalPages > 1" class="pager">
+        <AppButton
+          variant="ghost"
+          size="sm"
+          :label="t('common.prevPage')"
+          :disabled="page <= 1"
+          @click="prevPage"
+        />
+        <span class="pager__info">{{ tFmt('common.pageIndicator', { cur: page, total: totalPages }) }}</span>
+        <AppButton
+          variant="ghost"
+          size="sm"
+          :label="t('common.nextPage')"
+          :disabled="page >= totalPages"
+          @click="nextPage"
+        />
       </div>
     </section>
 
@@ -401,6 +435,9 @@ async function onRestartChoice(choice: 'now' | 'later') {
   max-width: 100%;
 }
 .page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-bottom: var(--space-5);
 }
 .back-link {
@@ -410,7 +447,17 @@ async function onRestartChoice(choice: 'now' | 'later') {
   font-size: var(--fs-sm);
   color: var(--text-secondary);
   text-decoration: none;
-  margin-bottom: var(--space-2);
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+.pager__info {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
 }
 .back-link:hover {
   color: var(--accent);

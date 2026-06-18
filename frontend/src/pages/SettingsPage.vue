@@ -124,9 +124,8 @@ function onPort(key: 'proxyPort' | 'adminPort', e: Event) {
   const v = Number((e.target as HTMLInputElement).value)
   if (Number.isFinite(v) && v > 0) void persist({ [key]: v })
 }
-function onUpdateUrl(e: Event) {
-  void persist({ updateUrl: (e.target as HTMLInputElement).value.trim() })
-}
+// 更新地址写死本仓库(不可自定义);后端 DEFAULT_UPDATE_URL 同样指向它
+const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
 </script>
 
 <template>
@@ -189,8 +188,8 @@ function onUpdateUrl(e: Event) {
     <SettingsGroup :title="t('settings.groupCodexConfig')">
       <RouterLink to="/desktop" class="nav-row">
         <div class="nav-row__text">
-          <div class="nav-row__title">{{ t('desktop.title') }}</div>
-          <div class="nav-row__desc">{{ t('desktop.subtitle') }}</div>
+          <div class="nav-row__title">{{ t('settings.codexCliRow') }}</div>
+          <div class="nav-row__desc">{{ t('settings.codexCliRowDesc') }}</div>
         </div>
         <IconChevronRight class="nav-row__chevron" />
       </RouterLink>
@@ -232,14 +231,7 @@ function onUpdateUrl(e: Event) {
         />
       </SettingsRow>
       <SettingsRow :title="t('settings.updateUrl')" :description="t('settings.updateUrlDesc')">
-        <input
-          type="text"
-          class="settings-input"
-          :value="store.str('updateUrl')"
-          placeholder="https://..."
-          spellcheck="false"
-          @change="onUpdateUrl"
-        />
+        <code class="settings-readonly">{{ UPDATE_REPO_URL }}</code>
       </SettingsRow>
       <DiagnosticPanel />
     </SettingsGroup>
@@ -249,6 +241,13 @@ function onUpdateUrl(e: Event) {
 <style scoped>
 .font-select {
   min-width: 120px;
+}
+.settings-readonly {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  word-break: break-all;
+  text-align: right;
 }
 .settings-num {
   width: 110px;

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Codex 原配置完整性自检(#268 反投毒)— 移植旧 refreshResidualScanStatus /
 // formatResidualPreview / handleRepairResidual / handleShowResidualFields。
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import {
@@ -10,6 +10,7 @@ import {
   type ResidualScanReport,
   type PollutedFile,
 } from '@/api/desktop'
+import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 
 const { show: toast } = useToast()
@@ -18,6 +19,13 @@ const statusText = ref('')
 const statusClass = ref('')
 const showRepair = ref(false)
 const preview = ref('')
+
+// 短状态(无残留/有残留)避免长文案破坏两行布局;未知/错误时回落原文
+const shortStatus = computed(() => {
+  if (statusClass.value === 'is-clean') return t('settings.residualClean')
+  if (statusClass.value === 'is-dirty') return t('settings.residualDirty')
+  return statusText.value
+})
 
 function errMsg(e: unknown): string {
   return (e as Error)?.message || String(e)
@@ -108,56 +116,38 @@ async function onShowFields() {
 </script>
 
 <template>
-  <div class="panel">
-    <div class="panel-head">{{ t('settings.residualScanTitle') }}</div>
-    <p class="hint">{{ t('settings.residualScanHint') }}</p>
-      <p class="status" :class="statusClass">{{ statusText }}</p>
-      <div class="actions">
-        <AppButton size="sm" variant="ghost" :label="t('settings.residualScanRefresh')" @click="refreshStatus" />
-        <AppButton size="sm" variant="ghost" :label="t('settings.residualScanShowFields')" @click="onShowFields" />
-        <AppButton v-if="showRepair" size="sm" variant="danger" :label="t('settings.residualScanRepair')" @click="onRepair" />
-      </div>
-      <pre v-if="preview" class="preview">{{ preview }}</pre>
-  </div>
+  <SettingsRow :title="t('settings.residualScanTitle')" :description="t('settings.residualScanHint')">
+    <div class="residual-ctl">
+      <span v-if="shortStatus" class="residual-status" :class="statusClass">{{ shortStatus }}</span>
+      <AppButton size="sm" variant="ghost" :label="t('settings.residualScanRefresh')" @click="refreshStatus" />
+      <AppButton size="sm" variant="ghost" :label="t('settings.residualScanShowFields')" @click="onShowFields" />
+      <AppButton v-if="showRepair" size="sm" variant="danger" :label="t('settings.residualScanRepair')" @click="onRepair" />
+    </div>
+  </SettingsRow>
+  <pre v-if="preview" class="preview">{{ preview }}</pre>
 </template>
 
 <style scoped>
-.panel {
-  padding: var(--space-4);
+.residual-ctl {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
-.panel-head {
-  font-size: var(--fs-md);
-  font-weight: 550;
-  color: var(--text);
-}
-.hint {
-  font-size: var(--fs-sm);
-  color: var(--text-muted);
-  line-height: 1.5;
-  margin: 0;
-}
-.status {
-  font-size: var(--fs-sm);
-  line-height: 1.5;
-  margin: 0;
-  color: var(--text-secondary);
-}
-.status.is-clean {
-  color: var(--success, #30a46c);
-}
-.status.is-dirty {
-  color: var(--warning, #e0a020);
-}
-.actions {
-  display: flex;
+  align-items: center;
   flex-wrap: wrap;
+  justify-content: flex-end;
   gap: var(--space-2);
 }
+.residual-status {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  margin-right: var(--space-1);
+}
+.residual-status.is-clean {
+  color: var(--success, #30a46c);
+}
+.residual-status.is-dirty {
+  color: var(--warning, #e0a020);
+}
 .preview {
-  margin: 0;
+  margin: var(--space-2) var(--space-4) var(--space-4);
   padding: var(--space-3);
   background: var(--surface-2);
   border-radius: var(--radius);

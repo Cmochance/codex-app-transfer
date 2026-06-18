@@ -18,16 +18,6 @@ const busy = ref(false)
 const { show: toast } = useToast()
 const { restoreCodexConfig } = useCodexRestore()
 
-const desktopReady = computed(
-  () => !!status.value && status.value.configured && !status.value.health.needsApply,
-)
-const statusText = computed(() => {
-  const s = status.value
-  if (!s) return ''
-  if (s.health.needsApply) return t('status.needsApply')
-  return s.configured ? t('status.configured') : t('status.notConfigured')
-})
-const healthMessage = computed(() => status.value?.health.issues?.[0]?.message || '')
 const configEntries = computed(() =>
   status.value ? Object.entries(status.value.config) : ([] as [string, string][]),
 )
@@ -82,20 +72,7 @@ async function onClear() {
         <IconChevronLeft class="back-icon" />
         {{ t('common.back') }}
       </RouterLink>
-      <h1 class="page-title">{{ t('desktop.title') }}</h1>
-      <p class="page-sub">{{ t('desktop.subtitle') }}</p>
     </header>
-
-    <SettingsGroup :title="t('status.configured')">
-      <SettingsRow :title="t('desktop.title')" :description="statusText">
-        <span class="status-dot" :class="{ 'status-dot--ok': desktopReady }" />
-      </SettingsRow>
-      <SettingsRow v-if="healthMessage">
-        <template #title>
-          <span class="health-warn">{{ healthMessage }}</span>
-        </template>
-      </SettingsRow>
-    </SettingsGroup>
 
     <SettingsGroup :title="t('desktop.configTitle')">
       <div class="config-list">
@@ -123,8 +100,6 @@ async function onClear() {
         @click="onClear"
       />
     </div>
-
-    <p class="explain">{{ t('desktop.explainText') }}</p>
   </div>
 </template>
 
