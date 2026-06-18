@@ -373,7 +373,17 @@ pub async fn get_settings() -> impl IntoResponse {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
+    let mut settings = cfg.get("settings").cloned().unwrap_or_else(|| json!({}));
+    // MOC-256:webFetchBackend 未设置 + 无 Chrome 就绪 → 派生 `off`(与启动持久化同语义)。
+    // 启动迁移在延迟任务里落盘,前端可能在落盘前 GET;此处同步派生让前端始终显示 off、
+    // 点 auto/headless 能触发门控(否则显示陈旧 auto,点已选中的 auto 会 early-return)。
+    if settings.get("webFetchBackend").is_none()
+        && !codex_app_transfer_http::headless::chrome_ready_without_download().await
+    {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.insert("webFetchBackend".to_string(), json!("off"));
+        }
+    }
     Json(settings).into_response()
 }
 

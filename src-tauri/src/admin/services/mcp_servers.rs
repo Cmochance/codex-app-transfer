@@ -561,6 +561,15 @@ pub async fn default_web_fetch_off_if_no_chrome() {
         return;
     }
     let _ = crate::admin::registry_io::with_config_write(|cfg| {
+        // 锁内复检(TOCTOU:锁外 already_set 检查之后、本写之前,别的进程 / 设置 UI 可能已写入
+        // 显式档如 curl/wreq —— 此时绝不能覆盖回 off)。仍 absent 才写。
+        let still_absent = cfg
+            .get("settings")
+            .and_then(|s| s.get("webFetchBackend"))
+            .is_none();
+        if !still_absent {
+            return Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()));
+        }
         if let Some(obj) = cfg.as_object_mut() {
             let settings = obj
                 .entry("settings")
