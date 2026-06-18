@@ -238,9 +238,10 @@ export async function deleteConversations(
   }
   try {
     data = await resp.json()
-  } catch {
+  } catch (parseErr) {
     throw new Error(
-      `Request failed: POST /api/conversations/delete — HTTP ${resp.status} ${resp.statusText || ''}`,
+      `Request failed: POST /api/conversations/delete — HTTP ${resp.status} ${resp.statusText || ''} ` +
+        `(非 JSON 响应: ${String(parseErr)})`,
     )
   }
   if (!resp.ok) throw new Error(data.message || `Request failed: HTTP ${resp.status}`)

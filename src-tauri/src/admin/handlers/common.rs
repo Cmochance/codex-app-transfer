@@ -69,6 +69,11 @@ pub(crate) async fn open_url_handler(Json(payload): Json<Value>) -> impl IntoRes
     let Some(url) = payload.get("url").and_then(|v| v.as_str()) else {
         return err(StatusCode::BAD_REQUEST, "missing 'url' field").into_response();
     };
+    // 该端点只该开外部网页链接(点赞/反馈),限定 http(s) scheme,避免把任意
+    // file://、应用协议等喂给系统 open/explorer/xdg-open(防御性,前端只传写死外链)。
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return err(StatusCode::BAD_REQUEST, "only http(s) urls allowed").into_response();
+    }
     match open_url(url) {
         Ok(()) => Json(json!({"success": true})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

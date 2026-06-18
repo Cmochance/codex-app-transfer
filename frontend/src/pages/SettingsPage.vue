@@ -89,7 +89,8 @@ const theme = computed<Appearance>({
       .save({ theme: v })
       .then((warn) => warn && toast(warn, 'error'))
       .catch((e) => {
-        setAppearance(prev)
+        // 仅当当前显示仍是本次所设值才回滚,避免快速连点时覆盖更晚成功的切换
+        if (appearance.value === v) setAppearance(prev)
         toast((e as Error).message || t('theme.saveFailed'), 'error')
       })
   },
@@ -103,7 +104,7 @@ const language = computed<'zh' | 'en'>({
       .save({ language: v })
       .then((warn) => warn && toast(warn, 'error'))
       .catch((e) => {
-        setLocale(prev)
+        if (i18nState.locale === v) setLocale(prev)
         toast((e as Error).message || t('theme.saveFailed'), 'error')
       })
   },
