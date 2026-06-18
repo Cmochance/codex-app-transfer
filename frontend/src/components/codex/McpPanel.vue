@@ -519,7 +519,7 @@ watch(subpane, (sub) => loadSubpane(sub))
                 v-if="!isNewServer"
                 type="button"
                 class="mcp__icon-btn danger"
-                title="删除"
+                :title="t('common.delete')"
                 @click="deleteServer"
               >
                 <IconTrash />
@@ -538,7 +538,7 @@ watch(subpane, (sub) => loadSubpane(sub))
                 size="sm"
                 :variant="jsonEditMode ? 'primary' : 'secondary'"
                 :icon="jsonEditMode ? IconCheck : IconPencil"
-                :label="jsonEditMode ? (isNewServer ? '确认创建' : t('codex.mcp.saveOk').replace('已', '')) : t('codex.agentsEdit')"
+                :label="jsonEditMode ? (isNewServer ? t('codex.mcp.confirmCreate') : t('common.save')) : t('codex.agentsEdit')"
                 @click="editToggle"
               />
               <AppButton size="sm" :icon="IconArchive" :label="t('codex.agentsBackup')" @click="backupServers" />
@@ -598,7 +598,7 @@ watch(subpane, (sub) => loadSubpane(sub))
             v-if="!s.official"
             type="button"
             class="mcp__source-remove"
-            title="删除该源"
+            :title="t('codex.mcp.deleteSource')"
             @click="removeSource(s)"
           >
             ×
@@ -627,7 +627,7 @@ watch(subpane, (sub) => loadSubpane(sub))
           </div>
           <div v-if="s.description" class="mcp__market-desc">{{ s.description }}</div>
         </div>
-        <AppButton size="sm" :icon="IconDownload" :label="t('codex.mcp.installServerOk').replace('已添加到', '加进')" @click="installMarketServer(s.id)" />
+        <AppButton size="sm" :icon="IconDownload" :label="t('codex.mcp.installAction')" @click="installMarketServer(s.id)" />
       </div>
 
       <h3 class="mcp__market-title">{{ t('codex.mcp.pluginBundles') }}</h3>

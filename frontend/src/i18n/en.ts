@@ -840,5 +840,10 @@ export default {
   "providerForm.errJsonNotObject": "{label} must be a JSON object",
   "providers.saved": "Provider saved",
   "providers.loading": "Loading…",
-  "providers.enableFailed": "Failed to enable"
+  "providers.enableFailed": "Failed to enable",
+  "common.clear": "Clear",
+  "codex.conv.defaultDir": "Default Export Folder",
+  "codex.mcp.deleteSource": "Delete this source",
+  "codex.mcp.confirmCreate": "Create",
+  "codex.mcp.installAction": "Install"
 } as Record<string, string>

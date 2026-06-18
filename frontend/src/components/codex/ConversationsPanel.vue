@@ -430,10 +430,10 @@ onMounted(() => {
 
     <!-- 默认导出目录 -->
     <div class="conv__defaultdir">
-      <SettingsRow title="默认导出文件夹" :description="defaultDir || t('codex.conv.defaultDirPlaceholder')">
+      <SettingsRow :title="t('codex.conv.defaultDir')" :description="defaultDir || t('codex.conv.defaultDirPlaceholder')">
         <div class="conv__dir-actions">
           <AppButton size="sm" :label="t('codex.conv.defaultDirPickTitle')" @click="pickDefaultDir" />
-          <AppButton v-if="defaultDir" size="sm" variant="ghost" label="清除" @click="clearDefaultDir" />
+          <AppButton v-if="defaultDir" size="sm" variant="ghost" :label="t('common.clear')" @click="clearDefaultDir" />
         </div>
       </SettingsRow>
     </div>

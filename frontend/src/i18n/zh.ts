@@ -985,4 +985,9 @@ export default {
   "providers.saved": "提供商已保存",
   "providers.loading": "加载中…",
   "providers.enableFailed": "启用失败",
+  "common.clear": "清除",
+  "codex.conv.defaultDir": "默认导出文件夹",
+  "codex.mcp.deleteSource": "删除该源",
+  "codex.mcp.confirmCreate": "确认创建",
+  "codex.mcp.installAction": "安装",
 } as Record<string, string>;
