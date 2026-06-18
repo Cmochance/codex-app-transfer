@@ -85,6 +85,11 @@ pub fn run() {
         }
     };
 
+    // MOC-256:Codex 直接拉起本 stdio server 时(用户没开 GUI)也要把未设置 + 无 Chrome 的
+    // webFetchBackend 落为 off,否则下面 tools/list / tools/call 读到 absent→auto 仍会暴露
+    // web_fetch、升 headless 静默下载 86MB。与 GUI 启动共用 helper,幂等 + 跨进程锁。
+    rt.block_on(crate::admin::services::mcp_servers::default_web_fetch_off_if_no_chrome());
+
     // 出站: 专用线程持 stdout 串行写(blocking 写不占 runtime worker; channel 序列化防
     // 并发响应交错)。所有 sender(派发器 + 各 spawn 任务的 clone)drop 后线程退出。
     let (out_tx, out_rx) = std::sync::mpsc::channel::<Value>();
