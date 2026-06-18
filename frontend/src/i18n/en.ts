@@ -857,5 +857,15 @@ export default {
   "providerForm.fetching": "Fetching…",
   "providerForm.modelsFetched": "Found {count} models",
   "providerForm.modelsFetchFailed": "Failed to fetch models",
-  "providerForm.modelsPick": "Click to fill the default model slot"
+  "providerForm.modelsPick": "Click to fill the default model slot",
+  "about.group": "About",
+  "about.version": "Version",
+  "about.checkUpdate": "Check Update",
+  "about.upToDate": "You're on the latest version",
+  "about.updateAvailable": "New version {version} available",
+  "about.checkFailed": "Update check failed",
+  "about.like": "Star on GitHub",
+  "about.likeDesc": "Star the repo to support development",
+  "about.feedback": "Feedback",
+  "about.feedbackDesc": "Report an issue or suggestion"
 } as Record<string, string>

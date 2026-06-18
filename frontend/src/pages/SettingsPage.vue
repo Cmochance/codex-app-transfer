@@ -1,16 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
-import { i18nState, setLocale, t } from '@/i18n'
+import { computed, onMounted, ref } from 'vue'
+import { i18nState, setLocale, t, tFmt } from '@/i18n'
 import { useAppearance, type Appearance } from '@/composables/useAppearance'
 import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
 import { useSettingsStore } from '@/stores/settings'
 import type { Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
+import { getAppVersion, checkAppUpdate, openExternalUrl } from '@/api/system'
 import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
 import AppSelect from '@/components/ui/AppSelect.vue'
+import AppButton from '@/components/ui/AppButton.vue'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
@@ -19,10 +21,32 @@ import IconChevronRight from '~icons/lucide/chevron-right'
 const store = useSettingsStore()
 const { current: appearance, set: setAppearance } = useAppearance()
 const { show: toast } = useToast()
+const appVersion = ref('')
 
 onMounted(() => {
   if (!store.loaded) store.load().catch(() => {})
+  getAppVersion()
+    .then((r) => (appVersion.value = r.version || ''))
+    .catch(() => {})
 })
+
+// 关于:检查更新 + 外链(走系统浏览器)
+async function onCheckUpdate() {
+  try {
+    const r = await checkAppUpdate()
+    const latest = r.latestVersion
+    if (r.hasUpdate || (latest && latest !== appVersion.value)) {
+      toast(tFmt('about.updateAvailable', { version: latest || '' }))
+    } else {
+      toast(t('about.upToDate'))
+    }
+  } catch (e) {
+    toast((e as Error).message || t('about.checkFailed'), 'error')
+  }
+}
+function openExternal(url: string) {
+  openExternalUrl(url).catch((e) => toast((e as Error).message, 'error'))
+}
 
 // 保存 partial → 后端浅合并;store.save 已做乐观更新 + 失败回滚,这里只 toast。
 async function persist(partial: Settings) {
@@ -230,10 +254,22 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
           @change="onPort('adminPort', $event)"
         />
       </SettingsRow>
+      <DiagnosticPanel />
+    </SettingsGroup>
+
+    <SettingsGroup :title="t('about.group')">
+      <SettingsRow :title="t('about.version')" :description="appVersion ? `v${appVersion}` : '…'">
+        <AppButton size="sm" variant="ghost" :label="t('about.checkUpdate')" @click="onCheckUpdate" />
+      </SettingsRow>
       <SettingsRow :title="t('settings.updateUrl')" :description="t('settings.updateUrlDesc')">
         <code class="settings-readonly">{{ UPDATE_REPO_URL }}</code>
       </SettingsRow>
-      <DiagnosticPanel />
+      <SettingsRow :title="t('about.like')" :description="t('about.likeDesc')">
+        <AppButton size="sm" variant="secondary" :label="t('about.like')" @click="openExternal(UPDATE_REPO_URL)" />
+      </SettingsRow>
+      <SettingsRow :title="t('about.feedback')" :description="t('about.feedbackDesc')">
+        <AppButton size="sm" variant="ghost" :label="t('about.feedback')" @click="openExternal(`${UPDATE_REPO_URL}/issues`)" />
+      </SettingsRow>
     </SettingsGroup>
   </div>
 </template>

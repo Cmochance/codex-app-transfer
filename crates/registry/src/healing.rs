@@ -252,6 +252,51 @@ pub fn heal_legacy_update_url(cfg: &mut Value) -> bool {
     true
 }
 
+/// 一次性迁移:把用户 config.json 里 `providers[].name` 字段中的旧预设显示名
+/// 改为新显示名(精确匹配,不动用户已手改过其他名字的 provider)。
+///
+/// 背景:v2.x 前端重构改了三个 preset 的 `name` 字段展示方式,
+/// 但 `heal_builtin_provider_fields` 不覆写 `name`(name 属于用户可改字段),
+/// 已配置的 provider 仍显示旧名。此迁移在 load 时一次性修正。
+///
+/// 有改动返回 `true`(由调用方决定是否写回磁盘)。
+pub fn migrate_legacy_preset_names(cfg: &mut Value) -> bool {
+    const RENAMES: &[(&str, &str)] = &[
+        ("Kimi (月之暗面)", "Kimi (MoonShot)"),
+        ("智谱 GLM Coding", "GLM Coding"),
+        ("阿里云百炼 (Token Plan)", "Aliyuncs (Token Plan)"),
+    ];
+
+    let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+
+    let mut changed = false;
+    for provider in providers.iter_mut() {
+        let Some(obj) = provider.as_object_mut() else {
+            continue;
+        };
+        let Some(name_val) = obj.get("name") else {
+            continue;
+        };
+        let Some(name) = name_val.as_str() else {
+            continue;
+        };
+        if let Some(&new_name) = RENAMES.iter().find_map(|(old, new)| {
+            if *old == name {
+                Some(new)
+            } else {
+                None
+            }
+        }) {
+            obj.insert("name".to_owned(), Value::String(new_name.to_owned()));
+            changed = true;
+        }
+    }
+    changed
+}
+
+
 /// provider 是否有合法的 `grokWeb.cookies.sso` JWT(非空 string)。
 ///
 /// 用于 [`heal_builtin_provider_fields`] 检测 grok-web preset 半残不变量:
