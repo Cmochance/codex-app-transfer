@@ -14,7 +14,7 @@ import AppSwitch from '@/components/ui/AppSwitch.vue'
 import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
-import { detectChrome, ensureChrome, getSystemProxyStatus, type SystemProxyStatus } from '@/api/chrome'
+import { getChromeReady, ensureChrome, getSystemProxyStatus, type SystemProxyStatus } from '@/api/chrome'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
@@ -220,8 +220,8 @@ async function onWebFetchChange(v: string | undefined) {
       await commitWebFetch('wreq')
       return
     }
-    // Chrome 探测:命中直接存,未命中弹下载确认(modal 期间保持 switching guard)
-    if ((await detectChrome()).detected) {
+    // Chrome readiness:就绪(系统 Chrome 自检过 / 已下载 shell)直接存,未就绪弹下载确认(modal 期间保持 guard)
+    if ((await getChromeReady()).ready) {
       if (await commitWebFetch(v)) toast(t('settings.headlessChromeSystemFound'))
     } else {
       pendingModal = true
