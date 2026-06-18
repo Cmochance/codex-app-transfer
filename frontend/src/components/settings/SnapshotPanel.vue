@@ -6,7 +6,6 @@ import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import { useCodexRestore } from '@/composables/useCodexRestore'
 import { getDesktopSnapshotStatus } from '@/api/desktop'
-import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 
@@ -45,14 +44,12 @@ async function onRestore() {
 </script>
 
 <template>
-  <SettingsGroup :title="t('settings.codexSnapshotTitle')">
-    <SettingsRow :description="statusText">
-      <template #title>
-        <span class="snap-title">{{ t('desktop.clear') }}</span>
-      </template>
-      <AppButton size="sm" variant="secondary" :label="t('desktop.clear')" @click="onRestore" />
-    </SettingsRow>
-  </SettingsGroup>
+  <SettingsRow :description="statusText">
+    <template #title>
+      <span class="snap-title">{{ t('settings.codexSnapshotTitle') }}</span>
+    </template>
+    <AppButton size="sm" variant="secondary" :label="t('desktop.clear')" @click="onRestore" />
+  </SettingsRow>
 </template>
 
 <style scoped>

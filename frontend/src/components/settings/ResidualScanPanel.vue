@@ -10,7 +10,6 @@ import {
   type ResidualScanReport,
   type PollutedFile,
 } from '@/api/desktop'
-import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 
 const { show: toast } = useToast()
@@ -109,9 +108,9 @@ async function onShowFields() {
 </script>
 
 <template>
-  <SettingsGroup :title="t('settings.residualScanTitle')">
-    <div class="panel">
-      <p class="hint">{{ t('settings.residualScanHint') }}</p>
+  <div class="panel">
+    <div class="panel-head">{{ t('settings.residualScanTitle') }}</div>
+    <p class="hint">{{ t('settings.residualScanHint') }}</p>
       <p class="status" :class="statusClass">{{ statusText }}</p>
       <div class="actions">
         <AppButton size="sm" variant="ghost" :label="t('settings.residualScanRefresh')" @click="refreshStatus" />
@@ -119,8 +118,7 @@ async function onShowFields() {
         <AppButton v-if="showRepair" size="sm" variant="danger" :label="t('settings.residualScanRepair')" @click="onRepair" />
       </div>
       <pre v-if="preview" class="preview">{{ preview }}</pre>
-    </div>
-  </SettingsGroup>
+  </div>
 </template>
 
 <style scoped>
@@ -129,6 +127,11 @@ async function onShowFields() {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+}
+.panel-head {
+  font-size: var(--fs-md);
+  font-weight: 550;
+  color: var(--text);
 }
 .hint {
   font-size: var(--fs-sm);

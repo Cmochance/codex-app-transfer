@@ -5,7 +5,6 @@ import { onMounted, ref, watch } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import { traceViewerStatus, traceViewerStart, traceViewerStop, openTraceViewer } from '@/api/desktop'
-import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
@@ -90,8 +89,7 @@ async function onOpen() {
 </script>
 
 <template>
-  <SettingsGroup>
-    <SettingsRow :title="t('settings.traceViewerEnabled')" :description="t('settings.traceViewerEnabledHint')">
+  <SettingsRow :title="t('settings.traceViewerEnabled')" :description="t('settings.traceViewerEnabledHint')">
       <div class="diag-control">
         <AppButton
           v-if="showOpenBtn"
@@ -102,8 +100,7 @@ async function onOpen() {
         />
         <AppSwitch v-model="enabledModel" />
       </div>
-    </SettingsRow>
-  </SettingsGroup>
+  </SettingsRow>
 </template>
 
 <style scoped>

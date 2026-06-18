@@ -3,7 +3,11 @@ import { onMounted } from 'vue'
 import AppLayout from './layout/AppLayout.vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useAppearance } from '@/composables/useAppearance'
+import { useFont } from '@/composables/useFont'
 import { setLocale } from '@/i18n'
+
+// 字体偏好(localStorage)启动即应用 — 顶层调用触发模块级 applyFamily/applySize
+useFont()
 
 // 启动后从后端 /api/settings hydrate(权威源,覆盖 main.ts 的 localStorage 初值,跨设备一致)。
 // load(false) 应用主题不回写、setLocale 仅本地不 PUT → 无 echo 回环。

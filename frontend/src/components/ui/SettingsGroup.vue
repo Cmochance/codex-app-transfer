@@ -28,8 +28,8 @@ defineProps<{ title?: string }>()
   border-radius: var(--radius-lg);
   overflow: hidden;
 }
-/* 卡片内相邻设置行之间的细分隔线 */
-.settings-group__card :deep(.settings-row + .settings-row) {
+/* 卡片内相邻条目(设置行 / 导航行 / 内嵌面板)之间的细分隔线 */
+.settings-group__card > :deep(* + *) {
   border-top: 1px solid var(--border);
 }
 </style>

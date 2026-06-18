@@ -2,6 +2,7 @@
 import { computed, onMounted } from 'vue'
 import { i18nState, setLocale, t } from '@/i18n'
 import { useAppearance, type Appearance } from '@/composables/useAppearance'
+import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
 import { useSettingsStore } from '@/stores/settings'
 import type { Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
@@ -9,6 +10,7 @@ import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
+import AppSelect from '@/components/ui/AppSelect.vue'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
@@ -74,8 +76,38 @@ const langOptions: { value: 'zh' | 'en'; label: string }[] = [
   { value: 'en', label: 'EN' },
 ]
 
+// 字体:按角色(正文/标题/等宽)+ 字号,纯 localStorage(useFont)。默认值 = 国风原字体。
+const font = useFont()
+const bodyFont = computed<FontChoice>({ get: () => font.body.value, set: (v) => font.setRole('body', v) })
+const headingFont = computed<FontChoice>({
+  get: () => font.heading.value,
+  set: (v) => font.setRole('heading', v),
+})
+const monoFont = computed<FontChoice>({ get: () => font.mono.value, set: (v) => font.setRole('mono', v) })
+const fontSize = computed<FontSize>({ get: () => font.size.value, set: (v) => font.setSize(v) })
+const bodyFontOptions: { value: FontChoice; label: string }[] = [
+  { value: 'system', label: '系统' },
+  { value: 'songti', label: '宋体' },
+  { value: 'kaiti', label: '楷体' },
+  { value: 'rounded', label: '圆体' },
+]
+const headingFontOptions: { value: FontChoice; label: string }[] = [
+  { value: 'songti', label: '宋体' },
+  { value: 'kaiti', label: '楷体' },
+  { value: 'system', label: '系统' },
+]
+const monoFontOptions: { value: FontChoice; label: string }[] = [
+  { value: 'mono', label: '等宽' },
+  { value: 'songti', label: '宋体' },
+  { value: 'system', label: '系统' },
+]
+const fontSizeOptions: { value: FontSize; label: string }[] = [
+  { value: 'small', label: '小' },
+  { value: 'normal', label: '标准' },
+  { value: 'large', label: '大' },
+]
+
 // webFetchBackend(off/auto/curl/wreq/headless;仅 off/auto 有 i18n,余技术名)
-// 默认 auto(对齐后端 schema DEFAULT_WEB_FETCH_BACKEND + 旧前端;key 缺失时运行时实为 auto)
 const webFetchBackend = computed<string>({
   get: () => store.str('webFetchBackend', 'auto'),
   set: (v) => void persist({ webFetchBackend: v }),
@@ -99,14 +131,24 @@ function onUpdateUrl(e: Event) {
 
 <template>
   <div>
-    <h1 class="page-title">{{ t('settings.title') }}</h1>
-
     <SettingsGroup title="外观与语言">
       <SettingsRow :title="t('settings.theme')" description="应用主题:白 / 黑 / 国风">
         <SegmentedControl v-model="theme" :options="themeOptions" />
       </SettingsRow>
       <SettingsRow :title="t('settings.language')" description="界面显示语言">
         <SegmentedControl v-model="language" :options="langOptions" />
+      </SettingsRow>
+      <SettingsRow title="正文字体" description="界面正文字体(默认国风:系统)">
+        <AppSelect v-model="bodyFont" :options="bodyFontOptions" class="font-select" />
+      </SettingsRow>
+      <SettingsRow title="标题字体" description="标题 / 分组名字体(默认国风:宋体)">
+        <AppSelect v-model="headingFont" :options="headingFontOptions" class="font-select" />
+      </SettingsRow>
+      <SettingsRow title="等宽字体" description="代码 / JSON 等宽显示字体">
+        <AppSelect v-model="monoFont" :options="monoFontOptions" class="font-select" />
+      </SettingsRow>
+      <SettingsRow title="字号" description="界面整体字号缩放">
+        <SegmentedControl v-model="fontSize" :options="fontSizeOptions" />
       </SettingsRow>
     </SettingsGroup>
 
@@ -117,24 +159,21 @@ function onUpdateUrl(e: Event) {
       <SettingsRow :title="t('settings.restoreCodexOnExit')" :description="t('settings.restoreCodexOnExitHint')">
         <AppSwitch v-model="restoreCodexOnExit" />
       </SettingsRow>
-    </SettingsGroup>
-
-    <SettingsGroup title="Codex 集成">
       <SettingsRow :title="t('settings.autoUnlockCodexPlugins')" :description="t('settings.autoUnlockCodexPluginsHint')">
         <AppSwitch v-model="autoUnlockCodexPlugins" />
       </SettingsRow>
       <SettingsRow :title="t('settings.autoWakeCodexPet')" :description="t('settings.autoWakeCodexPetHint')">
         <AppSwitch v-model="autoWakeCodexPet" />
       </SettingsRow>
-      <SettingsRow :title="t('settings.codexQuotaEnabled')" :description="t('settings.codexQuotaEnabledHint')">
-        <AppSwitch v-model="codexQuotaEnabled" />
-      </SettingsRow>
       <SettingsRow :title="t('settings.codexNetworkAccess')" :description="t('settings.codexNetworkAccessHint')">
         <AppSwitch v-model="codexNetworkAccess" />
       </SettingsRow>
     </SettingsGroup>
 
-    <SettingsGroup :title="t('settings.codexDesktopGroup')">
+    <SettingsGroup title="Codex 集成">
+      <SettingsRow :title="t('settings.codexQuotaEnabled')" :description="t('settings.codexQuotaEnabledHint')">
+        <AppSwitch v-model="codexQuotaEnabled" />
+      </SettingsRow>
       <RouterLink to="/codex-skin" class="nav-row">
         <div class="nav-row__text">
           <div class="nav-row__title">{{ t('theme.title') }}</div>
@@ -142,6 +181,12 @@ function onUpdateUrl(e: Event) {
         </div>
         <IconChevronRight class="nav-row__chevron" />
       </RouterLink>
+      <SettingsRow :title="t('settings.webFetchBackend')" :description="t('settings.webFetchBackendHint')">
+        <SegmentedControl v-model="webFetchBackend" :options="webFetchOptions" />
+      </SettingsRow>
+    </SettingsGroup>
+
+    <SettingsGroup title="Codex 配置">
       <RouterLink to="/desktop" class="nav-row">
         <div class="nav-row__text">
           <div class="nav-row__title">{{ t('desktop.title') }}</div>
@@ -149,23 +194,22 @@ function onUpdateUrl(e: Event) {
         </div>
         <IconChevronRight class="nav-row__chevron" />
       </RouterLink>
+      <ResidualScanPanel />
+      <SnapshotPanel />
     </SettingsGroup>
 
-    <SettingsGroup title="提供商">
+    <SettingsGroup title="高级">
       <SettingsRow :title="t('settings.exposeAllModels')" description="OpenAI 模型菜单展示全部模型">
         <AppSwitch v-model="exposeAllProviderModels" />
       </SettingsRow>
       <SettingsRow :title="t('settings.showGrayProviders')" :description="t('settings.showGrayProvidersHint')">
         <AppSwitch v-model="showGrayProviders" />
       </SettingsRow>
-    </SettingsGroup>
-
-    <SettingsGroup title="高级">
-      <SettingsRow :title="t('settings.mcpCredentialsPortableStore')" :description="t('settings.mcpCredentialsPortableStoreHint')">
+      <SettingsRow
+        :title="t('settings.mcpCredentialsPortableStore')"
+        :description="t('settings.mcpCredentialsPortableStoreHint')"
+      >
         <AppSwitch v-model="mcpCredentialsPortableStore" />
-      </SettingsRow>
-      <SettingsRow :title="t('settings.webFetchBackend')" :description="t('settings.webFetchBackendHint')">
-        <SegmentedControl v-model="webFetchBackend" :options="webFetchOptions" />
       </SettingsRow>
       <SettingsRow :title="t('settings.proxyPort')" description="本地转发代理监听端口(改后需重启生效)">
         <input
@@ -197,19 +241,14 @@ function onUpdateUrl(e: Event) {
           @change="onUpdateUrl"
         />
       </SettingsRow>
+      <DiagnosticPanel />
     </SettingsGroup>
-
-    <ResidualScanPanel />
-    <SnapshotPanel />
-    <DiagnosticPanel />
   </div>
 </template>
 
 <style scoped>
-.page-title {
-  font-size: var(--fs-xl);
-  font-weight: 600;
-  margin: 0 0 var(--space-5);
+.font-select {
+  min-width: 120px;
 }
 .settings-num {
   width: 110px;
@@ -235,7 +274,7 @@ function onUpdateUrl(e: Event) {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
-/* Codex 桌面导航行(整行可点 → 子页) */
+/* Codex 导航行(整行可点 → 子页) */
 .nav-row {
   display: flex;
   align-items: center;
@@ -248,9 +287,6 @@ function onUpdateUrl(e: Event) {
 }
 .nav-row:hover {
   background: var(--surface-hover);
-}
-.nav-row + .nav-row {
-  border-top: 1px solid var(--border);
 }
 .nav-row__title {
   font-size: var(--fs-md);

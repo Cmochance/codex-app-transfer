@@ -90,9 +90,9 @@ pre,
   background: transparent;
 }
 
-/* 国风标题用衬线做毛笔意境(正文仍系统字保可读) */
-html[data-theme="inkwash"] h1,
-html[data-theme="inkwash"] h2 {
+/* 标题统一用衬线(默认 = 国风毛笔意境;可在设置「标题字体」改 --font-serif,正文仍系统字保可读) */
+h1,
+h2 {
   font-family: var(--font-serif);
   letter-spacing: 0.01em;
 }
