@@ -497,9 +497,17 @@ fn main() {
             });
 
             let menu = build_tray_menu(app)?;
+            // 菜单栏专属图标:白+透明猫剪影模板图(非全彩 app 图标缩小, 后者在 22px 菜单栏糊成一团)。
+            // icon_as_template=true → macOS 按菜单栏明暗自动反色渲染(原生 menubar 风格)。
+            let tray_rgba = image::load_from_memory(include_bytes!("../icons/tray-icon.png"))
+                .expect("tray-icon.png 解码失败")
+                .to_rgba8();
+            let (tray_w, tray_h) = tray_rgba.dimensions();
+            let tray_icon = tauri::image::Image::new_owned(tray_rgba.into_raw(), tray_w, tray_h);
             let _ = TrayIconBuilder::with_id("main")
                 .tooltip("Codex App Transfer")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
+                .icon_as_template(true)
                 .menu(&menu)
                 // macOS 习惯:左键点图标 = 切窗口可见性,右键才弹菜单
                 .show_menu_on_left_click(false)
