@@ -966,7 +966,6 @@ export default {
   "providerForm.titleAdd": "添加提供商",
   "providerForm.name": "名称",
   "providerForm.customOption": "自定义",
-  "providerForm.apiKeyEditHint": "留空保持原 key 不变",
   "providerForm.apiFormat": "协议格式",
   "providerForm.authScheme": "鉴权方式",
   "providerForm.modelMapSection": "模型映射",

@@ -822,7 +822,6 @@ export default {
   "providerForm.titleAdd": "Add Provider",
   "providerForm.name": "Name",
   "providerForm.customOption": "Custom",
-  "providerForm.apiKeyEditHint": "Leave blank to keep the existing key",
   "providerForm.apiFormat": "Protocol Format",
   "providerForm.authScheme": "Auth Scheme",
   "providerForm.modelMapSection": "Model mapping",

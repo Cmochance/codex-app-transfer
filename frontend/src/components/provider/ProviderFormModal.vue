@@ -100,8 +100,11 @@ const matchedPreset = computed(() => {
     ) || null
   )
 })
-// 命中 preset 且其带多个备选 baseUrl(如小米 MiMo Token Plan 三集群)→ baseUrl 用下拉
-const baseUrlOptions = computed(() => matchedPreset.value?.baseUrlOptions ?? [])
+// 命中 preset 且其带多个备选 baseUrl(如小米 MiMo Token Plan 三集群)→ baseUrl 用下拉。
+// 下拉直接显示 baseUrl 本身(label = value),不显示区域名等额外文案。
+const baseUrlOptions = computed(() =>
+  (matchedPreset.value?.baseUrlOptions ?? []).map((o) => ({ value: o.value, label: o.value })),
+)
 // 鉴权方式由 preset 决定且被后端 healing(ENFORCED_BUILTIN_FIELDS)强制覆盖,
 // 用户在此设置无效 → 内置 / 命中 preset 时隐藏, 仅自定义 provider 可选。
 const showAuthScheme = computed(() => !isBuiltin.value && !matchedPreset.value)
@@ -307,7 +310,7 @@ async function save() {
           @select="onPickName"
         />
       </SettingsRow>
-      <SettingsRow title="Base URL" :description="matchedPreset?.baseUrlHint || ''">
+      <SettingsRow title="Base URL">
         <AppSelect
           v-if="baseUrlOptions.length >= 2"
           v-model="form.baseUrl"
@@ -315,7 +318,7 @@ async function save() {
         />
         <AppInput v-else v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
-      <SettingsRow title="API Key" :description="isEdit ? t('providerForm.apiKeyEditHint') : ''">
+      <SettingsRow title="API Key">
         <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
       </SettingsRow>
       <SettingsRow :title="t('providerForm.apiFormat')">
