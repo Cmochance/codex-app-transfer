@@ -4,11 +4,19 @@
 //! 没有则弹窗让用户确认,确认后 `POST /api/chrome/ensure` 触发按需下载 chrome-headless-shell。
 //!
 //! - `GET  /api/chrome/detect` → `{ detected: bool, path?: string }`
+//! - `GET  /api/chrome/ready`  → `{ ready: bool }`
 //! - `POST /api/chrome/ensure` → `{ success: bool, path?: string, message?: string }`
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_http::headless;
 use serde_json::json;
+
+/// readiness gate(设置门控用,对齐 web_search MOC-190):已下载内置 shell **或** 系统 Chrome
+/// `--version` 自检通过 → ready,且**都不触发下载**。比 `detect` 更准 —— detect 只查系统 Chrome
+/// 文件存在,忽略已下载的 shell、也不做自检(stale/坏 Chrome 会被 detect 误判命中)。
+pub async fn ready() -> impl IntoResponse {
+    Json(json!({ "ready": headless::chrome_ready_without_download().await })).into_response()
+}
 
 /// 探测系统已装的 Chrome/Edge/Chromium(**不下载**)。命中返回路径。
 pub async fn detect() -> impl IntoResponse {

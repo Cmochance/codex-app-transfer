@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { i18nState, setLocale, t, tFmt } from '@/i18n'
 import { useAppearance, type Appearance } from '@/composables/useAppearance'
 import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
@@ -13,6 +13,8 @@ import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
 import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
+import AppModal from '@/components/ui/AppModal.vue'
+import { getChromeReady, ensureChrome, getSystemProxyStatus, type SystemProxyStatus } from '@/api/chrome'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
@@ -151,10 +153,19 @@ const fontSizeOptions: { value: FontSize; label: string }[] = [
 ]
 
 // webFetchBackend(off/auto/curl/wreq/headless;仅 off/auto 有 i18n,余技术名)
-const webFetchBackend = computed<string>({
-  get: () => store.str('webFetchBackend', 'auto'),
-  set: (v) => void persist({ webFetchBackend: v }),
-})
+// MOC-256:auto/headless 需真浏览器(Chrome)+ 系统代理就绪 → persist 前门控
+//(系统代理 gate → detect → 无 Chrome 则弹确认 modal → ensure 按需下载),其余档直存。
+const wfbDisplay = ref(store.str('webFetchBackend', 'auto'))
+const wfbSwitching = ref(false) // in-flight guard,防 ~20s 下载期间重复点
+const wfbPending = ref<string | null>(null) // 下载确认后要启用的档
+const wfbDownloadModal = ref(false)
+// store 变更(load / 外部)同步显示值,但门控进行中不打断用户当前选择
+watch(
+  () => store.str('webFetchBackend', 'auto'),
+  (v) => {
+    if (!wfbSwitching.value) wfbDisplay.value = v
+  },
+)
 const webFetchOptions: { value: string; label: string }[] = [
   { value: 'off', label: t('settings.webFetchBackend.off') },
   { value: 'auto', label: t('settings.webFetchBackend.auto') },
@@ -162,6 +173,93 @@ const webFetchOptions: { value: string; label: string }[] = [
   { value: 'wreq', label: 'wreq' },
   { value: 'headless', label: 'headless' },
 ]
+
+// 存档某档:乐观更新 wfbDisplay + store.save。webFetchSyncWarning(注册到 Codex 失败)
+// 不回退、仅警告并返 false 跳成功 toast;真保存失败回退到上次值 + 报「设置保存失败」(区分「下载失败」)。
+async function commitWebFetch(v: string): Promise<boolean> {
+  const prev = store.str('webFetchBackend', 'auto') // 失败回退目标,不依赖 store.save 内部回滚时序
+  wfbDisplay.value = v
+  try {
+    const warn = await store.save({ webFetchBackend: v })
+    if (warn) {
+      toast(warn, 'error')
+      return false
+    }
+    return true
+  } catch (e) {
+    wfbDisplay.value = prev
+    const msg = (e as Error).message
+    toast(t('settings.webFetchSaveFailed') + (msg ? `: ${msg}` : ''), 'error')
+    return false
+  }
+}
+
+async function onWebFetchChange(v: string | undefined) {
+  if (!v || wfbSwitching.value || v === store.str('webFetchBackend', 'auto')) return
+  // off/curl/wreq 不需浏览器 → 直接存档
+  if (v !== 'auto' && v !== 'headless') {
+    await commitWebFetch(v)
+    return
+  }
+  wfbSwitching.value = true
+  wfbDisplay.value = v
+  let pendingModal = false
+  try {
+    // 系统代理门槛(MOC-161):配了梯子但连不上 → 降级 wreq;没配 / PAC / 查询失败一律 fail-open。
+    let sp: SystemProxyStatus | null = null
+    try {
+      sp = (await getSystemProxyStatus()).systemProxy ?? null
+    } catch (e) {
+      // fail-open(查询失败放行),但留痕便于真机 DevTools 定位后端回归
+      console.warn('[webFetch gate] system-proxy status probe failed, fail-open:', e)
+      sp = null
+    }
+    const gateOk = !sp || sp.kind === 'pac' || !sp.configured || sp.connected === true
+    if (!gateOk) {
+      toast(t('settings.webFetchAutoNeedsProxy'))
+      await commitWebFetch('wreq')
+      return
+    }
+    // Chrome readiness:就绪(系统 Chrome 自检过 / 已下载 shell)直接存,未就绪弹下载确认(modal 期间保持 guard)
+    if ((await getChromeReady()).ready) {
+      if (await commitWebFetch(v)) toast(t('settings.headlessChromeSystemFound'))
+    } else {
+      pendingModal = true
+      wfbPending.value = v
+      wfbDownloadModal.value = true
+    }
+  } catch (e) {
+    wfbDisplay.value = store.str('webFetchBackend', 'auto')
+    toast((e as Error).message || t('settings.headlessChromeFailed'), 'error')
+  } finally {
+    if (!pendingModal) wfbSwitching.value = false
+  }
+}
+
+async function onChromeDownloadConfirm() {
+  wfbDownloadModal.value = false
+  toast(t('settings.headlessChromeDownloading'))
+  try {
+    await ensureChrome()
+  } catch (e) {
+    // 下载本身失败 → 回退高亮,报「下载失败」
+    toast((e as Error).message || t('settings.headlessChromeFailed'), 'error')
+    wfbDisplay.value = store.str('webFetchBackend', 'auto')
+    wfbSwitching.value = false
+    return
+  }
+  const bk = wfbPending.value || 'headless'
+  if (await commitWebFetch(bk)) toast(t('settings.headlessChromeDownloaded'))
+  wfbPending.value = null
+  wfbSwitching.value = false
+}
+
+function onChromeDownloadCancel() {
+  wfbDownloadModal.value = false
+  wfbDisplay.value = store.str('webFetchBackend', 'auto') // 取消回退到上次保存值
+  wfbPending.value = null
+  wfbSwitching.value = false
+}
 
 function onPort(key: 'proxyPort' | 'adminPort', e: Event) {
   const v = Number((e.target as HTMLInputElement).value)
@@ -224,7 +322,11 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
         <IconChevronRight class="nav-row__chevron" />
       </RouterLink>
       <SettingsRow :title="t('settings.webFetchBackend')" :description="t('settings.webFetchBackendHint')">
-        <SegmentedControl v-model="webFetchBackend" :options="webFetchOptions" />
+        <SegmentedControl
+          :model-value="wfbDisplay"
+          :options="webFetchOptions"
+          @update:model-value="onWebFetchChange"
+        />
       </SettingsRow>
     </SettingsGroup>
 
@@ -292,12 +394,48 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     </SettingsGroup>
 
     <FeedbackModal v-if="feedbackOpen" @close="feedbackOpen = false" />
+
+    <AppModal
+      v-if="wfbDownloadModal"
+      :title="t('settings.headlessChromeTitle')"
+      @close="onChromeDownloadCancel"
+    >
+      <div class="chrome-dl">
+        <p class="chrome-dl__desc">{{ t('settings.headlessChromeDesc') }}</p>
+        <div class="chrome-dl__actions">
+          <AppButton variant="ghost" :label="t('common.cancel')" @click="onChromeDownloadCancel" />
+          <AppButton
+            variant="primary"
+            :label="t('settings.headlessChromeConfirm')"
+            @click="onChromeDownloadConfirm"
+          />
+        </div>
+      </div>
+    </AppModal>
   </div>
 </template>
 
 <style scoped>
 .font-select {
   min-width: 120px;
+}
+.chrome-dl {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 360px;
+  max-width: 460px;
+}
+.chrome-dl__desc {
+  margin: 0;
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+.chrome-dl__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-3);
 }
 .settings-readonly {
   font-family: var(--font-mono);

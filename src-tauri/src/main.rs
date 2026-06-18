@@ -52,6 +52,18 @@ fn main() {
     // (registry healing / desktop apply / proxy 拉起)的 tracing event 会被 drop。
     telemetry_bridge::init_global_subscriber();
 
+    // MOC-256:在 Tauri / webview / HTTP 起来**之前**就把无 Chrome 新装的 webFetchBackend
+    // 落为 off,确保前端首次 GET /api/settings(及任何 save 响应)就读到 off —— 避免迁移
+    // 落盘前显示陈旧 auto、点已选中的 auto 触发 early-return 而非门控。临时 current-thread
+    // runtime 跑一次即 drop,不与 Tauri 自身 runtime 冲突;`--mcp-serve-webfetch` 子进程路径
+    // 已在 run() 内自行落盘,故此处只覆盖 GUI 进程。幂等 + 跨进程锁。
+    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        rt.block_on(crate::admin::services::mcp_servers::default_web_fetch_off_if_no_chrome());
+    }
+
     // [MOC-196] macOS 自管单实例:flock 持锁 + 就绪态握手 + 超时接管,根治
     // 「僵尸主实例 → 后续启动被插件无条件 exit(0) 静默杀」(#436)。guard 持有
     // flock 至进程结束;第二实例路径在内部 exit、不返回。Windows/Linux 仍走
@@ -308,6 +320,9 @@ fn main() {
                 // (config 已是某后端但还没注册过 → 补注册;off → 移除)。幂等:已一致则
                 // 不写 config.toml。Codex 需重启才会加载/卸载该 server。
                 {
+                    // MOC-256:webFetchBackend 已在 main()(Builder.run() 之前)对无 Chrome 新装
+                    // 落为 off,此处直接读当前值对齐 cat-webfetch MCP server 注册态(off → 不暴露
+                    // 联网工具)。有 Chrome 但未设置 → key 仍 absent → 沿用 schema 默认 auto。
                     let backend = codex_app_transfer_registry::config_file()
                         .and_then(|p| codex_app_transfer_registry::load_raw_config(&p).ok())
                         .and_then(|c| {
@@ -316,7 +331,7 @@ fn main() {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string())
                         })
-                        // MOC-215: raw fallback 对齐 schema 默认(off→auto),否则老用户启动 sync 不注册 MCP
+                        // 有 Chrome 但未设置 → helper no-op、key 仍 absent → 沿用 schema 默认 auto
                         .unwrap_or_else(|| {
                             codex_app_transfer_registry::schema::DEFAULT_WEB_FETCH_BACKEND.to_string()
                         });
