@@ -282,20 +282,17 @@ pub fn migrate_legacy_preset_names(cfg: &mut Value) -> bool {
         let Some(name) = name_val.as_str() else {
             continue;
         };
-        if let Some(&new_name) = RENAMES.iter().find_map(|(old, new)| {
-            if *old == name {
-                Some(new)
-            } else {
-                None
-            }
-        }) {
+        if let Some(&new_name) =
+            RENAMES
+                .iter()
+                .find_map(|(old, new)| if *old == name { Some(new) } else { None })
+        {
             obj.insert("name".to_owned(), Value::String(new_name.to_owned()));
             changed = true;
         }
     }
     changed
 }
-
 
 /// provider 是否有合法的 `grokWeb.cookies.sso` JWT(非空 string)。
 ///
