@@ -16,12 +16,14 @@ import AppButton from '@/components/ui/AppButton.vue'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
+import FeedbackModal from '@/components/settings/FeedbackModal.vue'
 import IconChevronRight from '~icons/lucide/chevron-right'
 
 const store = useSettingsStore()
 const { current: appearance, set: setAppearance } = useAppearance()
 const { show: toast } = useToast()
 const appVersion = ref('')
+const feedbackOpen = ref(false)
 
 onMounted(() => {
   if (!store.loaded) store.load().catch(() => {})
@@ -268,9 +270,11 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
         <AppButton size="sm" variant="secondary" :label="t('about.like')" @click="openExternal(UPDATE_REPO_URL)" />
       </SettingsRow>
       <SettingsRow :title="t('about.feedback')" :description="t('about.feedbackDesc')">
-        <AppButton size="sm" variant="ghost" :label="t('about.feedback')" @click="openExternal(`${UPDATE_REPO_URL}/issues`)" />
+        <AppButton size="sm" variant="ghost" :label="t('about.feedback')" @click="feedbackOpen = true" />
       </SettingsRow>
     </SettingsGroup>
+
+    <FeedbackModal v-if="feedbackOpen" @close="feedbackOpen = false" />
   </div>
 </template>
 

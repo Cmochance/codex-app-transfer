@@ -9,3 +9,13 @@ export const checkAppUpdate = () =>
   )
 export const openExternalUrl = (url: string) =>
   api<{ success?: boolean }>('POST', '/api/open-url', { url })
+
+// 反馈提交(接旧版 /api/feedback worker;body 必填,include_diagnostics 默认 true)
+export interface FeedbackPayload {
+  title?: string
+  contact_email?: string
+  body: string
+  include_diagnostics?: boolean
+}
+export const submitFeedback = (payload: FeedbackPayload) =>
+  api<{ id?: string }>('POST', '/api/feedback', payload)
