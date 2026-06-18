@@ -42,6 +42,29 @@ export function restartCodexApp() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Codex 插件解锁 daemon(CDP 注入,/api/desktop/plugin-unlock/*)
+// ───────────────────────────────────────────────────────────────────────────
+export type PluginUnlockState =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'injected'
+  | 'failed'
+export interface PluginUnlockStatusResp {
+  status: PluginUnlockState
+  message: string
+}
+export function pluginUnlockStatus() {
+  return api<PluginUnlockStatusResp>('GET', '/api/desktop/plugin-unlock/status')
+}
+export function pluginUnlockStart() {
+  return api('POST', '/api/desktop/plugin-unlock/start')
+}
+export function pluginUnlockReinject() {
+  return api('POST', '/api/desktop/plugin-unlock/reinject')
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Desktop 配置(Codex CLI 接管,/api/desktop/{status,configure,clear})
 // ───────────────────────────────────────────────────────────────────────────
 export interface DesktopHealth {
