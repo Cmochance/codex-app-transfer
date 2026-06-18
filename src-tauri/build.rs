@@ -34,6 +34,22 @@ fn main() {
             );
         }
     }
+    // release(`cargo tauri build`):debug 兜底建的占位 index.html 会跨 PROFILE 残留在
+    // gitignored dist 里(release 不重建占位、但也不清),若此时直接 release 而没先
+    // `npm run build`,include_dir! 会把"前端未构建"占位页静默打进发布包(chatgpt-codex P2)。
+    // 故在 release profile 显式拦截:dist/index.html 仍是 dev 占位 → 编译 fail 报清晰原因。
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        use std::path::Path;
+        let index = Path::new("../frontend/dist/index.html");
+        if let Ok(content) = std::fs::read_to_string(index) {
+            if content.contains("dev placeholder") {
+                panic!(
+                    "frontend/dist/index.html 仍是 dev 占位页(debug 兜底残留)。release \
+                     构建前请先运行 `npm --prefix frontend run build` 生成真实 dist。"
+                );
+            }
+        }
+    }
     // PROFILE 变化(debug↔release)时重跑 build script,确保 release 不残留 debug 建的占位逻辑判断。
     println!("cargo:rerun-if-env-changed=PROFILE");
 

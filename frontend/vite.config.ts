@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import Icons from 'unplugin-icons/vite'
 import { fileURLToPath, URL } from 'node:url'
 
 // Tauri webview 在 prod 通过 cas://localhost/ 加载，由后端 axum static_files.rs
@@ -8,7 +9,11 @@ import { fileURLToPath, URL } from 'node:url'
 // （SFC 预编译，无模板编译器/eval）。下面的配置确保这两点。
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [vue()], // @vitejs/plugin-vue 在构建期把 SFC 编译成 render 函数，运行时不含 eval
+  plugins: [
+    vue(), // @vitejs/plugin-vue 在构建期把 SFC 编译成 render 函数，运行时不含 eval
+    // 编译期把 lucide 图标内联成 Vue SVG 组件(~icons/lucide/*), CSP 友好、tree-shake、无运行时字体
+    Icons({ compiler: 'vue3' }),
+  ],
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },

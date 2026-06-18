@@ -912,13 +912,13 @@ fn current_backend() -> Result<Option<WebFetchBackend>, String> {
     Ok(WebFetchBackend::parse(s))
 }
 
-/// 本应用图标(128x128 PNG)的 data URI —— 给 MCP `serverInfo.icons`。一次编码后缓存(initialize 不
-/// 频繁, OnceLock 足够)。图标取自 `src-tauri/icons/128x128.png`(Tauri app icon)。
+/// web_fetch MCP 图标(128x128 PNG)的 data URI —— 给 MCP `serverInfo.icons`(Codex 折叠工具汇总渲染的小叠层图标)。
+/// 一次编码后缓存(OnceLock)。图标取自 `src-tauri/icons/webfetch-mcp.png`(黑色透明菜单栏风,贴合 cat-webfetch 命名)。
 fn app_icon_data_uri() -> &'static str {
     use base64::Engine as _;
     static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     URI.get_or_init(|| {
-        let png = include_bytes!("../icons/128x128.png");
+        let png = include_bytes!("../icons/webfetch-mcp.png");
         let b64 = base64::engine::general_purpose::STANDARD.encode(png);
         format!("data:image/png;base64,{b64}")
     })

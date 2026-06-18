@@ -2,7 +2,7 @@
 
 use codex_app_transfer_registry::{
     config_file, heal_builtin_provider_fields, heal_legacy_update_url, load_raw_config,
-    save_raw_config, RawConfig, DEFAULT_UPDATE_URL,
+    migrate_legacy_preset_names, save_raw_config, RawConfig, DEFAULT_UPDATE_URL,
 };
 use serde_json::{json, Value};
 
@@ -41,6 +41,10 @@ pub fn load() -> Result<RawConfig, String> {
     // 与 provider healing 相同策略：有变更就尽量写回磁盘，避免用户下次启动
     // 仍被残留的旧仓库 URL 带偏“检查更新”。
     if heal_legacy_update_url(&mut cfg) {
+        healed = true;
+    }
+    // 迁移旧 preset 显示名（月之暗面→MoonShot / 智谱 GLM Coding→GLM Coding / 阿里云百炼→Aliyuncs）。
+    if migrate_legacy_preset_names(&mut cfg) {
         healed = true;
     }
     if healed {

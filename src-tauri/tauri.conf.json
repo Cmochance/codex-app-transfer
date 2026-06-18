@@ -5,7 +5,7 @@
   "identifier": "store.alyse.codex-app-transfer",
   "build": {
     "frontendDist": "../frontend/dist",
-    "beforeDevCommand": "npm install && npm run dev",
+    "beforeDevCommand": "npm --prefix frontend install && npm --prefix frontend run dev",
     "devUrl": "http://localhost:1420"
   },
   "app": {
@@ -14,10 +14,12 @@
       {
         "label": "main",
         "title": "Codex App Transfer",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
         "url": "cas://localhost/",
-        "width": 1100,
+        "width": 800,
         "height": 760,
-        "minWidth": 900,
+        "minWidth": 700,
         "minHeight": 600,
         "resizable": true,
         "fullscreen": false

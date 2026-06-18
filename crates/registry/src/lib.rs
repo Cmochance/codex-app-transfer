@@ -31,6 +31,7 @@ pub use compact_thinking_policy::{compact_disable_thinking_wire, DisableThinking
 pub use healing::heal_builtin_extra_headers;
 pub use healing::heal_builtin_provider_fields;
 pub use healing::heal_legacy_update_url;
+pub use healing::migrate_legacy_preset_names;
 pub use model_alias::{
     empty_model_mappings, has_internal_one_m_suffix, normalize_model_mappings, openai_model_slot,
     provider_slug, strip_internal_model_suffix, MODEL_ORDER, MODEL_SLOTS,

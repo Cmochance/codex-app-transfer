@@ -4,8 +4,8 @@
 //! - 不绑端口:通过 Tauri 的自定义 URI scheme(`cas://localhost/`)将 webview
 //!   请求路由进 axum router(`tower::ServiceExt::oneshot`),全程同进程,无 TCP
 //!   往返
-//! - **frontend/ 整目录通过 `include_dir!` 编进二进制**,首次加载零 IO
-//! - `/api/*` 数据 shape **严格对齐 v1.4**(frontend/js/api.js 不需要任何改动)
+//! - **`frontend/dist`(Vue/Vite 构建产物)通过 `include_dir!` 编进二进制**,首次加载零 IO
+//! - `/api/*` 数据 shape 沿用 v1.4 契约,由 `frontend/src/api/*.ts`(Vue 重构后)消费
 //!
 //! 详见 docs/refactor/migration.md Stage 6 修订日志。
 
@@ -242,6 +242,8 @@ pub fn build_app_router(state: AdminState) -> Router {
         )
         // Feedback
         .route("/api/feedback", post(handlers::feedback::submit_feedback))
+        // 系统浏览器打开外部 URL(点赞/反馈链接等)
+        .route("/api/open-url", post(handlers::common::open_url_handler))
         // Gemini CLI OAuth (login / status / logout)
         .merge(handlers::gemini_oauth::routes())
         // Plugin Unlock (CDP injection for Codex Desktop)
