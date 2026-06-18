@@ -110,10 +110,10 @@ codex-app-transfer/
 │   ├── codex_integration/      # 守护 ~/.codex/{config.toml,auth.json} 快照 / 还原 + MCP OAuth 凭据可移植保险箱
 │   └── gemini_oauth/           # Gemini CLI + Antigravity OAuth flow
 │
-├── frontend/                   # 前端 (静态文件被 include_dir! 编进二进制)
-│   ├── css/{tokens,base,responsive}.css + components/<name>.css + pages/<route>.css
-│   ├── gallery.html            # 组件预览页 (不需 dev server, 直接 open)
-│   └── js/api.js               # 调 cas://localhost/api/*
+├── frontend/                   # 前端 (Vue 3 + Vite + TS; npm run build 出 dist/ 被 include_dir! 编进二进制)
+│   ├── src/                    # main.ts + App.vue (重构进行中: 逐步迁 components/pages/stores/api/i18n)
+│   ├── vite.config.ts          # base './' + modulePreload.polyfill=false (CSP script-src 'self' 合规)
+│   └── public/assets/          # app + provider 图标 (vite 原样拷到 dist 根)
 │
 ├── xtask/                      # release-bundle (签名 + latest.json) + gen-fixtures
 ├── release/                    # 内置公钥 PEM (build-time include_str!)
@@ -530,7 +530,7 @@ Codex Desktop 默认隐藏 `Plugins` 选项卡(只对 ChatGPT 账号开放)。Pl
 | `cargo run -p xtask -- release-bundle` 报 "no platform artifacts found" | 这是预期,首次跑生成 keypair 即可 |
 | MiMo / Kimi 突然连不通 | 先查 `~/.codex-app-transfer/config.json` 里 `apiFormat` / `extraHeaders` 是否完整,缺失就是 healing 没生效 |
 | 客户端验签失败 | `rsa` / `sha2` crate 版本是否两边对齐(`src-tauri` vs `xtask`),`sha2` 必须带 `oid` feature |
-| `cargo tauri dev` 改前端不刷新 | frontend 是 `include_dir!` 编进二进制的,dev 模式仍走文件系统;改 `frontend/*.html|css|js` 不需重编译,改 Rust 需 |
+| `cargo tauri dev` 改前端不刷新 | 前端是 Vite 项目,dev 经 `beforeDevCommand` 拉起 vite(`localhost:1420`)+ HMR;改 `frontend/src/*.vue\|*.ts` 自动热更,改 Rust 需重编。prod 是 `npm run build` 出 `frontend/dist/` 被 `include_dir!` 嵌进二进制 |
 | 单实例锁死(双开打不开) | `tauri_plugin_single_instance` + `fs2::FileExt` 跨进程 file lock 双层;查 `~/.codex-app-transfer/.lock`(或类似) |
 
 ---

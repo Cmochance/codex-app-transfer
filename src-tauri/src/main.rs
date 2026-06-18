@@ -115,6 +115,18 @@ fn main() {
             // [MOC-211] 存全局 AppHandle 供 MiMo 小米账号内嵌 webview 登录开窗用
             // (AdminState 在建 router 时尚无 AppHandle,故走全局 OnceLock)。
             mimo_session::init(app.handle().clone());
+
+            // [dev] tauri.conf.json 的 window url 是 cas://localhost/(prod 同进程 axum 派发)。
+            // cas:// 是自定义协议,Tauri 不会用 build.devUrl 替换它(devUrl 只对 app-relative
+            // URL 生效),故 dev 模式手动把主窗口导航到 vite dev server,享受 HMR;前端 /api
+            // 请求经 vite proxy → 127.0.0.1:18900 的 debug TCP listener(见下方 app.run 前)。
+            // release 不编译此段,窗口仍走 cas://localhost/。
+            #[cfg(debug_assertions)]
+            if let Some(w) = app.get_webview_window("main") {
+                if let Ok(url) = "http://localhost:1420".parse::<tauri::Url>() {
+                    let _ = w.navigate(url);
+                }
+            }
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
 
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
@@ -547,6 +559,31 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error while building Codex App Transfer");
+
+    // [dev] vite dev server 在 http://localhost:1420 提供前端(HMR),其 /api 请求经
+    // vite proxy(vite.config.ts server.proxy)转发到这里的 TCP 监听 —— 因为 dev 下
+    // webview 在 devUrl 而非 cas://,相对路径 /api 打不到同进程 cas scheme 派发。
+    // prod 走 cas:// 同进程 axum,不绑任何 TCP 端口;故此监听仅 debug 编译。
+    #[cfg(debug_assertions)]
+    {
+        let dev_router = app_router.clone();
+        tauri::async_runtime::spawn(async move {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 18900));
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tracing::info!(
+                        "[dev] admin API listening on http://{addr} (vite proxy /api → here)"
+                    );
+                    if let Err(e) =
+                        axum::serve(listener, (*dev_router).clone().into_make_service()).await
+                    {
+                        tracing::warn!("[dev] admin API listener exited: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("[dev] failed to bind {addr} for admin API: {e}"),
+            }
+        });
+    }
 
     app.run(|app_handle, event| {
         // [MOC-196] 窗口创建成功(Ready)→ 单实例握手开始回 OK(此前回 STARTING)。

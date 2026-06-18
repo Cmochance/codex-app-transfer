@@ -9,8 +9,10 @@ use axum::{
 };
 use include_dir::{include_dir, Dir};
 
-/// frontend/ 目录在编译期被嵌入。路径相对 src-tauri/Cargo.toml 所在目录。
-static FRONTEND: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../frontend");
+/// frontend/dist/(Vite 构建产物)在编译期被嵌入。路径相对 src-tauri/Cargo.toml
+/// 所在目录。dist 必须在 cargo 编译前由 `npm run build` 生成(tauri
+/// beforeBuildCommand / CI / Makefile 负责),否则 include_dir! 编译期 panic。
+static FRONTEND: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../frontend/dist");
 
 pub async fn serve_static(req: Request) -> Response {
     let path = req.uri().path();

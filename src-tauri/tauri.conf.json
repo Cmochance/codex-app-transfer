@@ -4,7 +4,9 @@
   "version": "2.3.4",
   "identifier": "store.alyse.codex-app-transfer",
   "build": {
-    "frontendDist": "../frontend"
+    "frontendDist": "../frontend/dist",
+    "beforeDevCommand": "npm install && npm run dev",
+    "devUrl": "http://localhost:1420"
   },
   "app": {
     "withGlobalTauri": true,

@@ -220,30 +220,17 @@ viewer 现在有六个分页(顶部 `种类` 下拉切换):**forward**(协议转
 
 forward 分页详情为调 adapter 准备了几件利器(借鉴 [`liaohch3/claude-tap`](https://github.com/liaohch3/claude-tap),MOC-184):**一键 copy-as-cURL**(把 OUTBOUND 复刻成 curl 打上游,秒分「adapter 错 vs 上游错」;凭据已脱敏需自行填回)+ 复制 INBOUND/OUTBOUND body;**INBOUND↔OUTBOUND 行级 diff**(直接看出 adapter 把 Codex 原始请求转成了啥);**单请求 token 用量分解**(输入/输出/总计/缓存命中/推理,兼容 Responses / Chat / Gemini / Anthropic 各家命名);**tools[] 与消息结构化卡片**(跨协议尽力识别,识别不了退回原文)。列表还可按 `provider` / `model` 分组,`j`/`k`(或方向键)键盘上下导航。
 
-### 想改 UI 样式怎么改
+### 想改 UI 怎么改
 
-`frontend/css/` 走"组件库"形式拆开,不需要全文 grep `style.css`:
+前端是 **Vue 3 + Vite + TypeScript**(`frontend/`,正从旧 vanilla JS 逐步重构迁移)。源码在 `frontend/src/`(SFC 单文件组件 + Pinia + vue-router)。
 
-| 想改什么 | 改哪个文件 |
-|---|---|
-| 主题色 / 圆角 / 阴影 / 间距等 design tokens | `frontend/css/tokens.css`(129 vars + 6 套主题) |
-| 全局 reset / body 字体 / focus 描边 | `frontend/css/base.css` |
-| 按钮 / 卡片 / 表单 / 徽章 / 模态等组件 | `frontend/css/components/<name>.css` |
-| 仪表盘 / 提供商 / 转发 / 设置 / 引导某一页专属样式 | `frontend/css/pages/<route>.css` |
-| 响应式断点 / 1100px / 720px | `frontend/css/responsive.css` |
-
-预览所有组件 + 各状态 + 主题切换:
+开发(热更新):
 
 ```bash
-# 浏览器直接打开(不需 dev server)
-open frontend/gallery.html        # macOS
-xdg-open frontend/gallery.html    # Linux
-start frontend/gallery.html       # Windows
+cargo tauri dev    # 经 beforeDevCommand 拉起 vite (localhost:1420) + HMR,改 .vue/.ts 自动刷新
 ```
 
-`gallery.html` 顶部有主题切换 + 深浅色按钮,改 component css 后刷新即看。`frontend/index.html` 主入口 `<link href="css/style.css">` 不需要改 — `style.css` 只是 @import 入口聚合所有子文件。
-
-加新组件: 在 `components/` 建 `<name>.css` + 在 `style.css` 加一行 `@import url("components/<name>.css");` + 在 `gallery.html` 加 section。
+打包:`npm --prefix frontend run build` 出 `frontend/dist/`,被 `src-tauri` 的 `include_dir!` 编进二进制(prod 走 `cas://localhost/` 加载,严格 CSP `script-src 'self'`)。MacBook 风设计系统与三套主题(白 / 黑 / 国风)随重构阶段落地。
 
 ## 常见问题
 

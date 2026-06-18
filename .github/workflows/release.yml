@@ -174,6 +174,21 @@ jobs:
       # 因为第二次 cargo tauri build --bundles dmg 时 Tauri 会重新 bundle .app,
       # 把手动 codesign 结果覆盖 (PR #13 review 实测验证). 必须 Tauri 自己在
       # 同一次 build 里完成签名链.
+      # frontend/ 是 Vite 项目, dist 被 src-tauri include_dir! 编译期嵌入。
+      # 必须在 cargo tauri build 前产出 frontend/dist (CI runner 无 node_modules,
+      # 且 tauri.conf.json 不设 beforeBuildCommand)。setup-node 跨平台。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend (produce dist for include_dir!)
+        shell: bash
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+
       - name: cargo tauri build
         working-directory: src-tauri
         shell: bash

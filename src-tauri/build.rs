@@ -4,9 +4,38 @@ fn main() {
     // 错误显示 "OpenAI Chat" 而不是 "Gemini Native",root cause 就是 binary 用的是
     // 5月9日的旧版本(cargo 没探测到 frontend 改动)。
     //
-    // 显式声明 frontend 改动 + presets_data.json(embed 进 binary)→ 触发 rerun build。
-    println!("cargo:rerun-if-changed=../frontend");
+    // 显式声明 frontend 产物 + presets_data.json(embed 进 binary)→ 触发 rerun build。
+    // include_dir! 嵌入的是 ../frontend/dist(Vite 产物),只 watch dist 即可(改 frontend/src
+    // 需 `npm run build` 产新 dist 才影响 binary);避免 watch ../frontend 整目录把 node_modules
+    // 也纳入、每次 npm 操作触发重编。
+    println!("cargo:rerun-if-changed=../frontend/dist");
     println!("cargo:rerun-if-changed=../crates/registry/src/presets_data.json");
+
+    // frontend/dist 是 gitignored 构建产物。fresh checkout / `make clean` 后裸
+    // `cargo check`/`cargo tauri dev`(debug)会因 static_files.rs 的 include_dir!(编译期展开)
+    // 找不到 dist 而 panic。**仅在 debug profile** 兜底创建占位 index.html 让 dev/check 可编译;
+    // release(`cargo tauri build`)**不**建占位 —— 若没先 `npm run build` 真 dist,就让
+    // include_dir! 因 dist 缺失而编译 fail(明确报错),避免静默把"前端未构建"占位页打进
+    // release 包(直接 cargo tauri build 时)。真正产物由 `npm --prefix frontend run build`
+    // 生成(Makefile mac-app / CI rust-tauri-check / release.yml 均已在 cargo 前显式 build)。
+    if std::env::var("PROFILE").as_deref() == Ok("debug") {
+        use std::path::Path;
+        let index = Path::new("../frontend/dist/index.html");
+        if !index.exists() {
+            let _ = std::fs::create_dir_all("../frontend/dist");
+            let _ = std::fs::write(
+                index,
+                "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
+                 <title>Codex App Transfer</title></head>\
+                 <body style=\"font-family:-apple-system,system-ui,sans-serif;padding:2rem;color:#1d1d1f\">\
+                 <h2>前端未构建 / Frontend not built (dev placeholder)</h2>\
+                 <p>运行 <code>npm --prefix frontend run build</code> 生成 frontend/dist 后重新编译。</p>\
+                 </body></html>",
+            );
+        }
+    }
+    // PROFILE 变化(debug↔release)时重跑 build script,确保 release 不残留 debug 建的占位逻辑判断。
+    println!("cargo:rerun-if-env-changed=PROFILE");
 
     // 让 updateUrl 默认值“跟随当前发布仓库”（任务 1）。
     // - CI release 里通过 GITHUB_REPOSITORY 注入真实 owner/repo，binary 里 baked 的

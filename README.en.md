@@ -221,28 +221,15 @@ The viewer now has six tabs (switch via the "Kind" dropdown): **forward** (proto
 
 ### Tweaking the UI
 
-`frontend/css/` is organized as a small component library — no need to grep the whole `style.css`:
+The frontend is **Vue 3 + Vite + TypeScript** (`frontend/`, mid-migration from the old vanilla-JS stack). Source lives in `frontend/src/` (SFC single-file components + Pinia + vue-router).
 
-| What to tweak | Where to edit |
-|---|---|
-| Theme colors / radius / shadow / spacing (design tokens) | `frontend/css/tokens.css` (129 vars + 6 themes) |
-| Global reset / body font / focus ring | `frontend/css/base.css` |
-| Buttons / cards / forms / badges / modals etc. | `frontend/css/components/<name>.css` |
-| Page-specific styles for dashboard / providers / proxy / settings / guide | `frontend/css/pages/<route>.css` |
-| Responsive breakpoints (1100px / 720px) | `frontend/css/responsive.css` |
-
-Preview every component + variant + theme switching:
+Dev (hot reload):
 
 ```bash
-# Open directly in your browser (no dev server needed)
-open frontend/gallery.html        # macOS
-xdg-open frontend/gallery.html    # Linux
-start frontend/gallery.html       # Windows
+cargo tauri dev    # beforeDevCommand spins up vite (localhost:1420) + HMR; editing .vue/.ts auto-refreshes
 ```
 
-`gallery.html` has a theme picker + dark/light toggle at the top, refresh after editing component css to see changes. `frontend/index.html`'s `<link href="css/style.css">` does not need to change — `style.css` is just an `@import` entry that aggregates every sub-file.
-
-To add a new component: create `components/<name>.css` + add a line `@import url("components/<name>.css");` to `style.css` + add a section in `gallery.html`.
+Build: `npm --prefix frontend run build` emits `frontend/dist/`, embedded into the binary via `src-tauri`'s `include_dir!` (prod loads over `cas://localhost/` under a strict CSP `script-src 'self'`). The MacBook-style design system and three themes (light / dark / Chinese-ink) land across the refactor stages.
 
 ## Troubleshooting
 
