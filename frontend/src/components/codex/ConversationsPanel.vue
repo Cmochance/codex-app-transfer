@@ -442,12 +442,13 @@ onMounted(() => {
 </template>
 
 <style scoped>
+/* 局部固定高(= 视口 - 标题栏/标签栏/子导航/内边距)+ flex:列表 flex:1 框内滚,
+   「默认导出文件夹」常驻底部。自包含,不依赖全局布局;236 可微调。 */
 .conv {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  flex: 1;
-  min-height: 0;
+  height: calc(100vh - 236px);
 }
 .conv__warn {
   margin: 0;

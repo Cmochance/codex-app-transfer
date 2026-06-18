@@ -34,7 +34,7 @@ const tab = computed<Tab>({
 </script>
 
 <template>
-  <div class="codex-page">
+  <div>
     <div class="codex-subnav">
       <SegmentedControl v-model="tab" :options="tabOptions" />
     </div>
@@ -51,13 +51,6 @@ const tab = computed<Tab>({
 </template>
 
 <style scoped>
-/* flex 列:让 Sessions(ConversationsPanel)能 flex:1 撑满到底部内边距 */
-.codex-page {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
 .codex-subnav {
   display: flex;
   justify-content: center;

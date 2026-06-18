@@ -285,9 +285,10 @@ const cacheBars = computed(() => {
 </template>
 
 <style scoped>
+/* 局部固定高(= 视口 - 标题栏/标签栏/内边距)+ flex:KPI/工具栏固定,表格 flex:1 框内滚。
+   自包含,不依赖全局布局;180 这个数若偏多/偏少可微调。 */
 .usage-page {
-  flex: 1;
-  min-height: 0;
+  height: calc(100vh - 180px);
   display: flex;
   flex-direction: column;
 }

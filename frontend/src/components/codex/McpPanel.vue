@@ -686,8 +686,6 @@ watch(subpane, (sub) => loadSubpane(sub))
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  flex: 1;
-  min-height: 0;
 }
 .mcp__subnav {
   display: flex;
@@ -709,19 +707,13 @@ watch(subpane, (sub) => loadSubpane(sub))
   font-size: var(--fs-sm);
 }
 
-/* servers subpane 撑满 + split 框内滚(替代估算 calc 高度) */
-.mcp__servers {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
+/* servers split */
 .mcp__split {
   display: grid;
   grid-template-columns: 200px 1fr;
   gap: var(--space-3);
-  flex: 1;
-  min-height: 0;
+  height: calc(100vh - 280px);
+  min-height: 320px;
 }
 .mcp__list {
   display: flex;
@@ -873,14 +865,11 @@ watch(subpane, (sub) => loadSubpane(sub))
   gap: var(--space-2);
 }
 
-/* plugins:填满 + 框内滚 */
+/* plugins */
 .mcp__plugins {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
 }
 .mcp__plugin {
   display: flex;
@@ -923,14 +912,11 @@ watch(subpane, (sub) => loadSubpane(sub))
   color: var(--text-muted);
 }
 
-/* marketplace:填满 + 框内滚 */
+/* marketplace */
 .mcp__market {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
 }
 .mcp__sources {
   display: flex;
