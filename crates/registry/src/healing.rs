@@ -549,6 +549,34 @@ mod tests {
     }
 
     #[test]
+    fn heals_stale_zhipu_coding_claude_cli_ua_to_empty() {
+        // 回归(PR #502):旧 zhipu-coding preset 曾带 `User-Agent: claude-cli/...`,
+        // 存量用户 config.json 已快照该 UA。ZCode 指纹头改由 forward.rs 代码层注入后,
+        // preset extraHeaders 置为空对象 `{}` —— healing 必须把残留的 claude-cli UA
+        // 覆盖成 `{}`(preset 声明了该字段 → preset_specifies==true),否则它会与代码层
+        // 注入的 ZCode UA append 成双 User-Agent,BigModel 判定为非 ZCode 客户端。
+        let mut cfg = json!({
+            "providers": [
+                {
+                    "id": "a1b2c3d4",
+                    "name": "智谱 GLM Coding",
+                    "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+                    "isBuiltin": true,
+                    "apiFormat": "openai_chat",
+                    "extraHeaders": { "User-Agent": "claude-cli/2.1.175 (external, cli)" }
+                }
+            ]
+        });
+        let changed = heal_builtin_provider_fields(&mut cfg);
+        assert!(changed, "残留的 claude-cli UA 应被清除 → 报告有改动");
+        assert_eq!(
+            cfg["providers"][0]["extraHeaders"],
+            json!({}),
+            "extraHeaders 应被 healing 覆盖成空对象,残留 claude-cli UA 清除"
+        );
+    }
+
+    #[test]
     fn heals_user_built_provider_when_baseurl_matches_preset() {
         // 关键回归(2026-05-08):真机配置里所有 builtin-类 provider 都
         // `isBuiltin=false`、id 是随机 hex —— 老识别规则 (id == preset.id)
