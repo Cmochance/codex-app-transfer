@@ -14,7 +14,7 @@ use codex_app_transfer_codex_integration::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::admin::handlers::common::err;
+use crate::admin::handlers::common::{err, open_directory};
 use crate::admin::handlers::proxy::read_proxy_port;
 use crate::admin::registry_io::load as load_registry;
 
@@ -301,6 +301,25 @@ pub async fn restart_codex_app(State(state): State<crate::admin::AdminState>) ->
             service.reinject().await;
             Json(json!({"success": true, "desktopSync": desktop_sync})).into_response()
         }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// POST /api/desktop/open-config-dir — 在系统文件管理器打开本应用数据目录
+/// (`~/.codex-app-transfer/`,内含 Codex 原配置快照 / 备份),方便用户查找。
+pub async fn open_config_dir() -> impl IntoResponse {
+    let Some(dir) = codex_app_transfer_registry::paths::config_dir() else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位数据目录").into_response();
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("创建数据目录失败: {e}"),
+        )
+        .into_response();
+    }
+    match open_directory(&dir) {
+        Ok(_) => Json(json!({"success": true})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

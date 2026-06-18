@@ -936,6 +936,7 @@ export default {
   "settings.codexDesktopGroup": "Codex 桌面",
   "settings.codexThemeRowDesc": "修改 Codex Desktop 外观",
   "settings.codexSnapshotTitle": "Codex 配置快照",
+  "settings.openConfigFolder": "打开文件夹",
   "common.back": "返回",
   "settings.groupAppearance": "外观与语言",
   "settings.groupStartup": "启动与配置",

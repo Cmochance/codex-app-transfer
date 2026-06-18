@@ -131,6 +131,10 @@ pub fn build_app_router(state: AdminState) -> Router {
             post(handlers::desktop::restart_codex_app),
         )
         .route(
+            "/api/desktop/open-config-dir",
+            post(handlers::desktop::open_config_dir),
+        )
+        .route(
             "/api/desktop/snapshot-status",
             get(handlers::desktop::desktop_snapshot_status),
         )

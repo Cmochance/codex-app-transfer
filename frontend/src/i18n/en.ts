@@ -792,6 +792,7 @@ export default {
   "settings.codexDesktopGroup": "Codex Desktop",
   "settings.codexThemeRowDesc": "Inject a skin over Codex Desktop's native UI",
   "settings.codexSnapshotTitle": "Codex config snapshot",
+  "settings.openConfigFolder": "Open folder",
   "common.back": "Back",
   "settings.groupAppearance": "Appearance & Language",
   "settings.groupStartup": "Startup & Config",

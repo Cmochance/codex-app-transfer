@@ -305,13 +305,6 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     </SettingsGroup>
 
     <SettingsGroup :title="t('settings.groupCodexConfig')">
-      <RouterLink to="/desktop" class="nav-row">
-        <div class="nav-row__text">
-          <div class="nav-row__title">{{ t('settings.codexCliRow') }}</div>
-          <div class="nav-row__desc">{{ t('settings.codexCliRowDesc') }}</div>
-        </div>
-        <IconChevronRight class="nav-row__chevron" />
-      </RouterLink>
       <ResidualScanPanel />
       <SnapshotPanel />
     </SettingsGroup>

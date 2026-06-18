@@ -40,6 +40,10 @@ export function themeDeleteCustom() {
 export function restartCodexApp() {
   return api('POST', '/api/desktop/restart-codex-app')
 }
+// 在系统文件管理器打开本应用数据目录(~/.codex-app-transfer/,含原配置快照/备份)
+export function openCodexConfigDir() {
+  return api('POST', '/api/desktop/open-config-dir')
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Codex 插件解锁 daemon(CDP 注入,/api/desktop/plugin-unlock/*)
