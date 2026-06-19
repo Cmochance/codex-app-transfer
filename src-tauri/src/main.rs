@@ -277,7 +277,13 @@ fn main() {
                     })
                     .unwrap_or(true)
                 && admin::services::desktop::snapshot::active_provider_supports_relay();
-            codex_app_transfer_proxy::set_fake_account_mode(will_apply_synthetic);
+            // [MOC-257 review] 伪造器开 = 本次将 apply synthetic **或** 盘上已是合成态(上次 apply 后
+            // restoreCodexOnExit=false 没还原、auth.json 仍合成 + relay 仍指 proxy)。后者即使本次跳过 apply
+            // 也要保持伪造开,否则 /backend-api 经现存 relay 透传假 token 撞 401。非合成态(active 不是合成
+            // 且不 apply synthetic)则关,避免残留 config 误伪造。
+            codex_app_transfer_proxy::set_fake_account_mode(
+                will_apply_synthetic || crate::codex_real_account::active_is_synthetic(),
+            );
 
             // #MOC-54:保留 JoinHandle,让下面的残留扫描能 await auto_apply
             // 真正跑完(确定性),而不是用固定 sleep 猜它有没有落盘。
