@@ -200,6 +200,10 @@ jobs:
           # 结合 src-tauri/build.rs 的 option_env! 实现：用户下载这个 release 的 .app/.exe
           # 后，设置页“检查更新”默认就去本仓库的 releases 拉 latest.json。
           CODEX_APP_TRANSFER_REPO: ${{ github.repository }}
+          # 连接器市场官方源(私有 storage 仓库镜像)的只读 token，经 src-tauri/build.rs 的
+          # option_env! 烤进二进制（storage_token() build-baked 分支）。secret 未配置时解析成空串，
+          # storage_token() 自动 fallthrough 到运行时 env / dev 文件，不影响 build。
+          CODEX_APP_TRANSFER_STORAGE_TOKEN: ${{ secrets.CODEX_APP_TRANSFER_STORAGE_TOKEN }}
         run: |
           [[ -n "$APPLE_SIGNING_IDENTITY_RAW" ]] && export APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY_RAW"
           [[ -n "$APPLE_API_ISSUER_RAW" ]] && export APPLE_API_ISSUER="$APPLE_API_ISSUER_RAW"
