@@ -883,7 +883,11 @@ fn build_synthetic_auth() -> Value {
 /// 账号则 no-op(不每次 churn auth.json + 触发 Codex 重读)。持 `AUTH_LOCK`。caller 随后 apply
 /// relay(写 `chatgpt_base_url`→proxy)。
 ///
-/// **防误伤**:活动已是**真实** chatgpt(无哨兵)→ 拒绝,不覆盖真账号(应改用真实账号模式)。
+/// **防误伤**:活动有**真实 chatgpt tokens**(无哨兵)→ 拒绝,不覆盖真账号(应改用真实账号模式)。
+/// [MOC-257 bot P1] 用 `parse_chatgpt_tokens`(只看 tokens 非空、**不看 auth_mode**)判定,而非
+/// `parse_chatgpt_auth`(要 auth_mode==chatgpt):用户关真实账号模式后,活动是 `auth_mode=apikey` 但
+/// **保留真 tokens**(MOC-178 设计,供退出 restore 恢复);若只判 auth_mode==chatgpt 会漏判这种态、
+/// 合成写覆盖掉唯一一份可恢复的真 tokens(disable 又不自动 restore 备份)→ 用户丢真账号。
 pub async fn activate_fake_account() -> Result<(), String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
@@ -891,10 +895,10 @@ pub async fn activate_fake_account() -> Result<(), String> {
         if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
             return Ok(()); // 已是合成账号 → no-op
         }
-        // 活动是真实 chatgpt(有 tokens、无哨兵)→ 拒绝覆盖。
-        if parse_chatgpt_auth(&v).is_some() {
+        // 活动有真实 chatgpt tokens(无哨兵,含「已切 apikey 但保留 tokens」态)→ 拒绝覆盖。
+        if parse_chatgpt_tokens(&v).is_some() {
             return Err(
-                "检测到真实 ChatGPT 账号,模拟账号会覆盖它;请改用「真实账号模式」,或先清除真实账号"
+                "检测到 ChatGPT 登录态(tokens),模拟账号会覆盖它;请改用「真实账号模式」,或先在真实账号面板彻底清除"
                     .to_owned(),
             );
         }

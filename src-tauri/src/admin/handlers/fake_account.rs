@@ -85,7 +85,15 @@ pub async fn enable_handler(State(state): State<AdminState>) -> impl IntoRespons
 /// 活动停在「apikey 但无 key」残缺态,**不报成功切回**,告知用户需配 provider(对齐「禁止把失败
 /// 伪装成成功」硬规则)。
 pub async fn disable_handler(State(state): State<AdminState>) -> impl IntoResponse {
-    let _ = super::settings::set_fake_account_mode_enabled(false);
+    // [MOC-257 bot P2] flag 落 false 失败要如实报告:吞掉的话磁盘仍 fakeAccountModeEnabled=true,
+    // 下次启动 reconcile 会据 stale flag 重建合成账号 → 用户点的「关闭」并不持久,恰是磁盘/权限
+    // 失败这种最该提示的场景。捕获结果,失败时 error 留痕 + 进入下方非 clean 分支告知用户。
+    let flag_persisted = super::settings::set_fake_account_mode_enabled(false);
+    if !flag_persisted {
+        tracing::error!(
+            "[FakeAccount] disable:flag 回写 false 失败(config 不可写),磁盘仍 fakeAccountModeEnabled=true → 下次启动可能重建合成账号"
+        );
+    }
     // 切活动回干净 apikey(只动合成账号,真账号不碰)。
     let _ = codex_real_account::deactivate_fake_account().await;
     // apply 当前 provider 强制 apikey:写真正的 apikey/gateway key + strip chatgpt_base_url。
@@ -98,13 +106,16 @@ pub async fn disable_handler(State(state): State<AdminState>) -> impl IntoRespon
     // 活动已非合成后再关 proxy 伪造(见上方顺序说明)。
     codex_app_transfer_proxy::set_fake_account_mode(false);
     let still_synthetic = codex_real_account::active_is_synthetic();
-    // clean = 既不再是合成账号、apply 也成功写回了 apikey/gateway key。
-    let clean = !still_synthetic && sync_ok;
+    // clean = flag 持久化了 + 不再是合成账号 + apply 成功写回了 apikey/gateway key。
+    let clean = flag_persisted && !still_synthetic && sync_ok;
     Json(json!({
         "success": true,
-        "switchedToApikey": clean,
+        "switchedToApikey": !still_synthetic,
+        "flagPersisted": flag_persisted,
         "message": if clean {
             "已关闭模拟账号模式(切回 apikey)"
+        } else if !flag_persisted {
+            "切换已生效但开关未能写入磁盘(权限 / 磁盘满?)—— 重启后可能恢复模拟账号,请检查后重试"
         } else if !still_synthetic {
             "已关闭开关并清除合成账号,但未能重配 provider(无可用 provider?)—— 请配置并激活一个 provider 后重启 Codex"
         } else {
