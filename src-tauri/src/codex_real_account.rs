@@ -1356,4 +1356,32 @@ mod tests {
             .expect("import 前应备份原活动 auth.json");
         assert_eq!(read_auth(&prebackup).unwrap()["auth_mode"], "apikey");
     }
+
+    // [MOC-257] 合成伪造 auth.json 必须:① 满足 parse_chatgpt_auth(触发 relay gate)②带 cas_synthetic
+    // 哨兵 ③access_token 远未来不判过期 ④是 3 段 JWT + payload 含 chatgpt_account_id(镜像 proxy
+    // resolver::is_chatgpt_access_token 的放行条件,等价「真配置验证」——合成 token 一定被 proxy 放行)。
+    #[test]
+    fn synthetic_auth_is_wellformed_chatgpt() {
+        use base64::Engine;
+        let v = build_synthetic_auth();
+        assert!(parse_chatgpt_auth(&v).is_some(), "应满足 relay gate 的 chatgpt 判定");
+        assert_eq!(v.get("cas_synthetic").and_then(Value::as_bool), Some(true));
+        let access = v["tokens"]["access_token"].as_str().unwrap();
+        assert!(
+            !access_token_expired(access, chrono::Utc::now().timestamp()),
+            "远未来 exp 不应判过期(否则 detect 会标 relogin)"
+        );
+        let parts: Vec<&str> = access.split('.').collect();
+        assert_eq!(parts.len(), 3, "access_token 应是 3 段 JWT");
+        assert!(!parts[2].is_empty(), "签名段非空(resolver 形状校验要求)");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .unwrap();
+        let pv: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(
+            pv["https://api.openai.com/auth"]["chatgpt_account_id"].as_str(),
+            Some(SYNTHETIC_ACCOUNT_ID),
+            "payload 必须含非空 chatgpt_account_id(resolver 放行条件)"
+        );
+    }
 }

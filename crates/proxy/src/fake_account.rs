@@ -124,3 +124,89 @@ fn build_json_response(status: u16, payload: &Value) -> Result<Response, Forward
     let bytes = serde_json::to_vec(payload).unwrap_or_else(|_| b"{}".to_vec());
     Ok(builder.body(Body::from(bytes))?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn run(method: Method, path: &str, body: &str) -> (u16, Value) {
+        let resp = fabricate(&method, &HeaderMap::new(), path, Bytes::from(body.to_owned()))
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn analytics_is_204_empty() {
+        let (status, v) = run(
+            Method::POST,
+            "/backend-api/codex/analytics-events/events",
+            "{}",
+        )
+        .await;
+        assert_eq!(status, 204);
+        assert!(v.is_null());
+    }
+
+    #[tokio::test]
+    async fn installed_is_200_empty_marketplace() {
+        let (status, v) = run(
+            Method::GET,
+            "/backend-api/ps/plugins/installed?scope=GLOBAL",
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(v["plugins"], json!([]));
+        assert!(v["pagination"].is_object());
+    }
+
+    // 核心不变量:任何未建模 backend-api path 必须 200(绝不 401 → 否则触发 Codex auth 失败/重登)。
+    #[tokio::test]
+    async fn unknown_path_is_200_never_401() {
+        let (status, _) = run(Method::GET, "/backend-api/some/brand/new/endpoint", "").await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_echoes_id_with_empty_result() {
+        let (status, v) = run(
+            Method::POST,
+            "/backend-api/ps/mcp",
+            r#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(v["id"], json!(7));
+        assert_eq!(v["jsonrpc"], json!("2.0"));
+        assert!(v["result"].is_object());
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_notification_without_id_is_204() {
+        let (status, _) = run(
+            Method::POST,
+            "/backend-api/wham/apps",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        )
+        .await;
+        assert_eq!(status, 204);
+    }
+
+    #[test]
+    fn mode_flag_toggles() {
+        set_fake_account_mode(true);
+        assert!(fake_account_mode_enabled());
+        set_fake_account_mode(false);
+        assert!(!fake_account_mode_enabled());
+    }
+}
