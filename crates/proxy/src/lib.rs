@@ -12,6 +12,7 @@
 //! OS 集成(`crates/codex_integration`,Stage 2.5)、WebSocket 透传。
 
 pub mod diagnostics;
+pub mod fake_account;
 pub mod fixture;
 pub mod forward;
 pub mod resolver;
@@ -24,6 +25,7 @@ pub mod ws_passthrough;
 pub use diagnostics::{
     feedback_bundle_dir, is_credential_key, recent_feedback_bundles, rescrub_persisted_bundle,
 };
+pub use fake_account::{fake_account_mode_enabled, set_fake_account_mode};
 pub use forward::{forward_handler, ProxyState};
 pub use resolver::{
     AuthScheme, ProviderResolver, ResolveError, ResolvedProvider, SharedResolver, StaticResolver,

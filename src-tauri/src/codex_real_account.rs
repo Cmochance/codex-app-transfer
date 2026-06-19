@@ -70,6 +70,9 @@ pub struct RealAccountStatus {
     /// [connector review] 持久化到可查询的 status,而非只靠一次性 `emit` 事件 —— 启动时
     /// 若前端还没注册 listener,事件会丢;前端轮询 status 时读这个字段就不会漏报失效。
     pub relogin_required: bool,
+    /// [MOC-257] 活动账号是否是「模拟(伪造)账号」(合成 auth.json,带 `cas_synthetic` 哨兵)。
+    /// 前端据此显示「模拟账号」而非「真实账号」、隐藏 pin/导入(伪造账号不入持久镜像)。
+    pub is_synthetic: bool,
 }
 
 impl RealAccountStatus {
@@ -81,6 +84,7 @@ impl RealAccountStatus {
             source: AuthSource::None,
             has_imported,
             relogin_required: relogin_required(),
+            is_synthetic: active_is_synthetic(),
         }
     }
 }
@@ -456,6 +460,7 @@ pub fn detect() -> RealAccountStatus {
                 source: found.source,
                 has_imported,
                 relogin_required: relogin_required(),
+                is_synthetic: active_is_synthetic(),
             }
         }
         None => {
@@ -811,6 +816,112 @@ pub async fn deactivate_real_account() -> Result<bool, String> {
     }
     backup_active_auth(&paths, "predeactivate")?;
     write_auth(&paths.auth_json, &v).map_err(|e| format!("切 apikey 失败: {e}"))?;
+    Ok(true)
+}
+
+// ── [MOC-257] 模拟(伪造)账号:合成合规 auth.json + 开关 ────────────────────────
+//
+// 无真实 ChatGPT 账号时的「强制解锁」新实现:不再靠 CDP 改渲染层 authMethod(只改 UI、auth.json
+// 仍 apikey → 通信层不自洽,插件跑不通),而是写一份**合规但伪造**的 auth.json(auth_mode=chatgpt
+// + 合成 JWT),让 Codex 原生走 chatgpt 路径(原生显示 Plugins、CLI 原生发 `/backend-api/*`);这些
+// 账号/插件请求由 proxy 截断逐条伪造 200(见 `codex_app_transfer_proxy::fake_account`),不透传真
+// chatgpt.com(伪造 token 会被上游 401)。relay 装配(`active_is_real_chatgpt_now` → 写
+// `chatgpt_base_url`→proxy)整套复用,无需新增 managed key。
+
+/// 模拟账号的固定哨兵 account_id —— detect / 前端据此区分「伪造」vs「真实」账号。
+pub const SYNTHETIC_ACCOUNT_ID: &str = "cas-synthetic-0000-0000-0000-000000000000";
+
+/// 活动 auth.json 是否是模拟(伪造)账号 —— 顶层 `cas_synthetic==true` 哨兵。home 解析失败 → false。只读。
+pub fn active_is_synthetic() -> bool {
+    CodexPaths::from_home_env()
+        .ok()
+        .and_then(|p| read_auth(&p.auth_json).ok())
+        .and_then(|v| v.get("cas_synthetic").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// 合成 JWT(`base64url(header).base64url(payload).<占位签名>`)。resolver 只验形状不验签
+/// (`crates/proxy/src/resolver.rs::is_chatgpt_access_token`),故占位签名足够;`exp` 由 caller
+/// 放进 payload(远未来),让本地 JWT exp 判定不过期、且 Codex CLI 不触发 refresh。
+fn synth_jwt(payload: &Value) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap_or_default());
+    format!("{header}.{body}.cas-synthetic-sig")
+}
+
+/// 构造一份合规但伪造的 chatgpt `auth.json`。`exp` 设远未来(10 年)杜绝 Codex CLI 触发 token
+/// 刷新(假 refresh_token 刷新必失败);带 `cas_synthetic` 哨兵供识别。
+fn build_synthetic_auth() -> Value {
+    let now = chrono::Utc::now();
+    let exp = now.timestamp() + 10 * 365 * 86400;
+    let access = synth_jwt(&serde_json::json!({
+        "https://api.openai.com/auth": { "chatgpt_account_id": SYNTHETIC_ACCOUNT_ID },
+        "iss": "https://auth.openai.com",
+        "exp": exp,
+    }));
+    let id_token = synth_jwt(&serde_json::json!({
+        "https://api.openai.com/profile": { "email": "plugins@local.codex-app-transfer" },
+        "email": "plugins@local.codex-app-transfer",
+        "exp": exp,
+    }));
+    serde_json::json!({
+        "OPENAI_API_KEY": null,
+        "auth_mode": "chatgpt",
+        "cas_synthetic": true,
+        "last_refresh": now.to_rfc3339(),
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access,
+            "refresh_token": "cas-synthetic-refresh-token",
+            "account_id": SYNTHETIC_ACCOUNT_ID,
+        }
+    })
+}
+
+/// [MOC-257] 开模拟账号模式:把活动 auth.json 写成合成伪造账号(先备份)。幂等:活动已是合成
+/// 账号则 no-op(不每次 churn auth.json + 触发 Codex 重读)。持 `AUTH_LOCK`。caller 随后 apply
+/// relay(写 `chatgpt_base_url`→proxy)。
+///
+/// **防误伤**:活动已是**真实** chatgpt(无哨兵)→ 拒绝,不覆盖真账号(应改用真实账号模式)。
+pub async fn activate_fake_account() -> Result<(), String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    if let Ok(v) = read_auth(&paths.auth_json) {
+        if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+            return Ok(()); // 已是合成账号 → no-op
+        }
+        // 活动是真实 chatgpt(有 tokens、无哨兵)→ 拒绝覆盖。
+        if parse_chatgpt_auth(&v).is_some() {
+            return Err(
+                "检测到真实 ChatGPT 账号,模拟账号会覆盖它;请改用「真实账号模式」,或先清除真实账号"
+                    .to_owned(),
+            );
+        }
+    }
+    backup_active_auth(&paths, "prefake")?;
+    write_auth(&paths.auth_json, &build_synthetic_auth())
+        .map_err(|e| format!("写合成 auth.json 失败: {e}"))?;
+    Ok(())
+}
+
+/// [MOC-257] 关模拟账号模式:活动是合成账号则切回干净 apikey(删 tokens + 哨兵)。真实账号
+/// (无哨兵)**绝不动**(防误伤)。持 `AUTH_LOCK`。返回是否执行了切换(活动非合成 → `Ok(false)`)。
+/// caller 随后 apply 当前 provider(force_apikey)写回真正的 apikey/gateway key + strip chatgpt_base_url。
+pub async fn deactivate_fake_account() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let Ok(v) = read_auth(&paths.auth_json) else {
+        return Ok(false);
+    };
+    if v.get("cas_synthetic").and_then(Value::as_bool) != Some(true) {
+        return Ok(false); // 不是合成账号(真实账号 / 已 apikey)→ 不动
+    }
+    backup_active_auth(&paths, "prefakeoff")?;
+    // 合成账号无可保留的真 tokens → 写干净 apikey 占位,清掉哨兵 + 合成 tokens;
+    // 后续 apply(force_apikey)再写真正的 OPENAI_API_KEY/gateway + strip chatgpt_base_url。
+    let cleaned = serde_json::json!({ "auth_mode": "apikey", "OPENAI_API_KEY": Value::Null });
+    write_auth(&paths.auth_json, &cleaned).map_err(|e| format!("切回 apikey 失败: {e}"))?;
     Ok(true)
 }
 

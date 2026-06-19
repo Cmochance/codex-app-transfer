@@ -358,6 +358,25 @@ fn main() {
                     // 可能在 migrate 前读到 flag=None、跳过下面的 direct 收敛。reconcile 读 flag 前先跑
                     // migrate(幂等,已设则 no-op),确保读到落定值(有账号→true/无→false,不再 None)。
                     let _ = handlers::settings::migrate_real_account_mode_v1();
+                    // [MOC-257] 模拟账号模式优先:活动是合成伪造账号,relay 复用真实账号那套
+                    // (active_is_real_chatgpt_now 为真),但 /backend-api 由 proxy 伪造。fake on 时
+                    // **短路真实账号 reconcile**(否则 real flag=Some(false) 会 ForceDisable 把合成
+                    // auth.json 切回 apikey),并确保合成 auth.json 在位 + 按 synthetic 实况开 proxy 伪造。
+                    if handlers::settings::read_fake_account_mode_enabled() == Some(true)
+                        && admin::services::desktop::snapshot::active_provider_supports_relay()
+                    {
+                        let _ = crate::codex_real_account::activate_fake_account().await;
+                        let synthetic = crate::codex_real_account::active_is_synthetic();
+                        codex_app_transfer_proxy::set_fake_account_mode(synthetic);
+                        tracing::info!(
+                            "[FakeAccount] 启动调谐:模拟账号模式持久开启,synthetic_active={synthetic}(跳过真实账号 reconcile)"
+                        );
+                    } else {
+                    // [MOC-257] fake flag on 但无 provider → relay 起不来,持久关;否则保持 proxy 伪造关。
+                    if handlers::settings::read_fake_account_mode_enabled() == Some(true) {
+                        let _ = handlers::settings::set_fake_account_mode_enabled(false);
+                    }
+                    codex_app_transfer_proxy::set_fake_account_mode(false);
                     let mut mode_enabled = handlers::settings::read_real_account_mode_enabled();
                     // [MOC-178 codex P2] provider 不支持 relay(direct 直连 **或无 active provider**)→
                     // 真实账号 relay 无法生效。即便 flag=true(migrate 落定 / pin / 历史),也持久关 flag +
@@ -434,6 +453,7 @@ fn main() {
                             tracing::warn!("[RealAccount] 启动调谐失败(忽略): {e}")
                         }
                     }
+                    } // [MOC-257] close fake-mode else 分支
                 }
                 // [MOC-104] reconcile 已把活动账号 settle 完。relay 模式下真实 chatgpt
                 // 活动 → Codex 据 `auth_mode==chatgpt` **原生**显示 Plugins 入口(实测:
@@ -476,6 +496,14 @@ fn main() {
                 // task 内(第十二轮);本 task 读 flag 前也跑一次 migrate(幂等)保证读到落定值 —— 否则
                 // 首次启动 flag=None 时 mode_off=false、误当 relay active return,不启用户的 force daemon。
                 let _ = handlers::settings::migrate_real_account_mode_v1();
+                // [MOC-257] 模拟账号模式开 → 合成账号(auth_mode=chatgpt)让 Codex 原生显示 Plugins,
+                // 绝不启 CDP daemon(替代旧 CDP 注入档,无高延迟、无渲染层不自洽)。
+                if handlers::settings::read_fake_account_mode_enabled() == Some(true) {
+                    tracing::info!(
+                        "[PluginUnlock] 模拟账号模式开启,Codex 原生显示 plugins,不启 daemon"
+                    );
+                    return;
+                }
                 let mode_off =
                     handlers::settings::read_real_account_mode_enabled() == Some(false);
                 // [MOC-178 codex P2] relay 真生效还需 provider 支持 relay —— direct/无 provider 下即使

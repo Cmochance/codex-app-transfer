@@ -551,6 +551,27 @@ pub fn set_real_account_mode_enabled(enabled: bool) -> bool {
     .unwrap_or(false)
 }
 
+/// [MOC-257] 模拟(伪造)账号模式持久开关(用户意图)。无真实账号时的「强制解锁」新档:写一份
+/// 合规伪造 auth.json + proxy 截断 `/backend-api/*` 伪造。键缺失=未开。**与真实账号模式互斥**
+/// (handler 层强制),启动调谐据此重建 proxy `FAKE_ACCOUNT_MODE` atomic + 确保合成 auth.json 在位。
+pub fn read_fake_account_mode_enabled() -> Option<bool> {
+    crate::admin::registry_io::load().ok().and_then(|cfg| {
+        cfg.get("settings")
+            .and_then(|s| s.get("fakeAccountModeEnabled"))
+            .and_then(Value::as_bool)
+    })
+}
+
+/// [MOC-257] 写模拟账号模式开关。enable / disable handler 与失败回滚经这里落持久意图。
+pub fn set_fake_account_mode_enabled(enabled: bool) -> bool {
+    with_config_write(|cfg| {
+        ensure_settings_object(cfg)
+            .insert("fakeAccountModeEnabled".to_owned(), Value::Bool(enabled));
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false)
+}
+
 /// [MOC-178] 一次性迁移:首次落定 `realAccountModeEnabled` 初值,不突变老用户。键已存在 →
 /// no-op(幂等);不存在 → 按当前是否有可用真实账号(`detect().logged_in`,新口径认 token)
 /// 决定:有账号 → true(老用户保持开)、无账号 → false(与现状一致)。返回是否执行了写入。

@@ -17,6 +17,7 @@ pub mod common;
 pub mod conversations;
 pub mod desktop;
 pub mod diagnostic;
+pub mod fake_account;
 pub mod feedback;
 pub mod gemini_oauth;
 pub mod mcp;
