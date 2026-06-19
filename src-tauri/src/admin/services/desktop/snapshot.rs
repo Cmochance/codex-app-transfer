@@ -687,9 +687,12 @@ pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) 
         // settings.proxyPort)。
         let paths = CodexPaths::from_home_env().ok();
         let synthetic = crate::codex_real_account::active_is_synthetic();
+        // [MOC-257 review] **含 stale 快照**:restoreCodexOnExit=false 保留 real relay 时,证明 Transfer 拥有
+        // 该 URL 的 active 快照属于**上个 session**(本 session 还没拍)→ `has_snapshot` 为 false 但
+        // `has_stale_active_snapshot` 为 true。漏了它会让 real 保留态 transfer_applied=false、不恢复 proxy。
         let transfer_applied = paths
             .as_ref()
-            .is_some_and(|p| codex_app_transfer_codex_integration::has_snapshot(p));
+            .is_some_and(|p| has_snapshot(p) || has_stale_active_snapshot(p));
         let relay_port = if synthetic || transfer_applied {
             paths.as_ref().and_then(|p| {
                 let port_of = |k: &str| {
