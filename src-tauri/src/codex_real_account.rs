@@ -1401,8 +1401,15 @@ pub async fn reconcile_on_startup(mode_enabled: Option<bool>) -> Result<Reconcil
         });
     }
 
-    // 活动已是真实 chatgpt → 共用、绝不动(Codex 自维护这份,transfer 只读跟随、不覆盖)。
-    if active_is_real_chatgpt(&paths) {
+    // 活动已是**可用真实** chatgpt → 共用、绝不动(Codex 自维护这份,transfer 只读跟随、不覆盖)。
+    // [MOC-257 review] 用 `auth_value_real_and_usable`(非合成 + 未过期 + 未撤销)而非 `active_is_real_chatgpt`
+    // (后者经 `parse_chatgpt_auth` 既接受合成、又不查过期):restoreCodexOnExit=false 保留的合成态
+    // (auth_mode=chatgpt 假)会误 pass、返 StillValid、不查 mirror/stash、不发 relogin → persisted=real 用户
+    // (真账号已过期/撤销)被静默降级 synthetic 不提示重登。过期的真残留同理 fall through 去镜像/活源恢复或 relogin。
+    if read_auth(&paths.auth_json)
+        .ok()
+        .is_some_and(|v| auth_value_real_and_usable(&v))
+    {
         return Ok(ReconcileOutcome::StillValid {
             source: AuthSource::Official,
         });
