@@ -945,20 +945,33 @@ pub fn has_real_account() -> bool {
 }
 
 /// [MOC-257] 真账号当前是否**实际可用**(供「real 档不可用则降级 synthetic」+ 前端展示)。
-/// 可用 = 活动或 stash 有真 chatgpt 账号(非合成、access/refresh 非空)且 access_token 本地 JWT
-/// 未过期 且 **未标记 relogin**(服务端 401 撤销 / 本地过期,见 `mark_relogin_required_from_proxy`)。只读。
+/// 可用 = 活动 / 导入镜像 / stash 有真 chatgpt 账号(非合成、access/refresh 非空)、access_token 本地
+/// JWT 未过期、且**不是被服务端 401 撤销的那个 token**(指纹比对)。只读、无副作用。
+///
+/// [MOC-257 review] **不**盲目早返 `relogin_required()`(进程级粘滞标记)—— app 外重登换了新 token 后
+/// 标记一时未清会把新账号误降级。改逐 token 源直接判:本地过期由 `access_token_expired` 判;服务端撤销
+/// 由指纹比对(`access_token_fingerprint == REVOKED_TOKEN_FP`)判 —— token 已换则指纹不同、放行。真正清
+/// `relogin_required` 标记仍由 `detect()` 的指纹自愈在 startup / legacy status 路径做(这里只读)。
 pub fn real_account_usable() -> bool {
-    if relogin_required() {
-        return false; // 服务端撤销 / 已知失效
-    }
     let Ok(paths) = CodexPaths::from_home_env() else {
         return false;
     };
+    let revoked_fp = REVOKED_TOKEN_FP.load(Ordering::SeqCst);
+    let has_revocation = HAS_REVOCATION.load(Ordering::SeqCst);
+    // 有撤销但指纹未知(proxy 算不出被撤 token 指纹)→ 保守判全部不可用(对齐 detect「有撤销但指纹未知
+    // 就保持 relogin」,见 `mark_relogin_required_from_proxy` 注释)。
+    if has_revocation && revoked_fp == 0 {
+        return false;
+    }
     let usable = |v: &Value| -> bool {
         if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
             return false;
         }
         if parse_chatgpt_tokens(v).is_none() {
+            return false;
+        }
+        // 就是被服务端 401 撤销的那个 token → 不可用(token 已换 → 指纹不同 → 放行)。
+        if has_revocation && revoked_fp != 0 && access_token_fingerprint(v) == revoked_fp {
             return false;
         }
         let access = v
