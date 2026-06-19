@@ -386,13 +386,26 @@ fn main() {
                             .clone(),
                         trace_viewer_manager: Arc::new(trace_viewer::TraceViewerManager::new()),
                     };
-                    // [MOC-257 review] synthetic/real 需 relay(chatgpt_base_url→proxy)才自洽;无 active
-                    // provider 时 relay 起不来,若仍写合成/真 auth.json,Codex 会直连 chatgpt.com(合成 token
-                    // 全 401、真账号也绕过 proxy)。无 provider → 跳过 apply(对齐 set 端点 provider gate),
-                    // 保持 restore 后的 auth.json 不动(不写无 relay 的合成态)。
+                    // [MOC-257 review] autoApplyOnStart=false:用户不想启动就自动应用配置 → unlock apply
+                    // 也跳过(否则仅启动就重写 ~/.codex,违背意图;provider auto-apply 已据此跳过,这里对齐)。
+                    let auto_apply_on = handlers::settings::load_registry_for_startup_language_sync()
+                        .ok()
+                        .and_then(|cfg| {
+                            cfg.get("settings")
+                                .and_then(|s| s.get("autoApplyOnStart"))
+                                .and_then(|v| v.as_bool())
+                        })
+                        .unwrap_or(true);
+                    // synthetic/real 需 relay(chatgpt_base_url→proxy)才自洽;无 active provider 时 relay
+                    // 起不来,若仍写合成/真 auth.json,Codex 会直连 chatgpt.com(合成 token 全 401、真账号也
+                    // 绕过 proxy)。无 provider → 跳过 apply(对齐 set 端点 provider gate)。
                     let relay_ok =
                         admin::services::desktop::snapshot::active_provider_supports_relay();
-                    if matches!(
+                    if !auto_apply_on {
+                        tracing::info!(
+                            "[PluginUnlock] 启动跳过 unlock apply:autoApplyOnStart=false(尊重「启动不自动应用」)"
+                        );
+                    } else if matches!(
                         mode,
                         crate::codex_real_account::PluginUnlockMode::Synthetic
                             | crate::codex_real_account::PluginUnlockMode::Real
