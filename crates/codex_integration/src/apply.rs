@@ -581,6 +581,13 @@ fn restore_from_snapshot_values(
         return Ok(());
     }
     // 非合成:对每个 managed key,快照里有就改回快照值,没有就 remove。
+    // [MOC-257 review] genuine chatgpt 登录(auth_mode=chatgpt,已过上面 synthetic 过滤 = 真账号):**Auto
+    // restore**(退出/启动)下若快照拍于该登录**之前**(无 auth_mode)→ **保留** auth_mode,别 strip。否则用户
+    // 后登录的真账号(active / Real 模式;账号 pin 在 mirror 非 stash、reverse-order 的 restore_stashed 也兜不到)
+    // 被 merge 抹掉 auth_mode → tokens 在但 standalone Codex 不认作 chatgpt、插件不可用。**Manual restore**(UI
+    // 选老快照)语义是精确回到那个快照 → 仍 strip;apikey 模式 live 也仍 strip(撤 transfer 写的 apikey)。
+    let live_is_chatgpt =
+        current.get("auth_mode").and_then(serde_json::Value::as_str) == Some("chatgpt");
     if let Some(obj) = current.as_object_mut() {
         for key in MANAGED_AUTH_KEYS {
             match snapshot_auth.get(*key) {
@@ -588,6 +595,9 @@ fn restore_from_snapshot_values(
                     obj.insert((*key).to_owned(), v.clone());
                 }
                 None => {
+                    if *key == "auth_mode" && live_is_chatgpt && matches!(mode, RestoreMode::Auto) {
+                        continue; // 保留 genuine chatgpt 登录的 auth_mode
+                    }
                     obj.remove(*key);
                 }
             }
