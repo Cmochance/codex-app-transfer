@@ -181,7 +181,18 @@ pub fn snapshot_codex_state(
     std::fs::create_dir_all(&current_dir)?;
 
     let config_existed = paths.config_toml.exists();
-    let auth_existed = paths.auth_json.exists();
+    // [MOC-257 review] auth 写入端反投毒(对齐下面 config 的 signature-strip):合成 auth(`cas_synthetic`)
+    // 是 Transfer 伪造、**绝非**用户原始。上个 session `restoreCodexOnExit=false` 残留合成 auth 时,原样拍照会
+    // 把合成固化成「用户原始 auth」(active 快照语义)→ restore 还原成合成 → standalone Codex 拿假凭据撞
+    // chatgpt.com。合成则快照视为**无 auth**(auth_existed=false、不拷);真账号本就在 stash,exit/startup 的
+    // restore_stashed 兜底还原。非合成(真账号 / apikey)才拍。
+    let auth_is_synthetic = paths.auth_json.exists()
+        && std::fs::read_to_string(&paths.auth_json)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("cas_synthetic").and_then(serde_json::Value::as_bool))
+            == Some(true);
+    let auth_existed = paths.auth_json.exists() && !auth_is_synthetic;
 
     if config_existed {
         let snapshot_copy = config_path(&current_dir);
