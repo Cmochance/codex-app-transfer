@@ -715,7 +715,10 @@ async fn ensure_bg_data_uri(theme_id: &str, fallback: &str) -> String {
 async fn download_bg(theme_id: &str) -> Result<Vec<u8>, String> {
     let url = format!("{THEME_BG_BASE}/{theme_id}.jpg");
     let resp = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        // connect_timeout 让被 blackhole / 屏蔽的网络快速失败 → 立刻回退缩略图,
+        // 不傻等整个 total timeout(否则 apply 卡几十秒不注入任何 CSS)。
+        .connect_timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?
         .get(&url)
