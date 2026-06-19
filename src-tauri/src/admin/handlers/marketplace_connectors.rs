@@ -162,7 +162,7 @@ async fn fetch_official(token: &str, path: &str) -> Result<Vec<u8>, String> {
     let resp = client()?
         .get(&url)
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::ACCEPT, "application/vnd.github.raw")
+        .header(header::ACCEPT, "application/vnd.github.raw+json")
         .header(header::USER_AGENT, "codex-app-transfer")
         .send()
         .await

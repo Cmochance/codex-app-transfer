@@ -2,7 +2,12 @@
 //! - `/servers/*` — `[mcp_servers.*]` 结构化 CRUD
 //! - `/plugins/*` — `~/.codex/plugins/cache/<market>/<plugin>/` 已安装 plugin 管理 + tar.gz 安装
 
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::Query,
+    http::{header, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -129,5 +134,32 @@ pub async fn install_plugin(Json(input): Json<codex_plugins::InstallInput>) -> i
     match codex_plugins::install_tarball(&input).await {
         Ok(entry) => Json(json!({"success": true, "entry": entry})).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PluginIconQuery {
+    pub key: String,
+}
+
+/// `GET /api/codex/mcp/plugins/icon?key=` — 已安装 plugin 的图标(assets/app-icon.png)。
+pub async fn plugin_icon(Query(q): Query<PluginIconQuery>) -> impl IntoResponse {
+    match codex_plugins::plugin_icon_bytes(&q.key) {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, e).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PluginSkillQuery {
+    pub key: String,
+    pub name: String,
+}
+
+/// `GET /api/codex/mcp/plugins/skill?key=&name=` — 该 plugin 某 skill 的 SKILL.md(name/description/正文)。
+pub async fn plugin_skill(Query(q): Query<PluginSkillQuery>) -> impl IntoResponse {
+    match codex_plugins::read_plugin_skill(&q.key, &q.name) {
+        Ok(doc) => Json(json!({"success": true, "skill": doc})).into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, e).into_response(),
     }
 }

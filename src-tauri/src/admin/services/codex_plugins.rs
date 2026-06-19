@@ -247,6 +247,66 @@ pub fn list_installed() -> Result<Vec<PluginEntry>, String> {
     Ok(out)
 }
 
+/// key → 已安装 plugin 的 install_dir(从 list_installed 查,稳妥避开手拼 path)。
+fn installed_dir(key: &str) -> Result<PathBuf, String> {
+    list_installed()?
+        .into_iter()
+        .find(|e| e.key == key)
+        .map(|e| PathBuf::from(e.install_dir))
+        .ok_or_else(|| format!("plugin {key} 未安装"))
+}
+
+/// plugin 图标字节(`install_dir/assets/app-icon.png`)。
+pub fn plugin_icon_bytes(key: &str) -> Result<Vec<u8>, String> {
+    let icon = installed_dir(key)?.join("assets").join("app-icon.png");
+    fs::read(&icon).map_err(|e| format!("read icon: {e}"))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillDoc {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
+/// 读 plugin 某 skill 的 `skills/<skill>/SKILL.md`(解析 frontmatter name/description + 正文)。
+pub fn read_plugin_skill(key: &str, skill: &str) -> Result<SkillDoc, String> {
+    // skill 名来自 manifest,但仍校验防穿越。
+    if skill.is_empty() || skill.contains("..") || skill.contains('/') || skill.contains('\\') {
+        return Err("invalid skill name".to_owned());
+    }
+    let md = installed_dir(key)?
+        .join("skills")
+        .join(skill)
+        .join("SKILL.md");
+    let raw = fs::read_to_string(&md).map_err(|e| format!("read SKILL.md: {e}"))?;
+    Ok(parse_skill_md(skill, &raw))
+}
+
+/// 解析 SKILL.md 的 YAML frontmatter(`--- name/description ---`)+ 正文。
+fn parse_skill_md(fallback_name: &str, raw: &str) -> SkillDoc {
+    let mut name = fallback_name.to_owned();
+    let mut description = String::new();
+    let mut content = raw.trim_start().to_owned();
+    if let Some(rest) = raw.trim_start().strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            for line in rest[..end].lines() {
+                if let Some(v) = line.strip_prefix("name:") {
+                    name = v.trim().to_owned();
+                } else if let Some(v) = line.strip_prefix("description:") {
+                    description = v.trim().to_owned();
+                }
+            }
+            content = rest[end + 4..].trim_start().to_owned();
+        }
+    }
+    SkillDoc {
+        name,
+        description,
+        content,
+    }
+}
+
 /// 设 `[plugins."name@market"] enabled = <bool>`
 pub fn set_enabled(key: &str, enabled: bool) -> Result<(), String> {
     let mut doc = read_doc()?;

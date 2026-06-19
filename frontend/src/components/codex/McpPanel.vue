@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import * as codexApi from '@/api/codex'
-import type { McpServerSpec, McpPlugin, ManagedHistoryEntry } from '@/api/codex'
+import type { McpServerSpec, McpPlugin, ManagedHistoryEntry, PluginSkill } from '@/api/codex'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppInput from '@/components/ui/AppInput.vue'
 import AppModal from '@/components/ui/AppModal.vue'
+import AppSelect from '@/components/ui/AppSelect.vue'
 import HistoryModal from './HistoryModal.vue'
 import ConnectorMarket from './ConnectorMarket.vue'
 import IconPlus from '~icons/lucide/plus'
@@ -17,6 +18,7 @@ import IconHistory from '~icons/lucide/history'
 import IconFileCode from '~icons/lucide/file-code-2'
 import IconPencil from '~icons/lucide/pencil'
 import IconCheck from '~icons/lucide/circle-check-big'
+import IconSparkles from '~icons/lucide/sparkles'
 
 const { show: toast } = useToast()
 
@@ -327,6 +329,40 @@ async function uninstallPlugin(p: McpPlugin) {
   }
 }
 
+// ── plugin 图标 + skills 弹窗 ───────────────────────────────────────────────
+const pluginFailedIcons = ref<Set<string>>(new Set())
+function onPluginIconError(key: string) {
+  pluginFailedIcons.value = new Set(pluginFailedIcons.value).add(key)
+}
+
+const skillsModal = ref<McpPlugin | null>(null)
+const skillNames = ref<string[]>([])
+const selectedSkill = ref('')
+const skillDoc = ref<PluginSkill | null>(null)
+const skillLoading = ref(false)
+const skillOptions = computed(() => skillNames.value.map((n) => ({ value: n, label: n })))
+
+function openSkills(p: McpPlugin) {
+  skillsModal.value = p
+  skillNames.value = p.skillNames || []
+  selectedSkill.value = skillNames.value[0] || ''
+  loadSkill()
+}
+async function loadSkill() {
+  if (!skillsModal.value || !selectedSkill.value) return
+  skillLoading.value = true
+  skillDoc.value = null
+  try {
+    const j = await codexApi.getPluginSkill(skillsModal.value.key, selectedSkill.value)
+    skillDoc.value = j.skill || null
+  } catch (e) {
+    toast((e as Error).message || t('toast.requestFailed'), 'error')
+  } finally {
+    skillLoading.value = false
+  }
+}
+watch(selectedSkill, () => loadSkill())
+
 // ── subpane lazy load ──────────────────────────────────────────────────────
 async function loadSubpane(sub: Subpane) {
   if (sub === 'servers') await reloadServers()
@@ -423,11 +459,26 @@ watch(subpane, (sub) => loadSubpane(sub))
     <div v-else-if="subpane === 'plugins'" class="mcp__plugins">
       <div v-if="!plugins.length" class="mcp__empty">{{ t('codex.mcp.pluginsEmpty') }}</div>
       <div v-for="p in plugins" :key="p.key" class="mcp__plugin">
+        <img
+          v-if="!pluginFailedIcons.has(p.key)"
+          class="mcp__plugin-icon"
+          :src="codexApi.pluginIconUrl(p.key)"
+          :alt="p.name"
+          @error="onPluginIconError(p.key)"
+        />
+        <div v-else class="mcp__plugin-icon mcp__plugin-icon--ph" />
         <div class="mcp__plugin-body">
           <span class="mcp__plugin-name">{{ p.name }}</span>
           <span class="mcp__plugin-ver">@{{ p.marketplace }} · v{{ p.version }}</span>
         </div>
         <div class="mcp__plugin-actions">
+          <AppButton
+            v-if="p.skillNames?.length"
+            size="sm"
+            :icon="IconSparkles"
+            :label="`Skills · ${p.skillNames.length}`"
+            @click="openSkills(p)"
+          />
           <span class="mcp__plugin-state" :class="p.enabled ? 'on' : 'off'">
             {{ p.enabled ? t('codex.mcp.pluginOn') : t('codex.mcp.pluginOff') }}
           </span>
@@ -461,6 +512,26 @@ watch(subpane, (sub) => loadSubpane(sub))
       <div class="mcp__add-actions">
         <AppButton variant="ghost" :label="t('common.cancel')" @click="newServerModal = false" />
         <AppButton variant="primary" :label="t('codex.mcp.sourceAddConfirm')" @click="confirmNewServer" />
+      </div>
+    </AppModal>
+
+    <!-- plugin skills 弹窗 -->
+    <AppModal
+      v-if="skillsModal"
+      :title="`${skillsModal.name} · Skills`"
+      @close="skillsModal = null"
+    >
+      <AppSelect
+        v-if="skillNames.length > 1"
+        v-model="selectedSkill"
+        :options="skillOptions"
+        class="mcp__skill-select"
+      />
+      <div v-if="skillLoading" class="mcp__skill-loading">{{ t('market.loading') }}</div>
+      <div v-else-if="skillDoc" class="mcp__skill-doc">
+        <div class="mcp__skill-name">{{ skillDoc.name }}</div>
+        <div v-if="skillDoc.description" class="mcp__skill-desc">{{ skillDoc.description }}</div>
+        <pre class="mcp__skill-content">{{ skillDoc.content }}</pre>
       </div>
     </AppModal>
 
@@ -667,8 +738,20 @@ watch(subpane, (sub) => loadSubpane(sub))
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
+.mcp__plugin-icon {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+  background: var(--surface-2);
+}
+.mcp__plugin-icon--ph {
+  background: var(--surface-2);
+}
 .mcp__plugin-body {
   display: flex;
+  flex: 1;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
@@ -710,5 +793,35 @@ watch(subpane, (sub) => loadSubpane(sub))
   justify-content: flex-end;
   gap: var(--space-3);
   margin-top: var(--space-4);
+}
+.mcp__skill-select {
+  margin-bottom: var(--space-3);
+}
+.mcp__skill-loading {
+  padding: var(--space-4);
+  text-align: center;
+  color: var(--text-muted);
+}
+.mcp__skill-name {
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+.mcp__skill-desc {
+  margin-top: 2px;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+}
+.mcp__skill-content {
+  margin-top: var(--space-3);
+  max-height: 50vh;
+  overflow: auto;
+  padding: var(--space-3);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

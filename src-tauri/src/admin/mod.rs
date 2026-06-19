@@ -479,6 +479,14 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/mcp/plugins/install",
             post(handlers::mcp::install_plugin),
         )
+        .route(
+            "/api/codex/mcp/plugins/icon",
+            get(handlers::mcp::plugin_icon),
+        )
+        .route(
+            "/api/codex/mcp/plugins/skill",
+            get(handlers::mcp::plugin_skill),
+        )
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)

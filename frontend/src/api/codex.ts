@@ -97,7 +97,24 @@ export interface McpPlugin {
   marketplace?: string
   version?: string
   enabled?: boolean
+  skillNames?: string[]
+  installDir?: string
 }
+
+export interface PluginSkill {
+  name: string
+  description: string
+  content: string
+}
+// GET /api/codex/mcp/plugins/skill — 某 plugin 某 skill 的 SKILL.md(name/description/正文)。
+export const getPluginSkill = (key: string, name: string) =>
+  api<{ skill?: PluginSkill }>(
+    'GET',
+    `/api/codex/mcp/plugins/skill?key=${encodeURIComponent(key)}&name=${encodeURIComponent(name)}`,
+  )
+// 已安装 plugin 的图标(assets/app-icon.png),直接作为 <img src>。
+export const pluginIconUrl = (key: string) =>
+  `/api/codex/mcp/plugins/icon?key=${encodeURIComponent(key)}`
 
 // servers
 export const getMcpServers = () =>
