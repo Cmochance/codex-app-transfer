@@ -754,6 +754,16 @@ pub async fn forget_imported() -> Result<bool, String> {
 /// 优先用活动现存 tokens(清除切 apikey 后 tokens 仍在 → 只需改 auth_mode + 删 apikey key);
 /// 活动无有效 token 则从持久镜像恢复整份。先备份再写。持 `AUTH_LOCK`。返回是否成功激活
 /// (有可用 token);无可用 token → `Ok(false)`(caller 提示重登)。
+/// [MOC-257 review] 把可用真账号 Value 规整成 relay 要求的 chatgpt 形态(`auth_mode=chatgpt` + 去
+/// `OPENAI_API_KEY`)。活动/源/镜像可能是 apikey-with-tokens(Codex 切过 apikey 但留 tokens),写活动前统一,
+/// 否则 relay gate(`active_is_real_chatgpt_now` 要 auth_mode=chatgpt)会拒绝实则可用的账号。
+fn normalize_real_auth_to_chatgpt(v: &mut Value) {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
+        obj.remove("OPENAI_API_KEY");
+    }
+}
+
 pub async fn activate_real_account() -> Result<bool, String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
@@ -772,10 +782,7 @@ pub async fn activate_real_account() -> Result<bool, String> {
     // 活动有可用真 tokens 但 auth_mode 非 chatgpt(如清除后的 apikey-with-tokens)→ 只改 auth_mode。
     if let Some(mut v) = active {
         if auth_value_real_and_usable(&v) {
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
-                obj.remove("OPENAI_API_KEY");
-            }
+            normalize_real_auth_to_chatgpt(&mut v);
             backup_active_auth(&paths, "preactivate")?;
             write_auth(&paths.auth_json, &v).map_err(|e| format!("写回 chatgpt 失败: {e}"))?;
             return Ok(true);
@@ -785,16 +792,20 @@ pub async fn activate_real_account() -> Result<bool, String> {
     // 刷新),再回落镜像快照;两者都用 `auth_value_real_and_usable`(含**撤销**指纹判定,非裸过期)——
     // 否则「镜像 token 未过期但已被服务端 401 撤销、活源已刷新」时会写撤销镜像、永不到活源 → 401。对齐
     // reconcile_on_startup 的「活源 → 镜像」顺序。
-    if let Some(v) = read_imported_source_path(&paths)
+    if let Some(mut v) = read_imported_source_path(&paths)
         .and_then(|sp| std::fs::read_to_string(&sp).ok())
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
         .filter(|v| auth_value_real_and_usable(v))
     {
+        // [MOC-257 review] 源可能 auth_mode=apikey-with-tokens(源 Codex 切了 apikey 但留 tokens)→ 规整成
+        // chatgpt,否则下面 relay gate 拒绝可用账号。同 active-file 分支。
+        normalize_real_auth_to_chatgpt(&mut v);
         backup_active_auth(&paths, "preactivate")?;
         write_auth(&paths.auth_json, &v).map_err(|e| format!("从导入活源恢复失败: {e}"))?;
         return Ok(true);
     }
-    if let Some(v) = read_imported_mirror(&paths).filter(|v| auth_value_real_and_usable(v)) {
+    if let Some(mut v) = read_imported_mirror(&paths).filter(|v| auth_value_real_and_usable(v)) {
+        normalize_real_auth_to_chatgpt(&mut v);
         backup_active_auth(&paths, "preactivate")?;
         write_auth(&paths.auth_json, &v).map_err(|e| format!("从镜像恢复失败: {e}"))?;
         return Ok(true);
@@ -1145,11 +1156,12 @@ pub fn restash_real_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String> 
 }
 
 /// 把活动 `auth.json` 还原到 [`snapshot_active_auth_bytes`] 拿的快照(`Some`→写回原字节;`None`→删文件,
-/// 还原到「apply 前无 auth.json」)。供 apply 失败回滚。best-effort(失败只 warn)。
-pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) {
-    let Ok(p) = CodexPaths::from_home_env() else {
-        return;
-    };
+/// 还原到「apply 前无 auth.json」)。供 apply 失败回滚。[MOC-257 review] **fallible**:写/删失败(~/.codex 锁/
+/// 不可写)caller 要 surface,否则回滚不全(活动留错的 auth)却仍报 persisted 回滚成功 → Off/Synthetic 报上去
+/// 但 Codex 拿错账号。
+#[must_use = "回滚还原活动 auth 可能失败;失败要 surface 给 caller,别静默吞"]
+pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String> {
+    let p = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let r = match snapshot {
         Some(bytes) => std::fs::write(&p.auth_json, &bytes),
         None => match std::fs::remove_file(&p.auth_json) {
@@ -1157,9 +1169,10 @@ pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) {
             other => other,
         },
     };
-    if let Err(e) = r {
+    r.map_err(|e| {
         tracing::warn!("[PluginUnlock] apply 失败回滚 auth.json 快照失败: {e}");
-    }
+        format!("还原活动 auth 失败: {e}")
+    })
 }
 
 /// 把活动**真账号**整文件移到 stash 保全(保 tokens),供切到 synthetic/off 前调用。**只动真账号**
