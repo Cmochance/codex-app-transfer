@@ -272,6 +272,13 @@ pub async fn connectors(Query(q): Query<ConnectorsQuery>) -> impl IntoResponse {
                 Ok(reg) => {
                     if let Some(arr) = reg.get("connectors").and_then(|v| v.as_array()) {
                         for c in arr {
+                            // 校验自加源条目:必须是带 string id + name 的对象,否则丢弃 —— 防恶意/畸形
+                            // registry 把非对象/缺字段条目塞给前端,前端 c.id / displayName(c).charAt(0) 崩。
+                            let valid = c.get("id").and_then(|v| v.as_str()).is_some()
+                                && c.get("name").and_then(|v| v.as_str()).is_some();
+                            if !valid {
+                                continue;
+                            }
                             let mut c = c.clone();
                             if let Some(obj) = c.as_object_mut() {
                                 obj.insert("source".to_string(), json!(s.id));

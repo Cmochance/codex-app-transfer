@@ -291,7 +291,9 @@ pub fn plugin_icon_bytes(key: &str) -> Result<(Vec<u8>, &'static str), String> {
         .and_then(|i| i.logo)
         .unwrap_or_else(|| "./assets/app-icon.png".to_owned());
     let rel = rel.trim_start_matches("./");
-    if rel.contains("..") || rel.starts_with('/') {
+    // 防穿越(含 Windows 绝对 `C:\` / UNC `\\`):禁 `..` / 前导 `/` / 反斜杠 / 盘符冒号 —— 否则
+    // `dir.join(rel)` 遇绝对路径会越界读 plugin 目录外任意文件。合法 logo 是 `assets/x.png` 形态。
+    if rel.contains("..") || rel.starts_with('/') || rel.contains('\\') || rel.contains(':') {
         return Err("invalid logo path".to_owned());
     }
     let bytes = fs::read(dir.join(rel)).map_err(|e| format!("read icon: {e}"))?;
