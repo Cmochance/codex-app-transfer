@@ -10,6 +10,7 @@ import {
   themeList,
   themeStatus,
   themeApply,
+  themeBgProgress,
   themeUploadCustom,
   themeDeleteCustom,
   restartCodexApp,
@@ -30,6 +31,10 @@ const themes = ref<ThemeEntry[]>([])
 const badge = ref('')
 const cropSrc = ref<string | null>(null)
 const showRestart = ref(false)
+
+// 背景全图 on-demand 下载:正在下载的主题 id + 进度(0-100),给缩略图渲染白蒙版 + 进度环。
+const downloadingId = ref<string | null>(null)
+const downloadPct = ref(0)
 
 // 开关本地镜像 + 守卫:AppSwitch 直接 v-model;watch 里做异步落盘/校验,拒绝时回退。
 const enabledModel = ref(false)
@@ -147,7 +152,7 @@ watch(enabledModel, async (on) => {
       return
     }
     try {
-      await themeApply(selectedId.value)
+      await applyWithProgress(selectedId.value)
       toast(t('theme.appliedToast'))
     } catch {
       await promptRestart()
@@ -165,6 +170,43 @@ watch(enabledModel, async (on) => {
   await refreshBadge()
 })
 
+// apply 包一层下载进度:built-in 主题 bg on-demand 下载期间,轮询 bg-progress
+// 在该主题缩略图上渲染白蒙版 + 进度环(custom 用本地 disk,不下载)。
+async function applyWithProgress(id: string) {
+  if (id === 'custom') {
+    await themeApply(id)
+    return
+  }
+  let polling = true
+  const poll = async () => {
+    while (polling) {
+      try {
+        const p = await themeBgProgress(id)
+        if (p.downloading) {
+          downloadingId.value = id
+          downloadPct.value =
+            (p.total ?? 0) > 0
+              ? Math.min(100, Math.round(((p.downloaded ?? 0) / (p.total as number)) * 100))
+              : 0
+        } else {
+          downloadingId.value = null
+        }
+      } catch {
+        /* 进度查询失败不影响主流程 */
+      }
+      await new Promise((r) => setTimeout(r, 150))
+    }
+  }
+  void poll()
+  try {
+    await themeApply(id)
+  } finally {
+    polling = false
+    downloadingId.value = null
+    downloadPct.value = 0
+  }
+}
+
 // 点卡片选主题(__themePickHandler):toggle 开则落盘+即时注入,关则仅持久化选择。
 async function pickTheme(id: string) {
   if (enabledModel.value) {
@@ -176,7 +218,7 @@ async function pickTheme(id: string) {
       return
     }
     try {
-      await themeApply(id)
+      await applyWithProgress(id)
       toast(t('theme.appliedToast'))
     } catch {
       await promptRestart()
@@ -382,6 +424,19 @@ async function onRestartChoice(choice: 'now' | 'later') {
             >×</span
           >
           <img class="card-img" :src="th.previewDataUri" :alt="displayName(th)" />
+          <div v-if="downloadingId === th.id" class="card-dl">
+            <svg class="card-dl__ring" viewBox="0 0 36 36">
+              <circle class="card-dl__track" cx="18" cy="18" r="15.5" />
+              <circle
+                class="card-dl__fill"
+                cx="18"
+                cy="18"
+                r="15.5"
+                pathLength="100"
+                :stroke-dasharray="`${downloadPct}, 100`"
+              />
+            </svg>
+          </div>
           <div class="card-name">{{ displayName(th) }}</div>
         </div>
 
@@ -537,6 +592,38 @@ async function onRestartChoice(choice: 'now' | 'later') {
   display: block;
   pointer-events: none;
   background: var(--surface-2);
+}
+/* 背景全图下载中:白半透明蒙版盖缩略图 + 居中白进度环(无文字)。 */
+.card-dl {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.5);
+  z-index: 3;
+  pointer-events: none;
+}
+.card-dl__ring {
+  width: 38px;
+  height: 38px;
+  transform: rotate(-90deg);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.28));
+}
+.card-dl__track {
+  fill: none;
+  stroke: rgba(0, 0, 0, 0.12);
+  stroke-width: 3;
+}
+.card-dl__fill {
+  fill: none;
+  stroke: #fff;
+  stroke-width: 3;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.15s linear;
 }
 .card-name {
   padding: var(--space-2);

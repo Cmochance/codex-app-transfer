@@ -9,7 +9,7 @@
 //! - POST /api/desktop/theme/clear   → 清除主题(回原生 Codex UI)
 
 use axum::{
-    extract::Json,
+    extract::{Json, Query},
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -18,8 +18,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::codex_theme_injector::{
-    all_themes, apply_theme, clear_theme, delete_custom_theme, get_status as get_theme_status,
-    load_theme_assets, reload_codex_page, save_custom_theme,
+    all_themes, apply_theme, bg_download_progress, clear_theme, delete_custom_theme,
+    get_status as get_theme_status, load_theme_assets, reload_codex_page, save_custom_theme,
 };
 use axum::routing::delete;
 
@@ -51,6 +51,25 @@ pub async fn list_handler() -> impl IntoResponse {
 pub async fn status_handler() -> impl IntoResponse {
     let status = get_theme_status().await;
     Json(json!({ "status": status }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BgProgressQuery {
+    pub theme_id: String,
+}
+
+/// `GET /api/desktop/theme/bg-progress?theme_id=` — 内置主题背景全图 on-demand 下载进度。
+/// 前端在 apply 期间轮询,在该主题缩略图上渲染进度环 + 白半透明蒙版;`downloading:false`
+/// = 已缓存 / 未触发 / 下载结束(前端据此撤掉环+蒙版)。
+pub async fn bg_progress_handler(Query(q): Query<BgProgressQuery>) -> impl IntoResponse {
+    match bg_download_progress(&q.theme_id) {
+        Some((downloaded, total)) => Json(json!({
+            "downloading": true,
+            "downloaded": downloaded,
+            "total": total,
+        })),
+        None => Json(json!({ "downloading": false })),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +178,7 @@ pub fn routes() -> Router<AdminState> {
     Router::new()
         .route("/api/desktop/theme/list", get(list_handler))
         .route("/api/desktop/theme/status", get(status_handler))
+        .route("/api/desktop/theme/bg-progress", get(bg_progress_handler))
         .route("/api/desktop/theme/apply", post(apply_handler))
         .route("/api/desktop/theme/clear", post(clear_handler))
         .route("/api/desktop/theme/reload", post(reload_handler))

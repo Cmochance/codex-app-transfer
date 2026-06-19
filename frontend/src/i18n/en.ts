@@ -821,6 +821,8 @@ export default {
   "settings.fontMonoDesc": "Monospace font for code / JSON",
   "settings.fontSize": "Font Size",
   "settings.fontSizeDesc": "Overall interface font scaling",
+  "settings.hideDockIcon": "Hide Dock icon",
+  "settings.hideDockIconHint": "Reopen the window from the menu-bar icon",
   "settings.fontSystem": "System",
   "settings.fontSongti": "Songti",
   "settings.fontKaiti": "Kaiti",

@@ -435,6 +435,8 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
             // #262:settings.language 改动后 hot reload 到 adapters 全局,
             // 让接下来的 prompt 注入跟新语言一致(用户切语言无需重启 transfer)。
             sync_user_language_from_settings(&settings);
+            // hideDockIcon 改动当场生效(macOS 切 activation policy 显/隐 Dock 图标,无需重启)。
+            crate::macos_dock::apply_from_settings(&settings);
             // #MOC-62:开关当场变更即时生效 —— 开→切 Codex file 模式 + 同步镜像;
             // 关→删 config key 回退默认(`.credentials.json` 保留,非破坏)。
             if let Some(enabled) = portable_changed {

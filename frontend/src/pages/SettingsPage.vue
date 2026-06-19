@@ -92,6 +92,9 @@ const codexNetworkAccess = toggle('codexNetworkAccess', false)
 const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
 const mcpCredentialsPortableStore = toggle('mcpCredentialsPortableStore', true)
+const hideDockIcon = toggle('hideDockIcon', false)
+// macOS 限定:隐藏程序坞图标(Windows/Linux 无 Dock 概念,该开关不显示)
+const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.userAgent)
 
 // [MOC-257 三态] 插件解锁三态(关闭/模拟账号/真实账号):非普通 settings 键,调专用 set 端点
 // (写/移走 auth.json + apply relay + 驱动 proxy 伪造)。受控:高亮跟服务端,失败回滚 + toast。
@@ -413,6 +416,13 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       </SettingsRow>
       <SettingsRow :title="t('settings.fontSize')" :description="t('settings.fontSizeDesc')">
         <SegmentedControl v-model="fontSize" :options="fontSizeOptions" />
+      </SettingsRow>
+      <SettingsRow
+        v-if="isMac"
+        :title="t('settings.hideDockIcon')"
+        :description="t('settings.hideDockIconHint')"
+      >
+        <AppSwitch v-model="hideDockIcon" />
       </SettingsRow>
     </SettingsGroup>
 

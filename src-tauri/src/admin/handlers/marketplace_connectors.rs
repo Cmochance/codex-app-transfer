@@ -1,15 +1,14 @@
-//! 连接器市场(多源)— 官方源(私有 storage 仓库镜像)+ 用户自加源,聚合展示(MOC-7 phase2)。
+//! 连接器市场(多源)— 官方源(公开 storage 仓库镜像)+ 用户自加源,聚合展示(MOC-7 phase2)。
 //!
-//! - **官方源**:`Cmochance/codex-app-transfer-storage`(private),走 GitHub contents API + token。
+//! - **官方源**:`Cmochance/codex-app-transfer-storage`(public)的 `plugins/codex/`,走 `raw.githubusercontent.com` 公开直取(无 token)。
 //! - **自加源**:用户加的公开 `registry.json` URL(同 `{connectors,categories}` schema),直取。
-//! token 解析:build-baked `CODEX_APP_TRANSFER_STORAGE_TOKEN` → 运行时 env → `~/.codex-app-transfer/storage_token`。
 //!
 //! - `GET  /api/marketplace/connectors`       → 聚合所有启用源(返 sources[含 count] + connectors + categories + errors)
 //! - `GET  /api/marketplace/sources`          → 源列表(管理用)
 //! - `POST /api/marketplace/sources/add`      → 加自加源 {name,url}
 //! - `POST /api/marketplace/sources/remove`   → 删自加源 {id}(官方源不可删)
 //! - `POST /api/marketplace/sources/toggle`   → 启用/停用 {id,enabled}
-//! - `GET  /api/marketplace/icon?source=&path=` → 图标代理(官方走 token+icons/;自加源走其 base)
+//! - `GET  /api/marketplace/icon?source=&path=` → 图标代理(官方 raw+icons/;自加源走其 base)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,6 +27,9 @@ use serde_json::{json, Value};
 use super::common::err;
 
 const STORAGE_REPO: &str = "Cmochance/codex-app-transfer-storage";
+const STORAGE_BRANCH: &str = "main";
+/// 官方源资源在 storage 仓库的子目录(仓库已多资源化:`plugins/codex/` + `img/theme/`)。
+const OFFICIAL_BASE: &str = "plugins/codex";
 const REGISTRY_PATH: &str = "registry.json";
 const SOURCES_FILE: &str = "marketplace-connector-sources.json";
 const OFFICIAL_ID: &str = "official";
@@ -61,28 +63,6 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(PathBuf::from)
-}
-
-/// 官方源 token:build-baked → 运行时 env → dev 文件。任一非空即用。
-fn storage_token() -> Option<String> {
-    if let Some(t) = option_env!("CODEX_APP_TRANSFER_STORAGE_TOKEN") {
-        if !t.is_empty() {
-            return Some(t.to_string());
-        }
-    }
-    if let Ok(t) = std::env::var("CODEX_APP_TRANSFER_STORAGE_TOKEN") {
-        let t = t.trim().to_string();
-        if !t.is_empty() {
-            return Some(t);
-        }
-    }
-    let p = home_dir()?
-        .join(".codex-app-transfer")
-        .join("storage_token");
-    std::fs::read_to_string(p)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 fn client() -> Result<reqwest::Client, String> {
@@ -188,21 +168,10 @@ fn body_cache() -> &'static Mutex<HashMap<String, (Instant, String)>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// GitHub contents API 取私有仓库 raw 文件(`Accept: application/vnd.github.raw`)。
-async fn fetch_official(token: &str, path: &str) -> Result<Vec<u8>, String> {
-    let url = format!("https://api.github.com/repos/{STORAGE_REPO}/contents/{path}");
-    let resp = client()?
-        .get(&url)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::ACCEPT, "application/vnd.github.raw+json")
-        .header(header::USER_AGENT, "codex-app-transfer")
-        .send()
-        .await
-        .map_err(|e| format!("fetch: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("github {} for {path}", resp.status().as_u16()));
-    }
-    read_body_capped(resp).await
+/// 官方源(public storage 仓库)走 `raw.githubusercontent.com` 公开直取,无需 token。
+async fn fetch_official(path: &str) -> Result<Vec<u8>, String> {
+    let url = format!("https://raw.githubusercontent.com/{STORAGE_REPO}/{STORAGE_BRANCH}/{path}");
+    fetch_public(&url).await
 }
 
 /// 公开 URL 直取(自加源 registry / 图标)。
@@ -229,10 +198,7 @@ async fn source_registry(src: &ConnectorSource, force: bool) -> Result<String, S
         }
     }
     let bytes = if src.official {
-        let token = storage_token().ok_or(
-            "storage token 未配置(env CODEX_APP_TRANSFER_STORAGE_TOKEN 或 ~/.codex-app-transfer/storage_token)",
-        )?;
-        fetch_official(&token, REGISTRY_PATH).await?
+        fetch_official(&format!("{OFFICIAL_BASE}/{REGISTRY_PATH}")).await?
     } else {
         let url = src.url.as_deref().ok_or("源缺 url")?;
         fetch_public(url).await?
@@ -452,7 +418,7 @@ pub async fn icon(Query(q): Query<IconQuery>) -> impl IntoResponse {
     }
 
     let fetched = if source == OFFICIAL_ID {
-        // 官方源:仅 icons/ 下单层 .png(防穿越 + 防读非图标文件),走 token。
+        // 官方源:仅 icons/ 下单层 .png(防穿越 + 防读非图标文件),公开 raw 直取。
         if !path.starts_with("icons/")
             || !path.ends_with(".png")
             || path.matches('/').count() != 1
@@ -460,10 +426,7 @@ pub async fn icon(Query(q): Query<IconQuery>) -> impl IntoResponse {
         {
             return err(StatusCode::BAD_REQUEST, "invalid icon path").into_response();
         }
-        let Some(token) = storage_token() else {
-            return err(StatusCode::SERVICE_UNAVAILABLE, "storage token 未配置").into_response();
-        };
-        fetch_official(&token, &path).await
+        fetch_official(&format!("{OFFICIAL_BASE}/{path}")).await
     } else {
         // 自加源:按该源 url 解析 path(用户自配的源,本地 app 内 SSRF 风险可接受)。
         let sources = read_sources();

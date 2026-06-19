@@ -11,6 +11,7 @@ mod codex_real_account;
 mod codex_theme_injector;
 mod deepseek_quota;
 mod glm_quota;
+mod macos_dock;
 mod mcp_webfetch_server;
 mod mimo_quota;
 mod mimo_session;
@@ -127,6 +128,8 @@ fn main() {
             // [MOC-211] 存全局 AppHandle 供 MiMo 小米账号内嵌 webview 登录开窗用
             // (AdminState 在建 router 时尚无 AppHandle,故走全局 OnceLock)。
             mimo_session::init(app.handle().clone());
+            // [Dock 隐藏] 存全局 AppHandle 供 save_settings hot-reload 切 activation policy。
+            macos_dock::init(app.handle().clone());
 
             // [dev] tauri.conf.json 的 window url 是 cas://localhost/(prod 同进程 axum 派发)。
             // cas:// 是自定义协议,Tauri 不会用 build.devUrl 替换它(devUrl 只对 app-relative
@@ -157,6 +160,8 @@ fn main() {
             if let Ok(cfg) = handlers::settings::load_registry_for_startup_language_sync() {
                 let settings = cfg.get("settings").cloned().unwrap_or_else(|| serde_json::json!({}));
                 handlers::settings::sync_user_language_from_settings(&settings);
+                // 启动时按持久化的 `hideDockIcon` 应用 macOS Dock 图标显隐。
+                macos_dock::apply_from_settings(&settings);
             }
 
             // [MOC-185] 诊断流量查看器:仅 env `CAS_DIAG_TRACE` 显式开发者入口随 app 自启。
