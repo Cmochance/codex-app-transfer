@@ -494,13 +494,17 @@ pub async fn apply_plugin_unlock_mode(
                 tracing::error!("[PluginUnlock] synthetic activate 失败,回滚: {e}");
                 ra::restore_active_auth_bytes(pre_synth);
                 if displaced {
-                    // [MOC-257 review] 失败别静默吞:真账号本次已 displace 到 stash,还原它回活动若失败要留痕
-                    // (内部可能已删活动文件才在 rename 失败 → active 缺失;但真账号仍安全在 stash,下次启动
-                    // self-heal 重试)。
-                    if let Err(e) = ra::restore_stashed_real_auth().await {
+                    // [MOC-257 review] 失败别静默吞 + **surface 给 caller**:真账号本次已 displace 到 stash,还原
+                    // 它回活动若失败(内部可能已删活动文件才在 rename 失败 → active 缺失),把清理失败连同原错
+                    // 一起返回,让 UI 提示「切换失败且清理未完成,重启可自动恢复」,而非只报原错、静默留 active
+                    // 缺失。真账号本身未丢(仍在 stash,下次启动 self-heal 重试)。
+                    if let Err(e2) = ra::restore_stashed_real_auth().await {
                         tracing::error!(
-                            "[PluginUnlock] synthetic 回滚还原 stash 真账号失败(真账号仍在 stash,待启动 self-heal): {e}"
+                            "[PluginUnlock] synthetic 回滚还原 stash 真账号失败(真账号仍在 stash,待启动 self-heal): {e2}"
                         );
+                        return Err(format!(
+                            "切换失败({e});回滚还原真账号也失败({e2})—— 真账号仍安全在 stash,重启 Codex App Transfer 会自动恢复"
+                        ));
                     }
                 }
                 return Err(e);
@@ -512,13 +516,17 @@ pub async fn apply_plugin_unlock_mode(
                 codex_app_transfer_proxy::set_fake_account_mode(false);
                 ra::restore_active_auth_bytes(pre_synth);
                 if displaced {
-                    // [MOC-257 review] 失败别静默吞:真账号本次已 displace 到 stash,还原它回活动若失败要留痕
-                    // (内部可能已删活动文件才在 rename 失败 → active 缺失;但真账号仍安全在 stash,下次启动
-                    // self-heal 重试)。
-                    if let Err(e) = ra::restore_stashed_real_auth().await {
+                    // [MOC-257 review] 失败别静默吞 + **surface 给 caller**:真账号本次已 displace 到 stash,还原
+                    // 它回活动若失败(内部可能已删活动文件才在 rename 失败 → active 缺失),把清理失败连同原错
+                    // 一起返回,让 UI 提示「切换失败且清理未完成,重启可自动恢复」,而非只报原错、静默留 active
+                    // 缺失。真账号本身未丢(仍在 stash,下次启动 self-heal 重试)。
+                    if let Err(e2) = ra::restore_stashed_real_auth().await {
                         tracing::error!(
-                            "[PluginUnlock] synthetic 回滚还原 stash 真账号失败(真账号仍在 stash,待启动 self-heal): {e}"
+                            "[PluginUnlock] synthetic 回滚还原 stash 真账号失败(真账号仍在 stash,待启动 self-heal): {e2}"
                         );
+                        return Err(format!(
+                            "切换失败({e});回滚还原真账号也失败({e2})—— 真账号仍安全在 stash,重启 Codex App Transfer 会自动恢复"
+                        ));
                     }
                 }
                 return Err(e);
