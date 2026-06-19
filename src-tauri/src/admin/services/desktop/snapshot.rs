@@ -396,15 +396,23 @@ pub async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
     if crate::codex_real_account::resolve_plugin_unlock_mode()
         == crate::codex_real_account::PluginUnlockMode::Off
     {
-        // [MOC-257 review] 失败留痕(只读 ~/.codex / 文件锁 / 磁盘满):OFF 的「无 auth.json」不变量被
-        // sync 重建的 apikey auth.json 悄悄破坏却无声 → 至少 error 日志可诊断(真账号已 stash 不丢)。
-        if let Err(e) = crate::codex_real_account::stash_displaced_real_auth().await {
-            tracing::error!("[PluginUnlock] OFF sync 后 stash 失败: {e}");
-        }
-        if let Err(e) = crate::codex_real_account::clear_active_auth_file().await {
-            tracing::error!(
-                "[PluginUnlock] OFF sync 后重新清 auth.json 失败(无 auth.json 不变量未维持): {e}"
-            );
+        // [MOC-257 review] **stash 失败则绝不 clear**:stash_displaced 可能在移动活动文件**之前**失败(旧
+        // stash 归档不了 / stash 目录不可写),此时活动仍是**没安全 stash 的真账号** → 直接 clear 会删掉它丢
+        // 数据。仅 stash Ok(无论是否真 displace 了:apikey/合成/无账号返 Ok(false) 也安全可清)才清 apikey 残留
+        // 维持「无 auth.json」;Err 留痕跳过 clear,OFF 不变量这轮不维持、下次 sync/toggle 重试。
+        match crate::codex_real_account::stash_displaced_real_auth().await {
+            Ok(_) => {
+                if let Err(e) = crate::codex_real_account::clear_active_auth_file().await {
+                    tracing::error!(
+                        "[PluginUnlock] OFF sync 后重新清 auth.json 失败(无 auth.json 不变量未维持): {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[PluginUnlock] OFF sync 后 stash 失败,跳过 clear 以免删掉未安全 stash 的真账号: {e}"
+                );
+            }
         }
         codex_app_transfer_proxy::set_fake_account_mode(false);
     }
