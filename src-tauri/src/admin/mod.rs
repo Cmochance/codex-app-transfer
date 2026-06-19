@@ -463,26 +463,6 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/mcp/plugins/install",
             post(handlers::mcp::install_plugin),
         )
-        .route(
-            "/api/codex/mcp/marketplace/sources",
-            get(handlers::mcp::list_sources),
-        )
-        .route(
-            "/api/codex/mcp/marketplace/sources/add",
-            post(handlers::mcp::add_source),
-        )
-        .route(
-            "/api/codex/mcp/marketplace/sources/remove",
-            post(handlers::mcp::remove_source),
-        )
-        .route(
-            "/api/codex/mcp/marketplace/sources/toggle",
-            post(handlers::mcp::toggle_source),
-        )
-        .route(
-            "/api/codex/mcp/marketplace/index",
-            get(handlers::mcp::marketplace_index),
-        )
         // 静态文件兜底
         .fallback(static_files::serve_static)
         .with_state(state)

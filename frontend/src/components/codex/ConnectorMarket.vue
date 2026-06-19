@@ -6,8 +6,8 @@ import AppButton from '@/components/ui/AppButton.vue'
 import IconRefresh from '~icons/lucide/refresh-cw'
 import IconSearch from '~icons/lucide/search'
 import IconExternalLink from '~icons/lucide/external-link'
-import IconStore from '~icons/lucide/store'
 
+// 连接器市场(官方源)— 嵌进 McpPanel 的 Marketplace 子区。数据来自私有 storage 仓库的展示镜像。
 const loading = ref(true)
 const error = ref('')
 const registry = ref<ConnectorRegistry | null>(null)
@@ -75,62 +75,57 @@ function safeWebsite(c: Connector): string | null {
 </script>
 
 <template>
-  <div class="market">
-    <header class="market__head">
-      <div class="market__title">
-        <IconStore class="market__title-icon" />
-        <h1>{{ t('market.title') }}</h1>
-        <span v-if="registry" class="market__count">{{ registry.connectors.length }}</span>
+  <div class="cmkt">
+    <div class="cmkt__head">
+      <span class="cmkt__source">{{ t('codex.mcp.officialSource') }}</span>
+      <span v-if="registry" class="cmkt__count">{{ registry.connectors.length }}</span>
+      <div class="cmkt__search">
+        <IconSearch class="cmkt__search-icon" />
+        <input v-model="search" type="text" :placeholder="t('market.search')" />
       </div>
-      <div class="market__actions">
-        <div class="market__search">
-          <IconSearch class="market__search-icon" />
-          <input v-model="search" type="text" :placeholder="t('market.search')" />
-        </div>
-        <AppButton :icon="IconRefresh" :label="t('market.refresh')" @click="load(true)" />
-      </div>
-    </header>
-
-    <p class="market__note">{{ t('market.note') }}</p>
-
-    <div v-if="loading" class="market__state">{{ t('market.loading') }}</div>
-
-    <div v-else-if="error" class="market__state market__state--error">
-      <p>{{ t('market.loadFailed') }}</p>
-      <code>{{ error }}</code>
-      <AppButton :label="t('market.refresh')" @click="load(true)" />
+      <AppButton size="sm" :icon="IconRefresh" :label="t('market.refresh')" @click="load(true)" />
     </div>
 
-    <div v-else-if="filtered.length === 0" class="market__state">{{ t('market.empty') }}</div>
+    <p class="cmkt__note">{{ t('market.note') }}</p>
 
-    <section v-for="group in grouped" v-else :key="group.cat" class="market__group">
-      <h2 class="market__group-title">
-        {{ group.cat }} <span class="market__group-count">{{ group.items.length }}</span>
-      </h2>
-      <div class="market__grid">
-        <article v-for="c in group.items" :key="c.id" class="card">
+    <div v-if="loading" class="cmkt__state">{{ t('market.loading') }}</div>
+
+    <div v-else-if="error" class="cmkt__state cmkt__state--error">
+      <p>{{ t('market.loadFailed') }}</p>
+      <code>{{ error }}</code>
+      <AppButton size="sm" :label="t('market.refresh')" @click="load(true)" />
+    </div>
+
+    <div v-else-if="filtered.length === 0" class="cmkt__state">{{ t('market.empty') }}</div>
+
+    <section v-for="group in grouped" v-else :key="group.cat" class="cmkt__group">
+      <h3 class="cmkt__group-title">
+        {{ group.cat }} <span class="cmkt__group-count">{{ group.items.length }}</span>
+      </h3>
+      <div class="cmkt__grid">
+        <article v-for="c in group.items" :key="c.id" class="cmkt-card">
           <div
             v-if="failedIcons.has(c.id) || !c.logo_url"
-            class="card__logo card__logo--fallback"
+            class="cmkt-card__logo cmkt-card__logo--fallback"
             :style="{ background: c.brand_color || 'var(--accent)' }"
           >
             {{ initial(c) }}
           </div>
           <img
             v-else
-            class="card__logo"
+            class="cmkt-card__logo"
             :src="iconSrc(c.logo_url)"
             :alt="displayName(c)"
             loading="lazy"
             @error="onIconError(c.id)"
           />
-          <div class="card__body">
-            <div class="card__name">{{ displayName(c) }}</div>
-            <div class="card__desc">{{ c.short_description }}</div>
+          <div class="cmkt-card__body">
+            <div class="cmkt-card__name">{{ displayName(c) }}</div>
+            <div class="cmkt-card__desc">{{ c.short_description }}</div>
           </div>
           <a
             v-if="safeWebsite(c)"
-            class="card__link"
+            class="cmkt-card__link"
             :href="safeWebsite(c)!"
             target="_blank"
             rel="noopener noreferrer"
@@ -145,51 +140,36 @@ function safeWebsite(c: Connector): string | null {
 </template>
 
 <style scoped>
-.market {
-  padding: var(--space-5) var(--space-6);
-  max-width: 1100px;
-  margin: 0 auto;
+.cmkt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
 }
-.market__head {
+.cmkt__head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
+  gap: var(--space-2);
   flex-wrap: wrap;
 }
-.market__title {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-.market__title h1 {
-  font-size: var(--fs-xl);
-  font-weight: 600;
-  margin: 0;
-}
-.market__title-icon {
-  width: 22px;
-  height: 22px;
-  color: var(--accent);
-}
-.market__count {
+.cmkt__source {
   font-size: var(--fs-sm);
-  color: var(--text-muted);
-  background: var(--surface-2);
-  padding: 1px 8px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 2px 10px;
   border-radius: var(--radius-full);
 }
-.market__actions {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+.cmkt__count {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
 }
-.market__search {
+.cmkt__search {
   position: relative;
   display: flex;
   align-items: center;
+  margin-left: auto;
 }
-.market__search-icon {
+.cmkt__search-icon {
   position: absolute;
   left: 10px;
   width: 15px;
@@ -197,62 +177,62 @@ function safeWebsite(c: Connector): string | null {
   color: var(--text-muted);
   pointer-events: none;
 }
-.market__search input {
-  width: 240px;
-  padding: 7px 12px 7px 30px;
+.cmkt__search input {
+  width: 220px;
+  padding: 6px 12px 6px 30px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
   color: var(--text);
   font-size: var(--fs-sm);
 }
-.market__search input:focus {
+.cmkt__search input:focus {
   outline: none;
   border-color: var(--accent);
 }
-.market__note {
-  margin: var(--space-3) 0 var(--space-2);
-  font-size: var(--fs-sm);
+.cmkt__note {
+  margin: 0;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
 }
-.market__state {
-  padding: var(--space-6);
+.cmkt__state {
+  padding: var(--space-5);
   text-align: center;
   color: var(--text-muted);
 }
-.market__state--error code {
+.cmkt__state--error code {
   display: block;
   margin: var(--space-2) auto;
   max-width: 600px;
   padding: var(--space-2);
   background: var(--surface-2);
   border-radius: var(--radius-sm);
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   word-break: break-all;
 }
-.market__group {
-  margin-top: var(--space-5);
+.cmkt__group {
+  margin-top: var(--space-3);
 }
-.market__group-title {
+.cmkt__group-title {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   font-size: var(--fs-md);
   font-weight: 600;
-  margin: 0 0 var(--space-3);
+  margin: 0 0 var(--space-2);
 }
-.market__group-count {
+.cmkt__group-count {
   font-size: var(--fs-xs);
   font-weight: 400;
   color: var(--text-muted);
 }
-.market__grid {
+.cmkt__grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: var(--space-3);
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--space-2);
 }
-.card {
+.cmkt-card {
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -262,31 +242,31 @@ function safeWebsite(c: Connector): string | null {
   border-radius: var(--radius-lg);
   transition: border-color var(--transition), box-shadow var(--transition);
 }
-.card:hover {
+.cmkt-card:hover {
   border-color: var(--border-strong);
   box-shadow: var(--shadow-sm);
 }
-.card__logo {
+.cmkt-card__logo {
   flex-shrink: 0;
-  width: 40px;
-  height: 40px;
+  width: 38px;
+  height: 38px;
   border-radius: var(--radius);
   object-fit: cover;
   background: var(--surface-2);
 }
-.card__logo--fallback {
+.cmkt-card__logo--fallback {
   display: flex;
   align-items: center;
   justify-content: center;
   color: #fff;
   font-weight: 600;
-  font-size: 16px;
+  font-size: 15px;
 }
-.card__body {
+.cmkt-card__body {
   flex: 1;
   min-width: 0;
 }
-.card__name {
+.cmkt-card__name {
   font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--text);
@@ -294,7 +274,7 @@ function safeWebsite(c: Connector): string | null {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.card__desc {
+.cmkt-card__desc {
   margin-top: 2px;
   font-size: var(--fs-xs);
   color: var(--text-muted);
@@ -304,7 +284,7 @@ function safeWebsite(c: Connector): string | null {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.card__link {
+.cmkt-card__link {
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -314,11 +294,11 @@ function safeWebsite(c: Connector): string | null {
   border-radius: var(--radius-sm);
   color: var(--text-muted);
 }
-.card__link:hover {
+.cmkt-card__link:hover {
   background: var(--surface-2);
   color: var(--accent);
 }
-.card__link svg {
+.cmkt-card__link svg {
   width: 15px;
   height: 15px;
 }

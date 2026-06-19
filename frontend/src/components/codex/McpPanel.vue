@@ -1,13 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import * as codexApi from '@/api/codex'
-import type {
-  McpServerSpec,
-  McpPlugin,
-  McpSource,
-  McpMarketIndex,
-  ManagedHistoryEntry,
-} from '@/api/codex'
+import type { McpServerSpec, McpPlugin, ManagedHistoryEntry } from '@/api/codex'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
@@ -15,13 +9,12 @@ import AppButton from '@/components/ui/AppButton.vue'
 import AppInput from '@/components/ui/AppInput.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import HistoryModal from './HistoryModal.vue'
+import ConnectorMarket from './ConnectorMarket.vue'
 import IconPlus from '~icons/lucide/plus'
 import IconTrash from '~icons/lucide/trash-2'
 import IconArchive from '~icons/lucide/archive'
 import IconHistory from '~icons/lucide/history'
 import IconFileCode from '~icons/lucide/file-code-2'
-import IconRefresh from '~icons/lucide/refresh-cw'
-import IconDownload from '~icons/lucide/download'
 import IconPencil from '~icons/lucide/pencil'
 import IconCheck from '~icons/lucide/circle-check-big'
 
@@ -334,145 +327,11 @@ async function uninstallPlugin(p: McpPlugin) {
   }
 }
 
-// ── Marketplace ────────────────────────────────────────────────────────────
-const sources = ref<McpSource[]>([])
-const marketIndex = ref<McpMarketIndex>({ servers: [], plugins: [], errors: {} })
-const marketFilter = ref('')
-const addSourceModal = ref(false)
-const sourceName = ref('')
-const sourceUrl = ref('')
-
-async function reloadSources() {
-  try {
-    const j = await codexApi.getMcpSources()
-    sources.value = j.sources || []
-  } catch (e) {
-    console.error('reloadSources', e)
-    sources.value = []
-  }
-}
-async function reloadMarketIndex(forceRefresh: boolean) {
-  try {
-    const j = await codexApi.getMcpMarketIndex(forceRefresh)
-    marketIndex.value = j.index || { servers: [], plugins: [], errors: {} }
-  } catch (e) {
-    console.error('reloadMarketIndex', e)
-    marketIndex.value = { servers: [], plugins: [], errors: {} }
-  }
-}
-async function toggleSource(s: McpSource) {
-  try {
-    await codexApi.toggleMcpSource(s.id, !s.enabled)
-    await reloadSources()
-    await reloadMarketIndex(true)
-  } catch (e) {
-    toast((e as Error).message || t('toast.requestFailed'), 'error')
-  }
-}
-async function removeSource(s: McpSource) {
-  if (!window.confirm('删除该 marketplace 源?(官方源不可删)')) return
-  try {
-    await codexApi.removeMcpSource(s.id)
-    await reloadSources()
-    await reloadMarketIndex(true)
-  } catch (e) {
-    toast((e as Error).message || t('toast.requestFailed'), 'error')
-  }
-}
-async function confirmAddSource() {
-  const name = sourceName.value.trim()
-  const url = sourceUrl.value.trim()
-  if (!name || !url) {
-    toast('name 跟 url 都必填', 'error')
-    return
-  }
-  try {
-    await codexApi.addMcpSource(name, url)
-    addSourceModal.value = false
-    sourceName.value = ''
-    sourceUrl.value = ''
-    await reloadSources()
-    await reloadMarketIndex(true)
-  } catch (e) {
-    toast((e as Error).message || t('toast.requestFailed'), 'error')
-  }
-}
-
-const filter = computed(() => marketFilter.value.trim().toLowerCase())
-function matches(...txts: (string | undefined)[]): boolean {
-  if (!filter.value) return true
-  return txts.some((x) => (x || '').toLowerCase().includes(filter.value))
-}
-const marketErrors = computed(() => Object.entries(marketIndex.value.errors || {}))
-const filteredMarketServers = computed(() =>
-  (marketIndex.value.servers || []).filter((s) => matches(s.id, s.name, s.description, s.transport)),
-)
-const filteredMarketPlugins = computed(() =>
-  (marketIndex.value.plugins || []).filter((p) => matches(p.id, p.description, p.marketplace)),
-)
-
-async function installMarketServer(id: string) {
-  const item = (marketIndex.value.servers || []).find((s) => s.id === id)
-  if (!item) return
-  const spec: McpServerSpec = {
-    name: item.id,
-    transport: item.transport === 'stdio' ? 'stdio' : 'streamable_http',
-    enabled: true,
-    required: false,
-    supportsParallelToolCalls: false,
-  }
-  if (item.transport === 'stdio') {
-    spec.command = item.command || ''
-    spec.args = item.args || []
-  } else {
-    spec.url = item.url || ''
-    spec.bearerTokenEnvVar = item.bearerTokenEnvVar || undefined
-  }
-  if (!window.confirm(buildSaveConfirm(spec))) return
-  try {
-    await codexApi.saveMcpServer(spec)
-    toast(t('codex.mcp.installServerOk'))
-    currentServerName.value = item.id
-    subpane.value = 'servers'
-    await reloadServers()
-  } catch (e) {
-    toast((e as Error).message || t('toast.requestFailed'), 'error')
-  }
-}
-async function installMarketPlugin(id: string, marketplace: string) {
-  const item = (marketIndex.value.plugins || []).find((p) => p.id === id && p.marketplace === marketplace)
-  if (!item) return
-  if (
-    !window.confirm(
-      `下载并安装 plugin "${id}@${marketplace}" v${item.version}?\n\n来源:${item.tarballUrl}\n会解压到 ~/.codex/plugins/cache/${marketplace}/${id}/${item.version}/`,
-    )
-  )
-    return
-  try {
-    toast('正在下载 + 解压…')
-    await codexApi.installMcpPlugin({ name: id, marketplace, version: item.version, tarballUrl: item.tarballUrl })
-    toast(t('codex.mcp.installPluginOk'))
-    subpane.value = 'plugins'
-    await reloadPlugins()
-  } catch (e) {
-    toast((e as Error).message || t('toast.requestFailed'), 'error')
-  }
-}
-
-function pluginCaps(p: codexApi.McpMarketPluginItem): string {
-  if (!p.capabilities) return ''
-  const c = p.capabilities as { mcpServers?: number; skills?: number; apps?: number }
-  return `mcp:${c.mcpServers || 0} skills:${c.skills || 0} apps:${c.apps || 0}`
-}
-
 // ── subpane lazy load ──────────────────────────────────────────────────────
 async function loadSubpane(sub: Subpane) {
   if (sub === 'servers') await reloadServers()
   else if (sub === 'plugins') await reloadPlugins()
-  else {
-    await reloadSources()
-    await reloadMarketIndex(false)
-  }
+  // marketplace:ConnectorMarket 组件自身 onMounted 拉取连接器官方源,无需在此预载
 }
 onMounted(() => loadSubpane(subpane.value))
 watch(subpane, (sub) => loadSubpane(sub))
@@ -582,69 +441,8 @@ watch(subpane, (sub) => loadSubpane(sub))
       </div>
     </div>
 
-    <!-- ════ Marketplace ════ -->
-    <div v-else class="mcp__market">
-      <div class="mcp__sources">
-        <span
-          v-for="s in sources"
-          :key="s.id"
-          class="mcp__source"
-          :class="{ active: s.enabled, disabled: !s.enabled }"
-        >
-          <button type="button" class="mcp__source-toggle" @click="toggleSource(s)">
-            {{ s.official ? '✓' : '◦' }} {{ s.name }}
-          </button>
-          <button
-            v-if="!s.official"
-            type="button"
-            class="mcp__source-remove"
-            :title="t('codex.mcp.deleteSource')"
-            @click="removeSource(s)"
-          >
-            ×
-          </button>
-        </span>
-        <AppButton size="sm" :icon="IconPlus" :label="t('codex.mcp.sourceAdd')" @click="addSourceModal = true" />
-        <AppButton size="sm" :icon="IconRefresh" :label="t('codex.mcp.refresh')" @click="reloadMarketIndex(true)" />
-      </div>
-
-      <AppInput v-model="marketFilter" :placeholder="t('codex.mcp.searchPlaceholder')" class="mcp__search" />
-
-      <div v-for="[id, msg] in marketErrors" :key="id" class="mcp__market-error">
-        源 <code>{{ id }}</code> fetch 失败:{{ msg }}
-      </div>
-
-      <h3 class="mcp__market-title">{{ t('codex.mcp.serverPresets') }}</h3>
-      <div v-if="!filteredMarketServers.length" class="mcp__empty">{{ t('codex.mcp.marketEmpty') }}</div>
-      <div v-for="s in filteredMarketServers" :key="s.id" class="mcp__market-item">
-        <div class="mcp__market-body">
-          <div class="mcp__market-name">
-            <span class="mcp__tchip" :class="s.transport === 'stdio' ? 'stdio' : 'http'">{{
-              s.transport === 'stdio' ? 'stdio' : 'http'
-            }}</span>
-            <span>{{ s.name || s.id }}</span>
-            <span class="mcp__market-src">{{ s.source || '?' }}</span>
-          </div>
-          <div v-if="s.description" class="mcp__market-desc">{{ s.description }}</div>
-        </div>
-        <AppButton size="sm" :icon="IconDownload" :label="t('codex.mcp.installAction')" @click="installMarketServer(s.id)" />
-      </div>
-
-      <h3 class="mcp__market-title">{{ t('codex.mcp.pluginBundles') }}</h3>
-      <div v-if="!filteredMarketPlugins.length" class="mcp__empty">{{ t('codex.mcp.marketEmpty') }}</div>
-      <div v-for="p in filteredMarketPlugins" :key="`${p.marketplace}/${p.id}`" class="mcp__market-item">
-        <div class="mcp__market-body">
-          <div class="mcp__market-name">
-            <span>{{ p.id }}</span>
-            <span class="mcp__plugin-ver">@{{ p.marketplace }} v{{ p.version }}</span>
-            <span class="mcp__market-src">{{ p.source || '?' }}</span>
-          </div>
-          <div v-if="p.description" class="mcp__market-desc">{{ p.description }}</div>
-          <div v-if="pluginCaps(p)" class="mcp__market-caps">{{ pluginCaps(p) }}</div>
-        </div>
-        <AppButton size="sm" :icon="IconDownload" :label="t('codex.mcp.sourceAddConfirm')" @click="installMarketPlugin(p.id, p.marketplace || '')" />
-      </div>
-    </div>
+    <!-- ════ Marketplace(连接器官方源镜像)════ -->
+    <ConnectorMarket v-else />
 
     <!-- history (servers) -->
     <HistoryModal
@@ -666,18 +464,6 @@ watch(subpane, (sub) => loadSubpane(sub))
       </div>
     </AppModal>
 
-    <!-- add source modal -->
-    <AppModal v-if="addSourceModal" :title="t('codex.mcp.sourceAddTitle')" @close="addSourceModal = false">
-      <p class="mcp__add-desc">{{ t('codex.mcp.sourceAddPrompt') }}</p>
-      <div class="mcp__add-fields">
-        <AppInput v-model="sourceName" placeholder="My Registry" />
-        <AppInput v-model="sourceUrl" placeholder="https://example.com/registry.json" />
-      </div>
-      <div class="mcp__add-actions">
-        <AppButton variant="ghost" :label="t('common.cancel')" @click="addSourceModal = false" />
-        <AppButton variant="primary" :label="t('codex.mcp.sourceAddConfirm')" @click="confirmAddSource" />
-      </div>
-    </AppModal>
   </div>
 </template>
 
@@ -912,117 +698,12 @@ watch(subpane, (sub) => loadSubpane(sub))
   color: var(--text-muted);
 }
 
-/* marketplace */
-.mcp__market {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
-.mcp__sources {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-}
-.mcp__source {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-full);
-  overflow: hidden;
-}
-.mcp__source.active {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-}
-.mcp__source.disabled {
-  opacity: 0.5;
-}
-.mcp__source-toggle {
-  padding: 3px 10px;
-  border: none;
-  background: transparent;
-  color: var(--text);
-  font-size: var(--fs-xs);
-}
-.mcp__source-remove {
-  padding: 3px 8px;
-  border: none;
-  background: transparent;
-  color: var(--text-muted);
-}
-.mcp__source-remove:hover {
-  color: var(--danger);
-}
-.mcp__search :deep(.app-input) {
-  width: 100%;
-}
-.mcp__market-error {
-  padding: var(--space-2) var(--space-3);
-  background: var(--danger-soft);
-  border-radius: var(--radius-sm);
-  color: var(--danger);
-  font-size: var(--fs-xs);
-}
-.mcp__market-title {
-  margin: var(--space-2) 0 0;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-.mcp__market-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  padding: var(--space-3);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-}
-.mcp__market-body {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.mcp__market-name {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: var(--fs-sm);
-  font-weight: 550;
-}
-.mcp__market-src {
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-  font-weight: 400;
-}
-.mcp__market-desc {
-  font-size: var(--fs-xs);
-  color: var(--text-secondary);
-  line-height: 1.5;
-}
-.mcp__market-caps {
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-}
-
 /* modals */
 .mcp__add-desc {
   margin: 0 0 var(--space-3);
   font-size: var(--fs-sm);
   color: var(--text-secondary);
   line-height: 1.5;
-}
-.mcp__add-fields {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-.mcp__add-fields :deep(.app-input) {
-  width: 100%;
 }
 .mcp__add-actions {
   display: flex;

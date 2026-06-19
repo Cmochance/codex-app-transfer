@@ -1,0 +1,1509 @@
+- generic [ref=e3]:
+  - generic [ref=e4]:
+    - generic: Codex App Transfer
+  - banner [ref=e5]:
+    - navigation [ref=e6]:
+      - link "提供商" [ref=e7] [cursor=pointer]:
+        - /url: "#/providers"
+        - img [ref=e8]
+        - generic [ref=e10]: 提供商
+      - link "路由" [ref=e11] [cursor=pointer]:
+        - /url: "#/proxy"
+        - img [ref=e12]
+        - generic [ref=e16]: 路由
+      - link "用量" [ref=e17] [cursor=pointer]:
+        - /url: "#/usage"
+        - img [ref=e18]
+        - generic [ref=e20]: 用量
+      - link "文档" [ref=e21] [cursor=pointer]:
+        - /url: "#/codex"
+        - img [ref=e22]
+        - generic [ref=e24]: 文档
+      - link "市场" [ref=e25] [cursor=pointer]:
+        - /url: "#/marketplace"
+        - img [ref=e26]
+        - generic [ref=e30]: 市场
+      - link "设置" [ref=e31] [cursor=pointer]:
+        - /url: "#/settings"
+        - img [ref=e32]
+        - generic [ref=e36]: 设置
+  - main [ref=e37]:
+    - generic [ref=e39]:
+      - generic [ref=e40]:
+        - generic [ref=e41]:
+          - img [ref=e42]
+          - heading "插件市场" [level=1] [ref=e46]
+          - generic [ref=e59]: "178"
+        - generic [ref=e47]:
+          - generic [ref=e48]:
+            - img
+            - textbox "搜索连接器…" [ref=e49]
+          - button "刷新" [ref=e50] [cursor=pointer]:
+            - img [ref=e51]
+            - generic [ref=e56]: 刷新
+      - paragraph [ref=e57]: 镜像自 OpenAI Codex 插件目录的展示数据。这些是 OpenAI 平台的远程连接器,此处仅供浏览。
+      - generic [ref=e60]:
+        - heading "Business & Operations 16" [level=2] [ref=e61]:
+          - text: Business & Operations
+          - generic [ref=e62]: "16"
+        - generic [ref=e63]:
+          - article [ref=e64]:
+            - img "Actively" [ref=e65]
+            - generic [ref=e66]:
+              - generic [ref=e67]: Actively
+              - generic [ref=e68]: Account intelligence and prospecting signals from Actively
+            - link "打开官网" [ref=e69] [cursor=pointer]:
+              - /url: https://www.actively.ai
+              - img [ref=e70]
+          - article [ref=e72]:
+            - img "Apollo" [ref=e73]
+            - generic [ref=e74]:
+              - generic [ref=e75]: Apollo
+              - generic [ref=e76]: B2B prospecting, account research, contacts, and outreach lists
+            - link "打开官网" [ref=e77] [cursor=pointer]:
+              - /url: https://www.apollo.io
+              - img [ref=e78]
+          - article [ref=e80]:
+            - img "Attio" [ref=e81]
+            - generic [ref=e82]:
+              - generic [ref=e83]: Attio
+              - generic [ref=e84]: Attio connects Codex directly to your CRM workspace, letting you manage customer relationships through na...
+            - link "打开官网" [ref=e85] [cursor=pointer]:
+              - /url: https://attio.com
+              - img [ref=e86]
+          - article [ref=e88]:
+            - img "Carta CRM" [ref=e89]
+            - generic [ref=e90]:
+              - generic [ref=e91]: Carta CRM
+              - generic [ref=e92]: Carta CRM helps investment teams stay on top of deal flow by keeping deals, companies, and relationships in...
+            - link "打开官网" [ref=e93] [cursor=pointer]:
+              - /url: https://carta.com
+              - img [ref=e94]
+          - article [ref=e96]:
+            - img "Clay" [ref=e97]
+            - generic [ref=e98]:
+              - generic [ref=e99]: Clay
+              - generic [ref=e100]: Find and enrich GTM accounts, contacts, and prospects.
+            - link "打开官网" [ref=e101] [cursor=pointer]:
+              - /url: https://www.clay.com
+              - img [ref=e102]
+          - article [ref=e104]:
+            - img "Close" [ref=e105]
+            - generic [ref=e106]:
+              - generic [ref=e107]: Close
+              - generic [ref=e108]: CRM leads, opportunities, activities, and sales pipeline context
+            - link "打开官网" [ref=e109] [cursor=pointer]:
+              - /url: https://www.close.com
+              - img [ref=e110]
+          - article [ref=e112]:
+            - img "Demandbase" [ref=e113]
+            - generic [ref=e114]:
+              - generic [ref=e115]: Demandbase
+              - generic [ref=e116]: Demandbase integration with Codex gives sales, marketing, and GTM teams seamless access to rich B2B data...
+            - link "打开官网" [ref=e117] [cursor=pointer]:
+              - /url: https://www.demandbase.com
+              - img [ref=e118]
+          - article [ref=e120]:
+            - img "Hebbia" [ref=e121]
+            - generic [ref=e122]:
+              - generic [ref=e123]: Hebbia
+              - generic [ref=e124]: Document research, evidence-backed answers, and project analysis
+            - link "打开官网" [ref=e125] [cursor=pointer]:
+              - /url: https://www.hebbia.ai
+              - img [ref=e126]
+          - article [ref=e128]:
+            - img "HubSpot" [ref=e129]
+            - generic [ref=e130]:
+              - generic [ref=e131]: HubSpot
+              - generic [ref=e132]: Work with your HubSpot data to analyze patterns, create and update records, and manage your CRM operations.
+            - link "打开官网" [ref=e133] [cursor=pointer]:
+              - /url: https://www.hubspot.com/
+              - img [ref=e134]
+          - article [ref=e136]:
+            - img "Intercom" [ref=e137]
+            - generic [ref=e138]:
+              - generic [ref=e139]: Intercom
+              - generic [ref=e140]: Customer conversations, contacts, tickets, and support workflows from Intercom
+            - link "打开官网" [ref=e141] [cursor=pointer]:
+              - /url: https://www.intercom.com
+              - img [ref=e142]
+          - article [ref=e144]:
+            - img "Outreach" [ref=e145]
+            - generic [ref=e146]:
+              - generic [ref=e147]: Outreach
+              - generic [ref=e148]: Sales engagement, prospects, sequences, and deal activity context
+            - link "打开官网" [ref=e149] [cursor=pointer]:
+              - /url: https://www.outreach.io
+              - img [ref=e150]
+          - article [ref=e152]:
+            - img "Pipedrive" [ref=e153]
+            - generic [ref=e154]:
+              - generic [ref=e155]: Pipedrive
+              - generic [ref=e156]: Connect to sync Pipedrive deals and contacts for use in Codex.
+            - link "打开官网" [ref=e157] [cursor=pointer]:
+              - /url: https://www.pipedrive.com/
+              - img [ref=e158]
+          - article [ref=e160]:
+            - img "Sales" [ref=e161]
+            - generic [ref=e162]:
+              - generic [ref=e163]: Sales
+              - generic [ref=e164]: Prepare sales work faster
+            - link "打开官网" [ref=e165] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e166]
+          - article [ref=e168]:
+            - img "Streak" [ref=e169]
+            - generic [ref=e170]:
+              - generic [ref=e171]: Streak
+              - generic [ref=e172]: Streak is a CRM built directly into Gmail, so you can track deals, contacts, and workflows from your inbox.
+            - link "打开官网" [ref=e173] [cursor=pointer]:
+              - /url: https://www.streak.com
+              - img [ref=e174]
+          - article [ref=e176]:
+            - img "Zoho" [ref=e177]
+            - generic [ref=e178]:
+              - generic [ref=e179]: Zoho
+              - generic [ref=e180]: CRM records, deals, contacts, and account context from Zoho
+            - link "打开官网" [ref=e181] [cursor=pointer]:
+              - /url: https://www.zoho.com
+              - img [ref=e182]
+          - article [ref=e184]:
+            - img "ZoomInfo" [ref=e185]
+            - generic [ref=e186]:
+              - generic [ref=e187]: ZoomInfo
+              - generic [ref=e188]: B2B company intelligence, contacts, and go-to-market signals
+            - link "打开官网" [ref=e189] [cursor=pointer]:
+              - /url: https://www.zoominfo.com
+              - img [ref=e190]
+      - generic [ref=e192]:
+        - heading "Finance 27" [level=2] [ref=e193]:
+          - text: Finance
+          - generic [ref=e194]: "27"
+        - generic [ref=e195]:
+          - article [ref=e196]:
+            - img "Aiera" [ref=e197]
+            - generic [ref=e198]:
+              - generic [ref=e199]: Aiera
+              - generic [ref=e200]: Earnings calls, transcripts, financial events, and market commentary
+            - link "打开官网" [ref=e201] [cursor=pointer]:
+              - /url: https://www.aiera.com
+              - img [ref=e202]
+          - article [ref=e204]:
+            - img "Alpaca" [ref=e205]
+            - generic [ref=e206]:
+              - generic [ref=e207]: Alpaca
+              - generic [ref=e208]: Stop watching the markets.
+            - link "打开官网" [ref=e209] [cursor=pointer]:
+              - /url: https://alpaca.markets/
+              - img [ref=e210]
+          - article [ref=e212]:
+            - img "Binance" [ref=e213]
+            - generic [ref=e214]:
+              - generic [ref=e215]: Binance
+              - generic [ref=e216]: Binance for Codex lets you access and explore Binance public, read-only market data using natural language.
+            - link "打开官网" [ref=e217] [cursor=pointer]:
+              - /url: https://www.binance.com
+              - img [ref=e218]
+          - article [ref=e220]:
+            - img "Brex" [ref=e221]
+            - generic [ref=e222]:
+              - generic [ref=e223]: Brex
+              - generic [ref=e224]: Connect Brex to Codex and review your company finances through natural conversation — at Codex speed.
+            - link "打开官网" [ref=e225] [cursor=pointer]:
+              - /url: https://brex.com
+              - img [ref=e226]
+          - article [ref=e228]:
+            - img "CB Insights" [ref=e229]
+            - generic [ref=e230]:
+              - generic [ref=e231]: CB Insights
+              - generic [ref=e232]: Unleash Codex as your private markets research agent.
+            - link "打开官网" [ref=e233] [cursor=pointer]:
+              - /url: https://cbinsights.com
+              - img [ref=e234]
+          - article [ref=e236]:
+            - img "Chronograph" [ref=e237]
+            - generic [ref=e238]:
+              - generic [ref=e239]: Chronograph
+              - generic [ref=e240]: Private capital portfolio monitoring, fund metrics, and company updates
+            - link "打开官网" [ref=e241] [cursor=pointer]:
+              - /url: https://www.chronograph.pe
+              - img [ref=e242]
+          - article [ref=e244]:
+            - img "Cube" [ref=e245]
+            - generic [ref=e246]:
+              - generic [ref=e247]: Cube
+              - generic [ref=e248]: "With the Cube MCP Server, you can: - Query live Cube data from actuals, budgets, forecasts, variances, and..."
+            - link "打开官网" [ref=e249] [cursor=pointer]:
+              - /url: https://www.cubesoftware.com/
+              - img [ref=e250]
+          - article [ref=e252]:
+            - img "D&B Finance Analytics" [ref=e253]
+            - generic [ref=e254]:
+              - generic [ref=e255]: D&B Finance Analytics
+              - generic [ref=e256]: Credit origination, portfolio risk, company reports, and folder workflows.
+            - link "打开官网" [ref=e257] [cursor=pointer]:
+              - /url: https://www.dnb.com/
+              - img [ref=e258]
+          - article [ref=e260]:
+            - img "Daloopa" [ref=e261]
+            - generic [ref=e262]:
+              - generic [ref=e263]: Daloopa
+              - generic [ref=e264]: Institutional-grade financial analysis workflows.
+            - link "打开官网" [ref=e265] [cursor=pointer]:
+              - /url: https://daloopa.com
+              - img [ref=e266]
+          - article [ref=e268]:
+            - img "FactSet" [ref=e269]
+            - generic [ref=e270]:
+              - generic [ref=e271]: FactSet
+              - generic [ref=e272]: Financial data, estimates, market analytics, and research context
+            - link "打开官网" [ref=e273] [cursor=pointer]:
+              - /url: https://www.factset.com
+              - img [ref=e274]
+          - article [ref=e276]:
+            - img "Fiscal AI" [ref=e277]
+            - generic [ref=e278]:
+              - generic [ref=e279]: Fiscal AI
+              - generic [ref=e280]: Financial research, fundamentals, filings, and market insights
+            - link "打开官网" [ref=e281] [cursor=pointer]:
+              - /url: https://fiscal.ai
+              - img [ref=e282]
+          - article [ref=e284]:
+            - img "Investment Banking" [ref=e285]
+            - generic [ref=e286]:
+              - generic [ref=e287]: Investment Banking
+              - generic [ref=e288]: M&A, capital markets, LevFin, valuation, diligence, and pitch workflows
+            - link "打开官网" [ref=e289] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e290]
+          - article [ref=e292]:
+            - img "KeyBid Puls" [ref=e293]
+            - generic [ref=e294]:
+              - generic [ref=e295]: KeyBid Puls
+              - generic [ref=e296]: Unlock the profitability of short-term rental investments with our ROI Calculator app, tailored for platfor...
+            - link "打开官网" [ref=e297] [cursor=pointer]:
+              - /url: https://keybid.eu
+              - img [ref=e298]
+          - article [ref=e300]:
+            - img "LSEG" [ref=e301]
+            - generic [ref=e302]:
+              - generic [ref=e303]: LSEG
+              - generic [ref=e304]: Financial market data, company intelligence, and news
+            - link "打开官网" [ref=e305] [cursor=pointer]:
+              - /url: https://www.lseg.com
+              - img [ref=e306]
+          - article [ref=e308]:
+            - img "Moody's" [ref=e309]
+            - generic [ref=e310]:
+              - generic [ref=e311]: Moody's
+              - generic [ref=e312]: Credit ratings, research, entity intelligence, ownership, financials, and filings.
+            - link "打开官网" [ref=e313] [cursor=pointer]:
+              - /url: https://www.moodys.com
+              - img [ref=e314]
+          - article [ref=e316]:
+            - img "Morningstar" [ref=e317]
+            - generic [ref=e318]:
+              - generic [ref=e319]: Morningstar
+              - generic [ref=e320]: Screen, summarize, and compare funds with the Morningstar app.
+            - link "打开官网" [ref=e321] [cursor=pointer]:
+              - /url: https://www.morningstar.com
+              - img [ref=e322]
+          - article [ref=e324]:
+            - img "MT Newswires" [ref=e325]
+            - generic [ref=e326]:
+              - generic [ref=e327]: MT Newswires
+              - generic [ref=e328]: MT Newswires brings real-time global financial news directly into Codex — providing original, unbiased an...
+            - link "打开官网" [ref=e329] [cursor=pointer]:
+              - /url: https://www.mtnewswires.com
+              - img [ref=e330]
+          - article [ref=e332]:
+            - img "PitchBook" [ref=e333]
+            - generic [ref=e334]:
+              - generic [ref=e335]: PitchBook
+              - generic [ref=e336]: PitchBook provides structured access to private capital market data across companies, investors, funds, de...
+            - link "打开官网" [ref=e337] [cursor=pointer]:
+              - /url: https://www.pitchbook.com
+              - img [ref=e338]
+          - article [ref=e340]:
+            - img "Public Equity Investing" [ref=e341]
+            - generic [ref=e342]:
+              - generic [ref=e343]: Public Equity Investing
+              - generic [ref=e344]: Public equity PM research, long/short, earnings, ETF/index diligence, and memos
+            - link "打开官网" [ref=e345] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e346]
+          - article [ref=e348]:
+            - img "Quartr" [ref=e349]
+            - generic [ref=e350]:
+              - generic [ref=e351]: Quartr
+              - generic [ref=e352]: Access structured first-party IR data from over 14,500+ public companies across 65 markets Quartr delivers...
+            - link "打开官网" [ref=e353] [cursor=pointer]:
+              - /url: https://quartr.com
+              - img [ref=e354]
+          - article [ref=e356]:
+            - img "Razorpay" [ref=e357]
+            - generic [ref=e358]:
+              - generic [ref=e359]: Razorpay
+              - generic [ref=e360]: Connect your Razorpay account to access your payment data through conversation.
+            - link "打开官网" [ref=e361] [cursor=pointer]:
+              - /url: https://razorpay.com/
+              - img [ref=e362]
+          - article [ref=e364]:
+            - img "S&P Global" [ref=e365]
+            - generic [ref=e366]:
+              - generic [ref=e367]: S&P Global
+              - generic [ref=e368]: Company financials, ratings context, market research, and industry data
+            - link "打开官网" [ref=e369] [cursor=pointer]:
+              - /url: https://www.spglobal.com
+              - img [ref=e370]
+          - article [ref=e372]:
+            - img "Setu Bharat Connect BillPay" [ref=e373]
+            - generic [ref=e374]:
+              - generic [ref=e375]: Setu Bharat Connect BillPay
+              - generic [ref=e376]: This app helps you pay your utility bills through simple conversation.
+            - link "打开官网" [ref=e377] [cursor=pointer]:
+              - /url: https://setu.co/
+              - img [ref=e378]
+          - article [ref=e380]:
+            - img "Stripe" [ref=e381]
+            - generic [ref=e382]:
+              - generic [ref=e383]: Stripe
+              - generic [ref=e384]: Payments and business tools
+            - link "打开官网" [ref=e385] [cursor=pointer]:
+              - /url: https://stripe.com
+              - img [ref=e386]
+          - article [ref=e388]:
+            - img "Taxdown" [ref=e389]
+            - generic [ref=e390]:
+              - generic [ref=e391]: Taxdown
+              - generic [ref=e392]: "TaxDown te ayuda a resolver dudas fiscales en España, tanto para particulares como autónomos: deducciones,..."
+            - link "打开官网" [ref=e393] [cursor=pointer]:
+              - /url: https://taxdown.es/
+              - img [ref=e394]
+          - article [ref=e396]:
+            - img "Third Bridge" [ref=e397]
+            - generic [ref=e398]:
+              - generic [ref=e399]: Third Bridge
+              - generic [ref=e400]: Seamlessly incorporate critical context and trusted insights from industry experts as part of your financia...
+            - link "打开官网" [ref=e401] [cursor=pointer]:
+              - /url: https://www.thirdbridge.com
+              - img [ref=e402]
+          - article [ref=e404]:
+            - img "Tinman AI" [ref=e405]
+            - generic [ref=e406]:
+              - generic [ref=e407]: Tinman AI
+              - generic [ref=e408]: Tinman AI helps loan officers and underwriters quickly underwrite home financing scenarios and answer compl...
+            - link "打开官网" [ref=e409] [cursor=pointer]:
+              - /url: https://better.com
+              - img [ref=e410]
+      - generic [ref=e412]:
+        - heading "Productivity 42" [level=2] [ref=e413]:
+          - text: Productivity
+          - generic [ref=e414]: "42"
+        - generic [ref=e415]:
+          - article [ref=e416]:
+            - img "Airtable" [ref=e417]
+            - generic [ref=e418]:
+              - generic [ref=e419]: Airtable
+              - generic [ref=e420]: Database and operations layer for your agents.
+            - link "打开官网" [ref=e421] [cursor=pointer]:
+              - /url: https://www.airtable.com
+              - img [ref=e422]
+          - article [ref=e424]:
+            - img "Asana" [ref=e425]
+            - generic [ref=e426]:
+              - generic [ref=e427]: Asana
+              - generic [ref=e428]: Read and manage Asana
+            - link "打开官网" [ref=e429] [cursor=pointer]:
+              - /url: https://asana.com
+              - img [ref=e430]
+          - article [ref=e432]:
+            - img "Atlassian Rovo" [ref=e433]
+            - generic [ref=e434]:
+              - generic [ref=e435]: Atlassian Rovo
+              - generic [ref=e436]: Manage Jira and Confluence fast
+            - link "打开官网" [ref=e437] [cursor=pointer]:
+              - /url: https://www.atlassian.com
+              - img [ref=e438]
+          - article [ref=e440]:
+            - img "Box" [ref=e441]
+            - generic [ref=e442]:
+              - generic [ref=e443]: Box
+              - generic [ref=e444]: Search and reference your documents
+            - link "打开官网" [ref=e445] [cursor=pointer]:
+              - /url: https://www.box.com/home
+              - img [ref=e446]
+          - article [ref=e448]:
+            - img "Brand24" [ref=e449]
+            - generic [ref=e450]:
+              - generic [ref=e451]: Brand24
+              - generic [ref=e452]: The Brand24 app in Codex lets marketing and PR teams instantly explore brand mentions, sentiment, and med...
+            - link "打开官网" [ref=e453] [cursor=pointer]:
+              - /url: https://brand24.com
+              - img [ref=e454]
+          - article [ref=e456]:
+            - img "BrightHire" [ref=e457]
+            - generic [ref=e458]:
+              - generic [ref=e459]: BrightHire
+              - generic [ref=e460]: Search and analyze BrightHire interviews, candidates, calls, and hiring data.
+            - link "打开官网" [ref=e461] [cursor=pointer]:
+              - /url: https://www.brighthire.com
+              - img [ref=e462]
+          - article [ref=e464]:
+            - img "Calendly" [ref=e465]
+            - generic [ref=e466]:
+              - generic [ref=e467]: Calendly
+              - generic [ref=e468]: Search Calendly meetings, events, and availability.
+            - link "打开官网" [ref=e469] [cursor=pointer]:
+              - /url: https://calendly.com
+              - img [ref=e470]
+          - article [ref=e472]:
+            - img "Channel99" [ref=e473]
+            - generic [ref=e474]:
+              - generic [ref=e475]: Channel99
+              - generic [ref=e476]: Channel99 real time go to market intelligence connects Codex directly to Channel99’s performance marketin...
+            - link "打开官网" [ref=e477] [cursor=pointer]:
+              - /url: https://www.channel99.com/
+              - img [ref=e478]
+          - article [ref=e480]:
+            - img "ClickUp" [ref=e481]
+            - generic [ref=e482]:
+              - generic [ref=e483]: ClickUp
+              - generic [ref=e484]: Turn Codex into your ClickUp command center.
+          - article [ref=e485]:
+            - img "Common Room" [ref=e486]
+            - generic [ref=e487]:
+              - generic [ref=e488]: Common Room
+              - generic [ref=e489]: Embed complete buyer intelligence directly within Codex.
+            - link "打开官网" [ref=e490] [cursor=pointer]:
+              - /url: https://commonroom.io
+              - img [ref=e491]
+          - article [ref=e493]:
+            - img "Conductor" [ref=e494]
+            - generic [ref=e495]:
+              - generic [ref=e496]: Conductor
+              - generic [ref=e497]: The Conductor MCP server retrieves proprietary performance metrics regarding a brand's visibility, sentimen...
+            - link "打开官网" [ref=e498] [cursor=pointer]:
+              - /url: https://www.conductor.com/
+              - img [ref=e499]
+          - article [ref=e501]:
+            - img "Coveo" [ref=e502]
+            - generic [ref=e503]:
+              - generic [ref=e504]: Coveo
+              - generic [ref=e505]: Search your enterprise content
+            - link "打开官网" [ref=e506] [cursor=pointer]:
+              - /url: https://www.coveo.com
+              - img [ref=e507]
+          - article [ref=e509]:
+            - img "Datasite" [ref=e510]
+            - generic [ref=e511]:
+              - generic [ref=e512]: Datasite
+              - generic [ref=e513]: Deal room documents, diligence materials, and Q&A workflows
+            - link "打开官网" [ref=e514] [cursor=pointer]:
+              - /url: https://www.datasite.com
+              - img [ref=e515]
+          - article [ref=e517]:
+            - img "Docket" [ref=e518]
+            - generic [ref=e519]:
+              - generic [ref=e520]: Docket
+              - generic [ref=e521]: Docket AI makes your sales knowledge your instant superpower.
+            - link "打开官网" [ref=e522] [cursor=pointer]:
+              - /url: https://www.docket.io/
+              - img [ref=e523]
+          - article [ref=e525]:
+            - img "Docusign" [ref=e526]
+            - generic [ref=e527]:
+              - generic [ref=e528]: Docusign
+              - generic [ref=e529]: Agreement envelopes, signing status, recipients, and contract dates
+            - link "打开官网" [ref=e530] [cursor=pointer]:
+              - /url: https://www.docusign.com
+              - img [ref=e531]
+          - article [ref=e533]:
+            - img "Domotz (Preview)" [ref=e534]
+            - generic [ref=e535]:
+              - generic [ref=e536]: Domotz (Preview)
+              - generic [ref=e537]: Monitor and manage your network infrastructure through natural language.
+            - link "打开官网" [ref=e538] [cursor=pointer]:
+              - /url: https://www.domotz.com
+              - img [ref=e539]
+          - article [ref=e541]:
+            - img "Dovetail" [ref=e542]
+            - generic [ref=e543]:
+              - generic [ref=e544]: Dovetail
+              - generic [ref=e545]: Connect Dovetail inside Codex to turn customer feedback into decisions without leaving your conversation.
+            - link "打开官网" [ref=e546] [cursor=pointer]:
+              - /url: https://dovetail.com
+              - img [ref=e547]
+          - article [ref=e549]:
+            - img "Egnyte" [ref=e550]
+            - generic [ref=e551]:
+              - generic [ref=e552]: Egnyte
+              - generic [ref=e553]: Work with documents and files stored in Egnyte directly from Codex.
+            - link "打开官网" [ref=e554] [cursor=pointer]:
+              - /url: https://www.egnyte.com
+              - img [ref=e555]
+          - article [ref=e557]:
+            - img "Google Drive" [ref=e558]
+            - generic [ref=e559]:
+              - generic [ref=e560]: Google Drive
+              - generic [ref=e561]: Work across Drive, Docs, Sheets, and Slides
+            - link "打开官网" [ref=e562] [cursor=pointer]:
+              - /url: https://workspace.google.com/products/drive/
+              - img [ref=e563]
+          - article [ref=e565]:
+            - img "Happenstance" [ref=e566]
+            - generic [ref=e567]:
+              - generic [ref=e568]: Happenstance
+              - generic [ref=e569]: Happenstance searches your professional network using natural language to find the right people.
+            - link "打开官网" [ref=e570] [cursor=pointer]:
+              - /url: https://happenstance.ai
+              - img [ref=e571]
+          - article [ref=e573]:
+            - img "Help Scout" [ref=e574]
+            - generic [ref=e575]:
+              - generic [ref=e576]: Help Scout
+              - generic [ref=e577]: Connect to sync Help Scout mailboxes and conversations for use in Codex.
+            - link "打开官网" [ref=e578] [cursor=pointer]:
+              - /url: https://www.helpscout.com/
+              - img [ref=e579]
+          - article [ref=e581]:
+            - img "HG Insights" [ref=e582]
+            - generic [ref=e583]:
+              - generic [ref=e584]: HG Insights
+              - generic [ref=e585]: Use HG Insights revenue intelligence and GTM signals from Codex.
+            - link "打开官网" [ref=e586] [cursor=pointer]:
+              - /url: https://hginsights.com
+              - img [ref=e587]
+          - article [ref=e589]:
+            - img "HighLevel" [ref=e590]
+            - generic [ref=e591]:
+              - generic [ref=e592]: HighLevel
+              - generic [ref=e593]: HighLevel gives agencies a unified CRM, automation, and client communication platform.
+            - link "打开官网" [ref=e594] [cursor=pointer]:
+              - /url: https://www.gohighlevel.com
+              - img [ref=e595]
+          - article [ref=e597]:
+            - img "Jam" [ref=e598]
+            - generic [ref=e599]:
+              - generic [ref=e600]: Jam
+              - generic [ref=e601]: Screen record with context
+            - link "打开官网" [ref=e602] [cursor=pointer]:
+              - /url: https://jam.dev
+              - img [ref=e603]
+          - article [ref=e605]:
+            - img "Linear" [ref=e606]
+            - generic [ref=e607]:
+              - generic [ref=e608]: Linear
+              - generic [ref=e609]: Find and reference issues and projects.
+            - link "打开官网" [ref=e610] [cursor=pointer]:
+              - /url: https://linear.app/
+              - img [ref=e611]
+          - article [ref=e613]:
+            - img "Mem" [ref=e614]
+            - generic [ref=e615]:
+              - generic [ref=e616]: Mem
+              - generic [ref=e617]: Give Codex the full context of your second brain by connecting your Mem knowledge base.
+            - link "打开官网" [ref=e618] [cursor=pointer]:
+              - /url: https://mem.ai
+              - img [ref=e619]
+          - article [ref=e621]:
+            - img "Meticulate" [ref=e622]
+            - generic [ref=e623]:
+              - generic [ref=e624]: Meticulate
+              - generic [ref=e625]: Company matching, firmographic lookup, and go-to-market account intelligence
+          - article [ref=e626]:
+            - img "Monday.com" [ref=e627]
+            - generic [ref=e628]:
+              - generic [ref=e629]: Monday.com
+              - generic [ref=e630]: A powerful MCP connector enabling AI agents to seamlessly interact with monday.com.
+            - link "打开官网" [ref=e631] [cursor=pointer]:
+              - /url: https://monday.com
+              - img [ref=e632]
+          - article [ref=e634]:
+            - img "Network Solutions" [ref=e635]
+            - generic [ref=e636]:
+              - generic [ref=e637]: Network Solutions
+              - generic [ref=e638]: The Network Solutions Domain Search Assistant makes finding an available domain fast, simple, and conversat...
+            - link "打开官网" [ref=e639] [cursor=pointer]:
+              - /url: https://www.networksolutions.com/
+              - img [ref=e640]
+          - article [ref=e642]:
+            - img "Notion" [ref=e643]
+            - generic [ref=e644]:
+              - generic [ref=e645]: Notion
+              - generic [ref=e646]: Notion workflows for specs, research, meetings, and knowledge capture
+            - link "打开官网" [ref=e647] [cursor=pointer]:
+              - /url: https://www.notion.so/
+              - img [ref=e648]
+          - article [ref=e650]:
+            - img "Outlook Calendar" [ref=e651]
+            - generic [ref=e652]:
+              - generic [ref=e653]: Outlook Calendar
+              - generic [ref=e654]: Manage Outlook schedules and meeting changes
+            - link "打开官网" [ref=e655] [cursor=pointer]:
+              - /url: https://www.microsoft.com/en-us/microsoft-365/outlook/calendar-app
+              - img [ref=e656]
+          - article [ref=e658]:
+            - img "Pylon" [ref=e659]
+            - generic [ref=e660]:
+              - generic [ref=e661]: Pylon
+              - generic [ref=e662]: Access Pylon's customer support platform directly from Codex to search, manage, and resolve customer issues.
+            - link "打开官网" [ref=e663] [cursor=pointer]:
+              - /url: https://www.usepylon.com/
+              - img [ref=e664]
+          - article [ref=e666]:
+            - img "Ranked AI" [ref=e667]
+            - generic [ref=e668]:
+              - generic [ref=e669]: Ranked AI
+              - generic [ref=e670]: Ranked AI provides industry leading AI SEO & PPC software, with a fully managed service integrated into it.
+            - link "打开官网" [ref=e671] [cursor=pointer]:
+              - /url: https://www.ranked.ai
+              - img [ref=e672]
+          - article [ref=e674]:
+            - img "Responsive" [ref=e675]
+            - generic [ref=e676]:
+              - generic [ref=e677]: Responsive
+              - generic [ref=e678]: The Responsive App makes it easy to work with your organization’s data inside Codex.
+            - link "打开官网" [ref=e679] [cursor=pointer]:
+              - /url: https://www.responsive.io
+              - img [ref=e680]
+          - article [ref=e682]:
+            - img "Rox" [ref=e683]
+            - generic [ref=e684]:
+              - generic [ref=e685]: Rox
+              - generic [ref=e686]: Use Rox revenue agents and account intelligence from Codex.
+            - link "打开官网" [ref=e687] [cursor=pointer]:
+              - /url: https://www.rox.com
+              - img [ref=e688]
+          - article [ref=e690]:
+            - img "Semrush" [ref=e691]
+            - generic [ref=e692]:
+              - generic [ref=e693]: Semrush
+              - generic [ref=e694]: The Semrush MCP provides structured, quantitative SEO and traffic data for domains, keywords, backlinks, an...
+            - link "打开官网" [ref=e695] [cursor=pointer]:
+              - /url: https://www.semrush.com/
+              - img [ref=e696]
+          - article [ref=e698]:
+            - img "SharePoint" [ref=e699]
+            - generic [ref=e700]:
+              - generic [ref=e701]: SharePoint
+              - generic [ref=e702]: Summarize SharePoint sites and files
+            - link "打开官网" [ref=e703] [cursor=pointer]:
+              - /url: https://www.microsoft.com/en-us/microsoft-365/sharepoint/collaboration
+              - img [ref=e704]
+          - article [ref=e706]:
+            - img "SignNow" [ref=e707]
+            - generic [ref=e708]:
+              - generic [ref=e709]: SignNow
+              - generic [ref=e710]: Get documents signed faster without switching between tools.
+            - link "打开官网" [ref=e711] [cursor=pointer]:
+              - /url: https://www.signnow.com
+              - img [ref=e712]
+          - article [ref=e714]:
+            - img "SkyWatch" [ref=e715]
+            - generic [ref=e716]:
+              - generic [ref=e717]: SkyWatch
+              - generic [ref=e718]: Search and explore satellite imagery from top providers including Vantor, Planet, Airbus, and more, all in...
+            - link "打开官网" [ref=e719] [cursor=pointer]:
+              - /url: https://skywatch.com
+              - img [ref=e720]
+          - article [ref=e722]:
+            - img "Teamwork.com" [ref=e723]
+            - generic [ref=e724]:
+              - generic [ref=e725]: Teamwork.com
+              - generic [ref=e726]: Connect to sync Teamwork projects and tasks for use in Codex.
+            - link "打开官网" [ref=e727] [cursor=pointer]:
+              - /url: https://www.teamwork.com/
+              - img [ref=e728]
+          - article [ref=e730]:
+            - img "United Rentals" [ref=e731]
+            - generic [ref=e732]:
+              - generic [ref=e733]: United Rentals
+              - generic [ref=e734]: Get the right equipment for the job without guesswork.
+            - link "打开官网" [ref=e735] [cursor=pointer]:
+              - /url: https://www.unitedrentals.com
+              - img [ref=e736]
+          - article [ref=e738]:
+            - img "Waldo" [ref=e739]
+            - generic [ref=e740]:
+              - generic [ref=e741]: Waldo
+              - generic [ref=e742]: Waldo is an AI-powered strategy platform for agencies and brands.
+            - link "打开官网" [ref=e743] [cursor=pointer]:
+              - /url: https://www.waldo.fyi
+              - img [ref=e744]
+      - generic [ref=e746]:
+        - heading "Data & Analytics 15" [level=2] [ref=e747]:
+          - text: Data & Analytics
+          - generic [ref=e748]: "15"
+        - generic [ref=e749]:
+          - article [ref=e750]:
+            - img "Alation" [ref=e751]
+            - generic [ref=e752]:
+              - generic [ref=e753]: Alation
+              - generic [ref=e754]: Data catalog search, lineage, governance, and documentation
+            - link "打开官网" [ref=e755] [cursor=pointer]:
+              - /url: https://www.alation.com
+              - img [ref=e756]
+          - article [ref=e758]:
+            - img "Amplitude" [ref=e759]
+            - generic [ref=e760]:
+              - generic [ref=e761]: Amplitude
+              - generic [ref=e762]: Product analytics and funnels
+          - article [ref=e763]:
+            - img "Coupler.io" [ref=e764]
+            - generic [ref=e765]:
+              - generic [ref=e766]: Coupler.io
+              - generic [ref=e767]: Analyze multi-channel marketing, financial, sales, e-commerce, and other business data within Codex by co...
+            - link "打开官网" [ref=e768] [cursor=pointer]:
+              - /url: https://www.coupler.io/
+              - img [ref=e769]
+          - article [ref=e771]:
+            - img "Data Analytics" [ref=e772]
+            - generic [ref=e773]:
+              - generic [ref=e774]: Data Analytics
+              - generic [ref=e775]: Turn data into clear decisions
+            - link "打开官网" [ref=e776] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e777]
+          - article [ref=e779]:
+            - img "Deepnote" [ref=e780]
+            - generic [ref=e781]:
+              - generic [ref=e782]: Deepnote
+              - generic [ref=e783]: Explore data and automate analysis in Deepnote
+            - link "打开官网" [ref=e784] [cursor=pointer]:
+              - /url: https://deepnote.com
+              - img [ref=e785]
+          - article [ref=e787]:
+            - img "Hex" [ref=e788]
+            - generic [ref=e789]:
+              - generic [ref=e790]: Hex
+              - generic [ref=e791]: Search Hex projects and ask Hex Threads questions
+            - link "打开官网" [ref=e792] [cursor=pointer]:
+              - /url: https://hex.tech/
+              - img [ref=e793]
+          - article [ref=e795]:
+            - img "Metabase" [ref=e796]
+            - generic [ref=e797]:
+              - generic [ref=e798]: Metabase
+              - generic [ref=e799]: Query and explore your Metabase data
+            - link "打开官网" [ref=e800] [cursor=pointer]:
+              - /url: https://www.metabase.com
+              - img [ref=e801]
+          - article [ref=e803]:
+            - img "Mixpanel" [ref=e804]
+            - generic [ref=e805]:
+              - generic [ref=e806]: Mixpanel
+              - generic [ref=e807]: Query and analyze Mixpanel
+            - link "打开官网" [ref=e808] [cursor=pointer]:
+              - /url: https://mixpanel.com/home
+              - img [ref=e809]
+          - article [ref=e811]:
+            - img "Mixpanel Headless" [ref=e812]
+            - generic [ref=e813]:
+              - generic [ref=e814]: Mixpanel Headless
+              - generic [ref=e815]: Analyze Mixpanel data with Python
+            - link "打开官网" [ref=e816] [cursor=pointer]:
+              - /url: https://mixpanel.com/home
+              - img [ref=e817]
+          - article [ref=e819]:
+            - img "MotherDuck" [ref=e820]
+            - generic [ref=e821]:
+              - generic [ref=e822]: MotherDuck
+              - generic [ref=e823]: Connect AI assistants to your MotherDuck data warehouse.
+            - link "打开官网" [ref=e824] [cursor=pointer]:
+              - /url: https://motherduck.com/
+              - img [ref=e825]
+          - article [ref=e827]:
+            - img "Omni Analytics" [ref=e828]
+            - generic [ref=e829]:
+              - generic [ref=e830]: Omni Analytics
+              - generic [ref=e831]: Query Omni using the same semantic model, permissions, and logic defined by your data team directly from Codex.
+            - link "打开官网" [ref=e832] [cursor=pointer]:
+              - /url: https://www.omni.co
+              - img [ref=e833]
+          - article [ref=e835]:
+            - img "PostHog" [ref=e836]
+            - generic [ref=e837]:
+              - generic [ref=e838]: PostHog
+              - generic [ref=e839]: Query analytics, flags, experiments, and errors
+            - link "打开官网" [ref=e840] [cursor=pointer]:
+              - /url: https://posthog.com
+              - img [ref=e841]
+          - article [ref=e843]:
+            - img "Similarweb" [ref=e844]
+            - generic [ref=e845]:
+              - generic [ref=e846]: Similarweb
+              - generic [ref=e847]: Digital market intelligence and web traffic analytics
+            - link "打开官网" [ref=e848] [cursor=pointer]:
+              - /url: https://www.similarweb.com
+              - img [ref=e849]
+          - article [ref=e851]:
+            - img "ThoughtSpot" [ref=e852]
+            - generic [ref=e853]:
+              - generic [ref=e854]: ThoughtSpot
+              - generic [ref=e855]: Business intelligence answers, dashboards, metrics, and revenue analysis
+            - link "打开官网" [ref=e856] [cursor=pointer]:
+              - /url: https://www.thoughtspot.com
+              - img [ref=e857]
+          - article [ref=e859]:
+            - img "Windsor.ai" [ref=e860]
+            - generic [ref=e861]:
+              - generic [ref=e862]: Windsor.ai
+              - generic [ref=e863]: Windsor.ai connects your marketing and business data sources to Codex so you can ask questions in natural...
+            - link "打开官网" [ref=e864] [cursor=pointer]:
+              - /url: https://windsor.ai
+              - img [ref=e865]
+      - generic [ref=e867]:
+        - heading "Developer Tools 42" [level=2] [ref=e868]:
+          - text: Developer Tools
+          - generic [ref=e869]: "42"
+        - generic [ref=e870]:
+          - article [ref=e871]:
+            - img "Base44" [ref=e872]
+            - generic [ref=e873]:
+              - generic [ref=e874]: Base44
+              - generic [ref=e875]: Build and deploy Base44 full-stack apps from Codex
+            - link "打开官网" [ref=e876] [cursor=pointer]:
+              - /url: https://base44.com
+              - img [ref=e877]
+          - article [ref=e879]:
+            - img "Build iOS Apps" [ref=e880]
+            - generic [ref=e881]:
+              - generic [ref=e882]: Build iOS Apps
+              - generic [ref=e883]: Build, refine, and debug iOS apps with App Intents, SwiftUI, and Xcode workflows
+            - link "打开官网" [ref=e884] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e885]
+          - article [ref=e887]:
+            - img "Build macOS Apps" [ref=e888]
+            - generic [ref=e889]:
+              - generic [ref=e890]: Build macOS Apps
+              - generic [ref=e891]: Build, debug, instrument, and implement macOS apps with SwiftUI and AppKit guidance
+            - link "打开官网" [ref=e892] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e893]
+          - article [ref=e895]:
+            - img "Build Web Apps" [ref=e896]
+            - generic [ref=e897]:
+              - generic [ref=e898]: Build Web Apps
+              - generic [ref=e899]: Build frontend-focused web apps with generated assets, browser testing, payments, and databases
+            - link "打开官网" [ref=e900] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e901]
+          - article [ref=e903]:
+            - generic [ref=e1515]: B
+            - generic [ref=e905]:
+              - generic [ref=e906]: Build Web Data Visualization
+              - generic [ref=e907]: Design, build, test, and export web data visualizations
+            - link "打开官网" [ref=e908] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e909]
+          - article [ref=e911]:
+            - generic [ref=e1516]: C
+            - generic [ref=e913]:
+              - generic [ref=e914]: Catalyst by Zoho
+              - generic [ref=e915]: Use Catalyst by Zoho capabilities in Codex.
+            - link "打开官网" [ref=e916] [cursor=pointer]:
+              - /url: https://catalyst.zoho.com/
+              - img [ref=e917]
+          - article [ref=e919]:
+            - img "CircleCI" [ref=e920]
+            - generic [ref=e921]:
+              - generic [ref=e922]: CircleCI
+              - generic [ref=e923]: Build, test, and deploy any application
+            - link "打开官网" [ref=e924] [cursor=pointer]:
+              - /url: https://circleci.com
+              - img [ref=e925]
+          - article [ref=e927]:
+            - img "Cloudflare" [ref=e928]
+            - generic [ref=e929]:
+              - generic [ref=e930]: Cloudflare
+              - generic [ref=e931]: Cloudflare platform guidance with official MCP
+            - link "打开官网" [ref=e932] [cursor=pointer]:
+              - /url: https://workers.cloudflare.com/
+              - img [ref=e933]
+          - article [ref=e935]:
+            - img "Cloudinary" [ref=e936]
+            - generic [ref=e937]:
+              - generic [ref=e938]: Cloudinary
+              - generic [ref=e939]: Manage, search, and transform your Cloudinary media library — directly from Codex.
+            - link "打开官网" [ref=e940] [cursor=pointer]:
+              - /url: https://cloudinary.com/
+              - img [ref=e941]
+          - article [ref=e943]:
+            - img "CodeRabbit" [ref=e944]
+            - generic [ref=e945]:
+              - generic [ref=e946]: CodeRabbit
+              - generic [ref=e947]: Run AI-powered code review for your current changes
+            - link "打开官网" [ref=e948] [cursor=pointer]:
+              - /url: https://coderabbit.ai
+              - img [ref=e949]
+          - article [ref=e951]:
+            - img "Codex Security" [ref=e952]
+            - generic [ref=e953]:
+              - generic [ref=e954]: Codex Security
+              - generic [ref=e955]: Security scanning for your codebase
+            - link "打开官网" [ref=e956] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e957]
+          - article [ref=e959]:
+            - img "Convex" [ref=e960]
+            - generic [ref=e961]:
+              - generic [ref=e962]: Convex
+              - generic [ref=e963]: Add a backend to JS/TS apps.
+            - link "打开官网" [ref=e964] [cursor=pointer]:
+              - /url: https://chatgpt.com/apps/convex/asdk_app_6a0faef988b48191b843bac5cd170a9e
+              - img [ref=e965]
+          - article [ref=e967]:
+            - img "Datadog (Preview)" [ref=e968]
+            - generic [ref=e969]:
+              - generic [ref=e970]: Datadog (Preview)
+              - generic [ref=e971]: Investigate logs, metrics, traces, and incidents
+            - link "打开官网" [ref=e972] [cursor=pointer]:
+              - /url: https://www.datadoghq.com/
+              - img [ref=e973]
+          - article [ref=e975]:
+            - img "Expo" [ref=e976]
+            - generic [ref=e977]:
+              - generic [ref=e978]: Expo
+              - generic [ref=e979]: Build, deploy, upgrade, and debug Expo and React Native apps
+            - link "打开官网" [ref=e980] [cursor=pointer]:
+              - /url: https://expo.dev/
+              - img [ref=e981]
+          - article [ref=e983]:
+            - img "Game Studio" [ref=e984]
+            - generic [ref=e985]:
+              - generic [ref=e986]: Game Studio
+              - generic [ref=e987]: Design, prototype, and ship browser games
+            - link "打开官网" [ref=e988] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e989]
+          - article [ref=e991]:
+            - img "GitHub" [ref=e992]
+            - generic [ref=e993]:
+              - generic [ref=e994]: GitHub
+              - generic [ref=e995]: Triage PRs, issues, CI, and publish flows
+            - link "打开官网" [ref=e996] [cursor=pointer]:
+              - /url: https://github.com/
+              - img [ref=e997]
+          - article [ref=e999]:
+            - img "Hostinger" [ref=e1000]
+            - generic [ref=e1001]:
+              - generic [ref=e1002]: Hostinger
+              - generic [ref=e1003]: Hostinger Horizons lets you build real websites and apps just by describing what you want.
+            - link "打开官网" [ref=e1004] [cursor=pointer]:
+              - /url: https://hostinger.com
+              - img [ref=e1005]
+          - article [ref=e1007]:
+            - img "Hugging Face" [ref=e1008]
+            - generic [ref=e1009]:
+              - generic [ref=e1010]: Hugging Face
+              - generic [ref=e1011]: Inspect models, datasets, Spaces, and research
+            - link "打开官网" [ref=e1012] [cursor=pointer]:
+              - /url: https://huggingface.co
+              - img [ref=e1013]
+          - article [ref=e1015]:
+            - img "Lovable" [ref=e1016]
+            - generic [ref=e1017]:
+              - generic [ref=e1018]: Lovable
+              - generic [ref=e1019]: Build and inspect Lovable app projects from connected workspace context
+            - link "打开官网" [ref=e1020] [cursor=pointer]:
+              - /url: https://lovable.dev
+              - img [ref=e1021]
+          - article [ref=e1023]:
+            - img "MagicPath" [ref=e1024]
+            - generic [ref=e1025]:
+              - generic [ref=e1026]: MagicPath
+              - generic [ref=e1027]: Find, install, and author MagicPath UI components from Codex
+            - link "打开官网" [ref=e1028] [cursor=pointer]:
+              - /url: https://www.magicpath.ai/
+              - img [ref=e1029]
+          - article [ref=e1031]:
+            - img "MarcoPolo" [ref=e1032]
+            - generic [ref=e1033]:
+              - generic [ref=e1034]: MarcoPolo
+              - generic [ref=e1035]: MarcoPolo spins up a secure container where Codex can work with your actual data.
+            - link "打开官网" [ref=e1036] [cursor=pointer]:
+              - /url: https://marcopolo.dev
+              - img [ref=e1037]
+          - article [ref=e1039]:
+            - img "Neon Postgres" [ref=e1040]
+            - generic [ref=e1041]:
+              - generic [ref=e1042]: Neon Postgres
+              - generic [ref=e1043]: Manage Neon Serverless Postgres projects and databases
+            - link "打开官网" [ref=e1044] [cursor=pointer]:
+              - /url: https://neon.com
+              - img [ref=e1045]
+          - article [ref=e1047]:
+            - img "Netlify" [ref=e1048]
+            - generic [ref=e1049]:
+              - generic [ref=e1050]: Netlify
+              - generic [ref=e1051]: Deploy projects and manage releases
+            - link "打开官网" [ref=e1052] [cursor=pointer]:
+              - /url: https://www.netlify.com
+              - img [ref=e1053]
+          - article [ref=e1055]:
+            - img "NVIDIA" [ref=e1056]
+            - generic [ref=e1057]:
+              - generic [ref=e1058]: NVIDIA
+              - generic [ref=e1059]: Guided help for NVIDIA AI, GPU, robotics, simulation, and 3D workflows.
+            - link "打开官网" [ref=e1060] [cursor=pointer]:
+              - /url: https://www.nvidia.com/
+              - img [ref=e1061]
+          - article [ref=e1063]:
+            - img "OpenAI Developers" [ref=e1064]
+            - generic [ref=e1065]:
+              - generic [ref=e1066]: OpenAI Developers
+              - generic [ref=e1067]: Develop AI apps, agents, and ChatGPT Apps with OpenAI best practices
+            - link "打开官网" [ref=e1068] [cursor=pointer]:
+              - /url: https://platform.openai.com/
+              - img [ref=e1069]
+          - article [ref=e1071]:
+            - generic [ref=e1517]: P
+            - generic [ref=e1073]:
+              - generic [ref=e1074]: Plugin Eval
+              - generic [ref=e1075]: Start from chat, then evaluate or benchmark locally
+            - link "打开官网" [ref=e1076] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e1077]
+          - article [ref=e1079]:
+            - img "Quicknode" [ref=e1080]
+            - generic [ref=e1081]:
+              - generic [ref=e1082]: Quicknode
+              - generic [ref=e1083]: Manage your Quicknode infrastructure directly in OpenAI.
+            - link "打开官网" [ref=e1084] [cursor=pointer]:
+              - /url: https://www.quicknode.com/
+              - img [ref=e1085]
+          - article [ref=e1087]:
+            - generic [ref=e1518]: R
+            - generic [ref=e1089]:
+              - generic [ref=e1090]: Render
+              - generic [ref=e1091]: Deploy, debug, monitor, and migrate apps on Render.
+            - link "打开官网" [ref=e1092] [cursor=pointer]:
+              - /url: https://render.com/
+              - img [ref=e1093]
+          - article [ref=e1095]:
+            - img "Replit" [ref=e1096]
+            - generic [ref=e1097]:
+              - generic [ref=e1098]: Replit
+              - generic [ref=e1099]: Work with Replit projects, apps, deployments, and workspace context
+            - link "打开官网" [ref=e1100] [cursor=pointer]:
+              - /url: https://replit.com
+              - img [ref=e1101]
+          - article [ref=e1103]:
+            - img "SendGrid" [ref=e1104]
+            - generic [ref=e1105]:
+              - generic [ref=e1106]: SendGrid
+              - generic [ref=e1107]: Connector for interacting with the SendGrid email API.
+            - link "打开官网" [ref=e1108] [cursor=pointer]:
+              - /url: https://sendgrid.com/
+              - img [ref=e1109]
+          - article [ref=e1111]:
+            - img "Sentry" [ref=e1112]
+            - generic [ref=e1113]:
+              - generic [ref=e1114]: Sentry
+              - generic [ref=e1115]: Inspect recent Sentry issues and events
+            - link "打开官网" [ref=e1116] [cursor=pointer]:
+              - /url: https://sentry.io/
+              - img [ref=e1117]
+          - article [ref=e1119]:
+            - generic [ref=e1519]: S
+            - generic [ref=e1121]:
+              - generic [ref=e1122]: Shopify
+              - generic [ref=e1123]: Build Shopify apps, themes, storefronts, and APIs
+            - link "打开官网" [ref=e1124] [cursor=pointer]:
+              - /url: https://shopify.dev/
+              - img [ref=e1125]
+          - article [ref=e1127]:
+            - img "Statsig" [ref=e1128]
+            - generic [ref=e1129]:
+              - generic [ref=e1130]: Statsig
+              - generic [ref=e1131]: Bring your Statsig workspace into Codex.
+            - link "打开官网" [ref=e1132] [cursor=pointer]:
+              - /url: https://statsig.com
+              - img [ref=e1133]
+          - article [ref=e1135]:
+            - img "Supabase" [ref=e1136]
+            - generic [ref=e1137]:
+              - generic [ref=e1138]: Supabase
+              - generic [ref=e1139]: Supabase skills and MCP tools for Codex
+            - link "打开官网" [ref=e1140] [cursor=pointer]:
+              - /url: https://supabase.com
+              - img [ref=e1141]
+          - article [ref=e1143]:
+            - generic [ref=e1520]: S
+            - generic [ref=e1145]:
+              - generic [ref=e1146]: Superpowers
+              - generic [ref=e1147]: Planning, TDD, debugging, and delivery workflows for coding agents
+            - link "打开官网" [ref=e1148] [cursor=pointer]:
+              - /url: https://github.com/obra/superpowers
+              - img [ref=e1149]
+          - article [ref=e1151]:
+            - generic [ref=e1521]: T
+            - generic [ref=e1153]:
+              - generic [ref=e1154]: Temporal
+              - generic [ref=e1155]: Develop, run, and manage Temporal applications across the entire platform lifecycle
+            - link "打开官网" [ref=e1156] [cursor=pointer]:
+              - /url: https://temporal.io/
+              - img [ref=e1157]
+          - article [ref=e1159]:
+            - img "Test Android Apps" [ref=e1160]
+            - generic [ref=e1161]:
+              - generic [ref=e1162]: Test Android Apps
+              - generic [ref=e1163]: Reproduce issues, inspect UI, and capture performance evidence from Android emulators
+            - link "打开官网" [ref=e1164] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e1165]
+          - article [ref=e1167]:
+            - generic [ref=e1522]: T
+            - generic [ref=e1169]:
+              - generic [ref=e1170]: Twilio Developer Kit
+              - generic [ref=e1171]: Twilio Skills for building, debugging, and shipping on Twilio
+            - link "打开官网" [ref=e1172] [cursor=pointer]:
+              - /url: https://www.twilio.com
+              - img [ref=e1173]
+          - article [ref=e1175]:
+            - img "Vantage" [ref=e1176]
+            - generic [ref=e1177]:
+              - generic [ref=e1178]: Vantage
+              - generic [ref=e1179]: Vantage is a cloud observability and optimization platform that aggregates cloud infrastructure costs acros...
+            - link "打开官网" [ref=e1180] [cursor=pointer]:
+              - /url: https://www.vantage.sh
+              - img [ref=e1181]
+          - article [ref=e1183]:
+            - img "Vercel" [ref=e1184]
+            - generic [ref=e1185]:
+              - generic [ref=e1186]: Vercel
+              - generic [ref=e1187]: Build and deploy web apps and agents
+            - link "打开官网" [ref=e1188] [cursor=pointer]:
+              - /url: https://vercel.com/
+              - img [ref=e1189]
+          - article [ref=e1191]:
+            - generic [ref=e1523]: W
+            - generic [ref=e1193]:
+              - generic [ref=e1194]: Wix
+              - generic [ref=e1195]: Build Wix apps, headless websites, and manage your Wix business from Codex
+            - link "打开官网" [ref=e1196] [cursor=pointer]:
+              - /url: https://dev.wix.com/
+              - img [ref=e1197]
+          - article [ref=e1199]:
+            - img "YepCode" [ref=e1200]
+            - generic [ref=e1201]:
+              - generic [ref=e1202]: YepCode
+              - generic [ref=e1203]: YepCode lets you build custom AI tools using your own code with JSON Schema-defined inputs, executed in an...
+            - link "打开官网" [ref=e1204] [cursor=pointer]:
+              - /url: https://yepcode.io/
+              - img [ref=e1205]
+      - generic [ref=e1207]:
+        - heading "Creativity 11" [level=2] [ref=e1208]:
+          - text: Creativity
+          - generic [ref=e1209]: "11"
+        - generic [ref=e1210]:
+          - article [ref=e1211]:
+            - img "BioRender" [ref=e1212]
+            - generic [ref=e1213]:
+              - generic [ref=e1214]: BioRender
+              - generic [ref=e1215]: BioRender helps scientists create professional figures in minutes.
+            - link "打开官网" [ref=e1216] [cursor=pointer]:
+              - /url: https://biorender.com/
+              - img [ref=e1217]
+          - article [ref=e1219]:
+            - img "Canva" [ref=e1220]
+            - generic [ref=e1221]:
+              - generic [ref=e1222]: Canva
+              - generic [ref=e1223]: Search, create, edit designs
+            - link "打开官网" [ref=e1224] [cursor=pointer]:
+              - /url: https://www.canva.com
+              - img [ref=e1225]
+          - article [ref=e1227]:
+            - img "Creative Production" [ref=e1228]
+            - generic [ref=e1229]:
+              - generic [ref=e1230]: Creative Production
+              - generic [ref=e1231]: Create marketing visuals from a brief or product image.
+            - link "打开官网" [ref=e1232] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e1233]
+          - article [ref=e1235]:
+            - img "Fal" [ref=e1236]
+            - generic [ref=e1237]:
+              - generic [ref=e1238]: Fal
+              - generic [ref=e1239]: AI image and media generation workflows using Fal models
+            - link "打开官网" [ref=e1240] [cursor=pointer]:
+              - /url: https://fal.ai
+              - img [ref=e1241]
+          - article [ref=e1243]:
+            - img "Figma" [ref=e1244]
+            - generic [ref=e1245]:
+              - generic [ref=e1246]: Figma
+              - generic [ref=e1247]: Design-to-code workflows powered by the Figma integration
+            - link "打开官网" [ref=e1248] [cursor=pointer]:
+              - /url: https://www.figma.com
+              - img [ref=e1249]
+          - article [ref=e1251]:
+            - img "HeyGen" [ref=e1252]
+            - generic [ref=e1253]:
+              - generic [ref=e1254]: HeyGen
+              - generic [ref=e1255]: Avatar videos and personalized video messages
+            - link "打开官网" [ref=e1256] [cursor=pointer]:
+              - /url: https://heygen.com
+              - img [ref=e1257]
+          - article [ref=e1259]:
+            - img "HyperFrames by HeyGen" [ref=e1260]
+            - generic [ref=e1261]:
+              - generic [ref=e1262]: HyperFrames by HeyGen
+              - generic [ref=e1263]: Write HTML, render video
+            - link "打开官网" [ref=e1264] [cursor=pointer]:
+              - /url: https://hyperframes.heygen.com
+              - img [ref=e1265]
+          - article [ref=e1267]:
+            - img "Picsart" [ref=e1268]
+            - generic [ref=e1269]:
+              - generic [ref=e1270]: Picsart
+              - generic [ref=e1271]: Image editing, creative assets, and design workflows from Picsart
+            - link "打开官网" [ref=e1272] [cursor=pointer]:
+              - /url: https://picsart.com
+              - img [ref=e1273]
+          - article [ref=e1275]:
+            - img "Product Design" [ref=e1276]
+            - generic [ref=e1277]:
+              - generic [ref=e1278]: Product Design
+              - generic [ref=e1279]: Explore and prototype ideas
+            - link "打开官网" [ref=e1280] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e1281]
+          - article [ref=e1283]:
+            - generic [ref=e1524]: R
+            - generic [ref=e1285]:
+              - generic [ref=e1286]: Remotion
+              - generic [ref=e1287]: Create motion graphics from prompts
+            - link "打开官网" [ref=e1288] [cursor=pointer]:
+              - /url: https://remotion.dev
+              - img [ref=e1289]
+          - article [ref=e1291]:
+            - generic [ref=e1525]: S
+            - generic [ref=e1293]:
+              - generic [ref=e1294]: Shutterstock
+              - generic [ref=e1295]: Search licensed stock images, videos, music, and creative assets
+            - link "打开官网" [ref=e1296] [cursor=pointer]:
+              - /url: https://www.shutterstock.com
+              - img [ref=e1297]
+      - generic [ref=e1299]:
+        - heading "Communication 11" [level=2] [ref=e1300]:
+          - text: Communication
+          - generic [ref=e1301]: "11"
+        - generic [ref=e1302]:
+          - article [ref=e1303]:
+            - img "Circleback" [ref=e1304]
+            - generic [ref=e1305]:
+              - generic [ref=e1306]: Circleback
+              - generic [ref=e1307]: Circleback helps teams get the most out of every conversation with AI-powered meeting notes, action items,...
+            - link "打开官网" [ref=e1308] [cursor=pointer]:
+              - /url: https://circleback.ai
+              - img [ref=e1309]
+          - article [ref=e1311]:
+            - img "Fireflies" [ref=e1312]
+            - generic [ref=e1313]:
+              - generic [ref=e1314]: Fireflies
+              - generic [ref=e1315]: The Fireflies app brings your meetings and knowledge directly into Codex.
+            - link "打开官网" [ref=e1316] [cursor=pointer]:
+              - /url: https://fireflies.ai
+              - img [ref=e1317]
+          - article [ref=e1319]:
+            - img "Fyxer" [ref=e1320]
+            - generic [ref=e1321]:
+              - generic [ref=e1322]: Fyxer
+              - generic [ref=e1323]: Fyxer for Codex lets you write emails that sound like you, right from the chat.
+            - link "打开官网" [ref=e1324] [cursor=pointer]:
+              - /url: https://www.fyxer.com
+              - img [ref=e1325]
+          - article [ref=e1327]:
+            - img "Granola" [ref=e1328]
+            - generic [ref=e1329]:
+              - generic [ref=e1330]: Granola
+              - generic [ref=e1331]: Granola MCP connects your meeting history to Codex so your assistant can pull real context from past conv...
+            - link "打开官网" [ref=e1332] [cursor=pointer]:
+              - /url: https://www.granola.ai
+              - img [ref=e1333]
+          - article [ref=e1335]:
+            - img "Otter.ai" [ref=e1336]
+            - generic [ref=e1337]:
+              - generic [ref=e1338]: Otter.ai
+              - generic [ref=e1339]: The Otter.ai MCP server connects Codex to your meeting intelligence, enabling search and retrieval of tra...
+            - link "打开官网" [ref=e1340] [cursor=pointer]:
+              - /url: https://otter.ai
+              - img [ref=e1341]
+          - article [ref=e1343]:
+            - img "Outlook Email" [ref=e1344]
+            - generic [ref=e1345]:
+              - generic [ref=e1346]: Outlook Email
+              - generic [ref=e1347]: Triage Outlook inboxes and draft replies
+            - link "打开官网" [ref=e1348] [cursor=pointer]:
+              - /url: https://www.microsoft.com/en-us/microsoft-365/outlook/email-and-calendar-software-microsoft-outlook
+              - img [ref=e1349]
+          - article [ref=e1351]:
+            - img "Read AI" [ref=e1352]
+            - generic [ref=e1353]:
+              - generic [ref=e1354]: Read AI
+              - generic [ref=e1355]: Read AI brings your meeting intelligence directly into your AI workflows.
+            - link "打开官网" [ref=e1356] [cursor=pointer]:
+              - /url: https://read.ai
+              - img [ref=e1357]
+          - article [ref=e1359]:
+            - img "Slack" [ref=e1360]
+            - generic [ref=e1361]:
+              - generic [ref=e1362]: Slack
+              - generic [ref=e1363]: Read and manage Slack
+            - link "打开官网" [ref=e1364] [cursor=pointer]:
+              - /url: https://slack.com/
+              - img [ref=e1365]
+          - article [ref=e1367]:
+            - img "Superhuman Mail" [ref=e1368]
+            - generic [ref=e1369]:
+              - generic [ref=e1370]: Superhuman Mail
+              - generic [ref=e1371]: Search, draft, send, and schedule through Superhuman Mail MCP
+            - link "打开官网" [ref=e1372] [cursor=pointer]:
+              - /url: https://superhuman.com/
+              - img [ref=e1373]
+          - article [ref=e1375]:
+            - img "Teams" [ref=e1376]
+            - generic [ref=e1377]:
+              - generic [ref=e1378]: Teams
+              - generic [ref=e1379]: Summarize Teams and draft follow-ups
+            - link "打开官网" [ref=e1380] [cursor=pointer]:
+              - /url: https://www.microsoft.com/en-us/microsoft-teams/group-chat-software
+              - img [ref=e1381]
+          - article [ref=e1383]:
+            - img "Zoom" [ref=e1384]
+            - generic [ref=e1385]:
+              - generic [ref=e1386]: Zoom
+              - generic [ref=e1387]: Use Zoom meeting context and build Zoom integrations.
+            - link "打开官网" [ref=e1388] [cursor=pointer]:
+              - /url: https://developers.zoom.us/
+              - img [ref=e1389]
+      - generic [ref=e1391]:
+        - heading "Other 2" [level=2] [ref=e1392]:
+          - text: Other
+          - generic [ref=e1393]: "2"
+        - generic [ref=e1394]:
+          - article [ref=e1395]:
+            - img "Cogedim" [ref=e1396]
+            - generic [ref=e1397]:
+              - generic [ref=e1398]: Cogedim
+              - generic [ref=e1399]: Cogedim is one of France's leading real estate developers.
+            - link "打开官网" [ref=e1400] [cursor=pointer]:
+              - /url: https://www.cogedim.com
+              - img [ref=e1401]
+          - article [ref=e1403]:
+            - img "MyRegistry.com" [ref=e1404]
+            - generic [ref=e1405]:
+              - generic [ref=e1406]: MyRegistry.com
+              - generic [ref=e1407]: MyRegistry.com helps make gift-giving easy for friends & family to get you the gifts you really want!
+            - link "打开官网" [ref=e1408] [cursor=pointer]:
+              - /url: https://www.myregistry.com/
+              - img [ref=e1409]
+      - generic [ref=e1411]:
+        - heading "Education & Research 10" [level=2] [ref=e1412]:
+          - text: Education & Research
+          - generic [ref=e1413]: "10"
+        - generic [ref=e1414]:
+          - article [ref=e1415]:
+            - img "Dow Jones Factiva" [ref=e1416]
+            - generic [ref=e1417]:
+              - generic [ref=e1418]: Dow Jones Factiva
+              - generic [ref=e1419]: The Factiva Connector, enables authorized users to search Factiva’s global news archive, including premium...
+            - link "打开官网" [ref=e1420] [cursor=pointer]:
+              - /url: https://www.dowjones.com/business-intelligence/factiva/
+              - img [ref=e1421]
+          - article [ref=e1423]:
+            - img "GovTribe" [ref=e1424]
+            - generic [ref=e1425]:
+              - generic [ref=e1426]: GovTribe
+              - generic [ref=e1427]: Search government contracts, awards, and vendors directly from Codex.
+            - link "打开官网" [ref=e1428] [cursor=pointer]:
+              - /url: https://govtribe.com/
+              - img [ref=e1429]
+          - article [ref=e1431]:
+            - img "Life Science Research" [ref=e1432]
+            - generic [ref=e1433]:
+              - generic [ref=e1434]: Life Science Research
+              - generic [ref=e1435]: General life-sciences research with routing, evidence synthesis, and optional parallel subagent analysis
+            - link "打开官网" [ref=e1436] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e1437]
+          - article [ref=e1439]:
+            - img "Life Sciences NGS Analysis" [ref=e1440]
+            - generic [ref=e1441]:
+              - generic [ref=e1442]: Life Sciences NGS Analysis
+              - generic [ref=e1443]: Guided NGS routing and local execution for sequencing analysis
+            - link "打开官网" [ref=e1444] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e1445]
+          - article [ref=e1447]:
+            - img "Midpage" [ref=e1448]
+            - generic [ref=e1449]:
+              - generic [ref=e1450]: Midpage
+              - generic [ref=e1451]: Legal research, cases, statutes, regulations, and cited research memos
+            - link "打开官网" [ref=e1452] [cursor=pointer]:
+              - /url: https://www.midpage.ai
+              - img [ref=e1453]
+          - article [ref=e1455]:
+            - img "Particl Market Research" [ref=e1456]
+            - generic [ref=e1457]:
+              - generic [ref=e1458]: Particl Market Research
+              - generic [ref=e1459]: Particl Market Research helps teams answer ecommerce research questions directly in Codex.
+            - link "打开官网" [ref=e1460] [cursor=pointer]:
+              - /url: https://www.particl.com
+              - img [ref=e1461]
+          - article [ref=e1463]:
+            - img "PolicyNote" [ref=e1464]
+            - generic [ref=e1465]:
+              - generic [ref=e1466]: PolicyNote
+              - generic [ref=e1467]: Use the PolicyNote app to access structured policy and regulatory intelligence from around the world.
+            - link "打开官网" [ref=e1468] [cursor=pointer]:
+              - /url: https://fiscalnote.com/products/policynote-api
+              - img [ref=e1469]
+          - article [ref=e1471]:
+            - img "Readwise" [ref=e1472]
+            - generic [ref=e1473]:
+              - generic [ref=e1474]: Readwise
+              - generic [ref=e1475]: The official app for Readwise and Reader.
+            - link "打开官网" [ref=e1476] [cursor=pointer]:
+              - /url: https://readwise.io
+              - img [ref=e1477]
+          - article [ref=e1479]:
+            - img "Scite" [ref=e1480]
+            - generic [ref=e1481]:
+              - generic [ref=e1482]: Scite
+              - generic [ref=e1483]: Scite delivers answers grounded in peer-reviewed research you can verify.
+            - link "打开官网" [ref=e1484] [cursor=pointer]:
+              - /url: https://www.scite.ai
+              - img [ref=e1485]
+          - article [ref=e1487]:
+            - img "Zotero" [ref=e1488]
+            - generic [ref=e1489]:
+              - generic [ref=e1490]: Zotero
+              - generic [ref=e1491]: Find papers and add citations from Zotero
+            - link "打开官网" [ref=e1492] [cursor=pointer]:
+              - /url: https://openai.com/
+              - img [ref=e1493]
+      - generic [ref=e1495]:
+        - heading "Travel 2" [level=2] [ref=e1496]:
+          - text: Travel
+          - generic [ref=e1497]: "2"
+        - generic [ref=e1498]:
+          - article [ref=e1499]:
+            - img "FINN" [ref=e1500]
+            - generic [ref=e1501]:
+              - generic [ref=e1502]: FINN
+              - generic [ref=e1503]: A FINN car subscription is a flexible way to stay mobile anytime - without long-term commitments like buyin...
+            - link "打开官网" [ref=e1504] [cursor=pointer]:
+              - /url: https://www.finn.com/de-DE
+              - img [ref=e1505]
+          - article [ref=e1507]:
+            - img "WeatherPromise" [ref=e1508]
+            - generic [ref=e1509]:
+              - generic [ref=e1510]: WeatherPromise
+              - generic [ref=e1511]: Protect your trip with WeatherPromise and get back the full cost if it rains more than promised during your...
+            - link "打开官网" [ref=e1512] [cursor=pointer]:
+              - /url: https://www.weatherpromise.com/
+              - img [ref=e1513]

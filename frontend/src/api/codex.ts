@@ -65,7 +65,7 @@ export function revealManaged(resource: ManagedResource, hash?: string | null) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// MCP — servers / plugins / marketplace
+// MCP — servers / plugins
 // ───────────────────────────────────────────────────────────────────────────
 export interface McpServerSpec {
   name: string
@@ -99,39 +99,6 @@ export interface McpPlugin {
   enabled?: boolean
 }
 
-export interface McpSource {
-  id: string
-  name: string
-  enabled?: boolean
-  official?: boolean
-}
-
-export interface McpMarketServerItem {
-  id: string
-  name: string
-  description?: string
-  transport?: string
-  source?: string
-  command?: string
-  args?: string[]
-  url?: string
-  bearerTokenEnvVar?: string
-}
-export interface McpMarketPluginItem {
-  id: string
-  description?: string
-  marketplace?: string
-  version?: string
-  source?: string
-  tarballUrl?: string
-  capabilities?: { mcpServers?: unknown; skills?: unknown; apps?: unknown }
-}
-export interface McpMarketIndex {
-  servers?: McpMarketServerItem[]
-  plugins?: McpMarketPluginItem[]
-  errors?: Record<string, string>
-}
-
 // servers
 export const getMcpServers = () =>
   api<{ servers?: McpServerSpec[] }>('GET', '/api/codex/mcp/servers')
@@ -162,21 +129,6 @@ export const installMcpPlugin = (body: {
   version?: string
   tarballUrl?: string
 }) => api('POST', '/api/codex/mcp/plugins/install', body)
-
-// marketplace
-export const getMcpSources = () =>
-  api<{ sources?: McpSource[] }>('GET', '/api/codex/mcp/marketplace/sources')
-export const addMcpSource = (name: string, url: string) =>
-  api('POST', '/api/codex/mcp/marketplace/sources/add', { name, url })
-export const removeMcpSource = (id: string) =>
-  api('POST', '/api/codex/mcp/marketplace/sources/remove', { id })
-export const toggleMcpSource = (id: string, enabled: boolean) =>
-  api('POST', '/api/codex/mcp/marketplace/sources/toggle', { id, enabled })
-export const getMcpMarketIndex = (forceRefresh = false) =>
-  api<{ index?: McpMarketIndex }>(
-    'GET',
-    `/api/codex/mcp/marketplace/index${forceRefresh ? '?force_refresh=true' : ''}`,
-  )
 
 // ───────────────────────────────────────────────────────────────────────────
 // Conversations

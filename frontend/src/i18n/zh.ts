@@ -100,7 +100,6 @@ export default {
   "usage.cacheModal.totalInput": "总计输入",
   "usage.cacheModal.output": "输出",
   "nav.codex": "文档",
-  "nav.market": "市场",
   "nav.theme": "主题",
   "nav.guide": "引导",
   "market.title": "插件市场",
@@ -227,6 +226,7 @@ export default {
   "codex.mcp.servers": "Servers",
   "codex.mcp.plugins": "Plugins",
   "codex.mcp.marketplace": "Marketplace",
+  "codex.mcp.officialSource": "官方源",
   "codex.mcp.serversWarn":
     "修改 MCP servers 会改 ~/.codex/config.toml 全局生效",
   "codex.mcp.pluginsWarn":
