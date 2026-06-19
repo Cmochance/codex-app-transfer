@@ -733,6 +733,28 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
     match id {
         "show" => show_main_window(app),
         "hide" => hide_main_window(app),
+        "restart_codex" => {
+            // 同应用内「重启 Codex」按钮:先同步活动 provider 配置 → 重启 Codex → 通知 plugin daemon 重注入。
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let st = AdminState {
+                    proxy_manager: app_handle.state::<Arc<ProxyManager>>().inner().clone(),
+                    trace_viewer_manager: app_handle
+                        .state::<Arc<trace_viewer::TraceViewerManager>>()
+                        .inner()
+                        .clone(),
+                };
+                let _ =
+                    admin::services::desktop::snapshot::sync_desktop_for_active_provider(&st).await;
+                if admin::services::desktop::process::launch_codex_app_restart(
+                    std::env::consts::OS,
+                )
+                .is_ok()
+                {
+                    handlers::plugin_unlock::get_service().await.reinject().await;
+                }
+            });
+        }
         "quit" => {
             let manager = app.state::<Arc<ProxyManager>>();
             manager.stop_silent();
@@ -744,11 +766,31 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
     }
 }
 
+/// tray 菜单语言:跟随 `settings.language`(显式 "en" → 英文,其余/未设 → 中文,
+/// 与应用 Chinese-first 默认一致)。tray 是 Rust 原生菜单,不走前端 i18n 字典,
+/// 故在此内联中英双串按语言选取。
+fn tray_lang_is_zh() -> bool {
+    admin::registry_io::load()
+        .ok()
+        .map(|cfg| {
+            !matches!(
+                cfg.get("settings")
+                    .and_then(|s| s.get("language"))
+                    .and_then(|v| v.as_str()),
+                Some("en")
+            )
+        })
+        .unwrap_or(true)
+}
+
 fn build_tray_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Menu<R>> {
-    let mut providers = SubmenuBuilder::new(manager, "Switch provider");
+    let zh = tray_lang_is_zh();
+    let tr = |cn: &'static str, en: &'static str| if zh { cn } else { en };
+
+    let mut providers = SubmenuBuilder::new(manager, tr("切换提供商", "Switch provider"));
     let entries = tray_provider_entries();
     if entries.is_empty() {
-        providers = providers.text("provider:none", "No providers");
+        providers = providers.text("provider:none", tr("无提供商", "No providers"));
     } else {
         for entry in entries {
             let label = if entry.active {
@@ -761,12 +803,13 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Menu
     }
     let providers = providers.build()?;
     MenuBuilder::new(manager)
-        .text("show", "Show window")
-        .text("hide", "Hide window")
+        .text("show", tr("显示窗口", "Show window"))
+        .text("hide", tr("隐藏窗口", "Hide window"))
         .separator()
         .item(&providers)
+        .text("restart_codex", tr("重启 Codex", "Restart Codex"))
         .separator()
-        .text("quit", "Quit Codex App Transfer")
+        .text("quit", tr("退出 Codex App Transfer", "Quit Codex App Transfer"))
         .build()
 }
 
