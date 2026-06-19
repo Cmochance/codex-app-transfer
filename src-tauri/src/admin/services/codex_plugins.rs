@@ -282,6 +282,17 @@ fn installed_dir(key: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("plugin {key} 未安装"))
 }
 
+/// 规范化 path 并确认仍在 base 目录内 —— 防 symlink 逃逸(如 SKILL.md / icon 被 symlink 到
+/// `~/.codex/auth.json` 等目录外文件,`fs::read` 跟 symlink 会读出并泄露)。
+fn canonical_within(base: &Path, path: &Path) -> Result<PathBuf, String> {
+    let canon = fs::canonicalize(path).map_err(|e| format!("resolve path: {e}"))?;
+    let canon_base = fs::canonicalize(base).map_err(|e| format!("resolve base: {e}"))?;
+    if !canon.starts_with(&canon_base) {
+        return Err("path escapes plugin directory".to_owned());
+    }
+    Ok(canon)
+}
+
 /// plugin 图标字节 + content-type。各 plugin 图标路径不同 → 读 manifest `interface.logo`
 /// (cloudflare.png / app-icon.png / logo.png…),取不到再退 `assets/app-icon.png`。
 pub fn plugin_icon_bytes(key: &str) -> Result<(Vec<u8>, &'static str), String> {
@@ -296,7 +307,8 @@ pub fn plugin_icon_bytes(key: &str) -> Result<(Vec<u8>, &'static str), String> {
     if rel.contains("..") || rel.starts_with('/') || rel.contains('\\') || rel.contains(':') {
         return Err("invalid logo path".to_owned());
     }
-    let bytes = fs::read(dir.join(rel)).map_err(|e| format!("read icon: {e}"))?;
+    let icon = canonical_within(&dir, &dir.join(rel))?;
+    let bytes = fs::read(&icon).map_err(|e| format!("read icon: {e}"))?;
     let ct = if rel.ends_with(".svg") {
         "image/svg+xml"
     } else {
@@ -318,10 +330,8 @@ pub fn read_plugin_skill(key: &str, skill: &str) -> Result<SkillDoc, String> {
     if skill.is_empty() || skill.contains("..") || skill.contains('/') || skill.contains('\\') {
         return Err("invalid skill name".to_owned());
     }
-    let md = installed_dir(key)?
-        .join("skills")
-        .join(skill)
-        .join("SKILL.md");
+    let dir = installed_dir(key)?;
+    let md = canonical_within(&dir, &dir.join("skills").join(skill).join("SKILL.md"))?;
     let raw = fs::read_to_string(&md).map_err(|e| format!("read SKILL.md: {e}"))?;
     Ok(parse_skill_md(skill, &raw))
 }
