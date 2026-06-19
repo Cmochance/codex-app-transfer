@@ -1466,10 +1466,12 @@ pub fn start_login() -> Result<(), String> {
     // 后台线程 reap:wait_with_output 阻塞到 codex login 完成/被杀,记录结果。
     std::thread::spawn(move || {
         let result = child.wait_with_output();
-        let mut g = login_lock();
-        g.running = false;
-        g.pid = None;
-        g.last = match result {
+        // [MOC-257 review] **pin 不在持 LOGIN 锁时做**:pin_current_account_blocking 等 AUTH_LOCK,而
+        // reconcile_on_startup 反序持 AUTH_LOCK 再取 LOGIN(login_status)→ 持 LOGIN 等 AUTH_LOCK 会死锁(快速
+        // 登录撞上 startup reconcile 时 login 轮询 + auth reconcile 双卡死)。故:先读 cancel_requested 后释放
+        // LOGIN,pin 无锁做,算完最终态再重取 LOGIN 发布。
+        let cancel_requested = login_lock().cancel_requested;
+        let new_state = match result {
             Ok(out) if out.status.success() => {
                 clear_relogin_state(); // [MOC-124 H-2] 登录成功 = 拿到新鲜账号,清失效标记 + 撤销指纹
                                        // [MOC-257 review] 登录成功后**后端立即 pin** 当前账号进镜像,不依赖前端轮询(页面关 / app 退出
@@ -1489,7 +1491,7 @@ pub fn start_login() -> Result<(), String> {
                 }
             }
             Ok(out) => {
-                if g.cancel_requested {
+                if cancel_requested {
                     LoginState::Cancelled
                 } else {
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -1502,6 +1504,10 @@ pub fn start_login() -> Result<(), String> {
             }
             Err(e) => LoginState::Failed(format!("等待 codex login 失败: {e}")),
         };
+        let mut g = login_lock();
+        g.running = false;
+        g.pid = None;
+        g.last = new_state;
     });
     Ok(())
 }
