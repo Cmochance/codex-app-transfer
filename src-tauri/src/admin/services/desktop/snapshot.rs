@@ -494,7 +494,14 @@ pub async fn apply_plugin_unlock_mode(
                 tracing::error!("[PluginUnlock] synthetic activate 失败,回滚: {e}");
                 ra::restore_active_auth_bytes(pre_synth);
                 if displaced {
-                    let _ = ra::restore_stashed_real_auth().await;
+                    // [MOC-257 review] 失败别静默吞:真账号本次已 displace 到 stash,还原它回活动若失败要留痕
+                    // (内部可能已删活动文件才在 rename 失败 → active 缺失;但真账号仍安全在 stash,下次启动
+                    // self-heal 重试)。
+                    if let Err(e) = ra::restore_stashed_real_auth().await {
+                        tracing::error!(
+                            "[PluginUnlock] synthetic 回滚还原 stash 真账号失败(真账号仍在 stash,待启动 self-heal): {e}"
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -505,7 +512,14 @@ pub async fn apply_plugin_unlock_mode(
                 codex_app_transfer_proxy::set_fake_account_mode(false);
                 ra::restore_active_auth_bytes(pre_synth);
                 if displaced {
-                    let _ = ra::restore_stashed_real_auth().await;
+                    // [MOC-257 review] 失败别静默吞:真账号本次已 displace 到 stash,还原它回活动若失败要留痕
+                    // (内部可能已删活动文件才在 rename 失败 → active 缺失;但真账号仍安全在 stash,下次启动
+                    // self-heal 重试)。
+                    if let Err(e) = ra::restore_stashed_real_auth().await {
+                        tracing::error!(
+                            "[PluginUnlock] synthetic 回滚还原 stash 真账号失败(真账号仍在 stash,待启动 self-heal): {e}"
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -666,17 +680,28 @@ pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) 
         // 仍要把 proxy 起起来 —— 否则 Codex 据这些 base_url 把 chat + /backend-api 发到死端口、全挂。**synthetic
         // 与 real relay 都算**(real:真账号 + relay 透传;synthetic:合成 + 伪造):统一看 config.toml 是否指向
         // 本地 proxy(active_is_synthetic 兜底,防极端只写 auth 没写 relay)。早期预置只开伪造 flag,这里补进程。
-        let relay_port = CodexPaths::from_home_env().ok().and_then(|p| {
-            let port_of = |k: &str| {
-                read_codex_toml_root_string(&p, k).and_then(|u| parse_local_proxy_port(&u))
-            };
-            port_of("chatgpt_base_url").or_else(|| port_of("openai_base_url"))
-        });
-        if relay_port.is_some() || crate::codex_real_account::active_is_synthetic() {
-            // [MOC-257 review] 用 config.toml 里 **Codex 实际指向的端口**起 proxy(从 relay URL 解析)——
-            // 用户在 autoApplyOnStart=false 期间改过 settings.proxyPort、或盘上是遗留端口时,settings.proxyPort
-            // 与盘上 relay 不一致,Codex 仍发旧端口;只听新端口仍是死的。无 relay URL(纯 synthetic 兜底)回退
-            // settings.proxyPort。
+        // [MOC-257 review] 只在 **Transfer-owned** relay 时接管端口:合成 auth(Transfer 写的)或 Transfer 改过
+        // ~/.codex(apply 前必拍快照 has_snapshot)。否则 config.toml 上的 localhost base_url 可能是用户**自己**
+        // 的本地 provider(Ollama / LM Studio `http://localhost:11434/v1`)—— 别去 hijack 它的端口(会拦 Codex
+        // 流量 / 占住真本地服务端口)。端口仍从 URL 解析(对齐上条:用户改过 proxyPort / 遗留端口时不能用
+        // settings.proxyPort)。
+        let paths = CodexPaths::from_home_env().ok();
+        let synthetic = crate::codex_real_account::active_is_synthetic();
+        let transfer_applied = paths
+            .as_ref()
+            .is_some_and(|p| codex_app_transfer_codex_integration::has_snapshot(p));
+        let relay_port = if synthetic || transfer_applied {
+            paths.as_ref().and_then(|p| {
+                let port_of = |k: &str| {
+                    read_codex_toml_root_string(p, k).and_then(|u| parse_local_proxy_port(&u))
+                };
+                port_of("chatgpt_base_url").or_else(|| port_of("openai_base_url"))
+            })
+        } else {
+            None
+        };
+        if relay_port.is_some() || synthetic {
+            // Codex 实际指向的端口起 proxy;无 relay URL(纯 synthetic 兜底)回退 settings.proxyPort。
             let port = relay_port.unwrap_or_else(|| read_proxy_port(&cfg));
             let started = start_proxy_if_needed(&proxy_manager, port)
                 .await
