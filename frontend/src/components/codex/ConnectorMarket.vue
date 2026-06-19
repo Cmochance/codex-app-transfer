@@ -83,7 +83,9 @@ async function confirmAdd() {
 const sourceErrors = computed(() => Object.entries(registry.value?.errors || {}))
 
 function displayName(c: Connector): string {
-  return c.display_name || c.name
+  // 强制返回 string —— 自加源可能把 display_name 设成非 string(数字等),否则 initial() 的
+  // displayName(c).charAt(0) 会崩。name 后端已校验为 string。
+  return typeof c.display_name === 'string' && c.display_name ? c.display_name : c.name
 }
 
 const filtered = computed<Connector[]>(() => {
