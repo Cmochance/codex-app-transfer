@@ -481,11 +481,11 @@ pub async fn apply_plugin_unlock_mode(
             // 活动若是真账号先 stash 保全(也避开 activate 的真账号守护);写合成 → 活动=chatgpt;
             // proxy 伪造开;apply relay。**事务化**:activate / relay 任一失败都回滚(还原 stash 真账号回活动
             // 覆盖合成 / 无真账号则清掉合成)+ 关伪造,让 caller(set/add/tray/startup)无需各自清半生效态。
-            // [MOC-257 review] 记 pre-apply 是否已是合成态:已是 → 真账号本就在 stash、回滚**不该 un-stash**
-            // (否则把真账号挪回活动、留 persisted synthetic + real-active 无 relay);只有「本次从 real
-            // stash 走」才在回滚时还原真账号回活动。
-            let was_synthetic = ra::active_is_synthetic();
-            ra::stash_displaced_real_auth().await?;
+            // [MOC-257 review] `displaced` = **本次是否真把真账号移进了 stash**(stash_displaced 返回)。回滚
+            // 只在 displaced 时 un-stash 还原真账号回活动 —— 比旧 `!was_synthetic` 精确:已是合成态 / apikey /
+            // 「已有可用 stash 仅归档过期残留」都 displaced=false,这些情形回滚 un-stash 会把本次没动的真账号
+            // 误挪回活动(留 persisted synthetic + real-active 无 relay)。
+            let displaced = ra::stash_displaced_real_auth().await?;
             // 事务字节快照(stash 后的活动:真账号已移走、剩 apikey / 空 / 旧合成)。activate 覆写成合成,
             // 失败回滚:还原它(恢复原 apikey)。否则从 apikey 切 synthetic 失败时下面只清合成 → 原 apikey 丢
             // (stash 不收 apikey)。
@@ -493,7 +493,7 @@ pub async fn apply_plugin_unlock_mode(
             if let Err(e) = ra::activate_fake_account().await {
                 tracing::error!("[PluginUnlock] synthetic activate 失败,回滚: {e}");
                 ra::restore_active_auth_bytes(pre_synth);
-                if !was_synthetic {
+                if displaced {
                     let _ = ra::restore_stashed_real_auth().await;
                 }
                 return Err(e);
@@ -501,10 +501,10 @@ pub async fn apply_plugin_unlock_mode(
             codex_app_transfer_proxy::set_fake_account_mode(true);
             if let Err(e) = ensure_relay_applied(state).await {
                 // relay 没装上 → 别留「合成 active + 伪造开但无 relay」(Codex 直连 chatgpt.com 撞 401)。
-                // 还原原活动(apikey);本次从 real stash 走才还原真账号回活动,已是合成态则真账号留 stash。
+                // 还原原活动(apikey);只有本次 displace 了真账号才还原它回活动,否则它本就在 stash 留着。
                 codex_app_transfer_proxy::set_fake_account_mode(false);
                 ra::restore_active_auth_bytes(pre_synth);
-                if !was_synthetic {
+                if displaced {
                     let _ = ra::restore_stashed_real_auth().await;
                 }
                 return Err(e);
@@ -639,6 +639,17 @@ pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) 
         }
     };
     if !read_setting_bool(&cfg, "autoApplyOnStart", true) {
+        // [MOC-257 review] autoApplyOnStart=false 跳过 apply,但若盘上是**保留的合成态**(restoreCodexOnExit=
+        // false 把合成 auth + chatgpt_base_url relay 留下、上次退出停了 proxy),仍要把 proxy 起起来 —— 否则
+        // Codex 据 chatgpt_base_url 把 /backend-api 发到死端口、伪造器无处响应、插件请求全挂。早期预置已开伪造
+        // flag,这里补上 proxy 进程。非合成态不需要。
+        if crate::codex_real_account::active_is_synthetic() {
+            let port = read_proxy_port(&cfg);
+            let started = start_proxy_if_needed(&proxy_manager, port)
+                .await
+                .unwrap_or(false);
+            return json!({"applied": false, "requiresProxy": true, "proxyStarted": started, "message": "auto-apply disabled; proxy started for preserved synthetic"});
+        }
         return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "disabled by settings"});
     }
     if active_provider(&cfg).is_none() {

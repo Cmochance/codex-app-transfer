@@ -1167,17 +1167,19 @@ pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) {
 /// 把活动**真账号**整文件移到 stash 保全(保 tokens),供切到 synthetic/off 前调用。**只动真账号**
 /// (有 chatgpt tokens、非合成);合成账号 / apikey / 无 auth.json → 留着不动(各自由 `activate_fake_account`
 /// 覆盖、`clear_active_auth_file`(off)清、或本就空)。持 `AUTH_LOCK`。
-pub async fn stash_displaced_real_auth() -> Result<(), String> {
+/// 返回**本次是否真把一个真账号移进了 stash**(`true`)——供 caller(synthetic 回滚)判断是否该 un-stash:
+/// 已是合成 / apikey / 无文件 / 或「已有可用 stash 仅归档过期残留」都返 `false`(本次没 displace)。
+pub async fn stash_displaced_real_auth() -> Result<bool, String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let Ok(v) = read_auth(&paths.auth_json) else {
-        return Ok(()); // 无 auth.json
+        return Ok(false); // 无 auth.json
     };
     if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
-        return Ok(()); // 合成账号 → 不动(synthetic 的 activate no-op / off 的 clear 各自处理)
+        return Ok(false); // 合成账号 → 不动(synthetic 的 activate no-op / off 的 clear 各自处理)
     }
     if parse_chatgpt_tokens(&v).is_none() {
-        return Ok(()); // apikey 无真 tokens → 不进 stash(off 会清 / synthetic 会覆盖)
+        return Ok(false); // apikey 无真 tokens → 不进 stash(off 会清 / synthetic 会覆盖)
     }
     // 真账号 → 整文件移到 stash 保全。
     let stash = real_account_stash_path(&paths);
@@ -1194,7 +1196,7 @@ pub async fn stash_displaced_real_auth() -> Result<(), String> {
         // synthetic 的 `activate_fake_account` 守护会拒绝这个带 chatgpt token 的非合成文件 → synthetic apply
         // 失败;off 的 clear 也省一步。归档失败不阻断(活动留着、stash 仍保住、下次重试)。
         let _ = archive_existing_auth_file(&paths, &paths.auth_json);
-        return Ok(());
+        return Ok(false); // 保留已有可用 stash、只归档过期残留 → **本次没 displace 账号**(回滚别 un-stash)
     }
     if let Some(parent) = stash.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建 stash 目录失败: {e}"))?;
@@ -1209,7 +1211,7 @@ pub async fn stash_displaced_real_auth() -> Result<(), String> {
         );
     }
     std::fs::rename(&paths.auth_json, &stash).map_err(|e| format!("移真账号到 stash 失败: {e}"))?;
-    Ok(())
+    Ok(true) // 真把一个真账号移进了 stash → 回滚时该 un-stash 还原
 }
 
 /// [MOC-257 三态 OFF] 清掉活动 `~/.codex/auth.json`(确保 .codex 无 auth.json)。真账号应已先经
