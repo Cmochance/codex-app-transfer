@@ -1138,6 +1138,19 @@ pub fn snapshot_active_auth_bytes() -> Option<Vec<u8>> {
         .and_then(|p| std::fs::read(&p.auth_json).ok())
 }
 
+/// [MOC-257 review] 把 auth 文件设 0600(Unix)。`std::fs::write` 默认 `0666 & umask`,多用户共享 home + umask
+/// 022 时其它本地用户能读到 chatgpt refresh token / gateway key。`write_auth` 一直强制 0600,这里对齐 ——
+/// 用裸 `std::fs::write` 写 auth/stash 字节后必调。best-effort(设权限失败只忽略,内容已落盘)。
+fn set_auth_file_private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// [MOC-257 review] 把字节写回 stash 路径(apply 回滚:Real 分支若是从 stash unstash 了真账号才失败,需
 /// 把真账号放回 stash,恢复 pre-apply 的「真账号在 stash」态)。`None`(本次没 unstash)→ `Ok(())` no-op。
 /// **fallible**:写失败必须报 —— 此时原 stash 已被 unstash 消费、内存 Vec 是真账号唯一副本,caller 据 Err
@@ -1152,7 +1165,9 @@ pub fn restash_real_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String> 
     if let Some(parent) = stash.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建 stash 目录失败: {e}"))?;
     }
-    std::fs::write(&stash, &bytes).map_err(|e| format!("写 stash 失败: {e}"))
+    std::fs::write(&stash, &bytes).map_err(|e| format!("写 stash 失败: {e}"))?;
+    set_auth_file_private(&stash); // 真账号整文件含 refresh token → 0600
+    Ok(())
 }
 
 /// 把活动 `auth.json` 还原到 [`snapshot_active_auth_bytes`] 拿的快照(`Some`→写回原字节;`None`→删文件,
@@ -1162,8 +1177,8 @@ pub fn restash_real_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String> 
 #[must_use = "回滚还原活动 auth 可能失败;失败要 surface 给 caller,别静默吞"]
 pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String> {
     let p = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    let r = match snapshot {
-        Some(bytes) => std::fs::write(&p.auth_json, &bytes),
+    let r = match &snapshot {
+        Some(bytes) => std::fs::write(&p.auth_json, bytes),
         None => match std::fs::remove_file(&p.auth_json) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             other => other,
@@ -1172,7 +1187,11 @@ pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String
     r.map_err(|e| {
         tracing::warn!("[PluginUnlock] apply 失败回滚 auth.json 快照失败: {e}");
         format!("还原活动 auth 失败: {e}")
-    })
+    })?;
+    if snapshot.is_some() {
+        set_auth_file_private(&p.auth_json); // 写回的快照可能含 chatgpt token / gateway key → 0600
+    }
+    Ok(())
 }
 
 /// 把活动**真账号**整文件移到 stash 保全(保 tokens),供切到 synthetic/off 前调用。**只动真账号**
