@@ -441,13 +441,6 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     </SettingsGroup>
 
     <SettingsGroup :title="t('settings.groupCodexConfig')">
-      <RouterLink to="/desktop" class="nav-row">
-        <div class="nav-row__text">
-          <div class="nav-row__title">{{ t('settings.codexCliRow') }}</div>
-          <div class="nav-row__desc">{{ t('settings.codexCliRowDesc') }}</div>
-        </div>
-        <IconChevronRight class="nav-row__chevron" />
-      </RouterLink>
       <ResidualScanPanel />
       <SnapshotPanel />
     </SettingsGroup>
@@ -490,7 +483,7 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
 
     <SettingsGroup :title="t('about.group')">
       <SettingsRow :title="t('about.version')" :description="appVersion ? `v${appVersion}` : '…'">
-        <AppButton size="sm" variant="ghost" :label="t('about.checkUpdate')" @click="onCheckUpdate" />
+        <AppButton size="sm" variant="secondary" :label="t('about.checkUpdate')" @click="onCheckUpdate" />
       </SettingsRow>
       <SettingsRow :title="t('settings.updateUrl')" :description="t('settings.updateUrlDesc')">
         <code class="settings-readonly">{{ UPDATE_REPO_URL }}</code>
@@ -499,7 +492,7 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
         <AppButton size="sm" variant="secondary" :label="t('about.like')" @click="openExternal(UPDATE_REPO_URL)" />
       </SettingsRow>
       <SettingsRow :title="t('about.feedback')" :description="t('about.feedbackDesc')">
-        <AppButton size="sm" variant="ghost" :label="t('about.feedback')" @click="feedbackOpen = true" />
+        <AppButton size="sm" variant="secondary" :label="t('about.feedback')" @click="feedbackOpen = true" />
       </SettingsRow>
     </SettingsGroup>
 

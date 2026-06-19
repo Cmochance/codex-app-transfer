@@ -40,54 +40,14 @@ export function themeDeleteCustom() {
 export function restartCodexApp() {
   return api('POST', '/api/desktop/restart-codex-app')
 }
+// 在系统文件管理器打开 Codex 原配置快照目录(~/.codex-app-transfer/codex-snapshots/active/)
+export function openSnapshotDir() {
+  return api('POST', '/api/desktop/open-snapshot-dir')
+}
 
 // ───────────────────────────────────────────────────────────────────────────
-// Desktop 配置(Codex CLI 接管,/api/desktop/{status,configure,clear})
+// 还原 Codex 原配置(/api/desktop/clear,设置页快照「还原」复用 useCodexRestore)
 // ───────────────────────────────────────────────────────────────────────────
-export interface DesktopHealth {
-  needsApply: boolean
-  issues: { message?: string }[]
-}
-export interface DesktopConfig {
-  inferenceProvider: string
-  inferenceGatewayBaseUrl: string
-  inferenceGatewayApiKey: string
-  inferenceGatewayAuthScheme: string
-  inferenceModels: string
-}
-export interface DesktopStatus {
-  configured: boolean
-  health: DesktopHealth
-  config: DesktopConfig
-}
-
-// 旧 api.js getDesktopStatus:二次组装 /api/desktop/status + /api/status(取 proxyPort
-// 作 baseUrl 兜底),API Key 掩码成 '******'。
-export async function getDesktopStatus(): Promise<DesktopStatus> {
-  const data = await api<{
-    configured?: boolean
-    health?: DesktopHealth
-    keys?: Partial<DesktopConfig>
-  }>('GET', '/api/desktop/status')
-  const status = await api<{ proxyPort?: number }>('GET', '/api/status')
-  const proxyPort = status.proxyPort || 18080
-  const k = data.keys || {}
-  return {
-    configured: !!data.configured,
-    health: data.health || { needsApply: false, issues: [] },
-    config: {
-      inferenceProvider: k.inferenceProvider || 'gateway',
-      inferenceGatewayBaseUrl: k.inferenceGatewayBaseUrl || `http://127.0.0.1:${proxyPort}`,
-      inferenceGatewayApiKey: k.inferenceGatewayApiKey ? '******' : '',
-      inferenceGatewayAuthScheme: k.inferenceGatewayAuthScheme || 'bearer',
-      inferenceModels: k.inferenceModels || '[]',
-    },
-  }
-}
-
-export function configureDesktop() {
-  return api<{ commands?: { temporary?: string } }>('POST', '/api/desktop/configure')
-}
 export function clearDesktop() {
   return api<{ restored?: boolean }>('POST', '/api/desktop/clear')
 }

@@ -119,8 +119,8 @@ async function onShowFields() {
   <SettingsRow :title="t('settings.residualScanTitle')" :description="t('settings.residualScanHint')">
     <div class="residual-ctl">
       <span v-if="shortStatus" class="residual-status" :class="statusClass">{{ shortStatus }}</span>
-      <AppButton size="sm" variant="ghost" :label="t('settings.residualScanRefresh')" @click="refreshStatus" />
-      <AppButton size="sm" variant="ghost" :label="t('settings.residualScanShowFields')" @click="onShowFields" />
+      <AppButton size="sm" variant="secondary" :label="t('settings.residualScanRefresh')" @click="refreshStatus" />
+      <AppButton size="sm" variant="secondary" :label="t('settings.residualScanShowFields')" @click="onShowFields" />
       <AppButton v-if="showRepair" size="sm" variant="danger" :label="t('settings.residualScanRepair')" @click="onRepair" />
     </div>
   </SettingsRow>

@@ -2,20 +2,67 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useProvidersStore } from '@/stores/providers'
+import { useSettingsStore } from '@/stores/settings'
 import * as providersApi from '@/api/providers'
-import type { ProviderPayload } from '@/api/types'
+import type { ProviderPayload, Preset } from '@/api/types'
 import AppModal from '@/components/ui/AppModal.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppInput from '@/components/ui/AppInput.vue'
+import AppCombobox from '@/components/ui/AppCombobox.vue'
+import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
+import OAuthLoginSection from '@/components/provider/OAuthLoginSection.vue'
+import type { OAuthKind } from '@/api/oauth'
 import { useToast } from '@/composables/useToast'
 
 // editId 为空 = 添加;非空 = 编辑(从 store 取数据 + 拉 secret 回填)
 const props = defineProps<{ editId?: string | null }>()
 const emit = defineEmits<{ close: []; saved: [] }>()
 const store = useProvidersStore()
+const settingsStore = useSettingsStore()
 const { show: toast } = useToast()
+
+// JSON 对象 → 缩进字符串(空对象/缺失返空), 供回填高级字段(编辑 / 选预设共用)
+function stringifyIfAny(o: Record<string, unknown> | undefined): string {
+  return o && Object.keys(o).length ? JSON.stringify(o, null, 2) : ''
+}
+
+// 模型下拉选项:value=原始 model id(发往上游), label=显示名(如 Gemini displayName)。
+type ModelOpt = { value: string; label: string }
+// ── 获取到的模型清单本地持久化(按 baseUrl), 下次打开同上游 provider 无需重新「获取模型」──
+const MODEL_CACHE_PREFIX = 'cas:models:'
+const modelCacheKey = (baseUrl: string) => MODEL_CACHE_PREFIX + baseUrl.trim().replace(/\/+$/, '')
+function saveCachedModels(baseUrl: string, models: ModelOpt[]) {
+  if (!baseUrl.trim() || !models.length) return
+  try {
+    localStorage.setItem(modelCacheKey(baseUrl), JSON.stringify(models))
+  } catch {
+    /* localStorage 不可用时静默跳过, 不影响主流程 */
+  }
+}
+function loadCachedModels(baseUrl: string) {
+  if (!baseUrl.trim()) return
+  try {
+    const raw = localStorage.getItem(modelCacheKey(baseUrl))
+    if (!raw) return
+    const arr = JSON.parse(raw)
+    if (Array.isArray(arr)) {
+      // 兼容旧版纯 string 缓存
+      availableModels.value = arr
+        .map((x): ModelOpt | null =>
+          typeof x === 'string'
+            ? { value: x, label: x }
+            : x && typeof x.value === 'string'
+              ? { value: x.value, label: typeof x.label === 'string' ? x.label : x.value }
+              : null,
+        )
+        .filter((x): x is ModelOpt => !!x)
+    }
+  } catch {
+    /* 解析失败忽略 */
+  }
+}
 
 // Codex 槽位 → 上游模型 id 映射(对齐后端 models 字段 + 旧 providerFormDefaultRows)
 const MODEL_SLOTS = [
@@ -45,15 +92,131 @@ const form = reactive({
   extraHeaders: '',
   modelCapabilities: '',
   requestOptions: '',
+  grokSso: '',
 })
 const saving = ref(false)
 const error = ref('')
 const showAdvanced = ref(false)
 const isBuiltin = ref(false)
 const fetching = ref(false)
-const availableModels = ref<string[]>([])
-// 预设(内置)provider 不支持自定义鉴权 → 隐藏;第三方可自选(authScheme 已接后端 providerBody)
-const showAuthScheme = computed(() => !isBuiltin.value)
+const availableModels = ref<ModelOpt[]>([])
+
+// baseUrl 归一(去 scheme / 末尾斜杠 / 大小写)后反查命中的内置 preset。
+// 对齐后端 healing 的 baseUrl→preset 匹配:命中即视作内置 provider。
+const normUrl = (u: string) =>
+  u.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, '')
+const matchedPreset = computed(() => {
+  const cur = normUrl(form.baseUrl)
+  if (!cur) return null
+  return (
+    presets.value.find(
+      (p) =>
+        normUrl(p.baseUrl) === cur ||
+        (p.baseUrlOptions || []).some((o) => normUrl(o.value) === cur),
+    ) || null
+  )
+})
+// 命中 preset 且其带多个备选 baseUrl(如小米 MiMo Token Plan 三集群)→ baseUrl 用下拉。
+// 下拉直接显示 baseUrl 本身(label = value),不显示区域名等额外文案。
+const baseUrlOptions = computed(() =>
+  (matchedPreset.value?.baseUrlOptions ?? []).map((o) => ({ value: o.value, label: o.value })),
+)
+// 自定义(第三方)provider 才显示鉴权方式 + 高级 JSON 字段;预设 / 内置的这些值由
+// preset 决定(已由 applyPreset 填入 form 随保存发送)且被 healing 强制覆盖, 用户改也无效,
+// 故隐藏以保持显示统一。
+const isCustomProvider = computed(() => !isBuiltin.value && !matchedPreset.value)
+// 编辑内置/预设 provider 时 baseUrl 不可改:后端 update_provider 对 builtin 跳过 baseUrl,
+// 改了会被静默丢弃(含小米多集群切换)→ 设为只读, 如实反映后端行为(添加时仍可选集群)。
+const baseUrlReadonly = computed(() => isEdit.value && !isCustomProvider.value)
+
+// OAuth 账号登录类 provider(按 authScheme 判定, 添加经 preset 预填 / 编辑从后端回填均适用):
+// 这些用浏览器授权登录, 用登录区取代 API Key 输入。
+const OAUTH_KIND_BY_AUTH: Record<string, OAuthKind> = {
+  zai_oauth: 'zai',
+  bigmodel_oauth: 'bigmodel',
+  google_oauth_cloud_code: 'gemini',
+  gemini_cli_oauth: 'gemini',
+  google_oauth_antigravity: 'antigravity',
+  antigravity_oauth: 'antigravity',
+}
+const oauthKind = computed<OAuthKind | null>(() => OAUTH_KIND_BY_AUTH[form.authScheme] ?? null)
+// grok-web 不是 OAuth, 走粘贴 grok.com SSO cookie。
+const isGrokWeb = computed(
+  () => form.authScheme === 'grok_cookie' || form.apiFormat === 'grok_web',
+)
+
+// 小米账号登录:仅 Xiaomi MiMo Token Plan 的【已存】provider(登录按 provider id 落 mimoCookie),
+// 用于在 Codex 用量面板显示套餐额度。放编辑页底部。
+const mimoLoggedIn = ref(false)
+const mimoLoggingIn = ref(false)
+const showMimoLogin = computed(
+  () => isEdit.value && matchedPreset.value?.id === 'xiaomi-mimo-token-plan',
+)
+async function onMimoLogin() {
+  if (!props.editId) return
+  mimoLoggingIn.value = true
+  try {
+    const res = await providersApi.mimoLogin(props.editId)
+    if (res.captured) {
+      mimoLoggedIn.value = true
+      toast(t('providersAdd.mimoLogin.success'))
+    } else {
+      toast(t('providersAdd.mimoLogin.cancelled'))
+    }
+  } catch (e) {
+    toast((e as Error).message || t('providerForm.errSaveFailed'), 'error')
+  } finally {
+    mimoLoggingIn.value = false
+  }
+}
+
+// ── 名称下拉:可选内置预设(选中预填全部默认)或「自定义」(全手填) ──
+const CUSTOM_LABEL = t('providerForm.customOption')
+const presets = ref<Preset[]>([])
+// 名称下拉选项 = [自定义, ...预设名](灰色预设按「显示灰色提供商」开关过滤)
+const nameOptions = computed(() => [CUSTOM_LABEL, ...presets.value.map((p) => p.name)])
+
+// 选「自定义」→ 清空所有字段, 名称留空显示占位, 由用户全部手填
+function resetToCustom() {
+  form.name = ''
+  form.baseUrl = ''
+  form.apiKey = ''
+  form.apiFormat = 'openai_chat'
+  form.authScheme = 'bearer'
+  form.reviewModelSlot = ''
+  for (const s of MODEL_SLOTS) form.models[s.key] = ''
+  form.extraHeaders = ''
+  form.modelCapabilities = ''
+  form.requestOptions = ''
+  availableModels.value = []
+}
+
+// 选预设 → 预填该预设携带的全部默认内容(baseUrl / 协议 / 鉴权 / 模型映射 / 高级字段)
+function applyPreset(p: Preset) {
+  form.name = p.name
+  form.baseUrl = p.baseUrl || ''
+  form.apiKey = ''
+  form.apiFormat = p.apiFormat || 'openai_chat'
+  form.authScheme = p.authScheme || 'bearer'
+  form.reviewModelSlot = ''
+  for (const s of MODEL_SLOTS) form.models[s.key] = p.models?.[s.key] || ''
+  form.extraHeaders = stringifyIfAny(p.extraHeaders)
+  form.modelCapabilities = stringifyIfAny(p.modelCapabilities)
+  form.requestOptions = stringifyIfAny(p.requestOptions as Record<string, unknown> | undefined)
+  // 该上游若之前抓过模型, 带出缓存清单, 否则清空待用户「获取模型」
+  availableModels.value = []
+  loadCachedModels(form.baseUrl)
+}
+
+// 名称下拉显式点选(自由键入自定义名称不触发, 走 v-model 直更 form.name)
+function onPickName(picked: string) {
+  if (picked === CUSTOM_LABEL) {
+    resetToCustom()
+    return
+  }
+  const p = presets.value.find((x) => x.name === picked)
+  if (p) applyPreset(p)
+}
 
 // 获取上游可用模型(草稿走 form 当前值 → 用已输入/已回填的 key)
 async function fetchModels() {
@@ -72,22 +235,23 @@ async function fetchModels() {
       authScheme: form.authScheme,
     }
     const res = await providersApi.fetchProviderModelsDraft(draft)
+    // value=原始 model id;label 优先用上游 display_name(如 Gemini/Antigravity 友好名),
+    // 让用户在下拉里看得懂是哪个模型,而非难辨的 raw id。
     availableModels.value = (res.models || [])
-      .map((m) =>
-        typeof m === 'string'
-          ? m
-          : (m as { id?: string; name?: string })?.id || (m as { name?: string })?.name || '',
-      )
-      .filter(Boolean)
+      .map((m): ModelOpt => {
+        if (typeof m === 'string') return { value: m, label: m }
+        const o = m as { id?: string; name?: string; model?: string; display_name?: string }
+        const value = o.id || o.name || o.model || ''
+        return { value, label: o.display_name || value }
+      })
+      .filter((o) => o.value)
+    saveCachedModels(form.baseUrl, availableModels.value)
     toast(tFmt('providerForm.modelsFetched', { count: availableModels.value.length }))
   } catch (e) {
     error.value = (e as Error).message || t('providerForm.modelsFetchFailed')
   } finally {
     fetching.value = false
   }
-}
-function pickModel(m: string) {
-  form.models.default = m
 }
 
 const formatOptions = [
@@ -105,6 +269,14 @@ const isEdit = computed(() => !!props.editId)
 const title = computed(() => (isEdit.value ? t('providerForm.titleEdit') : t('providerForm.titleAdd')))
 
 onMounted(async () => {
+  // 名称下拉的预设列表(添加 / 编辑都需要): 灰色预设按「显示灰色提供商」开关过滤
+  if (!settingsStore.loaded) await settingsStore.load().catch(() => {})
+  const showGray = settingsStore.bool('showGrayProviders', false)
+  await providersApi
+    .getPresets()
+    .then((list) => (presets.value = list.filter((p) => showGray || !p.gray)))
+    .catch(() => {})
+
   if (!props.editId) return
   if (!store.list.length) await store.load().catch(() => {})
   const p = store.list.find((x) => x.id === props.editId)
@@ -117,15 +289,16 @@ onMounted(async () => {
   form.apiFormat = p.apiFormat
   form.authScheme = p.authScheme || 'bearer'
   isBuiltin.value = !!p.isBuiltin
+  mimoLoggedIn.value = !!p.hasMimoCookie
   form.reviewModelSlot = p.reviewModelSlot || ''
   for (const s of MODEL_SLOTS) {
     form.models[s.key] = (p.mappings as Record<string, string>)[s.key] || ''
   }
-  const stringifyIfAny = (o: Record<string, unknown> | undefined) =>
-    o && Object.keys(o).length ? JSON.stringify(o, null, 2) : ''
   form.extraHeaders = stringifyIfAny(p.extraHeaders)
   form.modelCapabilities = stringifyIfAny(p.modelCapabilities)
   form.requestOptions = stringifyIfAny(p.requestOptions)
+  // 该上游之前抓过模型 → 带出本地缓存清单, 无需重新「获取模型」即可切换映射
+  loadCachedModels(form.baseUrl)
   const secret = await providersApi.getProviderSecret(props.editId).catch(() => ({ apiKey: '' }))
   form.apiKey = secret.apiKey || ''
 })
@@ -175,6 +348,10 @@ async function save() {
     modelCapabilities,
     requestOptions,
   }
+  // grok-web:粘贴的 SSO cookie 封进 grokWeb.cookies.sso(留空=编辑时保持原值)
+  if (isGrokWeb.value && form.grokSso.trim()) {
+    payload.grokWeb = { cookies: { sso: form.grokSso.trim() } }
+  }
   saving.value = true
   error.value = ''
   try {
@@ -195,18 +372,35 @@ async function save() {
   <AppModal :title="title" wide @close="emit('close')">
     <div class="pf">
       <SettingsRow :title="t('providerForm.name')">
-        <AppInput v-model="form.name" placeholder="My Provider" />
+        <AppCombobox
+          v-model="form.name"
+          :options="nameOptions"
+          placeholder="My Provider"
+          @select="onPickName"
+        />
       </SettingsRow>
       <SettingsRow title="Base URL">
-        <AppInput v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
+        <AppInput v-if="baseUrlReadonly" v-model="form.baseUrl" :disabled="true" />
+        <AppSelect
+          v-else-if="baseUrlOptions.length >= 2"
+          v-model="form.baseUrl"
+          :options="baseUrlOptions"
+        />
+        <AppInput v-else v-model="form.baseUrl" placeholder="https://api.example.com/v1" />
       </SettingsRow>
-      <SettingsRow title="API Key" :description="isEdit ? t('providerForm.apiKeyEditHint') : ''">
+      <SettingsRow v-if="oauthKind" :title="t('providerForm.account')">
+        <OAuthLoginSection :key="oauthKind" :kind="oauthKind!" />
+      </SettingsRow>
+      <SettingsRow v-else-if="isGrokWeb" :title="t('providerForm.grokCookie')">
+        <AppInput v-model="form.grokSso" :placeholder="t('providerForm.grokCookiePlaceholder')" />
+      </SettingsRow>
+      <SettingsRow v-else title="API Key">
         <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
       </SettingsRow>
       <SettingsRow :title="t('providerForm.apiFormat')">
         <SegmentedControl v-model="form.apiFormat" :options="formatOptions" />
       </SettingsRow>
-      <SettingsRow v-if="showAuthScheme" :title="t('providerForm.authScheme')">
+      <SettingsRow v-if="isCustomProvider" :title="t('providerForm.authScheme')">
         <SegmentedControl v-model="form.authScheme" :options="authOptions" />
       </SettingsRow>
 
@@ -220,55 +414,63 @@ async function save() {
           @click="fetchModels"
         />
       </div>
-      <div v-if="availableModels.length" class="pf__models">
-        <span class="pf__models-hint">{{ t('providerForm.modelsPick') }}</span>
-        <button
-          v-for="m in availableModels"
-          :key="m"
-          type="button"
-          class="pf__model-chip"
-          @click="pickModel(m)"
-        >
-          {{ m }}
-        </button>
-      </div>
       <SettingsRow v-for="s in MODEL_SLOTS" :key="s.key" :title="s.label">
-        <AppInput
+        <AppCombobox
           v-model="form.models[s.key]"
+          :options="availableModels"
           :placeholder="s.key === 'default' ? 'gpt-4o' : t('providerForm.slotFallbackPlaceholder')"
         />
       </SettingsRow>
-      <SettingsRow :title="t('providerForm.reviewModelSlot')" :description="t('providerForm.reviewModelSlotDesc')">
+      <SettingsRow :title="t('providerForm.reviewModelSlot')">
         <AppInput v-model="form.reviewModelSlot" placeholder="default" />
       </SettingsRow>
 
-      <button type="button" class="pf__adv" @click="showAdvanced = !showAdvanced">
-        {{ showAdvanced ? '▾' : '▸' }} {{ t('providerForm.advancedToggle') }}
-      </button>
-      <template v-if="showAdvanced">
-        <div class="pf__field">
-          <label>{{ t('providerForm.extraHeaders') }} extraHeaders</label>
-          <textarea
-            v-model="form.extraHeaders"
-            class="pf__json"
-            spellcheck="false"
-            placeholder='{"X-Title": "..."}'
-          ></textarea>
-        </div>
-        <div class="pf__field">
-          <label>{{ t('providerForm.modelCapabilities') }} modelCapabilities</label>
-          <textarea
-            v-model="form.modelCapabilities"
-            class="pf__json"
-            spellcheck="false"
-            placeholder='{"gpt-4o": {"context_window": 1000000}}'
-          ></textarea>
-        </div>
-        <div class="pf__field">
-          <label>{{ t('providerForm.requestOptions') }} requestOptions</label>
-          <textarea v-model="form.requestOptions" class="pf__json" spellcheck="false"></textarea>
-        </div>
+      <template v-if="isCustomProvider">
+        <button type="button" class="pf__adv" @click="showAdvanced = !showAdvanced">
+          {{ showAdvanced ? '▾' : '▸' }} {{ t('providerForm.advancedToggle') }}
+        </button>
+        <template v-if="showAdvanced">
+          <div class="pf__field">
+            <label>{{ t('providerForm.extraHeaders') }} extraHeaders</label>
+            <textarea
+              v-model="form.extraHeaders"
+              class="pf__json"
+              spellcheck="false"
+              placeholder='{"X-Title": "..."}'
+            ></textarea>
+          </div>
+          <div class="pf__field">
+            <label>{{ t('providerForm.modelCapabilities') }} modelCapabilities</label>
+            <textarea
+              v-model="form.modelCapabilities"
+              class="pf__json"
+              spellcheck="false"
+              placeholder='{"gpt-4o": {"context_window": 1000000}}'
+            ></textarea>
+          </div>
+          <div class="pf__field">
+            <label>{{ t('providerForm.requestOptions') }} requestOptions</label>
+            <textarea v-model="form.requestOptions" class="pf__json" spellcheck="false"></textarea>
+          </div>
+        </template>
       </template>
+
+      <SettingsRow v-if="showMimoLogin" :title="t('providersAdd.mimoLogin.label')">
+        <div class="pf__mimo">
+          <span class="pf__mimo-status" :class="{ ok: mimoLoggedIn }">{{
+            mimoLoggedIn
+              ? t('providersAdd.mimoLogin.statusLoggedIn')
+              : t('providersAdd.mimoLogin.statusNotLoggedIn')
+          }}</span>
+          <AppButton
+            size="sm"
+            variant="secondary"
+            :label="mimoLoggingIn ? t('providersAdd.mimoLogin.statusLoggingIn') : t('providersAdd.mimoLogin.button')"
+            :disabled="mimoLoggingIn"
+            @click="onMimoLogin"
+          />
+        </div>
+      </SettingsRow>
 
       <div v-if="error" class="pf__error">{{ error }}</div>
       <div class="pf__actions">
@@ -307,31 +509,6 @@ async function save() {
 }
 .pf__section-row .pf__section {
   margin: var(--space-3) 0 var(--space-1);
-}
-.pf__models {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 0 var(--space-1) var(--space-2);
-}
-.pf__models-hint {
-  width: 100%;
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-}
-.pf__model-chip {
-  padding: 2px var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  cursor: pointer;
-}
-.pf__model-chip:hover {
-  border-color: var(--accent);
 }
 .pf__adv {
   align-self: flex-start;
@@ -380,5 +557,18 @@ async function save() {
   justify-content: flex-end;
   gap: var(--space-3);
   margin-top: var(--space-4);
+}
+.pf__mimo {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.pf__mimo-status {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.pf__mimo-status.ok {
+  color: var(--success);
 }
 </style>

@@ -14,7 +14,7 @@ use codex_app_transfer_codex_integration::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::admin::handlers::common::err;
+use crate::admin::handlers::common::{err, open_directory};
 use crate::admin::handlers::proxy::read_proxy_port;
 use crate::admin::registry_io::load as load_registry;
 
@@ -65,75 +65,6 @@ fn known_transfer_proxy_ports() -> Vec<u16> {
 }
 
 // ── /api/desktop/* Axum HTTP Handlers ─────────────────────────────────
-
-pub async fn desktop_status() -> impl IntoResponse {
-    let paths = match CodexPaths::from_home_env() {
-        Ok(p) => p,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let configured = has_snapshot(&paths);
-    let cfg = load_registry().unwrap_or_else(|_| json!({}));
-    let proxy_port = read_proxy_port(&cfg);
-    let actual_base_url = snapshot::read_codex_toml_root_string(&paths, "openai_base_url");
-    let actual_api_key_present = snapshot::codex_openai_api_key_present(&paths);
-    let desktop_target = snapshot::desktop_target_for_active_provider(&cfg);
-    let fallback_base_url = desktop_target
-        .as_ref()
-        .map(|target| target.base_url.clone())
-        .unwrap_or_else(|| format!("http://127.0.0.1:{proxy_port}"));
-    let api_key_present = actual_api_key_present
-        || desktop_target
-            .as_ref()
-            .map(|target| !target.api_key.is_empty())
-            .unwrap_or_else(|| !crate::admin::handlers::proxy::read_gateway_key(&cfg).is_empty());
-    let health = snapshot::desktop_health(
-        Some(&paths),
-        configured,
-        actual_base_url.as_deref(),
-        actual_api_key_present,
-        desktop_target.as_ref(),
-    );
-    Json(json!({
-        "configured": configured,
-        "health": health,
-        "keys": {
-            "inferenceProvider": "gateway",
-            "inferenceGatewayBaseUrl": actual_base_url.unwrap_or(fallback_base_url),
-            "inferenceGatewayApiKey": if api_key_present { "******" } else { "" },
-            "inferenceGatewayAuthScheme": "bearer",
-            "inferenceModels": snapshot::desktop_inference_models_json(desktop_target.as_ref()),
-        },
-    }))
-    .into_response()
-}
-
-pub async fn desktop_configure() -> impl IntoResponse {
-    let target_result = crate::admin::registry_io::with_config_write(|cfg| {
-        let Some(active) = crate::admin::handlers::providers::active_provider(cfg) else {
-            return Err("add a provider first".into());
-        };
-        let target = snapshot::desktop_config_target_for_provider(cfg, &active, None);
-        Ok(crate::admin::registry_io::ConfigMutation::Modified(target))
-    });
-    let target = match target_result {
-        Ok(t) => t,
-        Err(e) if e == "add a provider first" => {
-            return err(StatusCode::BAD_REQUEST, e).into_response();
-        }
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    match snapshot::apply_desktop_target(&target) {
-        Ok(mut result) => {
-            if let Some(obj) = result.as_object_mut() {
-                obj.insert("success".into(), Value::Bool(true));
-                obj.insert("mode".into(), Value::String(target.mode.to_owned()));
-                obj.insert("requiresProxy".into(), Value::Bool(target.requires_proxy));
-            }
-            Json(result).into_response()
-        }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
 
 pub async fn desktop_clear() -> impl IntoResponse {
     let paths = match CodexPaths::from_home_env() {
@@ -301,6 +232,29 @@ pub async fn restart_codex_app(State(state): State<crate::admin::AdminState>) ->
             service.reinject().await;
             Json(json!({"success": true, "desktopSync": desktop_sync})).into_response()
         }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// POST /api/desktop/open-snapshot-dir — 在系统文件管理器打开 Codex 原配置快照目录
+/// (`~/.codex-app-transfer/codex-snapshots/active/`,内含各次 pre-apply 快照的
+/// config.toml / auth.json / manifest.json),方便用户查找备份的原始配置。
+pub async fn open_snapshot_dir() -> impl IntoResponse {
+    let dir = match CodexPaths::from_home_env() {
+        Ok(p) => p.active_snapshots_dir,
+        Err(_) => {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "无法定位快照目录").into_response()
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("创建快照目录失败: {e}"),
+        )
+        .into_response();
+    }
+    match open_directory(&dir) {
+        Ok(_) => Json(json!({"success": true})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
