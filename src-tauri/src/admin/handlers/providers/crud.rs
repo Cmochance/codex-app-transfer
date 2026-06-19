@@ -546,6 +546,18 @@ pub async fn set_default_provider(
 ) -> impl IntoResponse {
     let result = switch_provider_and_sync(state.proxy_manager.clone(), id).await;
     if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        // [MOC-257 review] 激活/切 provider 后 relay 可用了 → 重新 apply 当前生效三态(synthetic/real),
+        // 弥补「无 provider 时启动跳过的 unlock apply」:否则 status 一直报 resolve 默认 synthetic 却从没真
+        // apply、前端 re-select 同档 no-op、unlock 永不生效。off 不依赖 provider、无需。idempotent + best-effort。
+        let mode = crate::codex_real_account::resolve_plugin_unlock_mode();
+        if !matches!(mode, crate::codex_real_account::PluginUnlockMode::Off) {
+            if let Err(e) =
+                crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, mode)
+                    .await
+            {
+                tracing::warn!("[PluginUnlock] 切 provider 后重 apply {mode:?} 失败: {e}");
+            }
+        }
         Json(result).into_response()
     } else {
         let status = if result.get("message").and_then(|v| v.as_str()) == Some("provider not found")

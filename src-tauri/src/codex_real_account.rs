@@ -766,20 +766,10 @@ pub async fn activate_real_account() -> Result<bool, String> {
             return Ok(true);
         }
     }
-    // 活动无可用真 token / 是合成 → 从持久镜像恢复整份(镜像有效且本地 JWT 未过期)。
-    if let Some(v) = read_imported_mirror(&paths) {
-        let access = v
-            .get("tokens")
-            .and_then(|t| t.get("access_token"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !access.is_empty() && !access_token_expired(access, chrono::Utc::now().timestamp()) {
-            backup_active_auth(&paths, "preactivate")?;
-            write_auth(&paths.auth_json, &v).map_err(|e| format!("从镜像恢复失败: {e}"))?;
-            return Ok(true);
-        }
-    }
-    // [MOC-257 review] 镜像无 / 过期 → 再试导入活源(对齐 reconcile 的活源跟随,覆盖合成 / 过期活动)。
+    // 活动无可用真 token / 是合成 → 从导入账号恢复。[MOC-257 review] **活源优先**(最新、跟随那边 Codex
+    // 刷新),再回落镜像快照;两者都用 `auth_value_real_and_usable`(含**撤销**指纹判定,非裸过期)——
+    // 否则「镜像 token 未过期但已被服务端 401 撤销、活源已刷新」时会写撤销镜像、永不到活源 → 401。对齐
+    // reconcile_on_startup 的「活源 → 镜像」顺序。
     if let Some(v) = read_imported_source_path(&paths)
         .and_then(|sp| std::fs::read_to_string(&sp).ok())
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
@@ -787,6 +777,11 @@ pub async fn activate_real_account() -> Result<bool, String> {
     {
         backup_active_auth(&paths, "preactivate")?;
         write_auth(&paths.auth_json, &v).map_err(|e| format!("从导入活源恢复失败: {e}"))?;
+        return Ok(true);
+    }
+    if let Some(v) = read_imported_mirror(&paths).filter(|v| auth_value_real_and_usable(v)) {
+        backup_active_auth(&paths, "preactivate")?;
+        write_auth(&paths.auth_json, &v).map_err(|e| format!("从镜像恢复失败: {e}"))?;
         return Ok(true);
     }
     Ok(false)
