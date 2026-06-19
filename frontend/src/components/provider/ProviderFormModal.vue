@@ -28,10 +28,12 @@ function stringifyIfAny(o: Record<string, unknown> | undefined): string {
   return o && Object.keys(o).length ? JSON.stringify(o, null, 2) : ''
 }
 
+// 模型下拉选项:value=原始 model id(发往上游), label=显示名(如 Gemini displayName)。
+type ModelOpt = { value: string; label: string }
 // ── 获取到的模型清单本地持久化(按 baseUrl), 下次打开同上游 provider 无需重新「获取模型」──
 const MODEL_CACHE_PREFIX = 'cas:models:'
 const modelCacheKey = (baseUrl: string) => MODEL_CACHE_PREFIX + baseUrl.trim().replace(/\/+$/, '')
-function saveCachedModels(baseUrl: string, models: string[]) {
+function saveCachedModels(baseUrl: string, models: ModelOpt[]) {
   if (!baseUrl.trim() || !models.length) return
   try {
     localStorage.setItem(modelCacheKey(baseUrl), JSON.stringify(models))
@@ -45,7 +47,18 @@ function loadCachedModels(baseUrl: string) {
     const raw = localStorage.getItem(modelCacheKey(baseUrl))
     if (!raw) return
     const arr = JSON.parse(raw)
-    if (Array.isArray(arr)) availableModels.value = arr.filter((x): x is string => typeof x === 'string')
+    if (Array.isArray(arr)) {
+      // 兼容旧版纯 string 缓存
+      availableModels.value = arr
+        .map((x): ModelOpt | null =>
+          typeof x === 'string'
+            ? { value: x, label: x }
+            : x && typeof x.value === 'string'
+              ? { value: x.value, label: typeof x.label === 'string' ? x.label : x.value }
+              : null,
+        )
+        .filter((x): x is ModelOpt => !!x)
+    }
   } catch {
     /* 解析失败忽略 */
   }
@@ -86,7 +99,7 @@ const error = ref('')
 const showAdvanced = ref(false)
 const isBuiltin = ref(false)
 const fetching = ref(false)
-const availableModels = ref<string[]>([])
+const availableModels = ref<ModelOpt[]>([])
 
 // baseUrl 归一(去 scheme / 末尾斜杠 / 大小写)后反查命中的内置 preset。
 // 对齐后端 healing 的 baseUrl→preset 匹配:命中即视作内置 provider。
@@ -108,9 +121,10 @@ const matchedPreset = computed(() => {
 const baseUrlOptions = computed(() =>
   (matchedPreset.value?.baseUrlOptions ?? []).map((o) => ({ value: o.value, label: o.value })),
 )
-// 鉴权方式由 preset 决定且被后端 healing(ENFORCED_BUILTIN_FIELDS)强制覆盖,
-// 用户在此设置无效 → 内置 / 命中 preset 时隐藏, 仅自定义 provider 可选。
-const showAuthScheme = computed(() => !isBuiltin.value && !matchedPreset.value)
+// 自定义(第三方)provider 才显示鉴权方式 + 高级 JSON 字段;预设 / 内置的这些值由
+// preset 决定(已由 applyPreset 填入 form 随保存发送)且被 healing 强制覆盖, 用户改也无效,
+// 故隐藏以保持显示统一。
+const isCustomProvider = computed(() => !isBuiltin.value && !matchedPreset.value)
 
 // OAuth 账号登录类 provider(按 authScheme 判定, 添加经 preset 预填 / 编辑从后端回填均适用):
 // 这些用浏览器授权登录, 用登录区取代 API Key 输入。
@@ -193,13 +207,16 @@ async function fetchModels() {
       authScheme: form.authScheme,
     }
     const res = await providersApi.fetchProviderModelsDraft(draft)
+    // value=原始 model id;label 优先用上游 display_name(如 Gemini/Antigravity 友好名),
+    // 让用户在下拉里看得懂是哪个模型,而非难辨的 raw id。
     availableModels.value = (res.models || [])
-      .map((m) =>
-        typeof m === 'string'
-          ? m
-          : (m as { id?: string; name?: string })?.id || (m as { name?: string })?.name || '',
-      )
-      .filter(Boolean)
+      .map((m): ModelOpt => {
+        if (typeof m === 'string') return { value: m, label: m }
+        const o = m as { id?: string; name?: string; model?: string; display_name?: string }
+        const value = o.id || o.name || o.model || ''
+        return { value, label: o.display_name || value }
+      })
+      .filter((o) => o.value)
     saveCachedModels(form.baseUrl, availableModels.value)
     toast(tFmt('providerForm.modelsFetched', { count: availableModels.value.length }))
   } catch (e) {
@@ -353,7 +370,7 @@ async function save() {
       <SettingsRow :title="t('providerForm.apiFormat')">
         <SegmentedControl v-model="form.apiFormat" :options="formatOptions" />
       </SettingsRow>
-      <SettingsRow v-if="showAuthScheme" :title="t('providerForm.authScheme')">
+      <SettingsRow v-if="isCustomProvider" :title="t('providerForm.authScheme')">
         <SegmentedControl v-model="form.authScheme" :options="authOptions" />
       </SettingsRow>
 
@@ -378,32 +395,34 @@ async function save() {
         <AppInput v-model="form.reviewModelSlot" placeholder="default" />
       </SettingsRow>
 
-      <button type="button" class="pf__adv" @click="showAdvanced = !showAdvanced">
-        {{ showAdvanced ? '▾' : '▸' }} {{ t('providerForm.advancedToggle') }}
-      </button>
-      <template v-if="showAdvanced">
-        <div class="pf__field">
-          <label>{{ t('providerForm.extraHeaders') }} extraHeaders</label>
-          <textarea
-            v-model="form.extraHeaders"
-            class="pf__json"
-            spellcheck="false"
-            placeholder='{"X-Title": "..."}'
-          ></textarea>
-        </div>
-        <div class="pf__field">
-          <label>{{ t('providerForm.modelCapabilities') }} modelCapabilities</label>
-          <textarea
-            v-model="form.modelCapabilities"
-            class="pf__json"
-            spellcheck="false"
-            placeholder='{"gpt-4o": {"context_window": 1000000}}'
-          ></textarea>
-        </div>
-        <div class="pf__field">
-          <label>{{ t('providerForm.requestOptions') }} requestOptions</label>
-          <textarea v-model="form.requestOptions" class="pf__json" spellcheck="false"></textarea>
-        </div>
+      <template v-if="isCustomProvider">
+        <button type="button" class="pf__adv" @click="showAdvanced = !showAdvanced">
+          {{ showAdvanced ? '▾' : '▸' }} {{ t('providerForm.advancedToggle') }}
+        </button>
+        <template v-if="showAdvanced">
+          <div class="pf__field">
+            <label>{{ t('providerForm.extraHeaders') }} extraHeaders</label>
+            <textarea
+              v-model="form.extraHeaders"
+              class="pf__json"
+              spellcheck="false"
+              placeholder='{"X-Title": "..."}'
+            ></textarea>
+          </div>
+          <div class="pf__field">
+            <label>{{ t('providerForm.modelCapabilities') }} modelCapabilities</label>
+            <textarea
+              v-model="form.modelCapabilities"
+              class="pf__json"
+              spellcheck="false"
+              placeholder='{"gpt-4o": {"context_window": 1000000}}'
+            ></textarea>
+          </div>
+          <div class="pf__field">
+            <label>{{ t('providerForm.requestOptions') }} requestOptions</label>
+            <textarea v-model="form.requestOptions" class="pf__json" spellcheck="false"></textarea>
+          </div>
+        </template>
       </template>
 
       <div v-if="error" class="pf__error">{{ error }}</div>

@@ -1,11 +1,13 @@
 <script setup lang="ts">
-// 可输入下拉框:保留自由输入(自定义模型 id),同时把 options(获取到的模型)
-// 作为下拉选项,点选即填入。面板锚定输入框下沿、固定高度可滚,点外/Esc 关闭。
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+// 可输入下拉框:保留自由输入(自定义值),同时把 options 作为下拉选项点选即填。
+// 选项支持 string 或 {value,label}:显示 label、存 value(如 Gemini 模型显示
+// displayName 但存原始 model id)。string 选项等价 {value:s,label:s},向后兼容。
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import IconChevronDown from '~icons/lucide/chevron-down'
 
+type Opt = { value: string; label: string }
 const props = withDefaults(
-  defineProps<{ options?: string[]; placeholder?: string }>(),
+  defineProps<{ options?: Array<string | Opt>; placeholder?: string }>(),
   { options: () => [], placeholder: '' },
 )
 const model = defineModel<string>({ default: '' })
@@ -14,20 +16,38 @@ const emit = defineEmits<{ select: [value: string] }>()
 const open = ref(false)
 const root = ref<HTMLElement>()
 
-// 输入为空 / 已选中某选项时列全部;正在键入部分文本时按其过滤候选
+const opts = computed<Opt[]>(() =>
+  (props.options || []).map((o) => (typeof o === 'string' ? { value: o, label: o } : o)),
+)
+// 输入框显示文本:选中项显示其 label, 否则显示原始值(自定义/未匹配)
+const text = ref('')
+function syncText() {
+  text.value = opts.value.find((o) => o.value === model.value)?.label ?? model.value
+}
+// model 外部变化(预填/缓存)或 options(label)到达后刷新显示文本
+watch([() => model.value, opts], syncText, { immediate: true })
+
+// 输入为空 / 文本等于某选项 label → 列全部;键入部分文本时按 label 过滤
 const filtered = computed(() => {
-  const q = model.value.trim().toLowerCase()
-  if (!q || props.options.some((o) => o.toLowerCase() === q)) return props.options
-  return props.options.filter((o) => o.toLowerCase().includes(q))
+  const q = text.value.trim().toLowerCase()
+  if (!q || opts.value.some((o) => o.label.toLowerCase() === q)) return opts.value
+  return opts.value.filter((o) => o.label.toLowerCase().includes(q))
 })
 
-function pick(o: string) {
-  model.value = o
+function onInput(e: Event) {
+  const v = (e.target as HTMLInputElement).value
+  text.value = v
+  model.value = v // 自由输入 = 直接作为值
+  if (opts.value.length) open.value = true
+}
+function pick(o: Opt) {
+  model.value = o.value
+  text.value = o.label
   open.value = false
-  emit('select', o)
+  emit('select', o.value)
 }
 function onFocus() {
-  if (props.options.length) open.value = true
+  if (opts.value.length) open.value = true
 }
 function onDocPointer(e: PointerEvent) {
   if (open.value && root.value && !root.value.contains(e.target as Node)) open.value = false
@@ -49,18 +69,19 @@ onUnmounted(() => {
   <div ref="root" class="combo">
     <div class="combo__field" :class="{ open }">
       <input
-        v-model="model"
+        :value="text"
         class="combo__input"
         :placeholder="placeholder"
         autocomplete="off"
         spellcheck="false"
+        @input="onInput"
         @focus="onFocus"
       />
       <button
         type="button"
         class="combo__chevron"
         :class="{ open }"
-        :disabled="!options.length"
+        :disabled="!opts.length"
         :aria-label="open ? 'collapse' : 'expand'"
         @click="open = !open"
       >
@@ -70,13 +91,13 @@ onUnmounted(() => {
     <div v-if="open && filtered.length" class="combo__panel">
       <button
         v-for="o in filtered"
-        :key="o"
+        :key="o.value"
         type="button"
         class="combo__option"
-        :class="{ sel: o === model }"
+        :class="{ sel: o.value === model }"
         @click="pick(o)"
       >
-        {{ o }}
+        {{ o.label }}
       </button>
     </div>
   </div>
