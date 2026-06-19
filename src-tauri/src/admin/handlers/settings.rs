@@ -59,7 +59,9 @@ pub(super) fn default_config_value() -> Value {
            "showGrayProviders": false,
            "restoreCodexOnExit": true,
            "mcpCredentialsPortableStore": true,
-           "autoUnlockCodexPlugins": false,
+            // [MOC-257 review] **不**在默认配置里 seed legacy `autoUnlockCodexPlugins`(已废弃,三态取代)——
+            // 否则 normalize_imported_config 给缺该键的导入配置补 false,migrate 会把这个**生成的默认**当成用户
+            // 显式 opt-out 迁成 off,绕过「无真账号→synthetic」缺键默认。缺键 = migrate None = 走默认推导。
             "autoWakeCodexPet": true,
            "updateUrl": DEFAULT_UPDATE_URL
         }
