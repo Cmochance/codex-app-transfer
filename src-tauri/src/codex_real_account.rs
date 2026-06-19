@@ -938,20 +938,17 @@ pub fn has_real_account() -> bool {
     let active_real = read_auth(&paths.auth_json)
         .ok()
         .is_some_and(|v| is_real(&v));
-    // [MOC-257 review] 也认导入/钉住的镜像:活动被删 / 换成 apikey 时,真账号只在镜像里(import/pin
-    // 过、reconcile 会从它恢复)。否则只剩镜像的老用户 set(real) 被拒、默认推导降级 synthetic。
+    // [MOC-257 review] 也认导入/钉住的镜像 + 导入活源(source_path 还在 + 可读):活动被删 / 换成 apikey
+    // 时,真账号只在镜像或活源里(import/pin 过、reconcile 会从它恢复)。否则这些老用户 set(real) 被拒、
+    // 默认推导降级 synthetic。
     let mirror_real = read_imported_mirror(&paths).is_some_and(|v| is_real(&v));
-    active_real || mirror_real || real_account_stash_exists()
+    let source_real = read_imported_source_path(&paths)
+        .and_then(|sp| std::fs::read_to_string(&sp).ok())
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .is_some_and(|v| is_real(&v));
+    active_real || mirror_real || source_real || real_account_stash_exists()
 }
 
-/// [MOC-257] 真账号当前是否**实际可用**(供「real 档不可用则降级 synthetic」+ 前端展示)。
-/// 可用 = 活动 / 导入镜像 / stash 有真 chatgpt 账号(非合成、access/refresh 非空)、access_token 本地
-/// JWT 未过期、且**不是被服务端 401 撤销的那个 token**(指纹比对)。只读、无副作用。
-///
-/// [MOC-257 review] **不**盲目早返 `relogin_required()`(进程级粘滞标记)—— app 外重登换了新 token 后
-/// 标记一时未清会把新账号误降级。改逐 token 源直接判:本地过期由 `access_token_expired` 判;服务端撤销
-/// 由指纹比对(`access_token_fingerprint == REVOKED_TOKEN_FP`)判 —— token 已换则指纹不同、放行。真正清
-/// `relogin_required` 标记仍由 `detect()` 的指纹自愈在 startup / legacy status 路径做(这里只读)。
 /// [MOC-257 review] 一个 auth.json `Value` 是否是**当前可用的真实** chatgpt 账号:非合成、access/refresh
 /// 非空、不是被服务端 401 撤销的那个 token(指纹比对)、且 access_token 本地 JWT 未过期。只读、无副作用。
 /// 供 `real_account_usable`(降级判定)+ `restore_stashed_real_auth_impl`(活动是否比 stash 新/好)复用。
@@ -976,6 +973,11 @@ fn auth_value_real_and_usable(v: &Value) -> bool {
     !access_token_expired(access, chrono::Utc::now().timestamp())
 }
 
+/// [MOC-257] 真账号当前是否**实际可用**(供「real 档不可用则降级 synthetic」+ 前端展示)。可用 = 活动 /
+/// 导入活源 / 导入镜像 / stash 任一有可用真账号(`auth_value_real_and_usable`)。
+///
+/// [MOC-257 review] **不**盲目早返 `relogin_required()`(进程级粘滞标记)—— app 外重登换新 token 后标记
+/// 一时未清会误降级;改逐源直接判(过期 + 撤销指纹)。真正清标记由 `detect()` 的指纹自愈做(这里只读)。
 pub fn real_account_usable() -> bool {
     let Ok(paths) = CodexPaths::from_home_env() else {
         return false;
@@ -987,6 +989,16 @@ pub fn real_account_usable() -> bool {
     }
     if read_auth(&paths.auth_json)
         .ok()
+        .is_some_and(|v| auth_value_real_and_usable(&v))
+    {
+        return true;
+    }
+    // [MOC-257 review] 导入活源(source_path 还在 + 可读 + chatgpt + 可用)——对齐 reconcile_on_startup:
+    // 镜像快照过期但活源已被那边 Codex 刷新时不误降级(否则 degrade 后 real-only 的 reconcile 不跑、活源
+    // 永不被恢复)。
+    if read_imported_source_path(&paths)
+        .and_then(|sp| std::fs::read_to_string(&sp).ok())
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
         .is_some_and(|v| auth_value_real_and_usable(&v))
     {
         return true;
@@ -1021,20 +1033,29 @@ pub fn resolve_plugin_unlock_mode() -> PluginUnlockMode {
 
 /// [MOC-257 review] 把 `path`(若存在)改名归档到 `<app_home>/real-account/discarded-stash-<ns>.json`,
 /// 覆盖前留可恢复副本(**不直删** —— 可能是不同真账号,直删 = 丢账号,违反「覆盖前必备份」不变量)。
-/// 失败仅 warn 不阻断。`path` 不存在 → no-op。
-fn archive_existing_auth_file(paths: &CodexPaths, path: &std::path::Path) {
+/// 返回归档后 `path` 是否**已不存在**(`true` = 已移走 / 本就不存在 → 可安全覆盖;`false` = 归档失败、
+/// 文件仍在 → caller **不应**覆盖以免丢账号)。
+#[must_use]
+fn archive_existing_auth_file(paths: &CodexPaths, path: &std::path::Path) -> bool {
     if !path.is_file() {
-        return;
+        return true; // 本就不存在
     }
     let archive_dir = paths.app_home.join("real-account");
-    let _ = std::fs::create_dir_all(&archive_dir);
+    if let Err(e) = std::fs::create_dir_all(&archive_dir) {
+        tracing::warn!("[PluginUnlock] 建归档目录失败(保留旧文件不直删): {e}");
+        return false;
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let archived = archive_dir.join(format!("discarded-stash-{ts}.json"));
-    if let Err(e) = std::fs::rename(path, &archived) {
-        tracing::warn!("[PluginUnlock] 归档旧 auth 文件失败(保留不直删): {e}");
+    match std::fs::rename(path, &archived) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("[PluginUnlock] 归档旧 auth 文件失败(保留不直删): {e}");
+            false
+        }
     }
 }
 
@@ -1060,8 +1081,13 @@ pub async fn stash_displaced_real_auth() -> Result<(), String> {
     }
     // [MOC-257 review] stash 已存在另一真账号(A 已 stash → app 外 login B 成活动 → 再 stash B)→ 先归档
     // 旧 stash 再覆盖,否则 rename 直接顶掉 A 丢账号(macOS/Linux rename 静默替换);也兼顾 Windows
-    // (rename 目标存在会失败)。归档后 stash 必空,rename 安全。
-    archive_existing_auth_file(&paths, &stash);
+    // (rename 目标存在会失败)。**归档失败(旧 stash 仍在)→ 中止**,绝不 rename 覆盖丢掉账号 A。
+    if !archive_existing_auth_file(&paths, &stash) {
+        return Err(
+            "旧 stash 归档失败,已中止以免覆盖丢账号;请检查 ~/.codex-app-transfer 目录权限后重试"
+                .to_owned(),
+        );
+    }
     std::fs::rename(&paths.auth_json, &stash).map_err(|e| format!("移真账号到 stash 失败: {e}"))?;
     Ok(())
 }
@@ -1095,8 +1121,8 @@ fn restore_stashed_real_auth_impl(paths: &CodexPaths) -> Result<bool, String> {
         .is_some_and(|v| auth_value_real_and_usable(&v));
     if active_usable {
         // 活动已是更新且可用的真账号 → 不覆盖;stash 那份也是真账号(含 tokens),改名归档(不直删:
-        // 可能不同账号 → 直删丢账号),留可恢复副本。
-        archive_existing_auth_file(paths, &stash);
+        // 可能不同账号 → 直删丢账号),留可恢复副本。归档失败这里不阻断:活动 + stash 都保住、下次重试。
+        let _ = archive_existing_auth_file(paths, &stash);
         return Ok(false);
     }
     // 活动非可用真账号(synthetic / apikey / 过期残留)→ 删掉再 rename:Windows `rename` 目标已存在会
