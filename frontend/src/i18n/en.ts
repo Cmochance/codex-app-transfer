@@ -94,7 +94,6 @@ export default {
   "nav.guide": "Guide",
   "market.title": "Plugin Marketplace",
   "market.search": "Search connectors…",
-  "market.note": "Mirrored display data from OpenAI Codex's plugin directory. These are OpenAI-platform remote connectors — browse only.",
   "market.refresh": "Refresh",
   "market.loading": "Loading…",
   "market.loadFailed": "Failed to load",

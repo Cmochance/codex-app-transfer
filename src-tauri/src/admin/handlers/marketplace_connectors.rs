@@ -1,14 +1,17 @@
-//! 连接器市场(展示镜像)— 从私有 storage 仓库拉 registry.json + 图标代理(MOC-7 / phase2)。
+//! 连接器市场(多源)— 官方源(私有 storage 仓库镜像)+ 用户自加源,聚合展示(MOC-7 phase2)。
 //!
-//! 源:`Cmochance/codex-app-transfer-storage`(**private**,镜像自 OpenAI Codex 插件目录的展示
-//! 数据)。前端无法直连私有仓库,故后端持 token 代拉 + 缓存。token 解析顺序:
-//! 1. build-baked `CODEX_APP_TRANSFER_STORAGE_TOKEN`(release 时 build.rs/CI 注入)
-//! 2. 运行时 env `CODEX_APP_TRANSFER_STORAGE_TOKEN`
-//! 3. dev 文件 `~/.codex-app-transfer/storage_token`(只读 PAT,本机开发用)
+//! - **官方源**:`Cmochance/codex-app-transfer-storage`(private),走 GitHub contents API + token。
+//! - **自加源**:用户加的公开 `registry.json` URL(同 `{connectors,categories}` schema),直取。
+//! token 解析:build-baked `CODEX_APP_TRANSFER_STORAGE_TOKEN` → 运行时 env → `~/.codex-app-transfer/storage_token`。
 //!
-//! - `GET /api/marketplace/connectors` → registry.json(内存缓存 30min)
-//! - `GET /api/marketplace/icon?path=icons/<f>.png` → 图标原始字节(磁盘缓存,路径白名单 icons/)
+//! - `GET  /api/marketplace/connectors`       → 聚合所有启用源(返 sources[含 count] + connectors + categories + errors)
+//! - `GET  /api/marketplace/sources`          → 源列表(管理用)
+//! - `POST /api/marketplace/sources/add`      → 加自加源 {name,url}
+//! - `POST /api/marketplace/sources/remove`   → 删自加源 {id}(官方源不可删)
+//! - `POST /api/marketplace/sources/toggle`   → 启用/停用 {id,enabled}
+//! - `GET  /api/marketplace/icon?source=&path=` → 图标代理(官方走 token+icons/;自加源走其 base)
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -19,12 +22,15 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use super::common::err;
 
 const STORAGE_REPO: &str = "Cmochance/codex-app-transfer-storage";
 const REGISTRY_PATH: &str = "registry.json";
+const SOURCES_FILE: &str = "marketplace-connector-sources.json";
+const OFFICIAL_ID: &str = "official";
 const CACHE_TTL: Duration = Duration::from_secs(60 * 30);
 
 /// home 目录(对齐 src-tauri 其它处:`HOME` → `USERPROFILE`,不引 `dirs` crate)。
@@ -35,7 +41,7 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// token:build-baked → 运行时 env → dev 文件。任一非空即用。
+/// 官方源 token:build-baked → 运行时 env → dev 文件。任一非空即用。
 fn storage_token() -> Option<String> {
     if let Some(t) = option_env!("CODEX_APP_TRANSFER_STORAGE_TOKEN") {
         if !t.is_empty() {
@@ -57,17 +63,88 @@ fn storage_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// GitHub contents API 取私有仓库 raw 文件字节(`Accept: application/vnd.github.raw`)。
-/// 注:GitHub raw 响应 content-type 恒为 `application/vnd.github.raw`(非具体 mime),故调用方
-/// 不依赖响应 content-type、按端点语义自定(registry=json / icon=png)。
-async fn fetch_raw(token: &str, path: &str) -> Result<Vec<u8>, String> {
-    let url = format!("https://api.github.com/repos/{STORAGE_REPO}/contents/{path}");
-    let client = reqwest::Client::builder()
+fn client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("reqwest build: {e}"))?;
-    let resp = client
+        .map_err(|e| format!("reqwest build: {e}"))
+}
+
+// ── Sources store ───────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ConnectorSource {
+    id: String,
+    /// 自加源:用户填的名字;官方源留空(前端按 `official` 用 i18n「官方源」渲染)。
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    official: bool,
+}
+fn yes() -> bool {
+    true
+}
+
+fn official_source() -> ConnectorSource {
+    ConnectorSource {
+        id: OFFICIAL_ID.to_string(),
+        name: String::new(),
+        url: None,
+        enabled: true,
+        official: true,
+    }
+}
+
+fn sources_path() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".codex-app-transfer").join(SOURCES_FILE))
+}
+
+/// 读源列表(官方源恒在,首次/缺失自动置顶补回)。
+fn read_sources() -> Vec<ConnectorSource> {
+    let mut list: Vec<ConnectorSource> = sources_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if !list.iter().any(|s| s.id == OFFICIAL_ID) {
+        list.insert(0, official_source());
+    }
+    list
+}
+
+fn write_sources(list: &[ConnectorSource]) -> Result<(), String> {
+    let p = sources_path().ok_or("HOME 未设置")?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let body = serde_json::to_string_pretty(list).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(p, body).map_err(|e| format!("write: {e}"))
+}
+
+/// 自加源 id:对 url 做字符净化(稳定 + 同 url 唯一)。
+fn source_id_from_url(url: &str) -> String {
+    let slug: String = url
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("src_{}", &slug[..slug.len().min(48)])
+}
+
+// ── fetch + 每源 body 缓存 ───────────────────────────────────────────────────
+
+fn body_cache() -> &'static Mutex<HashMap<String, (Instant, String)>> {
+    static C: OnceLock<Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// GitHub contents API 取私有仓库 raw 文件(`Accept: application/vnd.github.raw`)。
+async fn fetch_official(token: &str, path: &str) -> Result<Vec<u8>, String> {
+    let url = format!("https://api.github.com/repos/{STORAGE_REPO}/contents/{path}");
+    let resp = client()?
         .get(&url)
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::ACCEPT, "application/vnd.github.raw")
@@ -75,90 +152,292 @@ async fn fetch_raw(token: &str, path: &str) -> Result<Vec<u8>, String> {
         .send()
         .await
         .map_err(|e| format!("fetch: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("github {} for {path}", status.as_u16()));
+    if !resp.status().is_success() {
+        return Err(format!("github {} for {path}", resp.status().as_u16()));
     }
     resp.bytes()
         .await
         .map(|b| b.to_vec())
-        .map_err(|e| format!("read body: {e}"))
+        .map_err(|e| format!("read: {e}"))
 }
 
-fn registry_cache() -> &'static Mutex<Option<(Instant, String)>> {
-    static C: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(None))
+/// 公开 URL 直取(自加源 registry / 图标)。
+async fn fetch_public(url: &str) -> Result<Vec<u8>, String> {
+    let resp = client()?
+        .get(url)
+        .header(header::USER_AGENT, "codex-app-transfer")
+        .send()
+        .await
+        .map_err(|e| format!("fetch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("http {} for {url}", resp.status().as_u16()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("read: {e}"))
 }
 
-/// `GET /api/marketplace/connectors` — 私有 storage 仓库的 registry.json(连接器展示目录),内存缓存 30min。
-pub async fn connectors() -> impl IntoResponse {
-    {
-        let c = registry_cache().lock().unwrap();
-        if let Some((at, body)) = c.as_ref() {
+/// 取某源 registry 文本(走缓存,除非 force)。
+async fn source_registry(src: &ConnectorSource, force: bool) -> Result<String, String> {
+    if !force {
+        if let Some((at, body)) = body_cache().lock().unwrap().get(&src.id) {
             if at.elapsed() < CACHE_TTL {
-                return ([(header::CONTENT_TYPE, "application/json")], body.clone())
-                    .into_response();
+                return Ok(body.clone());
             }
         }
     }
-    let Some(token) = storage_token() else {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
+    let bytes = if src.official {
+        let token = storage_token().ok_or(
             "storage token 未配置(env CODEX_APP_TRANSFER_STORAGE_TOKEN 或 ~/.codex-app-transfer/storage_token)",
-        )
-        .into_response();
+        )?;
+        fetch_official(&token, REGISTRY_PATH).await?
+    } else {
+        let url = src.url.as_deref().ok_or("源缺 url")?;
+        fetch_public(url).await?
     };
-    match fetch_raw(&token, REGISTRY_PATH).await {
-        Ok(bytes) => {
-            let body = String::from_utf8_lossy(&bytes).to_string();
-            *registry_cache().lock().unwrap() = Some((Instant::now(), body.clone()));
-            ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    body_cache()
+        .lock()
+        .unwrap()
+        .insert(src.id.clone(), (Instant::now(), text.clone()));
+    Ok(text)
+}
+
+// ── Connectors 聚合 ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ConnectorsQuery {
+    #[serde(default)]
+    pub force_refresh: bool,
+}
+
+/// `GET /api/marketplace/connectors` — 聚合所有启用源。
+pub async fn connectors(Query(q): Query<ConnectorsQuery>) -> impl IntoResponse {
+    let sources = read_sources();
+    let mut connectors: Vec<Value> = Vec::new();
+    let mut categories: Vec<String> = Vec::new();
+    let mut source_meta: Vec<Value> = Vec::new();
+    let mut errors = serde_json::Map::new();
+
+    for s in &sources {
+        if !s.enabled {
+            source_meta.push(
+                json!({"id": s.id, "name": s.name, "official": s.official, "enabled": false, "count": 0}),
+            );
+            continue;
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, e).into_response(),
+        let before = connectors.len();
+        match source_registry(s, q.force_refresh).await {
+            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(reg) => {
+                    if let Some(arr) = reg.get("connectors").and_then(|v| v.as_array()) {
+                        for c in arr {
+                            let mut c = c.clone();
+                            if let Some(obj) = c.as_object_mut() {
+                                obj.insert("source".to_string(), json!(s.id));
+                                if let Some(cat) = obj.get("category").and_then(|v| v.as_str()) {
+                                    let cat = cat.to_string();
+                                    if !categories.contains(&cat) {
+                                        categories.push(cat);
+                                    }
+                                }
+                            }
+                            connectors.push(c);
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.insert(s.id.clone(), json!(format!("parse: {e}")));
+                }
+            },
+            Err(e) => {
+                errors.insert(s.id.clone(), json!(e));
+            }
+        }
+        source_meta.push(json!({
+            "id": s.id, "name": s.name, "official": s.official,
+            "enabled": true, "count": connectors.len() - before,
+        }));
+    }
+
+    Json(json!({
+        "sources": source_meta,
+        "connectors": connectors,
+        "categories": categories,
+        "errors": errors,
+    }))
+    .into_response()
+}
+
+// ── Sources 管理 ─────────────────────────────────────────────────────────────
+
+pub async fn sources() -> impl IntoResponse {
+    let list: Vec<Value> = read_sources()
+        .iter()
+        .map(|s| json!({"id": s.id, "name": s.name, "url": s.url, "enabled": s.enabled, "official": s.official}))
+        .collect();
+    Json(json!({"sources": list})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct AddSourceInput {
+    pub name: String,
+    pub url: String,
+}
+
+pub async fn add_source(Json(input): Json<AddSourceInput>) -> impl IntoResponse {
+    let name = input.name.trim().to_string();
+    let url = input.url.trim().to_string();
+    if name.is_empty() || url.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "name 跟 url 都必填").into_response();
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return err(StatusCode::BAD_REQUEST, "url 必须 http(s)").into_response();
+    }
+    let mut list = read_sources();
+    let id = source_id_from_url(&url);
+    if list.iter().any(|s| s.id == id) {
+        return err(StatusCode::BAD_REQUEST, "该源已存在").into_response();
+    }
+    list.push(ConnectorSource {
+        id,
+        name,
+        url: Some(url),
+        enabled: true,
+        official: false,
+    });
+    match write_sources(&list) {
+        Ok(()) => Json(json!({"success": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
 #[derive(Deserialize)]
-pub struct IconQuery {
-    pub path: String,
+pub struct SourceIdInput {
+    pub id: String,
 }
 
-/// `GET /api/marketplace/icon?path=icons/<f>.png` — 图标代理(路径白名单 `icons/` + 磁盘缓存)。
-pub async fn icon(Query(q): Query<IconQuery>) -> impl IntoResponse {
-    let path = q.path;
-    // 路径白名单:仅 `icons/` 下的**单层 .png**(registry 里图标都是 `icons/<id>.png` 扁平布局)。
-    // 收紧到 .png + 单 `/` 段 —— 防目录穿越、也防经此端点读 storage 仓库的非图标文件。
-    // axum Query 已 percent-decode,故编码后的 `..` 也会被这里的检查命中。
-    let valid = path.starts_with("icons/")
-        && path.ends_with(".png")
-        && path.matches('/').count() == 1
-        && !path.contains("..");
-    if !valid {
-        return err(StatusCode::BAD_REQUEST, "invalid icon path").into_response();
+pub async fn remove_source(Json(input): Json<SourceIdInput>) -> impl IntoResponse {
+    if input.id == OFFICIAL_ID {
+        return err(StatusCode::BAD_REQUEST, "官方源不可删").into_response();
     }
+    let mut list = read_sources();
+    let before = list.len();
+    list.retain(|s| s.id != input.id || s.official);
+    if list.len() == before {
+        return err(StatusCode::NOT_FOUND, "源不存在").into_response();
+    }
+    body_cache().lock().unwrap().remove(&input.id);
+    match write_sources(&list) {
+        Ok(()) => Json(json!({"success": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ToggleSourceInput {
+    pub id: String,
+    pub enabled: bool,
+}
+
+pub async fn toggle_source(Json(input): Json<ToggleSourceInput>) -> impl IntoResponse {
+    let mut list = read_sources();
+    let mut found = false;
+    for s in list.iter_mut() {
+        if s.id == input.id {
+            s.enabled = input.enabled;
+            found = true;
+        }
+    }
+    if !found {
+        return err(StatusCode::NOT_FOUND, "源不存在").into_response();
+    }
+    match write_sources(&list) {
+        Ok(()) => Json(json!({"success": true})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// ── Icon 代理 ────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct IconQuery {
+    pub path: String,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// 把图标 path 解析成可取的 URL:绝对 URL 原样;相对则按源 registry url 的目录拼接。
+fn resolve_icon_url(base: &str, path: &str) -> String {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return path.to_string();
+    }
+    let dir = base.rsplit_once('/').map(|(d, _)| d).unwrap_or(base);
+    format!("{}/{}", dir, path.trim_start_matches('/'))
+}
+
+/// `GET /api/marketplace/icon?source=&path=` — 图标代理 + 磁盘缓存。
+/// 官方源(source 缺省 / `official`):path 限 `icons/<f>.png`,走 token。
+/// 自加源:按该源 registry url 解析 path(绝对或相对),公开直取。
+pub async fn icon(Query(q): Query<IconQuery>) -> impl IntoResponse {
+    let source = q.source.unwrap_or_else(|| OFFICIAL_ID.to_string());
+    let path = q.path;
+
+    let cache_key = format!("{source}|{path}");
     let cache_file = home_dir().map(|h| {
         h.join(".codex-app-transfer")
             .join("marketplace-cache")
-            .join(path.replace('/', "_"))
+            .join(
+                cache_key
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect::<String>(),
+            )
     });
     if let Some(cf) = &cache_file {
         if let Ok(bytes) = std::fs::read(cf) {
             return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
         }
     }
-    let Some(token) = storage_token() else {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "storage token 未配置").into_response();
+
+    let fetched = if source == OFFICIAL_ID {
+        // 官方源:仅 icons/ 下单层 .png(防穿越 + 防读非图标文件),走 token。
+        if !path.starts_with("icons/")
+            || !path.ends_with(".png")
+            || path.matches('/').count() != 1
+            || path.contains("..")
+        {
+            return err(StatusCode::BAD_REQUEST, "invalid icon path").into_response();
+        }
+        let Some(token) = storage_token() else {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "storage token 未配置").into_response();
+        };
+        fetch_official(&token, &path).await
+    } else {
+        // 自加源:按该源 url 解析 path(用户自配的源,本地 app 内 SSRF 风险可接受)。
+        let sources = read_sources();
+        let Some(src) = sources.iter().find(|s| s.id == source) else {
+            return err(StatusCode::NOT_FOUND, "unknown source").into_response();
+        };
+        let Some(base) = src.url.as_deref() else {
+            return err(StatusCode::BAD_REQUEST, "source 无 url").into_response();
+        };
+        let target = resolve_icon_url(base, &path);
+        if !target.starts_with("http://") && !target.starts_with("https://") {
+            return err(StatusCode::BAD_REQUEST, "invalid icon url").into_response();
+        }
+        fetch_public(&target).await
     };
-    match fetch_raw(&token, &path).await {
-        // 路径已限定 .png,200 即图标字节;统一回 image/png(GitHub raw content-type 不具体)。
+
+    match fetched {
         Ok(bytes) => {
             if let Some(cf) = &cache_file {
                 if let Some(parent) = cf.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                // 缓存是优化非正确性,写失败软降级(回退到每次 fetch),但不静默 —— 留痕便于排查。
                 if let Err(e) = std::fs::write(cf, &bytes) {
-                    tracing::debug!("marketplace icon cache write failed for {path}: {e}");
+                    tracing::debug!("marketplace icon cache write failed for {cache_key}: {e}");
                 }
             }
             ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()

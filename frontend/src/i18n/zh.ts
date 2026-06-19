@@ -104,7 +104,6 @@ export default {
   "nav.guide": "引导",
   "market.title": "插件市场",
   "market.search": "搜索连接器…",
-  "market.note": "镜像自 OpenAI Codex 插件目录的展示数据。这些是 OpenAI 平台的远程连接器,此处仅供浏览。",
   "market.refresh": "刷新",
   "market.loading": "加载中…",
   "market.loadFailed": "加载失败",
