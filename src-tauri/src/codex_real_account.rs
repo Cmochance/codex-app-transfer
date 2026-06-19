@@ -1290,9 +1290,13 @@ fn restore_stashed_real_auth_impl(paths: &CodexPaths) -> Result<bool, String> {
     // [MOC-257 review] 活动是否「更新且**可用**的真账号」——必须含过期/撤销判定:活动只是**过期的**真
     // chatgpt 残留(auth_mode=chatgpt、tokens 在但已过期)时,不能当成「更新真账号」把有效的 stash 归档掉、
     // 回退到过期 active(切 real 会失败)。用 `auth_value_real_and_usable`(非合成 + 非空 + 未撤销 + 未过期)。
-    let active_usable = read_auth(&paths.auth_json)
-        .ok()
-        .is_some_and(|v| auth_value_real_and_usable(&v));
+    // [MOC-257 review] 必须是 **auth_mode=chatgpt** 的可用真账号才算「活动已还原、可跳过 stash」。apikey-with-
+    // tokens(退出/启动/手动 restore 重放的旧快照里 apikey 模式 + 残留 chatgpt tokens)虽 tokens 可用、但 Codex
+    // 不当作 chatgpt(插件不可用)→ 仍要还原 stash 里更新的 chatgpt 登录,否则归档掉 stash、留 apikey 模式。
+    let active_usable = read_auth(&paths.auth_json).ok().is_some_and(|v| {
+        v.get("auth_mode").and_then(Value::as_str) == Some("chatgpt")
+            && auth_value_real_and_usable(&v)
+    });
     if active_usable {
         // 活动已是更新且可用的真账号 → 不覆盖;stash 那份也是真账号(含 tokens),改名归档(不直删:
         // 可能不同账号 → 直删丢账号),留可恢复副本。归档失败这里不阻断:活动 + stash 都保住、下次重试。
@@ -1453,13 +1457,21 @@ pub fn start_login() -> Result<(), String> {
         g.last = match result {
             Ok(out) if out.status.success() => {
                 clear_relogin_state(); // [MOC-124 H-2] 登录成功 = 拿到新鲜账号,清失效标记 + 撤销指纹
-                                       // [MOC-257 review] 登录成功后**后端立即 pin** 当前账号进镜像,不依赖前端轮询(页面关 / app
-                                       // 退出来不及看到 succeeded 时账号没进 mirror、退出 restore 重放登录前快照会抹掉它)。失败留痕
-                                       // (前端成功路径仍会再 pin 一次兜底)。
-                if let Err(e) = pin_current_account_blocking() {
-                    tracing::warn!("[RealAccount] 登录成功后后端 pin 账号失败(前端会重试): {e}");
+                                       // [MOC-257 review] 登录成功后**后端立即 pin** 当前账号进镜像,不依赖前端轮询(页面关 / app 退出
+                                       // 来不及看到 succeeded 时账号没进 mirror、退出 restore 重放登录前快照会抹掉它)。**pin 失败报
+                                       // Failed**(不报 Succeeded):账号没进 mirror、撑不过退出 restore → 让用户(前端在场时)看到错误、
+                                       // 修 ~/.codex-app-transfer 权限后重试,而非静默 Succeeded 让后续应用一个会丢的账号。对齐前端 block。
+                match pin_current_account_blocking() {
+                    Ok(()) => LoginState::Succeeded,
+                    Err(e) => {
+                        tracing::error!(
+                            "[RealAccount] 登录成功但 pin 账号失败,报 Failed 让用户重试: {e}"
+                        );
+                        LoginState::Failed(format!(
+                            "登录成功,但账号持久化失败(请检查 ~/.codex-app-transfer 目录权限后重试): {e}"
+                        ))
+                    }
                 }
-                LoginState::Succeeded
             }
             Ok(out) => {
                 if g.cancel_requested {
