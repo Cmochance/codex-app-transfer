@@ -433,6 +433,27 @@ pub async fn apply_plugin_unlock_mode(
 ) -> Result<(), String> {
     use crate::codex_real_account as ra;
     use crate::codex_real_account::PluginUnlockMode as M;
+    // [MOC-257 P1 review] synthetic/real 写 auth 之前先**捕获原始 ~/.codex 快照**(若还没有)。否则首次
+    // apply 时,合成/真 auth 先写入,直到 ensure_relay_applied→apply_provider 才取快照 → 快照把合成 auth
+    // 当成「用户原始态」,退出 restore 还原成合成 → standalone Codex 拿假凭据撞 chatgpt.com(P1)。
+    // `snapshot_codex_state` 幂等(`has_snapshot` 已有则不覆盖);OFF 不写 auth(stash + restore 兜底),无需。
+    if matches!(mode, M::Synthetic | M::Real) {
+        if let Ok(paths) = CodexPaths::from_home_env() {
+            if !codex_app_transfer_codex_integration::has_snapshot(&paths) {
+                let pname = load_registry()
+                    .ok()
+                    .map(|c| active_provider_name(&c))
+                    .unwrap_or_default();
+                if let Err(e) = codex_app_transfer_codex_integration::snapshot_codex_state(
+                    &paths,
+                    APP_VERSION,
+                    &pname,
+                ) {
+                    tracing::error!("[PluginUnlock] 写解锁 auth 前捕获原始快照失败: {e}");
+                }
+            }
+        }
+    }
     let result = match mode {
         M::Off => {
             // 真账号 stash 走、合成残留清 → 确保 ~/.codex 无 auth.json(用户硬性要求);proxy 不伪造。
