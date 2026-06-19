@@ -83,7 +83,13 @@ pub async fn desktop_clear() -> impl IntoResponse {
         .into_response();
     }
     match restore_codex_state(&paths) {
-        Ok(restored) => Json(json!({"success": true, "restored": restored})).into_response(),
+        Ok(restored) => {
+            // [MOC-257 review] 还原原配置后已无解锁态(合成/真 auth + relay 都清了)→ 重置「最近生效」标记
+            // + 关伪造,否则 status 仍报陈旧 last_applied 档、前端 no-op 点不动。
+            crate::codex_real_account::reset_applied_mode();
+            codex_app_transfer_proxy::set_fake_account_mode(false);
+            Json(json!({"success": true, "restored": restored})).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -106,13 +112,18 @@ pub async fn desktop_restore(Json(payload): Json<DesktopRestoreRequest>) -> impl
     };
     let snapshot_id = payload.snapshot_id.unwrap_or_default();
     match restore_codex_snapshot(&paths, &snapshot_id, payload.cleanup_all) {
-        Ok(restored) => Json(json!({
-            "success": true,
-            "restored": restored,
-            "snapshotId": if snapshot_id.is_empty() { Value::Null } else { Value::String(snapshot_id) },
-            "cleanupAll": payload.cleanup_all,
-        }))
-        .into_response(),
+        Ok(restored) => {
+            // [MOC-257 review] 同 desktop_clear:还原快照后无解锁态 → 重置「最近生效」+ 关伪造。
+            crate::codex_real_account::reset_applied_mode();
+            codex_app_transfer_proxy::set_fake_account_mode(false);
+            Json(json!({
+                "success": true,
+                "restored": restored,
+                "snapshotId": if snapshot_id.is_empty() { Value::Null } else { Value::String(snapshot_id) },
+                "cleanupAll": payload.cleanup_all,
+            }))
+            .into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

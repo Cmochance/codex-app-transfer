@@ -1074,6 +1074,12 @@ pub fn record_applied_mode(mode: PluginUnlockMode) {
     LAST_APPLIED_MODE.store(v, Ordering::SeqCst);
 }
 
+/// [MOC-257 review] 清「最近生效」标记 → 未 apply 态。手动「还原 Codex 原配置」(desktop_clear/restore)
+/// 移除了合成/真 auth + relay,生效态已不是任何解锁档 → 重置,否则 status 报陈旧档、前端 no-op 点不动。
+pub fn reset_applied_mode() {
+    LAST_APPLIED_MODE.store(0, Ordering::SeqCst);
+}
+
 /// 最近成功 apply 的生效模式;还没 apply 过(启动前)→ `None`(caller 回退 `resolve`)。
 pub fn last_applied_mode() -> Option<PluginUnlockMode> {
     match LAST_APPLIED_MODE.load(Ordering::SeqCst) {
