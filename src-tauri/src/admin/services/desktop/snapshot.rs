@@ -449,7 +449,12 @@ pub async fn apply_plugin_unlock_mode(
                 APP_VERSION,
                 &pname,
             ) {
-                tracing::error!("[PluginUnlock] 改 ~/.codex 前捕获原始快照失败: {e}");
+                // [MOC-257 P1 review] 无既有快照 + 捕获失败(快照目录不可写而 ~/.codex 仍可写)→ **abort 不
+                // mutate**:否则下面 OFF clear / synthetic 覆写会改 ~/.codex 却无快照可还原(原 apikey /
+                // OPENAI_API_KEY 永久丢失)。宁可这次切换失败,也不毁原配置。
+                return Err(format!(
+                    "无法捕获 Codex 原配置快照,已中止切换以免丢失原配置(请检查 ~/.codex-app-transfer 目录权限): {e}"
+                ));
             }
         }
     }
@@ -477,19 +482,23 @@ pub async fn apply_plugin_unlock_mode(
             // proxy 伪造开;apply relay。**事务化**:activate / relay 任一失败都回滚(还原 stash 真账号回活动
             // 覆盖合成 / 无真账号则清掉合成)+ 关伪造,让 caller(set/add/tray/startup)无需各自清半生效态。
             ra::stash_displaced_real_auth().await?;
+            // [MOC-257 review] 事务字节快照(stash 后的活动:真账号已移走、剩 apikey / 空)。activate 覆写
+            // 成合成,失败回滚:还原它(恢复原 apikey)+ 还原 stash 真账号(若有,覆盖 apikey)。否则从
+            // apikey 切 synthetic 失败时下面只清合成 → 原 apikey 丢(stash 不收 apikey)。
+            let pre_synth = ra::snapshot_active_auth_bytes();
             if let Err(e) = ra::activate_fake_account().await {
                 tracing::error!("[PluginUnlock] synthetic activate 失败,回滚: {e}");
+                ra::restore_active_auth_bytes(pre_synth);
                 let _ = ra::restore_stashed_real_auth().await;
                 return Err(e);
             }
             codex_app_transfer_proxy::set_fake_account_mode(true);
             if let Err(e) = ensure_relay_applied(state).await {
                 // relay 没装上 → 别留「合成 active + 伪造开但无 relay」(Codex 直连 chatgpt.com 撞 401)。
+                // 还原原活动(apikey)+ stash 真账号(若有);保 gateway key,不丢原 apikey 配置。
                 codex_app_transfer_proxy::set_fake_account_mode(false);
-                let restored = ra::restore_stashed_real_auth().await.unwrap_or(false);
-                if !restored && ra::active_is_synthetic() {
-                    let _ = ra::clear_active_auth_file().await; // 无真账号可还原 + 仍合成 → 清掉
-                }
+                ra::restore_active_auth_bytes(pre_synth);
+                let _ = ra::restore_stashed_real_auth().await;
                 return Err(e);
             }
             Ok(())
