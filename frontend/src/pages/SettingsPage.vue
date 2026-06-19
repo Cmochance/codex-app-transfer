@@ -92,7 +92,9 @@ const mcpCredentialsPortableStore = toggle('mcpCredentialsPortableStore', true)
 
 // [MOC-257 三态] 插件解锁三态(关闭/模拟账号/真实账号):非普通 settings 键,调专用 set 端点
 // (写/移走 auth.json + apply relay + 驱动 proxy 伪造)。受控:高亮跟服务端,失败回滚 + toast。
-const pluginUnlockMode = ref<PluginUnlockMode>('synthetic')
+// null = 后端未 apply 过(启动跳过 / 首次)→ SegmentedControl 不高亮,点任一档都触发 apply(否则
+// 高亮某档时再点它 no-op、永远应用不上,见 review)。
+const pluginUnlockMode = ref<PluginUnlockMode | null>(null)
 const pluginUnlockBusy = ref(false)
 const pluginUnlockOptions: { value: PluginUnlockMode; label: string }[] = [
   { value: 'off', label: t('settings.pluginUnlockOff') },
@@ -407,9 +409,9 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       </SettingsRow>
       <SettingsRow :title="t('settings.pluginUnlock')" :description="t('settings.pluginUnlockHint')">
         <SegmentedControl
-          :model-value="pluginUnlockMode"
+          :model-value="pluginUnlockMode ?? undefined"
           :options="pluginUnlockOptions"
-          @update:model-value="onSetPluginUnlockMode"
+          @update:model-value="(m) => onSetPluginUnlockMode(m as PluginUnlockMode)"
         />
       </SettingsRow>
       <SettingsRow :title="t('settings.autoWakeCodexPet')" :description="t('settings.autoWakeCodexPetHint')">

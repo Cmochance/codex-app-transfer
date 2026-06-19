@@ -144,8 +144,8 @@ export function openTraceViewer() {
 export type PluginUnlockMode = 'off' | 'synthetic' | 'real'
 
 export interface PluginUnlockStatus {
-  /** 当前**生效**三态(持久值优先,缺失按真账号推导;real 失效会降级 synthetic) */
-  mode: PluginUnlockMode
+  /** 最近成功 apply 的**实际生效**三态;**null = 未 apply 过**(启动跳过 / 首次,~/.codex 是 restore 后原态) */
+  mode: PluginUnlockMode | null
   /** 持久值(用户是否手动设过);null = 未设、走默认推导 */
   persisted: PluginUnlockMode | null
   /** 本地是否有真账号(活动或 stash,含失效的) */
@@ -158,14 +158,14 @@ export interface PluginUnlockStatus {
 
 export async function getPluginUnlockStatus(): Promise<PluginUnlockStatus> {
   const r = await api<{
-    mode?: PluginUnlockMode
+    mode?: PluginUnlockMode | null
     persisted?: PluginUnlockMode | null
     hasRealAccount?: boolean
     realAccountUsable?: boolean
     activeIsSynthetic?: boolean
   }>('GET', '/api/desktop/plugin-unlock/status')
   return {
-    mode: r.mode ?? 'synthetic',
+    mode: r.mode ?? null,
     persisted: r.persisted ?? null,
     hasRealAccount: !!r.hasRealAccount,
     realAccountUsable: !!r.realAccountUsable,

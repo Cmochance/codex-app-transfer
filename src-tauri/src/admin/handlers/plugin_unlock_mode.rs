@@ -26,11 +26,12 @@ use super::common::err;
 pub async fn status_handler() -> impl IntoResponse {
     Json(json!({
         "success": true,
-        // [MOC-257 review] 当前**实际生效**三态 = 最近成功 apply 的模式(回退 resolve)。**不**直接报
-        // resolve:外部 codex login 等会让 resolve 升级(synthetic→real)但未 apply,proxy 伪造态仍旧,
-        // 报 resolve 会让 UI 显示 Real 却仍 fabricate /backend-api。报 last-applied 才与实际行为一致。
-        "mode": codex_real_account::last_applied_mode()
-            .unwrap_or_else(codex_real_account::resolve_plugin_unlock_mode),
+        // [MOC-257 review] 当前**实际生效**三态 = 最近成功 apply 的模式;**未 apply 过 → null**(不回退
+        // resolve)。① 报 last-applied 而非 resolve:外部 codex login 让 resolve 升级但未 apply 时,报
+        // resolve 会显示 Real 却仍 fabricate。② null(而非 resolve)用于「启动跳过 apply」(autoApplyOnStart
+        // =false / 无 provider):此时 ~/.codex 是 restore 后的原态、未应用任何解锁档,报某档=已生效会让前端
+        // re-select 同档 no-op、永远点不动;报 null → SegmentedControl 不高亮,点任一档都会 apply。
+        "mode": codex_real_account::last_applied_mode(),
         // resolve 推导出的「应当生效」模式(与 mode 不同 = 有待 apply 的升级,如外部登录后)。
         "resolved": codex_real_account::resolve_plugin_unlock_mode(),
         // 持久值(用户是否手动设过);null = 未设、走默认推导。
