@@ -142,6 +142,31 @@ const isGrokWeb = computed(
   () => form.authScheme === 'grok_cookie' || form.apiFormat === 'grok_web',
 )
 
+// 小米账号登录:仅 Xiaomi MiMo Token Plan 的【已存】provider(登录按 provider id 落 mimoCookie),
+// 用于在 Codex 用量面板显示套餐额度。放编辑页底部。
+const mimoLoggedIn = ref(false)
+const mimoLoggingIn = ref(false)
+const showMimoLogin = computed(
+  () => isEdit.value && matchedPreset.value?.id === 'xiaomi-mimo-token-plan',
+)
+async function onMimoLogin() {
+  if (!props.editId) return
+  mimoLoggingIn.value = true
+  try {
+    const res = await providersApi.mimoLogin(props.editId)
+    if (res.captured) {
+      mimoLoggedIn.value = true
+      toast(t('providersAdd.mimoLogin.success'))
+    } else {
+      toast(t('providersAdd.mimoLogin.cancelled'))
+    }
+  } catch (e) {
+    toast((e as Error).message || t('providerForm.errSaveFailed'), 'error')
+  } finally {
+    mimoLoggingIn.value = false
+  }
+}
+
 // ── 名称下拉:可选内置预设(选中预填全部默认)或「自定义」(全手填) ──
 const CUSTOM_LABEL = t('providerForm.customOption')
 const presets = ref<Preset[]>([])
@@ -261,6 +286,7 @@ onMounted(async () => {
   form.apiFormat = p.apiFormat
   form.authScheme = p.authScheme || 'bearer'
   isBuiltin.value = !!p.isBuiltin
+  mimoLoggedIn.value = !!p.hasMimoCookie
   form.reviewModelSlot = p.reviewModelSlot || ''
   for (const s of MODEL_SLOTS) {
     form.models[s.key] = (p.mappings as Record<string, string>)[s.key] || ''
@@ -425,6 +451,23 @@ async function save() {
         </template>
       </template>
 
+      <SettingsRow v-if="showMimoLogin" :title="t('providersAdd.mimoLogin.label')">
+        <div class="pf__mimo">
+          <span class="pf__mimo-status" :class="{ ok: mimoLoggedIn }">{{
+            mimoLoggedIn
+              ? t('providersAdd.mimoLogin.statusLoggedIn')
+              : t('providersAdd.mimoLogin.statusNotLoggedIn')
+          }}</span>
+          <AppButton
+            size="sm"
+            variant="secondary"
+            :label="mimoLoggingIn ? t('providersAdd.mimoLogin.statusLoggingIn') : t('providersAdd.mimoLogin.button')"
+            :disabled="mimoLoggingIn"
+            @click="onMimoLogin"
+          />
+        </div>
+      </SettingsRow>
+
       <div v-if="error" class="pf__error">{{ error }}</div>
       <div class="pf__actions">
         <AppButton variant="ghost" :label="t('common.cancel')" @click="emit('close')" />
@@ -510,5 +553,18 @@ async function save() {
   justify-content: flex-end;
   gap: var(--space-3);
   margin-top: var(--space-4);
+}
+.pf__mimo {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.pf__mimo-status {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.pf__mimo-status.ok {
+  color: var(--success);
 }
 </style>

@@ -415,7 +415,7 @@ export default {
   "providersAdd.gemini1mHint":
     "关闭时 Gemini 上下文限制在约 600K（更早触发自动压缩），提升长上下文下的指令遵循;开启使用完整 1M。默认关闭。",
   "providersAdd.apiFormatLabel": "协议类型",
-  "providersAdd.mimoLogin.label": "套餐用量额度",
+  "providersAdd.mimoLogin.label": "查看额度",
   "providersAdd.mimoLogin.button": "登录小米账号",
   "providersAdd.mimoLogin.hint":
     "MiMo 套餐用量需登录小米账号(用量接口不认 API Key)。点击在内嵌窗口登录,完成后用于在 Codex 用量面板显示套餐余量。",

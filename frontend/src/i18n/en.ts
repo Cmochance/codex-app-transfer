@@ -372,7 +372,7 @@ export default {
   "providersAdd.gemini1mLabel": "Enable Gemini 1M context",
   "providersAdd.gemini1mHint": "When off, Gemini context is capped at ~600K (auto-compaction triggers earlier) for better instruction-following on long contexts; turn on for the full 1M. Off by default.",
   "providersAdd.apiFormatLabel": "API protocol",
-  "providersAdd.mimoLogin.label": "Plan usage quota",
+  "providersAdd.mimoLogin.label": "View quota",
   "providersAdd.mimoLogin.button": "Sign in with Xiaomi",
   "providersAdd.mimoLogin.hint": "MiMo plan usage requires a Xiaomi account sign-in (the usage API does not accept the API key). Click to sign in via an embedded window; once done it's used to show plan quota in the Codex usage panel.",
   "providersAdd.mimoLogin.statusLoggedIn": "Signed in",
