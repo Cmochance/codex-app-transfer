@@ -82,8 +82,7 @@ pub fn save_for_test(cfg: &RawConfig) -> Result<(), String> {
 /// **迁移状态**(2026-05-11 完成全栈):所有 prod RMW callsite 走此 API:
 /// - `gemini_oauth.rs`:sync_project_id_to_active_provider /
 ///   clear_project_id_from_active_provider
-/// - `desktop.rs`:sync_desktop_for_active_provider / switch_provider_and_sync /
-///   desktop_configure
+/// - `desktop.rs`:sync_desktop_for_active_provider / switch_provider_and_sync
 /// - `providers/crud.rs`:add_provider / update_provider / delete_provider /
 ///   reorder_providers / update_models(save_draft 复用 update_provider)
 /// - `providers/models.rs`:autofill_provider_models(read 锁外 await + 写锁内)

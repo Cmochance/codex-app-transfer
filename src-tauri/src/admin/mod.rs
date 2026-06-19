@@ -110,14 +110,6 @@ pub fn build_app_router(state: AdminState) -> Router {
             get(handlers::providers::presets::list_presets),
         )
         // Desktop / Codex CLI
-        .route(
-            "/api/desktop/status",
-            get(handlers::desktop::desktop_status),
-        )
-        .route(
-            "/api/desktop/configure",
-            post(handlers::desktop::desktop_configure),
-        )
         .route("/api/desktop/clear", post(handlers::desktop::desktop_clear))
         .route(
             "/api/desktop/snapshots",
