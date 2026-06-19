@@ -122,16 +122,31 @@ fn write_sources(list: &[ConnectorSource]) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
     let body = serde_json::to_string_pretty(list).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(p, body).map_err(|e| format!("write: {e}"))
+    // atomic:写 tmp 再 rename,崩溃也不会留半截 JSON(否则下次 read 静默 unwrap_or_default 丢光自加源)。
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, body).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("rename: {e}"))
 }
 
-/// 自加源 id:对 url 做字符净化(稳定 + 同 url 唯一)。
+/// FNV-1a 稳定哈希(跨版本确定),用于源 id / 缓存文件名 —— 避免有损字符净化导致不同输入碰撞。
+fn stable_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// 自加源 id:对 url 稳定哈希(同 url 唯一、不碰撞)。
 fn source_id_from_url(url: &str) -> String {
-    let slug: String = url
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("src_{}", &slug[..slug.len().min(48)])
+    format!("src_{}", stable_hash(url))
+}
+
+/// 源文件 read-modify-write 串行化(本地单进程 app,进程内 Mutex 足够防丢更新)。
+fn sources_lock() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
 }
 
 // ── fetch + 每源 body 缓存 ───────────────────────────────────────────────────
@@ -295,6 +310,7 @@ pub async fn add_source(Json(input): Json<AddSourceInput>) -> impl IntoResponse 
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return err(StatusCode::BAD_REQUEST, "url 必须 http(s)").into_response();
     }
+    let _g = sources_lock().lock().unwrap();
     let mut list = read_sources();
     let id = source_id_from_url(&url);
     if list.iter().any(|s| s.id == id) {
@@ -322,6 +338,7 @@ pub async fn remove_source(Json(input): Json<SourceIdInput>) -> impl IntoRespons
     if input.id == OFFICIAL_ID {
         return err(StatusCode::BAD_REQUEST, "官方源不可删").into_response();
     }
+    let _g = sources_lock().lock().unwrap();
     let mut list = read_sources();
     let before = list.len();
     list.retain(|s| s.id != input.id || s.official);
@@ -342,6 +359,7 @@ pub struct ToggleSourceInput {
 }
 
 pub async fn toggle_source(Json(input): Json<ToggleSourceInput>) -> impl IntoResponse {
+    let _g = sources_lock().lock().unwrap();
     let mut list = read_sources();
     let mut found = false;
     for s in list.iter_mut() {
@@ -385,15 +403,11 @@ pub async fn icon(Query(q): Query<IconQuery>) -> impl IntoResponse {
     let path = q.path;
 
     let cache_key = format!("{source}|{path}");
+    // 缓存文件名用稳定哈希,避免有损字符净化把不同 (source,path) 坍缩到同一文件 → cache-hit 串图。
     let cache_file = home_dir().map(|h| {
         h.join(".codex-app-transfer")
             .join("marketplace-cache")
-            .join(
-                cache_key
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                    .collect::<String>(),
-            )
+            .join(format!("{}.png", stable_hash(&cache_key)))
     });
     if let Some(cf) = &cache_file {
         if let Ok(bytes) = std::fs::read(cf) {
