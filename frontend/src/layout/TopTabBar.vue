@@ -5,6 +5,7 @@ import IconPlug from '~icons/lucide/plug'
 import IconRadio from '~icons/lucide/radio'
 import IconChart from '~icons/lucide/bar-chart-3'
 import IconBookmark from '~icons/lucide/bookmark'
+import IconStore from '~icons/lucide/store'
 import IconSettings from '~icons/lucide/settings'
 
 interface Tab {
@@ -19,6 +20,7 @@ const tabs: Tab[] = [
   { to: '/proxy', key: 'nav.proxy', icon: IconRadio },
   { to: '/usage', key: 'nav.usage', icon: IconChart },
   { to: '/codex', key: 'nav.codex', icon: IconBookmark },
+  { to: '/marketplace', key: 'nav.market', icon: IconStore },
   { to: '/settings', key: 'nav.settings', icon: IconSettings },
 ]
 </script>

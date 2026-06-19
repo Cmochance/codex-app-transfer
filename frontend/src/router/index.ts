@@ -10,6 +10,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/usage', name: 'usage', component: () => import('@/pages/UsagePage.vue'), meta: { navKey: 'nav.usage', icon: 'chart' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/SettingsPage.vue'), meta: { navKey: 'nav.settings', icon: 'settings' } },
   { path: '/codex', name: 'codex', component: () => import('@/pages/CodexPage.vue'), meta: { navKey: 'nav.codex', icon: 'bookmark' } },
+  { path: '/marketplace', name: 'marketplace', component: () => import('@/pages/MarketplacePage.vue'), meta: { navKey: 'nav.market', icon: 'store' } },
   { path: '/codex-skin', name: 'codex-skin', component: () => import('@/pages/CodexSkinPage.vue'), meta: { navKey: 'nav.theme', icon: 'palette' } },
   { path: '/desktop', name: 'desktop', component: () => import('@/pages/DesktopPage.vue'), meta: { hidden: true } },
   { path: '/:pathMatch(.*)*', redirect: '/providers' },

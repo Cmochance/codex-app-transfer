@@ -37,6 +37,15 @@ pub fn build_app_router(state: AdminState) -> Router {
         .route("/api/chrome/detect", get(handlers::chrome::detect))
         .route("/api/chrome/ready", get(handlers::chrome::ready))
         .route("/api/chrome/ensure", post(handlers::chrome::ensure))
+        // 连接器市场(展示镜像,phase2):私有 storage 仓库 registry + 图标代理
+        .route(
+            "/api/marketplace/connectors",
+            get(handlers::marketplace_connectors::connectors),
+        )
+        .route(
+            "/api/marketplace/icon",
+            get(handlers::marketplace_connectors::icon),
+        )
         // Providers
         .route(
             "/api/providers",
