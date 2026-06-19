@@ -102,6 +102,13 @@ export default {
   "nav.codex": "文档",
   "nav.theme": "主题",
   "nav.guide": "引导",
+  "market.title": "插件市场",
+  "market.search": "搜索连接器…",
+  "market.refresh": "刷新",
+  "market.loading": "加载中…",
+  "market.loadFailed": "加载失败",
+  "market.empty": "无匹配连接器",
+  "market.openWebsite": "打开官网",
   "theme.title": "Codex Desktop 主题",
   "theme.subtitle":
     "向运行中的 Codex Desktop 通过 CDP 注入 CSS / DOM,覆盖原生外观。默认关闭;启用后选一个内置主题。改动后 Codex Desktop 整页 reload 会自动重应用;从本工具重启 Codex.app 也会自动应用已选主题。",
@@ -218,6 +225,7 @@ export default {
   "codex.mcp.servers": "Servers",
   "codex.mcp.plugins": "Plugins",
   "codex.mcp.marketplace": "Marketplace",
+  "codex.mcp.officialSource": "官方源",
   "codex.mcp.serversWarn":
     "修改 MCP servers 会改 ~/.codex/config.toml 全局生效",
   "codex.mcp.pluginsWarn":

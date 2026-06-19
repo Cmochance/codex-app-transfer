@@ -70,5 +70,10 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=CODEX_APP_TRANSFER_REPO");
 
+    // 连接器市场(MOC-7 phase2):私有 storage 仓库的只读 token 经 build-baked `option_env!` 注入。
+    // 不声明 rerun-if-env-changed 的话,CI/release 在缓存 build 上改/设 token 会静默复用旧 obj
+    // → 烤进 None/旧 token,feature 上线无 token 静默降级。对齐上面 REPO 的处理。
+    println!("cargo:rerun-if-env-changed=CODEX_APP_TRANSFER_STORAGE_TOKEN");
+
     tauri_build::build()
 }

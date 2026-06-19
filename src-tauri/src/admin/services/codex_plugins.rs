@@ -55,6 +55,15 @@ pub struct PluginManifest {
     pub skills: Option<serde_json::Value>,
     pub apps: Option<serde_json::Value>,
     pub hooks: Option<serde_json::Value>,
+    /// `interface.logo` 是各 plugin 自定的图标相对路径(cloudflare.png / app-icon.png / logo.png…)
+    pub interface: Option<PluginInterface>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PluginInterface {
+    pub logo: Option<String>,
+    pub composer_icon: Option<String>,
 }
 
 fn resolve_home() -> Option<PathBuf> {
@@ -117,6 +126,20 @@ fn load_manifest(dir: &Path) -> Option<PluginManifest> {
 /// 找 plugin 的 active version 目录 — 简单实现:取 lexicographic 最大 version dir,
 /// 找不到则用 `local`。codex 真实实现在 `core-plugins/src/store.rs` 更复杂(active
 /// pointer),本工具暂用简化版。
+/// 扫 `<install_dir>/skills/` 的子目录名 = plugin 真实 skill 列表。manifest.skills 只是 `"./skills/"`
+/// 路径取不到名;且对齐 Codex loader:只算**含 `SKILL.md`** 的子目录(排除共享库 / references 等非 skill 目录)。
+fn scan_skill_dirs(install_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(install_dir.join("skills"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("SKILL.md").is_file())
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    names
+}
+
 fn active_version_dir(plugin_root: &Path) -> Option<(String, PathBuf)> {
     if !plugin_root.is_dir() {
         return None;
@@ -215,11 +238,7 @@ pub fn list_installed() -> Result<Vec<PluginEntry>, String> {
                 .as_ref()
                 .map(extract_names_from_value)
                 .unwrap_or_default();
-            let skill_names = manifest
-                .skills
-                .as_ref()
-                .map(extract_names_from_value)
-                .unwrap_or_default();
+            let skill_names = scan_skill_dirs(&install_dir);
             let app_count = manifest.apps.as_ref().map(count_top).unwrap_or(0);
             let hook_count = manifest.hooks.as_ref().map(count_top).unwrap_or(0);
             let enabled = plugins_tbl
@@ -245,6 +264,100 @@ pub fn list_installed() -> Result<Vec<PluginEntry>, String> {
     }
     out.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(out)
+}
+
+/// key → 已安装 plugin 的 install_dir(**直接**按 `cache/<market>/<name>/<ver>/` 定位,
+/// 不再走 list_installed 全盘扫 —— 否则每图标请求一次全扫 = N²,延迟高)。
+fn installed_dir(key: &str) -> Result<PathBuf, String> {
+    let (name, marketplace) = parse_key(key);
+    // 防穿越:name/marketplace 直接进 path join。
+    for seg in [&name, &marketplace] {
+        if seg.is_empty() || seg.contains("..") || seg.contains('/') || seg.contains('\\') {
+            return Err("invalid plugin key".to_owned());
+        }
+    }
+    let plugin_root = plugins_cache_root()?.join(&marketplace).join(&name);
+    active_version_dir(&plugin_root)
+        .map(|(_, dir)| dir)
+        .ok_or_else(|| format!("plugin {key} 未安装"))
+}
+
+/// 规范化 path 并确认仍在 base 目录内 —— 防 symlink 逃逸(如 SKILL.md / icon 被 symlink 到
+/// `~/.codex/auth.json` 等目录外文件,`fs::read` 跟 symlink 会读出并泄露)。
+fn canonical_within(base: &Path, path: &Path) -> Result<PathBuf, String> {
+    let canon = fs::canonicalize(path).map_err(|e| format!("resolve path: {e}"))?;
+    let canon_base = fs::canonicalize(base).map_err(|e| format!("resolve base: {e}"))?;
+    if !canon.starts_with(&canon_base) {
+        return Err("path escapes plugin directory".to_owned());
+    }
+    Ok(canon)
+}
+
+/// plugin 图标字节 + content-type。各 plugin 图标路径不同 → 读 manifest `interface.logo`
+/// (cloudflare.png / app-icon.png / logo.png…),取不到再退 `assets/app-icon.png`。
+pub fn plugin_icon_bytes(key: &str) -> Result<(Vec<u8>, &'static str), String> {
+    let dir = installed_dir(key)?;
+    let rel = load_manifest(&dir)
+        .and_then(|m| m.interface)
+        .and_then(|i| i.logo)
+        .unwrap_or_else(|| "./assets/app-icon.png".to_owned());
+    let rel = rel.trim_start_matches("./");
+    // 防穿越(含 Windows 绝对 `C:\` / UNC `\\`):禁 `..` / 前导 `/` / 反斜杠 / 盘符冒号 —— 否则
+    // `dir.join(rel)` 遇绝对路径会越界读 plugin 目录外任意文件。合法 logo 是 `assets/x.png` 形态。
+    if rel.contains("..") || rel.starts_with('/') || rel.contains('\\') || rel.contains(':') {
+        return Err("invalid logo path".to_owned());
+    }
+    let icon = canonical_within(&dir, &dir.join(rel))?;
+    let bytes = fs::read(&icon).map_err(|e| format!("read icon: {e}"))?;
+    let ct = if rel.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "image/png"
+    };
+    Ok((bytes, ct))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillDoc {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+}
+
+/// 读 plugin 某 skill 的 `skills/<skill>/SKILL.md`(解析 frontmatter name/description + 正文)。
+pub fn read_plugin_skill(key: &str, skill: &str) -> Result<SkillDoc, String> {
+    // skill 名来自 manifest,但仍校验防穿越。
+    if skill.is_empty() || skill.contains("..") || skill.contains('/') || skill.contains('\\') {
+        return Err("invalid skill name".to_owned());
+    }
+    let dir = installed_dir(key)?;
+    let md = canonical_within(&dir, &dir.join("skills").join(skill).join("SKILL.md"))?;
+    let raw = fs::read_to_string(&md).map_err(|e| format!("read SKILL.md: {e}"))?;
+    Ok(parse_skill_md(skill, &raw))
+}
+
+/// 解析 SKILL.md 的 YAML frontmatter(`--- name/description ---`)+ 正文。
+fn parse_skill_md(fallback_name: &str, raw: &str) -> SkillDoc {
+    let mut name = fallback_name.to_owned();
+    let mut description = String::new();
+    let mut content = raw.trim_start().to_owned();
+    if let Some(rest) = raw.trim_start().strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            for line in rest[..end].lines() {
+                if let Some(v) = line.strip_prefix("name:") {
+                    name = v.trim().to_owned();
+                } else if let Some(v) = line.strip_prefix("description:") {
+                    description = v.trim().to_owned();
+                }
+            }
+            content = rest[end + 4..].trim_start().to_owned();
+        }
+    }
+    SkillDoc {
+        name,
+        description,
+        content,
+    }
 }
 
 /// 设 `[plugins."name@market"] enabled = <bool>`

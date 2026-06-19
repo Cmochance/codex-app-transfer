@@ -37,6 +37,31 @@ pub fn build_app_router(state: AdminState) -> Router {
         .route("/api/chrome/detect", get(handlers::chrome::detect))
         .route("/api/chrome/ready", get(handlers::chrome::ready))
         .route("/api/chrome/ensure", post(handlers::chrome::ensure))
+        // 连接器市场(多源,phase2):官方源(私有 storage 仓库)+ 自加源聚合 + 图标代理
+        .route(
+            "/api/marketplace/connectors",
+            get(handlers::marketplace_connectors::connectors),
+        )
+        .route(
+            "/api/marketplace/icon",
+            get(handlers::marketplace_connectors::icon),
+        )
+        .route(
+            "/api/marketplace/sources",
+            get(handlers::marketplace_connectors::sources),
+        )
+        .route(
+            "/api/marketplace/sources/add",
+            post(handlers::marketplace_connectors::add_source),
+        )
+        .route(
+            "/api/marketplace/sources/remove",
+            post(handlers::marketplace_connectors::remove_source),
+        )
+        .route(
+            "/api/marketplace/sources/toggle",
+            post(handlers::marketplace_connectors::toggle_source),
+        )
         // Providers
         .route(
             "/api/providers",
@@ -453,24 +478,12 @@ pub fn build_app_router(state: AdminState) -> Router {
             post(handlers::mcp::install_plugin),
         )
         .route(
-            "/api/codex/mcp/marketplace/sources",
-            get(handlers::mcp::list_sources),
+            "/api/codex/mcp/plugins/icon",
+            get(handlers::mcp::plugin_icon),
         )
         .route(
-            "/api/codex/mcp/marketplace/sources/add",
-            post(handlers::mcp::add_source),
-        )
-        .route(
-            "/api/codex/mcp/marketplace/sources/remove",
-            post(handlers::mcp::remove_source),
-        )
-        .route(
-            "/api/codex/mcp/marketplace/sources/toggle",
-            post(handlers::mcp::toggle_source),
-        )
-        .route(
-            "/api/codex/mcp/marketplace/index",
-            get(handlers::mcp::marketplace_index),
+            "/api/codex/mcp/plugins/skill",
+            get(handlers::mcp::plugin_skill),
         )
         // 静态文件兜底
         .fallback(static_files::serve_static)

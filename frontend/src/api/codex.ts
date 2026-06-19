@@ -65,7 +65,7 @@ export function revealManaged(resource: ManagedResource, hash?: string | null) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// MCP — servers / plugins / marketplace
+// MCP — servers / plugins
 // ───────────────────────────────────────────────────────────────────────────
 export interface McpServerSpec {
   name: string
@@ -97,40 +97,24 @@ export interface McpPlugin {
   marketplace?: string
   version?: string
   enabled?: boolean
+  skillNames?: string[]
+  installDir?: string
 }
 
-export interface McpSource {
-  id: string
+export interface PluginSkill {
   name: string
-  enabled?: boolean
-  official?: boolean
+  description: string
+  content: string
 }
-
-export interface McpMarketServerItem {
-  id: string
-  name: string
-  description?: string
-  transport?: string
-  source?: string
-  command?: string
-  args?: string[]
-  url?: string
-  bearerTokenEnvVar?: string
-}
-export interface McpMarketPluginItem {
-  id: string
-  description?: string
-  marketplace?: string
-  version?: string
-  source?: string
-  tarballUrl?: string
-  capabilities?: { mcpServers?: unknown; skills?: unknown; apps?: unknown }
-}
-export interface McpMarketIndex {
-  servers?: McpMarketServerItem[]
-  plugins?: McpMarketPluginItem[]
-  errors?: Record<string, string>
-}
+// GET /api/codex/mcp/plugins/skill — 某 plugin 某 skill 的 SKILL.md(name/description/正文)。
+export const getPluginSkill = (key: string, name: string) =>
+  api<{ skill?: PluginSkill }>(
+    'GET',
+    `/api/codex/mcp/plugins/skill?key=${encodeURIComponent(key)}&name=${encodeURIComponent(name)}`,
+  )
+// 已安装 plugin 的图标(assets/app-icon.png),直接作为 <img src>。
+export const pluginIconUrl = (key: string) =>
+  `/api/codex/mcp/plugins/icon?key=${encodeURIComponent(key)}`
 
 // servers
 export const getMcpServers = () =>
@@ -162,21 +146,6 @@ export const installMcpPlugin = (body: {
   version?: string
   tarballUrl?: string
 }) => api('POST', '/api/codex/mcp/plugins/install', body)
-
-// marketplace
-export const getMcpSources = () =>
-  api<{ sources?: McpSource[] }>('GET', '/api/codex/mcp/marketplace/sources')
-export const addMcpSource = (name: string, url: string) =>
-  api('POST', '/api/codex/mcp/marketplace/sources/add', { name, url })
-export const removeMcpSource = (id: string) =>
-  api('POST', '/api/codex/mcp/marketplace/sources/remove', { id })
-export const toggleMcpSource = (id: string, enabled: boolean) =>
-  api('POST', '/api/codex/mcp/marketplace/sources/toggle', { id, enabled })
-export const getMcpMarketIndex = (forceRefresh = false) =>
-  api<{ index?: McpMarketIndex }>(
-    'GET',
-    `/api/codex/mcp/marketplace/index${forceRefresh ? '?force_refresh=true' : ''}`,
-  )
 
 // ───────────────────────────────────────────────────────────────────────────
 // Conversations

@@ -1,13 +1,17 @@
 //! `/api/codex/mcp/*` — MCP tab 三 sub-resource 统一入口:
 //! - `/servers/*` — `[mcp_servers.*]` 结构化 CRUD
-//! - `/plugins/*` — `~/.codex/plugins/cache/<market>/<plugin>/` 已安装 plugin 管理
-//! - `/marketplace/*` — registry source 管理 + 索引聚合 + tar.gz 安装
+//! - `/plugins/*` — `~/.codex/plugins/cache/<market>/<plugin>/` 已安装 plugin 管理 + tar.gz 安装
 
-use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::Query,
+    http::{header, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::super::services::{codex_plugins, marketplace, mcp_servers};
+use super::super::services::{codex_plugins, mcp_servers};
 use super::common::err;
 
 // ── Servers ──
@@ -133,62 +137,29 @@ pub async fn install_plugin(Json(input): Json<codex_plugins::InstallInput>) -> i
     }
 }
 
-// ── Marketplace ──
+#[derive(Debug, Deserialize, Default)]
+pub struct PluginIconQuery {
+    pub key: String,
+}
+
+/// `GET /api/codex/mcp/plugins/icon?key=` — 已安装 plugin 的图标(assets/app-icon.png)。
+pub async fn plugin_icon(Query(q): Query<PluginIconQuery>) -> impl IntoResponse {
+    match codex_plugins::plugin_icon_bytes(&q.key) {
+        Ok((bytes, ct)) => ([(header::CONTENT_TYPE, ct)], bytes).into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, e).into_response(),
+    }
+}
 
 #[derive(Debug, Deserialize, Default)]
-pub struct AddSourceInput {
+pub struct PluginSkillQuery {
+    pub key: String,
     pub name: String,
-    pub url: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct RemoveSourceInput {
-    pub id: String,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct ToggleSourceInput {
-    pub id: String,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct IndexQuery {
-    #[serde(default)]
-    pub force_refresh: bool,
-}
-
-pub async fn list_sources() -> impl IntoResponse {
-    match marketplace::list_sources() {
-        Ok(sources) => Json(json!({"success": true, "sources": sources})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub async fn add_source(Json(input): Json<AddSourceInput>) -> impl IntoResponse {
-    match marketplace::add_source(input.name, input.url) {
-        Ok(src) => Json(json!({"success": true, "source": src})).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
-    }
-}
-
-pub async fn remove_source(Json(input): Json<RemoveSourceInput>) -> impl IntoResponse {
-    match marketplace::remove_source(&input.id) {
-        Ok(removed) => Json(json!({"success": true, "removed": removed})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub async fn toggle_source(Json(input): Json<ToggleSourceInput>) -> impl IntoResponse {
-    match marketplace::toggle_source(&input.id, input.enabled) {
-        Ok(updated) => Json(json!({"success": true, "updated": updated})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub async fn marketplace_index(Query(q): Query<IndexQuery>) -> impl IntoResponse {
-    match marketplace::index(q.force_refresh).await {
-        Ok(idx) => Json(json!({"success": true, "index": idx})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+/// `GET /api/codex/mcp/plugins/skill?key=&name=` — 该 plugin 某 skill 的 SKILL.md(name/description/正文)。
+pub async fn plugin_skill(Query(q): Query<PluginSkillQuery>) -> impl IntoResponse {
+    match codex_plugins::read_plugin_skill(&q.key, &q.name) {
+        Ok(doc) => Json(json!({"success": true, "skill": doc})).into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, e).into_response(),
     }
 }
