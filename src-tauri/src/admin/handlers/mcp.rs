@@ -145,7 +145,7 @@ pub struct PluginIconQuery {
 /// `GET /api/codex/mcp/plugins/icon?key=` — 已安装 plugin 的图标(assets/app-icon.png)。
 pub async fn plugin_icon(Query(q): Query<PluginIconQuery>) -> impl IntoResponse {
     match codex_plugins::plugin_icon_bytes(&q.key) {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        Ok((bytes, ct)) => ([(header::CONTENT_TYPE, ct)], bytes).into_response(),
         Err(e) => err(StatusCode::NOT_FOUND, e).into_response(),
     }
 }

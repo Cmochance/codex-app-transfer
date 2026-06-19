@@ -55,6 +55,15 @@ pub struct PluginManifest {
     pub skills: Option<serde_json::Value>,
     pub apps: Option<serde_json::Value>,
     pub hooks: Option<serde_json::Value>,
+    /// `interface.logo` 是各 plugin 自定的图标相对路径(cloudflare.png / app-icon.png / logo.png…)
+    pub interface: Option<PluginInterface>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PluginInterface {
+    pub logo: Option<String>,
+    pub composer_icon: Option<String>,
 }
 
 fn resolve_home() -> Option<PathBuf> {
@@ -117,6 +126,19 @@ fn load_manifest(dir: &Path) -> Option<PluginManifest> {
 /// 找 plugin 的 active version 目录 — 简单实现:取 lexicographic 最大 version dir,
 /// 找不到则用 `local`。codex 真实实现在 `core-plugins/src/store.rs` 更复杂(active
 /// pointer),本工具暂用简化版。
+/// 扫 `<install_dir>/skills/` 的子目录名 = plugin 真实 skill 列表(manifest.skills 只是 `"./skills/"` 路径,取不到名)。
+fn scan_skill_dirs(install_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(install_dir.join("skills"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    names
+}
+
 fn active_version_dir(plugin_root: &Path) -> Option<(String, PathBuf)> {
     if !plugin_root.is_dir() {
         return None;
@@ -215,11 +237,7 @@ pub fn list_installed() -> Result<Vec<PluginEntry>, String> {
                 .as_ref()
                 .map(extract_names_from_value)
                 .unwrap_or_default();
-            let skill_names = manifest
-                .skills
-                .as_ref()
-                .map(extract_names_from_value)
-                .unwrap_or_default();
+            let skill_names = scan_skill_dirs(&install_dir);
             let app_count = manifest.apps.as_ref().map(count_top).unwrap_or(0);
             let hook_count = manifest.hooks.as_ref().map(count_top).unwrap_or(0);
             let enabled = plugins_tbl
@@ -247,19 +265,41 @@ pub fn list_installed() -> Result<Vec<PluginEntry>, String> {
     Ok(out)
 }
 
-/// key → 已安装 plugin 的 install_dir(从 list_installed 查,稳妥避开手拼 path)。
+/// key → 已安装 plugin 的 install_dir(**直接**按 `cache/<market>/<name>/<ver>/` 定位,
+/// 不再走 list_installed 全盘扫 —— 否则每图标请求一次全扫 = N²,延迟高)。
 fn installed_dir(key: &str) -> Result<PathBuf, String> {
-    list_installed()?
-        .into_iter()
-        .find(|e| e.key == key)
-        .map(|e| PathBuf::from(e.install_dir))
+    let (name, marketplace) = parse_key(key);
+    // 防穿越:name/marketplace 直接进 path join。
+    for seg in [&name, &marketplace] {
+        if seg.is_empty() || seg.contains("..") || seg.contains('/') || seg.contains('\\') {
+            return Err("invalid plugin key".to_owned());
+        }
+    }
+    let plugin_root = plugins_cache_root()?.join(&marketplace).join(&name);
+    active_version_dir(&plugin_root)
+        .map(|(_, dir)| dir)
         .ok_or_else(|| format!("plugin {key} 未安装"))
 }
 
-/// plugin 图标字节(`install_dir/assets/app-icon.png`)。
-pub fn plugin_icon_bytes(key: &str) -> Result<Vec<u8>, String> {
-    let icon = installed_dir(key)?.join("assets").join("app-icon.png");
-    fs::read(&icon).map_err(|e| format!("read icon: {e}"))
+/// plugin 图标字节 + content-type。各 plugin 图标路径不同 → 读 manifest `interface.logo`
+/// (cloudflare.png / app-icon.png / logo.png…),取不到再退 `assets/app-icon.png`。
+pub fn plugin_icon_bytes(key: &str) -> Result<(Vec<u8>, &'static str), String> {
+    let dir = installed_dir(key)?;
+    let rel = load_manifest(&dir)
+        .and_then(|m| m.interface)
+        .and_then(|i| i.logo)
+        .unwrap_or_else(|| "./assets/app-icon.png".to_owned());
+    let rel = rel.trim_start_matches("./");
+    if rel.contains("..") || rel.starts_with('/') {
+        return Err("invalid logo path".to_owned());
+    }
+    let bytes = fs::read(dir.join(rel)).map_err(|e| format!("read icon: {e}"))?;
+    let ct = if rel.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "image/png"
+    };
+    Ok((bytes, ct))
 }
 
 #[derive(Debug, Serialize)]
