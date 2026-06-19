@@ -165,8 +165,12 @@ fn main() {
             // 整文件覆盖回真账号 → auth_mode/tokens 全胜过旧快照。原「补 managed key 防空壳」由真账号在后覆盖解决。
             // 同步版(无 block_on/AUTH_LOCK):此刻在任何 auth task spawn 之前、无并发。失败留痕。
             // [review] un-stash gate 在 restoreCodexOnExit:=false 表示保留 transfer 状态、跳过。
-            let _ = handlers::desktop::restore_codex_if_enabled("startup");
-            if restore_codex_on_exit_enabled() {
+            let startup_restore_ok = handlers::desktop::restore_codex_if_enabled("startup")
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            // [MOC-257 review] 同 exit:un-stash 只在 restore 成功后跑;失败则真账号留 stash 待下次 self-heal。
+            if restore_codex_on_exit_enabled() && startup_restore_ok {
                 if let Err(e) = crate::codex_real_account::restore_stashed_real_auth_blocking() {
                     tracing::error!(
                         "[PluginUnlock] 启动 stash 真账号还原失败(真账号仍在 stash 待下次重试): {e}"
@@ -674,8 +678,14 @@ fn main() {
             // 真账号的 auth_mode/tokens 全胜过旧快照。原「补 managed key 防空壳」顾虑由「真账号在后覆盖」解决。
             // **同步版**:exit 期 async runtime 可能正在 shutdown,block_on 异步锁会 panic → 同步纯文件操作避开。
             // [review] un-stash gate 在 restoreCodexOnExit:=false 表示退出保留 transfer 状态,不该 un-stash。
-            let _ = handlers::desktop::restore_codex_if_enabled("exit");
-            if restore_codex_on_exit_enabled() {
+            let exit_restore_ok = handlers::desktop::restore_codex_if_enabled("exit")
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            // [MOC-257 review] un-stash 只在 restore **成功**后跑:restore_codex 失败(快照不可读 / ~/.codex 锁)
+            // 时仍 un-stash 会留真账号 active + 没还原成功的 transfer relay/config 在盘上 → 下次启动 persisted
+            // off/synthetic 却 real-active 不一致。失败则真账号留 stash,下次启动 self-heal 重试。
+            if restore_codex_on_exit_enabled() && exit_restore_ok {
                 if let Err(e) = crate::codex_real_account::restore_stashed_real_auth_blocking() {
                     tracing::error!(
                         "[PluginUnlock] 退出 stash 真账号还原失败(真账号仍在 stash 待下次启动重试): {e}"

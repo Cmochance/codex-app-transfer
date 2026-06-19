@@ -546,8 +546,25 @@ fn restore_from_snapshot_values(
         sync_table_field(&paths.config_toml, section, key, literal.as_deref())?;
     }
 
-    // 2. auth.json:对每个 managed key,快照里有就改回快照值,没有就 remove
+    // 2. auth.json
     let mut current = read_auth(&paths.auth_json)?;
+    // [MOC-257 review] live auth 是**合成**(`cas_synthetic`,transfer 伪造)时,只 strip managed key 会留
+    // `cas_synthetic` + 假 tokens → 下次 `active_is_synthetic()` 仍 true、re-enable 伪造/起 proxy(即便 restore
+    // 跑过)。合成绝非用户原始 → **整体处理**:快照有真 auth(anti-poisoning 保证非合成)就整文件换回;快照无
+    // auth(原本就没 / 合成被反投毒跳过)就删掉合成。非合成(真账号/apikey)才走下面的 managed-key merge。
+    let live_is_synthetic = current
+        .get("cas_synthetic")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if live_is_synthetic {
+        if snapshot_auth.as_object().is_some_and(|o| !o.is_empty()) {
+            write_auth(&paths.auth_json, snapshot_auth)?;
+        } else if paths.auth_json.exists() {
+            std::fs::remove_file(&paths.auth_json)?;
+        }
+        return Ok(());
+    }
+    // 非合成:对每个 managed key,快照里有就改回快照值,没有就 remove。
     if let Some(obj) = current.as_object_mut() {
         for key in MANAGED_AUTH_KEYS {
             match snapshot_auth.get(*key) {
