@@ -438,8 +438,11 @@ pub async fn apply_plugin_unlock_mode(
     // 态」,退出 restore 还原成合成 → standalone Codex 拿假凭据撞 chatgpt.com);**OFF 会 clear auth.json**
     // ——用户原有 apikey(非真账号、stash 不收)无既有快照时直接被删、restore 无快照可还原 → 原始
     // OPENAI_API_KEY 永久丢失(P1)。`snapshot_codex_state` 幂等(`has_snapshot` 已有则不覆盖)。
+    // [MOC-257 review] **同时查 stale 快照**:restoreCodexOnExit=false 保留态下只剩 stale 快照(= 真·原始
+    // baseline),has_snapshot=false;若只查它,这里会对**当前已被 Transfer 改过的状态**(合成 auth + relay)
+    // 拍新快照、把 stale 原始归档掉 → 后续 restore 用被投毒的当前快照还原成合成。对齐 desktop_clear 的双查。
     if let Ok(paths) = CodexPaths::from_home_env() {
-        if !codex_app_transfer_codex_integration::has_snapshot(&paths) {
+        if !has_snapshot(&paths) && !has_stale_active_snapshot(&paths) {
             let pname = load_registry()
                 .ok()
                 .map(|c| active_provider_name(&c))
