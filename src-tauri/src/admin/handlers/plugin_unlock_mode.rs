@@ -77,8 +77,16 @@ pub async fn set_handler(
         )
         .into_response();
     }
-    // 先落持久意图(off 也持久:重启仍 stash 走 auth.json),再 apply。
-    let _ = super::settings::set_plugin_unlock_mode(&req.mode);
+    // 先落持久意图(off 也持久:重启仍 stash 走 auth.json),再 apply。[MOC-257 review] 持久化失败
+    // (config 只读 / 磁盘满)必须报错,不能 apply 完报成功 —— 否则下次启动 reconcile 读到旧/缺失
+    // 的持久值、收敛到与 UI 不一致的状态。
+    if !super::settings::set_plugin_unlock_mode(&req.mode) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "写入插件解锁模式失败(配置文件不可写?),请检查权限 / 磁盘后重试".to_owned(),
+        )
+        .into_response();
+    }
     if let Err(e) =
         crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, mode).await
     {

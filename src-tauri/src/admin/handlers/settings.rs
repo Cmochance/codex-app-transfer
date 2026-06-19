@@ -527,9 +527,10 @@ pub fn set_plugin_unlock_mode(mode: &str) -> bool {
 }
 
 /// [MOC-257 三态] 一次性迁移:把旧三开关折叠成 `pluginUnlockMode`。键已存在 → no-op(幂等)。
-/// 映射:`fakeAccountModeEnabled=true` → synthetic;否则 `realAccountModeEnabled=true` → real;
-/// 否则 `autoUnlockCodexPlugins=true`(旧 CDP 强制档,现由 synthetic 取代)→ synthetic;
-/// 都没有 → **不写键**(留给默认推导:有真账号→real / 无→synthetic)。返回是否写入。
+/// 映射:`fakeAccountModeEnabled=true` → synthetic;`realAccountModeEnabled=true` → real;
+/// **`realAccountModeEnabled=false`(显式关闭意图)→ off**(否则默认推导会从 deactivate 留下的
+/// tokens 推成 real、撤销用户的关闭意图,review P2);`autoUnlockCodexPlugins=true`(旧 CDP 强制档,
+/// 现由 synthetic 取代)→ synthetic;都没有 → **不写键**(留给默认推导:有真账号→real / 无→synthetic)。
 pub fn migrate_plugin_unlock_mode_v1() -> bool {
     let cfg = match crate::admin::registry_io::load() {
         Ok(c) => c,
@@ -544,10 +545,16 @@ pub fn migrate_plugin_unlock_mode_v1() -> bool {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
+    // [MOC-257 review] 显式取真实账号模式键,区分「缺失」vs「Some(false)」—— 后者是用户主动关闭意图。
+    let real_explicit = s
+        .and_then(|s| s.get("realAccountModeEnabled"))
+        .and_then(Value::as_bool);
     let mode = if b("fakeAccountModeEnabled") {
         Some("synthetic")
-    } else if b("realAccountModeEnabled") {
+    } else if real_explicit == Some(true) {
         Some("real")
+    } else if real_explicit == Some(false) {
+        Some("off") // 显式关闭意图 → off,不被默认推导从残留 tokens 翻成 real
     } else if b("autoUnlockCodexPlugins") {
         Some("synthetic")
     } else {

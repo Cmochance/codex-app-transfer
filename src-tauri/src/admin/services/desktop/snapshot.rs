@@ -395,7 +395,19 @@ fn apply_desktop_target_impl(
 }
 
 pub async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
-    sync_desktop_for_active_provider_impl(state, false).await
+    let result = sync_desktop_for_active_provider_impl(state, false).await;
+    // [MOC-257 review] OFF 不变量维护:apply_provider 会重建一份 apikey auth.json,撤销 OFF 的「无
+    // auth.json」。任何 sync 路径(重启 Codex / 切 provider)apply 之后,若**持久模式仍是 off** 则
+    // 重新清掉(真账号先 stash 兜底再清),否则用户选 OFF 后一重启 Codex / 切 provider 就丢了「无
+    // auth.json」态直到再 toggle。synthetic/real 模式(非 off)不触发。
+    if crate::codex_real_account::resolve_plugin_unlock_mode()
+        == crate::codex_real_account::PluginUnlockMode::Off
+    {
+        let _ = crate::codex_real_account::stash_displaced_real_auth().await;
+        let _ = crate::codex_real_account::clear_active_auth_file().await;
+        codex_app_transfer_proxy::set_fake_account_mode(false);
+    }
+    result
 }
 
 /// [MOC-178] 清除真实账号:apply 当前 active provider 强制切 apikey(写 auth_mode=apikey、
