@@ -42,7 +42,10 @@ onMounted(() => {
     .then((r) => (appVersion.value = r.version || ''))
     .catch(() => {})
   getPluginUnlockStatus()
-    .then((s) => (pluginUnlockMode.value = s.mode))
+    .then((s) => {
+      pluginUnlockMode.value = s.mode // 显示:实际生效(未 apply→null)
+      persistedMode.value = s.persisted // 意图:持久值(降级时仍是 real)
+    })
     .catch(() => {})
 })
 
@@ -95,6 +98,9 @@ const mcpCredentialsPortableStore = toggle('mcpCredentialsPortableStore', true)
 // null = 后端未 apply 过(启动跳过 / 首次)→ SegmentedControl 不高亮,点任一档都触发 apply(否则
 // 高亮某档时再点它 no-op、永远应用不上,见 review)。
 const pluginUnlockMode = ref<PluginUnlockMode | null>(null)
+// [review] 持久**意图**(降级时 displayed=synthetic 但 persisted 仍 real);no-op 判它而非 displayed,
+// 否则降级后点 synthetic(displayed 已是 synthetic)会 no-op、settle 不到 synthetic、账号恢复又被升回 real。
+const persistedMode = ref<PluginUnlockMode | null>(null)
 const pluginUnlockBusy = ref(false)
 const pluginUnlockOptions: { value: PluginUnlockMode; label: string }[] = [
   { value: 'off', label: t('settings.pluginUnlockOff') },
@@ -102,21 +108,26 @@ const pluginUnlockOptions: { value: PluginUnlockMode; label: string }[] = [
   { value: 'real', label: t('settings.pluginUnlockReal') },
 ]
 async function onSetPluginUnlockMode(mode: PluginUnlockMode) {
-  if (pluginUnlockBusy.value || mode === pluginUnlockMode.value) return
+  // no-op 判**持久意图**(persistedMode)而非 displayed:降级后 displayed=synthetic / persisted=real,
+  // 点 synthetic 仍应能把意图改成 synthetic(settle)。
+  if (pluginUnlockBusy.value || mode === persistedMode.value) return
   pluginUnlockBusy.value = true
-  const prev = pluginUnlockMode.value
-  pluginUnlockMode.value = mode // 乐观更新
+  const prevDisplay = pluginUnlockMode.value
+  const prevPersisted = persistedMode.value
+  pluginUnlockMode.value = mode // 乐观更新(显示)
+  persistedMode.value = mode // 乐观更新(意图,后端 persist 的就是 req.mode)
   try {
     const r = await setPluginUnlockMode(mode)
     if (r?.degraded && r.effective) {
-      // 真账号失效 → 高亮跟生效(合成)+ 提示重登
+      // 真账号失效 → 显示跟生效(合成);persistedMode 保持 real(意图),账号恢复可用会自动升回
       pluginUnlockMode.value = r.effective
       if (r.message) toast(r.message, 'error')
     } else if (r?.message) {
       toast(r.message)
     }
   } catch (e) {
-    pluginUnlockMode.value = prev // 失败回滚
+    pluginUnlockMode.value = prevDisplay // 失败回滚
+    persistedMode.value = prevPersisted
     const data = (e as ApiError)?.responseData as { needsLogin?: boolean } | undefined
     if (data?.needsLogin) {
       loginModalOpen.value = true // real 但本地无账号 → 弹登录提示

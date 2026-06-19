@@ -1138,6 +1138,10 @@ pub async fn stash_displaced_real_auth() -> Result<(), String> {
         .is_some_and(|s| auth_value_real_and_usable(&s))
         && !auth_value_real_and_usable(&v)
     {
+        // [MOC-257 review] 保留可用 stash;但把过期/撤销的活动残留**归档移走**(不留 ~/.codex)—— 否则后续
+        // synthetic 的 `activate_fake_account` 守护会拒绝这个带 chatgpt token 的非合成文件 → synthetic apply
+        // 失败;off 的 clear 也省一步。归档失败不阻断(活动留着、stash 仍保住、下次重试)。
+        let _ = archive_existing_auth_file(&paths, &paths.auth_json);
         return Ok(());
     }
     if let Some(parent) = stash.parent() {
