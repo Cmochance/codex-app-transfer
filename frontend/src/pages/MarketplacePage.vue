@@ -67,6 +67,11 @@ function onIconError(id: string) {
 function initial(c: Connector): string {
   return displayName(c).charAt(0).toUpperCase()
 }
+// 只放行 http(s) 官网链接(防 registry 里万一有 javascript:/data: 之类 URL 进 href)。
+function safeWebsite(c: Connector): string | null {
+  const u = c.website_url
+  return u && /^https?:\/\//i.test(u) ? u : null
+}
 </script>
 
 <template>
@@ -124,9 +129,9 @@ function initial(c: Connector): string {
             <div class="card__desc">{{ c.short_description }}</div>
           </div>
           <a
-            v-if="c.website_url"
+            v-if="safeWebsite(c)"
             class="card__link"
-            :href="c.website_url"
+            :href="safeWebsite(c)!"
             target="_blank"
             rel="noopener noreferrer"
             :title="t('market.openWebsite')"
