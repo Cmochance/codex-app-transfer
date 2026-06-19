@@ -529,6 +529,10 @@ pub async fn apply_plugin_unlock_mode(
                         ));
                     }
                 }
+                // [MOC-257 review] 上面 set_fake(false) 是回滚期防护;**还原后**按活动是否合成重置伪造:在已是
+                // 合成态上 re-apply synthetic、relay 失败还原回合成(displaced=false)→ 重开伪造,否则合成 token
+                // 经现存 relay 透传 chatgpt.com 撞 401;displaced 还原成真账号则保持关。
+                codex_app_transfer_proxy::set_fake_account_mode(ra::active_is_synthetic());
                 return Err(e);
             }
             Ok(())
