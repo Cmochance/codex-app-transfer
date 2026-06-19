@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { i18nState, setLocale, t, tFmt } from '@/i18n'
 import { useAppearance, type Appearance } from '@/composables/useAppearance'
 import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
@@ -15,7 +15,15 @@ import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import { getChromeReady, ensureChrome, getSystemProxyStatus, type SystemProxyStatus } from '@/api/chrome'
-import { getPluginUnlockStatus, setPluginUnlockMode, type PluginUnlockMode } from '@/api/desktop'
+import {
+  getPluginUnlockStatus,
+  setPluginUnlockMode,
+  getRealAccountStatus,
+  startRealAccountLogin,
+  cancelRealAccountLogin,
+  type PluginUnlockMode,
+} from '@/api/desktop'
+import type { ApiError } from '@/api/http'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
@@ -98,14 +106,84 @@ async function onSetPluginUnlockMode(mode: PluginUnlockMode) {
   pluginUnlockMode.value = mode // 乐观更新
   try {
     const r = await setPluginUnlockMode(mode)
-    if (r?.message) toast(r.message)
+    if (r?.degraded && r.effective) {
+      // 真账号失效 → 高亮跟生效(合成)+ 提示重登
+      pluginUnlockMode.value = r.effective
+      if (r.message) toast(r.message, 'error')
+    } else if (r?.message) {
+      toast(r.message)
+    }
   } catch (e) {
     pluginUnlockMode.value = prev // 失败回滚
-    toast((e as Error).message || t('settings.pluginUnlockFailed'), 'error')
+    const data = (e as ApiError)?.responseData as { needsLogin?: boolean } | undefined
+    if (data?.needsLogin) {
+      loginModalOpen.value = true // real 但本地无账号 → 弹登录提示
+    } else {
+      toast((e as Error).message || t('settings.pluginUnlockFailed'), 'error')
+    }
   } finally {
     pluginUnlockBusy.value = false
   }
 }
+
+// [MOC-257] 真账号登录弹窗:选「真实账号」但本地无账号时引导用户 codex login。
+const loginModalOpen = ref(false)
+const loginRunning = ref(false)
+const loginError = ref('')
+let loginPollTimer: number | undefined
+function stopLoginPoll() {
+  if (loginPollTimer) {
+    window.clearInterval(loginPollTimer)
+    loginPollTimer = undefined
+  }
+}
+async function startLogin() {
+  loginError.value = ''
+  loginRunning.value = true
+  try {
+    await startRealAccountLogin()
+  } catch (e) {
+    loginRunning.value = false
+    loginError.value = (e as Error).message
+    return
+  }
+  loginPollTimer = window.setInterval(async () => {
+    try {
+      const s = await getRealAccountStatus()
+      if (s.loginState === 'succeeded') {
+        stopLoginPoll()
+        loginRunning.value = false
+        loginModalOpen.value = false
+        toast(t('settings.realAccountLoginOk'))
+        await onSetPluginUnlockMode('real') // 现在有账号了,切真实账号
+      } else if (s.loginState === 'failed') {
+        stopLoginPoll()
+        loginRunning.value = false
+        loginError.value = s.loginMessage || t('settings.realAccountLoginFailed')
+      } else if (s.loginState === 'cancelled' || s.loginState === 'idle') {
+        stopLoginPoll()
+        loginRunning.value = false
+      }
+    } catch {
+      /* 轮询失败保持等待 */
+    }
+  }, 2000)
+}
+async function cancelLogin() {
+  stopLoginPoll()
+  loginRunning.value = false
+  try {
+    await cancelRealAccountLogin()
+  } catch {
+    /* ignore */
+  }
+}
+function closeLoginModal() {
+  if (loginRunning.value) cancelLogin()
+  stopLoginPoll()
+  loginModalOpen.value = false
+}
+onUnmounted(stopLoginPoll)
 
 // theme / language 双向(同步本地状态 + 持久化服务端)。
 // setAppearance/setLocale 立刻改 DOM/localStorage(无闪烁),但服务端保存失败时
@@ -444,6 +522,35 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
         </div>
       </div>
     </AppModal>
+
+    <AppModal
+      v-if="loginModalOpen"
+      :title="t('settings.realAccountLoginTitle')"
+      @close="closeLoginModal"
+    >
+      <div class="chrome-dl">
+        <p class="chrome-dl__desc">{{ t('settings.realAccountLoginPrompt') }}</p>
+        <p v-if="loginRunning" class="chrome-dl__desc">
+          {{ t('settings.realAccountLoginRunning') }}
+        </p>
+        <p v-if="loginError" class="chrome-dl__desc chrome-dl__err">{{ loginError }}</p>
+        <div class="chrome-dl__actions">
+          <AppButton variant="ghost" :label="t('common.cancel')" @click="closeLoginModal" />
+          <AppButton
+            v-if="!loginRunning"
+            variant="primary"
+            :label="t('settings.realAccountLoginGo')"
+            @click="startLogin"
+          />
+          <AppButton
+            v-else
+            variant="ghost"
+            :label="t('settings.realAccountLoginCancelBtn')"
+            @click="cancelLogin"
+          />
+        </div>
+      </div>
+    </AppModal>
   </div>
 </template>
 
@@ -463,6 +570,9 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
   font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-secondary);
+}
+.chrome-dl__err {
+  color: var(--accent);
 }
 .chrome-dl__actions {
   display: flex;

@@ -26,11 +26,14 @@ use super::common::err;
 pub async fn status_handler() -> impl IntoResponse {
     Json(json!({
         "success": true,
-        // 当前**生效**三态(持久键优先,缺失则按真账号推导)。serde snake_case: off/synthetic/real。
+        // 当前**生效**三态(持久键优先,缺失则按真账号推导;real 不可用会降级 synthetic)。
         "mode": codex_real_account::resolve_plugin_unlock_mode(),
         // 持久值(用户是否手动设过);null = 未设、走默认推导。
         "persisted": super::settings::read_plugin_unlock_mode(),
+        // 本地是否有真账号(活动或 stash,含失效的)。
         "hasRealAccount": codex_real_account::has_real_account(),
+        // 真账号是否**实际可用**(非空 + 未过期 + 未撤销)—— 前端据此显示「真账号已失效已降级」。
+        "realAccountUsable": codex_real_account::real_account_usable(),
         "activeIsSynthetic": codex_real_account::active_is_synthetic(),
     }))
 }
@@ -69,17 +72,21 @@ pub async fn set_handler(
         )
         .into_response();
     }
-    // real 需要确有真账号(活动或 stash);无则引导登录/导入或改用模拟账号。
+    // [MOC-257] real + 本地**完全无真账号**(活动 + stash 都没有)→ 不切模式,回 needsLogin 让前端
+    // 弹窗提示「请先在 Codex 登录 ChatGPT 账号」。区别于「有账号但失效」(那走下面降级,不拦)。
     if matches!(mode, PluginUnlockMode::Real) && !codex_real_account::has_real_account() {
-        return err(
+        return (
             StatusCode::BAD_REQUEST,
-            "未检测到真实 ChatGPT 账号(需先登录 / 导入),或改用「模拟账号」".to_owned(),
+            Json(json!({
+                "success": false,
+                "needsLogin": true,
+                "message": "未检测到 ChatGPT 账号;请先在 Codex 登录 ChatGPT 账号后再用真实账号",
+            })),
         )
-        .into_response();
+            .into_response();
     }
-    // 先落持久意图(off 也持久:重启仍 stash 走 auth.json),再 apply。[MOC-257 review] 持久化失败
-    // (config 只读 / 磁盘满)必须报错,不能 apply 完报成功 —— 否则下次启动 reconcile 读到旧/缺失
-    // 的持久值、收敛到与 UI 不一致的状态。
+    // 先落持久意图(off 也持久:重启仍 stash 走 auth.json)。[MOC-257 review] 持久化失败(config 只读 /
+    // 磁盘满)必须报错,不能 apply 完报成功 —— 否则下次启动 reconcile 读到旧/缺失的持久值、与 UI 不一致。
     if !super::settings::set_plugin_unlock_mode(&req.mode) {
         return err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -87,15 +94,28 @@ pub async fn set_handler(
         )
         .into_response();
     }
+    // [MOC-257] apply **生效**模式而非请求模式:real 但账号失效(过期/撤销)→ resolve 降级到 synthetic
+    // (用户要求);持久仍 real,账号恢复可用后自动升回。off/synthetic 生效=请求。
+    let effective = codex_real_account::resolve_plugin_unlock_mode();
     if let Err(e) =
-        crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, mode).await
+        crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, effective).await
     {
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }
+    let degraded =
+        matches!(mode, PluginUnlockMode::Real) && effective == PluginUnlockMode::Synthetic;
     Json(json!({
         "success": true,
-        "mode": req.mode,
+        "mode": req.mode,            // 用户意图(持久)
+        "effective": effective,      // 实际生效(real 失效会降级 synthetic)
+        "degraded": degraded,
+        "message": if degraded {
+            "真实账号已失效(过期 / 服务端撤销),已降级为模拟账号;请在 Codex 重新登录后再切真实账号"
+        } else {
+            ""
+        },
         "hasRealAccount": codex_real_account::has_real_account(),
+        "realAccountUsable": codex_real_account::real_account_usable(),
         "activeIsSynthetic": codex_real_account::active_is_synthetic(),
     }))
     .into_response()

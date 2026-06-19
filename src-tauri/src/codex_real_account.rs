@@ -939,15 +939,49 @@ pub fn has_real_account() -> bool {
     active_real || real_account_stash_exists()
 }
 
-/// 解析当前**生效**三态:持久键优先(off/synthetic/real);键缺失 → 按「本地有真账号 → Real;
-/// 否则 → Synthetic(自动合成)」推导默认。只读。
+/// [MOC-257] 真账号当前是否**实际可用**(供「real 档不可用则降级 synthetic」+ 前端展示)。
+/// 可用 = 活动或 stash 有真 chatgpt 账号(非合成、access/refresh 非空)且 access_token 本地 JWT
+/// 未过期 且 **未标记 relogin**(服务端 401 撤销 / 本地过期,见 `mark_relogin_required_from_proxy`)。只读。
+pub fn real_account_usable() -> bool {
+    if relogin_required() {
+        return false; // 服务端撤销 / 已知失效
+    }
+    let Ok(paths) = CodexPaths::from_home_env() else {
+        return false;
+    };
+    let usable = |v: &Value| -> bool {
+        if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
+        if parse_chatgpt_tokens(v).is_none() {
+            return false;
+        }
+        let access = v
+            .get("tokens")
+            .and_then(|t| t.get("access_token"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        !access_token_expired(access, chrono::Utc::now().timestamp())
+    };
+    if read_auth(&paths.auth_json).ok().is_some_and(|v| usable(&v)) {
+        return true;
+    }
+    read_auth(&real_account_stash_path(&paths))
+        .ok()
+        .is_some_and(|v| usable(&v))
+}
+
+/// 解析当前**生效**三态:持久键优先;键缺失 → 按可用真账号推导。
+/// [MOC-257] **real 档失效降级**:持久 real 但账号**实际不可用**(过期/服务端撤销)→ 降级 Synthetic
+/// (用户要求);持久仍 real,账号恢复可用(重登)后下次 resolve 自动升回 real。键缺失同理(有可用
+/// 真账号→Real、否则→Synthetic)。只读。
 pub fn resolve_plugin_unlock_mode() -> PluginUnlockMode {
     match crate::admin::handlers::settings::read_plugin_unlock_mode().as_deref() {
         Some("off") => PluginUnlockMode::Off,
         Some("synthetic") => PluginUnlockMode::Synthetic,
-        Some("real") => PluginUnlockMode::Real,
+        // real(显式)+ 键缺失(默认):都按「可用真账号→Real,否则降级 Synthetic」。
         _ => {
-            if has_real_account() {
+            if real_account_usable() {
                 PluginUnlockMode::Real
             } else {
                 PluginUnlockMode::Synthetic

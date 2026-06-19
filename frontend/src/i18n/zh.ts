@@ -691,6 +691,14 @@ export default {
   "settings.pluginUnlockSynthetic": "模拟账号",
   "settings.pluginUnlockReal": "真实账号",
   "settings.pluginUnlockFailed": "切换插件解锁模式失败",
+  "settings.realAccountLoginTitle": "登录真实 ChatGPT 账号",
+  "settings.realAccountLoginPrompt":
+    "「真实账号」需要本机已登录 ChatGPT。点「去登录」会打开浏览器走 OpenAI OAuth,完成后自动切到真实账号。",
+  "settings.realAccountLoginRunning": "登录中…请在弹出的浏览器完成授权。",
+  "settings.realAccountLoginGo": "去登录",
+  "settings.realAccountLoginCancelBtn": "取消登录",
+  "settings.realAccountLoginOk": "已登录真实账号,正在切换",
+  "settings.realAccountLoginFailed": "登录失败",
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
   "settings.codexQuotaEnabledHint":
     "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",
