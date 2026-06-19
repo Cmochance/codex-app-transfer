@@ -32,6 +32,28 @@ const REGISTRY_PATH: &str = "registry.json";
 const SOURCES_FILE: &str = "marketplace-connector-sources.json";
 const OFFICIAL_ID: &str = "official";
 const CACHE_TTL: Duration = Duration::from_secs(60 * 30);
+/// fetch 响应体上限(registry / 图标都远小于此)—— 封顶防恶意/异常自加源返超大体 OOM / 撑爆缓存。
+const MAX_FETCH_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 流式读响应体并封顶(先看 Content-Length,再边读边累计防谎报)。
+async fn read_body_capped(resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    use futures::StreamExt;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_FETCH_BYTES {
+            return Err(format!("response too large: {len} bytes"));
+        }
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("read body: {e}"))?;
+        if buf.len() as u64 + chunk.len() as u64 > MAX_FETCH_BYTES {
+            return Err("response exceeds size cap".to_owned());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
 
 /// home 目录(对齐 src-tauri 其它处:`HOME` → `USERPROFILE`,不引 `dirs` crate)。
 fn home_dir() -> Option<PathBuf> {
@@ -170,10 +192,7 @@ async fn fetch_official(token: &str, path: &str) -> Result<Vec<u8>, String> {
     if !resp.status().is_success() {
         return Err(format!("github {} for {path}", resp.status().as_u16()));
     }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("read: {e}"))
+    read_body_capped(resp).await
 }
 
 /// 公开 URL 直取(自加源 registry / 图标)。
@@ -187,10 +206,7 @@ async fn fetch_public(url: &str) -> Result<Vec<u8>, String> {
     if !resp.status().is_success() {
         return Err(format!("http {} for {url}", resp.status().as_u16()));
     }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("read: {e}"))
+    read_body_capped(resp).await
 }
 
 /// 取某源 registry 文本(走缓存,除非 force)。
