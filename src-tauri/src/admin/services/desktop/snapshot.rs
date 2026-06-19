@@ -518,8 +518,16 @@ pub async fn apply_plugin_unlock_mode(
             // tokens + gateway key(deactivate 只翻 auth_mode 会丢 key → apikey 模式无 key、对话挂)。
             let pre_apply = ra::snapshot_active_auth_bytes();
             // 记是否真从 stash 还原了 + 还原出的真账号字节;失败回滚时 re-stash 回去(恢复「真账号在 stash」,
-            // 否则还原活动后真账号丢)。restore_stashed:active 非可用真账号才覆盖。
-            let restored_from_stash = ra::restore_stashed_real_auth().await?;
+            // 否则还原活动后真账号丢)。restore_stashed:active 非可用真账号才覆盖。[MOC-257 review] 它内部可能
+            // 已删活动 auth 才在 rename stash 时失败 → **不能直接 `?` 退出**(会留活动被删、pre_apply 未还原);
+            // 同 activate/relay 失败,先还原 pre_apply 再返。
+            let restored_from_stash = match ra::restore_stashed_real_auth().await {
+                Ok(v) => v,
+                Err(e) => {
+                    ra::restore_active_auth_bytes(pre_apply);
+                    return Err(e);
+                }
+            };
             let unstashed_real = if restored_from_stash {
                 ra::snapshot_active_auth_bytes()
             } else {
@@ -541,6 +549,10 @@ pub async fn apply_plugin_unlock_mode(
             if let Err(e) = ensure_relay_applied(state).await {
                 ra::restore_active_auth_bytes(pre_apply);
                 ra::restash_real_auth_bytes(unstashed_real);
+                // [MOC-257 review] 上面已 set_fake(false)。若 pre-apply 是合成态(prior synthetic),还原后要把
+                // 伪造**重新开上**(按还原后的活动是否合成决定)——否则合成 token 经现存 relay 透传 chatgpt.com
+                // 撞 401;非合成态(apikey/off)保持关。
+                codex_app_transfer_proxy::set_fake_account_mode(ra::active_is_synthetic());
                 return Err(e);
             }
             Ok(())
