@@ -684,9 +684,32 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
             let provider_id = provider_id.to_owned();
             let app_handle = app.clone();
             let proxy_manager = app.state::<Arc<ProxyManager>>().inner().clone();
+            let trace_viewer_manager = app
+                .state::<Arc<trace_viewer::TraceViewerManager>>()
+                .inner()
+                .clone();
             tauri::async_runtime::spawn(async move {
                 let _ =
-                    handlers::desktop::switch_provider_and_sync(proxy_manager, provider_id).await;
+                    handlers::desktop::switch_provider_and_sync(proxy_manager.clone(), provider_id)
+                        .await;
+                // [MOC-257 review] 托盘切 provider 走 switch_provider_and_sync 直调(绕过 set_default/
+                // add_provider handler 的 re-apply)→ 这里补上:切 provider 后 relay 可用,重 apply 当前
+                // 生效三态(非 off),否则无 provider 时启动跳过的 synthetic/real unlock 仍不生效。
+                let mode = crate::codex_real_account::resolve_plugin_unlock_mode();
+                if !matches!(mode, crate::codex_real_account::PluginUnlockMode::Off) {
+                    let st = AdminState {
+                        proxy_manager,
+                        trace_viewer_manager,
+                    };
+                    if let Err(e) =
+                        admin::services::desktop::snapshot::apply_plugin_unlock_mode(&st, mode)
+                            .await
+                    {
+                        tracing::warn!(
+                            "[PluginUnlock] 托盘切 provider 后 apply {mode:?} 失败: {e}"
+                        );
+                    }
+                }
                 refresh_tray_menu(&app_handle);
             });
         }

@@ -417,6 +417,21 @@ pub fn detect() -> RealAccountStatus {
     // auth_mode —— 清除切 apikey 后 tokens 仍在且未过期 → 账号状态仍「获取成功」、用户可再开。
     match locate_valid_chatgpt_tokens(&paths) {
         Some(found) => {
+            // [MOC-257 review] 活动是**合成账号**:它不是真账号(只是 chatgpt-shaped 占位),locate 会把它
+            // 当 Official 有效 token。但**不**能走真账号自愈 —— `clear_relogin_state` 会因合成指纹 ≠ 被撤销
+            // 真账号指纹而清掉撤销标记,使 stash 里被撤销的真账号「看起来可用」、后续切回 Real 撞 401;也不
+            // 报 logged_in(它不是真登录)。is_synthetic 透出供前端区分。
+            if found.value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+                return RealAccountStatus {
+                    logged_in: false,
+                    active_auth_mode: active_mode,
+                    account_id: None,
+                    source: AuthSource::None,
+                    has_imported,
+                    relogin_required: relogin_required(),
+                    is_synthetic: true,
+                };
+            }
             // [connector review 自愈] 活动文件就是有效真实 chatgpt = 账号当前确实可用 → 清掉可能
             // stale 的「需重新登录」标记(覆盖 app 外重新 codex login / 直接恢复活动文件场景)。
             // [MOC-124 H-2] 但**只在 token 真换了**时清:proxy 401 回灌记下了被撤销 token 的指纹,
