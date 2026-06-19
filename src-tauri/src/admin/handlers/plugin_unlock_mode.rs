@@ -26,8 +26,13 @@ use super::common::err;
 pub async fn status_handler() -> impl IntoResponse {
     Json(json!({
         "success": true,
-        // 当前**生效**三态(持久键优先,缺失则按真账号推导;real 不可用会降级 synthetic)。
-        "mode": codex_real_account::resolve_plugin_unlock_mode(),
+        // [MOC-257 review] 当前**实际生效**三态 = 最近成功 apply 的模式(回退 resolve)。**不**直接报
+        // resolve:外部 codex login 等会让 resolve 升级(synthetic→real)但未 apply,proxy 伪造态仍旧,
+        // 报 resolve 会让 UI 显示 Real 却仍 fabricate /backend-api。报 last-applied 才与实际行为一致。
+        "mode": codex_real_account::last_applied_mode()
+            .unwrap_or_else(codex_real_account::resolve_plugin_unlock_mode),
+        // resolve 推导出的「应当生效」模式(与 mode 不同 = 有待 apply 的升级,如外部登录后)。
+        "resolved": codex_real_account::resolve_plugin_unlock_mode(),
         // 持久值(用户是否手动设过);null = 未设、走默认推导。
         "persisted": super::settings::read_plugin_unlock_mode(),
         // 本地是否有真账号(活动或 stash,含失效的)。

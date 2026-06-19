@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -663,6 +663,11 @@ pub async fn import_auth(source_path: String) -> Result<(), String> {
             "不是可用的 chatgpt auth.json(需 auth_mode=chatgpt + access/refresh token)".to_owned(),
         );
     }
+    // [MOC-257 review] 拒绝把**模拟(合成)账号**导入为真实账号镜像 —— 合成文件也是 auth_mode=chatgpt +
+    // 满 token,parse_chatgpt_auth 不排除它;若导入会用合成覆盖真镜像、Real 模式日后再也恢复不回真账号。
+    if value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return Err("不能把模拟(合成)账号导入为真实账号".to_owned());
+    }
     // [connector review] 导入**不刷新** token;先按本地 JWT exp 判过期 —— 过期则**拒绝导入、
     // 不激活**(不让过期账号覆盖当前可用活动 + 镜像;否则 import_locked 已写活动,reconcile 之后
     // 还会从过期镜像恢复,等于默默激活了死账号)。有效 token 才落盘激活。
@@ -691,6 +696,11 @@ pub async fn pin_current_account() -> Result<(), String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let located = locate_chatgpt_auth(&paths).ok_or("未检测到可钉住的真实 chatgpt 账号")?;
+    // [MOC-257 review] 模拟(合成)账号态下别把合成账号钉成真实镜像(locate 经 parse_chatgpt_auth 不排除
+    // 合成)—— 否则合成覆盖真镜像、Real 模式恢复不回真账号。要求先切真实账号 / 登录。
+    if located.value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return Err("当前是模拟(合成)账号,无法钉为真实账号;请先登录真实账号".to_owned());
+    }
     // pin 钉的是 Official 活动账号(源即 ~/.codex,reconcile 已优先读 Official)→ 无外部源,
     // 传 None(纯快照保留 + 清掉旧 source 记录),避免 reconcile 误从 ~/.codex 绕一圈重读。
     import_locked(&paths, &located.value, None)
@@ -732,41 +742,28 @@ pub async fn forget_imported() -> Result<bool, String> {
 pub async fn activate_real_account() -> Result<bool, String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    // [MOC-257 review] 活动是**合成账号**时**不**当真账号 no-op —— 它也是 auth_mode=chatgpt、会被
-    // `parse_chatgpt_auth` / `active_is_real_chatgpt` 接受,若直接保留,切 real 会关伪造 + 把合成 token
-    // 发真 chatgpt.com 全 401、UI 却显示 Real。跳过下面「保留活动」两个分支,直接去镜像 / 活源恢复真账号
-    // (覆盖掉合成文件)。
-    let active_synthetic = read_auth(&paths.auth_json)
-        .ok()
-        .is_some_and(|v| v.get("cas_synthetic").and_then(Value::as_bool) == Some(true));
-    if !active_synthetic {
-        // 已是真实 chatgpt → no-op 成功。
-        if active_is_real_chatgpt(&paths) {
-            return Ok(true);
-        }
-        // 活动有有效 chatgpt tokens(但 auth_mode 非 chatgpt,如清除后的 apikey)→ 只改 auth_mode。
-        // [codex-review P2] 必须连本地 JWT 过期一起判 —— parse_chatgpt_tokens 只校验非空,清除后保留的
-        // token 会随时间过期;不检查会激活 expired token + 报 Ok(true),前端显示「已开启」但 runtime 全
-        // 401,还会 shadow 掉下面可能有效的镜像(本分支 early-return 在镜像分支前)。过期则 fall through
-        // 到镜像分支(下面会判过期再决定是否恢复)。
-        if let Ok(mut v) = read_auth(&paths.auth_json) {
-            if parse_chatgpt_tokens(&v).is_some() {
-                let access = v
-                    .get("tokens")
-                    .and_then(|t| t.get("access_token"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !access_token_expired(access, chrono::Utc::now().timestamp()) {
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
-                        obj.remove("OPENAI_API_KEY");
-                    }
-                    backup_active_auth(&paths, "preactivate")?;
-                    write_auth(&paths.auth_json, &v)
-                        .map_err(|e| format!("写回 chatgpt 失败: {e}"))?;
-                    return Ok(true);
-                }
+    // [MOC-257 review] 「保留活动」两个分支都用 `auth_value_real_and_usable`(非合成 + 非空 + 未撤销 +
+    // **未过期**)统一判定,不再用 `active_is_real_chatgpt`(它经 `parse_chatgpt_auth` 既接受合成、又
+    // 不查过期 → 合成会被当真账号 no-op + 把合成 token 发真 chatgpt.com 全 401;过期残留也会 no-op、
+    // 忽略下面可用的镜像/活源 → 同样 401)。不可用(合成/过期/撤销)则 fall through 到镜像 / 活源恢复。
+    let active = read_auth(&paths.auth_json).ok();
+    // 活动已是 `auth_mode=chatgpt` 的**可用**真账号 → no-op 成功。
+    if active.as_ref().is_some_and(|v| {
+        v.get("auth_mode").and_then(Value::as_str) == Some("chatgpt")
+            && auth_value_real_and_usable(v)
+    }) {
+        return Ok(true);
+    }
+    // 活动有可用真 tokens 但 auth_mode 非 chatgpt(如清除后的 apikey-with-tokens)→ 只改 auth_mode。
+    if let Some(mut v) = active {
+        if auth_value_real_and_usable(&v) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("auth_mode".into(), Value::String("chatgpt".into()));
+                obj.remove("OPENAI_API_KEY");
             }
+            backup_active_auth(&paths, "preactivate")?;
+            write_auth(&paths.auth_json, &v).map_err(|e| format!("写回 chatgpt 失败: {e}"))?;
+            return Ok(true);
         }
     }
     // 活动无可用真 token / 是合成 → 从持久镜像恢复整份(镜像有效且本地 JWT 未过期)。
@@ -1048,6 +1045,32 @@ pub fn resolve_plugin_unlock_mode() -> PluginUnlockMode {
                 PluginUnlockMode::Synthetic
             }
         }
+    }
+}
+
+/// [MOC-257 review] 最近一次**成功 apply** 的生效三态。0=未 apply 过 / 1=off / 2=synthetic / 3=real。
+/// 供 status 如实报告「**当前实际生效**」而非 `resolve_plugin_unlock_mode` 的「意图/推导」:外部
+/// `codex login` 等会让 resolve 升级(synthetic→real),但在下次 apply 前 proxy 伪造态仍是旧的 ——
+/// 报 resolve 会让 UI 显示 Real 却仍在 fabricate /backend-api。`apply_plugin_unlock_mode` 成功后写。
+static LAST_APPLIED_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// `apply_plugin_unlock_mode` 成功后调:记录最近成功生效的三态。
+pub fn record_applied_mode(mode: PluginUnlockMode) {
+    let v = match mode {
+        PluginUnlockMode::Off => 1,
+        PluginUnlockMode::Synthetic => 2,
+        PluginUnlockMode::Real => 3,
+    };
+    LAST_APPLIED_MODE.store(v, Ordering::SeqCst);
+}
+
+/// 最近成功 apply 的生效模式;还没 apply 过(启动前)→ `None`(caller 回退 `resolve`)。
+pub fn last_applied_mode() -> Option<PluginUnlockMode> {
+    match LAST_APPLIED_MODE.load(Ordering::SeqCst) {
+        1 => Some(PluginUnlockMode::Off),
+        2 => Some(PluginUnlockMode::Synthetic),
+        3 => Some(PluginUnlockMode::Real),
+        _ => None,
     }
 }
 

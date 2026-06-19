@@ -433,7 +433,7 @@ pub async fn apply_plugin_unlock_mode(
 ) -> Result<(), String> {
     use crate::codex_real_account as ra;
     use crate::codex_real_account::PluginUnlockMode as M;
-    match mode {
+    let result = match mode {
         M::Off => {
             // 真账号 stash 走、合成残留清 → 确保 ~/.codex 无 auth.json(用户硬性要求);proxy 不伪造。
             // **不**跑 sync_clearing —— 它(force_apikey apply)会重写一份 apikey auth.json,违背「无
@@ -483,7 +483,13 @@ pub async fn apply_plugin_unlock_mode(
             codex_app_transfer_proxy::set_fake_account_mode(false);
             ensure_relay_applied(state).await
         }
+    };
+    // [MOC-257 review] 成功生效 → 记录最近 apply 的模式,供 status 如实报告「当前实际生效」(外部
+    // codex login 让 resolve 升级但未 apply 时,报 resolve 会显示 Real 却仍 fabricate /backend-api)。
+    if result.is_ok() {
+        ra::record_applied_mode(mode);
     }
+    result
 }
 
 /// apply active provider 并校验 relay 真生效(active 仍 chatgpt + sync success)。供 synthetic/real 共用。
