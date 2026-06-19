@@ -188,27 +188,6 @@ pub fn active_is_real_chatgpt_now() -> bool {
         .unwrap_or(false)
 }
 
-/// [MOC-178 codex P2] 是否有「可恢复的」导入镜像(存在 + access/refresh 非空 + 本地 JWT 未过期)。
-/// 供 migrate seed 判定「老用户之前在用真实账号」—— 有有效镜像 = 用户导入/钉住过、legacy
-/// reconcile 会从它恢复活动 chatgpt。只读,不写盘。
-pub fn has_restorable_imported_mirror() -> bool {
-    let Ok(paths) = CodexPaths::from_home_env() else {
-        return false;
-    };
-    let Some(v) = read_imported_mirror(&paths) else {
-        return false;
-    };
-    if parse_chatgpt_tokens(&v).is_none() {
-        return false;
-    }
-    let access = v
-        .get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    !access_token_expired(access, chrono::Utc::now().timestamp())
-}
-
 /// 从一个 `auth.json` Value 判断是否是**可用**的 chatgpt 登录态。
 /// 可用 = `auth_mode=="chatgpt"` 且 `tokens.{access_token,refresh_token}` 均非空。
 /// 返回 `account_id`(可能为 None)。
@@ -1527,5 +1506,69 @@ mod tests {
             Some(SYNTHETIC_ACCOUNT_ID),
             "payload 必须含非空 chatgpt_account_id(resolver 放行条件)"
         );
+    }
+
+    // ── [MOC-257] 三态 stash 原语单测 ────────────────────────────────────────
+
+    /// stash 存在 + 活动非真账号(合成/apikey/无)→ 整文件还原到活动、stash 消费。
+    #[test]
+    fn restore_stash_moves_to_active_when_active_not_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(&real_account_stash_path(&paths), &chatgpt_auth());
+        // 活动是合成账号 → 应被 stash 真账号覆盖。
+        write_json(
+            &paths.auth_json,
+            &json!({"auth_mode": "chatgpt", "cas_synthetic": true,
+                    "tokens": {"access_token": "syn", "refresh_token": "syn"}}),
+        );
+        assert!(restore_stashed_real_auth_impl(&paths).unwrap(), "应还原");
+        assert!(!real_account_stash_path(&paths).is_file(), "stash 应消费");
+        let restored = read_auth(&paths.auth_json).unwrap();
+        assert_eq!(
+            restored.get("cas_synthetic"),
+            None,
+            "活动应是真账号(无哨兵)"
+        );
+        assert!(
+            parse_chatgpt_tokens(&restored).is_some(),
+            "活动应有真 tokens"
+        );
+    }
+
+    /// [review 数据安全] 活动已是**更新真账号**(app 外 login)→ 不覆盖;旧 stash **改名归档**
+    /// (不直删,留可恢复副本),返 false。
+    #[test]
+    fn restore_archives_stash_when_active_already_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(&paths.auth_json, &chatgpt_auth()); // 活动真账号(更新)
+        write_json(&real_account_stash_path(&paths), &chatgpt_auth()); // stash 旧真账号
+        assert!(
+            !restore_stashed_real_auth_impl(&paths).unwrap(),
+            "活动已是真账号 → 不还原"
+        );
+        assert!(
+            !real_account_stash_path(&paths).is_file(),
+            "stash 应被移走(归档)"
+        );
+        let archived = std::fs::read_dir(paths.app_home.join("real-account"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("discarded-stash-")
+            })
+            .count();
+        assert_eq!(archived, 1, "应有一份归档副本(不直删,防丢账号)");
+    }
+
+    /// 无 stash → no-op 返 false。
+    #[test]
+    fn restore_noop_when_no_stash() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        assert!(!restore_stashed_real_auth_impl(&paths).unwrap());
     }
 }

@@ -479,57 +479,6 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
     }
 }
 
-/// [MOC-104] 真实账号失效时自动关「自动解锁 Codex Plugins」开关 + 停 daemon。
-/// 仅在当前为 on 时动作(返回 `true`),避免重复 no-op。复用 save_settings 同款
-/// "开关变更即时停 daemon"逻辑。
-pub async fn disable_auto_unlock_codex_plugins() -> bool {
-    let changed = with_config_write(|cfg| {
-        let was_on = cfg
-            .get("settings")
-            .and_then(|s| s.get("autoUnlockCodexPlugins"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if !was_on {
-            return Ok(ConfigMutation::Unchanged(false));
-        }
-        ensure_settings_object(cfg).insert("autoUnlockCodexPlugins".to_owned(), Value::Bool(false));
-        Ok(ConfigMutation::Modified(true))
-    })
-    .unwrap_or(false);
-    if changed {
-        crate::admin::handlers::plugin_unlock::get_service()
-            .await
-            .stop()
-            .await;
-    }
-    changed
-}
-
-/// [MOC-104] 一次性迁移:老版本 `autoUnlockCodexPlugins` 默认 true 直接驱动 CDP 伪造
-/// 注入 daemon —— 但只有活动 auth.json 不是真实 chatgpt 时该注入才造成不匹配 →
-/// Codex 启动重新初始化(高延迟)。真实账号模式上线后,高延迟 CDP 路径改为「显式
-/// 强制开启」才走;升级用户残留的旧 `true` 不该默默把人按在高延迟路径上。
-///
-/// 首次启动检测到没迁移过 → **硬重置 `autoUnlockCodexPlugins=false`**(用户指示),
-/// 之后只有「强制开启」按钮 / 用户手动开开关才会置回 true。幂等:迁移标记已置则
-/// no-op,不会反复覆盖用户后来的选择。返回本次是否执行了重置(供日志)。
-pub fn migrate_real_account_unlock_v1() -> bool {
-    with_config_write(|cfg| {
-        let s = ensure_settings_object(cfg);
-        let already = s
-            .get("realAccountUnlockMigratedV1")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if already {
-            return Ok(ConfigMutation::Unchanged(false));
-        }
-        s.insert("realAccountUnlockMigratedV1".to_owned(), Value::Bool(true));
-        s.insert("autoUnlockCodexPlugins".to_owned(), Value::Bool(false));
-        Ok(ConfigMutation::Modified(true))
-    })
-    .unwrap_or(false)
-}
-
 /// [MOC-178] 真实账号模式持久开关(用户意图)。三态:键缺失=未设(走迁移)/ true=开 / false=
 /// 用户主动关。**独立于活动 auth.json、不被退出 restore 撤销** —— 解决「清除后重启又自动开」。
 /// 跟 `autoUnlockCodexPlugins`(无账号时的强制 CDP daemon 档)是两个独立开关。
@@ -608,34 +557,6 @@ pub fn migrate_plugin_unlock_mode_v1() -> bool {
         Some(m) => set_plugin_unlock_mode(m),
         None => false,
     }
-}
-
-/// [MOC-178] 一次性迁移:首次落定 `realAccountModeEnabled` 初值,不突变老用户。键已存在 →
-/// no-op(幂等);不存在 → 按当前是否有可用真实账号(`detect().logged_in`,新口径认 token)
-/// 决定:有账号 → true(老用户保持开)、无账号 → false(与现状一致)。返回是否执行了写入。
-pub fn migrate_real_account_mode_v1() -> bool {
-    let already = crate::admin::registry_io::load()
-        .ok()
-        .map(|cfg| {
-            cfg.get("settings")
-                .and_then(|s| s.get("realAccountModeEnabled"))
-                .is_some()
-        })
-        .unwrap_or(false);
-    if already {
-        return false;
-    }
-    // [MOC-178 codex P2] seed 只认「活动**真** chatgpt」(relay 在用),不用 detect().logged_in ——
-    // 后者认 token,会把「chatgpt login 后切 apikey、活动 auth_mode=apikey 但 tokens 残留」误判成
-    // 有账号 → flag=true 但 reconcile 无法从 token-only apikey activate、前端却据 flag 显示 mode on
-    // (plugins 仍 locked)。活动真 chatgpt 才是「之前在用真实账号 relay」的可靠信号。
-    // [MOC-178 codex P2] seed = 活动真 chatgpt(relay 在用)**或**有可恢复的导入镜像(import/pin 过、
-    // legacy reconcile 会从镜像恢复)。只认前者会把「有有效镜像但活动 apikey」的老用户误 seed false →
-    // reconcile(Some(false)) 走 ForceDisable 在读镜像前就关了,静默禁用其真实账号模式。仍排除
-    // token-only apikey 活动文件(active_is_real_chatgpt_now 要 auth_mode==chatgpt、镜像分支判过期)。
-    let has_account = crate::codex_real_account::active_is_real_chatgpt_now()
-        || crate::codex_real_account::has_restorable_imported_mirror();
-    set_real_account_mode_enabled(has_account)
 }
 
 /// #262:把 `settings.language` 同步到 adapters 全局 [`codex_app_transfer_adapters::core::language`]。

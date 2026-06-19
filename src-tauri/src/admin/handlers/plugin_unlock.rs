@@ -1,108 +1,23 @@
-//! `/api/desktop/plugin-unlock/*` — Codex Desktop Plugins 解锁 HTTP API.
+//! Codex Desktop Plugins 解锁 daemon 单例(CDP 注入,MOC-100)。
 //!
-//! 前端通过这组 API 控制解锁服务:
-//! - GET  /api/desktop/plugin-unlock/status   → 查询当前状态
-//! - POST /api/desktop/plugin-unlock/start    → 启动守护循环
-//! - POST /api/desktop/plugin-unlock/stop     → 停止守护循环
-//! - POST /api/desktop/plugin-unlock/reinject → 手动触发重新注入
+//! [MOC-257] 原 HTTP API(`/api/desktop/plugin-unlock/{status,start,stop,reinject}`)已废弃 —— 插件
+//! 解锁改由三态选择器([`super::plugin_unlock_mode`],`/api/desktop/plugin-unlock/*`)接管同一命名空间。
+//! 本文件仅保留 daemon 单例 [`get_service`],供 `main.rs` 退出时停 daemon + `settings` 的
+//! `autoUnlockCodexPlugins` 设置变更时 start/stop(CDP 强制档,无 UI 入口、默认不启,见三态废弃说明)。
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
-use serde_json::{json, Value};
-
-use crate::codex_plugin_unlocker::{PluginUnlockService, UnlockStatus};
-
-use super::super::state::AdminState;
-use super::common::err;
-
-/// 解锁服务实例（全局单例，通过 OnceCell/Lazy 初始化）
 use tokio::sync::OnceCell;
+
+use crate::codex_plugin_unlocker::PluginUnlockService;
 
 static UNLOCK_SERVICE: OnceCell<Arc<PluginUnlockService>> = OnceCell::const_new();
 
-/// 拿 OnceCell 内的解锁服务单例,前端 HTTP handler 跟 `main.rs` setup hook
-/// 都通过这个共享同一实例,避免 auto-start 跟手动 start 各跑一份 daemon。
+/// 拿 OnceCell 内的解锁服务单例。`main.rs` 退出 hook 跟 `settings` 设置变更共享同一实例,
+/// 避免各跑一份 daemon。
 pub async fn get_service() -> Arc<PluginUnlockService> {
     UNLOCK_SERVICE
         .get_or_init(|| async { Arc::new(PluginUnlockService::with_defaults()) })
         .await
         .clone()
-}
-
-// ── HTTP Handlers ──
-
-/// GET /api/desktop/plugin-unlock/status
-pub async fn status_handler() -> impl IntoResponse {
-    let service = get_service().await;
-    let status = service.status().await;
-
-    let (code, message) = match &status {
-        UnlockStatus::Disconnected => ("disconnected", "Codex Desktop 未运行或无调试端口"),
-        UnlockStatus::Connecting => ("connecting", "正在连接 CDP..."),
-        UnlockStatus::Connected => ("connected", "已连接，等待注入"),
-        UnlockStatus::Injected => ("injected", "✅ Plugins 已解锁"),
-        UnlockStatus::Failed { error } => ("failed", error.as_str()),
-    };
-
-    Json(json!({
-        "success": true,
-        "status": code,
-        "message": message,
-        "detail": status
-    }))
-}
-
-/// POST /api/desktop/plugin-unlock/start
-pub async fn start_handler() -> impl IntoResponse {
-    let service = get_service().await;
-
-    // [MOC-100 P2-2] start() 现已基于 running flag 幂等,重复调用安全 —— 包括
-    // 退避中 status=Disconnected 但 daemon task 仍在跑的情况(旧的按 status 去重
-    // 会漏掉它再 spawn 一个 task 抢同一 receiver)。无需再按 status 手动去重。
-    service.start();
-
-    Json(json!({
-        "success": true,
-        "message": "解锁服务已启动"
-    }))
-}
-
-/// POST /api/desktop/plugin-unlock/stop
-pub async fn stop_handler() -> impl IntoResponse {
-    let service = get_service().await;
-    service.stop().await;
-
-    Json(json!({
-        "success": true,
-        "message": "解锁服务已停止"
-    }))
-}
-
-/// POST /api/desktop/plugin-unlock/reinject
-pub async fn reinject_handler() -> impl IntoResponse {
-    let service = get_service().await;
-    service.reinject().await;
-
-    Json(json!({
-        "success": true,
-        "message": "已请求重新注入"
-    }))
-}
-
-/// 组装路由
-pub fn routes() -> Router<AdminState> {
-    Router::new()
-        .route("/api/desktop/plugin-unlock/status", get(status_handler))
-        .route("/api/desktop/plugin-unlock/start", post(start_handler))
-        .route("/api/desktop/plugin-unlock/stop", post(stop_handler))
-        .route(
-            "/api/desktop/plugin-unlock/reinject",
-            post(reinject_handler),
-        )
 }
