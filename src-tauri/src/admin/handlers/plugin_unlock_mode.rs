@@ -115,6 +115,16 @@ pub async fn set_handler(
                 let _ = super::settings::clear_plugin_unlock_mode();
             }
         }
+        // [MOC-257 review] apply 非事务化:synthetic/real 分支可能已 stash/写 auth.json + 开伪造,才在
+        // ensure_relay_applied 失败 → auth/proxy 停在半生效态(与回滚后的 UI/持久不一致)。best-effort
+        // 重新 apply 回滚后的生效模式,把 auth/proxy 拉回一致;再失败只 log(下次启动 reconcile 兜底)。
+        let restored = codex_real_account::resolve_plugin_unlock_mode();
+        if let Err(e2) =
+            crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, restored)
+                .await
+        {
+            tracing::error!("[PluginUnlock] set 失败后回滚重 apply({restored:?})也失败: {e2}");
+        }
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }
     let degraded =

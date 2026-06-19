@@ -386,25 +386,44 @@ fn main() {
                             .clone(),
                         trace_viewer_manager: Arc::new(trace_viewer::TraceViewerManager::new()),
                     };
-                    // real 模式:先跑真账号 reconcile(从导入镜像恢复 / relogin 检测,MOC-104 保留)。
-                    if mode == crate::codex_real_account::PluginUnlockMode::Real {
-                        if let Ok(crate::codex_real_account::ReconcileOutcome::ReloginRequired {
-                            ..
-                        }) = crate::codex_real_account::reconcile_on_startup(Some(true)).await
-                        {
-                            if let Some(window) =
-                                app_handle_for_residual_scan.get_webview_window("main")
+                    // [MOC-257 review] synthetic/real 需 relay(chatgpt_base_url→proxy)才自洽;无 active
+                    // provider 时 relay 起不来,若仍写合成/真 auth.json,Codex 会直连 chatgpt.com(合成 token
+                    // 全 401、真账号也绕过 proxy)。无 provider → 跳过 apply(对齐 set 端点 provider gate),
+                    // 保持 restore 后的 auth.json 不动(不写无 relay 的合成态)。
+                    let relay_ok =
+                        admin::services::desktop::snapshot::active_provider_supports_relay();
+                    if matches!(
+                        mode,
+                        crate::codex_real_account::PluginUnlockMode::Synthetic
+                            | crate::codex_real_account::PluginUnlockMode::Real
+                    ) && !relay_ok
+                    {
+                        tracing::warn!(
+                            "[PluginUnlock] 启动跳过 apply {mode:?}:无 active provider、relay 起不来,不写无 relay 的解锁态"
+                        );
+                    } else {
+                        // real 模式:先跑真账号 reconcile(从导入镜像恢复 / relogin 检测,MOC-104 保留)。
+                        if mode == crate::codex_real_account::PluginUnlockMode::Real {
+                            if let Ok(
+                                crate::codex_real_account::ReconcileOutcome::ReloginRequired { .. },
+                            ) = crate::codex_real_account::reconcile_on_startup(Some(true)).await
                             {
-                                let _ = window.emit("real-account-relogin-required", ());
+                                if let Some(window) =
+                                    app_handle_for_residual_scan.get_webview_window("main")
+                                {
+                                    let _ = window.emit("real-account-relogin-required", ());
+                                }
                             }
                         }
-                    }
-                    match admin::services::desktop::snapshot::apply_plugin_unlock_mode(&st, mode)
-                        .await
-                    {
-                        Ok(()) => tracing::info!("[PluginUnlock] 启动调谐:已应用三态 {mode:?}"),
-                        Err(e) => {
-                            tracing::warn!("[PluginUnlock] 启动调谐 apply {mode:?} 失败(忽略): {e}")
+                        match admin::services::desktop::snapshot::apply_plugin_unlock_mode(&st, mode)
+                            .await
+                        {
+                            Ok(()) => tracing::info!("[PluginUnlock] 启动调谐:已应用三态 {mode:?}"),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[PluginUnlock] 启动调谐 apply {mode:?} 失败(忽略): {e}"
+                                )
+                            }
                         }
                     }
                 }
