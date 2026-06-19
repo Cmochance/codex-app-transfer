@@ -89,6 +89,14 @@ fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
+        // 只跟 https 重定向 —— 否则 https 源 / 图标可 30x 降级到 http,绕过 add_source 的 https 强制。
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.url().scheme() == "https" {
+                attempt.follow()
+            } else {
+                attempt.error("refusing redirect to non-https (downgrade)")
+            }
+        }))
         .build()
         .map_err(|e| format!("reqwest build: {e}"))
 }
