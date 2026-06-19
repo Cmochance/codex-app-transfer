@@ -596,7 +596,18 @@ pub fn migrate_plugin_unlock_mode_v1() -> bool {
         None // autoUnlock 也缺 → 留给默认推导
     };
     match mode {
-        Some(m) => set_plugin_unlock_mode(m),
+        Some(m) => {
+            // [MOC-257 review] 设新三态 **+ 清掉 legacy autoUnlockCodexPlugins**:它迁移后仍被 launcher
+            // `should_attach_debug_port` + settings 热重载消费(开 Codex 远程调试端口 / 旧 CDP 解锁路径),新 UI
+            // 不再暴露 → 留 true 会让升级用户即便迁到 synthetic/real 仍以调试端口启 Codex。同写一次避免中间态。
+            with_config_write(|cfg| {
+                let s = ensure_settings_object(cfg);
+                s.insert("pluginUnlockMode".to_owned(), Value::String(m.to_owned()));
+                s.remove("autoUnlockCodexPlugins");
+                Ok(ConfigMutation::Modified(true))
+            })
+            .unwrap_or(false)
+        }
         None => false,
     }
 }

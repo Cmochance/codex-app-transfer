@@ -723,6 +723,19 @@ pub async fn pin_current_account() -> Result<(), String> {
     import_locked(&paths, &located.value, None)
 }
 
+/// [MOC-257 review] [`pin_current_account`] 的**同步版**,供 `codex login` 的 reap 线程(plain `std::thread`,
+/// 非 async runtime 线程 → `blocking_lock` 安全)在登录成功后**立即**钉账号进镜像。不能只靠前端轮询 pin ——
+/// 页面关 / app 退出来不及看到 `succeeded` 时账号就没进 mirror、退出 restore 重放登录前快照会抹掉它。
+pub fn pin_current_account_blocking() -> Result<(), String> {
+    let _guard = AUTH_LOCK.blocking_lock();
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let located = locate_chatgpt_auth(&paths).ok_or("未检测到可钉住的真实 chatgpt 账号")?;
+    if located.value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return Err("当前是模拟(合成)账号,无法钉为真实账号;请先登录真实账号".to_owned());
+    }
+    import_locked(&paths, &located.value, None)
+}
+
 /// 忘记导入的真实账号(删持久镜像)= 退出"真实账号长期生效"。删镜像后启动不再
 /// 自动恢复。删除已不存在的镜像视作成功(幂等)。
 /// [review #1] 持 `AUTH_LOCK`,避免与 in-flight reconcile/import 竞态(删了之后 reconcile
@@ -1440,6 +1453,12 @@ pub fn start_login() -> Result<(), String> {
         g.last = match result {
             Ok(out) if out.status.success() => {
                 clear_relogin_state(); // [MOC-124 H-2] 登录成功 = 拿到新鲜账号,清失效标记 + 撤销指纹
+                                       // [MOC-257 review] 登录成功后**后端立即 pin** 当前账号进镜像,不依赖前端轮询(页面关 / app
+                                       // 退出来不及看到 succeeded 时账号没进 mirror、退出 restore 重放登录前快照会抹掉它)。失败留痕
+                                       // (前端成功路径仍会再 pin 一次兜底)。
+                if let Err(e) = pin_current_account_blocking() {
+                    tracing::warn!("[RealAccount] 登录成功后后端 pin 账号失败(前端会重试): {e}");
+                }
                 LoginState::Succeeded
             }
             Ok(out) => {
