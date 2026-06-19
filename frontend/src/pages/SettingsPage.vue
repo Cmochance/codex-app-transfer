@@ -108,9 +108,14 @@ const pluginUnlockOptions: { value: PluginUnlockMode; label: string }[] = [
   { value: 'real', label: t('settings.pluginUnlockReal') },
 ]
 async function onSetPluginUnlockMode(mode: PluginUnlockMode) {
-  // no-op 判**持久意图**(persistedMode)而非 displayed:降级后 displayed=synthetic / persisted=real,
-  // 点 synthetic 仍应能把意图改成 synthetic(settle)。
-  if (pluginUnlockBusy.value || mode === persistedMode.value) return
+  // no-op 只在「持久意图 **且** 当前已生效」都等于点击档时(真没东西可改);否则放行 apply:
+  // ① 降级(persisted=real / displayed=synthetic):点 synthetic 改意图 settle、点 real 重试;
+  // ② 启动跳过 apply(persisted=某档 / displayed=null 未生效):点该档才能真应用上。
+  if (
+    pluginUnlockBusy.value ||
+    (mode === persistedMode.value && mode === pluginUnlockMode.value)
+  )
+    return
   pluginUnlockBusy.value = true
   const prevDisplay = pluginUnlockMode.value
   const prevPersisted = persistedMode.value
