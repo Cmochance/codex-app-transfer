@@ -474,21 +474,12 @@ fn main() {
                         {
                             Ok(()) => tracing::info!("[PluginUnlock] 启动调谐:已应用三态 {mode:?}"),
                             Err(e) => {
-                                // [MOC-257 review] apply 非事务化:synthetic 可能已 stash/写合成 + 开伪造
-                                // 才在 ensure_relay 失败 → 半生效态(合成 active + 伪造开但无 relay → Codex
-                                // 直连 chatgpt.com 401)。best-effort 收拾:关伪造 + 还原真账号(un-stash);
-                                // 无真账号可还原且仍是合成 active → 清掉,使 Codex 退回无账号(不发
-                                // /backend-api)而非合成 401。
+                                // [MOC-257 review] auth/proxy 回滚**不在这里做**:apply_plugin_unlock_mode
+                                // 已事务化自清理(失败还原 pre-apply 字节 + 视情 re-stash + 关伪造),活动态已
+                                // 回 apply 前。再叠一层 un-stash(restore_stashed)会在自回滚之上重复动作 ——
+                                // 如从「已是合成态 + 真账号在 stash」re-apply synthetic 失败时,把真账号挪回活动、
+                                // 留 persisted synthetic + real-active 无 relay。只 log。
                                 tracing::error!("[PluginUnlock] 启动调谐 apply {mode:?} 失败: {e}");
-                                codex_app_transfer_proxy::set_fake_account_mode(false);
-                                let restored =
-                                    crate::codex_real_account::restore_stashed_real_auth()
-                                        .await
-                                        .unwrap_or(false);
-                                if !restored && crate::codex_real_account::active_is_synthetic() {
-                                    let _ =
-                                        crate::codex_real_account::clear_active_auth_file().await;
-                                }
                             }
                         }
                     }
