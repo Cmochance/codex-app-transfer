@@ -512,7 +512,7 @@ pub async fn apply_plugin_unlock_mode(
             // 事务字节快照(stash 后的活动:真账号已移走、剩 apikey / 空 / 旧合成)。activate 覆写成合成,
             // 失败回滚:还原它(恢复原 apikey)。否则从 apikey 切 synthetic 失败时下面只清合成 → 原 apikey 丢
             // (stash 不收 apikey)。
-            let pre_synth = ra::snapshot_active_auth_bytes();
+            let pre_synth = ra::snapshot_active_auth_bytes()?;
             if let Err(e) = ra::activate_fake_account().await {
                 tracing::error!("[PluginUnlock] synthetic activate 失败,回滚: {e}");
                 let restore_r = ra::restore_active_auth_bytes(pre_synth);
@@ -565,7 +565,7 @@ pub async fn apply_plugin_unlock_mode(
             // 失败回滚要还原它,而非 restore_stashed **之后**已 unstash 的真账号(还原成后者会留 real-active 无
             // relay)。activate 还会把 apikey-with-tokens 改写成 chatgpt + 移除 `OPENAI_API_KEY`,字节快照保
             // tokens + gateway key(deactivate 只翻 auth_mode 会丢 key → apikey 模式无 key、对话挂)。
-            let pre_apply = ra::snapshot_active_auth_bytes();
+            let pre_apply = ra::snapshot_active_auth_bytes()?;
             // 记是否真从 stash 还原了 + 还原出的真账号字节;失败回滚时 re-stash 回去(恢复「真账号在 stash」,
             // 否则还原活动后真账号丢)。restore_stashed:active 非可用真账号才覆盖。[MOC-257 review] 它内部可能
             // 已删活动 auth 才在 rename stash 时失败 → **不能直接 `?` 退出**(会留活动被删、pre_apply 未还原);
@@ -578,7 +578,7 @@ pub async fn apply_plugin_unlock_mode(
                 }
             };
             let unstashed_real = if restored_from_stash {
-                ra::snapshot_active_auth_bytes()
+                ra::snapshot_active_auth_bytes()?
             } else {
                 None
             };

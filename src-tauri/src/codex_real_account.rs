@@ -1149,12 +1149,19 @@ fn archive_existing_auth_file(paths: &CodexPaths, path: &std::path::Path) -> boo
 }
 
 /// [MOC-257 review] 读活动 `auth.json` 原始字节快照,供 apply 失败**事务回滚**(保留原 tokens + gateway
-/// key + 全部字段,不像 `deactivate_real_account` 只翻 `auth_mode` 会丢 `OPENAI_API_KEY`)。文件不存在 →
-/// `None`。只读。
-pub fn snapshot_active_auth_bytes() -> Option<Vec<u8>> {
-    CodexPaths::from_home_env()
-        .ok()
-        .and_then(|p| std::fs::read(&p.auth_json).ok())
+/// key + 全部字段,不像 `deactivate_real_account` 只翻 `auth_mode` 会丢 `OPENAI_API_KEY`)。只读。
+/// **fallible + 区分**:文件不存在 → `Ok(None)`(回滚时删活动 = 还原到无 auth);存在但**读失败**(权限/锁)
+/// → `Err`,caller 必须 abort 切换 —— 否则错误地拿 `None` 当「apply 前无 auth」,回滚 `restore_active_auth_bytes(None)`
+/// 会把这份**不可读但存在**的真账号删掉丢凭据。
+pub fn snapshot_active_auth_bytes() -> Result<Option<Vec<u8>>, String> {
+    let p = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    match std::fs::read(&p.auth_json) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "读活动 auth.json 字节失败(文件存在但不可读),已中止切换以免回滚误删: {e}"
+        )),
+    }
 }
 
 /// [MOC-257 review] 把 auth 文件设 0600(Unix)。`std::fs::write` 默认 `0666 & umask`,多用户共享 home + umask
@@ -1221,8 +1228,16 @@ pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String
 pub async fn stash_displaced_real_auth() -> Result<bool, String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    let Ok(v) = read_auth(&paths.auth_json) else {
-        return Ok(false); // 无 auth.json
+    // [MOC-257 review] read_auth 对**不存在 / 空**返 Ok({})(→ 下面 parse_chatgpt_tokens None 返 Ok(false));
+    // Err = 文件**存在但读/解析失败**(权限/锁/损坏 JSON)→ **绝不返 Ok(false) 当「无账号」继续**(OFF 接着
+    // clear_active_auth_file / synthetic activate 覆写会删掉这份不可读的真账号丢凭据)→ abort 切换。
+    let v = match read_auth(&paths.auth_json) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!(
+                "活动 auth.json 存在但读取/解析失败,已中止切换以免误删真账号(请检查 ~/.codex/auth.json): {e}"
+            ));
+        }
     };
     if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
         return Ok(false); // 合成账号 → 不动(synthetic 的 activate no-op / off 的 clear 各自处理)
