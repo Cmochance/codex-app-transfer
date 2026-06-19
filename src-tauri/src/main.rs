@@ -258,10 +258,21 @@ fn main() {
             // 的 legacy config,若不先折叠成 pluginUnlockMode,这里早期 resolve 会按缺键默认从残留 tokens
             // 推成 real/synthetic、预置错的伪造态(post-apply 的 migrate 才纠正,中间窄窗已发错报文)。
             let _ = handlers::settings::migrate_plugin_unlock_mode_v1();
-            codex_app_transfer_proxy::set_fake_account_mode(
-                crate::codex_real_account::resolve_plugin_unlock_mode()
-                    == crate::codex_real_account::PluginUnlockMode::Synthetic,
-            );
+            // [MOC-257 review] 只在 synthetic **且 startup 真会 apply**(autoApplyOnStart + 有 active
+            // provider)时预开伪造器:apply 被跳过(autoApplyOnStart=false / 无 provider)时没写 relay,若仍
+            // 开伪造,旧 / 残留 Codex config 指向本 proxy 的 /backend-api 会被伪造(尽管解锁档没真应用)。
+            let will_apply_synthetic = crate::codex_real_account::resolve_plugin_unlock_mode()
+                == crate::codex_real_account::PluginUnlockMode::Synthetic
+                && handlers::settings::load_registry_for_startup_language_sync()
+                    .ok()
+                    .and_then(|cfg| {
+                        cfg.get("settings")
+                            .and_then(|s| s.get("autoApplyOnStart"))
+                            .and_then(|v| v.as_bool())
+                    })
+                    .unwrap_or(true)
+                && admin::services::desktop::snapshot::active_provider_supports_relay();
+            codex_app_transfer_proxy::set_fake_account_mode(will_apply_synthetic);
 
             // #MOC-54:保留 JoinHandle,让下面的残留扫描能 await auto_apply
             // 真正跑完(确定性),而不是用固定 sleep 猜它有没有落盘。
