@@ -703,7 +703,12 @@ async fn ensure_bg_data_uri(theme_id: &str, fallback: &str) -> String {
                 if let Some(dir) = p.parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
-                let _ = std::fs::write(p, &bytes);
+                // atomic:写 tmp 再 rename —— 中途被 kill / 写错只留半截 tmp,不会让
+                // 后续 ensure_bg_data_uri 把残缺 <id>.jpg 当有效缓存返回坏图。
+                let tmp = p.with_extension("jpg.tmp");
+                if std::fs::write(&tmp, &bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, p);
+                }
             }
             encode_data_uri("image/jpeg", &bytes)
         }
