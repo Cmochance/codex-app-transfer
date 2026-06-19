@@ -1,6 +1,6 @@
 //! 连接器市场(多源)— 官方源(公开 storage 仓库镜像)+ 用户自加源,聚合展示(MOC-7 phase2)。
 //!
-//! - **官方源**:`Cmochance/codex-app-transfer-storage`(public),走 `raw.githubusercontent.com` 公开直取(无 token)。
+//! - **官方源**:`Cmochance/codex-app-transfer-storage`(public)的 `plugins/codex/`,走 `raw.githubusercontent.com` 公开直取(无 token)。
 //! - **自加源**:用户加的公开 `registry.json` URL(同 `{connectors,categories}` schema),直取。
 //!
 //! - `GET  /api/marketplace/connectors`       → 聚合所有启用源(返 sources[含 count] + connectors + categories + errors)
@@ -28,6 +28,8 @@ use super::common::err;
 
 const STORAGE_REPO: &str = "Cmochance/codex-app-transfer-storage";
 const STORAGE_BRANCH: &str = "main";
+/// 官方源资源在 storage 仓库的子目录(仓库已多资源化:`plugins/codex/` + `img/theme/`)。
+const OFFICIAL_BASE: &str = "plugins/codex";
 const REGISTRY_PATH: &str = "registry.json";
 const SOURCES_FILE: &str = "marketplace-connector-sources.json";
 const OFFICIAL_ID: &str = "official";
@@ -196,7 +198,7 @@ async fn source_registry(src: &ConnectorSource, force: bool) -> Result<String, S
         }
     }
     let bytes = if src.official {
-        fetch_official(REGISTRY_PATH).await?
+        fetch_official(&format!("{OFFICIAL_BASE}/{REGISTRY_PATH}")).await?
     } else {
         let url = src.url.as_deref().ok_or("源缺 url")?;
         fetch_public(url).await?
@@ -424,7 +426,7 @@ pub async fn icon(Query(q): Query<IconQuery>) -> impl IntoResponse {
         {
             return err(StatusCode::BAD_REQUEST, "invalid icon path").into_response();
         }
-        fetch_official(&path).await
+        fetch_official(&format!("{OFFICIAL_BASE}/{path}")).await
     } else {
         // 自加源:按该源 url 解析 path(用户自配的源,本地 app 内 SSRF 风险可接受)。
         let sources = read_sources();
