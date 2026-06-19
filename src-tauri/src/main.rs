@@ -391,8 +391,25 @@ fn main() {
                     };
                     if fake_engaged {
                         codex_app_transfer_proxy::set_fake_account_mode(true);
+                        // [MOC-257 真机] 补 apply relay:auto_apply 在合成 auth.json 写盘**之前**跑过、
+                        // 当时 preserve_chatgpt_auth=false → 只写了 openai_base_url、没写 chatgpt_base_url。
+                        // 合成账号(auth_mode=chatgpt)写好后这里重新 apply,active_is_real_chatgpt_now 为真 →
+                        // 写 chatgpt_base_url→proxy,否则 Codex 的 /backend-api 直连真 chatgpt.com、伪造拦不到
+                        // (假 token 撞 401)。与 enable_handler 的「activate 后 sync」对齐。
+                        let st = AdminState {
+                            proxy_manager: app_handle_for_residual_scan
+                                .state::<Arc<ProxyManager>>()
+                                .inner()
+                                .clone(),
+                            trace_viewer_manager: Arc::new(
+                                trace_viewer::TraceViewerManager::new(),
+                            ),
+                        };
+                        let _ =
+                            admin::services::desktop::snapshot::sync_desktop_for_active_provider(&st)
+                                .await;
                         tracing::info!(
-                            "[FakeAccount] 启动调谐:模拟账号模式生效,跳过真实账号 reconcile"
+                            "[FakeAccount] 启动调谐:模拟账号模式生效(已 apply relay),跳过真实账号 reconcile"
                         );
                     } else {
                     // 未 engage(无 provider / 真账号占用):持久关 fake flag(避免悬挂)+ 关 proxy 伪造,

@@ -893,10 +893,14 @@ pub async fn activate_fake_account() -> Result<(), String> {
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     if let Ok(v) = read_auth(&paths.auth_json) {
         if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
-            return Ok(()); // 已是合成账号 → no-op
-        }
-        // 活动有真实 chatgpt tokens(无哨兵,含「已切 apikey 但保留 tokens」态)→ 拒绝覆盖。
-        if parse_chatgpt_tokens(&v).is_some() {
+            // 我们自己的合成账号。**完整**(auth_mode==chatgpt)才 no-op;[MOC-257 真机] 哨兵在但
+            // auth_mode 被改残(如被另一个非 fake-aware build 的 reconcile 切成 apikey)→ fall through
+            // 重写干净合成账号自愈(否则 Codex auth_mode=apikey 不显示 plugins、relay gate 也不过)。
+            if v.get("auth_mode").and_then(Value::as_str) == Some("chatgpt") {
+                return Ok(());
+            }
+        } else if parse_chatgpt_tokens(&v).is_some() {
+            // 非合成 + 有真实 chatgpt tokens(无哨兵,含「已切 apikey 但保留 tokens」态)→ 拒绝覆盖。
             return Err(
                 "检测到 ChatGPT 登录态(tokens),模拟账号会覆盖它;请改用「真实账号模式」,或先在真实账号面板彻底清除"
                     .to_owned(),
