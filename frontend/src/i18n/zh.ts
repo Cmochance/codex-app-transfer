@@ -684,13 +684,13 @@ export default {
     "⚠️ 存在封号风险，开启并使用这些提供商的后果由你自行承担。",
   "settings.showGrayProvidersHint":
     "默认隐藏Gemini CLI、Antigravity 等实验性提供商。",
-  "settings.autoUnlockCodexPlugins": "自动解锁 Codex 插件",
-  "settings.autoUnlockCodexPluginsHint":
-    "此功能需要通过本应用内启动 Codex 才能正常使用。启动后，解锁 codex 插件的使用。",
-  "settings.fakeAccount": "模拟账号解锁 Plugins",
-  "settings.fakeAccountHint":
-    "无真实 ChatGPT 账号时,写入一份合规的模拟登录态让 Codex 原生显示 Plugins,账号/插件请求由本机伪造(marketplace 当前为空,仅显示本地已装插件)。需先配置并激活一个 provider;与真实账号模式互斥。",
-  "settings.fakeAccountFailed": "切换模拟账号模式失败",
+  "settings.pluginUnlock": "Codex 插件解锁",
+  "settings.pluginUnlockHint":
+    "关闭 / 模拟账号(本机伪造)/ 真实账号(已登录 ChatGPT);后两者需已激活 provider。",
+  "settings.pluginUnlockOff": "关闭",
+  "settings.pluginUnlockSynthetic": "模拟账号",
+  "settings.pluginUnlockReal": "真实账号",
+  "settings.pluginUnlockFailed": "切换插件解锁模式失败",
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
   "settings.codexQuotaEnabledHint":
     "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",

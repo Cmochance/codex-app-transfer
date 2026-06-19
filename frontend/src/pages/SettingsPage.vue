@@ -15,7 +15,7 @@ import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import { getChromeReady, ensureChrome, getSystemProxyStatus, type SystemProxyStatus } from '@/api/chrome'
-import { enableFakeAccount, disableFakeAccount, getFakeAccountStatus } from '@/api/desktop'
+import { getPluginUnlockStatus, setPluginUnlockMode, type PluginUnlockMode } from '@/api/desktop'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
@@ -33,8 +33,8 @@ onMounted(() => {
   getAppVersion()
     .then((r) => (appVersion.value = r.version || ''))
     .catch(() => {})
-  getFakeAccountStatus()
-    .then((s) => (fakeAccountEnabled.value = s.modeEnabled === true))
+  getPluginUnlockStatus()
+    .then((s) => (pluginUnlockMode.value = s.mode))
     .catch(() => {})
 })
 
@@ -75,7 +75,6 @@ function toggle(key: string, def: boolean) {
 }
 const autoApplyOnStart = toggle('autoApplyOnStart', true)
 const restoreCodexOnExit = toggle('restoreCodexOnExit', true)
-const autoUnlockCodexPlugins = toggle('autoUnlockCodexPlugins', false)
 const autoWakeCodexPet = toggle('autoWakeCodexPet', true)
 const codexQuotaEnabled = toggle('codexQuotaEnabled', false)
 const codexNetworkAccess = toggle('codexNetworkAccess', false)
@@ -83,23 +82,28 @@ const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
 const mcpCredentialsPortableStore = toggle('mcpCredentialsPortableStore', true)
 
-// [MOC-257] 模拟(伪造)账号模式:不是普通 settings 持久键,toggle 调专用 enable/disable 端点
-// (写合规伪造 auth.json + apply relay + 开 proxy 伪造)。失败回滚开关 + toast。
-const fakeAccountEnabled = ref(false)
-const fakeAccountBusy = ref(false)
-async function onToggleFakeAccount(v: boolean) {
-  if (fakeAccountBusy.value) return
-  fakeAccountBusy.value = true
-  const prev = fakeAccountEnabled.value
-  fakeAccountEnabled.value = v // 乐观更新
+// [MOC-257 三态] 插件解锁三态(关闭/模拟账号/真实账号):非普通 settings 键,调专用 set 端点
+// (写/移走 auth.json + apply relay + 驱动 proxy 伪造)。受控:高亮跟服务端,失败回滚 + toast。
+const pluginUnlockMode = ref<PluginUnlockMode>('synthetic')
+const pluginUnlockBusy = ref(false)
+const pluginUnlockOptions: { value: PluginUnlockMode; label: string }[] = [
+  { value: 'off', label: t('settings.pluginUnlockOff') },
+  { value: 'synthetic', label: t('settings.pluginUnlockSynthetic') },
+  { value: 'real', label: t('settings.pluginUnlockReal') },
+]
+async function onSetPluginUnlockMode(mode: PluginUnlockMode) {
+  if (pluginUnlockBusy.value || mode === pluginUnlockMode.value) return
+  pluginUnlockBusy.value = true
+  const prev = pluginUnlockMode.value
+  pluginUnlockMode.value = mode // 乐观更新
   try {
-    const r = v ? await enableFakeAccount() : await disableFakeAccount()
+    const r = await setPluginUnlockMode(mode)
     if (r?.message) toast(r.message)
   } catch (e) {
-    fakeAccountEnabled.value = prev // 失败回滚
-    toast((e as Error).message || t('settings.fakeAccountFailed'), 'error')
+    pluginUnlockMode.value = prev // 失败回滚
+    toast((e as Error).message || t('settings.pluginUnlockFailed'), 'error')
   } finally {
-    fakeAccountBusy.value = false
+    pluginUnlockBusy.value = false
   }
 }
 
@@ -323,14 +327,11 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       <SettingsRow :title="t('settings.restoreCodexOnExit')" :description="t('settings.restoreCodexOnExitHint')">
         <AppSwitch v-model="restoreCodexOnExit" />
       </SettingsRow>
-      <SettingsRow :title="t('settings.autoUnlockCodexPlugins')" :description="t('settings.autoUnlockCodexPluginsHint')">
-        <AppSwitch v-model="autoUnlockCodexPlugins" />
-      </SettingsRow>
-      <SettingsRow :title="t('settings.fakeAccount')" :description="t('settings.fakeAccountHint')">
-        <AppSwitch
-          :model-value="fakeAccountEnabled"
-          :disabled="fakeAccountBusy"
-          @update:model-value="onToggleFakeAccount"
+      <SettingsRow :title="t('settings.pluginUnlock')" :description="t('settings.pluginUnlockHint')">
+        <SegmentedControl
+          :model-value="pluginUnlockMode"
+          :options="pluginUnlockOptions"
+          @update:model-value="onSetPluginUnlockMode"
         />
       </SettingsRow>
       <SettingsRow :title="t('settings.autoWakeCodexPet')" :description="t('settings.autoWakeCodexPetHint')">

@@ -177,29 +177,40 @@ export function openTraceViewer() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 模拟(伪造)账号 plugin 模式(/api/desktop/fake-account/*,MOC-257)
-// 无真实 ChatGPT 账号时的插件强制解锁:写合规伪造 auth.json(auth_mode=chatgpt + 合成 JWT)
-// 让 Codex 原生显示 Plugins,proxy 截断 /backend-api/* 逐条伪造。替代不可靠的 CDP 注入档。
+// 三态插件解锁选择器(/api/desktop/plugin-unlock/*,MOC-257)
+// 统一「关闭 / 模拟账号 / 真实账号」三态,取代旧的 autoUnlockCodexPlugins(CDP,废弃)+ 模拟账号开关。
+// synthetic:写合成 auth.json + proxy 伪造;real:用真实账号 relay 透传;off:转移备份 auth.json、退出还原。
 // ───────────────────────────────────────────────────────────────────────────
-export interface FakeAccountStatus {
-  /** 持久开关(用户意图);键缺失=null */
-  modeEnabled: boolean | null
-  /** 活动 auth.json 当前是否合成账号(伪造 relay 此刻是否真生效) */
+export type PluginUnlockMode = 'off' | 'synthetic' | 'real'
+
+export interface PluginUnlockStatus {
+  /** 当前**生效**三态(持久值优先,缺失按真账号推导) */
+  mode: PluginUnlockMode
+  /** 持久值(用户是否手动设过);null = 未设、走默认推导 */
+  persisted: PluginUnlockMode | null
+  /** 本地是否有真实 chatgpt 账号可用(活动或 stash) */
+  hasRealAccount: boolean
+  /** 活动 auth.json 当前是否合成账号 */
   activeIsSynthetic: boolean
 }
 
-export async function getFakeAccountStatus(): Promise<FakeAccountStatus> {
-  const r = await api<{ mode_enabled?: boolean | null; active_is_synthetic?: boolean }>(
-    'GET',
-    '/api/desktop/fake-account/status',
-  )
-  return { modeEnabled: r.mode_enabled ?? null, activeIsSynthetic: !!r.active_is_synthetic }
+export async function getPluginUnlockStatus(): Promise<PluginUnlockStatus> {
+  const r = await api<{
+    mode?: PluginUnlockMode
+    persisted?: PluginUnlockMode | null
+    hasRealAccount?: boolean
+    activeIsSynthetic?: boolean
+  }>('GET', '/api/desktop/plugin-unlock/status')
+  return {
+    mode: r.mode ?? 'synthetic',
+    persisted: r.persisted ?? null,
+    hasRealAccount: !!r.hasRealAccount,
+    activeIsSynthetic: !!r.activeIsSynthetic,
+  }
 }
 
-export function enableFakeAccount() {
-  return api<{ success: boolean; message?: string }>('POST', '/api/desktop/fake-account/enable')
-}
-
-export function disableFakeAccount() {
-  return api<{ success: boolean; message?: string }>('POST', '/api/desktop/fake-account/disable')
+export function setPluginUnlockMode(mode: PluginUnlockMode) {
+  return api<{ success: boolean; message?: string }>('POST', '/api/desktop/plugin-unlock/set', {
+    mode,
+  })
 }

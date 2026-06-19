@@ -933,6 +933,133 @@ pub async fn deactivate_fake_account() -> Result<bool, String> {
     Ok(true)
 }
 
+// ── [MOC-257 三态] 插件解锁三态(off / synthetic / real)+ 真账号 stash ──────────────
+//
+// 三态选择器统一 off / 模拟账号 / 真实账号,取代旧 autoUnlockCodexPlugins(CDP,已废弃)+
+// fakeAccountModeEnabled + realAccountModeEnabled。非 off 一律写 chatgpt_base_url(不按账号类型
+// gate)。off 持久化:把真账号 auth.json **整文件** stash 走,退出/切回 real 时整文件还原 ——
+// 因现有快照 restore 只补 auth.json 的 managed key(auth_mode/OPENAI_API_KEY)、**不恢复 tokens**,
+// 直接移走真账号会丢 tokens,故用专用 stash 保全。
+
+/// 三态枚举。`resolve_plugin_unlock_mode` 由持久键 + 真账号检测推导。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUnlockMode {
+    Off,
+    Synthetic,
+    Real,
+}
+
+/// 真账号「被位移暂存区」:synthetic/off 占用活动 auth.json 时,把真账号整文件移到这里(保 tokens),
+/// 切回 real / 退出 / 启动 self-heal 前整文件还原。`~/.codex` 之外,不被 Codex 改、不被快照轮转。
+fn real_account_stash_path(paths: &CodexPaths) -> PathBuf {
+    paths
+        .app_home
+        .join("plugin-unlock")
+        .join("stashed-real-auth.json")
+}
+
+/// stash 是否存在(暂存着一份被位移的真账号)。只读。
+pub fn real_account_stash_exists() -> bool {
+    CodexPaths::from_home_env()
+        .map(|p| real_account_stash_path(&p).is_file())
+        .unwrap_or(false)
+}
+
+/// 是否「本地有真账号可用」:活动 auth.json 有真实 chatgpt tokens(非合成),或 stash 里存着真账号。
+/// 供三态默认推导(键缺失 → 有真账号则 real、否则 synthetic)。只读。
+pub fn has_real_account() -> bool {
+    let active_real = CodexPaths::from_home_env()
+        .ok()
+        .and_then(|p| read_auth(&p.auth_json).ok())
+        .map(|v| {
+            v.get("cas_synthetic").and_then(Value::as_bool) != Some(true)
+                && parse_chatgpt_tokens(&v).is_some()
+        })
+        .unwrap_or(false);
+    active_real || real_account_stash_exists()
+}
+
+/// 解析当前**生效**三态:持久键优先(off/synthetic/real);键缺失 → 按「本地有真账号 → Real;
+/// 否则 → Synthetic(自动合成)」推导默认。只读。
+pub fn resolve_plugin_unlock_mode() -> PluginUnlockMode {
+    match crate::admin::handlers::settings::read_plugin_unlock_mode().as_deref() {
+        Some("off") => PluginUnlockMode::Off,
+        Some("synthetic") => PluginUnlockMode::Synthetic,
+        Some("real") => PluginUnlockMode::Real,
+        _ => {
+            if has_real_account() {
+                PluginUnlockMode::Real
+            } else {
+                PluginUnlockMode::Synthetic
+            }
+        }
+    }
+}
+
+/// 把活动**真账号**整文件移到 stash 保全(保 tokens),供切到 synthetic/off 前调用。**只动真账号**
+/// (有 chatgpt tokens、非合成);合成账号 / apikey / 无 auth.json → 留着不动(各自由 `activate_fake_account`
+/// 覆盖、`clear_active_auth_file`(off)清、或本就空)。覆盖旧 stash(活动是更新的那份)。持 `AUTH_LOCK`。
+pub async fn stash_displaced_real_auth() -> Result<(), String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let Ok(v) = read_auth(&paths.auth_json) else {
+        return Ok(()); // 无 auth.json
+    };
+    if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return Ok(()); // 合成账号 → 不动(synthetic 的 activate no-op / off 的 clear 各自处理)
+    }
+    if parse_chatgpt_tokens(&v).is_none() {
+        return Ok(()); // apikey 无真 tokens → 不进 stash(off 会清 / synthetic 会覆盖)
+    }
+    // 真账号 → 整文件移到 stash 保全。
+    let stash = real_account_stash_path(&paths);
+    if let Some(parent) = stash.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("建 stash 目录失败: {e}"))?;
+    }
+    std::fs::rename(&paths.auth_json, &stash).map_err(|e| format!("移真账号到 stash 失败: {e}"))?;
+    Ok(())
+}
+
+/// [MOC-257 三态 OFF] 清掉活动 `~/.codex/auth.json`(确保 .codex 无 auth.json)。真账号应已先经
+/// `stash_displaced_real_auth` 移走;这里删剩下的合成 / apikey 残留。无文件 → no-op。持 `AUTH_LOCK`。
+pub async fn clear_active_auth_file() -> Result<(), String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    if paths.auth_json.is_file() {
+        std::fs::remove_file(&paths.auth_json)
+            .map_err(|e| format!("删活动 auth.json 失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 从 stash 整文件还原真账号到 `~/.codex/auth.json`。stash 不存在 → `Ok(false)`。**活动已是真账号**
+/// (app 外新 login,比 stash 更新)→ 丢弃 stash、不覆盖,返 `Ok(false)`。否则整文件还原、返
+/// `Ok(true)`。供切到 real / 退出 / 启动 self-heal **前**调用(让现有 restore 有真 auth.json 可补)。持 `AUTH_LOCK`。
+pub async fn restore_stashed_real_auth() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    let stash = real_account_stash_path(&paths);
+    if !stash.is_file() {
+        return Ok(false);
+    }
+    let active_real = read_auth(&paths.auth_json)
+        .ok()
+        .map(|v| {
+            v.get("cas_synthetic").and_then(Value::as_bool) != Some(true)
+                && parse_chatgpt_tokens(&v).is_some()
+        })
+        .unwrap_or(false);
+    if active_real {
+        // 活动已是真账号(更新)→ 弃 stash,不覆盖。
+        let _ = std::fs::remove_file(&stash);
+        return Ok(false);
+    }
+    std::fs::rename(&stash, &paths.auth_json)
+        .map_err(|e| format!("从 stash 还原真账号失败: {e}"))?;
+    Ok(true)
+}
+
 /// [MOC-104 req#5 启动调谐] 启动时(**绝不刷新 token**,见模块级分流说明):① 活动
 /// `~/.codex/auth.json` 已是有效真实 chatgpt → 共用、原样不动(本机 Codex 自维护);
 /// ② 活动失效(被 apply 改 apikey / 登出 / 清掉)且用户导入过账号 → 恢复:优先从

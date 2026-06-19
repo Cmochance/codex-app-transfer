@@ -102,6 +102,13 @@ async fn remote_control_ws_handler(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // [MOC-257] 模拟账号模式:remote-control WS **不能**透传 `wss://chatgpt.com`(合成 token 必失败,
+    // 且违反「绝不出网 / 绝不 401」不变量,见 codex-connector review)。本地接受 upgrade 后立即关闭
+    // (socket 一进闭包就 drop → close),绝不连 chatgpt.com。remote control 是 Mobile→Mac 远控、与
+    // 插件解锁无关,伪造模式下直接禁用即可。
+    if crate::fake_account::fake_account_mode_enabled() {
+        return ws.on_upgrade(|_socket| async move {});
+    }
     let path = uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())

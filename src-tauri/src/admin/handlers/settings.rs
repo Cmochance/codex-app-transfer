@@ -572,6 +572,65 @@ pub fn set_fake_account_mode_enabled(enabled: bool) -> bool {
     .unwrap_or(false)
 }
 
+/// [MOC-257 三态] 插件解锁三态选择器持久值(用户意图):`"off"` / `"synthetic"` / `"real"`。
+/// **键缺失 = 未手动设**,由 [`crate::codex_real_account::resolve_plugin_unlock_mode`] 按「本地有
+/// 真账号 auth.json → real;否则 → synthetic」推导默认。取代旧的 `autoUnlockCodexPlugins`(CDP 档,
+/// 已废弃)+ `fakeAccountModeEnabled` + `realAccountModeEnabled` 三个布尔开关。
+pub fn read_plugin_unlock_mode() -> Option<String> {
+    crate::admin::registry_io::load().ok().and_then(|cfg| {
+        cfg.get("settings")
+            .and_then(|s| s.get("pluginUnlockMode"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+/// [MOC-257 三态] 写三态选择器持久值。三态切换 handler 经这里落用户意图;`off` 是持久关闭意图,
+/// 重启后仍把 auth.json 转移备份(见 codex_real_account stash)。
+pub fn set_plugin_unlock_mode(mode: &str) -> bool {
+    with_config_write(|cfg| {
+        ensure_settings_object(cfg).insert(
+            "pluginUnlockMode".to_owned(),
+            Value::String(mode.to_owned()),
+        );
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false)
+}
+
+/// [MOC-257 三态] 一次性迁移:把旧三开关折叠成 `pluginUnlockMode`。键已存在 → no-op(幂等)。
+/// 映射:`fakeAccountModeEnabled=true` → synthetic;否则 `realAccountModeEnabled=true` → real;
+/// 否则 `autoUnlockCodexPlugins=true`(旧 CDP 强制档,现由 synthetic 取代)→ synthetic;
+/// 都没有 → **不写键**(留给默认推导:有真账号→real / 无→synthetic)。返回是否写入。
+pub fn migrate_plugin_unlock_mode_v1() -> bool {
+    let cfg = match crate::admin::registry_io::load() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let s = cfg.get("settings");
+    if s.and_then(|s| s.get("pluginUnlockMode")).is_some() {
+        return false; // 已迁移
+    }
+    let b = |k: &str| {
+        s.and_then(|s| s.get(k))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    let mode = if b("fakeAccountModeEnabled") {
+        Some("synthetic")
+    } else if b("realAccountModeEnabled") {
+        Some("real")
+    } else if b("autoUnlockCodexPlugins") {
+        Some("synthetic")
+    } else {
+        None // 留给默认推导
+    };
+    match mode {
+        Some(m) => set_plugin_unlock_mode(m),
+        None => false,
+    }
+}
+
 /// [MOC-178] 一次性迁移:首次落定 `realAccountModeEnabled` 初值,不突变老用户。键已存在 →
 /// no-op(幂等);不存在 → 按当前是否有可用真实账号(`detect().logged_in`,新口径认 token)
 /// 决定:有账号 → true(老用户保持开)、无账号 → false(与现状一致)。返回是否执行了写入。

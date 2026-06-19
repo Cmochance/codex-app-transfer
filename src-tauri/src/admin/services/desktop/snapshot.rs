@@ -404,6 +404,62 @@ pub async fn sync_desktop_clearing_real_account(state: &AdminState) -> Value {
     sync_desktop_for_active_provider_impl(state, true).await
 }
 
+/// [MOC-257 三态] 应用插件解锁三态:设活动 auth.json + 驱动 proxy 伪造 atomic + apply(relay/非relay)。
+///
+/// relay 写 chatgpt_base_url 仍复用现有 gate(`apply_desktop_target_impl` 的 `active_is_real_chatgpt_now`)——
+/// synthetic/real 两态都先把活动 auth.json 写成 `auth_mode=chatgpt`(activate_fake/real),故 gate 自然
+/// 为真 → 写 chatgpt_base_url(等价「非 off 一律写」);off 让活动腾空/apikey → gate 为假 → 不写。
+///
+/// **真账号 stash 时序**:synthetic/off 切走真账号前先 `stash_displaced_real_auth`(整文件保 tokens);
+/// real 切回先 `restore_stashed_real_auth`。退出/启动 self-heal 的还原由 main.rs 在「现有 restore 之前」
+/// 调 `restore_stashed_real_auth`,确保 auth.json 在位、不与现有 restore 冲突。
+pub async fn apply_plugin_unlock_mode(
+    state: &AdminState,
+    mode: crate::codex_real_account::PluginUnlockMode,
+) -> Result<(), String> {
+    use crate::codex_real_account as ra;
+    use crate::codex_real_account::PluginUnlockMode as M;
+    match mode {
+        M::Off => {
+            // 真账号 stash 走、合成/apikey 清 → 活动腾空;proxy 不伪造;apply 非 relay(apikey、无 chatgpt_base_url)。
+            ra::stash_displaced_real_auth().await?;
+            ra::clear_active_auth_file().await?;
+            codex_app_transfer_proxy::set_fake_account_mode(false);
+            let _ = sync_desktop_clearing_real_account(state).await;
+            Ok(())
+        }
+        M::Synthetic => {
+            // 活动若是真账号先 stash 保全(也避开 activate 的真账号守护);写合成 → 活动=chatgpt;
+            // proxy 伪造开;apply relay(active=chatgpt → 写 chatgpt_base_url)。
+            ra::stash_displaced_real_auth().await?;
+            ra::activate_fake_account().await?;
+            codex_app_transfer_proxy::set_fake_account_mode(true);
+            ensure_relay_applied(state).await
+        }
+        M::Real => {
+            // 从 stash 还原真账号;确保 auth_mode=chatgpt(apikey-with-tokens → chatgpt);proxy 透传;apply relay。
+            let _ = ra::restore_stashed_real_auth().await?;
+            let _ = ra::activate_real_account().await;
+            codex_app_transfer_proxy::set_fake_account_mode(false);
+            ensure_relay_applied(state).await
+        }
+    }
+}
+
+/// apply active provider 并校验 relay 真生效(active 仍 chatgpt + sync success)。供 synthetic/real 共用。
+async fn ensure_relay_applied(state: &AdminState) -> Result<(), String> {
+    let synced = sync_desktop_for_active_provider(state).await;
+    let ok = synced
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if ok && crate::codex_real_account::active_is_real_chatgpt_now() {
+        Ok(())
+    } else {
+        Err("apply relay 未生效(系统代理未起 / 无可用 provider?),请检查后重试".to_owned())
+    }
+}
+
 async fn sync_desktop_for_active_provider_impl(state: &AdminState, force_apikey: bool) -> Value {
     let target_result = with_config_write(|cfg| {
         let Some(provider) = active_provider(cfg) else {
