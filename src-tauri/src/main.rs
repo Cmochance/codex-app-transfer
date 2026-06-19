@@ -157,13 +157,15 @@ fn main() {
                     let _ = w.navigate(url);
                 }
             }
-            // [MOC-257 三态] self-heal restore **之前**先还原 stash:上次若被强杀(退出 hook 没跑)、
-            // 真账号被 OFF/synthetic 移到 stash、~/.codex 无 auth.json,先整文件还原回去,让现有 restore
-            // 把 managed key 补到**真** auth.json 上(否则 read_auth 缺文件得到 `{}` 空壳、restore 写回
-            // 一份无 tokens 的残壳)。同步版(无 block_on/AUTH_LOCK):此刻在任何 auth task spawn 之前、
-            // 无并发。失败 tracing::error 留痕。[review] 跟 exit + restore_codex_if_enabled 同 gate 在
-            // restoreCodexOnExit:=false 表示保留 transfer 状态(restore_codex 也会跳过),此时 un-stash 既补
-            // 不到 managed key、又让 real-active 与 persisted off/synthetic 不一致 → 一并跳过。
+            // [MOC-257 三态] self-heal restore:上次若被强杀(退出 hook 没跑)、真账号被 OFF/synthetic 移到
+            // stash、~/.codex 无 auth.json,整文件还原回去。**顺序同 exit:先 restore_codex_if_enabled,再
+            // un-stash 真账号**([MOC-257 review] 反转,真账号最终写)——原序让 restore_codex 在 stash 还原出的
+            // 真账号上 merge 旧快照 managed auth key,快照拍于 ChatGPT 登录前(无 auth_mode)时会抹掉真账号 genuine
+            // 的 `auth_mode=chatgpt`。改 restore_codex 先跑(还原 config + strip transfer key),再 restore_stashed
+            // 整文件覆盖回真账号 → auth_mode/tokens 全胜过旧快照。原「补 managed key 防空壳」由真账号在后覆盖解决。
+            // 同步版(无 block_on/AUTH_LOCK):此刻在任何 auth task spawn 之前、无并发。失败留痕。
+            // [review] un-stash gate 在 restoreCodexOnExit:=false 表示保留 transfer 状态、跳过。
+            let _ = handlers::desktop::restore_codex_if_enabled("startup");
             if restore_codex_on_exit_enabled() {
                 if let Err(e) = crate::codex_real_account::restore_stashed_real_auth_blocking() {
                     tracing::error!(
@@ -171,7 +173,6 @@ fn main() {
                     );
                 }
             }
-            let _ = handlers::desktop::restore_codex_if_enabled("startup");
 
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
             // startup 后第一个 user 请求的 prompt 注入就是正确语言。后续 user
@@ -665,11 +666,15 @@ fn main() {
                 tracing::info!("app exit: 已取消 in-flight codex login,防孤儿进程退出后改写 auth.json");
             }
             // [MOC-257 三态] 退出前先把 OFF/synthetic 移走的真账号 stash 整文件还原回 ~/.codex/auth.json
-            // (在 restore_codex_if_enabled **之前**:让它把 managed key 补到真 auth.json 而非缺文件得到
-            // 的空壳、tokens 不丢),使用户退出 transfer 后 Codex 拿回完整真账号。**同步版**:exit 期 async
-            // runtime 可能正在 shutdown,block_on 异步锁会 panic → panic 在 exit 闭包 abort 进程、跳过下面的
-            // restore_codex_if_enabled;同步纯文件操作避开。失败留痕。[review] gate 在 restoreCodexOnExit:
-            // =false 表示退出保留 transfer 状态,不该 un-stash(否则 real-active 与 persisted off/synthetic 不一致)。
+            // 顺序:**先 restore_codex_if_enabled,再 un-stash 真账号**([MOC-257 review] 反转,真账号最终写)。
+            // 原序(先 un-stash 再 restore_codex)让 restore_codex 在 stash 还原出的真账号上 merge 旧快照 managed
+            // auth key:若快照拍于用户**登录 ChatGPT 之前**(无 `auth_mode`),merge 会把真账号 genuine 的
+            // `auth_mode=chatgpt` 抹掉 → tokens 在但 standalone Codex 不再认作 ChatGPT。改为 restore_codex 先跑
+            // (还原 config + strip transfer auth key),再 restore_stashed 把**完整真账号整文件覆盖**回活动 →
+            // 真账号的 auth_mode/tokens 全胜过旧快照。原「补 managed key 防空壳」顾虑由「真账号在后覆盖」解决。
+            // **同步版**:exit 期 async runtime 可能正在 shutdown,block_on 异步锁会 panic → 同步纯文件操作避开。
+            // [review] un-stash gate 在 restoreCodexOnExit:=false 表示退出保留 transfer 状态,不该 un-stash。
+            let _ = handlers::desktop::restore_codex_if_enabled("exit");
             if restore_codex_on_exit_enabled() {
                 if let Err(e) = crate::codex_real_account::restore_stashed_real_auth_blocking() {
                     tracing::error!(
@@ -677,7 +682,6 @@ fn main() {
                     );
                 }
             }
-            let _ = handlers::desktop::restore_codex_if_enabled("exit");
             // MOC-144:transfer 注入的 web_fetch MCP server 在退出时从 Codex config.toml 移除
             // —— 它是 transfer 管理的工具, transfer 不在时不该残留 [mcp_servers.cat-webfetch]
             // (注入/移除对称;下次 transfer 启动 re-sync 会按 webFetchBackend 重新注册)。
