@@ -323,8 +323,15 @@ pub async fn add_source(Json(input): Json<AddSourceInput>) -> impl IntoResponse 
     if name.is_empty() || url.is_empty() {
         return err(StatusCode::BAD_REQUEST, "name 跟 url 都必填").into_response();
     }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return err(StatusCode::BAD_REQUEST, "url 必须 http(s)").into_response();
+    // 外部源必须 https(防明文 registry 被 MITM 篡改连接器展示数据 / 图标 URL);http 仅限 localhost(dev)。
+    let is_https = url.starts_with("https://");
+    let is_local_http = url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1");
+    if !is_https && !is_local_http {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "自加源 URL 必须 https(http 仅限 localhost)",
+        )
+        .into_response();
     }
     let _g = sources_lock().lock().unwrap();
     let mut list = read_sources();
