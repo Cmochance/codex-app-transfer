@@ -619,6 +619,8 @@ fn backup_active_auth(paths: &CodexPaths, suffix: &str) -> Result<(), String> {
     let backup = backup_dir.join(format!("auth-{suffix}-{ts}.json"));
     std::fs::copy(&paths.auth_json, &backup)
         .map_err(|e| format!("备份活动 auth.json 失败: {e}"))?;
+    // [MOC-257 review] copy 保留源权限,源若 0644 → 备份(含真账号 token)也 0644 → 共享 home 可读;强制 0600。
+    set_auth_file_private(&backup);
     Ok(())
 }
 
@@ -1121,7 +1123,11 @@ fn archive_existing_auth_file(paths: &CodexPaths, path: &std::path::Path) -> boo
         .unwrap_or(0);
     let archived = archive_dir.join(format!("discarded-stash-{ts}.json"));
     match std::fs::rename(path, &archived) {
-        Ok(()) => true,
+        Ok(()) => {
+            // [MOC-257 review] rename 保留源权限,归档的真账号 auth 文件强制 0600(同其它 stash/auth 写点)。
+            set_auth_file_private(&archived);
+            true
+        }
         Err(e) => {
             tracing::warn!("[PluginUnlock] 归档旧 auth 文件失败(保留不直删): {e}");
             false
@@ -1241,6 +1247,9 @@ pub async fn stash_displaced_real_auth() -> Result<bool, String> {
         );
     }
     std::fs::rename(&paths.auth_json, &stash).map_err(|e| format!("移真账号到 stash 失败: {e}"))?;
+    // [MOC-257 review] rename 保留源文件权限,活动 auth.json 若是外部(Codex CLI 等)以 0644 创建 → stash 也
+    // 0644、refresh token 在共享 home 下其它本地用户可读。同回滚 helper 强制 0600。
+    set_auth_file_private(&stash);
     Ok(true) // 真把一个真账号移进了 stash → 回滚时该 un-stash 还原
 }
 
@@ -1283,6 +1292,8 @@ fn restore_stashed_real_auth_impl(paths: &CodexPaths) -> Result<bool, String> {
     let _ = std::fs::remove_file(&paths.auth_json);
     std::fs::rename(&stash, &paths.auth_json)
         .map_err(|e| format!("从 stash 还原真账号失败: {e}"))?;
+    // [MOC-257 review] rename 保留源(stash)权限,确保还原回活动的真账号 auth.json 也 0600(老 stash 可能 0644)。
+    set_auth_file_private(&paths.auth_json);
     Ok(true)
 }
 
