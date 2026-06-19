@@ -631,6 +631,16 @@ async fn sync_desktop_for_active_provider_impl(state: &AdminState, force_apikey:
     }
 }
 
+/// [MOC-257 review] 从 `http://127.0.0.1:<port>` / `http://localhost:<port>`(Codex config.toml 的
+/// `chatgpt_base_url`/`openai_base_url`)解析出端口,供保留 relay 的 proxy 在 **Codex 实际指向的端口**重启。
+fn parse_local_proxy_port(url: &str) -> Option<u16> {
+    let rest = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://localhost:"))?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) -> Value {
     let cfg = match load_registry() {
         Ok(cfg) => cfg,
@@ -644,16 +654,18 @@ pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) 
         // 仍要把 proxy 起起来 —— 否则 Codex 据这些 base_url 把 chat + /backend-api 发到死端口、全挂。**synthetic
         // 与 real relay 都算**(real:真账号 + relay 透传;synthetic:合成 + 伪造):统一看 config.toml 是否指向
         // 本地 proxy(active_is_synthetic 兜底,防极端只写 auth 没写 relay)。早期预置只开伪造 flag,这里补进程。
-        let relay_on_disk = CodexPaths::from_home_env().ok().is_some_and(|p| {
-            let points_local = |k: &str| {
-                read_codex_toml_root_string(&p, k).is_some_and(|u| {
-                    u.starts_with("http://127.0.0.1:") || u.starts_with("http://localhost:")
-                })
+        let relay_port = CodexPaths::from_home_env().ok().and_then(|p| {
+            let port_of = |k: &str| {
+                read_codex_toml_root_string(&p, k).and_then(|u| parse_local_proxy_port(&u))
             };
-            points_local("chatgpt_base_url") || points_local("openai_base_url")
+            port_of("chatgpt_base_url").or_else(|| port_of("openai_base_url"))
         });
-        if relay_on_disk || crate::codex_real_account::active_is_synthetic() {
-            let port = read_proxy_port(&cfg);
+        if relay_port.is_some() || crate::codex_real_account::active_is_synthetic() {
+            // [MOC-257 review] 用 config.toml 里 **Codex 实际指向的端口**起 proxy(从 relay URL 解析)——
+            // 用户在 autoApplyOnStart=false 期间改过 settings.proxyPort、或盘上是遗留端口时,settings.proxyPort
+            // 与盘上 relay 不一致,Codex 仍发旧端口;只听新端口仍是死的。无 relay URL(纯 synthetic 兜底)回退
+            // settings.proxyPort。
+            let port = relay_port.unwrap_or_else(|| read_proxy_port(&cfg));
             let started = start_proxy_if_needed(&proxy_manager, port)
                 .await
                 .unwrap_or(false);
