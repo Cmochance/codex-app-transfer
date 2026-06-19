@@ -121,29 +121,10 @@ pub async fn set_handler(
                 let _ = super::settings::clear_plugin_unlock_mode();
             }
         }
-        // [MOC-257 review] apply 非事务化:synthetic/real 分支可能已 stash/写 auth.json + 开伪造,才在
-        // ensure_relay_applied 失败 → auth/proxy 停在半生效态。recovery 用**上次成功 apply 的模式**
-        // (last_applied)而非 resolve —— resolve 可能就是刚失败的那个(如默认 synthetic),重 apply 会再失败、
-        // 留半生效;从没成功 apply 过(None)→ 显式清到安全态(关伪造 + 还原真账号;仍合成则清掉)。
-        match codex_real_account::last_applied_mode() {
-            Some(last) => {
-                if let Err(e2) =
-                    crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(
-                        &state, last,
-                    )
-                    .await
-                {
-                    tracing::error!("[PluginUnlock] set 失败后回滚重 apply({last:?})也失败: {e2}");
-                }
-            }
-            None => {
-                codex_app_transfer_proxy::set_fake_account_mode(false);
-                let _ = codex_real_account::restore_stashed_real_auth().await;
-                if codex_real_account::active_is_synthetic() {
-                    let _ = codex_real_account::clear_active_auth_file().await;
-                }
-            }
-        }
+        // [MOC-257 review] auth/proxy 的回滚**不在这里做**:apply_plugin_unlock_mode 已**事务化自清理**
+        // (synthetic/real 分支失败时还原 pre-apply 活动字节 + re-stash + 关伪造),活动态已回到 apply 前。
+        // set 端点只需回滚自己写的持久键(上面)即可;再叠一层 recovery(重 apply last_applied / un-stash)
+        // 会在 apply 自回滚之上再动(如重复 un-stash 真账号),反而制造不一致。
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }
     let degraded =

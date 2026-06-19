@@ -567,10 +567,13 @@ pub fn migrate_plugin_unlock_mode_v1() -> bool {
         Some("synthetic")
     } else if real_explicit == Some(true) {
         Some("real")
-    } else if real_explicit == Some(false) {
-        Some("off") // 显式关闭意图 → off,不被默认推导从残留 tokens 翻成 real
     } else if b("autoUnlockCodexPlugins") {
+        // [MOC-257 review] 老 CDP 强制解锁(无真账号)→ synthetic 取代。**优先于** realAccountModeEnabled=
+        // false→off:同时有这俩的用户(显式关真账号 + 开 CDP 强制解锁)本意是「无真账号也要解锁」=synthetic,
+        // 若先判 off 会把插件关了(CDP daemon 迁移后不再启)。
         Some("synthetic")
+    } else if real_explicit == Some(false) {
+        Some("off") // 显式关闭意图(且无强制解锁)→ off,不被默认推导从残留 tokens 翻成 real
     } else {
         None // 留给默认推导
     };
