@@ -65,9 +65,12 @@ pub async fn fabricate(
         ("POST", "/backend-api/codex/analytics-events/events") => (204, Value::Null),
 
         // 插件:MVP 一律空目录。已装插件由 CLI 读本地 cache 显示,与此无关。
+        // [MOC-257 真机 e2e] `next_page_token` 必须是 **null**(=没有下一页),不能空字符串 ""——
+        // 实测 Codex 打开 Plugins tab 分页时把 "" 当成有效的下一页 token → 无限翻页死循环
+        // (~290 req/s 打 ps/plugins/installed)。null 才正确终止分页(与 connectors 的 next_token:null 一致)。
         ("GET", "/backend-api/ps/plugins/installed") => (
             200,
-            json!({ "plugins": [], "pagination": { "limit": 50, "next_page_token": "" } }),
+            json!({ "plugins": [], "pagination": { "limit": 50, "next_page_token": Value::Null } }),
         ),
         ("GET", "/backend-api/ps/plugins/list") => (200, json!({ "plugins": [] })),
         ("GET", "/backend-api/ps/plugins/suggested") => (200, json!({ "plugins": [] })),
@@ -173,6 +176,12 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(v["plugins"], json!([]));
         assert!(v["pagination"].is_object());
+        // [MOC-257 真机 e2e 回归] next_page_token 必须是 null(=无下一页)。空字符串 "" 会被 Codex
+        // 当成有效的下一页 token → 打开 Plugins tab 时无限翻页死循环(实测 ~290 req/s)。
+        assert!(
+            v["pagination"]["next_page_token"].is_null(),
+            "next_page_token 必须 null,否则 Codex 分页死循环"
+        );
     }
 
     // 核心不变量:任何未建模 backend-api path 必须 200(绝不 401 → 否则触发 Codex auth 失败/重登)。
