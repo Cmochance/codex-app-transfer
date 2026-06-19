@@ -949,6 +949,8 @@ export default {
   "settings.fontMonoDesc": "代码 / JSON 等宽显示字体",
   "settings.fontSize": "字号",
   "settings.fontSizeDesc": "界面整体字号缩放",
+  "settings.hideDockIcon": "隐藏程序坞图标",
+  "settings.hideDockIconHint": "仅从菜单栏图标唤起窗口",
   "settings.fontSystem": "系统",
   "settings.fontSongti": "宋体",
   "settings.fontKaiti": "楷体",
