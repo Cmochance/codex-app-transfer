@@ -559,9 +559,13 @@ pub fn migrate_plugin_unlock_mode_v1() -> bool {
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
-    // [MOC-257 review] 显式取真实账号模式键,区分「缺失」vs「Some(false)」—— 后者是用户主动关闭意图。
+    // [MOC-257 review] 显式取真实账号 / 强制解锁键,区分「缺失」vs「Some(false)」—— 后者是用户主动关闭意图,
+    // 不能跟缺失一样 fall through 到 None(会被 resolve 默认重新推成 synthetic/real)。
     let real_explicit = s
         .and_then(|s| s.get("realAccountModeEnabled"))
+        .and_then(Value::as_bool);
+    let auto_unlock = s
+        .and_then(|s| s.get("autoUnlockCodexPlugins"))
         .and_then(Value::as_bool);
     let mode = if b("fakeAccountModeEnabled") {
         Some("synthetic")
@@ -570,12 +574,12 @@ pub fn migrate_plugin_unlock_mode_v1() -> bool {
     } else if real_explicit == Some(false) {
         // [MOC-257 review] 显式关真账号:开了 CDP 强制解锁仍要解锁 → synthetic(否则 off 会把插件关了,CDP
         // daemon 迁移后不再启);没开 → off(不被默认推导从残留 tokens 翻成 real)。
-        Some(if b("autoUnlockCodexPlugins") {
+        Some(if auto_unlock == Some(true) {
             "synthetic"
         } else {
             "off"
         })
-    } else if b("autoUnlockCodexPlugins") {
+    } else if auto_unlock == Some(true) {
         // [MOC-257 review] 老 CDP 强制解锁、**无**显式真账号设置:有**可用真账号** → real(用真账号解锁,
         // 对齐缺键默认 resolve 的「有真账号→real」),否则 synthetic(无真账号也要解锁)。不能一律 synthetic,
         // 否则升级用户的可用真账号被 stash、真插件/backend 换成假空市场。
@@ -584,8 +588,12 @@ pub fn migrate_plugin_unlock_mode_v1() -> bool {
         } else {
             "synthetic"
         })
+    } else if auto_unlock == Some(false) {
+        // [MOC-257 review] **显式关**强制解锁(且无其它显式模式)→ off。别跟缺键一样 fall through 到 None,
+        // 否则 resolve 默认从残留 tokens 把用户已关的解锁重新推成 synthetic/real、启动又打开。
+        Some("off")
     } else {
-        None // 留给默认推导
+        None // autoUnlock 也缺 → 留给默认推导
     };
     match mode {
         Some(m) => set_plugin_unlock_mode(m),
