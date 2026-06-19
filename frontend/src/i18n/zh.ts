@@ -693,6 +693,8 @@ export default {
   "settings.realAccountLoginCancelBtn": "取消登录",
   "settings.realAccountLoginOk": "已登录真实账号,正在切换",
   "settings.realAccountLoginFailed": "登录失败",
+  "settings.realAccountPinFailed":
+    "登录成功,但账号持久化失败(请检查 ~/.codex-app-transfer 目录权限后重试),暂不切换真实账号",
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
   "settings.codexQuotaEnabledHint":
     "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",

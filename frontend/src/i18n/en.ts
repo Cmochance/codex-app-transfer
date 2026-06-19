@@ -600,6 +600,8 @@ export default {
   "settings.realAccountLoginCancelBtn": "Cancel login",
   "settings.realAccountLoginOk": "Logged in; switching to real account",
   "settings.realAccountLoginFailed": "Login failed",
+  "settings.realAccountPinFailed":
+    "Logged in, but saving the account failed (check ~/.codex-app-transfer permissions and retry); not switching to real account",
   "settings.autoUnlockCodexPlugins": "Auto-unlock Codex plugins",
   "settings.autoUnlockCodexPluginsHint": "Unlocks Codex plugins. Requires launching Codex from this app.",
   "settings.codexQuotaEnabled": "Show usage in Codex",

@@ -179,18 +179,21 @@ async function startLogin() {
       const s = await getRealAccountStatus()
       if (s.loginState === 'succeeded') {
         stopLoginPoll()
-        loginRunning.value = false
-        loginModalOpen.value = false
-        toast(t('settings.realAccountLoginOk'))
         // [MOC-257 review] 切 real 前先 pin 当前账号到 mirror/stash:否则登录前已有快照(startup auto-apply)
         // + restoreCodexOnExit 开时,新登录账号没存进 mirror、退出 restore 重放登录前快照抹掉 auth_mode。
-        // best-effort:pin 失败不阻断 real apply(relay 仍用活动账号,只是 restore 持久性弱)。
+        // pin **失败则 block 切 real**:账号没进 mirror,Real 切了也撑不过退出 restore → 留 modal 显示错误、让
+        // 用户修 ~/.codex-app-transfer 权限后重试,不带不可靠状态切 Real。
         try {
           await pinCurrentRealAccount()
         } catch {
-          /* pin 失败不阻断后续 real apply */
+          loginRunning.value = false
+          loginError.value = t('settings.realAccountPinFailed')
+          return // 保持 modal 打开显示错误,不切 real
         }
-        await onSetPluginUnlockMode('real') // 现在有账号了,切真实账号
+        loginRunning.value = false
+        loginModalOpen.value = false
+        toast(t('settings.realAccountLoginOk'))
+        await onSetPluginUnlockMode('real') // 现在有账号了 + 已 pin,切真实账号
       } else if (s.loginState === 'failed') {
         stopLoginPoll()
         loginRunning.value = false
