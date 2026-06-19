@@ -85,22 +85,29 @@ pub async fn set_handler(
         )
             .into_response();
     }
-    // 先落持久意图(off 也持久:重启仍 stash 走 auth.json)。[MOC-257 review] 持久化失败(config 只读 /
-    // 磁盘满)必须报错,不能 apply 完报成功 —— 否则下次启动 reconcile 读到旧/缺失的持久值、与 UI 不一致。
-    if !super::settings::set_plugin_unlock_mode(&req.mode) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "写入插件解锁模式失败(配置文件不可写?),请检查权限 / 磁盘后重试".to_owned(),
-        )
-        .into_response();
-    }
-    // [MOC-257] apply **生效**模式而非请求模式:real 但账号失效(过期/撤销)→ resolve 降级到 synthetic
-    // (用户要求);持久仍 real,账号恢复可用后自动升回。off/synthetic 生效=请求。
-    let effective = codex_real_account::resolve_plugin_unlock_mode();
+    // [MOC-257 review] **apply 先于 persist**:apply 失败时不留脏持久态(原先 persist→apply,apply 失败后
+    // 持久值已是新模式、UI 却回滚旧值 → 下次启动 reconcile 到 UI 没显示的状态)。effective 直接由请求模式
+    // + 账号可用性算(real 失效 → 降级 synthetic),不经 resolve(它读的是还没写的持久键)。
+    let effective = match mode {
+        PluginUnlockMode::Real if !codex_real_account::real_account_usable() => {
+            PluginUnlockMode::Synthetic
+        }
+        m => m,
+    };
     if let Err(e) =
         crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, effective).await
     {
         return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    // apply 成功后再落持久意图(off 也持久:重启仍 stash 走 auth.json)。持久化失败报错(config 只读 /
+    // 磁盘满)—— 此时已 apply 但持久未落,下次启动按旧持久值 reconcile;报错让用户知晓重试(罕见:配置
+    // 小写远比 apply 可靠,故把易失败的 apply 放前面)。
+    if !super::settings::set_plugin_unlock_mode(&req.mode) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "已应用但写入持久模式失败(配置文件不可写?),请检查权限 / 磁盘后重试".to_owned(),
+        )
+        .into_response();
     }
     let degraded =
         matches!(mode, PluginUnlockMode::Real) && effective == PluginUnlockMode::Synthetic;

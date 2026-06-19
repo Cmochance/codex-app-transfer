@@ -928,15 +928,20 @@ pub fn real_account_stash_exists() -> bool {
 /// 是否「本地有真账号可用」:活动 auth.json 有真实 chatgpt tokens(非合成),或 stash 里存着真账号。
 /// 供三态默认推导(键缺失 → 有真账号则 real、否则 synthetic)。只读。
 pub fn has_real_account() -> bool {
-    let active_real = CodexPaths::from_home_env()
+    let Ok(paths) = CodexPaths::from_home_env() else {
+        return false;
+    };
+    let is_real = |v: &Value| {
+        v.get("cas_synthetic").and_then(Value::as_bool) != Some(true)
+            && parse_chatgpt_tokens(v).is_some()
+    };
+    let active_real = read_auth(&paths.auth_json)
         .ok()
-        .and_then(|p| read_auth(&p.auth_json).ok())
-        .map(|v| {
-            v.get("cas_synthetic").and_then(Value::as_bool) != Some(true)
-                && parse_chatgpt_tokens(&v).is_some()
-        })
-        .unwrap_or(false);
-    active_real || real_account_stash_exists()
+        .is_some_and(|v| is_real(&v));
+    // [MOC-257 review] 也认导入/钉住的镜像:活动被删 / 换成 apikey 时,真账号只在镜像里(import/pin
+    // 过、reconcile 会从它恢复)。否则只剩镜像的老用户 set(real) 被拒、默认推导降级 synthetic。
+    let mirror_real = read_imported_mirror(&paths).is_some_and(|v| is_real(&v));
+    active_real || mirror_real || real_account_stash_exists()
 }
 
 /// [MOC-257] 真账号当前是否**实际可用**(供「real 档不可用则降级 synthetic」+ 前端展示)。
@@ -966,6 +971,10 @@ pub fn real_account_usable() -> bool {
     if read_auth(&paths.auth_json).ok().is_some_and(|v| usable(&v)) {
         return true;
     }
+    // [MOC-257 review] 导入/钉住的镜像也算(未过期才算可用)。
+    if read_imported_mirror(&paths).is_some_and(|v| usable(&v)) {
+        return true;
+    }
     read_auth(&real_account_stash_path(&paths))
         .ok()
         .is_some_and(|v| usable(&v))
@@ -990,9 +999,28 @@ pub fn resolve_plugin_unlock_mode() -> PluginUnlockMode {
     }
 }
 
+/// [MOC-257 review] 把 `path`(若存在)改名归档到 `<app_home>/real-account/discarded-stash-<ns>.json`,
+/// 覆盖前留可恢复副本(**不直删** —— 可能是不同真账号,直删 = 丢账号,违反「覆盖前必备份」不变量)。
+/// 失败仅 warn 不阻断。`path` 不存在 → no-op。
+fn archive_existing_auth_file(paths: &CodexPaths, path: &std::path::Path) {
+    if !path.is_file() {
+        return;
+    }
+    let archive_dir = paths.app_home.join("real-account");
+    let _ = std::fs::create_dir_all(&archive_dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let archived = archive_dir.join(format!("discarded-stash-{ts}.json"));
+    if let Err(e) = std::fs::rename(path, &archived) {
+        tracing::warn!("[PluginUnlock] 归档旧 auth 文件失败(保留不直删): {e}");
+    }
+}
+
 /// 把活动**真账号**整文件移到 stash 保全(保 tokens),供切到 synthetic/off 前调用。**只动真账号**
 /// (有 chatgpt tokens、非合成);合成账号 / apikey / 无 auth.json → 留着不动(各自由 `activate_fake_account`
-/// 覆盖、`clear_active_auth_file`(off)清、或本就空)。覆盖旧 stash(活动是更新的那份)。持 `AUTH_LOCK`。
+/// 覆盖、`clear_active_auth_file`(off)清、或本就空)。持 `AUTH_LOCK`。
 pub async fn stash_displaced_real_auth() -> Result<(), String> {
     let _guard = AUTH_LOCK.lock().await;
     let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
@@ -1010,6 +1038,10 @@ pub async fn stash_displaced_real_auth() -> Result<(), String> {
     if let Some(parent) = stash.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建 stash 目录失败: {e}"))?;
     }
+    // [MOC-257 review] stash 已存在另一真账号(A 已 stash → app 外 login B 成活动 → 再 stash B)→ 先归档
+    // 旧 stash 再覆盖,否则 rename 直接顶掉 A 丢账号(macOS/Linux rename 静默替换);也兼顾 Windows
+    // (rename 目标存在会失败)。归档后 stash 必空,rename 安全。
+    archive_existing_auth_file(&paths, &stash);
     std::fs::rename(&paths.auth_json, &stash).map_err(|e| format!("移真账号到 stash 失败: {e}"))?;
     Ok(())
 }
@@ -1043,20 +1075,15 @@ fn restore_stashed_real_auth_impl(paths: &CodexPaths) -> Result<bool, String> {
         })
         .unwrap_or(false);
     if active_real {
-        // [MOC-257 review] 活动已是更新真账号 → 不覆盖;stash 那份也是真账号(含 tokens),**不直删**
-        // (可能不同账号 → 直删丢账号),改名归档到 real-account/discarded-stash-<ns>.json 留可恢复副本。
-        let archive_dir = paths.app_home.join("real-account");
-        let _ = std::fs::create_dir_all(&archive_dir);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let archived = archive_dir.join(format!("discarded-stash-{ts}.json"));
-        if let Err(e) = std::fs::rename(&stash, &archived) {
-            tracing::warn!("[PluginUnlock] 归档被弃 stash 失败(保留 stash 不直删): {e}");
-        }
+        // [MOC-257 review] 活动已是更新真账号 → 不覆盖;stash 那份也是真账号(含 tokens),改名归档
+        // (不直删:可能不同账号 → 直删丢账号),留可恢复副本。
+        archive_existing_auth_file(paths, &stash);
         return Ok(false);
     }
+    // [MOC-257 review] 活动非真账号(synthetic/apikey)→ 删掉再 rename:Windows `rename` 目标已存在会
+    // 失败(real 还原直接报错、回不去 real);macOS/Linux 虽会替换,显式删保证跨平台一致。被删的是
+    // 合成/apikey 占位(非真账号),安全。
+    let _ = std::fs::remove_file(&paths.auth_json);
     std::fs::rename(&stash, &paths.auth_json)
         .map_err(|e| format!("从 stash 还原真账号失败: {e}"))?;
     Ok(true)

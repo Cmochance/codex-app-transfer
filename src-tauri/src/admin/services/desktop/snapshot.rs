@@ -396,8 +396,16 @@ pub async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
     if crate::codex_real_account::resolve_plugin_unlock_mode()
         == crate::codex_real_account::PluginUnlockMode::Off
     {
-        let _ = crate::codex_real_account::stash_displaced_real_auth().await;
-        let _ = crate::codex_real_account::clear_active_auth_file().await;
+        // [MOC-257 review] 失败留痕(只读 ~/.codex / 文件锁 / 磁盘满):OFF 的「无 auth.json」不变量被
+        // sync 重建的 apikey auth.json 悄悄破坏却无声 → 至少 error 日志可诊断(真账号已 stash 不丢)。
+        if let Err(e) = crate::codex_real_account::stash_displaced_real_auth().await {
+            tracing::error!("[PluginUnlock] OFF sync 后 stash 失败: {e}");
+        }
+        if let Err(e) = crate::codex_real_account::clear_active_auth_file().await {
+            tracing::error!(
+                "[PluginUnlock] OFF sync 后重新清 auth.json 失败(无 auth.json 不变量未维持): {e}"
+            );
+        }
         codex_app_transfer_proxy::set_fake_account_mode(false);
     }
     result

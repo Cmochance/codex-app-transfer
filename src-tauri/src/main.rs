@@ -254,6 +254,10 @@ fn main() {
             // [MOC-257 三态] 在 auto_apply 之前按生效三态预置 proxy 伪造(synthetic→开),避免「relay
             // 已通但伪造未开」窄窗里旧 Codex 实例发 /backend-api 透传假 token 被 401。post-apply 的
             // apply_plugin_unlock_mode 会再校正一次。
+            // [MOC-257 review] **先 migrate 再 resolve**:旧版只有 realAccountModeEnabled=false 等老布尔
+            // 的 legacy config,若不先折叠成 pluginUnlockMode,这里早期 resolve 会按缺键默认从残留 tokens
+            // 推成 real/synthetic、预置错的伪造态(post-apply 的 migrate 才纠正,中间窄窗已发错报文)。
+            let _ = handlers::settings::migrate_plugin_unlock_mode_v1();
             codex_app_transfer_proxy::set_fake_account_mode(
                 crate::codex_real_account::resolve_plugin_unlock_mode()
                     == crate::codex_real_account::PluginUnlockMode::Synthetic,
