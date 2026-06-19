@@ -687,6 +687,10 @@ export default {
   "settings.autoUnlockCodexPlugins": "自动解锁 Codex 插件",
   "settings.autoUnlockCodexPluginsHint":
     "此功能需要通过本应用内启动 Codex 才能正常使用。启动后，解锁 codex 插件的使用。",
+  "settings.fakeAccount": "模拟账号解锁 Plugins",
+  "settings.fakeAccountHint":
+    "无真实 ChatGPT 账号时,写入一份合规的模拟登录态让 Codex 原生显示 Plugins,账号/插件请求由本机伪造(marketplace 当前为空,仅显示本地已装插件)。需先配置并激活一个 provider;与真实账号模式互斥。",
+  "settings.fakeAccountFailed": "切换模拟账号模式失败",
   "settings.codexQuotaEnabled": "Codex 内显示用量信息",
   "settings.codexQuotaEnabledHint":
     "仅通过本应用启动 Codex 时生效，在 Codex 內显示用量面板:上下文占用、Tokens 速率与累计以及额度信息。",

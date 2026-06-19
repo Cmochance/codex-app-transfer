@@ -175,3 +175,31 @@ export function traceViewerStop() {
 export function openTraceViewer() {
   return api<{ success?: boolean }>('POST', '/api/trace-viewer/open')
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// 模拟(伪造)账号 plugin 模式(/api/desktop/fake-account/*,MOC-257)
+// 无真实 ChatGPT 账号时的插件强制解锁:写合规伪造 auth.json(auth_mode=chatgpt + 合成 JWT)
+// 让 Codex 原生显示 Plugins,proxy 截断 /backend-api/* 逐条伪造。替代不可靠的 CDP 注入档。
+// ───────────────────────────────────────────────────────────────────────────
+export interface FakeAccountStatus {
+  /** 持久开关(用户意图);键缺失=null */
+  modeEnabled: boolean | null
+  /** 活动 auth.json 当前是否合成账号(伪造 relay 此刻是否真生效) */
+  activeIsSynthetic: boolean
+}
+
+export async function getFakeAccountStatus(): Promise<FakeAccountStatus> {
+  const r = await api<{ mode_enabled?: boolean | null; active_is_synthetic?: boolean }>(
+    'GET',
+    '/api/desktop/fake-account/status',
+  )
+  return { modeEnabled: r.mode_enabled ?? null, activeIsSynthetic: !!r.active_is_synthetic }
+}
+
+export function enableFakeAccount() {
+  return api<{ success: boolean; message?: string }>('POST', '/api/desktop/fake-account/enable')
+}
+
+export function disableFakeAccount() {
+  return api<{ success: boolean; message?: string }>('POST', '/api/desktop/fake-account/disable')
+}

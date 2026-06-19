@@ -590,6 +590,10 @@ export default {
   "settings.showGrayProviders": "Show gray-area providers",
   "settings.showGrayProvidersWarn": "⚠️ Account-ban risk: enabling and using these providers is entirely at your own risk.",
   "settings.showGrayProvidersHint": "By default, TOS-gray / experimental providers such as Grok (Web), Gemini CLI and Antigravity are hidden. Turn this on to make them appear in the \"Add provider\" list.",
+  "settings.fakeAccount": "Unlock Plugins via synthetic account",
+  "settings.fakeAccountHint":
+    "With no real ChatGPT account, write a well-formed synthetic login so Codex natively shows Plugins; account/plugin requests are fabricated locally (marketplace is currently empty — only locally-installed plugins show). Requires an active provider; mutually exclusive with real-account mode.",
+  "settings.fakeAccountFailed": "Failed to toggle synthetic account mode",
   "settings.autoUnlockCodexPlugins": "Auto-unlock Codex plugins",
   "settings.autoUnlockCodexPluginsHint": "Codex must be launched from this app for plugin unlock to work. Click \"Restart Codex\" on the right to relaunch Codex now and trigger injection. Note: Plugins / MCP tools only take effect on protocol-translation routes (`apiFormat=openai_chat / anthropic_messages / gemini_native` etc.); Responses-direct providers (`apiFormat=responses`, e.g. OpenAI official) use byte-level passthrough and do NOT flatten the MCP `namespace` tool bundle — some upstreams silently drop the tool list.",
   "settings.codexQuotaEnabled": "Show usage in Codex",

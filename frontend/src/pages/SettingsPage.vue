@@ -15,6 +15,7 @@ import AppSelect from '@/components/ui/AppSelect.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import { getChromeReady, ensureChrome, getSystemProxyStatus, type SystemProxyStatus } from '@/api/chrome'
+import { enableFakeAccount, disableFakeAccount, getFakeAccountStatus } from '@/api/desktop'
 import ResidualScanPanel from '@/components/settings/ResidualScanPanel.vue'
 import SnapshotPanel from '@/components/settings/SnapshotPanel.vue'
 import DiagnosticPanel from '@/components/settings/DiagnosticPanel.vue'
@@ -31,6 +32,9 @@ onMounted(() => {
   if (!store.loaded) store.load().catch(() => {})
   getAppVersion()
     .then((r) => (appVersion.value = r.version || ''))
+    .catch(() => {})
+  getFakeAccountStatus()
+    .then((s) => (fakeAccountEnabled.value = s.modeEnabled === true))
     .catch(() => {})
 })
 
@@ -78,6 +82,26 @@ const codexNetworkAccess = toggle('codexNetworkAccess', false)
 const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
 const mcpCredentialsPortableStore = toggle('mcpCredentialsPortableStore', true)
+
+// [MOC-257] 模拟(伪造)账号模式:不是普通 settings 持久键,toggle 调专用 enable/disable 端点
+// (写合规伪造 auth.json + apply relay + 开 proxy 伪造)。失败回滚开关 + toast。
+const fakeAccountEnabled = ref(false)
+const fakeAccountBusy = ref(false)
+async function onToggleFakeAccount(v: boolean) {
+  if (fakeAccountBusy.value) return
+  fakeAccountBusy.value = true
+  const prev = fakeAccountEnabled.value
+  fakeAccountEnabled.value = v // 乐观更新
+  try {
+    const r = v ? await enableFakeAccount() : await disableFakeAccount()
+    if (r?.message) toast(r.message)
+  } catch (e) {
+    fakeAccountEnabled.value = prev // 失败回滚
+    toast((e as Error).message || t('settings.fakeAccountFailed'), 'error')
+  } finally {
+    fakeAccountBusy.value = false
+  }
+}
 
 // theme / language 双向(同步本地状态 + 持久化服务端)。
 // setAppearance/setLocale 立刻改 DOM/localStorage(无闪烁),但服务端保存失败时
@@ -301,6 +325,13 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       </SettingsRow>
       <SettingsRow :title="t('settings.autoUnlockCodexPlugins')" :description="t('settings.autoUnlockCodexPluginsHint')">
         <AppSwitch v-model="autoUnlockCodexPlugins" />
+      </SettingsRow>
+      <SettingsRow :title="t('settings.fakeAccount')" :description="t('settings.fakeAccountHint')">
+        <AppSwitch
+          :model-value="fakeAccountEnabled"
+          :disabled="fakeAccountBusy"
+          @update:model-value="onToggleFakeAccount"
+        />
       </SettingsRow>
       <SettingsRow :title="t('settings.autoWakeCodexPet')" :description="t('settings.autoWakeCodexPetHint')">
         <AppSwitch v-model="autoWakeCodexPet" />
