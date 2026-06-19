@@ -82,6 +82,10 @@ pub async fn desktop_clear() -> impl IntoResponse {
         }))
         .into_response();
     }
+    // [MOC-257 review] 先还原 stash 真账号(synthetic/off 把真账号移到 stash 了),再 restore_codex 补
+    // managed key(restore_codex 只 merge managed key、不会自己 un-stash)。否则手动还原后:active 还是合成/
+    // 空、真账号留在 stash 找不回。同 exit/startup 顺序。
+    let _ = crate::codex_real_account::restore_stashed_real_auth().await;
     match restore_codex_state(&paths) {
         Ok(restored) => {
             // [MOC-257 review] 还原原配置后已无解锁态(合成/真 auth + relay 都清了)→ 重置「最近生效」标记
@@ -111,6 +115,8 @@ pub async fn desktop_restore(Json(payload): Json<DesktopRestoreRequest>) -> impl
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let snapshot_id = payload.snapshot_id.unwrap_or_default();
+    // [MOC-257 review] 同 desktop_clear:先还原 stash 真账号再 restore_codex(否则真账号留 stash 找不回)。
+    let _ = crate::codex_real_account::restore_stashed_real_auth().await;
     match restore_codex_snapshot(&paths, &snapshot_id, payload.cleanup_all) {
         Ok(restored) => {
             // [MOC-257 review] 同 desktop_clear:还原快照后无解锁态 → 重置「最近生效」+ 关伪造。

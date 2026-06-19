@@ -481,24 +481,32 @@ pub async fn apply_plugin_unlock_mode(
             // 活动若是真账号先 stash 保全(也避开 activate 的真账号守护);写合成 → 活动=chatgpt;
             // proxy 伪造开;apply relay。**事务化**:activate / relay 任一失败都回滚(还原 stash 真账号回活动
             // 覆盖合成 / 无真账号则清掉合成)+ 关伪造,让 caller(set/add/tray/startup)无需各自清半生效态。
+            // [MOC-257 review] 记 pre-apply 是否已是合成态:已是 → 真账号本就在 stash、回滚**不该 un-stash**
+            // (否则把真账号挪回活动、留 persisted synthetic + real-active 无 relay);只有「本次从 real
+            // stash 走」才在回滚时还原真账号回活动。
+            let was_synthetic = ra::active_is_synthetic();
             ra::stash_displaced_real_auth().await?;
-            // [MOC-257 review] 事务字节快照(stash 后的活动:真账号已移走、剩 apikey / 空)。activate 覆写
-            // 成合成,失败回滚:还原它(恢复原 apikey)+ 还原 stash 真账号(若有,覆盖 apikey)。否则从
-            // apikey 切 synthetic 失败时下面只清合成 → 原 apikey 丢(stash 不收 apikey)。
+            // 事务字节快照(stash 后的活动:真账号已移走、剩 apikey / 空 / 旧合成)。activate 覆写成合成,
+            // 失败回滚:还原它(恢复原 apikey)。否则从 apikey 切 synthetic 失败时下面只清合成 → 原 apikey 丢
+            // (stash 不收 apikey)。
             let pre_synth = ra::snapshot_active_auth_bytes();
             if let Err(e) = ra::activate_fake_account().await {
                 tracing::error!("[PluginUnlock] synthetic activate 失败,回滚: {e}");
                 ra::restore_active_auth_bytes(pre_synth);
-                let _ = ra::restore_stashed_real_auth().await;
+                if !was_synthetic {
+                    let _ = ra::restore_stashed_real_auth().await;
+                }
                 return Err(e);
             }
             codex_app_transfer_proxy::set_fake_account_mode(true);
             if let Err(e) = ensure_relay_applied(state).await {
                 // relay 没装上 → 别留「合成 active + 伪造开但无 relay」(Codex 直连 chatgpt.com 撞 401)。
-                // 还原原活动(apikey)+ stash 真账号(若有);保 gateway key,不丢原 apikey 配置。
+                // 还原原活动(apikey);本次从 real stash 走才还原真账号回活动,已是合成态则真账号留 stash。
                 codex_app_transfer_proxy::set_fake_account_mode(false);
                 ra::restore_active_auth_bytes(pre_synth);
-                let _ = ra::restore_stashed_real_auth().await;
+                if !was_synthetic {
+                    let _ = ra::restore_stashed_real_auth().await;
+                }
                 return Err(e);
             }
             Ok(())
