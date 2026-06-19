@@ -168,6 +168,10 @@ pub fn snapshot_codex_state(
     paths: &CodexPaths,
     app_version: &str,
     provider_name: &str,
+    // [MOC-257 review] 写入端 signature-strip 要识别的 proxy 端口(含当前 settings.proxyPort,不止历史默认
+    // 18080)。否则自定义 proxyPort(如 19090)的 transfer relay 字段拍照时识别不到、被当「用户原始」固化进
+    // 快照 → restore 把它再写回(MOC-162 系统性缺口的 capture 端;这里至少让快照本身不带毒)。
+    proxy_ports: &[u16],
 ) -> Result<SnapshotManifest, CodexError> {
     move_stale_active_snapshots_to_recovery(paths)?;
 
@@ -207,7 +211,7 @@ pub fn snapshot_codex_state(
         for key in crate::residual::signature_fields_to_strip(
             &content,
             &paths.model_catalog_json,
-            &[18080],
+            proxy_ports,
         ) {
             crate::toml_sync::sync_root_value(&snapshot_copy, &key, None)?;
         }
@@ -955,7 +959,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"x\"\n").unwrap();
         std::fs::write(&paths.auth_json, "{\"OPENAI_API_KEY\":\"sk-real\"}\n").unwrap();
-        snapshot_codex_state(&paths, "v-test", "Mock").unwrap();
+        snapshot_codex_state(&paths, "v-test", "Mock", &[18080]).unwrap();
         assert!(has_snapshot(&paths));
 
         drop_all_snapshots(&paths).unwrap();
@@ -1013,7 +1017,7 @@ mod tests {
     #[test]
     fn snapshot_when_neither_file_exists() {
         let (_t, paths) = paths_with_tmp();
-        let m = snapshot_codex_state(&paths, "v2.0.0-stage2.5", "Mock").unwrap();
+        let m = snapshot_codex_state(&paths, "v2.0.0-stage2.5", "Mock", &[18080]).unwrap();
         assert!(!m.config_existed);
         assert!(!m.auth_existed);
         assert!(has_snapshot(&paths));
@@ -1030,7 +1034,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"existing\"\n").unwrap();
         std::fs::write(&paths.auth_json, "{\"OPENAI_API_KEY\":\"existing\"}\n").unwrap();
-        let m = snapshot_codex_state(&paths, "v", "Mock").unwrap();
+        let m = snapshot_codex_state(&paths, "v", "Mock", &[18080]).unwrap();
         assert!(m.config_existed);
         assert!(m.auth_existed);
         assert_eq!(
@@ -1044,10 +1048,10 @@ mod tests {
         let (_t, paths) = paths_with_tmp();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "old\n").unwrap();
-        snapshot_codex_state(&paths, "v", "Mock").unwrap();
+        snapshot_codex_state(&paths, "v", "Mock", &[18080]).unwrap();
         // 改了 config.toml,再 snapshot 一次 —— 不应覆盖原始备份
         std::fs::write(&paths.config_toml, "new\n").unwrap();
-        snapshot_codex_state(&paths, "v", "Mock").unwrap();
+        snapshot_codex_state(&paths, "v", "Mock", &[18080]).unwrap();
         assert_eq!(
             read_snapshot_config(&paths).unwrap(),
             "old\n",
@@ -1058,7 +1062,7 @@ mod tests {
     #[test]
     fn drop_snapshot_clears_dir() {
         let (_t, paths) = paths_with_tmp();
-        snapshot_codex_state(&paths, "v", "Mock").unwrap();
+        snapshot_codex_state(&paths, "v", "Mock", &[18080]).unwrap();
         assert!(has_snapshot(&paths));
         drop_snapshot(&paths).unwrap();
         assert!(!has_snapshot(&paths));
@@ -1088,7 +1092,7 @@ mod tests {
 
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
-        snapshot_codex_state(&paths, "v-new", "New").unwrap();
+        snapshot_codex_state(&paths, "v-new", "New", &[18080]).unwrap();
 
         assert!(!stale_dir.exists());
         let snapshots = list_snapshots(&paths);
@@ -1484,7 +1488,7 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
 
-        snapshot_codex_state(&paths, "v-new", "New").unwrap();
+        snapshot_codex_state(&paths, "v-new", "New", &[18080]).unwrap();
 
         assert!(
             snapshot_dirs_under(&paths.recovery_snapshots_dir).len() <= MAX_RECOVERY_SNAPSHOTS,

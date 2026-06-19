@@ -443,14 +443,15 @@ pub async fn apply_plugin_unlock_mode(
     // 拍新快照、把 stale 原始归档掉 → 后续 restore 用被投毒的当前快照还原成合成。对齐 desktop_clear 的双查。
     if let Ok(paths) = CodexPaths::from_home_env() {
         if !has_snapshot(&paths) && !has_stale_active_snapshot(&paths) {
-            let pname = load_registry()
-                .ok()
-                .map(|c| active_provider_name(&c))
-                .unwrap_or_default();
+            let cfg = load_registry().ok();
+            let pname = cfg.as_ref().map(active_provider_name).unwrap_or_default();
+            // [MOC-257 review] 传当前 proxyPort 给 signature-strip(不止 18080),自定义端口的 relay 字段也反投毒。
+            let proxy_port = cfg.as_ref().map(read_proxy_port).unwrap_or(18080);
             if let Err(e) = codex_app_transfer_codex_integration::snapshot_codex_state(
                 &paths,
                 APP_VERSION,
                 &pname,
+                &[proxy_port, 18080],
             ) {
                 // [MOC-257 P1 review] 无既有快照 + 捕获失败(快照目录不可写而 ~/.codex 仍可写)→ **abort 不
                 // mutate**:否则下面 OFF clear / synthetic 覆写会改 ~/.codex 却无快照可还原(原 apikey /

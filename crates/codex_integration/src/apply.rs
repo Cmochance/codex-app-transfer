@@ -110,10 +110,26 @@ pub struct ApplyResult {
 
 /// 把 active provider 配置写入 `~/.codex/{config.toml,auth.json}`,
 /// 首次写入前自动 snapshot。
+/// 从 `http://host:port[/path]` 解析端口(供 snapshot signature-strip 识别 transfer relay 字段;解析不到默认
+/// 历史 18080)。[MOC-257 review] 自定义 proxyPort 时让快照反投毒认得当前端口。
+fn proxy_port_from_url(base_url: &str) -> u16 {
+    base_url
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(18080)
+}
+
 pub fn apply_provider(paths: &CodexPaths, cfg: &ApplyConfig) -> Result<ApplyResult, CodexError> {
     // 1. snapshot(幂等;已有快照不会覆盖)
     let snapshot_taken_now = !has_snapshot(paths);
-    snapshot_codex_state(paths, cfg.app_version, cfg.provider_name)?;
+    snapshot_codex_state(
+        paths,
+        cfg.app_version,
+        cfg.provider_name,
+        &[proxy_port_from_url(cfg.base_url), 18080],
+    )?;
 
     // 2. config.toml: openai_base_url
     if cfg.base_url.is_empty() {
