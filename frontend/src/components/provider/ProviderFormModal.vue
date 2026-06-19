@@ -125,6 +125,9 @@ const baseUrlOptions = computed(() =>
 // preset 决定(已由 applyPreset 填入 form 随保存发送)且被 healing 强制覆盖, 用户改也无效,
 // 故隐藏以保持显示统一。
 const isCustomProvider = computed(() => !isBuiltin.value && !matchedPreset.value)
+// 编辑内置/预设 provider 时 baseUrl 不可改:后端 update_provider 对 builtin 跳过 baseUrl,
+// 改了会被静默丢弃(含小米多集群切换)→ 设为只读, 如实反映后端行为(添加时仍可选集群)。
+const baseUrlReadonly = computed(() => isEdit.value && !isCustomProvider.value)
 
 // OAuth 账号登录类 provider(按 authScheme 判定, 添加经 preset 预填 / 编辑从后端回填均适用):
 // 这些用浏览器授权登录, 用登录区取代 API Key 输入。
@@ -377,8 +380,9 @@ async function save() {
         />
       </SettingsRow>
       <SettingsRow title="Base URL">
+        <AppInput v-if="baseUrlReadonly" v-model="form.baseUrl" :disabled="true" />
         <AppSelect
-          v-if="baseUrlOptions.length >= 2"
+          v-else-if="baseUrlOptions.length >= 2"
           v-model="form.baseUrl"
           :options="baseUrlOptions"
         />

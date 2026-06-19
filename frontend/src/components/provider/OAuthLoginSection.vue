@@ -40,7 +40,13 @@ async function onLogin() {
   logging.value = true
   cancelled = false
   try {
-    await oauthLogin(props.kind) // 长阻塞:浏览器授权完成/取消才返回
+    // 长阻塞:浏览器授权完成/取消才返回。部分上游(zai/bigmodel/google)登录失败时
+    // 返回 HTTP 200 {loggedIn:false, error},api() 不抛 → 需显式读出 error 提示,
+    // 否则失败看起来像无操作。
+    const res = (await oauthLogin(props.kind)) as { loggedIn?: boolean; error?: string } | null
+    if (res && res.loggedIn === false && res.error && !cancelled) {
+      toast(res.error, 'error')
+    }
     await refresh()
   } catch (e) {
     if (!cancelled) toast(errMsg(e) || t('oauth.loginFailed'), 'error')

@@ -759,8 +759,18 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
                         .inner()
                         .clone(),
                 };
-                let _ =
+                // 与 HTTP restart_codex_app handler 一致:sync 尝试且失败时不重启,
+                // 避免用 stale/错误的 provider 配置拉起 Codex。
+                let sync =
                     admin::services::desktop::snapshot::sync_desktop_for_active_provider(&st).await;
+                let sync_failed = sync.get("attempted").and_then(|v| v.as_bool()) == Some(true)
+                    && sync.get("success").and_then(|v| v.as_bool()) != Some(true);
+                if sync_failed {
+                    tracing::warn!(
+                        "[tray] restart-codex: desktop sync 失败, 跳过重启(避免 stale 配置)"
+                    );
+                    return;
+                }
                 if admin::services::desktop::process::launch_codex_app_restart(std::env::consts::OS)
                     .is_ok()
                 {
