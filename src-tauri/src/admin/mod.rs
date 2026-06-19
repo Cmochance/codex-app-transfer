@@ -247,8 +247,8 @@ pub fn build_app_router(state: AdminState) -> Router {
         .route("/api/open-url", post(handlers::common::open_url_handler))
         // Gemini CLI OAuth (login / status / logout)
         .merge(handlers::gemini_oauth::routes())
-        // Plugin Unlock (CDP injection for Codex Desktop)
-        .merge(handlers::plugin_unlock::routes())
+        // [MOC-257] 旧 CDP 注入解锁路由(/api/desktop/plugin-unlock/start|stop|status)已废弃,
+        // 不再注册 —— 由下面的三态选择器接管同一命名空间。CDP daemon 代码保留但默认不启。
         // Real ChatGPT account detection for plugin mode (MOC-104)
         .merge(handlers::real_account::routes())
         // Three-state plugin unlock selector: off / synthetic / real (MOC-257)

@@ -421,11 +421,15 @@ pub async fn apply_plugin_unlock_mode(
     use crate::codex_real_account::PluginUnlockMode as M;
     match mode {
         M::Off => {
-            // 真账号 stash 走、合成/apikey 清 → 活动腾空;proxy 不伪造;apply 非 relay(apikey、无 chatgpt_base_url)。
+            // 真账号 stash 走、合成残留清 → 确保 ~/.codex 无 auth.json(用户硬性要求);proxy 不伪造。
+            // **不**跑 sync_clearing —— 它(force_apikey apply)会重写一份 apikey auth.json,违背「无
+            // auth.json」。config.toml 残留的 relay 字段(chatgpt_base_url)在无 auth.json / 无 chatgpt
+            // 账号时 inert(Codex 不会发 /backend-api),退出时 restore_codex_if_enabled 会清。`state`
+            // 在 OFF 分支不需要(不 apply provider),由 synthetic/real 分支使用。
+            let _ = state;
             ra::stash_displaced_real_auth().await?;
             ra::clear_active_auth_file().await?;
             codex_app_transfer_proxy::set_fake_account_mode(false);
-            let _ = sync_desktop_clearing_real_account(state).await;
             Ok(())
         }
         M::Synthetic => {
