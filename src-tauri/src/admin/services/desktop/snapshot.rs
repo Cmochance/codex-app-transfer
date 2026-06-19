@@ -468,9 +468,18 @@ pub async fn apply_plugin_unlock_mode(
             ensure_relay_applied(state).await
         }
         M::Real => {
-            // 从 stash 还原真账号;确保 auth_mode=chatgpt(apikey-with-tokens → chatgpt);proxy 透传;apply relay。
+            // 从 stash 还原真账号(active 非可用真账号才覆盖);再确保活动是**非合成**真 chatgpt(合成/过期 →
+            // 从镜像 / 活源恢复)。proxy 透传;apply relay。
             let _ = ra::restore_stashed_real_auth().await?;
-            let _ = ra::activate_real_account().await;
+            // [MOC-257 review] activate 返 false = 没能弄出可用真账号(active 仍合成 / 不可用)→ **报错**,
+            // 绝不带着合成 active 关伪造去 relay(会把合成 token 发真 chatgpt.com 全 401、UI 却显示 Real)。
+            // 正常 set 端点 effective-degrade 已据 real_account_usable 挡住 real-but-unusable;这是 TOCTOU 防御。
+            if !ra::activate_real_account().await.unwrap_or(false) {
+                return Err(
+                    "无法激活真实账号(账号不可用 / 已失效),请在 Codex 重新登录后再切「真实账号」"
+                        .to_owned(),
+                );
+            }
             codex_app_transfer_proxy::set_fake_account_mode(false);
             ensure_relay_applied(state).await
         }
