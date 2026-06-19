@@ -1128,22 +1128,20 @@ pub fn snapshot_active_auth_bytes() -> Option<Vec<u8>> {
 }
 
 /// [MOC-257 review] 把字节写回 stash 路径(apply 回滚:Real 分支若是从 stash unstash 了真账号才失败,需
-/// 把真账号放回 stash,恢复 pre-apply 的「真账号在 stash」态,否则它只剩在被还原的活动里、回滚活动后丢失)。
-/// `None` → no-op。best-effort。
-pub fn restash_real_auth_bytes(snapshot: Option<Vec<u8>>) {
+/// 把真账号放回 stash,恢复 pre-apply 的「真账号在 stash」态)。`None`(本次没 unstash)→ `Ok(())` no-op。
+/// **fallible**:写失败必须报 —— 此时原 stash 已被 unstash 消费、内存 Vec 是真账号唯一副本,caller 据 Err
+/// **别再覆盖活动**(真账号还在活动里),否则真 tokens 永久丢。
+#[must_use = "re-stash 可能失败;失败时别覆盖活动(真账号唯一副本在活动里),否则丢账号"]
+pub fn restash_real_auth_bytes(snapshot: Option<Vec<u8>>) -> Result<(), String> {
     let Some(bytes) = snapshot else {
-        return;
+        return Ok(()); // 本次没 unstash → 无需 re-stash
     };
-    let Ok(p) = CodexPaths::from_home_env() else {
-        return;
-    };
+    let p = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
     let stash = real_account_stash_path(&p);
     if let Some(parent) = stash.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|e| format!("建 stash 目录失败: {e}"))?;
     }
-    if let Err(e) = std::fs::write(&stash, &bytes) {
-        tracing::warn!("[PluginUnlock] 回滚 re-stash 真账号失败: {e}");
-    }
+    std::fs::write(&stash, &bytes).map_err(|e| format!("写 stash 失败: {e}"))
 }
 
 /// 把活动 `auth.json` 还原到 [`snapshot_active_auth_bytes`] 拿的快照(`Some`→写回原字节;`None`→删文件,

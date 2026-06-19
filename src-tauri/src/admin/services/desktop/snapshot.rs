@@ -558,8 +558,16 @@ pub async fn apply_plugin_unlock_mode(
             // activate 返 false = 没能弄出可用真账号 → 报错(绝不带合成 active 关伪造去 relay,会把合成 token
             // 发真 chatgpt.com 全 401);effective-degrade 已挡 real-but-unusable,这是 TOCTOU 防御。
             if !ra::activate_real_account().await.unwrap_or(false) {
+                // [MOC-257 review] 先 re-stash 真账号(fallible),成功才 restore pre_apply 覆盖活动;失败 → 把真
+                // 账号写回**活动**(内存副本保证不丢)+ surface,绝不静默丢真 tokens(原 stash 已被 unstash 消费、
+                // 内存 Vec 是唯一副本)。
+                if let Err(e2) = ra::restash_real_auth_bytes(unstashed_real.clone()) {
+                    ra::restore_active_auth_bytes(unstashed_real);
+                    return Err(format!(
+                        "无法激活真实账号(账号不可用 / 已失效);回滚 re-stash 真账号也失败({e2})—— 真账号已保留在活动 auth、未丢失,请在 Codex 重新登录后重试"
+                    ));
+                }
                 ra::restore_active_auth_bytes(pre_apply);
-                ra::restash_real_auth_bytes(unstashed_real);
                 return Err(
                     "无法激活真实账号(账号不可用 / 已失效),请在 Codex 重新登录后再切「真实账号」"
                         .to_owned(),
@@ -569,8 +577,14 @@ pub async fn apply_plugin_unlock_mode(
             // relay 没装上 → 还原 pre-apply 活动 + re-stash 真账号,别留「real chatgpt active 无 relay」(Codex
             // 据 auth_mode=chatgpt 直连真 chatgpt.com 绕过 proxy)。下次启动 resolve→real 再激活。
             if let Err(e) = ensure_relay_applied(state).await {
+                // 先 re-stash(fallible),成功才 restore pre_apply + 重置伪造;失败 → 真账号写回活动保不丢 + surface。
+                if let Err(e2) = ra::restash_real_auth_bytes(unstashed_real.clone()) {
+                    ra::restore_active_auth_bytes(unstashed_real);
+                    return Err(format!(
+                        "切换失败({e});回滚 re-stash 真账号也失败({e2})—— 真账号已保留在活动 auth、未丢失,重启 Codex App Transfer 会自动恢复"
+                    ));
+                }
                 ra::restore_active_auth_bytes(pre_apply);
-                ra::restash_real_auth_bytes(unstashed_real);
                 // [MOC-257 review] 上面已 set_fake(false)。若 pre-apply 是合成态(prior synthetic),还原后要把
                 // 伪造**重新开上**(按还原后的活动是否合成决定)——否则合成 token 经现存 relay 透传 chatgpt.com
                 // 撞 401;非合成态(apikey/off)保持关。
