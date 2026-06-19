@@ -639,16 +639,25 @@ pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) 
         }
     };
     if !read_setting_bool(&cfg, "autoApplyOnStart", true) {
-        // [MOC-257 review] autoApplyOnStart=false 跳过 apply,但若盘上是**保留的合成态**(restoreCodexOnExit=
-        // false 把合成 auth + chatgpt_base_url relay 留下、上次退出停了 proxy),仍要把 proxy 起起来 —— 否则
-        // Codex 据 chatgpt_base_url 把 /backend-api 发到死端口、伪造器无处响应、插件请求全挂。早期预置已开伪造
-        // flag,这里补上 proxy 进程。非合成态不需要。
-        if crate::codex_real_account::active_is_synthetic() {
+        // [MOC-257 review] autoApplyOnStart=false 跳过 apply,但若盘上是**保留的 relay 态**(restoreCodexOnExit=
+        // false 把 auth + config.toml 的 chatgpt_base_url/openai_base_url→本地 proxy 留下、上次退出停了 proxy),
+        // 仍要把 proxy 起起来 —— 否则 Codex 据这些 base_url 把 chat + /backend-api 发到死端口、全挂。**synthetic
+        // 与 real relay 都算**(real:真账号 + relay 透传;synthetic:合成 + 伪造):统一看 config.toml 是否指向
+        // 本地 proxy(active_is_synthetic 兜底,防极端只写 auth 没写 relay)。早期预置只开伪造 flag,这里补进程。
+        let relay_on_disk = CodexPaths::from_home_env().ok().is_some_and(|p| {
+            let points_local = |k: &str| {
+                read_codex_toml_root_string(&p, k).is_some_and(|u| {
+                    u.starts_with("http://127.0.0.1:") || u.starts_with("http://localhost:")
+                })
+            };
+            points_local("chatgpt_base_url") || points_local("openai_base_url")
+        });
+        if relay_on_disk || crate::codex_real_account::active_is_synthetic() {
             let port = read_proxy_port(&cfg);
             let started = start_proxy_if_needed(&proxy_manager, port)
                 .await
                 .unwrap_or(false);
-            return json!({"applied": false, "requiresProxy": true, "proxyStarted": started, "message": "auto-apply disabled; proxy started for preserved synthetic"});
+            return json!({"applied": false, "requiresProxy": true, "proxyStarted": started, "message": "auto-apply disabled; proxy started for preserved relay"});
         }
         return json!({"applied": false, "requiresProxy": false, "proxyStarted": false, "message": "disabled by settings"});
     }
