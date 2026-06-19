@@ -761,12 +761,13 @@ fn handle_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 };
                 let _ =
                     admin::services::desktop::snapshot::sync_desktop_for_active_provider(&st).await;
-                if admin::services::desktop::process::launch_codex_app_restart(
-                    std::env::consts::OS,
-                )
-                .is_ok()
+                if admin::services::desktop::process::launch_codex_app_restart(std::env::consts::OS)
+                    .is_ok()
                 {
-                    handlers::plugin_unlock::get_service().await.reinject().await;
+                    handlers::plugin_unlock::get_service()
+                        .await
+                        .reinject()
+                        .await;
                 }
             });
         }
@@ -824,7 +825,10 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(manager: &M) -> tauri::Result<Menu
         .item(&providers)
         .text("restart_codex", tr("重启 Codex", "Restart Codex"))
         .separator()
-        .text("quit", tr("退出 Codex App Transfer", "Quit Codex App Transfer"))
+        .text(
+            "quit",
+            tr("退出 Codex App Transfer", "Quit Codex App Transfer"),
+        )
         .build()
 }
 
