@@ -481,7 +481,15 @@ pub async fn apply_plugin_unlock_mode(
                 );
             }
             codex_app_transfer_proxy::set_fake_account_mode(false);
-            ensure_relay_applied(state).await
+            // [MOC-257 review] Real 分支事务化:activate 已把活动写成 auth_mode=chatgpt,若 relay 没装上
+            // (proxy/apply 失败)就别留「real chatgpt active 无 relay」—— Codex 会据 auth_mode=chatgpt 直连
+            // 真 chatgpt.com、绕过 proxy,且与回滚后的持久不一致。relay 失败 → 切回 apikey(保留 tokens,下次
+            // 启动 resolve→real 再激活)。
+            if let Err(e) = ensure_relay_applied(state).await {
+                let _ = ra::deactivate_real_account().await;
+                return Err(e);
+            }
+            Ok(())
         }
     };
     // [MOC-257 review] 成功生效 → 记录最近 apply 的模式,供 status 如实报告「当前实际生效」(外部
