@@ -461,8 +461,13 @@ fn main() {
                             "[PluginUnlock] 启动跳过 apply {mode:?}:无 active provider、relay 起不来,不写无 relay 的解锁态"
                         );
                     } else {
-                        // real 模式:先跑真账号 reconcile(从导入镜像恢复 / relogin 检测,MOC-104 保留)。
-                        if mode == crate::codex_real_account::PluginUnlockMode::Real {
+                        // [MOC-257 review] real 意图:先跑真账号 reconcile(镜像恢复 / relogin 检测,MOC-104
+                        // 保留)。gate 在**持久 Real 意图**而非 resolved mode —— persisted=real 但账号过期/撤销时
+                        // resolve 已把 mode 降级成 synthetic,按 mode 判会跳过 reconcile + relogin 提示,用户选了
+                        // Real 却不知账号失效、不被提示重登(对齐手动 set 的降级消息)。降级后仍 apply synthetic。
+                        if crate::admin::handlers::settings::read_plugin_unlock_mode().as_deref()
+                            == Some("real")
+                        {
                             if let Ok(
                                 crate::codex_real_account::ReconcileOutcome::ReloginRequired { .. },
                             ) = crate::codex_real_account::reconcile_on_startup(Some(true)).await
