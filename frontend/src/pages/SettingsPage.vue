@@ -21,6 +21,7 @@ import {
   getRealAccountStatus,
   startRealAccountLogin,
   cancelRealAccountLogin,
+  pinCurrentRealAccount,
   type PluginUnlockMode,
 } from '@/api/desktop'
 import type { ApiError } from '@/api/http'
@@ -181,6 +182,14 @@ async function startLogin() {
         loginRunning.value = false
         loginModalOpen.value = false
         toast(t('settings.realAccountLoginOk'))
+        // [MOC-257 review] 切 real 前先 pin 当前账号到 mirror/stash:否则登录前已有快照(startup auto-apply)
+        // + restoreCodexOnExit 开时,新登录账号没存进 mirror、退出 restore 重放登录前快照抹掉 auth_mode。
+        // best-effort:pin 失败不阻断 real apply(relay 仍用活动账号,只是 restore 持久性弱)。
+        try {
+          await pinCurrentRealAccount()
+        } catch {
+          /* pin 失败不阻断后续 real apply */
+        }
         await onSetPluginUnlockMode('real') // 现在有账号了,切真实账号
       } else if (s.loginState === 'failed') {
         stopLoginPoll()

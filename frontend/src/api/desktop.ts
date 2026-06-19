@@ -233,3 +233,15 @@ export function cancelRealAccountLogin() {
     '/api/desktop/real-account/login/cancel',
   )
 }
+
+/**
+ * 持久保留当前真实账号到 mirror/stash(登录成功后**自动调**)。否则登录前已有快照(startup auto-apply)+
+ * restoreCodexOnExit 开时,新登录账号没存进 mirror → 退出 restore 重放登录前快照、抹掉 auth_mode,Codex 不再
+ * 认作 ChatGPT。
+ */
+export function pinCurrentRealAccount() {
+  return api<{ success: boolean; message?: string }>(
+    'POST',
+    '/api/desktop/real-account/pin-current',
+  )
+}
