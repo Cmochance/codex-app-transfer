@@ -15,8 +15,10 @@
 //!   poll `DevToolsActivePort` 拿到端口后自动 re-inject。**仅 user 绕过 transfer
 //!   直接启 Codex.app(Spotlight / 系统重启 / kill -9 等)时需要手动 apply 一次**。
 //!
-//! **资源**:5 套内置主题在 `src-tauri/resources/themes/<name>/{bg.{png,jpg},mascot.png?}`,
-//! 编译时 `include_bytes!` 嵌进 binary,运行时 base64 编码注入 data URI。
+//! **资源**:11 套内置主题在 `src-tauri/resources/themes/<name>/{preview.jpg,mascot.png?}`。
+//! 缩略图 `preview.jpg`(+ carton mascot)编译时 `include_bytes!` 嵌进 binary;**背景全图
+//! `bg.jpg` 不再嵌入** —— 运行时 on-demand 从 storage 仓库 `img/theme/<id>.jpg` 下载 + 缓存
+//! (`~/.codex-app-transfer/theme-cache/`,带进度给前端进度环),失败/离线回退缩略图当 bg。
 
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -587,84 +589,56 @@ pub fn load_theme_assets(theme_id: &str) -> Option<ThemeAssets> {
     if theme_id == CUSTOM_THEME_ID {
         return load_custom_theme_assets();
     }
-    // include_bytes! 必须用字面路径,所以每条 theme 显式 match
-    let (bg_bytes, bg_mime, mascot, preview_bytes): (&[u8], &str, Option<(&[u8], &str)>, &[u8]) =
-        match theme_id {
-            "carton" => (
-                include_bytes!("../resources/themes/carton/bg.jpg"),
-                "image/jpeg",
-                Some((
-                    include_bytes!("../resources/themes/carton/mascot.png"),
-                    "image/png",
-                )),
-                include_bytes!("../resources/themes/carton/preview.jpg"),
-            ),
-            "changli" => (
-                include_bytes!("../resources/themes/changli/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/changli/preview.jpg"),
-            ),
-            "azurlane" => (
-                include_bytes!("../resources/themes/azurlane/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/azurlane/preview.jpg"),
-            ),
-            "nailin" => (
-                include_bytes!("../resources/themes/nailin/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/nailin/preview.jpg"),
-            ),
-            "zani" => (
-                include_bytes!("../resources/themes/zani/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/zani/preview.jpg"),
-            ),
-            "frost" => (
-                include_bytes!("../resources/themes/frost/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/frost/preview.jpg"),
-            ),
-            "nocturne" => (
-                include_bytes!("../resources/themes/nocturne/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/nocturne/preview.jpg"),
-            ),
-            "duet" => (
-                include_bytes!("../resources/themes/duet/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/duet/preview.jpg"),
-            ),
-            "rose" => (
-                include_bytes!("../resources/themes/rose/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/rose/preview.jpg"),
-            ),
-            "sonata" => (
-                include_bytes!("../resources/themes/sonata/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/sonata/preview.jpg"),
-            ),
-            "studio" => (
-                include_bytes!("../resources/themes/studio/bg.jpg"),
-                "image/jpeg",
-                None,
-                include_bytes!("../resources/themes/studio/preview.jpg"),
-            ),
-            _ => return None,
-        };
+    // include_bytes! 必须用字面路径,所以每条 theme 显式 match。
+    // 背景全图(bg.jpg)**不再嵌入 binary** —— 改 on-demand 从 storage 仓库下载(见
+    // [`ensure_bg_data_uri`]),这里只嵌**缩略图** preview.jpg(+ carton mascot)。bg_data_uri
+    // 先置缩略图作离线/下载失败兜底,apply 时被 [`ensure_bg_data_uri`] 覆盖成全图。
+    let (mascot, preview_bytes): (Option<(&[u8], &str)>, &[u8]) = match theme_id {
+        "carton" => (
+            Some((
+                include_bytes!("../resources/themes/carton/mascot.png"),
+                "image/png",
+            )),
+            include_bytes!("../resources/themes/carton/preview.jpg"),
+        ),
+        "changli" => (
+            None,
+            include_bytes!("../resources/themes/changli/preview.jpg"),
+        ),
+        "azurlane" => (
+            None,
+            include_bytes!("../resources/themes/azurlane/preview.jpg"),
+        ),
+        "nailin" => (
+            None,
+            include_bytes!("../resources/themes/nailin/preview.jpg"),
+        ),
+        "zani" => (None, include_bytes!("../resources/themes/zani/preview.jpg")),
+        "frost" => (
+            None,
+            include_bytes!("../resources/themes/frost/preview.jpg"),
+        ),
+        "nocturne" => (
+            None,
+            include_bytes!("../resources/themes/nocturne/preview.jpg"),
+        ),
+        "duet" => (None, include_bytes!("../resources/themes/duet/preview.jpg")),
+        "rose" => (None, include_bytes!("../resources/themes/rose/preview.jpg")),
+        "sonata" => (
+            None,
+            include_bytes!("../resources/themes/sonata/preview.jpg"),
+        ),
+        "studio" => (
+            None,
+            include_bytes!("../resources/themes/studio/preview.jpg"),
+        ),
+        _ => return None,
+    };
+    let preview_uri = encode_data_uri("image/jpeg", preview_bytes);
     Some(ThemeAssets {
-        bg_data_uri: encode_data_uri(bg_mime, bg_bytes),
+        bg_data_uri: preview_uri.clone(),
         mascot_data_uri: mascot.map(|(b, m)| encode_data_uri(m, b)),
-        preview_data_uri: encode_data_uri("image/jpeg", preview_bytes),
+        preview_data_uri: preview_uri,
     })
 }
 
@@ -674,6 +648,107 @@ fn encode_data_uri(mime: &str, bytes: &[u8]) -> String {
         "data:{mime};base64,{}",
         general_purpose::STANDARD.encode(bytes)
     )
+}
+
+const THEME_BG_BASE: &str =
+    "https://raw.githubusercontent.com/Cmochance/codex-app-transfer-storage/main/img/theme";
+/// 背景大图下载封顶(实际 0.3-1.1MB,封顶防异常超大响应 OOM)。
+const MAX_BG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 内置主题背景全图本地缓存:`~/.codex-app-transfer/theme-cache/<id>.jpg`。
+fn theme_cache_path(theme_id: &str) -> Option<std::path::PathBuf> {
+    codex_app_transfer_registry::paths::resolve_home().map(|h| {
+        h.join(".codex-app-transfer")
+            .join("theme-cache")
+            .join(format!("{theme_id}.jpg"))
+    })
+}
+
+/// 背景大图下载进度(theme_id → (downloaded, total))。前端轮询渲染缩略图上的进度环。
+fn bg_progress() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>> =
+        std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 查某主题当前下载进度。`None` = 没在下载(已缓存或未触发)。
+pub fn bg_download_progress(theme_id: &str) -> Option<(u64, u64)> {
+    bg_progress().lock().ok()?.get(theme_id).copied()
+}
+
+fn set_bg_progress(theme_id: &str, downloaded: u64, total: u64) {
+    if let Ok(mut m) = bg_progress().lock() {
+        m.insert(theme_id.to_owned(), (downloaded, total));
+    }
+}
+
+fn clear_bg_progress(theme_id: &str) {
+    if let Ok(mut m) = bg_progress().lock() {
+        m.remove(theme_id);
+    }
+}
+
+/// 取内置主题背景全图 data URI:先查本地缓存,没有就从 storage 下载(带进度)+ 缓存;
+/// 失败(离线 / 404 等)回退 `fallback`(烤进 binary 的缩略图,低清但不 break)。
+async fn ensure_bg_data_uri(theme_id: &str, fallback: &str) -> String {
+    let cache = theme_cache_path(theme_id);
+    if let Some(p) = &cache {
+        if let Ok(bytes) = std::fs::read(p) {
+            return encode_data_uri("image/jpeg", &bytes);
+        }
+    }
+    match download_bg(theme_id).await {
+        Ok(bytes) => {
+            if let Some(p) = &cache {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(p, &bytes);
+            }
+            encode_data_uri("image/jpeg", &bytes)
+        }
+        Err(_) => fallback.to_owned(),
+    }
+}
+
+/// 流式下载背景全图,边下边更新进度(给前端进度环);封顶防超大响应。
+async fn download_bg(theme_id: &str) -> Result<Vec<u8>, String> {
+    let url = format!("{THEME_BG_BASE}/{theme_id}.jpg");
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("http {}", resp.status().as_u16()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    if total > MAX_BG_BYTES {
+        return Err(format!("bg too large: {total}"));
+    }
+    set_bg_progress(theme_id, 0, total);
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                clear_bg_progress(theme_id);
+                return Err(e.to_string());
+            }
+        };
+        if buf.len() as u64 + chunk.len() as u64 > MAX_BG_BYTES {
+            clear_bg_progress(theme_id);
+            return Err("bg exceeds cap".to_owned());
+        }
+        buf.extend_from_slice(&chunk);
+        set_bg_progress(theme_id, buf.len() as u64, total);
+    }
+    clear_bg_progress(theme_id);
+    Ok(buf)
 }
 
 /// 主题注入状态(给前端展示)。
@@ -720,10 +795,16 @@ async fn set_status(new: ThemeStatus) {
 /// `theme_id` 必须在 [`THEME_IDS`] 内;否则返 `Err`。
 /// Codex.app 没启动 / CDP 未开 → 返 `Err`(caller 决定 retry 还是报 user)。
 pub async fn apply_theme(theme_id: &str) -> Result<(), String> {
-    let assets =
+    let mut assets =
         load_theme_assets(theme_id).ok_or_else(|| format!("unknown theme id: {theme_id}"))?;
 
     set_status(ThemeStatus::Applying).await;
+
+    // 内置主题:背景全图 on-demand 下载 + 缓存(custom 用本地 disk bg,不覆盖)。
+    // 此时 status 已是 Applying,前端轮询 bg-progress 在该主题缩略图上渲染进度环 + 白蒙版。
+    if theme_id != CUSTOM_THEME_ID {
+        assets.bg_data_uri = ensure_bg_data_uri(theme_id, &assets.preview_data_uri).await;
+    }
 
     match run_apply(theme_id, &assets).await {
         Ok(()) => {

@@ -31,6 +31,19 @@ export function themeStatus() {
 export function themeApply(themeId: string) {
   return api('POST', '/api/desktop/theme/apply', { theme_id: themeId })
 }
+// 背景全图 on-demand 下载进度(apply 期间轮询,渲染缩略图进度环 + 白蒙版)。
+// downloading:false = 已缓存 / 未触发 / 下载结束。
+export interface ThemeBgProgress {
+  downloading: boolean
+  downloaded?: number
+  total?: number
+}
+export function themeBgProgress(themeId: string) {
+  return api<ThemeBgProgress>(
+    'GET',
+    `/api/desktop/theme/bg-progress?theme_id=${encodeURIComponent(themeId)}`,
+  )
+}
 export function themeUploadCustom(dataUri: string) {
   return api('POST', '/api/desktop/theme/custom/upload', { data_uri: dataUri })
 }
