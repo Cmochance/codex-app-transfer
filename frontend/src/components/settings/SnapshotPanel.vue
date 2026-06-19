@@ -9,6 +9,9 @@ import { getDesktopSnapshotStatus, openSnapshotDir } from '@/api/desktop'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 
+// [MOC-257 review] 还原成功后通知父级(SettingsPage)刷新插件解锁状态:后端 restore 已 reset
+// LAST_APPLIED_MODE,但父级 mount 时的三态 ref 是陈旧的,不刷新会让用户点高亮档 no-op、应用不上。
+const emit = defineEmits<{ restored: [] }>()
 const { show: toast } = useToast()
 const { restoreCodexConfig } = useCodexRestore()
 // 存原始数据,statusText 用 computed 派生 → 随 locale 切换实时更新(修「中文界面残留旧 locale 英文」)
@@ -39,7 +42,10 @@ async function refreshStatus() {
 
 async function onRestore() {
   try {
-    if (await restoreCodexConfig()) await refreshStatus()
+    if (await restoreCodexConfig()) {
+      await refreshStatus()
+      emit('restored')
+    }
   } catch (e) {
     toast(errMsg(e), 'error')
   }

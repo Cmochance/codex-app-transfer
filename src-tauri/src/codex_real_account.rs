@@ -1127,6 +1127,25 @@ pub fn snapshot_active_auth_bytes() -> Option<Vec<u8>> {
         .and_then(|p| std::fs::read(&p.auth_json).ok())
 }
 
+/// [MOC-257 review] 把字节写回 stash 路径(apply 回滚:Real 分支若是从 stash unstash 了真账号才失败,需
+/// 把真账号放回 stash,恢复 pre-apply 的「真账号在 stash」态,否则它只剩在被还原的活动里、回滚活动后丢失)。
+/// `None` → no-op。best-effort。
+pub fn restash_real_auth_bytes(snapshot: Option<Vec<u8>>) {
+    let Some(bytes) = snapshot else {
+        return;
+    };
+    let Ok(p) = CodexPaths::from_home_env() else {
+        return;
+    };
+    let stash = real_account_stash_path(&p);
+    if let Some(parent) = stash.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&stash, &bytes) {
+        tracing::warn!("[PluginUnlock] 回滚 re-stash 真账号失败: {e}");
+    }
+}
+
 /// 把活动 `auth.json` 还原到 [`snapshot_active_auth_bytes`] 拿的快照(`Some`→写回原字节;`None`→删文件,
 /// 还原到「apply 前无 auth.json」)。供 apply 失败回滚。best-effort(失败只 warn)。
 pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) {

@@ -41,13 +41,18 @@ onMounted(() => {
   getAppVersion()
     .then((r) => (appVersion.value = r.version || ''))
     .catch(() => {})
+  refreshPluginUnlockStatus()
+})
+
+// 拉后端三态状态同步两 ref(mount + 「还原 Codex 原配置」后,后端 reset 了 LAST_APPLIED 需重读)。
+function refreshPluginUnlockStatus() {
   getPluginUnlockStatus()
     .then((s) => {
       pluginUnlockMode.value = s.mode // 显示:实际生效(未 apply→null)
       persistedMode.value = s.persisted // 意图:持久值(降级时仍是 real)
     })
     .catch(() => {})
-})
+}
 
 // 关于:检查更新 + 外链(走系统浏览器)
 async function onCheckUpdate() {
@@ -470,7 +475,7 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
 
     <SettingsGroup :title="t('settings.groupCodexConfig')">
       <ResidualScanPanel />
-      <SnapshotPanel />
+      <SnapshotPanel @restored="refreshPluginUnlockStatus" />
     </SettingsGroup>
 
     <SettingsGroup :title="t('settings.groupAdvanced')">
