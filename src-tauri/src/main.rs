@@ -241,6 +241,14 @@ fn main() {
             // 重试 —— fire-and-forget,不阻塞 startup,不在 tokio worker 上跑阻塞 IO。
             codex_app_transfer_adapters::responses::session::start_background_session_migration();
 
+            // [MOC-257] 在 auto_apply(可能据合成账号写 chatgpt_base_url→proxy)之前就按持久 flag +
+            // 活动是否合成预置 proxy 伪造,避免「relay 已通但伪造未开」窄窗里旧 Codex 实例发 /backend-api
+            // 透传假 token 被 401(还会误标 relogin)。post-apply 的 reconcile 会再校正一次。
+            codex_app_transfer_proxy::set_fake_account_mode(
+                handlers::settings::read_fake_account_mode_enabled() == Some(true)
+                    && crate::codex_real_account::active_is_synthetic(),
+            );
+
             // #MOC-54:保留 JoinHandle,让下面的残留扫描能 await auto_apply
             // 真正跑完(确定性),而不是用固定 sleep 猜它有没有落盘。
             let auto_apply_handle = tauri::async_runtime::spawn(async move {
@@ -359,20 +367,36 @@ fn main() {
                     // migrate(幂等,已设则 no-op),确保读到落定值(有账号→true/无→false,不再 None)。
                     let _ = handlers::settings::migrate_real_account_mode_v1();
                     // [MOC-257] 模拟账号模式优先:活动是合成伪造账号,relay 复用真实账号那套
-                    // (active_is_real_chatgpt_now 为真),但 /backend-api 由 proxy 伪造。fake on 时
-                    // **短路真实账号 reconcile**(否则 real flag=Some(false) 会 ForceDisable 把合成
-                    // auth.json 切回 apikey),并确保合成 auth.json 在位 + 按 synthetic 实况开 proxy 伪造。
-                    if handlers::settings::read_fake_account_mode_enabled() == Some(true)
+                    // (active_is_real_chatgpt_now 为真),但 /backend-api 由 proxy 伪造。真正 engage
+                    // (有 provider + 合成 auth.json 在位/可写)时短路真实账号 reconcile(否则 real
+                    // flag=Some(false) 会 ForceDisable 把合成 auth.json 切回 apikey);未 engage(无
+                    // provider / activate 被真账号占用拒绝)→ 持久关 fake flag + 交回真实账号 reconcile。
+                    let fake_engaged = if handlers::settings::read_fake_account_mode_enabled()
+                        == Some(true)
                         && admin::services::desktop::snapshot::active_provider_supports_relay()
                     {
-                        let _ = crate::codex_real_account::activate_fake_account().await;
-                        let synthetic = crate::codex_real_account::active_is_synthetic();
-                        codex_app_transfer_proxy::set_fake_account_mode(synthetic);
+                        match crate::codex_real_account::activate_fake_account().await {
+                            Ok(()) => crate::codex_real_account::active_is_synthetic(),
+                            Err(e) => {
+                                // 活动是真账号 → activate 拒绝覆盖(见 activate_fake_account)。不静默吞:
+                                // 留痕 + 下面收敛 flag,交回真实账号 reconcile 接管,避免悬挂态。
+                                tracing::warn!(
+                                    "[FakeAccount] 启动调谐:activate 失败(可能真账号占用),交回真实账号 reconcile: {e}"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if fake_engaged {
+                        codex_app_transfer_proxy::set_fake_account_mode(true);
                         tracing::info!(
-                            "[FakeAccount] 启动调谐:模拟账号模式持久开启,synthetic_active={synthetic}(跳过真实账号 reconcile)"
+                            "[FakeAccount] 启动调谐:模拟账号模式生效,跳过真实账号 reconcile"
                         );
                     } else {
-                    // [MOC-257] fake flag on 但无 provider → relay 起不来,持久关;否则保持 proxy 伪造关。
+                    // 未 engage(无 provider / 真账号占用):持久关 fake flag(避免悬挂)+ 关 proxy 伪造,
+                    // 交回下面的真实账号 reconcile 收敛(真账号则 relay 透传,apikey 则正常)。
                     if handlers::settings::read_fake_account_mode_enabled() == Some(true) {
                         let _ = handlers::settings::set_fake_account_mode_enabled(false);
                     }

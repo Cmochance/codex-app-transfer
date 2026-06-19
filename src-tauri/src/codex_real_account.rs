@@ -1364,7 +1364,10 @@ mod tests {
     fn synthetic_auth_is_wellformed_chatgpt() {
         use base64::Engine;
         let v = build_synthetic_auth();
-        assert!(parse_chatgpt_auth(&v).is_some(), "应满足 relay gate 的 chatgpt 判定");
+        assert!(
+            parse_chatgpt_auth(&v).is_some(),
+            "应满足 relay gate 的 chatgpt 判定"
+        );
         assert_eq!(v.get("cas_synthetic").and_then(Value::as_bool), Some(true));
         let access = v["tokens"]["access_token"].as_str().unwrap();
         assert!(

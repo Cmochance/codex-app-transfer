@@ -231,6 +231,16 @@ pub async fn forget_handler(
 pub async fn enable_handler(
     axum::extract::State(state): axum::extract::State<AdminState>,
 ) -> impl IntoResponse {
+    // [MOC-257] 与模拟账号模式互斥(双向):模拟模式开着时,活动是合成账号,会被 detect 当真账号
+    // 通过、activate_real_account 还会 no-op 把它"激活成真账号" → 假装开了真账号。先拦,要求用户
+    // 先关模拟账号模式。与 fake_account::enable_handler 的反向互斥对称。
+    if super::settings::read_fake_account_mode_enabled() == Some(true) {
+        return err(
+            StatusCode::CONFLICT,
+            "模拟账号模式已开启;如要用真实账号,请先关闭模拟账号模式".to_owned(),
+        )
+        .into_response();
+    }
     // 账号可用性(新口径认 token,清除切 apikey 后 tokens 还在也算有)。
     let status = codex_real_account::detect();
     if !status.logged_in {

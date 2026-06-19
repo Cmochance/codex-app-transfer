@@ -76,22 +76,37 @@ pub async fn enable_handler(State(state): State<AdminState>) -> impl IntoRespons
 
 /// POST /api/desktop/fake-account/disable
 ///
-/// 关模拟账号模式:关 proxy 伪造 + 落 flag=false + 切活动回 apikey + apply 当前 provider(strip
-/// chatgpt_base_url)。即便活动非合成也幂等收敛。
+/// 关模拟账号模式:落 flag=false + 切活动回 apikey + apply 当前 provider(写回 apikey/gateway
+/// key + strip chatgpt_base_url)+ 关 proxy 伪造。即便活动非合成也幂等收敛。
+///
+/// 顺序刻意:① 先落 flag ② deactivate 切活动回 apikey ③ apply 回填真 key ④ **最后**关 proxy
+/// 伪造 —— 活动还是合成(chatgpt)期间保持伪造,避免「伪造已关但活动仍 chatgpt」窗口里
+/// `/backend-api` 透传假 token 被上游 401。如实反映 apply 结果:无 provider 时 sync 不调 apply、
+/// 活动停在「apikey 但无 key」残缺态,**不报成功切回**,告知用户需配 provider(对齐「禁止把失败
+/// 伪装成成功」硬规则)。
 pub async fn disable_handler(State(state): State<AdminState>) -> impl IntoResponse {
-    codex_app_transfer_proxy::set_fake_account_mode(false);
     let _ = super::settings::set_fake_account_mode_enabled(false);
     // 切活动回干净 apikey(只动合成账号,真账号不碰)。
     let _ = codex_real_account::deactivate_fake_account().await;
     // apply 当前 provider 强制 apikey:写真正的 apikey/gateway key + strip chatgpt_base_url。
-    let _ =
+    let synced =
         crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(&state).await;
+    let sync_ok = synced
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // 活动已非合成后再关 proxy 伪造(见上方顺序说明)。
+    codex_app_transfer_proxy::set_fake_account_mode(false);
     let still_synthetic = codex_real_account::active_is_synthetic();
+    // clean = 既不再是合成账号、apply 也成功写回了 apikey/gateway key。
+    let clean = !still_synthetic && sync_ok;
     Json(json!({
         "success": true,
-        "switchedToApikey": !still_synthetic,
-        "message": if !still_synthetic {
+        "switchedToApikey": clean,
+        "message": if clean {
             "已关闭模拟账号模式(切回 apikey)"
+        } else if !still_synthetic {
+            "已关闭开关并清除合成账号,但未能重配 provider(无可用 provider?)—— 请配置并激活一个 provider 后重启 Codex"
         } else {
             "已关闭开关,但活动仍是合成账号(磁盘 / 权限?)—— 请重试或重启 Codex"
         },
@@ -126,17 +141,25 @@ async fn finalize_enable_fake_account(state: &AdminState) -> Result<(), String> 
     )
 }
 
-/// 回滚到关闭态:关 flag、关 proxy 伪造、切活动回 apikey、apply force_apikey。best-effort。
+/// 回滚到关闭态:关 flag、切活动回 apikey、apply force_apikey、最后关 proxy 伪造(同 disable
+/// 顺序,避免「伪造已关但活动仍合成」的 401 窗口)。best-effort,但失败留痕(回滚里二次失败会
+/// 留下 flag/auth.json/proxy 不一致,需可诊断)。
 async fn rollback_fake(state: &AdminState) {
-    codex_app_transfer_proxy::set_fake_account_mode(false);
     if !super::settings::set_fake_account_mode_enabled(false) {
         tracing::error!(
             "[FakeAccount] 回滚:flag 回写 false 失败(config 不可写),flag 残留 true → UI 可能误显 on"
         );
     }
-    let _ = codex_real_account::deactivate_fake_account().await;
+    // deactivate 失败留痕:activate 已写了合成 auth.json,这里没切回去 → 活动残留合成账号(且 flag
+    // 已关、不会再 reconcile 它),Codex 会对 /backend-api 透传假 token 撞 401,需手动检查。
+    if let Err(e) = codex_real_account::deactivate_fake_account().await {
+        tracing::error!(
+            "[FakeAccount] 回滚:deactivate 失败,活动 auth.json 可能残留合成账号需手动检查: {e}"
+        );
+    }
     let _ =
         crate::admin::services::desktop::snapshot::sync_desktop_clearing_real_account(state).await;
+    codex_app_transfer_proxy::set_fake_account_mode(false);
 }
 
 /// 组装路由 — 在 `admin/mod.rs` 调 `.merge(handlers::fake_account::routes())` 挂载。

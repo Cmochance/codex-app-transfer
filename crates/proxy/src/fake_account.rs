@@ -130,9 +130,14 @@ mod tests {
     use super::*;
 
     async fn run(method: Method, path: &str, body: &str) -> (u16, Value) {
-        let resp = fabricate(&method, &HeaderMap::new(), path, Bytes::from(body.to_owned()))
-            .await
-            .unwrap();
+        let resp = fabricate(
+            &method,
+            &HeaderMap::new(),
+            path,
+            Bytes::from(body.to_owned()),
+        )
+        .await
+        .unwrap();
         let status = resp.status().as_u16();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
