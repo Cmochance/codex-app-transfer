@@ -719,12 +719,14 @@ pub async fn auto_apply_on_startup_if_enabled(proxy_manager: Arc<ProxyManager>) 
         let transfer_applied = paths
             .as_ref()
             .is_some_and(|p| has_snapshot(p) || has_stale_active_snapshot(p));
+        // [MOC-257 review] **只认 chatgpt_base_url**,不认 openai_base_url:has_snapshot 可能是**旧** Transfer
+        // apply 残留,而用户后来手动把 Codex 改成本地 provider(Ollama / LM Studio `openai_base_url =
+        // "http://localhost:11434/v1"`)→ 认 openai_base_url 会绑 11434 抢用户的 Ollama 端口。chatgpt_base_url 是
+        // ChatGPT 专用 relay key,本地 provider 永不设它 → 指向 localhost 必是 Transfer 的插件解锁 relay。
         let relay_port = if synthetic || transfer_applied {
             paths.as_ref().and_then(|p| {
-                let port_of = |k: &str| {
-                    read_codex_toml_root_string(p, k).and_then(|u| parse_local_proxy_port(&u))
-                };
-                port_of("chatgpt_base_url").or_else(|| port_of("openai_base_url"))
+                read_codex_toml_root_string(p, "chatgpt_base_url")
+                    .and_then(|u| parse_local_proxy_port(&u))
             })
         } else {
             None
