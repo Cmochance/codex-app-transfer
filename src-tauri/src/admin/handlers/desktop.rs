@@ -85,7 +85,16 @@ pub async fn desktop_clear() -> impl IntoResponse {
     // [MOC-257 review] 先还原 stash 真账号(synthetic/off 把真账号移到 stash 了),再 restore_codex 补
     // managed key(restore_codex 只 merge managed key、不会自己 un-stash)。否则手动还原后:active 还是合成/
     // 空、真账号留在 stash 找不回。同 exit/startup 顺序。
-    let _ = crate::codex_real_account::restore_stashed_real_auth().await;
+    // [MOC-257 review] 失败 → **abort + surface**,别 `let _ =` 静默吞:restore_stashed_impl 先删活动再 rename
+    // stash,Windows 文件锁/权限失败会留 auth.json 缺失而仍返 success 误导。真账号未丢(rename 失败=仍在 stash),
+    // 报错让用户重启自愈,而非带缺失 auth 继续 restore_codex(只补 managed key、auth 仍缺)。
+    if let Err(e) = crate::codex_real_account::restore_stashed_real_auth().await {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("还原真账号失败(真账号仍安全在 stash,重启 Codex App Transfer 会自动恢复): {e}"),
+        )
+        .into_response();
+    }
     match restore_codex_state(&paths) {
         Ok(restored) => {
             // [MOC-257 review] 还原原配置后已无解锁态(合成/真 auth + relay 都清了)→ 重置「最近生效」标记
@@ -116,7 +125,16 @@ pub async fn desktop_restore(Json(payload): Json<DesktopRestoreRequest>) -> impl
     };
     let snapshot_id = payload.snapshot_id.unwrap_or_default();
     // [MOC-257 review] 同 desktop_clear:先还原 stash 真账号再 restore_codex(否则真账号留 stash 找不回)。
-    let _ = crate::codex_real_account::restore_stashed_real_auth().await;
+    // [MOC-257 review] 失败 → **abort + surface**,别 `let _ =` 静默吞:restore_stashed_impl 先删活动再 rename
+    // stash,Windows 文件锁/权限失败会留 auth.json 缺失而仍返 success 误导。真账号未丢(rename 失败=仍在 stash),
+    // 报错让用户重启自愈,而非带缺失 auth 继续 restore_codex(只补 managed key、auth 仍缺)。
+    if let Err(e) = crate::codex_real_account::restore_stashed_real_auth().await {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("还原真账号失败(真账号仍安全在 stash,重启 Codex App Transfer 会自动恢复): {e}"),
+        )
+        .into_response();
+    }
     match restore_codex_snapshot(&paths, &snapshot_id, payload.cleanup_all) {
         Ok(restored) => {
             // [MOC-257 review] 同 desktop_clear:还原快照后无解锁态 → 重置「最近生效」+ 关伪造。
