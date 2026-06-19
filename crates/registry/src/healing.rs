@@ -264,7 +264,9 @@ pub fn migrate_legacy_preset_names(cfg: &mut Value) -> bool {
     const RENAMES: &[(&str, &str)] = &[
         ("Kimi (月之暗面)", "Kimi (MoonShot)"),
         ("智谱 GLM Coding", "GLM Coding"),
+        ("智谱 GLM", "GLM"),
         ("阿里云百炼 (Token Plan)", "Aliyuncs (Token Plan)"),
+        ("阿里云百炼", "Aliyuncs"),
     ];
 
     let Some(providers) = cfg.get_mut("providers").and_then(|v| v.as_array_mut()) else {

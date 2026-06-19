@@ -168,13 +168,6 @@ pub fn desktop_expected_model_items(target: &DesktopConfigTarget) -> Vec<Value> 
     .collect()
 }
 
-pub fn desktop_inference_models_json(target: Option<&DesktopConfigTarget>) -> String {
-    let Some(target) = target else {
-        return "[]".to_owned();
-    };
-    serde_json::to_string(&desktop_expected_model_items(target)).unwrap_or_else(|_| "[]".to_owned())
-}
-
 pub fn read_codex_toml_root_string(paths: &CodexPaths, key: &str) -> Option<String> {
     let content = std::fs::read_to_string(&paths.config_toml).ok()?;
     for line in content.lines() {
@@ -688,10 +681,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::admin::handlers::common::test_support::with_isolated_home;
-    use crate::admin::handlers::desktop::desktop_status;
     use crate::admin::registry_io::save_for_test as save_registry;
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
     use codex_app_transfer_registry::DEFAULT_UPDATE_URL;
 
     fn config_with_secret() -> Value {
@@ -1113,7 +1103,7 @@ mod tests {
         });
         let provider = active_provider(&cfg).unwrap();
         let target = desktop_config_target_for_provider(&mut cfg, &provider, Some(19090));
-        let raw = desktop_inference_models_json(Some(&target));
+        let raw = serde_json::to_string(&desktop_expected_model_items(&target)).unwrap();
 
         assert!(!raw.contains("sonnet"));
         assert!(!raw.contains("haiku"));
@@ -1143,74 +1133,6 @@ mod tests {
                 .all(|item| item.get("supports1m").and_then(|v| v.as_bool()) != Some(true)),
             "kimi-k2 / glm-4.6 均非 1M,不应有 supports1m=true"
         );
-    }
-
-    #[test]
-    fn desktop_status_reports_current_models_and_health_issues() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        with_isolated_home(|home| {
-            runtime.block_on(async {
-                let mut cfg = config_with_secret();
-                cfg["providers"][0]["models"] = json!({
-                    "default": "deepseek-v4-pro[1m]",
-                    "gpt_5_5": "kimi-k2",
-                });
-                save_registry(&cfg).unwrap();
-
-                let codex_dir = home.join(".codex");
-                fs::create_dir_all(&codex_dir).unwrap();
-                fs::write(
-                    codex_dir.join("config.toml"),
-                    "openai_base_url = \"http://127.0.0.1:18080\"\n",
-                )
-                .unwrap();
-                fs::write(
-                    codex_dir.join("auth.json"),
-                    "{\"OPENAI_API_KEY\":\"cas_existing\"}\n",
-                )
-                .unwrap();
-
-                let response = desktop_status().await.into_response();
-                assert_eq!(response.status(), StatusCode::OK);
-                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .unwrap();
-                let payload: Value = serde_json::from_slice(&body).unwrap();
-
-                let models_raw = payload["keys"]["inferenceModels"].as_str().unwrap();
-                assert!(!models_raw.contains("sonnet"));
-                assert!(models_raw.contains("gpt-5.5"));
-                // [MOC-154] fallback entry(slug=实际模型名)已删;default_model 名作 display_name 出现
-                assert!(
-                    models_raw.contains("kimi-k2"),
-                    "default_model 作为 gpt-5.5 的 display_name 出现"
-                );
-                // [MOC-154] only gpt-5.5 slug exists in catalog; deepseek-v4-pro fallback entry was removed
-                assert_eq!(payload["configured"], json!(false));
-                assert_eq!(payload["health"]["needsApply"], json!(true));
-                // [MOC-154] kimi-k2(gpt_5_5 slot) context_window=258_400 <1M;
-                // one_million_names 为空 → one_million_catalog_ready 直接 true(无需检查 catalog);
-                // 旧 fallback entry deepseek-v4-pro(1M) 已删
-                assert_eq!(payload["health"]["oneMillionReady"], json!(true));
-
-                let codes: Vec<&str> = payload["health"]["issues"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|issue| issue.get("code").and_then(|v| v.as_str()))
-                    .collect();
-                assert!(codes.contains(&"not_managed_by_cas"));
-                // [MOC-154] oneMillionReady=true → one_million_not_written issue 不再出现
-                assert!(
-                    !codes.contains(&"one_million_not_written"),
-                    "no 1M model => no one_million_not_written"
-                );
-            });
-        });
     }
 
     #[test]

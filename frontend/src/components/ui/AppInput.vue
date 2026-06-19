@@ -1,6 +1,6 @@
 <script setup lang="ts">
 const model = defineModel<string>({ default: '' })
-defineProps<{ placeholder?: string; type?: string }>()
+defineProps<{ placeholder?: string; type?: string; disabled?: boolean }>()
 </script>
 
 <template>
@@ -8,6 +8,7 @@ defineProps<{ placeholder?: string; type?: string }>()
     :type="type || 'text'"
     :placeholder="placeholder"
     v-model="model"
+    :disabled="disabled"
     class="app-input"
     autocomplete="off"
     spellcheck="false"
@@ -30,6 +31,11 @@ defineProps<{ placeholder?: string; type?: string }>()
 }
 .app-input::placeholder {
   color: var(--text-muted);
+}
+.app-input:disabled {
+  color: var(--text-muted);
+  background: var(--surface-2);
+  cursor: not-allowed;
 }
 .app-input:focus {
   outline: none;

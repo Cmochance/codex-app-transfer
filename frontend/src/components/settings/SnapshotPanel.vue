@@ -5,7 +5,7 @@ import { computed, onMounted, ref } from 'vue'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import { useCodexRestore } from '@/composables/useCodexRestore'
-import { getDesktopSnapshotStatus } from '@/api/desktop'
+import { getDesktopSnapshotStatus, openSnapshotDir } from '@/api/desktop'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 
@@ -44,6 +44,14 @@ async function onRestore() {
     toast(errMsg(e), 'error')
   }
 }
+
+async function onOpenFolder() {
+  try {
+    await openSnapshotDir()
+  } catch (e) {
+    toast(errMsg(e), 'error')
+  }
+}
 </script>
 
 <template>
@@ -51,7 +59,10 @@ async function onRestore() {
     <template #title>
       <span class="snap-title">{{ t('settings.codexSnapshotTitle') }}</span>
     </template>
-    <AppButton size="sm" variant="secondary" :label="t('desktop.clear')" @click="onRestore" />
+    <div class="snap-actions">
+      <AppButton size="sm" variant="secondary" :label="t('settings.openConfigFolder')" @click="onOpenFolder" />
+      <AppButton size="sm" variant="secondary" :label="t('desktop.clear')" @click="onRestore" />
+    </div>
   </SettingsRow>
 </template>
 
@@ -59,5 +70,10 @@ async function onRestore() {
 .snap-title {
   font-size: var(--fs-md);
   font-weight: 550;
+}
+.snap-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 </style>

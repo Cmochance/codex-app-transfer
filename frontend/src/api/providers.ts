@@ -136,6 +136,11 @@ export const activateProvider = (id: string) => api('POST', `/api/providers/${id
 export const getProviderSecret = (id: string) =>
   api<{ apiKey?: string }>('GET', `/api/providers/${id}/secret`)
 
+// 小米账号登录(内嵌窗口抓套餐 session cookie,供 Codex 显示 MiMo 套餐额度)。
+// 长阻塞:窗口登录完成/关闭才返回;captured=true 表示已抓到 session。
+export const mimoLogin = (id: string) =>
+  api<{ captured?: boolean }>('POST', `/api/providers/${id}/mimo-login`)
+
 // 获取上游可用模型:已存在 provider 走 id(用落盘 key);草稿(新增/编辑未存)走 payload。
 export const fetchProviderModels = (id: string) =>
   api<{ models?: unknown[] }>('GET', `/api/providers/${id}/models/available`)

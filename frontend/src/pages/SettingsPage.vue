@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { i18nState, setLocale, t, tFmt } from '@/i18n'
 import { useAppearance, type Appearance } from '@/composables/useAppearance'
 import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
@@ -7,6 +7,12 @@ import { useSettingsStore } from '@/stores/settings'
 import type { Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
 import { getAppVersion, checkAppUpdate, openExternalUrl } from '@/api/system'
+import {
+  pluginUnlockStatus,
+  pluginUnlockStart,
+  pluginUnlockReinject,
+  type PluginUnlockState,
+} from '@/api/desktop'
 import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
@@ -78,6 +84,59 @@ const codexNetworkAccess = toggle('codexNetworkAccess', false)
 const exposeAllProviderModels = toggle('exposeAllProviderModels', false)
 const showGrayProviders = toggle('showGrayProviders', false)
 const mcpCredentialsPortableStore = toggle('mcpCredentialsPortableStore', true)
+
+// ── Codex 插件解锁 daemon:开关开启时轮询运行时状态 + 强制开启(手动注入)──
+const unlockState = ref<PluginUnlockState | ''>('')
+const unlockForcing = ref(false)
+const unlockStateLabel = computed(() =>
+  unlockState.value ? t(`settings.pluginUnlockState.${unlockState.value}`) : '',
+)
+let unlockTimer: ReturnType<typeof setInterval> | null = null
+async function refreshUnlockState() {
+  try {
+    unlockState.value = (await pluginUnlockStatus()).status
+  } catch {
+    unlockState.value = ''
+  }
+}
+function stopUnlockPoll() {
+  if (unlockTimer) {
+    clearInterval(unlockTimer)
+    unlockTimer = null
+  }
+}
+function startUnlockPoll() {
+  stopUnlockPoll()
+  refreshUnlockState()
+  unlockTimer = setInterval(refreshUnlockState, 3000)
+}
+// 开关开 → 轮询;关 → 停轮询并清状态(daemon 已被后端 stop)
+watch(
+  autoUnlockCodexPlugins,
+  (on) => {
+    if (on) startUnlockPoll()
+    else {
+      stopUnlockPoll()
+      unlockState.value = ''
+    }
+  },
+  { immediate: true },
+)
+onUnmounted(stopUnlockPoll)
+// 强制开启:先确保 daemon 在跑(/start 幂等),再触发一次注入(/reinject)。
+async function forceUnlock() {
+  unlockForcing.value = true
+  try {
+    await pluginUnlockStart()
+    await pluginUnlockReinject()
+    toast(t('settings.pluginUnlockForced'))
+  } catch (e) {
+    toast((e as Error).message || t('settings.pluginUnlockForceFailed'), 'error')
+  } finally {
+    unlockForcing.value = false
+    refreshUnlockState()
+  }
+}
 
 // theme / language 双向(同步本地状态 + 持久化服务端)。
 // setAppearance/setLocale 立刻改 DOM/localStorage(无闪烁),但服务端保存失败时
@@ -300,7 +359,24 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
         <AppSwitch v-model="restoreCodexOnExit" />
       </SettingsRow>
       <SettingsRow :title="t('settings.autoUnlockCodexPlugins')" :description="t('settings.autoUnlockCodexPluginsHint')">
-        <AppSwitch v-model="autoUnlockCodexPlugins" />
+        <div class="unlock-ctl">
+          <template v-if="autoUnlockCodexPlugins">
+            <span
+              v-if="unlockStateLabel"
+              class="unlock-ctl__state"
+              :class="`is-${unlockState}`"
+              >{{ unlockStateLabel }}</span
+            >
+            <AppButton
+              size="sm"
+              variant="secondary"
+              :label="t('settings.pluginUnlockForce')"
+              :disabled="unlockForcing"
+              @click="forceUnlock"
+            />
+          </template>
+          <AppSwitch v-model="autoUnlockCodexPlugins" />
+        </div>
       </SettingsRow>
       <SettingsRow :title="t('settings.autoWakeCodexPet')" :description="t('settings.autoWakeCodexPetHint')">
         <AppSwitch v-model="autoWakeCodexPet" />
@@ -331,13 +407,6 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
     </SettingsGroup>
 
     <SettingsGroup :title="t('settings.groupCodexConfig')">
-      <RouterLink to="/desktop" class="nav-row">
-        <div class="nav-row__text">
-          <div class="nav-row__title">{{ t('settings.codexCliRow') }}</div>
-          <div class="nav-row__desc">{{ t('settings.codexCliRowDesc') }}</div>
-        </div>
-        <IconChevronRight class="nav-row__chevron" />
-      </RouterLink>
       <ResidualScanPanel />
       <SnapshotPanel />
     </SettingsGroup>
@@ -380,7 +449,7 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
 
     <SettingsGroup :title="t('about.group')">
       <SettingsRow :title="t('about.version')" :description="appVersion ? `v${appVersion}` : '…'">
-        <AppButton size="sm" variant="ghost" :label="t('about.checkUpdate')" @click="onCheckUpdate" />
+        <AppButton size="sm" variant="secondary" :label="t('about.checkUpdate')" @click="onCheckUpdate" />
       </SettingsRow>
       <SettingsRow :title="t('settings.updateUrl')" :description="t('settings.updateUrlDesc')">
         <code class="settings-readonly">{{ UPDATE_REPO_URL }}</code>
@@ -389,7 +458,7 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
         <AppButton size="sm" variant="secondary" :label="t('about.like')" @click="openExternal(UPDATE_REPO_URL)" />
       </SettingsRow>
       <SettingsRow :title="t('about.feedback')" :description="t('about.feedbackDesc')">
-        <AppButton size="sm" variant="ghost" :label="t('about.feedback')" @click="feedbackOpen = true" />
+        <AppButton size="sm" variant="secondary" :label="t('about.feedback')" @click="feedbackOpen = true" />
       </SettingsRow>
     </SettingsGroup>
 
@@ -498,5 +567,21 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
   height: 16px;
   flex-shrink: 0;
   color: var(--text-muted);
+}
+.unlock-ctl {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.unlock-ctl__state {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.unlock-ctl__state.is-injected {
+  color: var(--success);
+}
+.unlock-ctl__state.is-failed {
+  color: var(--danger);
 }
 </style>

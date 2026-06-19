@@ -1,7 +1,7 @@
 import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-router'
 
 // FineTune redesign: 顶部 5 tab(providers/proxy/usage/codex/settings)+ 次要页
-// codex-skin(Codex Desktop 皮肤注入)/ desktop(配置状态)。Dashboard/Guide 已 drop
+// codex-skin(Codex Desktop 皮肤注入)。Dashboard/Guide 已 drop
 // (FineTune 主页 = providers,引导内容并入文档)。
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/providers' },
@@ -11,7 +11,6 @@ const routes: RouteRecordRaw[] = [
   { path: '/settings', name: 'settings', component: () => import('@/pages/SettingsPage.vue'), meta: { navKey: 'nav.settings', icon: 'settings' } },
   { path: '/codex', name: 'codex', component: () => import('@/pages/CodexPage.vue'), meta: { navKey: 'nav.codex', icon: 'bookmark' } },
   { path: '/codex-skin', name: 'codex-skin', component: () => import('@/pages/CodexSkinPage.vue'), meta: { navKey: 'nav.theme', icon: 'palette' } },
-  { path: '/desktop', name: 'desktop', component: () => import('@/pages/DesktopPage.vue'), meta: { hidden: true } },
   { path: '/:pathMatch(.*)*', redirect: '/providers' },
 ]
 
