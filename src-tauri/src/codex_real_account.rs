@@ -1112,6 +1112,33 @@ fn archive_existing_auth_file(paths: &CodexPaths, path: &std::path::Path) -> boo
     }
 }
 
+/// [MOC-257 review] 读活动 `auth.json` 原始字节快照,供 apply 失败**事务回滚**(保留原 tokens + gateway
+/// key + 全部字段,不像 `deactivate_real_account` 只翻 `auth_mode` 会丢 `OPENAI_API_KEY`)。文件不存在 →
+/// `None`。只读。
+pub fn snapshot_active_auth_bytes() -> Option<Vec<u8>> {
+    CodexPaths::from_home_env()
+        .ok()
+        .and_then(|p| std::fs::read(&p.auth_json).ok())
+}
+
+/// 把活动 `auth.json` 还原到 [`snapshot_active_auth_bytes`] 拿的快照(`Some`→写回原字节;`None`→删文件,
+/// 还原到「apply 前无 auth.json」)。供 apply 失败回滚。best-effort(失败只 warn)。
+pub fn restore_active_auth_bytes(snapshot: Option<Vec<u8>>) {
+    let Ok(p) = CodexPaths::from_home_env() else {
+        return;
+    };
+    let r = match snapshot {
+        Some(bytes) => std::fs::write(&p.auth_json, &bytes),
+        None => match std::fs::remove_file(&p.auth_json) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+    };
+    if let Err(e) = r {
+        tracing::warn!("[PluginUnlock] apply 失败回滚 auth.json 快照失败: {e}");
+    }
+}
+
 /// 把活动**真账号**整文件移到 stash 保全(保 tokens),供切到 synthetic/off 前调用。**只动真账号**
 /// (有 chatgpt tokens、非合成);合成账号 / apikey / 无 auth.json → 留着不动(各自由 `activate_fake_account`
 /// 覆盖、`clear_active_auth_file`(off)清、或本就空)。持 `AUTH_LOCK`。

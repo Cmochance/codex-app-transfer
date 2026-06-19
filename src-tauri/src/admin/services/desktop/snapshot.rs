@@ -454,39 +454,49 @@ pub async fn apply_plugin_unlock_mode(
         }
         M::Synthetic => {
             // 活动若是真账号先 stash 保全(也避开 activate 的真账号守护);写合成 → 活动=chatgpt;
-            // proxy 伪造开;apply relay(active=chatgpt → 写 chatgpt_base_url)。
+            // proxy 伪造开;apply relay。**事务化**:activate / relay 任一失败都回滚(还原 stash 真账号回活动
+            // 覆盖合成 / 无真账号则清掉合成)+ 关伪造,让 caller(set/add/tray/startup)无需各自清半生效态。
             ra::stash_displaced_real_auth().await?;
             if let Err(e) = ra::activate_fake_account().await {
-                // [MOC-257 review] stash 已移走真账号但合成写失败 → best-effort 还原真账号回活动,
-                // 别把用户留在「真账号已移走 + 活动空」窗口里(虽 stash + 退出 restore 兜底,但当前
-                // 模式没切成时尽快回滚体验更好)。留痕。
-                tracing::error!("[PluginUnlock] synthetic activate 失败,尝试还原真账号回活动: {e}");
+                tracing::error!("[PluginUnlock] synthetic activate 失败,回滚: {e}");
                 let _ = ra::restore_stashed_real_auth().await;
                 return Err(e);
             }
             codex_app_transfer_proxy::set_fake_account_mode(true);
-            ensure_relay_applied(state).await
+            if let Err(e) = ensure_relay_applied(state).await {
+                // relay 没装上 → 别留「合成 active + 伪造开但无 relay」(Codex 直连 chatgpt.com 撞 401)。
+                codex_app_transfer_proxy::set_fake_account_mode(false);
+                let restored = ra::restore_stashed_real_auth().await.unwrap_or(false);
+                if !restored && ra::active_is_synthetic() {
+                    let _ = ra::clear_active_auth_file().await; // 无真账号可还原 + 仍合成 → 清掉
+                }
+                return Err(e);
+            }
+            Ok(())
         }
         M::Real => {
             // 从 stash 还原真账号(active 非可用真账号才覆盖);再确保活动是**非合成**真 chatgpt(合成/过期 →
             // 从镜像 / 活源恢复)。proxy 透传;apply relay。
             let _ = ra::restore_stashed_real_auth().await?;
-            // [MOC-257 review] activate 返 false = 没能弄出可用真账号(active 仍合成 / 不可用)→ **报错**,
-            // 绝不带着合成 active 关伪造去 relay(会把合成 token 发真 chatgpt.com 全 401、UI 却显示 Real)。
-            // 正常 set 端点 effective-degrade 已据 real_account_usable 挡住 real-but-unusable;这是 TOCTOU 防御。
+            // [MOC-257 review] 事务快照:activate 会改写活动(apikey-with-tokens → chatgpt 时还移除
+            // `OPENAI_API_KEY`),relay 失败需还原**原字节**(保 tokens + gateway key,不像 deactivate 只翻
+            // auth_mode 会丢 key → apikey 模式无 key、普通对话挂)。
+            let pre_activate = ra::snapshot_active_auth_bytes();
+            // activate 返 false = 没能弄出可用真账号(active 仍合成 / 不可用)→ **报错**,绝不带合成 active 关
+            // 伪造去 relay(会把合成 token 发真 chatgpt.com 全 401、UI 却显示 Real)。effective-degrade 已挡
+            // real-but-unusable;这是 TOCTOU 防御。
             if !ra::activate_real_account().await.unwrap_or(false) {
+                ra::restore_active_auth_bytes(pre_activate);
                 return Err(
                     "无法激活真实账号(账号不可用 / 已失效),请在 Codex 重新登录后再切「真实账号」"
                         .to_owned(),
                 );
             }
             codex_app_transfer_proxy::set_fake_account_mode(false);
-            // [MOC-257 review] Real 分支事务化:activate 已把活动写成 auth_mode=chatgpt,若 relay 没装上
-            // (proxy/apply 失败)就别留「real chatgpt active 无 relay」—— Codex 会据 auth_mode=chatgpt 直连
-            // 真 chatgpt.com、绕过 proxy,且与回滚后的持久不一致。relay 失败 → 切回 apikey(保留 tokens,下次
-            // 启动 resolve→real 再激活)。
+            // relay 没装上 → 还原快照(保 tokens + key),别留「real chatgpt active 无 relay」(Codex 据
+            // auth_mode=chatgpt 直连真 chatgpt.com 绕过 proxy、且与回滚后持久不一致)。下次启动 resolve→real 再激活。
             if let Err(e) = ensure_relay_applied(state).await {
-                let _ = ra::deactivate_real_account().await;
+                ra::restore_active_auth_bytes(pre_activate);
                 return Err(e);
             }
             Ok(())
