@@ -126,13 +126,14 @@ fn load_manifest(dir: &Path) -> Option<PluginManifest> {
 /// 找 plugin 的 active version 目录 — 简单实现:取 lexicographic 最大 version dir,
 /// 找不到则用 `local`。codex 真实实现在 `core-plugins/src/store.rs` 更复杂(active
 /// pointer),本工具暂用简化版。
-/// 扫 `<install_dir>/skills/` 的子目录名 = plugin 真实 skill 列表(manifest.skills 只是 `"./skills/"` 路径,取不到名)。
+/// 扫 `<install_dir>/skills/` 的子目录名 = plugin 真实 skill 列表。manifest.skills 只是 `"./skills/"`
+/// 路径取不到名;且对齐 Codex loader:只算**含 `SKILL.md`** 的子目录(排除共享库 / references 等非 skill 目录)。
 fn scan_skill_dirs(install_dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(install_dir.join("skills"))
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.path().is_dir())
+        .filter(|e| e.path().join("SKILL.md").is_file())
         .filter_map(|e| e.file_name().to_str().map(str::to_owned))
         .collect();
     names.sort();
