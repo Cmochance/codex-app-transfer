@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import TopTabBar from './TopTabBar.vue'
 import ToastHost from '@/components/ui/ToastHost.vue'
+
+// macOS 用 titleBarStyle=Overlay 无原生标题栏,靠这条自绘标题栏提供窗口顶部应用名 + 红绿灯区 + 拖拽,
+// 必须保留;Windows 有原生标题栏(左上已显示应用名),这条居中标题就冗余 → 仅 Windows 隐藏。
+const isWindows = navigator.userAgent.includes('Windows')
 </script>
 
 <template>
   <div class="app-shell">
-    <!-- macOS overlay 标题栏:红绿灯浮在左上,应用名居中,整条可拖拽窗口 -->
-    <div class="titlebar" data-tauri-drag-region>
+    <!-- macOS overlay 标题栏:红绿灯浮在左上,应用名居中,整条可拖拽窗口。Windows 有原生标题栏 → 隐藏。 -->
+    <div v-if="!isWindows" class="titlebar" data-tauri-drag-region>
       <span class="titlebar__title">Codex App Transfer</span>
     </div>
     <TopTabBar />
