@@ -913,26 +913,6 @@ pub async fn activate_fake_account() -> Result<(), String> {
     Ok(())
 }
 
-/// [MOC-257] 关模拟账号模式:活动是合成账号则切回干净 apikey(删 tokens + 哨兵)。真实账号
-/// (无哨兵)**绝不动**(防误伤)。持 `AUTH_LOCK`。返回是否执行了切换(活动非合成 → `Ok(false)`)。
-/// caller 随后 apply 当前 provider(force_apikey)写回真正的 apikey/gateway key + strip chatgpt_base_url。
-pub async fn deactivate_fake_account() -> Result<bool, String> {
-    let _guard = AUTH_LOCK.lock().await;
-    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    let Ok(v) = read_auth(&paths.auth_json) else {
-        return Ok(false);
-    };
-    if v.get("cas_synthetic").and_then(Value::as_bool) != Some(true) {
-        return Ok(false); // 不是合成账号(真实账号 / 已 apikey)→ 不动
-    }
-    backup_active_auth(&paths, "prefakeoff")?;
-    // 合成账号无可保留的真 tokens → 写干净 apikey 占位,清掉哨兵 + 合成 tokens;
-    // 后续 apply(force_apikey)再写真正的 OPENAI_API_KEY/gateway + strip chatgpt_base_url。
-    let cleaned = serde_json::json!({ "auth_mode": "apikey", "OPENAI_API_KEY": Value::Null });
-    write_auth(&paths.auth_json, &cleaned).map_err(|e| format!("切回 apikey 失败: {e}"))?;
-    Ok(true)
-}
-
 // ── [MOC-257 三态] 插件解锁三态(off / synthetic / real)+ 真账号 stash ──────────────
 //
 // 三态选择器统一 off / 模拟账号 / 真实账号,取代旧 autoUnlockCodexPlugins(CDP,已废弃)+
@@ -1033,13 +1013,12 @@ pub async fn clear_active_auth_file() -> Result<(), String> {
     Ok(())
 }
 
-/// 从 stash 整文件还原真账号到 `~/.codex/auth.json`。stash 不存在 → `Ok(false)`。**活动已是真账号**
-/// (app 外新 login,比 stash 更新)→ 丢弃 stash、不覆盖,返 `Ok(false)`。否则整文件还原、返
-/// `Ok(true)`。供切到 real / 退出 / 启动 self-heal **前**调用(让现有 restore 有真 auth.json 可补)。持 `AUTH_LOCK`。
-pub async fn restore_stashed_real_auth() -> Result<bool, String> {
-    let _guard = AUTH_LOCK.lock().await;
-    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    let stash = real_account_stash_path(&paths);
+/// 从 stash 整文件还原真账号到 `~/.codex/auth.json`(纯文件逻辑,**无锁**,供 sync/async 复用)。
+/// stash 不存在 → `Ok(false)`。**活动已是真账号**(app 外新 login、比 stash 更新)→ 把 stash
+/// **改名归档**(不直删:可能是不同账号,直删 = 丢账号,违反「覆盖前必备份」不变量)、不覆盖活动,
+/// 返 `Ok(false)`。否则整文件还原、返 `Ok(true)`。
+fn restore_stashed_real_auth_impl(paths: &CodexPaths) -> Result<bool, String> {
+    let stash = real_account_stash_path(paths);
     if !stash.is_file() {
         return Ok(false);
     }
@@ -1051,13 +1030,40 @@ pub async fn restore_stashed_real_auth() -> Result<bool, String> {
         })
         .unwrap_or(false);
     if active_real {
-        // 活动已是真账号(更新)→ 弃 stash,不覆盖。
-        let _ = std::fs::remove_file(&stash);
+        // [MOC-257 review] 活动已是更新真账号 → 不覆盖;stash 那份也是真账号(含 tokens),**不直删**
+        // (可能不同账号 → 直删丢账号),改名归档到 real-account/discarded-stash-<ns>.json 留可恢复副本。
+        let archive_dir = paths.app_home.join("real-account");
+        let _ = std::fs::create_dir_all(&archive_dir);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let archived = archive_dir.join(format!("discarded-stash-{ts}.json"));
+        if let Err(e) = std::fs::rename(&stash, &archived) {
+            tracing::warn!("[PluginUnlock] 归档被弃 stash 失败(保留 stash 不直删): {e}");
+        }
         return Ok(false);
     }
     std::fs::rename(&stash, &paths.auth_json)
         .map_err(|e| format!("从 stash 还原真账号失败: {e}"))?;
     Ok(true)
+}
+
+/// 从 stash 整文件还原真账号(**异步**,持 `AUTH_LOCK`)。供 orchestrator(切到 real)用。
+pub async fn restore_stashed_real_auth() -> Result<bool, String> {
+    let _guard = AUTH_LOCK.lock().await;
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    restore_stashed_real_auth_impl(&paths)
+}
+
+/// [MOC-257 review] 从 stash 还原真账号的**同步**版(无 `AUTH_LOCK` / 不 `block_on`)。供 Tauri
+/// setup(startup self-heal)/ exit 闭包(非 async 上下文)用 —— exit 时 async runtime 可能正在
+/// shutdown,`block_on` 异步锁会 panic(panic 在 exit 闭包会 abort 进程、跳过紧随的
+/// `restore_codex_if_enabled`);且 exit 进程独占、startup self-heal 在任何 auth task spawn 之前,
+/// 均无并发,无需 AUTH_LOCK。失败由 caller `tracing::error!` 留痕(对齐 restore_codex_if_enabled)。
+pub fn restore_stashed_real_auth_blocking() -> Result<bool, String> {
+    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
+    restore_stashed_real_auth_impl(&paths)
 }
 
 /// [MOC-104 req#5 启动调谐] 启动时(**绝不刷新 token**,见模块级分流说明):① 活动

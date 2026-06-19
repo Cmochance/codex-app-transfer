@@ -551,27 +551,6 @@ pub fn set_real_account_mode_enabled(enabled: bool) -> bool {
     .unwrap_or(false)
 }
 
-/// [MOC-257] 模拟(伪造)账号模式持久开关(用户意图)。无真实账号时的「强制解锁」新档:写一份
-/// 合规伪造 auth.json + proxy 截断 `/backend-api/*` 伪造。键缺失=未开。**与真实账号模式互斥**
-/// (handler 层强制),启动调谐据此重建 proxy `FAKE_ACCOUNT_MODE` atomic + 确保合成 auth.json 在位。
-pub fn read_fake_account_mode_enabled() -> Option<bool> {
-    crate::admin::registry_io::load().ok().and_then(|cfg| {
-        cfg.get("settings")
-            .and_then(|s| s.get("fakeAccountModeEnabled"))
-            .and_then(Value::as_bool)
-    })
-}
-
-/// [MOC-257] 写模拟账号模式开关。enable / disable handler 与失败回滚经这里落持久意图。
-pub fn set_fake_account_mode_enabled(enabled: bool) -> bool {
-    with_config_write(|cfg| {
-        ensure_settings_object(cfg)
-            .insert("fakeAccountModeEnabled".to_owned(), Value::Bool(enabled));
-        Ok(ConfigMutation::Modified(true))
-    })
-    .unwrap_or(false)
-}
-
 /// [MOC-257 三态] 插件解锁三态选择器持久值(用户意图):`"off"` / `"synthetic"` / `"real"`。
 /// **键缺失 = 未手动设**,由 [`crate::codex_real_account::resolve_plugin_unlock_mode`] 按「本地有
 /// 真账号 auth.json → real;否则 → synthetic」推导默认。取代旧的 `autoUnlockCodexPlugins`(CDP 档,

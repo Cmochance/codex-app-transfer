@@ -141,10 +141,14 @@ fn main() {
             }
             // [MOC-257 三态] self-heal restore **之前**先还原 stash:上次若被强杀(退出 hook 没跑)、
             // 真账号被 OFF/synthetic 移到 stash、~/.codex 无 auth.json,先整文件还原回去,让现有 restore
-            // 有真 auth.json 可补 managed key + drop_snapshot 不被「读不到 auth.json」的 Err 阻断。
-            // block_on:setup 闭包非 async。mode-apply(post-apply task)之后会按三态再 stash。
-            let _ =
-                tauri::async_runtime::block_on(crate::codex_real_account::restore_stashed_real_auth());
+            // 把 managed key 补到**真** auth.json 上(否则 read_auth 缺文件得到 `{}` 空壳、restore 写回
+            // 一份无 tokens 的残壳)。同步版(无 block_on/AUTH_LOCK):此刻在任何 auth task spawn 之前、
+            // 无并发。失败 tracing::error 留痕(对齐 restore_codex_if_enabled,真账号 tokens 还原比 config 更高价值)。
+            if let Err(e) = crate::codex_real_account::restore_stashed_real_auth_blocking() {
+                tracing::error!(
+                    "[PluginUnlock] 启动 stash 真账号还原失败(真账号仍在 stash 待下次重试): {e}"
+                );
+            }
             let _ = handlers::desktop::restore_codex_if_enabled("startup");
 
             // #262:加载 `settings.language` 一次,同步到 adapters 全局,确保
@@ -573,10 +577,15 @@ fn main() {
                 tracing::info!("app exit: 已取消 in-flight codex login,防孤儿进程退出后改写 auth.json");
             }
             // [MOC-257 三态] 退出前先把 OFF/synthetic 移走的真账号 stash 整文件还原回 ~/.codex/auth.json
-            // (在 restore_codex_if_enabled **之前**:让它有真 auth.json 可补 managed key + drop_snapshot
-            // 干净),使用户退出 transfer 后 Codex 拿回完整真账号(含 tokens)。block_on:exit 闭包非 async。
-            let _ =
-                tauri::async_runtime::block_on(crate::codex_real_account::restore_stashed_real_auth());
+            // (在 restore_codex_if_enabled **之前**:让它把 managed key 补到真 auth.json 而非缺文件得到
+            // 的空壳、tokens 不丢),使用户退出 transfer 后 Codex 拿回完整真账号。**同步版**:exit 期 async
+            // runtime 可能正在 shutdown,block_on 异步锁会 panic → panic 在 exit 闭包 abort 进程、跳过下面的
+            // restore_codex_if_enabled;同步纯文件操作避开。失败留痕。
+            if let Err(e) = crate::codex_real_account::restore_stashed_real_auth_blocking() {
+                tracing::error!(
+                    "[PluginUnlock] 退出 stash 真账号还原失败(真账号仍在 stash 待下次启动重试): {e}"
+                );
+            }
             let _ = handlers::desktop::restore_codex_if_enabled("exit");
             // MOC-144:transfer 注入的 web_fetch MCP server 在退出时从 Codex config.toml 移除
             // —— 它是 transfer 管理的工具, transfer 不在时不该残留 [mcp_servers.cat-webfetch]

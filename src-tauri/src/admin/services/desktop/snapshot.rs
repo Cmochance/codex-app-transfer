@@ -412,7 +412,8 @@ pub async fn sync_desktop_clearing_real_account(state: &AdminState) -> Value {
 ///
 /// **真账号 stash 时序**:synthetic/off 切走真账号前先 `stash_displaced_real_auth`(整文件保 tokens);
 /// real 切回先 `restore_stashed_real_auth`。退出/启动 self-heal 的还原由 main.rs 在「现有 restore 之前」
-/// 调 `restore_stashed_real_auth`,确保 auth.json 在位、不与现有 restore 冲突。
+/// 调 `restore_stashed_real_auth_blocking`,把 managed key 补到真 auth.json(而非缺文件得到的空壳),
+/// 不与现有 restore 冲突。任一步失败:真账号已 stash 仍安全(stash + 退出/启动 restore 兜底)。
 pub async fn apply_plugin_unlock_mode(
     state: &AdminState,
     mode: crate::codex_real_account::PluginUnlockMode,
@@ -428,7 +429,13 @@ pub async fn apply_plugin_unlock_mode(
             // 在 OFF 分支不需要(不 apply provider),由 synthetic/real 分支使用。
             let _ = state;
             ra::stash_displaced_real_auth().await?;
-            ra::clear_active_auth_file().await?;
+            if let Err(e) = ra::clear_active_auth_file().await {
+                // 真账号已安全 stash;仅残留合成/apikey 没删干净。留痕(真账号不丢,退出 restore 兜底)。
+                tracing::error!(
+                    "[PluginUnlock] OFF 清空活动 auth.json 失败(真账号已 stash 安全): {e}"
+                );
+                return Err(e);
+            }
             codex_app_transfer_proxy::set_fake_account_mode(false);
             Ok(())
         }
@@ -436,7 +443,14 @@ pub async fn apply_plugin_unlock_mode(
             // 活动若是真账号先 stash 保全(也避开 activate 的真账号守护);写合成 → 活动=chatgpt;
             // proxy 伪造开;apply relay(active=chatgpt → 写 chatgpt_base_url)。
             ra::stash_displaced_real_auth().await?;
-            ra::activate_fake_account().await?;
+            if let Err(e) = ra::activate_fake_account().await {
+                // [MOC-257 review] stash 已移走真账号但合成写失败 → best-effort 还原真账号回活动,
+                // 别把用户留在「真账号已移走 + 活动空」窗口里(虽 stash + 退出 restore 兜底,但当前
+                // 模式没切成时尽快回滚体验更好)。留痕。
+                tracing::error!("[PluginUnlock] synthetic activate 失败,尝试还原真账号回活动: {e}");
+                let _ = ra::restore_stashed_real_auth().await;
+                return Err(e);
+            }
             codex_app_transfer_proxy::set_fake_account_mode(true);
             ensure_relay_applied(state).await
         }

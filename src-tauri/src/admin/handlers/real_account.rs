@@ -231,13 +231,14 @@ pub async fn forget_handler(
 pub async fn enable_handler(
     axum::extract::State(state): axum::extract::State<AdminState>,
 ) -> impl IntoResponse {
-    // [MOC-257] 与模拟账号模式互斥(双向):模拟模式开着时,活动是合成账号,会被 detect 当真账号
-    // 通过、activate_real_account 还会 no-op 把它"激活成真账号" → 假装开了真账号。先拦,要求用户
-    // 先关模拟账号模式。与 fake_account::enable_handler 的反向互斥对称。
-    if super::settings::read_fake_account_mode_enabled() == Some(true) {
+    // [MOC-257 review] 与模拟账号(synthetic)互斥:活动是合成账号时,detect 会当真账号通过、
+    // activate_real_account 会 no-op 把合成账号"激活成真账号"。先拦。判据改用 `active_is_synthetic()`
+    // (活动哨兵),**不读已废弃的 `fakeAccountModeEnabled` 键**(三态从不写它,旧守卫永远失效)。
+    // 注:此 legacy real-account 入口现已不被新前端调用,三态 set real 才是正路。
+    if codex_real_account::active_is_synthetic() {
         return err(
             StatusCode::CONFLICT,
-            "模拟账号模式已开启;如要用真实账号,请先关闭模拟账号模式".to_owned(),
+            "当前是模拟账号(合成)态;如要用真实账号,请在「插件解锁」选「真实账号」".to_owned(),
         )
         .into_response();
     }
