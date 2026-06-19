@@ -465,8 +465,9 @@ pub async fn icon(Query(q): Query<IconQuery>) -> impl IntoResponse {
             return err(StatusCode::BAD_REQUEST, "source 无 url").into_response();
         };
         let target = resolve_icon_url(base, &path);
-        if !target.starts_with("http://") && !target.starts_with("https://") {
-            return err(StatusCode::BAD_REQUEST, "invalid icon url").into_response();
+        // 自加源图标也强制 https —— https registry 仍可给绝对 http logo_url,明文下载可被 MITM 篡改图标。
+        if !target.starts_with("https://") {
+            return err(StatusCode::BAD_REQUEST, "icon url 必须 https").into_response();
         }
         fetch_public(&target).await
     };
