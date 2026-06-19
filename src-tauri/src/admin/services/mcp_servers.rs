@@ -541,6 +541,50 @@ pub const WEB_FETCH_SERVER_NAME: &str = "cat-webfetch";
 /// 残留,避免老用户 config 留两个 server(旧大写 CAT-WEB-MCP + 新小写 cat-webfetch)。
 const LEGACY_WEB_FETCH_SERVER_NAME: &str = "CAT-WEB-MCP";
 
+/// MOC-256:`webFetchBackend` **从未设置过** 且 Chrome 未就绪(无系统 Chrome 且未下载内置 shell)
+/// → 持久化 `off`。否则默认 `auto` 会在运行时 web_fetch 升 headless 时静默下载 ~86MB
+/// chrome-headless-shell(用户没机会同意)。GUI 启动 + `--mcp-serve-webfetch` stdio 入口**都调**,
+/// 覆盖两条进程路径(Codex 先拉起 MCP server / 用户先开 GUI 都拦得住)。已设置 / 有 Chrome /
+/// 已下载 shell 则 no-op(保留 absent→auto 的开箱即用)。用户之后手动选 auto/headless 经设置
+/// 门控确认下载。
+pub async fn default_web_fetch_off_if_no_chrome() {
+    let already_set = codex_app_transfer_registry::config_file()
+        .and_then(|p| codex_app_transfer_registry::load_raw_config(&p).ok())
+        .and_then(|c| {
+            c.get("settings")
+                .and_then(|s| s.get("webFetchBackend"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .is_some();
+    if already_set || codex_app_transfer_http::headless::chrome_ready_without_download().await {
+        return;
+    }
+    let _ = crate::admin::registry_io::with_config_write(|cfg| {
+        // 锁内复检(TOCTOU:锁外 already_set 检查之后、本写之前,别的进程 / 设置 UI 可能已写入
+        // 显式档如 curl/wreq —— 此时绝不能覆盖回 off)。仍 absent 才写。
+        let still_absent = cfg
+            .get("settings")
+            .and_then(|s| s.get("webFetchBackend"))
+            .is_none();
+        if !still_absent {
+            return Ok(crate::admin::registry_io::ConfigMutation::Unchanged(()));
+        }
+        if let Some(obj) = cfg.as_object_mut() {
+            let settings = obj
+                .entry("settings")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(so) = settings.as_object_mut() {
+                so.insert(
+                    "webFetchBackend".to_string(),
+                    serde_json::Value::String("off".to_string()),
+                );
+            }
+        }
+        Ok(crate::admin::registry_io::ConfigMutation::Modified(()))
+    });
+}
+
 /// 注册 transfer 自己的 web_fetch MCP server(`command` = 本二进制绝对路径 + `--mcp-serve-webfetch`)。
 ///
 /// MOC-235 起**始终注册**(不再随 `webFetchBackend=off` 移除):本 server 同时托管
