@@ -122,14 +122,27 @@ pub async fn set_handler(
             }
         }
         // [MOC-257 review] apply 非事务化:synthetic/real 分支可能已 stash/写 auth.json + 开伪造,才在
-        // ensure_relay_applied 失败 → auth/proxy 停在半生效态(与回滚后的 UI/持久不一致)。best-effort
-        // 重新 apply 回滚后的生效模式,把 auth/proxy 拉回一致;再失败只 log(下次启动 reconcile 兜底)。
-        let restored = codex_real_account::resolve_plugin_unlock_mode();
-        if let Err(e2) =
-            crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, restored)
-                .await
-        {
-            tracing::error!("[PluginUnlock] set 失败后回滚重 apply({restored:?})也失败: {e2}");
+        // ensure_relay_applied 失败 → auth/proxy 停在半生效态。recovery 用**上次成功 apply 的模式**
+        // (last_applied)而非 resolve —— resolve 可能就是刚失败的那个(如默认 synthetic),重 apply 会再失败、
+        // 留半生效;从没成功 apply 过(None)→ 显式清到安全态(关伪造 + 还原真账号;仍合成则清掉)。
+        match codex_real_account::last_applied_mode() {
+            Some(last) => {
+                if let Err(e2) =
+                    crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(
+                        &state, last,
+                    )
+                    .await
+                {
+                    tracing::error!("[PluginUnlock] set 失败后回滚重 apply({last:?})也失败: {e2}");
+                }
+            }
+            None => {
+                codex_app_transfer_proxy::set_fake_account_mode(false);
+                let _ = codex_real_account::restore_stashed_real_auth().await;
+                if codex_real_account::active_is_synthetic() {
+                    let _ = codex_real_account::clear_active_auth_file().await;
+                }
+            }
         }
         return err(StatusCode::BAD_REQUEST, e).into_response();
     }

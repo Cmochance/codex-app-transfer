@@ -1129,6 +1129,17 @@ pub async fn stash_displaced_real_auth() -> Result<(), String> {
     }
     // 真账号 → 整文件移到 stash 保全。
     let stash = real_account_stash_path(&paths);
+    // [MOC-257 review] 已有**可用** stash、而活动只是**过期/撤销的**真账号残留(app 外 login 写进来的死
+    // token)→ **不**用活动覆盖:否则把有效 stash 归档掉、`real_account_usable` / Real activation 只读
+    // `stashed-real-auth.json` 见过期 → 误降级 synthetic。保留可用 stash;活动残留交给 caller(synthetic
+    // 的 activate 覆盖 / off 的 clear)处理。
+    if read_auth(&stash)
+        .ok()
+        .is_some_and(|s| auth_value_real_and_usable(&s))
+        && !auth_value_real_and_usable(&v)
+    {
+        return Ok(());
+    }
     if let Some(parent) = stash.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建 stash 目录失败: {e}"))?;
     }
