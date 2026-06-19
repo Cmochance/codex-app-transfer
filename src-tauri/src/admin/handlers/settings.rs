@@ -526,6 +526,18 @@ pub fn set_plugin_unlock_mode(mode: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// [MOC-257 review] 删 `pluginUnlockMode` 键(回到默认推导)。set 端点 apply 失败回滚用:若切换前本无
+/// 键(走默认),回滚到无键而非某个固定值。键不存在 → no-op。成功返 true。
+pub fn clear_plugin_unlock_mode() -> bool {
+    with_config_write(|cfg| {
+        if let Some(s) = cfg.get_mut("settings").and_then(Value::as_object_mut) {
+            s.remove("pluginUnlockMode");
+        }
+        Ok(ConfigMutation::Modified(true))
+    })
+    .unwrap_or(false)
+}
+
 /// [MOC-257 三态] 一次性迁移:把旧三开关折叠成 `pluginUnlockMode`。键已存在 → no-op(幂等)。
 /// 映射:`fakeAccountModeEnabled=true` → synthetic;`realAccountModeEnabled=true` → real;
 /// **`realAccountModeEnabled=false`(显式关闭意图)→ off**(否则默认推导会从 deactivate 留下的

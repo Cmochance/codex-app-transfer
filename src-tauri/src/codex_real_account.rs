@@ -952,45 +952,52 @@ pub fn has_real_account() -> bool {
 /// 标记一时未清会把新账号误降级。改逐 token 源直接判:本地过期由 `access_token_expired` 判;服务端撤销
 /// 由指纹比对(`access_token_fingerprint == REVOKED_TOKEN_FP`)判 —— token 已换则指纹不同、放行。真正清
 /// `relogin_required` 标记仍由 `detect()` 的指纹自愈在 startup / legacy status 路径做(这里只读)。
+/// [MOC-257 review] 一个 auth.json `Value` 是否是**当前可用的真实** chatgpt 账号:非合成、access/refresh
+/// 非空、不是被服务端 401 撤销的那个 token(指纹比对)、且 access_token 本地 JWT 未过期。只读、无副作用。
+/// 供 `real_account_usable`(降级判定)+ `restore_stashed_real_auth_impl`(活动是否比 stash 新/好)复用。
+fn auth_value_real_and_usable(v: &Value) -> bool {
+    if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    if parse_chatgpt_tokens(v).is_none() {
+        return false;
+    }
+    // 就是被服务端 401 撤销的那个 token → 不可用(token 已换 → 指纹不同 → 放行)。
+    let revoked_fp = REVOKED_TOKEN_FP.load(Ordering::SeqCst);
+    let has_revocation = HAS_REVOCATION.load(Ordering::SeqCst);
+    if has_revocation && revoked_fp != 0 && access_token_fingerprint(v) == revoked_fp {
+        return false;
+    }
+    let access = v
+        .get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    !access_token_expired(access, chrono::Utc::now().timestamp())
+}
+
 pub fn real_account_usable() -> bool {
     let Ok(paths) = CodexPaths::from_home_env() else {
         return false;
     };
-    let revoked_fp = REVOKED_TOKEN_FP.load(Ordering::SeqCst);
-    let has_revocation = HAS_REVOCATION.load(Ordering::SeqCst);
     // 有撤销但指纹未知(proxy 算不出被撤 token 指纹)→ 保守判全部不可用(对齐 detect「有撤销但指纹未知
     // 就保持 relogin」,见 `mark_relogin_required_from_proxy` 注释)。
-    if has_revocation && revoked_fp == 0 {
+    if HAS_REVOCATION.load(Ordering::SeqCst) && REVOKED_TOKEN_FP.load(Ordering::SeqCst) == 0 {
         return false;
     }
-    let usable = |v: &Value| -> bool {
-        if v.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
-            return false;
-        }
-        if parse_chatgpt_tokens(v).is_none() {
-            return false;
-        }
-        // 就是被服务端 401 撤销的那个 token → 不可用(token 已换 → 指纹不同 → 放行)。
-        if has_revocation && revoked_fp != 0 && access_token_fingerprint(v) == revoked_fp {
-            return false;
-        }
-        let access = v
-            .get("tokens")
-            .and_then(|t| t.get("access_token"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        !access_token_expired(access, chrono::Utc::now().timestamp())
-    };
-    if read_auth(&paths.auth_json).ok().is_some_and(|v| usable(&v)) {
+    if read_auth(&paths.auth_json)
+        .ok()
+        .is_some_and(|v| auth_value_real_and_usable(&v))
+    {
         return true;
     }
-    // [MOC-257 review] 导入/钉住的镜像也算(未过期才算可用)。
-    if read_imported_mirror(&paths).is_some_and(|v| usable(&v)) {
+    // 导入/钉住的镜像也算(未过期才算可用)。
+    if read_imported_mirror(&paths).is_some_and(|v| auth_value_real_and_usable(&v)) {
         return true;
     }
     read_auth(&real_account_stash_path(&paths))
         .ok()
-        .is_some_and(|v| usable(&v))
+        .is_some_and(|v| auth_value_real_and_usable(&v))
 }
 
 /// 解析当前**生效**三态:持久键优先;键缺失 → 按可用真账号推导。
@@ -1080,22 +1087,21 @@ fn restore_stashed_real_auth_impl(paths: &CodexPaths) -> Result<bool, String> {
     if !stash.is_file() {
         return Ok(false);
     }
-    let active_real = read_auth(&paths.auth_json)
+    // [MOC-257 review] 活动是否「更新且**可用**的真账号」——必须含过期/撤销判定:活动只是**过期的**真
+    // chatgpt 残留(auth_mode=chatgpt、tokens 在但已过期)时,不能当成「更新真账号」把有效的 stash 归档掉、
+    // 回退到过期 active(切 real 会失败)。用 `auth_value_real_and_usable`(非合成 + 非空 + 未撤销 + 未过期)。
+    let active_usable = read_auth(&paths.auth_json)
         .ok()
-        .map(|v| {
-            v.get("cas_synthetic").and_then(Value::as_bool) != Some(true)
-                && parse_chatgpt_tokens(&v).is_some()
-        })
-        .unwrap_or(false);
-    if active_real {
-        // [MOC-257 review] 活动已是更新真账号 → 不覆盖;stash 那份也是真账号(含 tokens),改名归档
-        // (不直删:可能不同账号 → 直删丢账号),留可恢复副本。
+        .is_some_and(|v| auth_value_real_and_usable(&v));
+    if active_usable {
+        // 活动已是更新且可用的真账号 → 不覆盖;stash 那份也是真账号(含 tokens),改名归档(不直删:
+        // 可能不同账号 → 直删丢账号),留可恢复副本。
         archive_existing_auth_file(paths, &stash);
         return Ok(false);
     }
-    // [MOC-257 review] 活动非真账号(synthetic/apikey)→ 删掉再 rename:Windows `rename` 目标已存在会
+    // 活动非可用真账号(synthetic / apikey / 过期残留)→ 删掉再 rename:Windows `rename` 目标已存在会
     // 失败(real 还原直接报错、回不去 real);macOS/Linux 虽会替换,显式删保证跨平台一致。被删的是
-    // 合成/apikey 占位(非真账号),安全。
+    // 占位 / 过期残留(stash 里有更值得保留的),安全。
     let _ = std::fs::remove_file(&paths.auth_json);
     std::fs::rename(&stash, &paths.auth_json)
         .map_err(|e| format!("从 stash 还原真账号失败: {e}"))?;
@@ -1644,5 +1650,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = CodexPaths::from_home_dir(dir.path());
         assert!(!restore_stashed_real_auth_impl(&paths).unwrap());
+    }
+
+    /// [review] 活动只是**过期的**真账号残留 → 不当成「更新真账号」归档掉有效 stash,而是还原有效 stash。
+    #[test]
+    fn restore_prefers_stash_when_active_real_is_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        let now = chrono::Utc::now().timestamp();
+        // 活动:过期真 chatgpt 残留(auth_mode=chatgpt、tokens 在但 access 已过期)。
+        write_json(
+            &paths.auth_json,
+            &json!({"auth_mode": "chatgpt",
+                    "tokens": {"access_token": make_jwt_with_exp(now - 3600), "refresh_token": "r1"}}),
+        );
+        // stash:有效真账号(未过期)。
+        write_json(
+            &real_account_stash_path(&paths),
+            &json!({"auth_mode": "chatgpt",
+                    "tokens": {"access_token": make_jwt_with_exp(now + 86400), "refresh_token": "r2"}}),
+        );
+        assert!(
+            restore_stashed_real_auth_impl(&paths).unwrap(),
+            "过期活动残留 → 应还原有效 stash(而非归档掉好 stash)"
+        );
+        assert!(!real_account_stash_path(&paths).is_file(), "stash 应消费");
+        let active = read_auth(&paths.auth_json).unwrap();
+        assert_eq!(
+            active["tokens"]["refresh_token"], "r2",
+            "活动应换成 stash 里的有效账号"
+        );
     }
 }

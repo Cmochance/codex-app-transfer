@@ -85,9 +85,18 @@ pub async fn set_handler(
         )
             .into_response();
     }
-    // [MOC-257 review] **apply 先于 persist**:apply 失败时不留脏持久态(原先 persist→apply,apply 失败后
-    // 持久值已是新模式、UI 却回滚旧值 → 下次启动 reconcile 到 UI 没显示的状态)。effective 直接由请求模式
-    // + 账号可用性算(real 失效 → 降级 synthetic),不经 resolve(它读的是还没写的持久键)。
+    // [MOC-257 review] **persist 先于 apply,apply 失败回滚 persist**:两轮 review 的两面 —— persist 后于
+    // apply 则 persist 失败时 auth/proxy 已变、UI/持久回旧不一致;persist 先于 apply 则 apply 失败时持久
+    // 仍是新值。取「先 persist(失败 → 啥都没动直接报错)+ apply 失败时回滚 persist 到旧意图」同时满足两者。
+    let prev = super::settings::read_plugin_unlock_mode();
+    if !super::settings::set_plugin_unlock_mode(&req.mode) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "写入插件解锁模式失败(配置文件不可写?),请检查权限 / 磁盘后重试".to_owned(),
+        )
+        .into_response();
+    }
+    // effective 直接由请求模式 + 账号可用性算(real 失效 → 降级 synthetic)。
     let effective = match mode {
         PluginUnlockMode::Real if !codex_real_account::real_account_usable() => {
             PluginUnlockMode::Synthetic
@@ -97,17 +106,16 @@ pub async fn set_handler(
     if let Err(e) =
         crate::admin::services::desktop::snapshot::apply_plugin_unlock_mode(&state, effective).await
     {
+        // 回滚持久意图到切换前(无键则清回默认),避免下次启动 reconcile 到 UI 没显示的状态。
+        match prev {
+            Some(p) => {
+                let _ = super::settings::set_plugin_unlock_mode(&p);
+            }
+            None => {
+                let _ = super::settings::clear_plugin_unlock_mode();
+            }
+        }
         return err(StatusCode::BAD_REQUEST, e).into_response();
-    }
-    // apply 成功后再落持久意图(off 也持久:重启仍 stash 走 auth.json)。持久化失败报错(config 只读 /
-    // 磁盘满)—— 此时已 apply 但持久未落,下次启动按旧持久值 reconcile;报错让用户知晓重试(罕见:配置
-    // 小写远比 apply 可靠,故把易失败的 apply 放前面)。
-    if !super::settings::set_plugin_unlock_mode(&req.mode) {
-        return err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "已应用但写入持久模式失败(配置文件不可写?),请检查权限 / 磁盘后重试".to_owned(),
-        )
-        .into_response();
     }
     let degraded =
         matches!(mode, PluginUnlockMode::Real) && effective == PluginUnlockMode::Synthetic;
