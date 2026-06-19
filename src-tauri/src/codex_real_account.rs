@@ -1164,6 +1164,26 @@ pub fn snapshot_active_auth_bytes() -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+/// [MOC-257 review] 把当前活动 `auth.json` 整文件 rename **回 stash**(undo `restore_stashed`),供 Real apply 在
+/// unstash 后、activate 前的**读字节失败**回滚:无需读字节即可把真账号放回 stash、再还原 pre_apply,保状态一致
+/// (persisted 回滚 + active=pre_apply + 真账号在 stash)且不丢账号。活动不存在 / rename 失败 → `false`(best-effort)。
+pub fn move_active_to_stash_raw() -> bool {
+    let Ok(p) = CodexPaths::from_home_env() else {
+        return false;
+    };
+    if !p.auth_json.exists() {
+        return false;
+    }
+    let stash = real_account_stash_path(&p);
+    if let Some(parent) = stash.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if stash.exists() {
+        let _ = archive_existing_auth_file(&p, &stash); // 防御:理论上 restore_stashed 已消费 stash
+    }
+    std::fs::rename(&p.auth_json, &stash).is_ok()
+}
+
 /// [MOC-257 review] 把 auth 文件设 0600(Unix)。`std::fs::write` 默认 `0666 & umask`,多用户共享 home + umask
 /// 022 时其它本地用户能读到 chatgpt refresh token / gateway key。`write_auth` 一直强制 0600,这里对齐 ——
 /// 用裸 `std::fs::write` 写 auth/stash 字节后必调。best-effort(设权限失败只忽略,内容已落盘)。

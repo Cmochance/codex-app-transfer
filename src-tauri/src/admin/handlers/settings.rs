@@ -554,7 +554,19 @@ pub fn migrate_plugin_unlock_mode_v1() -> bool {
     };
     let s = cfg.get("settings");
     if s.and_then(|s| s.get("pluginUnlockMode")).is_some() {
-        return false; // 已迁移
+        // [MOC-257 review] 已迁移(有 pluginUnlockMode),但**仍清残留 legacy autoUnlockCodexPlugins**:早期 build
+        // 写了新键却没清旧键 / 导入的配置带旧键 → launcher `should_attach_debug_port`(process.rs)+ 设置热重载
+        // 仍读它开 Codex 远程调试端口 / 旧 CDP 路径。存在则清掉(否则升级用户即便已迁移仍以调试端口启 Codex)。
+        if s.and_then(|s| s.get("autoUnlockCodexPlugins")).is_some() {
+            return with_config_write(|cfg| {
+                if let Some(set) = cfg.get_mut("settings").and_then(Value::as_object_mut) {
+                    set.remove("autoUnlockCodexPlugins");
+                }
+                Ok(ConfigMutation::Modified(true))
+            })
+            .unwrap_or(false);
+        }
+        return false; // 已迁移 + 无 legacy 残留
     }
     let b = |k: &str| {
         s.and_then(|s| s.get(k))

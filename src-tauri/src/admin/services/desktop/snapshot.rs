@@ -578,7 +578,20 @@ pub async fn apply_plugin_unlock_mode(
                 }
             };
             let unstashed_real = if restored_from_stash {
-                ra::snapshot_active_auth_bytes()?
+                match ra::snapshot_active_auth_bytes() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // [MOC-257 review] 读 unstash 出的真账号字节失败(Win 锁 / ACL):此刻 stash 已被
+                        // restore_stashed 消费、真账号在活动。别直接 `?` 退出(留 real active + persisted 回滚不
+                        // 一致)→ 把活动 rename 回 stash(无需读字节)+ 还原 pre_apply,使状态一致且不丢账号。
+                        ra::move_active_to_stash_raw();
+                        let r = ra::restore_active_auth_bytes(pre_apply);
+                        return Err(fold_restore_err(
+                            format!("读 unstash 出的真账号字节失败: {e}"),
+                            r,
+                        ));
+                    }
+                }
             } else {
                 None
             };
