@@ -645,6 +645,78 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
+/// 末个 patch 操作是否为「`*** Add File:` + 代码/结构化配置文件目标」。用于 [`ensure_v4a_envelope`] 判定
+/// 末行 `+*** End Patch` 可否安全剥成终止符:**仅 Add File**(新建文件,裸 `*** End Patch` 不可能是合法
+/// 源码的**末行** → 必是误前缀终止符)才剥;`*** Update File:` 的 `+*** End Patch` 是**新增行**(可能往
+/// 字符串 / fixture 里加这串字),剥了=丢新增 → 不剥(chatgpt-codex-connector review:限定 Add File)。
+/// 文档 / 文本 / 未知扩展也不剥(可能是正文,留 incomplete 不猜)。allowlist 保守。MOC-268。
+fn last_op_is_add_file_code(body: &str) -> bool {
+    let last_op = body.lines().rev().find(|l| {
+        let t = l.trim_end();
+        t.starts_with("*** Add File: ")
+            || t.starts_with("*** Update File: ")
+            || t.starts_with("*** Delete File: ")
+    });
+    let Some(path) = last_op.and_then(|l| l.trim_end().strip_prefix("*** Add File: ")) else {
+        return false; // 无操作,或末操作是 Update/Delete(非 Add File)→ 不剥
+    };
+    let ext = std::path::Path::new(path.trim())
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some(
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "py"
+                | "go"
+                | "java"
+                | "kt"
+                | "kts"
+                | "c"
+                | "h"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "hpp"
+                | "hh"
+                | "cs"
+                | "rb"
+                | "php"
+                | "swift"
+                | "scala"
+                | "lua"
+                | "sql"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "css"
+                | "scss"
+                | "sass"
+                | "less"
+                | "html"
+                | "htm"
+                | "xml"
+                | "vue"
+                | "svelte"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "gradle"
+                | "cmake"
+                | "proto"
+                | "graphql"
+                | "dart"
+                | "r"
+        )
+    )
+}
+
 /// **缺信封自动补全**:模型常只写 `*** Add/Update File:` + 内容,漏掉 `*** Begin Patch` /
 /// `*** End Patch` 头尾 → Codex(及本 adapter 的 V4A 校验)判 incomplete → 模型被迫重试。
 /// 当 patch 含至少一个 `*** Add/Update/Delete File:` 操作、JSON 已完整(调用方先 gate
@@ -682,8 +754,39 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
     }
     if !has_end {
         let trimmed = body.trim_end();
-        body = format!("{trimmed}\n*** End Patch");
-        added.push("End Patch");
+        let last = trimmed.lines().last().unwrap_or("");
+        // [MOC-268] **只有 `+*** End Patch`(Add 行前缀)** 才是「模型给终止符误加前缀」的形态。
+        // ` *** End Patch`(context)/ `-*** End Patch`(deletion)是**合法 Update hunk 行**——例如模型
+        // 用 Update **删除**文件里之前残留的 `*** End Patch`(`-*** End Patch`),或用它当 context 锚点;
+        // 把它们当终止符剥会**静默丢弃删除 / 破坏锚点**(chatgpt-codex-connector review)→ 故 ` `/`-` 一律
+        // 走下面正常 append(补真终止符,hunk 行原样保留)。
+        // 对 `+*** End Patch` 再**按文件类型消歧**(用户拍板):
+        //   · 代码 / 结构化配置文件(裸 `*** End Patch` 不可能是合法源码末行)→ 必是误前缀终止符 → **剥前缀**
+        //     (`head` 切到末行起点、保留其前换行;末行 ASCII,边界安全)。
+        //   · 文档 / 文本 / 未知(可能是正文末行)→ **不猜**:不剥(免删正文)、不追加(免残留),留 incomplete
+        //     交下游判截断、模型按 guidance 规则2 重发。prompt 才是根治,中间层只在确定安全时介入。
+        if last == "+*** End Patch" {
+            if last_op_is_add_file_code(&body) {
+                let head = &trimmed[..trimmed.len() - last.len()];
+                body = format!("{head}*** End Patch");
+                added.push("End Patch(代码文件·剥误加前缀终止符)");
+            } else {
+                return (
+                    body,
+                    Some(Repair {
+                        file: "(envelope)".to_owned(),
+                        kind: "skipped:ambiguous_prefixed_end".to_owned(),
+                        detail:
+                            "末行 +*** End Patch 且目标非代码文件(可能是正文)→ 不猜不补全,留 incomplete"
+                                .to_owned(),
+                    }),
+                );
+            }
+        } else {
+            // 含 ` *** End Patch` / `-*** End Patch`(合法 hunk 行)及普通内容末行 → 正常补真终止符。
+            body = format!("{trimmed}\n*** End Patch");
+            added.push("End Patch");
+        }
     }
     (
         body,
@@ -1381,6 +1484,101 @@ mod tests {
         assert_eq!(out.matches("*** Begin Patch").count(), 1, "不重复加 Begin");
         assert!(out.trim_end().ends_with("*** End Patch"));
         assert!(rep.unwrap().detail.contains("End Patch"));
+    }
+
+    #[test]
+    fn envelope_prefixed_end_stripped_for_code_file() {
+        // MOC-268(用户拍板「按文件类型剥」):**仅 `+*** End Patch`**(Add 行误前缀)在代码/结构化配置文件
+        // 里(裸 `*** End Patch` 不可能是合法源码末行)剥前缀规整成裸终止符,不追加、零残留、零内容丢失。
+        for path in ["x.rs", "c.json", "s.toml", "w.vue"] {
+            let body = format!("*** Begin Patch\n*** Add File: {path}\n+a\n+b\n+*** End Patch");
+            let (out, rep) = ensure_v4a_envelope(&body);
+            assert!(
+                out.trim_end().ends_with("\n*** End Patch"),
+                "代码文件应剥成裸终止符 ({path}):\n{out}"
+            );
+            assert!(
+                !out.contains("+*** End Patch"),
+                "不应残留带前缀终止符 ({path}):\n{out}"
+            );
+            assert_eq!(
+                out.matches("*** End Patch").count(),
+                1,
+                "只一个终止符 ({path}):\n{out}"
+            );
+            assert!(rep.unwrap().detail.contains("剥误加前缀"), "{path}");
+        }
+    }
+
+    #[test]
+    fn envelope_deletion_or_context_end_line_not_stripped() {
+        // MOC-268(chatgpt-codex-connector review):` *** End Patch`(context)/ `-*** End Patch`(deletion)
+        // 是**合法 Update hunk 行**(如模型用 Update 删文件里残留的 *** End Patch),**绝不能当终止符剥**
+        // (剥 `-` = 静默丢弃删除)。这俩末行 → 正常补真终止符、hunk 行**原样保留**。即便目标是代码文件。
+        for last in ["-*** End Patch", " *** End Patch"] {
+            let body = format!("*** Begin Patch\n*** Update File: src/foo.rs\n keep\n{last}");
+            let (out, rep) = ensure_v4a_envelope(&body);
+            assert!(
+                out.contains(last),
+                "合法 hunk 行 {last:?} 必须原样保留(不剥=不丢删除):\n{out}"
+            );
+            assert!(
+                out.trim_end().ends_with("\n*** End Patch"),
+                "应正常补真终止符 ({last:?}):\n{out}"
+            );
+            let r = rep.unwrap();
+            assert!(
+                r.detail.contains("End Patch") && !r.detail.contains("剥误加前缀"),
+                "走正常 append、非剥 ({last:?}):{}",
+                r.detail
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_prefixed_end_left_incomplete_for_doc_file() {
+        // MOC-268(silent-failure review):文档/文本/未知类型里裸 `*** End Patch` **可能是正文末行**(本仓
+        // V4A 文档就有这串字)→ 歧义不猜:既不剥(免删正文)也不追加(免残留)→ 不补全留 incomplete。
+        for path in ["notes.md", "readme.txt", "data"] {
+            let body = format!(
+                "*** Begin Patch\n*** Add File: {path}\n+How to end a patch:\n+*** End Patch"
+            );
+            let (out, rep) = ensure_v4a_envelope(&body);
+            assert_eq!(out, body, "文档文件歧义末行应原样保留 ({path}):\n{out}");
+            assert!(
+                out.trim_end().ends_with("+*** End Patch"),
+                "正文行应保留不删 ({path}):\n{out}"
+            );
+            assert!(
+                !out.trim_end().ends_with("\n*** End Patch"),
+                "不应追加裸终止符 ({path}):\n{out}"
+            );
+            assert_eq!(
+                rep.unwrap().kind,
+                "skipped:ambiguous_prefixed_end",
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_prefixed_end_not_stripped_for_update_even_code() {
+        // MOC-268(chatgpt-codex-connector review):`*** Update File:` 的 `+*** End Patch` 是**新增行**
+        // (可能往代码文件的字符串/fixture 里加这串字),不是 Add File 的误前缀终止符 → **即便目标是代码
+        // 文件也不剥**(剥了=丢新增),走歧义 → 留 incomplete。剥仅限末操作是 Add File。
+        let body =
+            "*** Begin Patch\n*** Update File: src/foo.rs\n keep\n+*** End Patch".to_string();
+        let (out, rep) = ensure_v4a_envelope(&body);
+        assert_eq!(out, body, "Update 的 +*** End Patch 不应被剥/动:\n{out}");
+        assert!(
+            out.trim_end().ends_with("+*** End Patch"),
+            "新增行应保留:\n{out}"
+        );
+        assert!(
+            !out.trim_end().ends_with("\n*** End Patch"),
+            "不应追加裸终止符:\n{out}"
+        );
+        assert_eq!(rep.unwrap().kind, "skipped:ambiguous_prefixed_end");
     }
 
     #[test]

@@ -3010,7 +3010,7 @@ use tools::{convert_responses_tool_to_chat_tool, normalize_tool_choice, APPLY_PA
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "[apply_patch chat-path guidance — injected by codex-app-transfer adapter because the upstream lark grammar constraint is unavailable on chat function-call providers]\n",
     "\n",
-    "**ALWAYS use the `apply_patch` tool to write file content** — new files, single-line edits, and full-file rewrites alike. **NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. **EQUALLY, NEVER use `sed -i` / `perl -i` / `ed`, or shell line-number deletion (e.g. `sed -i 'N,Md' file`), to edit or delete existing file content** — in-place shell editors bypass the diff UI and are fragile to line-number drift across successive edits (deleting by stale line numbers corrupts the file). (To create a brand-new or empty file, use `*** Add File: <path>` — not a shell redirect.) **PREFER surgical targeted edits**: to change or replace existing content, emit ONLY the specific `-` (old) and `+` (new) lines for what actually changes. **To DELETE content — even a large contiguous block spanning many lines — emit those lines as `-` lines in an apply_patch hunk, or use `*** Delete File: <path>` to remove an entire file; do NOT switch to `sed`/`python` line-range deletion just because the block is large.** Multiple non-adjacent edits to the SAME file may go in ONE apply_patch call as separate hunks. Do NOT regenerate the whole file/section and append it, and do NOT rewrite an entire file just because part of it changed. Reserve full-file replacement (`*** Delete File: <path>` then `*** Add File: <path>` with every line `+`-prefixed, in one patch) for genuine cases ONLY: creating brand-new content, or when almost every line truly differs.\n",
+    "**ALWAYS use the `apply_patch` tool to write file content** — new files, single-line edits, and full-file rewrites alike. **NEVER use shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / any `>` redirect to write actual file content** — doing so bypasses the Codex diff UI and audit trail. **EQUALLY, NEVER use `sed -i` / `perl -i` / `ed`, or shell line-number deletion (e.g. `sed -i 'N,Md' file`), to edit or delete existing file content** — in-place shell editors bypass the diff UI and are fragile to line-number drift across successive edits (deleting by stale line numbers corrupts the file). (To create a brand-new or empty file, use `*** Add File: <path>` — not a shell redirect.) **PREFER surgical targeted edits**: to change or replace existing content, emit ONLY the specific `-` (old) and `+` (new) lines for what actually changes — keep each hunk minimal, and do NOT add or remove blank lines as part of an edit unless a blank line itself is the change (blank-line `+`/`-` are positionally ambiguous and may silently fail to apply). **To DELETE content — even a large contiguous block spanning many lines — emit those lines as `-` lines in an apply_patch hunk, or use `*** Delete File: <path>` to remove an entire file; do NOT switch to `sed`/`python` line-range deletion just because the block is large.** Multiple non-adjacent edits to the SAME file may go in ONE apply_patch call as separate hunks. Do NOT regenerate the whole file/section and append it, and do NOT rewrite an entire file just because part of it changed. Reserve full-file replacement (`*** Delete File: <path>` then `*** Add File: <path>` with every line `+`-prefixed, in one patch) for genuine cases ONLY: creating brand-new content, or when almost every line truly differs.\n",
     "\n",
     "When you call the `apply_patch` tool, follow these rules empirically observed with non-OpenAI chat providers:\n",
     "\n",
@@ -3024,7 +3024,8 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "**NEVER add a trailing `@@`** (`@@ <header> @@` is wrong) — Codex Desktop's V4A applier treats trailing `@@` as literal text and fails with `Failed to find context '... @@'`. ",
     "For deeply nested disambiguation use MULTIPLE `@@` lines on separate rows (e.g. `@@ class Outer\\n@@ def inner():`), each single-sided.\n",
     "\n",
-    "2. Add File uses NO `@@` markers and NO hunks. After `*** Add File: <path>`, prefix EVERY line of the new file's content with `+`, including blank lines (write them as a bare `+` on its own row). Raw source code without `+` prefix (e.g. `def main():` directly) causes `'def main():' is not a valid hunk header` errors.\n",
+    "2. Add File uses NO `@@` markers and NO hunks. After `*** Add File: <path>`, prefix every line of the new file's CONTENT with `+`, including blank lines (write them as a bare `+` on its own row). Raw source code without `+` prefix (e.g. `def main():` directly) causes `'def main():' is not a valid hunk header` errors. ",
+    "But the structural markers `*** Begin Patch` / `*** Add File:` / `*** End Patch` are NOT content — write them with NO prefix. In particular **do NOT prefix the terminator** (`+*** End Patch` is wrong); a `+`-prefixed terminator is treated as a content line and leaves a literal `*** End Patch` row at the end of the created file.\n",
     "\n",
     "3. Every `-` line and space-prefixed context line MUST match the file byte-for-byte (same leading whitespace, no trimmed trailing spaces, exact characters). If unsure, run `cat <path>` or `sed -n '1,80p' <path>` via shell first, then compose the patch from real bytes. Guessing produces `Failed to find context '<your guess>'` errors.\n",
     "\n",
@@ -3034,13 +3035,17 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
     "\n",
     "5. To populate a brand-new or empty file, use `*** Add File: <path>` with every line `+`-prefixed (not `*** Update File:`, not a shell redirect).\n",
     "\n",
-    "6. In a multi-line file, lone `+` lines without a corresponding `-` line APPEND below the previous context — they do NOT replace any existing line. To change an existing line, you MUST include BOTH a `-` line (removing the old content) AND a `+` line (adding the new content).\n",
+    "6. In a multi-line file, lone `+` lines without a corresponding `-` line APPEND below the previous context — they do NOT replace any existing line. To change an existing line, you MUST include BOTH a `-` line (removing the old content) AND a `+` line (adding the new content). ",
+    "A space-prefixed context line is MATCHED against the file, never added — it must already exist in the file. To introduce a brand-new line, prefix it `+`; writing a not-yet-present line as a context line (or with no prefix) yields a hunk with no real change that fails to apply or `Failed to find context`.\n",
     "\n",
-    "7. If an Update fails with `Failed to find context`, the `-`/context lines did not match the file byte-for-byte — re-read the file (`cat <path>` / `sed -n`) and fix those lines to match exactly, then retry the SAME surgical Update. Do NOT escalate to rewriting or re-appending the whole file; keep the edit targeted to the lines that change.\n",
+    "7. If an Update fails with `Failed to find context`, the `-`/context lines did not match the file byte-for-byte — re-read the file (`cat <path>` / `sed -n`) and fix those lines to match exactly, then retry the SAME surgical Update. Do NOT escalate to rewriting or re-appending the whole file; keep the edit targeted to the lines that change. ",
+    "When you make several edits to the SAME file in one turn, each applied hunk shifts the file's content — put related edits in ONE patch as separate hunks, or re-read the file between separate calls. A `-` line that no longer matches may have ALREADY been removed (by a prior hunk or an earlier edit this turn) — confirm it still exists before re-issuing the same deletion, instead of blindly retrying.\n",
     "\n",
     "8. `*** Begin Patch` MUST be the literal first line of the `input` string — no leading whitespace, no other content before it, never put `*** Add File:` or any operation header directly. Forgetting this causes `invalid patch: The first line of the patch must be '*** Begin Patch'`.\n",
     "\n",
     "9. `*** Update File: <old>` + `*** Move to: <new>` REQUIRES at least one hunk (with `-`/`+` lines or `*** End of File` marker). An empty Update+Move block fails with `Update file hunk for path '<old>' is empty`. **For pure rename without content change**, use `*** Delete File: <old>` + `*** Add File: <new>` within the same patch (copy original content with `+` prefix per line). **For rename WITH content change**, keep Update+Move and include the actual `-`/`+` hunks.\n",
+    "\n",
+    "10. Editing memory files (e.g. `~/.codex/memories/MEMORY.md`) needs extra care: a concurrent process may rewrite the file between when you last read it and when your patch applies. `cat` the file IMMEDIATELY before patching, make every `-`/context line a row that exists in the CURRENT file, and use minimal unique anchors (e.g. a single `@@ <section header>` plus only the exact rows you change). Stale `-` lines — content a concurrent consolidation already changed — fail with `Failed to find context`; on failure re-read and rebuild from the current bytes rather than retrying the stale patch.\n",
     "\n",
     "Following these rules avoids retry storms and improves the success rate on first attempt."
 );
@@ -3061,11 +3066,11 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_EN: &str = concat!(
 ///   `context` / `patch` / `function` 等(混入中文反而不自然)
 /// - 强调词译:**ALWAYS** → **务必**;**NEVER** → **绝不**;**MUST** → **必须**;
 ///   PREFERRED → 推荐;SINGLE-SIDED → 单端;DEEPLY NESTED → 深层嵌套
-/// - 跟英文版**逐条对应**(9 条规则 + 引言段),不简化不漏 emphasis
+/// - 跟英文版**逐条对应**(10 条规则 + 引言段,rule 10 = MOC-268 memory 专属引导),不简化不漏 emphasis
 const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
     "[apply_patch chat-path 指引 — 由 codex-app-transfer adapter 注入,因为上游 lark 语法约束在 chat function-call provider 上不可用]\n",
     "\n",
-    "**务必使用 `apply_patch` tool 写文件内容** —— 新建文件、单行编辑、整文件重写都一样。**绝不使用 shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / 任何 `>` 重定向来写实际文件内容** —— 这样做会绕过 Codex diff UI 和审计 trail。**同样,绝不使用 `sed -i` / `perl -i` / `ed`、或 shell 按行号删除(如 `sed -i 'N,Md' file`)来编辑或删除已有文件内容** —— 就地 shell 编辑器绕过 diff UI,且对多次编辑间的行号漂移很脆弱(按过期行号删会切错、损坏文件)。(新建或空文件用 `*** Add File: <path>` —— 不要用 shell 重定向。)**优先外科式针对性编辑**:要改/替换已有内容时,只发改动那几行的 `-`(旧)和 `+`(新)。**删除内容 —— 即便是跨很多行的大段连续块 —— 也用 apply_patch hunk 里的 `-` 行表达,或用 `*** Delete File: <path>` 删整个文件;不要因为块大就改用 `sed`/`python` 按行范围删除。** 对同一文件的多处不相邻编辑可以放进**一次** apply_patch 调用、分成多个 hunk。**不要**整段重新生成再追加,**不要**因为改了一部分就整文件重写。整文件替换(同一 patch 内 `*** Delete File: <path>` + `*** Add File: <path>`、每行前缀 `+`)**仅限**真正需要时:新建全新内容,或几乎每行都不同。\n",
+    "**务必使用 `apply_patch` tool 写文件内容** —— 新建文件、单行编辑、整文件重写都一样。**绝不使用 shell `cat <<EOF > file` / `printf '<content>' > file` / `echo '<content>' > file` / 任何 `>` 重定向来写实际文件内容** —— 这样做会绕过 Codex diff UI 和审计 trail。**同样,绝不使用 `sed -i` / `perl -i` / `ed`、或 shell 按行号删除(如 `sed -i 'N,Md' file`)来编辑或删除已有文件内容** —— 就地 shell 编辑器绕过 diff UI,且对多次编辑间的行号漂移很脆弱(按过期行号删会切错、损坏文件)。(新建或空文件用 `*** Add File: <path>` —— 不要用 shell 重定向。)**优先外科式针对性编辑**:要改/替换已有内容时,只发改动那几行的 `-`(旧)和 `+`(新),保持每个 hunk 最小;且**不要**把增删空行作为编辑的一部分,除非空行本身就是改动(空行 `+`/`-` 位置歧义、可能静默 apply 失败)。**删除内容 —— 即便是跨很多行的大段连续块 —— 也用 apply_patch hunk 里的 `-` 行表达,或用 `*** Delete File: <path>` 删整个文件;不要因为块大就改用 `sed`/`python` 按行范围删除。** 对同一文件的多处不相邻编辑可以放进**一次** apply_patch 调用、分成多个 hunk。**不要**整段重新生成再追加,**不要**因为改了一部分就整文件重写。整文件替换(同一 patch 内 `*** Delete File: <path>` + `*** Add File: <path>`、每行前缀 `+`)**仅限**真正需要时:新建全新内容,或几乎每行都不同。\n",
     "\n",
     "调用 `apply_patch` tool 时,遵循以下基于非 OpenAI chat provider 实战观察总结的规则:\n",
     "\n",
@@ -3079,7 +3084,8 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
     "**绝不加尾随 `@@`**(`@@ <header> @@` 是错的)—— Codex Desktop 的 V4A applier 会把尾随 `@@` 当字面文本,报 `Failed to find context '... @@'`。",
     "深层嵌套消歧时用**多个** `@@` 行各占一行(例如 `@@ class Outer\\n@@ def inner():`),每条都是单端。\n",
     "\n",
-    "2. Add File **不用** `@@` 标记、**不用** hunk。`*** Add File: <path>` 之后,新文件**每一行**(包括空行,写成单个 `+` 占一行)都前缀 `+`。没 `+` 前缀的原始源码(例如直接写 `def main():`)会触发 `'def main():' is not a valid hunk header` 错误。\n",
+    "2. Add File **不用** `@@` 标记、**不用** hunk。`*** Add File: <path>` 之后,新文件**每一行内容**(包括空行,写成单个 `+` 占一行)都前缀 `+`。没 `+` 前缀的原始源码(例如直接写 `def main():`)会触发 `'def main():' is not a valid hunk header` 错误。",
+    "但结构标记 `*** Begin Patch` / `*** Add File:` / `*** End Patch` **不是内容,不加前缀**。尤其**绝不给终止符加前缀**(`+*** End Patch` 是错的):带 `+` 的终止符会被当成内容行,在新建文件末尾留下一行字面 `*** End Patch`。\n",
     "\n",
     "3. 每个 `-` 行和空格前缀的 context 行**必须**跟文件 byte-for-byte 一致(同样的前导 whitespace,不能 trim 尾随空格,字符完全相同)。不确定时先用 shell 跑 `cat <path>` 或 `sed -n '1,80p' <path>` 查一下,再用真实字节组 patch。靠猜会触发 `Failed to find context '<your guess>'` 错误。\n",
     "\n",
@@ -3089,13 +3095,17 @@ const APPLY_PATCH_CHAT_PATH_SYSTEM_GUIDANCE_ZH: &str = concat!(
     "\n",
     "5. 新建或空文件用 `*** Add File: <path>`、每行前缀 `+`(不要用 `*** Update File:`,也不要用 shell 重定向)。\n",
     "\n",
-    "6. 多行文件里,**没有**对应 `-` 行的孤立 `+` 行会**追加**在上文 context 之下 —— **不会**替换任何已有行。要修改已有行,**必须**同时包含 `-` 行(删旧内容)和 `+` 行(加新内容)。\n",
+    "6. 多行文件里,**没有**对应 `-` 行的孤立 `+` 行会**追加**在上文 context 之下 —— **不会**替换任何已有行。要修改已有行,**必须**同时包含 `-` 行(删旧内容)和 `+` 行(加新内容)。",
+    "空格前缀的 context 行是拿来**跟文件匹配**的、绝不新增 —— 它必须已存在于文件中。要引入全新行,前缀 `+`;把文件里还没有的行写成 context(或不加前缀)会得到一个无实际改动、apply 失败或 `Failed to find context` 的 hunk。\n",
     "\n",
-    "7. Update 报 `Failed to find context` 时,说明 `-`/context 行跟文件 byte 对不上 —— 重新 `cat <path>` / `sed -n` 读文件、把这些行改成完全一致,再重试**同一个**针对性 Update。**不要**升级成整文件重写/重新追加,把编辑保持在改动的那几行。\n",
+    "7. Update 报 `Failed to find context` 时,说明 `-`/context 行跟文件 byte 对不上 —— 重新 `cat <path>` / `sed -n` 读文件、把这些行改成完全一致,再重试**同一个**针对性 Update。**不要**升级成整文件重写/重新追加,把编辑保持在改动的那几行。",
+    "在**一次**回合里对**同一文件**做多处编辑时,每个已应用的 hunk 都会改变文件内容 —— 把相关编辑放进**一个** patch 的多个 hunk,或在多次独立调用之间重新读文件。某个 `-` 行不再匹配,可能是它**已经被删掉**(被前一个 hunk、或本回合更早的编辑)—— 重发同一删除前先确认它还在,别盲目重试。\n",
     "\n",
     "8. `*** Begin Patch` **必须**是 `input` 字符串的字面第一行 —— 不能有前导空格,前面不能有其它内容,绝不能直接写 `*** Add File:` 或任何操作 header。漏了会触发 `invalid patch: The first line of the patch must be '*** Begin Patch'`。\n",
     "\n",
     "9. `*** Update File: <old>` + `*** Move to: <new>` **要求**至少一个 hunk(带 `-`/`+` 行或 `*** End of File` 标记)。空的 Update+Move 块会报 `Update file hunk for path '<old>' is empty`。**纯重命名不改内容**时,在同一 patch 内用 `*** Delete File: <old>` + `*** Add File: <new>`(把原内容每行前缀 `+` 复制过去)。**重命名同时改内容**时,保留 Update+Move 并写真实的 `-`/`+` hunk。\n",
+    "\n",
+    "10. 编辑 memory 文件(如 `~/.codex/memories/MEMORY.md`)要格外小心:并发进程可能在你上次读它、到你的 patch 落地之间重写该文件。打 patch **前立即** `cat` 该文件,让每个 `-`/context 行都是**当前**文件里存在的行,并用最小唯一锚点(如单个 `@@ <section header>` + 只写你实际改的那几行)。过期的 `-` 行 —— 内容已被并发固化(consolidation)改掉 —— 会报 `Failed to find context`;失败时重新读、按当前字节重建,而不是重试过期 patch。\n",
     "\n",
     "遵循这些规则可以避免 retry 风暴,提升首次尝试的成功率。"
 );
