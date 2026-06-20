@@ -141,6 +141,9 @@ function onImportConfig() {
       if (typeof reloaded.theme === 'string') useAppearance().load(reloaded.theme)
       if (reloaded.language === 'zh' || reloaded.language === 'en')
         setLocale(reloaded.language as 'zh' | 'en')
+      // 插件解锁档(settings.pluginUnlockMode)同由独立 ref 驱动(refreshPluginUnlockStatus),
+      // 刷新使段控件 + no-op 守卫反映导入后的持久档。(font 走 localStorage、不在 settings,import 不动它。)
+      refreshPluginUnlockStatus()
       toast(t('settings.importConfigOk'))
     } catch (e) {
       toast((e as Error).message, 'error')
