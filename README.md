@@ -139,7 +139,7 @@ macOS 暂未做 **Apple Developer ID 代码签名** 与 **Apple 公证(Notarizat
 | Anthropic Messages(custom Claude-compatible) | ✅(PR #153) | ✅(PR #153) | ✅(PR #153) | `apiFormat=anthropic_messages`,Claude preset 待真实验证后开放 |
 | Grok Web(SuperGrok / X Premium+) | ✅ | ✅ | ✅(v2.1.6 加 tool_calls flatten) | 实验性,TOS 灰色,仅本机个人使用 |
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | 后端就绪,UI 待 PR;gemini 全系上下文 1M(带后缀 id 此前误落 258k 兜底,MOC-221);**支持 Codex 内置 image_gen 工具原生出图**(MOC-210,gemini-3.1-flash-image;可 provider 覆盖) |
-| 智谱 GLM(5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代 |
+| 智谱 GLM(5.2 / 5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat 兼容反代;5.2 为 1M context |
 | 智谱 GLM Coding(4.7 / 4.6) | ✅ | ✅ | ✅ | GLM Coding Plan 订阅套餐专属端点(`/api/coding/paas/v4`);代理代码层注入完整 ZCode 指纹头(含运行时 `X-Platform`),与 OAuth 登录路径完全对齐,获取 Coding Plan 150% 配额加成 |
 | GLM（Z.ai）(`zai-login`) | ✅ | ✅ | ✅ | **OAuth 免 API key**,走你的 GLM Coding Plan 订阅额度;`api.z.ai/api/anthropic` Anthropic Messages wire + ZCode 指纹头;provider 配置内 OAuth 登录(免 key)+ GLM Coding Plan 额度显示 |
 | GLM（BigModel）(`bigmodel-login`) | ✅ | ✅ | ✅ | **OAuth 免 API key**,走你的 GLM Coding Plan 订阅额度;`open.bigmodel.cn/api/anthropic` Anthropic Messages wire + ZCode 指纹头;provider 配置内 OAuth 登录(免 key)+ GLM Coding Plan 额度显示 |
@@ -164,7 +164,7 @@ Codex 的 `low/medium/high/xhigh` 在各 chat-completions 上游的处理方式(
 
 ## 模型映射
 
-Codex APP 按 OpenAI 模型名提示;第三方 provider 用 `deepseek-v4-pro` / `kimi-k2.6` / `glm-5.1` / `gemini-3-pro` 等真实 ID。
+Codex APP 按 OpenAI 模型名提示;第三方 provider 用 `deepseek-v4-pro` / `kimi-k2.7` / `glm-5.2` / `gemini-3-pro` 等真实 ID。
 
 供应商配置页的「在 Codex 中显示的模型」直接列出你想在 Codex 模型选择器看到的真实模型(最多 5 个):**第一个是默认模型、新对话直接用它**,后端自动把它们映射到 Codex 槽位(`gpt-5.5` / `gpt-5.4` / …),无需手动指定槽位。Codex APP 模型选择器里看到的就是你列的真实模型名,数量与你的配置一致(不再有"默认占满"导致的占位重复模型,MOC-154)。上游 `chatcmpl-...` 应答 ID 自动重写为 Codex APP 校验通过的 `resp_<base64>`,保留 deployment affinity 编码,`previous_response_id` 跨轮一致。
 

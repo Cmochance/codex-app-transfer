@@ -140,7 +140,7 @@ macOS builds are **not yet signed with an Apple Developer ID** and **not yet Not
 | Anthropic Messages (custom Claude-compatible) | ✅ (PR #153) | ✅ (PR #153) | ✅ (PR #153) | `apiFormat=anthropic_messages`; Claude preset pending real validation |
 | Grok Web (SuperGrok / X Premium+) | ✅ | ✅ | ✅ (v2.1.6 adds tool_calls flatten) | Experimental, TOS gray area, personal use only |
 | Google Antigravity OAuth | ✅ | ✅ | ✅ | Backend ready, UI pending; gemini family context 1M (suffixed ids previously fell back to 258k, MOC-221); **native image_gen support** (MOC-210; gemini-3.1-flash-image by default, overridable via the `gpt-image-1` model slot) |
-| Zhipu GLM (5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy |
+| Zhipu GLM (5.2 / 5.1 / 4.7) | ✅ | ✅ | ✅ | OpenAI Chat-compatible reverse proxy; 5.2 is 1M context |
 | Zhipu GLM Coding (4.7 / 4.6) | ✅ | ✅ | ✅ | GLM Coding Plan subscription endpoint (`/api/coding/paas/v4`); full ZCode fingerprint headers (incl. runtime `X-Platform`) injected at the proxy code layer, fully aligned with the OAuth login path for the Coding Plan 150% quota bonus |
 | GLM (Z.ai) (`zai-login`) | ✅ | ✅ | ✅ | **OAuth — no API key required**; uses your GLM Coding Plan subscription quota; `api.z.ai/api/anthropic` Anthropic Messages wire + ZCode fingerprint headers; in-app OAuth login (no key) + GLM Coding Plan quota display |
 | GLM (BigModel) (`bigmodel-login`) | ✅ | ✅ | ✅ | **OAuth — no API key required**; uses your GLM Coding Plan subscription quota; `open.bigmodel.cn/api/anthropic` Anthropic Messages wire + ZCode fingerprint headers; in-app OAuth login (no key) + GLM Coding Plan quota display |
@@ -165,7 +165,7 @@ How Codex's `low/medium/high/xhigh` is dispatched per chat-completions upstream 
 
 ## Model mapping
 
-Codex App prompts by OpenAI model names; third-party providers use real IDs like `deepseek-v4-pro` / `kimi-k2.6` / `glm-5.1` / `gemini-3-pro`.
+Codex App prompts by OpenAI model names; third-party providers use real IDs like `deepseek-v4-pro` / `kimi-k2.7` / `glm-5.2` / `gemini-3-pro`.
 
 This tool maps via `provider.models[slot]` (`gpt-5.5` → `deepseek-v4-pro` etc.); Codex App's model picker shows `<provider> / <real-model>` real names. Upstream `chatcmpl-...` response IDs are auto-rewritten to Codex App-validatable `resp_<base64>`, preserving deployment-affinity encoding so `previous_response_id` is consistent across turns.
 

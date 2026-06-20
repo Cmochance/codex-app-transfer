@@ -98,14 +98,6 @@ pub fn build_app_router(state: AdminState) -> Router {
             post(handlers::providers::crud::save_draft),
         )
         .route(
-            "/api/providers/{id}/test",
-            post(handlers::providers::test::test_provider),
-        )
-        .route(
-            "/api/providers/{id}/usage",
-            post(handlers::providers::balance::query_provider_usage),
-        )
-        .route(
             "/api/providers/{id}/models",
             put(handlers::providers::crud::update_models),
         )
@@ -116,10 +108,6 @@ pub fn build_app_router(state: AdminState) -> Router {
         .route(
             "/api/providers/{id}/models/autofill",
             post(handlers::providers::models::autofill_provider_models),
-        )
-        .route(
-            "/api/providers/compatibility",
-            get(handlers::providers::test::provider_compatibility),
         )
         .route(
             "/api/providers/test",
