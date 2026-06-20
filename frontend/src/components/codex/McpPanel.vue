@@ -249,7 +249,7 @@ async function backupServers() {
   if (!(await confirm(t('codex.backupConfirm')))) return
   try {
     await codexApi.backupMcpServers()
-    toast(t('codex.agentsBackupOk'))
+    toast(tFmt('codex.docBackupOk', { doc: t('codex.mcp.servers') }))
   } catch (e) {
     toast((e as Error).message || t('toast.requestFailed'), 'error')
   }
@@ -267,10 +267,11 @@ async function openServersHistory() {
   }
 }
 async function onHistoryRestore(index: number) {
-  if (!(await confirm({ message: t('codex.agentsRestoreConfirm'), danger: true }))) return
+  if (!(await confirm({ message: tFmt('codex.docRestoreConfirm', { doc: t('codex.mcp.servers') }), danger: true })))
+    return
   try {
     await codexApi.restoreMcpServers(index)
-    toast(t('codex.agentsRestoreOk'))
+    toast(tFmt('codex.docRestoreOk', { doc: t('codex.mcp.servers') }))
     showHistory.value = false
     await reloadServers()
   } catch (e) {

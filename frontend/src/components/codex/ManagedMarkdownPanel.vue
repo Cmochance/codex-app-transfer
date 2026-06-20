@@ -143,7 +143,7 @@ async function onApply() {
     return
   try {
     await codexApi.saveManagedRaw(props.resource, currentHash.value, editDraft.value)
-    toast(t('codex.agentsApplyOk'))
+    toast(tFmt('codex.docApplyOk', { doc: features.value.docName }))
     await rawLoad()
   } catch (e) {
     toast((e as Error).message || t('toast.requestFailed'), 'error')
@@ -157,7 +157,7 @@ async function onBackup() {
   if (!(await confirm(t('codex.backupConfirm')))) return
   try {
     await codexApi.backupManaged(props.resource, currentHash.value)
-    toast(t('codex.agentsBackupOk'))
+    toast(tFmt('codex.docBackupOk', { doc: features.value.docName }))
   } catch (e) {
     toast((e as Error).message || t('toast.requestFailed'), 'error')
   }
@@ -286,10 +286,11 @@ async function openHistory() {
 }
 
 async function onHistoryRestore(index: number) {
-  if (!(await confirm({ message: t('codex.agentsRestoreConfirm'), danger: true }))) return
+  if (!(await confirm({ message: tFmt('codex.docRestoreConfirm', { doc: features.value.docName }), danger: true })))
+    return
   try {
     await codexApi.restoreManagedRaw(props.resource, currentHash.value, index)
-    toast(t('codex.agentsRestoreOk'))
+    toast(tFmt('codex.docRestoreOk', { doc: features.value.docName }))
     showHistory.value = false
     await rawLoad()
   } catch (e) {
