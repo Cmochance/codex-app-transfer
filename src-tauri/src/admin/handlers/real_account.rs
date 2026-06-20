@@ -31,9 +31,7 @@ pub async fn status_handler() -> impl IntoResponse {
         "success": true,
         "message": message,
         "status": status,
-        // [MOC-178] 真实账号模式持久开关(用户意图)+ 活动是否真 chatgpt(relay 此刻是否真生效)。
-        // 前端据 mode_enabled 派生 toggle(不再用 logged_in),据 active_is_chatgpt 判 relay 实效。
-        "mode_enabled": super::settings::read_real_account_mode_enabled(),
+        // 活动是否真 chatgpt(relay 此刻是否真生效)。
         "active_is_chatgpt": codex_real_account::active_is_real_chatgpt_now(),
         "login": codex_real_account::login_status(),
     }))

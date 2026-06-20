@@ -483,18 +483,9 @@ pub async fn save_settings(Json(input): Json<Value>) -> impl IntoResponse {
     }
 }
 
-/// [MOC-178] 真实账号模式持久开关(用户意图)。三态:键缺失=未设(走迁移)/ true=开 / false=
-/// 用户主动关。**独立于活动 auth.json、不被退出 restore 撤销** —— 解决「清除后重启又自动开」。
-/// 跟 `autoUnlockCodexPlugins`(无账号时的强制 CDP daemon 档)是两个独立开关。
-pub fn read_real_account_mode_enabled() -> Option<bool> {
-    crate::admin::registry_io::load().ok().and_then(|cfg| {
-        cfg.get("settings")
-            .and_then(|s| s.get("realAccountModeEnabled"))
-            .and_then(Value::as_bool)
-    })
-}
-
-/// [MOC-178] 写真实账号模式开关。toggle on / off / forget 都经这里落持久意图。
+/// [MOC-178] 写真实账号模式持久开关键 `realAccountModeEnabled`。三态:键缺失=未设(走迁移)/
+/// true=开 / false=用户主动关。**独立于活动 auth.json、不被退出 restore 撤销**。现仅
+/// `pin_current_handler` 写 + `migrate_plugin_unlock_mode_v1` 读(旧布尔 → `pluginUnlockMode` 一次性迁移)。
 pub fn set_real_account_mode_enabled(enabled: bool) -> bool {
     with_config_write(|cfg| {
         ensure_settings_object(cfg)
