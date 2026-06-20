@@ -87,11 +87,38 @@ fn has_cwd_candidate(primary: Option<&str>) -> bool {
     primary.map(|c| !c.is_empty()).unwrap_or(false) || !recall_cwd_candidates().is_empty()
 }
 
-/// 按候选 cwd 解析并读取 patch 目标文件(MOC-263 P1)。`primary`(当前请求 cwd,apply_patch
-/// 请求通常 None)优先,再按最近 cwd 历史逐个试,返回**第一个存在且可读**的 `(绝对路径, 内容)`。
-/// 绝对路径直接读。命中错 cwd 的同名文件最坏让调用方锚点匹配失败 → 安全 skip,不会误改。
-/// 单测里调用方传 `Some(<真实 tmp cwd>)` → primary 优先命中、不依赖全局历史 → 确定性。
-fn read_patch_file(relpath: &str, primary: Option<&str>) -> Option<(PathBuf, String)> {
+/// patch section 的「锚点 probe」:context(` `)/ 删除(`-`)行去前缀 + `@@ <header>` 的 header 文本。
+/// 这些是**目标文件里应当存在的行**,用于 [`read_patch_file`] 在多个同名候选间挑出 patch 真正针对的文件。
+fn anchor_probe<'a>(body: &[&'a str]) -> Vec<&'a str> {
+    let mut probe = Vec::new();
+    for l in body {
+        match l.chars().next() {
+            Some(' ') | Some('-') => probe.push(&l[1..]),
+            _ => {
+                if let Some(h) = l.strip_prefix("@@ ") {
+                    let h = h.trim();
+                    if !h.is_empty() {
+                        probe.push(h);
+                    }
+                }
+            }
+        }
+    }
+    probe
+}
+
+/// 按候选 cwd 解析并读取 patch 目标文件(MOC-263 P1 + P2)。`primary`(当前请求 cwd,apply_patch
+/// 请求通常 None)优先,再按最近 cwd 历史逐个试。`probe` = patch 的 context/删除锚点行内容
+/// ([`anchor_probe`]):多个候选 cwd 都存在同名相对文件时(并发会话共享 `README.md`/`package.json`
+/// 等),**选内容里命中最多 probe 锚点行的候选**(= patch 真正针对的文件),而非取第一个可读的
+/// (chatgpt-codex-connector review P2:取第一个会对错文件对齐)。所有候选 probe 命中均为 0 → 没有
+/// 候选是目标 → 返回 None(skip,安全)。`probe` 为空(纯新增 patch 无锚点)→ 退回第一个可读
+/// (无从判别、最好努力)。绝对路径直接读。
+fn read_patch_file(
+    relpath: &str,
+    primary: Option<&str>,
+    probe: &[&str],
+) -> Option<(PathBuf, String)> {
     let p = Path::new(relpath);
     if p.is_absolute() {
         return std::fs::read_to_string(p)
@@ -109,13 +136,47 @@ fn read_patch_file(relpath: &str, primary: Option<&str>) -> Option<(PathBuf, Str
             candidates.push(c);
         }
     }
+    // 读出所有存在的候选(保持 most-recent-first 顺序)。
+    let mut readable: Vec<(PathBuf, String)> = Vec::new();
     for c in &candidates {
         let abs = Path::new(c).join(p);
         if let Ok(content) = std::fs::read_to_string(&abs) {
-            return Some((abs, content));
+            readable.push((abs, content));
         }
     }
-    None
+    if readable.is_empty() {
+        return None;
+    }
+    // 用 trim()(忽略首尾空白)比对:patch 锚点常比文件差几个前导/尾随空格(正是 preflight 要对齐的
+    // 漂移),exact 比会漏判;trim 对 P2 区分仍足够(真/stale 文件内容不同则区分得开,仅空白差异则
+    // 选谁对齐结果都一样)。
+    let probe_lines: Vec<&str> = probe
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if probe_lines.is_empty() {
+        // 无锚点可判别(纯新增 patch)→ 第一个可读(most-recent)。
+        return readable.into_iter().next();
+    }
+    // 选 probe 锚点行命中最多的候选(= patch 真正针对的文件);并列取最 recent(顺序在前)。
+    let mut best_idx = 0usize;
+    let mut best_score = -1i64;
+    for (i, (_abs, content)) in readable.iter().enumerate() {
+        let file_lines: Vec<&str> = content.lines().map(str::trim).collect();
+        let score = probe_lines
+            .iter()
+            .filter(|pl| file_lines.contains(pl))
+            .count() as i64;
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    if best_score <= 0 {
+        return None; // 没有候选含任何锚点 → 都不是目标文件 → skip(安全)
+    }
+    Some(readable.swap_remove(best_idx))
 }
 
 /// 从 Codex Responses 请求里抽 `<cwd>...</cwd>`(Codex 注入的 environment_context 块,
@@ -358,8 +419,13 @@ fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     let mut i = 0;
     while i < lines.len() {
         if let Some(path) = lines[i].strip_prefix("*** Update File: ") {
-            // 切到新 Update File section → 载入该文件行(MOC-263:按候选 cwd 解析)
-            file_lines = read_patch_file(path.trim(), cwd)
+            // 切到新 Update File section → 按候选 cwd + 锚点 probe 解析目标文件(MOC-263 P1/P2)
+            let mut se = i + 1;
+            while se < lines.len() && !lines[se].starts_with("*** ") {
+                se += 1;
+            }
+            let probe = anchor_probe(&lines[i + 1..se]);
+            file_lines = read_patch_file(path.trim(), cwd, &probe)
                 .map(|(_, c)| c.lines().map(str::to_owned).collect())
                 .unwrap_or_default();
             have_file = !file_lines.is_empty();
@@ -637,7 +703,13 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
         let l = lines[i];
         if let Some(path) = l.strip_prefix("*** Update File: ") {
             in_update = true;
-            file_lines = read_patch_file(path.trim(), cwd)
+            // 按候选 cwd + 锚点 probe 解析目标文件(MOC-263 P1/P2)。
+            let mut se = i + 1;
+            while se < lines.len() && !lines[se].starts_with("*** ") {
+                se += 1;
+            }
+            let probe = anchor_probe(&lines[i + 1..se]);
+            file_lines = read_patch_file(path.trim(), cwd, &probe)
                 .map(|(_, c)| c.lines().map(str::to_owned).collect())
                 .unwrap_or_default();
             out.push(l.to_owned());
@@ -852,7 +924,8 @@ fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a
 /// 修复一个 `Update File` section 的 body。`path` 是 patch 里的(相对)路径。
 /// `cwd` 是当前请求 cwd(primary hint),读盘经 [`read_patch_file`] 再按候选历史解析(MOC-263)。
 fn repair_update_section(path: &str, body: &[&str], cwd: Option<&str>) -> (Vec<String>, Repair) {
-    let Some((_abs, content)) = read_patch_file(path, cwd) else {
+    let probe = anchor_probe(body);
+    let Some((_abs, content)) = read_patch_file(path, cwd, &probe) else {
         return (
             body.iter().map(|l| (*l).to_owned()).collect(),
             Repair {
@@ -1527,7 +1600,7 @@ mod tests {
         assert!(has_cwd_candidate(None), "有候选历史 → true");
         // primary=None(apply_patch 工具循环请求),真实 cwd 在候选里 → 读到文件
         // (stale cwd 无此文件,逐个试时自动跳过)。这是 P1 的核心:不再被 stale 单槽废掉。
-        let got = read_patch_file(&name, None);
+        let got = read_patch_file(&name, None, &["x"]);
         assert!(got.is_some(), "应经候选 cwd 读到文件");
         assert_eq!(got.unwrap().1, "x\n");
         // turn-start 请求抽 cwd 入候选(供后续 apply_patch 回退)。
@@ -1536,6 +1609,31 @@ mod tests {
         assert!(recall_cwd_candidates()
             .iter()
             .any(|c| c == "/tmp/ts_proj_b3f9"));
+    }
+
+    #[test]
+    fn read_patch_file_picks_by_probe_not_first_readable() {
+        // MOC-263 P2(chatgpt-codex-connector review):并发会话共享相对路径(README.md 等)、且 stale
+        // 会话更新时,按 patch 锚点 probe 选**真正含锚点的候选**,而非取队首(most-recent=stale)可读的。
+        let stale = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(stale.path().join("shared_moc263.txt"), "stale_only_line\n").unwrap();
+        std::fs::write(
+            real.path().join("shared_moc263.txt"),
+            "real_anchor_line\nmore\n",
+        )
+        .unwrap();
+        // 真实 cwd 先记、stale 后记 → stale 在候选队首(most-recent),模拟 review 担心的场景。
+        remember_cwd(real.path().to_str().unwrap());
+        remember_cwd(stale.path().to_str().unwrap());
+        // probe 命中 real(含 real_anchor_line)、不命中 stale → 应选 real,不取队首 stale。
+        let got = read_patch_file("shared_moc263.txt", None, &["real_anchor_line"]);
+        assert!(got.is_some(), "应选到含锚点的候选");
+        assert_eq!(
+            got.unwrap().1,
+            "real_anchor_line\nmore\n",
+            "应选 real(含 probe 锚点)而非队首 stale"
+        );
     }
 
     #[test]
