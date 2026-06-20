@@ -53,6 +53,15 @@ pub(crate) fn prepare_responses_request(
     }
 
     let upstream_path = routes::redirect_responses_to_chat(client_path);
+    // 空 / 纯空白请求体:Codex reconnect / warmup 探活落到 HTTP /responses 时会发零字节体,
+    // 裸 serde 报 "expected value at line 1 column 1",经 forward.rs 包成 "proxy adapter error:
+    // bad request: body 不是合法 JSON" 吓人且无指向。给明确人类可读信息(防御性 —— 根因是
+    // 上游错误触发 Codex 反复重连,已由 usage_limit_reached fail-fast 在源头切断)。
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Err(AdapterError::BadRequest(
+            "空请求体:未携带 /responses JSON(通常是连接探活 / warmup 帧,可忽略)".to_owned(),
+        ));
+    }
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| AdapterError::BadRequest(format!("body 不是合法 JSON: {e}")))?;
     let original_responses_request = Some(parsed.clone());
