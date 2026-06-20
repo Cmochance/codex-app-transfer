@@ -645,20 +645,24 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
-/// 末个 `*** Add/Update File:` 操作的目标是否**代码/结构化配置文件**(裸 `*** End Patch` 在其中不可能
-/// 是合法源码的**末行**)。用于 [`ensure_v4a_envelope`] 的歧义终止符判定:代码文件里末行 `+*** End Patch`
-/// 必是模型误加前缀的终止符(可安全剥),文档/文本/未知类型则无法排除是正文(留 incomplete 不猜)。
-/// allowlist(只在确定安全时剥;未知扩展回落保守)。MOC-268,用户拍板「按文件类型剥」。
-fn last_op_target_is_code(body: &str) -> bool {
-    let ext = body.lines().rev().find_map(|l| {
+/// 末个 patch 操作是否为「`*** Add File:` + 代码/结构化配置文件目标」。用于 [`ensure_v4a_envelope`] 判定
+/// 末行 `+*** End Patch` 可否安全剥成终止符:**仅 Add File**(新建文件,裸 `*** End Patch` 不可能是合法
+/// 源码的**末行** → 必是误前缀终止符)才剥;`*** Update File:` 的 `+*** End Patch` 是**新增行**(可能往
+/// 字符串 / fixture 里加这串字),剥了=丢新增 → 不剥(chatgpt-codex-connector review:限定 Add File)。
+/// 文档 / 文本 / 未知扩展也不剥(可能是正文,留 incomplete 不猜)。allowlist 保守。MOC-268。
+fn last_op_is_add_file_code(body: &str) -> bool {
+    let last_op = body.lines().rev().find(|l| {
         let t = l.trim_end();
-        let p = t
-            .strip_prefix("*** Add File: ")
-            .or_else(|| t.strip_prefix("*** Update File: "))?;
-        std::path::Path::new(p.trim())
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
+        t.starts_with("*** Add File: ")
+            || t.starts_with("*** Update File: ")
+            || t.starts_with("*** Delete File: ")
     });
+    let Some(path) = last_op.and_then(|l| l.trim_end().strip_prefix("*** Add File: ")) else {
+        return false; // 无操作,或末操作是 Update/Delete(非 Add File)→ 不剥
+    };
+    let ext = std::path::Path::new(path.trim())
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase());
     matches!(
         ext.as_deref(),
         Some(
@@ -762,7 +766,7 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
         //   · 文档 / 文本 / 未知(可能是正文末行)→ **不猜**:不剥(免删正文)、不追加(免残留),留 incomplete
         //     交下游判截断、模型按 guidance 规则2 重发。prompt 才是根治,中间层只在确定安全时介入。
         if last == "+*** End Patch" {
-            if last_op_target_is_code(&body) {
+            if last_op_is_add_file_code(&body) {
                 let head = &trimmed[..trimmed.len() - last.len()];
                 body = format!("{head}*** End Patch");
                 added.push("End Patch(代码文件·剥误加前缀终止符)");
@@ -1555,6 +1559,26 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn envelope_prefixed_end_not_stripped_for_update_even_code() {
+        // MOC-268(chatgpt-codex-connector review):`*** Update File:` 的 `+*** End Patch` 是**新增行**
+        // (可能往代码文件的字符串/fixture 里加这串字),不是 Add File 的误前缀终止符 → **即便目标是代码
+        // 文件也不剥**(剥了=丢新增),走歧义 → 留 incomplete。剥仅限末操作是 Add File。
+        let body =
+            "*** Begin Patch\n*** Update File: src/foo.rs\n keep\n+*** End Patch".to_string();
+        let (out, rep) = ensure_v4a_envelope(&body);
+        assert_eq!(out, body, "Update 的 +*** End Patch 不应被剥/动:\n{out}");
+        assert!(
+            out.trim_end().ends_with("+*** End Patch"),
+            "新增行应保留:\n{out}"
+        );
+        assert!(
+            !out.trim_end().ends_with("\n*** End Patch"),
+            "不应追加裸终止符:\n{out}"
+        );
+        assert_eq!(rep.unwrap().kind, "skipped:ambiguous_prefixed_end");
     }
 
     #[test]
