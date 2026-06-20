@@ -10,6 +10,7 @@ import {
   themeList,
   themeStatus,
   themeApply,
+  themeClear,
   themeBgProgress,
   themeUploadCustom,
   themeDeleteCustom,
@@ -160,11 +161,18 @@ watch(enabledModel, async (on) => {
   } else {
     try {
       await store.save({ codexUiThemeEnabled: false })
-      toast(t('theme.disabledPendingRestart'))
     } catch (e) {
       setEnabled(true)
       toast(`${t('theme.saveFailed')}: ${errMsg(e)}`, 'error')
       return
+    }
+    // [MOC-261 一-12] 与 ON 的 apply 对称:落盘后 best-effort 立即 CDP 清除已注入主题。
+    // 成功 → 即时关闭;失败(Codex 未经本工具启动 / 调试端口不可用)→ 回退「等重启移除」。
+    try {
+      await themeClear()
+      toast(t('theme.disabledToast'))
+    } catch {
+      toast(t('theme.disabledPendingRestart'))
     }
   }
   await refreshBadge()

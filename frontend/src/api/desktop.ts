@@ -31,6 +31,11 @@ export function themeStatus() {
 export function themeApply(themeId: string) {
   return api('POST', '/api/desktop/theme/apply', { theme_id: themeId })
 }
+// [MOC-261 一-12] 实时清除已注入主题(CDP),回原生 Codex UI。与 themeApply 对称:关闭开关时
+// best-effort 立即移除(Codex 未在 CDP 控制下则失败,由调用方回退「等重启移除」)。
+export function themeClear() {
+  return api('POST', '/api/desktop/theme/clear')
+}
 // 背景全图 on-demand 下载进度(apply 期间轮询,渲染缩略图进度环 + 白蒙版)。
 // downloading:false = 已缓存 / 未触发 / 下载结束。
 export interface ThemeBgProgress {

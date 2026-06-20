@@ -81,6 +81,7 @@ export default {
   "theme.clearFailed": "Clear failed",
   "theme.loadFailed": "Failed to load theme list",
   "theme.disabledPendingRestart": "Disabled. The applied theme will be removed after Codex restarts.",
+  "theme.disabledToast": "Theme turned off",
   "theme.savedTitle": "Theme preference saved",
   "theme.savedPendingRestart": "Codex isn't running via this tool (or its debug port is unavailable); the theme will take effect after Codex restarts.",
   "theme.savedPendingRestartToast": "Saved. The theme will take effect after Codex restarts.",

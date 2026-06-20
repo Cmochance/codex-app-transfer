@@ -84,6 +84,7 @@ export default {
   "theme.clearFailed": "清除失败",
   "theme.loadFailed": "主题列表加载失败",
   "theme.disabledPendingRestart": "已关闭,主题将在 Codex 重启后移除",
+  "theme.disabledToast": "已关闭主题",
   "theme.savedTitle": "主题偏好已保存",
   "theme.savedPendingRestart":
     "当前 Codex 未通过本工具启动或调试端口不可用,主题将在 Codex 重启后生效。",
