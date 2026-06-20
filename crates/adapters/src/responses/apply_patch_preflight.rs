@@ -815,6 +815,22 @@ fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a
         return None; // 单段(或全因空行间隙合并成单段)→ 没必要切,交回常规路径
     }
 
+    // [MOC-263 P0 安全防护] 段间「浮动 `+` 插入行」歧义:若前段末锚点与后段首锚点之间存在 `+` 新增行,
+    // 且**前段末锚点是 context(非 `-` 删除)**,则该 `+` 的落点不确定 —— 可能是前段末尾的插入,也可能
+    // 是模型写给后段的「引入行」(如 `+@memoize` 紧贴下一组的 `def beta():`)。两种归属在真实文件里落点
+    // 不同(段间隔着非空行)→ 贸然切会猜错落点、产生**静默错误 apply**(违反不猜不丢)。故放弃整次分段、
+    // 原样透过。注:紧跟 `-` 删除的 `+`(替换行,如 seg1 的 `-old`/`+new`)归前段是确定语义,不触发此防护。
+    for gi in 0..groups.len() - 1 {
+        let last_anchor_line = anchors[groups[gi].1 - 1].0;
+        let next_anchor_line = anchors[groups[gi + 1].0].0;
+        let gap_has_add = body[last_anchor_line + 1..next_anchor_line]
+            .iter()
+            .any(|l| l.starts_with('+'));
+        if gap_has_add && !body[last_anchor_line].starts_with('-') {
+            return None;
+        }
+    }
+
     // 段 g 的 body 行区间:首段含开头前导行(body[0..首锚点]);其余段从其首锚点起,
     // 到下一段首锚点止 → 段内 / 段后的 `+` 行随**前**段保留。
     let mut subhunks: Vec<Vec<&'a str>> = Vec::new();
@@ -1584,6 +1600,27 @@ mod tests {
             format!("*** Begin Patch\n*** Update File: {name}\n-x\n+X\n-y\n+Y\n*** End Patch\n");
         let (out, _reps) = preflight_repair(&v4a, Some(cwd));
         assert!(!out.contains("\n@@\n"), "歧义不应切:\n{out}");
+    }
+
+    #[test]
+    fn floating_add_after_context_passthrough_not_misplaced() {
+        // MOC-263 P0 安全防护:`+` 浮动在两不连续区域之间、前段末锚点是 context(非 `-` 删除)→ 落点
+        // 歧义(可能属前段尾插、也可能是后段引入行)→ 不切(否则会把 +@memoize 插到错位置、静默错误
+        // apply)。这是 pre-push review 抓到的 BLOCKER 回归点。
+        let content =
+            "def alpha():\n    return 1\n# --- section break ---\ndef beta():\n    return 2\n";
+        let (dir, name) = tmp_file("deco.py", content);
+        let cwd = dir.path().to_str().unwrap();
+        // 模型以为 `return 1` 与 `def beta():` 相邻、在中间加 +@memoize;实际隔着 section break。
+        let v4a = format!(
+            "*** Begin Patch\n*** Update File: {name}\n     return 1\n+@memoize\n def beta():\n*** End Patch\n"
+        );
+        let (out, _reps) = preflight_repair(&v4a, Some(cwd));
+        assert!(
+            !out.contains("\n@@\n"),
+            "浮动 + 落点歧义不应切段(防静默错误 apply):\n{out}"
+        );
+        assert!(out.contains("+@memoize"), "内容不丢");
     }
 
     #[test]
