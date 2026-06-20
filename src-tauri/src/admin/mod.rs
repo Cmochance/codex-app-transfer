@@ -376,23 +376,8 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/codex/memories-md/restore-raw",
             post(handlers::memories_md::restore_raw),
         )
-        // Skills file-snapshot backup / restore (#24 #25 PR-B)
-        .route(
-            "/api/codex/skills/list",
-            get(handlers::skills::list_handler),
-        )
-        .route(
-            "/api/codex/skills/backup",
-            post(handlers::skills::backup_handler),
-        )
-        .route(
-            "/api/codex/skills/backups",
-            get(handlers::skills::backups_handler),
-        )
-        .route(
-            "/api/codex/skills/restore",
-            post(handlers::skills::restore_handler),
-        )
+        // [MOC-261 一-9] Skills 目录级 tar.gz 快照(/skills/{list,backup,backups,restore})已删:
+        // 前端未接 + 单文件 SKILL.md 备份(下面 skills-md)已覆盖常用需求,按死代码移除。
         // Skills SKILL.md raw 编辑 + 打开文件夹(新)
         .route(
             "/api/codex/skills-md/paths",
