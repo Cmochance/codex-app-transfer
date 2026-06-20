@@ -682,6 +682,27 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
     }
     if !has_end {
         let trimmed = body.trim_end();
+        // [MOC-268] 末行是**带前缀的** `*** End Patch`(`+`/` `/`-` + `*** End Patch`)时:这**歧义**。
+        // 模型给 Add File 每行加 `+` 时常把终止符也误写成 `+*** End Patch`(此时该剥前缀当终止符);但它
+        // 也可能是文件**正文**最后一行恰好就是字面 `*** End Patch`(如 V4A 文档 / 测试 fixture —— 本仓
+        // 就有)、而模型漏了真终止符(此时它是正文,不能动)。两种从 patch **无法区分**。
+        // 不猜不丢:既不剥前缀(后者会**静默删掉正文最后一行**=破坏性降级)、也不追加裸 `*** End Patch`
+        // (前者会**留残留行**进新建文件),而是**不补全** → 保持无列 0 终止符,交下游 `detect_v4a_truncation`
+        // 判 incomplete、让模型按注入 guidance 规则2(终止符不加前缀)重发明确 patch。prompt 才是 A 的根治;
+        // 中间层只负责不静默猜错。
+        let last = trimmed.lines().last().unwrap_or("");
+        if matches!(last, "+*** End Patch" | " *** End Patch" | "-*** End Patch") {
+            return (
+                body,
+                Some(Repair {
+                    file: "(envelope)".to_owned(),
+                    kind: "skipped:ambiguous_prefixed_end".to_owned(),
+                    detail:
+                        "末行为带前缀的 *** End Patch(误前缀终止符 / 正文歧义)→ 不猜不补全,留 incomplete 交模型重发"
+                            .to_owned(),
+                }),
+            );
+        }
         body = format!("{trimmed}\n*** End Patch");
         added.push("End Patch");
     }
@@ -1381,6 +1402,30 @@ mod tests {
         assert_eq!(out.matches("*** Begin Patch").count(), 1, "不重复加 Begin");
         assert!(out.trim_end().ends_with("*** End Patch"));
         assert!(rep.unwrap().detail.contains("End Patch"));
+    }
+
+    #[test]
+    fn envelope_ambiguous_prefixed_end_left_incomplete() {
+        // MOC-268(silent-failure review):末行是带前缀的 `*** End Patch` 时歧义 —— 可能是模型误前缀的
+        // 终止符,也可能是文件正文最后一行恰好就是字面 `*** End Patch`(本仓 V4A 文档/fixture 就有)+ 漏真
+        // 终止符。不猜不丢:既不剥(会删正文)、也不追加裸 End(会留残留)→ **不补全**,保持无列 0 终止符、
+        // 交下游判 incomplete。验证:① `+*** End Patch` 正文行**原样保留**(零内容丢失);② **没有**追加
+        // 列 0 裸终止符(零残留);③ repair 标 skipped:ambiguous。
+        for last in ["+*** End Patch", " *** End Patch", "-*** End Patch"] {
+            let body = format!("*** Begin Patch\n*** Add File: x\n+a\n+b\n{last}");
+            let (out, rep) = ensure_v4a_envelope(&body);
+            assert_eq!(out, body, "歧义末行应原样保留、不动 (last={last}):\n{out}");
+            assert!(
+                out.trim_end().ends_with(last),
+                "末行带前缀终止符应原样保留(不剥=不删正文)(last={last}):\n{out}"
+            );
+            assert!(
+                !out.trim_end().ends_with("\n*** End Patch"),
+                "不应追加列 0 裸终止符(不追加=不留残留)(last={last}):\n{out}"
+            );
+            let r = rep.unwrap();
+            assert_eq!(r.kind, "skipped:ambiguous_prefixed_end", "last={last}");
+        }
     }
 
     #[test]

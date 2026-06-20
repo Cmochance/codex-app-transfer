@@ -217,6 +217,37 @@ fn starts_with_reader(s: &str) -> bool {
     ) || (has_word(s, "sed") && t.contains(" -n"))
 }
 
+/// 首 token 是否抓取/下载类(gh/curl/wget)。这类 `>` 写的是**下载产物**(如 `gh api … > x.tar.gz`、
+/// `curl … > f`),不是编辑源码 → 排除出 `redirect_write`,避免把下载误计成「绕过 apply_patch 编辑」
+/// (MOC-268:phase-2 shell_edit 误报口径修正)。
+fn starts_with_fetch(s: &str) -> bool {
+    let first = s
+        .trim_start()
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .unwrap_or("");
+    matches!(first, "gh" | "curl" | "wget")
+}
+
+/// 重定向目标是否归档/压缩产物(`*.tar.gz`/`.tgz`/`.zip`/`.gz`/`.bz2`/`.xz`/`.tar`)。这类是下载/打包
+/// 产物而非源码 → 排除出 `redirect_write`(MOC-268)。
+fn redirect_target_is_artifact(s: &str) -> bool {
+    let Some(pos) = s.find('>') else {
+        return false;
+    };
+    let target = s[pos + 1..]
+        .trim_start()
+        .trim_start_matches('>') // 容忍 `>>` 追加
+        .trim_start()
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c| c == '"' || c == '\'');
+    [".tar.gz", ".tgz", ".zip", ".gz", ".bz2", ".xz", ".tar"]
+        .iter()
+        .any(|ext| target.ends_with(ext))
+}
+
 /// 识别 shell 串里的「写盘 / 改文件」操作(MOC-263 P3 诊断用)。返回命中的种类(可多个);
 /// 纯只读(git/ls/grep/cargo/cat 读 等)返回空。宁可少报不滥报:只认明确的写盘形态。
 pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
@@ -267,8 +298,13 @@ pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
             push("tee_write", &mut kinds);
         } else if has_word(s, "truncate") {
             push("truncate", &mut kinds);
-        } else if redirects_to_file(s) && !starts_with_reader(s) {
-            // echo>/cat>/printf> 及通用 `prog > file`(已排除 awk/grep/sed -n 等只读左侧)。
+        } else if redirects_to_file(s)
+            && !starts_with_reader(s)
+            && !starts_with_fetch(s)
+            && !redirect_target_is_artifact(s)
+        {
+            // echo>/cat>/printf> 及通用 `prog > file`(已排除 awk/grep/sed -n 等只读左侧、
+            // gh/curl/wget 下载、归档产物目标 —— 见 MOC-268 shell_edit 误报口径修正)。
             push("redirect_write", &mut kinds);
         }
     }
@@ -667,6 +703,21 @@ mod tests {
         assert!(classify_shell_write("python3 train.py --epochs 3").is_empty());
         assert!(classify_shell_write("ls -la && find . -type f").is_empty());
         assert!(classify_shell_write("cat file.rs").is_empty());
+        // [MOC-268] 下载/抓取(gh/curl/wget)+ 归档产物目标 → 不计 redirect_write(phase-2 误报口径修正)。
+        assert!(
+            classify_shell_write("cd /tmp && gh api repos/o/r/tarball/main > sda.tar.gz 2>/dev/null && tar xzf sda.tar.gz")
+                .is_empty(),
+            "gh 下载 tarball 不应计 redirect_write"
+        );
+        assert!(classify_shell_write("curl -sL https://x/y.zip > y.zip").is_empty());
+        assert!(classify_shell_write("wget https://x/f -O out > log.txt").is_empty());
+        assert!(
+            classify_shell_write("python3 render.py > /tmp/w/plot.tar.gz").is_empty(),
+            "归档产物目标不计(即便左侧非下载)"
+        );
+        // 真源码写盘仍命中(回归保护:别因排除矫枉过正漏掉真编辑)。
+        assert!(classify_shell_write("echo 'x' > src/real.rs").contains(&"redirect_write"));
+        assert!(classify_shell_write("printf 'a' > config.toml").contains(&"redirect_write"));
     }
 
     #[test]
