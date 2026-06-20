@@ -169,31 +169,28 @@ fn extract_upstream_error_message(body_text: &str) -> Option<String> {
 /// `codex_retry_code` doc 的 MOC-79 教训);宁可漏判(继续 Retryable)也不误判。
 /// 触发样本:GLM Coding `code 1308`「已达到 N 小时的使用上限。您的限额将在 … 重置。」。
 ///
-/// 核心原则:**只要上游消息明确叫客户端「稍后/按节流重试」**(per-minute / RPM /
-/// retry-after / 每分钟 / 稍后重试 / 过于频繁 / 并发),就**一律保持可重试**,不论措辞
-/// 是否含"使用上限 / usage limit / quota"等耗尽词——这是 per-minute 瞬时限流,退避后
-/// 能成功(MOC-79 误杀教训)。该 `says_retry_soon` 守卫对中英全部信号生效(MOC-264 bot
-/// review,英文 per-minute/retry-after/RPM + 中文「每分钟使用上限」四轮收紧后的根治)。
+/// 瞬时 vs 耗尽的判据分两类标记,**别混用**(MOC-264 bot review 五轮收敛):
+/// - **THROTTLE 专属**(无歧义瞬时,退避后能成功):per-minute / RPM / per-second /
+///   每分钟 / 每秒 / 过于频繁 / 并发。命中即**一律保持可重试**(即便措辞含"使用上限")。
+/// - **耗尽专属**(永久窗口耗尽):reset / window / quota / credit / balance / 使用上限。
+/// - **模糊的 `retry after` / `try again in` / 稍后重试**:**不作判据** —— 因为既可能是
+///   30s 瞬时,也可能是「resets in 5 小时;try again in 5 小时」的窗口耗尽。把它当瞬时
+///   会把窗口耗尽误判可重试、重新陷入重连循环(bot 第 5 轮反例)。改由耗尽专属标记决定。
 ///
-/// 排除瞬时态后,再认无歧义的「计费/使用窗口耗尽」信号。英文 `usage limit` 仍额外
-/// 要求伴随耗尽专属标记(reset/quota/credit/balance/upgrade/daily/weekly),因泛词
-/// `usage limit` 单独歧义大;中文「使用上限」「余额不足」等本身已无歧义。
-/// 触发样本:GLM Coding `code 1308`「已达到 N 小时的使用上限。您的限额将在 … 重置。」。
+/// 英文裸 `usage limit` 仍额外要求伴随耗尽专属标记(reset/quota/credit/balance/upgrade/
+/// daily/weekly),因其单独歧义大;中文「使用上限」「余额不足」等本身已无歧义。
 fn body_has_usage_limit_signal(body_text: &str) -> bool {
     let lower = body_text.to_ascii_lowercase(); // 关键词均 ASCII;中文 .contains 直接走原文
-    let says_retry_soon = lower.contains("per minute")
+    // 仅 THROTTLE 专属标记算无歧义瞬时;命中即可重试,不再看耗尽词。
+    let throttle_specific = lower.contains("per minute")
         || lower.contains("per-minute")
+        || lower.contains("per second")
         || lower.contains("rpm")
-        || lower.contains("retry after")
-        || lower.contains("retry in")
-        || lower.contains("try again in")
         || body_text.contains("每分钟")
         || body_text.contains("每秒")
-        || body_text.contains("稍后重试")
-        || body_text.contains("请稍后")
         || body_text.contains("过于频繁")
         || body_text.contains("并发");
-    if says_retry_soon {
+    if throttle_specific {
         return false;
     }
     let usage_limit_is_exhaustion = lower.contains("usage limit")
@@ -487,12 +484,22 @@ mod tests {
     #[tokio::test]
     async fn usage_limit_429_chinese_per_minute_stays_retryable() {
         // MOC-264 bot P2 三轮:中文「每分钟使用上限,请稍后重试」是瞬时 per-minute 限流。
-        // says_retry_soon 守卫(每分钟 / 稍后重试)对中文「使用上限」信号同样生效 → 可重试。
+        // throttle_specific 守卫(每分钟)对中文「使用上限」信号同样生效 → 可重试。
         let body = r#"{"error":{"code":"1302","message":"已达到每分钟使用上限,请稍后重试"}}"#;
         let s = drive_error_stream(429, body, "rate_limited", "upstream").await;
         assert!(s.contains(r#""code":"rate_limited""#));
         assert!(!s.contains("usage_limit_reached"));
         assert!(!s.contains("invalid_prompt"));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_429_reset_window_with_try_again_fail_fast() {
+        // MOC-264 bot P2 五轮:模糊的 "try again in 5 hours" 不作瞬时判据——这是重置窗口
+        // 耗尽(带 resets),不是 per-minute throttle。reset 耗尽标记 → fail-fast,不重连。
+        let body = r#"{"error":{"message":"You've reached your usage limit; resets in 5 hours; try again in 5 hours"}}"#;
+        let s = drive_error_stream(429, body, "rate_limited", "upstream").await;
+        assert!(s.contains(r#""code":"invalid_prompt""#));
+        assert!(s.contains(r#""upstream_error_kind":"usage_limit_reached""#));
     }
 
     #[tokio::test]
