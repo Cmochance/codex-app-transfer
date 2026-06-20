@@ -25,6 +25,13 @@ pub struct CodexPaths {
     /// 传播登出删除,绝不写 live);live 整文件缺失时由用户确认后才从镜像恢复,
     /// 使 MCP 授权可恢复、可迁移。MOC-62。
     pub mcp_credentials_mirror: PathBuf,
+    /// MCP 凭据「丢失恢复」状态(`~/.codex-app-transfer/mcp-recovery.json`)。MOC-62 / MOC-261 一-4。
+    ///
+    /// live 整文件被清空(换机 / 误删 / 登出全部)时,镜像里的 server_key 进入「恢复待处理」并
+    /// 记录在此(`server_key` → `{ignored}`)。作用:① 让 [`sync_mcp_credentials`] 把这些 key
+    /// 当「待恢复」保护、**不**当登出从镜像静默清掉(部分恢复后剩余项仍可恢复);② 持久化「已忽略」
+    /// 状态(不再自动弹窗但仍可手动处理)。逐条 restore/remove/ignore 处理完即从中清除。
+    pub mcp_recovery_state: PathBuf,
     /// Legacy single-snapshot path kept for upgrade compatibility.
     pub snapshot_dir: PathBuf,
     pub snapshot_config: PathBuf,
@@ -78,6 +85,7 @@ impl CodexPaths {
             model_catalog_json: app_home.join("config.json"),
             mcp_credentials: codex_home.join(".credentials.json"),
             mcp_credentials_mirror: app_home.join("mcp-credentials.json"),
+            mcp_recovery_state: app_home.join("mcp-recovery.json"),
             snapshot_config: snapshot_dir.join("config.toml"),
             snapshot_auth: snapshot_dir.join("auth.json"),
             snapshot_manifest: snapshot_dir.join("manifest.json"),
@@ -140,6 +148,10 @@ mod tests {
         assert_eq!(
             p.mcp_credentials_mirror,
             PathBuf::from("/x/.codex-app-transfer/mcp-credentials.json")
+        );
+        assert_eq!(
+            p.mcp_recovery_state,
+            PathBuf::from("/x/.codex-app-transfer/mcp-recovery.json")
         );
         assert_eq!(
             p.snapshot_dir,

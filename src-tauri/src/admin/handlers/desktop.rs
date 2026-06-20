@@ -7,9 +7,10 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use codex_app_transfer_codex_integration::{
-    discard_mcp_mirror, get_snapshot_status, has_snapshot, has_stale_active_snapshot,
-    list_snapshots, repair_residual_pollution, restore_codex_snapshot, restore_codex_state,
-    restore_mcp_credentials_from_mirror, scan_residual_pollution, CodexPaths,
+    get_snapshot_status, has_snapshot, has_stale_active_snapshot, ignore_mcp_credentials_keys,
+    list_recovery, list_snapshots, remove_mcp_credentials_keys, repair_residual_pollution,
+    restore_codex_snapshot, restore_codex_state, restore_mcp_credentials_keys,
+    scan_residual_pollution, CodexPaths, RecoveryItem,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -191,36 +192,89 @@ pub async fn desktop_repair_residual(
     }
 }
 
-/// MOC-62:用户在"MCP 凭据文件丢失,从备份恢复?"确认里点**恢复** → 把镜像写回 live。
-/// 仅当 live 仍缺失 / 空时才写(不覆盖已重新授权的 live);返回写回条数。
-pub async fn mcp_credentials_restore() -> impl IntoResponse {
+/// MOC-261 一-4:逐条恢复操作的入参 —— 要处理的 server_key 列表。
+#[derive(Deserialize)]
+pub struct McpRecoveryKeys {
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+/// MOC-62 / 一-4:**选择性恢复** —— 把 body 里的 server_key 从镜像写回 live(不覆盖 live 已有),
+/// 并从恢复状态清除。返回真正写回条数。
+pub async fn mcp_credentials_restore(Json(req): Json<McpRecoveryKeys>) -> impl IntoResponse {
     let paths = match CodexPaths::from_home_env() {
         Ok(p) => p,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    match restore_mcp_credentials_from_mirror(&paths) {
+    match restore_mcp_credentials_keys(&paths, &req.keys) {
         Ok(restored) => Json(json!({"success": true, "restored": restored})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-/// MOC-62:用户点**忽略** → 删镜像,接受"凭据已不在",停止每次启动重复弹确认(非破坏:
-/// live 不动,日后重新授权会重新生成镜像)。
-pub async fn mcp_credentials_discard() -> impl IntoResponse {
+/// MOC-261 一-4:**选择性移除** —— 从镜像 + 恢复状态删除 body 里的 server_key(用户「不要这些备份」)。
+/// 不动 live;镜像清空则删文件。返回删除条数。
+pub async fn mcp_credentials_remove(Json(req): Json<McpRecoveryKeys>) -> impl IntoResponse {
     let paths = match CodexPaths::from_home_env() {
         Ok(p) => p,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    match discard_mcp_mirror(&paths) {
-        Ok(()) => Json(json!({"success": true})).into_response(),
+    match remove_mcp_credentials_keys(&paths, &req.keys) {
+        Ok(removed) => Json(json!({"success": true, "removed": removed})).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-/// MOC-62:前端 load 时轮询 —— 是否有可恢复的 MCP 凭据备份(>0 → 弹恢复确认)。
-/// 比一次性 startup event 可靠(避免 event 在 listener 注册前 emit 丢失)。只读。
+/// MOC-261 一-4:**标记忽略** —— body 里的 server_key 设为已忽略(留备份 + 列表,不再触发自动弹窗)。
+pub async fn mcp_credentials_ignore(Json(req): Json<McpRecoveryKeys>) -> impl IntoResponse {
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    match ignore_mcp_credentials_keys(&paths, &req.keys) {
+        Ok(ignored) => Json(json!({"success": true, "ignored": ignored})).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// MOC-62 / 一-4:前端 load 时轮询 —— 返回逐条待处理恢复项(server_key + 是否已忽略)+ 待处理
+/// (未忽略)条数。`pending>0` → 自动弹窗;设置入口据 `entries` 显示状态。只读(ensure 副作用仅
+/// 写恢复状态文件)。
 pub async fn mcp_credentials_status() -> impl IntoResponse {
-    Json(json!({"restoreAvailable": snapshot::mcp_credentials_restore_status()})).into_response()
+    // 保险箱开关关 → 不提示恢复(尊重用户关闭意图,与旧 mcp_credentials_restore_status gate 一致)。
+    let enabled = load_registry()
+        .ok()
+        .and_then(|c| {
+            c.get("settings")
+                .and_then(|s| s.get("mcpCredentialsPortableStore"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true);
+    if !enabled {
+        return Json(json!({"pending": 0, "restoreAvailable": 0, "entries": []})).into_response();
+    }
+    let paths = match CodexPaths::from_home_env() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // 恢复态不可信(读/写失败)→ 500,前端 refresh 的 catch 会静默不展示弹窗 / 入口,
+    // 避免在状态无法持久化时让用户执行恢复而丢未处理备份(silent-failure 防线)。
+    let items: Vec<RecoveryItem> = match list_recovery(&paths) {
+        Ok(items) => items,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let pending = items.iter().filter(|i| !i.ignored).count();
+    let entries: Vec<Value> = items
+        .iter()
+        .map(|i| json!({"key": i.key, "ignored": i.ignored}))
+        .collect();
+    Json(json!({
+        "pending": pending,
+        // 向后兼容:restoreAvailable 仍 = 待处理(未忽略)条数。
+        "restoreAvailable": pending,
+        "entries": entries,
+    }))
+    .into_response()
 }
 
 pub async fn desktop_snapshot_status() -> impl IntoResponse {
