@@ -1,8 +1,9 @@
 <script setup lang="ts">
 // 路由(转发)页 — 复刻原版布局(Image #8):① 状态条(运行态 + 端口 + 启停)
 // ② 四列统计(总请求/成功/失败/今日) ③ 暗色日志面板(标题行 + 分列 time/level/message)。
-import { onMounted, onUnmounted, ref, watch, nextTick } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch, nextTick } from 'vue'
 import { useProxyStore } from '@/stores/proxy'
+import { getDroppedTools, type DroppedToolsStatus } from '@/api/system'
 import { t } from '@/i18n'
 import { useToast } from '@/composables/useToast'
 import AppSwitch from '@/components/ui/AppSwitch.vue'
@@ -23,13 +24,31 @@ const portInput = ref<number>(18080)
 const autoScroll = ref(true)
 const logsEl = ref<HTMLElement>()
 
+// [MOC-261 一-11] 静默丢弃工具诊断(金丝雀):本进程累计被丢弃的未知 Responses API 工具类型。
+const dropped = ref<DroppedToolsStatus>({ total: 0, by_type: {} })
+const droppedExpanded = ref(false)
+const droppedEntries = computed(() =>
+  Object.entries(dropped.value.by_type).sort((a, b) => b[1] - a[1]),
+)
+async function loadDropped() {
+  try {
+    dropped.value = await getDroppedTools()
+  } catch {
+    /* 诊断信息,失败忽略 */
+  }
+}
+
 onMounted(async () => {
   await store.loadStatus().catch(() => {})
   portInput.value = store.port || 18080
   await store.loadLogs().catch(() => {})
+  loadDropped()
   scrollToBottom()
   timer = window.setInterval(() => {
-    if (store.running) store.loadLogs().catch(() => {})
+    if (store.running) {
+      store.loadLogs().catch(() => {})
+      loadDropped()
+    }
   }, 2000)
 })
 onUnmounted(() => {
@@ -152,6 +171,30 @@ async function onClearLogs() {
         </div>
       </div>
     </div>
+
+    <!-- [MOC-261 一-11] 静默丢弃工具诊断(金丝雀):未知 Responses API 工具类型累计 drop 数 -->
+    <div class="dropped">
+      <template v-if="dropped.total > 0">
+        <button type="button" class="dropped__head" @click="droppedExpanded = !droppedExpanded">
+          <span class="dropped__title">⚠ {{ t('diagnostic.droppedToolsTitle') }}</span>
+          <span class="dropped__count">
+            {{ dropped.total }} {{ t('diagnostic.droppedToolsCalls') }} ·
+            {{ droppedEntries.length }} {{ t('diagnostic.droppedToolsTypes') }}
+          </span>
+          <span class="dropped__toggle">{{ t('diagnostic.droppedToolsExpand') }}</span>
+        </button>
+        <div v-if="droppedExpanded" class="dropped__detail">
+          <p class="dropped__hint">{{ t('diagnostic.droppedToolsHint') }}</p>
+          <ul class="dropped__list">
+            <li v-for="[type, n] in droppedEntries" :key="type">
+              <code>{{ type }}</code>
+              <span>{{ n }} {{ t('diagnostic.droppedToolsCalls') }}</span>
+            </li>
+          </ul>
+        </div>
+      </template>
+      <div v-else class="dropped__none">{{ t('diagnostic.droppedToolsNone') }}</div>
+    </div>
   </div>
 </template>
 
@@ -160,6 +203,67 @@ async function onClearLogs() {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
+}
+
+/* [MOC-261 一-11] 静默丢弃工具诊断 */
+.dropped {
+  font-size: var(--fs-sm);
+}
+.dropped__none {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+.dropped__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--warning-soft, rgba(245, 158, 11, 0.4));
+  border-radius: var(--radius);
+  background: var(--warning-soft, rgba(245, 158, 11, 0.08));
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.dropped__title {
+  font-weight: 600;
+}
+.dropped__count {
+  color: var(--text-secondary);
+}
+.dropped__toggle {
+  margin-left: auto;
+  color: var(--accent);
+  font-size: var(--fs-xs);
+}
+.dropped__detail {
+  margin-top: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+.dropped__hint {
+  margin: 0 0 var(--space-2);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.dropped__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.dropped__list li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.dropped__list code {
+  font-family: var(--font-mono);
 }
 
 /* ① 状态条 */

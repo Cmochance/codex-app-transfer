@@ -290,12 +290,13 @@ export default {
   "dashboard.activeProvider": "当前提供商",
   "dashboard.configureDesktop": "添加并生成配置",
   "dashboard.switchProvider": "切换提供商",
-  "dashboard.droppedToolsTitle": "transfer 静默丢弃了 Responses API 工具",
-  "dashboard.droppedToolsExpand": "查看每个类型计数",
-  "dashboard.droppedToolsHint":
+  "diagnostic.droppedToolsTitle": "transfer 静默丢弃了 Responses API 工具",
+  "diagnostic.droppedToolsExpand": "查看每个类型计数",
+  "diagnostic.droppedToolsHint":
     "这是 transfer adapter 不识别的 Responses API 工具类型(可能 Codex 升级引入了新 type,或第三方客户端发了非 Codex 用的 type)。本进程累计计数,重启归零。如果某 type 计数持续上升,需要在 transfer 加 explicit 适配。",
-  "dashboard.droppedToolsCalls": "次",
-  "dashboard.droppedToolsTypes": "种",
+  "diagnostic.droppedToolsCalls": "次",
+  "diagnostic.droppedToolsTypes": "种",
+  "diagnostic.droppedToolsNone": "未检测到被丢弃的工具类型",
   "dashboard.restartCodex": "重启 Codex",
   "dashboard.clearDesktopConfig": "还原 Codex 原配置",
   "dashboard.feedback": "反馈",

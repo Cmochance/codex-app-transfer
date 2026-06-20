@@ -111,14 +111,6 @@ fn drop_tool_counters() -> &'static std::sync::Mutex<std::collections::HashMap<S
     COUNTERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// 测试用 reset hook — production 永远不调,仅 `#[cfg(test)]` caller 可见。
-#[cfg(test)]
-pub(crate) fn reset_dropped_tool_counters() {
-    if let Ok(mut g) = drop_tool_counters().lock() {
-        g.clear();
-    }
-}
-
 #[cfg(test)]
 mod warn_once_tests {
     //! `warn_once_drop_tool` first-N + counter 行为测试。
@@ -189,9 +181,8 @@ mod warn_once_tests {
         );
     }
 
-    // 注:不测 `reset_dropped_tool_counters()` — 它会清掉 global counter,跟
-    // 其他并发跑的 test race。reset 函数是 trivial 的 `g.clear()`,留作 future
-    // test 想 isolated state 时用。
+    // 注:counter 是 global OnceLock,test 间共享 —— 故各 test 用 unique tool_type 避免
+    // race(不靠 reset 清状态;原 `reset_dropped_tool_counters` test hook 因零调用已删)。
 }
 
 /// 把上游语义 error kind 映射成 Codex `response.failed` handler 认识的
