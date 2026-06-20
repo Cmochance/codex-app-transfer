@@ -12,6 +12,7 @@ import {
   type ConnectorSourceMeta,
 } from '@/api/marketplace'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppInput from '@/components/ui/AppInput.vue'
 import AppModal from '@/components/ui/AppModal.vue'
@@ -22,6 +23,7 @@ import IconExternalLink from '~icons/lucide/external-link'
 
 // 连接器市场(多源)— 官方源 + 用户自加源,聚合展示。嵌进 McpPanel 的 Marketplace 子区。
 const { show: toast } = useToast()
+const { confirm } = useConfirm()
 const loading = ref(true)
 const error = ref('')
 const registry = ref<ConnectorRegistry | null>(null)
@@ -57,7 +59,7 @@ async function toggle(s: ConnectorSourceMeta) {
   }
 }
 async function remove(s: ConnectorSourceMeta) {
-  if (!window.confirm(t('codex.mcp.deleteSource') + '?')) return
+  if (!(await confirm({ message: t('codex.mcp.deleteSource') + '?', danger: true }))) return
   try {
     await removeConnectorSource(s.id)
     await load(true)

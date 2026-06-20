@@ -2,6 +2,7 @@
 import { onMounted } from 'vue'
 import AppLayout from './layout/AppLayout.vue'
 import McpRecoveryModal from '@/components/settings/McpRecoveryModal.vue'
+import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useAppearance } from '@/composables/useAppearance'
 import { useFont } from '@/composables/useFont'
@@ -31,4 +32,5 @@ onMounted(async () => {
 <template>
   <AppLayout />
   <McpRecoveryModal />
+  <ConfirmDialog />
 </template>

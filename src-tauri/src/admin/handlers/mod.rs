@@ -29,7 +29,6 @@ pub mod providers;
 pub mod proxy;
 pub mod real_account;
 pub mod settings;
-pub mod skills;
 pub mod skills_md;
 pub mod theme;
 pub mod trace_viewer;
