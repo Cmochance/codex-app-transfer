@@ -335,39 +335,6 @@ pub(super) fn create_config_backup(reason: &str) -> Result<Value, String> {
     }))
 }
 
-pub(super) fn list_config_backups() -> Result<Vec<Value>, String> {
-    let backup_dir = app_backup_dir()?;
-    fs::create_dir_all(&backup_dir).map_err(|e| format!("create backup directory failed: {e}"))?;
-    let mut backups = Vec::new();
-    let entries =
-        fs::read_dir(&backup_dir).map_err(|e| format!("read backup directory failed: {e}"))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("json") || !path.is_file() {
-            continue;
-        }
-        let stat = match fs::metadata(&path) {
-            Ok(stat) => stat,
-            Err(_) => continue,
-        };
-        let name = match path.file_name().and_then(|v| v.to_str()) {
-            Some(name) => name.to_owned(),
-            None => continue,
-        };
-        backups.push(json!({
-            "name": name,
-            "size": stat.len(),
-            "createdAt": system_time_iso_seconds(stat.modified().unwrap_or_else(|_| SystemTime::now())),
-        }));
-    }
-    backups.sort_by(|a, b| {
-        let a = a.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
-        let b = b.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
-        b.cmp(a)
-    });
-    Ok(backups)
-}
-
 // ── /api/settings ────────────────────────────────────────────────────
 
 pub async fn get_settings() -> impl IntoResponse {
@@ -636,20 +603,6 @@ pub fn load_registry_for_startup_language_sync() -> Result<Value, String> {
 
 // ── /api/config/* ────────────────────────────────────────────────────
 
-pub async fn create_backup() -> impl IntoResponse {
-    match create_config_backup("manual") {
-        Ok(backup) => Json(json!({"success": true, "backup": backup})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub async fn list_backups() -> impl IntoResponse {
-    match list_config_backups() {
-        Ok(backups) => Json(json!({"backups": backups})).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
 pub async fn export_config() -> impl IntoResponse {
     let cfg = load_registry().unwrap_or_else(|_| json!({}));
     Json(json!({
@@ -749,11 +702,12 @@ mod tests {
     }
 
     #[test]
-    fn config_backup_list_uses_real_files() {
+    fn config_backup_copies_config_with_secrets() {
         with_isolated_home(|home| {
             let cfg = config_with_secret();
             save_registry(&cfg).unwrap();
 
+            // create_config_backup 仍被 import_config 的 before-import 备份复用(backup-now / list 端点已移除)。
             let backup = create_config_backup("manual").unwrap();
             let name = backup.get("name").and_then(|v| v.as_str()).unwrap();
             assert!(name.starts_with("config-"));
@@ -765,16 +719,12 @@ mod tests {
             let saved: Value =
                 serde_json::from_str(&fs::read_to_string(&backup_path).unwrap()).unwrap();
             assert_eq!(saved["providers"][0]["apiKey"], json!("sk-existing"));
-
-            let backups = list_config_backups().unwrap();
-            assert_eq!(backups.len(), 1);
-            assert_eq!(backups[0]["name"], backup["name"]);
         });
     }
 
     #[test]
     fn import_config_backs_up_and_preserves_existing_provider_secrets_when_missing() {
-        with_isolated_home(|_| {
+        with_isolated_home(|home| {
             save_registry(&config_with_secret()).unwrap();
 
             let incoming = json!({
@@ -813,13 +763,15 @@ mod tests {
                 json!("secret-header")
             );
 
-            let backups = list_config_backups().unwrap();
-            assert_eq!(backups.len(), 1);
-            assert!(backups[0]
-                .get("name")
-                .and_then(|v| v.as_str())
+            // import 自动先 before-import 备份(list 端点已移除,改直接扫 backups 目录核实)。
+            let backup_dir = home.join(".codex-app-transfer").join("backups");
+            let names: Vec<String> = std::fs::read_dir(&backup_dir)
                 .unwrap()
-                .contains("before-import"));
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            assert_eq!(names.len(), 1);
+            assert!(names[0].contains("before-import"));
         });
     }
 }

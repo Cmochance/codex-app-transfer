@@ -4,7 +4,7 @@ import { i18nState, setLocale, t, tFmt } from '@/i18n'
 import { useAppearance, type Appearance } from '@/composables/useAppearance'
 import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
 import { useSettingsStore } from '@/stores/settings'
-import type { Settings } from '@/api/settings'
+import { exportConfig, importConfig, type Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
 import { getAppVersion, checkAppUpdate, installAppUpdate, openExternalUrl } from '@/api/system'
 import SettingsGroup from '@/components/ui/SettingsGroup.vue'
@@ -98,6 +98,58 @@ async function confirmInstall() {
 }
 function openExternal(url: string) {
   openExternalUrl(url).catch((e) => toast((e as Error).message, 'error'))
+}
+
+// 配置文件:导出 → 下载整份配置 JSON(含 API key);导入 → 选文件读 JSON → POST
+// (后端自动 before-import 备份 + 保留现有 provider secret + normalize 校验)。
+function downloadJson(obj: unknown, filename: string) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+async function onExportConfig() {
+  try {
+    const data = await exportConfig()
+    const stamp = new Date().toISOString().slice(0, 10)
+    downloadJson(data, `codex-app-transfer-config-${stamp}.json`)
+    toast(t('settings.exportConfigOk'))
+  } catch (e) {
+    toast((e as Error).message, 'error')
+  }
+}
+function onImportConfig() {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = 'application/json,.json'
+  input.style.display = 'none'
+  document.body.appendChild(input)
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0]
+    input.remove()
+    if (!file) return
+    try {
+      const parsed = JSON.parse(await file.text())
+      await importConfig(parsed)
+      // import 替换整 config:刷新 store,并**立即重应用主题/语言** —— 它们由 useAppearance 单例 +
+      // i18nState 驱动、只在启动从 settings 注水(见 App.vue),不在此重应用则导入改了 theme/language
+      // 要重启才生效(段控件 + 实际外观停在旧值)。这里镜像 App.vue 的注水逻辑。
+      const reloaded = await store.load()
+      if (typeof reloaded.theme === 'string') useAppearance().load(reloaded.theme)
+      if (reloaded.language === 'zh' || reloaded.language === 'en')
+        setLocale(reloaded.language as 'zh' | 'en')
+      // 插件解锁档(settings.pluginUnlockMode)同由独立 ref 驱动(refreshPluginUnlockStatus),
+      // 刷新使段控件 + no-op 守卫反映导入后的持久档。(font 走 localStorage、不在 settings,import 不动它。)
+      refreshPluginUnlockStatus()
+      toast(t('settings.importConfigOk'))
+    } catch (e) {
+      toast((e as Error).message, 'error')
+    }
+  })
+  input.click()
 }
 
 // 保存 partial → 后端浅合并;store.save 已做乐观更新 + 失败回滚,这里只 toast。
@@ -563,6 +615,10 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
           :label="t('settings.installUpdate')"
           @click="installModalOpen = true"
         />
+      </SettingsRow>
+      <SettingsRow :title="t('settings.configBackup')" :description="t('settings.configBackupHint')">
+        <AppButton size="sm" variant="secondary" :label="t('settings.exportConfig')" @click="onExportConfig" />
+        <AppButton size="sm" variant="secondary" :label="t('settings.importConfig')" @click="onImportConfig" />
       </SettingsRow>
       <SettingsRow :title="t('settings.updateUrl')" :description="t('settings.updateUrlDesc')">
         <code class="settings-readonly">{{ UPDATE_REPO_URL }}</code>

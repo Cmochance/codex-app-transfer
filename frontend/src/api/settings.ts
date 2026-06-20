@@ -16,3 +16,10 @@ export async function saveSettings(
   )
   return { settings: data.settings || {}, webFetchSyncWarning: data.webFetchSyncWarning }
 }
+
+// 配置文件:导出整份配置(providers + 模型映射 + 全部设置,含 API key 明文)到文件 /
+// 从文件导入(后端自动 before-import 备份 + 保留现有 provider secret + normalize 校验)。
+export const exportConfig = () =>
+  api<{ format: string; exportedAt: string; config: unknown }>('GET', '/api/config/export')
+export const importConfig = (data: unknown) =>
+  api<{ success?: boolean; message?: string }>('POST', '/api/config/import', data)

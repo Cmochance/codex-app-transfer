@@ -239,12 +239,7 @@ pub fn build_app_router(state: AdminState) -> Router {
             "/api/update/install",
             post(handlers::update::update_install),
         )
-        // Config
-        .route(
-            "/api/config/backup",
-            post(handlers::settings::create_backup),
-        )
-        .route("/api/config/backups", get(handlers::settings::list_backups))
+        // Config 导出/导入(backup-now / backups-list 已移除:无 restore 端点 = 半截 UX,MOC-261)
         .route("/api/config/export", get(handlers::settings::export_config))
         .route(
             "/api/config/import",
