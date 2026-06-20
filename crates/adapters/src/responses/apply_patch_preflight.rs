@@ -645,6 +645,74 @@ fn recover_empty_move(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
+/// 末个 `*** Add/Update File:` 操作的目标是否**代码/结构化配置文件**(裸 `*** End Patch` 在其中不可能
+/// 是合法源码的**末行**)。用于 [`ensure_v4a_envelope`] 的歧义终止符判定:代码文件里末行 `+*** End Patch`
+/// 必是模型误加前缀的终止符(可安全剥),文档/文本/未知类型则无法排除是正文(留 incomplete 不猜)。
+/// allowlist(只在确定安全时剥;未知扩展回落保守)。MOC-268,用户拍板「按文件类型剥」。
+fn last_op_target_is_code(body: &str) -> bool {
+    let ext = body.lines().rev().find_map(|l| {
+        let t = l.trim_end();
+        let p = t
+            .strip_prefix("*** Add File: ")
+            .or_else(|| t.strip_prefix("*** Update File: "))?;
+        std::path::Path::new(p.trim())
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+    });
+    matches!(
+        ext.as_deref(),
+        Some(
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "py"
+                | "go"
+                | "java"
+                | "kt"
+                | "kts"
+                | "c"
+                | "h"
+                | "cc"
+                | "cpp"
+                | "cxx"
+                | "hpp"
+                | "hh"
+                | "cs"
+                | "rb"
+                | "php"
+                | "swift"
+                | "scala"
+                | "lua"
+                | "sql"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "css"
+                | "scss"
+                | "sass"
+                | "less"
+                | "html"
+                | "htm"
+                | "xml"
+                | "vue"
+                | "svelte"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "gradle"
+                | "cmake"
+                | "proto"
+                | "graphql"
+                | "dart"
+                | "r"
+        )
+    )
+}
+
 /// **缺信封自动补全**:模型常只写 `*** Add/Update File:` + 内容,漏掉 `*** Begin Patch` /
 /// `*** End Patch` 头尾 → Codex(及本 adapter 的 V4A 校验)判 incomplete → 模型被迫重试。
 /// 当 patch 含至少一个 `*** Add/Update/Delete File:` 操作、JSON 已完整(调用方先 gate
@@ -682,29 +750,36 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
     }
     if !has_end {
         let trimmed = body.trim_end();
-        // [MOC-268] 末行是**带前缀的** `*** End Patch`(`+`/` `/`-` + `*** End Patch`)时:这**歧义**。
-        // 模型给 Add File 每行加 `+` 时常把终止符也误写成 `+*** End Patch`(此时该剥前缀当终止符);但它
-        // 也可能是文件**正文**最后一行恰好就是字面 `*** End Patch`(如 V4A 文档 / 测试 fixture —— 本仓
-        // 就有)、而模型漏了真终止符(此时它是正文,不能动)。两种从 patch **无法区分**。
-        // 不猜不丢:既不剥前缀(后者会**静默删掉正文最后一行**=破坏性降级)、也不追加裸 `*** End Patch`
-        // (前者会**留残留行**进新建文件),而是**不补全** → 保持无列 0 终止符,交下游 `detect_v4a_truncation`
-        // 判 incomplete、让模型按注入 guidance 规则2(终止符不加前缀)重发明确 patch。prompt 才是 A 的根治;
-        // 中间层只负责不静默猜错。
+        // [MOC-268] 末行是**带前缀的** `*** End Patch`(`+`/` `/`-` + `*** End Patch`)= 歧义:既可能是模型
+        // 给 Add File 逐行加 `+` 时把**终止符**也误前缀了(该剥),也可能是文件**正文**最后一行恰好就是裸
+        // `*** End Patch`、而漏了真终止符(此时它是正文,剥了=删正文)。**按文件类型消歧**(用户拍板):
+        //   · 代码 / 结构化配置文件(.rs/.ts/.py/.json/.toml…):裸 `*** End Patch` 不可能是合法源码的末行
+        //     → 必是误前缀终止符 → **剥前缀**规整(`head` 切到末行起点、保留其前换行;末行 ASCII,边界安全)。
+        //   · 文档 / 文本 / 未知类型(.md/.txt/无扩展…):无法排除是正文末行 → **不猜**,既不剥(免删正文)
+        //     也不追加(免残留),保持无列 0 终止符 → 下游 `detect_v4a_truncation` 判 incomplete、模型按
+        //     guidance 规则2(终止符不加前缀)重发。prompt 才是根治,中间层只在确定安全时介入。
         let last = trimmed.lines().last().unwrap_or("");
         if matches!(last, "+*** End Patch" | " *** End Patch" | "-*** End Patch") {
-            return (
-                body,
-                Some(Repair {
-                    file: "(envelope)".to_owned(),
-                    kind: "skipped:ambiguous_prefixed_end".to_owned(),
-                    detail:
-                        "末行为带前缀的 *** End Patch(误前缀终止符 / 正文歧义)→ 不猜不补全,留 incomplete 交模型重发"
-                            .to_owned(),
-                }),
-            );
+            if last_op_target_is_code(&body) {
+                let head = &trimmed[..trimmed.len() - last.len()];
+                body = format!("{head}*** End Patch");
+                added.push("End Patch(代码文件·剥误加前缀终止符)");
+            } else {
+                return (
+                    body,
+                    Some(Repair {
+                        file: "(envelope)".to_owned(),
+                        kind: "skipped:ambiguous_prefixed_end".to_owned(),
+                        detail:
+                            "末行带前缀 *** End Patch 且目标非代码文件(可能是正文)→ 不猜不补全,留 incomplete"
+                                .to_owned(),
+                    }),
+                );
+            }
+        } else {
+            body = format!("{trimmed}\n*** End Patch");
+            added.push("End Patch");
         }
-        body = format!("{trimmed}\n*** End Patch");
-        added.push("End Patch");
     }
     (
         body,
@@ -1405,26 +1480,57 @@ mod tests {
     }
 
     #[test]
-    fn envelope_ambiguous_prefixed_end_left_incomplete() {
-        // MOC-268(silent-failure review):末行是带前缀的 `*** End Patch` 时歧义 —— 可能是模型误前缀的
-        // 终止符,也可能是文件正文最后一行恰好就是字面 `*** End Patch`(本仓 V4A 文档/fixture 就有)+ 漏真
-        // 终止符。不猜不丢:既不剥(会删正文)、也不追加裸 End(会留残留)→ **不补全**,保持无列 0 终止符、
-        // 交下游判 incomplete。验证:① `+*** End Patch` 正文行**原样保留**(零内容丢失);② **没有**追加
-        // 列 0 裸终止符(零残留);③ repair 标 skipped:ambiguous。
-        for last in ["+*** End Patch", " *** End Patch", "-*** End Patch"] {
-            let body = format!("*** Begin Patch\n*** Add File: x\n+a\n+b\n{last}");
+    fn envelope_prefixed_end_stripped_for_code_file() {
+        // MOC-268(用户拍板「按文件类型剥」):代码/结构化配置文件里裸 `*** End Patch` 不可能是合法源码的
+        // **末行** → 带前缀末行必是模型误加前缀的终止符 → 剥前缀规整成裸终止符,不追加、零残留、零内容丢失。
+        for (path, last) in [
+            ("x.rs", "+*** End Patch"),
+            ("y.ts", " *** End Patch"),
+            ("z.py", "-*** End Patch"),
+            ("c.json", "+*** End Patch"),
+        ] {
+            let body = format!("*** Begin Patch\n*** Add File: {path}\n+a\n+b\n{last}");
             let (out, rep) = ensure_v4a_envelope(&body);
-            assert_eq!(out, body, "歧义末行应原样保留、不动 (last={last}):\n{out}");
             assert!(
-                out.trim_end().ends_with(last),
-                "末行带前缀终止符应原样保留(不剥=不删正文)(last={last}):\n{out}"
+                out.trim_end().ends_with("\n*** End Patch"),
+                "代码文件应剥成裸终止符 ({path}/{last}):\n{out}"
+            );
+            assert!(
+                !out.contains(last),
+                "不应残留带前缀终止符 ({path}/{last}):\n{out}"
+            );
+            assert_eq!(
+                out.matches("*** End Patch").count(),
+                1,
+                "只一个终止符 ({path}/{last}):\n{out}"
+            );
+            assert!(rep.unwrap().detail.contains("剥误加前缀"), "{path}/{last}");
+        }
+    }
+
+    #[test]
+    fn envelope_prefixed_end_left_incomplete_for_doc_file() {
+        // MOC-268(silent-failure review):文档/文本/未知类型里裸 `*** End Patch` **可能是正文末行**(本仓
+        // V4A 文档就有这串字)→ 歧义不猜:既不剥(免删正文)也不追加(免残留)→ 不补全留 incomplete。
+        for path in ["notes.md", "readme.txt", "data"] {
+            let body = format!(
+                "*** Begin Patch\n*** Add File: {path}\n+How to end a patch:\n+*** End Patch"
+            );
+            let (out, rep) = ensure_v4a_envelope(&body);
+            assert_eq!(out, body, "文档文件歧义末行应原样保留 ({path}):\n{out}");
+            assert!(
+                out.trim_end().ends_with("+*** End Patch"),
+                "正文行应保留不删 ({path}):\n{out}"
             );
             assert!(
                 !out.trim_end().ends_with("\n*** End Patch"),
-                "不应追加列 0 裸终止符(不追加=不留残留)(last={last}):\n{out}"
+                "不应追加裸终止符 ({path}):\n{out}"
             );
-            let r = rep.unwrap();
-            assert_eq!(r.kind, "skipped:ambiguous_prefixed_end", "last={last}");
+            assert_eq!(
+                rep.unwrap().kind,
+                "skipped:ambiguous_prefixed_end",
+                "{path}"
+            );
         }
     }
 

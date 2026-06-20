@@ -217,20 +217,10 @@ fn starts_with_reader(s: &str) -> bool {
     ) || (has_word(s, "sed") && t.contains(" -n"))
 }
 
-/// 首 token 是否抓取/下载类(gh/curl/wget)。这类 `>` 写的是**下载产物**(如 `gh api … > x.tar.gz`、
-/// `curl … > f`),不是编辑源码 → 排除出 `redirect_write`,避免把下载误计成「绕过 apply_patch 编辑」
-/// (MOC-268:phase-2 shell_edit 误报口径修正)。
-fn starts_with_fetch(s: &str) -> bool {
-    let first = s
-        .trim_start()
-        .split(|c: char| c.is_whitespace())
-        .next()
-        .unwrap_or("");
-    matches!(first, "gh" | "curl" | "wget")
-}
-
 /// 重定向目标是否归档/压缩产物(`*.tar.gz`/`.tgz`/`.zip`/`.gz`/`.bz2`/`.xz`/`.tar`)。这类是下载/打包
-/// 产物而非源码 → 排除出 `redirect_write`(MOC-268)。
+/// 产物而非源码 → 排除出 `redirect_write`(MOC-268)。**按目标判定、不按命令**:`curl … > x.tar.gz`
+/// 排除,但 `curl … > src/generated.rs`(下载覆盖**真项目文件**)仍计 —— 它确实绕过 apply_patch 改了
+/// workspace 内容,审计信号必须保留(chatgpt-codex-connector review:不按 gh/curl/wget 命令一刀切豁免)。
 fn redirect_target_is_artifact(s: &str) -> bool {
     let Some(pos) = s.find('>') else {
         return false;
@@ -298,13 +288,12 @@ pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
             push("tee_write", &mut kinds);
         } else if has_word(s, "truncate") {
             push("truncate", &mut kinds);
-        } else if redirects_to_file(s)
-            && !starts_with_reader(s)
-            && !starts_with_fetch(s)
-            && !redirect_target_is_artifact(s)
+        } else if redirects_to_file(s) && !starts_with_reader(s) && !redirect_target_is_artifact(s)
         {
-            // echo>/cat>/printf> 及通用 `prog > file`(已排除 awk/grep/sed -n 等只读左侧、
-            // gh/curl/wget 下载、归档产物目标 —— 见 MOC-268 shell_edit 误报口径修正)。
+            // echo>/cat>/printf> 及通用 `prog > file`(已排除 awk/grep/sed -n 等只读左侧、归档产物目标)。
+            // **按目标而非命令豁免**:`gh/curl/wget … > x.tar.gz` 经 artifact-target 排除,但下载到真项目
+            // 文件(`curl … > src/x.rs`)仍计 —— 那是真·绕过 apply_patch 改 workspace,审计必须可见
+            // (MOC-268 shell_edit 误报口径修正,chatgpt-codex-connector review)。
             push("redirect_write", &mut kinds);
         }
     }
@@ -703,17 +692,28 @@ mod tests {
         assert!(classify_shell_write("python3 train.py --epochs 3").is_empty());
         assert!(classify_shell_write("ls -la && find . -type f").is_empty());
         assert!(classify_shell_write("cat file.rs").is_empty());
-        // [MOC-268] 下载/抓取(gh/curl/wget)+ 归档产物目标 → 不计 redirect_write(phase-2 误报口径修正)。
+        // [MOC-268] **归档产物目标** → 不计 redirect_write(按目标判定,非按命令;phase-2 误报口径修正)。
         assert!(
             classify_shell_write("cd /tmp && gh api repos/o/r/tarball/main > sda.tar.gz 2>/dev/null && tar xzf sda.tar.gz")
                 .is_empty(),
-            "gh 下载 tarball 不应计 redirect_write"
+            "下载到 tarball 产物不应计 redirect_write"
         );
         assert!(classify_shell_write("curl -sL https://x/y.zip > y.zip").is_empty());
-        assert!(classify_shell_write("wget https://x/f -O out > log.txt").is_empty());
         assert!(
             classify_shell_write("python3 render.py > /tmp/w/plot.tar.gz").is_empty(),
             "归档产物目标不计(即便左侧非下载)"
+        );
+        // [MOC-268 review] 下载/抓取到**真项目文件**仍计 —— 那是绕过 apply_patch 改 workspace,审计须可见
+        // (chatgpt-codex-connector:不按 gh/curl/wget 命令一刀切豁免)。
+        assert!(
+            classify_shell_write("curl -sL https://x/gen > src/generated.rs")
+                .contains(&"redirect_write"),
+            "curl 覆盖真项目文件应计 redirect_write"
+        );
+        assert!(
+            classify_shell_write("gh api repos/o/r/contents/x > fixtures/data.json")
+                .contains(&"redirect_write"),
+            "gh 写真项目文件应计 redirect_write"
         );
         // 真源码写盘仍命中(回归保护:别因排除矫枉过正漏掉真编辑)。
         assert!(classify_shell_write("echo 'x' > src/real.rs").contains(&"redirect_write"));
