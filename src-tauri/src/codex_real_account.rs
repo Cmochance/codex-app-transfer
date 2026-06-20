@@ -640,6 +640,14 @@ fn read_imported_mirror(paths: &CodexPaths) -> Option<Value> {
     parse_chatgpt_auth(&v).map(|_| v)
 }
 
+/// [MOC-257 review] 读镜像**原始** Value(不经 `read_imported_mirror` 的 `parse_chatgpt_auth`(只认 auth_mode=
+/// chatgpt)filter)。供「真账号是否可用」判定 + activate 恢复:镜像若 auth_mode=apikey 但带可用 chatgpt tokens
+/// (早期 build 镜像 / 切过 auth 模式的拷贝),用 `auth_value_real_and_usable`(查 tokens 非 auth_mode)判 + 由
+/// caller `normalize_real_auth_to_chatgpt` 规整,避免 chatgpt-only filter 漏判致 persisted Real 误降级 synthetic。
+fn read_imported_mirror_raw(paths: &CodexPaths) -> Option<Value> {
+    read_auth(&imported_mirror_path(paths)).ok()
+}
+
 /// import 内层(**假设 caller 已持 `AUTH_LOCK`**):备份活动 → 写活动 → 提交持久镜像。
 ///
 /// [connector review] 顺序是「先成功更新活动文件,再提交持久镜像」:若活动备份/写失败,
@@ -819,7 +827,10 @@ pub async fn activate_real_account() -> Result<bool, String> {
         write_auth(&paths.auth_json, &v).map_err(|e| format!("从导入活源恢复失败: {e}"))?;
         return Ok(true);
     }
-    if let Some(mut v) = read_imported_mirror(&paths).filter(|v| auth_value_real_and_usable(v)) {
+    // [MOC-257 review] 读 raw + normalize:auth_mode=apikey 但带可用 chatgpt tokens 的镜像也能恢复(与
+    // real_account_usable 一致,否则它判可用、这里却 read_imported_mirror chatgpt-filter 漏掉 → real apply 失败)。
+    if let Some(mut v) = read_imported_mirror_raw(&paths).filter(|v| auth_value_real_and_usable(v))
+    {
         normalize_real_auth_to_chatgpt(&mut v);
         backup_active_auth(&paths, "preactivate")?;
         write_auth(&paths.auth_json, &v).map_err(|e| format!("从镜像恢复失败: {e}"))?;
@@ -1056,8 +1067,9 @@ pub fn real_account_usable() -> bool {
     {
         return true;
     }
-    // 导入/钉住的镜像也算(未过期才算可用)。
-    if read_imported_mirror(&paths).is_some_and(|v| auth_value_real_and_usable(&v)) {
+    // 导入/钉住的镜像也算(未过期才算可用)。[MOC-257 review] 读 **raw**:auth_mode=apikey 但带可用 chatgpt
+    // tokens 的镜像 activate 能 normalize 恢复 → 这里也认它可用,避免误降级 synthetic(与 activate 镜像分支一致)。
+    if read_imported_mirror_raw(&paths).is_some_and(|v| auth_value_real_and_usable(&v)) {
         return true;
     }
     read_auth(&real_account_stash_path(&paths))
