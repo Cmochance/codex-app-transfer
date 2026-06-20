@@ -217,6 +217,48 @@ fn starts_with_reader(s: &str) -> bool {
     ) || (has_word(s, "sed") && t.contains(" -n"))
 }
 
+/// 单个重定向目标是否归档/压缩产物(`*.tar.gz`/`.tgz`/`.zip`/`.gz`/`.bz2`/`.xz`/`.tar`)。
+fn target_is_artifact(target: &str) -> bool {
+    let t = target.trim_matches(|c| c == '"' || c == '\'');
+    [".tar.gz", ".tgz", ".zip", ".gz", ".bz2", ".xz", ".tar"]
+        .iter()
+        .any(|ext| t.ends_with(ext))
+}
+
+/// 子命令里**所有**重定向目标是否都是归档/压缩产物(且至少有一个重定向)。用于 `redirect_write` 豁免:
+/// 只有「全部写的是下载/打包产物」才豁免;**任一**重定向目标是非归档的真 workspace 文件就**不豁免**
+/// (保留审计信号)。**按目标判定、不按命令**:`curl … > x.tar.gz` 豁免,但 `curl … > src/generated.rs`
+/// 仍计;且**逐个**重定向都看 —— `tool 2>err.gz > src.rs` 不能因首个 `2>err.gz` 像归档就豁免、漏掉
+/// 真 `> src.rs`(chatgpt-codex-connector review:inspect every redirection)。
+fn all_redirect_targets_are_artifacts(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut saw = false;
+    while i < b.len() {
+        if b[i] == b'>' {
+            let mut j = i + 1;
+            if j < b.len() && b[j] == b'>' {
+                j += 1; // `>>` 追加
+            }
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && !b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            saw = true;
+            if !target_is_artifact(&s[start..j]) {
+                return false; // 有一个非归档真文件目标 → 不豁免
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    saw
+}
+
 /// 识别 shell 串里的「写盘 / 改文件」操作(MOC-263 P3 诊断用)。返回命中的种类(可多个);
 /// 纯只读(git/ls/grep/cargo/cat 读 等)返回空。宁可少报不滥报:只认明确的写盘形态。
 pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
@@ -267,8 +309,14 @@ pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
             push("tee_write", &mut kinds);
         } else if has_word(s, "truncate") {
             push("truncate", &mut kinds);
-        } else if redirects_to_file(s) && !starts_with_reader(s) {
+        } else if redirects_to_file(s)
+            && !starts_with_reader(s)
+            && !all_redirect_targets_are_artifacts(s)
+        {
             // echo>/cat>/printf> 及通用 `prog > file`(已排除 awk/grep/sed -n 等只读左侧)。
+            // **按目标豁免、且逐个重定向都看**:仅当**所有**重定向目标都是归档产物(`> x.tar.gz`)才豁免;
+            // 下载/写到真项目文件(`curl … > src/x.rs`)、或多重定向里夹一个真文件(`tool 2>err.gz > src.rs`)
+            // 仍计 —— 真·绕过 apply_patch 改 workspace,审计必须可见(MOC-268,chatgpt-codex-connector review)。
             push("redirect_write", &mut kinds);
         }
     }
@@ -667,6 +715,41 @@ mod tests {
         assert!(classify_shell_write("python3 train.py --epochs 3").is_empty());
         assert!(classify_shell_write("ls -la && find . -type f").is_empty());
         assert!(classify_shell_write("cat file.rs").is_empty());
+        // [MOC-268] **归档产物目标** → 不计 redirect_write(按目标判定,非按命令;phase-2 误报口径修正)。
+        assert!(
+            classify_shell_write("cd /tmp && gh api repos/o/r/tarball/main > sda.tar.gz 2>/dev/null && tar xzf sda.tar.gz")
+                .is_empty(),
+            "下载到 tarball 产物不应计 redirect_write"
+        );
+        assert!(classify_shell_write("curl -sL https://x/y.zip > y.zip").is_empty());
+        assert!(
+            classify_shell_write("python3 render.py > /tmp/w/plot.tar.gz").is_empty(),
+            "归档产物目标不计(即便左侧非下载)"
+        );
+        // [MOC-268 review] 下载/抓取到**真项目文件**仍计 —— 那是绕过 apply_patch 改 workspace,审计须可见
+        // (chatgpt-codex-connector:不按 gh/curl/wget 命令一刀切豁免)。
+        assert!(
+            classify_shell_write("curl -sL https://x/gen > src/generated.rs")
+                .contains(&"redirect_write"),
+            "curl 覆盖真项目文件应计 redirect_write"
+        );
+        assert!(
+            classify_shell_write("gh api repos/o/r/contents/x > fixtures/data.json")
+                .contains(&"redirect_write"),
+            "gh 写真项目文件应计 redirect_write"
+        );
+        // 真源码写盘仍命中(回归保护:别因排除矫枉过正漏掉真编辑)。
+        assert!(classify_shell_write("echo 'x' > src/real.rs").contains(&"redirect_write"));
+        assert!(classify_shell_write("printf 'a' > config.toml").contains(&"redirect_write"));
+        // [MOC-268 review] 多重定向:逐个看,早一个像归档(`2>err.gz`)不能豁免真文件目标(`> src.rs`)。
+        assert!(
+            classify_shell_write("tool 2>err.gz > src/generated.rs").contains(&"redirect_write"),
+            "早归档 decoy 不应豁免真文件写"
+        );
+        // 全部目标都是归档产物才豁免。
+        assert!(
+            classify_shell_write("gh api repos/o/r/tarball/main > out.tar.gz 2>log.gz").is_empty()
+        );
     }
 
     #[test]

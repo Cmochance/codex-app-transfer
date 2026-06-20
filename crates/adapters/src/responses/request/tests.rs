@@ -2227,10 +2227,16 @@ fn apply_patch_chat_path_guidance_injected_when_tool_registered() {
             !guidance.contains("EMPTY LINE as the `@@` anchor"),
             "旧版 EMPTY LINE anchor 误导已删除:{guidance}"
         );
-        // (2) Add File 全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
+        // (2) Add File 内容行全 `+` 前缀(对抗 `def main():` 当 invalid hunk header)
         assert!(
-            guidance.contains("prefix EVERY line") && guidance.contains("`+`"),
-            "guidance 必须强调 Add File 全 `+` 前缀:{guidance}"
+            guidance.contains("prefix every line of the new file's CONTENT")
+                && guidance.contains("`+`"),
+            "guidance 必须强调 Add File 内容行全 `+` 前缀:{guidance}"
+        );
+        // (2a) [MOC-268] 信封终止符不加 `+`(防 `+*** End Patch` 残留进新建文件)
+        assert!(
+            guidance.contains("do NOT prefix the terminator"),
+            "guidance 必须强调终止符不加 `+`(防残留):{guidance}"
         );
         // (3) byte-exact matching
         assert!(
@@ -4102,12 +4108,12 @@ fn apply_patch_guidance_injected_in_chinese_when_language_zh() {
 }
 
 #[test]
-fn apply_patch_guidance_zh_covers_all_nine_rules() {
+fn apply_patch_guidance_zh_covers_all_ten_rules() {
     with_user_language("zh", || {
         let out = convert(first_turn_request_with_apply_patch());
         let guidance = out["messages"][1]["content"].as_str().unwrap();
-        // 9 条规则编号都必须出现(防漏译)
-        for n in 1..=9 {
+        // 10 条规则编号都必须出现(防漏译;rule 10 = MOC-268 memory 专属引导)
+        for n in 1..=10 {
             let marker = format!("{n}.");
             assert!(
                 guidance.contains(&marker),
@@ -4120,6 +4126,11 @@ fn apply_patch_guidance_zh_covers_all_nine_rules() {
             "missing **ALWAYS** equivalent"
         );
         assert!(guidance.contains("绝不"), "missing **NEVER** equivalent");
+        // [MOC-268] rule 10:memory 专属引导(并发重写 + cat 重读 + 当前文件存在的 `-` 行)
+        assert!(
+            guidance.contains("memory 文件") && guidance.contains("MEMORY.md"),
+            "ZH guidance 必须含 memory 专属引导(rule 10):{guidance}"
+        );
     });
 }
 
