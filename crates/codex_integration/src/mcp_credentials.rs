@@ -390,6 +390,10 @@ pub fn remove_mcp_credentials_keys(
     paths: &CodexPaths,
     keys: &[String],
 ) -> Result<usize, CodexError> {
+    // [bot P2] 事务次序:先读校验 + 写恢复态(非破坏、可失败),**破坏性的删镜像放最后**。
+    // 否则「删了镜像(可能是最后的备份)才发现恢复态读/写失败 → 返 Err 但备份已没」。本次序保证:
+    // 任一前置失败 → 镜像原样未动;只有最后删镜像失败 → 备份仍在(自愈偏「留备份」,下次重列)。
+    let mut state = read_recovery_state(&paths.mcp_recovery_state)?;
     let mut mirror = match read_creds(&paths.mcp_credentials_mirror) {
         CredRead::Parsed(m) => m,
         CredRead::Missing => Map::new(),
@@ -407,24 +411,26 @@ pub fn remove_mcp_credentials_keys(
             removed += 1;
         }
     }
-    if removed > 0 {
-        if mirror.is_empty() {
-            match std::fs::remove_file(&paths.mcp_credentials_mirror) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        } else {
-            write_creds_atomic(&paths.mcp_credentials_mirror, &mirror)?;
-        }
+    if removed == 0 {
+        return Ok(0); // 无命中:不写任何文件
     }
-    let mut state = read_recovery_state(&paths.mcp_recovery_state)?;
+    // 1) 先持久化恢复态(去掉被移除 key)。失败 → 早退,镜像未动。
     let before = state.len();
     for k in keys {
         state.remove(k);
     }
     if state.len() != before {
         write_recovery_state(&paths.mcp_recovery_state, &state)?;
+    }
+    // 2) 最后才动镜像(破坏性)。失败 → 备份仍在,恢复态虽已更新但 list 按镜像存在重新派生,不丢。
+    if mirror.is_empty() {
+        match std::fs::remove_file(&paths.mcp_credentials_mirror) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        write_creds_atomic(&paths.mcp_credentials_mirror, &mirror)?;
     }
     Ok(removed)
 }
@@ -694,6 +700,20 @@ mod tests {
         assert!(
             mirror.contains_key("a|1") && mirror.contains_key("b|2"),
             "镜像原样保留,b/2 不被静默清掉"
+        );
+    }
+
+    #[test]
+    fn remove_on_corrupt_recovery_state_errs_without_deleting_mirror() {
+        // [bot P2] 事务次序:恢复态损坏 → remove 先报错、**不删镜像备份**(杜绝「报失败但备份已没」)。
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(&paths.mcp_credentials_mirror, &json!({"a|1": entry("a")}));
+        std::fs::write(&paths.mcp_recovery_state, "}{ bad json").unwrap();
+        assert!(remove_mcp_credentials_keys(&paths, &["a|1".into()]).is_err());
+        assert!(
+            read_map(&paths.mcp_credentials_mirror).contains_key("a|1"),
+            "恢复态损坏时镜像备份未被删"
         );
     }
 
