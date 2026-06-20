@@ -196,6 +196,8 @@ fn body_has_usage_limit_signal(body_text: &str) -> bool {
     }
     let usage_limit_is_exhaustion = lower.contains("usage limit")
         && (lower.contains("reset")
+            || lower.contains("window") // "usage limit for the 5-hour window"
+            || lower.contains("hour")
             || lower.contains("quota")
             || lower.contains("credit")
             || lower.contains("balance")
@@ -498,6 +500,17 @@ mod tests {
         // MOC-264 bot P2 五轮:模糊的 "try again in 5 hours" 不作瞬时判据——这是重置窗口
         // 耗尽(带 resets),不是 per-minute throttle。reset 耗尽标记 → fail-fast,不重连。
         let body = r#"{"error":{"message":"You've reached your usage limit; resets in 5 hours; try again in 5 hours"}}"#;
+        let s = drive_error_stream(429, body, "rate_limited", "upstream").await;
+        assert!(s.contains(r#""code":"invalid_prompt""#));
+        assert!(s.contains(r#""upstream_error_kind":"usage_limit_reached""#));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_429_english_window_marker_fail_fast() {
+        // MOC-264 bot P2 六轮:英文「usage limit for the 5-hour window」是窗口耗尽,
+        // window / hour 标记 → fail-fast(否则漏判 → 重连循环)。
+        let body =
+            r#"{"error":{"message":"You've reached your usage limit for the 5-hour window"}}"#;
         let s = drive_error_stream(429, body, "rate_limited", "upstream").await;
         assert!(s.contains(r#""code":"invalid_prompt""#));
         assert!(s.contains(r#""upstream_error_kind":"usage_limit_reached""#));
