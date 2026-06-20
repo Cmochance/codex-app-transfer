@@ -6,6 +6,7 @@ import { useFont, type FontChoice, type FontSize } from '@/composables/useFont'
 import { useSettingsStore } from '@/stores/settings'
 import { exportConfig, importConfig, type Settings } from '@/api/settings'
 import { useToast } from '@/composables/useToast'
+import { useMcpRecovery } from '@/composables/useMcpRecovery'
 import { getAppVersion, checkAppUpdate, installAppUpdate, openExternalUrl } from '@/api/system'
 import SettingsGroup from '@/components/ui/SettingsGroup.vue'
 import SettingsRow from '@/components/ui/SettingsRow.vue'
@@ -41,6 +42,13 @@ const installSupported = ref(false)
 const latestVersion = ref('')
 const installModalOpen = ref(false)
 const installing = ref(false)
+// MOC-261 一-4:MCP 凭据丢失恢复 —— 入口状态(弹窗在 App.vue 全局渲染,此处仅展示状态 + 打开)。
+const mcpRecovery = useMcpRecovery()
+const mcpRecoveryStatus = computed(() =>
+  mcpRecovery.pending.value > 0
+    ? tFmt('settings.mcpRecoveryPending', { count: mcpRecovery.pending.value })
+    : tFmt('settings.mcpRecoveryAllIgnored', { count: mcpRecovery.entries.value.length }),
+)
 
 onMounted(() => {
   if (!store.loaded) store.load().catch(() => {})
@@ -48,6 +56,7 @@ onMounted(() => {
     .then((r) => (appVersion.value = r.version || ''))
     .catch(() => {})
   refreshPluginUnlockStatus()
+  mcpRecovery.refresh()
 })
 
 // 拉后端三态状态同步两 ref(mount + 「还原 Codex 原配置」后,后端 reset 了 LAST_APPLIED 需重读)。
@@ -581,6 +590,18 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
         :description="t('settings.mcpCredentialsPortableStoreHint')"
       >
         <AppSwitch v-model="mcpCredentialsPortableStore" />
+      </SettingsRow>
+      <SettingsRow
+        v-if="mcpRecovery.entries.value.length > 0"
+        :title="t('settings.mcpRecoveryTitle')"
+        :description="mcpRecoveryStatus"
+      >
+        <AppButton
+          size="sm"
+          variant="secondary"
+          :label="t('settings.mcpRecoveryHandle')"
+          @click="mcpRecovery.openModal()"
+        />
       </SettingsRow>
       <SettingsRow :title="t('settings.proxyPort')" :description="t('settings.proxyPortDesc')">
         <input

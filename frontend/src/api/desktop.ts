@@ -245,3 +245,43 @@ export function pinCurrentRealAccount() {
     '/api/desktop/real-account/pin-current',
   )
 }
+
+// ── MOC-261 一-4:MCP 凭据「丢失恢复」逐条状态机 ──────────────────────────────
+// 整文件被清空(换机/误删/登出全部)后,镜像里的 server 进入「待处理」;逐条 restore/remove/ignore。
+export interface McpRecoveryItem {
+  /** Codex 的 server_key(server_name|hash),行标识 + 显示。 */
+  key: string
+  /** 已忽略:不再触发自动弹窗,但仍在列表里可手动处理。 */
+  ignored: boolean
+}
+export interface McpRecoveryStatus {
+  /** 待处理(未忽略)条数;>0 → 启动自动弹窗。 */
+  pending: number
+  /** 全部待处理项(含已忽略),逐行显示。 */
+  entries: McpRecoveryItem[]
+}
+export async function getMcpRecoveryStatus(): Promise<McpRecoveryStatus> {
+  const r = await api<{ pending?: number; entries?: { key?: string; ignored?: boolean }[] }>(
+    'GET',
+    '/api/desktop/mcp-credentials/status',
+  )
+  return {
+    pending: r.pending ?? 0,
+    entries: (r.entries ?? []).map((e) => ({ key: e.key ?? '', ignored: !!e.ignored })),
+  }
+}
+/** 选择性恢复:把 keys 从镜像写回 live(不覆盖已有)。返回写回条数。 */
+export const restoreMcpCredentials = (keys: string[]) =>
+  api<{ success?: boolean; restored?: number }>('POST', '/api/desktop/mcp-credentials/restore', {
+    keys,
+  })
+/** 选择性移除:从备份镜像 + 状态删除 keys(不动 live)。返回删除条数。 */
+export const removeMcpCredentials = (keys: string[]) =>
+  api<{ success?: boolean; removed?: number }>('POST', '/api/desktop/mcp-credentials/remove', {
+    keys,
+  })
+/** 标记忽略:keys 不再触发自动弹窗,仍留列表可手动处理。返回标记条数。 */
+export const ignoreMcpCredentials = (keys: string[]) =>
+  api<{ success?: boolean; ignored?: number }>('POST', '/api/desktop/mcp-credentials/ignore', {
+    keys,
+  })

@@ -5,8 +5,7 @@ use std::sync::Arc;
 use codex_app_transfer_codex_integration::{
     apply_provider, catalog_models_for_provider_with_display_names, ensure_file_store_mode,
     get_snapshot_status, has_snapshot, has_stale_active_snapshot, list_snapshots, read_auth,
-    restore_available_count, restore_codex_snapshot, restore_codex_state, sync_mcp_credentials,
-    ApplyConfig, CodexPaths,
+    restore_codex_snapshot, restore_codex_state, sync_mcp_credentials, ApplyConfig, CodexPaths,
 };
 use codex_app_transfer_gemini_oauth::antigravity_static_models;
 use codex_app_transfer_proxy::proxy_telemetry;
@@ -897,23 +896,6 @@ pub fn mcp_credentials_startup_sync(reason: &str) -> usize {
 /// 同步;关→删 config key 回退 Codex 默认(`.credentials.json` **保留**,非破坏)。
 pub fn mcp_credentials_on_setting_changed(enabled: bool) -> usize {
     apply_mcp_portable_store(enabled, "setting-changed")
-}
-
-/// MOC-62:只读查询当前"是否有可恢复的 MCP 凭据备份"(开关开 + live 整文件缺失 + 镜像
-/// 非空 → 返回可恢复条数)。前端 load 时轮询此状态决定是否弹恢复确认 —— 比一次性
-/// startup event 可靠(避免 event 在前端 listener 注册前就 emit 而丢失,
-/// chatgpt-codex-connector P2)。无副作用。
-pub fn mcp_credentials_restore_status() -> usize {
-    let Ok(cfg) = load_registry() else {
-        return 0;
-    };
-    if !read_setting_bool(&cfg, "mcpCredentialsPortableStore", true) {
-        return 0;
-    }
-    match CodexPaths::from_home_env() {
-        Ok(paths) => restore_available_count(&paths),
-        Err(_) => 0,
-    }
 }
 
 /// 返回 `restore_available`(>0 = live 整文件缺失且镜像有备份,需弹恢复确认);
