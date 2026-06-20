@@ -4,6 +4,7 @@ import * as codexApi from '@/api/codex'
 import type { ManagedResource, ManagedPathEntry, ManagedHistoryEntry } from '@/api/codex'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
 import { renderMiniMd } from '@/lib/miniMd'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
@@ -21,6 +22,7 @@ import IconFolderOpen from '~icons/lucide/folder-open'
 // 每实例自管一个 resource 的状态 — 彻底消除旧 codexDocActiveResource 全局态 bug 源。
 const props = defineProps<{ resource: ManagedResource }>()
 const { show: toast } = useToast()
+const { confirm } = useConfirm()
 
 interface FeatureConfig {
   pathManagement: boolean // 添加/删除/浏览 路径(skills 无)
@@ -137,10 +139,11 @@ function onCancel() {
 }
 async function onApply() {
   if (!currentHash.value) return
-  if (!window.confirm(tFmt('codex.docApplyConfirm', { doc: features.value.docName }))) return
+  if (!(await confirm({ message: tFmt('codex.docApplyConfirm', { doc: features.value.docName }), danger: true })))
+    return
   try {
     await codexApi.saveManagedRaw(props.resource, currentHash.value, editDraft.value)
-    toast(t('codex.agentsApplyOk'))
+    toast(tFmt('codex.docApplyOk', { doc: features.value.docName }))
     await rawLoad()
   } catch (e) {
     toast((e as Error).message || t('toast.requestFailed'), 'error')
@@ -151,9 +154,10 @@ async function onBackup() {
     toast(emptyText.value)
     return
   }
+  if (!(await confirm(t('codex.backupConfirm')))) return
   try {
     await codexApi.backupManaged(props.resource, currentHash.value)
-    toast(t('codex.agentsBackupOk'))
+    toast(tFmt('codex.docBackupOk', { doc: features.value.docName }))
   } catch (e) {
     toast((e as Error).message || t('toast.requestFailed'), 'error')
   }
@@ -241,7 +245,7 @@ async function confirmPathAdd() {
 
 async function onPathRemove() {
   if (!currentHash.value) return
-  if (!window.confirm(t('codex.agentsPathRemoveConfirm'))) return
+  if (!(await confirm({ message: t('codex.agentsPathRemoveConfirm'), danger: true }))) return
   try {
     await codexApi.removeManagedPath(props.resource, currentHash.value)
     currentHash.value = null
@@ -282,10 +286,11 @@ async function openHistory() {
 }
 
 async function onHistoryRestore(index: number) {
-  if (!window.confirm(t('codex.agentsRestoreConfirm'))) return
+  if (!(await confirm({ message: tFmt('codex.docRestoreConfirm', { doc: features.value.docName }), danger: true })))
+    return
   try {
     await codexApi.restoreManagedRaw(props.resource, currentHash.value, index)
-    toast(t('codex.agentsRestoreOk'))
+    toast(tFmt('codex.docRestoreOk', { doc: features.value.docName }))
     showHistory.value = false
     await rawLoad()
   } catch (e) {

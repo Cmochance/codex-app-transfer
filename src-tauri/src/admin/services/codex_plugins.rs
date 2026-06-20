@@ -585,7 +585,7 @@ pub async fn install_tarball(input: &InstallInput) -> Result<PluginEntry, String
             // (3) extract this entry — 检查 unpack_in 的 bool 返回值:tar crate 对
             // 逃逸条目(`..`/绝对路径)返回 Ok(false) **静默跳过**,`?` 只传播 Err。
             // 前面手工 escape 校验已拦大部分,这里把 unpack_in 自带的 inside-dst 判定
-            // 作为 fail-closed backstop(与 skills_backup.rs 对齐,不静默放过)。
+            // 作为 fail-closed backstop(tarball 解包遇异常 entry 不静默放过)。
             let unpacked = entry
                 .unpack_in(&staged)
                 .map_err(|e| format!("untar entry {}: {e}", entry_path.display()))?;
