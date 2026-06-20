@@ -4,6 +4,7 @@ import * as codexApi from '@/api/codex'
 import type { McpServerSpec, McpPlugin, ManagedHistoryEntry, PluginSkill } from '@/api/codex'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
 import SegmentedControl from '@/components/ui/SegmentedControl.vue'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppInput from '@/components/ui/AppInput.vue'
@@ -21,6 +22,7 @@ import IconCheck from '~icons/lucide/circle-check-big'
 import IconSparkles from '~icons/lucide/sparkles'
 
 const { show: toast } = useToast()
+const { confirm } = useConfirm()
 
 type Subpane = 'servers' | 'plugins' | 'marketplace'
 const subpane = ref<Subpane>('servers')
@@ -186,7 +188,7 @@ async function saveJson() {
     enabledTools: (Array.isArray(pick('enabledTools', 'enabled_tools')) ? pick('enabledTools', 'enabled_tools') : undefined) as string[] | undefined,
     disabledTools: (Array.isArray(pick('disabledTools', 'disabled_tools')) ? pick('disabledTools', 'disabled_tools') : undefined) as string[] | undefined,
   }
-  if (!window.confirm(buildSaveConfirm(spec))) return
+  if (!(await confirm(buildSaveConfirm(spec)))) return
   try {
     await codexApi.saveMcpServer(spec)
     toast(t('codex.mcp.saveOk'))
@@ -202,7 +204,13 @@ async function saveJson() {
 
 async function deleteServer() {
   if (!currentServerName.value || currentServerName.value === '__new__') return
-  if (!window.confirm(`确认删除 server "${currentServerName.value}"?(会同步删 ~/.codex/config.toml 对应节)`)) return
+  if (
+    !(await confirm({
+      message: `确认删除 server "${currentServerName.value}"?(会同步删 ~/.codex/config.toml 对应节)`,
+      danger: true,
+    }))
+  )
+    return
   try {
     await codexApi.deleteMcpServer(currentServerName.value)
     currentServerName.value = null
@@ -238,6 +246,7 @@ function confirmNewServer() {
 }
 
 async function backupServers() {
+  if (!(await confirm(t('codex.backupConfirm')))) return
   try {
     await codexApi.backupMcpServers()
     toast(t('codex.agentsBackupOk'))
@@ -258,7 +267,7 @@ async function openServersHistory() {
   }
 }
 async function onHistoryRestore(index: number) {
-  if (!window.confirm(t('codex.agentsRestoreConfirm'))) return
+  if (!(await confirm({ message: t('codex.agentsRestoreConfirm'), danger: true }))) return
   try {
     await codexApi.restoreMcpServers(index)
     toast(t('codex.agentsRestoreOk'))
@@ -284,7 +293,7 @@ async function rawToggle() {
   }
 }
 async function rawApply() {
-  if (!window.confirm(t('codex.mcp.rawApplyConfirm'))) return
+  if (!(await confirm({ message: t('codex.mcp.rawApplyConfirm'), danger: true }))) return
   try {
     await codexApi.saveMcpConfigRaw(rawContent.value)
     toast(t('codex.mcp.saveOk'))
@@ -319,7 +328,13 @@ async function togglePlugin(p: McpPlugin) {
   }
 }
 async function uninstallPlugin(p: McpPlugin) {
-  if (!window.confirm(`确认卸载 plugin "${p.key}"?会同步删除 ~/.codex/plugins/cache/ 下整个目录`)) return
+  if (
+    !(await confirm({
+      message: `确认卸载 plugin "${p.key}"?会同步删除 ~/.codex/plugins/cache/ 下整个目录`,
+      danger: true,
+    }))
+  )
+    return
   try {
     await codexApi.uninstallMcpPlugin(p.key)
     toast(t('codex.mcp.uninstallOk'))

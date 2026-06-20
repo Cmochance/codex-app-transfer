@@ -4,6 +4,7 @@ import type { ManagedHistoryEntry } from '@/api/codex'
 import { t } from '@/i18n'
 import AppModal from '@/components/ui/AppModal.vue'
 import AppButton from '@/components/ui/AppButton.vue'
+import AppSelect from '@/components/ui/AppSelect.vue'
 
 // 通用历史快照 modal:picker + LCS diff(快照 vs 当前内容)+ restore。
 // entries 已 reversed(最新在前);labelPrefix 由 parent 按 resource 算好。
@@ -20,6 +21,12 @@ function fmtLabel(entry: ManagedHistoryEntry): string {
   const ts = new Date((entry.timestamp || 0) * 1000).toLocaleString()
   return props.labelPrefix ? `${props.labelPrefix} · ${ts}` : ts
 }
+
+// 自定义下拉(AppSelect)选项:value=快照下标,label=带前缀的时间戳。替代原生 <select>
+// (原生弹窗会遮挡 modal 内容)。
+const historyOptions = computed(() =>
+  props.entries.map((e, i) => ({ value: i, label: fmtLabel(e) })),
+)
 
 // LCS-based 行级 diff(逐字移植 codexLineDiff,O(m*n))→ [{type:ctx|add|del, text}]
 function lineDiff(oldText: string, newText: string): { type: string; text: string }[] {
@@ -69,9 +76,9 @@ function onRestore() {
   <AppModal wide :title="t('codex.historyTitle')" @close="emit('close')">
     <div v-if="!entries.length" class="hist-empty">{{ t('codex.historyEmpty') }}</div>
     <template v-else>
-      <select v-model.number="selectedIdx" class="hist-picker">
-        <option v-for="(entry, i) in entries" :key="i" :value="i">{{ fmtLabel(entry) }}</option>
-      </select>
+      <div class="hist-picker">
+        <AppSelect v-model="selectedIdx" :options="historyOptions" />
+      </div>
 
       <div v-if="!diff.length" class="hist-empty">{{ t('codex.historyDiffEmpty') }}</div>
       <pre v-else class="hist-diff"><span
@@ -97,16 +104,7 @@ function onRestore() {
   font-size: var(--fs-sm);
 }
 .hist-picker {
-  width: 100%;
-  height: 32px;
   margin-bottom: var(--space-3);
-  padding: 0 var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--text);
-  font-size: var(--fs-sm);
-  font-family: inherit;
 }
 .hist-diff {
   max-height: 46vh;

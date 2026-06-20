@@ -4,6 +4,7 @@ import * as codexApi from '@/api/codex'
 import type { ConversationMeta, ConversationDetail, ConversationItem, ExportOptions } from '@/api/codex'
 import { t, tFmt } from '@/i18n'
 import { useToast } from '@/composables/useToast'
+import { useConfirm } from '@/composables/useConfirm'
 import { renderMiniMd, truncateString } from '@/lib/miniMd'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppInput from '@/components/ui/AppInput.vue'
@@ -17,6 +18,7 @@ import IconTrash from '~icons/lucide/trash-2'
 import IconSettings from '~icons/lucide/sliders-horizontal'
 
 const { show: toast } = useToast()
+const { confirm } = useConfirm()
 
 const sessions = ref<ConversationMeta[]>([])
 const selected = reactive(new Set<string>())
@@ -279,7 +281,8 @@ async function exportSelected() {
 async function deleteSelected() {
   if (selected.size === 0) return
   const ids = [...selected]
-  if (!window.confirm(tFmt('codex.conv.confirmDelete', { count: ids.length }))) return
+  if (!(await confirm({ message: tFmt('codex.conv.confirmDelete', { count: ids.length }), danger: true })))
+    return
   try {
     const data = await codexApi.deleteConversations(ids)
     const moved = (data.deleted || []).length
