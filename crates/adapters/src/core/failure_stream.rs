@@ -169,19 +169,29 @@ fn extract_upstream_error_message(body_text: &str) -> Option<String> {
 /// `codex_retry_code` doc 的 MOC-79 教训);宁可漏判(继续 Retryable)也不误判。
 /// 触发样本:GLM Coding `code 1308`「已达到 N 小时的使用上限。您的限额将在 … 重置。」。
 ///
-/// 注:英文 `usage limit` 单独**不够**强 —— 瞬时 per-minute 限流也可能这么措辞
-/// (`usage limit ... per minute`,带 retry-after)。要求它伴随耗尽/重置/升级语义、
-/// 且不含 per-minute 标记才算永久耗尽,否则保持可重试退避(MOC-264 bot review P2)。
+/// 注:英文 `usage limit` 单独**不够**强 —— 瞬时 per-minute 限流也这么措辞,且泛词
+/// `reached`/`exceeded` 在 retry-after 瞬时消息里也常见(如 `Usage limit reached,
+/// retry after 30s` / `Usage limit exceeded: 60 RPM`)。要求它伴随**计费/窗口耗尽
+/// 专属**标记(reset / quota / credit / balance / upgrade / daily / weekly),且不含
+/// retry-after / rpm / per-minute 等瞬时退避标记,才算永久耗尽;否则保持可重试退避
+/// (MOC-264 bot review P2,两轮收紧)。
 fn body_has_usage_limit_signal(body_text: &str) -> bool {
     let lower = body_text.to_ascii_lowercase(); // 关键词均 ASCII;中文 .contains 直接走原文
+    let says_retry_soon = lower.contains("per minute")
+        || lower.contains("per-minute")
+        || lower.contains("rpm")
+        || lower.contains("retry after")
+        || lower.contains("retry in")
+        || lower.contains("try again in");
     let usage_limit_is_exhaustion = lower.contains("usage limit")
-        && !lower.contains("per minute")
-        && !lower.contains("per-minute")
+        && !says_retry_soon
         && (lower.contains("reset")
-            || lower.contains("reached")
+            || lower.contains("quota")
+            || lower.contains("credit")
+            || lower.contains("balance")
             || lower.contains("upgrade")
-            || lower.contains("exhausted")
-            || lower.contains("exceeded"));
+            || lower.contains("daily")
+            || lower.contains("weekly"));
     body_text.contains("使用上限")   // GLM 计费窗口上限
         || body_text.contains("余额不足")
         || body_text.contains("额度不足")
@@ -445,6 +455,21 @@ mod tests {
         assert!(s.contains(r#""code":"rate_limited""#));
         assert!(!s.contains("usage_limit_reached"));
         assert!(!s.contains("invalid_prompt"));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_429_retry_after_and_rpm_stay_retryable() {
+        // MOC-264 bot P2 二轮:泛词 reached/exceeded 不足以判永久。带 retry-after /
+        // RPM 的瞬时消息(无 reset/quota/credit/balance 耗尽专属标记)保持可重试。
+        for body in [
+            r#"{"error":{"message":"Usage limit reached, retry after 30 seconds"}}"#,
+            r#"{"error":{"message":"Usage limit exceeded: 60 RPM"}}"#,
+        ] {
+            let s = drive_error_stream(429, body, "rate_limited", "upstream").await;
+            assert!(s.contains(r#""code":"rate_limited""#), "body={body}");
+            assert!(!s.contains("usage_limit_reached"), "body={body}");
+            assert!(!s.contains("invalid_prompt"), "body={body}");
+        }
     }
 
     #[tokio::test]
