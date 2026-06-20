@@ -287,6 +287,14 @@ async function fetchModels() {
       })
       .filter((o) => o.value)
     saveCachedModels(form.baseUrl, availableModels.value)
+    // [MOC-261 一-7] 自动填充:用后端 suggested(槽位→模型 id 自动建议,目前主要给 default 槽)
+    // 预填**空**槽位,不覆盖用户已选;只接受确在可用列表里的 id。
+    const suggested = res.suggested || {}
+    const valid = new Set(availableModels.value.map((o) => o.value))
+    for (const slot of Object.keys(form.models)) {
+      const sv = suggested[slot]
+      if (sv && !form.models[slot] && valid.has(sv)) form.models[slot] = sv
+    }
     toast(tFmt('providerForm.modelsFetched', { count: availableModels.value.length }))
   } catch (e) {
     error.value = (e as Error).message || t('providerForm.modelsFetchFailed')

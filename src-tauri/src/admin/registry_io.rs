@@ -84,8 +84,7 @@ pub fn save_for_test(cfg: &RawConfig) -> Result<(), String> {
 ///   clear_project_id_from_active_provider
 /// - `desktop.rs`:sync_desktop_for_active_provider / switch_provider_and_sync
 /// - `providers/crud.rs`:add_provider / update_provider / delete_provider /
-///   reorder_providers / update_models(save_draft 复用 update_provider)
-/// - `providers/models.rs`:autofill_provider_models(read 锁外 await + 写锁内)
+///   reorder_providers(模型映射随 update_provider 保存)
 /// - `settings.rs`:save_settings / import_config / create_config_backup
 ///
 /// 测试代码 + read-only handlers(get_*)仍可用 raw [`load`] / [`save`],它们

@@ -1,5 +1,5 @@
-//! `/api/providers/*` CRUD handler —— 增删改 / activate / reorder /
-//! draft / update_models.
+//! `/api/providers/*` CRUD handler —— 增删改 / activate / reorder / draft
+//! (模型映射随 update_provider 的 body 一并保存,无独立 update_models 端点)。
 
 use axum::{
     extract::{Path, State},
@@ -679,45 +679,5 @@ pub async fn save_draft(
     update_provider(Path(id), Json(input)).await
 }
 
-#[derive(Debug, Deserialize)]
-pub struct UpdateModelsInput {
-    pub models: Value,
-}
-
-pub async fn update_models(
-    State(state): State<AdminState>,
-    Path(id): Path<String>,
-    Json(input): Json<UpdateModelsInput>,
-) -> impl IntoResponse {
-    let result = with_config_write(|cfg| {
-        let Some(idx) = provider_index(cfg, &id) else {
-            return Err("provider not found".into());
-        };
-        let was_active = cfg.get("activeProvider").and_then(|v| v.as_str()) == Some(id.as_str());
-        let providers = cfg
-            .get_mut("providers")
-            .and_then(|v| v.as_array_mut())
-            .unwrap();
-        if let Some(o) = providers[idx].as_object_mut() {
-            o.insert("models".into(), input.models.clone());
-        }
-        Ok(ConfigMutation::Modified(was_active))
-    });
-    match result {
-        Ok(was_active) => {
-            let desktop_sync = if was_active {
-                let sync =
-                    crate::admin::services::desktop::snapshot::sync_desktop_for_active_provider(
-                        &state,
-                    )
-                    .await;
-                Some(sync)
-            } else {
-                None
-            };
-            Json(json!({"success": true, "desktopSync": desktop_sync})).into_response()
-        }
-        Err(e) if e == "provider not found" => err(StatusCode::NOT_FOUND, e).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
+// [MOC-261 一-7] update_models(PUT /api/providers/{id}/models)已删:模型映射经主
+// update_provider(PUT /api/providers/{id},body 带 models)保存,该专用端点前后端零引用。

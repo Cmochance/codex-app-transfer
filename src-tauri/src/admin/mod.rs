@@ -98,16 +98,8 @@ pub fn build_app_router(state: AdminState) -> Router {
             post(handlers::providers::crud::save_draft),
         )
         .route(
-            "/api/providers/{id}/models",
-            put(handlers::providers::crud::update_models),
-        )
-        .route(
             "/api/providers/{id}/models/available",
             get(handlers::providers::models::fetch_provider_models),
-        )
-        .route(
-            "/api/providers/{id}/models/autofill",
-            post(handlers::providers::models::autofill_provider_models),
         )
         .route(
             "/api/providers/test",

@@ -142,10 +142,13 @@ export const mimoLogin = (id: string) =>
   api<{ captured?: boolean }>('POST', `/api/providers/${id}/mimo-login`)
 
 // 获取上游可用模型:已存在 provider 走 id(用落盘 key);草稿(新增/编辑未存)走 payload。
+// 响应除 models 列表外还带 suggested(后端 suggest_model_mappings 自动建议的「槽位→模型 id」映射,
+// 目前主要给 default 槽),供前端 fetchModels 一键预填空槽位(取代已删的 autofill 专用端点)。
+type ModelsAvailableResp = { models?: unknown[]; suggested?: Record<string, string> }
 export const fetchProviderModels = (id: string) =>
-  api<{ models?: unknown[] }>('GET', `/api/providers/${id}/models/available`)
+  api<ModelsAvailableResp>('GET', `/api/providers/${id}/models/available`)
 export const fetchProviderModelsDraft = (payload: ProviderPayload) =>
-  api<{ models?: unknown[] }>('POST', '/api/providers/models/available', providerBody(payload, false))
+  api<ModelsAvailableResp>('POST', '/api/providers/models/available', providerBody(payload, false))
 
 // 测试表单当前值的连接(后端用传入 payload 发探测请求,不依赖落盘配置)。
 // 新增/编辑均可测;返回 { ok, latencyMs, message };ok=true = endpoint 可达(含 401/403),
