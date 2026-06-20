@@ -7089,15 +7089,16 @@
   let selectedThemeId = null;
 
   /**
-   * 1:1 crop 弹窗 — user 上传图后用来选 crop 区域。
+   * 16:9 crop 弹窗 — user 上传图后用来选 crop 区域。
    *
    * UI:全屏暗背景 modal + 中央"舞台"显示原图(等比 fit 进 stage),叠一个
-   * 居中的方形 selection box(初始为 stage 短边 × 0.9)。
+   * 居中的 16:9 selection box(初始占满 stage 的 90%)。
    * 交互:
    *   - 拖动:mousedown 在 stage 任意位置即开始(不限 box 内)→ 拖动 box 位置
    *     (clamp 到 stage 内)
-   *   - 滚轮缩放:wheel up/down → box 边长 ±5%(min 40px 绝对值 / max stage 短边)
-   *   - 确认:canvas.drawImage 把选区缩到 `min(2048, selectionPixels)` 方形 →
+   *   - 滚轮缩放:wheel up/down → box 在保持 16:9 的前提下整体 ±5%
+   *     (min 高度 40px / max 不超出 stage)
+   *   - 确认:canvas.drawImage 把选区缩到最大宽度 2048(高度按 16:9) →
    *     toDataURL JPEG 92%
    *   - 取消 / 点遮罩 / 图片 decode 失败:resolve(null)
    *
@@ -7107,15 +7108,19 @@
   function openCropModal(srcDataUri) {
     return new Promise((resolve) => {
       const lang = CCI18n && CCI18n.language === "en" ? "en" : "zh";
+      const ASPECT = 16 / 9;
+      const MIN_H = 40;
+      const MIN_W = MIN_H * ASPECT;
+
       const overlay = document.createElement("div");
       overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.78);z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;";
       const panel = document.createElement("div");
       panel.style.cssText = "background:#1a1a1a;border:1px solid #444;border-radius:12px;padding:18px;max-width:90vw;max-height:90vh;display:flex;flex-direction:column;gap:12px;";
       const title = document.createElement("div");
       title.style.cssText = "color:#eee;font-size:15px;font-weight:600;";
-      title.textContent = lang === "en"
-        ? "Crop 1:1 (drag to move, scroll to zoom)"
-        : "1:1 截取(拖动调整位置,滚轮缩放)";
+      title.textContent = t("theme.cropTitle") || (lang === "en"
+        ? "Crop 16:9 (drag to move, scroll to zoom)"
+        : "16:9 截取(拖动调整位置,滚轮缩放)");
       const stage = document.createElement("div");
       stage.style.cssText = "position:relative;background:#000;border-radius:6px;overflow:hidden;cursor:move;user-select:none;";
       const img = new Image();
@@ -7143,23 +7148,38 @@
       document.body.appendChild(overlay);
 
       // box 状态(相对 stage 像素 — 显示坐标),img.naturalW/H = 原始像素
-      let boxX = 0, boxY = 0, boxSize = 0;
+      let boxX = 0, boxY = 0, boxW = 0, boxH = 0;
       let stageW = 0, stageH = 0;
 
       function clampBox() {
-        if (boxSize > Math.min(stageW, stageH)) boxSize = Math.min(stageW, stageH);
-        if (boxSize < 40) boxSize = 40;
+        if (boxW < MIN_W) { boxW = MIN_W; boxH = MIN_W / ASPECT; }
+        if (boxH < MIN_H) { boxH = MIN_H; boxW = MIN_H * ASPECT; }
+        if (boxW > stageW) { boxW = stageW; boxH = boxW / ASPECT; }
+        if (boxH > stageH) { boxH = stageH; boxW = boxH * ASPECT; }
         if (boxX < 0) boxX = 0;
         if (boxY < 0) boxY = 0;
-        if (boxX + boxSize > stageW) boxX = stageW - boxSize;
-        if (boxY + boxSize > stageH) boxY = stageH - boxSize;
+        if (boxX + boxW > stageW) boxX = stageW - boxW;
+        if (boxY + boxH > stageH) boxY = stageH - boxH;
       }
       function applyBox() {
         clampBox();
         box.style.left = boxX + "px";
         box.style.top = boxY + "px";
-        box.style.width = boxSize + "px";
-        box.style.height = boxSize + "px";
+        box.style.width = boxW + "px";
+        box.style.height = boxH + "px";
+      }
+
+      function initBoxSize() {
+        // 在 stage 内保持 16:9 的前提下最大化,默认占 90%
+        const maxW = stageW * 0.9;
+        const maxH = stageH * 0.9;
+        if (maxW / maxH >= ASPECT) {
+          boxH = maxH;
+          boxW = boxH * ASPECT;
+        } else {
+          boxW = maxW;
+          boxH = boxW / ASPECT;
+        }
       }
 
       // OK 默认 disabled,等 img.onload 才放行 — 防 0x0 canvas 路径
@@ -7170,9 +7190,9 @@
         stage.style.height = img.offsetHeight + "px";
         stageW = img.offsetWidth;
         stageH = img.offsetHeight;
-        boxSize = Math.min(stageW, stageH) * 0.9;
-        boxX = (stageW - boxSize) / 2;
-        boxY = (stageH - boxSize) / 2;
+        initBoxSize();
+        boxX = (stageW - boxW) / 2;
+        boxY = (stageH - boxH) / 2;
         applyBox();
         okBtn.disabled = false;
         okBtn.style.opacity = "";
@@ -7202,12 +7222,13 @@
       const onMouseUp = () => { dragging = false; };
       const onWheel = (e) => {
         e.preventDefault();
-        const cx = boxX + boxSize / 2;
-        const cy = boxY + boxSize / 2;
+        const cx = boxX + boxW / 2;
+        const cy = boxY + boxH / 2;
         const delta = e.deltaY < 0 ? 1.05 : 0.95;
-        boxSize = boxSize * delta;
-        boxX = cx - boxSize / 2;
-        boxY = cy - boxSize / 2;
+        boxW = boxW * delta;
+        boxH = boxW / ASPECT;
+        boxX = cx - boxW / 2;
+        boxY = cy - boxH / 2;
         applyBox();
       };
       stage.addEventListener("mousedown", onMouseDown);
@@ -7229,14 +7250,16 @@
         const scaleY = img.naturalHeight / stageH;
         const sx = boxX * scaleX;
         const sy = boxY * scaleY;
-        const ssize = boxSize * scaleX; // 1:1 所以 X/Y scale 相同
-        const outSize = Math.min(2048, Math.round(ssize)); // 不放大,只缩(或保持)
+        const sW = boxW * scaleX;
+        const sH = boxH * scaleY;
+        let outW = Math.min(2048, Math.round(sW)); // 不放大,只缩(或保持)
+        let outH = Math.round(outW / ASPECT);
         const canvas = document.createElement("canvas");
-        canvas.width = outSize;
-        canvas.height = outSize;
+        canvas.width = outW;
+        canvas.height = outH;
         const ctx = canvas.getContext("2d");
         ctx.imageSmoothingQuality = "high";
-        ctx.drawImage(img, sx, sy, ssize, ssize, 0, 0, outSize, outSize);
+        ctx.drawImage(img, sx, sy, sW, sH, 0, 0, outW, outH);
         const out = canvas.toDataURL("image/jpeg", 0.92);
         done(out);
       });
@@ -7537,12 +7560,12 @@
     });
 
     // "+ 添加自定义" / "替换" — 全局 fn `window.__themeUploadHandler`。
-    // 流程:file picker → FileReader.readAsDataURL → **弹 1:1 crop 弹窗**让 user
-    // 选 crop 区域 → canvas crop 出方形 JPEG → POST 给后端 → renderTheme + 自动
+    // 流程:file picker → FileReader.readAsDataURL → **弹 16:9 crop 弹窗**让 user
+    // 选 crop 区域 → canvas crop 出 16:9 JPEG → POST 给后端 → renderTheme + 自动
     // 选中 custom + apply。
     //
-    // crop 在前端完成(canvas):后端 save_custom_theme 收到已是方形图,只做
-    // resize + JPEG encode 不再二次 crop;user 可拖框 + 滚轮 zoom 自由选定。
+    // crop 在前端完成(canvas):后端 save_custom_theme 收到已是 16:9 图,只做
+    // 等比 resize + JPEG encode 不再二次 crop;user 可拖框 + 滚轮 zoom 自由选定。
     window.__themeUploadHandler = async () => {
       const input = document.createElement("input");
       input.type = "file";

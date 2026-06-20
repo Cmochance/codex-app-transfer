@@ -42,7 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 axum = { version = "0.8", features = ["http1", "tokio", "macros"] }
 base64 = "0.22"
-# Theme 自定义背景(#264):decode 用户上传图 → 中心 crop 方形 → resize → encode JPEG。
+# Theme 自定义背景(#264):decode 用户上传图 → 等比 resize → encode JPEG。
 # default-features = false 关掉 GIF/WebP/ICO/PNM 等少用格式只保 JPG/PNG,减体积。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 getrandom = "0.2"

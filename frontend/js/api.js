@@ -668,9 +668,9 @@ window.CCApi.theme = {
   async restartCodex() {
     return api('POST', '/api/desktop/restart-codex-app');
   },
-  /** 上传 / 替换自定义主题图。流程:前端 `openCropModal` 让 user 拖选 1:1
-   *  区域 → canvas 已 crop 成方形 JPEG → 后端再 center-crop(已是方图时 no-op)
-   *  + resize 2048 + JPEG encode 写 `~/.codex-app-transfer/themes/custom/`。
+  /** 上传 / 替换自定义主题图。流程:前端 `openCropModal` 让 user 拖选 16:9
+   *  区域 → canvas 已 crop 成 16:9 JPEG → 后端再做等比 resize(最长边 ≤2048)
+   *  + JPEG encode 写 `~/.codex-app-transfer/themes/custom/`。
    *  `dataUri` 形如 `data:image/jpeg;base64,...` */
   async uploadCustom(dataUri) {
     return api('POST', '/api/desktop/theme/custom/upload', { data_uri: dataUri });
