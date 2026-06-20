@@ -126,6 +126,234 @@ pub fn emit_result(call_id: &str, output: &Value) {
     (hook.sink)(build_result_value(call_id, &text));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MOC-263 P3:shell 写盘诊断埋点。模型可能用 `exec_command`(shell)跑 sed -i / cat> / echo> /
+// python write / `apply_patch <<EOF` 等**直接改文件**,绕过结构化 apply_patch(因此既不过 preflight
+// 双重兜底、也不进上面的 apply_patch 埋点)。这里在转换器处理 exec_command 类工具调用时识别写盘命令
+// 并 emit 一条 `trace_kind:"shell_edit"` 诊断(走同一 sink/gate),让诊断页 / jsonl 能看见"多少编辑
+// 绕过了 apply_patch",支撑 phase-2 对 shell 改文件行为的深入分析。**纯观测,不拦截、不改命令。**
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 被视作 shell 执行的工具名(其参数里可能含改文件命令)。
+pub fn is_shell_exec_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "exec_command" | "shell" | "execute_command" | "local_shell" | "container.exec"
+    )
+}
+
+/// 从 shell 串里剔除 fd→/dev 噪音重定向(`2>/dev/null` / `>/dev/null` / `2>&1` / `&>/dev/null`),
+/// 避免把它们的 `>` 误判成写盘。
+fn strip_dev_redirects(cmd: &str) -> String {
+    let mut out = cmd.to_owned();
+    for pat in [
+        "2>/dev/null",
+        "1>/dev/null",
+        ">/dev/null",
+        "&>/dev/null",
+        "2>&1",
+        "2> /dev/null",
+        "> /dev/null",
+    ] {
+        out = out.replace(pat, " ");
+    }
+    out
+}
+
+/// 把 shell 串按子命令边界(换行 / `;` / `|` / `&&` / `||` / `&`)粗切。分隔符均 ASCII,
+/// 按字节切片不会切坏 UTF-8(ASCII 字节不可能是多字节序列的一部分)。
+fn split_subcommands(cmd: &str) -> Vec<&str> {
+    let b = cmd.as_bytes();
+    let mut segs = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'\n' || b[i] == b';' || b[i] == b'|' {
+            segs.push(&cmd[start..i]);
+            start = i + 1;
+            i += 1;
+        } else if b[i] == b'&' && b.get(i + 1) == Some(&b'&') {
+            segs.push(&cmd[start..i]);
+            start = i + 2;
+            i += 2;
+        } else if b[i] == b'&' {
+            segs.push(&cmd[start..i]);
+            start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    segs.push(&cmd[start..]);
+    segs
+}
+
+/// 子命令里命令词 `w` 是否作为独立 token 出现(粗判,容许前导 `cd`/赋值已被切分)。
+fn has_word(s: &str, w: &str) -> bool {
+    s.split(|c: char| c.is_whitespace()).any(|t| t == w)
+}
+
+/// 是否带「就地编辑」标志(`sed -i` / `perl -pi` / `--in-place`)。
+fn has_inplace_flag(s: &str) -> bool {
+    s.split(|c: char| c.is_whitespace()).any(|t| {
+        t == "--in-place"
+            || t.starts_with("--in-place=")
+            || (t.starts_with('-') && !t.starts_with("--") && t.len() > 1 && t[1..].contains('i'))
+    })
+}
+
+/// 子命令是否把输出重定向写进**真实文件**(已剔除 /dev 噪音后仍含 `>`)。
+fn redirects_to_file(s: &str) -> bool {
+    s.contains('>')
+}
+
+/// 首 token 是否只读类(awk/grep/rg/find/diff/sort/jq/`sed -n`)—— 用于 generic 重定向写盘排除。
+fn starts_with_reader(s: &str) -> bool {
+    let t = s.trim_start();
+    let first = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+    matches!(
+        first,
+        "awk" | "grep" | "rg" | "find" | "diff" | "comm" | "sort" | "jq"
+    ) || (has_word(s, "sed") && t.contains(" -n"))
+}
+
+/// 识别 shell 串里的「写盘 / 改文件」操作(MOC-263 P3 诊断用)。返回命中的种类(可多个);
+/// 纯只读(git/ls/grep/cargo/cat 读 等)返回空。宁可少报不滥报:只认明确的写盘形态。
+pub fn classify_shell_write(cmd: &str) -> Vec<&'static str> {
+    let mut kinds: Vec<&'static str> = Vec::new();
+    let push = |k: &'static str, v: &mut Vec<&'static str>| {
+        if !v.contains(&k) {
+            v.push(k);
+        }
+    };
+    // 整串级:heredoc / -c 形态(子命令切分会破坏 heredoc 体,故看整串)。
+    if cmd.contains("apply_patch") && (cmd.contains("<<") || cmd.contains("*** Begin Patch")) {
+        push("apply_patch_via_shell", &mut kinds);
+    }
+    if (has_word(cmd, "python") || has_word(cmd, "python3"))
+        && (cmd.contains("<<") || cmd.contains(" -c"))
+        && (cmd.contains(".write(")
+            || cmd.contains("write_text")
+            || cmd.contains("writelines")
+            || (cmd.contains("open(")
+                && (cmd.contains("'w'")
+                    || cmd.contains("\"w\"")
+                    || cmd.contains("'a'")
+                    || cmd.contains("\"a\"")
+                    || cmd.contains("'w+'")
+                    || cmd.contains("'x'"))))
+    {
+        push("python_write", &mut kinds);
+    }
+    if has_word(cmd, "node")
+        && (cmd.contains("writeFileSync")
+            || cmd.contains("createWriteStream")
+            || cmd.contains("fs.write"))
+    {
+        push("node_write", &mut kinds);
+    }
+    // 子命令级:就地编辑 / 重定向写盘。
+    let normalized = strip_dev_redirects(cmd);
+    for seg in split_subcommands(&normalized) {
+        let s = seg.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if has_word(s, "sed") && has_inplace_flag(s) {
+            push("sed_inplace", &mut kinds);
+        } else if has_word(s, "perl") && has_inplace_flag(s) {
+            push("perl_inplace", &mut kinds);
+        } else if has_word(s, "tee") {
+            push("tee_write", &mut kinds);
+        } else if has_word(s, "truncate") {
+            push("truncate", &mut kinds);
+        } else if redirects_to_file(s) && !starts_with_reader(s) {
+            // echo>/cat>/printf> 及通用 `prog > file`(已排除 awk/grep/sed -n 等只读左侧)。
+            push("redirect_write", &mut kinds);
+        }
+    }
+    kinds
+}
+
+/// 从 exec_command 工具的 args(`{"cmd":"..."}` / 别名)里抽出 shell 命令文本。
+fn extract_shell_cmd(args_raw: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(args_raw.trim()).ok()?;
+    let obj = v.as_object()?;
+    for k in ["cmd", "command", "script", "input"] {
+        if let Some(val) = obj.get(k) {
+            if let Some(s) = val.as_str() {
+                return Some(s.to_owned());
+            }
+            if let Some(arr) = val.as_array() {
+                let joined: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned))
+                    .collect();
+                if !joined.is_empty() {
+                    return Some(joined.join(" "));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 采集开启 + 该 exec_command 是写盘命令时,emit 一条 `shell_edit` 诊断(模型用 shell 直接改文件、
+/// 绕过结构化 apply_patch)。否则零开销返回(先 gate,再 extract+classify)。`tool` 是工具名、
+/// `args_raw` 是原始工具参数。纯观测。
+pub fn emit_shell_edit(
+    source: &str,
+    model: &str,
+    call_id: &str,
+    fc_id: &str,
+    tool: &str,
+    args_raw: &str,
+) {
+    let Some(hook) = HOOK.get() else { return };
+    if !(hook.gate)() {
+        return;
+    }
+    let Some(cmd) = extract_shell_cmd(args_raw) else {
+        return;
+    };
+    let kinds = classify_shell_write(&cmd);
+    if kinds.is_empty() {
+        return;
+    }
+    (hook.sink)(build_shell_edit_value(
+        source, model, call_id, fc_id, tool, &cmd, &kinds,
+    ));
+}
+
+/// 构造 `shell_edit` 诊断 `Value`(seq/captured_at 由 proxy sink 补)。`pub(crate)` 供测试。
+pub(crate) fn build_shell_edit_value(
+    source: &str,
+    model: &str,
+    call_id: &str,
+    fc_id: &str,
+    tool: &str,
+    cmd: &str,
+    kinds: &[&str],
+) -> Value {
+    let (cmd_text, cmd_trunc) = cap_field(cmd);
+    json!({
+        "trace_kind": "shell_edit",
+        "phase": "call",
+        "source": source,
+        "model": model,
+        "call_id": call_id,
+        "fc_id": fc_id,
+        "tool": tool,
+        "bypass": "apply_patch",
+        "write_kinds": kinds,
+        "cmd": {
+            "len": cmd.len(),
+            "truncated_bytes": cmd_trunc,
+            "text": cmd_text,
+        },
+    })
+}
+
 /// 把一条 [`ApplyPatchTrace`] 构造成诊断 `Value`(viewer / jsonl 用)。`seq`/`captured_at`/
 /// `proxy_version` 由 proxy 注册的 sink 补(那里能拿到 `next_seq` + 版本号)。`pub(crate)` 供测试。
 pub(crate) fn build_value(t: &ApplyPatchTrace) -> Value {
@@ -411,6 +639,60 @@ mod tests {
         register_pending(id);
         assert!(take_pending(id), "首次结果应配对成功");
         assert!(!take_pending(id), "历史重放的重复结果应被去重(已移除)");
+    }
+
+    #[test]
+    fn classify_shell_write_flags_real_writes_only() {
+        // MOC-263 P3:写盘命令 → 命中对应种类。
+        assert!(classify_shell_write("sed -i '' '199,282d' f.rs").contains(&"sed_inplace"));
+        assert!(classify_shell_write("sed -i 's/a/b/' f.rs").contains(&"sed_inplace"));
+        assert!(classify_shell_write("perl -pi -e 's/x/y/' f.rs").contains(&"perl_inplace"));
+        assert!(classify_shell_write("echo \"}\" >> f.rs").contains(&"redirect_write"));
+        assert!(classify_shell_write("cat > new.rs <<'EOF'\nx\nEOF").contains(&"redirect_write"));
+        assert!(classify_shell_write("tee -a Cargo.toml").contains(&"tee_write"));
+        assert!(
+            classify_shell_write("python3 - <<'PY'\nopen('f','w').write(1)\nPY")
+                .contains(&"python_write")
+        );
+        assert!(
+            classify_shell_write("apply_patch <<'EOF'\n*** Begin Patch\nEOF")
+                .contains(&"apply_patch_via_shell")
+        );
+        // 只读命令 → 空(不滥报):管道/读取/awk NR>=/cargo/find/跑脚本。
+        assert!(classify_shell_write("cd x && git log --oneline 2>/dev/null | head").is_empty());
+        assert!(classify_shell_write("cat agent/issues.md 2>/dev/null | head -120").is_empty());
+        assert!(classify_shell_write("cargo check 2>&1 | tail").is_empty());
+        assert!(classify_shell_write("grep -rn foo src/ > /dev/null").is_empty());
+        assert!(classify_shell_write("awk 'NR>=199 && NR<=240' f.rs").is_empty());
+        assert!(classify_shell_write("python3 train.py --epochs 3").is_empty());
+        assert!(classify_shell_write("ls -la && find . -type f").is_empty());
+        assert!(classify_shell_write("cat file.rs").is_empty());
+    }
+
+    #[test]
+    fn extract_and_build_shell_edit() {
+        assert_eq!(
+            extract_shell_cmd(r#"{"cmd":"sed -i '' '1d' f.rs"}"#).as_deref(),
+            Some("sed -i '' '1d' f.rs")
+        );
+        let v = build_shell_edit_value(
+            "chat",
+            "glm-5.2",
+            "call_1",
+            "fc_1",
+            "exec_command",
+            "sed -i '' '1d' f.rs",
+            &["sed_inplace"],
+        );
+        assert_eq!(v["trace_kind"], "shell_edit");
+        assert_eq!(v["bypass"], "apply_patch");
+        assert_eq!(v["tool"], "exec_command");
+        assert!(v["write_kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "sed_inplace"));
+        assert!(v["cmd"]["text"].as_str().unwrap().contains("sed -i"));
     }
 
     #[test]

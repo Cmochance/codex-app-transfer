@@ -14,6 +14,7 @@
 //! - **Add File / Delete File 不碰**(无锚点,不涉及匹配)。读不到文件 / 无 cwd → 原样放行。
 //! - 每条修复 / 放行都记进 apply-patch 诊断页,可审计。
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -41,24 +42,80 @@ pub fn repairs_to_value(repairs: &[Repair]) -> Value {
     Value::Array(repairs.iter().map(Repair::to_value).collect())
 }
 
-/// [MOC-194] 进程级「最近一次见到的 cwd」缓存。`optimize_patch` 用它跨请求记忆:Codex 只在
-/// turn 开头请求发 `<cwd>`,apply_patch 工具循环后续请求 inbound 不带 cwd,不记忆则读盘规则全程
-/// 失效。带 cwd 的请求更新缓存,不带的回退到缓存值。
-static LAST_CWD: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// [MOC-194/MOC-263] 进程级「最近见过的 cwd」候选历史(most-recent-first,去重,容量上限)。
+///
+/// **为什么从单槽改成候选列表(MOC-263 P1)**:Codex 只在 turn-start 请求发 `<cwd>`,apply_patch
+/// 工具循环后续请求不带 cwd → 靠跨请求记忆。旧实现是**进程级单槽**,多个 Codex 会话并发时(真机
+/// 常态:同时开 N 个对话改不同项目)单槽被**别的会话**的 turn-start cwd 持续覆盖 → apply_patch
+/// 请求回退到的是**别项目的 stale cwd** → Tier B 读盘规则解析到错目录 → 全程 `skipped:unreadable`
+/// (实测 phase-1:5/5 段兜底全废)。改成**最近 N 个不同 cwd 的候选列表**:读盘时对每个候选试
+/// `cwd/相对路径` 是否存在,选**第一个存在**的(真项目 cwd 才有该文件,stale cwd 没有 → 自动选对)。
+/// 命中错 cwd 的同名文件最坏让后续锚点匹配失败 → 安全 skip,绝不误改(保持「不猜不丢」)。
+const CWD_CANDIDATES_CAP: usize = 12;
+static CWD_HISTORY: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 
-/// 当前请求带 cwd 则更新缓存并返回;不带则返回缓存的「最近 cwd」(可能为 None)。
-fn remember_or_recall_cwd(cwd: Option<&str>) -> Option<String> {
-    let cell = LAST_CWD.get_or_init(|| Mutex::new(None));
-    let Ok(mut last) = cell.lock() else {
-        return cwd.map(str::to_owned);
-    };
-    match cwd {
-        Some(c) if !c.is_empty() => {
-            *last = Some(c.to_owned());
-            last.clone()
-        }
-        _ => last.clone(),
+fn cwd_history() -> &'static Mutex<VecDeque<String>> {
+    CWD_HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// 记一个最近见到的 cwd(去重置顶,超 [`CWD_CANDIDATES_CAP`] 淘汰最旧)。空串忽略。
+fn remember_cwd(cwd: &str) {
+    if cwd.is_empty() {
+        return;
     }
+    if let Ok(mut q) = cwd_history().lock() {
+        if let Some(pos) = q.iter().position(|c| c == cwd) {
+            q.remove(pos);
+        }
+        q.push_front(cwd.to_owned());
+        while q.len() > CWD_CANDIDATES_CAP {
+            q.pop_back();
+        }
+    }
+}
+
+/// 最近见过的 cwd 候选(most-recent-first)。
+fn recall_cwd_candidates() -> Vec<String> {
+    cwd_history()
+        .lock()
+        .map(|q| q.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// 是否有任何可用 cwd(当前请求的 `primary` 或历史候选)。byte-exact 规则据此短路。
+fn has_cwd_candidate(primary: Option<&str>) -> bool {
+    primary.map(|c| !c.is_empty()).unwrap_or(false) || !recall_cwd_candidates().is_empty()
+}
+
+/// 按候选 cwd 解析并读取 patch 目标文件(MOC-263 P1)。`primary`(当前请求 cwd,apply_patch
+/// 请求通常 None)优先,再按最近 cwd 历史逐个试,返回**第一个存在且可读**的 `(绝对路径, 内容)`。
+/// 绝对路径直接读。命中错 cwd 的同名文件最坏让调用方锚点匹配失败 → 安全 skip,不会误改。
+/// 单测里调用方传 `Some(<真实 tmp cwd>)` → primary 优先命中、不依赖全局历史 → 确定性。
+fn read_patch_file(relpath: &str, primary: Option<&str>) -> Option<(PathBuf, String)> {
+    let p = Path::new(relpath);
+    if p.is_absolute() {
+        return std::fs::read_to_string(p)
+            .ok()
+            .map(|c| (p.to_path_buf(), c));
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(c) = primary {
+        if !c.is_empty() {
+            candidates.push(c.to_owned());
+        }
+    }
+    for c in recall_cwd_candidates() {
+        if !candidates.iter().any(|x| x == &c) {
+            candidates.push(c);
+        }
+    }
+    for c in &candidates {
+        let abs = Path::new(c).join(p);
+        if let Ok(content) = std::fs::read_to_string(&abs) {
+            return Some((abs, content));
+        }
+    }
+    None
 }
 
 /// 从 Codex Responses 请求里抽 `<cwd>...</cwd>`(Codex 注入的 environment_context 块,
@@ -100,7 +157,7 @@ fn extract_cwd_from_str(s: &str) -> Option<String> {
 /// (转换器 `with_original_request`),turn-start 的 cwd 才能被后续 apply_patch 请求回退到。
 pub fn remember_cwd_from_request(request: Option<&Value>) {
     if let Some(cwd) = extract_cwd(request) {
-        let _ = remember_or_recall_cwd(Some(&cwd));
+        remember_cwd(&cwd);
     }
 }
 
@@ -126,21 +183,25 @@ pub fn remember_cwd_from_request(request: Option<&Value>) {
 /// 未覆盖的错点:**原样透过**,交 Codex applier 报错(不猜不丢)。
 /// `json_complete`:调用方传 `detect_json_truncation(args).is_none()`(chat);gemini args 一次性完整传 `true`。
 pub fn optimize_patch(v4a: &str, cwd: Option<&str>, json_complete: bool) -> (String, Vec<Repair>) {
-    // [MOC-194] **两类 cwd,分流使用**:
+    // [MOC-194/MOC-263] **两类 cwd,分流使用**:
     // - `fresh_cwd` = 当前请求自带的 `<cwd>`(apply_patch 请求通常 None)。**判定文件 == Codex 应用
     //   文件**,可信。
-    // - `recall_cwd` = 跨请求记忆的最近 cwd(Codex 只在 turn-start 请求发 `<cwd>`,apply_patch 工具
-    //   循环后续请求不带 → 不记忆则读盘规则全 no-op)。可能 stale(多项目并发时被别项目污染)。
+    // - 候选历史 = 跨请求记忆的最近 N 个不同 cwd([`recall_cwd_candidates`])。Codex 只在 turn-start
+    //   请求发 `<cwd>`,apply_patch 工具循环后续请求不带 → 靠它回退。MOC-263:从单槽改候选列表,
+    //   并发多会话不再被别项目 stale cwd 覆盖(读盘按候选逐个试、选第一个存在的)。
     //
     // **状态改写规则**(`recover_update_empty_file` / `recover_empty_move`:把 Update 转成 Delete+Add)
-    // 的判定文件(读 recall_cwd)与应用文件(Codex 用 patch 相对路径在真实 cwd 应用)**可能不是同一个**
-    // → stale cwd 下会删错项目的同名文件(破坏性)。故这两条**只用 fresh_cwd**(判定==应用才安全);
+    // 的判定文件与应用文件(Codex 用 patch 相对路径在真实 cwd 应用)**可能不是同一个** → 错 cwd 下会
+    // 删错项目的同名文件(破坏性)。故这两条**只用 fresh_cwd**(判定==应用才安全),**不查候选历史**;
     // apply_patch 请求无 fresh cwd → 自动跳过透过(安全)。
-    // **byte-exact 对齐规则**(align/preflight/fix_unprefixed)用 recall_cwd:最坏 stale 也只是「文件不存在
-    // / 不唯一匹配 / byte 不符」→ 安全 no-op,不会误改。
+    // **byte-exact 对齐规则**(align/preflight/fix_unprefixed)传 `fresh_cwd` 作 primary,内部经
+    // [`read_patch_file`] 再查候选历史:最坏命中错文件也只是「不唯一匹配 / byte 不符」→ 安全 no-op。
     let fresh_cwd = cwd;
-    let recalled = remember_or_recall_cwd(cwd);
-    let recall_cwd = recalled.as_deref();
+    // 当前请求若带 cwd,记入候选历史(turn-start 的 cwd 主要由转换器 `remember_cwd_from_request`
+    // 在每请求记入;这里兜底:万一 apply_patch 请求自带 cwd 也纳入)。
+    if let Some(c) = cwd {
+        remember_cwd(c);
+    }
     let mut repairs = Vec::new();
     let mut s = v4a.to_owned();
 
@@ -167,16 +228,16 @@ pub fn optimize_patch(v4a: &str, cwd: Option<&str>, json_complete: bool) -> (Str
     s = s3;
     repairs.extend(r3);
 
-    // byte-exact 对齐规则 → recall_cwd(最坏安全 no-op)。
-    let (s_h, r_h) = align_at_headers(&s, recall_cwd);
+    // byte-exact 对齐规则 → 传 fresh_cwd 作 primary,内部 read_patch_file 再查候选历史(最坏安全 no-op)。
+    let (s_h, r_h) = align_at_headers(&s, fresh_cwd);
     s = s_h;
     repairs.extend(r_h);
 
-    let (s_u, r_u) = fix_unprefixed_lines(&s, recall_cwd);
+    let (s_u, r_u) = fix_unprefixed_lines(&s, fresh_cwd);
     s = s_u;
     repairs.extend(r_u);
 
-    let (s2, r2) = preflight_repair(&s, recall_cwd);
+    let (s2, r2) = preflight_repair(&s, fresh_cwd);
     s = s2;
     repairs.extend(r2);
 
@@ -282,9 +343,9 @@ fn ensure_add_file_plus(v4a: &str) -> (String, Vec<Repair>) {
 /// 文件里任何**整行**、但**恰好唯一包含于**某一文件行时,把 `@@ <header>` 对齐成 `@@ <该文件整行>`;
 /// 0 个 / 多个包含 → 歧义,原样放行(不猜)。裸 `@@`(无 header)不动。需 `cwd`。
 fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
-    let Some(cwd) = cwd else {
+    if !has_cwd_candidate(cwd) {
         return (v4a.to_owned(), Vec::new());
-    };
+    }
     if !v4a.contains("*** Update File:") {
         return (v4a.to_owned(), Vec::new());
     }
@@ -297,9 +358,9 @@ fn align_at_headers(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     let mut i = 0;
     while i < lines.len() {
         if let Some(path) = lines[i].strip_prefix("*** Update File: ") {
-            // 切到新 Update File section → 载入该文件行
-            file_lines = std::fs::read_to_string(resolve_path(path.trim(), cwd))
-                .map(|c| c.lines().map(str::to_owned).collect())
+            // 切到新 Update File section → 载入该文件行(MOC-263:按候选 cwd 解析)
+            file_lines = read_patch_file(path.trim(), cwd)
+                .map(|(_, c)| c.lines().map(str::to_owned).collect())
                 .unwrap_or_default();
             have_file = !file_lines.is_empty();
             out.push(lines[i].to_owned());
@@ -558,9 +619,9 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
 ///
 /// 仅作用于 `*** Update File:` section(Add File 的漏 `+` 由 [`ensure_add_file_plus`] 管)。需 `cwd`。
 fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
-    let Some(cwd) = cwd else {
+    if !has_cwd_candidate(cwd) {
         return (v4a.to_owned(), Vec::new());
-    };
+    }
     if !v4a.contains("*** Update File:") {
         return (v4a.to_owned(), Vec::new());
     }
@@ -576,8 +637,8 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
         let l = lines[i];
         if let Some(path) = l.strip_prefix("*** Update File: ") {
             in_update = true;
-            file_lines = std::fs::read_to_string(resolve_path(path.trim(), cwd))
-                .map(|c| c.lines().map(str::to_owned).collect())
+            file_lines = read_patch_file(path.trim(), cwd)
+                .map(|(_, c)| c.lines().map(str::to_owned).collect())
                 .unwrap_or_default();
             out.push(l.to_owned());
             i += 1;
@@ -634,9 +695,9 @@ fn fix_unprefixed_lines(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
 /// 对 V4A patch 做 pre-flight 修复。`cwd` 用于把 patch 的相对路径解析到真实文件。
 /// 返回 `(修复后 V4A, 处理记录)`。无 cwd / 无 `Update File` / 读不到文件时 V4A 原样返回。
 pub fn preflight_repair(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
-    let Some(cwd) = cwd else {
+    if !has_cwd_candidate(cwd) {
         return (v4a.to_owned(), Vec::new());
-    };
+    }
     // 没有任何 Update File 直接短路(Add/Delete File 不涉及锚点匹配)。
     if !v4a.contains("*** Update File:") {
         return (v4a.to_owned(), Vec::new());
@@ -672,23 +733,142 @@ pub fn preflight_repair(v4a: &str, cwd: Option<&str>) -> (String, Vec<Repair>) {
     (joined, repairs)
 }
 
+/// [MOC-263 P0] 在 `file[floor..]` 里找从 `anchors[0]` 起、能**唯一**匹配的最长连续块。
+/// 锚点用「忽略尾随空格」比较(段内字节漂移留给后续 repair_hunk 对齐)。返回 `(块长 = 匹配的锚点数,
+/// 文件起点)`。最长且唯一 → Some;最长的非空匹配若 >1 处(歧义)→ None(更短只会更歧义);全 0 → None。
+fn longest_unique_block(anchors: &[&str], file: &[&str], floor: usize) -> Option<(usize, usize)> {
+    if anchors.is_empty() || floor >= file.len() {
+        return None;
+    }
+    let max_len = anchors.len().min(file.len() - floor);
+    for len in (1..=max_len).rev() {
+        let block = &anchors[..len];
+        let mut hits: Vec<usize> = Vec::new();
+        let mut start = floor;
+        while start + len <= file.len() {
+            if (0..len).all(|t| file[start + t].trim_end() == block[t].trim_end()) {
+                hits.push(start);
+                if hits.len() > 1 {
+                    break;
+                }
+            }
+            start += 1;
+        }
+        match hits.len() {
+            1 => return Some((len, hits[0])),
+            0 => continue,    // 太长(跨越文件里的跳变)→ 缩短再试
+            _ => return None, // 最长非空匹配即歧义 → 放弃(不猜不丢)
+        }
+    }
+    None
+}
+
+/// [MOC-263 P0] 把**无 `@@`** 的 Update body 按文件真实位置切成多个 hunk。
+///
+/// 真机最主要 apply 失败因(phase-1 seg1/seg3):模型把多个**不连续**编辑组拼进一个 Update File 块、
+/// 漏写 `@@` 分隔 → applier 把整块当一段连续上下文匹配 → `Failed to find expected lines`。
+/// 这里按锚点(context/delete)序列贪心切成**有序、不重叠、各自唯一匹配**的 N 段(每段 = 从上一段
+/// 之后起、唯一匹配的最长连续锚点块),`+` 新增行随相邻段保留。仅 **N≥2 且每段都能唯一定位**时返回
+/// `Some`;单段 / 任一段歧义或无法定位 → `None`(调用方原样透过,不猜不丢)。调用方用裸 `@@` 串接各段。
+fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a str>>> {
+    let anchors: Vec<(usize, &str)> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, l)| match l.chars().next() {
+            Some(' ') | Some('-') => Some((idx, &l[1..])),
+            _ => None,
+        })
+        .collect();
+    if anchors.len() < 2 {
+        return None;
+    }
+    let anchor_contents: Vec<&str> = anchors.iter().map(|(_, c)| *c).collect();
+
+    // 贪心分段:每段 = 从 floor 起唯一匹配的最长连续锚点块。
+    // 记 (anchor_start, anchor_end_excl, file_start, file_end_excl);floor 单调推进保证有序不重叠。
+    let mut raw: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut ai = 0usize;
+    let mut floor = 0usize;
+    while ai < anchors.len() {
+        let (len, pos) = longest_unique_block(&anchor_contents[ai..], file, floor)?;
+        raw.push((ai, ai + len, pos, pos + len));
+        ai += len;
+        floor = pos + len;
+    }
+
+    // 合并相邻段:段间 file 间隙若**全空行**(模型漏写文件里的空行)→ 同一 hunk,不在此切,
+    // 交 repair_hunk 的 EP-1 blank-tolerant 处理(否则会把空行漂移误切成两段,破坏既有行为)。
+    // 只在间隙含**非空行**(真·不连续编辑区域)时才保留为独立段。
+    let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for g in raw {
+        if let Some(last) = groups.last_mut() {
+            let gap = &file[last.3..g.2];
+            if gap.iter().all(|l| l.trim().is_empty()) {
+                last.1 = g.1;
+                last.3 = g.3;
+                continue;
+            }
+        }
+        groups.push(g);
+    }
+    if groups.len() < 2 {
+        return None; // 单段(或全因空行间隙合并成单段)→ 没必要切,交回常规路径
+    }
+
+    // 段 g 的 body 行区间:首段含开头前导行(body[0..首锚点]);其余段从其首锚点起,
+    // 到下一段首锚点止 → 段内 / 段后的 `+` 行随**前**段保留。
+    let mut subhunks: Vec<Vec<&'a str>> = Vec::new();
+    for gi in 0..groups.len() {
+        let line_start = if gi == 0 { 0 } else { anchors[groups[gi].0].0 };
+        let line_end = if gi + 1 < groups.len() {
+            anchors[groups[gi + 1].0].0
+        } else {
+            body.len()
+        };
+        subhunks.push(body[line_start..line_end].to_vec());
+    }
+    Some(subhunks)
+}
+
 /// 修复一个 `Update File` section 的 body。`path` 是 patch 里的(相对)路径。
-fn repair_update_section(path: &str, body: &[&str], cwd: &str) -> (Vec<String>, Repair) {
-    let abs = resolve_path(path, cwd);
-    let Ok(content) = std::fs::read_to_string(&abs) else {
+/// `cwd` 是当前请求 cwd(primary hint),读盘经 [`read_patch_file`] 再按候选历史解析(MOC-263)。
+fn repair_update_section(path: &str, body: &[&str], cwd: Option<&str>) -> (Vec<String>, Repair) {
+    let Some((_abs, content)) = read_patch_file(path, cwd) else {
         return (
             body.iter().map(|l| (*l).to_owned()).collect(),
             Repair {
                 file: path.to_owned(),
                 kind: "skipped:unreadable".to_owned(),
-                detail: format!("读不到文件 {} → 原样放行", abs.display()),
+                detail: format!("读不到文件 {path}(候选 cwd 均无)→ 原样放行"),
             },
         );
     };
     let file_lines: Vec<&str> = content.lines().collect();
 
+    // [MOC-263 P0] body 无 `@@` 但含多个不连续编辑组(模型漏写 `@@` 分隔)→ 自动按文件位置切段、
+    // 用裸 `@@` 串接,使 applier 把各段当独立 hunk 定位(否则整块当一段连续上下文必失配)。
+    // 仅唯一可分段时才动;单段 / 歧义 → 保持原 body 交常规路径。
+    let mut split_owned: Vec<&str> = Vec::new();
+    let did_split = if !body.iter().any(|l| l.trim_start().starts_with("@@")) {
+        match segment_no_at_body(body, &file_lines) {
+            Some(subhunks) => {
+                for (k, sub) in subhunks.iter().enumerate() {
+                    if k > 0 {
+                        split_owned.push("@@");
+                    }
+                    split_owned.extend_from_slice(sub);
+                }
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    let effective_body: &[&str] = if did_split { &split_owned } else { body };
+
     // 把 body 切成 hunk(按 `@@` 行分段;`@@` 行本身保留、不参与锚点匹配)。
-    let mut new_body: Vec<String> = Vec::with_capacity(body.len());
+    let mut new_body: Vec<String> = Vec::with_capacity(effective_body.len());
     let mut repaired_hunks = 0;
     let mut clean_hunks = 0;
     let mut skipped: Vec<String> = Vec::new();
@@ -718,7 +898,7 @@ fn repair_update_section(path: &str, body: &[&str], cwd: &str) -> (Vec<String>, 
         hunk.clear();
     };
 
-    for &l in body {
+    for &l in effective_body {
         if l.starts_with("@@") {
             flush(
                 &mut hunk,
@@ -740,7 +920,7 @@ fn repair_update_section(path: &str, body: &[&str], cwd: &str) -> (Vec<String>, 
         &mut skipped,
     );
 
-    let kind = if repaired_hunks > 0 {
+    let kind = if repaired_hunks > 0 || did_split {
         "repaired"
     } else if skipped.is_empty() {
         "clean"
@@ -748,7 +928,12 @@ fn repair_update_section(path: &str, body: &[&str], cwd: &str) -> (Vec<String>, 
         "skipped:no_unique_match"
     };
     let detail = format!(
-        "hunk: 修复 {repaired_hunks} / 本就匹配 {clean_hunks} / 放行 {}{}",
+        "{}hunk: 修复 {repaired_hunks} / 本就匹配 {clean_hunks} / 放行 {}{}",
+        if did_split {
+            "多 hunk 无 @@ 分隔 → 自动按文件位置切段插裸 @@; "
+        } else {
+            ""
+        },
         skipped.len(),
         if skipped.is_empty() {
             String::new()
@@ -1312,19 +1497,93 @@ mod tests {
     }
 
     #[test]
-    fn cwd_recall_remembers_last_seen() {
-        // 带 cwd → 更新并返回;不带 → 回退到最近缓存(全局态,只做非 flaky 断言)。
-        let a = remember_or_recall_cwd(Some("/tmp/recall_unique_path_7af3"));
-        assert_eq!(a.as_deref(), Some("/tmp/recall_unique_path_7af3"));
-        // 不带 cwd → 必有缓存值(刚设过),不为 None。
-        assert!(remember_or_recall_cwd(None).is_some());
-        // remember_cwd_from_request 从 turn-start 请求抽 cwd 并写入缓存(供后续 apply_patch 回退)。
+    fn cwd_candidates_remember_recall_and_resolve() {
+        // MOC-263 P1:候选历史(deque)+ read_patch_file 按候选解析(全局态,只做非 flaky 断言)。
+        let (dir, name) = tmp_file("cand_moc263.txt", "x\n");
+        let real = dir.path().to_str().unwrap().to_owned();
+        // 模拟并发污染:先记一个不含该文件的 stale cwd,再记真实 cwd(置顶)。
+        remember_cwd("/tmp/stale_zzz_moc263_a");
+        remember_cwd(&real);
+        assert!(recall_cwd_candidates().iter().any(|c| c == &real));
+        assert!(has_cwd_candidate(None), "有候选历史 → true");
+        // primary=None(apply_patch 工具循环请求),真实 cwd 在候选里 → 读到文件
+        // (stale cwd 无此文件,逐个试时自动跳过)。这是 P1 的核心:不再被 stale 单槽废掉。
+        let got = read_patch_file(&name, None);
+        assert!(got.is_some(), "应经候选 cwd 读到文件");
+        assert_eq!(got.unwrap().1, "x\n");
+        // turn-start 请求抽 cwd 入候选(供后续 apply_patch 回退)。
         let req = json!({"input":[{"type":"message","role":"user","content":"<environment_context>\n  <cwd>/tmp/ts_proj_b3f9</cwd>\n</environment_context>"}]});
         remember_cwd_from_request(Some(&req));
-        assert!(
-            remember_or_recall_cwd(None).is_some(),
-            "remember 后 recall 应有值"
+        assert!(recall_cwd_candidates()
+            .iter()
+            .any(|c| c == "/tmp/ts_proj_b3f9"));
+    }
+
+    #[test]
+    fn preflight_aligns_via_candidate_cwd_with_none_primary() {
+        // MOC-263 P1 端到端:apply_patch 请求 cwd=None,真实 cwd 仅在候选历史里 → 仍能读盘对齐。
+        let (dir, name) = tmp_file("p1_e2e_moc263.txt", "alpha\nbeta\ngamma\n");
+        let real = dir.path().to_str().unwrap().to_owned();
+        remember_cwd(&real);
+        // context 带尾随空格(需读盘对齐);primary=None,靠候选历史找到真实文件。
+        let v4a = format!(
+            "*** Begin Patch\n*** Update File: {name}\n beta   \n+inserted\n*** End Patch\n"
         );
+        let (out, reps) = preflight_repair(&v4a, None);
+        assert!(
+            out.contains("\n beta\n"),
+            "应经候选 cwd 读盘对齐尾随空格:\n{out}"
+        );
+        assert!(out.contains("+inserted"), "新增行保留");
+        assert_eq!(reps[0].kind, "repaired", "{:?}", reps);
+    }
+
+    #[test]
+    fn multi_hunk_no_at_separator_auto_split() {
+        // MOC-263 P0:多个不连续 hunk 拼一个 Update File 块、无 @@(phase-1 seg1 真机失败形态)
+        // → 自动按文件位置切段、插裸 @@,各段独立定位。
+        let content = "const fetching = ref(false)\nconst a = 1\nconst b = 2\nfunction onMimoLogin() {\n  doStuff()\n}\nconst c = 3\n<SettingsRow title=\"API Key\">\n  <Input/>\n</SettingsRow>\n";
+        let (dir, name) = tmp_file("multi.vue", content);
+        let cwd = dir.path().to_str().unwrap();
+        let v4a = format!(
+            "*** Begin Patch\n*** Update File: {name}\n-const fetching = ref(false)\n+const fetching = ref(false)\n+const testing = ref(false)\n-function onMimoLogin() {{\n+function onMimoLogin() {{\n+  // added\n-<SettingsRow title=\"API Key\">\n+<SettingsRow title=\"API Key v2\">\n*** End Patch\n"
+        );
+        let (out, reps) = preflight_repair(&v4a, Some(cwd));
+        assert!(
+            out.matches("\n@@\n").count() >= 2,
+            "三个不连续 hunk 应插 2 个裸 @@:\n{out}"
+        );
+        assert_eq!(reps[0].kind, "repaired", "{:?}", reps);
+        assert!(reps[0].detail.contains("自动按文件位置切段"), "{:?}", reps);
+        assert!(
+            out.contains("+const testing = ref(false)"),
+            "新增行保留:\n{out}"
+        );
+        assert!(out.contains("+  // added"));
+        assert!(out.contains("+<SettingsRow title=\"API Key v2\">"));
+    }
+
+    #[test]
+    fn single_contiguous_hunk_not_split() {
+        // 单段连续 hunk → 不切(group<2 → None),走常规对齐。
+        let (dir, name) = tmp_file("single.txt", "a\nb\nc\nd\n");
+        let cwd = dir.path().to_str().unwrap();
+        let v4a =
+            format!("*** Begin Patch\n*** Update File: {name}\n a\n b\n+x\n c\n*** End Patch\n");
+        let (out, reps) = preflight_repair(&v4a, Some(cwd));
+        assert!(!out.contains("\n@@\n"), "单段连续 hunk 不应插 @@:\n{out}");
+        assert!(!reps[0].detail.contains("切段"), "{:?}", reps);
+    }
+
+    #[test]
+    fn ambiguous_multi_region_passthrough() {
+        // 锚点内容在文件里重复(歧义)→ longest_unique_block 返回 None → 不切,透过(不猜不丢)。
+        let (dir, name) = tmp_file("amb.txt", "x\ny\nx\ny\n");
+        let cwd = dir.path().to_str().unwrap();
+        let v4a =
+            format!("*** Begin Patch\n*** Update File: {name}\n-x\n+X\n-y\n+Y\n*** End Patch\n");
+        let (out, _reps) = preflight_repair(&v4a, Some(cwd));
+        assert!(!out.contains("\n@@\n"), "歧义不应切:\n{out}");
     }
 
     #[test]
