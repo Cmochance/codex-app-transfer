@@ -2,7 +2,7 @@
 //! 模型抓取 / 余额 / 内置 presets.
 //!
 //! 二级拆分:
-//! - `crud`:增删改 + activate / reorder / draft(模型映射随 update_provider 保存)
+//! - `crud`:增删改 + activate / reorder(草稿暂存 / 模型映射均随 update_provider 保存)
 //! - `test`:连通性测试
 //! - `models`:模型列表抓取(响应含 suggested 自动映射,供前端预填槽位)
 //! - `presets`:内置 presets
