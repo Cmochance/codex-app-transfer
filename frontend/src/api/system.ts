@@ -7,6 +7,13 @@ export const checkAppUpdate = () =>
     'GET',
     '/api/update/check',
   )
+// 下载并安装更新:后端做 macOS translocation 预检 → 下载 installer → app 退出拉起安装器。
+// 无 body(后端默认 url/current/platform)。成功后 app 即将退出,故返回多为 best-effort。
+export const installAppUpdate = () =>
+  api<{ success?: boolean; installerStarted?: boolean; message?: string }>(
+    'POST',
+    '/api/update/install',
+  )
 export const openExternalUrl = (url: string) =>
   api<{ success?: boolean }>('POST', '/api/open-url', { url })
 
