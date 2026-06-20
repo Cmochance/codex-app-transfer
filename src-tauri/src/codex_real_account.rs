@@ -17,10 +17,9 @@
 //!   [`access_token_expired`] 仅用于本地 JWT 判过期、标记 `relogin_required`,**不触发刷新**。
 //! - **登录**([`start_login`]/[`cancel_login`]/[`login_status`]):调起官方
 //!   `codex login`(它自己做 OAuth + 写 `~/.codex/auth.json`),非阻塞 + 可取消。
-//! - **导入 / 长期保留**([`import_auth`]/[`pin_current_account`]/[`forget_imported`]/
-//!   [`reconcile_on_startup`]):导入记录**源路径** + 写持久镜像快照;启动时活动文件失效
-//!   则恢复 —— 优先从**活源路径**重读最新(跟随源 Codex 刷新)、源失效回落镜像快照。
-//!   登录成功后前端自动 pin。单账号工具,非多账号切换器。
+//! - **长期保留**([`pin_current_account`]/[`reconcile_on_startup`]):登录成功后前端自动
+//!   pin 当前真账号、写持久镜像快照;启动时活动文件失效则从镜像快照恢复。单账号工具,
+//!   非多账号切换器。
 //!
 //! 检测来源(优先级):① 官方 `~/.codex/auth.json`(Codex 当前活动凭据)→ ② 用户
 //! 显式导入/钉住的持久镜像。**不扫 apply 快照备份** —— 那些是 transfer 改配置时的
@@ -673,47 +672,6 @@ fn import_locked(
     Ok(())
 }
 
-/// [MOC-104 req] 从**文件路径**导入真实 chatgpt auth(活源 / 静态文件统一入口)。读源
-/// 文件 → 校验可用 chatgpt → 写持久镜像快照 + **记录源路径** + 恢复到活动(先备份)。
-/// **不刷新** token(分流:刷新归源头);按本地 JWT exp 判过期设 relogin 标记。记下源路
-/// 径后,`reconcile_on_startup` 可在启动时从**活源**重读最新(跟随那边 Codex 刷新);源
-/// 失效/移除则回落到此处写的快照。前端用 Tauri dialog 选文件、把绝对路径传进来。
-pub async fn import_auth(source_path: String) -> Result<(), String> {
-    let content = std::fs::read_to_string(&source_path)
-        .map_err(|e| format!("读导入源文件失败({source_path}): {e}"))?;
-    let value: Value =
-        serde_json::from_str(&content).map_err(|e| format!("导入源不是合法 JSON: {e}"))?;
-    if parse_chatgpt_auth(&value).is_none() {
-        return Err(
-            "不是可用的 chatgpt auth.json(需 auth_mode=chatgpt + access/refresh token)".to_owned(),
-        );
-    }
-    // [MOC-257 review] 拒绝把**模拟(合成)账号**导入为真实账号镜像 —— 合成文件也是 auth_mode=chatgpt +
-    // 满 token,parse_chatgpt_auth 不排除它;若导入会用合成覆盖真镜像、Real 模式日后再也恢复不回真账号。
-    if value.get("cas_synthetic").and_then(Value::as_bool) == Some(true) {
-        return Err("不能把模拟(合成)账号导入为真实账号".to_owned());
-    }
-    // [connector review] 导入**不刷新** token;先按本地 JWT exp 判过期 —— 过期则**拒绝导入、
-    // 不激活**(不让过期账号覆盖当前可用活动 + 镜像;否则 import_locked 已写活动,reconcile 之后
-    // 还会从过期镜像恢复,等于默默激活了死账号)。有效 token 才落盘激活。
-    let access = value
-        .get("tokens")
-        .and_then(|t| t.get("access_token"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if access.is_empty() || access_token_expired(access, chrono::Utc::now().timestamp()) {
-        set_relogin_required(true);
-        return Err(
-            "导入文件的登录态已过期,请重新导出最新 auth.json 或改用「登录真实账号」".to_owned(),
-        );
-    }
-    let _guard = AUTH_LOCK.lock().await;
-    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    import_locked(&paths, &value, Some(&source_path))?;
-    clear_relogin_state(); // [MOC-124 H-2] 有效账号导入成功,清失效标记 + 撤销指纹
-    Ok(())
-}
-
 /// 钉住当前检测到的真实账号(官方活动 auth.json)进持久镜像。
 /// [review #5] locate + 写全程持 `AUTH_LOCK`,避免锁外读到 stale 值、随后被并发
 /// reconcile/import 抢先改写 auth.json,导致 pin 钉到被覆盖前的旧值。
@@ -742,34 +700,6 @@ pub fn pin_current_account_blocking() -> Result<(), String> {
         return Err("当前是模拟(合成)账号,无法钉为真实账号;请先登录真实账号".to_owned());
     }
     import_locked(&paths, &located.value, None)
-}
-
-/// 忘记导入的真实账号(删持久镜像)= 退出"真实账号长期生效"。删镜像后启动不再
-/// 自动恢复。删除已不存在的镜像视作成功(幂等)。
-/// [review #1] 持 `AUTH_LOCK`,避免与 in-flight reconcile/import 竞态(删了之后 reconcile
-/// 的 `write_auth` 又把镜像重建出来 → 已"忘记"的账号复活)。
-pub async fn forget_imported() -> Result<bool, String> {
-    let _guard = AUTH_LOCK.lock().await;
-    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    let mirror = imported_mirror_path(&paths);
-    let had_mirror = mirror.is_file();
-    if had_mirror {
-        std::fs::remove_file(&mirror).map_err(|e| format!("删持久镜像失败: {e}"))?;
-        // [MOC-104 导入分流] 镜像删了,导入来源路径记录也一并清(否则 reconcile 还会从旧
-        // 源路径重读、把已"忘记"的账号复活)。
-        write_imported_source_path(&paths, None);
-    }
-    // [MOC-124 H-2 / codex-connector P2] **不**在这里清 relogin / 撤销指纹 —— forget_imported
-    // 只删导入镜像、**保留活动 auth.json tokens**(见下 MOC-178)。若活动 token 正是被服务端 401
-    // 撤销的那个,清掉撤销状态会让它在重新启用真账号时被 detect 当 healthy 呈现(漏报撤销)。交给
-    // detect 自然处理:活动 token 有效(指纹不同 / 无撤销记录)→ self-heal 清 relogin;还是被撤销
-    // 的那个(指纹相同)→ 保持提示重登。比硬清更正确(detect 的指纹对比本就区分这两种)。
-    //
-    // [MOC-178] 不在这里删/改活动 auth.json —— 删整个文件会丢 tokens(退出 restore 只恢复
-    // MANAGED 的 auth_mode/OPENAI_API_KEY、tokens 恢复不回 → 残缺)。停用真实账号(让 toggle
-    // 关 + Codex 原生不显示 plugins)改由 forget_handler apply 当前 provider 强制 non-relay
-    // 完成:写 auth_mode=apikey 但**保留 tokens**,退出 restore 才能写回 chatgpt + tokens 完整恢复。
-    Ok(had_mirror)
 }
 
 /// [MOC-178] 开真实账号模式:把活动 auth.json 写回 `auth_mode=chatgpt` + 有效 tokens,使
@@ -837,29 +767,6 @@ pub async fn activate_real_account() -> Result<bool, String> {
         return Ok(true);
     }
     Ok(false)
-}
-
-/// [MOC-178 codex P2] 关真实账号模式的 auth 兜底:直接改活动 auth.json `auth_mode=apikey`
-/// (保留 tokens),**不依赖 provider config**。forget / enable 失败回滚走的 sync 路径依赖
-/// active provider(无 provider(默认 activeProvider null)/ apply 失败 → sync success:false、
-/// 活动仍 chatgpt),用本函数兜底确保活动不留 chatgpt(否则 Codex 仍显示 plugins、跟 flag=false
-/// 不一致,要等下次启动 ForceDisable 才纠)。持 `AUTH_LOCK`。返回是否执行了切换(活动本就
-/// 非 chatgpt → `Ok(false)` no-op)。
-pub async fn deactivate_real_account() -> Result<bool, String> {
-    let _guard = AUTH_LOCK.lock().await;
-    let paths = CodexPaths::from_home_env().map_err(|e| format!("解析 home 失败: {e}"))?;
-    let Ok(mut v) = read_auth(&paths.auth_json) else {
-        return Ok(false);
-    };
-    if v.get("auth_mode").and_then(Value::as_str) != Some("chatgpt") {
-        return Ok(false);
-    }
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("auth_mode".into(), Value::String("apikey".into()));
-    }
-    backup_active_auth(&paths, "predeactivate")?;
-    write_auth(&paths.auth_json, &v).map_err(|e| format!("切 apikey 失败: {e}"))?;
-    Ok(true)
 }
 
 // ── [MOC-257] 模拟(伪造)账号:合成合规 auth.json + 开关 ────────────────────────
@@ -1164,7 +1071,7 @@ fn archive_existing_auth_file(paths: &CodexPaths, path: &std::path::Path) -> boo
 }
 
 /// [MOC-257 review] 读活动 `auth.json` 原始字节快照,供 apply 失败**事务回滚**(保留原 tokens + gateway
-/// key + 全部字段,不像 `deactivate_real_account` 只翻 `auth_mode` 会丢 `OPENAI_API_KEY`)。只读。
+/// key + 全部字段,而非只翻 `auth_mode`(那会丢 `OPENAI_API_KEY`))。只读。
 /// **fallible + 区分**:文件不存在 → `Ok(None)`(回滚时删活动 = 还原到无 auth);存在但**读失败**(权限/锁)
 /// → `Err`,caller 必须 abort 切换 —— 否则错误地拿 `None` 当「apply 前无 auth」,回滚 `restore_active_auth_bytes(None)`
 /// 会把这份**不可读但存在**的真账号删掉丢凭据。
