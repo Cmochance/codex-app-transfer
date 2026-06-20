@@ -893,6 +893,20 @@ impl ChatToResponsesConverter {
             return;
         }
 
+        // [MOC-263 P3] exec_command 类工具用 shell 直接改文件(sed -i / cat> / echo> / python write /
+        // `apply_patch <<EOF` 等)会绕过结构化 apply_patch(既不过 preflight 兜底、也不进 apply_patch
+        // 埋点)→ emit `shell_edit` 诊断,让诊断页/jsonl 看见这部分编辑(纯观测,gate 关时零开销)。
+        if crate::core::apply_patch_trace::is_shell_exec_tool(&name) {
+            crate::core::apply_patch_trace::emit_shell_edit(
+                "chat",
+                &self.model,
+                &call_id,
+                &fc_id,
+                &name,
+                &args_acc,
+            );
+        }
+
         if is_apply_patch {
             // 从累积的 chat function args(标准形态 `{"input":"<V4A patch>"}`)
             // 提取裸 V4A 文本。降级:模型可能直接吐裸 V4A(不包 JSON)— 历史
