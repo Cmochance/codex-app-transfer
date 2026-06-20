@@ -46,6 +46,9 @@
       "kimi-k2.6": {
         "context_window": 262144
       },
+      "kimi-k2.7": {
+        "context_window": 262144
+      },
       "moonshot-v1-8k": {
         "context_window": 8192
       },
@@ -174,9 +177,12 @@
     "authScheme": "bearer",
     "apiFormat": "openai_chat",
     "models": {
-      "default": "glm-5.1"
+      "default": "glm-5.2"
     },
     "modelCapabilities": {
+      "glm-5.2": {
+        "context_window": 1000000
+      },
       "glm-5.1": {
         "context_window": 200000
       },

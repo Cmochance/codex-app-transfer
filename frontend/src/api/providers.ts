@@ -146,3 +146,16 @@ export const fetchProviderModels = (id: string) =>
   api<{ models?: unknown[] }>('GET', `/api/providers/${id}/models/available`)
 export const fetchProviderModelsDraft = (payload: ProviderPayload) =>
   api<{ models?: unknown[] }>('POST', '/api/providers/models/available', providerBody(payload, false))
+
+// 测试表单当前值的连接(后端用传入 payload 发探测请求,不依赖落盘配置)。
+// 新增/编辑均可测;返回 { ok, latencyMs, message };ok=true = endpoint 可达(含 401/403),
+// ok=false = endpoint 不存在或网络不通;message 带诊断详情(延迟/状态码)。
+// **必须带 models**: 只支持 POST 探测的上游(Kimi/GLM 等 HEAD/GET→404)会发 chat
+// 探测体,后端 provider_test_model 按 default 槽选模型;剥掉 models 会回落硬编码
+// claude-sonnet-4-6,对该模型返 404 的上游把可用 provider 误报为「endpoint unavailable」。
+export const testProvider = (payload: ProviderPayload) =>
+  api<{ ok?: boolean; latencyMs?: number; message?: string }>(
+    'POST',
+    '/api/providers/test',
+    providerBody(payload),
+  )

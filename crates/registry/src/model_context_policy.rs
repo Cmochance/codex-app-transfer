@@ -11,7 +11,7 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
         // DeepSeek
         "deepseek-v4-pro" | "deepseek-v4-flash" => Some(ONE_M_CONTEXT_WINDOW),
         // Kimi (月之暗面) + Kimi Code
-        "kimi-for-coding" | "kimi-k2.5" | "kimi-k2.6" | "kimi-2.6" => Some(262_144),
+        "kimi-for-coding" | "kimi-k2.5" | "kimi-k2.6" | "kimi-k2.7" | "kimi-2.6" => Some(262_144),
         "moonshot-v1-8k" | "moonshot-v1-8k-vision-preview" => Some(8192),
         "moonshot-v1-32k" | "moonshot-v1-32k-vision-preview" => Some(32768),
         "moonshot-v1-128k" | "moonshot-v1-auto" | "moonshot-v1-128k-vision-preview" => {
@@ -21,6 +21,7 @@ pub fn documented_context_window(model_id: &str) -> Option<u64> {
         "mimo-v2-pro" | "mimo-v2.5" | "mimo-v2.5-pro" => Some(ONE_M_CONTEXT_WINDOW),
         "mimo-v2-flash" | "mimo-v2-omni" => Some(262_144),
         // 智谱 GLM
+        "glm-5.2" => Some(ONE_M_CONTEXT_WINDOW),
         "glm-5.1" | "glm-4.7" => Some(200_000),
         // 阿里云百炼 Qwen 3.6
         "qwen3.6-plus" | "qwen3.6-flash" => Some(ONE_M_CONTEXT_WINDOW),
@@ -155,6 +156,8 @@ mod tests {
         assert_eq!(documented_context_window("qwen3.6-plus"), Some(1_000_000));
         assert_eq!(documented_context_window("MiniMax-M2.7"), Some(204_800));
         assert_eq!(documented_context_window("MiniMax-M3"), Some(1_000_000));
+        assert_eq!(documented_context_window("kimi-k2.7"), Some(262_144));
+        assert_eq!(documented_context_window("glm-5.2"), Some(1_000_000));
         assert_eq!(documented_context_window("unknown-model"), None);
     }
 

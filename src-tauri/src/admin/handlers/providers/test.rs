@@ -196,91 +196,6 @@ pub(super) fn provider_test_error_label(error: &reqwest::Error) -> &'static str 
     }
 }
 
-fn provider_compatibility_item(provider: &Value) -> Value {
-    let api_format =
-        normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
-    let id = provider.get("id").cloned().unwrap_or(Value::Null);
-    let name = provider.get("name").cloned().unwrap_or(Value::Null);
-    if api_format == "responses" {
-        return json!({
-            "id": id,
-            "name": name,
-            "apiFormat": api_format,
-            "level": "stable",
-            "message": "Responses 兼容接口，适合 Codex App 主流程。",
-            "checks": {
-                "models": true,
-                "text": true,
-                "stream": true,
-                "tools": true,
-                "streamingTools": true,
-            },
-        });
-    }
-    if api_format == "openai_chat" {
-        return json!({
-            "id": id,
-            "name": name,
-            "apiFormat": api_format,
-            "level": "experimental",
-            "message": "OpenAI Chat 实验适配：文本和非流式工具调用可测试，流式工具调用暂不作为稳定能力。",
-            "checks": {
-                "models": true,
-                "text": true,
-                "stream": true,
-                "tools": true,
-                "streamingTools": false,
-            },
-        });
-    }
-    if api_format == "gemini_native" {
-        return json!({
-            "id": id,
-            "name": name,
-            "apiFormat": api_format,
-            "level": "stable",
-            "message": "Gemini native generateContent 适配：Codex.app /responses → Gemini wire 直转,含 google_search grounding citations。",
-            "checks": {
-                "models": true,
-                "text": true,
-                "stream": true,
-                "tools": true,
-                "streamingTools": true,
-            },
-        });
-    }
-    if api_format == "anthropic_messages" {
-        return json!({
-            "id": id,
-            "name": name,
-            "apiFormat": api_format,
-            "level": "experimental",
-            "message": "Anthropic Messages 本地转换：Codex.app /responses → Anthropic /messages；真实 Claude 验证完成后再开放预设。",
-            "checks": {
-                "models": true,
-                "text": true,
-                "stream": true,
-                "tools": true,
-                "streamingTools": true,
-            },
-        });
-    }
-    json!({
-        "id": id,
-        "name": name,
-        "apiFormat": api_format,
-        "level": "unsupported",
-        "message": format!("{api_format} 暂未适配。"),
-        "checks": {
-            "models": false,
-            "text": false,
-            "stream": false,
-            "tools": false,
-            "streamingTools": false,
-        },
-    })
-}
-
 async fn test_provider_connection(provider: &Value) -> Value {
     let api_format =
         normalize_provider_api_format(provider.get("apiFormat").and_then(|v| v.as_str()));
@@ -458,32 +373,6 @@ pub async fn test_provider(Path(id): Path<String>) -> impl IntoResponse {
     };
     Json(test_provider_connection(provider).await).into_response()
 }
-
-pub async fn provider_compatibility() -> impl IntoResponse {
-    let cfg = match load_registry() {
-        Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    let providers: Vec<Value> = cfg
-        .get("providers")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(provider_compatibility_item)
-        .collect();
-    let experimental_count = providers
-        .iter()
-        .filter(|item| item.get("level").and_then(|v| v.as_str()) == Some("experimental"))
-        .count();
-    Json(json!({
-        "success": true,
-        "providers": providers,
-        "experimentalCount": experimental_count,
-    }))
-    .into_response()
-}
-
 pub async fn test_provider_payload(Json(payload): Json<Value>) -> impl IntoResponse {
     Json(test_provider_connection(&payload).await).into_response()
 }
@@ -982,35 +871,5 @@ mod tests {
                 "绝不能显示 endpoint unavailable(那是 baseUrl 错的红色文案)。实际:{msg}"
             );
         });
-    }
-
-    #[test]
-    fn provider_compatibility_matches_legacy_matrix() {
-        let responses = provider_compatibility_item(&json!({
-            "id": "responses",
-            "name": "Responses",
-            "apiFormat": "responses",
-        }));
-        assert_eq!(responses["level"], json!("stable"));
-        assert_eq!(responses["checks"]["streamingTools"], json!(true));
-
-        let openai_chat = provider_compatibility_item(&json!({
-            "id": "chat",
-            "name": "OpenAI Chat",
-            "apiFormat": "openai_chat",
-        }));
-        assert_eq!(openai_chat["level"], json!("experimental"));
-        assert_eq!(openai_chat["checks"]["models"], json!(true));
-        assert_eq!(openai_chat["checks"]["streamingTools"], json!(false));
-
-        let legacy_alias = provider_compatibility_item(&json!({
-            "id": "legacy",
-            "name": "Legacy",
-            "apiFormat": "anthropic",
-        }));
-        assert_eq!(legacy_alias["apiFormat"], json!("anthropic_messages"));
-        assert_eq!(legacy_alias["level"], json!("experimental"));
-        assert_eq!(legacy_alias["checks"]["models"], json!(true));
-        assert_eq!(legacy_alias["checks"]["streamingTools"], json!(true));
     }
 }

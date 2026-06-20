@@ -5,10 +5,8 @@
 //! - `crud`:增删改 + activate / reorder / draft / update_models
 //! - `test`:连通性测试 + compatibility
 //! - `models`:模型列表抓取 + autofill
-//! - `balance`:余额 / 用量查询
 //! - `presets`:内置 presets
 
-pub mod balance;
 pub mod crud;
 pub mod models;
 pub mod presets;
