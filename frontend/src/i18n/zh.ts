@@ -791,11 +791,6 @@ export default {
   "settings.backupLoadFailed": "备份列表读取失败",
   "settings.configBackupHint":
     "导出的配置会包含 API Key，请只保存在可信设备上。",
-  "settings.thirdPartyCompat": "第三方兼容",
-  "settings.checkCompatibility": "检查兼容性",
-  "settings.thirdPartyCompatHint":
-    "一键检查所有 provider 实际可用性。自定义 provider 可选择 OpenAI Chat 本地转换、原生 Responses 透传、Anthropic Messages 本地转换等协议路由。",
-  "settings.compatibilityEmpty": "还没有已保存的提供商。",
   "settings.checkUpdate": "检查更新",
   "settings.installUpdate": "下载并安装",
   "settings.downloadingUpdate": "下载中…",
@@ -837,9 +832,6 @@ export default {
   "guide.advThinkingTitle": "DeepSeek 思维模式",
   "guide.advThinkingText":
     "编辑 DeepSeek provider 时打开「Max 思维」开关,自动按官方 chat/completions 思维协议发送 reasoning_effort + thinking 字段。",
-  "guide.advCompatTitle": "兼容性测试",
-  "guide.advCompatText":
-    "Settings 页「检查兼容性」按钮一键测试所有 provider 的实际响应,标记哪些直连、哪些需要转发、哪些有问题。",
   "guide.advBackupTitle": "配置备份",
   "guide.advBackupText":
     "Settings 页可立即备份当前配置,或导出/导入完整 JSON。备份包含 API Key,只在可信设备上保存。",
@@ -901,7 +893,6 @@ export default {
   "toast.configImportFailed": "配置导入失败",
   "toast.allModelsEnabled": "已开启全部模型显示，请重新一键应用并重启终端",
   "toast.singleModelEnabled": "已切回只显示当前模型，请重新一键应用并重启终端",
-  "toast.compatibilityChecked": "兼容性检查完成",
   "toast.requestFailed": "操作失败，请查看后端日志",
   "confirm.desktopApply":
     "即将生成 Codex CLI 环境变量配置命令并复制到剪贴板。确认继续？",
@@ -1023,6 +1014,8 @@ export default {
   "providerForm.fetching": "获取中…",
   "providerForm.modelsFetched": "找到 {count} 个模型",
   "providerForm.modelsFetchFailed": "获取模型失败",
+  "providerForm.testConnection": "检测",
+  "providerForm.testing": "检测中…",
   "about.group": "关于",
   "about.version": "软件版本",
   "about.checkUpdate": "检查更新",

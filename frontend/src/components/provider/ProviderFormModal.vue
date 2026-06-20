@@ -99,6 +99,7 @@ const error = ref('')
 const showAdvanced = ref(false)
 const isBuiltin = ref(false)
 const fetching = ref(false)
+const testing = ref(false)
 const availableModels = ref<ModelOpt[]>([])
 
 // baseUrl 归一(去 scheme / 末尾斜杠 / 大小写)后反查命中的内置 preset。
@@ -167,6 +168,46 @@ async function onMimoLogin() {
     toast((e as Error).message || t('providerForm.errSaveFailed'), 'error')
   } finally {
     mimoLoggingIn.value = false
+  }
+}
+
+// 测试表单当前值的连接(后端用传入 payload 发探测,不读落盘配置)
+// draft 必须带 models + extraHeaders,否则探测请求与「保存后真实请求」不一致:
+//   • 缺 models → 后端回落硬编码 claude-sonnet-4-6,只支持 POST 探测的上游可能 404 误报不可达
+//   • 缺 extraHeaders → 依赖 Advanced 头(必需 provider 头 / {apiKey} 模板鉴权头)的上游会探测失败
+async function onTestConnection() {
+  if (!form.baseUrl.trim()) {
+    error.value = t('providerForm.errRequired')
+    return
+  }
+  let extraHeaders: Record<string, unknown> | undefined
+  try {
+    extraHeaders = parseJsonObj(t('providerForm.extraHeaders'), form.extraHeaders)
+  } catch (e) {
+    error.value = (e as Error).message
+    return
+  }
+  testing.value = true
+  error.value = ''
+  try {
+    // 全部槽都发(空发 ""),与 save 一致;后端按 default 槽(空则首个非空)选探测模型
+    const models: Record<string, string> = {}
+    for (const s of MODEL_SLOTS) models[s.key] = form.models[s.key].trim()
+    const draft: ProviderPayload = {
+      name: form.name.trim() || 'draft',
+      baseUrl: form.baseUrl.trim(),
+      apiKey: form.apiKey || undefined,
+      apiFormat: form.apiFormat,
+      authScheme: form.authScheme,
+      models,
+      extraHeaders: extraHeaders as Record<string, string> | undefined,
+    }
+    const res = await providersApi.testProvider(draft)
+    toast(res.message ?? '', res.ok ? 'info' : 'error')
+  } catch (e) {
+    toast((e as Error).message || t('providerForm.errSaveFailed'), 'error')
+  } finally {
+    testing.value = false
   }
 }
 
@@ -395,7 +436,16 @@ async function save() {
         <AppInput v-model="form.grokSso" :placeholder="t('providerForm.grokCookiePlaceholder')" />
       </SettingsRow>
       <SettingsRow v-else title="API Key">
-        <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
+        <div class="pf__key-row">
+          <AppButton
+            size="sm"
+            variant="ghost"
+            :label="testing ? t('providerForm.testing') : t('providerForm.testConnection')"
+            :disabled="testing"
+            @click="onTestConnection"
+          />
+          <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
+        </div>
       </SettingsRow>
       <SettingsRow :title="t('providerForm.apiFormat')">
         <SegmentedControl v-model="form.apiFormat" :options="formatOptions" />
@@ -519,6 +569,11 @@ async function save() {
   color: var(--accent);
   font-size: var(--fs-sm);
   cursor: pointer;
+}
+.pf__key-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 .pf__field {
   display: flex;
