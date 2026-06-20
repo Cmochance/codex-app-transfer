@@ -20,6 +20,15 @@ export const installAppUpdate = () =>
 export const openExternalUrl = (url: string) =>
   api<{ success?: boolean }>('POST', '/api/open-url', { url })
 
+// [MOC-261 一-11] transfer adapter 静默丢弃的未知 Responses API 工具类型累计计数(本进程累计、
+// 重启归零)。某类型计数持续增长 = 上游新增工具类型被静默丢弃的金丝雀(MOC-32 那类 bug 的征兆)。
+export interface DroppedToolsStatus {
+  total: number
+  by_type: Record<string, number>
+}
+export const getDroppedTools = () =>
+  api<DroppedToolsStatus>('GET', '/api/diagnostic/dropped-tools')
+
 // 反馈提交(接旧版 /api/feedback worker;body 必填,include_diagnostics 默认 true)
 export interface FeedbackPayload {
   title?: string
