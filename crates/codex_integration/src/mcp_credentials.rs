@@ -11,12 +11,14 @@
 //!    (在 `~/.codex` 之外,`rsync --delete` / 误删 / 换机都碰不到):
 //!    - live 文件**存在** → live 是 Codex 当前权威状态,镜像精确**跟随** live
 //!      (捕获新授权 + 传播用户的 logout / 撤销删除),**绝不**写 live。
-//!    - live 文件**整个不在** → **不自动恢复**:`SyncReport::restore_available` 报告镜像
-//!      里有多少条可恢复,由上层**弹确认**让用户决定(确认 → [`restore_mcp_credentials_from_mirror`];
-//!      忽略 → [`discard_mcp_mirror`])。因为 Codex 在登出最后一个 server 时会**删除**
-//!      `.credentials.json`(见 upstream `write_fallback_file`:store 空就 `remove_file`),
-//!      "整文件不在"既可能是用户有意登出全部、也可能是误删 / 换机,**同步时无从区分**,
-//!      所以交给用户确认而非静默复活已撤销的凭据。
+//!    - live 文件**整个不在**(换机 / 误删 / 登出全部)→ **不自动恢复**:镜像里的 server_key 进入
+//!      持久「恢复待处理」状态(`mcp-recovery.json`,见 [`CodexPaths::mcp_recovery_state`]),由上层
+//!      弹窗**逐条**让用户决定恢复 / 移除 / 忽略([`list_recovery`] / [`restore_mcp_credentials_keys`]
+//!      / [`remove_mcp_credentials_keys`] / [`ignore_mcp_credentials_keys`])。因为 Codex 在登出最后
+//!      一个 server 时会**删除** `.credentials.json`(见 upstream `write_fallback_file`:store 空就
+//!      `remove_file`),"整文件不在"既可能是用户有意登出全部、也可能是误删 / 换机,**同步时无从
+//!      区分**,所以交给用户逐条确认;且 sync 在 live 部分恢复后**保护**恢复态里的 key 不被当登出
+//!      静默从镜像清掉(MOC-261 一-4,不丢备份)。
 //!
 //! 边界:这是"备份 + 用户确认恢复",**不**解决 OAuth 过期(过期 token 恢复回去仍过期,
 //! 需重新授权)。安全权衡:file 模式 token 明文落盘(0o600,Codex 官方支持的模式)。
@@ -126,7 +128,17 @@ pub fn sync_mcp_credentials(paths: &CodexPaths) -> Result<SyncReport, CodexError
         CredRead::Parsed(m) => m,
         _ => Map::new(),
     };
-    let mut recovering = read_recovery_state(&paths.mcp_recovery_state);
+    // 恢复态不可读(IO 错 / 损坏)→ 无法区分「真登出」vs「待恢复未处理」→ 保守整体跳过本次同步
+    // (不写不清,保留 live / 镜像原样),绝不在状态不可信时 prune 掉可能要恢复的备份。
+    let mut recovering = match read_recovery_state(&paths.mcp_recovery_state) {
+        Ok(m) => m,
+        Err(_) => {
+            return Ok(SyncReport {
+                skipped: Some("mcp recovery state unreadable/corrupt".into()),
+                ..Default::default()
+            });
+        }
+    };
 
     match live {
         // 整个 live 文件不在 —— 可能是用户登出全部(Codex 删了文件),也可能是误删 / 换机,
@@ -207,13 +219,25 @@ fn entry_ignored(v: &Value) -> bool {
     v.get("ignored").and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn read_recovery_state(path: &Path) -> Map<String, Value> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => match serde_json::from_str::<Value>(&s) {
-            Ok(Value::Object(m)) => m,
-            _ => Map::new(),
-        },
-        Err(_) => Map::new(),
+/// 读恢复状态。NotFound / 空 → `Ok(空 Map)`(合法「无恢复态」);存在但读不动 / 非法 JSON →
+/// `Err`(状态不可信)。**绝不**把读失败当空 —— 恢复态是 Parsed 分支保护未处理备份的唯一依据,
+/// 当空会让保护落空、静默丢备份(与 `read_creds` 的严格三态一致)。
+fn read_recovery_state(path: &Path) -> Result<Map<String, Value>, CodexError> {
+    let s = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(e) => return Err(e.into()),
+    };
+    if s.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    match serde_json::from_str::<Value>(&s) {
+        Ok(Value::Object(m)) => Ok(m),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mcp recovery state not a JSON object",
+        )
+        .into()),
     }
 }
 
@@ -236,11 +260,13 @@ fn write_recovery_state(path: &Path, map: &Map<String, Value>) -> Result<(), Cod
 
 /// 若 live 整文件缺失(wipe)→ 把镜像里尚未跟踪的 server_key 加入恢复状态(待处理),并清掉
 /// 镜像已不存在的过期项。**仅在 live 缺失时引入新恢复项**(live 存在时由 [`sync_mcp_credentials`]
-/// 的 Parsed 分支收敛)。只写恢复状态文件,不碰 live / 镜像。返回最新状态。
-fn ensure_recovering(paths: &CodexPaths) -> Map<String, Value> {
-    let mut state = read_recovery_state(&paths.mcp_recovery_state);
+/// 的 Parsed 分支收敛)。只写恢复状态文件,不碰 live / 镜像。
+/// **写失败必须传播**(不能 `let _ =` 吞):恢复态没落盘 → 后续部分恢复会让未持久化的项在下次
+/// sync 被当登出静默清掉(silent-failure 红线)。返回最新状态。
+fn ensure_recovering(paths: &CodexPaths) -> Result<Map<String, Value>, CodexError> {
+    let mut state = read_recovery_state(&paths.mcp_recovery_state)?;
     if !matches!(read_creds(&paths.mcp_credentials), CredRead::Missing) {
-        return state;
+        return Ok(state);
     }
     let mirror = match read_creds(&paths.mcp_credentials_mirror) {
         CredRead::Parsed(m) => m,
@@ -256,9 +282,9 @@ fn ensure_recovering(paths: &CodexPaths) -> Map<String, Value> {
     let before = state.len();
     state.retain(|k, _| mirror.contains_key(k));
     if changed || state.len() != before {
-        let _ = write_recovery_state(&paths.mcp_recovery_state, &state);
+        write_recovery_state(&paths.mcp_recovery_state, &state)?;
     }
-    state
+    Ok(state)
 }
 
 /// 一条待处理的 MCP 凭据恢复项(供前端逐行显示)。
@@ -271,11 +297,12 @@ pub struct RecoveryItem {
 }
 
 /// 列出当前「待处理」的恢复项 = 恢复状态里、镜像有、live 没有的 server_key(按 key 排序)。
-/// 先 ensure(检测 wipe 引入新项),供状态端点 / 弹窗。
-pub fn list_recovery(paths: &CodexPaths) -> Vec<RecoveryItem> {
-    let state = ensure_recovering(paths);
+/// 先 ensure(检测 wipe 引入新项);恢复态读 / 写失败 → `Err`(上层 surface,前端不展示也不让操作,
+/// 避免在状态不可信时执行恢复而丢未处理备份)。
+pub fn list_recovery(paths: &CodexPaths) -> Result<Vec<RecoveryItem>, CodexError> {
+    let state = ensure_recovering(paths)?;
     if state.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mirror = match read_creds(&paths.mcp_credentials_mirror) {
         CredRead::Parsed(m) => m,
@@ -294,17 +321,12 @@ pub fn list_recovery(paths: &CodexPaths) -> Vec<RecoveryItem> {
         })
         .collect();
     items.sort_by(|a, b| a.key.cmp(&b.key));
-    items
+    Ok(items)
 }
 
 /// 自动弹窗触发数 = 待处理且未忽略的项数。供状态端点决定是否启动自动弹窗。
-pub fn pending_recovery_count(paths: &CodexPaths) -> usize {
-    list_recovery(paths).iter().filter(|i| !i.ignored).count()
-}
-
-/// 向后兼容别名:旧调用方(服务层弹窗判定)用它拿「需提示」条数 = 待处理未忽略数。
-pub fn restore_available_count(paths: &CodexPaths) -> usize {
-    pending_recovery_count(paths)
+pub fn pending_recovery_count(paths: &CodexPaths) -> Result<usize, CodexError> {
+    Ok(list_recovery(paths)?.iter().filter(|i| !i.ignored).count())
 }
 
 /// **选择性恢复**:把指定 server_key 从镜像写回 live(merge,**不覆盖** live 已有的 = 不动你已
@@ -313,15 +335,30 @@ pub fn restore_mcp_credentials_keys(
     paths: &CodexPaths,
     keys: &[String],
 ) -> Result<usize, CodexError> {
+    // 镜像损坏 → 拒绝(读不到备份就别声称恢复了 0 条骗用户)。
     let mirror = match read_creds(&paths.mcp_credentials_mirror) {
         CredRead::Parsed(m) => m,
-        _ => Map::new(),
+        CredRead::Missing => Map::new(),
+        CredRead::Corrupt => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MCP credential backup (mirror) is unreadable/corrupt",
+            )
+            .into())
+        }
     };
-    // live 损坏 → 不动(避免覆盖不可读但可能存在的凭据)。缺失 → 从空开始建。
+    // live 损坏 → **拒绝**(避免覆盖不可读但可能存在的凭据)+ 让前端报错而非静默「恢复 0 条」成功。
+    // 缺失 → 从空开始建。
     let mut live = match read_creds(&paths.mcp_credentials) {
         CredRead::Parsed(m) => m,
         CredRead::Missing => Map::new(),
-        CredRead::Corrupt => return Ok(0),
+        CredRead::Corrupt => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "~/.codex/.credentials.json is unreadable/corrupt; refused to overwrite",
+            )
+            .into())
+        }
     };
     let mut restored = 0;
     for k in keys {
@@ -336,7 +373,7 @@ pub fn restore_mcp_credentials_keys(
         write_creds_atomic(&paths.mcp_credentials, &live)?;
     }
     // 处理过的 key 从恢复状态清除(无论是否真写回:已在 live = 已处理)。
-    let mut state = read_recovery_state(&paths.mcp_recovery_state);
+    let mut state = read_recovery_state(&paths.mcp_recovery_state)?;
     let before = state.len();
     for k in keys {
         state.remove(k);
@@ -356,7 +393,13 @@ pub fn remove_mcp_credentials_keys(
     let mut mirror = match read_creds(&paths.mcp_credentials_mirror) {
         CredRead::Parsed(m) => m,
         CredRead::Missing => Map::new(),
-        CredRead::Corrupt => return Ok(0),
+        CredRead::Corrupt => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MCP credential backup (mirror) is unreadable/corrupt",
+            )
+            .into())
+        }
     };
     let mut removed = 0;
     for k in keys {
@@ -375,7 +418,7 @@ pub fn remove_mcp_credentials_keys(
             write_creds_atomic(&paths.mcp_credentials_mirror, &mirror)?;
         }
     }
-    let mut state = read_recovery_state(&paths.mcp_recovery_state);
+    let mut state = read_recovery_state(&paths.mcp_recovery_state)?;
     let before = state.len();
     for k in keys {
         state.remove(k);
@@ -392,7 +435,7 @@ pub fn ignore_mcp_credentials_keys(
     paths: &CodexPaths,
     keys: &[String],
 ) -> Result<usize, CodexError> {
-    let mut state = read_recovery_state(&paths.mcp_recovery_state);
+    let mut state = read_recovery_state(&paths.mcp_recovery_state)?;
     let mut n = 0;
     for k in keys {
         if state.contains_key(k) {
@@ -515,10 +558,10 @@ mod tests {
             &paths.mcp_credentials_mirror,
             &json!({"a|1": entry("a"), "b|2": entry("b")}),
         );
-        let items = list_recovery(&paths);
+        let items = list_recovery(&paths).unwrap();
         assert_eq!(keys(&items), vec!["a|1", "b|2"]);
         assert!(items.iter().all(|i| !i.ignored));
-        assert_eq!(pending_recovery_count(&paths), 2);
+        assert_eq!(pending_recovery_count(&paths).unwrap(), 2);
     }
 
     #[test]
@@ -529,13 +572,13 @@ mod tests {
             &paths.mcp_credentials_mirror,
             &json!({"a|1": entry("a"), "b|2": entry("b")}),
         );
-        let _ = list_recovery(&paths); // 引入恢复态
+        let _ = list_recovery(&paths).unwrap(); // 引入恢复态
         let n = restore_mcp_credentials_keys(&paths, &["a|1".into()]).unwrap();
         assert_eq!(n, 1);
         let live = read_map(&paths.mcp_credentials);
         assert!(live.contains_key("a|1") && !live.contains_key("b|2"));
         // a 已处理(出 recovery),b 仍待处理。
-        assert_eq!(keys(&list_recovery(&paths)), vec!["b|2"]);
+        assert_eq!(keys(&list_recovery(&paths).unwrap()), vec!["b|2"]);
     }
 
     #[test]
@@ -560,14 +603,14 @@ mod tests {
             &paths.mcp_credentials_mirror,
             &json!({"a|1": entry("a"), "b|2": entry("b")}),
         );
-        let _ = list_recovery(&paths);
+        let _ = list_recovery(&paths).unwrap();
         assert_eq!(
             remove_mcp_credentials_keys(&paths, &["a|1".into(), "b|2".into()]).unwrap(),
             2
         );
         assert!(!paths.mcp_credentials_mirror.exists(), "镜像清空 → 删文件");
         assert!(!paths.mcp_recovery_state.exists(), "恢复状态清空 → 删文件");
-        assert!(list_recovery(&paths).is_empty());
+        assert!(list_recovery(&paths).unwrap().is_empty());
     }
 
     #[test]
@@ -578,14 +621,14 @@ mod tests {
             &paths.mcp_credentials_mirror,
             &json!({"a|1": entry("a"), "b|2": entry("b")}),
         );
-        let _ = list_recovery(&paths);
+        let _ = list_recovery(&paths).unwrap();
         assert_eq!(
             ignore_mcp_credentials_keys(&paths, &["a|1".into()]).unwrap(),
             1
         );
         // a 已忽略:不计入 pending(不自动弹窗),但仍在列表里(可手动处理),标 ignored。
-        assert_eq!(pending_recovery_count(&paths), 1);
-        let items = list_recovery(&paths);
+        assert_eq!(pending_recovery_count(&paths).unwrap(), 1);
+        let items = list_recovery(&paths).unwrap();
         assert_eq!(keys(&items), vec!["a|1", "b|2"]);
         assert!(items.iter().find(|i| i.key == "a|1").unwrap().ignored);
     }
@@ -611,7 +654,7 @@ mod tests {
             "b/c 备份仍在镜像"
         );
         assert_eq!(
-            keys(&list_recovery(&paths)),
+            keys(&list_recovery(&paths).unwrap()),
             vec!["b|2", "c|3"],
             "b/c 仍待恢复"
         );
@@ -630,6 +673,28 @@ mod tests {
         let rep = sync_mcp_credentials(&paths).unwrap();
         assert_eq!(rep.dropped, 1);
         assert!(!read_map(&paths.mcp_credentials_mirror).contains_key("b|2"));
+    }
+
+    #[test]
+    fn corrupt_recovery_state_surfaces_error_and_sync_skips_without_loss() {
+        // 恢复态文件损坏(读不动/非法)→ list_recovery 必须 Err(不静默当空,否则保护落空丢备份);
+        // sync 必须保守跳过(不 prune 镜像)。锁定 CRITICAL-1 / MEDIUM-1 修复。
+        let dir = tempfile::tempdir().unwrap();
+        let paths = CodexPaths::from_home_dir(dir.path());
+        write_json(
+            &paths.mcp_credentials_mirror,
+            &json!({"a|1": entry("a"), "b|2": entry("b")}),
+        );
+        write_json(&paths.mcp_credentials, &json!({"a|1": entry("a")})); // live 部分态
+        std::fs::write(&paths.mcp_recovery_state, "}{ not json").unwrap();
+        assert!(list_recovery(&paths).is_err(), "恢复态损坏 → 报错,不当空");
+        let rep = sync_mcp_credentials(&paths).unwrap();
+        assert!(rep.skipped.is_some(), "恢复态不可信 → 保守跳过");
+        let mirror = read_map(&paths.mcp_credentials_mirror);
+        assert!(
+            mirror.contains_key("a|1") && mirror.contains_key("b|2"),
+            "镜像原样保留,b/2 不被静默清掉"
+        );
     }
 
     #[test]

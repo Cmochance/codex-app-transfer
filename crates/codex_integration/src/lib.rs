@@ -36,8 +36,8 @@ pub use apply::{
 pub use auth::{read_auth, write_auth};
 pub use mcp_credentials::{
     ensure_file_store_mode, ignore_mcp_credentials_keys, list_recovery, pending_recovery_count,
-    remove_mcp_credentials_keys, restore_available_count, restore_mcp_credentials_keys,
-    sync_mcp_credentials, RecoveryItem, SyncReport,
+    remove_mcp_credentials_keys, restore_mcp_credentials_keys, sync_mcp_credentials, RecoveryItem,
+    SyncReport,
 };
 pub use model_catalog::{
     catalog_models_for_provider, catalog_models_for_provider_with_display_names,

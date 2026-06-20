@@ -257,7 +257,12 @@ pub async fn mcp_credentials_status() -> impl IntoResponse {
         Ok(p) => p,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let items: Vec<RecoveryItem> = list_recovery(&paths);
+    // 恢复态不可信(读/写失败)→ 500,前端 refresh 的 catch 会静默不展示弹窗 / 入口,
+    // 避免在状态无法持久化时让用户执行恢复而丢未处理备份(silent-failure 防线)。
+    let items: Vec<RecoveryItem> = match list_recovery(&paths) {
+        Ok(items) => items,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
     let pending = items.iter().filter(|i| !i.ignored).count();
     let entries: Vec<Value> = items
         .iter()
