@@ -360,7 +360,7 @@ async function onClearLogs() {
 }
 .log-row {
   display: grid;
-  grid-template-columns: 72px 48px 1fr;
+  grid-template-columns: 72px 70px 1fr;
   gap: var(--space-3);
   white-space: pre-wrap;
   word-break: break-all;
@@ -371,6 +371,10 @@ async function onClearLogs() {
 .log-level {
   color: #5b9bd5;
   font-weight: 600;
+  white-space: nowrap;
+}
+.log-level--success {
+  color: #3fb950;
 }
 .log-level--warn {
   color: #e0a020;
