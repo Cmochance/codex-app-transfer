@@ -134,8 +134,14 @@ function onImportConfig() {
     try {
       const parsed = JSON.parse(await file.text())
       await importConfig(parsed)
+      // import 替换整 config:刷新 store,并**立即重应用主题/语言** —— 它们由 useAppearance 单例 +
+      // i18nState 驱动、只在启动从 settings 注水(见 App.vue),不在此重应用则导入改了 theme/language
+      // 要重启才生效(段控件 + 实际外观停在旧值)。这里镜像 App.vue 的注水逻辑。
+      const reloaded = await store.load()
+      if (typeof reloaded.theme === 'string') useAppearance().load(reloaded.theme)
+      if (reloaded.language === 'zh' || reloaded.language === 'en')
+        setLocale(reloaded.language as 'zh' | 'en')
       toast(t('settings.importConfigOk'))
-      await store.load() // import 替换整 config,刷新设置 UI
     } catch (e) {
       toast((e as Error).message, 'error')
     }
