@@ -1005,7 +1005,10 @@ pub fn has_real_account() -> bool {
     // [MOC-257 review] 也认导入/钉住的镜像 + 导入活源(source_path 还在 + 可读):活动被删 / 换成 apikey
     // 时,真账号只在镜像或活源里(import/pin 过、reconcile 会从它恢复)。否则这些老用户 set(real) 被拒、
     // 默认推导降级 synthetic。
-    let mirror_real = read_imported_mirror(&paths).is_some_and(|v| is_real(&v));
+    // [MOC-257 review] 读镜像 **raw**(非 read_imported_mirror 的 chatgpt-only filter):auth_mode=apikey 但带可用
+    // chatgpt tokens 的镜像 activate 能 normalize 恢复 → has_real_account 也认它,否则 set(real) 在 has_real_account
+    // 早返 needsLogin 挡住 Real(set handler 先调 has_real_account 再 real_account_usable/activate)。
+    let mirror_real = read_imported_mirror_raw(&paths).is_some_and(|v| is_real(&v));
     let source_real = read_imported_source_path(&paths)
         .and_then(|sp| std::fs::read_to_string(&sp).ok())
         .and_then(|c| serde_json::from_str::<Value>(&c).ok())
