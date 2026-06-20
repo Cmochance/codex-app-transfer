@@ -1,5 +1,5 @@
-//! `/api/providers/*` CRUD handler —— 增删改 / activate / reorder / draft
-//! (模型映射随 update_provider 的 body 一并保存,无独立 update_models 端点)。
+//! `/api/providers/*` CRUD handler —— 增删改 / activate / reorder
+//! (草稿暂存 / 模型映射均随 update_provider 的 body 一并保存,无独立 draft / update_models 端点)。
 
 use axum::{
     extract::{Path, State},
@@ -671,13 +671,8 @@ pub async fn reorder_providers(Json(input): Json<ReorderInput>) -> impl IntoResp
     }
 }
 
-// /api/providers/{id}/draft —— v1 当 update 用,我们直接复用
-pub async fn save_draft(
-    Path(id): Path<String>,
-    Json(input): Json<AddProviderInput>,
-) -> impl IntoResponse {
-    update_provider(Path(id), Json(input)).await
-}
+// [MOC-261 一-10] save_draft(POST /api/providers/{id}/draft)已删:它只是 update_provider 的纯
+// 别名(v1 拿来做编辑自动保存),无独立草稿存储 / 无读端点,前后端零引用 → 按死代码移除。
 
 // [MOC-261 一-7] update_models(PUT /api/providers/{id}/models)已删:模型映射经主
 // update_provider(PUT /api/providers/{id},body 带 models)保存,该专用端点前后端零引用。

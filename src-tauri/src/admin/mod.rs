@@ -94,10 +94,6 @@ pub fn build_app_router(state: AdminState) -> Router {
             get(handlers::providers::crud::get_secret),
         )
         .route(
-            "/api/providers/{id}/draft",
-            post(handlers::providers::crud::save_draft),
-        )
-        .route(
             "/api/providers/{id}/models/available",
             get(handlers::providers::models::fetch_provider_models),
         )
