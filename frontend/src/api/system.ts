@@ -3,10 +3,13 @@ import { api } from './http'
 // 软件版本 / 检查更新 / 打开外链(系统浏览器)
 export const getAppVersion = () => api<{ version?: string }>('GET', '/api/version')
 export const checkAppUpdate = () =>
-  api<{ hasUpdate?: boolean; latestVersion?: string; currentVersion?: string }>(
-    'GET',
-    '/api/update/check',
-  )
+  api<{
+    // 后端权威字段(update.rs check_update_impl):是否有更新 + 当前平台是否支持 in-app 安装。
+    updateAvailable?: boolean
+    installSupported?: boolean
+    latestVersion?: string
+    currentVersion?: string
+  }>('GET', '/api/update/check')
 // 下载并安装更新:后端做 macOS translocation 预检 → 下载 installer → app 退出拉起安装器。
 // 无 body(后端默认 url/current/platform)。成功后 app 即将退出,故返回多为 best-effort。
 export const installAppUpdate = () =>

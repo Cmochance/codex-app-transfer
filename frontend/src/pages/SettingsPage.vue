@@ -37,6 +37,7 @@ const { show: toast } = useToast()
 const appVersion = ref('')
 const feedbackOpen = ref(false)
 const updateAvailable = ref(false)
+const installSupported = ref(false)
 const latestVersion = ref('')
 const installModalOpen = ref(false)
 const installing = ref(false)
@@ -62,14 +63,17 @@ function refreshPluginUnlockStatus() {
 // 关于:检查更新 + 外链(走系统浏览器)
 async function onCheckUpdate() {
   try {
+    // 以后端权威 updateAvailable 为准(不再用 latest!=appVersion 字符串比较兜底,避免 /api/version
+    // 未就绪 / 格式差异误判);installSupported=false(如 Linux)时不显安装按钮,仅提示有更新。
     const r = await checkAppUpdate()
-    const latest = r.latestVersion
-    if (r.hasUpdate || (latest && latest !== appVersion.value)) {
+    if (r.updateAvailable) {
       updateAvailable.value = true
-      latestVersion.value = latest || ''
-      toast(tFmt('about.updateAvailable', { version: latest || '' }))
+      installSupported.value = !!r.installSupported
+      latestVersion.value = r.latestVersion || ''
+      toast(tFmt('about.updateAvailable', { version: r.latestVersion || '' }))
     } else {
       updateAvailable.value = false
+      installSupported.value = false
       toast(t('about.upToDate'))
     }
   } catch (e) {
@@ -553,7 +557,7 @@ const UPDATE_REPO_URL = 'https://github.com/Cmochance/codex-app-transfer'
       <SettingsRow :title="t('about.version')" :description="appVersion ? `v${appVersion}` : '…'">
         <AppButton size="sm" variant="secondary" :label="t('about.checkUpdate')" @click="onCheckUpdate" />
         <AppButton
-          v-if="updateAvailable"
+          v-if="updateAvailable && installSupported"
           size="sm"
           variant="primary"
           :label="t('settings.installUpdate')"

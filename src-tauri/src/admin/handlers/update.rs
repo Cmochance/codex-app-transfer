@@ -217,6 +217,13 @@ pub(super) fn pick_macos_installer(assets: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| "current release has no macOS installer asset".to_owned())
 }
 
+/// in-app 安装是否支持当前平台 —— 与 `pick_platform_installer` 的平台矩阵一致(仅 windows-* /
+/// macos-* 有安装器;linux-* 在线安装会被拒、走包管理器/手动重装)。`update/check` 用它告诉前端
+/// 是否显示「下载并安装」按钮,避免在 Linux 把用户引导进必然失败的安装流。
+pub(super) fn platform_supports_inapp_install(platform: &str) -> bool {
+    platform.starts_with("windows-") || platform.starts_with("macos-")
+}
+
 pub(super) fn pick_platform_installer(assets: &[Value], platform: &str) -> Result<Value, String> {
     if platform.starts_with("windows-") {
         return pick_windows_installer(assets);
@@ -547,6 +554,7 @@ pub(super) async fn check_update_impl(
         "currentVersion": current_version,
         "latestVersion": latest_version,
         "platform": platform,
+        "installSupported": platform_supports_inapp_install(platform),
         "pubDate": latest_json.get("pub_date").cloned().unwrap_or(Value::Null),
         "notes": latest_json.get("notes").cloned().unwrap_or_else(|| json!("")),
         "assets": assets,
