@@ -99,6 +99,7 @@ const error = ref('')
 const showAdvanced = ref(false)
 const isBuiltin = ref(false)
 const fetching = ref(false)
+const testing = ref(false)
 const availableModels = ref<ModelOpt[]>([])
 
 // baseUrl 归一(去 scheme / 末尾斜杠 / 大小写)后反查命中的内置 preset。
@@ -167,6 +168,31 @@ async function onMimoLogin() {
     toast((e as Error).message || t('providerForm.errSaveFailed'), 'error')
   } finally {
     mimoLoggingIn.value = false
+  }
+}
+
+// 测试表单当前值的连接(后端用传入 payload 发探测,不读落盘配置)
+async function onTestConnection() {
+  if (!form.baseUrl.trim()) {
+    error.value = t('providerForm.errRequired')
+    return
+  }
+  testing.value = true
+  error.value = ''
+  try {
+    const draft: ProviderPayload = {
+      name: form.name.trim() || 'draft',
+      baseUrl: form.baseUrl.trim(),
+      apiKey: form.apiKey || undefined,
+      apiFormat: form.apiFormat,
+      authScheme: form.authScheme,
+    }
+    const res = await providersApi.testProvider(draft)
+    toast(res.message ?? '', res.ok ? 'info' : 'error')
+  } catch (e) {
+    toast((e as Error).message || t('providerForm.errSaveFailed'), 'error')
+  } finally {
+    testing.value = false
   }
 }
 
@@ -395,7 +421,16 @@ async function save() {
         <AppInput v-model="form.grokSso" :placeholder="t('providerForm.grokCookiePlaceholder')" />
       </SettingsRow>
       <SettingsRow v-else title="API Key">
-        <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
+        <div class="pf__key-row">
+          <AppButton
+            size="sm"
+            variant="ghost"
+            :label="testing ? t('providerForm.testing') : t('providerForm.testConnection')"
+            :disabled="testing"
+            @click="onTestConnection"
+          />
+          <AppInput v-model="form.apiKey" type="password" placeholder="sk-..." />
+        </div>
       </SettingsRow>
       <SettingsRow :title="t('providerForm.apiFormat')">
         <SegmentedControl v-model="form.apiFormat" :options="formatOptions" />
@@ -519,6 +554,11 @@ async function save() {
   color: var(--accent);
   font-size: var(--fs-sm);
   cursor: pointer;
+}
+.pf__key-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 .pf__field {
   display: flex;
