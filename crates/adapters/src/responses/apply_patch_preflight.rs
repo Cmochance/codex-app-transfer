@@ -125,56 +125,55 @@ fn read_patch_file(
             .ok()
             .map(|c| (p.to_path_buf(), c));
     }
-    let mut candidates: Vec<String> = Vec::new();
+    // ① fresh primary 权威:当前请求自带 cwd 且文件可读 → 直接用,交下游决定匹配(含 align_at_headers
+    //    的 partial `@@` 子串修复)。**probe 只在多个同名候选间做 tie-breaker,绝不当 gate** —— 否则
+    //    残缺 `@@` 头 / 单一候选会因 probe 0 命中被误判 unreadable(chatgpt-codex-connector review P2 二轮)。
     if let Some(c) = primary {
         if !c.is_empty() {
-            candidates.push(c.to_owned());
+            let abs = Path::new(c).join(p);
+            if let Ok(content) = std::fs::read_to_string(&abs) {
+                return Some((abs, content));
+            }
         }
     }
-    for c in recall_cwd_candidates() {
-        if !candidates.iter().any(|x| x == &c) {
-            candidates.push(c);
-        }
-    }
-    // 读出所有存在的候选(保持 most-recent-first 顺序)。
+    // ② 否则用最近 cwd 候选历史(most-recent-first),读出所有存在的同名文件。
     let mut readable: Vec<(PathBuf, String)> = Vec::new();
-    for c in &candidates {
-        let abs = Path::new(c).join(p);
+    for c in recall_cwd_candidates() {
+        let abs = Path::new(&c).join(p);
         if let Ok(content) = std::fs::read_to_string(&abs) {
             readable.push((abs, content));
         }
     }
-    if readable.is_empty() {
-        return None;
+    match readable.len() {
+        0 => return None,
+        // 单候选 → 直接用(下游决定匹配,partial header 子串修复才有机会);不因 probe 0 命中而 skip。
+        1 => return readable.into_iter().next(),
+        _ => {}
     }
-    // 用 trim()(忽略首尾空白)比对:patch 锚点常比文件差几个前导/尾随空格(正是 preflight 要对齐的
-    // 漂移),exact 比会漏判;trim 对 P2 区分仍足够(真/stale 文件内容不同则区分得开,仅空白差异则
-    // 选谁对齐结果都一样)。
+    // ③ 多个同名候选(并发会话共享 README.md/package.json 等)→ probe 做 tie-breaker:选锚点命中最多的
+    //    (= patch 真正针对的文件,real 含锚点会胜过 stale);全 0(纯 partial header/纯新增,无法判别)→
+    //    取最 recent(下游用唯一匹配自保)。trim() 比对:容许 preflight 要修的首尾空白漂移。
     let probe_lines: Vec<&str> = probe
         .iter()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
-    if probe_lines.is_empty() {
-        // 无锚点可判别(纯新增 patch)→ 第一个可读(most-recent)。
-        return readable.into_iter().next();
-    }
-    // 选 probe 锚点行命中最多的候选(= patch 真正针对的文件);并列取最 recent(顺序在前)。
     let mut best_idx = 0usize;
     let mut best_score = -1i64;
     for (i, (_abs, content)) in readable.iter().enumerate() {
-        let file_lines: Vec<&str> = content.lines().map(str::trim).collect();
-        let score = probe_lines
-            .iter()
-            .filter(|pl| file_lines.contains(pl))
-            .count() as i64;
+        let score = if probe_lines.is_empty() {
+            0
+        } else {
+            let file_lines: Vec<&str> = content.lines().map(str::trim).collect();
+            probe_lines
+                .iter()
+                .filter(|pl| file_lines.contains(pl))
+                .count() as i64
+        };
         if score > best_score {
             best_score = score;
             best_idx = i;
         }
-    }
-    if best_score <= 0 {
-        return None; // 没有候选含任何锚点 → 都不是目标文件 → skip(安全)
     }
     Some(readable.swap_remove(best_idx))
 }
@@ -1634,6 +1633,26 @@ mod tests {
             "real_anchor_line\nmore\n",
             "应选 real(含 probe 锚点)而非队首 stale"
         );
+    }
+
+    #[test]
+    fn read_patch_file_single_candidate_partial_header_not_skipped() {
+        // MOC-263 P2 二轮(chatgpt-codex-connector review):probe 只含残缺 `@@` header(文件里无 exact
+        // 行,真实是 `## 6. 系统架构建议`),**单一候选**不应因 probe 0 命中被判 unreadable —— 仍返回
+        // 文件,让 align_at_headers 做子串修复。probe 是 tie-breaker 不是 gate。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("doc_moc263.md"),
+            "intro\n## 6. 系统架构建议\n建议分层\n",
+        )
+        .unwrap();
+        remember_cwd(dir.path().to_str().unwrap());
+        let got = read_patch_file("doc_moc263.md", None, &["系统架构建议"]);
+        assert!(
+            got.is_some(),
+            "单候选 + 残缺 header probe 不应被判 unreadable"
+        );
+        assert!(got.unwrap().1.contains("## 6. 系统架构建议"));
     }
 
     #[test]
