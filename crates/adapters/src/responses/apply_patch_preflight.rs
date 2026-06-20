@@ -97,12 +97,18 @@ fn anchor_probe<'a>(body: &[&'a str]) -> Vec<(bool, &'a str)> {
     for l in body {
         match l.chars().next() {
             Some(' ') | Some('-') => probe.push((false, &l[1..])),
+            Some('+') => {} // 新增行 —— 不在目标文件,不作 probe
             _ => {
                 if let Some(h) = l.strip_prefix("@@ ") {
                     let h = h.trim();
                     if !h.is_empty() {
                         probe.push((true, h));
                     }
+                } else if !l.is_empty() && !l.starts_with("@@") && !l.starts_with("*** ") {
+                    // 无前缀行(模型漏写前缀,fix_unprefixed_lines 要按文件整行 exact 匹配来修)→ 整行作
+                    // exact probe,使空-probe 路径(漏前缀是唯一锚点时)也能在同名候选间挑对文件
+                    // (chatgpt-codex-connector review)。
+                    probe.push((false, l));
                 }
             }
         }
@@ -1745,6 +1751,33 @@ mod tests {
         assert!(
             out.contains("\n@@\n"),
             "含 ` @@` context 行的多区删除仍应自动切段(列 0 判定):\n{out}"
+        );
+    }
+
+    #[test]
+    fn anchor_probe_includes_unprefixed_lines() {
+        // MOC-263 P2 六轮(chatgpt-codex-connector review):无前缀行(fix_unprefixed_lines 要按文件整行
+        // 匹配修)也要进 probe,否则它是唯一锚点时空-probe 路径会在同名候选间选错文件。`+` / `***` 不进。
+        let body = vec![
+            " ctx",
+            "-del",
+            "+add",
+            "@@ hdr",
+            "unprefixed line",
+            "*** End Patch",
+        ];
+        let p = anchor_probe(&body);
+        assert!(p.contains(&(false, "ctx")), "context 行进 probe");
+        assert!(p.contains(&(false, "del")), "删除行进 probe");
+        assert!(p.contains(&(true, "hdr")), "@@ 头进 probe(header)");
+        assert!(
+            p.contains(&(false, "unprefixed line")),
+            "无前缀行应作 exact probe"
+        );
+        assert!(!p.iter().any(|(_, t)| *t == "add"), "+ 新增行不进 probe");
+        assert!(
+            !p.iter().any(|(_, t)| t.starts_with("***")),
+            "*** 控制行不进 probe"
         );
     }
 
