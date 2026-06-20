@@ -815,18 +815,21 @@ fn segment_no_at_body<'a>(body: &[&'a str], file: &[&str]) -> Option<Vec<Vec<&'a
         return None; // 单段(或全因空行间隙合并成单段)→ 没必要切,交回常规路径
     }
 
-    // [MOC-263 P0 安全防护] 段间「浮动 `+` 插入行」歧义:若前段末锚点与后段首锚点之间存在 `+` 新增行,
-    // 且**前段末锚点是 context(非 `-` 删除)**,则该 `+` 的落点不确定 —— 可能是前段末尾的插入,也可能
-    // 是模型写给后段的「引入行」(如 `+@memoize` 紧贴下一组的 `def beta():`)。两种归属在真实文件里落点
-    // 不同(段间隔着非空行)→ 贸然切会猜错落点、产生**静默错误 apply**(违反不猜不丢)。故放弃整次分段、
-    // 原样透过。注:紧跟 `-` 删除的 `+`(替换行,如 seg1 的 `-old`/`+new`)归前段是确定语义,不触发此防护。
+    // [MOC-263 P0 安全防护] 段间「浮动 `+` 插入行」落点歧义 → 一律 bail。
+    // 若前段末锚点与后段首锚点之间存在**任何** `+` 新增行,该 `+` 的落点都无法从 V4A 唯一确定 ——
+    // 它可能是前段末尾的插入,也可能是模型写给后段的「引入行」;段间隔着非空内容时两种落点是文件里
+    // 不同位置,猜错就是**静默错误 apply**(违反不猜不丢)。**关键**:即便前段末锚点是 `-` 删除也不安全
+    // (chatgpt-codex-connector review 指出的混合 replace+insert:`-return 1`/`+return 42`/`+@memoize`/
+    // ` def beta():` —— `+return 42` 是替换、`+@memoize` 却是给后段的引入行,二者无法区分)→ 不做
+    // "前段有删除就放行"的豁免,只要 gap 里有 `+` 就放弃整次分段、原样透过(交模型自纠)。
+    // 纯删除 / 纯上下文的多区(gap 无 `+`)仍安全切。
     for gi in 0..groups.len() - 1 {
         let last_anchor_line = anchors[groups[gi].1 - 1].0;
         let next_anchor_line = anchors[groups[gi + 1].0].0;
         let gap_has_add = body[last_anchor_line + 1..next_anchor_line]
             .iter()
             .any(|l| l.starts_with('+'));
-        if gap_has_add && !body[last_anchor_line].starts_with('-') {
+        if gap_has_add {
             return None;
         }
     }
@@ -1555,28 +1558,45 @@ mod tests {
     }
 
     #[test]
-    fn multi_hunk_no_at_separator_auto_split() {
-        // MOC-263 P0:多个不连续 hunk 拼一个 Update File 块、无 @@(phase-1 seg1 真机失败形态)
-        // → 自动按文件位置切段、插裸 @@,各段独立定位。
-        let content = "const fetching = ref(false)\nconst a = 1\nconst b = 2\nfunction onMimoLogin() {\n  doStuff()\n}\nconst c = 3\n<SettingsRow title=\"API Key\">\n  <Input/>\n</SettingsRow>\n";
-        let (dir, name) = tmp_file("multi.vue", content);
+    fn multi_hunk_pure_delete_no_at_auto_split() {
+        // MOC-263 P0:多个不连续**纯删除/上下文**区拼一个 Update File 块、无 @@ → 安全自动切段插裸 @@。
+        // (带插入 `+` 的多区因落点歧义不在此切,见 mixed_replace_insert_gap_passthrough)
+        let content = "keep_top\nREMOVE_1\nmiddle\nmiddle2\nmiddle3\nREMOVE_2\nkeep_bottom\n";
+        let (dir, name) = tmp_file("multi_del.txt", content);
         let cwd = dir.path().to_str().unwrap();
         let v4a = format!(
-            "*** Begin Patch\n*** Update File: {name}\n-const fetching = ref(false)\n+const fetching = ref(false)\n+const testing = ref(false)\n-function onMimoLogin() {{\n+function onMimoLogin() {{\n+  // added\n-<SettingsRow title=\"API Key\">\n+<SettingsRow title=\"API Key v2\">\n*** End Patch\n"
+            "*** Begin Patch\n*** Update File: {name}\n keep_top\n-REMOVE_1\n middle\n-REMOVE_2\n keep_bottom\n*** End Patch\n"
         );
         let (out, reps) = preflight_repair(&v4a, Some(cwd));
-        assert!(
-            out.matches("\n@@\n").count() >= 2,
-            "三个不连续 hunk 应插 2 个裸 @@:\n{out}"
-        );
+        assert!(out.contains("\n@@\n"), "两个不连续删除区应插裸 @@:\n{out}");
         assert_eq!(reps[0].kind, "repaired", "{:?}", reps);
         assert!(reps[0].detail.contains("自动按文件位置切段"), "{:?}", reps);
         assert!(
-            out.contains("+const testing = ref(false)"),
-            "新增行保留:\n{out}"
+            out.contains("-REMOVE_1") && out.contains("-REMOVE_2"),
+            "删除行保留:\n{out}"
         );
-        assert!(out.contains("+  // added"));
-        assert!(out.contains("+<SettingsRow title=\"API Key v2\">"));
+    }
+
+    #[test]
+    fn mixed_replace_insert_gap_passthrough() {
+        // MOC-263 P0 安全(chatgpt-codex-connector review 指出):段间「替换 + 额外插入」混合 →
+        // `+` 落点歧义(`+return 42` 是替换、`+@memoize` 是给后段 `def beta` 的引入行,无法区分)→
+        // 不切、原样透过,避免把 @memoize 静默插到 return 后(错位)。即便前段末锚点是 `-` 删除也不豁免。
+        let content = "alpha\nreturn 1\n# gap\ndef beta():\n";
+        let (dir, name) = tmp_file("mixed.py", content);
+        let cwd = dir.path().to_str().unwrap();
+        let v4a = format!(
+            "*** Begin Patch\n*** Update File: {name}\n-return 1\n+return 42\n+@memoize\n def beta():\n*** End Patch\n"
+        );
+        let (out, _reps) = preflight_repair(&v4a, Some(cwd));
+        assert!(
+            !out.contains("\n@@\n"),
+            "混合 replace+insert 落点歧义不应切:\n{out}"
+        );
+        assert!(
+            out.contains("+@memoize") && out.contains("+return 42"),
+            "内容不丢"
+        );
     }
 
     #[test]
