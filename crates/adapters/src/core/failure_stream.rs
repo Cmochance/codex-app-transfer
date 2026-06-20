@@ -180,7 +180,8 @@ fn extract_upstream_error_message(body_text: &str) -> Option<String> {
 /// 英文裸 `usage limit` 仍额外要求伴随耗尽专属标记(reset/quota/credit/balance/upgrade/
 /// daily/weekly),因其单独歧义大;中文「使用上限」「余额不足」等本身已无歧义。
 fn body_has_usage_limit_signal(body_text: &str) -> bool {
-    let lower = body_text.to_ascii_lowercase(); // 关键词均 ASCII;中文 .contains 直接走原文
+    // 关键词均 ASCII;中文 .contains 直接走原文。
+    let lower = body_text.to_ascii_lowercase();
     // 仅 THROTTLE 专属标记算无歧义瞬时;命中即可重试,不再看耗尽词。
     let throttle_specific = lower.contains("per minute")
         || lower.contains("per-minute")
