@@ -133,24 +133,18 @@ pub fn custom_theme_exists() -> bool {
     custom_bg_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// User 上传图 bytes(JPG / PNG)→ **中心 crop 方形**(safety net:正常路径前端
-/// `openCropModal` 已 1:1 crop,这里 crop 已是方图时 no-op;兜底直接 POST raw
-/// image 不走 modal 的场景)→ resize 到 max 2048(节约 disk + base64 体积)→
-/// JPEG 90% 写 `bg.jpg`;同步生成 640px preview 写 `preview.jpg`。写入用 .tmp
-/// + rename 原子化避免半截文件。
+/// User 上传图 bytes(JPG / PNG)→ 等比 resize 到最长边 ≤2048(节约 disk +
+/// base64 体积)→ JPEG 90% 写 `bg.jpg`;同步生成最长边 ≤640 的等比 preview 写
+/// `preview.jpg`。正常路径前端 `openCropModal` 已按 16:9 裁切;若直接 POST raw
+/// image 则后端仅缩放、不二次裁切。写入用 .tmp + rename 原子化避免半截文件。
 pub fn save_custom_theme(image_bytes: &[u8]) -> Result<(), String> {
-    use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView};
+    use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
 
     let img = image::load_from_memory(image_bytes)
         .map_err(|e| format!("无法解析图片(请用 JPG 或 PNG): {e}"))?;
-    let (w, h) = img.dimensions();
-    let side = w.min(h);
-    let x = (w - side) / 2;
-    let y = (h - side) / 2;
-    let cropped = img.crop_imm(x, y, side, side);
 
-    let bg = cropped.resize(2048, 2048, FilterType::Lanczos3);
-    let preview = cropped.resize(640, 640, FilterType::Lanczos3);
+    let bg = img.resize(2048, 2048, FilterType::Lanczos3);
+    let preview = img.resize(640, 640, FilterType::Lanczos3);
 
     let dir = custom_theme_dir().ok_or_else(|| "无法解析 home 目录".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
@@ -562,7 +556,7 @@ pub fn all_themes() -> Vec<ThemeMeta> {
             display_name_en: "Custom",
             has_mascot: false,
             bg_fit: "cover",
-            bg_position: "center top",
+            bg_position: "center",
             palette: NEUTRAL_PALETTE,
         });
     }
