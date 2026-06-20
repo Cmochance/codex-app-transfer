@@ -168,18 +168,30 @@ fn extract_upstream_error_message(body_text: &str) -> Option<String> {
 /// `too many requests` / `并发` 等瞬时态 —— 把瞬时误判成永久会误杀重试(见 lib.rs
 /// `codex_retry_code` doc 的 MOC-79 教训);宁可漏判(继续 Retryable)也不误判。
 /// 触发样本:GLM Coding `code 1308`「已达到 N 小时的使用上限。您的限额将在 … 重置。」。
+///
+/// 注:英文 `usage limit` 单独**不够**强 —— 瞬时 per-minute 限流也可能这么措辞
+/// (`usage limit ... per minute`,带 retry-after)。要求它伴随耗尽/重置/升级语义、
+/// 且不含 per-minute 标记才算永久耗尽,否则保持可重试退避(MOC-264 bot review P2)。
 fn body_has_usage_limit_signal(body_text: &str) -> bool {
     let lower = body_text.to_ascii_lowercase(); // 关键词均 ASCII;中文 .contains 直接走原文
+    let usage_limit_is_exhaustion = lower.contains("usage limit")
+        && !lower.contains("per minute")
+        && !lower.contains("per-minute")
+        && (lower.contains("reset")
+            || lower.contains("reached")
+            || lower.contains("upgrade")
+            || lower.contains("exhausted")
+            || lower.contains("exceeded"));
     body_text.contains("使用上限")   // GLM 计费窗口上限
         || body_text.contains("余额不足")
         || body_text.contains("额度不足")
         || body_text.contains("额度已用")
         || body_text.contains("配额已用")
-        || lower.contains("usage limit")
         || lower.contains("insufficient_quota")       // OpenAI 计费耗尽(非 per-minute)
         || lower.contains("insufficient balance")
         || lower.contains("out of credits")
         || lower.contains("exceeded your current quota")
+        || usage_limit_is_exhaustion
 }
 
 /// 上游非 2xx → 合规 Responses 失败流(`response.created` + `response.failed`
@@ -422,6 +434,27 @@ mod tests {
         assert!(s.contains(r#""code":"invalid_prompt""#));
         assert!(s.contains(r#""upstream_error_kind":"usage_limit_reached""#));
         assert!(s.contains("exceeded your current quota"));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_429_per_minute_phrasing_stays_retryable() {
+        // 瞬时 per-minute 限流即便措辞含 "usage limit" 也保持可重试(MOC-264 bot P2):
+        // 不命中耗尽信号 → rate_limited → Retryable,不误杀退避。
+        let body = r#"{"error":{"message":"Usage limit exceeded: 60 requests per minute, retry after 30s","type":"rate_limit"}}"#;
+        let s = drive_error_stream(429, body, "rate_limited", "upstream").await;
+        assert!(s.contains(r#""code":"rate_limited""#));
+        assert!(!s.contains("usage_limit_reached"));
+        assert!(!s.contains("invalid_prompt"));
+    }
+
+    #[tokio::test]
+    async fn usage_limit_429_reached_with_marker_fail_fast() {
+        // "usage limit" 伴随耗尽/重置语义(非 per-minute)→ 永久耗尽 fail-fast。
+        let body =
+            r#"{"error":{"message":"You've reached your usage limit. Resets at 2026-06-21."}}"#;
+        let s = drive_error_stream(429, body, "rate_limited", "upstream").await;
+        assert!(s.contains(r#""code":"invalid_prompt""#));
+        assert!(s.contains(r#""upstream_error_kind":"usage_limit_reached""#));
     }
 
     #[tokio::test]
