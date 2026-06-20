@@ -173,9 +173,23 @@ pub fn snapshot_codex_state(
     // 快照 → restore 把它再写回(MOC-162 系统性缺口的 capture 端;这里至少让快照本身不带毒)。
     proxy_ports: &[u16],
 ) -> Result<SnapshotManifest, CodexError> {
+    let current_dir = current_active_snapshot_dir(paths);
+    // [MOC-257 review] **promote stale 而非投毒**:本 session 还没拍 + 无 legacy 单快照、但有上个 session 的
+    // stale active 快照(`restoreCodexOnExit=false` 保留态下它是真·原始 baseline)时,把**最新**那份 rename 成
+    // 本 session active(内容 = 原始 baseline),别走下面 move_stale→recovery + 拍当前(当前 ~/.codex 已被
+    // Transfer 改过,即便 auth 反投毒 + config strip 也只是「scrub 后的当前」、不等于原始用户配置)。promote 后
+    // 剩余更旧的 stale 仍 move→recovery 去重。manifest 里 session_id 字段是旧的无妨(stale 检测按**目录名**)。
+    if !manifest_path(&current_dir).exists() && !paths.snapshot_manifest.exists() {
+        let stale = stale_active_snapshot_dirs(paths);
+        if let Some(newest) = stale.last() {
+            std::fs::rename(newest, &current_dir)?;
+            move_stale_active_snapshots_to_recovery(paths)?; // 处理剩余更旧的 stale
+            return read_manifest_from_dir(&current_dir);
+        }
+    }
+
     move_stale_active_snapshots_to_recovery(paths)?;
 
-    let current_dir = current_active_snapshot_dir(paths);
     if manifest_path(&current_dir).exists() {
         return read_manifest_from_dir(&current_dir);
     }
@@ -1068,8 +1082,11 @@ mod tests {
         assert!(!has_snapshot(&paths));
     }
 
+    // [MOC-257 review] restoreCodexOnExit=false 保留态:上个 session 的 stale active 快照(原始 baseline,config
+    // "original")是真基线。snapshot_codex_state 应**promote** 它为本 session active(保住原始),而非把当前
+    // (Transfer 已改的 "current")拍成 active 快照、把原始挪去 recovery —— 那会让后续 restore 还原成被改过的当前。
     #[test]
-    fn stale_active_snapshot_moves_to_recovery_before_new_snapshot() {
+    fn stale_active_snapshot_promoted_as_baseline_not_overwritten_by_current() {
         let (_t, paths) = paths_with_tmp();
         let stale_dir = paths.active_snapshots_dir.join("old-session");
         std::fs::create_dir_all(&stale_dir).unwrap();
@@ -1094,14 +1111,23 @@ mod tests {
         std::fs::write(&paths.config_toml, "openai_base_url = \"current\"\n").unwrap();
         snapshot_codex_state(&paths, "v-new", "New", &[18080]).unwrap();
 
+        // stale 被 rename 成本 session active(不再在原 stale 目录)。
         assert!(!stale_dir.exists());
         let snapshots = list_snapshots(&paths);
+        // active 快照 = 被 promote 的**原始**(app_version v-old),**不是**当前的 v-new 拍照。
         assert!(snapshots
             .iter()
-            .any(|s| s.kind == "active" && s.app_version == "v-new"));
-        assert!(snapshots
+            .any(|s| s.kind == "active" && s.app_version == "v-old"));
+        assert!(!snapshots.iter().any(|s| s.app_version == "v-new"));
+        // promote 的那份没被挪去 recovery。
+        assert!(!snapshots
             .iter()
             .any(|s| s.kind == "recovery" && s.id == "old-session"));
+        // active 快照内容 = 原始 "original",而非被 Transfer 改过的 "current"。
+        let active_config =
+            std::fs::read_to_string(config_path(&current_active_snapshot_dir(&paths))).unwrap();
+        assert!(active_config.contains("original"));
+        assert!(!active_config.contains("current"));
     }
 
     // ── MOC-148 搭车:recovery/ 去重 + 上限 ────────────────────────────
