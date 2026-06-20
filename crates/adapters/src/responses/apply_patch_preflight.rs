@@ -750,16 +750,18 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
     }
     if !has_end {
         let trimmed = body.trim_end();
-        // [MOC-268] 末行是**带前缀的** `*** End Patch`(`+`/` `/`-` + `*** End Patch`)= 歧义:既可能是模型
-        // 给 Add File 逐行加 `+` 时把**终止符**也误前缀了(该剥),也可能是文件**正文**最后一行恰好就是裸
-        // `*** End Patch`、而漏了真终止符(此时它是正文,剥了=删正文)。**按文件类型消歧**(用户拍板):
-        //   · 代码 / 结构化配置文件(.rs/.ts/.py/.json/.toml…):裸 `*** End Patch` 不可能是合法源码的末行
-        //     → 必是误前缀终止符 → **剥前缀**规整(`head` 切到末行起点、保留其前换行;末行 ASCII,边界安全)。
-        //   · 文档 / 文本 / 未知类型(.md/.txt/无扩展…):无法排除是正文末行 → **不猜**,既不剥(免删正文)
-        //     也不追加(免残留),保持无列 0 终止符 → 下游 `detect_v4a_truncation` 判 incomplete、模型按
-        //     guidance 规则2(终止符不加前缀)重发。prompt 才是根治,中间层只在确定安全时介入。
         let last = trimmed.lines().last().unwrap_or("");
-        if matches!(last, "+*** End Patch" | " *** End Patch" | "-*** End Patch") {
+        // [MOC-268] **只有 `+*** End Patch`(Add 行前缀)** 才是「模型给终止符误加前缀」的形态。
+        // ` *** End Patch`(context)/ `-*** End Patch`(deletion)是**合法 Update hunk 行**——例如模型
+        // 用 Update **删除**文件里之前残留的 `*** End Patch`(`-*** End Patch`),或用它当 context 锚点;
+        // 把它们当终止符剥会**静默丢弃删除 / 破坏锚点**(chatgpt-codex-connector review)→ 故 ` `/`-` 一律
+        // 走下面正常 append(补真终止符,hunk 行原样保留)。
+        // 对 `+*** End Patch` 再**按文件类型消歧**(用户拍板):
+        //   · 代码 / 结构化配置文件(裸 `*** End Patch` 不可能是合法源码末行)→ 必是误前缀终止符 → **剥前缀**
+        //     (`head` 切到末行起点、保留其前换行;末行 ASCII,边界安全)。
+        //   · 文档 / 文本 / 未知(可能是正文末行)→ **不猜**:不剥(免删正文)、不追加(免残留),留 incomplete
+        //     交下游判截断、模型按 guidance 规则2 重发。prompt 才是根治,中间层只在确定安全时介入。
+        if last == "+*** End Patch" {
             if last_op_target_is_code(&body) {
                 let head = &trimmed[..trimmed.len() - last.len()];
                 body = format!("{head}*** End Patch");
@@ -771,12 +773,13 @@ pub fn ensure_v4a_envelope(input: &str) -> (String, Option<Repair>) {
                         file: "(envelope)".to_owned(),
                         kind: "skipped:ambiguous_prefixed_end".to_owned(),
                         detail:
-                            "末行带前缀 *** End Patch 且目标非代码文件(可能是正文)→ 不猜不补全,留 incomplete"
+                            "末行 +*** End Patch 且目标非代码文件(可能是正文)→ 不猜不补全,留 incomplete"
                                 .to_owned(),
                     }),
                 );
             }
         } else {
+            // 含 ` *** End Patch` / `-*** End Patch`(合法 hunk 行)及普通内容末行 → 正常补真终止符。
             body = format!("{trimmed}\n*** End Patch");
             added.push("End Patch");
         }
@@ -1481,30 +1484,50 @@ mod tests {
 
     #[test]
     fn envelope_prefixed_end_stripped_for_code_file() {
-        // MOC-268(用户拍板「按文件类型剥」):代码/结构化配置文件里裸 `*** End Patch` 不可能是合法源码的
-        // **末行** → 带前缀末行必是模型误加前缀的终止符 → 剥前缀规整成裸终止符,不追加、零残留、零内容丢失。
-        for (path, last) in [
-            ("x.rs", "+*** End Patch"),
-            ("y.ts", " *** End Patch"),
-            ("z.py", "-*** End Patch"),
-            ("c.json", "+*** End Patch"),
-        ] {
-            let body = format!("*** Begin Patch\n*** Add File: {path}\n+a\n+b\n{last}");
+        // MOC-268(用户拍板「按文件类型剥」):**仅 `+*** End Patch`**(Add 行误前缀)在代码/结构化配置文件
+        // 里(裸 `*** End Patch` 不可能是合法源码末行)剥前缀规整成裸终止符,不追加、零残留、零内容丢失。
+        for path in ["x.rs", "c.json", "s.toml", "w.vue"] {
+            let body = format!("*** Begin Patch\n*** Add File: {path}\n+a\n+b\n+*** End Patch");
             let (out, rep) = ensure_v4a_envelope(&body);
             assert!(
                 out.trim_end().ends_with("\n*** End Patch"),
-                "代码文件应剥成裸终止符 ({path}/{last}):\n{out}"
+                "代码文件应剥成裸终止符 ({path}):\n{out}"
             );
             assert!(
-                !out.contains(last),
-                "不应残留带前缀终止符 ({path}/{last}):\n{out}"
+                !out.contains("+*** End Patch"),
+                "不应残留带前缀终止符 ({path}):\n{out}"
             );
             assert_eq!(
                 out.matches("*** End Patch").count(),
                 1,
-                "只一个终止符 ({path}/{last}):\n{out}"
+                "只一个终止符 ({path}):\n{out}"
             );
-            assert!(rep.unwrap().detail.contains("剥误加前缀"), "{path}/{last}");
+            assert!(rep.unwrap().detail.contains("剥误加前缀"), "{path}");
+        }
+    }
+
+    #[test]
+    fn envelope_deletion_or_context_end_line_not_stripped() {
+        // MOC-268(chatgpt-codex-connector review):` *** End Patch`(context)/ `-*** End Patch`(deletion)
+        // 是**合法 Update hunk 行**(如模型用 Update 删文件里残留的 *** End Patch),**绝不能当终止符剥**
+        // (剥 `-` = 静默丢弃删除)。这俩末行 → 正常补真终止符、hunk 行**原样保留**。即便目标是代码文件。
+        for last in ["-*** End Patch", " *** End Patch"] {
+            let body = format!("*** Begin Patch\n*** Update File: src/foo.rs\n keep\n{last}");
+            let (out, rep) = ensure_v4a_envelope(&body);
+            assert!(
+                out.contains(last),
+                "合法 hunk 行 {last:?} 必须原样保留(不剥=不丢删除):\n{out}"
+            );
+            assert!(
+                out.trim_end().ends_with("\n*** End Patch"),
+                "应正常补真终止符 ({last:?}):\n{out}"
+            );
+            let r = rep.unwrap();
+            assert!(
+                r.detail.contains("End Patch") && !r.detail.contains("剥误加前缀"),
+                "走正常 append、非剥 ({last:?}):{}",
+                r.detail
+            );
         }
     }
 
