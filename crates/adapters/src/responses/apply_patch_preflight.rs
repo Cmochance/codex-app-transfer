@@ -87,18 +87,21 @@ fn has_cwd_candidate(primary: Option<&str>) -> bool {
     primary.map(|c| !c.is_empty()).unwrap_or(false) || !recall_cwd_candidates().is_empty()
 }
 
-/// patch section 的「锚点 probe」:context(` `)/ 删除(`-`)行去前缀 + `@@ <header>` 的 header 文本。
-/// 这些是**目标文件里应当存在的行**,用于 [`read_patch_file`] 在多个同名候选间挑出 patch 真正针对的文件。
-fn anchor_probe<'a>(body: &[&'a str]) -> Vec<&'a str> {
+/// patch section 的「锚点 probe」,每项 `(is_header, 文本)`:
+/// - context(` `)/ 删除(`-`)行去前缀 → `(false, 行内容)`,在候选文件里按**整行 exact**(trim)比对;
+/// - `@@ <header>` 的 header 文本 → `(true, header)`,按**子串**比对(残缺头是真实整行的子串,如
+///   `系统架构建议` ⊂ `## 6. 系统架构建议`)。两类分开评分:exact 头若被 stale 的同名整行命中会误选,
+///   故 header 不进 exact(chatgpt-codex-connector review)。供 [`read_patch_file`] 在同名候选间挑目标文件。
+fn anchor_probe<'a>(body: &[&'a str]) -> Vec<(bool, &'a str)> {
     let mut probe = Vec::new();
     for l in body {
         match l.chars().next() {
-            Some(' ') | Some('-') => probe.push(&l[1..]),
+            Some(' ') | Some('-') => probe.push((false, &l[1..])),
             _ => {
                 if let Some(h) = l.strip_prefix("@@ ") {
                     let h = h.trim();
                     if !h.is_empty() {
-                        probe.push(h);
+                        probe.push((true, h));
                     }
                 }
             }
@@ -117,7 +120,7 @@ fn anchor_probe<'a>(body: &[&'a str]) -> Vec<&'a str> {
 fn read_patch_file(
     relpath: &str,
     primary: Option<&str>,
-    probe: &[&str],
+    probe: &[(bool, &str)],
 ) -> Option<(PathBuf, String)> {
     let p = Path::new(relpath);
     if p.is_absolute() {
@@ -150,63 +153,43 @@ fn read_patch_file(
         1 => return readable.into_iter().next(),
         _ => {}
     }
-    // ③ 多个同名候选(并发会话共享 README.md/package.json 等)→ probe 做 tie-breaker:选锚点命中最多的
-    //    (= patch 真正针对的文件,real 含锚点会胜过 stale)。trim() 比对:容许 preflight 要修的首尾空白漂移。
-    let probe_lines: Vec<&str> = probe
+    // ③ 多个同名候选(并发会话共享 README.md/package.json 等)→ 按锚点 probe 挑 patch 真正针对的文件。
+    //    评分:context/删除行(非 header)按**整行 exact**(trim)命中;`@@` 头(header)按**子串**命中
+    //    真实整行(残缺头是整行子串,如 `系统架构建议` ⊂ `## 6. 系统架构建议`)。两类合并计分,**唯一
+    //    最高分**才选;并列 / 全 0 → None(歧义不猜,违反"不猜不丢"则会对 stale 文件对齐)。
+    //    header 不进 exact:否则 stale 的同名整行(恰=残缺头)会以 exact 胜过 real 的子串(review)。
+    let probe: Vec<(bool, &str)> = probe
         .iter()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
+        .map(|&(h, t)| (h, t.trim()))
+        .filter(|(_, t)| !t.is_empty())
         .collect();
-    if probe_lines.is_empty() {
+    if probe.is_empty() {
         return readable.into_iter().next(); // 无锚点(纯新增 patch)→ 最 recent(无需对齐,下游 no-op)
     }
-    // **唯一最高分**才选(chatgpt-codex-connector review:并列 = 歧义,不能盲取 most-recent,否则会对
-    // stale 文件对齐 —— 违反"不猜不丢")。max>0 且仅一个候选达到 → Some(下标);并列 / 全 0 → None。
-    let unique_best = |scores: &[i64]| -> Option<usize> {
-        let max = scores.iter().copied().max().unwrap_or(0);
-        if max <= 0 {
-            return None;
-        }
-        let winners: Vec<usize> = scores
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| **s == max)
-            .map(|(i, _)| i)
-            .collect();
-        (winners.len() == 1).then(|| winners[0])
-    };
-    // 主评分:整行 exact(trim)命中数。
-    let exact: Vec<i64> = readable
+    let scores: Vec<usize> = readable
         .iter()
         .map(|(_, c)| {
             let fl: Vec<&str> = c.lines().map(str::trim).collect();
-            probe_lines.iter().filter(|pl| fl.contains(pl)).count() as i64
+            probe
+                .iter()
+                .filter(|&&(is_header, t)| {
+                    if is_header {
+                        fl.iter().any(|line| !line.is_empty() && line.contains(t))
+                    } else {
+                        fl.iter().any(|line| *line == t)
+                    }
+                })
+                .count()
         })
         .collect();
-    let best_idx = match unique_best(&exact) {
-        Some(i) => i,
-        // exact 有 >0 但并列 → 歧义 → 不猜(None)。
-        None if exact.iter().any(|s| *s > 0) => return None,
-        // exact 全 0(典型:patch 只有残缺 `@@` 头,如 `@@ 系统架构建议` vs 文件 `## 6. 系统架构建议`)→
-        // 退**子串**评分(`@@` 头按子串命中真实文件整行),同样要求唯一最高;并列 / 全 0 → None(不猜)。
-        None => {
-            let sub: Vec<i64> = readable
-                .iter()
-                .map(|(_, c)| {
-                    let fls: Vec<&str> =
-                        c.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-                    probe_lines
-                        .iter()
-                        .filter(|pl| fls.iter().any(|fl| fl.contains(**pl)))
-                        .count() as i64
-                })
-                .collect();
-            match unique_best(&sub) {
-                Some(i) => i,
-                None => return None,
-            }
-        }
-    };
+    let max = scores.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return None; // 没有候选含任何锚点 → 都不是目标 → skip(安全)
+    }
+    if scores.iter().filter(|s| **s == max).count() != 1 {
+        return None; // 并列最高 = 歧义 → 不猜
+    }
+    let best_idx = scores.iter().position(|s| *s == max).unwrap();
     Some(readable.swap_remove(best_idx))
 }
 
@@ -972,7 +955,10 @@ fn repair_update_section(path: &str, body: &[&str], cwd: Option<&str>) -> (Vec<S
     // 用裸 `@@` 串接,使 applier 把各段当独立 hunk 定位(否则整块当一段连续上下文必失配)。
     // 仅唯一可分段时才动;单段 / 歧义 → 保持原 body 交常规路径。
     let mut split_owned: Vec<&str> = Vec::new();
-    let did_split = if !body.iter().any(|l| l.trim_start().starts_with("@@")) {
+    // 用**列 0** `@@`(不 trim_start)判断是否已有 hunk 分隔,与下方实际分割器(`l.starts_with("@@")`)
+    // 一致 —— 否则 context 行 ` @@ ...`(前导空格、内容以 @@ 开头,如 markdown/diff 文本)会被误当分隔符、
+    // 错误禁用自动切分,而分割器又不切它 → 仍失败(chatgpt-codex-connector review)。
+    let did_split = if !body.iter().any(|l| l.starts_with("@@")) {
         match segment_no_at_body(body, &file_lines) {
             Some(subhunks) => {
                 for (k, sub) in subhunks.iter().enumerate() {
@@ -1631,7 +1617,7 @@ mod tests {
         assert!(has_cwd_candidate(None), "有候选历史 → true");
         // primary=None(apply_patch 工具循环请求),真实 cwd 在候选里 → 读到文件
         // (stale cwd 无此文件,逐个试时自动跳过)。这是 P1 的核心:不再被 stale 单槽废掉。
-        let got = read_patch_file(&name, None, &["x"]);
+        let got = read_patch_file(&name, None, &[(false, "x")]);
         assert!(got.is_some(), "应经候选 cwd 读到文件");
         assert_eq!(got.unwrap().1, "x\n");
         // turn-start 请求抽 cwd 入候选(供后续 apply_patch 回退)。
@@ -1658,7 +1644,7 @@ mod tests {
         remember_cwd(real.path().to_str().unwrap());
         remember_cwd(stale.path().to_str().unwrap());
         // probe 命中 real(含 real_anchor_line)、不命中 stale → 应选 real,不取队首 stale。
-        let got = read_patch_file("shared_moc263.txt", None, &["real_anchor_line"]);
+        let got = read_patch_file("shared_moc263.txt", None, &[(false, "real_anchor_line")]);
         assert!(got.is_some(), "应选到含锚点的候选");
         assert_eq!(
             got.unwrap().1,
@@ -1679,7 +1665,7 @@ mod tests {
         )
         .unwrap();
         remember_cwd(dir.path().to_str().unwrap());
-        let got = read_patch_file("doc_moc263.md", None, &["系统架构建议"]);
+        let got = read_patch_file("doc_moc263.md", None, &[(true, "系统架构建议")]);
         assert!(
             got.is_some(),
             "单候选 + 残缺 header probe 不应被判 unreadable"
@@ -1705,7 +1691,7 @@ mod tests {
         .unwrap();
         remember_cwd(real.path().to_str().unwrap());
         remember_cwd(stale.path().to_str().unwrap()); // stale 在队首(most-recent)
-        let got = read_patch_file("doc2_moc263.md", None, &["系统架构建议"]);
+        let got = read_patch_file("doc2_moc263.md", None, &[(true, "系统架构建议")]);
         assert!(got.is_some());
         assert!(
             got.unwrap().1.contains("## 6. 系统架构建议"),
@@ -1723,8 +1709,43 @@ mod tests {
         std::fs::write(b.path().join("tie_moc263.txt"), "SHARED_ANCHOR\nbbb\n").unwrap();
         remember_cwd(a.path().to_str().unwrap());
         remember_cwd(b.path().to_str().unwrap());
-        let got = read_patch_file("tie_moc263.txt", None, &["SHARED_ANCHOR"]);
+        let got = read_patch_file("tie_moc263.txt", None, &[(false, "SHARED_ANCHOR")]);
         assert!(got.is_none(), "并列分数(歧义)应返回 None 不猜");
+    }
+
+    #[test]
+    fn read_patch_file_header_probe_not_beaten_by_stale_exact_fragment() {
+        // MOC-263 P2 五轮(chatgpt-codex-connector review):probe 只有残缺 `@@` 头;stale 恰有一整行 =
+        // 该 fragment,real 是其子串(`## 6. X`)。header 按**子串**评分(不进 exact)→ 两候选都子串命中
+        // → 并列 → None,**不会**因 stale 的 exact 整行被误选。
+        let stale = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(stale.path().join("h_moc263.md"), "系统架构建议\nx\n").unwrap();
+        std::fs::write(real.path().join("h_moc263.md"), "## 6. 系统架构建议\ny\n").unwrap();
+        remember_cwd(real.path().to_str().unwrap());
+        remember_cwd(stale.path().to_str().unwrap()); // stale 在队首
+        let got = read_patch_file("h_moc263.md", None, &[(true, "系统架构建议")]);
+        assert!(
+            got.is_none(),
+            "header 子串并列应 None,不被 stale 的 exact 整行误选"
+        );
+    }
+
+    #[test]
+    fn context_line_starting_with_at_at_does_not_block_split() {
+        // MOC-263 P2 五轮(chatgpt-codex-connector review):context 行内容以 @@ 开头(` @@ ...`,列 0 是
+        // 空格)不应被当 hunk 分隔符而禁用自动切分(分割器只认列 0 @@)。含此类 context 行的多区纯删除仍应切。
+        let content = "@@ banner\nkeep_a\nREMOVE_1\nmid1\nmid2\nmid3\nREMOVE_2\nkeep_b\n";
+        let (dir, name) = tmp_file("atat_moc263.txt", content);
+        let cwd = dir.path().to_str().unwrap();
+        let v4a = format!(
+            "*** Begin Patch\n*** Update File: {name}\n @@ banner\n keep_a\n-REMOVE_1\n mid1\n-REMOVE_2\n keep_b\n*** End Patch\n"
+        );
+        let (out, _reps) = preflight_repair(&v4a, Some(cwd));
+        assert!(
+            out.contains("\n@@\n"),
+            "含 ` @@` context 行的多区删除仍应自动切段(列 0 判定):\n{out}"
+        );
     }
 
     #[test]
