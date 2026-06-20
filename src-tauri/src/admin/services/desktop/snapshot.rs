@@ -419,12 +419,6 @@ pub async fn sync_desktop_for_active_provider(state: &AdminState) -> Value {
     result
 }
 
-/// [MOC-178] 清除真实账号:apply 当前 active provider 强制切 apikey(写 auth_mode=apikey、
-/// 保留 tokens),停用真实账号但退出 restore 能完整恢复 chatgpt。见 forget_handler。
-pub async fn sync_desktop_clearing_real_account(state: &AdminState) -> Value {
-    sync_desktop_for_active_provider_impl(state, true).await
-}
-
 /// [MOC-257 三态] 应用插件解锁三态:设活动 auth.json + 驱动 proxy 伪造 atomic + apply(relay/非relay)。
 ///
 /// relay 写 chatgpt_base_url 仍复用现有 gate(`apply_desktop_target_impl` 的 `active_is_real_chatgpt_now`)——
