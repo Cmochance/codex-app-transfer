@@ -158,8 +158,23 @@ fn read_patch_file(
         .filter(|l| !l.is_empty())
         .collect();
     if probe_lines.is_empty() {
-        return readable.into_iter().next(); // 无锚点(纯新增)→ 最 recent
+        return readable.into_iter().next(); // 无锚点(纯新增 patch)→ 最 recent(无需对齐,下游 no-op)
     }
+    // **唯一最高分**才选(chatgpt-codex-connector review:并列 = 歧义,不能盲取 most-recent,否则会对
+    // stale 文件对齐 —— 违反"不猜不丢")。max>0 且仅一个候选达到 → Some(下标);并列 / 全 0 → None。
+    let unique_best = |scores: &[i64]| -> Option<usize> {
+        let max = scores.iter().copied().max().unwrap_or(0);
+        if max <= 0 {
+            return None;
+        }
+        let winners: Vec<usize> = scores
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == max)
+            .map(|(i, _)| i)
+            .collect();
+        (winners.len() == 1).then(|| winners[0])
+    };
     // 主评分:整行 exact(trim)命中数。
     let exact: Vec<i64> = readable
         .iter()
@@ -168,28 +183,28 @@ fn read_patch_file(
             probe_lines.iter().filter(|pl| fl.contains(pl)).count() as i64
         })
         .collect();
-    let max_exact = exact.iter().copied().max().unwrap_or(0);
-    let best_idx = if max_exact > 0 {
-        exact.iter().position(|s| *s == max_exact).unwrap()
-    } else {
+    let best_idx = match unique_best(&exact) {
+        Some(i) => i,
+        // exact 有 >0 但并列 → 歧义 → 不猜(None)。
+        None if exact.iter().any(|s| *s > 0) => return None,
         // exact 全 0(典型:patch 只有残缺 `@@` 头,如 `@@ 系统架构建议` vs 文件 `## 6. 系统架构建议`)→
-        // 退**子串**评分(chatgpt-codex-connector review:`@@` 头按子串命中真实文件整行)做二级 tie-breaker,
-        // 让含该头的 real 胜过 stale,而不是盲取 most-recent。子串全 0 才退最 recent(idx 0)。
-        let sub: Vec<i64> = readable
-            .iter()
-            .map(|(_, c)| {
-                let fls: Vec<&str> = c.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-                probe_lines
-                    .iter()
-                    .filter(|pl| fls.iter().any(|fl| fl.contains(**pl)))
-                    .count() as i64
-            })
-            .collect();
-        let max_sub = sub.iter().copied().max().unwrap_or(0);
-        if max_sub > 0 {
-            sub.iter().position(|s| *s == max_sub).unwrap()
-        } else {
-            0
+        // 退**子串**评分(`@@` 头按子串命中真实文件整行),同样要求唯一最高;并列 / 全 0 → None(不猜)。
+        None => {
+            let sub: Vec<i64> = readable
+                .iter()
+                .map(|(_, c)| {
+                    let fls: Vec<&str> =
+                        c.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                    probe_lines
+                        .iter()
+                        .filter(|pl| fls.iter().any(|fl| fl.contains(**pl)))
+                        .count() as i64
+                })
+                .collect();
+            match unique_best(&sub) {
+                Some(i) => i,
+                None => return None,
+            }
         }
     };
     Some(readable.swap_remove(best_idx))
@@ -1696,6 +1711,20 @@ mod tests {
             got.unwrap().1.contains("## 6. 系统架构建议"),
             "子串评分应选含该头的 real,而非队首 stale"
         );
+    }
+
+    #[test]
+    fn read_patch_file_tied_score_is_ambiguous_none() {
+        // MOC-263 P2 四轮(chatgpt-codex-connector review):两候选 probe 分数并列(共享相同锚点行)→
+        // 歧义 → None(不猜),而非取队首 stale。下游 skip,patch 透过交 Codex / 模型自纠。
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("tie_moc263.txt"), "SHARED_ANCHOR\naaa\n").unwrap();
+        std::fs::write(b.path().join("tie_moc263.txt"), "SHARED_ANCHOR\nbbb\n").unwrap();
+        remember_cwd(a.path().to_str().unwrap());
+        remember_cwd(b.path().to_str().unwrap());
+        let got = read_patch_file("tie_moc263.txt", None, &["SHARED_ANCHOR"]);
+        assert!(got.is_none(), "并列分数(歧义)应返回 None 不猜");
     }
 
     #[test]
