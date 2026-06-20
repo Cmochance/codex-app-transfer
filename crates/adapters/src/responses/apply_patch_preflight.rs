@@ -151,30 +151,47 @@ fn read_patch_file(
         _ => {}
     }
     // ③ 多个同名候选(并发会话共享 README.md/package.json 等)→ probe 做 tie-breaker:选锚点命中最多的
-    //    (= patch 真正针对的文件,real 含锚点会胜过 stale);全 0(纯 partial header/纯新增,无法判别)→
-    //    取最 recent(下游用唯一匹配自保)。trim() 比对:容许 preflight 要修的首尾空白漂移。
+    //    (= patch 真正针对的文件,real 含锚点会胜过 stale)。trim() 比对:容许 preflight 要修的首尾空白漂移。
     let probe_lines: Vec<&str> = probe
         .iter()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
-    let mut best_idx = 0usize;
-    let mut best_score = -1i64;
-    for (i, (_abs, content)) in readable.iter().enumerate() {
-        let score = if probe_lines.is_empty() {
-            0
-        } else {
-            let file_lines: Vec<&str> = content.lines().map(str::trim).collect();
-            probe_lines
-                .iter()
-                .filter(|pl| file_lines.contains(pl))
-                .count() as i64
-        };
-        if score > best_score {
-            best_score = score;
-            best_idx = i;
-        }
+    if probe_lines.is_empty() {
+        return readable.into_iter().next(); // 无锚点(纯新增)→ 最 recent
     }
+    // 主评分:整行 exact(trim)命中数。
+    let exact: Vec<i64> = readable
+        .iter()
+        .map(|(_, c)| {
+            let fl: Vec<&str> = c.lines().map(str::trim).collect();
+            probe_lines.iter().filter(|pl| fl.contains(pl)).count() as i64
+        })
+        .collect();
+    let max_exact = exact.iter().copied().max().unwrap_or(0);
+    let best_idx = if max_exact > 0 {
+        exact.iter().position(|s| *s == max_exact).unwrap()
+    } else {
+        // exact 全 0(典型:patch 只有残缺 `@@` 头,如 `@@ 系统架构建议` vs 文件 `## 6. 系统架构建议`)→
+        // 退**子串**评分(chatgpt-codex-connector review:`@@` 头按子串命中真实文件整行)做二级 tie-breaker,
+        // 让含该头的 real 胜过 stale,而不是盲取 most-recent。子串全 0 才退最 recent(idx 0)。
+        let sub: Vec<i64> = readable
+            .iter()
+            .map(|(_, c)| {
+                let fls: Vec<&str> = c.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                probe_lines
+                    .iter()
+                    .filter(|pl| fls.iter().any(|fl| fl.contains(**pl)))
+                    .count() as i64
+            })
+            .collect();
+        let max_sub = sub.iter().copied().max().unwrap_or(0);
+        if max_sub > 0 {
+            sub.iter().position(|s| *s == max_sub).unwrap()
+        } else {
+            0
+        }
+    };
     Some(readable.swap_remove(best_idx))
 }
 
@@ -1653,6 +1670,32 @@ mod tests {
             "单候选 + 残缺 header probe 不应被判 unreadable"
         );
         assert!(got.unwrap().1.contains("## 6. 系统架构建议"));
+    }
+
+    #[test]
+    fn read_patch_file_partial_header_substring_picks_real_over_stale() {
+        // MOC-263 P2 三轮(chatgpt-codex-connector review):多候选 + 纯残缺 `@@` 头,exact 全 0 → 退
+        // 子串评分,选**子串含该头的 real**,而非盲取队首 stale(否则 align 会对 stale 子串修复)。
+        let stale = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(
+            stale.path().join("doc2_moc263.md"),
+            "stale intro\nunrelated heading\n",
+        )
+        .unwrap();
+        std::fs::write(
+            real.path().join("doc2_moc263.md"),
+            "intro\n## 6. 系统架构建议\n建议分层\n",
+        )
+        .unwrap();
+        remember_cwd(real.path().to_str().unwrap());
+        remember_cwd(stale.path().to_str().unwrap()); // stale 在队首(most-recent)
+        let got = read_patch_file("doc2_moc263.md", None, &["系统架构建议"]);
+        assert!(got.is_some());
+        assert!(
+            got.unwrap().1.contains("## 6. 系统架构建议"),
+            "子串评分应选含该头的 real,而非队首 stale"
+        );
     }
 
     #[test]
